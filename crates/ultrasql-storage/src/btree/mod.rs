@@ -262,13 +262,17 @@ impl<L: PageLoader> BTree<L> {
 
     /// Open an existing tree given its root block.
     #[must_use]
-    pub const fn open(pool: Arc<BufferPool<L>>, rel: RelationId, root_block: BlockNumber) -> Self {
-        // Allocate above any existing block to avoid colliding with on-
-        // disk content. The actual maximum is unknown from this entry
-        // point; the segment manager will hand us the correct value
-        // when integration lands. For v0.5 we conservatively start one
-        // past the root.
-        let next = root_block.raw().saturating_add(1);
+    pub fn open(pool: Arc<BufferPool<L>>, rel: RelationId, root_block: BlockNumber) -> Self {
+        // Allocate above resident blocks to avoid colliding with pages
+        // created by a previous handle for this same index relation.
+        // The segment manager will eventually own this; until then the
+        // buffer-pool resident set is the authoritative same-process
+        // view used by DML and index scans.
+        let next = pool
+            .max_resident_block(rel)
+            .map_or(root_block, |block| block)
+            .raw()
+            .saturating_add(1);
         Self {
             pool,
             rel,

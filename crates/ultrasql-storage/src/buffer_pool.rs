@@ -50,7 +50,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use dashmap::DashMap;
 use parking_lot::{Mutex, RwLock};
 use ultrasql_core::cache::CachePadded;
-use ultrasql_core::{Error, PageId, RelationId, Result};
+use ultrasql_core::{BlockNumber, Error, PageId, RelationId, Result};
 
 use crate::page::Page;
 use crate::wal_sink::WalSink;
@@ -282,6 +282,24 @@ impl<L: PageLoader> BufferPool<L> {
     #[must_use]
     pub fn capacity(&self) -> usize {
         self.frames.len()
+    }
+
+    /// Highest resident block for `rel`, if any.
+    ///
+    /// B-tree handles can be reopened from catalog metadata while their
+    /// pages are still resident in this process. Seeding fresh block
+    /// allocation above the resident maximum prevents reopened handles
+    /// from reusing an existing index page before the segment allocator is
+    /// wired into the B-tree layer.
+    #[must_use]
+    pub fn max_resident_block(&self, rel: RelationId) -> Option<BlockNumber> {
+        self.page_table
+            .iter()
+            .filter_map(|entry| {
+                let page_id = *entry.key();
+                (page_id.relation == rel).then_some(page_id.block)
+            })
+            .max()
     }
 
     /// Flush dirty, unpinned frames to disk using the provided `writer`

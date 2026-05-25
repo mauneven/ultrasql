@@ -1,0 +1,23 @@
+{
+  "engine": "ultrasql",
+  "workload": "sysbench_oltp_read_write",
+  "rows": 10000,
+  "connections": 32,
+  "warmup_secs": 1,
+  "duration_secs": 3,
+  "operations": 11937,
+  "reads": 6011,
+  "updates": 3471,
+  "inserts": 2455,
+  "throughput_per_sec": 3957.0157556364074,
+  "p50_latency_us": 2362.25,
+  "p95_latency_us": 41327.042,
+  "p99_latency_us": 65653.042,
+  "correctness": {
+    "passed": true,
+    "expected_row_count": 13382,
+    "actual_row_count": 13382,
+    "warmup_inserts": 927,
+    "measured_inserts": 2455
+  }
+}

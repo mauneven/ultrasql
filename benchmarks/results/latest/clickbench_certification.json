@@ -10,7 +10,13 @@
     "firebolt"
   ],
   "passed": false,
+  "reason": "missing_required_engine_results",
   "comparison_ready": false,
+  "target_max_ratio_ultrasql_vs_postgres": 0.2,
+  "target_ratio_ultrasql_vs_postgres": null,
+  "speedup_vs_postgres": null,
+  "postgres_geomean_ms": null,
+  "ultrasql_geomean_ms": null,
   "status": "partial",
   "postgres_result": "benchmarks/results/latest/raw/clickbench-postgres17.json",
   "ultrasql_result": "benchmarks/results/latest/raw/clickbench-ultrasql.json",

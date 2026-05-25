@@ -1,0 +1,10 @@
+.git
+.github
+target/
+benchmarks/results/
+tmp/
+*.log
+*.tmp
+site/
+dist/
+node_modules/

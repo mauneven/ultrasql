@@ -32,7 +32,7 @@ fn lower_query_eq_indexed_column_picks_index_scan() {
 }
 
 #[test]
-fn lower_update_eq_indexed_column_uses_point_fused_update() {
+fn lower_update_eq_indexed_column_uses_modifytable_not_fused_update() {
     let rows: Vec<(i32, i32)> = (1..=100).map(|i| (i, i * 10)).collect();
     let (fix, _entry, _) = build_index_fixture("t_update_indexed", &rows, true);
     let tables = SampleTables::new();
@@ -68,8 +68,8 @@ fn lower_update_eq_indexed_column_uses_point_fused_update() {
     let op = lower_query(&plan, &ctx).expect("lowers");
     let debug = format!("{op:?}");
     assert!(
-        debug.starts_with("FusedUpdateInt32Add") && debug.contains("target_tids: Some(1)"),
-        "expected indexed point fused update, got: {debug}"
+        debug.starts_with("ModifyTable"),
+        "indexed table UPDATE must maintain B-tree entries through ModifyTable, got: {debug}"
     );
 }
 

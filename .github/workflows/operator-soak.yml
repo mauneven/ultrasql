@@ -1,0 +1,48 @@
+name: operator soak
+
+on:
+  schedule:
+    - cron: '17 8 * * *'
+  pull_request:
+    paths:
+      - 'operator-reports/**'
+      - 'scripts/validate-operator-soak.py'
+      - 'docs/OPERATOR_SOAK.md'
+      - 'docs/operator-reports.md'
+      - '.github/workflows/operator-soak.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: operator-soak-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  validate:
+    name: validate operator soak reports
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.13'
+      - name: validate operator soak reports
+        run: |
+          python3 scripts/validate-operator-soak.py \
+            --reports-dir operator-reports \
+            --min-reports 3 \
+            --min-days 30 \
+            --out benchmarks/results/latest/operator_soak_status.json
+      - name: summarize status
+        run: |
+          {
+            echo '## Operator soak status'
+            echo
+            sed 's/^/    /' benchmarks/results/latest/operator_soak_status.json
+          } >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: operator-soak-status
+          path: benchmarks/results/latest/operator_soak_status.json

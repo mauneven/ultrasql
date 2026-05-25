@@ -1,0 +1,23 @@
+[Unit]
+Description=UltraSQL PostgreSQL-compatible database server
+Documentation=https://docs.ultrasql.org/
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ultrasql
+Group=ultrasql
+EnvironmentFile=-/etc/ultrasql/ultrasqld.env
+ExecStart=/usr/bin/ultrasqld --listen ${ULTRASQL_LISTEN} --data-dir ${ULTRASQL_DATA_DIR}
+Restart=on-failure
+RestartSec=2s
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=full
+ReadWritePaths=/var/lib/ultrasql
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target

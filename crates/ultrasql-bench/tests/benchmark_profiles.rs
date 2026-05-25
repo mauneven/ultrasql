@@ -25,6 +25,8 @@ fn certification_runner_splits_smoke_and_full_profiles() {
     assert!(script.contains("benchmarks/clickbench_certify.sh"));
     assert!(script.contains("benchmarks/tpcc_certify.sh"));
     assert!(script.contains("benchmarks/sysbench_certify.sh"));
+    assert!(script.contains("chaos-recovery"));
+    assert!(script.contains("benchmarks/chaos_recovery.sh"));
     assert!(script.contains("benchmarks/vector_topk_exact.sh"));
     assert!(script.contains("late-materialization"));
     assert!(script.contains("benchmarks/late_materialization.sh"));
@@ -60,9 +62,13 @@ fn tpcc_and_sysbench_certification_wrappers_write_artifacts() {
     assert!(tpcc.contains("missing_cross_engine_results"));
 
     assert!(sysbench.contains("sysbench_oltp_read_write"));
-    assert!(sysbench.contains("cross_compare_sql"));
-    assert!(sysbench.contains("--workload mixed-oltp"));
+    assert!(sysbench.contains("POSTGRES_DSN"));
+    assert!(sysbench.contains("SYSBENCH_ALLOW_ULTRASQL_ONLY"));
+    assert!(sysbench.contains("TMP_ULTRASQL_RESULT"));
+    assert!(sysbench.contains("TMP_POSTGRES_RESULT"));
     assert!(sysbench.contains("sysbench_certification.json"));
+    assert!(sysbench.contains("target_not_met"));
+    assert!(sysbench.contains("missing_cross_engine_results"));
 }
 
 #[test]
@@ -131,7 +137,13 @@ fn clickbench_runner_declares_complete_engine_artifacts_and_host_metadata() {
     assert!(clickbench.contains("\"schema_version\": 1"));
     assert!(clickbench.contains("\"host\""));
     assert!(clickbench.contains("\"status\": \"not_available\""));
-    assert!(clickbench.contains("runner_not_implemented_for_engine"));
+    assert!(clickbench.contains("run_clickhouse()"));
+    assert!(clickbench.contains("clickhouse/create.sql"));
+    assert!(clickbench.contains("clickhouse_client_missing"));
+    assert!(clickbench.contains("target_ratio_ultrasql_vs_postgres"));
+    assert!(clickbench.contains("missing_required_engine_results"));
+    assert!(clickbench.contains("target_not_met"));
+    assert!(!clickbench.contains("runner_not_implemented_for_engine"));
 }
 
 #[test]

@@ -5380,7 +5380,14 @@ impl Server {
         let scan_snapshot = scan_txn.snapshot.clone();
         let mut errors = Vec::new();
         let mut visible_rows = 0_u64;
+        let mut checked_tables = 0_u64;
+        let mut skipped_catalog_tables = 0_u64;
         for table in snapshot.tables.values() {
+            if table.schema_name == "pg_catalog" {
+                skipped_catalog_tables = skipped_catalog_tables.saturating_add(1);
+                continue;
+            }
+            checked_tables = checked_tables.saturating_add(1);
             let rel = RelationId(table.oid);
             let block_count = self.heap.block_count(rel).max(table.n_blocks);
             let codec = RowCodec::new(table.schema.clone());
@@ -5416,9 +5423,8 @@ impl Server {
             "heap_visibility",
             errors,
             format!(
-                "{} table(s), {} visible row(s)",
-                snapshot.tables.len(),
-                visible_rows
+                "{} user table(s), {} catalog table(s) skipped, {} visible row(s)",
+                checked_tables, skipped_catalog_tables, visible_rows
             ),
         )
     }

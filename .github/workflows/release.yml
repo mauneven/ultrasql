@@ -73,6 +73,14 @@ jobs:
       - run: cargo audit --deny yanked
       - run: cargo clippy --workspace --all-targets --all-features -- -D warnings
       - run: cargo test --workspace --all-features -- --nocapture
+      - name: validate operator soak reports
+        run: |
+          python3 scripts/validate-operator-soak.py \
+            --reports-dir operator-reports \
+            --min-reports 3 \
+            --min-days 30 \
+            --strict \
+            --out target/operator_soak_status.json
 
   build:
     name: build (${{ matrix.target }})
@@ -85,18 +93,23 @@ jobs:
           - target: x86_64-unknown-linux-gnu
             os: ubuntu-latest
             archive: tar
+            package_arch: amd64
           - target: aarch64-unknown-linux-gnu
             os: ubuntu-24.04-arm
             archive: tar
+            package_arch: arm64
           - target: x86_64-apple-darwin
             os: macos-14
             archive: tar
+            package_arch: ''
           - target: aarch64-apple-darwin
             os: macos-14
             archive: tar
+            package_arch: ''
           - target: x86_64-pc-windows-msvc
             os: windows-latest
             archive: zip
+            package_arch: ''
     steps:
       - uses: actions/checkout@v6
         with:
@@ -144,6 +157,34 @@ jobs:
           cp "target/${TARGET}/release-ship/ultrasql-local" "dist/${name}/"
           tar -C dist -czf "dist/${name}.tar.gz" "${name}"
           (cd dist && shasum -a 256 "${name}.tar.gz" > "${name}.tar.gz.sha256")
+      - name: prepare linux package root
+        env:
+          TARGET: ${{ matrix.target }}
+          PKG_ARCH: ${{ matrix.package_arch }}
+        shell: bash
+        if: matrix.package_arch != ''
+        run: |
+          version="${RELEASE_TAG#v}"
+          name="ultrasql-${RELEASE_TAG}-${TARGET}"
+          root="$PWD/target/package/${name}"
+          config="$PWD/target/package/${name}.nfpm.yaml"
+          install -d -m 0755 "$root/usr/bin"
+          install -m 0755 "target/${TARGET}/release-ship/ultrasqld" "$root/usr/bin/ultrasqld"
+          install -m 0755 "target/${TARGET}/release-ship/ultrasql" "$root/usr/bin/ultrasql"
+          install -m 0755 "target/${TARGET}/release-ship/ultrasql-local" "$root/usr/bin/ultrasql-local"
+          scripts/render-nfpm-config.sh "$version" "$PKG_ARCH" "$root" "$config"
+      - name: package deb
+        if: matrix.package_arch != ''
+        uses: goreleaser/nfpm-action@v2
+        with:
+          version: v2.43.1
+          args: package --packager deb --config target/package/ultrasql-${{ env.RELEASE_TAG }}-${{ matrix.target }}.nfpm.yaml --target dist/ultrasql-${{ env.RELEASE_TAG }}-${{ matrix.target }}.${{ matrix.package_arch }}.deb
+      - name: package rpm
+        if: matrix.package_arch != ''
+        uses: goreleaser/nfpm-action@v2
+        with:
+          version: v2.43.1
+          args: package --packager rpm --config target/package/ultrasql-${{ env.RELEASE_TAG }}-${{ matrix.target }}.nfpm.yaml --target dist/ultrasql-${{ env.RELEASE_TAG }}-${{ matrix.target }}.${{ matrix.package_arch }}.rpm
       - name: package zip
         env:
           TARGET: ${{ matrix.target }}
@@ -166,15 +207,46 @@ jobs:
             dist/ultrasql-${{ env.RELEASE_TAG }}-${{ matrix.target }}.tar.gz.sha256
             dist/ultrasql-${{ env.RELEASE_TAG }}-${{ matrix.target }}.zip
             dist/ultrasql-${{ env.RELEASE_TAG }}-${{ matrix.target }}.zip.sha256
+            dist/ultrasql-${{ env.RELEASE_TAG }}-${{ matrix.target }}.${{ matrix.package_arch }}.deb
+            dist/ultrasql-${{ env.RELEASE_TAG }}-${{ matrix.target }}.${{ matrix.package_arch }}.rpm
           if-no-files-found: ignore
+
+  docker:
+    name: publish docker image
+    runs-on: ubuntu-latest
+    needs: verify
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref }}
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: ghcr.io/${{ github.repository_owner }}/ultrasql:${{ env.RELEASE_TAG }}
+          labels: |
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.version=${{ env.RELEASE_TAG }}
 
   publish:
     name: publish release
     runs-on: ubuntu-latest
-    needs: build
+    needs: [build, docker]
     permissions:
       contents: write
     steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref }}
       - uses: actions/download-artifact@v8
         with:
           path: dist
@@ -182,14 +254,29 @@ jobs:
         shell: bash
         run: |
           mkdir -p release
-          find dist -type f \( -name '*.tar.gz' -o -name '*.zip' -o -name '*.sha256' \) \
+          find dist -type f \( -name '*.tar.gz' -o -name '*.zip' -o -name '*.deb' -o -name '*.rpm' -o -name '*.sha256' \) \
             -exec cp {} release/ \;
-          (cd release && shasum -a 256 *.tar.gz *.zip > SHASUMS256.txt)
+          (
+            cd release
+            for asset in *.tar.gz *.zip *.deb *.rpm; do
+              [ -e "$asset" ] || continue
+              shasum -a 256 "$asset"
+            done > SHASUMS256.txt
+          )
+          scripts/render-homebrew-formula.sh "$RELEASE_TAG" release/SHASUMS256.txt release/ultrasql.rb
+          python3 scripts/validate-operator-soak.py \
+            --reports-dir operator-reports \
+            --min-reports 3 \
+            --min-days 30 \
+            --strict \
+            --out release/operator_soak_status.json
+          scripts/render-release-notes.sh "$RELEASE_TAG" release/operator_soak_status.json release/RELEASE_NOTES.md
           ls -la release
       - name: publish github release
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ env.RELEASE_TAG }}
+          body_path: release/RELEASE_NOTES.md
           files: release/*
           generate_release_notes: true
           fail_on_unmatched_files: true

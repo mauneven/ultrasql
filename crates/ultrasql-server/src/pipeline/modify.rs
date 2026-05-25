@@ -1671,7 +1671,6 @@ pub(super) fn lower_real_update(
         .indexes_by_table
         .get(&entry.oid)
         .is_some_and(|indexes| !indexes.is_empty());
-    let indexed_assignment_changed = update_touches_indexed_column(entry, assignments, ctx);
     let has_child_constraints = ctx.table_constraints.get(&entry.oid).is_some_and(|c| {
         c.generated_stored.iter().any(Option::is_some)
             || !c.checks.is_empty()
@@ -1684,13 +1683,9 @@ pub(super) fn lower_real_update(
     // all match the `(Int32, Int32) WHERE col cmp lit SET col_i =
     // col_i ± lit` shape, bypass the SeqScan + Filter + ModifyTable
     // chain entirely and lower to the single `FusedUpdateInt32Add`
-    // operator. Saves ~150 µs / 10 000-row UPDATE on the bench shape
-    // — see the operator's module header for the full motivation.
-    if returning.is_empty()
-        && !indexed_assignment_changed
-        && !has_child_constraints
-        && !has_parent_constraints
-    {
+    // operator. Indexed tables stay on `ModifyTable` so non-key
+    // updates keep B-tree TIDs in sync with the new heap version.
+    if returning.is_empty() && !has_indexes && !has_child_constraints && !has_parent_constraints {
         if let Some(fused) = try_build_fused_update(table, entry, assignments, input, ctx)? {
             return Ok(fused);
         }
@@ -1758,37 +1753,6 @@ pub(super) fn lower_real_update(
         )
     };
     Ok(Box::new(modify))
-}
-
-fn update_touches_indexed_column(
-    entry: &TableEntry,
-    assignments: &[(usize, ScalarExpr)],
-    ctx: &LowerCtx<'_>,
-) -> bool {
-    let Some(indexes) = ctx.catalog_snapshot.indexes_by_table.get(&entry.oid) else {
-        return false;
-    };
-    indexes.iter().any(|index| {
-        let Some(metadata) = ctx
-            .table_constraints
-            .get(&entry.oid)
-            .and_then(|constraints| constraints.indexes.get(&index.oid).cloned())
-        else {
-            return assignments.iter().any(|(col, _)| {
-                u16::try_from(*col)
-                    .ok()
-                    .is_some_and(|attnum| index.columns.contains(&attnum))
-            });
-        };
-        !metadata.key_exprs.is_empty()
-            || metadata.predicate.is_some()
-            || assignments.iter().any(|(col, _)| {
-                index
-                    .columns
-                    .contains(&u16::try_from(*col).unwrap_or(u16::MAX))
-                    || metadata.include_columns.contains(col)
-            })
-    })
 }
 
 /// Try to detect the `(Int32, Int32) [WHERE col cmp lit]` DELETE

@@ -18,6 +18,8 @@ use ultrasql_bench::ann_vector::{AnnBenchmarkConfig, run_hnsw_ann_benchmark};
 use ultrasql_bench::registry::HostInfo;
 
 #[cfg(feature = "sql-bench")]
+mod sysbench_wire;
+#[cfg(feature = "sql-bench")]
 mod tpcb_wire;
 #[cfg(feature = "sql-bench")]
 mod tpcc_wire;
@@ -40,6 +42,8 @@ enum Command {
     FilteredVector(FilteredVectorArgs),
     /// Run page-backed HNSW/IVFFlat memory accounting benchmark.
     VectorMemory(VectorMemoryArgs),
+    /// Run a PostgreSQL-wire sysbench OLTP read/write benchmark.
+    Sysbench(SysbenchArgs),
     /// Run a PostgreSQL-wire TPC-B-shaped benchmark.
     Tpcb(TpcbArgs),
     /// Run a PostgreSQL-wire TPC-C-shaped benchmark.
@@ -193,6 +197,33 @@ struct TpcbArgs {
     output: Option<PathBuf>,
 }
 
+/// Sysbench OLTP read/write benchmark arguments.
+#[derive(Clone, Debug, Args)]
+struct SysbenchArgs {
+    /// Engine label and launch mode.
+    #[arg(long, value_enum, default_value_t = SysbenchEngine::Ultrasql)]
+    engine: SysbenchEngine,
+    /// PostgreSQL connection string. Required for postgres17; optional
+    /// for ultrasql, which starts an in-process server when omitted.
+    #[arg(long)]
+    dsn: Option<String>,
+    /// Initial table row count.
+    #[arg(long, default_value_t = 10_000)]
+    rows: usize,
+    /// Warmup window in seconds.
+    #[arg(long = "warmup", default_value_t = 30)]
+    warmup_secs: u64,
+    /// Measured window in seconds.
+    #[arg(long = "duration", default_value_t = 60)]
+    duration_secs: u64,
+    /// Number of concurrent clients.
+    #[arg(long, default_value_t = 32)]
+    connections: usize,
+    /// Output JSON path. Writes to stdout when omitted.
+    #[arg(long)]
+    output: Option<PathBuf>,
+}
+
 /// TPC-C benchmark arguments.
 #[derive(Clone, Debug, Args)]
 struct TpccArgs {
@@ -252,12 +283,23 @@ enum TpccEngine {
     Postgres17,
 }
 
+/// Engine selector for sysbench OLTP.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+enum SysbenchEngine {
+    /// Spawn and benchmark an in-process UltraSQL server unless `--dsn`
+    /// is supplied.
+    Ultrasql,
+    /// Benchmark an existing PostgreSQL 17-compatible server.
+    Postgres17,
+}
+
 fn main() -> ExitCode {
     let cli = Cli::parse();
     match cli.command {
         Some(Command::AnnVector(args)) => run_ann_vector(args),
         Some(Command::FilteredVector(args)) => run_filtered_vector(args),
         Some(Command::VectorMemory(args)) => run_vector_memory_command(args),
+        Some(Command::Sysbench(args)) => run_sysbench(args),
         Some(Command::Tpcb(args)) => run_tpcb(args),
         Some(Command::Tpcc(args)) => run_tpcc(args),
         None => {
@@ -359,6 +401,25 @@ fn run_vector_memory_command(args: VectorMemoryArgs) -> ExitCode {
 }
 
 #[cfg(feature = "sql-bench")]
+fn run_sysbench(args: SysbenchArgs) -> ExitCode {
+    match sysbench_wire::run_blocking(args) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(err) => {
+            eprintln!("sysbench benchmark failed: {err:#}");
+            ExitCode::from(1)
+        }
+    }
+}
+
+#[cfg(not(feature = "sql-bench"))]
+fn run_sysbench(_args: SysbenchArgs) -> ExitCode {
+    eprintln!(
+        "sysbench requires: cargo run -p ultrasql-bench --features sql-bench --bin ultrasql-bench -- sysbench ..."
+    );
+    ExitCode::from(2)
+}
+
+#[cfg(feature = "sql-bench")]
 fn run_tpcc(args: TpccArgs) -> ExitCode {
     match tpcc_wire::run_blocking(args) {
         Ok(()) => ExitCode::SUCCESS,
@@ -455,6 +516,22 @@ mod tests {
                 assert!(args.output.is_none());
             }
             _ => panic!("tpcc subcommand should parse"),
+        }
+    }
+
+    #[test]
+    fn sysbench_cli_defaults_to_v10_cert_shape() {
+        let cli = Cli::try_parse_from(["ultrasql-bench", "sysbench"]).expect("parse sysbench args");
+        match cli.command {
+            Some(Command::Sysbench(args)) => {
+                assert_eq!(args.engine, SysbenchEngine::Ultrasql);
+                assert_eq!(args.rows, 10_000);
+                assert_eq!(args.connections, 32);
+                assert_eq!(args.duration_secs, 60);
+                assert_eq!(args.warmup_secs, 30);
+                assert!(args.output.is_none());
+            }
+            _ => panic!("sysbench subcommand should parse"),
         }
     }
 

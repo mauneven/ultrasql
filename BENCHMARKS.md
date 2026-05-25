@@ -278,7 +278,12 @@ benchmarks/clickbench_certify.sh
 
 Set `CLICKBENCH_DOWNLOAD=1` to fetch
 `https://datasets.clickhouse.com/hits_compatible/hits.tsv.gz` into
-`target/clickbench/hits.tsv`. Set `CLICKBENCH_DOWNLOAD_PARQUET=1` to fetch
+`target/clickbench/hits.tsv`. The ClickHouse leg uses the pinned upstream
+`clickhouse/create.sql` and `clickhouse/queries.sql` files through a local
+`clickhouse-client`; when that client is absent the raw artifact records
+`status: "not_available"` with `reason: "clickhouse_client_missing"` rather
+than pretending the runner is not implemented. Set
+`CLICKBENCH_DOWNLOAD_PARQUET=1` to fetch
 `https://datasets.clickhouse.com/hits_compatible/hits.parquet` into
 `target/clickbench/hits.parquet` for the local Firebolt Core leg. Firebolt
 uses the upstream pinned `firebolt/create.sql` and `firebolt/queries.sql`
@@ -292,9 +297,13 @@ The script writes
 `benchmarks/results/latest/clickbench_certification.json`, including
 per-query runtimes, unsupported-query errors as `null`, geometric means,
 raw per-engine artifacts under `benchmarks/results/latest/raw/`, and the
-`≥ 5× PostgreSQL` pass/fail decision. Missing dataset, `psql`, or DSNs
-also write `passed: false` summaries so roadmap status never depends on
-an absent artifact.
+`≥ 5× PostgreSQL` pass/fail decision. The summary carries
+`target_ratio_ultrasql_vs_postgres`,
+`target_max_ratio_ultrasql_vs_postgres` set to `0.2`, and either
+`reason: "missing_required_engine_results"` or
+`reason: "target_not_met"` when it does not pass. Missing dataset, `psql`,
+DSNs, or local clients also write `passed: false` summaries so roadmap status
+never depends on an absent artifact.
 
 ### Firebolt Core Local Setup
 
@@ -410,7 +419,13 @@ UltraSQL is measured through
 `target/release/cross_compare_sql --workload sparse-pruning` using the
 same generated query shape. Raw artifacts land under
 `benchmarks/results/latest/raw/`, and the suite manifest is
-`benchmarks/results/latest/firebolt_sparse_pruning_manifest.json`.
+`benchmarks/results/latest/firebolt_sparse_pruning_manifest.json`. The
+manifest is the certification gate: it passes only when both engines are
+measured, Firebolt includes primary-index pruning evidence, and
+`target_ratio_ultrasql_vs_firebolt <= 0.5` (UltraSQL median latency is at
+least 2x faster). Missing evidence or missing engines produce
+`reason: "missing_required_engine_results"`; measured misses produce
+`reason: "target_not_met"`.
 
 ### Late Materialization
 
@@ -639,15 +654,30 @@ but the throughput target remains open.
 Sysbench-style OLTP smoke/full artifacts are recorded by:
 
 ```text
+POSTGRES_DSN="host=127.0.0.1 port=55417 user=postgres dbname=postgres" \
 benchmarks/sysbench_certify.sh
 ```
 
-The current runner uses UltraSQL's PostgreSQL-wire `mixed-oltp` workload as
-the committed sysbench-shaped artifact and writes
-`benchmarks/results/latest/sysbench_certification.json`. It records positive
-latency samples and a raw JSON result under `benchmarks/results/latest/raw/`;
-it does not make a competitor claim. `SYSBENCH_ROWS`, `SYSBENCH_ITERS`, and
-`SYSBENCH_WARMUP` control local smoke versus longer runs.
+The runner drives the same PostgreSQL-wire client code against PostgreSQL 17
+and UltraSQL. It creates a sysbench-shaped table with a unique index on `id`,
+then runs a deterministic OLTP read/write mix: point reads, indexed non-key
+updates, and inserts. Raw artifacts are written under
+`benchmarks/results/latest/raw/`; the comparison summary is
+`benchmarks/results/latest/sysbench_certification.json`. A pass requires row
+count correctness for both engines and UltraSQL throughput at least 2x
+PostgreSQL 17 on the same host. `SYSBENCH_ROWS`, `SYSBENCH_DURATION`,
+`SYSBENCH_WARMUP`, and `SYSBENCH_CONNECTIONS` control the run shape.
+
+Pull-request smoke uses `SYSBENCH_ALLOW_ULTRASQL_ONLY=1`; that mode is
+non-certifying and exists only to prove the UltraSQL runner still completes.
+Full certification without `POSTGRES_DSN` exits `not_available` instead of
+creating a competitor claim.
+
+Latest local reduced 32-client artifact
+(`POSTGRES_DSN=host=127.0.0.1 port=55417 user=postgres dbname=postgres`,
+`SYSBENCH_ROWS=10000`, `SYSBENCH_DURATION=3`, `SYSBENCH_WARMUP=1`,
+`SYSBENCH_CONNECTIONS=32`) is correct for both engines, but the target remains
+open: UltraSQL 3957.02 tx/s vs PostgreSQL 142427.44 tx/s (0.028x, below 2x).
 
 ---
 
@@ -727,6 +757,26 @@ The artifact is `measured` only when the restored row count and indexed point
 query both match the source. Missing local tools are recorded as
 `not_available`; no durability or performance claim exists from an unavailable
 artifact.
+
+## Chaos Recovery
+
+Release chaos evidence is recorded by:
+
+```text
+benchmarks/chaos_recovery.sh smoke
+```
+
+The runner starts real `ultrasqld` processes and verifies random kill restart,
+WAL truncation restart, and safe disk-full recovery. The disk-full leg uses a
+child-process `ulimit -f` cap instead of filling the host filesystem. It writes:
+
+```text
+benchmarks/results/latest/chaos_recovery_manifest.json
+```
+
+The artifact is `measured` only when all three cases verify row counts and
+`ultrasql validate` after restart. Missing local tools or unsupported file-size
+limits are recorded as `not_available`, not as recovery claims.
 
 ## Hot-Path Flamegraphs
 

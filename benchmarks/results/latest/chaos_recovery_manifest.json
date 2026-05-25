@@ -1,0 +1,57 @@
+{
+  "cases": [
+    {
+      "detail": "kill_after=11",
+      "disk_full_recovered_without_corruption": false,
+      "expected_rows": 11,
+      "name": "random_kill",
+      "reason": "ok",
+      "recovered_rows": 11,
+      "restarted_after_kill": true,
+      "row_count_verified": true,
+      "status": "passed",
+      "truncated_wal_recovered": false
+    },
+    {
+      "detail": "target/chaos-recovery/wal-truncation-data/pg_wal/segment_0000000000 1886 1879",
+      "disk_full_recovered_without_corruption": false,
+      "expected_rows": 8,
+      "name": "wal_truncation",
+      "reason": "ok",
+      "recovered_rows": 8,
+      "restarted_after_kill": false,
+      "row_count_verified": true,
+      "status": "passed",
+      "truncated_wal_recovered": true
+    },
+    {
+      "detail": "fsize_blocks=128; failure=server closed the connection unexpectedly  This probably means the server terminated abnormally  before or while processing the request. connection to server was lost",
+      "disk_full_recovered_without_corruption": true,
+      "expected_rows": 59,
+      "name": "disk_full",
+      "reason": "ok",
+      "recovered_rows": 59,
+      "restarted_after_kill": false,
+      "row_count_verified": true,
+      "status": "passed",
+      "truncated_wal_recovered": false
+    }
+  ],
+  "chaos_seed": "20260525",
+  "disk_full_max_inserts": 80,
+  "generated_at_unix": 1779686601,
+  "host": {
+    "cores": 10,
+    "cpu": "arm",
+    "machine": "arm64",
+    "os": "macOS-26.5-arm64-arm-64bit-Mach-O"
+  },
+  "passed": true,
+  "policy": "Chaos recovery is measured only when random kill restart, WAL truncation restart, and safe disk-full recovery all verify row counts and data-directory validation.",
+  "profile": "smoke",
+  "random_kill_rows": 12,
+  "schema_version": 1,
+  "status": "measured",
+  "suite": "chaos_recovery",
+  "wal_truncation_rows": 8
+}

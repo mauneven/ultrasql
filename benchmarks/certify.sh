@@ -4,7 +4,7 @@
 # Usage:
 #   benchmarks/certify.sh smoke
 #   benchmarks/certify.sh full
-#   benchmarks/certify.sh full tpch,tpch-sf1-postgres,clickbench,vector-ann,ai-vector-pgvector,ai-gauntlet,csv-gauntlet,object-parquet-range,late-materialization,firebolt-aggregate,firebolt-sparse-pruning,firebolt-vector
+#   benchmarks/certify.sh full tpch,tpch-sf1-postgres,clickbench,vector-ann,ai-vector-pgvector,ai-gauntlet,csv-gauntlet,object-parquet-range,late-materialization,firebolt-aggregate,firebolt-sparse-pruning,firebolt-vector,chaos-recovery
 #
 # Smoke is PR-safe: tiny datasets, crash/correctness checks, no external
 # benchmark assets. Full is nightly/manual: it attempts the full certification
@@ -29,7 +29,7 @@ case "$profile" in
         suites=(regression-gate vector-ann sysbench)
         ;;
     full)
-        suites=(tpch tpch-sf1-postgres clickbench tpcb tpcc sysbench vector-topk vector-ann ai-vector-pgvector ai-gauntlet csv-gauntlet object-parquet-range late-materialization firebolt-aggregate firebolt-sparse-pruning firebolt-vector)
+        suites=(tpch tpch-sf1-postgres clickbench tpcb tpcc sysbench vector-topk vector-ann ai-vector-pgvector ai-gauntlet csv-gauntlet object-parquet-range late-materialization firebolt-aggregate firebolt-sparse-pruning firebolt-vector chaos-recovery)
         ;;
     *)
         echo "certify.sh: profile must be smoke or full, got '$profile'" >&2
@@ -100,8 +100,10 @@ run_vector_ann_smoke() {
 
 run_sysbench_smoke() {
     SYSBENCH_ROWS=1000 \
-        SYSBENCH_ITERS=1 \
+        SYSBENCH_DURATION=1 \
         SYSBENCH_WARMUP=0 \
+        SYSBENCH_CONNECTIONS=4 \
+        SYSBENCH_ALLOW_ULTRASQL_ONLY=1 \
         benchmarks/sysbench_certify.sh
 }
 
@@ -176,6 +178,14 @@ run_firebolt_vector_full() {
     FIREBOLT_VECTOR_PROFILE=full benchmarks/firebolt_vector_search.sh full
 }
 
+run_chaos_recovery_smoke() {
+    CHAOS_PROFILE=smoke CHAOS_OUT_DIR="$OUT_DIR" benchmarks/chaos_recovery.sh smoke
+}
+
+run_chaos_recovery_full() {
+    CHAOS_PROFILE=full CHAOS_OUT_DIR="$OUT_DIR" benchmarks/chaos_recovery.sh full
+}
+
 for suite in "${suites[@]}"; do
     case "$suite" in
         regression-gate)
@@ -241,6 +251,13 @@ for suite in "${suites[@]}"; do
                 run_suite "$suite" run_firebolt_vector_smoke
             else
                 run_suite "$suite" run_firebolt_vector_full
+            fi
+            ;;
+        chaos-recovery)
+            if [[ "$profile" == "smoke" ]]; then
+                run_suite "$suite" run_chaos_recovery_smoke
+            else
+                run_suite "$suite" run_chaos_recovery_full
             fi
             ;;
         sysbench)

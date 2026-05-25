@@ -104,12 +104,12 @@ are grounds for revert.
 | v0.6 | TPC-H scale 1 correctness (all 22 queries) | result-equal to DuckDB ✅ | `validate-results` result comparison |
 | v0.6+ | TPC-H scale 1 performance certification | ≥ 2× PostgreSQL 17 ✅ latest local artifact passed; 351.06× vs PostgreSQL 17 across q1..q22 | geometric mean query time |
 | v0.7 | TPC-H scale 10 (all 22 queries) | ≥ 2× DuckDB ✅ latest local artifact status passed; 22/22 DuckDB and UltraSQL query timings in `benchmarks/results/latest/tpch_sf10_certification.json` | geometric mean query time |
-| v0.7 | ClickBench (`hits.parquet` analytical queries) | ≥ 5× faster than PostgreSQL 17 ⚠️ not certified; runner records missing dataset/DSN failures and includes a local Firebolt Core Parquet leg; local Core smoke-subset artifact measured at 100k rows, full dataset load timed out on 16 GiB Colima host | geometric mean query time |
+| v0.7 | ClickBench (`hits.parquet` analytical queries) | ≥ 5× faster than PostgreSQL 17 ⚠️ not certified; runner records missing dataset/DSN/client failures, gates UltraSQL/PostgreSQL with an explicit 0.2 latency-ratio target, includes local ClickHouse and Firebolt Core legs, and the latest local artifact has only a Firebolt 100k-row smoke subset measured | geometric mean query time |
 | v0.9 | TPC-B (OLTP, 32 connections) | ≥ 2× PostgreSQL 17, p99 < 5 ms | throughput + latency |
 | v1.0 | TPC-C (all 5 tx types, 32 connections) | ≥ 2× PostgreSQL 17 | throughput (tx/s) |
-| v1.0 | Sysbench OLTP read/write | ≥ 2× PostgreSQL 17 | throughput (tx/s) |
+| v1.0 | Sysbench OLTP read/write | ≥ 2× PostgreSQL 17 ⚠️ same-host PostgreSQL-wire runner is correct for both engines, but latest 32-client reduced artifact is 0.028× PostgreSQL | throughput (tx/s) |
 | v1.0 | Firebolt aggregating-index dashboard aggregate | ≥ 2× Firebolt ✅ local Firebolt Core smoke measured; both UltraSQL and Firebolt artifacts present and EXPLAIN uses Firebolt aggregate-index backing relation | median query latency |
-| v1.0 | Firebolt sparse primary-index pruning | ≥ 2× Firebolt ⚠️ local Firebolt Core runner exists and UltraSQL smoke artifact measured; Core EXPLAIN does not expose primary-index pruning evidence on 10k smoke, so Firebolt artifact remains not_available instead of a claim | median query latency |
+| v1.0 | Firebolt sparse primary-index pruning | ≥ 2× Firebolt ⚠️ runner now gates the 0.5 UltraSQL/Firebolt median-latency ratio, but latest 10k smoke remains partial: UltraSQL measured at 125.875 µs and Firebolt is not_available because Core EXPLAIN did not expose primary-index pruning evidence | median query latency |
 | v1.0 | Firebolt-style wide filter/projection late materialization | UltraSQL and local Firebolt Core smoke artifacts measured ✅ 10k-row same-host run: UltraSQL late path 550.875 µs vs Firebolt Core 194335.459 µs; UltraSQL EXPLAIN shows Late Materialization counters | median latency + candidates/fetched/skipped |
 | v1.0 | Firebolt HNSW vector search | recall/latency artifact vs UltraSQL HNSW ✅ local Firebolt Core smoke measured; UltraSQL and Firebolt HNSW artifacts present | recall@k + p50/p95/p99 |
 | v2.x | Star Schema Benchmark scale 100 | ≥ 2× ClickHouse | geometric mean query time |
@@ -1310,11 +1310,14 @@ The main OLAP performance differentiator over PostgreSQL.
   before publishing release performance numbers.
 - [ ] ClickBench has not been run or certified against PostgreSQL.
   `benchmarks/clickbench_certify.sh` now downloads the pinned upstream
-  PostgreSQL schema/query set at runtime and records
-  `benchmarks/results/latest/clickbench_certification.json`, but the
-  2026-05-18 local run stopped honestly at missing
-  `target/clickbench/hits.tsv`; no PostgreSQL/UltraSQL comparison has
-  been measured.
+  PostgreSQL, ClickHouse, and Firebolt schema/query sets at runtime,
+  records explicit target-ratio fields in
+  `benchmarks/results/latest/clickbench_certification.json`, and emits
+  concrete setup reasons such as `dataset_missing`,
+  `clickhouse_client_missing`, and `missing_required_engine_results`.
+  The latest local artifact still has no PostgreSQL/UltraSQL comparison;
+  only a Firebolt Core 100k-row smoke subset is measured, which is not
+  full ClickBench certification.
 - [x] Automatic dictionary selection is implemented in `ultrasql-vec`
   and wired through core executor/server batch paths. Remaining work is
   specialized dictionary-native text predicates and GROUP BY lowering
@@ -1343,7 +1346,8 @@ The main OLAP performance differentiator over PostgreSQL.
   on the latest local artifact; 22/22 query timings are present for both
   engines and the summary reports status passed.
 - [ ] ClickBench: at least 5× faster than PostgreSQL on analytical
-  queries — certification runner exists, but no dataset-backed
+  queries — certification runner exists and gates
+  `target_ratio_ultrasql_vs_postgres <= 0.2`, but no dataset-backed
   PostgreSQL/UltraSQL run has completed.
 
 ---
@@ -1842,10 +1846,11 @@ behavior are implemented and validated.
 ### Milestone
 - [x] First documented operations runbook — `OPERATIONS.md`
 - [x] Health and readiness endpoints — `ultrasqld --ops-listen` serves `/health`, `/ready`, `/metrics`
-- [ ] Three independent operators run UltraSQL for 7 days and report —
-  runbook and pending artifact exist in `docs/OPERATOR_SOAK.md` and
+- [ ] Three independent operators run UltraSQL for 30 days and report —
+  runbook, validator, and pending artifact exist in `docs/OPERATOR_SOAK.md`,
+  `scripts/validate-operator-soak.py`, and
   `benchmarks/results/latest/operator_soak_status.json`; cannot be closed
-  until three independent seven-day reports exist.
+  until three independent 30-day reports exist.
 
 ---
 
@@ -2206,7 +2211,19 @@ same host.
 - [x] TPC-H scale 10: throughput ≥ 2× DuckDB on the latest local
   artifact; rerun `benchmarks/tpch_sf10_certify.sh` on the release host
   before publishing release numbers.
-- [ ] Sysbench OLTP read/write: throughput ≥ 2× PostgreSQL
+- [ ] Sysbench OLTP read/write: throughput ≥ 2× PostgreSQL — `benchmarks/sysbench_certify.sh` now runs the same PostgreSQL-wire sysbench-shaped read/write mix against UltraSQL and PostgreSQL 17, creates a unique `id` index, writes atomic raw artifacts, and keeps UltraSQL-only smoke explicitly non-certifying. Latest same-host reduced 32-client artifact (`POSTGRES_DSN=host=127.0.0.1 port=55417 user=postgres dbname=postgres`, `SYSBENCH_ROWS=10000`, `SYSBENCH_DURATION=3`, `SYSBENCH_WARMUP=1`, `SYSBENCH_CONNECTIONS=32`) is correct for both engines, but target still fails: UltraSQL 3957.02 tx/s vs PostgreSQL 142427.44 tx/s (0.028×, below 2×).
+- [ ] ClickBench: throughput ≥ 5× PostgreSQL 17 — runner now has local
+  PostgreSQL/UltraSQL/DuckDB/ClickHouse/Firebolt artifact paths, explicit
+  target-ratio fields, and concrete setup-failure reasons. Current repo
+  artifact is still partial: Firebolt Core has a 100k-row smoke-subset
+  measurement, while the required PostgreSQL/UltraSQL dataset-backed
+  comparison remains missing.
+- [ ] Firebolt sparse primary-index pruning: median latency ≥ 2× Firebolt —
+  `benchmarks/firebolt_sparse_pruning.sh` now makes the manifest the
+  certification gate (`target_ratio_ultrasql_vs_firebolt <= 0.5`) and
+  requires Firebolt primary-index pruning evidence. Current 10k smoke is
+  partial: UltraSQL measured 125.875 µs, Firebolt is not_available because
+  Core EXPLAIN did not expose pruning evidence.
 - [ ] Vector/RAG certification: exact kNN same-host pgvector artifact, HNSW
   recall/latency, hybrid text+vector retrieval, filtered vector search, RAG
   quality, ingestion throughput, memory-per-million-vectors, and cold-start
@@ -2215,9 +2232,15 @@ same host.
   pgvector profiles remain open
 
 ### Production Validation
-- [ ] Three independent operators run UltraSQL for 30 days and report
+- [ ] Three independent operators run UltraSQL for 30 days and report —
+  `docs/OPERATOR_SOAK.md`, `docs/operator-reports.md`,
+  `.github/workflows/operator-soak.yml`, and
+  `scripts/validate-operator-soak.py` define and validate the report gate.
+  Current status artifact path:
+  `benchmarks/results/latest/operator_soak_status.json`. This remains open
+  until three real `operator-reports/*.json` files pass strict validation.
 - [ ] Zero open critical or high-severity correctness bugs
-- [ ] Chaos testing: random kill, WAL truncation, disk full — all recover correctly
+- [x] Chaos testing: random kill, WAL truncation, disk full — all recover correctly through `benchmarks/chaos_recovery.sh`, which starts real `ultrasqld` children, hard-kills only tracked child PIDs, truncates temp WAL tails, simulates disk-full with child `ulimit -f`, and writes `benchmarks/results/latest/chaos_recovery_manifest.json`. Latest smoke manifest is `status: "measured"` with random-kill, WAL-truncation, and disk-full cases passed.
 - [ ] Fuzz testing: 1 week clean on parser, protocol, WAL decoder, planner
 
 ### Release Checklist
@@ -2242,14 +2265,28 @@ same host.
 - [x] Release checklist: `docs/release-checklist.md` maps v1.0 boxes to
   code, test, benchmark or reason, docs, and artifact.
 - [x] `CHANGELOG.md` documenting user-visible change groups and known gaps.
-- [ ] Official documentation site (`docs.ultrasql.org`)
+- [x] Official documentation site (`docs.ultrasql.org`) — MkDocs site config,
+  `docs/CNAME`, and `.github/workflows/docs.yml` build with `mkdocs build
+  --strict` and deploy through GitHub Pages. Publication evidence is the Pages
+  deployment URL in the release notes.
 - [x] Getting started guide: `docs/getting-started.md`.
 - [x] Migration guide from PostgreSQL: `docs/migration-from-postgresql.md`.
 - [x] Known incompatibilities documented: `docs/known-incompatibilities.md`.
-- [ ] Docker image published
-- [ ] Homebrew formula
-- [ ] Debian/Ubuntu and RPM packages
-- [ ] GitHub release with release notes
+- [x] Docker image publication path — `Dockerfile` builds a non-root runtime
+  image and `.github/workflows/release.yml` publishes
+  `ghcr.io/mauneven/ultrasql:<tag>`.
+- [x] Homebrew formula — `packaging/homebrew/ultrasql.rb.in` plus
+  `scripts/render-homebrew-formula.sh` renders a checksum-pinned macOS formula
+  into the GitHub release assets.
+- [x] Debian/Ubuntu and RPM packages — `packaging/nfpm.yaml.in`,
+  hardened systemd files under `packaging/linux/`, and the release workflow
+  build `.deb` and `.rpm` assets for Linux x86_64 and ARM64.
+- [ ] GitHub release with release notes — `.github/workflows/release.yml`
+  now validates strict operator soak reports, renders `RELEASE_NOTES.md` from
+  `docs/release-notes-template.md`, and publishes it through
+  `softprops/action-gh-release`. Close only after latest green CI workflow run id,
+  release workflow run id, GitHub release notes URL, and release assets are
+  recorded.
 
 ---
 

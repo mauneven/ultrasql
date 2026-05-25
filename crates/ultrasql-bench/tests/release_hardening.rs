@@ -65,6 +65,61 @@ fn backup_restore_smoke_script_is_valid_bash() {
 }
 
 #[test]
+fn chaos_recovery_runner_documents_fault_coverage() {
+    let script = repo_file("benchmarks/chaos_recovery.sh");
+    let docs = repo_file("docs/chaos-recovery.md");
+    let release = repo_file("docs/release-checklist.md");
+    let roadmap = repo_file("ROADMAP.md");
+
+    for needle in [
+        "chaos_recovery_manifest.json",
+        "random_kill",
+        "wal_truncation",
+        "disk_full",
+        "CHAOS_SEED",
+        "kill -9",
+        "truncate_last_wal_segment",
+        "ulimit -f",
+        "\"restarted_after_kill\"",
+        "\"truncated_wal_recovered\"",
+        "\"disk_full_recovered_without_corruption\"",
+        "\"row_count_verified\"",
+        "\"status\": \"not_available\"",
+    ] {
+        assert!(script.contains(needle), "chaos runner missing {needle}");
+    }
+
+    for needle in [
+        "random kill",
+        "WAL truncation",
+        "disk full",
+        "benchmarks/chaos_recovery.sh",
+        "safe disk-full simulation",
+        "chaos_recovery_manifest.json",
+    ] {
+        assert!(docs.contains(needle), "chaos docs missing {needle}");
+    }
+
+    assert!(release.contains("Chaos recovery"));
+    assert!(release.contains("benchmarks/chaos_recovery.sh"));
+    assert!(roadmap.contains("Chaos testing: random kill, WAL truncation, disk full"));
+}
+
+#[test]
+fn chaos_recovery_script_is_valid_bash() {
+    let Some(mut bash) = bash_command() else {
+        eprintln!("skipping chaos bash syntax check: Git Bash not found");
+        return;
+    };
+    let status = bash
+        .arg("-n")
+        .arg(repo_path("benchmarks/chaos_recovery.sh"))
+        .status()
+        .expect("run bash -n chaos_recovery.sh");
+    assert!(status.success(), "chaos_recovery.sh must parse");
+}
+
+#[test]
 fn configuration_docs_cover_release_knobs() {
     let docs = repo_file("docs/configuration.md");
 
@@ -266,6 +321,276 @@ fn release_checklist_maps_69_to_74_to_artifacts() {
         "74 Release checklist",
     ] {
         assert!(docs.contains(needle), "release checklist missing {needle}");
+    }
+}
+
+#[test]
+fn packaging_and_docs_site_surface_is_release_ready() {
+    let mkdocs = repo_file("mkdocs.yml");
+    let docs_workflow = repo_file(".github/workflows/docs.yml");
+    let dockerfile = repo_file("Dockerfile");
+    let dockerignore = repo_file(".dockerignore");
+    let release = repo_file(".github/workflows/release.yml");
+    let nfpm = repo_file("packaging/nfpm.yaml.in");
+    let systemd = repo_file("packaging/linux/ultrasqld.service");
+    let homebrew = repo_file("packaging/homebrew/ultrasql.rb.in");
+    let homebrew_render = repo_file("scripts/render-homebrew-formula.sh");
+    let nfpm_render = repo_file("scripts/render-nfpm-config.sh");
+    let docs = repo_file("docs/packaging.md");
+    let install = repo_file("docs/install.md");
+    let roadmap = repo_file("ROADMAP.md");
+
+    for needle in [
+        "site_url: https://docs.ultrasql.org/",
+        "theme:",
+        "name: material",
+        "Getting Started",
+        "Packaging",
+    ] {
+        assert!(mkdocs.contains(needle), "mkdocs.yml missing {needle}");
+    }
+    for needle in [
+        "actions/configure-pages",
+        "mkdocs build --strict",
+        "actions/upload-pages-artifact",
+        "actions/deploy-pages",
+    ] {
+        assert!(
+            docs_workflow.contains(needle),
+            "docs workflow missing {needle}"
+        );
+    }
+
+    for needle in [
+        "FROM rust:",
+        "cargo build --locked --profile release-ship",
+        "USER 10001:10001",
+        "ENTRYPOINT",
+        "--listen",
+        "0.0.0.0:5432",
+        "--data-dir",
+        "/var/lib/ultrasql",
+    ] {
+        assert!(dockerfile.contains(needle), "Dockerfile missing {needle}");
+    }
+    assert!(dockerignore.contains("target/"));
+    assert!(dockerignore.contains("benchmarks/results/"));
+
+    for needle in [
+        "docker/build-push-action",
+        "ghcr.io/${{ github.repository_owner }}/ultrasql",
+        "render-nfpm-config.sh",
+        "package --packager deb",
+        "package --packager rpm",
+        "render-homebrew-formula.sh",
+        "ultrasql.rb",
+        "*.deb",
+        "*.rpm",
+    ] {
+        assert!(
+            release.contains(needle),
+            "release workflow missing {needle}"
+        );
+    }
+
+    for needle in [
+        "name: ultrasql",
+        "arch: \"@ARCH@\"",
+        "version: \"@VERSION@\"",
+        "/usr/bin/ultrasqld",
+        "/lib/systemd/system/ultrasqld.service",
+        "packaging/linux/preinstall.sh",
+        "packaging/linux/postinstall.sh",
+    ] {
+        assert!(nfpm.contains(needle), "nfpm template missing {needle}");
+    }
+    for needle in [
+        "User=ultrasql",
+        "Group=ultrasql",
+        "NoNewPrivileges=true",
+        "ReadWritePaths=/var/lib/ultrasql",
+    ] {
+        assert!(systemd.contains(needle), "systemd unit missing {needle}");
+    }
+
+    for needle in [
+        "class Ultrasql < Formula",
+        "version \"@VERSION@\"",
+        "@SHA256_DARWIN_ARM64@",
+        "@SHA256_DARWIN_AMD64@",
+        "bin.install \"ultrasqld\", \"ultrasql\", \"ultrasql-local\"",
+    ] {
+        assert!(
+            homebrew.contains(needle),
+            "homebrew template missing {needle}"
+        );
+    }
+    for needle in [
+        "SHA256_DARWIN_ARM64",
+        "SHA256_DARWIN_AMD64",
+        "checksum missing",
+    ] {
+        assert!(
+            homebrew_render.contains(needle),
+            "homebrew renderer missing {needle}"
+        );
+    }
+    for needle in ["@VERSION@", "@ARCH@", "@ROOT@", "sed"] {
+        assert!(
+            nfpm_render.contains(needle),
+            "nfpm renderer missing {needle}"
+        );
+    }
+
+    for needle in [
+        "docs.ultrasql.org",
+        "ghcr.io/mauneven/ultrasql",
+        "Homebrew",
+        "Debian",
+        "RPM",
+        "release workflow",
+    ] {
+        assert!(docs.contains(needle), "packaging docs missing {needle}");
+        assert!(install.contains(needle), "install docs missing {needle}");
+        assert!(roadmap.contains(needle), "ROADMAP missing {needle}");
+    }
+}
+
+#[test]
+fn packaging_scripts_have_valid_bash_syntax() {
+    if bash_command().is_none() {
+        eprintln!("skipping packaging bash syntax check: Git Bash not found");
+        return;
+    }
+
+    for script in [
+        "scripts/render-homebrew-formula.sh",
+        "scripts/render-nfpm-config.sh",
+        "packaging/linux/preinstall.sh",
+        "packaging/linux/postinstall.sh",
+    ] {
+        let status = bash_command()
+            .expect("bash available")
+            .arg("-n")
+            .arg(repo_path(script))
+            .status()
+            .unwrap_or_else(|err| panic!("run bash -n {script}: {err}"));
+        assert!(status.success(), "{script} must parse");
+    }
+}
+
+#[test]
+fn final_release_requires_operator_reports_green_workflows_and_notes() {
+    let operator_docs = repo_file("docs/OPERATOR_SOAK.md");
+    let operator_report_docs = repo_file("docs/operator-reports.md");
+    let operator_workflow = repo_file(".github/workflows/operator-soak.yml");
+    let validator = repo_file("scripts/validate-operator-soak.py");
+    let release = repo_file(".github/workflows/release.yml");
+    let notes_template = repo_file("docs/release-notes-template.md");
+    let notes_renderer = repo_file("scripts/render-release-notes.sh");
+    let release_config = repo_file(".github/release.yml");
+    let release_checklist = repo_file("docs/release-checklist.md");
+    let roadmap = repo_file("ROADMAP.md");
+
+    for needle in [
+        "30 continuous days",
+        "Three independent operators",
+        "operator-reports/*.json",
+        "benchmarks/results/latest/operator_soak_status.json",
+        "critical_issue_count",
+        "high_issue_count",
+    ] {
+        assert!(operator_docs.contains(needle), "soak docs missing {needle}");
+        assert!(
+            operator_report_docs.contains(needle),
+            "operator report docs missing {needle}"
+        );
+    }
+
+    for needle in [
+        "schedule:",
+        "validate operator soak reports",
+        "scripts/validate-operator-soak.py",
+        "--min-reports 3",
+        "--min-days 30",
+        "operator-soak-status",
+    ] {
+        assert!(
+            operator_workflow.contains(needle),
+            "operator soak workflow missing {needle}"
+        );
+    }
+
+    for needle in [
+        "min_reports",
+        "min_days",
+        "operator_id",
+        "start_time_utc",
+        "end_time_utc",
+        "critical_issue_count",
+        "high_issue_count",
+        "status",
+        "ready",
+        "not_ready",
+    ] {
+        assert!(
+            validator.contains(needle),
+            "operator validator missing {needle}"
+        );
+    }
+
+    for needle in [
+        "scripts/validate-operator-soak.py",
+        "--strict",
+        "operator_soak_status.json",
+        "scripts/render-release-notes.sh",
+        "RELEASE_NOTES.md",
+        "body_path: release/RELEASE_NOTES.md",
+    ] {
+        assert!(
+            release.contains(needle),
+            "release workflow missing {needle}"
+        );
+    }
+
+    for needle in [
+        "@RELEASE_TAG@",
+        "@RELEASE_RUN_URL@",
+        "@OPERATOR_SOAK_STATUS@",
+        "Green workflow evidence",
+        "GitHub release notes",
+        "30-day operator reports",
+    ] {
+        assert!(
+            notes_template.contains(needle),
+            "release notes template missing {needle}"
+        );
+    }
+    for needle in ["RELEASE_TAG", "OPERATOR_SOAK_STATUS", "sed"] {
+        assert!(
+            notes_renderer.contains(needle),
+            "release notes renderer missing {needle}"
+        );
+    }
+    for needle in ["changelog:", "exclude:", "categories:"] {
+        assert!(
+            release_config.contains(needle),
+            "github release config missing {needle}"
+        );
+    }
+
+    for needle in [
+        "operator soak reports",
+        "latest green CI workflow run id",
+        "release workflow run id",
+        "GitHub release notes",
+        "operator_soak_status.json",
+    ] {
+        assert!(
+            release_checklist.contains(needle),
+            "release checklist missing {needle}"
+        );
+        assert!(roadmap.contains(needle), "ROADMAP missing {needle}");
     }
 }
 

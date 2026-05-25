@@ -298,24 +298,40 @@ impl<L: PageLoader> BTree<L> {
                 }
             }
         }
-        // The root split. Create a new root.
+        // The root split. Keep the root block stable: catalog entries
+        // store the root block, and DML opens fresh BTree handles from
+        // that persisted value. Copy the split-left root into a new
+        // left child, then overwrite the original root block with the
+        // new internal root.
         let old_root = *self.root_block.lock();
-        let new_root_block = self.allocate_block();
-        let level = self.read_level(old_root)? + 1;
+        let new_left = self.allocate_block();
+        let (old_root_bytes, level) = {
+            let guard = self.pool.get_page(self.page_id(old_root))?;
+            let r = guard.read();
+            let meta = NodeMeta::read_from(&r)?;
+            (*r.as_bytes(), meta.level.saturating_add(1))
+        };
         {
-            let guard = self.pool.get_page(self.page_id(new_root_block))?;
+            let guard = self.pool.get_page(self.page_id(new_left))?;
+            guard
+                .write()
+                .as_bytes_mut()
+                .copy_from_slice(&old_root_bytes);
+        }
+        {
+            let guard = self.pool.get_page(self.page_id(old_root))?;
             {
                 let mut w = guard.write();
                 let meta = NodeMeta::fresh_internal(level);
                 init_btree_page(&mut w, meta)?;
-                // Two initial children: old root (covers (-inf, sep_key))
+                // Two initial children: copied left (covers (-inf, sep_key))
                 // and the new right sibling (covers [sep_key, +inf)). We
                 // encode the leftmost child as an entry with key = i64::MIN
                 // so binary search routes correctly.
                 let entries = [
                     InternalEntry {
                         key: i64::MIN,
-                        child: old_root.raw(),
+                        child: new_left.raw(),
                     },
                     InternalEntry {
                         key: sep_key,
@@ -328,21 +344,7 @@ impl<L: PageLoader> BTree<L> {
             }
             drop(guard);
         }
-        *self.root_block.lock() = new_root_block;
         Ok(())
-    }
-
-    fn read_level(&self, block: BlockNumber) -> Result<u16, BTreeError> {
-        let guard = self.pool.get_page(self.page_id(block))?;
-        let level;
-        {
-            let r = guard.read();
-            let meta = NodeMeta::read_from(&r)?;
-            level = meta.level;
-            drop(r);
-        }
-        drop(guard);
-        Ok(level)
     }
 
     fn insert_into_internal(

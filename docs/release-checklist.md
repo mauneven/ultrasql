@@ -44,6 +44,7 @@ Driver certification evidence includes stock psql meta-commands `\d`, `\dt`,
 pgAdmin, DBeaver, and DataGrip schema-browser catalog query families; Flyway,
 Liquibase, and Alembic migration version-table runs in nontransactional DDL
 mode; it is stored as `target/driver-certification.json` and uploaded by CI.
+Before final release sign-off, record the latest green CI workflow run id.
 
 ## Release artifact gate
 
@@ -56,12 +57,20 @@ Pushing a `vX.Y.Z` tag runs `.github/workflows/release.yml`. The workflow:
 - runs binary smoke checks (`--version` / `--help`) before packaging,
 - publishes Linux x86_64, Linux ARM64, macOS Intel, macOS Apple Silicon, and
   Windows x86_64 archives,
+- publishes `ghcr.io/mauneven/ultrasql:<tag>` from the Dockerfile,
+- builds Debian/Ubuntu `.deb` packages and `.rpm` packages with nFPM,
+- renders a Homebrew formula from the macOS archive checksums,
 - uploads per-asset `.sha256` files plus `SHASUMS256.txt`,
+- validates `operator-reports/*.json` with
+  `scripts/validate-operator-soak.py --strict`,
+- renders `RELEASE_NOTES.md` from `docs/release-notes-template.md`,
 - marks `v0.*` releases as pre-releases.
 
 Install instructions live in `docs/install.md`. The release workflow provides
 distribution plumbing only; it does not override any open correctness,
 benchmark, security, or operator-soak gate in this checklist.
+Before final release sign-off, record the release workflow run id and the
+published GitHub release notes URL.
 
 ## Nightly/manual gate
 
@@ -69,6 +78,7 @@ Run on schedule or by `workflow_dispatch`:
 
 ```bash
 benchmarks/certify.sh full
+benchmarks/chaos_recovery.sh full
 cargo bench --workspace
 cargo +nightly fuzz run parser_fuzz -- -max_total_time=900 -rss_limit_mb=4096 -max_len=1024
 cargo +nightly miri test -p ultrasql-storage
@@ -78,7 +88,7 @@ The `bench`, `fuzz`, and `sanitizers` workflows own these slower gates. TPC-H,
 ClickBench, Firebolt Core, AI gauntlet, fuzz, and Miri evidence belongs here,
 not in the PR-critical path.
 
-## 69-74 Evidence Map
+## 69-83 Evidence Map
 
 | item | code | test | benchmark or reason | docs | artifact |
 | --- | --- | --- | --- | --- | --- |
@@ -89,16 +99,33 @@ not in the PR-critical path.
 | 73 CI split | `.github/workflows/ci.yml`, `bench.yml`, `fuzz.yml`, `sanitizers.yml` | `crates/ultrasql-bench/tests/release_hardening.rs` | PR smoke vs nightly/manual full gates | this file | GitHub Actions run ids |
 | 74 Release checklist | this file | `crates/ultrasql-bench/tests/release_hardening.rs` | no benchmark; release evidence index | `docs/release-checklist.md` | completed release issue or tag notes |
 | 75 Binary installers | `.github/workflows/release.yml`, `scripts/install.sh`, `scripts/install.ps1` | release workflow binary smoke checks | no benchmark; distribution integrity gate | `docs/install.md` | release archives + `.sha256` files |
+| 76 Chaos recovery | `benchmarks/chaos_recovery.sh` | `crates/ultrasql-bench/tests/release_hardening.rs` | random kill, WAL truncation, and safe disk-full simulation all recover | `docs/chaos-recovery.md` | `benchmarks/results/latest/chaos_recovery_manifest.json` |
+| 77 Docs site | `mkdocs.yml`, `.github/workflows/docs.yml` | `crates/ultrasql-bench/tests/release_hardening.rs` | no benchmark; documentation publication gate | `docs/packaging.md` | GitHub Pages deployment for `docs.ultrasql.org` |
+| 78 Docker image | `Dockerfile`, `.dockerignore`, `.github/workflows/release.yml` | `crates/ultrasql-bench/tests/release_hardening.rs` | no benchmark; release packaging gate | `docs/packaging.md` | GHCR image digest for `ghcr.io/mauneven/ultrasql:<tag>` |
+| 79 Homebrew formula | `packaging/homebrew/ultrasql.rb.in`, `scripts/render-homebrew-formula.sh` | `crates/ultrasql-bench/tests/release_hardening.rs` | no benchmark; release packaging gate | `docs/install.md` | rendered `ultrasql.rb` release asset |
+| 80 Deb/RPM packages | `packaging/nfpm.yaml.in`, `packaging/linux/*`, `.github/workflows/release.yml` | `crates/ultrasql-bench/tests/release_hardening.rs` | no benchmark; release packaging gate | `docs/install.md` | `.deb` and `.rpm` release assets |
+| 81 Operator soak reports | `scripts/validate-operator-soak.py`, `.github/workflows/operator-soak.yml` | `crates/ultrasql-bench/tests/release_hardening.rs` | no benchmark; 30-day external operation gate | `docs/OPERATOR_SOAK.md`, `docs/operator-reports.md` | `benchmarks/results/latest/operator_soak_status.json` |
+| 82 Green CI/release workflows | `.github/workflows/ci.yml`, `.github/workflows/release.yml` | `crates/ultrasql-bench/tests/release_hardening.rs`, actionlint | no benchmark; release governance gate | this file | latest green CI workflow run id and release workflow run id |
+| 83 GitHub release notes | `docs/release-notes-template.md`, `scripts/render-release-notes.sh`, `.github/release.yml` | `crates/ultrasql-bench/tests/release_hardening.rs` | no benchmark; release communication gate | `CHANGELOG.md`, this file | rendered `RELEASE_NOTES.md` and GitHub release notes URL |
 
 ## Sign-off rule
 
 Before tagging v1.0, attach:
 
 - latest `ci-passed` run id,
+- latest green CI workflow run id,
+- release workflow run id,
 - latest full benchmark certification manifest,
 - TPC-H SF10 and ClickBench artifacts or explicit setup-missing reasons,
 - Firebolt Core local artifacts or explicit Docker/setup-missing reasons,
 - AI/vector same-host pgvector certification artifact,
 - backup/restore smoke manifest,
+- chaos recovery manifest,
+- docs site deployment URL or failed-run reason,
+- Docker image digest,
+- Homebrew formula asset,
+- Debian and RPM package assets,
+- operator soak reports and `operator_soak_status.json`,
+- GitHub release notes URL,
 - security/ethics audit notes,
 - config docs hash or commit id.

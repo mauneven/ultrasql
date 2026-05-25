@@ -1,0 +1,27 @@
+class Ultrasql < Formula
+  desc "PostgreSQL-compatible OLTP+OLAP database in Rust"
+  homepage "https://ultrasql.org"
+  version "@VERSION@"
+  license "Apache-2.0 OR MIT"
+
+  on_macos do
+    on_arm do
+      url "https://github.com/mauneven/ultrasql/releases/download/v@VERSION@/ultrasql-v@VERSION@-aarch64-apple-darwin.tar.gz"
+      sha256 "@SHA256_DARWIN_ARM64@"
+    end
+
+    on_intel do
+      url "https://github.com/mauneven/ultrasql/releases/download/v@VERSION@/ultrasql-v@VERSION@-x86_64-apple-darwin.tar.gz"
+      sha256 "@SHA256_DARWIN_AMD64@"
+    end
+  end
+
+  def install
+    bin.install "ultrasqld", "ultrasql", "ultrasql-local"
+  end
+
+  test do
+    assert_match version.to_s, shell_output("#{bin}/ultrasqld --version")
+    assert_match "UltraSQL", shell_output("#{bin}/ultrasql-local --help")
+  end
+end

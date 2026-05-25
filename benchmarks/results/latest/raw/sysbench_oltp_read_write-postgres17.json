@@ -1,0 +1,23 @@
+{
+  "engine": "postgres17",
+  "workload": "sysbench_oltp_read_write",
+  "rows": 10000,
+  "connections": 32,
+  "warmup_secs": 1,
+  "duration_secs": 3,
+  "operations": 427820,
+  "reads": 213999,
+  "updates": 128250,
+  "inserts": 85571,
+  "throughput_per_sec": 142427.43953743874,
+  "p50_latency_us": 199.042,
+  "p95_latency_us": 428.5,
+  "p99_latency_us": 696.958,
+  "correctness": {
+    "passed": true,
+    "expected_row_count": 123134,
+    "actual_row_count": 123134,
+    "warmup_inserts": 27563,
+    "measured_inserts": 85571
+  }
+}

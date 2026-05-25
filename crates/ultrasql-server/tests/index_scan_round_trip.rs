@@ -65,6 +65,29 @@ async fn preload(client: &tokio_postgres::Client, table: &str, n_rows: i32) {
     client.batch_execute(&sql).await.expect("preload");
 }
 
+/// Insert sysbench-like `(id, k, c, pad)` rows into `table_name`.
+async fn preload_sysbench_like(client: &tokio_postgres::Client, table: &str, n_rows: i32) {
+    client
+        .batch_execute(&format!(
+            "CREATE TABLE {table} \
+             (id INT NOT NULL, k INT NOT NULL, c TEXT NOT NULL, pad TEXT NOT NULL)"
+        ))
+        .await
+        .expect("create sysbench-like table");
+    let mut sql = String::with_capacity(usize::try_from(n_rows).unwrap_or(0) * 32 + 96);
+    sql.push_str("INSERT INTO ");
+    sql.push_str(table);
+    sql.push_str(" (id, k, c, pad) VALUES ");
+    for j in 0..n_rows {
+        if j > 0 {
+            sql.push(',');
+        }
+        let k = j.wrapping_mul(17) % 1_000_000;
+        sql.push_str(&format!("({j}, {k}, 'c{j}', 'pad{j}')"));
+    }
+    client.batch_execute(&sql).await.expect("preload");
+}
+
 fn rows_first_col(rows: &[tokio_postgres::SimpleQueryMessage]) -> Vec<String> {
     rows.iter()
         .filter_map(|m| match m {
@@ -396,6 +419,108 @@ async fn update_non_key_column_after_create_index_updates_btree_tid() {
         })
         .collect();
     assert_eq!(vals, vec![777]);
+
+    graceful_shutdown(running).await;
+}
+
+/// Repeated non-key updates on an indexed predicate must keep replacing the
+/// B-tree TID. A single update used to pass while the second lookup could
+/// follow the key to a dead heap version and return no rows.
+#[tokio::test]
+async fn repeated_non_key_update_after_create_index_keeps_point_lookup_alive() {
+    let running = start_sample_server("index_scan_test").await;
+    let client = &running.client;
+    preload(client, "t_update_indexed_repeat", 1000).await;
+    client
+        .batch_execute("CREATE INDEX ix_t_update_indexed_repeat_id ON t_update_indexed_repeat(id)")
+        .await
+        .expect("create index");
+
+    for expected in [281, 282] {
+        client
+            .batch_execute("UPDATE t_update_indexed_repeat SET val = val + 1 WHERE id = 28")
+            .await
+            .expect("indexed-table UPDATE");
+
+        let rows = client
+            .simple_query("SELECT val FROM t_update_indexed_repeat WHERE id = 28")
+            .await
+            .expect("query updated row through index");
+        let vals: Vec<i32> = rows
+            .iter()
+            .filter_map(|m| match m {
+                tokio_postgres::SimpleQueryMessage::Row(r) => r.get(0)?.parse::<i32>().ok(),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(vals, vec![expected]);
+    }
+
+    graceful_shutdown(running).await;
+}
+
+/// Sysbench read/write mixes point updates and high-key inserts. This locks
+/// the first deterministic single-client prefix that made an untouched key
+/// disappear from a unique index lookup.
+#[tokio::test]
+async fn sysbench_like_dml_prefix_keeps_untouched_point_lookup_alive() {
+    let running = start_sample_server("index_scan_test").await;
+    let client = &running.client;
+    preload_sysbench_like(client, "t_sysbench_prefix", 1000).await;
+    client
+        .batch_execute("CREATE UNIQUE INDEX ix_t_sysbench_prefix_id ON t_sysbench_prefix(id)")
+        .await
+        .expect("create index");
+
+    for (step, sql) in [
+        "UPDATE t_sysbench_prefix SET k = k + 1 WHERE id = 932",
+        "UPDATE t_sysbench_prefix SET k = k + 1 WHERE id = 323",
+        "UPDATE t_sysbench_prefix SET k = k + 1 WHERE id = 485",
+        "UPDATE t_sysbench_prefix SET k = k + 1 WHERE id = 396",
+        "UPDATE t_sysbench_prefix SET k = k + 1 WHERE id = 873",
+        "UPDATE t_sysbench_prefix SET k = k + 1 WHERE id = 283",
+        "INSERT INTO t_sysbench_prefix (id, k, c, pad) VALUES (1000001000, 235155926, 'c1000001000', 'pad1000001000')",
+        "UPDATE t_sysbench_prefix SET k = k + 1 WHERE id = 299",
+        "INSERT INTO t_sysbench_prefix (id, k, c, pad) VALUES (1000001001, -1322918395, 'c1000001001', 'pad1000001001')",
+        "UPDATE t_sysbench_prefix SET k = k + 1 WHERE id = 489",
+        "INSERT INTO t_sysbench_prefix (id, k, c, pad) VALUES (1000001002, 1885956909, 'c1000001002', 'pad1000001002')",
+        "UPDATE t_sysbench_prefix SET k = k + 1 WHERE id = 213",
+        "INSERT INTO t_sysbench_prefix (id, k, c, pad) VALUES (1000001003, -1403475000, 'c1000001003', 'pad1000001003')",
+        "INSERT INTO t_sysbench_prefix (id, k, c, pad) VALUES (1000001004, 1780127685, 'c1000001004', 'pad1000001004')",
+        "UPDATE t_sysbench_prefix SET k = k + 1 WHERE id = 454",
+        "UPDATE t_sysbench_prefix SET k = k + 1 WHERE id = 108",
+        "INSERT INTO t_sysbench_prefix (id, k, c, pad) VALUES (1000001005, 405047199, 'c1000001005', 'pad1000001005')",
+        "UPDATE t_sysbench_prefix SET k = k + 1 WHERE id = 990",
+        "UPDATE t_sysbench_prefix SET k = k + 1 WHERE id = 641",
+        "INSERT INTO t_sysbench_prefix (id, k, c, pad) VALUES (1000001006, -1586892587, 'c1000001006', 'pad1000001006')",
+        "UPDATE t_sysbench_prefix SET k = k + 1 WHERE id = 190",
+        "INSERT INTO t_sysbench_prefix (id, k, c, pad) VALUES (1000001007, -1672241594, 'c1000001007', 'pad1000001007')",
+        "INSERT INTO t_sysbench_prefix (id, k, c, pad) VALUES (1000001008, -1743059325, 'c1000001008', 'pad1000001008')",
+        "UPDATE t_sysbench_prefix SET k = k + 1 WHERE id = 576",
+        "INSERT INTO t_sysbench_prefix (id, k, c, pad) VALUES (1000001009, 781756086, 'c1000001009', 'pad1000001009')",
+        "INSERT INTO t_sysbench_prefix (id, k, c, pad) VALUES (1000001010, 1479574444, 'c1000001010', 'pad1000001010')",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        client.batch_execute(sql).await.expect("apply DML prefix");
+        let rows = client
+            .simple_query("SELECT k FROM t_sysbench_prefix WHERE id = 28")
+            .await
+            .expect("query untouched indexed row during DML prefix");
+        assert_eq!(
+            rows_first_col(&rows),
+            vec!["476".to_string()],
+            "lost indexed row after prefix step {}: {sql}",
+            step + 1
+        );
+    }
+
+    let rows = client
+        .simple_query("SELECT k FROM t_sysbench_prefix WHERE id = 28")
+        .await
+        .expect("query untouched indexed row");
+    assert_eq!(rows_first_col(&rows), vec!["476".to_string()]);
 
     graceful_shutdown(running).await;
 }

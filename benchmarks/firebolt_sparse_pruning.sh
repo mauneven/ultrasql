@@ -445,6 +445,7 @@ for engine in "${REQUESTED_ENGINES[@]}"; do
     run_engine "$engine"
 done
 
+set +e
 python3 - "$PROFILE" "$ENGINES" "$ROWS" "$WARMUP" "$ITERS" "$MANIFEST" "$STATUS_FILE" <<'PY'
 import json
 import pathlib
@@ -464,8 +465,38 @@ for line in pathlib.Path(status_path).read_text(encoding="utf-8").splitlines():
         }
     )
 
+def load_artifact(entry):
+    try:
+        return json.loads(pathlib.Path(entry["artifact"]).read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+
+artifacts = {entry["engine"]: load_artifact(entry) for entry in entries}
+ultrasql = artifacts.get("ultrasql") or {}
+firebolt = artifacts.get("firebolt") or {}
+ultrasql_median_us = ultrasql.get("median_us")
+firebolt_median_us = firebolt.get("median_us")
+firebolt_pruning_evidence = bool(firebolt.get("primary_index_pruning_evidence"))
+both_measured = (
+    ultrasql.get("status") == "measured"
+    and firebolt.get("status") == "measured"
+)
+target_ratio = None
+if (
+    both_measured
+    and isinstance(ultrasql_median_us, (int, float))
+    and isinstance(firebolt_median_us, (int, float))
+    and firebolt_median_us > 0
+):
+    target_ratio = ultrasql_median_us / firebolt_median_us
+target_ready = target_ratio is not None and firebolt_pruning_evidence
+target_passed = target_ready and target_ratio <= 0.5
 has_failed = any(entry["status"] == "failed" for entry in entries)
 has_unavailable = any(entry["status"] == "unavailable" for entry in entries)
+reason = None
+if not target_passed:
+    reason = "target_not_met" if target_ready else "missing_required_engine_results"
+status = "passed" if target_passed else "failed" if has_failed or target_ready else "partial"
 doc = {
     "schema_version": 1,
     "suite": "firebolt_sparse_pruning",
@@ -475,23 +506,32 @@ doc = {
     "warmup": int(warmup),
     "iters": int(iters),
     "generated_at_unix": int(time.time()),
-    "status": "failed" if has_failed else "partial" if has_unavailable else "passed",
-    "passed": not has_failed and not has_unavailable,
+    "status": status,
+    "passed": target_passed,
+    "reason": reason,
+    "both_engines_measured": both_measured,
+    "primary_index_pruning_evidence_required": True,
+    "firebolt_primary_index_pruning_evidence": firebolt_pruning_evidence,
+    "target_max_ratio_ultrasql_vs_firebolt": 0.5,
+    "target_ratio_ultrasql_vs_firebolt": target_ratio,
+    "ultrasql_median_us": ultrasql_median_us,
+    "firebolt_median_us": firebolt_median_us,
     "engines": entries,
     "policy": (
-        "No Firebolt sparse-pruning benchmark claim exists unless Firebolt "
-        "has a measured local Core artifact and EXPLAIN shows primary-index "
-        "pruning evidence."
+        "UltraSQL median latency at most half of Firebolt is required for "
+        "certification. No Firebolt sparse-pruning benchmark claim exists "
+        "unless Firebolt has a measured local Core artifact and EXPLAIN "
+        "shows primary-index pruning evidence."
     ),
 }
 pathlib.Path(manifest_path).write_text(json.dumps(doc, indent=2) + "\n", encoding="utf-8")
 print(json.dumps(doc, indent=2))
+if target_passed:
+    sys.exit(0)
+if has_failed or target_ready:
+    sys.exit(1)
+sys.exit(2)
 PY
-
-if (( failed != 0 )); then
-    exit 1
-fi
-if (( unavailable != 0 )); then
-    exit 2
-fi
-exit 0
+manifest_status=$?
+set -e
+exit "$manifest_status"

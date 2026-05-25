@@ -35,6 +35,14 @@ and must document the break here.
   Hermitage PostgreSQL scenarios, and explicit relation-level SSI honesty notes.
 - Reproducible benchmark scripts and result artifacts for PostgreSQL, DuckDB,
   SQLite, ClickHouse, and local Firebolt Core where available.
+- Same-host sysbench-style OLTP read/write certification runner with
+  PostgreSQL 17 comparison artifacts and non-certifying UltraSQL smoke mode.
+- Chaos recovery harness for random kill, WAL truncation, and safe disk-full
+  recovery evidence.
+- Packaging surface for docs site publication, GHCR Docker images, Homebrew
+  formula rendering, and Debian/RPM packages.
+- Final release evidence gates for 30-day operator reports, strict release
+  workflow validation, and rendered GitHub release notes.
 - Tagged release workflow for Linux, macOS, and Windows binary archives with
   checksum artifacts.
 
@@ -52,6 +60,22 @@ and must document the break here.
   OrderStatus, Delivery, and StockLevel, plus same-host PostgreSQL 17
   comparison artifacts. Correctness is verified, but the 2x throughput target
   remains open.
+- Sysbench OLTP certification now reports correctness for both engines and an
+  honest target failure rather than publishing the older UltraSQL-only latency
+  smoke as a competitor result.
+- ClickBench certification now has a local ClickHouse runner path, concrete
+  setup-failure reasons, and explicit UltraSQL/PostgreSQL target-ratio fields.
+- Firebolt sparse primary-index pruning now treats the manifest as the
+  certification gate, requiring both measured engines, Firebolt pruning
+  evidence, and `target_ratio_ultrasql_vs_firebolt <= 0.5`.
+
+### Fixed
+
+- B-tree root splits keep the persisted root block stable and reopened B-tree
+  handles seed allocation above resident pages, preserving indexed point
+  lookups after sysbench-style indexed DML churn.
+- `ultrasql validate` no longer mis-decodes internal `pg_catalog` heap rows as
+  SQL user rows during heap-visibility checks.
 
 ### Known gaps
 

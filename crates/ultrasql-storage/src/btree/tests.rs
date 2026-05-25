@@ -273,6 +273,76 @@ fn two_level_splits_force_inner_node_split() {
 }
 
 #[test]
+fn delete_reinsert_and_high_key_insert_preserve_low_key_lookup() {
+    let mut tree = make_tree();
+    let mut current_tids: Vec<TupleId> = Vec::with_capacity(1000);
+    for i in 0_i64..1000 {
+        let block = u32::try_from(i).expect("fits in u32");
+        let tuple = tid(block, 0);
+        tree.insert::<i64>(i, tuple, Xid::new(1), None).unwrap();
+        current_tids.push(tuple);
+    }
+
+    let mut next_block = 2_000_u32;
+    for (step, op) in [
+        Ok(932_i64),
+        Ok(323),
+        Ok(485),
+        Ok(396),
+        Ok(873),
+        Ok(283),
+        Err(1_000_001_000_i64),
+        Ok(299),
+        Err(1_000_001_001),
+        Ok(489),
+        Err(1_000_001_002),
+        Ok(213),
+        Err(1_000_001_003),
+        Err(1_000_001_004),
+        Ok(454),
+        Ok(108),
+        Err(1_000_001_005),
+        Ok(990),
+        Ok(641),
+        Err(1_000_001_006),
+        Ok(190),
+        Err(1_000_001_007),
+        Err(1_000_001_008),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        match op {
+            Ok(key) => {
+                let idx = usize::try_from(key).expect("positive test key");
+                let old_tid = current_tids[idx];
+                let new_tid = tid(next_block, 0);
+                next_block += 1;
+                assert!(
+                    tree.delete_logged::<i64>(key, old_tid, Xid::new(2), None)
+                        .unwrap(),
+                    "delete old key {key} at step {}",
+                    step + 1
+                );
+                tree.insert::<i64>(key, new_tid, Xid::new(2), None).unwrap();
+                current_tids[idx] = new_tid;
+            }
+            Err(key) => {
+                tree.insert::<i64>(key, tid(next_block, 0), Xid::new(3), None)
+                    .unwrap();
+                next_block += 1;
+            }
+        }
+        assert_eq!(
+            tree.lookup::<i64>(28).unwrap(),
+            Some(current_tids[28]),
+            "lookup(28) failed after step {}",
+            step + 1
+        );
+    }
+}
+
+#[test]
 fn concurrent_readers_all_succeed() {
     let mut tree = make_tree();
     for i in 0_i64..500 {

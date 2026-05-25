@@ -25,7 +25,10 @@ FIREBOLT_CORE_HELPER="${FIREBOLT_CORE_HELPER:-benchmarks/firebolt_core_local.sh}
 POSTGRES_DSN="${POSTGRES_DSN:-}"
 ULTRASQL_DSN="${ULTRASQL_DSN:-}"
 CLICKBENCH_ENGINES="${CLICKBENCH_ENGINES:-postgres,ultrasql,duckdb,clickhouse,firebolt}"
+CURL_BIN="${CLICKBENCH_CURL:-$(command -v curl || command -v /usr/bin/curl || true)}"
 DUCKDB_BIN="${CLICKBENCH_DUCKDB:-$(command -v duckdb || true)}"
+CLICKHOUSE_BIN="${CLICKBENCH_CLICKHOUSE:-$(command -v clickhouse-client || true)}"
+CLICKHOUSE_ARGS="${CLICKBENCH_CLICKHOUSE_ARGS:-}"
 RUNS="${CLICKBENCH_RUNS:-3}"
 ALLOW_PARTIAL="${CLICKBENCH_ALLOW_PARTIAL:-0}"
 OUT_DIR="${BENCH_CERT_OUT_DIR:-benchmarks/results/latest}"
@@ -40,9 +43,12 @@ FIREBOLT_OUT="$RAW_DIR/clickbench-firebolt.json"
 mkdir -p "$CLICKBENCH_WORK" "$OUT_DIR" "$RAW_DIR"
 
 base="https://raw.githubusercontent.com/ClickHouse/ClickBench/$CLICKBENCH_REF/postgresql"
+clickhouse_base="https://raw.githubusercontent.com/ClickHouse/ClickBench/$CLICKBENCH_REF/clickhouse"
 firebolt_base="https://raw.githubusercontent.com/ClickHouse/ClickBench/$CLICKBENCH_REF/firebolt"
 schema="$CLICKBENCH_WORK/create.sql"
 queries="$CLICKBENCH_WORK/queries.sql"
+clickhouse_schema="$CLICKBENCH_WORK/clickhouse_create.sql"
+clickhouse_queries="$CLICKBENCH_WORK/clickhouse_queries.sql"
 firebolt_schema="$CLICKBENCH_WORK/firebolt_create.sql"
 firebolt_queries="$CLICKBENCH_WORK/firebolt_queries.sql"
 
@@ -54,7 +60,7 @@ engine_requested() {
 }
 
 needs_tsv_dataset() {
-    engine_requested postgres || engine_requested ultrasql || engine_requested duckdb
+    engine_requested postgres || engine_requested ultrasql || engine_requested duckdb || engine_requested clickhouse
 }
 
 needs_psql() {
@@ -175,6 +181,13 @@ doc = {
     "requested_engines": [engine for engine in engines.split(",") if engine],
     "passed": False,
     "reason": reason,
+    "status": "partial",
+    "comparison_ready": False,
+    "target_max_ratio_ultrasql_vs_postgres": 0.2,
+    "target_ratio_ultrasql_vs_postgres": None,
+    "speedup_vs_postgres": None,
+    "postgres_geomean_ms": None,
+    "ultrasql_geomean_ms": None,
     "detail": detail,
     "dataset": dataset,
     "postgres_dsn_set": bool(pg_dsn),
@@ -196,17 +209,27 @@ print(json.dumps(doc, indent=2))
 PY
 }
 
-curl -L --fail --silent "$base/create.sql" -o "$schema"
-curl -L --fail --silent "$base/queries.sql" -o "$queries"
+if [[ -z "$CURL_BIN" ]]; then
+    write_failure_summary "curl_missing" "curl must be available on PATH or set CLICKBENCH_CURL=/path/to/curl."
+    echo "curl missing. Install curl or set CLICKBENCH_CURL." >&2
+    exit 2
+fi
+
+"$CURL_BIN" -L --fail --silent "$base/create.sql" -o "$schema"
+"$CURL_BIN" -L --fail --silent "$base/queries.sql" -o "$queries"
+if engine_requested clickhouse; then
+    "$CURL_BIN" -L --fail --silent "$clickhouse_base/create.sql" -o "$clickhouse_schema"
+    "$CURL_BIN" -L --fail --silent "$clickhouse_base/queries.sql" -o "$clickhouse_queries"
+fi
 if engine_requested firebolt; then
-    curl -L --fail --silent "$firebolt_base/create.sql" -o "$firebolt_schema"
-    curl -L --fail --silent "$firebolt_base/queries.sql" -o "$firebolt_queries"
+    "$CURL_BIN" -L --fail --silent "$firebolt_base/create.sql" -o "$firebolt_schema"
+    "$CURL_BIN" -L --fail --silent "$firebolt_base/queries.sql" -o "$firebolt_queries"
 fi
 
 if needs_tsv_dataset && [[ ! -f "$CLICKBENCH_TSV" ]]; then
     if [[ "${CLICKBENCH_DOWNLOAD:-0}" == "1" ]]; then
         mkdir -p "$(dirname "$CLICKBENCH_TSV")"
-        curl -L --fail "https://datasets.clickhouse.com/hits_compatible/hits.tsv.gz" \
+        "$CURL_BIN" -L --fail "https://datasets.clickhouse.com/hits_compatible/hits.tsv.gz" \
             | gunzip > "$CLICKBENCH_TSV"
     else
         write_failure_summary "dataset_missing" "Set CLICKBENCH_DOWNLOAD=1 or CLICKBENCH_TSV=/path/to/hits.tsv."
@@ -223,7 +246,7 @@ fi
 
 if engine_requested firebolt && [[ ! -f "$CLICKBENCH_PARQUET" && "${CLICKBENCH_DOWNLOAD_PARQUET:-0}" == "1" ]]; then
     mkdir -p "$(dirname "$CLICKBENCH_PARQUET")"
-    curl -L --fail "https://datasets.clickhouse.com/hits_compatible/hits.parquet" \
+    "$CURL_BIN" -L --fail "https://datasets.clickhouse.com/hits_compatible/hits.parquet" \
         -o "$CLICKBENCH_PARQUET"
 fi
 
@@ -237,12 +260,13 @@ if [[ "$ALLOW_PARTIAL" != "1" && ( -z "$POSTGRES_DSN" || -z "$ULTRASQL_DSN" ) ]]
     echo "ClickBench missing PostgreSQL-wire DSN; runner will emit not_available artifacts for those engines." >&2
 fi
 
-python3 - "$schema" "$queries" "$CLICKBENCH_TSV" "$RUNS" "$POSTGRES_DSN" "$ULTRASQL_DSN" "$SUMMARY_OUT" "$RAW_DIR" "$CLICKBENCH_REF" "$CLICKBENCH_ENGINES" "$DUCKDB_BIN" "$firebolt_schema" "$firebolt_queries" "$CLICKBENCH_PARQUET" "$FIREBOLT_CORE_HELPER" "$FIREBOLT_CORE_ENDPOINT" "$FIREBOLT_CORE_IMAGE" "$FIREBOLT_CORE_DATA_DIR" <<'PY'
+python3 - "$schema" "$queries" "$CLICKBENCH_TSV" "$RUNS" "$POSTGRES_DSN" "$ULTRASQL_DSN" "$SUMMARY_OUT" "$RAW_DIR" "$CLICKBENCH_REF" "$CLICKBENCH_ENGINES" "$DUCKDB_BIN" "$clickhouse_schema" "$clickhouse_queries" "$CLICKHOUSE_BIN" "$CLICKHOUSE_ARGS" "$firebolt_schema" "$firebolt_queries" "$CLICKBENCH_PARQUET" "$FIREBOLT_CORE_HELPER" "$FIREBOLT_CORE_ENDPOINT" "$FIREBOLT_CORE_IMAGE" "$FIREBOLT_CORE_DATA_DIR" <<'PY'
 import json
 import math
 import os
 import pathlib
 import platform
+import shlex
 import statistics
 import subprocess
 import sys
@@ -263,6 +287,10 @@ import urllib.request
     upstream_ref,
     engines_raw,
     duckdb_bin,
+    clickhouse_schema_path,
+    clickhouse_queries_path,
+    clickhouse_bin,
+    clickhouse_args_raw,
     firebolt_schema_path,
     firebolt_queries_path,
     firebolt_parquet_path,
@@ -275,6 +303,8 @@ runs = int(runs_raw)
 queries = [q.strip() for q in pathlib.Path(queries_path).read_text().split(";") if q.strip()]
 schema = pathlib.Path(schema_path).read_text()
 data_path = pathlib.Path(data_path)
+clickhouse_schema_path = pathlib.Path(clickhouse_schema_path)
+clickhouse_queries_path = pathlib.Path(clickhouse_queries_path)
 firebolt_schema_path = pathlib.Path(firebolt_schema_path)
 firebolt_queries_path = pathlib.Path(firebolt_queries_path)
 firebolt_parquet_path = pathlib.Path(firebolt_parquet_path)
@@ -464,6 +494,89 @@ def run_duckdb():
     doc["samples"] = runs
     return doc
 
+def clickhouse_command():
+    if not clickhouse_bin:
+        return None
+    return [clickhouse_bin, *shlex.split(clickhouse_args_raw)]
+
+def clickhouse_exec(sql, *, stdin=None, multiquery=False):
+    cmd = clickhouse_command()
+    if cmd is None:
+        raise FileNotFoundError("clickhouse-client")
+    if multiquery:
+        cmd.append("--multiquery")
+    cmd.extend(["--query", sql])
+    return subprocess.run(
+        cmd,
+        stdin=stdin,
+        text=False if stdin is not None else True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=True,
+    )
+
+def run_clickhouse():
+    if not clickhouse_bin:
+        return not_available(
+            "clickhouse",
+            "clickhouse_client_missing",
+            "clickhouse-client binary not found on PATH; set CLICKBENCH_CLICKHOUSE=/path/to/clickhouse-client.",
+        )
+    if not clickhouse_schema_path.exists() or not clickhouse_queries_path.exists():
+        return not_available(
+            "clickhouse",
+            "clickbench_clickhouse_sql_missing",
+            "Pinned upstream clickhouse/create.sql or clickhouse/queries.sql was not downloaded.",
+        )
+
+    ch_schema = clickhouse_schema_path.read_text(encoding="utf-8")
+    ch_queries = [
+        q.strip()
+        for q in clickhouse_queries_path.read_text(encoding="utf-8").split(";")
+        if q.strip()
+    ]
+    try:
+        clickhouse_exec("DROP TABLE IF EXISTS hits")
+        clickhouse_exec(ch_schema, multiquery=True)
+        with data_path.open("rb") as input_file:
+            clickhouse_exec("INSERT INTO hits FORMAT TSV", stdin=input_file)
+        clickhouse_exec("OPTIMIZE TABLE hits FINAL")
+    except (OSError, subprocess.CalledProcessError) as exc:
+        stderr = getattr(exc, "stderr", None)
+        detail = stderr.decode("utf-8", errors="replace") if isinstance(stderr, bytes) else stderr
+        return not_available(
+            "clickhouse",
+            "clickhouse_load_failed",
+            (detail or str(exc)).strip(),
+        )
+
+    q_results = []
+    for idx, query in enumerate(ch_queries, start=1):
+        samples = []
+        error = None
+        for _ in range(runs):
+            start = time.perf_counter()
+            try:
+                clickhouse_exec(query)
+            except subprocess.CalledProcessError as exc:
+                stderr = exc.stderr.decode("utf-8", errors="replace") if isinstance(exc.stderr, bytes) else exc.stderr
+                error = (stderr or str(exc)).strip()
+                break
+            samples.append((time.perf_counter() - start) * 1000.0)
+        q_results.append({
+            "query": idx,
+            "median_ms": statistics.median(samples) if samples else None,
+            "runs_ms": samples,
+            "error": error,
+        })
+    doc = artifact_base("clickhouse", "measured")
+    doc["queries"] = q_results
+    doc["query_count"] = len(ch_queries)
+    doc["samples"] = runs
+    doc["client"] = clickhouse_bin
+    doc["client_args"] = shlex.split(clickhouse_args_raw)
+    return doc
+
 def firebolt_formatted_endpoint() -> str:
     separator = "&" if urllib.parse.urlparse(firebolt_endpoint).query else "?"
     return f"{firebolt_endpoint}{separator}output_format=JSON_Compact"
@@ -636,11 +749,7 @@ elif "ultrasql" in requested_engines:
 if "duckdb" in requested_engines:
     results.append(run_duckdb())
 if "clickhouse" in requested_engines:
-    results.append(not_available(
-        "clickhouse",
-        "runner_not_implemented_for_engine",
-        "ClickHouse ClickBench local loader/query runner is not wired yet.",
-    ))
+    results.append(run_clickhouse())
 if "firebolt" in requested_engines:
     results.append(run_firebolt())
 if not results:
@@ -687,10 +796,13 @@ comparison_ready = (
     and pg["geomean_ms"] is not None
     and ul["geomean_ms"] is not None
 )
-passed = (
-    comparison_ready
-    and ul["geomean_ms"] * 5.0 <= pg["geomean_ms"]
-)
+target_ratio = ul["geomean_ms"] / pg["geomean_ms"] if comparison_ready else None
+passed = comparison_ready and target_ratio <= 0.2
+has_failed = any(r.get("status") == "failed" for r in results)
+has_unavailable = any(r.get("status") == "not_available" for r in results)
+reason = None
+if not passed:
+    reason = "target_not_met" if comparison_ready else "missing_required_engine_results"
 doc = {
     "schema_version": 1,
     "workload": "clickbench",
@@ -701,8 +813,14 @@ doc = {
     "target": "UltraSQL geometric mean at least 5x faster than PostgreSQL when both are measured; other requested engines publish measured or not_available artifacts",
     "requested_engines": requested_engines,
     "passed": passed,
+    "reason": reason,
     "comparison_ready": comparison_ready,
-    "status": "passed" if passed else "partial" if (not comparison_ready or any(r.get("status") == "not_available" for r in results)) else "failed",
+    "target_max_ratio_ultrasql_vs_postgres": 0.2,
+    "target_ratio_ultrasql_vs_postgres": target_ratio,
+    "speedup_vs_postgres": (pg["geomean_ms"] / ul["geomean_ms"]) if comparison_ready else None,
+    "postgres_geomean_ms": pg["geomean_ms"] if pg is not None else None,
+    "ultrasql_geomean_ms": ul["geomean_ms"] if ul is not None else None,
+    "status": "failed" if has_failed else "passed" if passed else "partial" if (not comparison_ready or has_unavailable) else "failed",
     "postgres_result": str(raw_dir / "clickbench-postgres17.json"),
     "ultrasql_result": str(raw_dir / "clickbench-ultrasql.json"),
     "duckdb_result": str(raw_dir / "clickbench-duckdb.json"),
@@ -713,11 +831,11 @@ doc = {
 }
 out_path.write_text(json.dumps(doc, indent=2) + "\n")
 print(json.dumps(doc, indent=2))
+if has_failed:
+    sys.exit(1)
 if passed:
     sys.exit(0)
-if any(r.get("status") == "failed" for r in results):
-    sys.exit(1)
-if not comparison_ready or any(r.get("status") == "not_available" for r in results):
+if not comparison_ready or has_unavailable:
     sys.exit(2)
 sys.exit(1)
 PY
