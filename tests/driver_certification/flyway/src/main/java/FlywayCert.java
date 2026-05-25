@@ -26,6 +26,8 @@ public final class FlywayCert {
                         .schemas("public")
                         .defaultSchema("public")
                         .createSchemas(false)
+                        .baselineOnMigrate(true)
+                        .baselineVersion("0")
                         .executeInTransaction(false)
                         .cleanDisabled(true)
                         .load();
@@ -44,7 +46,7 @@ public final class FlywayCert {
                     "flyway");
             assertCount(
                     stmt,
-                    "SELECT COUNT(*) FROM flyway_schema_history WHERE success = true",
+                    "SELECT COUNT(*) FROM flyway_schema_history WHERE success = true AND type = 'SQL'",
                     2);
         }
 
