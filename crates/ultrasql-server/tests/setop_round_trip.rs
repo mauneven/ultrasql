@@ -80,6 +80,17 @@ fn rows_to_i32_col(rows: &[tokio_postgres::SimpleQueryMessage], col: usize) -> V
         .collect()
 }
 
+/// Decode a `simple_query` result into the non-null strings from a
+/// selected column.
+fn rows_to_string_col(rows: &[tokio_postgres::SimpleQueryMessage], col: usize) -> Vec<String> {
+    rows.iter()
+        .filter_map(|m| match m {
+            tokio_postgres::SimpleQueryMessage::Row(row) => row.get(col).map(ToOwned::to_owned),
+            _ => None,
+        })
+        .collect()
+}
+
 /// Create a pair of tables `setop_l(id INT)` and `setop_r(id INT)`
 /// suffixed with `tag` so every test gets a fresh namespace. The same
 /// suffix scheme is used by the JOIN integration tests; it keeps tests
@@ -150,6 +161,31 @@ async fn union_all_keeps_every_row() {
     ids.sort_unstable();
     // 3 left rows + 3 right rows; all duplicates preserved.
     assert_eq!(ids, vec![1, 2, 2, 2, 3, 3]);
+
+    shutdown(client, server_handle).await;
+}
+
+/// `psql \d` emits set operations with repeated unnamed `NULL` output
+/// labels. PostgreSQL permits those duplicate result labels; binding
+/// must keep them ordinal-addressable instead of rejecting the schema.
+#[tokio::test]
+async fn union_all_allows_duplicate_unnamed_null_output_columns() {
+    let (client, _conn_handle, server_handle) = start_server_and_connect().await;
+    let (left, _) = create_setop_tables(&client, "dup_null").await;
+    insert_rows(&client, &left, &[1, 2]).await;
+
+    let rows = client
+        .simple_query(&format!(
+            "SELECT 'direct' AS pubname, NULL, NULL FROM {left} WHERE id = 1 \
+             UNION ALL \
+             SELECT 'all' AS pubname, NULL, NULL FROM {left} WHERE id = 2 \
+             ORDER BY 1"
+        ))
+        .await
+        .expect("duplicate unnamed NULL columns bind");
+    let mut names = rows_to_string_col(&rows, 0);
+    names.sort();
+    assert_eq!(names, vec!["all", "direct"]);
 
     shutdown(client, server_handle).await;
 }

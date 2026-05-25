@@ -710,8 +710,31 @@ pub fn batch_to_rows(batch: &Batch, schema: &Schema) -> Result<Vec<Vec<Value>>, 
         let is_null = |nulls: Option<&ultrasql_vec::bitmap::Bitmap>, i: usize| -> bool {
             nulls.is_some_and(|b| !b.get(i))
         };
+        let column_is_null = |column: &Column, i: usize| -> bool {
+            match column {
+                Column::Int32(c) => is_null(c.nulls(), i),
+                Column::Int64(c) => is_null(c.nulls(), i),
+                Column::Float32(c) => is_null(c.nulls(), i),
+                Column::Float64(c) => is_null(c.nulls(), i),
+                Column::Bool(c) => is_null(c.nulls(), i),
+                Column::Utf8(c) => is_null(c.nulls(), i),
+                Column::DictionaryUtf8(c) => is_null(c.codes.nulls(), i),
+            }
+        };
         let storage_type = field.data_type.storage_type();
         match (col, storage_type) {
+            (_, DataType::Null) => {
+                for (row_idx, row) in rows.iter_mut().enumerate() {
+                    if column_is_null(col, row_idx) {
+                        row.push(Value::Null);
+                    } else {
+                        return Err(ExecError::TypeMismatch(format!(
+                            "column {col_idx} ({name}): expected NULL at row {row_idx}",
+                            name = field.name,
+                        )));
+                    }
+                }
+            }
             (Column::Int32(c), DataType::Int16) => {
                 let nulls = c.nulls();
                 for (row_idx, row) in rows.iter_mut().enumerate() {

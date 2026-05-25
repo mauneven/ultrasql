@@ -842,6 +842,20 @@ pub fn build_batch(rows: &[Vec<Value>], schema: &Schema) -> Result<Batch, ExecEr
         let field = schema.field_at(col_idx);
         let storage_type = field.data_type.storage_type();
         let col = match storage_type {
+            DataType::Null => {
+                for (row_idx, row) in rows.iter().enumerate() {
+                    if !matches!(row[col_idx], Value::Null) {
+                        return Err(ExecError::TypeMismatch(format!(
+                            "expected NULL at row {row_idx} col {col_idx}, got {:?}",
+                            row[col_idx].data_type()
+                        )));
+                    }
+                }
+                Column::Int32(
+                    NumericColumn::with_nulls(vec![0_i32; n_rows], Bitmap::new(n_rows, false))
+                        .map_err(|e| ExecError::TypeMismatch(e.to_string()))?,
+                )
+            }
             DataType::Bool => {
                 let mut data: Vec<bool> = Vec::with_capacity(n_rows);
                 for (row_idx, row) in rows.iter().enumerate() {

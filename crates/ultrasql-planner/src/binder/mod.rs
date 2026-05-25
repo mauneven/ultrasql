@@ -662,8 +662,7 @@ fn bind_set_op(
             Ok(Field::nullable(lf.name.clone(), out_ty))
         })
         .collect();
-    let schema =
-        Schema::new(fields?).map_err(|e| PlanError::TypeMismatch(format!("set op schema: {e}")))?;
+    let schema = Schema::new_with_duplicate_names(fields?);
 
     let logical_op = match op {
         SetOp::Union => LogicalSetOp::Union,
