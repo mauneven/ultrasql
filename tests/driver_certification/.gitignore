@@ -1,0 +1,7 @@
+__pycache__/
+node/node_modules/
+node/generated/
+dotnet/bin/
+dotnet/obj/
+diesel/target/
+hibernate/target/

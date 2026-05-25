@@ -631,6 +631,14 @@ impl Parser<'_> {
             let zone = self.expect(TokenKind::KwZone, "ZONE")?;
             name.value = format!("{} with time zone", name.value);
             name.span = Span::new(name.span.start, zone.span.end);
+        } else if matches!(name.value.as_str(), "time" | "timestamp")
+            && self.next_identifier_is("without")?
+        {
+            self.advance()?;
+            self.expect(TokenKind::KwTime, "TIME")?;
+            let zone = self.expect(TokenKind::KwZone, "ZONE")?;
+            name.value = format!("{} without time zone", name.value);
+            name.span = Span::new(name.span.start, zone.span.end);
         }
 
         // Optional type modifiers: `(255)`, `(10, 2)`, etc.
@@ -819,6 +827,28 @@ mod tests {
         let partition = stmt.partition_by.expect("partition spec");
         assert_eq!(partition.kind, TablePartitionKind::Range);
         assert_eq!(partition.column.value, "ts");
+    }
+
+    #[test]
+    fn create_table_parses_timestamp_without_time_zone() {
+        let stmt = parse_create_table(
+            "CREATE TABLE databasechangelog (dateexecuted TIMESTAMP WITHOUT TIME ZONE NOT NULL)",
+        );
+        assert_eq!(
+            stmt.columns[0].data_type.name.value,
+            "timestamp without time zone"
+        );
+        assert!(matches!(
+            stmt.columns[0].constraints[0],
+            ColumnConstraint::NotNull { .. }
+        ));
+    }
+
+    #[test]
+    fn create_table_accepts_locked_as_column_name() {
+        let stmt = parse_create_table("CREATE TABLE lock_table (LOCKED BOOLEAN NOT NULL)");
+        assert_eq!(stmt.columns[0].name.value, "locked");
+        assert_eq!(stmt.columns[0].data_type.name.value, "boolean");
     }
 
     #[test]

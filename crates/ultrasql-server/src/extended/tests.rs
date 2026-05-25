@@ -8,8 +8,8 @@ use super::params::walk_plan_exprs;
 use super::substitute::substitute_parameters_in_plan;
 use super::{ExtendedConnState, PG_OID_BOOL, PG_OID_INT4, PG_OID_INT8, PG_OID_TEXT};
 use crate::error::ServerError;
-use ultrasql_core::Value;
-use ultrasql_planner::{BinaryOp, InMemoryCatalog, ScalarExpr};
+use ultrasql_core::{DataType, Value};
+use ultrasql_planner::{BinaryOp, InMemoryCatalog, LogicalPlan, ScalarExpr};
 use ultrasql_protocol::{BackendMessage, DescribeKind};
 
 fn fixture_catalog() -> InMemoryCatalog {
@@ -152,6 +152,102 @@ fn substitute_simple_eq_predicate() {
         }
     });
     assert!(found, "Parameter not substituted into Filter predicate");
+}
+
+#[test]
+fn substitute_int16_parameter_matches_int32_column_predicate() {
+    // psycopg3/libpq may send small Python integers as binary int2 when
+    // the parse message leaves parameter types unspecified. The prepared
+    // plan still compares against an INT column, so substitution must widen
+    // the concrete literal before execution.
+    let catalog = fixture_catalog();
+    let mut state = ExtendedConnState::new();
+    let _ = handle_parse(
+        &mut state,
+        "s1".to_string(),
+        "SELECT id FROM users WHERE id = $1".to_string(),
+        vec![],
+        &catalog,
+    )
+    .expect("parse ok");
+    let stmt = state.statements.get("s1").unwrap();
+    assert_eq!(stmt.n_params, 1);
+
+    let sub = substitute_parameters_in_plan(stmt.plan.as_ref().unwrap(), &[Value::Int16(2)]);
+    let mut found = false;
+    walk_plan_exprs(&sub, &mut |e| {
+        if let ScalarExpr::Binary {
+            op: BinaryOp::Eq,
+            left,
+            right,
+            ..
+        } = e
+        {
+            match (left.as_ref(), right.as_ref()) {
+                (
+                    ScalarExpr::Column { .. },
+                    ScalarExpr::Literal {
+                        value: Value::Int32(2),
+                        ..
+                    },
+                )
+                | (
+                    ScalarExpr::Literal {
+                        value: Value::Int32(2),
+                        ..
+                    },
+                    ScalarExpr::Column { .. },
+                ) => found = true,
+                _ => {}
+            }
+        }
+    });
+    assert!(
+        found,
+        "Int16 parameter was not widened to Int32 predicate literal"
+    );
+}
+
+#[test]
+fn substitute_int16_parameter_matches_insert_target_column() {
+    // INSERT VALUES carries the target table schema after binding. When a
+    // driver supplies a narrower concrete integer at Bind time, the cell
+    // must still be widened to the destination column type.
+    let catalog = fixture_catalog();
+    let mut state = ExtendedConnState::new();
+    let _ = handle_parse(
+        &mut state,
+        "s1".to_string(),
+        "INSERT INTO users VALUES ($1, $2, $3)".to_string(),
+        vec![],
+        &catalog,
+    )
+    .expect("parse ok");
+    let stmt = state.statements.get("s1").unwrap();
+    assert_eq!(stmt.n_params, 3);
+
+    let sub = substitute_parameters_in_plan(
+        stmt.plan.as_ref().unwrap(),
+        &[
+            Value::Int16(4),
+            Value::Text("Alan".to_string()),
+            Value::Float64(1.5),
+        ],
+    );
+    let LogicalPlan::Insert { source, .. } = sub else {
+        panic!("expected Insert plan");
+    };
+    let LogicalPlan::Values { rows, schema } = source.as_ref() else {
+        panic!("expected Values source");
+    };
+    assert_eq!(schema.field_at(0).data_type, DataType::Int32);
+    assert!(matches!(
+        rows[0][0],
+        ScalarExpr::Literal {
+            value: Value::Int32(4),
+            data_type: DataType::Int32
+        }
+    ));
 }
 
 #[test]

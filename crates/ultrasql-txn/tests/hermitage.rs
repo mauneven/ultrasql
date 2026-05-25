@@ -1,7 +1,9 @@
 //! Hermitage anomaly test suite skeleton.
 //!
-//! Ports the eight canonical anomaly tests from Martin Kleppmann's
-//! [Hermitage](https://github.com/ept/hermitage) test suite:
+//! Ports the canonical anomaly names from Martin Kleppmann's
+//! [Hermitage](https://github.com/ept/hermitage) test suite. The pinned
+//! source commit and CC BY 4.0 attribution are recorded under
+//! `tests/isolation/`.
 //!
 //! | ID      | Name                          | PostgreSQL behavior      |
 //! |---------|-------------------------------|--------------------------|
@@ -19,11 +21,11 @@
 //! Each test drives [`TransactionManager`] directly. The "tuple visibility"
 //! assertions are proxied through the [`XidStatusOracle`] and snapshot
 //! visibility predicates rather than reading from a real heap. The
-//! canonical Hermitage assertions (read value X, see Y) need a real heap;
-//! until the executor-layer round-trip lands, these tests assert the
-//! *transactional outcome* (commit / abort, snapshot frozen / refreshed)
-//! rather than the data values, which is sufficient to detect every
-//! anomaly listed above except those that depend on observed read values.
+//! canonical Hermitage assertions (read value X, see Y) need a real heap.
+//! Server-level value assertions for the G1a, PMP, and G2 slices live in
+//! `crates/ultrasql-server/tests/isolation_suite_round_trip.rs`; the remaining
+//! manager-level tests assert transactional outcomes (commit / abort, snapshot
+//! frozen / refreshed).
 
 use std::sync::Arc;
 

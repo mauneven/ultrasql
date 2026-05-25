@@ -286,6 +286,63 @@ fn postgres_compat_subset_preserves_public_provenance() {
 }
 
 #[test]
+fn postgres_compat_parser_type_baseline_is_imported_and_provenanced() {
+    let subset = repo_root().join("tests/slt/postgres_compat/regression_subset");
+    let manifest =
+        fs::read_to_string(subset.join("IMPORT_MANIFEST.txt")).expect("read PostgreSQL manifest");
+    let readme = fs::read_to_string(subset.join("README.md")).expect("read PostgreSQL README");
+    let shard = subset.join("parser_type_baseline.slt");
+    let text = fs::read_to_string(&shard).expect("read parser/type baseline shard");
+
+    for source in [
+        "derived_from=src/test/regress/sql/char.sql",
+        "derived_from=src/test/regress/sql/varchar.sql",
+        "derived_from=src/test/regress/sql/numeric.sql",
+        "derived_from=src/test/regress/sql/type_sanity.sql",
+    ] {
+        assert!(manifest.contains(source), "manifest:\n{manifest}");
+    }
+    assert!(
+        manifest.contains("file=parser_type_baseline.slt"),
+        "manifest:\n{manifest}"
+    );
+    assert!(
+        readme.contains("parser_type_baseline.slt"),
+        "README:\n{readme}"
+    );
+    assert!(
+        text.contains("PostgreSQL regression-derived parser/type baseline"),
+        "{} must document reviewed scope",
+        shard.display()
+    );
+    for surface in [
+        "CHAR(4)",
+        "VARCHAR(5)",
+        "NUMERIC(6,2)",
+        "DECIMAL(5,1)",
+        "pg_typeof",
+        "::regtype",
+    ] {
+        assert!(
+            text.contains(surface),
+            "{} missing {surface}",
+            shard.display()
+        );
+    }
+    assert!(
+        text.contains("# ultrasql:skip full PostgreSQL type_sanity catalog invariant"),
+        "{} must keep catalog breadth debt explicit",
+        shard.display()
+    );
+    let case_count = count_slt_cases(&text);
+    assert!(
+        (10..=32).contains(&case_count),
+        "{} must stay as a small reviewed shard, got {case_count} cases",
+        shard.display()
+    );
+}
+
+#[test]
 fn skip_directive_requires_explicit_reason() {
     let bin = env!("CARGO_BIN_EXE_ultrasql-sqllogictest-runner");
     let suite = temp_artifact_path("ultrasql-slt-empty-skip", "test");

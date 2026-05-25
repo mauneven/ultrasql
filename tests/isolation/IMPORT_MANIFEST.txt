@@ -1,0 +1,11 @@
+suite=ultrasql-isolation
+file=acid.sql
+acid_sql_origin=UltraSQL-authored account-transfer baseline
+hermitage_source=https://github.com/ept/hermitage
+hermitage_commit=f029bec8e32af6a9506508638fdf74ef61286225
+hermitage_file=postgres.md
+license=CC-BY-4.0
+scenario=Hermitage PostgreSQL G1a dirty read
+scenario=Hermitage PostgreSQL PMP repeatable-read phantom
+scenario=Hermitage PostgreSQL G2 serializable write skew
+notes=Hermitage scenarios are ported to Rust wire-level tests with attribution; no upstream Markdown or SQL dump is vendored

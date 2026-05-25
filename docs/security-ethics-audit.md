@@ -45,7 +45,15 @@ benchmarks/firebolt_core_local.sh stop
 
 Portable SQLLogicTest imports must be public and license-reviewed. PostgreSQL
 regression subsets must come from public PostgreSQL tests with explicit skip
-reasons. SQLite TH3 and any proprietary corpus are forbidden.
+reasons. The current PostgreSQL regression subset records `select.sql`,
+`char.sql`, `varchar.sql`, `numeric.sql`, and `type_sanity.sql` provenance at a
+pinned public commit and keeps unsupported catalog invariants as visible skips.
+SQLite TH3 and any proprietary corpus are forbidden.
+
+Hermitage isolation scenarios are CC BY 4.0 and must keep attribution, pinned
+commit provenance, and local reviewer notes beside the tests. UltraSQL ports
+selected schedules into Rust integration tests instead of vendoring the upstream
+Markdown dump.
 
 ## Benchmark claims
 

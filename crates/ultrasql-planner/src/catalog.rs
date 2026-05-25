@@ -177,7 +177,7 @@ pub fn builtin_type_oid(name: &str) -> Option<Oid> {
         "varchar" | "character varying" => PG_OID_VARCHAR,
         "date" => PG_OID_DATE,
         "time" | "time without time zone" => PG_OID_TIME,
-        "timestamp" => PG_OID_TIMESTAMP,
+        "timestamp" | "timestamp without time zone" => PG_OID_TIMESTAMP,
         "timestamptz" | "timestamp with time zone" => PG_OID_TIMESTAMPTZ,
         "timetz" | "time with time zone" => PG_OID_TIMETZ,
         "numeric" | "decimal" => PG_OID_NUMERIC,

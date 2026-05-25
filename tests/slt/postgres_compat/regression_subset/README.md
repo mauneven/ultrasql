@@ -9,11 +9,20 @@ License: PostgreSQL license, copied to `LICENSE.upstream`.
 Imported files:
 
 - `select_basics.slt`
+- `parser_type_baseline.slt`
 
-This is a small, hand-curated SQLLogicTest translation of public PostgreSQL
-regression `SELECT` behavior. The shard uses local deterministic fixtures and
-expected rows written in SQLLogicTest format; it does not vendor the full
-PostgreSQL regression suite.
+Derived upstream regression sources:
+
+- `src/test/regress/sql/select.sql`
+- `src/test/regress/sql/char.sql`
+- `src/test/regress/sql/varchar.sql`
+- `src/test/regress/sql/numeric.sql`
+- `src/test/regress/sql/type_sanity.sql`
+
+These are small, hand-curated SQLLogicTest translations of public PostgreSQL
+regression behavior. The shards use local deterministic fixtures and expected
+rows written in SQLLogicTest format; they do not vendor the full PostgreSQL
+regression suite.
 
 Run with PostgreSQL reference:
 

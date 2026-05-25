@@ -1688,6 +1688,11 @@ pub enum LogicalAlterTableAction {
         /// Relation storage options.
         options: Vec<LogicalTableOption>,
     },
+    /// `ALTER TABLE t ADD CONSTRAINT name PRIMARY KEY/UNIQUE (...)`.
+    AddUniqueConstraint {
+        /// Bound unique or primary-key constraint.
+        constraint: LogicalUniqueConstraint,
+    },
 }
 
 /// Tenant row-security predicate supported by the v1 RLS path.
@@ -2538,6 +2543,20 @@ impl LogicalPlan {
                         let _ = fmt::write(
                             out,
                             format_args!("AlterTable: {table_name} SET ({rendered})\n"),
+                        );
+                    }
+                    LogicalAlterTableAction::AddUniqueConstraint { constraint } => {
+                        let kind = if constraint.primary_key {
+                            "PRIMARY KEY"
+                        } else {
+                            "UNIQUE"
+                        };
+                        let _ = fmt::write(
+                            out,
+                            format_args!(
+                                "AlterTable: {table_name} ADD CONSTRAINT {} {kind} {:?}\n",
+                                constraint.name, constraint.columns
+                            ),
                         );
                     }
                 }

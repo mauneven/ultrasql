@@ -1,0 +1,5 @@
+psycopg2-binary==2.9.12
+psycopg[binary]==3.3.4
+SQLAlchemy==2.0.50
+Django==6.0.5
+Alembic==1.18.4

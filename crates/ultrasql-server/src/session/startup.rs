@@ -194,9 +194,8 @@ where
         // (psycopg2, JDBC) cache or branch on these values and behave
         // unpredictably if any standard one is missing. The values
         // chosen are PostgreSQL's defaults.
-        let server_version = format!("ultrasql-{}", env!("CARGO_PKG_VERSION"));
         let params: [(&str, &str); 13] = [
-            ("server_version", &server_version),
+            ("server_version", crate::POSTGRES_COMPAT_SERVER_VERSION),
             ("server_encoding", "UTF8"),
             ("client_encoding", "UTF8"),
             ("DateStyle", "ISO, MDY"),

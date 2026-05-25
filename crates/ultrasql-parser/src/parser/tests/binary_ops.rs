@@ -22,6 +22,18 @@ fn regex_match_operator() {
 }
 
 #[test]
+fn schema_qualified_operator_regex_match() {
+    let expr = parse_expr("name OPERATOR(pg_catalog.~) '^A'");
+    assert!(matches!(
+        expr,
+        Expr::Binary {
+            op: BinaryOp::RegexMatch,
+            ..
+        }
+    ));
+}
+
+#[test]
 fn regex_imatch_operator() {
     let expr = parse_expr("name ~* '^a'");
     assert!(matches!(

@@ -1954,6 +1954,21 @@ pub enum Expr {
         /// Source span.
         span: Span,
     },
+    /// `left_expr <op> ANY (array_expr)`.
+    ///
+    /// PostgreSQL accepts both array literals and array-producing scalar
+    /// expressions here. The parser keeps non-literal array expressions in
+    /// this node so the planner can bind them as scalar membership tests.
+    AnyArray {
+        /// Left-hand expression.
+        expr: Box<Self>,
+        /// Comparison operator.
+        op: BinaryOp,
+        /// Array-producing expression.
+        array: Box<Self>,
+        /// Source span.
+        span: Span,
+    },
     /// `left_expr <op> ALL (SELECT …)`.
     ///
     /// Like [`Expr::Any`] but with `ALL` semantics.
@@ -2136,6 +2151,7 @@ impl Expr {
             | Self::InList { span, .. }
             | Self::InSubquery { span, .. }
             | Self::Any { span, .. }
+            | Self::AnyArray { span, .. }
             | Self::All { span, .. }
             | Self::Case { span, .. }
             | Self::Coalesce { span, .. }

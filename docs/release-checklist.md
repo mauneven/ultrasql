@@ -12,12 +12,38 @@ cargo fmt --all -- --check
 cargo clippy --workspace --all-targets --all-features -- -D warnings
 cargo test --workspace --all-features
 cargo doc --workspace --all-features --no-deps
+cargo build -p ultrasql-server --bin ultrasqld
+python3 -m venv /tmp/ultrasql-driver-cert
+/tmp/ultrasql-driver-cert/bin/python -m pip install -r tests/driver_certification/requirements.txt
+# Python harness pins psycopg2, psycopg3, SQLAlchemy==2.0.50, Django==6.0.5,
+# and Alembic==1.18.4.
+# Stock psql meta-command coverage requires the PostgreSQL client package.
+bundle install --gemfile tests/driver_certification/rails/Gemfile
+# Rails ActiveRecord harness pins activerecord 8.1.3 and pg 1.6.3.
+pnpm --dir tests/driver_certification/node install --frozen-lockfile
+# Node harness pins node-postgres, Prisma, @prisma/client, and @prisma/adapter-pg.
+go -C tests/driver_certification/go mod download
+# Go harness pins lib/pq, pgx, and GORM.
+cargo fetch --manifest-path tests/driver_certification/diesel/Cargo.toml
+# Diesel harness pins Diesel 2.3.9.
+dotnet restore --locked-mode tests/driver_certification/dotnet/Ultrasql.DriverCertification.csproj
+# The harness compiles tests/driver_certification/java/JdbcCert.java itself.
+# Hibernate ORM dependencies resolve from tests/driver_certification/hibernate.
+# Flyway and Liquibase dependencies resolve from tests/driver_certification/flyway
+# and tests/driver_certification/liquibase.
+/tmp/ultrasql-driver-cert/bin/python tests/driver_certification/driver_certification.py \
+  --ultrasqld target/debug/ultrasqld
 benchmarks/certify.sh smoke
 ```
 
-The GitHub `ci` workflow runs format, clippy, tests, docs, and cargo-deny.
-The `bench` workflow runs the PR-safe smoke certification profile for benchmark
-touches.
+The GitHub `ci` workflow runs format, clippy, tests, driver certification,
+docs, cargo-deny, and cargo-audit. The `bench` workflow runs the PR-safe smoke
+certification profile for benchmark touches.
+Driver certification evidence includes stock psql meta-commands `\d`, `\dt`,
+`\di`, `\df`, `\dv`, `\du`, `\l`, and `\dn`; GUI introspection probes for
+pgAdmin, DBeaver, and DataGrip schema-browser catalog query families; Flyway,
+Liquibase, and Alembic migration version-table runs in nontransactional DDL
+mode; it is stored as `target/driver-certification.json` and uploaded by CI.
 
 ## Release artifact gate
 

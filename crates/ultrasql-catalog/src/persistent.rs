@@ -1727,7 +1727,7 @@ impl PersistentCatalog {
     /// # Errors
     ///
     /// Returns [`CatalogError::SchemaConflict`] when the column's
-    /// [`DataType`](ultrasql_core::DataType) is outside the catalog-
+    /// [`DataType`] is outside the catalog-
     /// persistable set (e.g. `Array`, `Record`), or when a heap I/O
     /// failure prevents either pg_class or pg_attribute from
     /// accepting the row.

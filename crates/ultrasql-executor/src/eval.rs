@@ -29,8 +29,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use num_traits::ToPrimitive;
 use serde_json::{Map as JsonMap, Number as JsonNumber, Value as JsonValue};
-use ultrasql_core::{DataType, SparseVector, Value, bpchar_semantic_text, timetz_utc_micros};
-use ultrasql_planner::{BinaryOp, ScalarExpr, UnaryOp};
+use ultrasql_core::{DataType, Oid, SparseVector, Value, bpchar_semantic_text, timetz_utc_micros};
+use ultrasql_planner::{BinaryOp, ScalarExpr, UnaryOp, catalog::builtin_type_oid};
 
 use crate::json_path::{parse_json_path, select_json_path};
 
@@ -260,7 +260,7 @@ fn eval_function_call(
     match name {
         "abs" => eval_abs(args),
         "extract" => eval_extract(args),
-        "now" | "current_timestamp" => eval_now(args),
+        "now" | "current_timestamp" => eval_now(args, return_type),
         "current_date" => eval_current_date(args),
         "age" => eval_age(args),
         "date_trunc" => eval_date_trunc(args),
@@ -319,20 +319,48 @@ fn eval_function_call(
         "jsonb_path_exists" => eval_jsonb_path_exists(args),
         "pg_advisory_lock"
         | "pg_try_advisory_lock"
+        | "pg_try_advisory_xact_lock"
         | "pg_advisory_unlock"
         | "pg_advisory_unlock_all" => Err(EvalError::Unsupported(
             "advisory lock functions require session context",
         )),
         "gen_random_uuid" => eval_gen_random_uuid(args),
-        "version" => eval_zero_arg_text(args, "UltraSQL 0.0.1"),
+        "version" => eval_zero_arg_text(args, "PostgreSQL 14.0 (UltraSQL 0.0.1)"),
+        "current_catalog" => eval_zero_arg_text(args, "ultrasql"),
         "current_database" => eval_zero_arg_text(args, "ultrasql"),
+        "current_schema" => eval_zero_arg_text(args, "public"),
+        "current_schemas" => eval_current_schemas(args),
         "current_user" | "session_user" => eval_zero_arg_text(args, "user"),
         "pg_typeof" => eval_pg_typeof(args),
+        "to_regtype" => eval_to_regtype(args),
+        "pg_table_is_visible" => eval_pg_table_is_visible(args),
+        "pg_is_other_temp_schema" => eval_pg_is_other_temp_schema(args),
+        "pg_function_is_visible" => eval_pg_function_is_visible(args),
+        "pg_relation_is_publishable" => eval_pg_relation_is_publishable(args),
+        "set_config" => eval_set_config(args),
+        "format_type" => eval_format_type(args),
+        "pg_get_expr" => eval_pg_get_expr(args),
+        "pg_get_indexdef" => eval_pg_get_indexdef(args),
+        "pg_get_constraintdef" => eval_pg_get_constraintdef(args),
+        "pg_get_statisticsobjdef_columns" => eval_pg_get_statisticsobjdef_columns(args),
+        "pg_get_function_result" => eval_pg_get_function_result(args),
+        "pg_get_function_arguments" => eval_pg_get_function_arguments(args),
+        "pg_encoding_to_char" => eval_pg_encoding_to_char(args),
+        "obj_description" | "shobj_description" => eval_obj_description(args),
+        "col_description" => eval_col_description(args),
+        "pg_get_serial_sequence" => eval_pg_get_serial_sequence(args),
         "pg_size_pretty" => eval_pg_size_pretty(args),
         "array_length" => eval_array_length(args),
+        "array_position" => eval_array_position(args),
         "array_to_string" => eval_array_to_string(args),
         "string_to_array" => eval_string_to_array(args),
         "array_cat" => eval_array_cat(args),
+        "__ultrasql_array_subscript" => eval_array_subscript(args),
+        "__ultrasql_eq_any_array" => eval_eq_any_array(args),
+        "__ultrasql_cast_oid" => eval_cast_oid(args),
+        "__ultrasql_cast_regclass" => eval_cast_regclass(args),
+        "__ultrasql_cast_regtype" => eval_cast_regtype(args),
+        "__ultrasql_cast_text" => eval_cast_text(args),
         "l2_distance" => eval_vector_metric(args, VectorDistanceOp::L2),
         "cosine_distance" => eval_vector_metric(args, VectorDistanceOp::Cosine),
         "inner_product" | "dot_product" => eval_vector_metric(args, VectorDistanceOp::InnerProduct),
@@ -371,6 +399,504 @@ fn eval_pg_typeof(args: &[Value]) -> Result<Value, EvalError> {
         )));
     }
     Ok(Value::Text(args[0].data_type().to_string()))
+}
+
+fn eval_current_schemas(args: &[Value]) -> Result<Value, EvalError> {
+    if args.len() != 1 {
+        return Err(EvalError::Type(format!(
+            "current_schemas: expected 1 arg, got {}",
+            args.len()
+        )));
+    }
+    let include_implicit = match args[0] {
+        Value::Bool(value) => value,
+        Value::Null => false,
+        ref other => {
+            return Err(EvalError::Type(format!(
+                "current_schemas: boolean argument required, got {:?}",
+                other.data_type()
+            )));
+        }
+    };
+    let mut elements = Vec::new();
+    if include_implicit {
+        elements.push(Value::Text("pg_catalog".to_owned()));
+    }
+    elements.push(Value::Text("public".to_owned()));
+    Ok(Value::Array {
+        element_type: DataType::Text { max_len: None },
+        elements,
+    })
+}
+
+fn eval_to_regtype(args: &[Value]) -> Result<Value, EvalError> {
+    if args.len() != 1 {
+        return Err(EvalError::Type(format!(
+            "to_regtype: expected 1 arg, got {}",
+            args.len()
+        )));
+    }
+    match &args[0] {
+        Value::Null => Ok(Value::Null),
+        Value::RegType(oid) => Ok(Value::RegType(*oid)),
+        Value::Text(text) | Value::Char(text) => Ok(resolve_regtype_text(text)
+            .map(Value::RegType)
+            .unwrap_or(Value::Null)),
+        other => Err(EvalError::Type(format!(
+            "to_regtype: text argument required, got {:?}",
+            other.data_type()
+        ))),
+    }
+}
+
+fn eval_pg_table_is_visible(args: &[Value]) -> Result<Value, EvalError> {
+    if args.len() != 1 {
+        return Err(EvalError::Type(format!(
+            "pg_table_is_visible: expected 1 arg, got {}",
+            args.len()
+        )));
+    }
+    match &args[0] {
+        Value::Null => Ok(Value::Null),
+        Value::Oid(_)
+        | Value::RegClass(_)
+        | Value::Int16(_)
+        | Value::Int32(_)
+        | Value::Int64(_) => Ok(Value::Bool(true)),
+        other => Err(EvalError::Type(format!(
+            "pg_table_is_visible: OID argument required, got {:?}",
+            other.data_type()
+        ))),
+    }
+}
+
+fn eval_pg_is_other_temp_schema(args: &[Value]) -> Result<Value, EvalError> {
+    if args.len() != 1 {
+        return Err(EvalError::Type(format!(
+            "pg_is_other_temp_schema: expected 1 arg, got {}",
+            args.len()
+        )));
+    }
+    match &args[0] {
+        Value::Null => Ok(Value::Null),
+        Value::Oid(_)
+        | Value::RegClass(_)
+        | Value::RegType(_)
+        | Value::Int16(_)
+        | Value::Int32(_)
+        | Value::Int64(_) => Ok(Value::Bool(false)),
+        other => Err(EvalError::Type(format!(
+            "pg_is_other_temp_schema: OID argument required, got {:?}",
+            other.data_type()
+        ))),
+    }
+}
+
+fn eval_pg_function_is_visible(args: &[Value]) -> Result<Value, EvalError> {
+    if args.len() != 1 {
+        return Err(EvalError::Type(format!(
+            "pg_function_is_visible: expected 1 arg, got {}",
+            args.len()
+        )));
+    }
+    match &args[0] {
+        Value::Null => Ok(Value::Null),
+        Value::Oid(_)
+        | Value::RegClass(_)
+        | Value::RegType(_)
+        | Value::Int16(_)
+        | Value::Int32(_)
+        | Value::Int64(_) => Ok(Value::Bool(true)),
+        other => Err(EvalError::Type(format!(
+            "pg_function_is_visible: OID argument required, got {:?}",
+            other.data_type()
+        ))),
+    }
+}
+
+fn eval_pg_relation_is_publishable(args: &[Value]) -> Result<Value, EvalError> {
+    if args.len() != 1 {
+        return Err(EvalError::Type(format!(
+            "pg_relation_is_publishable: expected 1 arg, got {}",
+            args.len()
+        )));
+    }
+    Ok(Value::Bool(!matches!(args[0], Value::Null)))
+}
+
+fn eval_set_config(args: &[Value]) -> Result<Value, EvalError> {
+    if args.len() != 3 {
+        return Err(EvalError::Type(format!(
+            "set_config: expected 3 args, got {}",
+            args.len()
+        )));
+    }
+    if matches!(args[0], Value::Null) || matches!(args[1], Value::Null) {
+        return Ok(Value::Null);
+    }
+    if !matches!(args[0], Value::Text(_) | Value::Char(_)) {
+        return Err(EvalError::Type(format!(
+            "set_config: setting name must be text, got {:?}",
+            args[0].data_type()
+        )));
+    }
+    let value = match &args[1] {
+        Value::Text(text) | Value::Char(text) => text.clone(),
+        other => {
+            return Err(EvalError::Type(format!(
+                "set_config: setting value must be text, got {:?}",
+                other.data_type()
+            )));
+        }
+    };
+    if !matches!(args[2], Value::Bool(_) | Value::Null) {
+        return Err(EvalError::Type(format!(
+            "set_config: local flag must be boolean, got {:?}",
+            args[2].data_type()
+        )));
+    }
+    Ok(Value::Text(value))
+}
+
+fn eval_format_type(args: &[Value]) -> Result<Value, EvalError> {
+    if args.len() != 2 {
+        return Err(EvalError::Type(format!(
+            "format_type: expected 2 args, got {}",
+            args.len()
+        )));
+    }
+    if matches!(args[0], Value::Null) {
+        return Ok(Value::Null);
+    }
+    let Some(oid) = oid_or_integer_arg(&args[0]) else {
+        return Err(EvalError::Type(format!(
+            "format_type: oid argument required, got {:?}",
+            args[0].data_type()
+        )));
+    };
+    let name = match oid {
+        16 => "boolean",
+        17 => "bytea",
+        20 => "bigint",
+        21 => "smallint",
+        23 => "integer",
+        25 => "text",
+        26 => "oid",
+        700 => "real",
+        701 => "double precision",
+        790 => "money",
+        114 => "json",
+        142 => "xml",
+        650 => "cidr",
+        829 => "macaddr",
+        869 => "inet",
+        1042 => "character",
+        1082 => "date",
+        1083 => "time without time zone",
+        1114 => "timestamp without time zone",
+        1184 => "timestamp with time zone",
+        1266 => "time with time zone",
+        1560 => "bit",
+        1562 => "bit varying",
+        1700 => "numeric",
+        2950 => "uuid",
+        3220 => "pg_lsn",
+        3802 => "jsonb",
+        2205 => "regclass",
+        2206 => "regtype",
+        _ => "text",
+    };
+    Ok(Value::Text(name.to_owned()))
+}
+
+fn eval_pg_get_expr(args: &[Value]) -> Result<Value, EvalError> {
+    if !(args.len() == 2 || args.len() == 3) {
+        return Err(EvalError::Type(format!(
+            "pg_get_expr: expected 2 or 3 args, got {}",
+            args.len()
+        )));
+    }
+    match &args[0] {
+        Value::Null => Ok(Value::Null),
+        Value::Text(text) | Value::Char(text) => Ok(Value::Text(text.clone())),
+        other => Err(EvalError::Type(format!(
+            "pg_get_expr: expression text required, got {:?}",
+            other.data_type()
+        ))),
+    }
+}
+
+fn eval_pg_get_indexdef(args: &[Value]) -> Result<Value, EvalError> {
+    if !(args.len() == 1 || args.len() == 2 || args.len() == 3) {
+        return Err(EvalError::Type(format!(
+            "pg_get_indexdef: expected 1 to 3 args, got {}",
+            args.len()
+        )));
+    }
+    if matches!(args[0], Value::Null) {
+        return Ok(Value::Null);
+    }
+    let Some(oid) = oid_or_integer_arg(&args[0]) else {
+        return Err(EvalError::Type(format!(
+            "pg_get_indexdef: oid argument required, got {:?}",
+            args[0].data_type()
+        )));
+    };
+    Ok(Value::Text(format!("index {oid}")))
+}
+
+fn eval_pg_get_constraintdef(args: &[Value]) -> Result<Value, EvalError> {
+    if !(args.len() == 1 || args.len() == 2) {
+        return Err(EvalError::Type(format!(
+            "pg_get_constraintdef: expected 1 or 2 args, got {}",
+            args.len()
+        )));
+    }
+    if matches!(args[0], Value::Null) {
+        return Ok(Value::Null);
+    }
+    let Some(oid) = oid_or_integer_arg(&args[0]) else {
+        return Err(EvalError::Type(format!(
+            "pg_get_constraintdef: oid argument required, got {:?}",
+            args[0].data_type()
+        )));
+    };
+    if oid == 0 {
+        return Ok(Value::Null);
+    }
+    Ok(Value::Text(format!("constraint {oid}")))
+}
+
+fn eval_pg_get_statisticsobjdef_columns(args: &[Value]) -> Result<Value, EvalError> {
+    if args.len() != 1 {
+        return Err(EvalError::Type(format!(
+            "pg_get_statisticsobjdef_columns: expected 1 arg, got {}",
+            args.len()
+        )));
+    }
+    if matches!(args[0], Value::Null) {
+        return Ok(Value::Null);
+    }
+    if oid_or_integer_arg(&args[0]).is_none() {
+        return Err(EvalError::Type(format!(
+            "pg_get_statisticsobjdef_columns: oid argument required, got {:?}",
+            args[0].data_type()
+        )));
+    }
+    Ok(Value::Text(String::new()))
+}
+
+fn eval_pg_get_function_result(args: &[Value]) -> Result<Value, EvalError> {
+    if args.len() != 1 {
+        return Err(EvalError::Type(format!(
+            "pg_get_function_result: expected 1 arg, got {}",
+            args.len()
+        )));
+    }
+    if matches!(args[0], Value::Null) {
+        return Ok(Value::Null);
+    }
+    if oid_or_integer_arg(&args[0]).is_none() {
+        return Err(EvalError::Type(format!(
+            "pg_get_function_result: oid argument required, got {:?}",
+            args[0].data_type()
+        )));
+    }
+    Ok(Value::Text(String::new()))
+}
+
+fn eval_pg_get_function_arguments(args: &[Value]) -> Result<Value, EvalError> {
+    if args.len() != 1 {
+        return Err(EvalError::Type(format!(
+            "pg_get_function_arguments: expected 1 arg, got {}",
+            args.len()
+        )));
+    }
+    if matches!(args[0], Value::Null) {
+        return Ok(Value::Null);
+    }
+    if oid_or_integer_arg(&args[0]).is_none() {
+        return Err(EvalError::Type(format!(
+            "pg_get_function_arguments: oid argument required, got {:?}",
+            args[0].data_type()
+        )));
+    }
+    Ok(Value::Text(String::new()))
+}
+
+fn eval_pg_encoding_to_char(args: &[Value]) -> Result<Value, EvalError> {
+    if args.len() != 1 {
+        return Err(EvalError::Type(format!(
+            "pg_encoding_to_char: expected 1 arg, got {}",
+            args.len()
+        )));
+    }
+    let Some(encoding) = args[0].as_i64() else {
+        return if matches!(args[0], Value::Null) {
+            Ok(Value::Null)
+        } else {
+            Err(EvalError::Type(format!(
+                "pg_encoding_to_char: integer argument required, got {:?}",
+                args[0].data_type()
+            )))
+        };
+    };
+    let name = if encoding == 6 { "UTF8" } else { "" };
+    Ok(Value::Text(name.to_owned()))
+}
+
+fn eval_obj_description(args: &[Value]) -> Result<Value, EvalError> {
+    if args.len() != 2 {
+        return Err(EvalError::Type(format!(
+            "obj_description: expected 2 args, got {}",
+            args.len()
+        )));
+    }
+    if matches!(args[0], Value::Null) || matches!(args[1], Value::Null) {
+        return Ok(Value::Null);
+    }
+    if oid_or_integer_arg(&args[0]).is_none() {
+        return Err(EvalError::Type(format!(
+            "obj_description: oid argument required, got {:?}",
+            args[0].data_type()
+        )));
+    }
+    match &args[1] {
+        Value::Text(_) | Value::Char(_) => Ok(Value::Null),
+        other => Err(EvalError::Type(format!(
+            "obj_description: catalog name must be text, got {:?}",
+            other.data_type()
+        ))),
+    }
+}
+
+fn eval_col_description(args: &[Value]) -> Result<Value, EvalError> {
+    if args.len() != 2 {
+        return Err(EvalError::Type(format!(
+            "col_description: expected 2 args, got {}",
+            args.len()
+        )));
+    }
+    if matches!(args[0], Value::Null) || matches!(args[1], Value::Null) {
+        return Ok(Value::Null);
+    }
+    if oid_or_integer_arg(&args[0]).is_none() || integer_value_i128(&args[1]).is_none() {
+        return Err(EvalError::Type(format!(
+            "col_description: oid and integer arguments required, got {:?}, {:?}",
+            args[0].data_type(),
+            args[1].data_type()
+        )));
+    }
+    Ok(Value::Null)
+}
+
+fn eval_pg_get_serial_sequence(args: &[Value]) -> Result<Value, EvalError> {
+    if args.len() != 2 {
+        return Err(EvalError::Type(format!(
+            "pg_get_serial_sequence: expected 2 args, got {}",
+            args.len()
+        )));
+    }
+    for arg in args {
+        if matches!(arg, Value::Null) {
+            return Ok(Value::Null);
+        }
+        if !matches!(arg, Value::Text(_) | Value::Char(_)) {
+            return Err(EvalError::Type(format!(
+                "pg_get_serial_sequence: text arguments required, got {:?}",
+                arg.data_type()
+            )));
+        }
+    }
+    Ok(Value::Null)
+}
+
+fn eval_cast_oid(args: &[Value]) -> Result<Value, EvalError> {
+    if args.len() != 1 {
+        return Err(EvalError::Type(format!(
+            "oid cast: expected 1 arg, got {}",
+            args.len()
+        )));
+    }
+    match &args[0] {
+        Value::Null => Ok(Value::Null),
+        Value::Oid(oid) | Value::RegClass(oid) | Value::RegType(oid) => Ok(Value::Oid(*oid)),
+        Value::Int16(v) => cast_i64_to_oid(i64::from(*v)).map(Value::Oid),
+        Value::Int32(v) => cast_i64_to_oid(i64::from(*v)).map(Value::Oid),
+        Value::Int64(v) => cast_i64_to_oid(*v).map(Value::Oid),
+        other => Err(EvalError::Type(format!(
+            "oid cast: OID argument required, got {:?}",
+            other.data_type()
+        ))),
+    }
+}
+
+fn eval_cast_regclass(args: &[Value]) -> Result<Value, EvalError> {
+    if args.len() != 1 {
+        return Err(EvalError::Type(format!(
+            "regclass cast: expected 1 arg, got {}",
+            args.len()
+        )));
+    }
+    match &args[0] {
+        Value::Null => Ok(Value::Null),
+        Value::Oid(oid) | Value::RegClass(oid) | Value::RegType(oid) => Ok(Value::RegClass(*oid)),
+        Value::Int16(v) => cast_i64_to_oid(i64::from(*v)).map(Value::RegClass),
+        Value::Int32(v) => cast_i64_to_oid(i64::from(*v)).map(Value::RegClass),
+        Value::Int64(v) => cast_i64_to_oid(*v).map(Value::RegClass),
+        other => Err(EvalError::Type(format!(
+            "regclass cast: OID argument required, got {:?}",
+            other.data_type()
+        ))),
+    }
+}
+
+fn eval_cast_regtype(args: &[Value]) -> Result<Value, EvalError> {
+    if args.len() != 1 {
+        return Err(EvalError::Type(format!(
+            "regtype cast: expected 1 arg, got {}",
+            args.len()
+        )));
+    }
+    match &args[0] {
+        Value::Null => Ok(Value::Null),
+        Value::Oid(oid) | Value::RegClass(oid) | Value::RegType(oid) => Ok(Value::RegType(*oid)),
+        Value::Int16(v) => cast_i64_to_oid(i64::from(*v)).map(Value::RegType),
+        Value::Int32(v) => cast_i64_to_oid(i64::from(*v)).map(Value::RegType),
+        Value::Int64(v) => cast_i64_to_oid(*v).map(Value::RegType),
+        other => Err(EvalError::Type(format!(
+            "regtype cast: OID argument required, got {:?}",
+            other.data_type()
+        ))),
+    }
+}
+
+fn cast_i64_to_oid(raw: i64) -> Result<Oid, EvalError> {
+    u32::try_from(raw)
+        .map(Oid::new)
+        .map_err(|_| EvalError::Type(format!("OID cast: value out of range: {raw}")))
+}
+
+fn eval_cast_text(args: &[Value]) -> Result<Value, EvalError> {
+    if args.len() != 1 {
+        return Err(EvalError::Type(format!(
+            "text cast: expected 1 arg, got {}",
+            args.len()
+        )));
+    }
+    if matches!(args[0], Value::Null) {
+        return Ok(Value::Null);
+    }
+    Ok(Value::Text(args[0].to_string()))
+}
+
+fn resolve_regtype_text(text: &str) -> Option<Oid> {
+    let trimmed = text.trim();
+    let unqualified = trimmed
+        .strip_prefix("pg_catalog.")
+        .or_else(|| trimmed.strip_prefix("PG_CATALOG."))
+        .unwrap_or(trimmed);
+    Value::parse_oid_text(unqualified).or_else(|| builtin_type_oid(unqualified))
 }
 
 fn eval_pg_size_pretty(args: &[Value]) -> Result<Value, EvalError> {
@@ -430,6 +956,111 @@ fn eval_array_length(args: &[Value]) -> Result<Value, EvalError> {
     let len =
         i32::try_from(*len).map_err(|_| EvalError::Type("array_length overflow".to_owned()))?;
     Ok(Value::Int32(len))
+}
+
+fn eval_array_subscript(args: &[Value]) -> Result<Value, EvalError> {
+    if args.len() != 2 {
+        return Err(EvalError::Type(format!(
+            "array subscript: expected 2 args, got {}",
+            args.len()
+        )));
+    }
+    let Value::Array { elements, .. } = &args[0] else {
+        return if matches!(args[0], Value::Null) {
+            Ok(Value::Null)
+        } else {
+            Err(EvalError::Type(format!(
+                "array subscript: array argument required, got {:?}",
+                args[0].data_type()
+            )))
+        };
+    };
+    let Some(index) = args[1].as_i64() else {
+        return if matches!(args[1], Value::Null) {
+            Ok(Value::Null)
+        } else {
+            Err(EvalError::Type(format!(
+                "array subscript: integer index required, got {:?}",
+                args[1].data_type()
+            )))
+        };
+    };
+    if index < 1 {
+        return Ok(Value::Null);
+    }
+    let zero_idx =
+        usize::try_from(index - 1).map_err(|_| EvalError::Type("array index overflow".into()))?;
+    Ok(elements.get(zero_idx).cloned().unwrap_or(Value::Null))
+}
+
+fn eval_eq_any_array(args: &[Value]) -> Result<Value, EvalError> {
+    if args.len() != 2 {
+        return Err(EvalError::Type(format!(
+            "= ANY array: expected 2 args, got {}",
+            args.len()
+        )));
+    }
+    if matches!(args[0], Value::Null) {
+        return Ok(Value::Null);
+    }
+    let Value::Array { elements, .. } = &args[1] else {
+        return if matches!(args[1], Value::Null) {
+            Ok(Value::Null)
+        } else {
+            Err(EvalError::Type(format!(
+                "= ANY array: array argument required, got {:?}",
+                args[1].data_type()
+            )))
+        };
+    };
+    let mut saw_null = false;
+    for element in elements {
+        if matches!(element, Value::Null) {
+            saw_null = true;
+            continue;
+        }
+        if compare_values(&args[0], element)? == std::cmp::Ordering::Equal {
+            return Ok(Value::Bool(true));
+        }
+    }
+    if saw_null {
+        Ok(Value::Null)
+    } else {
+        Ok(Value::Bool(false))
+    }
+}
+
+fn eval_array_position(args: &[Value]) -> Result<Value, EvalError> {
+    if args.len() != 2 {
+        return Err(EvalError::Type(format!(
+            "array_position: expected 2 args, got {}",
+            args.len()
+        )));
+    }
+    let Value::Array { elements, .. } = &args[0] else {
+        return if matches!(args[0], Value::Null) {
+            Ok(Value::Null)
+        } else {
+            Err(EvalError::Type(format!(
+                "array_position: array argument required, got {:?}",
+                args[0].data_type()
+            )))
+        };
+    };
+    if matches!(args[1], Value::Null) {
+        return Ok(Value::Null);
+    }
+    for (idx, element) in elements.iter().enumerate() {
+        if matches!(element, Value::Null) {
+            continue;
+        }
+        if compare_values(element, &args[1])? == std::cmp::Ordering::Equal {
+            let pos = i32::try_from(idx + 1)
+                .map_err(|_| EvalError::Type("array_position overflow".to_owned()))?;
+            return Ok(Value::Int32(pos));
+        }
+    }
+    Ok(Value::Null)
 }
 
 fn eval_array_to_string(args: &[Value]) -> Result<Value, EvalError> {
@@ -1693,14 +2324,19 @@ fn eval_case_simple(args: &[Value]) -> Result<Value, EvalError> {
     Ok(else_val)
 }
 
-fn eval_now(args: &[Value]) -> Result<Value, EvalError> {
+fn eval_now(args: &[Value], return_type: &DataType) -> Result<Value, EvalError> {
     if !args.is_empty() {
         return Err(EvalError::Type(format!(
             "now: expected 0 args, got {}",
             args.len()
         )));
     }
-    Ok(Value::TimestampTz(current_engine_timestamp_micros()))
+    let micros = current_engine_timestamp_micros();
+    if matches!(return_type, DataType::Timestamp) {
+        Ok(Value::Timestamp(micros))
+    } else {
+        Ok(Value::TimestampTz(micros))
+    }
 }
 
 fn eval_current_date(args: &[Value]) -> Result<Value, EvalError> {
@@ -2418,12 +3054,25 @@ fn apply_binary(op: BinaryOp, lv: Value, rv: Value) -> Result<Value, EvalError> 
         BinaryOp::VectorL1Distance => vector_distance(&lv, &rv, VectorDistanceOp::L1),
 
         // ------------------------------------------------------------------
-        // Unsupported operators (regex, JSON)
+        // Regex operators
         // ------------------------------------------------------------------
         BinaryOp::RegexMatch
         | BinaryOp::RegexIMatch
         | BinaryOp::RegexNotMatch
-        | BinaryOp::RegexNotIMatch => Err(EvalError::Unsupported("regex operators")),
+        | BinaryOp::RegexNotIMatch => {
+            let case_insensitive = matches!(op, BinaryOp::RegexIMatch | BinaryOp::RegexNotIMatch);
+            let negated = matches!(op, BinaryOp::RegexNotMatch | BinaryOp::RegexNotIMatch);
+            match (lv, rv) {
+                (
+                    Value::Text(haystack) | Value::Char(haystack),
+                    Value::Text(pattern) | Value::Char(pattern),
+                ) => regex_match(&haystack, &pattern, case_insensitive)
+                    .map(|matched| Value::Bool(matched ^ negated)),
+                (l, r) => Err(EvalError::Type(format!(
+                    "regex operators require Text operands, got {l:?} and {r:?}"
+                ))),
+            }
+        }
 
         BinaryOp::JsonGet | BinaryOp::JsonGetPath => json_get(&lv, &rv, false),
         BinaryOp::JsonGetText | BinaryOp::JsonGetPathText => json_get(&lv, &rv, true),
@@ -3638,6 +4287,13 @@ fn value_compare(
 /// Only types that have a natural total order are supported. Mismatched
 /// types return [`EvalError::Type`].
 fn compare_values(lv: &Value, rv: &Value) -> Result<std::cmp::Ordering, EvalError> {
+    if let (Some(left), Some(right)) = (oid_alias_value(lv), oid_alias_value(rv)) {
+        return Ok(left.cmp(&right));
+    }
+    if let Some(ordering) = compare_oid_alias_with_integer(lv, rv) {
+        return Ok(ordering);
+    }
+
     if matches!(
         (lv, rv),
         (Value::Decimal { .. }, _) | (_, Value::Decimal { .. })
@@ -3741,6 +4397,44 @@ fn compare_values(lv: &Value, rv: &Value) -> Result<std::cmp::Ordering, EvalErro
         (l, r) => Err(EvalError::Type(format!(
             "comparison type mismatch: {l:?} and {r:?}"
         ))),
+    }
+}
+
+fn oid_alias_value(value: &Value) -> Option<Oid> {
+    match value {
+        Value::Oid(oid) | Value::RegClass(oid) | Value::RegType(oid) => Some(*oid),
+        _ => None,
+    }
+}
+
+fn compare_oid_alias_with_integer(lv: &Value, rv: &Value) -> Option<std::cmp::Ordering> {
+    if let (Some(left), Some(right)) = (oid_alias_value(lv), integer_value_i128(rv)) {
+        return Some(i128::from(left.raw()).cmp(&right));
+    }
+    if let (Some(left), Some(right)) = (integer_value_i128(lv), oid_alias_value(rv)) {
+        return Some(left.cmp(&i128::from(right.raw())));
+    }
+    None
+}
+
+fn integer_value_i128(value: &Value) -> Option<i128> {
+    match value {
+        Value::Int16(v) => Some(i128::from(*v)),
+        Value::Int32(v) => Some(i128::from(*v)),
+        Value::Int64(v) => Some(i128::from(*v)),
+        _ => None,
+    }
+}
+
+fn oid_or_integer_arg(value: &Value) -> Option<u32> {
+    if let Some(oid) = oid_alias_value(value) {
+        return Some(oid.raw());
+    }
+    match value {
+        Value::Int16(v) => u32::try_from(i64::from(*v)).ok(),
+        Value::Int32(v) => u32::try_from(i64::from(*v)).ok(),
+        Value::Int64(v) => u32::try_from(*v).ok(),
+        _ => None,
     }
 }
 
@@ -3867,6 +4561,14 @@ fn like_match_chars(h: &[char], p: &[char]) -> bool {
             }
         }
     }
+}
+
+fn regex_match(haystack: &str, pattern: &str, case_insensitive: bool) -> Result<bool, EvalError> {
+    regex::RegexBuilder::new(pattern)
+        .case_insensitive(case_insensitive)
+        .build()
+        .map(|regex| regex.is_match(haystack))
+        .map_err(|err| EvalError::Type(format!("regex operator: invalid pattern: {err}")))
 }
 
 // ---------------------------------------------------------------------------
@@ -4740,6 +5442,16 @@ mod tests {
     fn ilike_no_match() {
         let ev = Eval::new(binop(BinaryOp::Ilike, lit_text("foobar"), lit_text("baz%")));
         assert_eq!(ev.eval(&[]).unwrap(), Value::Bool(false));
+    }
+
+    #[test]
+    fn regex_match_operator_matches_psql_meta_patterns() {
+        let ev = Eval::new(binop(
+            BinaryOp::RegexMatch,
+            lit_text("psql_meta_table"),
+            lit_text("^(psql_meta_table)$"),
+        ));
+        assert_eq!(ev.eval(&[]).unwrap(), Value::Bool(true));
     }
 
     // -----------------------------------------------------------------------

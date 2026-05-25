@@ -71,6 +71,78 @@ fn select_columns_and_alias() {
 }
 
 #[test]
+fn select_alias_allows_copy_option_keyword_after_as() {
+    let stmt = parse("SELECT typdelim AS delimiter FROM pg_type");
+    let Statement::Select(s) = stmt else { panic!() };
+    if let SelectItem::Expr { alias, .. } = &s.projection[0] {
+        assert_eq!(alias.as_ref().unwrap().value, "delimiter");
+    } else {
+        panic!("expected aliased item");
+    }
+}
+
+#[test]
+fn select_alias_allows_comment_keyword_after_as() {
+    let stmt = parse("SELECT col_description(a.attrelid, a.attnum) AS comment FROM pg_attribute a");
+    let Statement::Select(s) = stmt else { panic!() };
+    if let SelectItem::Expr { alias, .. } = &s.projection[0] {
+        assert_eq!(alias.as_ref().unwrap().value, "comment");
+    } else {
+        panic!("expected aliased item");
+    }
+}
+
+#[test]
+fn select_alias_allows_identity_keyword_after_as() {
+    let stmt = parse("SELECT '' AS identity FROM pg_attribute");
+    let Statement::Select(s) = stmt else { panic!() };
+    if let SelectItem::Expr { alias, .. } = &s.projection[0] {
+        assert_eq!(alias.as_ref().unwrap().value, "identity");
+    } else {
+        panic!("expected aliased item");
+    }
+}
+
+#[test]
+fn select_projection_allows_locked_column_name() {
+    let stmt = parse("SELECT LOCKED FROM databasechangeloglock");
+    let Statement::Select(s) = stmt else { panic!() };
+    let SelectItem::Expr {
+        expr: Expr::Column { name },
+        ..
+    } = &s.projection[0]
+    else {
+        panic!("expected locked column");
+    };
+    assert_eq!(name.to_string(), "locked");
+}
+
+#[test]
+fn select_eq_any_array_literal_parses_as_in_list() {
+    let stmt =
+        parse("SELECT * FROM pg_class WHERE relkind = ANY (ARRAY['r'::VARCHAR, 'v'::VARCHAR])");
+    let Statement::Select(s) = stmt else { panic!() };
+    let Some(Expr::InList { items, negated, .. }) = &s.r#where else {
+        panic!("expected = ANY array to lower to IN-list");
+    };
+    assert!(!negated);
+    assert_eq!(items.len(), 2);
+}
+
+#[test]
+fn select_eq_any_array_function_parses() {
+    let stmt = parse(
+        "SELECT c.relname \
+         FROM pg_class c LEFT JOIN pg_namespace n ON n.oid = c.relnamespace \
+         WHERE n.nspname = ANY (current_schemas(false))",
+    );
+    let Statement::Select(s) = stmt else { panic!() };
+    let Some(Expr::AnyArray { .. }) = &s.r#where else {
+        panic!("expected = ANY array expression");
+    };
+}
+
+#[test]
 fn select_with_where_clause() {
     let stmt = parse("SELECT id FROM users WHERE age >= 18 AND active = TRUE");
     let Statement::Select(s) = stmt else { panic!() };

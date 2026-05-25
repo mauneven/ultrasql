@@ -1,10 +1,15 @@
 //! Serializable Snapshot Isolation (SSI) manager.
 //!
-//! Implements PostgreSQL-style SSI as described in Ports et al. (VLDB 2012).
+//! Implements the core Serializable Snapshot Isolation (SSI) conflict graph
+//! described in Ports et al. (VLDB 2012).
 //! The core idea: two rw-anti-dependency edges that form a pivot (T2 has an
 //! in-conflict-in from T1 *and* an in-conflict-out to T3) constitute a
 //! dangerous structure if one of the three transactions has committed. When
 //! a dangerous structure is detected the pivot transaction is aborted.
+//!
+//! The manager supports tuple, page, and relation predicate-lock tags. Current
+//! `ultrasql-server` plumbing records relation-level SSI, not predicate-precise
+//! PostgreSQL SSI; callers that want finer precision must issue the finer tags.
 //!
 //! # Public surface
 //!

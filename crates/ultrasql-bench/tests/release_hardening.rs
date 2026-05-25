@@ -150,6 +150,105 @@ fn ci_split_matches_release_policy() {
 }
 
 #[test]
+fn driver_certification_matrix_covers_core_ecosystem() {
+    let ci = repo_file(".github/workflows/ci.yml");
+    let docs = repo_file("docs/driver-certification.md");
+    let release = repo_file("docs/release-checklist.md");
+    let roadmap = repo_file("ROADMAP.md");
+    let harness = repo_file("tests/driver_certification/driver_certification.py");
+
+    for needle in [
+        "libpq",
+        "psql meta-commands",
+        "psycopg2",
+        "psycopg3",
+        "SQLAlchemy",
+        "Django ORM",
+        "Rails ActiveRecord",
+        "Hibernate ORM",
+        "GORM",
+        "Prisma",
+        "Diesel",
+        "node-postgres",
+        "pgx",
+        "lib/pq",
+        "JDBC PostgreSQL driver",
+        "Npgsql",
+        "GUI introspection probes",
+        "pgAdmin",
+        "DBeaver",
+        "DataGrip",
+        "Flyway",
+        "Liquibase",
+        "Alembic",
+    ] {
+        assert!(docs.contains(needle), "driver docs missing {needle}");
+        assert!(roadmap.contains(needle), "ROADMAP missing {needle}");
+        assert!(harness.contains(needle), "cert harness missing {needle}");
+    }
+
+    for needle in [r"\d", r"\dt", r"\di", r"\df", r"\dv", r"\du", r"\l", r"\dn"] {
+        assert!(docs.contains(needle), "driver docs missing {needle}");
+        assert!(
+            release.contains(needle),
+            "release checklist missing {needle}"
+        );
+        assert!(roadmap.contains(needle), "ROADMAP missing {needle}");
+        assert!(harness.contains(needle), "cert harness missing {needle}");
+    }
+    assert!(harness.contains("certify_psql_meta_commands"));
+    assert!(harness.contains("psql meta-command certification failed"));
+
+    for needle in [
+        "actions/setup-node",
+        "actions/setup-go",
+        "actions/setup-java",
+        "actions/setup-dotnet",
+        "ruby/setup-ruby",
+        "bundle install --gemfile tests/driver_certification/rails/Gemfile",
+        "pnpm --dir tests/driver_certification/node install --frozen-lockfile",
+        "go mod download",
+        "dotnet restore",
+        "postgresql-client",
+        "cargo fetch --manifest-path tests/driver_certification/diesel/Cargo.toml",
+        "Alembic==",
+    ] {
+        assert!(ci.contains(needle), "CI driver gate missing {needle}");
+    }
+
+    for needle in [
+        "SQLAlchemy==",
+        "Django==",
+        "Stock psql meta-command coverage",
+        "activerecord",
+        "Hibernate ORM",
+        "GORM",
+        "Prisma",
+        "Diesel",
+        "tests/driver_certification/rails",
+        "tests/driver_certification/node",
+        "tests/driver_certification/go",
+        "tests/driver_certification/hibernate",
+        "tests/driver_certification/diesel",
+        "tests/driver_certification/java",
+        "tests/driver_certification/dotnet",
+        "driver-certification.json",
+        "GUI introspection probes",
+        "pgAdmin",
+        "DBeaver",
+        "DataGrip",
+        "Flyway",
+        "Liquibase",
+        "Alembic",
+    ] {
+        assert!(
+            release.contains(needle),
+            "release checklist missing {needle}"
+        );
+    }
+}
+
+#[test]
 fn release_checklist_maps_69_to_74_to_artifacts() {
     let docs = repo_file("docs/release-checklist.md");
 

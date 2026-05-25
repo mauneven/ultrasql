@@ -18,6 +18,43 @@ async fn startup_handshake_completes() {
 }
 
 #[tokio::test]
+async fn startup_server_version_is_driver_parseable() {
+    let (mut client, server_side) = tokio::io::duplex(8192);
+    let state = server();
+    let handle = tokio::spawn(handle_connection(server_side, state));
+
+    send_frontend(
+        &mut client,
+        &FrontendMessage::StartupMessage {
+            protocol_major: 3,
+            protocol_minor: 0,
+            params: vec![("user".to_string(), "tester".to_string())],
+        },
+    )
+    .await;
+    let msgs = drain_until_ready(&mut client).await;
+    let server_version = msgs
+        .iter()
+        .find_map(|msg| match msg {
+            BackendMessage::ParameterStatus { name, value } if name == "server_version" => {
+                Some(value.as_str())
+            }
+            _ => None,
+        })
+        .expect("server_version ParameterStatus");
+    assert!(
+        server_version
+            .split('.')
+            .all(|part| !part.is_empty() && part.chars().all(|c| c.is_ascii_digit())),
+        "server_version must be numeric for Npgsql, got {server_version:?}"
+    );
+
+    send_frontend(&mut client, &FrontendMessage::Terminate).await;
+    drop(client);
+    handle.await.expect("task joins").expect("clean exit");
+}
+
+#[tokio::test]
 async fn simple_query_returns_three_data_rows() {
     let (mut client, server_side) = tokio::io::duplex(8192);
     let state = server();
@@ -200,6 +237,35 @@ async fn empty_query_returns_empty_query_response() {
 
     complete_startup(&mut client).await;
     send_frontend(&mut client, &FrontendMessage::Query { sql: String::new() }).await;
+    let msgs = drain_until_ready(&mut client).await;
+    assert!(
+        msgs.iter()
+            .any(|m| matches!(m, BackendMessage::EmptyQueryResponse))
+    );
+    assert!(matches!(
+        msgs.last().unwrap(),
+        BackendMessage::ReadyForQuery { status: b'I' }
+    ));
+
+    send_frontend(&mut client, &FrontendMessage::Terminate).await;
+    drop(client);
+    handle.await.expect("task joins").expect("clean exit");
+}
+
+#[tokio::test]
+async fn comment_only_query_returns_empty_query_response() {
+    let (mut client, server_side) = tokio::io::duplex(8192);
+    let state = server();
+    let handle = tokio::spawn(handle_connection(server_side, state));
+
+    complete_startup(&mut client).await;
+    send_frontend(
+        &mut client,
+        &FrontendMessage::Query {
+            sql: "-- ping".to_owned(),
+        },
+    )
+    .await;
     let msgs = drain_until_ready(&mut client).await;
     assert!(
         msgs.iter()

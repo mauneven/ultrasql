@@ -165,19 +165,43 @@ fn coerce_literal_to_match(left: &mut ScalarExpr, right: &mut ScalarExpr) {
 }
 
 fn coerce_literal_side(lit_side: &mut ScalarExpr, ref_side: &ScalarExpr) {
-    let ScalarExpr::Literal { value, data_type } = lit_side else {
+    let target = ref_side.data_type();
+    coerce_literal_to_type(lit_side, &target);
+}
+
+fn coerce_literal_to_type(expr: &mut ScalarExpr, target: &DataType) {
+    let ScalarExpr::Literal { value, data_type } = expr else {
         return;
     };
-    let target = ref_side.data_type();
-    if matches!(target, DataType::Null) || data_type == &target {
+    if matches!(target, DataType::Null) || data_type == target {
         return;
     }
     match (target, &*value) {
+        (DataType::Int16, Value::Int32(v)) => {
+            if let Ok(narrow) = i16::try_from(*v) {
+                *value = Value::Int16(narrow);
+                *data_type = DataType::Int16;
+            }
+        }
+        (DataType::Int16, Value::Int64(v)) => {
+            if let Ok(narrow) = i16::try_from(*v) {
+                *value = Value::Int16(narrow);
+                *data_type = DataType::Int16;
+            }
+        }
+        (DataType::Int32, Value::Int16(v)) => {
+            *value = Value::Int32(i32::from(*v));
+            *data_type = DataType::Int32;
+        }
         (DataType::Int32, Value::Int64(v)) => {
             if let Ok(narrow) = i32::try_from(*v) {
                 *value = Value::Int32(narrow);
                 *data_type = DataType::Int32;
             }
+        }
+        (DataType::Int64, Value::Int16(v)) => {
+            *value = Value::Int64(i64::from(*v));
+            *data_type = DataType::Int64;
         }
         (DataType::Int64, Value::Int32(v)) => {
             *value = Value::Int64(i64::from(*v));
@@ -195,6 +219,10 @@ fn coerce_literal_side(lit_side: &mut ScalarExpr, ref_side: &ScalarExpr) {
         }
         // Int → Float widening (e.g. id (Int32) = 42 (Int32 lit) is fine;
         // this hits when comparing a Float column to an integer literal).
+        (DataType::Float64, Value::Int16(v)) => {
+            *value = Value::Float64(f64::from(*v));
+            *data_type = DataType::Float64;
+        }
         (DataType::Float64, Value::Int32(v)) => {
             *value = Value::Float64(f64::from(*v));
             *data_type = DataType::Float64;
@@ -204,6 +232,10 @@ fn coerce_literal_side(lit_side: &mut ScalarExpr, ref_side: &ScalarExpr) {
             let widened = *v as f64;
             *value = Value::Float64(widened);
             *data_type = DataType::Float64;
+        }
+        (DataType::Float32, Value::Int16(v)) => {
+            *value = Value::Float32(f32::from(*v));
+            *data_type = DataType::Float32;
         }
         _ => {}
     }
@@ -299,6 +331,14 @@ where
             // `DataType::Null` and we don't want a downstream panic.
             let new_rows: Vec<Vec<ScalarExpr>> =
                 rows.iter().map(|row| row.iter().map(f).collect()).collect();
+            let mut new_rows = new_rows;
+            for row in &mut new_rows {
+                for (ci, cell) in row.iter_mut().enumerate() {
+                    if let Some(field) = schema.fields().get(ci) {
+                        coerce_literal_to_type(cell, &field.data_type);
+                    }
+                }
+            }
             let new_schema = rebuild_values_schema(schema, &new_rows);
             LogicalPlan::Values {
                 rows: new_rows,

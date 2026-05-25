@@ -1978,11 +1978,7 @@ pub(super) fn lower_project_columns(
         for (e, name) in exprs {
             fields.push(ultrasql_core::Field::nullable(name.clone(), e.data_type()));
         }
-        let output_schema = ultrasql_core::Schema::new(fields).map_err(|e| {
-            ServerError::Plan(ultrasql_planner::PlanError::TypeMismatch(format!(
-                "projection schema: {e}"
-            )))
-        })?;
+        let output_schema = ultrasql_core::Schema::new_with_duplicate_names(fields);
         return ultrasql_executor::ProjectExprs::new(child, exprs, output_schema)
             .map(|op| Box::new(op) as Box<dyn Operator>)
             .map_err(|e| {
@@ -2030,11 +2026,7 @@ pub(super) fn lower_project_columns(
         .iter()
         .map(|(expr, name)| ultrasql_core::Field::nullable(name.clone(), expr.data_type()))
         .collect();
-    let output_schema = ultrasql_core::Schema::new(fields).map_err(|e| {
-        ServerError::Plan(ultrasql_planner::PlanError::TypeMismatch(format!(
-            "projection schema: {e}"
-        )))
-    })?;
+    let output_schema = ultrasql_core::Schema::new_with_duplicate_names(fields);
     Ok(Box::new(Project::with_schema(
         child,
         indices,

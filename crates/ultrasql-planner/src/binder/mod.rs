@@ -244,10 +244,18 @@ fn bind_set_var(stmt: &SetVarStmt) -> Result<LogicalPlan, PlanError> {
             LogicalSetVariableAction::Set | LogicalSetVariableAction::SetLocal,
             SetValue::Values(v),
         ) => {
-            if v.len() != 1 {
+            if v.len() == 1 {
+                Some(set_value_to_string(&v[0])?)
+            } else if name == "search_path" {
+                Some(
+                    v.iter()
+                        .map(set_search_path_value_to_string)
+                        .collect::<Result<Vec<_>, _>>()?
+                        .join(", "),
+                )
+            } else {
                 return Err(PlanError::NotSupported("SET with multiple values"));
             }
-            Some(set_value_to_string(&v[0])?)
         }
     };
     let schema = if action == LogicalSetVariableAction::Show {
@@ -289,6 +297,19 @@ fn set_value_to_string(expr: &AstExpr) -> Result<String, PlanError> {
         AstExpr::Column { name } if name.parts.len() == 1 => Ok(name.parts[0].value.clone()),
         _ => Err(PlanError::NotSupported("SET value expression")),
     }
+}
+
+fn set_search_path_value_to_string(expr: &AstExpr) -> Result<String, PlanError> {
+    match expr {
+        AstExpr::Column { name } if name.parts.len() == 1 && name.parts[0].quoted => {
+            Ok(quote_identifier(&name.parts[0].value))
+        }
+        _ => set_value_to_string(expr),
+    }
+}
+
+fn quote_identifier(value: &str) -> String {
+    format!("\"{}\"", value.replace('"', "\"\""))
 }
 
 /// Bind an `EXPLAIN [ANALYZE] [(FORMAT TEXT|JSON)] stmt`.
@@ -749,8 +770,7 @@ fn bind_select_body(
             .iter()
             .map(|(e, name)| Field::nullable(name, e.data_type()))
             .collect();
-        let proj_schema = Schema::new(proj_fields)
-            .map_err(|e| PlanError::TypeMismatch(format!("projection: {e}")))?;
+        let proj_schema = Schema::new_with_duplicate_names(proj_fields);
 
         plan = LogicalPlan::Project {
             input: Box::new(plan),
@@ -773,8 +793,7 @@ fn bind_select_body(
             .iter()
             .map(|(e, name)| Field::nullable(name, e.data_type()))
             .collect();
-        let proj_schema = Schema::new(proj_fields)
-            .map_err(|e| PlanError::TypeMismatch(format!("projection: {e}")))?;
+        let proj_schema = Schema::new_with_duplicate_names(proj_fields);
 
         plan = LogicalPlan::Project {
             input: Box::new(plan),

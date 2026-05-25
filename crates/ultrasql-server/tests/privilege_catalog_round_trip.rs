@@ -357,6 +357,28 @@ async fn role_inheritance_and_set_role_gate_privileges() {
 }
 
 #[tokio::test]
+async fn set_role_to_uncataloged_session_user_is_self_reset_compatible() {
+    let running = start_sample_server("set_role_self_compatibility_test").await;
+    let (client, connection) =
+        connect_as(running.bound, "driver_cert", "set_role_self_compatibility").await;
+
+    client
+        .batch_execute("SET ROLE 'driver_cert'")
+        .await
+        .expect("SET ROLE to the session user should be accepted");
+    let row = client
+        .query_one("SELECT current_user, session_user", &[])
+        .await
+        .expect("identity functions after self SET ROLE");
+    assert_eq!(row.get::<_, String>(0), "driver_cert");
+    assert_eq!(row.get::<_, String>(1), "driver_cert");
+
+    drop(client);
+    connection.await.expect("driver_cert connection joins");
+    shutdown(running).await;
+}
+
+#[tokio::test]
 async fn default_privileges_apply_to_future_objects_only() {
     let running = start_sample_server("default_privilege_catalog_test").await;
     let client = &running.client;

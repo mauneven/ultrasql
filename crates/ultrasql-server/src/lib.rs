@@ -63,6 +63,11 @@ pub mod wal_sink;
 pub mod wire_writer;
 pub mod workload;
 
+/// PostgreSQL-compatible numeric `server_version` exposed in startup
+/// `ParameterStatus` and `pg_settings`. Drivers parse this as a PostgreSQL
+/// feature baseline; UltraSQL's own product version remains `version()`.
+pub(crate) const POSTGRES_COMPAT_SERVER_VERSION: &str = "14.0";
+
 use std::future::Future;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
@@ -1425,6 +1430,34 @@ impl AdvisorySessionState {
                 Ok(Value::Null)
             }
             _ => Err(ServerError::Unsupported("advisory lock function")),
+        }
+    }
+
+    /// Evaluate a PostgreSQL transaction-scoped advisory-lock function.
+    pub fn evaluate_transaction_function(
+        &self,
+        name: &str,
+        args: &[Value],
+        lock_manager: &LockManager,
+        owner: Xid,
+    ) -> Result<Value, ServerError> {
+        match name {
+            "pg_try_advisory_xact_lock" => {
+                let Some(tag) = advisory_tag_from_values(name, args)? else {
+                    return Ok(Value::Null);
+                };
+                let acquired = lock_manager
+                    .try_acquire(LockRequest {
+                        xid: owner,
+                        tag,
+                        mode: LockMode::Exclusive,
+                    })
+                    .map_err(|err| advisory_type_error(format!("{name}: {err}")))?;
+                Ok(Value::Bool(acquired))
+            }
+            _ => Err(ServerError::Unsupported(
+                "transaction advisory lock function",
+            )),
         }
     }
 

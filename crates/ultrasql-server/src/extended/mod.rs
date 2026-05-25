@@ -222,6 +222,9 @@ pub struct PreparedStatement {
     /// Number of distinct `$N` placeholder slots referenced in `plan`.
     /// Equal to the highest `index` seen; `$1`+`$3` yields `n_params=3`.
     pub n_params: u32,
+    /// `$N` slots used only by LIMIT/OFFSET. These are rebound at Bind
+    /// time because the logical plan stores row caps as integers.
+    pub limit_offset_param_indexes: Vec<u32>,
 }
 
 /// A bound portal: a prepared statement plus the parameter values

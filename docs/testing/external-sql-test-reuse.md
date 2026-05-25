@@ -17,6 +17,9 @@ Use these sources conservatively:
   and provenance are recorded.
 - PostgreSQL regression-derived cases: useful for PostgreSQL compatibility.
   Preserve upstream notices and record the exact source commit.
+- Hermitage isolation scenarios: useful for transaction-isolation compatibility.
+  Preserve CC BY 4.0 attribution and pin the exact source commit; port reviewed
+  scenarios into local tests instead of vendoring the upstream Markdown dump.
 - DuckDB SQLLogicTest-style files: useful as inspiration. Check each file's
   license before copying concrete tests.
 
@@ -47,6 +50,10 @@ crates/ultrasql-sqllogictest-runner/
 `third_party/sqllogictest/` is a control area. Imported test files should live
 under `tests/slt/portable/imported/` or a reviewed suite-specific subdirectory,
 not loose under `third_party/`.
+
+Transaction isolation suites live under `tests/isolation/` because they require
+coordinated multi-connection schedules rather than single-connection
+SQLLogicTest records.
 
 ## Runner design
 
@@ -148,8 +155,11 @@ tests/slt/run_postgres_compat.sh
 The first curated shard lives under
 `tests/slt/postgres_compat/regression_subset/`. It pins PostgreSQL commit
 `ddd12d1a5c4d980c5f31dc7d096012547b724e55`, records
-`src/test/regress/sql/select.sql` as the source, and carries the PostgreSQL
-license next to the SLT file.
+`src/test/regress/sql/select.sql`, `char.sql`, `varchar.sql`, `numeric.sql`,
+and `type_sanity.sql` as sources, and carries the PostgreSQL license next to
+the SLT files. The parser/type shard keeps unsupported PostgreSQL catalog
+breadth checks as explicit `# ultrasql:skip` records instead of silently
+dropping them.
 
 Multiple reference engines can run in one pass:
 

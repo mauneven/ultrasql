@@ -188,6 +188,28 @@ fn postfix_cast_chain() {
 }
 
 #[test]
+fn postfix_cast_accepts_schema_qualified_pg_catalog_type() {
+    let expr = parse_expr("x::pg_catalog.regtype::pg_catalog.text");
+    let Expr::PostfixCast {
+        expr: inner,
+        target: outer_target,
+        ..
+    } = expr
+    else {
+        panic!()
+    };
+    assert_eq!(outer_target.value, "text");
+    let Expr::PostfixCast {
+        target: inner_target,
+        ..
+    } = *inner
+    else {
+        panic!()
+    };
+    assert_eq!(inner_target.value, "regtype");
+}
+
+#[test]
 fn postfix_cast_missing_type_is_error() {
     let err = parse_err("x::");
     assert!(matches!(

@@ -239,3 +239,58 @@ async fn oid_regclass_regtype_pg_lsn_store_cast_wire_and_restart() {
     );
     shutdown(running).await;
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn pg_type_probe_matches_psycopg_typeinfo_shape() {
+    let data_dir = tempfile::TempDir::new().unwrap();
+    let running = start_persistent_server(data_dir.path(), "pg_type_typeinfo_probe").await;
+
+    let known = simple_rows(
+        running
+            .client
+            .simple_query(
+                "SELECT
+                    typname AS name,
+                    oid,
+                    typarray AS array_oid,
+                    oid::regtype::text AS regtype,
+                    typdelim AS delimiter
+                FROM pg_type t
+                WHERE t.oid = to_regtype('int4')
+                ORDER BY t.oid",
+            )
+            .await
+            .expect("psycopg typeinfo probe for built-in type"),
+    );
+    assert_eq!(
+        known,
+        vec![vec![
+            "int4".to_owned(),
+            "23".to_owned(),
+            "1007".to_owned(),
+            "23".to_owned(),
+            ",".to_owned(),
+        ]]
+    );
+
+    let missing = simple_rows(
+        running
+            .client
+            .simple_query(
+                "SELECT
+                    typname AS name,
+                    oid,
+                    typarray AS array_oid,
+                    oid::regtype::text AS regtype,
+                    typdelim AS delimiter
+                FROM pg_type t
+                WHERE t.oid = to_regtype('hstore')
+                ORDER BY t.oid",
+            )
+            .await
+            .expect("psycopg typeinfo probe for absent extension type"),
+    );
+    assert!(missing.is_empty());
+
+    shutdown(running).await;
+}

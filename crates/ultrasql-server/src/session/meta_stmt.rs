@@ -94,6 +94,7 @@ where
                 plan_hash,
                 param_type_oids: Vec::new(),
                 n_params,
+                limit_offset_param_indexes: Vec::new(),
             },
         );
         Ok(simple_tag("PREPARE"))

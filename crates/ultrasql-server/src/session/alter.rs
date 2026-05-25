@@ -14,7 +14,7 @@ use tracing::{debug, error, info, warn};
 use ultrasql_catalog::{
     CatalogSnapshot, IndexEntry, MutableCatalog, PersistentCatalog, TableEntry,
 };
-use ultrasql_core::{DataType, PageId, RelationId, Value};
+use ultrasql_core::{BlockNumber, DataType, PageId, RelationId, Value};
 use ultrasql_optimizer::{NoStats, PlanCache, PlanCacheConfig, PlanCacheKey, StatsSource};
 use ultrasql_parser::Parser;
 use ultrasql_planner::{
@@ -39,6 +39,14 @@ use crate::{
     BlankPageLoader, CombinedCatalog, Server, TxnState, decode_key_column, notice_warning,
     run_plan_in_txn,
 };
+
+struct AlterRewriteIndexUpdate<'a> {
+    old_row: &'a [Value],
+    new_row: &'a [Value],
+    old_tid: ultrasql_core::TupleId,
+    new_tid: ultrasql_core::TupleId,
+    xid: ultrasql_core::Xid,
+}
 
 impl<RW> Session<RW>
 where
@@ -112,7 +120,95 @@ where
             LogicalAlterTableAction::SetOptions { options } => {
                 self.execute_alter_set_options(table_name, options, snapshot)
             }
+            LogicalAlterTableAction::AddUniqueConstraint { constraint } => {
+                self.execute_alter_add_unique_constraint(table_name, constraint, snapshot)
+            }
         }
+    }
+
+    fn execute_alter_add_unique_constraint(
+        &self,
+        table_name: &str,
+        constraint: &ultrasql_planner::LogicalUniqueConstraint,
+        snapshot: &CatalogSnapshot,
+    ) -> Result<SelectResult, ServerError> {
+        let table = snapshot.tables.get(table_name).ok_or_else(|| {
+            ServerError::Plan(ultrasql_planner::PlanError::TableNotFound(
+                table_name.to_owned(),
+            ))
+        })?;
+        if constraint.primary_key {
+            for &column in &constraint.columns {
+                let field = table.schema.field(column).ok_or_else(|| {
+                    ServerError::ddl(format!(
+                        "ALTER TABLE ADD PRIMARY KEY: column index {column} missing"
+                    ))
+                })?;
+                if field.nullable {
+                    return Err(ServerError::Unsupported(
+                        "ALTER TABLE ADD PRIMARY KEY currently requires NOT NULL columns",
+                    ));
+                }
+            }
+        }
+        let create_index = LogicalPlan::CreateIndex {
+            index_name: constraint.name.clone(),
+            table_name: table_name.to_owned(),
+            columns: constraint.columns.clone(),
+            key_exprs: Vec::new(),
+            opclasses: vec![None; constraint.columns.len()],
+            index_options: Vec::new(),
+            include_columns: Vec::new(),
+            predicate: None,
+            method: ultrasql_planner::LogicalIndexMethod::Btree,
+            aggregating: None,
+            unique: true,
+            concurrently: false,
+            if_not_exists: false,
+            schema: ultrasql_core::Schema::empty(),
+        };
+        let _ = self.execute_create_index(&create_index, snapshot)?;
+        let constraint_row = ultrasql_catalog::persistent::ConstraintRow {
+            oid: self.state.persistent_catalog.next_oid(),
+            conname: constraint.name.clone(),
+            conrelid: table.oid,
+            contype: if constraint.primary_key {
+                ultrasql_catalog::persistent::ConType::PrimaryKey
+            } else {
+                ultrasql_catalog::persistent::ConType::Unique
+            },
+            condeferrable: false,
+            condeferred: false,
+            conkey: alter_constraint_attnums(&constraint.columns, &constraint.name)?,
+            confrelid: ultrasql_core::Oid::INVALID,
+            confkey: Vec::new(),
+        };
+        let ddl_txn = self
+            .state
+            .txn_manager
+            .begin(ultrasql_txn::IsolationLevel::ReadCommitted);
+        if let Err(e) = self.state.persistent_catalog.persist_constraint_row(
+            &constraint_row,
+            self.state.heap.as_ref(),
+            ddl_txn.xid,
+            ddl_txn.current_command,
+        ) {
+            if let Err(abort_err) = self.state.txn_manager.abort(ddl_txn) {
+                tracing::warn!(
+                    error = %abort_err,
+                    "abort of catalog-write txn failed after ALTER TABLE ADD CONSTRAINT",
+                );
+            }
+            let _ = self.state.persistent_catalog.drop_index(&constraint.name);
+            return Err(e.into());
+        }
+        self.state.commit_transaction(
+            ddl_txn,
+            true,
+            "ALTER TABLE ADD CONSTRAINT catalog transaction",
+        )?;
+        self.plan_cache_invalidate();
+        Ok(run_ddl_command("ALTER TABLE"))
     }
 
     fn execute_alter_set_options(
@@ -431,12 +527,13 @@ where
 
             // Now perform the updates.
             for (tid, old_row) in to_rewrite {
-                let mut new_row = old_row;
+                let mut new_row = old_row.clone();
                 new_row.push(Value::Null);
                 let new_payload = new_codec
                     .encode(&new_row)
                     .map_err(|e| ServerError::ddl(format!("ALTER TABLE row encode: {e}")))?;
-                self.state
+                let outcome = self
+                    .state
                     .heap
                     .update(
                         tid,
@@ -450,6 +547,17 @@ where
                         },
                     )
                     .map_err(|e| ServerError::ddl(format!("ALTER TABLE heap update: {e}")))?;
+                self.maintain_indexes_for_alter_rewrite(
+                    entry,
+                    snapshot,
+                    AlterRewriteIndexUpdate {
+                        old_row: &old_row,
+                        new_row: &new_row,
+                        old_tid: tid,
+                        new_tid: outcome.new_tid,
+                        xid: txn.xid,
+                    },
+                )?;
             }
             Ok(())
         })();
@@ -464,6 +572,10 @@ where
                     .state
                     .persistent_catalog
                     .alter_table_add_column(table_name, column)?;
+                self.resize_runtime_column_metadata_after_add_column(
+                    entry.oid,
+                    updated_entry.schema.len(),
+                );
                 if let Err(e) = self
                     .state
                     .persistent_catalog
@@ -500,6 +612,87 @@ where
                 Err(e)
             }
         }
+    }
+
+    fn resize_runtime_column_metadata_after_add_column(
+        &self,
+        table_oid: ultrasql_core::Oid,
+        width: usize,
+    ) {
+        let Some(existing) = self.state.table_constraints.get(&table_oid) else {
+            return;
+        };
+        let mut constraints = existing.value().as_ref().clone();
+        constraints.defaults.resize(width, None);
+        constraints.sequence_defaults.resize(width, None);
+        constraints.identity_always.resize(width, false);
+        constraints.generated_stored.resize(width, None);
+        drop(existing);
+        self.state
+            .table_constraints
+            .insert(table_oid, Arc::new(constraints));
+    }
+
+    fn maintain_indexes_for_alter_rewrite(
+        &self,
+        table: &TableEntry,
+        snapshot: &CatalogSnapshot,
+        update: AlterRewriteIndexUpdate<'_>,
+    ) -> Result<(), ServerError> {
+        let Some(indexes) = snapshot.indexes_by_table.get(&table.oid) else {
+            return Ok(());
+        };
+        let wal = self.state.heap.wal_sink().map(|sink| sink.as_ref());
+        for index in indexes {
+            if index.root_block == BlockNumber::INVALID {
+                continue;
+            }
+            let columns = index
+                .columns
+                .iter()
+                .map(|column| usize::from(*column))
+                .collect::<Vec<_>>();
+            let encoding =
+                crate::index_key::IndexKeyEncoding::for_columns(&table.schema, &columns)?;
+            let old_key = alter_encode_index_key(&encoding, &columns, update.old_row, &index.name)?;
+            let new_key = alter_encode_index_key(&encoding, &columns, update.new_row, &index.name)?;
+            if old_key == new_key {
+                if let Some(key) = old_key {
+                    let mut tree = BTree::open(
+                        Arc::clone(self.state.heap.buffer_pool()),
+                        RelationId::new(index.oid.raw()),
+                        index.root_block,
+                    );
+                    let _ = tree
+                        .delete_logged::<i64>(key, update.old_tid, update.xid, wal)
+                        .map_err(|e| {
+                            ServerError::ddl(format!(
+                                "ALTER TABLE index delete {}: {e}",
+                                index.name
+                            ))
+                        })?;
+                    let result = if index.is_unique {
+                        tree.insert::<i64>(key, update.new_tid, update.xid, wal)
+                    } else {
+                        tree.insert_non_unique::<i64>(key, update.new_tid, update.xid, wal)
+                    };
+                    result.map_err(|e| match e {
+                        ultrasql_storage::btree::BTreeError::DuplicateKey => ServerError::Execute(
+                            ultrasql_executor::ExecError::UniqueViolation(index.name.clone()),
+                        ),
+                        other => ServerError::ddl(format!(
+                            "ALTER TABLE index insert {}: {other}",
+                            index.name
+                        )),
+                    })?;
+                }
+                continue;
+            }
+            return Err(ServerError::Unsupported(
+                "ALTER TABLE rewrite changed an index key unexpectedly",
+            ));
+        }
+        Ok(())
     }
 
     /// Empty every relation named in the `TRUNCATE` statement.
@@ -734,5 +927,38 @@ where
                 return Ok(truncate_tables);
             }
         }
+    }
+}
+
+fn alter_constraint_attnums(columns: &[usize], name: &str) -> Result<Vec<i16>, ServerError> {
+    columns
+        .iter()
+        .map(|col| {
+            let attnum = col.checked_add(1).ok_or(ServerError::Unsupported(
+                "ALTER TABLE: constraint attnum overflow",
+            ))?;
+            i16::try_from(attnum).map_err(|_| {
+                ServerError::ddl(format!(
+                    "ALTER TABLE: constraint {name} column position {attnum} does not fit i16"
+                ))
+            })
+        })
+        .collect()
+}
+
+fn alter_encode_index_key(
+    encoding: &crate::index_key::IndexKeyEncoding,
+    columns: &[usize],
+    row: &[Value],
+    index_name: &str,
+) -> Result<Option<i64>, ServerError> {
+    match columns {
+        [col] => {
+            let value = row.get(*col).ok_or_else(|| {
+                ServerError::ddl(format!("index {index_name}: row missing key column {col}"))
+            })?;
+            encoding.encode_value(value)
+        }
+        _ => encoding.encode_row(row),
     }
 }

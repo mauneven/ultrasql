@@ -3,7 +3,7 @@
 
 use std::sync::Arc;
 
-use ultrasql_core::{RelationId, Schema, Value, constants::PAGE_SIZE};
+use ultrasql_core::{DataType, RelationId, Schema, Value, constants::PAGE_SIZE};
 use ultrasql_executor::unique::UniqueMode;
 use ultrasql_executor::{
     Filter, HashAggregate, Limit, Operator, ProfiledOperator, ResultOp, Sort, Unique, ValuesScan,
@@ -647,6 +647,23 @@ fn rewrite_catalog_scalar_expr(
             expr: Box::new(rewrite_catalog_scalar_expr(inner, ctx)?),
             negated: *negated,
         }),
+        ScalarExpr::Exists {
+            subplan,
+            negated,
+            correlated,
+        } => {
+            if *correlated {
+                return Err(ServerError::Unsupported(
+                    "correlated EXISTS in projection is not supported",
+                ));
+            }
+            let mut op = lower_query(subplan, ctx)?;
+            let exists = op.next_batch()?.is_some_and(|batch| !batch.is_empty());
+            Ok(ScalarExpr::Literal {
+                value: Value::Bool(if *negated { !exists } else { exists }),
+                data_type: DataType::Bool,
+            })
+        }
         ScalarExpr::FunctionCall {
             name,
             args,
@@ -713,8 +730,18 @@ fn rewrite_catalog_scalar_expr(
                     "advisory lock functions require session context",
                 ));
             };
+            let value = if is_transaction_advisory_lock_function(name) {
+                state.evaluate_transaction_function(
+                    name,
+                    &values,
+                    &ctx.oracle.lock_manager,
+                    ctx.xid,
+                )?
+            } else {
+                state.evaluate_function(name, &values, &ctx.oracle.lock_manager)?
+            };
             Ok(ScalarExpr::Literal {
-                value: state.evaluate_function(name, &values, &ctx.oracle.lock_manager)?,
+                value,
                 data_type: data_type.clone(),
             })
         }
@@ -742,9 +769,14 @@ fn is_advisory_lock_function(name: &str) -> bool {
         name,
         "pg_advisory_lock"
             | "pg_try_advisory_lock"
+            | "pg_try_advisory_xact_lock"
             | "pg_advisory_unlock"
             | "pg_advisory_unlock_all"
     )
+}
+
+fn is_transaction_advisory_lock_function(name: &str) -> bool {
+    matches!(name, "pg_try_advisory_xact_lock")
 }
 
 fn is_privilege_check_function(name: &str) -> bool {

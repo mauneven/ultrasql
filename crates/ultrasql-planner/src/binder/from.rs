@@ -1813,20 +1813,13 @@ fn build_using_schema(
 
 pub(super) fn concat_schemas_cross(left: &Schema, right: &Schema) -> Result<Schema, PlanError> {
     let mut fields: Vec<Field> = Vec::with_capacity(left.len() + right.len());
-    let left_names: std::collections::HashSet<String> = left
-        .fields()
-        .iter()
-        .map(|f| f.name.to_ascii_lowercase())
-        .collect();
+    let mut used_names = std::collections::HashSet::new();
     for f in left.fields() {
+        used_names.insert(f.name.to_ascii_lowercase());
         fields.push(f.clone());
     }
     for f in right.fields() {
-        let name = if left_names.contains(&f.name.to_ascii_lowercase()) {
-            format!("{}_1", f.name)
-        } else {
-            f.name.clone()
-        };
+        let name = unique_join_field_name(&f.name, &mut used_names);
         fields.push(Field {
             name,
             data_type: f.data_type.clone(),
@@ -1850,14 +1843,10 @@ pub(super) fn concat_schemas_for_join(
         LogicalJoinType::LeftOuter | LogicalJoinType::FullOuter
     );
 
-    let left_names: std::collections::HashSet<String> = left
-        .fields()
-        .iter()
-        .map(|f| f.name.to_ascii_lowercase())
-        .collect();
-
     let mut fields: Vec<Field> = Vec::with_capacity(left.len() + right.len());
+    let mut used_names = std::collections::HashSet::new();
     for f in left.fields() {
+        used_names.insert(f.name.to_ascii_lowercase());
         fields.push(Field {
             name: f.name.clone(),
             data_type: f.data_type.clone(),
@@ -1865,11 +1854,7 @@ pub(super) fn concat_schemas_for_join(
         });
     }
     for f in right.fields() {
-        let name = if left_names.contains(&f.name.to_ascii_lowercase()) {
-            format!("{}_1", f.name)
-        } else {
-            f.name.clone()
-        };
+        let name = unique_join_field_name(&f.name, &mut used_names);
         fields.push(Field {
             name,
             data_type: f.data_type.clone(),
@@ -1877,6 +1862,22 @@ pub(super) fn concat_schemas_for_join(
         });
     }
     Schema::new(fields).map_err(|e| PlanError::TypeMismatch(format!("join schema: {e}")))
+}
+
+fn unique_join_field_name(
+    base: &str,
+    used_names: &mut std::collections::HashSet<String>,
+) -> String {
+    if used_names.insert(base.to_ascii_lowercase()) {
+        return base.to_owned();
+    }
+    for suffix in 1.. {
+        let candidate = format!("{base}_{suffix}");
+        if used_names.insert(candidate.to_ascii_lowercase()) {
+            return candidate;
+        }
+    }
+    unreachable!("unbounded suffix search returns before overflow")
 }
 
 pub(super) fn merge_scopes(

@@ -85,6 +85,21 @@ impl Schema {
         })
     }
 
+    /// Build a schema that preserves duplicate SQL output labels.
+    ///
+    /// PostgreSQL permits result sets such as `SELECT f(), f()` to expose the
+    /// same column label twice. This constructor is intended for final
+    /// projection/RETURNING schemas where fields are addressed by ordinal on
+    /// the wire. Name lookup methods continue to return the first matching
+    /// field, so internal relation schemas should keep using [`Schema::new`].
+    #[must_use]
+    pub fn new_with_duplicate_names<I: IntoIterator<Item = Field>>(fields: I) -> Self {
+        let fields: Vec<Field> = fields.into_iter().collect();
+        Self {
+            fields: fields.into(),
+        }
+    }
+
     /// Build an empty schema (zero columns). Used for plans that
     /// produce no projected columns (e.g., `EXISTS` subqueries
     /// pre-rewrite).
@@ -219,6 +234,19 @@ mod tests {
             Field::required("A", DataType::Int32),
         ]);
         assert!(dup.is_err());
+    }
+
+    #[test]
+    fn output_schema_preserves_duplicate_labels() {
+        let schema = Schema::new_with_duplicate_names([
+            Field::required("pg_get_expr", DataType::Text { max_len: None }),
+            Field::required("pg_get_expr", DataType::Text { max_len: None }),
+        ]);
+
+        assert_eq!(schema.len(), 2);
+        assert_eq!(schema.field_at(0).name, "pg_get_expr");
+        assert_eq!(schema.field_at(1).name, "pg_get_expr");
+        assert_eq!(schema.index_of("pg_get_expr").unwrap(), 0);
     }
 
     #[test]

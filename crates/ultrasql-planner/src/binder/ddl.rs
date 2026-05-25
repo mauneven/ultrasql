@@ -213,7 +213,7 @@ pub(super) fn bind_create_table(
                 "CREATE TABLE: DEFAULT may not reference rows, parameters, or subqueries",
             ));
         }
-        coerce_literal_to_type(&mut bound, &columns.field_at(idx).data_type);
+        coerce_default_expr_to_type(&mut bound, &columns.field_at(idx).data_type);
         let target = &columns.field_at(idx).data_type;
         let actual = bound.data_type();
         if actual != target.clone() && actual != DataType::Null {
@@ -245,7 +245,7 @@ pub(super) fn bind_create_table(
                 "CREATE TABLE: generated stored expression may not reference generated columns",
             ));
         }
-        coerce_literal_to_type(&mut bound, &columns.field_at(idx).data_type);
+        coerce_default_expr_to_type(&mut bound, &columns.field_at(idx).data_type);
         let target = &columns.field_at(idx).data_type;
         let actual = bound.data_type();
         if actual != target.clone() && actual != DataType::Null {
@@ -1042,6 +1042,21 @@ fn is_default_safe(expr: &ScalarExpr) -> bool {
     }
 }
 
+fn coerce_default_expr_to_type(expr: &mut ScalarExpr, target: &DataType) {
+    coerce_literal_to_type(expr, target);
+    if let (
+        DataType::Timestamp,
+        ScalarExpr::FunctionCall {
+            name, data_type, ..
+        },
+    ) = (target, expr)
+        && matches!(name.as_str(), "now" | "current_timestamp")
+        && matches!(data_type, DataType::TimestampTz)
+    {
+        *data_type = DataType::Timestamp;
+    }
+}
+
 fn is_generated_stored_safe(expr: &ScalarExpr) -> bool {
     match expr {
         ScalarExpr::Literal { .. } | ScalarExpr::Column { .. } => true,
@@ -1165,7 +1180,7 @@ pub(super) fn resolve_type_name(t: &TypeName) -> Result<DataType, PlanError> {
         "macaddr8" => Ok(DataType::MacAddr8),
         "time" | "time without time zone" => Ok(DataType::Time),
         "timetz" | "time with time zone" => Ok(DataType::TimeTz),
-        "timestamp" => Ok(DataType::Timestamp),
+        "timestamp" | "timestamp without time zone" => Ok(DataType::Timestamp),
         "timestamptz" | "timestamp with time zone" => Ok(DataType::TimestampTz),
         "uuid" => Ok(DataType::Uuid),
         "int4range" => Ok(DataType::Range(RangeType::Int4)),
@@ -2080,14 +2095,13 @@ pub(super) fn bind_drop_table(
 // ALTER TABLE
 // ---------------------------------------------------------------------------
 
-/// Bind an `ALTER TABLE name ADD [COLUMN] col type` statement.
+/// Bind an `ALTER TABLE` statement.
 ///
-/// This wave supports only `ADD COLUMN`. Every other parser-level
-/// action (`DROP COLUMN`, `RENAME COLUMN`, `RENAME TO`,
-/// `ADD CONSTRAINT`, `DROP CONSTRAINT`) is rejected with
-/// [`PlanError::NotSupported`] so the dispatcher contract stays
-/// honest; subsequent waves can add arms as the executor grows the
-/// matching kernel.
+/// This wave supports `ADD COLUMN`, `DROP COLUMN`, renames, storage
+/// options, row security enablement, and PostgreSQL migration-tool
+/// `ADD CONSTRAINT ... PRIMARY KEY/UNIQUE`. Other constraint kinds
+/// are rejected with [`PlanError::NotSupported`] so the dispatcher
+/// contract stays honest.
 ///
 /// For `ADD COLUMN` the binder resolves the column's data type and
 /// nullability against the same v0.5 column-constraint matrix used by
@@ -2170,10 +2184,14 @@ pub(super) fn bind_alter_table(
                 .collect::<Result<Vec<_>, PlanError>>()?;
             LogicalAlterTableAction::SetOptions { options }
         }
-        AlterTableAction::AddConstraint { .. } => {
-            return Err(PlanError::NotSupported(
-                "ALTER TABLE: ADD CONSTRAINT not yet supported",
-            ));
+        AlterTableAction::AddConstraint { constraint, .. } => {
+            LogicalAlterTableAction::AddUniqueConstraint {
+                constraint: bind_alter_add_unique_constraint(
+                    &table_name,
+                    table_schema,
+                    constraint,
+                )?,
+            }
         }
         AlterTableAction::DropConstraint { .. } => {
             return Err(PlanError::NotSupported(
@@ -2186,6 +2204,73 @@ pub(super) fn bind_alter_table(
         table_name,
         action,
         schema: Schema::empty(),
+    })
+}
+
+fn bind_alter_add_unique_constraint(
+    table_name: &str,
+    table_schema: &Schema,
+    constraint: &TableConstraint,
+) -> Result<LogicalUniqueConstraint, PlanError> {
+    let (name, raw_columns, primary_key) = match constraint {
+        TableConstraint::PrimaryKey { name, columns, .. } => (
+            named_or(name.as_ref(), || {
+                unique_name(
+                    table_name,
+                    &columns
+                        .iter()
+                        .map(|column| column.value.to_ascii_lowercase())
+                        .collect::<Vec<_>>(),
+                    true,
+                )
+            }),
+            columns,
+            true,
+        ),
+        TableConstraint::Unique { name, columns, .. } => (
+            named_or(name.as_ref(), || {
+                unique_name(
+                    table_name,
+                    &columns
+                        .iter()
+                        .map(|column| column.value.to_ascii_lowercase())
+                        .collect::<Vec<_>>(),
+                    false,
+                )
+            }),
+            columns,
+            false,
+        ),
+        TableConstraint::Check { .. }
+        | TableConstraint::ForeignKey { .. }
+        | TableConstraint::Exclude { .. } => {
+            return Err(PlanError::NotSupported(
+                "ALTER TABLE: ADD CONSTRAINT supports only PRIMARY KEY and UNIQUE",
+            ));
+        }
+    };
+    if raw_columns.is_empty() {
+        return Err(PlanError::NotSupported(
+            "ALTER TABLE: empty unique constraints are not supported",
+        ));
+    }
+    let mut columns = Vec::with_capacity(raw_columns.len());
+    for column in raw_columns {
+        let raw = column.value.to_ascii_lowercase();
+        let (idx, field) = table_schema
+            .find(&raw)
+            .ok_or_else(|| PlanError::ColumnNotFound(column.value.clone()))?;
+        if primary_key && field.nullable {
+            return Err(PlanError::NotSupported(
+                "ALTER TABLE: ADD PRIMARY KEY currently requires NOT NULL columns",
+            ));
+        }
+        columns.push(idx);
+    }
+    Ok(LogicalUniqueConstraint {
+        name,
+        columns,
+        primary_key,
     })
 }
 

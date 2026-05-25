@@ -138,6 +138,14 @@ where
             },
             None => return Ok(()),
         };
+        if self
+            .extended
+            .statements
+            .get(name)
+            .is_some_and(|stmt| !stmt.limit_offset_param_indexes.is_empty())
+        {
+            return Ok(());
+        }
         let is_optimizable = matches!(
             &bound_plan,
             LogicalPlan::Scan { .. }
@@ -415,6 +423,34 @@ where
             let err = ServerError::TransactionAborted;
             self.extended.mark_failed();
             return self.send_error(&err.to_string(), err.sqlstate()).await;
+        }
+
+        if let Some(ref plan) = plan_clone
+            && Self::is_ddl_plan(plan)
+        {
+            let catalog_snapshot = self.state.catalog_snapshot();
+            let result = if matches!(self.txn_state, TxnState::InTransaction(_)) {
+                Err(self.fail_if_in_transaction(ServerError::Unsupported(
+                    "DDL inside an explicit transaction block is not yet supported",
+                )))
+            } else {
+                self.execute_ddl_plan(plan, &catalog_snapshot)
+            };
+            match result {
+                Ok(result) => {
+                    for m in &result.messages {
+                        self.send(m).await?;
+                    }
+                    return Ok(());
+                }
+                Err(e) => {
+                    if !e.is_query_scoped() {
+                        return Err(e);
+                    }
+                    self.extended.mark_failed();
+                    return self.send_error(&e.to_string(), e.sqlstate()).await;
+                }
+            }
         }
 
         // Non-txn-control path: route through TxnState.

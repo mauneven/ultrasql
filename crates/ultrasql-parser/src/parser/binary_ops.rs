@@ -20,6 +20,9 @@ impl<'src> Parser<'src> {
             let tok = self.peek()?;
             (tok.kind, tok.span)
         };
+        if self.peek_is_operator_keyword()? {
+            return self.peek_schema_qualified_operator(span);
+        }
         let op = match kind {
             TokenKind::Plus => BinaryOp::Add,
             TokenKind::Minus => BinaryOp::Sub,
@@ -82,6 +85,9 @@ impl<'src> Parser<'src> {
     }
 
     pub(super) fn consume_binary_op(&mut self, op: BinaryOp) -> Result<(), ParseError> {
+        if self.peek_is_operator_keyword()? {
+            return self.consume_schema_qualified_operator(op);
+        }
         match op {
             BinaryOp::NotLike => {
                 self.expect(TokenKind::KwNot, "NOT")?;
@@ -98,4 +104,122 @@ impl<'src> Parser<'src> {
         }
         Ok(())
     }
+
+    fn peek_is_operator_keyword(&mut self) -> Result<bool, ParseError> {
+        let tok = *self.peek()?;
+        Ok(tok.kind == TokenKind::Identifier
+            && tok
+                .text(self.source)
+                .is_some_and(|text| text.eq_ignore_ascii_case("operator")))
+    }
+
+    fn peek_schema_qualified_operator(
+        &mut self,
+        span: Span,
+    ) -> Result<Option<(BinaryOp, Span)>, ParseError> {
+        if self.lookahead_at(1)?.kind != TokenKind::LParen {
+            return Ok(None);
+        }
+        let Some((op, _operator_distance)) = self.operator_syntax_target()? else {
+            return Ok(None);
+        };
+        Ok(Some((op, span)))
+    }
+
+    fn consume_schema_qualified_operator(&mut self, expected: BinaryOp) -> Result<(), ParseError> {
+        self.expect_identifier_keyword("operator", "OPERATOR")?;
+        self.expect(TokenKind::LParen, "(")?;
+        while matches!(
+            self.peek()?.kind,
+            TokenKind::Identifier | TokenKind::QuotedIdentifier
+        ) && self.lookahead_at(1)?.kind == TokenKind::Dot
+        {
+            self.advance()?;
+            self.expect(TokenKind::Dot, ".")?;
+        }
+        let tok = self.advance()?;
+        let Some(op) = operator_token_to_binary_op(tok.kind) else {
+            return Err(ParseError::Expected {
+                expected: "operator token inside OPERATOR(...)",
+                found: tok.kind,
+                offset: tok.span.start as usize,
+            });
+        };
+        if op != expected {
+            return Err(ParseError::Expected {
+                expected: "matching OPERATOR(...) token",
+                found: tok.kind,
+                offset: tok.span.start as usize,
+            });
+        }
+        self.expect(TokenKind::RParen, ")")?;
+        Ok(())
+    }
+
+    fn operator_syntax_target(&mut self) -> Result<Option<(BinaryOp, usize)>, ParseError> {
+        let mut distance = 2;
+        loop {
+            let tok = self.lookahead_at(distance)?;
+            if matches!(
+                tok.kind,
+                TokenKind::Identifier | TokenKind::QuotedIdentifier
+            ) && self.lookahead_at(distance + 1)?.kind == TokenKind::Dot
+            {
+                distance += 2;
+                continue;
+            }
+            let Some(op) = operator_token_to_binary_op(tok.kind) else {
+                return Ok(None);
+            };
+            if self.lookahead_at(distance + 1)?.kind != TokenKind::RParen {
+                return Ok(None);
+            }
+            return Ok(Some((op, distance)));
+        }
+    }
+}
+
+fn operator_token_to_binary_op(kind: TokenKind) -> Option<BinaryOp> {
+    Some(match kind {
+        TokenKind::Plus => BinaryOp::Add,
+        TokenKind::Minus => BinaryOp::Sub,
+        TokenKind::Star => BinaryOp::Mul,
+        TokenKind::Slash => BinaryOp::Div,
+        TokenKind::Percent => BinaryOp::Mod,
+        TokenKind::Caret => BinaryOp::Pow,
+        TokenKind::Concat => BinaryOp::Concat,
+        TokenKind::Eq => BinaryOp::Eq,
+        TokenKind::NotEq => BinaryOp::NotEq,
+        TokenKind::Lt => BinaryOp::Lt,
+        TokenKind::LtEq => BinaryOp::LtEq,
+        TokenKind::Gt => BinaryOp::Gt,
+        TokenKind::GtEq => BinaryOp::GtEq,
+        TokenKind::VectorL2Distance => BinaryOp::VectorL2Distance,
+        TokenKind::VectorNegativeInnerProduct => BinaryOp::VectorNegativeInnerProduct,
+        TokenKind::VectorCosineDistance => BinaryOp::VectorCosineDistance,
+        TokenKind::VectorL1Distance => BinaryOp::VectorL1Distance,
+        TokenKind::Tilde => BinaryOp::RegexMatch,
+        TokenKind::TildeStar => BinaryOp::RegexIMatch,
+        TokenKind::NotTilde => BinaryOp::RegexNotMatch,
+        TokenKind::NotTildeStar => BinaryOp::RegexNotIMatch,
+        TokenKind::Ampersand => BinaryOp::BitAnd,
+        TokenKind::Pipe => BinaryOp::BitOr,
+        TokenKind::Hash => BinaryOp::BitXor,
+        TokenKind::ShiftLeft => BinaryOp::ShiftLeft,
+        TokenKind::ShiftRight => BinaryOp::ShiftRight,
+        TokenKind::ShiftLeftEq => BinaryOp::NetworkContainedEq,
+        TokenKind::ShiftRightEq => BinaryOp::NetworkContainsEq,
+        TokenKind::Arrow => BinaryOp::JsonGet,
+        TokenKind::ArrowDouble => BinaryOp::JsonGetText,
+        TokenKind::HashArrow => BinaryOp::JsonGetPath,
+        TokenKind::HashArrowDouble => BinaryOp::JsonGetPathText,
+        TokenKind::AtArrow => BinaryOp::JsonContains,
+        TokenKind::AtAt => BinaryOp::TextSearchMatch,
+        TokenKind::ArrowAt => BinaryOp::JsonContained,
+        TokenKind::Overlap => BinaryOp::Overlap,
+        TokenKind::QuestionMark => BinaryOp::JsonHasKey,
+        TokenKind::QuestionPipe => BinaryOp::JsonHasAnyKey,
+        TokenKind::QuestionAmpersand => BinaryOp::JsonHasAllKeys,
+        _ => return None,
+    })
 }

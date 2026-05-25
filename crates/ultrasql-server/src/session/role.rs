@@ -135,6 +135,10 @@ where
         };
         match role_name {
             Some(role) => {
+                if role.eq_ignore_ascii_case(&self.auth_user) {
+                    self.current_user = self.auth_user.clone();
+                    return Ok(result_encoder::run_ddl_command("SET ROLE"));
+                }
                 if !self.state.role_catalog.can_set_role(&self.auth_user, role) {
                     return Err(ServerError::InsufficientPrivilege(format!(
                         "permission denied to set role {role}"

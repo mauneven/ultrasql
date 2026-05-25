@@ -22,7 +22,7 @@ pub(super) fn build_returning_schema(
         .iter()
         .map(|(e, n)| Field::nullable(n, e.data_type()))
         .collect();
-    Schema::new(fields).map_err(|e| PlanError::TypeMismatch(format!("RETURNING schema: {e}")))
+    Ok(Schema::new_with_duplicate_names(fields))
 }
 
 /// Bind a `RETURNING` projection list against `table_schema`.
@@ -62,6 +62,10 @@ pub(super) fn object_name_simple(name: &ObjectName) -> String {
 pub(super) fn derive_output_name(ast: &Expr, bound: &ScalarExpr) -> String {
     match ast {
         Expr::Column { name } => name
+            .parts
+            .last()
+            .map_or_else(String::new, |p| p.value.clone()),
+        Expr::Call { name, .. } => name
             .parts
             .last()
             .map_or_else(String::new, |p| p.value.clone()),

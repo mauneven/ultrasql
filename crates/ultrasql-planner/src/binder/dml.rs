@@ -301,10 +301,26 @@ fn bind_assignments(
         }
         let mut expr = bind_expr(&a.value, value_schema, catalog, scope)?;
         let target = &table_schema.field_at(idx).data_type;
-        coerce_literal_to_type(&mut expr, target);
+        coerce_assignment_expr_to_type(&mut expr, target);
         out.push((idx, expr));
     }
     Ok(out)
+}
+
+fn coerce_assignment_expr_to_type(expr: &mut ScalarExpr, target: &DataType) {
+    coerce_literal_to_type(expr, target);
+    let ScalarExpr::FunctionCall {
+        name, data_type, ..
+    } = expr
+    else {
+        return;
+    };
+    if matches!(target, DataType::Timestamp)
+        && matches!(name.as_str(), "now" | "current_timestamp")
+        && matches!(data_type, DataType::TimestampTz)
+    {
+        *data_type = DataType::Timestamp;
+    }
 }
 
 // ---------------------------------------------------------------------------

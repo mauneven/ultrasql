@@ -276,6 +276,12 @@ pub(super) fn comparable(a: &DataType, b: &DataType) -> bool {
     if a.is_numeric() && b.is_numeric() {
         return true;
     }
+    if a.is_oid_alias() && b.is_oid_alias() {
+        return true;
+    }
+    if (a.is_oid_alias() && b.is_integer()) || (a.is_integer() && b.is_oid_alias()) {
+        return true;
+    }
     if a.is_textlike() && b.is_textlike() {
         return true;
     }

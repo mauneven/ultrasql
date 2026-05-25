@@ -451,11 +451,12 @@ impl Parser<'_> {
             what: "file table literal without supported external file extension",
             offset: span.start as usize,
         })?;
-        let alias = if self.match_kw(TokenKind::KwAs)
-            || (matches!(
-                self.peek()?.kind,
-                TokenKind::Identifier | TokenKind::QuotedIdentifier
-            ) && !self.next_token_is_reserved_clause())
+        let alias = if self.match_kw(TokenKind::KwAs) {
+            Some(self.parse_alias_identifier()?)
+        } else if matches!(
+            self.peek()?.kind,
+            TokenKind::Identifier | TokenKind::QuotedIdentifier
+        ) && !self.next_token_is_reserved_clause()
         {
             Some(self.parse_identifier()?)
         } else {
@@ -697,11 +698,12 @@ impl Parser<'_> {
         }
 
         let expr = self.parse_expr()?;
-        let alias = if self.match_kw(TokenKind::KwAs)
-            || (matches!(
-                self.peek()?.kind,
-                TokenKind::Identifier | TokenKind::QuotedIdentifier
-            ) && !self.next_token_is_reserved_clause())
+        let alias = if self.match_kw(TokenKind::KwAs) {
+            Some(self.parse_alias_identifier()?)
+        } else if matches!(
+            self.peek()?.kind,
+            TokenKind::Identifier | TokenKind::QuotedIdentifier
+        ) && !self.next_token_is_reserved_clause()
         {
             Some(self.parse_identifier()?)
         } else {
@@ -993,7 +995,7 @@ impl Parser<'_> {
     pub(crate) fn parse_identifier(&mut self) -> Result<Identifier, ParseError> {
         let tok = self.peek()?;
         match tok.kind {
-            TokenKind::Identifier => {
+            TokenKind::Identifier | TokenKind::KwLocked => {
                 let tok = self.advance()?;
                 let raw = tok.text(self.source).unwrap_or("");
                 Ok(Identifier {
@@ -1044,6 +1046,34 @@ impl Parser<'_> {
             ids.push(self.parse_identifier()?);
         }
         Ok(ids)
+    }
+
+    fn parse_alias_identifier(&mut self) -> Result<Identifier, ParseError> {
+        if self.peek()?.kind == TokenKind::KwDelimiter {
+            let tok = self.advance()?;
+            return Ok(Identifier {
+                value: "delimiter".to_owned(),
+                quoted: false,
+                span: tok.span,
+            });
+        }
+        if self.peek()?.kind == TokenKind::KwComment {
+            let tok = self.advance()?;
+            return Ok(Identifier {
+                value: "comment".to_owned(),
+                quoted: false,
+                span: tok.span,
+            });
+        }
+        if self.peek()?.kind == TokenKind::KwIdentity {
+            let tok = self.advance()?;
+            return Ok(Identifier {
+                value: "identity".to_owned(),
+                quoted: false,
+                span: tok.span,
+            });
+        }
+        self.parse_identifier()
     }
 }
 
@@ -1191,10 +1221,31 @@ impl Parser<'_> {
         if after_any_all.kind != TokenKind::LParen {
             return Ok(None);
         }
-        // And after `(` must be `SELECT` or `WITH` to distinguish from function calls.
+        // And after `(` may be `SELECT` / `WITH` for subquery ANY, or
+        // `ARRAY[...]` for ORM catalog probes such as `relkind = ANY (...)`.
         let after_lparen = self.lookahead_at(2)?;
         if !matches!(after_lparen.kind, TokenKind::KwSelect | TokenKind::KwWith) {
-            return Ok(None);
+            if !is_any || op != crate::ast::BinaryOp::Eq {
+                return Ok(None);
+            }
+            let kw_tok = self.advance()?; // ANY
+            self.expect(TokenKind::LParen, "(")?;
+            let array_expr = self.parse_expr()?;
+            let rp = self.expect(TokenKind::RParen, ")")?;
+            let Expr::ArrayLiteral { elements, .. } = array_expr else {
+                return Ok(Some(Expr::AnyArray {
+                    expr: Box::new(lhs),
+                    op,
+                    array: Box::new(array_expr),
+                    span: Span::new(kw_tok.span.start, rp.span.end),
+                }));
+            };
+            return Ok(Some(Expr::InList {
+                expr: Box::new(lhs),
+                items: elements,
+                negated: false,
+                span: Span::new(kw_tok.span.start, rp.span.end),
+            }));
         }
 
         let kw_tok = self.advance()?; // ANY / ALL

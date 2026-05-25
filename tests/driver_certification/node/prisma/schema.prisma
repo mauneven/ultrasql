@@ -1,0 +1,15 @@
+generator client {
+  provider = "prisma-client-js"
+  output   = "../generated/prisma"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+model PrismaCert {
+  id    Int    @id
+  label String
+
+  @@map("prisma_cert")
+}

@@ -96,12 +96,12 @@ async fn prepared_create_insert_select_filter_round_trip() {
     let running = start_sample_server("extended_query_test").await;
     let client = &running.client;
 
-    // CREATE TABLE — DDL is rejected by the Extended Query path
-    // (documented gap). Use the Simple Query fallback via batch_execute.
+    // CREATE TABLE — stock drivers such as JDBC send this through the
+    // Extended Query path even when the caller uses a plain statement.
     client
-        .batch_execute("CREATE TABLE items (id INT NOT NULL, val INT)")
+        .execute("CREATE TABLE items (id INT NOT NULL, val INT)", &[])
         .await
-        .expect("create table via Simple Query");
+        .expect("create table via Extended Query");
 
     // INSERT — multi-row VALUES. Run as a prepared statement so we
     // exercise the Extended Query path.
@@ -144,6 +144,72 @@ async fn prepared_create_insert_select_filter_round_trip() {
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0].get::<_, i32>(0), 2);
     assert_eq!(rows[0].get::<_, i32>(1), 200);
+
+    shutdown(running).await;
+}
+
+/// Stock drivers such as the JDBC PostgreSQL driver send `CREATE TABLE`
+/// through the Extended Query path even when callers use a plain
+/// `Statement`. Autocommit DDL must therefore dispatch before executor
+/// lowering instead of returning the old documented gap.
+#[tokio::test]
+async fn extended_create_table_executes_autocommit_ddl() {
+    let running = start_sample_server("extended_query_test").await;
+    let client = &running.client;
+
+    client
+        .execute("CREATE TABLE ext_ddl_cert (id INT NOT NULL, val TEXT)", &[])
+        .await
+        .expect("extended CREATE TABLE succeeds");
+    let insert = client
+        .prepare("INSERT INTO ext_ddl_cert VALUES ($1, $2)")
+        .await
+        .expect("prepare insert");
+    client
+        .execute(&insert, &[&1_i32, &"ok"])
+        .await
+        .expect("insert into extended-created table");
+    let rows = client
+        .query("SELECT id, val FROM ext_ddl_cert", &[])
+        .await
+        .expect("select extended-created table");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].get::<_, i32>(0), 1);
+    assert_eq!(rows[0].get::<_, String>(1), "ok");
+
+    shutdown(running).await;
+}
+
+/// Prisma Client emits prepared `LIMIT $n OFFSET $m` for model `findMany`.
+/// The Extended Query path must bind those parameters after decoding them
+/// rather than rejecting the Parse with "non-literal LIMIT/OFFSET".
+#[tokio::test]
+async fn prepared_limit_offset_parameters_round_trip() {
+    let running = start_sample_server("extended_query_test").await;
+    let client = &running.client;
+
+    client
+        .batch_execute("CREATE TABLE limit_params (id INT NOT NULL, val TEXT)")
+        .await
+        .expect("create table");
+    let insert = client
+        .prepare("INSERT INTO limit_params VALUES ($1, $2)")
+        .await
+        .expect("prepare insert");
+    for (id, val) in [(1_i32, "a"), (2, "b"), (3, "c"), (4, "d")] {
+        client.execute(&insert, &[&id, &val]).await.expect("insert");
+    }
+
+    let stmt = client
+        .prepare("SELECT id FROM limit_params ORDER BY id LIMIT $1 OFFSET $2")
+        .await
+        .expect("prepare parameterized limit");
+    let rows = client
+        .query(&stmt, &[&2_i32, &1_i32])
+        .await
+        .expect("query parameterized limit");
+    let ids: Vec<i32> = rows.iter().map(|row| row.get(0)).collect();
+    assert_eq!(ids, vec![2, 3]);
 
     shutdown(running).await;
 }

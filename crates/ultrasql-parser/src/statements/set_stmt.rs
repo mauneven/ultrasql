@@ -59,11 +59,13 @@ impl Parser<'_> {
 
         let name = self.parse_set_name()?;
 
-        // `=` or `TO`
+        // `=` or `TO`. PostgreSQL also accepts `SET TIME ZONE value`;
+        // parse the preceding `TIME ZONE` alias as the `timezone` GUC.
         match self.peek()?.kind {
             TokenKind::Eq | TokenKind::KwTo => {
                 self.advance()?;
             }
+            _ if name.value.eq_ignore_ascii_case("timezone") => {}
             other => {
                 return Err(ParseError::Expected {
                     expected: "'=' or 'TO'",
@@ -139,6 +141,15 @@ impl Parser<'_> {
                 self.advance()?;
                 None
             }
+            TokenKind::String => {
+                let tok = self.advance()?;
+                let raw = tok.text(self.source).unwrap_or("");
+                Some(Identifier {
+                    value: raw[1..raw.len() - 1].replace("''", "'"),
+                    quoted: false,
+                    span: tok.span,
+                })
+            }
             _ => Some(self.parse_identifier()?),
         };
         let end = self.peek()?.span.start;
@@ -149,6 +160,40 @@ impl Parser<'_> {
     }
 
     fn parse_set_name(&mut self) -> Result<Identifier, ParseError> {
+        if self.peek()?.kind == TokenKind::KwTime {
+            let first = self.advance()?;
+            if self.peek()?.kind == TokenKind::KwZone {
+                let zone = self.advance()?;
+                return Ok(Identifier {
+                    value: "timezone".to_owned(),
+                    quoted: false,
+                    span: Span::new(first.span.start, zone.span.end),
+                });
+            }
+            return Ok(Identifier {
+                value: "time".to_owned(),
+                quoted: false,
+                span: first.span,
+            });
+        }
+        if self.peek()?.kind == TokenKind::KwTransaction {
+            let first = self.advance()?;
+            if self.peek()?.kind == TokenKind::KwIsolation {
+                self.advance()?;
+                let level = self.expect(TokenKind::KwLevel, "LEVEL")?;
+                return Ok(Identifier {
+                    value: "transaction_isolation".to_owned(),
+                    quoted: false,
+                    span: Span::new(first.span.start, level.span.end),
+                });
+            }
+            return Ok(Identifier {
+                value: "transaction".to_owned(),
+                quoted: false,
+                span: first.span,
+            });
+        }
+
         let first = self.parse_identifier()?;
         let mut value = first.value.clone();
         let mut end = first.span.end;
@@ -229,6 +274,14 @@ mod tests {
     }
 
     #[test]
+    fn show_transaction_isolation_level_alias() {
+        let stmt = parse_set("SHOW transaction isolation level");
+        assert_eq!(stmt.scope, SetScope::Show);
+        assert_eq!(stmt.name.value, "transaction_isolation");
+        assert!(matches!(stmt.value, SetValue::Default));
+    }
+
+    #[test]
     fn reset_var() {
         let stmt = parse_set("RESET search_path");
         assert_eq!(stmt.scope, SetScope::Reset);
@@ -237,6 +290,12 @@ mod tests {
     #[test]
     fn set_role_parses() {
         let stmt = parse_set_role("SET ROLE support");
+        assert_eq!(stmt.role.expect("role").value, "support");
+    }
+
+    #[test]
+    fn set_role_accepts_string_literal_role_name() {
+        let stmt = parse_set_role("SET ROLE 'support'");
         assert_eq!(stmt.role.expect("role").value, "support");
     }
 
@@ -260,6 +319,18 @@ mod tests {
         };
         assert_eq!(vals.len(), 1);
         assert!(matches!(&vals[0], Expr::Column { name } if name.to_string() == "on"));
+    }
+
+    #[test]
+    fn set_time_zone_postgres_alias() {
+        let stmt = parse_set("SET TIME ZONE 'UTC'");
+        assert_eq!(stmt.scope, SetScope::Session);
+        assert_eq!(stmt.name.value, "timezone");
+        let SetValue::Values(vals) = &stmt.value else {
+            panic!("expected Values")
+        };
+        assert_eq!(vals.len(), 1);
+        assert!(matches!(&vals[0], Expr::Literal(_)));
     }
 
     // ---- negative case ----------------------------------------------------

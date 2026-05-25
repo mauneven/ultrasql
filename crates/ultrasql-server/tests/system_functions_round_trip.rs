@@ -5,31 +5,172 @@ mod support;
 use support::{shutdown, start_sample_server};
 
 #[tokio::test]
+async fn jdbc_startup_runtime_parameters_round_trip() {
+    let running = start_sample_server("system_functions_test").await;
+    let client = &running.client;
+
+    client
+        .batch_execute("SET extra_float_digits = 3")
+        .await
+        .expect("JDBC startup SET extra_float_digits succeeds");
+    let row = client
+        .query_one("SHOW extra_float_digits", &[])
+        .await
+        .expect("SHOW extra_float_digits");
+    assert_eq!(row.get::<_, String>(0), "3");
+    client
+        .batch_execute("RESET extra_float_digits")
+        .await
+        .expect("RESET extra_float_digits succeeds");
+    let row = client
+        .query_one("SHOW extra_float_digits", &[])
+        .await
+        .expect("SHOW reset extra_float_digits");
+    assert_eq!(row.get::<_, String>(0), "1");
+
+    client
+        .batch_execute("SET application_name = 'driver_cert_jdbc'")
+        .await
+        .expect("JDBC startup SET application_name succeeds");
+    let row = client
+        .query_one("SHOW application_name", &[])
+        .await
+        .expect("SHOW application_name");
+    assert_eq!(row.get::<_, String>(0), "driver_cert_jdbc");
+
+    shutdown(running).await;
+}
+
+#[tokio::test]
+async fn orm_startup_runtime_parameters_round_trip() {
+    let running = start_sample_server("system_functions_test").await;
+    let client = &running.client;
+
+    client
+        .batch_execute("SET client_min_messages = warning")
+        .await
+        .expect("Rails startup SET client_min_messages succeeds");
+    let row = client
+        .query_one("SHOW client_min_messages", &[])
+        .await
+        .expect("SHOW client_min_messages");
+    assert_eq!(row.get::<_, String>(0), "warning");
+
+    client
+        .batch_execute("SET intervalstyle = iso_8601")
+        .await
+        .expect("Rails startup SET intervalstyle succeeds");
+    let row = client
+        .query_one("SHOW intervalstyle", &[])
+        .await
+        .expect("SHOW intervalstyle");
+    assert_eq!(row.get::<_, String>(0), "iso_8601");
+
+    client
+        .batch_execute("SET SESSION timezone TO 'UTC'")
+        .await
+        .expect("Rails startup SET timezone succeeds");
+    let row = client
+        .query_one("SHOW timezone", &[])
+        .await
+        .expect("SHOW timezone");
+    assert_eq!(row.get::<_, String>(0), "UTC");
+
+    client
+        .batch_execute("SET CLIENT_ENCODING TO 'UTF8'")
+        .await
+        .expect("Diesel startup SET CLIENT_ENCODING succeeds");
+    let row = client
+        .query_one("SHOW client_encoding", &[])
+        .await
+        .expect("SHOW client_encoding");
+    assert_eq!(row.get::<_, String>(0), "UTF8");
+
+    let row = client
+        .query_one("SHOW server_version", &[])
+        .await
+        .expect("SHOW server_version");
+    assert_eq!(row.get::<_, String>(0), "14.0");
+
+    let row = client
+        .query_one("SHOW max_identifier_length", &[])
+        .await
+        .expect("SHOW max_identifier_length");
+    assert_eq!(row.get::<_, String>(0), "63");
+
+    let row = client
+        .query_one("SHOW search_path", &[])
+        .await
+        .expect("SHOW search_path");
+    assert_eq!(row.get::<_, String>(0), "\"$user\", public");
+
+    client
+        .batch_execute("SET LOCAL search_path TO public, \"$user\"")
+        .await
+        .expect("SET LOCAL search_path list");
+    let row = client
+        .query_one("SHOW search_path", &[])
+        .await
+        .expect("SHOW search_path list");
+    assert_eq!(row.get::<_, String>(0), "public, \"$user\"");
+
+    let row = client
+        .query_one("SHOW transaction isolation level", &[])
+        .await
+        .expect("SHOW transaction isolation level");
+    assert_eq!(row.get::<_, String>(0), "read committed");
+
+    let row = client
+        .query_one("SHOW standard_conforming_strings", &[])
+        .await
+        .expect("SHOW standard_conforming_strings");
+    assert_eq!(row.get::<_, String>(0), "on");
+
+    let row = client
+        .query_one("SELECT set_config('TimeZone', 'UTC', false)", &[])
+        .await
+        .expect("Django startup set_config TimeZone");
+    assert_eq!(row.get::<_, String>(0), "UTC");
+
+    shutdown(running).await;
+}
+
+#[tokio::test]
 async fn scalar_system_functions_return_postgres_shaped_values() {
     let running = start_sample_server("system_functions_test").await;
     let client = &running.client;
 
     let rows = client
         .query(
-            "SELECT version(), current_database(), current_user(), pg_typeof(1), pg_size_pretty(2048)",
+            "SELECT version(), current_database(), current_schema(), current_user(), pg_typeof(1), pg_size_pretty(2048)",
             &[],
         )
         .await
         .expect("system functions");
     assert_eq!(rows.len(), 1);
-    assert_eq!(rows[0].get::<_, String>(0), "UltraSQL 0.0.1");
+    let version = rows[0].get::<_, String>(0);
+    assert!(
+        version.starts_with("PostgreSQL 14.0"),
+        "ORMs require PostgreSQL-shaped version(), got {version:?}"
+    );
+    assert!(
+        version.contains("UltraSQL 0.0.1"),
+        "version() should retain UltraSQL identity, got {version:?}"
+    );
     assert_eq!(rows[0].get::<_, String>(1), "ultrasql");
-    assert_eq!(rows[0].get::<_, String>(2), "tester");
-    assert_eq!(rows[0].get::<_, String>(3), "integer");
-    assert_eq!(rows[0].get::<_, String>(4), "2 kB");
+    assert_eq!(rows[0].get::<_, String>(2), "public");
+    assert_eq!(rows[0].get::<_, String>(3), "tester");
+    assert_eq!(rows[0].get::<_, String>(4), "integer");
+    assert_eq!(rows[0].get::<_, String>(5), "2 kB");
 
     let bare = client
-        .query("SELECT current_user, session_user", &[])
+        .query("SELECT current_user, session_user, current_catalog", &[])
         .await
         .expect("bare user functions");
     assert_eq!(bare.len(), 1);
     assert_eq!(bare[0].get::<_, String>(0), "tester");
     assert_eq!(bare[0].get::<_, String>(1), "tester");
+    assert_eq!(bare[0].get::<_, String>(2), "ultrasql");
 
     shutdown(running).await;
 }

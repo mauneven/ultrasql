@@ -43,6 +43,17 @@ fn fact_events_catalog() -> InMemoryCatalog {
     cat
 }
 
+fn timestamp_catalog() -> InMemoryCatalog {
+    let schema = Schema::new([
+        Field::required("id", DataType::Int32),
+        Field::nullable("locked_at", DataType::Timestamp),
+    ])
+    .expect("schema ok");
+    let mut cat = InMemoryCatalog::new();
+    cat.register("locks", TableMeta::new(schema));
+    cat
+}
+
 fn parse_and_bind(sql: &str, cat: &dyn Catalog) -> Result<LogicalPlan, PlanError> {
     let stmt = Parser::new(sql)
         .parse_statement()
@@ -99,6 +110,23 @@ fn binds_role_membership_grant_and_set_role() {
         panic!("expected SetRole");
     };
     assert_eq!(role_name, Some("app_group".to_owned()));
+}
+
+#[test]
+fn binds_search_path_list_set_local() {
+    let plan = parse_bind_ok("SET LOCAL search_path TO public, \"$user\"");
+    let LogicalPlan::SetVariable {
+        name,
+        action,
+        value,
+        ..
+    } = plan
+    else {
+        panic!("expected SetVariable");
+    };
+    assert_eq!(name, "search_path");
+    assert_eq!(action, LogicalSetVariableAction::SetLocal);
+    assert_eq!(value.as_deref(), Some("public, \"$user\""));
 }
 
 #[test]
@@ -391,6 +419,19 @@ fn binds_update_with_filter_and_assignments() {
     assert_eq!(assignments.len(), 1);
     assert_eq!(assignments[0].0, 2);
     assert!(matches!(input.as_ref(), LogicalPlan::Filter { .. }));
+}
+
+#[test]
+fn binds_update_now_assignment_to_timestamp_target() {
+    let cat = timestamp_catalog();
+    let plan =
+        parse_and_bind("UPDATE locks SET locked_at = now() WHERE id = 1", &cat).expect("bind ok");
+    let LogicalPlan::Update { assignments, .. } = plan else {
+        panic!("expected Update");
+    };
+    assert_eq!(assignments.len(), 1);
+    assert_eq!(assignments[0].0, 1);
+    assert_eq!(assignments[0].1.data_type(), DataType::Timestamp);
 }
 
 #[test]
@@ -1425,6 +1466,27 @@ fn binds_create_table_defaults_checks_and_unique_constraints() {
 }
 
 #[test]
+fn binds_timestamp_default_now_with_timestamp_type() {
+    let cat = InMemoryCatalog::new();
+    let plan = parse_and_bind(
+        "CREATE TABLE t (installed_on TIMESTAMP NOT NULL DEFAULT now())",
+        &cat,
+    )
+    .expect("bind ok");
+    let LogicalPlan::CreateTable { defaults, .. } = plan else {
+        panic!("expected CreateTable");
+    };
+    let Some(ScalarExpr::FunctionCall {
+        name, data_type, ..
+    }) = defaults[0].as_ref()
+    else {
+        panic!("expected function default");
+    };
+    assert_eq!(name, "now");
+    assert_eq!(*data_type, DataType::Timestamp);
+}
+
+#[test]
 fn binds_serial_column_as_required_with_sequence_default() {
     let cat = InMemoryCatalog::new();
     let plan = parse_and_bind(
@@ -1824,6 +1886,22 @@ fn order_by_can_reference_projection_alias() {
         matches!(input.as_ref(), LogicalPlan::Project { .. }),
         "alias ORDER BY should sort projected rows"
     );
+}
+
+#[test]
+fn binds_duplicate_unaliased_function_output_labels() {
+    let cat = users_catalog();
+    let plan = parse_and_bind(
+        "SELECT pg_get_expr(1, 1), pg_get_expr(2, 2) FROM users",
+        &cat,
+    )
+    .expect("bind ok");
+
+    let LogicalPlan::Project { schema, .. } = &plan else {
+        panic!("expected Project, got {plan:?}");
+    };
+    assert_eq!(schema.field_at(0).name, "pg_get_expr");
+    assert_eq!(schema.field_at(1).name, "pg_get_expr");
 }
 
 #[test]

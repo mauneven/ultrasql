@@ -338,7 +338,7 @@ claims rather than measured development targets.
 | `ultrasql-vec` | ✅ Push pipeline driver, SIMD kernels (filter/arith/hash/cmp/sum/min/max with mask-aware paths), Bitmap, `Column::DictionaryUtf8` dictionary encoding with automatic selection, ColumnBuilder, vectorized sort/HashJoin/HashAggregate |
 | `ultrasql-catalog` | ✅ PersistentCatalog with arc-swap snapshots, MutableCatalog DDL surface, pg_class/pg_attribute/pg_index/statistic row shapes; ✅ typed-tuple encoder/decoder in `encoding.rs` (`ClassRow`, `IndexRow`, `StatisticRow`, `StatisticExtRow`, `encode_attribute_row`/`decode_attribute_row`, `schema_from_attributes`); ✅ `bootstrap_from_heap` decodes pg_class + pg_attribute + pg_index + pg_statistic + pg_statistic_ext on warm restart and rebuilds user `TableEntry`, `IndexEntry`, and statistics snapshots with full schema |
 | `ultrasql-protocol` | ✅ Wire codec for Simple Query + Extended Query (Parse/Bind/Describe/Execute/Sync/Close) |
-| `ultrasql-server` | ✅ SCRAM-SHA-256 + TLS, Simple Query end-to-end for `CREATE TABLE`, `INSERT VALUES`, `SELECT`/`SELECT SUM`/`SELECT AVG`/`SELECT WHERE`, `UPDATE`, `DELETE` through real heap; ✅ Extended Query dispatch (Parse/Bind/Describe/Execute/Sync/Close/Flush) with parameter substitution through the same path; ✅ explicit transaction blocks (`BEGIN`/`COMMIT`/`ROLLBACK`) via both Simple and Extended Query, with PostgreSQL-faithful `ReadyForQuery` status bytes, `25P02` failed-block rejection, and COMMIT-as-ROLLBACK semantics |
+| `ultrasql-server` | ✅ SCRAM-SHA-256 + TLS, Simple Query end-to-end for `CREATE TABLE`, `INSERT VALUES`, `SELECT`/`SELECT SUM`/`SELECT AVG`/`SELECT WHERE`, `UPDATE`, `DELETE` through real heap; ✅ Extended Query dispatch (Parse/Bind/Describe/Execute/Sync/Close/Flush) with parameter substitution through the same path; ✅ explicit transaction blocks (`BEGIN`/`COMMIT`/`ROLLBACK`) via both Simple and Extended Query, with PostgreSQL-faithful `ReadyForQuery` status bytes, `25P02` failed-block rejection, and COMMIT-as-ROLLBACK semantics; ✅ driver/ORM certification harness for direct `libpq`, `psycopg2`, `psycopg3`, SQLAlchemy, Django ORM, Rails ActiveRecord, `node-postgres`, Go `lib/pq`, Go `pgx`, GORM, the JDBC PostgreSQL driver, Hibernate ORM, Npgsql, Prisma, Diesel, Flyway, Liquibase, and Alembic; ✅ GUI introspection probes for pgAdmin, DBeaver, and DataGrip schema-browser catalog SQL |
 
 ### Wire-protocol coverage matrix
 
@@ -574,8 +574,9 @@ them back with crash recovery. WAL wired to heap.
 
 ## v0.4 — "Transactions" ✅ COMPLETE
 
-**Scope:** ACID transactions with snapshot isolation and true
-serializable (SSI). Real row-level locking. Deadlock detection.
+**Scope:** ACID transactions with snapshot isolation and Serializable Snapshot
+Isolation. Server SSI is relation-level SSI, not predicate-precise PostgreSQL
+SSI yet. Real row-level locking. Deadlock detection.
 
 ### ⚠️ P0 correctness debt added by Wave F (must close before any v0.7 work)
 
@@ -658,7 +659,7 @@ serializable (SSI). Real row-level locking. Deadlock detection.
 - [x] RW-anti-dependency tracking
 - [x] Dangerous structure detection (T1 → T2 → T3 cycle)
 - [x] Safe snapshot optimization
-- [x] True SERIALIZABLE end-to-end — `Server::with_sample_database` and
+- [x] Serializable end-to-end — `Server::with_sample_database` and
   `Server::init` construct the `TransactionManager` with a fresh
   `SsiManager`; `BEGIN ISOLATION LEVEL SERIALIZABLE` and
   `SET TRANSACTION ISOLATION LEVEL SERIALIZABLE` register the txn with
@@ -666,7 +667,8 @@ serializable (SSI). Real row-level locking. Deadlock detection.
   predicate locks for scanned relations and relation-level write conflicts
   for DML targets; explicit `COMMIT` surfaces SQLSTATE `40001`; and a
   two-session write-skew wire regression verifies that one transaction
-  aborts. Current granularity is relation-level, not predicate-precise.
+  aborts. Current server granularity is relation-level SSI, not
+  predicate-precise PostgreSQL SSI.
   Snapshot strategy continues to alias `RepeatableRead` for the snapshot
   itself, matching PostgreSQL's SSI architecture (RR snapshot + SSI
   conflict graph).
@@ -703,7 +705,11 @@ serializable (SSI). Real row-level locking. Deadlock detection.
 ### Tests
 - [x] Loom-based concurrency model tests for lock manager — `crates/ultrasql-txn/tests/loom_lock_model.rs` exercises mutual-exclusion of exclusive holders and shared-drains-before-exclusive contracts under loom's exhaustive interleaving scheduler. Production code uses `parking_lot::Mutex` (which loom can't intercept), so the tests model the lock state machine via `loom::sync::atomic`. Run with `RUSTFLAGS="--cfg loom" cargo test -p ultrasql-txn --test loom_lock_model --release`
 - [x] Isolation level tests (READ COMMITTED, REPEATABLE READ, SERIALIZABLE) via real `BEGIN ISOLATION LEVEL ... COMMIT` wire-level tests in `txn_round_trip.rs` (4 new tests); `TransactionManager`-level contracts in `ultrasql-txn/tests/isolation.rs`
-- [x] Serializability checker (Hermitage test suite) — 10 tests in `crates/ultrasql-txn/tests/hermitage.rs` cover G0 (dirty write), G1a/G1b (dirty read, intermediate read), G1c (circular information flow at Serializable), OTV, PMP (predicate phantom prevented at RR), P4 (lost update), G-single (read skew prevented at RR), G2-item (single-item write skew aborts at Serializable), G2 (anti-dependency cycle aborts at Serializable). Tests drive `TransactionManager` directly; tuple-value assertions are deferred to the executor-layer integration follow-up
+- [x] Serializability checker (Hermitage test suite) — 10 tests in `crates/ultrasql-txn/tests/hermitage.rs` cover G0 (dirty write), G1a/G1b (dirty read, intermediate read), G1c (circular information flow at Serializable), OTV, PMP (predicate phantom prevented at RR), P4 (lost update), G-single (read skew prevented at RR), G2-item (single-item write skew aborts at Serializable), G2 (anti-dependency cycle aborts at Serializable). Tests drive `TransactionManager` directly; tuple-value assertions are covered by the server-level isolation-suite slice for G1a, PMP, and G2.
+- [x] Isolation suite: `tests/isolation/acid.sql` is an UltraSQL-authored
+  transfer invariant, Hermitage PostgreSQL G1a/PMP/G2 schedules are ported to
+  wire-level Rust tests with CC BY 4.0 attribution, and docs state that current
+  server SSI is relation-level SSI, not predicate-precise PostgreSQL SSI.
 
 ---
 
@@ -730,8 +736,11 @@ serializable (SSI). Real row-level locking. Deadlock detection.
 > - Removed four out-of-wave `[ ]` entries that never belonged to v0.5: `Gather`/`GatherMerge` and `Append`/`MergeAppend` (parallel + partition machinery — listed in v0.7 line 910 / v1.x Table Partitioning); execution-time type coercion (v0.6 §2.2); hash/sort spill (v0.6 §1.18). Each is now linked from its actual wave; the v0.5 reservation API + cap constant (`WorkMemBudget`, `temp_file_limit`) ship as designed.
 
 **Scope:** Full physical operator set exposed through the Simple Query
-wire path. Extended query protocol. Real auth. Any standard PostgreSQL
-driver can connect.
+wire path. Extended query protocol. Real auth. Direct `libpq`, `psycopg2`,
+`psycopg3`, SQLAlchemy, Django ORM, Rails ActiveRecord, `node-postgres`, Go
+`lib/pq`, Go `pgx`, GORM, the JDBC PostgreSQL driver, Hibernate ORM, Npgsql,
+Prisma, and Diesel are certified for core startup, DDL/DML, parameter binding,
+and transaction recovery.
 
 ### Scan Operators
 - [x] `SeqScan` with predicate pushdown — streaming + TID mode wired
@@ -799,7 +808,7 @@ driver can connect.
 - [x] `Execute` codec
 - [x] `Sync` codec
 - [x] `Close` codec
-- [x] **Server-side dispatch** for all of the above — `crates/ultrasql-server/src/extended.rs`; parameter values are decoded (text + binary) and substituted into the bound `LogicalPlan` so the same `lower_query` path runs both Simple and Extended; tokio-postgres prepared-statement round-trip green for `CREATE TABLE` (Simple) + `INSERT VALUES($1, $2)`, `SELECT * FROM t`, `SELECT WHERE col=$1`, `SELECT SUM(x)`, `UPDATE SET x=$1 WHERE id=$2`, `DELETE WHERE id=$1`
+- [x] **Server-side dispatch** for all of the above — `crates/ultrasql-server/src/extended.rs`; parameter values are decoded (text + binary) and substituted into the bound `LogicalPlan` so the same `lower_query` path runs both Simple and Extended; tokio-postgres prepared-statement round-trip green for `CREATE TABLE`, `INSERT VALUES($1, $2)`, `SELECT * FROM t`, `SELECT WHERE col=$1`, `SELECT SUM(x)`, `UPDATE SET x=$1 WHERE id=$2`, `DELETE WHERE id=$1`; driver certification now covers direct `libpq` `PQexecParams`, `psycopg2`, `psycopg3`, SQLAlchemy, Django ORM, Rails ActiveRecord, `node-postgres`, Go `lib/pq`, Go `pgx`, GORM, the JDBC PostgreSQL driver, Hibernate ORM, Npgsql, Prisma, and Diesel, including driver-supplied `int2` parameter coercion into `INT` predicates and INSERT target columns.
 - [x] Server-side statement cache (keyed by name; per-connection)
 - [x] Named portals (cursor via extended protocol)
 - [x] Per-column binary transfer format for int2/int4/int8/bool/text (float4/float8 binary v0.6)
@@ -1618,11 +1627,28 @@ geometric, and full-text type surfaces.
 - [x] `information_schema.sequences`
 
 ### Milestone
-- [x] `psql \d`, `\dt`, `\di`, `\df` work correctly for the current
-  UltraSQL metadata surface — the CLI meta-query SQL is backed by
-  virtual `pg_catalog` / `information_schema` scans and validated through
-  `catalog_views_round_trip.rs`; unsupported object kinds correctly
-  return empty metadata rows instead of parser/binder failures.
+- [x] Stock psql meta-commands `\d`, `\dt`, `\di`, `\df`, `\dv`,
+  `\du`, `\l`, and `\dn` work correctly for the current UltraSQL metadata
+  surface — the upstream `psql -X -E` SQL is backed by virtual
+  `pg_catalog` / `information_schema` scans and validated through
+  `catalog_views_round_trip.rs` plus `driver_certification.py`; unsupported
+  object kinds correctly return empty metadata rows instead of parser/binder
+  failures.
+- [x] GUI introspection probes for pgAdmin, DBeaver, and DataGrip
+  schema-browser query families — virtual catalog rows now expose nullable
+  ACL/options owner fields and helper functions (`obj_description`,
+  `pg_is_other_temp_schema`, `pg_get_serial_sequence`) with typed
+  PostgreSQL-compatible fallback values. Covered by
+  `catalog_views_round_trip.rs` plus `driver_certification.py`. Desktop UI
+  launch/click smoke remains outside this certification slice.
+- [x] Migration-tool certification for Flyway, Liquibase, and Alembic —
+  Flyway `12.6.2` runs two versioned SQL migrations and records
+  `flyway_schema_history`; Liquibase `5.0.3` applies an XML changelog and
+  records `databasechangelog` / `databasechangeloglock`; Alembic `1.18.4`
+  runs `upgrade head` through SQLAlchemy and records `alembic_version`.
+  Covered by public tool APIs in `driver_certification.py` with migration DDL
+  bodies configured for nontransactional execution until transactional DDL
+  lands.
 
 ---
 
@@ -1829,6 +1855,12 @@ behavior are implemented and validated.
 Every standard PostgreSQL driver and ORM works without modification.
 
 ### Data Types Completeness
+- [x] PostgreSQL regression parser/type baseline: curated SQLLogicTest shard
+  imports public cases derived from `char.sql`, `varchar.sql`, `numeric.sql`,
+  and `type_sanity.sql` at pinned commit
+  `ddd12d1a5c4d980c5f31dc7d096012547b724e55`; full PostgreSQL
+  `type_sanity` catalog invariants remain explicit skip debt until pg_type,
+  pg_cast, pg_proc, and regtype text-output parity are complete.
 - [x] `SMALLINT/INT2`, `INTEGER/INT4`, `BIGINT/INT8` — parser, binder,
   row codec, executor, PostgreSQL wire OIDs, and wire round-trip coverage
   exist (`core_type_surface_round_trip.rs`).
@@ -2075,36 +2107,39 @@ same host.
 - [x] `log_connections`, `log_min_duration_statement`, `log_statement`
 
 ### ORM Compatibility
-- [ ] SQLAlchemy (Python) — full dialect support
-- [ ] Django ORM (Python) — models, migrations, queries
-- [ ] Rails ActiveRecord (Ruby) — schema introspection, CRUD, migrations
-- [ ] Hibernate / Spring Data JPA (Java)
-- [ ] GORM (Go)
-- [ ] Prisma (TypeScript/Node)
-- [ ] Diesel (Rust)
+- [x] SQLAlchemy (Python) — pinned `SQLAlchemy==2.0.50` cert harness covers PostgreSQL dialect startup, Core `metadata.create_all` in autocommit mode, parameter binding, ORM `Session` insert/query, rollback, and failed-transaction recovery.
+- [x] Django ORM (Python) — pinned `Django==6.0.5` cert harness covers PostgreSQL backend startup, model schema creation via `schema_editor(atomic=False)`, cursor parameters, `QuerySet` create/filter/order/count, rollback, and failed-transaction recovery.
+- [x] Rails ActiveRecord (Ruby) — pinned `activerecord==8.1.3` and `pg==1.6.3` cert harness covers PostgreSQL adapter startup, schema creation, prepared model queries, model create/query, rollback, and failed-transaction recovery.
+- [x] Hibernate ORM (Java) — pinned `hibernate-core==7.3.5.Final` cert harness covers `SessionFactory`, annotated entity persist/query, rollback, and failed-transaction recovery.
+- [x] GORM (Go) — pinned `gorm.io/gorm==1.31.1` and `gorm.io/driver/postgres==1.6.0` cert harness covers `AutoMigrate`, model create/query, rollback, and failed-transaction recovery.
+- [x] Prisma (TypeScript/Node) — pinned `prisma==7.8.0`, `@prisma/client==7.8.0`, and `@prisma/adapter-pg==7.8.0` cert harness covers Prisma Client generation, raw parameter queries, model create/query, rollback, and failed-transaction recovery.
+- [x] Diesel (Rust) — pinned `diesel==2.3.9` cert harness covers PostgreSQL backend startup, query DSL parameter filtering, typed inserts, rollback, and failed-transaction recovery.
 
 ### Driver Compatibility
-- [ ] `libpq` (C)
-- [ ] `psycopg2` / `psycopg3` (Python)
-- [ ] `node-postgres` / `pg` (Node.js)
-- [ ] `pq` / `pgx` (Go)
-- [ ] JDBC PostgreSQL driver (Java)
-- [ ] `npgsql` (.NET)
+- [x] `libpq` (C) — compiled `PQconnectdb` / `PQexec` / `PQexecParams` cert harness covers startup, simple SELECT, parameterized SELECT/INSERT, rollback, and failed-transaction recovery.
+- [x] `psycopg2` / `psycopg3` (Python) — pinned driver cert harness covers startup, extended parameter SELECT/INSERT, rollback, and failed-transaction recovery.
+- [x] `node-postgres` / `pg` (Node.js) — pinned `pg==8.21.0` cert harness covers startup, extended parameter SELECT/INSERT, rollback, and failed-transaction recovery.
+- [x] `pq` / `pgx` (Go) — pinned `github.com/lib/pq==1.12.3` and `github.com/jackc/pgx/v5==5.9.2` cert harness covers startup, extended parameter SELECT/INSERT, rollback, and failed-transaction recovery.
+- [x] JDBC PostgreSQL driver (Java) — pinned `42.7.11` jar with SHA-256 verification covers startup, prepared-statement SELECT/INSERT, rollback, and failed-transaction recovery.
+- [x] `npgsql` (.NET) — pinned `Npgsql==10.0.2` cert harness covers startup, extended parameter SELECT/INSERT, rollback, and failed-transaction recovery.
 - [x] `tokio-postgres` (Rust) — CREATE / INSERT / SELECT / UPDATE / DELETE Simple Query round-trip via `cross_compare_sql`
 
 ### Tooling Compatibility
-- [ ] `psql` meta-commands: `\d`, `\dt`, `\di`, `\df`, `\dv`, `\du`, `\l`, `\dn`
-- [ ] `pgAdmin 4` connects and browses schema
-- [ ] `DBeaver` connects and runs queries
-- [ ] `DataGrip` connects and introspects schema
-- [ ] Flyway migrations run correctly
-- [ ] Liquibase migrations run correctly
-- [ ] Alembic migrations run correctly
+- [x] `psql` meta-commands: `\d`, `\dt`, `\di`, `\df`, `\dv`, `\du`, `\l`, `\dn`
+- [x] `pgAdmin 4` schema-browser introspection query family — desktop UI launch/click smoke remains open.
+- [x] `DBeaver` schema/table-browser introspection query family — desktop UI launch/click smoke remains open.
+- [x] `DataGrip` schema/column-browser introspection query family — desktop UI launch/click smoke remains open.
+- [x] Flyway migrations run correctly — pinned `12.6.2` Java API cert covers versioned SQL migrations, DDL/DML bodies, `flyway_schema_history`, and idempotent second `migrate` with `executeInTransaction(false)`.
+- [x] Liquibase migrations run correctly — pinned `5.0.3` Java API cert covers XML changelog update, DDL/DML changesets, `databasechangelog`, and `databasechangeloglock` with nontransactional changesets.
+- [x] Alembic migrations run correctly — pinned `1.18.4` command API cert covers `upgrade head`, DDL/DML revision bodies, and `alembic_version` with `transactional_ddl=False`.
 
 ### PostgreSQL Regression Suite
 - [ ] Parser tests pass
 - [ ] Type coercion tests pass
-- [ ] Transaction isolation tests pass (acid.sql, Hermitage)
+- [x] Transaction isolation baseline passes (`acid.sql`, Hermitage G1a/PMP/G2,
+  manager-level Hermitage matrix). Full PostgreSQL `src/test/isolation`
+  isolationtester schedule remains open because current SSI is relation-level
+  SSI, not predicate-precise PostgreSQL SSI.
 - [ ] Index tests pass
 - [ ] Aggregate and window function tests pass
 - [ ] Constraint tests pass

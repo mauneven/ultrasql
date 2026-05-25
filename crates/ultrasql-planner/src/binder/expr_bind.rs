@@ -53,6 +53,11 @@ pub(super) fn bind_expr_with_ctes(
         Expr::ArrayLiteral { elements, .. } => {
             bind_array_literal(elements, input, catalog, cte_catalog, scope)
         }
+        Expr::ArraySubscript {
+            expr: array_expr,
+            index,
+            ..
+        } => bind_array_subscript(array_expr, index, input, catalog, cte_catalog, scope),
         Expr::Unary {
             op, expr: inner, ..
         } => bind_unary(*op, inner, input, catalog, cte_catalog, scope),
@@ -292,6 +297,38 @@ pub(super) fn bind_expr_with_ctes(
                 data_type: inner_type,
             })
         }
+        Expr::AnyArray {
+            expr: lhs_ast,
+            op,
+            array,
+            ..
+        } => {
+            if *op != BinaryOp::Eq {
+                return Err(PlanError::NotSupported(
+                    "ANY with non-equality operator (only `= ANY` is supported)",
+                ));
+            }
+            let lhs = bind_expr_with_ctes(lhs_ast, input, catalog, cte_catalog, scope)?;
+            let array = bind_expr_with_ctes(array, input, catalog, cte_catalog, scope)?;
+            let DataType::Array(element_type) = array.data_type() else {
+                return Err(PlanError::TypeMismatch(format!(
+                    "= ANY array expression requires array argument, got {}",
+                    array.data_type()
+                )));
+            };
+            if !comparable(&lhs.data_type(), &element_type) {
+                return Err(PlanError::TypeMismatch(format!(
+                    "= ANY array: left type {} is not comparable to array element type {}",
+                    lhs.data_type(),
+                    element_type
+                )));
+            }
+            Ok(ScalarExpr::FunctionCall {
+                name: "__ultrasql_eq_any_array".to_owned(),
+                args: vec![lhs, array],
+                data_type: DataType::Bool,
+            })
+        }
 
         // `ALL (SELECT …)` — not supported at this layer.
         Expr::All { .. } => Err(PlanError::NotSupported(
@@ -472,6 +509,9 @@ fn bind_cast_expr(
     }
     coerce_literal_to_type(&mut bound, &target_type);
     let actual_type = bound.data_type();
+    if let Some(runtime_cast) = bind_runtime_cast(bound.clone(), &target_type, &actual_type) {
+        return Ok(runtime_cast);
+    }
     if cast_result_matches(&target_type, &actual_type) || matches!(actual_type, DataType::Null) {
         return Ok(bound);
     }
@@ -484,6 +524,35 @@ fn bind_cast_expr(
     Err(PlanError::NotSupported(
         "non-literal CAST expressions are not implemented",
     ))
+}
+
+fn bind_runtime_cast(
+    expr: ScalarExpr,
+    target_type: &DataType,
+    actual_type: &DataType,
+) -> Option<ScalarExpr> {
+    let name = match target_type {
+        DataType::Oid if actual_type.is_oid_alias() || actual_type.is_integer() => {
+            "__ultrasql_cast_oid"
+        }
+        DataType::RegClass if actual_type.is_oid_alias() || actual_type.is_integer() => {
+            "__ultrasql_cast_regclass"
+        }
+        DataType::RegType if actual_type.is_oid_alias() || actual_type.is_integer() => {
+            "__ultrasql_cast_regtype"
+        }
+        DataType::Text { .. }
+            if actual_type.is_oid_alias() || matches!(actual_type, DataType::PgLsn) =>
+        {
+            "__ultrasql_cast_text"
+        }
+        _ => return None,
+    };
+    Some(ScalarExpr::FunctionCall {
+        name: name.to_owned(),
+        args: vec![expr],
+        data_type: target_type.clone(),
+    })
 }
 
 /// Bind `expr [NOT] BETWEEN [SYMMETRIC] low AND high` into an equivalent
@@ -1241,19 +1310,47 @@ fn builtin_return_type(func_name: &str) -> Result<DataType, PlanError> {
         "row_to_json" | "json_build_object" | "jsonb_set" => Ok(DataType::Jsonb),
         "jsonb_path_exists" => Ok(DataType::Bool),
         "pg_advisory_lock" | "pg_advisory_unlock_all" => Ok(DataType::Null),
-        "pg_try_advisory_lock" | "pg_advisory_unlock" => Ok(DataType::Bool),
+        "pg_try_advisory_lock" | "pg_try_advisory_xact_lock" | "pg_advisory_unlock" => {
+            Ok(DataType::Bool)
+        }
         "has_table_privilege"
         | "has_schema_privilege"
         | "has_database_privilege"
         | "has_sequence_privilege"
         | "has_function_privilege"
-        | "has_column_privilege" => Ok(DataType::Bool),
+        | "has_column_privilege"
+        | "pg_table_is_visible"
+        | "pg_is_other_temp_schema"
+        | "pg_function_is_visible"
+        | "pg_relation_is_publishable" => Ok(DataType::Bool),
         "pg_get_userbyid" => Ok(DataType::Text { max_len: None }),
+        "to_regtype" => Ok(DataType::RegType),
         "gen_random_uuid" => Ok(DataType::Uuid),
         "pg_relation_size" => Ok(DataType::Int64),
-        "version" | "current_database" | "current_user" | "session_user" | "pg_typeof"
-        | "pg_size_pretty" => Ok(DataType::Text { max_len: None }),
+        "current_schemas" => Ok(DataType::Array(Box::new(DataType::Text { max_len: None }))),
+        "version"
+        | "current_catalog"
+        | "current_database"
+        | "current_schema"
+        | "current_user"
+        | "session_user"
+        | "pg_typeof"
+        | "pg_size_pretty"
+        | "set_config"
+        | "format_type"
+        | "pg_get_expr"
+        | "pg_get_indexdef"
+        | "pg_get_constraintdef"
+        | "pg_get_statisticsobjdef_columns"
+        | "pg_get_function_result"
+        | "pg_get_function_arguments"
+        | "pg_encoding_to_char"
+        | "obj_description"
+        | "shobj_description"
+        | "col_description"
+        | "pg_get_serial_sequence" => Ok(DataType::Text { max_len: None }),
         "array_length" => Ok(DataType::Int32),
+        "array_position" => Ok(DataType::Int32),
         "array_to_string" => Ok(DataType::Text { max_len: None }),
         "string_to_array" | "array_cat" => {
             Ok(DataType::Array(Box::new(DataType::Text { max_len: None })))
@@ -1318,6 +1415,7 @@ pub(super) fn is_supported_builtin(func_name: &str) -> bool {
             | "left"
             | "right"
             | "pg_get_userbyid"
+            | "to_regtype"
             | "substr"
             | "substring"
             | "position"
@@ -1338,6 +1436,7 @@ pub(super) fn is_supported_builtin(func_name: &str) -> bool {
             | "jsonb_path_exists"
             | "pg_advisory_lock"
             | "pg_try_advisory_lock"
+            | "pg_try_advisory_xact_lock"
             | "pg_advisory_unlock"
             | "pg_advisory_unlock_all"
             | "has_table_privilege"
@@ -1346,15 +1445,36 @@ pub(super) fn is_supported_builtin(func_name: &str) -> bool {
             | "has_sequence_privilege"
             | "has_function_privilege"
             | "has_column_privilege"
+            | "pg_table_is_visible"
+            | "pg_is_other_temp_schema"
+            | "pg_function_is_visible"
+            | "pg_relation_is_publishable"
             | "gen_random_uuid"
             | "version"
+            | "current_catalog"
             | "current_database"
+            | "current_schema"
             | "current_user"
             | "session_user"
             | "pg_typeof"
+            | "set_config"
+            | "format_type"
+            | "pg_get_expr"
+            | "pg_get_indexdef"
+            | "pg_get_constraintdef"
+            | "pg_get_statisticsobjdef_columns"
+            | "pg_get_function_result"
+            | "pg_get_function_arguments"
+            | "pg_encoding_to_char"
+            | "obj_description"
+            | "shobj_description"
+            | "col_description"
+            | "pg_get_serial_sequence"
             | "pg_relation_size"
+            | "current_schemas"
             | "pg_size_pretty"
             | "array_length"
+            | "array_position"
             | "array_to_string"
             | "string_to_array"
             | "array_cat"
@@ -1385,8 +1505,99 @@ fn validate_builtin_args(func_name: &str, args: &mut [ScalarExpr]) -> Result<(),
         | "has_sequence_privilege"
         | "has_function_privilege"
         | "has_column_privilege" => validate_has_privilege_args(func_name, args),
+        "pg_table_is_visible" | "pg_is_other_temp_schema" => {
+            validate_single_oidish_arg(func_name, args)
+        }
+        "current_schemas" => validate_current_schemas_args(args),
+        "to_regtype" => validate_to_regtype_args(args),
+        "set_config" => validate_set_config_args(args),
         _ => Ok(()),
     }
+}
+
+fn validate_current_schemas_args(args: &[ScalarExpr]) -> Result<(), PlanError> {
+    if args.len() != 1 {
+        return Err(PlanError::TypeMismatch(format!(
+            "current_schemas: expected 1 argument, got {}",
+            args.len()
+        )));
+    }
+    let data_type = args[0].data_type();
+    if matches!(data_type, DataType::Bool | DataType::Null) {
+        return Ok(());
+    }
+    Err(PlanError::TypeMismatch(format!(
+        "current_schemas: boolean argument required, got {data_type}"
+    )))
+}
+
+fn validate_set_config_args(args: &[ScalarExpr]) -> Result<(), PlanError> {
+    if args.len() != 3 {
+        return Err(PlanError::TypeMismatch(format!(
+            "set_config: expected 3 arguments, got {}",
+            args.len()
+        )));
+    }
+    let name_type = args[0].data_type();
+    let value_type = args[1].data_type();
+    let local_type = args[2].data_type();
+    if !matches!(
+        name_type,
+        DataType::Text { .. } | DataType::Char { .. } | DataType::Null
+    ) {
+        return Err(PlanError::TypeMismatch(format!(
+            "set_config: setting name must be text, got {name_type}"
+        )));
+    }
+    if !matches!(
+        value_type,
+        DataType::Text { .. } | DataType::Char { .. } | DataType::Null
+    ) {
+        return Err(PlanError::TypeMismatch(format!(
+            "set_config: setting value must be text, got {value_type}"
+        )));
+    }
+    if !matches!(local_type, DataType::Bool | DataType::Null) {
+        return Err(PlanError::TypeMismatch(format!(
+            "set_config: local flag must be boolean, got {local_type}"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_single_oidish_arg(func_name: &str, args: &[ScalarExpr]) -> Result<(), PlanError> {
+    if args.len() != 1 {
+        return Err(PlanError::TypeMismatch(format!(
+            "{func_name}: expected 1 argument, got {}",
+            args.len()
+        )));
+    }
+    let data_type = args[0].data_type();
+    if data_type.is_oid_alias() || data_type.is_integer() || matches!(data_type, DataType::Null) {
+        return Ok(());
+    }
+    Err(PlanError::TypeMismatch(format!(
+        "{func_name}: OID argument required, got {data_type}"
+    )))
+}
+
+fn validate_to_regtype_args(args: &[ScalarExpr]) -> Result<(), PlanError> {
+    if args.len() != 1 {
+        return Err(PlanError::TypeMismatch(format!(
+            "to_regtype: expected 1 argument, got {}",
+            args.len()
+        )));
+    }
+    let data_type = args[0].data_type();
+    if matches!(
+        data_type,
+        DataType::Null | DataType::Text { .. } | DataType::Char { .. } | DataType::RegType
+    ) {
+        return Ok(());
+    }
+    Err(PlanError::TypeMismatch(format!(
+        "to_regtype: text argument required, got {data_type}"
+    )))
 }
 
 fn validate_has_privilege_args(func_name: &str, args: &[ScalarExpr]) -> Result<(), PlanError> {
@@ -1789,7 +2000,7 @@ fn coerce_literal_to_oid_alias_with_catalog(
         }
         let resolved = match (target, &*value) {
             (DataType::RegClass, Value::Text(text) | Value::Char(text)) => {
-                Value::parse_oid_text(text).or_else(|| catalog.lookup_table_oid(text))
+                resolve_regclass_literal(text, catalog)
             }
             (DataType::RegType, Value::Text(text) | Value::Char(text)) => {
                 Value::parse_oid_text(text).or_else(|| catalog.lookup_type_oid(text))
@@ -1808,6 +2019,59 @@ fn coerce_literal_to_oid_alias_with_catalog(
         return true;
     }
     coerce_literal_to_oid_alias(expr, target)
+}
+
+fn resolve_regclass_literal(text: &str, catalog: &dyn Catalog) -> Option<Oid> {
+    Value::parse_oid_text(text)
+        .or_else(|| catalog.lookup_table_oid(text))
+        .or_else(|| {
+            parse_pg_identifier_path(text)
+                .and_then(|parts| parts.last().cloned())
+                .and_then(|name| catalog.lookup_table_oid(&name))
+        })
+}
+
+fn parse_pg_identifier_path(text: &str) -> Option<Vec<String>> {
+    let mut parts = Vec::new();
+    let mut chars = text.chars().peekable();
+    loop {
+        match chars.peek().copied()? {
+            '"' => {
+                chars.next();
+                let mut part = String::new();
+                loop {
+                    match chars.next()? {
+                        '"' if chars.peek() == Some(&'"') => {
+                            chars.next();
+                            part.push('"');
+                        }
+                        '"' => break,
+                        ch => part.push(ch),
+                    }
+                }
+                parts.push(part);
+            }
+            _ => {
+                let mut part = String::new();
+                while let Some(ch) = chars.peek().copied() {
+                    if ch == '.' {
+                        break;
+                    }
+                    part.push(ch);
+                    chars.next();
+                }
+                if part.is_empty() {
+                    return None;
+                }
+                parts.push(part);
+            }
+        }
+        match chars.next() {
+            Some('.') => continue,
+            None => return Some(parts),
+            Some(_) => return None,
+        }
+    }
 }
 
 fn decimal_from_f64(value: f64, scale: i32) -> Option<i64> {
@@ -1933,6 +2197,12 @@ pub(super) fn coerce_literal_to_type(expr: &mut ScalarExpr, target: &DataType) {
                 *data_type = DataType::Int16;
             }
         }
+        (DataType::Int16, Value::Text(text)) => {
+            if let Ok(parsed) = text.parse::<i16>() {
+                *value = Value::Int16(parsed);
+                *data_type = DataType::Int16;
+            }
+        }
         (DataType::Int32, Value::Int64(v)) => {
             if let Ok(narrow) = i32::try_from(*v) {
                 *value = Value::Int32(narrow);
@@ -1943,6 +2213,12 @@ pub(super) fn coerce_literal_to_type(expr: &mut ScalarExpr, target: &DataType) {
             *value = Value::Int32(i32::from(*v));
             *data_type = DataType::Int32;
         }
+        (DataType::Int32, Value::Text(text)) => {
+            if let Ok(parsed) = text.parse::<i32>() {
+                *value = Value::Int32(parsed);
+                *data_type = DataType::Int32;
+            }
+        }
         (DataType::Int64, Value::Int16(v)) => {
             *value = Value::Int64(i64::from(*v));
             *data_type = DataType::Int64;
@@ -1950,6 +2226,12 @@ pub(super) fn coerce_literal_to_type(expr: &mut ScalarExpr, target: &DataType) {
         (DataType::Int64, Value::Int32(v)) => {
             *value = Value::Int64(i64::from(*v));
             *data_type = DataType::Int64;
+        }
+        (DataType::Int64, Value::Text(text)) => {
+            if let Ok(parsed) = text.parse::<i64>() {
+                *value = Value::Int64(parsed);
+                *data_type = DataType::Int64;
+            }
         }
         (DataType::Float64, Value::Float32(v)) => {
             *value = Value::Float64(f64::from(*v));
@@ -2359,7 +2641,7 @@ fn resolve_cast_type(type_name: &str) -> Option<DataType> {
         "date" => Some(DataType::Date),
         "time" | "time without time zone" => Some(DataType::Time),
         "timetz" | "time with time zone" => Some(DataType::TimeTz),
-        "timestamp" => Some(DataType::Timestamp),
+        "timestamp" | "timestamp without time zone" => Some(DataType::Timestamp),
         "timestamptz" | "timestamp with time zone" => Some(DataType::TimestampTz),
         "uuid" => Some(DataType::Uuid),
         "json" => Some(DataType::Json),
@@ -2371,6 +2653,7 @@ fn resolve_cast_type(type_name: &str) -> Option<DataType> {
         }),
         "money" => Some(DataType::Money),
         "oid" => Some(DataType::Oid),
+        "regnamespace" => Some(DataType::Oid),
         "regclass" => Some(DataType::RegClass),
         "regtype" => Some(DataType::RegType),
         "pg_lsn" => Some(DataType::PgLsn),
@@ -2611,7 +2894,10 @@ pub(super) fn bind_column(
         }
         if input.is_empty()
             && name.parts.len() == 1
-            && matches!(col_name.as_str(), "current_user" | "session_user")
+            && matches!(
+                col_name.as_str(),
+                "current_catalog" | "current_user" | "session_user"
+            )
         {
             return Ok(ScalarExpr::FunctionCall {
                 name: col_name,
@@ -2635,6 +2921,40 @@ fn qualified_column_name(name: &ultrasql_parser::ast::ObjectName) -> Option<Stri
     let col = name.parts.last()?;
     let qualifier = name.parts.iter().rev().nth(1)?;
     Some(format!("{}.{}", qualifier.value, col.value))
+}
+
+fn bind_array_subscript(
+    array_expr: &Expr,
+    index: &Expr,
+    input: &Schema,
+    catalog: &dyn Catalog,
+    cte_catalog: &[(String, Schema)],
+    scope: &mut ScopeStack,
+) -> Result<ScalarExpr, PlanError> {
+    let array = bind_expr_with_ctes(array_expr, input, catalog, cte_catalog, scope)?;
+    let index = bind_expr_with_ctes(index, input, catalog, cte_catalog, scope)?;
+    let element_type = match array.data_type() {
+        DataType::Array(element_type) => *element_type,
+        other => {
+            return Err(PlanError::TypeMismatch(format!(
+                "array subscript requires array input, got {other}"
+            )));
+        }
+    };
+    let index_type = index.data_type();
+    if !matches!(
+        index_type,
+        DataType::Int16 | DataType::Int32 | DataType::Int64 | DataType::Null
+    ) {
+        return Err(PlanError::TypeMismatch(format!(
+            "array subscript index must be integer, got {index_type}"
+        )));
+    }
+    Ok(ScalarExpr::FunctionCall {
+        name: "__ultrasql_array_subscript".to_owned(),
+        args: vec![array, index],
+        data_type: element_type,
+    })
 }
 
 pub(super) fn bind_unary(

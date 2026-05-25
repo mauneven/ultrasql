@@ -1,0 +1,104 @@
+# PostgreSQL regression-derived parser/type baseline shard.
+# Source: PostgreSQL src/test/regress/sql/char.sql, varchar.sql,
+# numeric.sql, and type_sanity.sql at commit
+# ddd12d1a5c4d980c5f31dc7d096012547b724e55.
+# License/provenance live beside this file in IMPORT_MANIFEST.txt and
+# LICENSE.upstream.
+
+statement ok
+CREATE TABLE slt_pg_parser_types (
+  id INT NOT NULL,
+  c CHAR(4),
+  v VARCHAR(5),
+  n NUMERIC(6,2),
+  d DECIMAL(5,1),
+  flag BOOLEAN
+)
+
+statement ok
+INSERT INTO slt_pg_parser_types VALUES
+  (1, 'a', 'abc', 12.30, 4.5, true),
+  (2, 'xy', 'vwxyz', -7.25, -1.5, false),
+  (3, NULL, NULL, NULL, NULL, NULL)
+
+query I rowsort
+SELECT id FROM slt_pg_parser_types WHERE c = 'a'
+----
+1
+
+query II rowsort
+SELECT id, length(c) FROM slt_pg_parser_types WHERE c IS NOT NULL
+----
+1
+1
+2
+2
+
+query II rowsort
+SELECT id, length(v) FROM slt_pg_parser_types WHERE v IS NOT NULL
+----
+1
+3
+2
+5
+
+query I nosort
+SELECT id FROM slt_pg_parser_types WHERE n = 12.30
+----
+1
+
+query I nosort
+SELECT id FROM slt_pg_parser_types WHERE d = -1.5
+----
+2
+
+query I rowsort
+SELECT id FROM slt_pg_parser_types WHERE n + 0.70 = 13.00
+----
+1
+
+query I rowsort
+SELECT id FROM slt_pg_parser_types WHERE d - 0.5 = 4.0
+----
+1
+
+query T nosort
+SELECT pg_typeof(n) FROM slt_pg_parser_types WHERE id = 1
+----
+numeric
+
+query B nosort
+SELECT flag FROM slt_pg_parser_types WHERE id = 1
+----
+true
+
+query I nosort
+SELECT COUNT(*) FROM slt_pg_parser_types WHERE n IS NULL AND d IS NULL
+----
+1
+
+# ultrasql:skip VARCHAR(n) overlength INSERT compatibility is not enforced on this path yet
+statement error
+INSERT INTO slt_pg_parser_types VALUES (4, 'ab', 'abcdef', 1.00, 1.0, true)
+
+statement ok
+CREATE TABLE slt_pg_type_names (
+  id INT,
+  c CHARACTER(3),
+  v VARCHAR(4),
+  n DECIMAL,
+  m DECIMAL(4,1),
+  b BOOLEAN
+)
+
+# ultrasql:skip full PostgreSQL type_sanity catalog invariant needs complete pg_type/pg_cast/pg_proc parity and regtype text output parity
+query T nosort
+SELECT 'int4'::regtype::text
+----
+integer
+
+statement ok
+DROP TABLE slt_pg_type_names
+
+statement ok
+DROP TABLE slt_pg_parser_types

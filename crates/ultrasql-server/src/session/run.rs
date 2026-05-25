@@ -195,7 +195,7 @@ where
     #[inline]
     pub(crate) async fn handle_query(&mut self, sql: &str) -> Result<(), ServerError> {
         let trimmed = sql.trim();
-        if trimmed.is_empty() || trimmed == ";" {
+        if simple_query_is_empty(trimmed) {
             // Coalesce `EmptyQueryResponse` + any pending notifications
             // + `ReadyForQuery` into one `write_all` so the empty-query
             // reply stays a single syscall round-trip.
@@ -413,6 +413,34 @@ where
         self.io.flush().await?;
         Ok(())
     }
+}
+
+fn simple_query_is_empty(sql: &str) -> bool {
+    let bytes = sql.as_bytes();
+    let mut idx = 0;
+    while idx < bytes.len() {
+        match bytes[idx] {
+            b' ' | b'\t' | b'\n' | b'\r' | b';' => idx += 1,
+            b'-' if bytes.get(idx + 1) == Some(&b'-') => {
+                idx += 2;
+                while idx < bytes.len() && bytes[idx] != b'\n' {
+                    idx += 1;
+                }
+            }
+            b'/' if bytes.get(idx + 1) == Some(&b'*') => {
+                idx += 2;
+                while idx + 1 < bytes.len() && !(bytes[idx] == b'*' && bytes[idx + 1] == b'/') {
+                    idx += 1;
+                }
+                if idx + 1 >= bytes.len() {
+                    return true;
+                }
+                idx += 2;
+            }
+            _ => return false,
+        }
+    }
+    true
 }
 
 fn statement_log_class(sql: &str) -> &'static str {

@@ -73,7 +73,72 @@ jobs:
       - run: cargo test  --workspace --all-features -- --nocapture
 
   # -------------------------------------------------------------------
-  # 4. Documentation — broken intra-doc links fail the build.
+  # 4. Driver certification — stock PostgreSQL client libraries.
+  # -------------------------------------------------------------------
+  driver_certification:
+    name: driver certification
+    runs-on: ubuntu-latest
+    needs: fmt
+    env:
+      DOTNET_CLI_TELEMETRY_OPTOUT: "1"
+      DOTNET_NOLOGO: "1"
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: "3.4"
+          bundler-cache: false
+      - uses: actions/setup-node@v5
+        with:
+          node-version: "22"
+      - uses: pnpm/action-setup@v4
+        with:
+          version: "11.1.2"
+          run_install: false
+      - uses: actions/setup-go@v6
+        with:
+          go-version: "1.26.x"
+          cache-dependency-path: tests/driver_certification/go/go.sum
+      - uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: "21"
+      - uses: actions/setup-dotnet@v5
+        with:
+          dotnet-version: "8.0.x"
+      - name: install libpq development files
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libpq-dev postgresql-client
+      - name: install driver dependencies
+        run: |
+          python -m venv .venv-driver-cert
+          .venv-driver-cert/bin/python -m pip install --disable-pip-version-check \
+            -r tests/driver_certification/requirements.txt
+          # Python harness pins psycopg2, psycopg3, SQLAlchemy, Django, and Alembic==1.18.4.
+          bundle install --gemfile tests/driver_certification/rails/Gemfile --jobs 4 --retry 3
+          pnpm --dir tests/driver_certification/node install --frozen-lockfile
+          go -C tests/driver_certification/go mod download
+          cargo fetch --manifest-path tests/driver_certification/diesel/Cargo.toml
+          dotnet restore --locked-mode tests/driver_certification/dotnet/Ultrasql.DriverCertification.csproj
+      - run: cargo build -p ultrasql-server --bin ultrasqld
+      - name: run driver certification
+        run: |
+          .venv-driver-cert/bin/python tests/driver_certification/driver_certification.py \
+            --ultrasqld target/debug/ultrasqld \
+            --json-output target/driver-certification.json
+      - uses: actions/upload-artifact@v4
+        with:
+          name: driver-certification
+          path: target/driver-certification.json
+
+  # -------------------------------------------------------------------
+  # 5. Documentation — broken intra-doc links fail the build.
   # -------------------------------------------------------------------
   doc:
     name: docs
@@ -88,7 +153,7 @@ jobs:
       - run: cargo doc --workspace --all-features --no-deps
 
   # -------------------------------------------------------------------
-  # 5. cargo-deny — license, advisory, banned-deps checks.
+  # 6. cargo-deny — license, advisory, banned-deps checks.
   # -------------------------------------------------------------------
   deny:
     name: cargo-deny
@@ -102,7 +167,7 @@ jobs:
           command: check advisories bans licenses sources
 
   # -------------------------------------------------------------------
-  # 6. cargo-audit — direct RustSec advisory check.
+  # 7. cargo-audit — direct RustSec advisory check.
   # -------------------------------------------------------------------
   audit:
     name: cargo-audit
@@ -115,7 +180,7 @@ jobs:
       - run: cargo audit --deny yanked
 
   # -------------------------------------------------------------------
-  # 7. Aggregate status — required check for branch protection.
+  # 8. Aggregate status — required check for branch protection.
   #    Job result values are passed via `env:` so the run script does
   #    not interpolate workflow-context values directly into shell.
   # -------------------------------------------------------------------
@@ -123,20 +188,22 @@ jobs:
     name: ci-passed
     if: always()
     runs-on: ubuntu-latest
-    needs: [fmt, clippy, test, doc, deny, audit]
+    needs: [fmt, clippy, test, driver_certification, doc, deny, audit]
     steps:
       - name: check all required jobs succeeded
         env:
-          FMT_RESULT:    ${{ needs.fmt.result }}
-          CLIPPY_RESULT: ${{ needs.clippy.result }}
-          TEST_RESULT:   ${{ needs.test.result }}
-          DOC_RESULT:    ${{ needs.doc.result }}
-          DENY_RESULT:   ${{ needs.deny.result }}
-          AUDIT_RESULT:  ${{ needs.audit.result }}
+          FMT_RESULT:         ${{ needs.fmt.result }}
+          CLIPPY_RESULT:      ${{ needs.clippy.result }}
+          TEST_RESULT:        ${{ needs.test.result }}
+          DRIVER_CERT_RESULT: ${{ needs.driver_certification.result }}
+          DOC_RESULT:         ${{ needs.doc.result }}
+          DENY_RESULT:        ${{ needs.deny.result }}
+          AUDIT_RESULT:       ${{ needs.audit.result }}
         run: |
           if [ "$FMT_RESULT"    != "success" ] \
           || [ "$CLIPPY_RESULT" != "success" ] \
           || [ "$TEST_RESULT"   != "success" ] \
+          || [ "$DRIVER_CERT_RESULT" != "success" ] \
           || [ "$DOC_RESULT"    != "success" ] \
           || [ "$DENY_RESULT"   != "success" ] \
           || [ "$AUDIT_RESULT"  != "success" ]; then

@@ -57,7 +57,7 @@ async fn create_statistics_returns_command_tag() {
         .expect("CREATE STATISTICS");
     let rows = client
         .query(
-            "SELECT stxname, stxkeys, stxkind \
+            "SELECT stxname, stxkeys, array_to_string(stxkind, '') \
              FROM pg_catalog.pg_statistic_ext \
              WHERE stxname = 's_ab'",
             &[],

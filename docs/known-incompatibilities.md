@@ -17,6 +17,12 @@ release status.
 - Some PostgreSQL data types are partial or missing, including full XML, full
   locale/collation behavior, domain/composite type parity, and several network
   address/operator details.
+- Transactional DDL is not complete; ORM schema-creation certification runs in
+  autocommit mode until DDL inside explicit transaction blocks is implemented.
+- Serializable transactions use relation-level SSI, not predicate-precise
+  PostgreSQL SSI. The covered Hermitage write-skew case aborts one transaction
+  with SQLSTATE `40001`, but full PostgreSQL isolationtester parity remains
+  open.
 - Ordered-set aggregates and multi-argument statistical aggregates such as
   `CORR`, `PERCENTILE_CONT`, and `PERCENTILE_DISC` need a richer aggregate plan
   shape before SQL-surface parity can be claimed.
@@ -28,7 +34,9 @@ release status.
 
 - Role/privilege persistence is incomplete compared with PostgreSQL; roles and
   ACLs still use in-memory catalogs.
-- Broad ecosystem admin-tool introspection remains open.
+- GUI schema-browser introspection query families are certified for pgAdmin,
+  DBeaver, and DataGrip, but full desktop UI launch/click smoke, admin-tool
+  mutation workflows, and less common admin paths remain open.
 - Row-level security covers the documented tenant policy shape with
   owner/bypass/restart semantics but is not yet claimed as full PostgreSQL
   parity.
@@ -52,6 +60,15 @@ release status.
 
 ## Client ecosystem
 
-- PostgreSQL wire protocol support exists, but full certification for psql,
-  SQLAlchemy, Django, Rails, Hibernate, Prisma, Diesel, JDBC, Npgsql, and admin
-  tools is not complete.
+- Core PostgreSQL driver certification exists for direct `libpq`, `psycopg2`,
+  `psycopg3`, SQLAlchemy, Django ORM, Rails ActiveRecord, `node-postgres`, Go
+  `lib/pq`, Go `pgx`, GORM, the JDBC PostgreSQL driver, Hibernate ORM, Npgsql,
+  Prisma, Diesel traffic, and stock `psql` meta-commands `\d`, `\dt`, `\di`,
+  `\df`, `\dv`, `\du`, `\l`, and `\dn`. GUI introspection probes cover
+  pgAdmin, DBeaver, and DataGrip catalog schema-browser query families. Flyway,
+  Liquibase, and Alembic certification covers version-table migration runs
+  through their public APIs. Flyway uses `executeInTransaction(false)`,
+  Liquibase uses nontransactional changesets, and Alembic uses
+  `transactional_ddl=False` until transactional DDL lands. Full certification
+  for desktop admin tool workflows, every migration CLI flag, and
+  driver-specific advanced type adapters is not complete.

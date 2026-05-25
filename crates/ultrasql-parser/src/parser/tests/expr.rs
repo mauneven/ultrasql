@@ -327,6 +327,12 @@ fn row_unclosed_paren_is_error() {
 }
 
 #[test]
+fn array_constructor_accepts_parenthesized_subquery() {
+    let expr = parse_expr("array(select rolname from pg_roles)");
+    assert!(matches!(expr, Expr::Subquery { .. }));
+}
+
+#[test]
 fn over_clause_partition_and_order() {
     let expr = parse_expr("row_number() OVER (PARTITION BY a ORDER BY b ASC)");
     let Expr::Call { over, .. } = expr else {

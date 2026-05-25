@@ -389,6 +389,8 @@ impl<'src> Parser<'src> {
 
             TokenKind::LBracket => self.parse_array_literal(),
 
+            TokenKind::KwArray => self.parse_array_constructor(),
+
             TokenKind::KwExists => self.parse_exists_expr(false),
 
             TokenKind::KwCast => self.parse_cast_expr(),
@@ -423,7 +425,7 @@ impl<'src> Parser<'src> {
                 self.parse_keyword_function_call("format")
             }
 
-            TokenKind::Identifier | TokenKind::QuotedIdentifier => {
+            TokenKind::Identifier | TokenKind::QuotedIdentifier | TokenKind::KwLocked => {
                 if self.looks_like_vector_family_typed_literal()? {
                     self.parse_vector_family_typed_literal()
                 } else if self.looks_like_bit_string_typed_literal()? {
@@ -535,6 +537,35 @@ impl<'src> Parser<'src> {
         Ok(Expr::ArrayLiteral {
             elements,
             span: Span::new(lb.span.start, rb.span.end),
+        })
+    }
+
+    fn parse_array_constructor(&mut self) -> Result<Expr, ParseError> {
+        let array_tok = self.expect(TokenKind::KwArray, "ARRAY")?;
+        if self.peek()?.kind == TokenKind::LParen
+            && matches!(
+                self.lookahead_at(1)?.kind,
+                TokenKind::KwSelect | TokenKind::KwWith
+            )
+        {
+            let lp = self.advance()?;
+            let Some(Expr::Subquery { select, span }) =
+                self.try_parse_subquery_after_lparen(lp.span)?
+            else {
+                unreachable!("lookahead guarantees parenthesized SELECT or WITH");
+            };
+            return Ok(Expr::Subquery {
+                select,
+                span: Span::new(array_tok.span.start, span.end),
+            });
+        }
+        let literal = self.parse_array_literal()?;
+        let Expr::ArrayLiteral { elements, span } = literal else {
+            unreachable!("parse_array_literal always returns Expr::ArrayLiteral");
+        };
+        Ok(Expr::ArrayLiteral {
+            elements,
+            span: Span::new(array_tok.span.start, span.end),
         })
     }
 
@@ -1001,6 +1032,12 @@ impl<'src> Parser<'src> {
 
     fn parse_cast_type_name(&mut self) -> Result<Identifier, ParseError> {
         let mut target = self.parse_type_name()?;
+        let qualified_start = target.span.start;
+        while self.peek()?.kind == TokenKind::Dot {
+            self.advance()?; // .
+            target = self.parse_type_name()?;
+            target.span = Span::new(qualified_start, target.span.end);
+        }
         if target.value == "double" && self.peek()?.kind == TokenKind::KwPrecision {
             let precision = self.advance()?;
             target.value = "double precision".to_owned();
@@ -1016,6 +1053,14 @@ impl<'src> Parser<'src> {
             self.expect(TokenKind::KwTime, "TIME")?;
             let zone = self.expect(TokenKind::KwZone, "ZONE")?;
             target.value = format!("{} with time zone", target.value);
+            target.span = Span::new(target.span.start, zone.span.end);
+        } else if matches!(target.value.as_str(), "time" | "timestamp")
+            && self.next_identifier_is("without")?
+        {
+            self.advance()?;
+            self.expect(TokenKind::KwTime, "TIME")?;
+            let zone = self.expect(TokenKind::KwZone, "ZONE")?;
+            target.value = format!("{} without time zone", target.value);
             target.span = Span::new(target.span.start, zone.span.end);
         }
         if let Some(base) = vector_family_type_base(&target.value)

@@ -1,0 +1,30 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<databaseChangeLog
+    xmlns="http://www.liquibase.org/xml/ns/dbchangelog"
+    xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+    xsi:schemaLocation="http://www.liquibase.org/xml/ns/dbchangelog
+        https://www.liquibase.org/xml/ns/dbchangelog/dbchangelog-latest.xsd">
+
+  <changeSet id="1" author="ultrasql" runInTransaction="false">
+    <createTable tableName="liquibase_cert">
+      <column name="id" type="INT">
+        <constraints nullable="false" primaryKey="true"/>
+      </column>
+      <column name="label" type="TEXT"/>
+    </createTable>
+    <insert tableName="liquibase_cert">
+      <column name="id" valueNumeric="1"/>
+      <column name="label" value="alpha"/>
+    </insert>
+  </changeSet>
+
+  <changeSet id="2" author="ultrasql" runInTransaction="false">
+    <addColumn tableName="liquibase_cert">
+      <column name="applied_by" type="TEXT"/>
+    </addColumn>
+    <update tableName="liquibase_cert">
+      <column name="applied_by" value="liquibase"/>
+      <where>id = 1</where>
+    </update>
+  </changeSet>
+</databaseChangeLog>

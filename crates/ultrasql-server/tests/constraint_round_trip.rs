@@ -477,6 +477,132 @@ async fn primary_key_enforces_not_null_and_unique() {
     graceful_shutdown(running).await;
 }
 
+#[tokio::test]
+async fn primary_key_allows_update_of_non_key_columns() {
+    let running = start_sample_server("constraint_pk_update_test").await;
+    let client = &running.client;
+
+    client
+        .batch_execute("CREATE TABLE pk_update (id INT PRIMARY KEY, label TEXT)")
+        .await
+        .expect("create");
+    client
+        .batch_execute("INSERT INTO pk_update VALUES (1, 'before')")
+        .await
+        .expect("insert");
+    client
+        .batch_execute("UPDATE pk_update SET label = 'after' WHERE id = 1")
+        .await
+        .expect("non-key update should keep primary-key index valid");
+
+    let row = client
+        .query_one("SELECT label FROM pk_update WHERE id = 1", &[])
+        .await
+        .expect("select updated row");
+    assert_eq!(row.get::<_, String>(0), "after");
+
+    graceful_shutdown(running).await;
+}
+
+#[tokio::test]
+async fn primary_key_survives_add_column_then_update() {
+    let running = start_sample_server("constraint_pk_alter_update_test").await;
+    let client = &running.client;
+
+    client
+        .batch_execute("CREATE TABLE pk_alter_update (id INT PRIMARY KEY, label TEXT)")
+        .await
+        .expect("create");
+    client
+        .batch_execute("INSERT INTO pk_alter_update VALUES (1, 'before')")
+        .await
+        .expect("insert");
+    client
+        .batch_execute("ALTER TABLE pk_alter_update ADD COLUMN applied_by TEXT")
+        .await
+        .expect("add column");
+    client
+        .batch_execute("UPDATE pk_alter_update SET applied_by = 'flyway' WHERE id = 1")
+        .await
+        .expect("update after add column should keep primary-key index valid");
+
+    let row = client
+        .query_one(
+            "SELECT label, applied_by FROM pk_alter_update WHERE id = 1",
+            &[],
+        )
+        .await
+        .expect("select updated row");
+    assert_eq!(row.get::<_, String>(0), "before");
+    assert_eq!(row.get::<_, String>(1), "flyway");
+
+    graceful_shutdown(running).await;
+}
+
+#[tokio::test]
+async fn alter_add_column_resizes_runtime_column_metadata() {
+    let running = start_sample_server("constraint_alter_metadata_width_test").await;
+    let client = &running.client;
+
+    client
+        .batch_execute("CREATE TABLE alter_metadata_width (id SERIAL PRIMARY KEY, label TEXT)")
+        .await
+        .expect("create table");
+    client
+        .batch_execute("INSERT INTO alter_metadata_width (label) VALUES ('alpha')")
+        .await
+        .expect("insert row");
+    client
+        .batch_execute("ALTER TABLE alter_metadata_width ADD COLUMN applied_by TEXT")
+        .await
+        .expect("add column");
+    client
+        .batch_execute("UPDATE alter_metadata_width SET applied_by = 'alembic' WHERE id = 1")
+        .await
+        .expect("ALTER ADD COLUMN keeps runtime metadata width in sync");
+
+    let row = client
+        .query_one(
+            "SELECT label, applied_by FROM alter_metadata_width WHERE id = 1",
+            &[],
+        )
+        .await
+        .expect("select updated row");
+    assert_eq!(row.get::<_, String>(0), "alpha");
+    assert_eq!(row.get::<_, String>(1), "alembic");
+
+    graceful_shutdown(running).await;
+}
+
+/// `ALTER TABLE ... ADD CONSTRAINT ... PRIMARY KEY` builds the same unique
+/// enforcement used by inline primary keys.
+#[tokio::test]
+async fn alter_table_add_primary_key_constraint_enforces_unique() {
+    let running = start_sample_server("constraint_alter_pk_test").await;
+    let client = &running.client;
+
+    client
+        .batch_execute("CREATE TABLE alter_pk (id INT NOT NULL, v INT)")
+        .await
+        .expect("create");
+    client
+        .batch_execute("ALTER TABLE alter_pk ADD CONSTRAINT alter_pk_pk PRIMARY KEY (id)")
+        .await
+        .expect("add primary key");
+    client
+        .batch_execute("INSERT INTO alter_pk VALUES (1, 10)")
+        .await
+        .expect("insert");
+
+    let duplicate_err = client
+        .batch_execute("INSERT INTO alter_pk VALUES (1, 20)")
+        .await
+        .expect_err("ALTER-added PRIMARY KEY rejects duplicate");
+    assert_eq!(duplicate_err.code().expect("SQLSTATE").code(), "23505");
+
+    graceful_shutdown(running).await;
+}
+
 /// Basic non-deferrable FOREIGN KEY enforcement: child writes must find
 /// a parent row, and parent key deletes/updates are restricted while a
 /// child references them.

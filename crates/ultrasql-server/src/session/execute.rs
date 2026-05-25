@@ -631,6 +631,74 @@ where
         self.run_dml_or_select(&optimised_plan, &catalog_snapshot)
     }
 
+    pub(crate) fn is_ddl_plan(plan: &LogicalPlan) -> bool {
+        matches!(
+            plan,
+            LogicalPlan::CreateTable { .. }
+                | LogicalPlan::CreateMaterializedView { .. }
+                | LogicalPlan::CreateTypeEnum { .. }
+                | LogicalPlan::CreateTypeComposite { .. }
+                | LogicalPlan::CreateDomain { .. }
+                | LogicalPlan::CreateIndex { .. }
+                | LogicalPlan::CreatePolicy { .. }
+                | LogicalPlan::CreateRole { .. }
+                | LogicalPlan::AlterRole { .. }
+                | LogicalPlan::DropRole { .. }
+                | LogicalPlan::GrantPrivileges { .. }
+                | LogicalPlan::RevokePrivileges { .. }
+                | LogicalPlan::AlterDefaultPrivileges { .. }
+                | LogicalPlan::GrantRole { .. }
+                | LogicalPlan::RevokeRole { .. }
+                | LogicalPlan::CreateSequence { .. }
+                | LogicalPlan::AlterSequence { .. }
+                | LogicalPlan::DropSequence { .. }
+                | LogicalPlan::Comment { .. }
+                | LogicalPlan::DropTable { .. }
+                | LogicalPlan::AlterTable { .. }
+                | LogicalPlan::Truncate { .. }
+        )
+    }
+
+    pub(crate) fn execute_ddl_plan(
+        &mut self,
+        plan: &LogicalPlan,
+        catalog_snapshot: &Arc<CatalogSnapshot>,
+    ) -> Result<SelectResult, ServerError> {
+        match plan {
+            LogicalPlan::CreateTable { .. } => self.execute_create_table(plan, catalog_snapshot),
+            LogicalPlan::CreateMaterializedView { .. } => {
+                self.execute_create_materialized_view(plan, catalog_snapshot)
+            }
+            LogicalPlan::CreateTypeEnum { .. } => {
+                self.execute_create_type_enum(plan, catalog_snapshot)
+            }
+            LogicalPlan::CreateTypeComposite { .. } => {
+                self.execute_create_type_composite(plan, catalog_snapshot)
+            }
+            LogicalPlan::CreateDomain { .. } => self.execute_create_domain(plan, catalog_snapshot),
+            LogicalPlan::CreateIndex { .. } => self.execute_create_index(plan, catalog_snapshot),
+            LogicalPlan::CreatePolicy { .. } => self.execute_create_policy(plan, catalog_snapshot),
+            LogicalPlan::CreateRole { .. } => self.execute_create_role(plan),
+            LogicalPlan::AlterRole { .. } => self.execute_alter_role(plan),
+            LogicalPlan::DropRole { .. } => self.execute_drop_role(plan),
+            LogicalPlan::GrantPrivileges { .. } => self.execute_grant_privileges(plan),
+            LogicalPlan::RevokePrivileges { .. } => self.execute_revoke_privileges(plan),
+            LogicalPlan::AlterDefaultPrivileges { .. } => {
+                self.execute_alter_default_privileges(plan)
+            }
+            LogicalPlan::GrantRole { .. } => self.execute_grant_role(plan),
+            LogicalPlan::RevokeRole { .. } => self.execute_revoke_role(plan),
+            LogicalPlan::CreateSequence { .. } => self.execute_create_sequence(plan),
+            LogicalPlan::AlterSequence { .. } => self.execute_alter_sequence(plan),
+            LogicalPlan::DropSequence { .. } => self.execute_drop_sequence(plan),
+            LogicalPlan::Comment { .. } => self.execute_comment(plan, catalog_snapshot),
+            LogicalPlan::DropTable { .. } => self.execute_drop_table(plan),
+            LogicalPlan::AlterTable { .. } => self.execute_alter_table(plan, catalog_snapshot),
+            LogicalPlan::Truncate { .. } => self.execute_truncate(plan, catalog_snapshot),
+            _ => Err(ServerError::Unsupported("execute_ddl_plan: wrong plan")),
+        }
+    }
+
     pub(crate) fn execute_set_variable(
         &mut self,
         plan: &LogicalPlan,
@@ -674,6 +742,31 @@ where
                 self.statement_timeout_ms = 0;
                 Ok(result_encoder::run_ddl_command("RESET"))
             }
+            "extra_float_digits" => {
+                self.session_settings.remove("extra_float_digits");
+                Ok(result_encoder::run_ddl_command("RESET"))
+            }
+            "application_name" => {
+                self.session_settings.remove("application_name");
+                Ok(result_encoder::run_ddl_command("RESET"))
+            }
+            "client_min_messages" => {
+                self.session_settings.remove("client_min_messages");
+                Ok(result_encoder::run_ddl_command("RESET"))
+            }
+            "client_encoding" => Ok(result_encoder::run_ddl_command("RESET")),
+            "search_path" => {
+                self.session_settings.remove("search_path");
+                Ok(result_encoder::run_ddl_command("RESET"))
+            }
+            "intervalstyle" => {
+                self.session_settings.remove("intervalstyle");
+                Ok(result_encoder::run_ddl_command("RESET"))
+            }
+            "timezone" => {
+                self.session_settings.remove("timezone");
+                Ok(result_encoder::run_ddl_command("RESET"))
+            }
             "synchronous_commit" => Ok(result_encoder::run_ddl_command("RESET")),
             _ if name.contains('.') => {
                 self.session_settings.remove(&name.to_ascii_lowercase());
@@ -700,6 +793,59 @@ where
                 self.statement_timeout_ms = parse_statement_timeout_ms(value)?;
                 Ok(())
             }
+            "extra_float_digits" => {
+                let parsed = value
+                    .parse::<i32>()
+                    .map_err(|_| ServerError::Unsupported("invalid extra_float_digits"))?;
+                if !(-15..=3).contains(&parsed) {
+                    return Err(ServerError::Unsupported("invalid extra_float_digits"));
+                }
+                self.session_settings
+                    .insert("extra_float_digits".to_owned(), parsed.to_string());
+                Ok(())
+            }
+            "application_name" => {
+                self.session_settings
+                    .insert("application_name".to_owned(), value.to_owned());
+                Ok(())
+            }
+            "client_min_messages" => match value.to_ascii_lowercase().as_str() {
+                "debug5" | "debug4" | "debug3" | "debug2" | "debug1" | "log" | "notice"
+                | "warning" | "error" => {
+                    self.session_settings
+                        .insert("client_min_messages".to_owned(), value.to_ascii_lowercase());
+                    Ok(())
+                }
+                _ => Err(ServerError::Unsupported("invalid client_min_messages")),
+            },
+            "client_encoding" => match value.to_ascii_lowercase().as_str() {
+                "utf8" | "utf-8" | "unicode" => Ok(()),
+                _ => Err(ServerError::Unsupported("invalid client_encoding")),
+            },
+            "search_path" => {
+                self.session_settings
+                    .insert("search_path".to_owned(), value.to_owned());
+                Ok(())
+            }
+            "intervalstyle" => match value.to_ascii_lowercase().as_str() {
+                "postgres" | "postgres_verbose" | "sql_standard" | "iso_8601" => {
+                    self.session_settings
+                        .insert("intervalstyle".to_owned(), value.to_ascii_lowercase());
+                    Ok(())
+                }
+                _ => Err(ServerError::Unsupported("invalid intervalstyle")),
+            },
+            "timezone" => {
+                self.session_settings
+                    .insert("timezone".to_owned(), value.to_owned());
+                Ok(())
+            }
+            "standard_conforming_strings" => match value.to_ascii_lowercase().as_str() {
+                "on" => Ok(()),
+                _ => Err(ServerError::Unsupported(
+                    "invalid standard_conforming_strings",
+                )),
+            },
             "synchronous_commit" => match value.to_ascii_lowercase().as_str() {
                 "on" | "off" | "local" | "remote_write" | "remote_apply" => Ok(()),
                 _ => Err(ServerError::Unsupported("invalid synchronous_commit")),
@@ -728,6 +874,43 @@ where
             }
             "jit_above_cost" => self.jit_above_rows.to_string(),
             "statement_timeout" => self.statement_timeout_ms.to_string(),
+            "extra_float_digits" => self
+                .session_settings
+                .get("extra_float_digits")
+                .cloned()
+                .unwrap_or_else(|| "1".to_owned()),
+            "application_name" => self
+                .session_settings
+                .get("application_name")
+                .cloned()
+                .unwrap_or_default(),
+            "client_encoding" => "UTF8".to_owned(),
+            "client_min_messages" => self
+                .session_settings
+                .get("client_min_messages")
+                .cloned()
+                .unwrap_or_else(|| "notice".to_owned()),
+            "datestyle" => "ISO, MDY".to_owned(),
+            "intervalstyle" => self
+                .session_settings
+                .get("intervalstyle")
+                .cloned()
+                .unwrap_or_else(|| "postgres".to_owned()),
+            "max_identifier_length" => "63".to_owned(),
+            "server_version" => crate::POSTGRES_COMPAT_SERVER_VERSION.to_owned(),
+            "server_version_num" => "140000".to_owned(),
+            "search_path" => self
+                .session_settings
+                .get("search_path")
+                .cloned()
+                .unwrap_or_else(|| "\"$user\", public".to_owned()),
+            "timezone" | "TimeZone" => self
+                .session_settings
+                .get("timezone")
+                .cloned()
+                .unwrap_or_else(|| "UTC".to_owned()),
+            "transaction_isolation" => "read committed".to_owned(),
+            "standard_conforming_strings" => "on".to_owned(),
             "synchronous_commit" => "on".to_owned(),
             _ if name.contains('.') => self
                 .session_settings

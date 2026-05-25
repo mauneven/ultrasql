@@ -16,6 +16,10 @@ and must document the break here.
   RAG helper functions, external scans, and lakehouse-oriented CSV/Parquet
   surfaces.
 - SQLLogicTest runner and documented external-test import policy.
+- PostgreSQL regression-derived SQLLogicTest parser/type baseline with public
+  provenance and explicit unsupported-catalog skips.
+- Isolation-suite baseline covering an UltraSQL-authored `acid.sql`, selected
+  Hermitage PostgreSQL scenarios, and explicit relation-level SSI honesty notes.
 - Reproducible benchmark scripts and result artifacts for PostgreSQL, DuckDB,
   SQLite, ClickHouse, and local Firebolt Core where available.
 - Tagged release workflow for Linux, macOS, and Windows binary archives with

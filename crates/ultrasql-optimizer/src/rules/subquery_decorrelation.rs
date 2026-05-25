@@ -130,6 +130,9 @@ fn decorrelate(plan: &LogicalPlan) -> Result<Option<LogicalPlan>, OptimizeError>
             exprs,
             schema,
         } => {
+            if let Some(rewritten) = rewrite_project_with_scalar_subquery(input, exprs, schema) {
+                return Ok(Some(rewritten));
+            }
             let new_input = decorrelate(input)?;
             Ok(new_input.map(|i| LogicalPlan::Project {
                 input: Box::new(i),
@@ -219,6 +222,15 @@ struct CorrelatedScalarRight {
 }
 
 #[derive(Debug)]
+struct CorrelatedScalarProjectRight {
+    plan: LogicalPlan,
+    corr_pairs: Vec<CorrPair>,
+    residual_predicates: Vec<ScalarExpr>,
+    scalar_index: usize,
+    scalar_name: String,
+}
+
+#[derive(Debug)]
 struct CorrelatedExistsInput {
     clean_subplan: LogicalPlan,
     corr_pairs: Vec<CorrPair>,
@@ -283,6 +295,151 @@ fn rewrite_scalar_subquery_filter(
         predicate: rewritten_predicate,
     };
     Some(project_left(filtered, outer.schema()))
+}
+
+fn rewrite_project_with_scalar_subquery(
+    input: &LogicalPlan,
+    exprs: &[(ScalarExpr, String)],
+    schema: &Schema,
+) -> Option<LogicalPlan> {
+    let outer_width = input.schema().len();
+    for (expr_idx, (expr, _alias)) in exprs.iter().enumerate() {
+        if let Some((subplan, data_type)) = find_first_correlated_scalar_subquery(expr) {
+            let right = build_correlated_scalar_project_right(*subplan, outer_width)?;
+            let mut predicates = vec![build_correlation_condition_against_right_schema(
+                &right.corr_pairs,
+                outer_width,
+            )];
+            predicates.extend(right.residual_predicates);
+            let join_schema = concat_schemas(input.schema(), right.plan.schema());
+            let join = LogicalPlan::Join {
+                left: Box::new(input.clone()),
+                right: Box::new(right.plan),
+                join_type: LogicalJoinType::LeftOuter,
+                condition: LogicalJoinCondition::On(conjuncts_to_and(predicates)),
+                schema: join_schema,
+            };
+            let replacement = ScalarExpr::Column {
+                name: right.scalar_name,
+                index: outer_width + right.scalar_index,
+                data_type,
+            };
+            let mut new_exprs = exprs.to_vec();
+            new_exprs[expr_idx].0 = replace_first_correlated_scalar_subquery(expr, replacement)?;
+            return Some(LogicalPlan::Project {
+                input: Box::new(join),
+                exprs: new_exprs,
+                schema: schema.clone(),
+            });
+        }
+
+        if let Some((new_expr, subplan)) = replace_first_uncorrelated_scalar_subquery(
+            expr,
+            outer_width,
+            "__scalar_subquery".to_owned(),
+        ) {
+            let right = alias_first_column(*subplan, "__scalar_subquery")?;
+            let join_schema = concat_schemas(input.schema(), right.schema());
+            let join = LogicalPlan::Join {
+                left: Box::new(input.clone()),
+                right: Box::new(right),
+                join_type: LogicalJoinType::Cross,
+                condition: LogicalJoinCondition::None,
+                schema: join_schema,
+            };
+            let mut new_exprs = exprs.to_vec();
+            new_exprs[expr_idx].0 = new_expr;
+            return Some(LogicalPlan::Project {
+                input: Box::new(join),
+                exprs: new_exprs,
+                schema: schema.clone(),
+            });
+        }
+    }
+    None
+}
+
+fn build_correlated_scalar_project_right(
+    plan: LogicalPlan,
+    outer_width: usize,
+) -> Option<CorrelatedScalarProjectRight> {
+    let LogicalPlan::Project {
+        input,
+        exprs,
+        schema,
+    } = plan
+    else {
+        return None;
+    };
+    if schema.len() != 1 || exprs.len() != 1 || exprs[0].0.contains_outer_column() {
+        return None;
+    }
+    let CorrelatedExistsInput {
+        clean_subplan,
+        corr_pairs,
+        residual_predicates,
+    } = extract_correlated_exists_input(*input, outer_width)?;
+    if corr_pairs.is_empty() {
+        return None;
+    }
+
+    let mut needed = Vec::new();
+    for pair in &corr_pairs {
+        push_unique_index(&mut needed, pair.inner_index);
+    }
+    for predicate in &residual_predicates {
+        collect_join_right_column_indices(predicate, outer_width, &mut needed);
+    }
+
+    let input_schema = clean_subplan.schema().clone();
+    let mut fields = Vec::with_capacity(needed.len() + 1);
+    let mut project_exprs = Vec::with_capacity(needed.len() + 1);
+    for &idx in &needed {
+        let field = input_schema.fields().get(idx)?;
+        fields.push(field.clone());
+        project_exprs.push((
+            ScalarExpr::Column {
+                name: field.name.clone(),
+                index: idx,
+                data_type: field.data_type.clone(),
+            },
+            field.name.clone(),
+        ));
+    }
+
+    let scalar_name = "__scalar_subquery".to_owned();
+    let scalar_index = needed.len();
+    fields.push(Field::nullable(
+        scalar_name.clone(),
+        schema.field_at(0).data_type.clone(),
+    ));
+    project_exprs.push((exprs[0].0.clone(), scalar_name.clone()));
+    let project_schema = Schema::new(fields).ok()?;
+    let projected = LogicalPlan::Project {
+        input: Box::new(clean_subplan),
+        exprs: project_exprs,
+        schema: project_schema,
+    };
+
+    let mut projected_pairs = Vec::with_capacity(corr_pairs.len());
+    for pair in &corr_pairs {
+        let projected_idx = needed.iter().position(|&idx| idx == pair.inner_index)?;
+        let mut projected_pair = pair.clone();
+        projected_pair.inner_index = projected_idx;
+        projected_pairs.push(projected_pair);
+    }
+    let projected_residuals = residual_predicates
+        .iter()
+        .map(|predicate| rebase_projected_exists_residual(predicate, outer_width, &needed))
+        .collect::<Option<Vec<_>>>()?;
+
+    Some(CorrelatedScalarProjectRight {
+        plan: projected,
+        corr_pairs: projected_pairs,
+        residual_predicates: projected_residuals,
+        scalar_index,
+        scalar_name,
+    })
 }
 
 fn build_correlated_scalar_aggregate_right(plan: LogicalPlan) -> Option<CorrelatedScalarRight> {

@@ -19,35 +19,65 @@ const PUBLIC_OID: i64 = 2200;
 const PG_CLASS_OID: i64 = 1259;
 const PG_CONSTRAINT_OID: i64 = 2606;
 const PG_TYPE_BOOL: i32 = 16;
+const PG_TYPE_BOOL_ARRAY: i32 = 1000;
 const PG_TYPE_INT2: i32 = 21;
+const PG_TYPE_INT2_ARRAY: i32 = 1005;
 const PG_TYPE_INT4: i32 = 23;
+const PG_TYPE_INT4_ARRAY: i32 = 1007;
 const PG_TYPE_INT8: i32 = 20;
+const PG_TYPE_INT8_ARRAY: i32 = 1016;
 const PG_TYPE_FLOAT4: i32 = 700;
+const PG_TYPE_FLOAT4_ARRAY: i32 = 1021;
 const PG_TYPE_FLOAT8: i32 = 701;
+const PG_TYPE_FLOAT8_ARRAY: i32 = 1022;
 const PG_TYPE_TEXT: i32 = 25;
+const PG_TYPE_TEXT_ARRAY: i32 = 1009;
 const PG_TYPE_OID: i32 = 26;
+const PG_TYPE_OID_ARRAY: i32 = 1028;
 const PG_TYPE_REGCLASS: i32 = 2205;
+const PG_TYPE_REGCLASS_ARRAY: i32 = 2210;
 const PG_TYPE_REGTYPE: i32 = 2206;
+const PG_TYPE_REGTYPE_ARRAY: i32 = 2211;
 const PG_TYPE_PG_LSN: i32 = 3220;
+const PG_TYPE_PG_LSN_ARRAY: i32 = 3221;
 const PG_TYPE_BPCHAR: i32 = 1042;
+const PG_TYPE_BPCHAR_ARRAY: i32 = 1014;
 const PG_TYPE_BIT: i32 = 1560;
+const PG_TYPE_BIT_ARRAY: i32 = 1561;
 const PG_TYPE_VARBIT: i32 = 1562;
+const PG_TYPE_VARBIT_ARRAY: i32 = 1563;
 const PG_TYPE_CIDR: i32 = 650;
+const PG_TYPE_CIDR_ARRAY: i32 = 651;
 const PG_TYPE_INET: i32 = 869;
+const PG_TYPE_INET_ARRAY: i32 = 1041;
 const PG_TYPE_MACADDR: i32 = 829;
+const PG_TYPE_MACADDR_ARRAY: i32 = 1040;
 const PG_TYPE_MACADDR8: i32 = 774;
+const PG_TYPE_MACADDR8_ARRAY: i32 = 775;
 const PG_TYPE_NUMERIC: i32 = 1700;
+const PG_TYPE_NUMERIC_ARRAY: i32 = 1231;
 const PG_TYPE_MONEY: i32 = 790;
+const PG_TYPE_MONEY_ARRAY: i32 = 791;
 const PG_TYPE_DATE: i32 = 1082;
+const PG_TYPE_DATE_ARRAY: i32 = 1182;
 const PG_TYPE_TIMESTAMP: i32 = 1114;
+const PG_TYPE_TIMESTAMP_ARRAY: i32 = 1115;
 const PG_TYPE_TIMESTAMPTZ: i32 = 1184;
+const PG_TYPE_TIMESTAMPTZ_ARRAY: i32 = 1185;
 const PG_TYPE_TIME: i32 = 1083;
+const PG_TYPE_TIME_ARRAY: i32 = 1183;
 const PG_TYPE_TIMETZ: i32 = 1266;
+const PG_TYPE_TIMETZ_ARRAY: i32 = 1270;
 const PG_TYPE_UUID: i32 = 2950;
+const PG_TYPE_UUID_ARRAY: i32 = 2951;
 const PG_TYPE_JSON: i32 = 114;
+const PG_TYPE_JSON_ARRAY: i32 = 199;
 const PG_TYPE_JSONB: i32 = 3802;
+const PG_TYPE_JSONB_ARRAY: i32 = 3807;
 const PG_TYPE_XML: i32 = 142;
+const PG_TYPE_XML_ARRAY: i32 = 143;
 const PG_TYPE_BYTEA: i32 = 17;
+const PG_TYPE_BYTEA_ARRAY: i32 = 1001;
 
 /// Return the schema for a virtual catalog relation or view.
 #[must_use]
@@ -58,9 +88,14 @@ pub(crate) fn virtual_catalog_schema(name: &str) -> Option<Schema> {
         "pg_catalog.pg_attribute" => Some(schema_pg_attribute()),
         "pg_catalog.pg_attrdef" => Some(schema_pg_attrdef()),
         "pg_catalog.pg_type" => Some(schema_pg_type()),
+        "pg_catalog.pg_am" => Some(schema_pg_am()),
+        "pg_catalog.pg_range" => Some(schema_pg_range()),
+        "pg_catalog.pg_collation" => Some(schema_pg_collation()),
         "pg_catalog.pg_enum" => Some(schema_pg_enum()),
         "pg_catalog.pg_index" => Some(schema_pg_index()),
+        "pg_catalog.pg_inherits" => Some(schema_pg_inherits()),
         "pg_catalog.pg_constraint" => Some(schema_pg_constraint()),
+        "pg_catalog.pg_policy" => Some(schema_pg_policy()),
         "pg_catalog.pg_sequence" => Some(schema_pg_sequence()),
         "pg_catalog.pg_depend" => Some(schema_pg_depend()),
         "pg_catalog.pg_description" => Some(schema_pg_description()),
@@ -71,7 +106,9 @@ pub(crate) fn virtual_catalog_schema(name: &str) -> Option<Schema> {
         "pg_catalog.pg_views" => Some(schema_pg_views()),
         "pg_catalog.pg_sequences" => Some(schema_pg_sequences()),
         "pg_catalog.pg_roles" => Some(schema_pg_roles()),
+        "pg_catalog.pg_auth_members" => Some(schema_pg_auth_members()),
         "pg_catalog.pg_user" => Some(schema_pg_user()),
+        "pg_catalog.pg_get_keywords" => Some(schema_pg_get_keywords()),
         "pg_catalog.pg_settings" => Some(schema_pg_settings()),
         "pg_catalog.pg_stat_statements" => Some(schema_pg_stat_statements()),
         "pg_catalog.pg_locks" => Some(schema_pg_locks()),
@@ -91,6 +128,7 @@ pub(crate) fn virtual_catalog_schema(name: &str) -> Option<Schema> {
         "pg_catalog.pg_stat_subscription" => Some(schema_pg_stat_subscription()),
         "pg_catalog.pg_publication" => Some(schema_pg_publication()),
         "pg_catalog.pg_subscription" => Some(schema_pg_subscription()),
+        "pg_catalog.pg_publication_rel" => Some(schema_pg_publication_rel()),
         "pg_catalog.pg_publication_tables" => Some(schema_pg_publication_tables()),
         "pg_catalog.pg_proc" => Some(schema_pg_proc()),
         "pg_catalog.pg_database" => Some(schema_pg_database()),
@@ -138,9 +176,14 @@ fn virtual_rows(name: &str, ctx: &LowerCtx<'_>) -> Option<(Schema, Vec<Vec<Value
         "pg_catalog.pg_attribute" => Some((schema_pg_attribute(), rows_pg_attribute(ctx))),
         "pg_catalog.pg_attrdef" => Some((schema_pg_attrdef(), rows_pg_attrdef(ctx))),
         "pg_catalog.pg_type" => Some((schema_pg_type(), rows_pg_type(ctx))),
+        "pg_catalog.pg_am" => Some((schema_pg_am(), rows_pg_am())),
+        "pg_catalog.pg_range" => Some((schema_pg_range(), Vec::new())),
+        "pg_catalog.pg_collation" => Some((schema_pg_collation(), Vec::new())),
         "pg_catalog.pg_enum" => Some((schema_pg_enum(), rows_pg_enum(ctx))),
         "pg_catalog.pg_index" => Some((schema_pg_index(), rows_pg_index(ctx))),
+        "pg_catalog.pg_inherits" => Some((schema_pg_inherits(), Vec::new())),
         "pg_catalog.pg_constraint" => Some((schema_pg_constraint(), rows_pg_constraint(ctx))),
+        "pg_catalog.pg_policy" => Some((schema_pg_policy(), Vec::new())),
         "pg_catalog.pg_sequence" => Some((schema_pg_sequence(), rows_pg_sequence(ctx))),
         "pg_catalog.pg_depend" => Some((schema_pg_depend(), rows_pg_depend(ctx))),
         "pg_catalog.pg_description" => Some((schema_pg_description(), rows_pg_description(ctx))),
@@ -153,7 +196,9 @@ fn virtual_rows(name: &str, ctx: &LowerCtx<'_>) -> Option<(Schema, Vec<Vec<Value
         "pg_catalog.pg_views" => Some((schema_pg_views(), Vec::new())),
         "pg_catalog.pg_sequences" => Some((schema_pg_sequences(), rows_pg_sequences(ctx))),
         "pg_catalog.pg_roles" => Some((schema_pg_roles(), rows_pg_roles(ctx))),
+        "pg_catalog.pg_auth_members" => Some((schema_pg_auth_members(), Vec::new())),
         "pg_catalog.pg_user" => Some((schema_pg_user(), rows_pg_user(ctx))),
+        "pg_catalog.pg_get_keywords" => Some((schema_pg_get_keywords(), rows_pg_get_keywords())),
         "pg_catalog.pg_settings" => Some((schema_pg_settings(), rows_pg_settings(ctx))),
         "pg_catalog.pg_stat_statements" => {
             Some((schema_pg_stat_statements(), rows_pg_stat_statements(ctx)))
@@ -207,6 +252,7 @@ fn virtual_rows(name: &str, ctx: &LowerCtx<'_>) -> Option<(Schema, Vec<Vec<Value
         )),
         "pg_catalog.pg_publication" => Some((schema_pg_publication(), rows_pg_publication(ctx))),
         "pg_catalog.pg_subscription" => Some((schema_pg_subscription(), rows_pg_subscription(ctx))),
+        "pg_catalog.pg_publication_rel" => Some((schema_pg_publication_rel(), Vec::new())),
         "pg_catalog.pg_publication_tables" => Some((
             schema_pg_publication_tables(),
             rows_pg_publication_tables(ctx),
@@ -262,9 +308,14 @@ fn normalized_name(name: &str) -> String {
         | "pg_attribute"
         | "pg_attrdef"
         | "pg_type"
+        | "pg_am"
+        | "pg_range"
+        | "pg_collation"
         | "pg_enum"
         | "pg_index"
+        | "pg_inherits"
         | "pg_constraint"
+        | "pg_policy"
         | "pg_sequence"
         | "pg_depend"
         | "pg_description"
@@ -275,7 +326,9 @@ fn normalized_name(name: &str) -> String {
         | "pg_views"
         | "pg_sequences"
         | "pg_roles"
+        | "pg_auth_members"
         | "pg_user"
+        | "pg_get_keywords"
         | "pg_settings"
         | "pg_stat_statements"
         | "pg_locks"
@@ -296,6 +349,7 @@ fn normalized_name(name: &str) -> String {
         | "pg_stat_subscription"
         | "pg_publication"
         | "pg_subscription"
+        | "pg_publication_rel"
         | "pg_publication_tables"
         | "pg_database" => {
             format!("pg_catalog.{folded}")
@@ -324,12 +378,25 @@ fn text() -> DataType {
     DataType::Text { max_len: None }
 }
 
+fn text_array() -> DataType {
+    DataType::Array(Box::new(text()))
+}
+
 fn v_text(v: impl Into<String>) -> Value {
     Value::Text(v.into())
 }
 
 fn v_i64(v: u32) -> Value {
     Value::Int64(i64::from(v))
+}
+
+fn v_oid(v: u32) -> Value {
+    Value::Oid(Oid::new(v))
+}
+
+fn v_oid_i32(v: i32) -> Value {
+    let raw = u32::try_from(v).expect("PostgreSQL built-in OID constants fit u32");
+    v_oid(raw)
 }
 
 fn namespace_oid(schema_name: &str) -> i64 {
@@ -439,6 +506,7 @@ fn schema_pg_namespace() -> Schema {
         Field::required("oid", DataType::Int64),
         Field::required("nspname", text()),
         Field::required("nspowner", DataType::Int64),
+        Field::nullable("nspacl", text_array()),
     ])
 }
 
@@ -448,13 +516,20 @@ fn rows_pg_namespace() -> Vec<Vec<Value>> {
             Value::Int64(PG_CATALOG_OID),
             v_text("pg_catalog"),
             Value::Int64(10),
+            Value::Null,
         ],
         vec![
             Value::Int64(INFORMATION_SCHEMA_OID),
             v_text("information_schema"),
             Value::Int64(10),
+            Value::Null,
         ],
-        vec![Value::Int64(PUBLIC_OID), v_text("public"), Value::Int64(10)],
+        vec![
+            Value::Int64(PUBLIC_OID),
+            v_text("public"),
+            Value::Int64(10),
+            Value::Null,
+        ],
     ]
 }
 
@@ -468,40 +543,52 @@ fn schema_pg_class() -> Schema {
         Field::required("reltuples", DataType::Float64),
         Field::required("relfilenode", DataType::Int32),
         Field::required("relhasindex", DataType::Bool),
+        Field::required("relchecks", DataType::Int32),
+        Field::required("relhasrules", DataType::Bool),
+        Field::required("relhastriggers", DataType::Bool),
+        Field::required("relrowsecurity", DataType::Bool),
+        Field::required("relforcerowsecurity", DataType::Bool),
+        Field::required("relispartition", DataType::Bool),
+        Field::required("reltablespace", DataType::Int64),
+        Field::required("reloftype", DataType::Int64),
+        Field::required("relpersistence", DataType::Text { max_len: Some(1) }),
+        Field::required("relreplident", DataType::Text { max_len: Some(1) }),
+        Field::required("reltoastrelid", DataType::Int64),
+        Field::required("relam", DataType::Int64),
+        Field::nullable("relpartbound", text()),
+        Field::required("relowner", DataType::Int64),
+        Field::nullable("relacl", text_array()),
+        Field::nullable("reloptions", text_array()),
     ])
 }
 
 fn rows_pg_class(ctx: &LowerCtx<'_>) -> Vec<Vec<Value>> {
     let mut rows = Vec::new();
     for entry in table_entries(ctx) {
-        rows.push(vec![
-            v_i64(entry.oid.raw()),
-            v_text(entry.name.clone()),
-            Value::Int64(namespace_oid(&entry.schema_name)),
-            v_text("r"),
-            Value::Int32(i32::try_from(entry.n_blocks).unwrap_or(i32::MAX)),
-            Value::Float64(0.0),
-            Value::Int32(i32::try_from(entry.root_block.raw()).unwrap_or(i32::MAX)),
-            Value::Bool(
-                ctx.catalog_snapshot
-                    .indexes_by_table
-                    .contains_key(&entry.oid),
-            ),
-        ]);
+        rows.push(pg_class_row(
+            entry.oid.raw(),
+            entry.name.clone(),
+            namespace_oid(&entry.schema_name),
+            "r",
+            i32::try_from(entry.n_blocks).unwrap_or(i32::MAX),
+            i32::try_from(entry.root_block.raw()).unwrap_or(i32::MAX),
+            ctx.catalog_snapshot
+                .indexes_by_table
+                .contains_key(&entry.oid),
+        ));
     }
     let mut indexes: Vec<_> = ctx.catalog_snapshot.indexes.values().collect();
     indexes.sort_by(|a, b| a.name.cmp(&b.name));
     for index in indexes {
-        rows.push(vec![
-            v_i64(index.oid.raw()),
-            v_text(index.name.clone()),
-            Value::Int64(PUBLIC_OID),
-            v_text("i"),
-            Value::Int32(0),
-            Value::Float64(0.0),
-            Value::Int32(i32::try_from(index.root_block.raw()).unwrap_or(i32::MAX)),
-            Value::Bool(false),
-        ]);
+        rows.push(pg_class_row(
+            index.oid.raw(),
+            index.name.clone(),
+            PUBLIC_OID,
+            "i",
+            0,
+            i32::try_from(index.root_block.raw()).unwrap_or(i32::MAX),
+            false,
+        ));
     }
     let mut composites = ctx
         .catalog_snapshot
@@ -510,29 +597,71 @@ fn rows_pg_class(ctx: &LowerCtx<'_>) -> Vec<Vec<Value>> {
         .collect::<Vec<_>>();
     composites.sort_by_key(|entry| entry.oid.raw());
     for entry in composites {
-        rows.push(vec![
-            v_i64(entry.oid.raw()),
-            v_text(entry.name.clone()),
-            Value::Int64(namespace_oid(&entry.schema_name)),
-            v_text("c"),
-            Value::Int32(0),
-            Value::Float64(0.0),
-            Value::Int32(0),
-            Value::Bool(false),
-        ]);
+        rows.push(pg_class_row(
+            entry.oid.raw(),
+            entry.name.clone(),
+            namespace_oid(&entry.schema_name),
+            "c",
+            0,
+            0,
+            false,
+        ));
     }
     rows
+}
+
+fn pg_class_row(
+    oid: u32,
+    relname: String,
+    relnamespace: i64,
+    relkind: &str,
+    relpages: i32,
+    relfilenode: i32,
+    relhasindex: bool,
+) -> Vec<Value> {
+    vec![
+        v_i64(oid),
+        v_text(relname),
+        Value::Int64(relnamespace),
+        v_text(relkind),
+        Value::Int32(relpages),
+        Value::Float64(0.0),
+        Value::Int32(relfilenode),
+        Value::Bool(relhasindex),
+        Value::Int32(0),
+        Value::Bool(false),
+        Value::Bool(false),
+        Value::Bool(false),
+        Value::Bool(false),
+        Value::Bool(false),
+        Value::Int64(0),
+        Value::Int64(0),
+        v_text("p"),
+        v_text("d"),
+        Value::Int64(0),
+        Value::Int64(2),
+        Value::Null,
+        Value::Int64(10),
+        Value::Null,
+        Value::Null,
+    ]
 }
 
 fn schema_pg_attribute() -> Schema {
     schema([
         Field::required("attrelid", DataType::Int64),
         Field::required("attname", text()),
-        Field::required("atttypid", DataType::Int32),
+        Field::required("atttypid", DataType::Oid),
         Field::required("attnum", DataType::Int16),
         Field::required("attnotnull", DataType::Bool),
         Field::required("atthasdef", DataType::Bool),
         Field::required("attisdropped", DataType::Bool),
+        Field::required("atttypmod", DataType::Int32),
+        Field::required("attcollation", DataType::Oid),
+        Field::required("attidentity", DataType::Text { max_len: Some(1) }),
+        Field::required("attgenerated", DataType::Text { max_len: Some(1) }),
+        Field::nullable("attacl", text_array()),
+        Field::nullable("attoptions", text_array()),
     ])
 }
 
@@ -543,11 +672,17 @@ fn rows_pg_attribute(ctx: &LowerCtx<'_>) -> Vec<Vec<Value>> {
             rows.push(vec![
                 v_i64(entry.oid.raw()),
                 v_text(field.name.clone()),
-                Value::Int32(type_oid(&field.data_type)),
+                v_oid_i32(type_oid(&field.data_type)),
                 Value::Int16(i16::try_from(idx + 1).unwrap_or(i16::MAX)),
                 Value::Bool(!field.nullable),
                 Value::Bool(column_default_expr(ctx, entry.oid, idx).is_some()),
                 Value::Bool(false),
+                Value::Int32(-1),
+                v_oid(0),
+                v_text(""),
+                v_text(""),
+                Value::Null,
+                Value::Null,
             ]);
         }
     }
@@ -562,11 +697,17 @@ fn rows_pg_attribute(ctx: &LowerCtx<'_>) -> Vec<Vec<Value>> {
             rows.push(vec![
                 v_i64(entry.oid.raw()),
                 v_text(field.name.clone()),
-                Value::Int32(type_oid(&field.data_type)),
+                v_oid_i32(type_oid(&field.data_type)),
                 Value::Int16(i16::try_from(idx + 1).unwrap_or(i16::MAX)),
                 Value::Bool(!field.nullable),
                 Value::Bool(false),
                 Value::Bool(false),
+                Value::Int32(-1),
+                v_oid(0),
+                v_text(""),
+                v_text(""),
+                Value::Null,
+                Value::Null,
             ]);
         }
     }
@@ -609,63 +750,181 @@ fn attrdef_oid(relid: Oid, attnum: i16) -> i64 {
 
 fn schema_pg_type() -> Schema {
     schema([
-        Field::required("oid", DataType::Int64),
+        Field::required("oid", DataType::Oid),
         Field::required("typname", text()),
         Field::required("typnamespace", DataType::Int64),
+        Field::required("typowner", DataType::Int64),
         Field::required("typtype", text()),
         Field::required("typcategory", text()),
         Field::required("typlen", DataType::Int16),
         Field::required("typelem", DataType::Int32),
+        Field::required("typarray", DataType::Oid),
+        Field::required("typdelim", text()),
+        Field::required("typinput", text()),
+        Field::required("typbasetype", DataType::Oid),
+        Field::required("typcollation", DataType::Oid),
     ])
 }
 
 fn rows_pg_type(ctx: &LowerCtx<'_>) -> Vec<Vec<Value>> {
-    const BUILTINS: &[(i32, &str, &str, &str, i16, i32)] = &[
-        (PG_TYPE_BOOL, "bool", "b", "B", 1, 0),
-        (PG_TYPE_INT2, "int2", "b", "N", 2, 0),
-        (PG_TYPE_INT4, "int4", "b", "N", 4, 0),
-        (PG_TYPE_INT8, "int8", "b", "N", 8, 0),
-        (PG_TYPE_FLOAT4, "float4", "b", "N", 4, 0),
-        (PG_TYPE_FLOAT8, "float8", "b", "N", 8, 0),
-        (PG_TYPE_TEXT, "text", "b", "S", -1, 0),
-        (PG_TYPE_BPCHAR, "bpchar", "b", "S", -1, 0),
-        (PG_TYPE_NUMERIC, "numeric", "b", "N", -1, 0),
-        (PG_TYPE_MONEY, "money", "b", "N", 8, 0),
-        (PG_TYPE_OID, "oid", "b", "N", 4, 0),
-        (PG_TYPE_REGCLASS, "regclass", "b", "N", 4, 0),
-        (PG_TYPE_REGTYPE, "regtype", "b", "N", 4, 0),
-        (PG_TYPE_PG_LSN, "pg_lsn", "b", "U", 8, 0),
-        (PG_TYPE_BYTEA, "bytea", "b", "U", -1, 0),
-        (PG_TYPE_JSON, "json", "b", "U", -1, 0),
-        (PG_TYPE_JSONB, "jsonb", "b", "U", -1, 0),
-        (PG_TYPE_XML, "xml", "b", "U", -1, 0),
-        (PG_TYPE_DATE, "date", "b", "D", 4, 0),
-        (PG_TYPE_TIME, "time", "b", "D", 8, 0),
-        (PG_TYPE_TIMETZ, "timetz", "b", "D", 8, 0),
-        (PG_TYPE_TIMESTAMP, "timestamp", "b", "D", 8, 0),
-        (PG_TYPE_TIMESTAMPTZ, "timestamptz", "b", "D", 8, 0),
-        (PG_TYPE_UUID, "uuid", "b", "U", 16, 0),
-        (PG_TYPE_BIT, "bit", "b", "V", -1, 0),
-        (PG_TYPE_VARBIT, "varbit", "b", "V", -1, 0),
-        (PG_TYPE_INET, "inet", "b", "I", -1, 0),
-        (PG_TYPE_CIDR, "cidr", "b", "I", -1, 0),
-        (PG_TYPE_MACADDR, "macaddr", "b", "U", -1, 0),
-        (PG_TYPE_MACADDR8, "macaddr8", "b", "U", -1, 0),
+    const BUILTINS: &[(i32, &str, &str, &str, i16, i32, i32)] = &[
+        (PG_TYPE_BOOL, "bool", "b", "B", 1, 0, PG_TYPE_BOOL_ARRAY),
+        (PG_TYPE_INT2, "int2", "b", "N", 2, 0, PG_TYPE_INT2_ARRAY),
+        (PG_TYPE_INT4, "int4", "b", "N", 4, 0, PG_TYPE_INT4_ARRAY),
+        (PG_TYPE_INT8, "int8", "b", "N", 8, 0, PG_TYPE_INT8_ARRAY),
+        (
+            PG_TYPE_FLOAT4,
+            "float4",
+            "b",
+            "N",
+            4,
+            0,
+            PG_TYPE_FLOAT4_ARRAY,
+        ),
+        (
+            PG_TYPE_FLOAT8,
+            "float8",
+            "b",
+            "N",
+            8,
+            0,
+            PG_TYPE_FLOAT8_ARRAY,
+        ),
+        (PG_TYPE_TEXT, "text", "b", "S", -1, 0, PG_TYPE_TEXT_ARRAY),
+        (
+            PG_TYPE_BPCHAR,
+            "bpchar",
+            "b",
+            "S",
+            -1,
+            0,
+            PG_TYPE_BPCHAR_ARRAY,
+        ),
+        (
+            PG_TYPE_NUMERIC,
+            "numeric",
+            "b",
+            "N",
+            -1,
+            0,
+            PG_TYPE_NUMERIC_ARRAY,
+        ),
+        (PG_TYPE_MONEY, "money", "b", "N", 8, 0, PG_TYPE_MONEY_ARRAY),
+        (PG_TYPE_OID, "oid", "b", "N", 4, 0, PG_TYPE_OID_ARRAY),
+        (
+            PG_TYPE_REGCLASS,
+            "regclass",
+            "b",
+            "N",
+            4,
+            0,
+            PG_TYPE_REGCLASS_ARRAY,
+        ),
+        (
+            PG_TYPE_REGTYPE,
+            "regtype",
+            "b",
+            "N",
+            4,
+            0,
+            PG_TYPE_REGTYPE_ARRAY,
+        ),
+        (
+            PG_TYPE_PG_LSN,
+            "pg_lsn",
+            "b",
+            "U",
+            8,
+            0,
+            PG_TYPE_PG_LSN_ARRAY,
+        ),
+        (PG_TYPE_BYTEA, "bytea", "b", "U", -1, 0, PG_TYPE_BYTEA_ARRAY),
+        (PG_TYPE_JSON, "json", "b", "U", -1, 0, PG_TYPE_JSON_ARRAY),
+        (PG_TYPE_JSONB, "jsonb", "b", "U", -1, 0, PG_TYPE_JSONB_ARRAY),
+        (PG_TYPE_XML, "xml", "b", "U", -1, 0, PG_TYPE_XML_ARRAY),
+        (PG_TYPE_DATE, "date", "b", "D", 4, 0, PG_TYPE_DATE_ARRAY),
+        (PG_TYPE_TIME, "time", "b", "D", 8, 0, PG_TYPE_TIME_ARRAY),
+        (
+            PG_TYPE_TIMETZ,
+            "timetz",
+            "b",
+            "D",
+            8,
+            0,
+            PG_TYPE_TIMETZ_ARRAY,
+        ),
+        (
+            PG_TYPE_TIMESTAMP,
+            "timestamp",
+            "b",
+            "D",
+            8,
+            0,
+            PG_TYPE_TIMESTAMP_ARRAY,
+        ),
+        (
+            PG_TYPE_TIMESTAMPTZ,
+            "timestamptz",
+            "b",
+            "D",
+            8,
+            0,
+            PG_TYPE_TIMESTAMPTZ_ARRAY,
+        ),
+        (PG_TYPE_UUID, "uuid", "b", "U", 16, 0, PG_TYPE_UUID_ARRAY),
+        (PG_TYPE_BIT, "bit", "b", "V", -1, 0, PG_TYPE_BIT_ARRAY),
+        (
+            PG_TYPE_VARBIT,
+            "varbit",
+            "b",
+            "V",
+            -1,
+            0,
+            PG_TYPE_VARBIT_ARRAY,
+        ),
+        (PG_TYPE_INET, "inet", "b", "I", -1, 0, PG_TYPE_INET_ARRAY),
+        (PG_TYPE_CIDR, "cidr", "b", "I", -1, 0, PG_TYPE_CIDR_ARRAY),
+        (
+            PG_TYPE_MACADDR,
+            "macaddr",
+            "b",
+            "U",
+            -1,
+            0,
+            PG_TYPE_MACADDR_ARRAY,
+        ),
+        (
+            PG_TYPE_MACADDR8,
+            "macaddr8",
+            "b",
+            "U",
+            -1,
+            0,
+            PG_TYPE_MACADDR8_ARRAY,
+        ),
     ];
 
     let mut rows = BUILTINS
         .iter()
-        .map(|(oid, name, typtype, typcategory, typlen, typelem)| {
-            vec![
-                Value::Int64(i64::from(*oid)),
-                v_text(*name),
-                Value::Int64(PG_CATALOG_OID),
-                v_text(*typtype),
-                v_text(*typcategory),
-                Value::Int16(*typlen),
-                Value::Int32(*typelem),
-            ]
-        })
+        .map(
+            |(oid, name, typtype, typcategory, typlen, typelem, typarray)| {
+                vec![
+                    v_oid_i32(*oid),
+                    v_text(*name),
+                    Value::Int64(PG_CATALOG_OID),
+                    Value::Int64(10),
+                    v_text(*typtype),
+                    v_text(*typcategory),
+                    Value::Int16(*typlen),
+                    Value::Int32(*typelem),
+                    v_oid_i32(*typarray),
+                    v_text(","),
+                    v_text(format!("{name}in")),
+                    v_oid(0),
+                    v_oid(0),
+                ]
+            },
+        )
         .collect::<Vec<_>>();
     let mut enums = ctx
         .catalog_snapshot
@@ -675,13 +934,19 @@ fn rows_pg_type(ctx: &LowerCtx<'_>) -> Vec<Vec<Value>> {
     enums.sort_by_key(|entry| entry.oid.raw());
     for entry in enums {
         rows.push(vec![
-            v_i64(entry.oid.raw()),
+            v_oid(entry.oid.raw()),
             v_text(entry.name.clone()),
             Value::Int64(namespace_oid(&entry.schema_name)),
+            Value::Int64(10),
             v_text("e"),
             v_text("E"),
             Value::Int16(-1),
             Value::Int32(0),
+            v_oid(0),
+            v_text(","),
+            v_text("enum_in"),
+            v_oid(0),
+            v_oid(0),
         ]);
     }
     let mut composites = ctx
@@ -692,13 +957,19 @@ fn rows_pg_type(ctx: &LowerCtx<'_>) -> Vec<Vec<Value>> {
     composites.sort_by_key(|entry| entry.oid.raw());
     for entry in composites {
         rows.push(vec![
-            v_i64(entry.oid.raw()),
+            v_oid(entry.oid.raw()),
             v_text(entry.name.clone()),
             Value::Int64(namespace_oid(&entry.schema_name)),
+            Value::Int64(10),
             v_text("c"),
             v_text("C"),
             Value::Int16(-1),
             Value::Int32(0),
+            v_oid(0),
+            v_text(","),
+            v_text("record_in"),
+            v_oid(0),
+            v_oid(0),
         ]);
     }
     let mut domains = ctx
@@ -709,9 +980,10 @@ fn rows_pg_type(ctx: &LowerCtx<'_>) -> Vec<Vec<Value>> {
     domains.sort_by_key(|entry| entry.oid.raw());
     for entry in domains {
         rows.push(vec![
-            v_i64(entry.oid.raw()),
+            v_oid(entry.oid.raw()),
             v_text(entry.name.clone()),
             Value::Int64(namespace_oid(&entry.schema_name)),
+            Value::Int64(10),
             v_text("d"),
             v_text(type_category_text(&entry.base_type)),
             Value::Int16(
@@ -722,9 +994,78 @@ fn rows_pg_type(ctx: &LowerCtx<'_>) -> Vec<Vec<Value>> {
                     .unwrap_or(-1),
             ),
             Value::Int32(0),
+            v_oid(0),
+            v_text(","),
+            v_text("domain_in"),
+            v_oid_i32(type_oid(&entry.base_type)),
+            v_oid(0),
         ]);
     }
     rows
+}
+
+fn schema_pg_am() -> Schema {
+    schema([
+        Field::required("oid", DataType::Int64),
+        Field::required("amname", text()),
+        Field::required("amhandler", DataType::Int64),
+        Field::required("amtype", DataType::Text { max_len: Some(1) }),
+    ])
+}
+
+fn rows_pg_am() -> Vec<Vec<Value>> {
+    vec![
+        vec![
+            Value::Int64(2),
+            v_text("heap"),
+            Value::Int64(0),
+            v_text("t"),
+        ],
+        vec![
+            Value::Int64(403),
+            v_text("btree"),
+            Value::Int64(0),
+            v_text("i"),
+        ],
+        vec![
+            Value::Int64(405),
+            v_text("hash"),
+            Value::Int64(0),
+            v_text("i"),
+        ],
+        vec![
+            Value::Int64(783),
+            v_text("gist"),
+            Value::Int64(0),
+            v_text("i"),
+        ],
+        vec![
+            Value::Int64(2742),
+            v_text("gin"),
+            Value::Int64(0),
+            v_text("i"),
+        ],
+        vec![
+            Value::Int64(3580),
+            v_text("brin"),
+            Value::Int64(0),
+            v_text("i"),
+        ],
+    ]
+}
+
+fn schema_pg_range() -> Schema {
+    schema([
+        Field::required("rngtypid", DataType::Oid),
+        Field::required("rngsubtype", DataType::Oid),
+    ])
+}
+
+fn schema_pg_collation() -> Schema {
+    schema([
+        Field::required("oid", DataType::Oid),
+        Field::required("collname", text()),
+    ])
 }
 
 fn type_category_text(ty: &DataType) -> &'static str {
@@ -826,7 +1167,10 @@ fn schema_pg_index() -> Schema {
         Field::required("indnatts", DataType::Int16),
         Field::required("indisunique", DataType::Bool),
         Field::required("indisprimary", DataType::Bool),
+        Field::required("indisclustered", DataType::Bool),
         Field::required("indisvalid", DataType::Bool),
+        Field::required("indisreplident", DataType::Bool),
+        Field::required("indkey", DataType::Array(Box::new(DataType::Int16))),
     ])
 }
 
@@ -842,10 +1186,32 @@ fn rows_pg_index(ctx: &LowerCtx<'_>) -> Vec<Vec<Value>> {
                 Value::Int16(i16::try_from(idx.columns.len()).unwrap_or(i16::MAX)),
                 Value::Bool(idx.is_unique),
                 Value::Bool(idx.name.ends_with("_pkey")),
+                Value::Bool(false),
                 Value::Bool(true),
+                Value::Bool(false),
+                Value::Array {
+                    element_type: DataType::Int16,
+                    elements: idx
+                        .columns
+                        .iter()
+                        .map(|col| {
+                            let attnum = i16::try_from(usize::from(*col) + 1).unwrap_or(i16::MAX);
+                            Value::Int16(attnum)
+                        })
+                        .collect(),
+                },
             ]
         })
         .collect()
+}
+
+fn schema_pg_inherits() -> Schema {
+    schema([
+        Field::required("inhrelid", DataType::Int64),
+        Field::required("inhparent", DataType::Int64),
+        Field::required("inhseqno", DataType::Int32),
+        Field::required("inhdetachpending", DataType::Bool),
+    ])
 }
 
 #[derive(Clone, Debug)]
@@ -854,6 +1220,7 @@ struct VirtualConstraint {
     name: String,
     kind: &'static str,
     table_oid: Oid,
+    index_oid: Option<Oid>,
     table_schema: String,
     table_name: String,
     columns: Vec<usize>,
@@ -886,6 +1253,7 @@ fn virtual_constraints(ctx: &LowerCtx<'_>) -> Vec<VirtualConstraint> {
                 "u"
             },
             table_oid: table.oid,
+            index_oid: Some(index.oid),
             table_schema: table.schema_name.clone(),
             table_name: table.name.clone(),
             columns: index.columns.iter().map(|c| usize::from(*c)).collect(),
@@ -917,6 +1285,7 @@ fn virtual_constraints(ctx: &LowerCtx<'_>) -> Vec<VirtualConstraint> {
                 name: check.name.clone(),
                 kind: "c",
                 table_oid,
+                index_oid: None,
                 table_schema: table.schema_name.clone(),
                 table_name: table.name.clone(),
                 columns: Vec::new(),
@@ -937,6 +1306,7 @@ fn virtual_constraints(ctx: &LowerCtx<'_>) -> Vec<VirtualConstraint> {
                 name: fk.name.clone(),
                 kind: "f",
                 table_oid,
+                index_oid: None,
                 table_schema: table.schema_name.clone(),
                 table_name: table.name.clone(),
                 columns: fk.columns.clone(),
@@ -985,6 +1355,7 @@ fn schema_pg_constraint() -> Schema {
         Field::required("connamespace", DataType::Int64),
         Field::required("contype", DataType::Text { max_len: Some(1) }),
         Field::required("conrelid", DataType::Int64),
+        Field::required("conindid", DataType::Int64),
         Field::required("confrelid", DataType::Int64),
         Field::nullable("conkey", text()),
         Field::nullable("confkey", text()),
@@ -1004,6 +1375,7 @@ fn rows_pg_constraint(ctx: &LowerCtx<'_>) -> Vec<Vec<Value>> {
                 Value::Int64(namespace_oid(&c.table_schema)),
                 v_text(c.kind),
                 v_i64(c.table_oid.raw()),
+                c.index_oid.map_or(Value::Int64(0), |oid| v_i64(oid.raw())),
                 c.foreign_table_oid
                     .map_or(Value::Int64(0), |oid| v_i64(oid.raw())),
                 attnums_text(&c.columns),
@@ -1014,6 +1386,18 @@ fn rows_pg_constraint(ctx: &LowerCtx<'_>) -> Vec<Vec<Value>> {
             ]
         })
         .collect()
+}
+
+fn schema_pg_policy() -> Schema {
+    schema([
+        Field::required("polname", text()),
+        Field::required("polrelid", DataType::Int64),
+        Field::required("polcmd", DataType::Text { max_len: Some(1) }),
+        Field::required("polpermissive", DataType::Bool),
+        Field::required("polroles", DataType::Array(Box::new(DataType::Int64))),
+        Field::nullable("polqual", text()),
+        Field::nullable("polwithcheck", text()),
+    ])
 }
 
 fn schema_pg_sequence() -> Schema {
@@ -1160,8 +1544,13 @@ fn schema_pg_statistic_ext() -> Schema {
         Field::required("oid", DataType::Int64),
         Field::required("stxname", text()),
         Field::required("stxrelid", DataType::Int64),
+        Field::required("stxnamespace", DataType::Int64),
         Field::required("stxkeys", text()),
-        Field::required("stxkind", text()),
+        Field::required(
+            "stxkind",
+            DataType::Array(Box::new(DataType::Text { max_len: None })),
+        ),
+        Field::required("stxstattarget", DataType::Int32),
     ])
 }
 
@@ -1186,8 +1575,16 @@ fn rows_pg_statistic_ext(ctx: &LowerCtx<'_>) -> Vec<Vec<Value>> {
                 v_i64(row.oid.raw()),
                 v_text(row.stxname),
                 v_i64(row.stxrelid.raw()),
+                Value::Int64(namespace_oid("public")),
                 v_text(stxkeys),
-                v_text(stxkind),
+                Value::Array {
+                    element_type: DataType::Text { max_len: None },
+                    elements: stxkind
+                        .chars()
+                        .map(|kind| v_text(kind.to_string()))
+                        .collect(),
+                },
+                Value::Int32(-1),
             ]
         })
         .collect()
@@ -1355,6 +1752,15 @@ fn rows_pg_roles(ctx: &LowerCtx<'_>) -> Vec<Vec<Value>> {
         .collect()
 }
 
+fn schema_pg_auth_members() -> Schema {
+    schema([
+        Field::required("roleid", DataType::Int64),
+        Field::required("member", DataType::Int64),
+        Field::required("grantor", DataType::Int64),
+        Field::required("admin_option", DataType::Bool),
+    ])
+}
+
 fn schema_pg_user() -> Schema {
     schema([
         Field::required("usename", text()),
@@ -1390,6 +1796,26 @@ fn rows_pg_user(ctx: &LowerCtx<'_>) -> Vec<Vec<Value>> {
         .collect()
 }
 
+fn schema_pg_get_keywords() -> Schema {
+    schema([
+        Field::required("word", text()),
+        Field::required("catcode", DataType::Text { max_len: Some(1) }),
+        Field::required("barelabel", DataType::Bool),
+        Field::required("catdesc", text()),
+        Field::required("baredesc", text()),
+    ])
+}
+
+fn rows_pg_get_keywords() -> Vec<Vec<Value>> {
+    vec![vec![
+        v_text("abort"),
+        v_text("U"),
+        Value::Bool(true),
+        v_text("unreserved"),
+        v_text("can be bare label"),
+    ]]
+}
+
 fn masked_password_value(has_password: bool) -> Value {
     if has_password {
         v_text("********")
@@ -1415,10 +1841,10 @@ fn rows_pg_settings(ctx: &LowerCtx<'_>) -> Vec<Vec<Value>> {
     vec![
         vec![
             v_text("server_version"),
-            v_text(env!("CARGO_PKG_VERSION")),
+            v_text(crate::POSTGRES_COMPAT_SERVER_VERSION),
             Value::Null,
             v_text("Preset Options"),
-            v_text("UltraSQL server version."),
+            v_text("PostgreSQL-compatible wire version reported to drivers."),
             v_text("string"),
             v_text("internal"),
         ],
@@ -2223,6 +2649,13 @@ fn subscription_oid(idx: usize) -> i64 {
     91_000 + i64::try_from(idx).unwrap_or(i64::MAX)
 }
 
+fn schema_pg_publication_rel() -> Schema {
+    schema([
+        Field::required("prpubid", DataType::Int64),
+        Field::required("prrelid", DataType::Int64),
+    ])
+}
+
 fn schema_pg_publication_tables() -> Schema {
     schema([
         Field::required("pubname", text()),
@@ -2255,6 +2688,7 @@ fn rows_pg_publication_tables(ctx: &LowerCtx<'_>) -> Vec<Vec<Value>> {
 
 fn schema_pg_proc() -> Schema {
     schema([
+        Field::required("oid", DataType::Int64),
         Field::required("proname", text()),
         Field::required("pronamespace", DataType::Int64),
         Field::required("prokind", DataType::Text { max_len: Some(1) }),
@@ -2265,11 +2699,27 @@ fn schema_pg_database() -> Schema {
     schema([
         Field::required("datname", text()),
         Field::required("datdba", DataType::Int64),
+        Field::required("encoding", DataType::Int32),
+        Field::required("datallowconn", DataType::Bool),
+        Field::required("datcollate", text()),
+        Field::required("datctype", text()),
+        Field::nullable(
+            "datacl",
+            DataType::Array(Box::new(DataType::Text { max_len: None })),
+        ),
     ])
 }
 
 fn rows_pg_database() -> Vec<Vec<Value>> {
-    vec![vec![v_text("ultrasql"), Value::Int64(10)]]
+    vec![vec![
+        v_text("ultrasql"),
+        Value::Int64(10),
+        Value::Int32(6),
+        Value::Bool(true),
+        v_text("C"),
+        v_text("C"),
+        Value::Null,
+    ]]
 }
 
 fn schema_information_schema_tables() -> Schema {
