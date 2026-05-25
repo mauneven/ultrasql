@@ -343,6 +343,131 @@ fn postgres_compat_parser_type_baseline_is_imported_and_provenanced() {
 }
 
 #[test]
+fn postgres_compat_index_constraint_operator_baseline_is_imported_and_provenanced() {
+    let subset = repo_root().join("tests/slt/postgres_compat/regression_subset");
+    let manifest =
+        fs::read_to_string(subset.join("IMPORT_MANIFEST.txt")).expect("read PostgreSQL manifest");
+    let readme = fs::read_to_string(subset.join("README.md")).expect("read PostgreSQL README");
+    let shard = subset.join("index_constraint_operator_baseline.slt");
+    let text = fs::read_to_string(&shard).expect("read index/constraint/operator shard");
+
+    for source in [
+        "derived_from=src/test/regress/sql/create_index.sql",
+        "derived_from=src/test/regress/sql/constraints.sql",
+        "derived_from=src/test/regress/sql/create_operator.sql",
+        "derived_from=src/test/regress/sql/opr_sanity.sql",
+    ] {
+        assert!(manifest.contains(source), "manifest:\n{manifest}");
+    }
+    assert!(
+        manifest.contains("file=index_constraint_operator_baseline.slt"),
+        "manifest:\n{manifest}"
+    );
+    assert!(
+        readme.contains("index_constraint_operator_baseline.slt"),
+        "README:\n{readme}"
+    );
+    assert!(
+        text.contains("PostgreSQL regression-derived index/constraint/operator baseline"),
+        "{} must document reviewed scope",
+        shard.display()
+    );
+    for surface in [
+        "CREATE INDEX",
+        "CREATE UNIQUE INDEX",
+        "PRIMARY KEY",
+        "CHECK",
+        "REFERENCES",
+        "<>",
+        "!=",
+        "<=",
+        ">=",
+    ] {
+        assert!(
+            text.contains(surface),
+            "{} missing {surface}",
+            shard.display()
+        );
+    }
+    assert!(
+        text.contains("# ultrasql:skip full PostgreSQL opr_sanity catalog/operator invariant"),
+        "{} must keep full catalog/operator sanity debt explicit",
+        shard.display()
+    );
+    let case_count = count_slt_cases(&text);
+    assert!(
+        (14..=40).contains(&case_count),
+        "{} must stay as a small reviewed shard, got {case_count} cases",
+        shard.display()
+    );
+}
+
+#[test]
+fn postgres_compat_type_specific_baseline_is_imported_and_provenanced() {
+    let subset = repo_root().join("tests/slt/postgres_compat/regression_subset");
+    let manifest =
+        fs::read_to_string(subset.join("IMPORT_MANIFEST.txt")).expect("read PostgreSQL manifest");
+    let readme = fs::read_to_string(subset.join("README.md")).expect("read PostgreSQL README");
+    let shard = subset.join("type_specific_baseline.slt");
+    let text = fs::read_to_string(&shard).expect("read type-specific shard");
+
+    for source in [
+        "derived_from=src/test/regress/sql/numeric.sql",
+        "derived_from=src/test/regress/sql/text.sql",
+        "derived_from=src/test/regress/sql/date.sql",
+        "derived_from=src/test/regress/sql/time.sql",
+        "derived_from=src/test/regress/sql/timestamp.sql",
+        "derived_from=src/test/regress/sql/timetz.sql",
+        "derived_from=src/test/regress/sql/json.sql",
+        "derived_from=src/test/regress/sql/jsonb.sql",
+        "derived_from=src/test/regress/sql/arrays.sql",
+    ] {
+        assert!(manifest.contains(source), "manifest:\n{manifest}");
+    }
+    assert!(
+        manifest.contains("file=type_specific_baseline.slt"),
+        "manifest:\n{manifest}"
+    );
+    assert!(
+        readme.contains("type_specific_baseline.slt"),
+        "README:\n{readme}"
+    );
+    assert!(
+        text.contains("PostgreSQL regression-derived type-specific baseline"),
+        "{} must document reviewed scope",
+        shard.display()
+    );
+    for surface in [
+        "NUMERIC(8,2)",
+        "TEXT",
+        "DATE",
+        "TIMESTAMP",
+        "TIME",
+        "JSONB",
+        "INT[]",
+        "array_length",
+        "jsonb_path_exists",
+    ] {
+        assert!(
+            text.contains(surface),
+            "{} missing {surface}",
+            shard.display()
+        );
+    }
+    assert!(
+        text.contains("# ultrasql:skip full PostgreSQL type-specific regression breadth"),
+        "{} must keep full type regression breadth debt explicit",
+        shard.display()
+    );
+    let case_count = count_slt_cases(&text);
+    assert!(
+        (16..=42).contains(&case_count),
+        "{} must stay as a small reviewed shard, got {case_count} cases",
+        shard.display()
+    );
+}
+
+#[test]
 fn skip_directive_requires_explicit_reason() {
     let bin = env!("CARGO_BIN_EXE_ultrasql-sqllogictest-runner");
     let suite = temp_artifact_path("ultrasql-slt-empty-skip", "test");

@@ -31,6 +31,48 @@ fn lower_query_eq_indexed_column_picks_index_scan() {
     assert_eq!(pairs, vec![(42, 420)]);
 }
 
+#[test]
+fn lower_update_eq_indexed_column_uses_point_fused_update() {
+    let rows: Vec<(i32, i32)> = (1..=100).map(|i| (i, i * 10)).collect();
+    let (fix, _entry, _) = build_index_fixture("t_update_indexed", &rows, true);
+    let tables = SampleTables::new();
+    let ctx = fix.ctx(&tables);
+    let val_col = ScalarExpr::Column {
+        name: "val".into(),
+        index: 1,
+        data_type: DataType::Int32,
+    };
+    let delta = ScalarExpr::Literal {
+        value: Value::Int32(7),
+        data_type: DataType::Int32,
+    };
+    let plan = LogicalPlan::Update {
+        table: "t_update_indexed".into(),
+        assignments: vec![(
+            1,
+            ScalarExpr::Binary {
+                op: BinaryOp::Add,
+                left: Box::new(val_col),
+                right: Box::new(delta),
+                data_type: DataType::Int32,
+            },
+        )],
+        input: Box::new(build_filter_scan_plan(
+            "t_update_indexed",
+            eq_id_literal(42),
+        )),
+        returning: Vec::new(),
+        schema: Schema::empty(),
+    };
+
+    let op = lower_query(&plan, &ctx).expect("lowers");
+    let debug = format!("{op:?}");
+    assert!(
+        debug.starts_with("FusedUpdateInt32Add") && debug.contains("target_tids: Some(1)"),
+        "expected indexed point fused update, got: {debug}"
+    );
+}
+
 /// `WHERE id = 42` against an *unindexed* table falls back to
 /// `Filter(SeqScan)`. The `Debug` starts with `Filter` (the outer
 /// operator); `SeqScan` is the inner child.

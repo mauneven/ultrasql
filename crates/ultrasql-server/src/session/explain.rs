@@ -25,7 +25,7 @@ use std::time::Instant;
 
 use tokio::io::{AsyncRead, AsyncWrite};
 use ultrasql_catalog::CatalogSnapshot;
-use ultrasql_core::Field;
+use ultrasql_core::{DataType, Field, Value};
 use ultrasql_executor::Operator;
 use ultrasql_planner::{BinaryOp, ExplainFormat, LogicalIndexMethod, LogicalPlan, ScalarExpr};
 use ultrasql_protocol::messages::{BackendMessage, FieldDescription};
@@ -368,7 +368,7 @@ where
             return format!("skipped {table}: vector column index exceeds attnum");
         };
         let Some(indexes) = catalog_snapshot.indexes_by_table.get(&table_entry.oid) else {
-            return format!("skipped {table}: no vector indexes on table");
+            return exact_vector_fallback_note("no matching vector index");
         };
         let Some(constraints) = self.state.table_constraints.get(&table_entry.oid) else {
             return format!("skipped {table}: vector index runtime metadata unavailable");
@@ -419,7 +419,7 @@ where
                 );
             }
         }
-        format!("skipped {table}: no matching vector index")
+        exact_vector_fallback_note("no matching vector index")
     }
 
     fn late_materialization_note(
@@ -1018,6 +1018,9 @@ fn column_literal_index(left: &ScalarExpr, right: &ScalarExpr) -> Option<usize> 
 }
 
 fn simd_kernel_note(plan: &LogicalPlan) -> String {
+    if has_exact_vector_top_k_shape(plan) {
+        return "ultrasql-vec exact_top_k_f32 kernel".to_owned();
+    }
     if has_vector_distance_expr(plan) {
         return "ultrasql-vec vector distance kernel".to_owned();
     }
@@ -1028,6 +1031,74 @@ fn simd_kernel_note(plan: &LogicalPlan) -> String {
         return "ultrasql-vec scalar aggregate scalar/SIMD dispatch".to_owned();
     }
     "scalar fallback (no specialized SIMD kernel selected)".to_owned()
+}
+
+fn exact_vector_fallback_note(reason: &str) -> String {
+    format!("method=exact fallback_used=true fallback_reason={reason} recall_mode=n/a")
+}
+
+fn has_exact_vector_top_k_shape(plan: &LogicalPlan) -> bool {
+    match plan {
+        LogicalPlan::Limit {
+            input, n, offset, ..
+        } => *n != 0 && *n != u64::MAX && *offset == 0 && exact_vector_top_k_input(input),
+        _ => plan_children(plan)
+            .iter()
+            .any(|child| has_exact_vector_top_k_shape(child)),
+    }
+}
+
+fn exact_vector_top_k_input(input: &LogicalPlan) -> bool {
+    match input {
+        LogicalPlan::Sort { keys, .. } => exact_vector_top_k_keys(keys),
+        LogicalPlan::Project { input, .. } => {
+            let LogicalPlan::Sort { keys, .. } = input.as_ref() else {
+                return false;
+            };
+            exact_vector_top_k_keys(keys)
+        }
+        _ => false,
+    }
+}
+
+fn exact_vector_top_k_keys(keys: &[ultrasql_planner::SortKey]) -> bool {
+    let [key] = keys else {
+        return false;
+    };
+    if !key.asc || key.nulls_first {
+        return false;
+    }
+    let ScalarExpr::Binary {
+        op, left, right, ..
+    } = &key.expr
+    else {
+        return false;
+    };
+    matches!(
+        op,
+        BinaryOp::VectorL2Distance
+            | BinaryOp::VectorCosineDistance
+            | BinaryOp::VectorNegativeInnerProduct
+            | BinaryOp::VectorL1Distance
+    ) && (exact_dense_vector_column_probe(left, right)
+        || exact_dense_vector_column_probe(right, left))
+}
+
+fn exact_dense_vector_column_probe(column: &ScalarExpr, probe: &ScalarExpr) -> bool {
+    let ScalarExpr::Column {
+        data_type: DataType::Vector { .. } | DataType::HalfVec { .. },
+        ..
+    } = column
+    else {
+        return false;
+    };
+    matches!(
+        probe,
+        ScalarExpr::Literal {
+            value: Value::Vector(_) | Value::HalfVec(_),
+            ..
+        }
+    )
 }
 
 fn has_vector_distance_expr(plan: &LogicalPlan) -> bool {

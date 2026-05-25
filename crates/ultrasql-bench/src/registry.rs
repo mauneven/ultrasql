@@ -427,8 +427,8 @@ pub fn p99_f64(values: &[f64]) -> f64 {
 /// Returns placeholder zeros so the registry compiles and the gate can parse
 /// the baseline without a live UltraSQL execution path. All benchmarks
 /// previously using this stub have been wired to real implementations in
-/// [`crate::runs`]. The remaining stubs (`tpcb_32conn`, `tpcc_5types`) use
-/// their own module-level run functions that also return zeros.
+/// [`crate::runs`]. The remaining stub (`tpcb_32conn`) uses its own
+/// module-level run function that also returns zeros.
 ///
 /// Kept here for reference and future deferred benchmarks.
 #[allow(dead_code)]
@@ -704,8 +704,8 @@ static SPECS: [BenchSpec; 24] = [
             (Engine::Sqlite3, FloorMetric::ThroughputRatio(2.0)),
             (Engine::CockroachDb, FloorMetric::ThroughputRatio(2.0)),
         ],
-        // TODO(v1.0-tpcc): real implementation in runs::tpcc once all
-        // 5 TPC-C transaction types are implemented.
+        // Local kernel guard; publishable cross-engine evidence is produced
+        // by benchmarks/tpcc_certify.sh through PostgreSQL-wire sessions.
         run: crate::runs::tpcc::run,
     },
     // CSV gauntlet regression guard. Cross-engine claims remain in the

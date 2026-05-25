@@ -275,6 +275,13 @@ fn parse_two_statements_separated_by_semicolons() {
 }
 
 #[test]
+fn parse_statement_slices_preserve_source_text() {
+    let mut p = Parser::new(" BEGIN ; SELECT ';' FROM t ; COMMIT ");
+    let slices = p.parse_statement_slices().unwrap();
+    assert_eq!(slices, vec!["BEGIN", "SELECT ';' FROM t", "COMMIT"]);
+}
+
+#[test]
 fn missing_from_returns_select_without_from() {
     let stmt = parse("SELECT 1 + 1");
     let Statement::Select(s) = stmt else { panic!() };

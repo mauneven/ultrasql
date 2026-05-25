@@ -24,6 +24,10 @@ use crate::index_key::IndexKeyEncoding;
 
 use super::LowerCtx;
 use super::agg_fuse::{extract_int32_col_op_lit, shift_column_indices};
+use super::index_scan::{
+    find_single_column_index, key_type_for_btree, match_indexable_predicate,
+    probe_index_entries_ordered,
+};
 use super::lower_query::lower_query;
 
 type CascadeIndexDeletes = Vec<(BTree<crate::BlankPageLoader>, Vec<(i64, TupleId)>)>;
@@ -1597,6 +1601,12 @@ pub(super) fn try_build_fused_update(
         _ => return Ok(None),
     };
 
+    let target_tids = if let LogicalPlan::Filter { predicate, .. } = input {
+        try_indexed_update_target_tids(entry, predicate, ctx)?
+    } else {
+        None
+    };
+
     let rel = RelationId(entry.oid);
     let block_count = ctx.heap.block_count(rel).max(entry.n_blocks);
     let op = FusedUpdateInt32Add::new(
@@ -1610,9 +1620,33 @@ pub(super) fn try_build_fused_update(
         delta,
         ctx.xid,
         ctx.command_id,
-    )
+    );
+    let op = if let Some(target_tids) = target_tids {
+        op.with_target_tids(target_tids)
+    } else {
+        op
+    }
     .with_visibility_map(Arc::clone(&ctx.vm));
     Ok(Some(Box::new(op)))
+}
+
+fn try_indexed_update_target_tids(
+    entry: &TableEntry,
+    predicate: &ScalarExpr,
+    ctx: &LowerCtx<'_>,
+) -> Result<Option<Vec<TupleId>>, ServerError> {
+    let Some((col_idx, range)) = match_indexable_predicate(predicate) else {
+        return Ok(None);
+    };
+    if range.low != range.high || key_type_for_btree(entry, col_idx).is_none() {
+        return Ok(None);
+    }
+    let Some(index_entry) = find_single_column_index(&ctx.catalog_snapshot, entry, col_idx, ctx)
+    else {
+        return Ok(None);
+    };
+    let entries = probe_index_entries_ordered(index_entry, range, true, ctx)?;
+    Ok(Some(entries.into_iter().map(|(_, tid)| tid).collect()))
 }
 
 pub(super) fn lower_real_update(

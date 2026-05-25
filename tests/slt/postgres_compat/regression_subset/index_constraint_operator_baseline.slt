@@ -1,0 +1,115 @@
+# PostgreSQL regression-derived index/constraint/operator baseline shard.
+# Source: PostgreSQL src/test/regress/sql/create_index.sql, constraints.sql,
+# create_operator.sql, and opr_sanity.sql at commit
+# ddd12d1a5c4d980c5f31dc7d096012547b724e55.
+# License/provenance live beside this file in IMPORT_MANIFEST.txt and
+# LICENSE.upstream.
+
+statement ok
+CREATE TABLE slt_pg_ico_parent (
+  id INT PRIMARY KEY,
+  label TEXT NOT NULL
+)
+
+statement ok
+CREATE TABLE slt_pg_ico_child (
+  id INT PRIMARY KEY,
+  parent_id INT REFERENCES slt_pg_ico_parent(id),
+  amount INT CHECK (amount >= 0),
+  label TEXT NOT NULL
+)
+
+statement ok
+INSERT INTO slt_pg_ico_parent VALUES (1, 'one'), (2, 'two')
+
+statement ok
+INSERT INTO slt_pg_ico_child VALUES
+  (1, 1, 10, 'alpha'),
+  (2, 1, 20, 'beta'),
+  (3, 2, 30, 'gamma')
+
+statement ok
+CREATE INDEX slt_pg_ico_child_amount_idx ON slt_pg_ico_child(amount)
+
+statement ok
+CREATE UNIQUE INDEX slt_pg_ico_child_label_idx ON slt_pg_ico_child(label)
+
+query II nosort
+SELECT id, amount FROM slt_pg_ico_child WHERE amount >= 10 AND amount <= 20 ORDER BY amount
+----
+1
+10
+2
+20
+
+query I nosort
+SELECT id FROM slt_pg_ico_child WHERE amount <> 10 ORDER BY id
+----
+2
+3
+
+query I nosort
+SELECT id FROM slt_pg_ico_child WHERE amount != 20 ORDER BY id
+----
+1
+3
+
+query I nosort
+SELECT id FROM slt_pg_ico_child WHERE label LIKE 'a%'
+----
+1
+
+query I nosort
+SELECT id FROM slt_pg_ico_child WHERE amount BETWEEN 10 AND 20 ORDER BY id
+----
+1
+2
+
+statement error
+INSERT INTO slt_pg_ico_child VALUES (1, 1, 40, 'delta')
+
+statement error
+INSERT INTO slt_pg_ico_child VALUES (4, 1, -1, 'delta')
+
+statement error
+INSERT INTO slt_pg_ico_child VALUES (4, 1, 40, NULL)
+
+statement error
+INSERT INTO slt_pg_ico_child VALUES (4, 999, 40, 'delta')
+
+statement error
+INSERT INTO slt_pg_ico_child VALUES (4, 1, 40, 'alpha')
+
+statement ok
+UPDATE slt_pg_ico_child SET amount = 15 WHERE id = 2
+
+query II nosort
+SELECT id, amount FROM slt_pg_ico_child WHERE amount >= 10 AND amount <= 20 ORDER BY id
+----
+1
+10
+2
+15
+
+statement error
+UPDATE slt_pg_ico_child SET amount = -3 WHERE id = 1
+
+# ultrasql:skip CREATE OPERATOR PostgreSQL regression cases need user-defined operator DDL support
+statement ok
+CREATE OPERATOR === (
+  LEFTARG = boolean,
+  RIGHTARG = boolean,
+  PROCEDURE = bool_eq
+)
+
+# ultrasql:skip full PostgreSQL opr_sanity catalog/operator invariant needs complete pg_operator, pg_amop, pg_opclass, and pg_proc parity
+query I nosort
+SELECT COUNT(*) FROM pg_operator
+----
+0
+
+statement ok
+DROP TABLE slt_pg_ico_child
+
+statement ok
+DROP TABLE slt_pg_ico_parent

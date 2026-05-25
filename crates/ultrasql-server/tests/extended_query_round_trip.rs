@@ -249,6 +249,64 @@ async fn prepared_scalar_aggregate() {
     shutdown(running).await;
 }
 
+/// Prepared arithmetic UPDATE uses target-column type for RHS parameters.
+#[tokio::test]
+async fn prepared_increment_update_infers_parameter_types() {
+    let running = start_sample_server("extended_query_increment_update").await;
+    let client = &running.client;
+
+    client
+        .batch_execute("CREATE TABLE counters (id INT NOT NULL, val INT)")
+        .await
+        .expect("create table");
+    client
+        .batch_execute("INSERT INTO counters VALUES (1, 10)")
+        .await
+        .expect("seed row");
+
+    let upd = client
+        .prepare("UPDATE counters SET val = val + $1 WHERE id = $2")
+        .await
+        .expect("prepare increment update");
+    let n = client
+        .execute(&upd, &[&5_i32, &1_i32])
+        .await
+        .expect("increment update executes");
+
+    let row = client
+        .query_one("SELECT val FROM counters WHERE id = 1", &[])
+        .await
+        .expect("read updated row");
+    assert_eq!(n, 1);
+    assert_eq!(row.get::<_, i32>(0), 15);
+
+    shutdown(running).await;
+}
+
+/// Simple Query batches execute every semicolon-delimited statement.
+#[tokio::test]
+async fn simple_query_batch_executes_all_statements() {
+    let running = start_sample_server("simple_query_batch").await;
+    let client = &running.client;
+
+    client
+        .batch_execute(
+            "CREATE TABLE batch_items (id INT NOT NULL, val INT);
+             INSERT INTO batch_items VALUES (1, 10);
+             UPDATE batch_items SET val = val + 5 WHERE id = 1",
+        )
+        .await
+        .expect("batch executes");
+
+    let row = client
+        .query_one("SELECT val FROM batch_items WHERE id = 1", &[])
+        .await
+        .expect("batch row visible");
+    assert_eq!(row.get::<_, i32>(0), 15);
+
+    shutdown(running).await;
+}
+
 /// Prepared UPDATE + DELETE round-trip.
 #[tokio::test]
 async fn prepared_update_and_delete() {

@@ -217,6 +217,12 @@ where
             return Ok(());
         }
 
+        if let Ok(statement_slices) = Parser::new(trimmed).parse_statement_slices()
+            && statement_slices.len() > 1
+        {
+            return self.handle_query_batch(&statement_slices).await;
+        }
+
         // COPY needs the async wire flow.
         match self.try_bind_copy_plan(trimmed) {
             Ok(Some(plan)) => return self.handle_copy_statement(&plan).await,
@@ -275,6 +281,113 @@ where
             }
         }
         Ok(())
+    }
+
+    async fn handle_query_batch(&mut self, statements: &[&str]) -> Result<(), ServerError> {
+        let mut scratch = std::mem::take(&mut self.write_buf);
+        scratch.clear();
+
+        for statement in statements {
+            let trimmed = statement.trim();
+            if simple_query_is_empty(trimmed) {
+                continue;
+            }
+            match self.try_bind_copy_plan(trimmed) {
+                Ok(Some(_)) => {
+                    let err = ServerError::Unsupported(
+                        "COPY is not supported inside a multi-statement Simple Query batch",
+                    );
+                    Self::encode_error_response(&mut scratch, &err.to_string(), err.sqlstate());
+                    break;
+                }
+                Ok(None) => {}
+                Err(err) => {
+                    if !err.is_query_scoped() {
+                        scratch.clear();
+                        self.write_buf = scratch;
+                        return Err(err);
+                    }
+                    Self::encode_error_response(&mut scratch, &err.to_string(), err.sqlstate());
+                    break;
+                }
+            }
+
+            let started = Instant::now();
+            let timeout_guard =
+                StatementTimeoutGuard::arm(self.statement_timeout_ms, self.cancel_flag.clone());
+            let outcome = self.execute_query(trimmed);
+            drop(timeout_guard);
+            let elapsed = started.elapsed();
+            let rows = outcome.as_ref().map_or(0, |result| result.rows);
+            let error = outcome.as_ref().err().map(ToString::to_string);
+            self.log_completed_statement(trimmed, elapsed, rows, error.as_deref());
+            self.state.workload_recorder.record(WorkloadQueryRecord {
+                query: trimmed.to_string(),
+                plan_hash: workload::plan_hash_for_sql(trimmed),
+                elapsed,
+                rows,
+                error,
+                bind_param_count: 0,
+                bind_params_redacted: false,
+            });
+
+            match outcome {
+                Ok(result) => Self::encode_query_result_body(&mut scratch, result),
+                Err(err) => {
+                    if !err.is_query_scoped() {
+                        scratch.clear();
+                        self.write_buf = scratch;
+                        return Err(err);
+                    }
+                    Self::encode_error_response(&mut scratch, &err.to_string(), err.sqlstate());
+                    break;
+                }
+            }
+        }
+
+        self.drain_pending_notifications_into(&mut scratch);
+        encode_backend(
+            &BackendMessage::ReadyForQuery {
+                status: self.txn_state.ready_for_query_status(),
+            },
+            &mut scratch,
+        );
+        let res = self.io.write_all(&scratch).await;
+        scratch.clear();
+        self.write_buf = scratch;
+        res?;
+        self.io.flush().await?;
+        if matches!(self.txn_state, TxnState::Idle) {
+            self.run_post_response_maintenance();
+        }
+        Ok(())
+    }
+
+    fn encode_query_result_body(scratch: &mut BytesMut, mut result: SelectResult) {
+        if let Some(body) = result.streamed_body.take() {
+            scratch.extend_from_slice(&body);
+            return;
+        }
+        if let Some(body) = result.shared_streamed_body.take() {
+            scratch.extend_from_slice(body.as_ref());
+            return;
+        }
+        for msg in &result.messages {
+            encode_backend(msg, scratch);
+        }
+    }
+
+    fn encode_error_response(scratch: &mut BytesMut, message: &str, sqlstate: &str) {
+        encode_backend(
+            &BackendMessage::ErrorResponse {
+                fields: vec![
+                    (b'S', "ERROR".to_string()),
+                    (b'C', sqlstate.to_string()),
+                    (b'M', message.to_string()),
+                ],
+            },
+            scratch,
+        );
     }
 
     pub(in crate::session) fn log_completed_statement(

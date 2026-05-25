@@ -36,7 +36,7 @@
 
 use std::sync::Arc;
 
-use ultrasql_core::{CommandId, DataType, Field, RelationId, Schema, Xid};
+use ultrasql_core::{CommandId, DataType, Field, RelationId, Schema, TupleId, Xid};
 use ultrasql_mvcc::Snapshot;
 use ultrasql_storage::PageLoader;
 use ultrasql_storage::heap::HeapAccess;
@@ -107,6 +107,7 @@ pub struct FusedUpdateInt32Add<L: PageLoader> {
     delta: i32,
     xid: Xid,
     command_id: CommandId,
+    target_tids: Option<Vec<TupleId>>,
     vm: Option<Arc<VisibilityMap>>,
     schema: Schema,
     done: bool,
@@ -119,6 +120,7 @@ impl<L: PageLoader> std::fmt::Debug for FusedUpdateInt32Add<L> {
             .field("predicate", &self.predicate)
             .field("target_col", &self.target_col)
             .field("delta", &self.delta)
+            .field("target_tids", &self.target_tids.as_ref().map(Vec::len))
             .field("block_count", &self.block_count)
             .finish()
     }
@@ -153,10 +155,19 @@ impl<L: PageLoader> FusedUpdateInt32Add<L> {
             delta,
             xid,
             command_id,
+            target_tids: None,
             vm: None,
             schema,
             done: false,
         }
+    }
+
+    /// Restrict the fused update to the heap tuple IDs found through an
+    /// index point probe.
+    #[must_use]
+    pub fn with_target_tids(mut self, target_tids: Vec<TupleId>) -> Self {
+        self.target_tids = Some(target_tids);
+        self
     }
 
     #[must_use]
@@ -205,22 +216,43 @@ impl<L: PageLoader + Send + Sync + std::fmt::Debug + 'static> Operator for Fused
         // mutation path with `None`.
         let wal_sink_arc = self.heap.wal_sink().cloned();
         let wal_sink: Option<&dyn ultrasql_storage::WalSink> = wal_sink_arc.as_deref();
-        let n = self
-            .heap
-            .update_int32_pair_inplace_undo(
-                self.relation,
-                self.block_count,
-                &self.snapshot,
-                &*self.oracle,
-                predicate_fn,
-                target_col,
-                delta,
-                self.xid,
-                self.command_id,
-                wal_sink,
-                self.vm.as_deref(),
-            )
-            .map_err(|e| ExecError::TypeMismatch(e.to_string()))?;
+        let n = if let Some(target_tids) = &self.target_tids {
+            let mut total = 0_usize;
+            for tid in target_tids {
+                total += self
+                    .heap
+                    .update_int32_pair_tid_inplace_undo(
+                        *tid,
+                        &self.snapshot,
+                        &*self.oracle,
+                        predicate_fn,
+                        target_col,
+                        delta,
+                        self.xid,
+                        self.command_id,
+                        wal_sink,
+                        self.vm.as_deref(),
+                    )
+                    .map_err(|e| ExecError::TypeMismatch(e.to_string()))?;
+            }
+            total
+        } else {
+            self.heap
+                .update_int32_pair_inplace_undo(
+                    self.relation,
+                    self.block_count,
+                    &self.snapshot,
+                    &*self.oracle,
+                    predicate_fn,
+                    target_col,
+                    delta,
+                    self.xid,
+                    self.command_id,
+                    wal_sink,
+                    self.vm.as_deref(),
+                )
+                .map_err(|e| ExecError::TypeMismatch(e.to_string()))?
+        };
 
         let affected_i64 = i64::try_from(n).unwrap_or(i64::MAX);
         let batch = Batch::new([Column::Int64(NumericColumn::from_data(vec![affected_i64]))])

@@ -5,9 +5,10 @@
 //! the order keys per row, keeps only the best `k` annotated rows, then
 //! emits those rows in sort order. This is exact retrieval: every input
 //! row is considered, but memory is bounded by `k` instead of total
-//! cardinality. With a finite [`crate::WorkMemBudget`], it routes through
-//! the spillable [`crate::Sort`] path so large vector top-k queries can
-//! trade disk for memory instead of growing without bound.
+//! cardinality. With a finite [`crate::WorkMemBudget`], generic top-k routes
+//! through the spillable [`crate::Sort`] path; exact dense-vector top-k stays
+//! on the bounded kernel path so `ORDER BY embedding <op> probe LIMIT k` never
+//! turns back into a full physical sort.
 
 use std::cmp::Ordering;
 use std::sync::Arc;
@@ -44,6 +45,8 @@ pub struct TopK {
     presorted_emitted: usize,
     work_mem: Option<Arc<WorkMemBudget>>,
     spilled_to_disk: bool,
+    exact_vector_kernel_batches: usize,
+    exact_vector_generic_fallback_batches: usize,
     spill_delegate: Option<TopKSpillDelegate>,
     sorted: Option<std::vec::IntoIter<Vec<Value>>>,
     eof: bool,
@@ -91,6 +94,8 @@ impl TopK {
             presorted_emitted: 0,
             work_mem: None,
             spilled_to_disk: false,
+            exact_vector_kernel_batches: 0,
+            exact_vector_generic_fallback_batches: 0,
             spill_delegate: None,
             sorted: None,
             eof: false,
@@ -117,6 +122,8 @@ impl TopK {
             presorted_emitted: 0,
             work_mem: None,
             spilled_to_disk: false,
+            exact_vector_kernel_batches: 0,
+            exact_vector_generic_fallback_batches: 0,
             spill_delegate: None,
             sorted: None,
             eof: false,
@@ -164,13 +171,23 @@ impl Operator for TopK {
                     None => break,
                     Some(batch) => {
                         let rows = batch_to_rows(&batch, &self.schema)?;
-                        drain_top_k_batch(
+                        match drain_top_k_batch(
                             &mut kept,
                             rows,
                             &self.keys,
                             self.exact_vector_key.as_ref(),
                             self.cap,
-                        );
+                        ) {
+                            TopKDrainMode::ExactVector => {
+                                self.exact_vector_kernel_batches =
+                                    self.exact_vector_kernel_batches.saturating_add(1);
+                            }
+                            TopKDrainMode::GenericFallback => {
+                                self.exact_vector_generic_fallback_batches =
+                                    self.exact_vector_generic_fallback_batches.saturating_add(1);
+                            }
+                            TopKDrainMode::Generic => {}
+                        }
                     }
                 }
             }
@@ -219,10 +236,23 @@ impl Operator for TopK {
             .as_ref()
             .map_or(0, |delegate| delegate.sort.io_bytes())
     }
+
+    fn pruning_stats(&self) -> Vec<String> {
+        if self.exact_vector_key.is_none() {
+            return Vec::new();
+        }
+        vec![format!(
+            "kernel=exact_top_k_f32,full_sort=false,exact_batches={},generic_fallback_batches={}",
+            self.exact_vector_kernel_batches, self.exact_vector_generic_fallback_batches
+        )]
+    }
 }
 
 impl TopK {
     fn should_use_spill_delegate(&self) -> bool {
+        if self.exact_vector_key.is_some() {
+            return false;
+        }
         self.work_mem
             .as_ref()
             .is_some_and(|budget| budget.limit_bytes() != u64::MAX)
@@ -322,19 +352,32 @@ impl Operator for EmptyTopKChild {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TopKDrainMode {
+    ExactVector,
+    GenericFallback,
+    Generic,
+}
+
 fn drain_top_k_batch(
     kept: &mut Vec<(Vec<Value>, Vec<Value>)>,
     rows: Vec<Vec<Value>>,
     keys: &[CompiledKey],
     exact_vector_key: Option<&ExactVectorTopKKey>,
     cap: usize,
-) {
+) -> TopKDrainMode {
     if let Some(exact) = exact_vector_key
         && drain_exact_vector_top_k_batch(kept, &rows, keys, exact, cap)
     {
-        return;
+        return TopKDrainMode::ExactVector;
     }
+    let mode = if exact_vector_key.is_some() {
+        TopKDrainMode::GenericFallback
+    } else {
+        TopKDrainMode::Generic
+    };
     drain_generic_top_k_batch(kept, rows, keys, cap);
+    mode
 }
 
 fn drain_generic_top_k_batch(
@@ -361,7 +404,7 @@ fn drain_exact_vector_top_k_batch(
 ) -> bool {
     let mut vectors: Vec<&[f32]> = Vec::with_capacity(rows.len());
     for row in rows {
-        let Some(Value::Vector(vector)) = row.get(exact.column_idx) else {
+        let Some(Value::Vector(vector) | Value::HalfVec(vector)) = row.get(exact.column_idx) else {
             return false;
         };
         vectors.push(vector);
@@ -451,14 +494,14 @@ fn vector_column_probe(
 ) -> Option<ExactVectorTopKKey> {
     let ScalarExpr::Column {
         index,
-        data_type: ultrasql_core::DataType::Vector { .. },
+        data_type: ultrasql_core::DataType::Vector { .. } | ultrasql_core::DataType::HalfVec { .. },
         ..
     } = column
     else {
         return None;
     };
     let ScalarExpr::Literal {
-        value: Value::Vector(values),
+        value: Value::Vector(values) | Value::HalfVec(values),
         ..
     } = probe
     else {
@@ -575,7 +618,52 @@ mod tests {
     }
 
     #[test]
-    fn vector_top_k_spills_to_disk_when_work_mem_is_too_small() {
+    fn generic_top_k_spills_to_disk_when_work_mem_is_too_small() {
+        let schema = Schema::new([
+            Field::required("id", DataType::Int32),
+            Field::required("embedding", DataType::Vector { dims: Some(2) }),
+        ])
+        .expect("schema ok");
+        let rows = vec![
+            vec![Value::Int32(10), Value::Vector(vec![3.0, 0.0])],
+            vec![Value::Int32(20), Value::Vector(vec![0.0, 1.0])],
+            vec![Value::Int32(30), Value::Vector(vec![0.2, 0.0])],
+            vec![Value::Int32(40), Value::Vector(vec![0.0, 2.0])],
+        ];
+        let batch = crate::seq_scan::build_batch(&rows, &schema).expect("batch ok");
+        let child = CountingScan {
+            schema: schema.clone(),
+            batches: vec![batch],
+            next: 0,
+            pulls: Arc::new(AtomicUsize::new(0)),
+        };
+        let key = SortKey {
+            expr: ScalarExpr::Column {
+                name: "id".into(),
+                index: 0,
+                data_type: DataType::Int32,
+            },
+            asc: true,
+            nulls_first: false,
+        };
+        let mut top_k = TopK::new(Box::new(child), vec![key], schema.clone(), 2)
+            .with_work_mem_budget(std::sync::Arc::new(WorkMemBudget::new(1)));
+
+        let mut out = Vec::new();
+        while let Some(batch) = top_k.next_batch().expect("top-k ok") {
+            out.extend(crate::filter_op::batch_to_rows(&batch, top_k.schema()).expect("decode"));
+        }
+        let ids: Vec<Value> = out.into_iter().map(|row| row[0].clone()).collect();
+
+        assert_eq!(ids, vec![Value::Int32(10), Value::Int32(20)]);
+        assert!(
+            top_k.spilled_to_disk(),
+            "generic top-k must keep spillable external sort fallback"
+        );
+    }
+
+    #[test]
+    fn exact_vector_top_k_uses_bounded_kernel_under_tiny_work_mem() {
         let schema = Schema::new([
             Field::required("id", DataType::Int32),
             Field::required("embedding", DataType::Vector { dims: Some(2) }),
@@ -622,8 +710,16 @@ mod tests {
 
         assert_eq!(ids, vec![Value::Int32(30), Value::Int32(20)]);
         assert!(
-            top_k.spilled_to_disk(),
-            "vector top-k must route through spillable external sort"
+            !top_k.spilled_to_disk(),
+            "exact vector top-k must stay bounded instead of falling back to full Sort"
+        );
+        assert!(
+            top_k
+                .pruning_stats()
+                .iter()
+                .any(|note| note.contains("kernel=exact_top_k_f32")
+                    && note.contains("full_sort=false")),
+            "exact vector top-k must expose kernel/no-sort note"
         );
     }
 

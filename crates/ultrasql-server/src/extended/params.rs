@@ -371,8 +371,16 @@ fn infer_in_expr(expr: &ScalarExpr, target_type: Option<DataType>, out: &mut [Da
             ) {
                 infer_expr_types_from_predicate(expr, out);
             }
-            infer_in_expr(left, None, out);
-            infer_in_expr(right, None, out);
+            let child_target = if matches!(
+                op,
+                BinaryOp::Add | BinaryOp::Sub | BinaryOp::Mul | BinaryOp::Div | BinaryOp::Mod
+            ) {
+                target_type
+            } else {
+                None
+            };
+            infer_in_expr(left, child_target.clone(), out);
+            infer_in_expr(right, child_target, out);
         }
         ScalarExpr::ScalarSubquery { subplan, .. } | ScalarExpr::Exists { subplan, .. } => {
             // Type-inference inside subqueries does not have a catalog

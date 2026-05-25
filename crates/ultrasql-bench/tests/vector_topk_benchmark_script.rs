@@ -14,6 +14,7 @@ fn vector_topk_script_prefers_pgvector_then_duckdb_list_fallback() {
     assert!(script.contains("target/release/cross_compare_sql"));
     assert!(script.contains("CREATE EXTENSION IF NOT EXISTS vector"));
     assert!(script.contains("postgres17_pgvector"));
+    assert!(script.contains("\"schema_version\": 1"));
     assert!(script.contains("list_distance"));
     assert!(script.contains("array_distance"));
     assert!(script.contains("duckdb_list"));
@@ -41,6 +42,46 @@ fn vector_topk_script_certifies_recall_tail_latency_build_memory_and_index_size(
     assert!(script.contains("index_size_bytes"));
     assert!(script.contains("index_size_status"));
     assert!(script.contains("not_applicable_exact_scan"));
+}
+
+#[test]
+fn vector_topk_script_supports_strict_same_host_pgvector_certification() {
+    let script_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../..")
+        .join("benchmarks/vector_topk_exact.sh");
+    let script = fs::read_to_string(&script_path)
+        .unwrap_or_else(|err| panic!("read {}: {err}", script_path.display()));
+
+    assert!(script.contains("VECTOR_TOPK_REQUIRE_PGVECTOR"));
+    assert!(script.contains("VECTOR_TOPK_AUTO_PGVECTOR"));
+    assert!(script.contains("pgvector/pgvector:pg17"));
+    assert!(script.contains("try_start_local_pgvector"));
+    assert!(script.contains("docker_context_host"));
+    assert!(script.contains("\"host\""));
+    assert!(script.contains("HostInfo-equivalent host metadata"));
+}
+
+#[test]
+fn ai_vector_pgvector_certifier_requires_measured_same_host_artifacts() {
+    let script_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../..")
+        .join("benchmarks/ai_vector_pgvector_certify.sh");
+    let script = fs::read_to_string(&script_path)
+        .unwrap_or_else(|err| panic!("read {}: {err}", script_path.display()));
+
+    assert!(script.contains("VECTOR_TOPK_REQUIRE_PGVECTOR=1"));
+    assert!(script.contains("benchmarks/vector_topk_exact.sh"));
+    assert!(script.contains("ai_vector_pgvector_certification.json"));
+    assert!(script.contains("postgres17_pgvector"));
+    assert!(script.contains("ultrasql"));
+    assert!(script.contains("same_host"));
+    assert!(script.contains("status') != 'measured'"));
+    assert!(script.contains("answer"));
+    assert!(script.contains("recall_at_k"));
+    assert!(script.contains("p50_latency_us"));
+    assert!(script.contains("p95_latency_us"));
+    assert!(script.contains("p99_latency_us"));
+    assert!(script.contains("build_time_us"));
 }
 
 #[test]

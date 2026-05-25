@@ -52,8 +52,11 @@ tests/slt/run_postgres_compat.sh
 `postgres_compat/regression_subset/` pins PostgreSQL `REL_17_STABLE` commit
 `ddd12d1a5c4d980c5f31dc7d096012547b724e55` and preserves the upstream license
 beside the curated SQLLogicTest translations. Current reviewed sources are
-PostgreSQL `select.sql`, `char.sql`, `varchar.sql`, `numeric.sql`, and
-`type_sanity.sql`.
+PostgreSQL `select.sql`, `char.sql`, `varchar.sql`, `numeric.sql`,
+`text.sql`, `date.sql`, `time.sql`, `timestamp.sql`, `timetz.sql`,
+`json.sql`, `jsonb.sql`, `arrays.sql`, `type_sanity.sql`,
+`create_index.sql`, `constraints.sql`, `create_operator.sql`, and
+`opr_sanity.sql`.
 
 The first imported open suite shard lives under
 `portable/imported/hydromatic/`. It comes from the MIT-licensed Hydromatic SQL

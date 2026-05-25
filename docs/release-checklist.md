@@ -98,6 +98,7 @@ Before tagging v1.0, attach:
 - latest full benchmark certification manifest,
 - TPC-H SF10 and ClickBench artifacts or explicit setup-missing reasons,
 - Firebolt Core local artifacts or explicit Docker/setup-missing reasons,
+- AI/vector same-host pgvector certification artifact,
 - backup/restore smoke manifest,
 - security/ethics audit notes,
 - config docs hash or commit id.

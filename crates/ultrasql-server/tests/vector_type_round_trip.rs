@@ -131,6 +131,37 @@ fn truncate_wal_before_first(data_dir: &Path, record_type: RecordType) {
     panic!("WAL record type {record_type:?} not found");
 }
 
+fn truncate_inside_first_wal_record(data_dir: &Path, record_type: RecordType) {
+    let segments = sorted_wal_segments(data_dir);
+    for (segment_idx, segment) in segments.iter().enumerate() {
+        let bytes =
+            fs::read(segment).unwrap_or_else(|e| panic!("read WAL segment {segment:?}: {e}"));
+        let mut offset = 0;
+        while offset < bytes.len() {
+            let (record, used) = WalRecord::decode(&bytes[offset..])
+                .unwrap_or_else(|e| panic!("decode WAL segment {segment:?} at {offset}: {e}"));
+            if record.header.record_type == record_type {
+                assert!(used > 8, "ANN WAL record should be large enough to tear");
+                let keep_len =
+                    u64::try_from(offset + (used / 2)).expect("WAL torn offset fits u64");
+                let file = fs::OpenOptions::new()
+                    .write(true)
+                    .open(segment)
+                    .unwrap_or_else(|e| panic!("open WAL segment {segment:?}: {e}"));
+                file.set_len(keep_len)
+                    .unwrap_or_else(|e| panic!("tear WAL segment {segment:?}: {e}"));
+                for later in segments.iter().skip(segment_idx + 1) {
+                    fs::remove_file(later)
+                        .unwrap_or_else(|e| panic!("remove later WAL segment {later:?}: {e}"));
+                }
+                return;
+            }
+            offset += used;
+        }
+    }
+    panic!("WAL record type {record_type:?} not found");
+}
+
 fn corrupt_first_vector_wal_payload(data_dir: &Path, record_type: RecordType) {
     let segments = sorted_wal_segments(data_dir);
     for segment in &segments {
@@ -885,6 +916,87 @@ async fn hnsw_corrupt_index_wal_marks_index_unavailable_after_restart() {
 }
 
 #[tokio::test]
+async fn hnsw_torn_index_wal_tail_uses_exact_scan_after_restart() {
+    let dir = tempfile::tempdir().expect("tempdir");
+
+    {
+        let running = start_persistent_server(dir.path(), "vector_type_test").await;
+        let client = &running.client;
+        client
+            .batch_execute("CREATE TABLE ann_hnsw_torn (id INT NOT NULL, embedding VECTOR(3))")
+            .await
+            .expect("create vector table");
+        client
+            .batch_execute(
+                "INSERT INTO ann_hnsw_torn VALUES \
+                 (1, '[9,0,0]'), \
+                 (2, '[1,0,0]'), \
+                 (3, '[2,0,0]'), \
+                 (4, '[0,0,0]')",
+            )
+            .await
+            .expect("insert vectors");
+        graceful_shutdown(running).await;
+    }
+
+    {
+        let (client, _conn, server_handle) =
+            start_crash_persistent_server_and_connect(dir.path()).await;
+        client
+            .batch_execute(
+                "CREATE INDEX ann_hnsw_torn_embedding_idx \
+                 ON ann_hnsw_torn USING hnsw (embedding vector_l2_ops)",
+            )
+            .await
+            .expect("create hnsw index");
+        shutdown(client, server_handle).await;
+    }
+
+    truncate_inside_first_wal_record(dir.path(), RecordType::HnswOp);
+
+    {
+        let running = start_persistent_server(dir.path(), "vector_type_test").await;
+        let client = &running.client;
+        let messages = client
+            .simple_query(
+                "SELECT id FROM ann_hnsw_torn \
+                 ORDER BY embedding <-> VECTOR '[0,0,0]' LIMIT 3",
+            )
+            .await
+            .expect("top-k after torn hnsw WAL");
+        let rows = simple_rows(&messages);
+        assert_eq!(
+            rows,
+            vec![
+                vec!["4".to_owned()],
+                vec!["2".to_owned()],
+                vec!["3".to_owned()]
+            ],
+            "torn HNSW WAL tail must not produce wrong top-k results"
+        );
+
+        let messages = client
+            .simple_query(
+                "EXPLAIN ANALYZE SELECT id FROM ann_hnsw_torn \
+                 ORDER BY embedding <-> VECTOR '[0,0,0]' LIMIT 3",
+            )
+            .await
+            .expect("explain after torn hnsw WAL");
+        let text = simple_rows(&messages)
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            !text.contains("selected ann_hnsw_torn_embedding_idx"),
+            "torn HNSW WAL must not select incomplete index, got: {text}"
+        );
+
+        graceful_shutdown(running).await;
+    }
+}
+
+#[tokio::test]
 async fn ivfflat_l2_opclass_uses_lists_probes_and_survives_dml() {
     let (client, _conn, server_handle) = start_server_and_connect().await;
 
@@ -1385,6 +1497,75 @@ async fn ann_filtered_top_k_falls_back_to_exact_when_limit_can_be_satisfied() {
 }
 
 #[tokio::test]
+async fn exact_vector_top_k_explain_avoids_physical_sort_and_reports_fallback() {
+    let (client, _conn, server_handle) = start_server_and_connect().await;
+
+    client
+        .batch_execute(
+            "CREATE TABLE exact_topk_cert (id INT NOT NULL, tenant INT, embedding VECTOR(2))",
+        )
+        .await
+        .expect("create vector table");
+    client
+        .batch_execute(
+            "INSERT INTO exact_topk_cert VALUES \
+             (1, 1, '[3,0]'), \
+             (2, 1, '[0.2,0]'), \
+             (3, 1, '[0,1]'), \
+             (4, 2, '[0,0]'), \
+             (5, 2, '[0.1,0]')",
+        )
+        .await
+        .expect("insert vectors");
+
+    let messages = client
+        .simple_query(
+            "SELECT id FROM exact_topk_cert \
+             WHERE tenant = 1 \
+             ORDER BY embedding <-> VECTOR '[0,0]' LIMIT 2",
+        )
+        .await
+        .expect("exact vector top-k");
+    assert_eq!(
+        simple_rows(&messages),
+        vec![vec!["2".to_owned()], vec!["3".to_owned()]]
+    );
+
+    let messages = client
+        .simple_query(
+            "EXPLAIN ANALYZE SELECT id FROM exact_topk_cert \
+             WHERE tenant = 1 \
+             ORDER BY embedding <-> VECTOR '[0,0]' LIMIT 2",
+        )
+        .await
+        .expect("exact vector explain");
+    let text = simple_rows(&messages)
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>()
+        .join("\n");
+    for required in [
+        "SIMD Kernel: ultrasql-vec exact_top_k_f32 kernel",
+        "method=exact",
+        "fallback_used=true",
+        "fallback_reason=no matching vector index",
+        "kernel=exact_top_k_f32",
+        "full_sort=false",
+    ] {
+        assert!(
+            text.contains(required),
+            "EXPLAIN ANALYZE missing {required}, got: {text}"
+        );
+    }
+    assert!(
+        !text.contains("operator=Sort"),
+        "exact vector top-k must not lower to physical Sort, got: {text}"
+    );
+
+    shutdown(client, server_handle).await;
+}
+
+#[tokio::test]
 async fn ann_explain_analyze_reports_vector_index_counters() {
     let (client, _conn, server_handle) = start_server_and_connect().await;
 
@@ -1590,6 +1771,251 @@ async fn ivfflat_corrupt_index_wal_marks_index_unavailable_after_restart() {
         assert!(
             text.contains("skipped ann_ivf_corrupt_embedding_idx: page-backed ivfflat unavailable"),
             "corrupt IVFFlat WAL must mark index unavailable, got: {text}"
+        );
+
+        graceful_shutdown(running).await;
+    }
+}
+
+#[tokio::test]
+async fn ivfflat_torn_index_wal_tail_uses_exact_scan_after_restart() {
+    let dir = tempfile::tempdir().expect("tempdir");
+
+    {
+        let running = start_persistent_server(dir.path(), "vector_type_test").await;
+        let client = &running.client;
+        client
+            .batch_execute("CREATE TABLE ann_ivf_torn (id INT NOT NULL, embedding VECTOR(2))")
+            .await
+            .expect("create vector table");
+        client
+            .batch_execute(
+                "INSERT INTO ann_ivf_torn VALUES \
+                 (1, '[9,0]'), \
+                 (2, '[1,0]'), \
+                 (3, '[2,0]'), \
+                 (4, '[0,0]')",
+            )
+            .await
+            .expect("insert vectors");
+        graceful_shutdown(running).await;
+    }
+
+    {
+        let (client, _conn, server_handle) =
+            start_crash_persistent_server_and_connect(dir.path()).await;
+        client
+            .batch_execute(
+                "CREATE INDEX ann_ivf_torn_embedding_idx \
+                 ON ann_ivf_torn USING ivfflat (embedding vector_l2_ops) \
+                 WITH (lists = 2, probes = 1)",
+            )
+            .await
+            .expect("create ivfflat index");
+        shutdown(client, server_handle).await;
+    }
+
+    truncate_inside_first_wal_record(dir.path(), RecordType::IvfFlatOp);
+
+    {
+        let running = start_persistent_server(dir.path(), "vector_type_test").await;
+        let client = &running.client;
+        let messages = client
+            .simple_query(
+                "SELECT id FROM ann_ivf_torn \
+                 ORDER BY embedding <-> VECTOR '[0,0]' LIMIT 3",
+            )
+            .await
+            .expect("top-k after torn ivfflat WAL");
+        let rows = simple_rows(&messages);
+        assert_eq!(
+            rows,
+            vec![
+                vec!["4".to_owned()],
+                vec!["2".to_owned()],
+                vec!["3".to_owned()]
+            ],
+            "torn IVFFlat WAL tail must not produce wrong top-k results"
+        );
+
+        let messages = client
+            .simple_query(
+                "EXPLAIN ANALYZE SELECT id FROM ann_ivf_torn \
+                 ORDER BY embedding <-> VECTOR '[0,0]' LIMIT 3",
+            )
+            .await
+            .expect("explain after torn ivfflat WAL");
+        let text = simple_rows(&messages)
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            !text.contains("selected ann_ivf_torn_embedding_idx"),
+            "torn IVFFlat WAL must not select incomplete index, got: {text}"
+        );
+
+        graceful_shutdown(running).await;
+    }
+}
+
+#[tokio::test]
+async fn ann_restart_rebuild_replays_dml_wal_for_hnsw_and_ivfflat() {
+    let dir = tempfile::tempdir().expect("tempdir");
+
+    {
+        let running = start_persistent_server(dir.path(), "vector_type_test").await;
+        let client = &running.client;
+        client
+            .batch_execute("CREATE TABLE ann_hnsw_rebuild (id INT NOT NULL, embedding VECTOR(2))")
+            .await
+            .expect("create hnsw rebuild table");
+        client
+            .batch_execute(
+                "INSERT INTO ann_hnsw_rebuild VALUES \
+                 (1, '[9,0]'), \
+                 (2, '[3,0]'), \
+                 (3, '[6,0]')",
+            )
+            .await
+            .expect("insert hnsw rebuild rows");
+        client
+            .batch_execute("CREATE TABLE ann_ivf_rebuild (id INT NOT NULL, embedding VECTOR(2))")
+            .await
+            .expect("create ivfflat rebuild table");
+        client
+            .batch_execute(
+                "INSERT INTO ann_ivf_rebuild VALUES \
+                 (1, '[9,0]'), \
+                 (2, '[3,0]'), \
+                 (3, '[6,0]')",
+            )
+            .await
+            .expect("insert ivfflat rebuild rows");
+        graceful_shutdown(running).await;
+    }
+
+    {
+        let (client, _conn, server_handle) =
+            start_crash_persistent_server_and_connect(dir.path()).await;
+        client
+            .batch_execute(
+                "CREATE INDEX ann_hnsw_rebuild_idx \
+                 ON ann_hnsw_rebuild USING hnsw (embedding vector_l2_ops)",
+            )
+            .await
+            .expect("create hnsw rebuild index");
+        client
+            .batch_execute(
+                "CREATE INDEX ann_ivf_rebuild_idx \
+                 ON ann_ivf_rebuild USING ivfflat (embedding vector_l2_ops) \
+                 WITH (lists = 2, probes = 2)",
+            )
+            .await
+            .expect("create ivfflat rebuild index");
+        client
+            .batch_execute("INSERT INTO ann_hnsw_rebuild VALUES (4, '[0,0]')")
+            .await
+            .expect("insert into hnsw rebuild");
+        client
+            .batch_execute("UPDATE ann_hnsw_rebuild SET embedding = VECTOR '[1,0]' WHERE id = 2")
+            .await
+            .expect("update hnsw rebuild");
+        client
+            .batch_execute("DELETE FROM ann_hnsw_rebuild WHERE id = 1")
+            .await
+            .expect("delete hnsw rebuild");
+        client
+            .batch_execute("VACUUM ann_hnsw_rebuild")
+            .await
+            .expect("vacuum hnsw rebuild");
+        client
+            .batch_execute("INSERT INTO ann_ivf_rebuild VALUES (4, '[0,0]')")
+            .await
+            .expect("insert into ivfflat rebuild");
+        client
+            .batch_execute("UPDATE ann_ivf_rebuild SET embedding = VECTOR '[1,0]' WHERE id = 2")
+            .await
+            .expect("update ivfflat rebuild");
+        client
+            .batch_execute("DELETE FROM ann_ivf_rebuild WHERE id = 1")
+            .await
+            .expect("delete ivfflat rebuild");
+        client
+            .batch_execute("VACUUM ann_ivf_rebuild")
+            .await
+            .expect("vacuum ivfflat rebuild");
+        shutdown(client, server_handle).await;
+    }
+
+    {
+        let running = start_persistent_server(dir.path(), "vector_type_test").await;
+        let client = &running.client;
+
+        let messages = client
+            .simple_query(
+                "SELECT id FROM ann_hnsw_rebuild \
+                 ORDER BY embedding <-> VECTOR '[0,0]' LIMIT 3",
+            )
+            .await
+            .expect("hnsw top-k after restart rebuild");
+        assert_eq!(
+            simple_rows(&messages),
+            vec![
+                vec!["4".to_owned()],
+                vec!["2".to_owned()],
+                vec!["3".to_owned()]
+            ],
+            "replayed HNSW DML must preserve exact top-k visibility"
+        );
+        let messages = client
+            .simple_query(
+                "EXPLAIN ANALYZE SELECT id FROM ann_hnsw_rebuild \
+                 ORDER BY embedding <-> VECTOR '[0,0]' LIMIT 3",
+            )
+            .await
+            .expect("hnsw explain after restart rebuild");
+        let text = simple_rows(&messages)
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            text.contains("Vector Index: selected ann_hnsw_rebuild_idx (page-backed hnsw)"),
+            "restart rebuild must select recovered HNSW index, got: {text}"
+        );
+
+        let messages = client
+            .simple_query(
+                "SELECT id FROM ann_ivf_rebuild \
+                 ORDER BY embedding <-> VECTOR '[0,0]' LIMIT 3",
+            )
+            .await
+            .expect("ivfflat top-k after restart rebuild");
+        assert_eq!(
+            simple_rows(&messages),
+            vec![
+                vec!["4".to_owned()],
+                vec!["2".to_owned()],
+                vec!["3".to_owned()]
+            ],
+            "replayed IVFFlat DML must preserve exact top-k visibility"
+        );
+        let messages = client
+            .simple_query(
+                "EXPLAIN ANALYZE SELECT id FROM ann_ivf_rebuild \
+                 ORDER BY embedding <-> VECTOR '[0,0]' LIMIT 3",
+            )
+            .await
+            .expect("ivfflat explain after restart rebuild");
+        let text = simple_rows(&messages)
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            text.contains("Vector Index: selected ann_ivf_rebuild_idx (page-backed ivfflat)"),
+            "restart rebuild must select recovered IVFFlat index, got: {text}"
         );
 
         graceful_shutdown(running).await;

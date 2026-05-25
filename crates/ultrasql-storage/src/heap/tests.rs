@@ -633,6 +633,61 @@ fn inplace_int32_update_skips_unrelated_in_progress_writer() {
     assert_eq!(updated, 1);
 }
 
+#[test]
+fn point_inplace_int32_update_rechecks_tid_predicate() {
+    let heap = make_heap(8);
+    let first = heap
+        .insert(rel(), &int32_pair_payload(1, 10), opts(10))
+        .unwrap();
+    let second = heap
+        .insert(rel(), &int32_pair_payload(2, 20), opts(10))
+        .unwrap();
+
+    let oracle = MapOracle::new();
+    oracle.set_committed(Xid::new(10));
+    let writer_20 = Snapshot::new(
+        Xid::new(10),
+        Xid::new(100),
+        Xid::new(20),
+        CommandId::FIRST,
+        std::iter::empty(),
+    );
+
+    let updated = heap
+        .update_int32_pair_tid_inplace_undo(
+            second,
+            &writer_20,
+            &oracle,
+            |id, _val| id == 2,
+            1,
+            7,
+            Xid::new(20),
+            CommandId::FIRST,
+            None,
+            None,
+        )
+        .unwrap();
+    assert_eq!(updated, 1);
+    assert_eq!(heap.fetch(second).unwrap().data, int32_pair_payload(2, 27));
+
+    let skipped = heap
+        .update_int32_pair_tid_inplace_undo(
+            first,
+            &writer_20,
+            &oracle,
+            |id, _val| id == 2,
+            1,
+            100,
+            Xid::new(20),
+            CommandId::FIRST,
+            None,
+            None,
+        )
+        .unwrap();
+    assert_eq!(skipped, 0);
+    assert_eq!(heap.fetch(first).unwrap().data, int32_pair_payload(1, 10));
+}
+
 // -----------------------------------------------------------------------
 // Deliverable B tests
 // -----------------------------------------------------------------------

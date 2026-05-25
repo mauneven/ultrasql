@@ -1378,7 +1378,7 @@ fn probe_index_ordered_limited(
     Ok(payloads)
 }
 
-fn probe_index_entries_ordered(
+pub(super) fn probe_index_entries_ordered(
     index_entry: &IndexEntry,
     range: IndexKeyRange,
     ascending: bool,

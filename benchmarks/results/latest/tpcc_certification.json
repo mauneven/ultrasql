@@ -1,7 +1,16 @@
 {
   "workload": "tpcc_5types",
-  "target": "TPC-C NewOrder, Payment, OrderStatus, Delivery, and StockLevel with durable commits and concurrent PostgreSQL-wire sessions",
+  "target": "UltraSQL throughput >= 2x PostgreSQL 17 with all five TPC-C transaction types correct",
   "passed": false,
-  "reason": "runner_not_implemented",
-  "next_step": "Replace crates/ultrasql-bench/src/runs/tpcc.rs placeholder with a real TPC-C runner, then make this script measure UltraSQL and PostgreSQL on the same host."
+  "reason": "target_not_met",
+  "postgres_result": "benchmarks/results/latest/raw/tpcc_5types-postgres17.json",
+  "ultrasql_result": "benchmarks/results/latest/raw/tpcc_5types-ultrasql.json",
+  "postgres_correct": true,
+  "ultrasql_correct": true,
+  "postgres_all_five_transaction_types": true,
+  "ultrasql_all_five_transaction_types": true,
+  "postgres_throughput_per_sec": 301.03279515403483,
+  "ultrasql_throughput_per_sec": 4.661215698085378,
+  "throughput_ratio_ultrasql_vs_postgres": 0.015484079386434594,
+  "next_step": "Rerun benchmarks/tpcc_certify.sh on a quiet host after removing remaining UltraSQL OLTP bottlenecks."
 }

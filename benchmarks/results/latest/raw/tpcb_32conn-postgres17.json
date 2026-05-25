@@ -2,22 +2,22 @@
   "engine": "postgres17",
   "workload": "tpcb_32conn",
   "scale": 1,
-  "accounts": 1000,
+  "accounts": 100000,
   "branches": 1,
   "tellers": 10,
   "connections": 32,
   "warmup_secs": 1,
-  "duration_secs": 5,
-  "transactions": 2129,
-  "throughput_per_sec": 419.54048392129056,
-  "p50_latency_us": 75749.333,
-  "p99_latency_us": 111725.542,
+  "duration_secs": 3,
+  "transactions": 33836,
+  "throughput_per_sec": 11247.717634286126,
+  "p50_latency_us": 1851.0,
+  "p99_latency_us": 16296.791000000001,
   "correctness": {
     "passed": true,
-    "history_row_count": 2594,
-    "history_delta_sum": -2515,
-    "accounts_balance_sum": -2515,
-    "tellers_balance_sum": -2515,
-    "branches_balance_sum": -2515
+    "history_row_count": 46153,
+    "history_delta_sum": -249,
+    "accounts_balance_sum": -249,
+    "tellers_balance_sum": -249,
+    "branches_balance_sum": -249
   }
 }

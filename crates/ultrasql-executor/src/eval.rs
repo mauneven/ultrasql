@@ -2750,15 +2750,8 @@ fn eval_substring(args: &[Value]) -> Result<Value, EvalError> {
             args.len()
         )));
     }
-    let s = match &args[0] {
-        Value::Text(s) => s.clone(),
-        Value::Null => return Ok(Value::Null),
-        other => {
-            return Err(EvalError::Type(format!(
-                "substring: source must be text, got {:?}",
-                other.data_type()
-            )));
-        }
+    let Some(s) = text_arg("substring", args, 0)? else {
+        return Ok(Value::Null);
     };
     let from = match args[1].as_i64() {
         Some(v) => v,
@@ -4633,6 +4626,13 @@ mod tests {
         }
     }
 
+    fn lit_char(s: &str, len: Option<u32>) -> ScalarExpr {
+        ScalarExpr::Literal {
+            value: Value::Char(s.to_owned()),
+            data_type: DataType::Char { len },
+        }
+    }
+
     fn lit_jsonb(s: &str) -> ScalarExpr {
         ScalarExpr::Literal {
             value: Value::Jsonb(s.to_owned()),
@@ -4823,6 +4823,21 @@ mod tests {
             lit_text_array(&["yellow", "green"]),
         ));
         assert_eq!(overlaps.eval(&[]).unwrap(), Value::Bool(true));
+    }
+
+    #[test]
+    fn substring_accepts_bpchar_source() {
+        let ev = Eval::new(call(
+            "substring",
+            vec![
+                lit_char("13-111-1111    ", Some(15)),
+                lit_i32(1),
+                lit_i32(2),
+            ],
+            DataType::Text { max_len: None },
+        ));
+
+        assert_eq!(ev.eval(&[]).unwrap(), Value::Text("13".to_owned()));
     }
 
     #[test]

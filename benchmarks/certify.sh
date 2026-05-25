@@ -4,7 +4,7 @@
 # Usage:
 #   benchmarks/certify.sh smoke
 #   benchmarks/certify.sh full
-#   benchmarks/certify.sh full tpch,clickbench,vector-ann,ai-gauntlet,csv-gauntlet,object-parquet-range,late-materialization,firebolt-aggregate,firebolt-sparse-pruning,firebolt-vector
+#   benchmarks/certify.sh full tpch,tpch-sf1-postgres,clickbench,vector-ann,ai-vector-pgvector,ai-gauntlet,csv-gauntlet,object-parquet-range,late-materialization,firebolt-aggregate,firebolt-sparse-pruning,firebolt-vector
 #
 # Smoke is PR-safe: tiny datasets, crash/correctness checks, no external
 # benchmark assets. Full is nightly/manual: it attempts the full certification
@@ -29,7 +29,7 @@ case "$profile" in
         suites=(regression-gate vector-ann sysbench)
         ;;
     full)
-        suites=(tpch clickbench tpcb tpcc sysbench vector-topk vector-ann ai-gauntlet csv-gauntlet object-parquet-range late-materialization firebolt-aggregate firebolt-sparse-pruning firebolt-vector)
+        suites=(tpch tpch-sf1-postgres clickbench tpcb tpcc sysbench vector-topk vector-ann ai-vector-pgvector ai-gauntlet csv-gauntlet object-parquet-range late-materialization firebolt-aggregate firebolt-sparse-pruning firebolt-vector)
         ;;
     *)
         echo "certify.sh: profile must be smoke or full, got '$profile'" >&2
@@ -113,6 +113,10 @@ run_vector_topk_full() {
     benchmarks/vector_topk_exact.sh
 }
 
+run_ai_vector_pgvector_full() {
+    benchmarks/ai_vector_pgvector_certify.sh
+}
+
 run_ai_gauntlet_smoke() {
     AI_GAUNTLET_PROFILE=smoke benchmarks/ai_benchmark_gauntlet.sh smoke
 }
@@ -187,6 +191,9 @@ for suite in "${suites[@]}"; do
         vector-topk)
             run_suite "$suite" run_vector_topk_full
             ;;
+        ai-vector-pgvector)
+            run_suite "$suite" run_ai_vector_pgvector_full
+            ;;
         ai-gauntlet)
             if [[ "$profile" == "smoke" ]]; then
                 run_suite "$suite" run_ai_gauntlet_smoke
@@ -245,6 +252,9 @@ for suite in "${suites[@]}"; do
             ;;
         tpch)
             run_suite "$suite" benchmarks/tpch_sf10_certify.sh
+            ;;
+        tpch-sf1-postgres)
+            run_suite "$suite" benchmarks/tpch_sf1_postgres_certify.sh
             ;;
         clickbench)
             run_suite "$suite" benchmarks/clickbench_certify.sh

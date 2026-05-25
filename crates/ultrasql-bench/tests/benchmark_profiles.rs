@@ -21,6 +21,7 @@ fn certification_runner_splits_smoke_and_full_profiles() {
     assert!(script.contains("target/release/regression-gate --stage current --smoke"));
     assert!(script.contains("VECTOR_ANN_ROWS=512"));
     assert!(script.contains("benchmarks/tpch_sf10_certify.sh"));
+    assert!(script.contains("benchmarks/tpch_sf1_postgres_certify.sh"));
     assert!(script.contains("benchmarks/clickbench_certify.sh"));
     assert!(script.contains("benchmarks/tpcc_certify.sh"));
     assert!(script.contains("benchmarks/sysbench_certify.sh"));
@@ -51,9 +52,12 @@ fn tpcc_and_sysbench_certification_wrappers_write_artifacts() {
 
     assert!(tpcc.contains("tpcc_5types"));
     assert!(tpcc.contains("tpcc_certification.json"));
-    assert!(tpcc.contains("postgres_result_missing"));
-    assert!(tpcc.contains("ultrasql_scope"));
-    assert!(tpcc.contains("exit_code = 2"));
+    assert!(tpcc.contains("POSTGRES_DSN"));
+    assert!(tpcc.contains("TPCC_CONNECTIONS"));
+    assert!(tpcc.contains("TMP_ULTRASQL_RESULT"));
+    assert!(tpcc.contains("TMP_POSTGRES_RESULT"));
+    assert!(tpcc.contains("target_not_met"));
+    assert!(tpcc.contains("missing_cross_engine_results"));
 
     assert!(sysbench.contains("sysbench_oltp_read_write"));
     assert!(sysbench.contains("cross_compare_sql"));
@@ -93,6 +97,24 @@ fn tpch_sf10_runner_refuses_partial_and_writes_raw_atomically() {
     assert!(tpch.contains("mv \"$TMP_DUCKDB_OUT\" \"$DUCKDB_OUT\""));
     assert!(tpch.contains("mv \"$TMP_ULTRA_OUT\" \"$ULTRA_OUT\""));
     assert!(tpch.contains("trap cleanup EXIT"));
+}
+
+#[test]
+fn tpch_sf1_postgres_runner_compares_same_host_postgres() {
+    let tpch = repo_file("benchmarks/tpch_sf1_postgres_certify.sh");
+
+    assert!(tpch.contains("tpch_sf1_postgres"));
+    assert!(tpch.contains("POSTGRES_DSN"));
+    assert!(tpch.contains("TMP_POSTGRES_OUT"));
+    assert!(tpch.contains("TMP_ULTRA_OUT"));
+    assert!(tpch.contains("mv \"$TMP_POSTGRES_OUT\" \"$POSTGRES_OUT\""));
+    assert!(tpch.contains("mv \"$TMP_ULTRA_OUT\" \"$ULTRA_OUT\""));
+    assert!(tpch.contains("partial_query_set_refused"));
+    assert!(tpch.contains("ultrasql_gm <= postgres_gm * 0.5"));
+    assert!(tpch.contains("exit \"$summary_status\""));
+    assert!(tpch.contains("ANALYZE;"));
+    assert!(tpch.contains("autovacuum_enabled = false"));
+    assert!(tpch.contains("CREATE INDEX tpch_sf1_lineitem_part_qty_idx"));
 }
 
 #[test]

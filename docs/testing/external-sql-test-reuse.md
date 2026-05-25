@@ -156,10 +156,15 @@ The first curated shard lives under
 `tests/slt/postgres_compat/regression_subset/`. It pins PostgreSQL commit
 `ddd12d1a5c4d980c5f31dc7d096012547b724e55`, records
 `src/test/regress/sql/select.sql`, `char.sql`, `varchar.sql`, `numeric.sql`,
-and `type_sanity.sql` as sources, and carries the PostgreSQL license next to
-the SLT files. The parser/type shard keeps unsupported PostgreSQL catalog
-breadth checks as explicit `# ultrasql:skip` records instead of silently
-dropping them.
+`text.sql`, `date.sql`, `time.sql`, `timestamp.sql`, `timetz.sql`,
+`json.sql`, `jsonb.sql`, `arrays.sql`, `type_sanity.sql`,
+`create_index.sql`, `constraints.sql`, `create_operator.sql`, and
+`opr_sanity.sql` as sources, and carries the PostgreSQL license next to the
+SLT files. The parser/type, index/constraint/operator, and type-specific
+shards keep unsupported PostgreSQL catalog breadth, user-defined operator
+checks, numeric overflow breadth, collation, timezone-abbreviation, SQL/JSON,
+and array-slice checks as explicit `# ultrasql:skip` records instead of
+silently dropping them.
 
 Multiple reference engines can run in one pass:
 

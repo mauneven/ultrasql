@@ -6,9 +6,10 @@ use std::sync::Arc;
 use ultrasql_core::{DataType, RelationId, Schema, Value, constants::PAGE_SIZE};
 use ultrasql_executor::unique::UniqueMode;
 use ultrasql_executor::{
-    Filter, HashAggregate, Limit, Operator, ProfiledOperator, ResultOp, Sort, Unique, ValuesScan,
+    Filter, HashAggregate, Limit, Operator, ProfiledOperator, ResultOp, Sort, TopK, Unique,
+    ValuesScan,
 };
-use ultrasql_planner::{LogicalPlan, ScalarExpr};
+use ultrasql_planner::{BinaryOp, LogicalPlan, ScalarExpr, SortKey};
 use ultrasql_vec::Batch;
 
 use crate::error::ServerError;
@@ -239,6 +240,9 @@ fn lower_query_inner(
                 return Ok(op);
             }
             if let Some(op) = try_ordered_index_scan_limit(input, *n, *offset, ctx)? {
+                return Ok(op);
+            }
+            if let Some(op) = try_lower_exact_vector_top_k_limit(input, *n, *offset, ctx)? {
                 return Ok(op);
             }
             let child = lower_query(input, ctx)?;
@@ -542,6 +546,105 @@ fn lower_query_inner(
             )))
         }
     }
+}
+
+fn try_lower_exact_vector_top_k_limit(
+    input: &LogicalPlan,
+    limit: u64,
+    offset: u64,
+    ctx: &LowerCtx<'_>,
+) -> Result<Option<Box<dyn Operator>>, ServerError> {
+    if offset != 0 || limit == 0 || limit == u64::MAX {
+        return Ok(None);
+    }
+    let limit = saturate_row_count(limit);
+    match input {
+        LogicalPlan::Sort {
+            input: sort_input,
+            keys,
+        } => lower_exact_vector_sorted_input(sort_input, keys, limit, ctx),
+        LogicalPlan::Project {
+            input: project_input,
+            exprs,
+            ..
+        } => {
+            let LogicalPlan::Sort {
+                input: sort_input,
+                keys,
+            } = project_input.as_ref()
+            else {
+                return Ok(None);
+            };
+            let Some(top_k) = lower_exact_vector_sorted_input(sort_input, keys, limit, ctx)? else {
+                return Ok(None);
+            };
+            let top_k = if ctx.profile_operators {
+                Box::new(ProfiledOperator::new("TopK", top_k)) as Box<dyn Operator>
+            } else {
+                top_k
+            };
+            lower_project_columns(top_k, exprs).map(Some)
+        }
+        _ => Ok(None),
+    }
+}
+
+fn lower_exact_vector_sorted_input(
+    sort_input: &LogicalPlan,
+    keys: &[SortKey],
+    limit: usize,
+    ctx: &LowerCtx<'_>,
+) -> Result<Option<Box<dyn Operator>>, ServerError> {
+    if !is_exact_vector_top_k_keys(keys) {
+        return Ok(None);
+    }
+    let child = lower_query(sort_input, ctx)?;
+    let schema = child.schema().clone();
+    Ok(Some(Box::new(TopK::new(
+        child,
+        keys.to_vec(),
+        schema,
+        limit,
+    ))))
+}
+
+fn is_exact_vector_top_k_keys(keys: &[SortKey]) -> bool {
+    let [key] = keys else {
+        return false;
+    };
+    if !key.asc || key.nulls_first {
+        return false;
+    }
+    let ScalarExpr::Binary {
+        op, left, right, ..
+    } = &key.expr
+    else {
+        return false;
+    };
+    matches!(
+        op,
+        BinaryOp::VectorL2Distance
+            | BinaryOp::VectorCosineDistance
+            | BinaryOp::VectorNegativeInnerProduct
+            | BinaryOp::VectorL1Distance
+    ) && (is_dense_vector_column_probe(left, right) || is_dense_vector_column_probe(right, left))
+}
+
+fn is_dense_vector_column_probe(column: &ScalarExpr, probe: &ScalarExpr) -> bool {
+    let ScalarExpr::Column {
+        data_type: DataType::Vector { .. } | DataType::HalfVec { .. },
+        ..
+    } = column
+    else {
+        return false;
+    };
+    matches!(
+        probe,
+        ScalarExpr::Literal {
+            value: Value::Vector(_) | Value::HalfVec(_),
+            ..
+        }
+    )
 }
 
 fn profile_operator_name(plan: &LogicalPlan) -> &'static str {

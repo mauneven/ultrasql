@@ -2,22 +2,22 @@
   "engine": "ultrasql",
   "workload": "tpcb_32conn",
   "scale": 1,
-  "accounts": 1000,
+  "accounts": 100000,
   "branches": 1,
   "tellers": 10,
   "connections": 32,
   "warmup_secs": 1,
-  "duration_secs": 5,
-  "transactions": 3357,
-  "throughput_per_sec": 665.9854550026466,
-  "p50_latency_us": 22407.0,
-  "p99_latency_us": 531380.791,
+  "duration_secs": 3,
+  "transactions": 2228,
+  "throughput_per_sec": 734.0167683956363,
+  "p50_latency_us": 40945.916,
+  "p99_latency_us": 136412.75,
   "correctness": {
     "passed": true,
-    "history_row_count": 4085,
-    "history_delta_sum": -685,
-    "accounts_balance_sum": -685,
-    "tellers_balance_sum": -685,
-    "branches_balance_sum": -685
+    "history_row_count": 2971,
+    "history_delta_sum": -3567,
+    "accounts_balance_sum": -3567,
+    "tellers_balance_sum": -3567,
+    "branches_balance_sum": -3567
   }
 }

@@ -20,6 +20,12 @@ N_ITERS="${N_ITERS:-8}"
 WARMUP="${WARMUP:-2}"
 PGDATABASE="${PGDATABASE:-ultrasql_bench}"
 PGUSER="${PGUSER:-$(id -un)}"
+REQUIRE_PGVECTOR="${VECTOR_TOPK_REQUIRE_PGVECTOR:-0}"
+AUTO_PGVECTOR="${VECTOR_TOPK_AUTO_PGVECTOR:-1}"
+PGVECTOR_IMAGE="${VECTOR_TOPK_PGVECTOR_IMAGE:-pgvector/pgvector:pg17}"
+PGVECTOR_CONTAINER="${VECTOR_TOPK_PGVECTOR_CONTAINER:-ultrasql-pgvector-topk}"
+PGVECTOR_PORT="${VECTOR_TOPK_PGVECTOR_PORT:-55433}"
+PGVECTOR_PASSWORD="${VECTOR_TOPK_PGVECTOR_PASSWORD:-postgres}"
 CLICKHOUSE_BIN="${CLICKHOUSE_BIN:-clickhouse}"
 CLICKHOUSE_HOST="${CLICKHOUSE_HOST:-localhost}"
 CLICKHOUSE_PORT="${CLICKHOUSE_PORT:-9000}"
@@ -56,16 +62,57 @@ emit_not_available() {
     local out="$RAW_DIR/${WORKLOAD}-${engine}.json"
     python3 - "$engine" "$reason" "$WORKLOAD" "$ROWS" "$DIMS" "$TOP_K" "$REQUIRED_VECTOR_METRICS" <<'PY' > "$out"
 import json
+import os
+import platform
+import subprocess
 import sys
 
 engine, reason, workload = sys.argv[1], sys.argv[2], sys.argv[3]
 rows, dims, top_k = map(int, sys.argv[4:7])
 required_metrics = sys.argv[7].split(",")
+
+def host_info():
+    cpu = os.environ.get("BENCH_CPU_MODEL")
+    if not cpu and platform.system() == "Darwin":
+        try:
+            cpu = subprocess.check_output(
+                ["sysctl", "-n", "machdep.cpu.brand_string"], text=True
+            ).strip()
+        except Exception:
+            cpu = None
+    if not cpu:
+        cpu = platform.machine()
+    cores = int(os.environ.get("BENCH_CPU_CORES") or (os.cpu_count() or 0))
+    ram_gb = os.environ.get("BENCH_RAM_GB")
+    if ram_gb is None:
+        mem_bytes = 0
+        if platform.system() == "Darwin":
+            try:
+                mem_bytes = int(
+                    subprocess.check_output(["sysctl", "-n", "hw.memsize"], text=True).strip()
+                )
+            except Exception:
+                mem_bytes = 0
+        else:
+            try:
+                for line in open("/proc/meminfo", encoding="utf-8"):
+                    if line.startswith("MemTotal:"):
+                        mem_bytes = int(line.split()[1]) * 1024
+                        break
+            except OSError:
+                mem_bytes = 0
+        ram_gb = str(mem_bytes // 1073741824) if mem_bytes else "0"
+    os_name = {"Darwin": "macos", "Linux": "linux"}.get(platform.system(), platform.system().lower())
+    os_version = os.environ.get("BENCH_OS_VERSION", "unknown")
+    return {"cpu": cpu, "cores": cores, "ram_gb": int(ram_gb), "os": f"{os_name} {os_version}"}
+
 doc = {
+    "schema_version": 1,
     "engine": engine,
     "status": "not_available",
     "reason": reason,
     "workload": workload,
+    "host": host_info(),
     "n_rows": rows,
     "vector_dims": dims,
     "top_k": top_k,
@@ -96,7 +143,10 @@ emit_json() {
     python3 - "$engine" "$WORKLOAD" "$ROWS" "$DIMS" "$TOP_K" "$answer" "$build_time_us" "$REQUIRED_VECTOR_METRICS" "$@" <<'PY' > "$out"
 import json
 import math
+import os
+import platform
 import statistics
+import subprocess
 import sys
 
 engine, workload = sys.argv[1], sys.argv[2]
@@ -106,15 +156,53 @@ build_time_us = float(sys.argv[7])
 required_metrics = sys.argv[8].split(",")
 samples = [float(value) for value in sys.argv[9:]]
 
+# HostInfo-equivalent host metadata, matching `ultrasql-bench` artifacts.
+def host_info():
+    cpu = os.environ.get("BENCH_CPU_MODEL")
+    if not cpu and platform.system() == "Darwin":
+        try:
+            cpu = subprocess.check_output(
+                ["sysctl", "-n", "machdep.cpu.brand_string"], text=True
+            ).strip()
+        except Exception:
+            cpu = None
+    if not cpu:
+        cpu = platform.machine()
+    cores = int(os.environ.get("BENCH_CPU_CORES") or (os.cpu_count() or 0))
+    ram_gb = os.environ.get("BENCH_RAM_GB")
+    if ram_gb is None:
+        mem_bytes = 0
+        if platform.system() == "Darwin":
+            try:
+                mem_bytes = int(
+                    subprocess.check_output(["sysctl", "-n", "hw.memsize"], text=True).strip()
+                )
+            except Exception:
+                mem_bytes = 0
+        else:
+            try:
+                for line in open("/proc/meminfo", encoding="utf-8"):
+                    if line.startswith("MemTotal:"):
+                        mem_bytes = int(line.split()[1]) * 1024
+                        break
+            except OSError:
+                mem_bytes = 0
+        ram_gb = str(mem_bytes // 1073741824) if mem_bytes else "0"
+    os_name = {"Darwin": "macos", "Linux": "linux"}.get(platform.system(), platform.system().lower())
+    os_version = os.environ.get("BENCH_OS_VERSION", "unknown")
+    return {"cpu": cpu, "cores": cores, "ram_gb": int(ram_gb), "os": f"{os_name} {os_version}"}
+
 def percentile_nearest_rank(values, percentile):
     ordered = sorted(values)
     index = max(0, min(len(ordered) - 1, math.ceil(len(ordered) * percentile) - 1))
     return ordered[index]
 
 doc = {
+    "schema_version": 1,
     "engine": engine,
     "status": "measured",
     "workload": workload,
+    "host": host_info(),
     "n_rows": rows,
     "vector_dims": dims,
     "top_k": top_k,
@@ -136,9 +224,81 @@ doc = {
     "index_size_status": "not_applicable_exact_scan",
     "iterations_us": samples,
     "answer": answer,
+    "policy": "Raw measured samples only; same-host certification requires paired UltraSQL and PostgreSQL+pgvector measured artifacts.",
 }
 print(json.dumps(doc, separators=(",", ":")))
 PY
+}
+
+docker_context_host() {
+    local context
+    context="${DOCKER_CONTEXT:-}"
+    if [[ -z "$context" ]]; then
+        context="$(docker context show 2>/dev/null || true)"
+    fi
+    if [[ -n "$context" ]]; then
+        docker context inspect "$context" --format '{{ .Endpoints.docker.Host }}' 2>/dev/null || true
+    fi
+}
+
+docker_without_desktop_creds() {
+    local tmp_config
+    local context_host
+    tmp_config="$(mktemp -d)"
+    printf '{"auths":{}}\n' > "$tmp_config/config.json"
+    context_host="$(docker_context_host)"
+    if [[ -n "$context_host" ]]; then
+        DOCKER_CONFIG="$tmp_config" DOCKER_HOST="$context_host" docker "$@"
+    else
+        DOCKER_CONFIG="$tmp_config" docker "$@"
+    fi
+    local status=$?
+    rm -rf "$tmp_config"
+    return "$status"
+}
+
+docker_cmd() {
+    docker_without_desktop_creds "$@"
+}
+
+pgvector_tcp_ready() {
+    python3 - "$PGVECTOR_PORT" <<'PY'
+import socket
+import sys
+
+port = int(sys.argv[1])
+try:
+    with socket.create_connection(("127.0.0.1", port), timeout=1.0):
+        pass
+except OSError:
+    raise SystemExit(1)
+PY
+}
+
+try_start_local_pgvector() {
+    if [[ "$AUTO_PGVECTOR" == "0" ]] || [[ -n "${POSTGRES_DSN:-}" ]] || ! command -v docker >/dev/null 2>&1; then
+        return 1
+    fi
+
+    if docker_cmd inspect "$PGVECTOR_CONTAINER" >/dev/null 2>&1; then
+        docker_cmd start "$PGVECTOR_CONTAINER" >/dev/null || return 1
+    else
+        docker_cmd run -d \
+            --name "$PGVECTOR_CONTAINER" \
+            -e POSTGRES_PASSWORD="$PGVECTOR_PASSWORD" \
+            -e POSTGRES_DB=postgres \
+            -p "127.0.0.1:${PGVECTOR_PORT}:5432" \
+            "$PGVECTOR_IMAGE" >/dev/null || return 1
+    fi
+
+    for _ in $(seq 1 60); do
+        if docker_cmd exec "$PGVECTOR_CONTAINER" pg_isready -U postgres -d postgres >/dev/null 2>&1 && pgvector_tcp_ready; then
+            POSTGRES_DSN="host=127.0.0.1 port=${PGVECTOR_PORT} user=postgres password=${PGVECTOR_PASSWORD} dbname=postgres"
+            return 0
+        fi
+        sleep 1
+    done
+    return 1
 }
 
 write_setup_sql() {
@@ -230,6 +390,14 @@ run_postgres_pgvector() {
     fi
     if [[ -z "${POSTGRES_DSN:-}" ]]; then
         createdb -U "$PGUSER" "$PGDATABASE" >/dev/null 2>&1 || true
+    fi
+    if ! postgres_psql -c "SELECT 1" >/dev/null 2>&1 || ! postgres_psql -c "CREATE EXTENSION IF NOT EXISTS vector;" >/dev/null 2>&1; then
+        if try_start_local_pgvector; then
+            :
+        else
+            emit_not_available "$engine" "pgvector_extension_unavailable"
+            return 1
+        fi
     fi
     if ! postgres_psql -c "SELECT 1" >/dev/null 2>&1; then
         emit_not_available "$engine" "postgres_connection_failed"
@@ -448,6 +616,10 @@ if (( pg_status == 0 )); then
     echo "postgres17_pgvector measured"
 elif (( pg_status == 1 )); then
     echo "postgres17_pgvector unavailable; recorded not_available"
+    if [[ "$REQUIRE_PGVECTOR" == "1" ]]; then
+        echo "VECTOR_TOPK_REQUIRE_PGVECTOR=1 requires measured PostgreSQL + pgvector artifact" >&2
+        exit 2
+    fi
 else
     exit "$pg_status"
 fi

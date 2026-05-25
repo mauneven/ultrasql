@@ -15,6 +15,7 @@ PROFILE="${AI_GAUNTLET_PROFILE:-${1:-smoke}}"
 OUT_DIR="${AI_GAUNTLET_OUT_DIR:-benchmarks/results/latest}"
 RAW_DIR="${RAW_DIR:-$OUT_DIR/raw}"
 MANIFEST="$OUT_DIR/ai_benchmark_gauntlet_manifest.json"
+REQUIRE_PGVECTOR="${AI_GAUNTLET_REQUIRE_PGVECTOR:-0}"
 
 mkdir -p "$RAW_DIR"
 
@@ -84,6 +85,7 @@ run_exact_vector_scan() {
         VECTOR_TOPK_K="$top_k" \
         N_ITERS="$iters" \
         WARMUP="$warmup" \
+        VECTOR_TOPK_REQUIRE_PGVECTOR="$REQUIRE_PGVECTOR" \
         VECTOR_TOPK_RENDER_RESULTS=0 \
         benchmarks/vector_topk_exact.sh
 }
@@ -332,7 +334,9 @@ doc = {
     "policy": (
         "AI benchmark gauntlet requires every UltraSQL suite to emit measured "
         "artifacts. Smoke profiles may record missing competitors inside child "
-        "artifacts, but UltraSQL runner gaps fail this manifest."
+        "artifacts, but UltraSQL runner gaps fail this manifest. Set "
+        "AI_GAUNTLET_REQUIRE_PGVECTOR=1 to require measured same-host "
+        "PostgreSQL+pgvector exact-vector artifacts."
     ),
 }
 pathlib.Path(manifest_path).write_text(json.dumps(doc, indent=2) + "\n", encoding="utf-8")

@@ -506,4 +506,160 @@ impl<L: PageLoader> HeapAccess<L> {
 
         Ok(total_updated)
     }
+
+    /// Point form of [`Self::update_int32_pair_inplace_undo`].
+    ///
+    /// The caller already found candidate TIDs through a secondary
+    /// index. This method rechecks MVCC visibility and the predicate
+    /// against the heap slot before mutating, so stale or invisible
+    /// index entries remain correctness-neutral.
+    #[allow(clippy::too_many_arguments)]
+    pub fn update_int32_pair_tid_inplace_undo<O, P>(
+        &self,
+        tid: TupleId,
+        snapshot: &Snapshot,
+        oracle: &O,
+        predicate: P,
+        target_col: u8,
+        delta: i32,
+        xid: Xid,
+        command_id: CommandId,
+        wal: Option<&dyn WalSink>,
+        vm: Option<&crate::vm::VisibilityMap>,
+    ) -> Result<usize, HeapError>
+    where
+        O: XidStatusOracle + ?Sized,
+        P: Fn(i32, i32) -> bool,
+    {
+        use crate::page::{ITEMID_SIZE, PAGE_HEADER_SIZE};
+
+        let rel = tid.page.relation;
+        let xid_bytes = xid.raw().to_le_bytes();
+        let cmd_bytes = command_id.raw().to_le_bytes();
+
+        if let Some(sink) = wal {
+            Self::maybe_emit_fpw(&self.pool, tid.page, sink, &self.last_checkpoint_lsn, xid)?;
+        }
+
+        let mut pre_image = [0_u8; 9];
+        let mut post_image = [0_u8; 9];
+
+        {
+            let guard = self.pool.get_page(tid.page)?;
+            let mut page = guard.write();
+            let bytes = page.as_bytes_mut();
+            let slot_count = {
+                let hdr = crate::page::PageHeader::decode(bytes).map_err(HeapError::Page)?;
+                hdr.slot_count()
+            };
+            if tid.slot >= slot_count {
+                return Ok(0);
+            }
+
+            let item_id_off = PAGE_HEADER_SIZE + usize::from(tid.slot) * ITEMID_SIZE;
+            let item_raw = u32::from_le_bytes([
+                bytes[item_id_off],
+                bytes[item_id_off + 1],
+                bytes[item_id_off + 2],
+                bytes[item_id_off + 3],
+            ]);
+            if item_raw & 0b11 != 1 {
+                return Ok(0);
+            }
+            let length = ((item_raw >> 2) & 0x7FFF) as usize;
+            let offset = ((item_raw >> 17) & 0x7FFF) as usize;
+            if length < TUPLE_HEADER_SIZE
+                || offset.checked_add(length).is_none_or(|e| e > bytes.len())
+            {
+                return Err(HeapError::MalformedHeader("slot shorter than header"));
+            }
+
+            let (header, _) = TupleHeader::decode(&bytes[offset..offset + TUPLE_HEADER_SIZE])
+                .ok_or(HeapError::MalformedHeader("header decode failed"))?;
+            let payload_off = offset + TUPLE_HEADER_SIZE;
+            if payload_off + 9 > offset + length {
+                return Err(HeapError::MalformedHeader(
+                    "payload shorter than (Int32, Int32)",
+                ));
+            }
+
+            let id = i32::from_le_bytes([
+                bytes[payload_off + 1],
+                bytes[payload_off + 2],
+                bytes[payload_off + 3],
+                bytes[payload_off + 4],
+            ]);
+            let val = i32::from_le_bytes([
+                bytes[payload_off + 5],
+                bytes[payload_off + 6],
+                bytes[payload_off + 7],
+                bytes[payload_off + 8],
+            ]);
+
+            match is_visible(&header, snapshot, oracle) {
+                Visibility::Visible => {}
+                Visibility::VisiblePreImage => {
+                    if predicate(id, val) {
+                        return Err(HeapError::WriteConflict(
+                            "in-place tuple has an unresolved writer",
+                        ));
+                    }
+                    return Ok(0);
+                }
+                Visibility::Invisible | Visibility::DeletedByOwn => return Ok(0),
+            }
+
+            if !predicate(id, val) {
+                return Ok(0);
+            }
+
+            let (new_id, new_val) = if target_col == 0 {
+                (id.wrapping_add(delta), val)
+            } else {
+                (id, val.wrapping_add(delta))
+            };
+
+            pre_image.copy_from_slice(&bytes[payload_off..payload_off + 9]);
+            bytes[offset + 8..offset + 16].copy_from_slice(&xid_bytes);
+            bytes[offset + 20..offset + 24].copy_from_slice(&cmd_bytes);
+            let new_infomask =
+                header.infomask.bits() | InfoMask::UPDATED | InfoMask::UPDATED_IN_PLACE;
+            bytes[offset + 24..offset + 26].copy_from_slice(&new_infomask.to_le_bytes());
+
+            let payload_u64 = ((u32::from_ne_bytes(new_val.to_ne_bytes()) as u64) << 32)
+                | u32::from_ne_bytes(new_id.to_ne_bytes()) as u64;
+            bytes[payload_off + 1..payload_off + 9].copy_from_slice(&payload_u64.to_le_bytes());
+            post_image.copy_from_slice(&bytes[payload_off..payload_off + 9]);
+        }
+
+        if let Some(sink) = wal {
+            let lsn = Self::emit_update_in_place_wal(
+                sink,
+                tid,
+                xid,
+                command_id,
+                &pre_image,
+                &post_image,
+            )?;
+            Self::stamp_page_lsn(&self.pool, tid.page, lsn)?;
+        }
+        if let Some(vm) = vm {
+            vm.clear(tid.page.relation, tid.page.block);
+        }
+
+        let log_handle = self
+            .undo_log
+            .entry(rel)
+            .or_insert_with(|| parking_lot::RwLock::new(UndoRelationLog::default()));
+        let mut log = log_handle.write();
+        log.entries.push(UndoEntry {
+            tid,
+            writer_xid: xid,
+            old_payload: pre_image,
+        });
+        drop(log);
+
+        self.column_cache.bump_version(rel);
+        Ok(1)
+    }
 }

@@ -207,6 +207,34 @@ behavior, not millions of VALUES parses. Set
 `ULTRASQL_TPCH_LOAD_METHOD=insert` only when bisecting the older
 INSERT-based path.
 
+### TPC-H SF1 PostgreSQL Certification
+
+TPC-H SF1 against PostgreSQL 17 must be certified by the committed
+same-host runner:
+
+```text
+POSTGRES_DSN="host=127.0.0.1 port=55417 user=postgres dbname=postgres" \
+TPCH_PSQL=/opt/homebrew/opt/postgresql@17/bin/psql \
+TPCH_DATA_DIR=tpch-dbgen \
+TPCH_RUNS=1 \
+TPCH_WARMUP=0 \
+benchmarks/tpch_sf1_postgres_certify.sh
+```
+
+The runner refuses partial query sets, loads PostgreSQL from real SF1
+`.tbl` files, applies a disclosed PostgreSQL physical design, disables
+per-table autovacuum during timed queries, runs `ANALYZE`, then writes
+raw q1..q22 artifacts under `benchmarks/results/latest/raw/`.
+Certification passes only when
+`benchmarks/results/latest/tpch_sf1_postgres_certification.json` reports
+all 22 PostgreSQL and UltraSQL timings and UltraSQL's geometric mean is
+at most half PostgreSQL 17's geometric mean.
+
+Latest local evidence: passed. PostgreSQL 17 geometric mean was
+195.8068411679629 ms, UltraSQL geometric mean was
+0.5577649211787137 ms, for a 351.05621334910796x UltraSQL/PostgreSQL
+throughput ratio.
+
 ### TPC-H SF10 Certification
 
 TPC-H SF10 must be certified by the committed runner, not by manual
@@ -443,6 +471,22 @@ local smoke versus publishable runs. Raw artifacts land in
 `benchmarks/results/latest/raw/` with an `answer` field containing the
 exact top-k id checksum.
 
+The strict same-host PostgreSQL + pgvector certification gate is:
+
+```text
+POSTGRES_DSN="host=localhost user=postgres dbname=vector_pg" \
+benchmarks/ai_vector_pgvector_certify.sh
+```
+
+This wrapper runs `benchmarks/vector_topk_exact.sh` with
+`VECTOR_TOPK_REQUIRE_PGVECTOR=1`, then fails unless both UltraSQL and
+`postgres17_pgvector` raw artifacts are `status: "measured"`, share the same
+host descriptor, workload shape, and exact answer checksum. It writes
+`benchmarks/results/latest/ai_vector_pgvector_certification.json`. When no
+`POSTGRES_DSN` is set, `VECTOR_TOPK_AUTO_PGVECTOR=1` may start a local
+`pgvector/pgvector:pg17` Docker container; missing Docker or missing pgvector
+records `unavailable`, not a benchmark claim.
+
 ### HNSW ANN Vector
 
 Runtime HNSW approximate nearest-neighbor artifacts are recorded by:
@@ -536,6 +580,12 @@ POSTGRES_DSN="host=localhost user=postgres dbname=tpcb_pg" \
 benchmarks/tpcb_certify.sh
 ```
 
+The workload follows the pgbench TPC-B transaction shape: one Simple Query
+batch per transaction containing `BEGIN`, account update, account balance
+read, teller update, branch update, history insert, and `COMMIT`. The reset
+phase creates unique B-tree indexes on `bid`, `tid`, and `aid` so point-key
+updates exercise the same key contract PostgreSQL's pgbench tables rely on.
+
 When `POSTGRES_DSN` and `POSTGRES_TPCB_RESULT` are absent, the script tries
 to start local Docker `postgres:17` automatically through
 `TPCB_AUTO_POSTGRES=1` (default), container `ultrasql-postgres-tpcb`, and port
@@ -567,18 +617,22 @@ balance invariants but is not certification.
 
 ### TPC-C Certification
 
-TPC-C certification is tracked by:
+TPC-C certification is recorded by:
 
 ```text
+POSTGRES_DSN="host=127.0.0.1 port=55417 user=postgres dbname=postgres" \
 benchmarks/tpcc_certify.sh
 ```
 
-Today this script writes
-`benchmarks/results/latest/tpcc_certification.json` with
-`passed: false` and `reason: "runner_not_implemented"`, then exits with
-code 2. That makes nightly/full benchmark manifests honest: TPC-C is visible
-in the certification matrix, but no TPC-C performance claim exists until the
-five transaction types and concurrent durable wire runner are implemented.
+The runner drives NewOrder, Payment, OrderStatus, Delivery, and StockLevel
+through concurrent PostgreSQL-wire sessions against both UltraSQL and
+PostgreSQL 17. It writes raw artifacts under
+`benchmarks/results/latest/raw/` and an aggregate
+`benchmarks/results/latest/tpcc_certification.json`. The summary passes only
+when both engines report correctness for all five transaction families and
+UltraSQL throughput is at least 2x PostgreSQL. The current artifact is an
+honest failure: the five transaction families are correct for both engines,
+but the throughput target remains open.
 
 ### Sysbench-Style OLTP
 
@@ -618,7 +672,7 @@ certification attempts:
 ```text
 benchmarks/certify.sh smoke
 benchmarks/certify.sh full
-benchmarks/certify.sh full tpch,clickbench,vector-ann,ai-gauntlet,csv-gauntlet,object-parquet-range,late-materialization,firebolt-aggregate,firebolt-sparse-pruning,firebolt-vector
+benchmarks/certify.sh full tpch,clickbench,vector-ann,ai-vector-pgvector,ai-gauntlet,csv-gauntlet,object-parquet-range,late-materialization,firebolt-aggregate,firebolt-sparse-pruning,firebolt-vector
 ```
 
 Smoke profile:
@@ -629,7 +683,8 @@ Smoke profile:
 
 Full profile:
 - attempts TPC-H SF10, ClickBench, TPC-B, TPC-C, sysbench-style OLTP,
-  exact vector top-k, HNSW ANN vector search, the AI benchmark gauntlet,
+  exact vector top-k, same-host pgvector exact-vector certification,
+  HNSW ANN vector search, the AI benchmark gauntlet,
   the CSV benchmark gauntlet, object Parquet range smoke, late-materialization
   smoke, and Firebolt aggregate/sparse-pruning/vector runners;
 - writes `benchmarks/results/latest/benchmark_certification_manifest.json`;

@@ -3456,7 +3456,9 @@ fn encode_direct_value(
     column_idx: usize,
     out: &mut Vec<u8>,
 ) -> Result<()> {
-    use ultrasql_core::{DataType, Value};
+    use std::borrow::Cow;
+
+    use ultrasql_core::{DataType, Value, coerce_bpchar_text};
 
     match dtype {
         DataType::Bool => out.push(u8::from(parse_direct_bool(raw, column_idx)?)),
@@ -3498,8 +3500,16 @@ fn encode_direct_value(
         DataType::Date => {
             out.extend_from_slice(&parse_direct_date(raw, column_idx)?.to_le_bytes());
         }
-        DataType::Text { .. } => {
-            let bytes = raw.as_bytes();
+        DataType::Text { .. } | DataType::Char { .. } => {
+            let text = match dtype {
+                DataType::Text { .. } => Cow::Borrowed(raw),
+                DataType::Char { len } => Cow::Owned(
+                    coerce_bpchar_text(raw, *len, false)
+                        .with_context(|| format!("column {column_idx}: coerce CHAR `{raw}`"))?,
+                ),
+                _ => unreachable!("textlike branch only matches Text or Char"),
+            };
+            let bytes = text.as_bytes();
             let len = u32::try_from(bytes.len())
                 .with_context(|| format!("column {column_idx}: text too large"))?;
             out.extend_from_slice(&len.to_le_bytes());
@@ -4666,6 +4676,24 @@ mod tests {
         assert_eq!(row[8], Value::Text("N".to_owned()));
         assert_eq!(row[10], Value::Date(-487));
         assert_eq!(row[15], Value::Text("comment".to_owned()));
+    }
+
+    #[cfg(feature = "sql-bench")]
+    #[test]
+    fn direct_char_encoder_round_trips_padded_bpchar() {
+        use ultrasql_core::{DataType, Field, Schema, Value};
+        use ultrasql_executor::RowCodec;
+
+        let schema = Schema::new([
+            Field::required("r_name", DataType::Char { len: Some(4) }),
+            Field::required("r_comment", DataType::Text { max_len: None }),
+        ])
+        .expect("char schema");
+        let payload = encode_direct_tbl_row(&schema, "EU|comment").expect("direct encode");
+        let row = RowCodec::new(schema).decode(&payload).expect("row decode");
+
+        assert_eq!(row[0], Value::Char("EU  ".to_owned()));
+        assert_eq!(row[1], Value::Text("comment".to_owned()));
     }
 
     #[cfg(feature = "sql-bench")]

@@ -1,0 +1,37 @@
+{
+  "engine": "ultrasql",
+  "workload": "tpcc_5types",
+  "warehouses": 1,
+  "districts": 10,
+  "customers_per_district": 30,
+  "items": 100,
+  "initial_orders_per_district": 300,
+  "order_lines": 5,
+  "connections": 32,
+  "warmup_secs": 0,
+  "duration_secs": 3,
+  "transactions": 14,
+  "transaction_counts": {
+    "new_order": 4,
+    "payment": 4,
+    "order_status": 1,
+    "delivery": 2,
+    "stock_level": 3
+  },
+  "throughput_per_sec": 4.661215698085378,
+  "p50_latency_us": 2637.5,
+  "p99_latency_us": 10635.917,
+  "correctness": {
+    "passed": true,
+    "all_five_transaction_types": true,
+    "history_row_count": 4,
+    "history_amount_sum": 9046,
+    "warehouse_ytd_sum": 9046,
+    "district_ytd_sum": 9046,
+    "customer_ytd_payment_sum": 9046,
+    "orders_row_count": 3004,
+    "new_order_row_count": 3002,
+    "order_line_row_count": 15020,
+    "low_stock_row_count": 0
+  }
+}

@@ -132,6 +132,372 @@ async fn begin_insert_insert_commit_persists_both_rows() {
     shutdown(client, server_handle).await;
 }
 
+/// A transaction may update multiple rows in one relation. This is the
+/// shape TPC-C NewOrder uses when it decrements several stock rows.
+#[tokio::test]
+async fn begin_updates_two_rows_same_table_commits() {
+    let (client, _conn_handle, server_handle) = start_server_and_connect().await;
+
+    client
+        .batch_execute(
+            "CREATE TABLE multi_update (id INT NOT NULL, qty INT NOT NULL, ytd INT NOT NULL, cnt INT NOT NULL);\
+             INSERT INTO multi_update VALUES (1, 10, 0, 0), (2, 20, 0, 0);\
+             CREATE INDEX multi_update_id_idx ON multi_update (id)",
+        )
+        .await
+        .expect("seed table");
+
+    tokio::time::timeout(
+        Duration::from_secs(2),
+        client.batch_execute(
+            "BEGIN;\
+             UPDATE multi_update SET qty = qty - 1, ytd = ytd + 1, cnt = cnt + 1 WHERE id = 1;\
+             UPDATE multi_update SET qty = qty - 1, ytd = ytd + 1, cnt = cnt + 1 WHERE id = 2;\
+             COMMIT",
+        ),
+    )
+    .await
+    .expect("multi-row transaction should not hang")
+    .expect("multi-row transaction should commit");
+
+    let row = client
+        .query_one("SELECT SUM(qty), SUM(ytd), SUM(cnt) FROM multi_update", &[])
+        .await
+        .expect("sum query");
+    assert_eq!(row.get::<_, i64>(0), 28);
+    assert_eq!(row.get::<_, i64>(1), 2);
+    assert_eq!(row.get::<_, i64>(2), 2);
+
+    shutdown(client, server_handle).await;
+}
+
+/// TPC-C NewOrder updates district/customer rows before inserting order rows.
+#[tokio::test]
+async fn begin_update_then_insert_other_table_commits() {
+    let (client, _conn_handle, server_handle) = start_server_and_connect().await;
+
+    client
+        .batch_execute(
+            "CREATE TABLE update_before_insert_a (id INT NOT NULL, v INT NOT NULL);\
+             CREATE TABLE update_before_insert_b (id INT NOT NULL, v INT NOT NULL);\
+             CREATE TABLE update_before_insert_c (id INT NOT NULL, v INT NOT NULL);\
+             INSERT INTO update_before_insert_a VALUES (1, 10);\
+             INSERT INTO update_before_insert_b VALUES (1, 20);\
+             CREATE INDEX update_before_insert_c_id_idx ON update_before_insert_c (id)",
+        )
+        .await
+        .expect("seed tables");
+
+    tokio::time::timeout(
+        Duration::from_secs(2),
+        client.batch_execute(
+            "BEGIN;\
+             UPDATE update_before_insert_a SET v = v + 1 WHERE id = 1;\
+             UPDATE update_before_insert_b SET v = v + 1 WHERE id = 1;\
+             INSERT INTO update_before_insert_c VALUES (1, 30);\
+             COMMIT",
+        ),
+    )
+    .await
+    .expect("update-then-insert transaction should not hang")
+    .expect("update-then-insert transaction should commit");
+
+    let row = client
+        .query_one("SELECT COUNT(*) FROM update_before_insert_c", &[])
+        .await
+        .expect("count query");
+    assert_eq!(row.get::<_, i64>(0), 1);
+
+    shutdown(client, server_handle).await;
+}
+
+#[tokio::test]
+async fn separate_simple_queries_update_then_insert_in_transaction_commit() {
+    let (client, _conn_handle, server_handle) = start_server_and_connect().await;
+
+    client
+        .batch_execute(
+            "CREATE TABLE separate_update_a (id INT NOT NULL, v INT NOT NULL);\
+             CREATE TABLE separate_update_b (id INT NOT NULL, v INT NOT NULL);\
+             CREATE TABLE separate_insert_c (id INT NOT NULL, v INT NOT NULL);\
+             INSERT INTO separate_update_a VALUES (1, 10);\
+             INSERT INTO separate_update_b VALUES (1, 20);\
+             CREATE INDEX separate_insert_c_id_idx ON separate_insert_c (id)",
+        )
+        .await
+        .expect("seed tables");
+
+    client.batch_execute("BEGIN").await.expect("begin");
+    client
+        .batch_execute("UPDATE separate_update_a SET v = v + 1 WHERE id = 1")
+        .await
+        .expect("update a");
+    client
+        .batch_execute("UPDATE separate_update_b SET v = v + 1 WHERE id = 1")
+        .await
+        .expect("update b");
+    tokio::time::timeout(
+        Duration::from_secs(2),
+        client.batch_execute("INSERT INTO separate_insert_c VALUES (1, 30)"),
+    )
+    .await
+    .expect("separate insert should not hang")
+    .expect("separate insert should execute");
+    client.batch_execute("COMMIT").await.expect("commit");
+
+    let row = client
+        .query_one("SELECT COUNT(*) FROM separate_insert_c", &[])
+        .await
+        .expect("count query");
+    assert_eq!(row.get::<_, i64>(0), 1);
+
+    shutdown(client, server_handle).await;
+}
+
+#[tokio::test]
+async fn insert_duplicate_key_into_non_unique_index_commits() {
+    let (client, _conn_handle, server_handle) = start_server_and_connect().await;
+
+    client
+        .batch_execute(
+            "CREATE TABLE non_unique_index_insert (id INT NOT NULL, v INT NOT NULL);\
+             CREATE INDEX non_unique_index_insert_id_idx ON non_unique_index_insert (id);\
+             INSERT INTO non_unique_index_insert VALUES (1, 10)",
+        )
+        .await
+        .expect("seed indexed table");
+
+    tokio::time::timeout(
+        Duration::from_secs(2),
+        client.batch_execute("INSERT INTO non_unique_index_insert VALUES (1, 20)"),
+    )
+    .await
+    .expect("duplicate non-unique index insert should not hang")
+    .expect("duplicate non-unique index insert should commit");
+
+    let row = client
+        .query_one("SELECT COUNT(*) FROM non_unique_index_insert", &[])
+        .await
+        .expect("count query");
+    assert_eq!(row.get::<_, i64>(0), 2);
+
+    shutdown(client, server_handle).await;
+}
+
+#[tokio::test]
+async fn repeated_insert_into_indexed_table_after_commit_does_not_hang() {
+    let (client, _conn_handle, server_handle) = start_server_and_connect().await;
+
+    client
+        .batch_execute(
+            "CREATE TABLE repeated_index_insert (id INT NOT NULL, district INT NOT NULL, v INT NOT NULL);\
+             INSERT INTO repeated_index_insert VALUES (1, 1, 10), (1, 2, 20);\
+             CREATE INDEX repeated_index_insert_id_idx ON repeated_index_insert (id)",
+        )
+        .await
+        .expect("seed indexed table");
+
+    tokio::time::timeout(
+        Duration::from_secs(2),
+        client.batch_execute(
+            "BEGIN;\
+             INSERT INTO repeated_index_insert VALUES (2, 1, 30);\
+             COMMIT;\
+             BEGIN;\
+             INSERT INTO repeated_index_insert VALUES (2, 2, 40);\
+             COMMIT",
+        ),
+    )
+    .await
+    .expect("repeated indexed inserts should not hang")
+    .expect("repeated indexed inserts should commit");
+
+    let row = client
+        .query_one("SELECT COUNT(*) FROM repeated_index_insert", &[])
+        .await
+        .expect("count query");
+    assert_eq!(row.get::<_, i64>(0), 4);
+
+    shutdown(client, server_handle).await;
+}
+
+#[tokio::test]
+async fn sequential_new_keys_into_non_unique_index_after_build_do_not_hang() {
+    let (client, _conn_handle, server_handle) = start_server_and_connect().await;
+
+    client
+        .batch_execute(
+            "CREATE TABLE sequential_index_insert (id INT NOT NULL, d INT NOT NULL, v INT NOT NULL);\
+             INSERT INTO sequential_index_insert VALUES (1, 1, 10), (2, 1, 20), (3, 1, 30), (4, 1, 40), (5, 1, 50);\
+             CREATE INDEX sequential_index_insert_id_idx ON sequential_index_insert (id)",
+        )
+        .await
+        .expect("seed indexed table");
+
+    tokio::time::timeout(
+        Duration::from_secs(2),
+        client.batch_execute(
+            "BEGIN;\
+             INSERT INTO sequential_index_insert VALUES (6, 1, 60);\
+             COMMIT;\
+             BEGIN;\
+             INSERT INTO sequential_index_insert VALUES (7, 1, 70);\
+             COMMIT",
+        ),
+    )
+    .await
+    .expect("sequential indexed inserts should not hang")
+    .expect("sequential indexed inserts should commit");
+
+    let row = client
+        .query_one("SELECT COUNT(*) FROM sequential_index_insert", &[])
+        .await
+        .expect("count query");
+    assert_eq!(row.get::<_, i64>(0), 7);
+
+    shutdown(client, server_handle).await;
+}
+
+#[tokio::test]
+async fn insert_after_dense_duplicate_index_build_does_not_hang() {
+    let (client, _conn_handle, server_handle) = start_server_and_connect().await;
+
+    client
+        .batch_execute(
+            "CREATE TABLE dense_duplicate_index_insert (id INT NOT NULL, d INT NOT NULL, v INT NOT NULL);\
+             INSERT INTO dense_duplicate_index_insert VALUES \
+             (1, 1, 10), (2, 1, 20), (3, 1, 30), (4, 1, 40), (5, 1, 50),\
+             (1, 2, 10), (2, 2, 20), (3, 2, 30), (4, 2, 40), (5, 2, 50),\
+             (1, 3, 10), (2, 3, 20), (3, 3, 30), (4, 3, 40), (5, 3, 50),\
+             (1, 4, 10), (2, 4, 20), (3, 4, 30), (4, 4, 40), (5, 4, 50),\
+             (1, 5, 10), (2, 5, 20), (3, 5, 30), (4, 5, 40), (5, 5, 50),\
+             (1, 6, 10), (2, 6, 20), (3, 6, 30), (4, 6, 40), (5, 6, 50),\
+             (1, 7, 10), (2, 7, 20), (3, 7, 30), (4, 7, 40), (5, 7, 50),\
+             (1, 8, 10), (2, 8, 20), (3, 8, 30), (4, 8, 40), (5, 8, 50),\
+             (1, 9, 10), (2, 9, 20), (3, 9, 30), (4, 9, 40), (5, 9, 50),\
+             (1, 10, 10), (2, 10, 20), (3, 10, 30), (4, 10, 40), (5, 10, 50);\
+             CREATE INDEX dense_duplicate_index_insert_id_idx ON dense_duplicate_index_insert (id)",
+        )
+        .await
+        .expect("seed indexed table");
+
+    tokio::time::timeout(
+        Duration::from_secs(2),
+        client.batch_execute(
+            "BEGIN;\
+             INSERT INTO dense_duplicate_index_insert VALUES (6, 8, 60);\
+             COMMIT;\
+             BEGIN;\
+             INSERT INTO dense_duplicate_index_insert VALUES (7, 8, 70);\
+             COMMIT",
+        ),
+    )
+    .await
+    .expect("dense duplicate indexed inserts should not hang")
+    .expect("dense duplicate indexed inserts should commit");
+
+    let row = client
+        .query_one("SELECT COUNT(*) FROM dense_duplicate_index_insert", &[])
+        .await
+        .expect("count query");
+    assert_eq!(row.get::<_, i64>(0), 52);
+
+    shutdown(client, server_handle).await;
+}
+
+#[tokio::test]
+async fn two_tpcc_shaped_new_order_transactions_do_not_hang() {
+    let (client, _conn_handle, server_handle) = start_server_and_connect().await;
+
+    client
+        .batch_execute(
+            "CREATE TABLE tpcc_district_smoke (d_w_id INT NOT NULL, d_id INT NOT NULL, d_next_o_id INT NOT NULL);\
+             CREATE TABLE tpcc_customer_smoke (c_w_id INT NOT NULL, c_d_id INT NOT NULL, c_id INT NOT NULL, c_last_order_id INT NOT NULL);\
+             CREATE TABLE tpcc_orders_smoke (o_w_id INT NOT NULL, o_d_id INT NOT NULL, o_id INT NOT NULL, o_c_id INT NOT NULL, o_carrier_id INT NOT NULL, o_entry_d INT NOT NULL);\
+             CREATE TABLE tpcc_new_order_smoke (no_w_id INT NOT NULL, no_d_id INT NOT NULL, no_o_id INT NOT NULL);\
+             CREATE TABLE tpcc_stock_smoke (s_w_id INT NOT NULL, s_i_id INT NOT NULL, s_quantity INT NOT NULL, s_ytd INT NOT NULL, s_order_cnt INT NOT NULL);\
+             CREATE TABLE tpcc_order_line_smoke (ol_w_id INT NOT NULL, ol_d_id INT NOT NULL, ol_o_id INT NOT NULL, ol_number INT NOT NULL, ol_i_id INT NOT NULL, ol_quantity INT NOT NULL, ol_amount INT NOT NULL);\
+             INSERT INTO tpcc_district_smoke VALUES (1, 8, 6);\
+             INSERT INTO tpcc_customer_smoke VALUES (1, 8, 4, 0);\
+             INSERT INTO tpcc_orders_smoke VALUES (1, 8, 1, 1, 0, 1), (1, 8, 2, 2, 0, 2), (1, 8, 3, 3, 0, 3), (1, 8, 4, 4, 0, 4), (1, 8, 5, 5, 0, 5);\
+             INSERT INTO tpcc_stock_smoke VALUES (1, 12, 100, 0, 0), (1, 13, 100, 0, 0), (1, 15, 100, 0, 0), (1, 16, 100, 0, 0), (1, 20, 100, 0, 0);\
+             CREATE INDEX tpcc_orders_smoke_oid_idx ON tpcc_orders_smoke (o_id);\
+             CREATE INDEX tpcc_stock_smoke_iid_idx ON tpcc_stock_smoke (s_i_id)",
+        )
+        .await
+        .expect("seed TPC-C smoke tables");
+
+    tokio::time::timeout(
+        Duration::from_secs(2),
+        client.batch_execute(
+            "BEGIN;\
+             UPDATE tpcc_district_smoke SET d_next_o_id = d_next_o_id + 1 WHERE d_w_id = 1 AND d_id = 8;\
+             UPDATE tpcc_customer_smoke SET c_last_order_id = 6 WHERE c_w_id = 1 AND c_d_id = 8 AND c_id = 4;\
+             INSERT INTO tpcc_orders_smoke (o_w_id, o_d_id, o_id, o_c_id, o_carrier_id, o_entry_d) VALUES (1, 8, 6, 4, 0, 6);\
+             INSERT INTO tpcc_new_order_smoke (no_w_id, no_d_id, no_o_id) VALUES (1, 8, 6);\
+             UPDATE tpcc_stock_smoke SET s_quantity = s_quantity - 4, s_ytd = s_ytd + 4, s_order_cnt = s_order_cnt + 1 WHERE s_w_id = 1 AND s_i_id = 12;\
+             INSERT INTO tpcc_order_line_smoke VALUES (1, 8, 6, 1, 12, 4, 52);\
+             COMMIT;\
+             BEGIN;\
+             UPDATE tpcc_district_smoke SET d_next_o_id = d_next_o_id + 1 WHERE d_w_id = 1 AND d_id = 8;\
+             UPDATE tpcc_customer_smoke SET c_last_order_id = 7 WHERE c_w_id = 1 AND c_d_id = 8 AND c_id = 4;\
+             INSERT INTO tpcc_orders_smoke (o_w_id, o_d_id, o_id, o_c_id, o_carrier_id, o_entry_d) VALUES (1, 8, 7, 4, 0, 7);\
+             INSERT INTO tpcc_new_order_smoke (no_w_id, no_d_id, no_o_id) VALUES (1, 8, 7);\
+             UPDATE tpcc_stock_smoke SET s_quantity = s_quantity - 5, s_ytd = s_ytd + 5, s_order_cnt = s_order_cnt + 1 WHERE s_w_id = 1 AND s_i_id = 15;\
+             INSERT INTO tpcc_order_line_smoke VALUES (1, 8, 7, 1, 15, 5, 80);\
+             COMMIT",
+        ),
+    )
+    .await
+    .expect("TPC-C shaped new order transactions should not hang")
+    .expect("TPC-C shaped new order transactions should commit");
+
+    let row = client
+        .query_one("SELECT COUNT(*) FROM tpcc_orders_smoke", &[])
+        .await
+        .expect("count query");
+    assert_eq!(row.get::<_, i64>(0), 7);
+
+    shutdown(client, server_handle).await;
+}
+
+#[tokio::test]
+async fn update_non_unique_index_with_extra_filter_then_insert_commits() {
+    let (client, _conn_handle, server_handle) = start_server_and_connect().await;
+
+    client
+        .batch_execute(
+            "CREATE TABLE indexed_filter_update (w INT NOT NULL, d INT NOT NULL, id INT NOT NULL, v INT NOT NULL);\
+             CREATE TABLE indexed_filter_sink (id INT NOT NULL, v INT NOT NULL);\
+             INSERT INTO indexed_filter_update VALUES (1, 1, 4, 10), (1, 2, 4, 20), (1, 8, 4, 30);\
+             CREATE INDEX indexed_filter_update_id_idx ON indexed_filter_update (id);\
+             CREATE INDEX indexed_filter_sink_id_idx ON indexed_filter_sink (id)",
+        )
+        .await
+        .expect("seed indexed tables");
+
+    tokio::time::timeout(
+        Duration::from_secs(2),
+        client.batch_execute(
+            "BEGIN;\
+             UPDATE indexed_filter_update SET v = v + 1 WHERE w = 1 AND d = 8 AND id = 4;\
+             INSERT INTO indexed_filter_sink VALUES (7, 70);\
+             COMMIT",
+        ),
+    )
+    .await
+    .expect("indexed filtered update then insert should not hang")
+    .expect("indexed filtered update then insert should commit");
+
+    let row = client
+        .query_one("SELECT SUM(v) FROM indexed_filter_update", &[])
+        .await
+        .expect("sum query");
+    assert_eq!(row.get::<_, i64>(0), 61);
+
+    shutdown(client, server_handle).await;
+}
+
 /// `BEGIN; INSERT; ROLLBACK;` — row not persisted.
 #[tokio::test]
 async fn begin_insert_rollback_discards_row() {

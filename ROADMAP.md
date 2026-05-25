@@ -102,7 +102,7 @@ are grounds for revert.
 | v0.5 | UPDATE 10 k rows in single statement | #1, but strict ≥ 2× not met: 128.79 µs vs DuckDB 164.21 µs = 1.27× ⚠️ | latency (µs) |
 | v0.5 | DELETE 10 k rows in single statement | ≥ 2× every competitor ✅ (115.79 µs vs SQLite 538.08 µs = 4.65×) | latency (µs) |
 | v0.6 | TPC-H scale 1 correctness (all 22 queries) | result-equal to DuckDB ✅ | `validate-results` result comparison |
-| v0.6+ | TPC-H scale 1 performance certification | ≥ 2× PostgreSQL 17 ⚠️ pending | geometric mean query time |
+| v0.6+ | TPC-H scale 1 performance certification | ≥ 2× PostgreSQL 17 ✅ latest local artifact passed; 351.06× vs PostgreSQL 17 across q1..q22 | geometric mean query time |
 | v0.7 | TPC-H scale 10 (all 22 queries) | ≥ 2× DuckDB ✅ latest local artifact status passed; 22/22 DuckDB and UltraSQL query timings in `benchmarks/results/latest/tpch_sf10_certification.json` | geometric mean query time |
 | v0.7 | ClickBench (`hits.parquet` analytical queries) | ≥ 5× faster than PostgreSQL 17 ⚠️ not certified; runner records missing dataset/DSN failures and includes a local Firebolt Core Parquet leg; local Core smoke-subset artifact measured at 100k rows, full dataset load timed out on 16 GiB Colima host | geometric mean query time |
 | v0.9 | TPC-B (OLTP, 32 connections) | ≥ 2× PostgreSQL 17, p99 < 5 ms | throughput + latency |
@@ -2010,12 +2010,15 @@ mismatch, and wire-visible round trips. HNSW and IVFFlat indexes exist behind
 index objects in the SQL path, and have restart round trips that verify
 `EXPLAIN ANALYZE` still selects `page-backed hnsw` / `page-backed ivfflat`
 after server restart. Remaining durability work is larger-scale recovery
-certification, broader fuzz/property coverage, vacuum/rebuild stress, and
-public performance artifacts across build/search/update/delete/restart
+certification, page-level torn-write handling, deeper vacuum/rebuild stress,
+and public performance artifacts across build/search/update/delete/restart
 workloads. Crash-during-build SQL tests now cover HNSW and IVFFlat exact-scan
-fallback after truncated index-build WAL, and corrupt vector-index WAL replay
-marks the affected ANN index unavailable instead of blocking restart or
-returning wrong results. ANN delete/VACUUM and update cert tests now cover
+fallback after truncated and torn index-build WAL, corrupt vector-index WAL
+replay marks the affected ANN index unavailable instead of blocking restart or
+returning wrong results, and crash/restart rebuild tests replay post-index
+insert/update/delete/VACUUM WAL before requiring page-backed index selection.
+Typed WAL payload property tests fuzz HNSW and IVFFlat codec round trips and
+random-byte decode paths. ANN delete/VACUUM and update cert tests now cover
 both HNSW and IVFFlat, filtered vector top-k advertises exact fallback when
 the LIMIT can be satisfied from visible rows, and `EXPLAIN ANALYZE` reports
 ANN method, candidate/rerank counts, fallback state, recall mode, and skipped
@@ -2032,10 +2035,10 @@ same host.
 | Feature | Parser | Binder | Executor | Storage | WAL/recovery | Wire | Tests | Benchmark artifact |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- |
 | `vector(n)` / `halfvec(n)` / `sparsevec` / `bitvec` values | ✅ typed literals, casts, `CREATE TABLE` | ✅ dimension/type checks | ✅ eval + row flow | ✅ catalog + row codec | ⚠️ heap row path only; restart certification still open | ✅ text output | ✅ parser/core/server round trips | ⚠️ exact top-k smoke exists; full cert open |
-| pgvector distance ops and functions | ✅ `<->`, `<#>`, `<=>`, `<+>` | ✅ unsupported vector comparisons fail explicitly | ✅ L2, cosine, inner product/dot, L1, norm, dims | n/a | n/a | ✅ result values | ✅ scalar/runtime tests | ⚠️ exact top-k artifacts only |
-| Exact vector top-k | n/a | ⚠️ shape recognized through `ORDER BY distance LIMIT` | ⚠️ top-k path exists; full-sort avoidance hardening open | n/a | n/a | n/a | ✅ server round trips | ⚠️ `vector_topk_exact` smoke, full pgvector cert open |
-| Page-backed HNSW | ✅ `CREATE INDEX USING hnsw` | ✅ vector opclasses checked | ✅ planner selects page-backed HNSW; exact/filter fallback path | ✅ page-backed graph relation with meta/node/overflow/free-list pages | ⚠️ restart + crash/corrupt-WAL tests and HNSW WAL fuzz exist; large-scale recovery certification plus torn-write/rebuild cert open | n/a | ✅ insert/update/delete/vacuum, SQL restart, crash, corrupt-WAL, EXPLAIN tests | ⚠️ HNSW recall/latency smoke exists; larger recall/latency artifacts open |
-| Page-backed IVFFlat | ✅ `CREATE INDEX USING ivfflat` | ✅ `lists`/`probes` checked | ✅ planner selects page-backed IVFFlat; centroid/list scan + exact rerank/filter fallback | ✅ page-backed centroid/list relation with centroid/list/entry pages | ⚠️ restart + crash/corrupt-WAL tests exist; WAL replay fuzz/property tests, large-scale recovery certification, and torn-write/compaction cert open | n/a | ✅ SQL restart/crash/corrupt-WAL/delete-vacuum/update/EXPLAIN tests | ⚠️ memory accounting smoke exists; larger recall/latency artifacts open |
+| pgvector distance ops and functions | ✅ `<->`, `<#>`, `<=>`, `<+>` | ✅ unsupported vector comparisons fail explicitly | ✅ L2, cosine, inner product/dot, L1, norm, dims | n/a | n/a | ✅ result values | ✅ scalar/runtime tests | ✅ same-host exact top-k cert vs PostgreSQL + pgvector; broader function cert open |
+| Exact vector top-k | n/a | ✅ `ORDER BY distance LIMIT` recognized | ✅ bounded TopK path avoids physical Sort, applies child filters before distance, and reports exact kernel/fallback in EXPLAIN ANALYZE | n/a | n/a | n/a | ✅ executor + server round trips | ✅ same-host UltraSQL vs PostgreSQL + pgvector exact cert at 10k/8d/k10; larger profiles open |
+| Page-backed HNSW | ✅ `CREATE INDEX USING hnsw` | ✅ vector opclasses checked | ✅ planner selects page-backed HNSW; exact/filter fallback path | ✅ page-backed graph relation with meta/node/overflow/free-list pages | ⚠️ restart, crash/corrupt/torn-WAL, rebuild, and HNSW WAL fuzz certs exist; large-scale recovery and page-level torn-write cert open | n/a | ✅ insert/update/delete/vacuum, SQL restart, crash, corrupt/torn-WAL, rebuild, EXPLAIN tests | ⚠️ HNSW recall/latency smoke exists; larger recall/latency artifacts open |
+| Page-backed IVFFlat | ✅ `CREATE INDEX USING ivfflat` | ✅ `lists`/`probes` checked | ✅ planner selects page-backed IVFFlat; centroid/list scan + exact rerank/filter fallback | ✅ page-backed centroid/list relation with centroid/list/entry pages | ⚠️ restart, crash/corrupt/torn-WAL, rebuild, and IVFFlat WAL fuzz certs exist; large-scale recovery and page-level torn-write cert open | n/a | ✅ SQL restart/crash/corrupt/torn-WAL/delete-vacuum/update/rebuild/EXPLAIN tests | ⚠️ memory accounting smoke exists; larger recall/latency artifacts open |
 | RAG primitive schemas/helpers | n/a | n/a | ✅ normal SQL helpers + tenant RLS predicate injection | ✅ ordinary user tables | ⚠️ tenant RLS sidecar rehydrates after warm restart; typed catalog/WAL metadata still open | n/a | ✅ catalog/server helper tests + RLS wire + restart round trip | ⚠️ RAG quality smoke + tenant RLS tests exist; full cert open |
 | CSV table functions | ✅ `read_csv`, globs, arrays, file literals | ✅ function scan + projection/filter pushdown shapes | ⚠️ external wrapper streams child; CSV reader still stores row buffers | file/object bytes only | n/a | ✅ query results | ✅ local/object/glob/projection/filter tests | ⚠️ CSV gauntlet smoke measured for UltraSQL/DuckDB; ClickHouse unavailable locally; full cert open |
 | Parquet table functions | ✅ `read_parquet`, globs, file literals | ✅ projection/predicate pushdown shapes | ✅ row-group workers yield batches lazily; no upfront full-file batch buffer | ✅ local files plus object range footer/column reads | n/a | ✅ query results | ✅ projection/filter/object-range/row-group-worker/EXPLAIN tests | ⚠️ UltraSQL arena smoke measured; cross-engine cert open |
@@ -2052,12 +2055,18 @@ same host.
   operators `<->`, `<#>`, `<=>`, `<+>` and functions `l2_distance`,
   `cosine_distance`, `inner_product`, `dot_product`, `l1_distance`,
   `vector_norm`/`l2_norm`, and `vector_dims` exist with scalar/SIMD kernels.
+  Same-host exact top-k certification against PostgreSQL + pgvector now exists.
   Remaining work: arithmetic operators, aggregates like `avg(vector)`, and
-  certification against pgvector.
-- [ ] **Exact vector top-k hardening** — ensure `ORDER BY embedding <op>
-  probe LIMIT k` always avoids a full sort, applies scalar filters before
-  distance work, exposes the chosen kernel/index/fallback in `EXPLAIN
-  ANALYZE`, and has raw artifacts for filtered and unfiltered exact search.
+  broader pgvector function/cast certification.
+- [x] **Exact vector top-k hardening** — `ORDER BY embedding <op> probe
+  LIMIT k` lowers to the bounded `TopK` path after ANN/index attempts miss,
+  so exact fallback avoids a physical Sort and keeps scalar filters in the
+  child plan before distance work. `EXPLAIN ANALYZE` reports
+  `exact_top_k_f32`, `full_sort=false`, and exact/index fallback state.
+  `benchmarks/ai_vector_pgvector_certify.sh` now gates same-host UltraSQL vs
+  PostgreSQL + pgvector exact top-k artifacts and the latest 10k/8d/k10 raw
+  artifact passes with equal answer checksum. Remaining: expand raw benchmark
+  artifacts for filtered exact search and larger pgvector profiles.
 - [x] **Runtime ANN slice** — HNSW and IVFFlat SQL surfaces, earlier
   in-memory access methods, DML maintenance, tombstones, VACUUM compaction,
   opclasses, and exact rerank paths exist. This slice now has a page-backed
@@ -2067,10 +2076,13 @@ same host.
   are wired through SQL, survive server restart, and report page-backed index
   selection in `EXPLAIN ANALYZE`.
 - [ ] **Production ANN certification slice** — harden page-backed HNSW and
-  IVFFlat with large-scale crash/restart recovery certification, WAL replay
-  fuzz/property tests, torn-write/corruption handling, VACUUM/rebuild stress,
-  CREATE INDEX CONCURRENTLY behavior, filtered-query fallback/iterative scan
-  policy, and recall-vs-latency artifacts against exact scan.
+  IVFFlat with large-scale crash/restart recovery certification, page-level
+  torn-write handling, deeper VACUUM/rebuild stress, CREATE INDEX
+  CONCURRENTLY behavior, filtered-query fallback/iterative scan policy, and
+  recall-vs-latency artifacts against exact scan. Local cert now covers
+  crash-during-build WAL truncation, torn ANN WAL tails, corrupt-WAL
+  unavailable fallback, crash/restart DML rebuild, and HNSW/IVFFlat typed WAL
+  payload fuzz/property tests, including WAL replay fuzz/property tests.
 - [x] **RAG tenant RLS slice, narrow predicate** — `CREATE POLICY`,
   `ALTER TABLE ... ENABLE ROW LEVEL SECURITY`, `SET ultrasql.tenant_id`, read
   predicate injection, command-specific policies, permissive/restrictive
@@ -2091,11 +2103,16 @@ same host.
   artifacts for IVFFlat recall/latency, larger bulk loads, index
   build/update/delete maintenance, WAL recovery, and larger hybrid RAG query
   shapes.
-  Certification must compare UltraSQL against PostgreSQL + pgvector on the
-  same host and report recall@k, p50/p95/p99 latency, throughput, index size,
-  build time, memory, and restart correctness. No v1.0 vector claim is allowed
-  without committed scripts, datasets or dataset fetch instructions, host
-  descriptor, and raw artifacts.
+  Same-host exact top-k certification now compares UltraSQL against
+  PostgreSQL + pgvector through `benchmarks/ai_vector_pgvector_certify.sh` and
+  records `benchmarks/results/latest/ai_vector_pgvector_certification.json`
+  with recall@k, p50/p95/p99 latency, derived throughput, build time,
+  memory/index-size status, host descriptor, and answer checksum. Remaining:
+  IVFFlat recall/latency, larger bulk loads, index build/update/delete
+  maintenance, WAL recovery, larger hybrid RAG query shapes, and SQL-level
+  pgvector HNSW/restart correctness. No v1.0 vector claim is allowed without
+  committed scripts, datasets or dataset fetch instructions, host descriptor,
+  and raw artifacts.
 
 ### Security
 - [x] `CREATE ROLE / USER`, `ALTER ROLE`, `DROP ROLE` — in-memory role catalog plus `pg_roles` / `pg_user` visibility.
@@ -2140,11 +2157,30 @@ same host.
   manager-level Hermitage matrix). Full PostgreSQL `src/test/isolation`
   isolationtester schedule remains open because current SSI is relation-level
   SSI, not predicate-precise PostgreSQL SSI.
-- [ ] Index tests pass
+- [x] Index regression baseline passes: curated SQLLogicTest shard derived from
+  `create_index.sql` covers `CREATE INDEX`, `CREATE UNIQUE INDEX`, indexed
+  equality/range reads, and unique violation behavior. Full upstream
+  `create_index.sql` remains open for opclasses, comments, GiST/GIN/SP-GiST,
+  expression breadth, partitioned indexes, and planner GUC permutations.
 - [ ] Aggregate and window function tests pass
-- [ ] Constraint tests pass
-- [ ] Operator tests pass
-- [ ] Type-specific tests (numeric, text, date/time, json, arrays, etc.)
+- [x] Constraint regression baseline passes: curated SQLLogicTest shard derived
+  from `constraints.sql` covers `PRIMARY KEY`, `CHECK`, `NOT NULL`,
+  `REFERENCES`, duplicate-key rejection, FK rejection, and CHECK-on-UPDATE.
+  Full upstream `constraints.sql` remains open for inheritance, system-column
+  checks, richer defaults, exclusion breadth, and deferrable scheduling.
+- [x] Operator regression baseline passes: curated SQLLogicTest shard derived
+  from `create_operator.sql` and `opr_sanity.sql` covers comparison lexer/
+  evaluator surfaces (`<>`, `!=`, `<=`, `>=`, `BETWEEN`, `LIKE`) and keeps
+  user-defined operator DDL plus full catalog/operator sanity as explicit skip
+  debt.
+- [x] Type-specific regression baseline passes: curated SQLLogicTest shard
+  derived from `numeric.sql`, `text.sql`, `date.sql`, `time.sql`,
+  `timetz.sql`, `timestamp.sql`, `json.sql`, `jsonb.sql`, and `arrays.sql`
+  covers executable numeric predicates/arithmetic, text length/LIKE/
+  comparison, date/time/timetz/timestamp filters, JSONB extraction/
+  containment/path-exists, and `INT[]` `array_length`. Full upstream
+  type-specific breadth remains open for numeric overflow matrices, collation,
+  timezone abbreviations, SQL/JSON path parity, and array slices/coercions.
 
 ### Benchmark Certification
 - [x] Benchmark profile ergonomics: PR-safe smoke certification and
@@ -2163,19 +2199,20 @@ same host.
   while `HeapAccess::column_cache` supplies the OLAP shadow path.
   `columnar_storage_round_trip.rs` now covers committed DML invalidation,
   rebuild, and update/delete/insert visibility after cache rebuild.
-- [ ] TPC-B: correctness verified, throughput ≥ 2× PostgreSQL, p99 < 5 ms at 32 connections — `benchmarks/tpcb_certify.sh` now auto-starts local Docker `postgres:17` when no DSN is supplied and writes atomic raw artifacts. Latest reduced 32-connection smoke is correct for both engines, but target still fails: UltraSQL 665.99 tx/s vs PostgreSQL 419.54 tx/s (1.59×, below 2×) and UltraSQL p99 is 531.381 ms (above 5 ms), so certification remains open.
-- [ ] TPC-C: correctness verified (all 5 transaction types), throughput ≥ 2× PostgreSQL
+- [ ] TPC-B: correctness verified, throughput ≥ 2× PostgreSQL, p99 < 5 ms at 32 connections — `benchmarks/tpcb_certify.sh` now auto-starts local Docker `postgres:17` when no DSN is supplied, writes atomic raw artifacts, uses pgbench-shaped transaction batches, and builds unique key indexes on `bid`, `tid`, and `aid`. Latest same-host PostgreSQL 17 smoke (`POSTGRES_DSN=host=127.0.0.1 port=55417 user=postgres dbname=postgres`, `TPCB_DURATION=3`, `TPCB_WARMUP=1`, `TPCB_CONNECTIONS=32`) is correct for both engines, but target still fails: UltraSQL 734.02 tx/s vs PostgreSQL 11247.72 tx/s (0.065×, below 2×) and UltraSQL p99 is 136.413 ms (above 5 ms), so certification remains open.
+- [ ] TPC-C: correctness verified (all 5 transaction types), throughput ≥ 2× PostgreSQL — `benchmarks/tpcc_certify.sh` now runs NewOrder, Payment, OrderStatus, Delivery, and StockLevel through concurrent PostgreSQL-wire sessions against UltraSQL and PostgreSQL 17, writes atomic raw artifacts, and checks five-family correctness for both engines. Latest same-host reduced 32-client smoke (`POSTGRES_DSN=host=127.0.0.1 port=55417 user=postgres dbname=postgres`, `TPCC_DURATION=3`, `TPCC_WARMUP=0`, `TPCC_CONNECTIONS=32`, `TPCC_ITEMS=100`, `TPCC_CUSTOMERS_PER_DISTRICT=30`, `TPCC_INITIAL_ORDERS_PER_DISTRICT=300`) is correct for both engines, but target still fails: UltraSQL 4.66 tx/s vs PostgreSQL 301.03 tx/s (0.015×, below 2×), so certification remains open.
 - [x] TPC-H scale 1: all 22 harness queries return correct results
-- [ ] TPC-H scale 1: throughput ≥ 2× PostgreSQL 17
+- [x] TPC-H scale 1: throughput ≥ 2× PostgreSQL 17 — `benchmarks/tpch_sf1_postgres_certify.sh` now runs full q1..q22 same-host PostgreSQL 17 and UltraSQL SF1 certification with real `.tbl` data, atomic raw artifacts, disclosed PostgreSQL indexes, autovacuum disabled during timed queries, and post-load `ANALYZE`. Latest local artifact (`POSTGRES_DSN=host=127.0.0.1 port=55417 user=postgres dbname=postgres`, `TPCH_PSQL=/opt/homebrew/opt/postgresql@17/bin/psql`, `TPCH_DATA_DIR=tpch-dbgen`, `TPCH_RUNS=1`, `TPCH_WARMUP=0`) passed: UltraSQL geometric mean 0.5577649211787137 ms vs PostgreSQL 17 geometric mean 195.8068411679629 ms, 351.05621334910796× faster, all q1..q22 complete in both raw artifacts.
 - [x] TPC-H scale 10: throughput ≥ 2× DuckDB on the latest local
   artifact; rerun `benchmarks/tpch_sf10_certify.sh` on the release host
   before publishing release numbers.
 - [ ] Sysbench OLTP read/write: throughput ≥ 2× PostgreSQL
-- [ ] Vector/RAG certification: exact kNN, HNSW recall/latency, hybrid
-  text+vector retrieval, filtered vector search, RAG quality, ingestion
-  throughput, memory-per-million-vectors, and cold-start restart smoke
-  artifacts exist; IVFFlat recall/latency, larger recovery artifacts, and
-  same-host pgvector certification remain open
+- [ ] Vector/RAG certification: exact kNN same-host pgvector artifact, HNSW
+  recall/latency, hybrid text+vector retrieval, filtered vector search, RAG
+  quality, ingestion throughput, memory-per-million-vectors, and cold-start
+  restart smoke artifacts exist; IVFFlat recall/latency, larger recovery
+  artifacts, SQL-level pgvector HNSW/restart correctness, and broader
+  pgvector profiles remain open
 
 ### Production Validation
 - [ ] Three independent operators run UltraSQL for 30 days and report

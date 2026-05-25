@@ -19,6 +19,8 @@ use ultrasql_bench::registry::HostInfo;
 
 #[cfg(feature = "sql-bench")]
 mod tpcb_wire;
+#[cfg(feature = "sql-bench")]
+mod tpcc_wire;
 
 /// UltraSQL benchmark harness.
 #[derive(Debug, Parser)]
@@ -40,7 +42,7 @@ enum Command {
     VectorMemory(VectorMemoryArgs),
     /// Run a PostgreSQL-wire TPC-B-shaped benchmark.
     Tpcb(TpcbArgs),
-    /// Run a local five-transaction TPC-C-shaped kernel benchmark.
+    /// Run a PostgreSQL-wire TPC-C-shaped benchmark.
     Tpcc(TpccArgs),
 }
 
@@ -191,18 +193,40 @@ struct TpcbArgs {
     output: Option<PathBuf>,
 }
 
-/// TPC-C local kernel benchmark arguments.
+/// TPC-C benchmark arguments.
 #[derive(Clone, Debug, Args)]
 struct TpccArgs {
-    /// Artifact profile label.
-    #[arg(long, default_value = "local-kernel")]
-    profile: String,
-    /// Number of measured iterations.
-    #[arg(long, default_value_t = 5)]
-    iterations: u32,
-    /// Number of warmup iterations excluded from samples.
+    /// Engine label and launch mode.
+    #[arg(long, value_enum, default_value_t = TpccEngine::Ultrasql)]
+    engine: TpccEngine,
+    /// PostgreSQL connection string. Required for postgres17; optional
+    /// for ultrasql, which starts an in-process server when omitted.
+    #[arg(long)]
+    dsn: Option<String>,
+    /// Number of warehouses.
     #[arg(long, default_value_t = 1)]
-    warmup: u32,
+    warehouses: usize,
+    /// Override item cardinality for fast smoke runs.
+    #[arg(long)]
+    items: Option<usize>,
+    /// Override customers per district for fast smoke runs.
+    #[arg(long = "customers-per-district")]
+    customers_per_district: Option<usize>,
+    /// Override initial order backlog per district for fast smoke runs.
+    #[arg(long = "initial-orders-per-district")]
+    initial_orders_per_district: Option<usize>,
+    /// Order lines per new order.
+    #[arg(long = "order-lines", default_value_t = 5)]
+    order_lines: usize,
+    /// Warmup window in seconds.
+    #[arg(long = "warmup", default_value_t = 30)]
+    warmup_secs: u64,
+    /// Measured window in seconds.
+    #[arg(long = "duration", default_value_t = 60)]
+    duration_secs: u64,
+    /// Number of concurrent clients.
+    #[arg(long, default_value_t = 32)]
+    connections: usize,
     /// Output JSON path. Writes to stdout when omitted.
     #[arg(long)]
     output: Option<PathBuf>,
@@ -211,6 +235,16 @@ struct TpccArgs {
 /// Engine selector for TPC-B.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
 enum TpcbEngine {
+    /// Spawn and benchmark an in-process UltraSQL server unless `--dsn`
+    /// is supplied.
+    Ultrasql,
+    /// Benchmark an existing PostgreSQL 17-compatible server.
+    Postgres17,
+}
+
+/// Engine selector for TPC-C.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+enum TpccEngine {
     /// Spawn and benchmark an in-process UltraSQL server unless `--dsn`
     /// is supplied.
     Ultrasql,
@@ -324,59 +358,23 @@ fn run_vector_memory_command(args: VectorMemoryArgs) -> ExitCode {
     }
 }
 
-#[derive(Serialize)]
-struct TpccArtifact {
-    schema_version: u32,
-    workload: &'static str,
-    engine: &'static str,
-    profile: String,
-    transaction_types: [&'static str; 5],
-    iterations: u32,
-    warmup: u32,
-    host: HostInfo,
-    throughput_per_sec: f64,
-    p50_latency_us: f64,
-    p99_latency_us: f64,
-    samples: Vec<f64>,
-    certification_scope: &'static str,
-}
-
+#[cfg(feature = "sql-bench")]
 fn run_tpcc(args: TpccArgs) -> ExitCode {
-    let host = HostInfo::from_env();
-    let ctx = ultrasql_bench::registry::BenchContext {
-        iterations: args.iterations,
-        warmup_iterations: args.warmup,
-        host: host.clone(),
-    };
-    let result = ultrasql_bench::runs::tpcc::run(&ctx);
-    let artifact = TpccArtifact {
-        schema_version: 1,
-        workload: "tpcc_5types",
-        engine: "ultrasql",
-        profile: args.profile,
-        transaction_types: [
-            "NewOrder",
-            "Payment",
-            "OrderStatus",
-            "Delivery",
-            "StockLevel",
-        ],
-        iterations: args.iterations,
-        warmup: args.warmup,
-        host,
-        throughput_per_sec: result.throughput_per_sec,
-        p50_latency_us: result.p50_latency_us,
-        p99_latency_us: result.p99_latency_us,
-        samples: result.samples,
-        certification_scope: "local_kernel_not_wire_certification",
-    };
-    match write_artifact("tpcc benchmark", args.output.as_ref(), &artifact) {
+    match tpcc_wire::run_blocking(args) {
         Ok(()) => ExitCode::SUCCESS,
         Err(err) => {
             eprintln!("tpcc benchmark failed: {err:#}");
             ExitCode::from(1)
         }
     }
+}
+
+#[cfg(not(feature = "sql-bench"))]
+fn run_tpcc(_args: TpccArgs) -> ExitCode {
+    eprintln!(
+        "tpcc requires: cargo run -p ultrasql-bench --features sql-bench --bin ultrasql-bench -- tpcc ..."
+    );
+    ExitCode::from(2)
 }
 
 fn write_artifact<T: Serialize>(
@@ -445,13 +443,15 @@ mod tests {
     }
 
     #[test]
-    fn tpcc_cli_defaults_to_local_kernel_shape() {
+    fn tpcc_cli_defaults_to_v10_cert_shape() {
         let cli = Cli::try_parse_from(["ultrasql-bench", "tpcc"]).expect("parse tpcc args");
         match cli.command {
             Some(Command::Tpcc(args)) => {
-                assert_eq!(args.profile, "local-kernel");
-                assert_eq!(args.iterations, 5);
-                assert_eq!(args.warmup, 1);
+                assert_eq!(args.engine, TpccEngine::Ultrasql);
+                assert_eq!(args.warehouses, 1);
+                assert_eq!(args.connections, 32);
+                assert_eq!(args.duration_secs, 60);
+                assert_eq!(args.warmup_secs, 30);
                 assert!(args.output.is_none());
             }
             _ => panic!("tpcc subcommand should parse"),

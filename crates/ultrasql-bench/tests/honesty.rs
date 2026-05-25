@@ -9,8 +9,8 @@
 //! - No `NaN` or infinite value in `samples`
 //! - `throughput_per_sec > 0` (sanity: positive throughput follows from > 0 time)
 //!
-//! The stub benchmarks (`tpcb_32conn`, `tpcc_5types`) are excluded because they
-//! return all-zero placeholders by design while their execution paths are not
+//! The stub benchmark (`tpcb_32conn`) is excluded because it returns an
+//! all-zero placeholder by design while its registry execution path is not
 //! yet implemented.
 
 use ultrasql_bench::registry::{BenchContext, HostInfo, REGISTRY};
@@ -18,7 +18,7 @@ use ultrasql_bench::runs::enable_smoke_mode_for_process;
 
 /// Stubs that return all-zero / empty results while their real implementation
 /// is not yet wired. Completely excluded from all assertions.
-const STUB_IDS: &[&str] = &["tpcb_32conn", "tpcc_5types"];
+const STUB_IDS: &[&str] = &["tpcb_32conn"];
 
 fn smoke_ctx() -> BenchContext {
     BenchContext {

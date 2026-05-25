@@ -40,6 +40,8 @@ fn ai_gauntlet_declares_required_suites_and_artifacts() {
     assert!(script.contains("benchmarks/vector_ann_hnsw.sh"));
     assert!(script.contains("--workload hybrid-search-latency"));
     assert!(script.contains("--workload rag-retrieval-quality"));
+    assert!(script.contains("AI_GAUNTLET_REQUIRE_PGVECTOR"));
+    assert!(script.contains("VECTOR_TOPK_REQUIRE_PGVECTOR=\"$REQUIRE_PGVECTOR\""));
     assert!(script.contains("VECTOR_TOPK_RENDER_RESULTS=0"));
     assert!(script.contains("ai_benchmark_gauntlet_manifest.json"));
     assert!(script.contains("has_failed"));
@@ -186,7 +188,10 @@ fn certification_runner_exposes_ai_gauntlet_profiles() {
     let script = repo_file("benchmarks/certify.sh");
 
     assert!(script.contains("ai-gauntlet"));
+    assert!(script.contains("ai-vector-pgvector"));
+    assert!(script.contains("run_ai_vector_pgvector_full"));
     assert!(script.contains("run_ai_gauntlet_smoke"));
     assert!(script.contains("run_ai_gauntlet_full"));
+    assert!(script.contains("benchmarks/ai_vector_pgvector_certify.sh"));
     assert!(script.contains("benchmarks/ai_benchmark_gauntlet.sh"));
 }

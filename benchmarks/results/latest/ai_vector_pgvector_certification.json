@@ -1,0 +1,62 @@
+{
+  "schema_version": 1,
+  "suite": "ai_vector_pgvector_same_host",
+  "workload": "vector_topk_exact_10k_8d_k10",
+  "status": "passed",
+  "passed": true,
+  "reason": null,
+  "same_host": true,
+  "generated_at_unix": 1779670998,
+  "artifacts": {
+    "ultrasql": "benchmarks/results/latest/raw/vector_topk_exact_10k_8d_k10-ultrasql.json",
+    "postgres17_pgvector": "benchmarks/results/latest/raw/vector_topk_exact_10k_8d_k10-postgres17_pgvector.json"
+  },
+  "required_metrics": [
+    "recall_at_k",
+    "p50_latency_us",
+    "p95_latency_us",
+    "p99_latency_us",
+    "build_time_us",
+    "memory_bytes",
+    "index_size_bytes"
+  ],
+  "policy": "Certification requires measured UltraSQL and PostgreSQL+pgvector artifacts on the same host descriptor with identical workload shape and top-k answer checksum. Missing pgvector is unavailable, not a benchmark claim.",
+  "host": {
+    "cores": 10,
+    "cpu": "Apple M4",
+    "os": "macos unknown",
+    "ram_gb": 16
+  },
+  "metrics": {
+    "ultrasql": {
+      "recall_at_k": 1.0,
+      "p50_latency_us": 8512.166,
+      "p95_latency_us": 9352.167,
+      "p99_latency_us": 9352.167,
+      "build_time_us": 21386.292,
+      "memory_bytes": null,
+      "memory_status": "not_measured",
+      "index_size_bytes": null,
+      "index_size_status": "not_applicable_exact_scan",
+      "throughput_queries_per_sec": 117.4789119479108
+    },
+    "postgres17_pgvector": {
+      "recall_at_k": 1.0,
+      "p50_latency_us": 45493.04200918414,
+      "p95_latency_us": 47805.37501210347,
+      "p99_latency_us": 47805.37501210347,
+      "build_time_us": 59261.292015435174,
+      "memory_bytes": null,
+      "memory_status": "not_measured",
+      "index_size_bytes": null,
+      "index_size_status": "not_applicable_exact_scan",
+      "throughput_queries_per_sec": 21.981383434374866
+    }
+  },
+  "answer": "88,119,257,288,426,457,626,795,826,964",
+  "latency_ratio_pgvector_over_ultrasql_p50": 5.3444730764395505,
+  "p99_latency_us": {
+    "ultrasql": 9352.167,
+    "postgres17_pgvector": 47805.37501210347
+  }
+}

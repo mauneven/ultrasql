@@ -1,0 +1,37 @@
+{
+  "engine": "postgres17",
+  "workload": "tpcc_5types",
+  "warehouses": 1,
+  "districts": 10,
+  "customers_per_district": 30,
+  "items": 100,
+  "initial_orders_per_district": 300,
+  "order_lines": 5,
+  "connections": 32,
+  "warmup_secs": 0,
+  "duration_secs": 3,
+  "transactions": 989,
+  "transaction_counts": {
+    "new_order": 477,
+    "payment": 396,
+    "order_status": 36,
+    "delivery": 40,
+    "stock_level": 40
+  },
+  "throughput_per_sec": 301.03279515403483,
+  "p50_latency_us": 1952.625,
+  "p99_latency_us": 1060360.7079999999,
+  "correctness": {
+    "passed": true,
+    "all_five_transaction_types": true,
+    "history_row_count": 396,
+    "history_amount_sum": 1014916,
+    "warehouse_ytd_sum": 1014916,
+    "district_ytd_sum": 1014916,
+    "customer_ytd_payment_sum": 1014916,
+    "orders_row_count": 3477,
+    "new_order_row_count": 3437,
+    "order_line_row_count": 17385,
+    "low_stock_row_count": 93
+  }
+}

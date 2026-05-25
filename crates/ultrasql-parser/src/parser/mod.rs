@@ -183,6 +183,42 @@ impl<'src> Parser<'src> {
         }
     }
 
+    /// Parse the entire input and return source slices for each
+    /// `;`-delimited statement.
+    ///
+    /// The parser still validates each statement structurally; the
+    /// returned slices preserve the original text so callers can reuse
+    /// existing single-statement execution paths without ad hoc SQL
+    /// splitting.
+    pub fn parse_statement_slices(&mut self) -> Result<Vec<&'src str>, ParseError> {
+        let mut out = Vec::new();
+        loop {
+            let start = self.peek()?.span.start as usize;
+            if self.peek()?.kind == TokenKind::Eof {
+                return Ok(out);
+            }
+            let _ = self.parse_one()?;
+            let end = self.peek()?.span.start as usize;
+            let slice = self.source[start..end].trim();
+            if !slice.is_empty() {
+                out.push(slice);
+            }
+            match self.peek()?.kind {
+                TokenKind::Semicolon => {
+                    self.advance()?;
+                }
+                TokenKind::Eof => return Ok(out),
+                other => {
+                    return Err(ParseError::Expected {
+                        expected: "';' or end of input",
+                        found: other,
+                        offset: self.peek()?.span.start as usize,
+                    });
+                }
+            }
+        }
+    }
+
     // ---------------- statement-level ------------------------------------
 
     pub(crate) fn parse_one(&mut self) -> Result<Statement, ParseError> {

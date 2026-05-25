@@ -450,7 +450,7 @@ impl LockManager {
 
         let mut state = entry.inner.lock();
 
-        if !has_conflict(&state.grants, req.mode) {
+        if !has_conflict(&state.grants, req.xid, req.mode) {
             // Fast path: no conflict — grant immediately.
             state.grants.push((req.xid, req.mode));
             // Clear any stale victim flag from a previous false-positive
@@ -481,7 +481,7 @@ impl LockManager {
                 return Err(LockError::Deadlock { victim: req.xid });
             }
 
-            if !has_conflict(&state.grants, req.mode) {
+            if !has_conflict(&state.grants, req.xid, req.mode) {
                 remove_waiter(&mut state.waiters, req.xid, req.mode);
                 state.grants.push((req.xid, req.mode));
                 // Clear any stale victim flag (false positive from a
@@ -513,7 +513,7 @@ impl LockManager {
 
         let mut state = entry.inner.lock();
 
-        if has_conflict(&state.grants, req.mode) {
+        if has_conflict(&state.grants, req.xid, req.mode) {
             return Ok(false);
         }
 
@@ -811,8 +811,10 @@ fn dfs_find_cycle(
 
 /// Returns `true` if any existing grant in `grants` conflicts with
 /// `mode`.
-fn has_conflict(grants: &[(Xid, LockMode)], mode: LockMode) -> bool {
-    grants.iter().any(|(_, held)| mode.conflicts_with(*held))
+fn has_conflict(grants: &[(Xid, LockMode)], requester: Xid, mode: LockMode) -> bool {
+    grants
+        .iter()
+        .any(|(holder, held)| *holder != requester && mode.conflicts_with(*held))
 }
 
 /// Remove the first occurrence of (`xid`, `mode`) from a waiter queue.
@@ -1016,6 +1018,16 @@ mod tests {
 
         let got = mgr.try_acquire(req(1, tag, LockMode::AccessShare)).unwrap();
         assert!(got);
+    }
+
+    #[test]
+    fn same_xid_can_reacquire_conflicting_lock() {
+        let mgr = LockManager::new();
+        let tag = tup(6, 0, 0);
+
+        mgr.acquire(req(1, tag, LockMode::Exclusive)).unwrap();
+        let got = mgr.try_acquire(req(1, tag, LockMode::Exclusive)).unwrap();
+        assert!(got, "a transaction must not conflict with its own lock");
     }
 
     // ── release_all clears every lock held by the XID ────────────────────

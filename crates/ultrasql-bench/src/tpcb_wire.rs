@@ -17,7 +17,7 @@ const DEFAULT_ACCOUNTS_PER_SCALE: usize = 100_000;
 const TELLERS_PER_BRANCH: usize = 10;
 
 pub(crate) fn run_blocking(args: TpcbArgs) -> Result<()> {
-    let worker_threads = args.connections.clamp(1, 8);
+    let worker_threads = tpcb_worker_threads(args.connections);
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(worker_threads)
         .enable_all()
@@ -27,7 +27,8 @@ pub(crate) fn run_blocking(args: TpcbArgs) -> Result<()> {
 }
 
 async fn run(args: TpcbArgs) -> Result<()> {
-    let target = Target::start(args.engine, args.dsn.clone()).await?;
+    let worker_threads = tpcb_worker_threads(args.connections);
+    let target = Target::start(args.engine, args.dsn.clone(), worker_threads).await?;
     let config = TpcbConfig::from_args(&args)?;
     let admin = connect(&target.dsn).await?;
     reset_schema(&admin.client, &config).await?;
@@ -80,7 +81,7 @@ struct Target {
 }
 
 impl Target {
-    async fn start(engine: TpcbEngine, dsn: Option<String>) -> Result<Self> {
+    async fn start(engine: TpcbEngine, dsn: Option<String>, worker_threads: usize) -> Result<Self> {
         match (engine, dsn) {
             (TpcbEngine::Postgres17, Some(dsn)) | (TpcbEngine::Ultrasql, Some(dsn)) => {
                 Ok(Self { dsn })
@@ -95,7 +96,8 @@ impl Target {
                 std::thread::Builder::new()
                     .name("ultrasql-tpcb-server".to_string())
                     .spawn(move || {
-                        let runtime = match tokio::runtime::Builder::new_current_thread()
+                        let runtime = match tokio::runtime::Builder::new_multi_thread()
+                            .worker_threads(worker_threads)
                             .enable_all()
                             .build()
                         {
@@ -118,6 +120,10 @@ impl Target {
             }
         }
     }
+}
+
+fn tpcb_worker_threads(connections: usize) -> usize {
+    connections.saturating_add(2).clamp(2, 64)
 }
 
 #[derive(Clone)]
@@ -236,9 +242,9 @@ async fn reset_schema(client: &Client, config: &TpcbConfig) -> Result<()> {
     })
     .await?;
     for ddl in [
-        format!("CREATE INDEX {branches}_bid_idx ON {branches} (bid)"),
-        format!("CREATE INDEX {tellers}_tid_idx ON {tellers} (tid)"),
-        format!("CREATE INDEX {accounts}_aid_idx ON {accounts} (aid)"),
+        format!("CREATE UNIQUE INDEX {branches}_bid_idx ON {branches} (bid)"),
+        format!("CREATE UNIQUE INDEX {tellers}_tid_idx ON {tellers} (tid)"),
+        format!("CREATE UNIQUE INDEX {accounts}_aid_idx ON {accounts} (aid)"),
     ] {
         client
             .batch_execute(&ddl)
@@ -334,33 +340,35 @@ async fn run_client(
 }
 
 struct TpcbTx {
-    statements: [String; 9],
+    sql: String,
 }
 
 fn next_tx(config: &TpcbConfig, rng: &mut SplitMix64) -> Result<TpcbTx> {
-    let aid = bounded_one_based(rng.next_u64(), config.accounts)?;
-    let tid = bounded_one_based(rng.next_u64(), config.tellers)?;
-    let bid = ((tid - 1) / TELLERS_PER_BRANCH) + 1;
-    let delta = i64::try_from((rng.next_u64() % 199) + 1).unwrap_or(1) - 100;
+    let aid = i32::try_from(bounded_one_based(rng.next_u64(), config.accounts)?)
+        .context("aid conversion")?;
+    let tid_usize = bounded_one_based(rng.next_u64(), config.tellers)?;
+    let tid = i32::try_from(tid_usize).context("tid conversion")?;
+    let bid =
+        i32::try_from(((tid_usize - 1) / TELLERS_PER_BRANCH) + 1).context("bid conversion")?;
+    let delta = i32::try_from((rng.next_u64() % 199) + 1).unwrap_or(1) - 100;
+    let sql = tpcb_sql(config, aid, tid, bid, delta);
+    Ok(TpcbTx { sql })
+}
+
+fn tpcb_sql(config: &TpcbConfig, aid: i32, tid: i32, bid: i32, delta: i32) -> String {
     let accounts = config.accounts_table();
     let tellers = config.tellers_table();
     let branches = config.branches_table();
     let history = config.history_table();
-    Ok(TpcbTx {
-        statements: [
-            "BEGIN".to_string(),
-            format!("SELECT bbalance FROM {branches} WHERE bid = {bid} FOR UPDATE"),
-            format!("SELECT tbalance FROM {tellers} WHERE tid = {tid} FOR UPDATE"),
-            format!("SELECT abalance FROM {accounts} WHERE aid = {aid} FOR UPDATE"),
-            format!("UPDATE {accounts} SET abalance = abalance + {delta} WHERE aid = {aid}"),
-            format!("UPDATE {tellers} SET tbalance = tbalance + {delta} WHERE tid = {tid}"),
-            format!("UPDATE {branches} SET bbalance = bbalance + {delta} WHERE bid = {bid}"),
-            format!(
-                "INSERT INTO {history} (tid, bid, aid, delta) VALUES ({tid}, {bid}, {aid}, {delta})"
-            ),
-            "COMMIT".to_string(),
-        ],
-    })
+    format!(
+        "BEGIN;\
+         UPDATE {accounts} SET abalance = abalance + {delta} WHERE aid = {aid};\
+         SELECT abalance FROM {accounts} WHERE aid = {aid};\
+         UPDATE {tellers} SET tbalance = tbalance + {delta} WHERE tid = {tid};\
+         UPDATE {branches} SET bbalance = bbalance + {delta} WHERE bid = {bid};\
+         INSERT INTO {history} (tid, bid, aid, delta) VALUES ({tid}, {bid}, {aid}, {delta});\
+         COMMIT"
+    )
 }
 
 async fn execute_tx(client: &Client, tx: &TpcbTx) -> Result<()> {
@@ -388,12 +396,10 @@ async fn execute_tx(client: &Client, tx: &TpcbTx) -> Result<()> {
 }
 
 async fn execute_tx_once(client: &Client, tx: &TpcbTx) -> Result<()> {
-    for statement in &tx.statements {
-        client
-            .batch_execute(statement)
-            .await
-            .with_context(|| format!("execute tpcb statement: {statement}"))?;
-    }
+    client
+        .batch_execute(&tx.sql)
+        .await
+        .context("execute tpcb transaction batch")?;
     Ok(())
 }
 
@@ -526,7 +532,10 @@ impl SplitMix64 {
 
 #[cfg(test)]
 mod tests {
-    use super::is_retryable_conflict;
+    use super::{
+        SplitMix64, TELLERS_PER_BRANCH, TpcbConfig, is_retryable_conflict, next_tx,
+        tpcb_worker_threads,
+    };
 
     #[test]
     fn row_lock_conflict_is_retryable() {
@@ -535,5 +544,41 @@ mod tests {
         );
 
         assert!(is_retryable_conflict(&err));
+    }
+
+    #[test]
+    fn in_process_server_workers_cover_waiting_clients() {
+        assert_eq!(tpcb_worker_threads(0), 2);
+        assert_eq!(tpcb_worker_threads(1), 3);
+        assert_eq!(tpcb_worker_threads(32), 34);
+        assert_eq!(tpcb_worker_threads(usize::MAX), 64);
+    }
+
+    #[test]
+    fn tpcb_key_indexes_are_unique() {
+        let source = include_str!("tpcb_wire.rs");
+        assert!(source.contains("CREATE UNIQUE INDEX {branches}_bid_idx"));
+        assert!(source.contains("CREATE UNIQUE INDEX {tellers}_tid_idx"));
+        assert!(source.contains("CREATE UNIQUE INDEX {accounts}_aid_idx"));
+    }
+
+    #[test]
+    fn tpcb_transaction_matches_pgbench_shape() {
+        let config = TpcbConfig {
+            accounts: 100,
+            branches: 2,
+            tellers: 2 * TELLERS_PER_BRANCH,
+            connections: 1,
+            table_prefix: "bench".to_string(),
+        };
+        let mut rng = SplitMix64::new(7);
+
+        let tx = next_tx(&config, &mut rng).expect("build tpcb transaction");
+        assert!(tx.sql.contains("UPDATE bench_accounts SET"));
+        assert!(tx.sql.contains("SELECT abalance FROM bench_accounts"));
+        assert!(tx.sql.contains("UPDATE bench_tellers SET"));
+        assert!(tx.sql.contains("UPDATE bench_branches SET"));
+        assert!(tx.sql.contains("INSERT INTO bench_history"));
+        assert!(!tx.sql.contains("FOR UPDATE"));
     }
 }
