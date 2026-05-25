@@ -1333,6 +1333,9 @@ fn decode_wal_payload(record: &ultrasql_wal::WalRecord) -> String {
         RecordType::HeapUpdateInPlace => format_decoded(
             ultrasql_wal::HeapUpdateInPlacePayload::decode(&record.payload),
         ),
+        RecordType::HeapUpdateInPlaceBatch => format_decoded(
+            ultrasql_wal::HeapUpdateInPlaceBatchPayload::decode(&record.payload),
+        ),
         RecordType::HeapDeleteInPlace => format_decoded(
             ultrasql_wal::HeapDeleteInPlacePayload::decode(&record.payload),
         ),

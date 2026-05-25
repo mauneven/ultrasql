@@ -244,6 +244,7 @@ impl<L: PageLoader, O: XidStatusOracle + ?Sized> VisibleHeapWalker<'_, L, O> {
                         &self.undo_log,
                         self.rel,
                         tid,
+                        &self.page_scratch[offset + TUPLE_HEADER_SIZE..offset + length],
                         self.snapshot,
                         self.oracle,
                     ) {
@@ -265,32 +266,74 @@ fn lookup_undo_pre_image_owned<O: XidStatusOracle + ?Sized>(
     undo_log: &DashMap<RelationId, parking_lot::RwLock<UndoRelationLog>>,
     rel: RelationId,
     tid: TupleId,
+    current_payload: &[u8],
     snapshot: &Snapshot,
     oracle: &O,
 ) -> Option<Vec<u8>> {
     let log_handle = undo_log.get(&rel)?;
     let log = log_handle.read();
+    let mut best_writer: Option<Xid> = None;
+    let mut best_payload: Option<Vec<u8>> = None;
     for entry in log.entries.iter().rev() {
         if entry.tid != tid {
             continue;
         }
         let writer = entry.writer_xid;
-        let visible = if snapshot.is_current_xid(writer) {
-            true
-        } else if snapshot.xid_in_progress(writer) {
-            false
-        } else {
-            matches!(
-                oracle.status(writer),
-                ultrasql_mvcc::status::XidStatus::Committed
-                    | ultrasql_mvcc::status::XidStatus::Frozen,
-            )
-        };
-        if !visible {
-            return Some(entry.old_payload.to_vec());
+        if !writer_visible_to_snapshot(writer, snapshot, oracle)
+            && best_writer.is_none_or(|best| writer > best)
+        {
+            best_writer = Some(writer);
+            best_payload = Some(entry.old_payload.to_vec());
         }
     }
-    None
+    for batch in log.int32_pair_batches.iter().rev() {
+        if batch.page != tid.page || !batch.contains_slot(tid.slot) {
+            continue;
+        }
+        let writer = batch.writer_xid;
+        if !writer_visible_to_snapshot(writer, snapshot, oracle)
+            && best_writer.is_none_or(|best| writer > best)
+            && let Some(pre_image) =
+                compact_int32_pair_pre_image(current_payload, batch.target_col, batch.delta)
+        {
+            best_writer = Some(writer);
+            best_payload = Some(pre_image);
+        }
+    }
+    best_payload
+}
+
+#[inline]
+fn writer_visible_to_snapshot<O: XidStatusOracle + ?Sized>(
+    writer: Xid,
+    snapshot: &Snapshot,
+    oracle: &O,
+) -> bool {
+    if snapshot.is_current_xid(writer) {
+        true
+    } else if snapshot.xid_in_progress(writer) {
+        false
+    } else {
+        matches!(
+            oracle.status(writer),
+            ultrasql_mvcc::status::XidStatus::Committed | ultrasql_mvcc::status::XidStatus::Frozen,
+        )
+    }
+}
+
+fn compact_int32_pair_pre_image(
+    current_payload: &[u8],
+    target_col: u8,
+    delta: i32,
+) -> Option<Vec<u8>> {
+    if current_payload.len() < 9 {
+        return None;
+    }
+    let mut out = current_payload[..9].to_vec();
+    let offset = if target_col == 0 { 1 } else { 5 };
+    let current = i32::from_le_bytes(out[offset..offset + 4].try_into().ok()?);
+    out[offset..offset + 4].copy_from_slice(&current.wrapping_sub(delta).to_le_bytes());
+    Some(out)
 }
 
 /// `PAGE_HEADER_SIZE + slot * ITEMID_SIZE` — mirrors

@@ -271,7 +271,7 @@ impl<L: PageLoader> HeapAccess<L> {
                 continue;
             };
             let mut log = log_handle.write();
-            if log.entries.is_empty() {
+            if log.entries.is_empty() && log.int32_pair_batches.is_empty() {
                 continue;
             }
             // `retain` walks once, `O(n)`, dropping entries whose
@@ -282,6 +282,19 @@ impl<L: PageLoader> HeapAccess<L> {
             log.entries.retain(|e| e.writer_xid >= oldest_active_xid);
             let after = log.entries.len();
             total_trimmed += before - after;
+            let before_slots: usize = log
+                .int32_pair_batches
+                .iter()
+                .map(super::Int32PairUndoBatch::slot_len)
+                .sum();
+            log.int32_pair_batches
+                .retain(|batch| batch.writer_xid >= oldest_active_xid);
+            let after_slots: usize = log
+                .int32_pair_batches
+                .iter()
+                .map(super::Int32PairUndoBatch::slot_len)
+                .sum();
+            total_trimmed += before_slots - after_slots;
         }
         Ok(total_trimmed)
     }
@@ -297,6 +310,27 @@ impl<L: PageLoader> HeapAccess<L> {
         self.undo_log
             .get(&rel)
             .map_or(0, |h| h.read().entries.len())
+    }
+
+    /// Number of compact int32-pair undo batches retained for `rel`.
+    #[must_use]
+    pub fn int32_pair_undo_batch_len(&self, rel: RelationId) -> usize {
+        self.undo_log
+            .get(&rel)
+            .map_or(0, |h| h.read().int32_pair_batches.len())
+    }
+
+    /// Number of row pre-images represented by compact int32-pair undo
+    /// batches retained for `rel`.
+    #[must_use]
+    pub fn int32_pair_undo_slot_len(&self, rel: RelationId) -> usize {
+        self.undo_log.get(&rel).map_or(0, |h| {
+            h.read()
+                .int32_pair_batches
+                .iter()
+                .map(super::Int32PairUndoBatch::slot_len)
+                .sum()
+        })
     }
 }
 

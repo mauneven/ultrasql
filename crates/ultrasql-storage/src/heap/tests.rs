@@ -407,6 +407,13 @@ fn int32_pair_payload(id: i32, val: i32) -> [u8; 9] {
     payload
 }
 
+fn int32_pair_from_payload(payload: &[u8]) -> (i32, i32) {
+    assert!(payload.len() >= 9, "int32 pair payload must be 9 bytes");
+    let id = i32::from_le_bytes(payload[1..5].try_into().unwrap());
+    let val = i32::from_le_bytes(payload[5..9].try_into().unwrap());
+    (id, val)
+}
+
 // -----------------------------------------------------------------------
 // Deliverable A tests
 // -----------------------------------------------------------------------
@@ -631,6 +638,144 @@ fn inplace_int32_update_skips_unrelated_in_progress_writer() {
         .unwrap();
 
     assert_eq!(updated, 1);
+}
+
+#[test]
+fn inplace_int32_update_records_compact_undo_batch() {
+    let heap = make_heap(8);
+    for id in 0_i32..4 {
+        heap.insert(rel(), &int32_pair_payload(id, id * 10), opts(10))
+            .unwrap();
+    }
+
+    let oracle = MapOracle::new();
+    oracle.set_committed(Xid::new(10));
+    oracle.set_in_progress(Xid::new(20));
+    let writer_20 = Snapshot::new(
+        Xid::new(10),
+        Xid::new(100),
+        Xid::new(20),
+        CommandId::FIRST,
+        std::iter::empty(),
+    );
+
+    let updated = heap
+        .update_int32_pair_inplace_undo(
+            rel(),
+            heap.block_count(rel()),
+            &writer_20,
+            &oracle,
+            |_id, _val| true,
+            1,
+            5,
+            Xid::new(20),
+            CommandId::FIRST,
+            None,
+            None,
+        )
+        .unwrap();
+
+    assert_eq!(updated, 4);
+    assert_eq!(
+        heap.undo_log_len(rel()),
+        0,
+        "bulk int32 updates must not allocate one full undo entry per row",
+    );
+    assert_eq!(heap.int32_pair_undo_batch_len(rel()), 1);
+    let log = heap.undo_log.get(&rel()).unwrap();
+    let log = log.read();
+    let batch = &log.int32_pair_batches[0];
+    assert_eq!(batch.first_slot, 0);
+    assert_eq!(usize::from(batch.slot_count), 4);
+    assert!(
+        batch.slots.is_empty(),
+        "contiguous slot updates must not allocate a slot list"
+    );
+}
+
+#[test]
+fn invisible_inplace_int32_update_reads_compact_preimage() {
+    let heap = make_heap(8);
+    heap.insert(rel(), &int32_pair_payload(1, 10), opts(10))
+        .unwrap();
+
+    let oracle = MapOracle::new();
+    oracle.set_committed(Xid::new(10));
+    oracle.set_in_progress(Xid::new(20));
+    let writer_20 = Snapshot::new(
+        Xid::new(10),
+        Xid::new(100),
+        Xid::new(20),
+        CommandId::FIRST,
+        std::iter::empty(),
+    );
+    heap.update_int32_pair_inplace_undo(
+        rel(),
+        heap.block_count(rel()),
+        &writer_20,
+        &oracle,
+        |id, _val| id == 1,
+        1,
+        5,
+        Xid::new(20),
+        CommandId::FIRST,
+        None,
+        None,
+    )
+    .unwrap();
+
+    let reader = Snapshot::new(
+        Xid::new(10),
+        Xid::new(100),
+        Xid::new(30),
+        CommandId::FIRST,
+        [Xid::new(20)],
+    );
+    let visible: Vec<HeapTuple> = heap
+        .scan_visible(rel(), heap.block_count(rel()), &reader, &oracle)
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+
+    assert_eq!(visible.len(), 1);
+    assert_eq!(int32_pair_from_payload(&visible[0].data), (1, 10));
+}
+
+#[test]
+fn rollback_inplace_int32_update_restores_compact_undo_batch() {
+    let heap = make_heap(8);
+    let tid = heap
+        .insert(rel(), &int32_pair_payload(1, 10), opts(10))
+        .unwrap();
+
+    let oracle = MapOracle::new();
+    oracle.set_committed(Xid::new(10));
+    oracle.set_in_progress(Xid::new(20));
+    let writer_20 = Snapshot::new(
+        Xid::new(10),
+        Xid::new(100),
+        Xid::new(20),
+        CommandId::FIRST,
+        std::iter::empty(),
+    );
+    heap.update_int32_pair_inplace_undo(
+        rel(),
+        heap.block_count(rel()),
+        &writer_20,
+        &oracle,
+        |id, _val| id == 1,
+        1,
+        5,
+        Xid::new(20),
+        CommandId::FIRST,
+        None,
+        None,
+    )
+    .unwrap();
+
+    assert_eq!(heap.fetch(tid).unwrap().data, int32_pair_payload(1, 15));
+    assert_eq!(heap.rollback_in_place_updates(Xid::new(20)).unwrap(), 1);
+    assert_eq!(heap.fetch(tid).unwrap().data, int32_pair_payload(1, 10));
+    assert_eq!(heap.int32_pair_undo_batch_len(rel()), 0);
 }
 
 #[test]
@@ -976,7 +1121,8 @@ mod wal_emission {
     use ultrasql_core::{CommandId, Lsn, Xid};
     use ultrasql_wal::WalRecord;
     use ultrasql_wal::payload::{
-        HEAP_UPDATE_HOT, HeapDeletePayload, HeapInsertPayload, HeapUpdatePayload,
+        HEAP_UPDATE_HOT, HeapDeletePayload, HeapInsertPayload, HeapUpdateInPlaceBatchPayload,
+        HeapUpdatePayload,
     };
     use ultrasql_wal::record::RecordType;
 
@@ -1281,6 +1427,54 @@ mod wal_emission {
 
         assert_eq!(sink.len(), 0, "no-WAL insert must emit zero records");
         assert_eq!(del_sink.len(), 1, "delete with sink must emit one record");
+    }
+
+    #[test]
+    fn inplace_int32_update_emits_one_batch_record_per_page() {
+        let (heap, sink) = make_heap_with_sink(8);
+        for id in 0_i32..3 {
+            heap.insert(rel(), &int32_pair_payload(id, id * 10), opts(10))
+                .unwrap();
+        }
+
+        let oracle = MapOracle::new();
+        oracle.set_committed(Xid::new(10));
+        let snapshot = Snapshot::new(
+            Xid::new(10),
+            Xid::new(100),
+            Xid::new(20),
+            CommandId::FIRST,
+            std::iter::empty(),
+        );
+        let updated = heap
+            .update_int32_pair_inplace_undo(
+                rel(),
+                heap.block_count(rel()),
+                &snapshot,
+                &oracle,
+                |_id, _val| true,
+                1,
+                1,
+                Xid::new(20),
+                CommandId::FIRST,
+                Some(sink.as_ref()),
+                None,
+            )
+            .unwrap();
+
+        assert_eq!(updated, 3);
+        assert_eq!(sink.len(), 1, "one page should emit one batch record");
+        let records = sink.records();
+        let (_lsn, record) = &records[0];
+        assert_eq!(
+            record.header.record_type,
+            RecordType::HeapUpdateInPlaceBatch
+        );
+        let payload = HeapUpdateInPlaceBatchPayload::decode(&record.payload).unwrap();
+        assert_eq!(payload.page, PageId::new(rel(), BlockNumber::new(0)));
+        assert_eq!(payload.writer_xid, Xid::new(20));
+        assert_eq!(payload.command_id, CommandId::FIRST);
+        assert_eq!(payload.entries.len(), 3);
     }
 
     // -------------------------------------------------------------------

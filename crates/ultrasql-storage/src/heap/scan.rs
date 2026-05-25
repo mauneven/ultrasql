@@ -200,6 +200,7 @@ impl<L: PageLoader> HeapAccess<L> {
                             rel,
                             tid,
                             &header,
+                            &slot_bytes[TUPLE_HEADER_SIZE..],
                             snapshot,
                             oracle,
                         ) {
@@ -228,11 +229,14 @@ impl<L: PageLoader> HeapAccess<L> {
         rel: RelationId,
         tid: TupleId,
         _header: &TupleHeader,
+        current_payload: &[u8],
         snapshot: &Snapshot,
         oracle: &O,
     ) -> Option<Vec<u8>> {
         let log = undo_log.get(&rel)?;
         let log = log.read();
+        let mut best_writer: Option<Xid> = None;
+        let mut best_payload: Option<Vec<u8>> = None;
         // Entries are appended in `(tid, writer_xid)` order; we walk
         // backwards for newest-first. For the bench's autocommit
         // workload `entries` is short; binary search by tid would be
@@ -244,23 +248,29 @@ impl<L: PageLoader> HeapAccess<L> {
             // Pick the first (youngest) entry whose writer's commit
             // is *not* visible to this snapshot. That is the pre-
             // image the reader logically observes.
-            let writer_xmax = entry.writer_xid;
-            let visible = if snapshot.is_current_xid(writer_xmax) {
-                true
-            } else if snapshot.xid_in_progress(writer_xmax) {
-                false
-            } else {
-                matches!(
-                    oracle.status(writer_xmax),
-                    ultrasql_mvcc::status::XidStatus::Committed
-                        | ultrasql_mvcc::status::XidStatus::Frozen,
-                )
-            };
-            if !visible {
-                return Some(entry.old_payload.to_vec());
+            let writer = entry.writer_xid;
+            if !writer_visible_to_snapshot(writer, snapshot, oracle)
+                && best_writer.is_none_or(|best| writer > best)
+            {
+                best_writer = Some(writer);
+                best_payload = Some(entry.old_payload.to_vec());
             }
         }
-        None
+        for batch in log.int32_pair_batches.iter().rev() {
+            if batch.page != tid.page || !batch.contains_slot(tid.slot) {
+                continue;
+            }
+            let writer = batch.writer_xid;
+            if !writer_visible_to_snapshot(writer, snapshot, oracle)
+                && best_writer.is_none_or(|best| writer > best)
+                && let Some(pre_image) =
+                    compact_int32_pair_pre_image(current_payload, batch.target_col, batch.delta)
+            {
+                best_writer = Some(writer);
+                best_payload = Some(pre_image);
+            }
+        }
+        best_payload
     }
 
     pub fn scan_visible_walker<'a, O: XidStatusOracle + ?Sized>(
@@ -381,6 +391,39 @@ impl<L: PageLoader> HeapAccess<L> {
             pre_image_scratch: Vec::new(),
         }
     }
+}
+
+#[inline]
+fn writer_visible_to_snapshot<O: XidStatusOracle + ?Sized>(
+    writer: Xid,
+    snapshot: &Snapshot,
+    oracle: &O,
+) -> bool {
+    if snapshot.is_current_xid(writer) {
+        true
+    } else if snapshot.xid_in_progress(writer) {
+        false
+    } else {
+        matches!(
+            oracle.status(writer),
+            ultrasql_mvcc::status::XidStatus::Committed | ultrasql_mvcc::status::XidStatus::Frozen,
+        )
+    }
+}
+
+fn compact_int32_pair_pre_image(
+    current_payload: &[u8],
+    target_col: u8,
+    delta: i32,
+) -> Option<Vec<u8>> {
+    if current_payload.len() < 9 {
+        return None;
+    }
+    let mut out = current_payload[..9].to_vec();
+    let offset = if target_col == 0 { 1 } else { 5 };
+    let current = i32::from_le_bytes(out[offset..offset + 4].try_into().ok()?);
+    out[offset..offset + 4].copy_from_slice(&current.wrapping_sub(delta).to_le_bytes());
+    Some(out)
 }
 
 /// Iterator yielded by [`HeapAccess::scan`].
@@ -505,6 +548,7 @@ impl<L: PageLoader> Iterator for HeapScan<'_, L> {
 /// `Err(HeapError)`.
 pub struct VisibleHeapScan<'a, L: PageLoader, O: XidStatusOracle + ?Sized> {
     pub(super) inner: HeapScan<'a, L>,
+    pub(super) undo_log: &'a Arc<DashMap<RelationId, parking_lot::RwLock<UndoRelationLog>>>,
     pub(super) snapshot: &'a Snapshot,
     pub(super) oracle: &'a O,
     /// One-entry cache of `(xmin, infomask_bits) → visibility` valid
@@ -585,11 +629,25 @@ impl<L: PageLoader, O: XidStatusOracle + ?Sized> Iterator for VisibleHeapScan<'_
                     // false positives, so we go through the full
                     // `is_visible` rules without touching the
                     // cache.
-                    if matches!(
-                        is_visible(&tup.header, self.snapshot, self.oracle),
-                        Visibility::Visible
-                    ) {
-                        return Some(Ok(tup));
+                    match is_visible(&tup.header, self.snapshot, self.oracle) {
+                        Visibility::Visible => return Some(Ok(tup)),
+                        Visibility::VisiblePreImage => {
+                            let rel = tup.tid.page.relation;
+                            if let Some(pre) = HeapAccess::<L>::lookup_undo_pre_image(
+                                self.undo_log,
+                                rel,
+                                tup.tid,
+                                &tup.header,
+                                &tup.data,
+                                self.snapshot,
+                                self.oracle,
+                            ) {
+                                let mut tup = tup;
+                                tup.data = pre;
+                                return Some(Ok(tup));
+                            }
+                        }
+                        Visibility::Invisible | Visibility::DeletedByOwn => {}
                     }
                     // Invisible (other txn in-progress, aborted, deleted
                     // before our snapshot) or DeletedByOwn — skip and

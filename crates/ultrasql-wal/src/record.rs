@@ -123,6 +123,8 @@ pub enum RecordType {
     HnswOp = 13,
     /// An IVFFlat vector-index list mutation was recorded.
     IvfFlatOp = 14,
+    /// Multiple in-place tuple payload rewrites on one heap page.
+    HeapUpdateInPlaceBatch = 15,
     /// A no-op marker (used to round records up to alignment
     /// boundaries; ignored on replay).
     Nop = 255,
@@ -146,6 +148,7 @@ impl RecordType {
             12 => Self::HashOp,
             13 => Self::HnswOp,
             14 => Self::IvfFlatOp,
+            15 => Self::HeapUpdateInPlaceBatch,
             255 => Self::Nop,
             other => return Err(WalRecordError::UnknownType(other)),
         })
@@ -391,6 +394,7 @@ mod tests {
             RecordType::HashOp,
             RecordType::HnswOp,
             RecordType::IvfFlatOp,
+            RecordType::HeapUpdateInPlaceBatch,
             RecordType::Nop,
         ] {
             let raw = rt as u8;

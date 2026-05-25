@@ -480,6 +480,206 @@ impl HeapUpdateInPlacePayload {
 }
 
 // ---------------------------------------------------------------------------
+// HeapUpdateInPlaceBatchPayload
+// ---------------------------------------------------------------------------
+
+/// One slot rewrite inside a page-batched in-place UPDATE WAL record.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HeapUpdateInPlaceBatchEntry {
+    /// Slot number within [`HeapUpdateInPlaceBatchPayload::page`].
+    pub slot: u16,
+    /// Pre-update payload bytes for the fixed `(Int32, Int32)` row body.
+    pub pre_image: [u8; 9],
+    /// Post-update payload bytes for the fixed `(Int32, Int32)` row body.
+    pub post_image: [u8; 9],
+}
+
+/// Payload for a `RecordType::HeapUpdateInPlaceBatch` WAL record.
+///
+/// Groups all in-place rewrites that touch the same heap page into a
+/// single WAL record. The durability contract is page-level: the page
+/// LSN is stamped with this record's LSN after the mutation record is
+/// appended, so recovery either replays every entry in the batch or
+/// skips the already-flushed page image.
+///
+/// Wire layout (little-endian):
+/// ```text
+///  0   8   page (PageId)
+///  8   8   writer_xid (u64)
+/// 16   4   command_id (u32)
+/// 20   2   image_len (u16, currently 9)
+/// 22   2   reserved (zero)
+/// 24   4   entry_count (u32)
+/// 28  ..   repeated entries:
+///            slot (u16), reserved (u16), pre_image[image_len],
+///            post_image[image_len]
+/// ```
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HeapUpdateInPlaceBatchPayload {
+    /// Heap page containing every slot in [`Self::entries`].
+    pub page: PageId,
+    /// Transaction that performed the in-place UPDATE.
+    pub writer_xid: Xid,
+    /// Command within `writer_xid` that performed the UPDATE.
+    pub command_id: CommandId,
+    /// Slot rewrites on `page`, in ascending slot order.
+    pub entries: Vec<HeapUpdateInPlaceBatchEntry>,
+}
+
+impl HeapUpdateInPlaceBatchPayload {
+    const FIXED: usize = PAGE_ID_SIZE + 8 + 4 + 2 + 2 + 4;
+    const IMAGE_LEN: usize = 9;
+    const ENTRY_FIXED: usize = 4;
+
+    /// Encode this payload into a freshly-allocated byte vector.
+    pub fn encode(&self) -> Result<Vec<u8>, PayloadError> {
+        let entry_count = u32::try_from(self.entries.len()).map_err(|_| {
+            PayloadError::Malformed("heap_update_in_place_batch entry_count overflow")
+        })?;
+        let entry_size = Self::ENTRY_FIXED + Self::IMAGE_LEN * 2;
+        let entries_len =
+            self.entries
+                .len()
+                .checked_mul(entry_size)
+                .ok_or(PayloadError::Malformed(
+                    "heap_update_in_place_batch length overflow",
+                ))?;
+        let total = Self::FIXED
+            .checked_add(entries_len)
+            .ok_or(PayloadError::Malformed(
+                "heap_update_in_place_batch length overflow",
+            ))?;
+        if total > MAX_VARIABLE_PAYLOAD_BYTES {
+            return Err(PayloadError::Malformed(
+                "heap_update_in_place_batch length exceeds ceiling",
+            ));
+        }
+
+        let mut out = vec![0_u8; total];
+        let mut page_buf = [0_u8; PAGE_ID_SIZE];
+        encode_page_id(&mut page_buf, self.page);
+        out[..PAGE_ID_SIZE].copy_from_slice(&page_buf);
+        write_u64_le(
+            &mut out[PAGE_ID_SIZE..PAGE_ID_SIZE + 8],
+            self.writer_xid.raw(),
+        );
+        write_u32_le(
+            &mut out[PAGE_ID_SIZE + 8..PAGE_ID_SIZE + 12],
+            self.command_id.raw(),
+        );
+        write_u16_le(
+            &mut out[PAGE_ID_SIZE + 12..PAGE_ID_SIZE + 14],
+            u16::try_from(Self::IMAGE_LEN).expect("image len fits u16"),
+        );
+        write_u16_le(&mut out[PAGE_ID_SIZE + 14..PAGE_ID_SIZE + 16], 0);
+        write_u32_le(&mut out[PAGE_ID_SIZE + 16..Self::FIXED], entry_count);
+
+        let mut off = Self::FIXED;
+        for entry in &self.entries {
+            write_u16_le(&mut out[off..off + 2], entry.slot);
+            write_u16_le(&mut out[off + 2..off + 4], 0);
+            off += Self::ENTRY_FIXED;
+            out[off..off + Self::IMAGE_LEN].copy_from_slice(&entry.pre_image);
+            off += Self::IMAGE_LEN;
+            out[off..off + Self::IMAGE_LEN].copy_from_slice(&entry.post_image);
+            off += Self::IMAGE_LEN;
+        }
+        Ok(out)
+    }
+
+    /// Decode a `HeapUpdateInPlaceBatchPayload` from a byte slice.
+    pub fn decode(bytes: &[u8]) -> Result<Self, PayloadError> {
+        if bytes.len() < Self::FIXED {
+            return Err(PayloadError::Truncated {
+                needed: Self::FIXED,
+                have: bytes.len(),
+            });
+        }
+        let page = decode_page_id(bytes)?;
+        let writer_xid = Xid::new(
+            read_u64_le(&bytes[PAGE_ID_SIZE..PAGE_ID_SIZE + 8])
+                .map_err(|_| PayloadError::Malformed("heap_update_in_place_batch writer_xid"))?,
+        );
+        let command_id = CommandId::new(
+            read_u32_le(&bytes[PAGE_ID_SIZE + 8..PAGE_ID_SIZE + 12])
+                .map_err(|_| PayloadError::Malformed("heap_update_in_place_batch command_id"))?,
+        );
+        let image_len = usize::from(
+            read_u16_le(&bytes[PAGE_ID_SIZE + 12..PAGE_ID_SIZE + 14])
+                .map_err(|_| PayloadError::Malformed("heap_update_in_place_batch image_len"))?,
+        );
+        let reserved = read_u16_le(&bytes[PAGE_ID_SIZE + 14..PAGE_ID_SIZE + 16])
+            .map_err(|_| PayloadError::Malformed("heap_update_in_place_batch reserved"))?;
+        if reserved != 0 {
+            return Err(PayloadError::Malformed(
+                "heap_update_in_place_batch reserved bits set",
+            ));
+        }
+        if image_len != Self::IMAGE_LEN {
+            return Err(PayloadError::Malformed(
+                "heap_update_in_place_batch unsupported image length",
+            ));
+        }
+        let entry_count = usize::try_from(
+            read_u32_le(&bytes[PAGE_ID_SIZE + 16..Self::FIXED])
+                .map_err(|_| PayloadError::Malformed("heap_update_in_place_batch entry_count"))?,
+        )
+        .map_err(|_| PayloadError::Malformed("heap_update_in_place_batch entry_count usize"))?;
+        let entry_size = Self::ENTRY_FIXED + image_len * 2;
+        let entries_len = entry_count
+            .checked_mul(entry_size)
+            .ok_or(PayloadError::Malformed(
+                "heap_update_in_place_batch length overflow",
+            ))?;
+        let needed = Self::FIXED
+            .checked_add(entries_len)
+            .ok_or(PayloadError::Malformed(
+                "heap_update_in_place_batch length overflow",
+            ))?;
+        if bytes.len() < needed {
+            return Err(PayloadError::Truncated {
+                needed,
+                have: bytes.len(),
+            });
+        }
+
+        let mut entries = Vec::with_capacity(entry_count);
+        let mut off = Self::FIXED;
+        for _ in 0..entry_count {
+            let slot = read_u16_le(&bytes[off..off + 2])
+                .map_err(|_| PayloadError::Malformed("heap_update_in_place_batch slot"))?;
+            let entry_reserved = read_u16_le(&bytes[off + 2..off + 4]).map_err(|_| {
+                PayloadError::Malformed("heap_update_in_place_batch entry reserved")
+            })?;
+            if entry_reserved != 0 {
+                return Err(PayloadError::Malformed(
+                    "heap_update_in_place_batch entry reserved bits set",
+                ));
+            }
+            off += Self::ENTRY_FIXED;
+            let mut pre_image = [0_u8; Self::IMAGE_LEN];
+            pre_image.copy_from_slice(&bytes[off..off + Self::IMAGE_LEN]);
+            off += Self::IMAGE_LEN;
+            let mut post_image = [0_u8; Self::IMAGE_LEN];
+            post_image.copy_from_slice(&bytes[off..off + Self::IMAGE_LEN]);
+            off += Self::IMAGE_LEN;
+            entries.push(HeapUpdateInPlaceBatchEntry {
+                slot,
+                pre_image,
+                post_image,
+            });
+        }
+
+        Ok(Self {
+            page,
+            writer_xid,
+            command_id,
+            entries,
+        })
+    }
+}
+
+// ---------------------------------------------------------------------------
 // HeapDeleteInPlacePayload
 // ---------------------------------------------------------------------------
 
@@ -1838,6 +2038,31 @@ mod tests {
             new_tuple_bytes: (0_u8..=127).collect(),
         };
         assert_eq!(HeapUpdatePayload::decode(&p.encode().unwrap()).unwrap(), p);
+    }
+
+    #[test]
+    fn heap_update_in_place_batch_round_trip_two_slots() {
+        let p = HeapUpdateInPlaceBatchPayload {
+            page: page_id(9, 3),
+            writer_xid: Xid::new(77),
+            command_id: CommandId::new(4),
+            entries: vec![
+                HeapUpdateInPlaceBatchEntry {
+                    slot: 1,
+                    pre_image: [0, 1, 0, 0, 0, 10, 0, 0, 0],
+                    post_image: [0, 1, 0, 0, 0, 11, 0, 0, 0],
+                },
+                HeapUpdateInPlaceBatchEntry {
+                    slot: 2,
+                    pre_image: [0, 2, 0, 0, 0, 20, 0, 0, 0],
+                    post_image: [0, 2, 0, 0, 0, 21, 0, 0, 0],
+                },
+            ],
+        };
+        assert_eq!(
+            HeapUpdateInPlaceBatchPayload::decode(&p.encode().unwrap()).unwrap(),
+            p
+        );
     }
 
     // ── HeapDeletePayload ─────────────────────────────────────────────────

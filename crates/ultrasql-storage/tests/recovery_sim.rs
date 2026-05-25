@@ -415,13 +415,22 @@ fn crash_recovery_in_place_update_restores_post_image_and_undo_log() {
 
     // Phase 2: collect records and replay into a fresh heap.
     let records = sink.records();
-    assert!(
-        records.iter().any(|(_, r)| matches!(
-            r.header.record_type,
-            ultrasql_wal::record::RecordType::HeapUpdateInPlace
-        )),
-        "WAL must contain at least one HeapUpdateInPlace record"
-    );
+    let batch_rows: usize = records
+        .iter()
+        .filter(|(_, r)| {
+            matches!(
+                r.header.record_type,
+                ultrasql_wal::record::RecordType::HeapUpdateInPlaceBatch
+            )
+        })
+        .map(|(_, r)| {
+            ultrasql_wal::HeapUpdateInPlaceBatchPayload::decode(&r.payload)
+                .expect("batch payload decodes")
+                .entries
+                .len()
+        })
+        .sum();
+    assert_eq!(batch_rows, ROWS, "WAL must batch every in-place UPDATE row");
     let recovery_heap = make_persistent_heap(loader::MapLoader::new());
     for (_, rec) in &records {
         dispatch_record(&recovery_heap, rec).expect("dispatch_record during replay");

@@ -561,6 +561,7 @@ impl<L: PageLoader> HeapAccess<L> {
     ) -> VisibleHeapScan<'a, L, O> {
         VisibleHeapScan {
             inner: self.scan(rel, block_count),
+            undo_log: &self.undo_log,
             snapshot,
             oracle,
             xmin_cache: None,

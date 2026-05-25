@@ -17,7 +17,8 @@ use ultrasql_mvcc::{Snapshot, TupleHeader, Visibility, XidStatusOracle, is_visib
 use ultrasql_wal::WalRecord;
 use ultrasql_wal::payload::{
     FullPageWritePayload, HeapDeleteInPlacePayload, HeapDeletePayload, HeapInsertPayload,
-    HeapUpdateInPlacePayload, HeapUpdatePayload,
+    HeapUpdateInPlaceBatchEntry, HeapUpdateInPlaceBatchPayload, HeapUpdateInPlacePayload,
+    HeapUpdatePayload,
 };
 use ultrasql_wal::record::RecordType;
 
@@ -285,6 +286,52 @@ impl<L: PageLoader> HeapAccess<L> {
         .encode()?;
         let record = WalRecord::new(
             RecordType::HeapUpdateInPlace,
+            writer_xid,
+            prev_lsn,
+            0,
+            payload_bytes,
+        );
+        let lsn: Lsn = sink.append(record).expect(
+            "wal append must succeed after a committed page mutation; failure is unrecoverable",
+        );
+        Ok(lsn)
+    }
+
+    /// Emit one page-level in-place UPDATE record covering every slot
+    /// rewritten on `page_id`.
+    ///
+    /// The caller mutates one source page under one write guard, drops
+    /// the guard, appends this WAL record, then stamps the page with
+    /// the returned LSN. A torn WAL tail rejects the whole batch via
+    /// CRC before replay; a flushed page image is protected by the
+    /// page LSN check, matching the existing FPW + redo contract.
+    pub(super) fn emit_update_in_place_batch_wal(
+        sink: &dyn WalSink,
+        page_id: PageId,
+        writer_xid: Xid,
+        command_id: CommandId,
+        entries: &[(u16, [u8; 9], [u8; 9])],
+    ) -> Result<Lsn, HeapError> {
+        let prev_lsn = sink.last_lsn_for(writer_xid);
+        let payload_entries = entries
+            .iter()
+            .map(
+                |(slot, pre_image, post_image)| HeapUpdateInPlaceBatchEntry {
+                    slot: *slot,
+                    pre_image: *pre_image,
+                    post_image: *post_image,
+                },
+            )
+            .collect();
+        let payload_bytes = HeapUpdateInPlaceBatchPayload {
+            page: page_id,
+            writer_xid,
+            command_id,
+            entries: payload_entries,
+        }
+        .encode()?;
+        let record = WalRecord::new(
+            RecordType::HeapUpdateInPlaceBatch,
             writer_xid,
             prev_lsn,
             0,

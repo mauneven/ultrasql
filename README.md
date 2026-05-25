@@ -67,11 +67,11 @@ cargo run --package ultrasql-bench --bin readme-render
 
 | Engine | Median | vs fastest |
 | --- | ---: | ---: |
-| DuckDB | 78.69 µs | — |
-| **UltraSQL** | 85.42 µs | 8.6% slower |
-| SQLite | 945.52 µs | 1,102% slower |
-| Firebolt Core | 4.09 ms | 5,092% slower |
-| PostgreSQL | 31.00 ms | 39,301% slower |
+| **UltraSQL** | 46.25 µs | — |
+| DuckDB | 94.54 µs | 104.4% slower |
+| SQLite | 909.79 µs | 1,867% slower |
+| Firebolt Core | 4.09 ms | 8,733% slower |
+| PostgreSQL | 29.73 ms | 64,184% slower |
 <!-- END AUTO: BENCH:select_sum_65k_i64 -->
 
 <!-- BEGIN AUTO: BENCH:filter_sum_1m_i64 -->
@@ -79,11 +79,11 @@ cargo run --package ultrasql-bench --bin readme-render
 
 | Engine | Median | vs fastest |
 | --- | ---: | ---: |
-| **UltraSQL** | 66.29 µs | — |
-| DuckDB | 202.69 µs | 205.8% slower |
-| Firebolt Core | 2.66 ms | 3,909% slower |
-| SQLite | 16.70 ms | 25,089% slower |
-| PostgreSQL | 44.49 ms | 67,009% slower |
+| **UltraSQL** | 43.58 µs | — |
+| DuckDB | 168.15 µs | 285.8% slower |
+| Firebolt Core | 2.66 ms | 5,998% slower |
+| SQLite | 15.48 ms | 35,406% slower |
+| PostgreSQL | 41.97 ms | 96,187% slower |
 <!-- END AUTO: BENCH:filter_sum_1m_i64 -->
 
 <!-- BEGIN AUTO: BENCH:select_avg_1m_i64 -->
@@ -91,11 +91,11 @@ cargo run --package ultrasql-bench --bin readme-render
 
 | Engine | Median | vs fastest |
 | --- | ---: | ---: |
-| **UltraSQL** | 218.04 µs | — |
-| DuckDB | 288.36 µs | 32.2% slower |
-| Firebolt Core | 3.96 ms | 1,717% slower |
-| SQLite | 14.38 ms | 6,496% slower |
-| PostgreSQL | 46.90 ms | 21,411% slower |
+| **UltraSQL** | 37.17 µs | — |
+| DuckDB | 268.85 µs | 623.4% slower |
+| Firebolt Core | 3.96 ms | 10,562% slower |
+| SQLite | 14.03 ms | 37,657% slower |
+| PostgreSQL | 41.35 ms | 111,163% slower |
 <!-- END AUTO: BENCH:select_avg_1m_i64 -->
 
 <!-- BEGIN AUTO: BENCH:insert_throughput_10k -->
@@ -103,11 +103,11 @@ cargo run --package ultrasql-bench --bin readme-render
 
 | Engine | Median | vs fastest |
 | --- | ---: | ---: |
-| **UltraSQL** | 13.53 ms | — |
-| SQLite | 22.45 ms | 66.0% slower |
-| Firebolt Core | 37.43 ms | 176.6% slower |
-| PostgreSQL | 60.21 ms | 345.0% slower |
-| DuckDB | 73.65 ms | 444.4% slower |
+| **UltraSQL** | 6.18 ms | — |
+| SQLite | 18.35 ms | 196.8% slower |
+| Firebolt Core | 37.43 ms | 505.5% slower |
+| PostgreSQL | 53.94 ms | 772.8% slower |
+| DuckDB | 60.30 ms | 875.7% slower |
 <!-- END AUTO: BENCH:insert_throughput_10k -->
 
 <!-- BEGIN AUTO: BENCH:select_scan_10k -->
@@ -115,11 +115,11 @@ cargo run --package ultrasql-bench --bin readme-render
 
 | Engine | Median | vs fastest |
 | --- | ---: | ---: |
-| DuckDB | 887.92 µs | — |
-| SQLite | 1.90 ms | 114.0% slower |
-| **UltraSQL** | 3.19 ms | 258.9% slower |
-| Firebolt Core | 4.71 ms | 430.8% slower |
-| PostgreSQL | 29.46 ms | 3,218% slower |
+| **UltraSQL** | 701.75 µs | — |
+| DuckDB | 882.06 µs | 25.7% slower |
+| SQLite | 1.83 ms | 161.3% slower |
+| Firebolt Core | 4.71 ms | 571.6% slower |
+| PostgreSQL | 27.66 ms | 3,842% slower |
 <!-- END AUTO: BENCH:select_scan_10k -->
 
 <!-- BEGIN AUTO: BENCH:update_throughput_10k -->
@@ -127,11 +127,11 @@ cargo run --package ultrasql-bench --bin readme-render
 
 | Engine | Median | vs fastest |
 | --- | ---: | ---: |
-| DuckDB | 173.17 µs | — |
-| **UltraSQL** | 239.33 µs | 38.2% slower |
-| SQLite | 418.79 µs | 141.8% slower |
-| Firebolt Core | 44.54 ms | 25,623% slower |
-| PostgreSQL | 53.63 ms | 30,870% slower |
+| **UltraSQL** | 95.83 µs | — |
+| DuckDB | 172.56 µs | 80.1% slower |
+| SQLite | 456.63 µs | 376.5% slower |
+| Firebolt Core | 44.54 ms | 46,381% slower |
+| PostgreSQL | 47.87 ms | 49,851% slower |
 <!-- END AUTO: BENCH:update_throughput_10k -->
 
 <!-- BEGIN AUTO: BENCH:delete_throughput_10k -->
@@ -139,11 +139,11 @@ cargo run --package ultrasql-bench --bin readme-render
 
 | Engine | Median | vs fastest |
 | --- | ---: | ---: |
-| **UltraSQL** | 199.00 µs | — |
-| SQLite | 538.73 µs | 170.7% slower |
-| DuckDB | 5.73 ms | 2,779% slower |
-| Firebolt Core | 10.84 ms | 5,347% slower |
-| PostgreSQL | 28.29 ms | 14,115% slower |
+| **UltraSQL** | 168.38 µs | — |
+| SQLite | 520.40 µs | 209.1% slower |
+| DuckDB | 1.91 ms | 1,036% slower |
+| Firebolt Core | 10.84 ms | 6,338% slower |
+| PostgreSQL | 23.86 ms | 14,074% slower |
 <!-- END AUTO: BENCH:delete_throughput_10k -->
 
 <!-- BEGIN AUTO: BENCH:mixed_oltp_pgbench_like -->
@@ -151,11 +151,11 @@ cargo run --package ultrasql-bench --bin readme-render
 
 | Engine | Median | vs fastest |
 | --- | ---: | ---: |
-| **UltraSQL** | 182.15 µs | — |
-| SQLite | 388.25 µs | 113.1% slower |
-| DuckDB | 3.39 ms | 1,759% slower |
-| PostgreSQL | 12.20 ms | 6,595% slower |
-| Firebolt Core | 28.08 ms | 15,314% slower |
+| **UltraSQL** | 166.75 µs | — |
+| SQLite | 327.23 µs | 96.2% slower |
+| DuckDB | 1.21 ms | 625.1% slower |
+| PostgreSQL | 11.24 ms | 6,638% slower |
+| Firebolt Core | 28.08 ms | 16,738% slower |
 <!-- END AUTO: BENCH:mixed_oltp_pgbench_like -->
 
 <!-- BEGIN AUTO: BENCH:window_row_number_65k_i64 -->
@@ -163,11 +163,11 @@ cargo run --package ultrasql-bench --bin readme-render
 
 | Engine | Median | vs fastest |
 | --- | ---: | ---: |
-| DuckDB | 7.71 ms | — |
-| Firebolt Core | 15.72 ms | 103.8% slower |
-| **UltraSQL** | 21.11 ms | 173.7% slower |
-| SQLite | 30.21 ms | 291.7% slower |
-| PostgreSQL | 71.69 ms | 829.4% slower |
+| **UltraSQL** | 4.83 ms | — |
+| DuckDB | 6.37 ms | 32.0% slower |
+| Firebolt Core | 15.72 ms | 225.8% slower |
+| SQLite | 28.60 ms | 492.7% slower |
+| PostgreSQL | 51.49 ms | 967% slower |
 <!-- END AUTO: BENCH:window_row_number_65k_i64 -->
 
 Additional local Firebolt Core smoke comparisons target Firebolt-specific

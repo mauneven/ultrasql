@@ -470,6 +470,19 @@ where
             return Ok(());
         }
         if let Some(body) = result.shared_streamed_body.take() {
+            if body.len() <= 1024 {
+                let mut scratch = std::mem::take(&mut self.write_buf);
+                scratch.clear();
+                scratch.extend_from_slice(body.as_ref());
+                self.drain_pending_notifications_into(&mut scratch);
+                encode_backend(&ready, &mut scratch);
+                let res = self.io.write_all(&scratch).await;
+                scratch.clear();
+                self.write_buf = scratch;
+                res?;
+                self.io.flush().await?;
+                return Ok(());
+            }
             self.io.write_all(body.as_ref()).await?;
             let mut scratch = std::mem::take(&mut self.write_buf);
             scratch.clear();

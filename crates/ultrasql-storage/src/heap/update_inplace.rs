@@ -32,8 +32,8 @@ use crate::page::PageError;
 use crate::wal_sink::WalSink;
 
 use super::{
-    DeleteOptions, HeapAccess, HeapError, HeapTuple, InsertOptions, UndoEntry, UndoRelationLog,
-    UpdateOptions, UpdateOutcome, UpdatePayload,
+    DeleteOptions, HeapAccess, HeapError, HeapTuple, InsertOptions, Int32PairUndoBatch, UndoEntry,
+    UndoRelationLog, UpdateOptions, UpdateOutcome, UpdatePayload,
 };
 
 impl<L: PageLoader> HeapAccess<L> {
@@ -61,13 +61,14 @@ impl<L: PageLoader> HeapAccess<L> {
                 continue;
             };
             let mut log = log_handle.write();
-            if log.entries.is_empty() {
+            if log.entries.is_empty() && log.int32_pair_batches.is_empty() {
                 continue;
             }
             // Partition entries: keep everything not written by `xid`;
             // collect the rolled-back set so we can apply them under
             // page guards.
             let mut to_apply: Vec<UndoEntry> = Vec::new();
+            let mut compact_to_apply: Vec<Int32PairUndoBatch> = Vec::new();
             let mut kept: Vec<UndoEntry> = Vec::with_capacity(log.entries.len());
             for e in std::mem::take(&mut log.entries) {
                 if e.writer_xid == xid {
@@ -77,12 +78,23 @@ impl<L: PageLoader> HeapAccess<L> {
                 }
             }
             log.entries = kept;
+            let mut kept_batches: Vec<Int32PairUndoBatch> =
+                Vec::with_capacity(log.int32_pair_batches.len());
+            for batch in std::mem::take(&mut log.int32_pair_batches) {
+                if batch.writer_xid == xid {
+                    compact_to_apply.push(batch);
+                } else {
+                    kept_batches.push(batch);
+                }
+            }
+            log.int32_pair_batches = kept_batches;
             drop(log);
 
-            if to_apply.is_empty() {
+            if to_apply.is_empty() && compact_to_apply.is_empty() {
                 continue;
             }
 
+            let restored_before = total_restored;
             // Process per-page so each affected page is pinned once.
             // Entries are sorted by tid (appended in (page, slot)
             // order); `to_apply` therefore is sorted as well.
@@ -137,7 +149,61 @@ impl<L: PageLoader> HeapAccess<L> {
                 drop(guard);
                 i = j;
             }
-            self.column_cache.bump_version(rel);
+
+            for batch in compact_to_apply.iter().rev() {
+                let guard = self.pool.get_page(batch.page)?;
+                let mut page = guard.write();
+                let bytes = page.as_bytes_mut();
+                for slot in batch_slots(batch) {
+                    let item_id_off = crate::page::PAGE_HEADER_SIZE
+                        + usize::from(slot) * crate::page::ITEMID_SIZE;
+                    let item_raw = u32::from_le_bytes([
+                        bytes[item_id_off],
+                        bytes[item_id_off + 1],
+                        bytes[item_id_off + 2],
+                        bytes[item_id_off + 3],
+                    ]);
+                    if item_raw & 0b11 != 1 {
+                        continue;
+                    }
+                    let length = ((item_raw >> 2) & 0x7FFF) as usize;
+                    let offset = ((item_raw >> 17) & 0x7FFF) as usize;
+                    if length < TUPLE_HEADER_SIZE
+                        || offset.checked_add(length).is_none_or(|e| e > bytes.len())
+                    {
+                        return Err(HeapError::MalformedHeader("slot shorter than header"));
+                    }
+                    let payload_off = offset + TUPLE_HEADER_SIZE;
+                    if payload_off + 9 > offset + length {
+                        return Err(HeapError::MalformedHeader(
+                            "payload shorter than (Int32, Int32)",
+                        ));
+                    }
+                    let target_off = if batch.target_col == 0 {
+                        payload_off + 1
+                    } else {
+                        payload_off + 5
+                    };
+                    let current = i32::from_le_bytes(
+                        bytes[target_off..target_off + 4]
+                            .try_into()
+                            .expect("4-byte slice"),
+                    );
+                    let restored = current.wrapping_sub(batch.delta);
+                    bytes[target_off..target_off + 4].copy_from_slice(&restored.to_le_bytes());
+                    bytes[offset + 8..offset + 16].copy_from_slice(&[0u8; 8]);
+                    bytes[offset + 20..offset + 24].copy_from_slice(&[0u8; 4]);
+                    let cur_im = u16::from_le_bytes([bytes[offset + 24], bytes[offset + 25]]);
+                    let new_im = cur_im & !(InfoMask::UPDATED | InfoMask::UPDATED_IN_PLACE);
+                    bytes[offset + 24..offset + 26].copy_from_slice(&new_im.to_le_bytes());
+                    total_restored += 1;
+                }
+                drop(page);
+                drop(guard);
+            }
+            if total_restored > restored_before {
+                self.column_cache.bump_version(rel);
+            }
         }
         Ok(total_restored)
     }
@@ -200,10 +266,10 @@ impl<L: PageLoader> HeapAccess<L> {
     /// # Durability
     ///
     /// When `wal` is `Some`, the inner loop emits one
-    /// [`RecordType::HeapUpdateInPlace`] record per applied row
-    /// (carrying pre + post-image bytes) after the per-page write
-    /// guard is dropped, and stamps the page LSN with the last
-    /// assigned LSN. A
+    /// page-batched in-place UPDATE record per touched page
+    /// (carrying pre + post-image bytes for every slot) after the
+    /// per-page write guard is dropped, and stamps the page LSN with
+    /// the assigned LSN. A
     /// [`ultrasql_wal::RecordType::FullPageWrite`]
     /// record is emitted first when the page has not been touched
     /// since the previous checkpoint, mirroring the
@@ -242,22 +308,21 @@ impl<L: PageLoader> HeapAccess<L> {
         let mut total_updated: usize = 0;
         let mut xmin_cache: Option<(Xid, u16, bool)> = None;
 
-        // Local scratch buffer for the undo log. The slot-major walk
-        // pushes one record at a time across every source page; we
-        // move them all into the per-relation log in a single
-        // `parking_lot::RwLock::write` acquire at the end. Pre-sized
-        // to a tight upper bound (`block_count × 160` rows per page)
-        // so the inner loop never re-allocates.
-        let mut undo_scratch: Vec<UndoEntry> =
-            Vec::with_capacity((block_count as usize).saturating_mul(160).max(200));
+        // Local scratch buffers for the compact undo log. This path
+        // changes one fixed-width int32 column by one literal delta,
+        // so a page id + slot list + delta is enough to reconstruct
+        // the pre-image for old snapshots.
+        let mut compact_undo_scratch: Vec<Int32PairUndoBatch> =
+            Vec::with_capacity(block_count as usize);
+        let mut page_undo_slots: Vec<u16> = Vec::with_capacity(256);
 
-        // When a WAL sink is wired, collect per-row `(TupleId,
+        // When a WAL sink is wired, collect per-row `(slot,
         // pre_image, post_image)` triples *during* the page write
         // and emit them with the page write guard dropped. Holding
         // the per-frame `RwLock<Page>` write across WAL I/O would
         // pin the buffer-pool frame for the duration of an fsync.
         // Reusing one Vec across pages avoids allocator churn.
-        let mut wal_scratch: Vec<(TupleId, [u8; 9], [u8; 9])> = if wal.is_some() {
+        let mut wal_scratch: Vec<(u16, [u8; 9], [u8; 9])> = if wal.is_some() {
             Vec::with_capacity(256)
         } else {
             Vec::new()
@@ -370,18 +435,13 @@ impl<L: PageLoader> HeapAccess<L> {
                         "payload shorter than (Int32, Int32)",
                     ));
                 }
-                let id = i32::from_le_bytes([
-                    src_bytes[payload_off + 1],
-                    src_bytes[payload_off + 2],
-                    src_bytes[payload_off + 3],
-                    src_bytes[payload_off + 4],
-                ]);
-                let val = i32::from_le_bytes([
-                    src_bytes[payload_off + 5],
-                    src_bytes[payload_off + 6],
-                    src_bytes[payload_off + 7],
-                    src_bytes[payload_off + 8],
-                ]);
+                let pair = u64::from_le_bytes(
+                    src_bytes[payload_off + 1..payload_off + 9]
+                        .try_into()
+                        .expect("8-byte payload"),
+                );
+                let id = i32::from_ne_bytes((pair as u32).to_ne_bytes());
+                let val = i32::from_ne_bytes(((pair >> 32) as u32).to_ne_bytes());
 
                 match visibility {
                     Visibility::Visible => {}
@@ -406,22 +466,13 @@ impl<L: PageLoader> HeapAccess<L> {
                     (id, val.wrapping_add(delta))
                 };
 
-                // Capture pre-image (9 bytes: 0 + id + val) directly
-                // from the slot bytes — no decode + re-encode pair.
-                let mut pre_image = [0_u8; 9];
-                pre_image.copy_from_slice(&src_bytes[payload_off..payload_off + 9]);
-                let tup_id = TupleId::new(src_page_id, src_slot);
                 if wal.is_some() {
                     let mut pre_bytes = [0u8; 9];
                     pre_bytes.copy_from_slice(&src_bytes[payload_off..payload_off + 9]);
                     // Post bytes are filled in below before the loop tail.
-                    wal_scratch.push((tup_id, pre_bytes, [0u8; 9]));
+                    wal_scratch.push((src_slot, pre_bytes, [0u8; 9]));
                 }
-                undo_scratch.push(UndoEntry {
-                    tid: tup_id,
-                    writer_xid: xid,
-                    old_payload: pre_image,
-                });
+                page_undo_slots.push(src_slot);
 
                 // Stamp the source slot's header in place:
                 //   bytes  8..16  xmax
@@ -435,10 +486,10 @@ impl<L: PageLoader> HeapAccess<L> {
                 // Overwrite the payload with the new (id, val) — same
                 // 8-byte region the prior values occupied. The
                 // null-bitmap byte stays zero. Packed as one u64 store.
-                let payload_u64 = ((u32::from_ne_bytes(new_val.to_ne_bytes()) as u64) << 32)
+                let new_pair = ((u32::from_ne_bytes(new_val.to_ne_bytes()) as u64) << 32)
                     | u32::from_ne_bytes(new_id.to_ne_bytes()) as u64;
                 src_bytes[payload_off + 1..payload_off + 9]
-                    .copy_from_slice(&payload_u64.to_le_bytes());
+                    .copy_from_slice(&new_pair.to_le_bytes());
 
                 if wal.is_some() {
                     let last = wal_scratch.last_mut().expect("just pushed");
@@ -455,49 +506,70 @@ impl<L: PageLoader> HeapAccess<L> {
             drop(src_page);
             drop(src_guard);
 
-            // Emit one WAL record per applied row on this page, with
+            // Emit one WAL record for the applied rows on this page, with
             // the page guard dropped (no buffer-pool pin held during
-            // WAL I/O). Stamp the page LSN with the largest assigned
-            // LSN at the end so recovery's redo-skip check sees the
-            // page as covered by every record on it.
+            // WAL I/O). Stamp the page LSN with the page-batch
+            // record's assigned LSN so recovery's redo-skip check
+            // sees the page as covered by every entry in it.
             if let Some(sink) = wal {
-                let mut last_lsn = ultrasql_core::Lsn::ZERO;
-                for (tid, pre, post) in wal_scratch.iter() {
-                    let lsn =
-                        Self::emit_update_in_place_wal(sink, *tid, xid, command_id, pre, post)?;
-                    last_lsn = lsn;
-                }
                 if !wal_scratch.is_empty() {
-                    Self::stamp_page_lsn(&self.pool, src_page_id, last_lsn)?;
+                    let lsn = Self::emit_update_in_place_batch_wal(
+                        sink,
+                        src_page_id,
+                        xid,
+                        command_id,
+                        &wal_scratch,
+                    )?;
+                    Self::stamp_page_lsn(&self.pool, src_page_id, lsn)?;
                 }
                 wal_scratch.clear();
+            }
+            if let Some(&first_slot) = page_undo_slots.first() {
+                let slot_count = u16::try_from(page_undo_slots.len())
+                    .map_err(|_| HeapError::MalformedHeader("too many updated slots"))?;
+                let last_slot = *page_undo_slots
+                    .last()
+                    .expect("first slot exists, so last slot exists");
+                let contiguous =
+                    usize::from(last_slot.saturating_sub(first_slot)) + 1 == page_undo_slots.len();
+                let slots = if contiguous {
+                    Vec::new()
+                } else {
+                    std::mem::take(&mut page_undo_slots)
+                };
+                compact_undo_scratch.push(Int32PairUndoBatch {
+                    page: src_page_id,
+                    writer_xid: xid,
+                    target_col,
+                    delta,
+                    first_slot,
+                    slot_count,
+                    slots,
+                });
+                page_undo_slots.clear();
             }
             if page_updated && let Some(vm) = vm {
                 vm.clear(src_page_id.relation, src_page_id.block);
             }
 
-            // Defer per-page undo append: keep accumulating into the
-            // local `undo_scratch` and bulk-move once after the
-            // entire UPDATE finishes. Saves one
-            // `parking_lot::RwLock::write` + `Vec::extend` per
-            // source page (typically 65 pages on the bench) and
-            // shrinks the per-relation log's growth pattern to a
-            // single push.
+            // Defer undo append: keep accumulating compact per-page
+            // batches and bulk-move once after the entire UPDATE
+            // finishes. Saves one log write-lock per source page and
+            // avoids per-row pre-image allocation.
         }
 
-        // Single append of every captured pre-image into the per-
-        // relation undo log under one write-lock acquire.
-        if !undo_scratch.is_empty() {
+        // Single append of every compact pre-image batch into the
+        // per-relation undo log under one write-lock acquire.
+        if !compact_undo_scratch.is_empty() {
             let log_handle = self
                 .undo_log
                 .entry(rel)
                 .or_insert_with(|| parking_lot::RwLock::new(UndoRelationLog::default()));
             let mut log = log_handle.write();
-            if log.entries.is_empty() {
-                let upper = (block_count as usize).saturating_mul(160);
-                log.entries.reserve(upper);
+            if log.int32_pair_batches.is_empty() {
+                log.int32_pair_batches.reserve(block_count as usize);
             }
-            log.entries.append(&mut undo_scratch);
+            log.int32_pair_batches.append(&mut compact_undo_scratch);
         }
 
         if total_updated > 0 {
@@ -662,4 +734,13 @@ impl<L: PageLoader> HeapAccess<L> {
         self.column_cache.bump_version(rel);
         Ok(1)
     }
+}
+
+fn batch_slots(batch: &Int32PairUndoBatch) -> Vec<u16> {
+    if !batch.slots.is_empty() {
+        return batch.slots.clone();
+    }
+    (0..batch.slot_count)
+        .map(|offset| batch.first_slot.saturating_add(offset))
+        .collect()
 }

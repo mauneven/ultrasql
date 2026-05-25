@@ -35,7 +35,7 @@ use ultrasql_mvcc::tuple_header::{InfoMask, TUPLE_HEADER_SIZE};
 use ultrasql_wal::applier::{ApplyError, HeapTarget};
 use ultrasql_wal::payload::{
     BTreeOpKind, BTreeOpPayload, FullPageWritePayload, HeapDeleteInPlacePayload, HeapDeletePayload,
-    HeapInsertPayload, HeapUpdateInPlacePayload, HeapUpdatePayload,
+    HeapInsertPayload, HeapUpdateInPlaceBatchPayload, HeapUpdateInPlacePayload, HeapUpdatePayload,
 };
 
 use crate::btree::{BTree, BTreeError};
@@ -460,6 +460,111 @@ impl<L: PageLoader + 'static> HeapTarget for HeapAccess<L> {
                 writer_xid: payload.writer_xid,
                 old_payload: pre,
             });
+        }
+        drop(log);
+
+        self.column_cache.bump_version(rel);
+        Ok(())
+    }
+
+    #[allow(clippy::significant_drop_tightening)]
+    fn apply_update_in_place_batch_at_lsn(
+        &self,
+        payload: &HeapUpdateInPlaceBatchPayload,
+        record_lsn: Lsn,
+    ) -> Result<(), ApplyError> {
+        let page_id = payload.page;
+        let rel = page_id.relation;
+        self.advance_counter(rel, page_id.block);
+
+        let guard = self
+            .pool
+            .get_page(page_id)
+            .map_err(|e| ApplyError::Refused {
+                operation: "heap_update_in_place_batch",
+                detail: format!("buffer pool: {e}"),
+            })?;
+        let mut page = guard.write();
+        if should_skip_redo(&page, record_lsn) {
+            return Ok(());
+        }
+
+        for entry in &payload.entries {
+            let existing = page
+                .read_tuple(entry.slot)
+                .map_err(|e| ApplyError::Refused {
+                    operation: "heap_update_in_place_batch",
+                    detail: format!("read slot: {e}"),
+                })?;
+            if existing.len() < TUPLE_HEADER_SIZE {
+                return Err(ApplyError::Refused {
+                    operation: "heap_update_in_place_batch",
+                    detail: String::from("slot shorter than tuple header"),
+                });
+            }
+            let (mut hdr, _) =
+                TupleHeader::decode(&existing[..TUPLE_HEADER_SIZE]).ok_or_else(|| {
+                    ApplyError::Refused {
+                        operation: "heap_update_in_place_batch",
+                        detail: String::from("header decode failed"),
+                    }
+                })?;
+
+            hdr.xmax = payload.writer_xid;
+            hdr.cmax = payload.command_id;
+            hdr.infomask.set(InfoMask::UPDATED);
+            hdr.infomask.set(InfoMask::UPDATED_IN_PLACE);
+            let mut hdr_bytes = [0_u8; TUPLE_HEADER_SIZE];
+            hdr.encode(&mut hdr_bytes);
+
+            let page_bytes = page.as_bytes_mut();
+            let item_id_off =
+                crate::page::PAGE_HEADER_SIZE + usize::from(entry.slot) * crate::page::ITEMID_SIZE;
+            let raw = u32::from_le_bytes(
+                page_bytes[item_id_off..item_id_off + crate::page::ITEMID_SIZE]
+                    .try_into()
+                    .map_err(|_| ApplyError::Refused {
+                        operation: "heap_update_in_place_batch",
+                        detail: String::from("itemid slice"),
+                    })?,
+            );
+            let item = crate::page::ItemId::from_raw(raw);
+            let slot_off = item.offset() as usize;
+            let slot_len = item.length() as usize;
+            if slot_len < TUPLE_HEADER_SIZE + entry.post_image.len() {
+                return Err(ApplyError::Refused {
+                    operation: "heap_update_in_place_batch",
+                    detail: format!("slot length {slot_len} too small for header + post-image"),
+                });
+            }
+            page_bytes[slot_off..slot_off + TUPLE_HEADER_SIZE].copy_from_slice(&hdr_bytes);
+            let payload_off = slot_off + TUPLE_HEADER_SIZE;
+            page_bytes[payload_off..payload_off + entry.post_image.len()]
+                .copy_from_slice(&entry.post_image);
+        }
+        stamp_replayed_lsn(&mut page, record_lsn);
+        drop(page);
+        drop(guard);
+
+        let log_handle = self
+            .undo_log
+            .entry(rel)
+            .or_insert_with(|| parking_lot::RwLock::new(UndoRelationLog::default()));
+        let mut log = log_handle.write();
+        for entry in &payload.entries {
+            let tid = TupleId::new(page_id, entry.slot);
+            let already = log.entries.iter().rev().any(|existing| {
+                existing.tid == tid
+                    && existing.writer_xid == payload.writer_xid
+                    && existing.old_payload == entry.pre_image
+            });
+            if !already {
+                log.entries.push(UndoEntry {
+                    tid,
+                    writer_xid: payload.writer_xid,
+                    old_payload: entry.pre_image,
+                });
+            }
         }
         drop(log);
 

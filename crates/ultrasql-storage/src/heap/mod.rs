@@ -41,7 +41,7 @@ use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 use dashmap::DashMap;
 use smallvec::SmallVec;
-use ultrasql_core::{BlockNumber, CommandId, RelationId, TupleId, Xid};
+use ultrasql_core::{BlockNumber, CommandId, PageId, RelationId, TupleId, Xid};
 use ultrasql_mvcc::TupleHeader;
 use ultrasql_wal::payload::PayloadError;
 
@@ -352,6 +352,10 @@ pub struct UndoRelationLog {
     /// monotonically-increasing TIDs preserve the sort. Readers
     /// binary-search.
     pub entries: Vec<UndoEntry>,
+    /// Compact fixed-width in-place UPDATE batches. These cover the
+    /// `(Int32, Int32) SET col = col ± literal` path and avoid one
+    /// full [`UndoEntry`] per row on bulk updates.
+    pub int32_pair_batches: Vec<Int32PairUndoBatch>,
 }
 
 /// One pre-image record carried by the in-place-update undo log.
@@ -369,6 +373,52 @@ pub struct UndoEntry {
     /// in-place fast path stores exactly the 9-byte `(null, id, val)`
     /// body for `(Int32, Int32)` rows.
     pub old_payload: [u8; 9],
+}
+
+/// Compact pre-image metadata for one page of fixed-width `(Int32, Int32)`
+/// in-place updates.
+#[derive(Clone, Debug)]
+pub struct Int32PairUndoBatch {
+    /// Page whose slots were updated.
+    pub page: PageId,
+    /// XID of the transaction that wrote the post-image.
+    pub writer_xid: Xid,
+    /// Updated column: `0` for `id`, `1` for `val`.
+    pub target_col: u8,
+    /// Delta applied to the target column.
+    pub delta: i32,
+    /// First updated slot when the batch is a contiguous range.
+    pub first_slot: u16,
+    /// Number of slots in the contiguous range starting at
+    /// [`Self::first_slot`]. When [`Self::slots`] is non-empty this
+    /// mirrors `slots.len()` for observability.
+    pub slot_count: u16,
+    /// Updated slots on `page`, in ascending slot order. Empty means
+    /// the batch is represented by `first_slot..first_slot+slot_count`.
+    pub slots: Vec<u16>,
+}
+
+impl Int32PairUndoBatch {
+    /// Number of row pre-images represented by this batch.
+    #[must_use]
+    pub fn slot_len(&self) -> usize {
+        if self.slots.is_empty() {
+            usize::from(self.slot_count)
+        } else {
+            self.slots.len()
+        }
+    }
+
+    /// Return `true` when this batch contains `slot`.
+    #[must_use]
+    pub fn contains_slot(&self, slot: u16) -> bool {
+        if self.slots.is_empty() {
+            let end = self.first_slot.saturating_add(self.slot_count);
+            slot >= self.first_slot && slot < end
+        } else {
+            self.slots.binary_search(&slot).is_ok()
+        }
+    }
 }
 
 impl<L: PageLoader> std::fmt::Debug for HeapAccess<L> {

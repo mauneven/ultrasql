@@ -556,6 +556,9 @@ async fn main() -> Result<()> {
             run_shared_window_row_number(bound, args.rows, args.warmup, total_iters, &mut iters_us)
                 .await?;
         }
+        Workload::UpdateBulk => {
+            run_shared_update(bound, args.rows, args.warmup, total_iters, &mut iters_us).await?;
+        }
         Workload::VectorTopK => {
             let certification = run_shared_vector_topk(
                 bound,
@@ -716,7 +719,6 @@ async fn main() -> Result<()> {
             for i in 0..total_iters {
                 let micros = match args.workload {
                     Workload::InsertBulk => run_insert_iter(bound, args.rows, i).await?,
-                    Workload::UpdateBulk => run_update_iter(bound, args.rows, i).await?,
                     Workload::DeleteBulk => run_delete_iter(bound, args.rows, i).await?,
                     Workload::MixedOltp => run_mixed_oltp_iter(bound, args.rows, i).await?,
                     Workload::SelectScan
@@ -727,6 +729,7 @@ async fn main() -> Result<()> {
                     | Workload::DashboardAggregate
                     | Workload::SparsePruning
                     | Workload::WindowRowNumber
+                    | Workload::UpdateBulk
                     | Workload::VectorTopK
                     | Workload::CsvColdRead
                     | Workload::CsvWarmRead
@@ -2297,60 +2300,9 @@ async fn run_filter_sum_iter(server: SocketAddr, n_rows: usize, ix: usize) -> Re
     Ok(elapsed_us)
 }
 
-/// Run one bulk-UPDATE iteration.
-///
-/// Preloads `n_rows` of `(id INT, val INT)` outside the timed region,
-/// then times a single Simple-Query
-/// `UPDATE bench_update_{ix} SET val = val + 1 WHERE id < <n_rows>`.
-///
-/// The shape mirrors `benchmarks/scripts/run_postgres_writes.sh::run_update`
-/// — the postgres script uses `BETWEEN 0 AND 9999` while UltraSQL's
-/// v0.5 binder does not yet recognise `BETWEEN` (parser limitation as
-/// of this commit), so the predicate is rewritten to `id < n_rows`
-/// which selects the identical row set on this monotonic-id preload.
-async fn run_update_iter(server: SocketAddr, n_rows: usize, ix: usize) -> Result<f64> {
-    let conn_str = format!("host=127.0.0.1 port={} user=ultrasql_bench", server.port());
-    let (client, connection) = tokio_postgres::connect(&conn_str, NoTls)
-        .await
-        .context("tokio-postgres connect to ultrasqld")?;
-    let conn_handle = tokio::spawn(async move {
-        if let Err(e) = connection.await {
-            eprintln!("tokio-postgres connection error: {e}");
-        }
-    });
-
-    let table = format!("bench_update_{ix}");
-    client
-        .batch_execute(&format!("CREATE TABLE {table} (id INT NOT NULL, val INT)"))
-        .await
-        .with_context(|| format!("CREATE TABLE {table}"))?;
-    preload_chunked(&client, &table, n_rows).await?;
-
-    let started = Instant::now();
-    let messages = client
-        .simple_query(&format!(
-            "UPDATE {table} SET val = val + 1 WHERE id < {n_rows}"
-        ))
-        .await
-        .with_context(|| format!("UPDATE {table}"))?;
-    let elapsed_us = started.elapsed().as_secs_f64() * 1e6;
-    // CommandComplete carries the row count; a sanity-check tag would
-    // require parsing — verifying that the simple_query returned at
-    // least a CommandComplete is sufficient here.
-    if !messages
-        .iter()
-        .any(|m| matches!(m, tokio_postgres::SimpleQueryMessage::CommandComplete(_)))
-    {
-        anyhow::bail!("UPDATE returned no CommandComplete message");
-    }
-
-    drop(client);
-    conn_handle.abort();
-    Ok(elapsed_us)
-}
-
-/// Run one bulk-DELETE iteration. See [`run_update_iter`] for the
-/// shape; only the SQL statement differs.
+/// Run one bulk-DELETE iteration. Preload happens outside the timed
+/// region; only the SQL statement differs from the legacy UPDATE
+/// single-iteration shape.
 async fn run_delete_iter(server: SocketAddr, n_rows: usize, ix: usize) -> Result<f64> {
     let conn_str = format!("host=127.0.0.1 port={} user=ultrasql_bench", server.port());
     let (client, connection) = tokio_postgres::connect(&conn_str, NoTls)
@@ -2434,6 +2386,71 @@ async fn run_shared_select_scan(
             .count();
         if row_count != n_rows {
             anyhow::bail!("row count mismatch: expected {n_rows}, observed {row_count}");
+        }
+        if i >= warmup {
+            iters_us.push(elapsed_us);
+        }
+    }
+
+    drop(client);
+    conn_handle.abort();
+    Ok(())
+}
+
+/// Shared-table bulk UPDATE workload: preload `n_rows` once, then
+/// time only `UPDATE t SET val = val + 1 WHERE id < n_rows` inside
+/// a transaction and roll it back after the timed statement.
+///
+/// This matches the DuckDB and SQLite competitor runners: one
+/// persistent driver connection, stable SQL text, identical starting
+/// row image for every sample, and rollback outside the timed region.
+/// It measures the UPDATE executor/wire round-trip rather than
+/// per-sample table creation or cold parse/bind misses.
+async fn run_shared_update(
+    server: SocketAddr,
+    n_rows: usize,
+    warmup: usize,
+    total_iters: usize,
+    iters_us: &mut Vec<f64>,
+) -> Result<()> {
+    let conn_str = format!("host=127.0.0.1 port={} user=ultrasql_bench", server.port());
+    let (client, connection) = tokio_postgres::connect(&conn_str, NoTls)
+        .await
+        .context("tokio-postgres connect to ultrasqld")?;
+    let conn_handle = tokio::spawn(async move {
+        if let Err(e) = connection.await {
+            eprintln!("tokio-postgres connection error: {e}");
+        }
+    });
+
+    let table = "bench_update_shared";
+    client
+        .batch_execute(&format!("CREATE TABLE {table} (id INT NOT NULL, val INT)"))
+        .await
+        .with_context(|| format!("CREATE TABLE {table}"))?;
+    preload_chunked(&client, table, n_rows).await?;
+
+    let query = format!("UPDATE {table} SET val = val + 1 WHERE id < {n_rows}");
+    for i in 0..total_iters {
+        client
+            .batch_execute("BEGIN")
+            .await
+            .context("BEGIN update sample")?;
+        let started = Instant::now();
+        let messages = client
+            .simple_query(&query)
+            .await
+            .with_context(|| format!("UPDATE {table}"))?;
+        let elapsed_us = started.elapsed().as_secs_f64() * 1e6;
+        client
+            .batch_execute("ROLLBACK")
+            .await
+            .context("ROLLBACK update sample")?;
+        if !messages
+            .iter()
+            .any(|m| matches!(m, tokio_postgres::SimpleQueryMessage::CommandComplete(_)))
+        {
+            anyhow::bail!("UPDATE returned no CommandComplete message");
         }
         if i >= warmup {
             iters_us.push(elapsed_us);

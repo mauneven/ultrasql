@@ -129,10 +129,8 @@ fn vacuum_undo_log_drops_only_below_threshold() {
     let n_blocks = heap.block_count(rel());
 
     // Two committed in-place UPDATE batches under xid=2 and xid=4.
-    // Each batch updates every row, so the undo log accumulates
-    // 2 * ROWS entries (50 per writer for the most-recent state of
-    // the slot, plus 50 from the previous writer — UPDATE pushes one
-    // entry per visited row per pass).
+    // Each batch updates every row, so compact undo represents
+    // 2 * ROWS pre-images without storing one full entry per row.
     for xid_raw in [2_u64, 4_u64] {
         oracle.set_committed(Xid::new(xid_raw));
         let snap = Snapshot::new(
@@ -159,22 +157,28 @@ fn vacuum_undo_log_drops_only_below_threshold() {
     }
     assert_eq!(
         heap.undo_log_len(rel()),
+        0,
+        "bulk int32 updates use compact undo batches"
+    );
+    assert_eq!(
+        heap.int32_pair_undo_slot_len(rel()),
         2 * ROWS,
-        "two committed writers should leave 2 * ROWS entries"
+        "two committed writers should retain 2 * ROWS pre-images"
     );
 
     // Oldest active xid = 3 → trim every writer < 3 (xid=2 only).
     let trimmed = heap.vacuum_undo_log(Xid::new(3)).expect("vacuum");
-    assert_eq!(trimmed, ROWS, "every xid=2 entry should be dropped");
+    assert_eq!(trimmed, ROWS, "every xid=2 pre-image should be dropped");
     assert_eq!(
-        heap.undo_log_len(rel()),
+        heap.int32_pair_undo_slot_len(rel()),
         ROWS,
-        "only the xid=4 entries should remain"
+        "only the xid=4 pre-images should remain"
     );
 
     // Oldest active xid = 5 → trim the remaining xid=4 entries too.
     let trimmed = heap.vacuum_undo_log(Xid::new(5)).expect("vacuum");
     assert_eq!(trimmed, ROWS);
+    assert_eq!(heap.int32_pair_undo_slot_len(rel()), 0);
     assert_eq!(heap.undo_log_len(rel()), 0);
 
     // Second call at the same threshold is a no-op.
@@ -226,12 +230,12 @@ fn vacuum_undo_log_no_op_when_threshold_below_every_writer() {
     )
     .expect("update");
 
-    let before = heap.undo_log_len(rel());
+    let before = heap.int32_pair_undo_slot_len(rel());
     assert!(before > 0);
     // Threshold strictly below the writer xid — no entries qualify.
     let trimmed = heap.vacuum_undo_log(Xid::new(5)).expect("vacuum");
     assert_eq!(trimmed, 0);
-    assert_eq!(heap.undo_log_len(rel()), before);
+    assert_eq!(heap.int32_pair_undo_slot_len(rel()), before);
 }
 
 #[test]
@@ -290,7 +294,8 @@ fn long_snapshot_survives_update_delete_and_vacuum() {
         .expect("update");
     oracle.set_committed(Xid::new(2));
     assert_eq!(updated, ROWS / 2);
-    assert_eq!(heap.undo_log_len(rel()), updated);
+    assert_eq!(heap.undo_log_len(rel()), 0);
+    assert_eq!(heap.int32_pair_undo_slot_len(rel()), updated);
 
     let writer_delete = Snapshot::new(
         Xid::new(3),
