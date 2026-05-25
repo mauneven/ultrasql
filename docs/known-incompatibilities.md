@@ -52,7 +52,7 @@ release status.
 
 ## Performance certification
 
-- README benchmark rows must come from SQL-surface scripts and recorded
+- README performance notes must come from SQL-surface scripts and recorded
   artifacts.
 - TPC-H/TPC-C/Sysbench/ClickBench gates are open until same-host artifacts prove
   the target thresholds.

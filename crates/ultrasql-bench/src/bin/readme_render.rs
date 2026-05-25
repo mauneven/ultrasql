@@ -204,10 +204,9 @@ static STATIC_DEFAULTS: &[StaticTable] = &[
         heading: "UPDATE throughput — 10 000 rows",
         rows: &[
             // DuckDB / SQLite store the 10 000-row UPDATE as a vectorized
-            // expression and so report sub-µs medians in the captured run;
-            // they remain ranked above UltraSQL on this workload. UltraSQL
-            // beats PostgreSQL by ~14× and is the fastest engine that
-            // actually walks 10 000 row versions one at a time.
+            // expression and so report sub-µs medians in the captured run.
+            // This static table is legacy context; published README claims
+            // should come from SQL-surface raw artifacts.
             StaticRow {
                 engine: "DuckDB",
                 median_us: 52.719,
@@ -263,9 +262,9 @@ static STATIC_DEFAULTS: &[StaticTable] = &[
         id: "mixed_oltp_pgbench_like",
         heading: "Mixed OLTP (pgbench-like)",
         rows: &[
-            // SQLite/DuckDB report this as a tight in-memory loop and
-            // beat UltraSQL on the captured run. UltraSQL beats PostgreSQL
-            // by ~4×.
+            // SQLite/DuckDB report this as a tight in-memory loop on the
+            // captured run. This static table is legacy context; published
+            // README claims should come from SQL-surface raw artifacts.
             StaticRow {
                 engine: "SQLite",
                 median_us: 367.782,

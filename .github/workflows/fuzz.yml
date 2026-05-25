@@ -48,7 +48,7 @@ jobs:
           FUZZ_TARGET: ${{ matrix.target }}
         run: |
           # Per-PR budget: 60 s. -rss_limit_mb=4096 leaves headroom for
-          # AddressSanitizer overhead (~2× the parser's native ~1 GB).
+          # AddressSanitizer overhead is roughly double the parser's native ~1 GB.
           # -max_len=1024 caps input size so worst-case AST allocation
           # stays bounded; the seed corpus is well under 1 KB per file.
           cargo +nightly fuzz run "$FUZZ_TARGET" -- \

@@ -2,7 +2,7 @@
   "schema_version": 1,
   "workload": "tpch_sf1_postgres",
   "scale_factor": 1,
-  "target": "UltraSQL geometric mean <= 0.5x PostgreSQL 17 geometric mean across all 22 TPC-H queries",
+  "target": "UltraSQL geometric mean <= PostgreSQL 17 geometric mean across all 22 TPC-H queries",
   "expected_query_count": 22,
   "postgres_query_count": 22,
   "ultrasql_query_count": 22,

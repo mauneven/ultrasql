@@ -807,8 +807,8 @@ mod tests {
     #[test]
     fn passes_when_no_regression_and_floors_met() {
         // Baseline throughput = 200_000; current = 200_000 (0% change).
-        // Competitor throughput = 80_000; floor = 2.0× (we need ≥ 160_000).
-        // Our 200_000 ≥ 160_000, so no floor failure.
+        // Competitor throughput = 80_000; floor = 1.0 (we need >= 80_000).
+        // Our 200_000 leads, so no floor failure.
         let baseline = make_baseline(200_000.0, 0.0, 80_000.0, "postgres17");
         let result = make_result(200_000.0, vec![]);
         let mut reg_failures = Vec::new();
@@ -827,7 +827,7 @@ mod tests {
         );
 
         let floors: &[(Engine, FloorMetric)] =
-            &[(Engine::Postgres17, FloorMetric::ThroughputRatio(2.0))];
+            &[(Engine::Postgres17, FloorMetric::ThroughputRatio(1.0))];
         let mut floor_failures = Vec::new();
         check_competitor_floors(
             "point_lookup",
@@ -851,10 +851,10 @@ mod tests {
 
     #[test]
     fn detects_competitor_floor_violation() {
-        // Competitor throughput = 100_000; floor = 2.0×; ours = 60_000 → fail.
+        // Competitor throughput = 100_000; floor = 1.0; ours = 60_000 -> fail.
         let baseline = make_baseline(60_000.0, 0.0, 100_000.0, "postgres17");
         let floors: &[(Engine, FloorMetric)] =
-            &[(Engine::Postgres17, FloorMetric::ThroughputRatio(2.0))];
+            &[(Engine::Postgres17, FloorMetric::ThroughputRatio(1.0))];
         let mut failures = Vec::new();
         check_competitor_floors(
             "point_lookup",
@@ -882,19 +882,19 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // competitor_floor_2x_throughput_passes_when_ultrasql_at_2_5x
+    // competitor_floor_throughput_passes_when_ultrasql_leads
     // -----------------------------------------------------------------------
 
     #[test]
-    fn competitor_floor_2x_throughput_passes_when_ultrasql_at_2_5x() {
-        // Competitor = 100_000 ops/s; floor = 2.0×; ours = 250_000 (2.5×) → pass.
-        let baseline = make_baseline(250_000.0, 0.0, 100_000.0, "postgres17");
+    fn competitor_floor_throughput_passes_when_ultrasql_leads() {
+        // Competitor = 100_000 ops/s; floor = 1.0; ours = 125_000 -> pass.
+        let baseline = make_baseline(125_000.0, 0.0, 100_000.0, "postgres17");
         let floors: &[(Engine, FloorMetric)] =
-            &[(Engine::Postgres17, FloorMetric::ThroughputRatio(2.0))];
+            &[(Engine::Postgres17, FloorMetric::ThroughputRatio(1.0))];
         let mut failures = Vec::new();
         check_competitor_floors(
             "point_lookup",
-            250_000.0,
+            125_000.0,
             50.0,
             floors,
             None,
@@ -903,32 +903,35 @@ mod tests {
         );
         assert!(
             failures.is_empty(),
-            "2.5× should pass a 2.0× floor; got: {:?}",
+            "leader should pass the competitor floor; got: {:?}",
             failures
         );
     }
 
     // -----------------------------------------------------------------------
-    // competitor_floor_2x_throughput_fails_when_ultrasql_at_1_8x
+    // competitor_floor_throughput_fails_when_ultrasql_trails
     // -----------------------------------------------------------------------
 
     #[test]
-    fn competitor_floor_2x_throughput_fails_when_ultrasql_at_1_8x() {
-        // Competitor = 100_000 ops/s; floor = 2.0×; ours = 180_000 (1.8×) → fail.
-        let baseline = make_baseline(180_000.0, 0.0, 100_000.0, "postgres17");
+    fn competitor_floor_throughput_fails_when_ultrasql_trails() {
+        // Competitor = 100_000 ops/s; floor = 1.0; ours = 90_000 -> fail.
+        let baseline = make_baseline(90_000.0, 0.0, 100_000.0, "postgres17");
         let floors: &[(Engine, FloorMetric)] =
-            &[(Engine::Postgres17, FloorMetric::ThroughputRatio(2.0))];
+            &[(Engine::Postgres17, FloorMetric::ThroughputRatio(1.0))];
         let mut failures = Vec::new();
         check_competitor_floors(
             "point_lookup",
-            180_000.0,
+            90_000.0,
             50.0,
             floors,
             None,
             Some(&baseline),
             &mut failures,
         );
-        assert!(!failures.is_empty(), "1.8× should fail a 2.0× floor");
+        assert!(
+            !failures.is_empty(),
+            "trailing competitor should fail floor"
+        );
         assert!(
             failures[0].contains("COMPETITOR LOSS"),
             "failure message must contain 'COMPETITOR LOSS': {}",
@@ -942,19 +945,19 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // competitor_floor_2x_throughput_fails_when_at_exactly_2x_minus_epsilon
+    // competitor_floor_throughput_fails_when_below_required_ratio
     // -----------------------------------------------------------------------
 
     #[test]
-    fn competitor_floor_2x_throughput_fails_when_at_exactly_2x_minus_epsilon() {
-        // Competitor = 100_000 ops/s; floor = 2.0×; ours = 199_999 (< 200_000) → fail.
-        let baseline = make_baseline(199_999.0, 0.0, 100_000.0, "duckdb");
+    fn competitor_floor_throughput_fails_when_below_required_ratio() {
+        // Competitor = 100_000 ops/s; floor = 1.0; ours = 99_999 -> fail.
+        let baseline = make_baseline(99_999.0, 0.0, 100_000.0, "duckdb");
         let floors: &[(Engine, FloorMetric)] =
-            &[(Engine::DuckDb, FloorMetric::ThroughputRatio(2.0))];
+            &[(Engine::DuckDb, FloorMetric::ThroughputRatio(1.0))];
         let mut failures = Vec::new();
         check_competitor_floors(
             "point_lookup",
-            199_999.0,
+            99_999.0,
             50.0,
             floors,
             None,
@@ -963,7 +966,7 @@ mod tests {
         );
         assert!(
             !failures.is_empty(),
-            "199_999 ops/s should fail a 2.0× floor against 100_000 ops/s"
+            "99_999 ops/s should fail a 1.0 floor against 100_000 ops/s"
         );
         assert!(
             failures[0].contains("duckdb"),
@@ -982,11 +985,11 @@ mod tests {
         // make_baseline passes 0.0 for competitor_tput, which omits the entry.
         let baseline = make_baseline(100_000.0, 0.0, 0.0, "postgres17");
         let floors: &[(Engine, FloorMetric)] =
-            &[(Engine::Postgres17, FloorMetric::ThroughputRatio(2.0))];
+            &[(Engine::Postgres17, FloorMetric::ThroughputRatio(1.0))];
         let mut failures = Vec::new();
         check_competitor_floors(
             "point_lookup",
-            50_000.0, // ours is only 0.5× — would fail if data existed
+            50_000.0, // ours trails competitor and would fail if data existed
             50.0,
             floors,
             None,
@@ -1129,10 +1132,10 @@ mod tests {
     /// so a run that would otherwise fail a floor passes cleanly.
     #[test]
     fn smoke_skips_competitor_floor_checks() {
-        // Competitor floor would require 200_000 ops/s but we only have 50_000.
+        // Competitor floor would require 100_000 ops/s but we only have 50_000.
         let baseline = make_baseline(50_000.0, 0.0, 100_000.0, "postgres17");
         let floors: &[(Engine, FloorMetric)] =
-            &[(Engine::Postgres17, FloorMetric::ThroughputRatio(2.0))];
+            &[(Engine::Postgres17, FloorMetric::ThroughputRatio(1.0))];
 
         // Smoke mode skips floor checks entirely — simulate by calling
         // check_competitor_floors with the gate active but confirming the

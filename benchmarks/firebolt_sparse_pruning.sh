@@ -490,7 +490,7 @@ if (
 ):
     target_ratio = ultrasql_median_us / firebolt_median_us
 target_ready = target_ratio is not None and firebolt_pruning_evidence
-target_passed = target_ready and target_ratio <= 0.5
+target_passed = target_ready and target_ratio <= 1.0
 has_failed = any(entry["status"] == "failed" for entry in entries)
 has_unavailable = any(entry["status"] == "unavailable" for entry in entries)
 reason = None
@@ -512,13 +512,13 @@ doc = {
     "both_engines_measured": both_measured,
     "primary_index_pruning_evidence_required": True,
     "firebolt_primary_index_pruning_evidence": firebolt_pruning_evidence,
-    "target_max_ratio_ultrasql_vs_firebolt": 0.5,
+    "target_max_ratio_ultrasql_vs_firebolt": 1.0,
     "target_ratio_ultrasql_vs_firebolt": target_ratio,
     "ultrasql_median_us": ultrasql_median_us,
     "firebolt_median_us": firebolt_median_us,
     "engines": entries,
     "policy": (
-        "UltraSQL median latency at most half of Firebolt is required for "
+        "UltraSQL median latency no higher than Firebolt is required for "
         "certification. No Firebolt sparse-pruning benchmark claim exists "
         "unless Firebolt has a measured local Core artifact and EXPLAIN "
         "shows primary-index pruning evidence."

@@ -217,8 +217,8 @@ async fn intersect_distinct_returns_common_rows() {
 async fn intersect_all_respects_per_row_min_counts() {
     let (client, _conn_handle, server_handle) = start_server_and_connect().await;
     let (left, right) = create_setop_tables(&client, "intersect_a").await;
-    // left: 1×{1}, 3×{2}, 1×{3}; right: 2×{2}, 1×{3}, 1×{4}.
-    // INTERSECT ALL = 0×{1}, 2×{2}, 1×{3}, 0×{4} → [2, 2, 3].
+    // left counts: {1:1, 2:3, 3:1}; right counts: {2:2, 3:1, 4:1}.
+    // INTERSECT ALL = {1:0, 2:2, 3:1, 4:0} -> [2, 2, 3].
     insert_rows(&client, &left, &[1, 2, 2, 2, 3]).await;
     insert_rows(&client, &right, &[2, 2, 3, 4]).await;
 
@@ -264,7 +264,7 @@ async fn except_all_subtracts_right_counts_from_left() {
     let (client, _conn_handle, server_handle) = start_server_and_connect().await;
     let (left, right) = create_setop_tables(&client, "except_a").await;
     // left: 1×{1}, 3×{2}, 1×{3}; right: 1×{2}, 1×{4}.
-    // EXCEPT ALL = 1×{1}, 2×{2}, 1×{3}, 0×{4} → [1, 2, 2, 3].
+    // EXCEPT ALL = {1:1, 2:2, 3:1, 4:0} -> [1, 2, 2, 3].
     insert_rows(&client, &left, &[1, 2, 2, 2, 3]).await;
     insert_rows(&client, &right, &[2, 4]).await;
 

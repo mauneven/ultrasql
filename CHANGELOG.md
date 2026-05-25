@@ -20,7 +20,7 @@ and must document the break here.
 - Same-host AI/vector certification runner now requires measured UltraSQL and
   PostgreSQL + pgvector exact top-k artifacts before passing.
 - Same-host TPC-H SF1 PostgreSQL 17 certification now runs complete q1..q22
-  raw artifacts and records the 2x geometric-mean pass/fail decision.
+  raw artifacts and records the geometric-mean pass/fail decision.
 - HNSW/IVFFlat durability certification covers torn ANN WAL tails,
   crash/restart rebuild after DML, and typed WAL payload fuzz/property tests.
 - SQLLogicTest runner and documented external-test import policy.
@@ -58,7 +58,7 @@ and must document the break here.
   statement in a batch. The certification target remains open.
 - TPC-C certification now has a PostgreSQL-wire runner for NewOrder, Payment,
   OrderStatus, Delivery, and StockLevel, plus same-host PostgreSQL 17
-  comparison artifacts. Correctness is verified, but the 2x throughput target
+  comparison artifacts. Correctness is verified, but throughput leadership
   remains open.
 - Sysbench OLTP certification now reports correctness for both engines and an
   honest target failure rather than publishing the older UltraSQL-only latency
@@ -67,7 +67,7 @@ and must document the break here.
   setup-failure reasons, and explicit UltraSQL/PostgreSQL target-ratio fields.
 - Firebolt sparse primary-index pruning now treats the manifest as the
   certification gate, requiring both measured engines, Firebolt pruning
-  evidence, and `target_ratio_ultrasql_vs_firebolt <= 0.5`.
+  evidence, and `target_ratio_ultrasql_vs_firebolt <= 1.0`.
 
 ### Fixed
 

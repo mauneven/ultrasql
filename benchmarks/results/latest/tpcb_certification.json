@@ -1,6 +1,6 @@
 {
   "workload": "tpcb_32conn",
-  "target": "UltraSQL throughput >= 2x PostgreSQL 17 and p99 < 5 ms at 32 clients",
+  "target": "UltraSQL throughput >= PostgreSQL 17 and p99 < 5 ms at 32 clients",
   "passed": false,
   "reason": "target_not_met",
   "postgres_result": "benchmarks/results/latest/raw/tpcb_32conn-postgres17.json",

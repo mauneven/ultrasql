@@ -4,13 +4,14 @@ UltraSQL is an open-source project. Governance is deliberately
 lightweight: enough structure to make decisions cleanly, not enough
 to slow them down.
 
-
 ## 1. Roles
 
 ### Contributor
 
-A human who submits a PR, files an issue, reviews code, or participates
+A person who submits a PR, files an issue, reviews code, or participates
 in discussions. There is no application; you become a contributor by
+contributing.
+
 ### Reviewer
 
 A long-standing contributor who is trusted to review PRs in a specific

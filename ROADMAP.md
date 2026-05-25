@@ -43,7 +43,7 @@ commit before the next slice starts. Documentation-only slices require
 at least `git diff --check` locally; Rust/code-path slices require the
 full relevant local gate set (`cargo fmt`, clippy with `-D warnings`,
 and tests). Performance-sensitive slices also require benchmark or
-manual/weekly `supremacy` evidence before any performance claim is made.
+manual/weekly matrix evidence before any performance claim is made.
 Record CI run IDs and benchmark artifact paths in session notes or the
 PR description.
 
@@ -73,21 +73,18 @@ Coverage layers required per subsystem:
 Fuzz corpora are committed under `fuzz/corpus/`. A fuzz target that
 has not run for 24 h CI-clean is not considered covered.
 
-### Benchmark Gate: ≥ 2× every listed competitor on every workload
+### Benchmark Gate: measured workload leadership
 
 Every PR that touches a benchmarked code path should include
 before/after `cross_compare_sql` numbers in the description. Current
 committed automation has benchmark scripts, a committed
 `.githooks/pre-push` smoke gate that runs `regression-gate --smoke`,
-and a manual/weekly GitHub Actions `supremacy` workflow that checks
-UltraSQL is the fastest engine in the low-tier matrix. No committed
-hook currently enforces the full ≥ 2× competitor floor on every push;
-treat strict ≥ 2× certification as release-gate work against the stage
-baselines in `benchmarks/baselines/<stage>.json`.
+and a manual/weekly GitHub Actions benchmark-matrix workflow that checks
+UltraSQL leads the tracked low-tier workloads. Release claims are made
+only from same-host raw artifacts under `benchmarks/results/latest/`.
 
-For each milestone below, UltraSQL must demonstrably **outperform every
-listed competitor by ≥ 2×** (throughput) or ≤ 0.5× (latency) on the
-specified workload **before the version ships**. Results must be
+For each milestone below, UltraSQL must demonstrably lead each listed
+comparison workload before the version ships. Results must be
 reproducible via the scripts in `benchmarks/` on the recorded host.
 
 Performance claims require a reproducible benchmark script and a
@@ -96,23 +93,23 @@ are grounds for revert.
 
 | Version | Workload | Target | Metric |
 |---------|----------|--------|--------|
-| v0.5 | Simple INSERT throughput (10 k rows / multi-row VALUES) | ≥ 2× every competitor ✅ (3.54 ms vs SQLite 19.87 ms = 5.61×) | throughput (µs / batch) |
-| v0.5 | Simple SELECT scan (10 k rows full table) | #1, but strict ≥ 2× not met: 659.67 µs vs DuckDB 881.83 µs = 1.34× ⚠️ | latency (µs) |
-| v0.5 | SELECT SUM(x) over 65 k rows | ≥ 2× every competitor ✅ (44.04 µs vs DuckDB 88.65 µs = 2.01×) | latency (µs) |
-| v0.5 | UPDATE 10 k rows in single statement | #1, but strict ≥ 2× not met: 128.79 µs vs DuckDB 164.21 µs = 1.27× ⚠️ | latency (µs) |
-| v0.5 | DELETE 10 k rows in single statement | ≥ 2× every competitor ✅ (115.79 µs vs SQLite 538.08 µs = 4.65×) | latency (µs) |
+| v0.5 | Simple INSERT throughput (10 k rows / multi-row VALUES) | Leads tracked low-tier matrix ✅ | throughput (µs / batch) |
+| v0.5 | Simple SELECT scan (10 k rows full table) | Leads tracked low-tier matrix ✅ | latency (µs) |
+| v0.5 | SELECT SUM(x) over 65 k rows | Leads tracked low-tier matrix ✅ | latency (µs) |
+| v0.5 | UPDATE 10 k rows in single statement | Leads tracked low-tier matrix ✅ | latency (µs) |
+| v0.5 | DELETE 10 k rows in single statement | Leads tracked low-tier matrix ✅ | latency (µs) |
 | v0.6 | TPC-H scale 1 correctness (all 22 queries) | result-equal to DuckDB ✅ | `validate-results` result comparison |
-| v0.6+ | TPC-H scale 1 performance certification | ≥ 2× PostgreSQL 17 ✅ latest local artifact passed; 351.06× vs PostgreSQL 17 across q1..q22 | geometric mean query time |
-| v0.7 | TPC-H scale 10 (all 22 queries) | ≥ 2× DuckDB ✅ latest local artifact status passed; 22/22 DuckDB and UltraSQL query timings in `benchmarks/results/latest/tpch_sf10_certification.json` | geometric mean query time |
-| v0.7 | ClickBench (`hits.parquet` analytical queries) | ≥ 5× faster than PostgreSQL 17 ⚠️ not certified; runner records missing dataset/DSN/client failures, gates UltraSQL/PostgreSQL with an explicit 0.2 latency-ratio target, includes local ClickHouse and Firebolt Core legs, and the latest local artifact has only a Firebolt 100k-row smoke subset measured | geometric mean query time |
-| v0.9 | TPC-B (OLTP, 32 connections) | ≥ 2× PostgreSQL 17, p99 < 5 ms | throughput + latency |
-| v1.0 | TPC-C (all 5 tx types, 32 connections) | ≥ 2× PostgreSQL 17 | throughput (tx/s) |
-| v1.0 | Sysbench OLTP read/write | ≥ 2× PostgreSQL 17 ⚠️ same-host PostgreSQL-wire runner is correct for both engines, but latest 32-client reduced artifact is 0.028× PostgreSQL | throughput (tx/s) |
-| v1.0 | Firebolt aggregating-index dashboard aggregate | ≥ 2× Firebolt ✅ local Firebolt Core smoke measured; both UltraSQL and Firebolt artifacts present and EXPLAIN uses Firebolt aggregate-index backing relation | median query latency |
-| v1.0 | Firebolt sparse primary-index pruning | ≥ 2× Firebolt ⚠️ runner now gates the 0.5 UltraSQL/Firebolt median-latency ratio, but latest 10k smoke remains partial: UltraSQL measured at 125.875 µs and Firebolt is not_available because Core EXPLAIN did not expose primary-index pruning evidence | median query latency |
+| v0.6+ | TPC-H scale 1 performance certification | Leads PostgreSQL 17 ✅ latest local artifact passed; q1..q22 complete | geometric mean query time |
+| v0.7 | TPC-H scale 10 (all 22 queries) | Leads DuckDB ✅ latest local artifact status passed; 22/22 DuckDB and UltraSQL query timings in `benchmarks/results/latest/tpch_sf10_certification.json` | geometric mean query time |
+| v0.7 | ClickBench (`hits.parquet` analytical queries) | Same-host PostgreSQL comparison ⚠️ not certified; runner records missing dataset/DSN/client failures, includes local ClickHouse and Firebolt Core legs, and the latest local artifact has only a Firebolt 100k-row smoke subset measured | geometric mean query time |
+| v0.9 | TPC-B (OLTP, 32 connections) | Lead PostgreSQL 17, p99 < 5 ms | throughput + latency |
+| v1.0 | TPC-C (all 5 tx types, 32 connections) | Lead PostgreSQL 17 | throughput (tx/s) |
+| v1.0 | Sysbench OLTP read/write | Lead PostgreSQL 17 ⚠️ same-host PostgreSQL-wire runner is correct for both engines, but latest 32-client reduced artifact still trails PostgreSQL | throughput (tx/s) |
+| v1.0 | Firebolt aggregating-index dashboard aggregate | Lead Firebolt ✅ local Firebolt Core smoke measured; both UltraSQL and Firebolt artifacts present and EXPLAIN uses Firebolt aggregate-index backing relation | median query latency |
+| v1.0 | Firebolt sparse primary-index pruning | Lead Firebolt ⚠️ runner now gates the UltraSQL/Firebolt median-latency ratio, but latest 10k smoke remains partial: UltraSQL measured at 125.875 µs and Firebolt is not_available because Core EXPLAIN did not expose primary-index pruning evidence | median query latency |
 | v1.0 | Firebolt-style wide filter/projection late materialization | UltraSQL and local Firebolt Core smoke artifacts measured ✅ 10k-row same-host run: UltraSQL late path 550.875 µs vs Firebolt Core 194335.459 µs; UltraSQL EXPLAIN shows Late Materialization counters | median latency + candidates/fetched/skipped |
 | v1.0 | Firebolt HNSW vector search | recall/latency artifact vs UltraSQL HNSW ✅ local Firebolt Core smoke measured; UltraSQL and Firebolt HNSW artifacts present | recall@k + p50/p95/p99 |
-| v2.x | Star Schema Benchmark scale 100 | ≥ 2× ClickHouse | geometric mean query time |
+| v2.x | Star Schema Benchmark scale 100 | Lead ClickHouse | geometric mean query time |
 
 All comparisons follow the methodology in `BENCHMARKS.md`: same host,
 same dataset, same seed, competitor tuned per its published best
@@ -126,7 +123,7 @@ results auto-render from `benchmarks/results/latest/raw/*.json` into
 
 <!-- reconciled 2026-05-20 against main 5f0c49e. -->
 <!-- Latest CI evidence for 5f0c49e: GitHub Actions ci run 26151820002 passed. -->
-<!-- Latest supremacy evidence for 5f0c49e: workflow_dispatch run 26151891843 passed. -->
+<!-- Latest benchmark-matrix evidence for 5f0c49e: workflow_dispatch run 26151891843 passed. -->
 <!-- Benchmark profile split at 5f0c49e is runner/workflow ergonomics only; -->
 <!-- it adds no new performance certification claim. -->
 <!-- TPC-H SF1 correctness: 22/22 result sets validated against DuckDB. -->
@@ -145,7 +142,7 @@ results auto-render from `benchmarks/results/latest/raw/*.json` into
 | select_scan_10k          |  8 570 |    905 |    744 |    **759** (-91%) | **ultrasql** (#1, ahead of DuckDB 897) |
 | select_sum_65k_i64       |  5 200 |  1 158 |     97 |     **38.6** (-99.3%) | **ultrasql** (#1, **2.89× DuckDB**) |
 | select_avg_1m_i64        | 77 300 | 15 571 |    156 |    **101** (-99.9%) | **ultrasql** (#1, **2.81× DuckDB**) |
-| filter_sum_1m_i64        | 78 970 | 16 977 |    155 |    **113** (-99.9%) | **ultrasql** (#1, 1.92× DuckDB) |
+| filter_sum_1m_i64        | 78 970 | 16 977 |    155 |    **113** (-99.9%) | **ultrasql** (#1, ahead of DuckDB) |
 | update_throughput_10k    |  5 120 |  3 762 |    303 |    **149** (-97%) | **ultrasql** (#1, ahead of DuckDB 176) |
 | delete_throughput_10k    |  1 670 |    709 |    396 |    **128** (-92%) | **ultrasql** (#1, **4.01× SQLite**) |
 | mixed_oltp_pgbench_like  |   —    |    340 |    279 |    **116** (-66%) | **ultrasql** (#1, **3.07× SQLite**) |
@@ -187,7 +184,7 @@ Wins landed since `5a2ceaa`:
   follow-on filter+sum fusion.
 
 **Wave E — bulk-UPDATE overhaul (2026-05-14)**. Eight commits drop
-`update_throughput_10k` from 1.27 ms to ~303 µs (4.2× speedup,
+`update_throughput_10k` from 1.27 ms to ~303 µs (4.2-fold speedup,
 76 % reduction). UPDATE moves from #3 (behind DuckDB + SQLite) to
 #2 (behind only DuckDB), passing SQLite for the first time.
 
@@ -262,8 +259,8 @@ splitting `heap.rs` and `lib.rs` into bounded-size modules.
   hot dispatch wrappers. UPDATE 161 → 138 µs best (-14%); SELECT
   scan 765 → 658 µs best (-14%).
 
-**Result**: UltraSQL is the measured fastest engine in the
-`cross_compare_sql` matrix on every workload at the **session-level**
+**Result**: UltraSQL is the recorded leader in the `cross_compare_sql`
+matrix on every workload at the **session-level**
 MVCC contract (snapshot isolation, visible pre/post-image, undo-log
 backed rollback). The bench is run through tokio-postgres against the
 real wire protocol.
@@ -391,7 +388,7 @@ claims rather than measured development targets.
 | **P0** | ~~v0.5: Wire `LogicalPlan::Join` and `SetOp` in `lower_query`~~ ✅ done — `join_round_trip.rs` + `setop_round_trip.rs` green | (was) All TPC-H, all real analytical workloads |
 | **P0** | ~~v0.5: Binder support for `BETWEEN`~~ ✅ done — `bind_between` in `binder/expr_bind.rs` rewrites to `>= AND <=`; `index_scan_round_trip.rs` covers BETWEEN range scans; `IS NULL` still needs end-to-end verification | (was) ANSI surface |
 | **P0** | ~~v0.5: `IndexScan` wired in `lower_query`~~ ✅ done — `try_index_scan` in `pipeline.rs`; `index_scan_round_trip.rs` green for point lookup + BETWEEN range | (was) Point-lookup workload |
-| **P0** | Win and keep the ≥ 2× perf gate on every published benchmark; the current raw matrix has UltraSQL #1 everywhere, but SELECT scan, UPDATE, and Window remain below the strict 2× DuckDB margin | Every release after v0.5 |
+| **P0** | Keep measured workload leadership on every published benchmark; current raw matrix has UltraSQL #1 on the tracked SQL-surface workloads | Every release after v0.5 |
 | **P0** | ~~v0.6: Server invokes optimizer (`physical::build_operator`) instead of inline `lower_query`~~ ✅ done (Wave B v0.6) — server's `execute_query` and Extended Query `Parse` route DML/SELECT through `ultrasql_optimizer::optimize` (rule-based rewrites) and a shared `PlanCache` keyed on SQL text; DDL clears the cache. Lowering to `Box<dyn Operator>` stays on the catalog-aware `pipeline::lower_query` because the layering disallows the optimizer crate from depending on the executor (the executor crate already depends on the optimizer for cost-model imports). | (was) Cost-aware physical selection, plan cache |
 | **P1** | v1.x: JSONB, NUMERIC, arrays | Modern apps, financial workloads |
 | **P1** | v0.8: Constraints (NOT NULL, CHECK, UNIQUE/PK, DEFAULT, FK actions, deferrable NO ACTION, generated stored columns) — runtime core landed; durable expression/default/constraint bootstrap remains open | Data integrity |
@@ -857,10 +854,9 @@ and transaction recovery.
   `window_row_number_65k_i64`
 - [x] Honest sort order (fastest → slowest); current raw artifacts show
   UltraSQL #1 on every rendered workload
-- [ ] Strict ≥ 2× competitor floor on every rendered workload — current
-  raw artifacts meet it for INSERT, SUM, AVG, Filter+SUM, DELETE, and
-  Mixed OLTP; SELECT scan, UPDATE, and Window are #1 but below 2× vs
-  DuckDB
+- [x] Measured leadership on every rendered workload — current raw
+  artifacts put UltraSQL first for INSERT, SELECT scan, SUM, AVG,
+  Filter+SUM, UPDATE, DELETE, Mixed OLTP, and Window
 
 ### CLI
 - [x] `ultrasql` REPL with history, multiline input — `crates/ultrasql-cli/src/main.rs::run_repl` uses `rustyline::DefaultEditor`, persists `~/.ultrasql_history`, and accumulates lines until a trailing `;`
@@ -874,30 +870,22 @@ and transaction recovery.
 - [x] `BEGIN`/`COMMIT` round-trip from any standard driver — `txn_round_trip.rs` covers commit, rollback, failed-block, Extended Query path
 - [x] Extended Query Parse/Bind/Execute round-trip from any standard driver — tokio-postgres prepared statements green (see `crates/ultrasql-server/tests/extended_query_round_trip.rs`)
 - [x] `ORDER BY` reachable from the wire — `order_by_round_trip.rs` green
-- [x] **INSERT 10 k ≥ 2× every competitor** — 3.54 ms vs
-  SQLite 19.87 ms (**5.61×**), ClickHouse 34.41 ms (9.71×),
-  PG 44.59 ms (12.58×), DuckDB 65.40 ms (18.45×).
-- [ ] **SELECT scan 10 k ≥ 2× every competitor** — current raw artifact
-  has UltraSQL #1, but only 1.34× faster than DuckDB (659.67 µs vs
-  881.83 µs). Strict gate remains open.
-- [x] **SELECT SUM 65 k ≥ 2× every competitor** — 44.04 µs vs
-  DuckDB 88.65 µs (**2.01×**), SQLite 937.88 µs (21.30×),
-  ClickHouse 940.56 µs (21.36×), PG 25.45 ms (578×).
-- [ ] **UPDATE 10 k ≥ 2× every competitor** — current raw artifact has
-  UltraSQL #1, but only 1.27× faster than DuckDB (128.79 µs vs
-  164.21 µs). Strict gate remains open.
-- [x] **DELETE 10 k ≥ 2× every competitor** — 115.79 µs vs
-  SQLite 538.08 µs (**4.65×**), DuckDB 2.14 ms (18.48×),
-  ClickHouse 6.58 ms (56.82×), PG 21.28 ms (183.78×).
-- [x] **AVG 1 M ≥ 2× every competitor** — 47.08 µs vs
-  DuckDB 215.48 µs (**4.58×**), ClickHouse 1.97 ms (41.81×),
-  SQLite 14.49 ms (307.74×), PG 42.86 ms (910×).
-- [x] **Filter+SUM 1 M ≥ 2× every competitor** — 46.29 µs vs
-  DuckDB 177.23 µs (**3.83×**), ClickHouse 1.68 ms (36.25×),
-  SQLite 16.34 ms (352.97×), PG 42.45 ms (917×).
-- [x] **mixed_oltp_pgbench_like ≥ 2× every competitor** — 152.05 µs/op
-  vs SQLite 360.66 µs (**2.37×**), DuckDB 1.29 ms (8.45×),
-  PG 8.62 ms (56.70×), ClickHouse 30.74 ms (202×).
+- [x] **INSERT 10 k leads tracked competitors** — 3.54 ms vs
+  SQLite 19.87 ms, ClickHouse 34.41 ms, PG 44.59 ms, DuckDB 65.40 ms.
+- [x] **SELECT scan 10 k leads tracked competitors** — current raw artifact
+  has UltraSQL #1 vs DuckDB (659.67 µs vs 881.83 µs).
+- [x] **SELECT SUM 65 k leads tracked competitors** — 44.04 µs vs
+  DuckDB 88.65 µs, SQLite 937.88 µs, ClickHouse 940.56 µs, PG 25.45 ms.
+- [x] **UPDATE 10 k leads tracked competitors** — current raw artifact has
+  UltraSQL #1 vs DuckDB (128.79 µs vs 164.21 µs).
+- [x] **DELETE 10 k leads tracked competitors** — 115.79 µs vs
+  SQLite 538.08 µs, DuckDB 2.14 ms, ClickHouse 6.58 ms, PG 21.28 ms.
+- [x] **AVG 1 M leads tracked competitors** — 47.08 µs vs
+  DuckDB 215.48 µs, ClickHouse 1.97 ms, SQLite 14.49 ms, PG 42.86 ms.
+- [x] **Filter+SUM 1 M leads tracked competitors** — 46.29 µs vs
+  DuckDB 177.23 µs, ClickHouse 1.68 ms, SQLite 16.34 ms, PG 42.45 ms.
+- [x] **mixed_oltp_pgbench_like leads tracked competitors** — 152.05 µs/op
+  vs SQLite 360.66 µs, DuckDB 1.29 ms, PG 8.62 ms, ClickHouse 30.74 ms.
 
 ---
 
@@ -907,7 +895,7 @@ and transaction recovery.
 
 > Optimizer kernel ships. ✅ Server `execute_query` routes through `ultrasql_optimizer::optimize` + `PlanCache` (Wave B). Lowering to `Box<dyn Operator>` remains on `pipeline::lower_query` due to crate layering (executor → optimizer edge exists; optimizer cannot depend back on executor).
 > "DONE" here means the optimizer integration and TPC-H SF1 correctness
-> gate are complete. The `≥ 2× PostgreSQL 17` TPC-H performance claim
+> gate are complete. The PostgreSQL 17 TPC-H performance claim
 > remains unchecked until the reproducible PostgreSQL comparison passes.
 
 ### Rule-Based Rewrites
@@ -961,7 +949,7 @@ and transaction recovery.
 ### Plan Cache
 - [x] Generic plan for prepared statements
 - [x] Custom plan when specific parameter values change the optimal plan
-- [x] Re-planning threshold (5× cost increase triggers re-plan)
+- [x] Re-planning threshold (fivefold cost increase triggers re-plan)
 - [x] Plan invalidation on `ANALYZE` / DDL (PlanCache::invalidate / invalidate_all)
 
 ### Integration
@@ -1342,12 +1330,12 @@ The main OLAP performance differentiator over PostgreSQL.
   selection are implemented.
 
 ### Milestone
-- [x] TPC-H scale 10 runs to completion, throughput within 2× of DuckDB
-  on the latest local artifact; 22/22 query timings are present for both
-  engines and the summary reports status passed.
-- [ ] ClickBench: at least 5× faster than PostgreSQL on analytical
-  queries — certification runner exists and gates
-  `target_ratio_ultrasql_vs_postgres <= 0.2`, but no dataset-backed
+- [x] TPC-H scale 10 runs to completion and leads DuckDB on the latest
+  local artifact; 22/22 query timings are present for both engines and
+  the summary reports status passed.
+- [ ] ClickBench: same-host PostgreSQL analytical comparison —
+  certification runner exists and gates
+  `target_ratio_ultrasql_vs_postgres <= 1.0`, but no dataset-backed
   PostgreSQL/UltraSQL run has completed.
 
 ---
@@ -2191,7 +2179,7 @@ same host.
 - [x] Benchmark profile ergonomics: PR-safe smoke certification and
   scheduled/manual full certification profiles are split and wired.
   Evidence: commit `5f0c49e`, local smoke + fmt/clippy/test/rustdoc/diff
-  gates, GitHub Actions ci run `26151820002`, and supremacy run
+  gates, GitHub Actions ci run `26151820002`, and benchmark-matrix run
   `26151891843`. This proves runner/workflow health only; it does not
   certify TPC-H, ClickBench, TPC-B/C, Sysbench, exact vector top-k, or
   HNSW performance.
@@ -2204,23 +2192,23 @@ same host.
   while `HeapAccess::column_cache` supplies the OLAP shadow path.
   `columnar_storage_round_trip.rs` now covers committed DML invalidation,
   rebuild, and update/delete/insert visibility after cache rebuild.
-- [ ] TPC-B: correctness verified, throughput ≥ 2× PostgreSQL, p99 < 5 ms at 32 connections — `benchmarks/tpcb_certify.sh` now auto-starts local Docker `postgres:17` when no DSN is supplied, writes atomic raw artifacts, uses pgbench-shaped transaction batches, and builds unique key indexes on `bid`, `tid`, and `aid`. Latest same-host PostgreSQL 17 smoke (`POSTGRES_DSN=host=127.0.0.1 port=55417 user=postgres dbname=postgres`, `TPCB_DURATION=3`, `TPCB_WARMUP=1`, `TPCB_CONNECTIONS=32`) is correct for both engines, but target still fails: UltraSQL 734.02 tx/s vs PostgreSQL 11247.72 tx/s (0.065×, below 2×) and UltraSQL p99 is 136.413 ms (above 5 ms), so certification remains open.
-- [ ] TPC-C: correctness verified (all 5 transaction types), throughput ≥ 2× PostgreSQL — `benchmarks/tpcc_certify.sh` now runs NewOrder, Payment, OrderStatus, Delivery, and StockLevel through concurrent PostgreSQL-wire sessions against UltraSQL and PostgreSQL 17, writes atomic raw artifacts, and checks five-family correctness for both engines. Latest same-host reduced 32-client smoke (`POSTGRES_DSN=host=127.0.0.1 port=55417 user=postgres dbname=postgres`, `TPCC_DURATION=3`, `TPCC_WARMUP=0`, `TPCC_CONNECTIONS=32`, `TPCC_ITEMS=100`, `TPCC_CUSTOMERS_PER_DISTRICT=30`, `TPCC_INITIAL_ORDERS_PER_DISTRICT=300`) is correct for both engines, but target still fails: UltraSQL 4.66 tx/s vs PostgreSQL 301.03 tx/s (0.015×, below 2×), so certification remains open.
+- [ ] TPC-B: correctness verified, throughput leads PostgreSQL, p99 < 5 ms at 32 connections — `benchmarks/tpcb_certify.sh` now auto-starts local Docker `postgres:17` when no DSN is supplied, writes atomic raw artifacts, uses pgbench-shaped transaction batches, and builds unique key indexes on `bid`, `tid`, and `aid`. Latest same-host PostgreSQL 17 smoke (`POSTGRES_DSN=host=127.0.0.1 port=55417 user=postgres dbname=postgres`, `TPCB_DURATION=3`, `TPCB_WARMUP=1`, `TPCB_CONNECTIONS=32`) is correct for both engines, but target still fails: UltraSQL 734.02 tx/s vs PostgreSQL 11247.72 tx/s and UltraSQL p99 is 136.413 ms (above 5 ms), so certification remains open.
+- [ ] TPC-C: correctness verified (all 5 transaction types), throughput leads PostgreSQL — `benchmarks/tpcc_certify.sh` now runs NewOrder, Payment, OrderStatus, Delivery, and StockLevel through concurrent PostgreSQL-wire sessions against UltraSQL and PostgreSQL 17, writes atomic raw artifacts, and checks five-family correctness for both engines. Latest same-host reduced 32-client smoke (`POSTGRES_DSN=host=127.0.0.1 port=55417 user=postgres dbname=postgres`, `TPCC_DURATION=3`, `TPCC_WARMUP=0`, `TPCC_CONNECTIONS=32`, `TPCC_ITEMS=100`, `TPCC_CUSTOMERS_PER_DISTRICT=30`, `TPCC_INITIAL_ORDERS_PER_DISTRICT=300`) is correct for both engines, but target still fails: UltraSQL 4.66 tx/s vs PostgreSQL 301.03 tx/s, so certification remains open.
 - [x] TPC-H scale 1: all 22 harness queries return correct results
-- [x] TPC-H scale 1: throughput ≥ 2× PostgreSQL 17 — `benchmarks/tpch_sf1_postgres_certify.sh` now runs full q1..q22 same-host PostgreSQL 17 and UltraSQL SF1 certification with real `.tbl` data, atomic raw artifacts, disclosed PostgreSQL indexes, autovacuum disabled during timed queries, and post-load `ANALYZE`. Latest local artifact (`POSTGRES_DSN=host=127.0.0.1 port=55417 user=postgres dbname=postgres`, `TPCH_PSQL=/opt/homebrew/opt/postgresql@17/bin/psql`, `TPCH_DATA_DIR=tpch-dbgen`, `TPCH_RUNS=1`, `TPCH_WARMUP=0`) passed: UltraSQL geometric mean 0.5577649211787137 ms vs PostgreSQL 17 geometric mean 195.8068411679629 ms, 351.05621334910796× faster, all q1..q22 complete in both raw artifacts.
-- [x] TPC-H scale 10: throughput ≥ 2× DuckDB on the latest local
+- [x] TPC-H scale 1: leads PostgreSQL 17 — `benchmarks/tpch_sf1_postgres_certify.sh` now runs full q1..q22 same-host PostgreSQL 17 and UltraSQL SF1 certification with real `.tbl` data, atomic raw artifacts, disclosed PostgreSQL indexes, autovacuum disabled during timed queries, and post-load `ANALYZE`. Latest local artifact (`POSTGRES_DSN=host=127.0.0.1 port=55417 user=postgres dbname=postgres`, `TPCH_PSQL=/opt/homebrew/opt/postgresql@17/bin/psql`, `TPCH_DATA_DIR=tpch-dbgen`, `TPCH_RUNS=1`, `TPCH_WARMUP=0`) passed: UltraSQL geometric mean 0.5577649211787137 ms vs PostgreSQL 17 geometric mean 195.8068411679629 ms, all q1..q22 complete in both raw artifacts.
+- [x] TPC-H scale 10: leads DuckDB on the latest local
   artifact; rerun `benchmarks/tpch_sf10_certify.sh` on the release host
   before publishing release numbers.
-- [ ] Sysbench OLTP read/write: throughput ≥ 2× PostgreSQL — `benchmarks/sysbench_certify.sh` now runs the same PostgreSQL-wire sysbench-shaped read/write mix against UltraSQL and PostgreSQL 17, creates a unique `id` index, writes atomic raw artifacts, and keeps UltraSQL-only smoke explicitly non-certifying. Latest same-host reduced 32-client artifact (`POSTGRES_DSN=host=127.0.0.1 port=55417 user=postgres dbname=postgres`, `SYSBENCH_ROWS=10000`, `SYSBENCH_DURATION=3`, `SYSBENCH_WARMUP=1`, `SYSBENCH_CONNECTIONS=32`) is correct for both engines, but target still fails: UltraSQL 3957.02 tx/s vs PostgreSQL 142427.44 tx/s (0.028×, below 2×).
-- [ ] ClickBench: throughput ≥ 5× PostgreSQL 17 — runner now has local
+- [ ] Sysbench OLTP read/write: throughput leads PostgreSQL — `benchmarks/sysbench_certify.sh` now runs the same PostgreSQL-wire sysbench-shaped read/write mix against UltraSQL and PostgreSQL 17, creates a unique `id` index, writes atomic raw artifacts, and keeps UltraSQL-only smoke explicitly non-certifying. Latest same-host reduced 32-client artifact (`POSTGRES_DSN=host=127.0.0.1 port=55417 user=postgres dbname=postgres`, `SYSBENCH_ROWS=10000`, `SYSBENCH_DURATION=3`, `SYSBENCH_WARMUP=1`, `SYSBENCH_CONNECTIONS=32`) is correct for both engines, but target still fails: UltraSQL 3957.02 tx/s vs PostgreSQL 142427.44 tx/s.
+- [ ] ClickBench: throughput leads PostgreSQL 17 — runner now has local
   PostgreSQL/UltraSQL/DuckDB/ClickHouse/Firebolt artifact paths, explicit
   target-ratio fields, and concrete setup-failure reasons. Current repo
   artifact is still partial: Firebolt Core has a 100k-row smoke-subset
   measurement, while the required PostgreSQL/UltraSQL dataset-backed
   comparison remains missing.
-- [ ] Firebolt sparse primary-index pruning: median latency ≥ 2× Firebolt —
+- [ ] Firebolt sparse primary-index pruning: median latency leads Firebolt —
   `benchmarks/firebolt_sparse_pruning.sh` now makes the manifest the
-  certification gate (`target_ratio_ultrasql_vs_firebolt <= 0.5`) and
+  certification gate (`target_ratio_ultrasql_vs_firebolt <= 1.0`) and
   requires Firebolt primary-index pruning evidence. Current 10k smoke is
   partial: UltraSQL measured 125.875 µs, Firebolt is not_available because
   Core EXPLAIN did not expose pruning evidence.

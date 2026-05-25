@@ -438,7 +438,7 @@ impl Engine {
 /// Heuristic for "frames needed to hold every page this workload
 /// dirties". The tuple is `(40 B header + 16 B payload)` = 56 bytes.
 /// At 8 KiB pages we fit roughly 130 tuples per page; we budget
-/// 1.5× headroom plus 1 024 frames of slack.
+/// 1.5-fold headroom plus 1 024 frames of slack.
 fn frames_for_rows(rows: usize) -> usize {
     let pages = rows.div_ceil(120);
     (pages * 3 / 2).max(1) + 1_024

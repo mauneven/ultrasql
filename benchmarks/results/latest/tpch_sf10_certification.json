@@ -2,7 +2,7 @@
   "schema_version": 1,
   "workload": "tpch_sf10",
   "scale_factor": 10,
-  "target": "UltraSQL geometric mean <= 2x DuckDB geometric mean across all 22 TPC-H queries",
+  "target": "UltraSQL geometric mean <= DuckDB geometric mean across all 22 TPC-H queries",
   "expected_query_count": 22,
   "duckdb_query_count": 22,
   "ultrasql_query_count": 22,

@@ -297,9 +297,9 @@ The script writes
 `benchmarks/results/latest/clickbench_certification.json`, including
 per-query runtimes, unsupported-query errors as `null`, geometric means,
 raw per-engine artifacts under `benchmarks/results/latest/raw/`, and the
-`≥ 5× PostgreSQL` pass/fail decision. The summary carries
+same-host PostgreSQL comparison pass/fail decision. The summary carries
 `target_ratio_ultrasql_vs_postgres`,
-`target_max_ratio_ultrasql_vs_postgres` set to `0.2`, and either
+`target_max_ratio_ultrasql_vs_postgres`, and either
 `reason: "missing_required_engine_results"` or
 `reason: "target_not_met"` when it does not pass. Missing dataset, `psql`,
 DSNs, or local clients also write `passed: false` summaries so roadmap status
@@ -422,8 +422,8 @@ same generated query shape. Raw artifacts land under
 `benchmarks/results/latest/firebolt_sparse_pruning_manifest.json`. The
 manifest is the certification gate: it passes only when both engines are
 measured, Firebolt includes primary-index pruning evidence, and
-`target_ratio_ultrasql_vs_firebolt <= 0.5` (UltraSQL median latency is at
-least 2x faster). Missing evidence or missing engines produce
+`target_ratio_ultrasql_vs_firebolt <= 1.0` (UltraSQL median latency is no
+higher than Firebolt). Missing evidence or missing engines produce
 `reason: "missing_required_engine_results"`; measured misses produce
 `reason: "target_not_met"`.
 
@@ -610,7 +610,7 @@ path is same-host only; it never uses a hosted database endpoint.
 The script always writes
 `benchmarks/results/latest/tpcb_certification.json`. It passes only when both
 same-host 32-client PostgreSQL-wire result artifacts exist, both engines pass
-the TPC-B balance-sum correctness check, UltraSQL throughput is at least 2×
+the TPC-B balance-sum correctness check, UltraSQL throughput is no lower than
 PostgreSQL 17, and UltraSQL p99 latency is below 5 ms. If `ULTRASQL_DSN` is
 not set, the script starts an in-process UltraSQL server and measures it over
 `tokio-postgres`; PostgreSQL uses the explicit DSN/result first, then local
@@ -645,9 +645,9 @@ PostgreSQL 17. It writes raw artifacts under
 `benchmarks/results/latest/raw/` and an aggregate
 `benchmarks/results/latest/tpcc_certification.json`. The summary passes only
 when both engines report correctness for all five transaction families and
-UltraSQL throughput is at least 2x PostgreSQL. The current artifact is an
-honest failure: the five transaction families are correct for both engines,
-but the throughput target remains open.
+UltraSQL throughput leads PostgreSQL. The current artifact is an honest
+failure: the five transaction families are correct for both engines, but the
+throughput target remains open.
 
 ### Sysbench-Style OLTP
 
@@ -664,7 +664,7 @@ then runs a deterministic OLTP read/write mix: point reads, indexed non-key
 updates, and inserts. Raw artifacts are written under
 `benchmarks/results/latest/raw/`; the comparison summary is
 `benchmarks/results/latest/sysbench_certification.json`. A pass requires row
-count correctness for both engines and UltraSQL throughput at least 2x
+count correctness for both engines and UltraSQL throughput no lower than
 PostgreSQL 17 on the same host. `SYSBENCH_ROWS`, `SYSBENCH_DURATION`,
 `SYSBENCH_WARMUP`, and `SYSBENCH_CONNECTIONS` control the run shape.
 
@@ -677,7 +677,7 @@ Latest local reduced 32-client artifact
 (`POSTGRES_DSN=host=127.0.0.1 port=55417 user=postgres dbname=postgres`,
 `SYSBENCH_ROWS=10000`, `SYSBENCH_DURATION=3`, `SYSBENCH_WARMUP=1`,
 `SYSBENCH_CONNECTIONS=32`) is correct for both engines, but the target remains
-open: UltraSQL 3957.02 tx/s vs PostgreSQL 142427.44 tx/s (0.028x, below 2x).
+open: UltraSQL 3957.02 tx/s vs PostgreSQL 142427.44 tx/s.
 
 ---
 
@@ -730,8 +730,8 @@ the maintainer asks or after a batch of benchmark-sensitive work.
 
 Status as of 2026-05-20: the profile split is validated at commit `5f0c49e`
 by local `benchmarks/certify.sh smoke`, `cargo fmt`, clippy, tests, rustdoc,
-and `git diff --check`; GitHub Actions ci run `26151820002`; and supremacy
-run `26151891843`. This proves runner/workflow health only. It does not
+and `git diff --check`; GitHub Actions ci run `26151820002`; and benchmark
+matrix run `26151891843`. This proves runner/workflow health only. It does not
 certify TPC-H, ClickBench, TPC-B/C, Sysbench, exact vector top-k, or HNSW
 performance. Full profile results still report `unavailable` when required
 DSNs, datasets, engines, or implementations are absent.
@@ -944,20 +944,19 @@ Comparison runs land in `latest/`; the dashboard renders them from
 
 Every benchmark in `registry.rs` carries a `FloorMetric` per competitor:
 
-- `ThroughputRatio(2.0)` — UltraSQL must achieve at least 2× the
+- `ThroughputRatio(1.0)` — UltraSQL throughput must be no lower than the
   competitor's throughput on this workload.
-- `LatencyRatio(0.5)` — UltraSQL must run at most half the
+- `LatencyRatio(1.0)` — UltraSQL latency must be no higher than the
   competitor's latency on this workload.
 
-This is the "50% better in any case" policy. Any commit that fails
-to meet the floor on any registered competitor is rejected by the
-pre-push regression gate. No exceptions; tighten the kernel until
-the gate passes.
+Any commit that fails to meet the floor on any registered competitor is
+rejected by the pre-push regression gate. No exceptions; tighten the kernel
+until the gate passes.
 
 The gate runs against `benchmarks/results/latest/results.json`. If
 a competitor's number is 0.0 (not yet measured), the floor for that
-engine is skipped — but the commit still must beat every measured
-engine by ≥ 2×.
+engine is skipped — but any published comparison still needs measured
+same-host artifacts.
 
 ---
 

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-check_supremacy.py — assert UltraSQL wins every workload in the
+Benchmark lead check - assert UltraSQL leads every workload in the
 benchmark matrix.
 
 Reads every `*-<engine>.json` file under `benchmarks/results/latest/raw/`,
@@ -17,7 +17,7 @@ those workloads are reported as "uncontested" but do NOT fail the gate
 unless ultrasql itself is missing.
 
 Usage:
-  benchmarks/scripts/check_supremacy.py [results_dir]
+  benchmark-lead-check [results_dir]
 
 Default results_dir is benchmarks/results/latest/raw.
 """
@@ -64,7 +64,7 @@ def main(argv: list[str]) -> int:
         return 2
 
     losses: list[str] = []
-    print(f"== supremacy check on {results_dir} ==")
+    print(f"== benchmark lead check on {results_dir} ==")
     print(f"{'workload':<28} {'winner':<14} {'µs':>12}  others")
     for workload in sorted(by_workload.keys()):
         engines = by_workload[workload]

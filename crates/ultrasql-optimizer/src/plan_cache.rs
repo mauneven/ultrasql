@@ -617,7 +617,7 @@ mod tests {
     #[test]
     fn eviction_after_consecutive_custom_cheaper_executions() {
         let config = PlanCacheConfig {
-            replan_threshold: 0.5, // custom must be < 0.5x generic to trigger
+            replan_threshold: 0.5, // custom must be less than half the generic cost to trigger
             max_entries: 1_024,
         };
         let cache = PlanCache::new(config);

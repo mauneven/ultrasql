@@ -55,7 +55,7 @@ const BATCH_TARGET_ROWS: usize = 4096;
 const PARALLEL_SORT_THRESHOLD: usize = 16 * 1024;
 
 /// Maximum worker count for the parallel sort. Capped at 8 to match
-/// the host topologies our `≥ 2×` performance gate targets (4–8
+/// the host topologies our benchmark leadership gate targets (4–8
 /// performance cores on Apple M-series, 8–16 cores on x86 server
 /// CPUs) and to keep the merge tree shallow (log₂ 8 = 3 passes).
 const PARALLEL_SORT_MAX_THREADS: usize = 8;
@@ -694,7 +694,7 @@ fn scatter_rank_from_pairs(sorted: &[(i64, u32)], total: usize) -> Vec<i64> {
 ///    is sorted. Each merge pass is itself parallelised: each pair
 ///    can be merged in its own worker.
 ///
-/// A 2-way binary merge tree is ~2× faster than an 8-way
+/// A two-way binary merge tree is materially faster than an eight-way
 /// `BinaryHeap` for this shape because every merge step is a
 /// branch-predicted linear scan with sequential reads — the heap's
 /// `pop`/`push` chain misses L1 on the way back up the heap.

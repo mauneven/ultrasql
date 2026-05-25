@@ -665,7 +665,7 @@ mod tests {
     fn deep_duplicate_is_hoisted_into_project_below_filter() {
         // Filter(Scan, neg(a+b) * neg(a+b) = 0)
         // neg(a+b) has 4 nodes and appears twice.
-        let dup = deep_dup(); // neg(a+b) * neg(a+b) — neg(a+b) appears 2×
+        let dup = deep_dup(); // neg(a+b) * neg(a+b) — neg(a+b) appears twice
         let predicate = ScalarExpr::Binary {
             op: BinaryOp::Eq,
             left: Box::new(dup),

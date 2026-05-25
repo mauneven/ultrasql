@@ -106,7 +106,7 @@ mod tests {
     use super::*;
 
     fn samples() -> Vec<Value> {
-        // 5× value 1, 3× value 2, 2× value 3, 1× value 4.
+        // Five copies of value 1, three of value 2, two of value 3, one of value 4.
         vec![
             Value::Int32(1),
             Value::Int32(1),

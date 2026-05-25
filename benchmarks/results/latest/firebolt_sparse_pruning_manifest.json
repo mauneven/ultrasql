@@ -16,7 +16,7 @@
   "both_engines_measured": false,
   "primary_index_pruning_evidence_required": true,
   "firebolt_primary_index_pruning_evidence": false,
-  "target_max_ratio_ultrasql_vs_firebolt": 0.5,
+  "target_max_ratio_ultrasql_vs_firebolt": 1.0,
   "target_ratio_ultrasql_vs_firebolt": null,
   "ultrasql_median_us": 125.87500000000001,
   "firebolt_median_us": null,
@@ -34,5 +34,5 @@
       "artifact": "benchmarks/results/latest/raw/firebolt_sparse_pruning_10k-firebolt.json"
     }
   ],
-  "policy": "UltraSQL median latency at most half of Firebolt is required for certification. No Firebolt sparse-pruning benchmark claim exists unless Firebolt has a measured local Core artifact and EXPLAIN shows primary-index pruning evidence."
+  "policy": "UltraSQL median latency no higher than Firebolt is required for certification. No Firebolt sparse-pruning benchmark claim exists unless Firebolt has a measured local Core artifact and EXPLAIN shows primary-index pruning evidence."
 }

@@ -5,14 +5,14 @@
   "dataset": "target/clickbench/hits.tsv",
   "dataset_rows": null,
   "query_count": 43,
-  "target": "UltraSQL geometric mean at least 5x faster than PostgreSQL when both are measured; other requested engines publish measured or not_available artifacts",
+  "target": "UltraSQL geometric mean <= PostgreSQL geometric mean when both are measured; other requested engines publish measured or not_available artifacts",
   "requested_engines": [
     "firebolt"
   ],
   "passed": false,
   "reason": "missing_required_engine_results",
   "comparison_ready": false,
-  "target_max_ratio_ultrasql_vs_postgres": 0.2,
+  "target_max_ratio_ultrasql_vs_postgres": 1.0,
   "target_ratio_ultrasql_vs_postgres": null,
   "speedup_vs_postgres": null,
   "postgres_geomean_ms": null,

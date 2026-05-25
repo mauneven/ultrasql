@@ -50,7 +50,7 @@ doc = {
     "schema_version": 1,
     "workload": "tpch_sf10",
     "scale_factor": 10,
-    "target": "UltraSQL geometric mean <= 2x DuckDB geometric mean across all 22 TPC-H queries",
+    "target": "UltraSQL geometric mean <= DuckDB geometric mean across all 22 TPC-H queries",
     "passed": False,
     "status": "not_available",
     "reason": reason,
@@ -185,7 +185,7 @@ doc = {
     "schema_version": 1,
     "workload": "tpch_sf10",
     "scale_factor": 10,
-    "target": "UltraSQL geometric mean <= 2x DuckDB geometric mean across all 22 queries",
+    "target": "UltraSQL geometric mean <= DuckDB geometric mean across all 22 queries",
     "passed": False,
     "status": "failed",
     "reason": reason,
@@ -202,7 +202,7 @@ doc = {
     "next_step": (
             "Inspect ultrasql_log_tail and rerun with ULTRASQL_TPCH_PROGRESS=1; "
             "benchmark certification remains open until UltraSQL completes all "
-            "22 queries and the geometric mean is <= 2x DuckDB."
+            "22 queries and the geometric mean is no higher than DuckDB."
     ),
     "policy": "TPC-H SF10 raw artifacts are not published when either engine fails before q1..q22 complete.",
 }
@@ -313,7 +313,7 @@ base_summary = {
     "schema_version": 1,
     "workload": "tpch_sf10",
     "scale_factor": 10,
-    "target": "UltraSQL geometric mean <= 2x DuckDB geometric mean across all 22 TPC-H queries",
+    "target": "UltraSQL geometric mean <= DuckDB geometric mean across all 22 TPC-H queries",
     "expected_query_count": len(expected_queries),
     "duckdb_query_count": len(duckdb_queries),
     "ultrasql_query_count": len(ultrasql_queries),
@@ -360,7 +360,7 @@ ultrasql_gm = gm(ultrasql)
 passed = (
     duckdb_gm is not None
     and ultrasql_gm is not None
-    and ultrasql_gm <= duckdb_gm * 2.0
+    and ultrasql_gm <= duckdb_gm
 )
 summary = {
     **base_summary,

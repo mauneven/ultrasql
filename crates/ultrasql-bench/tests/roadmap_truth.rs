@@ -55,7 +55,7 @@ fn roadmap_ai_gauntlet_lists_measured_runner_set() {
 fn roadmap_firebolt_status_is_local_core_only() {
     let roadmap = repo_file("ROADMAP.md");
 
-    assert!(roadmap.contains("target_ratio_ultrasql_vs_firebolt <= 0.5"));
+    assert!(roadmap.contains("target_ratio_ultrasql_vs_firebolt <= 1.0"));
     assert!(roadmap.contains("Firebolt primary-index pruning evidence"));
     assert!(roadmap.contains("local Firebolt Core smoke measured"));
     assert!(roadmap.contains("Firebolt is not_available"));

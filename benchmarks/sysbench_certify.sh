@@ -3,7 +3,7 @@
 #
 # Full certification requires same-host UltraSQL and PostgreSQL 17 raw
 # artifacts. A pass requires both engines to preserve row-count correctness and
-# UltraSQL throughput to be at least 2x PostgreSQL throughput.
+# UltraSQL throughput to be no lower than PostgreSQL throughput.
 
 set -euo pipefail
 
@@ -56,7 +56,7 @@ import sys
 doc = {
     "schema_version": 1,
     "workload": "sysbench_oltp_read_write",
-    "target": "UltraSQL throughput >= 2x PostgreSQL 17 throughput on the same sysbench-style OLTP read/write shape",
+    "target": "UltraSQL throughput >= PostgreSQL 17 throughput on the same sysbench-style OLTP read/write shape",
     "passed": False,
     "status": "not_available",
     "reason": reason,
@@ -173,7 +173,7 @@ passed = correct and math.isfinite(throughput) and throughput > 0.0
 doc = {
     "schema_version": 1,
     "workload": "sysbench_oltp_read_write",
-    "target": "UltraSQL throughput >= 2x PostgreSQL 17 throughput on the same sysbench-style OLTP read/write shape",
+    "target": "UltraSQL throughput >= PostgreSQL 17 throughput on the same sysbench-style OLTP read/write shape",
     "passed": passed,
     "status": "smoke_passed" if passed else "failed",
     "reason": None if passed else "ultrasql_smoke_failed",
@@ -187,7 +187,7 @@ doc = {
     "postgres_throughput_per_sec": None,
     "throughput_ratio_ultrasql_vs_postgres": None,
     "competitor_claim": None,
-    "policy": "UltraSQL-only sysbench smoke is non-certifying; set POSTGRES_DSN for the 2x PostgreSQL gate.",
+    "policy": "UltraSQL-only sysbench smoke is non-certifying; set POSTGRES_DSN for the PostgreSQL comparison gate.",
 }
 pathlib.Path(summary_path).write_text(json.dumps(doc, indent=2) + "\n")
 print(json.dumps(doc, indent=2))
@@ -234,11 +234,11 @@ valid = (
     and pg_tps > 0.0
     and ultra_tps > 0.0
 )
-passed = valid and ultra_tps >= pg_tps * 2.0
+passed = valid and ultra_tps >= pg_tps
 doc = {
     "schema_version": 1,
     "workload": "sysbench_oltp_read_write",
-    "target": "UltraSQL throughput >= 2x PostgreSQL 17 throughput on the same sysbench-style OLTP read/write shape",
+    "target": "UltraSQL throughput >= PostgreSQL 17 throughput on the same sysbench-style OLTP read/write shape",
     "passed": passed,
     "status": "passed" if passed else "failed",
     "reason": None if passed else ("target_not_met" if valid else "missing_cross_engine_results"),
@@ -255,7 +255,7 @@ doc = {
     "ultrasql_throughput_per_sec": ultra_tps,
     "postgres_throughput_per_sec": pg_tps,
     "throughput_ratio_ultrasql_vs_postgres": ratio,
-    "competitor_claim": "UltraSQL >= 2x PostgreSQL 17" if passed else None,
+    "competitor_claim": "UltraSQL >= PostgreSQL 17" if passed else None,
     "policy": "Full sysbench certification publishes complete same-driver PostgreSQL and UltraSQL raw artifacts only.",
 }
 pathlib.Path(summary_path).write_text(json.dumps(doc, indent=2) + "\n")

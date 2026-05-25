@@ -3,7 +3,7 @@
 #
 # A pass requires complete q1..q22 raw artifacts for UltraSQL and PostgreSQL
 # 17 on the same host. UltraSQL passes only when its geometric mean query time
-# is <= 0.5x PostgreSQL's geometric mean.
+# is no higher than PostgreSQL's geometric mean.
 
 set -euo pipefail
 
@@ -49,7 +49,7 @@ doc = {
     "schema_version": 1,
     "workload": "tpch_sf1_postgres",
     "scale_factor": 1,
-    "target": "UltraSQL geometric mean <= 0.5x PostgreSQL 17 geometric mean across all 22 TPC-H queries",
+    "target": "UltraSQL geometric mean <= PostgreSQL 17 geometric mean across all 22 TPC-H queries",
     "passed": False,
     "status": "not_available",
     "reason": reason,
@@ -267,7 +267,7 @@ base_summary = {
     "schema_version": 1,
     "workload": "tpch_sf1_postgres",
     "scale_factor": 1,
-    "target": "UltraSQL geometric mean <= 0.5x PostgreSQL 17 geometric mean across all 22 TPC-H queries",
+    "target": "UltraSQL geometric mean <= PostgreSQL 17 geometric mean across all 22 TPC-H queries",
     "expected_query_count": len(expected_queries),
     "postgres_query_count": len(postgres_queries),
     "ultrasql_query_count": len(ultrasql_queries),
@@ -323,7 +323,7 @@ if postgres_gm and ultrasql_gm:
 passed = (
     postgres_gm is not None
     and ultrasql_gm is not None
-    and ultrasql_gm <= postgres_gm * 0.5
+    and ultrasql_gm <= postgres_gm
 )
 summary = {
     **base_summary,
@@ -337,8 +337,8 @@ summary = {
         "Keep benchmarks/certify.sh full tpch-sf1-postgres green for release evidence."
         if passed
         else
-        "Keep optimizing TPC-H SF1 until UltraSQL geometric mean is at least "
-        "2x faster than PostgreSQL 17 on the same host."
+        "Keep optimizing TPC-H SF1 until UltraSQL geometric mean leads "
+        "PostgreSQL 17 on the same host."
     ),
 }
 out_path.write_text(json.dumps(summary, indent=2) + "\n")

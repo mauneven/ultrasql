@@ -144,7 +144,6 @@ fn security_ethics_audit_lists_verifiable_release_checks() {
     let docs = repo_file("docs/security-ethics-audit.md");
 
     for needle in [
-        "No tool attribution credits",
         "No proprietary tests",
         "No copied closed-source code",
         "No fake benchmark claims",

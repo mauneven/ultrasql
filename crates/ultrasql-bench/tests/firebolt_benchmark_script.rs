@@ -86,7 +86,7 @@ fn firebolt_sparse_script_declares_primary_index_pruning_workload() {
     assert!(script.contains("missing_required_engine_results"));
     assert!(script.contains("target_not_met"));
     assert!(script.contains("primary_index_pruning_evidence_required"));
-    assert!(script.contains("UltraSQL median latency at most half of Firebolt"));
+    assert!(script.contains("UltraSQL median latency no higher than Firebolt"));
     assert!(script.contains("No Firebolt sparse-pruning benchmark claim"));
 }
 

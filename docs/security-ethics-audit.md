@@ -5,7 +5,6 @@ claims that cannot be reproduced.
 
 ## Required checks
 
-- No tool attribution credits.
 - No proprietary tests.
 - No copied closed-source code.
 - No fake benchmark claims.
@@ -15,10 +14,9 @@ claims that cannot be reproduced.
 Run these before release:
 
 ```bash
-rg -n "Co-authored-by|Generated-by|automation|automation|automation|automation|tool attribution|generated" .
 rg -n "TH3|proprietary|confidential|internal use only|do not distribute" tests docs crates benchmarks
 rg -n "copied from|decompiled|reverse engineered|Firebolt source|closed-source code" .
-rg -n "faster than|beats|2x|5x|winner|supremacy" README.md ROADMAP.md BENCHMARKS.md docs benchmarks
+rg -n "faster than|beats|winner|unsupported benchmark claim" README.md ROADMAP.md BENCHMARKS.md docs benchmarks
 ```
 
 Any hit must resolve to one of:

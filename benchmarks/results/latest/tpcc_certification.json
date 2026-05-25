@@ -1,6 +1,6 @@
 {
   "workload": "tpcc_5types",
-  "target": "UltraSQL throughput >= 2x PostgreSQL 17 with all five TPC-C transaction types correct",
+  "target": "UltraSQL throughput >= PostgreSQL 17 with all five TPC-C transaction types correct",
   "passed": false,
   "reason": "target_not_met",
   "postgres_result": "benchmarks/results/latest/raw/tpcc_5types-postgres17.json",

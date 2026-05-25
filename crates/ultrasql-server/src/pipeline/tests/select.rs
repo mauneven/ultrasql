@@ -252,8 +252,8 @@ fn lower_query_intersect_distinct_returns_common_distinct_rows() {
 fn lower_query_intersect_all_respects_multiset_min_counts() {
     let tables = SampleTables::new();
     let ctx = synthetic_ctx(&tables);
-    // left: 1×{1}, 3×{2}, 1×{3}; right: 2×{2}, 1×{3}, 1×{4}.
-    // multiset min: 0×{1}, 2×{2}, 1×{3} → [2, 2, 3].
+    // left counts: {1:1, 2:3, 3:1}; right counts: {2:2, 3:1, 4:1}.
+    // multiset min: {1:0, 2:2, 3:1} -> [2, 2, 3].
     let plan = build_int_set_op_plan(
         &[1, 2, 2, 2, 3],
         &[2, 2, 3, 4],
@@ -287,7 +287,7 @@ fn lower_query_except_all_subtracts_right_counts_from_left() {
     let tables = SampleTables::new();
     let ctx = synthetic_ctx(&tables);
     // left: 1×{1}, 3×{2}, 1×{3}; right: 1×{2}, 1×{4}.
-    // multiset diff: 1×{1}, 2×{2}, 1×{3} → [1, 2, 2, 3].
+    // multiset diff: {1:1, 2:2, 3:1} -> [1, 2, 2, 3].
     let plan = build_int_set_op_plan(
         &[1, 2, 2, 2, 3],
         &[2, 4],

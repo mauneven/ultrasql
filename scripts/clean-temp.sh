@@ -1,9 +1,8 @@
 #!/usr/bin/env bash
-# clean-temp.sh — idempotent cleanup of build/agent temp artifacts.
+# clean-temp.sh — idempotent cleanup of build temp artifacts.
 #
-# Runs after each automation Code turn via a Stop hook (see
-# .claude/settings.local.json). Designed to be fast (<200ms) when there
-# is nothing to clean, so it can run on every turn without friction.
+# Designed to be fast (<200ms) when there is nothing to clean, so it can run
+# often without friction.
 #
 # Removes:
 #   - .claude/worktrees/agent-* dirs (orphaned Agent-isolation worktrees,

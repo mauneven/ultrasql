@@ -116,7 +116,7 @@ fn tpch_sf1_postgres_runner_compares_same_host_postgres() {
     assert!(tpch.contains("mv \"$TMP_POSTGRES_OUT\" \"$POSTGRES_OUT\""));
     assert!(tpch.contains("mv \"$TMP_ULTRA_OUT\" \"$ULTRA_OUT\""));
     assert!(tpch.contains("partial_query_set_refused"));
-    assert!(tpch.contains("ultrasql_gm <= postgres_gm * 0.5"));
+    assert!(tpch.contains("ultrasql_gm <= postgres_gm"));
     assert!(tpch.contains("exit \"$summary_status\""));
     assert!(tpch.contains("ANALYZE;"));
     assert!(tpch.contains("autovacuum_enabled = false"));

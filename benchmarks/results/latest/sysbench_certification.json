@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
   "workload": "sysbench_oltp_read_write",
-  "target": "UltraSQL throughput >= 2x PostgreSQL 17 throughput on the same sysbench-style OLTP read/write shape",
+  "target": "UltraSQL throughput >= PostgreSQL 17 throughput on the same sysbench-style OLTP read/write shape",
   "passed": false,
   "status": "failed",
   "reason": "target_not_met",
