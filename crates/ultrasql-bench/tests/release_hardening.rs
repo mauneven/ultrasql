@@ -379,8 +379,11 @@ fn packaging_and_docs_site_surface_is_release_ready() {
         "docker/build-push-action",
         "ghcr.io/${{ github.repository_owner }}/ultrasql",
         "render-nfpm-config.sh",
-        "package --packager deb",
-        "package --packager rpm",
+        "actions/setup-go@v6",
+        "go install github.com/goreleaser/nfpm/v2/cmd/nfpm@v2.43.1",
+        "$(go env GOPATH)/bin/nfpm",
+        "--packager deb",
+        "--packager rpm",
         "render-homebrew-formula.sh",
         "ultrasql.rb",
         "actions/setup-node@v5",
@@ -397,6 +400,10 @@ fn packaging_and_docs_site_surface_is_release_ready() {
             "release workflow missing {needle}"
         );
     }
+    assert!(
+        !release.contains("goreleaser/nfpm-action"),
+        "release workflow must install nfpm from the Go module, not a missing action"
+    );
 
     for needle in [
         "name: ultrasql",

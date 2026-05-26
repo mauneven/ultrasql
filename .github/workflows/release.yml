@@ -178,18 +178,36 @@ jobs:
           install -m 0755 "target/${TARGET}/release-ship/ultrasql" "$root/usr/bin/ultrasql"
           install -m 0755 "target/${TARGET}/release-ship/ultrasql-local" "$root/usr/bin/ultrasql-local"
           scripts/render-nfpm-config.sh "$version" "$PKG_ARCH" "$root" "$config"
+      - uses: actions/setup-go@v6
+        if: matrix.package_arch != ''
+        with:
+          go-version: "1.25"
+      - name: install nfpm
+        if: matrix.package_arch != ''
+        shell: bash
+        run: go install github.com/goreleaser/nfpm/v2/cmd/nfpm@v2.43.1
       - name: package deb
         if: matrix.package_arch != ''
-        uses: goreleaser/nfpm-action@v2
-        with:
-          version: v2.43.1
-          args: package --packager deb --config target/package/ultrasql-${{ env.RELEASE_TAG }}-${{ matrix.target }}.nfpm.yaml --target dist/ultrasql-${{ env.RELEASE_TAG }}-${{ matrix.target }}.${{ matrix.package_arch }}.deb
+        shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
+          PKG_ARCH: ${{ matrix.package_arch }}
+        run: |
+          "$(go env GOPATH)/bin/nfpm" package \
+            --packager deb \
+            --config "target/package/ultrasql-${RELEASE_TAG}-${TARGET}.nfpm.yaml" \
+            --target "dist/ultrasql-${RELEASE_TAG}-${TARGET}.${PKG_ARCH}.deb"
       - name: package rpm
         if: matrix.package_arch != ''
-        uses: goreleaser/nfpm-action@v2
-        with:
-          version: v2.43.1
-          args: package --packager rpm --config target/package/ultrasql-${{ env.RELEASE_TAG }}-${{ matrix.target }}.nfpm.yaml --target dist/ultrasql-${{ env.RELEASE_TAG }}-${{ matrix.target }}.${{ matrix.package_arch }}.rpm
+        shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
+          PKG_ARCH: ${{ matrix.package_arch }}
+        run: |
+          "$(go env GOPATH)/bin/nfpm" package \
+            --packager rpm \
+            --config "target/package/ultrasql-${RELEASE_TAG}-${TARGET}.nfpm.yaml" \
+            --target "dist/ultrasql-${RELEASE_TAG}-${TARGET}.${PKG_ARCH}.rpm"
       - name: package zip
         env:
           TARGET: ${{ matrix.target }}
