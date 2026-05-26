@@ -27,7 +27,7 @@ exclude = ["fuzz"]
 default-members = ["crates/ultrasql-server", "crates/ultrasql-cli"]
 
 [workspace.package]
-version = "0.0.4"
+version = "0.0.5"
 edition = "2024"
 rust-version = "1.85"
 license = "Apache-2.0 OR MIT"
@@ -41,22 +41,22 @@ categories = ["database-implementations"]
 
 [workspace.dependencies]
 # Internal
-ultrasql-core      = { path = "crates/ultrasql-core",      version = "0.0.4" }
-ultrasql-storage   = { path = "crates/ultrasql-storage",   version = "0.0.4" }
-ultrasql-wal       = { path = "crates/ultrasql-wal",       version = "0.0.4" }
-ultrasql-mvcc      = { path = "crates/ultrasql-mvcc",      version = "0.0.4" }
-ultrasql-txn       = { path = "crates/ultrasql-txn",       version = "0.0.4" }
-ultrasql-parser    = { path = "crates/ultrasql-parser",    version = "0.0.4" }
-ultrasql-planner   = { path = "crates/ultrasql-planner",   version = "0.0.4" }
-ultrasql-optimizer = { path = "crates/ultrasql-optimizer", version = "0.0.4" }
-ultrasql-executor  = { path = "crates/ultrasql-executor",  version = "0.0.4" }
-ultrasql-vec       = { path = "crates/ultrasql-vec",       version = "0.0.4" }
-ultrasql-catalog   = { path = "crates/ultrasql-catalog",   version = "0.0.4" }
-ultrasql-protocol  = { path = "crates/ultrasql-protocol",  version = "0.0.4" }
-ultrasql-objectstore = { path = "crates/ultrasql-objectstore", version = "0.0.4" }
-ultrasql-iceberg   = { path = "crates/ultrasql-iceberg",   version = "0.0.4" }
-ultrasql-arrow     = { path = "crates/ultrasql-arrow",     version = "0.0.4" }
-ultrasql-server    = { path = "crates/ultrasql-server",    version = "0.0.4" }
+ultrasql-core      = { path = "crates/ultrasql-core",      version = "0.0.5" }
+ultrasql-storage   = { path = "crates/ultrasql-storage",   version = "0.0.5" }
+ultrasql-wal       = { path = "crates/ultrasql-wal",       version = "0.0.5" }
+ultrasql-mvcc      = { path = "crates/ultrasql-mvcc",      version = "0.0.5" }
+ultrasql-txn       = { path = "crates/ultrasql-txn",       version = "0.0.5" }
+ultrasql-parser    = { path = "crates/ultrasql-parser",    version = "0.0.5" }
+ultrasql-planner   = { path = "crates/ultrasql-planner",   version = "0.0.5" }
+ultrasql-optimizer = { path = "crates/ultrasql-optimizer", version = "0.0.5" }
+ultrasql-executor  = { path = "crates/ultrasql-executor",  version = "0.0.5" }
+ultrasql-vec       = { path = "crates/ultrasql-vec",       version = "0.0.5" }
+ultrasql-catalog   = { path = "crates/ultrasql-catalog",   version = "0.0.5" }
+ultrasql-protocol  = { path = "crates/ultrasql-protocol",  version = "0.0.5" }
+ultrasql-objectstore = { path = "crates/ultrasql-objectstore", version = "0.0.5" }
+ultrasql-iceberg   = { path = "crates/ultrasql-iceberg",   version = "0.0.5" }
+ultrasql-arrow     = { path = "crates/ultrasql-arrow",     version = "0.0.5" }
+ultrasql-server    = { path = "crates/ultrasql-server",    version = "0.0.5" }
 
 # Error handling
 thiserror = "2"

@@ -66,7 +66,8 @@ Registry package managers, after their release publish secrets are configured:
 ```bash
 npm install -g ultrasql
 pnpm add -g ultrasql
-brew install mauneven/tap/ultrasql
+brew tap mauneven/tap
+brew install ultrasql
 yay -S ultrasql-bin
 choco install ultrasql
 ```
@@ -74,15 +75,15 @@ choco install ultrasql
 GitHub Release package fallback:
 
 ```bash
-npm install -g https://github.com/mauneven/ultrasql/releases/download/v0.0.4/ultrasql-0.0.4.tgz
-pnpm add -g https://github.com/mauneven/ultrasql/releases/download/v0.0.4/ultrasql-0.0.4.tgz
+npm install -g https://github.com/mauneven/ultrasql/releases/download/v0.0.5/ultrasql-0.0.5.tgz
+pnpm add -g https://github.com/mauneven/ultrasql/releases/download/v0.0.5/ultrasql-0.0.5.tgz
 ```
 
 Windows PowerShell or setup EXE:
 
 ```powershell
 iwr https://raw.githubusercontent.com/mauneven/ultrasql/main/scripts/install.ps1 -UseB | iex
-iwr https://github.com/mauneven/ultrasql/releases/download/v0.0.4/ultrasql-v0.0.4-x86_64-pc-windows-msvc-setup.exe -OutFile ultrasql-setup.exe
+iwr https://github.com/mauneven/ultrasql/releases/download/v0.0.5/ultrasql-v0.0.5-x86_64-pc-windows-msvc-setup.exe -OutFile ultrasql-setup.exe
 Start-Process .\ultrasql-setup.exe -Wait
 ```
 
@@ -111,6 +112,7 @@ fuzz/         parser, wire, WAL, and planner fuzz targets
 ## Read Next
 
 - [ROADMAP.md](ROADMAP.md) - production plan and open gates.
+- [DONE.md](DONE.md) - completed milestones and evidence ledger.
 - [docs/getting-started.md](docs/getting-started.md) - local first steps.
 - [docs/install.md](docs/install.md) - release archives, package managers, and source build.
 - [docs/packaging.md](docs/packaging.md) - Docker, npm, Homebrew, AUR, Chocolatey, Debian, RPM.

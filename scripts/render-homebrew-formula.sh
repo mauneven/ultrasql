@@ -17,23 +17,16 @@ sha_for() {
     awk -v file="$file" '$2 == file || $2 == "./" file { print $1 }' "$checksums" | head -n 1
 }
 
-darwin_arm64_asset="ultrasql-v${version}-aarch64-apple-darwin.tar.gz"
-darwin_amd64_asset="ultrasql-v${version}-x86_64-apple-darwin.tar.gz"
-SHA256_DARWIN_ARM64="$(sha_for "$darwin_arm64_asset")"
-SHA256_DARWIN_AMD64="$(sha_for "$darwin_amd64_asset")"
+source_asset="ultrasql-v${version}-source.tar.gz"
+SHA256_SOURCE="$(sha_for "$source_asset")"
 
-if [ -z "$SHA256_DARWIN_ARM64" ]; then
-    echo "checksum missing for $darwin_arm64_asset" >&2
-    exit 1
-fi
-if [ -z "$SHA256_DARWIN_AMD64" ]; then
-    echo "checksum missing for $darwin_amd64_asset" >&2
+if [ -z "$SHA256_SOURCE" ]; then
+    echo "source tarball checksum missing for $source_asset" >&2
     exit 1
 fi
 
 mkdir -p "$(dirname "$out")"
 sed \
     -e "s|@VERSION@|${version}|g" \
-    -e "s|@SHA256_DARWIN_ARM64@|${SHA256_DARWIN_ARM64}|g" \
-    -e "s|@SHA256_DARWIN_AMD64@|${SHA256_DARWIN_AMD64}|g" \
+    -e "s|@SHA256_SOURCE@|${SHA256_SOURCE}|g" \
     "$template" > "$out"

@@ -1,8 +1,8 @@
 # Known Incompatibilities
 
 This document lists major PostgreSQL compatibility gaps that are still open or
-only partially implemented. `ROADMAP.md` remains the source of truth for exact
-release status.
+only partially implemented. `ROADMAP.md` tracks open release gates; `DONE.md`
+tracks completed evidence.
 
 ## Production readiness
 

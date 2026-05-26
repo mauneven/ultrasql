@@ -23,8 +23,8 @@ fn roadmap_ann_matrix_tracks_page_backed_indexes() {
     assert!(!roadmap.contains("| Runtime IVFFlat |"));
     assert!(!roadmap.contains("| Production IVFFlat |"));
 
-    assert!(roadmap.contains("| Page-backed HNSW |"));
-    assert!(roadmap.contains("| Page-backed IVFFlat |"));
+    assert!(roadmap.contains("Page-backed HNSW"));
+    assert!(roadmap.contains("Page-backed IVFFlat"));
     assert!(roadmap.contains("large-scale recovery certification"));
     assert!(roadmap.contains("WAL replay fuzz/property tests"));
     assert!(roadmap.contains("larger recall/latency artifacts"));
@@ -65,8 +65,9 @@ fn roadmap_firebolt_status_is_local_core_only() {
 
 #[test]
 fn roadmap_tpch_sf10_matches_complete_artifact() {
+    let done = repo_file("DONE.md");
     let roadmap = repo_file("ROADMAP.md");
-    let normalized = collapse_ws(&roadmap);
+    let normalized = collapse_ws(&done);
 
     assert!(normalized.contains("TPC-H scale 10 (all 22 queries)"));
     assert!(normalized.contains("benchmarks/results/latest/tpch_sf10_certification.json"));
@@ -80,8 +81,8 @@ fn roadmap_tpch_sf10_matches_complete_artifact() {
 
 #[test]
 fn roadmap_tracks_columnar_scan_mvcc_contract() {
-    let roadmap = repo_file("ROADMAP.md");
-    let normalized = collapse_ws(&roadmap);
+    let done = repo_file("DONE.md");
+    let normalized = collapse_ws(&done);
 
     assert!(normalized.contains("Columnar scan path"));
     assert!(normalized.contains("heap rows remain the OLTP/MVCC source of truth"));

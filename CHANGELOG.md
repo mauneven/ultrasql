@@ -45,6 +45,11 @@ and must document the break here.
   workflow validation, and rendered GitHub release notes.
 - Tagged release workflow for Linux, macOS, and Windows binary archives with
   checksum artifacts.
+- npm package metadata now includes keywords, supported OS/CPU constraints, and
+  a richer package README with Node.js `pg` usage, supported targets, and
+  checksum behavior.
+- Release workflow emits a source tarball for Homebrew and renders a
+  source-built formula.
 
 ### Changed
 
@@ -68,6 +73,10 @@ and must document the break here.
 - Firebolt sparse primary-index pruning now treats the manifest as the
   certification gate, requiring both measured engines, Firebolt pruning
   evidence, and `target_ratio_ultrasql_vs_firebolt <= 1.0`.
+- Homebrew packaging builds from source with Cargo instead of installing macOS
+  binary archives, keeping the tap closer to `homebrew/core` expectations.
+- Roadmap now tracks only open production gates; completed milestones moved to
+  `DONE.md`.
 
 ### Fixed
 

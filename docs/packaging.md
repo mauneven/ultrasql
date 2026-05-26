@@ -51,10 +51,10 @@ The release workflow also packs `ultrasql-<version>.tgz` and attaches it to the
 GitHub Release, so npm-compatible installers can consume the same package before
 registry credentials are configured.
 
-The package is a binary installer, not a replacement for PostgreSQL driver
-libraries. It verifies the GitHub release archive checksum during install and
-then launches `ultrasql`, `ultrasqld`, or `ultrasql-local` from the vendored
-release binaries.
+The package is a binary launcher, not a replacement for PostgreSQL driver
+libraries. It exposes shims at install time; the first command run verifies the
+GitHub release archive checksum, vendors the matching binaries, and then
+launches `ultrasql`, `ultrasqld`, or `ultrasql-local`.
 
 The release workflow runs the package tests and calls:
 
@@ -70,14 +70,38 @@ is published to npmjs when `NPM_TOKEN` is configured.
 
 The release workflow renders `ultrasql.rb` from
 `packaging/homebrew/ultrasql.rb.in` and the release checksum manifest. The
-rendered formula installs the macOS release archives for Intel and Apple
-Silicon hosts. When `HOMEBREW_TAP_TOKEN` is configured, the workflow also
-pushes the rendered formula to the Homebrew tap repository. The default tap is
+formula is source-built: it downloads `ultrasql-v<version>-source.tar.gz`,
+uses Homebrew's `rust` build dependency, runs `cargo install --locked` for the
+server and CLI crates, and installs `ultrasqld`, `ultrasql`, and
+`ultrasql-local`. This matches Homebrew core expectations better than a binary
+formula. When `HOMEBREW_TAP_TOKEN` is configured, the workflow pushes the
+rendered formula to the Homebrew tap repository. The default tap is
 `mauneven/homebrew-tap`; set `HOMEBREW_TAP_REPOSITORY` to override it.
 
 ```bash
 brew install mauneven/tap/ultrasql
 ```
+
+After the tap is installed once, the short command works:
+
+```bash
+brew tap mauneven/tap
+brew install ultrasql
+```
+
+The single-command, no-tap form:
+
+```bash
+brew install ultrasql
+```
+
+requires acceptance into `homebrew/core`. That is a separate upstream Homebrew
+review path, not something the release workflow can force. The formula is now
+source-built so it is shaped for that path, but the project should submit to
+`homebrew/core` only after UltraSQL has a stable tagged release that is not
+advertised as pre-alpha/beta, builds and passes tests on Homebrew-supported
+macOS and Linux targets, and satisfies Homebrew's notability and maintainability
+checks. Until then, the tap is the correct distribution channel.
 
 ## AUR
 

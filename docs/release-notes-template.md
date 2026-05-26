@@ -37,4 +37,5 @@ Release assets include:
 
 ## Known Gaps
 
-See `CHANGELOG.md`, `ROADMAP.md`, and `docs/known-incompatibilities.md`.
+See `CHANGELOG.md`, `ROADMAP.md`, `DONE.md`, and
+`docs/known-incompatibilities.md`.

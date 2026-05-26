@@ -1,9 +1,21 @@
 {
   "name": "ultrasql",
-  "version": "0.0.4",
-  "description": "UltraSQL server and CLI installer for Node.js package managers.",
+  "version": "0.0.5",
+  "description": "PostgreSQL-wire UltraSQL server and CLI binaries for Node.js package managers.",
   "license": "Apache-2.0 OR MIT",
   "homepage": "https://github.com/mauneven/ultrasql#readme",
+  "keywords": [
+    "database",
+    "sql",
+    "postgresql",
+    "postgres",
+    "pgwire",
+    "oltp",
+    "olap",
+    "vector",
+    "rust",
+    "cli"
+  ],
   "repository": {
     "type": "git",
     "url": "git+https://github.com/mauneven/ultrasql.git",
@@ -18,7 +30,6 @@
     "ultrasql-local": "bin/ultrasql-local.js"
   },
   "scripts": {
-    "postinstall": "node scripts/install.js",
     "test": "node --test test/*.test.js"
   },
   "files": [
@@ -30,5 +41,14 @@
   ],
   "engines": {
     "node": ">=18"
-  }
+  },
+  "os": [
+    "darwin",
+    "linux",
+    "win32"
+  ],
+  "cpu": [
+    "x64",
+    "arm64"
+  ]
 }

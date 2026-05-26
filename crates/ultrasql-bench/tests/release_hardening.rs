@@ -69,7 +69,7 @@ fn chaos_recovery_runner_documents_fault_coverage() {
     let script = repo_file("benchmarks/chaos_recovery.sh");
     let docs = repo_file("docs/chaos-recovery.md");
     let release = repo_file("docs/release-checklist.md");
-    let roadmap = repo_file("ROADMAP.md");
+    let done = repo_file("DONE.md");
 
     for needle in [
         "chaos_recovery_manifest.json",
@@ -102,7 +102,7 @@ fn chaos_recovery_runner_documents_fault_coverage() {
 
     assert!(release.contains("Chaos recovery"));
     assert!(release.contains("benchmarks/chaos_recovery.sh"));
-    assert!(roadmap.contains("Chaos testing: random kill, WAL truncation, disk full"));
+    assert!(done.contains("Chaos testing: random kill, WAL truncation, disk full"));
 }
 
 #[test]
@@ -397,6 +397,8 @@ fn packaging_and_docs_site_surface_is_release_ready() {
         "$(go env GOPATH)/bin/nfpm",
         "--packager deb",
         "--packager rpm",
+        "git archive --format=tar.gz",
+        "-source.tar.gz",
         "render-homebrew-formula.sh",
         "ultrasql.rb",
         "actions/setup-node@v5",
@@ -450,10 +452,14 @@ fn packaging_and_docs_site_surface_is_release_ready() {
 
     for needle in [
         "class Ultrasql < Formula",
-        "version \"@VERSION@\"",
-        "@SHA256_DARWIN_ARM64@",
-        "@SHA256_DARWIN_AMD64@",
-        "bin.install \"ultrasqld\", \"ultrasql\", \"ultrasql-local\"",
+        "ultrasql-v@VERSION@-source.tar.gz",
+        "sha256 \"@SHA256_SOURCE@\"",
+        "depends_on \"rust\" => :build",
+        "cargo\", \"install\"",
+        "crates/ultrasql-server",
+        "crates/ultrasql-cli",
+        "--profile\", \"release-ship\"",
+        "rm_f prefix/\".crates.toml\"",
     ] {
         assert!(
             homebrew.contains(needle),
@@ -461,9 +467,9 @@ fn packaging_and_docs_site_surface_is_release_ready() {
         );
     }
     for needle in [
-        "SHA256_DARWIN_ARM64",
-        "SHA256_DARWIN_AMD64",
-        "checksum missing",
+        "SHA256_SOURCE",
+        "ultrasql-v${version}-source.tar.gz",
+        "source tarball checksum missing",
     ] {
         assert!(
             homebrew_render.contains(needle),
