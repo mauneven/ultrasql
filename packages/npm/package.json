@@ -1,0 +1,34 @@
+{
+  "name": "ultrasql",
+  "version": "0.0.2",
+  "description": "UltraSQL server and CLI installer for Node.js package managers.",
+  "license": "Apache-2.0 OR MIT",
+  "homepage": "https://github.com/mauneven/ultrasql#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/mauneven/ultrasql.git",
+    "directory": "packages/npm"
+  },
+  "bugs": {
+    "url": "https://github.com/mauneven/ultrasql/issues"
+  },
+  "bin": {
+    "ultrasql": "bin/ultrasql.js",
+    "ultrasqld": "bin/ultrasqld.js",
+    "ultrasql-local": "bin/ultrasql-local.js"
+  },
+  "scripts": {
+    "postinstall": "node scripts/install.js",
+    "test": "node --test test/*.test.js"
+  },
+  "files": [
+    "bin",
+    "LICENSE-APACHE",
+    "LICENSE-MIT",
+    "scripts",
+    "README.md"
+  ],
+  "engines": {
+    "node": ">=18"
+  }
+}

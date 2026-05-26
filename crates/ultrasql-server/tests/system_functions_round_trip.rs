@@ -154,7 +154,7 @@ async fn scalar_system_functions_return_postgres_shaped_values() {
         "ORMs require PostgreSQL-shaped version(), got {version:?}"
     );
     assert!(
-        version.contains("UltraSQL 0.0.1"),
+        version.contains(concat!("UltraSQL ", env!("CARGO_PKG_VERSION"))),
         "version() should retain UltraSQL identity, got {version:?}"
     );
     assert_eq!(rows[0].get::<_, String>(1), "ultrasql");

@@ -8,6 +8,8 @@ Each release contains:
 - `ultrasql-local` / `ultrasql-local.exe` — local read-only query helper.
 - Linux `.deb` and `.rpm` packages for x86_64 and ARM64.
 - A rendered Homebrew formula asset, `ultrasql.rb`, for macOS archives.
+- A clean npm package, `ultrasql`, backed by the same checksummed release
+  archives.
 - Per-asset `.sha256` files and a `SHASUMS256.txt` manifest.
 
 The docs site for install and operations is `https://docs.ultrasql.org`.
@@ -31,7 +33,7 @@ curl -fsSL https://raw.githubusercontent.com/mauneven/ultrasql/main/scripts/inst
 Install a specific tag:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/mauneven/ultrasql/main/scripts/install.sh | sh -s -- v0.0.1
+curl -fsSL https://raw.githubusercontent.com/mauneven/ultrasql/main/scripts/install.sh | sh -s -- v0.0.2
 ```
 
 Install somewhere else:
@@ -44,14 +46,41 @@ ULTRASQL_INSTALL_DIR=/usr/local/bin \
 The script downloads the platform archive and `.sha256` file, verifies the
 checksum, and installs the binaries. It does not edit shell startup files.
 
+## npm / pnpm
+
+The npm package is named `ultrasql`. It downloads the platform release archive,
+verifies the matching `.sha256` file, and exposes `ultrasql`, `ultrasqld`, and
+`ultrasql-local` on `PATH`.
+
+Install from the GitHub Release package asset:
+
+```bash
+npm install -g https://github.com/mauneven/ultrasql/releases/download/v0.0.2/ultrasql-0.0.2.tgz
+pnpm add -g https://github.com/mauneven/ultrasql/releases/download/v0.0.2/ultrasql-0.0.2.tgz
+```
+
+After the npm registry publish job is configured, the same package installs as:
+
+```bash
+npm install -g ultrasql
+pnpm add -g ultrasql
+```
+
+Applications should keep using PostgreSQL client libraries such as `pg`,
+`psycopg`, `libpq`, or `pgx`; UltraSQL speaks PostgreSQL wire protocol.
+
+Release automation always attaches `ultrasql-<version>.tgz` to GitHub Releases
+and publishes the registry package from `packages/npm` with `npm publish` when
+npm credentials are configured.
+
 ## Docker
 
 Tagged releases publish a non-root Linux image from the release workflow:
 
 ```bash
-docker pull ghcr.io/mauneven/ultrasql:v0.0.1
+docker pull ghcr.io/mauneven/ultrasql:v0.0.2
 docker run --rm -p 5432:5432 -v ultrasql-data:/var/lib/ultrasql \
-  ghcr.io/mauneven/ultrasql:v0.0.1
+  ghcr.io/mauneven/ultrasql:v0.0.2
 ```
 
 The image listens on `0.0.0.0:5432` and stores data in `/var/lib/ultrasql`.
@@ -61,7 +90,7 @@ The image listens on `0.0.0.0:5432` and stores data in `/var/lib/ultrasql`.
 Release assets include a rendered Homebrew formula:
 
 ```bash
-curl -fsSLO https://github.com/mauneven/ultrasql/releases/download/v0.0.1/ultrasql.rb
+curl -fsSLO https://github.com/mauneven/ultrasql/releases/download/v0.0.2/ultrasql.rb
 brew install --formula ./ultrasql.rb
 ```
 
@@ -75,7 +104,7 @@ Download the `.deb` package for your architecture and verify the checksum from
 the release `SHASUMS256.txt` file:
 
 ```bash
-sudo apt install ./ultrasql-v0.0.1-x86_64-unknown-linux-gnu.amd64.deb
+sudo apt install ./ultrasql-v0.0.2-x86_64-unknown-linux-gnu.amd64.deb
 ```
 
 The package installs binaries under `/usr/bin`, creates a locked `ultrasql`
@@ -88,7 +117,7 @@ Download the `.rpm` package for your architecture and verify the checksum from
 the release `SHASUMS256.txt` file:
 
 ```bash
-sudo rpm -Uvh ./ultrasql-v0.0.1-x86_64-unknown-linux-gnu.amd64.rpm
+sudo rpm -Uvh ./ultrasql-v0.0.2-x86_64-unknown-linux-gnu.amd64.rpm
 ```
 
 RPM contents match the Debian package: binaries, `/etc/ultrasql/ultrasqld.env`,
@@ -103,7 +132,7 @@ iwr https://raw.githubusercontent.com/mauneven/ultrasql/main/scripts/install.ps1
 Install a specific tag:
 
 ```powershell
-& ([scriptblock]::Create((iwr https://raw.githubusercontent.com/mauneven/ultrasql/main/scripts/install.ps1 -UseB))) -Version v0.0.1
+& ([scriptblock]::Create((iwr https://raw.githubusercontent.com/mauneven/ultrasql/main/scripts/install.ps1 -UseB))) -Version v0.0.2
 ```
 
 Add the install directory to the user `PATH`:
@@ -122,14 +151,14 @@ Add the install directory to the user `PATH`:
 macOS / Linux checksum:
 
 ```bash
-shasum -a 256 -c ultrasql-v0.0.1-aarch64-apple-darwin.tar.gz.sha256
+shasum -a 256 -c ultrasql-v0.0.2-aarch64-apple-darwin.tar.gz.sha256
 ```
 
 Windows checksum:
 
 ```powershell
-$expected = (Get-Content .\ultrasql-v0.0.1-x86_64-pc-windows-msvc.zip.sha256).Split(" ")[0]
-$actual = (Get-FileHash .\ultrasql-v0.0.1-x86_64-pc-windows-msvc.zip -Algorithm SHA256).Hash.ToLower()
+$expected = (Get-Content .\ultrasql-v0.0.2-x86_64-pc-windows-msvc.zip.sha256).Split(" ")[0]
+$actual = (Get-FileHash .\ultrasql-v0.0.2-x86_64-pc-windows-msvc.zip -Algorithm SHA256).Hash.ToLower()
 if ($expected -ne $actual) { throw "checksum mismatch" }
 ```
 
@@ -146,5 +175,5 @@ cargo build --locked --profile release-ship --bin ultrasqld --bin ultrasql --bin
 Binary packaging does not mean the database is production-stable. The stable
 release decision is controlled by `docs/release-checklist.md`, `ROADMAP.md`,
 CI, benchmark artifacts, security evidence, and operator-soak evidence.
-See `docs/packaging.md` for docs site, Docker, Homebrew, Debian, RPM, and
-release workflow details.
+See `docs/packaging.md` for docs site, Docker, npm publish, Homebrew, Debian,
+RPM, and release workflow details.

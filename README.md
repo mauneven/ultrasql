@@ -61,6 +61,13 @@ Install the latest release archive:
 curl -fsSL https://raw.githubusercontent.com/mauneven/ultrasql/main/scripts/install.sh | sh
 ```
 
+Install with npm or pnpm from the release package:
+
+```bash
+npm install -g https://github.com/mauneven/ultrasql/releases/download/v0.0.2/ultrasql-0.0.2.tgz
+pnpm add -g https://github.com/mauneven/ultrasql/releases/download/v0.0.2/ultrasql-0.0.2.tgz
+```
+
 Windows PowerShell:
 
 ```powershell
@@ -93,8 +100,8 @@ fuzz/         parser, wire, WAL, and planner fuzz targets
 
 - [ROADMAP.md](ROADMAP.md) - production plan and open gates.
 - [docs/getting-started.md](docs/getting-started.md) - local first steps.
-- [docs/install.md](docs/install.md) - release archives and source build.
-- [docs/packaging.md](docs/packaging.md) - Docker, Homebrew, Debian, RPM.
+- [docs/install.md](docs/install.md) - release archives, npm, and source build.
+- [docs/packaging.md](docs/packaging.md) - Docker, npm, Homebrew, Debian, RPM.
 - [docs/known-incompatibilities.md](docs/known-incompatibilities.md) - current PostgreSQL gaps.
 - [docs/release-checklist.md](docs/release-checklist.md) - release evidence.
 - [BENCHMARKS.md](BENCHMARKS.md) - methodology and artifact policy.

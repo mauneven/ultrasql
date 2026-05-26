@@ -383,6 +383,12 @@ fn packaging_and_docs_site_surface_is_release_ready() {
         "package --packager rpm",
         "render-homebrew-formula.sh",
         "ultrasql.rb",
+        "actions/setup-node@v5",
+        "packages/npm",
+        "npm pack ./packages/npm",
+        "*.tgz",
+        "npm publish --access public --provenance",
+        "NPM_TOKEN",
         "*.deb",
         "*.rpm",
     ] {
@@ -444,6 +450,8 @@ fn packaging_and_docs_site_surface_is_release_ready() {
     for needle in [
         "docs.ultrasql.org",
         "ghcr.io/mauneven/ultrasql",
+        "packages/npm",
+        "npm publish",
         "Homebrew",
         "Debian",
         "RPM",

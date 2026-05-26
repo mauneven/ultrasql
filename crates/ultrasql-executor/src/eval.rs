@@ -325,7 +325,10 @@ fn eval_function_call(
             "advisory lock functions require session context",
         )),
         "gen_random_uuid" => eval_gen_random_uuid(args),
-        "version" => eval_zero_arg_text(args, "PostgreSQL 14.0 (UltraSQL 0.0.1)"),
+        "version" => eval_zero_arg_text(
+            args,
+            concat!("PostgreSQL 14.0 (UltraSQL ", env!("CARGO_PKG_VERSION"), ")"),
+        ),
         "current_catalog" => eval_zero_arg_text(args, "ultrasql"),
         "current_database" => eval_zero_arg_text(args, "ultrasql"),
         "current_schema" => eval_zero_arg_text(args, "public"),

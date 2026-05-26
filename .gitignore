@@ -39,6 +39,10 @@ Thumbs.db
 coverage/
 lcov.info
 tarpaulin-report.html
+site/
+
+# npm package vendor cache
+packages/npm/vendor/
 
 # Fuzz — seed corpus in fuzz/corpus/ IS committed (see AGENTS.md §8).
 # Only build output and crash artefacts are ignored.

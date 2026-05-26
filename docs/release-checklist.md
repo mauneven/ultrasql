@@ -58,11 +58,14 @@ Pushing a `vX.Y.Z` tag runs `.github/workflows/release.yml`. The workflow:
 - publishes Linux x86_64, Linux ARM64, macOS Intel, macOS Apple Silicon, and
   Windows x86_64 archives,
 - publishes `ghcr.io/mauneven/ultrasql:<tag>` from the Dockerfile,
+- attaches `ultrasql-<version>.tgz` from `packages/npm` and publishes the
+  `ultrasql` npm registry package when npm credentials are configured,
 - builds Debian/Ubuntu `.deb` packages and `.rpm` packages with nFPM,
 - renders a Homebrew formula from the macOS archive checksums,
 - uploads per-asset `.sha256` files plus `SHASUMS256.txt`,
-- validates `operator-reports/*.json` with
-  `scripts/validate-operator-soak.py --strict`,
+- validates `operator-reports/*.json`; `v1+` releases require
+  `scripts/validate-operator-soak.py --strict`, while `v0.*` prereleases record
+  the current soak status without blocking publication,
 - renders `RELEASE_NOTES.md` from `docs/release-notes-template.md`,
 - marks `v0.*` releases as pre-releases.
 
@@ -102,6 +105,7 @@ not in the PR-critical path.
 | 76 Chaos recovery | `benchmarks/chaos_recovery.sh` | `crates/ultrasql-bench/tests/release_hardening.rs` | random kill, WAL truncation, and safe disk-full simulation all recover | `docs/chaos-recovery.md` | `benchmarks/results/latest/chaos_recovery_manifest.json` |
 | 77 Docs site | `mkdocs.yml`, `.github/workflows/docs.yml` | `crates/ultrasql-bench/tests/release_hardening.rs` | no benchmark; documentation publication gate | `docs/packaging.md` | GitHub Pages deployment for `docs.ultrasql.org` |
 | 78 Docker image | `Dockerfile`, `.dockerignore`, `.github/workflows/release.yml` | `crates/ultrasql-bench/tests/release_hardening.rs` | no benchmark; release packaging gate | `docs/packaging.md` | GHCR image digest for `ghcr.io/mauneven/ultrasql:<tag>` |
+| 78.1 npm / pnpm package | `packages/npm`, `.github/workflows/release.yml` | `node --test packages/npm/test/*.test.js`, `crates/ultrasql-bench/tests/release_hardening.rs` | no benchmark; release packaging gate | `docs/install.md`, `docs/packaging.md` | `ultrasql-<version>.tgz` release asset and npm publish output for `ultrasql` |
 | 79 Homebrew formula | `packaging/homebrew/ultrasql.rb.in`, `scripts/render-homebrew-formula.sh` | `crates/ultrasql-bench/tests/release_hardening.rs` | no benchmark; release packaging gate | `docs/install.md` | rendered `ultrasql.rb` release asset |
 | 80 Deb/RPM packages | `packaging/nfpm.yaml.in`, `packaging/linux/*`, `.github/workflows/release.yml` | `crates/ultrasql-bench/tests/release_hardening.rs` | no benchmark; release packaging gate | `docs/install.md` | `.deb` and `.rpm` release assets |
 | 81 Operator soak reports | `scripts/validate-operator-soak.py`, `.github/workflows/operator-soak.yml` | `crates/ultrasql-bench/tests/release_hardening.rs` | no benchmark; 30-day external operation gate | `docs/OPERATOR_SOAK.md`, `docs/operator-reports.md` | `benchmarks/results/latest/operator_soak_status.json` |
@@ -123,6 +127,7 @@ Before tagging v1.0, attach:
 - chaos recovery manifest,
 - docs site deployment URL or failed-run reason,
 - Docker image digest,
+- npm package tarball asset and publish output,
 - Homebrew formula asset,
 - Debian and RPM package assets,
 - operator soak reports and `operator_soak_status.json`,

@@ -2263,6 +2263,11 @@ same host.
 - [x] Docker image publication path — `Dockerfile` builds a non-root runtime
   image and `.github/workflows/release.yml` publishes
   `ghcr.io/mauneven/ultrasql:<tag>`.
+- [x] npm / pnpm installer package — `packages/npm` publishes the clean
+  `ultrasql` package name with `npm publish --access public --provenance` when
+  npm credentials are configured; release workflow also attaches
+  `ultrasql-<version>.tgz`. The package downloads checksummed release archives
+  and exposes `ultrasql`, `ultrasqld`, and `ultrasql-local`.
 - [x] Homebrew formula — `packaging/homebrew/ultrasql.rb.in` plus
   `scripts/render-homebrew-formula.sh` renders a checksum-pinned macOS formula
   into the GitHub release assets.

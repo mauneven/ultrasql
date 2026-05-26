@@ -35,6 +35,35 @@ docker build -t ultrasql:local .
 docker run --rm -p 5432:5432 -v ultrasql-data:/var/lib/ultrasql ultrasql:local
 ```
 
+## npm / pnpm
+
+The Node package lives in `packages/npm` and publishes the clean package name
+`ultrasql` to the public npm registry:
+
+```bash
+npm install -g ultrasql
+pnpm add -g ultrasql
+```
+
+The release workflow also packs `ultrasql-<version>.tgz` and attaches it to the
+GitHub Release, so npm-compatible installers can consume the same package before
+registry credentials are configured.
+
+The package is a binary installer, not a replacement for PostgreSQL driver
+libraries. It verifies the GitHub release archive checksum during install and
+then launches `ultrasql`, `ultrasqld`, or `ultrasql-local` from the vendored
+release binaries.
+
+The release workflow runs the package tests and calls:
+
+```bash
+npm publish --access public --provenance
+```
+
+GitHub Packages remains the container registry surface through GHCR. GitHub's
+npm registry requires scoped package names, so the unscoped `ultrasql` package
+is published to npmjs when `NPM_TOKEN` is configured.
+
 ## Homebrew
 
 The release workflow renders `ultrasql.rb` from
@@ -58,6 +87,7 @@ systemd unit is hardened and writes only to `/var/lib/ultrasql`.
 
 ## Release workflow
 
-Tagged releases build archives, Deb/RPM packages, the Homebrew formula, and the
-GHCR Docker image. Release publication evidence is the GitHub Actions run id
-plus release assets and container digest.
+Tagged releases build archives, Deb/RPM packages, the Homebrew formula, the
+GHCR Docker image, and the npm package. Release publication evidence is the
+GitHub Actions run id plus release assets, container digest, and npm publish
+run output.

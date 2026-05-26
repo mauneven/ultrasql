@@ -10,7 +10,7 @@ candidate path until the v1.0 release checklist is closed.
 ## Start here
 
 - [Getting Started](getting-started.md) builds and runs a local server.
-- [Install](install.md) covers archives, Docker, Homebrew, Debian, and RPM.
+- [Install](install.md) covers archives, npm, Docker, Homebrew, Debian, and RPM.
 - [Configuration](configuration.md) lists release-relevant server knobs.
 - [Known Incompatibilities](known-incompatibilities.md) records PostgreSQL gaps.
 - [Release Checklist](release-checklist.md) is the production readiness gate.
