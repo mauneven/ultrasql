@@ -37,7 +37,7 @@ curl -fsSL https://raw.githubusercontent.com/mauneven/ultrasql/main/scripts/inst
 Install a specific tag:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/mauneven/ultrasql/main/scripts/install.sh | sh -s -- v0.0.5
+curl -fsSL https://raw.githubusercontent.com/mauneven/ultrasql/main/scripts/install.sh | sh -s -- v0.0.6
 ```
 
 Install somewhere else:
@@ -60,8 +60,8 @@ command run downloads the platform release archive and verifies the matching
 Install from the GitHub Release package asset:
 
 ```bash
-npm install -g https://github.com/mauneven/ultrasql/releases/download/v0.0.5/ultrasql-0.0.5.tgz
-pnpm add -g https://github.com/mauneven/ultrasql/releases/download/v0.0.5/ultrasql-0.0.5.tgz
+npm install -g https://github.com/mauneven/ultrasql/releases/download/v0.0.6/ultrasql-0.0.6.tgz
+pnpm add -g https://github.com/mauneven/ultrasql/releases/download/v0.0.6/ultrasql-0.0.6.tgz
 ```
 
 After the npm registry publish job is configured, the same package installs as:
@@ -94,9 +94,9 @@ npm credentials are configured.
 Tagged releases publish a non-root Linux image from the release workflow:
 
 ```bash
-docker pull ghcr.io/mauneven/ultrasql:v0.0.5
+docker pull ghcr.io/mauneven/ultrasql:v0.0.6
 docker run --rm -p 5432:5432 -v ultrasql-data:/var/lib/ultrasql \
-  ghcr.io/mauneven/ultrasql:v0.0.5
+  ghcr.io/mauneven/ultrasql:v0.0.6
 ```
 
 The image listens on `0.0.0.0:5432` and stores data in `/var/lib/ultrasql`.
@@ -109,7 +109,7 @@ image so GHCR shows a clean GHCR platform list instead of an extra
 Release assets include a rendered Homebrew formula:
 
 ```bash
-curl -fsSLO https://github.com/mauneven/ultrasql/releases/download/v0.0.5/ultrasql.rb
+curl -fsSLO https://github.com/mauneven/ultrasql/releases/download/v0.0.6/ultrasql.rb
 brew install --formula ./ultrasql.rb
 ```
 
@@ -153,7 +153,7 @@ Download the `.deb` package for your architecture and verify the checksum from
 the release `SHASUMS256.txt` file:
 
 ```bash
-sudo apt install ./ultrasql-v0.0.5-x86_64-unknown-linux-gnu.amd64.deb
+sudo apt install ./ultrasql-v0.0.6-x86_64-unknown-linux-gnu.amd64.deb
 ```
 
 The package installs binaries under `/usr/bin`, creates a locked `ultrasql`
@@ -166,7 +166,7 @@ Download the `.rpm` package for your architecture and verify the checksum from
 the release `SHASUMS256.txt` file:
 
 ```bash
-sudo rpm -Uvh ./ultrasql-v0.0.5-x86_64-unknown-linux-gnu.amd64.rpm
+sudo rpm -Uvh ./ultrasql-v0.0.6-x86_64-unknown-linux-gnu.amd64.rpm
 ```
 
 RPM contents match the Debian package: binaries, `/etc/ultrasql/ultrasqld.env`,
@@ -181,7 +181,7 @@ iwr https://raw.githubusercontent.com/mauneven/ultrasql/main/scripts/install.ps1
 Install a specific tag:
 
 ```powershell
-& ([scriptblock]::Create((iwr https://raw.githubusercontent.com/mauneven/ultrasql/main/scripts/install.ps1 -UseB))) -Version v0.0.5
+& ([scriptblock]::Create((iwr https://raw.githubusercontent.com/mauneven/ultrasql/main/scripts/install.ps1 -UseB))) -Version v0.0.6
 ```
 
 Add the install directory to the user `PATH`:
@@ -195,7 +195,7 @@ Add the install directory to the user `PATH`:
 Each release includes a normal Windows setup EXE:
 
 ```powershell
-iwr https://github.com/mauneven/ultrasql/releases/download/v0.0.5/ultrasql-v0.0.5-x86_64-pc-windows-msvc-setup.exe -OutFile ultrasql-setup.exe
+iwr https://github.com/mauneven/ultrasql/releases/download/v0.0.6/ultrasql-v0.0.6-x86_64-pc-windows-msvc-setup.exe -OutFile ultrasql-setup.exe
 Start-Process .\ultrasql-setup.exe -Wait
 ```
 
@@ -219,14 +219,14 @@ choco install ultrasql
 macOS / Linux checksum:
 
 ```bash
-shasum -a 256 -c ultrasql-v0.0.5-aarch64-apple-darwin.tar.gz.sha256
+shasum -a 256 -c ultrasql-v0.0.6-aarch64-apple-darwin.tar.gz.sha256
 ```
 
 Windows checksum:
 
 ```powershell
-$expected = (Get-Content .\ultrasql-v0.0.5-x86_64-pc-windows-msvc.zip.sha256).Split(" ")[0]
-$actual = (Get-FileHash .\ultrasql-v0.0.5-x86_64-pc-windows-msvc.zip -Algorithm SHA256).Hash.ToLower()
+$expected = (Get-Content .\ultrasql-v0.0.6-x86_64-pc-windows-msvc.zip.sha256).Split(" ")[0]
+$actual = (Get-FileHash .\ultrasql-v0.0.6-x86_64-pc-windows-msvc.zip -Algorithm SHA256).Hash.ToLower()
 if ($expected -ne $actual) { throw "checksum mismatch" }
 ```
 
