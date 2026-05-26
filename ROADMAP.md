@@ -2262,7 +2262,8 @@ same host.
 - [x] Known incompatibilities documented: `docs/known-incompatibilities.md`.
 - [x] Docker image publication path — `Dockerfile` builds a non-root runtime
   image and `.github/workflows/release.yml` publishes
-  `ghcr.io/mauneven/ultrasql:<tag>`.
+  `ghcr.io/mauneven/ultrasql:<tag>` with Docker attestations disabled so GHCR
+  shows a clean GHCR platform list.
 - [x] npm / pnpm installer package — `packages/npm` publishes the clean
   `ultrasql` package name with `npm publish --access public --provenance` when
   npm credentials are configured; release workflow also attaches
@@ -2270,7 +2271,15 @@ same host.
   and exposes `ultrasql`, `ultrasqld`, and `ultrasql-local`.
 - [x] Homebrew formula — `packaging/homebrew/ultrasql.rb.in` plus
   `scripts/render-homebrew-formula.sh` renders a checksum-pinned macOS formula
-  into the GitHub release assets.
+  into the GitHub release assets; `HOMEBREW_TAP_TOKEN` promotes it to the
+  Homebrew tap.
+- [x] AUR package — `packaging/aur/PKGBUILD.in`,
+  `packaging/aur/.SRCINFO.in`, and `scripts/render-aur-package.sh` render
+  `ultrasql-bin` for `yay -S ultrasql-bin`; `AUR_SSH_PRIVATE_KEY` promotes it
+  to `aur@aur.archlinux.org:ultrasql-bin.git`.
+- [x] Windows setup EXE and Chocolatey — `packaging/windows/ultrasql.nsi.in`
+  builds a normal setup EXE, and `packaging/chocolatey/` builds a checksum-
+  pinned `.nupkg`; `CHOCOLATEY_API_KEY` promotes it with `choco push`.
 - [x] Debian/Ubuntu and RPM packages — `packaging/nfpm.yaml.in`,
   hardened systemd files under `packaging/linux/`, and the release workflow
   build `.deb` and `.rpm` assets for Linux x86_64 and ARM64.

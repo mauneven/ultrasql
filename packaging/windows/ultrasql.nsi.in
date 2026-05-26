@@ -1,0 +1,58 @@
+Unicode true
+Name "UltraSQL"
+OutFile "@OUT_FILE@"
+InstallDir "$PROGRAMFILES64\UltraSQL"
+RequestExecutionLevel admin
+SetCompressor /SOLID lzma
+
+!include LogicLib.nsh
+!include WinMessages.nsh
+
+BrandingText "UltraSQL @VERSION@"
+LicenseData "@LICENSE_FILE@"
+
+Page license
+Page directory
+Page instfiles
+
+UninstPage uninstConfirm
+UninstPage instfiles
+
+Section "UltraSQL"
+  SetOutPath "$INSTDIR\bin"
+  File "@SOURCE_DIR@\ultrasqld.exe"
+  File "@SOURCE_DIR@\ultrasql.exe"
+  File "@SOURCE_DIR@\ultrasql-local.exe"
+
+  WriteUninstaller "$INSTDIR\Uninstall.exe"
+  WriteRegStr HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\UltraSQL" "DisplayName" "UltraSQL"
+  WriteRegStr HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\UltraSQL" "DisplayVersion" "@VERSION@"
+  WriteRegStr HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\UltraSQL" "Publisher" "UltraSQL"
+  WriteRegStr HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\UltraSQL" "InstallLocation" "$INSTDIR"
+  WriteRegStr HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\UltraSQL" "UninstallString" '"$INSTDIR\Uninstall.exe"'
+  WriteRegDWORD HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\UltraSQL" "NoModify" 1
+  WriteRegDWORD HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\UltraSQL" "NoRepair" 1
+
+  Call AddToPath
+SectionEnd
+
+Section "Uninstall"
+  Call un.RemoveFromPath
+  Delete "$INSTDIR\bin\ultrasqld.exe"
+  Delete "$INSTDIR\bin\ultrasql.exe"
+  Delete "$INSTDIR\bin\ultrasql-local.exe"
+  Delete "$INSTDIR\Uninstall.exe"
+  RMDir "$INSTDIR\bin"
+  RMDir "$INSTDIR"
+  DeleteRegKey HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\UltraSQL"
+SectionEnd
+
+Function AddToPath
+  nsExec::ExecToLog `powershell.exe -NoProfile -ExecutionPolicy Bypass -Command "$$p=[Environment]::GetEnvironmentVariable('Path','Machine'); $$b='$INSTDIR\bin'; $$parts=@($$p -split ';' | Where-Object { $$_ }); if ($$parts -notcontains $$b) { [Environment]::SetEnvironmentVariable('Path', (($$parts + $$b) -join ';'), 'Machine') }"`
+  SendMessage ${HWND_BROADCAST} ${WM_SETTINGCHANGE} 0 "STR:Environment" /TIMEOUT=5000
+FunctionEnd
+
+Function un.RemoveFromPath
+  nsExec::ExecToLog `powershell.exe -NoProfile -ExecutionPolicy Bypass -Command "$$p=[Environment]::GetEnvironmentVariable('Path','Machine'); $$b='$INSTDIR\bin'; $$parts=@($$p -split ';' | Where-Object { $$_ -and $$_ -ne $$b }); [Environment]::SetEnvironmentVariable('Path', ($$parts -join ';'), 'Machine')"`
+  SendMessage ${HWND_BROADCAST} ${WM_SETTINGCHANGE} 0 "STR:Environment" /TIMEOUT=5000
+FunctionEnd

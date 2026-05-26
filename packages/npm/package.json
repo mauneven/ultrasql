@@ -1,6 +1,6 @@
 {
   "name": "ultrasql",
-  "version": "0.0.2",
+  "version": "0.0.3",
   "description": "UltraSQL server and CLI installer for Node.js package managers.",
   "license": "Apache-2.0 OR MIT",
   "homepage": "https://github.com/mauneven/ultrasql#readme",

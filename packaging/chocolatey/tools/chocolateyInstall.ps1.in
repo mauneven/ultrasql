@@ -1,0 +1,14 @@
+$ErrorActionPreference = 'Stop'
+
+$packageName = 'ultrasql'
+$packageArgs = @{
+  packageName    = $packageName
+  fileType       = 'exe'
+  url64bit       = 'https://github.com/mauneven/ultrasql/releases/download/@TAG@/ultrasql-@TAG@-x86_64-pc-windows-msvc-setup.exe'
+  checksum64     = '@SETUP_SHA256@'
+  checksumType64 = 'sha256'
+  silentArgs     = '/S'
+  validExitCodes = @(0)
+}
+
+Install-ChocolateyPackage @packageArgs

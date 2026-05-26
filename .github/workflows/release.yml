@@ -222,6 +222,61 @@ jobs:
           Compress-Archive -Path "dist/$name/*" -DestinationPath "dist/$name.zip" -Force
           $hash = (Get-FileHash -Algorithm SHA256 "dist/$name.zip").Hash.ToLowerInvariant()
           "$hash  $name.zip" | Out-File -Encoding ascii "dist/$name.zip.sha256"
+      - name: install nsis
+        shell: pwsh
+        if: matrix.archive == 'zip'
+        run: choco install nsis -y --no-progress
+      - name: package windows setup exe
+        env:
+          TARGET: ${{ matrix.target }}
+        shell: pwsh
+        if: matrix.archive == 'zip'
+        run: |
+          $name = "ultrasql-$env:RELEASE_TAG-$env:TARGET"
+          $version = $env:RELEASE_TAG
+          if ($version.StartsWith("v")) { $version = $version.Substring(1) }
+          $source = (Resolve-Path "dist/$name").Path
+          $out = Join-Path (Resolve-Path "dist").Path "$name-setup.exe"
+          $license = (Resolve-Path "LICENSE-MIT").Path
+          $nsi = "target/package/$name.nsi"
+          New-Item -ItemType Directory -Force -Path (Split-Path $nsi) | Out-Null
+          $template = Get-Content "packaging/windows/ultrasql.nsi.in" -Raw
+          $template = $template.Replace("@VERSION@", $version)
+          $template = $template.Replace("@SOURCE_DIR@", $source)
+          $template = $template.Replace("@OUT_FILE@", $out)
+          $template = $template.Replace("@LICENSE_FILE@", $license)
+          Set-Content -Path $nsi -Value $template -Encoding ascii
+          $makensis = Join-Path ${env:ProgramFiles(x86)} "NSIS\makensis.exe"
+          & $makensis $nsi
+          $setup = "$name-setup.exe"
+          $hash = (Get-FileHash -Algorithm SHA256 "dist/$setup").Hash.ToLowerInvariant()
+          "$hash  $setup" | Out-File -Encoding ascii "dist/$setup.sha256"
+      - name: package chocolatey nupkg
+        env:
+          TARGET: ${{ matrix.target }}
+        shell: pwsh
+        if: matrix.archive == 'zip'
+        run: |
+          $name = "ultrasql-$env:RELEASE_TAG-$env:TARGET"
+          $version = $env:RELEASE_TAG
+          if ($version.StartsWith("v")) { $version = $version.Substring(1) }
+          $setup = "$name-setup.exe"
+          $setupSha = (Get-Content "dist/$setup.sha256").Split(" ")[0]
+          $pkgDir = "target/chocolatey"
+          New-Item -ItemType Directory -Force -Path "$pkgDir/tools" | Out-Null
+          $nuspec = Get-Content "packaging/chocolatey/ultrasql.nuspec.in" -Raw
+          $nuspec = $nuspec.Replace("@VERSION@", $version)
+          Set-Content -Path "$pkgDir/ultrasql.nuspec" -Value $nuspec -Encoding utf8
+          $install = Get-Content "packaging/chocolatey/tools/chocolateyInstall.ps1.in" -Raw
+          $install = $install.Replace("@VERSION@", $version)
+          $install = $install.Replace("@TAG@", $env:RELEASE_TAG)
+          $install = $install.Replace("@SETUP_SHA256@", $setupSha)
+          Set-Content -Path "$pkgDir/tools/chocolateyInstall.ps1" -Value $install -Encoding utf8
+          Copy-Item "packaging/chocolatey/tools/chocolateyUninstall.ps1.in" "$pkgDir/tools/chocolateyUninstall.ps1"
+          choco pack "$pkgDir/ultrasql.nuspec" --outputdirectory "dist"
+          $nupkg = "ultrasql.$version.nupkg"
+          $hash = (Get-FileHash -Algorithm SHA256 "dist/$nupkg").Hash.ToLowerInvariant()
+          "$hash  $nupkg" | Out-File -Encoding ascii "dist/$nupkg.sha256"
       - uses: actions/upload-artifact@v7
         with:
           name: ultrasql-${{ env.RELEASE_TAG }}-${{ matrix.target }}
@@ -230,8 +285,12 @@ jobs:
             dist/ultrasql-${{ env.RELEASE_TAG }}-${{ matrix.target }}.tar.gz.sha256
             dist/ultrasql-${{ env.RELEASE_TAG }}-${{ matrix.target }}.zip
             dist/ultrasql-${{ env.RELEASE_TAG }}-${{ matrix.target }}.zip.sha256
+            dist/ultrasql-${{ env.RELEASE_TAG }}-${{ matrix.target }}-setup.exe
+            dist/ultrasql-${{ env.RELEASE_TAG }}-${{ matrix.target }}-setup.exe.sha256
             dist/ultrasql-${{ env.RELEASE_TAG }}-${{ matrix.target }}.${{ matrix.package_arch }}.deb
             dist/ultrasql-${{ env.RELEASE_TAG }}-${{ matrix.target }}.${{ matrix.package_arch }}.rpm
+            dist/ultrasql.*.nupkg
+            dist/ultrasql.*.nupkg.sha256
           if-no-files-found: ignore
 
   docker:
@@ -255,6 +314,9 @@ jobs:
         with:
           context: .
           push: true
+          platforms: linux/amd64
+          provenance: false
+          sbom: false
           tags: ghcr.io/${{ github.repository_owner }}/ultrasql:${{ env.RELEASE_TAG }}
           labels: |
             org.opencontainers.image.source=https://github.com/${{ github.repository }}
@@ -281,17 +343,25 @@ jobs:
         shell: bash
         run: |
           mkdir -p release
-          find dist -type f \( -name '*.tar.gz' -o -name '*.zip' -o -name '*.deb' -o -name '*.rpm' -o -name '*.sha256' \) \
+          find dist -type f \( -name '*.tar.gz' -o -name '*.zip' -o -name '*.exe' -o -name '*.deb' -o -name '*.rpm' -o -name '*.nupkg' -o -name '*.sha256' \) \
             -exec cp {} release/ \;
           npm pack ./packages/npm --pack-destination release
           (
             cd release
-            for asset in *.tar.gz *.tgz *.zip *.deb *.rpm; do
+            for asset in *.tar.gz *.tgz *.zip *.exe *.deb *.rpm *.nupkg; do
               [ -e "$asset" ] || continue
               shasum -a 256 "$asset"
             done > SHASUMS256.txt
           )
           scripts/render-homebrew-formula.sh "$RELEASE_TAG" release/SHASUMS256.txt release/ultrasql.rb
+          scripts/render-aur-package.sh "$RELEASE_TAG" release/SHASUMS256.txt release
+          (
+            cd release
+            for asset in ultrasql.rb "ultrasql-aur-${RELEASE_TAG}.tar.gz"; do
+              shasum -a 256 "$asset" >> SHASUMS256.txt
+              shasum -a 256 "$asset" > "$asset.sha256"
+            done
+          )
           args=(
             --reports-dir operator-reports
             --min-reports 3
@@ -351,3 +421,101 @@ jobs:
             exit 0
           fi
           npm publish --access public --provenance
+
+  chocolatey:
+    name: publish chocolatey package
+    runs-on: windows-latest
+    needs: publish
+    permissions:
+      contents: read
+    steps:
+      - name: publish chocolatey package
+        shell: pwsh
+        env:
+          CHOCOLATEY_API_KEY: ${{ secrets.CHOCOLATEY_API_KEY }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if ([string]::IsNullOrWhiteSpace($env:CHOCOLATEY_API_KEY)) {
+            Write-Output "::warning::CHOCOLATEY_API_KEY missing; Chocolatey publish skipped"
+            exit 0
+          }
+          New-Item -ItemType Directory -Force -Path release | Out-Null
+          gh release download $env:RELEASE_TAG --repo $env:GITHUB_REPOSITORY --pattern "ultrasql.*.nupkg" --dir release
+          choco apikey --key $env:CHOCOLATEY_API_KEY --source https://push.chocolatey.org/
+          $package = Get-ChildItem release -Filter "*.nupkg" | Select-Object -First 1
+          if ($null -eq $package) { throw "Chocolatey package asset missing" }
+          choco push $package.FullName --source https://push.chocolatey.org/
+
+  aur:
+    name: publish AUR package
+    runs-on: ubuntu-latest
+    needs: publish
+    permissions:
+      contents: read
+    steps:
+      - name: publish AUR package
+        shell: bash
+        env:
+          AUR_SSH_PRIVATE_KEY: ${{ secrets.AUR_SSH_PRIVATE_KEY }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if [ -z "${AUR_SSH_PRIVATE_KEY:-}" ]; then
+            echo "::warning::AUR_SSH_PRIVATE_KEY missing; AUR publish skipped"
+            exit 0
+          fi
+          mkdir -p ~/.ssh release aur-package
+          printf '%s\n' "$AUR_SSH_PRIVATE_KEY" > ~/.ssh/aur
+          chmod 600 ~/.ssh/aur
+          ssh-keyscan aur.archlinux.org >> ~/.ssh/known_hosts
+          export GIT_SSH_COMMAND="ssh -i ~/.ssh/aur -o IdentitiesOnly=yes"
+          gh release download "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --pattern "ultrasql-aur-${RELEASE_TAG}.tar.gz" --dir release
+          tar -C aur-package -xzf "release/ultrasql-aur-${RELEASE_TAG}.tar.gz"
+          git clone aur@aur.archlinux.org:ultrasql-bin.git aur || {
+            git init aur
+            git -C aur checkout -b master
+            git -C aur remote add origin aur@aur.archlinux.org:ultrasql-bin.git
+          }
+          cp aur-package/PKGBUILD aur-package/.SRCINFO aur/
+          git -C aur config user.name "github-actions[bot]"
+          git -C aur config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git -C aur add PKGBUILD .SRCINFO
+          if git -C aur diff --cached --quiet; then
+            echo "AUR package already current"
+            exit 0
+          fi
+          git -C aur commit -m "update ultrasql ${RELEASE_TAG}"
+          git -C aur push origin master
+
+  homebrew:
+    name: publish homebrew tap
+    runs-on: ubuntu-latest
+    needs: publish
+    permissions:
+      contents: read
+    steps:
+      - name: publish homebrew tap
+        shell: bash
+        env:
+          HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          HOMEBREW_TAP_REPOSITORY: ${{ vars.HOMEBREW_TAP_REPOSITORY }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if [ -z "${HOMEBREW_TAP_TOKEN:-}" ]; then
+            echo "::warning::HOMEBREW_TAP_TOKEN missing; Homebrew tap publish skipped"
+            exit 0
+          fi
+          tap_repo="${HOMEBREW_TAP_REPOSITORY:-mauneven/homebrew-tap}"
+          mkdir -p release
+          gh release download "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --pattern "ultrasql.rb" --dir release
+          git clone "https://x-access-token:${HOMEBREW_TAP_TOKEN}@github.com/${tap_repo}.git" tap
+          mkdir -p tap/Formula
+          cp release/ultrasql.rb tap/Formula/ultrasql.rb
+          git -C tap config user.name "github-actions[bot]"
+          git -C tap config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git -C tap add Formula/ultrasql.rb
+          if git -C tap diff --cached --quiet; then
+            echo "Homebrew tap already current"
+            exit 0
+          fi
+          git -C tap commit -m "update ultrasql ${RELEASE_TAG}"
+          git -C tap push origin HEAD

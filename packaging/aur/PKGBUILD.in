@@ -1,0 +1,33 @@
+pkgname=ultrasql-bin
+pkgver=@VERSION@
+pkgrel=1
+pkgdesc='PostgreSQL-compatible OLTP+OLAP database in Rust'
+arch=('x86_64' 'aarch64')
+url='https://github.com/mauneven/ultrasql'
+license=('Apache-2.0' 'MIT')
+provides=('ultrasql')
+conflicts=('ultrasql')
+source_x86_64=("ultrasql-v${pkgver}-x86_64-unknown-linux-gnu.tar.gz::https://github.com/mauneven/ultrasql/releases/download/v${pkgver}/ultrasql-v${pkgver}-x86_64-unknown-linux-gnu.tar.gz")
+source_aarch64=("ultrasql-v${pkgver}-aarch64-unknown-linux-gnu.tar.gz::https://github.com/mauneven/ultrasql/releases/download/v${pkgver}/ultrasql-v${pkgver}-aarch64-unknown-linux-gnu.tar.gz")
+sha256sums_x86_64=('@SHA256_LINUX_AMD64@')
+sha256sums_aarch64=('@SHA256_LINUX_ARM64@')
+
+package() {
+  local release_dir
+  case "$CARCH" in
+    x86_64)
+      release_dir="ultrasql-v${pkgver}-x86_64-unknown-linux-gnu"
+      ;;
+    aarch64)
+      release_dir="ultrasql-v${pkgver}-aarch64-unknown-linux-gnu"
+      ;;
+    *)
+      echo "unsupported architecture: $CARCH" >&2
+      return 1
+      ;;
+  esac
+
+  install -Dm755 "$srcdir/$release_dir/ultrasqld" "$pkgdir/usr/bin/ultrasqld"
+  install -Dm755 "$srcdir/$release_dir/ultrasql" "$pkgdir/usr/bin/ultrasql"
+  install -Dm755 "$srcdir/$release_dir/ultrasql-local" "$pkgdir/usr/bin/ultrasql-local"
+}

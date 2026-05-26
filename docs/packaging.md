@@ -26,7 +26,9 @@ ghcr.io/mauneven/ultrasql:<tag>
 ```
 
 The image runs as UID/GID `10001`, listens on `0.0.0.0:5432`, and stores data
-under `/var/lib/ultrasql`.
+under `/var/lib/ultrasql`. Docker provenance and SBOM attestations are disabled
+for release images so GHCR presents a clean GHCR platform list instead of an
+extra `unknown/unknown` attestation manifest row.
 
 Local smoke build:
 
@@ -69,7 +71,44 @@ is published to npmjs when `NPM_TOKEN` is configured.
 The release workflow renders `ultrasql.rb` from
 `packaging/homebrew/ultrasql.rb.in` and the release checksum manifest. The
 rendered formula installs the macOS release archives for Intel and Apple
-Silicon hosts.
+Silicon hosts. When `HOMEBREW_TAP_TOKEN` is configured, the workflow also
+pushes the rendered formula to the Homebrew tap repository. The default tap is
+`mauneven/homebrew-tap`; set `HOMEBREW_TAP_REPOSITORY` to override it.
+
+```bash
+brew install mauneven/tap/ultrasql
+```
+
+## AUR
+
+The release workflow renders `packaging/aur/PKGBUILD.in` and
+`packaging/aur/.SRCINFO.in` into `ultrasql-aur-<tag>.tar.gz`. The package name
+is `ultrasql-bin` because it installs the checksummed binary release tarballs.
+
+When `AUR_SSH_PRIVATE_KEY` is configured, the workflow pushes those files to:
+
+```text
+aur@aur.archlinux.org:ultrasql-bin.git
+```
+
+Arch users install with:
+
+```bash
+yay -S ultrasql-bin
+```
+
+## Windows setup EXE and Chocolatey
+
+The Windows release job builds a setup EXE from
+`packaging/windows/ultrasql.nsi.in` with NSIS. The installer copies
+`ultrasqld.exe`, `ultrasql.exe`, and `ultrasql-local.exe` to
+`Program Files\UltraSQL\bin`, registers an uninstaller, and adds the bin
+directory to the machine `PATH`.
+
+The same job renders `packaging/chocolatey/ultrasql.nuspec.in`, embeds the
+setup EXE checksum in `chocolateyInstall.ps1`, and runs `choco pack` to produce
+`ultrasql.<version>.nupkg`. When `CHOCOLATEY_API_KEY` is configured, the
+workflow runs `choco push`.
 
 ## Debian and RPM
 
@@ -87,7 +126,17 @@ systemd unit is hardened and writes only to `/var/lib/ultrasql`.
 
 ## Release workflow
 
-Tagged releases build archives, Deb/RPM packages, the Homebrew formula, the
-GHCR Docker image, and the npm package. Release publication evidence is the
-GitHub Actions run id plus release assets, container digest, and npm publish
-run output.
+Tagged releases build archives, the Windows setup EXE, Deb/RPM packages, the
+Homebrew formula, the AUR source package, the Chocolatey nupkg, the GHCR Docker
+image, and the npm package. Release publication evidence is the GitHub Actions
+run id plus release assets, container digest, and publish output for npm,
+Chocolatey, AUR, and the Homebrew tap.
+
+Registry publishing is automatic once these secrets or variables are present:
+
+| Surface | Secret / variable |
+| --- | --- |
+| npmjs `ultrasql` | `NPM_TOKEN` |
+| Chocolatey | `CHOCOLATEY_API_KEY` |
+| AUR `ultrasql-bin` | `AUR_SSH_PRIVATE_KEY` |
+| Homebrew tap | `HOMEBREW_TAP_TOKEN`, optional `HOMEBREW_TAP_REPOSITORY` |

@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="utf-8"?>
+<package xmlns="http://schemas.microsoft.com/packaging/2015/06/nuspec.xsd">
+  <metadata>
+    <id>ultrasql</id>
+    <version>@VERSION@</version>
+    <title>UltraSQL</title>
+    <authors>UltraSQL Contributors</authors>
+    <owners>UltraSQL Contributors</owners>
+    <license type="expression">Apache-2.0 OR MIT</license>
+    <projectUrl>https://github.com/mauneven/ultrasql</projectUrl>
+    <packageSourceUrl>https://github.com/mauneven/ultrasql</packageSourceUrl>
+    <tags>database sql postgresql rust</tags>
+    <summary>PostgreSQL-compatible OLTP+OLAP database in Rust.</summary>
+    <description>UltraSQL server, CLI, and local runner for Windows. The package installs the checksummed release setup executable.</description>
+  </metadata>
+  <files>
+    <file src="tools\chocolateyInstall.ps1" target="tools" />
+    <file src="tools\chocolateyUninstall.ps1" target="tools" />
+  </files>
+</package>

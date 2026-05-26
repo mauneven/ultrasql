@@ -334,6 +334,13 @@ fn packaging_and_docs_site_surface_is_release_ready() {
     let systemd = repo_file("packaging/linux/ultrasqld.service");
     let homebrew = repo_file("packaging/homebrew/ultrasql.rb.in");
     let homebrew_render = repo_file("scripts/render-homebrew-formula.sh");
+    let aur = repo_file("packaging/aur/PKGBUILD.in");
+    let aur_srcinfo = repo_file("packaging/aur/.SRCINFO.in");
+    let aur_render = repo_file("scripts/render-aur-package.sh");
+    let chocolatey = repo_file("packaging/chocolatey/ultrasql.nuspec.in");
+    let chocolatey_install = repo_file("packaging/chocolatey/tools/chocolateyInstall.ps1.in");
+    let chocolatey_uninstall = repo_file("packaging/chocolatey/tools/chocolateyUninstall.ps1.in");
+    let windows_installer = repo_file("packaging/windows/ultrasql.nsi.in");
     let nfpm_render = repo_file("scripts/render-nfpm-config.sh");
     let docs = repo_file("docs/packaging.md");
     let install = repo_file("docs/install.md");
@@ -378,6 +385,12 @@ fn packaging_and_docs_site_surface_is_release_ready() {
     for needle in [
         "docker/build-push-action",
         "ghcr.io/${{ github.repository_owner }}/ultrasql",
+        "platforms: linux/amd64",
+        "provenance: false",
+        "sbom: false",
+        "makensis",
+        "setup.exe",
+        "*.exe",
         "render-nfpm-config.sh",
         "actions/setup-go@v6",
         "go install github.com/goreleaser/nfpm/v2/cmd/nfpm@v2.43.1",
@@ -392,6 +405,15 @@ fn packaging_and_docs_site_surface_is_release_ready() {
         "*.tgz",
         "npm publish --access public --provenance",
         "NPM_TOKEN",
+        "render-aur-package.sh",
+        "ultrasql-aur-${RELEASE_TAG}.tar.gz",
+        "AUR_SSH_PRIVATE_KEY",
+        "aur@aur.archlinux.org:ultrasql-bin.git",
+        "choco pack",
+        "*.nupkg",
+        "CHOCOLATEY_API_KEY",
+        "choco push",
+        "HOMEBREW_TAP_TOKEN",
         "pattern: ultrasql-${{ env.RELEASE_TAG }}-*",
         "*.deb",
         "*.rpm",
@@ -448,6 +470,81 @@ fn packaging_and_docs_site_surface_is_release_ready() {
             "homebrew renderer missing {needle}"
         );
     }
+    for needle in [
+        "pkgname=ultrasql-bin",
+        "pkgver=@VERSION@",
+        "x86_64",
+        "aarch64",
+        "@SHA256_LINUX_AMD64@",
+        "@SHA256_LINUX_ARM64@",
+        "install -Dm755",
+    ] {
+        assert!(aur.contains(needle), "AUR PKGBUILD missing {needle}");
+    }
+    for needle in [
+        "pkgbase = ultrasql-bin",
+        "pkgver = @VERSION@",
+        "arch = x86_64",
+        "arch = aarch64",
+        "@SHA256_LINUX_AMD64@",
+        "@SHA256_LINUX_ARM64@",
+    ] {
+        assert!(aur_srcinfo.contains(needle), "AUR SRCINFO missing {needle}");
+    }
+    for needle in [
+        "SHA256_LINUX_AMD64",
+        "SHA256_LINUX_ARM64",
+        "checksum missing",
+        "ultrasql-aur-${tag}.tar.gz",
+        "PKGBUILD",
+        ".SRCINFO",
+    ] {
+        assert!(aur_render.contains(needle), "AUR renderer missing {needle}");
+    }
+    for needle in [
+        "<id>ultrasql</id>",
+        "<version>@VERSION@</version>",
+        "chocolateyInstall.ps1",
+        "chocolateyUninstall.ps1",
+    ] {
+        assert!(
+            chocolatey.contains(needle),
+            "Chocolatey nuspec missing {needle}"
+        );
+    }
+    for needle in [
+        "Install-ChocolateyPackage",
+        "url64bit",
+        "@SETUP_SHA256@",
+        "ultrasql-@TAG@-x86_64-pc-windows-msvc-setup.exe",
+    ] {
+        assert!(
+            chocolatey_install.contains(needle),
+            "Chocolatey install script missing {needle}"
+        );
+    }
+    for needle in ["Uninstall-ChocolateyPackage", "UltraSQL", "Uninstall.exe"] {
+        assert!(
+            chocolatey_uninstall.contains(needle),
+            "Chocolatey uninstall script missing {needle}"
+        );
+    }
+    for needle in [
+        "Name \"UltraSQL\"",
+        "OutFile \"@OUT_FILE@\"",
+        "RequestExecutionLevel admin",
+        "ultrasqld.exe",
+        "ultrasql.exe",
+        "ultrasql-local.exe",
+        "WriteUninstaller",
+        "AddToPath",
+        "RemoveFromPath",
+    ] {
+        assert!(
+            windows_installer.contains(needle),
+            "Windows installer template missing {needle}"
+        );
+    }
     for needle in ["@VERSION@", "@ARCH@", "@ROOT@", "sed"] {
         assert!(
             nfpm_render.contains(needle),
@@ -460,6 +557,12 @@ fn packaging_and_docs_site_surface_is_release_ready() {
         "ghcr.io/mauneven/ultrasql",
         "packages/npm",
         "npm publish",
+        "Windows setup EXE",
+        "Chocolatey",
+        "AUR",
+        "yay -S ultrasql-bin",
+        "Homebrew tap",
+        "clean GHCR platform list",
         "Homebrew",
         "Debian",
         "RPM",
@@ -480,6 +583,7 @@ fn packaging_scripts_have_valid_bash_syntax() {
 
     for script in [
         "scripts/render-homebrew-formula.sh",
+        "scripts/render-aur-package.sh",
         "scripts/render-nfpm-config.sh",
         "packaging/linux/preinstall.sh",
         "packaging/linux/postinstall.sh",

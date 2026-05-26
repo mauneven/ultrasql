@@ -1,0 +1,8 @@
+$ErrorActionPreference = 'Stop'
+
+$packageName = 'ultrasql'
+$uninstaller = Join-Path ${env:ProgramFiles} 'UltraSQL\Uninstall.exe'
+
+if (Test-Path $uninstaller) {
+  Uninstall-ChocolateyPackage $packageName 'exe' '/S' $uninstaller
+}

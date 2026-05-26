@@ -61,17 +61,29 @@ Install the latest release archive:
 curl -fsSL https://raw.githubusercontent.com/mauneven/ultrasql/main/scripts/install.sh | sh
 ```
 
-Install with npm or pnpm from the release package:
+Registry package managers, after their release publish secrets are configured:
 
 ```bash
-npm install -g https://github.com/mauneven/ultrasql/releases/download/v0.0.2/ultrasql-0.0.2.tgz
-pnpm add -g https://github.com/mauneven/ultrasql/releases/download/v0.0.2/ultrasql-0.0.2.tgz
+npm install -g ultrasql
+pnpm add -g ultrasql
+brew install mauneven/tap/ultrasql
+yay -S ultrasql-bin
+choco install ultrasql
 ```
 
-Windows PowerShell:
+GitHub Release package fallback:
+
+```bash
+npm install -g https://github.com/mauneven/ultrasql/releases/download/v0.0.3/ultrasql-0.0.3.tgz
+pnpm add -g https://github.com/mauneven/ultrasql/releases/download/v0.0.3/ultrasql-0.0.3.tgz
+```
+
+Windows PowerShell or setup EXE:
 
 ```powershell
 iwr https://raw.githubusercontent.com/mauneven/ultrasql/main/scripts/install.ps1 -UseB | iex
+iwr https://github.com/mauneven/ultrasql/releases/download/v0.0.3/ultrasql-v0.0.3-x86_64-pc-windows-msvc-setup.exe -OutFile ultrasql-setup.exe
+Start-Process .\ultrasql-setup.exe -Wait
 ```
 
 Build from source:
@@ -100,8 +112,8 @@ fuzz/         parser, wire, WAL, and planner fuzz targets
 
 - [ROADMAP.md](ROADMAP.md) - production plan and open gates.
 - [docs/getting-started.md](docs/getting-started.md) - local first steps.
-- [docs/install.md](docs/install.md) - release archives, npm, and source build.
-- [docs/packaging.md](docs/packaging.md) - Docker, npm, Homebrew, Debian, RPM.
+- [docs/install.md](docs/install.md) - release archives, package managers, and source build.
+- [docs/packaging.md](docs/packaging.md) - Docker, npm, Homebrew, AUR, Chocolatey, Debian, RPM.
 - [docs/known-incompatibilities.md](docs/known-incompatibilities.md) - current PostgreSQL gaps.
 - [docs/release-checklist.md](docs/release-checklist.md) - release evidence.
 - [BENCHMARKS.md](BENCHMARKS.md) - methodology and artifact policy.
