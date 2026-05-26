@@ -74,15 +74,15 @@ choco install ultrasql
 GitHub Release package fallback:
 
 ```bash
-npm install -g https://github.com/mauneven/ultrasql/releases/download/v0.0.3/ultrasql-0.0.3.tgz
-pnpm add -g https://github.com/mauneven/ultrasql/releases/download/v0.0.3/ultrasql-0.0.3.tgz
+npm install -g https://github.com/mauneven/ultrasql/releases/download/v0.0.4/ultrasql-0.0.4.tgz
+pnpm add -g https://github.com/mauneven/ultrasql/releases/download/v0.0.4/ultrasql-0.0.4.tgz
 ```
 
 Windows PowerShell or setup EXE:
 
 ```powershell
 iwr https://raw.githubusercontent.com/mauneven/ultrasql/main/scripts/install.ps1 -UseB | iex
-iwr https://github.com/mauneven/ultrasql/releases/download/v0.0.3/ultrasql-v0.0.3-x86_64-pc-windows-msvc-setup.exe -OutFile ultrasql-setup.exe
+iwr https://github.com/mauneven/ultrasql/releases/download/v0.0.4/ultrasql-v0.0.4-x86_64-pc-windows-msvc-setup.exe -OutFile ultrasql-setup.exe
 Start-Process .\ultrasql-setup.exe -Wait
 ```
 

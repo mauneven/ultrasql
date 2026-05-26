@@ -274,6 +274,7 @@ jobs:
           Set-Content -Path "$pkgDir/tools/chocolateyInstall.ps1" -Value $install -Encoding utf8
           Copy-Item "packaging/chocolatey/tools/chocolateyUninstall.ps1.in" "$pkgDir/tools/chocolateyUninstall.ps1"
           choco pack "$pkgDir/ultrasql.nuspec" --outputdirectory "dist"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           $nupkg = "ultrasql.$version.nupkg"
           $hash = (Get-FileHash -Algorithm SHA256 "dist/$nupkg").Hash.ToLowerInvariant()
           "$hash  $nupkg" | Out-File -Encoding ascii "dist/$nupkg.sha256"

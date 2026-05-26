@@ -504,6 +504,8 @@ fn packaging_and_docs_site_surface_is_release_ready() {
     for needle in [
         "<id>ultrasql</id>",
         "<version>@VERSION@</version>",
+        "<licenseUrl>",
+        "<requireLicenseAcceptance>false</requireLicenseAcceptance>",
         "chocolateyInstall.ps1",
         "chocolateyUninstall.ps1",
     ] {
