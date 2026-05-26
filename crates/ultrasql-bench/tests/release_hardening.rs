@@ -392,6 +392,7 @@ fn packaging_and_docs_site_surface_is_release_ready() {
         "*.tgz",
         "npm publish --access public --provenance",
         "NPM_TOKEN",
+        "pattern: ultrasql-${{ env.RELEASE_TAG }}-*",
         "*.deb",
         "*.rpm",
     ] {

@@ -275,6 +275,7 @@ jobs:
           node-version: "22"
       - uses: actions/download-artifact@v8
         with:
+          pattern: ultrasql-${{ env.RELEASE_TAG }}-*
           path: dist
       - name: flatten assets and generate checksum manifest
         shell: bash
