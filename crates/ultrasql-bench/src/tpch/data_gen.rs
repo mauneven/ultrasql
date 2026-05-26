@@ -116,19 +116,43 @@ fn run_dbgen(dbgen: &Path, scale: u32, out_dir: &Path) -> Result<()> {
 /// data is pseudo-random but reproducible. This is **not** TPC-H-compliant —
 /// it exists solely to allow `cargo test` and CI runs without a `dbgen` binary.
 fn write_synthetic(scale: u32, out_dir: &Path) -> Result<()> {
+    let rows = SyntheticRows::from_scale(scale);
+    write_synthetic_rows(rows, out_dir)
+}
+
+fn write_synthetic_rows(rows: SyntheticRows, out_dir: &Path) -> Result<()> {
     write_region(out_dir)?;
     write_nation(out_dir)?;
-    write_supplier(scale, out_dir)?;
-    write_customer(scale, out_dir)?;
-    write_part(scale, out_dir)?;
-    write_partsupp(scale, out_dir)?;
-    write_orders(scale, out_dir)?;
-    write_lineitem(scale, out_dir)?;
+    write_supplier(rows.suppliers, out_dir)?;
+    write_customer(rows.customers, out_dir)?;
+    write_part(rows.parts, out_dir)?;
+    write_partsupp(rows.parts, rows.suppliers, out_dir)?;
+    write_orders(rows.orders, rows.customers, out_dir)?;
+    write_lineitem(rows.orders, rows.parts, rows.suppliers, out_dir)?;
     Ok(())
 }
 
 fn tbl_path(out_dir: &Path, name: &str) -> PathBuf {
     out_dir.join(format!("{name}.tbl"))
+}
+
+#[derive(Clone, Copy, Debug)]
+struct SyntheticRows {
+    suppliers: u32,
+    customers: u32,
+    parts: u32,
+    orders: u32,
+}
+
+impl SyntheticRows {
+    fn from_scale(scale: u32) -> Self {
+        Self {
+            suppliers: (10_000 * scale).max(1),
+            customers: (150_000 * scale).max(1),
+            parts: (200_000 * scale).max(1),
+            orders: (1_500_000 * scale).max(1),
+        }
+    }
 }
 
 fn write_region(out_dir: &Path) -> Result<()> {
@@ -173,8 +197,7 @@ fn write_nation(out_dir: &Path) -> Result<()> {
     Ok(())
 }
 
-fn write_supplier(scale: u32, out_dir: &Path) -> Result<()> {
-    let n = (10_000 * scale).max(1);
+fn write_supplier(n: u32, out_dir: &Path) -> Result<()> {
     let mut buf = String::new();
     let mut rng = Xorshift64::new(0x5EED_0001);
     for i in 1..=n {
@@ -192,8 +215,7 @@ fn write_supplier(scale: u32, out_dir: &Path) -> Result<()> {
     std::fs::write(tbl_path(out_dir, "supplier"), buf).context("write supplier.tbl")
 }
 
-fn write_customer(scale: u32, out_dir: &Path) -> Result<()> {
-    let n = (150_000 * scale).max(1);
+fn write_customer(n: u32, out_dir: &Path) -> Result<()> {
     let segments = [
         "AUTOMOBILE",
         "BUILDING",
@@ -219,8 +241,7 @@ fn write_customer(scale: u32, out_dir: &Path) -> Result<()> {
     std::fs::write(tbl_path(out_dir, "customer"), buf).context("write customer.tbl")
 }
 
-fn write_part(scale: u32, out_dir: &Path) -> Result<()> {
-    let n = (200_000 * scale).max(1);
+fn write_part(n: u32, out_dir: &Path) -> Result<()> {
     let mut buf = String::new();
     let mut rng = Xorshift64::new(0x5EED_0003);
     for i in 1..=n {
@@ -241,9 +262,7 @@ fn write_part(scale: u32, out_dir: &Path) -> Result<()> {
     std::fs::write(tbl_path(out_dir, "part"), buf).context("write part.tbl")
 }
 
-fn write_partsupp(scale: u32, out_dir: &Path) -> Result<()> {
-    let n_parts = (200_000 * scale).max(1);
-    let n_suppliers = (10_000 * scale).max(1);
+fn write_partsupp(n_parts: u32, n_suppliers: u32, out_dir: &Path) -> Result<()> {
     let mut buf = String::new();
     let mut rng = Xorshift64::new(0x5EED_0004);
     // Each part has exactly 4 suppliers.
@@ -265,9 +284,7 @@ fn write_partsupp(scale: u32, out_dir: &Path) -> Result<()> {
     std::fs::write(tbl_path(out_dir, "partsupp"), buf).context("write partsupp.tbl")
 }
 
-fn write_orders(scale: u32, out_dir: &Path) -> Result<()> {
-    let n = (1_500_000 * scale).max(1);
-    let n_customers = (150_000 * scale).max(1);
+fn write_orders(n: u32, n_customers: u32, out_dir: &Path) -> Result<()> {
     let statuses = ['O', 'F', 'P'];
     let priorities = ["1-URGENT", "2-HIGH", "3-MEDIUM", "4-NOT SPECIFIED", "5-LOW"];
     let mut buf = String::new();
@@ -294,10 +311,7 @@ fn write_orders(scale: u32, out_dir: &Path) -> Result<()> {
     std::fs::write(tbl_path(out_dir, "orders"), buf).context("write orders.tbl")
 }
 
-fn write_lineitem(scale: u32, out_dir: &Path) -> Result<()> {
-    let n_orders = (1_500_000 * scale).max(1);
-    let n_parts = (200_000 * scale).max(1);
-    let n_suppliers = (10_000 * scale).max(1);
+fn write_lineitem(n_orders: u32, n_parts: u32, n_suppliers: u32, out_dir: &Path) -> Result<()> {
     let shipmodes = ["AIR", "TRUCK", "SHIP", "RAIL", "MAIL", "FOB", "REG AIR"];
     let shipinstructs = [
         "DELIVER IN PERSON",
@@ -475,10 +489,17 @@ fn fake_container(rng: &mut Xorshift64) -> String {
 mod tests {
     use super::*;
 
+    const TEST_ROWS: SyntheticRows = SyntheticRows {
+        suppliers: 3,
+        customers: 4,
+        parts: 5,
+        orders: 6,
+    };
+
     #[test]
     fn synthetic_generates_all_tbl_files() {
         let dir = tempfile::tempdir().expect("tempdir");
-        write_synthetic(1, dir.path()).expect("generate");
+        write_synthetic_rows(TEST_ROWS, dir.path()).expect("generate");
         for name in TABLE_NAMES {
             let path = dir.path().join(format!("{name}.tbl"));
             assert!(path.exists(), "{name}.tbl not created");
@@ -493,8 +514,8 @@ mod tests {
     fn synthetic_is_deterministic() {
         let dir1 = tempfile::tempdir().expect("tempdir1");
         let dir2 = tempfile::tempdir().expect("tempdir2");
-        write_synthetic(1, dir1.path()).expect("gen1");
-        write_synthetic(1, dir2.path()).expect("gen2");
+        write_synthetic_rows(TEST_ROWS, dir1.path()).expect("gen1");
+        write_synthetic_rows(TEST_ROWS, dir2.path()).expect("gen2");
         for name in TABLE_NAMES {
             let a = std::fs::read(dir1.path().join(format!("{name}.tbl"))).expect("read a");
             let b = std::fs::read(dir2.path().join(format!("{name}.tbl"))).expect("read b");
