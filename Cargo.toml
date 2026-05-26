@@ -17,6 +17,7 @@ members = [
     "crates/ultrasql-iceberg",
     "crates/ultrasql-arrow",
     "crates/ultrasql-server",
+    "crates/ultrasql-node",
     "crates/ultrasql-cli",
     "crates/ultrasql-bench",
     "crates/ultrasql-sqllogictest-runner",

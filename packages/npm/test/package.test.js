@@ -10,8 +10,20 @@ test("does not require install-time build approval", () => {
 });
 
 test("publishes discoverable npm metadata", () => {
-  assert.match(packageJson.description, /PostgreSQL-wire UltraSQL/);
-  for (const keyword of ["database", "sql", "postgresql", "pgwire", "vector", "rust"]) {
+  assert.match(packageJson.description, /Embedded UltraSQL database API/);
+  assert.equal(packageJson.main, "index.js");
+  assert.equal(packageJson.types, "index.d.ts");
+  for (const keyword of [
+    "database",
+    "sql",
+    "postgresql",
+    "pgwire",
+    "embedded",
+    "node-api",
+    "bun",
+    "vector",
+    "rust",
+  ]) {
     assert.ok(packageJson.keywords.includes(keyword), `missing keyword ${keyword}`);
   }
   assert.deepEqual(packageJson.os, ["darwin", "linux", "win32"]);
@@ -21,6 +33,8 @@ test("publishes discoverable npm metadata", () => {
 test("readme documents node usage and binary behavior", () => {
   const readme = fs.readFileSync(path.join(__dirname, "..", "README.md"), "utf8");
   for (const needle of [
+    "Database.open(\":memory:\")",
+    "db.prepare",
     "pnpm add pg",
     "import pg from \"pg\"",
     "Supported Targets",

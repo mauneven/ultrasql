@@ -117,6 +117,7 @@ fn command_tag(msgs: &[BackendMessage]) -> Option<String> {
 mod basic;
 mod ddl_alter;
 mod ddl_create;
+mod embedded;
 mod extended;
 mod plan_cache;
 mod recovery;

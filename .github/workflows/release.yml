@@ -134,6 +134,8 @@ jobs:
             --bin ultrasqld \
             --bin ultrasql \
             --bin ultrasql-local
+          cargo build --locked --profile release-ship --target "$TARGET" \
+            -p ultrasql-node
           "target/${TARGET}/release-ship/ultrasqld" --version
           "target/${TARGET}/release-ship/ultrasql" --version
           "target/${TARGET}/release-ship/ultrasql-local" --help >/dev/null
@@ -147,6 +149,8 @@ jobs:
             --bin ultrasqld `
             --bin ultrasql `
             --bin ultrasql-local
+          cargo build --locked --profile release-ship --target $env:TARGET `
+            -p ultrasql-node
           & "target/$env:TARGET/release-ship/ultrasqld.exe" --version
           & "target/$env:TARGET/release-ship/ultrasql.exe" --version
           & "target/$env:TARGET/release-ship/ultrasql-local.exe" --help | Out-Null
@@ -161,6 +165,11 @@ jobs:
           cp "target/${TARGET}/release-ship/ultrasqld" "dist/${name}/"
           cp "target/${TARGET}/release-ship/ultrasql" "dist/${name}/"
           cp "target/${TARGET}/release-ship/ultrasql-local" "dist/${name}/"
+          case "$TARGET" in
+            *apple-darwin) cp "target/${TARGET}/release-ship/libultrasql_node.dylib" "dist/${name}/ultrasql.node" ;;
+            *linux-gnu) cp "target/${TARGET}/release-ship/libultrasql_node.so" "dist/${name}/ultrasql.node" ;;
+            *) echo "unsupported native addon target: $TARGET" >&2; exit 1 ;;
+          esac
           tar -C dist -czf "dist/${name}.tar.gz" "${name}"
           (cd dist && shasum -a 256 "${name}.tar.gz" > "${name}.tar.gz.sha256")
       - name: prepare linux package root
@@ -221,6 +230,7 @@ jobs:
           Copy-Item "target/$env:TARGET/release-ship/ultrasqld.exe" "dist/$name/"
           Copy-Item "target/$env:TARGET/release-ship/ultrasql.exe" "dist/$name/"
           Copy-Item "target/$env:TARGET/release-ship/ultrasql-local.exe" "dist/$name/"
+          Copy-Item "target/$env:TARGET/release-ship/ultrasql_node.dll" "dist/$name/ultrasql.node"
           Compress-Archive -Path "dist/$name/*" -DestinationPath "dist/$name.zip" -Force
           $hash = (Get-FileHash -Algorithm SHA256 "dist/$name.zip").Hash.ToLowerInvariant()
           "$hash  $name.zip" | Out-File -Encoding ascii "dist/$name.zip.sha256"

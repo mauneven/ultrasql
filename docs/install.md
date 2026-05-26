@@ -13,7 +13,7 @@ Each release contains:
   `ultrasql-bin`.
 - A Chocolatey `.nupkg` backed by the Windows setup EXE.
 - A clean npm package, `ultrasql`, backed by the same checksummed release
-  archives.
+  archives and the embedded Node-API addon.
 - Per-asset `.sha256` files and a `SHASUMS256.txt` manifest.
 
 The docs site for install and operations is `https://docs.ultrasql.org`.
@@ -50,11 +50,12 @@ ULTRASQL_INSTALL_DIR=/usr/local/bin \
 The script downloads the platform archive and `.sha256` file, verifies the
 checksum, and installs the binaries. It does not edit shell startup files.
 
-## npm / pnpm
+## npm / pnpm / Bun
 
-The npm package is named `ultrasql`. It exposes `ultrasql`, `ultrasqld`, and
-`ultrasql-local` on `PATH`; the first command run downloads the platform release
-archive and verifies the matching `.sha256` file.
+The npm package is named `ultrasql`. It exposes the embedded `Database` API plus
+`ultrasql`, `ultrasqld`, and `ultrasql-local` on `PATH`. First embedded open or
+command run downloads the platform release archive and verifies the matching
+`.sha256` file.
 
 Install from the GitHub Release package asset:
 
@@ -68,10 +69,21 @@ After the npm registry publish job is configured, the same package installs as:
 ```bash
 npm install -g ultrasql
 pnpm add -g ultrasql
+bun add -g ultrasql
 ```
 
-Applications should keep using PostgreSQL client libraries such as `pg`,
-`psycopg`, `libpq`, or `pgx`; UltraSQL speaks PostgreSQL wire protocol.
+Embedded Node/Bun use:
+
+```js
+const { Database } = require("ultrasql");
+const db = await Database.open(":memory:");
+db.run("CREATE TABLE t (x int4)");
+db.run("INSERT INTO t VALUES (?)", 42);
+console.log(db.get("SELECT x FROM t"));
+```
+
+Server-mode applications should keep using PostgreSQL client libraries such as
+`pg`, `psycopg`, `libpq`, or `pgx`; UltraSQL speaks PostgreSQL wire protocol.
 
 Release automation always attaches `ultrasql-<version>.tgz` to GitHub Releases
 and publishes the registry package from `packages/npm` with `npm publish` when

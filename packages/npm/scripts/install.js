@@ -11,6 +11,7 @@ const { assetForPlatform, normalizeTag } = require("./platform");
 
 const PACKAGE_ROOT = path.resolve(__dirname, "..");
 const BINARIES = ["ultrasqld", "ultrasql", "ultrasql-local"];
+const NATIVE_MODULE = "ultrasql.node";
 
 function packageVersion() {
   return require(path.join(PACKAGE_ROOT, "package.json")).version;
@@ -136,6 +137,10 @@ function copyBinaries(plan, extractDir, vendorDir) {
       fs.chmodSync(destination, 0o755);
     }
   }
+  const nativeSource = findBinary(extractDir, NATIVE_MODULE);
+  if (nativeSource) {
+    fs.copyFileSync(nativeSource, path.join(vendorDir, NATIVE_MODULE));
+  }
   fs.writeFileSync(path.join(vendorDir, ".release-tag"), `${plan.tag}\n`);
 }
 
@@ -143,18 +148,25 @@ function vendorDirFor(plan) {
   return path.join(PACKAGE_ROOT, "vendor", plan.target);
 }
 
-function isInstalled(plan) {
+function isInstalled(plan, options = {}) {
   const vendorDir = vendorDirFor(plan);
   const marker = path.join(vendorDir, ".release-tag");
   if (!fs.existsSync(marker) || fs.readFileSync(marker, "utf8").trim() !== plan.tag) {
     return false;
   }
-  return BINARIES.every((binary) =>
+  const hasBinaries = BINARIES.every((binary) =>
     fs.existsSync(path.join(vendorDir, `${binary}${plan.binaryExtension}`))
   );
+  if (!hasBinaries) {
+    return false;
+  }
+  if (options.requireNative && !fs.existsSync(path.join(vendorDir, NATIVE_MODULE))) {
+    return false;
+  }
+  return true;
 }
 
-async function install() {
+async function install(options = {}) {
   if (process.env.ULTRASQL_NPM_SKIP_DOWNLOAD === "1") {
     return;
   }
@@ -162,7 +174,7 @@ async function install() {
     packageVersion: packageVersion(),
     versionOverride: process.env.ULTRASQL_VERSION,
   });
-  if (isInstalled(plan)) {
+  if (isInstalled(plan, options)) {
     return;
   }
 

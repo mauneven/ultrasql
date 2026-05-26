@@ -37,7 +37,7 @@ docker build -t ultrasql:local .
 docker run --rm -p 5432:5432 -v ultrasql-data:/var/lib/ultrasql ultrasql:local
 ```
 
-## npm / pnpm
+## npm / pnpm / Bun
 
 The Node package lives in `packages/npm` and publishes the clean package name
 `ultrasql` to the public npm registry:
@@ -45,16 +45,21 @@ The Node package lives in `packages/npm` and publishes the clean package name
 ```bash
 npm install -g ultrasql
 pnpm add -g ultrasql
+bun add -g ultrasql
 ```
 
 The release workflow also packs `ultrasql-<version>.tgz` and attaches it to the
 GitHub Release, so npm-compatible installers can consume the same package before
 registry credentials are configured.
 
-The package is a binary launcher, not a replacement for PostgreSQL driver
-libraries. It exposes shims at install time; the first command run verifies the
-GitHub release archive checksum, vendors the matching binaries, and then
-launches `ultrasql`, `ultrasqld`, or `ultrasql-local`.
+The package exposes a Node-API embedded `Database` class plus command shims.
+`Database.open(":memory:")` verifies the GitHub release archive checksum,
+vendors `ultrasql.node`, and opens the engine in-process. The command shims use
+the same archive and launch `ultrasql`, `ultrasqld`, or `ultrasql-local`.
+
+Server-mode applications should still use PostgreSQL driver libraries. Embedded
+mode is for in-process local databases; wire mode is for drop-in PostgreSQL
+client compatibility.
 
 The release workflow runs the package tests and calls:
 

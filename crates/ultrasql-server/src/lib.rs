@@ -49,6 +49,7 @@ pub mod cancel;
 pub mod catalog_version;
 pub mod columnar_storage;
 pub mod copy;
+pub mod embedded;
 pub mod error;
 pub mod extended;
 pub mod index_key;
@@ -125,6 +126,7 @@ use ultrasql_wal::payload::{
 };
 use ultrasql_wal::{RecordType, WalRecord};
 
+pub use embedded::EmbeddedDatabase;
 pub use error::ServerError;
 pub use pipeline::{LowerCtx, SampleTables, build_sample_database};
 pub use result_encoder::{
@@ -1908,11 +1910,14 @@ fn is_local_read_plan(plan: &LogicalPlan) -> bool {
     }
 }
 
-fn local_output_from_select_result(result: SelectResult) -> Result<LocalQueryOutput, ServerError> {
+pub(crate) fn local_output_from_select_result(
+    result: SelectResult,
+) -> Result<LocalQueryOutput, ServerError> {
+    let messages = local_result_messages(result)?;
     let mut columns = Vec::new();
     let mut rows = Vec::new();
     let mut command_tag = String::new();
-    for message in result.messages {
+    for message in messages {
         match message {
             BackendMessage::RowDescription { fields } => {
                 columns = fields
@@ -1950,6 +1955,31 @@ fn local_output_from_select_result(result: SelectResult) -> Result<LocalQueryOut
         rows,
         command_tag,
     })
+}
+
+fn local_result_messages(result: SelectResult) -> Result<Vec<BackendMessage>, ServerError> {
+    if let Some(body) = result.streamed_body {
+        return decode_local_result_body(body);
+    }
+    if let Some(body) = result.shared_streamed_body {
+        return decode_local_result_body(bytes::BytesMut::from(body.as_ref()));
+    }
+    Ok(result.messages)
+}
+
+fn decode_local_result_body(mut body: bytes::BytesMut) -> Result<Vec<BackendMessage>, ServerError> {
+    let mut messages = Vec::new();
+    while !body.is_empty() {
+        match ultrasql_protocol::decode_backend(&mut body)? {
+            Some(message) => messages.push(message),
+            None => {
+                return Err(ServerError::CopyFormat(
+                    "embedded result ended with a partial wire frame".to_owned(),
+                ));
+            }
+        }
+    }
+    Ok(messages)
 }
 
 /// Default initial read buffer. Picked to fit a small startup message
@@ -3153,6 +3183,20 @@ fn validation_check(name: &'static str, errors: Vec<String>, ok_detail: String) 
 }
 
 impl Server {
+    /// Build an empty in-memory server.
+    ///
+    /// This is the embedded `:memory:` entry point: no TCP listener, no WAL,
+    /// no preloaded sample relations. DDL and DML still use the same heap,
+    /// catalog, MVCC, and executor paths as a normal session.
+    #[must_use]
+    pub fn with_empty_database() -> Self {
+        Self::with_in_memory_catalog(
+            InMemoryCatalog::new(),
+            SampleTables::new(),
+            IN_MEMORY_POOL_FRAMES,
+        )
+    }
+
     /// Execute one read-only SQL query without opening a server socket.
     ///
     /// The local path deliberately reuses the normal parser, binder, and
@@ -3250,7 +3294,14 @@ impl Server {
     pub fn with_sample_database_pool_frames(pool_frames: usize) -> Self {
         let mut catalog = InMemoryCatalog::new();
         let tables = build_sample_database(&mut catalog);
+        Self::with_in_memory_catalog(catalog, tables, pool_frames)
+    }
 
+    fn with_in_memory_catalog(
+        catalog: InMemoryCatalog,
+        tables: SampleTables,
+        pool_frames: usize,
+    ) -> Self {
         let persistent_catalog = Arc::new(PersistentCatalog::new());
         // One in-memory buffer pool for both catalog bootstrap and
         // user-table DML so every connection observes the same heap.

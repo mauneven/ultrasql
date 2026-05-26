@@ -66,10 +66,22 @@ Registry package managers, after their release publish secrets are configured:
 ```bash
 npm install -g ultrasql
 pnpm add -g ultrasql
+bun add -g ultrasql
 brew tap mauneven/tap
 brew install ultrasql
 yay -S ultrasql-bin
 choco install ultrasql
+```
+
+Embedded Node/Bun:
+
+```js
+const { Database } = require("ultrasql");
+const db = await Database.open(":memory:");
+
+db.run("CREATE TABLE t (x int4)");
+db.run("INSERT INTO t VALUES (?)", 42);
+console.log(db.get("SELECT x FROM t"));
 ```
 
 GitHub Release package fallback:

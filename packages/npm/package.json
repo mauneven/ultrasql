@@ -1,7 +1,7 @@
 {
   "name": "ultrasql",
   "version": "0.0.5",
-  "description": "PostgreSQL-wire UltraSQL server and CLI binaries for Node.js package managers.",
+  "description": "Embedded UltraSQL database API plus PostgreSQL-wire server and CLI binaries.",
   "license": "Apache-2.0 OR MIT",
   "homepage": "https://github.com/mauneven/ultrasql#readme",
   "keywords": [
@@ -10,6 +10,9 @@
     "postgresql",
     "postgres",
     "pgwire",
+    "embedded",
+    "node-api",
+    "bun",
     "oltp",
     "olap",
     "vector",
@@ -20,6 +23,15 @@
     "type": "git",
     "url": "git+https://github.com/mauneven/ultrasql.git",
     "directory": "packages/npm"
+  },
+  "main": "index.js",
+  "types": "index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./index.d.ts",
+      "default": "./index.js"
+    },
+    "./package.json": "./package.json"
   },
   "bugs": {
     "url": "https://github.com/mauneven/ultrasql/issues"
@@ -34,8 +46,11 @@
   },
   "files": [
     "bin",
+    "index.d.ts",
+    "index.js",
     "LICENSE-APACHE",
     "LICENSE-MIT",
+    "prebuilds",
     "scripts",
     "README.md"
   ],

@@ -1,11 +1,46 @@
 # UltraSQL
 
-PostgreSQL-compatible OLTP + OLAP database binaries for Node.js package
-managers.
+Embedded UltraSQL database API plus PostgreSQL-compatible server and CLI
+binaries for Node.js package managers.
 
-UltraSQL speaks the PostgreSQL wire protocol, so Node applications use standard
-PostgreSQL clients such as `pg`, Prisma, Drizzle, Kysely, TypeORM, or any other
-driver that connects to PostgreSQL.
+Use `Database.open(":memory:")` for an in-process database. Use `ultrasqld`
+when an application should connect through the PostgreSQL wire protocol with
+`pg`, Prisma, Drizzle, Kysely, TypeORM, or any other PostgreSQL client.
+
+## Embedded Quick Start
+
+```bash
+pnpm add ultrasql
+npm install ultrasql
+bun add ultrasql
+```
+
+```js
+const { Database } = require("ultrasql");
+
+const db = await Database.open(":memory:");
+
+db.run("CREATE TABLE lorem (info TEXT)");
+
+const stmt = db.prepare("INSERT INTO lorem VALUES (?)");
+for (let i = 0; i < 10; i++) {
+  stmt.run(`Ipsum ${i}`);
+}
+stmt.finalize();
+
+db.each("SELECT info FROM lorem", (err, row) => {
+  if (err) throw err;
+  console.log(row.info);
+});
+
+db.close();
+```
+
+`Database.open()` downloads the matching GitHub Release archive on first use,
+verifies the published SHA-256 checksum, loads the native Node-API addon, and
+opens the engine in-process. The same API is intended for Node.js and Bun's
+Node-API runtime. `new Database(":memory:")` is also available after the native
+addon is already present.
 
 This npm package installs command shims for:
 
@@ -13,11 +48,8 @@ This npm package installs command shims for:
 - `ultrasql` - CLI client and admin tool.
 - `ultrasql-local` - local query helper.
 
-The package is a binary launcher. It does not ship a JavaScript database client
-API and it does not replace `pg`. On first command run it downloads the matching
-GitHub Release archive for your platform, verifies the published SHA-256
-checksum, vendors the binaries inside the package, and then launches the
-requested command.
+The command shims use the same release archive and checksum verification path as
+embedded mode.
 
 ## Install
 
@@ -33,7 +65,7 @@ Project-local install:
 pnpm add -D ultrasql
 ```
 
-## Quick Start
+## PostgreSQL Wire Quick Start
 
 Start a local server:
 

@@ -403,6 +403,8 @@ fn packaging_and_docs_site_surface_is_release_ready() {
         "ultrasql.rb",
         "actions/setup-node@v5",
         "packages/npm",
+        "ultrasql-node",
+        "ultrasql.node",
         "npm pack ./packages/npm",
         "*.tgz",
         "npm publish --access public --provenance",

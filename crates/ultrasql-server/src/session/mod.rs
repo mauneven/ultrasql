@@ -23,6 +23,7 @@ mod advisory;
 mod alter;
 mod copy;
 mod ddl;
+mod embedded;
 mod execute;
 mod explain;
 mod ext;
