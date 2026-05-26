@@ -22,6 +22,7 @@ env:
   CARGO_INCREMENTAL: 0
   RUSTFLAGS: "-D warnings"
   RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
 jobs:
   verify:
@@ -112,7 +113,7 @@ jobs:
             archive: tar
             package_arch: ''
           - target: x86_64-pc-windows-msvc
-            os: windows-latest
+            os: windows-2025
             archive: zip
             package_arch: ''
     steps:
@@ -182,6 +183,7 @@ jobs:
         if: matrix.package_arch != ''
         with:
           go-version: "1.25"
+          cache: false
       - name: install nfpm
         if: matrix.package_arch != ''
         shell: bash
@@ -376,7 +378,7 @@ jobs:
           scripts/render-release-notes.sh "$RELEASE_TAG" release/operator_soak_status.json release/RELEASE_NOTES.md
           ls -la release
       - name: publish github release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           tag_name: ${{ env.RELEASE_TAG }}
           body_path: release/RELEASE_NOTES.md
@@ -425,7 +427,7 @@ jobs:
 
   chocolatey:
     name: publish chocolatey package
-    runs-on: windows-latest
+    runs-on: windows-2025
     needs: publish
     permissions:
       contents: read
