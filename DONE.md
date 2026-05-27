@@ -98,6 +98,9 @@ as a concise evidence ledger; roadmap stays for open gates only.
   COPY, and restart round trip.
 - Ordered-set aggregates `PERCENTILE_CONT` and `PERCENTILE_DISC` have plan shape
   and PostgreSQL-wire coverage.
+- Portable scalar compatibility helpers now cover `COALESCE`, `IFNULL` / `NVL`,
+  `NULLIF`, `LEAST`, `GREATEST`, and SQLite-style multi-argument scalar
+  `MIN` / `MAX` through PostgreSQL wire round-trip tests.
 
 ## Security And Compatibility
 

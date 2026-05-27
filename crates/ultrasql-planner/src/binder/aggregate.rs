@@ -27,8 +27,23 @@ pub(super) fn projection_item_has_aggregate(item: &SelectItem) -> bool {
 
 pub(super) fn expr_has_aggregate(expr: &Expr) -> bool {
     match expr {
-        Expr::Call { name, .. } => {
-            is_aggregate_name(name.parts.last().map_or("", |p| p.value.as_str()))
+        Expr::Call {
+            name,
+            args,
+            distinct,
+            within_group,
+            over,
+            ..
+        } => {
+            let func_name = name.parts.last().map_or("", |p| p.value.as_str());
+            is_aggregate_name(func_name)
+                && !is_scalar_min_max_call(
+                    func_name,
+                    args.len(),
+                    *distinct,
+                    within_group.is_some(),
+                    over.is_some(),
+                )
         }
         Expr::Unary { expr: inner, .. }
         | Expr::Paren { expr: inner, .. }
@@ -36,6 +51,20 @@ pub(super) fn expr_has_aggregate(expr: &Expr) -> bool {
         Expr::Binary { left, right, .. } => expr_has_aggregate(left) || expr_has_aggregate(right),
         _ => false,
     }
+}
+
+pub(super) fn is_scalar_min_max_call(
+    func_name: &str,
+    arg_count: usize,
+    distinct: bool,
+    has_within_group: bool,
+    has_over: bool,
+) -> bool {
+    matches!(func_name.to_ascii_lowercase().as_str(), "min" | "max")
+        && arg_count > 1
+        && !distinct
+        && !has_within_group
+        && !has_over
 }
 
 #[inline]
@@ -265,6 +294,7 @@ fn collect_aggregates(
             args,
             distinct,
             within_group,
+            over,
             ..
         } => {
             let func_name = name
@@ -276,6 +306,24 @@ fn collect_aggregates(
                 && matches!(&args[0], Expr::Column { name: n }
                     if n.parts.len() == 1 && n.parts[0].value == "*");
             let args_empty_or_star = args.is_empty() || is_star_arg;
+            let scalar_min_max = is_scalar_min_max_call(
+                &func_name,
+                args.len(),
+                *distinct,
+                within_group.is_some(),
+                over.is_some(),
+            );
+            if scalar_min_max {
+                return collect_non_aggregate_function_args(
+                    &func_name,
+                    args,
+                    input_schema,
+                    out,
+                    catalog,
+                    cte_catalog,
+                    scope,
+                );
+            }
             if let Some(func) = classify_aggregate(&func_name, args_empty_or_star) {
                 let bound = if matches!(
                     func,
@@ -359,15 +407,15 @@ fn collect_aggregates(
                 }
                 Ok(())
             } else {
-                if !is_supported_builtin(&func_name) {
-                    return Err(PlanError::NotSupported(
-                        "non-aggregate function calls in aggregation context",
-                    ));
-                }
-                for arg in args {
-                    collect_aggregates(arg, None, input_schema, out, catalog, cte_catalog, scope)?;
-                }
-                Ok(())
+                collect_non_aggregate_function_args(
+                    &func_name,
+                    args,
+                    input_schema,
+                    out,
+                    catalog,
+                    cte_catalog,
+                    scope,
+                )
             }
         }
         Expr::Paren { expr: inner, .. } | Expr::Unary { expr: inner, .. } => {
@@ -379,6 +427,26 @@ fn collect_aggregates(
         }
         _ => Ok(()),
     }
+}
+
+fn collect_non_aggregate_function_args(
+    func_name: &str,
+    args: &[Expr],
+    input_schema: &Schema,
+    out: &mut Vec<LogicalAggregateExpr>,
+    catalog: &dyn Catalog,
+    cte_catalog: &[(String, Schema)],
+    scope: &mut ScopeStack,
+) -> Result<(), PlanError> {
+    if !is_supported_builtin(func_name) {
+        return Err(PlanError::NotSupported(
+            "non-aggregate function calls in aggregation context",
+        ));
+    }
+    for arg in args {
+        collect_aggregates(arg, None, input_schema, out, catalog, cte_catalog, scope)?;
+    }
+    Ok(())
 }
 
 fn bind_ordered_set_percentile(
@@ -520,7 +588,9 @@ fn bind_expr_or_agg_ref(
         Expr::Call {
             name,
             args,
+            distinct,
             within_group,
+            over,
             ..
         } => {
             if let Some(alias) = alias_name {
@@ -537,7 +607,15 @@ fn bind_expr_or_agg_ref(
                 .last()
                 .map_or("", |p| p.value.as_str())
                 .to_ascii_lowercase();
-            if is_aggregate_name(&func_name) {
+            if is_aggregate_name(&func_name)
+                && !is_scalar_min_max_call(
+                    &func_name,
+                    args.len(),
+                    *distinct,
+                    within_group.is_some(),
+                    over.is_some(),
+                )
+            {
                 let agg_name = derive_agg_output_name(&func_name, args, within_group.as_deref());
                 if let Some((i, f)) = agg_schema.find(&agg_name) {
                     return Ok(ScalarExpr::Column {

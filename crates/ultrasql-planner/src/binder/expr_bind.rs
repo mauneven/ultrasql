@@ -21,7 +21,7 @@ use ultrasql_parser::ast::{BinaryOp, Expr, Literal, UnaryOp};
 use super::expr_type::{binary_result_type, comparable, display_unary};
 use super::{
     Catalog, PlanError, ScalarExpr, Schema, ScopeFrame, ScopeStack, bind_select_with_ctes,
-    derive_agg_output_name, is_aggregate_name, plan_contains_outer_column,
+    derive_agg_output_name, is_aggregate_name, is_scalar_min_max_call, plan_contains_outer_column,
 };
 
 const MICROS_PER_DAY: i64 = 86_400_000_000;
@@ -77,7 +77,9 @@ pub(super) fn bind_expr_with_ctes(
         Expr::Call {
             name,
             args,
+            distinct,
             within_group,
+            over,
             ..
         } => {
             // If this is a known aggregate and we have an aggregate output schema,
@@ -87,7 +89,14 @@ pub(super) fn bind_expr_with_ctes(
                 .last()
                 .map_or("", |p| p.value.as_str())
                 .to_ascii_lowercase();
-            if is_aggregate_name(&func_name) {
+            let scalar_min_max = is_scalar_min_max_call(
+                &func_name,
+                args.len(),
+                *distinct,
+                within_group.is_some(),
+                over.is_some(),
+            );
+            if is_aggregate_name(&func_name) && !scalar_min_max {
                 let agg_col_name =
                     derive_agg_output_name(&func_name, args, within_group.as_deref());
                 if let Some((i, f)) = input.find(&agg_col_name) {
@@ -123,7 +132,8 @@ pub(super) fn bind_expr_with_ctes(
                 .collect();
             let mut bound_args = bound_args?;
             validate_builtin_args(&func_name, &mut bound_args)?;
-            let return_type = builtin_return_type(&func_name)?;
+            let return_type = builtin_return_type(&func_name, &bound_args)?;
+            coerce_common_builtin_args(&func_name, &mut bound_args, &return_type);
             Ok(ScalarExpr::FunctionCall {
                 name: func_name,
                 args: bound_args,
@@ -471,10 +481,9 @@ pub(super) fn bind_expr_with_ctes(
                 .map(|a| bind_expr_with_ctes(a, input, catalog, cte_catalog, scope))
                 .collect();
             let bound_args = bound_args?;
-            let return_type = bound_args
-                .first()
-                .map(ScalarExpr::data_type)
-                .unwrap_or(DataType::Null);
+            let return_type = common_scalar_return_type("coalesce", &bound_args)?;
+            let mut bound_args = bound_args;
+            coerce_args_to_common_type(&mut bound_args, &return_type);
             Ok(ScalarExpr::FunctionCall {
                 name: "coalesce".to_owned(),
                 args: bound_args,
@@ -482,7 +491,118 @@ pub(super) fn bind_expr_with_ctes(
             })
         }
 
+        Expr::NullIf { a, b, .. } => {
+            let mut left = bind_expr_with_ctes(a, input, catalog, cte_catalog, scope)?;
+            let mut right = bind_expr_with_ctes(b, input, catalog, cte_catalog, scope)?;
+            coerce_literal_to_match(&mut left, &mut right);
+            let left_type = left.data_type();
+            let right_type = right.data_type();
+            if !comparable(&left_type, &right_type) {
+                return Err(PlanError::TypeMismatch(format!(
+                    "nullif: cannot compare {left_type} and {right_type}"
+                )));
+            }
+            Ok(ScalarExpr::FunctionCall {
+                name: "nullif".to_owned(),
+                args: vec![left, right],
+                data_type: left_type,
+            })
+        }
+
+        Expr::Greatest { args, .. } => {
+            bind_extremum_expr("greatest", args, input, catalog, cte_catalog, scope)
+        }
+
+        Expr::Least { args, .. } => {
+            bind_extremum_expr("least", args, input, catalog, cte_catalog, scope)
+        }
+
         _ => Err(PlanError::NotSupported("expression variant")),
+    }
+}
+
+fn bind_extremum_expr(
+    func_name: &str,
+    args: &[Expr],
+    input: &Schema,
+    catalog: &dyn Catalog,
+    cte_catalog: &[(String, Schema)],
+    scope: &mut ScopeStack,
+) -> Result<ScalarExpr, PlanError> {
+    let bound_args: Result<Vec<_>, PlanError> = args
+        .iter()
+        .map(|a| bind_expr_with_ctes(a, input, catalog, cte_catalog, scope))
+        .collect();
+    let mut bound_args = bound_args?;
+    let return_type = common_scalar_return_type(func_name, &bound_args)?;
+    coerce_args_to_common_type(&mut bound_args, &return_type);
+    Ok(ScalarExpr::FunctionCall {
+        name: func_name.to_owned(),
+        args: bound_args,
+        data_type: return_type,
+    })
+}
+
+fn common_scalar_return_type(func_name: &str, args: &[ScalarExpr]) -> Result<DataType, PlanError> {
+    if args.is_empty() {
+        return Err(PlanError::TypeMismatch(format!(
+            "{func_name}: expected at least 1 argument, got 0"
+        )));
+    }
+    args.iter()
+        .map(ScalarExpr::data_type)
+        .try_fold(DataType::Null, |acc, data_type| {
+            common_scalar_pair_type(func_name, &acc, &data_type)
+        })
+}
+
+fn common_scalar_pair_type(
+    func_name: &str,
+    left: &DataType,
+    right: &DataType,
+) -> Result<DataType, PlanError> {
+    if left == right || matches!(right, DataType::Null) {
+        return Ok(left.clone());
+    }
+    if matches!(left, DataType::Null) {
+        return Ok(right.clone());
+    }
+    if left.is_numeric() && right.is_numeric() {
+        return left.numeric_join(right).map_err(|_| {
+            PlanError::TypeMismatch(format!(
+                "{func_name}: arguments must share a numeric type, got {left} and {right}"
+            ))
+        });
+    }
+    if left.is_textlike() && right.is_textlike() {
+        return Ok(DataType::Text { max_len: None });
+    }
+    if matches!(
+        (left, right),
+        (DataType::Json, DataType::Jsonb) | (DataType::Jsonb, DataType::Json)
+    ) {
+        return Ok(DataType::Jsonb);
+    }
+    if comparable(left, right) {
+        return Ok(left.clone());
+    }
+    Err(PlanError::TypeMismatch(format!(
+        "{func_name}: arguments must share a comparable type, got {left} and {right}"
+    )))
+}
+
+fn coerce_args_to_common_type(args: &mut [ScalarExpr], target: &DataType) {
+    for arg in args {
+        coerce_literal_to_type(arg, target);
+    }
+}
+
+fn coerce_common_builtin_args(func_name: &str, args: &mut [ScalarExpr], target: &DataType) {
+    if matches!(
+        func_name,
+        "ifnull" | "nvl" | "least" | "greatest" | "min" | "max"
+    ) {
+        coerce_args_to_common_type(args, target);
     }
 }
 
@@ -1286,8 +1406,19 @@ fn literal_numeric_as_f64(value: &Value) -> Option<f64> {
 /// Statically infer the return type of a builtin scalar function.
 /// The set must stay in sync with the executor's `eval_function_call`
 /// dispatcher in [`crates/ultrasql-executor/src/eval.rs`].
-fn builtin_return_type(func_name: &str) -> Result<DataType, PlanError> {
+fn builtin_return_type(func_name: &str, args: &[ScalarExpr]) -> Result<DataType, PlanError> {
     match func_name {
+        "ifnull" | "nvl" => common_scalar_return_type(func_name, args),
+        "nullif" => {
+            if args.len() != 2 {
+                return Err(PlanError::TypeMismatch(format!(
+                    "{func_name}: expected 2 arguments, got {}",
+                    args.len()
+                )));
+            }
+            Ok(args[0].data_type())
+        }
+        "least" | "greatest" | "min" | "max" => common_scalar_return_type(func_name, args),
         "extract" => Ok(DataType::Int64),
         "current_date" | "make_date" => Ok(DataType::Date),
         "now" | "current_timestamp" | "date_trunc" | "to_timestamp" | "date_bin" => {
@@ -1374,6 +1505,11 @@ pub(super) fn is_supported_builtin(func_name: &str) -> bool {
     matches!(
         func_name,
         "abs"
+            | "ifnull"
+            | "nvl"
+            | "nullif"
+            | "least"
+            | "greatest"
             | "extract"
             | "current_date"
             | "current_timestamp"
@@ -1478,6 +1614,8 @@ pub(super) fn is_supported_builtin(func_name: &str) -> bool {
             | "array_to_string"
             | "string_to_array"
             | "array_cat"
+            | "min"
+            | "max"
             | "l2_distance"
             | "cosine_distance"
             | "inner_product"
@@ -1492,6 +1630,9 @@ pub(super) fn is_supported_builtin(func_name: &str) -> bool {
 
 fn validate_builtin_args(func_name: &str, args: &mut [ScalarExpr]) -> Result<(), PlanError> {
     match func_name {
+        "ifnull" | "nvl" | "nullif" => validate_exact_arg_count(func_name, args, 2),
+        "least" | "greatest" => validate_min_arg_count(func_name, args, 1),
+        "min" | "max" => validate_min_arg_count(func_name, args, 2),
         "l2_distance" | "cosine_distance" | "inner_product" | "dot_product" | "l1_distance" => {
             validate_vector_metric_args(func_name, args)
         }
@@ -1513,6 +1654,34 @@ fn validate_builtin_args(func_name: &str, args: &mut [ScalarExpr]) -> Result<(),
         "set_config" => validate_set_config_args(args),
         _ => Ok(()),
     }
+}
+
+fn validate_exact_arg_count(
+    func_name: &str,
+    args: &[ScalarExpr],
+    expected: usize,
+) -> Result<(), PlanError> {
+    if args.len() == expected {
+        return Ok(());
+    }
+    Err(PlanError::TypeMismatch(format!(
+        "{func_name}: expected {expected} arguments, got {}",
+        args.len()
+    )))
+}
+
+fn validate_min_arg_count(
+    func_name: &str,
+    args: &[ScalarExpr],
+    min: usize,
+) -> Result<(), PlanError> {
+    if args.len() >= min {
+        return Ok(());
+    }
+    Err(PlanError::TypeMismatch(format!(
+        "{func_name}: expected at least {min} arguments, got {}",
+        args.len()
+    )))
 }
 
 fn validate_current_schemas_args(args: &[ScalarExpr]) -> Result<(), PlanError> {

@@ -312,6 +312,12 @@ fn eval_function_call(
         "quote_ident" => eval_quote_ident(args),
         "format" => eval_format(args),
         "regexp_replace" => eval_regexp_replace(args),
+        "ifnull" | "nvl" => eval_ifnull(args),
+        "nullif" => eval_nullif(args),
+        "least" => eval_extremum(args, "least", ExtremumKind::Least, NullPolicy::Ignore),
+        "greatest" => eval_extremum(args, "greatest", ExtremumKind::Greatest, NullPolicy::Ignore),
+        "min" => eval_extremum(args, "min", ExtremumKind::Least, NullPolicy::Propagate),
+        "max" => eval_extremum(args, "max", ExtremumKind::Greatest, NullPolicy::Propagate),
         "row" => eval_row_constructor(args, return_type),
         "row_to_json" => eval_row_to_json(args),
         "json_build_object" => eval_json_build_object(args),
@@ -392,6 +398,86 @@ fn eval_zero_arg_text(args: &[Value], value: &'static str) -> Result<Value, Eval
         )));
     }
     Ok(Value::Text(value.to_owned()))
+}
+
+#[derive(Clone, Copy)]
+enum ExtremumKind {
+    Least,
+    Greatest,
+}
+
+#[derive(Clone, Copy)]
+enum NullPolicy {
+    Ignore,
+    Propagate,
+}
+
+fn eval_ifnull(args: &[Value]) -> Result<Value, EvalError> {
+    if args.len() != 2 {
+        return Err(EvalError::Type(format!(
+            "ifnull: expected 2 args, got {}",
+            args.len()
+        )));
+    }
+    if matches!(args[0], Value::Null) {
+        Ok(args[1].clone())
+    } else {
+        Ok(args[0].clone())
+    }
+}
+
+fn eval_nullif(args: &[Value]) -> Result<Value, EvalError> {
+    if args.len() != 2 {
+        return Err(EvalError::Type(format!(
+            "nullif: expected 2 args, got {}",
+            args.len()
+        )));
+    }
+    if matches!(args[0], Value::Null) || matches!(args[1], Value::Null) {
+        return Ok(args[0].clone());
+    }
+    if compare_values(&args[0], &args[1])? == std::cmp::Ordering::Equal {
+        Ok(Value::Null)
+    } else {
+        Ok(args[0].clone())
+    }
+}
+
+fn eval_extremum(
+    args: &[Value],
+    func_name: &str,
+    kind: ExtremumKind,
+    null_policy: NullPolicy,
+) -> Result<Value, EvalError> {
+    if args.is_empty() {
+        return Err(EvalError::Type(format!(
+            "{func_name}: expected at least 1 arg, got 0"
+        )));
+    }
+    let mut best: Option<Value> = None;
+    for value in args {
+        if matches!(value, Value::Null) {
+            if matches!(null_policy, NullPolicy::Propagate) {
+                return Ok(Value::Null);
+            }
+            continue;
+        }
+        let replace = match &best {
+            None => true,
+            Some(current) => {
+                let ordering = compare_values(value, current)?;
+                matches!(
+                    (kind, ordering),
+                    (ExtremumKind::Least, std::cmp::Ordering::Less)
+                        | (ExtremumKind::Greatest, std::cmp::Ordering::Greater)
+                )
+            }
+        };
+        if replace {
+            best = Some(value.clone());
+        }
+    }
+    Ok(best.unwrap_or(Value::Null))
 }
 
 fn eval_pg_typeof(args: &[Value]) -> Result<Value, EvalError> {

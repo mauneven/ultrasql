@@ -78,7 +78,7 @@ mod window;
 
 use self::aggregate::{
     bind_aggregate, bind_projection_agg, bind_projection_with_scope, derive_agg_output_name,
-    expr_has_aggregate, is_aggregate_name, projection_item_has_aggregate,
+    expr_has_aggregate, is_aggregate_name, is_scalar_min_max_call, projection_item_has_aggregate,
 };
 use self::ddl::{
     bind_alter_role, bind_alter_sequence, bind_alter_table, bind_comment, bind_copy,

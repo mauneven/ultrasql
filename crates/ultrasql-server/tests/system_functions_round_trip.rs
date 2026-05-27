@@ -241,6 +241,53 @@ async fn scalar_string_functions_return_postgres_shaped_values() {
 }
 
 #[tokio::test]
+async fn portable_scalar_compatibility_helpers_round_trip() {
+    let running = start_sample_server("system_functions_test").await;
+    let client = &running.client;
+
+    let row = client
+        .query_one(
+            "SELECT \
+             coalesce(NULL, 'fallback'), \
+             ifnull(NULL, 'fallback'), \
+             ifnull('value', 'fallback'), \
+             nullif('same', 'same') IS NULL, \
+             nullif('left', 'right'), \
+             least(3, 1, 2), \
+             greatest(3, 1, 2), \
+             least('beta', 'alpha', 'gamma'), \
+             greatest('beta', 'alpha', 'gamma'), \
+             least(NULL, 2), \
+             greatest(NULL, 2), \
+             min(3, 1, 2), \
+             max(3, 1, 2), \
+             min(NULL, 2) IS NULL, \
+             max(NULL, 2) IS NULL",
+            &[],
+        )
+        .await
+        .expect("portable scalar compatibility helpers");
+
+    assert_eq!(row.get::<_, String>(0), "fallback");
+    assert_eq!(row.get::<_, String>(1), "fallback");
+    assert_eq!(row.get::<_, String>(2), "value");
+    assert!(row.get::<_, bool>(3));
+    assert_eq!(row.get::<_, String>(4), "left");
+    assert_eq!(row.get::<_, i32>(5), 1);
+    assert_eq!(row.get::<_, i32>(6), 3);
+    assert_eq!(row.get::<_, String>(7), "alpha");
+    assert_eq!(row.get::<_, String>(8), "gamma");
+    assert_eq!(row.get::<_, i32>(9), 2);
+    assert_eq!(row.get::<_, i32>(10), 2);
+    assert_eq!(row.get::<_, i32>(11), 1);
+    assert_eq!(row.get::<_, i32>(12), 3);
+    assert!(row.get::<_, bool>(13));
+    assert!(row.get::<_, bool>(14));
+
+    shutdown(running).await;
+}
+
+#[tokio::test]
 async fn scalar_math_functions_return_postgres_shaped_values() {
     let running = start_sample_server("system_functions_test").await;
     let client = &running.client;

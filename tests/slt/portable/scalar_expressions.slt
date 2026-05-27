@@ -58,5 +58,19 @@ SELECT label FROM slt_scalar_expr WHERE label LIKE 'g%'
 ----
 gamma
 
+query TT nosort
+SELECT ifnull(NULL, 'fallback'), nullif('left', 'right')
+----
+fallback
+left
+
+query II nosort
+SELECT
+  CASE WHEN nullif('same', 'same') IS NULL THEN 1 ELSE 0 END,
+  CASE WHEN ifnull('value', 'fallback') = 'value' THEN 1 ELSE 0 END
+----
+1
+1
+
 statement ok
 DROP TABLE slt_scalar_expr
