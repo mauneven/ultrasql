@@ -87,8 +87,19 @@ Server-mode applications should keep using PostgreSQL client libraries such as
 
 Release automation always attaches `ultrasql-<version>.tgz` to GitHub Releases
 and publishes the registry package from `packages/npm` with `npm publish`.
-Configure npm Trusted Publishing for `.github/workflows/release.yml`, or set
-`NPM_TOKEN` before tagging a release.
+Configure npm Trusted Publishing before tagging a release:
+
+```text
+Publisher: GitHub Actions
+Organization or user: mauneven
+Repository: ultrasql
+Workflow filename: release.yml
+Environment name: main
+Allowed actions: npm publish
+```
+
+The release workflow uses GitHub OIDC for npm. It does not need a long-lived
+npm write token.
 
 ## Docker
 

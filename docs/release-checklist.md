@@ -60,8 +60,8 @@ Pushing a `vX.Y.Z` tag runs `.github/workflows/release.yml`. The workflow:
   Windows x86_64 archives,
 - publishes `ghcr.io/mauneven/ultrasql:<tag>` from the Dockerfile,
 - attaches `ultrasql-<version>.tgz` from `packages/npm` and publishes the
-  `ultrasql` npm registry package through npm Trusted Publishing or
-  `NPM_TOKEN`,
+  `ultrasql` npm registry package through npm Trusted Publishing with GitHub
+  OIDC,
 - builds Debian/Ubuntu `.deb` packages and `.rpm` packages with nFPM,
 - renders a Homebrew formula from the macOS archive checksums,
 - uploads per-asset `.sha256` files plus `SHASUMS256.txt`,
@@ -107,7 +107,7 @@ not in the PR-critical path.
 | 76 Chaos recovery | `benchmarks/chaos_recovery.sh` | `crates/ultrasql-bench/tests/release_hardening.rs` | random kill, WAL truncation, and safe disk-full simulation all recover | `docs/chaos-recovery.md` | `benchmarks/results/latest/chaos_recovery_manifest.json` |
 | 77 Docs site | `mkdocs.yml`, `.github/workflows/docs.yml` | `crates/ultrasql-bench/tests/release_hardening.rs` | no benchmark; documentation publication gate | `docs/packaging.md` | GitHub Pages deployment for `docs.ultrasql.org` |
 | 78 Docker image | `Dockerfile`, `.dockerignore`, `.github/workflows/release.yml` | `crates/ultrasql-bench/tests/release_hardening.rs` | no benchmark; release packaging gate | `docs/packaging.md` | GHCR image digest for `ghcr.io/mauneven/ultrasql:<tag>` and clean GHCR platform list |
-| 78.1 npm / pnpm / Bun package | `packages/npm`, `crates/ultrasql-node`, `.github/workflows/release.yml` | `node --test packages/npm/test/*.test.js`, `cargo test -p ultrasql-node`, `crates/ultrasql-bench/tests/release_hardening.rs` | no benchmark; release packaging gate | `docs/install.md`, `docs/packaging.md` | `ultrasql-<version>.tgz` release asset, `ultrasql.node` in platform archives, and npm publish output for `ultrasql` |
+| 78.1 npm / pnpm / Bun package | `packages/npm`, `crates/ultrasql-node`, `.github/workflows/release.yml` | `node --test packages/npm/test/*.test.js`, `cargo test -p ultrasql-node`, `crates/ultrasql-bench/tests/release_hardening.rs` | no benchmark; release packaging gate | `docs/install.md`, `docs/packaging.md` | `ultrasql-<version>.tgz` release asset, `ultrasql.node` in platform archives, npm Trusted Publisher configuration, and npm publish output for `ultrasql` |
 | 79 Homebrew formula | `packaging/homebrew/ultrasql.rb.in`, `scripts/render-homebrew-formula.sh`, `.github/workflows/release.yml` | `crates/ultrasql-bench/tests/release_hardening.rs` | no benchmark; release packaging gate | `docs/install.md`, `docs/packaging.md` | rendered `ultrasql.rb` release asset and Homebrew tap publish output |
 | 80 Deb/RPM packages | `packaging/nfpm.yaml.in`, `packaging/linux/*`, `.github/workflows/release.yml` | `crates/ultrasql-bench/tests/release_hardening.rs` | no benchmark; release packaging gate | `docs/install.md` | `.deb` and `.rpm` release assets |
 | 80.1 AUR package | `packaging/aur/PKGBUILD.in`, `packaging/aur/.SRCINFO.in`, `scripts/render-aur-package.sh`, `.github/workflows/release.yml` | `crates/ultrasql-bench/tests/release_hardening.rs`, `bash -n scripts/render-aur-package.sh` | no benchmark; release packaging gate | `docs/install.md`, `docs/packaging.md` | `ultrasql-aur-<tag>.tar.gz` and AUR publish output for `yay -S ultrasql-bin` |

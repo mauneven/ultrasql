@@ -402,13 +402,18 @@ fn packaging_and_docs_site_surface_is_release_ready() {
         "render-homebrew-formula.sh",
         "ultrasql.rb",
         "actions/setup-node@v5",
+        "actions/setup-node@v6",
+        "node-version: \"24\"",
+        "package-manager-cache: false",
+        "environment: main",
+        "id-token: write",
         "packages/npm",
         "ultrasql-node",
         "ultrasql.node",
         "npm pack ./packages/npm",
         "*.tgz",
-        "npm publish --access public --provenance",
-        "NPM_TOKEN",
+        "npm publish --access public",
+        "show npm trusted publishing toolchain",
         "render-aur-package.sh",
         "ultrasql-aur-${RELEASE_TAG}.tar.gz",
         "AUR_SSH_PRIVATE_KEY",
@@ -430,6 +435,14 @@ fn packaging_and_docs_site_surface_is_release_ready() {
     assert!(
         !release.contains("goreleaser/nfpm-action"),
         "release workflow must install nfpm from the Go module, not a missing action"
+    );
+    assert!(
+        !release.contains("NODE_AUTH_TOKEN"),
+        "npm trusted publishing must not use a long-lived npm write token"
+    );
+    assert!(
+        !release.contains("NPM_TOKEN"),
+        "npm trusted publishing must not depend on NPM_TOKEN"
     );
 
     for needle in [
@@ -581,6 +594,15 @@ fn packaging_and_docs_site_surface_is_release_ready() {
         assert!(docs.contains(needle), "packaging docs missing {needle}");
         assert!(install.contains(needle), "install docs missing {needle}");
         assert!(roadmap.contains(needle), "ROADMAP missing {needle}");
+    }
+    for needle in [
+        "Workflow filename: release.yml",
+        "Environment name: main",
+        "Allowed actions: npm publish",
+        "GitHub OIDC",
+    ] {
+        assert!(docs.contains(needle), "packaging docs missing {needle}");
+        assert!(install.contains(needle), "install docs missing {needle}");
     }
 }
 
