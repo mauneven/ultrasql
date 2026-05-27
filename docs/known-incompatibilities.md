@@ -23,12 +23,16 @@ tracks completed evidence.
   PostgreSQL SSI. The covered Hermitage write-skew case aborts one transaction
   with SQLSTATE `40001`, but full PostgreSQL isolationtester parity remains
   open.
-- Ordered-set aggregates and multi-argument statistical aggregates such as
-  `CORR`, `PERCENTILE_CONT`, and `PERCENTILE_DISC` need a richer aggregate plan
-  shape before SQL-surface parity can be claimed.
+- Broader aggregate parity remains open for PostgreSQL variants beyond the
+  covered `STDDEV`, `VARIANCE`, `CORR`, `PERCENTILE_CONT`, and
+  `PERCENTILE_DISC` surfaces, including hypothetical-set aggregates,
+  `DISTINCT` ordered-set forms, and additional multi-argument statistical
+  functions.
 - PL/pgSQL, stored procedures, trigger semantics, event triggers, and
   PostgreSQL extension loading are not complete.
-- Views, materialized views, and partitioning remain roadmap items.
+- Plain view expansion, updatable views, `WITH CHECK OPTION`, materialized-view
+  refresh/index parity, and general `RANGE`/`LIST`/`HASH` partitioning remain
+  roadmap items.
 
 ## Security and administration
 

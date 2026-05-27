@@ -1,8 +1,9 @@
 //! Frontend message decoder.
 //!
 //! Distinguishes the unframed startup message (whose first byte is the
-//! high byte of an `i32` length, conventionally zero for any realistic
-//! protocol number) from the regular tagged messages. The tagged path
+//! high byte of an `i32` length, normally zero for legitimate startup
+//! packets and sometimes non-zero for oversized hostile packets) from
+//! the regular tagged messages. The tagged path
 //! delegates to [`decode_frontend_payload`], which dispatches on the
 //! type byte.
 
@@ -25,12 +26,14 @@ pub(super) fn decode_frontend_inner(
     bytes: &[u8],
 ) -> Result<(FrontendMessage, usize), ProtocolError> {
     // The startup-vs-tagged discriminator: every tagged frontend
-    // message type tag is an ASCII letter. The startup message's
-    // first byte is the most-significant byte of an `i32` length, and
-    // for any realistic startup length (< 16 MiB) that byte is zero.
-    // We therefore treat a leading zero as "startup".
+    // message type tag is a printable ASCII byte. The startup message's
+    // first byte is the most-significant byte of an `i32` length: zero
+    // for legitimate packets, low control values for oversized packets
+    // near our 16 MiB ceiling. Treat those control bytes as startup so
+    // malicious first packets are rejected after the 4-byte length
+    // instead of being mistaken for incomplete tagged messages.
     let first = *bytes.first().ok_or(ProtocolError::Truncated)?;
-    if first == 0 {
+    if first < b' ' {
         return decode_startup(bytes);
     }
 

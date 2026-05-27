@@ -108,7 +108,7 @@ fn invalid_utf8_cstring_rejected() {
 }
 
 #[test]
-fn cstring_missing_nul_reported_as_truncated() {
+fn cstring_missing_nul_reported_as_malformed() {
     // A frontend Query whose declared length covers the bytes,
     // but where the SQL string never reaches a NUL terminator.
     let mut buf = BytesMut::new();
@@ -116,15 +116,10 @@ fn cstring_missing_nul_reported_as_truncated() {
     buf.put_i32(8); // 4 + 4 bytes of payload
     buf.put_slice(b"ABCD"); // no NUL
     let err = decode_frontend(&mut buf).unwrap_err();
-    // No NUL inside the framed payload is a payload-internal
-    // truncation. The public decoder turns top-level truncation
-    // into Ok(None); here the framed slice is complete so we
-    // surface the inner Truncated as an error. Either way it must
-    // not be a successful decode.
-    assert!(matches!(
-        err,
-        ProtocolError::Truncated | ProtocolError::Malformed(_)
-    ));
+    // No NUL inside a complete frame is payload-internal truncation,
+    // which must be a definitive protocol violation rather than a
+    // streaming "read more bytes" condition.
+    assert!(matches!(err, ProtocolError::Malformed(_)), "got {err:?}");
 }
 
 #[test]
@@ -218,9 +213,23 @@ fn backend_length_above_max_rejected() {
 /// the bound at the tagged-decode site that handles every
 /// message after handshake.)
 #[test]
-fn startup_length_above_max_rejected() {
+fn tagged_frontend_length_above_max_rejected() {
     let mut buf = BytesMut::new();
     buf.put_u8(b'Q'); // any ASCII tag
+    let oversized = i32::try_from(MAX_MESSAGE_BYTES + 1).unwrap();
+    buf.put_i32(oversized);
+    let err = decode_frontend(&mut buf).unwrap_err();
+    assert!(matches!(err, ProtocolError::Malformed(_)), "got {err:?}");
+}
+
+/// A startup packet has no type tag: the first four bytes are the
+/// length. An oversized length must be rejected after those four bytes
+/// are available, even when the high byte is non-zero. Otherwise a
+/// hostile first packet can make the server wait for a tagged-message
+/// byte that will never be needed.
+#[test]
+fn startup_length_above_max_rejected() {
+    let mut buf = BytesMut::new();
     let oversized = i32::try_from(MAX_MESSAGE_BYTES + 1).unwrap();
     buf.put_i32(oversized);
     let err = decode_frontend(&mut buf).unwrap_err();
@@ -254,10 +263,7 @@ fn bind_lies_about_param_count_caught_by_truncation() {
     let length = i32::try_from(payload_end - payload_start + 4).unwrap();
     buf[len_pos..len_pos + 4].copy_from_slice(&length.to_be_bytes());
     let err = decode_frontend(&mut buf).unwrap_err();
-    assert!(
-        matches!(err, ProtocolError::Malformed(_) | ProtocolError::Truncated),
-        "got {err:?}"
-    );
+    assert!(matches!(err, ProtocolError::Malformed(_)), "got {err:?}");
 }
 
 // -------------------------------------------------------------------
