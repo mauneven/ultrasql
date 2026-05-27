@@ -102,7 +102,15 @@ impl VisibilityMap {
     /// update, delete). Clearing ensures that index-only scans do not
     /// skip heap fetches on a page that is no longer all-visible.
     pub fn clear(&self, rel: RelationId, block: BlockNumber) {
-        self.set_bits(rel, block, BIT_VISIBLE | BIT_FROZEN, false);
+        let Some(entry) = self.inner.get(&rel) else {
+            return;
+        };
+        let mut vec = entry.write();
+        let (byte_idx, shift) = Self::byte_index_and_shift(block);
+        if byte_idx >= vec.len() {
+            return;
+        }
+        vec[byte_idx] &= !((BIT_VISIBLE | BIT_FROZEN) << shift);
     }
 
     // ------------------------------------------------------------------

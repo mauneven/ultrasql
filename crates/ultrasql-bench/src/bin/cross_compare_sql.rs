@@ -2034,14 +2034,13 @@ async fn run_csv_malformed_behavior(
 }
 
 /// Rows packed into each timed INSERT statement for the bulk-insert
-/// benchmark. Competitor scripts use 1 000-row chunks inside one
-/// transaction; matching that shape avoids oversized wire messages and keeps
-/// the benchmark at the SQL/client level instead of measuring one giant parser
-/// payload.
-const INSERT_BENCH_CHUNK_ROWS: usize = 1_000;
+/// benchmark. Competitor scripts use the same 10 000-row chunk size inside one
+/// transaction. This keeps the workload at the SQL/client level without
+/// turning a 1M-row load into 1 000 parser/round-trip cycles.
+const INSERT_BENCH_CHUNK_ROWS: usize = 10_000;
 
 /// Run one INSERT iteration: open a fresh wire connection, CREATE a
-/// unique table, then insert rows in 1 000-row chunks inside one timed
+/// unique table, then insert rows in 10 000-row chunks inside one timed
 /// transaction. The CREATE and SQL string construction are outside the timed
 /// region.
 async fn run_insert_iter(server: SocketAddr, n_rows: usize, ix: usize) -> Result<f64> {

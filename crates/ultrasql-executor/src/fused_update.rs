@@ -237,8 +237,21 @@ impl<L: PageLoader + Send + Sync + std::fmt::Debug + 'static> Operator for Fused
             }
             total
         } else {
-            self.heap
-                .update_int32_pair_inplace_undo(
+            if wal_sink.is_none() {
+                self.heap.update_int32_pair_inplace_undo_parallel_no_wal(
+                    self.relation,
+                    self.block_count,
+                    &self.snapshot,
+                    &*self.oracle,
+                    predicate_fn,
+                    target_col,
+                    delta,
+                    self.xid,
+                    self.command_id,
+                    self.vm.as_deref(),
+                )
+            } else {
+                self.heap.update_int32_pair_inplace_undo(
                     self.relation,
                     self.block_count,
                     &self.snapshot,
@@ -251,7 +264,8 @@ impl<L: PageLoader + Send + Sync + std::fmt::Debug + 'static> Operator for Fused
                     wal_sink,
                     self.vm.as_deref(),
                 )
-                .map_err(|e| ExecError::TypeMismatch(e.to_string()))?
+            }
+            .map_err(|e| ExecError::TypeMismatch(e.to_string()))?
         };
 
         let affected_i64 = i64::try_from(n).unwrap_or(i64::MAX);

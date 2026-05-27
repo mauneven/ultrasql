@@ -36,6 +36,11 @@ use super::{
     UndoRelationLog, UpdateOptions, UpdateOutcome, UpdatePayload,
 };
 
+struct Int32PairRangeUpdate {
+    total_updated: usize,
+    compact_undo: Vec<Int32PairUndoBatch>,
+}
+
 impl<L: PageLoader> HeapAccess<L> {
     /// Roll back every in-place UPDATE performed by `xid` by
     /// restoring the slot's pre-image from the undo log and clearing
@@ -577,6 +582,334 @@ impl<L: PageLoader> HeapAccess<L> {
         }
 
         Ok(total_updated)
+    }
+
+    /// Parallel no-WAL variant for large in-memory fused `(Int32, Int32)`
+    /// UPDATEs.
+    ///
+    /// The WAL-backed path stays sequential so per-transaction WAL chain
+    /// ordering remains unchanged. For the in-memory server mode used by the
+    /// DB-vs-DB benchmark, source pages are independent: each worker owns a
+    /// disjoint block range, records compact undo locally, and the caller
+    /// appends all undo batches under one relation-log lock after workers
+    /// finish.
+    #[allow(clippy::too_many_arguments)]
+    pub fn update_int32_pair_inplace_undo_parallel_no_wal<O, P>(
+        &self,
+        rel: RelationId,
+        block_count: u32,
+        snapshot: &Snapshot,
+        oracle: &O,
+        predicate: P,
+        target_col: u8,
+        delta: i32,
+        xid: Xid,
+        command_id: CommandId,
+        vm: Option<&crate::vm::VisibilityMap>,
+    ) -> Result<usize, HeapError>
+    where
+        O: XidStatusOracle + Sync + ?Sized,
+        P: Fn(i32, i32) -> bool + Sync,
+    {
+        let available_workers = std::thread::available_parallelism().map_or(1, |n| n.get());
+        if block_count < 2_048 || available_workers <= 1 {
+            return self.update_int32_pair_inplace_undo(
+                rel,
+                block_count,
+                snapshot,
+                oracle,
+                predicate,
+                target_col,
+                delta,
+                xid,
+                command_id,
+                None,
+                vm,
+            );
+        }
+
+        let block_count_usize = block_count as usize;
+        let workers = available_workers
+            .min(block_count_usize.div_ceil(512))
+            .min(block_count_usize)
+            .max(1);
+        if workers <= 1 {
+            return self.update_int32_pair_inplace_undo(
+                rel,
+                block_count,
+                snapshot,
+                oracle,
+                predicate,
+                target_col,
+                delta,
+                xid,
+                command_id,
+                None,
+                vm,
+            );
+        }
+
+        let workers_u32 =
+            u32::try_from(workers).map_err(|_| HeapError::MalformedHeader("worker overflow"))?;
+        let chunk_blocks = block_count.div_ceil(workers_u32).max(1);
+        let predicate_ref = &predicate;
+        let mut updates = Vec::with_capacity(workers);
+
+        std::thread::scope(|scope| {
+            let mut handles = Vec::with_capacity(workers);
+            let mut start_block = 0_u32;
+            while start_block < block_count {
+                let end_block = start_block.saturating_add(chunk_blocks).min(block_count);
+                handles.push(scope.spawn(move || {
+                    self.update_int32_pair_range_no_wal(
+                        rel,
+                        start_block,
+                        end_block,
+                        snapshot,
+                        oracle,
+                        predicate_ref,
+                        target_col,
+                        delta,
+                        xid,
+                        command_id,
+                        vm,
+                    )
+                }));
+                start_block = end_block;
+            }
+
+            for handle in handles {
+                let update = handle
+                    .join()
+                    .map_err(|_| HeapError::MalformedHeader("parallel update worker panicked"))??;
+                updates.push(update);
+            }
+            Ok::<(), HeapError>(())
+        })?;
+
+        let total_updated = updates.iter().fold(0_usize, |total, update| {
+            total.saturating_add(update.total_updated)
+        });
+        let mut compact_undo_scratch = Vec::with_capacity(block_count as usize);
+        for mut update in updates {
+            compact_undo_scratch.append(&mut update.compact_undo);
+        }
+
+        if !compact_undo_scratch.is_empty() {
+            let log_handle = self
+                .undo_log
+                .entry(rel)
+                .or_insert_with(|| parking_lot::RwLock::new(UndoRelationLog::default()));
+            let mut log = log_handle.write();
+            if log.int32_pair_batches.is_empty() {
+                log.int32_pair_batches.reserve(block_count as usize);
+            }
+            log.int32_pair_batches.append(&mut compact_undo_scratch);
+        }
+
+        if total_updated > 0 {
+            self.column_cache.bump_version(rel);
+        }
+
+        Ok(total_updated)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn update_int32_pair_range_no_wal<O, P>(
+        &self,
+        rel: RelationId,
+        start_block: u32,
+        end_block: u32,
+        snapshot: &Snapshot,
+        oracle: &O,
+        predicate: &P,
+        target_col: u8,
+        delta: i32,
+        xid: Xid,
+        command_id: CommandId,
+        vm: Option<&crate::vm::VisibilityMap>,
+    ) -> Result<Int32PairRangeUpdate, HeapError>
+    where
+        O: XidStatusOracle + ?Sized,
+        P: Fn(i32, i32) -> bool,
+    {
+        use crate::page::{ITEMID_SIZE, PAGE_HEADER_SIZE};
+
+        let range_len = end_block.saturating_sub(start_block) as usize;
+        let mut total_updated: usize = 0;
+        let mut xmin_cache: Option<(Xid, u16, bool)> = None;
+        let mut compact_undo_scratch: Vec<Int32PairUndoBatch> = Vec::with_capacity(range_len);
+        let mut page_undo_slots: Vec<u16> = Vec::with_capacity(256);
+        let xid_bytes = xid.raw().to_le_bytes();
+        let cmd_bytes = command_id.raw().to_le_bytes();
+
+        for src_block in start_block..end_block {
+            let src_page_id = PageId::new(rel, BlockNumber::new(src_block));
+            let mut page_updated = false;
+
+            let src_guard = self.pool.get_page(src_page_id)?;
+            let mut src_page = src_guard.write();
+            let src_bytes = src_page.as_bytes_mut();
+            let src_slot_count = {
+                let hdr = crate::page::PageHeader::decode(src_bytes).map_err(HeapError::Page)?;
+                hdr.slot_count()
+            };
+
+            for src_slot in 0..src_slot_count {
+                let item_id_off = PAGE_HEADER_SIZE + usize::from(src_slot) * ITEMID_SIZE;
+                let item_raw = u32::from_le_bytes([
+                    src_bytes[item_id_off],
+                    src_bytes[item_id_off + 1],
+                    src_bytes[item_id_off + 2],
+                    src_bytes[item_id_off + 3],
+                ]);
+                if item_raw & 0b11 != 1 {
+                    continue;
+                }
+                let length = ((item_raw >> 2) & 0x7FFF) as usize;
+                let offset = ((item_raw >> 17) & 0x7FFF) as usize;
+                if length < TUPLE_HEADER_SIZE
+                    || offset
+                        .checked_add(length)
+                        .is_none_or(|e| e > src_bytes.len())
+                {
+                    return Err(HeapError::MalformedHeader("slot shorter than header"));
+                }
+
+                let xmin_raw = u64::from_le_bytes(
+                    src_bytes[offset..offset + 8]
+                        .try_into()
+                        .expect("8-byte slice"),
+                );
+                let xmax_raw = u64::from_le_bytes(
+                    src_bytes[offset + 8..offset + 16]
+                        .try_into()
+                        .expect("8-byte slice"),
+                );
+                let infomask_bits = u16::from_le_bytes(
+                    src_bytes[offset + 24..offset + 26]
+                        .try_into()
+                        .expect("2-byte slice"),
+                );
+                let xmin_xid = Xid::new(xmin_raw);
+
+                let visibility = if xmax_raw == 0 {
+                    match xmin_cache {
+                        Some((cxmin, cinfo, cv)) if cxmin == xmin_xid && cinfo == infomask_bits => {
+                            if cv {
+                                Visibility::Visible
+                            } else {
+                                Visibility::Invisible
+                            }
+                        }
+                        _ => {
+                            let (h, _) =
+                                TupleHeader::decode(&src_bytes[offset..offset + TUPLE_HEADER_SIZE])
+                                    .ok_or(HeapError::MalformedHeader("header decode failed"))?;
+                            let v = matches!(is_visible(&h, snapshot, oracle), Visibility::Visible);
+                            xmin_cache = Some((h.xmin, h.infomask.bits(), v));
+                            if v {
+                                Visibility::Visible
+                            } else {
+                                Visibility::Invisible
+                            }
+                        }
+                    }
+                } else {
+                    let (h, _) =
+                        TupleHeader::decode(&src_bytes[offset..offset + TUPLE_HEADER_SIZE])
+                            .ok_or(HeapError::MalformedHeader("header decode failed"))?;
+                    is_visible(&h, snapshot, oracle)
+                };
+
+                let payload_off = offset + TUPLE_HEADER_SIZE;
+                if payload_off + 9 > offset + length {
+                    return Err(HeapError::MalformedHeader(
+                        "payload shorter than (Int32, Int32)",
+                    ));
+                }
+                let pair = u64::from_le_bytes(
+                    src_bytes[payload_off + 1..payload_off + 9]
+                        .try_into()
+                        .expect("8-byte payload"),
+                );
+                let id = i32::from_ne_bytes((pair as u32).to_ne_bytes());
+                let val = i32::from_ne_bytes(((pair >> 32) as u32).to_ne_bytes());
+
+                match visibility {
+                    Visibility::Visible => {}
+                    Visibility::VisiblePreImage => {
+                        if predicate(id, val) {
+                            return Err(HeapError::WriteConflict(
+                                "in-place tuple has an unresolved writer",
+                            ));
+                        }
+                        continue;
+                    }
+                    Visibility::Invisible | Visibility::DeletedByOwn => continue,
+                }
+
+                if !predicate(id, val) {
+                    continue;
+                }
+
+                let (new_id, new_val) = if target_col == 0 {
+                    (id.wrapping_add(delta), val)
+                } else {
+                    (id, val.wrapping_add(delta))
+                };
+
+                page_undo_slots.push(src_slot);
+                src_bytes[offset + 8..offset + 16].copy_from_slice(&xid_bytes);
+                src_bytes[offset + 20..offset + 24].copy_from_slice(&cmd_bytes);
+                let new_infomask = infomask_bits | InfoMask::UPDATED | InfoMask::UPDATED_IN_PLACE;
+                src_bytes[offset + 24..offset + 26].copy_from_slice(&new_infomask.to_le_bytes());
+
+                let new_pair = ((u32::from_ne_bytes(new_val.to_ne_bytes()) as u64) << 32)
+                    | u32::from_ne_bytes(new_id.to_ne_bytes()) as u64;
+                src_bytes[payload_off + 1..payload_off + 9]
+                    .copy_from_slice(&new_pair.to_le_bytes());
+
+                total_updated += 1;
+                page_updated = true;
+            }
+
+            drop(src_page);
+            drop(src_guard);
+
+            if let Some(&first_slot) = page_undo_slots.first() {
+                let slot_count = u16::try_from(page_undo_slots.len())
+                    .map_err(|_| HeapError::MalformedHeader("too many updated slots"))?;
+                let last_slot = *page_undo_slots
+                    .last()
+                    .expect("first slot exists, so last slot exists");
+                let contiguous =
+                    usize::from(last_slot.saturating_sub(first_slot)) + 1 == page_undo_slots.len();
+                let slots = if contiguous {
+                    Vec::new()
+                } else {
+                    std::mem::take(&mut page_undo_slots)
+                };
+                compact_undo_scratch.push(Int32PairUndoBatch {
+                    page: src_page_id,
+                    writer_xid: xid,
+                    target_col,
+                    delta,
+                    first_slot,
+                    slot_count,
+                    slots,
+                });
+                page_undo_slots.clear();
+            }
+            if page_updated && let Some(vm) = vm {
+                vm.clear(src_page_id.relation, src_page_id.block);
+            }
+        }
+
+        Ok(Int32PairRangeUpdate {
+            total_updated,
+            compact_undo: compact_undo_scratch,
+        })
     }
 
     /// Point form of [`Self::update_int32_pair_inplace_undo`].

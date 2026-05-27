@@ -24,15 +24,23 @@ WORKLOAD_ORDER = [
     "insert_throughput",
     "select_scan",
     "select_sum",
+    "select_avg",
     "filter_sum",
     "update_throughput",
+    "delete_throughput",
+    "mixed_oltp_pgbench_like",
+    "window_row_number",
 ]
 WORKLOAD_LABELS = {
     "insert_throughput": "INSERT throughput",
     "select_scan": "SELECT scan",
     "select_sum": "SELECT SUM(x)",
+    "select_avg": "SELECT AVG(x)",
     "filter_sum": "Filter + SUM",
     "update_throughput": "UPDATE throughput",
+    "delete_throughput": "DELETE throughput",
+    "mixed_oltp_pgbench_like": "Mixed OLTP",
+    "window_row_number": "Window row_number()",
 }
 
 
@@ -58,7 +66,7 @@ def parse_args() -> argparse.Namespace:
 
 def workload_family(workload: str) -> str | None:
     for family in WORKLOAD_ORDER:
-        if workload.startswith(f"{family}_"):
+        if workload == family or workload.startswith(f"{family}_"):
             return family
     return None
 
@@ -67,12 +75,13 @@ def format_rows(rows: int) -> str:
     return f"{rows:,}".replace(",", " ")
 
 
-def format_duration(us: float | None) -> str:
+def format_duration(us: float | None, family: str) -> str:
     if us is None:
         return "-"
+    suffix = "/op" if family == "mixed_oltp_pgbench_like" else ""
     if us < 1000.0:
-        return f"{us:.2f} µs"
-    return f"{us / 1000.0:.2f} ms"
+        return f"{us:.2f} µs{suffix}"
+    return f"{us / 1000.0:.2f} ms{suffix}"
 
 
 def load_raw(raw_dir: Path) -> list[dict]:
@@ -143,7 +152,7 @@ def render_markdown(title: str, note: str, rows: list[dict]) -> str:
         cells = []
         for engine in ENGINE_ORDER:
             value = row["engines"].get(engine)
-            formatted = format_duration(value["median_us"] if value else None)
+            formatted = format_duration(value["median_us"] if value else None, row["workload"])
             if engine == row["fastest_engine"]:
                 formatted = f"**{formatted}**"
             cells.append(formatted)

@@ -161,7 +161,10 @@ UltraSQL is installed through `scripts/install.sh` unless `ULTRASQLD_BIN` points
 at an existing release binary. The harness launches that external `ultrasqld`
 over TCP and runs the same SQL-surface workloads as installed DuckDB, SQLite,
 and PostgreSQL clients. Failures are recorded as `status=not_available`; they
-are not ranked and are not claims. Artifacts live under:
+are not ranked and are not claims. Bulk INSERT uses a fresh UltraSQL server per
+measured sample, matching the fresh in-memory table setup used by the embedded
+competitor runners, and all engines use 10k-row INSERT chunks. Artifacts live
+under:
 
 ```text
 benchmarks/results/latest/scale-sweep/

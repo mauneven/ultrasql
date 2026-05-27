@@ -34,6 +34,7 @@ RAW_DIR="${RAW_DIR:-benchmarks/results/latest/raw}"
 N_ITERS="${N_ITERS:-8}"
 N_ROWS="${N_ROWS:-10000}"
 ANALYTICAL_ROWS="${ANALYTICAL_ROWS:-}"
+INSERT_CHUNK_ROWS="${INSERT_CHUNK_ROWS:-10000}"
 
 row_suffix() {
     local rows="$1"
@@ -111,10 +112,11 @@ run_insert() {
     # Generate values CSV.
     local values_sql
     values_sql="$(mktemp /tmp/duckdb_insert_XXXX.sql)"
-    python3 - "$N_ROWS" "$values_sql" <<'PYEOF'
+    python3 - "$N_ROWS" "$INSERT_CHUNK_ROWS" "$values_sql" <<'PYEOF'
 import sys, random
 n = int(sys.argv[1])
-out = sys.argv[2]
+chunk_rows = int(sys.argv[2])
+out = sys.argv[3]
 rng = random.Random(0xC0FFEE)
 ids = list(range(n))
 rng.shuffle(ids)
@@ -122,8 +124,8 @@ vals = [rng.randint(-2**31, 2**31-1) for _ in range(n)]
 with open(out, "w") as f:
     f.write("CREATE OR REPLACE TABLE bench_write(id BIGINT PRIMARY KEY, val BIGINT);\n")
     f.write("BEGIN TRANSACTION;\n")
-    chunks = [ids[i:i+1000] for i in range(0, n, 1000)]
-    vchunks = [vals[i:i+1000] for i in range(0, n, 1000)]
+    chunks = [ids[i:i+chunk_rows] for i in range(0, n, chunk_rows)]
+    vchunks = [vals[i:i+chunk_rows] for i in range(0, n, chunk_rows)]
     for ch, vc in zip(chunks, vchunks):
         rows = ",".join(f"({i},{v})" for i, v in zip(ch, vc))
         f.write(f"INSERT INTO bench_write(id,val) VALUES {rows};\n")

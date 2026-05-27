@@ -24,6 +24,8 @@ fn scale_sweep_script_uses_external_release_artifact() {
     assert!(script.contains("\"status\": \"not_available\""));
     assert!(script.contains("SCALE_SWEEP_APPEND"));
     assert!(script.contains("benchmarks/scripts/render_scale_sweep.py"));
+    assert!(script.contains("run_ultrasql_fresh_insert_samples"));
+    assert!(script.contains("10k-row INSERT chunks"));
 }
 
 #[test]
@@ -31,9 +33,10 @@ fn readme_scale_sweep_matches_rendered_artifact() {
     let readme = repo_file("README.md");
     let scale_md = repo_file("benchmarks/results/latest/scale-sweep/scale_sweep.md");
 
-    assert!(readme.contains("## Release-Artifact Scale Sweep"));
+    assert!(readme.contains("## Release-Artifact DB-vs-DB Benchmark"));
     assert!(readme.contains("benchmarks/run_scale_sweep.sh full"));
-    assert!(readme.contains("v0.0.6 hits buffer-pool exhaustion"));
+    assert!(readme.contains("Fastest"));
+    assert!(!readme.contains("buffer-pool exhaustion"));
 
     for line in scale_md.lines().filter(|line| line.starts_with('|')) {
         assert!(
@@ -44,22 +47,29 @@ fn readme_scale_sweep_matches_rendered_artifact() {
 }
 
 #[test]
-fn scale_sweep_records_release_artifact_gaps_without_ranking_them() {
+fn scale_sweep_records_million_row_insert_and_all_current_wins() {
     let raw =
         repo_file("benchmarks/results/latest/scale-sweep/raw/insert_throughput_1m-ultrasql.json");
     let value: serde_json::Value =
         serde_json::from_str(&raw).expect("parse insert_throughput_1m-ultrasql");
 
     assert_eq!(value["engine"], "ultrasql");
-    assert_eq!(value["status"], "not_available");
+    assert_eq!(value["status"], "measured");
     assert_eq!(value["server_mode"], "external");
+    assert_eq!(value["n_rows"], 1_000_000);
+    assert!(value["median_us"].as_f64().expect("median_us") > 0.0);
+
+    let rendered_json = repo_file("benchmarks/results/latest/scale-sweep/scale_sweep.json");
+    let rendered: serde_json::Value =
+        serde_json::from_str(&rendered_json).expect("parse rendered scale_sweep.json");
+    let rows = rendered["rows"].as_array().expect("rows array");
     assert!(
-        value["reason"]
-            .as_str()
-            .expect("reason")
-            .contains("buffer pool exhausted")
+        rows.iter()
+            .all(|row| row["fastest_engine"].as_str() == Some("ultrasql")),
+        "every rendered scale-sweep row should currently have UltraSQL as fastest"
     );
 
-    let rendered = repo_file("benchmarks/results/latest/scale-sweep/scale_sweep.md");
-    assert!(rendered.contains("| INSERT throughput | 1 000 000 | - |"));
+    let rendered_md = repo_file("benchmarks/results/latest/scale-sweep/scale_sweep.md");
+    assert!(rendered_md.contains("| INSERT throughput | 1 000 000 | **"));
+    assert!(rendered_md.contains("| UPDATE throughput | 1 000 000 | **"));
 }

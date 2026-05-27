@@ -1787,9 +1787,16 @@ where
                     Some(self.cancel_flag.clone()),
                     &mut self.write_buf,
                 );
-                if let Ok(result) = &outcome {
-                    self.note_dml_effect(plan, result.rows);
-                }
+                let outcome = match outcome {
+                    Ok(result) => {
+                        self.note_dml_effect(plan, result.rows);
+                        match self.flush_dirty_heap_pages_after_dml_if_needed(plan, result.rows) {
+                            Ok(()) => Ok(result),
+                            Err(err) => Err(err),
+                        }
+                    }
+                    Err(err) => Err(err),
+                };
                 // Transition: Ok → InTransaction; Err → Failed. The txn
                 // remains alive in the CLOG (InProgress) until the user
                 // issues COMMIT/ROLLBACK.
@@ -1833,6 +1840,23 @@ where
                             tracing::warn!(
                                 error = %abort_err,
                                 "autocommit rollback failed after deferred FK violation",
+                            );
+                        }
+                        return Err(e);
+                    }
+                    if let Err(e) =
+                        self.flush_dirty_heap_pages_after_dml_if_needed(plan, result.rows)
+                    {
+                        if let Err(rollback_err) = self.state.heap.rollback_in_place_updates(xid) {
+                            tracing::warn!(
+                                error = %rollback_err,
+                                "in-place update rollback failed after dirty-page flush error",
+                            );
+                        }
+                        if let Err(abort_err) = self.state.txn_manager.abort(txn) {
+                            tracing::warn!(
+                                error = %abort_err,
+                                "autocommit rollback failed after dirty-page flush error",
                             );
                         }
                         return Err(e);
@@ -2529,6 +2553,17 @@ where
             .entry(table.to_ascii_lowercase())
             .or_insert(0);
         *entry = entry.saturating_add(rows);
+    }
+
+    pub(crate) fn flush_dirty_heap_pages_after_dml_if_needed(
+        &self,
+        plan: &LogicalPlan,
+        rows: u64,
+    ) -> Result<(), ServerError> {
+        if rows > 0 && matches!(plan, LogicalPlan::Insert { .. }) {
+            self.state.flush_dirty_heap_pages_if_needed()?;
+        }
+        Ok(())
     }
 
     pub(crate) fn parse_affected_rows_tag(messages: &[BackendMessage]) -> u64 {

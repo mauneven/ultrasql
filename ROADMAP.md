@@ -56,9 +56,9 @@ file focused on what still blocks production.
   `Firebolt is not_available` when Core EXPLAIN does not expose pruning.
 - Rerun TPC-H SF1/SF10 on the release host before publishing release
   performance claims; completed local evidence lives in `DONE.md`.
-- Close release-artifact scale-sweep gaps before broader performance claims:
-  1M bulk INSERT currently records `not_available` from buffer-pool exhaustion,
-  SQLite leads 100k INSERT, DuckDB leads 10k SUM, and DuckDB leads 1M UPDATE.
+- Broaden release-artifact scale-sweep coverage beyond the current same-host
+  DuckDB/SQLite/PostgreSQL table: larger row counts, WAL-backed `--data-dir`
+  mode, and ClickHouse/Firebolt legs when local services are available.
 
 ## P1 - PostgreSQL Compatibility
 

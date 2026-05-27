@@ -119,6 +119,84 @@ async fn begin_commit_persists_rows_rollback_discards() {
     handle.await.expect("task joins").expect("clean exit");
 }
 
+#[tokio::test]
+async fn explicit_transaction_bulk_insert_spills_dirty_pages_under_pressure() {
+    let (mut client, server_side) = tokio::io::duplex(1 << 20);
+    let state = Arc::new(Server::with_sample_database_pool_frames(16));
+    let observed_state = Arc::clone(&state);
+    let handle = tokio::spawn(handle_connection(server_side, state));
+    complete_startup(&mut client).await;
+
+    for sql in [
+        "CREATE TABLE pressure_t (id INT NOT NULL, val INT)",
+        "BEGIN",
+    ] {
+        send_frontend(&mut client, &FrontendMessage::Query { sql: sql.into() }).await;
+        let msgs = drain_until_ready(&mut client).await;
+        assert!(
+            msgs.iter()
+                .all(|msg| !matches!(msg, BackendMessage::ErrorResponse { .. })),
+            "{sql} failed: {msgs:?}",
+        );
+    }
+
+    let mut inserted = 0_usize;
+    for chunk in 0..24 {
+        let start = chunk * 250;
+        let end = start + 250;
+        let mut sql = String::from("INSERT INTO pressure_t VALUES ");
+        for row in start..end {
+            if row > start {
+                sql.push(',');
+            }
+            sql.push('(');
+            sql.push_str(&row.to_string());
+            sql.push(',');
+            sql.push_str(&(row * 10).to_string());
+            sql.push(')');
+        }
+
+        send_frontend(&mut client, &FrontendMessage::Query { sql }).await;
+        let msgs = drain_until_ready(&mut client).await;
+        assert_eq!(command_tag(&msgs).as_deref(), Some("INSERT 0 250"));
+        assert_eq!(ready_status(&msgs), b'T');
+        inserted += 250;
+    }
+
+    send_frontend(
+        &mut client,
+        &FrontendMessage::Query {
+            sql: "COMMIT".to_string(),
+        },
+    )
+    .await;
+    let msgs = drain_until_ready(&mut client).await;
+    assert_eq!(command_tag(&msgs).as_deref(), Some("COMMIT"));
+    assert_eq!(ready_status(&msgs), b'I');
+
+    send_frontend(
+        &mut client,
+        &FrontendMessage::Query {
+            sql: "SELECT COUNT(*) FROM pressure_t".to_string(),
+        },
+    )
+    .await;
+    let msgs = drain_until_ready(&mut client).await;
+    let count = msgs.iter().find_map(|msg| match msg {
+        BackendMessage::DataRow { columns } => columns.first().and_then(Clone::clone),
+        _ => None,
+    });
+    assert_eq!(count.as_deref(), Some(inserted.to_string().as_bytes()));
+    assert!(
+        observed_state.heap.buffer_pool().stats().evictions > 0,
+        "bulk insert should cycle frames under the small test pool",
+    );
+
+    send_frontend(&mut client, &FrontendMessage::Terminate).await;
+    drop(client);
+    handle.await.expect("task joins").expect("clean exit");
+}
+
 /// `BEGIN; UPDATE; ROLLBACK;` — UPDATE is undone.
 #[tokio::test]
 async fn begin_update_rollback_reverts_value() {

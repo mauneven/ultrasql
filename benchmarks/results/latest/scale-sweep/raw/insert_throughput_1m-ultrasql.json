@@ -1,10 +1,1 @@
-{
-  "engine": "ultrasql",
-  "n_rows": 1000000,
-  "policy": "Failure is recorded as not_available; no benchmark claim is made for this row.",
-  "reason": "Error: INSERT chunk INTO bench_insert_10\n\nCaused by:\n    0: db error\n    1: ERROR: execution error: type mismatch: buffer pool: buffer pool exhausted: every frame is pinned",
-  "schema_version": 1,
-  "server_mode": "external",
-  "status": "not_available",
-  "workload": "insert_throughput_1m"
-}
+{"engine": "ultrasql", "host": {"cores": 10, "cpu": "Apple M4", "os": "macos unknown", "ram_gb": 16}, "iterations_us": [652749.166, 633694.208, 635194.4160000001, 647249.041, 619987.292, 631895.042, 651088.2919999999, 620625.5, 649423.5, 630867.625, 624588.0, 659470.792, 673469.584, 644084.5830000001, 658551.2919999999, 633052.25], "median_us": 639639.4995000002, "min_us": 619987.292, "n_rows": 1000000, "policy": "Raw measured samples only; no ranking or winner claim.", "samples": 16, "schema_version": 1, "server_addr": "127.0.0.1:53285", "server_mode": "external", "status": "measured", "workload": "insert_throughput_1m"}

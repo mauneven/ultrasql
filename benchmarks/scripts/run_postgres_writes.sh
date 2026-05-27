@@ -39,6 +39,7 @@ N_ROWS="${N_ROWS:-10000}"
 PGDATABASE="${PGDATABASE:-ultrasql_bench}"
 PGUSER="${PGUSER:-$(id -un)}"
 ANALYTICAL_ROWS="${ANALYTICAL_ROWS:-}"
+INSERT_CHUNK_ROWS="${INSERT_CHUNK_ROWS:-10000}"
 
 row_suffix() {
     local rows="$1"
@@ -148,19 +149,20 @@ SQL
     # Pre-generate values as a Python CSV to avoid shell loops.
     local values_file
     values_file="$(mktemp /tmp/pg_bench_insert_XXXX.sql)"
-    python3 - "$N_ROWS" "$values_file" <<'PYEOF'
+    python3 - "$N_ROWS" "$INSERT_CHUNK_ROWS" "$values_file" <<'PYEOF'
 import sys, random
 n = int(sys.argv[1])
-out = sys.argv[2]
+chunk_rows = int(sys.argv[2])
+out = sys.argv[3]
 rng = random.Random(0xC0FFEE)
 ids = list(range(n))
 rng.shuffle(ids)
 vals = [rng.randint(-2**31, 2**31-1) for _ in range(n)]
 with open(out, "w") as f:
     f.write("BEGIN;\n")
-    # Build one multi-row INSERT for efficiency (matches the single-transaction benchmark).
-    chunks = [ids[i:i+1000] for i in range(0, n, 1000)]
-    vchunks = [vals[i:i+1000] for i in range(0, n, 1000)]
+    # Build multi-row INSERT chunks for efficiency (matches the single-transaction benchmark).
+    chunks = [ids[i:i+chunk_rows] for i in range(0, n, chunk_rows)]
+    vchunks = [vals[i:i+chunk_rows] for i in range(0, n, chunk_rows)]
     for ch, vc in zip(chunks, vchunks):
         rows = ",".join(f"({i},{v})" for i, v in zip(ch, vc))
         f.write(f"INSERT INTO bench_write(id,val) VALUES {rows};\n")

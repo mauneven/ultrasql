@@ -7,7 +7,7 @@
         "duckdb": {
           "engine": "duckdb",
           "family": "insert_throughput",
-          "median_us": 62635.875,
+          "median_us": 66232.479,
           "n_rows": 10000,
           "path": "benchmarks/results/latest/scale-sweep/raw/insert_throughput_10k-duckdb.json",
           "samples": 16,
@@ -17,7 +17,7 @@
         "postgres17": {
           "engine": "postgres17",
           "family": "insert_throughput",
-          "median_us": 50574.416,
+          "median_us": 50503.333,
           "n_rows": 10000,
           "path": "benchmarks/results/latest/scale-sweep/raw/insert_throughput_10k-postgres17.json",
           "samples": 16,
@@ -27,7 +27,7 @@
         "sqlite3": {
           "engine": "sqlite3",
           "family": "insert_throughput",
-          "median_us": 18748.729,
+          "median_us": 19274.624,
           "n_rows": 10000,
           "path": "benchmarks/results/latest/scale-sweep/raw/insert_throughput_10k-sqlite3.json",
           "samples": 16,
@@ -37,7 +37,7 @@
         "ultrasql": {
           "engine": "ultrasql",
           "family": "insert_throughput",
-          "median_us": 6618.875,
+          "median_us": 6793.604,
           "n_rows": 10000,
           "path": "benchmarks/results/latest/scale-sweep/raw/insert_throughput_10k-ultrasql.json",
           "samples": 16,
@@ -46,7 +46,7 @@
         }
       },
       "fastest_engine": "ultrasql",
-      "fastest_median_us": 6618.875,
+      "fastest_median_us": 6793.604,
       "n_rows": 10000,
       "workload": "insert_throughput",
       "workload_label": "INSERT throughput"
@@ -56,7 +56,7 @@
         "duckdb": {
           "engine": "duckdb",
           "family": "insert_throughput",
-          "median_us": 402548.646,
+          "median_us": 409007.0,
           "n_rows": 100000,
           "path": "benchmarks/results/latest/scale-sweep/raw/insert_throughput_100k-duckdb.json",
           "samples": 16,
@@ -66,7 +66,7 @@
         "postgres17": {
           "engine": "postgres17",
           "family": "insert_throughput",
-          "median_us": 179945.916,
+          "median_us": 193879.667,
           "n_rows": 100000,
           "path": "benchmarks/results/latest/scale-sweep/raw/insert_throughput_100k-postgres17.json",
           "samples": 16,
@@ -76,7 +76,7 @@
         "sqlite3": {
           "engine": "sqlite3",
           "family": "insert_throughput",
-          "median_us": 65863.084,
+          "median_us": 62370.521,
           "n_rows": 100000,
           "path": "benchmarks/results/latest/scale-sweep/raw/insert_throughput_100k-sqlite3.json",
           "samples": 16,
@@ -86,7 +86,7 @@
         "ultrasql": {
           "engine": "ultrasql",
           "family": "insert_throughput",
-          "median_us": 69440.833,
+          "median_us": 59749.042,
           "n_rows": 100000,
           "path": "benchmarks/results/latest/scale-sweep/raw/insert_throughput_100k-ultrasql.json",
           "samples": 16,
@@ -94,8 +94,8 @@
           "workload": "insert_throughput_100k"
         }
       },
-      "fastest_engine": "sqlite3",
-      "fastest_median_us": 65863.084,
+      "fastest_engine": "ultrasql",
+      "fastest_median_us": 59749.042,
       "n_rows": 100000,
       "workload": "insert_throughput",
       "workload_label": "INSERT throughput"
@@ -105,7 +105,7 @@
         "duckdb": {
           "engine": "duckdb",
           "family": "insert_throughput",
-          "median_us": 3814022.937,
+          "median_us": 3929789.354,
           "n_rows": 1000000,
           "path": "benchmarks/results/latest/scale-sweep/raw/insert_throughput_1m-duckdb.json",
           "samples": 16,
@@ -115,7 +115,7 @@
         "postgres17": {
           "engine": "postgres17",
           "family": "insert_throughput",
-          "median_us": 2932005.709,
+          "median_us": 2108268.167,
           "n_rows": 1000000,
           "path": "benchmarks/results/latest/scale-sweep/raw/insert_throughput_1m-postgres17.json",
           "samples": 16,
@@ -125,16 +125,26 @@
         "sqlite3": {
           "engine": "sqlite3",
           "family": "insert_throughput",
-          "median_us": 790305.583,
+          "median_us": 642382.208,
           "n_rows": 1000000,
           "path": "benchmarks/results/latest/scale-sweep/raw/insert_throughput_1m-sqlite3.json",
           "samples": 16,
           "server_mode": null,
           "workload": "insert_throughput_1m"
+        },
+        "ultrasql": {
+          "engine": "ultrasql",
+          "family": "insert_throughput",
+          "median_us": 639639.4995000002,
+          "n_rows": 1000000,
+          "path": "benchmarks/results/latest/scale-sweep/raw/insert_throughput_1m-ultrasql.json",
+          "samples": 16,
+          "server_mode": "external",
+          "workload": "insert_throughput_1m"
         }
       },
-      "fastest_engine": "sqlite3",
-      "fastest_median_us": 790305.583,
+      "fastest_engine": "ultrasql",
+      "fastest_median_us": 639639.4995000002,
       "n_rows": 1000000,
       "workload": "insert_throughput",
       "workload_label": "INSERT throughput"
@@ -144,7 +154,7 @@
         "duckdb": {
           "engine": "duckdb",
           "family": "select_scan",
-          "median_us": 866.0,
+          "median_us": 953.208,
           "n_rows": 10000,
           "path": "benchmarks/results/latest/scale-sweep/raw/select_scan_10k-duckdb.json",
           "samples": 16,
@@ -154,7 +164,7 @@
         "postgres17": {
           "engine": "postgres17",
           "family": "select_scan",
-          "median_us": 28218.334,
+          "median_us": 30655.938,
           "n_rows": 10000,
           "path": "benchmarks/results/latest/scale-sweep/raw/select_scan_10k-postgres17.json",
           "samples": 16,
@@ -164,7 +174,7 @@
         "sqlite3": {
           "engine": "sqlite3",
           "family": "select_scan",
-          "median_us": 1842.188,
+          "median_us": 1949.27,
           "n_rows": 10000,
           "path": "benchmarks/results/latest/scale-sweep/raw/select_scan_10k-sqlite3.json",
           "samples": 16,
@@ -174,7 +184,7 @@
         "ultrasql": {
           "engine": "ultrasql",
           "family": "select_scan",
-          "median_us": 714.5409999999999,
+          "median_us": 685.375,
           "n_rows": 10000,
           "path": "benchmarks/results/latest/scale-sweep/raw/select_scan_10k-ultrasql.json",
           "samples": 16,
@@ -183,7 +193,7 @@
         }
       },
       "fastest_engine": "ultrasql",
-      "fastest_median_us": 714.5409999999999,
+      "fastest_median_us": 685.375,
       "n_rows": 10000,
       "workload": "select_scan",
       "workload_label": "SELECT scan"
@@ -193,7 +203,7 @@
         "duckdb": {
           "engine": "duckdb",
           "family": "select_scan",
-          "median_us": 9899.105,
+          "median_us": 9196.479,
           "n_rows": 100000,
           "path": "benchmarks/results/latest/scale-sweep/raw/select_scan_100k-duckdb.json",
           "samples": 16,
@@ -203,7 +213,7 @@
         "postgres17": {
           "engine": "postgres17",
           "family": "select_scan",
-          "median_us": 55996.416,
+          "median_us": 59290.77,
           "n_rows": 100000,
           "path": "benchmarks/results/latest/scale-sweep/raw/select_scan_100k-postgres17.json",
           "samples": 16,
@@ -213,7 +223,7 @@
         "sqlite3": {
           "engine": "sqlite3",
           "family": "select_scan",
-          "median_us": 19177.771,
+          "median_us": 19781.896,
           "n_rows": 100000,
           "path": "benchmarks/results/latest/scale-sweep/raw/select_scan_100k-sqlite3.json",
           "samples": 16,
@@ -223,7 +233,7 @@
         "ultrasql": {
           "engine": "ultrasql",
           "family": "select_scan",
-          "median_us": 7072.375,
+          "median_us": 6872.416,
           "n_rows": 100000,
           "path": "benchmarks/results/latest/scale-sweep/raw/select_scan_100k-ultrasql.json",
           "samples": 16,
@@ -232,7 +242,7 @@
         }
       },
       "fastest_engine": "ultrasql",
-      "fastest_median_us": 7072.375,
+      "fastest_median_us": 6872.416,
       "n_rows": 100000,
       "workload": "select_scan",
       "workload_label": "SELECT scan"
@@ -242,7 +252,7 @@
         "duckdb": {
           "engine": "duckdb",
           "family": "select_scan",
-          "median_us": 94881.271,
+          "median_us": 95336.23,
           "n_rows": 1000000,
           "path": "benchmarks/results/latest/scale-sweep/raw/select_scan_1m-duckdb.json",
           "samples": 16,
@@ -252,7 +262,7 @@
         "postgres17": {
           "engine": "postgres17",
           "family": "select_scan",
-          "median_us": 204613.229,
+          "median_us": 210672.292,
           "n_rows": 1000000,
           "path": "benchmarks/results/latest/scale-sweep/raw/select_scan_1m-postgres17.json",
           "samples": 16,
@@ -262,7 +272,7 @@
         "sqlite3": {
           "engine": "sqlite3",
           "family": "select_scan",
-          "median_us": 202343.876,
+          "median_us": 203264.604,
           "n_rows": 1000000,
           "path": "benchmarks/results/latest/scale-sweep/raw/select_scan_1m-sqlite3.json",
           "samples": 16,
@@ -272,7 +282,7 @@
         "ultrasql": {
           "engine": "ultrasql",
           "family": "select_scan",
-          "median_us": 68794.0,
+          "median_us": 67709.209,
           "n_rows": 1000000,
           "path": "benchmarks/results/latest/scale-sweep/raw/select_scan_1m-ultrasql.json",
           "samples": 16,
@@ -281,7 +291,7 @@
         }
       },
       "fastest_engine": "ultrasql",
-      "fastest_median_us": 68794.0,
+      "fastest_median_us": 67709.209,
       "n_rows": 1000000,
       "workload": "select_scan",
       "workload_label": "SELECT scan"
@@ -291,7 +301,7 @@
         "duckdb": {
           "engine": "duckdb",
           "family": "select_sum",
-          "median_us": 68.625,
+          "median_us": 93.312,
           "n_rows": 10000,
           "path": "benchmarks/results/latest/scale-sweep/raw/select_sum_10k_i64-duckdb.json",
           "samples": 16,
@@ -301,7 +311,7 @@
         "postgres17": {
           "engine": "postgres17",
           "family": "select_sum",
-          "median_us": 24184.625,
+          "median_us": 25613.188,
           "n_rows": 10000,
           "path": "benchmarks/results/latest/scale-sweep/raw/select_sum_10k_i64-postgres17.json",
           "samples": 16,
@@ -311,7 +321,7 @@
         "sqlite3": {
           "engine": "sqlite3",
           "family": "select_sum",
-          "median_us": 138.313,
+          "median_us": 136.208,
           "n_rows": 10000,
           "path": "benchmarks/results/latest/scale-sweep/raw/select_sum_10k_i64-sqlite3.json",
           "samples": 16,
@@ -321,7 +331,7 @@
         "ultrasql": {
           "engine": "ultrasql",
           "family": "select_sum",
-          "median_us": 74.584,
+          "median_us": 70.625,
           "n_rows": 10000,
           "path": "benchmarks/results/latest/scale-sweep/raw/select_sum_10k_i64-ultrasql.json",
           "samples": 16,
@@ -329,8 +339,8 @@
           "workload": "select_sum_10k_i64"
         }
       },
-      "fastest_engine": "duckdb",
-      "fastest_median_us": 68.625,
+      "fastest_engine": "ultrasql",
+      "fastest_median_us": 70.625,
       "n_rows": 10000,
       "workload": "select_sum",
       "workload_label": "SELECT SUM(x)"
@@ -340,7 +350,7 @@
         "duckdb": {
           "engine": "duckdb",
           "family": "select_sum",
-          "median_us": 104.584,
+          "median_us": 104.437,
           "n_rows": 100000,
           "path": "benchmarks/results/latest/scale-sweep/raw/select_sum_100k_i64-duckdb.json",
           "samples": 16,
@@ -350,7 +360,7 @@
         "postgres17": {
           "engine": "postgres17",
           "family": "select_sum",
-          "median_us": 33310.479,
+          "median_us": 36688.187,
           "n_rows": 100000,
           "path": "benchmarks/results/latest/scale-sweep/raw/select_sum_100k_i64-postgres17.json",
           "samples": 16,
@@ -360,7 +370,7 @@
         "sqlite3": {
           "engine": "sqlite3",
           "family": "select_sum",
-          "median_us": 1419.541,
+          "median_us": 1442.333,
           "n_rows": 100000,
           "path": "benchmarks/results/latest/scale-sweep/raw/select_sum_100k_i64-sqlite3.json",
           "samples": 16,
@@ -370,7 +380,7 @@
         "ultrasql": {
           "engine": "ultrasql",
           "family": "select_sum",
-          "median_us": 59.625,
+          "median_us": 74.75,
           "n_rows": 100000,
           "path": "benchmarks/results/latest/scale-sweep/raw/select_sum_100k_i64-ultrasql.json",
           "samples": 16,
@@ -379,7 +389,7 @@
         }
       },
       "fastest_engine": "ultrasql",
-      "fastest_median_us": 59.625,
+      "fastest_median_us": 74.75,
       "n_rows": 100000,
       "workload": "select_sum",
       "workload_label": "SELECT SUM(x)"
@@ -389,7 +399,7 @@
         "duckdb": {
           "engine": "duckdb",
           "family": "select_sum",
-          "median_us": 164.084,
+          "median_us": 174.208,
           "n_rows": 1000000,
           "path": "benchmarks/results/latest/scale-sweep/raw/select_sum_1m_i64-duckdb.json",
           "samples": 16,
@@ -399,7 +409,7 @@
         "postgres17": {
           "engine": "postgres17",
           "family": "select_sum",
-          "median_us": 40509.999,
+          "median_us": 43732.687,
           "n_rows": 1000000,
           "path": "benchmarks/results/latest/scale-sweep/raw/select_sum_1m_i64-postgres17.json",
           "samples": 16,
@@ -409,7 +419,7 @@
         "sqlite3": {
           "engine": "sqlite3",
           "family": "select_sum",
-          "median_us": 14042.791,
+          "median_us": 13844.646,
           "n_rows": 1000000,
           "path": "benchmarks/results/latest/scale-sweep/raw/select_sum_1m_i64-sqlite3.json",
           "samples": 16,
@@ -419,7 +429,7 @@
         "ultrasql": {
           "engine": "ultrasql",
           "family": "select_sum",
-          "median_us": 63.0,
+          "median_us": 63.37499999999999,
           "n_rows": 1000000,
           "path": "benchmarks/results/latest/scale-sweep/raw/select_sum_1m_i64-ultrasql.json",
           "samples": 16,
@@ -428,7 +438,7 @@
         }
       },
       "fastest_engine": "ultrasql",
-      "fastest_median_us": 63.0,
+      "fastest_median_us": 63.37499999999999,
       "n_rows": 1000000,
       "workload": "select_sum",
       "workload_label": "SELECT SUM(x)"
@@ -437,8 +447,155 @@
       "engines": {
         "duckdb": {
           "engine": "duckdb",
+          "family": "select_avg",
+          "median_us": 94.188,
+          "n_rows": 10000,
+          "path": "benchmarks/results/latest/scale-sweep/raw/select_avg_10k_i64-duckdb.json",
+          "samples": 16,
+          "server_mode": null,
+          "workload": "select_avg_10k_i64"
+        },
+        "postgres17": {
+          "engine": "postgres17",
+          "family": "select_avg",
+          "median_us": 25351.584,
+          "n_rows": 10000,
+          "path": "benchmarks/results/latest/scale-sweep/raw/select_avg_10k_i64-postgres17.json",
+          "samples": 16,
+          "server_mode": null,
+          "workload": "select_avg_10k_i64"
+        },
+        "sqlite3": {
+          "engine": "sqlite3",
+          "family": "select_avg",
+          "median_us": 149.25,
+          "n_rows": 10000,
+          "path": "benchmarks/results/latest/scale-sweep/raw/select_avg_10k_i64-sqlite3.json",
+          "samples": 16,
+          "server_mode": null,
+          "workload": "select_avg_10k_i64"
+        },
+        "ultrasql": {
+          "engine": "ultrasql",
+          "family": "select_avg",
+          "median_us": 76.667,
+          "n_rows": 10000,
+          "path": "benchmarks/results/latest/scale-sweep/raw/select_avg_10k_i64-ultrasql.json",
+          "samples": 16,
+          "server_mode": "external",
+          "workload": "select_avg_10k_i64"
+        }
+      },
+      "fastest_engine": "ultrasql",
+      "fastest_median_us": 76.667,
+      "n_rows": 10000,
+      "workload": "select_avg",
+      "workload_label": "SELECT AVG(x)"
+    },
+    {
+      "engines": {
+        "duckdb": {
+          "engine": "duckdb",
+          "family": "select_avg",
+          "median_us": 131.542,
+          "n_rows": 100000,
+          "path": "benchmarks/results/latest/scale-sweep/raw/select_avg_100k_i64-duckdb.json",
+          "samples": 16,
+          "server_mode": null,
+          "workload": "select_avg_100k_i64"
+        },
+        "postgres17": {
+          "engine": "postgres17",
+          "family": "select_avg",
+          "median_us": 38980.313,
+          "n_rows": 100000,
+          "path": "benchmarks/results/latest/scale-sweep/raw/select_avg_100k_i64-postgres17.json",
+          "samples": 16,
+          "server_mode": null,
+          "workload": "select_avg_100k_i64"
+        },
+        "sqlite3": {
+          "engine": "sqlite3",
+          "family": "select_avg",
+          "median_us": 1481.771,
+          "n_rows": 100000,
+          "path": "benchmarks/results/latest/scale-sweep/raw/select_avg_100k_i64-sqlite3.json",
+          "samples": 16,
+          "server_mode": null,
+          "workload": "select_avg_100k_i64"
+        },
+        "ultrasql": {
+          "engine": "ultrasql",
+          "family": "select_avg",
+          "median_us": 74.75,
+          "n_rows": 100000,
+          "path": "benchmarks/results/latest/scale-sweep/raw/select_avg_100k_i64-ultrasql.json",
+          "samples": 16,
+          "server_mode": "external",
+          "workload": "select_avg_100k_i64"
+        }
+      },
+      "fastest_engine": "ultrasql",
+      "fastest_median_us": 74.75,
+      "n_rows": 100000,
+      "workload": "select_avg",
+      "workload_label": "SELECT AVG(x)"
+    },
+    {
+      "engines": {
+        "duckdb": {
+          "engine": "duckdb",
+          "family": "select_avg",
+          "median_us": 242.438,
+          "n_rows": 1000000,
+          "path": "benchmarks/results/latest/scale-sweep/raw/select_avg_1m_i64-duckdb.json",
+          "samples": 16,
+          "server_mode": null,
+          "workload": "select_avg_1m_i64"
+        },
+        "postgres17": {
+          "engine": "postgres17",
+          "family": "select_avg",
+          "median_us": 40820.105,
+          "n_rows": 1000000,
+          "path": "benchmarks/results/latest/scale-sweep/raw/select_avg_1m_i64-postgres17.json",
+          "samples": 16,
+          "server_mode": null,
+          "workload": "select_avg_1m_i64"
+        },
+        "sqlite3": {
+          "engine": "sqlite3",
+          "family": "select_avg",
+          "median_us": 14540.562,
+          "n_rows": 1000000,
+          "path": "benchmarks/results/latest/scale-sweep/raw/select_avg_1m_i64-sqlite3.json",
+          "samples": 16,
+          "server_mode": null,
+          "workload": "select_avg_1m_i64"
+        },
+        "ultrasql": {
+          "engine": "ultrasql",
+          "family": "select_avg",
+          "median_us": 64.625,
+          "n_rows": 1000000,
+          "path": "benchmarks/results/latest/scale-sweep/raw/select_avg_1m_i64-ultrasql.json",
+          "samples": 16,
+          "server_mode": "external",
+          "workload": "select_avg_1m_i64"
+        }
+      },
+      "fastest_engine": "ultrasql",
+      "fastest_median_us": 64.625,
+      "n_rows": 1000000,
+      "workload": "select_avg",
+      "workload_label": "SELECT AVG(x)"
+    },
+    {
+      "engines": {
+        "duckdb": {
+          "engine": "duckdb",
           "family": "filter_sum",
-          "median_us": 108.479,
+          "median_us": 103.021,
           "n_rows": 10000,
           "path": "benchmarks/results/latest/scale-sweep/raw/filter_sum_10k_i64-duckdb.json",
           "samples": 16,
@@ -448,7 +605,7 @@
         "postgres17": {
           "engine": "postgres17",
           "family": "filter_sum",
-          "median_us": 26385.187,
+          "median_us": 26144.0,
           "n_rows": 10000,
           "path": "benchmarks/results/latest/scale-sweep/raw/filter_sum_10k_i64-postgres17.json",
           "samples": 16,
@@ -458,7 +615,7 @@
         "sqlite3": {
           "engine": "sqlite3",
           "family": "filter_sum",
-          "median_us": 155.833,
+          "median_us": 153.375,
           "n_rows": 10000,
           "path": "benchmarks/results/latest/scale-sweep/raw/filter_sum_10k_i64-sqlite3.json",
           "samples": 16,
@@ -468,7 +625,7 @@
         "ultrasql": {
           "engine": "ultrasql",
           "family": "filter_sum",
-          "median_us": 62.375,
+          "median_us": 70.33300000000001,
           "n_rows": 10000,
           "path": "benchmarks/results/latest/scale-sweep/raw/filter_sum_10k_i64-ultrasql.json",
           "samples": 16,
@@ -477,7 +634,7 @@
         }
       },
       "fastest_engine": "ultrasql",
-      "fastest_median_us": 62.375,
+      "fastest_median_us": 70.33300000000001,
       "n_rows": 10000,
       "workload": "filter_sum",
       "workload_label": "Filter + SUM"
@@ -487,7 +644,7 @@
         "duckdb": {
           "engine": "duckdb",
           "family": "filter_sum",
-          "median_us": 141.187,
+          "median_us": 136.624,
           "n_rows": 100000,
           "path": "benchmarks/results/latest/scale-sweep/raw/filter_sum_100k_i64-duckdb.json",
           "samples": 16,
@@ -497,7 +654,7 @@
         "postgres17": {
           "engine": "postgres17",
           "family": "filter_sum",
-          "median_us": 36039.563,
+          "median_us": 37061.729,
           "n_rows": 100000,
           "path": "benchmarks/results/latest/scale-sweep/raw/filter_sum_100k_i64-postgres17.json",
           "samples": 16,
@@ -507,7 +664,7 @@
         "sqlite3": {
           "engine": "sqlite3",
           "family": "filter_sum",
-          "median_us": 1568.083,
+          "median_us": 1597.792,
           "n_rows": 100000,
           "path": "benchmarks/results/latest/scale-sweep/raw/filter_sum_100k_i64-sqlite3.json",
           "samples": 16,
@@ -517,7 +674,7 @@
         "ultrasql": {
           "engine": "ultrasql",
           "family": "filter_sum",
-          "median_us": 71.5,
+          "median_us": 73.375,
           "n_rows": 100000,
           "path": "benchmarks/results/latest/scale-sweep/raw/filter_sum_100k_i64-ultrasql.json",
           "samples": 16,
@@ -526,7 +683,7 @@
         }
       },
       "fastest_engine": "ultrasql",
-      "fastest_median_us": 71.5,
+      "fastest_median_us": 73.375,
       "n_rows": 100000,
       "workload": "filter_sum",
       "workload_label": "Filter + SUM"
@@ -536,7 +693,7 @@
         "duckdb": {
           "engine": "duckdb",
           "family": "filter_sum",
-          "median_us": 180.563,
+          "median_us": 186.0,
           "n_rows": 1000000,
           "path": "benchmarks/results/latest/scale-sweep/raw/filter_sum_1m_i64-duckdb.json",
           "samples": 16,
@@ -546,7 +703,7 @@
         "postgres17": {
           "engine": "postgres17",
           "family": "filter_sum",
-          "median_us": 40149.813,
+          "median_us": 41282.25,
           "n_rows": 1000000,
           "path": "benchmarks/results/latest/scale-sweep/raw/filter_sum_1m_i64-postgres17.json",
           "samples": 16,
@@ -556,7 +713,7 @@
         "sqlite3": {
           "engine": "sqlite3",
           "family": "filter_sum",
-          "median_us": 15798.521,
+          "median_us": 16393.75,
           "n_rows": 1000000,
           "path": "benchmarks/results/latest/scale-sweep/raw/filter_sum_1m_i64-sqlite3.json",
           "samples": 16,
@@ -566,7 +723,7 @@
         "ultrasql": {
           "engine": "ultrasql",
           "family": "filter_sum",
-          "median_us": 64.5,
+          "median_us": 63.87499999999999,
           "n_rows": 1000000,
           "path": "benchmarks/results/latest/scale-sweep/raw/filter_sum_1m_i64-ultrasql.json",
           "samples": 16,
@@ -575,7 +732,7 @@
         }
       },
       "fastest_engine": "ultrasql",
-      "fastest_median_us": 64.5,
+      "fastest_median_us": 63.87499999999999,
       "n_rows": 1000000,
       "workload": "filter_sum",
       "workload_label": "Filter + SUM"
@@ -585,7 +742,7 @@
         "duckdb": {
           "engine": "duckdb",
           "family": "update_throughput",
-          "median_us": 167.583,
+          "median_us": 171.354,
           "n_rows": 10000,
           "path": "benchmarks/results/latest/scale-sweep/raw/update_throughput_10k-duckdb.json",
           "samples": 16,
@@ -595,7 +752,7 @@
         "postgres17": {
           "engine": "postgres17",
           "family": "update_throughput",
-          "median_us": 42240.541,
+          "median_us": 44334.771,
           "n_rows": 10000,
           "path": "benchmarks/results/latest/scale-sweep/raw/update_throughput_10k-postgres17.json",
           "samples": 16,
@@ -605,7 +762,7 @@
         "sqlite3": {
           "engine": "sqlite3",
           "family": "update_throughput",
-          "median_us": 418.167,
+          "median_us": 407.625,
           "n_rows": 10000,
           "path": "benchmarks/results/latest/scale-sweep/raw/update_throughput_10k-sqlite3.json",
           "samples": 16,
@@ -615,7 +772,7 @@
         "ultrasql": {
           "engine": "ultrasql",
           "family": "update_throughput",
-          "median_us": 109.75,
+          "median_us": 120.667,
           "n_rows": 10000,
           "path": "benchmarks/results/latest/scale-sweep/raw/update_throughput_10k-ultrasql.json",
           "samples": 16,
@@ -624,7 +781,7 @@
         }
       },
       "fastest_engine": "ultrasql",
-      "fastest_median_us": 109.75,
+      "fastest_median_us": 120.667,
       "n_rows": 10000,
       "workload": "update_throughput",
       "workload_label": "UPDATE throughput"
@@ -634,7 +791,7 @@
         "duckdb": {
           "engine": "duckdb",
           "family": "update_throughput",
-          "median_us": 773.104,
+          "median_us": 778.499,
           "n_rows": 100000,
           "path": "benchmarks/results/latest/scale-sweep/raw/update_throughput_100k-duckdb.json",
           "samples": 16,
@@ -644,7 +801,7 @@
         "postgres17": {
           "engine": "postgres17",
           "family": "update_throughput",
-          "median_us": 159750.25,
+          "median_us": 172340.104,
           "n_rows": 100000,
           "path": "benchmarks/results/latest/scale-sweep/raw/update_throughput_100k-postgres17.json",
           "samples": 16,
@@ -654,7 +811,7 @@
         "sqlite3": {
           "engine": "sqlite3",
           "family": "update_throughput",
-          "median_us": 4158.646,
+          "median_us": 4205.479,
           "n_rows": 100000,
           "path": "benchmarks/results/latest/scale-sweep/raw/update_throughput_100k-sqlite3.json",
           "samples": 16,
@@ -664,7 +821,7 @@
         "ultrasql": {
           "engine": "ultrasql",
           "family": "update_throughput",
-          "median_us": 434.83299999999997,
+          "median_us": 429.875,
           "n_rows": 100000,
           "path": "benchmarks/results/latest/scale-sweep/raw/update_throughput_100k-ultrasql.json",
           "samples": 16,
@@ -673,7 +830,7 @@
         }
       },
       "fastest_engine": "ultrasql",
-      "fastest_median_us": 434.83299999999997,
+      "fastest_median_us": 429.875,
       "n_rows": 100000,
       "workload": "update_throughput",
       "workload_label": "UPDATE throughput"
@@ -683,7 +840,7 @@
         "duckdb": {
           "engine": "duckdb",
           "family": "update_throughput",
-          "median_us": 2212.125,
+          "median_us": 2148.792,
           "n_rows": 1000000,
           "path": "benchmarks/results/latest/scale-sweep/raw/update_throughput_1m-duckdb.json",
           "samples": 16,
@@ -693,7 +850,7 @@
         "postgres17": {
           "engine": "postgres17",
           "family": "update_throughput",
-          "median_us": 1923446.729,
+          "median_us": 1953675.23,
           "n_rows": 1000000,
           "path": "benchmarks/results/latest/scale-sweep/raw/update_throughput_1m-postgres17.json",
           "samples": 16,
@@ -703,7 +860,7 @@
         "sqlite3": {
           "engine": "sqlite3",
           "family": "update_throughput",
-          "median_us": 45390.417,
+          "median_us": 42392.687,
           "n_rows": 1000000,
           "path": "benchmarks/results/latest/scale-sweep/raw/update_throughput_1m-sqlite3.json",
           "samples": 16,
@@ -713,7 +870,7 @@
         "ultrasql": {
           "engine": "ultrasql",
           "family": "update_throughput",
-          "median_us": 3940.542,
+          "median_us": 2101.2079999999996,
           "n_rows": 1000000,
           "path": "benchmarks/results/latest/scale-sweep/raw/update_throughput_1m-ultrasql.json",
           "samples": 16,
@@ -721,11 +878,256 @@
           "workload": "update_throughput_1m"
         }
       },
-      "fastest_engine": "duckdb",
-      "fastest_median_us": 2212.125,
+      "fastest_engine": "ultrasql",
+      "fastest_median_us": 2101.2079999999996,
       "n_rows": 1000000,
       "workload": "update_throughput",
       "workload_label": "UPDATE throughput"
+    },
+    {
+      "engines": {
+        "duckdb": {
+          "engine": "duckdb",
+          "family": "delete_throughput",
+          "median_us": 2080.979,
+          "n_rows": 10000,
+          "path": "benchmarks/results/latest/scale-sweep/raw/delete_throughput_10k-duckdb.json",
+          "samples": 16,
+          "server_mode": null,
+          "workload": "delete_throughput_10k"
+        },
+        "postgres17": {
+          "engine": "postgres17",
+          "family": "delete_throughput",
+          "median_us": 21566.104,
+          "n_rows": 10000,
+          "path": "benchmarks/results/latest/scale-sweep/raw/delete_throughput_10k-postgres17.json",
+          "samples": 16,
+          "server_mode": null,
+          "workload": "delete_throughput_10k"
+        },
+        "sqlite3": {
+          "engine": "sqlite3",
+          "family": "delete_throughput",
+          "median_us": 538.625,
+          "n_rows": 10000,
+          "path": "benchmarks/results/latest/scale-sweep/raw/delete_throughput_10k-sqlite3.json",
+          "samples": 16,
+          "server_mode": null,
+          "workload": "delete_throughput_10k"
+        },
+        "ultrasql": {
+          "engine": "ultrasql",
+          "family": "delete_throughput",
+          "median_us": 167.333,
+          "n_rows": 10000,
+          "path": "benchmarks/results/latest/scale-sweep/raw/delete_throughput_10k-ultrasql.json",
+          "samples": 16,
+          "server_mode": "external",
+          "workload": "delete_throughput_10k"
+        }
+      },
+      "fastest_engine": "ultrasql",
+      "fastest_median_us": 167.333,
+      "n_rows": 10000,
+      "workload": "delete_throughput",
+      "workload_label": "DELETE throughput"
+    },
+    {
+      "engines": {
+        "duckdb": {
+          "engine": "duckdb",
+          "family": "delete_throughput",
+          "median_us": 19898.833,
+          "n_rows": 100000,
+          "path": "benchmarks/results/latest/scale-sweep/raw/delete_throughput_100k-duckdb.json",
+          "samples": 16,
+          "server_mode": null,
+          "workload": "delete_throughput_100k"
+        },
+        "postgres17": {
+          "engine": "postgres17",
+          "family": "delete_throughput",
+          "median_us": 37017.583,
+          "n_rows": 100000,
+          "path": "benchmarks/results/latest/scale-sweep/raw/delete_throughput_100k-postgres17.json",
+          "samples": 16,
+          "server_mode": null,
+          "workload": "delete_throughput_100k"
+        },
+        "sqlite3": {
+          "engine": "sqlite3",
+          "family": "delete_throughput",
+          "median_us": 5883.187,
+          "n_rows": 100000,
+          "path": "benchmarks/results/latest/scale-sweep/raw/delete_throughput_100k-sqlite3.json",
+          "samples": 16,
+          "server_mode": null,
+          "workload": "delete_throughput_100k"
+        },
+        "ultrasql": {
+          "engine": "ultrasql",
+          "family": "delete_throughput",
+          "median_us": 724.583,
+          "n_rows": 100000,
+          "path": "benchmarks/results/latest/scale-sweep/raw/delete_throughput_100k-ultrasql.json",
+          "samples": 16,
+          "server_mode": "external",
+          "workload": "delete_throughput_100k"
+        }
+      },
+      "fastest_engine": "ultrasql",
+      "fastest_median_us": 724.583,
+      "n_rows": 100000,
+      "workload": "delete_throughput",
+      "workload_label": "DELETE throughput"
+    },
+    {
+      "engines": {
+        "duckdb": {
+          "engine": "duckdb",
+          "family": "delete_throughput",
+          "median_us": 220817.0,
+          "n_rows": 1000000,
+          "path": "benchmarks/results/latest/scale-sweep/raw/delete_throughput_1m-duckdb.json",
+          "samples": 16,
+          "server_mode": null,
+          "workload": "delete_throughput_1m"
+        },
+        "postgres17": {
+          "engine": "postgres17",
+          "family": "delete_throughput",
+          "median_us": 186190.313,
+          "n_rows": 1000000,
+          "path": "benchmarks/results/latest/scale-sweep/raw/delete_throughput_1m-postgres17.json",
+          "samples": 16,
+          "server_mode": null,
+          "workload": "delete_throughput_1m"
+        },
+        "sqlite3": {
+          "engine": "sqlite3",
+          "family": "delete_throughput",
+          "median_us": 59432.792,
+          "n_rows": 1000000,
+          "path": "benchmarks/results/latest/scale-sweep/raw/delete_throughput_1m-sqlite3.json",
+          "samples": 16,
+          "server_mode": null,
+          "workload": "delete_throughput_1m"
+        },
+        "ultrasql": {
+          "engine": "ultrasql",
+          "family": "delete_throughput",
+          "median_us": 6292.792,
+          "n_rows": 1000000,
+          "path": "benchmarks/results/latest/scale-sweep/raw/delete_throughput_1m-ultrasql.json",
+          "samples": 16,
+          "server_mode": "external",
+          "workload": "delete_throughput_1m"
+        }
+      },
+      "fastest_engine": "ultrasql",
+      "fastest_median_us": 6292.792,
+      "n_rows": 1000000,
+      "workload": "delete_throughput",
+      "workload_label": "DELETE throughput"
+    },
+    {
+      "engines": {
+        "duckdb": {
+          "engine": "duckdb",
+          "family": "mixed_oltp_pgbench_like",
+          "median_us": 1261.064,
+          "n_rows": 10000,
+          "path": "benchmarks/results/latest/scale-sweep/raw/mixed_oltp_pgbench_like-duckdb.json",
+          "samples": 16,
+          "server_mode": null,
+          "workload": "mixed_oltp_pgbench_like"
+        },
+        "postgres17": {
+          "engine": "postgres17",
+          "family": "mixed_oltp_pgbench_like",
+          "median_us": 11299.796,
+          "n_rows": 10000,
+          "path": "benchmarks/results/latest/scale-sweep/raw/mixed_oltp_pgbench_like-postgres17.json",
+          "samples": 16,
+          "server_mode": null,
+          "workload": "mixed_oltp_pgbench_like"
+        },
+        "sqlite3": {
+          "engine": "sqlite3",
+          "family": "mixed_oltp_pgbench_like",
+          "median_us": 354.824,
+          "n_rows": 10000,
+          "path": "benchmarks/results/latest/scale-sweep/raw/mixed_oltp_pgbench_like-sqlite3.json",
+          "samples": 16,
+          "server_mode": null,
+          "workload": "mixed_oltp_pgbench_like"
+        },
+        "ultrasql": {
+          "engine": "ultrasql",
+          "family": "mixed_oltp_pgbench_like",
+          "median_us": 168.95778425409696,
+          "n_rows": 10000,
+          "path": "benchmarks/results/latest/scale-sweep/raw/mixed_oltp_pgbench_like-ultrasql.json",
+          "samples": 16,
+          "server_mode": "external",
+          "workload": "mixed_oltp_pgbench_like"
+        }
+      },
+      "fastest_engine": "ultrasql",
+      "fastest_median_us": 168.95778425409696,
+      "n_rows": 10000,
+      "workload": "mixed_oltp_pgbench_like",
+      "workload_label": "Mixed OLTP"
+    },
+    {
+      "engines": {
+        "duckdb": {
+          "engine": "duckdb",
+          "family": "window_row_number",
+          "median_us": 7319.062,
+          "n_rows": 65536,
+          "path": "benchmarks/results/latest/scale-sweep/raw/window_row_number_65k_i64-duckdb.json",
+          "samples": 16,
+          "server_mode": null,
+          "workload": "window_row_number_65k_i64"
+        },
+        "postgres17": {
+          "engine": "postgres17",
+          "family": "window_row_number",
+          "median_us": 53096.687,
+          "n_rows": 65536,
+          "path": "benchmarks/results/latest/scale-sweep/raw/window_row_number_65k_i64-postgres17.json",
+          "samples": 16,
+          "server_mode": null,
+          "workload": "window_row_number_65k_i64"
+        },
+        "sqlite3": {
+          "engine": "sqlite3",
+          "family": "window_row_number",
+          "median_us": 30043.749,
+          "n_rows": 65536,
+          "path": "benchmarks/results/latest/scale-sweep/raw/window_row_number_65k_i64-sqlite3.json",
+          "samples": 16,
+          "server_mode": null,
+          "workload": "window_row_number_65k_i64"
+        },
+        "ultrasql": {
+          "engine": "ultrasql",
+          "family": "window_row_number",
+          "median_us": 4692.458,
+          "n_rows": 65536,
+          "path": "benchmarks/results/latest/scale-sweep/raw/window_row_number_65k_i64-ultrasql.json",
+          "samples": 16,
+          "server_mode": "external",
+          "workload": "window_row_number_65k_i64"
+        }
+      },
+      "fastest_engine": "ultrasql",
+      "fastest_median_us": 4692.458,
+      "n_rows": 65536,
+      "workload": "window_row_number",
+      "workload_label": "Window row_number()"
     }
   ],
   "schema_version": 1

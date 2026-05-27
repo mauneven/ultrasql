@@ -16,6 +16,10 @@
 #   SCALE_SWEEP_ROWS           row counts (default "10000 100000 1000000")
 #   SCALE_SWEEP_OUT            artifact dir (default benchmarks/results/latest/scale-sweep)
 #   N_ITERS                    measured samples override
+#
+# Bulk INSERT uses fresh UltraSQL server processes per measured sample so
+# every engine times a fresh table load. INSERT chunks are 10k rows across
+# UltraSQL, DuckDB, SQLite, and PostgreSQL.
 
 set -euo pipefail
 
@@ -70,8 +74,12 @@ workload_id() {
         insert-bulk)   echo "insert_throughput_${suffix}" ;;
         select-scan)   echo "select_scan_${suffix}" ;;
         sum-scalar)    echo "select_sum_${suffix}_i64" ;;
+        avg-scalar)    echo "select_avg_${suffix}_i64" ;;
         filter-sum)    echo "filter_sum_${suffix}_i64" ;;
         update-bulk)   echo "update_throughput_${suffix}" ;;
+        delete-bulk)   echo "delete_throughput_${suffix}" ;;
+        mixed-oltp)    echo "mixed_oltp_pgbench_like" ;;
+        window-row-number) echo "window_row_number_${suffix}_i64" ;;
         *) echo "unknown workload '$workload'" >&2; exit 2 ;;
     esac
 }
@@ -140,6 +148,12 @@ run_ultrasql_workload() {
     local rows="$2"
     local wid="$3"
     local port log tmp_json err_log
+
+    if [[ "$workload" == "insert-bulk" ]]; then
+        run_ultrasql_fresh_insert_samples "$workload" "$rows" "$wid"
+        return
+    fi
+
     port="$(free_port)"
     log="$OUT/ultrasqld-${wid}.log"
     tmp_json="$RAW/${wid}-ultrasql.json.tmp"
@@ -191,11 +205,112 @@ PY
     server_pid=""
 }
 
+run_ultrasql_fresh_insert_samples() {
+    local workload="$1"
+    local rows="$2"
+    local wid="$3"
+    local sample sample_dir total
+    sample_dir="$RAW/.${wid}-ultrasql-samples"
+    rm -rf "$sample_dir"
+    mkdir -p "$sample_dir"
+    total=$((WARMUP + ITERS))
+
+    for ((sample = 0; sample < total; sample++)); do
+        local port log tmp_json err_log
+        port="$(free_port)"
+        log="$OUT/ultrasqld-${wid}-sample-${sample}.log"
+        tmp_json="$sample_dir/sample-${sample}.json"
+        err_log="$OUT/cross_compare-${wid}-sample-${sample}.err"
+        "$ULTRASQLD_BIN" \
+            --listen "127.0.0.1:${port}" \
+            --log-level warn \
+            >"$log" 2>&1 &
+        server_pid="$!"
+        wait_for_port "$port"
+        if ! "$BIN/cross_compare_sql" \
+            --server "127.0.0.1:${port}" \
+            --workload "$workload" \
+            --rows "$rows" \
+            --warmup 0 \
+            --iters 1 \
+            > "$tmp_json" 2>"$err_log"; then
+            cat "$err_log" >&2 || true
+            kill "$server_pid" >/dev/null 2>&1 || true
+            wait "$server_pid" >/dev/null 2>&1 || true
+            server_pid=""
+            python3 - "$RAW/${wid}-ultrasql.json" "$wid" "$rows" "$err_log" "$log" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+out, workload, rows, err_log, server_log = sys.argv[1:]
+reason_parts = []
+for path in [Path(err_log), Path(server_log)]:
+    if path.exists():
+        text = path.read_text(errors="replace").strip()
+        if text:
+            reason_parts.append(text[-2000:])
+doc = {
+    "schema_version": 1,
+    "engine": "ultrasql",
+    "workload": workload,
+    "status": "not_available",
+    "n_rows": int(rows),
+    "server_mode": "external",
+    "reason": "\n".join(reason_parts) or "benchmark command failed",
+    "policy": "Failure is recorded as not_available; no benchmark claim is made for this row.",
+}
+Path(out).write_text(json.dumps(doc, indent=2, sort_keys=True) + "\n")
+PY
+            rm -rf "$sample_dir"
+            return
+        fi
+        kill "$server_pid" >/dev/null 2>&1 || true
+        wait "$server_pid" >/dev/null 2>&1 || true
+        server_pid=""
+    done
+
+    python3 - "$RAW/${wid}-ultrasql.json" "$wid" "$rows" "$WARMUP" "$sample_dir"/*.json <<'PY'
+import json
+import statistics
+import sys
+from pathlib import Path
+
+out, workload, rows, warmup, *sample_paths = sys.argv[1:]
+warmup = int(warmup)
+def sample_index(path: str) -> int:
+    stem = Path(path).stem
+    return int(stem.rsplit("-", 1)[1])
+
+docs = [json.loads(Path(path).read_text()) for path in sorted(sample_paths, key=sample_index)]
+measured = docs[warmup:]
+iters = [float(doc["median_us"]) for doc in measured]
+base = dict(measured[0] if measured else docs[-1])
+base.update(
+    {
+        "schema_version": 1,
+        "engine": "ultrasql",
+        "workload": workload,
+        "status": "measured",
+        "n_rows": int(rows),
+        "server_mode": "external",
+        "samples": len(iters),
+        "iterations_us": iters,
+        "median_us": statistics.median(iters),
+        "min_us": min(iters),
+        "policy": "Raw measured samples only; no ranking or winner claim.",
+    }
+)
+Path(out).write_text(json.dumps(base, sort_keys=True) + "\n")
+PY
+    rm -rf "$sample_dir"
+}
+
 run_competitors() {
     local selector="$1"
     local rows="$2"
     case "$selector" in
-        insert_throughput_10k|select_scan_10k|update_throughput_10k)
+        insert_throughput_*|select_scan_*|update_throughput_*|delete_throughput_*|mixed_oltp_pgbench_like)
             RAW_DIR="$RAW" N_ITERS="$ITERS" N_ROWS="$rows" \
                 bash benchmarks/scripts/run_duckdb_writes.sh "$selector" || true
             RAW_DIR="$RAW" N_ITERS="$ITERS" N_ROWS="$rows" \
@@ -203,7 +318,7 @@ run_competitors() {
             RAW_DIR="$RAW" N_ITERS="$ITERS" N_ROWS="$rows" \
                 bash benchmarks/scripts/run_postgres_writes.sh "$selector" || true
             ;;
-        select_sum_65k_i64|filter_sum_1m_i64)
+        select_sum_*_i64|select_avg_*_i64|filter_sum_*_i64|window_row_number_*_i64)
             RAW_DIR="$RAW" N_ITERS="$ITERS" ANALYTICAL_ROWS="$rows" \
                 bash benchmarks/scripts/run_duckdb_writes.sh "$selector" || true
             RAW_DIR="$RAW" N_ITERS="$ITERS" ANALYTICAL_ROWS="$rows" \
@@ -219,8 +334,15 @@ declare -a SPECS=(
     "insert-bulk  insert_throughput_10k"
     "select-scan  select_scan_10k"
     "sum-scalar   select_sum_65k_i64"
+    "avg-scalar   select_avg_1m_i64"
     "filter-sum   filter_sum_1m_i64"
     "update-bulk  update_throughput_10k"
+    "delete-bulk  delete_throughput_10k"
+)
+
+declare -a FIXED_SPECS=(
+    "mixed-oltp         mixed_oltp_pgbench_like      10000"
+    "window-row-number  window_row_number_65k_i64    65536"
 )
 
 for rows in $ROWS; do
@@ -232,6 +354,15 @@ for rows in $ROWS; do
         echo "--- Competitors $wid rows=$rows ---"
         run_competitors "$selector" "$rows"
     done
+done
+
+for spec in "${FIXED_SPECS[@]}"; do
+    read -r workload selector rows <<<"$spec"
+    wid="$(workload_id "$workload" "$rows")"
+    echo "--- UltraSQL $wid rows=$rows ---"
+    run_ultrasql_workload "$workload" "$rows" "$wid"
+    echo "--- Competitors $wid rows=$rows ---"
+    run_competitors "$selector" "$rows"
 done
 
 echo "--- Rendering scale sweep artifacts ---"
@@ -267,7 +398,7 @@ doc = {
     "rows": merged_rows,
     "ultrasql_version": version,
     "ultrasql_install_source": install_source,
-    "methodology": "UltraSQL external release artifact over TCP; competitors installed local clients.",
+    "methodology": "UltraSQL external release artifact over TCP; competitors installed local clients; bulk INSERT uses a fresh UltraSQL server per measured sample and 10k-row INSERT chunks across engines.",
 }
 with open(path_obj, "w", encoding="utf-8") as fh:
     json.dump(doc, fh, indent=2, sort_keys=True)

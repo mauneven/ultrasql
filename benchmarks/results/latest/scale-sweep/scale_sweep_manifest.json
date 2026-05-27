@@ -1,6 +1,6 @@
 {
   "iters": 16,
-  "methodology": "UltraSQL external release artifact over TCP; competitors installed local clients.",
+  "methodology": "UltraSQL external release artifact over TCP; competitors installed local clients; bulk INSERT uses a fresh UltraSQL server per measured sample and 10k-row INSERT chunks across engines.",
   "mode": "full",
   "rows": [
     10000,
@@ -8,7 +8,7 @@
     1000000
   ],
   "schema_version": 1,
-  "ultrasql_install_source": "scripts/install.sh latest",
+  "ultrasql_install_source": "ULTRASQLD_BIN",
   "ultrasql_version": "ultrasqld 0.0.6",
   "warmup": 2
 }

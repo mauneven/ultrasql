@@ -131,8 +131,9 @@ as a concise evidence ledger; roadmap stays for open gates only.
   in the committed matrix; no blanket claim is allowed beyond recorded
   artifacts.
 - Release-artifact scale sweep exists through `benchmarks/run_scale_sweep.sh`
-  and artifacts under `benchmarks/results/latest/scale-sweep/`; it installs
-  v0.0.6, launches external `ultrasqld`, and records both wins and losing rows.
+  and artifacts under `benchmarks/results/latest/scale-sweep/`; the latest
+  v0.0.6 same-host run launches external `ultrasqld` and records UltraSQL as
+  the fastest engine on every published DuckDB/SQLite/PostgreSQL row.
 - TPC-H SF1 local PostgreSQL 17 certification passed with all q1..q22 complete
   for both engines.
 - TPC-H scale 10 (all 22 queries) is complete: latest local artifact

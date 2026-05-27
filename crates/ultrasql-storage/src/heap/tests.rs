@@ -779,6 +779,60 @@ fn rollback_inplace_int32_update_restores_compact_undo_batch() {
 }
 
 #[test]
+fn parallel_no_wal_inplace_int32_update_records_undo_and_rolls_back() {
+    let heap = make_heap(4096);
+    let tids = (0_i32..4)
+        .map(|id| {
+            heap.insert(rel(), &int32_pair_payload(id, id * 10), opts(10))
+                .unwrap()
+        })
+        .collect::<Vec<_>>();
+
+    let oracle = MapOracle::new();
+    oracle.set_committed(Xid::new(10));
+    oracle.set_in_progress(Xid::new(20));
+    let writer_20 = Snapshot::new(
+        Xid::new(10),
+        Xid::new(100),
+        Xid::new(20),
+        CommandId::FIRST,
+        std::iter::empty(),
+    );
+    let updated = heap
+        .update_int32_pair_inplace_undo_parallel_no_wal(
+            rel(),
+            2_048,
+            &writer_20,
+            &oracle,
+            |_id, _val| true,
+            1,
+            7,
+            Xid::new(20),
+            CommandId::FIRST,
+            None,
+        )
+        .unwrap();
+
+    assert_eq!(updated, 4);
+    assert_eq!(heap.int32_pair_undo_batch_len(rel()), 1);
+    for (idx, tid) in tids.iter().enumerate() {
+        let id = i32::try_from(idx).unwrap();
+        assert_eq!(
+            heap.fetch(*tid).unwrap().data,
+            int32_pair_payload(id, id * 10 + 7)
+        );
+    }
+    assert_eq!(heap.rollback_in_place_updates(Xid::new(20)).unwrap(), 4);
+    for (idx, tid) in tids.iter().enumerate() {
+        let id = i32::try_from(idx).unwrap();
+        assert_eq!(
+            heap.fetch(*tid).unwrap().data,
+            int32_pair_payload(id, id * 10)
+        );
+    }
+}
+
+#[test]
 fn point_inplace_int32_update_rechecks_tid_predicate() {
     let heap = make_heap(8);
     let first = heap
