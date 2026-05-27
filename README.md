@@ -164,6 +164,7 @@ fuzz/         parser, wire, WAL, and planner fuzz targets
 - [DONE.md](DONE.md) - completed milestones and evidence ledger.
 - [docs/getting-started.md](docs/getting-started.md) - local first steps.
 - [docs/install.md](docs/install.md) - release archives, package managers, and source build.
+- [docs/ai-database-strategy.md](docs/ai-database-strategy.md) - DuckDB/ClickHouse parity map and AI memory engine plan.
 - [docs/packaging.md](docs/packaging.md) - Docker, npm, Homebrew, AUR, Chocolatey, Debian, RPM.
 - [docs/known-incompatibilities.md](docs/known-incompatibilities.md) - current PostgreSQL gaps.
 - [docs/release-checklist.md](docs/release-checklist.md) - release evidence.

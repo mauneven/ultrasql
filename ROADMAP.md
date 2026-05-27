@@ -120,6 +120,10 @@ file focused on what still blocks production.
 
 ### AI Gauntlet
 
+- AI memory engine: implement the strategy in
+  `docs/ai-database-strategy.md` as a PostgreSQL-wire table surface that
+  combines MVCC state, columnar shadow scans, BM25, vector ANN, JSON metadata,
+  tenant/time projections, and auditable `EXPLAIN ANALYZE` path evidence.
 - Expand `AI gauntlet measured artifacts`: `exact top-k`,
   `HNSW ANN recall/latency`, `hybrid search latency`, `filtered vector search`,
   `RAG retrieval quality`, `memory per million vectors`, `ingestion throughput`,
