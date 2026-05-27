@@ -30,10 +30,21 @@ esac
 
 if [ "$version" = "latest" ]; then
   version="$(
-    curl -fsSL "https://api.github.com/repos/${repo}/releases/latest" \
-      | sed -n 's/.*"tag_name":[[:space:]]*"\([^"]*\)".*/\1/p' \
-      | head -n 1
+    {
+      curl -fsSL "https://api.github.com/repos/${repo}/releases/latest" 2>/dev/null \
+        | sed -n 's/.*"tag_name":[[:space:]]*"\([^"]*\)".*/\1/p' \
+        | head -n 1
+    } || true
   )"
+  if [ -z "$version" ]; then
+    version="$(
+      {
+        curl -fsSL "https://api.github.com/repos/${repo}/tags" 2>/dev/null \
+          | sed -n 's/.*"name":[[:space:]]*"\(v[0-9][^"]*\)".*/\1/p' \
+          | head -n 1
+      } || true
+    )"
+  fi
 fi
 
 if [ -z "$version" ]; then

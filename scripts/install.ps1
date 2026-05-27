@@ -16,8 +16,14 @@ switch ($arch) {
 }
 
 if ($Version -eq "latest") {
-    $latest = Invoke-RestMethod -Uri "https://api.github.com/repos/$Repo/releases/latest"
-    $Version = $latest.tag_name
+    try {
+        $latest = Invoke-RestMethod -Uri "https://api.github.com/repos/$Repo/releases/latest"
+        $Version = $latest.tag_name
+    }
+    catch {
+        $tags = Invoke-RestMethod -Uri "https://api.github.com/repos/$Repo/tags"
+        $Version = ($tags | Where-Object { $_.name -match '^v[0-9]' } | Select-Object -First 1).name
+    }
 }
 
 if ([string]::IsNullOrWhiteSpace($Version)) {

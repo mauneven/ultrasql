@@ -120,3 +120,48 @@ jobs:
             benchmarks/results/latest/ai_benchmark_gauntlet_manifest.json
             benchmarks/results/latest/benchmark_certification_manifest.json
             benchmarks/results/latest/raw/
+
+  # -------------------------------------------------------------------
+  # Release-artifact scale sweep. This proves the published archive can be
+  # installed, launched as ultrasqld, and benchmarked over TCP against local
+  # installed engines. It is not a PR gate because it depends on the latest
+  # GitHub Release and package-manager setup.
+  # -------------------------------------------------------------------
+  release-artifact-sweep:
+    name: release artifact scale sweep
+    runs-on: macos-14
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: install local comparison engines
+        shell: bash
+        run: |
+          brew update
+          brew install duckdb sqlite postgresql@14
+          echo "$(brew --prefix postgresql@14)/bin" >> "$GITHUB_PATH"
+      - name: start PostgreSQL
+        shell: bash
+        run: |
+          pg_bin="$(brew --prefix postgresql@14)/bin"
+          data="$RUNNER_TEMP/ultrasql-postgres"
+          "$pg_bin/initdb" -D "$data" --username runner >/dev/null
+          "$pg_bin/pg_ctl" -D "$data" -o "-h 127.0.0.1 -p 55432" -w start
+          createdb -h 127.0.0.1 -p 55432 -U runner ultrasql_bench
+      - name: run release artifact scale sweep
+        shell: bash
+        env:
+          PGHOST: 127.0.0.1
+          PGPORT: 55432
+          PGUSER: runner
+          PGDATABASE: ultrasql_bench
+          SCALE_SWEEP_ROWS: "10000 100000"
+        run: benchmarks/run_scale_sweep.sh quick
+      - name: upload scale sweep artifacts
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: release-artifact-scale-sweep
+          path: benchmarks/results/latest/scale-sweep/

@@ -1,0 +1,277 @@
+#!/usr/bin/env bash
+# Release-artifact DB-vs-DB scale sweep.
+#
+# UltraSQL is measured as an external `ultrasqld` binary over TCP. If
+# ULTRASQLD_BIN is unset, this script installs a GitHub Release archive into a
+# temporary directory through scripts/install.sh, then benchmarks that binary.
+# Competitors use installed local clients and the same raw artifact schema.
+#
+# Usage:
+#   benchmarks/run_scale_sweep.sh quick
+#   benchmarks/run_scale_sweep.sh full
+#
+# Environment:
+#   ULTRASQLD_BIN              path to an existing release ultrasqld binary
+#   ULTRASQL_RELEASE_VERSION   release tag for scripts/install.sh (default latest)
+#   SCALE_SWEEP_ROWS           row counts (default "10000 100000 1000000")
+#   SCALE_SWEEP_OUT            artifact dir (default benchmarks/results/latest/scale-sweep)
+#   N_ITERS                    measured samples override
+
+set -euo pipefail
+
+REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+cd "$REPO_ROOT"
+
+mode="${1:-full}"
+case "$mode" in
+    full)  ITERS="${N_ITERS:-16}"; WARMUP=2 ;;
+    quick) ITERS="${N_ITERS:-4}";  WARMUP=1 ;;
+    *) echo "unknown mode '$mode' (full|quick)" >&2; exit 2 ;;
+esac
+
+OUT="${SCALE_SWEEP_OUT:-benchmarks/results/latest/scale-sweep}"
+RAW="$OUT/raw"
+ROWS="${SCALE_SWEEP_ROWS:-10000 100000 1000000}"
+mkdir -p "$RAW"
+if [[ "${SCALE_SWEEP_APPEND:-0}" != "1" ]]; then
+    rm -f "$RAW"/*.json
+fi
+
+tmp_dir="$(mktemp -d)"
+server_pid=""
+cleanup() {
+    if [[ -n "${server_pid:-}" ]] && kill -0 "$server_pid" >/dev/null 2>&1; then
+        kill "$server_pid" >/dev/null 2>&1 || true
+        wait "$server_pid" >/dev/null 2>&1 || true
+    fi
+    rm -rf "$tmp_dir"
+}
+trap cleanup EXIT INT TERM
+
+row_suffix() {
+    local rows="$1"
+    if [[ "$rows" -eq 65536 ]]; then
+        echo "65k"
+    elif [[ "$rows" -ge 1000000 && $((rows % 1000000)) -eq 0 ]]; then
+        echo "$((rows / 1000000))m"
+    elif [[ "$rows" -ge 1000 && $((rows % 1000)) -eq 0 ]]; then
+        echo "$((rows / 1000))k"
+    else
+        echo "$rows"
+    fi
+}
+
+workload_id() {
+    local workload="$1"
+    local rows="$2"
+    local suffix
+    suffix="$(row_suffix "$rows")"
+    case "$workload" in
+        insert-bulk)   echo "insert_throughput_${suffix}" ;;
+        select-scan)   echo "select_scan_${suffix}" ;;
+        sum-scalar)    echo "select_sum_${suffix}_i64" ;;
+        filter-sum)    echo "filter_sum_${suffix}_i64" ;;
+        update-bulk)   echo "update_throughput_${suffix}" ;;
+        *) echo "unknown workload '$workload'" >&2; exit 2 ;;
+    esac
+}
+
+free_port() {
+    python3 - <<'PY'
+import socket
+with socket.socket() as s:
+    s.bind(("127.0.0.1", 0))
+    print(s.getsockname()[1])
+PY
+}
+
+wait_for_port() {
+    python3 - "$1" <<'PY'
+import socket
+import sys
+import time
+
+port = int(sys.argv[1])
+deadline = time.time() + 15.0
+last_error = None
+while time.time() < deadline:
+    try:
+        with socket.create_connection(("127.0.0.1", port), timeout=0.2):
+            sys.exit(0)
+    except OSError as exc:
+        last_error = exc
+        time.sleep(0.05)
+print(f"timed out waiting for ultrasqld on 127.0.0.1:{port}: {last_error}", file=sys.stderr)
+sys.exit(1)
+PY
+}
+
+echo "=== scale sweep mode=$mode iters=$ITERS warmup=$WARMUP rows=[$ROWS] ==="
+
+echo "--- Building benchmark driver ---"
+cargo build --release \
+    --package ultrasql-bench \
+    --features sql-bench \
+    --bin cross_compare_sql \
+    --bin results-render
+BIN="target/release"
+
+if [[ -z "${ULTRASQLD_BIN:-}" ]]; then
+    install_dir="$tmp_dir/bin"
+    install_source="scripts/install.sh ${ULTRASQL_RELEASE_VERSION:-latest}"
+    echo "--- Installing UltraSQL release artifact ---"
+    ULTRASQL_INSTALL_DIR="$install_dir" \
+        scripts/install.sh "${ULTRASQL_RELEASE_VERSION:-latest}"
+    ULTRASQLD_BIN="$install_dir/ultrasqld"
+else
+    install_source="ULTRASQLD_BIN"
+fi
+
+if [[ ! -x "$ULTRASQLD_BIN" ]]; then
+    echo "run_scale_sweep.sh: ULTRASQLD_BIN is not executable: $ULTRASQLD_BIN" >&2
+    exit 1
+fi
+
+ULTRASQL_VERSION_TEXT="$("$ULTRASQLD_BIN" --version 2>&1 | head -n 1)"
+echo "--- UltraSQL artifact: $ULTRASQL_VERSION_TEXT ($ULTRASQLD_BIN) ---"
+
+run_ultrasql_workload() {
+    local workload="$1"
+    local rows="$2"
+    local wid="$3"
+    local port log tmp_json err_log
+    port="$(free_port)"
+    log="$OUT/ultrasqld-${wid}.log"
+    tmp_json="$RAW/${wid}-ultrasql.json.tmp"
+    err_log="$OUT/cross_compare-${wid}.err"
+    "$ULTRASQLD_BIN" \
+        --listen "127.0.0.1:${port}" \
+        --log-level warn \
+        >"$log" 2>&1 &
+    server_pid="$!"
+    wait_for_port "$port"
+    if "$BIN/cross_compare_sql" \
+        --server "127.0.0.1:${port}" \
+        --workload "$workload" \
+        --rows "$rows" \
+        --warmup "$WARMUP" \
+        --iters "$ITERS" \
+        > "$tmp_json" 2>"$err_log"; then
+        mv "$tmp_json" "$RAW/${wid}-ultrasql.json"
+    else
+        cat "$err_log" >&2 || true
+        rm -f "$tmp_json"
+        python3 - "$RAW/${wid}-ultrasql.json" "$wid" "$rows" "$err_log" "$log" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+out, workload, rows, err_log, server_log = sys.argv[1:]
+reason_parts = []
+for path in [Path(err_log), Path(server_log)]:
+    if path.exists():
+        text = path.read_text(errors="replace").strip()
+        if text:
+            reason_parts.append(text[-2000:])
+doc = {
+    "schema_version": 1,
+    "engine": "ultrasql",
+    "workload": workload,
+    "status": "not_available",
+    "n_rows": int(rows),
+    "server_mode": "external",
+    "reason": "\n".join(reason_parts) or "benchmark command failed",
+    "policy": "Failure is recorded as not_available; no benchmark claim is made for this row.",
+}
+Path(out).write_text(json.dumps(doc, indent=2, sort_keys=True) + "\n")
+PY
+    fi
+    kill "$server_pid" >/dev/null 2>&1 || true
+    wait "$server_pid" >/dev/null 2>&1 || true
+    server_pid=""
+}
+
+run_competitors() {
+    local selector="$1"
+    local rows="$2"
+    case "$selector" in
+        insert_throughput_10k|select_scan_10k|update_throughput_10k)
+            RAW_DIR="$RAW" N_ITERS="$ITERS" N_ROWS="$rows" \
+                bash benchmarks/scripts/run_duckdb_writes.sh "$selector" || true
+            RAW_DIR="$RAW" N_ITERS="$ITERS" N_ROWS="$rows" \
+                bash benchmarks/scripts/run_sqlite3_writes.sh "$selector" || true
+            RAW_DIR="$RAW" N_ITERS="$ITERS" N_ROWS="$rows" \
+                bash benchmarks/scripts/run_postgres_writes.sh "$selector" || true
+            ;;
+        select_sum_65k_i64|filter_sum_1m_i64)
+            RAW_DIR="$RAW" N_ITERS="$ITERS" ANALYTICAL_ROWS="$rows" \
+                bash benchmarks/scripts/run_duckdb_writes.sh "$selector" || true
+            RAW_DIR="$RAW" N_ITERS="$ITERS" ANALYTICAL_ROWS="$rows" \
+                bash benchmarks/scripts/run_sqlite3_writes.sh "$selector" || true
+            RAW_DIR="$RAW" N_ITERS="$ITERS" ANALYTICAL_ROWS="$rows" \
+                bash benchmarks/scripts/run_postgres_writes.sh "$selector" || true
+            ;;
+        *) echo "run_scale_sweep.sh: unknown competitor selector $selector" >&2; exit 2 ;;
+    esac
+}
+
+declare -a SPECS=(
+    "insert-bulk  insert_throughput_10k"
+    "select-scan  select_scan_10k"
+    "sum-scalar   select_sum_65k_i64"
+    "filter-sum   filter_sum_1m_i64"
+    "update-bulk  update_throughput_10k"
+)
+
+for rows in $ROWS; do
+    for spec in "${SPECS[@]}"; do
+        read -r workload selector <<<"$spec"
+        wid="$(workload_id "$workload" "$rows")"
+        echo "--- UltraSQL $wid rows=$rows ---"
+        run_ultrasql_workload "$workload" "$rows" "$wid"
+        echo "--- Competitors $wid rows=$rows ---"
+        run_competitors "$selector" "$rows"
+    done
+done
+
+echo "--- Rendering scale sweep artifacts ---"
+"$BIN/results-render" \
+    --raw-dir "$RAW" \
+    --output-md "$OUT/results.md" \
+    --output-json "$OUT/results.json"
+
+python3 benchmarks/scripts/render_scale_sweep.py \
+    --raw-dir "$RAW" \
+    --output-md "$OUT/scale_sweep.md" \
+    --output-json "$OUT/scale_sweep.json"
+
+python3 - "$OUT/scale_sweep_manifest.json" "$mode" "$ITERS" "$WARMUP" "$ROWS" "$ULTRASQL_VERSION_TEXT" "$install_source" "${SCALE_SWEEP_APPEND:-0}" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+path, mode, iters, warmup, rows, version, install_source, append = sys.argv[1:]
+path_obj = Path(path)
+existing_rows = []
+if append == "1" and path_obj.exists():
+    try:
+        existing_rows = json.loads(path_obj.read_text()).get("rows", [])
+    except json.JSONDecodeError:
+        existing_rows = []
+merged_rows = sorted(set(int(part) for part in rows.split()) | set(int(row) for row in existing_rows))
+doc = {
+    "schema_version": 1,
+    "mode": mode,
+    "iters": int(iters),
+    "warmup": int(warmup),
+    "rows": merged_rows,
+    "ultrasql_version": version,
+    "ultrasql_install_source": install_source,
+    "methodology": "UltraSQL external release artifact over TCP; competitors installed local clients.",
+}
+with open(path_obj, "w", encoding="utf-8") as fh:
+    json.dump(doc, fh, indent=2, sort_keys=True)
+    fh.write("\n")
+PY
+
+echo "=== Done. Scale sweep in $OUT ==="

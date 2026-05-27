@@ -1,10 +1,11 @@
 //! UltraSQL wire-protocol cross-engine benchmark driver.
 //!
 //! Spawns an in-process `ultrasqld` instance bound to an ephemeral
-//! local TCP port, then drives a workload from the bench harness
-//! through `tokio-postgres` over that real socket. The measurements
-//! are end-to-end: TCP send → server message decode → parser → binder
-//! → catalog snapshot → autocommit transaction → `ModifyTable` /
+//! local TCP port, or connects to an already-running release artifact
+//! with `--server`. It then drives a workload from the bench harness
+//! through `tokio-postgres` over that real socket. The measurements are
+//! end-to-end: TCP send → server message decode → parser → binder →
+//! catalog snapshot → autocommit transaction → `ModifyTable` /
 //! `SeqScan` over real heap pages → `RowDescription`/`DataRow`/
 //! `CommandComplete` encode → TCP receive.
 //!
@@ -415,6 +416,10 @@ struct Args {
     /// Malformed CSV data file for `csv-malformed-behavior`.
     #[arg(long)]
     csv_bad_path: Option<PathBuf>,
+    /// Existing UltraSQL server address to benchmark instead of spawning the
+    /// in-process harness server. Used by release-artifact certification.
+    #[arg(long)]
+    server: Option<SocketAddr>,
 }
 
 #[tokio::main(flavor = "multi_thread", worker_threads = 4)]
@@ -437,24 +442,30 @@ async fn main() -> Result<()> {
         return run_ingestion_throughput_workload(&args, &workload_id).await;
     }
 
-    // Bring up an in-process ultrasqld on an ephemeral port.
-    let bind_addr: SocketAddr = "127.0.0.1:0".parse()?;
-    let (listener, bound) = bind_listener(bind_addr).await.context("bind listener")?;
-    let state = Arc::new(Server::with_sample_database());
-    let _server_thread = std::thread::Builder::new()
-        .name("ultrasql-bench-server".to_string())
-        .spawn(move || {
-            let runtime = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .expect("benchmark server runtime should build");
-            runtime.block_on(async move {
-                if let Err(e) = serve_listener(listener, state).await {
-                    eprintln!("ultrasqld task exited: {e}");
-                }
-            });
-        })
-        .expect("benchmark server thread should spawn");
+    // Bring up an in-process ultrasqld on an ephemeral port unless an
+    // already-running release artifact was supplied.
+    let (bound, _server_thread) = if let Some(server) = args.server {
+        (server, None)
+    } else {
+        let bind_addr: SocketAddr = "127.0.0.1:0".parse()?;
+        let (listener, bound) = bind_listener(bind_addr).await.context("bind listener")?;
+        let state = Arc::new(Server::with_sample_database());
+        let handle = std::thread::Builder::new()
+            .name("ultrasql-bench-server".to_string())
+            .spawn(move || {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("benchmark server runtime should build");
+                runtime.block_on(async move {
+                    if let Err(e) = serve_listener(listener, state).await {
+                        eprintln!("ultrasqld task exited: {e}");
+                    }
+                });
+            })
+            .expect("benchmark server thread should spawn");
+        (bound, Some(handle))
+    };
 
     // Run warmup + measured iterations.
     let mut iters_us: Vec<f64> = Vec::with_capacity(args.iters);
@@ -771,6 +782,8 @@ async fn main() -> Result<()> {
         "min_us": min_us,
         "iterations_us": iters_us,
         "host": HostInfo::from_env(),
+        "server_addr": bound.to_string(),
+        "server_mode": if args.server.is_some() { "external" } else { "in_process" },
         "policy": "Raw measured samples only; no ranking or winner claim.",
     });
     if let Some(answer) = answer {
@@ -2020,10 +2033,17 @@ async fn run_csv_malformed_behavior(
     Ok(answer)
 }
 
+/// Rows packed into each timed INSERT statement for the bulk-insert
+/// benchmark. Competitor scripts use 1 000-row chunks inside one
+/// transaction; matching that shape avoids oversized wire messages and keeps
+/// the benchmark at the SQL/client level instead of measuring one giant parser
+/// payload.
+const INSERT_BENCH_CHUNK_ROWS: usize = 1_000;
+
 /// Run one INSERT iteration: open a fresh wire connection, CREATE a
-/// unique table, run one multi-row INSERT, return elapsed
-/// microseconds of the INSERT (the CREATE is outside the timed
-/// region).
+/// unique table, then insert rows in 1 000-row chunks inside one timed
+/// transaction. The CREATE and SQL string construction are outside the timed
+/// region.
 async fn run_insert_iter(server: SocketAddr, n_rows: usize, ix: usize) -> Result<f64> {
     let conn_str = format!("host=127.0.0.1 port={} user=ultrasql_bench", server.port());
     let (client, connection) = tokio_postgres::connect(&conn_str, NoTls)
@@ -2041,29 +2061,43 @@ async fn run_insert_iter(server: SocketAddr, n_rows: usize, ix: usize) -> Result
         .await
         .with_context(|| format!("CREATE TABLE {table}"))?;
 
-    // Build the multi-row INSERT outside the timed window so the
-    // measurement isolates the server-side cost (parser → planner →
-    // ModifyTable → heap → WAL stub).
-    let mut sql = String::with_capacity(n_rows * 16 + 64);
-    sql.push_str("INSERT INTO ");
-    sql.push_str(&table);
-    sql.push_str(" VALUES ");
-    for j in 0..n_rows {
-        if j > 0 {
+    let mut chunks = Vec::with_capacity(n_rows.div_ceil(INSERT_BENCH_CHUNK_ROWS));
+    let mut start = 0;
+    while start < n_rows {
+        let end = (start + INSERT_BENCH_CHUNK_ROWS).min(n_rows);
+        let mut sql = String::with_capacity((end - start) * 16 + 64);
+        sql.push_str("INSERT INTO ");
+        sql.push_str(&table);
+        sql.push_str(" VALUES ");
+        for j in start..end {
+            if j > start {
+                sql.push(',');
+            }
+            sql.push('(');
+            sql.push_str(&j.to_string());
             sql.push(',');
+            sql.push_str(&(j * 10).to_string());
+            sql.push(')');
         }
-        sql.push('(');
-        sql.push_str(&j.to_string());
-        sql.push(',');
-        sql.push_str(&(j * 10).to_string());
-        sql.push(')');
+        chunks.push(sql);
+        start = end;
     }
 
     let started = Instant::now();
     client
-        .batch_execute(&sql)
+        .batch_execute("BEGIN")
         .await
-        .with_context(|| format!("INSERT INTO {table}"))?;
+        .context("BEGIN insert sample")?;
+    for sql in &chunks {
+        client
+            .batch_execute(sql)
+            .await
+            .with_context(|| format!("INSERT chunk INTO {table}"))?;
+    }
+    client
+        .batch_execute("COMMIT")
+        .await
+        .context("COMMIT insert sample")?;
     let elapsed_us = started.elapsed().as_secs_f64() * 1e6;
 
     drop(client);

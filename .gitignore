@@ -62,6 +62,8 @@ local.toml
 
 # Benchmark artifacts (intermediate; committed results live in benchmarks/results)
 target/criterion/
+benchmarks/results/latest/scale-sweep/*.err
+benchmarks/results/latest/scale-sweep/*.log
 .automation/
 
 # TPC-H local tooling and generated data. dbgen/qgen are external benchmark

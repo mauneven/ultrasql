@@ -148,6 +148,25 @@ Parquet range runs. Firebolt entries use local Firebolt Core Docker only.
 If Docker is absent, the Core image cannot be pulled, or Core does not
 support the required SQL shape, Firebolt entries stay `not_available`.
 
+### Release-Artifact Scale Sweep
+
+The release-artifact sweep verifies package reality before publishing a scale
+claim:
+
+```text
+SCALE_SWEEP_ROWS="10000 100000 1000000" benchmarks/run_scale_sweep.sh full
+```
+
+UltraSQL is installed through `scripts/install.sh` unless `ULTRASQLD_BIN` points
+at an existing release binary. The harness launches that external `ultrasqld`
+over TCP and runs the same SQL-surface workloads as installed DuckDB, SQLite,
+and PostgreSQL clients. Failures are recorded as `status=not_available`; they
+are not ranked and are not claims. Artifacts live under:
+
+```text
+benchmarks/results/latest/scale-sweep/
+```
+
 ### SQLLogicTest Replay Timing
 
 SQLLogicTest replay timing is a smoke benchmark for portable SQL compatibility

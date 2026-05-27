@@ -38,6 +38,20 @@ N_ITERS="${N_ITERS:-8}"
 N_ROWS="${N_ROWS:-10000}"
 PGDATABASE="${PGDATABASE:-ultrasql_bench}"
 PGUSER="${PGUSER:-$(id -un)}"
+ANALYTICAL_ROWS="${ANALYTICAL_ROWS:-}"
+
+row_suffix() {
+    local rows="$1"
+    if [[ "$rows" -eq 65536 ]]; then
+        echo "65k"
+    elif [[ "$rows" -ge 1000000 && $((rows % 1000000)) -eq 0 ]]; then
+        echo "$((rows / 1000000))m"
+    elif [[ "$rows" -ge 1000 && $((rows % 1000)) -eq 0 ]]; then
+        echo "$((rows / 1000))k"
+    else
+        echo "$rows"
+    fi
+}
 
 # ---------------------------------------------------------------------------
 # Prerequisites
@@ -122,7 +136,7 @@ PYEOF
 # Workload: insert_throughput_10k
 # ---------------------------------------------------------------------------
 run_insert() {
-    local wl="insert_throughput_10k"
+    local wl="insert_throughput_$(row_suffix "$N_ROWS")"
     echo "  workload: ${wl}"
 
     # Setup: ensure empty table.
@@ -179,7 +193,7 @@ PYEOF
 # Workload: update_throughput_10k
 # ---------------------------------------------------------------------------
 run_update() {
-    local wl="update_throughput_10k"
+    local wl="update_throughput_$(row_suffix "$N_ROWS")"
     echo "  workload: ${wl}"
 
     # Preload N_ROWS rows once.
@@ -225,7 +239,7 @@ PYEOF
 # Workload: delete_throughput_10k
 # ---------------------------------------------------------------------------
 run_delete() {
-    local wl="delete_throughput_10k"
+    local wl="delete_throughput_$(row_suffix "$N_ROWS")"
     echo "  workload: ${wl}"
 
     # Generate insert SQL once.
@@ -357,7 +371,7 @@ PYEOF
 # Workload: select_scan_10k
 # ---------------------------------------------------------------------------
 run_select_scan() {
-    local wl="select_scan_10k"
+    local wl="select_scan_$(row_suffix "$N_ROWS")"
     echo "  workload: ${wl}"
 
     # Preload N_ROWS rows once, outside the timed region. Schema matches the
@@ -447,7 +461,8 @@ PYEOF
 # Workload: select_sum_65k_i64
 # ---------------------------------------------------------------------------
 run_sum_scalar() {
-    run_analytical "select_sum_65k_i64" 65536 \
+    local rows="${ANALYTICAL_ROWS:-65536}"
+    run_analytical "select_sum_$(row_suffix "$rows")_i64" "$rows" \
         "SELECT SUM(x) FROM bench_analytical;"
 }
 
@@ -455,7 +470,8 @@ run_sum_scalar() {
 # Workload: select_avg_1m_i64
 # ---------------------------------------------------------------------------
 run_avg_scalar() {
-    run_analytical "select_avg_1m_i64" 1000000 \
+    local rows="${ANALYTICAL_ROWS:-1000000}"
+    run_analytical "select_avg_$(row_suffix "$rows")_i64" "$rows" \
         "SELECT AVG(x) FROM bench_analytical;"
 }
 
@@ -463,8 +479,10 @@ run_avg_scalar() {
 # Workload: filter_sum_1m_i64
 # ---------------------------------------------------------------------------
 run_filter_sum() {
-    run_analytical "filter_sum_1m_i64" 1000000 \
-        "SELECT SUM(x) FROM bench_analytical WHERE x > 5000000;"
+    local rows="${ANALYTICAL_ROWS:-1000000}"
+    local threshold=$((rows * 5))
+    run_analytical "filter_sum_$(row_suffix "$rows")_i64" "$rows" \
+        "SELECT SUM(x) FROM bench_analytical WHERE x > ${threshold};"
 }
 
 # ---------------------------------------------------------------------------
@@ -473,7 +491,8 @@ run_filter_sum() {
 # fixture as the SUM/AVG/FilterSum benches.
 # ---------------------------------------------------------------------------
 run_window_row_number() {
-    run_analytical "window_row_number_65k_i64" 65536 \
+    local rows="${ANALYTICAL_ROWS:-65536}"
+    run_analytical "window_row_number_$(row_suffix "$rows")_i64" "$rows" \
         "SELECT id, row_number() OVER (ORDER BY x) FROM bench_analytical;"
 }
 
