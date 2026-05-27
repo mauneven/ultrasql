@@ -363,15 +363,15 @@ fn render_md(by_workload: &HashMap<String, Vec<EngineResult>>) -> String {
         "> **Methodology**: every row is measured through that engine's full \
          SQL pipeline. Competitor rows come from each engine's native client \
          (`sqlite3` Python driver, `duckdb` Python driver, ClickHouse native \
-         TCP via `clickhouse_driver`, `psql`/libpq subprocess for PostgreSQL \
-         17); UltraSQL rows are measured via `tokio-postgres` against an \
+         TCP via `clickhouse_driver`, `psql`/libpq subprocess for PostgreSQL); \
+         UltraSQL rows are measured via `tokio-postgres` against an \
          in-process `ultrasqld` (see `cross_compare_sql`). Every benchmark \
          shape — INSERT, SELECT scan, SUM / AVG / Filter+SUM, UPDATE, \
          DELETE, mixed OLTP — now travels the wire path end-to-end through \
          `ultrasqld`. See [`../../BENCHMARKS.md`](../../BENCHMARKS.md) for \
          the methodology gate.\n\n\
-         > **Honest scope note**: this matrix is eight kernel-style \
-         workloads on one fixed `(id INT, val INT)` schema. The UltraSQL \
+         > **Honest scope note**: this matrix is a tracked SQL-surface \
+         workload set on fixed narrow schemas. The UltraSQL \
          UPDATE / DELETE rows are produced by hand-rolled operators \
          (`FusedUpdateInt32Add`, `FusedDeleteInt32Pair`, the in-place \
          undo-log path) that match exactly the `(Int32, Int32) col cmp \

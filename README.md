@@ -53,6 +53,31 @@ Raw benchmark data lives under
 [`benchmarks/results/latest/`](benchmarks/results/latest/). Methodology lives in
 [`BENCHMARKS.md`](BENCHMARKS.md).
 
+## Current DB-vs-DB Snapshot
+
+Fresh local run: `benchmarks/run_wire.sh full`, 32 measured samples per row,
+benchmarked commit `46b47ab9`, Apple M4 / 10 cores / 16 GB RAM, macOS 26.5.
+
+Engines measured in this run: UltraSQL v0.0.6 through `tokio-postgres` against
+`ultrasqld`; DuckDB v1.5.2; SQLite 3.51.0; PostgreSQL 14.22 Homebrew. Lower is
+better. Bold marks the fastest measured engine for that workload.
+
+| Workload | Rows | UltraSQL | DuckDB | SQLite | PostgreSQL |
+|---|---:|---:|---:|---:|---:|
+| INSERT throughput | 10 000 | **6.05 ms** | 63.42 ms | 19.05 ms | 48.05 ms |
+| SELECT scan | 10 000 | **704.29 µs** | 878.14 µs | 1.90 ms | 28.80 ms |
+| SELECT SUM(x) | 65 536 | **63.67 µs** | 93.62 µs | 956.25 µs | 32.15 ms |
+| SELECT AVG(x) | 1 000 000 | **61.79 µs** | 258.81 µs | 14.43 ms | 41.54 ms |
+| Filter + SUM | 1 000 000 | **63.17 µs** | 191.10 µs | 15.99 ms | 44.27 ms |
+| UPDATE throughput | 10 000 | **114.33 µs** | 154.46 µs | 409.42 µs | 47.15 ms |
+| DELETE throughput | 10 000 | **146.04 µs** | 2.03 ms | 535.88 µs | 22.08 ms |
+| Mixed OLTP | 10 000 | **166.33 µs/op** | 1.25 ms/op | 351.76 µs/op | 10.64 ms/op |
+| Window row_number() | 65 536 | **4.62 ms** | 7.05 ms | 29.19 ms | 53.51 ms |
+
+This is a same-host SQL-surface snapshot, not a universal performance claim.
+ClickHouse and Firebolt were not measured in this run because their local
+binaries/services were unavailable.
+
 ## Quick Start
 
 Install the latest release archive:
