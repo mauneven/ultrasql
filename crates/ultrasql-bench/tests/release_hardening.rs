@@ -756,7 +756,7 @@ fn release_user_docs_exist_and_state_current_limits() {
     }
     for needle in [
         "v1.0 is not released",
-        "Ordered-set aggregates",
+        "Broader aggregate parity",
         "Firebolt comparisons use local Firebolt Core only",
     ] {
         assert!(
