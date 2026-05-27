@@ -26,6 +26,27 @@ fn scale_sweep_script_uses_external_release_artifact() {
     assert!(script.contains("benchmarks/scripts/render_scale_sweep.py"));
     assert!(script.contains("run_ultrasql_fresh_insert_samples"));
     assert!(script.contains("10k-row INSERT chunks"));
+    assert!(script.contains("benchmarks/scripts/run_clickhouse_writes.sh"));
+    assert!(script.contains("ClickHouse"));
+}
+
+#[test]
+fn scale_sweep_renders_clickhouse_as_first_class_competitor() {
+    let renderer = repo_file("benchmarks/scripts/render_scale_sweep.py");
+    let scale_md = repo_file("benchmarks/results/latest/scale-sweep/scale_sweep.md");
+    let scale_json = repo_file("benchmarks/results/latest/scale-sweep/scale_sweep.json");
+    let readme = repo_file("README.md");
+    let benchmarks = repo_file("BENCHMARKS.md");
+
+    assert!(renderer.contains("\"clickhouse\""));
+    assert!(renderer.contains("\"ClickHouse\""));
+    assert!(scale_md.contains(
+        "| Workload | Rows | UltraSQL | DuckDB | SQLite | PostgreSQL | ClickHouse | Fastest |"
+    ));
+    assert!(scale_json.contains("\"clickhouse\""));
+    assert!(readme.contains("ClickHouse"));
+    assert!(benchmarks.contains("PostgreSQL, and ClickHouse clients"));
+    assert!(benchmarks.contains("benchmarks/scripts/run_clickhouse_writes.sh"));
 }
 
 #[test]

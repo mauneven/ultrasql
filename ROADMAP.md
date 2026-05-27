@@ -57,8 +57,9 @@ file focused on what still blocks production.
 - Rerun TPC-H SF1/SF10 on the release host before publishing release
   performance claims; completed local evidence lives in `DONE.md`.
 - Broaden release-artifact scale-sweep coverage beyond the current same-host
-  DuckDB/SQLite/PostgreSQL table: larger row counts, WAL-backed `--data-dir`
-  mode, and ClickHouse/Firebolt legs when local services are available.
+  table: larger row counts, WAL-backed `--data-dir` mode, measured ClickHouse
+  artifacts when a local ClickHouse server is available, and Firebolt legs
+  when local services are available.
 
 ## P1 - PostgreSQL Compatibility
 

@@ -19,7 +19,7 @@
 #
 # Bulk INSERT uses fresh UltraSQL server processes per measured sample so
 # every engine times a fresh table load. INSERT chunks are 10k rows across
-# UltraSQL, DuckDB, SQLite, and PostgreSQL.
+# UltraSQL, DuckDB, SQLite, PostgreSQL, and ClickHouse.
 
 set -euo pipefail
 
@@ -317,6 +317,8 @@ run_competitors() {
                 bash benchmarks/scripts/run_sqlite3_writes.sh "$selector" || true
             RAW_DIR="$RAW" N_ITERS="$ITERS" N_ROWS="$rows" \
                 bash benchmarks/scripts/run_postgres_writes.sh "$selector" || true
+            RAW_DIR="$RAW" N_ITERS="$ITERS" N_ROWS="$rows" \
+                bash benchmarks/scripts/run_clickhouse_writes.sh "$selector" || true
             ;;
         select_sum_*_i64|select_avg_*_i64|filter_sum_*_i64|window_row_number_*_i64)
             RAW_DIR="$RAW" N_ITERS="$ITERS" ANALYTICAL_ROWS="$rows" \
@@ -325,6 +327,8 @@ run_competitors() {
                 bash benchmarks/scripts/run_sqlite3_writes.sh "$selector" || true
             RAW_DIR="$RAW" N_ITERS="$ITERS" ANALYTICAL_ROWS="$rows" \
                 bash benchmarks/scripts/run_postgres_writes.sh "$selector" || true
+            RAW_DIR="$RAW" N_ITERS="$ITERS" ANALYTICAL_ROWS="$rows" \
+                bash benchmarks/scripts/run_clickhouse_writes.sh "$selector" || true
             ;;
         *) echo "run_scale_sweep.sh: unknown competitor selector $selector" >&2; exit 2 ;;
     esac
@@ -398,7 +402,7 @@ doc = {
     "rows": merged_rows,
     "ultrasql_version": version,
     "ultrasql_install_source": install_source,
-    "methodology": "UltraSQL external release artifact over TCP; competitors installed local clients; bulk INSERT uses a fresh UltraSQL server per measured sample and 10k-row INSERT chunks across engines.",
+    "methodology": "UltraSQL external release artifact over TCP; competitors installed local clients including ClickHouse when available; bulk INSERT uses a fresh UltraSQL server per measured sample and 10k-row INSERT chunks across engines.",
 }
 with open(path_obj, "w", encoding="utf-8") as fh:
     json.dump(doc, fh, indent=2, sort_keys=True)

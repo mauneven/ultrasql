@@ -13,12 +13,13 @@ import json
 from pathlib import Path
 
 
-ENGINE_ORDER = ["ultrasql", "duckdb", "sqlite3", "postgres17"]
+ENGINE_ORDER = ["ultrasql", "duckdb", "sqlite3", "postgres17", "clickhouse"]
 ENGINE_LABELS = {
     "ultrasql": "UltraSQL",
     "duckdb": "DuckDB",
     "sqlite3": "SQLite",
     "postgres17": "PostgreSQL",
+    "clickhouse": "ClickHouse",
 }
 WORKLOAD_ORDER = [
     "insert_throughput",
@@ -145,8 +146,8 @@ def render_markdown(title: str, note: str, rows: list[dict]) -> str:
         "",
         note,
         "",
-        "| Workload | Rows | UltraSQL | DuckDB | SQLite | PostgreSQL | Fastest |",
-        "|---|---:|---:|---:|---:|---:|---|",
+        "| Workload | Rows | UltraSQL | DuckDB | SQLite | PostgreSQL | ClickHouse | Fastest |",
+        "|---|---:|---:|---:|---:|---:|---:|---|",
     ]
     for row in rows:
         cells = []
@@ -162,13 +163,14 @@ def render_markdown(title: str, note: str, rows: list[dict]) -> str:
             else "-"
         )
         lines.append(
-            "| {workload} | {rows} | {ultrasql} | {duckdb} | {sqlite} | {postgres} | {fastest} |".format(
+            "| {workload} | {rows} | {ultrasql} | {duckdb} | {sqlite} | {postgres} | {clickhouse} | {fastest} |".format(
                 workload=row["workload_label"],
                 rows=format_rows(row["n_rows"]),
                 ultrasql=cells[0],
                 duckdb=cells[1],
                 sqlite=cells[2],
                 postgres=cells[3],
+                clickhouse=cells[4],
                 fastest=fastest,
             )
         )
@@ -183,6 +185,8 @@ def main() -> None:
     payload = {
         "schema_version": 1,
         "raw_dir": str(args.raw_dir),
+        "engine_order": ENGINE_ORDER,
+        "engine_labels": ENGINE_LABELS,
         "rows": rows,
         "policy": "Only measured raw artifacts are rendered; missing engines are not ranked.",
     }

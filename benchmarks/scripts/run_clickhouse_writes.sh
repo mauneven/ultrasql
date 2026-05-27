@@ -37,6 +37,7 @@
 #   RAW_DIR   (default: benchmarks/results/latest/raw)
 #   N_ITERS   (default: 8)
 #   N_ROWS    (default: 10000)
+#   ANALYTICAL_ROWS  row count for SUM/AVG/filter/window workloads
 #   CH_BIN    (default: /tmp/ultracmp/clickhouse)
 #   CH_TCP_PORT  (default: 19000)
 #
@@ -53,20 +54,109 @@ ENGINE="clickhouse"
 RAW_DIR="${RAW_DIR:-benchmarks/results/latest/raw}"
 N_ITERS="${N_ITERS:-8}"
 N_ROWS="${N_ROWS:-10000}"
+ANALYTICAL_ROWS="${ANALYTICAL_ROWS:-}"
 CH_BIN="${CH_BIN:-/tmp/ultracmp/clickhouse}"
 CH_TCP_PORT="${CH_TCP_PORT:-19000}"
 CH_HTTP_PORT="${CH_HTTP_PORT:-18123}"
 CH_DATA_DIR="${CH_DATA_DIR:-/tmp/ch_bench}"
+WORKLOAD="${1:-all}"
 
-WORKLOADS=(insert_throughput_10k update_throughput_10k delete_throughput_10k mixed_oltp_pgbench_like select_scan_10k select_sum_65k_i64 select_avg_1m_i64 filter_sum_1m_i64 window_row_number_65k_i64)
+row_suffix() {
+    local rows="$1"
+    if [[ "$rows" -eq 65536 ]]; then
+        echo "65k"
+    elif [[ "$rows" -ge 1000000 && $((rows % 1000000)) -eq 0 ]]; then
+        echo "$((rows / 1000000))m"
+    elif [[ "$rows" -ge 1000 && $((rows % 1000)) -eq 0 ]]; then
+        echo "$((rows / 1000))k"
+    else
+        echo "$rows"
+    fi
+}
+
+workload_rows() {
+    local wl="$1"
+    case "$wl" in
+        insert_throughput_*|update_throughput_*|delete_throughput_*|select_scan_*)
+            echo "$N_ROWS" ;;
+        mixed_oltp_pgbench_like)
+            echo "$N_ROWS" ;;
+        select_sum_*_i64|select_avg_*_i64|filter_sum_*_i64|window_row_number_*_i64)
+            case "$wl" in
+                select_sum_*_i64) echo "${ANALYTICAL_ROWS:-65536}" ;;
+                select_avg_*_i64|filter_sum_*_i64) echo "${ANALYTICAL_ROWS:-1000000}" ;;
+                window_row_number_*_i64) echo "${ANALYTICAL_ROWS:-65536}" ;;
+            esac
+            ;;
+        *) echo "$N_ROWS" ;;
+    esac
+}
+
+target_workloads() {
+    case "$WORKLOAD" in
+        insert_throughput_10k)   echo "insert_throughput_$(row_suffix "$N_ROWS")" ;;
+        update_throughput_10k)   echo "update_throughput_$(row_suffix "$N_ROWS")" ;;
+        delete_throughput_10k)   echo "delete_throughput_$(row_suffix "$N_ROWS")" ;;
+        mixed_oltp_pgbench_like) echo "mixed_oltp_pgbench_like" ;;
+        select_scan_10k)         echo "select_scan_$(row_suffix "$N_ROWS")" ;;
+        select_sum_65k_i64)
+            local rows="${ANALYTICAL_ROWS:-65536}"
+            echo "select_sum_$(row_suffix "$rows")_i64"
+            ;;
+        select_avg_1m_i64)
+            local rows="${ANALYTICAL_ROWS:-1000000}"
+            echo "select_avg_$(row_suffix "$rows")_i64"
+            ;;
+        filter_sum_1m_i64)
+            local rows="${ANALYTICAL_ROWS:-1000000}"
+            echo "filter_sum_$(row_suffix "$rows")_i64"
+            ;;
+        window_row_number_65k_i64)
+            local rows="${ANALYTICAL_ROWS:-65536}"
+            echo "window_row_number_$(row_suffix "$rows")_i64"
+            ;;
+        all)
+            echo "insert_throughput_$(row_suffix "$N_ROWS")"
+            echo "update_throughput_$(row_suffix "$N_ROWS")"
+            echo "delete_throughput_$(row_suffix "$N_ROWS")"
+            echo "mixed_oltp_pgbench_like"
+            echo "select_scan_$(row_suffix "$N_ROWS")"
+            echo "select_sum_65k_i64"
+            echo "select_avg_1m_i64"
+            echo "filter_sum_1m_i64"
+            echo "window_row_number_65k_i64"
+            ;;
+        *)
+            echo "run_clickhouse_writes.sh: unknown workload '$WORKLOAD'" >&2
+            exit 2
+            ;;
+    esac
+}
 
 mark_unavailable() {
     local reason="$1"
     echo "run_clickhouse_writes.sh: WARNING: ${reason} — emitting unavailable stubs" >&2
     mkdir -p "$RAW_DIR"
-    for wl in "${WORKLOADS[@]}"; do
-        echo "{\"engine\":\"${ENGINE}\",\"status\":\"not_available\",\"workload\":\"${wl}\"}" \
-            > "${RAW_DIR}/${wl}-${ENGINE}.json"
+    target_workloads | while IFS= read -r wl; do
+        local rows
+        rows="$(workload_rows "$wl")"
+        python3 - "$RAW_DIR/${wl}-${ENGINE}.json" "$ENGINE" "$wl" "$rows" "$reason" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+out, engine, workload, rows, reason = sys.argv[1:]
+doc = {
+    "schema_version": 1,
+    "engine": engine,
+    "status": "not_available",
+    "workload": workload,
+    "n_rows": int(rows),
+    "reason": reason,
+    "policy": "No ClickHouse benchmark claim exists until this artifact records measured samples from the same scale-sweep run.",
+}
+Path(out).write_text(json.dumps(doc, sort_keys=True) + "\n")
+PY
     done
     exit 0
 }
@@ -179,7 +269,7 @@ print(json.dumps([float(x) for x in sys.argv[1:]]))
 # Workload: insert_throughput_10k
 # ---------------------------------------------------------------------------
 run_insert() {
-    local wl="insert_throughput_10k"
+    local wl="insert_throughput_$(row_suffix "$N_ROWS")"
     echo "  workload: ${wl}"
     local samples_raw
     samples_raw="$(python3 - "$N_ROWS" "$N_ITERS" "$CH_TCP_PORT" <<'PYEOF'
@@ -227,7 +317,7 @@ PYEOF
 # ALTER TABLE ... UPDATE WHERE with mutations_sync=2.
 # ---------------------------------------------------------------------------
 run_update() {
-    local wl="update_throughput_10k"
+    local wl="update_throughput_$(row_suffix "$N_ROWS")"
     echo "  workload: ${wl}"
     local samples_raw
     samples_raw="$(python3 - "$N_ROWS" "$N_ITERS" "$CH_TCP_PORT" <<'PYEOF'
@@ -276,7 +366,7 @@ PYEOF
 # ALTER TABLE ... DELETE WHERE with mutations_sync=2.
 # ---------------------------------------------------------------------------
 run_delete() {
-    local wl="delete_throughput_10k"
+    local wl="delete_throughput_$(row_suffix "$N_ROWS")"
     echo "  workload: ${wl}"
     local samples_raw
     samples_raw="$(python3 - "$N_ROWS" "$N_ITERS" "$CH_TCP_PORT" <<'PYEOF'
@@ -385,7 +475,7 @@ PYEOF
 # Workload: select_scan_10k
 # ---------------------------------------------------------------------------
 run_select_scan() {
-    local wl="select_scan_10k"
+    local wl="select_scan_$(row_suffix "$N_ROWS")"
     echo "  workload: ${wl}"
     local samples_raw
     samples_raw="$(python3 - "$N_ROWS" "$N_ITERS" "$CH_TCP_PORT" <<'PYEOF'
@@ -475,15 +565,34 @@ PYEOF
     echo "    median: ${median_us} µs"
 }
 
-run_sum_scalar()  { run_analytical "select_sum_65k_i64"  65536    "SELECT SUM(x) FROM bench_analytical"; }
-run_avg_scalar()  { run_analytical "select_avg_1m_i64"  1000000   "SELECT AVG(x) FROM bench_analytical"; }
-run_filter_sum()  { run_analytical "filter_sum_1m_i64"  1000000   "SELECT SUM(x) FROM bench_analytical WHERE x > 5000000"; }
-run_window_row_number() { run_analytical "window_row_number_65k_i64" 65536 "SELECT id, row_number() OVER (ORDER BY x) FROM bench_analytical"; }
+run_sum_scalar() {
+    local rows="${ANALYTICAL_ROWS:-65536}"
+    run_analytical "select_sum_$(row_suffix "$rows")_i64" "$rows" \
+        "SELECT SUM(x) FROM bench_analytical"
+}
+
+run_avg_scalar() {
+    local rows="${ANALYTICAL_ROWS:-1000000}"
+    run_analytical "select_avg_$(row_suffix "$rows")_i64" "$rows" \
+        "SELECT AVG(x) FROM bench_analytical"
+}
+
+run_filter_sum() {
+    local rows="${ANALYTICAL_ROWS:-1000000}"
+    local threshold=$((rows * 5))
+    run_analytical "filter_sum_$(row_suffix "$rows")_i64" "$rows" \
+        "SELECT SUM(x) FROM bench_analytical WHERE x > ${threshold}"
+}
+
+run_window_row_number() {
+    local rows="${ANALYTICAL_ROWS:-65536}"
+    run_analytical "window_row_number_$(row_suffix "$rows")_i64" "$rows" \
+        "SELECT id, row_number() OVER (ORDER BY x) FROM bench_analytical"
+}
 
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
-WORKLOAD="${1:-all}"
 case "$WORKLOAD" in
     insert_throughput_10k)   run_insert ;;
     update_throughput_10k)   run_update ;;

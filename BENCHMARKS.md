@@ -160,11 +160,13 @@ SCALE_SWEEP_ROWS="10000 100000 1000000" benchmarks/run_scale_sweep.sh full
 UltraSQL is installed through `scripts/install.sh` unless `ULTRASQLD_BIN` points
 at an existing release binary. The harness launches that external `ultrasqld`
 over TCP and runs the same SQL-surface workloads as installed DuckDB, SQLite,
-and PostgreSQL clients. Failures are recorded as `status=not_available`; they
-are not ranked and are not claims. Bulk INSERT uses a fresh UltraSQL server per
-measured sample, matching the fresh in-memory table setup used by the embedded
-competitor runners, and all engines use 10k-row INSERT chunks. Artifacts live
-under:
+PostgreSQL, and ClickHouse clients. ClickHouse is driven through
+`benchmarks/scripts/run_clickhouse_writes.sh`, which uses the native TCP client
+when `clickhouse_driver` and a local ClickHouse binary/server are available.
+Failures are recorded as `status=not_available`; they are not ranked and are
+not claims. Bulk INSERT uses a fresh UltraSQL server per measured sample,
+matching the fresh in-memory table setup used by the embedded competitor
+runners, and all engines use 10k-row INSERT chunks. Artifacts live under:
 
 ```text
 benchmarks/results/latest/scale-sweep/

@@ -137,6 +137,10 @@ as a concise evidence ledger; roadmap stays for open gates only.
   and artifacts under `benchmarks/results/latest/scale-sweep/`; the latest
   v0.0.6 same-host run launches external `ultrasqld` and records UltraSQL as
   the fastest engine on every published DuckDB/SQLite/PostgreSQL row.
+- ClickHouse is now a first-class release-artifact scale-sweep leg through
+  `benchmarks/scripts/run_clickhouse_writes.sh`; missing local ClickHouse setup
+  records `not_available` instead of dropping the competitor from rendered
+  benchmark tables.
 - TPC-H SF1 local PostgreSQL 17 certification passed with all q1..q22 complete
   for both engines.
 - TPC-H scale 10 (all 22 queries) is complete: latest local artifact

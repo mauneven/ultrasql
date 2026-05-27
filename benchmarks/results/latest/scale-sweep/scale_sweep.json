@@ -1,4 +1,18 @@
 {
+  "engine_labels": {
+    "clickhouse": "ClickHouse",
+    "duckdb": "DuckDB",
+    "postgres17": "PostgreSQL",
+    "sqlite3": "SQLite",
+    "ultrasql": "UltraSQL"
+  },
+  "engine_order": [
+    "ultrasql",
+    "duckdb",
+    "sqlite3",
+    "postgres17",
+    "clickhouse"
+  ],
   "policy": "Only measured raw artifacts are rendered; missing engines are not ranked.",
   "raw_dir": "benchmarks/results/latest/scale-sweep/raw",
   "rows": [
