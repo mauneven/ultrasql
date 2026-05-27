@@ -60,7 +60,8 @@ Pushing a `vX.Y.Z` tag runs `.github/workflows/release.yml`. The workflow:
   Windows x86_64 archives,
 - publishes `ghcr.io/mauneven/ultrasql:<tag>` from the Dockerfile,
 - attaches `ultrasql-<version>.tgz` from `packages/npm` and publishes the
-  `ultrasql` npm registry package when npm credentials are configured,
+  `ultrasql` npm registry package through npm Trusted Publishing or
+  `NPM_TOKEN`,
 - builds Debian/Ubuntu `.deb` packages and `.rpm` packages with nFPM,
 - renders a Homebrew formula from the macOS archive checksums,
 - uploads per-asset `.sha256` files plus `SHASUMS256.txt`,

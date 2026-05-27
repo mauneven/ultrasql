@@ -49,8 +49,8 @@ bun add -g ultrasql
 ```
 
 The release workflow also packs `ultrasql-<version>.tgz` and attaches it to the
-GitHub Release, so npm-compatible installers can consume the same package before
-registry credentials are configured.
+GitHub Release. The npm registry publish is a required release step; configure
+either npm Trusted Publishing for this workflow or `NPM_TOKEN` before tagging.
 
 The package exposes a Node-API embedded `Database` class plus command shims.
 `Database.open(":memory:")` verifies the GitHub release archive checksum,
@@ -69,7 +69,8 @@ npm publish --access public --provenance
 
 GitHub Packages remains the container registry surface through GHCR. GitHub's
 npm registry requires scoped package names, so the unscoped `ultrasql` package
-is published to npmjs when `NPM_TOKEN` is configured.
+is published to npmjs. Prefer npm Trusted Publishing with GitHub OIDC; use
+`NPM_TOKEN` only when trusted publishing is unavailable.
 
 ## Homebrew
 
@@ -165,7 +166,7 @@ Registry publishing is automatic once these secrets or variables are present:
 
 | Surface | Secret / variable |
 | --- | --- |
-| npmjs `ultrasql` | `NPM_TOKEN` |
+| npmjs `ultrasql` | npm Trusted Publishing, or `NPM_TOKEN` |
 | Chocolatey | `CHOCOLATEY_API_KEY` |
 | AUR `ultrasql-bin` | `AUR_SSH_PRIVATE_KEY` |
 | Homebrew tap | `HOMEBREW_TAP_TOKEN`, optional `HOMEBREW_TAP_REPOSITORY` |

@@ -86,8 +86,9 @@ Server-mode applications should keep using PostgreSQL client libraries such as
 `pg`, `psycopg`, `libpq`, or `pgx`; UltraSQL speaks PostgreSQL wire protocol.
 
 Release automation always attaches `ultrasql-<version>.tgz` to GitHub Releases
-and publishes the registry package from `packages/npm` with `npm publish` when
-npm credentials are configured.
+and publishes the registry package from `packages/npm` with `npm publish`.
+Configure npm Trusted Publishing for `.github/workflows/release.yml`, or set
+`NPM_TOKEN` before tagging a release.
 
 ## Docker
 
