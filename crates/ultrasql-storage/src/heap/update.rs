@@ -170,7 +170,7 @@ impl<L: PageLoader> HeapAccess<L> {
     /// `edits` is an iterator of `(old_tid, new_payload)` pairs.
     /// `update_many` groups them by `old_tid.page` and attempts a
     /// `try_hot_update` for every targeted slot under a single
-    /// [`PageGuard`] per page. Entries whose HOT path returns
+    /// [`crate::buffer_pool::PageGuard`] per page. Entries whose HOT path returns
     /// `None` (the page lacks room for the new version) fall back
     /// to the per-tuple non-HOT path via [`Self::update`].
     ///
@@ -199,7 +199,7 @@ impl<L: PageLoader> HeapAccess<L> {
     ///
     /// # Concurrency
     ///
-    /// At most one [`PageGuard`] is held at any instant for the HOT
+    /// At most one [`crate::buffer_pool::PageGuard`] is held at any instant for the HOT
     /// batch on a given page. The guard is dropped before WAL I/O.
     /// The non-HOT fallback re-enters [`Self::update`] for each
     /// affected tuple — same locking discipline as the single-tuple

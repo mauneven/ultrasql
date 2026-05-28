@@ -47,6 +47,8 @@ use ultrasql_vec::column::{Column, NumericColumn};
 
 use crate::{ExecError, Operator};
 
+type TargetTidLock = dyn Fn(TupleId) -> Result<bool, String> + Send + Sync;
+
 /// Predicate descriptor for the optional `WHERE col_j cmp literal`
 /// clause. Both `col_index` and `literal` are typed at construction
 /// time: only `Int32` columns and `Int32` literals are accepted.
@@ -108,7 +110,7 @@ pub struct FusedUpdateInt32Add<L: PageLoader> {
     xid: Xid,
     command_id: CommandId,
     target_tids: Option<Vec<TupleId>>,
-    target_tid_lock: Option<Arc<dyn Fn(TupleId) -> Result<bool, String> + Send + Sync>>,
+    target_tid_lock: Option<Arc<TargetTidLock>>,
     refresh_snapshot_after_lock: bool,
     vm: Option<Arc<VisibilityMap>>,
     schema: Schema,

@@ -20,8 +20,8 @@ use super::{HeapError, UndoRelationLog};
 /// Visibility-filtered sequential scan that yields borrowed slot
 /// payload slices.
 ///
-/// Constructed via [`HeapAccess::scan_visible_walker`]. The walker
-/// owns one [`PageGuard`] at a time (released at block boundaries)
+/// Constructed via [`crate::heap::HeapAccess::scan_visible_walker`]. The walker
+/// owns one [`crate::buffer_pool::PageGuard`] at a time (released at block boundaries)
 /// and one [`Vec<u8>`] scratch buffer reused across every slot read;
 /// per-tuple work is zero allocation.
 ///
