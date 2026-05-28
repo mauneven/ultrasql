@@ -2,20 +2,14 @@
 //!
 //! [`ValuesScan`] materialises a `VALUES (...)` clause by evaluating
 //! each cell through the [`Eval`] interpreter and emitting the results
-//! as a single [`Batch`].
+//! as executor-sized [`Batch`] chunks.
 //!
 //! This is the leaf operator for `LogicalPlan::Values` lowering. It
 //! evaluates with an empty row slice and no bound parameters; all cells
 //! must be literal-only expressions (column references, sub-queries, or
 //! parameters are not expected at this level for v0.5).
 //!
-//! # Single-batch limitation
-//!
-//! The current implementation emits all rows in a single batch on the
-//! first `next_batch` call, even if the row count exceeds 4096. Splitting
-//! into 4096-row batches is a follow-up tracked by TODO(values-batching).
-
-use ultrasql_core::{Schema, Value};
+use ultrasql_core::{Schema, Value, constants::DEFAULT_BATCH_SIZE};
 use ultrasql_planner::ScalarExpr;
 use ultrasql_vec::Batch;
 
@@ -26,15 +20,17 @@ use crate::{ExecError, Operator};
 /// Leaf operator materialising a list of scalar-expression rows.
 ///
 /// Each inner `Vec<ScalarExpr>` is one row; all inner vecs must have the
-/// same length, matching `schema.len()`. The operator emits a single
-/// batch on the first `next_batch` call and returns `Ok(None)` on all
-/// subsequent calls.
+/// same length, matching `schema.len()`. The operator emits chunks capped
+/// at [`DEFAULT_BATCH_SIZE`] rows and returns `Ok(None)` after all rows
+/// have been materialised.
 #[derive(Debug)]
 pub struct ValuesScan {
     rows: Vec<Vec<ScalarExpr>>,
     schema: Schema,
-    /// Set to `true` after the one batch has been emitted.
-    emitted: bool,
+    /// Start offset for the next non-empty output batch.
+    next_row: usize,
+    /// Set after the single zero-row batch has been emitted.
+    emitted_empty: bool,
 }
 
 impl ValuesScan {
@@ -49,28 +45,39 @@ impl ValuesScan {
         Self {
             rows,
             schema,
-            emitted: false,
+            next_row: 0,
+            emitted_empty: false,
         }
     }
 }
 
 impl Operator for ValuesScan {
     fn next_batch(&mut self) -> Result<Option<Batch>, ExecError> {
-        if self.emitted {
-            return Ok(None);
-        }
-        self.emitted = true;
-
         if self.rows.is_empty() {
+            if self.emitted_empty {
+                return Ok(None);
+            }
+            self.emitted_empty = true;
             // Zero rows: emit an empty batch with the declared schema.
             return build_batch(&[], &self.schema).map(Some);
         }
 
+        if self.next_row >= self.rows.len() {
+            return Ok(None);
+        }
+
+        let start = self.next_row;
+        let end = start
+            .saturating_add(DEFAULT_BATCH_SIZE)
+            .min(self.rows.len());
+        self.next_row = end;
+
         // Evaluate each cell. We use an empty row slice because VALUES
         // expressions should not contain column references at this level.
         let empty_row: &[Value] = &[];
-        let mut decoded: Vec<Vec<Value>> = Vec::with_capacity(self.rows.len());
-        for (row_idx, expr_row) in self.rows.iter().enumerate() {
+        let mut decoded: Vec<Vec<Value>> = Vec::with_capacity(end - start);
+        for (relative_idx, expr_row) in self.rows[start..end].iter().enumerate() {
+            let row_idx = start + relative_idx;
             let mut value_row: Vec<Value> = Vec::with_capacity(expr_row.len());
             for (col_idx, expr) in expr_row.iter().enumerate() {
                 let evaluator = Eval::new(expr.clone());
@@ -155,6 +162,29 @@ mod tests {
         let batch = scan.next_batch().unwrap().unwrap();
         assert_eq!(batch.rows(), 0);
         assert!(scan.next_batch().unwrap().is_none());
+    }
+
+    #[test]
+    fn values_scan_chunks_large_inputs_into_executor_batches() {
+        let rows: Vec<Vec<ScalarExpr>> = (0_i32..8200).map(|value| vec![lit_i32(value)]).collect();
+        let schema = Schema::new([Field::nullable("id", DataType::Int32)]).expect("schema ok");
+        let mut scan = ValuesScan::new(rows, schema);
+
+        let mut sizes = Vec::new();
+        let mut values = Vec::new();
+        while let Some(batch) = scan.next_batch().unwrap() {
+            sizes.push(batch.rows());
+            match &batch.columns()[0] {
+                Column::Int32(ids) => values.extend_from_slice(ids.data()),
+                other => panic!("unexpected column type: {other:?}"),
+            }
+        }
+
+        assert_eq!(sizes, vec![4096, 4096, 8]);
+        assert_eq!(values.len(), 8200);
+        assert_eq!(values.first(), Some(&0));
+        assert_eq!(values.get(4096), Some(&4096));
+        assert_eq!(values.last(), Some(&8199));
     }
 
     #[test]
