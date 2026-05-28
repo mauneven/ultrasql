@@ -44,6 +44,11 @@ GORM_VERSION = "1.31.1"
 GORM_POSTGRES_VERSION = "1.6.0"
 JDBC_VERSION = "42.7.11"
 JDBC_SHA256 = "1981b31d3993c58702783c1cddf10a34e48c1f413d70ff1cb6def0a143484647"
+JDBC_ARTIFACT_PATH = f"org/postgresql/postgresql/{JDBC_VERSION}/postgresql-{JDBC_VERSION}.jar"
+JDBC_URLS = [
+    f"https://repo.maven.apache.org/maven2/{JDBC_ARTIFACT_PATH}",
+    f"https://repo1.maven.org/maven2/{JDBC_ARTIFACT_PATH}",
+]
 HIBERNATE_VERSION = "7.3.5.Final"
 APACHE_MAVEN_VERSION = "3.9.11"
 NPGSQL_VERSION = "10.0.2"
@@ -735,15 +740,32 @@ def ensure_jdbc_jar() -> Path:
     target_dir.mkdir(parents=True, exist_ok=True)
     jar = target_dir / f"postgresql-{JDBC_VERSION}.jar"
     if not jar.exists():
-        url = (
-            "https://repo1.maven.org/maven2/org/postgresql/postgresql/"
-            f"{JDBC_VERSION}/postgresql-{JDBC_VERSION}.jar"
-        )
-        require_tool("curl", "install curl or preseed the JDBC driver jar")
-        run_checked(
-            ["curl", "-fsSL", "--proto", "=https", "--tlsv1.2", "-o", str(jar), url],
-            "JDBC PostgreSQL driver jar download failed",
-        )
+        curl = require_tool("curl", "install curl or preseed the JDBC driver jar")
+        failures = []
+        for url in JDBC_URLS:
+            try:
+                run_checked(
+                    [
+                        curl,
+                        "-fsSL",
+                        "--proto",
+                        "=https",
+                        "--tlsv1.2",
+                        "-o",
+                        str(jar),
+                        url,
+                    ],
+                    f"JDBC PostgreSQL driver jar download failed from {url}",
+                )
+                break
+            except CertificationFailure as exc:
+                failures.append(str(exc))
+                jar.unlink(missing_ok=True)
+        else:
+            joined = "\n\n".join(failures)
+            raise CertificationFailure(
+                f"JDBC PostgreSQL driver jar download failed from every mirror:\n{joined}"
+            )
 
     digest = hashlib.sha256(jar.read_bytes()).hexdigest()
     if digest != JDBC_SHA256:

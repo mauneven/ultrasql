@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import importlib.util
+import hashlib
 import ssl
 import subprocess
 import sys
@@ -80,6 +81,74 @@ class DownloadFileTests(unittest.TestCase):
             self.assertIn("--output", calls[0])
             self.assertIn(str(target), calls[0])
             self.assertEqual(calls[0][-1], "https://example.invalid/archive.tar.gz")
+
+
+class JdbcJarTests(unittest.TestCase):
+    """JDBC driver artifact download behavior."""
+
+    def test_jdbc_urls_prefer_canonical_maven_central(self) -> None:
+        """Use the canonical Maven Central host before the legacy repo1 mirror."""
+
+        self.assertEqual(
+            driver_certification.JDBC_URLS[0],
+            "https://repo.maven.apache.org/maven2/"
+            "org/postgresql/postgresql/42.7.11/postgresql-42.7.11.jar",
+        )
+        self.assertEqual(
+            driver_certification.JDBC_URLS[1],
+            "https://repo1.maven.org/maven2/"
+            "org/postgresql/postgresql/42.7.11/postgresql-42.7.11.jar",
+        )
+
+    def test_jdbc_download_falls_back_between_mirrors(self) -> None:
+        """A transient 403 from one Maven mirror should not fail certification."""
+
+        payload = b"jdbc jar bytes"
+        expected_digest = hashlib.sha256(payload).hexdigest()
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            calls: list[list[str]] = []
+
+            def fake_run_checked(
+                cmd: list[str],
+                context: str,
+                *,
+                cwd: Path | None = None,
+                env: dict[str, str] | None = None,
+            ) -> subprocess.CompletedProcess[str]:
+                del cwd, env
+                calls.append(cmd)
+                if len(calls) == 1:
+                    raise driver_certification.CertificationFailure(context)
+                output_path = Path(cmd[cmd.index("-o") + 1])
+                output_path.write_bytes(payload)
+                return subprocess.CompletedProcess(cmd, 0, "", "")
+
+            with (
+                mock.patch.object(driver_certification, "repo_root", return_value=root),
+                mock.patch.object(
+                    driver_certification,
+                    "require_tool",
+                    return_value="/usr/bin/curl",
+                ),
+                mock.patch.object(
+                    driver_certification,
+                    "JDBC_SHA256",
+                    expected_digest,
+                ),
+                mock.patch.object(
+                    driver_certification,
+                    "run_checked",
+                    side_effect=fake_run_checked,
+                ),
+            ):
+                jar = driver_certification.ensure_jdbc_jar()
+
+            self.assertEqual(jar.read_bytes(), payload)
+            self.assertEqual(len(calls), 2)
+            self.assertEqual(calls[0][-1], driver_certification.JDBC_URLS[0])
+            self.assertEqual(calls[1][-1], driver_certification.JDBC_URLS[1])
 
 
 if __name__ == "__main__":
