@@ -14,9 +14,9 @@ completed evidence.
 
 ## SQL and type system
 
-- Some SQL data types are partial or missing, including full XML, full
-  locale/collation behavior, domain/composite type breadth, and several network
-  address/operator details.
+- Some SQL data types are partial or missing, including full XML namespace /
+  `XMLTABLE` coverage, full locale/collation behavior, domain/composite type
+  breadth, and several network address/operator details.
 - Transactional DDL is not complete; ORM schema-creation certification runs in
   autocommit mode until DDL inside explicit transaction blocks is implemented.
 - Serializable transactions use relation-level SSI, not predicate-precise SSI.

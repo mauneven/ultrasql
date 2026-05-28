@@ -61,6 +61,10 @@ file focused on what still blocks production.
 - Broaden release-artifact scale-sweep coverage beyond the current same-host
   table: larger row counts, WAL-backed `--data-dir` mode, repeatable
   ClickHouse artifacts, and Firebolt legs when local services are available.
+- AI/vector competitor claims require same-host DuckDB, ClickHouse, and
+  PostgreSQL+pgvector artifacts for exact top-k, ANN recall/latency, hybrid
+  search, JSON-filtered retrieval, and RAG quality, with answer or recall gates
+  before any README row is published.
 
 ## P1 - SQL Surface
 
@@ -78,7 +82,8 @@ file focused on what still blocks production.
   (strict/lax modes, variables, methods, full predicate algebra).
 - Full-text search: `TSVECTOR`, `TSQUERY`, ranking, headline, dictionaries, and
   GIN integration.
-- XML full support: xpath, xmltable, and function catalog parity.
+- XML remaining surface: namespaces, full XPath axes/functions, `XMLTABLE`,
+  `XMLPARSE` / `XMLSERIALIZE` syntax, and function catalog parity.
 - Locale/collation: ICU-backed collations, `CREATE COLLATION`, and `COLLATE`
   in definitions and `ORDER BY`.
 

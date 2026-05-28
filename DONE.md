@@ -103,6 +103,12 @@ as a concise evidence ledger; roadmap stays for open gates only.
   support exists.
 - Basic XML storage exists with validated text storage, OID 142 wire rendering,
   COPY, and restart round trip.
+- XML scalar functions now cover local-only secure well-formed checks
+  (`xml_is_well_formed`, `xml_is_well_formed_content`,
+  `xml_is_well_formed_document`) plus a deterministic `xpath` /
+  `xpath_exists` subset for absolute element paths with optional attribute
+  equality filters. DTD declarations, external entity expansion, unknown entity
+  references, and pre-root junk are rejected.
 - Ordered-set aggregates `PERCENTILE_CONT` and `PERCENTILE_DISC` have plan shape
   and wire coverage.
 - Portable scalar helpers now cover `COALESCE`, `IFNULL` / `NVL`,
@@ -142,8 +148,16 @@ as a concise evidence ledger; roadmap stays for open gates only.
   artifacts.
 - Release-artifact scale sweep exists through `benchmarks/run_scale_sweep.sh`
   and artifacts under `benchmarks/results/latest/scale-sweep/`; the latest
-  v0.0.6 same-host run launches external `ultrasqld` and records UltraSQL as
-  the fastest engine on every published DuckDB/SQLite/PostgreSQL row.
+  v0.0.6 same-host run builds the harness with `release-ship`, launches
+  external `ultrasqld`, and records UltraSQL as the fastest engine on every
+  published DuckDB/ClickHouse/SQLite/PostgreSQL row.
+- Mixed correctness benchmark coverage exists in the release-artifact scale
+  sweep: each measured engine runs write + write + aggregate inside a rolled-back
+  transaction, emits an `answer_sha256`, and
+  `benchmarks/scripts/render_scale_sweep.py` refuses to rank the row unless all
+  measured answers match. Latest 100k-row artifact records UltraSQL fastest at
+  153.38 us with matching answer hash
+  `a4bb5c94eb7ea1c1d2c927b57b7da3ae26d2c455d5e60f54b7b57b4ede93f06b`.
 - ClickHouse is now a first-class release-artifact scale-sweep leg through
   `benchmarks/scripts/run_clickhouse_writes.sh`; missing local ClickHouse setup
   records `not_available` instead of dropping the measured engine from rendered

@@ -166,7 +166,9 @@ when `clickhouse_driver` and a local ClickHouse binary/server are available.
 Failures are recorded as `status=not_available`; they are not ranked and are
 not claims. Bulk INSERT uses a fresh UltraSQL server per measured sample,
 matching the fresh in-memory table setup used by the embedded measured-engine
-runners, and all engines use 10k-row INSERT chunks. Artifacts live under:
+runners, and all engines use 10k-row INSERT chunks. The mixed correctness row
+also emits `answer_sha256`; the renderer refuses to rank that workload unless
+every measured engine returns the same answer hash. Artifacts live under:
 
 ```text
 benchmarks/results/latest/scale-sweep/
