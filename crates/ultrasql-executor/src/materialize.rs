@@ -91,7 +91,10 @@ impl Operator for Materialize {
             self.buffer = Some(buf);
         }
 
-        let buf = self.buffer.as_ref().expect("just-set");
+        let buf = self
+            .buffer
+            .as_ref()
+            .ok_or(ExecError::Internal("materialize buffer missing"))?;
         if self.cursor >= buf.len() {
             self.eof = true;
             return Ok(None);

@@ -6,6 +6,7 @@ use std::sync::Arc;
 use ultrasql_catalog::{IndexEntry, TableEntry};
 use ultrasql_core::{BlockNumber, CommandId, DataType, RelationId, Schema, TupleId, Value, Xid};
 use ultrasql_executor::fused_delete::FusedDeleteInt32Pair;
+use ultrasql_executor::fused_insert::FusedInsertInt32Pair;
 use ultrasql_executor::fused_update::{FusedCmp, FusedPredicate, FusedUpdateInt32Add};
 use ultrasql_executor::{
     Eval, Filter, InsertConflictAction, InsertIndexEncoder, InsertIndexMaintainer, ModifyKind,
@@ -108,6 +109,16 @@ pub(super) fn lower_real_insert(
         )
         .with_wal(ctx.heap.wal_sink().cloned());
         return Ok(Box::new(insert));
+    }
+    if let Some(fused) = try_build_fused_insert_int32_pair(
+        entry,
+        &insert_columns,
+        source,
+        on_conflict,
+        returning,
+        ctx,
+    ) {
+        return Ok(fused);
     }
     let child: Box<dyn Operator> = match source {
         LogicalPlan::Values { rows, schema } => {
@@ -227,6 +238,71 @@ pub(super) fn lower_real_insert(
         )
     };
     Ok(Box::new(modify))
+}
+
+fn try_build_fused_insert_int32_pair(
+    entry: &TableEntry,
+    insert_columns: &[usize],
+    source: &LogicalPlan,
+    on_conflict: Option<&LogicalOnConflict>,
+    returning: &[(ScalarExpr, String)],
+    ctx: &LowerCtx<'_>,
+) -> Option<Box<dyn Operator>> {
+    if on_conflict.is_some()
+        || !returning.is_empty()
+        || insert_column_map_needed(insert_columns, entry.schema.len())
+        || ctx.table_constraints.contains_key(&entry.oid)
+        || ctx
+            .catalog_snapshot
+            .indexes_by_table
+            .get(&entry.oid)
+            .is_some_and(|indexes| !indexes.is_empty())
+    {
+        return None;
+    }
+    let fields = entry.schema.fields();
+    if fields.len() != 2
+        || fields[0].data_type != DataType::Int32
+        || fields[1].data_type != DataType::Int32
+    {
+        return None;
+    }
+    let LogicalPlan::Values { rows, schema } = source else {
+        return None;
+    };
+    if schema.len() != 2
+        || schema.field_at(0).data_type != DataType::Int32
+        || schema.field_at(1).data_type != DataType::Int32
+    {
+        return None;
+    }
+    let mut literal_rows = Vec::with_capacity(rows.len());
+    for row in rows {
+        let [
+            ScalarExpr::Literal {
+                value: Value::Int32(id),
+                ..
+            },
+            ScalarExpr::Literal {
+                value: Value::Int32(val),
+                ..
+            },
+        ] = row.as_slice()
+        else {
+            return None;
+        };
+        literal_rows.push((*id, *val));
+    }
+    let op = FusedInsertInt32Pair::new(
+        Arc::clone(&ctx.heap),
+        RelationId(entry.oid),
+        literal_rows,
+        ctx.xid,
+        ctx.command_id,
+        ctx.heap.wal_sink().cloned(),
+        Some(Arc::clone(&ctx.vm)),
+    );
+    Some(Box::new(op))
 }
 
 fn build_insert_conflict_action(
@@ -1475,25 +1551,21 @@ pub(super) fn try_build_fused_update(
     input: &LogicalPlan,
     ctx: &LowerCtx<'_>,
 ) -> Result<Option<Box<dyn Operator>>, ServerError> {
-    // Schema must be exactly (Int32, Int32). No extra columns, no
-    // NULLability change — `FusedUpdateInt32Add` reads a fixed
-    // 9-byte payload layout.
     let fields = entry.schema.fields();
-    if fields.len() != 2
-        || fields[0].data_type != DataType::Int32
-        || fields[1].data_type != DataType::Int32
-    {
-        return Ok(None);
-    }
+    let exact_int32_pair = fields.len() == 2
+        && fields[0].data_type == DataType::Int32
+        && fields[1].data_type == DataType::Int32;
 
     if assignments.len() != 1 {
         return Ok(None);
     }
     let (target_col_usize, assign_expr) = &assignments[0];
-    if *target_col_usize > 1 {
+    let Some(target_field) = fields.get(*target_col_usize) else {
+        return Ok(None);
+    };
+    if target_field.data_type.storage_type() != &DataType::Int32 {
         return Ok(None);
     }
-    let target_col = u8::try_from(*target_col_usize).expect("target_col fits in u8");
 
     // The assignment body must read the target column and add (or
     // subtract) an Int32 literal. Subtraction is normalised to
@@ -1581,9 +1653,12 @@ pub(super) fn try_build_fused_update(
             let Some((pred_col_idx, cmp, lit)) = extract_int32_col_op_lit(predicate) else {
                 return Ok(None);
             };
-            if pred_col_idx > 1 {
+            if exact_int32_pair && pred_col_idx > 1 {
                 return Ok(None);
             }
+            let Ok(pred_col_u8) = u8::try_from(pred_col_idx) else {
+                return Ok(None);
+            };
             let fused_cmp = match cmp {
                 ultrasql_vec::kernels::CmpOp::Eq => FusedCmp::Eq,
                 ultrasql_vec::kernels::CmpOp::Ne => FusedCmp::Ne,
@@ -1593,7 +1668,7 @@ pub(super) fn try_build_fused_update(
                 ultrasql_vec::kernels::CmpOp::Ge => FusedCmp::Ge,
             };
             Some(FusedPredicate {
-                col_index: u8::try_from(pred_col_idx).expect("col idx fits in u8"),
+                col_index: pred_col_u8,
                 op: fused_cmp,
                 literal: lit,
             })
@@ -1608,26 +1683,31 @@ pub(super) fn try_build_fused_update(
     };
 
     let rel = RelationId(entry.oid);
-    let block_count = ctx.heap.block_count(rel).max(entry.n_blocks);
-    let op = FusedUpdateInt32Add::new(
-        Arc::clone(&ctx.heap),
-        rel,
-        ctx.snapshot.clone(),
-        Arc::clone(&ctx.oracle),
-        block_count,
-        predicate,
-        target_col,
-        delta,
-        ctx.xid,
-        ctx.command_id,
-    );
-    let op = if let Some(target_tids) = target_tids {
-        op.with_target_tids(target_tids)
-    } else {
-        op
+    if exact_int32_pair {
+        let target_col = u8::try_from(*target_col_usize).expect("target_col fits in u8");
+        let block_count = ctx.heap.block_count(rel).max(entry.n_blocks);
+        let op = FusedUpdateInt32Add::new(
+            Arc::clone(&ctx.heap),
+            rel,
+            ctx.snapshot.clone(),
+            Arc::clone(&ctx.oracle),
+            block_count,
+            predicate,
+            target_col,
+            delta,
+            ctx.xid,
+            ctx.command_id,
+        );
+        let op = if let Some(target_tids) = target_tids {
+            op.with_target_tids(target_tids)
+        } else {
+            op
+        }
+        .with_visibility_map(Arc::clone(&ctx.vm));
+        return Ok(Some(Box::new(op)));
     }
-    .with_visibility_map(Arc::clone(&ctx.vm));
-    Ok(Some(Box::new(op)))
+
+    Ok(None)
 }
 
 fn try_indexed_update_target_tids(
@@ -1647,6 +1727,52 @@ fn try_indexed_update_target_tids(
     };
     let entries = probe_index_entries_ordered(index_entry, range, true, ctx)?;
     Ok(Some(entries.into_iter().map(|(_, tid)| tid).collect()))
+}
+
+fn update_requires_index_maintenance(
+    entry: &TableEntry,
+    assignments: &[(usize, ScalarExpr)],
+    ctx: &LowerCtx<'_>,
+) -> bool {
+    let Some(indexes) = ctx.catalog_snapshot.indexes_by_table.get(&entry.oid) else {
+        return false;
+    };
+    if indexes.is_empty() {
+        return false;
+    }
+
+    let target_matches = |column: usize| assignments.iter().any(|(target, _)| *target == column);
+    let constraints = ctx.table_constraints.get(&entry.oid);
+    for index in indexes {
+        if index
+            .columns
+            .iter()
+            .any(|attnum| target_matches(usize::from(*attnum)))
+        {
+            return true;
+        }
+
+        let metadata = constraints
+            .as_ref()
+            .and_then(|constraints| constraints.indexes.get(&index.oid));
+        if let Some(metadata) = metadata {
+            if !metadata.key_exprs.is_empty()
+                || metadata.predicate.is_some()
+                || metadata.aggregating.is_some()
+            {
+                return true;
+            }
+            if metadata
+                .include_columns
+                .iter()
+                .any(|column| target_matches(*column))
+            {
+                return true;
+            }
+        }
+    }
+
+    false
 }
 
 pub(super) fn lower_real_update(
@@ -1679,13 +1805,17 @@ pub(super) fn lower_real_update(
     });
     let has_parent_constraints = !build_referenced_by_update_checks(entry.oid, ctx)?.is_empty();
 
-    // Fast-path: when the relation, assignment, and optional filter
-    // all match the `(Int32, Int32) WHERE col cmp lit SET col_i =
-    // col_i ± lit` shape, bypass the SeqScan + Filter + ModifyTable
-    // chain entirely and lower to the single `FusedUpdateInt32Add`
-    // operator. Indexed tables stay on `ModifyTable` so non-key
-    // updates keep B-tree TIDs in sync with the new heap version.
-    if returning.is_empty() && !has_indexes && !has_child_constraints && !has_parent_constraints {
+    // Fast-path: when the relation, assignment, and optional filter all
+    // match the `(Int32, Int32) WHERE col cmp lit SET col_i = col_i ±
+    // lit` shape, bypass the SeqScan + Filter + ModifyTable chain. This
+    // is also safe for indexed tables when the update is in-place and no
+    // maintained index state can depend on the assigned column.
+    let index_maintenance_needed = update_requires_index_maintenance(entry, assignments, ctx);
+    if returning.is_empty()
+        && !index_maintenance_needed
+        && !has_child_constraints
+        && !has_parent_constraints
+    {
         if let Some(fused) = try_build_fused_update(table, entry, assignments, input, ctx)? {
             return Ok(fused);
         }

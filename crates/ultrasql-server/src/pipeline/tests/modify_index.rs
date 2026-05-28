@@ -32,7 +32,7 @@ fn lower_query_eq_indexed_column_picks_index_scan() {
 }
 
 #[test]
-fn lower_update_eq_indexed_column_uses_modifytable_not_fused_update() {
+fn lower_update_eq_indexed_column_non_key_assignment_uses_fused_update() {
     let rows: Vec<(i32, i32)> = (1..=100).map(|i| (i, i * 10)).collect();
     let (fix, _entry, _) = build_index_fixture("t_update_indexed", &rows, true);
     let tables = SampleTables::new();
@@ -68,8 +68,52 @@ fn lower_update_eq_indexed_column_uses_modifytable_not_fused_update() {
     let op = lower_query(&plan, &ctx).expect("lowers");
     let debug = format!("{op:?}");
     assert!(
+        debug.starts_with("FusedUpdateInt32Add")
+            && debug.contains("target_tids: Some(1)")
+            && debug.contains("target_col: 1"),
+        "indexed non-key UPDATE should use TID-targeted fused update, got: {debug}"
+    );
+}
+
+#[test]
+fn lower_update_eq_indexed_column_key_assignment_uses_modifytable() {
+    let rows: Vec<(i32, i32)> = (1..=100).map(|i| (i, i * 10)).collect();
+    let (fix, _entry, _) = build_index_fixture("t_update_indexed_key", &rows, true);
+    let tables = SampleTables::new();
+    let ctx = fix.ctx(&tables);
+    let id_col = ScalarExpr::Column {
+        name: "id".into(),
+        index: 0,
+        data_type: DataType::Int32,
+    };
+    let delta = ScalarExpr::Literal {
+        value: Value::Int32(7),
+        data_type: DataType::Int32,
+    };
+    let plan = LogicalPlan::Update {
+        table: "t_update_indexed_key".into(),
+        assignments: vec![(
+            0,
+            ScalarExpr::Binary {
+                op: BinaryOp::Add,
+                left: Box::new(id_col),
+                right: Box::new(delta),
+                data_type: DataType::Int32,
+            },
+        )],
+        input: Box::new(build_filter_scan_plan(
+            "t_update_indexed_key",
+            eq_id_literal(42),
+        )),
+        returning: Vec::new(),
+        schema: Schema::empty(),
+    };
+
+    let op = lower_query(&plan, &ctx).expect("lowers");
+    let debug = format!("{op:?}");
+    assert!(
         debug.starts_with("ModifyTable"),
-        "indexed table UPDATE must maintain B-tree entries through ModifyTable, got: {debug}"
+        "indexed key UPDATE must maintain index entries through ModifyTable, got: {debug}"
     );
 }
 

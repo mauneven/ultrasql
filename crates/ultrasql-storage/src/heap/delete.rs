@@ -5,32 +5,147 @@
 //! `heap/mod.rs`. Splitting across files keeps each unit under the
 //! 600-line ceiling without changing semantics.
 
-#![allow(unused_imports)]
+use std::sync::atomic::Ordering;
 
-use std::sync::Arc;
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
-
-use ahash::AHashMap;
 use ultrasql_core::{BlockNumber, CommandId, Lsn, PageId, RelationId, TupleId, Xid};
 use ultrasql_mvcc::tuple_header::{InfoMask, TUPLE_HEADER_SIZE};
 use ultrasql_mvcc::{Snapshot, TupleHeader, Visibility, XidStatusOracle, is_visible};
 use ultrasql_wal::WalRecord;
-use ultrasql_wal::payload::{
-    FullPageWritePayload, HeapDeleteInPlacePayload, HeapDeletePayload, HeapInsertPayload,
-    HeapUpdatePayload,
-};
+use ultrasql_wal::payload::HeapDeletePayload;
 use ultrasql_wal::record::RecordType;
 
-use crate::buffer_pool::{BufferPool, PageGuard, PageLoader};
-use crate::page::PageError;
+use crate::buffer_pool::{PageGuard, PageLoader};
 use crate::wal_sink::WalSink;
 
-use super::{
-    DeleteOptions, HeapAccess, HeapError, HeapTuple, InsertOptions, UndoEntry, UndoRelationLog,
-    UpdateOptions, UpdateOutcome, UpdatePayload,
-};
+use super::{DeleteOptions, HeapAccess, HeapError};
+
+#[inline]
+fn read_le_u16(bytes: &[u8], start: usize, error: &'static str) -> Result<u16, HeapError> {
+    let end = start
+        .checked_add(2)
+        .ok_or(HeapError::MalformedHeader(error))?;
+    let slice = bytes
+        .get(start..end)
+        .ok_or(HeapError::MalformedHeader(error))?;
+    Ok(u16::from_le_bytes([slice[0], slice[1]]))
+}
+
+#[inline]
+fn read_le_u64(bytes: &[u8], start: usize, error: &'static str) -> Result<u64, HeapError> {
+    let end = start
+        .checked_add(8)
+        .ok_or(HeapError::MalformedHeader(error))?;
+    let slice = bytes
+        .get(start..end)
+        .ok_or(HeapError::MalformedHeader(error))?;
+    Ok(u64::from_le_bytes([
+        slice[0], slice[1], slice[2], slice[3], slice[4], slice[5], slice[6], slice[7],
+    ]))
+}
+
+#[inline]
+fn read_le_i32(bytes: &[u8], start: usize, error: &'static str) -> Result<i32, HeapError> {
+    let end = start
+        .checked_add(4)
+        .ok_or(HeapError::MalformedHeader(error))?;
+    let slice = bytes
+        .get(start..end)
+        .ok_or(HeapError::MalformedHeader(error))?;
+    Ok(i32::from_le_bytes([slice[0], slice[1], slice[2], slice[3]]))
+}
+
+#[inline]
+fn itemid_window(item_raw: u32) -> Result<(usize, usize), HeapError> {
+    let length = u16::try_from((item_raw >> 2) & 0x7FFF)
+        .map_err(|_| HeapError::MalformedHeader("item length overflow"))?;
+    let offset = u16::try_from((item_raw >> 17) & 0x7FFF)
+        .map_err(|_| HeapError::MalformedHeader("item offset overflow"))?;
+    Ok((usize::from(length), usize::from(offset)))
+}
 
 impl<L: PageLoader> HeapAccess<L> {
+    /// Clear `xmax` stamps for an aborted transaction.
+    ///
+    /// Regular MVCC visibility can treat an aborted `xmax` as visible,
+    /// but the heap update helpers must also see the slot as physically
+    /// alive before stamping a new `xmax`. Abort cleanup therefore clears
+    /// `xmax`/`cmax` for DELETE stamps and aborted classical UPDATE old
+    /// versions. In-place UPDATEs are skipped here because their payload
+    /// must be restored from the undo log before their header is cleared.
+    pub(crate) fn rollback_delete_stamps(&self, xid: Xid) -> Result<usize, HeapError> {
+        use crate::page::{ITEMID_SIZE, PAGE_HEADER_SIZE, PageHeader};
+
+        let mut total_restored = 0_usize;
+        let rels: Vec<RelationId> = self.block_counters.iter().map(|e| *e.key()).collect();
+        for rel in rels {
+            let Some(counter) = self.block_counters.get(&rel) else {
+                continue;
+            };
+            let block_count = counter.load(Ordering::Acquire);
+            drop(counter);
+
+            let mut relation_restored = false;
+            for block in 0..block_count {
+                let page_id = PageId::new(rel, BlockNumber::new(block));
+                let guard = self.pool.get_page(page_id)?;
+                let mut page = guard.write();
+                let bytes = page.as_bytes_mut();
+                let slot_count = PageHeader::decode(bytes)
+                    .map_err(HeapError::Page)?
+                    .slot_count();
+
+                for slot in 0..slot_count {
+                    let item_id_off = PAGE_HEADER_SIZE + usize::from(slot) * ITEMID_SIZE;
+                    let item_raw = u32::from_le_bytes([
+                        bytes[item_id_off],
+                        bytes[item_id_off + 1],
+                        bytes[item_id_off + 2],
+                        bytes[item_id_off + 3],
+                    ]);
+                    if item_raw & 0b11 != 1 {
+                        continue;
+                    }
+                    let (length, offset) = itemid_window(item_raw)?;
+                    if length < TUPLE_HEADER_SIZE
+                        || offset.checked_add(length).is_none_or(|e| e > bytes.len())
+                    {
+                        return Err(HeapError::MalformedHeader("slot shorter than header"));
+                    }
+                    let (header, _) =
+                        TupleHeader::decode(&bytes[offset..offset + TUPLE_HEADER_SIZE])
+                            .ok_or(HeapError::MalformedHeader("header decode failed"))?;
+                    if header.xmax != xid || header.infomask.contains(InfoMask::UPDATED_IN_PLACE) {
+                        continue;
+                    }
+
+                    let tid = TupleId::new(page_id, slot);
+                    let mut restored = header;
+                    restored.xmax = Xid::INVALID;
+                    restored.cmax = CommandId::FIRST;
+                    restored.ctid = tid;
+                    restored.infomask.clear(
+                        InfoMask::UPDATED
+                            | InfoMask::HOT_UPDATED
+                            | InfoMask::UPDATED_IN_PLACE
+                            | InfoMask::XMAX_COMMITTED
+                            | InfoMask::XMAX_INVALID,
+                    );
+                    let mut header_bytes = [0_u8; TUPLE_HEADER_SIZE];
+                    restored.encode(&mut header_bytes);
+                    bytes[offset..offset + TUPLE_HEADER_SIZE].copy_from_slice(&header_bytes);
+                    relation_restored = true;
+                    total_restored += 1;
+                }
+            }
+
+            if relation_restored {
+                self.column_cache.bump_version(rel);
+            }
+        }
+
+        Ok(total_restored)
+    }
+
     /// Mark a tuple deleted.
     ///
     /// The slot stays allocated and the payload is left untouched; only
@@ -342,8 +457,7 @@ impl<L: PageLoader> HeapAccess<L> {
                 if item_raw & 0b11 != 1 {
                     continue;
                 }
-                let length = ((item_raw >> 2) & 0x7FFF) as usize;
-                let offset = ((item_raw >> 17) & 0x7FFF) as usize;
+                let (length, offset) = itemid_window(item_raw)?;
                 if length < TUPLE_HEADER_SIZE
                     || offset
                         .checked_add(length)
@@ -352,12 +466,9 @@ impl<L: PageLoader> HeapAccess<L> {
                     return Err(HeapError::MalformedHeader("slot shorter than header"));
                 }
 
-                let xmin_raw =
-                    u64::from_le_bytes(src_bytes[offset..offset + 8].try_into().expect("8B"));
-                let xmax_raw =
-                    u64::from_le_bytes(src_bytes[offset + 8..offset + 16].try_into().expect("8B"));
-                let infomask_bits =
-                    u16::from_le_bytes(src_bytes[offset + 24..offset + 26].try_into().expect("2B"));
+                let xmin_raw = read_le_u64(src_bytes, offset, "xmin out of bounds")?;
+                let xmax_raw = read_le_u64(src_bytes, offset + 8, "xmax out of bounds")?;
+                let infomask_bits = read_le_u16(src_bytes, offset + 24, "infomask out of bounds")?;
                 let xmin_xid = Xid::new(xmin_raw);
 
                 let visible = if xmax_raw == 0 {
@@ -447,6 +558,224 @@ impl<L: PageLoader> HeapAccess<L> {
 
         if total_deleted > 0 {
             self.column_cache.bump_version(rel);
+        }
+
+        Ok(total_deleted)
+    }
+
+    /// Parallel no-WAL variant for large in-memory fused `(Int32, Int32)`
+    /// DELETEs.
+    ///
+    /// WAL-backed deletes stay sequential so per-transaction WAL chain ordering
+    /// remains unchanged. Without WAL, each worker owns a disjoint page range
+    /// and stamps matching visible tuples under the same MVCC rules as
+    /// [`Self::delete_int32_pair_inplace`].
+    #[allow(clippy::too_many_arguments)]
+    pub fn delete_int32_pair_inplace_parallel_no_wal<O, P>(
+        &self,
+        rel: RelationId,
+        block_count: u32,
+        snapshot: &Snapshot,
+        oracle: &O,
+        predicate: P,
+        xid: Xid,
+        command_id: CommandId,
+        vm: Option<&crate::vm::VisibilityMap>,
+    ) -> Result<usize, HeapError>
+    where
+        O: XidStatusOracle + Sync + ?Sized,
+        P: Fn(i32, i32) -> bool + Sync,
+    {
+        let available_workers = std::thread::available_parallelism().map_or(1, |n| n.get());
+        if block_count < 2_048 || available_workers <= 1 {
+            return self.delete_int32_pair_inplace(
+                rel,
+                block_count,
+                snapshot,
+                oracle,
+                predicate,
+                xid,
+                command_id,
+                None,
+                vm,
+            );
+        }
+
+        let block_count_usize = usize::try_from(block_count)
+            .map_err(|_| HeapError::MalformedHeader("block count overflow"))?;
+        let workers = available_workers
+            .min(block_count_usize.div_ceil(512))
+            .min(block_count_usize)
+            .max(1);
+        if workers <= 1 {
+            return self.delete_int32_pair_inplace(
+                rel,
+                block_count,
+                snapshot,
+                oracle,
+                predicate,
+                xid,
+                command_id,
+                None,
+                vm,
+            );
+        }
+
+        let workers_u32 =
+            u32::try_from(workers).map_err(|_| HeapError::MalformedHeader("worker overflow"))?;
+        let chunk_blocks = block_count.div_ceil(workers_u32).max(1);
+        let predicate_ref = &predicate;
+        let mut total_deleted = 0_usize;
+
+        std::thread::scope(|scope| {
+            let mut handles = Vec::with_capacity(workers);
+            let mut start_block = 0_u32;
+            while start_block < block_count {
+                let end_block = start_block.saturating_add(chunk_blocks).min(block_count);
+                handles.push(scope.spawn(move || {
+                    self.delete_int32_pair_range_no_wal(
+                        rel,
+                        start_block,
+                        end_block,
+                        snapshot,
+                        oracle,
+                        predicate_ref,
+                        xid,
+                        command_id,
+                        vm,
+                    )
+                }));
+                start_block = end_block;
+            }
+
+            for handle in handles {
+                total_deleted = total_deleted.saturating_add(handle.join().map_err(|_| {
+                    HeapError::MalformedHeader("parallel delete worker panicked")
+                })??);
+            }
+            Ok::<(), HeapError>(())
+        })?;
+
+        if total_deleted > 0 {
+            self.column_cache.bump_version(rel);
+        }
+
+        Ok(total_deleted)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn delete_int32_pair_range_no_wal<O, P>(
+        &self,
+        rel: RelationId,
+        start_block: u32,
+        end_block: u32,
+        snapshot: &Snapshot,
+        oracle: &O,
+        predicate: &P,
+        xid: Xid,
+        command_id: CommandId,
+        vm: Option<&crate::vm::VisibilityMap>,
+    ) -> Result<usize, HeapError>
+    where
+        O: XidStatusOracle + ?Sized,
+        P: Fn(i32, i32) -> bool,
+    {
+        use crate::page::{ITEMID_SIZE, PAGE_HEADER_SIZE};
+
+        let mut total_deleted: usize = 0;
+        let mut xmin_cache: Option<(Xid, u16, bool)> = None;
+        let xid_bytes = xid.raw().to_le_bytes();
+        let cmd_bytes = command_id.raw().to_le_bytes();
+
+        for src_block in start_block..end_block {
+            let src_page_id = PageId::new(rel, BlockNumber::new(src_block));
+            let mut page_deleted = false;
+
+            let src_guard = self.pool.get_page(src_page_id)?;
+            let mut src_page = src_guard.write();
+            let src_bytes = src_page.as_bytes_mut();
+            let src_slot_count = {
+                let hdr = crate::page::PageHeader::decode(src_bytes).map_err(HeapError::Page)?;
+                hdr.slot_count()
+            };
+
+            for src_slot in 0..src_slot_count {
+                let item_id_off = PAGE_HEADER_SIZE + usize::from(src_slot) * ITEMID_SIZE;
+                let item_raw = u32::from_le_bytes([
+                    src_bytes[item_id_off],
+                    src_bytes[item_id_off + 1],
+                    src_bytes[item_id_off + 2],
+                    src_bytes[item_id_off + 3],
+                ]);
+                if item_raw & 0b11 != 1 {
+                    continue;
+                }
+                let (length, offset) = itemid_window(item_raw)?;
+                if length < TUPLE_HEADER_SIZE
+                    || offset
+                        .checked_add(length)
+                        .is_none_or(|e| e > src_bytes.len())
+                {
+                    return Err(HeapError::MalformedHeader("slot shorter than header"));
+                }
+
+                let xmin_raw = read_le_u64(src_bytes, offset, "xmin out of bounds")?;
+                let xmax_raw = read_le_u64(src_bytes, offset + 8, "xmax out of bounds")?;
+                let infomask_bits = read_le_u16(src_bytes, offset + 24, "infomask out of bounds")?;
+                let xmin_xid = Xid::new(xmin_raw);
+
+                let visible = if xmax_raw == 0 {
+                    match xmin_cache {
+                        Some((cxmin, cinfo, cv)) if cxmin == xmin_xid && cinfo == infomask_bits => {
+                            cv
+                        }
+                        _ => {
+                            let (h, _) =
+                                TupleHeader::decode(&src_bytes[offset..offset + TUPLE_HEADER_SIZE])
+                                    .ok_or(HeapError::MalformedHeader("header decode failed"))?;
+                            let v =
+                                matches!(is_visible(&h, snapshot, oracle), Visibility::Visible,);
+                            xmin_cache = Some((h.xmin, h.infomask.bits(), v));
+                            v
+                        }
+                    }
+                } else {
+                    let (h, _) =
+                        TupleHeader::decode(&src_bytes[offset..offset + TUPLE_HEADER_SIZE])
+                            .ok_or(HeapError::MalformedHeader("header decode failed"))?;
+                    matches!(is_visible(&h, snapshot, oracle), Visibility::Visible)
+                };
+                if !visible {
+                    continue;
+                }
+
+                let payload_off = offset + TUPLE_HEADER_SIZE;
+                if payload_off + 9 > offset + length {
+                    return Err(HeapError::MalformedHeader(
+                        "payload shorter than (Int32, Int32)",
+                    ));
+                }
+                let id = read_le_i32(src_bytes, payload_off + 1, "id payload out of bounds")?;
+                let val = read_le_i32(src_bytes, payload_off + 5, "val payload out of bounds")?;
+                if !predicate(id, val) {
+                    continue;
+                }
+
+                src_bytes[offset + 8..offset + 16].copy_from_slice(&xid_bytes);
+                src_bytes[offset + 20..offset + 24].copy_from_slice(&cmd_bytes);
+                let new_infomask = infomask_bits | InfoMask::UPDATED;
+                src_bytes[offset + 24..offset + 26].copy_from_slice(&new_infomask.to_le_bytes());
+
+                total_deleted += 1;
+                page_deleted = true;
+            }
+
+            drop(src_page);
+            drop(src_guard);
+
+            if page_deleted && let Some(vm) = vm {
+                vm.clear(src_page_id.relation, src_page_id.block);
+            }
         }
 
         Ok(total_deleted)

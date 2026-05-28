@@ -138,7 +138,9 @@ impl Operator for NestedLoopJoin {
             self.left_phase_done = true;
         }
 
-        let iter = self.output.as_mut().expect("just-set");
+        let iter = self.output.as_mut().ok_or(ExecError::Internal(
+            "nested loop join output iterator missing",
+        ))?;
         let chunk: Vec<Vec<Value>> = iter.by_ref().take(BATCH_TARGET_ROWS).collect();
         if chunk.is_empty() {
             self.eof = true;

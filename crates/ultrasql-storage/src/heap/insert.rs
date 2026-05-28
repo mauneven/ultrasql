@@ -12,29 +12,17 @@
     clippy::cast_lossless,
     reason = "on-disk format / fixed-width packing; narrowings bounded by PAGE_SIZE / relation size"
 )]
-#![allow(unused_imports)]
-
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::Ordering;
 
-use ahash::AHashMap;
-use ultrasql_core::{BlockNumber, CommandId, Lsn, PageId, RelationId, TupleId, Xid};
-use ultrasql_mvcc::tuple_header::{InfoMask, TUPLE_HEADER_SIZE};
-use ultrasql_mvcc::{Snapshot, TupleHeader, Visibility, XidStatusOracle, is_visible};
-use ultrasql_wal::WalRecord;
-use ultrasql_wal::payload::{
-    FullPageWritePayload, HeapDeletePayload, HeapInsertPayload, HeapUpdatePayload,
-};
-use ultrasql_wal::record::RecordType;
+use ultrasql_core::{BlockNumber, PageId, RelationId, TupleId};
+use ultrasql_mvcc::TupleHeader;
+use ultrasql_mvcc::tuple_header::TUPLE_HEADER_SIZE;
 
 use crate::buffer_pool::{BufferPool, PageGuard, PageLoader};
 use crate::page::PageError;
-use crate::wal_sink::WalSink;
 
-use super::{
-    DeleteOptions, HeapAccess, HeapError, HeapTuple, InsertOptions, UndoEntry, UndoRelationLog,
-    UpdateOptions, UpdateOutcome, UpdatePayload,
-};
+use super::{HeapAccess, HeapError, InsertOptions};
 
 impl<L: PageLoader> HeapAccess<L> {
     /// Insert a tuple into the relation.

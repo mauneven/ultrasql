@@ -193,6 +193,18 @@ async fn xml_stores_renders_copies_rejects_invalid_and_survives_restart() {
         .batch_execute("SELECT '<root>'::xml")
         .await
         .expect_err("malformed XML rejected");
+    client
+        .batch_execute("SELECT 'junk<root/>'::xml")
+        .await
+        .expect_err("pre-root junk rejected");
+    client
+        .batch_execute("SELECT '<!DOCTYPE root SYSTEM \"file:///tmp/x\"><root/>'::xml")
+        .await
+        .expect_err("DTD/external entity surface rejected");
+    client
+        .batch_execute("SELECT '<root>&unknown;</root>'::xml")
+        .await
+        .expect_err("unknown entity rejected");
 
     shutdown(running).await;
 
@@ -213,6 +225,57 @@ async fn xml_stores_renders_copies_rejects_invalid_and_survives_restart() {
             vec!["<root attr=\"v\"><child>text</child></root>".to_owned()],
             vec!["<root><copy/></root>".to_owned()],
         ]
+    );
+
+    shutdown(running).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn xml_functions_validate_securely_and_extract_simple_xpath() {
+    let data_dir = tempfile::TempDir::new().unwrap();
+    let running = start_persistent_server(data_dir.path(), "xml_functions").await;
+    let client = &running.client;
+
+    assert_eq!(
+        simple_rows(
+            client
+                .simple_query(
+                    "SELECT \
+                        xml_is_well_formed_document('<root><child/></root>'), \
+                        xml_is_well_formed_document('junk<root/>'), \
+                        xml_is_well_formed_document('<!DOCTYPE root SYSTEM \"file:///tmp/x\"><root/>'), \
+                        xml_is_well_formed_document('<root>&unknown;</root>'), \
+                        xml_is_well_formed_content('<a/><b/>')",
+                )
+                .await
+                .expect("xml well-formed functions"),
+        ),
+        vec![vec![
+            "t".to_owned(),
+            "f".to_owned(),
+            "f".to_owned(),
+            "f".to_owned(),
+            "t".to_owned(),
+        ]]
+    );
+
+    assert_eq!(
+        simple_rows(
+            client
+                .simple_query(
+                    "SELECT \
+                        xpath_exists('/root/item[@id=\"2\"]', XML '<root><item id=\"1\"/><item id=\"2\"><name>b</name></item></root>'), \
+                        xpath_exists('/root/missing', XML '<root><item id=\"1\"/></root>'), \
+                        xpath('/root/item[@id=\"2\"]/name', XML '<root><item id=\"1\"/><item id=\"2\"><name>b</name></item></root>')",
+                )
+                .await
+                .expect("xpath functions"),
+        ),
+        vec![vec![
+            "t".to_owned(),
+            "f".to_owned(),
+            "{<name>b</name>}".to_owned(),
+        ]]
     );
 
     shutdown(running).await;

@@ -70,8 +70,7 @@ impl<L: PageLoader> FusedDeleteInt32Pair<L> {
         xid: Xid,
         command_id: CommandId,
     ) -> Self {
-        let schema = Schema::new([Field::required("count", DataType::Int64)])
-            .expect("affected-count schema is well-formed");
+        let schema = Schema::new_with_duplicate_names([Field::required("count", DataType::Int64)]);
         Self {
             heap,
             relation,
@@ -116,9 +115,8 @@ impl<L: PageLoader + Send + Sync + std::fmt::Debug + 'static> Operator for Fused
         };
         let wal_sink_arc = self.heap.wal_sink().cloned();
         let wal_sink: Option<&dyn ultrasql_storage::WalSink> = wal_sink_arc.as_deref();
-        let n = self
-            .heap
-            .delete_int32_pair_inplace(
+        let n = if wal_sink.is_some() {
+            self.heap.delete_int32_pair_inplace(
                 self.relation,
                 self.block_count,
                 &self.snapshot,
@@ -129,7 +127,19 @@ impl<L: PageLoader + Send + Sync + std::fmt::Debug + 'static> Operator for Fused
                 wal_sink,
                 self.vm.as_deref(),
             )
-            .map_err(|e| ExecError::TypeMismatch(e.to_string()))?;
+        } else {
+            self.heap.delete_int32_pair_inplace_parallel_no_wal(
+                self.relation,
+                self.block_count,
+                &self.snapshot,
+                &*self.oracle,
+                predicate_fn,
+                self.xid,
+                self.command_id,
+                self.vm.as_deref(),
+            )
+        }
+        .map_err(|e| ExecError::TypeMismatch(e.to_string()))?;
 
         let affected_i64 = i64::try_from(n).unwrap_or(i64::MAX);
         let batch = Batch::new([Column::Int64(NumericColumn::from_data(vec![affected_i64]))])

@@ -694,7 +694,9 @@ impl Operator for SortAggregate {
             let rows = self.build()?;
             self.output = Some(rows.into_iter());
         }
-        let iter = self.output.as_mut().expect("just-set");
+        let iter = self.output.as_mut().ok_or(ExecError::Internal(
+            "sort aggregate output iterator missing",
+        ))?;
         let chunk: Vec<Vec<Value>> = iter.by_ref().take(BATCH_TARGET_ROWS).collect();
         if chunk.is_empty() {
             self.eof = true;

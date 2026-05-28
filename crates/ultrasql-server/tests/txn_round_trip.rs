@@ -561,6 +561,207 @@ async fn begin_update_rollback_reverts_value() {
     shutdown(client, server_handle).await;
 }
 
+/// `BEGIN; DELETE; ROLLBACK; UPDATE` — rollback clears the delete stamp so
+/// later writes can still update the row.
+#[tokio::test]
+async fn begin_delete_rollback_allows_future_update() {
+    let (client, _conn_handle, server_handle) = start_server_and_connect().await;
+
+    client
+        .batch_execute("CREATE TABLE t (id INT NOT NULL, val INT)")
+        .await
+        .expect("create table");
+    client
+        .batch_execute("INSERT INTO t VALUES (1, 100), (2, 200)")
+        .await
+        .expect("baseline insert");
+
+    client.batch_execute("BEGIN").await.expect("BEGIN");
+    client
+        .batch_execute("DELETE FROM t WHERE id = 1")
+        .await
+        .expect("delete inside tx");
+    client.batch_execute("ROLLBACK").await.expect("ROLLBACK");
+
+    client
+        .batch_execute("UPDATE t SET val = val + 7 WHERE id = 1")
+        .await
+        .expect("update after delete rollback");
+    let rows = client
+        .query("SELECT val FROM t WHERE id = 1", &[])
+        .await
+        .expect("select after update");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].get::<_, i32>(0), 107);
+
+    shutdown(client, server_handle).await;
+}
+
+/// Wide rows use the general heap update/delete path; rollback must clear
+/// those delete stamps too.
+#[tokio::test]
+async fn begin_wide_delete_rollback_allows_future_update() {
+    let (client, _conn_handle, server_handle) = start_server_and_connect().await;
+
+    client
+        .batch_execute(
+            "CREATE TABLE t (
+                id INT NOT NULL,
+                tenant_id INT NOT NULL,
+                bucket INT NOT NULL,
+                amount BIGINT NOT NULL,
+                paid INT NOT NULL,
+                score INT NOT NULL
+            )",
+        )
+        .await
+        .expect("create table");
+    client
+        .batch_execute(
+            "INSERT INTO t VALUES
+                (1, 3, 5, 100, 1, 10),
+                (2, 4, 6, 200, 0, 20)",
+        )
+        .await
+        .expect("baseline insert");
+
+    client.batch_execute("BEGIN").await.expect("BEGIN");
+    client
+        .batch_execute("DELETE FROM t WHERE id = 1")
+        .await
+        .expect("delete inside tx");
+    client.batch_execute("ROLLBACK").await.expect("ROLLBACK");
+
+    client
+        .batch_execute("UPDATE t SET amount = amount + 7, score = score + 3 WHERE id = 1")
+        .await
+        .expect("update after wide delete rollback");
+    let rows = client
+        .query("SELECT amount, score FROM t WHERE id = 1", &[])
+        .await
+        .expect("select after update");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].get::<_, i64>(0), 107);
+    assert_eq!(rows[0].get::<_, i32>(1), 13);
+
+    shutdown(client, server_handle).await;
+}
+
+/// Wide-row UPDATE rollback must unchain the aborted old-version stamp so the
+/// row can be updated again.
+#[tokio::test]
+async fn begin_wide_update_rollback_allows_future_update() {
+    let (client, _conn_handle, server_handle) = start_server_and_connect().await;
+
+    client
+        .batch_execute(
+            "CREATE TABLE t (
+                id INT NOT NULL,
+                tenant_id INT NOT NULL,
+                bucket INT NOT NULL,
+                amount BIGINT NOT NULL,
+                paid INT NOT NULL,
+                score INT NOT NULL
+            )",
+        )
+        .await
+        .expect("create table");
+    client
+        .batch_execute("INSERT INTO t VALUES (1, 3, 5, 100, 1, 10)")
+        .await
+        .expect("baseline insert");
+
+    client.batch_execute("BEGIN").await.expect("BEGIN");
+    client
+        .batch_execute("UPDATE t SET amount = amount + 999, score = score + 999 WHERE id = 1")
+        .await
+        .expect("update inside tx");
+    client.batch_execute("ROLLBACK").await.expect("ROLLBACK");
+
+    client
+        .batch_execute("UPDATE t SET amount = amount + 7, score = score + 3 WHERE id = 1")
+        .await
+        .expect("update after wide update rollback");
+    let rows = client
+        .query("SELECT amount, score FROM t WHERE id = 1", &[])
+        .await
+        .expect("select after update");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].get::<_, i64>(0), 107);
+    assert_eq!(rows[0].get::<_, i32>(1), 13);
+
+    shutdown(client, server_handle).await;
+}
+
+/// Cached scalar aggregates are safe inside a read-committed transaction only
+/// when the transaction has not modified the aggregate's target table. If it
+/// has, the normal MVCC path must still see the transaction's own write.
+#[tokio::test]
+async fn explicit_transaction_scalar_aggregate_sees_own_write_on_target_table() {
+    let (client, _conn_handle, server_handle) = start_server_and_connect().await;
+
+    client
+        .batch_execute(
+            "CREATE TABLE t (id INT NOT NULL, val INT NOT NULL);\
+             INSERT INTO t VALUES (1, 1), (2, 2), (3, 3)",
+        )
+        .await
+        .expect("seed table");
+    client
+        .query_one("SELECT SUM(val) FROM t", &[])
+        .await
+        .expect("prime scalar aggregate cache");
+
+    client.batch_execute("BEGIN").await.expect("BEGIN");
+    client
+        .batch_execute("INSERT INTO t VALUES (4, 4)")
+        .await
+        .expect("insert target row inside tx");
+    let row = client
+        .query_one("SELECT SUM(val) FROM t", &[])
+        .await
+        .expect("sum inside tx");
+    assert_eq!(row.get::<_, i64>(0), 10);
+    client.batch_execute("ROLLBACK").await.expect("ROLLBACK");
+
+    shutdown(client, server_handle).await;
+}
+
+/// A transaction that writes one table may still use the cached scalar
+/// aggregate path for an unrelated table under read committed semantics.
+#[tokio::test]
+async fn explicit_transaction_scalar_aggregate_reads_unmodified_table() {
+    let (client, _conn_handle, server_handle) = start_server_and_connect().await;
+
+    client
+        .batch_execute(
+            "CREATE TABLE fact (id INT NOT NULL, val INT NOT NULL);\
+             CREATE TABLE state (id INT NOT NULL, val INT NOT NULL);\
+             INSERT INTO fact VALUES (1, 1), (2, 2), (3, 3);\
+             INSERT INTO state VALUES (1, 10)",
+        )
+        .await
+        .expect("seed tables");
+    client
+        .query_one("SELECT SUM(val) FROM fact", &[])
+        .await
+        .expect("prime scalar aggregate cache");
+
+    client.batch_execute("BEGIN").await.expect("BEGIN");
+    client
+        .batch_execute("UPDATE state SET val = val + 7 WHERE id = 1")
+        .await
+        .expect("update unrelated table inside tx");
+    let row = client
+        .query_one("SELECT SUM(val) FROM fact", &[])
+        .await
+        .expect("sum unrelated table inside tx");
+    assert_eq!(row.get::<_, i64>(0), 6);
+    client.batch_execute("ROLLBACK").await.expect("ROLLBACK");
+
+    shutdown(client, server_handle).await;
+}
+
 /// Implicit autocommit still works.  An INSERT issued without a
 /// surrounding BEGIN is visible immediately to subsequent statements.
 #[tokio::test]

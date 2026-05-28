@@ -4,8 +4,6 @@
 //! across files keeps every unit under the 600-line ceiling without
 //! changing semantics.
 
-#![allow(unused_imports)]
-
 use std::sync::Arc;
 
 use bytes::BytesMut;
@@ -1082,6 +1080,62 @@ where
         }
     }
 
+    fn scalar_aggregate_source_table(plan: &LogicalPlan) -> Option<String> {
+        let agg_plan = match plan {
+            LogicalPlan::Project { input, exprs, .. } => {
+                let passthrough = exprs
+                    .iter()
+                    .all(|(expr, _)| matches!(expr, ScalarExpr::Column { .. }));
+                if !passthrough {
+                    return None;
+                }
+                input.as_ref()
+            }
+            other => other,
+        };
+
+        let LogicalPlan::Aggregate {
+            input,
+            group_by,
+            aggregates,
+            ..
+        } = agg_plan
+        else {
+            return None;
+        };
+        if !group_by.is_empty() || aggregates.len() != 1 || aggregates[0].distinct {
+            return None;
+        }
+
+        let table = match input.as_ref() {
+            LogicalPlan::Scan { table, .. } => table,
+            LogicalPlan::Filter {
+                input: filter_input,
+                ..
+            } => {
+                let LogicalPlan::Scan { table, .. } = filter_input.as_ref() else {
+                    return None;
+                };
+                table
+            }
+            _ => return None,
+        };
+        Some(table.to_ascii_lowercase())
+    }
+
+    fn can_use_cached_scalar_aggregate_in_explicit_txn(&self, plan: &LogicalPlan) -> bool {
+        let TxnState::InTransaction(txn) = &self.txn_state else {
+            return false;
+        };
+        if txn.isolation != IsolationLevel::ReadCommitted {
+            return false;
+        }
+        let Some(table) = Self::scalar_aggregate_source_table(plan) else {
+            return false;
+        };
+        !self.pending_table_modifications.contains_key(&table)
+    }
+
     /// `true` iff `plan` is `Insert { source: Values { .. }, .. }`
     /// with no `ON CONFLICT` / `RETURNING` — see the call site for
     /// why this bypasses the optimizer + plan-cache lookup.
@@ -1721,6 +1775,16 @@ where
             {
                 return Ok(result);
             }
+        }
+        if self.can_use_cached_scalar_aggregate_in_explicit_txn(plan)
+            && let Some(result) = try_run_cached_scalar_aggregate_select(
+                plan,
+                catalog_snapshot,
+                self.state.heap.as_ref(),
+                &mut self.write_buf,
+            )
+        {
+            return Ok(result);
         }
         self.reject_non_append_materialized_view_source_write(plan)?;
 

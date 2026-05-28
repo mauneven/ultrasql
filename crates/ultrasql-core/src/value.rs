@@ -811,6 +811,24 @@ impl Value {
         Some(trimmed.to_owned())
     }
 
+    /// Return `true` when text is one well-formed XML document.
+    ///
+    /// Validation is local only: DTD declarations and external entity
+    /// expansion are rejected rather than resolved.
+    #[must_use]
+    pub fn xml_document_is_well_formed(text: &str) -> bool {
+        xml_document_is_well_formed(text)
+    }
+
+    /// Return `true` when text is well-formed XML content.
+    ///
+    /// Content may contain more than one top-level element. The same local-only
+    /// security policy as [`Self::xml_document_is_well_formed`] applies.
+    #[must_use]
+    pub fn xml_content_is_well_formed(text: &str) -> bool {
+        xml_content_is_well_formed(text)
+    }
+
     /// Parse a pgvector-style vector literal, such as `[1,2.5,-3]`.
     ///
     /// Elements are `f32` and must be finite. Empty vectors and values
@@ -1044,7 +1062,17 @@ impl Value {
     }
 }
 
-fn xml_document_is_well_formed(text: &str) -> bool {
+/// Return `true` when `text` is one locally parsed XML document.
+///
+/// The parser rejects DTD declarations and unknown entity references. It never
+/// resolves external entities, so validation cannot read local files or touch
+/// the network.
+#[must_use]
+pub fn xml_document_is_well_formed(text: &str) -> bool {
+    let text = text.trim();
+    if text.is_empty() {
+        return false;
+    }
     let mut stack: Vec<String> = Vec::new();
     let mut cursor = 0_usize;
     let mut saw_root = false;
@@ -1052,7 +1080,14 @@ fn xml_document_is_well_formed(text: &str) -> bool {
 
     while let Some(relative) = text[cursor..].find('<') {
         let open = cursor + relative;
-        if stack.is_empty() && root_closed && !text[cursor..open].trim().is_empty() {
+        let text_segment = &text[cursor..open];
+        if !xml_text_segment_is_well_formed(text_segment) {
+            return false;
+        }
+        if stack.is_empty() && !saw_root && !text_segment.trim().is_empty() {
+            return false;
+        }
+        if stack.is_empty() && root_closed && !text_segment.trim().is_empty() {
             return false;
         }
         let Some(next) = text.as_bytes().get(open + 1).copied() else {
@@ -1080,12 +1115,7 @@ fn xml_document_is_well_formed(text: &str) -> bool {
                 };
                 cursor = open + 9 + end + 3;
             }
-            b'!' => {
-                let Some(close) = xml_tag_end(text, open + 2) else {
-                    return false;
-                };
-                cursor = close + 1;
-            }
+            b'!' => return false,
             b'/' => {
                 let Some(close) = xml_tag_end(text, open + 2) else {
                     return false;
@@ -1137,7 +1167,296 @@ fn xml_document_is_well_formed(text: &str) -> bool {
         }
     }
 
-    saw_root && stack.is_empty() && text[cursor..].trim().is_empty()
+    let trailing = &text[cursor..];
+    saw_root
+        && stack.is_empty()
+        && xml_text_segment_is_well_formed(trailing)
+        && trailing.trim().is_empty()
+}
+
+/// Return `true` when `text` is locally parsed XML content.
+///
+/// Content accepts more than one top-level element by validating it inside a
+/// synthetic wrapper. DTD declarations and unknown entity references remain
+/// rejected.
+#[must_use]
+pub fn xml_content_is_well_formed(text: &str) -> bool {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+    let wrapped = format!("<__ultrasql_xml_content>{trimmed}</__ultrasql_xml_content>");
+    xml_document_is_well_formed(&wrapped)
+}
+
+/// Return element fragments selected by a small, deterministic XPath subset.
+///
+/// Supported paths are absolute child paths such as `/root/item/name` with
+/// optional equality filters on element attributes:
+/// `/root/item[@id="42"]`. Unsupported path syntax returns `None`. Missing
+/// matches return `Some(Vec::new())`.
+#[must_use]
+pub fn xml_xpath_element_fragments(path: &str, document: &str) -> Option<Vec<String>> {
+    let document = document.trim();
+    if !xml_document_is_well_formed(document) {
+        return None;
+    }
+    let steps = parse_xml_path(path)?;
+    let root = xml_root_element(document)?;
+    if !xml_step_matches(&root, &steps[0]) {
+        return Some(Vec::new());
+    }
+    let mut current = vec![root];
+    for step in &steps[1..] {
+        let mut next = Vec::new();
+        for element in &current {
+            for child in xml_direct_child_elements(document, element) {
+                if xml_step_matches(&child, step) {
+                    next.push(child);
+                }
+            }
+        }
+        current = next;
+        if current.is_empty() {
+            break;
+        }
+    }
+    Some(
+        current
+            .into_iter()
+            .map(|element| document[element.open_start..element.close_end].to_owned())
+            .collect(),
+    )
+}
+
+#[derive(Clone, Debug)]
+struct XmlPathStep {
+    name: String,
+    attr_filter: Option<(String, String)>,
+}
+
+#[derive(Clone, Debug)]
+struct XmlElement {
+    name: String,
+    attrs: Vec<(String, String)>,
+    open_start: usize,
+    content_start: usize,
+    close_start: usize,
+    close_end: usize,
+}
+
+fn parse_xml_path(path: &str) -> Option<Vec<XmlPathStep>> {
+    let body = path.trim().strip_prefix('/')?;
+    if body.is_empty() || body.starts_with('/') {
+        return None;
+    }
+    let mut steps = Vec::new();
+    for raw_segment in body.split('/') {
+        let segment = raw_segment.trim();
+        if segment.is_empty() || segment == "." || segment == ".." || segment == "text()" {
+            return None;
+        }
+        let (name, attr_filter) = if let Some(open) = segment.find('[') {
+            let predicate = segment.get(open + 1..segment.len().checked_sub(1)?)?.trim();
+            if !segment.ends_with(']') || !predicate.starts_with('@') {
+                return None;
+            }
+            let (attr_name, attr_value) = predicate[1..].split_once('=')?;
+            let attr_name = attr_name.trim();
+            let attr_value = unquote_xml_path_literal(attr_value.trim())?;
+            (&segment[..open], Some((attr_name.to_owned(), attr_value)))
+        } else {
+            (segment, None)
+        };
+        if xml_name_len(name.as_bytes()) != name.len() {
+            return None;
+        }
+        if let Some((attr_name, _)) = &attr_filter
+            && xml_name_len(attr_name.as_bytes()) != attr_name.len()
+        {
+            return None;
+        }
+        steps.push(XmlPathStep {
+            name: name.to_owned(),
+            attr_filter,
+        });
+    }
+    if steps.is_empty() { None } else { Some(steps) }
+}
+
+fn unquote_xml_path_literal(text: &str) -> Option<String> {
+    let quote = text.as_bytes().first().copied()?;
+    if !matches!(quote, b'\'' | b'"') || text.as_bytes().last().copied() != Some(quote) {
+        return None;
+    }
+    Some(text[1..text.len().checked_sub(1)?].to_owned())
+}
+
+fn xml_root_element(text: &str) -> Option<XmlElement> {
+    let mut cursor = 0_usize;
+    while let Some(relative) = text[cursor..].find('<') {
+        let open = cursor + relative;
+        let next = text.as_bytes().get(open + 1).copied()?;
+        match next {
+            b'?' => {
+                let end = text[open + 2..].find("?>")?;
+                cursor = open + 2 + end + 2;
+            }
+            b'!' if text[open..].starts_with("<!--") => {
+                let end = text[open + 4..].find("-->")?;
+                cursor = open + 4 + end + 3;
+            }
+            b'!' => return None,
+            b'/' => return None,
+            _ => return read_xml_element_at(text, open),
+        }
+    }
+    None
+}
+
+fn read_xml_element_at(text: &str, open: usize) -> Option<XmlElement> {
+    if text.as_bytes().get(open) != Some(&b'<') {
+        return None;
+    }
+    let next = text.as_bytes().get(open + 1).copied()?;
+    if matches!(next, b'/' | b'!' | b'?') {
+        return None;
+    }
+    let tag_close = xml_tag_end(text, open + 1)?;
+    let mut content = text[open + 1..tag_close].trim();
+    let self_closing = content.ends_with('/');
+    if self_closing {
+        content = content[..content.len().checked_sub(1)?].trim_end();
+    }
+    let name_len = xml_name_len(content.as_bytes());
+    if name_len == 0 {
+        return None;
+    }
+    let name = content[..name_len].to_owned();
+    let attrs = xml_parse_attributes(&content[name_len..])?;
+    let content_start = tag_close + 1;
+    if self_closing {
+        return Some(XmlElement {
+            name,
+            attrs,
+            open_start: open,
+            content_start,
+            close_start: content_start,
+            close_end: content_start,
+        });
+    }
+
+    let mut cursor = content_start;
+    let mut same_name_depth = 1_usize;
+    while let Some(relative) = text[cursor..].find('<') {
+        let tag_open = cursor + relative;
+        let next = text.as_bytes().get(tag_open + 1).copied()?;
+        match next {
+            b'?' => {
+                let end = text[tag_open + 2..].find("?>")?;
+                cursor = tag_open + 2 + end + 2;
+            }
+            b'!' if text[tag_open..].starts_with("<!--") => {
+                let end = text[tag_open + 4..].find("-->")?;
+                cursor = tag_open + 4 + end + 3;
+            }
+            b'!' if text[tag_open..].starts_with("<![CDATA[") => {
+                let end = text[tag_open + 9..].find("]]>")?;
+                cursor = tag_open + 9 + end + 3;
+            }
+            b'/' => {
+                let close = xml_tag_end(text, tag_open + 2)?;
+                let closing_name = text[tag_open + 2..close].trim();
+                if closing_name == name {
+                    same_name_depth = same_name_depth.checked_sub(1)?;
+                    if same_name_depth == 0 {
+                        return Some(XmlElement {
+                            name,
+                            attrs,
+                            open_start: open,
+                            content_start,
+                            close_start: tag_open,
+                            close_end: close + 1,
+                        });
+                    }
+                }
+                cursor = close + 1;
+            }
+            _ => {
+                let child_close = xml_tag_end(text, tag_open + 1)?;
+                let mut child_content = text[tag_open + 1..child_close].trim();
+                let child_self_closing = child_content.ends_with('/');
+                if child_self_closing {
+                    child_content = child_content[..child_content.len().checked_sub(1)?].trim_end();
+                }
+                let child_name_len = xml_name_len(child_content.as_bytes());
+                if child_name_len == 0 {
+                    return None;
+                }
+                if child_content[..child_name_len] == name && !child_self_closing {
+                    same_name_depth = same_name_depth.checked_add(1)?;
+                }
+                cursor = child_close + 1;
+            }
+        }
+    }
+    None
+}
+
+fn xml_direct_child_elements(text: &str, parent: &XmlElement) -> Vec<XmlElement> {
+    let mut out = Vec::new();
+    let mut cursor = parent.content_start;
+    while cursor < parent.close_start {
+        let Some(relative) = text[cursor..parent.close_start].find('<') else {
+            break;
+        };
+        let open = cursor + relative;
+        let Some(next) = text.as_bytes().get(open + 1).copied() else {
+            break;
+        };
+        match next {
+            b'?' => {
+                let Some(end) = text[open + 2..parent.close_start].find("?>") else {
+                    break;
+                };
+                cursor = open + 2 + end + 2;
+            }
+            b'!' if text[open..].starts_with("<!--") => {
+                let Some(end) = text[open + 4..parent.close_start].find("-->") else {
+                    break;
+                };
+                cursor = open + 4 + end + 3;
+            }
+            b'!' if text[open..].starts_with("<![CDATA[") => {
+                let Some(end) = text[open + 9..parent.close_start].find("]]>") else {
+                    break;
+                };
+                cursor = open + 9 + end + 3;
+            }
+            b'/' => break,
+            _ => {
+                let Some(element) = read_xml_element_at(text, open) else {
+                    break;
+                };
+                cursor = element.close_end;
+                out.push(element);
+            }
+        }
+    }
+    out
+}
+
+fn xml_step_matches(element: &XmlElement, step: &XmlPathStep) -> bool {
+    element.name == step.name
+        && step
+            .attr_filter
+            .as_ref()
+            .is_none_or(|(expected_name, expected_value)| {
+                element
+                    .attrs
+                    .iter()
+                    .any(|(name, value)| name == expected_name && value == expected_value)
+            })
 }
 
 fn xml_tag_end(text: &str, start: usize) -> Option<usize> {
@@ -1179,8 +1498,13 @@ fn xml_name_byte(byte: u8) -> bool {
 }
 
 fn xml_attributes_are_well_formed(rest: &str) -> bool {
+    xml_parse_attributes(rest).is_some()
+}
+
+fn xml_parse_attributes(rest: &str) -> Option<Vec<(String, String)>> {
     let bytes = rest.as_bytes();
     let mut cursor = 0_usize;
+    let mut attrs = Vec::new();
     while cursor < bytes.len() {
         while bytes
             .get(cursor)
@@ -1189,12 +1513,13 @@ fn xml_attributes_are_well_formed(rest: &str) -> bool {
             cursor += 1;
         }
         if cursor == bytes.len() {
-            return true;
+            return Some(attrs);
         }
         let name_len = xml_name_len(&bytes[cursor..]);
         if name_len == 0 {
-            return false;
+            return None;
         }
+        let name = rest[cursor..cursor + name_len].to_owned();
         cursor += name_len;
         while bytes
             .get(cursor)
@@ -1203,7 +1528,7 @@ fn xml_attributes_are_well_formed(rest: &str) -> bool {
             cursor += 1;
         }
         if bytes.get(cursor) != Some(&b'=') {
-            return false;
+            return None;
         }
         cursor += 1;
         while bytes
@@ -1213,21 +1538,64 @@ fn xml_attributes_are_well_formed(rest: &str) -> bool {
             cursor += 1;
         }
         let Some(quote @ (b'\'' | b'"')) = bytes.get(cursor).copied() else {
-            return false;
+            return None;
         };
         cursor += 1;
+        let value_start = cursor;
         while bytes.get(cursor).is_some_and(|byte| *byte != quote) {
             if bytes[cursor] == b'<' {
-                return false;
+                return None;
             }
             cursor += 1;
         }
-        if bytes.get(cursor) != Some(&quote) {
-            return false;
+        if !xml_text_segment_is_well_formed(&rest[value_start..cursor]) {
+            return None;
         }
+        if bytes.get(cursor) != Some(&quote) {
+            return None;
+        }
+        attrs.push((name, rest[value_start..cursor].to_owned()));
         cursor += 1;
     }
+    Some(attrs)
+}
+
+fn xml_text_segment_is_well_formed(text: &str) -> bool {
+    let bytes = text.as_bytes();
+    let mut cursor = 0_usize;
+    while let Some(relative) = bytes[cursor..].iter().position(|byte| *byte == b'&') {
+        let amp = cursor + relative;
+        let Some(entity_len) = xml_entity_ref_len(&bytes[amp..]) else {
+            return false;
+        };
+        cursor = amp + entity_len;
+    }
     true
+}
+
+fn xml_entity_ref_len(bytes: &[u8]) -> Option<usize> {
+    if bytes.first() != Some(&b'&') {
+        return None;
+    }
+    let semi = bytes.iter().take(64).position(|byte| *byte == b';')?;
+    if semi <= 1 {
+        return None;
+    }
+    let body = std::str::from_utf8(&bytes[1..semi]).ok()?;
+    if matches!(body, "amp" | "lt" | "gt" | "apos" | "quot") {
+        return Some(semi + 1);
+    }
+    if let Some(hex) = body.strip_prefix("#x").or_else(|| body.strip_prefix("#X")) {
+        if !hex.is_empty() && hex.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            return Some(semi + 1);
+        }
+    } else if let Some(dec) = body.strip_prefix('#')
+        && !dec.is_empty()
+        && dec.bytes().all(|byte| byte.is_ascii_digit())
+    {
+        return Some(semi + 1);
+    }
+    None
 }
 
 fn hex_nibble(byte: u8) -> Option<u8> {

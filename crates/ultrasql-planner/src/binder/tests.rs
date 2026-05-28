@@ -239,6 +239,27 @@ fn binds_row_to_json_whole_row_alias_to_named_record() {
     assert_eq!(row_args.len(), 3);
 }
 
+#[test]
+fn binds_xml_scalar_functions_with_precise_return_types() {
+    let plan = parse_bind_ok(
+        "SELECT \
+            xml_is_well_formed_document('<root/>'), \
+            xml_is_well_formed_content('<a/><b/>'), \
+            xpath_exists('/root/item', XML '<root><item/></root>'), \
+            xpath('/root/item', XML '<root><item/></root>')",
+    );
+    let LogicalPlan::Project { exprs, .. } = &plan else {
+        panic!("expected Project, got {plan:?}");
+    };
+    assert_eq!(exprs[0].0.data_type(), DataType::Bool);
+    assert_eq!(exprs[1].0.data_type(), DataType::Bool);
+    assert_eq!(exprs[2].0.data_type(), DataType::Bool);
+    assert_eq!(
+        exprs[3].0.data_type(),
+        DataType::Array(Box::new(DataType::Xml))
+    );
+}
+
 // -----------------------------------------------------------------------
 // INSERT — happy paths
 // -----------------------------------------------------------------------

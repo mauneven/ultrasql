@@ -1439,7 +1439,12 @@ fn builtin_return_type(func_name: &str, args: &[ScalarExpr]) -> Result<DataType,
             Ok(DataType::Text { max_len: None })
         }
         "row_to_json" | "json_build_object" | "jsonb_set" => Ok(DataType::Jsonb),
-        "jsonb_path_exists" => Ok(DataType::Bool),
+        "jsonb_path_exists"
+        | "xml_is_well_formed"
+        | "xml_is_well_formed_content"
+        | "xml_is_well_formed_document"
+        | "xpath_exists" => Ok(DataType::Bool),
+        "xpath" => Ok(DataType::Array(Box::new(DataType::Xml))),
         "pg_advisory_lock" | "pg_advisory_unlock_all" => Ok(DataType::Null),
         "pg_try_advisory_lock" | "pg_try_advisory_xact_lock" | "pg_advisory_unlock" => {
             Ok(DataType::Bool)
@@ -1570,6 +1575,11 @@ pub(super) fn is_supported_builtin(func_name: &str) -> bool {
             | "json_build_object"
             | "jsonb_set"
             | "jsonb_path_exists"
+            | "xml_is_well_formed"
+            | "xml_is_well_formed_content"
+            | "xml_is_well_formed_document"
+            | "xpath"
+            | "xpath_exists"
             | "pg_advisory_lock"
             | "pg_try_advisory_lock"
             | "pg_try_advisory_xact_lock"
@@ -1640,6 +1650,10 @@ fn validate_builtin_args(func_name: &str, args: &mut [ScalarExpr]) -> Result<(),
         "vector_norm" | "l2_norm" => validate_vector_norm_args(func_name, args),
         "vector_dims" => validate_vector_dims_args(args),
         "jsonb_path_exists" => validate_jsonb_path_exists_args(args),
+        "xml_is_well_formed" | "xml_is_well_formed_content" | "xml_is_well_formed_document" => {
+            validate_xml_well_formed_args(func_name, args)
+        }
+        "xpath" | "xpath_exists" => validate_xpath_args(func_name, args),
         "has_table_privilege"
         | "has_schema_privilege"
         | "has_database_privilege"
@@ -1800,6 +1814,27 @@ fn validate_jsonb_path_exists_args(args: &[ScalarExpr]) -> Result<(), PlanError>
         )));
     }
     Ok(())
+}
+
+fn validate_xml_well_formed_args(func_name: &str, args: &[ScalarExpr]) -> Result<(), PlanError> {
+    validate_exact_arg_count(func_name, args, 1)?;
+    validate_text_or_xml_arg(func_name, &args[0])
+}
+
+fn validate_xpath_args(func_name: &str, args: &[ScalarExpr]) -> Result<(), PlanError> {
+    validate_exact_arg_count(func_name, args, 2)?;
+    validate_text_or_xml_arg(func_name, &args[0])?;
+    validate_text_or_xml_arg(func_name, &args[1])
+}
+
+fn validate_text_or_xml_arg(func_name: &str, arg: &ScalarExpr) -> Result<(), PlanError> {
+    let data_type = arg.data_type();
+    if matches!(data_type, DataType::Null | DataType::Xml) || data_type.is_textlike() {
+        return Ok(());
+    }
+    Err(PlanError::TypeMismatch(format!(
+        "{func_name}: expected text or xml, got {data_type}"
+    )))
 }
 
 fn validate_vector_metric_args(func_name: &str, args: &mut [ScalarExpr]) -> Result<(), PlanError> {

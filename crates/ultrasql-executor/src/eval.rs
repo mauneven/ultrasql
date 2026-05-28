@@ -29,7 +29,10 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use num_traits::ToPrimitive;
 use serde_json::{Map as JsonMap, Number as JsonNumber, Value as JsonValue};
-use ultrasql_core::{DataType, Oid, SparseVector, Value, bpchar_semantic_text, timetz_utc_micros};
+use ultrasql_core::{
+    DataType, Oid, SparseVector, Value, bpchar_semantic_text, timetz_utc_micros,
+    xml_content_is_well_formed, xml_document_is_well_formed, xml_xpath_element_fragments,
+};
 use ultrasql_planner::{BinaryOp, ScalarExpr, UnaryOp, catalog::builtin_type_oid};
 
 use crate::json_path::{parse_json_path, select_json_path};
@@ -323,6 +326,12 @@ fn eval_function_call(
         "json_build_object" => eval_json_build_object(args),
         "jsonb_set" => eval_jsonb_set(args),
         "jsonb_path_exists" => eval_jsonb_path_exists(args),
+        "xml_is_well_formed" | "xml_is_well_formed_content" => {
+            eval_xml_is_well_formed(args, XmlWellFormedMode::Content)
+        }
+        "xml_is_well_formed_document" => eval_xml_is_well_formed(args, XmlWellFormedMode::Document),
+        "xpath_exists" => eval_xpath_exists(args),
+        "xpath" => eval_xpath(args),
         "pg_advisory_lock"
         | "pg_try_advisory_lock"
         | "pg_try_advisory_xact_lock"
@@ -2131,6 +2140,91 @@ fn eval_jsonb_path_exists(args: &[Value]) -> Result<Value, EvalError> {
     let path = parse_json_path(path)
         .map_err(|err| EvalError::Type(format!("jsonb_path_exists: invalid jsonpath: {err}")))?;
     Ok(Value::Bool(!select_json_path(&document, &path).is_empty()))
+}
+
+#[derive(Clone, Copy)]
+enum XmlWellFormedMode {
+    Content,
+    Document,
+}
+
+fn eval_xml_is_well_formed(args: &[Value], mode: XmlWellFormedMode) -> Result<Value, EvalError> {
+    if args.len() != 1 {
+        return Err(EvalError::Type(format!(
+            "xml_is_well_formed: expected 1 arg, got {}",
+            args.len()
+        )));
+    }
+    let Some(text) = xml_text_arg("xml_is_well_formed", args, 0)? else {
+        return Ok(Value::Null);
+    };
+    let ok = match mode {
+        XmlWellFormedMode::Content => xml_content_is_well_formed(text),
+        XmlWellFormedMode::Document => xml_document_is_well_formed(text),
+    };
+    Ok(Value::Bool(ok))
+}
+
+fn eval_xpath_exists(args: &[Value]) -> Result<Value, EvalError> {
+    if args.len() != 2 {
+        return Err(EvalError::Type(format!(
+            "xpath_exists: expected 2 args, got {}",
+            args.len()
+        )));
+    }
+    let Some(path) = xml_text_arg("xpath_exists", args, 0)? else {
+        return Ok(Value::Null);
+    };
+    let Some(document) = xml_text_arg("xpath_exists", args, 1)? else {
+        return Ok(Value::Null);
+    };
+    let fragments = xml_xpath_element_fragments(path, document).ok_or_else(|| {
+        EvalError::Type(
+            "xpath_exists: supported subset is absolute element paths with optional @attr equality"
+                .to_owned(),
+        )
+    })?;
+    Ok(Value::Bool(!fragments.is_empty()))
+}
+
+fn eval_xpath(args: &[Value]) -> Result<Value, EvalError> {
+    if args.len() != 2 {
+        return Err(EvalError::Type(format!(
+            "xpath: expected 2 args, got {}",
+            args.len()
+        )));
+    }
+    let Some(path) = xml_text_arg("xpath", args, 0)? else {
+        return Ok(Value::Null);
+    };
+    let Some(document) = xml_text_arg("xpath", args, 1)? else {
+        return Ok(Value::Null);
+    };
+    let fragments = xml_xpath_element_fragments(path, document).ok_or_else(|| {
+        EvalError::Type(
+            "xpath: supported subset is absolute element paths with optional @attr equality"
+                .to_owned(),
+        )
+    })?;
+    Ok(Value::Array {
+        element_type: DataType::Xml,
+        elements: fragments.into_iter().map(Value::Xml).collect(),
+    })
+}
+
+fn xml_text_arg<'a>(
+    function: &'static str,
+    args: &'a [Value],
+    idx: usize,
+) -> Result<Option<&'a str>, EvalError> {
+    match args.get(idx) {
+        Some(Value::Null) | None => Ok(None),
+        Some(Value::Text(text) | Value::Char(text) | Value::Xml(text)) => Ok(Some(text)),
+        Some(other) => Err(EvalError::Type(format!(
+            "{function}: expected text or xml, got {:?}",
+            other.data_type()
+        ))),
+    }
 }
 
 fn json_document_arg(

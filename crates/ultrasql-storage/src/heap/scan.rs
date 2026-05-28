@@ -5,32 +5,18 @@
 //! `heap/mod.rs`. Splitting across files keeps each unit under the
 //! 600-line ceiling without changing semantics.
 
-#![allow(unused_imports)]
-
-use std::sync::Arc;
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
-
-use ahash::AHashMap;
 use dashmap::DashMap;
-use ultrasql_core::{BlockNumber, CommandId, Lsn, PageId, RelationId, TupleId, Xid};
-use ultrasql_mvcc::tuple_header::{InfoMask, TUPLE_HEADER_SIZE};
+use std::sync::Arc;
+use ultrasql_core::{BlockNumber, PageId, RelationId, TupleId, Xid};
+use ultrasql_mvcc::tuple_header::TUPLE_HEADER_SIZE;
 use ultrasql_mvcc::{Snapshot, TupleHeader, Visibility, XidStatusOracle, is_visible};
-use ultrasql_wal::WalRecord;
-use ultrasql_wal::payload::{
-    FullPageWritePayload, HeapDeletePayload, HeapInsertPayload, HeapUpdatePayload,
-};
-use ultrasql_wal::record::RecordType;
 
 use crate::buffer_pool::{BufferPool, PageGuard, PageLoader};
 use crate::page::PageError;
 use crate::vm::VisibilityMap;
-use crate::wal_sink::WalSink;
 
 use super::walker::VisibleHeapWalker;
-use super::{
-    DeleteOptions, HeapAccess, HeapError, HeapTuple, InsertOptions, UndoEntry, UndoRelationLog,
-    UpdateOptions, UpdateOutcome, UpdatePayload,
-};
+use super::{HeapAccess, HeapError, HeapTuple, UndoRelationLog};
 
 impl<L: PageLoader> HeapAccess<L> {
     /// Read a tuple by id. Visibility is not enforced — callers running

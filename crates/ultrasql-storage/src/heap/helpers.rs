@@ -5,29 +5,17 @@
 //! `heap/mod.rs`. Splitting across files keeps each unit under the
 //! 600-line ceiling without changing semantics.
 
-#![allow(unused_imports)]
-
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::AtomicU32;
 
-use ahash::AHashMap;
-use ultrasql_core::{BlockNumber, CommandId, Lsn, PageId, RelationId, TupleId, Xid};
+use ultrasql_core::{BlockNumber, CommandId, PageId, RelationId, TupleId, Xid};
+use ultrasql_mvcc::TupleHeader;
 use ultrasql_mvcc::tuple_header::{InfoMask, TUPLE_HEADER_SIZE};
-use ultrasql_mvcc::{Snapshot, TupleHeader, Visibility, XidStatusOracle, is_visible};
-use ultrasql_wal::WalRecord;
-use ultrasql_wal::payload::{
-    FullPageWritePayload, HeapDeletePayload, HeapInsertPayload, HeapUpdatePayload,
-};
-use ultrasql_wal::record::RecordType;
 
 use crate::buffer_pool::{BufferPool, PageGuard, PageLoader, PageWrite};
 use crate::page::PageError;
-use crate::wal_sink::WalSink;
 
-use super::{
-    DeleteOptions, HeapAccess, HeapError, HeapTuple, InsertOptions, UndoEntry, UndoRelationLog,
-    UpdateOptions, UpdateOutcome, UpdatePayload,
-};
+use super::{DeleteOptions, HeapAccess, HeapError, HeapTuple, InsertOptions, UpdateOptions};
 
 impl<L: PageLoader> HeapAccess<L> {
     /// Mark a page as all-visible in the visibility map.

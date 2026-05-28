@@ -4,8 +4,7 @@
 //! across files keeps every unit under the 600-line ceiling without
 //! changing semantics.
 
-#![allow(unused_imports)]
-
+use std::io::{Error as IoError, ErrorKind, IoSlice};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -43,6 +42,8 @@ use crate::{
     BlankPageLoader, CombinedCatalog, Server, TxnState, decode_key_column, notice_warning,
     run_plan_in_txn,
 };
+
+const SHARED_STREAM_COPY_LIMIT_BYTES: usize = 16 * 1024 * 1024;
 
 impl<RW> Session<RW>
 where
@@ -470,7 +471,11 @@ where
             return Ok(());
         }
         if let Some(body) = result.shared_streamed_body.take() {
-            if body.len() <= 1024 {
+            // Same-host scan responses under this cap are faster as one
+            // contiguous `write_all` than as repeated partial `writev`
+            // progress over a shared body plus tiny trailer. The cap keeps
+            // very large result sets on the zero-copy shared-body path.
+            if body.len() <= SHARED_STREAM_COPY_LIMIT_BYTES {
                 let mut scratch = std::mem::take(&mut self.write_buf);
                 scratch.clear();
                 scratch.extend_from_slice(body.as_ref());
@@ -483,12 +488,11 @@ where
                 self.io.flush().await?;
                 return Ok(());
             }
-            self.io.write_all(body.as_ref()).await?;
             let mut scratch = std::mem::take(&mut self.write_buf);
             scratch.clear();
             self.drain_pending_notifications_into(&mut scratch);
             encode_backend(&ready, &mut scratch);
-            let res = self.io.write_all(&scratch).await;
+            let res = self.write_all_vectored_pair(body.as_ref(), &scratch).await;
             scratch.clear();
             self.write_buf = scratch;
             res?;
@@ -507,6 +511,38 @@ where
         self.write_buf = scratch;
         res?;
         self.io.flush().await?;
+        Ok(())
+    }
+
+    async fn write_all_vectored_pair(
+        &mut self,
+        mut first: &[u8],
+        mut second: &[u8],
+    ) -> std::io::Result<()> {
+        while !first.is_empty() || !second.is_empty() {
+            let written = if first.is_empty() {
+                self.io.write_vectored(&[IoSlice::new(second)]).await?
+            } else if second.is_empty() {
+                self.io.write_vectored(&[IoSlice::new(first)]).await?
+            } else {
+                self.io
+                    .write_vectored(&[IoSlice::new(first), IoSlice::new(second)])
+                    .await?
+            };
+            if written == 0 {
+                return Err(IoError::new(
+                    ErrorKind::WriteZero,
+                    "failed to write query response",
+                ));
+            }
+            if written < first.len() {
+                first = &first[written..];
+            } else {
+                let second_written = written.saturating_sub(first.len()).min(second.len());
+                first = &[];
+                second = &second[second_written..];
+            }
+        }
         Ok(())
     }
 
