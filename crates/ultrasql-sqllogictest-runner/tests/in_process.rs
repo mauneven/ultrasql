@@ -4,6 +4,8 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process;
 use std::process::Command;
+use std::process::Stdio;
+use std::time::Duration;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 #[test]
@@ -83,6 +85,13 @@ fn in_process_mode_compares_against_multiple_reference_engines_when_available() 
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("passed=15"), "stdout:\n{stdout}");
     assert!(stdout.contains("failed=0"), "stdout:\n{stdout}");
+}
+
+#[test]
+fn reference_engine_probe_uses_engine_specific_version_flags() {
+    assert_eq!(version_arg_for("sqlite3"), "-version");
+    assert_eq!(version_arg_for("duckdb"), "--version");
+    assert_eq!(version_arg_for("DuckDB"), "--version");
 }
 
 #[test]
@@ -626,10 +635,43 @@ fn run_reference_engine_smoke(engine: &str) {
 }
 
 fn command_available(program: &str) -> bool {
-    Command::new(program)
-        .arg("-version")
-        .output()
-        .is_ok_and(|output| output.status.success())
+    command_status_with_timeout(program, version_arg_for(program), Duration::from_secs(5))
+        .is_some_and(|status| status.success())
+}
+
+fn version_arg_for(program: &str) -> &'static str {
+    if program.eq_ignore_ascii_case("duckdb") {
+        "--version"
+    } else {
+        "-version"
+    }
+}
+
+fn command_status_with_timeout(
+    program: &str,
+    arg: &str,
+    timeout: Duration,
+) -> Option<process::ExitStatus> {
+    let mut child = Command::new(program)
+        .arg(arg)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .ok()?;
+    let deadline = std::time::Instant::now() + timeout;
+
+    loop {
+        if let Ok(Some(status)) = child.try_wait() {
+            return Some(status);
+        }
+        if std::time::Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            return None;
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
 }
 
 #[cfg(unix)]
