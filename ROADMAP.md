@@ -147,9 +147,9 @@ file focused on what still blocks production.
 ## P3 - Packaging, Distribution, Operations
 
 - Promote packages from the `release workflow`: `docs.ultrasql.org`,
-  `ghcr.io/mauneven/ultrasql`, `clean GHCR platform list`, `Windows setup EXE`,
-  `Chocolatey`, `AUR`, `yay -S ultrasql-bin`, `Homebrew tap`, `Homebrew`,
-  `Debian`, and `RPM`.
+  `ghcr.io/mauneven/ultrasql`, `clean GHCR platform list`, `packages/npm`,
+  `npm publish`, `Windows setup EXE`, `Chocolatey`, `AUR`,
+  `yay -S ultrasql-bin`, `Homebrew tap`, `Homebrew`, `Debian`, and `RPM`.
 - Homebrew core path: use the source-built formula as the base for upstream
   review once UltraSQL is stable/notable enough for plain `brew install
   ultrasql` without tapping `mauneven/tap`.
