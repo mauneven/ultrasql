@@ -141,7 +141,25 @@ TMP_KERNEL_SMOKE_RESULT="${KERNEL_SMOKE_RESULT}.tmp.$$"
 KERNEL_SMOKE_ERR="${KERNEL_SMOKE_RESULT}.err.$$"
 if target/release/regression-gate --stage v0_9 --smoke \
     > "$TMP_KERNEL_SMOKE_RESULT" 2>"$KERNEL_SMOKE_ERR"; then
-    mv "$TMP_KERNEL_SMOKE_RESULT" "$KERNEL_SMOKE_RESULT"
+    python3 - "$KERNEL_SMOKE_RESULT" "$TMP_KERNEL_SMOKE_RESULT" "$KERNEL_SMOKE_ERR" <<'PY'
+import json
+import pathlib
+import sys
+
+out_path, stdout_path, stderr_path = sys.argv[1:]
+stdout = pathlib.Path(stdout_path).read_text(errors="replace") if pathlib.Path(stdout_path).exists() else ""
+stderr = pathlib.Path(stderr_path).read_text(errors="replace") if pathlib.Path(stderr_path).exists() else ""
+detail = (stdout + stderr)[-2000:]
+doc = {
+    "workload": "tpcb_32conn",
+    "engine": "ultrasql",
+    "status": "passed",
+    "stage": "v0_9",
+    "smoke": True,
+    "detail": detail,
+}
+pathlib.Path(out_path).write_text(json.dumps(doc, indent=2) + "\n")
+PY
 else
     python3 - "$KERNEL_SMOKE_RESULT" "$KERNEL_SMOKE_ERR" <<'PY'
 import json
@@ -161,7 +179,7 @@ pathlib.Path(out_path).write_text(json.dumps(doc, indent=2) + "\n")
 PY
     rm -f "$TMP_KERNEL_SMOKE_RESULT"
 fi
-rm -f "$KERNEL_SMOKE_ERR"
+rm -f "$TMP_KERNEL_SMOKE_RESULT" "$KERNEL_SMOKE_ERR"
 
 if [[ -z "$ULTRASQL_RESULT" ]]; then
     ULTRASQL_RESULT="$RAW_DIR/tpcb_32conn-ultrasql.json"

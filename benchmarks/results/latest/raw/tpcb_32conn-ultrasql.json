@@ -8,16 +8,16 @@
   "connections": 32,
   "warmup_secs": 1,
   "duration_secs": 3,
-  "transactions": 2228,
-  "throughput_per_sec": 734.0167683956363,
-  "p50_latency_us": 40945.916,
-  "p99_latency_us": 136412.75,
+  "transactions": 25312,
+  "throughput_per_sec": 8404.68312290606,
+  "p50_latency_us": 2565.917,
+  "p99_latency_us": 19409.0,
   "correctness": {
     "passed": true,
-    "history_row_count": 2971,
-    "history_delta_sum": -3567,
-    "accounts_balance_sum": -3567,
-    "tellers_balance_sum": -3567,
-    "branches_balance_sum": -3567
+    "history_row_count": 33776,
+    "history_delta_sum": 4324,
+    "accounts_balance_sum": 4324,
+    "tellers_balance_sum": 4324,
+    "branches_balance_sum": 4324
   }
 }

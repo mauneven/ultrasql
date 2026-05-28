@@ -1,6 +1,8 @@
-regression-gate: SMOKE mode — one run per benchmark, no competitor checks
-regression-gate: stage = v0_9
-regression-gate: 1 benchmark(s) in stage v0_9:
-  - tpcb_32conn
-  running tpcb_32conn …
-regression-gate: smoke complete in 0.00s — 1 benchmark(s) ran without panic
+{
+  "workload": "tpcb_32conn",
+  "engine": "ultrasql",
+  "status": "passed",
+  "stage": "v0_9",
+  "smoke": true,
+  "detail": "regression-gate: SMOKE mode \u2014 one run per benchmark, no competitor checks\nregression-gate: stage = v0_9\nregression-gate: 1 benchmark(s) in stage v0_9:\n  - tpcb_32conn\n  running tpcb_32conn \u2026\nregression-gate: smoke complete in 0.00s \u2014 1 benchmark(s) ran without panic\n"
+}

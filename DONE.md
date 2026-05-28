@@ -162,6 +162,12 @@ as a concise evidence ledger; roadmap stays for open gates only.
   `benchmarks/scripts/run_clickhouse_writes.sh`; missing local ClickHouse setup
   records `not_available` instead of dropping the measured engine from rendered
   benchmark tables.
+- TPC-B certification evidence was refreshed after indexed-update row-lock
+  contention fixes: `benchmarks/tpcb_certify.sh` now writes the kernel smoke as
+  explicit JSON, `benchmarks/results/latest/raw/tpcb_32conn-ultrasql.json`
+  records 8,404.68 tx/s with correctness passing, and
+  `benchmarks/results/latest/tpcb_certification.json` remains honestly failed
+  until the 32-client p99 and PostgreSQL 17 throughput gates close.
 - TPC-H SF1 local PostgreSQL 17 certification passed with all q1..q22 complete
   for both engines.
 - TPC-H scale 10 (all 22 queries) is complete: latest local artifact
