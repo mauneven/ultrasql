@@ -154,7 +154,7 @@ Categories of contribution that are particularly welcome:
   before/after EXPLAIN diff.
 - **Vectorized kernels.** Filter, hash, aggregate, sort. Scalar
   implementation first, intrinsics second.
-- **Compatibility patches.** A pg_catalog view, a system function,
+- **SQL surface patches.** A catalog view, a system function,
   an operator missing from the dialect, a wire protocol corner case.
 - **Documentation.** Cookbook recipes, tuning guides, ops runbooks.
 - **Benchmarks.** New workloads, especially industry benchmarks we do

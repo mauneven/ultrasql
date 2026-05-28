@@ -2,7 +2,7 @@
 """Render scale-sweep raw benchmark artifacts.
 
 The input directory contains one JSON file per workload and engine. This
-renderer keeps the public README table honest by copying only measured
+renderer keeps the public README table honest by including only measured
 artifacts into a compact scale table; missing engines stay explicit.
 """
 
@@ -59,7 +59,7 @@ def parse_args() -> argparse.Namespace:
         "--note",
         default=(
             "UltraSQL is an external release binary launched as ultrasqld; "
-            "competitors use installed local clients on the same host."
+            "measured engines use installed local clients on the same host."
         ),
     )
     return parser.parse_args()

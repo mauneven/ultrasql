@@ -24,7 +24,7 @@ const DEFAULT_UNKNOWN_SEL: f64 = 0.333;
 /// of `input_rows` rows.
 ///
 /// Returns a value in `[0.0, 1.0]`. When statistics are absent the
-/// function falls back to PostgreSQL-compatible default selectivities.
+/// function falls back to default selectivities.
 ///
 /// ## Arguments
 ///

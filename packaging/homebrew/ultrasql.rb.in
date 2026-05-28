@@ -1,5 +1,5 @@
 class Ultrasql < Formula
-  desc "PostgreSQL-compatible OLTP+OLAP database in Rust"
+  desc "Fast SQL database in Rust"
   homepage "https://ultrasql.org"
   url "https://github.com/mauneven/ultrasql/releases/download/v@VERSION@/ultrasql-v@VERSION@-source.tar.gz"
   sha256 "@SHA256_SOURCE@"

@@ -1844,7 +1844,7 @@ fn rows_pg_settings(ctx: &LowerCtx<'_>) -> Vec<Vec<Value>> {
             v_text(crate::POSTGRES_COMPAT_SERVER_VERSION),
             Value::Null,
             v_text("Preset Options"),
-            v_text("PostgreSQL-compatible wire version reported to drivers."),
+            v_text("Wire version reported to drivers."),
             v_text("string"),
             v_text("internal"),
         ],

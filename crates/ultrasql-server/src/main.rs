@@ -24,7 +24,7 @@ use ultrasql_server::{
     AutovacuumConfig, LogStatementMode, LoggingConfig, Server, WalArchiveConfig, run_server,
 };
 
-/// `ultrasqld` v0.5: PostgreSQL-wire-compatible server with an
+/// `ultrasqld` v0.5: SQL server with an
 /// in-memory sample database.
 ///
 /// On startup the server registers a single table:

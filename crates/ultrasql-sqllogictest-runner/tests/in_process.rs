@@ -277,7 +277,7 @@ fn postgres_compat_subset_preserves_public_provenance() {
         "manifest:\n{manifest}"
     );
     let shard = subset.join("select_basics.slt");
-    let text = fs::read_to_string(&shard).expect("read PostgreSQL compatibility shard");
+    let text = fs::read_to_string(&shard).expect("read engine-specific shard");
     assert!(
         text.contains("# ultrasql:skip row-value IN compatibility not implemented yet"),
         "{} must keep unsupported PostgreSQL regression coverage as explicit skip",

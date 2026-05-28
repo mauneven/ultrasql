@@ -1,6 +1,6 @@
 //! Parser methods for object privilege DDL.
 //!
-//! Handles the PostgreSQL-compatible subset:
+//! Handles the supported privilege statement subset:
 //! - `GRANT privileges ON {TABLE|SCHEMA|DATABASE|SEQUENCE|FUNCTION} objects TO roles`
 //! - `REVOKE privileges ON {TABLE|SCHEMA|DATABASE|SEQUENCE|FUNCTION} objects FROM roles`
 

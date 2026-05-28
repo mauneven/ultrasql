@@ -145,7 +145,7 @@ fn security_ethics_audit_lists_verifiable_release_checks() {
 
     for needle in [
         "No proprietary tests",
-        "No copied closed-source code",
+        "No closed-source code",
         "No fake benchmark claims",
         "rg -n",
         "Firebolt Core is a closed-source Docker image",
@@ -226,7 +226,7 @@ fn driver_certification_matrix_covers_core_ecosystem() {
         "node-postgres",
         "pgx",
         "lib/pq",
-        "JDBC PostgreSQL driver",
+        "JDBC",
         "Npgsql",
         "GUI introspection probes",
         "pgAdmin",
@@ -749,8 +749,8 @@ fn final_release_requires_operator_reports_green_workflows_and_notes() {
 fn release_user_docs_exist_and_state_current_limits() {
     let changelog = repo_file("CHANGELOG.md");
     let getting_started = repo_file("docs/getting-started.md");
-    let migration = repo_file("docs/migration-from-postgresql.md");
-    let incompat = repo_file("docs/known-incompatibilities.md");
+    let migration = repo_file("docs/migration-guide.md");
+    let limitations = repo_file("docs/known-limitations.md");
 
     for needle in ["Unreleased", "Known gaps", "pre-1.0 releases"] {
         assert!(changelog.contains(needle), "CHANGELOG missing {needle}");
@@ -767,7 +767,7 @@ fn release_user_docs_exist_and_state_current_limits() {
         );
     }
     for needle in [
-        "not a drop-in production replacement yet",
+        "not a v1.0 production database yet",
         "COPY",
         "Validation rule",
     ] {
@@ -778,12 +778,12 @@ fn release_user_docs_exist_and_state_current_limits() {
     }
     for needle in [
         "v1.0 is not released",
-        "Broader aggregate parity",
+        "Broader aggregate coverage",
         "Firebolt comparisons use local Firebolt Core only",
     ] {
         assert!(
-            incompat.contains(needle),
-            "known incompatibilities missing {needle}"
+            limitations.contains(needle),
+            "known limitations missing {needle}"
         );
     }
 }

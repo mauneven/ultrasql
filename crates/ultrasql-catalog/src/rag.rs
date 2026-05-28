@@ -131,7 +131,7 @@ impl RagPrimitiveSchemas {
 
 /// Return SQL that creates the RAG primitive tables.
 ///
-/// The generated DDL is deliberately plain PostgreSQL-compatible SQL so tests
+/// The generated DDL is deliberately plain SQL so tests
 /// can execute it through the normal wire path. IDs are `TEXT` today because
 /// UltraSQL's current B-tree key encoder supports text uniqueness and foreign
 /// keys, while UUID B-tree keys remain a separate index-key slice.
@@ -366,7 +366,7 @@ RETURNING tenant_id, job_id, chunk_id, status",
 /// Return plain SQL that atomically claims pending embedding jobs.
 ///
 /// Parameters are `tenant_id`, worker id, claim limit, and claim timestamp.
-/// The CTE keeps PostgreSQL-compatible ordering and limit semantics visible.
+/// The CTE keeps ordering and limit semantics visible.
 pub fn claim_rag_embedding_jobs_sql(config: &RagSchemaConfig) -> Result<String, RagSchemaError> {
     let names = config.table_names()?;
     Ok(format!(
@@ -553,7 +553,7 @@ ON {embeddings} USING hnsw (embedding vector_l2_ops)",
 /// Return SQL statements for tenant row policies over the RAG tables.
 ///
 /// UltraSQL does not execute `CREATE POLICY` yet. These statements document the
-/// intended PostgreSQL-compatible policy shape and can be applied once row-level
+/// intended policy shape and can be applied once row-level
 /// security lands. Until then, use tenant-scoped helper SQL and application
 /// checks.
 pub fn create_rag_tenant_policy_sql(config: &RagSchemaConfig) -> Result<String, RagSchemaError> {

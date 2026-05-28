@@ -12,7 +12,7 @@ release-grade benchmark tooling.
 
 The project is pre-alpha. It is already fast on the tracked SQL-surface
 benchmarks, but release readiness is evidence-based: correctness, driver
-compatibility, security, coverage, packaging, and operator soak gates must all
+certification, security, coverage, packaging, and operator soak gates must all
 close before v1.0.
 
 ## Current Shape
@@ -23,7 +23,7 @@ close before v1.0.
   surfaces.
 - Driver certification for common application drivers, ORMs, CLI tools, GUI
   tools, and migration tools.
-- Reproducible benchmark scripts for reference engines including DuckDB,
+- Reproducible benchmark scripts for measured engines including DuckDB,
   ClickHouse, SQLite, PostgreSQL, local Firebolt Core, TPC-H, TPC-B, TPC-C,
   Sysbench-style OLTP, ClickBench, ANN/vector, and chaos recovery.
 - CI gates for format, clippy, tests, cargo-audit, cargo-deny, docs, coverage,
@@ -150,7 +150,7 @@ cargo run --release --bin ultrasqld
 ```text
 crates/       core engine, storage, WAL, MVCC, SQL, protocol, server, CLI, bench
 benchmarks/   reproducible scripts, raw artifacts, baselines, certification
-docs/         install, operations, compatibility, packaging, release notes
+docs/         install, operations, limitations, packaging, release notes
 tests/        workspace integration and driver certification
 fuzz/         parser, wire, WAL, and planner fuzz targets
 .github/      CI, docs, coverage, fuzz, sanitizer, operator, release workflows
@@ -164,7 +164,7 @@ fuzz/         parser, wire, WAL, and planner fuzz targets
 - [docs/install.md](docs/install.md) - release archives, package managers, and source build.
 - [docs/ai-database-strategy.md](docs/ai-database-strategy.md) - AI database and memory-engine plan.
 - [docs/packaging.md](docs/packaging.md) - Docker, npm, Homebrew, AUR, Chocolatey, Debian, RPM.
-- [docs/known-incompatibilities.md](docs/known-incompatibilities.md) - current SQL compatibility gaps.
+- [docs/known-limitations.md](docs/known-limitations.md) - current SQL limitations.
 - [docs/release-checklist.md](docs/release-checklist.md) - release evidence.
 - [BENCHMARKS.md](BENCHMARKS.md) - methodology and artifact policy.
 

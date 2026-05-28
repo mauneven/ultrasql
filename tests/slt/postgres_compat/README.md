@@ -1,6 +1,5 @@
-# PostgreSQL Compatibility SQLLogicTest Files
+# Public Regression SQLLogicTest Files
 
-Place PostgreSQL-semantics tests here when behavior is intentionally not
-engine-neutral. Imported PostgreSQL regression-derived cases must preserve the
-PostgreSQL license notice and record source commit/provenance in the import
-manifest.
+Place engine-specific public regression tests here when behavior is
+intentionally not engine-neutral. Imported cases must preserve the upstream
+license notice and record source commit/provenance in the import manifest.

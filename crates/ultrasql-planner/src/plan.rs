@@ -82,7 +82,7 @@ pub enum LogicalSetQuantifier {
 /// Index access method requested by `CREATE INDEX ... USING`.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum LogicalIndexMethod {
-    /// PostgreSQL-compatible B-tree method.
+    /// B-tree method.
     #[default]
     Btree,
     /// Equality-only hash method. UltraSQL stores hash buckets in the
@@ -434,7 +434,7 @@ pub enum LogicalPlan {
     /// A literal row set produced by a `VALUES` clause.
     ///
     /// All rows must have the same arity (enforced by the binder). The
-    /// output schema uses PostgreSQL-compatible synthetic column names
+    /// output schema uses stable synthetic column names
     /// `column1`, `column2`, … Column types are the `numeric_join` of
     /// all cells in the same column across all rows; columns that are
     /// entirely NULL have type `DataType::Null`.

@@ -31,15 +31,13 @@ file focused on what still blocks production.
 ### Correctness Debt
 
 - Serializable isolation remains `relation-level SSI`, `not predicate-precise`
-  PostgreSQL SSI. Either implement predicate-precise SSI or keep the public
-  compatibility claim scoped.
+  SSI. Implement predicate-precise SSI before broad serializable claims.
 - Durable expression/default/constraint bootstrap must survive restart.
 - Persistent typed-catalog decoder must bootstrap user tables, indexes,
   `pg_statistic`, and `pg_statistic_ext` from heap storage.
-- Full PostgreSQL regression import still open for parser, type coercion,
-  aggregate/window, and upstream isolationtester schedules.
-- `pg_dump` custom/directory/tar output and `pg_restore` archive restore need
-  compatibility certification.
+- Full public regression import still open for parser, type coercion,
+  aggregate/window, and upstream isolation schedules.
+- Custom/directory/tar archive output and restore need workload certification.
 
 ### Performance Certification
 
@@ -60,7 +58,7 @@ file focused on what still blocks production.
   table: larger row counts, WAL-backed `--data-dir` mode, repeatable
   ClickHouse artifacts, and Firebolt legs when local services are available.
 
-## P1 - SQL Compatibility
+## P1 - SQL Surface
 
 ### Type Surface
 
@@ -71,7 +69,7 @@ file focused on what still blocks production.
   matrix, and range parity beyond signed-cent storage remain open.
 - Date/time: named time-zone database support plus broader `DateStyle` and
   locale variants.
-- Arrays: full PostgreSQL coercion parity and every supported element family.
+- Arrays: broader coercion breadth and every supported element family.
 - JSON/JSONB: full SQL/JSON path parity beyond the supported subset
   (strict/lax modes, variables, methods, full predicate algebra).
 - Full-text search: `TSVECTOR`, `TSQUERY`, ranking, headline, dictionaries, and
@@ -83,12 +81,12 @@ file focused on what still blocks production.
 ### Catalog, Roles, Privileges
 
 - Persist role, privilege, membership, default-privilege, and RLS policy state
-  through restart with PostgreSQL-faithful catalog rows.
+  through restart with durable catalog rows.
 - Finish role-scoped RLS policies, `INSERT ... SELECT` checks, update new-row
   checks, and tenant certification artifacts.
 - Broaden dependency tracking for every object kind and every `DROP ... CASCADE`
   / `RESTRICT` path.
-- Keep security gates ethical: no proprietary tests, no copied closed-source
+- Keep security gates ethical: no proprietary tests, no closed-source
   code, no fake benchmark claims.
 
 ### Drivers, ORMs, Tools
@@ -96,7 +94,7 @@ file focused on what still blocks production.
 - Keep certification green for `libpq`, `psql meta-commands`, `psycopg2`,
   `psycopg3`, `SQLAlchemy`, `Django ORM`, `Rails ActiveRecord`, `Hibernate ORM`,
   `GORM`, `Prisma`, `Diesel`, `node-postgres`, `pgx`, `lib/pq`,
-  `JDBC PostgreSQL driver`, and `Npgsql`.
+  `JDBC`, and `Npgsql`.
 - Keep stock psql meta-command coverage green: `\d`, `\dt`, `\di`, `\df`,
   `\dv`, `\du`, `\l`, `\dn`.
 - GUI probes exist for `GUI introspection probes`, `pgAdmin`, `DBeaver`, and
@@ -164,7 +162,7 @@ file focused on what still blocks production.
 - Complete `pg_stat_*` operator views, `pg_stat_bgwriter`,
   `pg_stat_replication`, and production dashboards.
 
-## P4 - Later PostgreSQL Surface
+## P4 - Later SQL Surface
 
 - Views and materialized views: expansion, updatable views, `WITH CHECK OPTION`,
   refresh, and materialized-view indexes.

@@ -1,4 +1,4 @@
-//! Wire-level coverage for PostgreSQL-compatible role-management DDL.
+//! Wire-level coverage for role-management DDL.
 
 mod support;
 

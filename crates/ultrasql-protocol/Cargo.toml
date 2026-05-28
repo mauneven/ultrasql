@@ -1,6 +1,6 @@
 [package]
 name        = "ultrasql-protocol"
-description = "UltraSQL PostgreSQL wire protocol v3 implementation."
+description = "UltraSQL wire protocol v3 implementation."
 version.workspace      = true
 edition.workspace      = true
 rust-version.workspace = true

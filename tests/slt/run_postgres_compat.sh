@@ -22,7 +22,7 @@ else
 fi
 
 if [[ "${#SUITES[@]}" -eq 0 ]]; then
-  echo "run_postgres_compat.sh: no PostgreSQL compatibility SQLLogicTest files selected" >&2
+  echo "run_postgres_compat.sh: no engine-specific SQLLogicTest files selected" >&2
   exit 2
 fi
 
@@ -30,7 +30,7 @@ for suite in "${SUITES[@]}"; do
   case "$suite" in
     tests/slt/postgres_compat/*) ;;
     *)
-      echo "run_postgres_compat.sh: non-PostgreSQL-compat SQLLogicTest path: $suite" >&2
+      echo "run_postgres_compat.sh: non-engine-specific SQLLogicTest path: $suite" >&2
       echo "run_postgres_compat.sh: paths must stay under tests/slt/postgres_compat/" >&2
       exit 2
       ;;

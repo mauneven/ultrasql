@@ -25,21 +25,20 @@ The PR gate covers:
   `PQexecParams`;
 - `psycopg2` through `psycopg2-binary==2.9.12`;
 - `psycopg3` through `psycopg[binary]==3.3.4`;
-- SQLAlchemy through `SQLAlchemy==2.0.50` on the psycopg3 PostgreSQL
-  dialect, covering Core metadata creation in autocommit mode and ORM
-  `Session` traffic;
+- SQLAlchemy through `SQLAlchemy==2.0.50` on the psycopg3 dialect, covering
+  Core metadata creation in autocommit mode and ORM `Session` traffic;
 - Django ORM through `Django==6.0.5`, covering model schema creation via
   `schema_editor(atomic=False)`, cursor parameters, `QuerySet` CRUD,
   rollback, and recovery after errors;
 - Rails ActiveRecord through `activerecord==8.1.3` and `pg==1.6.3`,
-  covering PostgreSQL adapter startup, schema creation, prepared model
-  queries, model create/query, rollback, and recovery after errors;
+  covering adapter startup, schema creation, prepared model queries, model
+  create/query, rollback, and recovery after errors;
 - `node-postgres` through `pg==8.21.0` under Node.js 22;
 - Go `lib/pq==1.12.3`, `pgx==5.9.2`, and GORM `1.31.1` with
   `gorm.io/driver/postgres==1.6.0`, covering `AutoMigrate`, model CRUD,
   rollback, and recovery after errors;
-- the JDBC PostgreSQL driver `42.7.11`, downloaded from Maven Central and
-  checked against a pinned SHA-256 digest;
+- the JDBC driver `42.7.11`, downloaded from Maven Central and checked against
+  a pinned SHA-256 digest;
 - Hibernate ORM `7.3.5.Final`, built through a pinned Apache Maven runner
   when no system Maven is available, covering `SessionFactory`, annotated
   entity persist/query, rollback, and recovery after errors;
@@ -48,7 +47,7 @@ The PR gate covers:
 - Prisma `7.8.0` with `@prisma/adapter-pg==7.8.0`, covering Prisma Client
   generation, raw parameter queries, model create/query, rollback, and
   recovery after errors;
-- Diesel `2.3.9`, covering the PostgreSQL backend, query DSL parameter
+- Diesel `2.3.9`, covering the backend under test, query DSL parameter
   filtering, typed inserts, rollback, and recovery after errors.
 
 Run locally:
@@ -78,5 +77,4 @@ certify every ORM edge, desktop GUI launch/click path, admin-tool mutation
 workflow, COPY mode, TLS mode, async notification edge, pipeline mode, every
 migration command-line flag, or driver-specific type adapter. ORM and
 migration schema creation runs outside explicit transaction blocks where the
-upstream tool allows it because transactional DDL remains an open
-compatibility gap.
+upstream tool allows it because transactional DDL remains open.

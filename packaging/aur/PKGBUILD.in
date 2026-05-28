@@ -1,7 +1,7 @@
 pkgname=ultrasql-bin
 pkgver=@VERSION@
 pkgrel=1
-pkgdesc='PostgreSQL-compatible OLTP+OLAP database in Rust'
+pkgdesc='Fast SQL database in Rust'
 arch=('x86_64' 'aarch64')
 url='https://github.com/mauneven/ultrasql'
 license=('Apache-2.0' 'MIT')

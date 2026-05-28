@@ -45,7 +45,7 @@ as a concise evidence ledger; roadmap stays for open gates only.
 - Backup/restore smoke runner covers `ultrasql --basebackup`,
   `ultrasql --pg-dump`, `ultrasql --pg-restore`, row counts, and indexed lookup.
 - Catalog upgrade story is documented and enforced with `catalog.version = 1`.
-- Security/ethics audit docs cover no proprietary tests, no copied closed-source
+- Security/ethics audit docs cover no proprietary tests, no closed-source
   code, and no fake benchmark claims.
 
 ## Core SQL And Wire Protocol
@@ -53,7 +53,7 @@ as a concise evidence ledger; roadmap stays for open gates only.
 - Simple Query and Extended Query dispatch are wired for parse, bind, describe,
   execute, sync, close, flush, and prepared-statement round trips.
 - Explicit transactions work through Simple and Extended Query:
-  `BEGIN`, `COMMIT`, `ROLLBACK`, failed-block SQLSTATE `25P02`, and PostgreSQL
+  `BEGIN`, `COMMIT`, `ROLLBACK`, failed-block SQLSTATE `25P02`, and
   `ReadyForQuery` status bytes.
 - `ORDER BY`, joins, set operations, `BETWEEN`, index scans, transaction blocks,
   plan cache, and optimizer routing are wired through server execution.
@@ -65,11 +65,11 @@ as a concise evidence ledger; roadmap stays for open gates only.
 
 ## Type And Function Surface
 
-- PostgreSQL-grade `NUMERIC` / `DECIMAL` base-10000 storage, row/COPY/wire
+- Exact `NUMERIC` / `DECIMAL` base-10000 storage, row/COPY/wire
   payloads, exact scaled arithmetic, scale rounding, text casts, and OID
   coverage exist; arbitrary precision and precision enforcement remain open.
 - `MONEY` type surface, signed-cent storage, OID 790, wire, COPY, catalog
-  persistence, and compatibility tests exist.
+  persistence, and behavior tests exist.
 - `CHAR(n)` / `bpchar` parser, binder, row codec, executor, OID 1042, COPY,
   catalog persistence, blank padding, assignment/cast truncation, and
   trailing-space comparison semantics exist.
@@ -97,12 +97,12 @@ as a concise evidence ledger; roadmap stays for open gates only.
 - Basic XML storage exists with validated text storage, OID 142 wire rendering,
   COPY, and restart round trip.
 - Ordered-set aggregates `PERCENTILE_CONT` and `PERCENTILE_DISC` have plan shape
-  and PostgreSQL-wire coverage.
-- Portable scalar compatibility helpers now cover `COALESCE`, `IFNULL` / `NVL`,
+  and wire coverage.
+- Portable scalar helpers now cover `COALESCE`, `IFNULL` / `NVL`,
   `NULLIF`, `LEAST`, `GREATEST`, and SQLite-style multi-argument scalar
-  `MIN` / `MAX` through PostgreSQL wire round-trip tests.
+  `MIN` / `MAX` through wire round-trip tests.
 
-## Security And Compatibility
+## Security And Client Certification
 
 - `CREATE ROLE / USER`, `ALTER ROLE`, and `DROP ROLE` work through the role
   catalog and `pg_roles` / `pg_user` visibility.
@@ -117,7 +117,7 @@ as a concise evidence ledger; roadmap stays for open gates only.
 - Persistent RLS policies cover owner, superuser, `BYPASSRLS`, and restart
   semantics for the documented RAG tenant policy shape.
 - Driver certification covers `libpq`, `psycopg2`, `psycopg3`,
-  `node-postgres`, `pgx`, `lib/pq`, `JDBC PostgreSQL driver`, `Npgsql`, and
+  `node-postgres`, `pgx`, `lib/pq`, `JDBC`, `Npgsql`, and
   `tokio-postgres`.
 - ORM certification covers `SQLAlchemy`, `Django ORM`, `Rails ActiveRecord`,
   `Hibernate ORM`, `GORM`, `Prisma`, and `Diesel`.
@@ -139,7 +139,7 @@ as a concise evidence ledger; roadmap stays for open gates only.
   the fastest engine on every published DuckDB/SQLite/PostgreSQL row.
 - ClickHouse is now a first-class release-artifact scale-sweep leg through
   `benchmarks/scripts/run_clickhouse_writes.sh`; missing local ClickHouse setup
-  records `not_available` instead of dropping the competitor from rendered
+  records `not_available` instead of dropping the measured engine from rendered
   benchmark tables.
 - TPC-H SF1 local PostgreSQL 17 certification passed with all q1..q22 complete
   for both engines.

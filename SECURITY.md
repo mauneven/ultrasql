@@ -102,7 +102,7 @@ In scope:
   access to data, the server process, or the host.
 - Bugs in UltraSQL that cause silent data corruption or violation of
   documented isolation levels.
-- Wire-protocol implementation flaws (message parsing, auth handshake,
+- Wire protocol implementation flaws (message parsing, auth handshake,
   copy protocol).
 - Cryptographic flaws in SCRAM-SHA-256, TLS termination (when added),
   or any other cryptographic primitive used in UltraSQL.

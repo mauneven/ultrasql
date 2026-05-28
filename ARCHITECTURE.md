@@ -102,7 +102,7 @@ batches for clients that speak Arrow Flight.
 - **Segment / file manager.** Allocates and tracks 1 GiB segment
   files per relation. Each segment exposes a `read_page` /
   `write_page` API backed by positional `pread` / `pwrite`; the
-  historical `use_mmap` knob is retained for compatibility but does
+  historical `use_mmap` knob is retained for older configurations but does
   not currently mmap heap segment files.
 - **Buffer pool.** CLOCK-Pro replacement with sharded page-table
   buckets keyed by `PageId`. Pins are reference-counted; a pinned page
@@ -110,8 +110,7 @@ batches for clients that speak Arrow Flight.
   RFC-level change.
 - **Heap access method.** Slotted-page tuple storage with HOT
   (heap-only-tuple) chains for non-indexed updates to non-key columns.
-  Compatible with PostgreSQL's tuple layout for line items so future
-  pg_dump interop is feasible.
+  The tuple layout stays stable so archive/export tooling can inspect rows.
 - **B+ tree access method.** Lehman-Yao concurrent B-link tree. Page
   splits use right-link pointers so readers never block on splitters.
 - **Free-space map (FSM).** Per-relation summary of free space per
@@ -131,18 +130,15 @@ batches for clients that speak Arrow Flight.
   uses try-locks and falls back to the CLOCK hand if the candidate is
   pinned.
 
-**Rationale.** PostgreSQL's storage format is the most widely
-deployed in the world. Matching tuple layout for the common case
-costs little and buys interop. CLOCK-Pro beats classical LRU on mixed
-OLTP/OLAP workloads where a single big scan would otherwise evict the
-working set; the cost is a slightly more complex eviction state
-machine.
+**Rationale.** A compact slotted-page format keeps OLTP updates cheap while
+remaining inspectable by tooling. CLOCK-Pro beats classical LRU on mixed
+OLTP/OLAP workloads where a single big scan would otherwise evict the working
+set; the cost is a slightly more complex eviction state machine.
 
-**Tradeoffs.** Fixed 8 KiB pages match PostgreSQL but are smaller than
-the natural unit on modern NVMe (4 KiB) or analytical engines (256 KiB).
-We accept this for compatibility; a future segment format may introduce
-larger physical pages with logical 8 KiB sub-pages for the analytical
-heap.
+**Tradeoffs.** Fixed 8 KiB pages are smaller than the natural unit on modern
+NVMe (4 KiB) or analytical engines (256 KiB). We accept this for predictable
+OLTP behavior; a future segment format may introduce larger physical pages
+with logical 8 KiB sub-pages for the analytical heap.
 
 **Columnar secondary layout.** The row-store heap remains the source of
 truth for OLTP, WAL, and MVCC. For OLAP scans, the server maintains a
@@ -154,10 +150,9 @@ counts for future on-disk segment spill. Scan replay validates the
 relation version before reading the shadow, so stale columnar data is
 never returned.
 
-**Performance implications.** The slotted-page layout is the same hot
-path for OLTP inserts as PostgreSQL. The B-link tree variant scales
-better than the lock-coupling tree used by PostgreSQL on concurrent
-inserters; this is one of the main concurrency wins.
+**Performance implications.** The slotted-page layout keeps OLTP inserts on a
+compact row path. The B-link tree variant scales better than lock-coupling
+trees on concurrent inserters; this is one of the main concurrency wins.
 
 **Scalability implications.** The buffer pool's sharded page table
 scales linearly with cores up to the number of shards (default 64).
@@ -198,9 +193,8 @@ tunable.
 
 **Rationale.** Group commit is the single largest OLTP throughput
 multiplier on rotational storage and on NVMe under bursty write
-patterns. The implementation here borrows from PostgreSQL's
-`XLogFlush` design but uses lock-free channels rather than condition
-variables.
+patterns. The implementation batches flush requests through lock-free channels
+rather than condition variables.
 
 **Tradeoffs.** A bounded fsync window adds at most one window of
 latency to single-transaction commits. We default to 200 µs because
@@ -236,19 +230,17 @@ struct TupleHeader {
    `T.xmax = 0` or `T.xmax` is not committed before `S.xmin`, **or**
 2. `T.xmin = S.current_xid` and `T.cmin < S.current_command`.
 
-The rules match PostgreSQL's `HeapTupleSatisfiesMVCC`. Serializable
-isolation layers additional predicate locking on top; see the txn
+The rules implement snapshot visibility for committed rows and own writes.
+Serializable isolation layers additional predicate locking on top; see the txn
 section.
 
-**Rationale.** Matching PostgreSQL semantics buys behavioral
-compatibility for application code that depends on snapshot isolation
-quirks (visibility of own writes in the same statement, READ COMMITTED
-re-snapshot per statement, etc.).
+**Rationale.** Snapshot semantics must be predictable for application code
+that depends on visibility of own writes in the same statement and
+READ COMMITTED re-snapshot per statement.
 
-**XID width.** 64 bits. The PostgreSQL wraparound vacuum problem is
-not a problem we want to inherit. The cost is 4 bytes per tuple header
-field; at 8 bytes for xmin and xmax, the per-tuple cost is the same
-as PostgreSQL's 32-bit xmin + 32-bit xmax + epoch tracking machinery.
+**XID width.** 64 bits. 32-bit transaction-id wraparound is not a problem we
+want to inherit. The cost is 4 bytes per tuple header field; at 8 bytes for
+xmin and xmax, the per-tuple cost remains bounded and simple.
 
 ---
 
@@ -265,7 +257,7 @@ on commit.
 **Locking.** Two layers:
 
 - **Fastpath relation locks.** Per-backend cached AccessShare locks
-  with no central state, modeled on PostgreSQL's fastpath locking.
+  with no central state.
 - **Central lock table.** Sharded `DashMap<LockTag, LockEntry>` with a
   wait-for graph maintained per-entry. The deadlock detector runs on
   a dedicated thread at a configurable interval (default 1 s) and
@@ -279,9 +271,8 @@ on commit.
 | REPEATABLE READ   | Snapshot per transaction; first-update wins.          |
 | SERIALIZABLE      | SSI (predicate locks + RW-conflict graph).            |
 
-**Rationale.** PostgreSQL's SSI is the only published serializable
-implementation that retains MVCC's read-doesn't-block-write property.
-We adopt it directly.
+**Rationale.** SSI retains MVCC's read-doesn't-block-write property while
+detecting dangerous structures. UltraSQL implements that model directly.
 
 ---
 
@@ -290,14 +281,14 @@ We adopt it directly.
 **Responsibility.** Source text → AST.
 
 **Lexer.** Hand-written, single-pass, SIMD-friendly. Token kinds cover
-PostgreSQL keywords, operators (including custom operators `~~`,
-`@@`, etc.), integer/float/hex/exponent literals, single-quoted /
+SQL keywords, operators (including custom operators `~~`, `@@`, etc.),
+integer/float/hex/exponent literals, single-quoted /
 E-prefix / dollar-quoted strings, double-quoted identifiers, line and
 block comments (block comments nest), and the parameter placeholder
 `$N`.
 
 **Parser.** Recursive descent at statement level, Pratt at expression
-level. Operator precedence matches PostgreSQL. Each AST node carries a
+level. Operator precedence is explicit in the parser. Each AST node carries a
 `Span { start, end }` referencing the source for error messages.
 
 **AST.** A typed enum per statement category (`Select`, `Insert`,
@@ -306,9 +297,9 @@ level. Operator precedence matches PostgreSQL. Each AST node carries a
 `Expr::Column`, `Expr::Literal`, `Expr::Unary`, `Expr::Binary`,
 `Expr::FunctionCall`, `Expr::Cast`, `Expr::Case`, `Expr::Subquery`, ...
 
-**Rationale.** A hand-written parser is the only way to deliver
-PostgreSQL-quality error messages with source spans. Generator-based
-parsers (LALRPOP, pest) produce parsers, not error stories.
+**Rationale.** A hand-written parser is the only way to deliver high-quality
+error messages with source spans. Generator-based parsers (LALRPOP, pest)
+produce parsers, not error stories.
 
 ---
 
@@ -322,7 +313,7 @@ parsers (LALRPOP, pest) produce parsers, not error stories.
    column references. Produces a bound AST where every name maps to a
    stable `Oid` or local `BindingId`.
 2. **Typecheck.** Annotate each expression with its `DataType` and
-   insert implicit casts per the PostgreSQL coercion matrix.
+   insert implicit casts per the SQL coercion matrix.
 3. **Lower.** Translate to a logical plan tree
    (`LogicalScan`, `LogicalFilter`, `LogicalProject`, `LogicalJoin`,
    `LogicalAggregate`, `LogicalSort`, `LogicalLimit`,
@@ -362,9 +353,8 @@ correlation. Stats are refreshed by `ANALYZE` and incrementally by
 the heap on heavy modifications.
 
 **Rationale.** Cascades is widely used for cost-based search and is the
-basis of SQL Server's optimizer. PostgreSQL's bottom-up dynamic
-programming becomes painful past 8 relations; we want to leave room for
-cross-block optimization.
+basis of SQL Server's optimizer. Bottom-up dynamic programming becomes painful
+past 8 relations; we want to leave room for cross-block optimization.
 
 ---
 
@@ -410,9 +400,9 @@ aggregate. Each kernel has:
 - An optional hand-written intrinsics path behind `cfg(target_arch)`
   guards, validated against the scalar path by property tests.
 
-**Rationale.** SIMD is most of the speedup over PostgreSQL on
-analytical queries. The scalar/auto/intrinsic three-tier approach keeps
-the scalar version honest as the differential oracle.
+**Rationale.** SIMD is central to fast analytical queries. The
+scalar/auto/intrinsic three-tier approach keeps the scalar version honest as
+the differential oracle.
 
 ---
 
@@ -426,14 +416,14 @@ wait-free reads.
 **MVCC of catalog data.** Catalog tuples carry the same MVCC headers
 as user data. A statement obtains a *catalog snapshot* at the moment
 it enters the planner; subsequent DDL in concurrent transactions does
-not perturb that statement's view. This matches PostgreSQL semantics
-and is what allows online DDL to be safe.
+not perturb that statement's view. This stable snapshot is what allows online
+DDL to be safe.
 
 ---
 
 ## 12. ultrasql-protocol
 
-**Responsibility.** PostgreSQL wire protocol v3.
+**Responsibility.** Wire protocol v3.
 
 **Implementation.** The protocol layer is pure data shuffling. It
 parses incoming messages into typed enums (`StartupMessage`,
@@ -462,8 +452,8 @@ catalog cache → start WAL writer → start checkpointer → bind listener
 
 **Per-session transaction state.** Each connection owns a
 `TxnState` machine with three variants — `Idle`, `InTransaction(txn)`,
-`Failed(txn)` — that mirrors the PostgreSQL `ReadyForQuery` status
-bytes (`'I'`, `'T'`, `'E'`). `BEGIN` transitions `Idle →
+`Failed(txn)` — that mirrors the wire readiness status bytes (`'I'`, `'T'`,
+`'E'`). `BEGIN` transitions `Idle →
 InTransaction`; `COMMIT`/`ROLLBACK` finalise via
 `TxnManager::commit`/`abort` and return to `Idle`. Any executor error
 inside `InTransaction` transitions to `Failed`, and every subsequent

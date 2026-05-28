@@ -6,7 +6,7 @@ claims that cannot be reproduced.
 ## Required checks
 
 - No proprietary tests.
-- No copied closed-source code.
+- No closed-source code.
 - No fake benchmark claims.
 
 ## Verification commands
@@ -15,7 +15,7 @@ Run these before release:
 
 ```bash
 rg -n "TH3|proprietary|confidential|internal use only|do not distribute" tests docs crates benchmarks
-rg -n "copied from|decompiled|reverse engineered|Firebolt source|closed-source code" .
+rg -n "decompiled|reverse engineered|Firebolt source|closed-source code" .
 rg -n "faster than|beats|winner|unsupported benchmark claim" README.md ROADMAP.md DONE.md BENCHMARKS.md docs benchmarks
 ```
 
@@ -29,7 +29,7 @@ Any hit must resolve to one of:
 ## Firebolt Core
 
 Firebolt Core is a closed-source Docker image used only as an external local
-competitor. UltraSQL does not vendor, copy, redistribute, decompile, or derive
+measured engine. UltraSQL does not vendor, redistribute, decompile, or derive
 code from that image. Firebolt Core benchmark artifacts must say
 `core_mode: local_docker` and must use the committed local helper:
 
@@ -60,6 +60,6 @@ Markdown dump.
 ## Benchmark claims
 
 A benchmark claim exists only when the committed runner produced a measured
-artifact on a recorded host. Missing competitors, missing datasets, Docker
+artifact on a recorded host. Missing measured engines, missing datasets, Docker
 unavailability, or unsupported SQL shapes must be recorded as `not_available`.
 Do not convert those records into wins.

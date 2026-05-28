@@ -1,4 +1,4 @@
-//! `ultrasql-server` library: PostgreSQL-wire-compatible session loop.
+//! `ultrasql-server` library: wire-protocol session loop.
 //!
 //! The crate exposes two top-level async entry points:
 //!
@@ -64,7 +64,7 @@ pub mod wal_sink;
 pub mod wire_writer;
 pub mod workload;
 
-/// PostgreSQL-compatible numeric `server_version` exposed in startup
+/// Numeric `server_version` exposed in startup
 /// `ParameterStatus` and `pg_settings`. Drivers parse this as a PostgreSQL
 /// feature baseline; UltraSQL's own product version remains `version()`.
 pub(crate) const POSTGRES_COMPAT_SERVER_VERSION: &str = "14.0";
@@ -139,7 +139,7 @@ pub use result_encoder::{
 pub struct LocalResultColumn {
     /// Display name returned by the planner/executor.
     pub name: String,
-    /// PostgreSQL-compatible type OID for the text-encoded value.
+    /// Wire type OID for the text-encoded value.
     pub type_oid: u32,
 }
 
@@ -1377,7 +1377,7 @@ impl SequenceSessionState {
     }
 }
 
-/// Session-local ownership for PostgreSQL-compatible advisory locks.
+/// Session-local ownership for advisory locks.
 #[derive(Clone, Debug)]
 pub struct AdvisorySessionState {
     owner: Xid,
@@ -2251,7 +2251,7 @@ pub enum LogStatementMode {
 }
 
 impl LogStatementMode {
-    /// Return the PostgreSQL-compatible setting string.
+    /// Return the setting string.
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
@@ -3537,7 +3537,7 @@ impl Server {
             .map_err(|e| ServerError::ddl(format!("bulk load encoded rows: {e}")))
     }
 
-    /// Record a PostgreSQL-compatible backup marker in the data directory.
+    /// Record a backup marker in the data directory.
     ///
     /// Returns the current backup LSN surface. UltraSQL v0.9 does not expose a
     /// stable public LSN accessor yet, so the marker records wall-clock time

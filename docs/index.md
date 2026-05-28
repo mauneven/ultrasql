@@ -1,7 +1,7 @@
 # UltraSQL Documentation
 
 UltraSQL is a fast SQL database in Rust. These docs cover local evaluation,
-release artifacts, operational gates, and compatibility limits.
+release artifacts, operational gates, and known limits.
 
 UltraSQL is pre-alpha. Treat every install path as an evaluation or release
 candidate path until the v1.0 release checklist is closed.
@@ -13,6 +13,6 @@ candidate path until the v1.0 release checklist is closed.
 - [Configuration](configuration.md) lists release-relevant server knobs.
 - [AI Database Strategy](ai-database-strategy.md) maps UltraSQL's AI memory
   engine plan.
-- [Known Incompatibilities](known-incompatibilities.md) records open SQL
-  compatibility gaps.
+- [Known Limitations](known-limitations.md) records open SQL and operations
+  gaps.
 - [Release Checklist](release-checklist.md) is the production readiness gate.

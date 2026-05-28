@@ -54,7 +54,7 @@ SELECT pg_start_backup('operator-backup');
 SELECT pg_stop_backup();
 ```
 
-Compatibility view shapes exist so tools do not fail during introspection.
+Catalog view shapes exist so tools do not fail during introspection.
 Most counters are currently zero-valued until live stat collectors are wired.
 
 ## Control and WAL inspection
@@ -78,7 +78,7 @@ cargo run --bin ultrasql -- --wal-receive-once target/ship --data-dir target/sta
 
 `--ctl initdb` creates a local directory skeleton. `--ctl start` prints the
 server command for service managers. `--ctl status` checks readiness.
-`--ctl standby` and `--ctl recovery` create PostgreSQL-style signal
+`--ctl standby` and `--ctl recovery` create signal
 files for orchestration. `--basebackup` copies the data directory and writes
 `backup_manifest.json` with file sizes and checksums. `--pg-dump` and
 `--pg-restore` provide UltraSQL archive/directory export and restore paths for

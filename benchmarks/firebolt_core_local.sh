@@ -2,7 +2,7 @@
 # Local Firebolt Core Docker lifecycle helper for benchmark scripts.
 #
 # Firebolt Core is supplied as an external Docker image. UltraSQL does not
-# vendor, copy, or redistribute Firebolt Core.
+# vendor or redistribute Firebolt Core.
 
 set -euo pipefail
 

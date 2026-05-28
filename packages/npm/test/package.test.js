@@ -38,6 +38,7 @@ test("readme documents node usage and binary behavior", () => {
     "Supported Targets",
     "No install-time `postinstall` script",
     "UltraSQL is pre-alpha",
+    "known limitations",
   ]) {
     assert.ok(readme.includes(needle), `README missing ${needle}`);
   }

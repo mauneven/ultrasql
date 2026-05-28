@@ -16,8 +16,8 @@ You need an RFC for any change that:
 
 - Modifies the on-disk format, the WAL record format, or any other
   durable representation.
-- Modifies the PostgreSQL wire protocol implementation in ways that
-  affect compatibility.
+- Modifies the wire protocol implementation in ways that affect client
+  behavior.
 - Adds, removes, or changes a public API in a versioned crate.
 - Adds or removes a workspace-level dependency that compiles into
   the server binary.
@@ -69,9 +69,9 @@ implement the proposal without further design.
 Why this design? What alternatives were considered, and why were
 they rejected? What is the impact of not doing this?
 
-## Compatibility
-How does this affect existing users? Existing on-disk data? Existing
-clients? Existing benchmarks?
+## Upgrade impact
+How does this affect existing users? Existing on-disk data? Existing clients?
+Existing benchmarks?
 
 ## Migration
 If the change is breaking, what is the migration path?

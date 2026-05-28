@@ -3,16 +3,16 @@ PRAGMA	SQLite-specific pragma syntax is not portable.
 WITHOUT ROWID	SQLite-specific storage option is not portable.
 MATCH	Full-text MATCH/TSQUERY behavior is tracked outside the portable SLT subset.
 REGEXP	Regular-expression operator semantics are not implemented in UltraSQL.
-GLOB	SQLite-specific glob operator is not PostgreSQL-compatible.
+GLOB	SQLite-specific glob operator is not portable across measured engines.
 ATTACH DATABASE	SQLite database-attachment syntax is outside portable SQLLogicTest coverage.
 CREATE VIRTUAL TABLE	SQLite virtual-table modules are outside portable SQLLogicTest coverage.
-CREATE TRIGGER	Trigger semantics require dedicated PostgreSQL compatibility tests before import.
+CREATE TRIGGER	Trigger semantics require dedicated engine-specific tests before import.
 CREATE VIEW	View expansion belongs in a reviewed planner/catalog compatibility shard.
 CREATE POLICY	Row-policy syntax belongs in tenant-security tests, not generic portable imports.
 ENABLE ROW LEVEL SECURITY	Row-level-security DDL belongs in tenant-security tests, not generic portable imports.
-MERGE INTO	MERGE semantics need dedicated compatibility tests before import.
-ON CONFLICT DO	Advanced PostgreSQL upsert behavior needs dedicated compatibility tests.
-WINDOW	Window-function coverage belongs in a tagged PostgreSQL compatibility subset.
+MERGE INTO	MERGE semantics need dedicated engine-specific tests before import.
+ON CONFLICT DO	Advanced upsert behavior needs dedicated engine-specific tests.
+WINDOW	Window-function coverage belongs in a tagged engine-specific subset.
 CREATE INDEX idx_tab2_0 ON tab2 (col3,col1)	Hydromatic SLT uses composite float indexes beyond current UltraSQL index-key support; query semantics still run through scans.
 CREATE UNIQUE INDEX idx_tab3_1 ON tab3 (col1,col0)	Hydromatic SLT uses composite float indexes beyond current UltraSQL index-key support; query semantics still run through scans.
 CREATE INDEX idx_tab4_0 ON tab4 (col4,col0)	Hydromatic SLT uses composite float indexes beyond current UltraSQL index-key support; query semantics still run through scans.

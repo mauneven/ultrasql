@@ -11,7 +11,7 @@
     <projectUrl>https://github.com/mauneven/ultrasql</projectUrl>
     <packageSourceUrl>https://github.com/mauneven/ultrasql</packageSourceUrl>
     <tags>database sql postgresql rust</tags>
-    <summary>PostgreSQL-compatible OLTP+OLAP database in Rust.</summary>
+    <summary>Fast SQL database in Rust.</summary>
     <description>UltraSQL server, CLI, and local runner for Windows. The package installs the checksummed release setup executable.</description>
   </metadata>
   <files>

@@ -16,7 +16,7 @@
 //!
 //! # System relations baked in
 //!
-//! The thirteen core system tables that exist in every PostgreSQL-compatible
+//! The thirteen core system tables that exist in every UltraSQL
 //! database.  Their OIDs are well-known constants used throughout the
 //! rest of the system.
 //!

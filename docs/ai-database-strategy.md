@@ -99,7 +99,7 @@ claims auditable and gives operators enough information to tune production.
 
 Every AI claim needs raw artifacts:
 
-- Exact top-k across installed reference engines and vector extensions when
+- Exact top-k across installed measured engines and vector extensions when
   available.
 - HNSW recall/latency across rows, dimensions, filters, and update/restart
   cycles.
@@ -111,7 +111,7 @@ Every AI claim needs raw artifacts:
 - Model telemetry analytics: token usage, latency, tool calls, errors, and
   prompt/version dimensions.
 
-Missing reference engines are allowed only as explicit `not_available`
+Missing measured engines are allowed only as explicit `not_available`
 artifacts with reason fields. No README, release note, or package metadata may
 rank a missing engine.
 

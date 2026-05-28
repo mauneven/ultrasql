@@ -1,4 +1,4 @@
-//! PostgreSQL-compatible blank-padded character helpers.
+//! Blank-padded character helpers.
 //!
 //! `CHAR(n)` / `BPCHAR(n)` stores exactly `n` characters by padding with
 //! ASCII spaces on assignment. Equality and ordering ignore those trailing

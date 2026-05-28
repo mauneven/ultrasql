@@ -117,10 +117,9 @@ ULTRASQL_NPM_SKIP_DOWNLOAD=1 pnpm add -D ultrasql
 
 ## Status
 
-UltraSQL is pre-alpha. It is useful for local testing, compatibility work, and
-benchmark reproduction, but it is not a v1.0 production database yet. See the
-project roadmap and known incompatibilities before using it with important
-data.
+UltraSQL is pre-alpha. It is useful for local SQL testing, embedded experiments,
+and benchmark reproduction, but it is not a v1.0 production database yet. See
+the project roadmap and known limitations before using it with important data.
 
 ## Links
 

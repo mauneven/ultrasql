@@ -47,7 +47,6 @@ doc-valid-idents = [
     "TPC-B",
     "TPC-C",
     "TPC-H",
-    "PostgreSQL's",
     "UltraSQL's",
     "DDL",
     "DML",

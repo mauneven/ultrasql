@@ -1,4 +1,4 @@
-//! PostgreSQL-compatible sequence generator.
+//! SQL sequence generator.
 //!
 //! A [`Sequence`] is a monotonically advancing (or descending) integer
 //! generator. Sequences power `SERIAL` / `IDENTITY` columns and are
@@ -17,13 +17,12 @@
 //! to the buffer pool and WAL sink so the state survives a restart.
 //! Currently the state is in-memory only and resets after a crash.
 //!
-//! # PostgreSQL compatibility
+//! # Sequence semantics
 //!
-//! Matches PostgreSQL 16 semantics: `nextval` advances the sequence and
-//! returns the new value; `currval` returns the last value returned by
-//! `nextval` in the current session (or `SequenceError::NotCalled` if
-//! `nextval` has never been called); `lastval` returns the last value
-//! from any sequence in the current session.
+//! `nextval` advances the sequence and returns the new value; `currval`
+//! returns the last value returned by `nextval` in the current session (or
+//! `SequenceError::NotCalled` if `nextval` has never been called); `lastval`
+//! returns the last value from any sequence in the current session.
 
 use parking_lot::Mutex;
 use thiserror::Error;

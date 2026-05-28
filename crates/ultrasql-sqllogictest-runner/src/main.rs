@@ -34,7 +34,7 @@ struct Cli {
     #[arg(long, env = "ULTRASQL_SLT_DATABASE_URL")]
     database_url: Option<String>,
 
-    /// Optional PostgreSQL-compatible reference connection string.
+    /// Optional reference connection string.
     #[arg(long, env = "ULTRASQL_SLT_REFERENCE_URL")]
     reference_url: Option<String>,
 

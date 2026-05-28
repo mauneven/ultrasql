@@ -8,7 +8,7 @@ priority: optional
 maintainer: ultrasql <contact@ultrasql.org>
 homepage: https://ultrasql.org
 license: Apache-2.0 OR MIT
-description: PostgreSQL-compatible OLTP+OLAP database in Rust.
+description: Fast SQL database in Rust.
 vendor: UltraSQL
 contents:
   - src: "@ROOT@/usr/bin/ultrasqld"

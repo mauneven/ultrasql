@@ -35,8 +35,8 @@ nav:
   - Operator Reports: operator-reports.md
   - Release Notes Template: release-notes-template.md
   - Driver Certification: driver-certification.md
-  - Migration From PostgreSQL: migration-from-postgresql.md
-  - Known Incompatibilities: known-incompatibilities.md
+  - Migration Guide: migration-guide.md
+  - Known Limitations: known-limitations.md
   - Security and Ethics Audit: security-ethics-audit.md
   - Testing:
       - Coverage Evidence: testing/coverage-evidence-2026-05-24.md

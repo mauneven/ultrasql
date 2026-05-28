@@ -4,7 +4,7 @@
 //! `pg_class` and `pg_attribute` rows to its underlying heap so
 //! [`crate::PersistentCatalog::bootstrap_from_heap`] can rebuild the
 //! in-memory `TableEntry` map after a restart. The on-disk shape is
-//! **not** PostgreSQL wire-compatible — it is an internal length-
+//! **not** protocol wire format — it is an internal length-
 //! prefixed binary encoding designed for compact, fast round-trips
 //! during bootstrap, not for client interoperability.
 //!

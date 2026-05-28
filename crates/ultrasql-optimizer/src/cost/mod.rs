@@ -6,7 +6,7 @@
 //!   adapter (landing after wave 6b). During development [`NoStats`] is
 //!   used so the cost model is exercised even without `ANALYZE` data.
 //! - [`CostEstimate`]: the output of the cost model for a single plan node.
-//! - [`CostGucs`]: PostgreSQL-compatible cost GUCs (grand unified constants).
+//! - [`CostGucs`]: cost GUCs (grand unified constants).
 //! - [`CostModel`]: the entry point; call [`CostModel::estimate`] on any
 //!   [`LogicalPlan`] to obtain a [`CostEstimate`].
 //!
@@ -114,7 +114,7 @@ pub struct CostEstimate {
 // CostGucs
 // ============================================================================
 
-/// PostgreSQL-compatible cost GUCs (Grand Unified Constants).
+/// Cost GUCs (Grand Unified Constants).
 ///
 /// These constants translate hardware-relative operation costs into the
 /// shared cost unit. The defaults match PostgreSQL 17's defaults exactly so

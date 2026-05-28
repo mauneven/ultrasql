@@ -1,7 +1,7 @@
 # External SQL Test Reuse
 
 UltraSQL can reuse external SQL test suites only through an auditable import
-pipeline. SQLLogicTest is the compatibility layer; it does not replace
+pipeline. SQLLogicTest is the portable SQL layer; it does not replace
 UltraSQL-specific tests for WAL, recovery, MVCC visibility, snapshot isolation,
 undo/update behavior, page LSNs, full-page writes, protocol edge cases, parser
 fuzzing, WAL decoder fuzzing, or planner fuzzing.
@@ -15,19 +15,20 @@ Use these sources conservatively:
   replay timing.
 - SQLLogicTest-style corpora: preferred for portable SQL behavior when license
   and provenance are recorded.
-- PostgreSQL regression-derived cases: useful for PostgreSQL compatibility.
+- Public regression-derived cases: useful for SQL behavior coverage.
   Preserve upstream notices and record the exact source commit.
-- Hermitage isolation scenarios: useful for transaction-isolation compatibility.
+- Hermitage isolation scenarios: useful for transaction-isolation coverage.
   Preserve CC BY 4.0 attribution and pin the exact source commit; port reviewed
   scenarios into local tests instead of vendoring the upstream Markdown dump.
 - DuckDB SQLLogicTest-style files: useful as inspiration. Check each file's
-  license before copying concrete tests.
+  license before reusing concrete tests.
 
 Do not use these sources:
 
 - SQLite TH3. It is proprietary.
 - Any SQLite testing asset whose license is unclear.
-- Any third-party file without a copied license notice and immutable provenance.
+- Any third-party file without an included license notice and immutable
+  provenance.
 
 ## Repository layout
 
@@ -66,12 +67,12 @@ SQLLogicTest record shapes:
 
 The runner supports two UltraSQL execution modes:
 
-- `--mode wire`: connect to an already-running UltraSQL PostgreSQL-wire
+- `--mode wire`: connect to an already-running UltraSQL wire
   endpoint with `--database-url`.
 - `--mode in-process`: start an in-process UltraSQL server on an ephemeral TCP
   listener, then connect to it with `tokio-postgres`.
 
-Both modes run through PostgreSQL wire protocol. That validates parser, binder,
+Both modes run through the wire protocol. That validates parser, binder,
 planner, executor, MVCC-visible SQL behavior, and wire result formatting. A
 future storage-direct mode can reuse the same parsed test model if needed.
 
@@ -135,17 +136,17 @@ compares formatted row values after applying the same SQLLogicTest sort mode.
 
 Documented normalizations are intentionally narrow:
 
-- PostgreSQL wire rows are formatted as SQLLogicTest scalar values.
+- Wire rows are formatted as SQLLogicTest scalar values.
 - SQLite/DuckDB CLI output uses one value per line, `NULL` for nulls, and
   carriage-return stripping for cross-platform shells.
 - `rowsort` sorts complete SQLLogicTest rows before value comparison.
 
 Any row-value mismatch after those normalizations is a failure.
 
-SQLite and DuckDB comparison is intended only for portable subsets. PostgreSQL
-compatibility tests should use PostgreSQL as the reference.
+SQLite and DuckDB comparison is intended only for portable subsets. Engine-
+specific public regression shards should use their matching reference.
 
-Run the PostgreSQL regression-derived compatibility subset with:
+Run the public regression-derived subset with:
 
 ```sh
 POSTGRES_URL="host=127.0.0.1 port=5432 user=postgres dbname=ultrasql_slt" \
@@ -161,12 +162,12 @@ The first curated shard lives under
 `create_index.sql`, `constraints.sql`, `create_operator.sql`, and
 `opr_sanity.sql` as sources, and carries the PostgreSQL license next to the
 SLT files. The parser/type, index/constraint/operator, and type-specific
-shards keep unsupported PostgreSQL catalog breadth, user-defined operator
+shards keep unsupported catalog breadth, user-defined operator
 checks, numeric overflow breadth, collation, timezone-abbreviation, SQL/JSON,
 and array-slice checks as explicit `# ultrasql:skip` records instead of
 silently dropping them.
 
-Multiple reference engines can run in one pass:
+Multiple measured engines can run in one pass:
 
 ```sh
 cargo run -p ultrasql-sqllogictest-runner -- \
@@ -177,7 +178,7 @@ cargo run -p ultrasql-sqllogictest-runner -- \
 ```
 
 The first committed imported shard is from Hydromatic SQL Logic Test at commit
-`0a809c530457bf0e56d637ef19fcaabd2964fd67`. License and notice files are copied
+`0a809c530457bf0e56d637ef19fcaabd2964fd67`. License and notice files live
 beside the imported shard under `tests/slt/portable/imported/hydromatic/`.
 Smoke command:
 
@@ -304,4 +305,4 @@ cargo run -p ultrasql-sqllogictest-runner -- \
 - Manual: run larger imported suites after legal/provenance review.
 
 Keep CI artifacts with counts for passed, skipped, and failed records. A growing
-skip count is a compatibility signal, not noise.
+skip count is a coverage signal, not noise.

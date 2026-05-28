@@ -154,7 +154,7 @@ impl Catalog for InMemoryCatalog {
     }
 }
 
-/// PostgreSQL-compatible OID for a built-in type name.
+/// Wire OID for a built-in type name.
 #[must_use]
 pub fn builtin_type_oid(name: &str) -> Option<Oid> {
     let folded = name.to_ascii_lowercase();

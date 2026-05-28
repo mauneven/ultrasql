@@ -123,7 +123,7 @@ fn postgres_compat_script_exists_and_skips_without_reference_url() {
         .env_remove("ULTRASQL_SLT_REFERENCE_URL")
         .env_remove("POSTGRES_URL")
         .output()
-        .expect("run PostgreSQL compatibility script");
+        .expect("run engine-specific script");
 
     assert!(
         output.status.success(),
@@ -145,7 +145,7 @@ fn postgres_compat_script_rejects_non_compat_paths() {
         .env("ULTRASQL_SLT_REFERENCE_URL", "postgres://example")
         .env("ULTRASQL_SLT_RUNNER", "/bin/false")
         .output()
-        .expect("run PostgreSQL compatibility script");
+        .expect("run engine-specific script");
 
     assert!(
         !output.status.success(),
@@ -155,7 +155,7 @@ fn postgres_compat_script_rejects_non_compat_paths() {
     );
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stderr.contains("non-PostgreSQL-compat SQLLogicTest path"),
+        stderr.contains("non-engine-specific SQLLogicTest path"),
         "stderr:\n{stderr}"
     );
 }

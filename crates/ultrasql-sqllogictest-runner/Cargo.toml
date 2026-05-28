@@ -1,6 +1,6 @@
 [package]
 name = "ultrasql-sqllogictest-runner"
-description = "SQLLogicTest-compatible runner for UltraSQL wire-protocol compatibility tests."
+description = "SQLLogicTest runner for UltraSQL wire-protocol tests."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

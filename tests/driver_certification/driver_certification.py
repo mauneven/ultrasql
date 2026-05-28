@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Certify UltraSQL with stock PostgreSQL client drivers.
+"""Certify UltraSQL with stock SQL client drivers.
 
 The harness starts a real `ultrasqld` process on an ephemeral localhost
 port and drives it through stock psql meta-commands, direct libpq, psycopg2, psycopg3,
@@ -8,7 +8,7 @@ Go pgx, GORM, the JDBC PostgreSQL driver, Hibernate ORM, Npgsql, Prisma,
 Diesel, and GUI introspection query families used by pgAdmin, DBeaver,
 DataGrip, Flyway, Liquibase, and Alembic.
 It intentionally uses only public driver APIs so failures represent
-client-visible PostgreSQL wire incompatibilities.
+client-visible wire behavior gaps.
 """
 
 from __future__ import annotations

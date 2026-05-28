@@ -23,7 +23,7 @@ is valid for the operator shape.
 ## Goals
 
 - Persistent, crash-recoverable HNSW graph stored in the storage layer.
-- PostgreSQL-shaped DDL:
+- SQL DDL:
 
 ```sql
 CREATE INDEX items_embedding_hnsw

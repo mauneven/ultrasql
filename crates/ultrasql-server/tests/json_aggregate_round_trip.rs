@@ -1,7 +1,7 @@
-//! Wire-level regression tests for JSON aggregate compatibility.
+//! Wire-level regression tests for JSON aggregate behavior.
 //!
-//! `JSON_AGG` is part of the v1.0 PostgreSQL compatibility surface. These
-//! tests use the PostgreSQL wire path rather than executor internals so the
+//! `JSON_AGG` is part of the v1.0 SQL surface. These tests use the wire path
+//! rather than executor internals so the
 //! parser, binder, planner, aggregate executor, and result encoder all stay
 //! covered together.
 

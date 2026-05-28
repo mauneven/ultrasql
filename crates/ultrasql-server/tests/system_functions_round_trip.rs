@@ -1,4 +1,4 @@
-//! End-to-end scalar system-function compatibility tests.
+//! End-to-end scalar system-function behavior tests.
 
 mod support;
 

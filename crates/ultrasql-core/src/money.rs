@@ -1,4 +1,4 @@
-//! PostgreSQL-compatible MONEY helpers.
+//! MONEY helpers.
 //!
 //! UltraSQL stores `MONEY` as PostgreSQL's `Cash` shape: a signed
 //! 64-bit integer counting fractional currency units. This v0.8 surface

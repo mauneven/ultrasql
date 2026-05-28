@@ -1,4 +1,4 @@
-//! Wire-level coverage for PostgreSQL-compatible privilege DDL.
+//! Wire-level coverage for privilege DDL.
 
 mod support;
 

@@ -40,7 +40,7 @@ pub enum DescribeKind {
 
 /// Per-column field description in a [`BackendMessage::RowDescription`].
 ///
-/// All offsets and OIDs are PostgreSQL-compatible. `type_size` is
+/// All offsets and OIDs follow the wire contract. `type_size` is
 /// negative for variable-length types (e.g. `text`, `bytea`); positive
 /// values denote a fixed byte width. `format_code` is `0` for the text
 /// format and `1` for the binary format — the only two values defined

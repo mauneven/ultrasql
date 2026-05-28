@@ -1,6 +1,6 @@
 [package]
 name        = "ultrasql-parser"
-description = "UltraSQL SQL lexer and parser. PostgreSQL-compatible dialect."
+description = "UltraSQL SQL lexer and parser."
 version.workspace      = true
 edition.workspace      = true
 rust-version.workspace = true

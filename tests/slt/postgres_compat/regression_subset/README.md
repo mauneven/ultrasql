@@ -1,10 +1,10 @@
-# PostgreSQL Regression Compatibility Subset
+# Public Regression Subset
 
 Source: `https://github.com/postgres/postgres`
 
 Pinned commit: `ddd12d1a5c4d980c5f31dc7d096012547b724e55` (`REL_17_STABLE`, checked 2026-05-21).
 
-License: PostgreSQL license, copied to `LICENSE.upstream`.
+License: PostgreSQL license, included at `LICENSE.upstream`.
 
 Imported files:
 
@@ -33,9 +33,9 @@ Derived upstream regression sources:
 - `src/test/regress/sql/create_operator.sql`
 - `src/test/regress/sql/opr_sanity.sql`
 
-These are small, hand-curated SQLLogicTest translations of public PostgreSQL
+These are small, hand-curated SQLLogicTest translations of public upstream
 regression behavior. The shards use local deterministic fixtures and expected
-rows written in SQLLogicTest format; they do not vendor the full PostgreSQL
+rows written in SQLLogicTest format; they do not vendor the full upstream
 regression suite. Unsupported catalog-wide sanity checks and user-defined
 operator DDL stay as explicit `# ultrasql:skip` debt in the relevant shard.
 The type-specific shard likewise keeps full numeric overflow, collation,

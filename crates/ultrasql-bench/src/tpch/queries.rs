@@ -2,7 +2,7 @@
 //!
 //! Parameters from the TPC-H specification (substitution variables) are
 //! inlined with the "canonical" values listed in the spec. Query texts
-//! follow the PostgreSQL-compatible SQL dialect used by tpch-kit.
+//! follow the SQL dialect used by tpch-kit.
 //!
 //! Each query is exposed both as a named constant (`Q1` through `Q22`)
 //! and through the [`query`] helper function that maps a 1-based index.

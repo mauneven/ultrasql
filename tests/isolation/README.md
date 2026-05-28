@@ -10,5 +10,5 @@ This directory holds the audited transaction-isolation baseline used by
   `NOTICE.hermitage.md`.
 
 The suite is intentionally small. It proves specific ACID/Hermitage scenarios
-and documents open SSI precision gaps; it is not a substitute for PostgreSQL's
-full isolationtester schedule.
+and documents open SSI precision gaps; it is not a substitute for the full
+isolationtester schedule.

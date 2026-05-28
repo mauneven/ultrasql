@@ -4,9 +4,9 @@ Source: `https://github.com/hydromatic/sql-logic-test`
 
 Pinned commit: `0a809c530457bf0e56d637ef19fcaabd2964fd67`
 
-License: MIT, copied to `LICENSE.upstream`.
+License: MIT, included at `LICENSE.upstream`.
 
-Notice: copied to `NOTICE.upstream`.
+Notice: included at `NOTICE.upstream`.
 
 Imported files:
 

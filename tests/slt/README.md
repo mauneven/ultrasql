@@ -6,8 +6,8 @@ This tree contains SQLLogicTest-style files used by
 Buckets:
 
 - `portable/`: UltraSQL-authored or audited portable SQL subset tests.
-- `postgres_compat/`: tests whose expected behavior intentionally follows
-  PostgreSQL.
+- `postgres_compat/`: public regression-derived tests that are intentionally
+  engine-specific.
 - `ultrasql_specific/`: tests for UltraSQL behavior exposed through SQL, not a
   replacement for storage/WAL/MVCC unit and integration tests.
 
@@ -28,7 +28,7 @@ The benchmark artifact compares UltraSQL with installed SQLite/DuckDB
 references. It is a smoke signal for portable SQL replay speed, not a
 replacement for TPC-H, ClickBench, or UltraSQL-specific correctness tests.
 
-Run portable differential correctness against reference engines:
+Run portable differential correctness against measured engines:
 
 ```sh
 tests/slt/run_differential.sh
@@ -42,7 +42,7 @@ engines are skipped with explicit reasons on stderr. Use `SLT_DIFF_PATHS` only
 for reviewed portable paths and `SLT_DIFF_ENGINES=postgres,duckdb,sqlite` to
 choose engines.
 
-Run the PostgreSQL compatibility subset only against PostgreSQL as reference:
+Run the public regression-derived subset against its matching reference:
 
 ```sh
 POSTGRES_URL="host=127.0.0.1 port=5432 user=postgres dbname=ultrasql_slt" \

@@ -208,7 +208,7 @@ pub fn run_ddl_command(tag: &str) -> SelectResult {
 }
 
 /// Drive a `ModifyTable` operator to completion and emit the
-/// PostgreSQL-compatible row-count `CommandComplete` tag.
+/// Row-count `CommandComplete` tag.
 ///
 /// `command` is one of `"INSERT"`, `"UPDATE"`, `"DELETE"`. `INSERT`
 /// uses the legacy `INSERT 0 N` shape (the `0` is the historical OID
@@ -402,7 +402,7 @@ fn prepare_stream_sink(sink: &mut BytesMut, initial_cap: usize) {
 
 /// Convenience wrapper around [`stream_select`] that returns a
 /// [`SelectResult`] whose `streamed_body` field carries the encoded
-/// wire bytes. Drop-in replacement for [`run_select`] at the SELECT
+/// wire bytes. Alternative for [`run_select`] at the SELECT
 /// dispatch site in `run_plan_in_txn`.
 ///
 /// The `messages` field is left empty by design: the session sends

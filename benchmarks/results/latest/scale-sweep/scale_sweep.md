@@ -1,6 +1,6 @@
 ## Release-artifact scale sweep
 
-UltraSQL is an external release binary launched as ultrasqld; competitors use installed local clients on the same host.
+UltraSQL is an external release binary launched as ultrasqld; measured engines use installed local clients on the same host.
 
 | Workload | Rows | UltraSQL | DuckDB | ClickHouse | SQLite | PostgreSQL | Fastest |
 |---|---:|---:|---:|---:|---:|---:|---|

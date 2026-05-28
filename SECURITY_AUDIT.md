@@ -9,7 +9,7 @@ regression tests added)
 
 This document records the findings of an internal adversarial pass on
 the v0.5 surface. The pass focused on the new public network surface
-(PostgreSQL wire protocol parser, server connection handler) plus
+(wire protocol parser, server connection handler) plus
 the durability path (WAL recovery, segment files) and the SQL frontend
 (lexer, parser).
 
@@ -118,7 +118,7 @@ unmodified).
 
 **Exploitation:** The codec previously accepted any message whose
 declared length was up to `(1 << 30) - 1` (approximately 1 GiB),
-matching PostgreSQL's `MaxAllocSize`. A single client opening a TCP
+matching the configured frame-size cap. A single client opening a TCP
 connection and writing a 5-byte tagged header advertising `length =
 1 GiB` made the server pre-allocate a buffer of that size (or wait
 forever for that many bytes to arrive). Repeat from N connections to

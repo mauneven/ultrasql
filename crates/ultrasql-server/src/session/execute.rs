@@ -301,7 +301,7 @@ where
         // catalog provides the legacy fallback.
         let catalog_snapshot: Arc<CatalogSnapshot> = self.state.catalog_snapshot();
 
-        // Wire-level statement no-ops kept for PostgreSQL compatibility
+        // Wire-level statement no-ops kept for SQL tooling
         // while the real plumbing lands behind the same names:
         //
         // - `VACUUM [table]` (§3.2-aligned): manual vacuum surface for

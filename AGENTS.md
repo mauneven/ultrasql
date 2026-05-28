@@ -16,7 +16,7 @@ is wrong; resolve the conflict, do not ignore it.
 
 UltraSQL is a from-scratch SQL OLTP+OLAP engine in pure Rust. It aims for
 durable storage, a broad SQL surface, MVCC semantics, and wide client
-compatibility. The mission has three legs:
+certification. The mission has three legs:
 
 1. **Correctness first.** A database that loses data, returns wrong
    answers, or violates the isolation level it advertises is not useful
@@ -33,9 +33,8 @@ compatibility. The mission has three legs:
 
 ## 2. Project Philosophy
 
-> Behavior-compatible with PostgreSQL. Re-implemented underneath for
-> current hardware: many cores, deep cache hierarchies, wide SIMD units,
-> NVMe-class storage.
+> Built for current hardware: many cores, deep cache hierarchies, wide SIMD
+> units, NVMe-class storage, and measurable end-to-end performance.
 
 Every technical decision must be defensible against the following
 ordered priorities. When two conflict, the earlier one wins.
@@ -220,7 +219,7 @@ artifacts. There is no undocumented "trust me" benchmark path.
 
 - Correctness: a passing test never becomes a `#[ignore]` test in the
   same PR that breaks it. Disabling a test requires a tracking issue.
-- Compatibility: changes to public APIs of versioned crates require a
+- API stability: changes to public APIs of versioned crates require a
   semver-major bump unless documented as an unstable pre-1.0 surface.
 
 ---
@@ -327,8 +326,8 @@ reviewer missed is a bug in the review, not a CI success.
 - **Document tradeoffs.** When a design has tradeoffs (and most do),
   spell them out in the PR description or in a comment near the code.
 - **Push back when the request is wrong.** "Make this faster" is not a
-  task description; "the hash-aggregate is 20% slower than DuckDB at
-  TPC-H Q1 on M4, here is the flamegraph" is.
+  task description; "the hash-aggregate regressed 20% on TPC-H Q1 on M4,
+  here is the flamegraph" is.
 
 ---
 
@@ -360,7 +359,7 @@ ultrasql/
 │   ├── ultrasql-executor/         physical execution
 │   ├── ultrasql-vec/              vectorized kernels
 │   ├── ultrasql-catalog/          system catalog
-│   ├── ultrasql-protocol/         PostgreSQL wire protocol v3
+│   ├── ultrasql-protocol/         wire protocol v3
 │   ├── ultrasql-server/           ultrasqld binary
 │   ├── ultrasql-cli/              ultrasql interactive client
 │   └── ultrasql-bench/            benchmark harness binary
@@ -381,7 +380,7 @@ specific glossaries live in the relevant crate's docs.
 - **OID** — object identifier; a 32-bit ID assigned to each catalog
   entity. Stable for the life of the entity.
 - **XID** — transaction identifier; UltraSQL uses a 64-bit XID to avoid
-  the PostgreSQL wraparound problem.
+  32-bit wraparound problems.
 - **LSN** — log sequence number; a monotonically increasing 64-bit
   position in the WAL.
 - **Page** — an 8 KiB unit of on-disk and in-memory storage. The buffer

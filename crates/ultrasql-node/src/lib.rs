@@ -12,7 +12,7 @@ use ultrasql_server::{EmbeddedDatabase, LocalQueryOutput, ServerError};
 pub struct QueryColumn {
     /// Output column name.
     pub name: String,
-    /// PostgreSQL-compatible type OID.
+    /// Wire type OID.
     pub type_oid: u32,
 }
 

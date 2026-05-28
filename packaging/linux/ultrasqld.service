@@ -1,5 +1,5 @@
 [Unit]
-Description=UltraSQL PostgreSQL-compatible database server
+Description=UltraSQL SQL database server
 Documentation=https://docs.ultrasql.org/
 After=network-online.target
 Wants=network-online.target

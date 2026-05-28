@@ -17,7 +17,7 @@ pub struct JitConfig {
 }
 
 impl JitConfig {
-    /// JIT disabled, PostgreSQL-compatible surface default until
+    /// JIT disabled, SQL surface default until
     /// benchmark gates prove compiled paths win broadly.
     pub const OFF: Self = Self {
         enabled: false,

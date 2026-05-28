@@ -66,7 +66,7 @@ where
         Ok(())
     }
 
-    /// Send a PostgreSQL-compatible `ErrorResponse`. The fields are
+    /// Send a wire `ErrorResponse`. The fields are
     /// the minimal set every libpq client expects: severity, code,
     /// message.
     pub(crate) async fn send_error(

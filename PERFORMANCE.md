@@ -168,10 +168,10 @@ This section overlaps with [BENCHMARKS.md](BENCHMARKS.md); read that
 file for the methodology. The rules that belong here:
 
 - Every published number is a *measurement*, not a *claim*.
-- "Faster than PostgreSQL" without a configuration and a host
+- "Faster than another database" without a configuration and a host
   description is a marketing statement, not an engineering one.
-- Comparison benchmarks tune the competitor. We do not benchmark
-  PostgreSQL with `shared_buffers = 128MB` against ourselves with a
+- Comparison benchmarks tune the measured engine. We do not benchmark
+  another database with tiny memory settings against ourselves with a
   4 GB buffer pool and call it a win.
 - Microbenchmarks measure microseconds. Macrobenchmarks measure
   workloads. Both are necessary; neither substitutes for the other.
