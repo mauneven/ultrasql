@@ -136,8 +136,32 @@ CARGO_INCREMENTAL="${CARGO_INCREMENTAL:-0}" \
     cargo build --release --package ultrasql-bench --features sql-bench \
         --bin regression-gate --bin ultrasql-bench >/dev/null
 
-target/release/regression-gate --stage v0_9 --smoke \
-    > "$RAW_DIR/tpcb_32conn-ultrasql-kernel.json" 2>&1 || true
+KERNEL_SMOKE_RESULT="$RAW_DIR/tpcb_32conn-ultrasql-kernel.json"
+TMP_KERNEL_SMOKE_RESULT="${KERNEL_SMOKE_RESULT}.tmp.$$"
+KERNEL_SMOKE_ERR="${KERNEL_SMOKE_RESULT}.err.$$"
+if target/release/regression-gate --stage v0_9 --smoke \
+    > "$TMP_KERNEL_SMOKE_RESULT" 2>"$KERNEL_SMOKE_ERR"; then
+    mv "$TMP_KERNEL_SMOKE_RESULT" "$KERNEL_SMOKE_RESULT"
+else
+    python3 - "$KERNEL_SMOKE_RESULT" "$KERNEL_SMOKE_ERR" <<'PY'
+import json
+import pathlib
+import sys
+
+out_path, err_path = sys.argv[1:]
+detail = pathlib.Path(err_path).read_text(errors="replace") if pathlib.Path(err_path).exists() else ""
+doc = {
+    "workload": "tpcb_32conn",
+    "engine": "ultrasql",
+    "status": "not_available",
+    "reason": "kernel_smoke_failed",
+    "detail": detail[-2000:],
+}
+pathlib.Path(out_path).write_text(json.dumps(doc, indent=2) + "\n")
+PY
+    rm -f "$TMP_KERNEL_SMOKE_RESULT"
+fi
+rm -f "$KERNEL_SMOKE_ERR"
 
 if [[ -z "$ULTRASQL_RESULT" ]]; then
     ULTRASQL_RESULT="$RAW_DIR/tpcb_32conn-ultrasql.json"

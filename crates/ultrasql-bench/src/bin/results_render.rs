@@ -282,6 +282,12 @@ fn rank_engines(results: &mut Vec<EngineResult>) {
     });
 }
 
+fn has_ultrasql_measurement(results: &[EngineResult]) -> bool {
+    results
+        .iter()
+        .any(|result| result.engine == "ultrasql" || result.engine.starts_with("ultrasql_"))
+}
+
 // ---------------------------------------------------------------------------
 // Markdown rendering
 // ---------------------------------------------------------------------------
@@ -312,22 +318,39 @@ fn render_workload_md(workload: &str, results: &[EngineResult]) -> String {
     // is visible at a glance.
     let max_us = results.iter().map(|r| r.median_us).fold(0.0_f64, f64::max);
 
-    out.push_str("| Rank | Engine | Median time | Relative | Samples |\n");
-    out.push_str("|------|--------|-------------|----------|---------|\n");
-
-    let n = results.len();
-    for (i, r) in results.iter().enumerate() {
-        // Rank 1 = fastest (row 0 after ascending sort); rank N = slowest.
-        let rank = i + 1;
-        let bar = render_bar(r.median_us, max_us);
-        let _ = writeln!(
-            out,
-            "| {rank} | {} | {} | `{bar}` | {} |",
-            r.engine,
-            format_duration(r.median_us),
-            r.samples,
+    let comparison_ready = has_ultrasql_measurement(results);
+    if !comparison_ready {
+        out.push_str(
+            "Comparison status: UltraSQL measurement missing; table is not a win/loss ranking.\n\n",
         );
-        let _ = n; // suppress unused warning while we keep the simple rank scheme
+        out.push_str("| Status | Engine | Median time | Relative | Samples |\n");
+        out.push_str("|--------|--------|-------------|----------|---------|\n");
+    } else {
+        out.push_str("| Rank | Engine | Median time | Relative | Samples |\n");
+        out.push_str("|------|--------|-------------|----------|---------|\n");
+    }
+
+    for (i, r) in results.iter().enumerate() {
+        let bar = render_bar(r.median_us, max_us);
+        if comparison_ready {
+            // Rank 1 = fastest (row 0 after ascending sort); rank N = slowest.
+            let rank = i + 1;
+            let _ = writeln!(
+                out,
+                "| {rank} | {} | {} | `{bar}` | {} |",
+                r.engine,
+                format_duration(r.median_us),
+                r.samples,
+            );
+        } else {
+            let _ = writeln!(
+                out,
+                "| unranked | {} | {} | `{bar}` | {} |",
+                r.engine,
+                format_duration(r.median_us),
+                r.samples,
+            );
+        }
     }
 
     out
@@ -422,6 +445,7 @@ fn render_json(by_workload: &HashMap<String, Vec<EngineResult>>) -> Result<Strin
     let mut workloads_obj = serde_json::Map::new();
 
     for (workload, results) in by_workload {
+        let comparison_ready = has_ultrasql_measurement(results);
         let engines: Vec<Value> = results
             .iter()
             .enumerate()
@@ -442,7 +466,13 @@ fn render_json(by_workload: &HashMap<String, Vec<EngineResult>>) -> Result<Strin
             })
             .collect();
 
-        workloads_obj.insert(workload.clone(), json!({ "engines": engines }));
+        workloads_obj.insert(
+            workload.clone(),
+            json!({
+                "comparison_ready": comparison_ready,
+                "engines": engines,
+            }),
+        );
     }
 
     let doc = json!({
@@ -764,5 +794,34 @@ mod tests {
         assert_eq!(rank1["engine"], "ultrasql", "fastest first");
         assert_eq!(rank2["rank"], 2);
         assert_eq!(rank2["engine"], "postgres", "slowest last");
+    }
+
+    #[test]
+    fn renderer_marks_workloads_without_ultrasql_as_unranked() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let firebolt = r#"{
+            "workload": "clickbench",
+            "n_rows": 100000,
+            "samples": 1,
+            "median_us": 7868.7,
+            "min_us": 7868.7,
+            "iterations_us": [7868.7],
+            "answer": "x"
+        }"#;
+        std::fs::write(dir.path().join("clickbench-firebolt.json"), firebolt)
+            .expect("write firebolt record");
+
+        let mut by_workload = load_raw_dir(dir.path()).expect("load_raw_dir");
+        for results in by_workload.values_mut() {
+            rank_engines(results);
+        }
+
+        let md = render_md(&by_workload);
+        assert!(md.contains("UltraSQL measurement missing"));
+        assert!(md.contains("| unranked | firebolt |"));
+
+        let json_str = render_json(&by_workload).expect("render_json");
+        let json: serde_json::Value = serde_json::from_str(&json_str).expect("parse");
+        assert_eq!(json["workloads"]["clickbench"]["comparison_ready"], false);
     }
 }

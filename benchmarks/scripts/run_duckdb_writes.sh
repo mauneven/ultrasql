@@ -7,6 +7,8 @@
 #   delete_throughput_10k  — BEGIN TRANSACTION; DELETE 10 000 rows; COMMIT
 #   mixed_oltp_pgbench_like — 1-second window: 50% point reads, 30% updates,
 #                             20% inserts; reports µs per op
+#   mixed_correctness_100k  — UPDATE + INSERT + aggregate
+#                             with answer_sha256 emitted for cross-engine check
 #   select_scan_10k        — preload 10 000 rows; time `SELECT id, val FROM t`
 #                             draining the full result set
 #   select_sum_65k_i64     — preload 65 536 rows; time `SELECT SUM(x) FROM
@@ -55,7 +57,7 @@ row_suffix() {
 
 if ! command -v duckdb >/dev/null 2>&1; then
     echo "run_duckdb_writes.sh: WARNING: duckdb not found — skipping duckdb benchmarks" >&2
-    for wl in insert_throughput_10k update_throughput_10k delete_throughput_10k mixed_oltp_pgbench_like select_scan_10k select_sum_65k_i64 select_avg_1m_i64 filter_sum_1m_i64 window_row_number_65k_i64; do
+    for wl in insert_throughput_10k update_throughput_10k delete_throughput_10k mixed_oltp_pgbench_like "mixed_correctness_$(row_suffix "$N_ROWS")" select_scan_10k select_sum_65k_i64 select_avg_1m_i64 filter_sum_1m_i64 window_row_number_65k_i64; do
         echo "{\"engine\":\"${ENGINE}\",\"status\":\"not_available\",\"workload\":\"${wl}\"}" \
             > "${RAW_DIR}/${wl}-${ENGINE}.json"
     done
@@ -357,6 +359,20 @@ PYEOF
 }
 
 # ---------------------------------------------------------------------------
+# Workload: mixed_correctness
+# ---------------------------------------------------------------------------
+run_mixed_correctness() {
+    local wl="mixed_correctness_$(row_suffix "$N_ROWS")"
+    echo "  workload: ${wl}"
+    python3 benchmarks/scripts/run_mixed_correctness.py \
+        --engine "$ENGINE" \
+        --workload "$wl" \
+        --rows "$N_ROWS" \
+        --iters "$N_ITERS" \
+        --out "${RAW_DIR}/${wl}-${ENGINE}.json"
+}
+
+# ---------------------------------------------------------------------------
 # Workload: select_scan_10k
 # ---------------------------------------------------------------------------
 run_select_scan() {
@@ -519,6 +535,7 @@ case "$WORKLOAD" in
     update_throughput_10k)   run_update ;;
     delete_throughput_10k)   run_delete ;;
     mixed_oltp_pgbench_like) run_mixed ;;
+    mixed_correctness_*)     run_mixed_correctness ;;
     select_scan_10k)         run_select_scan ;;
     select_sum_65k_i64)      run_sum_scalar ;;
     select_avg_1m_i64)       run_avg_scalar ;;
@@ -529,6 +546,7 @@ case "$WORKLOAD" in
         run_update
         run_delete
         run_mixed
+        run_mixed_correctness
         run_select_scan
         run_sum_scalar
         run_avg_scalar

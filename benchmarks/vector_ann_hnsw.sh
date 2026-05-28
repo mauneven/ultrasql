@@ -73,6 +73,11 @@ with open(path, "r", encoding="utf-8") as f:
     doc = json.load(f)
 
 required = [
+    "status",
+    "samples",
+    "median_us",
+    "min_us",
+    "iterations_us",
     "recall_at_k",
     "p50_latency_us",
     "p95_latency_us",
@@ -85,6 +90,7 @@ if missing:
     raise SystemExit(f"ANN artifact missing fields: {', '.join(missing)}")
 
 print(
+    "status={status} samples={samples} median_us={median_us} "
     "recall_at_k={recall_at_k} p50_latency_us={p50_latency_us} "
     "p95_latency_us={p95_latency_us} p99_latency_us={p99_latency_us} "
     "build_time_us={build_time_us} memory_bytes={memory_bytes}".format(**doc)

@@ -30,6 +30,7 @@ WORKLOAD_ORDER = [
     "update_throughput",
     "delete_throughput",
     "mixed_oltp_pgbench_like",
+    "mixed_correctness",
     "window_row_number",
 ]
 WORKLOAD_LABELS = {
@@ -41,8 +42,10 @@ WORKLOAD_LABELS = {
     "update_throughput": "UPDATE throughput",
     "delete_throughput": "DELETE throughput",
     "mixed_oltp_pgbench_like": "Mixed OLTP",
+    "mixed_correctness": "Mixed correctness",
     "window_row_number": "Window row_number()",
 }
+ANSWER_REQUIRED_WORKLOADS = {"mixed_correctness"}
 
 
 def parse_args() -> argparse.Namespace:
@@ -116,6 +119,7 @@ def load_raw(raw_dir: Path) -> list[dict]:
                 "median_us": float(doc["median_us"]),
                 "samples": int(doc.get("samples", 0)),
                 "server_mode": doc.get("server_mode"),
+                "answer_sha256": doc.get("answer_sha256"),
                 "path": str(path),
             }
         )
@@ -134,6 +138,24 @@ def normalize(records: list[dict]) -> list[dict]:
         by_key.items(), key=lambda item: (order[item[0][0]], item[0][1])
     ):
         measured = [record for record in engines.values() if record["median_us"] > 0.0]
+        correctness_status = None
+        answer_sha256 = None
+        if family in ANSWER_REQUIRED_WORKLOADS and measured:
+            missing = [record["path"] for record in measured if not record.get("answer_sha256")]
+            if missing:
+                raise SystemExit(
+                    "answer_sha256 is required before ranking "
+                    f"{family}: {', '.join(missing)}"
+                )
+            hashes = {str(record["answer_sha256"]) for record in measured}
+            if len(hashes) != 1:
+                details = ", ".join(
+                    f"{record['engine']}={record['answer_sha256']} ({record['path']})"
+                    for record in measured
+                )
+                raise SystemExit(f"answer mismatch for {family}: {details}")
+            correctness_status = "verified"
+            answer_sha256 = next(iter(hashes))
         fastest = min(measured, key=lambda record: record["median_us"]) if measured else None
         rows.append(
             {
@@ -143,6 +165,8 @@ def normalize(records: list[dict]) -> list[dict]:
                 "engines": engines,
                 "fastest_engine": fastest["engine"] if fastest else None,
                 "fastest_median_us": fastest["median_us"] if fastest else None,
+                "correctness_status": correctness_status,
+                "answer_sha256": answer_sha256,
             }
         )
     return rows

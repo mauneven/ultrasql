@@ -21,6 +21,8 @@ fn scale_sweep_script_uses_external_release_artifact() {
     assert!(script.contains("scripts/install.sh"));
     assert!(script.contains("ULTRASQLD_BIN"));
     assert!(script.contains("--server \"127.0.0.1:${port}\""));
+    assert!(script.contains("SCALE_SWEEP_PROFILE:-release-ship"));
+    assert!(script.contains("cargo build --profile \"$PROFILE\""));
     assert!(script.contains("\"status\": \"not_available\""));
     assert!(script.contains("SCALE_SWEEP_APPEND"));
     assert!(script.contains("benchmarks/scripts/render_scale_sweep.py"));
@@ -28,6 +30,45 @@ fn scale_sweep_script_uses_external_release_artifact() {
     assert!(script.contains("10k-row INSERT chunks"));
     assert!(script.contains("benchmarks/scripts/run_clickhouse_writes.sh"));
     assert!(script.contains("ClickHouse"));
+    assert!(script.contains("mixed-correctness"));
+    assert!(script.contains("mixed_correctness_100k"));
+    assert!(script.contains("run_competitor_script"));
+    assert!(script.contains("record_competitor_failure"));
+    assert!(!script.contains("run_duckdb_writes.sh \"$selector\" || true"));
+    assert!(!script.contains("run_sqlite3_writes.sh \"$selector\" || true"));
+    assert!(!script.contains("run_postgres_writes.sh \"$selector\" || true"));
+    assert!(!script.contains("run_clickhouse_writes.sh \"$selector\" || true"));
+}
+
+#[test]
+fn postgres_runner_does_not_swallow_database_setup_failures() {
+    let script = repo_file("benchmarks/scripts/run_postgres_writes.sh");
+
+    assert!(script.contains("ensure_database"));
+    assert!(script.contains("pg_database"));
+    assert!(script.contains("<<'SQL'"));
+    assert!(script.contains("insert_throughput_*)"));
+    assert!(script.contains("select_sum_*_i64)"));
+    assert!(script.contains("filter_sum_*_i64)"));
+    assert!(
+        !script.contains("createdb -U \"$PGUSER\" \"$PGDATABASE\" 2>/dev/null || true"),
+        "PostgreSQL runner must not hide createdb failures"
+    );
+    assert!(
+        !script.contains("-c \"SELECT 1 FROM pg_database WHERE datname = :'db'\""),
+        "PostgreSQL runner must not use psql -c with :'db'; this client does not expand it"
+    );
+}
+
+#[test]
+fn clickhouse_runner_requires_tcp_readiness_before_measurement() {
+    let script = repo_file("benchmarks/scripts/run_clickhouse_writes.sh");
+
+    assert!(script.contains("clickhouse server did not become ready"));
+    assert!(script.contains("clickhouse_ready=0"));
+    assert!(script.contains("clickhouse_ready=1"));
+    assert!(script.contains("if [[ \"$clickhouse_ready\" -ne 1 ]]; then"));
+    assert!(script.contains("mark_unavailable \"clickhouse server did not become ready"));
 }
 
 #[test]
@@ -69,7 +110,53 @@ fn readme_scale_sweep_matches_rendered_artifact() {
 }
 
 #[test]
-fn scale_sweep_records_million_row_insert_and_visible_gaps() {
+fn scale_sweep_verifies_mixed_correctness_before_ranking() {
+    let renderer = repo_file("benchmarks/scripts/render_scale_sweep.py");
+    let rendered_json = repo_file("benchmarks/results/latest/scale-sweep/scale_sweep.json");
+    let rendered_md = repo_file("benchmarks/results/latest/scale-sweep/scale_sweep.md");
+    let readme = repo_file("README.md");
+    let raw_ultrasql =
+        repo_file("benchmarks/results/latest/scale-sweep/raw/mixed_correctness_100k-ultrasql.json");
+
+    assert!(renderer.contains("ANSWER_REQUIRED_WORKLOADS"));
+    assert!(renderer.contains("answer_sha256"));
+    assert!(renderer.contains("correctness_status"));
+
+    let raw: serde_json::Value =
+        serde_json::from_str(&raw_ultrasql).expect("parse mixed_correctness_100k-ultrasql");
+    assert_eq!(raw["engine"], "ultrasql");
+    assert_eq!(raw["status"], "measured");
+    assert_eq!(raw["workload"], "mixed_correctness_100k");
+    assert_eq!(raw["n_rows"], 100_000);
+    assert_eq!(
+        raw["answer_sha256"].as_str().expect("answer hash").len(),
+        64
+    );
+    assert!(raw["answer"].is_array());
+
+    let rendered: serde_json::Value =
+        serde_json::from_str(&rendered_json).expect("parse rendered scale_sweep.json");
+    let rows = rendered["rows"].as_array().expect("rows array");
+    let mixed = rows
+        .iter()
+        .find(|row| {
+            row["workload"].as_str() == Some("mixed_correctness")
+                && row["n_rows"].as_u64() == Some(100_000)
+        })
+        .expect("mixed correctness row");
+    assert_eq!(mixed["correctness_status"].as_str(), Some("verified"));
+    assert_eq!(
+        mixed["answer_sha256"].as_str().expect("answer hash").len(),
+        64
+    );
+    assert_eq!(mixed["fastest_engine"].as_str(), Some("ultrasql"));
+
+    assert!(rendered_md.contains("| Mixed correctness | 100 000 | **"));
+    assert!(readme.contains("| Mixed correctness | 100 000 | **"));
+}
+
+#[test]
+fn scale_sweep_records_million_row_insert_and_update_wins() {
     let raw =
         repo_file("benchmarks/results/latest/scale-sweep/raw/insert_throughput_1m-ultrasql.json");
     let value: serde_json::Value =
@@ -94,16 +181,59 @@ fn scale_sweep_records_million_row_insert_and_visible_gaps() {
         .expect("1m insert row");
     assert_eq!(one_m_insert["fastest_engine"].as_str(), Some("ultrasql"));
 
-    let visible_gaps = rows
-        .iter()
-        .filter(|row| row["fastest_engine"].as_str() != Some("ultrasql"))
-        .count();
-    assert!(
-        visible_gaps > 0,
-        "scale-sweep should keep non-UltraSQL fastest rows visible instead of hiding them"
-    );
-
     let rendered_md = repo_file("benchmarks/results/latest/scale-sweep/scale_sweep.md");
     assert!(rendered_md.contains("| INSERT throughput | 1 000 000 | **"));
     assert!(rendered_md.contains("| UPDATE throughput | 1 000 000 | **"));
+}
+
+#[test]
+fn scale_sweep_records_ultrasql_fastest_for_every_published_row() {
+    let rendered_json = repo_file("benchmarks/results/latest/scale-sweep/scale_sweep.json");
+    let rendered: serde_json::Value =
+        serde_json::from_str(&rendered_json).expect("parse rendered scale_sweep.json");
+    let rows = rendered["rows"].as_array().expect("rows array");
+    let gaps = rows
+        .iter()
+        .filter(|row| row["fastest_engine"].as_str() != Some("ultrasql"))
+        .map(|row| {
+            format!(
+                "{} rows={} fastest={}",
+                row["workload"].as_str().unwrap_or("<unknown>"),
+                row["n_rows"].as_u64().unwrap_or(0),
+                row["fastest_engine"].as_str().unwrap_or("<none>")
+            )
+        })
+        .collect::<Vec<_>>();
+
+    assert!(gaps.is_empty(), "non-UltraSQL fastest rows: {gaps:?}");
+}
+
+#[test]
+fn current_scale_sweep_records_ultrasql_fastest_for_every_row() {
+    let current_path = repo_path("benchmarks/results/latest/scale-sweep-current/scale_sweep.json");
+    if !current_path.exists() {
+        return;
+    }
+    let rendered_json = fs::read_to_string(&current_path)
+        .unwrap_or_else(|err| panic!("read {}: {err}", current_path.display()));
+    let rendered: serde_json::Value =
+        serde_json::from_str(&rendered_json).expect("parse current scale_sweep.json");
+    let rows = rendered["rows"].as_array().expect("rows array");
+    let gaps = rows
+        .iter()
+        .filter(|row| row["fastest_engine"].as_str() != Some("ultrasql"))
+        .map(|row| {
+            format!(
+                "{} rows={} fastest={}",
+                row["workload"].as_str().unwrap_or("<unknown>"),
+                row["n_rows"].as_u64().unwrap_or(0),
+                row["fastest_engine"].as_str().unwrap_or("<none>")
+            )
+        })
+        .collect::<Vec<_>>();
+
+    assert!(
+        gaps.is_empty(),
+        "current non-UltraSQL fastest rows: {gaps:?}"
+    );
 }

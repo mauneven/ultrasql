@@ -631,6 +631,79 @@ fn packaging_scripts_have_valid_bash_syntax() {
 }
 
 #[test]
+fn principal_files_keep_hygiene_guards() {
+    for path in [
+        "crates/ultrasql-server/src/session/execute.rs",
+        "crates/ultrasql-storage/src/heap/delete.rs",
+        "crates/ultrasql-storage/src/heap/update_inplace.rs",
+        "crates/ultrasql-storage/src/heap/wal_emit.rs",
+        "crates/ultrasql-storage/src/heap/scan.rs",
+        "crates/ultrasql-storage/src/heap/insert.rs",
+        "crates/ultrasql-storage/src/heap/walker.rs",
+        "crates/ultrasql-storage/src/heap/helpers.rs",
+        "crates/ultrasql-storage/src/heap/update.rs",
+    ] {
+        let source = repo_file(path);
+        assert!(
+            !source.contains("#![allow(unused_imports)]"),
+            "{path} must prune stale imports instead of suppressing them"
+        );
+    }
+
+    for path in [
+        "crates/ultrasql-storage/src/heap/delete.rs",
+        "crates/ultrasql-storage/src/heap/update_inplace.rs",
+    ] {
+        let source = repo_file(path);
+        assert!(
+            !source.contains("clippy::cast_possible") && !source.contains("clippy::cast_lossless"),
+            "{path} must use checked/widening conversions instead of suppressing cast lints"
+        );
+        for needle in [" as usize", " as u32", " as u64"] {
+            assert!(
+                !source.contains(needle),
+                "{path} hot heap code must avoid integer casts via `{needle}`"
+            );
+        }
+    }
+
+    let fused_delete = repo_file("crates/ultrasql-executor/src/fused_delete.rs");
+    assert!(
+        !fused_delete.contains("affected-count schema is well-formed"),
+        "fused delete must build static schemas without panic-style expect"
+    );
+
+    for path in [
+        "crates/ultrasql-executor/src/materialize.rs",
+        "crates/ultrasql-executor/src/unique.rs",
+        "crates/ultrasql-executor/src/merge_join.rs",
+        "crates/ultrasql-executor/src/sort_aggregate.rs",
+        "crates/ultrasql-executor/src/set_op.rs",
+        "crates/ultrasql-executor/src/nested_loop_join.rs",
+        "crates/ultrasql-executor/src/hash_aggregate.rs",
+    ] {
+        let source = repo_file(path);
+        assert!(
+            !source.contains("expect(\"just-set\")"),
+            "{path} must return ExecError::Internal instead of panicking on state-machine invariants"
+        );
+    }
+
+    let heap_delete = repo_file("crates/ultrasql-storage/src/heap/delete.rs");
+    for needle in [
+        "expect(\"8B\")",
+        "expect(\"2B\")",
+        "expect(\"4-byte id\")",
+        "expect(\"4-byte val\")",
+    ] {
+        assert!(
+            !heap_delete.contains(needle),
+            "heap delete hot-path decode must return HeapError instead of {needle}"
+        );
+    }
+}
+
+#[test]
 fn final_release_requires_operator_reports_green_workflows_and_notes() {
     let operator_docs = repo_file("docs/OPERATOR_SOAK.md");
     let operator_report_docs = repo_file("docs/operator-reports.md");

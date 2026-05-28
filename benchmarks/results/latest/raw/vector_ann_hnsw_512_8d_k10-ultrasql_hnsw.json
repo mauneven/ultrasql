@@ -2,13 +2,23 @@
   "schema_version": 1,
   "engine": "ultrasql_hnsw",
   "workload": "vector_ann_hnsw_512_8d_k10",
+  "status": "measured",
+  "n_rows": 512,
+  "samples": 4,
+  "median_us": 139.125,
+  "min_us": 124.084,
+  "iterations_us": [
+    124.084,
+    135.5,
+    142.75,
+    144.875
+  ],
   "host": {
     "cpu": "Apple M4",
     "cores": 10,
     "ram_gb": 16,
     "os": "macos unknown"
   },
-  "n_rows": 512,
   "vector_dims": 8,
   "top_k": 10,
   "queries": 4,
@@ -18,16 +28,16 @@
   "ef_search": 64,
   "seed": 1367265502,
   "recall_at_k": 1.0,
-  "p50_latency_us": 278.83299999999997,
-  "p95_latency_us": 309.25,
-  "p99_latency_us": 309.25,
-  "build_time_us": 10106.291,
+  "p50_latency_us": 135.5,
+  "p95_latency_us": 144.875,
+  "p99_latency_us": 144.875,
+  "build_time_us": 10238.5,
   "memory_bytes": 175560,
   "query_iterations_us": [
-    309.25,
-    278.83299999999997,
-    295.20799999999997,
-    250.62499999999997
+    135.5,
+    142.75,
+    144.875,
+    124.084
   ],
   "recall_iterations": [
     1.0,

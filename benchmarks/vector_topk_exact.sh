@@ -367,6 +367,32 @@ postgres_psql() {
     fi
 }
 
+ensure_pgvector_database() {
+    if [[ -n "${POSTGRES_DSN:-}" ]]; then
+        return 0
+    fi
+    if createdb -U "$PGUSER" "$PGDATABASE" >/dev/null 2>&1; then
+        return 0
+    fi
+
+    local exists
+    local status
+    set +e
+    exists="$(psql -U "$PGUSER" -d postgres -q --no-align -t -v ON_ERROR_STOP=1 \
+        --set=db="$PGDATABASE" 2>/dev/null <<'SQL'
+SELECT 1 FROM pg_database WHERE datname = :'db';
+SQL
+)"
+    status=$?
+    set -e
+    if [[ "$status" -eq 0 && "$exists" == "1" ]]; then
+        return 0
+    fi
+
+    echo "vector_topk_exact.sh: ERROR: failed to create PostgreSQL database '$PGDATABASE'" >&2
+    return 1
+}
+
 time_python() {
     python3 -c 'import time; print(time.perf_counter())'
 }
@@ -388,9 +414,7 @@ run_postgres_pgvector() {
         emit_not_available "$engine" "psql_not_found"
         return 1
     fi
-    if [[ -z "${POSTGRES_DSN:-}" ]]; then
-        createdb -U "$PGUSER" "$PGDATABASE" >/dev/null 2>&1 || true
-    fi
+    ensure_pgvector_database || return 1
     if ! postgres_psql -c "SELECT 1" >/dev/null 2>&1 || ! postgres_psql -c "CREATE EXTENSION IF NOT EXISTS vector;" >/dev/null 2>&1; then
         if try_start_local_pgvector; then
             :

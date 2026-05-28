@@ -64,6 +64,7 @@ use arrow_array::{Int64Array, RecordBatch, StringArray};
 use arrow_schema::{DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema};
 use clap::{Parser, ValueEnum};
 use parquet::arrow::{ArrowWriter, arrow_reader::ParquetRecordBatchReaderBuilder};
+use sha2::{Digest, Sha256};
 use tokio_postgres::NoTls;
 use ultrasql_bench::registry::HostInfo;
 use ultrasql_catalog::rag::{RagSchemaConfig, create_rag_table_statements};
@@ -249,6 +250,13 @@ enum Workload {
     /// microseconds per operation (elapsed / op_count) — matches the
     /// shape of `benchmarks/scripts/run_*_writes.sh::run_mixed`.
     MixedOltp,
+    /// Deterministic mixed write/read correctness workload. Preloads a
+    /// table, then each sample runs UPDATE + INSERT and an aggregate
+    /// inside a transaction. The transaction is rolled back after timing
+    /// so every sample starts from the same image. The returned rows are
+    /// hashed and compared across engines by the release renderer before
+    /// ranking.
+    MixedCorrectness,
     /// Whole-relation `SELECT id, row_number() OVER (ORDER BY x) FROM
     /// t` over a preloaded `(id INT, x INT)` table. Exercises the
     /// `LogicalPlan::Window` → `WindowAgg` wire end-to-end against the
@@ -330,6 +338,7 @@ impl Workload {
             // count suffix; matching ID keeps results-render's grouping
             // happy.
             Self::MixedOltp => "mixed_oltp_pgbench_like".to_string(),
+            Self::MixedCorrectness => format!("mixed_correctness_{}", k_or_raw(n_rows)),
             Self::WindowRowNumber => format!("window_row_number_{}_i64", k_or_raw(n_rows)),
             Self::VectorTopK => {
                 format!(
@@ -570,6 +579,18 @@ async fn main() -> Result<()> {
         Workload::UpdateBulk => {
             run_shared_update(bound, args.rows, args.warmup, total_iters, &mut iters_us).await?;
         }
+        Workload::MixedCorrectness => {
+            answer = Some(
+                run_shared_mixed_correctness(
+                    bound,
+                    args.rows,
+                    args.warmup,
+                    total_iters,
+                    &mut iters_us,
+                )
+                .await?,
+            );
+        }
         Workload::VectorTopK => {
             let certification = run_shared_vector_topk(
                 bound,
@@ -741,6 +762,7 @@ async fn main() -> Result<()> {
                     | Workload::SparsePruning
                     | Workload::WindowRowNumber
                     | Workload::UpdateBulk
+                    | Workload::MixedCorrectness
                     | Workload::VectorTopK
                     | Workload::CsvColdRead
                     | Workload::CsvWarmRead
@@ -787,7 +809,9 @@ async fn main() -> Result<()> {
         "policy": "Raw measured samples only; no ranking or winner claim.",
     });
     if let Some(answer) = answer {
+        let answer_hash = answer_sha256(&answer)?;
         report["answer"] = answer;
+        report["answer_sha256"] = serde_json::json!(answer_hash);
     }
     if matches!(args.workload, Workload::LateMaterialization) {
         report["schema_version"] = serde_json::json!(1);
@@ -972,6 +996,15 @@ fn simple_query_rows(messages: &[tokio_postgres::SimpleQueryMessage]) -> Vec<Vec
             _ => None,
         })
         .collect()
+}
+
+fn answer_sha256(answer: &serde_json::Value) -> Result<String> {
+    let bytes = serde_json::to_vec(answer).context("serialize benchmark answer")?;
+    let digest = Sha256::digest(&bytes);
+    Ok(digest
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>())
 }
 
 async fn start_persistent_bench_server(data_dir: &Path) -> Result<PersistentBenchServer> {
@@ -2493,6 +2526,127 @@ async fn run_shared_update(
     drop(client);
     conn_handle.abort();
     Ok(())
+}
+
+fn push_mixed_correctness_row(sql: &mut String, row_id: usize) {
+    let val_mod = row_id.wrapping_mul(17) % 1_000;
+    let val = i64::try_from(val_mod).unwrap_or(0) - 500;
+
+    sql.push('(');
+    sql.push_str(&row_id.to_string());
+    sql.push(',');
+    sql.push_str(&val.to_string());
+    sql.push(')');
+}
+
+async fn preload_mixed_correctness_chunked(
+    client: &tokio_postgres::Client,
+    table: &str,
+    n_rows: usize,
+) -> Result<()> {
+    let mut start = 0;
+    while start < n_rows {
+        let end = (start + PRELOAD_CHUNK_ROWS).min(n_rows);
+        let mut sql = String::with_capacity((end - start) * 56 + 64);
+        sql.push_str("INSERT INTO ");
+        sql.push_str(table);
+        sql.push_str(" VALUES ");
+        for row_id in start..end {
+            if row_id > start {
+                sql.push(',');
+            }
+            push_mixed_correctness_row(&mut sql, row_id);
+        }
+        client.batch_execute(&sql).await.with_context(|| {
+            format!("preload mixed-correctness chunk [{start}, {end}) INSERT into {table}")
+        })?;
+        start = end;
+    }
+    Ok(())
+}
+
+fn mixed_correctness_insert_sql(table: &str, n_rows: usize) -> String {
+    let mut sql = String::with_capacity(96);
+    sql.push_str("INSERT INTO ");
+    sql.push_str(table);
+    sql.push_str(" VALUES ");
+    push_mixed_correctness_row(&mut sql, n_rows);
+    sql
+}
+
+fn mixed_correctness_fact_query(table: &str) -> String {
+    format!("SELECT SUM(val) FROM {table} WHERE id >= 0")
+}
+
+/// Shared mixed correctness workload: preload once, then each timed
+/// sample mutates rows and runs a scalar aggregate inside a rolled-back
+/// transaction. The answer rows are returned so release rendering can
+/// reject cross-engine mismatches before ranking.
+async fn run_shared_mixed_correctness(
+    server: SocketAddr,
+    n_rows: usize,
+    warmup: usize,
+    total_iters: usize,
+    iters_us: &mut Vec<f64>,
+) -> Result<serde_json::Value> {
+    let (client, conn_handle) = connect_sql_server(server).await?;
+    let fact_table = "bench_mixed_correctness_fact";
+    let state_table = "bench_mixed_correctness_state";
+    client
+        .batch_execute(&format!(
+            "CREATE TABLE {fact_table} (
+                id INT NOT NULL,
+                val INT NOT NULL
+            )"
+        ))
+        .await
+        .with_context(|| format!("CREATE TABLE {fact_table}"))?;
+    client
+        .batch_execute(&format!(
+            "CREATE TABLE {state_table} (
+                id INT NOT NULL,
+                val INT NOT NULL
+            )"
+        ))
+        .await
+        .with_context(|| format!("CREATE TABLE {state_table}"))?;
+    preload_mixed_correctness_chunked(&client, fact_table, n_rows).await?;
+    preload_mixed_correctness_chunked(&client, state_table, 16).await?;
+
+    let update_sql = format!("UPDATE {state_table} SET val = val + 7 WHERE id = 0");
+    let insert_sql = mixed_correctness_insert_sql(state_table, n_rows);
+    let fact_query = mixed_correctness_fact_query(fact_table);
+    let batch_sql = format!("{insert_sql}; {update_sql}; {fact_query}");
+
+    let mut answer_rows = Vec::new();
+    for i in 0..total_iters {
+        client
+            .batch_execute("BEGIN")
+            .await
+            .context("BEGIN mixed-correctness sample")?;
+        let started = Instant::now();
+        let fact_messages = client
+            .simple_query(&batch_sql)
+            .await
+            .with_context(|| format!("mixed-correctness batch on {state_table}/{fact_table}"))?;
+        let elapsed_us = started.elapsed().as_secs_f64() * 1e6;
+        client
+            .batch_execute("ROLLBACK")
+            .await
+            .context("ROLLBACK mixed-correctness sample")?;
+        let rows = simple_query_rows(&fact_messages);
+        if rows.is_empty() {
+            anyhow::bail!("mixed-correctness aggregate returned no rows");
+        }
+        if i >= warmup {
+            iters_us.push(elapsed_us);
+            answer_rows = rows;
+        }
+    }
+
+    drop(client);
+    conn_handle.abort();
+    Ok(serde_json::json!(answer_rows))
 }
 
 /// Shared-table analytical aggregate workload: preload once, then

@@ -1,6 +1,6 @@
 {
   "iters": 16,
-  "methodology": "UltraSQL external release artifact over TCP; competitors installed local clients; bulk INSERT uses a fresh UltraSQL server per measured sample and 10k-row INSERT chunks across engines.",
+  "methodology": "UltraSQL external release artifact over TCP; competitors installed local clients including ClickHouse when available; bulk INSERT uses a fresh UltraSQL server per measured sample and 10k-row INSERT chunks across engines.",
   "mode": "full",
   "rows": [
     10000,

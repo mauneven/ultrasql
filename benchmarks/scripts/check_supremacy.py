@@ -51,13 +51,20 @@ def main(argv: list[str]) -> int:
         except (OSError, json.JSONDecodeError) as e:
             print(f"WARN: skip {name}: {e}", file=sys.stderr)
             continue
+        if obj.get("status", "measured") != "measured":
+            continue
         workload = obj.get("workload")
         engine = obj.get("engine")
         median = obj.get("median_us")
         if workload is None or engine is None or median is None:
             print(f"WARN: skip {name}: missing workload/engine/median_us", file=sys.stderr)
             continue
-        by_workload[workload][engine] = float(median)
+        canonical_engine = "ultrasql" if str(engine).startswith("ultrasql") else str(engine)
+        median_us = float(median)
+        previous = by_workload[workload].get(canonical_engine)
+        by_workload[workload][canonical_engine] = (
+            median_us if previous is None else min(previous, median_us)
+        )
 
     if not by_workload:
         print(f"ERROR: no benchmark results found in {results_dir}", file=sys.stderr)

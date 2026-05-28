@@ -63,10 +63,20 @@ pub struct AnnBenchmarkArtifact {
     pub engine: String,
     /// Stable workload id.
     pub workload: String,
-    /// Host descriptor captured at run time.
-    pub host: HostInfo,
+    /// Result status consumed by benchmark renderers.
+    pub status: String,
     /// Number of indexed vectors.
     pub n_rows: usize,
+    /// Number of measured query samples.
+    pub samples: usize,
+    /// Median measured query latency in microseconds.
+    pub median_us: f64,
+    /// Minimum measured query latency in microseconds.
+    pub min_us: f64,
+    /// Raw measured query latencies, sorted for generic result renderers.
+    pub iterations_us: Vec<f64>,
+    /// Host descriptor captured at run time.
+    pub host: HostInfo,
     /// Dimension count per vector.
     pub vector_dims: usize,
     /// Top-k requested by every query.
@@ -169,13 +179,20 @@ pub fn run_hnsw_ann_benchmark(
     } else {
         recall_iterations.iter().sum::<f64>() / recall_iterations.len() as f64
     };
+    let median_us = median_sorted(&sorted_latencies);
+    let min_us = sorted_latencies.first().copied().unwrap_or(0.0);
 
     Ok(AnnBenchmarkArtifact {
         schema_version: 1,
         engine: "ultrasql_hnsw".to_owned(),
         workload: workload_id(config.rows, config.dims, config.top_k),
-        host,
+        status: "measured".to_owned(),
         n_rows: config.rows,
+        samples: query_iterations_us.len(),
+        median_us,
+        min_us,
+        iterations_us: sorted_latencies.clone(),
+        host,
         vector_dims: config.dims,
         top_k: config.top_k,
         queries: config.queries,
@@ -314,6 +331,14 @@ fn percentile_nearest_rank(sorted_values: &[f64], quantile: f64) -> f64 {
     let rank = (quantile.clamp(0.0, 1.0) * sorted_values.len() as f64).ceil();
     let index = (rank.max(1.0) as usize).saturating_sub(1);
     sorted_values[index.min(sorted_values.len() - 1)]
+}
+
+fn median_sorted(sorted_values: &[f64]) -> f64 {
+    match sorted_values.len() {
+        0 => 0.0,
+        len if len % 2 == 1 => sorted_values[len / 2],
+        len => (sorted_values[(len / 2) - 1] + sorted_values[len / 2]) / 2.0,
+    }
 }
 
 fn k_or_raw(n: usize) -> String {

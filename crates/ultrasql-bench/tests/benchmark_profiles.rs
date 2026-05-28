@@ -90,6 +90,12 @@ fn setup_missing_certifications_are_unavailable_not_failed() {
     assert!(tpcb.contains("rm -f \"$TMP_ULTRASQL_RESULT\" \"$ULTRASQL_RESULT\""));
     assert!(tpcb.contains("postgres_dsn_missing"));
     assert!(tpcb.contains("sys.exit(2 if reason == \"missing_cross_engine_results\""));
+    assert!(tpcb.contains("KERNEL_SMOKE_RESULT"));
+    assert!(tpcb.contains("kernel_smoke_failed"));
+    assert!(
+        !tpcb.contains("tpcb_32conn-ultrasql-kernel.json\" 2>&1 || true"),
+        "TPCB kernel smoke must write explicit JSON instead of swallowing failures"
+    );
 
     assert!(tpch.contains("write_setup_summary \"data_dir_missing\""));
     assert!(tpch.contains("write_setup_summary \"duckdb_missing\""));

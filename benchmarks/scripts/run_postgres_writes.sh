@@ -7,6 +7,8 @@
 #   delete_throughput_10k  — BEGIN; DELETE 10 000 rows; COMMIT
 #   mixed_oltp_pgbench_like — 1-second window: 50% point reads, 30% updates,
 #                             20% inserts; reports ops/s converted to median_us
+#   mixed_correctness_100k  — UPDATE + INSERT + aggregate
+#                             with answer_sha256 emitted for cross-engine check
 #   select_scan_10k        — preload 10 000 rows; time `SELECT id, val FROM t`
 #                             draining the full result set
 #   select_sum_65k_i64     — preload 65 536 rows; time `SELECT SUM(x) FROM
@@ -60,7 +62,7 @@ row_suffix() {
 
 if ! command -v psql >/dev/null 2>&1; then
     echo "run_postgres_writes.sh: WARNING: psql not found — skipping postgres17 benchmarks" >&2
-    for wl in insert_throughput_10k update_throughput_10k delete_throughput_10k mixed_oltp_pgbench_like select_scan_10k select_sum_65k_i64 select_avg_1m_i64 filter_sum_1m_i64 window_row_number_65k_i64; do
+    for wl in insert_throughput_10k update_throughput_10k delete_throughput_10k mixed_oltp_pgbench_like "mixed_correctness_$(row_suffix "$N_ROWS")" select_scan_10k select_sum_65k_i64 select_avg_1m_i64 filter_sum_1m_i64 window_row_number_65k_i64; do
         echo "{\"engine\":\"${ENGINE}\",\"status\":\"not_available\",\"workload\":\"${wl}\"}" \
             > "${RAW_DIR}/${wl}-${ENGINE}.json"
     done
@@ -69,7 +71,7 @@ fi
 
 if ! pg_isready -q 2>/dev/null; then
     echo "run_postgres_writes.sh: WARNING: PostgreSQL not accepting connections — skipping" >&2
-    for wl in insert_throughput_10k update_throughput_10k delete_throughput_10k mixed_oltp_pgbench_like select_scan_10k select_sum_65k_i64 select_avg_1m_i64 filter_sum_1m_i64 window_row_number_65k_i64; do
+    for wl in insert_throughput_10k update_throughput_10k delete_throughput_10k mixed_oltp_pgbench_like "mixed_correctness_$(row_suffix "$N_ROWS")" select_scan_10k select_sum_65k_i64 select_avg_1m_i64 filter_sum_1m_i64 window_row_number_65k_i64; do
         echo "{\"engine\":\"${ENGINE}\",\"status\":\"not_available\",\"workload\":\"${wl}\"}" \
             > "${RAW_DIR}/${wl}-${ENGINE}.json"
     done
@@ -79,7 +81,7 @@ fi
 # Validate connection.
 if ! psql -U "$PGUSER" -d postgres -c "SELECT 1" -q --no-align -t >/dev/null 2>&1; then
     echo "run_postgres_writes.sh: WARNING: cannot connect to PostgreSQL as $PGUSER — skipping" >&2
-    for wl in insert_throughput_10k update_throughput_10k delete_throughput_10k mixed_oltp_pgbench_like select_scan_10k select_sum_65k_i64 select_avg_1m_i64 filter_sum_1m_i64 window_row_number_65k_i64; do
+    for wl in insert_throughput_10k update_throughput_10k delete_throughput_10k mixed_oltp_pgbench_like "mixed_correctness_$(row_suffix "$N_ROWS")" select_scan_10k select_sum_65k_i64 select_avg_1m_i64 filter_sum_1m_i64 window_row_number_65k_i64; do
         echo "{\"engine\":\"${ENGINE}\",\"status\":\"not_available\",\"workload\":\"${wl}\"}" \
             > "${RAW_DIR}/${wl}-${ENGINE}.json"
     done
@@ -88,8 +90,30 @@ fi
 
 mkdir -p "$RAW_DIR"
 
-# Create/ensure bench database.
-createdb -U "$PGUSER" "$PGDATABASE" 2>/dev/null || true
+ensure_database() {
+    if createdb -U "$PGUSER" "$PGDATABASE" >/dev/null 2>&1; then
+        return 0
+    fi
+
+    local exists
+    local status
+    set +e
+    exists="$(psql -U "$PGUSER" -d postgres -q --no-align -t \
+        --set=db="$PGDATABASE" 2>/dev/null <<'SQL'
+SELECT 1 FROM pg_database WHERE datname = :'db';
+SQL
+)"
+    status=$?
+    set -e
+    if [[ "$status" -eq 0 && "$exists" == "1" ]]; then
+        return 0
+    fi
+
+    echo "run_postgres_writes.sh: ERROR: failed to create PostgreSQL database '$PGDATABASE'" >&2
+    return 1
+}
+
+ensure_database
 
 PSQL="psql -U $PGUSER -d $PGDATABASE -q --no-align -t"
 
@@ -370,6 +394,22 @@ PYEOF
 }
 
 # ---------------------------------------------------------------------------
+# Workload: mixed_correctness
+# ---------------------------------------------------------------------------
+run_mixed_correctness() {
+    local wl="mixed_correctness_$(row_suffix "$N_ROWS")"
+    echo "  workload: ${wl}"
+    python3 benchmarks/scripts/run_mixed_correctness.py \
+        --engine "$ENGINE" \
+        --workload "$wl" \
+        --rows "$N_ROWS" \
+        --iters "$N_ITERS" \
+        --pg-user "$PGUSER" \
+        --pg-database "$PGDATABASE" \
+        --out "${RAW_DIR}/${wl}-${ENGINE}.json"
+}
+
+# ---------------------------------------------------------------------------
 # Workload: select_scan_10k
 # ---------------------------------------------------------------------------
 run_select_scan() {
@@ -503,20 +543,22 @@ run_window_row_number() {
 # ---------------------------------------------------------------------------
 WORKLOAD="${1:-all}"
 case "$WORKLOAD" in
-    insert_throughput_10k)   run_insert ;;
-    update_throughput_10k)   run_update ;;
-    delete_throughput_10k)   run_delete ;;
+    insert_throughput_*)     run_insert ;;
+    update_throughput_*)     run_update ;;
+    delete_throughput_*)     run_delete ;;
     mixed_oltp_pgbench_like) run_mixed ;;
-    select_scan_10k)         run_select_scan ;;
-    select_sum_65k_i64)      run_sum_scalar ;;
-    select_avg_1m_i64)       run_avg_scalar ;;
-    filter_sum_1m_i64)       run_filter_sum ;;
+    mixed_correctness_*)     run_mixed_correctness ;;
+    select_scan_*)           run_select_scan ;;
+    select_sum_*_i64)        run_sum_scalar ;;
+    select_avg_*_i64)        run_avg_scalar ;;
+    filter_sum_*_i64)        run_filter_sum ;;
     window_row_number_65k_i64) run_window_row_number ;;
     all)
         run_insert
         run_update
         run_delete
         run_mixed
+        run_mixed_correctness
         run_select_scan
         run_sum_scalar
         run_avg_scalar

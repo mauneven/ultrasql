@@ -32,6 +32,7 @@ fn vector_topk_script_certifies_recall_tail_latency_build_memory_and_index_size(
 
     assert!(script.contains("REQUIRED_VECTOR_METRICS"));
     assert!(script.contains("recall_at_k"));
+    assert!(script.contains("median_us"));
     assert!(script.contains("p50_latency_us"));
     assert!(script.contains("p95_latency_us"));
     assert!(script.contains("p99_latency_us"));
@@ -59,6 +60,17 @@ fn vector_topk_script_supports_strict_same_host_pgvector_certification() {
     assert!(script.contains("docker_context_host"));
     assert!(script.contains("\"host\""));
     assert!(script.contains("HostInfo-equivalent host metadata"));
+    assert!(script.contains("ensure_pgvector_database"));
+    assert!(script.contains("pg_database"));
+    assert!(script.contains("<<'SQL'"));
+    assert!(
+        !script.contains("createdb -U \"$PGUSER\" \"$PGDATABASE\" >/dev/null 2>&1 || true"),
+        "vector top-k pgvector setup must not hide createdb failures"
+    );
+    assert!(
+        !script.contains("-c \"SELECT 1 FROM pg_database WHERE datname = :'db'\""),
+        "pgvector setup must not use psql -c with :'db'; this client does not expand it"
+    );
 }
 
 #[test]
@@ -96,6 +108,7 @@ fn vector_ann_script_emits_recall_latency_build_and_memory_artifacts() {
     assert!(script.contains("VECTOR_ANN_ROWS"));
     assert!(script.contains("VECTOR_ANN_DIMS"));
     assert!(script.contains("recall_at_k"));
+    assert!(script.contains("median_us"));
     assert!(script.contains("p50_latency_us"));
     assert!(script.contains("p95_latency_us"));
     assert!(script.contains("p99_latency_us"));

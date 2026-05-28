@@ -36,6 +36,7 @@ esac
 OUT="${SCALE_SWEEP_OUT:-benchmarks/results/latest/scale-sweep}"
 RAW="$OUT/raw"
 ROWS="${SCALE_SWEEP_ROWS:-10000 100000 1000000}"
+INSERT_CHUNK_ROWS="${INSERT_CHUNK_ROWS:-10000}"
 mkdir -p "$RAW"
 if [[ "${SCALE_SWEEP_APPEND:-0}" != "1" ]]; then
     rm -f "$RAW"/*.json
@@ -79,6 +80,7 @@ workload_id() {
         update-bulk)   echo "update_throughput_${suffix}" ;;
         delete-bulk)   echo "delete_throughput_${suffix}" ;;
         mixed-oltp)    echo "mixed_oltp_pgbench_like" ;;
+        mixed-correctness) echo "mixed_correctness_${suffix}" ;;
         window-row-number) echo "window_row_number_${suffix}_i64" ;;
         *) echo "unknown workload '$workload'" >&2; exit 2 ;;
     esac
@@ -116,13 +118,14 @@ PY
 
 echo "=== scale sweep mode=$mode iters=$ITERS warmup=$WARMUP rows=[$ROWS] ==="
 
-echo "--- Building benchmark driver ---"
-cargo build --release \
+PROFILE="${SCALE_SWEEP_PROFILE:-release-ship}"
+echo "--- Building benchmark driver (profile=$PROFILE) ---"
+cargo build --profile "$PROFILE" \
     --package ultrasql-bench \
     --features sql-bench \
     --bin cross_compare_sql \
     --bin results-render
-BIN="target/release"
+BIN="target/$PROFILE"
 
 if [[ -z "${ULTRASQLD_BIN:-}" ]]; then
     install_dir="$tmp_dir/bin"
@@ -306,29 +309,79 @@ PY
     rm -rf "$sample_dir"
 }
 
+record_competitor_failure() {
+    local engine="$1"
+    local selector="$2"
+    local rows="$3"
+    local err_log="$4"
+    python3 - "$RAW/${selector}-${engine}.json" "$engine" "$selector" "$rows" "$err_log" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+out, engine, workload, rows, err_log = sys.argv[1:]
+reason = "competitor benchmark command failed"
+path = Path(err_log)
+if path.exists():
+    text = path.read_text(errors="replace").strip()
+    if text:
+        reason = text[-2000:]
+doc = {
+    "schema_version": 1,
+    "engine": engine,
+    "workload": workload,
+    "status": "not_available",
+    "n_rows": int(rows),
+    "reason": reason,
+    "policy": "Failure is recorded as not_available; no benchmark claim is made for this row.",
+}
+Path(out).write_text(json.dumps(doc, indent=2, sort_keys=True) + "\n")
+PY
+}
+
+run_competitor_script() {
+    local engine="$1"
+    local script="$2"
+    local selector="$3"
+    local rows="$4"
+    local row_mode="$5"
+    local raw_file="$RAW/${selector}-${engine}.json"
+    local err_log="$OUT/competitor-${selector}-${engine}.err"
+
+    rm -f "$err_log"
+    if [[ "$row_mode" == "analytical" ]]; then
+        if RAW_DIR="$RAW" N_ITERS="$ITERS" ANALYTICAL_ROWS="$rows" \
+            bash "$script" "$selector" 2>"$err_log"; then
+            return
+        fi
+    else
+        if RAW_DIR="$RAW" N_ITERS="$ITERS" N_ROWS="$rows" INSERT_CHUNK_ROWS="$INSERT_CHUNK_ROWS" \
+            bash "$script" "$selector" 2>"$err_log"; then
+            return
+        fi
+    fi
+
+    cat "$err_log" >&2 || true
+    if [[ ! -s "$raw_file" ]]; then
+        record_competitor_failure "$engine" "$selector" "$rows" "$err_log"
+    fi
+}
+
 run_competitors() {
     local selector="$1"
     local rows="$2"
     case "$selector" in
-        insert_throughput_*|select_scan_*|update_throughput_*|delete_throughput_*|mixed_oltp_pgbench_like)
-            RAW_DIR="$RAW" N_ITERS="$ITERS" N_ROWS="$rows" \
-                bash benchmarks/scripts/run_duckdb_writes.sh "$selector" || true
-            RAW_DIR="$RAW" N_ITERS="$ITERS" N_ROWS="$rows" \
-                bash benchmarks/scripts/run_sqlite3_writes.sh "$selector" || true
-            RAW_DIR="$RAW" N_ITERS="$ITERS" N_ROWS="$rows" \
-                bash benchmarks/scripts/run_postgres_writes.sh "$selector" || true
-            RAW_DIR="$RAW" N_ITERS="$ITERS" N_ROWS="$rows" \
-                bash benchmarks/scripts/run_clickhouse_writes.sh "$selector" || true
+        insert_throughput_*|select_scan_*|update_throughput_*|delete_throughput_*|mixed_oltp_pgbench_like|mixed_correctness_*)
+            run_competitor_script duckdb benchmarks/scripts/run_duckdb_writes.sh "$selector" "$rows" row
+            run_competitor_script sqlite3 benchmarks/scripts/run_sqlite3_writes.sh "$selector" "$rows" row
+            run_competitor_script postgres17 benchmarks/scripts/run_postgres_writes.sh "$selector" "$rows" row
+            run_competitor_script clickhouse benchmarks/scripts/run_clickhouse_writes.sh "$selector" "$rows" row
             ;;
         select_sum_*_i64|select_avg_*_i64|filter_sum_*_i64|window_row_number_*_i64)
-            RAW_DIR="$RAW" N_ITERS="$ITERS" ANALYTICAL_ROWS="$rows" \
-                bash benchmarks/scripts/run_duckdb_writes.sh "$selector" || true
-            RAW_DIR="$RAW" N_ITERS="$ITERS" ANALYTICAL_ROWS="$rows" \
-                bash benchmarks/scripts/run_sqlite3_writes.sh "$selector" || true
-            RAW_DIR="$RAW" N_ITERS="$ITERS" ANALYTICAL_ROWS="$rows" \
-                bash benchmarks/scripts/run_postgres_writes.sh "$selector" || true
-            RAW_DIR="$RAW" N_ITERS="$ITERS" ANALYTICAL_ROWS="$rows" \
-                bash benchmarks/scripts/run_clickhouse_writes.sh "$selector" || true
+            run_competitor_script duckdb benchmarks/scripts/run_duckdb_writes.sh "$selector" "$rows" analytical
+            run_competitor_script sqlite3 benchmarks/scripts/run_sqlite3_writes.sh "$selector" "$rows" analytical
+            run_competitor_script postgres17 benchmarks/scripts/run_postgres_writes.sh "$selector" "$rows" analytical
+            run_competitor_script clickhouse benchmarks/scripts/run_clickhouse_writes.sh "$selector" "$rows" analytical
             ;;
         *) echo "run_scale_sweep.sh: unknown competitor selector $selector" >&2; exit 2 ;;
     esac
@@ -346,6 +399,7 @@ declare -a SPECS=(
 
 declare -a FIXED_SPECS=(
     "mixed-oltp         mixed_oltp_pgbench_like      10000"
+    "mixed-correctness  mixed_correctness_100k       100000"
     "window-row-number  window_row_number_65k_i64    65536"
 )
 

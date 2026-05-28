@@ -29,11 +29,17 @@ fn hnsw_ann_artifact_records_recall_latency_build_and_memory() {
 
     assert_eq!(artifact.engine, "ultrasql_hnsw");
     assert_eq!(artifact.workload, "vector_ann_hnsw_128_4d_k5");
+    assert_eq!(artifact.status, "measured");
     assert_eq!(artifact.n_rows, config.rows);
+    assert_eq!(artifact.samples, config.queries);
+    assert_eq!(artifact.iterations_us.len(), config.queries);
     assert_eq!(artifact.vector_dims, config.dims);
     assert_eq!(artifact.top_k, config.top_k);
     assert_eq!(artifact.query_iterations_us.len(), config.queries);
     assert!((0.0..=1.0).contains(&artifact.recall_at_k));
+    assert!(artifact.median_us > 0.0);
+    assert!(artifact.min_us > 0.0);
+    assert!(artifact.median_us >= artifact.min_us);
     assert!(artifact.p50_latency_us > 0.0);
     assert!(artifact.p95_latency_us >= artifact.p50_latency_us);
     assert!(artifact.p99_latency_us >= artifact.p95_latency_us);
@@ -43,6 +49,11 @@ fn hnsw_ann_artifact_records_recall_latency_build_and_memory() {
     let json = serde_json::to_value(&artifact).expect("serialize artifact");
     for key in [
         "recall_at_k",
+        "status",
+        "samples",
+        "median_us",
+        "min_us",
+        "iterations_us",
         "p50_latency_us",
         "p95_latency_us",
         "p99_latency_us",

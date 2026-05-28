@@ -1,8 +1,9 @@
 {
-  "rendered_at": "2026-06-11T03:51:38Z",
+  "rendered_at": "2026-06-12T13:30:51Z",
   "schema_version": 1,
   "workloads": {
     "ai_gauntlet_hybrid_search_latency_full": {
+      "comparison_ready": true,
       "engines": [
         {
           "bm25_score": "implicit lexical component",
@@ -53,6 +54,7 @@
       ]
     },
     "ai_gauntlet_hybrid_search_latency_smoke": {
+      "comparison_ready": true,
       "engines": [
         {
           "bm25_score": "implicit lexical component",
@@ -96,6 +98,7 @@
       ]
     },
     "ai_gauntlet_rag_retrieval_quality_full": {
+      "comparison_ready": true,
       "engines": [
         {
           "answer_citation_coverage": 1.0,
@@ -153,6 +156,7 @@
       ]
     },
     "ai_gauntlet_rag_retrieval_quality_smoke": {
+      "comparison_ready": true,
       "engines": [
         {
           "answer_citation_coverage": 1.0,
@@ -203,6 +207,7 @@
       ]
     },
     "arena_parquet_smoke": {
+      "comparison_ready": true,
       "engines": [
         {
           "engine": "ultrasql",
@@ -262,6 +267,7 @@
       ]
     },
     "clickbench": {
+      "comparison_ready": false,
       "engines": [
         {
           "certification_scope": "smoke_subset",
@@ -647,6 +653,7 @@
       ]
     },
     "csv_cold_read_1k": {
+      "comparison_ready": true,
       "engines": [
         {
           "engine": "ultrasql",
@@ -685,6 +692,7 @@
       ]
     },
     "csv_copy_import_1k": {
+      "comparison_ready": true,
       "engines": [
         {
           "engine": "ultrasql",
@@ -723,6 +731,7 @@
       ]
     },
     "csv_filter_1k": {
+      "comparison_ready": true,
       "engines": [
         {
           "engine": "ultrasql",
@@ -761,6 +770,7 @@
       ]
     },
     "csv_group_by_1k": {
+      "comparison_ready": true,
       "engines": [
         {
           "engine": "ultrasql",
@@ -799,6 +809,7 @@
       ]
     },
     "csv_join_table_1k": {
+      "comparison_ready": true,
       "engines": [
         {
           "engine": "ultrasql",
@@ -837,6 +848,7 @@
       ]
     },
     "csv_malformed_behavior_1k": {
+      "comparison_ready": true,
       "engines": [
         {
           "engine": "ultrasql",
@@ -861,6 +873,7 @@
       ]
     },
     "csv_warm_read_1k": {
+      "comparison_ready": true,
       "engines": [
         {
           "engine": "ultrasql",
@@ -899,6 +912,7 @@
       ]
     },
     "delete_throughput_10k": {
+      "comparison_ready": true,
       "engines": [
         {
           "engine": "ultrasql",
@@ -1140,6 +1154,7 @@
       ]
     },
     "filter_sum_1m_i64": {
+      "comparison_ready": true,
       "engines": [
         {
           "engine": "ultrasql",
@@ -1381,6 +1396,7 @@
       ]
     },
     "firebolt_aggregate_index_10k": {
+      "comparison_ready": true,
       "engines": [
         {
           "engine": "ultrasql",
@@ -1445,6 +1461,7 @@
       ]
     },
     "firebolt_sparse_pruning_10k": {
+      "comparison_ready": true,
       "engines": [
         {
           "engine": "ultrasql",
@@ -1471,6 +1488,7 @@
       ]
     },
     "insert_throughput_10k": {
+      "comparison_ready": true,
       "engines": [
         {
           "engine": "ultrasql",
@@ -1712,6 +1730,7 @@
       ]
     },
     "late_materialization_10k": {
+      "comparison_ready": true,
       "engines": [
         {
           "engine": "ultrasql",
@@ -1786,6 +1805,7 @@
       ]
     },
     "mixed_oltp_pgbench_like": {
+      "comparison_ready": true,
       "engines": [
         {
           "engine": "ultrasql",
@@ -2063,6 +2083,7 @@
       ]
     },
     "object_parquet_range_smoke": {
+      "comparison_ready": true,
       "engines": [
         {
           "cache_hits": 8,
@@ -2396,6 +2417,7 @@
       ]
     },
     "select_avg_1m_i64": {
+      "comparison_ready": true,
       "engines": [
         {
           "engine": "ultrasql",
@@ -2637,6 +2659,7 @@
       ]
     },
     "select_scan_10k": {
+      "comparison_ready": true,
       "engines": [
         {
           "engine": "ultrasql",
@@ -2878,6 +2901,7 @@
       ]
     },
     "select_sum_65k_i64": {
+      "comparison_ready": true,
       "engines": [
         {
           "engine": "ultrasql",
@@ -3119,6 +3143,7 @@
       ]
     },
     "sysbench_oltp_read_write_10k": {
+      "comparison_ready": true,
       "engines": [
         {
           "engine": "ultrasql",
@@ -3147,6 +3172,7 @@
       ]
     },
     "sysbench_oltp_read_write_1k": {
+      "comparison_ready": true,
       "engines": [
         {
           "engine": "ultrasql",
@@ -3171,6 +3197,7 @@
       ]
     },
     "update_throughput_10k": {
+      "comparison_ready": true,
       "engines": [
         {
           "engine": "ultrasql",
@@ -3412,7 +3439,80 @@
       ]
     },
     "vector_ann_hnsw_512_8d_k10": {
+      "comparison_ready": true,
       "engines": [
+        {
+          "build_time_us": 10238.5,
+          "ef_search": 64,
+          "engine": "ultrasql_hnsw",
+          "first_ann_answer": [
+            454,
+            420,
+            366,
+            169,
+            284,
+            367,
+            241,
+            471,
+            218,
+            161
+          ],
+          "first_exact_answer": [
+            454,
+            420,
+            366,
+            169,
+            284,
+            367,
+            241,
+            471,
+            218,
+            161
+          ],
+          "host": {
+            "cores": 10,
+            "cpu": "Apple M4",
+            "os": "macos unknown",
+            "ram_gb": 16
+          },
+          "iterations_us": [
+            124.084,
+            135.5,
+            142.75,
+            144.875
+          ],
+          "m": 16,
+          "median_us": 139.125,
+          "memory_bytes": 175560,
+          "metric": "l2",
+          "min_us": 124.084,
+          "n_rows": 512,
+          "p50_latency_us": 135.5,
+          "p95_latency_us": 144.875,
+          "p99_latency_us": 144.875,
+          "queries": 4,
+          "query_iterations_us": [
+            135.5,
+            142.75,
+            144.875,
+            124.084
+          ],
+          "rank": 1,
+          "recall_at_k": 1.0,
+          "recall_iterations": [
+            1.0,
+            1.0,
+            1.0,
+            1.0
+          ],
+          "samples": 4,
+          "schema_version": 1,
+          "seed": 1367265502,
+          "status": "measured",
+          "top_k": 10,
+          "vector_dims": 8,
+          "warmup_queries": 0
+        },
         {
           "build_time_scope": "create_table_index_and_insert",
           "build_time_us": 147279.45893537253,
@@ -3472,7 +3572,7 @@
             12920.332956127822,
             11762.750102207065
           ],
-          "rank": 1,
+          "rank": 2,
           "recall_at_k": 1.0,
           "recall_iterations": [
             1.0,
@@ -3501,6 +3601,7 @@
       ]
     },
     "vector_topk_exact_10k_8d_k10": {
+      "comparison_ready": true,
       "engines": [
         {
           "build_time_scope": "table_load_before_timed_query",
@@ -3655,6 +3756,7 @@
       ]
     },
     "vector_topk_exact_512_8d_k5": {
+      "comparison_ready": true,
       "engines": [
         {
           "build_time_scope": "table_load_before_timed_query",
@@ -3737,6 +3839,7 @@
       ]
     },
     "window_row_number_65k_i64": {
+      "comparison_ready": true,
       "engines": [
         {
           "engine": "ultrasql",

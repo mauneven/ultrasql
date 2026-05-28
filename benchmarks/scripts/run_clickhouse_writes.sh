@@ -9,6 +9,8 @@
 #   delete_throughput_10k    — ALTER TABLE … DELETE … (mutations_sync=2).
 #   mixed_oltp_pgbench_like  — 1-second window: 50% point reads, 30%
 #                              point UPDATE-mutations, 20% inserts.
+#   mixed_correctness_100k   — UPDATE-mutation + INSERT + aggregate
+#                              with answer_sha256.
 #   select_scan_10k          — drain full `SELECT id, val FROM t`.
 #   select_sum_65k_i64       — `SELECT SUM(x) FROM bench_analytical`.
 #   select_avg_1m_i64        — `SELECT AVG(x) FROM bench_analytical`.
@@ -81,7 +83,7 @@ workload_rows() {
     case "$wl" in
         insert_throughput_*|update_throughput_*|delete_throughput_*|select_scan_*)
             echo "$N_ROWS" ;;
-        mixed_oltp_pgbench_like)
+        mixed_oltp_pgbench_like|mixed_correctness_*)
             echo "$N_ROWS" ;;
         select_sum_*_i64|select_avg_*_i64|filter_sum_*_i64|window_row_number_*_i64)
             case "$wl" in
@@ -100,6 +102,7 @@ target_workloads() {
         update_throughput_10k)   echo "update_throughput_$(row_suffix "$N_ROWS")" ;;
         delete_throughput_10k)   echo "delete_throughput_$(row_suffix "$N_ROWS")" ;;
         mixed_oltp_pgbench_like) echo "mixed_oltp_pgbench_like" ;;
+        mixed_correctness_*)     echo "mixed_correctness_$(row_suffix "$N_ROWS")" ;;
         select_scan_10k)         echo "select_scan_$(row_suffix "$N_ROWS")" ;;
         select_sum_65k_i64)
             local rows="${ANALYTICAL_ROWS:-65536}"
@@ -122,6 +125,7 @@ target_workloads() {
             echo "update_throughput_$(row_suffix "$N_ROWS")"
             echo "delete_throughput_$(row_suffix "$N_ROWS")"
             echo "mixed_oltp_pgbench_like"
+            echo "mixed_correctness_$(row_suffix "$N_ROWS")"
             echo "select_scan_$(row_suffix "$N_ROWS")"
             echo "select_sum_65k_i64"
             echo "select_avg_1m_i64"
@@ -216,7 +220,9 @@ XMLCONF
 XMLUSERS
     "$CH_BIN" server --config-file="${CH_DATA_DIR}/config.xml" >/dev/null 2>&1 &
     STARTED_SERVER=$!
+    trap '[[ ${STARTED_SERVER} -ne 0 ]] && kill ${STARTED_SERVER} 2>/dev/null || true; rm -rf "${CH_DATA_DIR}"' EXIT
     # Wait until TCP port responds.
+    clickhouse_ready=0
     for _ in $(seq 1 40); do
         if python3 -c "
 import socket
@@ -228,11 +234,14 @@ try:
 except Exception:
     raise SystemExit(1)
 " 2>/dev/null; then
+            clickhouse_ready=1
             break
         fi
         sleep 0.25
     done
-    trap '[[ ${STARTED_SERVER} -ne 0 ]] && kill ${STARTED_SERVER} 2>/dev/null || true; rm -rf "${CH_DATA_DIR}"' EXIT
+    if [[ "$clickhouse_ready" -ne 1 ]]; then
+        mark_unavailable "clickhouse server did not become ready on 127.0.0.1:${CH_TCP_PORT}"
+    fi
 fi
 
 # ---------------------------------------------------------------------------
@@ -476,6 +485,21 @@ PYEOF
 }
 
 # ---------------------------------------------------------------------------
+# Workload: mixed_correctness
+# ---------------------------------------------------------------------------
+run_mixed_correctness() {
+    local wl="mixed_correctness_$(row_suffix "$N_ROWS")"
+    echo "  workload: ${wl}"
+    python3 benchmarks/scripts/run_mixed_correctness.py \
+        --engine "$ENGINE" \
+        --workload "$wl" \
+        --rows "$N_ROWS" \
+        --iters "$N_ITERS" \
+        --ch-port "$CH_TCP_PORT" \
+        --out "${RAW_DIR}/${wl}-${ENGINE}.json"
+}
+
+# ---------------------------------------------------------------------------
 # Workload: select_scan_10k
 # ---------------------------------------------------------------------------
 run_select_scan() {
@@ -602,6 +626,7 @@ case "$WORKLOAD" in
     update_throughput_10k)   run_update ;;
     delete_throughput_10k)   run_delete ;;
     mixed_oltp_pgbench_like) run_mixed ;;
+    mixed_correctness_*)     run_mixed_correctness ;;
     select_scan_10k)         run_select_scan ;;
     select_sum_65k_i64)      run_sum_scalar ;;
     select_avg_1m_i64)       run_avg_scalar ;;
@@ -612,6 +637,7 @@ case "$WORKLOAD" in
         run_update
         run_delete
         run_mixed
+        run_mixed_correctness
         run_select_scan
         run_sum_scalar
         run_avg_scalar

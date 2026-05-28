@@ -52,9 +52,11 @@ Dataset:          8192 rows
 
 ## clickbench
 
-| Rank | Engine | Median time | Relative | Samples |
-|------|--------|-------------|----------|---------|
-| 1 | firebolt | 7.87 ms | `████████████████████████████████████████████████` | 1 |
+Comparison status: UltraSQL measurement missing; table is not a win/loss ranking.
+
+| Status | Engine | Median time | Relative | Samples |
+|--------|--------|-------------|----------|---------|
+| unranked | firebolt | 7.87 ms | `████████████████████████████████████████████████` | 1 |
 
 ## csv_cold_read_1k
 
@@ -270,7 +272,8 @@ Dataset:           512 rows
 
 | Rank | Engine | Median time | Relative | Samples |
 |------|--------|-------------|----------|---------|
-| 1 | firebolt_hnsw | 13.79 ms | `████████████████████████████████████████████████` | 4 |
+| 1 | ultrasql_hnsw | 139.12 µs | `█                                               ` | 4 |
+| 2 | firebolt_hnsw | 13.79 ms | `████████████████████████████████████████████████` | 4 |
 
 ## vector_topk_exact_10k_8d_k10
 
