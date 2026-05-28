@@ -121,6 +121,11 @@ file focused on what still blocks production.
   `docs/ai-database-strategy.md` as a SQL table surface that combines MVCC
   state, columnar shadow scans, BM25, vector ANN, JSON metadata, tenant/time
   projections, and auditable `EXPLAIN ANALYZE` path evidence.
+- Keep `AI gauntlet measured artifacts` expanding across: `exact top-k`,
+  `HNSW ANN recall/latency`, `hybrid search latency`,
+  `filtered vector search`, `RAG retrieval quality`,
+  `memory per million vectors`, `ingestion throughput`, and
+  `cold-start index load`.
 - Broaden the completed UltraSQL AI gauntlet into competitor comparisons:
   DuckDB VSS/HNSW, ClickHouse vector similarity/HNSW, PostgreSQL+pgvector
   HNSW/IVFFlat, Firebolt Core vector search, and optional local vector-service
