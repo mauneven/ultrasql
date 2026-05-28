@@ -289,9 +289,9 @@ certification.
 
 ### ClickBench Certification
 
-ClickBench uses the upstream PostgreSQL-compatible schema and 43-query
-set from ClickHouse/ClickBench at a pinned commit, downloaded at runtime
-to avoid vendoring benchmark files:
+ClickBench uses the upstream SQL schema variant and 43-query set from
+ClickHouse/ClickBench at a pinned commit, downloaded at runtime to avoid
+vendoring benchmark files:
 
 ```text
 CLICKBENCH_TSV=target/clickbench/hits.tsv \

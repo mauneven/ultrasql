@@ -57,11 +57,10 @@ file focused on what still blocks production.
 - Rerun TPC-H SF1/SF10 on the release host before publishing release
   performance claims; completed local evidence lives in `DONE.md`.
 - Broaden release-artifact scale-sweep coverage beyond the current same-host
-  table: larger row counts, WAL-backed `--data-dir` mode, measured ClickHouse
-  artifacts when a local ClickHouse server is available, and Firebolt legs
-  when local services are available.
+  table: larger row counts, WAL-backed `--data-dir` mode, repeatable
+  ClickHouse artifacts, and Firebolt legs when local services are available.
 
-## P1 - PostgreSQL Compatibility
+## P1 - SQL Compatibility
 
 ### Type Surface
 
@@ -121,9 +120,9 @@ file focused on what still blocks production.
 ### AI Gauntlet
 
 - AI memory engine: implement the strategy in
-  `docs/ai-database-strategy.md` as a PostgreSQL-wire table surface that
-  combines MVCC state, columnar shadow scans, BM25, vector ANN, JSON metadata,
-  tenant/time projections, and auditable `EXPLAIN ANALYZE` path evidence.
+  `docs/ai-database-strategy.md` as a SQL table surface that combines MVCC
+  state, columnar shadow scans, BM25, vector ANN, JSON metadata, tenant/time
+  projections, and auditable `EXPLAIN ANALYZE` path evidence.
 - Expand `AI gauntlet measured artifacts`: `exact top-k`,
   `HNSW ANN recall/latency`, `hybrid search latency`, `filtered vector search`,
   `RAG retrieval quality`, `memory per million vectors`, `ingestion throughput`,

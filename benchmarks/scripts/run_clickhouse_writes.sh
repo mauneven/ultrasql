@@ -40,6 +40,7 @@
 #   ANALYTICAL_ROWS  row count for SUM/AVG/filter/window workloads
 #   CH_BIN    (default: /tmp/ultracmp/clickhouse)
 #   CH_TCP_PORT  (default: 19000)
+#   INSERT_CHUNK_ROWS (default: 10000)
 #
 # Pre-requisites:
 #   - `clickhouse_driver` Python module on PATH.
@@ -58,7 +59,8 @@ ANALYTICAL_ROWS="${ANALYTICAL_ROWS:-}"
 CH_BIN="${CH_BIN:-/tmp/ultracmp/clickhouse}"
 CH_TCP_PORT="${CH_TCP_PORT:-19000}"
 CH_HTTP_PORT="${CH_HTTP_PORT:-18123}"
-CH_DATA_DIR="${CH_DATA_DIR:-/tmp/ch_bench}"
+CH_DATA_DIR="${CH_DATA_DIR:-/tmp/ch_bench_$$}"
+INSERT_CHUNK_ROWS="${INSERT_CHUNK_ROWS:-10000}"
 WORKLOAD="${1:-all}"
 
 row_suffix() {
@@ -230,7 +232,7 @@ except Exception:
         fi
         sleep 0.25
     done
-    trap '[[ ${STARTED_SERVER} -ne 0 ]] && kill ${STARTED_SERVER} 2>/dev/null || true' EXIT
+    trap '[[ ${STARTED_SERVER} -ne 0 ]] && kill ${STARTED_SERVER} 2>/dev/null || true; rm -rf "${CH_DATA_DIR}"' EXIT
 fi
 
 # ---------------------------------------------------------------------------
@@ -272,13 +274,14 @@ run_insert() {
     local wl="insert_throughput_$(row_suffix "$N_ROWS")"
     echo "  workload: ${wl}"
     local samples_raw
-    samples_raw="$(python3 - "$N_ROWS" "$N_ITERS" "$CH_TCP_PORT" <<'PYEOF'
+    samples_raw="$(python3 - "$N_ROWS" "$N_ITERS" "$INSERT_CHUNK_ROWS" "$CH_TCP_PORT" <<'PYEOF'
 import sys, time, random
 from clickhouse_driver import Client
 
 n = int(sys.argv[1])
 n_iters = int(sys.argv[2])
-port = int(sys.argv[3])
+chunk_rows = int(sys.argv[3])
+port = int(sys.argv[4])
 
 rng = random.Random(0xC0FFEE)
 ids = list(range(n))
@@ -295,7 +298,8 @@ for _ in range(n_iters):
         "ENGINE = MergeTree() ORDER BY id"
     )
     t0 = time.perf_counter()
-    c.execute("INSERT INTO bench_write (id, val) VALUES", rows)
+    for start in range(0, n, chunk_rows):
+        c.execute("INSERT INTO bench_write (id, val) VALUES", rows[start:start + chunk_rows])
     t1 = time.perf_counter()
     print((t1 - t0) * 1e6)
 PYEOF

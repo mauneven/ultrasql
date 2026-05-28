@@ -297,8 +297,8 @@ cargo run -p ultrasql-sqllogictest-runner -- \
 - Every PR: run `benchmarks/slt_speed_compare.sh` with `SLT_BENCH_RUNS=3` and
   only installed local references, storing the JSON artifact.
 - Nightly: run the full audited portable imported subset with skip reporting.
-- Nightly optional: run `--reference-url` against PostgreSQL for
-  PostgreSQL-compatible semantics.
+- Nightly optional: run `--reference-url` against PostgreSQL for reference
+  semantics.
 - Nightly optional: run the portable subset with SQLite, DuckDB, and PostgreSQL
   references plus `SLT_BENCH_RUNS=25`.
 - Manual: run larger imported suites after legal/provenance review.

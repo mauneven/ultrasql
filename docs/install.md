@@ -3,7 +3,7 @@
 UltraSQL release artifacts are built by GitHub Actions from version tags.
 Each release contains:
 
-- `ultrasqld` / `ultrasqld.exe` — PostgreSQL-wire server.
+- `ultrasqld` / `ultrasqld.exe` — SQL database server.
 - `ultrasql` / `ultrasql.exe` — CLI client and admin tool.
 - `ultrasql-local` / `ultrasql-local.exe` — local read-only query helper.
 - Linux `.deb` and `.rpm` packages for x86_64 and ARM64.
@@ -82,8 +82,9 @@ db.run("INSERT INTO t VALUES (?)", 42);
 console.log(db.get("SELECT x FROM t"));
 ```
 
-Server-mode applications should keep using PostgreSQL client libraries such as
-`pg`, `psycopg`, `libpq`, or `pgx`; UltraSQL speaks PostgreSQL wire protocol.
+Server-mode applications can use the supported SQL drivers listed in
+`docs/driver-certification.md`. Embedded applications can use the Node/Bun
+`Database` API directly.
 
 Release automation always attaches `ultrasql-<version>.tgz` to GitHub Releases
 and publishes the registry package from `packages/npm` with `npm publish`.

@@ -41,8 +41,9 @@ fn scale_sweep_renders_clickhouse_as_first_class_competitor() {
     assert!(renderer.contains("\"clickhouse\""));
     assert!(renderer.contains("\"ClickHouse\""));
     assert!(scale_md.contains(
-        "| Workload | Rows | UltraSQL | DuckDB | SQLite | PostgreSQL | ClickHouse | Fastest |"
+        "| Workload | Rows | UltraSQL | DuckDB | ClickHouse | SQLite | PostgreSQL | Fastest |"
     ));
+    assert!(scale_md.contains("% slower"));
     assert!(scale_json.contains("\"clickhouse\""));
     assert!(readme.contains("ClickHouse"));
     assert!(benchmarks.contains("PostgreSQL, and ClickHouse clients"));
@@ -68,7 +69,7 @@ fn readme_scale_sweep_matches_rendered_artifact() {
 }
 
 #[test]
-fn scale_sweep_records_million_row_insert_and_all_current_wins() {
+fn scale_sweep_records_million_row_insert_and_visible_gaps() {
     let raw =
         repo_file("benchmarks/results/latest/scale-sweep/raw/insert_throughput_1m-ultrasql.json");
     let value: serde_json::Value =
@@ -84,10 +85,22 @@ fn scale_sweep_records_million_row_insert_and_all_current_wins() {
     let rendered: serde_json::Value =
         serde_json::from_str(&rendered_json).expect("parse rendered scale_sweep.json");
     let rows = rendered["rows"].as_array().expect("rows array");
+    let one_m_insert = rows
+        .iter()
+        .find(|row| {
+            row["workload"].as_str() == Some("insert_throughput")
+                && row["n_rows"].as_u64() == Some(1_000_000)
+        })
+        .expect("1m insert row");
+    assert_eq!(one_m_insert["fastest_engine"].as_str(), Some("ultrasql"));
+
+    let visible_gaps = rows
+        .iter()
+        .filter(|row| row["fastest_engine"].as_str() != Some("ultrasql"))
+        .count();
     assert!(
-        rows.iter()
-            .all(|row| row["fastest_engine"].as_str() == Some("ultrasql")),
-        "every rendered scale-sweep row should currently have UltraSQL as fastest"
+        visible_gaps > 0,
+        "scale-sweep should keep non-UltraSQL fastest rows visible instead of hiding them"
     );
 
     let rendered_md = repo_file("benchmarks/results/latest/scale-sweep/scale_sweep.md");

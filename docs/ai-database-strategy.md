@@ -3,19 +3,18 @@
 UltraSQL targets AI database workloads by combining three surfaces in one
 engine:
 
-- PostgreSQL-wire OLTP for application state and existing drivers.
-- DuckDB-class local analytics for files, Parquet, Arrow, CSV, and embedded
-  Node/Bun/Python use.
-- ClickHouse-class real-time analytics for high-ingest events, projections,
-  sparse pruning, JSON, full-text, and vector workloads.
+- SQL server mode for application state and existing drivers.
+- Embedded analytics for files, Parquet, Arrow, CSV, and Node/Bun/Python use.
+- Real-time analytics for high-ingest events, projections, sparse pruning,
+  JSON, full-text, and vector workloads.
 
-This document is a product and engineering map. It borrows public ideas and
-interfaces where they are useful, but it does not copy proprietary tests,
-closed-source code, or non-public implementation details.
+This document is a product and engineering map. Implementation is original
+Rust code. External engines are used only as public benchmark references
+through documented interfaces and license-reviewed test data.
 
-## Competitor Feature Map
+## Feature Map
 
-### DuckDB-Class Capabilities To Match
+### Embedded Analytics
 
 - In-process database with a tiny install footprint and language-native APIs.
 - Direct file/lake queries: `read_parquet`, CSV/JSON scans, S3/object-store
@@ -28,7 +27,7 @@ closed-source code, or non-public implementation details.
   storage integrations.
 - Spilling and external execution so analytical queries can exceed memory.
 
-### ClickHouse-Class Capabilities To Match
+### Real-Time Analytics
 
 - Columnar storage for analytical scans, compression, and high-ingest event
   tables.
@@ -100,8 +99,8 @@ claims auditable and gives operators enough information to tune production.
 
 Every AI claim needs raw artifacts:
 
-- Exact top-k vs PostgreSQL + pgvector, DuckDB list distance, ClickHouse vector
-  functions, and Firebolt when available.
+- Exact top-k across installed reference engines and vector extensions when
+  available.
 - HNSW recall/latency across rows, dimensions, filters, and update/restart
   cycles.
 - Hybrid BM25 + vector search with deterministic answer checksums.
@@ -112,9 +111,9 @@ Every AI claim needs raw artifacts:
 - Model telemetry analytics: token usage, latency, tool calls, errors, and
   prompt/version dimensions.
 
-Missing competitors are allowed only as explicit `not_available` artifacts with
-reason fields. No README, release note, or package metadata may rank a missing
-engine.
+Missing reference engines are allowed only as explicit `not_available`
+artifacts with reason fields. No README, release note, or package metadata may
+rank a missing engine.
 
 ## Implementation Slices
 
@@ -123,9 +122,10 @@ engine.
    vector, and AI gauntlet runners. Tables render missing engines instead of
    hiding them.
 
-2. Lakehouse parity.
+2. Lakehouse certification.
    Certify Parquet/CSV pushdown, object-range reads, file metadata functions,
-   and `COPY TO ... FORMAT parquet` against DuckDB and ClickHouse shapes.
+   and `COPY TO ... FORMAT parquet` against license-reviewed reference
+   behavior.
 
 3. Columnar shadow.
    Make OLTP heap remain source of truth while committed rows feed a compressed
@@ -142,8 +142,8 @@ engine.
 
 6. AI telemetry.
    Ship a schema and benchmark for traces, prompts, token usage, retrieval
-   hits, evaluations, and model/version dimensions. This targets the operational
-   AI data that ClickHouse-style systems already attract.
+   hits, evaluations, and model/version dimensions. This targets operational AI
+   data with fast ingestion and auditable query paths.
 
 ## Source References
 

@@ -37,8 +37,8 @@ Start the server:
 cargo run --release --bin ultrasqld
 ```
 
-Connect with the UltraSQL CLI or any PostgreSQL wire client that only uses the
-currently supported protocol surface:
+Connect with the UltraSQL CLI or any supported SQL client that only uses the
+currently certified surface:
 
 ```bash
 cargo run --release --bin ultrasql -- "host=127.0.0.1 port=5432 user=ultrasql"

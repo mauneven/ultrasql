@@ -1,6 +1,6 @@
 site_name: UltraSQL
 site_url: https://docs.ultrasql.org/
-site_description: PostgreSQL-compatible OLTP+OLAP database in Rust.
+site_description: Fast SQL database in Rust.
 repo_name: mauneven/ultrasql
 repo_url: https://github.com/mauneven/ultrasql
 edit_uri: edit/main/docs/

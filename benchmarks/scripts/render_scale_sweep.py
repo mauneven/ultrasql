@@ -13,7 +13,7 @@ import json
 from pathlib import Path
 
 
-ENGINE_ORDER = ["ultrasql", "duckdb", "sqlite3", "postgres17", "clickhouse"]
+ENGINE_ORDER = ["ultrasql", "duckdb", "clickhouse", "sqlite3", "postgres17"]
 ENGINE_LABELS = {
     "ultrasql": "UltraSQL",
     "duckdb": "DuckDB",
@@ -85,6 +85,14 @@ def format_duration(us: float | None, family: str) -> str:
     return f"{us / 1000.0:.2f} ms{suffix}"
 
 
+def format_slower(value_us: float, fastest_us: float | None) -> str:
+    if fastest_us is None or fastest_us <= 0.0 or value_us <= fastest_us:
+        return ""
+    slower = ((value_us / fastest_us) - 1.0) * 100.0
+    text = f"{slower:.1f}".rstrip("0").rstrip(".")
+    return f" ({text}% slower)"
+
+
 def load_raw(raw_dir: Path) -> list[dict]:
     records = []
     for path in sorted(raw_dir.glob("*.json")):
@@ -146,7 +154,7 @@ def render_markdown(title: str, note: str, rows: list[dict]) -> str:
         "",
         note,
         "",
-        "| Workload | Rows | UltraSQL | DuckDB | SQLite | PostgreSQL | ClickHouse | Fastest |",
+        "| Workload | Rows | UltraSQL | DuckDB | ClickHouse | SQLite | PostgreSQL | Fastest |",
         "|---|---:|---:|---:|---:|---:|---:|---|",
     ]
     for row in rows:
@@ -156,6 +164,8 @@ def render_markdown(title: str, note: str, rows: list[dict]) -> str:
             formatted = format_duration(value["median_us"] if value else None, row["workload"])
             if engine == row["fastest_engine"]:
                 formatted = f"**{formatted}**"
+            elif value:
+                formatted = f"{formatted}{format_slower(value['median_us'], row['fastest_median_us'])}"
             cells.append(formatted)
         fastest = (
             ENGINE_LABELS.get(row["fastest_engine"], row["fastest_engine"])
@@ -163,14 +173,14 @@ def render_markdown(title: str, note: str, rows: list[dict]) -> str:
             else "-"
         )
         lines.append(
-            "| {workload} | {rows} | {ultrasql} | {duckdb} | {sqlite} | {postgres} | {clickhouse} | {fastest} |".format(
+            "| {workload} | {rows} | {ultrasql} | {duckdb} | {clickhouse} | {sqlite} | {postgres} | {fastest} |".format(
                 workload=row["workload_label"],
                 rows=format_rows(row["n_rows"]),
                 ultrasql=cells[0],
                 duckdb=cells[1],
-                sqlite=cells[2],
-                postgres=cells[3],
-                clickhouse=cells[4],
+                clickhouse=cells[2],
+                sqlite=cells[3],
+                postgres=cells[4],
                 fastest=fastest,
             )
         )

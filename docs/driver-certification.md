@@ -1,7 +1,7 @@
 # Driver Certification
 
-UltraSQL certifies PostgreSQL-wire compatibility against stock client
-drivers before claiming client ecosystem support.
+UltraSQL certifies server-mode driver behavior against stock client libraries
+before claiming client ecosystem support.
 
 The PR gate covers:
 

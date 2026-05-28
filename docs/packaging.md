@@ -69,9 +69,9 @@ The package exposes a Node-API embedded `Database` class plus command shims.
 vendors `ultrasql.node`, and opens the engine in-process. The command shims use
 the same archive and launch `ultrasql`, `ultrasqld`, or `ultrasql-local`.
 
-Server-mode applications should still use PostgreSQL driver libraries. Embedded
-mode is for in-process local databases; wire mode is for drop-in PostgreSQL
-client compatibility.
+Server-mode applications use the supported driver surface listed in
+`docs/driver-certification.md`. Embedded mode is for in-process local
+databases through the `Database` API.
 
 The release workflow runs the package tests and calls:
 

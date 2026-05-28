@@ -23,8 +23,8 @@ curl -fsS http://127.0.0.1:8080/ready
 cargo run --bin ultrasql -- --isready --ops-endpoint 127.0.0.1:8080
 ```
 
-`/health` reports process liveness. `/ready` additionally checks that the
-PostgreSQL-wire listener accepts TCP connections.
+`/health` reports process liveness. `/ready` additionally checks that the SQL
+listener accepts TCP connections.
 
 ## Metrics
 

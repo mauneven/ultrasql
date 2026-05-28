@@ -16,8 +16,6 @@ test("publishes discoverable npm metadata", () => {
   for (const keyword of [
     "database",
     "sql",
-    "postgresql",
-    "pgwire",
     "embedded",
     "node-api",
     "bun",
@@ -35,8 +33,8 @@ test("readme documents node usage and binary behavior", () => {
   for (const needle of [
     "Database.open(\":memory:\")",
     "db.prepare",
-    "pnpm add pg",
-    "import pg from \"pg\"",
+    "Server Mode",
+    "pnpm exec ultrasql",
     "Supported Targets",
     "No install-time `postinstall` script",
     "UltraSQL is pre-alpha",

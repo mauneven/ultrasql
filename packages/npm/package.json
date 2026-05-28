@@ -1,15 +1,12 @@
 {
   "name": "ultrasql",
   "version": "0.0.6",
-  "description": "Embedded UltraSQL database API plus PostgreSQL-wire server and CLI binaries.",
+  "description": "Embedded UltraSQL database API plus server and CLI binaries.",
   "license": "Apache-2.0 OR MIT",
   "homepage": "https://github.com/mauneven/ultrasql#readme",
   "keywords": [
     "database",
     "sql",
-    "postgresql",
-    "postgres",
-    "pgwire",
     "embedded",
     "node-api",
     "bun",

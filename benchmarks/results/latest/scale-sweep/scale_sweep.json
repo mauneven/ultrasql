@@ -9,15 +9,25 @@
   "engine_order": [
     "ultrasql",
     "duckdb",
+    "clickhouse",
     "sqlite3",
-    "postgres17",
-    "clickhouse"
+    "postgres17"
   ],
   "policy": "Only measured raw artifacts are rendered; missing engines are not ranked.",
   "raw_dir": "benchmarks/results/latest/scale-sweep/raw",
   "rows": [
     {
       "engines": {
+        "clickhouse": {
+          "engine": "clickhouse",
+          "family": "insert_throughput",
+          "median_us": 60544.375,
+          "n_rows": 10000,
+          "path": "benchmarks/results/latest/scale-sweep/raw/insert_throughput_10k-clickhouse.json",
+          "samples": 16,
+          "server_mode": null,
+          "workload": "insert_throughput_10k"
+        },
         "duckdb": {
           "engine": "duckdb",
           "family": "insert_throughput",
@@ -67,6 +77,16 @@
     },
     {
       "engines": {
+        "clickhouse": {
+          "engine": "clickhouse",
+          "family": "insert_throughput",
+          "median_us": 658305.896,
+          "n_rows": 100000,
+          "path": "benchmarks/results/latest/scale-sweep/raw/insert_throughput_100k-clickhouse.json",
+          "samples": 16,
+          "server_mode": null,
+          "workload": "insert_throughput_100k"
+        },
         "duckdb": {
           "engine": "duckdb",
           "family": "insert_throughput",
@@ -116,6 +136,16 @@
     },
     {
       "engines": {
+        "clickhouse": {
+          "engine": "clickhouse",
+          "family": "insert_throughput",
+          "median_us": 6495586.541,
+          "n_rows": 1000000,
+          "path": "benchmarks/results/latest/scale-sweep/raw/insert_throughput_1m-clickhouse.json",
+          "samples": 16,
+          "server_mode": null,
+          "workload": "insert_throughput_1m"
+        },
         "duckdb": {
           "engine": "duckdb",
           "family": "insert_throughput",
@@ -165,6 +195,16 @@
     },
     {
       "engines": {
+        "clickhouse": {
+          "engine": "clickhouse",
+          "family": "select_scan",
+          "median_us": 1102.208,
+          "n_rows": 10000,
+          "path": "benchmarks/results/latest/scale-sweep/raw/select_scan_10k-clickhouse.json",
+          "samples": 16,
+          "server_mode": null,
+          "workload": "select_scan_10k"
+        },
         "duckdb": {
           "engine": "duckdb",
           "family": "select_scan",
@@ -214,6 +254,16 @@
     },
     {
       "engines": {
+        "clickhouse": {
+          "engine": "clickhouse",
+          "family": "select_scan",
+          "median_us": 7261.396,
+          "n_rows": 100000,
+          "path": "benchmarks/results/latest/scale-sweep/raw/select_scan_100k-clickhouse.json",
+          "samples": 16,
+          "server_mode": null,
+          "workload": "select_scan_100k"
+        },
         "duckdb": {
           "engine": "duckdb",
           "family": "select_scan",
@@ -263,6 +313,16 @@
     },
     {
       "engines": {
+        "clickhouse": {
+          "engine": "clickhouse",
+          "family": "select_scan",
+          "median_us": 67048.854,
+          "n_rows": 1000000,
+          "path": "benchmarks/results/latest/scale-sweep/raw/select_scan_1m-clickhouse.json",
+          "samples": 16,
+          "server_mode": null,
+          "workload": "select_scan_1m"
+        },
         "duckdb": {
           "engine": "duckdb",
           "family": "select_scan",
@@ -304,14 +364,24 @@
           "workload": "select_scan_1m"
         }
       },
-      "fastest_engine": "ultrasql",
-      "fastest_median_us": 67709.209,
+      "fastest_engine": "clickhouse",
+      "fastest_median_us": 67048.854,
       "n_rows": 1000000,
       "workload": "select_scan",
       "workload_label": "SELECT scan"
     },
     {
       "engines": {
+        "clickhouse": {
+          "engine": "clickhouse",
+          "family": "select_sum",
+          "median_us": 559.145,
+          "n_rows": 10000,
+          "path": "benchmarks/results/latest/scale-sweep/raw/select_sum_10k_i64-clickhouse.json",
+          "samples": 16,
+          "server_mode": null,
+          "workload": "select_sum_10k_i64"
+        },
         "duckdb": {
           "engine": "duckdb",
           "family": "select_sum",
@@ -361,6 +431,16 @@
     },
     {
       "engines": {
+        "clickhouse": {
+          "engine": "clickhouse",
+          "family": "select_sum",
+          "median_us": 870.938,
+          "n_rows": 100000,
+          "path": "benchmarks/results/latest/scale-sweep/raw/select_sum_100k_i64-clickhouse.json",
+          "samples": 16,
+          "server_mode": null,
+          "workload": "select_sum_100k_i64"
+        },
         "duckdb": {
           "engine": "duckdb",
           "family": "select_sum",
@@ -410,6 +490,16 @@
     },
     {
       "engines": {
+        "clickhouse": {
+          "engine": "clickhouse",
+          "family": "select_sum",
+          "median_us": 1939.104,
+          "n_rows": 1000000,
+          "path": "benchmarks/results/latest/scale-sweep/raw/select_sum_1m_i64-clickhouse.json",
+          "samples": 16,
+          "server_mode": null,
+          "workload": "select_sum_1m_i64"
+        },
         "duckdb": {
           "engine": "duckdb",
           "family": "select_sum",
@@ -459,6 +549,16 @@
     },
     {
       "engines": {
+        "clickhouse": {
+          "engine": "clickhouse",
+          "family": "select_avg",
+          "median_us": 572.708,
+          "n_rows": 10000,
+          "path": "benchmarks/results/latest/scale-sweep/raw/select_avg_10k_i64-clickhouse.json",
+          "samples": 16,
+          "server_mode": null,
+          "workload": "select_avg_10k_i64"
+        },
         "duckdb": {
           "engine": "duckdb",
           "family": "select_avg",
@@ -508,6 +608,16 @@
     },
     {
       "engines": {
+        "clickhouse": {
+          "engine": "clickhouse",
+          "family": "select_avg",
+          "median_us": 790.896,
+          "n_rows": 100000,
+          "path": "benchmarks/results/latest/scale-sweep/raw/select_avg_100k_i64-clickhouse.json",
+          "samples": 16,
+          "server_mode": null,
+          "workload": "select_avg_100k_i64"
+        },
         "duckdb": {
           "engine": "duckdb",
           "family": "select_avg",
@@ -557,6 +667,16 @@
     },
     {
       "engines": {
+        "clickhouse": {
+          "engine": "clickhouse",
+          "family": "select_avg",
+          "median_us": 2047.916,
+          "n_rows": 1000000,
+          "path": "benchmarks/results/latest/scale-sweep/raw/select_avg_1m_i64-clickhouse.json",
+          "samples": 16,
+          "server_mode": null,
+          "workload": "select_avg_1m_i64"
+        },
         "duckdb": {
           "engine": "duckdb",
           "family": "select_avg",
@@ -606,6 +726,16 @@
     },
     {
       "engines": {
+        "clickhouse": {
+          "engine": "clickhouse",
+          "family": "filter_sum",
+          "median_us": 702.625,
+          "n_rows": 10000,
+          "path": "benchmarks/results/latest/scale-sweep/raw/filter_sum_10k_i64-clickhouse.json",
+          "samples": 16,
+          "server_mode": null,
+          "workload": "filter_sum_10k_i64"
+        },
         "duckdb": {
           "engine": "duckdb",
           "family": "filter_sum",
@@ -655,6 +785,16 @@
     },
     {
       "engines": {
+        "clickhouse": {
+          "engine": "clickhouse",
+          "family": "filter_sum",
+          "median_us": 979.0,
+          "n_rows": 100000,
+          "path": "benchmarks/results/latest/scale-sweep/raw/filter_sum_100k_i64-clickhouse.json",
+          "samples": 16,
+          "server_mode": null,
+          "workload": "filter_sum_100k_i64"
+        },
         "duckdb": {
           "engine": "duckdb",
           "family": "filter_sum",
@@ -704,6 +844,16 @@
     },
     {
       "engines": {
+        "clickhouse": {
+          "engine": "clickhouse",
+          "family": "filter_sum",
+          "median_us": 1587.187,
+          "n_rows": 1000000,
+          "path": "benchmarks/results/latest/scale-sweep/raw/filter_sum_1m_i64-clickhouse.json",
+          "samples": 16,
+          "server_mode": null,
+          "workload": "filter_sum_1m_i64"
+        },
         "duckdb": {
           "engine": "duckdb",
           "family": "filter_sum",
@@ -753,6 +903,16 @@
     },
     {
       "engines": {
+        "clickhouse": {
+          "engine": "clickhouse",
+          "family": "update_throughput",
+          "median_us": 4588.083,
+          "n_rows": 10000,
+          "path": "benchmarks/results/latest/scale-sweep/raw/update_throughput_10k-clickhouse.json",
+          "samples": 16,
+          "server_mode": null,
+          "workload": "update_throughput_10k"
+        },
         "duckdb": {
           "engine": "duckdb",
           "family": "update_throughput",
@@ -802,6 +962,16 @@
     },
     {
       "engines": {
+        "clickhouse": {
+          "engine": "clickhouse",
+          "family": "update_throughput",
+          "median_us": 11956.188,
+          "n_rows": 100000,
+          "path": "benchmarks/results/latest/scale-sweep/raw/update_throughput_100k-clickhouse.json",
+          "samples": 16,
+          "server_mode": null,
+          "workload": "update_throughput_100k"
+        },
         "duckdb": {
           "engine": "duckdb",
           "family": "update_throughput",
@@ -851,6 +1021,16 @@
     },
     {
       "engines": {
+        "clickhouse": {
+          "engine": "clickhouse",
+          "family": "update_throughput",
+          "median_us": 32137.146,
+          "n_rows": 1000000,
+          "path": "benchmarks/results/latest/scale-sweep/raw/update_throughput_1m-clickhouse.json",
+          "samples": 16,
+          "server_mode": null,
+          "workload": "update_throughput_1m"
+        },
         "duckdb": {
           "engine": "duckdb",
           "family": "update_throughput",
@@ -900,6 +1080,16 @@
     },
     {
       "engines": {
+        "clickhouse": {
+          "engine": "clickhouse",
+          "family": "delete_throughput",
+          "median_us": 5527.437,
+          "n_rows": 10000,
+          "path": "benchmarks/results/latest/scale-sweep/raw/delete_throughput_10k-clickhouse.json",
+          "samples": 16,
+          "server_mode": null,
+          "workload": "delete_throughput_10k"
+        },
         "duckdb": {
           "engine": "duckdb",
           "family": "delete_throughput",
@@ -949,6 +1139,16 @@
     },
     {
       "engines": {
+        "clickhouse": {
+          "engine": "clickhouse",
+          "family": "delete_throughput",
+          "median_us": 3966.292,
+          "n_rows": 100000,
+          "path": "benchmarks/results/latest/scale-sweep/raw/delete_throughput_100k-clickhouse.json",
+          "samples": 16,
+          "server_mode": null,
+          "workload": "delete_throughput_100k"
+        },
         "duckdb": {
           "engine": "duckdb",
           "family": "delete_throughput",
@@ -998,6 +1198,16 @@
     },
     {
       "engines": {
+        "clickhouse": {
+          "engine": "clickhouse",
+          "family": "delete_throughput",
+          "median_us": 3190.104,
+          "n_rows": 1000000,
+          "path": "benchmarks/results/latest/scale-sweep/raw/delete_throughput_1m-clickhouse.json",
+          "samples": 16,
+          "server_mode": null,
+          "workload": "delete_throughput_1m"
+        },
         "duckdb": {
           "engine": "duckdb",
           "family": "delete_throughput",
@@ -1039,14 +1249,24 @@
           "workload": "delete_throughput_1m"
         }
       },
-      "fastest_engine": "ultrasql",
-      "fastest_median_us": 6292.792,
+      "fastest_engine": "clickhouse",
+      "fastest_median_us": 3190.104,
       "n_rows": 1000000,
       "workload": "delete_throughput",
       "workload_label": "DELETE throughput"
     },
     {
       "engines": {
+        "clickhouse": {
+          "engine": "clickhouse",
+          "family": "mixed_oltp_pgbench_like",
+          "median_us": 23384.458,
+          "n_rows": 10000,
+          "path": "benchmarks/results/latest/scale-sweep/raw/mixed_oltp_pgbench_like-clickhouse.json",
+          "samples": 16,
+          "server_mode": null,
+          "workload": "mixed_oltp_pgbench_like"
+        },
         "duckdb": {
           "engine": "duckdb",
           "family": "mixed_oltp_pgbench_like",
@@ -1096,6 +1316,16 @@
     },
     {
       "engines": {
+        "clickhouse": {
+          "engine": "clickhouse",
+          "family": "window_row_number",
+          "median_us": 6182.791,
+          "n_rows": 65536,
+          "path": "benchmarks/results/latest/scale-sweep/raw/window_row_number_65k_i64-clickhouse.json",
+          "samples": 16,
+          "server_mode": null,
+          "workload": "window_row_number_65k_i64"
+        },
         "duckdb": {
           "engine": "duckdb",
           "family": "window_row_number",

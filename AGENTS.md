@@ -14,9 +14,9 @@ is wrong; resolve the conflict, do not ignore it.
 
 ## 1. Mission
 
-UltraSQL is a from-scratch PostgreSQL-compatible OLTP+OLAP engine in pure
-Rust. Drop-in replacement target for PostgreSQL: same wire protocol v3,
-same SQL dialect, MVCC semantics. The mission has three legs:
+UltraSQL is a from-scratch SQL OLTP+OLAP engine in pure Rust. It aims for
+durable storage, a broad SQL surface, MVCC semantics, and wide client
+compatibility. The mission has three legs:
 
 1. **Correctness first.** A database that loses data, returns wrong
    answers, or violates the isolation level it advertises is not useful

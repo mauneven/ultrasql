@@ -1,11 +1,10 @@
 # UltraSQL
 
-Embedded UltraSQL database API plus PostgreSQL-compatible server and CLI
-binaries for Node.js package managers.
+Embedded UltraSQL database API plus server and CLI binaries for Node.js package
+managers.
 
 Use `Database.open(":memory:")` for an in-process database. Use `ultrasqld`
-when an application should connect through the PostgreSQL wire protocol with
-`pg`, Prisma, Drizzle, Kysely, TypeORM, or any other PostgreSQL client.
+when an application should connect to a long-running SQL server process.
 
 ## Embedded Quick Start
 
@@ -44,7 +43,7 @@ addon is already present.
 
 This npm package installs command shims for:
 
-- `ultrasqld` - PostgreSQL-wire database server.
+- `ultrasqld` - SQL database server.
 - `ultrasql` - CLI client and admin tool.
 - `ultrasql-local` - local query helper.
 
@@ -65,7 +64,7 @@ Project-local install:
 pnpm add -D ultrasql
 ```
 
-## PostgreSQL Wire Quick Start
+## Server Mode
 
 Start a local server:
 
@@ -73,41 +72,10 @@ Start a local server:
 pnpm exec ultrasqld --listen 127.0.0.1:5433
 ```
 
-In another terminal:
+Use the CLI from another terminal:
 
 ```bash
-pnpm add pg
-```
-
-Create `index.mjs`:
-
-```js
-import pg from "pg";
-
-const { Client } = pg;
-
-const db = new Client({
-  host: "127.0.0.1",
-  port: 5433,
-  database: "ultrasql",
-  user: "ultrasql",
-});
-
-await db.connect();
-
-const result = await db.query(
-  "SELECT id, name, score FROM users ORDER BY id"
-);
-
-console.table(result.rows);
-
-await db.end();
-```
-
-Run it:
-
-```bash
-node index.mjs
+pnpm exec ultrasql -- "host=127.0.0.1 port=5433 user=ultrasql"
 ```
 
 ## Supported Targets
@@ -150,9 +118,9 @@ ULTRASQL_NPM_SKIP_DOWNLOAD=1 pnpm add -D ultrasql
 ## Status
 
 UltraSQL is pre-alpha. It is useful for local testing, compatibility work, and
-benchmark reproduction, but it is not a v1.0 production PostgreSQL replacement
-yet. See the project roadmap and known incompatibilities before using it with
-important data.
+benchmark reproduction, but it is not a v1.0 production database yet. See the
+project roadmap and known incompatibilities before using it with important
+data.
 
 ## Links
 

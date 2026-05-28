@@ -1,8 +1,7 @@
 # UltraSQL Documentation
 
-UltraSQL is a PostgreSQL-compatible OLTP+OLAP database in Rust. These docs
-cover local evaluation, release artifacts, operational gates, and compatibility
-limits.
+UltraSQL is a fast SQL database in Rust. These docs cover local evaluation,
+release artifacts, operational gates, and compatibility limits.
 
 UltraSQL is pre-alpha. Treat every install path as an evaluation or release
 candidate path until the v1.0 release checklist is closed.
@@ -12,7 +11,8 @@ candidate path until the v1.0 release checklist is closed.
 - [Getting Started](getting-started.md) builds and runs a local server.
 - [Install](install.md) covers archives, npm, Docker, Homebrew, Debian, and RPM.
 - [Configuration](configuration.md) lists release-relevant server knobs.
-- [AI Database Strategy](ai-database-strategy.md) maps DuckDB/ClickHouse parity
-  and the UltraSQL AI memory engine plan.
-- [Known Incompatibilities](known-incompatibilities.md) records PostgreSQL gaps.
+- [AI Database Strategy](ai-database-strategy.md) maps UltraSQL's AI memory
+  engine plan.
+- [Known Incompatibilities](known-incompatibilities.md) records open SQL
+  compatibility gaps.
 - [Release Checklist](release-checklist.md) is the production readiness gate.
