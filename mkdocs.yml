@@ -39,6 +39,7 @@ nav:
   - Known Limitations: known-limitations.md
   - Security and Ethics Audit: security-ethics-audit.md
   - Testing:
-      - Coverage Evidence: testing/coverage-evidence-2026-05-24.md
+      - Coverage Evidence 2026-05-28: testing/coverage-evidence-2026-05-28.md
+      - Coverage Evidence 2026-05-24: testing/coverage-evidence-2026-05-24.md
       - External SQL Test Reuse: testing/external-sql-test-reuse.md
       - Isolation Suite: testing/isolation-suite.md

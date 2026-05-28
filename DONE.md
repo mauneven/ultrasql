@@ -40,6 +40,10 @@ as a concise evidence ledger; roadmap stays for open gates only.
 - `cargo audit` and `cargo deny` CI gates are wired.
 - Coverage workflow proof exists; per-crate 80% enforcement remains open until
   every crate clears the threshold.
+- Coverage audit refreshed on 2026-05-28. Full workspace `cargo llvm-cov`
+  passed test execution, `scripts/coverage_gate.py --min-lines 80` produced
+  `docs/testing/coverage-evidence-2026-05-28.md`, and `ultrasql-node` now
+  clears the per-crate gate at 84.00%.
 - Driver-certification CI was repaired, action runtimes refreshed, and release
   workflows validated on `main`.
 - Chaos testing: random kill, WAL truncation, disk full recovery is implemented
