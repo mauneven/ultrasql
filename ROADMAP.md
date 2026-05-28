@@ -121,13 +121,16 @@ file focused on what still blocks production.
   `docs/ai-database-strategy.md` as a SQL table surface that combines MVCC
   state, columnar shadow scans, BM25, vector ANN, JSON metadata, tenant/time
   projections, and auditable `EXPLAIN ANALYZE` path evidence.
-- Expand `AI gauntlet measured artifacts`: `exact top-k`,
-  `HNSW ANN recall/latency`, `hybrid search latency`, `filtered vector search`,
-  `RAG retrieval quality`, `memory per million vectors`, `ingestion throughput`,
-  and `cold-start index load`.
-- Commit datasets or dataset fetch instructions, host descriptors, raw
-  artifacts, answer checksums, and failure reasons for every published vector
-  claim.
+- Broaden the completed UltraSQL AI gauntlet into competitor comparisons:
+  DuckDB VSS/HNSW, ClickHouse vector similarity/HNSW, PostgreSQL+pgvector
+  HNSW/IVFFlat, Firebolt Core vector search, and optional local vector-service
+  adapters when reproducible local setup exists.
+- Scale AI artifacts beyond the current full profile: larger rows, larger
+  dimensions, more probes, metadata-filtered recall/latency, SQL-level HNSW
+  restart correctness, and publishable p50/p95/p99 tables.
+- For every new published AI/vector claim, commit dataset or fetch instructions,
+  host descriptors, raw artifacts, answer checksums, recall target, failure
+  reasons, and same-host competitor configuration.
 
 ### Columnar And External Data
 
@@ -143,8 +146,6 @@ file focused on what still blocks production.
 
 ## P3 - Packaging, Distribution, Operations
 
-- External registry cutover: publish the clean `ultrasql` npm package with
-  `npm publish`, promote `packages/npm`, keep pnpm install tested.
 - Promote packages from the `release workflow`: `docs.ultrasql.org`,
   `ghcr.io/mauneven/ultrasql`, `clean GHCR platform list`, `Windows setup EXE`,
   `Chocolatey`, `AUR`, `yay -S ultrasql-bin`, `Homebrew tap`, `Homebrew`,

@@ -12,6 +12,9 @@ as a concise evidence ledger; roadmap stays for open gates only.
 - npm / pnpm installer support exists under `packages/npm`; package metadata uses
   the clean `ultrasql` name and supports `npm publish --access public
   --provenance` when credentials are configured.
+- External npm registry cutover is complete: public package `ultrasql` latest
+  version `0.0.6` was verified from `https://registry.npmjs.org/ultrasql/latest`
+  with repository directory `packages/npm`.
 - Homebrew support exists through a source-built `packaging/homebrew/ultrasql.rb.in`
   formula and `scripts/render-homebrew-formula.sh`.
 - AUR support exists through `packaging/aur/PKGBUILD.in`,
@@ -149,15 +152,24 @@ as a concise evidence ledger; roadmap stays for open gates only.
 - Columnar scan path landed: heap rows remain the OLTP/MVCC source of truth,
   `HeapAccess::column_cache` supplies the OLAP shadow path, and committed DML
   invalidation/rebuild/update/delete/insert visibility tests exist.
-- Exact vector top-k avoids full physical sort on fallback, reports exact
-  kernel/fallback in `EXPLAIN ANALYZE`, and has same-host pgvector exact cert
-  smoke.
+- Exact vector top-k avoids full physical sort on fallback and reports exact
+  kernel/fallback in `EXPLAIN ANALYZE`.
+- Exact vector cross-engine artifacts exist for the 10k-row, 8-dimension, k=10
+  shape. `benchmarks/results/latest/raw/vector_topk_exact_10k_8d_k10-ultrasql.json`,
+  `benchmarks/results/latest/raw/vector_topk_exact_10k_8d_k10-duckdb_list.json`,
+  and
+  `benchmarks/results/latest/raw/vector_topk_exact_10k_8d_k10-postgres17_pgvector.json`
+  are measured with matching answer checksums. The ClickHouse artifact
+  `benchmarks/results/latest/raw/vector_topk_exact_10k_8d_k10-clickhouse_vector.json`
+  records `status=not_available` with `reason=clickhouse_not_found`.
 - Page-backed HNSW and IVFFlat SQL paths exist, survive restart, and have
   crash/corrupt/torn-WAL, rebuild, EXPLAIN, insert/update/delete/VACUUM, and WAL
   payload fuzz/property tests.
-- AI/vector smoke artifacts exist for exact top-k, HNSW recall/latency, hybrid
-  search, filtered vector search, RAG quality, memory per million vectors,
-  ingestion throughput, and cold-start index load.
+- AI benchmark gauntlet full profile passed in
+  `benchmarks/results/latest/ai_benchmark_gauntlet_manifest.json` with measured
+  UltraSQL artifacts for exact top-k, HNSW recall/latency, hybrid search,
+  filtered vector search, RAG quality, memory per million vectors, ingestion
+  throughput, and cold-start index load.
 - local Firebolt Core smoke measured for aggregating-index, wide
   filter/projection, and HNSW vector shapes; sparse primary-index pruning
   remains open because Core EXPLAIN did not expose pruning evidence.
