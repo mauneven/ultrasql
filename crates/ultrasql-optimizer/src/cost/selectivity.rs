@@ -151,7 +151,7 @@ fn sel_inner(pred: &ScalarExpr, stats: &dyn StatsSource, table: &str) -> f64 {
             }
         }
 
-        // Unknown expression → PG-compatible default
+        // Unknown expression -> PG-style default
         _ => DEFAULT_UNKNOWN_SEL,
     }
 }

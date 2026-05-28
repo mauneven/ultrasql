@@ -241,7 +241,7 @@ async fn scalar_string_functions_return_postgres_shaped_values() {
 }
 
 #[tokio::test]
-async fn portable_scalar_compatibility_helpers_round_trip() {
+async fn portable_scalar_catalog_helpers_round_trip() {
     let running = start_sample_server("system_functions_test").await;
     let client = &running.client;
 
@@ -266,7 +266,7 @@ async fn portable_scalar_compatibility_helpers_round_trip() {
             &[],
         )
         .await
-        .expect("portable scalar compatibility helpers");
+        .expect("portable scalar catalog helpers");
 
     assert_eq!(row.get::<_, String>(0), "fallback");
     assert_eq!(row.get::<_, String>(1), "fallback");

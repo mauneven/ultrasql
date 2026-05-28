@@ -193,7 +193,7 @@ fn frontend_length_above_max_rejected() {
 /// Same scenario via the backend decoder. Defense in depth: even
 /// though backend frames originate from our own server, the codec
 /// must enforce the bound symmetrically because the decoder is
-/// also exercised by clients (psql, libpq-compatible drivers)
+/// also exercised by clients (psql, libpq-style drivers)
 /// against malicious servers.
 #[test]
 fn backend_length_above_max_rejected() {

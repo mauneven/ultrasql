@@ -85,7 +85,7 @@ forces every executor operator to be generic over column types, which
 hurts both compile times and code size.
 
 **Future evolution.** A future RFC may introduce a separate
-`ultrasql-arrow` crate exposing a zero-copy Arrow-compatible view of
+`ultrasql-arrow` crate exposing a zero-copy Arrow-layout view of
 batches for clients that speak Arrow Flight.
 
 ---

@@ -150,7 +150,7 @@ async fn plan_cache_ddl_invalidates_every_entry() {
 /// Cross-protocol cache sharing: a Simple Query primes the cache;
 /// an Extended Query `Parse` over the same SQL text hits the cache
 /// and does NOT insert a second entry. The headline win of the
-/// wave — wire-compatibility for the libpq world means an ORM that
+/// wave — wire behavior for the libpq world means an ORM that
 /// issues `Parse`+`Bind`+`Execute` for a SELECT a `psql` session
 /// previously typed pays no extra optimization cost.
 #[tokio::test]

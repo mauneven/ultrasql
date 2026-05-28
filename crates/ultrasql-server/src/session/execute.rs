@@ -897,7 +897,7 @@ where
                 .cloned()
                 .unwrap_or_else(|| "postgres".to_owned()),
             "max_identifier_length" => "63".to_owned(),
-            "server_version" => crate::POSTGRES_COMPAT_SERVER_VERSION.to_owned(),
+            "server_version" => crate::REPORTED_SERVER_VERSION.to_owned(),
             "server_version_num" => "140000".to_owned(),
             "search_path" => self
                 .session_settings

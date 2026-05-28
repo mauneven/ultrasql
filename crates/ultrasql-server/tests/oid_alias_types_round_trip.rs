@@ -1,4 +1,4 @@
-//! End-to-end `OID` / `REGCLASS` / `REGTYPE` / `PG_LSN` compatibility.
+//! End-to-end `OID` / `REGCLASS` / `REGTYPE` / `PG_LSN` behavior.
 
 mod support;
 

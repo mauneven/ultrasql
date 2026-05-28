@@ -67,7 +67,7 @@ pub mod workload;
 /// Numeric `server_version` exposed in startup
 /// `ParameterStatus` and `pg_settings`. Drivers parse this as a PostgreSQL
 /// feature baseline; UltraSQL's own product version remains `version()`.
-pub(crate) const POSTGRES_COMPAT_SERVER_VERSION: &str = "14.0";
+pub(crate) const REPORTED_SERVER_VERSION: &str = "14.0";
 
 use std::future::Future;
 use std::net::SocketAddr;
@@ -2140,7 +2140,7 @@ pub struct Server {
     pub auth: AuthConfig,
     /// Same-process role catalog backing role DDL and virtual auth views.
     pub role_catalog: Arc<auth::InMemoryAuthCatalog>,
-    /// Same-process privilege catalog backing GRANT/REVOKE compatibility.
+    /// Same-process privilege catalog backing GRANT/REVOKE behavior.
     pub privilege_catalog: Arc<auth::InMemoryPrivilegeCatalog>,
     /// Async pub-sub hub backing `LISTEN` / `NOTIFY` / `UNLISTEN`.
     ///

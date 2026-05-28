@@ -77,7 +77,7 @@ SELECT COUNT(*) FROM slt_pg_parser_types WHERE n IS NULL AND d IS NULL
 ----
 1
 
-# ultrasql:skip VARCHAR(n) overlength INSERT compatibility is not enforced on this path yet
+# ultrasql:skip VARCHAR(n) overlength INSERT support is not enforced on this path yet
 statement error
 INSERT INTO slt_pg_parser_types VALUES (4, 'ab', 'abcdef', 1.00, 1.0, true)
 

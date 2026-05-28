@@ -253,8 +253,8 @@ fn imported_sqllogictest_shards_stay_small_and_provenanced() {
 }
 
 #[test]
-fn postgres_compat_subset_preserves_public_provenance() {
-    let subset = repo_root().join("tests/slt/postgres_compat/regression_subset");
+fn sql_regression_subset_preserves_public_provenance() {
+    let subset = repo_root().join("tests/slt/sql_regression/regression_subset");
     for required in ["README.md", "IMPORT_MANIFEST.txt", "LICENSE.upstream"] {
         assert!(
             subset.join(required).is_file(),
@@ -279,15 +279,15 @@ fn postgres_compat_subset_preserves_public_provenance() {
     let shard = subset.join("select_basics.slt");
     let text = fs::read_to_string(&shard).expect("read engine-specific shard");
     assert!(
-        text.contains("# ultrasql:skip row-value IN compatibility not implemented yet"),
+        text.contains("# ultrasql:skip row-value IN support not implemented yet"),
         "{} must keep unsupported PostgreSQL regression coverage as explicit skip",
         shard.display()
     );
 }
 
 #[test]
-fn postgres_compat_parser_type_baseline_is_imported_and_provenanced() {
-    let subset = repo_root().join("tests/slt/postgres_compat/regression_subset");
+fn sql_regression_parser_type_baseline_is_imported_and_provenanced() {
+    let subset = repo_root().join("tests/slt/sql_regression/regression_subset");
     let manifest =
         fs::read_to_string(subset.join("IMPORT_MANIFEST.txt")).expect("read PostgreSQL manifest");
     let readme = fs::read_to_string(subset.join("README.md")).expect("read PostgreSQL README");
@@ -343,8 +343,8 @@ fn postgres_compat_parser_type_baseline_is_imported_and_provenanced() {
 }
 
 #[test]
-fn postgres_compat_index_constraint_operator_baseline_is_imported_and_provenanced() {
-    let subset = repo_root().join("tests/slt/postgres_compat/regression_subset");
+fn sql_regression_index_constraint_operator_baseline_is_imported_and_provenanced() {
+    let subset = repo_root().join("tests/slt/sql_regression/regression_subset");
     let manifest =
         fs::read_to_string(subset.join("IMPORT_MANIFEST.txt")).expect("read PostgreSQL manifest");
     let readme = fs::read_to_string(subset.join("README.md")).expect("read PostgreSQL README");
@@ -403,8 +403,8 @@ fn postgres_compat_index_constraint_operator_baseline_is_imported_and_provenance
 }
 
 #[test]
-fn postgres_compat_type_specific_baseline_is_imported_and_provenanced() {
-    let subset = repo_root().join("tests/slt/postgres_compat/regression_subset");
+fn sql_regression_type_specific_baseline_is_imported_and_provenanced() {
+    let subset = repo_root().join("tests/slt/sql_regression/regression_subset");
     let manifest =
         fs::read_to_string(subset.join("IMPORT_MANIFEST.txt")).expect("read PostgreSQL manifest");
     let readme = fs::read_to_string(subset.join("README.md")).expect("read PostgreSQL README");
@@ -558,7 +558,7 @@ fn differential_wrong_rows_fail() {
     let _ = fs::remove_dir_all(&temp_dir);
     assert!(
         !output.status.success(),
-        "runner unexpectedly accepted wrong reference rows\nstdout:\n{}\nstderr:\n{}",
+        "runner unexpectedly accepted wrong comparison rows\nstdout:\n{}\nstderr:\n{}",
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );

@@ -390,11 +390,11 @@ pub enum Value {
     Jsonb(String),
     /// Well-formed textual XML document payload.
     Xml(String),
-    /// pgvector-compatible finite single-precision vector.
+    /// SQL vector finite single-precision vector.
     Vector(Vec<f32>),
-    /// pgvector-compatible finite half-precision vector.
+    /// SQL vector finite half-precision vector.
     HalfVec(Vec<f32>),
-    /// pgvector-compatible sparse vector.
+    /// SQL vector sparse vector.
     SparseVec(SparseVector),
     /// Dense bit vector. Bits are packed most-significant-bit first
     /// inside each byte; `dims` names the logical bit count.

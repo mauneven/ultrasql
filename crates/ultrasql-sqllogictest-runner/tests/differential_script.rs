@@ -35,7 +35,7 @@ fn differential_script_skips_postgres_without_reference_url() {
 fn differential_script_rejects_non_portable_paths() {
     let output = Command::new(differential_script())
         .env("SLT_DIFF_ENGINES", "sqlite")
-        .env("SLT_DIFF_PATHS", "tests/slt/postgres_compat")
+        .env("SLT_DIFF_PATHS", "tests/slt/sql_regression")
         .env("ULTRASQL_SLT_RUNNER", "/bin/false")
         .output()
         .expect("run differential SLT script");
@@ -117,8 +117,8 @@ fn differential_script_does_not_leak_postgres_url_into_cli_engines() {
 }
 
 #[test]
-fn postgres_compat_script_exists_and_skips_without_reference_url() {
-    let output = Command::new(postgres_compat_script())
+fn sql_regression_script_exists_and_skips_without_reference_url() {
+    let output = Command::new(sql_regression_script())
         .env("ULTRASQL_SLT_RUNNER", "/bin/false")
         .env_remove("ULTRASQL_SLT_REFERENCE_URL")
         .env_remove("POSTGRES_URL")
@@ -133,15 +133,15 @@ fn postgres_compat_script_exists_and_skips_without_reference_url() {
     );
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stderr.contains("skip postgres_compat: set ULTRASQL_SLT_REFERENCE_URL or POSTGRES_URL"),
+        stderr.contains("skip sql_regression: set ULTRASQL_SLT_REFERENCE_URL or POSTGRES_URL"),
         "stderr:\n{stderr}"
     );
 }
 
 #[test]
-fn postgres_compat_script_rejects_non_compat_paths() {
-    let output = Command::new(postgres_compat_script())
-        .env("SLT_PG_COMPAT_PATHS", "tests/slt/portable/basic.slt")
+fn sql_regression_script_rejects_unscoped_paths() {
+    let output = Command::new(sql_regression_script())
+        .env("SLT_SQL_REGRESSION_PATHS", "tests/slt/portable/basic.slt")
         .env("ULTRASQL_SLT_REFERENCE_URL", "postgres://example")
         .env("ULTRASQL_SLT_RUNNER", "/bin/false")
         .output()
@@ -164,8 +164,8 @@ fn differential_script() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/slt/run_differential.sh")
 }
 
-fn postgres_compat_script() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/slt/run_postgres_compat.sh")
+fn sql_regression_script() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/slt/run_sql_regression.sh")
 }
 
 fn assert_engine_was_run_or_skipped(stderr: &str, engine: &str, skip_reason: &str) {

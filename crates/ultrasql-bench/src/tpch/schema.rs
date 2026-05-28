@@ -1,7 +1,7 @@
 //! TPC-H DDL constants for all eight standard tables.
 //!
 //! Each public constant holds the `CREATE TABLE` statement for one TPC-H
-//! table. The statements are compatible with both PostgreSQL and the target
+//! table. The statements run on both PostgreSQL and the target
 //! UltraSQL surface. Call [`ddl_for_engine`] to obtain the full ordered
 //! schema for a given engine.
 

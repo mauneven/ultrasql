@@ -41,7 +41,7 @@ third_party/sqllogictest/
   filters/unsupported.txt
 tests/slt/
   portable/
-  postgres_compat/
+  sql_regression/
   ultrasql_specific/
 crates/ultrasql-sqllogictest-runner/
   Cargo.toml
@@ -150,11 +150,11 @@ Run the public regression-derived subset with:
 
 ```sh
 POSTGRES_URL="host=127.0.0.1 port=5432 user=postgres dbname=ultrasql_slt" \
-tests/slt/run_postgres_compat.sh
+tests/slt/run_sql_regression.sh
 ```
 
 The first curated shard lives under
-`tests/slt/postgres_compat/regression_subset/`. It pins PostgreSQL commit
+`tests/slt/sql_regression/regression_subset/`. It pins PostgreSQL commit
 `ddd12d1a5c4d980c5f31dc7d096012547b724e55`, records
 `src/test/regress/sql/select.sql`, `char.sql`, `varchar.sql`, `numeric.sql`,
 `text.sql`, `date.sql`, `time.sql`, `timestamp.sql`, `timetz.sql`,

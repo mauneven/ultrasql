@@ -1,4 +1,4 @@
-//! SQLLogicTest-compatible runner for UltraSQL.
+//! SQLLogicTest runner for UltraSQL.
 //!
 //! The first implementation is deliberately wire-first: it connects through
 //! `tokio-postgres` so every test exercises the same PostgreSQL protocol path
@@ -486,7 +486,7 @@ impl CliReference {
         let command = self
             .engine
             .command()
-            .expect("CLI reference engines have commands");
+            .expect("CLI comparison engines have commands");
         let output = Command::new(command)
             .arg("-batch")
             .arg("-bail")
@@ -535,7 +535,7 @@ async fn connect_reference_targets(cli: &Cli) -> Result<Vec<ReferenceTarget>> {
         match engine {
             ReferenceEngine::Postgres => {
                 if cli.reference_db.is_some() {
-                    bail!("--reference-db is only valid with duckdb or sqlite reference engines");
+                    bail!("--reference-db is only valid with duckdb or sqlite comparison engines");
                 }
                 let reference_url = cli.reference_url.as_deref().ok_or_else(|| {
                     anyhow::anyhow!("--reference-engine postgres requires --reference-url")
@@ -750,7 +750,7 @@ fn benchmark_cli_engine(
 ) -> Result<EngineBenchmark> {
     let command = engine
         .command()
-        .expect("CLI reference engines have commands");
+        .expect("CLI comparison engines have commands");
     let db_path = temp_reference_db_path(engine)?;
     let mut script = String::new();
     let mut statements = 0_u64;
@@ -966,7 +966,7 @@ fn write_benchmark_artifacts(
     writeln!(&mut markdown)?;
     writeln!(
         &mut markdown,
-        "This is compatibility-suite replay timing, not TPC-H/ClickBench certification."
+        "This is SQLLogicTest replay replay timing, not TPC-H/ClickBench certification."
     )?;
     std::fs::write(markdown_path, markdown)?;
     Ok(())

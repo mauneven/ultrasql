@@ -2,7 +2,7 @@
 //!
 //! Connects to an `ultrasqld` instance over the PostgreSQL wire protocol
 //! and provides an interactive REPL plus a script-execution mode. Backslash
-//! commands are compatible with a useful subset of psql.
+//! commands cover a useful subset of psql.
 //!
 //! # Connection precedence
 //!
@@ -31,7 +31,7 @@ use ultrasql_server::{Server, ValidationReport};
 // ---------------------------------------------------------------------------
 
 /// UltraSQL command-line client — connects to ultrasqld or any PostgreSQL
-/// compatible server.
+/// UltraSQL server.
 #[derive(Debug, Parser)]
 #[command(name = "ultrasql", about, version)]
 struct Cli {

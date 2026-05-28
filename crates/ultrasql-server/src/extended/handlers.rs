@@ -397,7 +397,7 @@ pub fn handle_bind(
 ///
 /// 1. The client's declared OID from `Parse` (`param_type_oids[i]`).
 /// 2. A type inferred from the plan via `infer_parameter_types`.
-/// 3. `text` (OID `25`) as the libpq-compatible fallback.
+/// 3. `text` (OID `25`) as the libpq-style fallback.
 ///
 /// Steps 1 and 2 matter for drivers like `tokio-postgres` that refuse
 /// to send a binary-format parameter unless the server's announced

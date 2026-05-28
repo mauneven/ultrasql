@@ -1,4 +1,4 @@
-//! End-to-end `TIMETZ` plus ISO date/time display/coercion compatibility.
+//! End-to-end `TIMETZ` plus ISO date/time display/coercion behavior.
 
 mod support;
 

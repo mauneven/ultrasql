@@ -1841,7 +1841,7 @@ fn rows_pg_settings(ctx: &LowerCtx<'_>) -> Vec<Vec<Value>> {
     vec![
         vec![
             v_text("server_version"),
-            v_text(crate::POSTGRES_COMPAT_SERVER_VERSION),
+            v_text(crate::REPORTED_SERVER_VERSION),
             Value::Null,
             v_text("Preset Options"),
             v_text("Wire version reported to drivers."),

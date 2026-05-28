@@ -65,7 +65,7 @@ pub enum ScalarExpr {
     /// `BindParameter` rewrite assigns one; we keep the field explicit
     /// so the variant has the same shape as its peers.
     Parameter {
-        /// 1-based parameter index, copied from the parser.
+        /// 1-based parameter index carried from the parser.
         index: u32,
         /// Placeholder type — `DataType::Null` until bound.
         data_type: DataType,

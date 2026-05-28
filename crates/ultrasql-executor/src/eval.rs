@@ -247,7 +247,7 @@ pub(crate) fn eval_expr(
 /// - `extract(unit, date)` — date-part extraction. Returns `i64`.
 /// - `lower(text)` / `upper(text)` — case folding for expression indexes
 ///   and simple scalar projections.
-/// - `pg_get_userbyid(oid)` — compatibility helper for psql catalog meta SQL.
+/// - `pg_get_userbyid(oid)` — catalog helper for psql meta SQL.
 /// - `substring(text, from[, for])` — 1-based string slicing.
 ///
 /// Unknown function names return [`EvalError::Unsupported`] so the

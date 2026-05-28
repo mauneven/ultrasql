@@ -357,10 +357,10 @@ async fn role_inheritance_and_set_role_gate_privileges() {
 }
 
 #[tokio::test]
-async fn set_role_to_uncataloged_session_user_is_self_reset_compatible() {
-    let running = start_sample_server("set_role_self_compatibility_test").await;
+async fn set_role_to_uncataloged_session_user_resets_to_self() {
+    let running = start_sample_server("set_role_self_reset_test").await;
     let (client, connection) =
-        connect_as(running.bound, "driver_cert", "set_role_self_compatibility").await;
+        connect_as(running.bound, "driver_cert", "set_role_self_reset").await;
 
     client
         .batch_execute("SET ROLE 'driver_cert'")

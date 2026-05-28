@@ -2,7 +2,7 @@
 //!
 //! PostgreSQL stores ACL arrays on object catalog rows. UltraSQL does
 //! not yet persist those ACL attributes, so this module provides the
-//! same-process catalog used by `GRANT` / `REVOKE` and compatibility
+//! same-process catalog used by `GRANT` / `REVOKE` and certification
 //! helpers such as `has_table_privilege`.
 
 use std::collections::BTreeMap;

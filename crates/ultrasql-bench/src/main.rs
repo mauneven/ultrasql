@@ -269,7 +269,7 @@ enum TpcbEngine {
     /// Spawn and benchmark an in-process UltraSQL server unless `--dsn`
     /// is supplied.
     Ultrasql,
-    /// Benchmark an existing PostgreSQL 17-compatible server.
+    /// Benchmark an existing PostgreSQL 17 server.
     Postgres17,
 }
 
@@ -279,7 +279,7 @@ enum TpccEngine {
     /// Spawn and benchmark an in-process UltraSQL server unless `--dsn`
     /// is supplied.
     Ultrasql,
-    /// Benchmark an existing PostgreSQL 17-compatible server.
+    /// Benchmark an existing PostgreSQL 17 server.
     Postgres17,
 }
 
@@ -289,7 +289,7 @@ enum SysbenchEngine {
     /// Spawn and benchmark an in-process UltraSQL server unless `--dsn`
     /// is supplied.
     Ultrasql,
-    /// Benchmark an existing PostgreSQL 17-compatible server.
+    /// Benchmark an existing PostgreSQL 17 server.
     Postgres17,
 }
 

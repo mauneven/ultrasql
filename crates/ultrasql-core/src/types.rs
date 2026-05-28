@@ -15,7 +15,7 @@ use std::sync::Arc;
 use crate::error::{Error, Result};
 use crate::id::Oid;
 
-/// Maximum number of `f32` elements in a pgvector-compatible `vector`
+/// Maximum number of `f32` elements in a SQL vector `vector`
 /// value.
 pub const MAX_VECTOR_DIMS: u32 = 16_000;
 
@@ -254,7 +254,7 @@ pub enum DataType {
     /// Textual XML. Values preserve the accepted input spelling.
     Xml,
 
-    /// pgvector-compatible single-precision embedding vector.
+    /// SQL vector single-precision embedding vector.
     ///
     /// `None` represents the unconstrained `vector` type. `Some(n)`
     /// represents `vector(n)` and requires values to have exactly `n`
@@ -265,7 +265,7 @@ pub enum DataType {
         dims: Option<u32>,
     },
 
-    /// pgvector-compatible half-precision embedding vector.
+    /// SQL vector half-precision embedding vector.
     ///
     /// Runtime values are kept as finite `f32` values at expression
     /// boundaries; storage can choose a narrower binary layout while the
@@ -276,7 +276,7 @@ pub enum DataType {
         dims: Option<u32>,
     },
 
-    /// pgvector-compatible sparse embedding vector.
+    /// SQL vector sparse embedding vector.
     SparseVec {
         /// Fixed dimension for `sparsevec(n)`, or `None` for unconstrained
         /// `sparsevec`.

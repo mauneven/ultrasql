@@ -33,7 +33,7 @@ use ultrasql_wal::applier::dispatch_record;
 // Shared test infrastructure
 // ---------------------------------------------------------------------------
 
-/// In-memory page loader (copied from heap unit tests).
+/// In-memory page loader shared with heap unit-test shape.
 #[allow(unreachable_pub)]
 mod loader {
     use std::collections::HashMap;

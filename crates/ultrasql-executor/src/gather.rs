@@ -23,7 +23,7 @@ const BATCH_TARGET_ROWS: usize = 4096;
 /// Round-robin fan-in for unordered parallel worker streams.
 ///
 /// Each child must emit the same schema. `Gather` returns whole batches
-/// without copying their columns, rotating across live children so one
+/// without duplicating columns, rotating across live children so one
 /// worker cannot monopolize the coordinator while other workers are ready.
 #[derive(Debug)]
 pub struct Gather {

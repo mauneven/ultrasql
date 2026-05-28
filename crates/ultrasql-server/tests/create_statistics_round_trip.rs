@@ -1,7 +1,7 @@
 //! `CREATE STATISTICS` Simple-Query handler test (§3.3).
 //!
 //! Accepts the canonical PostgreSQL `CREATE STATISTICS name ON c1, c2
-//! FROM table` form and exposes a `pg_statistic_ext` compatibility row.
+//! FROM table` form and exposes a `pg_statistic_ext` catalog row.
 
 use std::net::SocketAddr;
 use std::sync::Arc;

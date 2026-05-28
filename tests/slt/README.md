@@ -6,10 +6,10 @@ This tree contains SQLLogicTest-style files used by
 Buckets:
 
 - `portable/`: UltraSQL-authored or audited portable SQL subset tests.
-- `postgres_compat/`: public regression-derived tests that are intentionally
+- `sql_regression/`: public regression-derived tests that are intentionally
   engine-specific.
 - `ultrasql_specific/`: tests for UltraSQL behavior exposed through SQL, not a
-  replacement for storage/WAL/MVCC unit and integration tests.
+  substitute for storage/WAL/MVCC unit and integration tests.
 
 External imports must go through `third_party/sqllogictest/import.py` and keep
 license/provenance records. Imported shards stay small and filtered; expand the
@@ -26,7 +26,7 @@ SLT_BENCH_RUNS=25 benchmarks/slt_speed_compare.sh
 
 The benchmark artifact compares UltraSQL with installed SQLite/DuckDB
 references. It is a smoke signal for portable SQL replay speed, not a
-replacement for TPC-H, ClickBench, or UltraSQL-specific correctness tests.
+substitute for TPC-H, ClickBench, or UltraSQL-specific correctness tests.
 
 Run portable differential correctness against measured engines:
 
@@ -46,10 +46,10 @@ Run the public regression-derived subset against its matching reference:
 
 ```sh
 POSTGRES_URL="host=127.0.0.1 port=5432 user=postgres dbname=ultrasql_slt" \
-tests/slt/run_postgres_compat.sh
+tests/slt/run_sql_regression.sh
 ```
 
-`postgres_compat/regression_subset/` pins PostgreSQL `REL_17_STABLE` commit
+`sql_regression/regression_subset/` pins PostgreSQL `REL_17_STABLE` commit
 `ddd12d1a5c4d980c5f31dc7d096012547b724e55` and preserves the upstream license
 beside the curated SQLLogicTest translations. Current reviewed sources are
 PostgreSQL `select.sql`, `char.sql`, `varchar.sql`, `numeric.sql`,

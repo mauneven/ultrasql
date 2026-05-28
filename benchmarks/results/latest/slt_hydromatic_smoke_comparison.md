@@ -11,4 +11,4 @@
 | `sqlite` | true | 19 | 28 | 28 | 3 | 9.435 | 336.947 |
 | `duckdb` | true | 19 | 28 | 28 | 3 | 27.965 | 998.748 |
 
-This is compatibility-suite replay timing, not TPC-H/ClickBench certification.
+This is SQLLogicTest replay replay timing, not TPC-H/ClickBench certification.

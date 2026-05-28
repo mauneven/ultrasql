@@ -17,7 +17,7 @@
 //!   `actual rows = N (took Xms)` annotation is overlaid on the root
 //!   node line. Per-operator timing is out of scope until the
 //!   executor grows a generic `OperatorStats` channel; the root-level
-//!   number alone is sufficient for ORM compatibility (psycopg /
+//!   number alone is sufficient for ORM behavior (psycopg /
 //!   tokio-postgres surface the rows just fine).
 
 use std::sync::Arc;

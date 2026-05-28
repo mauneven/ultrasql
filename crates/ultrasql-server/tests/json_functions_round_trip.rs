@@ -1,4 +1,4 @@
-//! Wire-level regression tests for SQL/JSON scalar compatibility.
+//! Wire-level regression tests for SQL/JSON scalar behavior.
 
 mod support;
 

@@ -8,7 +8,7 @@ This document specifies the storage, WAL, MVCC, delete, vacuum, and rebuild
 contracts for a future `CREATE INDEX ... USING hnsw` vector access method.
 It is the required design checkpoint before adding code.
 
-The first implementation targets `VECTOR(n)` columns and pgvector-compatible
+The first implementation targets `VECTOR(n)` columns and SQL vector
 distance operators:
 
 - L2: `<->`

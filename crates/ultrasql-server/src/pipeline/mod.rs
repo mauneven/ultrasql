@@ -219,7 +219,7 @@ pub struct LowerCtx<'a> {
     pub sequences: Arc<dashmap::DashMap<String, Arc<ultrasql_storage::sequence::Sequence>>>,
     /// Runtime role catalog backing virtual auth views.
     pub role_catalog: Arc<crate::auth::InMemoryAuthCatalog>,
-    /// Runtime privilege catalog backing GRANT/REVOKE compatibility.
+    /// Runtime privilege catalog backing GRANT/REVOKE behavior.
     pub privilege_catalog: Arc<crate::auth::InMemoryPrivilegeCatalog>,
     /// Effective role for `current_user` and privilege checks.
     pub current_user: String,

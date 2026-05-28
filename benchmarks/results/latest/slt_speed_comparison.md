@@ -10,4 +10,4 @@
 | `ultrasql` | true | 29 | 19 | 95 | 2 | 15.586 | 164.066 |
 | `duckdb` | true | 29 | 19 | 95 | 2 | 38.818 | 408.615 |
 
-This is compatibility-suite replay timing, not TPC-H/ClickBench certification.
+This is SQLLogicTest replay replay timing, not TPC-H/ClickBench certification.

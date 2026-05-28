@@ -1,4 +1,4 @@
-//! End-to-end `CHAR(n)` / `bpchar` padding and comparison compatibility.
+//! End-to-end `CHAR(n)` / `bpchar` padding and comparison behavior.
 
 mod support;
 

@@ -46,7 +46,7 @@ CI changes:
 Gate policy: fail on known vulnerabilities and yanked crates. Allow the
 current unmaintained warning for transitive `paste` while it is pulled
 by the latest `parquet` release; keep it visible in audit output and
-re-check when Arrow/Parquet publishes a replacement path.
+re-check when Arrow/Parquet publishes an alternate path.
 
 ---
 
@@ -187,7 +187,7 @@ exercise the path; failure mode is "no UB regression").
 
 **Affected:** `crates/ultrasql-server/src/lib.rs` `Session::startup`
 
-**Exploitation:** A libpq-compatible client whose advertised version is
+**Exploitation:** A libpq-style client whose advertised version is
 not `(3, 0)` (e.g. a future PG client speaking a hypothetical v4
 protocol) previously saw the socket close with no diagnostic. The
 client reports a confusing "connection closed before handshake"
@@ -418,5 +418,5 @@ None. Three new public symbols (`MAX_PARSE_DEPTH`,
    work in D-1 has landed.
 3. Track upstream `parquet` releases for removal of transitive
    `paste 1.0.15`; tighten the audit gate to `--deny warnings` once
-   the latest compatible Parquet stack no longer emits
+   the latest supported Parquet stack no longer emits
    `RUSTSEC-2024-0436`.

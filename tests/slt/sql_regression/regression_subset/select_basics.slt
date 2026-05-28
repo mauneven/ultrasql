@@ -1,4 +1,4 @@
-# PostgreSQL regression-derived SQLLogicTest compatibility shard.
+# Public regression-derived SQLLogicTest coverage shard.
 # Source: PostgreSQL src/test/regress/sql/select.sql at commit ddd12d1a5c4d980c5f31dc7d096012547b724e55.
 # License/provenance live beside this file in IMPORT_MANIFEST.txt and LICENSE.upstream.
 
@@ -28,7 +28,7 @@ SELECT id, score FROM slt_pg_select WHERE score IS NOT NULL ORDER BY score DESC,
 2
 3
 
-# ultrasql:skip row-value IN compatibility not implemented yet
+# ultrasql:skip row-value IN support not implemented yet
 query I rowsort
 SELECT id FROM slt_pg_select WHERE (id, score) IN ((1, 42), (3, 10), (5, 0))
 ----

@@ -1,4 +1,4 @@
-//! PostgreSQL wire-compatibility edge cases that need raw protocol control.
+//! Wire protocol edge cases that need raw protocol control.
 
 use std::sync::Arc;
 use std::time::Duration;

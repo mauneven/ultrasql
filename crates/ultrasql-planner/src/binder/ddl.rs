@@ -210,7 +210,7 @@ pub(super) fn bind_create_table(
         let mut bound = bind_expr(expr, &Schema::empty(), catalog, &mut scope)?;
         if !is_default_safe(&bound) {
             return Err(PlanError::NotSupported(
-                "CREATE TABLE: DEFAULT may not reference rows, parameters, or subqueries",
+                "CREATE TABLE: DEFAULT may not refer to rows, parameters, or subqueries",
             ));
         }
         coerce_default_expr_to_type(&mut bound, &columns.field_at(idx).data_type);

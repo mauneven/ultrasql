@@ -1,4 +1,4 @@
-//! `pg_hba.conf`-compatible host-based access control.
+//! `pg_hba.conf`-style host-based access control.
 //!
 //! Parses a subset of PostgreSQL's `pg_hba.conf` syntax and evaluates
 //! rules against incoming connection attributes.

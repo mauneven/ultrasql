@@ -162,7 +162,7 @@ in-memory sample database pre-populated with:
     users(id INT, name TEXT, score DOUBLE PRECISION)
     -- 3 rows: Ada/Grace/Linus
 
-Connect with any libpq-compatible client. Example session:
+Connect with any libpq-style client. Example session:
 
     psql -h 127.0.0.1 -p 5433 -d ultrasql -c 'SELECT id FROM users;'
 

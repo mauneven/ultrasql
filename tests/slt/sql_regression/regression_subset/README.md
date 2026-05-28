@@ -45,5 +45,5 @@ Run with PostgreSQL reference:
 
 ```sh
 POSTGRES_URL="host=127.0.0.1 port=5432 user=postgres dbname=ultrasql_slt" \
-tests/slt/run_postgres_compat.sh
+tests/slt/run_sql_regression.sh
 ```

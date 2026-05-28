@@ -195,7 +195,7 @@ where
         // unpredictably if any standard one is missing. The values
         // chosen are PostgreSQL's defaults.
         let params: [(&str, &str); 13] = [
-            ("server_version", crate::POSTGRES_COMPAT_SERVER_VERSION),
+            ("server_version", crate::REPORTED_SERVER_VERSION),
             ("server_encoding", "UTF8"),
             ("client_encoding", "UTF8"),
             ("DateStyle", "ISO, MDY"),
