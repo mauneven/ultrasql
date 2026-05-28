@@ -3243,6 +3243,7 @@ impl Server {
             heap: Arc::clone(&self.heap),
             vm: Arc::clone(&self.vm),
             snapshot: txn.snapshot.clone(),
+            isolation: txn.isolation,
             oracle: Arc::clone(&self.txn_manager),
             xid: txn.current_xid(),
             command_id: txn.current_command,
@@ -6242,6 +6243,7 @@ fn run_plan_in_txn(
         heap,
         vm,
         snapshot: txn.snapshot.clone(),
+        isolation: txn.isolation,
         oracle,
         // Use the *current* effective xid so writes performed inside an
         // active SAVEPOINT carry the subxact xid in their tuple header

@@ -541,6 +541,7 @@ where
                     heap: Arc::clone(&self.state.heap),
                     vm: Arc::clone(&self.state.vm),
                     snapshot: txn.snapshot.clone(),
+                    isolation: txn.isolation,
                     oracle: Arc::clone(&self.state.txn_manager),
                     xid: txn.current_xid(),
                     command_id: txn.current_command,
@@ -658,6 +659,7 @@ where
                     heap: Arc::clone(&self.state.heap),
                     vm: Arc::clone(&self.state.vm),
                     snapshot: txn.snapshot.clone(),
+                    isolation: txn.isolation,
                     oracle: Arc::clone(&self.state.txn_manager),
                     // Stamp writes with the *current* effective xid so
                     // SAVEPOINT-scoped INSERT/UPDATE/DELETE carry the

@@ -503,6 +503,7 @@ impl IndexFixture {
             heap: StdArc::clone(&self.heap),
             vm: StdArc::clone(&self.vm),
             snapshot: self.reader_snapshot.clone(),
+            isolation: ultrasql_txn::IsolationLevel::ReadCommitted,
             oracle: StdArc::clone(&self.txn_manager),
             xid: self.loader_xid,
             command_id: CommandId::FIRST,

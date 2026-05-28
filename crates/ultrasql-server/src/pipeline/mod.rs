@@ -68,7 +68,7 @@ use ultrasql_executor::{Operator, RowCodec};
 use ultrasql_planner::{BinaryOp, LogicalJoinCondition, LogicalJoinType};
 use ultrasql_storage::heap::HeapAccess;
 use ultrasql_storage::vm::VisibilityMap;
-use ultrasql_txn::TransactionManager;
+use ultrasql_txn::{IsolationLevel, TransactionManager};
 use ultrasql_vec::Batch;
 #[cfg(test)]
 use ultrasql_vec::column::Column;
@@ -253,6 +253,8 @@ pub struct LowerCtx<'a> {
     pub vm: Arc<VisibilityMap>,
     /// MVCC snapshot taken at statement start.
     pub snapshot: Snapshot,
+    /// Transaction isolation for the statement being lowered.
+    pub isolation: IsolationLevel,
     /// Transaction manager (also serves as `XidStatusOracle` for
     /// `SeqScan`'s visibility check).
     pub oracle: Arc<TransactionManager>,

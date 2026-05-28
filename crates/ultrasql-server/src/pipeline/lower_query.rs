@@ -1174,6 +1174,7 @@ pub(super) fn lower_cte(
         heap: Arc::clone(&ctx.heap),
         vm: Arc::clone(&ctx.vm),
         snapshot: ctx.snapshot.clone(),
+        isolation: ctx.isolation,
         oracle: Arc::clone(&ctx.oracle),
         xid: ctx.xid,
         command_id: ctx.command_id,

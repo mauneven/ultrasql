@@ -39,7 +39,7 @@ use std::sync::Arc;
 use ultrasql_core::{CommandId, DataType, Field, RelationId, Schema, TupleId, Xid};
 use ultrasql_mvcc::Snapshot;
 use ultrasql_storage::PageLoader;
-use ultrasql_storage::heap::HeapAccess;
+use ultrasql_storage::heap::{HeapAccess, HeapError};
 use ultrasql_storage::vm::VisibilityMap;
 use ultrasql_txn::TransactionManager;
 use ultrasql_vec::Batch;
@@ -108,6 +108,8 @@ pub struct FusedUpdateInt32Add<L: PageLoader> {
     xid: Xid,
     command_id: CommandId,
     target_tids: Option<Vec<TupleId>>,
+    target_tid_lock: Option<Arc<dyn Fn(TupleId) -> Result<bool, String> + Send + Sync>>,
+    refresh_snapshot_after_lock: bool,
     vm: Option<Arc<VisibilityMap>>,
     schema: Schema,
     done: bool,
@@ -156,6 +158,8 @@ impl<L: PageLoader> FusedUpdateInt32Add<L> {
             xid,
             command_id,
             target_tids: None,
+            target_tid_lock: None,
+            refresh_snapshot_after_lock: false,
             vm: None,
             schema,
             done: false,
@@ -167,6 +171,23 @@ impl<L: PageLoader> FusedUpdateInt32Add<L> {
     #[must_use]
     pub fn with_target_tids(mut self, target_tids: Vec<TupleId>) -> Self {
         self.target_tids = Some(target_tids);
+        self
+    }
+
+    /// Acquire row locks before indexed point updates.
+    ///
+    /// The callback returns `true` when it had to wait. When
+    /// `refresh_snapshot_after_lock` is true, waits install a fresh
+    /// statement snapshot before the heap write.
+    /// That is the READ COMMITTED update path: a waiter must operate on
+    /// the latest committed row after the prior writer releases the row.
+    #[must_use]
+    pub fn with_target_tid_lock<F>(mut self, lock: F, refresh_snapshot_after_lock: bool) -> Self
+    where
+        F: Fn(TupleId) -> Result<bool, String> + Send + Sync + 'static,
+    {
+        self.target_tid_lock = Some(Arc::new(lock));
+        self.refresh_snapshot_after_lock = refresh_snapshot_after_lock;
         self
     }
 
@@ -218,22 +239,53 @@ impl<L: PageLoader + Send + Sync + std::fmt::Debug + 'static> Operator for Fused
         let wal_sink: Option<&dyn ultrasql_storage::WalSink> = wal_sink_arc.as_deref();
         let n = if let Some(target_tids) = &self.target_tids {
             let mut total = 0_usize;
+            let mut update_snapshot = self.snapshot.clone();
             for tid in target_tids {
-                total += self
-                    .heap
-                    .update_int32_pair_tid_inplace_undo(
-                        *tid,
-                        &self.snapshot,
-                        &*self.oracle,
-                        predicate_fn,
-                        target_col,
-                        delta,
-                        self.xid,
-                        self.command_id,
-                        wal_sink,
-                        self.vm.as_deref(),
-                    )
-                    .map_err(|e| ExecError::TypeMismatch(e.to_string()))?;
+                let mut refreshed_after_lock = false;
+                if let Some(lock) = &self.target_tid_lock {
+                    let waited = lock(*tid).map_err(ExecError::TypeMismatch)?;
+                    if waited && self.refresh_snapshot_after_lock {
+                        update_snapshot = self.oracle.statement_snapshot(self.xid, self.command_id);
+                        refreshed_after_lock = true;
+                    }
+                }
+                let update_result = self.heap.update_int32_pair_tid_inplace_undo(
+                    *tid,
+                    &update_snapshot,
+                    &*self.oracle,
+                    predicate_fn,
+                    target_col,
+                    delta,
+                    self.xid,
+                    self.command_id,
+                    wal_sink,
+                    self.vm.as_deref(),
+                );
+                total += match update_result {
+                    Ok(updated) => updated,
+                    Err(HeapError::WriteConflict(_))
+                        if self.target_tid_lock.is_some()
+                            && self.refresh_snapshot_after_lock
+                            && !refreshed_after_lock =>
+                    {
+                        update_snapshot = self.oracle.statement_snapshot(self.xid, self.command_id);
+                        self.heap
+                            .update_int32_pair_tid_inplace_undo(
+                                *tid,
+                                &update_snapshot,
+                                &*self.oracle,
+                                predicate_fn,
+                                target_col,
+                                delta,
+                                self.xid,
+                                self.command_id,
+                                wal_sink,
+                                self.vm.as_deref(),
+                            )
+                            .map_err(|e| ExecError::TypeMismatch(e.to_string()))?
+                    }
+                    Err(e) => return Err(ExecError::TypeMismatch(e.to_string())),
+                };
             }
             total
         } else {

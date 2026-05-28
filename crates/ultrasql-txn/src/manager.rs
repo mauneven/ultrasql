@@ -341,6 +341,19 @@ impl TransactionManager {
         }
     }
 
+    /// Build a fresh statement snapshot for `current_xid` at
+    /// `current_command`.
+    ///
+    /// Callers use this after blocking on a row lock in READ COMMITTED
+    /// mode. The lock wait may let an earlier writer commit after the
+    /// statement began; the update then needs to re-check the latest
+    /// committed row instead of treating the stale snapshot's `xip`
+    /// entry as a permanent write conflict.
+    #[must_use]
+    pub fn statement_snapshot(&self, current_xid: Xid, current_command: CommandId) -> Snapshot {
+        self.build_snapshot(current_xid, current_command)
+    }
+
     /// Commit `txn`. Marks the XID `Committed` in the CLOG.
     ///
     /// For [`IsolationLevel::Serializable`] transactions with an installed

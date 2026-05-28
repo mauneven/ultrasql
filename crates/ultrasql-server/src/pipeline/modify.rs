@@ -1699,7 +1699,13 @@ pub(super) fn try_build_fused_update(
             ctx.command_id,
         );
         let op = if let Some(target_tids) = target_tids {
-            op.with_target_tids(target_tids)
+            let refresh_after_lock = ctx.isolation == ultrasql_txn::IsolationLevel::ReadCommitted;
+            let lock_manager = Arc::clone(&ctx.oracle.lock_manager);
+            let xid = ctx.xid;
+            op.with_target_tids(target_tids).with_target_tid_lock(
+                move |tid| acquire_indexed_update_row_lock(&lock_manager, xid, tid),
+                refresh_after_lock,
+            )
         } else {
             op
         }
@@ -1773,6 +1779,33 @@ fn update_requires_index_maintenance(
     }
 
     false
+}
+
+fn acquire_indexed_update_row_lock(
+    lock_manager: &ultrasql_txn::LockManager,
+    xid: Xid,
+    tid: TupleId,
+) -> Result<bool, String> {
+    let req = ultrasql_txn::LockRequest {
+        xid,
+        tag: ultrasql_txn::LockTag::Tuple(tid),
+        mode: ultrasql_txn::LockMode::Exclusive,
+    };
+    match lock_manager.try_acquire(req) {
+        Ok(true) => return Ok(false),
+        Ok(false) => {}
+        Err(e) => return Err(e.to_string()),
+    }
+    let acquire = || lock_manager.acquire(req).map_err(|e| e.to_string());
+    if matches!(
+        tokio::runtime::Handle::try_current().map(|handle| handle.runtime_flavor()),
+        Ok(tokio::runtime::RuntimeFlavor::MultiThread)
+    ) {
+        tokio::task::block_in_place(acquire)?;
+    } else {
+        acquire()?;
+    }
+    Ok(true)
 }
 
 pub(super) fn lower_real_update(
