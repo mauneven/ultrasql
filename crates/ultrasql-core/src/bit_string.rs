@@ -352,6 +352,7 @@ fn mask_unused_bits(len: u32, bytes: &mut [u8]) {
 #[cfg(test)]
 mod tests {
     use super::BitString;
+    use crate::DataType;
 
     #[test]
     fn bit_string_parse_display_and_ops() {
@@ -409,5 +410,48 @@ mod tests {
             BitString::from_i64(12, -44).unwrap().to_string(),
             "111111010100"
         );
+    }
+
+    #[test]
+    fn bit_string_binary_masks_padding_and_type_checks() {
+        let bits = BitString::new(5, vec![0b1010_1111]).unwrap();
+        assert_eq!(bits.to_string(), "10101");
+        assert_eq!(bits.bytes(), &[0b1010_1000]);
+        assert_eq!(bits.len(), 5);
+        assert!(!bits.is_empty());
+        assert_eq!(bits.bit(5), None);
+        assert_eq!(bits.set_bit(5, true), None);
+
+        let encoded = bits.to_pg_binary();
+        assert_eq!(BitString::from_pg_binary(&encoded), Some(bits.clone()));
+        assert_eq!(BitString::from_pg_binary(&encoded[..3]), None);
+
+        let mut negative_len = (-1_i32).to_be_bytes().to_vec();
+        negative_len.push(0);
+        assert_eq!(BitString::from_pg_binary(&negative_len), None);
+
+        let mut wrong_payload_len = encoded;
+        wrong_payload_len.push(0);
+        assert_eq!(BitString::from_pg_binary(&wrong_payload_len), None);
+        assert_eq!(BitString::new(9, vec![0]), None);
+        assert_eq!(BitString::parse("10x"), None);
+        assert!(BitString::parse("").unwrap().is_empty());
+
+        assert!(bits.matches_type(&DataType::Bit { len: Some(5) }));
+        assert!(!bits.matches_type(&DataType::Bit { len: Some(4) }));
+        assert!(
+            bits.coerce_to(&DataType::Bit { len: None }, false)
+                .is_some()
+        );
+        assert!(
+            bits.coerce_to(&DataType::VarBit { max_len: Some(4) }, false)
+                .is_none()
+        );
+        assert!(
+            bits.coerce_to(&DataType::VarBit { max_len: None }, false)
+                .is_some()
+        );
+        assert!(bits.coerce_to(&DataType::Int32, false).is_none());
+        assert!(bits.bit_and(&BitString::parse("1010").unwrap()).is_none());
     }
 }

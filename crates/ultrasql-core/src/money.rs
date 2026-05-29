@@ -118,3 +118,38 @@ pub fn decode_pg_money_binary(payload: &[u8]) -> Result<Value, MoneyError> {
         .map_err(|_| MoneyError::new("money binary payload must be 8 bytes"))?;
     Ok(Value::Money(i64::from_be_bytes(raw)))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_money_text_accepts_common_signed_currency_forms() {
+        assert_eq!(parse_money_text(" $1,234.565 "), Ok(Value::Money(123_457)));
+        assert_eq!(parse_money_text("-$1.235"), Ok(Value::Money(-124)));
+        assert_eq!(parse_money_text("$-0.015"), Ok(Value::Money(-2)));
+        assert_eq!(parse_money_text("(+$2.00)"), Ok(Value::Money(-200)));
+        assert_eq!(
+            parse_money_text(""),
+            Err(MoneyError::new("empty money literal"))
+        );
+        assert!(parse_money_text("$").is_err());
+    }
+
+    #[test]
+    fn format_money_text_groups_negative_and_large_values() {
+        assert_eq!(format_money_text(0), "$0.00");
+        assert_eq!(format_money_text(123_456_789), "$1,234,567.89");
+        assert_eq!(format_money_text(-123_456_789), "-$1,234,567.89");
+    }
+
+    #[test]
+    fn pg_money_binary_round_trips_and_rejects_bad_width() {
+        let encoded = encode_pg_money_binary(-123_456);
+        assert_eq!(decode_pg_money_binary(&encoded), Ok(Value::Money(-123_456)));
+        assert_eq!(
+            decode_pg_money_binary(&encoded[..7]),
+            Err(MoneyError::new("money binary payload must be 8 bytes"))
+        );
+    }
+}

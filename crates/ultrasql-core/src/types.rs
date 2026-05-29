@@ -828,6 +828,75 @@ mod tests {
     }
 
     #[test]
+    fn custom_types_display_and_keep_storage_contracts() {
+        let enum_type = DataType::Enum {
+            oid: Oid::new(10_001),
+            name: Arc::from("mood"),
+            labels: Arc::from([String::from("sad"), String::from("ok")]),
+        };
+        let composite_type = DataType::Composite {
+            oid: Oid::new(10_002),
+            name: Arc::from("address"),
+            fields: Arc::from([
+                (String::from("street"), DataType::Text { max_len: None }),
+                (String::from("zip"), DataType::Int32),
+            ]),
+        };
+        let domain_type = DataType::Domain {
+            oid: Oid::new(10_003),
+            name: Arc::from("positive_int"),
+            base_type: Box::new(DataType::Int32),
+            not_null: true,
+        };
+
+        assert_eq!(enum_type.to_string(), "mood");
+        assert!(enum_type.is_enum());
+        assert_eq!(composite_type.to_string(), "address");
+        assert!(composite_type.is_composite());
+        assert_eq!(domain_type.to_string(), "positive_int");
+        assert!(domain_type.is_domain());
+        assert_eq!(domain_type.storage_type(), &DataType::Int32);
+        assert_eq!(domain_type.fixed_size(), Some(4));
+        assert_eq!(domain_type.alignment(), 4);
+    }
+
+    #[test]
+    fn network_vector_and_record_categories_are_explicit() {
+        assert!(DataType::Oid.is_oid_alias());
+        assert!(DataType::RegClass.is_oid_alias());
+        assert!(DataType::RegType.is_oid_alias());
+        assert!(DataType::Inet.is_network_address());
+        assert!(DataType::Cidr.is_ip_network());
+        assert!(DataType::MacAddr.is_mac_address());
+        assert_eq!(
+            DataType::Vector { dims: Some(768) }.vector_dims(),
+            Some(Some(768))
+        );
+        assert_eq!(DataType::Int32.vector_dims(), None);
+        assert_eq!(
+            DataType::Range(RangeType::TimestampTz).to_string(),
+            "tstzrange"
+        );
+        assert_eq!(
+            DataType::Geometry(GeometryType::Polygon).to_string(),
+            "polygon"
+        );
+        assert_eq!(
+            DataType::Record(vec![
+                (String::from("id"), DataType::Int64),
+                (String::from("payload"), DataType::Jsonb),
+            ])
+            .to_string(),
+            "record(id bigint, payload jsonb)"
+        );
+        assert!(composite_text_matches_arity("(\"a,b\",(nested,value),)", 3));
+        assert!(!composite_text_matches_arity(
+            "(\"a,b\",(nested,value),)",
+            2
+        ));
+    }
+
+    #[test]
     fn categorization() {
         assert!(DataType::Int32.is_numeric());
         assert!(DataType::Int32.is_integer());

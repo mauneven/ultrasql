@@ -2425,6 +2425,69 @@ mod tests {
     }
 
     #[test]
+    fn xml_xpath_subset_filters_children_without_entity_resolution() {
+        let doc = r#"<root><item id="1"><name>A</name></item><item id="2"><name>B</name></item><empty/></root>"#;
+        assert_eq!(
+            xml_xpath_element_fragments(r#"/root/item[@id="2"]/name"#, doc),
+            Some(vec!["<name>B</name>".to_owned()])
+        );
+        assert_eq!(
+            xml_xpath_element_fragments("/root/missing", doc),
+            Some(Vec::new())
+        );
+        assert_eq!(xml_xpath_element_fragments("/root/..", doc), None);
+        assert!(Value::xml_content_is_well_formed("<a/><b/>"));
+        assert!(!Value::xml_content_is_well_formed("&unknown;"));
+        assert!(!Value::xml_document_is_well_formed(
+            r#"<!DOCTYPE root [<!ENTITY xxe SYSTEM "file:///etc/passwd">]><root/>"#
+        ));
+    }
+
+    #[test]
+    fn range_values_cover_overlap_containment_and_empty_edges() {
+        let left = RangeValue::parse(RangeType::Int4, "[1,10)").unwrap();
+        let overlapping = RangeValue::parse(RangeType::Int4, "[9,12]").unwrap();
+        let inside = RangeValue::parse(RangeType::Int4, "[2,3]").unwrap();
+        let outside = RangeValue::parse(RangeType::Int4, "[10,12]").unwrap();
+        let empty = RangeValue::parse(RangeType::Int4, "[5,5)").unwrap();
+
+        assert!(left.overlaps(&overlapping));
+        assert!(!left.overlaps(&outside));
+        assert!(left.contains_range(&inside));
+        assert!(left.contains_range(&empty));
+        assert_eq!(empty.to_string(), "empty");
+        assert_eq!(
+            RangeValue::parse(RangeType::Num, "(1.5,2.25]")
+                .unwrap()
+                .to_string(),
+            "(1.5,2.25]"
+        );
+        assert_eq!(
+            RangeValue::parse(RangeType::Date, "[2000-01-01,2000-01-03)")
+                .unwrap()
+                .to_string(),
+            "[0,2)"
+        );
+        assert!(RangeValue::parse(RangeType::Int4, "bad").is_none());
+        assert!(!left.overlaps(&RangeValue::parse(RangeType::Int8, "[1,10)").unwrap()));
+    }
+
+    #[test]
+    fn geometry_values_use_bounding_boxes_for_gist_predicates() {
+        let point = GeometryValue::parse(GeometryType::Point, "(1,2)").unwrap();
+        let circle = GeometryValue::parse(GeometryType::Circle, "<(5,5),2>").unwrap();
+        let container = GeometryValue::parse(GeometryType::Box, "((0,0),(10,10))").unwrap();
+        let far = GeometryValue::parse(GeometryType::Polygon, "((20,20),(21,21),(22,20))").unwrap();
+
+        assert_eq!(point.to_string(), "(1,2)");
+        assert!(container.contains_geometry(&circle));
+        assert!(container.overlaps(&circle));
+        assert!(!container.overlaps(&far));
+        assert!(GeometryValue::parse(GeometryType::Point, "(1)").is_none());
+        assert!(GeometryValue::parse(GeometryType::Circle, "(1,2)").is_none());
+    }
+
+    #[test]
     fn array_display_and_parse_round_trip() {
         let value = Value::Array {
             element_type: DataType::Text { max_len: None },
@@ -2464,6 +2527,79 @@ mod tests {
             Some(value)
         );
         assert_eq!(Value::parse_array(matrix_type, "{{1,2},{3}}"), None);
+    }
+
+    #[test]
+    fn array_parser_covers_scalar_element_families_and_escaping() {
+        assert_eq!(
+            Value::parse_array(DataType::Bool, "{t,false,NULL}")
+                .unwrap()
+                .to_string(),
+            "{true,false,NULL}"
+        );
+        assert_eq!(
+            Value::parse_array(DataType::Int16, "{-1,2}")
+                .unwrap()
+                .to_string(),
+            "{-1,2}"
+        );
+        assert_eq!(
+            Value::parse_array(DataType::Float64, "{1.5,2.25}")
+                .unwrap()
+                .to_string(),
+            "{1.5,2.25}"
+        );
+        assert_eq!(
+            Value::parse_array(DataType::Oid, "{42}"),
+            Some(Value::Array {
+                element_type: DataType::Oid,
+                elements: vec![Value::Oid(crate::Oid::new(42))]
+            })
+        );
+        assert_eq!(
+            Value::parse_array(DataType::RegClass, "{43}"),
+            Some(Value::Array {
+                element_type: DataType::RegClass,
+                elements: vec![Value::RegClass(crate::Oid::new(43))]
+            })
+        );
+        assert_eq!(
+            Value::parse_array(DataType::RegType, "{44}"),
+            Some(Value::Array {
+                element_type: DataType::RegType,
+                elements: vec![Value::RegType(crate::Oid::new(44))]
+            })
+        );
+        assert_eq!(
+            Value::parse_array(DataType::PgLsn, "{0/2A}"),
+            Some(Value::Array {
+                element_type: DataType::PgLsn,
+                elements: vec![Value::PgLsn(crate::Lsn::new(42))]
+            })
+        );
+        assert_eq!(
+            Value::parse_array(DataType::Char { len: Some(3) }, r#"{"a"}"#)
+                .unwrap()
+                .to_string(),
+            r#"{"a  "}"#
+        );
+        assert_eq!(
+            Value::parse_array(DataType::Bytea, r#"{"\\xdead"}"#)
+                .unwrap()
+                .to_string(),
+            r#"{\xdead}"#
+        );
+        assert_eq!(
+            Value::parse_array(DataType::Money, "{$1.25}")
+                .unwrap()
+                .to_string(),
+            "{$1.25}"
+        );
+        assert!(Value::parse_array(DataType::Uuid, "{not-a-uuid}").is_none());
+        assert!(
+            Value::parse_array(DataType::Text { max_len: None }, r#"{"unterminated}"#).is_none()
+        );
+        assert!(Value::parse_array(DataType::Vector { dims: None }, "{[1,2]}").is_none());
     }
 
     #[test]
@@ -2620,6 +2756,36 @@ mod tests {
             Some(expected)
         );
         assert_eq!(Value::parse_uuid("not-a-uuid"), None);
+    }
+
+    #[test]
+    fn time_text_parser_and_timetz_pack_reject_bad_edges() {
+        assert_eq!(
+            parse_time_text("2000-01-01 04:05:06.789 -08"),
+            Some(14_706_789_000)
+        );
+        assert_eq!(parse_timetz_text("04:05 zulu"), Some((14_700_000_000, 0)));
+        assert_eq!(
+            parse_timetz_text("04:05:06+0530"),
+            Some((14_706_000_000, 19_800))
+        );
+        assert_eq!(
+            format_timetz(14_706_789_000, 19_830),
+            "04:05:06.789+05:30:30"
+        );
+        assert_eq!(parse_time_text("24:00"), Some(MICROS_PER_DAY));
+        assert_eq!(parse_time_text("24:00:00.000001"), None);
+        assert_eq!(parse_timetz_text("04:05 +16"), None);
+
+        let packed = pack_timetz(MICROS_PER_DAY, 86_400).unwrap();
+        assert_eq!(unpack_timetz(packed), Some((MICROS_PER_DAY, 86_400)));
+        assert_eq!(pack_timetz(-1, 0), None);
+        assert_eq!(pack_timetz(0, 86_401), None);
+        assert_eq!(unpack_timetz(-1), None);
+        assert_eq!(
+            unpack_timetz((MICROS_PER_DAY + 1) << TIMETZ_OFFSET_BITS),
+            None
+        );
     }
 
     #[test]

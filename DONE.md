@@ -52,6 +52,13 @@ as a concise evidence ledger; roadmap stays for open gates only.
   88.28%. The full workspace coverage rerun on this Mac stopped at link time
   with `errno=28 (No space left on device)`, so the production coverage gate
   remains open until a full-host or CI artifact refreshes the workspace table.
+- Focused `ultrasql-core` coverage now exercises bit-string binary/type
+  contracts, money parsing and binary payloads, network wire/bitwise paths,
+  custom type storage helpers, XML/XPath security edges, range/geometry
+  predicates, array scalar coercions, and `TIMETZ` parsing/packing. Package
+  `cargo llvm-cov` plus `scripts/coverage_gate.py --min-lines 80` clears
+  `ultrasql-core` at 80.46%. Evidence:
+  `docs/testing/coverage-evidence-2026-05-29-core.md`.
 - Driver-certification CI was repaired, action runtimes refreshed, and release
   workflows validated on `main`.
 - Chaos testing: random kill, WAL truncation, disk full recovery is implemented

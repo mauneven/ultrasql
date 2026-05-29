@@ -580,6 +580,7 @@ fn write_mac(f: &mut fmt::Formatter<'_>, bytes: &[u8]) -> fmt::Result {
 #[cfg(test)]
 mod tests {
     use super::{InetAddr, NetworkValue};
+    use crate::DataType;
 
     #[test]
     fn network_parse_display_and_containment() {
@@ -615,5 +616,89 @@ mod tests {
                 .to_string(),
             "08:00:2b:ff:fe:01:02:03"
         );
+    }
+
+    #[test]
+    fn network_binary_round_trips_and_rejects_wrong_families() {
+        let inet = InetAddr::parse_inet("2001:db8::1/64").unwrap();
+        let encoded = inet.to_pg_binary(false);
+        assert_eq!(
+            NetworkValue::from_pg_binary(&DataType::Inet, &encoded),
+            Some(NetworkValue::Inet(inet))
+        );
+
+        let cidr = InetAddr::parse_cidr("192.168.0.0/16").unwrap();
+        let encoded = cidr.to_pg_binary(true);
+        assert_eq!(
+            NetworkValue::from_pg_binary(&DataType::Cidr, &encoded),
+            Some(NetworkValue::Cidr(cidr))
+        );
+        assert_eq!(
+            NetworkValue::from_pg_binary(&DataType::Inet, &encoded),
+            None
+        );
+
+        let mut invalid_prefix = cidr.to_pg_binary(true);
+        invalid_prefix[1] = 33;
+        assert_eq!(
+            NetworkValue::from_pg_binary(&DataType::Cidr, &invalid_prefix),
+            None
+        );
+
+        let host_bits = InetAddr::parse_inet("192.168.1.5/24")
+            .unwrap()
+            .to_pg_binary(true);
+        assert_eq!(
+            NetworkValue::from_pg_binary(&DataType::Cidr, &host_bits),
+            None
+        );
+        assert_eq!(
+            NetworkValue::from_pg_binary(&DataType::Inet, &[2, 32, 0]),
+            None
+        );
+        assert_eq!(
+            NetworkValue::parse_for_type(&DataType::Int32, "127.0.0.1"),
+            None
+        );
+    }
+
+    #[test]
+    fn network_bitwise_ordering_and_wire_payloads_cover_all_families() {
+        let host = NetworkValue::parse_for_type(&DataType::Inet, "192.168.1.5").unwrap();
+        let mask = NetworkValue::parse_for_type(&DataType::Inet, "255.255.255.0").unwrap();
+        assert_eq!(
+            host.bitwise(mask, |left, right| left & right)
+                .unwrap()
+                .to_string(),
+            "192.168.1.0"
+        );
+        assert_eq!(host.bit_not().to_string(), "63.87.254.250");
+        assert!(host.inet_addr().is_some());
+
+        let mac = NetworkValue::parse_for_type(&DataType::MacAddr, "08:00:2b:01:02:03").unwrap();
+        let mac_mask =
+            NetworkValue::parse_for_type(&DataType::MacAddr, "ff:ff:ff:00:00:00").unwrap();
+        assert_eq!(
+            mac.bitwise(mac_mask, |left, right| left & right)
+                .unwrap()
+                .to_string(),
+            "08:00:2b:00:00:00"
+        );
+        assert_eq!(mac.to_pg_binary(), vec![0x08, 0x00, 0x2b, 0x01, 0x02, 0x03]);
+        assert_eq!(
+            NetworkValue::from_pg_binary(&DataType::MacAddr, &mac.to_pg_binary()),
+            Some(mac)
+        );
+        assert!(mac.inet_addr().is_none());
+
+        let mac8 =
+            NetworkValue::parse_for_type(&DataType::MacAddr8, "08:00:2b:ff:fe:01:02:03").unwrap();
+        assert_eq!(
+            NetworkValue::from_pg_binary(&DataType::MacAddr8, &mac8.to_pg_binary()),
+            Some(mac8)
+        );
+        assert_eq!(mac.cmp_network(mac8), None);
+        assert_eq!(mac.bitwise(mac8, |left, right| left | right), None);
+        assert_eq!(mac.data_type(), DataType::MacAddr);
     }
 }
