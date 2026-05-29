@@ -1414,7 +1414,7 @@ fn run_basebackup_copy(
     dest: &PathBuf,
     checkpoint_fence: Option<&str>,
 ) -> Result<()> {
-    if dest.exists() {
+    if path_exists_or_symlink(dest)? {
         anyhow::bail!("basebackup destination already exists: {}", dest.display());
     }
     fs::create_dir_all(dest)?;
@@ -1422,7 +1422,11 @@ fn run_basebackup_copy(
     copy_tree_with_manifest(data_dir, data_dir, dest, &mut manifest)?;
     if let Some(fence) = checkpoint_fence {
         let label = backup_label_text(fence);
-        fs::write(dest.join("backup_label"), label.as_bytes())?;
+        write_regular_file(
+            &dest.join("backup_label"),
+            label.as_bytes(),
+            "basebackup label",
+        )?;
         let len = u64::try_from(label.len()).unwrap_or(u64::MAX);
         manifest.push((
             "backup_label".to_string(),
@@ -1432,7 +1436,11 @@ fn run_basebackup_copy(
     }
     manifest.sort_by(|a, b| a.0.cmp(&b.0));
     let text = basebackup_manifest_text(&manifest, checkpoint_fence);
-    fs::write(dest.join("backup_manifest.json"), text)?;
+    write_regular_file(
+        &dest.join("backup_manifest.json"),
+        text.as_bytes(),
+        "basebackup manifest",
+    )?;
     println!(
         "base backup copied {} files to {}",
         manifest.len(),
@@ -1481,7 +1489,7 @@ fn json_escape(value: &str) -> String {
 fn run_pg_dump(data_dir: &Path, dest: &Path, format: DumpFormat) -> Result<()> {
     match format {
         DumpFormat::Directory => {
-            if dest.exists() {
+            if path_exists_or_symlink(dest)? {
                 anyhow::bail!("dump destination already exists: {}", dest.display());
             }
             fs::create_dir_all(dest)?;
@@ -1493,9 +1501,10 @@ fn run_pg_dump(data_dir: &Path, dest: &Path, format: DumpFormat) -> Result<()> {
                 &mut manifest,
             )?;
             manifest.sort_by(|a, b| a.0.cmp(&b.0));
-            fs::write(
-                dest.join("ultrasql_dump.manifest"),
-                dump_manifest_text(&manifest),
+            write_regular_file(
+                &dest.join("ultrasql_dump.manifest"),
+                dump_manifest_text(&manifest).as_bytes(),
+                "dump manifest",
             )?;
             println!(
                 "directory dump wrote {} files to {}",
@@ -1504,7 +1513,7 @@ fn run_pg_dump(data_dir: &Path, dest: &Path, format: DumpFormat) -> Result<()> {
             );
         }
         DumpFormat::Plain | DumpFormat::Custom | DumpFormat::Tar => {
-            if dest.exists() {
+            if path_exists_or_symlink(dest)? {
                 anyhow::bail!("dump destination already exists: {}", dest.display());
             }
             let mut entries = Vec::new();
@@ -1520,7 +1529,7 @@ fn run_pg_dump(data_dir: &Path, dest: &Path, format: DumpFormat) -> Result<()> {
                 writeln!(&mut out, "{}", hex_bytes(bytes))?;
                 writeln!(&mut out, "END")?;
             }
-            fs::write(dest, out)?;
+            write_regular_file(dest, out.as_bytes(), "dump archive")?;
             println!(
                 "{format:?} dump wrote {} files to {}",
                 entries.len(),
@@ -1725,10 +1734,15 @@ fn copy_regular_file(source: &Path, dest: &Path, context: &str) -> Result<()> {
 
 fn write_regular_file(dest: &Path, bytes: &[u8], context: &str) -> Result<()> {
     ensure_regular_destination_file(dest, context)?;
-    let mut file = fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+
+        options.custom_flags(libc::O_NOFOLLOW);
+    }
+    let mut file = options
         .open(dest)
         .with_context(|| format!("cannot create {context}: {}", dest.display()))?;
     std::io::Write::write_all(&mut file, bytes)
@@ -1753,6 +1767,14 @@ fn ensure_regular_destination_file(path: &Path, context: &str) -> Result<()> {
         Err(err) => {
             Err(err).with_context(|| format!("cannot inspect {context}: {}", path.display()))
         }
+    }
+}
+
+fn path_exists_or_symlink(path: &Path) -> Result<bool> {
+    match fs::symlink_metadata(path) {
+        Ok(_) => Ok(true),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(err) => Err(err).with_context(|| format!("cannot inspect path: {}", path.display())),
     }
 }
 
@@ -2686,6 +2708,24 @@ mod tests {
         );
         assert!(run_pg_dump(&data, &dir.path().join("dumpdir"), DumpFormat::Directory).is_err());
         assert!(run_pg_dump(&data, &dir.path().join("dump.ultra"), DumpFormat::Plain).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pg_dump_rejects_symlinked_archive_outputs() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let data = dir.path().join("data");
+        fs::create_dir_all(data.join("base/1")).expect("create data dir");
+        fs::write(data.join("base/1/heap"), b"rows").expect("write heap");
+        fs::write(data.join("pg_version"), b"1").expect("write version");
+        let outside = dir.path().join("outside-dump");
+        let dump = dir.path().join("dump.ultra");
+        symlink(&outside, &dump).expect("dump symlink");
+
+        assert!(run_pg_dump(&data, &dump, DumpFormat::Plain).is_err());
+        assert!(!outside.exists());
     }
 
     #[cfg(unix)]

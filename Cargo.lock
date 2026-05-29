@@ -3437,6 +3437,7 @@ version = "0.0.7"
 dependencies = [
  "anyhow",
  "clap",
+ "libc",
  "rustyline",
  "tempfile",
  "thiserror",
