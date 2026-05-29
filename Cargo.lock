@@ -3458,6 +3458,7 @@ dependencies = [
  "ahash",
  "byteorder",
  "bytes",
+ "libc",
  "proptest",
  "rstest",
  "smallvec",

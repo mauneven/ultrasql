@@ -8,8 +8,14 @@
 
 use std::error::Error as StdError;
 use std::fmt;
-use std::fs;
+use std::fs::{self, File, OpenOptions};
+use std::io::{ErrorKind, Read};
+#[cfg(unix)]
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
+
+const DEFAULT_CSV_LOCAL_READ_LIMIT_BYTES: u64 = 128 * 1024 * 1024;
+const CSV_LOCAL_READ_LIMIT_ENV: &str = "ULTRASQL_CSV_LOCAL_READ_LIMIT_BYTES";
 
 const DEFAULT_DELIMITER: char = ',';
 const DEFAULT_QUOTE: char = '"';
@@ -454,8 +460,67 @@ fn read_regular_utf8_file(operation: &str, path: &Path) -> Result<String, CsvErr
             path.display()
         )));
     }
-    fs::read_to_string(path)
-        .map_err(|err| CsvError::new(format!("{operation} cannot read {}: {err}", path.display())))
+    let limit = csv_local_read_limit_bytes();
+    if metadata.len() > limit {
+        return Err(CsvError::new(csv_limit_error_message(
+            operation,
+            path,
+            metadata.len(),
+            limit,
+        )));
+    }
+
+    let file = open_regular_utf8_file(path).map_err(|err| {
+        CsvError::new(format!("{operation} cannot open {}: {err}", path.display()))
+    })?;
+    let mut limited = file.take(limit.saturating_add(1));
+    let mut text = String::new();
+    limited.read_to_string(&mut text).map_err(|err| {
+        CsvError::new(format!("{operation} cannot read {}: {err}", path.display()))
+    })?;
+    let bytes_read = u64::try_from(text.len()).unwrap_or(u64::MAX);
+    if bytes_read > limit {
+        return Err(CsvError::new(csv_limit_error_message(
+            operation, path, bytes_read, limit,
+        )));
+    }
+    Ok(text)
+}
+
+fn csv_local_read_limit_bytes() -> u64 {
+    std::env::var(CSV_LOCAL_READ_LIMIT_ENV)
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|&limit| limit > 0)
+        .unwrap_or(DEFAULT_CSV_LOCAL_READ_LIMIT_BYTES)
+}
+
+fn csv_limit_error_message(operation: &str, path: &Path, bytes: u64, limit: u64) -> String {
+    format!(
+        "{operation} file exceeds read limit: path={} bytes={} limit={} env={}",
+        path.display(),
+        bytes,
+        limit,
+        CSV_LOCAL_READ_LIMIT_ENV
+    )
+}
+
+#[cfg_attr(not(unix), allow(unused_variables))]
+fn open_regular_utf8_file(path: &Path) -> std::io::Result<File> {
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    options.custom_flags(libc::O_NOFOLLOW);
+    let file = options.open(path)?;
+    let metadata = file.metadata()?;
+    if metadata.file_type().is_file() {
+        Ok(file)
+    } else {
+        Err(std::io::Error::new(
+            ErrorKind::InvalidInput,
+            format!("path is not a regular file: {}", path.display()),
+        ))
+    }
 }
 
 /// Read one UTF-8 CSV string using sniffer-derived dialect and header metadata.
@@ -937,5 +1002,36 @@ mod tests {
 
         assert!(err.to_string().contains("regular file"));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn read_csv_rejects_configured_oversized_input() {
+        let _env_guard = csv_env_test_lock();
+        // SAFETY: csv_env_test_lock serializes process-env mutation in this
+        // module's tests.
+        unsafe {
+            std::env::set_var("ULTRASQL_CSV_LOCAL_READ_LIMIT_BYTES", "3");
+        }
+
+        let path =
+            std::env::temp_dir().join(format!("ultrasql-csv-oversized-{}", std::process::id()));
+        std::fs::write(&path, "id\n1\n").expect("write csv");
+
+        let err = super::read_csv_data_from_path(&path).expect_err("oversized csv rejected");
+
+        assert!(err.to_string().contains("exceeds read limit"));
+        let _ = std::fs::remove_file(&path);
+
+        // SAFETY: csv_env_test_lock serializes process-env mutation in this
+        // module's tests.
+        unsafe {
+            std::env::remove_var("ULTRASQL_CSV_LOCAL_READ_LIMIT_BYTES");
+        }
+    }
+
+    fn csv_env_test_lock() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        LOCK.lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 }

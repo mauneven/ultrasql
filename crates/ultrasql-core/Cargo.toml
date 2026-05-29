@@ -21,6 +21,7 @@ byteorder   = { workspace = true }
 smallvec    = { workspace = true }
 ahash       = { workspace = true }
 xxhash-rust = { workspace = true }
+libc        = { workspace = true }
 
 [dev-dependencies]
 proptest = { workspace = true }
