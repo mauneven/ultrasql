@@ -26,6 +26,7 @@ use ultrasql_parser::ast::{JoinCondition, JoinOp, JsonTableColumnKind, TableRef,
 
 const READ_CSV_HEADER_SAMPLE_BYTES: u64 = 64 * 1024;
 const JSON_STREAM_CHUNK_BYTES: u64 = 64 * 1024;
+const PLANNER_JSON_RECORD_LIMIT_BYTES: usize = 16 * 1024 * 1024;
 
 use super::ddl::resolve_type_name;
 use super::{
@@ -1065,6 +1066,11 @@ fn planner_next_ndjson_text(
                 break;
             }
             bytes.push(byte[0]);
+            if bytes.len() > PLANNER_JSON_RECORD_LIMIT_BYTES {
+                return Err(PlanError::TypeMismatch(format!(
+                    "{function_name} record in {display} exceeds record limit: limit={PLANNER_JSON_RECORD_LIMIT_BYTES}"
+                )));
+            }
             if byte[0] == b'\n' {
                 break;
             }
@@ -1178,6 +1184,11 @@ fn planner_read_json_container(
         }
         let b = byte[0];
         bytes.push(b);
+        if bytes.len() > PLANNER_JSON_RECORD_LIMIT_BYTES {
+            return Err(PlanError::TypeMismatch(format!(
+                "{function_name} record in {display} exceeds record limit: limit={PLANNER_JSON_RECORD_LIMIT_BYTES}"
+            )));
+        }
         if in_string {
             if escaped {
                 escaped = false;
@@ -2373,6 +2384,33 @@ mod tests {
                 .next_text("read_json", "truncated-object.json")
                 .is_err()
         );
+    }
+
+    #[test]
+    fn json_record_readers_reject_oversized_records() {
+        let payload = "x".repeat(PLANNER_JSON_RECORD_LIMIT_BYTES);
+        let object = format!("{{\"payload\":\"{payload}\"}}");
+        let mut ndjson = PlannerJsonRecordReader::new(
+            JsonInputKind::Ndjson,
+            Box::new(Cursor::new(format!("{object}\n").into_bytes())),
+        );
+        assert_json_record_limit(
+            ndjson.next_text("read_ndjson", "large.ndjson"),
+            "read_ndjson",
+        );
+
+        let mut json = PlannerJsonRecordReader::new(
+            JsonInputKind::Json,
+            Box::new(Cursor::new(format!("[{object}]").into_bytes())),
+        );
+        assert_json_record_limit(json.next_text("read_json", "large.json"), "read_json");
+    }
+
+    fn assert_json_record_limit(result: Result<Option<(usize, String)>, PlanError>, name: &str) {
+        match result {
+            Err(err) => assert!(err.to_string().contains("exceeds record limit"), "{err}"),
+            Ok(_) => panic!("{name} oversized record accepted"),
+        }
     }
 
     #[test]
