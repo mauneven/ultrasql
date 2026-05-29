@@ -482,12 +482,8 @@ fn open_path_reader(
     projection: Option<&[String]>,
     predicate: Option<&ParquetPredicate>,
 ) -> Result<Option<ActiveParquetReader>, ServerError> {
-    let file = File::open(path).map_err(|err| {
-        ServerError::CopyFormat(format!(
-            "read_parquet cannot open {}: {err}",
-            path.display()
-        ))
-    })?;
+    let display = path.display().to_string();
+    let file = open_regular_parquet_file(path, &display, "open")?;
     let builder = ParquetRecordBatchReaderBuilder::try_new(file).map_err(|err| {
         ServerError::CopyFormat(format!(
             "read_parquet cannot inspect {}: {err}",
@@ -501,12 +497,7 @@ fn open_path_reader(
         )));
     }
 
-    let row_group_reader = File::open(path).map_err(|err| {
-        ServerError::CopyFormat(format!(
-            "read_parquet cannot open {} for pruning: {err}",
-            path.display()
-        ))
-    })?;
+    let row_group_reader = open_regular_parquet_file(path, &display, "open for pruning")?;
     let row_groups = selected_row_groups_with_dictionary(
         Arc::new(row_group_reader),
         builder.metadata(),
@@ -516,7 +507,6 @@ fn open_path_reader(
     if row_groups.is_empty() {
         return Ok(None);
     }
-    let display = path.display().to_string();
     spawn_parquet_row_group_workers(
         display,
         ParquetWorkerSource::Path(path.to_path_buf()),
@@ -525,6 +515,24 @@ fn open_path_reader(
         &row_groups,
     )
     .map(Some)
+}
+
+fn open_regular_parquet_file(
+    path: &Path,
+    display: &str,
+    purpose: &str,
+) -> Result<File, ServerError> {
+    let metadata = fs::symlink_metadata(path).map_err(|err| {
+        ServerError::CopyFormat(format!("read_parquet cannot inspect {display}: {err}"))
+    })?;
+    if !metadata.file_type().is_file() {
+        return Err(ServerError::CopyFormat(format!(
+            "read_parquet path is not a regular file: {display}"
+        )));
+    }
+    File::open(path).map_err(|err| {
+        ServerError::CopyFormat(format!("read_parquet cannot {purpose} {display}: {err}"))
+    })
 }
 
 fn open_object_reader(
@@ -653,9 +661,7 @@ fn build_row_group_reader(
 ) -> Result<ParquetRecordBatchReader, ServerError> {
     match source {
         ParquetWorkerSource::Path(path) => {
-            let file = File::open(&path).map_err(|err| {
-                ServerError::CopyFormat(format!("read_parquet cannot open {display}: {err}"))
-            })?;
+            let file = open_regular_parquet_file(&path, display, "open")?;
             let builder = ParquetRecordBatchReaderBuilder::try_new(file).map_err(|err| {
                 ServerError::CopyFormat(format!("read_parquet cannot inspect {display}: {err}"))
             })?;
@@ -995,12 +1001,8 @@ fn parquet_path_row_group_summary(
     path: &Path,
     predicate: Option<&ParquetPredicate>,
 ) -> Result<ParquetRowGroupSummary, ServerError> {
-    let file = File::open(path).map_err(|err| {
-        ServerError::CopyFormat(format!(
-            "read_parquet cannot open {}: {err}",
-            path.display()
-        ))
-    })?;
+    let display = path.display().to_string();
+    let file = open_regular_parquet_file(path, &display, "open")?;
     let builder = ParquetRecordBatchReaderBuilder::try_new(file).map_err(|err| {
         ServerError::CopyFormat(format!(
             "read_parquet cannot inspect {}: {err}",
@@ -1011,12 +1013,11 @@ fn parquet_path_row_group_summary(
         .map(|predicate| predicate.resolved_for_schema(builder.schema().as_ref()))
         .transpose()?;
     row_group_summary_with_dictionary(
-        Arc::new(File::open(path).map_err(|err| {
-            ServerError::CopyFormat(format!(
-                "read_parquet cannot open {} for pruning: {err}",
-                path.display()
-            ))
-        })?),
+        Arc::new(open_regular_parquet_file(
+            path,
+            &display,
+            "open for pruning",
+        )?),
         builder.metadata(),
         builder.schema().as_ref(),
         predicate.as_ref(),
@@ -1044,12 +1045,8 @@ fn parquet_object_row_group_summary(
 }
 
 fn read_arrow_schema(path: &Path) -> Result<arrow_schema::SchemaRef, ServerError> {
-    let file = File::open(path).map_err(|err| {
-        ServerError::CopyFormat(format!(
-            "read_parquet cannot open {}: {err}",
-            path.display()
-        ))
-    })?;
+    let display = path.display().to_string();
+    let file = open_regular_parquet_file(path, &display, "open")?;
     let builder = ParquetRecordBatchReaderBuilder::try_new(file).map_err(|err| {
         ServerError::CopyFormat(format!(
             "read_parquet cannot inspect {}: {err}",
@@ -1675,7 +1672,7 @@ fn wildcard_match(pattern: &str, text: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{ParquetPredicate, ParquetTableScan};
+    use super::{ParquetPredicate, ParquetTableScan, open_regular_parquet_file};
     use std::fs;
     use std::sync::Arc;
 
@@ -1739,6 +1736,20 @@ mod tests {
             "part-??.parquet",
             "part-001.parquet"
         ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn parquet_scan_rejects_symlinked_input_file() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let target = dir.path().join("target.parquet");
+        let link = dir.path().join("link.parquet");
+        fs::write(&target, b"not parquet").expect("write target");
+        symlink(&target, &link).expect("symlink parquet");
+
+        assert!(open_regular_parquet_file(&link, &link.display().to_string(), "open").is_err());
     }
 
     #[test]

@@ -2,7 +2,7 @@
 
 use std::cmp::Ordering;
 use std::collections::VecDeque;
-use std::fs::File;
+use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 
@@ -229,12 +229,16 @@ struct CsvRejectSink {
 
 impl CsvRejectSink {
     fn create(path: &Path) -> Result<Self, ServerError> {
-        let file = File::create(path).map_err(|err| {
-            ServerError::CopyFormat(format!(
-                "read_csv cannot create reject artifact {}: {err}",
-                path.display()
-            ))
-        })?;
+        let file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(path)
+            .map_err(|err| {
+                ServerError::CopyFormat(format!(
+                    "read_csv cannot create reject artifact {}: {err}",
+                    path.display()
+                ))
+            })?;
         let mut writer = BufWriter::new(file);
         writer
             .write_all(b"filename,row_number,error,raw_row\n")
@@ -530,9 +534,7 @@ impl CsvReaderState {
         let sample = read_csv_sample_from_path(path)?;
         let sniff = sniff_csv_text_for_read_csv(&display, &sample, allow_rejects)?;
         let header = sniff_header(&sniff);
-        let file = File::open(path).map_err(|err| {
-            ServerError::CopyFormat(format!("read_csv cannot open {}: {err}", path.display()))
-        })?;
+        let file = open_csv_input_file(path)?;
         let reader = CsvRecordReader::new(
             display.clone(),
             CsvRecordSource::File(BufReader::new(file)),
@@ -1012,9 +1014,7 @@ fn detect_sample_newline(sample: &str) -> &'static str {
 }
 
 fn read_csv_sample_from_path(path: &Path) -> Result<String, ServerError> {
-    let file = File::open(path).map_err(|err| {
-        ServerError::CopyFormat(format!("read_csv cannot open {}: {err}", path.display()))
-    })?;
+    let file = open_csv_input_file(path)?;
     let mut bytes = Vec::new();
     file.take(CSV_SNIFF_SAMPLE_BYTES_U64)
         .read_to_end(&mut bytes)
@@ -1041,6 +1041,21 @@ fn read_csv_sample_from_path(path: &Path) -> Result<String, ServerError> {
         ServerError::CopyFormat(format!("read_csv cannot decode {}: {err}", path.display()))
     })?;
     Ok(csv_sample_from_text_with_truncation(text, true).to_owned())
+}
+
+fn open_csv_input_file(path: &Path) -> Result<File, ServerError> {
+    let metadata = fs::symlink_metadata(path).map_err(|err| {
+        ServerError::CopyFormat(format!("read_csv cannot inspect {}: {err}", path.display()))
+    })?;
+    if !metadata.file_type().is_file() {
+        return Err(ServerError::CopyFormat(format!(
+            "read_csv path is not a regular file: {}",
+            path.display()
+        )));
+    }
+    File::open(path).map_err(|err| {
+        ServerError::CopyFormat(format!("read_csv cannot open {}: {err}", path.display()))
+    })
 }
 
 fn read_csv_sample_from_object(
@@ -1212,7 +1227,7 @@ mod tests {
 
     use ultrasql_executor::Operator as _;
 
-    use super::{CSV_BATCH_TARGET_ROWS, CsvTableScan};
+    use super::{CSV_BATCH_TARGET_ROWS, CsvRejectSink, CsvTableScan, read_csv_sample_from_path};
 
     #[test]
     fn csv_scan_construction_does_not_parse_past_first_batch() {
@@ -1257,5 +1272,30 @@ mod tests {
         assert_eq!(first.rows(), CSV_BATCH_TARGET_ROWS);
         assert_eq!(second.rows(), 1);
         assert!(scan.next_batch().expect("eof reads").is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn csv_scan_rejects_symlinked_input_and_reject_sink() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let input_target = dir.path().join("input.csv");
+        let input_link = dir.path().join("input-link.csv");
+        fs::write(&input_target, "id,name\n1,Ada\n").expect("write input");
+        symlink(&input_target, &input_link).expect("input symlink");
+
+        assert!(read_csv_sample_from_path(&input_link).is_err());
+
+        let reject_target = dir.path().join("rejects.csv");
+        let reject_link = dir.path().join("rejects-link.csv");
+        fs::write(&reject_target, "keep").expect("write reject target");
+        symlink(&reject_target, &reject_link).expect("reject symlink");
+
+        assert!(CsvRejectSink::create(&reject_link).is_err());
+        assert_eq!(
+            fs::read_to_string(&reject_target).expect("reject target"),
+            "keep"
+        );
     }
 }

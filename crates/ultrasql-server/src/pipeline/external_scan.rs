@@ -366,10 +366,7 @@ fn open_external_stream(
 ) -> Result<ExternalStreamReader, ServerError> {
     match source {
         ExternalStreamSpec::Local(path) => {
-            let display = path.display();
-            let file = File::open(path).map_err(|err| {
-                ServerError::CopyFormat(format!("{function_name} cannot open {display}: {err}"))
-            })?;
+            let file = open_local_external_file(function_name, path)?;
             Ok(ExternalStreamReader::File(BufReader::new(file)))
         }
         ExternalStreamSpec::Object(object) => Ok(ExternalStreamReader::Object(
@@ -407,12 +404,47 @@ fn read_external_sources(
         .into_iter()
         .map(|path| {
             let display = path.display().to_string();
-            let bytes = fs::read(&path).map_err(|err| {
-                ServerError::CopyFormat(format!("{function_name} cannot read {display}: {err}"))
-            })?;
+            let bytes = read_local_external_file(function_name, &path)?;
             Ok(ExternalBytes { display, bytes })
         })
         .collect()
+}
+
+fn open_local_external_file(function_name: &str, path: &Path) -> Result<File, ServerError> {
+    ensure_regular_external_file(function_name, path)?;
+    File::open(path).map_err(|err| {
+        ServerError::CopyFormat(format!(
+            "{function_name} cannot open {}: {err}",
+            path.display()
+        ))
+    })
+}
+
+fn read_local_external_file(function_name: &str, path: &Path) -> Result<Vec<u8>, ServerError> {
+    ensure_regular_external_file(function_name, path)?;
+    fs::read(path).map_err(|err| {
+        ServerError::CopyFormat(format!(
+            "{function_name} cannot read {}: {err}",
+            path.display()
+        ))
+    })
+}
+
+fn ensure_regular_external_file(function_name: &str, path: &Path) -> Result<(), ServerError> {
+    let metadata = fs::symlink_metadata(path).map_err(|err| {
+        ServerError::CopyFormat(format!(
+            "{function_name} cannot inspect {}: {err}",
+            path.display()
+        ))
+    })?;
+    if metadata.file_type().is_file() {
+        Ok(())
+    } else {
+        Err(ServerError::CopyFormat(format!(
+            "{function_name} path is not a regular file: {}",
+            path.display()
+        )))
+    }
 }
 
 fn path_specs_use_object_store(
@@ -1226,6 +1258,22 @@ mod tests {
         .expect("json scan");
 
         assert!(matches!(scan.source, ExternalScanSource::Streaming(_)));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn external_local_sources_reject_symlinked_files() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let target = dir.path().join("people.json");
+        let link = dir.path().join("link.json");
+        fs::write(&target, r#"[{"id":1}]"#).expect("write json");
+        symlink(&target, &link).expect("symlink json");
+
+        let source = ExternalStreamSpec::Local(link.clone());
+        assert!(open_external_stream("read_json", &source).is_err());
+        assert!(read_external_sources("read_json", &[link.to_string_lossy().to_string()]).is_err());
     }
 
     #[test]
