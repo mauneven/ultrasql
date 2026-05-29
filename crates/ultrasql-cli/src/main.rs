@@ -343,6 +343,9 @@ fn pgpass_lookup_in_home(
     user: &str,
 ) -> Option<String> {
     let pgpass = home.join(".pgpass");
+    if !pgpass_permissions_are_private(&pgpass) {
+        return None;
+    }
     let content = fs::read_to_string(&pgpass).ok()?;
 
     let port_str = port.to_string();
@@ -365,6 +368,20 @@ fn pgpass_lookup_in_home(
         }
     }
     None
+}
+
+#[cfg(unix)]
+fn pgpass_permissions_are_private(path: &Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+
+    fs::metadata(path)
+        .map(|metadata| metadata.permissions().mode() & 0o077 == 0)
+        .unwrap_or(false)
+}
+
+#[cfg(not(unix))]
+fn pgpass_permissions_are_private(_path: &Path) -> bool {
+    true
 }
 
 // ---------------------------------------------------------------------------
@@ -1914,7 +1931,7 @@ mod tests {
         // Build a temp pgpass file.
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join(".pgpass");
-        fs::write(&path, "*:5432:mydb:bob:hunter2\n").expect("write");
+        write_pgpass(&path, "*:5432:mydb:bob:hunter2\n");
 
         let pw = pgpass_lookup_in_home(dir.path(), "anyhost", 5432, "mydb", "bob");
         assert_eq!(pw.as_deref(), Some("hunter2"));
@@ -1924,10 +1941,24 @@ mod tests {
     fn pgpass_wrong_user_no_match() {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join(".pgpass");
-        fs::write(&path, "localhost:5432:mydb:alice:pw\n").expect("write");
+        write_pgpass(&path, "localhost:5432:mydb:alice:pw\n");
 
         let pw = pgpass_lookup_in_home(dir.path(), "localhost", 5432, "mydb", "bob");
         assert!(pw.is_none(), "wrong user must not match");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pgpass_world_readable_file_is_ignored() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join(".pgpass");
+        fs::write(&path, "localhost:5432:db:user:secret\n").expect("write");
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).expect("chmod");
+
+        let pw = pgpass_lookup_in_home(dir.path(), "localhost", 5432, "db", "user");
+        assert!(pw.is_none());
     }
 
     // --- Statement splitter ---
@@ -2132,14 +2163,23 @@ mod tests {
     #[test]
     fn pgpass_ignores_comments_malformed_and_non_matching_lines() {
         let dir = tempfile::tempdir().expect("tempdir");
-        fs::write(
-            dir.path().join(".pgpass"),
+        write_pgpass(
+            &dir.path().join(".pgpass"),
             "# comment\nbad-line\nlocalhost:9999:db:user:nope\nlocalhost:5432:db:user:pw\n",
-        )
-        .expect("write pgpass");
+        );
 
         let pw = pgpass_lookup_in_home(dir.path(), "localhost", 5432, "db", "user");
         assert_eq!(pw.as_deref(), Some("pw"));
+    }
+
+    fn write_pgpass(path: &Path, content: &str) {
+        fs::write(path, content).expect("write pgpass");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            fs::set_permissions(path, fs::Permissions::from_mode(0o600)).expect("chmod pgpass");
+        }
     }
 
     #[test]
