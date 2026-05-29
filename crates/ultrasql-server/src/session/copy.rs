@@ -67,6 +67,7 @@ use crate::error::ServerError;
 
 const COPY_INSERT_BATCH_ROWS: usize = 4096;
 const COPY_AUTODETECT_SAMPLE_BYTES: usize = 64 * 1024;
+const DEFAULT_COPY_BINARY_FILE_LIMIT_BYTES: u64 = 128 * 1024 * 1024;
 const MICROS_PER_DAY: i64 = 86_400_000_000;
 
 struct CopyRejectTarget {
@@ -1373,11 +1374,37 @@ fn open_copy_input_file(path: &str) -> Result<File, ServerError> {
 }
 
 fn read_copy_input_file(path: &str) -> Result<Vec<u8>, ServerError> {
-    let mut file = open_copy_input_file(path)?;
+    let file = open_copy_input_file(path)?;
+    let limit = copy_binary_file_limit_bytes();
+    let len = file
+        .metadata()
+        .map_err(|e| ServerError::Io(std::io::Error::other(format!("{path}: {e}"))))?
+        .len();
+    if len > limit {
+        return Err(ServerError::CopyFormat(format!(
+            "COPY binary file exceeds limit: {path} size={len} limit={limit}"
+        )));
+    }
     let mut bytes = Vec::new();
-    file.read_to_end(&mut bytes)
+    let mut limited = file.take(limit.saturating_add(1));
+    limited
+        .read_to_end(&mut bytes)
         .map_err(|e| ServerError::Io(std::io::Error::other(format!("{path}: {e}"))))?;
+    let read_len = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
+    if read_len > limit {
+        return Err(ServerError::CopyFormat(format!(
+            "COPY binary file exceeds limit: {path} size={read_len} limit={limit}"
+        )));
+    }
     Ok(bytes)
+}
+
+fn copy_binary_file_limit_bytes() -> u64 {
+    std::env::var("ULTRASQL_COPY_BINARY_FILE_LIMIT_BYTES")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(DEFAULT_COPY_BINARY_FILE_LIMIT_BYTES)
 }
 
 fn ensure_regular_copy_input(path: &str) -> Result<(), ServerError> {
@@ -2485,6 +2512,23 @@ b"#
             read_copy_file_sample(file.path().to_str().expect("utf8 path")).expect("copy sample");
         assert!(sample.contains("multi"));
 
+        let _env_guard = copy_env_test_lock();
+        // SAFETY: copy_env_test_lock serializes process-env mutation in this
+        // module's tests.
+        unsafe {
+            std::env::set_var("ULTRASQL_COPY_BINARY_FILE_LIMIT_BYTES", "3");
+        }
+        let oversized = tempfile::NamedTempFile::new().expect("oversized file");
+        std::fs::write(oversized.path(), b"abcd").expect("write oversized");
+        let err = read_copy_input_file(oversized.path().to_str().expect("utf8 oversized"))
+            .expect_err("oversized binary COPY input rejected");
+        assert!(err.to_string().contains("COPY binary file exceeds limit"));
+        // SAFETY: copy_env_test_lock serializes process-env mutation in this
+        // module's tests.
+        unsafe {
+            std::env::remove_var("ULTRASQL_COPY_BINARY_FILE_LIMIT_BYTES");
+        }
+
         #[cfg(unix)]
         {
             use std::os::unix::fs::symlink;
@@ -3040,5 +3084,12 @@ b"#
         assert_eq!(format_float_f32(f32::INFINITY), b"Infinity".to_vec());
         assert_eq!(format_float_f64(f64::NEG_INFINITY), b"-Infinity".to_vec());
         assert_eq!(format_float_f64(f64::NAN), b"NaN".to_vec());
+    }
+
+    fn copy_env_test_lock() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+        LOCK.get_or_init(|| std::sync::Mutex::new(()))
+            .lock()
+            .expect("copy env test lock")
     }
 }
