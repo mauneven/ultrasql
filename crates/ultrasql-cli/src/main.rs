@@ -14,7 +14,7 @@
 
 use std::fmt::Write as _;
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::thread;
 use std::time::Duration;
 
@@ -1547,7 +1547,7 @@ fn run_pg_restore(source: &Path, data_dir: &Path) -> Result<()> {
         if end != "END" {
             anyhow::bail!("malformed dump archive terminator: {end}");
         }
-        let dest = data_dir.join(rel_path);
+        let dest = data_dir.join(validate_restore_manifest_path(rel_path)?);
         if let Some(parent) = dest.parent() {
             fs::create_dir_all(parent)?;
         }
@@ -1555,6 +1555,24 @@ fn run_pg_restore(source: &Path, data_dir: &Path) -> Result<()> {
     }
     println!("restored archive dump into {}", data_dir.display());
     Ok(())
+}
+
+fn validate_restore_manifest_path(rel_path: &str) -> Result<PathBuf> {
+    let path = Path::new(rel_path);
+    let mut clean = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::Normal(part) => clean.push(part),
+            Component::CurDir => {}
+            Component::ParentDir | Component::RootDir | Component::Prefix(_) => {
+                anyhow::bail!("dump archive path escapes restore directory: {rel_path}");
+            }
+        }
+    }
+    if clean.as_os_str().is_empty() {
+        anyhow::bail!("dump archive path is empty");
+    }
+    Ok(clean)
 }
 
 fn copy_tree_with_manifest(
@@ -2434,6 +2452,23 @@ mod tests {
         assert_eq!(json_escape("\"\\\n"), "\\\"\\\\\\n");
         assert_eq!(checksum_hex(b"same"), checksum_hex(b"same"));
         assert!(run_pg_restore(&dir.path().join("missing.dump"), &dir.path().join("bad")).is_err());
+    }
+
+    #[test]
+    fn pg_restore_rejects_archive_paths_outside_data_dir() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let archive = dir.path().join("escape.dump");
+        let data_dir = dir.path().join("restore");
+        let escaped = dir.path().join("escaped");
+
+        fs::write(
+            &archive,
+            "ULTRASQL_DUMP_V1 format=Plain\nFILE 5 ../escaped\n68656c6c6f\nEND\n",
+        )
+        .expect("write archive");
+
+        assert!(run_pg_restore(&archive, &data_dir).is_err());
+        assert!(!escaped.exists());
     }
 
     #[test]
