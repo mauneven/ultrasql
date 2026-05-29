@@ -480,7 +480,9 @@ impl LogicalReplicationRuntime {
         let Some(root) = &self.metadata_dir else {
             return Ok(());
         };
-        match fs::remove_file(metadata_path(&root.join(kind), name)) {
+        let dir = root.join(kind);
+        ensure_directory(&dir, "logical replication metadata directory")?;
+        match fs::remove_file(metadata_path(&dir, name)) {
             Ok(()) => Ok(()),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
             Err(e) => Err(ServerError::Io(e)),
@@ -1054,6 +1056,32 @@ mod tests {
                 .next()
                 .is_none()
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn logical_metadata_drop_does_not_follow_swapped_symlinked_kind_directory() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::TempDir::new().expect("metadata dir");
+        let outside = tempfile::TempDir::new().expect("outside dir");
+        let runtime = LogicalReplicationRuntime::open_metadata(dir.path()).expect("runtime");
+        runtime
+            .create_publication("pub_events", vec!["events".to_string()])
+            .expect("publication");
+        fs::remove_file(metadata_path(
+            &dir.path().join("publications"),
+            "pub_events",
+        ))
+        .expect("remove local metadata");
+        fs::remove_dir(dir.path().join("publications")).expect("remove publications dir");
+        let outside_file = metadata_path(outside.path(), "pub_events");
+        fs::write(&outside_file, "name=pub_events\ntables=secret\n").expect("outside metadata");
+        symlink(outside.path(), dir.path().join("publications")).expect("publication dir symlink");
+
+        assert!(runtime.drop_publication("pub_events"));
+
+        assert!(outside_file.exists());
     }
 
     #[test]
