@@ -1940,7 +1940,7 @@ fn rows_pg_settings(ctx: &LowerCtx<'_>) -> Vec<Vec<Value>> {
         ],
         vec![
             v_text("archive_command"),
-            v_text(&ctx.wal_archive_config.archive_command),
+            sensitive_setting_value(&ctx.wal_archive_config.archive_command),
             Value::Null,
             v_text("Write-Ahead Log / Archiving"),
             v_text("Command to archive completed WAL files."),
@@ -1949,7 +1949,7 @@ fn rows_pg_settings(ctx: &LowerCtx<'_>) -> Vec<Vec<Value>> {
         ],
         vec![
             v_text("restore_command"),
-            v_text(&ctx.wal_archive_config.restore_command),
+            sensitive_setting_value(&ctx.wal_archive_config.restore_command),
             Value::Null,
             v_text("Write-Ahead Log / Recovery"),
             v_text("Command to restore archived WAL files."),
@@ -1988,6 +1988,14 @@ fn rows_pg_settings(ctx: &LowerCtx<'_>) -> Vec<Vec<Value>> {
             v_text("sighup"),
         ],
     ]
+}
+
+fn sensitive_setting_value(value: &str) -> Value {
+    if value.is_empty() {
+        v_text("")
+    } else {
+        v_text("<redacted>")
+    }
 }
 
 fn format_scale_factor(value: f64) -> String {

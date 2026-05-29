@@ -8,7 +8,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use tokio_postgres::NoTls;
-use ultrasql_server::{Server, bind_listener, serve_listener};
+use ultrasql_server::{Server, WalArchiveConfig, bind_listener, serve_listener};
 
 async fn start_server_and_connect() -> (
     Arc<Server>,
@@ -16,12 +16,35 @@ async fn start_server_and_connect() -> (
     tokio::task::JoinHandle<()>,
     tokio::task::JoinHandle<Result<(), ultrasql_server::ServerError>>,
 ) {
+    start_server_and_connect_with(Server::with_sample_database()).await
+}
+
+async fn start_server_and_connect_with(
+    server: Server,
+) -> (
+    Arc<Server>,
+    tokio_postgres::Client,
+    tokio::task::JoinHandle<()>,
+    tokio::task::JoinHandle<Result<(), ultrasql_server::ServerError>>,
+) {
+    start_server_and_connect_with_user(server, "tester").await
+}
+
+async fn start_server_and_connect_with_user(
+    server: Server,
+    user: &str,
+) -> (
+    Arc<Server>,
+    tokio_postgres::Client,
+    tokio::task::JoinHandle<()>,
+    tokio::task::JoinHandle<Result<(), ultrasql_server::ServerError>>,
+) {
     let addr: SocketAddr = "127.0.0.1:0".parse().expect("addr parses");
     let (listener, bound) = bind_listener(addr).await.expect("bind");
-    let server = Arc::new(Server::with_sample_database());
+    let server = Arc::new(server);
     let server_handle = tokio::spawn(serve_listener(listener, Arc::clone(&server)));
     let conn_str = format!(
-        "host={host} port={port} user=tester application_name=catalog_views_test",
+        "host={host} port={port} user={user} application_name=catalog_views_test",
         host = bound.ip(),
         port = bound.port()
     );
@@ -547,6 +570,39 @@ async fn pg_catalog_and_information_schema_reflect_runtime_objects() {
         .await
         .expect("information_schema.triggers query");
     assert!(triggers.is_empty());
+
+    shutdown(client, server_handle).await;
+}
+
+#[tokio::test]
+async fn pg_settings_redacts_wal_archive_commands() {
+    let mut server = Server::with_sample_database();
+    server.set_wal_archive_config(WalArchiveConfig {
+        archive_command: "aws s3 cp %p s3://bucket/%f --token secret".to_owned(),
+        restore_command: "curl -H 'Authorization: Bearer secret' %f > %p".to_owned(),
+    });
+    let (_server, client, _conn, server_handle) =
+        start_server_and_connect_with_user(server, "ultrasql").await;
+
+    let rows = client
+        .query(
+            "SELECT name, setting \
+             FROM pg_catalog.pg_settings \
+             WHERE name IN ('archive_command', 'restore_command') \
+             ORDER BY name",
+            &[],
+        )
+        .await
+        .expect("pg_settings WAL command query");
+    let pairs: Vec<(String, String)> = rows.iter().map(|row| (row.get(0), row.get(1))).collect();
+
+    assert_eq!(
+        pairs,
+        vec![
+            ("archive_command".to_owned(), "<redacted>".to_owned()),
+            ("restore_command".to_owned(), "<redacted>".to_owned()),
+        ]
+    );
 
     shutdown(client, server_handle).await;
 }
