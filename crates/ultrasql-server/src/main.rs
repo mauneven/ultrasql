@@ -552,12 +552,16 @@ fn logging_config_from_cli(cli: &Cli) -> Result<LoggingConfig, String> {
 }
 
 fn apply_startup_signal_files(state: &Server, data_dir: &Path) -> bool {
-    let enabled =
-        data_dir.join("standby.signal").exists() || data_dir.join("recovery.signal").exists();
+    let enabled = startup_signal_file_present(&data_dir.join("standby.signal"))
+        || startup_signal_file_present(&data_dir.join("recovery.signal"));
     if enabled {
         state.set_standby_mode(true);
     }
     enabled
+}
+
+fn startup_signal_file_present(path: &Path) -> bool {
+    std::fs::symlink_metadata(path).is_ok_and(|metadata| metadata.file_type().is_file())
 }
 
 fn start_backup_fence(state: &Server) -> Result<String, String> {
@@ -1354,5 +1358,20 @@ mod tests {
         std::fs::write(dir.path().join("standby.signal"), b"standby\n").expect("write signal");
         assert!(apply_startup_signal_files(&server, dir.path()));
         assert!(server.is_standby_mode());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn startup_signal_files_ignore_symlinked_markers() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let server = Server::with_sample_database();
+        let outside = dir.path().join("outside-signal");
+        std::fs::write(&outside, b"standby\n").expect("outside signal");
+        symlink(&outside, dir.path().join("standby.signal")).expect("standby symlink");
+
+        assert!(!apply_startup_signal_files(&server, dir.path()));
+        assert!(!server.is_standby_mode());
     }
 }
