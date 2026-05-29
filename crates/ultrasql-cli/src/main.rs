@@ -1781,7 +1781,7 @@ fn run_archive_wal(wal_path: &Path, archive_dir: &Path) -> Result<()> {
         .context("WAL path must have a filename")?;
     validate_wal_file_name(name)?;
     let dest = archive_dir.join(name);
-    fs::copy(wal_path, &dest)?;
+    copy_regular_file(wal_path, &dest, "WAL archive")?;
     println!("archived {} to {}", wal_path.display(), dest.display());
     Ok(())
 }
@@ -1789,8 +1789,7 @@ fn run_archive_wal(wal_path: &Path, archive_dir: &Path) -> Result<()> {
 fn run_restore_wal(wal_name: &str, archive_dir: &Path, output: &Path) -> Result<()> {
     validate_wal_file_name(wal_name)?;
     let source = archive_dir.join(wal_name);
-    fs::copy(&source, output)
-        .with_context(|| format!("restore WAL {} to {}", source.display(), output.display()))?;
+    copy_regular_file(&source, output, "WAL restore")?;
     println!("restored {} to {}", source.display(), output.display());
     Ok(())
 }
@@ -2646,6 +2645,43 @@ mod tests {
         fs::create_dir_all(restore.join("base/1")).expect("restore dir");
         symlink(&outside, restore.join("base/1/heap")).expect("target symlink");
         assert!(run_pg_restore(&archive, &restore).is_err());
+        assert_eq!(fs::read(&outside).expect("outside unchanged"), b"keep");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn wal_archive_restore_rejects_symlinked_sources_and_targets() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let wal_name = "000000010000000000000001";
+        let outside = dir.path().join("outside");
+        fs::write(&outside, b"keep").expect("outside file");
+
+        let wal_link = dir.path().join(wal_name);
+        symlink(&outside, &wal_link).expect("wal source symlink");
+        let archive = dir.path().join("archive");
+        assert!(run_archive_wal(&wal_link, &archive).is_err());
+        assert!(!archive.join(wal_name).exists());
+
+        let real_wal = dir.path().join("000000010000000000000002");
+        fs::write(&real_wal, b"wal").expect("real wal");
+        fs::create_dir_all(&archive).expect("archive dir");
+        symlink(&outside, archive.join("000000010000000000000002")).expect("archive symlink");
+        assert!(run_archive_wal(&real_wal, &archive).is_err());
+        assert_eq!(fs::read(&outside).expect("outside unchanged"), b"keep");
+
+        let restore_archive = dir.path().join("restore-archive");
+        fs::create_dir_all(&restore_archive).expect("restore archive dir");
+        symlink(&outside, restore_archive.join(wal_name)).expect("restore source symlink");
+        assert!(run_restore_wal(wal_name, &restore_archive, &dir.path().join("restored")).is_err());
+
+        let real_archive = dir.path().join("real-archive");
+        fs::create_dir_all(&real_archive).expect("real archive dir");
+        fs::write(real_archive.join(wal_name), b"wal").expect("archive wal");
+        let output = dir.path().join("output");
+        symlink(&outside, &output).expect("restore output symlink");
+        assert!(run_restore_wal(wal_name, &real_archive, &output).is_err());
         assert_eq!(fs::read(&outside).expect("outside unchanged"), b"keep");
     }
 
