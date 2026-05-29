@@ -570,6 +570,7 @@ impl ReplicationSlotStore {
 
     /// Load a slot, creating it if absent.
     pub fn get_or_create(&self, name: &str) -> Result<ReplicationSlot, ServerError> {
+        validate_replication_slot_name(name)?;
         let path = self.slot_path(name);
         if !path.exists() {
             let slot = ReplicationSlot::new(name);
@@ -582,6 +583,7 @@ impl ReplicationSlotStore {
 
     /// Save a slot atomically enough for single-process tools.
     pub fn save(&self, slot: &ReplicationSlot) -> Result<(), ServerError> {
+        validate_replication_slot_name(&slot.name)?;
         fs::create_dir_all(&self.root).map_err(ServerError::Io)?;
         let body = format!(
             "name={}\nrestart_lsn={}\nconfirmed_flush_lsn={}\n",
@@ -616,6 +618,21 @@ impl ReplicationSlotStore {
 
     fn slot_path(&self, name: &str) -> PathBuf {
         self.root.join(format!("{name}.slot"))
+    }
+}
+
+fn validate_replication_slot_name(name: &str) -> Result<(), ServerError> {
+    let valid = !name.is_empty()
+        && name.len() <= 63
+        && name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_');
+    if valid {
+        Ok(())
+    } else {
+        Err(ServerError::ddl(
+            "invalid replication slot name; use ASCII letters, digits, and underscore",
+        ))
     }
 }
 
@@ -794,6 +811,20 @@ mod tests {
             Some("0000000100000000")
         );
         assert_eq!(slots[1].name, "standby_b");
+    }
+
+    #[test]
+    fn slot_store_rejects_path_traversal_slot_names() {
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let slots_dir = dir.path().join("pg_replslot");
+        let store = ReplicationSlotStore::open(&slots_dir).expect("slot store");
+
+        let err = store
+            .get_or_create("../escaped")
+            .expect_err("traversal slot rejected");
+
+        assert!(err.to_string().contains("invalid replication slot name"));
+        assert!(!dir.path().join("escaped.slot").exists());
     }
 
     #[test]
