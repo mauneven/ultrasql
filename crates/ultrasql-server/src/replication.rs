@@ -5,7 +5,8 @@
 //! future network WAL sender can share the same slot-state rules.
 
 use std::collections::BTreeSet;
-use std::fs;
+use std::fs::{self, OpenOptions};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -390,10 +391,10 @@ impl LogicalReplicationRuntime {
         fs::create_dir_all(root.join("logical_slots")).map_err(ServerError::Io)?;
         for entry in fs::read_dir(root.join("publications")).map_err(ServerError::Io)? {
             let entry = entry.map_err(ServerError::Io)?;
-            let path = entry.path();
-            if !path.is_file() {
+            if !entry.file_type().map_err(ServerError::Io)?.is_file() {
                 continue;
             }
+            let path = entry.path();
             let text = fs::read_to_string(path).map_err(ServerError::Io)?;
             if let Some(publication) = parse_publication_metadata(&text) {
                 self.publications
@@ -402,10 +403,10 @@ impl LogicalReplicationRuntime {
         }
         for entry in fs::read_dir(root.join("subscriptions")).map_err(ServerError::Io)? {
             let entry = entry.map_err(ServerError::Io)?;
-            let path = entry.path();
-            if !path.is_file() {
+            if !entry.file_type().map_err(ServerError::Io)?.is_file() {
                 continue;
             }
+            let path = entry.path();
             let text = fs::read_to_string(path).map_err(ServerError::Io)?;
             if let Some(subscription) = parse_subscription_metadata(&text) {
                 self.subscriptions
@@ -415,10 +416,10 @@ impl LogicalReplicationRuntime {
         let mut max_confirmed = 0_u64;
         for entry in fs::read_dir(root.join("logical_slots")).map_err(ServerError::Io)? {
             let entry = entry.map_err(ServerError::Io)?;
-            let path = entry.path();
-            if !path.is_file() {
+            if !entry.file_type().map_err(ServerError::Io)?.is_file() {
                 continue;
             }
+            let path = entry.path();
             let text = fs::read_to_string(path).map_err(ServerError::Io)?;
             if let Some(slot) = parse_logical_slot_metadata(&text) {
                 max_confirmed = max_confirmed.max(slot.confirmed_lsn);
@@ -438,7 +439,7 @@ impl LogicalReplicationRuntime {
         fs::create_dir_all(&dir).map_err(ServerError::Io)?;
         let tables = publication.tables().collect::<Vec<_>>().join(",");
         let body = format!("name={}\ntables={tables}\n", publication.name);
-        fs::write(metadata_path(&dir, &publication.name), body).map_err(ServerError::Io)
+        write_regular_text_file(&metadata_path(&dir, &publication.name), &body)
     }
 
     fn persist_subscription(&self, subscription: &Subscription) -> Result<(), ServerError> {
@@ -455,7 +456,7 @@ impl LogicalReplicationRuntime {
             subscription.publications.join(","),
             subscription.enabled
         );
-        fs::write(metadata_path(&dir, &subscription.name), body).map_err(ServerError::Io)
+        write_regular_text_file(&metadata_path(&dir, &subscription.name), &body)
     }
 
     fn persist_logical_slot(&self, slot: &LogicalReplicationSlot) -> Result<(), ServerError> {
@@ -465,7 +466,7 @@ impl LogicalReplicationRuntime {
         let dir = root.join("logical_slots");
         fs::create_dir_all(&dir).map_err(ServerError::Io)?;
         let body = format!("name={}\nconfirmed_lsn={}\n", slot.name, slot.confirmed_lsn);
-        fs::write(metadata_path(&dir, &slot.name), body).map_err(ServerError::Io)
+        write_regular_text_file(&metadata_path(&dir, &slot.name), &body)
     }
 
     fn remove_metadata_file(&self, kind: &str, name: &str) -> Result<(), ServerError> {
@@ -478,6 +479,27 @@ impl LogicalReplicationRuntime {
             Err(e) => Err(ServerError::Io(e)),
         }
     }
+}
+
+fn write_regular_text_file(path: &Path, body: &str) -> Result<(), ServerError> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if !metadata.file_type().is_file() => {
+            return Err(ServerError::ddl(format!(
+                "refusing to write non-regular metadata file {}",
+                path.display()
+            )));
+        }
+        Ok(_) => {}
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+        Err(err) => return Err(ServerError::Io(err)),
+    }
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(path)
+        .map_err(ServerError::Io)?;
+    file.write_all(body.as_bytes()).map_err(ServerError::Io)
 }
 
 fn fold_identifier(ident: &str) -> String {
@@ -572,10 +594,20 @@ impl ReplicationSlotStore {
     pub fn get_or_create(&self, name: &str) -> Result<ReplicationSlot, ServerError> {
         validate_replication_slot_name(name)?;
         let path = self.slot_path(name);
-        if !path.exists() {
-            let slot = ReplicationSlot::new(name);
-            self.save(&slot)?;
-            return Ok(slot);
+        match fs::symlink_metadata(&path) {
+            Ok(metadata) if metadata.file_type().is_file() => {}
+            Ok(_) => {
+                return Err(ServerError::ddl(format!(
+                    "replication slot state is not a regular file: {}",
+                    path.display()
+                )));
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                let slot = ReplicationSlot::new(name);
+                self.save(&slot)?;
+                return Ok(slot);
+            }
+            Err(err) => return Err(ServerError::Io(err)),
         }
         let text = fs::read_to_string(path).map_err(ServerError::Io)?;
         Ok(parse_slot(name, &text))
@@ -591,7 +623,7 @@ impl ReplicationSlotStore {
             slot.restart_lsn.clone().unwrap_or_default(),
             slot.confirmed_flush_lsn.clone().unwrap_or_default()
         );
-        fs::write(self.slot_path(&slot.name), body).map_err(ServerError::Io)
+        write_regular_text_file(&self.slot_path(&slot.name), &body)
     }
 
     /// Return all persisted slots in deterministic slot-name order.
@@ -602,8 +634,11 @@ impl ReplicationSlotStore {
         }
         for entry in fs::read_dir(&self.root).map_err(ServerError::Io)? {
             let entry = entry.map_err(ServerError::Io)?;
+            if !entry.file_type().map_err(ServerError::Io)?.is_file() {
+                continue;
+            }
             let path = entry.path();
-            if !path.is_file() || path.extension().and_then(|ext| ext.to_str()) != Some("slot") {
+            if path.extension().and_then(|ext| ext.to_str()) != Some("slot") {
                 continue;
             }
             let Some(stem) = path.file_stem().and_then(|name| name.to_str()) else {
@@ -838,6 +873,56 @@ mod tests {
 
         assert!(err.to_string().contains("invalid replication slot name"));
         assert!(!dir.path().join("escaped.slot").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn slot_store_rejects_symlinked_slot_state_files() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let slots_dir = dir.path().join("pg_replslot");
+        let store = ReplicationSlotStore::open(&slots_dir).expect("slot store");
+        let outside = dir.path().join("outside.slot");
+        fs::write(&outside, "keep").expect("outside slot");
+        symlink(&outside, slots_dir.join("standby.slot")).expect("slot symlink");
+
+        assert!(store.get_or_create("standby").is_err());
+        assert!(store.save(&ReplicationSlot::new("standby")).is_err());
+        assert!(store.list().expect("list slots").is_empty());
+        assert_eq!(
+            fs::read_to_string(&outside).expect("outside unchanged"),
+            "keep"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn logical_metadata_ignores_and_rejects_symlinked_files() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::TempDir::new().expect("metadata dir");
+        let publications = dir.path().join("publications");
+        fs::create_dir_all(&publications).expect("publications dir");
+        let outside = dir.path().join("outside.meta");
+        fs::write(&outside, "name=pub_events\ntables=events\n").expect("outside metadata");
+        symlink(
+            &outside,
+            publications.join(format!("{}.meta", hex_name("pub_events"))),
+        )
+        .expect("metadata symlink");
+
+        let runtime = LogicalReplicationRuntime::open_metadata(dir.path()).expect("runtime");
+        assert!(runtime.publication("pub_events").is_none());
+        assert!(
+            runtime
+                .create_publication("pub_events", vec!["events".to_string()])
+                .is_err()
+        );
+        assert_eq!(
+            fs::read_to_string(&outside).expect("outside unchanged"),
+            "name=pub_events\ntables=events\n"
+        );
     }
 
     #[test]
