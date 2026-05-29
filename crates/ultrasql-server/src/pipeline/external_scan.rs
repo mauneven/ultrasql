@@ -5,8 +5,10 @@
 //! common scan contract seen by the rest of the executor.
 
 use std::collections::{BTreeMap, VecDeque};
-use std::fs::{self, File};
-use std::io::{BufRead, BufReader, Cursor, Read};
+use std::fs::{self, File, OpenOptions};
+use std::io::{BufRead, BufReader, Cursor, ErrorKind, Read};
+#[cfg(unix)]
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 
 use arrow_ipc::reader::FileReader as ArrowFileReader;
@@ -30,6 +32,8 @@ use super::object_stream::ObjectRangeReader;
 use super::parquet_scan::{ParquetPredicate, ParquetTableScan};
 
 const EXTERNAL_BATCH_TARGET_ROWS: usize = 4096;
+const DEFAULT_EXTERNAL_LOCAL_READ_LIMIT_BYTES: u64 = 128 * 1024 * 1024;
+const EXTERNAL_LOCAL_READ_LIMIT_ENV: &str = "ULTRASQL_EXTERNAL_LOCAL_READ_LIMIT_BYTES";
 
 /// Return true for file-backed table functions lowered through
 /// [`ExternalTableScan`].
@@ -412,7 +416,7 @@ fn read_external_sources(
 
 fn open_local_external_file(function_name: &str, path: &Path) -> Result<File, ServerError> {
     ensure_regular_external_file(function_name, path)?;
-    File::open(path).map_err(|err| {
+    open_regular_external_file(path).map_err(|err| {
         ServerError::CopyFormat(format!(
             "{function_name} cannot open {}: {err}",
             path.display()
@@ -421,16 +425,47 @@ fn open_local_external_file(function_name: &str, path: &Path) -> Result<File, Se
 }
 
 fn read_local_external_file(function_name: &str, path: &Path) -> Result<Vec<u8>, ServerError> {
-    ensure_regular_external_file(function_name, path)?;
-    fs::read(path).map_err(|err| {
+    let metadata = ensure_regular_external_file(function_name, path)?;
+    let limit = external_local_read_limit_bytes();
+    if metadata.len() > limit {
+        return Err(external_local_read_limit_error(
+            function_name,
+            path,
+            metadata.len(),
+            limit,
+        ));
+    }
+
+    let file = open_regular_external_file(path).map_err(|err| {
+        ServerError::CopyFormat(format!(
+            "{function_name} cannot open {}: {err}",
+            path.display()
+        ))
+    })?;
+    let mut limited = file.take(limit.saturating_add(1));
+    let mut bytes = Vec::new();
+    limited.read_to_end(&mut bytes).map_err(|err| {
         ServerError::CopyFormat(format!(
             "{function_name} cannot read {}: {err}",
             path.display()
         ))
-    })
+    })?;
+    let bytes_read = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
+    if bytes_read > limit {
+        return Err(external_local_read_limit_error(
+            function_name,
+            path,
+            bytes_read,
+            limit,
+        ));
+    }
+    Ok(bytes)
 }
 
-fn ensure_regular_external_file(function_name: &str, path: &Path) -> Result<(), ServerError> {
+fn ensure_regular_external_file(
+    function_name: &str,
+    path: &Path,
+) -> Result<fs::Metadata, ServerError> {
     let metadata = fs::symlink_metadata(path).map_err(|err| {
         ServerError::CopyFormat(format!(
             "{function_name} cannot inspect {}: {err}",
@@ -438,13 +473,54 @@ fn ensure_regular_external_file(function_name: &str, path: &Path) -> Result<(), 
         ))
     })?;
     if metadata.file_type().is_file() {
-        Ok(())
+        Ok(metadata)
     } else {
         Err(ServerError::CopyFormat(format!(
             "{function_name} path is not a regular file: {}",
             path.display()
         )))
     }
+}
+
+#[cfg_attr(not(unix), allow(unused_variables))]
+fn open_regular_external_file(path: &Path) -> std::io::Result<File> {
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    options.custom_flags(libc::O_NOFOLLOW);
+    let file = options.open(path)?;
+    let metadata = file.metadata()?;
+    if metadata.file_type().is_file() {
+        Ok(file)
+    } else {
+        Err(std::io::Error::new(
+            ErrorKind::InvalidInput,
+            format!("path is not a regular file: {}", path.display()),
+        ))
+    }
+}
+
+fn external_local_read_limit_bytes() -> u64 {
+    std::env::var(EXTERNAL_LOCAL_READ_LIMIT_ENV)
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|&limit| limit > 0)
+        .unwrap_or(DEFAULT_EXTERNAL_LOCAL_READ_LIMIT_BYTES)
+}
+
+fn external_local_read_limit_error(
+    function_name: &str,
+    path: &Path,
+    bytes: u64,
+    limit: u64,
+) -> ServerError {
+    ServerError::CopyFormat(format!(
+        "{function_name} file exceeds read limit: path={} bytes={} limit={} env={}",
+        path.display(),
+        bytes,
+        limit,
+        EXTERNAL_LOCAL_READ_LIMIT_ENV
+    ))
 }
 
 fn path_specs_use_object_store(
@@ -1277,6 +1353,31 @@ mod tests {
     }
 
     #[test]
+    fn external_local_sources_reject_configured_oversized_files() {
+        let _env_guard = external_env_test_lock();
+        // SAFETY: external_env_test_lock serializes process-env mutation in
+        // this module's tests.
+        unsafe {
+            std::env::set_var("ULTRASQL_EXTERNAL_LOCAL_READ_LIMIT_BYTES", "3");
+        }
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("oversized.arrow");
+        fs::write(&path, b"abcd").expect("write file");
+
+        let err = read_external_sources("read_arrow", &[path.to_string_lossy().to_string()])
+            .expect_err("oversized local file rejected");
+
+        assert!(err.to_string().contains("exceeds read limit"));
+
+        // SAFETY: external_env_test_lock serializes process-env mutation in
+        // this module's tests.
+        unsafe {
+            std::env::remove_var("ULTRASQL_EXTERNAL_LOCAL_READ_LIMIT_BYTES");
+        }
+    }
+
+    #[test]
     fn read_ndjson_uses_streaming_scan_source() {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("people.ndjson");
@@ -1293,5 +1394,11 @@ mod tests {
         .expect("ndjson scan");
 
         assert!(matches!(scan.source, ExternalScanSource::Streaming(_)));
+    }
+
+    fn external_env_test_lock() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        LOCK.lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 }
