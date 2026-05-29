@@ -1529,13 +1529,18 @@ fn run_pg_dump(data_dir: &Path, dest: &Path, format: DumpFormat) -> Result<()> {
 
 fn run_pg_restore(source: &Path, data_dir: &Path) -> Result<()> {
     fs::create_dir_all(data_dir)?;
-    if source.is_dir() {
+    let source_type = fs::symlink_metadata(source)
+        .with_context(|| format!("cannot inspect dump source: {}", source.display()))?
+        .file_type();
+    if source_type.is_dir() {
         restore_dump_directory(source, source, data_dir)?;
         println!("restored directory dump into {}", data_dir.display());
         return Ok(());
     }
-    let text = fs::read_to_string(source)
-        .with_context(|| format!("cannot read dump archive: {}", source.display()))?;
+    if !source_type.is_file() {
+        anyhow::bail!("dump source is not a regular file: {}", source.display());
+    }
+    let text = read_regular_text_file(source, "dump archive")?;
     let mut lines = text.lines();
     let header = lines.next().context("empty dump archive")?;
     if !header.starts_with("ULTRASQL_DUMP_V1 ") {
@@ -1568,7 +1573,7 @@ fn run_pg_restore(source: &Path, data_dir: &Path) -> Result<()> {
         if let Some(parent) = dest.parent() {
             fs::create_dir_all(parent)?;
         }
-        fs::write(dest, bytes)?;
+        write_regular_file(&dest, &bytes, "dump archive restore")?;
     }
     println!("restored archive dump into {}", data_dir.display());
     Ok(())
@@ -1600,21 +1605,24 @@ fn copy_tree_with_manifest(
 ) -> Result<()> {
     for entry in fs::read_dir(current)? {
         let entry = entry?;
+        let file_type = entry.file_type()?;
         let path = entry.path();
         let rel = path.strip_prefix(root)?.to_path_buf();
         let dest = dest_root.join(&rel);
-        if path.is_dir() {
+        if file_type.is_dir() {
             fs::create_dir_all(&dest)?;
             copy_tree_with_manifest(root, &path, dest_root, manifest)?;
-        } else if path.is_file() {
+        } else if file_type.is_file() {
             if let Some(parent) = dest.parent() {
                 fs::create_dir_all(parent)?;
             }
-            fs::copy(&path, &dest)?;
-            let bytes = fs::read(&path)?;
+            copy_regular_file(&path, &dest, "dump source")?;
+            let bytes = read_regular_file(&path, "dump source")?;
             let checksum = checksum_hex(&bytes);
             let len = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
             manifest.push((rel.display().to_string(), len, checksum));
+        } else {
+            anyhow::bail!("dump source is not a regular file: {}", path.display());
         }
     }
     Ok(())
@@ -1649,12 +1657,15 @@ fn collect_dump_entries(
 ) -> Result<()> {
     for entry in fs::read_dir(current)? {
         let entry = entry?;
+        let file_type = entry.file_type()?;
         let path = entry.path();
-        if path.is_dir() {
+        if file_type.is_dir() {
             collect_dump_entries(root, &path, entries)?;
-        } else if path.is_file() {
+        } else if file_type.is_file() {
             let rel = path.strip_prefix(root)?.display().to_string();
-            entries.push((rel, fs::read(&path)?));
+            entries.push((rel, read_regular_file(&path, "dump source")?));
+        } else {
+            anyhow::bail!("dump source is not a regular file: {}", path.display());
         }
     }
     Ok(())
@@ -1663,23 +1674,82 @@ fn collect_dump_entries(
 fn restore_dump_directory(root: &Path, current: &Path, data_dir: &Path) -> Result<()> {
     for entry in fs::read_dir(current)? {
         let entry = entry?;
+        let file_type = entry.file_type()?;
         let path = entry.path();
         let rel = path.strip_prefix(root)?;
         if rel == Path::new("ultrasql_dump.manifest") {
             continue;
         }
         let dest = data_dir.join(rel);
-        if path.is_dir() {
+        if file_type.is_dir() {
             fs::create_dir_all(&dest)?;
             restore_dump_directory(root, &path, data_dir)?;
-        } else if path.is_file() {
+        } else if file_type.is_file() {
             if let Some(parent) = dest.parent() {
                 fs::create_dir_all(parent)?;
             }
-            fs::copy(&path, &dest)?;
+            copy_regular_file(&path, &dest, "directory dump restore")?;
+        } else {
+            anyhow::bail!("dump source is not a regular file: {}", path.display());
         }
     }
     Ok(())
+}
+
+fn read_regular_text_file(path: &Path, context: &str) -> Result<String> {
+    ensure_regular_source_file(path, context)?;
+    fs::read_to_string(path).with_context(|| format!("cannot read {context}: {}", path.display()))
+}
+
+fn read_regular_file(path: &Path, context: &str) -> Result<Vec<u8>> {
+    ensure_regular_source_file(path, context)?;
+    fs::read(path).with_context(|| format!("cannot read {context}: {}", path.display()))
+}
+
+fn copy_regular_file(source: &Path, dest: &Path, context: &str) -> Result<()> {
+    ensure_regular_source_file(source, context)?;
+    ensure_regular_destination_file(dest, context)?;
+    fs::copy(source, dest).with_context(|| {
+        format!(
+            "cannot copy {context}: {} to {}",
+            source.display(),
+            dest.display()
+        )
+    })?;
+    Ok(())
+}
+
+fn write_regular_file(dest: &Path, bytes: &[u8], context: &str) -> Result<()> {
+    ensure_regular_destination_file(dest, context)?;
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(dest)
+        .with_context(|| format!("cannot create {context}: {}", dest.display()))?;
+    std::io::Write::write_all(&mut file, bytes)
+        .with_context(|| format!("cannot write {context}: {}", dest.display()))
+}
+
+fn ensure_regular_source_file(path: &Path, context: &str) -> Result<()> {
+    let metadata = fs::symlink_metadata(path)
+        .with_context(|| format!("cannot inspect {context}: {}", path.display()))?;
+    if metadata.file_type().is_file() {
+        Ok(())
+    } else {
+        anyhow::bail!("{context} is not a regular file: {}", path.display());
+    }
+}
+
+fn ensure_regular_destination_file(path: &Path, context: &str) -> Result<()> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_file() => Ok(()),
+        Ok(_) => anyhow::bail!("{context} target is not a regular file: {}", path.display()),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(err) => {
+            Err(err).with_context(|| format!("cannot inspect {context}: {}", path.display()))
+        }
+    }
 }
 
 fn hex_bytes(bytes: &[u8]) -> String {
@@ -2530,6 +2600,53 @@ mod tests {
 
         assert!(run_pg_restore(&archive, &data_dir).is_err());
         assert!(!escaped.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn backup_and_dump_reject_symlinked_source_files() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let data = dir.path().join("data");
+        fs::create_dir_all(data.join("base/1")).expect("create data dir");
+        let outside = dir.path().join("outside");
+        fs::write(&outside, b"secret").expect("outside file");
+        symlink(&outside, data.join("base/1/heap")).expect("source symlink");
+
+        assert!(
+            run_basebackup_copy(&data.to_path_buf(), &dir.path().join("backup"), None).is_err()
+        );
+        assert!(run_pg_dump(&data, &dir.path().join("dumpdir"), DumpFormat::Directory).is_err());
+        assert!(run_pg_dump(&data, &dir.path().join("dump.ultra"), DumpFormat::Plain).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pg_restore_rejects_symlinked_directory_sources_and_targets() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let outside = dir.path().join("outside");
+        fs::write(&outside, b"keep").expect("outside file");
+
+        let dump = dir.path().join("dumpdir");
+        fs::create_dir_all(dump.join("base/1")).expect("dump dir");
+        symlink(&outside, dump.join("base/1/heap")).expect("dump symlink");
+        assert!(run_pg_restore(&dump, &dir.path().join("restore-source")).is_err());
+        assert!(!dir.path().join("restore-source/base/1/heap").exists());
+
+        let archive = dir.path().join("dump.ultra");
+        fs::write(
+            &archive,
+            "ULTRASQL_DUMP_V1 format=Plain\nFILE 4 base/1/heap\n726f7773\nEND\n",
+        )
+        .expect("archive");
+        let restore = dir.path().join("restore-target");
+        fs::create_dir_all(restore.join("base/1")).expect("restore dir");
+        symlink(&outside, restore.join("base/1/heap")).expect("target symlink");
+        assert!(run_pg_restore(&archive, &restore).is_err());
+        assert_eq!(fs::read(&outside).expect("outside unchanged"), b"keep");
     }
 
     #[test]
