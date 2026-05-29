@@ -53,6 +53,19 @@ fn newer_catalog_version_is_refused() {
     );
 }
 
+#[test]
+fn oversized_catalog_version_marker_is_refused() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let mut marker = format!("{CURRENT_CATALOG_VERSION}\n");
+    marker.push_str(&" ".repeat(128));
+    std::fs::write(dir.path().join(CATALOG_VERSION_FILE), marker)
+        .expect("write oversized catalog marker");
+
+    let err = ensure_catalog_version(dir.path()).expect_err("oversized catalog must be refused");
+
+    assert!(err.to_string().contains("exceeds read limit"), "{err}");
+}
+
 #[cfg(unix)]
 #[test]
 fn symlinked_catalog_version_marker_is_refused() {

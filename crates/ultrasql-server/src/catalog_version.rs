@@ -5,6 +5,10 @@
 //! for pre-v1 development directories, and refuses markers written by a newer
 //! binary so an older server cannot silently corrupt a newer catalog layout.
 
+use std::fs::{File, OpenOptions};
+use std::io::{Read, Write};
+#[cfg(unix)]
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::Path;
 
 use crate::ServerError;
@@ -14,6 +18,8 @@ pub const CURRENT_CATALOG_VERSION: u32 = 1;
 
 /// Root-relative marker filename in a WAL-backed data directory.
 pub const CATALOG_VERSION_FILE: &str = "catalog.version";
+
+const CATALOG_VERSION_MARKER_LIMIT_BYTES: u64 = 64;
 
 /// Result of checking the data-directory catalog-version marker.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -42,7 +48,7 @@ pub fn ensure_catalog_version(data_dir: &Path) -> Result<CatalogVersionStatus, S
     let path = data_dir.join(CATALOG_VERSION_FILE);
     match std::fs::symlink_metadata(&path) {
         Ok(metadata) if metadata.file_type().is_file() => {
-            let raw = std::fs::read_to_string(&path).map_err(ServerError::Io)?;
+            let raw = read_catalog_version_marker(&path)?;
             let observed_version = raw.trim().parse::<u32>().map_err(|err| {
                 ServerError::Ddl(format!(
                     "catalog version marker {} is not a u32: {err}",
@@ -64,12 +70,12 @@ pub fn ensure_catalog_version(data_dir: &Path) -> Result<CatalogVersionStatus, S
             path.display()
         ))),
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-            let mut file = std::fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&path)
-                .map_err(ServerError::Io)?;
-            std::io::Write::write_all(&mut file, format!("{CURRENT_CATALOG_VERSION}\n").as_bytes())
+            let mut options = OpenOptions::new();
+            options.write(true).create_new(true);
+            #[cfg(unix)]
+            options.custom_flags(libc::O_NOFOLLOW);
+            let mut file = options.open(&path).map_err(ServerError::Io)?;
+            file.write_all(format!("{CURRENT_CATALOG_VERSION}\n").as_bytes())
                 .map_err(ServerError::Io)?;
             Ok(CatalogVersionStatus {
                 observed_version: CURRENT_CATALOG_VERSION,
@@ -78,4 +84,46 @@ pub fn ensure_catalog_version(data_dir: &Path) -> Result<CatalogVersionStatus, S
         }
         Err(err) => Err(ServerError::Io(err)),
     }
+}
+
+fn read_catalog_version_marker(path: &Path) -> Result<String, ServerError> {
+    let file = open_catalog_version_marker(path)?;
+    let metadata = file.metadata().map_err(ServerError::Io)?;
+    if !metadata.file_type().is_file() {
+        return Err(ServerError::Ddl(format!(
+            "catalog version marker {} is not a regular file",
+            path.display()
+        )));
+    }
+    if metadata.len() > CATALOG_VERSION_MARKER_LIMIT_BYTES {
+        return Err(ServerError::Ddl(format!(
+            "catalog version marker {} exceeds read limit: bytes={} limit={}",
+            path.display(),
+            metadata.len(),
+            CATALOG_VERSION_MARKER_LIMIT_BYTES
+        )));
+    }
+
+    let mut raw = String::new();
+    let mut limited = file.take(CATALOG_VERSION_MARKER_LIMIT_BYTES.saturating_add(1));
+    limited.read_to_string(&mut raw).map_err(ServerError::Io)?;
+    let bytes_read = u64::try_from(raw.len()).unwrap_or(u64::MAX);
+    if bytes_read > CATALOG_VERSION_MARKER_LIMIT_BYTES {
+        return Err(ServerError::Ddl(format!(
+            "catalog version marker {} exceeds read limit: bytes={} limit={}",
+            path.display(),
+            bytes_read,
+            CATALOG_VERSION_MARKER_LIMIT_BYTES
+        )));
+    }
+    Ok(raw)
+}
+
+#[cfg_attr(not(unix), allow(unused_variables))]
+fn open_catalog_version_marker(path: &Path) -> Result<File, ServerError> {
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    options.custom_flags(libc::O_NOFOLLOW);
+    options.open(path).map_err(ServerError::Io)
 }
