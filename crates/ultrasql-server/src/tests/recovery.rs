@@ -321,6 +321,19 @@ fn recovery_target_xid_file_parses_decimal_xid() {
 }
 
 #[test]
+fn oversized_recovery_targets_file_is_refused() {
+    let data_dir = tempfile::TempDir::new().unwrap();
+    let mut text = String::from("recovery_target_xid = '42'\n");
+    text.push_str(&" ".repeat(70 * 1024));
+    fs::write(data_dir.path().join("recovery.targets"), text).unwrap();
+
+    let err = recovery_replay_target_from_data_dir(data_dir.path())
+        .expect_err("oversized recovery targets rejected");
+
+    assert!(err.to_string().contains("exceeds read limit"), "{err}");
+}
+
+#[test]
 fn server_init_honors_recovery_target_lsn_before_installing_wal_writer() {
     let data_dir = tempfile::TempDir::new().unwrap();
     let wal_dir = data_dir.path().join("pg_wal");

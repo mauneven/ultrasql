@@ -68,11 +68,14 @@ pub mod workload;
 /// `ParameterStatus` and `pg_settings`. Drivers parse this as a PostgreSQL
 /// feature baseline; UltraSQL's own product version remains `version()`.
 pub(crate) const REPORTED_SERVER_VERSION: &str = "14.0";
+const RECOVERY_TARGETS_FILE_LIMIT_BYTES: u64 = 64 * 1024;
+const RUNTIME_METADATA_FILE_LIMIT_BYTES: u64 = 16 * 1024 * 1024;
 
 #[cfg(test)]
 pub(crate) static TPCH_TEST_CACHE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 use std::future::Future;
+use std::io::Read;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -3038,20 +3041,13 @@ fn recovery_replay_target_from_data_dir(
     data_dir: &Path,
 ) -> Result<ultrasql_wal::RecoveryTarget, ServerError> {
     let path = data_dir.join("recovery.targets");
-    let text = match std::fs::symlink_metadata(&path) {
-        Ok(metadata) if metadata.file_type().is_file() => {
-            std::fs::read_to_string(&path).map_err(ServerError::Io)?
-        }
-        Ok(_) => {
-            return Err(ServerError::ddl(format!(
-                "recovery targets file {} is not a regular file",
-                path.display()
-            )));
-        }
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-            return Ok(ultrasql_wal::RecoveryTarget::none());
-        }
-        Err(err) => return Err(ServerError::Io(err)),
+    let Some(text) = read_capped_regular_text_file(
+        &path,
+        "recovery targets file",
+        RECOVERY_TARGETS_FILE_LIMIT_BYTES,
+    )?
+    else {
+        return Ok(ultrasql_wal::RecoveryTarget::none());
     };
     let mut target = ultrasql_wal::RecoveryTarget::none();
     for line in text.lines() {
@@ -3197,17 +3193,78 @@ fn validation_check(name: &'static str, errors: Vec<String>, ok_detail: String) 
 }
 
 fn read_runtime_metadata_file(path: &Path) -> Result<Option<String>, ServerError> {
+    read_capped_regular_text_file(
+        path,
+        "runtime metadata file",
+        RUNTIME_METADATA_FILE_LIMIT_BYTES,
+    )
+}
+
+fn read_capped_regular_text_file(
+    path: &Path,
+    context: &str,
+    limit: u64,
+) -> Result<Option<String>, ServerError> {
     match std::fs::symlink_metadata(path) {
-        Ok(metadata) if metadata.file_type().is_file() => std::fs::read_to_string(path)
-            .map(Some)
-            .map_err(ServerError::Io),
+        Ok(metadata) if metadata.file_type().is_file() => {
+            if metadata.len() > limit {
+                return Err(ServerError::ddl(format!(
+                    "{context} {} exceeds read limit: bytes={} limit={}",
+                    path.display(),
+                    metadata.len(),
+                    limit
+                )));
+            }
+            let file = open_no_follow_read(path)?;
+            let opened = file.metadata().map_err(ServerError::Io)?;
+            if !opened.file_type().is_file() {
+                return Err(ServerError::ddl(format!(
+                    "{context} {} is not a regular file",
+                    path.display()
+                )));
+            }
+            if opened.len() > limit {
+                return Err(ServerError::ddl(format!(
+                    "{context} {} exceeds read limit: bytes={} limit={}",
+                    path.display(),
+                    opened.len(),
+                    limit
+                )));
+            }
+            let mut text = String::new();
+            let mut limited = file.take(limit.saturating_add(1));
+            limited.read_to_string(&mut text).map_err(ServerError::Io)?;
+            let bytes_read = u64::try_from(text.len()).unwrap_or(u64::MAX);
+            if bytes_read > limit {
+                return Err(ServerError::ddl(format!(
+                    "{context} {} exceeds read limit: bytes={} limit={}",
+                    path.display(),
+                    bytes_read,
+                    limit
+                )));
+            }
+            Ok(Some(text))
+        }
         Ok(_) => Err(ServerError::ddl(format!(
-            "runtime metadata file {} is not a regular file",
+            "{context} {} is not a regular file",
             path.display()
         ))),
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(err) => Err(ServerError::Io(err)),
     }
+}
+
+#[cfg_attr(not(unix), allow(unused_variables))]
+fn open_no_follow_read(path: &Path) -> Result<std::fs::File, ServerError> {
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+
+        options.custom_flags(libc::O_NOFOLLOW);
+    }
+    options.open(path).map_err(ServerError::Io)
 }
 
 fn write_runtime_metadata_file(path: &Path, text: &str) -> Result<(), ServerError> {
