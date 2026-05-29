@@ -613,8 +613,7 @@ impl Session {
         }
         if cmd.starts_with("\\i ") {
             let path = cmd.strip_prefix("\\i ").unwrap_or("").trim();
-            let content =
-                fs::read_to_string(path).with_context(|| format!("cannot read file: {path}"))?;
+            let content = read_sql_script_file(Path::new(path))?;
             // Execute each SQL statement from the file directly (no meta-
             // recursion: \i inside an \i file is not supported).
             for stmt in split_statements(&content) {
@@ -1149,8 +1148,7 @@ async fn run(cli: Cli) -> Result<()> {
 
     // -f / --file: execute from file and exit.
     if let Some(path) = cli.file {
-        let content = fs::read_to_string(&path)
-            .with_context(|| format!("cannot read file: {}", path.display()))?;
+        let content = read_sql_script_file(&path)?;
         session.exec_batch(&content).await?;
         return Ok(());
     }
@@ -1266,6 +1264,7 @@ struct OpsHttpResponse {
 }
 
 const OPS_HTTP_RESPONSE_LIMIT_BYTES: usize = 64 * 1024;
+const DEFAULT_SQL_SCRIPT_FILE_LIMIT_BYTES: u64 = 128 * 1024 * 1024;
 
 async fn http_get_ops_endpoint(endpoint: &str, path: &str) -> Result<OpsHttpResponse> {
     http_ops_endpoint("GET", endpoint, path).await
@@ -1769,6 +1768,23 @@ fn read_regular_text_file(path: &Path, context: &str) -> Result<String> {
     let mut file = open_regular_source_file(path, context)?;
     std::io::Read::read_to_end(&mut file, &mut bytes)
         .with_context(|| format!("cannot read {context}: {}", path.display()))?;
+    String::from_utf8(bytes).with_context(|| format!("{context} is not UTF-8: {}", path.display()))
+}
+
+fn read_sql_script_file(path: &Path) -> Result<String> {
+    read_regular_text_file_capped(path, "SQL script", sql_script_file_limit_bytes())
+}
+
+fn sql_script_file_limit_bytes() -> u64 {
+    std::env::var("ULTRASQL_SQL_SCRIPT_FILE_LIMIT_BYTES")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(DEFAULT_SQL_SCRIPT_FILE_LIMIT_BYTES)
+}
+
+fn read_regular_text_file_capped(path: &Path, context: &str, limit: u64) -> Result<String> {
+    let bytes = read_regular_file_capped(path, context, limit)?;
     String::from_utf8(bytes).with_context(|| format!("{context} is not UTF-8: {}", path.display()))
 }
 
@@ -2678,6 +2694,28 @@ mod tests {
     fn cli_env_test_lock() -> std::sync::MutexGuard<'static, ()> {
         static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
         LOCK.lock().expect("cli env test lock")
+    }
+
+    #[test]
+    fn sql_script_file_reads_are_bounded() {
+        let _env_guard = cli_env_test_lock();
+        // SAFETY: cli_env_test_lock serializes process-env mutation in this
+        // module's tests.
+        unsafe {
+            std::env::set_var("ULTRASQL_SQL_SCRIPT_FILE_LIMIT_BYTES", "3");
+        }
+        let dir = tempfile::tempdir().expect("tempdir");
+        let script = dir.path().join("script.sql");
+        fs::write(&script, "SELECT 1;").expect("write script");
+
+        let err = read_sql_script_file(&script).expect_err("oversized script rejected");
+
+        assert!(err.to_string().contains("exceeds read limit"), "{err}");
+        // SAFETY: cli_env_test_lock serializes process-env mutation in this
+        // module's tests.
+        unsafe {
+            std::env::remove_var("ULTRASQL_SQL_SCRIPT_FILE_LIMIT_BYTES");
+        }
     }
 
     #[test]
