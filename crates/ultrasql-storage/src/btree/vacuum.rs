@@ -2,6 +2,8 @@
 //! entries whose `TupleId`s satisfy a caller-supplied `is_dead`
 //! predicate, and report the number removed.
 
+use std::sync::Arc;
+
 use ultrasql_core::{BlockNumber, TupleId};
 
 use crate::buffer_pool::PageLoader;
@@ -22,11 +24,12 @@ impl<L: PageLoader> BTree<L> {
     ///
     /// # Concurrency
     ///
-    /// v0.8 requires exclusive access during vacuum (no concurrent
-    /// writers). The caller must hold an appropriate relation lock.
+    /// Vacuum takes the same relation-level operation latch as writers.
     /// `TODO(btree-vacuum-concurrent)`: allow concurrent reads during
     /// vacuum using a second-pass cleanup protocol.
     pub fn vacuum(&self, is_dead: impl Fn(TupleId) -> bool) -> Result<usize, BTreeError> {
+        let op_latch = Arc::clone(&self.op_latch);
+        let _op_guard = op_latch.write();
         let root = *self.root_block.lock();
         // Find the leftmost leaf.
         let mut leaf = self.leftmost_leaf(root)?;

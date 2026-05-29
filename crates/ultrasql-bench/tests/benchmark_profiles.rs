@@ -70,6 +70,8 @@ fn tpcc_and_sysbench_certification_wrappers_write_artifacts() {
     assert!(sysbench.contains("TMP_ULTRASQL_RESULT"));
     assert!(sysbench.contains("TMP_POSTGRES_RESULT"));
     assert!(sysbench.contains("sysbench_certification.json"));
+    assert!(sysbench.contains("sysbench_smoke.json"));
+    assert!(sysbench.contains("sysbench_oltp_read_write_smoke-ultrasql.json"));
     assert!(sysbench.contains("target_not_met"));
     assert!(sysbench.contains("missing_cross_engine_results"));
 }

@@ -424,6 +424,94 @@ fn open_recovers_existing_root() {
     }
 }
 
+#[test]
+fn reopened_handles_share_block_allocation_across_splits() {
+    let pool = Arc::new(BufferPool::new(4096, MapLoader::new()));
+    let rel = RelationId::new(8);
+    let tree = BTree::create(Arc::clone(&pool), rel).unwrap();
+    let root = tree.root_block();
+    drop(tree);
+
+    let mut first = BTree::open(Arc::clone(&pool), rel, root);
+    let mut second = BTree::open(Arc::clone(&pool), rel, root);
+
+    for i in 0_i64..96 {
+        let block = u32::try_from(i).expect("fits in u32");
+        first
+            .insert::<i64>(i, tid(block, 0), Xid::new(1), None)
+            .unwrap();
+    }
+    for i in 1_000_i64..1_096 {
+        let block = u32::try_from(i).expect("fits in u32");
+        second
+            .insert::<i64>(i, tid(block, 0), Xid::new(2), None)
+            .unwrap();
+    }
+
+    let probe = BTree::open(pool, rel, root);
+    for i in 0_i64..96 {
+        let block = u32::try_from(i).expect("fits in u32");
+        assert_eq!(
+            probe.lookup::<i64>(i).unwrap(),
+            Some(tid(block, 0)),
+            "first handle key {i} missing after second handle splits",
+        );
+    }
+    for i in 1_000_i64..1_096 {
+        let block = u32::try_from(i).expect("fits in u32");
+        assert_eq!(
+            probe.lookup::<i64>(i).unwrap(),
+            Some(tid(block, 0)),
+            "second handle key {i} missing after split",
+        );
+    }
+}
+
+#[test]
+fn reopened_handles_high_key_splits_preserve_existing_low_keys() {
+    let pool = Arc::new(BufferPool::new(4096, MapLoader::new()));
+    let rel = RelationId::new(9);
+    let mut tree = BTree::create(Arc::clone(&pool), rel).unwrap();
+    for i in 0_i64..1000 {
+        let block = u32::try_from(i).expect("fits in u32");
+        tree.insert::<i64>(i, tid(block, 0), Xid::new(1), None)
+            .unwrap();
+    }
+    let root = tree.root_block();
+    drop(tree);
+
+    let mut handles: Vec<_> = (0_u32..4)
+        .map(|_| BTree::open(Arc::clone(&pool), rel, root))
+        .collect();
+    for round in 0_i64..250 {
+        for client in 0_usize..handles.len() {
+            let client_i64 = i64::try_from(client).expect("fits");
+            let key = 1_000_001_000_i64 + client_i64 * 10_000_000_i64 + round;
+            handles[client]
+                .insert::<i64>(
+                    key,
+                    tid(
+                        u32::try_from(round).expect("fits"),
+                        u16::try_from(client).unwrap(),
+                    ),
+                    Xid::new(2),
+                    None,
+                )
+                .unwrap();
+        }
+    }
+
+    let probe = BTree::open(pool, rel, root);
+    for i in 0_i64..1000 {
+        let block = u32::try_from(i).expect("fits in u32");
+        assert_eq!(
+            probe.lookup::<i64>(i).unwrap(),
+            Some(tid(block, 0)),
+            "low key {i} missing after high-key split load",
+        );
+    }
+}
+
 // --- v0.8 additions ---
 
 #[test]

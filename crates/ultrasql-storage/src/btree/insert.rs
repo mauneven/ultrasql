@@ -1,6 +1,7 @@
 //! Insertion path: leaf split, internal split, and bottom-up
 //! split propagation up to a new root.
 
+use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
 use ultrasql_core::endian::{read_i64_le, write_i64_le, write_u16_le, write_u32_le};
@@ -44,6 +45,8 @@ impl<L: PageLoader> BTree<L> {
         xid: Xid,
         wal: Option<&dyn WalSink>,
     ) -> Result<(), BTreeError> {
+        let op_latch = Arc::clone(&self.op_latch);
+        let _op_guard = op_latch.write();
         self.insert_inner(key, value, xid, wal, false)
     }
 
@@ -60,10 +63,12 @@ impl<L: PageLoader> BTree<L> {
         xid: Xid,
         wal: Option<&dyn WalSink>,
     ) -> Result<(), BTreeError> {
+        let op_latch = Arc::clone(&self.op_latch);
+        let _op_guard = op_latch.write();
         self.insert_inner(key, value, xid, wal, true)
     }
 
-    fn insert_inner<K: Key>(
+    pub(super) fn insert_inner<K: Key>(
         &mut self,
         key: K,
         value: TupleId,

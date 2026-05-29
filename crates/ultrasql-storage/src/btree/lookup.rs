@@ -6,6 +6,8 @@
 //! propagated up. [`BTree::descend_to_leaf_readonly`] skips that
 //! bookkeeping for pure reads.
 
+use std::sync::Arc;
+
 use ultrasql_core::endian::{read_i64_le, write_u16_le, write_u32_le};
 use ultrasql_core::{BlockNumber, Lsn, TupleId, Xid};
 use ultrasql_wal::WalRecord;
@@ -21,6 +23,8 @@ use super::{BTree, BTreeError, Key, NO_SIBLING};
 impl<L: PageLoader> BTree<L> {
     /// Point lookup. Returns `None` if the key is absent.
     pub fn lookup<K: Key>(&self, key: K) -> Result<Option<TupleId>, BTreeError> {
+        let op_latch = Arc::clone(&self.op_latch);
+        let _op_guard = op_latch.read();
         if K::SIZE != 8 {
             return Err(BTreeError::KeyTooLarge);
         }
@@ -41,6 +45,8 @@ impl<L: PageLoader> BTree<L> {
     /// walks the leaf chain from the leftmost leaf and collects every matching
     /// key.
     pub fn lookup_all<K: Key>(&self, key: K) -> Result<Vec<TupleId>, BTreeError> {
+        let op_latch = Arc::clone(&self.op_latch);
+        let _op_guard = op_latch.read();
         if K::SIZE != 8 {
             return Err(BTreeError::KeyTooLarge);
         }
@@ -135,6 +141,8 @@ impl<L: PageLoader> BTree<L> {
     /// stale keys disappear immediately while future inserts can reuse
     /// the same logical key.
     pub fn delete<K: Key>(&mut self, key: K, value: TupleId) -> Result<bool, BTreeError> {
+        let op_latch = Arc::clone(&self.op_latch);
+        let _op_guard = op_latch.write();
         self.delete_inner(key, value, None, None)
     }
 
@@ -147,10 +155,12 @@ impl<L: PageLoader> BTree<L> {
         xid: Xid,
         wal: Option<&dyn WalSink>,
     ) -> Result<bool, BTreeError> {
+        let op_latch = Arc::clone(&self.op_latch);
+        let _op_guard = op_latch.write();
         self.delete_inner(key, value, Some(xid), wal)
     }
 
-    fn delete_inner<K: Key>(
+    pub(super) fn delete_inner<K: Key>(
         &mut self,
         key: K,
         value: TupleId,

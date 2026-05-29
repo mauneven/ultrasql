@@ -29,6 +29,7 @@ use std::collections::HashSet;
 use std::sync::Arc;
 
 use ultrasql_core::{CommandId, DataType, Field, RelationId, Schema, TupleId, Value, Xid};
+use ultrasql_mvcc::{InfoMask, TupleHeader};
 use ultrasql_planner::{BinaryOp, ScalarExpr};
 use ultrasql_storage::PageLoader;
 use ultrasql_storage::access_method::{
@@ -913,6 +914,15 @@ fn detect_update_int32_pair_fast_path(
     })
 }
 
+fn updated_ctid_target(header: &TupleHeader, current: TupleId) -> Option<TupleId> {
+    if header.ctid == current {
+        return None;
+    }
+    let redirects = header.infomask.contains(InfoMask::UPDATED)
+        || header.infomask.contains(InfoMask::HOT_UPDATED);
+    redirects.then_some(header.ctid)
+}
+
 fn conflict_target_columns(action: &InsertConflictAction) -> Option<&[usize]> {
     match action {
         InsertConflictAction::DoNothing { target } => target.as_deref(),
@@ -1158,19 +1168,10 @@ impl<L: PageLoader + Send + Sync + std::fmt::Debug + 'static> Operator for Modif
                                                     .to_owned(),
                                             ));
                                         };
-                                        let tuple = self.heap.fetch(tid).map_err(|e| {
-                                            ExecError::TypeMismatch(format!(
-                                                "ON CONFLICT fetch existing tuple: {e}"
-                                            ))
-                                        })?;
-                                        let old_row =
-                                            self.codec.decode(&tuple.data).map_err(|e| {
-                                                ExecError::TypeMismatch(format!(
-                                                    "ON CONFLICT decode existing tuple: {e}"
-                                                ))
-                                            })?;
+                                        let (current_tid, old_row) =
+                                            self.fetch_conflict_current_row(tid)?;
                                         if let Some(computed) = self.compute_conflict_update_edit(
-                                            tid,
+                                            current_tid,
                                             &old_row,
                                             target_row,
                                             assignments,
@@ -1288,10 +1289,18 @@ impl<L: PageLoader + Send + Sync + std::fmt::Debug + 'static> Operator for Modif
             let n = all_update_edits.len();
             let wal = self.wal.clone();
             let wal_ref: Option<&dyn WalSink> = wal.as_deref();
+            let index_keys_unchanged = self.update_indexes.is_empty()
+                || all_update_index_changes
+                    .iter()
+                    .all(|change| change.old_keys == change.new_keys);
+            let vector_index_keys_unchanged = self.update_vector_indexes.is_empty()
+                || all_update_vector_index_changes
+                    .iter()
+                    .all(|change| change.old_keys == change.new_keys);
             let update_opts = UpdateOptions {
                 xid: self.delete_xmax,
                 command_id: self.delete_cmax,
-                hot_eligible: self.update_indexes.is_empty(),
+                hot_eligible: index_keys_unchanged && vector_index_keys_unchanged,
                 wal: wal_ref,
                 vm: self.vm.as_deref(),
             };
@@ -1565,6 +1574,26 @@ impl<L: PageLoader + Send + Sync + std::fmt::Debug + 'static> ModifyTable<L> {
             vector_index_change,
             returning_row: capture_returning_row.then_some(new_row),
         }))
+    }
+
+    fn fetch_conflict_current_row(&self, tid: TupleId) -> Result<(TupleId, Vec<Value>), ExecError> {
+        let mut current = tid;
+        for _ in 0..64 {
+            let tuple = self.heap.fetch(current).map_err(|e| {
+                ExecError::TypeMismatch(format!("ON CONFLICT fetch existing tuple: {e}"))
+            })?;
+            if let Some(next) = updated_ctid_target(&tuple.header, current) {
+                current = next;
+                continue;
+            }
+            let row = self.codec.decode(&tuple.data).map_err(|e| {
+                ExecError::TypeMismatch(format!("ON CONFLICT decode existing tuple: {e}"))
+            })?;
+            return Ok((current, row));
+        }
+        Err(ExecError::Internal(
+            "ON CONFLICT update ctid chain exceeded 64 hops",
+        ))
     }
 
     fn evaluate_returning_row(&self, row: &[Value]) -> Result<Vec<Value>, ExecError> {
@@ -1871,29 +1900,24 @@ impl<L: PageLoader + Send + Sync + std::fmt::Debug + 'static> ModifyTable<L> {
         outcomes: &[ultrasql_storage::heap::UpdateOutcome],
         wal: Option<&dyn WalSink>,
     ) -> Result<(), ExecError> {
-        let new_tid_by_old: std::collections::HashMap<TupleId, TupleId> = outcomes
+        let outcome_by_old: std::collections::HashMap<
+            TupleId,
+            ultrasql_storage::heap::UpdateOutcome,
+        > = outcomes
             .iter()
-            .map(|outcome| (outcome.old_tid, outcome.new_tid))
+            .map(|outcome| (outcome.old_tid, *outcome))
             .collect();
         for change in changes {
-            let Some(new_tid) = new_tid_by_old.get(&change.old_tid).copied() else {
+            let Some(outcome) = outcome_by_old.get(&change.old_tid).copied() else {
                 return Err(ExecError::Internal(
                     "heap update_many_with_outcomes omitted an updated TID",
                 ));
             };
+            let new_tid = outcome.new_tid;
             for idx in 0..self.update_indexes.len() {
                 let old_key = change.old_keys[idx];
                 let new_key = change.new_keys[idx];
                 if old_key == new_key {
-                    if let Some(key) = old_key {
-                        let _ = self.update_indexes[idx].delete_key(
-                            key,
-                            change.old_tid,
-                            self.delete_xmax,
-                            wal,
-                        )?;
-                        self.update_indexes[idx].insert_key(key, new_tid, self.delete_xmax, wal)?;
-                    }
                     continue;
                 }
                 if let Some(key) = old_key {
@@ -2025,17 +2049,24 @@ impl<L: PageLoader + Send + Sync + std::fmt::Debug + 'static> ModifyTable<L> {
         changes: &[VectorUpdateIndexChange],
         outcomes: &[ultrasql_storage::heap::UpdateOutcome],
     ) -> Result<(), ExecError> {
-        let new_tid_by_old: std::collections::HashMap<TupleId, TupleId> = outcomes
+        let outcome_by_old: std::collections::HashMap<
+            TupleId,
+            ultrasql_storage::heap::UpdateOutcome,
+        > = outcomes
             .iter()
-            .map(|outcome| (outcome.old_tid, outcome.new_tid))
+            .map(|outcome| (outcome.old_tid, *outcome))
             .collect();
         for change in changes {
-            let Some(new_tid) = new_tid_by_old.get(&change.old_tid).copied() else {
+            let Some(outcome) = outcome_by_old.get(&change.old_tid).copied() else {
                 return Err(ExecError::Internal(
                     "heap update_many_with_outcomes omitted an updated TID",
                 ));
             };
+            let new_tid = outcome.new_tid;
             for idx in 0..self.update_vector_indexes.len() {
+                if outcome.hot && change.old_keys[idx] == change.new_keys[idx] {
+                    continue;
+                }
                 if change.old_keys[idx].is_some() {
                     self.update_vector_indexes[idx].delete_tid(change.old_tid)?;
                 }

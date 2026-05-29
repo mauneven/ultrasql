@@ -68,16 +68,15 @@
 //! Concurrency
 //! -----------
 //!
-//! v0.5 ships with a *single-writer* assumption: callers must
-//! serialize concurrent `insert` calls externally. Concurrent readers
-//! work safely against a single in-flight writer because the buffer
-//! pool's per-frame `RwLock` enforces shared/exclusive access on each
-//! page, and the right-link mechanism ensures readers that observe an
-//! in-flight split simply chase the right link. Concurrent writers may
-//! panic under contention; see the TODO below.
+//! Each index relation has shared same-process state in the buffer pool:
+//! a relation-level operation latch and a monotonic block allocator.
+//! Inserts, deletes, and vacuum take the write side of the latch; point
+//! probes take the read side. This conservative policy preserves index
+//! correctness for reopened statement handles while the page-level
+//! latch-coupling implementation is still pending.
 //!
-//! TODO(v1.0): support multiple concurrent writers with latch coupling
-//! and a structure-modification log.
+//! TODO(v1.0): replace the relation-level operation latch with latch
+//! coupling and a structure-modification log.
 //!
 //! Limits
 //! ------
@@ -97,7 +96,7 @@ use std::sync::atomic::AtomicU32;
 use crate::buffer_pool::{BufferPool, BufferPoolError, PageLoader};
 use crate::page::PageError;
 use crate::wal_sink::WalSinkError;
-use parking_lot::Mutex;
+use parking_lot::{Mutex, RwLock};
 use ultrasql_core::constants::PAGE_SIZE;
 use ultrasql_core::endian::{read_i64_le, write_i64_le};
 use ultrasql_core::{BlockNumber, PageId, RelationId};
@@ -232,10 +231,12 @@ pub struct BTree<L: PageLoader> {
     pub(super) pool: Arc<BufferPool<L>>,
     pub(super) rel: RelationId,
     pub(super) root_block: Mutex<BlockNumber>,
-    /// Monotonically increasing block allocator. v0.5 hands out fresh
-    /// block numbers without coordination with the segment manager;
-    /// production code will route allocation through the segment layer.
-    pub(super) next_block: AtomicU32,
+    /// Relation-level operation latch shared by reopened handles for
+    /// this index relation.
+    pub(super) op_latch: Arc<RwLock<()>>,
+    /// Monotonically increasing block allocator shared by reopened
+    /// handles for this index relation.
+    pub(super) next_block: Arc<AtomicU32>,
 }
 
 impl<L: PageLoader> BTree<L> {
@@ -244,11 +245,14 @@ impl<L: PageLoader> BTree<L> {
     /// The root is a leaf with no entries and no right sibling.
     pub fn create(pool: Arc<BufferPool<L>>, rel: RelationId) -> Result<Self, BTreeError> {
         let root_block = BlockNumber::new(0);
+        let op_latch = pool.btree_latch(rel);
+        let next_block = pool.btree_block_allocator(rel, 1);
         let tree = Self {
             pool,
             rel,
             root_block: Mutex::new(root_block),
-            next_block: AtomicU32::new(1),
+            op_latch,
+            next_block,
         };
         // Materialize the root as a fresh empty leaf.
         let guard = tree.pool.get_page(tree.page_id(root_block))?;
@@ -273,11 +277,14 @@ impl<L: PageLoader> BTree<L> {
             .map_or(root_block, |block| block)
             .raw()
             .saturating_add(1);
+        let op_latch = pool.btree_latch(rel);
+        let next_block = pool.btree_block_allocator(rel, next);
         Self {
             pool,
             rel,
             root_block: Mutex::new(root_block),
-            next_block: AtomicU32::new(next),
+            op_latch,
+            next_block,
         }
     }
 

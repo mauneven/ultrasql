@@ -1,14 +1,16 @@
 //! Forward and backward range iterators over the B-tree.
 //!
 //! [`RangeIter`] streams leaf entries by following the right-link chain;
-//! it holds no buffer-pool guards across `next` calls so concurrent
-//! writes do not invalidate its position. [`BackwardRangeIter`]
-//! materialises the forward range into a `Vec` and reverses it — a
-//! placeholder until the leaf list grows a backward pointer
+//! it holds a shared relation-level operation latch across the scan but
+//! no buffer-pool guards across `next` calls. [`BackwardRangeIter`]
+//! materialises the forward range into a `Vec` under the same shared
+//! latch and reverses it — a placeholder until the leaf list grows a
+//! backward pointer
 //! (`TODO(btree-backward-efficient)`).
 
 use std::marker::PhantomData;
 
+use parking_lot::{ArcRwLockReadGuard, RawRwLock};
 use ultrasql_core::endian::{read_i64_le, write_i64_le};
 use ultrasql_core::{BlockNumber, TupleId};
 
@@ -19,13 +21,12 @@ use super::{BTree, BTreeError, Key, NO_SIBLING};
 
 /// Forward range iterator returned by [`BTree::range_scan`].
 ///
-/// The iterator holds no buffer-pool guards across `next` calls. Each
-/// step re-acquires a read guard on the current leaf, copies its
-/// entries, and advances. Concurrent writes to leaves do not invalidate
-/// the iterator's position because the right-link chain is followed
-/// explicitly.
+/// The iterator holds the relation-level operation read latch, but no
+/// buffer-pool guards across `next` calls. Each step re-acquires a read
+/// guard on the current leaf, copies its entries, and advances.
 pub struct RangeIter<'a, L: PageLoader, K: Key> {
     pub(super) tree: &'a BTree<L>,
+    pub(super) _op_guard: ArcRwLockReadGuard<RawRwLock, ()>,
     pub(super) current_leaf: Option<BlockNumber>,
     pub(super) current_slot: usize,
     pub(super) start: K,
@@ -166,6 +167,7 @@ pub struct BackwardRangeIter<'a, L: PageLoader, K: Key> {
     pub(super) items: Vec<(K, TupleId)>,
     /// Current position (counts down).
     pub(super) pos: usize,
+    pub(super) _op_guard: ArcRwLockReadGuard<RawRwLock, ()>,
     pub(super) _tree: std::marker::PhantomData<&'a BTree<L>>,
 }
 
@@ -192,9 +194,11 @@ impl<L: PageLoader, K: Key> Iterator for BackwardRangeIter<'_, L, K> {
 impl<L: PageLoader> BTree<L> {
     /// Forward range scan from `start` (inclusive) to `end` (exclusive
     /// if provided, unbounded otherwise).
-    pub const fn range_scan<K: Key>(&self, start: K, end: Option<K>) -> RangeIter<'_, L, K> {
+    pub fn range_scan<K: Key>(&self, start: K, end: Option<K>) -> RangeIter<'_, L, K> {
+        let op_guard = self.op_latch.read_arc();
         RangeIter {
             tree: self,
+            _op_guard: op_guard,
             current_leaf: None,
             current_slot: 0,
             start,
@@ -218,6 +222,7 @@ impl<L: PageLoader> BTree<L> {
         start: K,
         end: Option<K>,
     ) -> Result<BackwardRangeIter<'_, L, K>, BTreeError> {
+        let op_guard = self.op_latch.read_arc();
         if K::SIZE != 8 {
             return Err(BTreeError::KeyTooLarge);
         }
@@ -261,6 +266,7 @@ impl<L: PageLoader> BTree<L> {
         Ok(BackwardRangeIter {
             items,
             pos,
+            _op_guard: op_guard,
             _tree: std::marker::PhantomData,
         })
     }

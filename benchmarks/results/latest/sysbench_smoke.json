@@ -1,0 +1,19 @@
+{
+  "schema_version": 1,
+  "workload": "sysbench_oltp_read_write",
+  "target": "UltraSQL throughput >= PostgreSQL 17 throughput on the same sysbench-style OLTP read/write shape",
+  "passed": true,
+  "status": "smoke_passed",
+  "reason": null,
+  "rows": 1000,
+  "duration_secs": 1,
+  "warmup_secs": 0,
+  "connections": 4,
+  "ultrasql_result": "benchmarks/results/latest/raw/sysbench_oltp_read_write_smoke-ultrasql.json",
+  "postgres_result": null,
+  "ultrasql_throughput_per_sec": 9939.437174873845,
+  "postgres_throughput_per_sec": null,
+  "throughput_ratio_ultrasql_vs_postgres": null,
+  "competitor_claim": null,
+  "policy": "UltraSQL-only sysbench smoke is non-certifying; set POSTGRES_DSN for the PostgreSQL comparison gate."
+}

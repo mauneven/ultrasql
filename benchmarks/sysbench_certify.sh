@@ -19,11 +19,21 @@ CONNECTIONS="${SYSBENCH_CONNECTIONS:-32}"
 POSTGRES_DSN="${POSTGRES_DSN:-}"
 ALLOW_ULTRASQL_ONLY="${SYSBENCH_ALLOW_ULTRASQL_ONLY:-0}"
 TIMEOUT_SECONDS="${SYSBENCH_TIMEOUT_SECONDS:-600}"
-SUMMARY_OUT="$OUT_DIR/sysbench_certification.json"
-ULTRASQL_RESULT="$RAW_DIR/sysbench_oltp_read_write-ultrasql.json"
-POSTGRES_RESULT="$RAW_DIR/sysbench_oltp_read_write-postgres17.json"
-TMP_ULTRASQL_RESULT="$RAW_DIR/.sysbench_oltp_read_write-ultrasql.$$.tmp.json"
-TMP_POSTGRES_RESULT="$RAW_DIR/.sysbench_oltp_read_write-postgres17.$$.tmp.json"
+SMOKE_ONLY=0
+if [[ -z "$POSTGRES_DSN" && "$ALLOW_ULTRASQL_ONLY" == "1" ]]; then
+    SMOKE_ONLY=1
+    SUMMARY_OUT="$OUT_DIR/sysbench_smoke.json"
+    ULTRASQL_RESULT="$RAW_DIR/sysbench_oltp_read_write_smoke-ultrasql.json"
+    POSTGRES_RESULT=""
+    TMP_ULTRASQL_RESULT="$RAW_DIR/.sysbench_oltp_read_write_smoke-ultrasql.$$.tmp.json"
+    TMP_POSTGRES_RESULT="$RAW_DIR/.sysbench_oltp_read_write_smoke-postgres17.$$.tmp.json"
+else
+    SUMMARY_OUT="$OUT_DIR/sysbench_certification.json"
+    ULTRASQL_RESULT="$RAW_DIR/sysbench_oltp_read_write-ultrasql.json"
+    POSTGRES_RESULT="$RAW_DIR/sysbench_oltp_read_write-postgres17.json"
+    TMP_ULTRASQL_RESULT="$RAW_DIR/.sysbench_oltp_read_write-ultrasql.$$.tmp.json"
+    TMP_POSTGRES_RESULT="$RAW_DIR/.sysbench_oltp_read_write-postgres17.$$.tmp.json"
+fi
 
 mkdir -p "$RAW_DIR"
 
@@ -124,7 +134,10 @@ CARGO_INCREMENTAL="${CARGO_INCREMENTAL:-0}" \
     cargo build --release --package ultrasql-bench --features sql-bench \
         --bin ultrasql-bench >/dev/null
 
-rm -f "$ULTRASQL_RESULT" "$POSTGRES_RESULT" "$TMP_ULTRASQL_RESULT" "$TMP_POSTGRES_RESULT"
+rm -f "$ULTRASQL_RESULT" "$TMP_ULTRASQL_RESULT" "$TMP_POSTGRES_RESULT"
+if [[ -n "$POSTGRES_RESULT" ]]; then
+    rm -f "$POSTGRES_RESULT"
+fi
 
 if [[ -n "$POSTGRES_DSN" ]]; then
     echo "Running PostgreSQL 17 sysbench OLTP read/write"
@@ -157,7 +170,7 @@ if ! run_with_watchdog \
     exit 1
 fi
 
-if [[ -z "$POSTGRES_DSN" ]]; then
+if (( SMOKE_ONLY == 1 )); then
     mv "$TMP_ULTRASQL_RESULT" "$ULTRASQL_RESULT"
     python3 - "$SUMMARY_OUT" "$ULTRASQL_RESULT" "$ROWS" "$DURATION" "$WARMUP" "$CONNECTIONS" <<'PY'
 import json

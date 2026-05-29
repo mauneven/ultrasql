@@ -1,0 +1,23 @@
+{
+  "profile": "smoke",
+  "generated_at_unix": 1780014656,
+  "passed": true,
+  "suites": [
+    {
+      "suite": "regression-gate",
+      "status": "passed",
+      "exit_code": 0
+    },
+    {
+      "suite": "vector-ann",
+      "status": "passed",
+      "exit_code": 0
+    },
+    {
+      "suite": "sysbench",
+      "status": "passed",
+      "exit_code": 0
+    }
+  ],
+  "policy": "smoke is PR-safe and short; full attempts certification runners. Exit code 2 means prerequisites were unavailable and the suite did not produce a benchmark claim."
+}

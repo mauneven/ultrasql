@@ -64,7 +64,7 @@ thiserror = "2"
 anyhow    = "1"
 
 # Concurrency / sync
-parking_lot = "0.12"
+parking_lot = { version = "0.12", features = ["arc_lock"] }
 crossbeam   = "0.8"
 crossbeam-utils = "0.8"
 crossbeam-queue = "0.3"

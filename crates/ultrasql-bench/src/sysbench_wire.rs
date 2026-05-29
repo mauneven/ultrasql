@@ -430,7 +430,10 @@ async fn execute_op(client: &Client, op: &SysbenchOp) -> Result<()> {
                     tokio::time::sleep(Duration::from_micros(backoff_us)).await;
                 }
             }
-            Err(err) => return Err(err).context("execute sysbench operation"),
+            Err(err) => {
+                return Err(err)
+                    .with_context(|| format!("execute sysbench operation `{}`", op.sql));
+            }
         }
     }
     unreachable!("bounded retry loop either returns or errors")

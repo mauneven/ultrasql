@@ -154,6 +154,15 @@ async fn insert_on_conflict_do_update_uses_excluded_row() {
         .await
         .expect("predicate false skips update");
 
+    client
+        .batch_execute(
+            "INSERT INTO t VALUES (1, 30, 2) \
+             ON CONFLICT (id) DO UPDATE SET v = excluded.v, touched = touched + excluded.touched \
+             WHERE excluded.v > v",
+        )
+        .await
+        .expect("second update follows conflict tuple chain");
+
     let persisted = client
         .query("SELECT id, v, touched FROM t ORDER BY id", &[])
         .await
@@ -168,7 +177,7 @@ async fn insert_on_conflict_do_update_uses_excluded_row() {
             )
         })
         .collect();
-    assert_eq!(rows, vec![(1, 20, 1)]);
+    assert_eq!(rows, vec![(1, 30, 3)]);
 
     shutdown(client, server_handle).await;
 }

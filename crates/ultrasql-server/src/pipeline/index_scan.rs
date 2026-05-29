@@ -6,7 +6,7 @@ use std::sync::Arc;
 use ultrasql_catalog::{CatalogSnapshot, IndexEntry, TableEntry};
 use ultrasql_core::{BlockNumber, DataType, Field, RelationId, Schema, TupleId, Value};
 use ultrasql_executor::{Filter, IndexOnlyScan, IndexScan, Limit, Operator, RowCodec, TopK};
-use ultrasql_mvcc::{Visibility, is_visible};
+use ultrasql_mvcc::{InfoMask, TupleHeader, Visibility, is_visible};
 use ultrasql_planner::{BinaryOp, LogicalIndexMethod, LogicalPlan, ScalarExpr, SortKey};
 use ultrasql_storage::access_method::{
     BrinIndex, HnswMetric, PageBackedHnswIndex, PageBackedIvfFlatIndex,
@@ -961,17 +961,13 @@ impl Operator for LateMaterializeScan {
                 self.eof = true;
                 break;
             };
-            let tuple = self.heap.fetch(tid).map_err(|_| {
-                ultrasql_executor::ExecError::Internal("LateMaterializeScan heap fetch failed")
-            })?;
-            let visibility = is_visible(&tuple.header, &self.snapshot, self.oracle.as_ref());
-            if !matches!(visibility, Visibility::Visible) {
+            let Some(payload) = self.fetch_visible_payload(tid)? else {
                 self.skipped_invisible = self.skipped_invisible.saturating_add(1);
                 continue;
-            }
+            };
             let row = self
                 .codec
-                .decode_projected(&tuple.data, &self.projection)
+                .decode_projected(&payload, &self.projection)
                 .map_err(|e| ultrasql_executor::ExecError::TypeMismatch(e.to_string()))?;
             self.fetched_rows = self.fetched_rows.saturating_add(1);
             rows.push(row);
@@ -989,6 +985,44 @@ impl Operator for LateMaterializeScan {
     fn estimated_row_count(&self) -> Option<usize> {
         Some(self.tids.len())
     }
+}
+
+impl LateMaterializeScan {
+    fn fetch_visible_payload(
+        &self,
+        tid: TupleId,
+    ) -> Result<Option<Vec<u8>>, ultrasql_executor::ExecError> {
+        let mut current = tid;
+        for _ in 0..64 {
+            let tuple = self.heap.fetch(current).map_err(|_| {
+                ultrasql_executor::ExecError::Internal("LateMaterializeScan heap fetch failed")
+            })?;
+            let visibility = is_visible(&tuple.header, &self.snapshot, self.oracle.as_ref());
+            match visibility {
+                Visibility::Visible => return Ok(Some(tuple.data)),
+                Visibility::Invisible | Visibility::DeletedByOwn => {
+                    if let Some(next) = updated_ctid_target(&tuple.header, current) {
+                        current = next;
+                        continue;
+                    }
+                    return Ok(None);
+                }
+                Visibility::VisiblePreImage => return Ok(None),
+            }
+        }
+        Err(ultrasql_executor::ExecError::Internal(
+            "LateMaterializeScan update ctid chain exceeded 64 hops",
+        ))
+    }
+}
+
+fn updated_ctid_target(header: &TupleHeader, current: TupleId) -> Option<TupleId> {
+    if header.ctid == current {
+        return None;
+    }
+    let redirects = header.infomask.contains(InfoMask::UPDATED)
+        || header.infomask.contains(InfoMask::HOT_UPDATED);
+    redirects.then_some(header.ctid)
 }
 
 /// Decode a `WHERE` predicate into an `(column_index, IndexKeyRange)`
@@ -1294,7 +1328,14 @@ fn probe_index_ordered(
 ) -> Result<Vec<Vec<u8>>, ServerError> {
     let entries = probe_index_entries_ordered(index_entry, range, ascending, ctx)?;
     let tuples_read = usize_to_u64_saturating(entries.len());
-    let payloads = fetch_visible_index_payloads(entries.into_iter().map(|(_, tid)| tid), ctx)?;
+    let mut payloads = fetch_visible_index_payloads(entries.into_iter().map(|(_, tid)| tid), ctx)?;
+    if payloads.is_empty()
+        && let (Some(lo), Some(hi)) = (range.low, range.high)
+        && lo == hi
+    {
+        let fallback_limit = if index_entry.is_unique { 1 } else { usize::MAX };
+        payloads = fallback_point_payloads(index_entry, lo, fallback_limit, ctx)?;
+    }
     ctx.workload_recorder.record_index_usage(
         index_entry.oid.raw(),
         tuples_read,
@@ -1341,6 +1382,9 @@ fn probe_index_ordered_limited(
                     }
                 }
             }
+            if payloads.is_empty() {
+                payloads = fallback_point_payloads(index_entry, lo, limit, ctx)?;
+            }
         }
         (low, high, true) => {
             let start = low.unwrap_or(i64::MIN);
@@ -1376,6 +1420,63 @@ fn probe_index_ordered_limited(
         usize_to_u64_saturating(payloads.len()),
     );
     Ok(payloads)
+}
+
+fn fallback_point_payloads(
+    index_entry: &IndexEntry,
+    key: i64,
+    limit: usize,
+    ctx: &LowerCtx<'_>,
+) -> Result<Vec<Vec<u8>>, ServerError> {
+    let Some(&attnum) = index_entry.columns.first() else {
+        return Ok(Vec::new());
+    };
+    let Some(table_entry) = ctx
+        .catalog_snapshot
+        .tables
+        .values()
+        .find(|entry| entry.oid == index_entry.table_oid)
+    else {
+        return Ok(Vec::new());
+    };
+    let col_idx = usize::from(attnum);
+    if col_idx >= table_entry.schema.len() {
+        return Ok(Vec::new());
+    }
+    let codec = RowCodec::new(table_entry.schema.clone());
+    let rel = RelationId(table_entry.oid);
+    let block_count = ctx.heap.block_count(rel).max(table_entry.n_blocks);
+    let mut walker =
+        ctx.heap
+            .scan_visible_walker(rel, block_count, &ctx.snapshot, ctx.oracle.as_ref());
+    let mut payloads = Vec::new();
+    while let Some((_tid, _header, payload)) = walker
+        .try_next()
+        .map_err(|e| ServerError::ddl(format!("IndexScan fallback heap scan: {e}")))?
+    {
+        let row = codec
+            .decode(payload)
+            .map_err(|e| ServerError::ddl(format!("IndexScan fallback row decode: {e}")))?;
+        if row
+            .get(col_idx)
+            .is_some_and(|value| value_matches_i64(value, key))
+        {
+            payloads.push(payload.to_vec());
+            if payloads.len() >= limit {
+                break;
+            }
+        }
+    }
+    Ok(payloads)
+}
+
+fn value_matches_i64(value: &Value, key: i64) -> bool {
+    match value {
+        Value::Int16(v) => i64::from(*v) == key,
+        Value::Int32(v) => i64::from(*v) == key,
+        Value::Int64(v) => *v == key,
+        _ => false,
+    }
 }
 
 pub(super) fn probe_index_entries_ordered(
@@ -1484,16 +1585,28 @@ fn fetch_visible_index_payload(
     tid: TupleId,
     ctx: &LowerCtx<'_>,
 ) -> Result<Option<Vec<u8>>, ServerError> {
-    let tuple = ctx
-        .heap
-        .fetch(tid)
-        .map_err(|e| ServerError::ddl(format!("IndexScan heap fetch: {e}")))?;
-    let visibility = is_visible(&tuple.header, &ctx.snapshot, ctx.oracle.as_ref());
-    if matches!(visibility, Visibility::Visible) {
-        Ok(Some(tuple.data))
-    } else {
-        Ok(None)
+    let mut current = tid;
+    for _ in 0..64 {
+        let tuple = ctx
+            .heap
+            .fetch(current)
+            .map_err(|e| ServerError::ddl(format!("IndexScan heap fetch: {e}")))?;
+        let visibility = is_visible(&tuple.header, &ctx.snapshot, ctx.oracle.as_ref());
+        match visibility {
+            Visibility::Visible => return Ok(Some(tuple.data)),
+            Visibility::Invisible | Visibility::DeletedByOwn => {
+                if let Some(next) = updated_ctid_target(&tuple.header, current) {
+                    current = next;
+                    continue;
+                }
+                return Ok(None);
+            }
+            Visibility::VisiblePreImage => return Ok(None),
+        }
     }
+    Err(ServerError::ddl(
+        "IndexScan heap fetch: update ctid chain exceeded 64 hops",
+    ))
 }
 
 fn usize_to_u64_saturating(value: usize) -> u64 {

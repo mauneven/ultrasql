@@ -44,8 +44,9 @@
 //!   new lock-ordering hazards with respect to the existing buffer-pool
 //!   ordering rules.
 
+use std::collections::HashMap;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
 use dashmap::DashMap;
 use parking_lot::{Mutex, RwLock};
@@ -153,6 +154,18 @@ pub struct BufferPool<L: PageLoader> {
     counters: Counters,
     /// Cumulative counters keyed by relation id.
     relation_counters: DashMap<RelationId, RelationCounters>,
+    /// Shared B-tree operation latches keyed by index relation.
+    ///
+    /// B-tree handles are reopened from catalog metadata for independent
+    /// statements. This registry gives every handle for the same index a
+    /// common relation-level latch until page-level latch coupling lands.
+    btree_latches: Mutex<HashMap<RelationId, Arc<RwLock<()>>>>,
+    /// Shared B-tree block allocators keyed by index relation.
+    ///
+    /// Reopened handles must not seed independent allocators from the same
+    /// resident maximum. A single monotonic allocator per relation prevents
+    /// two split paths from reusing the same page id.
+    btree_block_allocators: Mutex<HashMap<RelationId, Arc<AtomicU32>>>,
 }
 
 impl<L: PageLoader> std::fmt::Debug for BufferPool<L> {
@@ -232,6 +245,8 @@ impl<L: PageLoader> BufferPool<L> {
             wal_sink: None,
             counters: Counters::default(),
             relation_counters: DashMap::new(),
+            btree_latches: Mutex::new(HashMap::new()),
+            btree_block_allocators: Mutex::new(HashMap::new()),
         }
     }
 
@@ -262,6 +277,8 @@ impl<L: PageLoader> BufferPool<L> {
             wal_sink: Some(wal),
             counters: Counters::default(),
             relation_counters: DashMap::new(),
+            btree_latches: Mutex::new(HashMap::new()),
+            btree_block_allocators: Mutex::new(HashMap::new()),
         }
     }
 
@@ -300,6 +317,34 @@ impl<L: PageLoader> BufferPool<L> {
                 (page_id.relation == rel).then_some(page_id.block)
             })
             .max()
+    }
+
+    /// Return the shared operation latch for one B-tree relation.
+    pub(crate) fn btree_latch(&self, rel: RelationId) -> Arc<RwLock<()>> {
+        let mut latches = self.btree_latches.lock();
+        Arc::clone(
+            latches
+                .entry(rel)
+                .or_insert_with(|| Arc::new(RwLock::new(()))),
+        )
+    }
+
+    /// Return the shared block allocator for one B-tree relation.
+    ///
+    /// `next_floor` is the lowest page id a newly opened handle believes is
+    /// free. Existing allocators are raised to at least that value without
+    /// moving them backwards.
+    pub(crate) fn btree_block_allocator(&self, rel: RelationId, next_floor: u32) -> Arc<AtomicU32> {
+        let allocator = {
+            let mut allocators = self.btree_block_allocators.lock();
+            Arc::clone(
+                allocators
+                    .entry(rel)
+                    .or_insert_with(|| Arc::new(AtomicU32::new(next_floor))),
+            )
+        };
+        raise_atomic_floor(&allocator, next_floor);
+        allocator
     }
 
     /// Flush dirty, unpinned frames to disk using the provided `writer`
@@ -612,6 +657,16 @@ impl<L: PageLoader> BufferPool<L> {
         // Drop the pin count last so concurrent readers see dirty
         // before unpin.
         frame.pin_count.fetch_sub(1, Ordering::Release);
+    }
+}
+
+fn raise_atomic_floor(value: &AtomicU32, floor: u32) {
+    let mut current = value.load(Ordering::Acquire);
+    while current < floor {
+        match value.compare_exchange(current, floor, Ordering::AcqRel, Ordering::Acquire) {
+            Ok(_) => break,
+            Err(observed) => current = observed,
+        }
     }
 }
 
