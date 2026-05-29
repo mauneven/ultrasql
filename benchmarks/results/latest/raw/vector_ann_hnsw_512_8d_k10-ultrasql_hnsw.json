@@ -5,13 +5,13 @@
   "status": "measured",
   "n_rows": 512,
   "samples": 4,
-  "median_us": 142.3125,
-  "min_us": 126.50000000000001,
+  "median_us": 199.27100000000002,
+  "min_us": 177.917,
   "iterations_us": [
-    126.50000000000001,
-    138.083,
-    146.542,
-    150.5
+    177.917,
+    193.75,
+    204.792,
+    213.0
   ],
   "host": {
     "cpu": "Apple M4",
@@ -28,16 +28,16 @@
   "ef_search": 64,
   "seed": 1367265502,
   "recall_at_k": 1.0,
-  "p50_latency_us": 138.083,
-  "p95_latency_us": 150.5,
-  "p99_latency_us": 150.5,
-  "build_time_us": 4205.0830000000005,
+  "p50_latency_us": 193.75,
+  "p95_latency_us": 213.0,
+  "p99_latency_us": 213.0,
+  "build_time_us": 5898.5,
   "memory_bytes": 175560,
   "query_iterations_us": [
-    138.083,
-    146.542,
-    150.5,
-    126.50000000000001
+    193.75,
+    204.792,
+    213.0,
+    177.917
   ],
   "recall_iterations": [
     1.0,

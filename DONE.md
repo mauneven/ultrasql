@@ -59,6 +59,14 @@ as a concise evidence ledger; roadmap stays for open gates only.
   `cargo llvm-cov` plus `scripts/coverage_gate.py --min-lines 80` clears
   `ultrasql-core` at 80.46%. Evidence:
   `docs/testing/coverage-evidence-2026-05-29-core.md`.
+- Focused `ultrasql-sqllogictest-runner` coverage now exercises parser
+  directives, skip filters, malformed-record errors, reference-engine
+  selection, benchmark artifact JSON/Markdown rendering, hash expectation
+  checks, and file collection. This also fixed a skip-filter parsing bug where
+  whole-line trimming made empty-pattern validation unreachable. Package
+  `cargo llvm-cov` plus `scripts/coverage_gate.py --min-lines 80` clears
+  `ultrasql-sqllogictest-runner` at 85.46%. Evidence:
+  `docs/testing/coverage-evidence-2026-05-29-sqllogictest-runner.md`.
 - Driver-certification CI was repaired, action runtimes refreshed, and release
   workflows validated on `main`.
 - Chaos testing: random kill, WAL truncation, disk full recovery is implemented
@@ -191,9 +199,10 @@ as a concise evidence ledger; roadmap stays for open gates only.
   until the 32-client p99 and PostgreSQL 17 throughput gates close.
 - Sysbench indexed-update smoke was hardened on 2026-05-28. A 30-run local
   repeat of `ultrasql-bench sysbench --engine ultrasql --rows 1000 --duration 1
-  --warmup 0 --connections 4` passed, and `benchmarks/certify.sh smoke` passed
-  regression-gate, HNSW ANN (`median_us=215.7085`, `recall_at_k=1.0`), and
-  UltraSQL sysbench smoke (`9939.4372 ops/s`). Smoke artifacts live at
+  --warmup 0 --connections 4` passed. Latest 2026-05-29
+  `benchmarks/certify.sh smoke` passed regression-gate, HNSW ANN
+  (`median_us=199.2710`, `recall_at_k=1.0`), and UltraSQL sysbench smoke
+  (`10083.2531 ops/s`). Smoke artifacts live at
   `benchmarks/results/latest/benchmark_certification_manifest.json`,
   `benchmarks/results/latest/sysbench_smoke.json`, and
   `benchmarks/results/latest/raw/sysbench_oltp_read_write_smoke-ultrasql.json`.
