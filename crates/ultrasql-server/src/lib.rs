@@ -3236,6 +3236,41 @@ fn ensure_runtime_metadata_file_slot(path: &Path) -> Result<(), ServerError> {
     }
 }
 
+fn write_backup_marker_file(path: &Path, payload: &str) -> Result<(), ServerError> {
+    ensure_backup_marker_file_slot(path)?;
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+
+        options.custom_flags(libc::O_NOFOLLOW);
+    }
+    let mut file = options.open(path).map_err(|err| {
+        #[cfg(unix)]
+        if err.raw_os_error() == Some(libc::ELOOP) {
+            return ServerError::ddl(format!(
+                "backup marker file {} is not a regular file",
+                path.display()
+            ));
+        }
+        ServerError::Io(err)
+    })?;
+    std::io::Write::write_all(&mut file, payload.as_bytes()).map_err(ServerError::Io)
+}
+
+fn ensure_backup_marker_file_slot(path: &Path) -> Result<(), ServerError> {
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_file() => Ok(()),
+        Ok(_) => Err(ServerError::ddl(format!(
+            "backup marker file {} is not a regular file",
+            path.display()
+        ))),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(ServerError::Io(err)),
+    }
+}
+
 impl Server {
     /// Build an empty in-memory server.
     ///
@@ -3612,7 +3647,7 @@ impl Server {
             .map(|duration| duration.as_secs())
             .unwrap_or(0);
         let payload = format!("function={function_name}\nlsn=0/0\nunix_seconds={now}\n");
-        std::fs::write(data_dir.join(file_name), payload).map_err(ServerError::Io)?;
+        write_backup_marker_file(&data_dir.join(file_name), &payload)?;
         Ok("0/0".to_owned())
     }
 

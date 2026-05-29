@@ -141,6 +141,28 @@ fn runtime_metadata_persist_refuses_symlinked_temp_file() {
 
 #[cfg(unix)]
 #[test]
+fn backup_markers_refuse_symlinked_targets() {
+    use std::os::unix::fs::symlink;
+
+    let data_dir = tempfile::TempDir::new().unwrap();
+    let server = Server::init(data_dir.path()).unwrap();
+    let outside = data_dir.path().join("outside-label");
+    fs::write(&outside, "keep").unwrap();
+    symlink(&outside, data_dir.path().join("backup_label")).unwrap();
+
+    let err = server
+        .record_backup_marker("pg_start_backup")
+        .expect_err("symlinked backup marker rejected");
+
+    assert!(
+        err.to_string().contains("backup marker"),
+        "expected backup marker rejection, got {err}"
+    );
+    assert_eq!(fs::read_to_string(&outside).unwrap(), "keep");
+}
+
+#[cfg(unix)]
+#[test]
 fn server_init_refuses_symlinked_recovery_targets() {
     use std::os::unix::fs::symlink;
 
