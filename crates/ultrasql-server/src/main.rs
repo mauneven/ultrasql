@@ -364,17 +364,28 @@ fn archive_wal_once(data_dir: &Path, archive_command: &str) -> Result<usize, Str
     let status_dir = wal_dir.join("archive_status");
     fs::create_dir_all(&status_dir).map_err(|e| format!("create archive_status: {e}"))?;
 
-    let mut files = fs::read_dir(&wal_dir)
-        .map_err(|e| format!("read {}: {e}", wal_dir.display()))?
-        .filter_map(Result::ok)
-        .map(|entry| entry.path())
-        .filter(|path| path.is_file())
-        .filter(|path| {
-            path.parent().is_some_and(|parent| {
-                parent.file_name().and_then(|n| n.to_str()) != Some("archive_status")
-            })
-        })
-        .collect::<Vec<_>>();
+    let mut files = Vec::new();
+    for entry in fs::read_dir(&wal_dir).map_err(|e| format!("read {}: {e}", wal_dir.display()))? {
+        let entry = entry.map_err(|e| format!("read {} entry: {e}", wal_dir.display()))?;
+        let path = entry.path();
+        let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        if matches!(name, "archive_status" | "restore_status") {
+            continue;
+        }
+        let file_type = entry
+            .file_type()
+            .map_err(|e| format!("inspect {}: {e}", path.display()))?;
+        if file_type.is_file() {
+            if !is_safe_wal_archive_filename(name) {
+                return Err(format!("unsafe WAL filename: {name}"));
+            }
+            files.push(path);
+        } else if is_safe_wal_archive_filename(name) {
+            return Err(format!("not a regular WAL file: {name}"));
+        }
+    }
     files.sort();
 
     // Conservative cut: skip newest segment candidate, because it is likely the
@@ -388,11 +399,8 @@ fn archive_wal_once(data_dir: &Path, archive_command: &str) -> Result<usize, Str
         let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
             continue;
         };
-        if !is_safe_wal_archive_filename(name) {
-            return Err(format!("unsafe WAL filename: {name}"));
-        }
         let done = status_dir.join(format!("{name}.done"));
-        if done.exists() {
+        if status_marker_exists(&done)? {
             continue;
         }
         let rendered = render_archive_command(archive_command, &path, name);
@@ -400,13 +408,12 @@ fn archive_wal_once(data_dir: &Path, archive_command: &str) -> Result<usize, Str
             .map_err(|e| format!("archive command spawn failed for {name}: {e}"))?;
         if !status.success() {
             let failed = status_dir.join(format!("{name}.failed"));
-            let _ = fs::write(&failed, rendered.as_bytes());
+            write_status_marker(&failed, rendered.as_bytes())?;
             return Err(format!(
                 "archive command failed for {name} with status {status}"
             ));
         }
-        fs::write(&done, rendered.as_bytes())
-            .map_err(|e| format!("write {}: {e}", done.display()))?;
+        write_status_marker(&done, rendered.as_bytes())?;
         archived = archived.saturating_add(1);
     }
     Ok(archived)
@@ -429,7 +436,7 @@ fn restore_wal_once(
     for index in 0..max_segments {
         let name = wal_segment_filename(index);
         let path = wal_dir.join(&name);
-        if path.is_file() {
+        if wal_file_exists(&path, &name)? {
             continue;
         }
 
@@ -438,21 +445,56 @@ fn restore_wal_once(
             .map_err(|e| format!("restore command spawn failed for {name}: {e}"))?;
         if !status.success() {
             let missing = status_dir.join(format!("{name}.missing"));
-            let _ = fs::write(&missing, rendered.as_bytes());
+            write_status_marker(&missing, rendered.as_bytes())?;
             break;
         }
-        if !path.is_file() {
+        if !wal_file_exists(&path, &name)? {
             let missing = status_dir.join(format!("{name}.missing"));
-            let _ = fs::write(&missing, rendered.as_bytes());
+            write_status_marker(&missing, rendered.as_bytes())?;
             break;
         }
 
         let done = status_dir.join(format!("{name}.done"));
-        fs::write(&done, rendered.as_bytes())
-            .map_err(|e| format!("write {}: {e}", done.display()))?;
+        write_status_marker(&done, rendered.as_bytes())?;
         restored = restored.saturating_add(1);
     }
     Ok(restored)
+}
+
+fn wal_file_exists(path: &Path, name: &str) -> Result<bool, String> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_file() => Ok(true),
+        Ok(_) => Err(format!("not a regular WAL file: {name}")),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(err) => Err(format!("inspect {}: {err}", path.display())),
+    }
+}
+
+fn status_marker_exists(path: &Path) -> Result<bool, String> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_file() => Ok(true),
+        Ok(_) => Err(format!(
+            "status marker is not a regular file: {}",
+            path.display()
+        )),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(err) => Err(format!("inspect {}: {err}", path.display())),
+    }
+}
+
+fn write_status_marker(path: &Path, bytes: &[u8]) -> Result<(), String> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_file() => {}
+        Ok(_) => {
+            return Err(format!(
+                "status marker is not a regular file: {}",
+                path.display()
+            ));
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+        Err(err) => return Err(format!("inspect {}: {err}", path.display())),
+    }
+    fs::write(path, bytes).map_err(|e| format!("write {}: {e}", path.display()))
 }
 
 fn is_safe_wal_archive_filename(name: &str) -> bool {
@@ -1088,6 +1130,51 @@ mod tests {
         assert!(!dir.path().join("wal_pwned").exists());
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn archive_wal_once_rejects_symlinked_wal_files() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let wal_dir = dir.path().join("pg_wal");
+        std::fs::create_dir_all(&wal_dir).expect("pg_wal");
+        let outside = dir.path().join("outside");
+        std::fs::write(&outside, b"secret").expect("outside");
+        symlink(&outside, wal_dir.join("000000010000000000000001")).expect("wal symlink");
+        std::fs::write(wal_dir.join("000000010000000000000002"), b"newest").expect("newest wal");
+
+        let err = archive_wal_once(dir.path(), successful_archive_command())
+            .expect_err("symlinked WAL rejected");
+
+        assert!(err.contains("not a regular WAL file"));
+        assert!(
+            !wal_dir
+                .join("archive_status/000000010000000000000001.done")
+                .exists()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn archive_wal_once_rejects_symlinked_status_markers() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let wal_dir = dir.path().join("pg_wal");
+        let status_dir = wal_dir.join("archive_status");
+        std::fs::create_dir_all(&status_dir).expect("archive_status");
+        std::fs::write(wal_dir.join("000000010000000000000001"), b"wal-a").expect("wal a");
+        std::fs::write(wal_dir.join("000000010000000000000002"), b"wal-b").expect("wal b");
+        let outside = dir.path().join("outside.done");
+        symlink(&outside, status_dir.join("000000010000000000000001.done")).expect("done symlink");
+
+        let err = archive_wal_once(dir.path(), successful_archive_command())
+            .expect_err("symlinked status rejected");
+
+        assert!(err.contains("status marker"));
+        assert!(!outside.exists());
+    }
+
     #[cfg(windows)]
     fn successful_archive_command() -> &'static str {
         "exit /B 0"
@@ -1191,6 +1278,26 @@ mod tests {
                 .exists()
         );
         assert_eq!(wal_segment_filename(7), "segment_0000000007");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn restore_wal_once_rejects_symlinked_output_paths() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let archive = tempfile::TempDir::new().expect("archive dir");
+        let wal_dir = dir.path().join("pg_wal");
+        std::fs::create_dir_all(&wal_dir).expect("pg_wal");
+        std::fs::write(archive.path().join("segment_0000000000"), b"wal-a").expect("wal a");
+        let outside = dir.path().join("outside");
+        symlink(&outside, wal_dir.join("segment_0000000000")).expect("wal output symlink");
+
+        let err = restore_wal_once(dir.path(), &copy_restore_command(archive.path()), 1)
+            .expect_err("symlinked output rejected");
+
+        assert!(err.contains("not a regular WAL file"));
+        assert!(!outside.exists());
     }
 
     #[cfg(windows)]
