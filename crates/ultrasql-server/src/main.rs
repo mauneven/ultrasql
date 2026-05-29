@@ -362,7 +362,8 @@ async fn run_wal_archiver_loop(data_dir: PathBuf, archive_command: String, inter
 fn archive_wal_once(data_dir: &Path, archive_command: &str) -> Result<usize, String> {
     let wal_dir = data_dir.join("pg_wal");
     let status_dir = wal_dir.join("archive_status");
-    fs::create_dir_all(&status_dir).map_err(|e| format!("create archive_status: {e}"))?;
+    ensure_directory(&wal_dir, "WAL directory")?;
+    ensure_directory(&status_dir, "archive status directory")?;
 
     let mut files = Vec::new();
     for entry in fs::read_dir(&wal_dir).map_err(|e| format!("read {}: {e}", wal_dir.display()))? {
@@ -430,7 +431,8 @@ fn restore_wal_once(
 
     let wal_dir = data_dir.join("pg_wal");
     let status_dir = wal_dir.join("restore_status");
-    fs::create_dir_all(&status_dir).map_err(|e| format!("create restore_status: {e}"))?;
+    ensure_directory(&wal_dir, "WAL directory")?;
+    ensure_directory(&status_dir, "restore status directory")?;
 
     let mut restored = 0_usize;
     for index in 0..max_segments {
@@ -470,6 +472,22 @@ fn wal_file_exists(path: &Path, name: &str) -> Result<bool, String> {
     }
 }
 
+fn ensure_directory(path: &Path, label: &str) -> Result<(), String> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_dir() => Ok(()),
+        Ok(_) => Err(format!("{label} is not a directory: {}", path.display())),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            fs::create_dir_all(path).map_err(|err| format!("create {}: {err}", path.display()))?;
+            match fs::symlink_metadata(path) {
+                Ok(metadata) if metadata.file_type().is_dir() => Ok(()),
+                Ok(_) => Err(format!("{label} is not a directory: {}", path.display())),
+                Err(err) => Err(format!("inspect {}: {err}", path.display())),
+            }
+        }
+        Err(err) => Err(format!("inspect {}: {err}", path.display())),
+    }
+}
+
 fn status_marker_exists(path: &Path) -> Result<bool, String> {
     match fs::symlink_metadata(path) {
         Ok(metadata) if metadata.file_type().is_file() => Ok(true),
@@ -494,7 +512,29 @@ fn write_status_marker(path: &Path, bytes: &[u8]) -> Result<(), String> {
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
         Err(err) => return Err(format!("inspect {}: {err}", path.display())),
     }
-    fs::write(path, bytes).map_err(|e| format!("write {}: {e}", path.display()))
+    write_regular_status_marker(path, bytes).map_err(|e| format!("write {}: {e}", path.display()))
+}
+
+#[cfg(unix)]
+fn write_regular_status_marker(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::fs::OpenOptions;
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let mut file = OpenOptions::new()
+        .create(true)
+        .truncate(true)
+        .write(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)?;
+    file.write_all(bytes)?;
+    file.flush()
+}
+
+#[cfg(not(unix))]
+fn write_regular_status_marker(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    fs::write(path, bytes)
 }
 
 fn is_safe_wal_archive_filename(name: &str) -> bool {
@@ -1099,7 +1139,7 @@ mod tests {
         std::fs::write(bad_dir.path().join("pg_wal"), b"not a directory").expect("pg_wal file");
         let err = archive_wal_once(bad_dir.path(), successful_archive_command())
             .expect_err("pg_wal file should fail");
-        assert!(err.contains("create archive_status"));
+        assert!(err.contains("WAL directory is not a directory"));
 
         let dir = tempfile::TempDir::new().expect("temp dir");
         let wal_dir = dir.path().join("pg_wal");
@@ -1154,6 +1194,54 @@ mod tests {
         assert!(
             !wal_dir
                 .join("archive_status/000000010000000000000001.done")
+                .exists()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn archive_wal_once_rejects_symlinked_wal_directory() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let outside = tempfile::TempDir::new().expect("outside dir");
+        std::fs::write(outside.path().join("000000010000000000000001"), b"wal-a").expect("wal a");
+        std::fs::write(outside.path().join("000000010000000000000002"), b"wal-b").expect("wal b");
+        symlink(outside.path(), dir.path().join("pg_wal")).expect("pg_wal symlink");
+
+        let err = archive_wal_once(dir.path(), successful_archive_command())
+            .expect_err("symlinked WAL directory rejected");
+
+        assert!(err.contains("WAL directory is not a directory"));
+        assert!(
+            !outside
+                .path()
+                .join("archive_status/000000010000000000000001.done")
+                .exists()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn archive_wal_once_rejects_symlinked_status_directory() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let outside = tempfile::TempDir::new().expect("outside dir");
+        let wal_dir = dir.path().join("pg_wal");
+        std::fs::create_dir_all(&wal_dir).expect("pg_wal");
+        std::fs::write(wal_dir.join("000000010000000000000001"), b"wal-a").expect("wal a");
+        std::fs::write(wal_dir.join("000000010000000000000002"), b"wal-b").expect("wal b");
+        symlink(outside.path(), wal_dir.join("archive_status")).expect("archive_status symlink");
+
+        let err = archive_wal_once(dir.path(), successful_archive_command())
+            .expect_err("symlinked archive status rejected");
+
+        assert!(err.contains("archive status directory is not a directory"));
+        assert!(
+            !outside
+                .path()
+                .join("000000010000000000000001.done")
                 .exists()
         );
     }
@@ -1302,6 +1390,45 @@ mod tests {
 
         assert!(err.contains("not a regular WAL file"));
         assert!(!outside.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn restore_wal_once_rejects_symlinked_wal_directory() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let outside = tempfile::TempDir::new().expect("outside dir");
+        symlink(outside.path(), dir.path().join("pg_wal")).expect("pg_wal symlink");
+
+        let err = restore_wal_once(dir.path(), successful_archive_command(), 1)
+            .expect_err("symlinked WAL directory rejected");
+
+        assert!(err.contains("WAL directory is not a directory"));
+        assert!(
+            !outside
+                .path()
+                .join("restore_status/segment_0000000000.missing")
+                .exists()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn restore_wal_once_rejects_symlinked_status_directory() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let outside = tempfile::TempDir::new().expect("outside dir");
+        let wal_dir = dir.path().join("pg_wal");
+        std::fs::create_dir_all(&wal_dir).expect("pg_wal");
+        symlink(outside.path(), wal_dir.join("restore_status")).expect("restore_status symlink");
+
+        let err = restore_wal_once(dir.path(), successful_archive_command(), 1)
+            .expect_err("symlinked restore status rejected");
+
+        assert!(err.contains("restore status directory is not a directory"));
+        assert!(!outside.path().join("segment_0000000000.missing").exists());
     }
 
     #[cfg(windows)]
