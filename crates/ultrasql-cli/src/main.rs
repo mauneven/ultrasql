@@ -1324,8 +1324,7 @@ async fn http_ops_endpoint(method: &str, endpoint: &str, path: &str) -> Result<O
 }
 
 fn run_waldump(path: &PathBuf) -> Result<()> {
-    let bytes =
-        fs::read(path).with_context(|| format!("cannot read WAL file: {}", path.display()))?;
+    let bytes = read_regular_file_capped(path, "WAL file", waldump_file_limit_bytes())?;
     println!("file: {}", path.display());
     println!("bytes: {}", bytes.len());
     println!("records:");
@@ -1343,6 +1342,14 @@ fn run_waldump(path: &PathBuf) -> Result<()> {
         println!("{absolute:08x}: {hex}");
     }
     Ok(())
+}
+
+fn waldump_file_limit_bytes() -> u64 {
+    std::env::var("ULTRASQL_WALDUMP_FILE_LIMIT_BYTES")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(256 * 1024 * 1024)
 }
 
 fn waldump_record_lines(bytes: &[u8]) -> Vec<String> {
@@ -1758,13 +1765,64 @@ fn restore_dump_directory(root: &Path, current: &Path, data_dir: &Path) -> Resul
 }
 
 fn read_regular_text_file(path: &Path, context: &str) -> Result<String> {
-    ensure_regular_source_file(path, context)?;
-    fs::read_to_string(path).with_context(|| format!("cannot read {context}: {}", path.display()))
+    let mut bytes = Vec::new();
+    let mut file = open_regular_source_file(path, context)?;
+    std::io::Read::read_to_end(&mut file, &mut bytes)
+        .with_context(|| format!("cannot read {context}: {}", path.display()))?;
+    String::from_utf8(bytes).with_context(|| format!("{context} is not UTF-8: {}", path.display()))
 }
 
 fn read_regular_file(path: &Path, context: &str) -> Result<Vec<u8>> {
+    let mut bytes = Vec::new();
+    let mut file = open_regular_source_file(path, context)?;
+    std::io::Read::read_to_end(&mut file, &mut bytes)
+        .with_context(|| format!("cannot read {context}: {}", path.display()))?;
+    Ok(bytes)
+}
+
+fn read_regular_file_capped(path: &Path, context: &str, limit: u64) -> Result<Vec<u8>> {
+    let file = open_regular_source_file(path, context)?;
+    let len = file
+        .metadata()
+        .with_context(|| format!("cannot inspect {context}: {}", path.display()))?
+        .len();
+    if len > limit {
+        anyhow::bail!(
+            "{context} exceeds read limit: {} size={} limit={}",
+            path.display(),
+            len,
+            limit
+        );
+    }
+    let mut bytes = Vec::new();
+    let mut limited = std::io::Read::take(file, limit.saturating_add(1));
+    std::io::Read::read_to_end(&mut limited, &mut bytes)
+        .with_context(|| format!("cannot read {context}: {}", path.display()))?;
+    let read_len = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
+    if read_len > limit {
+        anyhow::bail!(
+            "{context} exceeds read limit: {} size={} limit={}",
+            path.display(),
+            read_len,
+            limit
+        );
+    }
+    Ok(bytes)
+}
+
+fn open_regular_source_file(path: &Path, context: &str) -> Result<fs::File> {
     ensure_regular_source_file(path, context)?;
-    fs::read(path).with_context(|| format!("cannot read {context}: {}", path.display()))
+    let mut options = fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+
+        options.custom_flags(libc::O_NOFOLLOW);
+    }
+    options
+        .open(path)
+        .with_context(|| format!("cannot read {context}: {}", path.display()))
 }
 
 fn copy_regular_file(source: &Path, dest: &Path, context: &str) -> Result<()> {
@@ -2617,6 +2675,11 @@ mod tests {
         (addr, request_rx)
     }
 
+    fn cli_env_test_lock() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        LOCK.lock().expect("cli env test lock")
+    }
+
     #[test]
     fn wal_dump_archive_restore_and_hex_helpers_cover_success_and_errors() {
         use ultrasql_core::{Lsn, Xid};
@@ -2628,6 +2691,21 @@ mod tests {
         fs::write(&wal, record.encode()).expect("write WAL");
 
         run_waldump(&wal).expect("waldump");
+        let _env_guard = cli_env_test_lock();
+        // SAFETY: cli_env_test_lock serializes process-env mutation in this
+        // module's tests.
+        unsafe {
+            std::env::set_var("ULTRASQL_WALDUMP_FILE_LIMIT_BYTES", "3");
+        }
+        let oversized = dir.path().join("oversized-wal");
+        fs::write(&oversized, b"abcd").expect("oversized wal");
+        let err = run_waldump(&oversized).expect_err("oversized waldump rejected");
+        assert!(err.to_string().contains("exceeds read limit"), "{err}");
+        // SAFETY: cli_env_test_lock serializes process-env mutation in this
+        // module's tests.
+        unsafe {
+            std::env::remove_var("ULTRASQL_WALDUMP_FILE_LIMIT_BYTES");
+        }
         assert!(
             waldump_record_lines(&[])
                 .first()
