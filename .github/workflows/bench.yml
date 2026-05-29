@@ -150,6 +150,15 @@ jobs:
           "$pg_bin/initdb" -D "$data" --username runner >/dev/null
           "$pg_bin/pg_ctl" -D "$data" -o "-h 127.0.0.1 -p 55432" -w start
           createdb -h 127.0.0.1 -p 55432 -U runner ultrasql_bench
+      - name: resolve package version
+        id: package-version
+        shell: bash
+        run: |
+          version="$(
+            cargo metadata --no-deps --format-version 1 \
+              | python3 -c 'import json, sys; data = json.load(sys.stdin); print(next(p["version"] for p in data["packages"] if p["name"] == "ultrasql-server"))'
+          )"
+          echo "version=${version}" >> "$GITHUB_OUTPUT"
       - name: run release artifact scale sweep
         shell: bash
         env:
@@ -158,7 +167,9 @@ jobs:
           PGUSER: runner
           PGDATABASE: ultrasql_bench
           SCALE_SWEEP_ROWS: "10000 100000"
-        run: benchmarks/run_scale_sweep.sh quick
+          ULTRASQL_RELEASE_VERSION: v${{ steps.package-version.outputs.version }}
+        run: |
+          benchmarks/run_scale_sweep.sh quick
       - name: upload scale sweep artifacts
         if: always()
         uses: actions/upload-artifact@v7

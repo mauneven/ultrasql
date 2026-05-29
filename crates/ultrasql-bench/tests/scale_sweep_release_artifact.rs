@@ -41,6 +41,22 @@ fn scale_sweep_script_uses_external_release_artifact() {
 }
 
 #[test]
+fn release_sweep_workflow_pins_manifest_release_version() {
+    let workflow = repo_file(".github/workflows/bench.yml");
+
+    assert!(workflow.contains("id: package-version"));
+    assert!(workflow.contains("cargo metadata --no-deps --format-version 1"));
+    assert!(
+        workflow
+            .contains(r#"ULTRASQL_RELEASE_VERSION: v${{ steps.package-version.outputs.version }}"#)
+    );
+    assert!(
+        !workflow.contains("run: benchmarks/run_scale_sweep.sh quick"),
+        "release sweep must not install a mutable latest release"
+    );
+}
+
+#[test]
 fn postgres_runner_does_not_swallow_database_setup_failures() {
     let script = repo_file("benchmarks/scripts/run_postgres_writes.sh");
 
