@@ -38,13 +38,18 @@
 //! and `ROLLBACK PREPARED`) are serialised by the [`DashMap`] entry's shard lock
 //! via the `entry()` API.
 
-use std::fs::{self, OpenOptions};
-use std::io::Write;
-use std::path::PathBuf;
+use std::fs::{self, File, OpenOptions};
+use std::io::{ErrorKind, Read, Write};
+#[cfg(unix)]
+use std::os::unix::fs::OpenOptionsExt;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use dashmap::DashMap;
 use ultrasql_core::Xid;
+
+const DEFAULT_STATE_FILE_LIMIT_BYTES: u64 = 1024 * 1024;
+const STATE_FILE_LIMIT_ENV: &str = "ULTRASQL_2PC_STATE_FILE_LIMIT_BYTES";
 
 /// Errors returned by 2PC operations.
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
@@ -222,7 +227,11 @@ impl TwoPhaseCoordinator {
                 continue;
             }
 
-            let Ok(content) = fs::read_to_string(&path) else {
+            let Ok(content) = read_state_file_text(&path) else {
+                tracing::warn!(
+                    path = %path.display(),
+                    "skipping unreadable 2PC state file during recovery"
+                );
                 continue;
             };
 
@@ -336,6 +345,60 @@ fn write_state_file(
             gid: gid.to_owned(),
             detail: e.to_string(),
         })
+}
+
+fn read_state_file_text(path: &Path) -> std::io::Result<String> {
+    let limit = state_file_limit_bytes();
+    let file = open_state_file_for_read(path)?;
+    let metadata = file.metadata()?;
+    if !metadata.file_type().is_file() {
+        return Err(std::io::Error::new(
+            ErrorKind::InvalidInput,
+            format!("2PC state path is not a regular file: {}", path.display()),
+        ));
+    }
+    if metadata.len() > limit {
+        return Err(state_file_limit_error(path, metadata.len(), limit));
+    }
+
+    let mut content = String::new();
+    let mut limited = file.take(limit.saturating_add(1));
+    limited.read_to_string(&mut content)?;
+    let bytes_read = u64::try_from(content.len()).unwrap_or(u64::MAX);
+    if bytes_read > limit {
+        return Err(state_file_limit_error(path, bytes_read, limit));
+    }
+    Ok(content)
+}
+
+fn state_file_limit_bytes() -> u64 {
+    std::env::var(STATE_FILE_LIMIT_ENV)
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|&limit| limit > 0)
+        .unwrap_or(DEFAULT_STATE_FILE_LIMIT_BYTES)
+}
+
+fn state_file_limit_error(path: &Path, bytes: u64, limit: u64) -> std::io::Error {
+    std::io::Error::new(
+        ErrorKind::InvalidData,
+        format!(
+            "2PC state file exceeds read limit: path={} bytes={} limit={} env={}",
+            path.display(),
+            bytes,
+            limit,
+            STATE_FILE_LIMIT_ENV
+        ),
+    )
+}
+
+#[cfg_attr(not(unix), allow(unused_variables))]
+fn open_state_file_for_read(path: &Path) -> std::io::Result<File> {
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    options.custom_flags(libc::O_NOFOLLOW);
+    options.open(path)
 }
 
 /// Parsed record from a state file.
@@ -682,6 +745,19 @@ mod tests {
         )
         .expect("target state");
         symlink(&target, dir.path().join("from-link.txn")).expect("state symlink");
+
+        let coord = TwoPhaseCoordinator::new(dir.path().to_path_buf());
+        assert_eq!(coord.recover_from_disk().expect("recover"), 0);
+        assert!(coord.list_prepared().is_empty());
+    }
+
+    #[test]
+    fn recover_from_disk_skips_configured_oversized_state_files() {
+        let dir = TempDir::new().expect("tempdir");
+        let mut state = String::from("{\"gid\":\"oversized\",\"xid\":702,\"prepared_at_secs\":0}");
+        let padding = usize::try_from(DEFAULT_STATE_FILE_LIMIT_BYTES).unwrap() + 1;
+        state.push_str(&" ".repeat(padding));
+        std::fs::write(dir.path().join("oversized.txn"), state).expect("state file");
 
         let coord = TwoPhaseCoordinator::new(dir.path().to_path_buf());
         assert_eq!(coord.recover_from_disk().expect("recover"), 0);
