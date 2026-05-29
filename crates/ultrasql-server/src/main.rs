@@ -649,11 +649,10 @@ async fn handle_ops_request(mut stream: TcpStream, pg_addr: SocketAddr, state: A
         Err(_) => return,
     };
     let req = String::from_utf8_lossy(&buf[..n]);
-    let path = req
-        .lines()
-        .next()
-        .and_then(|line| line.split_whitespace().nth(1))
-        .unwrap_or("/");
+    let request_line = req.lines().next().unwrap_or_default();
+    let mut request_parts = request_line.split_whitespace();
+    let method = request_parts.next().unwrap_or_default();
+    let path = request_parts.next().unwrap_or("/");
 
     let (status, content_type, body) = match path {
         "/health" => (
@@ -687,11 +686,18 @@ async fn handle_ops_request(mut stream: TcpStream, pg_addr: SocketAddr, state: A
             }
         }
         "/metrics" => ("200 OK", "text/plain; version=0.0.4", metrics_body(&state)),
-        "/backup/start" => match start_backup_fence(&state) {
+        "/backup/start" if method == "POST" => match start_backup_fence(&state) {
             Ok(body) => ("200 OK", "application/json", body),
             Err(body) => ("500 Internal Server Error", "application/json", body),
         },
-        "/backup/stop" => ("200 OK", "application/json", stop_backup_fence(&state)),
+        "/backup/stop" if method == "POST" => {
+            ("200 OK", "application/json", stop_backup_fence(&state))
+        }
+        "/backup/start" | "/backup/stop" => (
+            "405 Method Not Allowed",
+            "application/json",
+            "{\"error\":\"method not allowed\"}\n".to_string(),
+        ),
         _ => (
             "404 Not Found",
             "application/json",
@@ -932,12 +938,14 @@ mod tests {
         assert!(metrics.contains("content-type: text/plain; version=0.0.4"));
         assert!(metrics.contains("ultrasql_up 1"));
 
-        let backup_start = request_ops_path("/backup/start", missing_pg, Arc::clone(&state)).await;
+        let backup_start =
+            request_ops_method("POST", "/backup/start", missing_pg, Arc::clone(&state)).await;
         assert!(backup_start.starts_with("HTTP/1.1 200 OK"));
         assert!(backup_start.contains("\"backup_started\""));
         assert!(state.is_standby_mode());
 
-        let backup_stop = request_ops_path("/backup/stop", missing_pg, Arc::clone(&state)).await;
+        let backup_stop =
+            request_ops_method("POST", "/backup/stop", missing_pg, Arc::clone(&state)).await;
         assert!(backup_stop.starts_with("HTTP/1.1 200 OK"));
         assert!(backup_stop.contains("\"backup_stopped\""));
         assert!(!state.is_standby_mode());
@@ -947,7 +955,31 @@ mod tests {
         assert!(not_found.contains("\"error\":\"not found\""));
     }
 
+    #[tokio::test]
+    async fn ops_endpoint_backup_routes_reject_get_requests() {
+        let state = Arc::new(Server::with_sample_database());
+        let missing_pg: SocketAddr = "127.0.0.1:0".parse().expect("missing pg addr");
+
+        let backup_start = request_ops_path("/backup/start", missing_pg, Arc::clone(&state)).await;
+        assert!(backup_start.starts_with("HTTP/1.1 405 Method Not Allowed"));
+        assert!(!state.is_standby_mode());
+
+        state.set_standby_mode(true);
+        let backup_stop = request_ops_path("/backup/stop", missing_pg, Arc::clone(&state)).await;
+        assert!(backup_stop.starts_with("HTTP/1.1 405 Method Not Allowed"));
+        assert!(state.is_standby_mode());
+    }
+
     async fn request_ops_path(path: &str, pg_addr: SocketAddr, state: Arc<Server>) -> String {
+        request_ops_method("GET", path, pg_addr, state).await
+    }
+
+    async fn request_ops_method(
+        method: &str,
+        path: &str,
+        pg_addr: SocketAddr,
+        state: Arc<Server>,
+    ) -> String {
         let listener = TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind ops probe");
@@ -959,7 +991,7 @@ mod tests {
 
         let mut client = TcpStream::connect(addr).await.expect("connect ops probe");
         client
-            .write_all(format!("GET {path} HTTP/1.1\r\nhost: localhost\r\n\r\n").as_bytes())
+            .write_all(format!("{method} {path} HTTP/1.1\r\nhost: localhost\r\n\r\n").as_bytes())
             .await
             .expect("write request");
         let mut response = Vec::new();
