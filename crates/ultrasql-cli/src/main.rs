@@ -1238,12 +1238,23 @@ async fn check_http_ready(endpoint: &str) -> Result<bool> {
     Ok(http_get_ops_endpoint(endpoint, "/ready").await?.ok)
 }
 
+#[derive(Debug)]
 struct OpsHttpResponse {
     ok: bool,
     body: String,
 }
 
+const OPS_HTTP_RESPONSE_LIMIT_BYTES: usize = 64 * 1024;
+
 async fn http_get_ops_endpoint(endpoint: &str, path: &str) -> Result<OpsHttpResponse> {
+    http_ops_endpoint("GET", endpoint, path).await
+}
+
+async fn http_post_ops_endpoint(endpoint: &str, path: &str) -> Result<OpsHttpResponse> {
+    http_ops_endpoint("POST", endpoint, path).await
+}
+
+async fn http_ops_endpoint(method: &str, endpoint: &str, path: &str) -> Result<OpsHttpResponse> {
     let endpoint = endpoint
         .strip_prefix("http://")
         .unwrap_or(endpoint)
@@ -1259,11 +1270,27 @@ async fn http_get_ops_endpoint(endpoint: &str, path: &str) -> Result<OpsHttpResp
     let mut stream = tokio::net::TcpStream::connect(host_port)
         .await
         .with_context(|| format!("{host_port} - no response"))?;
-    let request = format!("GET {path} HTTP/1.1\r\nhost: {host_port}\r\nconnection: close\r\n\r\n");
+    let request =
+        format!("{method} {path} HTTP/1.1\r\nhost: {host_port}\r\nconnection: close\r\n\r\n");
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     stream.write_all(request.as_bytes()).await?;
     let mut response = Vec::new();
-    stream.read_to_end(&mut response).await?;
+    let mut buffer = [0_u8; 4096];
+    loop {
+        let read = stream.read(&mut buffer).await?;
+        if read == 0 {
+            break;
+        }
+        let next_len = response.len().saturating_add(read);
+        if next_len > OPS_HTTP_RESPONSE_LIMIT_BYTES {
+            anyhow::bail!(
+                "ops endpoint response exceeds read limit: bytes={} limit={}",
+                next_len,
+                OPS_HTTP_RESPONSE_LIMIT_BYTES
+            );
+        }
+        response.extend_from_slice(&buffer[..read]);
+    }
     let ok = response.starts_with(b"HTTP/1.1 200") || response.starts_with(b"HTTP/1.0 200");
     let body = response
         .windows(4)
@@ -1385,7 +1412,7 @@ async fn run_basebackup(
     ops_endpoint: Option<&str>,
 ) -> Result<()> {
     let checkpoint_fence = if let Some(endpoint) = ops_endpoint {
-        let response = http_get_ops_endpoint(endpoint, "/backup/start").await?;
+        let response = http_post_ops_endpoint(endpoint, "/backup/start").await?;
         if !response.ok {
             anyhow::bail!("backup fence start failed: {}", response.body.trim());
         }
@@ -1396,7 +1423,7 @@ async fn run_basebackup(
 
     let backup_result = run_basebackup_copy(data_dir, dest, checkpoint_fence.as_deref());
     if let Some(endpoint) = ops_endpoint {
-        let stop_result = http_get_ops_endpoint(endpoint, "/backup/stop").await;
+        let stop_result = http_post_ops_endpoint(endpoint, "/backup/stop").await;
         if backup_result.is_ok() {
             let response = stop_result?;
             if !response.ok {
@@ -2456,6 +2483,49 @@ mod tests {
             .expect("ops isready");
     }
 
+    #[tokio::test]
+    async fn ops_http_response_body_is_bounded() {
+        let body = "x".repeat(70 * 1024);
+        let response = format!(
+            "HTTP/1.1 200 OK\r\ncontent-length: {}\r\n\r\n{}",
+            body.len(),
+            body
+        );
+        let (endpoint, _requests) = spawn_recording_http(vec![response]).await;
+
+        let err = http_get_ops_endpoint(&endpoint.to_string(), "/ready")
+            .await
+            .expect_err("oversized ops response rejected");
+
+        assert!(err.to_string().contains("exceeds read limit"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn basebackup_fence_uses_post_requests() {
+        let data_dir = tempfile::tempdir().expect("data dir");
+        fs::write(data_dir.path().join("heap"), b"data").expect("data file");
+        let dest_parent = tempfile::tempdir().expect("dest parent");
+        let dest = dest_parent.path().join("backup");
+        let (endpoint, mut requests) = spawn_recording_http(vec![
+            "HTTP/1.1 200 OK\r\ncontent-length: 20\r\n\r\n{\"status\":\"start\"}".to_owned(),
+            "HTTP/1.1 200 OK\r\ncontent-length: 19\r\n\r\n{\"status\":\"stop\"}".to_owned(),
+        ])
+        .await;
+
+        run_basebackup(
+            &data_dir.path().to_path_buf(),
+            &dest,
+            Some(&endpoint.to_string()),
+        )
+        .await
+        .expect("basebackup");
+
+        let start = requests.recv().await.expect("start request");
+        let stop = requests.recv().await.expect("stop request");
+        assert!(start.starts_with("POST /backup/start HTTP/1.1"), "{start}");
+        assert!(stop.starts_with("POST /backup/stop HTTP/1.1"), "{stop}");
+    }
+
     async fn spawn_one_shot_http(response: &'static str) -> std::net::SocketAddr {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -2473,6 +2543,46 @@ mod tests {
                 .expect("write test HTTP response");
         });
         addr
+    }
+
+    async fn spawn_recording_http(
+        responses: Vec<String>,
+    ) -> (
+        std::net::SocketAddr,
+        tokio::sync::mpsc::UnboundedReceiver<String>,
+    ) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test http listener");
+        let addr = listener.local_addr().expect("listener addr");
+        let (request_tx, request_rx) = tokio::sync::mpsc::unbounded_channel();
+        tokio::spawn(async move {
+            for response in responses {
+                let (mut socket, _) = listener.accept().await.expect("accept test HTTP");
+                let mut request = Vec::new();
+                let mut buf = [0_u8; 512];
+                loop {
+                    let read = socket.read(&mut buf).await.expect("read request");
+                    if read == 0 {
+                        break;
+                    }
+                    request.extend_from_slice(&buf[..read]);
+                    if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                        break;
+                    }
+                }
+                request_tx
+                    .send(String::from_utf8_lossy(&request).into_owned())
+                    .expect("record request");
+                socket
+                    .write_all(response.as_bytes())
+                    .await
+                    .expect("write test HTTP response");
+            }
+        });
+        (addr, request_rx)
     }
 
     #[test]
