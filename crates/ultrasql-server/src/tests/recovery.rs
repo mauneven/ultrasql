@@ -141,6 +141,24 @@ fn runtime_metadata_persist_refuses_symlinked_temp_file() {
 
 #[cfg(unix)]
 #[test]
+fn server_init_refuses_symlinked_recovery_targets() {
+    use std::os::unix::fs::symlink;
+
+    let data_dir = tempfile::TempDir::new().unwrap();
+    let outside = data_dir.path().join("outside.targets");
+    fs::write(&outside, "recovery_target_xid = '42'\n").unwrap();
+    symlink(&outside, data_dir.path().join("recovery.targets")).unwrap();
+
+    let err = Server::init(data_dir.path()).expect_err("symlinked recovery targets rejected");
+
+    assert!(
+        err.to_string().contains("recovery targets"),
+        "expected recovery target rejection, got {err}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
 fn data_dir_owner_check_rejects_unexpected_uid() {
     use std::os::unix::fs::MetadataExt;
 

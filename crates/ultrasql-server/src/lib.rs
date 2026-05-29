@@ -3038,10 +3038,21 @@ fn recovery_replay_target_from_data_dir(
     data_dir: &Path,
 ) -> Result<ultrasql_wal::RecoveryTarget, ServerError> {
     let path = data_dir.join("recovery.targets");
-    if !path.exists() {
-        return Ok(ultrasql_wal::RecoveryTarget::none());
-    }
-    let text = std::fs::read_to_string(&path).map_err(ServerError::Io)?;
+    let text = match std::fs::symlink_metadata(&path) {
+        Ok(metadata) if metadata.file_type().is_file() => {
+            std::fs::read_to_string(&path).map_err(ServerError::Io)?
+        }
+        Ok(_) => {
+            return Err(ServerError::ddl(format!(
+                "recovery targets file {} is not a regular file",
+                path.display()
+            )));
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(ultrasql_wal::RecoveryTarget::none());
+        }
+        Err(err) => return Err(ServerError::Io(err)),
+    };
     let mut target = ultrasql_wal::RecoveryTarget::none();
     for line in text.lines() {
         let line = line.trim();
