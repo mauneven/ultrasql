@@ -42,10 +42,8 @@ use crate::column::{ColumnError, NumericColumn, StringColumn};
 /// caller-supplied `validity` mask (if any). When both are present they are
 /// AND-folded; when neither is present the output is non-nullable.
 ///
-/// # Panics
-///
-/// Panics if `validity` is present and its length disagrees with the
-/// column length.
+/// A mismatched validity bitmap fails closed: every row is marked NULL and
+/// payload slots are zeroed.
 #[must_use]
 pub fn len_text(column: &StringColumn, validity: Option<&Bitmap>) -> NumericColumn<i64> {
     let n = column.len();
@@ -81,10 +79,8 @@ pub fn len_text_scalar(column: &StringColumn, validity: Option<&Bitmap>) -> Nume
 /// NULL rows produce empty strings; the merged validity bitmap (column nulls
 /// AND-folded with the supplied `validity`) tags those positions as NULL.
 ///
-/// # Panics
-///
-/// Panics if `validity` is present and its length disagrees with the
-/// column length.
+/// A mismatched validity bitmap fails closed: every row is marked NULL and
+/// payload slots are zeroed.
 #[must_use]
 pub fn lower_text(column: &StringColumn, validity: Option<&Bitmap>) -> StringColumn {
     let bytes = column.values();
@@ -125,10 +121,8 @@ pub fn lower_text_scalar(column: &StringColumn, validity: Option<&Bitmap>) -> St
 /// NULL rows produce empty strings; the merged validity bitmap tags those
 /// positions as NULL.
 ///
-/// # Panics
-///
-/// Panics if `validity` is present and its length disagrees with the
-/// column length.
+/// A mismatched validity bitmap fails closed: every row is marked NULL and
+/// payload slots are zeroed.
 #[must_use]
 pub fn upper_text(column: &StringColumn, validity: Option<&Bitmap>) -> StringColumn {
     let bytes = column.values();
@@ -165,12 +159,20 @@ pub fn upper_text_scalar(column: &StringColumn, validity: Option<&Bitmap>) -> St
 
 /// Combine the column's own nulls bitmap with the caller-supplied `validity`
 /// mask into a single bitmap. `None` if neither is present.
-fn combined_validity(column_nulls: Option<&Bitmap>, validity: Option<&Bitmap>) -> Option<Bitmap> {
+///
+/// Any bitmap whose length disagrees with `n` fails closed to an all-NULL mask.
+fn combined_validity(
+    column_nulls: Option<&Bitmap>,
+    validity: Option<&Bitmap>,
+    n: usize,
+) -> Option<Bitmap> {
     match (column_nulls, validity) {
         (None, None) => None,
-        (Some(a), None) | (None, Some(a)) => Some(a.clone()),
+        (Some(a), None) | (None, Some(a)) => Some(normalize_bitmap(a, n)),
         (Some(a), Some(b)) => {
-            assert_eq!(a.len(), b.len(), "validity length mismatch in text kernel");
+            if a.len() != n || b.len() != n {
+                return Some(Bitmap::new(n, false));
+            }
             let mut merged = a.clone();
             for i in 0..a.len() {
                 merged.set(i, a.get(i) && b.get(i));
@@ -187,7 +189,7 @@ fn finalize_numeric_i64(
     validity: Option<&Bitmap>,
     n: usize,
 ) -> NumericColumn<i64> {
-    let merged = combined_validity(column_nulls, validity);
+    let merged = combined_validity(column_nulls, validity, n);
     if let Some(bm) = merged {
         for (i, slot) in data.iter_mut().enumerate().take(n) {
             if !bm.get(i) {
@@ -196,10 +198,8 @@ fn finalize_numeric_i64(
         }
         match NumericColumn::with_nulls(data, bm) {
             Ok(c) => c,
-            Err(ColumnError::LengthMismatch { bitmap, column }) => {
-                panic!("finalize_numeric_i64: validity length {bitmap} != column length {column}")
-            }
-            Err(err) => panic!("finalize_numeric_i64: unexpected column error: {err}"),
+            Err(ColumnError::LengthMismatch { column, .. }) => all_null_i64(column),
+            Err(_) => NumericColumn::from_data(Vec::new()),
         }
     } else {
         NumericColumn::from_data(data)
@@ -218,7 +218,7 @@ fn finalize_string_with(
     validity: Option<&Bitmap>,
 ) -> StringColumn {
     let n = column.len();
-    let merged = combined_validity(column.nulls(), validity);
+    let merged = combined_validity(column.nulls(), validity, n);
     if let Some(ref bm) = merged {
         // Rebuild offsets so null rows have a zero-length slice. This is
         // the cleanest way to ensure no garbage bytes ever leak through the
@@ -251,10 +251,8 @@ fn finalize_string_with(
             .collect();
         match StringColumn::with_nulls(rows, bm.clone()) {
             Ok(c) => c,
-            Err(ColumnError::LengthMismatch { bitmap, column }) => {
-                panic!("finalize_string_with: validity length {bitmap} != column length {column}")
-            }
-            Err(err) => panic!("finalize_string_with: unexpected column error: {err}"),
+            Err(ColumnError::LengthMismatch { column, .. }) => all_null_strings(column),
+            Err(_) => StringColumn::from_data(Vec::<String>::new()),
         }
     } else {
         // No nulls — reuse the source column's offsets verbatim.
@@ -281,25 +279,42 @@ fn finalize_string_from_rows(
     validity: Option<&Bitmap>,
     n: usize,
 ) -> StringColumn {
-    let merged = combined_validity(column_nulls, validity);
+    let merged = combined_validity(column_nulls, validity, n);
     if let Some(bm) = merged {
         let masked: Vec<String> = rows
             .into_iter()
             .enumerate()
             .map(|(i, s)| if bm.get(i) { s } else { String::new() })
             .collect();
-        assert_eq!(masked.len(), n, "row count mismatch in text scalar kernel");
         match StringColumn::with_nulls(masked, bm) {
             Ok(c) => c,
-            Err(ColumnError::LengthMismatch { bitmap, column }) => {
-                panic!(
-                    "finalize_string_from_rows: validity length {bitmap} != column length {column}"
-                )
-            }
-            Err(err) => panic!("finalize_string_from_rows: unexpected column error: {err}"),
+            Err(ColumnError::LengthMismatch { column, .. }) => all_null_strings(column),
+            Err(_) => StringColumn::from_data(Vec::<String>::new()),
         }
     } else {
         StringColumn::from_data(rows)
+    }
+}
+
+fn normalize_bitmap(bitmap: &Bitmap, n: usize) -> Bitmap {
+    if bitmap.len() == n {
+        bitmap.clone()
+    } else {
+        Bitmap::new(n, false)
+    }
+}
+
+fn all_null_i64(len: usize) -> NumericColumn<i64> {
+    match NumericColumn::with_nulls(vec![0_i64; len], Bitmap::new(len, false)) {
+        Ok(c) => c,
+        Err(_) => NumericColumn::from_data(Vec::new()),
+    }
+}
+
+fn all_null_strings(len: usize) -> StringColumn {
+    match StringColumn::with_nulls(vec![String::new(); len], Bitmap::new(len, false)) {
+        Ok(c) => c,
+        Err(_) => StringColumn::from_data(Vec::<String>::new()),
     }
 }
 
@@ -350,6 +365,21 @@ mod tests {
     }
 
     #[test]
+    fn len_text_mismatched_validity_fails_closed() {
+        let c = col(&["alpha", "beta", "gamma"]);
+        let bm = Bitmap::new(1, true);
+
+        let out = len_text(&c, Some(&bm));
+
+        assert_eq!(out.data(), &[0_i64, 0, 0]);
+        let nulls = out
+            .nulls()
+            .expect("mismatched validity should stay nullable");
+        assert_eq!(nulls.len(), 3);
+        assert_eq!(nulls.count_ones(), 0);
+    }
+
+    #[test]
     fn len_text_matches_scalar() {
         let c = col(&["", "x", "abc", "longerstring", "12345"]);
         let got = len_text(&c, None);
@@ -385,6 +415,40 @@ mod tests {
         for i in 0..got.len() {
             assert_eq!(got.value(i), want.value(i), "row {i}");
         }
+    }
+
+    #[test]
+    fn lower_text_mismatched_validity_fails_closed() {
+        let c = col(&["HELLO", "World!", "ALREADY-low"]);
+        let bm = Bitmap::new(1, true);
+
+        let out = lower_text(&c, Some(&bm));
+
+        assert_eq!(out.value(0), "");
+        assert_eq!(out.value(1), "");
+        assert_eq!(out.value(2), "");
+        let nulls = out
+            .nulls()
+            .expect("mismatched validity should stay nullable");
+        assert_eq!(nulls.len(), 3);
+        assert_eq!(nulls.count_ones(), 0);
+    }
+
+    #[test]
+    fn lower_text_scalar_mismatched_validity_fails_closed() {
+        let c = col(&["HELLO", "World!", "ALREADY-low"]);
+        let bm = Bitmap::new(1, true);
+
+        let out = lower_text_scalar(&c, Some(&bm));
+
+        assert_eq!(out.value(0), "");
+        assert_eq!(out.value(1), "");
+        assert_eq!(out.value(2), "");
+        let nulls = out
+            .nulls()
+            .expect("mismatched validity should stay nullable");
+        assert_eq!(nulls.len(), 3);
+        assert_eq!(nulls.count_ones(), 0);
     }
 
     // ---- upper_text ----

@@ -270,10 +270,7 @@ impl Drop for S3EndpointOverrideGuard {
 /// Overrides the S3 endpoint for this process until the returned guard drops.
 #[must_use]
 pub fn override_s3_endpoint_for_process(endpoint: impl Into<String>) -> S3EndpointOverrideGuard {
-    let lock = S3_ENDPOINT_OVERRIDE_LOCK
-        .get_or_init(|| Mutex::new(()))
-        .lock()
-        .expect("s3 endpoint override guard mutex");
+    let lock = lock_unpoisoned(S3_ENDPOINT_OVERRIDE_LOCK.get_or_init(|| Mutex::new(())));
     S3EndpointOverrideGuard {
         _lock: lock,
         previous: replace_s3_endpoint_override(Some(endpoint.into())),
@@ -281,19 +278,19 @@ pub fn override_s3_endpoint_for_process(endpoint: impl Into<String>) -> S3Endpoi
 }
 
 fn s3_endpoint_override() -> Option<String> {
-    S3_ENDPOINT_OVERRIDE
-        .get_or_init(|| Mutex::new(None))
-        .lock()
-        .expect("s3 endpoint override mutex")
-        .clone()
+    lock_unpoisoned(S3_ENDPOINT_OVERRIDE.get_or_init(|| Mutex::new(None))).clone()
 }
 
 fn replace_s3_endpoint_override(value: Option<String>) -> Option<String> {
-    let mut guard = S3_ENDPOINT_OVERRIDE
-        .get_or_init(|| Mutex::new(None))
-        .lock()
-        .expect("s3 endpoint override mutex");
+    let mut guard = lock_unpoisoned(S3_ENDPOINT_OVERRIDE.get_or_init(|| Mutex::new(None)));
     std::mem::replace(&mut *guard, value)
+}
+
+fn lock_unpoisoned<T>(mutex: &'static Mutex<T>) -> MutexGuard<'static, T> {
+    match mutex.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -953,6 +950,22 @@ mod tests {
         assert_eq!(
             request.canonical_query,
             "list-type=2&prefix=logs%2Fa%20b%2F"
+        );
+    }
+
+    #[test]
+    fn s3_endpoint_override_recovers_from_poisoned_guard_lock() {
+        let _test_guard = objectstore_env_test_lock();
+
+        let _ = std::panic::catch_unwind(|| {
+            let _guard = override_s3_endpoint_for_process("http://127.0.0.1:9001/");
+            panic!("poison endpoint override lock");
+        });
+
+        let _guard = override_s3_endpoint_for_process("http://127.0.0.1:9002/");
+        assert_eq!(
+            s3_endpoint_override().as_deref(),
+            Some("http://127.0.0.1:9002/")
         );
     }
 

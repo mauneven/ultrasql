@@ -11,7 +11,7 @@
   "connections": 4,
   "ultrasql_result": "benchmarks/results/latest/raw/sysbench_oltp_read_write_smoke-ultrasql.json",
   "postgres_result": null,
-  "ultrasql_throughput_per_sec": 9939.437174873845,
+  "ultrasql_throughput_per_sec": 10032.039018925741,
   "postgres_throughput_per_sec": null,
   "throughput_ratio_ultrasql_vs_postgres": null,
   "competitor_claim": null,

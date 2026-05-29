@@ -95,33 +95,72 @@ pub(super) const fn cmp_to_i32(ord: std::cmp::Ordering) -> i32 {
     }
 }
 
-/// Apply a validity mask to the output data and wrap it in a
-/// [`NumericColumn`].
+/// Apply a validity mask to the output data and wrap it in a [`NumericColumn`].
 ///
 /// Where `validity[i]` is 0 (NULL), the output value is forced to `default`
 /// (the type's zero) so garbage values never escape. The output column
 /// carries the same validity bitmap. If `validity` is `None` the column is
-/// returned non-nullable.
+/// returned non-nullable. A mismatched validity bitmap fails closed: all rows
+/// become NULL and payload slots are set to `default`.
 pub(super) fn apply_null_numeric<T: Copy>(
     mut data: Vec<T>,
     validity: Option<&Bitmap>,
     n: usize,
     default: T,
 ) -> NumericColumn<T> {
-    if let Some(bm) = validity {
-        for (i, slot) in data.iter_mut().enumerate().take(n) {
+    if let Some(bm) = normalize_validity(validity, data.len(), n) {
+        for (i, slot) in data.iter_mut().enumerate() {
             if !bm.get(i) {
                 *slot = default;
             }
         }
-        match NumericColumn::with_nulls(data, bm.clone()) {
+        match NumericColumn::with_nulls(data, bm) {
             Ok(c) => c,
-            Err(ColumnError::LengthMismatch { bitmap, column }) => {
-                panic!("apply_null_numeric: validity length {bitmap} != column length {column}")
-            }
-            Err(err) => panic!("apply_null_numeric: unexpected column error: {err}"),
+            Err(ColumnError::LengthMismatch { column, .. }) => all_null_numeric(column, default),
+            Err(_) => NumericColumn::from_data(Vec::new()),
         }
     } else {
         NumericColumn::from_data(data)
+    }
+}
+
+fn normalize_validity(
+    validity: Option<&Bitmap>,
+    column_len: usize,
+    expected_len: usize,
+) -> Option<Bitmap> {
+    validity.map(|bm| {
+        if bm.len() == column_len && expected_len == column_len {
+            bm.clone()
+        } else {
+            Bitmap::new(column_len, false)
+        }
+    })
+}
+
+fn all_null_numeric<T: Copy>(len: usize, default: T) -> NumericColumn<T> {
+    let data = vec![default; len];
+    match NumericColumn::with_nulls(data, Bitmap::new(len, false)) {
+        Ok(c) => c,
+        Err(_) => NumericColumn::from_data(Vec::new()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn apply_null_numeric_mismatched_validity_fails_closed() {
+        let validity = Bitmap::new(1, true);
+
+        let out = apply_null_numeric(vec![10_i64, 20, 30], Some(&validity), 3, 0_i64);
+
+        assert_eq!(out.data(), &[0, 0, 0]);
+        let nulls = out
+            .nulls()
+            .expect("mismatched validity should stay nullable");
+        assert_eq!(nulls.len(), 3);
+        assert_eq!(nulls.count_ones(), 0);
     }
 }
