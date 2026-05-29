@@ -907,10 +907,223 @@ mod tests {
     }
 
     #[test]
+    fn rejects_empty_and_invalid_specs() {
+        let empty: Vec<String> = Vec::new();
+        let err = expand_object_store_specs(&empty).expect_err("empty patterns rejected");
+        assert!(err.to_string().contains("path list cannot be empty"));
+
+        let err = ObjectUri::parse("file:///tmp/a.csv").expect_err("unsupported scheme");
+        assert!(err.to_string().contains("scheme unsupported"));
+
+        let err = ObjectUri::parse("s3://bucket").expect_err("missing key rejected");
+        assert!(err.to_string().contains("must include bucket and key"));
+    }
+
+    #[test]
     fn xml_key_parser_decodes_entities() {
         let xml =
             "<ListBucketResult><Contents><Key>a&amp;b.csv</Key></Contents></ListBucketResult>";
         assert_eq!(parse_xml_tag_values(xml, "Key"), vec!["a&b.csv"]);
+    }
+
+    #[test]
+    fn object_request_uses_endpoint_path_style_and_sorted_query() {
+        let _test_guard = objectstore_env_test_lock();
+        let _guard = override_s3_endpoint_for_process("http://127.0.0.1:9000/");
+        let uri = ObjectUri::parse("s3://my-bucket/path with space/file.csv").expect("uri");
+
+        let request = object_request(
+            &uri,
+            vec![
+                ("prefix".to_owned(), "logs/a b/".to_owned()),
+                ("list-type".to_owned(), "2".to_owned()),
+            ],
+        )
+        .expect("object request");
+
+        assert_eq!(request.host, "127.0.0.1:9000");
+        assert_eq!(
+            request.url,
+            "http://127.0.0.1:9000/my-bucket/path%20with%20space/file.csv?list-type=2&prefix=logs%2Fa%20b%2F"
+        );
+        assert_eq!(
+            request.canonical_uri,
+            "/my-bucket/path%20with%20space/file.csv"
+        );
+        assert_eq!(
+            request.canonical_query,
+            "list-type=2&prefix=logs%2Fa%20b%2F"
+        );
+    }
+
+    #[test]
+    fn zero_length_range_returns_empty_without_http() {
+        let location = ObjectLocation {
+            uri: ObjectUri::parse("s3://bucket/path/file.parquet").expect("uri"),
+        };
+
+        let range = read_object_range_with_metadata(&location, 42, 0).expect("empty range");
+
+        assert!(range.bytes().is_empty());
+        assert_eq!(range.object_size(), None);
+    }
+
+    #[test]
+    fn range_overflow_is_rejected_before_http() {
+        let location = ObjectLocation {
+            uri: ObjectUri::parse("s3://bucket/path/file.parquet").expect("uri"),
+        };
+
+        let err =
+            read_object_range_with_metadata(&location, u64::MAX, 2).expect_err("range overflow");
+
+        assert!(err.to_string().contains("object range overflows u64"));
+    }
+
+    #[test]
+    fn signed_headers_include_session_token_and_range() {
+        let request = ObjectRequest {
+            scheme: ObjectScheme::R2,
+            method: "GET",
+            url: "https://example.invalid/bucket/object".to_owned(),
+            host: "example.invalid".to_owned(),
+            canonical_uri: "/bucket/object".to_owned(),
+            canonical_query: "list-type=2".to_owned(),
+            headers: vec![("range", "bytes=4-9".to_owned())],
+        };
+        let credentials = Credentials {
+            access_key: "access".to_owned(),
+            secret_key: "secret".to_owned(),
+            session_token: Some("token".to_owned()),
+            region: "auto".to_owned(),
+        };
+
+        let headers = signed_headers(&request, &credentials);
+
+        assert!(headers.iter().any(|(name, value)| {
+            *name == "authorization"
+                && value.contains("Credential=access/")
+                && value.contains("/auto/s3/aws4_request")
+                && value.contains(
+                    "SignedHeaders=host;range;x-amz-content-sha256;x-amz-date;x-amz-security-token",
+                )
+        }));
+        assert!(
+            headers
+                .iter()
+                .any(|(name, value)| *name == "x-amz-security-token" && value == "token")
+        );
+        assert!(
+            headers
+                .iter()
+                .any(|(name, value)| *name == "range" && value == "bytes=4-9")
+        );
+    }
+
+    #[test]
+    fn wildcard_listing_follows_continuation_and_sorts_matches() {
+        let _test_guard = objectstore_env_test_lock();
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock server");
+        let endpoint = format!("http://{}", listener.local_addr().expect("local addr"));
+        let (request_tx, request_rx) = mpsc::channel();
+        let handle = thread::spawn(move || {
+            let first_body = concat!(
+                "<ListBucketResult>",
+                "<IsTruncated>true</IsTruncated>",
+                "<NextContinuationToken>token-1</NextContinuationToken>",
+                "<Contents><Key>logs/b.csv</Key></Contents>",
+                "<Contents><Key>logs/ignore.txt</Key></Contents>",
+                "</ListBucketResult>"
+            );
+            let second_body = concat!(
+                "<ListBucketResult>",
+                "<IsTruncated>false</IsTruncated>",
+                "<Contents><Key>logs/a.csv</Key></Contents>",
+                "</ListBucketResult>"
+            );
+            for body in [first_body, second_body] {
+                let (mut stream, _) = listener.accept().expect("accept request");
+                let mut request = Vec::new();
+                let mut buf = [0_u8; 1024];
+                loop {
+                    let read = stream.read(&mut buf).expect("read request");
+                    if read == 0 {
+                        break;
+                    }
+                    request.extend_from_slice(&buf[..read]);
+                    if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                        break;
+                    }
+                }
+                request_tx
+                    .send(String::from_utf8(request).expect("request utf8"))
+                    .expect("send request");
+                write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{}",
+                    body.len(),
+                    body
+                )
+                .expect("write response");
+            }
+        });
+
+        let _guard = override_s3_endpoint_for_process(endpoint);
+        let objects = expand_object_store_specs(&["s3://bucket/logs/*.csv".to_owned()])
+            .expect("expand wildcard");
+
+        let uris = objects
+            .iter()
+            .map(ObjectLocation::display_uri)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            uris,
+            vec!["s3://bucket/logs/a.csv", "s3://bucket/logs/b.csv"]
+        );
+        let first_request = request_rx.recv().expect("first request");
+        assert!(first_request.starts_with("GET /bucket?list-type=2&prefix=logs%2F"));
+        let second_request = request_rx.recv().expect("second request");
+        assert!(second_request.contains("continuation-token=token-1"));
+        handle.join().expect("mock server done");
+    }
+
+    #[test]
+    fn read_first_object_bytes_reads_literal_object() {
+        let _test_guard = objectstore_env_test_lock();
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock server");
+        let endpoint = format!("http://{}", listener.local_addr().expect("local addr"));
+        let (request_tx, request_rx) = mpsc::channel();
+        let handle = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept request");
+            let mut request = Vec::new();
+            let mut buf = [0_u8; 1024];
+            loop {
+                let read = stream.read(&mut buf).expect("read request");
+                if read == 0 {
+                    break;
+                }
+                request.extend_from_slice(&buf[..read]);
+                if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            request_tx
+                .send(String::from_utf8(request).expect("request utf8"))
+                .expect("send request");
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 3\r\n\r\nabc")
+                .expect("write response");
+        });
+
+        let _guard = override_s3_endpoint_for_process(endpoint);
+        let (location, bytes) = read_first_object_bytes(&["s3://bucket/path/file.csv".to_owned()])
+            .expect("read first object");
+
+        assert_eq!(location.display_uri(), "s3://bucket/path/file.csv");
+        assert_eq!(bytes, b"abc");
+        let request = request_rx.recv().expect("request text");
+        assert!(request.starts_with("GET /bucket/path/file.csv HTTP/1.1"));
+        handle.join().expect("mock server done");
     }
 
     #[test]

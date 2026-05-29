@@ -528,10 +528,14 @@ fn copy_boolean_buffer_to_bitmap(boolean: &BooleanBuffer, len: usize) -> Bitmap 
 mod tests {
     use std::sync::Arc;
 
-    use arrow_array::{Array, BooleanArray, Int64Array, RecordBatch, StringArray};
+    use arrow_array::{
+        Array, BooleanArray, Float32Array, Float64Array, Int64Array, LargeStringArray, RecordBatch,
+        StringArray,
+    };
     use arrow_schema::{DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema};
     use ultrasql_core::{DataType, Field, Schema};
     use ultrasql_vec::column::{Column, NumericColumn, StringColumn};
+    use ultrasql_vec::dict::DictionaryColumn;
     use ultrasql_vec::{Batch, Bitmap};
 
     use crate::{batch_to_record_batch, record_batch_to_batch, schema_from_arrow, schema_to_arrow};
@@ -574,6 +578,65 @@ mod tests {
         assert_eq!(exported.values().as_ptr(), original_values_ptr);
         assert_eq!(exported.value(0), "ada");
         assert_eq!(exported.value(1), "grace");
+    }
+
+    #[test]
+    fn exports_bool_float_and_dictionary_columns() {
+        let mut bool_validity = Bitmap::new(4, true);
+        bool_validity.set(1, false);
+        let bools = ultrasql_vec::column::BoolColumn::with_nulls(
+            vec![true, false, true, false],
+            bool_validity,
+        )
+        .expect("bool nulls");
+        let dictionary =
+            DictionaryColumn::from_strings([Some("red"), None, Some("red"), Some("blue")]);
+        let batch = Batch::new([
+            Column::Bool(bools),
+            Column::Float32(NumericColumn::from_data(vec![1.5_f32, 2.5, 3.5, 4.5])),
+            Column::Float64(NumericColumn::from_data(vec![10.0_f64, 20.0, 30.0, 40.0])),
+            Column::DictionaryUtf8(dictionary),
+        ])
+        .expect("batch");
+        let schema = Schema::new([
+            Field::nullable("ok", DataType::Bool),
+            Field::required("f32", DataType::Float32),
+            Field::required("f64", DataType::Float64),
+            Field::nullable("label", DataType::Text { max_len: None }),
+        ])
+        .expect("schema");
+
+        let record_batch = batch_to_record_batch(&schema, batch).expect("export");
+
+        let bools = record_batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<BooleanArray>()
+            .expect("bool array");
+        assert!(bools.value(0));
+        assert!(bools.is_null(1));
+        assert!(bools.value(2));
+        let floats = record_batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<Float32Array>()
+            .expect("float32 array");
+        assert_eq!(floats.values(), &[1.5_f32, 2.5, 3.5, 4.5]);
+        let doubles = record_batch
+            .column(2)
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .expect("float64 array");
+        assert_eq!(doubles.values(), &[10.0_f64, 20.0, 30.0, 40.0]);
+        let labels = record_batch
+            .column(3)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("string array");
+        assert_eq!(labels.value(0), "red");
+        assert!(labels.is_null(1));
+        assert_eq!(labels.value(2), "red");
+        assert_eq!(labels.value(3), "blue");
     }
 
     #[test]
@@ -625,19 +688,92 @@ mod tests {
     }
 
     #[test]
+    fn imports_sliced_utf8_array_with_nulls() {
+        let arrow_array =
+            StringArray::from(vec![Some("zero"), Some("one"), None, Some("three")]).slice(1, 2);
+        let arrow_schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "name",
+            ArrowDataType::Utf8,
+            true,
+        )]));
+        let record_batch =
+            RecordBatch::try_new(Arc::clone(&arrow_schema), vec![Arc::new(arrow_array)])
+                .expect("record batch");
+
+        let batch = crate::record_batch_to_ultrasql_batch(record_batch).expect("arrow import");
+
+        let Column::Utf8(imported) = &batch.columns()[0] else {
+            panic!("expected utf8 column");
+        };
+        assert_eq!(imported.len(), 2);
+        assert_eq!(imported.value(0), "one");
+        let nulls = imported.nulls().expect("utf8 nulls");
+        assert!(nulls.get(0));
+        assert!(!nulls.get(1));
+    }
+
+    #[test]
+    fn imports_large_utf8_array() {
+        let arrow_array = LargeStringArray::from(vec![Some("wide"), Some("text")]);
+        let arrow_schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "body",
+            ArrowDataType::LargeUtf8,
+            true,
+        )]));
+        let record_batch =
+            RecordBatch::try_new(Arc::clone(&arrow_schema), vec![Arc::new(arrow_array)])
+                .expect("record batch");
+
+        let (_schema, batch) = record_batch_to_batch(record_batch).expect("arrow import");
+
+        let Column::Utf8(imported) = &batch.columns()[0] else {
+            panic!("expected utf8 column");
+        };
+        assert_eq!(imported.value(0), "wide");
+        assert_eq!(imported.value(1), "text");
+    }
+
+    #[test]
     fn maps_schemas_in_both_directions() {
         let schema = Schema::new([
+            Field::required("ok", DataType::Bool),
             Field::required("id", DataType::Int64),
+            Field::required("weight32", DataType::Float32),
+            Field::required("weight64", DataType::Float64),
             Field::nullable("name", DataType::Text { max_len: None }),
         ])
         .expect("ultrasql schema");
 
         let arrow = schema_to_arrow(&schema).expect("to arrow schema");
-        assert_eq!(arrow.field(0).data_type(), &ArrowDataType::Int64);
-        assert_eq!(arrow.field(1).data_type(), &ArrowDataType::Utf8);
+        assert_eq!(arrow.field(0).data_type(), &ArrowDataType::Boolean);
+        assert_eq!(arrow.field(1).data_type(), &ArrowDataType::Int64);
+        assert_eq!(arrow.field(2).data_type(), &ArrowDataType::Float32);
+        assert_eq!(arrow.field(3).data_type(), &ArrowDataType::Float64);
+        assert_eq!(arrow.field(4).data_type(), &ArrowDataType::Utf8);
 
         let imported = schema_from_arrow(&arrow).expect("from arrow schema");
         assert_eq!(imported, schema);
+    }
+
+    #[test]
+    fn rejects_schema_and_type_mismatches() {
+        let schema = Schema::new([Field::required("id", DataType::Int64)]).expect("schema");
+        let batch = Batch::new([
+            Column::Int64(NumericColumn::from_data(vec![1_i64])),
+            Column::Int64(NumericColumn::from_data(vec![2_i64])),
+        ])
+        .expect("batch");
+        let err = batch_to_record_batch(&schema, batch).expect_err("schema width mismatch");
+        assert!(err.to_string().contains("expected 1 columns, got 2"));
+
+        let schema = Schema::new([Field::required("d", DataType::Date)]).expect("schema");
+        let err = schema_to_arrow(&schema).expect_err("unsupported SQL type");
+        assert!(err.to_string().contains("unsupported UltraSQL type: date"));
+
+        let arrow_schema =
+            ArrowSchema::new(vec![ArrowField::new("d", ArrowDataType::Date32, false)]);
+        let err = schema_from_arrow(&arrow_schema).expect_err("unsupported Arrow type");
+        assert!(err.to_string().contains("unsupported Arrow type: Date32"));
     }
 
     #[test]

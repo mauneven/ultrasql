@@ -746,6 +746,164 @@ mod tests {
     }
 
     #[test]
+    fn public_schema_reader_accepts_explicit_metadata_file() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let table = temp.path();
+        write_iceberg_metadata(table);
+        let metadata_path = table.join("metadata/v1.metadata.json");
+
+        let schema = read_iceberg_schema(metadata_path.to_str().expect("metadata path utf8"))
+            .expect("schema from metadata file");
+
+        assert_eq!(schema.len(), 2);
+        assert_eq!(schema.field_at(0).name, "id");
+        assert_eq!(schema.field_at(0).data_type, DataType::Int64);
+        assert_eq!(schema.field_at(1).name, "category");
+        assert_eq!(
+            schema.field_at(1).data_type,
+            DataType::Text { max_len: None }
+        );
+    }
+
+    #[test]
+    fn public_scan_uses_current_snapshot_by_default() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let table = temp.path();
+        write_iceberg_metadata(table);
+        let metadata_dir = table.join("metadata");
+        let new_manifest = metadata_dir.join("new.avro");
+        let new_list = metadata_dir.join("new-list.avro");
+
+        write_manifest_with_partitions(&new_manifest, &[("current.parquet", &[])]);
+        write_manifest_list_with_bounds(&new_list, &[(&new_manifest, "", "zz")]);
+
+        let plan =
+            plan_iceberg_scan(&table.display().to_string()).expect("plan current snapshot scan");
+
+        assert_eq!(plan.snapshot_id, Some(2));
+        assert_eq!(
+            plan.data_files,
+            vec![table.join("current.parquet").display().to_string()]
+        );
+    }
+
+    #[test]
+    fn scan_without_current_snapshot_returns_empty_plan() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let table = temp.path();
+        let metadata_dir = table.join("metadata");
+        fs::create_dir_all(&metadata_dir).expect("metadata dir");
+        fs::write(metadata_dir.join("version-hint.text"), "1\n").expect("version hint");
+        write_metadata_json(
+            &metadata_dir.join("v1.metadata.json"),
+            table,
+            serde_json::Value::Null,
+        );
+
+        let plan = plan_iceberg_scan(&table.display().to_string()).expect("empty snapshot plan");
+
+        assert_eq!(plan.snapshot_id, None);
+        assert!(plan.data_files.is_empty());
+        assert_eq!(plan.manifests_scanned, 0);
+    }
+
+    #[test]
+    fn metadata_discovery_uses_highest_version_without_hint() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let table = temp.path();
+        let metadata_dir = table.join("metadata");
+        fs::create_dir_all(&metadata_dir).expect("metadata dir");
+        write_metadata_json(&metadata_dir.join("v1.metadata.json"), table, 1.into());
+        write_metadata_json(&metadata_dir.join("v2.metadata.json"), table, 2.into());
+
+        let discovered = discover_metadata_json(&metadata_dir).expect("discover metadata");
+
+        assert_eq!(discovered, metadata_dir.join("v2.metadata.json"));
+    }
+
+    #[test]
+    fn object_metadata_locations_are_explicit_only() {
+        let metadata = metadata_location_for("s3://bucket/table/metadata/v7.metadata.json")
+            .expect("object metadata path");
+
+        assert_eq!(metadata.table_root, "s3://bucket/table");
+        assert_eq!(
+            metadata.metadata_path,
+            "s3://bucket/table/metadata/v7.metadata.json"
+        );
+        let err = metadata_location_for("s3://bucket/table").expect_err("object root rejected");
+        assert!(err.to_string().contains("require explicit metadata JSON"));
+    }
+
+    #[test]
+    fn location_helpers_decode_file_and_object_paths() {
+        assert_eq!(
+            local_path_from_location("file:///tmp/table%20name/metadata.json"),
+            PathBuf::from("/tmp/table name/metadata.json")
+        );
+        assert_eq!(
+            resolve_location("s3://bucket/table", "data/a.parquet"),
+            "s3://bucket/table/data/a.parquet"
+        );
+        assert_eq!(
+            resolve_location("/tmp/table", "https://example.invalid/a.parquet"),
+            "https://example.invalid/a.parquet"
+        );
+    }
+
+    #[test]
+    fn rejects_malformed_metadata_and_unsupported_types() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let metadata = temp.path().join("bad.metadata.json");
+        fs::write(&metadata, [0xff, 0xfe]).expect("write invalid utf8");
+
+        let err =
+            read_iceberg_schema(metadata.to_str().expect("metadata utf8")).expect_err("bad utf8");
+
+        assert!(err.to_string().contains("is not UTF-8"));
+        assert!(
+            iceberg_type_to_sql(&serde_json::json!({"logicalType": "uuid"}))
+                .expect_err("missing object type")
+                .to_string()
+                .contains("unsupported type")
+        );
+        assert!(
+            iceberg_type_to_sql(&serde_json::json!("decimal"))
+                .expect_err("unsupported string type")
+                .to_string()
+                .contains("unsupported type: decimal")
+        );
+    }
+
+    #[test]
+    fn avro_scalar_helpers_cover_supported_primitives() {
+        assert_eq!(
+            avro_bytes(&AvroValue::Fixed(2, vec![b'a', b'b'])),
+            Some(&b"ab"[..])
+        );
+        assert_eq!(
+            avro_scalar_to_string(&AvroValue::Int(7)),
+            Some("7".to_owned())
+        );
+        assert_eq!(
+            avro_scalar_to_string(&AvroValue::Long(9)),
+            Some("9".to_owned())
+        );
+        assert_eq!(
+            avro_scalar_to_string(&AvroValue::Boolean(true)),
+            Some("true".to_owned())
+        );
+        assert_eq!(
+            avro_scalar_to_string(&AvroValue::Float(1.5)),
+            Some("1.5".to_owned())
+        );
+        assert_eq!(
+            avro_scalar_to_string(&AvroValue::Double(2.5)),
+            Some("2.5".to_owned())
+        );
+    }
+
+    #[test]
     fn scan_options_select_snapshot_and_prune_partitions() {
         let temp = tempfile::tempdir().expect("tempdir");
         let table = temp.path();
@@ -834,6 +992,11 @@ mod tests {
         let metadata_dir = table_dir.join("metadata");
         fs::create_dir_all(&metadata_dir).expect("metadata dir");
         fs::write(metadata_dir.join("version-hint.text"), "1\n").expect("version hint");
+        write_metadata_json(&metadata_dir.join("v1.metadata.json"), table_dir, 2.into());
+    }
+
+    fn write_metadata_json(path: &Path, table_dir: &Path, current_snapshot_id: serde_json::Value) {
+        let metadata_dir = table_dir.join("metadata");
         let metadata_json = serde_json::json!({
             "format-version": 2,
             "table-uuid": "00000000-0000-0000-0000-000000000045",
@@ -862,7 +1025,7 @@ mod tests {
             "default-spec-id": 0,
             "last-partition-id": 1000,
             "properties": {},
-            "current-snapshot-id": 2,
+            "current-snapshot-id": current_snapshot_id,
             "snapshots": [
                 {
                     "snapshot-id": 1,
@@ -884,7 +1047,7 @@ mod tests {
             "metadata-log": []
         });
         fs::write(
-            metadata_dir.join("v1.metadata.json"),
+            path,
             serde_json::to_string_pretty(&metadata_json).expect("metadata json"),
         )
         .expect("write metadata json");
