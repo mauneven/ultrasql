@@ -153,6 +153,16 @@ fn firebolt_core_local_helper_manages_local_docker_core_only() {
     assert!(script.contains("docker_pull_image"));
     assert!(script.contains("SELECT 42;"));
     assert!(script.contains("wait_ready"));
+    assert!(
+        !script.contains("chmod 777"),
+        "Firebolt helper must not make benchmark data dirs world-writable by default"
+    );
+    assert!(script.contains("mode=700"));
+    assert!(script.contains("mode=1777"));
+    assert!(script.contains("id -u"));
+    assert!(script.contains("id -g"));
+    assert!(script.contains("FIREBOLT_CORE_RELAX_DATA_DIR_PERMS"));
+    assert!(script.contains("FIREBOLT_CORE_UNCONFINED_SECCOMP"));
     assert!(script.contains("clean --yes"));
     assert!(script.contains("refusing to clean"));
     assert!(!script.contains(LEGACY_FIREBOLT_REMOTE_ENV));
@@ -161,6 +171,8 @@ fn firebolt_core_local_helper_manages_local_docker_core_only() {
     assert!(docs.contains("benchmarks/firebolt_core_local.sh start"));
     assert!(docs.contains("benchmarks/firebolt_core_local.sh query \"SELECT 42;\""));
     assert!(docs.contains("benchmarks/firebolt_core_local.sh clean --yes"));
+    assert!(docs.contains("FIREBOLT_CORE_RELAX_DATA_DIR_PERMS"));
+    assert!(docs.contains("FIREBOLT_CORE_UNCONFINED_SECCOMP"));
     assert!(docs.contains("same-host CPU model"));
     assert!(docs.contains("No claim policy"));
     assert!(!docs.contains(LEGACY_FIREBOLT_REMOTE_ENV));

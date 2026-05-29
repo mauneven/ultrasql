@@ -99,6 +99,33 @@ wait_ready() {
     done
 }
 
+prepare_data_dir() {
+    if ! mkdir -p "$FIREBOLT_CORE_DATA_DIR"; then
+        echo "firebolt_core_local.sh: cannot create $FIREBOLT_CORE_DATA_DIR" >&2
+        return 2
+    fi
+    local mode
+    if [[ "${FIREBOLT_CORE_RELAX_DATA_DIR_PERMS:-0}" == "1" ]]; then
+        mode=1777
+    else
+        mode=700
+    fi
+    if ! chmod "$mode" "$FIREBOLT_CORE_DATA_DIR"; then
+        echo "firebolt_core_local.sh: cannot set $FIREBOLT_CORE_DATA_DIR permissions to $mode" >&2
+        return 2
+    fi
+}
+
+default_core_user() {
+    if [[ -n "${FIREBOLT_CORE_USER:-}" ]]; then
+        printf '%s' "$FIREBOLT_CORE_USER"
+    elif [[ "$(uname)" == "Darwin" ]]; then
+        printf 'root'
+    else
+        printf '%s:%s' "$(id -u)" "$(id -g)"
+    fi
+}
+
 start_core() {
     if core_ready; then
         echo "$FIREBOLT_CORE_ENDPOINT"
@@ -117,29 +144,28 @@ start_core() {
         docker rm -f "$FIREBOLT_CORE_CONTAINER" >/dev/null 2>&1 || true
     fi
 
-    mkdir -p "$FIREBOLT_CORE_DATA_DIR"
-    chmod 777 "$FIREBOLT_CORE_DATA_DIR" >/dev/null 2>&1 || true
+    prepare_data_dir
     if ! docker_pull_image; then
         echo "firebolt_core_local.sh: failed to pull $FIREBOLT_CORE_IMAGE" >&2
         return 2
     fi
 
     local core_user
-    if [[ "$(uname)" == "Darwin" ]]; then
-        core_user="${FIREBOLT_CORE_USER:-root}"
-    else
-        core_user="${FIREBOLT_CORE_USER:-firebolt-core}"
-    fi
+    core_user="$(default_core_user)"
 
     local port
     port="${FIREBOLT_CORE_PORT:-$(endpoint_port)}"
+    local security_args=()
+    if [[ "${FIREBOLT_CORE_UNCONFINED_SECCOMP:-0}" == "1" ]]; then
+        security_args+=(--security-opt seccomp=unconfined)
+    fi
     if ! docker run \
         --detach \
         --name "$FIREBOLT_CORE_CONTAINER" \
         --rm \
         --user "$core_user" \
         --ulimit memlock=8589934592:8589934592 \
-        --security-opt seccomp=unconfined \
+        "${security_args[@]}" \
         -v "$FIREBOLT_CORE_DATA_DIR:/firebolt-core/volume" \
         -p "127.0.0.1:${port}:3473" \
         "$FIREBOLT_CORE_IMAGE" >/dev/null; then

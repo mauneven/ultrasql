@@ -356,6 +356,15 @@ container name `ultrasql-firebolt-core`, data directory
 `FIREBOLT_CORE_CONTAINER`, `FIREBOLT_CORE_DATA_DIR`, or
 `FIREBOLT_CORE_WAIT_SECS`.
 
+The helper keeps the data directory owner-only by default (`chmod 700`) and
+runs the Linux container as the host `uid:gid`; set `FIREBOLT_CORE_USER` only
+when the local image requires a different runtime user. Set
+`FIREBOLT_CORE_RELAX_DATA_DIR_PERMS=1` only for throwaway local compatibility
+runs that need sticky world-writable directory permissions (`chmod 1777`).
+Docker's default seccomp profile stays enabled unless
+`FIREBOLT_CORE_UNCONFINED_SECCOMP=1` is explicitly set for a local image that
+cannot start without it.
+
 The official local install/run command from Firebolt is also acceptable for
 manual setup, as long as the resulting Core process listens on the same local
 endpoint used by the benchmark helper:
