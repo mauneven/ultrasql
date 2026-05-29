@@ -1083,7 +1083,11 @@ async fn run(cli: Cli) -> Result<()> {
                 &wal_dir,
                 cli.wal_receive_cascade_archive.as_deref(),
             )?;
-            fs::write(cli.data_dir.join("standby.signal"), b"standby\n")?;
+            write_regular_file(
+                &cli.data_dir.join("standby.signal"),
+                b"standby\n",
+                "standby signal",
+            )?;
             println!("received {copied} WAL file(s) into {}", wal_dir.display());
         } else {
             run_wal_receive_loop(
@@ -1829,7 +1833,11 @@ fn run_wal_receive_loop(
 ) -> Result<()> {
     let interval = Duration::from_millis(interval_ms);
     let wal_dir = data_dir.join("pg_wal");
-    fs::write(data_dir.join("standby.signal"), b"standby\n")?;
+    write_regular_file(
+        &data_dir.join("standby.signal"),
+        b"standby\n",
+        "standby signal",
+    )?;
     println!(
         "receiving WAL every {interval_ms}ms into {}",
         wal_dir.display()
@@ -1896,9 +1904,10 @@ async fn run_ctl(
             fs::create_dir_all(data_dir.join("base"))?;
             fs::create_dir_all(data_dir.join("pg_wal"))?;
             fs::create_dir_all(data_dir.join("global"))?;
-            fs::write(
-                data_dir.join("ultrasql.control"),
-                format!("version={}\nstate=initialized\n", env!("CARGO_PKG_VERSION")),
+            write_regular_file(
+                &data_dir.join("ultrasql.control"),
+                format!("version={}\nstate=initialized\n", env!("CARGO_PKG_VERSION")).as_bytes(),
+                "control file",
             )?;
             println!(
                 "initialized UltraSQL data directory at {}",
@@ -1920,17 +1929,29 @@ async fn run_ctl(
             println!("reload requested; send SIGHUP to ultrasqld process manager");
         }
         CtlCommand::Promote => {
-            fs::write(data_dir.join("promote.signal"), b"promote\n")?;
+            write_regular_file(
+                &data_dir.join("promote.signal"),
+                b"promote\n",
+                "promote signal",
+            )?;
             println!("created {}", data_dir.join("promote.signal").display());
         }
         CtlCommand::Standby => {
             fs::create_dir_all(data_dir)?;
-            fs::write(data_dir.join("standby.signal"), b"standby\n")?;
+            write_regular_file(
+                &data_dir.join("standby.signal"),
+                b"standby\n",
+                "standby signal",
+            )?;
             println!("created {}", data_dir.join("standby.signal").display());
         }
         CtlCommand::Recovery => {
             fs::create_dir_all(data_dir)?;
-            fs::write(data_dir.join("recovery.signal"), b"recovery\n")?;
+            write_regular_file(
+                &data_dir.join("recovery.signal"),
+                b"recovery\n",
+                "recovery signal",
+            )?;
             let mut conf = String::new();
             if let Some(value) = &targets.time {
                 conf.push_str(&format!(
@@ -1944,7 +1965,11 @@ async fn run_ctl(
             if let Some(value) = &targets.xid {
                 conf.push_str(&format!("recovery_target_xid = '{}'\n", escape_conf(value)));
             }
-            fs::write(data_dir.join("recovery.targets"), conf)?;
+            write_regular_file(
+                &data_dir.join("recovery.targets"),
+                conf.as_bytes(),
+                "recovery targets",
+            )?;
             println!("created {}", data_dir.join("recovery.signal").display());
         }
         CtlCommand::Stop => {
@@ -2528,6 +2553,49 @@ mod tests {
         assert!(recovery.contains("O''Hara"));
         assert!(recovery.contains("recovery_target_lsn = '0/16B6C50'"));
         assert!(recovery.contains("recovery_target_xid = '42'"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn ctl_commands_reject_symlinked_signal_targets() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let params = ConnParams::default();
+        let targets = RecoveryTargets {
+            time: None,
+            lsn: None,
+            xid: None,
+        };
+
+        let promote_dir = dir.path().join("promote-data");
+        fs::create_dir_all(&promote_dir).expect("promote data");
+        let outside = dir.path().join("outside.signal");
+        fs::write(&outside, b"keep").expect("outside signal");
+        symlink(&outside, promote_dir.join("promote.signal")).expect("promote symlink");
+
+        assert!(
+            run_ctl(CtlCommand::Promote, &promote_dir, &params, None, &targets)
+                .await
+                .is_err()
+        );
+        assert_eq!(fs::read(&outside).expect("outside unchanged"), b"keep");
+
+        let recovery_dir = dir.path().join("recovery-data");
+        fs::create_dir_all(&recovery_dir).expect("recovery data");
+        let outside_targets = dir.path().join("outside.targets");
+        fs::write(&outside_targets, b"keep").expect("outside targets");
+        symlink(&outside_targets, recovery_dir.join("recovery.targets")).expect("targets symlink");
+
+        assert!(
+            run_ctl(CtlCommand::Recovery, &recovery_dir, &params, None, &targets)
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            fs::read(&outside_targets).expect("outside targets unchanged"),
+            b"keep"
+        );
     }
 
     #[test]
