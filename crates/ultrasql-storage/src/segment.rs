@@ -42,9 +42,11 @@ use std::fs::{self, File, OpenOptions};
 use std::io;
 #[cfg(unix)]
 use std::os::unix::fs::FileExt as UnixFileExt;
+#[cfg(unix)]
+use std::os::unix::fs::OpenOptionsExt;
 #[cfg(windows)]
 use std::os::windows::fs::FileExt as WindowsFileExt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 
@@ -163,6 +165,8 @@ impl SegmentFile {
         if create {
             opts.create(true);
         }
+        #[cfg(unix)]
+        opts.custom_flags(libc::O_NOFOLLOW);
         let file = opts.open(&path)?;
         let meta = file.metadata()?;
         let len = meta.len();
@@ -342,15 +346,7 @@ impl RelationFiles {
         _use_mmap: bool,
         create_if_missing: bool,
     ) -> Result<Arc<Self>, SegmentError> {
-        if !dir.exists() {
-            if !create_if_missing {
-                return Err(SegmentError::Io(io::Error::new(
-                    io::ErrorKind::NotFound,
-                    format!("relation dir {} does not exist", dir.display()),
-                )));
-            }
-            fs::create_dir_all(&dir)?;
-        }
+        ensure_storage_dir(&dir, create_if_missing, "relation dir")?;
 
         let mut entries: Vec<(u32, PathBuf)> = Vec::new();
         for entry in fs::read_dir(&dir)? {
@@ -679,17 +675,7 @@ impl SegmentFileManager {
         if config.segment_size_pages == 0 {
             return Err(SegmentError::Layout("segment_size_pages must be non-zero"));
         }
-        if !base_dir.exists() {
-            if !config.create_if_missing {
-                return Err(SegmentError::Io(io::Error::new(
-                    io::ErrorKind::NotFound,
-                    format!("base dir {} does not exist", base_dir.display()),
-                )));
-            }
-            fs::create_dir_all(&base_dir)?;
-        } else if !base_dir.is_dir() {
-            return Err(SegmentError::Layout("base_dir is not a directory"));
-        }
+        ensure_storage_dir(&base_dir, config.create_if_missing, "base_dir")?;
         debug!(
             target: "ultrasql::storage::segment",
             base = ?base_dir,
@@ -782,6 +768,40 @@ impl SegmentFileManager {
     }
 }
 
+fn ensure_storage_dir(
+    path: &Path,
+    create_if_missing: bool,
+    context: &'static str,
+) -> Result<(), SegmentError> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_dir() => Ok(()),
+        Ok(_) => Err(SegmentError::Layout(match context {
+            "base_dir" => "base_dir is not a directory",
+            "relation dir" => "relation dir is not a directory",
+            _ => "storage path is not a directory",
+        })),
+        Err(err) if err.kind() == io::ErrorKind::NotFound => {
+            if !create_if_missing {
+                return Err(SegmentError::Io(io::Error::new(
+                    io::ErrorKind::NotFound,
+                    format!("{context} {} does not exist", path.display()),
+                )));
+            }
+            fs::create_dir_all(path)?;
+            match fs::symlink_metadata(path) {
+                Ok(metadata) if metadata.file_type().is_dir() => Ok(()),
+                Ok(_) => Err(SegmentError::Layout(match context {
+                    "base_dir" => "base_dir is not a directory",
+                    "relation dir" => "relation dir is not a directory",
+                    _ => "storage path is not a directory",
+                })),
+                Err(err) => Err(SegmentError::Io(err)),
+            }
+        }
+        Err(err) => Err(SegmentError::Io(err)),
+    }
+}
+
 impl PageLoader for SegmentFileManager {
     fn load(&self, page_id: PageId) -> Result<Page> {
         self.read_page(page_id).map_err(Into::into)
@@ -846,6 +866,73 @@ mod tests {
         assert!(!inner.exists());
         let _mgr = SegmentFileManager::open(&inner, config_mmap(false)).unwrap();
         assert!(inner.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn open_refuses_symlinked_base_dir() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = TempDir::new().unwrap();
+        let real = tmp.path().join("real-base");
+        std::fs::create_dir(&real).unwrap();
+        let link = tmp.path().join("base-link");
+        symlink(&real, &link).unwrap();
+
+        let err = SegmentFileManager::open(&link, config_mmap(false))
+            .expect_err("base dir symlink must be refused");
+
+        assert!(
+            err.to_string().contains("base_dir"),
+            "expected base_dir error, got {err}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn allocate_block_refuses_symlinked_relation_dir() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = TempDir::new().unwrap();
+        let outside = tmp.path().join("outside-relation");
+        std::fs::create_dir(&outside).unwrap();
+        symlink(&outside, tmp.path().join("42")).unwrap();
+
+        let mgr = SegmentFileManager::open(tmp.path(), config_mmap(false)).unwrap();
+        let err = mgr
+            .allocate_block(rel(42))
+            .expect_err("relation dir symlink must be refused");
+
+        assert!(
+            err.to_string().contains("relation dir"),
+            "expected relation dir error, got {err}"
+        );
+        assert!(!outside.join("0").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn allocate_block_refuses_symlinked_new_segment_file() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = TempDir::new().unwrap();
+        let rel_dir = tmp.path().join("42");
+        std::fs::create_dir_all(&rel_dir).unwrap();
+        let outside = tmp.path().join("outside.segment");
+        let original = vec![0xA5; PAGE_SIZE];
+        std::fs::write(&outside, &original).unwrap();
+        symlink(&outside, rel_dir.join("0")).unwrap();
+
+        let mgr = SegmentFileManager::open(tmp.path(), config_mmap(false)).unwrap();
+        let err = mgr
+            .allocate_block(rel(42))
+            .expect_err("symlinked segment must be refused");
+
+        assert!(
+            err.to_string().contains("segment"),
+            "expected segment error, got {err}"
+        );
+        assert_eq!(std::fs::read(&outside).unwrap(), original);
     }
 
     #[test]
