@@ -40,8 +40,9 @@ pub struct CatalogVersionStatus {
 pub fn ensure_catalog_version(data_dir: &Path) -> Result<CatalogVersionStatus, ServerError> {
     std::fs::create_dir_all(data_dir).map_err(ServerError::Io)?;
     let path = data_dir.join(CATALOG_VERSION_FILE);
-    match std::fs::read_to_string(&path) {
-        Ok(raw) => {
+    match std::fs::symlink_metadata(&path) {
+        Ok(metadata) if metadata.file_type().is_file() => {
+            let raw = std::fs::read_to_string(&path).map_err(ServerError::Io)?;
             let observed_version = raw.trim().parse::<u32>().map_err(|err| {
                 ServerError::Ddl(format!(
                     "catalog version marker {} is not a u32: {err}",
@@ -58,8 +59,17 @@ pub fn ensure_catalog_version(data_dir: &Path) -> Result<CatalogVersionStatus, S
                 created: false,
             })
         }
+        Ok(_) => Err(ServerError::Ddl(format!(
+            "catalog version marker {} is not a regular file",
+            path.display()
+        ))),
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-            std::fs::write(&path, format!("{CURRENT_CATALOG_VERSION}\n"))
+            let mut file = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&path)
+                .map_err(ServerError::Io)?;
+            std::io::Write::write_all(&mut file, format!("{CURRENT_CATALOG_VERSION}\n").as_bytes())
                 .map_err(ServerError::Io)?;
             Ok(CatalogVersionStatus {
                 observed_version: CURRENT_CATALOG_VERSION,

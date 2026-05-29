@@ -52,3 +52,33 @@ fn newer_catalog_version_is_refused() {
         "{message}"
     );
 }
+
+#[cfg(unix)]
+#[test]
+fn symlinked_catalog_version_marker_is_refused() {
+    use std::os::unix::fs::symlink;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let outside = dir.path().join("outside.version");
+    std::fs::write(&outside, format!("{CURRENT_CATALOG_VERSION}\n")).expect("outside marker");
+    symlink(&outside, dir.path().join(CATALOG_VERSION_FILE)).expect("catalog symlink");
+
+    let err = ensure_catalog_version(dir.path()).expect_err("symlink marker refused");
+
+    assert!(err.to_string().contains("catalog version marker"), "{err}");
+}
+
+#[cfg(unix)]
+#[test]
+fn broken_symlink_catalog_version_marker_does_not_create_target() {
+    use std::os::unix::fs::symlink;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let outside = dir.path().join("outside.version");
+    symlink(&outside, dir.path().join(CATALOG_VERSION_FILE)).expect("catalog symlink");
+
+    let err = ensure_catalog_version(dir.path()).expect_err("broken symlink marker refused");
+
+    assert!(err.to_string().contains("catalog version marker"), "{err}");
+    assert!(!outside.exists());
+}
