@@ -5,12 +5,17 @@
 //! future network WAL sender can share the same slot-state rules.
 
 use std::collections::BTreeSet;
-use std::fs::{self, OpenOptions};
-use std::io::Write;
+use std::fs::{self, File, OpenOptions};
+use std::io::{ErrorKind, Read, Write};
+#[cfg(unix)]
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::error::ServerError;
+
+const DEFAULT_REPLICATION_METADATA_FILE_LIMIT_BYTES: u64 = 1024 * 1024;
+const REPLICATION_METADATA_FILE_LIMIT_ENV: &str = "ULTRASQL_REPLICATION_METADATA_FILE_LIMIT_BYTES";
 
 /// Persistent replication slot state.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -402,7 +407,7 @@ impl LogicalReplicationRuntime {
                 continue;
             }
             let path = entry.path();
-            let text = fs::read_to_string(path).map_err(ServerError::Io)?;
+            let text = read_regular_text_file(&path, "logical publication metadata file")?;
             if let Some(publication) = parse_publication_metadata(&text) {
                 self.publications
                     .insert(publication.name.clone(), publication);
@@ -414,7 +419,7 @@ impl LogicalReplicationRuntime {
                 continue;
             }
             let path = entry.path();
-            let text = fs::read_to_string(path).map_err(ServerError::Io)?;
+            let text = read_regular_text_file(&path, "logical subscription metadata file")?;
             if let Some(subscription) = parse_subscription_metadata(&text) {
                 self.subscriptions
                     .insert(subscription.name.clone(), subscription);
@@ -427,7 +432,7 @@ impl LogicalReplicationRuntime {
                 continue;
             }
             let path = entry.path();
-            let text = fs::read_to_string(path).map_err(ServerError::Io)?;
+            let text = read_regular_text_file(&path, "logical slot metadata file")?;
             if let Some(slot) = parse_logical_slot_metadata(&text) {
                 max_confirmed = max_confirmed.max(slot.confirmed_lsn);
                 self.logical_slots.insert(slot.name.clone(), slot);
@@ -502,13 +507,72 @@ fn write_regular_text_file(path: &Path, body: &str) -> Result<(), ServerError> {
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
         Err(err) => return Err(ServerError::Io(err)),
     }
-    let mut file = OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .open(path)
-        .map_err(ServerError::Io)?;
+    let mut options = OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    options.custom_flags(libc::O_NOFOLLOW);
+    let mut file = options.open(path).map_err(ServerError::Io)?;
     file.write_all(body.as_bytes()).map_err(ServerError::Io)
+}
+
+fn read_regular_text_file(path: &Path, context: &str) -> Result<String, ServerError> {
+    let limit = replication_metadata_file_limit_bytes();
+    let file = open_regular_metadata_file(path)?;
+    let metadata = file.metadata().map_err(ServerError::Io)?;
+    if !metadata.file_type().is_file() {
+        return Err(ServerError::ddl(format!(
+            "{context} is not a regular file: {}",
+            path.display()
+        )));
+    }
+    if metadata.len() > limit {
+        return Err(ServerError::Io(replication_metadata_limit_error(
+            path,
+            metadata.len(),
+            limit,
+        )));
+    }
+
+    let mut text = String::new();
+    let mut limited = file.take(limit.saturating_add(1));
+    limited.read_to_string(&mut text).map_err(ServerError::Io)?;
+    let bytes_read = u64::try_from(text.len()).unwrap_or(u64::MAX);
+    if bytes_read > limit {
+        return Err(ServerError::Io(replication_metadata_limit_error(
+            path, bytes_read, limit,
+        )));
+    }
+    Ok(text)
+}
+
+fn replication_metadata_file_limit_bytes() -> u64 {
+    std::env::var(REPLICATION_METADATA_FILE_LIMIT_ENV)
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|&limit| limit > 0)
+        .unwrap_or(DEFAULT_REPLICATION_METADATA_FILE_LIMIT_BYTES)
+}
+
+fn replication_metadata_limit_error(path: &Path, bytes: u64, limit: u64) -> std::io::Error {
+    std::io::Error::new(
+        ErrorKind::InvalidData,
+        format!(
+            "replication metadata file exceeds read limit: path={} bytes={} limit={} env={}",
+            path.display(),
+            bytes,
+            limit,
+            REPLICATION_METADATA_FILE_LIMIT_ENV
+        ),
+    )
+}
+
+#[cfg_attr(not(unix), allow(unused_variables))]
+fn open_regular_metadata_file(path: &Path) -> std::io::Result<File> {
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    options.custom_flags(libc::O_NOFOLLOW);
+    options.open(path)
 }
 
 fn fold_identifier(ident: &str) -> String {
@@ -618,7 +682,7 @@ impl ReplicationSlotStore {
             }
             Err(err) => return Err(ServerError::Io(err)),
         }
-        let text = fs::read_to_string(path).map_err(ServerError::Io)?;
+        let text = read_regular_text_file(&path, "replication slot state file")?;
         Ok(parse_slot(name, &text))
     }
 
@@ -653,7 +717,7 @@ impl ReplicationSlotStore {
             let Some(stem) = path.file_stem().and_then(|name| name.to_str()) else {
                 continue;
             };
-            let text = fs::read_to_string(&path).map_err(ServerError::Io)?;
+            let text = read_regular_text_file(&path, "replication slot state file")?;
             slots.push(parse_slot(stem, &text));
         }
         slots.sort_by(|left, right| left.name.cmp(&right.name));
@@ -1044,6 +1108,21 @@ mod tests {
             LogicalReplicationRuntime::open_metadata(dir.path()).expect_err("subdir rejected");
 
         assert!(err.to_string().contains("directory"));
+    }
+
+    #[test]
+    fn logical_metadata_rejects_oversized_metadata_files() {
+        let dir = tempfile::TempDir::new().expect("metadata dir");
+        let publications = dir.path().join("publications");
+        fs::create_dir_all(&publications).expect("publications dir");
+        let mut body = String::from("name=pub_events\ntables=events\n");
+        body.push_str(&" ".repeat(1024 * 1024 + 1));
+        fs::write(metadata_path(&publications, "pub_events"), body).expect("metadata");
+
+        let err = LogicalReplicationRuntime::open_metadata(dir.path())
+            .expect_err("oversized metadata rejected");
+
+        assert!(err.to_string().contains("exceeds read limit"));
     }
 
     #[cfg(unix)]
