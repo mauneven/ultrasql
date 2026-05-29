@@ -41,6 +41,9 @@ where
             .role_catalog
             .inherited_role_names(&self.current_user);
         for requirement in collector.requirements {
+            if self.owns_table_for_column_privilege(&requirement.table, catalog_snapshot) {
+                continue;
+            }
             if !self.state.privilege_catalog.has_column_privilege_for_roles(
                 &roles,
                 PrivilegeObjectKind::Table,
@@ -57,6 +60,24 @@ where
             }
         }
         Ok(())
+    }
+
+    fn owns_table_for_column_privilege(
+        &self,
+        table: &str,
+        catalog_snapshot: &CatalogSnapshot,
+    ) -> bool {
+        let current_user = self.current_user.to_ascii_lowercase();
+        if current_user.is_empty() {
+            return false;
+        }
+        let Some(table_oid) = PlannerCatalog::lookup_table_oid(catalog_snapshot, table) else {
+            return false;
+        };
+        let Some(runtime) = self.state.row_security.get(&table_oid) else {
+            return false;
+        };
+        !runtime.owner_role.is_empty() && runtime.owner_role.eq_ignore_ascii_case(&current_user)
     }
 
     fn privilege_bypass(&self) -> bool {
