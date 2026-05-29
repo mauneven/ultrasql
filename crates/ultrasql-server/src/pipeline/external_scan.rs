@@ -34,6 +34,8 @@ use super::parquet_scan::{ParquetPredicate, ParquetTableScan};
 const EXTERNAL_BATCH_TARGET_ROWS: usize = 4096;
 const DEFAULT_EXTERNAL_LOCAL_READ_LIMIT_BYTES: u64 = 128 * 1024 * 1024;
 const EXTERNAL_LOCAL_READ_LIMIT_ENV: &str = "ULTRASQL_EXTERNAL_LOCAL_READ_LIMIT_BYTES";
+const DEFAULT_JSON_RECORD_READ_LIMIT_BYTES: u64 = 16 * 1024 * 1024;
+const JSON_RECORD_READ_LIMIT_ENV: &str = "ULTRASQL_JSON_RECORD_LIMIT_BYTES";
 
 /// Return true for file-backed table functions lowered through
 /// [`ExternalTableScan`].
@@ -792,15 +794,10 @@ fn next_ndjson_text(
     line_number: &mut usize,
     display: &str,
 ) -> Result<Option<(usize, String)>, ServerError> {
-    let mut line = String::new();
     loop {
-        line.clear();
-        let bytes = reader.read_line(&mut line).map_err(|err| {
-            ServerError::CopyFormat(format!("read_ndjson cannot read {display}: {err}"))
-        })?;
-        if bytes == 0 {
+        let Some(line) = read_bounded_json_line(reader, display)? else {
             return Ok(None);
-        }
+        };
         *line_number = line_number.saturating_add(1);
         let trimmed = line.trim();
         if !trimmed.is_empty() {
@@ -888,6 +885,7 @@ fn read_json_container(
     first: u8,
     display: &str,
 ) -> Result<String, ServerError> {
+    let limit = json_record_read_limit_bytes();
     let mut bytes = vec![first];
     let mut depth = 1_i32;
     let mut in_string = false;
@@ -903,6 +901,16 @@ fn read_json_container(
             )));
         }
         let b = byte[0];
+        let next_len = bytes.len().saturating_add(1);
+        let next_len_u64 = u64::try_from(next_len).unwrap_or(u64::MAX);
+        if next_len_u64 > limit {
+            return Err(json_record_limit_error(
+                "read_json",
+                display,
+                next_len_u64,
+                limit,
+            ));
+        }
         bytes.push(b);
         if in_string {
             if escaped {
@@ -923,6 +931,64 @@ fn read_json_container(
     }
     String::from_utf8(bytes)
         .map_err(|err| ServerError::CopyFormat(format!("read_json cannot decode {display}: {err}")))
+}
+
+fn read_bounded_json_line(
+    reader: &mut ExternalStreamReader,
+    display: &str,
+) -> Result<Option<String>, ServerError> {
+    let limit = json_record_read_limit_bytes();
+    let mut bytes = Vec::new();
+    loop {
+        let available = reader.fill_buf().map_err(|err| {
+            ServerError::CopyFormat(format!("read_ndjson cannot read {display}: {err}"))
+        })?;
+        if available.is_empty() {
+            if bytes.is_empty() {
+                return Ok(None);
+            }
+            break;
+        }
+        let newline_pos = available.iter().position(|&byte| byte == b'\n');
+        let take = newline_pos.map_or(available.len(), |idx| idx.saturating_add(1));
+        let next_len = bytes.len().saturating_add(take);
+        let next_len_u64 = u64::try_from(next_len).unwrap_or(u64::MAX);
+        if next_len_u64 > limit {
+            return Err(json_record_limit_error(
+                "read_ndjson",
+                display,
+                next_len_u64,
+                limit,
+            ));
+        }
+        bytes.extend_from_slice(&available[..take]);
+        reader.consume(take);
+        if newline_pos.is_some() {
+            break;
+        }
+    }
+    String::from_utf8(bytes).map(Some).map_err(|err| {
+        ServerError::CopyFormat(format!("read_ndjson cannot decode {display}: {err}"))
+    })
+}
+
+fn json_record_read_limit_bytes() -> u64 {
+    std::env::var(JSON_RECORD_READ_LIMIT_ENV)
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|&limit| limit > 0)
+        .unwrap_or(DEFAULT_JSON_RECORD_READ_LIMIT_BYTES)
+}
+
+fn json_record_limit_error(
+    function_name: &str,
+    display: &str,
+    bytes: u64,
+    limit: u64,
+) -> ServerError {
+    ServerError::CopyFormat(format!(
+        "{function_name} record exceeds read limit: path={display} bytes={bytes} limit={limit} env={JSON_RECORD_READ_LIMIT_ENV}"
+    ))
 }
 
 fn infer_json_columns_from_streams(
@@ -1323,6 +1389,7 @@ mod tests {
 
     #[test]
     fn read_json_uses_streaming_scan_source() {
+        let _env_guard = external_env_test_lock();
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("people.json");
         fs::write(&path, r#"[{"id":1,"name":"Ada"},{"id":2,"name":"Grace"}]"#).expect("write json");
@@ -1334,6 +1401,34 @@ mod tests {
         .expect("json scan");
 
         assert!(matches!(scan.source, ExternalScanSource::Streaming(_)));
+    }
+
+    #[test]
+    fn read_json_rejects_configured_oversized_record() {
+        let _env_guard = external_env_test_lock();
+        // SAFETY: external_env_test_lock serializes process-env mutation in
+        // this module's tests.
+        unsafe {
+            std::env::set_var("ULTRASQL_JSON_RECORD_LIMIT_BYTES", "3");
+        }
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("people.json");
+        fs::write(&path, r#"[{"id":1}]"#).expect("write json");
+
+        let err = ExternalTableScan::from_json(
+            &[text_lit(path.to_str().expect("utf8 path"))],
+            JsonInputKind::Json,
+        )
+        .expect_err("oversized json record rejected");
+
+        assert!(err.to_string().contains("record exceeds read limit"));
+
+        // SAFETY: external_env_test_lock serializes process-env mutation in
+        // this module's tests.
+        unsafe {
+            std::env::remove_var("ULTRASQL_JSON_RECORD_LIMIT_BYTES");
+        }
     }
 
     #[cfg(unix)]
@@ -1379,6 +1474,7 @@ mod tests {
 
     #[test]
     fn read_ndjson_uses_streaming_scan_source() {
+        let _env_guard = external_env_test_lock();
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("people.ndjson");
         fs::write(
