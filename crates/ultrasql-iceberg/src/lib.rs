@@ -6,6 +6,7 @@
 
 use std::fs;
 use std::io::Cursor;
+use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 
 use apache_avro::{Reader, types::Value as AvroValue};
@@ -335,7 +336,7 @@ fn metadata_location_for(table: &str) -> Result<MetadataLocation> {
     }
 
     let path = Path::new(table);
-    if path.is_file() {
+    if local_regular_file_exists(path)? {
         return Ok(MetadataLocation {
             table_root: local_table_root_from_metadata(path).display().to_string(),
             metadata_path: path.display().to_string(),
@@ -352,7 +353,7 @@ fn metadata_location_for(table: &str) -> Result<MetadataLocation> {
 
 fn discover_metadata_json(metadata_dir: &Path) -> Result<PathBuf> {
     let hint = metadata_dir.join("version-hint.text");
-    if let Ok(text) = fs::read_to_string(&hint) {
+    if let Some(text) = read_local_regular_text_if_exists(&hint)? {
         let version = text.trim().parse::<i64>().map_err(|err| {
             IcebergError::InvalidMetadata(format!(
                 "iceberg_scan cannot parse {}: {err}",
@@ -363,26 +364,50 @@ fn discover_metadata_json(metadata_dir: &Path) -> Result<PathBuf> {
             metadata_dir.join(format!("v{version}.metadata.json")),
             metadata_dir.join(format!("{version}.metadata.json")),
         ] {
-            if candidate.is_file() {
+            if local_regular_file_exists(&candidate)? {
                 return Ok(candidate);
             }
         }
     }
 
-    let mut candidates = fs::read_dir(metadata_dir)
-        .map_err(|err| {
+    ensure_local_directory(metadata_dir)?;
+    let mut candidates = Vec::new();
+    for entry in fs::read_dir(metadata_dir).map_err(|err| {
+        IcebergError::Io(format!(
+            "iceberg_scan cannot read metadata directory {}: {err}",
+            metadata_dir.display()
+        ))
+    })? {
+        let entry = entry.map_err(|err| {
             IcebergError::Io(format!(
                 "iceberg_scan cannot read metadata directory {}: {err}",
                 metadata_dir.display()
             ))
-        })?
-        .filter_map(|entry| entry.ok().map(|entry| entry.path()))
-        .filter(|path| {
-            path.file_name()
-                .and_then(|name| name.to_str())
-                .is_some_and(|name| name.ends_with(".metadata.json"))
-        })
-        .collect::<Vec<_>>();
+        })?;
+        let path = entry.path();
+        if !path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.ends_with(".metadata.json"))
+        {
+            continue;
+        }
+        let file_type = entry.file_type().map_err(|err| {
+            IcebergError::Io(format!(
+                "iceberg_scan cannot inspect metadata file {}: {err}",
+                path.display()
+            ))
+        })?;
+        if file_type.is_symlink() {
+            return Err(IcebergError::Io(format!(
+                "iceberg_scan refuses symlinked local metadata file {}",
+                path.display()
+            )));
+        }
+        if file_type.is_file() {
+            candidates.push(path);
+        }
+    }
     candidates.sort_by(|left, right| {
         metadata_version(left)
             .cmp(&metadata_version(right))
@@ -581,12 +606,95 @@ fn read_location_bytes(location: &str) -> Result<Vec<u8>> {
             .map_err(|err| IcebergError::Io(format!("iceberg_scan: {err}")));
     }
     let path = local_path_from_location(location);
-    fs::read(&path).map_err(|err| {
+    read_local_regular_bytes(&path)
+}
+
+fn read_local_regular_bytes(path: &Path) -> Result<Vec<u8>> {
+    ensure_local_regular_file(path)?;
+    fs::read(path).map_err(|err| {
         IcebergError::Io(format!(
             "iceberg_scan cannot read {}: {err}",
             path.display()
         ))
     })
+}
+
+fn read_local_regular_text_if_exists(path: &Path) -> Result<Option<String>> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_file() => {
+            fs::read_to_string(path).map(Some).map_err(|err| {
+                IcebergError::Io(format!(
+                    "iceberg_scan cannot read {}: {err}",
+                    path.display()
+                ))
+            })
+        }
+        Ok(metadata) if metadata.file_type().is_symlink() => Err(IcebergError::Io(format!(
+            "iceberg_scan refuses symlinked local file {}",
+            path.display()
+        ))),
+        Ok(_) => Err(IcebergError::Io(format!(
+            "iceberg_scan refuses non-regular local file {}",
+            path.display()
+        ))),
+        Err(err) if err.kind() == ErrorKind::NotFound => Ok(None),
+        Err(err) => Err(IcebergError::Io(format!(
+            "iceberg_scan cannot inspect {}: {err}",
+            path.display()
+        ))),
+    }
+}
+
+fn local_regular_file_exists(path: &Path) -> Result<bool> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_file() => Ok(true),
+        Ok(metadata) if metadata.file_type().is_symlink() => Err(IcebergError::Io(format!(
+            "iceberg_scan refuses symlinked local file {}",
+            path.display()
+        ))),
+        Ok(_) => Ok(false),
+        Err(err) if err.kind() == ErrorKind::NotFound => Ok(false),
+        Err(err) => Err(IcebergError::Io(format!(
+            "iceberg_scan cannot inspect {}: {err}",
+            path.display()
+        ))),
+    }
+}
+
+fn ensure_local_regular_file(path: &Path) -> Result<()> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_file() => Ok(()),
+        Ok(metadata) if metadata.file_type().is_symlink() => Err(IcebergError::Io(format!(
+            "iceberg_scan refuses symlinked local file {}",
+            path.display()
+        ))),
+        Ok(_) => Err(IcebergError::Io(format!(
+            "iceberg_scan refuses non-regular local file {}",
+            path.display()
+        ))),
+        Err(err) => Err(IcebergError::Io(format!(
+            "iceberg_scan cannot inspect {}: {err}",
+            path.display()
+        ))),
+    }
+}
+
+fn ensure_local_directory(path: &Path) -> Result<()> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_dir() => Ok(()),
+        Ok(metadata) if metadata.file_type().is_symlink() => Err(IcebergError::Io(format!(
+            "iceberg_scan refuses symlinked local directory {}",
+            path.display()
+        ))),
+        Ok(_) => Err(IcebergError::Io(format!(
+            "iceberg_scan refuses non-directory local path {}",
+            path.display()
+        ))),
+        Err(err) => Err(IcebergError::Io(format!(
+            "iceberg_scan cannot inspect {}: {err}",
+            path.display()
+        ))),
+    }
 }
 
 fn local_path_from_location(location: &str) -> PathBuf {
@@ -819,6 +927,67 @@ mod tests {
         let discovered = discover_metadata_json(&metadata_dir).expect("discover metadata");
 
         assert_eq!(discovered, metadata_dir.join("v2.metadata.json"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn local_metadata_reads_reject_symlinked_files() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let table = temp.path().join("table");
+        write_iceberg_metadata(&table);
+        let metadata = table.join("metadata/v1.metadata.json");
+        let link = temp.path().join("linked.metadata.json");
+        symlink(&metadata, &link).expect("metadata symlink");
+
+        let Err(err) = read_iceberg_schema(link.to_str().expect("metadata utf8")) else {
+            panic!("symlinked metadata should be rejected");
+        };
+
+        assert!(err.to_string().contains("symlink"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn metadata_discovery_rejects_symlinked_version_hint() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let table = temp.path();
+        let metadata_dir = table.join("metadata");
+        fs::create_dir_all(&metadata_dir).expect("metadata dir");
+        write_metadata_json(&metadata_dir.join("v1.metadata.json"), table, 1.into());
+        let hint_target = temp.path().join("version-hint-target");
+        fs::write(&hint_target, "1\n").expect("hint target");
+        symlink(&hint_target, metadata_dir.join("version-hint.text")).expect("hint symlink");
+
+        let err = discover_metadata_json(&metadata_dir).expect_err("symlinked hint rejected");
+
+        assert!(err.to_string().contains("symlink"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn iceberg_plan_rejects_symlinked_manifest_lists() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let table = temp.path();
+        write_iceberg_metadata(table);
+        let metadata_dir = table.join("metadata");
+        let manifest = metadata_dir.join("new.avro");
+        let real_list = metadata_dir.join("real-new-list.avro");
+        let linked_list = metadata_dir.join("new-list.avro");
+        write_manifest_with_partitions(&manifest, &[("current.parquet", &[])]);
+        write_manifest_list_with_bounds(&real_list, &[(&manifest, "", "zz")]);
+        symlink(&real_list, &linked_list).expect("manifest-list symlink");
+
+        let Err(err) = plan_iceberg_scan(&table.display().to_string()) else {
+            panic!("symlinked manifest list should be rejected");
+        };
+
+        assert!(err.to_string().contains("symlink"));
     }
 
     #[test]
