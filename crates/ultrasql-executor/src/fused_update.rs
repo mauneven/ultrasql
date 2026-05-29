@@ -332,3 +332,292 @@ impl<L: PageLoader + Send + Sync + std::fmt::Debug + 'static> Operator for Fused
         &self.schema
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+    use std::sync::Arc;
+
+    use parking_lot::Mutex;
+    use ultrasql_core::constants::PAGE_SIZE;
+    use ultrasql_core::{
+        CommandId, DataType, Field, PageId, RelationId, Result, Schema, TupleId, Value, Xid,
+    };
+    use ultrasql_mvcc::Snapshot;
+    use ultrasql_storage::buffer_pool::{BufferPool, PageLoader};
+    use ultrasql_storage::heap::{HeapAccess, InsertOptions};
+    use ultrasql_storage::page::Page;
+    use ultrasql_txn::TransactionManager;
+    use ultrasql_vec::column::Column;
+
+    use super::{FusedCmp, FusedPredicate, FusedUpdateInt32Add};
+    use crate::Operator;
+    use crate::filter_op::batch_to_rows;
+    use crate::fused_delete::FusedDeleteInt32Pair;
+    use crate::fused_insert::FusedInsertInt32Pair;
+    use crate::row_codec::RowCodec;
+    use crate::seq_scan::SeqScan;
+
+    #[derive(Default, Debug)]
+    struct MapLoader {
+        store: Mutex<HashMap<PageId, Box<[u8; PAGE_SIZE]>>>,
+    }
+
+    impl PageLoader for MapLoader {
+        fn load(&self, page_id: PageId) -> Result<Page> {
+            let stored = {
+                let store = self.store.lock();
+                store.get(&page_id).map(|bytes| {
+                    let mut copy: Box<[u8; PAGE_SIZE]> = vec![0_u8; PAGE_SIZE]
+                        .into_boxed_slice()
+                        .try_into()
+                        .expect("alloc matches PAGE_SIZE");
+                    copy.copy_from_slice(&**bytes);
+                    copy
+                })
+            };
+            if let Some(bytes) = stored {
+                return Page::from_bytes(bytes)
+                    .map_err(|e| ultrasql_core::Error::Corruption(format!("test loader: {e}")));
+            }
+            let page = Page::new_heap();
+            let mut copy: Box<[u8; PAGE_SIZE]> = vec![0_u8; PAGE_SIZE]
+                .into_boxed_slice()
+                .try_into()
+                .expect("alloc matches PAGE_SIZE");
+            copy.copy_from_slice(page.as_bytes());
+            self.store.lock().insert(page_id, copy);
+            Ok(page)
+        }
+    }
+
+    fn rel() -> RelationId {
+        RelationId::new(9001)
+    }
+
+    fn schema_pair() -> Schema {
+        Schema::new([
+            Field::required("id", DataType::Int32),
+            Field::required("val", DataType::Int32),
+        ])
+        .expect("schema ok")
+    }
+
+    fn heap() -> Arc<HeapAccess<MapLoader>> {
+        Arc::new(HeapAccess::new(Arc::new(BufferPool::new(
+            32,
+            MapLoader::default(),
+        ))))
+    }
+
+    fn snapshot(current_xid: Xid) -> Snapshot {
+        snapshot_at(current_xid, CommandId::FIRST)
+    }
+
+    fn snapshot_at(current_xid: Xid, command_id: CommandId) -> Snapshot {
+        Snapshot::new(
+            Xid::BOOTSTRAP,
+            current_xid.next(),
+            current_xid,
+            command_id,
+            [],
+        )
+    }
+
+    fn insert_pair_rows(heap: &HeapAccess<MapLoader>, rows: &[(i32, i32)]) -> Vec<TupleId> {
+        let codec = RowCodec::new(schema_pair());
+        rows.iter()
+            .map(|(id, val)| {
+                let payload = codec
+                    .encode(&[Value::Int32(*id), Value::Int32(*val)])
+                    .expect("encode pair");
+                heap.insert(
+                    rel(),
+                    &payload,
+                    InsertOptions {
+                        xmin: Xid::BOOTSTRAP,
+                        command_id: CommandId::FIRST,
+                        wal: None,
+                        fsm: None,
+                        vm: None,
+                    },
+                )
+                .expect("insert")
+            })
+            .collect()
+    }
+
+    fn affected_count(batch: ultrasql_vec::Batch) -> i64 {
+        let Column::Int64(column) = &batch.columns()[0] else {
+            panic!("affected count must be Int64");
+        };
+        column.data()[0]
+    }
+
+    fn scan_pairs(
+        heap: Arc<HeapAccess<MapLoader>>,
+        oracle: Arc<TransactionManager>,
+        current_xid: Xid,
+    ) -> Vec<(i32, i32)> {
+        let mut scan = SeqScan::new(
+            Arc::clone(&heap),
+            rel(),
+            heap.block_count(rel()),
+            snapshot_at(current_xid, CommandId::new(1)),
+            oracle,
+            RowCodec::new(schema_pair()),
+        );
+        let schema = scan.schema().clone();
+        let mut rows = Vec::new();
+        while let Some(batch) = scan.next_batch().expect("scan") {
+            for row in batch_to_rows(&batch, &schema).expect("rows") {
+                let (Value::Int32(id), Value::Int32(val)) = (&row[0], &row[1]) else {
+                    panic!("expected int32 pair");
+                };
+                rows.push((*id, *val));
+            }
+        }
+        rows.sort_unstable();
+        rows
+    }
+
+    #[test]
+    fn fused_insert_writes_int32_pairs_and_is_single_shot() {
+        let heap = heap();
+        let oracle = Arc::new(TransactionManager::new());
+        let mut op = FusedInsertInt32Pair::new(
+            Arc::clone(&heap),
+            rel(),
+            vec![(1, 10), (2, 20), (3, 30)],
+            Xid::BOOTSTRAP,
+            CommandId::FIRST,
+            None,
+            None,
+        );
+
+        let batch = op.next_batch().expect("insert").expect("batch");
+        assert_eq!(affected_count(batch), 3);
+        assert!(op.next_batch().expect("single shot").is_none());
+        assert_eq!(
+            scan_pairs(heap, oracle, Xid::new(100)),
+            vec![(1, 10), (2, 20), (3, 30)]
+        );
+    }
+
+    #[test]
+    fn fused_update_filters_rows_and_updates_target_column() {
+        let heap = heap();
+        let oracle = Arc::new(TransactionManager::new());
+        insert_pair_rows(&heap, &[(1, 10), (2, 20), (3, 30)]);
+        let xid = Xid::new(20);
+        let predicate = FusedPredicate {
+            col_index: 0,
+            op: FusedCmp::Ge,
+            literal: 2,
+        };
+        let mut op = FusedUpdateInt32Add::new(
+            Arc::clone(&heap),
+            rel(),
+            snapshot(xid),
+            Arc::clone(&oracle),
+            heap.block_count(rel()),
+            Some(predicate),
+            1,
+            5,
+            xid,
+            CommandId::FIRST,
+        );
+
+        let batch = op.next_batch().expect("update").expect("batch");
+        assert_eq!(affected_count(batch), 2);
+        assert!(op.next_batch().expect("single shot").is_none());
+        assert_eq!(
+            scan_pairs(heap, oracle, xid),
+            vec![(1, 10), (2, 25), (3, 35)]
+        );
+    }
+
+    #[test]
+    fn fused_update_locks_target_tids_and_refreshes_after_wait() {
+        let heap = heap();
+        let oracle = Arc::new(TransactionManager::new());
+        let tids = insert_pair_rows(&heap, &[(1, 10), (2, 20)]);
+        let xid = Xid::new(21);
+        let locked = Arc::new(Mutex::new(Vec::new()));
+        let locked_for_callback = Arc::clone(&locked);
+        let mut op = FusedUpdateInt32Add::new(
+            Arc::clone(&heap),
+            rel(),
+            snapshot(xid),
+            Arc::clone(&oracle),
+            heap.block_count(rel()),
+            None,
+            0,
+            100,
+            xid,
+            CommandId::FIRST,
+        )
+        .with_target_tids(vec![tids[1]])
+        .with_target_tid_lock(
+            move |tid| {
+                locked_for_callback.lock().push(tid);
+                Ok(true)
+            },
+            true,
+        );
+
+        let batch = op.next_batch().expect("target update").expect("batch");
+        assert_eq!(affected_count(batch), 1);
+        assert_eq!(&*locked.lock(), &[tids[1]]);
+        assert_eq!(scan_pairs(heap, oracle, xid), vec![(1, 10), (102, 20)]);
+    }
+
+    #[test]
+    fn fused_delete_filters_visible_rows() {
+        let heap = heap();
+        let oracle = Arc::new(TransactionManager::new());
+        insert_pair_rows(&heap, &[(1, 10), (2, 20), (3, 30)]);
+        let xid = Xid::new(22);
+        let predicate = FusedPredicate {
+            col_index: 1,
+            op: FusedCmp::Lt,
+            literal: 30,
+        };
+        let mut op = FusedDeleteInt32Pair::new(
+            Arc::clone(&heap),
+            rel(),
+            snapshot(xid),
+            Arc::clone(&oracle),
+            heap.block_count(rel()),
+            Some(predicate),
+            xid,
+            CommandId::FIRST,
+        );
+
+        let batch = op.next_batch().expect("delete").expect("batch");
+        assert_eq!(affected_count(batch), 2);
+        assert!(op.next_batch().expect("single shot").is_none());
+        assert_eq!(scan_pairs(heap, oracle, xid), vec![(3, 30)]);
+    }
+
+    #[test]
+    fn fused_comparison_matrix_matches_int32_predicate_semantics() {
+        let cases = [
+            (FusedCmp::Eq, 4, 4, true),
+            (FusedCmp::Ne, 4, 5, true),
+            (FusedCmp::Lt, 4, 5, true),
+            (FusedCmp::Le, 4, 4, true),
+            (FusedCmp::Gt, 5, 4, true),
+            (FusedCmp::Ge, 4, 4, true),
+            (FusedCmp::Eq, 4, 5, false),
+            (FusedCmp::Ne, 4, 4, false),
+            (FusedCmp::Lt, 5, 4, false),
+            (FusedCmp::Le, 5, 4, false),
+            (FusedCmp::Gt, 4, 5, false),
+            (FusedCmp::Ge, 4, 5, false),
+        ];
+        for (op, lhs, rhs, expected) in cases {
+            assert_eq!(op.check(lhs, rhs), expected, "{op:?} {lhs} {rhs}");
+        }
+    }
+}

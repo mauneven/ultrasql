@@ -419,6 +419,18 @@ impl RowCodec {
                     })?;
                     payload.extend_from_slice(&packed.to_le_bytes());
                 }
+                (
+                    DataType::Interval,
+                    Value::Interval {
+                        months,
+                        days,
+                        microseconds,
+                    },
+                ) => {
+                    payload.extend_from_slice(&microseconds.to_le_bytes());
+                    payload.extend_from_slice(&days.to_le_bytes());
+                    payload.extend_from_slice(&months.to_le_bytes());
+                }
                 (DataType::Uuid, Value::Uuid(bytes)) => {
                     payload.extend_from_slice(bytes);
                 }
@@ -821,6 +833,42 @@ impl RowCodec {
                         _ => unreachable!(),
                     }
                 }
+                DataType::Interval => {
+                    let needed = cursor + 16;
+                    if bytes.len() < needed {
+                        return Err(RowCodecError::Truncated {
+                            needed,
+                            have: bytes.len(),
+                        });
+                    }
+                    let micros_raw: [u8; 8] =
+                        bytes[cursor..cursor + 8].try_into().map_err(|_| {
+                            RowCodecError::Truncated {
+                                needed,
+                                have: bytes.len(),
+                            }
+                        })?;
+                    let days_raw: [u8; 4] =
+                        bytes[cursor + 8..cursor + 12].try_into().map_err(|_| {
+                            RowCodecError::Truncated {
+                                needed,
+                                have: bytes.len(),
+                            }
+                        })?;
+                    let months_raw: [u8; 4] =
+                        bytes[cursor + 12..cursor + 16].try_into().map_err(|_| {
+                            RowCodecError::Truncated {
+                                needed,
+                                have: bytes.len(),
+                            }
+                        })?;
+                    cursor = needed;
+                    Value::Interval {
+                        months: i32::from_le_bytes(months_raw),
+                        days: i32::from_le_bytes(days_raw),
+                        microseconds: i64::from_le_bytes(micros_raw),
+                    }
+                }
                 DataType::Uuid => {
                     let needed = cursor + 16;
                     if bytes.len() < needed {
@@ -1148,6 +1196,16 @@ impl RowCodec {
                     _ => unreachable!(),
                 }
             }
+            DataType::Interval => {
+                let micros = i64::from_le_bytes(read_fixed::<8>(bytes, cursor)?);
+                let days = i32::from_le_bytes(read_fixed::<4>(bytes, cursor)?);
+                let months = i32::from_le_bytes(read_fixed::<4>(bytes, cursor)?);
+                Ok(Value::Interval {
+                    months,
+                    days,
+                    microseconds: micros,
+                })
+            }
             DataType::Uuid => {
                 let raw = read_fixed::<16>(bytes, cursor)?;
                 Ok(Value::Uuid(raw))
@@ -1282,6 +1340,7 @@ impl RowCodec {
             | DataType::Time
             | DataType::TimeTz
             | DataType::PgLsn => skip_fixed(bytes, cursor, 8),
+            DataType::Interval => skip_fixed(bytes, cursor, 16),
             DataType::Decimal { .. } => skip_varlena_payload(bytes, cursor),
             DataType::Uuid => skip_fixed(bytes, cursor, 16),
             DataType::Bytea
@@ -1289,6 +1348,8 @@ impl RowCodec {
             | DataType::Enum { .. }
             | DataType::Composite { .. }
             | DataType::Char { .. }
+            | DataType::Bit { .. }
+            | DataType::VarBit { .. }
             | DataType::Json
             | DataType::Inet
             | DataType::Cidr
@@ -1598,6 +1659,59 @@ impl RowCodec {
                     })?;
                     cursor += 8;
                     data.push(i64::from_le_bytes(raw));
+                    nulls.push_valid();
+                }
+                (
+                    DataType::Interval,
+                    ColumnBuilder::Utf8 {
+                        offsets,
+                        values,
+                        nulls,
+                    },
+                ) => {
+                    let needed = cursor + 16;
+                    if bytes.len() < needed {
+                        return Err(RowCodecError::Truncated {
+                            needed,
+                            have: bytes.len(),
+                        });
+                    }
+                    let micros_raw: [u8; 8] =
+                        bytes[cursor..cursor + 8].try_into().map_err(|_| {
+                            RowCodecError::Truncated {
+                                needed,
+                                have: bytes.len(),
+                            }
+                        })?;
+                    let days_raw: [u8; 4] =
+                        bytes[cursor + 8..cursor + 12].try_into().map_err(|_| {
+                            RowCodecError::Truncated {
+                                needed,
+                                have: bytes.len(),
+                            }
+                        })?;
+                    let months_raw: [u8; 4] =
+                        bytes[cursor + 12..cursor + 16].try_into().map_err(|_| {
+                            RowCodecError::Truncated {
+                                needed,
+                                have: bytes.len(),
+                            }
+                        })?;
+                    cursor = needed;
+                    let text = Value::Interval {
+                        months: i32::from_le_bytes(months_raw),
+                        days: i32::from_le_bytes(days_raw),
+                        microseconds: i64::from_le_bytes(micros_raw),
+                    }
+                    .to_string();
+                    values.extend_from_slice(text.as_bytes());
+                    let new_end = u32::try_from(values.len()).map_err(|_| {
+                        RowCodecError::UnsupportedType {
+                            column: col_idx,
+                            ty: field.data_type.clone(),
+                        }
+                    })?;
+                    offsets.push(new_end);
                     nulls.push_valid();
                 }
                 (
@@ -1978,6 +2092,7 @@ impl ColumnBuilder {
             | DataType::Array(_)
             | DataType::Uuid
             | DataType::Bytea
+            | DataType::Interval
             | DataType::PgLsn => Self::Utf8 {
                 offsets: {
                     let mut o = Vec::with_capacity(capacity + 1);
@@ -2050,9 +2165,14 @@ fn finish_builders(builders: Vec<ColumnBuilder>) -> Vec<Column> {
     let mut out: Vec<Column> = Vec::with_capacity(builders.len());
     for b in builders {
         let col = match b {
-            ColumnBuilder::Bool { data, nulls: _ } => {
+            ColumnBuilder::Bool { data, nulls } => {
                 let bools: Vec<bool> = data.iter().map(|&b| b != 0).collect();
-                Column::Bool(BoolColumn::from_data(bools))
+                match nulls.finish() {
+                    Some(bm) => Column::Bool(
+                        BoolColumn::with_nulls(bools, bm).expect("builder length invariant"),
+                    ),
+                    None => Column::Bool(BoolColumn::from_data(bools)),
+                }
             }
             ColumnBuilder::Int16 { data, nulls } | ColumnBuilder::Int32 { data, nulls } => {
                 match nulls.finish() {
@@ -2952,8 +3072,13 @@ pub enum RowCodecError {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use proptest::prelude::*;
-    use ultrasql_core::{DataType, Field, Schema, SparseVector, Value};
+    use ultrasql_core::{
+        BitString, DataType, Field, GeometryType, GeometryValue, Lsn, NetworkValue, Oid, RangeType,
+        RangeValue, Schema, SparseVector, Value,
+    };
 
     use super::{ColumnBuilder, RowCodec, RowCodecError, VECTOR_DIMS_WIDTH, VECTOR_ELEMENT_WIDTH};
     use ultrasql_vec::column::Column;
@@ -3238,6 +3363,208 @@ mod tests {
     }
 
     #[test]
+    fn decode_into_builders_fast_paths_cover_fixed_width_shapes() {
+        for (schema, row, expected_width) in [
+            (
+                Schema::new([Field::required("a", DataType::Int32)]).unwrap(),
+                vec![Value::Int32(1)],
+                1,
+            ),
+            (
+                Schema::new([
+                    Field::required("a", DataType::Int32),
+                    Field::required("b", DataType::Int32),
+                ])
+                .unwrap(),
+                vec![Value::Int32(1), Value::Int32(2)],
+                2,
+            ),
+            (
+                Schema::new([
+                    Field::required("a", DataType::Int32),
+                    Field::required("b", DataType::Int32),
+                    Field::required("c", DataType::Int32),
+                ])
+                .unwrap(),
+                vec![Value::Int32(1), Value::Int32(2), Value::Int32(3)],
+                3,
+            ),
+            (
+                Schema::new([Field::required("a", DataType::Int64)]).unwrap(),
+                vec![Value::Int64(4)],
+                1,
+            ),
+            (
+                Schema::new([
+                    Field::required("a", DataType::Int64),
+                    Field::required("b", DataType::Int64),
+                ])
+                .unwrap(),
+                vec![Value::Int64(4), Value::Int64(5)],
+                2,
+            ),
+        ] {
+            let codec = RowCodec::new(schema.clone());
+            let encoded = codec.encode(&row).expect("encode");
+            let mut builders = schema
+                .fields()
+                .iter()
+                .map(|field| ColumnBuilder::new(&field.data_type, 1, 0).expect("builder"))
+                .collect::<Vec<_>>();
+
+            codec
+                .decode_into_builders(&encoded, &mut builders)
+                .expect("fast decode");
+            let batch = RowCodec::finish_batch(builders).expect("finish");
+            assert_eq!(batch.width(), expected_width);
+            assert_eq!(batch.rows(), 1);
+            assert_eq!(codec.decode(&encoded).expect("decode"), row);
+        }
+    }
+
+    #[test]
+    fn decode_into_builders_fast_path_falls_back_for_nulls_and_mismatched_builders() {
+        let schema = Schema::new([
+            Field::required("a", DataType::Int32),
+            Field::required("b", DataType::Int32),
+        ])
+        .unwrap();
+        let codec = RowCodec::new(schema.clone());
+        let encoded = codec
+            .encode(&[Value::Null, Value::Int32(7)])
+            .expect("encode");
+        let mut builders = codec.new_builders(1).expect("builders");
+        codec
+            .decode_into_builders(&encoded, &mut builders)
+            .expect("generic decode");
+        let batch = RowCodec::finish_batch(builders).expect("finish");
+        match &batch.columns()[0] {
+            Column::Int32(c) => assert!(c.nulls().is_some_and(|n| !n.get(0))),
+            other => panic!("expected int32 column, got {other:?}"),
+        }
+        match &batch.columns()[1] {
+            Column::Int32(c) => assert_eq!(c.data()[0], 7),
+            other => panic!("expected int32 column, got {other:?}"),
+        }
+
+        let mut wrong_builders = vec![
+            ColumnBuilder::new(&DataType::Int64, 1, 0).expect("wrong builder"),
+            ColumnBuilder::new(&DataType::Int64, 1, 1).expect("wrong builder"),
+        ];
+        let err = codec
+            .decode_into_builders(
+                &codec
+                    .encode(&[Value::Int32(1), Value::Int32(2)])
+                    .expect("encode"),
+                &mut wrong_builders,
+            )
+            .expect_err("builder mismatch");
+        assert!(matches!(
+            err,
+            RowCodecError::UnsupportedType { column: 0, .. }
+        ));
+    }
+
+    #[test]
+    fn decode_into_builders_fast_path_reports_truncated_fixed_width_payloads() {
+        for schema in [
+            Schema::new([Field::required("a", DataType::Int32)]).unwrap(),
+            Schema::new([
+                Field::required("a", DataType::Int32),
+                Field::required("b", DataType::Int32),
+            ])
+            .unwrap(),
+            Schema::new([
+                Field::required("a", DataType::Int32),
+                Field::required("b", DataType::Int32),
+                Field::required("c", DataType::Int32),
+            ])
+            .unwrap(),
+            Schema::new([Field::required("a", DataType::Int64)]).unwrap(),
+            Schema::new([
+                Field::required("a", DataType::Int64),
+                Field::required("b", DataType::Int64),
+            ])
+            .unwrap(),
+        ] {
+            let codec = RowCodec::new(schema);
+            let mut builders = codec.new_builders(1).expect("builders");
+            let err = codec
+                .decode_into_builders(&[0], &mut builders)
+                .expect_err("truncated fixed payload");
+            assert!(matches!(err, RowCodecError::Truncated { .. }));
+        }
+    }
+
+    #[test]
+    fn decode_into_builders_generic_covers_bool_smallint_float_and_nulls() {
+        let schema = Schema::new([
+            Field::nullable("b", DataType::Bool),
+            Field::nullable("s", DataType::Int16),
+            Field::nullable("f4", DataType::Float32),
+            Field::nullable("f8", DataType::Float64),
+        ])
+        .unwrap();
+        let codec = RowCodec::new(schema.clone());
+        assert_eq!(codec.fixed_width_lower_bound(), 1 + 1 + 2 + 4 + 8);
+        let rows = [
+            vec![
+                Value::Bool(true),
+                Value::Int16(-7),
+                Value::Float32(1.5),
+                Value::Float64(-2.25),
+            ],
+            vec![Value::Null, Value::Null, Value::Null, Value::Null],
+        ];
+        let mut builders = codec.new_builders(rows.len()).expect("builders");
+        for row in rows {
+            let encoded = codec.encode(&row).expect("encode");
+            codec
+                .decode_into_builders(&encoded, &mut builders)
+                .expect("decode builders");
+        }
+
+        let batch = RowCodec::finish_batch(builders).expect("finish");
+        assert_eq!(batch.rows(), 2);
+        match &batch.columns()[0] {
+            Column::Bool(c) => {
+                assert_eq!(c.data(), &[1, 0]);
+                let nulls = c.nulls().expect("bool nulls");
+                assert!(nulls.get(0));
+                assert!(!nulls.get(1));
+            }
+            other => panic!("expected bool column, got {other:?}"),
+        }
+        match &batch.columns()[1] {
+            Column::Int32(c) => {
+                assert_eq!(c.data(), &[-7, 0]);
+                let nulls = c.nulls().expect("int16 nulls");
+                assert!(nulls.get(0));
+                assert!(!nulls.get(1));
+            }
+            other => panic!("expected int32-backed int16 column, got {other:?}"),
+        }
+        match &batch.columns()[2] {
+            Column::Float32(c) => {
+                assert_eq!(c.data(), &[1.5, 0.0]);
+                let nulls = c.nulls().expect("float32 nulls");
+                assert!(nulls.get(0));
+                assert!(!nulls.get(1));
+            }
+            other => panic!("expected float32 column, got {other:?}"),
+        }
+        match &batch.columns()[3] {
+            Column::Float64(c) => {
+                assert_eq!(c.data(), &[-2.25, 0.0]);
+                let nulls = c.nulls().expect("float64 nulls");
+                assert!(nulls.get(0));
+                assert!(!nulls.get(1));
+            }
+            other => panic!("expected float64 column, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn round_trip_int_array() {
         let schema = Schema::new([Field::required(
             "xs",
@@ -3381,6 +3708,188 @@ mod tests {
             },
         ];
         assert_eq!(codec.decode(&codec.encode(&row).unwrap()).unwrap(), row);
+    }
+
+    #[test]
+    fn round_trip_temporal_oid_binary_network_range_and_geometry_values() {
+        let schema = Schema::new([
+            Field::required("oid", DataType::Oid),
+            Field::required("regclass", DataType::RegClass),
+            Field::required("regtype", DataType::RegType),
+            Field::required("lsn", DataType::PgLsn),
+            Field::required("date", DataType::Date),
+            Field::required("ts", DataType::Timestamp),
+            Field::required("tstz", DataType::TimestampTz),
+            Field::required("time", DataType::Time),
+            Field::required("timetz", DataType::TimeTz),
+            Field::required("interval", DataType::Interval),
+            Field::required("uuid", DataType::Uuid),
+            Field::required("bytea", DataType::Bytea),
+            Field::required("bits", DataType::Bit { len: Some(4) }),
+            Field::required("varbits", DataType::VarBit { max_len: Some(8) }),
+            Field::required("inet", DataType::Inet),
+            Field::required("range", DataType::Range(RangeType::Int4)),
+            Field::required("geom", DataType::Geometry(GeometryType::Box)),
+        ])
+        .unwrap();
+        let codec = RowCodec::new(schema.clone());
+        let row = vec![
+            Value::Oid(Oid::new(1)),
+            Value::RegClass(Oid::new(2)),
+            Value::RegType(Oid::new(3)),
+            Value::PgLsn(Lsn::new(0x1_0000_0002)),
+            Value::Date(42),
+            Value::Timestamp(123),
+            Value::TimestampTz(456),
+            Value::Time(789),
+            Value::TimeTz {
+                micros: 1_000,
+                offset_seconds: -18_000,
+            },
+            Value::Interval {
+                months: 2,
+                days: 3,
+                microseconds: 4,
+            },
+            Value::Uuid([7; 16]),
+            Value::Bytea(vec![0, 1, 2, 255]),
+            Value::BitString(BitString::parse("1010").expect("bit")),
+            Value::BitString(BitString::parse("101011").expect("varbit")),
+            Value::Network(
+                NetworkValue::parse_for_type(&DataType::Inet, "192.168.1.10").expect("inet"),
+            ),
+            Value::Range(RangeValue::parse(RangeType::Int4, "[1,4)").expect("range")),
+            Value::Geometry(GeometryValue::parse(GeometryType::Box, "((0,0),(2,3))").expect("box")),
+        ];
+        let encoded = codec.encode(&row).expect("encode");
+        assert_eq!(codec.decode(&encoded).expect("decode"), row);
+        assert_eq!(
+            codec
+                .decode_projected(&encoded, &[14, 0, 12])
+                .expect("project"),
+            vec![
+                Value::Network(
+                    NetworkValue::parse_for_type(&DataType::Inet, "192.168.1.10").expect("inet")
+                ),
+                Value::Oid(Oid::new(1)),
+                Value::BitString(BitString::parse("1010").expect("bit")),
+            ]
+        );
+
+        let mut builders = schema
+            .fields()
+            .iter()
+            .map(|field| ColumnBuilder::new(&field.data_type, 1, 0).expect("builder"))
+            .collect::<Vec<_>>();
+        codec
+            .decode_into_builders(&encoded, &mut builders)
+            .expect("decode builders");
+        let batch = RowCodec::finish_batch(builders).expect("finish");
+        assert_eq!(batch.width(), schema.len());
+        assert_eq!(batch.rows(), 1);
+    }
+
+    #[test]
+    fn decode_projected_covers_varlena_catalog_network_and_vector_families() {
+        let enum_type = DataType::Enum {
+            oid: Oid::new(8_001),
+            name: Arc::<str>::from("mood"),
+            labels: Arc::from(vec!["happy".to_owned(), "sad".to_owned()].into_boxed_slice()),
+        };
+        let composite_type = DataType::Composite {
+            oid: Oid::new(8_002),
+            name: Arc::<str>::from("pair"),
+            fields: Arc::from(
+                vec![
+                    ("id".to_owned(), DataType::Int32),
+                    ("name".to_owned(), DataType::Text { max_len: None }),
+                ]
+                .into_boxed_slice(),
+            ),
+        };
+        let schema = Schema::new([
+            Field::required("b", DataType::Bool),
+            Field::required("s", DataType::Int16),
+            Field::required("f4", DataType::Float32),
+            Field::required("f8", DataType::Float64),
+            Field::required("enumv", enum_type.clone()),
+            Field::required("comp", composite_type.clone()),
+            Field::required("charv", DataType::Char { len: Some(4) }),
+            Field::required("cidr", DataType::Cidr),
+            Field::required("mac", DataType::MacAddr),
+            Field::required("mac8", DataType::MacAddr8),
+            Field::required("json", DataType::Json),
+            Field::required("jsonb", DataType::Jsonb),
+            Field::required("xml", DataType::Xml),
+            Field::required("bytea", DataType::Bytea),
+            Field::required("vector", DataType::Vector { dims: Some(2) }),
+            Field::required("halfvec", DataType::HalfVec { dims: Some(2) }),
+            Field::required("sparse", DataType::SparseVec { dims: Some(4) }),
+            Field::required("bitvec", DataType::BitVec { dims: Some(8) }),
+            Field::required(
+                "array",
+                DataType::Array(Box::new(DataType::Text { max_len: None })),
+            ),
+            Field::required("geom", DataType::Geometry(GeometryType::Point)),
+        ])
+        .unwrap();
+        let row = vec![
+            Value::Bool(false),
+            Value::Int16(12),
+            Value::Float32(3.5),
+            Value::Float64(-4.5),
+            Value::Text("happy".to_owned()),
+            Value::Text("(1,foo)".to_owned()),
+            Value::Char("xy  ".to_owned()),
+            Value::Network(
+                NetworkValue::parse_for_type(&DataType::Cidr, "192.168.0.0/24").expect("cidr"),
+            ),
+            Value::Network(
+                NetworkValue::parse_for_type(&DataType::MacAddr, "08:00:2b:01:02:03").expect("mac"),
+            ),
+            Value::Network(
+                NetworkValue::parse_for_type(&DataType::MacAddr8, "08:00:2b:01:02:03:04:05")
+                    .expect("mac8"),
+            ),
+            Value::Json(r#"{"z":0}"#.to_owned()),
+            Value::Jsonb(r#"{"a":1}"#.to_owned()),
+            Value::Xml("<root/>".to_owned()),
+            Value::Bytea(vec![1, 2, 3]),
+            Value::Vector(vec![1.0, -1.0]),
+            Value::HalfVec(vec![0.5, 2.0]),
+            Value::SparseVec(SparseVector::new(4, vec![(1, 1.0), (3, -2.0)]).unwrap()),
+            Value::BitVec {
+                dims: 8,
+                bytes: vec![0b1010_1100],
+            },
+            Value::Array {
+                element_type: DataType::Text { max_len: None },
+                elements: vec![Value::Text("a".to_owned()), Value::Text("b".to_owned())],
+            },
+            Value::Geometry(GeometryValue::parse(GeometryType::Point, "(1,2)").expect("point")),
+        ];
+        let codec = RowCodec::new(schema.clone());
+        let encoded = codec.encode(&row).expect("encode");
+        let all_columns = (0..schema.len()).collect::<Vec<_>>();
+        assert_eq!(
+            codec
+                .decode_projected(&encoded, &all_columns)
+                .expect("project all"),
+            row
+        );
+        assert_eq!(
+            codec.decode_projected(&encoded, &[19]).expect("skip all"),
+            vec![Value::Geometry(
+                GeometryValue::parse(GeometryType::Point, "(1,2)").expect("point")
+            )]
+        );
+        assert!(codec.encode(&[Value::Text("angry".to_owned())]).is_err());
+        let null_schema = Schema::new([Field::required("n", DataType::Null)]).expect("null");
+        assert!(matches!(
+            RowCodec::new(null_schema).encode(&[Value::Int32(1)]),
+            Err(RowCodecError::Type { column: 0, .. })
+                | Err(RowCodecError::UnsupportedType { column: 0, .. })
+        ));
     }
 
     #[test]

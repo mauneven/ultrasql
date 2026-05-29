@@ -723,12 +723,74 @@ impl Operator for FilterSumI64Scan {
 mod tests {
     use super::*;
     use ultrasql_core::{DataType, Field};
+    use ultrasql_vec::Bitmap;
+
+    use crate::mem_table_scan::MemTableScan;
 
     fn output_i64(batch: &Batch) -> i64 {
         let Column::Int64(col) = &batch.columns()[0] else {
             panic!("expected int64 output")
         };
         col.data()[0]
+    }
+
+    fn output_f64(batch: &Batch) -> f64 {
+        let Column::Float64(col) = &batch.columns()[0] else {
+            panic!("expected float64 output")
+        };
+        col.data()[0]
+    }
+
+    fn output_is_null(batch: &Batch) -> bool {
+        match &batch.columns()[0] {
+            Column::Int64(col) => col.nulls().is_some_and(|nulls| !nulls.get(0)),
+            Column::Float64(col) => col.nulls().is_some_and(|nulls| !nulls.get(0)),
+            other => panic!("unexpected output column {other:?}"),
+        }
+    }
+
+    fn schema_i32_pair() -> Schema {
+        Schema::new([
+            Field::required("pred", DataType::Int32),
+            Field::required("sum", DataType::Int32),
+        ])
+        .expect("schema")
+    }
+
+    fn schema_i64_pair() -> Schema {
+        Schema::new([
+            Field::required("pred", DataType::Int64),
+            Field::required("sum", DataType::Int64),
+        ])
+        .expect("schema")
+    }
+
+    fn i32_pair_batch(rows: &[(i32, i32)]) -> Batch {
+        Batch::new([
+            Column::Int32(NumericColumn::from_data(
+                rows.iter().map(|(pred, _)| *pred).collect(),
+            )),
+            Column::Int32(NumericColumn::from_data(
+                rows.iter().map(|(_, sum)| *sum).collect(),
+            )),
+        ])
+        .expect("batch")
+    }
+
+    fn i64_pair_batch(rows: &[(i64, i64)]) -> Batch {
+        Batch::new([
+            Column::Int64(NumericColumn::from_data(
+                rows.iter().map(|(pred, _)| *pred).collect(),
+            )),
+            Column::Int64(NumericColumn::from_data(
+                rows.iter().map(|(_, sum)| *sum).collect(),
+            )),
+        ])
+        .expect("batch")
+    }
+
+    fn cached_i32(columns: Vec<Column>) -> Arc<CachedColumns> {
+        Arc::new(CachedColumns::new(7, schema_i32_pair(), columns))
     }
 
     #[test]
@@ -771,5 +833,137 @@ mod tests {
         let batch = op.next_batch().expect("ok").expect("row");
         assert_eq!(output_i64(&batch), 93);
         assert!(op.next_batch().expect("ok").is_none());
+    }
+
+    #[test]
+    fn filter_sum_i32_streams_cross_column_predicate() {
+        let scan = MemTableScan::new(
+            schema_i32_pair(),
+            vec![
+                i32_pair_batch(&[(1, 10), (5, 50)]),
+                i32_pair_batch(&[(2, 20), (9, 90)]),
+            ],
+        );
+        let mut op = FilterSumI32Scan::new(Box::new(scan), 0, 3, CmpOp::Lt, 1, "sum".to_owned());
+
+        let batch = op.next_batch().expect("ok").expect("row");
+        assert_eq!(output_i64(&batch), 30);
+        assert_eq!(op.estimated_row_count(), Some(1));
+        assert!(op.next_batch().expect("ok").is_none());
+    }
+
+    #[test]
+    fn filter_sum_i32_empty_input_emits_null() {
+        let scan = MemTableScan::new(schema_i32_pair(), vec![]);
+        let mut op = FilterSumI32Scan::new(Box::new(scan), 0, 0, CmpOp::Gt, 1, "sum".to_owned());
+
+        let batch = op.next_batch().expect("ok").expect("row");
+        assert!(output_is_null(&batch));
+        assert!(op.next_batch().expect("ok").is_none());
+    }
+
+    #[test]
+    fn filter_sum_i64_streams_and_reports_type_errors() {
+        let scan = MemTableScan::new(
+            schema_i64_pair(),
+            vec![i64_pair_batch(&[(10, 100), (20, 200), (30, 300)])],
+        );
+        let mut op = FilterSumI64Scan::new(Box::new(scan), 0, 20, CmpOp::Ge, 1, "sum".to_owned());
+        let batch = op.next_batch().expect("ok").expect("row");
+        assert_eq!(output_i64(&batch), 500);
+
+        let bad_scan = MemTableScan::new(schema_i32_pair(), vec![i32_pair_batch(&[(1, 2)])]);
+        let mut bad =
+            FilterSumI64Scan::new(Box::new(bad_scan), 0, 0, CmpOp::Gt, 1, "sum".to_owned());
+        let err = bad.next_batch().expect_err("type mismatch");
+        assert!(err.to_string().contains("must both be Int64"));
+    }
+
+    #[test]
+    fn cached_filter_sum_i32_cross_column_and_type_error() {
+        let columns = cached_i32(vec![
+            Column::Int32(NumericColumn::from_data(vec![1, 2, 3])),
+            Column::Int32(NumericColumn::from_data(vec![10, 20, 30])),
+        ]);
+        let mut op = CachedFilterSumI32Scan::new(columns, 0, 2, CmpOp::Ne, 1, "sum".to_owned());
+        let batch = op.next_batch().expect("ok").expect("row");
+        assert_eq!(output_i64(&batch), 40);
+        assert_eq!(op.estimated_row_count(), Some(1));
+
+        let bad_columns = Arc::new(CachedColumns::new(
+            0,
+            Schema::new([
+                Field::required("pred", DataType::Int32),
+                Field::required("sum", DataType::Int64),
+            ])
+            .expect("schema"),
+            vec![
+                Column::Int32(NumericColumn::from_data(vec![1])),
+                Column::Int64(NumericColumn::from_data(vec![2])),
+            ],
+        ));
+        let mut bad =
+            CachedFilterSumI32Scan::new(bad_columns, 0, 0, CmpOp::Gt, 1, "sum".to_owned());
+        let err = bad.next_batch().expect_err("type mismatch");
+        assert!(err.to_string().contains("must both be Int32"));
+    }
+
+    #[test]
+    fn cached_filter_sum_i64_empty_input_emits_null() {
+        let columns = Arc::new(CachedColumns::new(
+            0,
+            schema_i64_pair(),
+            vec![
+                Column::Int64(NumericColumn::from_data(Vec::new())),
+                Column::Int64(NumericColumn::from_data(Vec::new())),
+            ],
+        ));
+        let mut op = CachedFilterSumI64Scan::new(columns, 0, 0, CmpOp::Gt, 1, "sum".to_owned());
+        let batch = op.next_batch().expect("ok").expect("row");
+        assert!(output_is_null(&batch));
+    }
+
+    #[test]
+    fn cached_sum_and_avg_cover_non_empty_empty_and_null_bitmaps() {
+        let columns = cached_i32(vec![
+            Column::Int32(NumericColumn::from_data(vec![1, 2, 3])),
+            Column::Int32(NumericColumn::from_data(vec![10, 20, 30])),
+        ]);
+        let mut sum = CachedSumI32Scan::new(Arc::clone(&columns), 1, "sum".to_owned());
+        assert_eq!(output_i64(&sum.next_batch().expect("ok").expect("row")), 60);
+        assert_eq!(sum.estimated_row_count(), Some(1));
+
+        let mut avg = CachedAvgI32Scan::new(Arc::clone(&columns), 1, "avg".to_owned());
+        assert_eq!(
+            output_f64(&avg.next_batch().expect("ok").expect("row")),
+            20.0
+        );
+
+        let empty = cached_i32(vec![
+            Column::Int32(NumericColumn::from_data(Vec::new())),
+            Column::Int32(NumericColumn::from_data(Vec::new())),
+        ]);
+        let mut empty_sum = CachedSumI32Scan::new(Arc::clone(&empty), 1, "sum".to_owned());
+        assert!(output_is_null(
+            &empty_sum.next_batch().expect("ok").expect("row")
+        ));
+        let mut empty_avg = CachedAvgI32Scan::new(empty, 1, "avg".to_owned());
+        assert!(output_is_null(
+            &empty_avg.next_batch().expect("ok").expect("row")
+        ));
+
+        let mut valid = Bitmap::new(3, true);
+        valid.set(1, false);
+        let nullable = cached_i32(vec![
+            Column::Int32(NumericColumn::from_data(vec![1, 2, 3])),
+            Column::Int32(
+                NumericColumn::with_nulls(vec![10, 20, 30], valid).expect("matching lengths"),
+            ),
+        ]);
+        let mut nullable_avg = CachedAvgI32Scan::new(nullable, 1, "avg".to_owned());
+        assert_eq!(
+            output_f64(&nullable_avg.next_batch().expect("ok").expect("row")),
+            20.0
+        );
     }
 }

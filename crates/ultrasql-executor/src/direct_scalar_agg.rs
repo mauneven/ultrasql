@@ -339,6 +339,7 @@ mod tests {
     use crate::MemTableScan;
     use ultrasql_core::{DataType, Field, Schema};
     use ultrasql_vec::Batch;
+    use ultrasql_vec::Bitmap;
     use ultrasql_vec::column::{Column, NumericColumn};
 
     fn make_int32_scan(name: &str, values: Vec<i32>) -> MemTableScan {
@@ -350,6 +351,32 @@ mod tests {
     fn make_int64_scan(name: &str, values: Vec<i64>) -> MemTableScan {
         let schema = Schema::new([Field::required(name, DataType::Int64)]).expect("schema");
         let batch = Batch::new([Column::Int64(NumericColumn::from_data(values))]).expect("batch");
+        MemTableScan::new(schema, vec![batch])
+    }
+
+    fn nullable_int32_scan(name: &str, values: Vec<i32>, valid: &[bool]) -> MemTableScan {
+        let schema = Schema::new([Field::required(name, DataType::Int32)]).expect("schema");
+        let mut nulls = Bitmap::new(valid.len(), false);
+        for (idx, is_valid) in valid.iter().copied().enumerate() {
+            nulls.set(idx, is_valid);
+        }
+        let batch = Batch::new([Column::Int32(
+            NumericColumn::with_nulls(values, nulls).expect("bitmap len matches"),
+        )])
+        .expect("batch");
+        MemTableScan::new(schema, vec![batch])
+    }
+
+    fn nullable_int64_scan(name: &str, values: Vec<i64>, valid: &[bool]) -> MemTableScan {
+        let schema = Schema::new([Field::required(name, DataType::Int64)]).expect("schema");
+        let mut nulls = Bitmap::new(valid.len(), false);
+        for (idx, is_valid) in valid.iter().copied().enumerate() {
+            nulls.set(idx, is_valid);
+        }
+        let batch = Batch::new([Column::Int64(
+            NumericColumn::with_nulls(values, nulls).expect("bitmap len matches"),
+        )])
+        .expect("batch");
         MemTableScan::new(schema, vec![batch])
     }
 
@@ -446,5 +473,92 @@ mod tests {
             Column::Int64(c) => assert_eq!(c.data(), &[0]),
             other => panic!("expected Int64, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn avg_int64_schema_debug_and_row_count_are_stable() {
+        let scan = make_int64_scan("x", vec![10_i64, 20, 30]);
+        let mut agg = DirectScalarAggScan::avg_int64(Box::new(scan), 0, "avg".into());
+        assert_eq!(agg.schema().field_at(0).name, "avg");
+        assert_eq!(agg.estimated_row_count(), Some(1));
+        assert!(format!("{agg:?}").contains("DirectScalarAggScan"));
+
+        let batch = agg.next_batch().expect("ok").expect("row");
+
+        match &batch.columns()[0] {
+            Column::Float64(c) => assert_eq!(c.data(), &[20.0_f64]),
+            other => panic!("expected Float64, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn direct_scalar_agg_skips_empty_batches_before_accumulating() {
+        let schema = Schema::new([Field::required("x", DataType::Int64)]).expect("schema");
+        let empty =
+            Batch::new([Column::Int64(NumericColumn::from_data(Vec::<i64>::new()))]).unwrap();
+        let non_empty =
+            Batch::new([Column::Int64(NumericColumn::from_data(vec![2_i64, 3]))]).expect("batch");
+        let scan = MemTableScan::new(schema, vec![empty, non_empty]);
+        let mut agg = DirectScalarAggScan::sum_int64(Box::new(scan), 0, "sum".into());
+
+        let batch = agg.next_batch().expect("ok").expect("row");
+
+        match &batch.columns()[0] {
+            Column::Int64(c) => assert_eq!(c.data(), &[5]),
+            other => panic!("expected Int64, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn direct_scalar_agg_reports_bad_column_shapes() {
+        let mut out_of_range = DirectScalarAggScan::sum_int32(
+            Box::new(make_int32_scan("x", vec![1])),
+            4,
+            "sum".into(),
+        );
+        let err = out_of_range
+            .next_batch()
+            .expect_err("out-of-range column must fail");
+        assert!(err.to_string().contains("column index 4 out of range"));
+
+        let mut wrong_i32 = DirectScalarAggScan::sum_int32(
+            Box::new(make_int64_scan("x", vec![1])),
+            0,
+            "sum".into(),
+        );
+        let err = wrong_i32
+            .next_batch()
+            .expect_err("wrong Int32 type must fail");
+        assert!(err.to_string().contains("expected Int32 column"));
+
+        let mut wrong_i64 = DirectScalarAggScan::sum_int64(
+            Box::new(make_int32_scan("x", vec![1])),
+            0,
+            "sum".into(),
+        );
+        let err = wrong_i64
+            .next_batch()
+            .expect_err("wrong Int64 type must fail");
+        assert!(err.to_string().contains("expected Int64 column"));
+
+        let mut nullable_i32 = DirectScalarAggScan::sum_int32(
+            Box::new(nullable_int32_scan("x", vec![1, 2], &[true, false])),
+            0,
+            "sum".into(),
+        );
+        let err = nullable_i32
+            .next_batch()
+            .expect_err("nullable Int32 fast path must fail");
+        assert!(err.to_string().contains("NULL-aware path not implemented"));
+
+        let mut nullable_i64 = DirectScalarAggScan::sum_int64(
+            Box::new(nullable_int64_scan("x", vec![1, 2], &[true, false])),
+            0,
+            "sum".into(),
+        );
+        let err = nullable_i64
+            .next_batch()
+            .expect_err("nullable Int64 fast path must fail");
+        assert!(err.to_string().contains("NULL-aware path not implemented"));
     }
 }

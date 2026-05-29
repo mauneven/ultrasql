@@ -2206,14 +2206,26 @@ fn value_lt(a: &Value, b: &Value) -> bool {
     reason = "tests: index arithmetic against compile-time-known loop bounds"
 )]
 mod tests {
-    use ultrasql_core::{DataType, Field, Schema, Value};
+    use std::collections::HashSet;
+
+    use ultrasql_core::{
+        BitString, DataType, Field, GeometryType, GeometryValue, Lsn, NetworkValue, Oid, RangeType,
+        RangeValue, Schema, SparseVector, Value,
+    };
     use ultrasql_planner::{AggregateFunc, LogicalAggregateExpr, ScalarExpr};
     use ultrasql_vec::Batch;
-    use ultrasql_vec::column::{Column, NumericColumn, StringColumn};
+    use ultrasql_vec::bitmap::Bitmap;
+    use ultrasql_vec::column::{BoolColumn, Column, NumericColumn, StringColumn};
+    use ultrasql_vec::dict::DictionaryColumn;
 
-    use super::{AggState, HashAggregate, accumulate_sum, finalise};
+    use super::{
+        AggState, GroupKey, HashAggregate, accumulate_sum, build_grouped_vectorized_plan,
+        build_vectorized_plan, column_non_null_count, finalise, finalize_grouped_sum,
+        grouped_vectorized_step, read_i32_key, read_i64_key, read_numeric_value, update_extremum,
+        vectorized_step,
+    };
     use crate::mem_table_scan::MemTableScan;
-    use crate::{Operator, WorkMemBudget};
+    use crate::{CancelFlag, Operator, WorkMemBudget};
 
     // -------------------------------------------------------------------------
     // Helpers
@@ -2308,6 +2320,28 @@ mod tests {
         .expect("batch ok")
     }
 
+    #[derive(Debug)]
+    struct CancellingScan {
+        schema: Schema,
+        batch: Option<Batch>,
+        flag: CancelFlag,
+    }
+
+    impl Operator for CancellingScan {
+        fn next_batch(&mut self) -> Result<Option<Batch>, crate::ExecError> {
+            if let Some(batch) = self.batch.take() {
+                self.flag.cancel();
+                Ok(Some(batch))
+            } else {
+                Ok(None)
+            }
+        }
+
+        fn schema(&self) -> &Schema {
+            &self.schema
+        }
+    }
+
     fn sum_decimal_mul_i32_agg() -> LogicalAggregateExpr {
         LogicalAggregateExpr {
             func: AggregateFunc::Sum,
@@ -2346,6 +2380,249 @@ mod tests {
             out.extend(rows);
         }
         out
+    }
+
+    #[test]
+    fn group_key_hashes_supported_value_families_with_sql_key_semantics() {
+        let values = vec![
+            Value::Null,
+            Value::Bool(true),
+            Value::Int16(1),
+            Value::Int32(2),
+            Value::Int64(3),
+            Value::Money(4),
+            Value::Oid(Oid::new(5)),
+            Value::RegClass(Oid::new(6)),
+            Value::RegType(Oid::new(7)),
+            Value::PgLsn(Lsn::new(8)),
+            Value::Float32(f32::from_bits(0x7fc0_0001)),
+            Value::Float64(f64::from_bits(0x7ff8_0000_0000_0001)),
+            Value::Text("text".into()),
+            Value::Char("bpchar  ".into()),
+            Value::Json(r#"{"a":1}"#.into()),
+            Value::Jsonb(r#"{"a":1}"#.into()),
+            Value::Xml("<r/>".into()),
+            Value::Bytea(vec![0, 1, 255]),
+            Value::Timestamp(9),
+            Value::TimestampTz(10),
+            Value::Time(11),
+            Value::TimeTz {
+                micros: 12,
+                offset_seconds: 3_600,
+            },
+            Value::Date(13),
+            Value::Uuid([14; 16]),
+            Value::Decimal {
+                value: 15,
+                scale: 2,
+            },
+            Value::Interval {
+                months: 1,
+                days: 2,
+                microseconds: 3,
+            },
+            Value::Range(RangeValue::parse(RangeType::Int4, "[1,3)").expect("range")),
+            Value::Geometry(GeometryValue::parse(GeometryType::Box, "((0,0),(1,1))").expect("box")),
+            Value::Array {
+                element_type: DataType::Int32,
+                elements: vec![Value::Int32(1), Value::Null],
+            },
+            Value::Vector(vec![1.0, f32::NAN]),
+            Value::HalfVec(vec![2.0, f32::NAN]),
+            Value::SparseVec(SparseVector {
+                dims: 4,
+                entries: vec![(2, 1.5)],
+            }),
+            Value::BitVec {
+                dims: 9,
+                bytes: vec![0b1010_0000, 0b1000_0000],
+            },
+            Value::BitString(BitString::parse("10101").expect("bits")),
+            Value::Network(
+                NetworkValue::parse_for_type(&DataType::Inet, "127.0.0.1").expect("inet"),
+            ),
+            Value::Record(vec![("x".into(), Value::Int32(1))]),
+        ];
+
+        let key = GroupKey::from_values(values.clone());
+        let clone = GroupKey::from_values(values.clone());
+        let mut seen = HashSet::new();
+        assert!(seen.insert(key));
+        assert!(!seen.insert(clone));
+        assert_eq!(GroupKey::from_values(values).into_values().len(), 36);
+
+        assert_eq!(
+            GroupKey::from_values(vec![Value::Char("a".into())]),
+            GroupKey::from_values(vec![Value::Char("a   ".into())])
+        );
+        assert_eq!(
+            GroupKey::from_values(vec![Value::TimeTz {
+                micros: 3_600_000_000,
+                offset_seconds: 3_600,
+            }]),
+            GroupKey::from_values(vec![Value::TimeTz {
+                micros: 0,
+                offset_seconds: 0,
+            }])
+        );
+    }
+
+    #[test]
+    fn vectorized_helper_paths_cover_counts_extrema_and_grouped_errors() {
+        let mut validity = Bitmap::new(4, true);
+        validity.set(1, false);
+        let int32 = Column::Int32(
+            NumericColumn::with_nulls(vec![1, 2, 3, 4], validity.clone()).expect("int32"),
+        );
+        let int64 = Column::Int64(
+            NumericColumn::with_nulls(vec![10, 20, 30, 40], validity.clone()).expect("int64"),
+        );
+        let float32 = Column::Float32(
+            NumericColumn::with_nulls(vec![1.0, f32::NAN, 3.0, 4.0], validity.clone())
+                .expect("float32"),
+        );
+        let float64 = Column::Float64(
+            NumericColumn::with_nulls(vec![1.0, 2.0, 3.0, 4.0], validity.clone()).expect("float64"),
+        );
+        let bools = Column::Bool(
+            BoolColumn::with_nulls(vec![true, false, true, false], validity.clone()).expect("bool"),
+        );
+        let utf8 = Column::Utf8(
+            StringColumn::with_nulls(
+                ["a", "b", "c", "d"].into_iter().map(str::to_owned),
+                validity.clone(),
+            )
+            .expect("utf8"),
+        );
+        let dict = Column::DictionaryUtf8(DictionaryColumn::from_strings([
+            Some("a"),
+            None,
+            Some("c"),
+            Some("d"),
+        ]));
+        assert_eq!(column_non_null_count(&int32), 3);
+        assert_eq!(column_non_null_count(&int64), 3);
+        assert_eq!(column_non_null_count(&float32), 3);
+        assert_eq!(column_non_null_count(&float64), 3);
+        assert_eq!(column_non_null_count(&bools), 3);
+        assert_eq!(column_non_null_count(&utf8), 3);
+        assert_eq!(column_non_null_count(&dict), 3);
+
+        let batch = Batch::new([
+            int32.clone(),
+            int64.clone(),
+            float32.clone(),
+            float64.clone(),
+        ])
+        .expect("batch");
+        let aggregates = vec![
+            count_star_agg(),
+            LogicalAggregateExpr {
+                func: AggregateFunc::Count,
+                arg: Some(col("a", 0, DataType::Int32)),
+                direct_arg: None,
+                order_by: None,
+                distinct: false,
+                output_name: "cnt".into(),
+                data_type: DataType::Int64,
+            },
+            sum_agg("b", 1),
+            LogicalAggregateExpr {
+                func: AggregateFunc::Avg,
+                arg: Some(col("c", 2, DataType::Float32)),
+                direct_arg: None,
+                order_by: None,
+                distinct: false,
+                output_name: "avg".into(),
+                data_type: DataType::Float64,
+            },
+            min_agg("b", 1),
+            max_agg("b", 1),
+        ];
+        let plan = build_vectorized_plan(&aggregates).expect("vectorized plan");
+        let mut states = vec![
+            AggState::CountStar(0),
+            AggState::Count(0),
+            AggState::Sum(None),
+            AggState::Avg(None, 0),
+            AggState::Min(None),
+            AggState::Max(None),
+        ];
+        vectorized_step(&plan, &batch, &mut states).expect("vectorized step");
+        assert_eq!(finalise(&states[0]), Value::Int64(4));
+        assert_eq!(finalise(&states[1]), Value::Int64(3));
+        assert_eq!(finalise(&states[2]), Value::Int64(80));
+        assert_eq!(finalise(&states[4]), Value::Int64(10));
+        assert_eq!(finalise(&states[5]), Value::Int64(40));
+
+        assert!(
+            build_vectorized_plan(&[LogicalAggregateExpr {
+                func: AggregateFunc::Sum,
+                arg: Some(ScalarExpr::Literal {
+                    value: Value::Int32(1),
+                    data_type: DataType::Int32,
+                }),
+                direct_arg: None,
+                order_by: None,
+                distinct: false,
+                output_name: "bad".into(),
+                data_type: DataType::Int64,
+            }])
+            .is_none()
+        );
+
+        let mut min_acc = None;
+        update_extremum(&mut min_acc, &int32, true).expect("min");
+        assert_eq!(min_acc, Some(Value::Int32(1)));
+        let mut max_acc = None;
+        update_extremum(&mut max_acc, &float64, false).expect("max");
+        assert_eq!(max_acc, Some(Value::Float64(4.0)));
+        let mut wrong_sum = Some(Value::Text("bad".into()));
+        assert!(accumulate_sum(&mut wrong_sum, &int64).is_err());
+
+        assert_eq!(read_i32_key(Some(&int32), 1).expect("null key"), None);
+        assert_eq!(read_i64_key(Some(&int64), 2).expect("i64 key"), Some(30));
+        assert_eq!(
+            read_numeric_value(Some(&int32), 2).expect("numeric"),
+            Some(3)
+        );
+        assert!(read_i32_key(None, 0).is_err());
+        assert!(read_i64_key(Some(&int32), 0).is_err());
+        assert!(read_numeric_value(Some(&float64), 0).is_err());
+
+        let grouped_schema = Schema::new([
+            Field::required("k", DataType::Int32),
+            Field::required("v", DataType::Int64),
+        ])
+        .expect("schema");
+        let grouped_plan = build_grouped_vectorized_plan(
+            &[col("k", 0, DataType::Int32)],
+            &[sum_agg("v", 1)],
+            &grouped_schema,
+        )
+        .expect("grouped plan");
+        let grouped_batch = Batch::new([int32, int64]).expect("grouped batch");
+        let mut table = std::collections::HashMap::new();
+        grouped_vectorized_step(&grouped_plan, &grouped_batch, &mut table).expect("grouped step");
+        assert_eq!(table.get(&Some(1)), Some(&10));
+        assert_eq!(table.get(&Some(3)), Some(&30));
+        assert_eq!(
+            finalize_grouped_sum(
+                123,
+                &DataType::Decimal {
+                    precision: None,
+                    scale: Some(2),
+                },
+            ),
+            Value::Decimal {
+                value: 123,
+                scale: 2
+            }
+        );
+        assert_eq!(
+            finalize_grouped_sum(i64::from(i32::MAX) + 1, &DataType::Int32),
+            Value::Int32(i32::MAX)
+        );
     }
 
     // -------------------------------------------------------------------------
@@ -2487,6 +2764,11 @@ mod tests {
             op.spilled_to_disk(),
             "grouped hash aggregate must partition-spill"
         );
+        let profile = op.spill_profile();
+        assert!(profile.spills > 0);
+        assert!(profile.bytes > 0);
+        assert_eq!(op.io_bytes(), profile.bytes.saturating_mul(2));
+        assert_eq!(op.profile_children().len(), 1);
     }
 
     #[test]
@@ -2936,6 +3218,151 @@ mod tests {
             ref other => panic!("expected Int32 group key, got {other:?}"),
         });
         assert_eq!(rows_vec, rows_sca);
+    }
+
+    #[test]
+    fn grouped_vectorized_i64_and_null_keys_are_finalized_correctly() {
+        let schema = Schema::new([
+            Field::nullable("group", DataType::Int64),
+            Field::required("val", DataType::Int64),
+        ])
+        .expect("schema ok");
+        let mut key_validity = Bitmap::new(3, true);
+        key_validity.set(1, false);
+        let batch = Batch::new([
+            Column::Int64(
+                NumericColumn::with_nulls(vec![10_i64, 99, 10], key_validity).expect("keys"),
+            ),
+            Column::Int64(NumericColumn::from_data(vec![1_i64, 2, 3])),
+        ])
+        .expect("batch ok");
+        let out_schema = Schema::new([
+            Field::nullable("group", DataType::Int64),
+            Field::nullable("total", DataType::Int64),
+        ])
+        .expect("schema ok");
+        let mut op = HashAggregate::new(
+            Box::new(MemTableScan::new(schema, vec![batch])),
+            vec![col("group", 0, DataType::Int64)],
+            vec![sum_agg("val", 1)],
+            out_schema,
+        );
+
+        let mut rows = drain_all(&mut op);
+        rows.sort_by_key(|row| match row[0] {
+            Value::Int64(v) => v,
+            Value::Null => i64::MAX,
+            ref other => panic!("unexpected key: {other:?}"),
+        });
+
+        assert_eq!(
+            rows,
+            vec![
+                vec![Value::Int64(10), Value::Int64(4)],
+                vec![Value::Null, Value::Int64(2)],
+            ]
+        );
+    }
+
+    #[test]
+    fn hash_agg_cancel_flag_is_observed_across_build_paths() {
+        let pre_cancel = CancelFlag::new();
+        pre_cancel.cancel();
+        let (schema, batch) = make_i64_batch(vec![1_i64], None);
+        let mut op = HashAggregate::new(
+            Box::new(MemTableScan::new(schema, vec![batch])),
+            vec![],
+            vec![count_star_agg()],
+            Schema::new([Field::required("cnt", DataType::Int64)]).expect("schema ok"),
+        )
+        .with_cancel_flag(pre_cancel);
+        assert!(matches!(op.next_batch(), Err(crate::ExecError::Cancelled)));
+
+        let vector_flag = CancelFlag::new();
+        let (schema, batch) = make_i64_batch(vec![1_i64, 2], None);
+        let scan = CancellingScan {
+            schema,
+            batch: Some(batch),
+            flag: vector_flag.clone(),
+        };
+        let mut op = HashAggregate::new(
+            Box::new(scan),
+            vec![],
+            vec![count_star_agg()],
+            Schema::new([Field::required("cnt", DataType::Int64)]).expect("schema ok"),
+        )
+        .with_cancel_flag(vector_flag);
+        assert!(matches!(op.next_batch(), Err(crate::ExecError::Cancelled)));
+
+        let scalar_flag = CancelFlag::new();
+        let schema = schema_group_val();
+        let batch = make_batch_i32_i64(&[(1, 10), (2, 20)]);
+        let scan = CancellingScan {
+            schema,
+            batch: Some(batch),
+            flag: scalar_flag.clone(),
+        };
+        let mut op = HashAggregate::new(
+            Box::new(scan),
+            vec![col("group", 0, DataType::Int32)],
+            vec![count_star_agg()],
+            Schema::new([
+                Field::required("group", DataType::Int32),
+                Field::required("cnt", DataType::Int64),
+            ])
+            .expect("schema ok"),
+        )
+        .with_cancel_flag(scalar_flag);
+        assert!(matches!(op.next_batch(), Err(crate::ExecError::Cancelled)));
+
+        let spill_flag = CancelFlag::new();
+        let schema = schema_group_val();
+        let batch = make_batch_i32_i64(&[(1, 10), (2, 20)]);
+        let scan = CancellingScan {
+            schema,
+            batch: Some(batch),
+            flag: spill_flag.clone(),
+        };
+        let mut op = HashAggregate::new(
+            Box::new(scan),
+            vec![col("group", 0, DataType::Int32)],
+            vec![sum_agg("val", 1)],
+            Schema::new([
+                Field::required("group", DataType::Int32),
+                Field::required("total", DataType::Int64),
+            ])
+            .expect("schema ok"),
+        )
+        .with_work_mem_budget(std::sync::Arc::new(WorkMemBudget::new(1)))
+        .with_cancel_flag(spill_flag);
+        assert!(matches!(op.next_batch(), Err(crate::ExecError::Cancelled)));
+    }
+
+    #[test]
+    fn hash_agg_scalar_identity_and_vectorized_empty_batch_paths() {
+        let schema = schema_group_val();
+        let empty = make_batch_i32_i64(&[]);
+        let scan = MemTableScan::new(schema, vec![empty]);
+        let mut op = HashAggregate::new(
+            Box::new(scan),
+            vec![],
+            vec![count_star_agg()],
+            Schema::new([Field::required("cnt", DataType::Int64)]).expect("schema ok"),
+        );
+        let rows = drain_all(&mut op);
+        assert_eq!(rows, vec![vec![Value::Int64(0)]]);
+
+        let schema = schema_group_val();
+        let scan = MemTableScan::new(schema, vec![]);
+        let mut op = HashAggregate::new(
+            Box::new(scan),
+            vec![],
+            vec![sum_agg("val", 1)],
+            Schema::new([Field::nullable("total", DataType::Int64)]).expect("schema ok"),
+        );
+        op.force_scalar_path();
+        let rows = drain_all(&mut op);
+        assert_eq!(rows, vec![vec![Value::Null]]);
     }
 
     /// Test 3: COUNT(*) over a 100-row batch returns exactly 100 via the

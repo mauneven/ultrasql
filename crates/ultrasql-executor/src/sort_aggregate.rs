@@ -862,9 +862,10 @@ pub(crate) fn finalise_stat(state: &AggState) -> Value {
 #[cfg(test)]
 mod tests {
     use ultrasql_core::{DataType, Field, Schema, Value};
+    use ultrasql_planner::SortKey;
     use ultrasql_planner::{AggregateFunc, LogicalAggregateExpr, ScalarExpr};
     use ultrasql_vec::Batch;
-    use ultrasql_vec::column::{Column, NumericColumn};
+    use ultrasql_vec::column::{BoolColumn, Column, NumericColumn, StringColumn};
 
     use super::{SortAggregate, StatAggFunc, accumulate_stat, finalise_stat, init_stat_state};
     use crate::Operator;
@@ -918,6 +919,56 @@ mod tests {
             name: "group".into(),
             index: 0,
             data_type: DataType::Int32,
+        }
+    }
+
+    fn col(name: &str, index: usize, data_type: DataType) -> ScalarExpr {
+        ScalarExpr::Column {
+            name: name.to_owned(),
+            index,
+            data_type,
+        }
+    }
+
+    fn lit(value: Value, data_type: DataType) -> ScalarExpr {
+        ScalarExpr::Literal { value, data_type }
+    }
+
+    fn agg(
+        func: AggregateFunc,
+        arg: Option<ScalarExpr>,
+        output_name: &str,
+        data_type: DataType,
+    ) -> LogicalAggregateExpr {
+        LogicalAggregateExpr {
+            func,
+            arg,
+            direct_arg: None,
+            order_by: None,
+            distinct: false,
+            output_name: output_name.to_owned(),
+            data_type,
+        }
+    }
+
+    fn percentile_agg(
+        func: AggregateFunc,
+        fraction: Value,
+        order_expr: ScalarExpr,
+        output_name: &str,
+    ) -> LogicalAggregateExpr {
+        LogicalAggregateExpr {
+            func,
+            arg: Some(order_expr.clone()),
+            direct_arg: Some(lit(fraction, DataType::Float64)),
+            order_by: Some(SortKey {
+                expr: order_expr,
+                asc: true,
+                nulls_first: false,
+            }),
+            distinct: false,
+            output_name: output_name.to_owned(),
+            data_type: DataType::Float64,
         }
     }
 
@@ -977,6 +1028,152 @@ mod tests {
         assert!(rows.is_empty());
     }
 
+    #[test]
+    fn sort_agg_accumulates_scalar_collection_and_json_aggregates() {
+        let input_schema = Schema::new([
+            Field::required("group", DataType::Int32),
+            Field::required("val", DataType::Int64),
+            Field::required("flag", DataType::Bool),
+            Field::required("label", DataType::Text { max_len: None }),
+        ])
+        .expect("schema");
+        let batch = Batch::new([
+            Column::Int32(NumericColumn::from_data(vec![1, 1, 2])),
+            Column::Int64(NumericColumn::from_data(vec![10, 20, 5])),
+            Column::Bool(BoolColumn::from_data(vec![true, false, true])),
+            Column::Utf8(StringColumn::from_data(["a", "b", "c"].map(str::to_owned))),
+        ])
+        .expect("batch");
+        let scan = MemTableScan::new(input_schema, vec![batch]);
+        let out_schema = Schema::new([
+            Field::required("group", DataType::Int32),
+            Field::required("sum", DataType::Int64),
+            Field::required("avg", DataType::Float64),
+            Field::required("min", DataType::Text { max_len: None }),
+            Field::required("max", DataType::Int64),
+            Field::required("all", DataType::Bool),
+            Field::required("any", DataType::Bool),
+            Field::required("str", DataType::Text { max_len: None }),
+            Field::required("arr", DataType::Array(Box::new(DataType::Int64))),
+            Field::required("json", DataType::Jsonb),
+        ])
+        .expect("schema");
+        let aggs = vec![
+            agg(
+                AggregateFunc::Sum,
+                Some(col("val", 1, DataType::Int64)),
+                "sum",
+                DataType::Int64,
+            ),
+            agg(
+                AggregateFunc::Avg,
+                Some(col("val", 1, DataType::Int64)),
+                "avg",
+                DataType::Float64,
+            ),
+            agg(
+                AggregateFunc::Min,
+                Some(col("label", 3, DataType::Text { max_len: None })),
+                "min",
+                DataType::Text { max_len: None },
+            ),
+            agg(
+                AggregateFunc::Max,
+                Some(col("val", 1, DataType::Int64)),
+                "max",
+                DataType::Int64,
+            ),
+            agg(
+                AggregateFunc::BoolAnd,
+                Some(col("flag", 2, DataType::Bool)),
+                "all",
+                DataType::Bool,
+            ),
+            agg(
+                AggregateFunc::BoolOr,
+                Some(col("flag", 2, DataType::Bool)),
+                "any",
+                DataType::Bool,
+            ),
+            agg(
+                AggregateFunc::StringAgg,
+                Some(col("label", 3, DataType::Text { max_len: None })),
+                "str",
+                DataType::Text { max_len: None },
+            ),
+            agg(
+                AggregateFunc::ArrayAgg,
+                Some(col("val", 1, DataType::Int64)),
+                "arr",
+                DataType::Array(Box::new(DataType::Int64)),
+            ),
+            agg(
+                AggregateFunc::JsonAgg,
+                Some(col("label", 3, DataType::Text { max_len: None })),
+                "json",
+                DataType::Jsonb,
+            ),
+        ];
+        let mut op = SortAggregate::new(Box::new(scan), vec![col_group()], aggs, out_schema);
+        let rows = drain_all(&mut op);
+
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0][1], Value::Int64(30));
+        assert_eq!(rows[0][2], Value::Float64(15.0));
+        assert_eq!(rows[0][3], Value::Text("a".to_owned()));
+        assert_eq!(rows[0][4], Value::Int64(20));
+        assert_eq!(rows[0][5], Value::Bool(false));
+        assert_eq!(rows[0][6], Value::Bool(true));
+        assert_eq!(rows[0][7], Value::Text("ab".to_owned()));
+        assert_eq!(
+            rows[0][8],
+            Value::Array {
+                element_type: DataType::Int64,
+                elements: vec![Value::Int64(10), Value::Int64(20)],
+            }
+        );
+        assert_eq!(rows[0][9], Value::Jsonb(r#"["a","b"]"#.to_owned()));
+    }
+
+    #[test]
+    fn sort_agg_percentiles_reject_bad_fraction_and_pick_disc_value() {
+        let scan = MemTableScan::new(
+            schema_group_val(),
+            vec![make_batch(&[(1, 10), (1, 20), (1, 30), (1, 40)])],
+        );
+        let out_schema = Schema::new([
+            Field::required("group", DataType::Int32),
+            Field::required("pdisc", DataType::Int64),
+        ])
+        .expect("schema");
+        let aggs = vec![percentile_agg(
+            AggregateFunc::PercentileDisc,
+            Value::Float64(0.5),
+            col("val", 1, DataType::Int64),
+            "pdisc",
+        )];
+        let mut op = SortAggregate::new(Box::new(scan), vec![col_group()], aggs, out_schema);
+        let rows = drain_all(&mut op);
+        assert_eq!(rows[0][1], Value::Int64(20));
+
+        let bad_scan = MemTableScan::new(schema_group_val(), vec![make_batch(&[(1, 10)])]);
+        let bad_schema = Schema::new([
+            Field::required("group", DataType::Int32),
+            Field::required("pcont", DataType::Float64),
+        ])
+        .expect("schema");
+        let bad_aggs = vec![percentile_agg(
+            AggregateFunc::PercentileCont,
+            Value::Float64(1.5),
+            col("val", 1, DataType::Int64),
+            "pcont",
+        )];
+        let mut bad =
+            SortAggregate::new(Box::new(bad_scan), vec![col_group()], bad_aggs, bad_schema);
+        let err = bad.next_batch().expect_err("bad fraction");
+        assert!(err.to_string().contains("between 0 and 1"));
+    }
+
     // Statistical aggregate unit tests.
 
     #[test]
@@ -1003,5 +1200,26 @@ mod tests {
         // median of [1,2,3,4,5] = 3.0
         let result = finalise_stat(&state);
         assert_eq!(result, Value::Float64(3.0));
+    }
+
+    #[test]
+    fn stat_helpers_cover_stddev_corr_and_percentile_disc() {
+        let mut stddev = init_stat_state(&StatAggFunc::Stddev);
+        for &x in &[2.0_f64, 4.0, 4.0, 4.0] {
+            accumulate_stat(&mut stddev, x);
+        }
+        let Value::Float64(value) = finalise_stat(&stddev) else {
+            panic!("expected stddev");
+        };
+        assert!((value - 1.0).abs() < 1e-9);
+
+        let corr = init_stat_state(&StatAggFunc::Corr);
+        assert_eq!(finalise_stat(&corr), Value::Null);
+
+        let mut disc = init_stat_state(&StatAggFunc::PercentileDisc(0.75));
+        for &x in &[1.0_f64, 3.0, 2.0, 4.0] {
+            accumulate_stat(&mut disc, x);
+        }
+        assert_eq!(finalise_stat(&disc), Value::Float64(3.0));
     }
 }

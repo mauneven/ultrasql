@@ -201,6 +201,7 @@ async fn scalar_string_functions_return_postgres_shaped_values() {
              sha256('abc'), \
              quote_ident('simple_name'), \
              quote_ident('select'), \
+             quote_literal('O''Reilly'), \
              format('hello %s %I %L %%', 'world', 'odd name', 'O''Reilly'), \
              regexp_replace('abc123abc', '[a-z]+', 'X'), \
              regexp_replace('abc123abc', '[a-z]+', 'X', 'g')",
@@ -230,12 +231,13 @@ async fn scalar_string_functions_return_postgres_shaped_values() {
     );
     assert_eq!(row.get::<_, String>(16), "simple_name");
     assert_eq!(row.get::<_, String>(17), "\"select\"");
+    assert_eq!(row.get::<_, String>(18), "'O''Reilly'");
     assert_eq!(
-        row.get::<_, String>(18),
+        row.get::<_, String>(19),
         "hello world \"odd name\" 'O''Reilly' %"
     );
-    assert_eq!(row.get::<_, String>(19), "X123abc");
-    assert_eq!(row.get::<_, String>(20), "X123X");
+    assert_eq!(row.get::<_, String>(20), "X123abc");
+    assert_eq!(row.get::<_, String>(21), "X123X");
 
     shutdown(running).await;
 }

@@ -1435,9 +1435,8 @@ fn builtin_return_type(func_name: &str, args: &[ScalarExpr]) -> Result<DataType,
         "set_bit" => Ok(DataType::VarBit { max_len: None }),
         "lower" | "upper" | "trim" | "lpad" | "rpad" | "left" | "right" | "substr"
         | "substring" | "replace" | "split_part" | "concat" | "concat_ws" | "repeat"
-        | "reverse" | "md5" | "sha256" | "quote_ident" | "format" | "regexp_replace" => {
-            Ok(DataType::Text { max_len: None })
-        }
+        | "reverse" | "md5" | "sha256" | "quote_ident" | "quote_literal" | "format"
+        | "regexp_replace" => Ok(DataType::Text { max_len: None }),
         "row_to_json" | "json_build_object" | "jsonb_set" => Ok(DataType::Jsonb),
         "jsonb_path_exists"
         | "xml_is_well_formed"
@@ -1569,6 +1568,7 @@ pub(super) fn is_supported_builtin(func_name: &str) -> bool {
             | "md5"
             | "sha256"
             | "quote_ident"
+            | "quote_literal"
             | "format"
             | "regexp_replace"
             | "row_to_json"

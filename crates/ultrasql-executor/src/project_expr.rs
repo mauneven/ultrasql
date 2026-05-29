@@ -492,3 +492,241 @@ const fn dims_compatible(left: Option<u32>, right: Option<u32>) -> bool {
         _ => true,
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use ultrasql_core::{
+        BitString, DataType, Lsn, NetworkValue, Oid, SparseVector, Value, pack_timetz,
+    };
+    use ultrasql_vec::column::Column;
+
+    use super::{build_column, vector_family_value_matches};
+
+    fn assert_i32_values(column: Column, expected: &[i32], null_at: Option<usize>) {
+        let Column::Int32(c) = column else {
+            panic!("expected Int32 column");
+        };
+        assert_eq!(c.data(), expected);
+        if let Some(row) = null_at {
+            assert!(!c.nulls().expect("nulls").get(row));
+        } else {
+            assert!(c.nulls().is_none());
+        }
+    }
+
+    fn assert_i64_values(column: Column, expected: &[i64], null_at: Option<usize>) {
+        let Column::Int64(c) = column else {
+            panic!("expected Int64 column");
+        };
+        assert_eq!(c.data(), expected);
+        if let Some(row) = null_at {
+            assert!(!c.nulls().expect("nulls").get(row));
+        } else {
+            assert!(c.nulls().is_none());
+        }
+    }
+
+    fn assert_text_values(column: Column, expected: &[Option<&str>]) {
+        assert_eq!(column.len(), expected.len());
+        for (row, expected_value) in expected.iter().enumerate() {
+            assert_eq!(column.text_value(row), *expected_value);
+        }
+    }
+
+    #[test]
+    fn build_column_covers_numeric_bool_temporal_and_oid_families() {
+        let bool_col = build_column(
+            &DataType::Bool,
+            vec![Value::Bool(true), Value::Null, Value::Bool(false)],
+        )
+        .expect("bool column");
+        let Column::Bool(c) = bool_col else {
+            panic!("expected bool column");
+        };
+        assert_eq!(c.data(), &[1, 0, 0]);
+        assert!(!c.nulls().expect("nulls").get(1));
+
+        assert_i32_values(
+            build_column(&DataType::Int16, vec![Value::Int16(7), Value::Null]).expect("int16"),
+            &[7, 0],
+            Some(1),
+        );
+        assert_i32_values(
+            build_column(&DataType::Int32, vec![Value::Int32(11), Value::Int32(12)])
+                .expect("int32"),
+            &[11, 12],
+            None,
+        );
+        assert_i64_values(
+            build_column(&DataType::Int64, vec![Value::Int64(9), Value::Null]).expect("int64"),
+            &[9, 0],
+            Some(1),
+        );
+        assert_i64_values(
+            build_column(
+                &DataType::TimeTz,
+                vec![
+                    Value::TimeTz {
+                        micros: 12_345,
+                        offset_seconds: -18_000,
+                    },
+                    Value::Null,
+                ],
+            )
+            .expect("timetz"),
+            &[pack_timetz(12_345, -18_000).expect("packed"), 0],
+            Some(1),
+        );
+        assert_i32_values(
+            build_column(&DataType::Date, vec![Value::Date(42)]).expect("date"),
+            &[42],
+            None,
+        );
+        assert_i64_values(
+            build_column(
+                &DataType::Decimal {
+                    precision: Some(10),
+                    scale: Some(2),
+                },
+                vec![Value::Decimal {
+                    value: 1234,
+                    scale: 2,
+                }],
+            )
+            .expect("decimal"),
+            &[1234],
+            None,
+        );
+        assert_i64_values(
+            build_column(&DataType::Money, vec![Value::Money(999)]).expect("money"),
+            &[999],
+            None,
+        );
+        assert_i64_values(
+            build_column(
+                &DataType::RegClass,
+                vec![Value::RegClass(Oid::new(77)), Value::Null],
+            )
+            .expect("regclass"),
+            &[77, 0],
+            Some(1),
+        );
+    }
+
+    #[test]
+    fn build_column_covers_textual_json_vector_array_uuid_and_bytea_families() {
+        assert_text_values(
+            build_column(
+                &DataType::Enum {
+                    oid: Oid::new(5000),
+                    name: Arc::from("mood"),
+                    labels: Arc::from([String::from("ok")]),
+                },
+                vec![Value::Text("ok".to_owned()), Value::Null],
+            )
+            .expect("enum"),
+            &[Some("ok"), None],
+        );
+        assert_text_values(
+            build_column(
+                &DataType::Bit { len: Some(4) },
+                vec![Value::BitString(BitString::parse("1010").expect("bits"))],
+            )
+            .expect("bit"),
+            &[Some("1010")],
+        );
+        assert_text_values(
+            build_column(
+                &DataType::Inet,
+                vec![Value::Network(
+                    NetworkValue::parse_for_type(&DataType::Inet, "127.0.0.1").expect("inet"),
+                )],
+            )
+            .expect("inet"),
+            &[Some("127.0.0.1")],
+        );
+        assert_text_values(
+            build_column(
+                &DataType::PgLsn,
+                vec![Value::PgLsn(Lsn::new(0x16_B374_D848))],
+            )
+            .expect("pg_lsn"),
+            &[Some("16/B374D848")],
+        );
+        assert_text_values(
+            build_column(
+                &DataType::Jsonb,
+                vec![Value::Jsonb("{\"a\":1}".to_owned()), Value::Null],
+            )
+            .expect("jsonb"),
+            &[Some("{\"a\":1}"), None],
+        );
+        assert_text_values(
+            build_column(
+                &DataType::Vector { dims: Some(2) },
+                vec![Value::Vector(vec![1.0, 2.0])],
+            )
+            .expect("vector"),
+            &[Some("[1,2]")],
+        );
+        assert_text_values(
+            build_column(
+                &DataType::SparseVec { dims: Some(4) },
+                vec![Value::SparseVec(
+                    SparseVector::new(4, vec![(1, 1.5)]).expect("sparse"),
+                )],
+            )
+            .expect("sparsevec"),
+            &[Some("{1:1.5}/4")],
+        );
+        assert_text_values(
+            build_column(
+                &DataType::Array(Box::new(DataType::Int32)),
+                vec![Value::Array {
+                    element_type: DataType::Int32,
+                    elements: vec![Value::Int32(1), Value::Int32(2)],
+                }],
+            )
+            .expect("array"),
+            &[Some("{1,2}")],
+        );
+        assert_text_values(
+            build_column(&DataType::Uuid, vec![Value::Uuid([1; 16])]).expect("uuid"),
+            &[Some("01010101-0101-0101-0101-010101010101")],
+        );
+        assert_text_values(
+            build_column(&DataType::Bytea, vec![Value::Bytea(vec![0xde, 0xad])]).expect("bytea"),
+            &[Some("\\xdead")],
+        );
+        assert_i32_values(
+            build_column(&DataType::Null, vec![Value::Null, Value::Null]).expect("null"),
+            &[0, 0],
+            Some(0),
+        );
+    }
+
+    #[test]
+    fn build_column_rejects_type_mismatch_and_bad_vector_dimensions() {
+        let err = build_column(&DataType::Int32, vec![Value::Text("x".to_owned())])
+            .expect_err("type mismatch");
+        assert!(err.to_string().contains("expected Int32"));
+
+        let err = build_column(
+            &DataType::Vector { dims: Some(3) },
+            vec![Value::Vector(vec![1.0, 2.0])],
+        )
+        .expect_err("dimension mismatch");
+        assert!(err.to_string().contains("expected Vector"));
+
+        assert!(vector_family_value_matches(
+            &DataType::HalfVec { dims: Some(2) },
+            &Value::HalfVec(vec![1.0, 2.0])
+        ));
+        assert!(!vector_family_value_matches(
+            &DataType::HalfVec { dims: Some(3) },
+            &Value::HalfVec(vec![1.0, 2.0])
+        ));
+    }
+}

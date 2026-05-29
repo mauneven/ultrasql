@@ -92,6 +92,14 @@ as a concise evidence ledger; roadmap stays for open gates only.
   preservation. Package `cargo llvm-cov` plus
   `scripts/coverage_gate.py --min-lines 80` clears `ultrasql-server` at
   80.06%. Evidence: `docs/testing/coverage-evidence-2026-05-29-server.md`.
+- Focused `ultrasql-executor` coverage now exercises scalar compatibility
+  functions, physical lowering edge families, row encoding/decoding,
+  projection/filter/sort/unique/set/window/hash aggregate behavior, modify-table
+  constraints/index maintenance, and executor profile paths. This also fixed
+  non-contiguous window partition grouping, BOOL builder NULL preservation, and
+  INTERVAL row-codec coverage. Package `cargo llvm-cov` plus
+  `scripts/coverage_gate.py --min-lines 80` clears `ultrasql-executor` at
+  80.24%. Evidence: `docs/testing/coverage-evidence-2026-05-29-executor.md`.
 - Driver-certification CI was repaired, action runtimes refreshed, and release
   workflows validated on `main`.
 - Chaos testing: random kill, WAL truncation, disk full recovery is implemented

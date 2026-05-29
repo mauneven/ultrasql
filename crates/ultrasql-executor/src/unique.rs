@@ -457,11 +457,17 @@ fn rows_equal_for_distinct(a: &[Value], b: &[Value]) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use ultrasql_core::{DataType, Field, Schema, Value};
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+
+    use ultrasql_core::{
+        BitString, DataType, Field, GeometryType, GeometryValue, Lsn, NetworkValue, Oid, RangeType,
+        RangeValue, Schema, SparseVector, Value,
+    };
     use ultrasql_vec::Batch;
     use ultrasql_vec::column::{Column, NumericColumn};
 
-    use super::{Unique, UniqueMode};
+    use super::{KeyValue, RowKey, Unique, UniqueMode, rows_equal_for_distinct};
     use crate::Operator;
     use crate::filter_op::batch_to_rows;
     use crate::mem_table_scan::MemTableScan;
@@ -488,6 +494,12 @@ mod tests {
         out
     }
 
+    fn key_hash(value: Value) -> u64 {
+        let mut hasher = DefaultHasher::new();
+        KeyValue(value).hash(&mut hasher);
+        hasher.finish()
+    }
+
     #[test]
     fn unique_hash_deduplicates_unordered_input() {
         let scan = MemTableScan::new(schema_i32(), vec![i32_batch(&[3, 1, 2, 1, 3, 2, 1])]);
@@ -510,5 +522,149 @@ mod tests {
         let scan = MemTableScan::new(schema_i32(), vec![]);
         let mut op = Unique::new(Box::new(scan), UniqueMode::Hash);
         assert!(op.next_batch().expect("ok").is_none());
+    }
+
+    #[test]
+    fn unique_hash_fast_paths_cover_nulls_and_i64_type_errors() {
+        let mut valid = ultrasql_vec::Bitmap::new(5, true);
+        valid.set(1, false);
+        valid.set(3, false);
+        let scan = MemTableScan::new(
+            Schema::new([Field::required("v", DataType::Int64)]).expect("schema"),
+            vec![
+                Batch::new([Column::Int64(
+                    NumericColumn::with_nulls(vec![7, 0, 7, 0, 9], valid)
+                        .expect("matching lengths"),
+                )])
+                .expect("batch"),
+            ],
+        );
+        let mut op = Unique::new(Box::new(scan), UniqueMode::Hash);
+        let rows = drain_all(&mut op);
+        assert_eq!(rows.len(), 3);
+        assert!(rows.iter().any(|row| row[0] == Value::Null));
+        assert!(rows.iter().any(|row| row[0] == Value::Int64(7)));
+        assert!(rows.iter().any(|row| row[0] == Value::Int64(9)));
+
+        let bad_scan = MemTableScan::new(
+            Schema::new([Field::required("v", DataType::Int64)]).expect("schema"),
+            vec![i32_batch(&[1])],
+        );
+        let mut bad = Unique::new(Box::new(bad_scan), UniqueMode::Hash);
+        let err = bad.next_batch().expect_err("type mismatch");
+        assert!(err.to_string().contains("does not match Int64 schema"));
+    }
+
+    #[test]
+    fn distinct_row_keys_hash_supported_value_families() {
+        let values = vec![
+            Value::Null,
+            Value::Bool(true),
+            Value::Int16(7),
+            Value::Int32(8),
+            Value::Int64(9),
+            Value::Money(1234),
+            Value::Oid(Oid::new(10)),
+            Value::RegClass(Oid::new(11)),
+            Value::RegType(Oid::new(12)),
+            Value::PgLsn(Lsn::new(0x1_0000_0002)),
+            Value::Float32(-0.0),
+            Value::Float64(f64::NAN),
+            Value::Text("text".to_owned()),
+            Value::Char("x   ".to_owned()),
+            Value::Json(r#"{"a":1}"#.to_owned()),
+            Value::Jsonb(r#"{"a":1}"#.to_owned()),
+            Value::Xml("<x/>".to_owned()),
+            Value::Bytea(vec![1, 2, 3]),
+            Value::Timestamp(1),
+            Value::TimestampTz(2),
+            Value::Time(3),
+            Value::TimeTz {
+                micros: 4,
+                offset_seconds: 3600,
+            },
+            Value::Date(5),
+            Value::Uuid([6; 16]),
+            Value::Decimal {
+                value: 12345,
+                scale: 2,
+            },
+            Value::Interval {
+                months: 1,
+                days: 2,
+                microseconds: 3,
+            },
+            Value::Range(RangeValue::parse(RangeType::Int4, "[1,4)").expect("range")),
+            Value::Geometry(GeometryValue::parse(GeometryType::Point, "(1,2)").expect("geometry")),
+            Value::Array {
+                element_type: DataType::Int32,
+                elements: vec![Value::Int32(1), Value::Null],
+            },
+            Value::Vector(vec![1.0, -0.0]),
+            Value::HalfVec(vec![1.0, 2.0]),
+            Value::SparseVec(SparseVector::new(8, vec![(2, 1.5)]).expect("sparse")),
+            Value::BitVec {
+                dims: 8,
+                bytes: vec![0b1010_0000],
+            },
+            Value::BitString(BitString::parse("1010").expect("bits")),
+            Value::Network(
+                NetworkValue::parse_for_type(&DataType::Inet, "127.0.0.1").expect("inet"),
+            ),
+            Value::Record(vec![("a".to_owned(), Value::Int32(1))]),
+        ];
+
+        for value in values {
+            let first = key_hash(value.clone());
+            let second = key_hash(value);
+            assert_eq!(first, second);
+        }
+
+        assert_eq!(
+            KeyValue(Value::Float32(f32::NAN)),
+            KeyValue(Value::Float32(f32::NAN))
+        );
+        assert_eq!(
+            KeyValue(Value::Float64(-0.0)),
+            KeyValue(Value::Float64(-0.0))
+        );
+        assert_ne!(
+            KeyValue(Value::Float64(-0.0)),
+            KeyValue(Value::Float64(0.0))
+        );
+        assert_eq!(
+            KeyValue(Value::Char("x".to_owned())),
+            KeyValue(Value::Char("x   ".to_owned()))
+        );
+
+        let row_a = RowKey::from_row(&[Value::Null, Value::Int32(1)]);
+        let row_b = RowKey::from_row(&[Value::Null, Value::Int32(1)]);
+        assert_eq!(row_a, row_b);
+    }
+
+    #[test]
+    fn distinct_sort_row_equality_handles_nulls_floats_and_widths() {
+        assert!(rows_equal_for_distinct(&[Value::Null], &[Value::Null]));
+        assert!(rows_equal_for_distinct(
+            &[Value::Float32(f32::NAN)],
+            &[Value::Float32(f32::NAN)]
+        ));
+        assert!(!rows_equal_for_distinct(
+            &[Value::Float64(-0.0)],
+            &[Value::Float64(0.0)]
+        ));
+        assert!(!rows_equal_for_distinct(
+            &[Value::Int32(1)],
+            &[Value::Int32(1), Value::Int32(2)]
+        ));
+    }
+
+    fn drain_all(op: &mut dyn Operator) -> Vec<Vec<Value>> {
+        let schema = op.schema().clone();
+        let mut out = Vec::new();
+        while let Some(b) = op.next_batch().expect("ok") {
+            out.extend(batch_to_rows(&b, &schema).expect("decode"));
+        }
+        out
     }
 }

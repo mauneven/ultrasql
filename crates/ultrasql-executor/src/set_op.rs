@@ -429,12 +429,17 @@ impl SetOp {
 
 #[cfg(test)]
 mod tests {
-    use ultrasql_core::{DataType, Field, Schema, Value};
+    use std::collections::HashSet;
+
+    use ultrasql_core::{
+        BitString, DataType, Field, GeometryType, GeometryValue, Lsn, NetworkValue, Oid, RangeType,
+        RangeValue, Schema, SparseVector, Value,
+    };
     use ultrasql_planner::{LogicalSetOp, LogicalSetQuantifier};
     use ultrasql_vec::Batch;
     use ultrasql_vec::column::{Column, NumericColumn};
 
-    use super::SetOp;
+    use super::{RowKey, SetOp};
     use crate::Operator;
     use crate::filter_op::batch_to_rows;
     use crate::mem_table_scan::MemTableScan;
@@ -536,5 +541,108 @@ mod tests {
         );
         let vals = drain_sorted(&mut op);
         assert_eq!(vals, vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn intersect_all_respects_duplicate_counts_and_eof() {
+        let left = MemTableScan::new(schema_i32(), vec![i32_batch(&[1, 2, 2, 2, 3])]);
+        let right = MemTableScan::new(schema_i32(), vec![i32_batch(&[2, 2, 4])]);
+        let mut op = SetOp::new(
+            Box::new(left),
+            Box::new(right),
+            LogicalSetOp::Intersect,
+            LogicalSetQuantifier::All,
+            schema_i32(),
+        );
+        assert_eq!(drain_sorted(&mut op), vec![2, 2]);
+        assert!(op.next_batch().expect("eof").is_none());
+    }
+
+    #[test]
+    fn row_key_hashes_supported_value_families_with_null_equal_semantics() {
+        let values = vec![
+            Value::Null,
+            Value::Bool(true),
+            Value::Int16(1),
+            Value::Int32(2),
+            Value::Int64(3),
+            Value::Money(4),
+            Value::Oid(Oid::new(5)),
+            Value::RegClass(Oid::new(6)),
+            Value::RegType(Oid::new(7)),
+            Value::PgLsn(Lsn::new(8)),
+            Value::Float32(f32::from_bits(0x7fc0_0001)),
+            Value::Float64(f64::from_bits(0x7ff8_0000_0000_0001)),
+            Value::Text("text".into()),
+            Value::Char("bpchar  ".into()),
+            Value::Json(r#"{"a":1}"#.into()),
+            Value::Jsonb(r#"{"a":1}"#.into()),
+            Value::Xml("<r/>".into()),
+            Value::Bytea(vec![0, 1, 255]),
+            Value::Timestamp(9),
+            Value::TimestampTz(10),
+            Value::Time(11),
+            Value::TimeTz {
+                micros: 12,
+                offset_seconds: 3_600,
+            },
+            Value::Date(13),
+            Value::Uuid([14; 16]),
+            Value::Decimal {
+                value: 15,
+                scale: 2,
+            },
+            Value::Interval {
+                months: 1,
+                days: 2,
+                microseconds: 3,
+            },
+            Value::Range(RangeValue::parse(RangeType::Int4, "[1,3)").expect("range")),
+            Value::Geometry(GeometryValue::parse(GeometryType::Box, "((0,0),(1,1))").expect("box")),
+            Value::Array {
+                element_type: DataType::Int32,
+                elements: vec![Value::Int32(1), Value::Null],
+            },
+            Value::Vector(vec![1.0, f32::NAN]),
+            Value::HalfVec(vec![2.0, f32::NAN]),
+            Value::SparseVec(SparseVector {
+                dims: 4,
+                entries: vec![(2, 1.5)],
+            }),
+            Value::BitVec {
+                dims: 9,
+                bytes: vec![0b1010_0000, 0b1000_0000],
+            },
+            Value::BitString(BitString::parse("10101").expect("bits")),
+            Value::Network(
+                NetworkValue::parse_for_type(&DataType::Inet, "127.0.0.1").expect("inet"),
+            ),
+            Value::Record(vec![("x".into(), Value::Int32(1))]),
+        ];
+
+        let key = RowKey::from_row(&values);
+        let clone = RowKey::from_row(&values);
+        let mut seen = HashSet::new();
+        assert!(seen.insert(key));
+        assert!(!seen.insert(clone));
+
+        assert_eq!(
+            RowKey::from_row(&[Value::Null]),
+            RowKey::from_row(&[Value::Null])
+        );
+        assert_eq!(
+            RowKey::from_row(&[Value::Char("a".into())]),
+            RowKey::from_row(&[Value::Char("a   ".into())])
+        );
+        assert_eq!(
+            RowKey::from_row(&[Value::TimeTz {
+                micros: 3_600_000_000,
+                offset_seconds: 3_600,
+            }]),
+            RowKey::from_row(&[Value::TimeTz {
+                micros: 0,
+                offset_seconds: 0,
+            }])
+        );
     }
 }

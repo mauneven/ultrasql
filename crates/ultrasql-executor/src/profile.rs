@@ -152,3 +152,107 @@ fn estimate_column_memory(column: &Column) -> usize {
 fn bitmap_bytes(bitmap: Option<&ultrasql_vec::Bitmap>) -> usize {
     bitmap.map_or(0, |bits| bits.len().div_ceil(8))
 }
+
+#[cfg(test)]
+mod tests {
+    use ultrasql_core::{DataType, Field, Schema};
+    use ultrasql_vec::Batch;
+    use ultrasql_vec::bitmap::Bitmap;
+    use ultrasql_vec::column::{BoolColumn, Column, NumericColumn, StringColumn};
+
+    use super::{OperatorSpillProfile, ProfiledOperator};
+    use crate::{ExecError, Operator};
+
+    #[derive(Debug)]
+    struct StaticOperator {
+        schema: Schema,
+        batches: Vec<Batch>,
+        spill: OperatorSpillProfile,
+        io_bytes: u64,
+        pruning: Vec<String>,
+    }
+
+    impl StaticOperator {
+        fn new(batches: Vec<Batch>) -> Self {
+            Self {
+                schema: Schema::new([
+                    Field::required("i", DataType::Int32),
+                    Field::required("b", DataType::Bool),
+                    Field::required("s", DataType::Text { max_len: None }),
+                ])
+                .expect("schema ok"),
+                batches,
+                spill: OperatorSpillProfile {
+                    spills: 2,
+                    bytes: 128,
+                },
+                io_bytes: 256,
+                pruning: vec!["row_groups=1/4".to_owned()],
+            }
+        }
+    }
+
+    impl Operator for StaticOperator {
+        fn next_batch(&mut self) -> Result<Option<Batch>, ExecError> {
+            if self.batches.is_empty() {
+                return Ok(None);
+            }
+            Ok(Some(self.batches.remove(0)))
+        }
+
+        fn schema(&self) -> &Schema {
+            &self.schema
+        }
+
+        fn estimated_row_count(&self) -> Option<usize> {
+            Some(7)
+        }
+
+        fn spill_profile(&self) -> OperatorSpillProfile {
+            self.spill
+        }
+
+        fn io_bytes(&self) -> u64 {
+            self.io_bytes
+        }
+
+        fn pruning_stats(&self) -> Vec<String> {
+            self.pruning.clone()
+        }
+    }
+
+    fn profiled_batch() -> Batch {
+        let mut nulls = Bitmap::new(3, true);
+        nulls.set(1, false);
+        Batch::new([
+            Column::Int32(NumericColumn::from_data(vec![1, 2, 3])),
+            Column::Bool(BoolColumn::with_nulls(vec![true, false, true], nulls).expect("bool")),
+            Column::Utf8(
+                StringColumn::from_parts(vec![0, 2, 2, 5], b"abxyz".to_vec(), None)
+                    .expect("strings"),
+            ),
+        ])
+        .expect("batch ok")
+    }
+
+    #[test]
+    fn profiled_operator_tracks_rows_batches_memory_and_child_stats() {
+        let child = StaticOperator::new(vec![profiled_batch()]);
+        let mut op = ProfiledOperator::new("Static", Box::new(child));
+
+        assert_eq!(op.estimated_row_count(), Some(7));
+        assert!(op.next_batch().expect("first batch").is_some());
+        assert!(op.next_batch().expect("eof").is_none());
+
+        let profile = op.runtime_profile().expect("profile");
+        assert_eq!(profile.operator, "Static");
+        assert_eq!(profile.rows_out, 3);
+        assert_eq!(profile.batches, 1);
+        assert!(profile.time_us < u64::MAX);
+        assert!(profile.memory_bytes > 0);
+        assert_eq!(profile.spills, 2);
+        assert_eq!(profile.spill_bytes, 128);
+        assert_eq!(profile.io_bytes, 256);
+        assert_eq!(profile.pruning, vec!["row_groups=1/4"]);
+    }
+}

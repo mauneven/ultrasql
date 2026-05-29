@@ -719,9 +719,11 @@ fn build_project(
 #[cfg(test)]
 mod tests {
     use ultrasql_core::{DataType, Field, Schema, Value};
+    use ultrasql_planner::plan::{LockStrength, LockWaitPolicy};
     use ultrasql_planner::{
-        AggregateFunc, BinaryOp, LogicalAggregateExpr, LogicalJoinCondition, LogicalJoinType,
-        LogicalPlan, LogicalSetOp, LogicalSetQuantifier, ScalarExpr, SortKey,
+        AggregateFunc, BinaryOp, CopyDirection, CopyFormat, CopySource, ExplainFormat,
+        LogicalAggregateExpr, LogicalJoinCondition, LogicalJoinType, LogicalPlan, LogicalSetOp,
+        LogicalSetQuantifier, LogicalWindowFunc, ScalarExpr, SortKey,
     };
     use ultrasql_vec::Batch;
     use ultrasql_vec::column::{Column, NumericColumn};
@@ -945,6 +947,19 @@ mod tests {
         }
     }
 
+    fn empty_schema() -> Schema {
+        Schema::empty()
+    }
+
+    fn window_schema(data_type: DataType) -> Schema {
+        Schema::new([
+            Field::required("id", DataType::Int32),
+            Field::required("val", DataType::Int64),
+            Field::required("win", data_type),
+        ])
+        .expect("window schema ok")
+    }
+
     #[test]
     fn scan_emits_every_batch_from_data_source() {
         let src = StaticSource::with_users();
@@ -1133,6 +1148,205 @@ mod tests {
         let mut op = build_operator(&plan, &src).expect("set op builds");
         let rows = drain_id_val(&mut *op);
         assert_eq!(rows.len(), 12, "UNION ALL doubles the 6 rows");
+    }
+
+    #[test]
+    fn values_lock_rows_cte_and_window_lowers_execute() {
+        let values_schema =
+            Schema::new([Field::required("column1", DataType::Int32)]).expect("schema");
+        let values_plan = LogicalPlan::Values {
+            rows: vec![vec![lit_i32(1)], vec![lit_i32(2)]],
+            schema: values_schema,
+        };
+        let src = StaticSource::new();
+        let mut values = build_operator(&values_plan, &src).expect("values builds");
+        assert_eq!(drain_i32(&mut *values), vec![1, 2]);
+
+        let src = StaticSource::with_users();
+        let lock_plan = LogicalPlan::LockRows {
+            input: Box::new(scan_plan()),
+            strength: LockStrength::Update,
+            wait_policy: LockWaitPolicy::Wait,
+            schema: users_schema(),
+        };
+        let mut locked = build_operator(&lock_plan, &src).expect("lock rows builds");
+        assert_eq!(drain_id_val(&mut *locked).len(), 6);
+
+        let cte_plan = LogicalPlan::Cte {
+            name: "u".into(),
+            recursive: false,
+            definition: Box::new(scan_plan()),
+            body: Box::new(LogicalPlan::Empty {
+                schema: users_schema(),
+            }),
+            schema: users_schema(),
+        };
+        let mut cte = build_operator(&cte_plan, &src).expect("cte builds");
+        assert_eq!(drain_id_val(&mut *cte).len(), 6);
+
+        let window_plan = LogicalPlan::Window {
+            input: Box::new(scan_plan()),
+            partition_by: vec![],
+            order_by: vec![SortKey {
+                expr: col_id(),
+                asc: true,
+                nulls_first: false,
+            }],
+            func: LogicalWindowFunc::RowNumber,
+            output_name: "rn".into(),
+            schema: window_schema(DataType::Int64),
+        };
+        let mut window = build_operator(&window_plan, &src).expect("window builds");
+        let mut rows = Vec::new();
+        while let Some(batch) = window.next_batch().expect("window executes") {
+            rows.extend(crate::filter_op::batch_to_rows(&batch, window.schema()).expect("decode"));
+        }
+        assert_eq!(rows.len(), 6);
+        assert!(matches!(rows[0][2], Value::Int64(_)));
+    }
+
+    #[test]
+    fn window_lowerer_maps_every_window_function_variant() {
+        let funcs = vec![
+            (LogicalWindowFunc::RowNumber, DataType::Int64),
+            (LogicalWindowFunc::Rank, DataType::Int64),
+            (LogicalWindowFunc::DenseRank, DataType::Int64),
+            (
+                LogicalWindowFunc::Lag {
+                    expr: col_id(),
+                    offset: 1,
+                    default: Value::Int32(-1),
+                },
+                DataType::Int32,
+            ),
+            (
+                LogicalWindowFunc::Lead {
+                    expr: col_id(),
+                    offset: 1,
+                    default: Value::Int32(-1),
+                },
+                DataType::Int32,
+            ),
+            (LogicalWindowFunc::FirstValue(col_id()), DataType::Int32),
+            (LogicalWindowFunc::LastValue(col_id()), DataType::Int32),
+            (
+                LogicalWindowFunc::NthValue {
+                    expr: col_id(),
+                    n: 2,
+                },
+                DataType::Int32,
+            ),
+            (LogicalWindowFunc::Ntile(4), DataType::Int64),
+        ];
+        let src = StaticSource::with_users();
+
+        for (func, data_type) in funcs {
+            let plan = LogicalPlan::Window {
+                input: Box::new(scan_plan()),
+                partition_by: vec![],
+                order_by: vec![SortKey {
+                    expr: col_id(),
+                    asc: true,
+                    nulls_first: false,
+                }],
+                func,
+                output_name: "win".into(),
+                schema: window_schema(data_type),
+            };
+            let op = build_operator(&plan, &src).expect("window variant builds");
+            assert_eq!(op.schema().field_at(2).name, "win");
+        }
+    }
+
+    #[test]
+    fn unsupported_statement_groups_return_stable_build_errors() {
+        let src = StaticSource::new();
+        let plans = vec![
+            LogicalPlan::Insert {
+                table: "users".into(),
+                columns: vec![],
+                source: Box::new(LogicalPlan::Empty {
+                    schema: empty_schema(),
+                }),
+                on_conflict: None,
+                returning: vec![],
+                schema: empty_schema(),
+            },
+            LogicalPlan::Update {
+                table: "users".into(),
+                assignments: vec![],
+                input: Box::new(LogicalPlan::Empty {
+                    schema: empty_schema(),
+                }),
+                returning: vec![],
+                schema: empty_schema(),
+            },
+            LogicalPlan::Delete {
+                table: "users".into(),
+                input: Box::new(LogicalPlan::Empty {
+                    schema: empty_schema(),
+                }),
+                returning: vec![],
+                schema: empty_schema(),
+            },
+            LogicalPlan::Truncate {
+                tables: vec!["users".into()],
+                restart_identity: false,
+                cascade: false,
+                schema: empty_schema(),
+            },
+            LogicalPlan::DropTable {
+                tables: vec!["users".into()],
+                if_exists: true,
+                cascade: false,
+                schema: empty_schema(),
+            },
+            LogicalPlan::Begin {
+                isolation_level: None,
+                schema: empty_schema(),
+            },
+            LogicalPlan::Listen {
+                channel: "events".into(),
+                schema: empty_schema(),
+            },
+            LogicalPlan::Explain {
+                analyze: false,
+                format: ExplainFormat::Text,
+                input: Box::new(scan_plan()),
+                schema: Schema::new([Field::nullable(
+                    "QUERY PLAN",
+                    DataType::Text { max_len: None },
+                )])
+                .expect("schema"),
+            },
+            LogicalPlan::Copy {
+                relation: Some("users".into()),
+                input: None,
+                columns: vec![],
+                direction: CopyDirection::To,
+                source: CopySource::Stdout,
+                format: CopyFormat::Text,
+                delimiter: '\t',
+                null_str: "\\N".into(),
+                header: false,
+                auto_detect: false,
+                ignore_errors: false,
+                max_errors: 0,
+                reject_table: None,
+                schema: users_schema(),
+            },
+            LogicalPlan::FunctionScan {
+                name: "generate_series".into(),
+                args: vec![lit_i32(1), lit_i32(2)],
+                schema: Schema::new([Field::required("generate_series", DataType::Int32)])
+                    .expect("schema"),
+            },
+        ];
+
+        for plan in plans {
+            let err = build_operator(&plan, &src).expect_err("statement group unsupported");
+            assert!(matches!(err, BuildError::Unsupported(_)), "got {err:?}");
+        }
     }
 
     #[test]

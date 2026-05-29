@@ -31,7 +31,7 @@
 
 #![allow(clippy::cast_possible_wrap)]
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::thread;
 
 use ultrasql_core::{Schema, Value};
@@ -401,33 +401,23 @@ impl WindowAgg {
             vec![(0..n_total).collect()]
         } else {
             let key_count = self.partition_key_evals.len();
-            let mut keys: Vec<Value> = Vec::with_capacity(n_total * key_count);
-            for row in &all_rows {
-                for kv in &self.partition_key_evals {
-                    keys.push(kv.eval(row).unwrap_or(Value::Null));
-                }
-            }
-            let key_slice = |i: usize| -> &[Value] {
-                let lo = i * key_count;
-                &keys[lo..lo + key_count]
-            };
             let mut parts: Vec<Vec<usize>> = Vec::new();
-            let mut current: Vec<usize> = Vec::new();
-            let mut current_key_start: Option<usize> = None;
-            for idx in 0..n_total {
-                let same = current_key_start
-                    .map(|s| keys_equal(&keys[s..s + key_count], key_slice(idx)))
-                    .unwrap_or(false);
-                if !same {
-                    if !current.is_empty() {
-                        parts.push(std::mem::take(&mut current));
-                    }
-                    current_key_start = Some(idx * key_count);
+            let mut part_by_key: HashMap<Vec<Value>, usize> = HashMap::new();
+            for (idx, row) in all_rows.iter().enumerate() {
+                let mut key: Vec<Value> = Vec::with_capacity(key_count);
+                for kv in &self.partition_key_evals {
+                    key.push(kv.eval(row).unwrap_or(Value::Null));
                 }
-                current.push(idx);
-            }
-            if !current.is_empty() {
-                parts.push(current);
+                let part_idx = match part_by_key.entry(key) {
+                    std::collections::hash_map::Entry::Occupied(entry) => *entry.get(),
+                    std::collections::hash_map::Entry::Vacant(entry) => {
+                        let part_idx = parts.len();
+                        entry.insert(part_idx);
+                        parts.push(Vec::new());
+                        part_idx
+                    }
+                };
+                parts[part_idx].push(idx);
             }
             parts
         };
@@ -599,14 +589,6 @@ impl WindowAgg {
 
         Ok(output)
     }
-}
-
-fn keys_equal(a: &[Value], b: &[Value]) -> bool {
-    a.len() == b.len()
-        && a.iter().zip(b.iter()).all(|(av, bv)| match (av, bv) {
-            (Value::Null, Value::Null) => true,
-            _ => av == bv,
-        })
 }
 
 /// `true` iff `keys` is monotonically non-decreasing.
@@ -864,6 +846,7 @@ mod tests {
     use ultrasql_core::{DataType, Field, Schema, Value};
     use ultrasql_planner::ScalarExpr;
     use ultrasql_vec::Batch;
+    use ultrasql_vec::bitmap::Bitmap;
     use ultrasql_vec::column::{Column, NumericColumn};
 
     use super::{WindowAgg, WindowFunc};
@@ -888,6 +871,23 @@ mod tests {
         .expect("ok")
     }
 
+    fn schema_id_val_i64() -> Schema {
+        Schema::new([
+            Field::required("id", DataType::Int32),
+            Field::required("val", DataType::Int64),
+        ])
+        .expect("ok")
+    }
+
+    fn schema_with_value_window(data_type: DataType) -> Schema {
+        Schema::new([
+            Field::required("id", DataType::Int32),
+            Field::required("val", DataType::Int32),
+            Field::required("win", data_type),
+        ])
+        .expect("ok")
+    }
+
     fn make_batch(rows: &[(i32, i32)]) -> Batch {
         Batch::new([
             Column::Int32(NumericColumn::from_data(
@@ -900,10 +900,45 @@ mod tests {
         .expect("ok")
     }
 
+    fn make_batch_i64(rows: &[(i32, i64)], nulls: Option<&[bool]>) -> Batch {
+        let id = Column::Int32(NumericColumn::from_data(
+            rows.iter().map(|(a, _)| *a).collect(),
+        ));
+        let vals: Vec<i64> = rows.iter().map(|(_, b)| *b).collect();
+        let val_col = if let Some(mask) = nulls {
+            let mut bitmap = Bitmap::new(mask.len(), false);
+            for (idx, valid) in mask.iter().copied().enumerate() {
+                if valid {
+                    bitmap.set(idx, true);
+                }
+            }
+            NumericColumn::with_nulls(vals, bitmap).expect("null bitmap matches rows")
+        } else {
+            NumericColumn::from_data(vals)
+        };
+        Batch::new([id, Column::Int64(val_col)]).expect("ok")
+    }
+
     fn col_val() -> ScalarExpr {
         ScalarExpr::Column {
             name: "val".into(),
             index: 1,
+            data_type: DataType::Int32,
+        }
+    }
+
+    fn col_val_i64() -> ScalarExpr {
+        ScalarExpr::Column {
+            name: "val".into(),
+            index: 1,
+            data_type: DataType::Int64,
+        }
+    }
+
+    fn col_id() -> ScalarExpr {
+        ScalarExpr::Column {
+            name: "id".into(),
+            index: 0,
             data_type: DataType::Int32,
         }
     }
@@ -918,6 +953,16 @@ mod tests {
                     out.push(*v);
                 }
             }
+        }
+        out
+    }
+
+    fn drain_window_values(op: &mut dyn Operator) -> Vec<Value> {
+        let schema = op.schema().clone();
+        let mut out = Vec::new();
+        while let Some(b) = op.next_batch().expect("ok") {
+            let rows = batch_to_rows(&b, &schema).expect("decode");
+            out.extend(rows.into_iter().map(|row| row[2].clone()));
         }
         out
     }
@@ -973,6 +1018,255 @@ mod tests {
         );
         let buckets = drain_window_col(&mut op);
         assert_eq!(buckets, vec![1, 1, 2, 2]);
+    }
+
+    #[test]
+    fn window_row_number_partitions_non_contiguous_keys_together() {
+        let scan = MemTableScan::new(
+            schema_id_val(),
+            vec![make_batch(&[(1, 20), (2, 10), (1, 10), (2, 20)])],
+        );
+        let mut op = WindowAgg::new(
+            Box::new(scan),
+            vec![col_id()],
+            vec![col_val()],
+            WindowFunc::RowNumber,
+            schema_with_window(),
+        );
+
+        let rns = drain_window_col(&mut op);
+
+        assert_eq!(rns, vec![2, 1, 1, 2]);
+    }
+
+    #[test]
+    fn window_profile_empty_and_unordered_row_number_paths() {
+        let empty_scan = MemTableScan::new(schema_id_val(), vec![]);
+        let mut empty = WindowAgg::new(
+            Box::new(empty_scan),
+            vec![],
+            vec![col_val()],
+            WindowFunc::RowNumber,
+            schema_with_window(),
+        );
+        assert_eq!(empty.profile_children().len(), 1);
+        assert!(empty.next_batch().expect("empty ok").is_none());
+        assert!(empty.next_batch().expect("eof ok").is_none());
+
+        let scan = MemTableScan::new(schema_id_val(), vec![make_batch(&[(9, 30), (8, 10)])]);
+        let mut unordered = WindowAgg::new(
+            Box::new(scan),
+            vec![],
+            vec![],
+            WindowFunc::RowNumber,
+            schema_with_window(),
+        );
+
+        assert_eq!(drain_window_col(&mut unordered), vec![1, 2]);
+    }
+
+    #[test]
+    fn window_rank_with_ties_uses_gap_semantics() {
+        let scan = MemTableScan::new(
+            schema_id_val(),
+            vec![make_batch(&[(1, 10), (2, 10), (3, 20), (4, 30)])],
+        );
+        let mut op = WindowAgg::new(
+            Box::new(scan),
+            vec![],
+            vec![col_val()],
+            WindowFunc::Rank,
+            schema_with_window(),
+        );
+
+        assert_eq!(drain_window_col(&mut op), vec![1, 1, 3, 4]);
+    }
+
+    #[test]
+    fn window_lag_and_lead_follow_sorted_order_with_defaults() {
+        let schema = schema_with_value_window(DataType::Int32);
+        let rows = vec![make_batch(&[(100, 20), (200, 10), (300, 30)])];
+        let lag_scan = MemTableScan::new(schema_id_val(), rows.clone());
+        let mut lag = WindowAgg::new(
+            Box::new(lag_scan),
+            vec![],
+            vec![col_val()],
+            WindowFunc::Lag {
+                expr: col_id(),
+                offset: 1,
+                default: Value::Int32(-1),
+            },
+            schema.clone(),
+        );
+        assert_eq!(
+            drain_window_values(&mut lag),
+            vec![Value::Int32(200), Value::Int32(-1), Value::Int32(100)]
+        );
+
+        let lead_scan = MemTableScan::new(schema_id_val(), rows);
+        let mut lead = WindowAgg::new(
+            Box::new(lead_scan),
+            vec![],
+            vec![col_val()],
+            WindowFunc::Lead {
+                expr: col_id(),
+                offset: 1,
+                default: Value::Int32(-1),
+            },
+            schema,
+        );
+        assert_eq!(
+            drain_window_values(&mut lead),
+            vec![Value::Int32(300), Value::Int32(100), Value::Int32(-1)]
+        );
+    }
+
+    #[test]
+    fn window_value_functions_use_sorted_partition_values() {
+        let rows = vec![make_batch(&[(100, 20), (200, 10), (300, 30)])];
+        let schema = schema_with_value_window(DataType::Int32);
+
+        let mut first = WindowAgg::new(
+            Box::new(MemTableScan::new(schema_id_val(), rows.clone())),
+            vec![],
+            vec![col_val()],
+            WindowFunc::FirstValue(col_id()),
+            schema.clone(),
+        );
+        assert_eq!(
+            drain_window_values(&mut first),
+            vec![Value::Int32(200), Value::Int32(200), Value::Int32(200)]
+        );
+
+        let mut last = WindowAgg::new(
+            Box::new(MemTableScan::new(schema_id_val(), rows.clone())),
+            vec![],
+            vec![col_val()],
+            WindowFunc::LastValue(col_id()),
+            schema.clone(),
+        );
+        assert_eq!(
+            drain_window_values(&mut last),
+            vec![Value::Int32(300), Value::Int32(300), Value::Int32(300)]
+        );
+
+        let mut second = WindowAgg::new(
+            Box::new(MemTableScan::new(schema_id_val(), rows.clone())),
+            vec![],
+            vec![col_val()],
+            WindowFunc::NthValue {
+                expr: col_id(),
+                n: 2,
+            },
+            schema.clone(),
+        );
+        assert_eq!(
+            drain_window_values(&mut second),
+            vec![Value::Int32(100), Value::Int32(100), Value::Int32(100)]
+        );
+
+        let mut missing = WindowAgg::new(
+            Box::new(MemTableScan::new(schema_id_val(), rows)),
+            vec![],
+            vec![col_val()],
+            WindowFunc::NthValue {
+                expr: col_id(),
+                n: 0,
+            },
+            schema,
+        );
+        assert_eq!(
+            drain_window_values(&mut missing),
+            vec![Value::Null, Value::Null, Value::Null]
+        );
+    }
+
+    #[test]
+    fn window_ntile_zero_and_literal_order_fallback_paths() {
+        let scan = MemTableScan::new(
+            schema_id_val(),
+            vec![make_batch(&[(1, 20), (2, 10), (3, 30)])],
+        );
+        let mut ntile = WindowAgg::new(
+            Box::new(scan),
+            vec![],
+            vec![ScalarExpr::Literal {
+                value: Value::Int32(1),
+                data_type: DataType::Int32,
+            }],
+            WindowFunc::Ntile(0),
+            schema_with_window(),
+        );
+
+        assert_eq!(drain_window_col(&mut ntile), vec![1, 1, 1]);
+    }
+
+    #[test]
+    fn columnar_row_number_fast_path_handles_i64_nulls_and_unsorted_keys() {
+        let scan = MemTableScan::new(
+            schema_id_val_i64(),
+            vec![make_batch_i64(
+                &[(1, 30), (2, 10), (3, 999), (4, 20)],
+                Some(&[true, true, false, true]),
+            )],
+        );
+        let mut op = WindowAgg::new(
+            Box::new(scan),
+            vec![],
+            vec![col_val_i64()],
+            WindowFunc::RowNumber,
+            Schema::new([
+                Field::required("id", DataType::Int32),
+                Field::required("val", DataType::Int64),
+                Field::required("rn", DataType::Int64),
+            ])
+            .expect("ok"),
+        );
+
+        assert_eq!(drain_window_col(&mut op), vec![3, 1, 4, 2]);
+    }
+
+    #[test]
+    fn columnar_row_number_empty_and_bad_order_column_paths() {
+        let empty_scan = MemTableScan::new(schema_id_val_i64(), vec![]);
+        let mut empty = WindowAgg::new(
+            Box::new(empty_scan),
+            vec![],
+            vec![col_val_i64()],
+            WindowFunc::RowNumber,
+            Schema::new([
+                Field::required("id", DataType::Int32),
+                Field::required("val", DataType::Int64),
+                Field::required("rn", DataType::Int64),
+            ])
+            .expect("ok"),
+        );
+        assert!(empty.next_batch().expect("empty fast path ok").is_none());
+
+        let scan = MemTableScan::new(schema_id_val_i64(), vec![make_batch_i64(&[(1, 10)], None)]);
+        let mut bad = WindowAgg::new(
+            Box::new(scan),
+            vec![],
+            vec![ScalarExpr::Column {
+                name: "missing".into(),
+                index: 9,
+                data_type: DataType::Int64,
+            }],
+            WindowFunc::RowNumber,
+            Schema::new([
+                Field::required("id", DataType::Int32),
+                Field::required("val", DataType::Int64),
+                Field::required("rn", DataType::Int64),
+            ])
+            .expect("ok"),
+        );
+        let err = bad
+            .next_batch()
+            .expect_err("missing order column must error");
+        assert!(
+            err.to_string()
+                .contains("window: order column index 9 out of range")
+        );
     }
 
     #[test]

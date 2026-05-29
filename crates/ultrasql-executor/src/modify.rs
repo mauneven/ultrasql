@@ -2254,25 +2254,43 @@ fn extract_tid_and_row(
 
 #[cfg(test)]
 mod tests {
+    use std::collections::{HashMap, HashSet};
     use std::sync::Arc;
 
     use parking_lot::Mutex;
-    use std::collections::HashMap;
     use ultrasql_core::constants::PAGE_SIZE;
     use ultrasql_core::{
-        CommandId, DataType, Field, PageId, RelationId, Result, Schema, Value, Xid,
+        BlockNumber, CommandId, DataType, Field, PageId, RelationId, Result, Schema, TupleId,
+        Value, Xid,
     };
+    use ultrasql_mvcc::{InfoMask, TupleHeader};
+    use ultrasql_storage::btree::BTree;
     use ultrasql_storage::buffer_pool::{BufferPool, PageLoader};
-    use ultrasql_storage::heap::HeapAccess;
+    use ultrasql_storage::heap::{HeapAccess, InsertOptions, UpdateOutcome};
     use ultrasql_storage::page::Page;
+    use ultrasql_storage::sequence::SequenceOptions;
+    use ultrasql_storage::vm::VisibilityMap;
     use ultrasql_storage::wal_sink::test_support::InMemoryWalSink;
-    use ultrasql_vec::column::Column;
+    use ultrasql_vec::Batch;
+    use ultrasql_vec::column::{Column, NumericColumn};
 
-    use super::{ModifyKind, ModifyTable};
-    use crate::Operator;
+    use super::{
+        DeleteIndexChange, InsertConflictAction, InsertIndexMaintainer, ModifyKind, ModifyTable,
+        UpdateFastPathInt32Pair, UpdateIndexChange, build_update_edits_int32_pair,
+        check_not_null_violations, columns_match_unordered, conflict_target_columns,
+        detect_update_int32_pair_fast_path, expand_insert_row, extract_tid_and_row,
+        extract_tids_from_batch, row_codec_error_to_exec, updated_ctid_target,
+    };
+    use crate::eval::Eval;
     use crate::mem_table_scan::MemTableScan;
+    use crate::row_codec::{RowCodec, RowCodecError};
     use crate::values_scan::ValuesScan;
-    use ultrasql_planner::ScalarExpr;
+    use crate::{ExecError, Operator};
+    use ultrasql_planner::{BinaryOp, ScalarExpr};
+
+    type RowCheck = Arc<dyn Fn(&[Value]) -> std::result::Result<(), ExecError> + Send + Sync>;
+    type UpdateCheck =
+        Arc<dyn Fn(&[Value], &[Value]) -> std::result::Result<(), ExecError> + Send + Sync>;
 
     // -----------------------------------------------------------------------
     // In-memory heap fixtures (duplicated from seq_scan tests)
@@ -2346,6 +2364,95 @@ mod tests {
             value: Value::Text(s.to_owned()),
             data_type: DataType::Text { max_len: None },
         }
+    }
+
+    fn lit_bool(v: bool) -> ScalarExpr {
+        ScalarExpr::Literal {
+            value: Value::Bool(v),
+            data_type: DataType::Bool,
+        }
+    }
+
+    fn schema_i32_pair() -> Schema {
+        Schema::new([
+            Field::required("id", DataType::Int32),
+            Field::required("val", DataType::Int32),
+        ])
+        .expect("schema ok")
+    }
+
+    fn col_i32(name: &str, index: usize) -> ScalarExpr {
+        ScalarExpr::Column {
+            name: name.to_owned(),
+            index,
+            data_type: DataType::Int32,
+        }
+    }
+
+    fn col_text(name: &str, index: usize) -> ScalarExpr {
+        ScalarExpr::Column {
+            name: name.to_owned(),
+            index,
+            data_type: DataType::Text { max_len: None },
+        }
+    }
+
+    fn binary_i32(op: BinaryOp, left: ScalarExpr, right: ScalarExpr) -> ScalarExpr {
+        ScalarExpr::Binary {
+            op,
+            left: Box::new(left),
+            right: Box::new(right),
+            data_type: DataType::Int32,
+        }
+    }
+
+    fn tid(block: u32, slot: u16) -> TupleId {
+        TupleId::new(PageId::new(rel(), BlockNumber::new(block)), slot)
+    }
+
+    fn tid_row_schema(relation_schema: &Schema) -> Schema {
+        let mut fields = vec![
+            Field::required("tid_block", DataType::Int32),
+            Field::required("tid_slot", DataType::Int32),
+        ];
+        fields.extend(relation_schema.fields().iter().cloned());
+        Schema::new(fields).expect("tid schema")
+    }
+
+    fn insert_payload(heap: &HeapAccess<MapLoader>, schema: &Schema, row: &[Value]) -> TupleId {
+        let codec = RowCodec::new(schema.clone());
+        let payload = codec.encode(row).expect("payload");
+        let tids = heap
+            .insert_batch(
+                rel(),
+                &[payload.as_slice()],
+                InsertOptions {
+                    xmin: Xid::new(1),
+                    command_id: CommandId::FIRST,
+                    wal: None,
+                    fsm: None,
+                    vm: None,
+                },
+            )
+            .expect("insert row");
+        tids[0]
+    }
+
+    fn btree_index(name: &str, unique: bool) -> InsertIndexMaintainer<MapLoader> {
+        let pool = Arc::new(BufferPool::new(64, MapLoader::new()));
+        let tree = BTree::create(pool, RelationId::new(100)).expect("btree");
+        InsertIndexMaintainer::new(
+            name,
+            tree,
+            Arc::new(|row| match row.first() {
+                Some(Value::Int32(v)) => Ok(Some(i64::from(*v))),
+                Some(Value::Int64(v)) => Ok(Some(*v)),
+                Some(Value::Null) => Ok(None),
+                other => Err(ExecError::TypeMismatch(format!("bad key {other:?}"))),
+            }),
+            unique,
+        )
+        .with_key_columns(vec![0])
     }
 
     // -----------------------------------------------------------------------
@@ -2487,5 +2594,754 @@ mod tests {
         assert_eq!(op.schema().len(), 1);
         assert_eq!(op.schema().field_at(0).name, "affected_rows");
         assert_eq!(op.schema().field_at(0).data_type, DataType::Int64);
+    }
+
+    #[test]
+    fn modify_table_builder_methods_store_runtime_descriptors() {
+        let heap = make_heap();
+        let schema = schema_i32_text();
+        let source = MemTableScan::new(schema.clone(), vec![]);
+        let wal = Arc::new(InMemoryWalSink::new()) as Arc<dyn ultrasql_storage::wal_sink::WalSink>;
+        let observed = Arc::new(Mutex::new(Vec::new()));
+        let observed_clone = Arc::clone(&observed);
+        let sequence = Arc::new(
+            ultrasql_storage::sequence::Sequence::new(SequenceOptions::default())
+                .expect("sequence"),
+        );
+        let sequence_default = super::SequenceDefault::new("users_id_seq", sequence)
+            .with_observer(Arc::new(move |name, value| {
+                observed_clone.lock().push((name.to_owned(), value));
+            }))
+            .with_wal(Some(Arc::clone(&wal)), Xid::new(9), rel());
+        let returning_schema =
+            Schema::new([Field::required("id", DataType::Int32)]).expect("returning");
+        let row_check: RowCheck = Arc::new(|_| Ok(()));
+        let update_check: UpdateCheck = Arc::new(|_, _| Ok(()));
+
+        let op = ModifyTable::new(
+            Arc::clone(&heap),
+            rel(),
+            schema,
+            ModifyKind::Insert,
+            Xid::new(1),
+            CommandId::FIRST,
+            Xid::new(1),
+            CommandId::FIRST,
+            None,
+            Box::new(source),
+        )
+        .with_visibility_map(Arc::new(VisibilityMap::new()))
+        .with_insert_conflict_action(InsertConflictAction::DoNothing {
+            target: Some(vec![0]),
+        })
+        .with_insert_column_map(vec![1, 0])
+        .with_column_defaults(vec![Some(lit_i32(7)), None])
+        .with_sequence_defaults(vec![Some(sequence_default), None])
+        .with_identity_always(vec![true, false])
+        .with_generated_stored(vec![None, Some(lit_text("stored"))])
+        .with_check_constraints(vec![("ck_true".to_owned(), lit_bool(true))])
+        .with_foreign_key_checks(vec![Arc::clone(&row_check)])
+        .with_exclusion_checks(vec![Arc::clone(&row_check)])
+        .with_exclusion_update_checks(vec![Arc::clone(&update_check)])
+        .with_referenced_by_delete_checks(vec![Arc::clone(&row_check)])
+        .with_referenced_by_update_checks(vec![update_check])
+        .with_returning(vec![col_i32("id", 0)], returning_schema);
+
+        assert!(op.vm.is_some());
+        assert!(matches!(
+            op.insert_conflict_action,
+            Some(InsertConflictAction::DoNothing { .. })
+        ));
+        assert_eq!(op.insert_column_map.as_deref(), Some(&[1, 0][..]));
+        assert_eq!(op.column_defaults.len(), 2);
+        assert_eq!(op.sequence_defaults.len(), 2);
+        assert_eq!(op.identity_always, vec![true, false]);
+        assert_eq!(op.generated_stored.len(), 2);
+        assert_eq!(op.check_constraints[0].name, "ck_true");
+        assert_eq!(op.foreign_key_checks.len(), 1);
+        assert_eq!(op.exclusion_checks.len(), 1);
+        assert_eq!(op.exclusion_update_checks.len(), 1);
+        assert_eq!(op.referenced_by_delete_checks.len(), 1);
+        assert_eq!(op.referenced_by_update_checks.len(), 1);
+        assert_eq!(op.returning_evaluators.len(), 1);
+        assert_eq!(op.schema.field_at(0).name, "id");
+        assert!(observed.lock().is_empty());
+    }
+
+    #[test]
+    fn not_null_and_row_codec_errors_map_to_sql_errors() {
+        let schema = schema_i32_text();
+        let err = check_not_null_violations(&[Value::Int32(1), Value::Null], &schema)
+            .expect_err("not null");
+        assert!(matches!(err, ExecError::NotNullViolation(ref col) if col == "name"));
+        check_not_null_violations(&[Value::Int32(1), Value::Text("ok".to_owned())], &schema)
+            .expect("valid row");
+
+        let trunc = row_codec_error_to_exec(RowCodecError::StringDataRightTruncation {
+            column: 1,
+            ty: DataType::Char { len: Some(2) },
+            detail: "too long".to_owned(),
+        });
+        assert!(
+            matches!(trunc, ExecError::StringDataRightTruncation(ref detail) if detail == "too long")
+        );
+
+        let ty = row_codec_error_to_exec(RowCodecError::Arity { schema: 2, row: 1 });
+        assert!(matches!(ty, ExecError::TypeMismatch(_)));
+    }
+
+    #[test]
+    fn update_int32_pair_fast_path_detection_covers_supported_shapes() {
+        let schema = schema_i32_pair();
+        let add_right = binary_i32(BinaryOp::Add, col_i32("val", 1), lit_i32(3));
+        let spec = detect_update_int32_pair_fast_path(&[(1, add_right)], &schema).expect("add");
+        assert_eq!(spec.target_col_in_relation, 1);
+        assert_eq!(spec.delta, 3);
+
+        let add_left = binary_i32(BinaryOp::Add, lit_i32(4), col_i32("id", 0));
+        let spec = detect_update_int32_pair_fast_path(&[(0, add_left)], &schema).expect("add");
+        assert_eq!(spec.target_col_in_relation, 0);
+        assert_eq!(spec.delta, 4);
+
+        let sub = binary_i32(BinaryOp::Sub, col_i32("val", 1), lit_i32(5));
+        let spec = detect_update_int32_pair_fast_path(&[(1, sub)], &schema).expect("sub");
+        assert_eq!(spec.delta, -5);
+
+        let lit_minus_col = binary_i32(BinaryOp::Sub, lit_i32(5), col_i32("val", 1));
+        assert!(detect_update_int32_pair_fast_path(&[(1, lit_minus_col)], &schema).is_none());
+        assert!(
+            detect_update_int32_pair_fast_path(
+                &[(2, binary_i32(BinaryOp::Add, col_i32("val", 1), lit_i32(1)))],
+                &schema
+            )
+            .is_none()
+        );
+        assert!(detect_update_int32_pair_fast_path(&[], &schema).is_none());
+        assert!(
+            detect_update_int32_pair_fast_path(
+                &[(1, binary_i32(BinaryOp::Gt, col_i32("val", 1), lit_i32(1)))],
+                &schema
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn tid_extraction_and_update_fast_payloads_validate_shapes() {
+        let batch = Batch::new([
+            Column::Int32(NumericColumn::from_data(vec![2, 3])),
+            Column::Int32(NumericColumn::from_data(vec![7, 8])),
+            Column::Int32(NumericColumn::from_data(vec![10, 20])),
+            Column::Int32(NumericColumn::from_data(vec![100, 200])),
+        ])
+        .expect("batch");
+        let edits = build_update_edits_int32_pair(
+            &batch,
+            rel(),
+            UpdateFastPathInt32Pair {
+                target_col_in_relation: 1,
+                delta: 5,
+            },
+        )
+        .expect("edits");
+        assert_eq!(edits[0].0, tid(2, 7));
+        assert_eq!(edits[0].1.as_slice(), &[0, 10, 0, 0, 0, 105, 0, 0, 0]);
+
+        let tids = extract_tids_from_batch(&batch, rel()).expect("tids");
+        assert_eq!(tids, vec![tid(2, 7), tid(3, 8)]);
+
+        let tid_row = [Value::Int32(4), Value::Int32(9), Value::Text("x".into())];
+        let (one_tid, row) = extract_tid_and_row(&tid_row, rel()).expect("tid row");
+        assert_eq!(one_tid, tid(4, 9));
+        assert_eq!(row, &[Value::Text("x".to_owned())]);
+
+        let bad_short =
+            Batch::new([Column::Int32(NumericColumn::from_data(vec![1]))]).expect("batch");
+        assert!(extract_tids_from_batch(&bad_short, rel()).is_err());
+        assert!(
+            build_update_edits_int32_pair(
+                &bad_short,
+                rel(),
+                UpdateFastPathInt32Pair {
+                    target_col_in_relation: 0,
+                    delta: 1,
+                },
+            )
+            .is_err()
+        );
+
+        let bad_negative = Batch::new([
+            Column::Int32(NumericColumn::from_data(vec![-1])),
+            Column::Int32(NumericColumn::from_data(vec![1])),
+        ])
+        .expect("batch");
+        assert!(extract_tids_from_batch(&bad_negative, rel()).is_err());
+
+        assert!(extract_tid_and_row(&[Value::Text("bad".into())], rel()).is_err());
+        assert!(extract_tid_and_row(&[Value::Int32(-1), Value::Int32(1)], rel()).is_err());
+        assert!(extract_tid_and_row(&[Value::Int32(1), Value::Int32(70_000)], rel()).is_err());
+    }
+
+    #[test]
+    fn conflict_targets_and_ctid_redirect_helpers_cover_edge_cases() {
+        assert!(columns_match_unordered(&[2, 1], &[1, 2]));
+        assert!(!columns_match_unordered(&[1, 2], &[1, 3]));
+
+        let do_nothing = InsertConflictAction::DoNothing {
+            target: Some(vec![1, 2]),
+        };
+        assert_eq!(conflict_target_columns(&do_nothing), Some(&[1, 2][..]));
+        let do_nothing_any = InsertConflictAction::DoNothing { target: None };
+        assert!(conflict_target_columns(&do_nothing_any).is_none());
+        let do_update = InsertConflictAction::DoUpdate {
+            target: vec![0],
+            assignments: Vec::new(),
+            predicate: None,
+        };
+        assert_eq!(conflict_target_columns(&do_update), Some(&[0][..]));
+
+        let current = tid(1, 1);
+        let next = tid(1, 2);
+        let mut header = TupleHeader::fresh(Xid::new(1), CommandId::FIRST, current, 2);
+        header.ctid = next;
+        assert_eq!(updated_ctid_target(&header, current), None);
+        header.infomask.set(InfoMask::UPDATED);
+        assert_eq!(updated_ctid_target(&header, current), Some(next));
+        header.ctid = current;
+        assert_eq!(updated_ctid_target(&header, current), None);
+    }
+
+    #[test]
+    fn insert_column_map_sequence_generated_constraints_and_returning() {
+        let heap = make_heap();
+        let target_schema = Schema::new([
+            Field::required("id", DataType::Int32),
+            Field::required("name", DataType::Text { max_len: None }),
+            Field::required("stored", DataType::Text { max_len: None }),
+        ])
+        .expect("target schema");
+        let source_schema =
+            Schema::new([Field::required("name", DataType::Text { max_len: None })])
+                .expect("source schema");
+        let source = ValuesScan::new(vec![vec![lit_text("alpha")]], source_schema);
+
+        let observed = Arc::new(Mutex::new(Vec::new()));
+        let observed_clone = Arc::clone(&observed);
+        let wal = Arc::new(InMemoryWalSink::new()) as Arc<dyn ultrasql_storage::wal_sink::WalSink>;
+        let sequence = Arc::new(
+            ultrasql_storage::sequence::Sequence::new(SequenceOptions::default())
+                .expect("sequence"),
+        );
+        let sequence_default = super::SequenceDefault::new("users_id_seq", sequence)
+            .with_observer(Arc::new(move |name, value| {
+                observed_clone.lock().push((name.to_owned(), value));
+            }))
+            .with_wal(Some(Arc::clone(&wal)), Xid::new(11), rel());
+        let fk_hits = Arc::new(Mutex::new(0_usize));
+        let fk_hits_clone = Arc::clone(&fk_hits);
+        let fk: RowCheck = Arc::new(move |row| {
+            assert_eq!(row[1], Value::Text("alpha".to_owned()));
+            *fk_hits_clone.lock() += 1;
+            Ok(())
+        });
+        let exclusion_hits = Arc::new(Mutex::new(0_usize));
+        let exclusion_hits_clone = Arc::clone(&exclusion_hits);
+        let exclusion: RowCheck = Arc::new(move |row| {
+            assert_eq!(row[2], Value::Text("stored".to_owned()));
+            *exclusion_hits_clone.lock() += 1;
+            Ok(())
+        });
+        let returning_schema = Schema::new([
+            Field::required("id", DataType::Int32),
+            Field::required("stored", DataType::Text { max_len: None }),
+        ])
+        .expect("returning schema");
+
+        let mut op = ModifyTable::new(
+            Arc::clone(&heap),
+            rel(),
+            target_schema,
+            ModifyKind::Insert,
+            Xid::new(11),
+            CommandId::FIRST,
+            Xid::new(11),
+            CommandId::FIRST,
+            Some(wal),
+            Box::new(source),
+        )
+        .with_insert_column_map(vec![1])
+        .with_sequence_defaults(vec![Some(sequence_default), None, None])
+        .with_identity_always(vec![true, false, false])
+        .with_generated_stored(vec![None, None, Some(lit_text("stored"))])
+        .with_check_constraints(vec![("ck_true".to_owned(), lit_bool(true))])
+        .with_foreign_key_checks(vec![fk])
+        .with_exclusion_checks(vec![exclusion])
+        .with_returning(
+            vec![col_i32("id", 0), col_text("stored", 2)],
+            returning_schema,
+        );
+
+        let batch = op.next_batch().expect("insert").expect("returning");
+        assert_eq!(batch.rows(), 1);
+        match &batch.columns()[0] {
+            Column::Int32(c) => assert_eq!(c.data(), &[1]),
+            other => panic!("unexpected id column {other:?}"),
+        }
+        assert_eq!(batch.columns()[1].text_value(0), Some("stored"));
+        assert_eq!(&*observed.lock(), &[("users_id_seq".to_owned(), 1)]);
+        assert_eq!(*fk_hits.lock(), 1);
+        assert_eq!(*exclusion_hits.lock(), 1);
+    }
+
+    #[test]
+    fn update_and_delete_operator_paths_cover_slow_branches_and_returning() {
+        let heap = make_heap();
+        let schema = schema_i32_text();
+        let old_tid = insert_payload(
+            &heap,
+            &schema,
+            &[Value::Int32(1), Value::Text("old".to_owned())],
+        );
+        let child_schema = tid_row_schema(&schema);
+        let update_source = ValuesScan::new(
+            vec![vec![
+                lit_i32(i32::try_from(old_tid.page.block.raw()).expect("block fits")),
+                lit_i32(i32::from(old_tid.slot)),
+                lit_i32(1),
+                lit_text("old"),
+            ]],
+            child_schema.clone(),
+        );
+        let returning_schema =
+            Schema::new([Field::required("name", DataType::Text { max_len: None })])
+                .expect("returning");
+        let mut update = ModifyTable::new(
+            Arc::clone(&heap),
+            rel(),
+            schema.clone(),
+            ModifyKind::Update {
+                assignments: vec![(1, lit_text("new"))],
+            },
+            Xid::new(2),
+            CommandId::FIRST,
+            Xid::new(2),
+            CommandId::FIRST,
+            None,
+            Box::new(update_source),
+        )
+        .with_returning(vec![col_text("name", 1)], returning_schema);
+
+        let batch = update.next_batch().expect("update").expect("returning");
+        assert_eq!(batch.rows(), 1);
+        assert_eq!(batch.columns()[0].text_value(0), Some("new"));
+
+        let delete_tid = insert_payload(
+            &heap,
+            &schema,
+            &[Value::Int32(2), Value::Text("gone".to_owned())],
+        );
+        let delete_source = ValuesScan::new(
+            vec![vec![
+                lit_i32(i32::try_from(delete_tid.page.block.raw()).expect("block fits")),
+                lit_i32(i32::from(delete_tid.slot)),
+                lit_i32(2),
+                lit_text("gone"),
+            ]],
+            child_schema,
+        );
+        let returning_schema =
+            Schema::new([Field::required("id", DataType::Int32)]).expect("returning");
+        let mut delete = ModifyTable::new(
+            Arc::clone(&heap),
+            rel(),
+            schema,
+            ModifyKind::Delete,
+            Xid::new(3),
+            CommandId::FIRST,
+            Xid::new(3),
+            CommandId::FIRST,
+            None,
+            Box::new(delete_source),
+        )
+        .with_returning(vec![col_i32("id", 0)], returning_schema);
+
+        let batch = delete.next_batch().expect("delete").expect("returning");
+        assert_eq!(batch.rows(), 1);
+        match &batch.columns()[0] {
+            Column::Int32(c) => assert_eq!(c.data(), &[2]),
+            other => panic!("unexpected returning column {other:?}"),
+        }
+    }
+
+    #[test]
+    fn update_conflict_defaults_and_constraint_helpers_cover_error_edges() {
+        let heap = make_heap();
+        let schema = schema_i32_text();
+        let child = MemTableScan::new(tid_row_schema(&schema), vec![]);
+        let update_op = ModifyTable::new(
+            Arc::clone(&heap),
+            rel(),
+            schema.clone(),
+            ModifyKind::Update {
+                assignments: vec![(1, lit_text("computed"))],
+            },
+            Xid::new(4),
+            CommandId::FIRST,
+            Xid::new(4),
+            CommandId::FIRST,
+            None,
+            Box::new(child),
+        );
+        let update_row = [
+            Value::Int32(0),
+            Value::Int32(7),
+            Value::Int32(9),
+            Value::Text("before".to_owned()),
+        ];
+        let computed = update_op
+            .compute_update_edit(&update_row, true)
+            .expect("computed update");
+        assert_eq!(computed.tid, tid(0, 7));
+        assert_eq!(
+            computed.returning_row,
+            Some(vec![Value::Int32(9), Value::Text("computed".to_owned())])
+        );
+
+        let conflict = update_op
+            .compute_conflict_update_edit(
+                tid(0, 8),
+                &[Value::Int32(1), Value::Text("old".to_owned())],
+                &[Value::Int32(1), Value::Text("excluded".to_owned())],
+                &[(1, Eval::new(lit_text("merged")))],
+                Some(&Eval::new(lit_bool(true))),
+                true,
+            )
+            .expect("conflict update")
+            .expect("updated");
+        assert_eq!(
+            conflict.returning_row,
+            Some(vec![Value::Int32(1), Value::Text("merged".to_owned())])
+        );
+        assert!(
+            update_op
+                .compute_conflict_update_edit(
+                    tid(0, 8),
+                    &[Value::Int32(1), Value::Text("old".to_owned())],
+                    &[Value::Int32(1), Value::Text("excluded".to_owned())],
+                    &[(1, Eval::new(lit_text("merged")))],
+                    Some(&Eval::new(lit_bool(false))),
+                    false,
+                )
+                .expect("predicate false")
+                .is_none()
+        );
+        assert!(
+            update_op
+                .compute_conflict_update_edit(
+                    tid(0, 8),
+                    &[Value::Int32(1), Value::Text("old".to_owned())],
+                    &[Value::Int32(1), Value::Text("excluded".to_owned())],
+                    &[(1, Eval::new(lit_text("merged")))],
+                    Some(&Eval::new(lit_i32(1))),
+                    false,
+                )
+                .is_err()
+        );
+
+        let insert_op = ModifyTable::new(
+            Arc::clone(&heap),
+            rel(),
+            schema.clone(),
+            ModifyKind::Insert,
+            Xid::new(5),
+            CommandId::FIRST,
+            Xid::new(5),
+            CommandId::FIRST,
+            None,
+            Box::new(MemTableScan::new(schema.clone(), vec![])),
+        )
+        .with_column_defaults(vec![Some(lit_i32(42)), None]);
+        let mut row = vec![Value::Null, Value::Text("kept".to_owned())];
+        insert_op
+            .apply_insert_defaults(&mut row, &[true, false])
+            .expect("defaults");
+        assert_eq!(row[0], Value::Int32(42));
+        assert!(insert_op.apply_insert_defaults(&mut row, &[true]).is_err());
+
+        let generated_op = ModifyTable::new(
+            Arc::clone(&heap),
+            rel(),
+            schema.clone(),
+            ModifyKind::Insert,
+            Xid::new(6),
+            CommandId::FIRST,
+            Xid::new(6),
+            CommandId::FIRST,
+            None,
+            Box::new(MemTableScan::new(schema.clone(), vec![])),
+        )
+        .with_generated_stored(vec![None, Some(lit_text("stored"))])
+        .with_identity_always(vec![true, false]);
+        assert!(
+            generated_op
+                .check_identity_explicit_values(&[false, true])
+                .is_err()
+        );
+        assert!(
+            generated_op
+                .check_generated_stored_explicit_values(&[true, false])
+                .is_err()
+        );
+        let mut generated_row = vec![Value::Int32(1), Value::Null];
+        generated_op
+            .apply_generated_stored(&mut generated_row)
+            .expect("generated");
+        assert_eq!(generated_row[1], Value::Text("stored".to_owned()));
+        assert!(
+            generated_op
+                .apply_generated_stored(&mut [Value::Int32(1)])
+                .is_err()
+        );
+
+        let check_false = ModifyTable::new(
+            Arc::clone(&heap),
+            rel(),
+            schema.clone(),
+            ModifyKind::Insert,
+            Xid::new(7),
+            CommandId::FIRST,
+            Xid::new(7),
+            CommandId::FIRST,
+            None,
+            Box::new(MemTableScan::new(schema.clone(), vec![])),
+        )
+        .with_check_constraints(vec![("ck_false".to_owned(), lit_bool(false))]);
+        assert!(matches!(
+            check_false.check_row_constraints(&[Value::Int32(1), Value::Text("x".to_owned())]),
+            Err(ExecError::CheckViolation(ref name)) if name == "ck_false"
+        ));
+        let check_type = ModifyTable::new(
+            Arc::clone(&heap),
+            rel(),
+            schema.clone(),
+            ModifyKind::Insert,
+            Xid::new(8),
+            CommandId::FIRST,
+            Xid::new(8),
+            CommandId::FIRST,
+            None,
+            Box::new(MemTableScan::new(schema, vec![])),
+        )
+        .with_check_constraints(vec![("ck_type".to_owned(), lit_i32(1))]);
+        assert!(
+            check_type
+                .check_row_constraints(&[Value::Int32(1), Value::Text("x".to_owned())])
+                .is_err()
+        );
+
+        let expanded = expand_insert_row(&[Value::Int32(3)], 2, &[1]).expect("expanded");
+        assert_eq!(expanded.values, vec![Value::Null, Value::Int32(3)]);
+        assert_eq!(expanded.omitted, vec![true, false]);
+        assert!(expand_insert_row(&[Value::Int32(1)], 2, &[2]).is_err());
+        assert!(expand_insert_row(&[Value::Int32(1)], 2, &[0, 0]).is_err());
+
+        let int64_schema =
+            Schema::new([Field::required("seq", DataType::Int64)]).expect("int64 schema");
+        let seq_op = ModifyTable::new(
+            heap,
+            rel(),
+            int64_schema,
+            ModifyKind::Insert,
+            Xid::new(9),
+            CommandId::FIRST,
+            Xid::new(9),
+            CommandId::FIRST,
+            None,
+            Box::new(MemTableScan::new(
+                Schema::new([Field::required("seq", DataType::Int64)]).expect("source"),
+                vec![],
+            )),
+        );
+        let seq = Arc::new(
+            ultrasql_storage::sequence::Sequence::new(SequenceOptions {
+                start: 9,
+                ..SequenceOptions::default()
+            })
+            .expect("sequence"),
+        );
+        let default = super::SequenceDefault::new("s", seq);
+        assert_eq!(
+            seq_op
+                .next_sequence_default_value(0, &default)
+                .expect("seq"),
+            Value::Int64(9)
+        );
+    }
+
+    #[test]
+    fn btree_index_conflict_and_maintenance_helpers_cover_index_paths() {
+        let heap = make_heap();
+        let schema = schema_i32_text();
+        let existing = tid(0, 1);
+        let mut index = btree_index("idx_users_id", true);
+        assert!(format!("{index:?}").contains("idx_users_id"));
+        assert_eq!(
+            index
+                .encode_key(&[Value::Int32(7), Value::Text("x".to_owned())])
+                .expect("key"),
+            Some(7)
+        );
+        assert!(!index.contains_key(7).expect("missing"));
+        index
+            .insert_key(7, existing, Xid::new(10), None)
+            .expect("insert key");
+        assert!(index.contains_key(7).expect("present"));
+        assert!(matches!(
+            index.insert_key(7, tid(0, 2), Xid::new(10), None),
+            Err(ExecError::UniqueViolation(ref name)) if name == "idx_users_id"
+        ));
+        assert!(
+            index
+                .delete_key(7, existing, Xid::new(11), None)
+                .expect("delete key")
+        );
+        assert!(!index.contains_key(7).expect("deleted"));
+
+        let mut conflict_index = btree_index("idx_conflict", true);
+        conflict_index
+            .insert_key(7, existing, Xid::new(12), None)
+            .expect("seed conflict");
+        let op = ModifyTable::new(
+            Arc::clone(&heap),
+            rel(),
+            schema.clone(),
+            ModifyKind::Insert,
+            Xid::new(12),
+            CommandId::FIRST,
+            Xid::new(12),
+            CommandId::FIRST,
+            None,
+            Box::new(MemTableScan::new(schema.clone(), vec![])),
+        )
+        .with_insert_indexes(vec![conflict_index]);
+        let action = InsertConflictAction::DoNothing {
+            target: Some(vec![0]),
+        };
+        op.validate_insert_conflict_arbiter(Some(&action))
+            .expect("arbiter");
+        assert!(
+            op.validate_insert_conflict_arbiter(Some(&InsertConflictAction::DoNothing {
+                target: Some(vec![1])
+            }))
+            .is_err()
+        );
+        assert!(matches!(
+            op.find_insert_conflict(&action, &[Some(7)], &[HashSet::new()])
+                .expect("existing"),
+            Some(super::InsertConflict::Existing(t)) if t == existing
+        ));
+        let mut seen = vec![HashSet::new()];
+        seen[0].insert(8);
+        assert!(matches!(
+            op.find_insert_conflict(&action, &[Some(8)], &seen)
+                .expect("in batch"),
+            Some(super::InsertConflict::InBatch)
+        ));
+        op.remember_insert_keys(&[Some(9)], &mut seen);
+        assert!(seen[0].contains(&9));
+        let mut duplicate_seen = vec![HashSet::new()];
+        op.reject_duplicate_insert_keys(&[Some(10)], &mut duplicate_seen)
+            .expect("first key");
+        assert!(
+            op.reject_duplicate_insert_keys(&[Some(10)], &mut duplicate_seen)
+                .is_err()
+        );
+
+        let mut update_index = btree_index("idx_update", true);
+        let old_tid = tid(0, 3);
+        let new_tid = tid(0, 4);
+        update_index
+            .insert_key(1, old_tid, Xid::new(13), None)
+            .expect("old key");
+        let mut update_op = ModifyTable::new(
+            Arc::clone(&heap),
+            rel(),
+            schema.clone(),
+            ModifyKind::Update {
+                assignments: vec![(0, lit_i32(2))],
+            },
+            Xid::new(13),
+            CommandId::FIRST,
+            Xid::new(13),
+            CommandId::FIRST,
+            None,
+            Box::new(MemTableScan::new(tid_row_schema(&schema), vec![])),
+        )
+        .with_update_indexes(vec![update_index]);
+        let changes = vec![UpdateIndexChange {
+            old_tid,
+            old_keys: vec![Some(1)],
+            new_keys: vec![Some(2)],
+        }];
+        update_op
+            .precheck_update_index_changes(&changes)
+            .expect("precheck");
+        update_op
+            .apply_update_index_changes(
+                &changes,
+                &[UpdateOutcome {
+                    old_tid,
+                    new_tid,
+                    hot: false,
+                }],
+                None,
+            )
+            .expect("apply update index");
+        assert!(
+            !update_op.update_indexes[0]
+                .contains_key(1)
+                .expect("old gone")
+        );
+        assert!(
+            update_op.update_indexes[0]
+                .contains_key(2)
+                .expect("new key")
+        );
+
+        let mut delete_index = btree_index("idx_delete", true);
+        delete_index
+            .insert_key(5, old_tid, Xid::new(14), None)
+            .expect("delete seed");
+        let mut delete_op = ModifyTable::new(
+            Arc::clone(&heap),
+            rel(),
+            schema,
+            ModifyKind::Delete,
+            Xid::new(14),
+            CommandId::FIRST,
+            Xid::new(14),
+            CommandId::FIRST,
+            None,
+            Box::new(MemTableScan::new(
+                Schema::new([
+                    Field::required("tid_block", DataType::Int32),
+                    Field::required("tid_slot", DataType::Int32),
+                ])
+                .expect("delete source"),
+                vec![],
+            )),
+        )
+        .with_delete_indexes(vec![delete_index]);
+        delete_op
+            .apply_delete_index_changes(&[DeleteIndexChange {
+                tid: old_tid,
+                keys: vec![Some(5)],
+            }])
+            .expect("delete index");
+        assert!(
+            !delete_op.delete_indexes[0]
+                .contains_key(5)
+                .expect("delete gone")
+        );
     }
 }

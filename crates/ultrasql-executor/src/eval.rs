@@ -313,6 +313,7 @@ fn eval_function_call(
         "md5" => eval_md5(args),
         "sha256" => eval_sha256(args),
         "quote_ident" => eval_quote_ident(args),
+        "quote_literal" => eval_quote_literal(args),
         "format" => eval_format(args),
         "regexp_replace" => eval_regexp_replace(args),
         "ifnull" | "nvl" => eval_ifnull(args),
@@ -1918,6 +1919,19 @@ fn eval_quote_ident(args: &[Value]) -> Result<Value, EvalError> {
         return Ok(Value::Null);
     };
     Ok(Value::Text(quote_identifier(text)))
+}
+
+fn eval_quote_literal(args: &[Value]) -> Result<Value, EvalError> {
+    if args.len() != 1 {
+        return Err(EvalError::Type(format!(
+            "quote_literal: expected 1 arg, got {}",
+            args.len()
+        )));
+    }
+    let Some(text) = text_arg("quote_literal", args, 0)? else {
+        return Ok(Value::Null);
+    };
+    Ok(Value::Text(quote_literal(text)))
 }
 
 fn eval_format(args: &[Value]) -> Result<Value, EvalError> {
@@ -4754,10 +4768,10 @@ fn regex_match(haystack: &str, pattern: &str, case_insensitive: bool) -> Result<
 #[cfg(test)]
 mod tests {
     use proptest::prelude::*;
-    use ultrasql_core::{DataType, Value};
-    use ultrasql_planner::{BinaryOp, ScalarExpr, UnaryOp};
+    use ultrasql_core::{BitString, DataType, Field, NetworkValue, Oid, Schema, Value};
+    use ultrasql_planner::{BinaryOp, LogicalPlan, ScalarExpr, UnaryOp};
 
-    use super::{Eval, EvalError};
+    use super::{Eval, EvalError, eval_function_call};
 
     // -----------------------------------------------------------------------
     // Helper builders
@@ -4905,6 +4919,638 @@ mod tests {
         }
     }
 
+    fn eval_fn(name: &str, args: Vec<Value>) -> Value {
+        eval_function_call(name, &args, &DataType::Null).expect("function eval")
+    }
+
+    fn eval_fn_err(name: &str, args: Vec<Value>) -> String {
+        eval_function_call(name, &args, &DataType::Null)
+            .expect_err("function error")
+            .to_string()
+    }
+
+    fn inet(text: &str) -> Value {
+        Value::Network(NetworkValue::parse_for_type(&DataType::Inet, text).expect("inet"))
+    }
+
+    fn assert_float_close(value: Value, expected: f64) {
+        let Value::Float64(actual) = value else {
+            panic!("expected float64, got {value:?}");
+        };
+        assert!(
+            (actual - expected).abs() < 1e-9,
+            "expected {expected}, got {actual}"
+        );
+    }
+
+    fn one_col_empty_plan() -> LogicalPlan {
+        LogicalPlan::Empty {
+            schema: Schema::new([Field::required("x", DataType::Int32)]).expect("schema"),
+        }
+    }
+
+    #[test]
+    fn subquery_and_outer_scope_guards_return_unsupported() {
+        let subplan = one_col_empty_plan();
+        let exprs = vec![
+            ScalarExpr::OuterColumn {
+                name: "x".into(),
+                frame_depth: 1,
+                column_index: 0,
+                data_type: DataType::Int32,
+            },
+            ScalarExpr::ScalarSubquery {
+                subplan: Box::new(subplan.clone()),
+                correlated: false,
+                data_type: DataType::Int32,
+            },
+            ScalarExpr::Exists {
+                subplan: Box::new(subplan.clone()),
+                negated: false,
+                correlated: false,
+            },
+            ScalarExpr::InSubquery {
+                expr: Box::new(lit_i32(1)),
+                subplan: Box::new(subplan),
+                negated: false,
+                correlated: false,
+                data_type: DataType::Int32,
+            },
+        ];
+
+        for expr in exprs {
+            let err = Eval::new(expr).eval(&[]).expect_err("guard must reject");
+            assert!(matches!(err, EvalError::Unsupported(_)), "got {err}");
+        }
+    }
+
+    #[test]
+    fn null_helpers_extrema_xml_and_unknown_function_paths() {
+        assert_eq!(
+            eval_fn("coalesce", vec![Value::Null, Value::Text("x".into())]),
+            Value::Text("x".into())
+        );
+        assert_eq!(eval_fn("coalesce", vec![Value::Null]), Value::Null);
+
+        assert_eq!(
+            eval_fn("ifnull", vec![Value::Null, Value::Int32(7)]),
+            Value::Int32(7)
+        );
+        assert_eq!(
+            eval_fn(
+                "nvl",
+                vec![Value::Text("a".into()), Value::Text("b".into())]
+            ),
+            Value::Text("a".into())
+        );
+        assert!(eval_fn_err("ifnull", vec![Value::Null]).contains("expected 2 args"));
+
+        assert_eq!(
+            eval_fn("nullif", vec![Value::Int32(7), Value::Int32(7)]),
+            Value::Null
+        );
+        assert_eq!(
+            eval_fn("nullif", vec![Value::Int32(7), Value::Int32(8)]),
+            Value::Int32(7)
+        );
+        assert_eq!(
+            eval_fn("nullif", vec![Value::Null, Value::Int32(8)]),
+            Value::Null
+        );
+        assert!(eval_fn_err("nullif", vec![Value::Int32(1)]).contains("expected 2 args"));
+
+        assert_eq!(
+            eval_fn("least", vec![Value::Null, Value::Int32(8), Value::Int32(3)]),
+            Value::Int32(3)
+        );
+        assert_eq!(
+            eval_fn("greatest", vec![Value::Int32(8), Value::Int32(3)]),
+            Value::Int32(8)
+        );
+        assert_eq!(eval_fn("least", vec![Value::Null]), Value::Null);
+        assert_eq!(
+            eval_fn("min", vec![Value::Int32(1), Value::Null]),
+            Value::Null
+        );
+        assert!(eval_fn_err("greatest", vec![]).contains("expected at least 1 arg"));
+
+        assert_eq!(
+            eval_fn("xml_is_well_formed", vec![Value::Text("<a/><b/>".into())]),
+            Value::Bool(true)
+        );
+        assert_eq!(
+            eval_fn(
+                "xml_is_well_formed_document",
+                vec![Value::Text("<a/><b/>".into())]
+            ),
+            Value::Bool(false)
+        );
+        assert_eq!(
+            eval_fn("xml_is_well_formed_content", vec![Value::Null]),
+            Value::Null
+        );
+        assert!(eval_fn_err("xml_is_well_formed", vec![]).contains("expected 1 arg"));
+
+        assert!(eval_fn_err("does_not_exist", vec![]).contains("function not implemented"));
+    }
+
+    #[test]
+    fn catalog_edge_cases_cover_remaining_error_and_oid_paths() {
+        for (oid, name) in [
+            (21, "smallint"),
+            (26, "oid"),
+            (700, "real"),
+            (701, "double precision"),
+            (790, "money"),
+            (114, "json"),
+            (142, "xml"),
+            (650, "cidr"),
+            (829, "macaddr"),
+            (869, "inet"),
+            (1042, "character"),
+            (1082, "date"),
+            (1083, "time without time zone"),
+            (1114, "timestamp without time zone"),
+            (1184, "timestamp with time zone"),
+            (1266, "time with time zone"),
+            (1560, "bit"),
+            (1562, "bit varying"),
+            (3220, "pg_lsn"),
+            (2205, "regclass"),
+            (2206, "regtype"),
+        ] {
+            assert_eq!(
+                eval_fn("format_type", vec![Value::Oid(Oid::new(oid)), Value::Null]),
+                Value::Text(name.into())
+            );
+        }
+
+        assert!(eval_fn_err("pg_typeof", vec![]).contains("expected 1 arg"));
+        assert!(eval_fn_err("pg_get_indexdef", vec![]).contains("expected 1 to 3 args"));
+        assert!(eval_fn_err("pg_get_constraintdef", vec![]).contains("expected 1 or 2 args"));
+        assert_eq!(
+            eval_fn("pg_get_constraintdef", vec![Value::Oid(Oid::new(0))]),
+            Value::Null
+        );
+        assert!(eval_fn_err("pg_get_statisticsobjdef_columns", vec![]).contains("expected 1 arg"));
+        assert!(eval_fn_err("pg_get_function_result", vec![]).contains("expected 1 arg"));
+        assert!(eval_fn_err("pg_get_function_arguments", vec![]).contains("expected 1 arg"));
+        assert!(eval_fn_err("pg_encoding_to_char", vec![]).contains("expected 1 arg"));
+        assert_eq!(
+            eval_fn("pg_encoding_to_char", vec![Value::Null]),
+            Value::Null
+        );
+        assert!(
+            eval_fn_err("pg_encoding_to_char", vec![Value::Text("UTF8".into())])
+                .contains("integer argument")
+        );
+
+        assert!(eval_fn_err("obj_description", vec![]).contains("expected 2 args"));
+        assert_eq!(
+            eval_fn(
+                "obj_description",
+                vec![Value::Null, Value::Text("pg_class".into())]
+            ),
+            Value::Null
+        );
+        assert!(
+            eval_fn_err(
+                "obj_description",
+                vec![Value::Text("bad".into()), Value::Text("pg_class".into())]
+            )
+            .contains("oid argument")
+        );
+        assert!(
+            eval_fn_err(
+                "obj_description",
+                vec![Value::Oid(Oid::new(1)), Value::Int32(1)]
+            )
+            .contains("catalog name")
+        );
+
+        assert!(eval_fn_err("col_description", vec![]).contains("expected 2 args"));
+        assert_eq!(
+            eval_fn("col_description", vec![Value::Null, Value::Int32(1)]),
+            Value::Null
+        );
+        assert!(
+            eval_fn_err(
+                "col_description",
+                vec![Value::Text("bad".into()), Value::Text("bad".into())]
+            )
+            .contains("oid and integer")
+        );
+
+        assert!(eval_fn_err("pg_get_serial_sequence", vec![]).contains("expected 2 args"));
+        assert_eq!(
+            eval_fn(
+                "pg_get_serial_sequence",
+                vec![Value::Null, Value::Text("id".into())]
+            ),
+            Value::Null
+        );
+        assert!(
+            eval_fn_err(
+                "pg_get_serial_sequence",
+                vec![Value::Int32(1), Value::Text("id".into())]
+            )
+            .contains("text arguments")
+        );
+    }
+
+    #[test]
+    fn cast_size_and_array_error_edges_cover_scalar_compat_paths() {
+        assert!(eval_fn_err("__ultrasql_cast_oid", vec![]).contains("expected 1 arg"));
+        assert_eq!(
+            eval_fn("__ultrasql_cast_oid", vec![Value::Null]),
+            Value::Null
+        );
+        assert_eq!(
+            eval_fn("__ultrasql_cast_oid", vec![Value::RegClass(Oid::new(42))]),
+            Value::Oid(Oid::new(42))
+        );
+        assert_eq!(
+            eval_fn("__ultrasql_cast_oid", vec![Value::Int16(42)]),
+            Value::Oid(Oid::new(42))
+        );
+        assert!(eval_fn_err("__ultrasql_cast_oid", vec![Value::Text("x".into())]).contains("OID"));
+
+        assert!(eval_fn_err("__ultrasql_cast_regclass", vec![]).contains("expected 1 arg"));
+        assert_eq!(
+            eval_fn("__ultrasql_cast_regclass", vec![Value::Null]),
+            Value::Null
+        );
+        assert_eq!(
+            eval_fn("__ultrasql_cast_regclass", vec![Value::Int16(7)]),
+            Value::RegClass(Oid::new(7))
+        );
+        assert_eq!(
+            eval_fn("__ultrasql_cast_regclass", vec![Value::Int32(8)]),
+            Value::RegClass(Oid::new(8))
+        );
+        assert_eq!(
+            eval_fn("__ultrasql_cast_regclass", vec![Value::Int64(9)]),
+            Value::RegClass(Oid::new(9))
+        );
+        assert!(
+            eval_fn_err("__ultrasql_cast_regclass", vec![Value::Text("x".into())]).contains("OID")
+        );
+
+        assert!(eval_fn_err("__ultrasql_cast_regtype", vec![]).contains("expected 1 arg"));
+        assert_eq!(
+            eval_fn("__ultrasql_cast_regtype", vec![Value::Null]),
+            Value::Null
+        );
+        assert_eq!(
+            eval_fn("__ultrasql_cast_regtype", vec![Value::Int16(7)]),
+            Value::RegType(Oid::new(7))
+        );
+        assert_eq!(
+            eval_fn("__ultrasql_cast_regtype", vec![Value::Int32(8)]),
+            Value::RegType(Oid::new(8))
+        );
+        assert_eq!(
+            eval_fn("__ultrasql_cast_regtype", vec![Value::Int64(9)]),
+            Value::RegType(Oid::new(9))
+        );
+        assert!(
+            eval_fn_err("__ultrasql_cast_regtype", vec![Value::Text("x".into())]).contains("OID")
+        );
+
+        assert!(eval_fn_err("__ultrasql_cast_text", vec![]).contains("expected 1 arg"));
+        assert_eq!(
+            eval_fn("__ultrasql_cast_text", vec![Value::Null]),
+            Value::Null
+        );
+        assert!(eval_fn_err("pg_size_pretty", vec![]).contains("expected 1 arg"));
+        assert_eq!(eval_fn("pg_size_pretty", vec![Value::Null]), Value::Null);
+        assert!(eval_fn_err("pg_size_pretty", vec![Value::Text("x".into())]).contains("integer"));
+
+        let array = Value::Array {
+            element_type: DataType::Int32,
+            elements: vec![Value::Int32(1)],
+        };
+        assert_eq!(
+            eval_fn("array_length", vec![array.clone(), Value::Int32(0)]),
+            Value::Null
+        );
+        assert!(eval_fn_err("__ultrasql_array_subscript", vec![]).contains("expected 2 args"));
+        assert_eq!(
+            eval_fn(
+                "__ultrasql_array_subscript",
+                vec![Value::Null, Value::Int32(1)]
+            ),
+            Value::Null
+        );
+        assert_eq!(
+            eval_fn(
+                "__ultrasql_array_subscript",
+                vec![array.clone(), Value::Null]
+            ),
+            Value::Null
+        );
+        assert_eq!(
+            eval_fn(
+                "__ultrasql_array_subscript",
+                vec![array.clone(), Value::Int32(0)]
+            ),
+            Value::Null
+        );
+        assert!(eval_fn_err("__ultrasql_eq_any_array", vec![]).contains("expected 2 args"));
+        assert_eq!(
+            eval_fn("__ultrasql_eq_any_array", vec![Value::Null, array.clone()]),
+            Value::Null
+        );
+        assert_eq!(
+            eval_fn("__ultrasql_eq_any_array", vec![Value::Int32(2), array]),
+            Value::Bool(false)
+        );
+    }
+
+    #[test]
+    fn catalog_and_array_functions_cover_nulls_errors_and_fallbacks() {
+        for name in [
+            "version",
+            "current_catalog",
+            "current_database",
+            "current_schema",
+            "current_user",
+        ] {
+            assert!(eval_fn(name, vec![]).data_type() == DataType::Text { max_len: None });
+            assert!(eval_fn_err(name, vec![Value::Int32(1)]).contains("expected 0 args"));
+        }
+
+        assert_eq!(
+            eval_fn("current_schemas", vec![Value::Bool(true)]),
+            Value::Array {
+                element_type: DataType::Text { max_len: None },
+                elements: vec![
+                    Value::Text("pg_catalog".into()),
+                    Value::Text("public".into())
+                ],
+            }
+        );
+        assert_eq!(
+            eval_fn("current_schemas", vec![Value::Bool(false)]),
+            Value::Array {
+                element_type: DataType::Text { max_len: None },
+                elements: vec![Value::Text("public".into())],
+            }
+        );
+        assert_eq!(
+            eval_fn("current_schemas", vec![Value::Null]),
+            Value::Array {
+                element_type: DataType::Text { max_len: None },
+                elements: vec![Value::Text("public".into())],
+            }
+        );
+        assert!(eval_fn_err("current_schemas", vec![]).contains("expected 1 arg"));
+        assert!(eval_fn_err("current_schemas", vec![Value::Int32(1)]).contains("boolean"));
+
+        assert_eq!(eval_fn("to_regtype", vec![Value::Null]), Value::Null);
+        assert_eq!(
+            eval_fn("to_regtype", vec![Value::RegType(Oid::new(23))]),
+            Value::RegType(Oid::new(23))
+        );
+        assert_eq!(
+            eval_fn("to_regtype", vec![Value::Text("int4".into())]),
+            Value::RegType(Oid::new(23))
+        );
+        assert!(eval_fn_err("to_regtype", vec![]).contains("expected 1 arg"));
+        assert!(eval_fn_err("to_regtype", vec![Value::Int32(1)]).contains("text argument"));
+
+        for name in [
+            "pg_table_is_visible",
+            "pg_is_other_temp_schema",
+            "pg_function_is_visible",
+            "pg_relation_is_publishable",
+        ] {
+            assert!(matches!(
+                eval_fn(name, vec![Value::Null]),
+                Value::Null | Value::Bool(false)
+            ));
+            assert!(matches!(
+                eval_fn(name, vec![Value::Oid(Oid::new(1))]),
+                Value::Bool(_)
+            ));
+            assert!(eval_fn_err(name, vec![]).contains("expected 1 arg"));
+            if name != "pg_relation_is_publishable" {
+                assert!(eval_fn_err(name, vec![Value::Text("bad".into())]).contains("OID"));
+            }
+        }
+
+        assert_eq!(
+            eval_fn(
+                "set_config",
+                vec![
+                    Value::Text("work_mem".into()),
+                    Value::Text("4MB".into()),
+                    Value::Bool(true),
+                ],
+            ),
+            Value::Text("4MB".into())
+        );
+        assert_eq!(
+            eval_fn(
+                "set_config",
+                vec![Value::Null, Value::Text("x".into()), Value::Bool(false)]
+            ),
+            Value::Null
+        );
+        assert!(eval_fn_err("set_config", vec![]).contains("expected 3 args"));
+        assert!(
+            eval_fn_err(
+                "set_config",
+                vec![Value::Int32(1), Value::Text("x".into()), Value::Bool(false)]
+            )
+            .contains("setting name")
+        );
+        assert!(
+            eval_fn_err(
+                "set_config",
+                vec![Value::Text("x".into()), Value::Int32(1), Value::Bool(false)]
+            )
+            .contains("setting value")
+        );
+        assert!(
+            eval_fn_err(
+                "set_config",
+                vec![
+                    Value::Text("x".into()),
+                    Value::Text("y".into()),
+                    Value::Int32(1)
+                ]
+            )
+            .contains("local flag")
+        );
+
+        for (oid, name) in [
+            (16, "boolean"),
+            (17, "bytea"),
+            (20, "bigint"),
+            (23, "integer"),
+            (25, "text"),
+            (2950, "uuid"),
+            (3802, "jsonb"),
+            (999_999, "text"),
+        ] {
+            assert_eq!(
+                eval_fn("format_type", vec![Value::Oid(Oid::new(oid)), Value::Null]),
+                Value::Text(name.into())
+            );
+        }
+        assert_eq!(
+            eval_fn("format_type", vec![Value::Null, Value::Null]),
+            Value::Null
+        );
+        assert!(eval_fn_err("format_type", vec![]).contains("expected 2 args"));
+        assert!(
+            eval_fn_err("format_type", vec![Value::Text("bad".into()), Value::Null])
+                .contains("oid")
+        );
+
+        assert_eq!(
+            eval_fn(
+                "pg_get_expr",
+                vec![Value::Text("x + 1".into()), Value::Oid(Oid::new(1))]
+            ),
+            Value::Text("x + 1".into())
+        );
+        assert_eq!(
+            eval_fn(
+                "pg_get_expr",
+                vec![
+                    Value::Text("x + 1".into()),
+                    Value::Oid(Oid::new(1)),
+                    Value::Bool(false)
+                ]
+            ),
+            Value::Text("x + 1".into())
+        );
+        assert_eq!(
+            eval_fn("pg_get_expr", vec![Value::Null, Value::Oid(Oid::new(1))]),
+            Value::Null
+        );
+        assert!(eval_fn_err("pg_get_expr", vec![]).contains("expected 2 or 3 args"));
+        assert!(
+            eval_fn_err(
+                "pg_get_expr",
+                vec![Value::Int32(1), Value::Oid(Oid::new(1))]
+            )
+            .contains("expression text")
+        );
+
+        for name in [
+            "pg_get_indexdef",
+            "pg_get_constraintdef",
+            "pg_get_statisticsobjdef_columns",
+            "pg_get_function_result",
+            "pg_get_function_arguments",
+        ] {
+            assert_eq!(eval_fn(name, vec![Value::Null]), Value::Null);
+            assert!(eval_fn_err(name, vec![Value::Text("bad".into())]).contains("oid"));
+        }
+        assert_eq!(
+            eval_fn("pg_encoding_to_char", vec![Value::Int32(6)]),
+            Value::Text("UTF8".into())
+        );
+        assert_eq!(
+            eval_fn(
+                "obj_description",
+                vec![Value::Oid(Oid::new(1)), Value::Text("pg_class".into())]
+            ),
+            Value::Null
+        );
+        assert_eq!(
+            eval_fn(
+                "col_description",
+                vec![Value::Oid(Oid::new(1)), Value::Int32(1)]
+            ),
+            Value::Null
+        );
+        assert_eq!(
+            eval_fn(
+                "pg_get_serial_sequence",
+                vec![Value::Text("public.t".into()), Value::Text("id".into())]
+            ),
+            Value::Null
+        );
+
+        let array = Value::Array {
+            element_type: DataType::Int32,
+            elements: vec![Value::Int32(10), Value::Null, Value::Int32(30)],
+        };
+        assert_eq!(
+            eval_fn("array_length", vec![array.clone(), Value::Int32(1)]),
+            Value::Int32(3)
+        );
+        assert_eq!(
+            eval_fn("array_length", vec![Value::Null, Value::Int32(1)]),
+            Value::Null
+        );
+        assert!(
+            eval_fn_err("array_length", vec![Value::Int32(1), Value::Int32(1)]).contains("array")
+        );
+        assert!(
+            eval_fn_err("array_length", vec![array.clone(), Value::Text("1".into())])
+                .contains("dimension")
+        );
+        assert_eq!(
+            eval_fn("array_position", vec![array.clone(), Value::Int32(30)]),
+            Value::Int32(3)
+        );
+        assert_eq!(
+            eval_fn("array_position", vec![array.clone(), Value::Int32(99)]),
+            Value::Null
+        );
+        assert_eq!(
+            eval_fn(
+                "array_to_string",
+                vec![
+                    array.clone(),
+                    Value::Text(",".into()),
+                    Value::Text("NULL".into())
+                ]
+            ),
+            Value::Text("10,NULL,30".into())
+        );
+        assert_eq!(
+            eval_fn(
+                "string_to_array",
+                vec![Value::Text("a,b".into()), Value::Text(",".into())]
+            ),
+            Value::Array {
+                element_type: DataType::Text { max_len: None },
+                elements: vec![Value::Text("a".into()), Value::Text("b".into())],
+            }
+        );
+        assert_eq!(
+            eval_fn(
+                "__ultrasql_array_subscript",
+                vec![array.clone(), Value::Int32(2)]
+            ),
+            Value::Null
+        );
+        assert_eq!(
+            eval_fn(
+                "__ultrasql_array_subscript",
+                vec![array.clone(), Value::Int32(3)]
+            ),
+            Value::Int32(30)
+        );
+        assert_eq!(
+            eval_fn(
+                "__ultrasql_eq_any_array",
+                vec![Value::Int32(10), array.clone()]
+            ),
+            Value::Bool(true)
+        );
+        assert_eq!(
+            eval_fn("__ultrasql_eq_any_array", vec![Value::Int32(20), array]),
+            Value::Null
+        );
+    }
+
     // -----------------------------------------------------------------------
     // Column reference
     // -----------------------------------------------------------------------
@@ -4934,6 +5580,641 @@ mod tests {
     fn literal_returns_its_value() {
         let ev = Eval::new(lit_i32(42));
         assert_eq!(ev.eval(&[]).unwrap(), Value::Int32(42));
+    }
+
+    #[test]
+    fn catalog_compatibility_functions_cover_visible_oid_and_description_paths() {
+        assert_eq!(
+            eval_fn("pg_typeof", vec![Value::Int32(1)]),
+            Value::Text("integer".to_owned())
+        );
+        assert_eq!(
+            eval_fn("current_schemas", vec![Value::Bool(true)]),
+            Value::Array {
+                element_type: DataType::Text { max_len: None },
+                elements: vec![
+                    Value::Text("pg_catalog".to_owned()),
+                    Value::Text("public".to_owned())
+                ],
+            }
+        );
+        assert_eq!(
+            eval_fn(
+                "to_regtype",
+                vec![Value::Text("pg_catalog.int4".to_owned())]
+            ),
+            Value::RegType(Oid::new(23))
+        );
+        assert_eq!(
+            eval_fn("pg_table_is_visible", vec![Value::RegClass(Oid::new(1259))]),
+            Value::Bool(true)
+        );
+        assert_eq!(
+            eval_fn("pg_is_other_temp_schema", vec![Value::Oid(Oid::new(11))]),
+            Value::Bool(false)
+        );
+        assert_eq!(
+            eval_fn("pg_function_is_visible", vec![Value::Int64(42)]),
+            Value::Bool(true)
+        );
+        assert_eq!(
+            eval_fn("pg_relation_is_publishable", vec![Value::Null]),
+            Value::Bool(false)
+        );
+        assert_eq!(
+            eval_fn(
+                "set_config",
+                vec![
+                    Value::Text("search_path".to_owned()),
+                    Value::Text("public".to_owned()),
+                    Value::Bool(true),
+                ],
+            ),
+            Value::Text("public".to_owned())
+        );
+        assert_eq!(
+            eval_fn("format_type", vec![Value::Oid(Oid::new(1700)), Value::Null]),
+            Value::Text("numeric".to_owned())
+        );
+        assert_eq!(
+            eval_fn(
+                "pg_get_expr",
+                vec![Value::Text("a + b".to_owned()), Value::Oid(Oid::new(1))],
+            ),
+            Value::Text("a + b".to_owned())
+        );
+        assert_eq!(
+            eval_fn("pg_get_indexdef", vec![Value::Oid(Oid::new(42))]),
+            Value::Text("index 42".to_owned())
+        );
+        assert_eq!(
+            eval_fn(
+                "pg_get_constraintdef",
+                vec![Value::Oid(Oid::new(7)), Value::Bool(true)],
+            ),
+            Value::Text("constraint 7".to_owned())
+        );
+        assert_eq!(
+            eval_fn("pg_get_statisticsobjdef_columns", vec![Value::Int32(9)]),
+            Value::Text(String::new())
+        );
+        assert_eq!(
+            eval_fn("pg_get_function_result", vec![Value::RegType(Oid::new(10))]),
+            Value::Text(String::new())
+        );
+        assert_eq!(
+            eval_fn("pg_get_function_arguments", vec![Value::Int16(10)]),
+            Value::Text(String::new())
+        );
+        assert_eq!(
+            eval_fn("pg_encoding_to_char", vec![Value::Int32(6)]),
+            Value::Text("UTF8".to_owned())
+        );
+        assert_eq!(
+            eval_fn(
+                "obj_description",
+                vec![Value::Oid(Oid::new(1)), Value::Text("pg_class".to_owned())],
+            ),
+            Value::Null
+        );
+        assert_eq!(
+            eval_fn(
+                "col_description",
+                vec![Value::Oid(Oid::new(1)), Value::Int32(2)]
+            ),
+            Value::Null
+        );
+        assert_eq!(
+            eval_fn(
+                "pg_get_serial_sequence",
+                vec![Value::Text("t".to_owned()), Value::Text("id".to_owned()),],
+            ),
+            Value::Null
+        );
+    }
+
+    #[test]
+    fn cast_and_size_helpers_cover_oid_reg_and_text_surfaces() {
+        assert_eq!(
+            eval_fn("__ultrasql_cast_oid", vec![Value::Int64(42)]),
+            Value::Oid(Oid::new(42))
+        );
+        assert_eq!(
+            eval_fn("__ultrasql_cast_regclass", vec![Value::Oid(Oid::new(43))]),
+            Value::RegClass(Oid::new(43))
+        );
+        assert_eq!(
+            eval_fn(
+                "__ultrasql_cast_regtype",
+                vec![Value::RegClass(Oid::new(44))]
+            ),
+            Value::RegType(Oid::new(44))
+        );
+        assert_eq!(
+            eval_fn("__ultrasql_cast_text", vec![Value::Money(1234)]),
+            Value::Text("$12.34".to_owned())
+        );
+        assert_eq!(
+            eval_fn("pg_size_pretty", vec![Value::Int64(1536)]),
+            Value::Text("1 kB".to_owned())
+        );
+        assert!(
+            matches!(eval_fn("gen_random_uuid", vec![]), Value::Uuid(_)),
+            "gen_random_uuid should emit uuid bytes"
+        );
+        assert!(
+            eval_fn_err("__ultrasql_cast_oid", vec![Value::Int64(-1)])
+                .contains("value out of range")
+        );
+    }
+
+    #[test]
+    fn text_math_regex_and_format_helpers_cover_common_scalar_paths() {
+        assert_eq!(eval_fn("abs", vec![Value::Int32(-7)]), Value::Int64(7));
+        assert_eq!(
+            eval_fn("lower", vec![Value::Text("MiXeD".to_owned())]),
+            Value::Text("mixed".to_owned())
+        );
+        assert_eq!(
+            eval_fn("upper", vec![Value::Text("MiXeD".to_owned())]),
+            Value::Text("MIXED".to_owned())
+        );
+        assert_eq!(eval_fn("pi", vec![]), Value::Float64(std::f64::consts::PI));
+        assert!(matches!(eval_fn("random", vec![]), Value::Float64(v) if (0.0..1.0).contains(&v)));
+        assert_eq!(
+            eval_fn("length", vec![Value::Text("abc".to_owned())]),
+            Value::Int32(3)
+        );
+        assert_eq!(
+            eval_fn(
+                "bit_length",
+                vec![Value::BitString(BitString::parse("10101").expect("bits"))]
+            ),
+            Value::Int32(5)
+        );
+        assert_eq!(
+            eval_fn(
+                "octet_length",
+                vec![Value::BitString(BitString::parse("10101").expect("bits"))]
+            ),
+            Value::Int32(1)
+        );
+        assert_eq!(
+            eval_fn("trim", vec![Value::Text("  hi  ".to_owned())]),
+            Value::Text("hi".to_owned())
+        );
+        assert_eq!(
+            eval_fn(
+                "lpad",
+                vec![
+                    Value::Text("7".to_owned()),
+                    Value::Int32(3),
+                    Value::Text("0".to_owned())
+                ]
+            ),
+            Value::Text("007".to_owned())
+        );
+        assert_eq!(
+            eval_fn(
+                "rpad",
+                vec![
+                    Value::Text("7".to_owned()),
+                    Value::Int32(3),
+                    Value::Text("0".to_owned())
+                ]
+            ),
+            Value::Text("700".to_owned())
+        );
+        assert_eq!(
+            eval_fn(
+                "left",
+                vec![Value::Text("abcdef".to_owned()), Value::Int32(2)]
+            ),
+            Value::Text("ab".to_owned())
+        );
+        assert_eq!(
+            eval_fn(
+                "right",
+                vec![Value::Text("abcdef".to_owned()), Value::Int32(2)]
+            ),
+            Value::Text("ef".to_owned())
+        );
+        assert_eq!(
+            eval_fn(
+                "position",
+                vec![
+                    Value::Text("cd".to_owned()),
+                    Value::Text("abcdef".to_owned())
+                ]
+            ),
+            Value::Int32(3)
+        );
+        assert_eq!(
+            eval_fn(
+                "replace",
+                vec![
+                    Value::Text("banana".to_owned()),
+                    Value::Text("na".to_owned()),
+                    Value::Text("NA".to_owned())
+                ]
+            ),
+            Value::Text("baNANA".to_owned())
+        );
+        assert_eq!(
+            eval_fn(
+                "split_part",
+                vec![
+                    Value::Text("a,b,c".to_owned()),
+                    Value::Text(",".to_owned()),
+                    Value::Int32(2)
+                ]
+            ),
+            Value::Text("b".to_owned())
+        );
+        assert_eq!(
+            eval_fn(
+                "concat",
+                vec![Value::Text("a".to_owned()), Value::Null, Value::Int32(7)]
+            ),
+            Value::Text("a7".to_owned())
+        );
+        assert_eq!(
+            eval_fn(
+                "concat_ws",
+                vec![
+                    Value::Text("-".to_owned()),
+                    Value::Text("a".to_owned()),
+                    Value::Null,
+                    Value::Text("b".to_owned())
+                ]
+            ),
+            Value::Text("a-b".to_owned())
+        );
+        assert_eq!(
+            eval_fn(
+                "repeat",
+                vec![Value::Text("ha".to_owned()), Value::Int32(3)]
+            ),
+            Value::Text("hahaha".to_owned())
+        );
+        assert_eq!(
+            eval_fn("reverse", vec![Value::Text("abc".to_owned())]),
+            Value::Text("cba".to_owned())
+        );
+        assert_eq!(
+            eval_fn("quote_ident", vec![Value::Text("select".to_owned())]),
+            Value::Text("\"select\"".to_owned())
+        );
+        assert_eq!(
+            eval_fn("quote_literal", vec![Value::Text("a'b".to_owned())]),
+            Value::Text("'a''b'".to_owned())
+        );
+        assert_eq!(
+            eval_fn(
+                "format",
+                vec![
+                    Value::Text("hello %s %I".to_owned()),
+                    Value::Text("x".to_owned()),
+                    Value::Text("select".to_owned())
+                ]
+            ),
+            Value::Text("hello x \"select\"".to_owned())
+        );
+        assert_eq!(
+            eval_fn(
+                "regexp_replace",
+                vec![
+                    Value::Text("abc123".to_owned()),
+                    Value::Text("[0-9]+".to_owned()),
+                    Value::Text("!".to_owned())
+                ]
+            ),
+            Value::Text("abc!".to_owned())
+        );
+    }
+
+    #[test]
+    fn date_json_xml_bit_and_network_helpers_cover_scalar_edges() {
+        let date = eval_fn(
+            "make_date",
+            vec![Value::Int32(2024), Value::Int32(2), Value::Int32(29)],
+        );
+        assert_eq!(
+            eval_fn(
+                "extract",
+                vec![Value::Text("year".to_owned()), date.clone()]
+            ),
+            Value::Int64(2024)
+        );
+        assert_eq!(
+            eval_fn(
+                "extract",
+                vec![Value::Text("month".to_owned()), date.clone()]
+            ),
+            Value::Int64(2)
+        );
+        assert_eq!(
+            eval_fn("extract", vec![Value::Text("day".to_owned()), date]),
+            Value::Int64(29)
+        );
+        assert_eq!(
+            eval_fn(
+                "extract",
+                vec![Value::Text("hour".to_owned()), Value::Time(3_661_000_000)]
+            ),
+            Value::Int64(1)
+        );
+        assert_eq!(
+            eval_fn(
+                "extract",
+                vec![
+                    Value::Text("minute".to_owned()),
+                    Value::Interval {
+                        months: 14,
+                        days: 2,
+                        microseconds: 7_200_000_000,
+                    },
+                ]
+            ),
+            Value::Int64(0)
+        );
+        assert_eq!(
+            eval_fn(
+                "date_trunc",
+                vec![
+                    Value::Text("minute".to_owned()),
+                    Value::TimestampTz(123_456_789),
+                ]
+            ),
+            Value::TimestampTz(120_000_000)
+        );
+        assert_eq!(
+            eval_fn(
+                "age",
+                vec![
+                    Value::Timestamp(2 * 86_400_000_000 + 1_000_000),
+                    Value::Timestamp(0),
+                ]
+            ),
+            Value::Interval {
+                months: 0,
+                days: 2,
+                microseconds: 1_000_000,
+            }
+        );
+        assert_eq!(
+            eval_fn(
+                "date_bin",
+                vec![
+                    Value::Interval {
+                        months: 0,
+                        days: 0,
+                        microseconds: 15 * 60_000_000,
+                    },
+                    Value::TimestampTz(46 * 60_000_000),
+                    Value::TimestampTz(0),
+                ]
+            ),
+            Value::TimestampTz(45 * 60_000_000)
+        );
+        assert!(
+            eval_fn_err(
+                "make_date",
+                vec![Value::Int32(2024), Value::Int32(2), Value::Int32(30)]
+            )
+            .contains("invalid date")
+        );
+        assert!(
+            eval_fn_err(
+                "date_bin",
+                vec![
+                    Value::Interval {
+                        months: 1,
+                        days: 0,
+                        microseconds: 0,
+                    },
+                    Value::TimestampTz(0),
+                    Value::TimestampTz(0),
+                ],
+            )
+            .contains("month stride")
+        );
+
+        let bits = Value::BitString(BitString::parse("1010").expect("bits"));
+        assert_eq!(eval_fn("bit_count", vec![bits.clone()]), Value::Int64(2));
+        assert_eq!(
+            eval_fn("get_bit", vec![bits.clone(), Value::Int32(2)]),
+            Value::Int32(1)
+        );
+        assert_eq!(
+            eval_fn("set_bit", vec![bits, Value::Int32(1), Value::Int32(1)]),
+            Value::BitString(BitString::parse("1110").expect("bits"))
+        );
+        assert!(
+            eval_fn_err(
+                "set_bit",
+                vec![
+                    Value::BitString(BitString::parse("10").expect("bits")),
+                    Value::Int32(0),
+                    Value::Int32(2),
+                ],
+            )
+            .contains("new value")
+        );
+
+        assert_eq!(
+            eval_fn(
+                "json_build_object",
+                vec![
+                    Value::Text("a".to_owned()),
+                    Value::Int32(1),
+                    Value::Text("b".to_owned()),
+                    Value::Bool(true),
+                ]
+            ),
+            Value::Jsonb(r#"{"a":1,"b":true}"#.to_owned())
+        );
+        assert_eq!(
+            eval_fn(
+                "jsonb_set",
+                vec![
+                    Value::Jsonb(r#"{"a":{"b":1}}"#.to_owned()),
+                    Value::Array {
+                        element_type: DataType::Text { max_len: None },
+                        elements: vec![Value::Text("a".to_owned()), Value::Text("b".to_owned())],
+                    },
+                    Value::Int32(9),
+                    Value::Bool(true),
+                ]
+            ),
+            Value::Jsonb(r#"{"a":{"b":9}}"#.to_owned())
+        );
+        assert_eq!(
+            eval_fn(
+                "jsonb_path_exists",
+                vec![
+                    Value::Jsonb(r#"{"items":[{"score":12},{"score":25}]}"#.to_owned()),
+                    Value::Text("$.items[*] ? (@.score >= 20)".to_owned()),
+                ]
+            ),
+            Value::Bool(true)
+        );
+        assert_eq!(
+            eval_fn(
+                "row_to_json",
+                vec![Value::Record(vec![
+                    ("id".to_owned(), Value::Int32(1)),
+                    ("name".to_owned(), Value::Text("a".to_owned())),
+                ])]
+            ),
+            Value::Jsonb(r#"{"id":1,"name":"a"}"#.to_owned())
+        );
+
+        assert_eq!(
+            eval_fn(
+                "xml_is_well_formed_document",
+                vec![Value::Text(
+                    "<root><item id=\"2\">b</item></root>".to_owned()
+                )]
+            ),
+            Value::Bool(true)
+        );
+        assert_eq!(
+            eval_fn(
+                "xpath_exists",
+                vec![
+                    Value::Text("/root/item[@id=\"2\"]".to_owned()),
+                    Value::Xml("<root><item id=\"1\"/><item id=\"2\">b</item></root>".to_owned()),
+                ]
+            ),
+            Value::Bool(true)
+        );
+        assert_eq!(
+            eval_fn(
+                "xpath",
+                vec![
+                    Value::Text("/root/item".to_owned()),
+                    Value::Xml("<root><item>a</item><item>b</item></root>".to_owned()),
+                ]
+            ),
+            Value::Array {
+                element_type: DataType::Xml,
+                elements: vec![
+                    Value::Xml("<item>a</item>".to_owned()),
+                    Value::Xml("<item>b</item>".to_owned()),
+                ],
+            }
+        );
+
+        let lit_inet = |text: &str| ScalarExpr::Literal {
+            value: inet(text),
+            data_type: DataType::Inet,
+        };
+        let network_add = ScalarExpr::Binary {
+            op: BinaryOp::Add,
+            left: Box::new(lit_inet("192.168.1.10")),
+            right: Box::new(lit_i32(5)),
+            data_type: DataType::Inet,
+        };
+        assert_eq!(
+            Eval::new(network_add).eval(&[]).expect("network add"),
+            inet("192.168.1.15")
+        );
+        let network_sub = ScalarExpr::Binary {
+            op: BinaryOp::Sub,
+            left: Box::new(lit_inet("192.168.1.15")),
+            right: Box::new(lit_inet("192.168.1.10")),
+            data_type: DataType::Int64,
+        };
+        assert_eq!(
+            Eval::new(network_sub).eval(&[]).expect("network sub"),
+            Value::Int64(5)
+        );
+    }
+
+    #[test]
+    fn numeric_and_case_function_dispatch_covers_common_edges() {
+        assert_float_close(eval_fn("ceil", vec![Value::Float64(1.2)]), 2.0);
+        assert_float_close(eval_fn("floor", vec![Value::Float64(1.8)]), 1.0);
+        assert_float_close(eval_fn("round", vec![Value::Float64(1.5)]), 2.0);
+        assert_float_close(eval_fn("trunc", vec![Value::Float64(1.9)]), 1.0);
+        assert_float_close(
+            eval_fn("mod", vec![Value::Float64(7.0), Value::Float64(4.0)]),
+            3.0,
+        );
+        assert_float_close(
+            eval_fn("power", vec![Value::Float64(2.0), Value::Float64(3.0)]),
+            8.0,
+        );
+        assert_float_close(eval_fn("sqrt", vec![Value::Float64(9.0)]), 3.0);
+        assert_float_close(eval_fn("exp", vec![Value::Float64(0.0)]), 1.0);
+        assert_float_close(
+            eval_fn("ln", vec![Value::Float64(std::f64::consts::E)]),
+            1.0,
+        );
+        assert_float_close(eval_fn("log", vec![Value::Float64(100.0)]), 2.0);
+        assert_float_close(eval_fn("sin", vec![Value::Float64(0.0)]), 0.0);
+        assert_float_close(eval_fn("cos", vec![Value::Float64(0.0)]), 1.0);
+        assert_float_close(eval_fn("tan", vec![Value::Float64(0.0)]), 0.0);
+        assert_float_close(
+            eval_fn("asin", vec![Value::Float64(1.0)]),
+            std::f64::consts::FRAC_PI_2,
+        );
+        assert_float_close(eval_fn("acos", vec![Value::Float64(1.0)]), 0.0);
+        assert_float_close(
+            eval_fn("atan", vec![Value::Float64(1.0)]),
+            std::f64::consts::FRAC_PI_4,
+        );
+        assert!(eval_fn_err("sqrt", vec![Value::Text("bad".to_owned())]).contains("numeric"));
+
+        assert_eq!(
+            eval_fn(
+                "case_searched",
+                vec![
+                    Value::Bool(false),
+                    Value::Text("no".to_owned()),
+                    Value::Null,
+                    Value::Text("skip".to_owned()),
+                    Value::Bool(true),
+                    Value::Text("yes".to_owned()),
+                    Value::Text("else".to_owned()),
+                ],
+            ),
+            Value::Text("yes".to_owned())
+        );
+        assert!(
+            eval_fn_err(
+                "case_searched",
+                vec![Value::Int32(1), Value::Text("bad".to_owned()), Value::Null],
+            )
+            .contains("WHEN clause")
+        );
+        assert_eq!(
+            eval_fn(
+                "case_simple",
+                vec![
+                    Value::Int32(2),
+                    Value::Int32(1),
+                    Value::Text("one".to_owned()),
+                    Value::Int32(2),
+                    Value::Text("two".to_owned()),
+                    Value::Text("else".to_owned()),
+                ],
+            ),
+            Value::Text("two".to_owned())
+        );
+        assert_eq!(
+            eval_fn(
+                "case_simple",
+                vec![
+                    Value::Null,
+                    Value::Null,
+                    Value::Text("null".to_owned()),
+                    Value::Text("else".to_owned()),
+                ],
+            ),
+            Value::Text("else".to_owned())
+        );
     }
 
     #[test]
