@@ -3580,6 +3580,7 @@ dependencies = [
  "proptest",
  "serde_json",
  "smallvec",
+ "tempfile",
  "thiserror",
  "tracing",
  "ultrasql-catalog",

@@ -358,6 +358,20 @@ const fn display_binary(op: BinaryOp) -> &'static str {
 mod tests {
     use super::*;
 
+    fn lit(value: i32) -> ScalarExpr {
+        ScalarExpr::Literal {
+            value: Value::Int32(value),
+            data_type: DataType::Int32,
+        }
+    }
+
+    fn empty_plan_with_field(name: &str, data_type: DataType) -> LogicalPlan {
+        LogicalPlan::Empty {
+            schema: ultrasql_core::Schema::new([ultrasql_core::Field::nullable(name, data_type)])
+                .expect("schema"),
+        }
+    }
+
     #[test]
     fn data_type_accessor_returns_carried_type() {
         let lit = ScalarExpr::Literal {
@@ -388,5 +402,253 @@ mod tests {
             data_type: DataType::Int32,
         };
         assert_eq!(e.to_string(), "(1 + 2)");
+    }
+
+    #[test]
+    fn data_type_accessor_covers_subquery_and_function_variants() {
+        let subplan = empty_plan_with_field("v", DataType::Float64);
+        let variants = [
+            ScalarExpr::Column {
+                name: "v".into(),
+                index: 0,
+                data_type: DataType::Float64,
+            },
+            ScalarExpr::Parameter {
+                index: 1,
+                data_type: DataType::Text { max_len: None },
+            },
+            ScalarExpr::Unary {
+                op: UnaryOp::Neg,
+                expr: Box::new(lit(1)),
+                data_type: DataType::Int32,
+            },
+            ScalarExpr::OuterColumn {
+                name: "outer_v".into(),
+                frame_depth: 1,
+                column_index: 0,
+                data_type: DataType::Int64,
+            },
+            ScalarExpr::ScalarSubquery {
+                subplan: Box::new(subplan.clone()),
+                correlated: false,
+                data_type: DataType::Float64,
+            },
+            ScalarExpr::FunctionCall {
+                name: "lower".into(),
+                args: vec![],
+                data_type: DataType::Text { max_len: None },
+            },
+        ];
+        assert_eq!(variants[0].data_type(), DataType::Float64);
+        assert_eq!(variants[1].data_type(), DataType::Text { max_len: None });
+        assert_eq!(variants[2].data_type(), DataType::Int32);
+        assert_eq!(variants[3].data_type(), DataType::Int64);
+        assert_eq!(variants[4].data_type(), DataType::Float64);
+        assert_eq!(variants[5].data_type(), DataType::Text { max_len: None });
+
+        assert_eq!(
+            ScalarExpr::Exists {
+                subplan: Box::new(subplan.clone()),
+                negated: false,
+                correlated: false,
+            }
+            .data_type(),
+            DataType::Bool
+        );
+        assert_eq!(
+            ScalarExpr::InSubquery {
+                expr: Box::new(lit(1)),
+                subplan: Box::new(subplan),
+                negated: false,
+                correlated: false,
+                data_type: DataType::Int32,
+            }
+            .data_type(),
+            DataType::Bool
+        );
+    }
+
+    #[test]
+    fn contains_outer_column_recurses_through_scalar_children_only() {
+        let outer = ScalarExpr::OuterColumn {
+            name: "id".into(),
+            frame_depth: 1,
+            column_index: 0,
+            data_type: DataType::Int32,
+        };
+        assert!(
+            ScalarExpr::Unary {
+                op: UnaryOp::Neg,
+                expr: Box::new(outer.clone()),
+                data_type: DataType::Int32,
+            }
+            .contains_outer_column()
+        );
+        assert!(
+            ScalarExpr::Binary {
+                op: BinaryOp::Eq,
+                left: Box::new(lit(1)),
+                right: Box::new(outer.clone()),
+                data_type: DataType::Bool,
+            }
+            .contains_outer_column()
+        );
+        assert!(
+            ScalarExpr::FunctionCall {
+                name: "abs".into(),
+                args: vec![outer],
+                data_type: DataType::Int32,
+            }
+            .contains_outer_column()
+        );
+        assert!(
+            !ScalarExpr::ScalarSubquery {
+                subplan: Box::new(empty_plan_with_field("id", DataType::Int32)),
+                correlated: true,
+                data_type: DataType::Int32,
+            }
+            .contains_outer_column()
+        );
+    }
+
+    #[test]
+    fn display_renders_every_expression_shape() {
+        let plan = empty_plan_with_field("v", DataType::Int32);
+        assert_eq!(
+            ScalarExpr::Column {
+                name: "id".into(),
+                index: 0,
+                data_type: DataType::Int32,
+            }
+            .to_string(),
+            "id"
+        );
+        assert_eq!(
+            ScalarExpr::Parameter {
+                index: 3,
+                data_type: DataType::Int32,
+            }
+            .to_string(),
+            "$3"
+        );
+        assert_eq!(
+            ScalarExpr::Unary {
+                op: UnaryOp::Not,
+                expr: Box::new(ScalarExpr::IsNull {
+                    expr: Box::new(lit(1)),
+                    negated: true,
+                }),
+                data_type: DataType::Bool,
+            }
+            .to_string(),
+            "NOT (1 IS NOT NULL)"
+        );
+        assert_eq!(
+            ScalarExpr::OuterColumn {
+                name: "id".into(),
+                frame_depth: 2,
+                column_index: 0,
+                data_type: DataType::Int32,
+            }
+            .to_string(),
+            "outer[2].id"
+        );
+        assert_eq!(
+            ScalarExpr::ScalarSubquery {
+                subplan: Box::new(plan.clone()),
+                correlated: true,
+                data_type: DataType::Int32,
+            }
+            .to_string(),
+            "(SUBQUERY[correlated])"
+        );
+        assert_eq!(
+            ScalarExpr::Exists {
+                subplan: Box::new(plan.clone()),
+                negated: true,
+                correlated: true,
+            }
+            .to_string(),
+            "NOT EXISTS[correlated]"
+        );
+        assert_eq!(
+            ScalarExpr::InSubquery {
+                expr: Box::new(lit(1)),
+                subplan: Box::new(plan),
+                negated: true,
+                correlated: false,
+                data_type: DataType::Int32,
+            }
+            .to_string(),
+            "(1 NOT IN SUBQUERY[uncorrelated])"
+        );
+        assert_eq!(
+            ScalarExpr::FunctionCall {
+                name: "coalesce".into(),
+                args: vec![lit(1), lit(2)],
+                data_type: DataType::Int32,
+            }
+            .to_string(),
+            "coalesce(1, 2)"
+        );
+    }
+
+    #[test]
+    fn display_renders_all_binary_operator_tokens() {
+        for (op, token) in [
+            (BinaryOp::Add, "+"),
+            (BinaryOp::Sub, "-"),
+            (BinaryOp::Mul, "*"),
+            (BinaryOp::Div, "/"),
+            (BinaryOp::Mod, "%"),
+            (BinaryOp::Pow, "^"),
+            (BinaryOp::Concat, "||"),
+            (BinaryOp::Eq, "="),
+            (BinaryOp::NotEq, "<>"),
+            (BinaryOp::Lt, "<"),
+            (BinaryOp::LtEq, "<="),
+            (BinaryOp::Gt, ">"),
+            (BinaryOp::GtEq, ">="),
+            (BinaryOp::VectorL2Distance, "<->"),
+            (BinaryOp::VectorNegativeInnerProduct, "<#>"),
+            (BinaryOp::VectorCosineDistance, "<=>"),
+            (BinaryOp::VectorL1Distance, "<+>"),
+            (BinaryOp::And, "AND"),
+            (BinaryOp::Or, "OR"),
+            (BinaryOp::Like, "LIKE"),
+            (BinaryOp::NotLike, "NOT LIKE"),
+            (BinaryOp::Ilike, "ILIKE"),
+            (BinaryOp::NotIlike, "NOT ILIKE"),
+            (BinaryOp::RegexMatch, "~"),
+            (BinaryOp::RegexIMatch, "~*"),
+            (BinaryOp::RegexNotMatch, "!~"),
+            (BinaryOp::RegexNotIMatch, "!~*"),
+            (BinaryOp::BitAnd, "&"),
+            (BinaryOp::BitOr, "|"),
+            (BinaryOp::BitXor, "#"),
+            (BinaryOp::ShiftLeft, "<<"),
+            (BinaryOp::ShiftRight, ">>"),
+            (BinaryOp::NetworkContainedEq, "<<="),
+            (BinaryOp::NetworkContainsEq, ">>="),
+            (BinaryOp::JsonGet, "->"),
+            (BinaryOp::JsonGetText, "->>"),
+            (BinaryOp::JsonGetPath, "#>"),
+            (BinaryOp::JsonGetPathText, "#>>"),
+            (BinaryOp::JsonContains, "@>"),
+            (BinaryOp::JsonContained, "<@"),
+            (BinaryOp::Overlap, "&&"),
+            (BinaryOp::JsonHasKey, "?"),
+            (BinaryOp::JsonHasAnyKey, "?|"),
+            (BinaryOp::JsonHasAllKeys, "?&"),
+            (BinaryOp::TextSearchMatch, "@@"),
+        ] {
+            let expr = ScalarExpr::Binary {
+                op,
+                left: Box::new(lit(1)),
+                right: Box::new(lit(2)),
+                data_type: DataType::Bool,
+            };
+            assert_eq!(expr.to_string(), format!("(1 {token} 2)"));
+        }
     }
 }

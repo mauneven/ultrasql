@@ -367,15 +367,26 @@ fn extract_literal_value(expr: &ScalarExpr) -> Option<Value> {
             ScalarExpr::Literal {
                 value: Value::Int32(v),
                 ..
-            } => Some(Value::Int32(-v)),
+            } => v.checked_neg().map(Value::Int32),
             ScalarExpr::Literal {
                 value: Value::Int64(v),
                 ..
-            } => Some(Value::Int64(-v)),
+            } => v.checked_neg().map(Value::Int64),
             ScalarExpr::Literal {
                 value: Value::Float64(v),
                 ..
             } => Some(Value::Float64(-v)),
+            ScalarExpr::Literal {
+                value: Value::Decimal { value, scale },
+                ..
+            } => value.checked_neg().map(|value| Value::Decimal {
+                value,
+                scale: *scale,
+            }),
+            ScalarExpr::Literal {
+                value: Value::Money(v),
+                ..
+            } => v.checked_neg().map(Value::Money),
             _ => None,
         },
         _ => None,

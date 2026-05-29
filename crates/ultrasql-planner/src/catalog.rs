@@ -258,7 +258,9 @@ impl Catalog for ultrasql_catalog::CatalogSnapshot {
 
 #[cfg(test)]
 mod tests {
-    use ultrasql_core::{DataType, Field};
+    use std::sync::Arc;
+
+    use ultrasql_core::{DataType, Field, Oid};
 
     use super::*;
 
@@ -292,5 +294,65 @@ mod tests {
         );
         let previous = cat.register("users", replacement);
         assert_eq!(previous, Some(first));
+    }
+
+    #[test]
+    fn builtin_type_oids_cover_supported_aliases() {
+        for (name, oid) in [
+            ("bool", 16),
+            ("boolean", 16),
+            ("bytea", 17),
+            ("bigint", 20),
+            ("int8", 20),
+            ("smallint", 21),
+            ("int2", 21),
+            ("int", 23),
+            ("integer", 23),
+            ("int4", 23),
+            ("text", 25),
+            ("oid", 26),
+            ("cidr", 650),
+            ("real", 700),
+            ("float4", 700),
+            ("double precision", 701),
+            ("float8", 701),
+            ("macaddr8", 774),
+            ("money", 790),
+            ("macaddr", 829),
+            ("inet", 869),
+            ("char", 1042),
+            ("bpchar", 1042),
+            ("varchar", 1043),
+            ("date", 1082),
+            ("time without time zone", 1083),
+            ("timestamp with time zone", 1184),
+            ("timetz", 1266),
+            ("numeric", 1700),
+            ("decimal", 1700),
+            ("regclass", 2205),
+            ("regtype", 2206),
+            ("uuid", 2950),
+            ("pg_lsn", 3220),
+            ("json", 114),
+            ("jsonb", 3802),
+            ("xml", 142),
+        ] {
+            assert_eq!(builtin_type_oid(name), Some(Oid::new(oid)), "{name}");
+        }
+        assert_eq!(builtin_type_oid("does_not_exist"), None);
+    }
+
+    #[test]
+    fn registered_user_type_oids_override_builtin_fallback() {
+        let mut cat = InMemoryCatalog::new();
+        let enum_type = DataType::Enum {
+            oid: Oid::new(42_001),
+            name: Arc::from("mood"),
+            labels: Arc::from([String::from("sad"), String::from("ok")]),
+        };
+        assert!(cat.register_type("Mood", enum_type.clone()).is_none());
+        assert_eq!(cat.lookup_type("mood"), Some(enum_type));
+        assert_eq!(cat.lookup_type_oid("MOOD"), Some(Oid::new(42_001)));
+        assert_eq!(cat.lookup_type_oid("int4"), Some(Oid::new(23)));
     }
 }

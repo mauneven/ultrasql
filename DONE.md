@@ -74,6 +74,15 @@ as a concise evidence ledger; roadmap stays for open gates only.
   `ultrasql-local` file/query helpers. Package `cargo llvm-cov` plus
   `scripts/coverage_gate.py --min-lines 80` clears `ultrasql-cli` at 84.96%.
   Evidence: `docs/testing/coverage-evidence-2026-05-29-cli.md`.
+- Focused `ultrasql-planner` coverage now exercises table-reference binding,
+  local CSV/JSON inference, Arrow type mapping, expression literals/coercions,
+  builtin validation, window binding, catalog OID resolution, expression
+  display/accessors, logical plan display/schema/pipeline paths, and privilege
+  binding matrices. This also hardened window negative-literal extraction with
+  checked negation for integer, decimal, and money defaults. Package
+  `cargo llvm-cov` plus `scripts/coverage_gate.py --min-lines 80` clears
+  `ultrasql-planner` at 80.19%. Evidence:
+  `docs/testing/coverage-evidence-2026-05-29-planner.md`.
 - Driver-certification CI was repaired, action runtimes refreshed, and release
   workflows validated on `main`.
 - Chaos testing: random kill, WAL truncation, disk full recovery is implemented

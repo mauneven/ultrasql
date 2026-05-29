@@ -394,3 +394,309 @@ pub(super) const fn display_binary(op: BinaryOp) -> &'static str {
         BinaryOp::TextSearchMatch => "@@",
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn decimal(scale: Option<i32>) -> DataType {
+        DataType::Decimal {
+            precision: None,
+            scale,
+        }
+    }
+
+    #[test]
+    fn binary_result_type_covers_numeric_decimal_and_network_arithmetic() {
+        assert_eq!(
+            binary_result_type(BinaryOp::Add, DataType::Int32, DataType::Int64).expect("int add"),
+            DataType::Int64
+        );
+        assert_eq!(
+            binary_result_type(BinaryOp::Add, DataType::Inet, DataType::Int32).expect("inet add"),
+            DataType::Inet
+        );
+        assert_eq!(
+            binary_result_type(BinaryOp::Sub, DataType::Inet, DataType::Cidr).expect("inet diff"),
+            DataType::Int64
+        );
+        assert_eq!(
+            binary_result_type(BinaryOp::Add, decimal(Some(2)), DataType::Int32)
+                .expect("decimal add"),
+            decimal(Some(2))
+        );
+        assert_eq!(
+            binary_result_type(BinaryOp::Mul, decimal(Some(2)), decimal(Some(3)))
+                .expect("decimal mul"),
+            decimal(Some(5))
+        );
+        assert_eq!(
+            binary_result_type(BinaryOp::Div, decimal(Some(2)), decimal(Some(3)))
+                .expect("decimal div"),
+            decimal(Some(6))
+        );
+        assert_eq!(
+            binary_result_type(BinaryOp::Pow, decimal(Some(2)), DataType::Int32)
+                .expect("decimal pow"),
+            decimal(None)
+        );
+        assert_eq!(
+            binary_result_type(BinaryOp::Add, decimal(Some(2)), DataType::Float64)
+                .expect("decimal float"),
+            DataType::Float64
+        );
+        assert!(
+            binary_result_type(
+                BinaryOp::Add,
+                DataType::Text { max_len: None },
+                DataType::Int32
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn binary_result_type_covers_text_bit_bool_and_comparison_families() {
+        assert_eq!(
+            binary_result_type(
+                BinaryOp::Concat,
+                DataType::Text { max_len: None },
+                DataType::Char { len: Some(3) },
+            )
+            .expect("text concat"),
+            DataType::Text { max_len: None }
+        );
+        assert_eq!(
+            binary_result_type(
+                BinaryOp::Concat,
+                DataType::Bit { len: Some(3) },
+                DataType::VarBit { max_len: None },
+            )
+            .expect("bit concat"),
+            DataType::VarBit { max_len: None }
+        );
+        assert!(
+            binary_result_type(
+                BinaryOp::Concat,
+                DataType::Int32,
+                DataType::Text { max_len: None }
+            )
+            .is_err()
+        );
+
+        for op in [
+            BinaryOp::Eq,
+            BinaryOp::NotEq,
+            BinaryOp::Lt,
+            BinaryOp::LtEq,
+            BinaryOp::Gt,
+            BinaryOp::GtEq,
+        ] {
+            assert_eq!(
+                binary_result_type(op, DataType::Int32, DataType::Float64).expect("compare"),
+                DataType::Bool
+            );
+        }
+        assert!(
+            binary_result_type(
+                BinaryOp::Eq,
+                DataType::Vector { dims: Some(3) },
+                DataType::Vector { dims: Some(3) },
+            )
+            .is_err()
+        );
+        assert!(binary_result_type(BinaryOp::Eq, DataType::Jsonb, DataType::Int32).is_err());
+
+        assert_eq!(
+            binary_result_type(BinaryOp::And, DataType::Bool, DataType::Null).expect("bool"),
+            DataType::Bool
+        );
+        assert!(binary_result_type(BinaryOp::Or, DataType::Bool, DataType::Int32).is_err());
+        assert_eq!(
+            binary_result_type(
+                BinaryOp::Like,
+                DataType::Text { max_len: None },
+                DataType::Text { max_len: None },
+            )
+            .expect("like"),
+            DataType::Bool
+        );
+        assert!(
+            binary_result_type(
+                BinaryOp::RegexMatch,
+                DataType::Int32,
+                DataType::Text { max_len: None }
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn binary_result_type_covers_vector_bitwise_shift_json_and_search_ops() {
+        assert_eq!(
+            binary_result_type(
+                BinaryOp::VectorL2Distance,
+                DataType::Vector { dims: Some(3) },
+                DataType::Vector { dims: Some(3) },
+            )
+            .expect("vector l2"),
+            DataType::Float64
+        );
+        assert!(
+            binary_result_type(
+                BinaryOp::VectorCosineDistance,
+                DataType::Vector { dims: Some(3) },
+                DataType::HalfVec { dims: Some(3) },
+            )
+            .is_err()
+        );
+        assert!(
+            binary_result_type(
+                BinaryOp::VectorL1Distance,
+                DataType::SparseVec { dims: Some(3) },
+                DataType::SparseVec { dims: Some(4) },
+            )
+            .is_err()
+        );
+
+        assert_eq!(
+            binary_result_type(BinaryOp::BitAnd, DataType::Inet, DataType::Cidr)
+                .expect("network and"),
+            DataType::Inet
+        );
+        assert_eq!(
+            binary_result_type(BinaryOp::BitOr, DataType::MacAddr, DataType::MacAddr)
+                .expect("mac or"),
+            DataType::MacAddr
+        );
+        assert!(
+            binary_result_type(BinaryOp::BitXor, DataType::MacAddr, DataType::MacAddr8).is_err()
+        );
+        assert_eq!(
+            binary_result_type(
+                BinaryOp::ShiftLeft,
+                DataType::VarBit { max_len: Some(8) },
+                DataType::Int32,
+            )
+            .expect("bit shift"),
+            DataType::VarBit { max_len: Some(8) }
+        );
+        assert_eq!(
+            binary_result_type(BinaryOp::ShiftRight, DataType::Inet, DataType::Cidr)
+                .expect("network shift"),
+            DataType::Bool
+        );
+        assert!(
+            binary_result_type(
+                BinaryOp::ShiftLeft,
+                DataType::Text { max_len: None },
+                DataType::Int32
+            )
+            .is_err()
+        );
+
+        assert_eq!(
+            binary_result_type(BinaryOp::NetworkContainedEq, DataType::Inet, DataType::Cidr)
+                .expect("network contains"),
+            DataType::Bool
+        );
+        assert!(
+            binary_result_type(
+                BinaryOp::NetworkContainsEq,
+                DataType::MacAddr,
+                DataType::Inet
+            )
+            .is_err()
+        );
+        assert_eq!(
+            binary_result_type(
+                BinaryOp::JsonGet,
+                DataType::Jsonb,
+                DataType::Text { max_len: None }
+            )
+            .expect("json get"),
+            DataType::Jsonb
+        );
+        assert_eq!(
+            binary_result_type(
+                BinaryOp::JsonGetText,
+                DataType::Jsonb,
+                DataType::Text { max_len: None },
+            )
+            .expect("json text"),
+            DataType::Text { max_len: None }
+        );
+        for op in [
+            BinaryOp::JsonContains,
+            BinaryOp::JsonContained,
+            BinaryOp::Overlap,
+            BinaryOp::JsonHasKey,
+            BinaryOp::JsonHasAnyKey,
+            BinaryOp::JsonHasAllKeys,
+            BinaryOp::TextSearchMatch,
+        ] {
+            assert_eq!(
+                binary_result_type(op, DataType::Jsonb, DataType::Jsonb).expect("bool op"),
+                DataType::Bool
+            );
+        }
+    }
+
+    #[test]
+    fn displays_every_operator_token() {
+        assert_eq!(display_unary(UnaryOp::Neg), "-");
+        assert_eq!(display_unary(UnaryOp::Pos), "+");
+        assert_eq!(display_unary(UnaryOp::Not), "NOT");
+        assert_eq!(display_unary(UnaryOp::BitNot), "~");
+
+        for (op, token) in [
+            (BinaryOp::Add, "+"),
+            (BinaryOp::Sub, "-"),
+            (BinaryOp::Mul, "*"),
+            (BinaryOp::Div, "/"),
+            (BinaryOp::Mod, "%"),
+            (BinaryOp::Pow, "^"),
+            (BinaryOp::Concat, "||"),
+            (BinaryOp::Eq, "="),
+            (BinaryOp::NotEq, "<>"),
+            (BinaryOp::Lt, "<"),
+            (BinaryOp::LtEq, "<="),
+            (BinaryOp::Gt, ">"),
+            (BinaryOp::GtEq, ">="),
+            (BinaryOp::VectorL2Distance, "<->"),
+            (BinaryOp::VectorNegativeInnerProduct, "<#>"),
+            (BinaryOp::VectorCosineDistance, "<=>"),
+            (BinaryOp::VectorL1Distance, "<+>"),
+            (BinaryOp::And, "AND"),
+            (BinaryOp::Or, "OR"),
+            (BinaryOp::Like, "LIKE"),
+            (BinaryOp::NotLike, "NOT LIKE"),
+            (BinaryOp::Ilike, "ILIKE"),
+            (BinaryOp::NotIlike, "NOT ILIKE"),
+            (BinaryOp::RegexMatch, "~"),
+            (BinaryOp::RegexIMatch, "~*"),
+            (BinaryOp::RegexNotMatch, "!~"),
+            (BinaryOp::RegexNotIMatch, "!~*"),
+            (BinaryOp::BitAnd, "&"),
+            (BinaryOp::BitOr, "|"),
+            (BinaryOp::BitXor, "#"),
+            (BinaryOp::ShiftLeft, "<<"),
+            (BinaryOp::ShiftRight, ">>"),
+            (BinaryOp::NetworkContainedEq, "<<="),
+            (BinaryOp::NetworkContainsEq, ">>="),
+            (BinaryOp::JsonGet, "->"),
+            (BinaryOp::JsonGetText, "->>"),
+            (BinaryOp::JsonGetPath, "#>"),
+            (BinaryOp::JsonGetPathText, "#>>"),
+            (BinaryOp::JsonContains, "@>"),
+            (BinaryOp::JsonContained, "<@"),
+            (BinaryOp::Overlap, "&&"),
+            (BinaryOp::JsonHasKey, "?"),
+            (BinaryOp::JsonHasAnyKey, "?|"),
+            (BinaryOp::JsonHasAllKeys, "?&"),
+            (BinaryOp::TextSearchMatch, "@@"),
+        ] {
+            assert_eq!(display_binary(op), token);
+        }
+    }
+}

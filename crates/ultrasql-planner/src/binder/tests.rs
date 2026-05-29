@@ -5,7 +5,10 @@ use ultrasql_parser::ast::BinaryOp;
 
 use super::*;
 use crate::catalog::{InMemoryCatalog, TableMeta};
-use crate::{LogicalIndexMethod, LogicalPrivilegeKind, LogicalPrivilegeObjectKind};
+use crate::plan::PipelineMode;
+use crate::{
+    LogicalIndexMethod, LogicalPrivilegeKind, LogicalPrivilegeObjectKind, LogicalWindowFunc,
+};
 
 /// Catalog with a single `users` table: id INT, name TEXT, score FLOAT8.
 fn users_catalog() -> InMemoryCatalog {
@@ -3450,4 +3453,382 @@ fn binds_alter_table_rename_to_new_name() {
         panic!("expected RenameTable action");
     };
     assert_eq!(new_name, "subscribers");
+}
+
+fn collect_window_funcs<'a>(plan: &'a LogicalPlan, out: &mut Vec<&'a LogicalWindowFunc>) {
+    match plan {
+        LogicalPlan::Window { input, func, .. } => {
+            out.push(func);
+            collect_window_funcs(input, out);
+        }
+        LogicalPlan::Project { input, .. }
+        | LogicalPlan::Filter { input, .. }
+        | LogicalPlan::Limit { input, .. }
+        | LogicalPlan::Sort { input, .. }
+        | LogicalPlan::Aggregate { input, .. }
+        | LogicalPlan::LockRows { input, .. }
+        | LogicalPlan::Update { input, .. }
+        | LogicalPlan::Delete { input, .. } => collect_window_funcs(input, out),
+        LogicalPlan::Insert { source, .. } => collect_window_funcs(source, out),
+        LogicalPlan::Join { left, right, .. } | LogicalPlan::SetOp { left, right, .. } => {
+            collect_window_funcs(left, out);
+            collect_window_funcs(right, out);
+        }
+        LogicalPlan::Cte {
+            definition, body, ..
+        } => {
+            collect_window_funcs(definition, out);
+            collect_window_funcs(body, out);
+        }
+        LogicalPlan::CreateMaterializedView { source, .. }
+        | LogicalPlan::Explain { input: source, .. }
+        | LogicalPlan::Copy {
+            input: Some(source),
+            ..
+        } => collect_window_funcs(source, out),
+        LogicalPlan::Scan { .. }
+        | LogicalPlan::Empty { .. }
+        | LogicalPlan::Values { .. }
+        | LogicalPlan::FunctionScan { .. }
+        | LogicalPlan::Truncate { .. }
+        | LogicalPlan::CreateTable { .. }
+        | LogicalPlan::CreateTypeEnum { .. }
+        | LogicalPlan::CreateTypeComposite { .. }
+        | LogicalPlan::CreateDomain { .. }
+        | LogicalPlan::CreateIndex { .. }
+        | LogicalPlan::CreatePolicy { .. }
+        | LogicalPlan::CreateRole { .. }
+        | LogicalPlan::AlterRole { .. }
+        | LogicalPlan::DropRole { .. }
+        | LogicalPlan::GrantPrivileges { .. }
+        | LogicalPlan::RevokePrivileges { .. }
+        | LogicalPlan::AlterDefaultPrivileges { .. }
+        | LogicalPlan::GrantRole { .. }
+        | LogicalPlan::RevokeRole { .. }
+        | LogicalPlan::DropTable { .. }
+        | LogicalPlan::AlterTable { .. }
+        | LogicalPlan::CreateSequence { .. }
+        | LogicalPlan::AlterSequence { .. }
+        | LogicalPlan::DropSequence { .. }
+        | LogicalPlan::Comment { .. }
+        | LogicalPlan::Begin { .. }
+        | LogicalPlan::Commit { .. }
+        | LogicalPlan::Rollback { .. }
+        | LogicalPlan::Savepoint { .. }
+        | LogicalPlan::RollbackToSavepoint { .. }
+        | LogicalPlan::ReleaseSavepoint { .. }
+        | LogicalPlan::PrepareTransaction { .. }
+        | LogicalPlan::CommitPrepared { .. }
+        | LogicalPlan::RollbackPrepared { .. }
+        | LogicalPlan::SetTransaction { .. }
+        | LogicalPlan::SetVariable { .. }
+        | LogicalPlan::SetRole { .. }
+        | LogicalPlan::Listen { .. }
+        | LogicalPlan::Notify { .. }
+        | LogicalPlan::Unlisten { .. }
+        | LogicalPlan::Copy { input: None, .. } => {}
+    }
+}
+
+#[test]
+fn binds_window_functions_and_preserves_result_types() {
+    let plan = parse_bind_ok(
+        "SELECT id, row_number() OVER (PARTITION BY name ORDER BY score DESC NULLS FIRST) AS rn \
+         FROM users",
+    );
+    let LogicalPlan::Project { schema, .. } = &plan else {
+        panic!("expected Project");
+    };
+    assert_eq!(schema.field_at(1).name, "rn");
+    assert_eq!(schema.field_at(1).data_type, DataType::Int64);
+
+    let mut funcs = Vec::new();
+    collect_window_funcs(&plan, &mut funcs);
+    assert!(matches!(funcs.as_slice(), [LogicalWindowFunc::RowNumber]));
+    let dump = plan.display(0);
+    assert!(dump.contains("Window: $wn_0 = RowNumber"));
+    assert!(dump.contains("PARTITION BY [name]"));
+    assert!(dump.contains("ORDER BY [score DESC]"));
+}
+
+#[test]
+fn binds_offset_and_value_window_function_arguments() {
+    let plan = parse_bind_ok(
+        "SELECT \
+            lag(score, 2, -1.5) OVER (ORDER BY id) AS lag_score, \
+            lead(name, 1, 'n/a') OVER (ORDER BY id) AS lead_name, \
+            first_value(score) OVER (ORDER BY id) AS first_score, \
+            last_value(score) OVER (ORDER BY id) AS last_score, \
+            nth_value(score, 2) OVER (ORDER BY id) AS nth_score, \
+            ntile(4) OVER (ORDER BY id) AS bucket \
+         FROM users",
+    );
+    let mut funcs = Vec::new();
+    collect_window_funcs(&plan, &mut funcs);
+    assert_eq!(funcs.len(), 6);
+    assert!(funcs.iter().any(|func| {
+        matches!(
+            func,
+            LogicalWindowFunc::Lag {
+                offset: 2,
+                default: Value::Decimal {
+                    value: -15,
+                    scale: 1
+                },
+                ..
+            }
+        )
+    }));
+    assert!(funcs.iter().any(|func| {
+        matches!(
+            func,
+            LogicalWindowFunc::Lead {
+                offset: 1,
+                default: Value::Text(v),
+                ..
+            } if v == "n/a"
+        )
+    }));
+    assert!(
+        funcs
+            .iter()
+            .any(|func| matches!(func, LogicalWindowFunc::FirstValue(_)))
+    );
+    assert!(
+        funcs
+            .iter()
+            .any(|func| matches!(func, LogicalWindowFunc::LastValue(_)))
+    );
+    assert!(
+        funcs
+            .iter()
+            .any(|func| matches!(func, LogicalWindowFunc::NthValue { n: 2, .. }))
+    );
+    assert!(
+        funcs
+            .iter()
+            .any(|func| matches!(func, LogicalWindowFunc::Ntile(4)))
+    );
+}
+
+#[test]
+fn rejects_malformed_window_function_calls() {
+    let cat = users_catalog();
+    for sql in [
+        "SELECT row_number(1) OVER () FROM users",
+        "SELECT lag(score, score) OVER () FROM users",
+        "SELECT lag(score, 1, score) OVER () FROM users",
+        "SELECT nth_value(score, 0) OVER () FROM users",
+        "SELECT ntile(0) OVER () FROM users",
+        "SELECT mystery_window(score) OVER () FROM users",
+    ] {
+        let err = parse_and_bind(sql, &cat).expect_err(sql);
+        assert!(
+            matches!(err, PlanError::TypeMismatch(_) | PlanError::NotSupported(_)),
+            "{sql}: {err:?}"
+        );
+    }
+}
+
+#[test]
+fn statement_family_display_schema_and_pipeline_modes_are_stable() {
+    let cases = [
+        (
+            "SELECT id FROM users WHERE score > 1 ORDER BY id LIMIT 2",
+            "Project:",
+            PipelineMode::VectorizedOlap,
+        ),
+        (
+            "EXPLAIN (FORMAT JSON) SELECT id FROM users",
+            "Explain (JSON)",
+            PipelineMode::ScalarOltp,
+        ),
+        (
+            "COPY users (id, name) FROM STDIN WITH (FORMAT CSV, HEADER)",
+            "Copy: users (0,1) FROM STDIN FORMAT=CSV",
+            PipelineMode::ScalarOltp,
+        ),
+        (
+            "COPY (SELECT id FROM users) TO STDOUT WITH (FORMAT PARQUET)",
+            "Copy: <query> (*) TO STDOUT FORMAT=PARQUET",
+            PipelineMode::ScalarOltp,
+        ),
+        (
+            "CREATE TABLE IF NOT EXISTS accounts (id INT PRIMARY KEY, amount INT CHECK (amount > 0), UNIQUE (amount))",
+            "CreateTable: public.accounts IF NOT EXISTS",
+            PipelineMode::ScalarOltp,
+        ),
+        (
+            "CREATE MATERIALIZED VIEW IF NOT EXISTS user_mv (user_id, username) AS SELECT id, name FROM users",
+            "CreateMaterializedView: public.user_mv IF NOT EXISTS",
+            PipelineMode::ScalarOltp,
+        ),
+        (
+            "CREATE TYPE mood AS ENUM ('sad', 'ok')",
+            "CreateTypeEnum: public.mood",
+            PipelineMode::ScalarOltp,
+        ),
+        (
+            "CREATE TYPE postal_address AS (street TEXT, zip INT)",
+            "CreateTypeComposite: public.postal_address",
+            PipelineMode::ScalarOltp,
+        ),
+        (
+            "CREATE DOMAIN positive_int AS INT NOT NULL CHECK (VALUE > 0)",
+            "CreateDomain: public.positive_int",
+            PipelineMode::ScalarOltp,
+        ),
+        (
+            "CREATE INDEX CONCURRENTLY IF NOT EXISTS users_id_idx ON users USING hash (id)",
+            "CreateIndex Concurrently IF NOT EXISTS: users_id_idx",
+            PipelineMode::ScalarOltp,
+        ),
+        (
+            "DROP TABLE IF EXISTS users CASCADE",
+            "DropTable IF EXISTS: tables=[users] CASCADE",
+            PipelineMode::ScalarOltp,
+        ),
+        (
+            "ALTER TABLE users ADD COLUMN extra INTEGER",
+            "AlterTable: users ADD COLUMN extra",
+            PipelineMode::ScalarOltp,
+        ),
+        (
+            "CREATE POLICY user_tenant ON users USING (name = current_setting('ultrasql.tenant_id', true))",
+            "CreatePolicy: user_tenant ON users",
+            PipelineMode::ScalarOltp,
+        ),
+        (
+            "CREATE ROLE app_user LOGIN",
+            "CreateRole: app_user",
+            PipelineMode::ScalarOltp,
+        ),
+        (
+            "ALTER ROLE app_user NOLOGIN",
+            "AlterRole: app_user",
+            PipelineMode::ScalarOltp,
+        ),
+        (
+            "DROP ROLE IF EXISTS app_user",
+            "DropRole IF EXISTS: roles=[app_user]",
+            PipelineMode::ScalarOltp,
+        ),
+        (
+            "GRANT SELECT ON TABLE users TO app_user WITH GRANT OPTION",
+            "GrantPrivileges: Table objects=[users] grantees=[app_user] WITH GRANT OPTION",
+            PipelineMode::ScalarOltp,
+        ),
+        (
+            "REVOKE SELECT ON TABLE users FROM app_user CASCADE",
+            "RevokePrivileges: Table objects=[users] grantees=[app_user] CASCADE",
+            PipelineMode::ScalarOltp,
+        ),
+        (
+            "ALTER DEFAULT PRIVILEGES GRANT SELECT ON TABLES TO app_user",
+            "AlterDefaultPrivileges: Grant Table",
+            PipelineMode::ScalarOltp,
+        ),
+        (
+            "GRANT app_role TO app_user WITH ADMIN OPTION",
+            "GrantRole: roles=[app_role] grantees=[app_user] WITH ADMIN OPTION",
+            PipelineMode::ScalarOltp,
+        ),
+        (
+            "REVOKE app_role FROM app_user CASCADE",
+            "RevokeRole: roles=[app_role] grantees=[app_user] CASCADE",
+            PipelineMode::ScalarOltp,
+        ),
+        (
+            "CREATE SEQUENCE IF NOT EXISTS s START WITH 10",
+            "CreateSequence IF NOT EXISTS: public.s",
+            PipelineMode::ScalarOltp,
+        ),
+        (
+            "ALTER SEQUENCE s INCREMENT BY 2",
+            "AlterSequence: s",
+            PipelineMode::ScalarOltp,
+        ),
+        (
+            "DROP SEQUENCE IF EXISTS s CASCADE",
+            "DropSequence IF EXISTS: sequences=[s] CASCADE",
+            PipelineMode::ScalarOltp,
+        ),
+        (
+            "COMMENT ON TABLE users IS 'hello'",
+            "Comment: TABLE users SET",
+            PipelineMode::ScalarOltp,
+        ),
+        (
+            "BEGIN ISOLATION LEVEL SERIALIZABLE",
+            "Begin",
+            PipelineMode::ScalarOltp,
+        ),
+        ("COMMIT", "Commit", PipelineMode::ScalarOltp),
+        ("ROLLBACK", "Rollback", PipelineMode::ScalarOltp),
+        ("SAVEPOINT sp1", "Savepoint: sp1", PipelineMode::ScalarOltp),
+        (
+            "ROLLBACK TO SAVEPOINT sp1",
+            "RollbackToSavepoint: sp1",
+            PipelineMode::ScalarOltp,
+        ),
+        (
+            "RELEASE SAVEPOINT sp1",
+            "ReleaseSavepoint: sp1",
+            PipelineMode::ScalarOltp,
+        ),
+        (
+            "PREPARE TRANSACTION 'gid1'",
+            "PrepareTransaction: gid1",
+            PipelineMode::ScalarOltp,
+        ),
+        (
+            "COMMIT PREPARED 'gid1'",
+            "CommitPrepared: gid1",
+            PipelineMode::ScalarOltp,
+        ),
+        (
+            "ROLLBACK PREPARED 'gid1'",
+            "RollbackPrepared: gid1",
+            PipelineMode::ScalarOltp,
+        ),
+        (
+            "SET TRANSACTION ISOLATION LEVEL REPEATABLE READ",
+            "SetTransaction: RepeatableRead",
+            PipelineMode::ScalarOltp,
+        ),
+        (
+            "SET search_path TO public",
+            "SetVariable: Set search_path=public",
+            PipelineMode::ScalarOltp,
+        ),
+        (
+            "SET ROLE app_user",
+            "SetRole: app_user",
+            PipelineMode::ScalarOltp,
+        ),
+        (
+            "LISTEN changes",
+            "Listen: changes",
+            PipelineMode::ScalarOltp,
+        ),
+        (
+            "NOTIFY changes, 'payload'",
+            "Notify: changes 'payload'",
+            PipelineMode::ScalarOltp,
+        ),
+        ("UNLISTEN *", "Unlisten: *", PipelineMode::ScalarOltp),
+    ];
+
+    let cat = users_catalog();
+    for (sql, expected_display, expected_mode) in cases {
+        let plan = parse_and_bind(sql, &cat).expect(sql);
+        assert_eq!(plan.pipeline_mode(), expected_mode, "{sql}");
+        let _schema = plan.schema();
+        let display = plan.display(0);
+        assert!(
+            display.contains(expected_display),
+            "{sql}: expected {expected_display:?}, got {display:?}"
+        );
+        assert_eq!(format!("{plan}"), display);
+    }
 }
