@@ -574,12 +574,7 @@ fn scope_entries(qualifier: &str, fields: Vec<Field>) -> Vec<ScopeEntry> {
 }
 
 fn read_parquet_arrow_schema(path: &Path) -> Result<arrow_schema::SchemaRef, PlanError> {
-    let file = File::open(path).map_err(|err| {
-        PlanError::TypeMismatch(format!(
-            "read_parquet cannot open {}: {err}",
-            path.display()
-        ))
-    })?;
+    let file = open_local_regular_file("read_parquet", path)?;
     let builder = ParquetRecordBatchReaderBuilder::try_new(file).map_err(|err| {
         PlanError::TypeMismatch(format!(
             "read_parquet cannot inspect {}: {err}",
@@ -880,10 +875,7 @@ fn open_planner_stream(
 ) -> Result<Box<dyn Read>, PlanError> {
     match source {
         PlannerStreamSpec::Local(path) => {
-            let display = path.display();
-            let file = File::open(path).map_err(|err| {
-                PlanError::TypeMismatch(format!("{function_name} cannot open {display}: {err}"))
-            })?;
+            let file = open_local_regular_file(function_name, path)?;
             Ok(Box::new(file))
         }
         PlannerStreamSpec::Object(object) => {
@@ -1351,12 +1343,7 @@ fn read_arrow_schema_from_path_specs(
         .into_iter()
         .next()
         .expect("path expansion returns at least one file");
-    let file = File::open(&first_path).map_err(|err| {
-        PlanError::TypeMismatch(format!(
-            "read_arrow cannot open {}: {err}",
-            first_path.display()
-        ))
-    })?;
+    let file = open_local_regular_file("read_arrow", &first_path)?;
     let reader = ArrowFileReader::try_new(file, None).map_err(|err| {
         PlanError::TypeMismatch(format!(
             "read_arrow cannot inspect {}: {err}",
