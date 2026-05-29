@@ -16,7 +16,10 @@
 //! returns the LSN of the last record that decoded cleanly. Earlier
 //! segments are guaranteed durable because we fsync before rotating.
 
-use std::io::Read;
+use std::fs::{File, OpenOptions};
+use std::io::{ErrorKind, Read};
+#[cfg(unix)]
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::Path;
 
 use tracing::{debug, info, warn};
@@ -26,6 +29,9 @@ use crate::RecordType;
 use crate::payload::CommitPayload;
 use crate::record::{WalRecord, WalRecordError};
 use crate::segment::list_segments;
+
+const DEFAULT_RECOVERY_SEGMENT_READ_LIMIT_BYTES: u64 = 128 * 1024 * 1024;
+const RECOVERY_SEGMENT_LIMIT_ENV: &str = "ULTRASQL_WAL_RECOVERY_SEGMENT_LIMIT_BYTES";
 
 /// Optional point-in-time recovery target.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -170,9 +176,7 @@ pub fn recover_with_target(
     let mut last_good_pos: u64 = 0;
 
     for (index, path) in segments {
-        let mut file = std::fs::File::open(&path)?;
-        let mut buf = Vec::new();
-        file.read_to_end(&mut buf)?;
+        let buf = read_segment_bytes(&path)?;
         debug!(
             ?path,
             segment = index,
@@ -249,6 +253,55 @@ pub fn recover_with_target(
         "wal recovery complete"
     );
     Ok(Lsn::new(last_good_pos))
+}
+
+fn read_segment_bytes(path: &Path) -> Result<Vec<u8>, RecoveryError> {
+    let limit = recovery_segment_read_limit_bytes();
+    let file = open_recovery_segment(path)?;
+    let file_len = file.metadata()?.len();
+    if file_len > limit {
+        return Err(recovery_segment_limit_error(path, file_len, limit));
+    }
+
+    let max_read = limit.saturating_add(1);
+    let mut reader = file.take(max_read);
+    let mut buf = Vec::new();
+    reader.read_to_end(&mut buf)?;
+    let bytes_read = u64::try_from(buf.len()).unwrap_or(u64::MAX);
+    if bytes_read > limit {
+        return Err(recovery_segment_limit_error(path, bytes_read, limit));
+    }
+    Ok(buf)
+}
+
+fn recovery_segment_read_limit_bytes() -> u64 {
+    std::env::var(RECOVERY_SEGMENT_LIMIT_ENV)
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|&limit| limit > 0)
+        .unwrap_or(DEFAULT_RECOVERY_SEGMENT_READ_LIMIT_BYTES)
+}
+
+fn recovery_segment_limit_error(path: &Path, bytes: u64, limit: u64) -> RecoveryError {
+    RecoveryError::Io(std::io::Error::new(
+        ErrorKind::InvalidData,
+        format!(
+            "WAL segment exceeds recovery read limit: path={} bytes={} limit={} env={}",
+            path.display(),
+            bytes,
+            limit,
+            RECOVERY_SEGMENT_LIMIT_ENV
+        ),
+    ))
+}
+
+#[cfg_attr(not(unix), allow(unused_variables))]
+fn open_recovery_segment(path: &Path) -> std::io::Result<File> {
+    let mut opts = OpenOptions::new();
+    opts.read(true);
+    #[cfg(unix)]
+    opts.custom_flags(libc::O_NOFOLLOW);
+    opts.open(path)
 }
 
 #[cfg(test)]
@@ -355,11 +408,43 @@ mod tests {
         );
     }
 
+    #[test]
+    fn recovery_rejects_configured_oversized_segment() {
+        let _env_guard = recovery_env_test_lock();
+        // SAFETY: recovery_env_test_lock serializes process-env mutation in
+        // this module's tests.
+        unsafe {
+            std::env::set_var("ULTRASQL_WAL_RECOVERY_SEGMENT_LIMIT_BYTES", "3");
+        }
+
+        let dir = TempDir::new().unwrap();
+        std::fs::write(dir.path().join("segment_0000000000"), [0_u8; 4]).unwrap();
+
+        let err = recover(dir.path(), |_| Ok(())).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("WAL segment exceeds recovery read limit"),
+            "{err}"
+        );
+
+        // SAFETY: recovery_env_test_lock serializes process-env mutation in
+        // this module's tests.
+        unsafe {
+            std::env::remove_var("ULTRASQL_WAL_RECOVERY_SEGMENT_LIMIT_BYTES");
+        }
+    }
+
     fn commit_record(xid: Xid, commit_timestamp_micros: u64) -> WalRecord {
         let payload = CommitPayload {
             commit_lsn: Lsn::ZERO,
             commit_timestamp_micros,
         };
         WalRecord::new(RecordType::Commit, xid, Lsn::ZERO, 0, payload.encode())
+    }
+
+    fn recovery_env_test_lock() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        LOCK.lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 }
