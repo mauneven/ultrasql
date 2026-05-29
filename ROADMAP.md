@@ -13,10 +13,12 @@ file focused on what still blocks production.
 - Close coverage: `cargo llvm-cov --workspace` plus
   `scripts/coverage_gate.py --min-lines 80`. Latest evidence:
   `docs/testing/coverage-evidence-2026-05-28.md`. Remaining crates below the
-  per-crate 80% line gate: `ultrasql-cli`, `ultrasql-bench`,
+  latest full-workspace per-crate 80% line gate: `ultrasql-cli`, `ultrasql-bench`,
   `ultrasql-arrow`, `ultrasql-server`, `ultrasql-objectstore`,
   `ultrasql-sqllogictest-runner`, `ultrasql-planner`, `ultrasql-executor`,
-  `ultrasql-iceberg`, and `ultrasql-core`.
+  `ultrasql-iceberg`, and `ultrasql-core`. A focused package coverage slice now
+  clears `ultrasql-arrow`, `ultrasql-objectstore`, and `ultrasql-iceberg`; remove
+  them only after the full workspace artifact refreshes cleanly.
 - Final release needs `operator soak reports`, `latest green CI workflow run id`,
   `release workflow run id`, `GitHub release notes`, and
   `operator_soak_status.json` recorded in the release checklist.
@@ -48,7 +50,9 @@ file focused on what still blocks production.
 - TPC-B: correctness verified, throughput leads PostgreSQL 17, p99 < 5 ms at
   32 connections.
 - TPC-C: all five transaction types correct and throughput leads PostgreSQL 17.
-- Sysbench OLTP read/write: throughput leads PostgreSQL 17.
+- Sysbench OLTP read/write: full same-host PostgreSQL 17 certification remains
+  open. Latest UltraSQL-only smoke passes, but is non-certifying until a
+  `POSTGRES_DSN` artifact refreshes the comparison.
 - ClickBench: dataset-backed same-host PostgreSQL 17 comparison, plus
   ClickHouse and Firebolt legs when available.
 - Firebolt sparse primary-index pruning: pass

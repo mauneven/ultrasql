@@ -44,6 +44,14 @@ as a concise evidence ledger; roadmap stays for open gates only.
   passed test execution, `scripts/coverage_gate.py --min-lines 80` produced
   `docs/testing/coverage-evidence-2026-05-28.md`, and `ultrasql-node` now
   clears the per-crate gate at 84.00%.
+- Focused coverage tests now exercise Arrow import/export edge paths,
+  object-store URI/range/list/signing paths, and Iceberg metadata planning
+  edge paths. Package-scoped `cargo llvm-cov` plus
+  `scripts/coverage_gate.py --min-lines 80` clears `ultrasql-arrow` at
+  87.24%, `ultrasql-iceberg` at 87.32%, and `ultrasql-objectstore` at
+  88.28%. The full workspace coverage rerun on this Mac stopped at link time
+  with `errno=28 (No space left on device)`, so the production coverage gate
+  remains open until a full-host or CI artifact refreshes the workspace table.
 - Driver-certification CI was repaired, action runtimes refreshed, and release
   workflows validated on `main`.
 - Chaos testing: random kill, WAL truncation, disk full recovery is implemented
@@ -64,6 +72,12 @@ as a concise evidence ledger; roadmap stays for open gates only.
   `ReadyForQuery` status bytes.
 - `ORDER BY`, joins, set operations, `BETWEEN`, index scans, transaction blocks,
   plan cache, and optimizer routing are wired through server execution.
+- B-tree handles now share per-relation block allocation and operation latches,
+  preventing reopened index handles from reusing leaf blocks during concurrent
+  splits.
+- Key-stable indexed UPDATE paths keep indexes anchored through HOT/classic
+  `ctid` chains. Point probes, range scans, late materialization, and
+  `ON CONFLICT DO UPDATE` now resolve the live tuple behind old indexed TIDs.
 - SCRAM-SHA-256, optional MD5 auth, TLS, CancelRequest, COPY text/CSV, and
   LISTEN/NOTIFY base surfaces exist.
 - Parser, binder, optimizer, executor, storage, MVCC, WAL, catalog, protocol,
@@ -168,6 +182,16 @@ as a concise evidence ledger; roadmap stays for open gates only.
   records 8,404.68 tx/s with correctness passing, and
   `benchmarks/results/latest/tpcb_certification.json` remains honestly failed
   until the 32-client p99 and PostgreSQL 17 throughput gates close.
+- Sysbench indexed-update smoke was hardened on 2026-05-28. A 30-run local
+  repeat of `ultrasql-bench sysbench --engine ultrasql --rows 1000 --duration 1
+  --warmup 0 --connections 4` passed, and `benchmarks/certify.sh smoke` passed
+  regression-gate, HNSW ANN (`median_us=215.7085`, `recall_at_k=1.0`), and
+  UltraSQL sysbench smoke (`9939.4372 ops/s`). Smoke artifacts live at
+  `benchmarks/results/latest/benchmark_certification_manifest.json`,
+  `benchmarks/results/latest/sysbench_smoke.json`, and
+  `benchmarks/results/latest/raw/sysbench_oltp_read_write_smoke-ultrasql.json`.
+  This is correctness/perf smoke evidence only; PostgreSQL comparison remains
+  open without `POSTGRES_DSN`.
 - TPC-H SF1 local PostgreSQL 17 certification passed with all q1..q22 complete
   for both engines.
 - TPC-H scale 10 (all 22 queries) is complete: latest local artifact
