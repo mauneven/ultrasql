@@ -386,10 +386,17 @@ impl LogicalReplicationRuntime {
         let Some(root) = &self.metadata_dir else {
             return Ok(());
         };
-        fs::create_dir_all(root.join("publications")).map_err(ServerError::Io)?;
-        fs::create_dir_all(root.join("subscriptions")).map_err(ServerError::Io)?;
-        fs::create_dir_all(root.join("logical_slots")).map_err(ServerError::Io)?;
-        for entry in fs::read_dir(root.join("publications")).map_err(ServerError::Io)? {
+        ensure_directory(root, "logical replication metadata directory")?;
+        let publications_dir = root.join("publications");
+        let subscriptions_dir = root.join("subscriptions");
+        let logical_slots_dir = root.join("logical_slots");
+        ensure_directory(&publications_dir, "logical publication metadata directory")?;
+        ensure_directory(
+            &subscriptions_dir,
+            "logical subscription metadata directory",
+        )?;
+        ensure_directory(&logical_slots_dir, "logical slot metadata directory")?;
+        for entry in fs::read_dir(&publications_dir).map_err(ServerError::Io)? {
             let entry = entry.map_err(ServerError::Io)?;
             if !entry.file_type().map_err(ServerError::Io)?.is_file() {
                 continue;
@@ -401,7 +408,7 @@ impl LogicalReplicationRuntime {
                     .insert(publication.name.clone(), publication);
             }
         }
-        for entry in fs::read_dir(root.join("subscriptions")).map_err(ServerError::Io)? {
+        for entry in fs::read_dir(&subscriptions_dir).map_err(ServerError::Io)? {
             let entry = entry.map_err(ServerError::Io)?;
             if !entry.file_type().map_err(ServerError::Io)?.is_file() {
                 continue;
@@ -414,7 +421,7 @@ impl LogicalReplicationRuntime {
             }
         }
         let mut max_confirmed = 0_u64;
-        for entry in fs::read_dir(root.join("logical_slots")).map_err(ServerError::Io)? {
+        for entry in fs::read_dir(&logical_slots_dir).map_err(ServerError::Io)? {
             let entry = entry.map_err(ServerError::Io)?;
             if !entry.file_type().map_err(ServerError::Io)?.is_file() {
                 continue;
@@ -436,7 +443,7 @@ impl LogicalReplicationRuntime {
             return Ok(());
         };
         let dir = root.join("publications");
-        fs::create_dir_all(&dir).map_err(ServerError::Io)?;
+        ensure_directory(&dir, "logical publication metadata directory")?;
         let tables = publication.tables().collect::<Vec<_>>().join(",");
         let body = format!("name={}\ntables={tables}\n", publication.name);
         write_regular_text_file(&metadata_path(&dir, &publication.name), &body)
@@ -447,7 +454,7 @@ impl LogicalReplicationRuntime {
             return Ok(());
         };
         let dir = root.join("subscriptions");
-        fs::create_dir_all(&dir).map_err(ServerError::Io)?;
+        ensure_directory(&dir, "logical subscription metadata directory")?;
         let body = format!(
             "name={}\nconninfo={}\nslot_name={}\npublications={}\nenabled={}\n",
             subscription.name,
@@ -464,7 +471,7 @@ impl LogicalReplicationRuntime {
             return Ok(());
         };
         let dir = root.join("logical_slots");
-        fs::create_dir_all(&dir).map_err(ServerError::Io)?;
+        ensure_directory(&dir, "logical slot metadata directory")?;
         let body = format!("name={}\nconfirmed_lsn={}\n", slot.name, slot.confirmed_lsn);
         write_regular_text_file(&metadata_path(&dir, &slot.name), &body)
     }
@@ -991,6 +998,61 @@ mod tests {
         assert_eq!(
             fs::read_to_string(&outside).expect("outside unchanged"),
             "name=pub_events\ntables=events\n"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn logical_metadata_rejects_symlinked_root_directory() {
+        use std::os::unix::fs::symlink;
+
+        let parent = tempfile::TempDir::new().expect("parent dir");
+        let outside = tempfile::TempDir::new().expect("outside dir");
+        let metadata_link = parent.path().join("pg_logical");
+        symlink(outside.path(), &metadata_link).expect("metadata root symlink");
+
+        let err =
+            LogicalReplicationRuntime::open_metadata(&metadata_link).expect_err("root rejected");
+
+        assert!(err.to_string().contains("directory"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn logical_metadata_rejects_symlinked_kind_directory() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::TempDir::new().expect("metadata dir");
+        let outside = tempfile::TempDir::new().expect("outside dir");
+        symlink(outside.path(), dir.path().join("publications")).expect("publication dir symlink");
+
+        let err =
+            LogicalReplicationRuntime::open_metadata(dir.path()).expect_err("subdir rejected");
+
+        assert!(err.to_string().contains("directory"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn logical_metadata_persist_rejects_swapped_symlinked_kind_directory() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::TempDir::new().expect("metadata dir");
+        let outside = tempfile::TempDir::new().expect("outside dir");
+        let runtime = LogicalReplicationRuntime::open_metadata(dir.path()).expect("runtime");
+        fs::remove_dir(dir.path().join("publications")).expect("remove publications dir");
+        symlink(outside.path(), dir.path().join("publications")).expect("publication dir symlink");
+
+        assert!(
+            runtime
+                .create_publication("pub_events", vec!["events".to_string()])
+                .is_err()
+        );
+        assert!(
+            fs::read_dir(outside.path())
+                .expect("outside read")
+                .next()
+                .is_none()
         );
     }
 
