@@ -101,6 +101,46 @@ fn server_init_refuses_symlinked_data_dir() {
 
 #[cfg(unix)]
 #[test]
+fn server_init_refuses_symlinked_runtime_metadata_sidecar() {
+    use std::os::unix::fs::symlink;
+
+    let data_dir = tempfile::TempDir::new().unwrap();
+    let outside = data_dir.path().join("outside.meta");
+    fs::write(&outside, "# outside\n").unwrap();
+    symlink(&outside, data_dir.path().join("pg_domain_runtime.meta")).unwrap();
+
+    let err = Server::init(data_dir.path()).expect_err("symlinked sidecar rejected");
+
+    assert!(
+        err.to_string().contains("runtime metadata"),
+        "expected metadata rejection, got {err}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn runtime_metadata_persist_refuses_symlinked_temp_file() {
+    use std::os::unix::fs::symlink;
+
+    let data_dir = tempfile::TempDir::new().unwrap();
+    let server = Server::init(data_dir.path()).unwrap();
+    let outside = data_dir.path().join("outside.tmp");
+    fs::write(&outside, "keep").unwrap();
+    symlink(&outside, data_dir.path().join("pg_domain_runtime.meta.tmp")).unwrap();
+
+    let err = server
+        .persist_domain_runtime_constraints_metadata()
+        .expect_err("symlinked temp sidecar rejected");
+
+    assert!(
+        err.to_string().contains("runtime metadata"),
+        "expected metadata rejection, got {err}"
+    );
+    assert_eq!(fs::read_to_string(&outside).unwrap(), "keep");
+}
+
+#[cfg(unix)]
+#[test]
 fn data_dir_owner_check_rejects_unexpected_uid() {
     use std::os::unix::fs::MetadataExt;
 

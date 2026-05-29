@@ -3185,6 +3185,46 @@ fn validation_check(name: &'static str, errors: Vec<String>, ok_detail: String) 
     }
 }
 
+fn read_runtime_metadata_file(path: &Path) -> Result<Option<String>, ServerError> {
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_file() => std::fs::read_to_string(path)
+            .map(Some)
+            .map_err(ServerError::Io),
+        Ok(_) => Err(ServerError::ddl(format!(
+            "runtime metadata file {} is not a regular file",
+            path.display()
+        ))),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(err) => Err(ServerError::Io(err)),
+    }
+}
+
+fn write_runtime_metadata_file(path: &Path, text: &str) -> Result<(), ServerError> {
+    ensure_runtime_metadata_file_slot(path)?;
+    let tmp = path.with_extension("meta.tmp");
+    ensure_runtime_metadata_file_slot(&tmp)?;
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(&tmp)
+        .map_err(ServerError::Io)?;
+    std::io::Write::write_all(&mut file, text.as_bytes()).map_err(ServerError::Io)?;
+    std::fs::rename(tmp, path).map_err(ServerError::Io)
+}
+
+fn ensure_runtime_metadata_file_slot(path: &Path) -> Result<(), ServerError> {
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_file() => Ok(()),
+        Ok(_) => Err(ServerError::ddl(format!(
+            "runtime metadata file {} is not a regular file",
+            path.display()
+        ))),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(ServerError::Io(err)),
+    }
+}
+
 impl Server {
     /// Build an empty in-memory server.
     ///
@@ -3915,20 +3955,15 @@ impl Server {
                 ));
             }
         }
-        let tmp = path.with_extension("meta.tmp");
-        std::fs::write(&tmp, out).map_err(ServerError::Io)?;
-        std::fs::rename(tmp, path).map_err(ServerError::Io)?;
-        Ok(())
+        write_runtime_metadata_file(&path, &out)
     }
 
     fn rebuild_domain_runtime_constraint_sidecars(&self) -> Result<(), ServerError> {
         let Some(path) = self.domain_runtime_metadata_path() else {
             return Ok(());
         };
-        let text = match std::fs::read_to_string(&path) {
-            Ok(text) => text,
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-            Err(err) => return Err(ServerError::Io(err)),
+        let Some(text) = read_runtime_metadata_file(&path)? else {
+            return Ok(());
         };
         let mut domains: std::collections::HashMap<Oid, DomainTypeEntry> =
             std::collections::HashMap::new();
@@ -4144,20 +4179,15 @@ impl Server {
                 ));
             }
         }
-        let tmp = path.with_extension("meta.tmp");
-        std::fs::write(&tmp, out).map_err(ServerError::Io)?;
-        std::fs::rename(tmp, path).map_err(ServerError::Io)?;
-        Ok(())
+        write_runtime_metadata_file(&path, &out)
     }
 
     fn rebuild_table_runtime_constraint_sidecars(&self) -> Result<(), ServerError> {
         let Some(path) = self.table_runtime_metadata_path() else {
             return Ok(());
         };
-        let text = match std::fs::read_to_string(&path) {
-            Ok(text) => text,
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-            Err(err) => return Err(ServerError::Io(err)),
+        let Some(text) = read_runtime_metadata_file(&path)? else {
+            return Ok(());
         };
         let snapshot = self.catalog_snapshot();
         let mut table_names: std::collections::HashMap<Oid, String> =
@@ -4491,20 +4521,15 @@ impl Server {
                 ));
             }
         }
-        let tmp = path.with_extension("meta.tmp");
-        std::fs::write(&tmp, out).map_err(ServerError::Io)?;
-        std::fs::rename(tmp, path).map_err(ServerError::Io)?;
-        Ok(())
+        write_runtime_metadata_file(&path, &out)
     }
 
     fn rebuild_row_security_sidecars(&self) -> Result<(), ServerError> {
         let Some(path) = self.row_security_metadata_path() else {
             return Ok(());
         };
-        let text = match std::fs::read_to_string(&path) {
-            Ok(text) => text,
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-            Err(err) => return Err(ServerError::Io(err)),
+        let Some(text) = read_runtime_metadata_file(&path)? else {
+            return Ok(());
         };
         let snapshot = self.catalog_snapshot();
         let mut rows: std::collections::HashMap<ultrasql_core::Oid, (String, TableRowSecurity)> =
@@ -4593,10 +4618,8 @@ impl Server {
         let Some(path) = self.materialized_view_metadata_path() else {
             return Ok(Vec::new());
         };
-        let text = match std::fs::read_to_string(&path) {
-            Ok(text) => text,
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
-            Err(err) => return Err(ServerError::Io(err)),
+        let Some(text) = read_runtime_metadata_file(&path)? else {
+            return Ok(Vec::new());
         };
         let mut records = Vec::new();
         for (line_no, line) in text.lines().enumerate() {
@@ -4681,10 +4704,7 @@ impl Server {
                 projection
             ));
         }
-        let tmp = path.with_extension("meta.tmp");
-        std::fs::write(&tmp, out).map_err(ServerError::Io)?;
-        std::fs::rename(tmp, path).map_err(ServerError::Io)?;
-        Ok(())
+        write_runtime_metadata_file(&path, &out)
     }
 
     pub(crate) fn persist_materialized_view_runtime_metadata(
