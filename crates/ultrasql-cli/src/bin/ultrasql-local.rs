@@ -169,13 +169,79 @@ fn split_statements(input: &str) -> Vec<&str> {
 
 #[cfg(test)]
 mod tests {
-    use super::split_statements;
+    use super::*;
+    use ultrasql_server::LocalResultColumn;
 
     #[test]
     fn split_statements_respects_quoted_semicolon() {
         assert_eq!(
             split_statements("SELECT ';'; SELECT 2"),
             vec!["SELECT ';'", "SELECT 2"]
+        );
+    }
+
+    #[test]
+    fn read_sql_prefers_query_then_file() {
+        let query_cli = Cli {
+            query: Some("SELECT 1".to_owned()),
+            file: None,
+        };
+        assert_eq!(read_sql(&query_cli).expect("query sql"), "SELECT 1");
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let file = dir.path().join("script.sql");
+        std::fs::write(&file, "SELECT 2").expect("write SQL file");
+        let file_cli = Cli {
+            query: None,
+            file: Some(file),
+        };
+        assert_eq!(read_sql(&file_cli).expect("file sql"), "SELECT 2");
+    }
+
+    #[test]
+    fn print_output_handles_command_empty_and_null_cells() {
+        let command = LocalQueryOutput {
+            columns: Vec::new(),
+            rows: Vec::new(),
+            command_tag: "CREATE TABLE".to_owned(),
+        };
+        print_output(&command).expect("print command tag");
+
+        let empty_rows = LocalQueryOutput {
+            columns: vec![LocalResultColumn {
+                name: "id".to_owned(),
+                type_oid: 23,
+            }],
+            rows: Vec::new(),
+            command_tag: "SELECT 0".to_owned(),
+        };
+        print_output(&empty_rows).expect("print empty result");
+
+        let rows = LocalQueryOutput {
+            columns: vec![
+                LocalResultColumn {
+                    name: "id".to_owned(),
+                    type_oid: 23,
+                },
+                LocalResultColumn {
+                    name: "note".to_owned(),
+                    type_oid: 25,
+                },
+            ],
+            rows: vec![
+                vec![Some("1".to_owned()), None],
+                vec![Some("200".to_owned()), Some("ok".to_owned())],
+            ],
+            command_tag: "SELECT 2".to_owned(),
+        };
+        print_output(&rows).expect("print rows");
+    }
+
+    #[test]
+    fn local_splitter_skips_semicolons_inside_line_comments() {
+        assert_eq!(
+            split_statements("SELECT 1 -- ; comment\n; SELECT 2"),
+            vec!["SELECT 1 -- ; comment", "SELECT 2"]
         );
     }
 }

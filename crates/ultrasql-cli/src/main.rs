@@ -2013,4 +2013,468 @@ mod tests {
         let pw = pgpass_lookup_in_home(dir.path(), "localhost", 5432, "db", "user");
         assert!(pw.is_none());
     }
+
+    fn test_cli() -> Cli {
+        Cli {
+            host: None,
+            port: None,
+            dbname: None,
+            username: None,
+            password: None,
+            url: None,
+            command: None,
+            file: None,
+            isready: false,
+            ops_endpoint: None,
+            waldump: None,
+            ctl: None,
+            basebackup: None,
+            pg_dump: None,
+            dump_format: DumpFormat::Custom,
+            pg_restore: None,
+            archive_wal: None,
+            restore_wal: None,
+            wal_send_once: None,
+            wal_send_interval_ms: 0,
+            wal_receive_once: None,
+            wal_receive_interval_ms: 0,
+            wal_receive_cascade_archive: None,
+            replication_slot: "standby".to_owned(),
+            archive_dir: PathBuf::from("archive"),
+            restore_output: None,
+            recovery_target_time: None,
+            recovery_target_lsn: None,
+            recovery_target_xid: None,
+            data_dir: PathBuf::from("data"),
+            subcommand: None,
+            positional_url: None,
+        }
+    }
+
+    #[test]
+    fn conn_params_merge_overrides_and_connection_string_are_stable() {
+        let mut params = ConnParams::default();
+        params.merge_from(
+            &ConnParams::from_url("postgresql://bob:pw@db.internal:15432/app").expect("valid URL"),
+        );
+        params.apply_overrides(
+            Some("override.internal".to_owned()),
+            Some(25432),
+            Some("prod".to_owned()),
+            Some("alice".to_owned()),
+            Some("secret".to_owned()),
+        );
+
+        assert_eq!(params.host, "override.internal");
+        assert_eq!(params.port, 25432);
+        assert_eq!(params.dbname, "prod");
+        assert_eq!(params.user, "alice");
+        assert_eq!(params.password.as_deref(), Some("secret"));
+        assert_eq!(
+            build_conn_string(&params),
+            "host=override.internal port=25432 dbname=prod user=alice password=secret"
+        );
+
+        let err = ConnParams::from_url("postgresql://host:notaport/db")
+            .expect_err("invalid URL port fails");
+        assert!(format!("{err:#}").contains("invalid port in URL"));
+
+        let p = ConnParams::from_url("postgresql://carol@/db").expect("empty host accepted");
+        assert_eq!(p.user, "carol");
+        assert_eq!(p.dbname, "db");
+    }
+
+    #[test]
+    fn resolve_params_honors_url_position_and_flags() {
+        let mut cli = test_cli();
+        cli.url = Some("postgresql://u1:p1@url-host:5555/url_db".to_owned());
+        cli.positional_url = Some("pos-host".to_owned());
+        cli.host = Some("flag-host".to_owned());
+        cli.port = Some(7777);
+        cli.dbname = Some("flag_db".to_owned());
+        cli.username = Some("flag_user".to_owned());
+        cli.password = Some("flag_pw".to_owned());
+
+        let params = resolve_params(&cli).expect("resolve params");
+
+        assert_eq!(params.host, "flag-host");
+        assert_eq!(params.port, 7777);
+        assert_eq!(params.dbname, "flag_db");
+        assert_eq!(params.user, "flag_user");
+        assert_eq!(params.password.as_deref(), Some("flag_pw"));
+
+        let mut positional = test_cli();
+        positional.positional_url = Some("postgresql://pos_user@pos-host/pos_db".to_owned());
+        let params = resolve_params(&positional).expect("resolve positional URL");
+        assert_eq!(params.host, "pos-host");
+        assert_eq!(params.user, "pos_user");
+        assert_eq!(params.dbname, "pos_db");
+    }
+
+    #[test]
+    fn pgpass_ignores_comments_malformed_and_non_matching_lines() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        fs::write(
+            dir.path().join(".pgpass"),
+            "# comment\nbad-line\nlocalhost:9999:db:user:nope\nlocalhost:5432:db:user:pw\n",
+        )
+        .expect("write pgpass");
+
+        let pw = pgpass_lookup_in_home(dir.path(), "localhost", 5432, "db", "user");
+        assert_eq!(pw.as_deref(), Some("pw"));
+    }
+
+    #[test]
+    fn meta_query_builders_sanitize_patterns() {
+        assert!(list_tables_sql("").contains("pg_catalog.pg_tables"));
+        let tables = list_tables_sql("foo';DROP%bar");
+        assert!(tables.contains("LIKE 'fooDROP%bar'"));
+        assert!(!tables.contains("foo'"));
+
+        let describe = describe_table_sql("public.users;DELETE");
+        assert!(describe.contains("table_name = 'public.usersDELETE'"));
+
+        let indexes = list_indexes_sql("idx_%';");
+        assert!(indexes.contains("LIKE 'idx_%'"));
+        assert!(!indexes.contains("idx_%';"));
+    }
+
+    #[tokio::test]
+    async fn session_meta_batch_and_sql_paths_execute_against_in_process_server() {
+        let addr: std::net::SocketAddr = "127.0.0.1:0".parse().expect("socket literal");
+        let (listener, bound) = ultrasql_server::bind_listener(addr)
+            .await
+            .expect("bind in-process listener");
+        let server = std::sync::Arc::new(Server::with_sample_database());
+        let handle = tokio::spawn(ultrasql_server::serve_listener(listener, server));
+        let conn = format!(
+            "host={} port={} user=ultrasql_cli application_name=ultrasql_cli_test",
+            bound.ip(),
+            bound.port()
+        );
+        let (client, connection) = tokio_postgres::connect(&conn, NoTls)
+            .await
+            .expect("connect in-process server");
+        tokio::spawn(async move {
+            let _ = connection.await;
+        });
+
+        let params = ConnParams {
+            host: bound.ip().to_string(),
+            port: bound.port(),
+            dbname: "ultrasql".to_owned(),
+            user: "ultrasql_cli".to_owned(),
+            password: None,
+        };
+        let mut session = Session::new(client, params);
+
+        session
+            .exec_sql("SELECT 1 AS one")
+            .await
+            .expect("select row");
+        session
+            .exec_sql("SELECT 1 AS one WHERE false")
+            .await
+            .expect("empty select");
+        session
+            .exec_sql("SELECT no_such_column")
+            .await
+            .expect("error path");
+
+        for cmd in [
+            "\\?",
+            "\\timing",
+            "\\conninfo",
+            "\\dt",
+            "\\dt users",
+            "\\d",
+            "\\d users",
+            "\\di",
+            "\\dn",
+            "\\l",
+            "\\du",
+            "\\df",
+            "\\dv",
+            "\\ds",
+            "\\x",
+            "\\x on",
+            "\\x off",
+            "\\pset",
+            "\\pset expanded off",
+            "\\pset format aligned",
+            "\\pset unknown value",
+            "\\c",
+            "\\c otherdb",
+            "\\unknown",
+        ] {
+            assert!(!session.handle_meta(cmd).await.expect("meta command"));
+        }
+        assert!(!session.handle_meta("\\x bad").await.expect("invalid x"));
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let script = dir.path().join("script.sql");
+        fs::write(&script, "SELECT 2 AS two;\\ignored\nSELECT 3 AS three;")
+            .expect("write include script");
+        let include_cmd = format!("\\i {}", script.display());
+        assert!(
+            !session
+                .handle_meta(&include_cmd)
+                .await
+                .expect("include command")
+        );
+
+        session
+            .exec_batch("\\timing; SELECT 4 AS four; \\q; SELECT 5 AS five;")
+            .await
+            .expect("batch execution");
+        assert!(session.handle_meta("\\q").await.expect("quit command"));
+
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn ops_http_readiness_handles_ok_and_failure_statuses() {
+        let ok_endpoint =
+            spawn_one_shot_http("HTTP/1.1 200 OK\r\ncontent-length: 2\r\n\r\nOK").await;
+        let response = http_get_ops_endpoint(&format!("http://{ok_endpoint}/ops"), "ready")
+            .await
+            .expect("http ready");
+        assert!(response.ok);
+        assert_eq!(response.body, "OK");
+        let ready_endpoint =
+            spawn_one_shot_http("HTTP/1.1 200 OK\r\ncontent-length: 2\r\n\r\nOK").await;
+        assert!(
+            check_http_ready(&ready_endpoint.to_string())
+                .await
+                .expect("ready true")
+        );
+
+        let fail_endpoint = spawn_one_shot_http(
+            "HTTP/1.1 503 Service Unavailable\r\ncontent-length: 4\r\n\r\nDOWN",
+        )
+        .await;
+        assert!(
+            !check_http_ready(&fail_endpoint.to_string())
+                .await
+                .expect("ready false")
+        );
+
+        let run_endpoint =
+            spawn_one_shot_http("HTTP/1.1 200 OK\r\ncontent-length: 2\r\n\r\nOK").await;
+        let params = ConnParams::default();
+        run_isready(&params, Some(&run_endpoint.to_string()))
+            .await
+            .expect("ops isready");
+    }
+
+    async fn spawn_one_shot_http(response: &'static str) -> std::net::SocketAddr {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test http listener");
+        let addr = listener.local_addr().expect("listener addr");
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.expect("accept test HTTP");
+            let mut request = [0_u8; 512];
+            let _ = socket.read(&mut request).await;
+            socket
+                .write_all(response.as_bytes())
+                .await
+                .expect("write test HTTP response");
+        });
+        addr
+    }
+
+    #[test]
+    fn wal_dump_archive_restore_and_hex_helpers_cover_success_and_errors() {
+        use ultrasql_core::{Lsn, Xid};
+        use ultrasql_wal::{RecordType, WalRecord};
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let wal = dir.path().join("000000010000000000000001");
+        let record = WalRecord::new(RecordType::Nop, Xid::new(1), Lsn::ZERO, 0, Vec::new());
+        fs::write(&wal, record.encode()).expect("write WAL");
+
+        run_waldump(&wal).expect("waldump");
+        assert!(
+            waldump_record_lines(&[])
+                .first()
+                .is_some_and(|line| line.contains("empty"))
+        );
+        assert!(decode_wal_payload(&record).contains("Nop"));
+        assert_eq!(
+            format_decoded::<()>(Err(ultrasql_wal::PayloadError::Malformed("bad"))),
+            "payload_error=payload malformed: bad"
+        );
+
+        let archive = dir.path().join("archive");
+        run_archive_wal(&wal, &archive).expect("archive WAL");
+        let restored = dir.path().join("restored.wal");
+        run_restore_wal("000000010000000000000001", &archive, &restored).expect("restore WAL");
+        assert_eq!(
+            fs::read(&wal).expect("read wal"),
+            fs::read(restored).expect("read restored")
+        );
+
+        assert_eq!(hex_bytes(&[0, 1, 255]), "0001ff");
+        assert_eq!(decode_hex("0001ff").expect("decode hex"), vec![0, 1, 255]);
+        assert!(
+            decode_hex("0")
+                .expect_err("odd hex")
+                .to_string()
+                .contains("odd length")
+        );
+        assert!(
+            format!("{:#}", decode_hex("zz").expect_err("invalid hex")).contains("invalid hex")
+        );
+    }
+
+    #[tokio::test]
+    async fn ctl_commands_write_expected_signal_files() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let data_dir = dir.path().join("data");
+        let data_dir = data_dir.to_path_buf();
+        let params = ConnParams::default();
+        let targets = RecoveryTargets {
+            time: Some("2026-05-29 00:00:00 O'Hara".to_owned()),
+            lsn: Some("0/16B6C50".to_owned()),
+            xid: Some("42".to_owned()),
+        };
+
+        run_ctl(CtlCommand::Initdb, &data_dir, &params, None, &targets)
+            .await
+            .expect("initdb");
+        assert!(data_dir.join("base").is_dir());
+        assert!(data_dir.join("pg_wal").is_dir());
+        assert!(data_dir.join("global").is_dir());
+
+        run_ctl(CtlCommand::Start, &data_dir, &params, None, &targets)
+            .await
+            .expect("start");
+        run_ctl(CtlCommand::Reload, &data_dir, &params, None, &targets)
+            .await
+            .expect("reload");
+        run_ctl(CtlCommand::Promote, &data_dir, &params, None, &targets)
+            .await
+            .expect("promote");
+        run_ctl(CtlCommand::Standby, &data_dir, &params, None, &targets)
+            .await
+            .expect("standby");
+        run_ctl(CtlCommand::Recovery, &data_dir, &params, None, &targets)
+            .await
+            .expect("recovery");
+        run_ctl(CtlCommand::Stop, &data_dir, &params, None, &targets)
+            .await
+            .expect("stop");
+
+        assert_eq!(
+            fs::read_to_string(data_dir.join("promote.signal")).expect("promote"),
+            "promote\n"
+        );
+        assert_eq!(
+            fs::read_to_string(data_dir.join("standby.signal")).expect("standby"),
+            "standby\n"
+        );
+        let recovery = fs::read_to_string(data_dir.join("recovery.targets")).expect("targets");
+        assert!(recovery.contains("O''Hara"));
+        assert!(recovery.contains("recovery_target_lsn = '0/16B6C50'"));
+        assert!(recovery.contains("recovery_target_xid = '42'"));
+    }
+
+    #[test]
+    fn basebackup_dump_restore_and_manifest_helpers_round_trip_files() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let data = dir.path().join("data");
+        fs::create_dir_all(data.join("base/1")).expect("create data dir");
+        fs::write(data.join("base/1/heap"), b"rows").expect("write heap");
+        fs::write(data.join("pg_version"), b"1").expect("write version");
+
+        let backup = dir.path().join("backup");
+        run_basebackup_copy(
+            &data.to_path_buf(),
+            &backup.to_path_buf(),
+            Some("{\"flushed_lsn\":7}\n"),
+        )
+        .expect("basebackup copy");
+        assert_eq!(
+            fs::read(backup.join("base/1/heap")).expect("backup heap"),
+            b"rows"
+        );
+        assert!(
+            fs::read_to_string(backup.join("backup_label"))
+                .expect("backup label")
+                .contains("ULTRASQL BACKUP FENCE")
+        );
+        assert!(run_basebackup_copy(&data.to_path_buf(), &backup.to_path_buf(), None).is_err());
+
+        let directory_dump = dir.path().join("dumpdir");
+        run_pg_dump(&data, &directory_dump, DumpFormat::Directory).expect("directory dump");
+        assert!(directory_dump.join("ultrasql_dump.manifest").is_file());
+
+        for format in [DumpFormat::Plain, DumpFormat::Custom, DumpFormat::Tar] {
+            let archive = dir.path().join(format!("dump-{format:?}.ultra"));
+            run_pg_dump(&data, &archive, format).expect("archive dump");
+            let restored = dir.path().join(format!("restore-{format:?}"));
+            run_pg_restore(&archive, &restored).expect("archive restore");
+            assert_eq!(
+                fs::read(restored.join("base/1/heap")).expect("restored heap"),
+                b"rows"
+            );
+        }
+
+        let restored_dir = dir.path().join("restore-dir");
+        run_pg_restore(&directory_dump, &restored_dir).expect("directory restore");
+        assert_eq!(
+            fs::read(restored_dir.join("base/1/heap")).expect("dir restore"),
+            b"rows"
+        );
+
+        assert!(dump_manifest_text(&[("a\"b".to_owned(), 3, "abc".to_owned())]).contains("a\\\"b"));
+        assert_eq!(json_escape("\"\\\n"), "\\\"\\\\\\n");
+        assert_eq!(checksum_hex(b"same"), checksum_hex(b"same"));
+        assert!(run_pg_restore(&dir.path().join("missing.dump"), &dir.path().join("bad")).is_err());
+    }
+
+    #[test]
+    fn wal_receiver_wrapper_copies_and_cascades_archived_files() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let source = dir.path().join("source");
+        let standby = dir.path().join("standby");
+        let cascade = dir.path().join("cascade");
+        fs::create_dir_all(&source).expect("source");
+        fs::write(source.join("000000010000000000000001"), b"wal1").expect("wal1");
+
+        let receiver = WalReceiver::new(&source);
+        assert_eq!(
+            receive_wal_once(&receiver, &standby, None).expect("receive"),
+            1
+        );
+        assert_eq!(
+            fs::read(standby.join("000000010000000000000001")).expect("standby wal"),
+            b"wal1"
+        );
+        assert_eq!(
+            receive_wal_once(&receiver, &standby, Some(&cascade)).expect("cascade receive"),
+            1
+        );
+        assert_eq!(
+            fs::read(cascade.join("000000010000000000000001")).expect("cascade wal"),
+            b"wal1"
+        );
+    }
+
+    #[test]
+    fn validation_report_prints_failure_and_escape_conf_quotes() {
+        let report = ValidationReport {
+            checks: vec![ultrasql_server::ValidationCheck {
+                name: "catalog",
+                status: ultrasql_server::ValidationStatus::Failed,
+                detail: "broken".to_owned(),
+            }],
+        };
+        assert!(!report.is_ok());
+        print_validation_report(&report);
+        assert_eq!(escape_conf("O'Hara"), "O''Hara");
+    }
 }

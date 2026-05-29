@@ -18,8 +18,8 @@ file focused on what still blocks production.
   `ultrasql-sqllogictest-runner`, `ultrasql-planner`, `ultrasql-executor`,
   `ultrasql-iceberg`, and `ultrasql-core`. A focused package coverage slice now
   clears `ultrasql-arrow`, `ultrasql-objectstore`, `ultrasql-iceberg`,
-  `ultrasql-core`, and `ultrasql-sqllogictest-runner`; remove them only after
-  the full workspace artifact refreshes cleanly.
+  `ultrasql-core`, `ultrasql-sqllogictest-runner`, and `ultrasql-cli`; remove
+  them only after the full workspace artifact refreshes cleanly.
 - Final release needs `operator soak reports`, `latest green CI workflow run id`,
   `release workflow run id`, `GitHub release notes`, and
   `operator_soak_status.json` recorded in the release checklist.

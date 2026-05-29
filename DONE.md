@@ -67,6 +67,13 @@ as a concise evidence ledger; roadmap stays for open gates only.
   `cargo llvm-cov` plus `scripts/coverage_gate.py --min-lines 80` clears
   `ultrasql-sqllogictest-runner` at 85.46%. Evidence:
   `docs/testing/coverage-evidence-2026-05-29-sqllogictest-runner.md`.
+- Focused `ultrasql-cli` coverage now exercises connection resolution,
+  pgpass parsing, meta-command dispatch, local result rendering, ops HTTP
+  readiness, WAL dump/archive/restore helpers, `pg_ctl`-style signal writers,
+  basebackup, dump/restore, WAL receiver cascade, validation output, and
+  `ultrasql-local` file/query helpers. Package `cargo llvm-cov` plus
+  `scripts/coverage_gate.py --min-lines 80` clears `ultrasql-cli` at 84.96%.
+  Evidence: `docs/testing/coverage-evidence-2026-05-29-cli.md`.
 - Driver-certification CI was repaired, action runtimes refreshed, and release
   workflows validated on `main`.
 - Chaos testing: random kill, WAL truncation, disk full recovery is implemented
@@ -201,8 +208,8 @@ as a concise evidence ledger; roadmap stays for open gates only.
   repeat of `ultrasql-bench sysbench --engine ultrasql --rows 1000 --duration 1
   --warmup 0 --connections 4` passed. Latest 2026-05-29
   `benchmarks/certify.sh smoke` passed regression-gate, HNSW ANN
-  (`median_us=199.2710`, `recall_at_k=1.0`), and UltraSQL sysbench smoke
-  (`10083.2531 ops/s`). Smoke artifacts live at
+  (`median_us=199.7495`, `recall_at_k=1.0`), and UltraSQL sysbench smoke
+  (`10178.8167 ops/s`). Smoke artifacts live at
   `benchmarks/results/latest/benchmark_certification_manifest.json`,
   `benchmarks/results/latest/sysbench_smoke.json`, and
   `benchmarks/results/latest/raw/sysbench_oltp_read_write_smoke-ultrasql.json`.
