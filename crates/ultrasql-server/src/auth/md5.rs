@@ -77,9 +77,16 @@ pub fn compute_md5_response(password: &str, username: &str, salt: &Md5Salt) -> S
 /// Returns `true` if the response matches.
 #[must_use]
 pub fn verify_md5_response(expected: &str, client_response: &str) -> bool {
-    // Constant-time comparison is ideal here; for MD5 (already broken)
-    // timing is secondary. Use a simple byte equality.
-    expected == client_response
+    constant_time_eq(expected.as_bytes(), client_response.as_bytes())
+}
+
+fn constant_time_eq(expected: &[u8], supplied: &[u8]) -> bool {
+    let mut diff = expected.len() ^ supplied.len();
+    for (idx, expected_byte) in expected.iter().copied().enumerate() {
+        let supplied_byte = supplied.get(idx).copied().unwrap_or(0);
+        diff |= usize::from(expected_byte ^ supplied_byte);
+    }
+    diff == 0
 }
 
 // ---------------------------------------------------------------------------

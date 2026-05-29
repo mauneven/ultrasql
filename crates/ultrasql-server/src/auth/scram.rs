@@ -92,6 +92,13 @@ fn xor32(a: &mut [u8; 32], b: &[u8; 32]) {
     }
 }
 
+fn constant_time_eq_32(left: &[u8; 32], right: &[u8; 32]) -> bool {
+    left.iter()
+        .zip(right.iter())
+        .fold(0_u8, |diff, (left, right)| diff | (*left ^ *right))
+        == 0
+}
+
 // ── Password hashing ─────────────────────────────────────────────────────────
 
 /// PBKDF2-HMAC-SHA-256 derived keys for SCRAM-SHA-256.
@@ -356,7 +363,7 @@ impl ScramSha256Server {
         };
 
         // Verify: H(recovered_client_key) must equal stored StoredKey.
-        if recovered_stored_key != self.stored_key {
+        if !constant_time_eq_32(&recovered_stored_key, &self.stored_key) {
             return Err(AuthError::ProofMismatch);
         }
 
