@@ -30,8 +30,9 @@
 
 #![allow(unused_imports)]
 
-use std::fs::{self, File};
-use std::io::{BufRead, BufReader};
+use std::fs::{self, File, OpenOptions};
+use std::io::{BufRead, BufReader, Read, Write};
+use std::path::Path;
 use std::sync::Arc;
 
 use bytes::BytesMut;
@@ -673,16 +674,14 @@ where
             return self.send_copy_complete(rows, emit_ready_for_query).await;
         }
         if opts.format == ServerCopyFormat::Binary {
-            let bytes = fs::read(path)
-                .map_err(|e| ServerError::Io(std::io::Error::other(format!("{path}: {e}"))))?;
+            let bytes = read_copy_input_file(path)?;
             return self
                 .copy_binary_bytes_into_table(entry, columns, schema, &bytes, emit_ready_for_query)
                 .await;
         }
 
         let effective_opts = self.effective_copy_file_options(path, opts)?;
-        let file = File::open(path)
-            .map_err(|e| ServerError::Io(std::io::Error::other(format!("{path}: {e}"))))?;
+        let file = open_copy_input_file(path)?;
         let mut reader = BufReader::new(file);
         let txn = self.state.txn_manager.begin(IsolationLevel::ReadCommitted);
         let codec = RowCodec::new(entry.schema.clone());
@@ -1061,8 +1060,7 @@ where
         } else {
             self.encode_table_textual_copy(entry, columns, opts)?
         };
-        fs::write(path, bytes)
-            .map_err(|e| ServerError::Io(std::io::Error::other(format!("{path}: {e}"))))?;
+        write_copy_output_file(path, &bytes)?;
         Ok(rows)
     }
 
@@ -1161,8 +1159,7 @@ where
                 Ok(())
             }
             CopySource::File(path) => {
-                fs::write(path, payload)
-                    .map_err(|e| ServerError::Io(std::io::Error::other(format!("{path}: {e}"))))?;
+                write_copy_output_file(path, &payload)?;
                 self.send_copy_complete(rows, emit_ready_for_query).await
             }
             CopySource::Stdin => Err(ServerError::Unsupported(
@@ -1346,8 +1343,7 @@ fn reject_column_type_matches(data_type: &DataType, expected: RejectColumnType) 
 }
 
 fn read_copy_file_sample(path: &str) -> Result<String, ServerError> {
-    let file = File::open(path)
-        .map_err(|e| ServerError::Io(std::io::Error::other(format!("{path}: {e}"))))?;
+    let file = open_copy_input_file(path)?;
     let mut reader = BufReader::new(file);
     let mut sample = Vec::new();
     let mut line = Vec::new();
@@ -1369,6 +1365,41 @@ fn read_copy_file_sample(path: &str) -> Result<String, ServerError> {
             "COPY AUTO_DETECT {path}: invalid UTF-8 sample: {e}"
         ))
     })
+}
+
+fn open_copy_input_file(path: &str) -> Result<File, ServerError> {
+    ensure_regular_copy_input(path)?;
+    File::open(path).map_err(|e| ServerError::Io(std::io::Error::other(format!("{path}: {e}"))))
+}
+
+fn read_copy_input_file(path: &str) -> Result<Vec<u8>, ServerError> {
+    let mut file = open_copy_input_file(path)?;
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes)
+        .map_err(|e| ServerError::Io(std::io::Error::other(format!("{path}: {e}"))))?;
+    Ok(bytes)
+}
+
+fn ensure_regular_copy_input(path: &str) -> Result<(), ServerError> {
+    let metadata = fs::symlink_metadata(Path::new(path))
+        .map_err(|e| ServerError::Io(std::io::Error::other(format!("{path}: {e}"))))?;
+    if metadata.file_type().is_file() {
+        Ok(())
+    } else {
+        Err(ServerError::CopyFormat(format!(
+            "COPY file is not a regular file: {path}"
+        )))
+    }
+}
+
+fn write_copy_output_file(path: &str, bytes: &[u8]) -> Result<(), ServerError> {
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+        .map_err(|e| ServerError::Io(std::io::Error::other(format!("{path}: {e}"))))?;
+    file.write_all(bytes)
+        .map_err(|e| ServerError::Io(std::io::Error::other(format!("{path}: {e}"))))
 }
 
 fn csv_record_complete(record: &[u8], opts: &CopyOptions) -> Result<bool, ServerError> {
@@ -2453,6 +2484,25 @@ b"#
         let sample =
             read_copy_file_sample(file.path().to_str().expect("utf8 path")).expect("copy sample");
         assert!(sample.contains("multi"));
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::symlink;
+
+            let dir = tempfile::TempDir::new().expect("copy symlink dir");
+            let link = dir.path().join("sample.csv");
+            symlink(file.path(), &link).expect("symlink sample");
+            assert!(read_copy_file_sample(link.to_str().expect("utf8 link")).is_err());
+
+            let target = dir.path().join("target.out");
+            let output_link = dir.path().join("output.csv");
+            std::fs::write(&target, b"keep").expect("write target");
+            symlink(&target, &output_link).expect("symlink output");
+            assert!(
+                write_copy_output_file(output_link.to_str().expect("utf8 output"), b"new").is_err()
+            );
+            assert_eq!(std::fs::read(&target).expect("read target"), b"keep");
+        }
 
         let table_schema = schema([
             Field::required("id", DataType::Int32),
