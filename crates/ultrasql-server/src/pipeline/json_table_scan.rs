@@ -433,3 +433,131 @@ fn string_column(values: Vec<String>, validity: Bitmap) -> Result<Column, Server
             .map_err(|err| ServerError::CopyFormat(format!("JSON_TABLE text column: {err}")))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn lit(value: Value, data_type: DataType) -> ScalarExpr {
+        ScalarExpr::Literal { value, data_type }
+    }
+
+    fn lit_text(value: &str) -> ScalarExpr {
+        lit(
+            Value::Text(value.to_owned()),
+            DataType::Text { max_len: None },
+        )
+    }
+
+    #[test]
+    fn json_table_lowers_rows_columns_nulls_and_exists_flags() {
+        let context = r#"{
+            "items": [
+                {"id": "1", "name": "ada", "score": "42.5", "raw": {"k": 1}},
+                {"id": 2, "score": 3.5}
+            ]
+        }"#;
+        let spec = r#"{
+            "columns": [
+                {"name": "ord", "kind": "ordinality"},
+                {"name": "id", "kind": "value", "type": "int4", "path": "$.id"},
+                {"name": "name", "kind": "value", "type": "text"},
+                {"name": "has_score", "kind": "exists", "path": "$.score"},
+                {"name": "score", "kind": "value", "type": "float8"},
+                {"name": "raw", "kind": "value", "type": "jsonb", "path": "$.raw"}
+            ]
+        }"#;
+        let args = [
+            lit(Value::Jsonb(context.to_owned()), DataType::Jsonb),
+            lit_text("$.items[*]"),
+            lit_text(spec),
+        ];
+
+        let mut op = lower_json_table_scan(&args).expect("lower json table");
+        assert_eq!(op.schema().len(), 6);
+        let batch = op.next_batch().expect("first batch").expect("batch");
+        assert_eq!(batch.rows(), 2);
+        assert!(op.next_batch().expect("eof").is_none());
+
+        let Column::Int64(ord) = &batch.columns()[0] else {
+            panic!("ordinality column");
+        };
+        assert_eq!(ord.data(), &[1, 2]);
+        let Column::Int32(ids) = &batch.columns()[1] else {
+            panic!("id column");
+        };
+        assert_eq!(ids.data(), &[1, 2]);
+        assert_eq!(batch.columns()[2].text_value(0), Some("ada"));
+        assert_eq!(batch.columns()[2].text_value(1), None);
+        let Column::Bool(flags) = &batch.columns()[3] else {
+            panic!("exists column");
+        };
+        assert_eq!(flags.data(), &[1, 1]);
+        let Column::Float64(scores) = &batch.columns()[4] else {
+            panic!("score column");
+        };
+        assert_eq!(scores.data(), &[42.5, 3.5]);
+        assert_eq!(batch.columns()[5].text_value(0), Some(r#"{"k":1}"#));
+        assert_eq!(batch.columns()[5].text_value(1), None);
+    }
+
+    #[test]
+    fn json_table_rejects_bad_specs_and_bad_values() {
+        assert!(lower_json_table_scan(&[]).is_err());
+        assert!(parse_json_document(Value::Int32(1)).is_err());
+        assert!(parse_json_table_columns("{}").is_err());
+        assert!(
+            parse_json_table_columns(r#"{"columns":[{"kind":"value","type":"int4"}]}"#).is_err()
+        );
+        assert!(parse_json_table_columns(r#"{"columns":[{"name":"x","kind":"value"}]}"#).is_err());
+        assert!(
+            parse_json_table_columns(
+                r#"{"columns":[{"name":"x","kind":"value","type":"int4[]"}]}"#
+            )
+            .is_err()
+        );
+        assert!(parse_json_table_columns(r#"{"columns":[{"name":"x","kind":"other"}]}"#).is_err());
+        assert!(json_value_to_sql(&serde_json::json!(40000), &DataType::Int16).is_err());
+        assert!(json_value_to_sql(&serde_json::json!({}), &DataType::Uuid).is_err());
+        assert!(json_i64(&serde_json::json!(u64::MAX)).is_none());
+        assert!(json_f64(&serde_json::json!("not-a-float")).is_none());
+    }
+
+    #[test]
+    fn json_table_batch_helpers_cover_nullable_and_mismatch_paths() {
+        let schema = Schema::new([
+            Field::nullable("b", DataType::Bool),
+            Field::nullable("i2", DataType::Int16),
+            Field::nullable("i8", DataType::Int64),
+            Field::nullable("f8", DataType::Float64),
+            Field::nullable("txt", DataType::Text { max_len: None }),
+        ])
+        .expect("schema");
+        let rows = vec![
+            vec![
+                Value::Bool(true),
+                Value::Int16(7),
+                Value::Int64(9),
+                Value::Float64(1.5),
+                Value::Text("x".to_owned()),
+            ],
+            vec![
+                Value::Null,
+                Value::Null,
+                Value::Null,
+                Value::Null,
+                Value::Null,
+            ],
+        ];
+        let batch = rows_to_batch(&schema, &rows).expect("nullable batch");
+        assert_eq!(batch.rows(), 2);
+        assert_eq!(batch.columns()[0].len(), 2);
+        assert_eq!(batch.columns()[4].text_value(1), None);
+
+        assert!(
+            values_to_column(&[vec![Value::Text("bad".to_owned())]], 0, &DataType::Bool).is_err()
+        );
+        assert!(values_to_column(&[vec![Value::Bool(true)]], 0, &DataType::Int64).is_err());
+        assert!(values_to_column(&[vec![Value::Int32(1)]], 0, &DataType::Uuid).is_err());
+    }
+}

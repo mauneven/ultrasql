@@ -83,6 +83,15 @@ as a concise evidence ledger; roadmap stays for open gates only.
   `cargo llvm-cov` plus `scripts/coverage_gate.py --min-lines 80` clears
   `ultrasql-planner` at 80.19%. Evidence:
   `docs/testing/coverage-evidence-2026-05-29-planner.md`.
+- Focused `ultrasql-server` coverage now exercises COPY text/binary edge cases,
+  result encoding, transaction state transitions, EXPLAIN rendering, metadata
+  statements, privilege collection/enforcement, JSON_TABLE lowering, recursive
+  CTE set helpers, TPC-H sidecar caches, Q1 columnar summaries, ops HTTP paths,
+  and WAL archive/restore edges. This also fixed binary COPY UUID encoding,
+  text COPY `bytea` hex validation, and recursive CTE DISTINCT NULL-bitmap
+  preservation. Package `cargo llvm-cov` plus
+  `scripts/coverage_gate.py --min-lines 80` clears `ultrasql-server` at
+  80.06%. Evidence: `docs/testing/coverage-evidence-2026-05-29-server.md`.
 - Driver-certification CI was repaired, action runtimes refreshed, and release
   workflows validated on `main`.
 - Chaos testing: random kill, WAL truncation, disk full recovery is implemented

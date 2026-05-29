@@ -987,4 +987,184 @@ mod tests {
             other => panic!("expected DataRow, got {other:?}"),
         }
     }
+
+    #[test]
+    fn dml_and_streaming_helpers_emit_postgres_command_shapes() {
+        let ddl = run_ddl_command("CREATE TABLE");
+        assert_eq!(ddl.rows, 0);
+        assert!(matches!(
+            ddl.messages.last(),
+            Some(BackendMessage::CommandComplete { tag }) if tag == "CREATE TABLE"
+        ));
+
+        let affected_schema = Schema::new([Field::required("affected", DataType::Int64)]).unwrap();
+        let affected_batches = vec![
+            Batch::new([Column::Int64(NumericColumn::from_data(vec![2]))]).unwrap(),
+            Batch::new([Column::Int64(NumericColumn::from_data(vec![3]))]).unwrap(),
+        ];
+        let mut modify_scan = MemTableScan::new(affected_schema, affected_batches);
+        let modify = run_modify_command(&mut modify_scan, "update").expect("modify");
+        assert_eq!(modify.rows, 5);
+        assert!(matches!(
+            modify.messages.last(),
+            Some(BackendMessage::CommandComplete { tag }) if tag == "UPDATE 5"
+        ));
+
+        let returning_schema = Schema::new([Field::required("id", DataType::Int32)]).unwrap();
+        let returning_batch =
+            Batch::new([Column::Int32(NumericColumn::from_data(vec![1, 2]))]).unwrap();
+        let mut returning_scan = MemTableScan::new(returning_schema, vec![returning_batch]);
+        let returning = run_modify_returning(&mut returning_scan, "insert").expect("returning");
+        assert_eq!(returning.rows, 2);
+        assert!(matches!(
+            returning.messages.last(),
+            Some(BackendMessage::CommandComplete { tag }) if tag == "INSERT 0 2"
+        ));
+    }
+
+    #[test]
+    fn streamed_select_helpers_reuse_buffers_and_shared_bodies() {
+        let schema = Schema::new([
+            Field::required("id", DataType::Int32),
+            Field::required("value", DataType::Int32),
+        ])
+        .unwrap();
+        let batch = Batch::new([
+            Column::Int32(NumericColumn::from_data(vec![1, 2])),
+            Column::Int32(NumericColumn::from_data(vec![10, 20])),
+        ])
+        .unwrap();
+        let mut scan = MemTableScan::new(schema.clone(), vec![batch]);
+        let mut sink = BytesMut::with_capacity(1);
+        let streamed = run_select_streamed(&mut scan, &mut sink).expect("streamed");
+        assert_eq!(streamed.rows, 2);
+        assert!(streamed.messages.is_empty());
+        let body = streamed.streamed_body.expect("body");
+        assert!(body.windows(b"SELECT 2".len()).any(|w| w == b"SELECT 2"));
+
+        let mut cached_sink = BytesMut::new();
+        let cached =
+            run_cached_int32_pair_select_streamed(&schema, &[1, 2], &[10, 20], &mut cached_sink);
+        assert_eq!(cached.rows, 2);
+        let cached_body = cached.streamed_body.as_ref().expect("cached body");
+        assert!(
+            cached_body
+                .windows(b"SELECT 2".len())
+                .any(|w| w == b"SELECT 2")
+        );
+
+        let mut pre_sink = BytesMut::from(&b"old bytes"[..]);
+        let preencoded = run_preencoded_select_streamed(cached_body, 2, &mut pre_sink);
+        assert_eq!(preencoded.rows, 2);
+        assert_eq!(
+            preencoded.streamed_body.as_deref(),
+            Some(cached_body.as_ref())
+        );
+
+        let shared = run_shared_preencoded_select_streamed(std::sync::Arc::from(&b"abc"[..]), 7);
+        assert_eq!(shared.rows, 7);
+        assert!(shared.streamed_body.is_none());
+        assert_eq!(shared.shared_streamed_body.as_deref(), Some(&b"abc"[..]));
+    }
+
+    #[test]
+    fn typed_text_encoding_covers_temporal_oids_vectors_and_special_floats() {
+        assert_eq!(format_f32(f32::NAN), b"NaN");
+        assert_eq!(format_f32(f32::INFINITY), b"Infinity");
+        assert_eq!(format_f32(f32::NEG_INFINITY), b"-Infinity");
+        assert_eq!(format_f64(f64::NAN), b"NaN");
+        assert_eq!(format_f64(f64::INFINITY), b"Infinity");
+        assert_eq!(format_f64(f64::NEG_INFINITY), b"-Infinity");
+
+        let times = Column::Int64(NumericColumn::from_data(vec![
+            3_600_000_000,
+            0,
+            ultrasql_core::pack_timetz(3_600_000_000, -18_000).expect("timetz"),
+            i64::from(u32::MAX) + 1,
+        ]));
+        assert_eq!(
+            encode_text_value_typed(&times, 0, &DataType::Time),
+            Some(b"01:00:00".to_vec())
+        );
+        assert_eq!(
+            encode_text_value_typed(&times, 1, &DataType::TimestampTz),
+            Some(b"2000-01-01 00:00:00+00".to_vec())
+        );
+        assert_eq!(
+            encode_text_value_typed(&times, 2, &DataType::TimeTz),
+            Some(b"01:00:00-05".to_vec())
+        );
+        assert_eq!(encode_text_value_typed(&times, 3, &DataType::Oid), None);
+
+        let vectors = Column::Utf8(StringColumn::from_data([
+            "[1.0,2.50]".to_owned(),
+            "{1:0.5}/3".to_owned(),
+            "not-a-vector".to_owned(),
+        ]));
+        assert_eq!(
+            encode_text_value_typed(&vectors, 0, &DataType::Vector { dims: Some(2) }),
+            Some(b"[1,2.5]".to_vec())
+        );
+        assert_eq!(
+            encode_text_value_typed(&vectors, 1, &DataType::SparseVec { dims: Some(3) }),
+            Some(b"{1:0.5}/3".to_vec())
+        );
+        assert_eq!(
+            encode_text_value_typed(&vectors, 2, &DataType::Vector { dims: Some(2) }),
+            Some(b"not-a-vector".to_vec())
+        );
+    }
+
+    #[test]
+    fn array_oids_and_type_sizes_cover_extended_type_surface() {
+        for (ty, oid) in [
+            (DataType::Bool, PG_OID_BOOL_ARRAY),
+            (DataType::Int16, PG_OID_INT2_ARRAY),
+            (DataType::Int64, PG_OID_INT8_ARRAY),
+            (DataType::Float32, PG_OID_FLOAT4_ARRAY),
+            (DataType::Float64, PG_OID_FLOAT8_ARRAY),
+            (
+                DataType::Decimal {
+                    precision: None,
+                    scale: None,
+                },
+                PG_OID_NUMERIC_ARRAY,
+            ),
+            (DataType::Money, PG_OID_MONEY_ARRAY),
+            (DataType::Oid, PG_OID_OID_ARRAY),
+            (DataType::RegClass, PG_OID_REGCLASS_ARRAY),
+            (DataType::RegType, PG_OID_REGTYPE_ARRAY),
+            (DataType::PgLsn, PG_OID_PG_LSN_ARRAY),
+            (DataType::Text { max_len: None }, PG_OID_TEXT_ARRAY),
+            (DataType::Char { len: Some(4) }, PG_OID_BPCHAR_ARRAY),
+            (DataType::Bit { len: Some(4) }, PG_OID_BIT_ARRAY),
+            (DataType::VarBit { max_len: None }, PG_OID_VARBIT_ARRAY),
+            (DataType::Inet, PG_OID_INET_ARRAY),
+            (DataType::Cidr, PG_OID_CIDR_ARRAY),
+            (DataType::MacAddr, PG_OID_MACADDR_ARRAY),
+            (DataType::MacAddr8, PG_OID_MACADDR8_ARRAY),
+            (DataType::Date, PG_OID_DATE_ARRAY),
+            (DataType::Time, PG_OID_TIME_ARRAY),
+            (DataType::Timestamp, PG_OID_TIMESTAMP_ARRAY),
+            (DataType::TimeTz, PG_OID_TIMETZ_ARRAY),
+            (DataType::TimestampTz, PG_OID_TIMESTAMPTZ_ARRAY),
+            (DataType::Bytea, PG_OID_BYTEA_ARRAY),
+            (DataType::Uuid, PG_OID_UUID_ARRAY),
+            (DataType::Json, PG_OID_JSON_ARRAY),
+            (DataType::Jsonb, PG_OID_JSONB_ARRAY),
+            (DataType::Xml, PG_OID_XML_ARRAY),
+        ] {
+            assert_eq!(pg_array_type_oid(&ty), oid);
+        }
+        assert_eq!(
+            pg_array_type_oid(&DataType::Array(Box::new(DataType::Uuid))),
+            PG_OID_UUID_ARRAY
+        );
+        assert_eq!(pg_array_type_oid(&DataType::Null), PG_OID_TEXT_ARRAY);
+        assert_eq!(pg_type_size(&DataType::Bool), 1);
+        assert_eq!(pg_type_size(&DataType::Int16), 2);
+        assert_eq!(pg_type_size(&DataType::Uuid), 16);
+        assert_eq!(pg_type_size(&DataType::TimeTz), 12);
+        assert_eq!(pg_type_size(&DataType::Jsonb), -1);
+    }
 }

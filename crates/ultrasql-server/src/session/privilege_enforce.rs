@@ -465,3 +465,277 @@ where
         });
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+    use tokio::io::duplex;
+    use ultrasql_core::{DataType, Field, Value};
+    use ultrasql_planner::{
+        AggregateFunc, ConflictTarget, LogicalAggregateExpr, LogicalJoinType, LogicalSetOp,
+        LogicalSetQuantifier, LogicalWindowFunc,
+    };
+
+    fn users_schema() -> Schema {
+        Schema::new([
+            Field::required("id", DataType::Int32),
+            Field::nullable("name", DataType::Text { max_len: None }),
+            Field::nullable("score", DataType::Float64),
+        ])
+        .expect("schema")
+    }
+
+    fn scan(table: &str) -> LogicalPlan {
+        LogicalPlan::Scan {
+            table: table.to_owned(),
+            schema: users_schema(),
+            projection: None,
+        }
+    }
+
+    fn col(name: &str, index: usize, data_type: DataType) -> ScalarExpr {
+        ScalarExpr::Column {
+            name: name.to_owned(),
+            index,
+            data_type,
+        }
+    }
+
+    fn id_col() -> ScalarExpr {
+        col("id", 0, DataType::Int32)
+    }
+
+    fn name_col() -> ScalarExpr {
+        col("name", 1, DataType::Text { max_len: None })
+    }
+
+    fn req(column: &str, privilege: PrivilegeKind) -> ColumnPrivilegeRequirement {
+        ColumnPrivilegeRequirement {
+            table: "users".to_owned(),
+            column: column.to_owned(),
+            privilege,
+        }
+    }
+
+    fn collector<'a>(
+        session: &'a Session<tokio::io::DuplexStream>,
+        snapshot: &'a CatalogSnapshot,
+    ) -> ColumnPrivilegeCollector<'a, tokio::io::DuplexStream> {
+        ColumnPrivilegeCollector {
+            session,
+            catalog_snapshot: snapshot,
+            requirements: BTreeSet::new(),
+        }
+    }
+
+    #[test]
+    fn collector_tracks_dml_copy_window_and_subquery_privilege_sources() {
+        let server = Arc::new(crate::Server::with_sample_database());
+        let snapshot = server.catalog_snapshot();
+        let (io, _peer) = duplex(64);
+        let session = Session::new(io, Arc::clone(&server));
+        let mut collector = collector(&session, &snapshot);
+
+        let insert = LogicalPlan::Insert {
+            table: "users".to_owned(),
+            columns: vec![0, 1],
+            source: Box::new(LogicalPlan::Values {
+                rows: vec![vec![
+                    ScalarExpr::Literal {
+                        value: Value::Int32(1),
+                        data_type: DataType::Int32,
+                    },
+                    ScalarExpr::Literal {
+                        value: Value::Text("a".to_owned()),
+                        data_type: DataType::Text { max_len: None },
+                    },
+                ]],
+                schema: Schema::new([
+                    Field::required("id", DataType::Int32),
+                    Field::nullable("name", DataType::Text { max_len: None }),
+                ])
+                .expect("values schema"),
+            }),
+            on_conflict: Some(ultrasql_planner::LogicalOnConflict::DoUpdate {
+                target: ConflictTarget { columns: vec![0] },
+                assignments: vec![(1, id_col())],
+                r#where: Some(name_col()),
+            }),
+            returning: vec![(name_col(), "name".to_owned())],
+            schema: Schema::new([Field::nullable("name", DataType::Text { max_len: None })])
+                .expect("returning schema"),
+        };
+        collector.collect_plan(&insert, true);
+
+        let update = LogicalPlan::Update {
+            table: "users".to_owned(),
+            assignments: vec![(2, id_col())],
+            input: Box::new(LogicalPlan::Filter {
+                input: Box::new(scan("users")),
+                predicate: ScalarExpr::Binary {
+                    op: ultrasql_planner::BinaryOp::Eq,
+                    left: Box::new(id_col()),
+                    right: Box::new(ScalarExpr::Literal {
+                        value: Value::Int32(1),
+                        data_type: DataType::Int32,
+                    }),
+                    data_type: DataType::Bool,
+                },
+            }),
+            returning: vec![(name_col(), "name".to_owned())],
+            schema: Schema::empty(),
+        };
+        collector.collect_plan(&update, true);
+
+        let window = LogicalPlan::Window {
+            input: Box::new(scan("users")),
+            partition_by: vec![name_col()],
+            order_by: vec![SortKey {
+                expr: id_col(),
+                asc: true,
+                nulls_first: false,
+            }],
+            func: LogicalWindowFunc::Lag {
+                expr: ScalarExpr::InSubquery {
+                    expr: Box::new(id_col()),
+                    subplan: Box::new(scan("users")),
+                    negated: false,
+                    correlated: true,
+                    data_type: DataType::Int32,
+                },
+                offset: 1,
+                default: Value::Null,
+            },
+            output_name: "lag".to_owned(),
+            schema: users_schema(),
+        };
+        collector.collect_plan(&window, true);
+
+        let aggregate = LogicalPlan::Aggregate {
+            input: Box::new(scan("users")),
+            group_by: vec![name_col()],
+            aggregates: vec![LogicalAggregateExpr {
+                func: AggregateFunc::PercentileCont,
+                arg: Some(id_col()),
+                direct_arg: Some(ScalarExpr::Literal {
+                    value: Value::Float64(0.5),
+                    data_type: DataType::Float64,
+                }),
+                order_by: Some(SortKey {
+                    expr: id_col(),
+                    asc: true,
+                    nulls_first: false,
+                }),
+                distinct: false,
+                output_name: "p".to_owned(),
+                data_type: DataType::Float64,
+            }],
+            schema: Schema::empty(),
+        };
+        collector.collect_plan(&aggregate, true);
+
+        let copy_to = LogicalPlan::Copy {
+            relation: Some("users".to_owned()),
+            input: None,
+            columns: vec![0],
+            direction: CopyDirection::To,
+            source: ultrasql_planner::CopySource::Stdout,
+            format: ultrasql_planner::CopyFormat::Text,
+            delimiter: '\t',
+            null_str: "\\N".to_owned(),
+            header: false,
+            auto_detect: false,
+            ignore_errors: false,
+            max_errors: 0,
+            reject_table: None,
+            schema: Schema::empty(),
+        };
+        collector.collect_plan(&copy_to, true);
+
+        assert!(
+            collector
+                .requirements
+                .contains(&req("id", PrivilegeKind::Insert))
+        );
+        assert!(
+            collector
+                .requirements
+                .contains(&req("name", PrivilegeKind::Insert))
+        );
+        assert!(
+            collector
+                .requirements
+                .contains(&req("name", PrivilegeKind::Update))
+        );
+        assert!(
+            collector
+                .requirements
+                .contains(&req("score", PrivilegeKind::Update))
+        );
+        assert!(
+            collector
+                .requirements
+                .contains(&req("id", PrivilegeKind::Select))
+        );
+        assert!(
+            collector
+                .requirements
+                .contains(&req("name", PrivilegeKind::Select))
+        );
+    }
+
+    #[test]
+    fn collector_handles_join_setop_and_noop_shapes_without_requirements() {
+        let server = Arc::new(crate::Server::with_sample_database());
+        let snapshot = server.catalog_snapshot();
+        let (io, _peer) = duplex(64);
+        let session = Session::new(io, Arc::clone(&server));
+        let mut collector = collector(&session, &snapshot);
+
+        let join = LogicalPlan::Join {
+            left: Box::new(scan("users")),
+            right: Box::new(scan("users")),
+            join_type: LogicalJoinType::Inner,
+            condition: LogicalJoinCondition::Using(vec![(0, 0)]),
+            schema: users_schema(),
+        };
+        let set_op = LogicalPlan::SetOp {
+            op: LogicalSetOp::Union,
+            quantifier: LogicalSetQuantifier::All,
+            left: Box::new(join),
+            right: Box::new(LogicalPlan::Empty {
+                schema: users_schema(),
+            }),
+            schema: users_schema(),
+        };
+        let cte = LogicalPlan::Cte {
+            name: "u".to_owned(),
+            recursive: false,
+            definition: Box::new(scan("users")),
+            body: Box::new(set_op),
+            schema: users_schema(),
+        };
+        collector.collect_plan(&cte, true);
+        collector.collect_plan(
+            &LogicalPlan::FunctionScan {
+                name: "generate_series".to_owned(),
+                args: Vec::new(),
+                schema: Schema::empty(),
+            },
+            true,
+        );
+
+        assert!(
+            collector
+                .requirements
+                .contains(&req("id", PrivilegeKind::Select))
+        );
+        assert!(
+            collector
+                .requirements
+                .contains(&req("name", PrivilegeKind::Select))
+        );
+        assert!(session.privilege_bypass());
+    }
+}

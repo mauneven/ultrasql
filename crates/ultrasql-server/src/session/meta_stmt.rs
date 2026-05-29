@@ -413,3 +413,228 @@ fn walk_expr_for_max_param(expr: &ScalarExpr, max_idx: &mut u32) {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ultrasql_core::{DataType, Field, Schema};
+    use ultrasql_parser::span::Span;
+    use ultrasql_planner::{
+        AggregateFunc, BinaryOp, LogicalAggregateExpr, LogicalJoinCondition, LogicalJoinType,
+        LogicalSetOp, LogicalSetQuantifier, LogicalWindowFunc, SortKey,
+    };
+
+    fn span() -> Span {
+        Span::default()
+    }
+
+    fn param(index: u32) -> ScalarExpr {
+        ScalarExpr::Parameter {
+            index,
+            data_type: DataType::Int32,
+        }
+    }
+
+    fn schema() -> Schema {
+        Schema::new([Field::required("x", DataType::Int32)]).expect("schema")
+    }
+
+    fn values_with_param(index: u32) -> LogicalPlan {
+        LogicalPlan::Values {
+            rows: vec![vec![param(index)]],
+            schema: schema(),
+        }
+    }
+
+    #[test]
+    fn literal_execute_args_cover_scalars_negation_and_errors() {
+        assert_eq!(
+            literal_to_value(&Literal::Null { span: span() }).expect("null"),
+            Value::Null
+        );
+        assert_eq!(
+            literal_to_value(&Literal::Bool {
+                value: true,
+                span: span()
+            })
+            .expect("bool"),
+            Value::Bool(true)
+        );
+        assert_eq!(
+            literal_to_value(&Literal::Integer {
+                text: "42".to_owned(),
+                span: span()
+            })
+            .expect("i32"),
+            Value::Int32(42)
+        );
+        assert!(matches!(
+            literal_to_value(&Literal::Integer {
+                text: i64::MAX.to_string(),
+                span: span()
+            })
+            .expect("i64"),
+            Value::Int64(_)
+        ));
+        assert!(
+            literal_to_value(&Literal::Integer {
+                text: "999999999999999999999999999999".to_owned(),
+                span: span()
+            })
+            .is_err()
+        );
+        assert_eq!(
+            eval_literal_arg(&Expr::Paren {
+                expr: Box::new(Expr::Unary {
+                    op: ultrasql_parser::ast::UnaryOp::Neg,
+                    expr: Box::new(Expr::Literal(Literal::Float {
+                        text: "2.5".to_owned(),
+                        span: span(),
+                    })),
+                    span: span(),
+                }),
+                span: span(),
+            })
+            .expect("negative float"),
+            Value::Float64(-2.5)
+        );
+        assert!(
+            eval_literal_arg(&Expr::Unary {
+                op: ultrasql_parser::ast::UnaryOp::Neg,
+                expr: Box::new(Expr::Literal(Literal::String {
+                    value: "x".to_owned(),
+                    span: span(),
+                })),
+                span: span(),
+            })
+            .is_err()
+        );
+        assert!(
+            eval_literal_arg(&Expr::Parameter {
+                index: 1,
+                span: span()
+            })
+            .is_err()
+        );
+        assert!(
+            literal_to_value(&Literal::Float {
+                text: "nope".to_owned(),
+                span: span()
+            })
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn max_param_index_walks_nested_plan_and_expression_shapes() {
+        let filter = LogicalPlan::Filter {
+            input: Box::new(values_with_param(1)),
+            predicate: ScalarExpr::Binary {
+                op: BinaryOp::Eq,
+                left: Box::new(param(2)),
+                right: Box::new(ScalarExpr::FunctionCall {
+                    name: "coalesce".to_owned(),
+                    args: vec![param(3)],
+                    data_type: DataType::Int32,
+                }),
+                data_type: DataType::Bool,
+            },
+        };
+        let project = LogicalPlan::Project {
+            input: Box::new(filter),
+            exprs: vec![(
+                ScalarExpr::IsNull {
+                    expr: Box::new(param(4)),
+                    negated: true,
+                },
+                "p".to_owned(),
+            )],
+            schema: schema(),
+        };
+        let sorted = LogicalPlan::Sort {
+            input: Box::new(project),
+            keys: vec![SortKey {
+                expr: param(5),
+                asc: true,
+                nulls_first: false,
+            }],
+        };
+        let aggregate = LogicalPlan::Aggregate {
+            input: Box::new(sorted),
+            group_by: vec![param(6)],
+            aggregates: vec![LogicalAggregateExpr {
+                func: AggregateFunc::Sum,
+                arg: Some(ScalarExpr::ScalarSubquery {
+                    subplan: Box::new(values_with_param(7)),
+                    correlated: false,
+                    data_type: DataType::Int32,
+                }),
+                direct_arg: None,
+                order_by: None,
+                distinct: false,
+                output_name: "s".to_owned(),
+                data_type: DataType::Int64,
+            }],
+            schema: schema(),
+        };
+        let joined = LogicalPlan::Join {
+            left: Box::new(aggregate),
+            right: Box::new(values_with_param(8)),
+            join_type: LogicalJoinType::Inner,
+            condition: LogicalJoinCondition::On(param(9)),
+            schema: schema(),
+        };
+        let set_op = LogicalPlan::SetOp {
+            op: LogicalSetOp::Union,
+            quantifier: LogicalSetQuantifier::All,
+            left: Box::new(joined),
+            right: Box::new(values_with_param(10)),
+            schema: schema(),
+        };
+        let cte = LogicalPlan::Cte {
+            name: "r".to_owned(),
+            recursive: false,
+            definition: Box::new(values_with_param(11)),
+            body: Box::new(set_op),
+            schema: schema(),
+        };
+        let window = LogicalPlan::Window {
+            input: Box::new(cte),
+            partition_by: vec![param(12)],
+            order_by: vec![SortKey {
+                expr: param(13),
+                asc: true,
+                nulls_first: false,
+            }],
+            func: LogicalWindowFunc::Lag {
+                expr: ScalarExpr::InSubquery {
+                    expr: Box::new(param(14)),
+                    subplan: Box::new(values_with_param(15)),
+                    negated: false,
+                    correlated: true,
+                    data_type: DataType::Int32,
+                },
+                offset: 1,
+                default: Value::Null,
+            },
+            output_name: "lag".to_owned(),
+            schema: schema(),
+        };
+        let update = LogicalPlan::Update {
+            table: "t".to_owned(),
+            assignments: vec![(0, param(16))],
+            input: Box::new(window),
+            returning: vec![],
+            schema: Schema::empty(),
+        };
+
+        assert_eq!(max_param_index(&update), 16);
+        assert_eq!(
+            max_param_index(&LogicalPlan::Empty {
+                schema: Schema::empty()
+            }),
+            0
+        );
+        assert_eq!(simple_tag("DEALLOCATE").rows, 0);
+    }
+}

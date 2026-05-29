@@ -1604,6 +1604,7 @@ fn binary_copy_cell_bytes(value: &Value, dtype: &DataType) -> Result<Vec<u8>, Se
         (DataType::Jsonb, Value::Jsonb(v)) => encode_pg_binary_jsonb(v),
         (DataType::Xml, Value::Xml(v)) => v.as_bytes().to_vec(),
         (DataType::Bytea, Value::Bytea(v)) => v.clone(),
+        (DataType::Uuid, Value::Uuid(v)) => v.to_vec(),
         (_, other) => other.to_string().into_bytes(),
     };
     Ok(bytes)
@@ -2103,7 +2104,15 @@ fn decode_copy_cell(
             .parse_text(bytes, column_idx)
             .map(Value::Jsonb),
         DataType::Xml => parse_xml_text(bytes, column_idx).map(Value::Xml),
-        DataType::Bytea => Ok(Value::Bytea(bytes.to_vec())),
+        DataType::Bytea => {
+            if s.starts_with("\\x") {
+                Value::parse_bytea(s).map(Value::Bytea).ok_or_else(|| {
+                    ServerError::CopyFormat(format!("column {column_idx}: invalid bytea literal"))
+                })
+            } else {
+                Ok(Value::Bytea(bytes.to_vec()))
+            }
+        }
         DataType::Uuid => Value::parse_uuid(s).map(Value::Uuid).ok_or_else(|| {
             ServerError::CopyFormat(format!("column {column_idx}: invalid uuid literal"))
         }),
@@ -2353,5 +2362,633 @@ fn format_float_f64(v: f64) -> Vec<u8> {
         }
     } else {
         format!("{v}").into_bytes()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::result_encoder::SelectResult;
+    use ultrasql_core::{Field, GeometryType, Oid, RangeType};
+
+    fn copy_opts(format: ServerCopyFormat) -> CopyOptions {
+        CopyOptions {
+            format,
+            delimiter: ',',
+            null_str: "\\N".to_owned(),
+            header: false,
+            auto_detect: false,
+            ignore_errors: false,
+            max_errors: 0,
+            reject_table: None,
+        }
+    }
+
+    fn schema(fields: impl IntoIterator<Item = Field>) -> Schema {
+        Schema::new(fields).expect("test schema")
+    }
+
+    fn entry_with_schema(schema: Schema) -> TableEntry {
+        TableEntry::new(Oid::new(42), "copy_t", "public", schema)
+    }
+
+    #[test]
+    fn copy_reject_table_validation_and_textual_helpers_cover_edges() {
+        let valid = entry_with_schema(schema([
+            Field::required("filename", DataType::Text { max_len: None }),
+            Field::required("line_number", DataType::Int64),
+            Field::required("raw_row", DataType::Char { len: Some(64) }),
+            Field::required("error", DataType::Text { max_len: None }),
+        ]));
+        validate_copy_reject_table(&valid).expect("valid reject table");
+
+        let wrong_len = entry_with_schema(schema([Field::required(
+            "filename",
+            DataType::Text { max_len: None },
+        )]));
+        assert!(validate_copy_reject_table(&wrong_len).is_err());
+        let wrong_name = entry_with_schema(schema([
+            Field::required("path", DataType::Text { max_len: None }),
+            Field::required("line_number", DataType::Int64),
+            Field::required("raw_row", DataType::Text { max_len: None }),
+            Field::required("error", DataType::Text { max_len: None }),
+        ]));
+        assert!(validate_copy_reject_table(&wrong_name).is_err());
+        assert!(reject_column_type_matches(
+            &DataType::Char { len: Some(8) },
+            RejectColumnType::Text,
+        ));
+        assert!(!reject_column_type_matches(
+            &DataType::Int32,
+            RejectColumnType::Int64,
+        ));
+
+        let opts = copy_opts(ServerCopyFormat::Csv);
+        assert!(
+            csv_record_complete(
+                br#""a","b
+c""#,
+                &opts
+            )
+            .expect("record check")
+        );
+        assert!(!csv_record_complete(br#""a","b"#, &opts).expect("record check"));
+        assert!(csv_sample_record_complete(
+            br#""a
+b""#
+        ));
+        assert!(!csv_sample_record_complete(
+            br#""a
+b"#
+        ));
+        assert_eq!(single_byte_delimiter('|').expect("delimiter"), b'|');
+        assert!(single_byte_delimiter('¿').is_err());
+        assert_eq!(copy_format_code(ServerCopyFormat::Text), 0);
+        assert_eq!(copy_format_code(ServerCopyFormat::Csv), 0);
+        assert_eq!(copy_format_code(ServerCopyFormat::Binary), 1);
+        assert_eq!(copy_format_code(ServerCopyFormat::Parquet), 0);
+
+        let file = tempfile::NamedTempFile::new().expect("sample file");
+        std::fs::write(file.path(), b"col1,col2\n\"multi\nline\",2\n").expect("write sample");
+        let sample =
+            read_copy_file_sample(file.path().to_str().expect("utf8 path")).expect("copy sample");
+        assert!(sample.contains("multi"));
+
+        let table_schema = schema([
+            Field::required("id", DataType::Int32),
+            Field::required("name", DataType::Text { max_len: None }),
+            Field::required("created", DataType::Date),
+            Field::required(
+                "amount",
+                DataType::Decimal {
+                    precision: Some(12),
+                    scale: Some(2),
+                },
+            ),
+            Field::required("paid", DataType::Money),
+        ]);
+        let entry = entry_with_schema(table_schema.clone());
+        let projected = projected_schema(&entry, &[1, 3]).expect("projected schema");
+        assert_eq!(projected.fields()[0].name, "name");
+        assert_eq!(projected.fields()[1].name, "amount");
+
+        let row = vec![
+            Value::Int32(7),
+            Value::Text("ada".to_owned()),
+            Value::Date(0),
+            Value::Int64(12_34),
+            Value::Money(56_78),
+        ];
+        let cells = copy_cells_from_row(&row, &table_schema, &[0, 2, 3, 4]);
+        assert_eq!(cells[0].as_deref(), Some(&b"7"[..]));
+        assert_eq!(cells[1].as_deref(), Some(&b"2000-01-01"[..]));
+        assert_eq!(cells[2].as_deref(), Some(&b"12.34"[..]));
+        assert_eq!(cells[3].as_deref(), Some(&b"$56.78"[..]));
+
+        let select = SelectResult {
+            messages: vec![
+                BackendMessage::RowDescription { fields: Vec::new() },
+                BackendMessage::DataRow {
+                    columns: vec![Some(b"1".to_vec()), Some(b"ada".to_vec())],
+                },
+                BackendMessage::CommandComplete {
+                    tag: "SELECT 1".to_owned(),
+                },
+            ],
+            streamed_body: None,
+            shared_streamed_body: None,
+            rows: 1,
+        };
+        let stream_schema = schema([
+            Field::required("id", DataType::Int32),
+            Field::required("name", DataType::Text { max_len: None }),
+        ]);
+        let mut text_opts = copy_opts(ServerCopyFormat::Text);
+        text_opts.header = true;
+        let (payload, rows) =
+            copy_rows_from_select_result(&select, &stream_schema, &text_opts).expect("copy rows");
+        assert_eq!(rows, 1);
+        assert!(
+            String::from_utf8(payload)
+                .expect("utf8")
+                .starts_with("id,name\n")
+        );
+        assert!(
+            copy_rows_from_select_result(
+                &select,
+                &stream_schema,
+                &copy_opts(ServerCopyFormat::Binary),
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn binary_copy_round_trips_rows_and_rejects_malformed_payloads() {
+        let table_schema = schema([
+            Field::required("b", DataType::Bool),
+            Field::required("i2", DataType::Int16),
+            Field::required("i4", DataType::Int32),
+            Field::required("i8", DataType::Int64),
+            Field::required("f4", DataType::Float32),
+            Field::required("f8", DataType::Float64),
+            Field::required("d", DataType::Date),
+            Field::required("t", DataType::Time),
+            Field::required("ts", DataType::Timestamp),
+            Field::required("tstz", DataType::TimestampTz),
+            Field::required("ttz", DataType::TimeTz),
+            Field::required(
+                "n",
+                DataType::Decimal {
+                    precision: Some(10),
+                    scale: Some(2),
+                },
+            ),
+            Field::required("m", DataType::Money),
+            Field::required("txt", DataType::Text { max_len: None }),
+            Field::required("ch", DataType::Char { len: Some(4) }),
+            Field::required("bits", DataType::Bit { len: Some(4) }),
+            Field::required("inet", DataType::Inet),
+            Field::required("json", DataType::Json),
+            Field::required("jsonb", DataType::Jsonb),
+            Field::required("xml", DataType::Xml),
+            Field::required("bytea", DataType::Bytea),
+            Field::required("uuid", DataType::Uuid),
+        ]);
+        let entry = entry_with_schema(table_schema.clone());
+        let row = vec![
+            Value::Bool(true),
+            Value::Int16(-2),
+            Value::Int32(32),
+            Value::Int64(64),
+            Value::Float32(1.25),
+            Value::Float64(-2.5),
+            Value::Date(0),
+            Value::Time(1_000),
+            Value::Timestamp(2_000),
+            Value::TimestampTz(3_000),
+            Value::TimeTz {
+                micros: 4_000,
+                offset_seconds: -18_000,
+            },
+            Value::Decimal {
+                value: 12_34,
+                scale: 2,
+            },
+            Value::Money(56_78),
+            Value::Text("hello".to_owned()),
+            Value::Char("xy  ".to_owned()),
+            Value::parse_bit_string("1010").expect("bit string"),
+            Value::parse_network(&DataType::Inet, "127.0.0.1").expect("inet"),
+            Value::Json("{\"a\":1}".to_owned()),
+            Value::Jsonb("{\"a\":1}".to_owned()),
+            Value::Xml("<root/>".to_owned()),
+            Value::Bytea(vec![1, 2, 3]),
+            Value::Uuid([7; 16]),
+        ];
+
+        let mut encoded = Vec::new();
+        append_binary_copy_header(&mut encoded);
+        append_binary_copy_row(&mut encoded, &row, &table_schema, &[], &table_schema)
+            .expect("append row");
+        append_i16_be(&mut encoded, -1);
+
+        let codec = RowCodec::new(table_schema.clone());
+        let mut cache = JsonbShapeCache::default();
+        let payloads =
+            decode_binary_copy_payload(&encoded, &entry, &[], &table_schema, &codec, &mut cache)
+                .expect("decode binary copy");
+        assert_eq!(payloads.len(), 1);
+        assert_eq!(codec.decode(&payloads[0]).expect("row decode"), row);
+
+        assert!(
+            decode_binary_copy_payload(b"bad", &entry, &[], &table_schema, &codec, &mut cache)
+                .is_err()
+        );
+
+        let mut negative_ext = Vec::new();
+        negative_ext.extend_from_slice(b"PGCOPY\n\xff\r\n\0");
+        negative_ext.extend_from_slice(&0_i32.to_be_bytes());
+        negative_ext.extend_from_slice(&(-1_i32).to_be_bytes());
+        assert!(
+            decode_binary_copy_payload(
+                &negative_ext,
+                &entry,
+                &[],
+                &table_schema,
+                &codec,
+                &mut cache
+            )
+            .is_err()
+        );
+
+        let mut wrong_count = Vec::new();
+        append_binary_copy_header(&mut wrong_count);
+        append_i16_be(&mut wrong_count, 1);
+        wrong_count.extend_from_slice(&(-1_i32).to_be_bytes());
+        assert!(
+            decode_binary_copy_payload(
+                &wrong_count,
+                &entry,
+                &[],
+                &table_schema,
+                &codec,
+                &mut cache
+            )
+            .is_err()
+        );
+
+        let mut bad_len = Vec::new();
+        append_binary_copy_header(&mut bad_len);
+        append_i16_be(
+            &mut bad_len,
+            i16::try_from(table_schema.len()).expect("column count"),
+        );
+        bad_len.extend_from_slice(&(-2_i32).to_be_bytes());
+        assert!(
+            decode_binary_copy_payload(&bad_len, &entry, &[], &table_schema, &codec, &mut cache)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn copy_text_cell_decoding_covers_types_and_errors() {
+        let mut cache = JsonbShapeCache::default();
+        assert_eq!(
+            decode_copy_cell(Some(b"yes"), &DataType::Bool, 0, &mut cache).expect("bool"),
+            Value::Bool(true)
+        );
+        assert_eq!(
+            decode_copy_cell(Some(b"N"), &DataType::Bool, 0, &mut cache).expect("bool"),
+            Value::Bool(false)
+        );
+        assert!(decode_copy_cell(Some(b"maybe"), &DataType::Bool, 0, &mut cache).is_err());
+        assert_eq!(
+            decode_copy_cell(Some(b"123"), &DataType::Oid, 0, &mut cache).expect("oid"),
+            Value::Oid(Oid::new(123))
+        );
+        assert_eq!(
+            decode_copy_cell(Some(b"124"), &DataType::RegClass, 0, &mut cache).expect("regclass"),
+            Value::RegClass(Oid::new(124))
+        );
+        assert_eq!(
+            decode_copy_cell(Some(b"125"), &DataType::RegType, 0, &mut cache).expect("regtype"),
+            Value::RegType(Oid::new(125))
+        );
+        assert!(decode_copy_cell(Some(b"bad"), &DataType::PgLsn, 0, &mut cache).is_err());
+        assert_eq!(
+            decode_copy_cell(Some(b"1.25"), &DataType::Float32, 0, &mut cache).expect("float4"),
+            Value::Float32(1.25)
+        );
+        assert_eq!(
+            decode_copy_cell(Some(b"-2.5"), &DataType::Float64, 0, &mut cache).expect("float8"),
+            Value::Float64(-2.5)
+        );
+        assert_eq!(
+            decode_copy_cell(
+                Some(b"12.345"),
+                &DataType::Decimal {
+                    precision: Some(8),
+                    scale: Some(2),
+                },
+                0,
+                &mut cache,
+            )
+            .expect("decimal"),
+            Value::Decimal {
+                value: 1235,
+                scale: 2,
+            }
+        );
+        assert_eq!(
+            decode_copy_cell(Some(b"$1.25"), &DataType::Money, 0, &mut cache).expect("money"),
+            Value::Money(125)
+        );
+        assert_eq!(
+            decode_copy_cell(Some(b"1970-01-02"), &DataType::Date, 0, &mut cache).expect("date"),
+            Value::Date(-10_956)
+        );
+        assert!(decode_copy_cell(Some(b"2024-02-30"), &DataType::Date, 0, &mut cache).is_err());
+        assert_eq!(
+            decode_copy_cell(Some(b"00:00:01"), &DataType::Time, 0, &mut cache).expect("time"),
+            Value::Time(1_000_000)
+        );
+        assert_eq!(
+            decode_copy_cell(Some(b"00:00:01+05"), &DataType::TimeTz, 0, &mut cache)
+                .expect("timetz"),
+            Value::TimeTz {
+                micros: 1_000_000,
+                offset_seconds: 18_000,
+            }
+        );
+        assert_eq!(
+            decode_copy_cell(
+                Some(b"1970-01-01 00:00:01"),
+                &DataType::Timestamp,
+                0,
+                &mut cache,
+            )
+            .expect("timestamp"),
+            Value::Timestamp(-946_684_799_000_000)
+        );
+        assert_eq!(
+            decode_copy_cell(
+                Some(b"1970-01-01 00:00:01+00"),
+                &DataType::TimestampTz,
+                0,
+                &mut cache,
+            )
+            .expect("timestamptz"),
+            Value::TimestampTz(-946_684_799_000_000)
+        );
+        assert_eq!(
+            decode_copy_cell(Some(b"xy"), &DataType::Char { len: Some(4) }, 0, &mut cache,)
+                .expect("char"),
+            Value::Char("xy  ".to_owned())
+        );
+        assert_eq!(
+            decode_copy_cell(
+                Some(b"1010"),
+                &DataType::Bit { len: Some(4) },
+                0,
+                &mut cache,
+            )
+            .expect("bit"),
+            Value::parse_bit_string("1010").expect("bit string")
+        );
+        assert!(
+            decode_copy_cell(Some(b"101"), &DataType::Bit { len: Some(4) }, 0, &mut cache,)
+                .is_err()
+        );
+        assert!(decode_copy_cell(Some(b"{"), &DataType::Json, 0, &mut cache).is_err());
+        assert_eq!(
+            decode_copy_cell(Some(b"<root/>"), &DataType::Xml, 0, &mut cache).expect("xml"),
+            Value::Xml("<root/>".to_owned())
+        );
+        assert!(decode_copy_cell(Some(b"<root>"), &DataType::Xml, 0, &mut cache).is_err());
+        assert_eq!(
+            decode_copy_cell(
+                Some(b"00000000-0000-0000-0000-000000000007"),
+                &DataType::Uuid,
+                0,
+                &mut cache,
+            )
+            .expect("uuid"),
+            Value::Uuid([0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 7])
+        );
+        assert!(
+            decode_copy_cell(
+                Some(b"[1,2]"),
+                &DataType::Vector { dims: Some(3) },
+                0,
+                &mut cache,
+            )
+            .is_err()
+        );
+        assert_eq!(
+            decode_copy_cell(
+                Some(b"[1,2]"),
+                &DataType::HalfVec { dims: Some(2) },
+                0,
+                &mut cache,
+            )
+            .expect("halfvec"),
+            Value::parse_halfvec("[1,2]").expect("halfvec")
+        );
+        assert_eq!(
+            decode_copy_cell(
+                Some(b"{1:1,3:2}/3"),
+                &DataType::SparseVec { dims: Some(3) },
+                0,
+                &mut cache,
+            )
+            .expect("sparsevec"),
+            Value::parse_sparsevec("{1:1,3:2}/3").expect("sparsevec")
+        );
+        assert_eq!(
+            decode_copy_cell(
+                Some(b"101"),
+                &DataType::BitVec { dims: Some(3) },
+                0,
+                &mut cache,
+            )
+            .expect("bitvec"),
+            Value::parse_bitvec("101").expect("bitvec")
+        );
+        assert!(
+            decode_copy_cell(
+                Some(b"101"),
+                &DataType::BitVec { dims: Some(4) },
+                0,
+                &mut cache,
+            )
+            .is_err()
+        );
+        assert_eq!(
+            decode_copy_cell(
+                Some(b"[1,10)"),
+                &DataType::Range(RangeType::Int4),
+                0,
+                &mut cache,
+            )
+            .expect("range"),
+            Value::Range(
+                ultrasql_core::RangeValue::parse(RangeType::Int4, "[1,10)").expect("range")
+            )
+        );
+        assert!(
+            decode_copy_cell(
+                Some(b"bad"),
+                &DataType::Range(RangeType::Int4),
+                0,
+                &mut cache,
+            )
+            .is_err()
+        );
+        assert_eq!(
+            decode_copy_cell(
+                Some(b"(1,2)"),
+                &DataType::Geometry(GeometryType::Point),
+                0,
+                &mut cache,
+            )
+            .expect("point"),
+            Value::Geometry(
+                ultrasql_core::GeometryValue::parse(GeometryType::Point, "(1,2)").expect("point")
+            )
+        );
+        assert!(
+            decode_copy_cell(
+                Some(b"(1)"),
+                &DataType::Geometry(GeometryType::Point),
+                0,
+                &mut cache,
+            )
+            .is_err()
+        );
+        assert_eq!(
+            decode_copy_cell(Some(b"\\x0a0b"), &DataType::Bytea, 0, &mut cache).expect("bytea"),
+            Value::Bytea(vec![10, 11])
+        );
+        assert_eq!(
+            decode_copy_cell(Some(b"deadbeef"), &DataType::Bytea, 0, &mut cache)
+                .expect("raw bytea"),
+            Value::Bytea(b"deadbeef".to_vec())
+        );
+        assert!(decode_copy_cell(Some(b"\\xabc"), &DataType::Bytea, 0, &mut cache).is_err());
+        assert!(
+            decode_copy_cell(
+                Some(&[0xff]),
+                &DataType::Text { max_len: None },
+                0,
+                &mut cache
+            )
+            .is_err()
+        );
+        assert_eq!(
+            decode_copy_cell(None, &DataType::Int32, 0, &mut cache).expect("null"),
+            Value::Null
+        );
+        assert!(decode_copy_cell(Some(b"x"), &DataType::Null, 0, &mut cache).is_err());
+    }
+
+    #[test]
+    fn copy_row_and_binary_cell_helpers_cover_projection_and_errors() {
+        let table_schema = schema([
+            Field::required("id", DataType::Int32),
+            Field::required("name", DataType::Text { max_len: None }),
+            Field::nullable("optional", DataType::Int64),
+        ]);
+        let stream_schema = schema([
+            Field::required("name", DataType::Text { max_len: None }),
+            Field::required("id", DataType::Int32),
+        ]);
+        let entry = entry_with_schema(table_schema.clone());
+        let codec = RowCodec::new(table_schema.clone());
+        let mut cache = JsonbShapeCache::default();
+        let payload = decode_copy_cells_to_payload(
+            &[Some(b"ada"), Some(b"7")],
+            &entry,
+            &[1, 0],
+            &stream_schema,
+            &codec,
+            &mut cache,
+        )
+        .expect("decode projected payload");
+        let decoded = codec.decode(&payload).expect("payload row");
+        assert_eq!(
+            decoded,
+            vec![Value::Int32(7), Value::Text("ada".to_owned()), Value::Null]
+        );
+        assert!(
+            decode_copy_cells_to_payload(
+                &[Some(b"ada")],
+                &entry,
+                &[1, 0],
+                &stream_schema,
+                &codec,
+                &mut cache,
+            )
+            .is_err()
+        );
+
+        let opts = copy_opts(ServerCopyFormat::Csv);
+        let payload = decode_one_copy_row(
+            b"ada,7\n",
+            &entry,
+            &[1, 0],
+            &stream_schema,
+            &codec,
+            &opts,
+            &mut cache,
+        )
+        .expect("fast csv decode");
+        assert_eq!(
+            codec.decode(&payload).expect("fast row")[0],
+            Value::Int32(7)
+        );
+        assert!(
+            decode_one_copy_row(
+                b"ada,7\n",
+                &entry,
+                &[1, 0],
+                &stream_schema,
+                &codec,
+                &copy_opts(ServerCopyFormat::Binary),
+                &mut cache,
+            )
+            .is_err()
+        );
+
+        assert!(read_i16_be(&[1], &mut 0).is_err());
+        assert!(read_i32_be(&[1, 2, 3], &mut 0).is_err());
+        assert_eq!(
+            binary_copy_cell_bytes(&Value::Null, &DataType::Text { max_len: None })
+                .expect("null fallback"),
+            b"NULL".to_vec()
+        );
+        assert!(decode_binary_copy_cell(&[1, 2], &DataType::Int32, 0, &mut cache).is_err());
+        assert!(decode_binary_copy_cell(b"bad", &DataType::Jsonb, 0, &mut cache).is_err());
+        assert!(decode_binary_copy_cell(b"<bad>", &DataType::Xml, 0, &mut cache).is_err());
+        assert_eq!(
+            decode_binary_copy_cell(&[9; 16], &DataType::Uuid, 0, &mut cache).expect("uuid"),
+            Value::Uuid([9; 16])
+        );
+
+        assert_eq!(parse_copy_date("2000-02-29", 0).expect("leap"), 59);
+        assert!(parse_copy_date("20000229", 0).is_err());
+        assert!(parse_copy_date("year-02-29", 0).is_err());
+        assert!(parse_copy_date("2024-mm-29", 0).is_err());
+        assert!(parse_copy_date("2024-02-dd", 0).is_err());
+        assert!(parse_copy_timestamp("1970-01-01", 0).is_err());
+        assert!(parse_copy_timestamptz("1970-01-01 bad", 0).is_err());
+        assert!(parse_copy_time("bad", 0).is_err());
+        assert!(parse_copy_timetz("bad", 0).is_err());
+        assert_eq!(days_in_month(2024, 2), 29);
+        assert_eq!(days_in_month(2023, 2), 28);
+        assert_eq!(days_in_month(2023, 13), 0);
+        assert_eq!(format_float_f32(f32::INFINITY), b"Infinity".to_vec());
+        assert_eq!(format_float_f64(f64::NEG_INFINITY), b"-Infinity".to_vec());
+        assert_eq!(format_float_f64(f64::NAN), b"NaN".to_vec());
     }
 }

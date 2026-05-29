@@ -69,6 +69,9 @@ pub mod workload;
 /// feature baseline; UltraSQL's own product version remains `version()`.
 pub(crate) const REPORTED_SERVER_VERSION: &str = "14.0";
 
+#[cfg(test)]
+pub(crate) static TPCH_TEST_CACHE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 use std::future::Future;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};

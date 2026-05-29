@@ -7,6 +7,7 @@ use ultrasql_planner::{InMemoryCatalog, LogicalPlan, ScalarExpr, bind};
 
 mod modify_index;
 mod select;
+mod tpch_sidecars;
 
 pub(super) fn fixture() -> (InMemoryCatalog, SampleTables) {
     let mut catalog = InMemoryCatalog::new();

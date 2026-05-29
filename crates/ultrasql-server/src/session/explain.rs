@@ -1294,3 +1294,199 @@ fn json_escape(input: &str) -> String {
 
 #[allow(dead_code)]
 fn _silence_unused(_f: Field) {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ultrasql_core::Schema;
+    use ultrasql_executor::MemTableScan;
+    use ultrasql_planner::{
+        AggregateFunc, LogicalAggregateExpr, LogicalJoinCondition, LogicalJoinType, LogicalSetOp,
+        LogicalSetQuantifier, SortKey,
+    };
+    use ultrasql_vec::column::{Column, NumericColumn, StringColumn};
+
+    fn schema() -> Schema {
+        Schema::new([Field::required("id", DataType::Int32)]).expect("schema")
+    }
+
+    fn scan(name: &str) -> LogicalPlan {
+        LogicalPlan::Scan {
+            table: name.to_owned(),
+            schema: schema(),
+            projection: None,
+        }
+    }
+
+    fn col(name: &str, index: usize) -> ScalarExpr {
+        ScalarExpr::Column {
+            name: name.to_owned(),
+            index,
+            data_type: DataType::Int32,
+        }
+    }
+
+    fn lit_i32(value: i32) -> ScalarExpr {
+        ScalarExpr::Literal {
+            value: Value::Int32(value),
+            data_type: DataType::Int32,
+        }
+    }
+
+    #[test]
+    fn render_text_and_json_include_analyze_evidence_and_escape_metadata() {
+        let plan = LogicalPlan::Limit {
+            input: Box::new(LogicalPlan::Filter {
+                input: Box::new(scan("items")),
+                predicate: ScalarExpr::Binary {
+                    op: BinaryOp::Gt,
+                    left: Box::new(col("id", 0)),
+                    right: Box::new(lit_i32(10)),
+                    data_type: DataType::Bool,
+                },
+            }),
+            n: 5,
+            offset: 1,
+        };
+        let actuals = ExplainActuals {
+            rows: 4,
+            batches: 1,
+            peak_output_memory_bytes: 64,
+            disk_spill: DiskSpillSummary {
+                used: true,
+                bytes: 128,
+                reason: "quoted \"spill\" path",
+            },
+            elapsed_ms: 1.25,
+            simd_kernel: "scalar".to_owned(),
+            index_decision: "seq".to_owned(),
+            vector_index: "none".to_owned(),
+            late_materialization: "not applicable".to_owned(),
+            aggregating_index: "none".to_owned(),
+            pushdowns_applied: vec!["read_parquet projection".to_owned()],
+            parquet_row_groups: Some(crate::pipeline::ParquetRowGroupSummary {
+                scanned: 2,
+                skipped: 3,
+            }),
+            parquet_columns_read: Some(vec!["a\"b".to_owned(), "c\\d".to_owned()]),
+            operator_profile: None,
+        };
+
+        let text = render_text(&plan, Some(&actuals));
+        assert!(text.contains("Actual Rows: 4"));
+        assert!(text.contains("Disk Spill: yes"));
+        assert!(text.contains("Parquet Row Groups: scanned=2 skipped=3"));
+        let json = render_json(&plan, Some(&actuals));
+        assert!(json.contains("\"Node Type\": \"Limit\""));
+        assert!(json.contains("\"Disk Spill\": {\"Used\": true"));
+        assert!(json.contains(r#""a\"b""#));
+        assert!(json.contains(r#""c\\d""#));
+        assert_eq!(
+            format_parquet_columns_read_json(Some(&["x".to_owned()])),
+            r#"{"Columns": ["x"], "Count": 1}"#
+        );
+        assert_eq!(json_escape("a\nb\rc\td\\e\"f"), "a\\nb\\rc\\td\\\\e\\\"f");
+    }
+
+    #[test]
+    fn plan_children_node_types_and_pushdown_notes_cover_nested_shapes() {
+        let function = LogicalPlan::FunctionScan {
+            name: "read_parquet".to_owned(),
+            args: vec![],
+            schema: schema(),
+        };
+        let project = LogicalPlan::Project {
+            input: Box::new(function.clone()),
+            exprs: vec![(col("id", 0), "id".to_owned())],
+            schema: schema(),
+        };
+        let filter = LogicalPlan::Filter {
+            input: Box::new(function),
+            predicate: ScalarExpr::Binary {
+                op: BinaryOp::LtEq,
+                left: Box::new(col("id", 0)),
+                right: Box::new(lit_i32(99)),
+                data_type: DataType::Bool,
+            },
+        };
+        let join = LogicalPlan::Join {
+            left: Box::new(project),
+            right: Box::new(filter),
+            join_type: LogicalJoinType::Inner,
+            condition: LogicalJoinCondition::None,
+            schema: Schema::new([
+                Field::required("l", DataType::Int32),
+                Field::required("r", DataType::Int32),
+            ])
+            .expect("join schema"),
+        };
+        let aggregate = LogicalPlan::Aggregate {
+            input: Box::new(join),
+            group_by: vec![col("l", 0)],
+            aggregates: vec![LogicalAggregateExpr {
+                func: AggregateFunc::Sum,
+                arg: Some(col("r", 1)),
+                direct_arg: None,
+                order_by: None,
+                distinct: false,
+                output_name: "sum".to_owned(),
+                data_type: DataType::Int64,
+            }],
+            schema: schema(),
+        };
+        let set_op = LogicalPlan::SetOp {
+            op: LogicalSetOp::Union,
+            quantifier: LogicalSetQuantifier::Distinct,
+            left: Box::new(aggregate),
+            right: Box::new(scan("fallback")),
+            schema: schema(),
+        };
+
+        assert_eq!(plan_node_type(&set_op), "Set Op");
+        assert_eq!(plan_children(&set_op).len(), 2);
+        let notes = pushdown_notes(&set_op);
+        assert!(notes.contains(&"read_parquet projection".to_owned()));
+        assert!(notes.contains(&"read_parquet predicate".to_owned()));
+        assert!(parquet_pushdown_shape(&ScalarExpr::Binary {
+            op: BinaryOp::Eq,
+            left: Box::new(col("id", 0)),
+            right: Box::new(lit_i32(1)),
+            data_type: DataType::Bool,
+        }));
+        assert!(!parquet_pushdown_shape(&ScalarExpr::Binary {
+            op: BinaryOp::Add,
+            left: Box::new(col("id", 0)),
+            right: Box::new(lit_i32(1)),
+            data_type: DataType::Int32,
+        }));
+    }
+
+    #[test]
+    fn drain_explain_operator_counts_rows_batches_and_memory() {
+        let batch = Batch::new(vec![
+            Column::Int32(NumericColumn::from_data(vec![1, 2, 3])),
+            Column::Utf8(StringColumn::from_data([
+                "a".to_owned(),
+                "bb".to_owned(),
+                "ccc".to_owned(),
+            ])),
+        ])
+        .expect("batch");
+        let schema = Schema::new([
+            Field::required("id", DataType::Int32),
+            Field::required("name", DataType::Text { max_len: None }),
+        ])
+        .expect("schema");
+        let mut op = MemTableScan::new(schema, vec![batch]);
+        let actuals = drain_explain_operator(&mut op).expect("drain");
+        assert_eq!(actuals.rows, 3);
+        assert_eq!(actuals.batches, 1);
+        assert!(actuals.peak_output_memory_bytes >= 12);
+        assert!(actuals.operator_profile.is_none());
+
+        assert_eq!(format_parquet_row_groups(None), "not applicable");
+        assert_eq!(format_parquet_row_groups_json(None), "null");
+        assert_eq!(format_parquet_columns_read(None), "not applicable");
+        assert_eq!(format_parquet_columns_read_json(None), "null");
+    }
+}

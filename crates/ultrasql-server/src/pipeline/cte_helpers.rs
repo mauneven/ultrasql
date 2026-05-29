@@ -316,7 +316,13 @@ pub(super) fn filter_unseen_rows(
                     .zip(keep_mask.iter())
                     .filter_map(|(v, k)| k.then_some(*v != 0))
                     .collect();
-                Column::Bool(ultrasql_vec::column::BoolColumn::from_data(data))
+                let nulls = c.nulls().map(|source| filter_bitmap(source, &keep_mask));
+                let col = match nulls {
+                    Some(nulls) => ultrasql_vec::column::BoolColumn::with_nulls(data, nulls)
+                        .expect("filtered bool validity length matches data length"),
+                    None => ultrasql_vec::column::BoolColumn::from_data(data),
+                };
+                Column::Bool(col)
             }
             Column::Utf8(_) | Column::DictionaryUtf8(_) => {
                 let strings: Vec<Option<String>> = (0..keep_mask.len())
@@ -352,7 +358,24 @@ pub(super) fn filter_numeric<T: Copy>(
         .zip(keep_mask.iter())
         .filter_map(|(v, k)| k.then_some(*v))
         .collect();
-    ultrasql_vec::column::NumericColumn::from_data(data)
+    match col.nulls().map(|source| filter_bitmap(source, keep_mask)) {
+        Some(nulls) => ultrasql_vec::column::NumericColumn::with_nulls(data, nulls)
+            .expect("filtered numeric validity length matches data length"),
+        None => ultrasql_vec::column::NumericColumn::from_data(data),
+    }
+}
+
+fn filter_bitmap(source: &ultrasql_vec::Bitmap, keep_mask: &[bool]) -> ultrasql_vec::Bitmap {
+    let kept = keep_mask.iter().filter(|&&keep| keep).count();
+    let mut out = ultrasql_vec::Bitmap::new(kept, true);
+    let mut out_idx = 0;
+    for (idx, keep) in keep_mask.iter().copied().enumerate() {
+        if keep {
+            out.set(out_idx, source.get(idx));
+            out_idx += 1;
+        }
+    }
+    out
 }
 
 /// Re-check the contract `bind_set_op` enforces: both inputs must have
@@ -403,4 +426,94 @@ pub(super) fn lower_set_op_real(
     Ok(Box::new(SetOp::new(
         left_op, right_op, op, quantifier, out_schema,
     )))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ultrasql_core::{DataType, Field};
+    use ultrasql_vec::Bitmap;
+    use ultrasql_vec::column::{BoolColumn, Column, NumericColumn, StringColumn};
+    use ultrasql_vec::dict::DictionaryColumn;
+
+    fn validity(bits: &[bool]) -> Bitmap {
+        let mut bitmap = Bitmap::new(bits.len(), true);
+        for (idx, valid) in bits.iter().copied().enumerate() {
+            bitmap.set(idx, valid);
+        }
+        bitmap
+    }
+
+    fn mixed_batch() -> Batch {
+        Batch::new(vec![
+            Column::Int32(
+                NumericColumn::with_nulls(vec![1, 99, 1], validity(&[true, false, true]))
+                    .expect("i32 nulls"),
+            ),
+            Column::Int64(NumericColumn::from_data(vec![10, 20, 10])),
+            Column::Float32(NumericColumn::from_data(vec![1.0, 2.0, 1.0])),
+            Column::Float64(NumericColumn::from_data(vec![3.0, 4.0, 3.0])),
+            Column::Bool(
+                BoolColumn::with_nulls(vec![true, false, true], validity(&[true, false, true]))
+                    .expect("bool nulls"),
+            ),
+            Column::Utf8(
+                StringColumn::with_nulls(
+                    ["same".to_owned(), String::new(), "same".to_owned()],
+                    validity(&[true, false, true]),
+                )
+                .expect("utf8 nulls"),
+            ),
+            Column::DictionaryUtf8(DictionaryColumn::from_strings([
+                Some("dict"),
+                None,
+                Some("dict"),
+            ])),
+        ])
+        .expect("mixed batch")
+    }
+
+    #[test]
+    fn row_keys_and_unseen_filter_preserve_nulls_across_column_kinds() {
+        let batch = mixed_batch();
+        let keys = batch_row_keys(&batch);
+        assert_eq!(keys.len(), 3);
+        assert_eq!(keys[0], keys[2]);
+        assert_ne!(keys[0], keys[1]);
+
+        let mut seen = std::collections::HashSet::new();
+        seen.insert(keys[0].clone());
+        let kept = filter_unseen_rows(&batch, &mut seen)
+            .expect("filter")
+            .expect("one null row survives");
+        assert_eq!(kept.rows(), 1);
+        let Column::Int32(i32s) = &kept.columns()[0] else {
+            panic!("i32 column");
+        };
+        assert!(!i32s.nulls().expect("i32 nulls").get(0));
+        let Column::Bool(flags) = &kept.columns()[4] else {
+            panic!("bool column");
+        };
+        assert!(!flags.nulls().expect("bool nulls").get(0));
+        assert_eq!(kept.columns()[5].text_value(0), None);
+        assert_eq!(kept.columns()[6].text_value(0), None);
+
+        assert!(
+            filter_unseen_rows(&batch, &mut seen)
+                .expect("all seen")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn set_op_schema_check_reports_arity_mismatch() {
+        let left = Schema::new([Field::required("id", DataType::Int32)]).expect("left");
+        let right = Schema::new([
+            Field::required("id", DataType::Int32),
+            Field::required("name", DataType::Text { max_len: None }),
+        ])
+        .expect("right");
+        assert!(check_set_op_schemas(&left, &right).is_err());
+        assert!(check_set_op_schemas(&left, &left).is_ok());
+    }
 }

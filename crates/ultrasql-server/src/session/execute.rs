@@ -2979,3 +2979,498 @@ impl StatsSource for ServerStatsSource<'_> {
             .unwrap_or(0.0)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::io::duplex;
+    use ultrasql_core::{Field, Schema};
+    use ultrasql_planner::{AggregateFunc, LogicalAggregateExpr, LogicalSetVariableAction};
+
+    fn test_schema() -> Schema {
+        Schema::new([
+            Field::required("id", DataType::Int32),
+            Field::required("value", DataType::Int32),
+        ])
+        .expect("test schema")
+    }
+
+    fn scan_plan() -> LogicalPlan {
+        LogicalPlan::Scan {
+            table: "t".to_owned(),
+            schema: test_schema(),
+            projection: None,
+        }
+    }
+
+    fn int_column(name: &str, index: usize) -> ScalarExpr {
+        ScalarExpr::Column {
+            name: name.to_owned(),
+            index,
+            data_type: DataType::Int32,
+        }
+    }
+
+    fn test_session() -> Session<tokio::io::DuplexStream> {
+        let (io, _peer) = duplex(64);
+        Session::new(io, Arc::new(Server::with_sample_database()))
+    }
+
+    fn first_data_row_text(result: &SelectResult) -> String {
+        let Some(BackendMessage::DataRow { columns }) = result
+            .messages
+            .iter()
+            .find(|msg| matches!(msg, BackendMessage::DataRow { .. }))
+        else {
+            panic!("missing data row");
+        };
+        String::from_utf8(columns[0].clone().expect("value")).expect("utf8")
+    }
+
+    #[test]
+    fn logical_replication_and_guc_parsers_cover_success_and_errors() {
+        for value in ["on", "TRUE", "1", "yes"] {
+            assert!(parse_bool_guc(value).expect("true guc"));
+        }
+        for value in ["off", "FALSE", "0", "no"] {
+            assert!(!parse_bool_guc(value).expect("false guc"));
+        }
+        assert!(parse_bool_guc("maybe").is_err());
+        assert_eq!(parse_statement_timeout_ms(" 250 ").expect("timeout"), 250);
+        assert!(parse_statement_timeout_ms("-1").is_err());
+        assert!(parse_statement_timeout_ms("abc").is_err());
+
+        assert!(starts_with_keyword_pair(
+            "create publication pub for table t",
+            "CREATE",
+            "PUBLICATION",
+        ));
+        assert!(!starts_with_keyword_pair("create", "CREATE", "PUBLICATION"));
+        assert_eq!(
+            split_first_token("  name rest ").expect("token"),
+            ("name", "rest")
+        );
+        assert!(split_first_token("   ").is_err());
+        assert_eq!(
+            parse_publication_tables("FOR TABLE users, \"Orders\"").expect("tables"),
+            vec!["users".to_owned(), "Orders".to_owned()]
+        );
+        assert!(parse_publication_tables("FOR ALL TABLES").is_err());
+        assert!(parse_publication_tables("FOR TABLE ,").is_err());
+        assert_eq!(
+            parse_quoted_literal(" 'conn info' PUBLICATION pub").expect("literal"),
+            ("conn info", "PUBLICATION pub")
+        );
+        assert!(parse_quoted_literal("conn").is_err());
+        assert!(parse_quoted_literal("'unterminated").is_err());
+        assert_eq!(
+            parse_subscription_publications("PUBLICATION pub1, \"Pub2\" WITH (slot_name='s')")
+                .expect("publications"),
+            vec!["pub1".to_owned(), "Pub2".to_owned()]
+        );
+        assert!(parse_subscription_publications("WITH ()").is_err());
+        assert_eq!(
+            parse_subscription_slot_name(
+                "PUBLICATION pub WITH (copy_data=false, slot_name='slot_a')"
+            )
+            .expect("slot"),
+            Some("slot_a".to_owned())
+        );
+        assert_eq!(
+            parse_subscription_slot_name("PUBLICATION pub").expect("no slot"),
+            None
+        );
+
+        let subscription = parse_create_subscription(
+            "sub CONNECTION 'host=localhost' PUBLICATION pub WITH (slot_name = \"slot_b\")",
+        )
+        .expect("subscription");
+        assert_eq!(
+            subscription,
+            LogicalReplicationDdl::CreateSubscription {
+                name: "sub".to_owned(),
+                conninfo: "host=localhost".to_owned(),
+                publications: vec!["pub".to_owned()],
+                slot_name: Some("slot_b".to_owned()),
+            }
+        );
+        assert!(parse_create_subscription("sub PUBLICATION pub").is_err());
+
+        assert_eq!(
+            Session::<tokio::io::DuplexStream>::try_parse_logical_replication_ddl(
+                "CREATE PUBLICATION pub FOR TABLE users;"
+            )
+            .expect("parse publication"),
+            Some(LogicalReplicationDdl::CreatePublication {
+                name: "pub".to_owned(),
+                tables: vec!["users".to_owned()],
+            })
+        );
+        assert_eq!(
+            Session::<tokio::io::DuplexStream>::try_parse_logical_replication_ddl(
+                "DROP PUBLICATION IF EXISTS pub"
+            )
+            .expect("drop publication"),
+            Some(LogicalReplicationDdl::DropPublication {
+                name: "pub".to_owned(),
+                if_exists: true,
+            })
+        );
+        assert_eq!(
+            Session::<tokio::io::DuplexStream>::try_parse_logical_replication_ddl(
+                "DROP SUBSCRIPTION sub"
+            )
+            .expect("drop subscription"),
+            Some(LogicalReplicationDdl::DropSubscription {
+                name: "sub".to_owned(),
+                if_exists: false,
+            })
+        );
+        assert!(
+            Session::<tokio::io::DuplexStream>::try_parse_logical_replication_ddl("SELECT 1")
+                .expect("not ddl")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn session_variable_surface_sets_shows_and_resets_supported_gucs() {
+        let mut session = test_session();
+        session
+            .apply_session_variable("jit", "on")
+            .expect("set jit");
+        assert!(session.jit_enabled);
+        session
+            .apply_session_variable("jit_above_cost", "123")
+            .expect("set jit threshold");
+        assert_eq!(session.jit_above_rows, 123);
+        session
+            .apply_session_variable("statement_timeout", "50")
+            .expect("set timeout");
+        assert_eq!(session.statement_timeout_ms, 50);
+        session
+            .apply_session_variable("extra_float_digits", "3")
+            .expect("extra_float_digits");
+        session
+            .apply_session_variable("application_name", "cert")
+            .expect("application name");
+        session
+            .apply_session_variable("client_min_messages", "WARNING")
+            .expect("client min messages");
+        session
+            .apply_session_variable("client_encoding", "UTF8")
+            .expect("encoding");
+        session
+            .apply_session_variable("search_path", "app, public")
+            .expect("search path");
+        session
+            .apply_session_variable("intervalstyle", "iso_8601")
+            .expect("intervalstyle");
+        session
+            .apply_session_variable("timezone", "America/Bogota")
+            .expect("timezone");
+        session
+            .apply_session_variable("standard_conforming_strings", "on")
+            .expect("strings");
+        session
+            .apply_session_variable("synchronous_commit", "remote_write")
+            .expect("sync commit");
+        session
+            .apply_session_variable("ultrasql.tenant", "acme")
+            .expect("custom guc");
+
+        assert_eq!(
+            first_data_row_text(
+                &session
+                    .show_session_variable("jit", true)
+                    .expect("show jit")
+            ),
+            "on"
+        );
+        assert_eq!(
+            first_data_row_text(
+                &session
+                    .show_session_variable("timezone", false)
+                    .expect("show timezone")
+            ),
+            "America/Bogota"
+        );
+        assert_eq!(
+            first_data_row_text(
+                &session
+                    .show_session_variable("ultrasql.tenant", false)
+                    .expect("show custom")
+            ),
+            "acme"
+        );
+        assert_eq!(
+            first_data_row_text(
+                &session
+                    .show_session_variable("server_version", true)
+                    .expect("show version")
+            ),
+            crate::REPORTED_SERVER_VERSION
+        );
+
+        assert!(session.apply_session_variable("jit", "maybe").is_err());
+        assert!(
+            session
+                .apply_session_variable("jit_above_cost", "bad")
+                .is_err()
+        );
+        assert!(
+            session
+                .apply_session_variable("extra_float_digits", "4")
+                .is_err()
+        );
+        assert!(
+            session
+                .apply_session_variable("client_min_messages", "loud")
+                .is_err()
+        );
+        assert!(
+            session
+                .apply_session_variable("client_encoding", "LATIN1")
+                .is_err()
+        );
+        assert!(
+            session
+                .apply_session_variable("intervalstyle", "bad")
+                .is_err()
+        );
+        assert!(
+            session
+                .apply_session_variable("standard_conforming_strings", "off")
+                .is_err()
+        );
+        assert!(
+            session
+                .apply_session_variable("synchronous_commit", "bad")
+                .is_err()
+        );
+        assert!(session.apply_session_variable("unknown", "x").is_err());
+
+        for name in [
+            "jit",
+            "jit_above_cost",
+            "statement_timeout",
+            "extra_float_digits",
+            "application_name",
+            "client_min_messages",
+            "client_encoding",
+            "search_path",
+            "intervalstyle",
+            "timezone",
+            "synchronous_commit",
+            "ultrasql.tenant",
+        ] {
+            session
+                .execute_set_variable_reset(name)
+                .unwrap_or_else(|_| panic!("reset {name}"));
+        }
+        assert!(!session.jit_enabled);
+        assert_eq!(session.statement_timeout_ms, 0);
+        assert!(!session.session_settings.contains_key("ultrasql.tenant"));
+        assert!(session.execute_set_variable_reset("unsupported").is_err());
+
+        let show_plan = LogicalPlan::SetVariable {
+            name: "client_encoding".to_owned(),
+            action: LogicalSetVariableAction::Show,
+            value: None,
+            schema: Schema::new([Field::required(
+                "client_encoding",
+                DataType::Text { max_len: None },
+            )])
+            .expect("show schema"),
+        };
+        assert_eq!(
+            first_data_row_text(
+                &session
+                    .execute_set_variable(&show_plan, true)
+                    .expect("execute show")
+            ),
+            "UTF8"
+        );
+        let wrong = LogicalPlan::Values {
+            rows: Vec::new(),
+            schema: Schema::empty(),
+        };
+        assert!(session.execute_set_variable(&wrong, true).is_err());
+    }
+
+    #[test]
+    fn plan_shape_predicates_and_command_tags_cover_dml_edges() {
+        let scan = scan_plan();
+        let filtered = LogicalPlan::Filter {
+            input: Box::new(scan.clone()),
+            predicate: bool_literal(true),
+        };
+        let update = LogicalPlan::Update {
+            table: "t".to_owned(),
+            assignments: vec![(1, int_column("value", 1))],
+            input: Box::new(filtered.clone()),
+            returning: Vec::new(),
+            schema: Schema::empty(),
+        };
+        assert!(Session::<tokio::io::DuplexStream>::is_fused_update_shape(
+            &update
+        ));
+        let mut returning_update = update.clone();
+        if let LogicalPlan::Update { returning, .. } = &mut returning_update {
+            returning.push((int_column("id", 0), "id".to_owned()));
+        }
+        assert!(!Session::<tokio::io::DuplexStream>::is_fused_update_shape(
+            &returning_update
+        ));
+
+        let aggregate = LogicalPlan::Aggregate {
+            input: Box::new(filtered),
+            group_by: Vec::new(),
+            aggregates: vec![LogicalAggregateExpr {
+                func: AggregateFunc::Sum,
+                arg: Some(int_column("value", 1)),
+                direct_arg: None,
+                order_by: None,
+                distinct: false,
+                output_name: "sum".to_owned(),
+                data_type: DataType::Int64,
+            }],
+            schema: Schema::new([Field::required("sum", DataType::Int64)]).expect("agg schema"),
+        };
+        let projected_aggregate = LogicalPlan::Project {
+            input: Box::new(aggregate.clone()),
+            exprs: vec![(int_column("sum", 0), "sum".to_owned())],
+            schema: Schema::new([Field::required("sum", DataType::Int64)]).expect("project schema"),
+        };
+        assert!(
+            Session::<tokio::io::DuplexStream>::is_scalar_aggregate_shape(&projected_aggregate)
+        );
+        assert_eq!(
+            Session::<tokio::io::DuplexStream>::scalar_aggregate_source_table(&projected_aggregate),
+            Some("t".to_owned())
+        );
+        let mut grouped = aggregate.clone();
+        if let LogicalPlan::Aggregate { group_by, .. } = &mut grouped {
+            group_by.push(int_column("id", 0));
+        }
+        assert!(!Session::<tokio::io::DuplexStream>::is_scalar_aggregate_shape(&grouped));
+
+        let insert_values = LogicalPlan::Insert {
+            table: "t".to_owned(),
+            columns: Vec::new(),
+            source: Box::new(LogicalPlan::Values {
+                rows: vec![vec![ScalarExpr::Literal {
+                    value: Value::Int32(1),
+                    data_type: DataType::Int32,
+                }]],
+                schema: Schema::new([Field::required("id", DataType::Int32)])
+                    .expect("values schema"),
+            }),
+            on_conflict: None,
+            returning: Vec::new(),
+            schema: Schema::empty(),
+        };
+        assert!(Session::<tokio::io::DuplexStream>::is_trivial_insert_values(&insert_values));
+        assert_eq!(
+            Session::<tokio::io::DuplexStream>::dml_target_table(&insert_values),
+            Some("t")
+        );
+        assert_eq!(
+            Session::<tokio::io::DuplexStream>::dml_change_kind(&insert_values),
+            Some(LogicalChangeKind::Insert)
+        );
+        assert_eq!(
+            Session::<tokio::io::DuplexStream>::dml_change_kind(&update),
+            Some(LogicalChangeKind::Update)
+        );
+        let delete = LogicalPlan::Delete {
+            table: "t".to_owned(),
+            input: Box::new(scan),
+            returning: Vec::new(),
+            schema: Schema::empty(),
+        };
+        assert_eq!(
+            Session::<tokio::io::DuplexStream>::dml_change_kind(&delete),
+            Some(LogicalChangeKind::Delete)
+        );
+        assert_eq!(
+            Session::<tokio::io::DuplexStream>::dml_target_table(&LogicalPlan::Empty {
+                schema: Schema::empty(),
+            }),
+            None
+        );
+
+        let messages = vec![BackendMessage::CommandComplete {
+            tag: "INSERT 0 9".to_owned(),
+        }];
+        assert_eq!(
+            Session::<tokio::io::DuplexStream>::parse_affected_rows_tag(&messages),
+            9
+        );
+        assert_eq!(
+            Session::<tokio::io::DuplexStream>::parse_command_rows_tag(&messages),
+            9
+        );
+        assert_eq!(
+            Session::<tokio::io::DuplexStream>::parse_affected_rows_tag(&[
+                BackendMessage::CommandComplete {
+                    tag: "SELECT 9".to_owned(),
+                }
+            ]),
+            0
+        );
+        assert_eq!(
+            Session::<tokio::io::DuplexStream>::parse_command_rows_tag(&[]),
+            0
+        );
+    }
+
+    #[test]
+    fn backup_hot_standby_and_single_text_helpers_cover_admin_edges() {
+        assert_eq!(
+            Session::<tokio::io::DuplexStream>::try_parse_backup_function(
+                "SELECT pg_start_backup('label');"
+            ),
+            Some("pg_start_backup")
+        );
+        assert_eq!(
+            Session::<tokio::io::DuplexStream>::try_parse_backup_function(
+                "select pg_backup_stop()"
+            ),
+            Some("pg_stop_backup")
+        );
+        assert_eq!(
+            Session::<tokio::io::DuplexStream>::try_parse_backup_function("SELECT 1"),
+            None
+        );
+
+        for sql in [
+            "",
+            "SELECT 1",
+            "SHOW client_encoding",
+            "EXPLAIN SELECT 1",
+            "WITH x AS (SELECT 1) SELECT * FROM x",
+            "VALUES (1)",
+            "COPY t TO STDOUT",
+        ] {
+            assert!(Session::<tokio::io::DuplexStream>::hot_standby_allows(sql));
+        }
+        for sql in ["INSERT INTO t VALUES (1)", "COPY t FROM STDIN"] {
+            assert!(!Session::<tokio::io::DuplexStream>::hot_standby_allows(sql));
+        }
+
+        let result = Session::<tokio::io::DuplexStream>::single_text_select("answer", "42");
+        assert_eq!(result.rows, 1);
+        assert_eq!(first_data_row_text(&result), "42");
+
+        let mut session = test_session();
+        let txn = session
+            .state
+            .txn_manager
+            .begin(IsolationLevel::ReadCommitted);
+        session.txn_state = TxnState::InTransaction(txn);
+        let err = session.fail_if_in_transaction(ServerError::Unsupported("boom"));
+        assert!(matches!(err, ServerError::Unsupported("boom")));
+        assert!(matches!(session.txn_state, TxnState::Failed(_)));
+    }
+}

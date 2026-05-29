@@ -582,3 +582,108 @@ pub(super) fn extract_int64_col_op_lit(
         None
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ultrasql_core::{DataType, Value};
+    use ultrasql_vec::kernels::CmpOp;
+
+    fn col_i32(index: usize) -> ScalarExpr {
+        ScalarExpr::Column {
+            name: format!("c{index}"),
+            index,
+            data_type: DataType::Int32,
+        }
+    }
+
+    fn col_i64(index: usize) -> ScalarExpr {
+        ScalarExpr::Column {
+            name: format!("c{index}"),
+            index,
+            data_type: DataType::Int64,
+        }
+    }
+
+    fn lit_i32(value: i32) -> ScalarExpr {
+        ScalarExpr::Literal {
+            value: Value::Int32(value),
+            data_type: DataType::Int32,
+        }
+    }
+
+    fn lit_i64(value: i64) -> ScalarExpr {
+        ScalarExpr::Literal {
+            value: Value::Int64(value),
+            data_type: DataType::Int64,
+        }
+    }
+
+    fn bin(op: BinaryOp, left: ScalarExpr, right: ScalarExpr) -> ScalarExpr {
+        ScalarExpr::Binary {
+            op,
+            left: Box::new(left),
+            right: Box::new(right),
+            data_type: DataType::Bool,
+        }
+    }
+
+    #[test]
+    fn predicate_extractors_accept_direct_and_mirrored_integer_shapes() {
+        assert_eq!(
+            extract_int32_col_op_lit(&bin(BinaryOp::LtEq, col_i32(2), lit_i32(7))),
+            Some((2, CmpOp::Le, 7))
+        );
+        assert_eq!(
+            extract_int32_col_op_lit(&bin(BinaryOp::Lt, lit_i32(7), col_i32(3))),
+            Some((3, CmpOp::Gt, 7))
+        );
+        assert_eq!(
+            extract_int64_col_op_lit(&bin(BinaryOp::GtEq, col_i64(4), lit_i64(11))),
+            Some((4, CmpOp::Ge, 11))
+        );
+        assert_eq!(
+            extract_int64_col_op_lit(&bin(BinaryOp::Gt, lit_i64(11), col_i64(5))),
+            Some((5, CmpOp::Lt, 11))
+        );
+        assert!(extract_int32_col_op_lit(&bin(BinaryOp::Add, col_i32(0), lit_i32(1))).is_none());
+        assert!(extract_int64_col_op_lit(&bin(BinaryOp::Eq, col_i32(0), lit_i64(1))).is_none());
+    }
+
+    #[test]
+    fn shift_column_indices_recurses_without_rewriting_subquery_shapes() {
+        let expr = ScalarExpr::FunctionCall {
+            name: "abs".to_owned(),
+            args: vec![ScalarExpr::Unary {
+                op: ultrasql_planner::UnaryOp::Neg,
+                expr: Box::new(bin(BinaryOp::Add, col_i32(0), col_i32(2))),
+                data_type: DataType::Int32,
+            }],
+            data_type: DataType::Int32,
+        };
+        let shifted = shift_column_indices(&expr, 5);
+        let ScalarExpr::FunctionCall { args, .. } = shifted else {
+            panic!("function call");
+        };
+        let ScalarExpr::Unary { expr, .. } = &args[0] else {
+            panic!("unary");
+        };
+        let ScalarExpr::Binary { left, right, .. } = expr.as_ref() else {
+            panic!("binary");
+        };
+        assert!(matches!(left.as_ref(), ScalarExpr::Column { index: 5, .. }));
+        assert!(matches!(
+            right.as_ref(),
+            ScalarExpr::Column { index: 7, .. }
+        ));
+
+        let subquery = ScalarExpr::Exists {
+            subplan: Box::new(LogicalPlan::Empty {
+                schema: ultrasql_core::Schema::empty(),
+            }),
+            negated: false,
+            correlated: false,
+        };
+        assert_eq!(shift_column_indices(&subquery, 9), subquery);
+    }
+}

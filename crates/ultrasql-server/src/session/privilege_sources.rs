@@ -224,3 +224,218 @@ fn join_sources(
     }
     vec![None; schema.len()]
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ultrasql_core::{DataType, Field, Value};
+    use ultrasql_planner::{
+        AggregateFunc, LogicalAggregateExpr, LogicalSetOp, LogicalSetQuantifier, LogicalWindowFunc,
+    };
+
+    fn schema(names: &[&str]) -> Schema {
+        Schema::new(
+            names
+                .iter()
+                .map(|name| Field::required(*name, DataType::Int32)),
+        )
+        .expect("schema")
+    }
+
+    fn scan(table: &str, fields: &[&str]) -> LogicalPlan {
+        LogicalPlan::Scan {
+            table: table.to_owned(),
+            schema: schema(fields),
+            projection: None,
+        }
+    }
+
+    fn projected_scan(table: &str, fields: &[&str], projection: Vec<usize>) -> LogicalPlan {
+        LogicalPlan::Scan {
+            table: table.to_owned(),
+            schema: schema(fields),
+            projection: Some(projection),
+        }
+    }
+
+    fn col(name: &str, index: usize) -> ScalarExpr {
+        ScalarExpr::Column {
+            name: name.to_owned(),
+            index,
+            data_type: DataType::Int32,
+        }
+    }
+
+    fn lit(value: i32) -> ScalarExpr {
+        ScalarExpr::Literal {
+            value: Value::Int32(value),
+            data_type: DataType::Int32,
+        }
+    }
+
+    fn source_names(sources: &[Option<ColumnSource>]) -> Vec<Option<String>> {
+        sources
+            .iter()
+            .map(|source| source.as_ref().map(|s| format!("{}.{}", s.table, s.column)))
+            .collect()
+    }
+
+    #[test]
+    fn scan_project_window_and_aggregate_sources_preserve_direct_columns() {
+        assert_eq!(
+            source_names(&plan_sources(&scan("Users", &["Id", "Score"]))),
+            vec![Some("users.id".to_owned()), Some("users.score".to_owned())]
+        );
+        assert_eq!(
+            source_names(&plan_sources(&projected_scan("Users", &["Id"], vec![1]))),
+            vec![Some("users.id".to_owned())]
+        );
+        assert_eq!(
+            target_columns(&[], &schema(&["a", "b", "c"])),
+            vec![0, 1, 2]
+        );
+        assert_eq!(
+            target_columns(&[2, 0], &schema(&["a", "b", "c"])),
+            vec![2, 0]
+        );
+
+        let base = scan("Users", &["id", "score"]);
+        let project = LogicalPlan::Project {
+            input: Box::new(base.clone()),
+            exprs: vec![
+                (col("score", 1), "score".to_owned()),
+                (lit(7), "seven".to_owned()),
+            ],
+            schema: schema(&["score", "seven"]),
+        };
+        assert_eq!(
+            source_names(&plan_sources(&project)),
+            vec![Some("users.score".to_owned()), None]
+        );
+
+        let window = LogicalPlan::Window {
+            input: Box::new(base.clone()),
+            partition_by: vec![col("id", 0)],
+            order_by: Vec::new(),
+            func: LogicalWindowFunc::RowNumber,
+            output_name: "rn".to_owned(),
+            schema: schema(&["id", "score", "rn"]),
+        };
+        assert_eq!(
+            source_names(&plan_sources(&window)),
+            vec![
+                Some("users.id".to_owned()),
+                Some("users.score".to_owned()),
+                None
+            ]
+        );
+
+        let aggregate = LogicalPlan::Aggregate {
+            input: Box::new(base),
+            group_by: vec![col("id", 0), lit(1)],
+            aggregates: vec![LogicalAggregateExpr {
+                func: AggregateFunc::Sum,
+                arg: Some(col("score", 1)),
+                direct_arg: None,
+                order_by: None,
+                distinct: false,
+                output_name: "sum_score".to_owned(),
+                data_type: DataType::Int64,
+            }],
+            schema: schema(&["id", "one", "sum_score"]),
+        };
+        assert_eq!(
+            source_names(&plan_sources(&aggregate)),
+            vec![Some("users.id".to_owned()), None, None]
+        );
+    }
+
+    #[test]
+    fn join_and_fallback_sources_cover_using_semi_and_unknown_shapes() {
+        let left = scan("LeftT", &["id", "lv"]);
+        let right = scan("RightT", &["id", "rv"]);
+        let concatenated = LogicalPlan::Join {
+            left: Box::new(left.clone()),
+            right: Box::new(right.clone()),
+            join_type: LogicalJoinType::Inner,
+            condition: LogicalJoinCondition::None,
+            schema: schema(&["id", "lv", "id2", "rv"]),
+        };
+        assert_eq!(
+            source_names(&plan_sources(&concatenated)),
+            vec![
+                Some("leftt.id".to_owned()),
+                Some("leftt.lv".to_owned()),
+                Some("rightt.id".to_owned()),
+                Some("rightt.rv".to_owned())
+            ]
+        );
+
+        let using_join = LogicalPlan::Join {
+            left: Box::new(left.clone()),
+            right: Box::new(right.clone()),
+            join_type: LogicalJoinType::Inner,
+            condition: LogicalJoinCondition::Using(vec![(0, 0)]),
+            schema: schema(&["id", "lv", "rv"]),
+        };
+        assert_eq!(
+            source_names(&plan_sources(&using_join)),
+            vec![
+                Some("leftt.id".to_owned()),
+                Some("leftt.lv".to_owned()),
+                Some("rightt.rv".to_owned())
+            ]
+        );
+
+        let semi = LogicalPlan::Join {
+            left: Box::new(left.clone()),
+            right: Box::new(right.clone()),
+            join_type: LogicalJoinType::Semi,
+            condition: LogicalJoinCondition::None,
+            schema: schema(&["id", "lv"]),
+        };
+        assert_eq!(
+            source_names(&plan_sources(&semi)),
+            vec![Some("leftt.id".to_owned()), Some("leftt.lv".to_owned())]
+        );
+
+        let unknown = LogicalPlan::Join {
+            left: Box::new(left),
+            right: Box::new(right),
+            join_type: LogicalJoinType::Inner,
+            condition: LogicalJoinCondition::None,
+            schema: schema(&["mystery"]),
+        };
+        assert_eq!(source_names(&plan_sources(&unknown)), vec![None]);
+
+        let setop = LogicalPlan::SetOp {
+            op: LogicalSetOp::Union,
+            quantifier: LogicalSetQuantifier::Distinct,
+            left: Box::new(scan("a", &["x"])),
+            right: Box::new(scan("b", &["x"])),
+            schema: schema(&["x"]),
+        };
+        assert_eq!(source_names(&plan_sources(&setop)), vec![None]);
+    }
+
+    #[test]
+    fn privilege_names_cover_all_supported_privilege_kinds() {
+        let cases = [
+            (PrivilegeKind::Select, "SELECT"),
+            (PrivilegeKind::Insert, "INSERT"),
+            (PrivilegeKind::Update, "UPDATE"),
+            (PrivilegeKind::Delete, "DELETE"),
+            (PrivilegeKind::Truncate, "TRUNCATE"),
+            (PrivilegeKind::References, "REFERENCES"),
+            (PrivilegeKind::Trigger, "TRIGGER"),
+            (PrivilegeKind::Usage, "USAGE"),
+            (PrivilegeKind::Create, "CREATE"),
+            (PrivilegeKind::Connect, "CONNECT"),
+            (PrivilegeKind::Temporary, "TEMPORARY"),
+            (PrivilegeKind::Execute, "EXECUTE"),
+        ];
+        for (kind, expected) in cases {
+            assert_eq!(privilege_name(kind), expected);
+        }
+    }
+}

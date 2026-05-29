@@ -808,6 +808,72 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn ops_endpoint_paths_return_expected_http_shapes() {
+        let state = Arc::new(Server::with_sample_database());
+        let pg_listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind pg probe");
+        let ready_addr = pg_listener.local_addr().expect("pg addr");
+
+        let health = request_ops_path("/health", ready_addr, Arc::clone(&state)).await;
+        assert!(health.starts_with("HTTP/1.1 200 OK"));
+        assert!(health.contains("\"status\":\"ok\""));
+
+        let ready = request_ops_path("/ready", ready_addr, Arc::clone(&state)).await;
+        assert!(ready.starts_with("HTTP/1.1 200 OK"));
+        assert!(ready.contains("\"status\":\"ready\""));
+        drop(pg_listener);
+
+        let missing_pg: SocketAddr = "127.0.0.1:0".parse().expect("missing pg addr");
+        let not_ready = request_ops_path("/ready", missing_pg, Arc::clone(&state)).await;
+        assert!(not_ready.starts_with("HTTP/1.1 503 Service Unavailable"));
+        assert!(not_ready.contains("\"status\":\"not_ready\""));
+
+        let metrics = request_ops_path("/metrics", missing_pg, Arc::clone(&state)).await;
+        assert!(metrics.starts_with("HTTP/1.1 200 OK"));
+        assert!(metrics.contains("content-type: text/plain; version=0.0.4"));
+        assert!(metrics.contains("ultrasql_up 1"));
+
+        let backup_start = request_ops_path("/backup/start", missing_pg, Arc::clone(&state)).await;
+        assert!(backup_start.starts_with("HTTP/1.1 200 OK"));
+        assert!(backup_start.contains("\"backup_started\""));
+        assert!(state.is_standby_mode());
+
+        let backup_stop = request_ops_path("/backup/stop", missing_pg, Arc::clone(&state)).await;
+        assert!(backup_stop.starts_with("HTTP/1.1 200 OK"));
+        assert!(backup_stop.contains("\"backup_stopped\""));
+        assert!(!state.is_standby_mode());
+
+        let not_found = request_ops_path("/nope", missing_pg, state).await;
+        assert!(not_found.starts_with("HTTP/1.1 404 Not Found"));
+        assert!(not_found.contains("\"error\":\"not found\""));
+    }
+
+    async fn request_ops_path(path: &str, pg_addr: SocketAddr, state: Arc<Server>) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind ops probe");
+        let addr = listener.local_addr().expect("ops addr");
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept ops probe");
+            handle_ops_request(stream, pg_addr, state).await;
+        });
+
+        let mut client = TcpStream::connect(addr).await.expect("connect ops probe");
+        client
+            .write_all(format!("GET {path} HTTP/1.1\r\nhost: localhost\r\n\r\n").as_bytes())
+            .await
+            .expect("write request");
+        let mut response = Vec::new();
+        client
+            .read_to_end(&mut response)
+            .await
+            .expect("read response");
+        server.await.expect("ops task");
+        String::from_utf8(response).expect("utf8 response")
+    }
+
     #[test]
     fn autovacuum_config_from_cli_converts_scale_factors() {
         let cli = Cli {
@@ -970,6 +1036,30 @@ mod tests {
         );
     }
 
+    #[test]
+    fn archive_wal_once_reports_missing_dir_and_failed_status() {
+        let bad_dir = tempfile::TempDir::new().expect("bad temp dir");
+        std::fs::write(bad_dir.path().join("pg_wal"), b"not a directory").expect("pg_wal file");
+        let err = archive_wal_once(bad_dir.path(), successful_archive_command())
+            .expect_err("pg_wal file should fail");
+        assert!(err.contains("create archive_status"));
+
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let wal_dir = dir.path().join("pg_wal");
+        std::fs::create_dir_all(&wal_dir).expect("pg_wal");
+        std::fs::write(wal_dir.join("000000010000000000000001"), b"wal-a").expect("wal a");
+        std::fs::write(wal_dir.join("000000010000000000000002"), b"wal-b").expect("wal b");
+
+        let err = archive_wal_once(dir.path(), failing_shell_command())
+            .expect_err("failed archive command");
+        assert!(err.contains("archive command failed"));
+        assert!(
+            wal_dir
+                .join("archive_status/000000010000000000000001.failed")
+                .exists()
+        );
+    }
+
     #[cfg(windows)]
     fn successful_archive_command() -> &'static str {
         "exit /B 0"
@@ -978,6 +1068,16 @@ mod tests {
     #[cfg(not(windows))]
     fn successful_archive_command() -> &'static str {
         "true"
+    }
+
+    #[cfg(windows)]
+    fn failing_shell_command() -> &'static str {
+        "exit /B 7"
+    }
+
+    #[cfg(not(windows))]
+    fn failing_shell_command() -> &'static str {
+        "exit 7"
     }
 
     #[test]
@@ -1033,6 +1133,33 @@ mod tests {
         );
     }
 
+    #[test]
+    fn restore_wal_once_handles_disabled_existing_and_no_output_paths() {
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let wal_dir = dir.path().join("pg_wal");
+        std::fs::create_dir_all(&wal_dir).expect("pg_wal");
+        std::fs::write(wal_dir.join("segment_0000000000"), b"existing").expect("existing wal");
+
+        assert_eq!(
+            restore_wal_once(dir.path(), "", 2).expect("empty restore command"),
+            0
+        );
+        assert_eq!(
+            restore_wal_once(dir.path(), successful_archive_command(), 0).expect("disabled"),
+            0
+        );
+
+        let restored = restore_wal_once(dir.path(), successful_archive_command(), 2)
+            .expect("successful command without output stops as missing");
+        assert_eq!(restored, 0);
+        assert!(
+            wal_dir
+                .join("restore_status/segment_0000000001.missing")
+                .exists()
+        );
+        assert_eq!(wal_segment_filename(7), "segment_0000000007");
+    }
+
     #[cfg(windows)]
     fn copy_restore_command(archive_dir: &Path) -> String {
         let source = powershell_single_quoted_path(&archive_dir.join("%f"));
@@ -1065,6 +1192,15 @@ mod tests {
         let body = stop_backup_fence(&server);
         assert!(!server.is_standby_mode());
         assert!(body.contains("\"status\":\"backup_stopped\""));
+    }
+
+    #[test]
+    fn scalar_render_helpers_escape_json_and_saturate_usize() {
+        let mut body = String::new();
+        push_metric(&mut body, "x_total", 42);
+        assert_eq!(body, "x_total 42\n");
+        assert_eq!(json_escape("a\\b\"c"), "a\\\\b\\\"c");
+        assert_eq!(usize_to_u64_saturated(7), 7);
     }
 
     #[test]

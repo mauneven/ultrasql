@@ -583,3 +583,126 @@ where
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::io::{DuplexStream, duplex};
+
+    fn test_session() -> Session<DuplexStream> {
+        let (io, _peer) = duplex(64);
+        Session::new(io, Arc::new(Server::with_sample_database()))
+    }
+
+    fn empty_plan() -> LogicalPlan {
+        LogicalPlan::Empty {
+            schema: ultrasql_core::Schema::empty(),
+        }
+    }
+
+    fn last_tag(result: &SelectResult) -> &str {
+        let Some(BackendMessage::CommandComplete { tag }) = result.messages.last() else {
+            panic!("missing command tag");
+        };
+        tag
+    }
+
+    #[test]
+    fn txn_control_unit_paths_cover_idle_warnings_and_failed_blocks() {
+        let mut session = test_session();
+        assert!(session.execute_txn_control(&empty_plan()).is_err());
+
+        let commit = session.execute_commit().expect("idle commit warning");
+        assert_eq!(last_tag(&commit), "COMMIT");
+        assert_eq!(commit.messages.len(), 2);
+        let rollback = session.execute_rollback().expect("idle rollback warning");
+        assert_eq!(last_tag(&rollback), "ROLLBACK");
+        assert_eq!(rollback.messages.len(), 2);
+
+        let prepare = session
+            .execute_prepare_transaction("idle-gid")
+            .expect("idle prepare warning");
+        assert_eq!(last_tag(&prepare), "PREPARE TRANSACTION");
+        assert_eq!(prepare.messages.len(), 2);
+
+        session
+            .execute_begin(Some(TxnIsolationLevel::Serializable))
+            .expect("begin");
+        assert!(matches!(session.txn_state, TxnState::InTransaction(_)));
+        let nested = session.execute_begin(None).expect("nested begin warning");
+        assert_eq!(last_tag(&nested), "BEGIN");
+        assert_eq!(nested.messages.len(), 2);
+        let set = session
+            .execute_set_transaction(TxnIsolationLevel::RepeatableRead)
+            .expect("set transaction");
+        assert_eq!(last_tag(&set), "SET");
+
+        let txn = match std::mem::replace(&mut session.txn_state, TxnState::Idle) {
+            TxnState::InTransaction(txn) => txn,
+            other => panic!("expected in transaction, got {other:?}"),
+        };
+        session.txn_state = TxnState::Failed(txn);
+        let failed_commit = session.execute_commit().expect("failed commit rolls back");
+        assert_eq!(last_tag(&failed_commit), "ROLLBACK");
+
+        let txn = session
+            .state
+            .txn_manager
+            .begin(IsolationLevel::ReadCommitted);
+        session.txn_state = TxnState::Failed(txn);
+        let failed_prepare = session
+            .execute_prepare_transaction("failed-gid")
+            .expect("failed prepare rolls back");
+        assert_eq!(last_tag(&failed_prepare), "ROLLBACK");
+    }
+
+    #[test]
+    fn two_phase_and_savepoint_paths_cover_success_and_errors() {
+        let mut session = test_session();
+        assert!(session.execute_commit_prepared("missing").is_err());
+        assert!(session.execute_rollback_prepared("missing").is_err());
+        assert!(session.execute_savepoint("s").is_err());
+        assert!(session.execute_rollback_to_savepoint("s").is_err());
+        assert!(session.execute_release_savepoint("s").is_err());
+
+        session.execute_begin(None).expect("begin");
+        session.execute_savepoint("s1").expect("savepoint");
+        assert!(session.execute_rollback_to_savepoint("missing").is_err());
+        assert!(matches!(session.txn_state, TxnState::InTransaction(_)));
+        session
+            .execute_savepoint("s2")
+            .expect("savepoint after error");
+        session
+            .execute_rollback_to_savepoint("s2")
+            .expect("rollback to savepoint");
+        session
+            .execute_release_savepoint("s1")
+            .expect("release savepoint");
+        session.execute_rollback().expect("rollback");
+
+        session.execute_begin(None).expect("begin failed release");
+        session.execute_savepoint("bad_release").expect("savepoint");
+        assert!(session.execute_release_savepoint("missing").is_err());
+        assert!(matches!(session.txn_state, TxnState::Failed(_)));
+        assert!(session.execute_savepoint("after_failed").is_err());
+        session.execute_rollback().expect("rollback failed block");
+
+        session.execute_begin(None).expect("begin prepare commit");
+        session
+            .execute_prepare_transaction("commit-gid")
+            .expect("prepare commit");
+        let committed = session
+            .execute_commit_prepared("commit-gid")
+            .expect("commit prepared");
+        assert_eq!(last_tag(&committed), "COMMIT PREPARED");
+
+        session.execute_begin(None).expect("begin prepare rollback");
+        session
+            .execute_prepare_transaction("rollback-gid")
+            .expect("prepare rollback");
+        let rolled_back = session
+            .execute_rollback_prepared("rollback-gid")
+            .expect("rollback prepared");
+        assert_eq!(last_tag(&rolled_back), "ROLLBACK PREPARED");
+    }
+}

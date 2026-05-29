@@ -563,7 +563,130 @@ fn q1_schema() -> Schema {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::TpchQ1SummaryRow;
+    use std::sync::Arc;
+
+    use crate::{TpchQ1ColumnarCache, TpchQ1SummaryRow, set_tpch_q1_columnar_cache};
+    use ultrasql_core::{Oid, Value};
+    use ultrasql_storage::buffer_pool::BufferPool;
+    use ultrasql_storage::heap::HeapAccess;
+    use ultrasql_txn::{IsolationLevel, TransactionManager};
+
+    fn bool_lit(value: bool) -> ScalarExpr {
+        ScalarExpr::Literal {
+            value: Value::Bool(value),
+            data_type: DataType::Bool,
+        }
+    }
+
+    fn lineitem_scan() -> LogicalPlan {
+        LogicalPlan::Scan {
+            table: "lineitem".to_owned(),
+            schema: Schema::empty(),
+            projection: None,
+        }
+    }
+
+    fn col(name: &str, index: usize) -> ScalarExpr {
+        ScalarExpr::Column {
+            name: name.to_owned(),
+            index,
+            data_type: DataType::Text { max_len: None },
+        }
+    }
+
+    fn agg(func: AggregateFunc) -> LogicalAggregateExpr {
+        LogicalAggregateExpr {
+            func,
+            arg: None,
+            direct_arg: None,
+            order_by: None,
+            distinct: false,
+            output_name: format!("{func:?}"),
+            data_type: DataType::Int64,
+        }
+    }
+
+    fn q1_aggs() -> Vec<LogicalAggregateExpr> {
+        [
+            AggregateFunc::Sum,
+            AggregateFunc::Sum,
+            AggregateFunc::Sum,
+            AggregateFunc::Sum,
+            AggregateFunc::Avg,
+            AggregateFunc::Avg,
+            AggregateFunc::Avg,
+            AggregateFunc::CountStar,
+        ]
+        .into_iter()
+        .map(agg)
+        .collect()
+    }
+
+    fn q1_group_by() -> [ScalarExpr; 2] {
+        [col("l_returnflag", 8), col("l_linestatus", 9)]
+    }
+
+    fn q1_cache() -> TpchQ1ColumnarCache {
+        TpchQ1ColumnarCache {
+            quantity: vec![100, 200, 300],
+            extendedprice: vec![1_000, 2_000, 3_000],
+            discount: vec![10, 20, 30],
+            tax: vec![5, 0, 10],
+            returnflag: vec![b'N', b'N', b'R'],
+            linestatus: vec![b'O', b'O', b'F'],
+            shipdate: vec![
+                LINEITEM_SHIPDATE_CUTOFF_1998_09_02,
+                LINEITEM_SHIPDATE_CUTOFF_1998_09_02 + 1,
+                LINEITEM_SHIPDATE_CUTOFF_1998_09_02 - 1,
+            ],
+            summary_rows: Vec::new(),
+            q6_revenue: 0,
+        }
+    }
+
+    fn large_q1_cache(rows: usize) -> TpchQ1ColumnarCache {
+        TpchQ1ColumnarCache {
+            quantity: vec![100; rows],
+            extendedprice: vec![1_000; rows],
+            discount: vec![10; rows],
+            tax: vec![5; rows],
+            returnflag: vec![b'N'; rows],
+            linestatus: vec![b'O'; rows],
+            shipdate: vec![LINEITEM_SHIPDATE_CUTOFF_1998_09_02; rows],
+            summary_rows: Vec::new(),
+            q6_revenue: 0,
+        }
+    }
+
+    fn q1_operator() -> TpchQ1Operator {
+        let pool = Arc::new(BufferPool::new(8, crate::BlankPageLoader::new()));
+        let heap = Arc::new(HeapAccess::new(pool));
+        let txn = Arc::new(TransactionManager::new());
+        let snapshot = txn.begin(IsolationLevel::ReadCommitted).snapshot;
+        TpchQ1Operator {
+            heap,
+            rel: RelationId(Oid::new(42)),
+            block_count: 0,
+            snapshot,
+            oracle: txn,
+            schema: q1_schema(),
+            emitted: false,
+        }
+    }
+
+    fn encoded_lineitem_payload(shipdate: i32) -> Vec<u8> {
+        let mut payload = vec![0, 0];
+        payload.extend_from_slice(&[0; 16]);
+        for value in [100_i64, 1_000, 10, 5] {
+            payload.extend_from_slice(&value.to_le_bytes());
+        }
+        payload.extend_from_slice(&1_u32.to_le_bytes());
+        payload.push(b'N');
+        payload.extend_from_slice(&1_u32.to_le_bytes());
+        payload.push(b'O');
+        payload.extend_from_slice(&shipdate.to_le_bytes());
+        payload
+    }
 
     #[test]
     fn cached_summary_rows_build_sorted_q1_batch() {
@@ -618,5 +741,113 @@ mod tests {
             panic!("count_order should be Int64");
         };
         assert_eq!(count_order.data(), &[2, 1]);
+    }
+
+    #[test]
+    fn q1_shape_matcher_accepts_nested_lineitem_and_rejects_misses() {
+        let input = LogicalPlan::Limit {
+            input: Box::new(LogicalPlan::Filter {
+                input: Box::new(lineitem_scan()),
+                predicate: bool_lit(true),
+            }),
+            n: 10,
+            offset: 0,
+        };
+        assert!(looks_like_q1_shape(&input, &q1_group_by(), &q1_aggs()));
+
+        let bad_group = [col("l_returnflag", 8), col("wrong", 9)];
+        assert!(!looks_like_q1_shape(&input, &bad_group, &q1_aggs()));
+        assert!(!looks_like_q1_shape(
+            &input,
+            &q1_group_by(),
+            &[agg(AggregateFunc::Sum)]
+        ));
+        assert!(!looks_like_q1_shape(
+            &LogicalPlan::Empty {
+                schema: Schema::empty()
+            },
+            &q1_group_by(),
+            &q1_aggs()
+        ));
+    }
+
+    #[test]
+    fn q1_decoder_and_columnar_aggregation_cover_edges() {
+        let row = decode_lineitem_q1(&encoded_lineitem_payload(
+            LINEITEM_SHIPDATE_CUTOFF_1998_09_02,
+        ))
+        .expect("decode")
+        .expect("visible row");
+        assert_eq!(row.quantity, 100);
+        assert_eq!(row.extendedprice, 1_000);
+        assert_eq!(row.discount, 10);
+        assert_eq!(row.tax, 5);
+        assert_eq!(row.returnflag, b'N');
+        assert_eq!(row.linestatus, b'O');
+        assert!(
+            decode_lineitem_q1(&encoded_lineitem_payload(
+                LINEITEM_SHIPDATE_CUTOFF_1998_09_02 + 1,
+            ))
+            .expect("decode filtered")
+            .is_none()
+        );
+        assert!(decode_lineitem_q1(&[]).is_err());
+        assert!(decode_lineitem_q1(&encoded_lineitem_payload(0)[..20]).is_err());
+        let mut empty_text = encoded_lineitem_payload(0);
+        let returnflag_len_offset = 2 + 16 + 8 * 4;
+        empty_text[returnflag_len_offset..returnflag_len_offset + 4]
+            .copy_from_slice(&0_u32.to_le_bytes());
+        assert!(decode_lineitem_q1(&empty_text).is_err());
+
+        let groups = aggregate_q1_columnar(&q1_cache()).expect("columnar aggregate");
+        assert_eq!(groups.len(), 2);
+        assert_eq!(groups[&(b'N', b'O')].count, 1);
+        assert_eq!(groups[&(b'R', b'F')].sum_qty, 300);
+
+        let mut bad = q1_cache();
+        bad.tax.pop();
+        assert!(aggregate_q1_columnar(&bad).is_err());
+    }
+
+    #[test]
+    fn q1_parallel_columnar_path_and_operator_cache_emit_once() {
+        let groups = aggregate_q1_columnar(&large_q1_cache(1_000_000)).expect("parallel aggregate");
+        assert_eq!(groups[&(b'N', b'O')].count, 1_000_000);
+
+        let _cache_guard = crate::TPCH_TEST_CACHE_LOCK
+            .lock()
+            .expect("tpch cache test lock");
+        set_tpch_q1_columnar_cache(Some(TpchQ1ColumnarCache {
+            summary_rows: vec![TpchQ1SummaryRow {
+                returnflag: b'N',
+                linestatus: b'O',
+                sum_qty: 100,
+                sum_base_price: 1_000,
+                sum_disc_price: 900,
+                sum_charge: 945,
+                sum_discount: 10,
+                count: 1,
+            }],
+            ..q1_cache()
+        }));
+        let mut summary_op = q1_operator();
+        assert!(format!("{summary_op:?}").starts_with("TpchQ1Operator"));
+        let summary_batch = summary_op.next_batch().expect("summary op").expect("batch");
+        assert_eq!(summary_batch.width(), 10);
+        assert_eq!(summary_batch.rows(), 1);
+        assert!(summary_op.next_batch().expect("second").is_none());
+        assert_eq!(summary_op.schema().fields().len(), 10);
+
+        set_tpch_q1_columnar_cache(Some(q1_cache()));
+        let mut columnar_op = q1_operator();
+        let columnar_batch = columnar_op
+            .next_batch()
+            .expect("columnar op")
+            .expect("batch");
+        assert_eq!(columnar_batch.width(), 10);
+        assert_eq!(columnar_batch.rows(), 2);
+        assert!(columnar_op.next_batch().expect("second").is_none());
+
+        set_tpch_q1_columnar_cache(None);
     }
 }
