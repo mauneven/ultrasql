@@ -586,7 +586,7 @@ impl ReplicationSlotStore {
     /// Open or create a slot store.
     pub fn open(root: impl Into<PathBuf>) -> Result<Self, ServerError> {
         let root = root.into();
-        fs::create_dir_all(&root).map_err(ServerError::Io)?;
+        ensure_directory(&root, "replication slot directory")?;
         Ok(Self { root })
     }
 
@@ -616,7 +616,7 @@ impl ReplicationSlotStore {
     /// Save a slot atomically enough for single-process tools.
     pub fn save(&self, slot: &ReplicationSlot) -> Result<(), ServerError> {
         validate_replication_slot_name(&slot.name)?;
-        fs::create_dir_all(&self.root).map_err(ServerError::Io)?;
+        ensure_directory(&self.root, "replication slot directory")?;
         let body = format!(
             "name={}\nrestart_lsn={}\nconfirmed_flush_lsn={}\n",
             slot.name,
@@ -629,7 +629,7 @@ impl ReplicationSlotStore {
     /// Return all persisted slots in deterministic slot-name order.
     pub fn list(&self) -> Result<Vec<ReplicationSlot>, ServerError> {
         let mut slots = Vec::new();
-        if !self.root.exists() {
+        if !directory_exists(&self.root, "replication slot directory")? {
             return Ok(slots);
         }
         for entry in fs::read_dir(&self.root).map_err(ServerError::Io)? {
@@ -692,7 +692,7 @@ impl WalSender {
 
     /// Ship all archived WAL files after the slot's last restart filename.
     pub fn send_once(&self, slot_name: &str, dest_dir: &Path) -> Result<usize, ServerError> {
-        fs::create_dir_all(dest_dir).map_err(ServerError::Io)?;
+        ensure_directory(dest_dir, "WAL send destination directory")?;
         let mut slot = self.slots.get_or_create(slot_name)?;
         let mut files = wal_files(&self.archive_dir)?;
         if let Some(restart) = &slot.restart_lsn {
@@ -732,7 +732,7 @@ impl WalReceiver {
 
     /// Copy all received WAL files into standby `pg_wal`.
     pub fn receive_once(&self, standby_wal_dir: &Path) -> Result<usize, ServerError> {
-        fs::create_dir_all(standby_wal_dir).map_err(ServerError::Io)?;
+        ensure_directory(standby_wal_dir, "WAL receive destination directory")?;
         let files = wal_files(&self.source_dir)?;
         let mut copied = 0_usize;
         for file in files {
@@ -753,8 +753,8 @@ impl WalReceiver {
         standby_wal_dir: &Path,
         cascade_archive_dir: &Path,
     ) -> Result<usize, ServerError> {
-        fs::create_dir_all(standby_wal_dir).map_err(ServerError::Io)?;
-        fs::create_dir_all(cascade_archive_dir).map_err(ServerError::Io)?;
+        ensure_directory(standby_wal_dir, "WAL receive destination directory")?;
+        ensure_directory(cascade_archive_dir, "WAL cascade archive directory")?;
         let files = wal_files(&self.source_dir)?;
         let mut copied = 0_usize;
         for file in files {
@@ -798,7 +798,7 @@ fn copy_if_changed(source: &Path, dest: &Path) -> Result<bool, ServerError> {
 
 fn wal_files(dir: &Path) -> Result<Vec<PathBuf>, ServerError> {
     let mut files = Vec::new();
-    if !dir.exists() {
+    if !directory_exists(dir, "WAL source directory")? {
         return Ok(files);
     }
     for entry in fs::read_dir(dir).map_err(ServerError::Io)? {
@@ -815,6 +815,40 @@ fn wal_files(dir: &Path) -> Result<Vec<PathBuf>, ServerError> {
     }
     files.sort();
     Ok(files)
+}
+
+fn ensure_directory(path: &Path, context: &str) -> Result<(), ServerError> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_dir() => Ok(()),
+        Ok(_) => Err(ServerError::ddl(format!(
+            "{context} is not a non-symlink directory: {}",
+            path.display()
+        ))),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            fs::create_dir_all(path).map_err(ServerError::Io)?;
+            match fs::symlink_metadata(path) {
+                Ok(metadata) if metadata.file_type().is_dir() => Ok(()),
+                Ok(_) => Err(ServerError::ddl(format!(
+                    "{context} is not a non-symlink directory: {}",
+                    path.display()
+                ))),
+                Err(err) => Err(ServerError::Io(err)),
+            }
+        }
+        Err(err) => Err(ServerError::Io(err)),
+    }
+}
+
+fn directory_exists(path: &Path, context: &str) -> Result<bool, ServerError> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_dir() => Ok(true),
+        Ok(_) => Err(ServerError::ddl(format!(
+            "{context} is not a non-symlink directory: {}",
+            path.display()
+        ))),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(err) => Err(ServerError::Io(err)),
+    }
 }
 
 fn is_safe_wal_file_name(name: &str) -> bool {
@@ -909,6 +943,26 @@ mod tests {
             fs::read_to_string(&outside).expect("outside unchanged"),
             "keep"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn slot_store_rejects_symlinked_root_directory() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let outside = tempfile::TempDir::new().expect("outside dir");
+        fs::write(
+            outside.path().join("standby.slot"),
+            "name=standby\nrestart_lsn=segment_0000000001\n",
+        )
+        .expect("outside slot");
+        let slots_dir = dir.path().join("pg_replslot");
+        symlink(outside.path(), &slots_dir).expect("slot root symlink");
+
+        let err = ReplicationSlotStore::open(&slots_dir).expect_err("symlinked root rejected");
+
+        assert!(err.to_string().contains("directory"));
     }
 
     #[cfg(unix)]
@@ -1065,6 +1119,27 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn wal_receiver_rejects_symlinked_source_directory() {
+        use std::os::unix::fs::symlink;
+
+        let real_source = tempfile::TempDir::new().expect("real source dir");
+        let link_parent = tempfile::TempDir::new().expect("link parent");
+        let standby = tempfile::TempDir::new().expect("standby dir");
+        fs::write(
+            real_source.path().join("000000010000000000000001"),
+            b"wal-a",
+        )
+        .expect("wal a");
+        let source_link = link_parent.path().join("source-link");
+        symlink(real_source.path(), &source_link).expect("source dir symlink");
+
+        let receiver = WalReceiver::new(&source_link);
+        assert!(receiver.receive_once(standby.path()).is_err());
+        assert!(!standby.path().join("000000010000000000000001").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn wal_receiver_rejects_symlinked_destination_files() {
         use std::os::unix::fs::symlink;
 
@@ -1085,6 +1160,23 @@ mod tests {
             fs::read_to_string(outside.path()).expect("outside unchanged"),
             "keep"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn wal_receiver_rejects_symlinked_destination_directory() {
+        use std::os::unix::fs::symlink;
+
+        let source = tempfile::TempDir::new().expect("source dir");
+        let outside = tempfile::TempDir::new().expect("outside dir");
+        let link_parent = tempfile::TempDir::new().expect("link parent");
+        fs::write(source.path().join("000000010000000000000001"), b"wal-a").expect("wal a");
+        let standby_link = link_parent.path().join("standby-link");
+        symlink(outside.path(), &standby_link).expect("standby dir symlink");
+
+        let receiver = WalReceiver::new(source.path());
+        assert!(receiver.receive_once(&standby_link).is_err());
+        assert!(!outside.path().join("000000010000000000000001").exists());
     }
 
     #[cfg(unix)]
