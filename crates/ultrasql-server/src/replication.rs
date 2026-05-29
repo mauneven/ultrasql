@@ -753,13 +753,26 @@ fn wal_files(dir: &Path) -> Result<Vec<PathBuf>, ServerError> {
     }
     for entry in fs::read_dir(dir).map_err(ServerError::Io)? {
         let entry = entry.map_err(ServerError::Io)?;
+        let file_type = entry.file_type().map_err(ServerError::Io)?;
         let path = entry.path();
-        if path.is_file() {
+        let safe_name = entry
+            .file_name()
+            .to_str()
+            .is_some_and(is_safe_wal_file_name);
+        if file_type.is_file() && safe_name {
             files.push(path);
         }
     }
     files.sort();
     Ok(files)
+}
+
+fn is_safe_wal_file_name(name: &str) -> bool {
+    let ultrasql_segment = name
+        .strip_prefix("segment_")
+        .is_some_and(|suffix| suffix.len() == 10 && suffix.bytes().all(|b| b.is_ascii_digit()));
+    let pg_segment = name.len() == 24 && name.bytes().all(|b| b.is_ascii_hexdigit());
+    ultrasql_segment || pg_segment
 }
 
 fn parse_slot(name: &str, text: &str) -> ReplicationSlot {
@@ -923,6 +936,31 @@ mod tests {
                 .expect("third receive"),
             1
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn wal_receiver_rejects_symlinked_source_files() {
+        use std::os::unix::fs::symlink;
+
+        let source = tempfile::TempDir::new().expect("source dir");
+        let standby = tempfile::TempDir::new().expect("standby dir");
+        let secret = tempfile::NamedTempFile::new().expect("secret file");
+        fs::write(secret.path(), b"not-wal").expect("secret contents");
+        symlink(
+            secret.path(),
+            source.path().join("000000010000000000000001"),
+        )
+        .expect("symlink wal");
+
+        let receiver = WalReceiver::new(source.path());
+        assert_eq!(
+            receiver
+                .receive_once(standby.path())
+                .expect("receive skips symlink"),
+            0
+        );
+        assert!(!standby.path().join("000000010000000000000001").exists());
     }
 
     #[test]
