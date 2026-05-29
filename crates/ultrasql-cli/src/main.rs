@@ -326,6 +326,8 @@ impl ConnParams {
 // ~/.pgpass reader
 // ---------------------------------------------------------------------------
 
+const PGPASS_FILE_LIMIT_BYTES: usize = 64 * 1024;
+
 /// Look up a password from `~/.pgpass`.
 ///
 /// Each line has the form `host:port:database:user:password`. Wildcards
@@ -346,7 +348,7 @@ fn pgpass_lookup_in_home(
     if !pgpass_permissions_are_private(&pgpass) {
         return None;
     }
-    let content = fs::read_to_string(&pgpass).ok()?;
+    let content = read_pgpass_file(&pgpass)?;
 
     let port_str = port.to_string();
     for line in content.lines() {
@@ -368,6 +370,25 @@ fn pgpass_lookup_in_home(
         }
     }
     None
+}
+
+fn read_pgpass_file(path: &Path) -> Option<String> {
+    let mut options = fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+
+        options.custom_flags(libc::O_NOFOLLOW);
+    }
+    let file = options.open(path).ok()?;
+    let mut limited = std::io::Read::take(file, (PGPASS_FILE_LIMIT_BYTES + 1) as u64);
+    let mut content = String::new();
+    std::io::Read::read_to_string(&mut limited, &mut content).ok()?;
+    if content.len() > PGPASS_FILE_LIMIT_BYTES {
+        return None;
+    }
+    Some(content)
 }
 
 #[cfg(unix)]
@@ -2328,6 +2349,17 @@ mod tests {
 
         let pw = pgpass_lookup_in_home(dir.path(), "localhost", 5432, "db", "user");
         assert_eq!(pw.as_deref(), Some("pw"));
+    }
+
+    #[test]
+    fn pgpass_oversized_file_is_ignored() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let content = format!("{}\nlocalhost:5432:db:user:pw\n", "#".repeat(70 * 1024));
+        write_pgpass(&dir.path().join(".pgpass"), &content);
+
+        let pw = pgpass_lookup_in_home(dir.path(), "localhost", 5432, "db", "user");
+
+        assert_eq!(pw, None);
     }
 
     fn write_pgpass(path: &Path, content: &str) {
