@@ -35,7 +35,7 @@
 //! certificate verification. It is accepted by the parser but is not
 //! wired into the [`rustls::ServerConfig`] yet.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use rustls::pki_types::pem::PemObject;
@@ -128,7 +128,7 @@ impl TlsHandshake {
     /// - [`TlsError::Rustls`] if rustls rejects the configuration.
     pub fn build_server_config(cfg: &TlsConfig) -> Result<Arc<rustls::ServerConfig>, TlsError> {
         // Load certificates.
-        let cert_pem = std::fs::read(&cfg.cert_file)?;
+        let cert_pem = read_regular_pem_file(&cfg.cert_file)?;
         let certs: Vec<CertificateDer<'static>> =
             CertificateDer::pem_slice_iter(&cert_pem).collect::<Result<Vec<_>, _>>()?;
         if certs.is_empty() {
@@ -138,7 +138,7 @@ impl TlsHandshake {
         }
 
         // Load private key (PKCS#8 only).
-        let key_pem = std::fs::read(&cfg.key_file)?;
+        let key_pem = read_regular_pem_file(&cfg.key_file)?;
         let private_key = match PrivatePkcs8KeyDer::from_pem_slice(&key_pem) {
             Ok(k) => PrivateKeyDer::Pkcs8(k),
             Err(rustls::pki_types::pem::Error::NoItemsFound) => {
@@ -176,6 +176,37 @@ impl TlsHandshake {
         let tls_stream = acceptor.accept(stream).await?;
         Ok(tls_stream)
     }
+}
+
+fn read_regular_pem_file(path: &Path) -> Result<Vec<u8>, TlsError> {
+    let metadata = std::fs::symlink_metadata(path)?;
+    if !metadata.file_type().is_file() {
+        return Err(TlsError::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("TLS PEM path {} is not a regular file", path.display()),
+        )));
+    }
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+
+        options.custom_flags(libc::O_NOFOLLOW);
+    }
+    let mut file = options.open(path).map_err(|err| {
+        #[cfg(unix)]
+        if err.raw_os_error() == Some(libc::ELOOP) {
+            return TlsError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("TLS PEM path {} is not a regular file", path.display()),
+            ));
+        }
+        TlsError::Io(err)
+    })?;
+    let mut bytes = Vec::new();
+    std::io::Read::read_to_end(&mut file, &mut bytes)?;
+    Ok(bytes)
 }
 
 // ── Tests ──────────────────────────────────────────────────────────────────────
@@ -370,5 +401,49 @@ mod tests {
             ca_file: None,
         };
         let _config = TlsHandshake::build_server_config(&cfg).expect("build ok");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn build_server_config_rejects_symlinked_pem_files() {
+        use std::io::Write;
+        use std::os::unix::fs::symlink;
+
+        let (cert_pem, key_pem) = generate_self_signed();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let real_cert = dir.path().join("real-cert.pem");
+        let real_key = dir.path().join("real-key.pem");
+        let cert_link = dir.path().join("cert-link.pem");
+        let key_link = dir.path().join("key-link.pem");
+        std::fs::File::create(&real_cert)
+            .expect("cert file")
+            .write_all(&cert_pem)
+            .expect("write cert");
+        std::fs::File::create(&real_key)
+            .expect("key file")
+            .write_all(&key_pem)
+            .expect("write key");
+        symlink(&real_cert, &cert_link).expect("cert symlink");
+        symlink(&real_key, &key_link).expect("key symlink");
+
+        let cert_cfg = TlsConfig {
+            cert_file: cert_link,
+            key_file: real_key.clone(),
+            ca_file: None,
+        };
+        let Err(cert_err) = TlsHandshake::build_server_config(&cert_cfg) else {
+            panic!("symlinked cert should be rejected");
+        };
+        assert!(cert_err.to_string().contains("regular file"));
+
+        let key_cfg = TlsConfig {
+            cert_file: real_cert,
+            key_file: key_link,
+            ca_file: None,
+        };
+        let Err(key_err) = TlsHandshake::build_server_config(&key_cfg) else {
+            panic!("symlinked key should be rejected");
+        };
+        assert!(key_err.to_string().contains("regular file"));
     }
 }
