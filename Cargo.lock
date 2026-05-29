@@ -3579,6 +3579,7 @@ dependencies = [
  "arrow-ipc",
  "arrow-schema",
  "bytes",
+ "libc",
  "parquet",
  "proptest",
  "serde_json",

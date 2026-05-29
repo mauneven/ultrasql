@@ -1376,15 +1376,78 @@ fn read_csv_header_from_first_record(path_specs: &[String]) -> Result<Vec<String
             .first()
             .expect("expand_file_path_specs returns non-empty paths");
         let display = first.display().to_string();
-        let bytes = fs::read(first).map_err(|err| {
-            PlanError::TypeMismatch(format!("read_csv cannot read {display}: {err}"))
-        })?;
+        let bytes = read_local_csv_header_sample(&display, first)?;
         (display, bytes)
     };
     let text = String::from_utf8(bytes).map_err(|err| {
         PlanError::TypeMismatch(format!("read_csv: {display} is not UTF-8: {err}"))
     })?;
     infer_csv_header_from_first_record(&display, &text)
+}
+
+fn read_local_csv_header_sample(display: &str, path: &Path) -> Result<Vec<u8>, PlanError> {
+    let file = open_local_regular_file("read_csv", path)?;
+    let mut bytes = Vec::new();
+    file.take(READ_CSV_HEADER_SAMPLE_BYTES.saturating_add(1))
+        .read_to_end(&mut bytes)
+        .map_err(|err| PlanError::TypeMismatch(format!("read_csv cannot read {display}: {err}")))?;
+    let sample_limit = usize::try_from(READ_CSV_HEADER_SAMPLE_BYTES).unwrap_or(usize::MAX);
+    if bytes.len() > sample_limit {
+        if !csv_header_sample_has_complete_record(&bytes[..sample_limit]) {
+            return Err(PlanError::TypeMismatch(format!(
+                "read_csv: {display} first record exceeds sample limit: limit={READ_CSV_HEADER_SAMPLE_BYTES}"
+            )));
+        }
+        bytes.truncate(sample_limit);
+    }
+    Ok(bytes)
+}
+
+fn open_local_regular_file(function_name: &str, path: &Path) -> Result<File, PlanError> {
+    let metadata = fs::symlink_metadata(path).map_err(|err| {
+        PlanError::TypeMismatch(format!(
+            "{function_name} cannot inspect {}: {err}",
+            path.display()
+        ))
+    })?;
+    if !metadata.file_type().is_file() {
+        return Err(PlanError::TypeMismatch(format!(
+            "{function_name} path is not a regular file: {}",
+            path.display()
+        )));
+    }
+    let mut options = fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+
+        options.custom_flags(libc::O_NOFOLLOW);
+    }
+    options.open(path).map_err(|err| {
+        PlanError::TypeMismatch(format!(
+            "{function_name} cannot open {}: {err}",
+            path.display()
+        ))
+    })
+}
+
+fn csv_header_sample_has_complete_record(sample: &[u8]) -> bool {
+    let mut in_quotes = false;
+    let mut i = 0;
+    while i < sample.len() {
+        match sample[i] {
+            b'"' if in_quotes && i + 1 < sample.len() && sample[i + 1] == b'"' => {
+                i += 2;
+                continue;
+            }
+            b'"' => in_quotes = !in_quotes,
+            b'\n' | b'\r' if !in_quotes => return true,
+            _ => {}
+        }
+        i += 1;
+    }
+    false
 }
 
 fn infer_csv_header_from_first_record(display: &str, text: &str) -> Result<Vec<String>, PlanError> {
@@ -2191,6 +2254,25 @@ mod tests {
             .is_err()
         );
         assert!(infer_csv_header_from_first_record("multi.csv", "a,b\n1,2\n").is_ok());
+    }
+
+    #[test]
+    fn csv_header_fallback_rejects_oversized_first_record() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("large-header.csv");
+        fs::write(
+            &path,
+            format!(
+                "{}\n1\n",
+                "a".repeat(READ_CSV_HEADER_SAMPLE_BYTES as usize + 1)
+            ),
+        )
+        .expect("write csv");
+
+        let err = read_csv_header_from_first_record(&[path.display().to_string()])
+            .expect_err("oversized first record rejected");
+
+        assert!(err.to_string().contains("exceeds sample limit"), "{err}");
     }
 
     #[test]
