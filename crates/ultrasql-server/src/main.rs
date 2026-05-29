@@ -388,6 +388,9 @@ fn archive_wal_once(data_dir: &Path, archive_command: &str) -> Result<usize, Str
         let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
             continue;
         };
+        if !is_safe_wal_archive_filename(name) {
+            return Err(format!("unsafe WAL filename: {name}"));
+        }
         let done = status_dir.join(format!("{name}.done"));
         if done.exists() {
             continue;
@@ -450,6 +453,14 @@ fn restore_wal_once(
         restored = restored.saturating_add(1);
     }
     Ok(restored)
+}
+
+fn is_safe_wal_archive_filename(name: &str) -> bool {
+    let ultrasql_segment = name
+        .strip_prefix("segment_")
+        .is_some_and(|suffix| suffix.len() == 10 && suffix.bytes().all(|b| b.is_ascii_digit()));
+    let pg_segment = name.len() == 24 && name.bytes().all(|b| b.is_ascii_hexdigit());
+    ultrasql_segment || pg_segment
 }
 
 fn wal_segment_filename(index: u32) -> String {
@@ -1060,6 +1071,23 @@ mod tests {
         );
     }
 
+    #[cfg(not(windows))]
+    #[test]
+    fn archive_wal_once_rejects_shell_unsafe_filenames() {
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let wal_dir = dir.path().join("pg_wal");
+        std::fs::create_dir_all(&wal_dir).expect("pg_wal");
+        std::fs::write(wal_dir.join("segment_0000000000;touch wal_pwned"), b"wal-a")
+            .expect("malicious wal");
+        std::fs::write(wal_dir.join("segment_0000000001"), b"wal-b").expect("newest wal");
+
+        let command = format!("cd {} && true %p", sh_single_quoted_path(dir.path()));
+        let err = archive_wal_once(dir.path(), &command).expect_err("unsafe WAL name");
+
+        assert!(err.contains("unsafe WAL filename"));
+        assert!(!dir.path().join("wal_pwned").exists());
+    }
+
     #[cfg(windows)]
     fn successful_archive_command() -> &'static str {
         "exit /B 0"
@@ -1078,6 +1106,11 @@ mod tests {
     #[cfg(not(windows))]
     fn failing_shell_command() -> &'static str {
         "exit 7"
+    }
+
+    #[cfg(not(windows))]
+    fn sh_single_quoted_path(path: &Path) -> String {
+        format!("'{}'", path.to_string_lossy().replace('\'', "'\\''"))
     }
 
     #[test]
