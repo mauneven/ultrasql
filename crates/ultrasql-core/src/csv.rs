@@ -282,8 +282,7 @@ pub fn parse_csv_records_with_options(
 ///
 /// Returns [`CsvError`] on file I/O, UTF-8, CSV syntax, or empty-file input.
 pub fn sniff_csv_path(path: &Path) -> Result<CsvSniff, CsvError> {
-    let text = fs::read_to_string(path)
-        .map_err(|err| CsvError::new(format!("sniff_csv cannot read {}: {err}", path.display())))?;
+    let text = read_regular_utf8_file("sniff_csv", path)?;
     sniff_csv_text(&path.display().to_string(), &text)
 }
 
@@ -438,9 +437,25 @@ pub fn read_csv_records_from_path(path: &Path) -> Result<Vec<Vec<String>>, CsvEr
 /// Returns [`CsvError`] on file I/O, UTF-8, CSV syntax, or inconsistent row
 /// width.
 pub fn read_csv_data_from_path(path: &Path) -> Result<CsvReadData, CsvError> {
-    let text = fs::read_to_string(path)
-        .map_err(|err| CsvError::new(format!("read_csv cannot read {}: {err}", path.display())))?;
+    let text = read_regular_utf8_file("read_csv", path)?;
     read_csv_data_from_text(&path.display().to_string(), &text)
+}
+
+fn read_regular_utf8_file(operation: &str, path: &Path) -> Result<String, CsvError> {
+    let metadata = fs::symlink_metadata(path).map_err(|err| {
+        CsvError::new(format!(
+            "{operation} cannot inspect {}: {err}",
+            path.display()
+        ))
+    })?;
+    if !metadata.file_type().is_file() {
+        return Err(CsvError::new(format!(
+            "{operation} path is not a regular file: {}",
+            path.display()
+        )));
+    }
+    fs::read_to_string(path)
+        .map_err(|err| CsvError::new(format!("{operation} cannot read {}: {err}", path.display())))
 }
 
 /// Read one UTF-8 CSV string using sniffer-derived dialect and header metadata.
@@ -896,5 +911,31 @@ mod tests {
         assert!(super::wildcard_match("*.csv", "a.csv"));
         assert!(super::wildcard_match("part-?.csv", "part-a.csv"));
         assert!(!super::wildcard_match("part-?.csv", "part-ab.csv"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn read_csv_rejects_symlinked_input() {
+        use std::os::unix::fs::symlink;
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "ultrasql-csv-symlink-{}-{nonce}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let target = dir.join("secret.csv");
+        let link = dir.join("link.csv");
+        std::fs::write(&target, "id,name\n1,Ada\n").expect("write csv");
+        symlink(&target, &link).expect("symlink csv");
+
+        let err = super::read_csv_data_from_path(&link).expect_err("symlink rejected");
+
+        assert!(err.to_string().contains("regular file"));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
