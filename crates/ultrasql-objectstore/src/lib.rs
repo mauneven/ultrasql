@@ -507,17 +507,50 @@ fn get_response(
         .get("content-range")
         .and_then(|value| value.to_str().ok())
         .and_then(parse_content_range_size);
+    let full_read_limit =
+        (expectation == ResponseExpectation::Success).then(object_full_read_limit_bytes);
+    if let Some(limit) = full_read_limit
+        && let Some(content_length) = response
+            .headers()
+            .get("content-length")
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.parse::<u64>().ok())
+        && content_length > limit
+    {
+        return Err(ObjectStoreError::Http(format!(
+            "object GET {} body exceeds limit: content-length={content_length} limit={limit}",
+            request.url
+        )));
+    }
+    let body_read_limit = full_read_limit.map_or(u64::MAX, |limit| limit.saturating_add(1));
     let bytes = response
         .body_mut()
         .with_config()
-        .limit(u64::MAX)
+        .limit(body_read_limit)
         .read_to_vec()
         .map_err(|err| ObjectStoreError::Http(format!("object GET {} body: {err}", request.url)))?;
+    if let Some(limit) = full_read_limit {
+        let len = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
+        if len > limit {
+            return Err(ObjectStoreError::Http(format!(
+                "object GET {} body exceeds limit: bytes={len} limit={limit}",
+                request.url
+            )));
+        }
+    }
     Ok(ObjectResponse { bytes, object_size })
 }
 
 const OBJECT_RANGE_CACHE_MAX_ENTRIES: usize = 1024;
 const OBJECT_RANGE_CACHE_MAX_BYTES: u64 = 64 * 1024 * 1024;
+const DEFAULT_OBJECT_FULL_READ_LIMIT_BYTES: u64 = 128 * 1024 * 1024;
+
+fn object_full_read_limit_bytes() -> u64 {
+    first_env(&["ULTRASQL_OBJECT_FULL_READ_LIMIT_BYTES"])
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(DEFAULT_OBJECT_FULL_READ_LIMIT_BYTES)
+}
 
 static OBJECT_RANGE_REMOTE_BYTES: AtomicU64 = AtomicU64::new(0);
 static OBJECT_RANGE_REQUESTS: AtomicU64 = AtomicU64::new(0);
@@ -1137,6 +1170,48 @@ mod tests {
         let request = request_rx.recv().expect("request text");
         assert!(request.starts_with("GET /bucket/path/file.csv HTTP/1.1"));
         handle.join().expect("mock server done");
+    }
+
+    #[test]
+    fn read_first_object_bytes_rejects_configured_oversized_body() {
+        let _test_guard = objectstore_env_test_lock();
+        // SAFETY: objectstore_env_test_lock serializes process-env mutation in
+        // this crate's tests.
+        unsafe {
+            std::env::set_var("ULTRASQL_OBJECT_FULL_READ_LIMIT_BYTES", "3");
+        }
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock server");
+        let endpoint = format!("http://{}", listener.local_addr().expect("local addr"));
+        let handle = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept request");
+            let mut request = Vec::new();
+            let mut buf = [0_u8; 1024];
+            loop {
+                let read = stream.read(&mut buf).expect("read request");
+                if read == 0 {
+                    break;
+                }
+                request.extend_from_slice(&buf[..read]);
+                if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\nabcd")
+                .expect("write response");
+        });
+
+        let _guard = override_s3_endpoint_for_process(endpoint);
+        let err = read_first_object_bytes(&["s3://bucket/path/file.csv".to_owned()])
+            .expect_err("oversized object rejected");
+
+        assert!(err.to_string().contains("body exceeds limit"));
+        handle.join().expect("mock server done");
+        // SAFETY: objectstore_env_test_lock serializes process-env mutation in
+        // this crate's tests.
+        unsafe {
+            std::env::remove_var("ULTRASQL_OBJECT_FULL_READ_LIMIT_BYTES");
+        }
     }
 
     #[test]
