@@ -703,10 +703,12 @@ impl WalSender {
             let Some(name) = file.file_name() else {
                 continue;
             };
-            fs::copy(&file, dest_dir.join(name)).map_err(ServerError::Io)?;
+            let changed = copy_if_changed(&file, &dest_dir.join(name))?;
             slot.restart_lsn = Some(name.to_string_lossy().to_string());
             slot.confirmed_flush_lsn.clone_from(&slot.restart_lsn);
-            copied = copied.saturating_add(1);
+            if changed {
+                copied = copied.saturating_add(1);
+            }
         }
         self.slots.save(&slot)?;
         Ok(copied)
@@ -770,12 +772,25 @@ impl WalReceiver {
 }
 
 fn copy_if_changed(source: &Path, dest: &Path) -> Result<bool, ServerError> {
-    if dest.exists() {
-        let source_len = fs::metadata(source).map_err(ServerError::Io)?.len();
-        let dest_len = fs::metadata(dest).map_err(ServerError::Io)?.len();
-        if source_len == dest_len {
-            return Ok(false);
+    match fs::symlink_metadata(dest) {
+        Ok(metadata) if metadata.file_type().is_file() => {
+            let source_len = fs::metadata(source).map_err(ServerError::Io)?.len();
+            let dest_len = metadata.len();
+            if source_len == dest_len {
+                return Ok(false);
+            }
         }
+        Ok(_) => {
+            return Err(ServerError::ddl(format!(
+                "refusing to overwrite non-regular WAL file {}",
+                dest.display()
+            )));
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+        Err(err) => return Err(ServerError::Io(err)),
+    }
+    if let Some(parent) = dest.parent() {
+        fs::create_dir_all(parent).map_err(ServerError::Io)?;
     }
     fs::copy(source, dest).map_err(ServerError::Io)?;
     Ok(true)
@@ -1046,6 +1061,55 @@ mod tests {
             0
         );
         assert!(!standby.path().join("000000010000000000000001").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn wal_receiver_rejects_symlinked_destination_files() {
+        use std::os::unix::fs::symlink;
+
+        let source = tempfile::TempDir::new().expect("source dir");
+        let standby = tempfile::TempDir::new().expect("standby dir");
+        let outside = tempfile::NamedTempFile::new().expect("outside file");
+        fs::write(source.path().join("000000010000000000000001"), b"wal-a").expect("wal a");
+        fs::write(outside.path(), b"keep").expect("outside contents");
+        symlink(
+            outside.path(),
+            standby.path().join("000000010000000000000001"),
+        )
+        .expect("dest symlink");
+
+        let receiver = WalReceiver::new(source.path());
+        assert!(receiver.receive_once(standby.path()).is_err());
+        assert_eq!(
+            fs::read_to_string(outside.path()).expect("outside unchanged"),
+            "keep"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn wal_sender_rejects_symlinked_destination_files() {
+        use std::os::unix::fs::symlink;
+
+        let archive = tempfile::TempDir::new().expect("archive dir");
+        let slots = tempfile::TempDir::new().expect("slots dir");
+        let downstream = tempfile::TempDir::new().expect("downstream dir");
+        let outside = tempfile::NamedTempFile::new().expect("outside file");
+        fs::write(archive.path().join("000000010000000000000001"), b"wal-a").expect("wal a");
+        fs::write(outside.path(), b"keep").expect("outside contents");
+        symlink(
+            outside.path(),
+            downstream.path().join("000000010000000000000001"),
+        )
+        .expect("dest symlink");
+
+        let sender = WalSender::new(archive.path(), slots.path()).expect("sender");
+        assert!(sender.send_once("standby_a", downstream.path()).is_err());
+        assert_eq!(
+            fs::read_to_string(outside.path()).expect("outside unchanged"),
+            "keep"
+        );
     }
 
     #[test]
