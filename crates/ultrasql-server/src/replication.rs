@@ -781,9 +781,10 @@ impl WalReceiver {
 }
 
 fn copy_if_changed(source: &Path, dest: &Path) -> Result<bool, ServerError> {
+    ensure_file(source, "WAL source file")?;
     match fs::symlink_metadata(dest) {
         Ok(metadata) if metadata.file_type().is_file() => {
-            let source_len = fs::metadata(source).map_err(ServerError::Io)?.len();
+            let source_len = fs::symlink_metadata(source).map_err(ServerError::Io)?.len();
             let dest_len = metadata.len();
             if source_len == dest_len {
                 return Ok(false);
@@ -824,6 +825,17 @@ fn wal_files(dir: &Path) -> Result<Vec<PathBuf>, ServerError> {
     }
     files.sort();
     Ok(files)
+}
+
+fn ensure_file(path: &Path, context: &str) -> Result<(), ServerError> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_file() => Ok(()),
+        Ok(_) => Err(ServerError::ddl(format!(
+            "{context} is not a regular file: {}",
+            path.display()
+        ))),
+        Err(err) => Err(ServerError::Io(err)),
+    }
 }
 
 fn ensure_directory(path: &Path, context: &str) -> Result<(), ServerError> {
@@ -1205,6 +1217,22 @@ mod tests {
             0
         );
         assert!(!standby.path().join("000000010000000000000001").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn wal_copy_rejects_symlinked_sources() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let outside = tempfile::NamedTempFile::new().expect("outside file");
+        fs::write(outside.path(), b"not-wal").expect("outside contents");
+        let source = dir.path().join("000000010000000000000001");
+        let dest = dir.path().join("standby/000000010000000000000001");
+        symlink(outside.path(), &source).expect("source symlink");
+
+        assert!(copy_if_changed(&source, &dest).is_err());
+        assert!(!dest.exists());
     }
 
     #[cfg(unix)]
