@@ -295,21 +295,16 @@ const fn make_tid(block: u32, slot: u16) -> TupleId {
 // --- conc-read-sum -------------------------------------------------------
 
 fn run_read_sum(args: &Args) -> Result<String> {
-    let data = load_or_synthesize_dataset(args)?;
+    let data: Arc<[i64]> = Arc::from(load_or_synthesize_dataset(args)?.into_boxed_slice());
     let total = data.len();
-    // Leak the dataset into 'static memory so each thread can hold a
-    // `&'static [i64]` view without an Arc and without cloning. This
-    // is fine for a one-shot benchmark; the process exits when the
-    // run is done.
-    let leaked: &'static [i64] = Box::leak(data.into_boxed_slice());
 
     let mut iters = Vec::with_capacity(args.repeats);
     for rep in 0..args.repeats {
         // Warmup pass.
-        run_read_sum_window(leaked, total, args.threads, args.warmup_secs);
+        run_read_sum_window(&data, total, args.threads, args.warmup_secs);
 
         // Measured pass.
-        let (total_ops, secs) = run_read_sum_window(leaked, total, args.threads, args.measure_secs);
+        let (total_ops, secs) = run_read_sum_window(&data, total, args.threads, args.measure_secs);
         let ops_per_sec = if secs > 0.0 {
             (total_ops as f64) / secs
         } else {
@@ -329,18 +324,14 @@ fn run_read_sum(args: &Args) -> Result<String> {
     Ok(emit_json(args.workload, args.threads, args, &iters))
 }
 
-fn run_read_sum_window(
-    leaked: &'static [i64],
-    total: usize,
-    threads: usize,
-    secs: u64,
-) -> (u64, f64) {
+fn run_read_sum_window(data: &Arc<[i64]>, total: usize, threads: usize, secs: u64) -> (u64, f64) {
     let stop = Arc::new(AtomicBool::new(false));
     let counters: Vec<Arc<AtomicU64>> = (0..threads).map(|_| Arc::new(AtomicU64::new(0))).collect();
     let mut handles = Vec::with_capacity(threads);
     for (tid, counter) in counters.iter().enumerate() {
         let stop_t = Arc::clone(&stop);
         let counter_t = Arc::clone(counter);
+        let data_t = Arc::clone(data);
         let chunk = total / threads;
         let lo = tid * chunk;
         let hi = if tid + 1 == threads {
@@ -348,9 +339,8 @@ fn run_read_sum_window(
         } else {
             (tid + 1) * chunk
         };
-        let slice: &'static [i64] = &leaked[lo..hi];
         handles.push(thread::spawn(move || {
-            let n = run_read_sum_thread(slice, &stop_t);
+            let n = run_read_sum_thread(&data_t[lo..hi], &stop_t);
             counter_t.store(n, Ordering::Release);
         }));
     }

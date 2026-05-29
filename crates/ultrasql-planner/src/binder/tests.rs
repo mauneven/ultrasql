@@ -3624,7 +3624,7 @@ fn rejects_malformed_window_function_calls() {
     ] {
         let err = parse_and_bind(sql, &cat).expect_err(sql);
         assert!(
-            matches!(err, PlanError::TypeMismatch(_) | PlanError::NotSupported(_)),
+            matches!(err, PlanError::TypeMismatch(_)) || err.is_not_supported(),
             "{sql}: {err:?}"
         );
     }

@@ -340,11 +340,9 @@ pub(super) fn filter_unseen_rows(
         };
         cols.push(new_col);
     }
-    Batch::new(cols).map(Some).map_err(|e| {
-        ServerError::Unsupported(Box::leak(
-            format!("recursive CTE filter: {e}").into_boxed_str(),
-        ))
-    })
+    Batch::new(cols)
+        .map(Some)
+        .map_err(|e| ServerError::unsupported(format!("recursive CTE filter: {e}")))
 }
 
 /// Filter helper for numeric columns — drops rows whose mask bit is 0.

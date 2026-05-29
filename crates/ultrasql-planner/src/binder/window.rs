@@ -346,8 +346,8 @@ fn resolve_window_func(
             }
             Ok(LogicalWindowFunc::Ntile(n))
         }
-        other => Err(PlanError::NotSupported(Box::leak(
-            format!("window function '{other}'").into_boxed_str(),
+        other => Err(PlanError::not_supported(format!(
+            "window function '{other}'"
         ))),
     }
 }

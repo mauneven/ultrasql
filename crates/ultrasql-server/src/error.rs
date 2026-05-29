@@ -71,6 +71,11 @@ pub enum ServerError {
     #[error("unsupported in v0.5: {0}")]
     Unsupported(&'static str),
 
+    /// A statement uses an unsupported construct whose explanation is
+    /// computed from the rejected query.
+    #[error("unsupported in v0.5: {0}")]
+    UnsupportedOwned(String),
+
     /// A DDL kernel (catalog mutation, B-tree build, ALTER rewrite,
     /// etc.) failed at runtime with a dynamic message — for example
     /// a storage error encountered while populating an index, or a
@@ -168,6 +173,13 @@ impl ServerError {
     pub fn ddl<M: Into<String>>(msg: M) -> Self {
         Self::Ddl(msg.into())
     }
+
+    /// Build an owned unsupported-feature error without leaking a
+    /// formatted message to satisfy a `'static` lifetime.
+    #[must_use]
+    pub fn unsupported<M: Into<String>>(message: M) -> Self {
+        Self::UnsupportedOwned(message.into())
+    }
 }
 
 impl ServerError {
@@ -186,6 +198,7 @@ impl ServerError {
                 | Self::Execute(_)
                 | Self::Build(_)
                 | Self::Unsupported(_)
+                | Self::UnsupportedOwned(_)
                 | Self::Ddl(_)
                 | Self::Catalog(_)
                 | Self::DependentObjectsStillExist(_)
@@ -215,15 +228,15 @@ impl ServerError {
             // undefined_table — coarse planner fallback plus the catalog
             // NotFound that surfaces when DROP / ALTER fails to resolve a name
             Self::Plan(_) | Self::Catalog(ultrasql_catalog::CatalogError::NotFound(_)) => "42P01",
-            Self::Build(_) | Self::Unsupported(_) => "0A000", // feature_not_supported
-            Self::UnsupportedProtocol { .. } => "08P01",      // protocol_violation
-            Self::DependentObjectsStillExist(_) => "2BP01",   // dependent_objects_still_exist
-            Self::Catalog(_) => "42000",                      // generic catalog failure
-            Self::SerializationFailure(_) => "40001",         // serialization_failure
-            Self::TransactionAborted => "25P02",              // in_failed_sql_transaction
-            Self::Savepoint(_) => "25P01",                    // no_active_sql_transaction
-            Self::SavepointNotFound(_) => "3B001",            // invalid_savepoint_specification
-            Self::InsufficientPrivilege(_) => "42501",        // insufficient_privilege
+            Self::Build(_) | Self::Unsupported(_) | Self::UnsupportedOwned(_) => "0A000", // feature_not_supported
+            Self::UnsupportedProtocol { .. } => "08P01", // protocol_violation
+            Self::DependentObjectsStillExist(_) => "2BP01", // dependent_objects_still_exist
+            Self::Catalog(_) => "42000",                 // generic catalog failure
+            Self::SerializationFailure(_) => "40001",    // serialization_failure
+            Self::TransactionAborted => "25P02",         // in_failed_sql_transaction
+            Self::Savepoint(_) => "25P01",               // no_active_sql_transaction
+            Self::SavepointNotFound(_) => "3B001",       // invalid_savepoint_specification
+            Self::InsufficientPrivilege(_) => "42501",   // insufficient_privilege
             // NOT-NULL constraint violation surfaced by `ModifyTable`
             // on INSERT / UPDATE. Mirrors PostgreSQL's
             // `not_null_violation`.
@@ -301,5 +314,17 @@ mod tests {
         let err: ServerError = ultrasql_executor::physical::BuildError::Unsupported("test").into();
         assert!(err.is_query_scoped());
         assert_eq!(err.sqlstate(), "0A000");
+    }
+
+    #[test]
+    fn dynamic_unsupported_owns_message() {
+        let err = ServerError::unsupported(format!("unsupported function '{}'", "foo"));
+
+        assert!(err.is_query_scoped());
+        assert_eq!(err.sqlstate(), "0A000");
+        assert_eq!(
+            err.to_string(),
+            "unsupported in v0.5: unsupported function 'foo'"
+        );
     }
 }

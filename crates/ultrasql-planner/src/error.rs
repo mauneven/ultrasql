@@ -42,4 +42,42 @@ pub enum PlanError {
     /// cheap.
     #[error("not supported: {0}")]
     NotSupported(&'static str),
+
+    /// The construct is syntactically valid but not yet implemented by
+    /// the binder, with context computed from the rejected query.
+    #[error("not supported: {0}")]
+    NotSupportedOwned(String),
+}
+
+impl PlanError {
+    /// Build an owned "not supported" error without leaking a formatted
+    /// message to satisfy a `'static` lifetime.
+    #[must_use]
+    pub fn not_supported<M: Into<String>>(message: M) -> Self {
+        Self::NotSupportedOwned(message.into())
+    }
+
+    /// `true` when the planner rejected an unsupported but syntactically
+    /// valid SQL construct.
+    #[must_use]
+    pub const fn is_not_supported(&self) -> bool {
+        matches!(self, Self::NotSupported(_) | Self::NotSupportedOwned(_))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::PlanError;
+
+    #[test]
+    fn dynamic_not_supported_owns_message() {
+        let err = PlanError::not_supported(format!("window function '{}'", "foo"));
+
+        assert_eq!(
+            err,
+            PlanError::NotSupportedOwned("window function 'foo'".to_string())
+        );
+        assert_eq!(err.to_string(), "not supported: window function 'foo'");
+        assert!(err.is_not_supported());
+    }
 }

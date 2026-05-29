@@ -803,8 +803,8 @@ fn rewrite_catalog_scalar_expr(
             data_type,
         } if matches!(name.as_str(), "current_user" | "session_user") => {
             if !args.is_empty() {
-                return Err(ServerError::Unsupported(Box::leak(
-                    format!("{name} expects zero arguments").into_boxed_str(),
+                return Err(ServerError::unsupported(format!(
+                    "{name} expects zero arguments"
                 )));
             }
             let value = if name == "current_user" {
@@ -914,24 +914,24 @@ fn privilege_check_from_literal_args(
 ) -> Result<Value, ServerError> {
     let expected = if name == "has_column_privilege" { 4 } else { 3 };
     if args.len() != expected {
-        return Err(ServerError::Unsupported(Box::leak(
-            format!("{name} expects exactly {expected} text arguments").into_boxed_str(),
+        return Err(ServerError::unsupported(format!(
+            "{name} expects exactly {expected} text arguments"
         )));
     }
     let mut texts = Vec::with_capacity(expected);
     for arg in args {
         let ScalarExpr::Literal { value, .. } = arg else {
-            return Err(ServerError::Unsupported(Box::leak(
-                format!("{name} currently requires literal arguments").into_boxed_str(),
+            return Err(ServerError::unsupported(format!(
+                "{name} currently requires literal arguments"
             )));
         };
         match value {
             Value::Null => return Ok(Value::Null),
             Value::Text(text) => texts.push(text.as_str()),
             other => {
-                return Err(ServerError::Unsupported(Box::leak(
-                    format!("{name} expects text arguments, got {:?}", other.data_type())
-                        .into_boxed_str(),
+                return Err(ServerError::unsupported(format!(
+                    "{name} expects text arguments, got {:?}",
+                    other.data_type()
                 )));
             }
         }
@@ -950,9 +950,7 @@ fn privilege_check_from_literal_args(
         ));
     }
     let object_kind = privilege_object_kind_for_function(name).ok_or_else(|| {
-        ServerError::Unsupported(Box::leak(
-            format!("unsupported privilege check function {name}").into_boxed_str(),
-        ))
+        ServerError::unsupported(format!("unsupported privilege check function {name}"))
     })?;
     let privilege = privilege_kind_from_text(texts[2])?;
     let roles = ctx.role_catalog.inherited_role_names(texts[0]);
@@ -989,8 +987,8 @@ fn privilege_kind_from_text(text: &str) -> Result<crate::auth::PrivilegeKind, Se
         "connect" => Ok(crate::auth::PrivilegeKind::Connect),
         "temporary" | "temp" => Ok(crate::auth::PrivilegeKind::Temporary),
         "execute" => Ok(crate::auth::PrivilegeKind::Execute),
-        other => Err(ServerError::Unsupported(Box::leak(
-            format!("unsupported privilege kind '{other}'").into_boxed_str(),
+        other => Err(ServerError::unsupported(format!(
+            "unsupported privilege kind '{other}'"
         ))),
     }
 }
@@ -1013,12 +1011,9 @@ fn relation_size_from_literal_args(
         Value::Null => return Ok(Value::Null),
         Value::Text(s) => s,
         other => {
-            return Err(ServerError::Unsupported(Box::leak(
-                format!(
-                    "pg_relation_size expects text/regclass relation name, got {:?}",
-                    other.data_type()
-                )
-                .into_boxed_str(),
+            return Err(ServerError::unsupported(format!(
+                "pg_relation_size expects text/regclass relation name, got {:?}",
+                other.data_type()
             )));
         }
     };
