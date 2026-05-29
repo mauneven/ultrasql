@@ -13,6 +13,8 @@ use clap::Parser;
 use tracing_subscriber::EnvFilter;
 use ultrasql_server::{LocalQueryOutput, Server};
 
+const DEFAULT_LOCAL_SQL_LIMIT_BYTES: u64 = 128 * 1024 * 1024;
+
 /// Query local files through UltraSQL without starting `ultrasqld`.
 #[derive(Debug, Parser)]
 #[command(name = "ultrasql-local", about, version)]
@@ -44,15 +46,57 @@ fn read_sql(cli: &Cli) -> Result<String> {
     if let Some(query) = &cli.query {
         return Ok(query.clone());
     }
+    let limit = local_sql_limit_bytes();
     if let Some(file) = &cli.file {
-        return std::fs::read_to_string(file)
-            .with_context(|| format!("cannot read SQL file: {}", file.display()));
+        let file_handle = open_sql_file(file)?;
+        return read_limited_utf8(file_handle, "SQL file", file.display().to_string(), limit);
     }
-    let mut sql = String::new();
-    std::io::stdin()
-        .read_to_string(&mut sql)
-        .context("cannot read SQL from stdin")?;
-    Ok(sql)
+    read_limited_utf8(std::io::stdin(), "SQL stdin", "stdin".to_owned(), limit)
+}
+
+fn local_sql_limit_bytes() -> u64 {
+    std::env::var("ULTRASQL_LOCAL_SQL_LIMIT_BYTES")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(DEFAULT_LOCAL_SQL_LIMIT_BYTES)
+}
+
+fn open_sql_file(path: &PathBuf) -> Result<std::fs::File> {
+    let metadata = std::fs::symlink_metadata(path)
+        .with_context(|| format!("cannot inspect SQL file: {}", path.display()))?;
+    if !metadata.file_type().is_file() {
+        anyhow::bail!("SQL file is not a regular file: {}", path.display());
+    }
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+
+        options.custom_flags(libc::O_NOFOLLOW);
+    }
+    options
+        .open(path)
+        .with_context(|| format!("cannot read SQL file: {}", path.display()))
+}
+
+fn read_limited_utf8<R: std::io::Read>(
+    reader: R,
+    context: &str,
+    display: String,
+    limit: u64,
+) -> Result<String> {
+    let mut bytes = Vec::new();
+    let mut limited = reader.take(limit.saturating_add(1));
+    limited
+        .read_to_end(&mut bytes)
+        .with_context(|| format!("cannot read {context}: {display}"))?;
+    let read_len = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
+    if read_len > limit {
+        anyhow::bail!("{context} exceeds read limit: {display} size={read_len} limit={limit}");
+    }
+    String::from_utf8(bytes).with_context(|| format!("{context} is not UTF-8: {display}"))
 }
 
 fn print_output(output: &LocalQueryOutput) -> Result<()> {
@@ -182,6 +226,12 @@ mod tests {
 
     #[test]
     fn read_sql_prefers_query_then_file() {
+        let _env_guard = local_env_test_lock();
+        // SAFETY: local_env_test_lock serializes process-env mutation in this
+        // module's tests.
+        unsafe {
+            std::env::remove_var("ULTRASQL_LOCAL_SQL_LIMIT_BYTES");
+        }
         let query_cli = Cli {
             query: Some("SELECT 1".to_owned()),
             file: None,
@@ -196,6 +246,37 @@ mod tests {
             file: Some(file),
         };
         assert_eq!(read_sql(&file_cli).expect("file sql"), "SELECT 2");
+    }
+
+    #[test]
+    fn read_sql_rejects_oversized_file() {
+        let _env_guard = local_env_test_lock();
+        // SAFETY: local_env_test_lock serializes process-env mutation in this
+        // module's tests.
+        unsafe {
+            std::env::set_var("ULTRASQL_LOCAL_SQL_LIMIT_BYTES", "3");
+        }
+        let dir = tempfile::tempdir().expect("tempdir");
+        let file = dir.path().join("script.sql");
+        std::fs::write(&file, "SELECT 1").expect("write SQL file");
+        let file_cli = Cli {
+            query: None,
+            file: Some(file),
+        };
+
+        let err = read_sql(&file_cli).expect_err("oversized SQL file rejected");
+
+        assert!(err.to_string().contains("exceeds read limit"), "{err}");
+        // SAFETY: local_env_test_lock serializes process-env mutation in this
+        // module's tests.
+        unsafe {
+            std::env::remove_var("ULTRASQL_LOCAL_SQL_LIMIT_BYTES");
+        }
+    }
+
+    fn local_env_test_lock() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        LOCK.lock().expect("local env test lock")
     }
 
     #[test]
