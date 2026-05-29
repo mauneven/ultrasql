@@ -3498,6 +3498,7 @@ name = "ultrasql-iceberg"
 version = "0.0.7"
 dependencies = [
  "apache-avro",
+ "libc",
  "serde",
  "serde_json",
  "tempfile",

@@ -7,12 +7,15 @@
 use std::fs;
 use std::io::Cursor;
 use std::io::ErrorKind;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use apache_avro::{Reader, types::Value as AvroValue};
 use serde::Deserialize;
 use ultrasql_core::{DataType, Field, Schema};
 use ultrasql_objectstore::{expand_object_store_specs, is_object_store_uri, read_object_bytes};
+
+const DEFAULT_ICEBERG_LOCAL_READ_LIMIT_BYTES: u64 = 256 * 1024 * 1024;
 
 /// Result type for Iceberg metadata planning.
 pub type Result<T> = std::result::Result<T, IcebergError>;
@@ -610,33 +613,59 @@ fn read_location_bytes(location: &str) -> Result<Vec<u8>> {
 }
 
 fn read_local_regular_bytes(path: &Path) -> Result<Vec<u8>> {
-    ensure_local_regular_file(path)?;
-    fs::read(path).map_err(|err| {
+    let metadata = ensure_local_regular_file(path)?;
+    let limit = iceberg_local_read_limit_bytes();
+    if metadata.len() > limit {
+        return Err(IcebergError::Io(format!(
+            "iceberg_scan local file exceeds limit: {} size={} limit={limit}",
+            path.display(),
+            metadata.len()
+        )));
+    }
+    let mut options = fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+
+        options.custom_flags(libc::O_NOFOLLOW);
+    }
+    let file = options.open(path).map_err(|err| {
         IcebergError::Io(format!(
             "iceberg_scan cannot read {}: {err}",
             path.display()
         ))
-    })
+    })?;
+    let mut bytes = Vec::new();
+    let mut limited = file.take(limit.saturating_add(1));
+    limited.read_to_end(&mut bytes).map_err(|err| {
+        IcebergError::Io(format!(
+            "iceberg_scan cannot read {}: {err}",
+            path.display()
+        ))
+    })?;
+    let read_len = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
+    if read_len > limit {
+        return Err(IcebergError::Io(format!(
+            "iceberg_scan local file exceeds limit: {} size={read_len} limit={limit}",
+            path.display()
+        )));
+    }
+    Ok(bytes)
 }
 
 fn read_local_regular_text_if_exists(path: &Path) -> Result<Option<String>> {
     match fs::symlink_metadata(path) {
-        Ok(metadata) if metadata.file_type().is_file() => {
-            fs::read_to_string(path).map(Some).map_err(|err| {
-                IcebergError::Io(format!(
-                    "iceberg_scan cannot read {}: {err}",
-                    path.display()
-                ))
+        Ok(_) => read_local_regular_bytes(path)
+            .and_then(|bytes| {
+                String::from_utf8(bytes).map_err(|err| {
+                    IcebergError::Io(format!(
+                        "iceberg_scan cannot read {}: {err}",
+                        path.display()
+                    ))
+                })
             })
-        }
-        Ok(metadata) if metadata.file_type().is_symlink() => Err(IcebergError::Io(format!(
-            "iceberg_scan refuses symlinked local file {}",
-            path.display()
-        ))),
-        Ok(_) => Err(IcebergError::Io(format!(
-            "iceberg_scan refuses non-regular local file {}",
-            path.display()
-        ))),
+            .map(Some),
         Err(err) if err.kind() == ErrorKind::NotFound => Ok(None),
         Err(err) => Err(IcebergError::Io(format!(
             "iceberg_scan cannot inspect {}: {err}",
@@ -661,9 +690,9 @@ fn local_regular_file_exists(path: &Path) -> Result<bool> {
     }
 }
 
-fn ensure_local_regular_file(path: &Path) -> Result<()> {
+fn ensure_local_regular_file(path: &Path) -> Result<fs::Metadata> {
     match fs::symlink_metadata(path) {
-        Ok(metadata) if metadata.file_type().is_file() => Ok(()),
+        Ok(metadata) if metadata.file_type().is_file() => Ok(metadata),
         Ok(metadata) if metadata.file_type().is_symlink() => Err(IcebergError::Io(format!(
             "iceberg_scan refuses symlinked local file {}",
             path.display()
@@ -677,6 +706,14 @@ fn ensure_local_regular_file(path: &Path) -> Result<()> {
             path.display()
         ))),
     }
+}
+
+fn iceberg_local_read_limit_bytes() -> u64 {
+    std::env::var("ULTRASQL_ICEBERG_LOCAL_READ_LIMIT_BYTES")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(DEFAULT_ICEBERG_LOCAL_READ_LIMIT_BYTES)
 }
 
 fn ensure_local_directory(path: &Path) -> Result<()> {
@@ -1045,6 +1082,28 @@ mod tests {
     }
 
     #[test]
+    fn read_local_regular_bytes_rejects_configured_oversized_file() {
+        let _env_guard = iceberg_env_test_lock();
+        // SAFETY: iceberg_env_test_lock serializes process-env mutation in
+        // this module's tests.
+        unsafe {
+            std::env::set_var("ULTRASQL_ICEBERG_LOCAL_READ_LIMIT_BYTES", "3");
+        }
+        let temp = tempfile::tempdir().expect("tempdir");
+        let metadata = temp.path().join("oversized.metadata.json");
+        fs::write(&metadata, b"abcd").expect("write oversized metadata");
+
+        let err = read_local_regular_bytes(&metadata).expect_err("oversized metadata rejected");
+
+        assert!(err.to_string().contains("local file exceeds limit"));
+        // SAFETY: iceberg_env_test_lock serializes process-env mutation in
+        // this module's tests.
+        unsafe {
+            std::env::remove_var("ULTRASQL_ICEBERG_LOCAL_READ_LIMIT_BYTES");
+        }
+    }
+
+    #[test]
     fn avro_scalar_helpers_cover_supported_primitives() {
         assert_eq!(
             avro_bytes(&AvroValue::Fixed(2, vec![b'a', b'b'])),
@@ -1408,5 +1467,12 @@ mod tests {
             fs::write(table_dir.join(file_name), b"PAR1").expect("write data placeholder");
         }
         writer.flush().expect("flush manifest");
+    }
+
+    fn iceberg_env_test_lock() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+        LOCK.get_or_init(|| std::sync::Mutex::new(()))
+            .lock()
+            .expect("iceberg env test lock")
     }
 }
