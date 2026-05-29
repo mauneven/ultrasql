@@ -158,7 +158,10 @@ pub fn read_object_range_with_metadata(
         return Ok(cached);
     }
     OBJECT_RANGE_CACHE_MISSES.fetch_add(1, Ordering::Relaxed);
-    let response = get_response(request, ResponseExpectation::PartialContent)?;
+    let response = get_response(
+        request,
+        ResponseExpectation::PartialContent { max_bytes: len },
+    )?;
     OBJECT_RANGE_REQUESTS.fetch_add(1, Ordering::Relaxed);
     OBJECT_RANGE_REMOTE_BYTES.fetch_add(
         u64::try_from(response.bytes.len()).unwrap_or(u64::MAX),
@@ -347,7 +350,7 @@ struct ObjectRequest {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ResponseExpectation {
     Success,
-    PartialContent,
+    PartialContent { max_bytes: u64 },
 }
 
 #[derive(Debug)]
@@ -494,22 +497,24 @@ fn get_response(
                 request.url
             )));
         }
-        ResponseExpectation::PartialContent if status.as_u16() != 206 => {
+        ResponseExpectation::PartialContent { .. } if status.as_u16() != 206 => {
             return Err(ObjectStoreError::Http(format!(
                 "object range GET {} returned {status}, expected 206 Partial Content",
                 request.url
             )));
         }
-        ResponseExpectation::Success | ResponseExpectation::PartialContent => {}
+        ResponseExpectation::Success | ResponseExpectation::PartialContent { .. } => {}
     }
     let object_size = response
         .headers()
         .get("content-range")
         .and_then(|value| value.to_str().ok())
         .and_then(parse_content_range_size);
-    let full_read_limit =
-        (expectation == ResponseExpectation::Success).then(object_full_read_limit_bytes);
-    if let Some(limit) = full_read_limit
+    let body_limit = match expectation {
+        ResponseExpectation::Success => Some(object_full_read_limit_bytes()),
+        ResponseExpectation::PartialContent { max_bytes } => Some(max_bytes),
+    };
+    if let Some(limit) = body_limit
         && let Some(content_length) = response
             .headers()
             .get("content-length")
@@ -522,14 +527,14 @@ fn get_response(
             request.url
         )));
     }
-    let body_read_limit = full_read_limit.map_or(u64::MAX, |limit| limit.saturating_add(1));
+    let body_read_limit = body_limit.map_or(u64::MAX, |limit| limit.saturating_add(1));
     let bytes = response
         .body_mut()
         .with_config()
         .limit(body_read_limit)
         .read_to_vec()
         .map_err(|err| ObjectStoreError::Http(format!("object GET {} body: {err}", request.url)))?;
-    if let Some(limit) = full_read_limit {
+    if let Some(limit) = body_limit {
         let len = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
         if len > limit {
             return Err(ObjectStoreError::Http(format!(
@@ -1254,6 +1259,42 @@ mod tests {
         let request = request_rx.recv().expect("request text");
         assert!(request.starts_with("GET /bucket/path/file.parquet HTTP/1.1"));
         assert!(request.contains("\r\nrange: bytes=4-9\r\n"));
+        handle.join().expect("mock server done");
+    }
+
+    #[test]
+    fn read_object_range_rejects_body_larger_than_requested_range() {
+        let _test_guard = objectstore_env_test_lock();
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock server");
+        let endpoint = format!("http://{}", listener.local_addr().expect("local addr"));
+        let handle = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept request");
+            let mut request = Vec::new();
+            let mut buf = [0_u8; 1024];
+            loop {
+                let read = stream.read(&mut buf).expect("read request");
+                if read == 0 {
+                    break;
+                }
+                request.extend_from_slice(&buf[..read]);
+                if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            stream
+                .write_all(
+                    b"HTTP/1.1 206 Partial Content\r\nContent-Length: 4\r\nContent-Range: bytes 4-6/16\r\n\r\n4567",
+                )
+                .expect("write response");
+        });
+
+        let _guard = override_s3_endpoint_for_process(endpoint);
+        let objects = expand_object_store_specs(&["s3://bucket/path/file.parquet".to_owned()])
+            .expect("expand object");
+        let err =
+            read_object_range_with_metadata(&objects[0], 4, 3).expect_err("oversized range body");
+
+        assert!(err.to_string().contains("body exceeds limit"));
         handle.join().expect("mock server done");
     }
 
