@@ -38,7 +38,8 @@
 //! and `ROLLBACK PREPARED`) are serialised by the [`DashMap`] entry's shard lock
 //! via the `entry()` API.
 
-use std::fs;
+use std::fs::{self, OpenOptions};
+use std::io::Write;
 use std::path::PathBuf;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -209,6 +210,12 @@ impl TwoPhaseCoordinator {
             let Ok(dir_entry) = dir_entry_result else {
                 continue; // skip unreadable entries
             };
+            let Ok(file_type) = dir_entry.file_type() else {
+                continue;
+            };
+            if !file_type.is_file() {
+                continue;
+            }
 
             let path = dir_entry.path();
             if path.extension().and_then(|s| s.to_str()) != Some("txn") {
@@ -316,10 +323,19 @@ fn write_state_file(
         secs
     );
 
-    fs::write(path, content).map_err(|e| TwoPhaseError::Io {
-        gid: gid.to_owned(),
-        detail: e.to_string(),
-    })
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+        .map_err(|e| TwoPhaseError::Io {
+            gid: gid.to_owned(),
+            detail: e.to_string(),
+        })?;
+    file.write_all(content.as_bytes())
+        .map_err(|e| TwoPhaseError::Io {
+            gid: gid.to_owned(),
+            detail: e.to_string(),
+        })
 }
 
 /// Parsed record from a state file.
@@ -634,5 +650,41 @@ mod tests {
         assert_eq!(c1, 1);
         assert_eq!(c2, 1);
         assert_eq!(coord.list_prepared().len(), 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn prepare_refuses_symlinked_state_file() {
+        use std::os::unix::fs::symlink;
+
+        let dir = TempDir::new().expect("tempdir");
+        let target = dir.path().join("target");
+        std::fs::write(&target, b"keep").expect("target");
+        symlink(&target, dir.path().join("evil.txn")).expect("state symlink");
+
+        let coord = TwoPhaseCoordinator::new(dir.path().to_path_buf());
+        assert!(coord.prepare("evil", xid(700)).is_err());
+        assert_eq!(std::fs::read(&target).expect("target unchanged"), b"keep");
+        assert!(coord.list_prepared().is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn recover_from_disk_skips_symlinked_state_files() {
+        use std::os::unix::fs::symlink;
+
+        let dir = TempDir::new().expect("tempdir");
+        let outside = TempDir::new().expect("outside tempdir");
+        let target = outside.path().join("target.txn");
+        std::fs::write(
+            &target,
+            "{\"gid\":\"from-link\",\"xid\":701,\"prepared_at_secs\":0}",
+        )
+        .expect("target state");
+        symlink(&target, dir.path().join("from-link.txn")).expect("state symlink");
+
+        let coord = TwoPhaseCoordinator::new(dir.path().to_path_buf());
+        assert_eq!(coord.recover_from_disk().expect("recover"), 0);
+        assert!(coord.list_prepared().is_empty());
     }
 }
