@@ -63,7 +63,7 @@ where
         self.state
             .role_catalog
             .lookup_role(&self.current_user)
-            .is_none_or(|role| role.is_superuser)
+            .is_some_and(|role| role.is_superuser)
     }
 }
 
@@ -530,11 +530,21 @@ mod tests {
     }
 
     #[test]
+    fn missing_role_does_not_bypass_column_privileges() {
+        let server = Arc::new(crate::Server::with_sample_database());
+        let (io, _peer) = duplex(64);
+        let session = Session::new(io, server);
+
+        assert!(!session.privilege_bypass());
+    }
+
+    #[test]
     fn collector_tracks_dml_copy_window_and_subquery_privilege_sources() {
         let server = Arc::new(crate::Server::with_sample_database());
         let snapshot = server.catalog_snapshot();
         let (io, _peer) = duplex(64);
-        let session = Session::new(io, Arc::clone(&server));
+        let mut session = Session::new(io, Arc::clone(&server));
+        session.current_user = "ultrasql".to_owned();
         let mut collector = collector(&session, &snapshot);
 
         let insert = LogicalPlan::Insert {
@@ -690,7 +700,8 @@ mod tests {
         let server = Arc::new(crate::Server::with_sample_database());
         let snapshot = server.catalog_snapshot();
         let (io, _peer) = duplex(64);
-        let session = Session::new(io, Arc::clone(&server));
+        let mut session = Session::new(io, Arc::clone(&server));
+        session.current_user = "ultrasql".to_owned();
         let mut collector = collector(&session, &snapshot);
 
         let join = LogicalPlan::Join {
