@@ -1370,7 +1370,17 @@ fn read_copy_file_sample(path: &str) -> Result<String, ServerError> {
 
 fn open_copy_input_file(path: &str) -> Result<File, ServerError> {
     ensure_regular_copy_input(path)?;
-    File::open(path).map_err(|e| ServerError::Io(std::io::Error::other(format!("{path}: {e}"))))
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+
+        options.custom_flags(libc::O_NOFOLLOW);
+    }
+    options
+        .open(path)
+        .map_err(|e| ServerError::Io(std::io::Error::other(format!("{path}: {e}"))))
 }
 
 fn read_copy_input_file(path: &str) -> Result<Vec<u8>, ServerError> {

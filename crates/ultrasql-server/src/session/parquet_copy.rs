@@ -184,7 +184,17 @@ fn open_parquet_input_file(path: &str) -> Result<File, ServerError> {
             "COPY FROM parquet file is not a regular file: {path}"
         )));
     }
-    File::open(path).map_err(|err| ServerError::Io(std::io::Error::other(format!("{path}: {err}"))))
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+
+        options.custom_flags(libc::O_NOFOLLOW);
+    }
+    options
+        .open(path)
+        .map_err(|err| ServerError::Io(std::io::Error::other(format!("{path}: {err}"))))
 }
 
 struct ParquetBatchBuilder<'a> {

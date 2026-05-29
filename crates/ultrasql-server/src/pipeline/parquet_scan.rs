@@ -2,7 +2,7 @@
 
 use std::cmp::Ordering;
 use std::collections::VecDeque;
-use std::fs::{self, File};
+use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 use std::sync::{
@@ -530,7 +530,15 @@ fn open_regular_parquet_file(
             "read_parquet path is not a regular file: {display}"
         )));
     }
-    File::open(path).map_err(|err| {
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+
+        options.custom_flags(libc::O_NOFOLLOW);
+    }
+    options.open(path).map_err(|err| {
         ServerError::CopyFormat(format!("read_parquet cannot {purpose} {display}: {err}"))
     })
 }

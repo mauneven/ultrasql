@@ -1053,7 +1053,15 @@ fn open_csv_input_file(path: &Path) -> Result<File, ServerError> {
             path.display()
         )));
     }
-    File::open(path).map_err(|err| {
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+
+        options.custom_flags(libc::O_NOFOLLOW);
+    }
+    options.open(path).map_err(|err| {
         ServerError::CopyFormat(format!("read_csv cannot open {}: {err}", path.display()))
     })
 }
