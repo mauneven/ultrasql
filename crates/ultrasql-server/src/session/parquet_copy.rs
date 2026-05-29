@@ -1,6 +1,7 @@
 //! Parquet-backed server-side `COPY` helpers.
 
-use std::fs::File;
+use std::fs::{self, File, OpenOptions};
+use std::path::Path;
 use std::sync::Arc;
 
 use arrow_array::{
@@ -34,8 +35,7 @@ where
         path: &str,
     ) -> Result<u64, ServerError> {
         let arrow_schema = Arc::new(copy_arrow_schema(stream_schema)?);
-        let file = File::create(path)
-            .map_err(|err| ServerError::Io(std::io::Error::other(format!("{path}: {err}"))))?;
+        let file = create_parquet_output_file(path)?;
         let mut writer = ArrowWriter::try_new(file, Arc::clone(&arrow_schema), None)
             .map_err(|err| ServerError::CopyFormat(format!("COPY TO parquet {path}: {err}")))?;
 
@@ -108,8 +108,7 @@ where
         stream_schema: &Schema,
         path: &str,
     ) -> Result<u64, ServerError> {
-        let file = File::open(path)
-            .map_err(|err| ServerError::Io(std::io::Error::other(format!("{path}: {err}"))))?;
+        let file = open_parquet_input_file(path)?;
         let builder = ParquetRecordBatchReaderBuilder::try_new(file).map_err(|err| {
             ServerError::CopyFormat(format!("COPY FROM parquet cannot inspect {path}: {err}"))
         })?;
@@ -167,6 +166,25 @@ where
         self.finalise_copy_from_commit(txn, rows, "COPY FROM parquet")?;
         Ok(rows)
     }
+}
+
+fn create_parquet_output_file(path: &str) -> Result<File, ServerError> {
+    OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+        .map_err(|err| ServerError::Io(std::io::Error::other(format!("{path}: {err}"))))
+}
+
+fn open_parquet_input_file(path: &str) -> Result<File, ServerError> {
+    let metadata = fs::symlink_metadata(Path::new(path))
+        .map_err(|err| ServerError::Io(std::io::Error::other(format!("{path}: {err}"))))?;
+    if !metadata.file_type().is_file() {
+        return Err(ServerError::CopyFormat(format!(
+            "COPY FROM parquet file is not a regular file: {path}"
+        )));
+    }
+    File::open(path).map_err(|err| ServerError::Io(std::io::Error::other(format!("{path}: {err}"))))
 }
 
 struct ParquetBatchBuilder<'a> {
@@ -562,4 +580,34 @@ fn char_cell(array: &dyn Array, row_index: usize, len: Option<u32>) -> Result<Va
     coerce_bpchar_text(&text, len, false)
         .map(Value::Char)
         .map_err(|err| ServerError::CopyFormat(err.to_string()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn parquet_file_helpers_reject_symlinks() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let input_target = dir.path().join("input.parquet");
+        let input_link = dir.path().join("input-link.parquet");
+        fs::write(&input_target, b"not parquet").expect("write input");
+        symlink(&input_target, &input_link).expect("input symlink");
+
+        assert!(open_parquet_input_file(input_link.to_str().expect("utf8 input")).is_err());
+
+        let output_target = dir.path().join("output-target.parquet");
+        let output_link = dir.path().join("output-link.parquet");
+        fs::write(&output_target, b"keep").expect("write output target");
+        symlink(&output_target, &output_link).expect("output symlink");
+
+        assert!(create_parquet_output_file(output_link.to_str().expect("utf8 output")).is_err());
+        assert_eq!(
+            fs::read(&output_target).expect("read output target"),
+            b"keep"
+        );
+    }
 }
