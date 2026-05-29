@@ -1707,7 +1707,9 @@ fn run_archive_wal(wal_path: &Path, archive_dir: &Path) -> Result<()> {
     fs::create_dir_all(archive_dir)?;
     let name = wal_path
         .file_name()
+        .and_then(|name| name.to_str())
         .context("WAL path must have a filename")?;
+    validate_wal_file_name(name)?;
     let dest = archive_dir.join(name);
     fs::copy(wal_path, &dest)?;
     println!("archived {} to {}", wal_path.display(), dest.display());
@@ -1715,11 +1717,24 @@ fn run_archive_wal(wal_path: &Path, archive_dir: &Path) -> Result<()> {
 }
 
 fn run_restore_wal(wal_name: &str, archive_dir: &Path, output: &Path) -> Result<()> {
+    validate_wal_file_name(wal_name)?;
     let source = archive_dir.join(wal_name);
     fs::copy(&source, output)
         .with_context(|| format!("restore WAL {} to {}", source.display(), output.display()))?;
     println!("restored {} to {}", source.display(), output.display());
     Ok(())
+}
+
+fn validate_wal_file_name(name: &str) -> Result<()> {
+    let ultrasql_segment = name
+        .strip_prefix("segment_")
+        .is_some_and(|suffix| suffix.len() == 10 && suffix.bytes().all(|b| b.is_ascii_digit()));
+    let pg_segment = name.len() == 24 && name.bytes().all(|b| b.is_ascii_hexdigit());
+    if ultrasql_segment || pg_segment {
+        Ok(())
+    } else {
+        anyhow::bail!("unsafe WAL filename: {name}");
+    }
 }
 
 fn run_wal_send_loop(sender: &WalSender, slot: &str, dest: &Path, interval_ms: u64) -> Result<()> {
@@ -2374,6 +2389,12 @@ mod tests {
             fs::read(&wal).expect("read wal"),
             fs::read(restored).expect("read restored")
         );
+
+        let outside = dir.path().join("outside.wal");
+        fs::write(&outside, b"outside").expect("outside wal");
+        let escaped = dir.path().join("escaped.wal");
+        assert!(run_restore_wal("../outside.wal", &archive, &escaped).is_err());
+        assert!(!escaped.exists());
 
         assert_eq!(hex_bytes(&[0, 1, 255]), "0001ff");
         assert_eq!(decode_hex("0001ff").expect("decode hex"), vec![0, 1, 255]);
