@@ -14,6 +14,7 @@ use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
+use std::time::Duration;
 
 use clap::{Parser, ValueEnum};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -23,6 +24,10 @@ use tracing_subscriber::EnvFilter;
 use ultrasql_server::{
     AutovacuumConfig, LogStatementMode, LoggingConfig, Server, WalArchiveConfig, run_server,
 };
+
+const OPS_REQUEST_HEAD_LIMIT_BYTES: usize = 8 * 1024;
+const OPS_REQUEST_HEAD_HARD_LIMIT_BYTES: usize = 64 * 1024;
+const OPS_REQUEST_READ_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// `ultrasqld` v0.5: SQL server with an
 /// in-memory sample database.
@@ -643,12 +648,21 @@ async fn run_ops_endpoint(
 }
 
 async fn handle_ops_request(mut stream: TcpStream, pg_addr: SocketAddr, state: Arc<Server>) {
-    let mut buf = [0_u8; 1024];
-    let n = match stream.read(&mut buf).await {
-        Ok(n) => n,
-        Err(_) => return,
+    let buf = match read_ops_request_head(&mut stream).await {
+        OpsRequestHead::Complete(buf) => buf,
+        OpsRequestHead::TooLarge => {
+            write_ops_response(
+                &mut stream,
+                "431 Request Header Fields Too Large",
+                "application/json",
+                "{\"error\":\"request header too large\"}\n",
+            )
+            .await;
+            return;
+        }
+        OpsRequestHead::Timeout | OpsRequestHead::Io => return,
     };
-    let req = String::from_utf8_lossy(&buf[..n]);
+    let req = String::from_utf8_lossy(&buf);
     let request_line = req.lines().next().unwrap_or_default();
     let mut request_parts = request_line.split_whitespace();
     let method = request_parts.next().unwrap_or_default();
@@ -705,6 +719,48 @@ async fn handle_ops_request(mut stream: TcpStream, pg_addr: SocketAddr, state: A
         ),
     };
 
+    write_ops_response(&mut stream, status, content_type, &body).await;
+}
+
+enum OpsRequestHead {
+    Complete(Vec<u8>),
+    TooLarge,
+    Timeout,
+    Io,
+}
+
+async fn read_ops_request_head(stream: &mut TcpStream) -> OpsRequestHead {
+    let mut request = Vec::new();
+    let mut chunk = [0_u8; 1024];
+    let mut too_large = false;
+    loop {
+        let read =
+            match tokio::time::timeout(OPS_REQUEST_READ_TIMEOUT, stream.read(&mut chunk)).await {
+                Ok(Ok(read)) => read,
+                Ok(Err(_)) => return OpsRequestHead::Io,
+                Err(_) => return OpsRequestHead::Timeout,
+            };
+        if read == 0 {
+            break;
+        }
+        request.extend_from_slice(&chunk[..read]);
+        if request.len() > OPS_REQUEST_HEAD_LIMIT_BYTES {
+            too_large = true;
+        }
+        if request.len() > OPS_REQUEST_HEAD_HARD_LIMIT_BYTES {
+            return OpsRequestHead::TooLarge;
+        }
+        if request.windows(4).any(|window| window == b"\r\n\r\n") {
+            break;
+        }
+    }
+    if too_large {
+        return OpsRequestHead::TooLarge;
+    }
+    OpsRequestHead::Complete(request)
+}
+
+async fn write_ops_response(stream: &mut TcpStream, status: &str, content_type: &str, body: &str) {
     let response = format!(
         "HTTP/1.1 {status}\r\ncontent-type: {content_type}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
         body.len()
@@ -968,6 +1024,20 @@ mod tests {
         let backup_stop = request_ops_path("/backup/stop", missing_pg, Arc::clone(&state)).await;
         assert!(backup_stop.starts_with("HTTP/1.1 405 Method Not Allowed"));
         assert!(state.is_standby_mode());
+    }
+
+    #[tokio::test]
+    async fn ops_endpoint_rejects_oversized_request_headers() {
+        let state = Arc::new(Server::with_sample_database());
+        let missing_pg: SocketAddr = "127.0.0.1:0".parse().expect("missing pg addr");
+        let path = format!("/ready{}", "x".repeat(9 * 1024));
+
+        let response = request_ops_path(&path, missing_pg, state).await;
+
+        assert!(
+            response.starts_with("HTTP/1.1 431 Request Header Fields Too Large"),
+            "{response}"
+        );
     }
 
     async fn request_ops_path(path: &str, pg_addr: SocketAddr, state: Arc<Server>) -> String {
