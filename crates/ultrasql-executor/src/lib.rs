@@ -183,6 +183,11 @@ pub enum ExecError {
     #[error("{0}")]
     StringDataRightTruncation(String),
 
+    /// A numeric value exceeds declared precision. The server maps this
+    /// to PostgreSQL SQLSTATE `22003`.
+    #[error("{0}")]
+    NumericFieldOverflow(String),
+
     /// A batch was produced that exceeds the configured maximum row
     /// count. The executor caps batches at 4096 rows
     /// (see `ARCHITECTURE.md`); kernels that violate this are buggy.

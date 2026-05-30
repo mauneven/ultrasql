@@ -61,9 +61,8 @@ file focused on what still blocks production.
 
 ### Type Surface
 
-- `NUMERIC(p,s)` / `DECIMAL(p,s)`: arbitrary-precision runtime arithmetic,
-  precision enforcement, and variable-scale bare-`NUMERIC` columnar result
-  preservation remain open.
+- `NUMERIC(p,s)` / `DECIMAL(p,s)`: arbitrary-precision runtime arithmetic and
+  variable-scale bare-`NUMERIC` columnar result preservation remain open.
 - `MONEY`: `lc_monetary` formatting/input, full arithmetic/operator/cast
   matrix, and range parity beyond signed-cent storage remain open.
 - Date/time: named time-zone database support plus broader `DateStyle` and

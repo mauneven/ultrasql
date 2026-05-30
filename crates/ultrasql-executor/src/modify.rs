@@ -69,6 +69,9 @@ fn row_codec_error_to_exec(err: RowCodecError) -> ExecError {
         RowCodecError::StringDataRightTruncation { detail, .. } => {
             ExecError::StringDataRightTruncation(detail)
         }
+        RowCodecError::NumericFieldOverflow { detail, .. } => {
+            ExecError::NumericFieldOverflow(detail)
+        }
         other => ExecError::TypeMismatch(other.to_string()),
     }
 }

@@ -386,7 +386,21 @@ impl RowCodec {
                     // surrounding executor.
                     payload.extend_from_slice(&v.to_le_bytes());
                 }
-                (DataType::Decimal { .. }, Value::Decimal { value, scale }) => {
+                (
+                    DataType::Decimal {
+                        precision,
+                        scale: declared_scale,
+                    },
+                    Value::Decimal { value, scale },
+                ) => {
+                    validate_decimal_precision(
+                        *value,
+                        *scale,
+                        *precision,
+                        *declared_scale,
+                        col_idx,
+                        &field.data_type,
+                    )?;
                     encode_numeric_value_payload(
                         &mut payload,
                         *value,
@@ -2573,6 +2587,54 @@ fn decimal_to_numeric_parts(
     })
 }
 
+fn validate_decimal_precision(
+    value: i64,
+    value_scale: i32,
+    precision: Option<u32>,
+    declared_scale: Option<i32>,
+    column: usize,
+    ty: &DataType,
+) -> Result<(), RowCodecError> {
+    let Some(precision) = precision else {
+        return Ok(());
+    };
+    let precision = usize::try_from(precision)
+        .map_err(|_| numeric_field_overflow(column, ty, "numeric precision out of range"))?;
+    let actual_scale = usize::try_from(value_scale.max(0))
+        .map_err(|_| numeric_field_overflow(column, ty, "numeric scale out of range"))?;
+    let declared_scale = usize::try_from(declared_scale.unwrap_or(0).max(0))
+        .map_err(|_| numeric_field_overflow(column, ty, "numeric scale out of range"))?;
+
+    let magnitude = i128::from(value)
+        .checked_abs()
+        .ok_or_else(|| numeric_field_overflow(column, ty, "numeric magnitude overflow"))?;
+    let total_digits = decimal_magnitude_digits(magnitude);
+    let integer_digits = total_digits.saturating_sub(actual_scale);
+    let max_integer_digits = precision.saturating_sub(declared_scale);
+
+    if total_digits > precision || integer_digits > max_integer_digits {
+        return Err(numeric_field_overflow(column, ty, "numeric field overflow"));
+    }
+    Ok(())
+}
+
+fn decimal_magnitude_digits(mut magnitude: i128) -> usize {
+    let mut digits = 1;
+    while magnitude >= 10 {
+        magnitude /= 10;
+        digits += 1;
+    }
+    digits
+}
+
+fn numeric_field_overflow(column: usize, ty: &DataType, detail: &str) -> RowCodecError {
+    RowCodecError::NumericFieldOverflow {
+        column,
+        ty: ty.clone(),
+        detail: detail.to_owned(),
+    }
+}
+
 fn decimal_group_to_u16(group: &[u8]) -> Option<u16> {
     let mut value = 0_u16;
     for byte in group {
@@ -3073,6 +3135,16 @@ pub enum RowCodecError {
         /// User-facing error detail.
         detail: String,
     },
+    /// A numeric value exceeds declared precision.
+    #[error("{detail}")]
+    NumericFieldOverflow {
+        /// Column index.
+        column: usize,
+        /// Expected schema type.
+        ty: DataType,
+        /// User-facing error detail.
+        detail: String,
+    },
     /// Truncated payload.
     #[error("payload truncated: needed {needed}, have {have}")]
     Truncated {
@@ -3274,6 +3346,35 @@ mod tests {
                 0x00, 0x7b, // 0123
             ]
         );
+    }
+
+    #[test]
+    fn decimal_precision_rejects_integer_overflow() {
+        let schema = Schema::new([Field::required(
+            "n",
+            DataType::Decimal {
+                precision: Some(4),
+                scale: Some(2),
+            },
+        )])
+        .unwrap();
+        let codec = RowCodec::new(schema);
+
+        assert!(
+            codec
+                .encode(&[Value::Decimal {
+                    value: 1_234,
+                    scale: 2,
+                }])
+                .is_ok()
+        );
+        assert!(matches!(
+            codec.encode(&[Value::Decimal {
+                value: 12_345,
+                scale: 2,
+            }]),
+            Err(RowCodecError::NumericFieldOverflow { column: 0, .. })
+        ));
     }
 
     #[test]

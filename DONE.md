@@ -165,7 +165,8 @@ as a concise evidence ledger; roadmap stays for open gates only.
 
 - Exact `NUMERIC` / `DECIMAL` base-10000 storage, row/COPY/wire
   payloads, exact scaled arithmetic, scale rounding, text casts, and OID
-  coverage exist; arbitrary precision and precision enforcement remain open.
+  coverage exist. Declared `NUMERIC(p,s)` precision is enforced on heap writes
+  with SQLSTATE `22003` for overflow; arbitrary precision remains open.
 - `MONEY` type surface, signed-cent storage, OID 790, wire, COPY, catalog
   persistence, and behavior tests exist.
 - `CHAR(n)` / `bpchar` parser, binder, row codec, executor, OID 1042, COPY,

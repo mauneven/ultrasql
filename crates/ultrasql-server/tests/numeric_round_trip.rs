@@ -2,7 +2,7 @@
 
 mod support;
 
-use support::{shutdown, start_sample_server};
+use support::{shutdown, start_persistent_server, start_sample_server};
 
 #[tokio::test]
 async fn numeric_arithmetic_casts_and_extended_wire_type() {
@@ -35,5 +35,43 @@ async fn numeric_arithmetic_casts_and_extended_wire_type() {
         .expect("extended numeric query");
     assert_eq!(rows[0].columns()[0].type_().oid(), 1700);
 
+    shutdown(running).await;
+}
+
+#[tokio::test]
+async fn numeric_precision_overflow_reports_sqlstate() {
+    let data_dir = tempfile::TempDir::new().expect("temp dir");
+    let running = start_persistent_server(data_dir.path(), "numeric_round_trip").await;
+    let client = &running.client;
+
+    client
+        .batch_execute("CREATE TABLE numeric_precision (amount NUMERIC(4,2))")
+        .await
+        .expect("create numeric precision table");
+    client
+        .batch_execute("INSERT INTO numeric_precision VALUES (12.34)")
+        .await
+        .expect("insert in-range numeric");
+
+    let err = client
+        .batch_execute("INSERT INTO numeric_precision VALUES (123.45)")
+        .await
+        .expect_err("numeric precision overflow must fail");
+    assert_eq!(
+        err.code().map(tokio_postgres::error::SqlState::code),
+        Some("22003")
+    );
+    shutdown(running).await;
+
+    let running = start_persistent_server(data_dir.path(), "numeric_round_trip").await;
+    let err = running
+        .client
+        .batch_execute("INSERT INTO numeric_precision VALUES (123.45)")
+        .await
+        .expect_err("numeric precision overflow must fail after restart");
+    assert_eq!(
+        err.code().map(tokio_postgres::error::SqlState::code),
+        Some("22003")
+    );
     shutdown(running).await;
 }

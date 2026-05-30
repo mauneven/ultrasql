@@ -256,6 +256,9 @@ impl ServerError {
             // string_data_right_truncation — assignment to CHAR(n) /
             // VARCHAR(n)-style width exceeded declared length.
             Self::Execute(ultrasql_executor::ExecError::StringDataRightTruncation(_)) => "22001",
+            // numeric_value_out_of_range — assignment exceeds
+            // declared NUMERIC/DECIMAL precision.
+            Self::Execute(ultrasql_executor::ExecError::NumericFieldOverflow(_)) => "22003",
             // query_canceled — operator polled the `CancelFlag` between
             // batches and short-circuited after a peer `CancelRequest`
             // flipped it. Mirrors PostgreSQL's `query_canceled`.
