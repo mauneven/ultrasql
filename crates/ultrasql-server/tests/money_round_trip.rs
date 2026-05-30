@@ -49,5 +49,25 @@ async fn money_cast_insert_select_and_extended_wire_type() {
         .expect("extended money query");
     assert_eq!(rows[0].columns()[0].type_().oid(), 790);
 
+    let arithmetic = client
+        .simple_query(
+            "SELECT '$1.25'::money + '$3.75'::money, \
+                    '$5.00'::money - '$1.25'::money",
+        )
+        .await
+        .expect("money arithmetic");
+    let values: Vec<Vec<String>> = arithmetic
+        .into_iter()
+        .filter_map(|message| match message {
+            tokio_postgres::SimpleQueryMessage::Row(row) => Some(
+                (0..row.len())
+                    .filter_map(|idx| row.get(idx).map(str::to_owned))
+                    .collect(),
+            ),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(values, vec![vec!["$5.00".to_owned(), "$3.75".to_owned()]]);
+
     shutdown(running).await;
 }

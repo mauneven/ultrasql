@@ -172,7 +172,7 @@ as a concise evidence ledger; roadmap stays for open gates only.
   with SQLSTATE `22003` for overflow, and invalid zero precision typmods are
   rejected at bind time with SQLSTATE `42804`; arbitrary precision remains open.
 - `MONEY` type surface, signed-cent storage, OID 790, wire, COPY, catalog
-  persistence, and behavior tests exist.
+  persistence, checked addition/subtraction, and behavior tests exist.
 - `CHAR(n)` / `bpchar` parser, binder, row codec, executor, OID 1042, COPY,
   catalog persistence, blank padding, assignment/cast truncation, and
   trailing-space comparison semantics exist.

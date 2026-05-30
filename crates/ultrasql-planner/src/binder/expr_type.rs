@@ -18,6 +18,9 @@ pub(super) fn binary_result_type(
             if matches!(op, BinaryOp::Add) && network_integer_add_type(&lt, &rt).is_some() {
                 return Ok(DataType::Inet);
             }
+            if matches!(op, BinaryOp::Add) && is_money_arithmetic(&lt, &rt) {
+                return Ok(DataType::Money);
+            }
             if matches!(lt, DataType::Null) {
                 Ok(rt)
             } else if matches!(rt, DataType::Null) {
@@ -38,6 +41,8 @@ pub(super) fn binary_result_type(
                 Ok(DataType::Inet)
             } else if lt.is_ip_network() && rt.is_ip_network() {
                 Ok(DataType::Int64)
+            } else if is_money_arithmetic(&lt, &rt) {
+                Ok(DataType::Money)
             } else if matches!(lt, DataType::Null) {
                 Ok(rt)
             } else if matches!(rt, DataType::Null) {
@@ -209,6 +214,10 @@ pub(super) fn binary_result_type(
         | BinaryOp::JsonHasAllKeys
         | BinaryOp::TextSearchMatch => Ok(DataType::Bool),
     }
+}
+
+fn is_money_arithmetic(left: &DataType, right: &DataType) -> bool {
+    matches!((left, right), (DataType::Money, DataType::Money))
 }
 
 fn network_integer_add_type(left: &DataType, right: &DataType) -> Option<DataType> {

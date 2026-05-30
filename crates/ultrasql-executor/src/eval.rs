@@ -3975,6 +3975,10 @@ fn integer_delta(value: &Value) -> Result<i64, EvalError> {
 /// [`EvalError::Type`]. Floating-point overflow produces `f64::INFINITY`
 /// (IEEE 754 semantics, consistent with PostgreSQL).
 fn numeric_arith(lv: Value, rv: Value, op: ArithOp) -> Result<Value, EvalError> {
+    if let Some(value) = money_arith(&lv, &rv, op)? {
+        return Ok(value);
+    }
+
     if let Some((left, right)) = decimal_float_operands(&lv, &rv) {
         return float64_arith(left, right, op);
     }
@@ -4017,6 +4021,25 @@ fn numeric_arith(lv: Value, rv: Value, op: ArithOp) -> Result<Value, EvalError> 
         (l, r) => Err(EvalError::Type(format!(
             "arithmetic type mismatch: {l:?} and {r:?}"
         ))),
+    }
+}
+
+fn money_arith(left: &Value, right: &Value, op: ArithOp) -> Result<Option<Value>, EvalError> {
+    match (left, right, op) {
+        (Value::Money(l), Value::Money(r), ArithOp::Add) => l
+            .checked_add(*r)
+            .map(Value::Money)
+            .map(Some)
+            .ok_or(EvalError::Overflow),
+        (Value::Money(l), Value::Money(r), ArithOp::Sub) => l
+            .checked_sub(*r)
+            .map(Value::Money)
+            .map(Some)
+            .ok_or(EvalError::Overflow),
+        (Value::Money(_), Value::Money(_), _) => Err(EvalError::Type(
+            "money arithmetic supports addition and subtraction".to_owned(),
+        )),
+        _ => Ok(None),
     }
 }
 
@@ -4920,6 +4943,13 @@ mod tests {
                 precision: None,
                 scale: Some(scale),
             },
+        }
+    }
+
+    fn lit_money(cents: i64) -> ScalarExpr {
+        ScalarExpr::Literal {
+            value: Value::Money(cents),
+            data_type: DataType::Money,
         }
     }
 
@@ -6361,6 +6391,25 @@ mod tests {
             ),
             Value::Text("else".to_owned())
         );
+    }
+
+    #[test]
+    fn money_addition_and_subtraction_evaluate() {
+        let add = Eval::new(ScalarExpr::Binary {
+            op: BinaryOp::Add,
+            left: Box::new(lit_money(125)),
+            right: Box::new(lit_money(375)),
+            data_type: DataType::Money,
+        });
+        assert_eq!(add.eval(&[]).expect("money add"), Value::Money(500));
+
+        let sub = Eval::new(ScalarExpr::Binary {
+            op: BinaryOp::Sub,
+            left: Box::new(lit_money(500)),
+            right: Box::new(lit_money(125)),
+            data_type: DataType::Money,
+        });
+        assert_eq!(sub.eval(&[]).expect("money sub"), Value::Money(375));
     }
 
     #[test]

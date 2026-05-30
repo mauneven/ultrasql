@@ -842,6 +842,18 @@ fn binds_text_literal_cast_to_money() {
 }
 
 #[test]
+fn binds_money_addition_and_subtraction() {
+    let cat = InMemoryCatalog::new();
+    for sql in [
+        "SELECT '$1.00'::money + '$2.50'::money",
+        "SELECT '$3.00'::money - '$1.25'::money",
+    ] {
+        let plan = parse_and_bind(sql, &cat).expect("bind ok");
+        assert_eq!(plan.schema().field_at(0).data_type, DataType::Money);
+    }
+}
+
+#[test]
 fn binds_create_table_char_and_bpchar_types() {
     let cat = InMemoryCatalog::new();
     let plan = parse_and_bind(
