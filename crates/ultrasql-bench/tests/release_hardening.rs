@@ -35,19 +35,36 @@ fn catalog_upgrade_story_is_documented_and_enforced() {
 fn backup_restore_smoke_runner_documents_real_verification() {
     let script = repo_file("benchmarks/backup_restore_smoke.sh");
     let docs = repo_file("docs/backup-restore.md");
+    let manifest = repo_file("benchmarks/results/latest/backup_restore_smoke_manifest.json");
 
     assert!(script.contains("backup_restore_smoke_manifest.json"));
     assert!(script.contains("ultrasql --basebackup"));
     assert!(script.contains("ultrasql --pg-dump"));
     assert!(script.contains("ultrasql --pg-restore"));
+    assert!(script.contains("DUMP_FORMATS"));
+    assert!(script.contains("custom directory tar"));
+    assert!(script.contains("for format in"));
+    assert!(script.contains("--dump-format \"$format\""));
+    assert!(script.contains("verify_restored_dump"));
     assert!(script.contains("SELECT COUNT(*) FROM backup_restore_smoke"));
     assert!(script.contains("SELECT payload FROM backup_restore_smoke WHERE id = 2"));
     assert!(script.contains("\"row_count_verified\""));
     assert!(script.contains("\"index_query_verified\""));
+    assert!(script.contains("\"dump_format_results\""));
+    assert!(script.contains("\"dump_formats_verified\""));
     assert!(script.contains("\"status\": \"not_available\""));
     assert!(docs.contains("row counts"));
     assert!(docs.contains("index query"));
+    assert!(docs.contains("custom, directory, and tar"));
     assert!(docs.contains("benchmarks/backup_restore_smoke.sh"));
+    assert!(manifest.contains("\"status\": \"measured\""));
+    assert!(manifest.contains("\"dump_formats_verified\""));
+    for format in ["custom", "directory", "tar"] {
+        assert!(
+            manifest.contains(&format!("\"format\": \"{format}\"")),
+            "backup/restore manifest missing {format} format evidence"
+        );
+    }
 }
 
 #[test]

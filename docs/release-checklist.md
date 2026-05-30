@@ -98,7 +98,7 @@ not in the PR-critical path.
 | item | code | test | benchmark or reason | docs | artifact |
 | --- | --- | --- | --- | --- | --- |
 | 69 Catalog upgrade story | `crates/ultrasql-server/src/catalog_version.rs` | `crates/ultrasql-server/tests/catalog_version_round_trip.rs` | no benchmark; startup safety guard | `docs/catalog-upgrades.md` | `catalog.version` in data dir |
-| 70 Backup/restore smoke | `ultrasql --basebackup`, `--pg-dump`, `--pg-restore`; `benchmarks/backup_restore_smoke.sh` | `crates/ultrasql-bench/tests/release_hardening.rs` | `benchmarks/backup_restore_smoke.sh` verifies row counts and index query | `docs/backup-restore.md` | `benchmarks/results/latest/backup_restore_smoke_manifest.json` |
+| 70 Backup/restore smoke | `ultrasql --basebackup`, `--pg-dump`, `--pg-restore`; `benchmarks/backup_restore_smoke.sh` | `crates/ultrasql-bench/tests/release_hardening.rs` | `benchmarks/backup_restore_smoke.sh` verifies row counts and index query for custom, directory, and tar dump formats | `docs/backup-restore.md` | `benchmarks/results/latest/backup_restore_smoke_manifest.json` |
 | 71 Config docs | server/CLI flags and benchmark envs | `crates/ultrasql-bench/tests/release_hardening.rs` | no benchmark; documentation surface | `docs/configuration.md` | release checklist entry |
 | 72 Security/ethics audit | repository rules and benchmark runners | `crates/ultrasql-bench/tests/release_hardening.rs` | no benchmark; provenance gate | `docs/security-ethics-audit.md` | audit command output in release notes |
 | 73 CI split | `.github/workflows/ci.yml`, `bench.yml`, `fuzz.yml`, `sanitizers.yml` | `crates/ultrasql-bench/tests/release_hardening.rs` | PR smoke vs nightly/manual full gates | this file | GitHub Actions run ids |
@@ -127,7 +127,7 @@ Before tagging v1.0, attach:
 - TPC-H SF10 and ClickBench artifacts or explicit setup-missing reasons,
 - Firebolt Core local artifacts or explicit Docker/setup-missing reasons,
 - AI/vector same-host pgvector certification artifact,
-- backup/restore smoke manifest,
+- backup/restore smoke manifest with custom, directory, and tar dump formats,
 - chaos recovery manifest,
 - docs site deployment URL or failed-run reason,
 - Docker image digest,

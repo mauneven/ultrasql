@@ -1,7 +1,44 @@
 {
   "basebackup_dir": "target/backup-restore-smoke/basebackup",
-  "created_at_unix": 1779393667.9713888,
-  "dump_path": "target/backup-restore-smoke/backup_restore_smoke.dump",
+  "created_at_unix": 1780111170.490747,
+  "dump_format_results": [
+    {
+      "dump_path": "target/backup-restore-smoke/backup_restore_smoke-custom.dump",
+      "format": "custom",
+      "index_query_result": "bravo",
+      "index_query_verified": true,
+      "restore_data_dir": "target/backup-restore-smoke/restored-data-custom",
+      "restored_row_count": "3",
+      "row_count_verified": true,
+      "source_row_count": "3"
+    },
+    {
+      "dump_path": "target/backup-restore-smoke/backup_restore_smoke-directory.dir",
+      "format": "directory",
+      "index_query_result": "bravo",
+      "index_query_verified": true,
+      "restore_data_dir": "target/backup-restore-smoke/restored-data-directory",
+      "restored_row_count": "3",
+      "row_count_verified": true,
+      "source_row_count": "3"
+    },
+    {
+      "dump_path": "target/backup-restore-smoke/backup_restore_smoke-tar.tar",
+      "format": "tar",
+      "index_query_result": "bravo",
+      "index_query_verified": true,
+      "restore_data_dir": "target/backup-restore-smoke/restored-data-tar",
+      "restored_row_count": "3",
+      "row_count_verified": true,
+      "source_row_count": "3"
+    }
+  ],
+  "dump_formats_verified": [
+    "custom",
+    "directory",
+    "tar"
+  ],
+  "dump_path": "target/backup-restore-smoke/backup_restore_smoke-custom.dump",
   "host": {
     "cpu": "arm",
     "machine": "arm64",
@@ -9,7 +46,7 @@
   },
   "index_query_result": "bravo",
   "index_query_verified": true,
-  "policy": "Backup/restore is measured only when basebackup, pg-dump, pg-restore, restored row count, and restored indexed query all pass.",
+  "policy": "Backup/restore is measured only when basebackup, pg-dump, pg-restore, restored row count, and restored indexed query all pass for every requested dump format.",
   "profile": "smoke",
   "reason": "ok",
   "restore_data_dir": "target/backup-restore-smoke/restored-data",

@@ -34,7 +34,6 @@ file focused on what still blocks production.
   `pg_statistic`, and `pg_statistic_ext` from heap storage.
 - Full public regression import still open for parser, type coercion,
   aggregate/window, and upstream isolation schedules.
-- Custom/directory/tar archive output and restore need workload certification.
 
 ### Performance Certification
 

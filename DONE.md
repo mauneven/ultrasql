@@ -116,6 +116,12 @@ as a concise evidence ledger; roadmap stays for open gates only.
   `benchmarks/results/latest/chaos_recovery_manifest.json`.
 - Backup/restore smoke runner covers `ultrasql --basebackup`,
   `ultrasql --pg-dump`, `ultrasql --pg-restore`, row counts, and indexed lookup.
+- Backup/restore dump-format certification now covers custom, directory, and
+  tar dump output. The 2026-05-30 smoke artifact
+  `benchmarks/results/latest/backup_restore_smoke_manifest.json` records
+  `status: measured`, `dump_formats_verified: ["custom", "directory", "tar"]`,
+  matching source/restored row counts, and indexed point-query result `bravo`
+  for every format.
 - Catalog upgrade story is documented and enforced with `catalog.version = 1`.
 - Security/ethics audit docs cover no proprietary tests, no closed-source
   code, and no fake benchmark claims.
