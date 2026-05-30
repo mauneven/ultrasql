@@ -330,7 +330,12 @@ pub fn sniff_csv_text(path: &str, input: &str) -> Result<CsvSniff, CsvError> {
         records.as_slice()
     };
     let names = if has_header {
-        records.first().expect("records checked non-empty").to_vec()
+        let Some(header) = records.first() else {
+            return Err(CsvError::new(
+                "sniff_csv found no records after header detection",
+            ));
+        };
+        header.to_vec()
     } else {
         (0..width).map(|idx| format!("column{idx}")).collect()
     };
@@ -576,9 +581,9 @@ pub fn read_csv_header(pattern: &str) -> Result<Vec<String>, CsvError> {
 /// Returns [`CsvError`] when no files match or the first file has no header.
 pub fn read_csv_header_from_specs(patterns: &[String]) -> Result<Vec<String>, CsvError> {
     let paths = expand_csv_path_specs(patterns)?;
-    let first = paths
-        .first()
-        .expect("expand_csv_path_specs returns non-empty paths");
+    let Some(first) = paths.first() else {
+        return Err(CsvError::new("no CSV files matched path specs"));
+    };
     let data = read_csv_data_from_path(first)?;
     let header = &data.header;
     if header.is_empty() || header.iter().any(String::is_empty) {

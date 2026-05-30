@@ -1677,8 +1677,11 @@ impl fmt::Display for Value {
             Self::BitString(v) => write!(f, "{v}"),
             Self::Network(v) => write!(f, "{v}"),
             Self::BitVec { dims, bytes } => {
-                let dims_usize =
-                    usize::try_from(*dims).expect("u32 fits in usize on supported targets");
+                let dims_usize = usize::try_from(*dims).map_err(|_| fmt::Error)?;
+                let required_bytes = dims_usize.div_ceil(8);
+                if bytes.len() < required_bytes {
+                    return Err(fmt::Error);
+                }
                 for idx in 0..dims_usize {
                     let byte_idx = idx / 8;
                     let bit_idx = idx % 8;

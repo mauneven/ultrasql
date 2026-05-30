@@ -367,6 +367,12 @@ as a concise evidence ledger; roadmap stays for open gates only.
   clippy::expect_used -W clippy::unwrap_used`, and
   `cargo clippy -p ultrasql-executor --all-targets --all-features -- -D
   warnings`.
+- Core bit-string display/counting, CSV header discovery, money formatting,
+  network bitwise operations, and bit-vector display now avoid production
+  `expect` paths and return deterministic fallbacks or formatting errors for
+  impossible conversion failures. Evidence:
+  `cargo test -p ultrasql-core --lib` and
+  `cargo clippy -p ultrasql-core --all-targets --all-features -- -D warnings`.
 
 ## Core SQL And Wire Protocol
 

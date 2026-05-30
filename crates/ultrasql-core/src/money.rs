@@ -91,8 +91,8 @@ pub fn format_money_text(cents: i64) -> String {
     }
     out.push('$');
     push_grouped_digits(&mut out, &dollars.to_string());
-    use std::fmt::Write as _;
-    write!(&mut out, ".{cents_part:02}").expect("write to String cannot fail");
+    out.push('.');
+    out.push_str(&format!("{cents_part:02}"));
     out
 }
 

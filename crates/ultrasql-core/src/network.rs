@@ -134,7 +134,7 @@ impl InetAddr {
         let width = self.max_prefix();
         let bits = !addr_bits(self.addr) & low_bits_mask(width);
         Self {
-            addr: bits_to_addr(bits, width).expect("masked IP bits fit address family"),
+            addr: bits_to_addr(bits, width).unwrap_or(self.addr),
             prefix: self.prefix,
         }
     }
@@ -399,12 +399,12 @@ impl NetworkValue {
             }
             (Self::MacAddr(left), Self::MacAddr(right)) => {
                 Some(Self::MacAddr(left.bitwise(right, |a, b| {
-                    u8::try_from(op(u128::from(a), u128::from(b)) & 0xff).expect("masked byte fits")
+                    masked_byte(op(u128::from(a), u128::from(b)))
                 })))
             }
             (Self::MacAddr8(left), Self::MacAddr8(right)) => {
                 Some(Self::MacAddr8(left.bitwise(right, |a, b| {
-                    u8::try_from(op(u128::from(a), u128::from(b)) & 0xff).expect("masked byte fits")
+                    masked_byte(op(u128::from(a), u128::from(b)))
                 })))
             }
             _ => None,
@@ -423,6 +423,10 @@ impl NetworkValue {
             _ => None,
         }
     }
+}
+
+fn masked_byte(value: u128) -> u8 {
+    u8::try_from(value & 0xff).unwrap_or_default()
 }
 
 impl fmt::Display for InetAddr {

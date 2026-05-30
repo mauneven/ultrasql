@@ -85,7 +85,9 @@ impl BitString {
     /// PostgreSQL text form.
     #[must_use]
     pub fn to_bit_text(&self) -> String {
-        let len = usize::try_from(self.len).expect("u32 fits in usize on supported targets");
+        let Some(len) = usize::try_from(self.len).ok() else {
+            return String::new();
+        };
         let mut out = String::with_capacity(len);
         for idx in 0..len {
             out.push(if self.bit(idx).unwrap_or(false) {
@@ -198,7 +200,9 @@ impl BitString {
     /// Count set bits.
     #[must_use]
     pub fn bit_count(&self) -> u32 {
-        let len = usize::try_from(self.len).expect("u32 fits in usize on supported targets");
+        let Some(len) = usize::try_from(self.len).ok() else {
+            return 0;
+        };
         (0..len)
             .filter(|idx| self.bit(*idx).unwrap_or(false))
             .count()
