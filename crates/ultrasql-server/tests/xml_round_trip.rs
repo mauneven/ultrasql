@@ -278,5 +278,29 @@ async fn xml_functions_validate_securely_and_extract_simple_xpath() {
         ]]
     );
 
+    assert_eq!(
+        simple_rows(
+            client
+                .simple_query(
+                    "SELECT \
+                        XMLPARSE(DOCUMENT '<root><item/></root>'), \
+                        XMLPARSE(CONTENT '<a/><b/>'), \
+                        XMLSERIALIZE(CONTENT XML '<root><item/></root>' AS TEXT)",
+                )
+                .await
+                .expect("xml parse and serialize syntax"),
+        ),
+        vec![vec![
+            "<root><item/></root>".to_owned(),
+            "<a/><b/>".to_owned(),
+            "<root><item/></root>".to_owned(),
+        ]]
+    );
+
+    client
+        .batch_execute("SELECT XMLPARSE(DOCUMENT '<a/><b/>')")
+        .await
+        .expect_err("XMLPARSE DOCUMENT rejects content fragments");
+
     shutdown(running).await;
 }

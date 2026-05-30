@@ -92,6 +92,47 @@ fn cast_expression_accepts_vector_family_type_modifiers() {
 }
 
 #[test]
+fn xml_parse_and_serialize_syntax_lower_to_builtin_calls() {
+    let stmt = parse(
+        "SELECT \
+            XMLPARSE(DOCUMENT '<root/>'), \
+            XMLSERIALIZE(CONTENT XML '<root/>' AS TEXT)",
+    );
+    let Statement::Select(s) = stmt else { panic!() };
+    let SelectItem::Expr {
+        expr: Expr::Call { name, args, .. },
+        ..
+    } = &s.projection[0]
+    else {
+        panic!("expected XMLPARSE builtin call");
+    };
+    assert_eq!(name.parts[0].value, "xmlparse");
+    assert_eq!(args.len(), 2);
+    assert!(matches!(
+        &args[0],
+        Expr::Literal(Literal::String { value, .. }) if value == "document"
+    ));
+
+    let SelectItem::Expr {
+        expr: Expr::Call { name, args, .. },
+        ..
+    } = &s.projection[1]
+    else {
+        panic!("expected XMLSERIALIZE builtin call");
+    };
+    assert_eq!(name.parts[0].value, "xmlserialize");
+    assert_eq!(args.len(), 3);
+    assert!(matches!(
+        &args[0],
+        Expr::Literal(Literal::String { value, .. }) if value == "content"
+    ));
+    assert!(matches!(
+        &args[2],
+        Expr::Literal(Literal::String { value, .. }) if value == "text"
+    ));
+}
+
+#[test]
 fn vector_typed_literal() {
     let expr = parse_expr("VECTOR '[1,2,3]'");
     let Expr::Literal(Literal::Typed {

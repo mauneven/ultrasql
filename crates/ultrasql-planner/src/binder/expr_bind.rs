@@ -1476,6 +1476,8 @@ fn builtin_return_type(func_name: &str, args: &[ScalarExpr]) -> Result<DataType,
         | "xml_is_well_formed_content"
         | "xml_is_well_formed_document"
         | "xpath_exists" => Ok(DataType::Bool),
+        "xmlparse" => Ok(DataType::Xml),
+        "xmlserialize" => Ok(DataType::Text { max_len: None }),
         "xpath" => Ok(DataType::Array(Box::new(DataType::Xml))),
         "pg_advisory_lock" | "pg_advisory_unlock_all" => Ok(DataType::Null),
         "pg_try_advisory_lock" | "pg_try_advisory_xact_lock" | "pg_advisory_unlock" => {
@@ -1608,6 +1610,8 @@ pub(super) fn is_supported_builtin(func_name: &str) -> bool {
             | "json_build_object"
             | "jsonb_set"
             | "jsonb_path_exists"
+            | "xmlparse"
+            | "xmlserialize"
             | "xml_is_well_formed"
             | "xml_is_well_formed_content"
             | "xml_is_well_formed_document"
@@ -1683,6 +1687,8 @@ fn validate_builtin_args(func_name: &str, args: &mut [ScalarExpr]) -> Result<(),
         "vector_norm" | "l2_norm" => validate_vector_norm_args(func_name, args),
         "vector_dims" => validate_vector_dims_args(args),
         "jsonb_path_exists" => validate_jsonb_path_exists_args(args),
+        "xmlparse" => validate_xmlparse_args(args),
+        "xmlserialize" => validate_xmlserialize_args(args),
         "xml_is_well_formed" | "xml_is_well_formed_content" | "xml_is_well_formed_document" => {
             validate_xml_well_formed_args(func_name, args)
         }
@@ -1854,10 +1860,57 @@ fn validate_xml_well_formed_args(func_name: &str, args: &[ScalarExpr]) -> Result
     validate_text_or_xml_arg(func_name, &args[0])
 }
 
+fn validate_xmlparse_args(args: &[ScalarExpr]) -> Result<(), PlanError> {
+    validate_exact_arg_count("xmlparse", args, 2)?;
+    validate_xml_mode_arg("xmlparse", &args[0])?;
+    validate_text_or_xml_arg("xmlparse", &args[1])
+}
+
+fn validate_xmlserialize_args(args: &[ScalarExpr]) -> Result<(), PlanError> {
+    validate_exact_arg_count("xmlserialize", args, 3)?;
+    validate_xml_mode_arg("xmlserialize", &args[0])?;
+    validate_text_or_xml_arg("xmlserialize", &args[1])?;
+    let Some(target) = literal_text_arg(&args[2]) else {
+        return Err(PlanError::TypeMismatch(
+            "xmlserialize: target type must be a parser-supplied text literal".to_owned(),
+        ));
+    };
+    if target.eq_ignore_ascii_case("text") {
+        return Ok(());
+    }
+    Err(PlanError::TypeMismatch(format!(
+        "xmlserialize: only AS TEXT is supported, got {target}"
+    )))
+}
+
 fn validate_xpath_args(func_name: &str, args: &[ScalarExpr]) -> Result<(), PlanError> {
     validate_exact_arg_count(func_name, args, 2)?;
     validate_text_or_xml_arg(func_name, &args[0])?;
     validate_text_or_xml_arg(func_name, &args[1])
+}
+
+fn validate_xml_mode_arg(func_name: &str, arg: &ScalarExpr) -> Result<(), PlanError> {
+    let Some(mode) = literal_text_arg(arg) else {
+        return Err(PlanError::TypeMismatch(format!(
+            "{func_name}: mode must be DOCUMENT or CONTENT"
+        )));
+    };
+    if mode.eq_ignore_ascii_case("document") || mode.eq_ignore_ascii_case("content") {
+        return Ok(());
+    }
+    Err(PlanError::TypeMismatch(format!(
+        "{func_name}: mode must be DOCUMENT or CONTENT, got {mode}"
+    )))
+}
+
+fn literal_text_arg(arg: &ScalarExpr) -> Option<&str> {
+    match arg {
+        ScalarExpr::Literal {
+            value: Value::Text(text) | Value::Char(text),
+            ..
+        } => Some(text),
+        _ => None,
+    }
 }
 
 fn validate_text_or_xml_arg(func_name: &str, arg: &ScalarExpr) -> Result<(), PlanError> {

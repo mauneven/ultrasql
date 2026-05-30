@@ -74,7 +74,7 @@ file focused on what still blocks production.
 - Full-text search: `TSVECTOR`, `TSQUERY`, ranking, headline, dictionaries, and
   GIN integration.
 - XML remaining surface: namespaces, full XPath axes/functions, `XMLTABLE`,
-  `XMLPARSE` / `XMLSERIALIZE` syntax, and function catalog parity.
+  and function catalog parity beyond the supported secure subset.
 - Locale/collation: ICU-backed collations, `CREATE COLLATION`, and `COLLATE`
   in definitions and `ORDER BY`.
 

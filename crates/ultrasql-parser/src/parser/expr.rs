@@ -580,6 +580,13 @@ impl<'src> Parser<'src> {
             // the source expression. We desugar to the canonical
             // `extract(unit_text, expr)` call shape so the binder can
             // dispatch through its usual function-resolution path.
+            if name.parts.len() == 1 && name.parts[0].value.eq_ignore_ascii_case("xmlparse") {
+                return self.parse_xmlparse_call(name);
+            }
+            if name.parts.len() == 1 && name.parts[0].value.eq_ignore_ascii_case("xmlserialize") {
+                return self.parse_xmlserialize_call(name);
+            }
+
             let is_extract =
                 name.parts.len() == 1 && name.parts[0].value.eq_ignore_ascii_case("extract");
             if is_extract && self.peek()?.kind != TokenKind::RParen {
@@ -723,6 +730,68 @@ impl<'src> Parser<'src> {
         } else {
             Ok(Expr::Column { name })
         }
+    }
+
+    fn parse_xmlparse_call(&mut self, name: ObjectName) -> Result<Expr, ParseError> {
+        let mode = self.parse_xml_mode()?;
+        let value = self.parse_expr()?;
+        let rp = self.expect(TokenKind::RParen, ")")?;
+        Ok(Expr::Call {
+            args: vec![mode, value],
+            distinct: false,
+            within_group: None,
+            over: None,
+            span: Span::new(name.span.start, rp.span.end),
+            name,
+        })
+    }
+
+    fn parse_xmlserialize_call(&mut self, name: ObjectName) -> Result<Expr, ParseError> {
+        let mode = self.parse_xml_mode()?;
+        let value = self.parse_expr()?;
+        self.expect(TokenKind::KwAs, "AS")?;
+        let target = self.parse_cast_type_name()?;
+        let rp = self.expect(TokenKind::RParen, ")")?;
+        Ok(Expr::Call {
+            args: vec![
+                mode,
+                value,
+                Expr::Literal(Literal::String {
+                    value: target.value,
+                    span: target.span,
+                }),
+            ],
+            distinct: false,
+            within_group: None,
+            over: None,
+            span: Span::new(name.span.start, rp.span.end),
+            name,
+        })
+    }
+
+    fn parse_xml_mode(&mut self) -> Result<Expr, ParseError> {
+        let tok = *self.peek()?;
+        if tok.kind != TokenKind::Identifier {
+            return Err(ParseError::Expected {
+                expected: "DOCUMENT or CONTENT",
+                found: tok.kind,
+                offset: tok.span.start as usize,
+            });
+        }
+        let raw = tok.text(self.source).unwrap_or("");
+        if !(raw.eq_ignore_ascii_case("document") || raw.eq_ignore_ascii_case("content")) {
+            return Err(ParseError::Expected {
+                expected: "DOCUMENT or CONTENT",
+                found: tok.kind,
+                offset: tok.span.start as usize,
+            });
+        }
+        let value = raw.to_ascii_lowercase();
+        let tok = self.advance()?;
+        Ok(Expr::Literal(Literal::String {
+            value,
+            span: tok.span,
+        }))
     }
 
     fn parse_within_group_clause(

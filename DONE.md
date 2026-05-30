@@ -136,6 +136,9 @@ as a concise evidence ledger; roadmap stays for open gates only.
 - Catalog upgrade story is documented and enforced with `catalog.version = 1`.
 - Security/ethics audit docs cover no proprietary tests, no closed-source
   code, and no fake benchmark claims.
+- Constant `SELECT` result execution now propagates scalar evaluation failures
+  instead of silently returning NULL. Evidence:
+  `cargo test -p ultrasql-executor result_propagates_constant_eval_errors`.
 
 ## Core SQL And Wire Protocol
 
@@ -212,6 +215,10 @@ as a concise evidence ledger; roadmap stays for open gates only.
   `xpath_exists` subset for absolute element paths with optional attribute
   equality filters. DTD declarations, external entity expansion, unknown entity
   references, and pre-root junk are rejected.
+- XML syntax now covers `XMLPARSE(DOCUMENT|CONTENT ...)` and
+  `XMLSERIALIZE(DOCUMENT|CONTENT ... AS TEXT)`, with malformed `DOCUMENT`
+  inputs rejected through the wire path. Evidence:
+  `cargo test -p ultrasql-server --test xml_round_trip xml_functions_validate_securely_and_extract_simple_xpath`.
 - Ordered-set aggregates `PERCENTILE_CONT` and `PERCENTILE_DISC` have plan shape
   and wire coverage.
 - Portable scalar helpers now cover `COALESCE`, `IFNULL` / `NVL`,

@@ -327,6 +327,8 @@ fn eval_function_call(
         "json_build_object" => eval_json_build_object(args),
         "jsonb_set" => eval_jsonb_set(args),
         "jsonb_path_exists" => eval_jsonb_path_exists(args),
+        "xmlparse" => eval_xmlparse(args),
+        "xmlserialize" => eval_xmlserialize(args),
         "xml_is_well_formed" | "xml_is_well_formed_content" => {
             eval_xml_is_well_formed(args, XmlWellFormedMode::Content)
         }
@@ -2292,6 +2294,73 @@ fn eval_xml_is_well_formed(args: &[Value], mode: XmlWellFormedMode) -> Result<Va
     Ok(Value::Bool(ok))
 }
 
+fn eval_xmlparse(args: &[Value]) -> Result<Value, EvalError> {
+    if args.len() != 2 {
+        return Err(EvalError::Type(format!(
+            "xmlparse: expected 2 args, got {}",
+            args.len()
+        )));
+    }
+    let Some(mode) = xml_mode_arg("xmlparse", args, 0)? else {
+        return Ok(Value::Null);
+    };
+    let Some(text) = xml_text_arg("xmlparse", args, 1)? else {
+        return Ok(Value::Null);
+    };
+    parse_xml_value("xmlparse", mode, text)
+}
+
+fn eval_xmlserialize(args: &[Value]) -> Result<Value, EvalError> {
+    if args.len() != 3 {
+        return Err(EvalError::Type(format!(
+            "xmlserialize: expected 3 args, got {}",
+            args.len()
+        )));
+    }
+    let Some(mode) = xml_mode_arg("xmlserialize", args, 0)? else {
+        return Ok(Value::Null);
+    };
+    let Some(text) = xml_text_arg("xmlserialize", args, 1)? else {
+        return Ok(Value::Null);
+    };
+    let Some(target) = xml_text_arg("xmlserialize", args, 2)? else {
+        return Ok(Value::Null);
+    };
+    if !target.eq_ignore_ascii_case("text") {
+        return Err(EvalError::Type(format!(
+            "xmlserialize: only AS TEXT is supported, got {target}"
+        )));
+    }
+    let parsed = parse_xml_value("xmlserialize", mode, text)?;
+    let Value::Xml(text) = parsed else {
+        unreachable!("parse_xml_value returns XML")
+    };
+    Ok(Value::Text(text))
+}
+
+fn parse_xml_value(
+    function: &'static str,
+    mode: XmlWellFormedMode,
+    text: &str,
+) -> Result<Value, EvalError> {
+    let text = text.trim();
+    if text.is_empty() {
+        return Err(EvalError::Type(format!("{function}: empty XML input")));
+    }
+    let valid = match mode {
+        XmlWellFormedMode::Content => xml_content_is_well_formed(text),
+        XmlWellFormedMode::Document => xml_document_is_well_formed(text),
+    };
+    if valid {
+        return Ok(Value::Xml(text.to_owned()));
+    }
+    let shape = match mode {
+        XmlWellFormedMode::Content => "well-formed XML content",
+        XmlWellFormedMode::Document => "well-formed XML document",
+    };
+    Err(EvalError::Type(format!("{function}: expected {shape}")))
+}
+
 fn eval_xpath_exists(args: &[Value]) -> Result<Value, EvalError> {
     if args.len() != 2 {
         return Err(EvalError::Type(format!(
@@ -2351,6 +2420,25 @@ fn xml_text_arg<'a>(
             "{function}: expected text or xml, got {:?}",
             other.data_type()
         ))),
+    }
+}
+
+fn xml_mode_arg(
+    function: &'static str,
+    args: &[Value],
+    idx: usize,
+) -> Result<Option<XmlWellFormedMode>, EvalError> {
+    let Some(mode) = xml_text_arg(function, args, idx)? else {
+        return Ok(None);
+    };
+    if mode.eq_ignore_ascii_case("content") {
+        Ok(Some(XmlWellFormedMode::Content))
+    } else if mode.eq_ignore_ascii_case("document") {
+        Ok(Some(XmlWellFormedMode::Document))
+    } else {
+        Err(EvalError::Type(format!(
+            "{function}: mode must be DOCUMENT or CONTENT, got {mode}"
+        )))
     }
 }
 
@@ -5360,6 +5448,47 @@ mod tests {
             Value::Null
         );
         assert!(eval_fn_err("xml_is_well_formed", vec![]).contains("expected 1 arg"));
+        assert_eq!(
+            eval_fn(
+                "xmlparse",
+                vec![
+                    Value::Text("document".into()),
+                    Value::Text("<root/>".into())
+                ]
+            ),
+            Value::Xml("<root/>".into())
+        );
+        assert_eq!(
+            eval_fn(
+                "xmlparse",
+                vec![
+                    Value::Text("content".into()),
+                    Value::Text("<a/><b/>".into())
+                ]
+            ),
+            Value::Xml("<a/><b/>".into())
+        );
+        assert!(
+            eval_fn_err(
+                "xmlparse",
+                vec![
+                    Value::Text("document".into()),
+                    Value::Text("<a/><b/>".into())
+                ]
+            )
+            .contains("well-formed XML document")
+        );
+        assert_eq!(
+            eval_fn(
+                "xmlserialize",
+                vec![
+                    Value::Text("content".into()),
+                    Value::Xml("<root/>".into()),
+                    Value::Text("text".into())
+                ]
+            ),
+            Value::Text("<root/>".into())
+        );
 
         assert!(eval_fn_err("does_not_exist", vec![]).contains("function not implemented"));
     }
