@@ -200,6 +200,7 @@ where
                 }
             }
         }
+        let mut privilege_grants_removed = false;
         for name in sequences {
             if !drop_set.contains(&name.to_ascii_lowercase()) {
                 continue;
@@ -216,6 +217,13 @@ where
             }
             self.state.sequences.remove(name);
             self.sequence_state.forget(name);
+            privilege_grants_removed |= self
+                .state
+                .privilege_catalog
+                .remove_object_grants(crate::auth::PrivilegeObjectKind::Sequence, name);
+        }
+        if privilege_grants_removed {
+            self.state.persist_privilege_metadata()?;
         }
         self.plan_cache_invalidate();
         Ok(result_encoder::run_ddl_command("DROP SEQUENCE"))

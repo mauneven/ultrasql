@@ -179,6 +179,93 @@ async fn drop_table_removes_table_privilege_grants() {
     shutdown(running).await;
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn drop_sequence_removes_sequence_privilege_grants() {
+    let data_dir = tempfile::TempDir::new().expect("temp data dir");
+    let metadata_path = data_dir.path().join("pg_privileges.meta");
+
+    let running = start_persistent_server(data_dir.path(), "privilege_drop_sequence").await;
+    let client = &running.client;
+    client
+        .batch_execute("CREATE ROLE tester SUPERUSER LOGIN")
+        .await
+        .expect("register admin role");
+    client
+        .batch_execute("CREATE ROLE analyst LOGIN")
+        .await
+        .expect("create analyst role");
+    client
+        .batch_execute("CREATE SEQUENCE privilege_drop_seq")
+        .await
+        .expect("create privilege sequence");
+    client
+        .batch_execute("GRANT USAGE, SELECT ON SEQUENCE privilege_drop_seq TO analyst")
+        .await
+        .expect("grant sequence privileges");
+    let before_drop = std::fs::read_to_string(&metadata_path).expect("privilege metadata exists");
+    assert!(
+        before_drop.contains("privilege_drop_seq"),
+        "privilege metadata should record sequence grants before drop: {before_drop}"
+    );
+
+    client
+        .batch_execute("DROP SEQUENCE privilege_drop_seq")
+        .await
+        .expect("drop privilege sequence");
+    let stale = client
+        .query_one(
+            "SELECT \
+                has_sequence_privilege('analyst', 'privilege_drop_seq', 'USAGE'), \
+                has_sequence_privilege('analyst', 'privilege_drop_seq', 'SELECT')",
+            &[],
+        )
+        .await
+        .expect("privilege checks after sequence drop");
+    assert!(
+        !stale.get::<_, bool>(0),
+        "dropped sequence must clear USAGE grants"
+    );
+    assert!(
+        !stale.get::<_, bool>(1),
+        "dropped sequence must clear SELECT grants"
+    );
+    shutdown(running).await;
+
+    let after_drop = std::fs::read_to_string(&metadata_path).expect("privilege metadata exists");
+    assert!(
+        !after_drop.contains("privilege_drop_seq"),
+        "dropped sequence grants must be removed from privilege metadata: {after_drop}"
+    );
+
+    let running =
+        start_persistent_server(data_dir.path(), "privilege_drop_sequence_recreate").await;
+    running
+        .client
+        .batch_execute("CREATE SEQUENCE privilege_drop_seq")
+        .await
+        .expect("recreate privilege sequence");
+    let recreated = running
+        .client
+        .query_one(
+            "SELECT \
+                has_sequence_privilege('analyst', 'privilege_drop_seq', 'USAGE'), \
+                has_sequence_privilege('analyst', 'privilege_drop_seq', 'SELECT')",
+            &[],
+        )
+        .await
+        .expect("privilege checks after sequence recreate");
+    assert!(
+        !recreated.get::<_, bool>(0),
+        "recreated sequence must not inherit stale USAGE grant"
+    );
+    assert!(
+        !recreated.get::<_, bool>(1),
+        "recreated sequence must not inherit stale SELECT grant"
+    );
+
+    shutdown(running).await;
+}
+
 #[tokio::test]
 async fn column_privileges_gate_select_insert_and_update_targets() {
     let running = start_sample_server("column_privilege_catalog_test").await;

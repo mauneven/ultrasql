@@ -680,6 +680,10 @@ as a concise evidence ledger; roadmap stays for open gates only.
   durable `pg_privileges.meta`, so a recreated table cannot inherit stale ACLs
   by name. Evidence:
   `cargo test -p ultrasql-server --test privilege_catalog_round_trip`.
+- Dropped sequences remove sequence privilege grants from memory and durable
+  `pg_privileges.meta`, so a recreated sequence cannot inherit stale ACLs by
+  name. Evidence:
+  `cargo test -p ultrasql-server --test privilege_catalog_round_trip`.
 - `DROP SEQUENCE` dependency tracking now treats SERIAL/identity column defaults
   as dependents: `RESTRICT` blocks sequence drops while defaults reference the
   sequence, and `CASCADE` detaches those defaults before removing the sequence.
