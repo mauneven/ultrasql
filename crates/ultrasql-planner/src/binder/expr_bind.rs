@@ -2355,6 +2355,9 @@ fn fold_signed_literal(expr: &mut ScalarExpr) {
                 data_type.clone(),
             )
         }),
+        (UnaryOp::Neg, Value::Money(v)) => v
+            .checked_neg()
+            .map(|neg| (Value::Money(neg), data_type.clone())),
         _ => None,
     };
 
@@ -3238,7 +3241,7 @@ pub(super) fn bind_unary(
     let inner_ty = bound.data_type();
     let data_type = match op {
         UnaryOp::Neg | UnaryOp::Pos => {
-            if inner_ty.is_numeric() {
+            if inner_ty.is_numeric() || matches!(inner_ty, DataType::Money) {
                 inner_ty
             } else if matches!(inner_ty, DataType::Null) {
                 DataType::Null
@@ -3272,11 +3275,13 @@ pub(super) fn bind_unary(
             }
         }
     };
-    Ok(ScalarExpr::Unary {
+    let mut expr = ScalarExpr::Unary {
         op,
         expr: Box::new(bound),
         data_type,
-    })
+    };
+    fold_signed_literal(&mut expr);
+    Ok(expr)
 }
 
 #[allow(clippy::too_many_lines)]

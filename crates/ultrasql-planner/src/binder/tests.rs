@@ -854,6 +854,22 @@ fn binds_money_addition_and_subtraction() {
 }
 
 #[test]
+fn binds_money_unary_signs() {
+    let cat = InMemoryCatalog::new();
+    let plan = parse_and_bind("SELECT -('$1.25'::money), +'$2.00'::money", &cat).expect("bind ok");
+    let LogicalPlan::Project { exprs, schema, .. } = plan else {
+        panic!("expected Project");
+    };
+    assert_eq!(schema.field_at(0).data_type, DataType::Money);
+    assert_eq!(schema.field_at(1).data_type, DataType::Money);
+    let ScalarExpr::Literal { value, data_type } = &exprs[0].0 else {
+        panic!("expected folded negative money literal");
+    };
+    assert_eq!(value, &Value::Money(-125));
+    assert_eq!(data_type, &DataType::Money);
+}
+
+#[test]
 fn binds_create_table_char_and_bpchar_types() {
     let cat = InMemoryCatalog::new();
     let plan = parse_and_bind(

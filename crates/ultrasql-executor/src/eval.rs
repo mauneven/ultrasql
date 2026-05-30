@@ -3131,6 +3131,7 @@ fn apply_unary(op: UnaryOp, val: Value) -> Result<Value, EvalError> {
             Value::Int64(v) => v.checked_neg().map(Value::Int64).ok_or(EvalError::Overflow),
             Value::Float32(v) => Ok(Value::Float32(-v)),
             Value::Float64(v) => Ok(Value::Float64(-v)),
+            Value::Money(v) => v.checked_neg().map(Value::Money).ok_or(EvalError::Overflow),
             other => Err(EvalError::Type(format!(
                 "unary negation not defined for {other:?}"
             ))),
@@ -6410,6 +6411,23 @@ mod tests {
             data_type: DataType::Money,
         });
         assert_eq!(sub.eval(&[]).expect("money sub"), Value::Money(375));
+    }
+
+    #[test]
+    fn money_unary_signs_evaluate() {
+        let neg = Eval::new(ScalarExpr::Unary {
+            op: UnaryOp::Neg,
+            expr: Box::new(lit_money(125)),
+            data_type: DataType::Money,
+        });
+        assert_eq!(neg.eval(&[]).expect("money neg"), Value::Money(-125));
+
+        let pos = Eval::new(ScalarExpr::Unary {
+            op: UnaryOp::Pos,
+            expr: Box::new(lit_money(125)),
+            data_type: DataType::Money,
+        });
+        assert_eq!(pos.eval(&[]).expect("money pos"), Value::Money(125));
     }
 
     #[test]
