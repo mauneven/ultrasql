@@ -30,8 +30,6 @@ file focused on what still blocks production.
 - Serializable isolation remains `relation-level SSI`, `not predicate-precise`
   SSI. Implement predicate-precise SSI before broad serializable claims.
 - Durable expression/default/constraint bootstrap must survive restart.
-- Persistent typed-catalog decoder must bootstrap user tables, indexes,
-  `pg_statistic`, and `pg_statistic_ext` from heap storage.
 - Full public regression import still open for parser, type coercion,
   aggregate/window, and upstream isolation schedules.
 

@@ -122,6 +122,12 @@ as a concise evidence ledger; roadmap stays for open gates only.
   `status: measured`, `dump_formats_verified: ["custom", "directory", "tar"]`,
   matching source/restored row counts, and indexed point-query result `bravo`
   for every format.
+- Persistent typed-catalog bootstrap now reloads user tables, indexes,
+  `pg_statistic`, and `pg_statistic_ext` from heap storage and hydrates the
+  optimizer stats catalog after WAL commit-status recovery. Evidence:
+  `crates/ultrasql-server/tests/analyze_round_trip.rs` covers `ANALYZE`
+  statistics surviving restart as both `pg_statistic` rows and cost-model
+  `lookup_relation_stats` entries.
 - Catalog upgrade story is documented and enforced with `catalog.version = 1`.
 - Security/ethics audit docs cover no proprietary tests, no closed-source
   code, and no fake benchmark claims.

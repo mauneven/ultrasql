@@ -90,9 +90,9 @@ pub trait StatsCatalog: Send + Sync {
 /// Default in-memory [`StatsCatalog`] implementation.
 ///
 /// Statistics are stored in an `AHashMap<String, RelationStats>` keyed by
-/// the case-folded table name. This catalog is not persistent: statistics
-/// survive only for the lifetime of the process. Persistent storage is a
-/// wave 8 task.
+/// the case-folded table name. The map itself is process-local; WAL-backed
+/// server startup may hydrate it from durable catalog rows before query
+/// planning begins.
 ///
 /// ## Usage
 ///
