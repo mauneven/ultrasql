@@ -80,7 +80,7 @@ impl<L: PageLoader + 'static> HeapTarget for HeapAccess<L> {
         let rel = page_id.relation;
 
         // Ensure the block counter reflects this block.
-        self.advance_counter(rel, page_id.block);
+        self.advance_counter(rel, page_id.block)?;
 
         // Obtain an exclusive pin on the page.
         let guard = self
@@ -140,9 +140,9 @@ impl<L: PageLoader + 'static> HeapTarget for HeapAccess<L> {
         let old_page_id = payload.old_tid.page;
 
         // Ensure block counters cover both pages.
-        self.advance_counter(new_page_id.relation, new_page_id.block);
+        self.advance_counter(new_page_id.relation, new_page_id.block)?;
         if old_page_id != new_page_id {
-            self.advance_counter(old_page_id.relation, old_page_id.block);
+            self.advance_counter(old_page_id.relation, old_page_id.block)?;
         }
 
         // Write the new tuple onto its page.
@@ -257,7 +257,7 @@ impl<L: PageLoader + 'static> HeapTarget for HeapAccess<L> {
         record_lsn: Lsn,
     ) -> Result<(), ApplyError> {
         let page_id = payload.tid.page;
-        self.advance_counter(page_id.relation, page_id.block);
+        self.advance_counter(page_id.relation, page_id.block)?;
 
         let guard = self
             .pool
@@ -346,7 +346,7 @@ impl<L: PageLoader + 'static> HeapTarget for HeapAccess<L> {
     ) -> Result<(), ApplyError> {
         let page_id = payload.tid.page;
         let rel = page_id.relation;
-        self.advance_counter(rel, page_id.block);
+        self.advance_counter(rel, page_id.block)?;
 
         let guard = self
             .pool
@@ -475,7 +475,7 @@ impl<L: PageLoader + 'static> HeapTarget for HeapAccess<L> {
     ) -> Result<(), ApplyError> {
         let page_id = payload.page;
         let rel = page_id.relation;
-        self.advance_counter(rel, page_id.block);
+        self.advance_counter(rel, page_id.block)?;
 
         let guard = self
             .pool
@@ -587,7 +587,7 @@ impl<L: PageLoader + 'static> HeapTarget for HeapAccess<L> {
         record_lsn: Lsn,
     ) -> Result<(), ApplyError> {
         let page_id = payload.tid.page;
-        self.advance_counter(page_id.relation, page_id.block);
+        self.advance_counter(page_id.relation, page_id.block)?;
 
         let guard = self
             .pool
@@ -671,7 +671,7 @@ impl<L: PageLoader + 'static> HeapTarget for HeapAccess<L> {
         use ultrasql_core::constants::PAGE_SIZE;
 
         let page_id = payload.page;
-        self.advance_counter(page_id.relation, page_id.block);
+        self.advance_counter(page_id.relation, page_id.block)?;
 
         let guard = self
             .pool
@@ -806,12 +806,22 @@ impl<L: PageLoader> HeapAccess<L> {
     /// Called by the applier when it writes to a block during recovery to
     /// ensure that post-recovery scans driven by `block_count()` cover all
     /// replayed blocks.
-    pub(crate) fn advance_counter(&self, rel: ultrasql_core::RelationId, block: BlockNumber) {
+    pub(crate) fn advance_counter(
+        &self,
+        rel: ultrasql_core::RelationId,
+        block: BlockNumber,
+    ) -> Result<(), ApplyError> {
         let counter = self.counter_for(rel);
         let needed = block
             .raw()
             .checked_add(1)
-            .expect("block number overflow in advance_counter; block is u32::MAX");
+            .ok_or_else(|| ApplyError::Refused {
+                operation: "advance_counter",
+                detail: format!(
+                    "block {} cannot be represented as exclusive block_count",
+                    block.raw()
+                ),
+            })?;
         // CAS loop: advance only if the current value is less than `needed`.
         let mut current = counter.load(Ordering::Acquire);
         while current < needed {
@@ -825,6 +835,7 @@ impl<L: PageLoader> HeapAccess<L> {
                 Err(actual) => current = actual,
             }
         }
+        Ok(())
     }
 }
 
@@ -838,7 +849,7 @@ mod tests {
     use ultrasql_core::{BlockNumber, CommandId, Lsn, PageId, RelationId, Result, TupleId, Xid};
     use ultrasql_mvcc::TupleHeader;
     use ultrasql_mvcc::tuple_header::TUPLE_HEADER_SIZE;
-    use ultrasql_wal::applier::HeapTarget;
+    use ultrasql_wal::applier::{ApplyError, HeapTarget};
     use ultrasql_wal::payload::{
         BTreeOpKind, BTreeOpPayload, FullPageWritePayload, HeapDeletePayload, HeapInsertPayload,
     };
@@ -1220,10 +1231,30 @@ mod tests {
     #[test]
     fn advance_counter_updates_block_count() {
         let heap = make_heap();
-        heap.advance_counter(rel(), BlockNumber::new(4));
+        heap.advance_counter(rel(), BlockNumber::new(4)).unwrap();
         assert_eq!(heap.block_count(rel()), 5);
         // Advancing to a lower block must not decrease the counter.
-        heap.advance_counter(rel(), BlockNumber::new(2));
+        heap.advance_counter(rel(), BlockNumber::new(2)).unwrap();
         assert_eq!(heap.block_count(rel()), 5);
+    }
+
+    #[test]
+    fn apply_insert_rejects_unrepresentable_block_count_without_panic() {
+        let heap = make_heap();
+        let tid = tuple_id(u32::MAX, 0);
+        let payload = HeapInsertPayload {
+            tid,
+            tuple_bytes: minimal_tuple(1, tid),
+        };
+
+        let result = heap.apply_insert(&payload);
+
+        assert!(matches!(
+            result,
+            Err(ApplyError::Refused {
+                operation: "advance_counter",
+                ..
+            })
+        ));
     }
 }

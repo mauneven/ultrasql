@@ -494,6 +494,13 @@ as a concise evidence ledger; roadmap stays for open gates only.
   checkpointer_flushes_dirty_pages -- --ignored --nocapture`, and
   `cargo clippy -p ultrasql-storage --all-targets --all-features -- -D
   warnings`.
+- WAL applier block-counter maintenance now rejects unrepresentable
+  `u32::MAX` page blocks with a typed replay error instead of panicking during
+  recovery. Evidence: `cargo test -p ultrasql-storage
+  apply_insert_rejects_unrepresentable_block_count_without_panic --
+  --nocapture`, `cargo test -p ultrasql-storage wal_applier -- --nocapture`,
+  and `cargo clippy -p ultrasql-storage --all-targets --all-features -- -D
+  warnings`.
 
 ## Core SQL And Wire Protocol
 
