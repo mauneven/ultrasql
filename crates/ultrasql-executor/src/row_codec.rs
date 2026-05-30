@@ -245,7 +245,8 @@ impl RowCodec {
                         have: bytes.len(),
                     });
                 }
-                let raw: [u8; 8] = bytes[1..9].try_into().expect("len checked above");
+                let mut cursor = 1;
+                let raw = read_fixed::<8>(bytes, &mut cursor)?;
                 let v0 = i64::from_le_bytes(raw);
                 if let ColumnBuilder::Int64 { data, nulls } = &mut builders[0] {
                     data.push(v0);
@@ -262,8 +263,9 @@ impl RowCodec {
                         have: bytes.len(),
                     });
                 }
-                let r0: [u8; 8] = bytes[1..9].try_into().expect("len checked above");
-                let r1: [u8; 8] = bytes[9..17].try_into().expect("len checked above");
+                let mut cursor = 1;
+                let r0 = read_fixed::<8>(bytes, &mut cursor)?;
+                let r1 = read_fixed::<8>(bytes, &mut cursor)?;
                 let v0 = i64::from_le_bytes(r0);
                 let v1 = i64::from_le_bytes(r1);
                 let (head, tail) = builders.split_at_mut(1);

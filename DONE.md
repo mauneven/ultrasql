@@ -217,6 +217,9 @@ as a concise evidence ledger; roadmap stays for open gates only.
   `Utf8Error` variant instead of constructing the error through
   `expect_err`, preserving the no-allocation validation path. Evidence:
   `cargo test -p ultrasql-executor row_codec`.
+- Row codec fixed-width `Int64` builder fast paths now use the shared
+  `read_fixed` typed truncation helper instead of production `try_into`
+  `expect` calls. Evidence: `cargo test -p ultrasql-executor row_codec`.
 
 ## Core SQL And Wire Protocol
 
