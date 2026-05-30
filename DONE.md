@@ -669,6 +669,9 @@ as a concise evidence ledger; roadmap stays for open gates only.
   as dependents: `RESTRICT` blocks sequence drops while defaults reference the
   sequence, and `CASCADE` detaches those defaults before removing the sequence.
   Evidence: `cargo test -p ultrasql-server --test sequence_round_trip`.
+- `DROP ROLE` now rejects roles that still own live tables or still appear in
+  object/default privilege grants, avoiding stale ownership and ACL references.
+  Evidence: `cargo test -p ultrasql-server --test role_ddl_round_trip`.
 
 ## Security And Client Certification
 

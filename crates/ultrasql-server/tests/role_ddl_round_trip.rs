@@ -91,6 +91,50 @@ async fn create_alter_drop_role_and_user_update_catalog_views() {
     shutdown(running).await;
 }
 
+#[tokio::test]
+async fn drop_role_rejects_owned_table_until_object_is_dropped() {
+    let running = start_sample_server("role_ddl_test").await;
+    let client = &running.client;
+
+    client
+        .batch_execute("CREATE ROLE tester SUPERUSER LOGIN")
+        .await
+        .expect("register tester role");
+    client
+        .batch_execute("CREATE ROLE object_owner LOGIN")
+        .await
+        .expect("create object owner");
+    client
+        .batch_execute("SET ROLE object_owner")
+        .await
+        .expect("set role to object owner");
+    client
+        .batch_execute("CREATE TABLE role_owned_table (id INT)")
+        .await
+        .expect("create owned table");
+    client
+        .batch_execute("RESET ROLE")
+        .await
+        .expect("reset role");
+
+    let restricted = client
+        .batch_execute("DROP ROLE object_owner")
+        .await
+        .expect_err("owned table must block DROP ROLE");
+    assert_eq!(restricted.code().expect("SQLSTATE").code(), "2BP01");
+
+    client
+        .batch_execute("DROP TABLE role_owned_table")
+        .await
+        .expect("drop owned table");
+    client
+        .batch_execute("DROP ROLE object_owner")
+        .await
+        .expect("drop role after owned object removed");
+
+    shutdown(running).await;
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn role_catalog_survives_restart() {
     let data_dir = tempfile::TempDir::new().expect("temp data dir");

@@ -88,6 +88,18 @@ where
                 "execute_drop_role called with non-DropRole plan",
             ));
         };
+        for role in roles {
+            if self.state.role_catalog.lookup_role(role).is_none() {
+                continue;
+            }
+            let dependencies = self.role_drop_dependencies(role);
+            if !dependencies.is_empty() {
+                return Err(ServerError::DependentObjectsStillExist(format!(
+                    "cannot drop role {role} because other objects depend on it: {}",
+                    dependencies.join(", ")
+                )));
+            }
+        }
         let before_roles = self.state.role_catalog.list_roles();
         let before_memberships = self.state.role_catalog.list_memberships();
         for role in roles {
@@ -110,6 +122,61 @@ where
         }
         self.plan_cache_invalidate();
         Ok(result_encoder::run_ddl_command("DROP ROLE"))
+    }
+
+    fn role_drop_dependencies(&self, role: &str) -> Vec<String> {
+        let role = role.to_ascii_lowercase();
+        let snapshot = self.state.catalog_snapshot();
+        let mut dependencies = Vec::new();
+
+        for item in self.state.row_security.iter() {
+            let runtime = item.value();
+            if runtime.owner_role.eq_ignore_ascii_case(&role)
+                && let Some(table) = snapshot.tables_by_oid.get(item.key())
+            {
+                dependencies.push(format!("table {}", table.name));
+            }
+        }
+
+        for grant in self.state.privilege_catalog.list_grants() {
+            if grant.grantee.eq_ignore_ascii_case(&role) {
+                dependencies.push(format!(
+                    "{:?} privilege grant on {} to role",
+                    grant.object_kind, grant.object_name
+                ));
+            }
+            if grant.grantor.eq_ignore_ascii_case(&role) {
+                dependencies.push(format!(
+                    "{:?} privilege grant on {} by role",
+                    grant.object_kind, grant.object_name
+                ));
+            }
+        }
+
+        for grant in self.state.privilege_catalog.list_default_grants() {
+            if grant.owner_role.eq_ignore_ascii_case(&role) {
+                dependencies.push(format!(
+                    "default {:?} privileges for owned objects",
+                    grant.object_kind
+                ));
+            }
+            if grant.grantee.eq_ignore_ascii_case(&role) {
+                dependencies.push(format!(
+                    "default {:?} privilege grant to role",
+                    grant.object_kind
+                ));
+            }
+            if grant.grantor.eq_ignore_ascii_case(&role) {
+                dependencies.push(format!(
+                    "default {:?} privilege grant by role",
+                    grant.object_kind
+                ));
+            }
+        }
+
+        dependencies.sort();
+        dependencies.dedup();
+        dependencies
     }
 
     pub(crate) fn execute_grant_role(
