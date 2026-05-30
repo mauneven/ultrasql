@@ -407,6 +407,12 @@ as a concise evidence ledger; roadmap stays for open gates only.
   `cargo test -p ultrasql-storage wal`,
   `cargo check --workspace --all-targets`, and clippy for the touched WAL,
   storage, server, CLI, and bench crates.
+- Vector parallel filter+sum fan-out now joins all workers and falls back to
+  the serial kernel if a worker panics instead of panicking in the caller.
+  Evidence: `cargo test -p ultrasql-vec par_above_threshold_matches_serial`,
+  `cargo test -p ultrasql-vec prop_par_matches_serial`,
+  `cargo test -p ultrasql-vec prop_dict_kernel_matches_dense`, and
+  `cargo clippy -p ultrasql-vec --all-targets --all-features -- -D warnings`.
 
 ## Core SQL And Wire Protocol
 

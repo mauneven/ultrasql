@@ -691,13 +691,15 @@ fn par_dict_slice(xs: &[i64], codes: &[u8], mask: &[i64; 256], n_threads: usize)
             handles.push(s.spawn(move || filter_sum_dict_dispatch(x_slice, c_slice, mask)));
         }
         let mut total: i64 = 0;
+        let mut worker_panicked = false;
         for h in handles {
-            // The worker only calls into `filter_sum_dict_dispatch`,
-            // which is panic-free for non-mismatched slices (and we
-            // sliced ourselves so the lengths agree). A panic here
-            // would mean an unrelated invariant violation; surface it.
-            let partial = h.join().expect("filter_sum_par_dict worker panicked");
-            total = total.wrapping_add(partial);
+            match h.join() {
+                Ok(partial) => total = total.wrapping_add(partial),
+                Err(_) => worker_panicked = true,
+            }
+        }
+        if worker_panicked {
+            return filter_sum_dict_dispatch(xs, codes, mask);
         }
         total
     })

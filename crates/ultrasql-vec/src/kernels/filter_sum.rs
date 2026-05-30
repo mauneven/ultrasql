@@ -269,15 +269,15 @@ fn filter_sum_par_slice(xs: &[i64], ys: &[i64], n_threads: usize) -> i64 {
         // Reduce: `wrapping_add` preserves the serial-kernel semantics
         // (partial sums commute under wrapping addition).
         let mut total: i64 = 0;
+        let mut worker_panicked = false;
         for h in handles {
-            // SAFETY-of-`expect`: a scoped worker can only fail to
-            // join if the thread itself panicked. Our worker only
-            // calls into `filter_sum_dispatch`, which is panic-free
-            // for non-mismatched lengths (and we sliced the inputs
-            // ourselves, so the lengths match by construction). A
-            // panic here is genuinely unreachable; surface it loudly.
-            let partial = h.join().expect("filter_sum worker panicked");
-            total = total.wrapping_add(partial);
+            match h.join() {
+                Ok(partial) => total = total.wrapping_add(partial),
+                Err(_) => worker_panicked = true,
+            }
+        }
+        if worker_panicked {
+            return filter_sum_dispatch(xs, ys);
         }
         total
     })
