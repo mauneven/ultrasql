@@ -7197,7 +7197,7 @@ fn build_cached_sum_column(
                 return None;
             }
             if col.is_empty() {
-                Some(null_int64_column())
+                null_int64_column()
             } else {
                 Some(Column::Int64(NumericColumn::from_data(vec![
                     sum_i32_widening(col),
@@ -7212,7 +7212,7 @@ fn build_cached_sum_column(
                 return None;
             }
             if col.is_empty() {
-                Some(null_int64_column())
+                null_int64_column()
             } else {
                 Some(Column::Int64(NumericColumn::from_data(vec![sum_i64(col)])))
             }
@@ -7235,7 +7235,7 @@ fn build_cached_avg_column(
                 return None;
             }
             if col.is_empty() {
-                Some(null_float64_column())
+                null_float64_column()
             } else {
                 let avg = (sum_i32_widening(col) as f64) / (col.len() as f64);
                 Some(Column::Float64(NumericColumn::from_data(vec![avg])))
@@ -7249,7 +7249,7 @@ fn build_cached_avg_column(
                 return None;
             }
             if col.is_empty() {
-                Some(null_float64_column())
+                null_float64_column()
             } else {
                 let avg = (sum_i64(col) as f64) / (col.len() as f64);
                 Some(Column::Float64(NumericColumn::from_data(vec![avg])))
@@ -7277,7 +7277,7 @@ fn build_cached_filter_sum_column(
                 return None;
             }
             if sum.is_empty() {
-                return Some(null_int64_column());
+                return null_int64_column();
             }
             let total = if pred_col == sum_col && matches!(pred_op, CmpOp::Gt) {
                 filter_sum_i32_widening_gt(sum.data(), pred_lit)
@@ -7298,7 +7298,7 @@ fn build_cached_filter_sum_column(
                 return None;
             }
             if sum.is_empty() {
-                return Some(null_int64_column());
+                return null_int64_column();
             }
             let total = if pred_col == sum_col && matches!(pred_op, CmpOp::Gt) {
                 filter_sum_i64_gt(sum.data(), pred_lit)
@@ -7404,16 +7404,20 @@ fn reverse_binary_op_to_cmp(op: BinaryOp) -> Option<CmpOp> {
     }
 }
 
-fn null_int64_column() -> Column {
+fn null_int64_column() -> Option<Column> {
     let mut nulls = ultrasql_vec::Bitmap::new(1, false);
     nulls.set(0, false);
-    Column::Int64(NumericColumn::with_nulls(vec![0_i64], nulls).expect("matching lengths"))
+    NumericColumn::with_nulls(vec![0_i64], nulls)
+        .ok()
+        .map(Column::Int64)
 }
 
-fn null_float64_column() -> Column {
+fn null_float64_column() -> Option<Column> {
     let mut nulls = ultrasql_vec::Bitmap::new(1, false);
     nulls.set(0, false);
-    Column::Float64(NumericColumn::with_nulls(vec![0.0_f64], nulls).expect("matching lengths"))
+    NumericColumn::with_nulls(vec![0.0_f64], nulls)
+        .ok()
+        .map(Column::Float64)
 }
 
 fn decode_key_column(

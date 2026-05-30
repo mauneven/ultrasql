@@ -268,6 +268,12 @@ as a concise evidence ledger; roadmap stays for open gates only.
   `cargo test -p ultrasql-server join` and
   `cargo clippy -p ultrasql-server --lib --all-features -- -W
   clippy::expect_used -W clippy::unwrap_used`.
+- Cached aggregate summary null sentinels now return `None` and fall back when
+  nullable column construction fails, instead of panicking in the fast-path
+  cache helper. Evidence:
+  `cargo test -p ultrasql-server projection_summary` and
+  `cargo clippy -p ultrasql-server --lib --all-features -- -W
+  clippy::expect_used -W clippy::unwrap_used`.
 
 ## Core SQL And Wire Protocol
 
