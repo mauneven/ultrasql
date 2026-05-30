@@ -352,6 +352,13 @@ as a concise evidence ledger; roadmap stays for open gates only.
   `cargo clippy -p ultrasql-executor --all-targets --all-features -- -D
   warnings`, and `rg "u32 fits in usize|small const"
   crates/ultrasql-executor/src/row_codec.rs` returning no matches.
+- Row-codec builder finalization now propagates builder null-bitmap, text
+  offset, UTF-8, and final batch invariant errors through `RowCodecError`
+  instead of panicking while finishing decoded batches. Evidence:
+  `cargo test -p ultrasql-executor row_codec`,
+  `cargo test -p ultrasql-executor seq_scan`, and
+  `cargo clippy -p ultrasql-executor --all-targets --all-features -- -D
+  warnings`.
 
 ## Core SQL And Wire Protocol
 

@@ -630,7 +630,8 @@ where
         // backing batch itself).
         let replacement = build_initial_builders(&self.codec, self.with_tids)?;
         let finished = std::mem::replace(&mut self.builders, replacement);
-        let batch = RowCodec::finish_batch(finished).map_err(ExecError::from)?;
+        let batch = RowCodec::finish_batch(finished)
+            .map_err(|err| ExecError::TypeMismatch(err.to_string()))?;
 
         if iter_exhausted {
             self.eof = true;

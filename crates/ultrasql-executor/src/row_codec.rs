@@ -1920,11 +1920,10 @@ impl RowCodec {
     ///
     /// # Errors
     ///
-    /// [`ultrasql_vec::BatchError`] if builders disagree on length.
-    pub(crate) fn finish_batch(
-        builders: Vec<ColumnBuilder>,
-    ) -> Result<Batch, ultrasql_vec::BatchError> {
-        Batch::new(finish_builders(builders))
+    /// [`RowCodecError`] if builder null bitmaps, text offsets, or final
+    /// batch columns violate their length invariants.
+    pub(crate) fn finish_batch(builders: Vec<ColumnBuilder>) -> Result<Batch, RowCodecError> {
+        Batch::new(finish_builders(builders)?).map_err(RowCodecError::from)
     }
 
     /// Inject an `Int32` into `builders[col_idx]`. Used to prepend TID
@@ -2181,77 +2180,86 @@ impl ColumnBuilder {
     }
 }
 
-fn finish_builders(builders: Vec<ColumnBuilder>) -> Vec<Column> {
+fn finish_builders(builders: Vec<ColumnBuilder>) -> Result<Vec<Column>, RowCodecError> {
     let mut out: Vec<Column> = Vec::with_capacity(builders.len());
     for b in builders {
         let col = match b {
             ColumnBuilder::Bool { data, nulls } => {
                 let bools: Vec<bool> = data.iter().map(|&b| b != 0).collect();
                 match nulls.finish() {
-                    Some(bm) => Column::Bool(
-                        BoolColumn::with_nulls(bools, bm).expect("builder length invariant"),
-                    ),
+                    Some(bm) => BoolColumn::with_nulls(bools, bm)
+                        .map(Column::Bool)
+                        .map_err(|_| RowCodecError::BuilderInvariant("bool null bitmap length"))?,
                     None => Column::Bool(BoolColumn::from_data(bools)),
                 }
             }
             ColumnBuilder::Int16 { data, nulls } | ColumnBuilder::Int32 { data, nulls } => {
                 match nulls.finish() {
-                    Some(bm) => Column::Int32(
-                        NumericColumn::with_nulls(data, bm).expect("builder length invariant"),
-                    ),
+                    Some(bm) => NumericColumn::with_nulls(data, bm)
+                        .map(Column::Int32)
+                        .map_err(|_| RowCodecError::BuilderInvariant("i32 null bitmap length"))?,
                     None => Column::Int32(NumericColumn::from_data(data)),
                 }
             }
             ColumnBuilder::Int64 { data, nulls } => match nulls.finish() {
-                Some(bm) => Column::Int64(
-                    NumericColumn::with_nulls(data, bm).expect("builder length invariant"),
-                ),
+                Some(bm) => NumericColumn::with_nulls(data, bm)
+                    .map(Column::Int64)
+                    .map_err(|_| RowCodecError::BuilderInvariant("i64 null bitmap length"))?,
                 None => Column::Int64(NumericColumn::from_data(data)),
             },
             ColumnBuilder::Float32 { data, nulls } => match nulls.finish() {
-                Some(bm) => Column::Float32(
-                    NumericColumn::with_nulls(data, bm).expect("builder length invariant"),
-                ),
+                Some(bm) => NumericColumn::with_nulls(data, bm)
+                    .map(Column::Float32)
+                    .map_err(|_| RowCodecError::BuilderInvariant("f32 null bitmap length"))?,
                 None => Column::Float32(NumericColumn::from_data(data)),
             },
             ColumnBuilder::Float64 { data, nulls } => match nulls.finish() {
-                Some(bm) => Column::Float64(
-                    NumericColumn::with_nulls(data, bm).expect("builder length invariant"),
-                ),
+                Some(bm) => NumericColumn::with_nulls(data, bm)
+                    .map(Column::Float64)
+                    .map_err(|_| RowCodecError::BuilderInvariant("f64 null bitmap length"))?,
                 None => Column::Float64(NumericColumn::from_data(data)),
             },
             ColumnBuilder::Utf8 {
                 offsets,
                 values,
                 nulls,
-            } => text_column_from_parts(&offsets, &values, nulls.finish()),
+            } => text_column_from_parts(&offsets, &values, nulls.finish())?,
         };
         out.push(col);
     }
-    out
+    Ok(out)
 }
 
-fn text_column_from_parts(offsets: &[u32], values: &[u8], nulls: Option<Bitmap>) -> Column {
+fn text_column_from_parts(
+    offsets: &[u32],
+    values: &[u8],
+    nulls: Option<Bitmap>,
+) -> Result<Column, RowCodecError> {
     let n = offsets.len().saturating_sub(1);
     let mut rows: Vec<Option<String>> = Vec::with_capacity(n);
     for i in 0..n {
         if nulls.as_ref().is_some_and(|bm| !bm.get(i)) {
             rows.push(None);
         } else {
-            let start = offsets[i] as usize;
-            let end = offsets[i + 1] as usize;
+            let start = u32_payload_len_to_usize(offsets[i])?;
+            let end = u32_payload_len_to_usize(offsets[i + 1])?;
+            if start > end || end > values.len() {
+                return Err(RowCodecError::BuilderInvariant("text offset bounds"));
+            }
             let s = String::from_utf8(values[start..end].to_vec())
-                .expect("StringColumn builder invariant: values are validated UTF-8");
+                .map_err(|error| RowCodecError::InvalidUtf8(error, "text builder"))?;
             rows.push(Some(s));
         }
     }
-    match encode_strings_auto(
-        rows.iter().map(|v| v.as_deref()),
-        DictionaryEncodingPolicy::default(),
-    ) {
-        StringEncoding::Raw(c) => Column::Utf8(c),
-        StringEncoding::Dictionary(c) => Column::DictionaryUtf8(c),
-    }
+    Ok(
+        match encode_strings_auto(
+            rows.iter().map(|v| v.as_deref()),
+            DictionaryEncodingPolicy::default(),
+        ) {
+            StringEncoding::Raw(c) => Column::Utf8(c),
+            StringEncoding::Dictionary(c) => Column::DictionaryUtf8(c),
+        },
+    )
 }
 
 fn decode_bit_string_value(
@@ -3161,6 +3169,12 @@ pub enum RowCodecError {
         /// The raw little-endian `u32` length prefix.
         len: u32,
     },
+    /// A decode builder violated a finish-time invariant.
+    #[error("row builder invariant violation: {0}")]
+    BuilderInvariant(&'static str),
+    /// Batch construction failed after decoding builders.
+    #[error(transparent)]
+    Batch(#[from] ultrasql_vec::BatchError),
     /// Unsupported type.
     #[error("unsupported type at column {column}: {ty}")]
     UnsupportedType {
