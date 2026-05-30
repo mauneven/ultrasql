@@ -14,7 +14,7 @@ use ultrasql_storage::buffer_pool::{BufferPool, PageLoader};
 use ultrasql_storage::heap::{HeapAccess, InsertOptions};
 use ultrasql_storage::page::Page;
 
-use crate::registry::{BenchContext, BenchResult, median_f64, p99_f64};
+use crate::registry::{BenchContext, BenchResult, median_f64, p99_f64, require_bench_ok};
 
 /// Full production row count: 1 000 000 rows.
 #[allow(dead_code)] // used only in non-test builds via smoke_row_count
@@ -72,8 +72,7 @@ fn build_heap(n: usize) -> (Arc<BufferPool<BlankLoader>>, HeapAccess<BlankLoader
     for id in 0..n_i32 {
         let val = i64::from(id).wrapping_mul(1_000_000_007);
         let payload = encode_row(id, val);
-        heap.insert(REL, &payload, opts)
-            .expect("insert must succeed during heap build");
+        require_bench_ok(heap.insert(REL, &payload, opts), "heap build insert");
     }
 
     (pool, heap)
@@ -99,7 +98,7 @@ pub fn run(ctx: &BenchContext) -> BenchResult {
         let t0 = Instant::now();
         let mut count: usize = 0;
         for result in h.scan(REL, block_count) {
-            let tuple = result.expect("scan must not error on a freshly built heap");
+            let tuple = require_bench_ok(result, "scan freshly built heap");
             std::hint::black_box(&tuple.data);
             count = count.wrapping_add(1);
         }

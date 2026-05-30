@@ -24,7 +24,7 @@ use ultrasql_storage::buffer_pool::{BufferPool, PageLoader};
 use ultrasql_storage::heap::{HeapAccess, InsertOptions, UpdateOptions};
 use ultrasql_storage::page::Page;
 
-use crate::registry::{BenchContext, BenchResult, median_f64, p99_f64};
+use crate::registry::{BenchContext, BenchResult, median_f64, p99_f64, require_bench_ok};
 
 /// Full production rows per iteration.
 #[cfg(not(test))]
@@ -91,9 +91,10 @@ pub fn run(ctx: &BenchContext) -> BenchResult {
         .map(|id| encode_row(id, i64::from(id).wrapping_mul(999_983)))
         .collect();
     let preload_rows: Vec<&[u8]> = preload_payloads.iter().map(<[u8; 12]>::as_slice).collect();
-    let mut tids: Vec<TupleId> = heap
-        .insert_batch(REL, &preload_rows, insert_opts)
-        .expect("preload insert_batch must succeed");
+    let mut tids: Vec<TupleId> = require_bench_ok(
+        heap.insert_batch(REL, &preload_rows, insert_opts),
+        "preload insert_batch",
+    );
 
     let update_opts = UpdateOptions {
         xid: Xid::FIRST_USER,
@@ -111,9 +112,7 @@ pub fn run(ctx: &BenchContext) -> BenchResult {
             // Increment val by 1 on each update pass.
             let val = i64::from(id).wrapping_mul(999_983).wrapping_add(1);
             let payload = encode_row(id, val);
-            let outcome = h
-                .update(old_tid, &payload, update_opts)
-                .expect("update must succeed");
+            let outcome = require_bench_ok(h.update(old_tid, &payload, update_opts), "update row");
             new_tids.push(outcome.new_tid);
         }
         let elapsed = t0.elapsed();

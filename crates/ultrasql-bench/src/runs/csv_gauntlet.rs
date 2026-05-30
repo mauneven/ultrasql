@@ -12,7 +12,7 @@ use std::time::Instant;
 
 use tempfile::NamedTempFile;
 
-use crate::registry::{BenchContext, BenchResult, median_f64, p99_f64};
+use crate::registry::{BenchContext, BenchResult, median_f64, p99_f64, require_bench_ok};
 
 #[allow(dead_code)]
 const PROD_ROWS: usize = 10_000;
@@ -38,7 +38,7 @@ struct MalformedOutcome {
 /// Measures first-touch read + parse of the deterministic CSV file.
 pub fn run_cold_read(ctx: &BenchContext) -> BenchResult {
     run_file_backed(ctx, |path| {
-        let data = fs::read_to_string(path).expect("read benchmark csv");
+        let data = require_bench_ok(fs::read_to_string(path), "read benchmark csv");
         count_rows(&data)
     })
 }
@@ -46,7 +46,7 @@ pub fn run_cold_read(ctx: &BenchContext) -> BenchResult {
 /// Measures repeated parse of already-read CSV bytes.
 pub fn run_warm_read(ctx: &BenchContext) -> BenchResult {
     let file = write_good_csv(row_count());
-    let data = fs::read_to_string(file.path()).expect("read benchmark csv");
+    let data = require_bench_ok(fs::read_to_string(file.path()), "read benchmark csv");
     let timed = || count_rows(&data);
     measure(ctx, row_count(), timed)
 }
@@ -54,7 +54,7 @@ pub fn run_warm_read(ctx: &BenchContext) -> BenchResult {
 /// Measures a pushed CSV category filter.
 pub fn run_filter(ctx: &BenchContext) -> BenchResult {
     run_file_backed(ctx, |path| {
-        let data = fs::read_to_string(path).expect("read benchmark csv");
+        let data = require_bench_ok(fs::read_to_string(path), "read benchmark csv");
         parse_rows(&data)
             .filter(|row| row.category == "alpha")
             .count()
@@ -64,7 +64,7 @@ pub fn run_filter(ctx: &BenchContext) -> BenchResult {
 /// Measures grouping directly over CSV rows.
 pub fn run_group_by(ctx: &BenchContext) -> BenchResult {
     run_file_backed(ctx, |path| {
-        let data = fs::read_to_string(path).expect("read benchmark csv");
+        let data = require_bench_ok(fs::read_to_string(path), "read benchmark csv");
         let mut groups = HashMap::<&str, usize>::with_capacity(CATEGORIES.len());
         for row in parse_rows(&data) {
             *groups.entry(row.category).or_insert(0) += 1;
@@ -76,7 +76,7 @@ pub fn run_group_by(ctx: &BenchContext) -> BenchResult {
 /// Measures joining CSV rows to a small in-memory dimension table.
 pub fn run_join_table(ctx: &BenchContext) -> BenchResult {
     run_file_backed(ctx, |path| {
-        let data = fs::read_to_string(path).expect("read benchmark csv");
+        let data = require_bench_ok(fs::read_to_string(path), "read benchmark csv");
         let dims = HashMap::from([
             ("alpha", 3_i64),
             ("beta", 5_i64),
@@ -92,7 +92,7 @@ pub fn run_join_table(ctx: &BenchContext) -> BenchResult {
 /// Measures CSV import materialization into owned rows.
 pub fn run_copy_import(ctx: &BenchContext) -> BenchResult {
     run_file_backed(ctx, |path| {
-        let data = fs::read_to_string(path).expect("read benchmark csv");
+        let data = require_bench_ok(fs::read_to_string(path), "read benchmark csv");
         parse_rows(&data)
             .map(|row| (row.id, row.category.to_owned(), row.value))
             .collect::<Vec<_>>()
@@ -104,7 +104,7 @@ pub fn run_copy_import(ctx: &BenchContext) -> BenchResult {
 pub fn run_malformed_behavior(ctx: &BenchContext) -> BenchResult {
     let file = write_bad_csv(row_count());
     let timed = || {
-        let data = fs::read_to_string(file.path()).expect("read benchmark csv");
+        let data = require_bench_ok(fs::read_to_string(file.path()), "read benchmark csv");
         let outcome = parse_with_rejects(&data);
         std::hint::black_box(outcome.rejected);
         outcome.accepted
@@ -161,30 +161,30 @@ fn row_count() -> usize {
 }
 
 fn write_good_csv(rows: usize) -> NamedTempFile {
-    let mut file = NamedTempFile::new().expect("create benchmark csv");
-    writeln!(file, "id,category,value").expect("write header");
+    let mut file = require_bench_ok(NamedTempFile::new(), "create benchmark csv");
+    require_bench_ok(writeln!(file, "id,category,value"), "write header");
     for i in 0..rows {
         let category = CATEGORIES[i % CATEGORIES.len()];
-        let value = i64::try_from(i).expect("row id fits i64") * 17 - 9;
-        writeln!(file, "{i},{category},{value}").expect("write row");
+        let value = require_bench_ok(i64::try_from(i), "row id fits i64") * 17 - 9;
+        require_bench_ok(writeln!(file, "{i},{category},{value}"), "write row");
     }
-    file.flush().expect("flush benchmark csv");
+    require_bench_ok(file.flush(), "flush benchmark csv");
     file
 }
 
 fn write_bad_csv(rows: usize) -> NamedTempFile {
-    let mut file = NamedTempFile::new().expect("create malformed benchmark csv");
-    writeln!(file, "id,category,value").expect("write header");
+    let mut file = require_bench_ok(NamedTempFile::new(), "create malformed benchmark csv");
+    require_bench_ok(writeln!(file, "id,category,value"), "write header");
     for i in 0..rows {
         if i % 31 == 0 {
-            writeln!(file, "{i},broken").expect("write malformed row");
+            require_bench_ok(writeln!(file, "{i},broken"), "write malformed row");
         } else {
             let category = CATEGORIES[i % CATEGORIES.len()];
-            let value = i64::try_from(i).expect("row id fits i64") * 17 - 9;
-            writeln!(file, "{i},{category},{value}").expect("write row");
+            let value = require_bench_ok(i64::try_from(i), "row id fits i64") * 17 - 9;
+            require_bench_ok(writeln!(file, "{i},{category},{value}"), "write row");
         }
     }
-    file.flush().expect("flush malformed benchmark csv");
+    require_bench_ok(file.flush(), "flush malformed benchmark csv");
     file
 }
 

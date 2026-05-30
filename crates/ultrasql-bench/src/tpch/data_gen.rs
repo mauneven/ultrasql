@@ -210,7 +210,7 @@ fn write_supplier(n: u32, out_dir: &Path) -> Result<()> {
             buf,
             "{i}|Supplier#{i:>000009}|{addr}|{nation_key}|{phone}|{acctbal}|{comment}"
         )
-        .expect("String write is infallible");
+        .context("format supplier row")?;
     }
     std::fs::write(tbl_path(out_dir, "supplier"), buf).context("write supplier.tbl")
 }
@@ -236,7 +236,7 @@ fn write_customer(n: u32, out_dir: &Path) -> Result<()> {
             buf,
             "{i}|Customer#{i:>000009}|{addr}|{nation_key}|{phone}|{acctbal}|{seg}|{comment}"
         )
-        .expect("String write is infallible");
+        .context("format customer row")?;
     }
     std::fs::write(tbl_path(out_dir, "customer"), buf).context("write customer.tbl")
 }
@@ -257,7 +257,7 @@ fn write_part(n: u32, out_dir: &Path) -> Result<()> {
             buf,
             "{i}|{name}|Manufacturer#{mfgr}|Brand#{brand}|{ptype}|{size}|{container}|{price}|{comment}"
         )
-        .expect("String write is infallible");
+        .context("format part row")?;
     }
     std::fs::write(tbl_path(out_dir, "part"), buf).context("write part.tbl")
 }
@@ -278,7 +278,7 @@ fn write_partsupp(n_parts: u32, n_suppliers: u32, out_dir: &Path) -> Result<()> 
             );
             let comment = fake_string(&mut rng, 30, 199);
             writeln!(buf, "{p}|{suppkey}|{availqty}|{supplycost}|{comment}")
-                .expect("String write is infallible");
+                .context("format partsupp row")?;
         }
     }
     std::fs::write(tbl_path(out_dir, "partsupp"), buf).context("write partsupp.tbl")
@@ -306,7 +306,7 @@ fn write_orders(n: u32, n_customers: u32, out_dir: &Path) -> Result<()> {
             buf,
             "{orderkey}|{custkey}|{status}|{price}|{date}|{priority}|{clerk}|0|{comment}"
         )
-        .expect("String write is infallible");
+        .context("format orders row")?;
     }
     std::fs::write(tbl_path(out_dir, "orders"), buf).context("write orders.tbl")
 }
@@ -348,7 +348,7 @@ fn write_lineitem(n_orders: u32, n_parts: u32, n_suppliers: u32, out_dir: &Path)
                  {returnflag}|{linestatus}|{shipdate}|{commitdate}|{receiptdate}|\
                  {shipinstruct}|{shipmode}|{comment}"
             )
-            .expect("String write is infallible");
+            .context("format lineitem row")?;
         }
     }
     std::fs::write(tbl_path(out_dir, "lineitem"), buf).context("write lineitem.tbl")

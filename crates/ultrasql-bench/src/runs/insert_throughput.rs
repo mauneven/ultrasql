@@ -27,7 +27,7 @@ use ultrasql_storage::buffer_pool::{BufferPool, PageLoader};
 use ultrasql_storage::heap::{HeapAccess, InsertOptions};
 use ultrasql_storage::page::Page;
 
-use crate::registry::{BenchContext, BenchResult, median_f64, p99_f64};
+use crate::registry::{BenchContext, BenchResult, median_f64, p99_f64, require_bench_ok};
 
 /// Full production rows per iteration.
 #[allow(dead_code)] // used only in non-test builds via smoke_row_count
@@ -102,8 +102,7 @@ pub(crate) fn setup(n: usize) -> SetupState {
         .map(|id| encode_row(id, i64::from(id).wrapping_mul(999_983)))
         .collect();
     let rows: Vec<&[u8]> = payloads.iter().map(<[u8; 12]>::as_slice).collect();
-    heap.insert_batch(REL, &rows, opts)
-        .expect("insert_batch must succeed during setup");
+    require_bench_ok(heap.insert_batch(REL, &rows, opts), "setup insert_batch");
     SetupState {
         rows: n,
         pool,
@@ -136,9 +135,10 @@ pub(crate) fn run_one_iter(state: &SetupState) -> Duration {
     let t0 = Instant::now();
     let pool = Arc::new(BufferPool::new(frames, BlankLoader));
     let heap = HeapAccess::new(Arc::clone(&pool));
-    let tids = heap
-        .insert_batch(REL, &rows, opts)
-        .expect("insert_batch must succeed during benchmark");
+    let tids = require_bench_ok(
+        heap.insert_batch(REL, &rows, opts),
+        "benchmark insert_batch",
+    );
     let elapsed = t0.elapsed();
     std::hint::black_box(heap.block_count(REL));
     std::hint::black_box(tids.len());

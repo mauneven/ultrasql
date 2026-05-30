@@ -237,6 +237,14 @@ as a concise evidence ledger; roadmap stays for open gates only.
   `cargo clippy -p ultrasql-optimizer --all-targets --all-features -- -D warnings`,
   and
   `cargo clippy -p ultrasql-server --lib --all-features -- -D clippy::unwrap_used -D clippy::expect_used`.
+- Workspace lib strict panic audit now reaches the benchmark harness too.
+  Benchmark setup failures are centralized through `require_bench_ok`, so
+  release evidence aborts loudly instead of using raw `expect`, while TPC-H
+  formatting/query helpers return typed `anyhow` errors where possible.
+  Evidence:
+  `cargo clippy --workspace --lib --all-features -- -D clippy::unwrap_used -D clippy::expect_used`,
+  `cargo test -p ultrasql-bench --lib`, and
+  `cargo clippy -p ultrasql-bench --all-targets --all-features -- -D warnings`.
 - Decimal sort comparison no longer treats scale-normalization overflow as
   equality; high-scale `NUMERIC` ordering uses overflow-safe digit alignment
   shared by full sort and top-k. Evidence:

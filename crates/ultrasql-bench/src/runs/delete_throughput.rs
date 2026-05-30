@@ -17,7 +17,7 @@ use ultrasql_storage::buffer_pool::{BufferPool, PageLoader};
 use ultrasql_storage::heap::{DeleteOptions, HeapAccess, InsertOptions};
 use ultrasql_storage::page::Page;
 
-use crate::registry::{BenchContext, BenchResult, median_f64, p99_f64};
+use crate::registry::{BenchContext, BenchResult, median_f64, p99_f64, require_bench_ok};
 
 /// Full production rows per iteration.
 #[cfg(not(test))]
@@ -78,9 +78,8 @@ fn preload(
         .map(|id| encode_row(id, i64::from(id).wrapping_mul(999_983)))
         .collect();
     let rows: Vec<&[u8]> = payloads.iter().map(<[u8; 12]>::as_slice).collect();
-    let tids: Vec<TupleId> = heap
-        .insert_batch(REL, &rows, opts)
-        .expect("preload insert_batch must succeed");
+    let tids: Vec<TupleId> =
+        require_bench_ok(heap.insert_batch(REL, &rows, opts), "preload insert_batch");
 
     (pool, heap, tids)
 }
@@ -105,8 +104,7 @@ pub fn run(ctx: &BenchContext) -> BenchResult {
 
         let t0 = Instant::now();
         for &tid in &tids {
-            heap.delete(tid, delete_opts)
-                .expect("delete must succeed on a live tuple");
+            require_bench_ok(heap.delete(tid, delete_opts), "delete live tuple");
         }
         let elapsed = t0.elapsed();
         std::hint::black_box(heap.block_count(REL));

@@ -104,9 +104,9 @@ pub fn query_sql(n: u8) -> Result<Cow<'static, str>> {
         Ok(path) => Ok(Cow::Owned(std::fs::read_to_string(&path).map_err(
             |error| anyhow::anyhow!("read ULTRASQL_TPCH_SQL_FILE `{path}`: {error}"),
         )?)),
-        Err(std::env::VarError::NotPresent) => Ok(Cow::Borrowed(
-            queries::query(n).expect("queries 1..=22 always present"),
-        )),
+        Err(std::env::VarError::NotPresent) => queries::query(n)
+            .map(Cow::Borrowed)
+            .ok_or_else(|| anyhow::anyhow!("TPC-H query {n} is not available")),
         Err(error) => Err(anyhow::anyhow!("read ULTRASQL_TPCH_SQL_FILE: {error}")),
     }
 }

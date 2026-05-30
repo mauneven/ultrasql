@@ -24,6 +24,18 @@
 
 use serde::{Deserialize, Serialize};
 
+/// Abort a benchmark when setup or measurement plumbing fails.
+///
+/// Benchmark functions return [`BenchResult`] so the regression gate cannot
+/// carry a typed setup error today. Returning fake zero samples would corrupt
+/// benchmark evidence, so setup failures fail fast with the original error.
+pub fn require_bench_ok<T, E: std::fmt::Display>(result: Result<T, E>, context: &str) -> T {
+    match result {
+        Ok(value) => value,
+        Err(error) => panic!("benchmark setup failed: {context}: {error}"),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Public types
 // ---------------------------------------------------------------------------

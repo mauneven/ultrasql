@@ -3403,7 +3403,7 @@ fn build_ultrasql_insert_sql(table: &str, rows: &[Vec<String>]) -> Result<String
         bail!("unknown TPC-H table `{table}`");
     }
     let mut sql = String::new();
-    write!(&mut sql, "INSERT INTO {table} VALUES ").expect("write into String");
+    write!(&mut sql, "INSERT INTO {table} VALUES ").context("format insert SQL prefix")?;
     for (row_idx, row) in rows.iter().enumerate() {
         if row.len() != kinds.len() {
             bail!(
@@ -3640,7 +3640,8 @@ fn direct_decimal_parts(
     let magnitude_digits = magnitude.to_string();
     let dscale_usize = usize::try_from(scale)
         .with_context(|| format!("column {column_idx}: decimal display scale out of range"))?;
-    let group_width = usize::try_from(DIRECT_NUMERIC_DEC_DIGITS).expect("small const");
+    let group_width = usize::try_from(DIRECT_NUMERIC_DEC_DIGITS)
+        .context("direct numeric decimal digit group width")?;
     let digit_len = magnitude_digits.len();
     let integer_digits = digit_len.saturating_sub(dscale_usize);
     let groups_before_decimal = integer_digits.div_ceil(group_width);

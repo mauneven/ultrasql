@@ -13,7 +13,7 @@ use ultrasql_storage::btree::BTree;
 use ultrasql_storage::buffer_pool::{BufferPool, PageLoader};
 use ultrasql_storage::page::Page;
 
-use crate::registry::{BenchContext, BenchResult, median_f64, p99_f64};
+use crate::registry::{BenchContext, BenchResult, median_f64, p99_f64, require_bench_ok};
 
 /// Full production key count for the `BTree`.
 #[allow(dead_code)] // used only in non-test builds via smoke_row_count
@@ -62,8 +62,10 @@ fn build_tree(n: usize) -> BTree<BlankLoader> {
     // Budget: ~n / 16 leaf pages + headroom for internal pages.
     let frames = (n / 12).max(1) + 4_096;
     let pool = Arc::new(BufferPool::new(frames, BlankLoader));
-    let mut tree =
-        BTree::create(Arc::clone(&pool), RelationId::new(42)).expect("BTree::create must succeed");
+    let mut tree = require_bench_ok(
+        BTree::create(Arc::clone(&pool), RelationId::new(42)),
+        "BTree::create",
+    );
 
     let n_i64 = i64::try_from(n).unwrap_or(i64::MAX);
     let mut perm: Vec<i64> = (0..n_i64).collect();
@@ -85,8 +87,10 @@ fn build_tree(n: usize) -> BTree<BlankLoader> {
             PageId::new(RelationId::new(42), BlockNumber::new(block)),
             slot,
         );
-        tree.insert::<i64>(k, tid, Xid::FIRST_USER, None)
-            .expect("BTree insert must succeed during build");
+        require_bench_ok(
+            tree.insert::<i64>(k, tid, Xid::FIRST_USER, None),
+            "BTree insert during build",
+        );
     }
 
     tree

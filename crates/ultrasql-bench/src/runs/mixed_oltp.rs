@@ -21,7 +21,7 @@ use ultrasql_storage::buffer_pool::{BufferPool, PageLoader};
 use ultrasql_storage::heap::{HeapAccess, InsertOptions, UpdateOptions};
 use ultrasql_storage::page::Page;
 
-use crate::registry::{BenchContext, BenchResult, median_f64, p99_f64};
+use crate::registry::{BenchContext, BenchResult, median_f64, p99_f64, require_bench_ok};
 
 /// Initial population of the relation.
 #[cfg(not(test))]
@@ -97,9 +97,10 @@ pub fn run(ctx: &BenchContext) -> BenchResult {
         .collect();
     let preload_rows: Vec<&[u8]> = preload_payloads.iter().map(<[u8; 12]>::as_slice).collect();
     let mut tids: Vec<TupleId> = Vec::with_capacity(max_rows);
-    let preloaded = heap
-        .insert_batch(REL, &preload_rows, insert_opts)
-        .expect("preload insert_batch must succeed");
+    let preloaded = require_bench_ok(
+        heap.insert_batch(REL, &preload_rows, insert_opts),
+        "preload insert_batch",
+    );
     tids.extend(preloaded);
 
     let update_opts = UpdateOptions {
