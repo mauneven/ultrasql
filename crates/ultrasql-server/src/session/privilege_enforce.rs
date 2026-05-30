@@ -3,7 +3,7 @@
 use std::collections::BTreeSet;
 
 use tokio::io::{AsyncRead, AsyncWrite};
-use ultrasql_catalog::CatalogSnapshot;
+use ultrasql_catalog::{CatalogSnapshot, TableEntry};
 use ultrasql_core::Schema;
 use ultrasql_planner::{
     Catalog as PlannerCatalog, CopyDirection, LogicalAggregateExpr, LogicalJoinCondition,
@@ -34,6 +34,7 @@ where
             session: self,
             catalog_snapshot,
             requirements: BTreeSet::new(),
+            cte_names: Vec::new(),
         };
         collector.collect_plan(plan, true);
         let roles = self
@@ -41,6 +42,11 @@ where
             .role_catalog
             .inherited_role_names(&self.current_user);
         for requirement in collector.requirements {
+            if requirement.privilege == PrivilegeKind::Select
+                && self.public_catalog_table(&requirement.table, catalog_snapshot)
+            {
+                continue;
+            }
             if self.owns_table_for_column_privilege(&requirement.table, catalog_snapshot) {
                 continue;
             }
@@ -62,6 +68,16 @@ where
         Ok(())
     }
 
+    fn public_catalog_table(&self, table: &str, catalog_snapshot: &CatalogSnapshot) -> bool {
+        if let Some(entry) = self.table_entry_for_privilege(table, catalog_snapshot) {
+            return matches!(
+                entry.schema_name.as_str(),
+                "pg_catalog" | "information_schema"
+            );
+        }
+        crate::pipeline::catalog_views::virtual_catalog_schema(table).is_some()
+    }
+
     fn owns_table_for_column_privilege(
         &self,
         table: &str,
@@ -71,13 +87,32 @@ where
         if current_user.is_empty() {
             return false;
         }
-        let Some(table_oid) = PlannerCatalog::lookup_table_oid(catalog_snapshot, table) else {
+        let Some(table_oid) = self
+            .table_entry_for_privilege(table, catalog_snapshot)
+            .map(|entry| entry.oid)
+        else {
             return false;
         };
         let Some(runtime) = self.state.row_security.get(&table_oid) else {
             return false;
         };
         !runtime.owner_role.is_empty() && runtime.owner_role.eq_ignore_ascii_case(&current_user)
+    }
+
+    fn table_entry_for_privilege<'a>(
+        &self,
+        table: &str,
+        catalog_snapshot: &'a CatalogSnapshot,
+    ) -> Option<&'a TableEntry> {
+        if let Some(table_oid) = PlannerCatalog::lookup_table_oid(catalog_snapshot, table) {
+            return catalog_snapshot.tables_by_oid.get(&table_oid);
+        }
+        let folded = table.to_ascii_lowercase();
+        let (schema, name) = folded.rsplit_once('.')?;
+        catalog_snapshot
+            .tables
+            .get(name)
+            .filter(|entry| entry.schema_name.eq_ignore_ascii_case(schema))
     }
 
     fn privilege_bypass(&self) -> bool {
@@ -99,6 +134,7 @@ struct ColumnPrivilegeCollector<'a, RW> {
     session: &'a Session<RW>,
     catalog_snapshot: &'a CatalogSnapshot,
     requirements: BTreeSet<ColumnPrivilegeRequirement>,
+    cte_names: Vec<String>,
 }
 
 impl<RW> ColumnPrivilegeCollector<'_, RW>
@@ -184,10 +220,22 @@ where
                 self.collect_plan(right, output_observed);
             }
             LogicalPlan::Cte {
-                definition, body, ..
+                name,
+                recursive,
+                definition,
+                body,
+                ..
             } => {
+                if *recursive {
+                    self.cte_names.push(name.to_ascii_lowercase());
+                }
                 self.collect_plan(definition, true);
+                if *recursive {
+                    self.cte_names.pop();
+                }
+                self.cte_names.push(name.to_ascii_lowercase());
                 self.collect_plan(body, output_observed);
+                self.cte_names.pop();
             }
             LogicalPlan::Insert {
                 table,
@@ -479,6 +527,14 @@ where
     }
 
     fn require(&mut self, source: ColumnSource, privilege: PrivilegeKind) {
+        if self
+            .cte_names
+            .iter()
+            .rev()
+            .any(|name| name.eq_ignore_ascii_case(&source.table))
+        {
+            return;
+        }
         self.requirements.insert(ColumnPrivilegeRequirement {
             table: source.table,
             column: source.column,
@@ -547,6 +603,7 @@ mod tests {
             session,
             catalog_snapshot: snapshot,
             requirements: BTreeSet::new(),
+            cte_names: Vec::new(),
         }
     }
 
@@ -557,6 +614,34 @@ mod tests {
         let session = Session::new(io, server);
 
         assert!(!session.privilege_bypass());
+    }
+
+    #[test]
+    fn sample_database_grants_public_select_on_users() {
+        let server = crate::Server::with_sample_database();
+
+        assert!(
+            server.privilege_catalog.has_column_privilege(
+                "tester",
+                PrivilegeObjectKind::Table,
+                "users",
+                "id",
+                PrivilegeKind::Select,
+            ),
+            "sample database must remain readable for trust-auth demo users"
+        );
+    }
+
+    #[test]
+    fn catalog_tables_are_publicly_selectable() {
+        let server = Arc::new(crate::Server::with_sample_database());
+        let snapshot = server.catalog_snapshot();
+        let (io, _peer) = duplex(64);
+        let session = Session::new(io, server);
+
+        assert!(session.public_catalog_table("pg_catalog.pg_class", &snapshot));
+        assert!(session.public_catalog_table("pg_collation", &snapshot));
+        assert!(!session.public_catalog_table("users", &snapshot));
     }
 
     #[test]
@@ -767,6 +852,13 @@ mod tests {
             collector
                 .requirements
                 .contains(&req("name", PrivilegeKind::Select))
+        );
+        assert!(
+            collector
+                .requirements
+                .iter()
+                .all(|requirement| requirement.table != "u"),
+            "CTE aliases must not become table privilege requirements"
         );
         assert!(session.privilege_bypass());
     }

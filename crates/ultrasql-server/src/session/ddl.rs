@@ -833,6 +833,7 @@ where
         }
         self.state.row_security.insert(oid, Arc::new(row_security));
         self.state.persist_table_runtime_constraints_metadata()?;
+        self.state.persist_row_security_metadata()?;
         self.state.privilege_catalog.apply_default_privileges(
             &self.current_user,
             namespace,
@@ -962,6 +963,23 @@ where
             true,
             "CREATE MATERIALIZED VIEW catalog transaction",
         )?;
+        let mut row_security = self
+            .state
+            .row_security
+            .get(&oid)
+            .map(|guard| guard.as_ref().clone())
+            .unwrap_or_default();
+        if row_security.owner_role.is_empty() {
+            row_security.owner_role = self.current_user.to_ascii_lowercase();
+        }
+        self.state.row_security.insert(oid, Arc::new(row_security));
+        self.state.persist_row_security_metadata()?;
+        self.state.privilege_catalog.apply_default_privileges(
+            &self.current_user,
+            namespace,
+            crate::auth::PrivilegeObjectKind::Table,
+            table_name,
+        );
         runtime
             .materialized_rows
             .store(materialized_rows, std::sync::atomic::Ordering::Release);

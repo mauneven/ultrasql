@@ -140,6 +140,25 @@ pub use result_encoder::{
     run_select_streamed,
 };
 
+fn sample_privilege_catalog() -> Arc<auth::InMemoryPrivilegeCatalog> {
+    let catalog = Arc::new(auth::InMemoryPrivilegeCatalog::new());
+    let objects = [String::from("users")];
+    let grantees = [String::from("public")];
+    let privileges = [auth::PrivilegeRequest {
+        privilege: auth::PrivilegeKind::Select,
+        columns: Vec::new(),
+    }];
+    catalog.grant_many(
+        "ultrasql",
+        auth::PrivilegeObjectKind::Table,
+        &objects,
+        &grantees,
+        &privileges,
+        false,
+    );
+    catalog
+}
+
 /// One column in an `ultrasql-local` query result.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LocalResultColumn {
@@ -3511,7 +3530,7 @@ impl Server {
             two_phase,
             auth: AuthConfig::Trust,
             role_catalog: Arc::new(auth::InMemoryAuthCatalog::with_bootstrap_superuser()),
-            privilege_catalog: Arc::new(auth::InMemoryPrivilegeCatalog::new()),
+            privilege_catalog: sample_privilege_catalog(),
             notify_hub: Arc::new(notify::NotifyHub::new()),
             cancel_registry: Arc::new(cancel::CancelRegistry::new()),
             next_pid: std::sync::atomic::AtomicU32::new(1),
@@ -3984,7 +4003,7 @@ impl Server {
             two_phase,
             auth: AuthConfig::Trust,
             role_catalog: Arc::new(auth::InMemoryAuthCatalog::with_bootstrap_superuser()),
-            privilege_catalog: Arc::new(auth::InMemoryPrivilegeCatalog::new()),
+            privilege_catalog: sample_privilege_catalog(),
             notify_hub: Arc::new(notify::NotifyHub::new()),
             cancel_registry: Arc::new(cancel::CancelRegistry::new()),
             next_pid: std::sync::atomic::AtomicU32::new(1),
@@ -4583,7 +4602,10 @@ impl Server {
             .row_security
             .iter()
             .filter_map(|entry| {
-                if !entry.value().enabled && entry.value().policies.is_empty() {
+                if !entry.value().enabled
+                    && entry.value().policies.is_empty()
+                    && entry.value().owner_role.is_empty()
+                {
                     return None;
                 }
                 let table = snapshot.tables_by_oid.get(entry.key())?;
