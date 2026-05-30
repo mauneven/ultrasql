@@ -372,6 +372,37 @@ impl InMemoryAuthCatalog {
         roles.sort_by_key(|role| role.oid);
         roles
     }
+
+    /// Replace roles and memberships from a durable snapshot.
+    ///
+    /// The caller supplies complete role and membership rows. Names are
+    /// normalized the same way live DDL normalizes them, and the next OID
+    /// counter advances past the largest installed user role OID.
+    pub fn install_snapshot(&self, roles: Vec<RoleEntry>, memberships: Vec<RoleMembership>) {
+        let mut max_oid = FIRST_USER_ROLE_OID.saturating_sub(1);
+        let mut role_map = HashMap::with_capacity(roles.len());
+        for mut role in roles {
+            role.name = normalize_role_name(&role.name);
+            max_oid = max_oid.max(role.oid);
+            role_map.insert(role.name.clone(), role);
+        }
+
+        let mut membership_map = BTreeMap::new();
+        for mut membership in memberships {
+            membership.role = normalize_role_name(&membership.role);
+            membership.member = normalize_role_name(&membership.member);
+            membership.grantor = normalize_role_name(&membership.grantor);
+            membership_map.insert(
+                (membership.role.clone(), membership.member.clone()),
+                membership,
+            );
+        }
+
+        *self.roles.write() = role_map;
+        *self.memberships.write() = membership_map;
+        self.next_oid
+            .store(max_oid.saturating_add(1), Ordering::Relaxed);
+    }
 }
 
 impl AuthCatalog for InMemoryAuthCatalog {

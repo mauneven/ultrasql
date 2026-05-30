@@ -780,3 +780,10 @@ as a concise evidence ledger; roadmap stays for open gates only.
   -D clippy::todo -D clippy::unimplemented`; benchmark setup failures now emit
   contextual stderr and exit with status 2 instead of unwinding through the
   regression gate.
+- Role catalog restart persistence is covered by `pg_auth.meta`: `CREATE ROLE`,
+  `ALTER ROLE`, `DROP ROLE`, `GRANT role`, and `REVOKE role` snapshot roles and
+  memberships to the data directory with rollback on metadata-write failure.
+  `role_catalog_survives_restart` verifies role attributes and `SET ROLE`
+  membership after `Server::init` restart, and
+  `role_catalog_rolls_back_when_metadata_slot_is_unsafe` verifies unsafe
+  metadata slots do not leave failed role DDL in memory.

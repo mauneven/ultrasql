@@ -30,8 +30,16 @@ where
             ));
         };
         let entry = build_role_entry(*kind, role_name, options)?;
+        let before_roles = self.state.role_catalog.list_roles();
+        let before_memberships = self.state.role_catalog.list_memberships();
         match self.state.role_catalog.create_role(entry) {
             Ok(()) => {
+                if let Err(err) = self.state.persist_role_metadata() {
+                    self.state
+                        .role_catalog
+                        .install_snapshot(before_roles, before_memberships);
+                    return Err(err);
+                }
                 self.plan_cache_invalidate();
                 Ok(result_encoder::run_ddl_command("CREATE ROLE"))
             }
@@ -55,7 +63,15 @@ where
             ));
         };
         let changes = build_role_changes(options)?;
+        let before_roles = self.state.role_catalog.list_roles();
+        let before_memberships = self.state.role_catalog.list_memberships();
         self.state.role_catalog.alter_role(role_name, changes)?;
+        if let Err(err) = self.state.persist_role_metadata() {
+            self.state
+                .role_catalog
+                .install_snapshot(before_roles, before_memberships);
+            return Err(err);
+        }
         self.plan_cache_invalidate();
         Ok(result_encoder::run_ddl_command("ALTER ROLE"))
     }
@@ -72,12 +88,25 @@ where
                 "execute_drop_role called with non-DropRole plan",
             ));
         };
+        let before_roles = self.state.role_catalog.list_roles();
+        let before_memberships = self.state.role_catalog.list_memberships();
         for role in roles {
             match self.state.role_catalog.drop_role(role) {
                 Ok(()) => {}
                 Err(ultrasql_catalog::CatalogError::NotFound(_)) if *if_exists => {}
-                Err(err) => return Err(err.into()),
+                Err(err) => {
+                    self.state
+                        .role_catalog
+                        .install_snapshot(before_roles, before_memberships);
+                    return Err(err.into());
+                }
             }
+        }
+        if let Err(err) = self.state.persist_role_metadata() {
+            self.state
+                .role_catalog
+                .install_snapshot(before_roles, before_memberships);
+            return Err(err);
         }
         self.plan_cache_invalidate();
         Ok(result_encoder::run_ddl_command("DROP ROLE"))
@@ -99,9 +128,17 @@ where
             ));
         };
         self.ensure_role_membership_admin()?;
+        let before_roles = self.state.role_catalog.list_roles();
+        let before_memberships = self.state.role_catalog.list_memberships();
         self.state
             .role_catalog
             .grant_roles(&self.current_user, roles, grantees, *admin_option)?;
+        if let Err(err) = self.state.persist_role_metadata() {
+            self.state
+                .role_catalog
+                .install_snapshot(before_roles, before_memberships);
+            return Err(err);
+        }
         self.plan_cache_invalidate();
         Ok(result_encoder::run_ddl_command("GRANT ROLE"))
     }
@@ -119,7 +156,15 @@ where
             ));
         };
         self.ensure_role_membership_admin()?;
+        let before_roles = self.state.role_catalog.list_roles();
+        let before_memberships = self.state.role_catalog.list_memberships();
         self.state.role_catalog.revoke_roles(roles, grantees);
+        if let Err(err) = self.state.persist_role_metadata() {
+            self.state
+                .role_catalog
+                .install_snapshot(before_roles, before_memberships);
+            return Err(err);
+        }
         self.plan_cache_invalidate();
         Ok(result_encoder::run_ddl_command("REVOKE ROLE"))
     }

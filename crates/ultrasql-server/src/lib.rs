@@ -81,6 +81,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::OnceLock;
 
+use base64::{Engine as _, engine::general_purpose::STANDARD as B64};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpListener;
 use tracing::{debug, error, info, warn};
@@ -529,6 +530,109 @@ fn metadata_unescape(raw: &str) -> Result<String, ServerError> {
         }
     }
     Ok(out)
+}
+
+fn format_password_hash(password: Option<&auth::PasswordHash>) -> String {
+    let Some(password) = password else {
+        return String::new();
+    };
+    format!(
+        "SCRAM-SHA-256${}${}${}${}",
+        password.iterations,
+        B64.encode(&password.salt),
+        B64.encode(password.stored_key),
+        B64.encode(password.server_key)
+    )
+}
+
+fn parse_password_hash(
+    raw: &str,
+    line_no: usize,
+) -> Result<Option<auth::PasswordHash>, ServerError> {
+    if raw.is_empty() {
+        return Ok(None);
+    }
+    let parts = raw.split('$').collect::<Vec<_>>();
+    if parts.len() != 5 || parts[0] != "SCRAM-SHA-256" {
+        return Err(ServerError::ddl(format!(
+            "role metadata line {} has malformed SCRAM password hash",
+            line_no + 1
+        )));
+    }
+    let iterations = parse_role_u32(parts[1], line_no, "password iterations")?;
+    let salt = B64.decode(parts[2]).map_err(|err| {
+        ServerError::ddl(format!(
+            "role metadata line {} bad password salt: {err}",
+            line_no + 1
+        ))
+    })?;
+    let stored_key = decode_hash_key(parts[3], line_no, "stored key")?;
+    let server_key = decode_hash_key(parts[4], line_no, "server key")?;
+    Ok(Some(auth::PasswordHash {
+        salt,
+        iterations,
+        stored_key,
+        server_key,
+    }))
+}
+
+fn decode_hash_key(raw: &str, line_no: usize, field: &str) -> Result<[u8; 32], ServerError> {
+    let bytes = B64.decode(raw).map_err(|err| {
+        ServerError::ddl(format!(
+            "role metadata line {} bad password {field}: {err}",
+            line_no + 1
+        ))
+    })?;
+    bytes.try_into().map_err(|bytes: Vec<u8>| {
+        ServerError::ddl(format!(
+            "role metadata line {} password {field} has {} bytes, expected 32",
+            line_no + 1,
+            bytes.len()
+        ))
+    })
+}
+
+fn parse_role_bool(raw: &str, line_no: usize, field: &str) -> Result<bool, ServerError> {
+    raw.parse::<bool>().map_err(|err| {
+        ServerError::ddl(format!(
+            "role metadata line {} bad {field}: {err}",
+            line_no + 1
+        ))
+    })
+}
+
+fn parse_role_u32(raw: &str, line_no: usize, field: &str) -> Result<u32, ServerError> {
+    raw.parse::<u32>().map_err(|err| {
+        ServerError::ddl(format!(
+            "role metadata line {} bad {field}: {err}",
+            line_no + 1
+        ))
+    })
+}
+
+fn parse_role_i32(raw: &str, line_no: usize, field: &str) -> Result<i32, ServerError> {
+    raw.parse::<i32>().map_err(|err| {
+        ServerError::ddl(format!(
+            "role metadata line {} bad {field}: {err}",
+            line_no + 1
+        ))
+    })
+}
+
+fn parse_role_optional_i64(
+    raw: &str,
+    line_no: usize,
+    field: &str,
+) -> Result<Option<i64>, ServerError> {
+    if raw.is_empty() {
+        return Ok(None);
+    }
+    raw.parse::<i64>().map(Some).map_err(|err| {
+        ServerError::ddl(format!(
+            "role metadata line {} bad {field}: {err}",
+            line_no + 1
+        ))
+    })
 }
 
 fn rls_permissiveness_name(value: RuntimeRlsPermissiveness) -> &'static str {
@@ -4143,6 +4247,7 @@ impl Server {
         server.rebuild_persistent_index_sidecars()?;
         server.rebuild_domain_runtime_constraint_sidecars()?;
         server.rebuild_table_runtime_constraint_sidecars()?;
+        server.rebuild_role_metadata()?;
         server.rebuild_row_security_sidecars()?;
         server.rebuild_materialized_view_runtime_sidecars()?;
         Ok(server)
@@ -4712,6 +4817,109 @@ impl Server {
             }
             self.table_constraints.insert(oid, Arc::new(runtime));
         }
+        Ok(())
+    }
+
+    fn role_metadata_path(&self) -> Option<std::path::PathBuf> {
+        self.data_dir.as_ref().map(|dir| dir.join("pg_auth.meta"))
+    }
+
+    pub(crate) fn persist_role_metadata(&self) -> Result<(), ServerError> {
+        let Some(path) = self.role_metadata_path() else {
+            return Ok(());
+        };
+        let mut roles = self.role_catalog.list_roles();
+        roles.sort_by_key(|role| role.oid);
+        let mut memberships = self.role_catalog.list_memberships();
+        memberships.sort_by(|left, right| {
+            left.role
+                .cmp(&right.role)
+                .then_with(|| left.member.cmp(&right.member))
+        });
+
+        let mut out = String::from("# ultrasql auth runtime v1\n");
+        for role in roles {
+            out.push_str(&format!(
+                "role\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
+                metadata_escape(&role.name),
+                role.oid,
+                metadata_escape(&format_password_hash(role.password.as_ref())),
+                role.is_superuser,
+                role.inherit,
+                role.create_role,
+                role.create_db,
+                role.can_login,
+                role.replication,
+                role.bypass_rls,
+                role.connection_limit,
+                role.valid_until
+                    .map_or_else(String::new, |value| value.to_string())
+            ));
+        }
+        for membership in memberships {
+            out.push_str(&format!(
+                "member\t{}\t{}\t{}\t{}\n",
+                metadata_escape(&membership.role),
+                metadata_escape(&membership.member),
+                metadata_escape(&membership.grantor),
+                membership.admin_option
+            ));
+        }
+        write_runtime_metadata_file(&path, &out)
+    }
+
+    fn rebuild_role_metadata(&self) -> Result<(), ServerError> {
+        let Some(path) = self.role_metadata_path() else {
+            return Ok(());
+        };
+        let Some(text) = read_runtime_metadata_file(&path)? else {
+            return Ok(());
+        };
+
+        let mut roles = Vec::new();
+        let mut memberships = Vec::new();
+        for (line_no, line) in text.lines().enumerate() {
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            let parts = line.split('\t').collect::<Vec<_>>();
+            match parts.first().copied() {
+                Some("role") if parts.len() == 13 => {
+                    roles.push(auth::RoleEntry {
+                        name: metadata_unescape(parts[1])?,
+                        oid: parse_role_u32(parts[2], line_no, "oid")?,
+                        password: parse_password_hash(&metadata_unescape(parts[3])?, line_no)?,
+                        is_superuser: parse_role_bool(parts[4], line_no, "is_superuser")?,
+                        inherit: parse_role_bool(parts[5], line_no, "inherit")?,
+                        create_role: parse_role_bool(parts[6], line_no, "create_role")?,
+                        create_db: parse_role_bool(parts[7], line_no, "create_db")?,
+                        can_login: parse_role_bool(parts[8], line_no, "can_login")?,
+                        replication: parse_role_bool(parts[9], line_no, "replication")?,
+                        bypass_rls: parse_role_bool(parts[10], line_no, "bypass_rls")?,
+                        connection_limit: parse_role_i32(parts[11], line_no, "connection_limit")?,
+                        valid_until: parse_role_optional_i64(parts[12], line_no, "valid_until")?,
+                    });
+                }
+                Some("member") if parts.len() == 5 => {
+                    memberships.push(auth::RoleMembership {
+                        role: metadata_unescape(parts[1])?,
+                        member: metadata_unescape(parts[2])?,
+                        grantor: metadata_unescape(parts[3])?,
+                        admin_option: parse_role_bool(parts[4], line_no, "admin_option")?,
+                    });
+                }
+                _ => {
+                    return Err(ServerError::ddl(format!(
+                        "malformed role metadata line {}",
+                        line_no + 1
+                    )));
+                }
+            }
+        }
+        if roles.is_empty() {
+            roles.push(auth::RoleEntry::bootstrap_superuser());
+        }
+        self.role_catalog.install_snapshot(roles, memberships);
         Ok(())
     }
 

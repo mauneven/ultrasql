@@ -2,7 +2,8 @@
 
 mod support;
 
-use support::{shutdown, start_sample_server};
+use support::{shutdown, start_persistent_server, start_sample_server};
+use tokio_postgres::NoTls;
 
 #[tokio::test]
 async fn create_alter_drop_role_and_user_update_catalog_views() {
@@ -86,6 +87,136 @@ async fn create_alter_drop_role_and_user_update_catalog_views() {
         .await
         .expect("roles removed");
     assert_eq!(remaining.get::<_, i64>(0), 0);
+
+    shutdown(running).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn role_catalog_survives_restart() {
+    let data_dir = tempfile::TempDir::new().expect("temp data dir");
+
+    let running = start_persistent_server(data_dir.path(), "role_restart_setup").await;
+    let client = &running.client;
+    client
+        .batch_execute("CREATE ROLE tester SUPERUSER LOGIN")
+        .await
+        .expect("register tester role");
+    client
+        .batch_execute("CREATE ROLE parent NOLOGIN")
+        .await
+        .expect("create parent role");
+    client
+        .batch_execute("CREATE ROLE persisted LOGIN CREATEDB BYPASSRLS")
+        .await
+        .expect("create persisted role");
+    client
+        .batch_execute("ALTER ROLE persisted CREATEROLE")
+        .await
+        .expect("alter persisted role");
+    client
+        .batch_execute("GRANT parent TO persisted WITH ADMIN OPTION")
+        .await
+        .expect("grant persisted membership");
+    shutdown(running).await;
+
+    let running = start_persistent_server(data_dir.path(), "role_restart_verify").await;
+    let role = running
+        .client
+        .query_one(
+            "SELECT rolcanlogin, rolcreatedb, rolcreaterole, rolbypassrls \
+             FROM pg_catalog.pg_roles \
+             WHERE rolname = 'persisted'",
+            &[],
+        )
+        .await
+        .expect("persisted role visible after restart");
+    assert!(role.get::<_, bool>(0), "LOGIN should survive restart");
+    assert!(role.get::<_, bool>(1), "CREATEDB should survive restart");
+    assert!(role.get::<_, bool>(2), "CREATEROLE should survive restart");
+    assert!(role.get::<_, bool>(3), "BYPASSRLS should survive restart");
+
+    let parent = running
+        .client
+        .query_one(
+            "SELECT rolcanlogin FROM pg_catalog.pg_roles WHERE rolname = 'parent'",
+            &[],
+        )
+        .await
+        .expect("parent role visible after restart");
+    assert!(
+        !parent.get::<_, bool>(0),
+        "NOLOGIN parent should survive restart"
+    );
+
+    let conn_str = format!(
+        "host={host} port={port} user=persisted application_name=role_restart_member",
+        host = running.bound.ip(),
+        port = running.bound.port()
+    );
+    let (persisted, persisted_conn) = tokio_postgres::connect(&conn_str, NoTls)
+        .await
+        .expect("connect as persisted role");
+    let persisted_conn = tokio::spawn(async move {
+        if let Err(err) = persisted_conn.await {
+            eprintln!("persisted connection error: {err}");
+        }
+    });
+    persisted
+        .batch_execute("SET ROLE parent")
+        .await
+        .expect("persisted membership permits SET ROLE parent after restart");
+    let identity = persisted
+        .query_one("SELECT current_user, session_user", &[])
+        .await
+        .expect("identity after restarted SET ROLE");
+    assert_eq!(identity.get::<_, String>(0), "parent");
+    assert_eq!(identity.get::<_, String>(1), "persisted");
+    drop(persisted);
+    persisted_conn.await.expect("persisted connection joins");
+
+    shutdown(running).await;
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn role_catalog_rolls_back_when_metadata_slot_is_unsafe() {
+    use std::os::unix::fs::symlink;
+
+    let data_dir = tempfile::TempDir::new().expect("temp data dir");
+    let outside = data_dir.path().join("outside-auth-meta");
+    std::fs::write(&outside, b"keep").expect("outside metadata target");
+
+    let running = start_persistent_server(data_dir.path(), "role_rollback_setup").await;
+    running
+        .client
+        .batch_execute("CREATE ROLE tester SUPERUSER LOGIN")
+        .await
+        .expect("register tester role");
+    symlink(&outside, data_dir.path().join("pg_auth.meta.tmp")).expect("auth temp symlink");
+
+    let err = running
+        .client
+        .batch_execute("CREATE ROLE rollback_probe LOGIN")
+        .await
+        .expect_err("unsafe auth metadata slot rejects role DDL");
+    assert!(
+        err.as_db_error()
+            .is_some_and(|db| db.message().contains("runtime metadata file")),
+        "unexpected error: {err}"
+    );
+    let count = running
+        .client
+        .query_one(
+            "SELECT COUNT(*) FROM pg_catalog.pg_roles WHERE rolname = 'rollback_probe'",
+            &[],
+        )
+        .await
+        .expect("rollback probe role count");
+    assert_eq!(
+        count.get::<_, i64>(0),
+        0,
+        "failed role DDL must not remain in memory after metadata failure"
+    );
 
     shutdown(running).await;
 }
