@@ -143,6 +143,11 @@ as a concise evidence ledger; roadmap stays for open gates only.
   evaluation failures instead of silently treating them as NULL. Evidence:
   `cargo test -p ultrasql-executor sort` and
   `cargo test -p ultrasql-executor top_k`.
+- `HashAggregate` and `SortAggregate` now propagate group-key,
+  aggregate-argument, and ordered-set percentile expression failures instead of
+  silently treating them as NULL. Evidence:
+  `cargo test -p ultrasql-executor hash_aggregate` and
+  `cargo test -p ultrasql-executor sort_aggregate`.
 
 ## Core SQL And Wire Protocol
 

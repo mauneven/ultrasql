@@ -132,7 +132,12 @@ fn accumulate(
     let arg: Option<Value> = agg
         .arg
         .as_ref()
-        .map(|expr| Eval::new(expr.clone()).eval(row).unwrap_or(Value::Null));
+        .map(|expr| {
+            Eval::new(expr.clone())
+                .eval(row)
+                .map_err(|err| ExecError::TypeMismatch(err.to_string()))
+        })
+        .transpose()?;
 
     match state {
         AggState::CountStar(n) => {
@@ -378,7 +383,7 @@ fn percentile_fraction(
     };
     let value = Eval::new(direct_arg.clone())
         .eval(row)
-        .unwrap_or(Value::Null);
+        .map_err(|err| ExecError::TypeMismatch(err.to_string()))?;
     if value.is_null() {
         return Ok(None);
     }
@@ -737,11 +742,7 @@ impl SortAggregate {
             })?;
             for row in &rows {
                 saw_any_row = true;
-                let key: Vec<Value> = self
-                    .group_key_evals
-                    .iter()
-                    .map(|ev| ev.eval(row).unwrap_or(Value::Null))
-                    .collect();
+                let key = eval_group_key_values(&self.group_key_evals, row)?;
 
                 let same_group = current_key.as_ref().is_some_and(|ck| keys_equal(ck, &key));
 
@@ -785,6 +786,16 @@ impl SortAggregate {
 
         Ok(output)
     }
+}
+
+fn eval_group_key_values(evals: &[Eval], row: &[Value]) -> Result<Vec<Value>, ExecError> {
+    evals
+        .iter()
+        .map(|eval| {
+            eval.eval(row)
+                .map_err(|err| ExecError::TypeMismatch(err.to_string()))
+        })
+        .collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -863,7 +874,7 @@ pub(crate) fn finalise_stat(state: &AggState) -> Value {
 mod tests {
     use ultrasql_core::{DataType, Field, Schema, Value};
     use ultrasql_planner::SortKey;
-    use ultrasql_planner::{AggregateFunc, LogicalAggregateExpr, ScalarExpr};
+    use ultrasql_planner::{AggregateFunc, BinaryOp, LogicalAggregateExpr, ScalarExpr};
     use ultrasql_vec::Batch;
     use ultrasql_vec::column::{BoolColumn, Column, NumericColumn, StringColumn};
 
@@ -930,8 +941,36 @@ mod tests {
         }
     }
 
+    fn lit_i32(v: i32) -> ScalarExpr {
+        ScalarExpr::Literal {
+            value: Value::Int32(v),
+            data_type: DataType::Int32,
+        }
+    }
+
     fn lit(value: Value, data_type: DataType) -> ScalarExpr {
         ScalarExpr::Literal { value, data_type }
+    }
+
+    fn divide_i32_by_zero(name: &str, index: usize) -> ScalarExpr {
+        ScalarExpr::Binary {
+            op: BinaryOp::Div,
+            left: Box::new(col(name, index, DataType::Int32)),
+            right: Box::new(lit_i32(0)),
+            data_type: DataType::Int32,
+        }
+    }
+
+    fn divide_i64_by_zero(name: &str, index: usize) -> ScalarExpr {
+        ScalarExpr::Binary {
+            op: BinaryOp::Div,
+            left: Box::new(col(name, index, DataType::Int64)),
+            right: Box::new(ScalarExpr::Literal {
+                value: Value::Int64(0),
+                data_type: DataType::Int64,
+            }),
+            data_type: DataType::Int64,
+        }
     }
 
     fn agg(
@@ -1026,6 +1065,86 @@ mod tests {
         );
         let rows = drain_all(&mut op);
         assert!(rows.is_empty());
+    }
+
+    #[test]
+    fn sort_agg_group_key_eval_error_propagates() {
+        let scan = MemTableScan::new(schema_group_val(), vec![make_batch(&[(1, 10), (2, 20)])]);
+        let out_schema = Schema::new([
+            Field::required("group", DataType::Int32),
+            Field::required("cnt", DataType::Int64),
+        ])
+        .expect("schema");
+        let mut op = SortAggregate::new(
+            Box::new(scan),
+            vec![divide_i32_by_zero("group", 0)],
+            vec![count_star_agg()],
+            out_schema,
+        );
+
+        let err = op.next_batch().expect_err("group key division must error");
+        assert!(
+            err.to_string().contains("division by zero"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn sort_agg_arg_eval_error_propagates() {
+        let scan = MemTableScan::new(schema_group_val(), vec![make_batch(&[(1, 10)])]);
+        let out_schema = Schema::new([Field::required("total", DataType::Int64)]).expect("schema");
+        let mut op = SortAggregate::new(
+            Box::new(scan),
+            vec![],
+            vec![agg(
+                AggregateFunc::Sum,
+                Some(divide_i64_by_zero("val", 1)),
+                "total",
+                DataType::Int64,
+            )],
+            out_schema,
+        );
+
+        let err = op
+            .next_batch()
+            .expect_err("aggregate arg division must error");
+        assert!(
+            err.to_string().contains("division by zero"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn sort_agg_percentile_fraction_eval_error_propagates() {
+        let scan = MemTableScan::new(schema_group_val(), vec![make_batch(&[(1, 10)])]);
+        let order_expr = col("val", 1, DataType::Int64);
+        let out_schema = Schema::new([
+            Field::required("group", DataType::Int32),
+            Field::required("p", DataType::Float64),
+        ])
+        .expect("schema");
+        let aggs = vec![LogicalAggregateExpr {
+            func: AggregateFunc::PercentileCont,
+            arg: Some(order_expr.clone()),
+            direct_arg: Some(divide_i32_by_zero("group", 0)),
+            order_by: Some(SortKey {
+                expr: order_expr,
+                asc: true,
+                nulls_first: false,
+            }),
+            distinct: false,
+            output_name: "p".to_owned(),
+            data_type: DataType::Float64,
+        }];
+        let mut op = SortAggregate::new(Box::new(scan), vec![col_group()], aggs, out_schema);
+
+        let err = op
+            .next_batch()
+            .expect_err("percentile fraction division must error");
+        assert!(
+            err.to_string().contains("division by zero"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]

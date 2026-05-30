@@ -522,11 +522,7 @@ impl HashAggregate {
             for row in &rows {
                 saw_any_row = true;
                 // Evaluate group keys.
-                let key_values: Vec<Value> = self
-                    .group_key_evals
-                    .iter()
-                    .map(|ev| ev.eval(row).unwrap_or(Value::Null))
-                    .collect();
+                let key_values = eval_group_key_values(&self.group_key_evals, row)?;
                 let key = GroupKey::from_values(key_values);
 
                 // Get or insert agg states for this group.
@@ -629,11 +625,7 @@ impl HashAggregate {
             })?;
             for row in rows {
                 saw_any_row = true;
-                let key_values: Vec<Value> = self
-                    .group_key_evals
-                    .iter()
-                    .map(|ev| ev.eval(&row).unwrap_or(Value::Null))
-                    .collect();
+                let key_values = eval_group_key_values(&self.group_key_evals, &row)?;
                 let partition = partition_for_group_key_values(&key_values)?;
                 if partitions[partition].is_none() {
                     partitions[partition] = Some(RowSpillFile::new("hash aggregate")?);
@@ -662,11 +654,7 @@ impl HashAggregate {
             let mut spill = partition;
             let mut table: HashMap<GroupKey, Vec<AggState>> = HashMap::new();
             spill.scan_rows(&codec, |row| {
-                let key_values: Vec<Value> = self
-                    .group_key_evals
-                    .iter()
-                    .map(|ev| ev.eval(&row).unwrap_or(Value::Null))
-                    .collect();
+                let key_values = eval_group_key_values(&self.group_key_evals, &row)?;
                 let key = GroupKey::from_values(key_values);
                 let states = table
                     .entry(key)
@@ -699,6 +687,16 @@ fn partition_for_group_key_values(values: &[Value]) -> Result<usize, ExecError> 
     let idx = hasher.finish() % partitions;
     usize::try_from(idx)
         .map_err(|_| ExecError::Internal("hash aggregate partition index exceeds usize"))
+}
+
+fn eval_group_key_values(evals: &[Eval], row: &[Value]) -> Result<Vec<Value>, ExecError> {
+    evals
+        .iter()
+        .map(|eval| {
+            eval.eval(row)
+                .map_err(|err| ExecError::TypeMismatch(err.to_string()))
+        })
+        .collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -1618,7 +1616,12 @@ fn accumulate(
     let arg_val: Option<Value> = agg
         .arg
         .as_ref()
-        .map(|expr| Eval::new(expr.clone()).eval(row).unwrap_or(Value::Null));
+        .map(|expr| {
+            Eval::new(expr.clone())
+                .eval(row)
+                .map_err(|err| ExecError::TypeMismatch(err.to_string()))
+        })
+        .transpose()?;
 
     if let AggState::Distinct { inner, seen } = state {
         let Some(v) = arg_val else {
@@ -1814,7 +1817,7 @@ fn percentile_fraction(
     })?;
     let value = Eval::new(direct_arg.clone())
         .eval(row)
-        .unwrap_or(Value::Null);
+        .map_err(|err| ExecError::TypeMismatch(err.to_string()))?;
     if value.is_null() {
         return Ok(None);
     }
@@ -1853,9 +1856,9 @@ fn percentile_sample(agg: &LogicalAggregateExpr, row: &[Value]) -> Result<Value,
         .ok_or_else(|| {
             ExecError::TypeMismatch("ordered-set percentile missing order key".to_owned())
         })?;
-    Ok(Eval::new(sample_expr.clone())
+    Eval::new(sample_expr.clone())
         .eval(row)
-        .unwrap_or(Value::Null))
+        .map_err(|err| ExecError::TypeMismatch(err.to_string()))
 }
 
 /// Coerce a numeric `Value` to `f64` for floating-point folds.
@@ -2212,7 +2215,7 @@ mod tests {
         BitString, DataType, Field, GeometryType, GeometryValue, Lsn, NetworkValue, Oid, RangeType,
         RangeValue, Schema, SparseVector, Value,
     };
-    use ultrasql_planner::{AggregateFunc, LogicalAggregateExpr, ScalarExpr};
+    use ultrasql_planner::{AggregateFunc, BinaryOp, LogicalAggregateExpr, ScalarExpr, SortKey};
     use ultrasql_vec::Batch;
     use ultrasql_vec::bitmap::Bitmap;
     use ultrasql_vec::column::{BoolColumn, Column, NumericColumn, StringColumn};
@@ -2236,6 +2239,41 @@ mod tests {
             name: name.into(),
             index,
             data_type,
+        }
+    }
+
+    fn lit_i32(v: i32) -> ScalarExpr {
+        ScalarExpr::Literal {
+            value: Value::Int32(v),
+            data_type: DataType::Int32,
+        }
+    }
+
+    fn lit_f64(v: f64) -> ScalarExpr {
+        ScalarExpr::Literal {
+            value: Value::Float64(v),
+            data_type: DataType::Float64,
+        }
+    }
+
+    fn divide_i32_by_zero(name: &str, index: usize) -> ScalarExpr {
+        ScalarExpr::Binary {
+            op: BinaryOp::Div,
+            left: Box::new(col(name, index, DataType::Int32)),
+            right: Box::new(lit_i32(0)),
+            data_type: DataType::Int32,
+        }
+    }
+
+    fn divide_i64_by_zero(name: &str, index: usize) -> ScalarExpr {
+        ScalarExpr::Binary {
+            op: BinaryOp::Div,
+            left: Box::new(col(name, index, DataType::Int64)),
+            right: Box::new(ScalarExpr::Literal {
+                value: Value::Int64(0),
+                data_type: DataType::Int64,
+            }),
+            data_type: DataType::Int64,
         }
     }
 
@@ -2721,6 +2759,114 @@ mod tests {
         // group=2: sum=20, min=20, max=20
         assert_eq!(rows[1][0], Value::Int32(2));
         assert_eq!(rows[1][1], Value::Int64(20));
+    }
+
+    #[test]
+    fn hash_agg_group_key_eval_error_propagates() {
+        let scan = MemTableScan::new(
+            schema_group_val(),
+            vec![make_batch_i32_i64(&[(1, 10), (2, 20)])],
+        );
+        let out_schema = Schema::new([
+            Field::required("group", DataType::Int32),
+            Field::required("cnt", DataType::Int64),
+        ])
+        .expect("schema ok");
+        let mut op = HashAggregate::new(
+            Box::new(scan),
+            vec![divide_i32_by_zero("group", 0)],
+            vec![count_star_agg()],
+            out_schema,
+        );
+
+        let err = op.next_batch().expect_err("group key division must error");
+        assert!(
+            err.to_string().contains("division by zero"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn hash_agg_arg_eval_error_propagates() {
+        let scan = MemTableScan::new(schema_group_val(), vec![make_batch_i32_i64(&[(1, 10)])]);
+        let out_schema =
+            Schema::new([Field::required("total", DataType::Int64)]).expect("schema ok");
+        let agg = LogicalAggregateExpr {
+            func: AggregateFunc::Sum,
+            arg: Some(divide_i64_by_zero("val", 1)),
+            direct_arg: None,
+            order_by: None,
+            distinct: false,
+            output_name: "total".into(),
+            data_type: DataType::Int64,
+        };
+        let mut op = HashAggregate::new(Box::new(scan), vec![], vec![agg], out_schema);
+
+        let err = op
+            .next_batch()
+            .expect_err("aggregate arg division must error");
+        assert!(
+            err.to_string().contains("division by zero"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn hash_agg_percentile_fraction_eval_error_propagates() {
+        let scan = MemTableScan::new(schema_group_val(), vec![make_batch_i32_i64(&[(1, 10)])]);
+        let order_expr = col("val", 1, DataType::Int64);
+        let out_schema = Schema::new([Field::required("p", DataType::Float64)]).expect("schema ok");
+        let agg = LogicalAggregateExpr {
+            func: AggregateFunc::PercentileCont,
+            arg: Some(order_expr.clone()),
+            direct_arg: Some(divide_i32_by_zero("group", 0)),
+            order_by: Some(SortKey {
+                expr: order_expr,
+                asc: true,
+                nulls_first: false,
+            }),
+            distinct: false,
+            output_name: "p".into(),
+            data_type: DataType::Float64,
+        };
+        let mut op = HashAggregate::new(Box::new(scan), vec![], vec![agg], out_schema);
+
+        let err = op
+            .next_batch()
+            .expect_err("percentile fraction division must error");
+        assert!(
+            err.to_string().contains("division by zero"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn hash_agg_percentile_order_eval_error_propagates() {
+        let scan = MemTableScan::new(schema_group_val(), vec![make_batch_i32_i64(&[(1, 10)])]);
+        let order_expr = divide_i64_by_zero("val", 1);
+        let out_schema = Schema::new([Field::required("p", DataType::Float64)]).expect("schema ok");
+        let agg = LogicalAggregateExpr {
+            func: AggregateFunc::PercentileCont,
+            arg: Some(col("val", 1, DataType::Int64)),
+            direct_arg: Some(lit_f64(0.5)),
+            order_by: Some(SortKey {
+                expr: order_expr,
+                asc: true,
+                nulls_first: false,
+            }),
+            distinct: false,
+            output_name: "p".into(),
+            data_type: DataType::Float64,
+        };
+        let mut op = HashAggregate::new(Box::new(scan), vec![], vec![agg], out_schema);
+
+        let err = op
+            .next_batch()
+            .expect_err("percentile order division must error");
+        assert!(
+            err.to_string().contains("division by zero"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]
