@@ -359,6 +359,14 @@ as a concise evidence ledger; roadmap stays for open gates only.
   `cargo test -p ultrasql-executor seq_scan`, and
   `cargo clippy -p ultrasql-executor --all-targets --all-features -- -D
   warnings`.
+- Row-codec vector element decoding now maps impossible chunk-width failures
+  to a typed `RowCodecError::Type`, clearing the executor source
+  `expect`/`unwrap` audit. Evidence:
+  `cargo test -p ultrasql-executor row_codec`,
+  `cargo clippy -p ultrasql-executor --lib --all-features -- -W
+  clippy::expect_used -W clippy::unwrap_used`, and
+  `cargo clippy -p ultrasql-executor --all-targets --all-features -- -D
+  warnings`.
 
 ## Core SQL And Wire Protocol
 

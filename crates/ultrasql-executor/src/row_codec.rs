@@ -2978,9 +2978,12 @@ fn decode_vector_value(
     }
     let mut values = Vec::with_capacity(dims_usize);
     for chunk in bytes[*cursor..values_end].chunks_exact(VECTOR_ELEMENT_WIDTH) {
-        let raw: [u8; VECTOR_ELEMENT_WIDTH] = chunk
-            .try_into()
-            .expect("chunks_exact(VECTOR_ELEMENT_WIDTH)");
+        let raw: [u8; VECTOR_ELEMENT_WIDTH] =
+            chunk.try_into().map_err(|_| RowCodecError::Type {
+                column,
+                expected: ty.clone(),
+                got: "invalid vector element width".to_owned(),
+            })?;
         let value = f32::from_le_bytes(raw);
         if !value.is_finite() {
             return Err(RowCodecError::Type {
