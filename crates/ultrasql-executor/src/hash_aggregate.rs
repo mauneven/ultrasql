@@ -41,6 +41,7 @@ use crate::filter_op::batch_to_rows;
 use crate::row_codec::RowCodec;
 use crate::row_spill::RowSpillFile;
 use crate::seq_scan::build_batch;
+use crate::value_key::{decimal_values_equal, hash_decimal_key};
 use crate::work_mem::WorkMemBudget;
 use crate::{CancelFlag, ExecError, Operator, OperatorSpillProfile};
 
@@ -70,6 +71,16 @@ impl PartialEq for KeyValue {
             (Value::Vector(a), Value::Vector(b)) | (Value::HalfVec(a), Value::HalfVec(b)) => {
                 a.len() == b.len() && a.iter().zip(b).all(|(l, r)| l.to_bits() == r.to_bits())
             }
+            (
+                Value::Decimal {
+                    value: left_value,
+                    scale: left_scale,
+                },
+                Value::Decimal {
+                    value: right_value,
+                    scale: right_scale,
+                },
+            ) => decimal_values_equal(*left_value, *left_scale, *right_value, *right_scale),
             _ => self.0 == other.0,
         }
     }
@@ -176,8 +187,7 @@ fn hash_value<H: Hasher>(v: &Value, state: &mut H) {
         }
         Value::Decimal { value, scale } => {
             state.write_u8(12);
-            value.hash(state);
-            scale.hash(state);
+            hash_decimal_key(state, *value, *scale);
         }
         Value::Interval {
             months,
@@ -2492,6 +2502,19 @@ mod tests {
         assert_eq!(
             GroupKey::from_values(vec![Value::Char("a".into())]),
             GroupKey::from_values(vec![Value::Char("a   ".into())])
+        );
+        let mut decimal_seen = HashSet::new();
+        assert!(
+            decimal_seen.insert(GroupKey::from_values(vec![Value::Decimal {
+                value: 10,
+                scale: 1,
+            }]))
+        );
+        assert!(
+            !decimal_seen.insert(GroupKey::from_values(vec![Value::Decimal {
+                value: 1,
+                scale: 0,
+            }]))
         );
         assert_eq!(
             GroupKey::from_values(vec![Value::TimeTz {

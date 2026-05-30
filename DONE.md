@@ -194,6 +194,10 @@ as a concise evidence ledger; roadmap stays for open gates only.
   equality, UNION, INTERSECT, and EXCEPT key semantics. Evidence:
   `cargo test -p ultrasql-executor unique` and
   `cargo test -p ultrasql-executor set_op`.
+- Hash aggregate group keys and aggregate `DISTINCT` keys now use shared
+  decimal `NUMERIC` canonicalization, so grouped and distinct aggregate paths
+  no longer split equal values by display scale. Evidence:
+  `cargo test -p ultrasql-executor hash_aggregate`.
 
 ## Core SQL And Wire Protocol
 
