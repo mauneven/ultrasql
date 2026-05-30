@@ -20,6 +20,7 @@ use ultrasql_planner::{
 use ultrasql_storage::btree::BTree;
 use ultrasql_storage::heap::{DeleteOptions, UpdateOptions, UpdatePayload};
 
+use crate::auth::pg_authid::AuthCatalog;
 use crate::error::ServerError;
 use crate::index_key::IndexKeyEncoding;
 
@@ -65,7 +66,13 @@ pub(super) fn lower_real_insert(
         })?;
     let insert_columns =
         resolve_insert_columns(columns, source.schema().len(), entry.schema.len())?;
+    let rls_insert_checks = build_rls_insert_checks(entry, ctx);
     if let Some(partition) = ctx.time_partitions.get(&table.to_ascii_lowercase()) {
+        if !rls_insert_checks.is_empty() {
+            return Err(ServerError::Unsupported(
+                "partitioned INSERT does not yet support row-level security checks",
+            ));
+        }
         if on_conflict.is_some() {
             return Err(ServerError::Unsupported(
                 "partitioned INSERT does not yet support ON CONFLICT",
@@ -110,15 +117,17 @@ pub(super) fn lower_real_insert(
         .with_wal(ctx.heap.wal_sink().cloned());
         return Ok(Box::new(insert));
     }
-    if let Some(fused) = try_build_fused_insert_int32_pair(
-        entry,
-        &insert_columns,
-        source,
-        on_conflict,
-        returning,
-        ctx,
-    ) {
-        return Ok(fused);
+    if rls_insert_checks.is_empty() {
+        if let Some(fused) = try_build_fused_insert_int32_pair(
+            entry,
+            &insert_columns,
+            source,
+            on_conflict,
+            returning,
+            ctx,
+        ) {
+            return Ok(fused);
+        }
     }
     let child: Box<dyn Operator> = match source {
         LogicalPlan::Values { rows, schema } => {
@@ -192,6 +201,20 @@ pub(super) fn lower_real_insert(
     } else {
         modify
     };
+    let mut check_constraints = rls_insert_checks;
+    if let Some(constraints) = &constraints {
+        check_constraints.extend(
+            constraints
+                .checks
+                .iter()
+                .map(|check| (check.name.clone(), check.expr.clone())),
+        );
+    }
+    let modify = if !check_constraints.is_empty() {
+        modify.with_check_constraints(check_constraints)
+    } else {
+        modify
+    };
     let modify = if let Some(constraints) = constraints {
         modify
             .with_column_defaults(constraints.defaults.clone())
@@ -201,13 +224,6 @@ pub(super) fn lower_real_insert(
             )?)
             .with_identity_always(constraints.identity_always.clone())
             .with_generated_stored(constraints.generated_stored.clone())
-            .with_check_constraints(
-                constraints
-                    .checks
-                    .iter()
-                    .map(|check| (check.name.clone(), check.expr.clone()))
-                    .collect(),
-            )
             .with_foreign_key_checks(build_foreign_key_checks(&constraints.foreign_keys, ctx)?)
             .with_exclusion_checks(build_exclusion_insert_checks(
                 entry,
@@ -238,6 +254,106 @@ pub(super) fn lower_real_insert(
         )
     };
     Ok(Box::new(modify))
+}
+
+fn build_rls_insert_checks(entry: &TableEntry, ctx: &LowerCtx<'_>) -> Vec<(String, ScalarExpr)> {
+    let Some(runtime_ref) = ctx.row_security.get(&entry.oid) else {
+        return Vec::new();
+    };
+    let runtime = Arc::clone(runtime_ref.value());
+    if !runtime.enabled || bypasses_row_security(runtime.as_ref(), ctx) {
+        return Vec::new();
+    }
+
+    let inherited_roles = ctx.role_catalog.inherited_role_names(&ctx.current_user);
+    let mut permissive = Vec::new();
+    let mut restrictive = Vec::new();
+    for policy in runtime.policies.iter().filter(|policy| {
+        policy.command.applies_to(crate::RuntimeRlsCommand::Insert)
+            && policy.applies_to_roles(&inherited_roles)
+    }) {
+        let Some(expr) = policy.with_check.as_ref().or(policy.using.as_ref()) else {
+            continue;
+        };
+        let predicate = rls_tenant_check_predicate(entry, expr, ctx);
+        match policy.permissiveness {
+            crate::RuntimeRlsPermissiveness::Permissive => permissive.push(predicate),
+            crate::RuntimeRlsPermissiveness::Restrictive => restrictive.push(predicate),
+        }
+    }
+
+    let Some(mut predicate) = combine_rls_check_predicates(permissive, BinaryOp::Or) else {
+        return vec![("row-level security policy".to_owned(), bool_literal(false))];
+    };
+    if let Some(restrictive) = combine_rls_check_predicates(restrictive, BinaryOp::And) {
+        predicate = ScalarExpr::Binary {
+            op: BinaryOp::And,
+            left: Box::new(predicate),
+            right: Box::new(restrictive),
+            data_type: DataType::Bool,
+        };
+    }
+    vec![("row-level security policy".to_owned(), predicate)]
+}
+
+fn bypasses_row_security(runtime: &crate::TableRowSecurity, ctx: &LowerCtx<'_>) -> bool {
+    let current_user = ctx.current_user.to_ascii_lowercase();
+    let Some(role) = ctx.role_catalog.lookup_role(&current_user) else {
+        return false;
+    };
+    role.is_superuser
+        || role.bypass_rls
+        || (!runtime.owner_role.is_empty()
+            && runtime.owner_role.eq_ignore_ascii_case(&current_user))
+}
+
+fn rls_tenant_check_predicate(
+    _entry: &TableEntry,
+    expr: &crate::RuntimeTenantPolicyExpr,
+    ctx: &LowerCtx<'_>,
+) -> ScalarExpr {
+    let Some(value) = ctx
+        .session_settings
+        .get(&expr.setting_name.to_ascii_lowercase())
+    else {
+        return bool_literal(false);
+    };
+    ScalarExpr::Binary {
+        op: BinaryOp::Eq,
+        left: Box::new(ScalarExpr::Column {
+            name: expr.column_name.clone(),
+            index: expr.column_index,
+            data_type: DataType::Text { max_len: None },
+        }),
+        right: Box::new(ScalarExpr::Literal {
+            value: Value::Text(value.clone()),
+            data_type: DataType::Text { max_len: None },
+        }),
+        data_type: DataType::Bool,
+    }
+}
+
+fn combine_rls_check_predicates(
+    mut predicates: Vec<ScalarExpr>,
+    op: BinaryOp,
+) -> Option<ScalarExpr> {
+    let mut current = predicates.pop()?;
+    while let Some(next) = predicates.pop() {
+        current = ScalarExpr::Binary {
+            op,
+            left: Box::new(next),
+            right: Box::new(current),
+            data_type: DataType::Bool,
+        };
+    }
+    Some(current)
+}
+
+fn bool_literal(value: bool) -> ScalarExpr {
+    ScalarExpr::Literal {
+        value: Value::Bool(value),
+        data_type: DataType::Bool,
+    }
 }
 
 fn try_build_fused_insert_int32_pair(

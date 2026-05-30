@@ -679,6 +679,11 @@ as a concise evidence ledger; roadmap stays for open gates only.
   role membership, persist across restart, and fail closed when no scoped policy
   applies. Evidence:
   `cargo test -p ultrasql-server --test rls_round_trip rls_policy_roles_scope_visibility_and_restart -- --nocapture`.
+- RLS `INSERT ... SELECT` now enforces target-table `WITH CHECK` predicates on
+  every produced row through the mutation operator, skips unchecked fused insert
+  paths when a row-security check exists, and rejects mixed-tenant source rows
+  atomically. Evidence:
+  `cargo test -p ultrasql-server --test rls_round_trip rls_insert_select_checks_source_rows_atomically -- --nocapture`.
 - Driver certification covers `libpq`, `psycopg2`, `psycopg3`,
   `node-postgres`, `pgx`, `lib/pq`, `JDBC`, `Npgsql`, and
   `tokio-postgres`.

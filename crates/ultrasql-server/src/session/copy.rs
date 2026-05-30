@@ -1092,6 +1092,8 @@ where
             sequences: Arc::clone(&self.state.sequences),
             role_catalog: Arc::clone(&self.state.role_catalog),
             privilege_catalog: Arc::clone(&self.state.privilege_catalog),
+            row_security: Arc::clone(&self.state.row_security),
+            session_settings: Arc::new(self.session_settings.clone()),
             current_user: self.current_user.clone(),
             session_user: self.auth_user.clone(),
             persistent_catalog: Arc::clone(&self.state.persistent_catalog),

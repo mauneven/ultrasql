@@ -526,6 +526,105 @@ async fn rls_insert_uses_insert_policies_not_select_using_predicates() {
 }
 
 #[tokio::test]
+async fn rls_insert_select_checks_source_rows_atomically() {
+    let (client, _conn, server_handle) = start_server_and_connect().await;
+
+    client
+        .batch_execute(
+            "CREATE TABLE tenant_docs_insert_select_source (\
+                tenant_id TEXT NOT NULL, \
+                doc_id TEXT NOT NULL\
+             )",
+        )
+        .await
+        .expect("create source table");
+    client
+        .batch_execute(
+            "CREATE TABLE tenant_docs_insert_select_target (\
+                tenant_id TEXT NOT NULL, \
+                doc_id TEXT NOT NULL\
+             )",
+        )
+        .await
+        .expect("create target table");
+    client
+        .batch_execute(
+            "INSERT INTO tenant_docs_insert_select_source VALUES \
+                ('tenant-a', 'doc-a'), \
+                ('tenant-b', 'doc-b')",
+        )
+        .await
+        .expect("insert source rows");
+    client
+        .batch_execute(
+            "CREATE POLICY tenant_docs_insert_select_write \
+                ON tenant_docs_insert_select_target \
+                FOR INSERT \
+                WITH CHECK (tenant_id = current_setting('ultrasql.tenant_id', true))",
+        )
+        .await
+        .expect("create insert policy");
+    client
+        .batch_execute(
+            "CREATE POLICY tenant_docs_insert_select_read \
+                ON tenant_docs_insert_select_target \
+                FOR SELECT \
+                USING (tenant_id = current_setting('ultrasql.tenant_id', true))",
+        )
+        .await
+        .expect("create select policy");
+    client
+        .batch_execute("ALTER TABLE tenant_docs_insert_select_target ENABLE ROW LEVEL SECURITY")
+        .await
+        .expect("enable target rls");
+    client
+        .batch_execute("SET ultrasql.tenant_id = 'tenant-a'")
+        .await
+        .expect("set tenant guc");
+
+    client
+        .batch_execute(
+            "INSERT INTO tenant_docs_insert_select_target \
+                SELECT tenant_id, doc_id \
+                FROM tenant_docs_insert_select_source \
+                WHERE tenant_id = 'tenant-a'",
+        )
+        .await
+        .expect("same-tenant insert-select passes");
+    let rows = simple_rows(
+        &client
+            .simple_query("SELECT doc_id FROM tenant_docs_insert_select_target ORDER BY doc_id")
+            .await
+            .expect("select inserted same-tenant rows"),
+    );
+    assert_eq!(rows, vec![vec!["doc-a".to_owned()]]);
+
+    let err = client
+        .batch_execute(
+            "INSERT INTO tenant_docs_insert_select_target \
+                SELECT tenant_id, doc_id \
+                FROM tenant_docs_insert_select_source \
+                ORDER BY doc_id",
+        )
+        .await
+        .expect_err("cross-tenant insert-select must fail RLS WITH CHECK");
+    assert!(
+        err.as_db_error()
+            .is_some_and(|db| db.message().contains("row-level security")),
+        "unexpected error: {err}"
+    );
+    let rows = simple_rows(
+        &client
+            .simple_query("SELECT doc_id FROM tenant_docs_insert_select_target ORDER BY doc_id")
+            .await
+            .expect("select rows after rejected insert-select"),
+    );
+    assert_eq!(rows, vec![vec!["doc-a".to_owned()]]);
+
+    shutdown(client, server_handle).await;
+}
+
+#[tokio::test]
 async fn rls_restrictive_select_policies_narrow_permissive_visibility() {
     let (client, _conn, server_handle) = start_server_and_connect().await;
 

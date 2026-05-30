@@ -1671,9 +1671,7 @@ where
             }
         }
         let LogicalPlan::Values { rows, .. } = source.as_ref() else {
-            return Err(ServerError::Unsupported(
-                "RLS WITH CHECK for INSERT currently requires VALUES input",
-            ));
+            return Ok(());
         };
         for row in rows {
             let mut accepted = false;
@@ -1818,6 +1816,8 @@ where
                     Arc::clone(&self.state.sequences),
                     Arc::clone(&self.state.role_catalog),
                     Arc::clone(&self.state.privilege_catalog),
+                    Arc::clone(&self.state.row_security),
+                    Arc::new(self.session_settings.clone()),
                     self.current_user.clone(),
                     self.auth_user.clone(),
                     Arc::clone(&self.state.persistent_catalog),
@@ -1850,6 +1850,8 @@ where
                     Arc::clone(&self.state.sequences),
                     Arc::clone(&self.state.role_catalog),
                     Arc::clone(&self.state.privilege_catalog),
+                    Arc::clone(&self.state.row_security),
+                    Arc::new(self.session_settings.clone()),
                     self.current_user.clone(),
                     self.auth_user.clone(),
                     Arc::clone(&self.state.persistent_catalog),
@@ -2594,6 +2596,8 @@ where
             Arc::clone(&self.state.sequences),
             Arc::clone(&self.state.role_catalog),
             Arc::clone(&self.state.privilege_catalog),
+            Arc::clone(&self.state.row_security),
+            Arc::new(std::collections::HashMap::new()),
             self.current_user.clone(),
             self.auth_user.clone(),
             Arc::clone(&self.state.persistent_catalog),

@@ -221,6 +221,10 @@ pub struct LowerCtx<'a> {
     pub role_catalog: Arc<crate::auth::InMemoryAuthCatalog>,
     /// Runtime privilege catalog backing GRANT/REVOKE behavior.
     pub privilege_catalog: Arc<crate::auth::InMemoryPrivilegeCatalog>,
+    /// Runtime row-security registry keyed by table OID.
+    pub row_security: Arc<dashmap::DashMap<ultrasql_core::Oid, Arc<crate::TableRowSecurity>>>,
+    /// Session-local GUCs used by row-security policy predicates.
+    pub session_settings: Arc<HashMap<String, String>>,
     /// Effective role for `current_user` and privilege checks.
     pub current_user: String,
     /// Startup role for `session_user`.

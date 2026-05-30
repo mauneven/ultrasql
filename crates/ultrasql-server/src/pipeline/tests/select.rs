@@ -488,6 +488,8 @@ impl IndexFixture {
             sequences: StdArc::new(dashmap::DashMap::new()),
             role_catalog: StdArc::new(crate::auth::InMemoryAuthCatalog::with_bootstrap_superuser()),
             privilege_catalog: StdArc::new(crate::auth::InMemoryPrivilegeCatalog::new()),
+            row_security: StdArc::new(dashmap::DashMap::new()),
+            session_settings: StdArc::new(HashMap::new()),
             current_user: "ultrasql".to_owned(),
             session_user: "ultrasql".to_owned(),
             persistent_catalog: StdArc::new(ultrasql_catalog::persistent::PersistentCatalog::new()),
