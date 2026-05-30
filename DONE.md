@@ -198,6 +198,10 @@ as a concise evidence ledger; roadmap stays for open gates only.
   decimal `NUMERIC` canonicalization, so grouped and distinct aggregate paths
   no longer split equal values by display scale. Evidence:
   `cargo test -p ultrasql-executor hash_aggregate`.
+- Sort aggregate group-key equality now uses shared decimal `NUMERIC`
+  canonicalization, keeping sorted GROUP BY boundaries aligned with hash GROUP
+  BY semantics for mixed-scale equal values. Evidence:
+  `cargo test -p ultrasql-executor sort_aggregate`.
 
 ## Core SQL And Wire Protocol
 

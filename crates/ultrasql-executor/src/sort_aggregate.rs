@@ -34,6 +34,7 @@ use ultrasql_vec::Batch;
 use crate::eval::Eval;
 use crate::filter_op::batch_to_rows;
 use crate::seq_scan::build_batch;
+use crate::value_key::decimal_values_equal;
 use crate::{ExecError, Operator};
 
 const BATCH_TARGET_ROWS: usize = 4096;
@@ -634,6 +635,16 @@ fn keys_equal(a: &[Value], b: &[Value]) -> bool {
             (Value::Null, Value::Null) => true,
             (Value::Float32(x), Value::Float32(y)) => x.to_bits() == y.to_bits(),
             (Value::Float64(x), Value::Float64(y)) => x.to_bits() == y.to_bits(),
+            (
+                Value::Decimal {
+                    value: left_value,
+                    scale: left_scale,
+                },
+                Value::Decimal {
+                    value: right_value,
+                    scale: right_scale,
+                },
+            ) => decimal_values_equal(*left_value, *left_scale, *right_value, *right_scale),
             _ => av == bv,
         })
 }
@@ -1087,6 +1098,17 @@ mod tests {
             err.to_string().contains("division by zero"),
             "unexpected error: {err}"
         );
+    }
+
+    #[test]
+    fn sort_agg_group_keys_match_decimal_values_across_scales() {
+        assert!(super::keys_equal(
+            &[Value::Decimal {
+                value: 10,
+                scale: 1,
+            }],
+            &[Value::Decimal { value: 1, scale: 0 }]
+        ));
     }
 
     #[test]
