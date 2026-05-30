@@ -625,6 +625,95 @@ async fn rls_insert_select_checks_source_rows_atomically() {
 }
 
 #[tokio::test]
+async fn rls_update_checks_new_rows_and_preserves_old_row_on_failure() {
+    let (client, _conn, server_handle) = start_server_and_connect().await;
+
+    client
+        .batch_execute(
+            "CREATE TABLE tenant_docs_update_check (\
+                tenant_id TEXT NOT NULL, \
+                doc_id TEXT NOT NULL, \
+                body TEXT\
+             )",
+        )
+        .await
+        .expect("create update rls table");
+    client
+        .batch_execute(
+            "INSERT INTO tenant_docs_update_check VALUES \
+                ('tenant-a', 'doc-a', 'alpha'), \
+                ('tenant-b', 'doc-b', 'bravo')",
+        )
+        .await
+        .expect("insert update rls rows");
+    client
+        .batch_execute(
+            "CREATE POLICY tenant_docs_update_check_read \
+                ON tenant_docs_update_check \
+                FOR SELECT \
+                USING (tenant_id = current_setting('ultrasql.tenant_id', true))",
+        )
+        .await
+        .expect("create select policy");
+    client
+        .batch_execute(
+            "CREATE POLICY tenant_docs_update_check_write \
+                ON tenant_docs_update_check \
+                FOR UPDATE \
+                USING (tenant_id = current_setting('ultrasql.tenant_id', true)) \
+                WITH CHECK (tenant_id = current_setting('ultrasql.tenant_id', true))",
+        )
+        .await
+        .expect("create update policy");
+    client
+        .batch_execute("ALTER TABLE tenant_docs_update_check ENABLE ROW LEVEL SECURITY")
+        .await
+        .expect("enable update rls");
+    client
+        .batch_execute("SET ultrasql.tenant_id = 'tenant-a'")
+        .await
+        .expect("set tenant guc");
+
+    client
+        .batch_execute(
+            "UPDATE tenant_docs_update_check SET body = 'alpha-2' WHERE doc_id = 'doc-a'",
+        )
+        .await
+        .expect("same-tenant update passes");
+    let err = client
+        .batch_execute(
+            "UPDATE tenant_docs_update_check SET tenant_id = 'tenant-b' WHERE doc_id = 'doc-a'",
+        )
+        .await
+        .expect_err("cross-tenant update must fail RLS WITH CHECK");
+    assert!(
+        err.as_db_error()
+            .is_some_and(|db| db.message().contains("row-level security")),
+        "unexpected error: {err}"
+    );
+    let rows = simple_rows(
+        &client
+            .simple_query(
+                "SELECT tenant_id, doc_id, body \
+                 FROM tenant_docs_update_check \
+                 ORDER BY doc_id",
+            )
+            .await
+            .expect("select rows after rejected update"),
+    );
+    assert_eq!(
+        rows,
+        vec![vec![
+            "tenant-a".to_owned(),
+            "doc-a".to_owned(),
+            "alpha-2".to_owned(),
+        ]]
+    );
+
+    shutdown(client, server_handle).await;
+}
+
+#[tokio::test]
 async fn rls_restrictive_select_policies_narrow_permissive_visibility() {
     let (client, _conn, server_handle) = start_server_and_connect().await;
 

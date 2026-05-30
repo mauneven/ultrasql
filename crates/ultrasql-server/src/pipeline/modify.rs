@@ -257,6 +257,18 @@ pub(super) fn lower_real_insert(
 }
 
 fn build_rls_insert_checks(entry: &TableEntry, ctx: &LowerCtx<'_>) -> Vec<(String, ScalarExpr)> {
+    build_rls_mutation_checks(entry, ctx, crate::RuntimeRlsCommand::Insert)
+}
+
+fn build_rls_update_checks(entry: &TableEntry, ctx: &LowerCtx<'_>) -> Vec<(String, ScalarExpr)> {
+    build_rls_mutation_checks(entry, ctx, crate::RuntimeRlsCommand::Update)
+}
+
+fn build_rls_mutation_checks(
+    entry: &TableEntry,
+    ctx: &LowerCtx<'_>,
+    command: crate::RuntimeRlsCommand,
+) -> Vec<(String, ScalarExpr)> {
     let Some(runtime_ref) = ctx.row_security.get(&entry.oid) else {
         return Vec::new();
     };
@@ -269,8 +281,7 @@ fn build_rls_insert_checks(entry: &TableEntry, ctx: &LowerCtx<'_>) -> Vec<(Strin
     let mut permissive = Vec::new();
     let mut restrictive = Vec::new();
     for policy in runtime.policies.iter().filter(|policy| {
-        policy.command.applies_to(crate::RuntimeRlsCommand::Insert)
-            && policy.applies_to_roles(&inherited_roles)
+        policy.command.applies_to(command) && policy.applies_to_roles(&inherited_roles)
     }) {
         let Some(expr) = policy.with_check.as_ref().or(policy.using.as_ref()) else {
             continue;
@@ -1955,6 +1966,7 @@ pub(super) fn lower_real_update(
             || !c.exclusion_constraints.is_empty()
     });
     let has_parent_constraints = !build_referenced_by_update_checks(entry.oid, ctx)?.is_empty();
+    let rls_update_checks = build_rls_update_checks(entry, ctx);
 
     // Fast-path: when the relation, assignment, and optional filter all
     // match the `(Int32, Int32) WHERE col cmp lit SET col_i = col_i ±
@@ -1966,6 +1978,7 @@ pub(super) fn lower_real_update(
         && !index_maintenance_needed
         && !has_child_constraints
         && !has_parent_constraints
+        && rls_update_checks.is_empty()
     {
         if let Some(fused) = try_build_fused_update(table, entry, assignments, input, ctx)? {
             return Ok(fused);
@@ -1997,16 +2010,23 @@ pub(super) fn lower_real_update(
         child,
     )
     .with_visibility_map(Arc::clone(&ctx.vm));
+    let mut check_constraints = rls_update_checks;
+    if let Some(constraints) = &constraints {
+        check_constraints.extend(
+            constraints
+                .checks
+                .iter()
+                .map(|check| (check.name.clone(), check.expr.clone())),
+        );
+    }
+    let modify = if !check_constraints.is_empty() {
+        modify.with_check_constraints(check_constraints)
+    } else {
+        modify
+    };
     let modify = if let Some(constraints) = constraints {
         modify
             .with_generated_stored(constraints.generated_stored.clone())
-            .with_check_constraints(
-                constraints
-                    .checks
-                    .iter()
-                    .map(|check| (check.name.clone(), check.expr.clone()))
-                    .collect(),
-            )
             .with_foreign_key_checks(build_foreign_key_checks(&constraints.foreign_keys, ctx)?)
             .with_exclusion_update_checks(build_exclusion_update_checks(
                 entry,
@@ -2189,10 +2209,10 @@ pub(super) fn lower_real_delete(
 
 /// Build the TID-emitting child operator for an UPDATE / DELETE.
 ///
-/// Recognises the binder's `Scan` / `Filter(Scan)` shapes:
+/// Recognises the binder's `Scan` / nested `Filter` shapes:
 ///
 /// - bare `Scan { table }` → TID-emitting `SeqScan`.
-/// - `Filter { Scan { table }, predicate }` → `Filter`(`SeqScan`),
+/// - `Filter { input, predicate }` → `Filter`(lowered `input`),
 ///   with every `Column { index }` in `predicate` shifted by +2 to
 ///   re-target the TID-prefixed batch.
 ///
@@ -2217,19 +2237,9 @@ pub(super) fn build_filtered_tid_scan(
             input: filter_input,
             predicate,
         } => {
-            let LogicalPlan::Scan { table, .. } = filter_input.as_ref() else {
-                return Err(ServerError::Unsupported(
-                    "UPDATE / DELETE WHERE input must be a base-table scan",
-                ));
-            };
-            if !table.eq_ignore_ascii_case(target_table) {
-                return Err(ServerError::Unsupported(
-                    "UPDATE / DELETE child scan references a different table",
-                ));
-            }
-            let scan = build_tid_seq_scan(entry, ctx);
+            let child = build_filtered_tid_scan(target_table, entry, filter_input, ctx)?;
             let shifted = shift_column_indices(predicate, 2);
-            Ok(Box::new(Filter::new(scan, shifted)))
+            Ok(Box::new(Filter::new(child, shifted)))
         }
         _ => Err(ServerError::Unsupported(
             "UPDATE / DELETE input shape; expected Scan or Filter(Scan)",

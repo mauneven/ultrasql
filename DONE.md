@@ -684,6 +684,11 @@ as a concise evidence ledger; roadmap stays for open gates only.
   paths when a row-security check exists, and rejects mixed-tenant source rows
   atomically. Evidence:
   `cargo test -p ultrasql-server --test rls_round_trip rls_insert_select_checks_source_rows_atomically -- --nocapture`.
+- RLS `UPDATE` now enforces new-row `WITH CHECK` predicates through the same
+  mutation check path, skips unchecked fused update paths when row-security
+  checks exist, supports nested RLS/user filters for TID scans, and preserves
+  old rows on rejected tenant changes. Evidence:
+  `cargo test -p ultrasql-server --test rls_round_trip rls_update_checks_new_rows_and_preserves_old_row_on_failure -- --nocapture`.
 - Driver certification covers `libpq`, `psycopg2`, `psycopg3`,
   `node-postgres`, `pgx`, `lib/pq`, `JDBC`, `Npgsql`, and
   `tokio-postgres`.
