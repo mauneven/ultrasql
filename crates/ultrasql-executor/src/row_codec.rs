@@ -1876,13 +1876,8 @@ impl RowCodec {
                             have: bytes.len(),
                         });
                     }
-                    if std::str::from_utf8(&bytes[cursor..str_end]).is_err() {
-                        return Err(RowCodecError::InvalidUtf8(
-                            String::from_utf8(bytes[cursor..str_end].to_vec())
-                                .expect_err("just observed invalid utf8"),
-                            "text column",
-                        ));
-                    }
+                    std::str::from_utf8(&bytes[cursor..str_end])
+                        .map_err(|error| RowCodecError::InvalidUtf8Slice(error, "text column"))?;
                     values.extend_from_slice(&bytes[cursor..str_end]);
                     cursor += str_len;
                     let new_end = u32::try_from(values.len()).map_err(|_| {
@@ -3164,6 +3159,9 @@ pub enum RowCodecError {
     /// Invalid UTF-8 in a Text column.
     #[error("invalid utf8 at column {1}: {0}")]
     InvalidUtf8(#[source] std::string::FromUtf8Error, &'static str),
+    /// Invalid UTF-8 in a borrowed Text column payload.
+    #[error("invalid utf8 at column {1}: {0}")]
+    InvalidUtf8Slice(#[source] std::str::Utf8Error, &'static str),
 }
 
 #[cfg(test)]
@@ -3631,6 +3629,19 @@ mod tests {
                 .expect_err("truncated fixed payload");
             assert!(matches!(err, RowCodecError::Truncated { .. }));
         }
+    }
+
+    #[test]
+    fn decode_into_builders_rejects_invalid_utf8_without_owned_error_roundtrip() {
+        let codec = RowCodec::new(schema_text());
+        let mut builders = codec.new_builders(1).expect("builders");
+        let err = codec
+            .decode_into_builders(&[0x00, 0x01, 0x00, 0x00, 0x00, 0xff], &mut builders)
+            .expect_err("invalid utf8");
+        assert!(matches!(
+            err,
+            RowCodecError::InvalidUtf8Slice(_, "text column")
+        ));
     }
 
     #[test]

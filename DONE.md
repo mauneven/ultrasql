@@ -213,6 +213,10 @@ as a concise evidence ledger; roadmap stays for open gates only.
 - Vectorized pipeline builder now resolves terminal schema with a typed
   `ExecError::Internal` instead of a production `expect`. Evidence:
   `cargo test -p ultrasql-executor push_pipeline`.
+- Row codec builder decode now rejects invalid UTF-8 with a borrowed
+  `Utf8Error` variant instead of constructing the error through
+  `expect_err`, preserving the no-allocation validation path. Evidence:
+  `cargo test -p ultrasql-executor row_codec`.
 
 ## Core SQL And Wire Protocol
 
