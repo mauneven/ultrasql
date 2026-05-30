@@ -459,6 +459,17 @@ pub struct PersistentCatalog {
     next_oid: AtomicU32,
 }
 
+fn attnum_for_index(idx: usize, object: &str) -> Result<i16, CatalogError> {
+    let one_based = idx.checked_add(1).ok_or_else(|| {
+        CatalogError::schema_conflict(format!("{object} has too many attributes"))
+    })?;
+    i16::try_from(one_based).map_err(|_| {
+        CatalogError::schema_conflict(format!(
+            "{object} has too many attributes: attribute number {one_based} exceeds i16::MAX"
+        ))
+    })
+}
+
 impl Default for PersistentCatalog {
     fn default() -> Self {
         Self::new()
@@ -538,7 +549,19 @@ impl PersistentCatalog {
     /// should hold `write_lock` across both operations so concurrent
     /// readers either see the old snapshot or the new one — never a
     /// partially-updated state.
-    pub fn install_snapshot(&self, snap: CatalogSnapshot) {
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CatalogError::SchemaConflict`] if a composite type has
+    /// more attributes than `pg_attribute.attnum` can represent.
+    pub fn install_snapshot(&self, snap: CatalogSnapshot) -> Result<(), CatalogError> {
+        for entry in snap.composite_types.values() {
+            let attr_context = format!("composite type {}", entry.name);
+            for (idx, _) in entry.schema.fields().iter().enumerate() {
+                attnum_for_index(idx, &attr_context)?;
+            }
+        }
+
         let _guard = self.write_lock.lock();
         // Re-populate the backing DashMaps from the snapshot so that
         // subsequent MutableCatalog operations (create_table, etc.) have
@@ -591,7 +614,7 @@ impl PersistentCatalog {
             self.pg_class
                 .insert(entry.oid, class_row_from_composite(entry));
             for (idx, field) in entry.schema.fields().iter().enumerate() {
-                let attnum = i16::try_from(idx + 1).expect("attribute count fits in i16");
+                let attnum = attnum_for_index(idx, &format!("composite type {}", entry.name))?;
                 let attr = AttributeRow {
                     attrelid: entry.oid,
                     attname: field.name.clone(),
@@ -620,6 +643,7 @@ impl PersistentCatalog {
             self.pg_statistic_ext.insert(*oid, row.clone());
         }
         self.snapshot.store(Arc::new(snap));
+        Ok(())
     }
 
     /// Bootstrap the catalog from on-disk system catalog heap pages.
@@ -677,7 +701,7 @@ impl PersistentCatalog {
             // Fresh database — install the initial hard-coded snapshot.
             let snap = initial_snapshot();
             let stats = CatalogStats::initial();
-            self.install_snapshot(snap);
+            self.install_snapshot(snap)?;
             tracing::debug!(
                 ?stats,
                 "catalog bootstrapped from initial snapshot (empty heap)"
@@ -1148,7 +1172,7 @@ impl PersistentCatalog {
             statistics: total_statistics,
             statistic_ext: total_statistic_ext,
         };
-        self.install_snapshot(snap);
+        self.install_snapshot(snap)?;
         self.pg_attribute.clear();
         for (key, row) in attribute_rows {
             self.pg_attribute.insert(key, row);
@@ -1273,9 +1297,11 @@ impl PersistentCatalog {
         let wal = heap.wal_sink().map(|sink| sink.as_ref());
 
         let type_row = type_row_from_enum(entry);
+        let type_bytes = encode_type_row(&type_row)
+            .map_err(|e| CatalogError::schema_conflict(format!("encode pg_type: {e}")))?;
         heap.insert(
             pg_type_rel,
-            &encode_type_row(&type_row),
+            &type_bytes,
             InsertOptions {
                 xmin,
                 command_id,
@@ -1288,9 +1314,11 @@ impl PersistentCatalog {
 
         for label in &entry.labels {
             let enum_row = enum_row_from_label(entry.oid, label);
+            let enum_bytes = encode_enum_row(&enum_row)
+                .map_err(|e| CatalogError::schema_conflict(format!("encode pg_enum: {e}")))?;
             heap.insert(
                 pg_enum_rel,
-                &encode_enum_row(&enum_row),
+                &enum_bytes,
                 InsertOptions {
                     xmin,
                     command_id,
@@ -1341,8 +1369,9 @@ impl PersistentCatalog {
             .insert(entry.oid, type_row_from_composite(&entry));
         self.pg_class
             .insert(entry.oid, class_row_from_composite(&entry));
+        let attr_context = format!("composite type {}", entry.name);
         for (idx, field) in entry.schema.fields().iter().enumerate() {
-            let attnum = i16::try_from(idx + 1).unwrap_or(i16::MAX);
+            let attnum = attnum_for_index(idx, &attr_context)?;
             self.pg_attribute.insert(
                 (entry.oid, attnum),
                 AttributeRow {
@@ -1405,9 +1434,11 @@ impl PersistentCatalog {
         let wal = heap.wal_sink().map(|sink| sink.as_ref());
 
         let type_row = type_row_from_composite(entry);
+        let type_bytes = encode_type_row(&type_row)
+            .map_err(|e| CatalogError::schema_conflict(format!("encode pg_type: {e}")))?;
         heap.insert(
             pg_type_rel,
-            &encode_type_row(&type_row),
+            &type_bytes,
             InsertOptions {
                 xmin,
                 command_id,
@@ -1418,9 +1449,12 @@ impl PersistentCatalog {
         )
         .map_err(|e| CatalogError::schema_conflict(format!("pg_type insert: {e}")))?;
 
+        let class_bytes = class_row_from_composite(entry)
+            .encode()
+            .map_err(|e| CatalogError::schema_conflict(format!("encode pg_class: {e}")))?;
         heap.insert(
             pg_class_rel,
-            &class_row_from_composite(entry).encode(),
+            &class_bytes,
             InsertOptions {
                 xmin,
                 command_id,
@@ -1431,12 +1465,14 @@ impl PersistentCatalog {
         )
         .map_err(|e| CatalogError::schema_conflict(format!("pg_class insert: {e}")))?;
 
+        let attr_context = format!("composite type {}", entry.name);
         for (idx, field) in entry.schema.fields().iter().enumerate() {
+            let attnum = attnum_for_index(idx, &attr_context)?;
             let attr_row = AttributeRow {
                 attrelid: entry.oid,
                 attname: field.name.clone(),
                 atttypid: 0,
-                attnum: i16::try_from(idx + 1).unwrap_or(i16::MAX),
+                attnum,
                 attnotnull: !field.nullable,
                 atthasdef: false,
                 attisdropped: false,
@@ -1526,9 +1562,11 @@ impl PersistentCatalog {
 
         let pg_type_rel = RelationId::new(bootstrap::PG_TYPE_OID);
         let wal = heap.wal_sink().map(|sink| sink.as_ref());
+        let type_bytes = encode_type_row(&type_row_from_domain(entry))
+            .map_err(|e| CatalogError::schema_conflict(format!("encode pg_type: {e}")))?;
         heap.insert(
             pg_type_rel,
-            &encode_type_row(&type_row_from_domain(entry)),
+            &type_bytes,
             InsertOptions {
                 xmin,
                 command_id,
@@ -1572,9 +1610,12 @@ impl PersistentCatalog {
             relhasindex: false,
             reloptions: Vec::new(),
         };
+        let class_bytes = class_row
+            .encode()
+            .map_err(|e| CatalogError::schema_conflict(format!("encode pg_class: {e}")))?;
         heap.insert(
             pg_class_rel,
-            &class_row.encode(),
+            &class_bytes,
             InsertOptions {
                 xmin,
                 command_id,
@@ -1611,7 +1652,8 @@ impl PersistentCatalog {
             indopclasses: normalized_opclasses(entry),
             indoptions: entry.options.clone(),
         };
-        let bytes = encode_index_row(&index_row);
+        let bytes = encode_index_row(&index_row)
+            .map_err(|e| CatalogError::schema_conflict(format!("encode pg_index: {e}")))?;
         heap.insert(
             pg_index_rel,
             &bytes,
@@ -1640,7 +1682,8 @@ impl PersistentCatalog {
 
         let pg_constraint_rel = RelationId::new(bootstrap::PG_CONSTRAINT_OID);
         let wal = heap.wal_sink().map(|sink| sink.as_ref());
-        let bytes = encode_constraint_row(row);
+        let bytes = encode_constraint_row(row)
+            .map_err(|e| CatalogError::schema_conflict(format!("encode pg_constraint: {e}")))?;
         heap.insert(
             pg_constraint_rel,
             &bytes,
@@ -1682,9 +1725,12 @@ impl PersistentCatalog {
             relhasindex: false,
             reloptions: Vec::new(),
         };
+        let class_bytes = class_row
+            .encode()
+            .map_err(|e| CatalogError::schema_conflict(format!("encode pg_class: {e}")))?;
         heap.insert(
             pg_class_rel,
-            &class_row.encode(),
+            &class_bytes,
             InsertOptions {
                 xmin,
                 command_id,
@@ -1779,9 +1825,12 @@ impl PersistentCatalog {
             relhasindex: false,
             reloptions: new_entry.options.clone(),
         };
+        let class_bytes = class_row
+            .encode()
+            .map_err(|e| CatalogError::schema_conflict(format!("encode pg_class: {e}")))?;
         heap.insert(
             pg_class_rel,
-            &class_row.encode(),
+            &class_bytes,
             InsertOptions {
                 xmin,
                 command_id,
@@ -1792,12 +1841,14 @@ impl PersistentCatalog {
         )
         .map_err(|e| CatalogError::schema_conflict(format!("pg_class insert: {e}")))?;
 
+        let old_attr_context = format!("old table {}", old_entry.name);
         for (i, field) in old_entry.schema.fields().iter().enumerate() {
+            let attnum = attnum_for_index(i, &old_attr_context)?;
             let attr_row = AttributeRow {
                 attrelid: new_entry.oid,
                 attname: field.name.clone(),
                 atttypid: 0,
-                attnum: i16::try_from(i + 1).unwrap_or(i16::MAX),
+                attnum,
                 attnotnull: !field.nullable,
                 atthasdef: false,
                 attisdropped: true,
@@ -1818,12 +1869,14 @@ impl PersistentCatalog {
             .map_err(|e| CatalogError::schema_conflict(format!("pg_attribute insert: {e}")))?;
         }
 
+        let new_attr_context = format!("table {}", new_entry.name);
         for (i, field) in new_entry.schema.fields().iter().enumerate() {
+            let attnum = attnum_for_index(i, &new_attr_context)?;
             let attr_row = AttributeRow {
                 attrelid: new_entry.oid,
                 attname: field.name.clone(),
                 atttypid: 0,
-                attnum: i16::try_from(i + 1).unwrap_or(i16::MAX),
+                attnum,
                 attnotnull: !field.nullable,
                 atthasdef: false,
                 attisdropped: false,
@@ -1882,9 +1935,12 @@ impl PersistentCatalog {
             relhasindex: false,
             reloptions: entry.options.clone(),
         };
+        let class_bytes = class_row
+            .encode()
+            .map_err(|e| CatalogError::schema_conflict(format!("encode pg_class: {e}")))?;
         heap.insert(
             pg_class_rel,
-            &class_row.encode(),
+            &class_bytes,
             InsertOptions {
                 xmin,
                 command_id,
@@ -1895,12 +1951,14 @@ impl PersistentCatalog {
         )
         .map_err(|e| CatalogError::schema_conflict(format!("pg_class tombstone insert: {e}")))?;
 
+        let attr_context = format!("table {}", entry.name);
         for (i, field) in entry.schema.fields().iter().enumerate() {
+            let attnum = attnum_for_index(i, &attr_context)?;
             let attr_row = AttributeRow {
                 attrelid: entry.oid,
                 attname: field.name.clone(),
                 atttypid: 0,
-                attnum: i16::try_from(i + 1).unwrap_or(i16::MAX),
+                attnum,
                 attnotnull: !field.nullable,
                 atthasdef: false,
                 attisdropped: true,
@@ -1983,7 +2041,9 @@ impl PersistentCatalog {
             relhasindex: false,
             reloptions: entry.options.clone(),
         };
-        let class_bytes = class_row.encode();
+        let class_bytes = class_row
+            .encode()
+            .map_err(|e| CatalogError::schema_conflict(format!("encode pg_class: {e}")))?;
         let wal = heap.wal_sink().map(|sink| sink.as_ref());
         let class_opts = InsertOptions {
             xmin,
@@ -1995,12 +2055,14 @@ impl PersistentCatalog {
         heap.insert(pg_class_rel, &class_bytes, class_opts)
             .map_err(|e| CatalogError::schema_conflict(format!("pg_class insert: {e}")))?;
 
+        let attr_context = format!("table {}", entry.name);
         for (i, field) in entry.schema.fields().iter().enumerate() {
+            let attnum = attnum_for_index(i, &attr_context)?;
             let attr_row = AttributeRow {
                 attrelid: entry.oid,
                 attname: field.name.clone(),
                 atttypid: 0,
-                attnum: i16::try_from(i + 1).unwrap_or(i16::MAX),
+                attnum,
                 attnotnull: !field.nullable,
                 atthasdef: attr_has_defaults.get(i).copied().unwrap_or(false),
                 attisdropped: false,
@@ -2066,7 +2128,8 @@ impl PersistentCatalog {
 
         let pg_statistic_ext_rel = RelationId::new(bootstrap::PG_STATISTIC_EXT_OID);
         let wal = heap.wal_sink().map(|sink| sink.as_ref());
-        let bytes = encode_statistic_ext_row(row);
+        let bytes = encode_statistic_ext_row(row)
+            .map_err(|e| CatalogError::schema_conflict(format!("encode pg_statistic_ext: {e}")))?;
         heap.insert(
             pg_statistic_ext_rel,
             &bytes,
@@ -2209,7 +2272,8 @@ impl PersistentCatalog {
 
         let pg_description_rel = RelationId::new(bootstrap::PG_DESCRIPTION_OID);
         let wal = heap.wal_sink().map(|sink| sink.as_ref());
-        let bytes = encode_description_row(row, deleted);
+        let bytes = encode_description_row(row, deleted)
+            .map_err(|e| CatalogError::schema_conflict(format!("encode pg_description: {e}")))?;
         heap.insert(
             pg_description_rel,
             &bytes,
@@ -2638,7 +2702,7 @@ mod tests {
     use ultrasql_core::{BlockNumber, DataType, Field, Lsn, Oid, Schema};
 
     use super::*;
-    use crate::entry::{IndexEntry, TableEntry};
+    use crate::entry::{CompositeTypeEntry, IndexEntry, TableEntry};
     use crate::traits::{Catalog, MutableCatalog};
 
     fn sample_schema() -> Schema {
@@ -2755,6 +2819,51 @@ mod tests {
         cat.update_table_size(oid, 42).expect("update");
         let snap = cat.snapshot();
         assert_eq!(snap.tables_by_oid[&oid].n_blocks, 42);
+    }
+
+    #[test]
+    fn attnum_overflow_returns_catalog_error() {
+        let overflowing_index =
+            usize::try_from(i64::from(i16::MAX)).expect("usize stores i16::MAX");
+        let err =
+            attnum_for_index(overflowing_index, "composite type c").expect_err("attnum overflow");
+        assert!(
+            matches!(err, CatalogError::SchemaConflict(message) if message.contains("too many attributes"))
+        );
+    }
+
+    #[test]
+    fn install_snapshot_attnum_overflow_preserves_existing_snapshot() {
+        let cat = PersistentCatalog::new();
+        let heap = blank_heap();
+        cat.bootstrap_from_heap(&heap).expect("bootstrap");
+        let before = cat.snapshot();
+        let mut snap = (*before).clone();
+        let field_count =
+            usize::try_from(i64::from(i16::MAX) + 1).expect("usize stores overflow field count");
+        let fields = (0..field_count)
+            .map(|idx| Field::required(format!("c{idx}"), DataType::Int32))
+            .collect::<Vec<_>>();
+        let schema = Schema::new(fields).expect("many unique fields");
+        let entry = CompositeTypeEntry {
+            oid: cat.next_oid(),
+            name: "too_wide".to_owned(),
+            schema_name: "public".to_owned(),
+            schema,
+        };
+        snap.composite_types
+            .insert("too_wide".to_owned(), entry.clone());
+        snap.composite_types_by_oid.insert(entry.oid, entry);
+
+        let err = cat
+            .install_snapshot(snap)
+            .expect_err("attnum overflow rejects snapshot");
+        assert!(
+            matches!(err, CatalogError::SchemaConflict(message) if message.contains("too many attributes"))
+        );
+        let after = cat.snapshot();
+        assert_eq!(after.tables.len(), before.tables.len());
+        assert!(!after.composite_types.contains_key("too_wide"));
     }
 
     // -----------------------------------------------------------------------
@@ -2885,7 +2994,7 @@ mod tests {
             statistics: snap_a.statistics.clone(),
             statistic_ext: snap_a.statistic_ext.clone(),
         };
-        cat.install_snapshot(snap_b);
+        cat.install_snapshot(snap_b).expect("install snapshot");
 
         // Snapshot B must be visible immediately.
         let snap_after = cat.snapshot();

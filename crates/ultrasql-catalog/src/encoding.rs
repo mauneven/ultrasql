@@ -38,6 +38,16 @@ pub enum EncodeError {
     /// uses it.
     #[error("data type not yet supported for catalog persistence: {0:?}")]
     UnsupportedType(DataType),
+
+    /// A variable-length field exceeded the catalog row format's
+    /// 32-bit length prefix.
+    #[error("encoded {what} length {len} exceeds u32::MAX")]
+    LengthOverflow {
+        /// Field or collection being encoded.
+        what: &'static str,
+        /// Source length in host `usize` units.
+        len: usize,
+    },
 }
 
 /// Errors raised while reading a row from bytes.
@@ -88,6 +98,10 @@ pub enum DecodeError {
 
 struct Writer<'a>(&'a mut Vec<u8>);
 
+fn len_u32(len: usize, what: &'static str) -> Result<u32, EncodeError> {
+    u32::try_from(len).map_err(|_| EncodeError::LengthOverflow { what, len })
+}
+
 impl Writer<'_> {
     fn u8(&mut self, v: u8) {
         self.0.push(v);
@@ -113,17 +127,19 @@ impl Writer<'_> {
     fn bool(&mut self, v: bool) {
         self.0.push(u8::from(v));
     }
-    fn str(&mut self, s: &str) {
+    fn str(&mut self, s: &str) -> Result<(), EncodeError> {
         let bytes = s.as_bytes();
-        self.u32(u32::try_from(bytes.len()).expect("string fits in u32"));
+        self.u32(len_u32(bytes.len(), "string")?);
         self.0.extend_from_slice(bytes);
+        Ok(())
     }
-    fn string_pairs(&mut self, pairs: &[(String, String)]) {
-        self.u32(u32::try_from(pairs.len()).expect("pair count fits in u32"));
+    fn string_pairs(&mut self, pairs: &[(String, String)]) -> Result<(), EncodeError> {
+        self.u32(len_u32(pairs.len(), "string pair count")?);
         for (key, value) in pairs {
-            self.str(key);
-            self.str(value);
+            self.str(key)?;
+            self.str(value)?;
         }
+        Ok(())
     }
     fn opt_u32(&mut self, v: Option<u32>) {
         match v {
@@ -316,19 +332,19 @@ fn encode_data_type(w: &mut Writer<'_>, ty: &DataType) -> Result<(), EncodeError
         DataType::Enum { oid, name, labels } => {
             w.u8(DT_ENUM);
             w.u32(oid.raw());
-            w.str(name);
-            w.u32(u32::try_from(labels.len()).expect("enum label count fits in u32"));
+            w.str(name)?;
+            w.u32(len_u32(labels.len(), "enum label count")?);
             for label in labels.iter() {
-                w.str(label);
+                w.str(label)?;
             }
         }
         DataType::Composite { oid, name, fields } => {
             w.u8(DT_COMPOSITE);
             w.u32(oid.raw());
-            w.str(name);
-            w.u32(u32::try_from(fields.len()).expect("composite field count fits in u32"));
+            w.str(name)?;
+            w.u32(len_u32(fields.len(), "composite field count")?);
             for (field_name, field_type) in fields.iter() {
-                w.str(field_name);
+                w.str(field_name)?;
                 encode_data_type(w, field_type)?;
             }
         }
@@ -340,7 +356,7 @@ fn encode_data_type(w: &mut Writer<'_>, ty: &DataType) -> Result<(), EncodeError
         } => {
             w.u8(DT_DOMAIN);
             w.u32(oid.raw());
-            w.str(name);
+            w.str(name)?;
             w.bool(*not_null);
             encode_data_type(w, base_type)?;
         }
@@ -611,20 +627,25 @@ fn decode_relkind(b: u8, offset: usize) -> Result<RelKind, DecodeError> {
 impl ClassRow {
     /// Serialise this row into the catalog's internal binary format.
     /// See the module-level documentation for the byte layout.
-    #[must_use]
-    pub fn encode(&self) -> Vec<u8> {
+    ///
+    /// # Errors
+    ///
+    /// Returns [`EncodeError::LengthOverflow`] when a variable-length
+    /// string or option list cannot fit the row format's 32-bit length
+    /// prefix.
+    pub fn encode(&self) -> Result<Vec<u8>, EncodeError> {
         let mut out = Vec::with_capacity(64 + self.relname.len());
         let mut w = Writer(&mut out);
         w.u32(self.oid.raw());
-        w.str(&self.relname);
+        w.str(&self.relname)?;
         w.u32(self.relnamespace.raw());
         w.u8(encode_relkind(self.relkind));
         w.u32(self.relpages);
         w.f64(self.reltuples);
         w.u32(self.relfilenode);
         w.bool(self.relhasindex);
-        w.string_pairs(&self.reloptions);
-        out
+        w.string_pairs(&self.reloptions)?;
+        Ok(out)
     }
 
     /// Deserialise a row produced by [`Self::encode`].
@@ -692,7 +713,7 @@ pub fn encode_attribute_row(
     let mut out = Vec::with_capacity(32 + row.attname.len());
     let mut w = Writer(&mut out);
     w.u32(row.attrelid.raw());
-    w.str(&row.attname);
+    w.str(&row.attname)?;
     w.u32(row.atttypid);
     w.i16(row.attnum);
     w.bool(row.attnotnull);
@@ -770,18 +791,22 @@ pub fn schema_from_attributes(
 // ---------------------------------------------------------------------------
 
 /// Encode a `pg_type` row into the catalog's internal binary format.
-#[must_use]
-pub fn encode_type_row(row: &TypeRow) -> Vec<u8> {
+///
+/// # Errors
+///
+/// Returns [`EncodeError::LengthOverflow`] when a text field cannot fit
+/// the row format's 32-bit length prefix.
+pub fn encode_type_row(row: &TypeRow) -> Result<Vec<u8>, EncodeError> {
     let mut out = Vec::with_capacity(32 + row.typname.len());
     let mut w = Writer(&mut out);
     w.u32(row.oid.raw());
-    w.str(&row.typname);
+    w.str(&row.typname)?;
     w.u32(row.typnamespace.raw());
-    w.str(&row.typtype.to_string());
-    w.str(&row.typcategory.to_string());
+    w.str(&row.typtype.to_string())?;
+    w.str(&row.typcategory.to_string())?;
     w.i16(row.typlen);
     w.u32(row.typelem);
-    out
+    Ok(out)
 }
 
 /// Decode a `pg_type` row from the catalog's internal binary format.
@@ -806,15 +831,19 @@ pub fn decode_type_row(bytes: &[u8]) -> Result<TypeRow, DecodeError> {
 }
 
 /// Encode a `pg_enum` row into the catalog's internal binary format.
-#[must_use]
-pub fn encode_enum_row(row: &EnumRow) -> Vec<u8> {
+///
+/// # Errors
+///
+/// Returns [`EncodeError::LengthOverflow`] when the label cannot fit
+/// the row format's 32-bit length prefix.
+pub fn encode_enum_row(row: &EnumRow) -> Result<Vec<u8>, EncodeError> {
     let mut out = Vec::with_capacity(24 + row.enumlabel.len());
     let mut w = Writer(&mut out);
     w.u32(row.oid.raw());
     w.u32(row.enumtypid.raw());
     w.u32(row.enumsortorder);
-    w.str(&row.enumlabel);
-    out
+    w.str(&row.enumlabel)?;
+    Ok(out)
 }
 
 /// Decode a `pg_enum` row from the catalog's internal binary format.
@@ -844,8 +873,12 @@ fn decode_single_char(text: &str) -> Result<char, DecodeError> {
 // ---------------------------------------------------------------------------
 
 /// Encode a `pg_index` row into the catalog's internal binary format.
-#[must_use]
-pub fn encode_index_row(row: &IndexRow) -> Vec<u8> {
+///
+/// # Errors
+///
+/// Returns [`EncodeError::LengthOverflow`] when a variable-length field
+/// cannot fit the row format's 32-bit length prefix.
+pub fn encode_index_row(row: &IndexRow) -> Result<Vec<u8>, EncodeError> {
     let mut out = Vec::with_capacity(32 + row.indkey.len() * 2);
     let mut w = Writer(&mut out);
     w.u32(row.indexrelid.raw());
@@ -854,27 +887,27 @@ pub fn encode_index_row(row: &IndexRow) -> Vec<u8> {
     w.bool(row.indisunique);
     w.bool(row.indisprimary);
     w.bool(row.indisvalid);
-    w.u32(u32::try_from(row.indkey.len()).expect("indkey length fits in u32"));
+    w.u32(len_u32(row.indkey.len(), "index key count")?);
     for attnum in &row.indkey {
         w.i16(*attnum);
     }
-    w.str(&row.indmethod);
-    w.u32(u32::try_from(row.indopclasses.len()).expect("opclass length fits in u32"));
+    w.str(&row.indmethod)?;
+    w.u32(len_u32(row.indopclasses.len(), "index opclass count")?);
     for opclass in &row.indopclasses {
         match opclass {
             Some(opclass) => {
                 w.bool(true);
-                w.str(opclass);
+                w.str(opclass)?;
             }
             None => w.bool(false),
         }
     }
-    w.u32(u32::try_from(row.indoptions.len()).expect("option length fits in u32"));
+    w.u32(len_u32(row.indoptions.len(), "index option count")?);
     for (name, value) in &row.indoptions {
-        w.str(name);
-        w.str(value);
+        w.str(name)?;
+        w.str(value)?;
     }
-    out
+    Ok(out)
 }
 
 /// Decode a row produced by [`encode_index_row`].
@@ -951,11 +984,16 @@ fn decode_con_type(tag: u8, offset: usize) -> Result<ConType, DecodeError> {
     }
 }
 
-fn write_i16_vec(w: &mut Writer<'_>, values: &[i16]) {
-    w.u32(u32::try_from(values.len()).expect("i16 vec length fits in u32"));
+fn write_i16_vec(
+    w: &mut Writer<'_>,
+    values: &[i16],
+    what: &'static str,
+) -> Result<(), EncodeError> {
+    w.u32(len_u32(values.len(), what)?);
     for value in values {
         w.i16(*value);
     }
+    Ok(())
 }
 
 fn read_i16_vec(r: &mut Reader<'_>) -> Result<Vec<i16>, DecodeError> {
@@ -968,20 +1006,24 @@ fn read_i16_vec(r: &mut Reader<'_>) -> Result<Vec<i16>, DecodeError> {
 }
 
 /// Encode a `pg_constraint` row into the catalog's internal binary format.
-#[must_use]
-pub fn encode_constraint_row(row: &ConstraintRow) -> Vec<u8> {
+///
+/// # Errors
+///
+/// Returns [`EncodeError::LengthOverflow`] when a variable-length field
+/// cannot fit the row format's 32-bit length prefix.
+pub fn encode_constraint_row(row: &ConstraintRow) -> Result<Vec<u8>, EncodeError> {
     let mut out = Vec::new();
     let mut w = Writer(&mut out);
     w.u32(row.oid.raw());
-    w.str(&row.conname);
+    w.str(&row.conname)?;
     w.u32(row.conrelid.raw());
     w.u8(encode_con_type(row.contype));
     w.bool(row.condeferrable);
     w.bool(row.condeferred);
-    write_i16_vec(&mut w, &row.conkey);
+    write_i16_vec(&mut w, &row.conkey, "constraint key count")?;
     w.u32(row.confrelid.raw());
-    write_i16_vec(&mut w, &row.confkey);
-    out
+    write_i16_vec(&mut w, &row.confkey, "constraint foreign key count")?;
+    Ok(out)
 }
 
 /// Decode a row produced by [`encode_constraint_row`].
@@ -1052,16 +1094,20 @@ pub fn decode_sequence_row(bytes: &[u8]) -> Result<SequenceRow, DecodeError> {
 /// Encode a `pg_description` row into the catalog's internal binary format.
 ///
 /// `deleted` marks an append-only tombstone for `COMMENT ... IS NULL`.
-#[must_use]
-pub fn encode_description_row(row: &DescriptionRow, deleted: bool) -> Vec<u8> {
+///
+/// # Errors
+///
+/// Returns [`EncodeError::LengthOverflow`] when the description cannot
+/// fit the row format's 32-bit length prefix.
+pub fn encode_description_row(row: &DescriptionRow, deleted: bool) -> Result<Vec<u8>, EncodeError> {
     let mut out = Vec::with_capacity(17 + row.description.len());
     let mut w = Writer(&mut out);
     w.u32(row.objoid.raw());
     w.u32(row.classoid.raw());
     w.i32(row.objsubid);
-    w.str(&row.description);
+    w.str(&row.description)?;
     w.bool(deleted);
-    out
+    Ok(out)
 }
 
 /// Decode a row produced by [`encode_description_row`].
@@ -1105,20 +1151,24 @@ pub fn decode_statistic_row(bytes: &[u8]) -> Result<StatisticRow, DecodeError> {
 }
 
 /// Encode a `pg_statistic_ext` row into the catalog's internal binary format.
-#[must_use]
-pub fn encode_statistic_ext_row(row: &StatisticExtRow) -> Vec<u8> {
+///
+/// # Errors
+///
+/// Returns [`EncodeError::LengthOverflow`] when a variable-length field
+/// cannot fit the row format's 32-bit length prefix.
+pub fn encode_statistic_ext_row(row: &StatisticExtRow) -> Result<Vec<u8>, EncodeError> {
     let mut out = Vec::with_capacity(32 + row.stxname.len());
     let mut w = Writer(&mut out);
     w.u32(row.oid.raw());
-    w.str(&row.stxname);
+    w.str(&row.stxname)?;
     w.u32(row.stxrelid.raw());
-    w.u32(u32::try_from(row.stxkeys.len()).expect("stxkeys length fits in u32"));
+    w.u32(len_u32(row.stxkeys.len(), "statistic-ext key count")?);
     for key in &row.stxkeys {
         w.i16(*key);
     }
     let stxkind: String = row.stxkind.iter().collect();
-    w.str(&stxkind);
-    out
+    w.str(&stxkind)?;
+    Ok(out)
 }
 
 /// Decode a row produced by [`encode_statistic_ext_row`].
@@ -1165,9 +1215,25 @@ mod tests {
     #[test]
     fn class_row_round_trip() {
         let row = sample_class_row(1234);
-        let bytes = row.encode();
+        let bytes = row.encode().expect("encode");
         let decoded = ClassRow::decode(&bytes).expect("decode");
         assert_eq!(decoded, row);
+    }
+
+    #[test]
+    fn catalog_length_overflow_returns_encode_error() {
+        if usize::BITS <= u32::BITS {
+            return;
+        }
+        let len = usize::try_from(u64::from(u32::MAX) + 1).expect("test target has wider usize");
+        let err = len_u32(len, "test field").expect_err("length overflow");
+        assert!(matches!(
+            err,
+            EncodeError::LengthOverflow {
+                what: "test field",
+                len: got,
+            } if got == len
+        ));
     }
 
     #[test]
@@ -1185,7 +1251,7 @@ mod tests {
         ] {
             let mut row = sample_class_row(7);
             row.relkind = k;
-            let bytes = row.encode();
+            let bytes = row.encode().expect("encode");
             let decoded = ClassRow::decode(&bytes).expect("decode");
             assert_eq!(decoded.relkind, k);
         }
@@ -1369,7 +1435,7 @@ mod tests {
     #[test]
     fn truncated_payload_is_caught() {
         let row = sample_class_row(1);
-        let bytes = row.encode();
+        let bytes = row.encode().expect("encode");
         for cut in 0..bytes.len() {
             assert!(
                 ClassRow::decode(&bytes[..cut]).is_err(),
@@ -1447,7 +1513,7 @@ mod tests {
             indopclasses: vec![Some("vector_l2_ops".to_owned()), None],
             indoptions: vec![("m".to_owned(), "16".to_owned())],
         };
-        let bytes = encode_index_row(&row);
+        let bytes = encode_index_row(&row).expect("encode");
         let decoded = decode_index_row(&bytes).expect("decode");
         assert_eq!(decoded, row);
     }
@@ -1465,7 +1531,7 @@ mod tests {
             confrelid: Oid::new(42_001),
             confkey: vec![0],
         };
-        let bytes = encode_constraint_row(&row);
+        let bytes = encode_constraint_row(&row).expect("encode");
         let decoded = decode_constraint_row(&bytes).expect("decode");
         assert_eq!(decoded, row);
     }
@@ -1496,7 +1562,7 @@ mod tests {
             stxkeys: vec![1, 2],
             stxkind: vec!['d', 'f', 'm'],
         };
-        let bytes = encode_statistic_ext_row(&row);
+        let bytes = encode_statistic_ext_row(&row).expect("encode");
         let decoded = decode_statistic_ext_row(&bytes).expect("decode");
         assert_eq!(decoded, row);
     }

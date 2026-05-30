@@ -153,6 +153,15 @@ as a concise evidence ledger; roadmap stays for open gates only.
   schema site. Evidence:
   `cargo test -p ultrasql-catalog --lib bootstrap -- --nocapture` and
   `cargo clippy -p ultrasql-catalog --all-targets --all-features -- -D warnings`.
+- Catalog row encoders now return typed `EncodeError::LengthOverflow` instead
+  of panicking when variable-length strings, option lists, index vectors,
+  constraint keys, or statistic-extension keys exceed the `u32` row-format
+  prefix. Snapshot installation and composite/table attribute persistence now
+  reject `pg_attribute.attnum` overflow with `CatalogError::SchemaConflict`
+  instead of panicking or clamping to `i16::MAX`. Evidence:
+  `cargo test -p ultrasql-catalog --lib`,
+  `cargo clippy -p ultrasql-catalog --lib --all-features -- -D clippy::unwrap_used -D clippy::expect_used`,
+  and `cargo clippy -p ultrasql-catalog --all-targets --all-features -- -D warnings`.
 - Backup/restore smoke runner covers `ultrasql --basebackup`,
   `ultrasql --pg-dump`, `ultrasql --pg-restore`, row counts, and indexed lookup.
 - Backup/restore dump-format certification now covers custom, directory, and
