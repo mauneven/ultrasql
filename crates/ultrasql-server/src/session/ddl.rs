@@ -37,6 +37,7 @@ use ultrasql_txn::{IsolationLevel, Transaction, TransactionManager};
 use ultrasql_wal::payload::SequenceOpKind;
 
 use super::Session;
+use crate::auth::pg_authid::AuthCatalog;
 use crate::error::ServerError;
 use crate::extended;
 use crate::pipeline::{self, LowerCtx, SampleTables};
@@ -195,6 +196,14 @@ where
                 policy.policy_name, policy.table_name
             )));
         }
+        let mut roles = policy.roles.clone();
+        roles.sort();
+        roles.dedup();
+        for role in &roles {
+            if role != "public" && self.state.role_catalog.lookup_role(role).is_none() {
+                return Err(ServerError::ddl(format!("role \"{role}\" does not exist")));
+            }
+        }
         runtime.policies.push(crate::RuntimeRlsPolicy {
             name: policy.policy_name.clone(),
             permissiveness: match policy.permissiveness {
@@ -210,6 +219,7 @@ where
                 LogicalRlsCommand::Update => crate::RuntimeRlsCommand::Update,
                 LogicalRlsCommand::Delete => crate::RuntimeRlsCommand::Delete,
             },
+            roles,
             using: policy
                 .using
                 .as_ref()

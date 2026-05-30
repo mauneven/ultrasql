@@ -1572,13 +1572,15 @@ where
         runtime: &crate::TableRowSecurity,
         command: crate::RuntimeRlsCommand,
     ) -> Result<ScalarExpr, ServerError> {
+        let inherited_roles = self
+            .state
+            .role_catalog
+            .inherited_role_names(&self.current_user);
         let mut permissive = Vec::new();
         let mut restrictive = Vec::new();
-        for policy in runtime
-            .policies
-            .iter()
-            .filter(|policy| policy.command.applies_to(command))
-        {
+        for policy in runtime.policies.iter().filter(|policy| {
+            policy.command.applies_to(command) && policy.applies_to_roles(&inherited_roles)
+        }) {
             let Some(expr) = policy.using.as_ref() else {
                 continue;
             };
@@ -1650,13 +1652,16 @@ where
         let Some(runtime) = self.enabled_row_security(entry.oid) else {
             return Ok(());
         };
+        let inherited_roles = self
+            .state
+            .role_catalog
+            .inherited_role_names(&self.current_user);
         let mut permissive_checks = Vec::new();
         let mut restrictive_checks = Vec::new();
-        for policy in runtime
-            .policies
-            .iter()
-            .filter(|policy| policy.command.applies_to(crate::RuntimeRlsCommand::Insert))
-        {
+        for policy in runtime.policies.iter().filter(|policy| {
+            policy.command.applies_to(crate::RuntimeRlsCommand::Insert)
+                && policy.applies_to_roles(&inherited_roles)
+        }) {
             let Some(check) = policy.with_check.as_ref().or(policy.using.as_ref()) else {
                 continue;
             };

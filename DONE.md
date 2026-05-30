@@ -675,6 +675,10 @@ as a concise evidence ledger; roadmap stays for open gates only.
 - Default privileges apply matching templates for future tables and sequences.
 - Persistent RLS policies cover owner, superuser, `BYPASSRLS`, and restart
   semantics for the documented RAG tenant policy shape.
+- Role-scoped RLS policies parse `CREATE POLICY ... TO role`, enforce inherited
+  role membership, persist across restart, and fail closed when no scoped policy
+  applies. Evidence:
+  `cargo test -p ultrasql-server --test rls_round_trip rls_policy_roles_scope_visibility_and_restart -- --nocapture`.
 - Driver certification covers `libpq`, `psycopg2`, `psycopg3`,
   `node-postgres`, `pgx`, `lib/pq`, `JDBC`, `Npgsql`, and
   `tokio-postgres`.

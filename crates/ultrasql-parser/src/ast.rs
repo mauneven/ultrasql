@@ -66,7 +66,7 @@ pub enum Statement {
     CreateType(Box<CreateTypeStmt>),
     /// `CREATE DOMAIN name AS base_type [constraints...]`.
     CreateDomain(Box<CreateDomainStmt>),
-    /// `CREATE POLICY name ON table USING (...) WITH CHECK (...)`.
+    /// `CREATE POLICY name ON table [TO roles] USING (...) WITH CHECK (...)`.
     CreatePolicy(Box<CreatePolicyStmt>),
     /// `CREATE ROLE name ...` / `CREATE USER name ...`.
     CreateRole(Box<CreateRoleStmt>),
@@ -497,7 +497,7 @@ pub enum PolicyCommand {
     Delete,
 }
 
-/// `CREATE POLICY name ON table [AS mode] [FOR command] [USING ...] [WITH CHECK ...]`.
+/// `CREATE POLICY name ON table [AS mode] [FOR command] [TO roles] [USING ...] [WITH CHECK ...]`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CreatePolicyStmt {
     /// Policy name.
@@ -508,6 +508,8 @@ pub struct CreatePolicyStmt {
     pub permissiveness: PolicyPermissiveness,
     /// Command class this policy applies to.
     pub command: PolicyCommand,
+    /// Role names this policy applies to. Empty means all roles.
+    pub roles: Vec<Identifier>,
     /// Read visibility predicate.
     pub using: Option<Expr>,
     /// Write acceptance predicate.

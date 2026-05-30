@@ -462,6 +462,11 @@ impl<'src> Parser<'src> {
         } else {
             PolicyCommand::All
         };
+        let roles = if self.match_kw(TokenKind::KwTo) {
+            self.parse_identifier_list()?
+        } else {
+            Vec::new()
+        };
         let mut using = None;
         let mut with_check = None;
         loop {
@@ -484,6 +489,7 @@ impl<'src> Parser<'src> {
             table,
             permissiveness,
             command,
+            roles,
             using,
             with_check,
             span: crate::span::Span::new(create_start, end),

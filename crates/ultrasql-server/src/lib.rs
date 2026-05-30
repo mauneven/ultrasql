@@ -413,10 +413,26 @@ pub struct RuntimeRlsPolicy {
     pub permissiveness: RuntimeRlsPermissiveness,
     /// Command class this policy applies to.
     pub command: RuntimeRlsCommand,
+    /// Role names this policy applies to. Empty means all roles.
+    pub roles: Vec<String>,
     /// Read visibility predicate.
     pub using: Option<RuntimeTenantPolicyExpr>,
     /// Write acceptance predicate.
     pub with_check: Option<RuntimeTenantPolicyExpr>,
+}
+
+impl RuntimeRlsPolicy {
+    /// Return whether this policy applies to one of the session's inherited roles.
+    #[must_use]
+    pub fn applies_to_roles(&self, inherited_roles: &[String]) -> bool {
+        self.roles.is_empty()
+            || self.roles.iter().any(|role| {
+                role == "public"
+                    || inherited_roles
+                        .iter()
+                        .any(|inherited| inherited.eq_ignore_ascii_case(role))
+            })
+    }
 }
 
 /// Runtime row-security policy combination mode.
@@ -507,6 +523,44 @@ fn metadata_escape(raw: &str) -> String {
         }
     }
     out
+}
+
+fn metadata_encode_list(values: &[String]) -> String {
+    let mut out = String::new();
+    for value in values {
+        out.push_str(&value.len().to_string());
+        out.push(':');
+        out.push_str(value);
+    }
+    out
+}
+
+fn metadata_decode_list(raw: &str) -> Result<Vec<String>, ServerError> {
+    let mut values = Vec::new();
+    let mut offset = 0;
+    while offset < raw.len() {
+        let Some(rel_colon) = raw[offset..].find(':') else {
+            return Err(ServerError::Ddl(
+                "malformed metadata list length".to_owned(),
+            ));
+        };
+        let len_end = offset + rel_colon;
+        let len = raw[offset..len_end]
+            .parse::<usize>()
+            .map_err(|err| ServerError::Ddl(format!("malformed metadata list length: {err}")))?;
+        let value_start = len_end + 1;
+        let value_end = value_start
+            .checked_add(len)
+            .ok_or_else(|| ServerError::Ddl("metadata list value length overflow".to_owned()))?;
+        if value_end > raw.len() || !raw.is_char_boundary(value_end) {
+            return Err(ServerError::Ddl(
+                "metadata list value exceeds field length".to_owned(),
+            ));
+        }
+        values.push(raw[value_start..value_end].to_owned());
+        offset = value_end;
+    }
+    Ok(values)
 }
 
 fn metadata_unescape(raw: &str) -> Result<String, ServerError> {
@@ -5151,7 +5205,7 @@ impl Server {
                 let (check_idx, check_col, check_setting) =
                     rls_expr_fields(policy.with_check.as_ref());
                 out.push_str(&format!(
-                    "policy\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
+                    "policy\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
                     oid.raw(),
                     metadata_escape(&policy.name),
                     rls_permissiveness_name(policy.permissiveness),
@@ -5161,7 +5215,8 @@ impl Server {
                     using_setting,
                     check_idx,
                     check_col,
-                    check_setting
+                    check_setting,
+                    metadata_escape(&metadata_encode_list(&policy.roles))
                 ));
             }
         }
@@ -5210,17 +5265,23 @@ impl Server {
                     entry.1.enabled = enabled;
                     entry.1.owner_role = owner_role;
                 }
-                Some("policy") if parts.len() == 11 => {
+                Some("policy") if parts.len() == 11 || parts.len() == 12 => {
                     let oid = ultrasql_core::Oid::new(parts[1].parse::<u32>().map_err(|err| {
                         ServerError::Ddl(format!(
                             "RLS metadata line {} bad oid: {err}",
                             line_no + 1
                         ))
                     })?);
+                    let roles = if parts.len() == 12 {
+                        metadata_decode_list(&metadata_unescape(parts[11])?)?
+                    } else {
+                        Vec::new()
+                    };
                     let policy = RuntimeRlsPolicy {
                         name: metadata_unescape(parts[2])?,
                         permissiveness: parse_rls_permissiveness(parts[3])?,
                         command: parse_rls_command(parts[4])?,
+                        roles,
                         using: parse_rls_expr(parts[5], parts[6], parts[7])?,
                         with_check: parse_rls_expr(parts[8], parts[9], parts[10])?,
                     };

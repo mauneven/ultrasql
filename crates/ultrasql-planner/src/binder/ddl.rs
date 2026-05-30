@@ -523,6 +523,11 @@ pub(super) fn bind_create_policy(
                 AstPolicyCommand::Update => LogicalRlsCommand::Update,
                 AstPolicyCommand::Delete => LogicalRlsCommand::Delete,
             },
+            roles: s
+                .roles
+                .iter()
+                .map(|role| role.value.to_ascii_lowercase())
+                .collect(),
             using,
             with_check,
         },

@@ -1717,6 +1717,8 @@ pub struct LogicalRlsPolicy {
     pub permissiveness: LogicalRlsPermissiveness,
     /// Command class this policy applies to.
     pub command: LogicalRlsCommand,
+    /// Role names this policy applies to. Empty means all roles.
+    pub roles: Vec<String>,
     /// Read visibility predicate.
     pub using: Option<LogicalTenantPolicyExpr>,
     /// Write acceptance predicate.
@@ -3456,6 +3458,7 @@ mod tests {
                         table_name: "users".to_owned(),
                         permissiveness: LogicalRlsPermissiveness::Restrictive,
                         command: LogicalRlsCommand::Select,
+                        roles: Vec::new(),
                         using: Some(LogicalTenantPolicyExpr {
                             column_index: 0,
                             column_name: "id".to_owned(),

@@ -383,6 +383,66 @@ async fn rls_tenant_policy_survives_restart() {
     graceful_shutdown(running).await;
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn rls_policy_roles_scope_visibility_and_restart() {
+    let data_dir = tempfile::TempDir::new().unwrap();
+
+    let running = start_persistent_server(data_dir.path(), "rls_role_scope_setup").await;
+    for sql in [
+        "CREATE ROLE tester SUPERUSER LOGIN",
+        "CREATE ROLE tenant_group NOLOGIN",
+        "CREATE ROLE tenant_reader LOGIN",
+        "CREATE ROLE tenant_blocked LOGIN",
+        "GRANT tenant_group TO tenant_reader",
+        "CREATE TABLE rls_role_docs (tenant_id TEXT NOT NULL, doc_id TEXT NOT NULL)",
+        "INSERT INTO rls_role_docs VALUES ('tenant-a', 'doc-a'), ('tenant-b', 'doc-b')",
+        "CREATE POLICY rls_role_docs_tenant ON rls_role_docs \
+            FOR SELECT TO tenant_group \
+            USING (tenant_id = current_setting('ultrasql.tenant_id', true))",
+        "ALTER TABLE rls_role_docs ENABLE ROW LEVEL SECURITY",
+        "GRANT SELECT ON TABLE rls_role_docs TO tenant_group, tenant_blocked",
+    ] {
+        running.client.batch_execute(sql).await.expect(sql);
+    }
+    graceful_shutdown(running).await;
+
+    let running = start_persistent_server(data_dir.path(), "rls_role_scope_verify").await;
+
+    let (reader, reader_conn) =
+        connect_as(running.bound, "tenant_reader", "rls_role_scope_reader").await;
+    reader
+        .batch_execute("SET ultrasql.tenant_id = 'tenant-a'")
+        .await
+        .expect("set reader tenant");
+    let rows = simple_rows(
+        &reader
+            .simple_query("SELECT doc_id FROM rls_role_docs ORDER BY doc_id")
+            .await
+            .expect("role member sees scoped policy rows"),
+    );
+    assert_eq!(rows, vec![vec!["doc-a".to_owned()]]);
+
+    let (blocked, blocked_conn) =
+        connect_as(running.bound, "tenant_blocked", "rls_role_scope_blocked").await;
+    blocked
+        .batch_execute("SET ultrasql.tenant_id = 'tenant-a'")
+        .await
+        .expect("set blocked tenant");
+    let rows = simple_rows(
+        &blocked
+            .simple_query("SELECT doc_id FROM rls_role_docs ORDER BY doc_id")
+            .await
+            .expect("role outside policy sees no rows"),
+    );
+    assert!(rows.is_empty(), "policy-scoped role leaked rows: {rows:?}");
+
+    drop(reader);
+    drop(blocked);
+    reader_conn.await.expect("reader connection joins");
+    blocked_conn.await.expect("blocked connection joins");
+    graceful_shutdown(running).await;
+}
+
 #[tokio::test]
 async fn rls_insert_uses_insert_policies_not_select_using_predicates() {
     let (client, _conn, server_handle) = start_server_and_connect().await;
