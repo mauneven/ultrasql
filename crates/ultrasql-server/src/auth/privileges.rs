@@ -447,6 +447,52 @@ impl InMemoryPrivilegeCatalog {
     pub fn list_default_grants(&self) -> Vec<DefaultPrivilegeGrant> {
         self.default_grants.read().values().cloned().collect()
     }
+
+    /// Replace privilege and default-privilege state from a durable snapshot.
+    pub fn install_snapshot(
+        &self,
+        grants: Vec<PrivilegeGrant>,
+        default_grants: Vec<DefaultPrivilegeGrant>,
+    ) {
+        let mut grant_map = BTreeMap::new();
+        for mut grant in grants {
+            grant.object_name = normalize_object_name(grant.object_kind, &grant.object_name);
+            grant.grantee = grant.grantee.to_ascii_lowercase();
+            grant.grantor = grant.grantor.to_ascii_lowercase();
+            grant.column_name = grant.column_name.map(|column| column.to_ascii_lowercase());
+            grant_map.insert(
+                PrivilegeKey {
+                    object_kind: grant.object_kind,
+                    object_name: grant.object_name.clone(),
+                    grantee: grant.grantee.clone(),
+                    privilege: grant.privilege,
+                    column_name: grant.column_name.clone(),
+                },
+                grant,
+            );
+        }
+
+        let mut default_map = BTreeMap::new();
+        for mut grant in default_grants {
+            grant.owner_role = grant.owner_role.to_ascii_lowercase();
+            grant.schema_name = grant.schema_name.map(|schema| schema.to_ascii_lowercase());
+            grant.grantee = grant.grantee.to_ascii_lowercase();
+            grant.grantor = grant.grantor.to_ascii_lowercase();
+            default_map.insert(
+                DefaultPrivilegeKey {
+                    owner_role: grant.owner_role.clone(),
+                    schema_name: grant.schema_name.clone(),
+                    object_kind: grant.object_kind,
+                    grantee: grant.grantee.clone(),
+                    privilege: grant.privilege,
+                },
+                grant,
+            );
+        }
+
+        *self.grants.write() = grant_map;
+        *self.default_grants.write() = default_map;
+    }
 }
 
 fn normalize_object_name(kind: PrivilegeObjectKind, name: &str) -> String {

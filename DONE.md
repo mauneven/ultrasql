@@ -787,3 +787,9 @@ as a concise evidence ledger; roadmap stays for open gates only.
   membership after `Server::init` restart, and
   `role_catalog_rolls_back_when_metadata_slot_is_unsafe` verifies unsafe
   metadata slots do not leave failed role DDL in memory.
+- Privilege catalog restart persistence is covered by `pg_privileges.meta`:
+  `GRANT`, `REVOKE`, `ALTER DEFAULT PRIVILEGES`, and default-privilege
+  application on future tables, materialized views, and sequences snapshot ACLs
+  to the data directory with rollback on metadata-write failure. Evidence:
+  `privilege_catalog_survives_restart` and
+  `privilege_catalog_rolls_back_when_metadata_slot_is_unsafe`.

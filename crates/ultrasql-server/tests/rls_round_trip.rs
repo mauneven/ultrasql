@@ -259,8 +259,6 @@ async fn rls_owner_and_bypass_semantics_survive_restart() {
 
     let running = start_persistent_server(data_dir.path(), "rls_owner_restart_verify").await;
     for sql in [
-        "CREATE ROLE tester SUPERUSER LOGIN",
-        "CREATE ROLE app_owner LOGIN",
         "CREATE ROLE tenant_user LOGIN",
         "CREATE ROLE rls_bypass LOGIN BYPASSRLS",
         "GRANT SELECT ON TABLE rls_restart_owner_docs TO app_owner, tenant_user, rls_bypass",

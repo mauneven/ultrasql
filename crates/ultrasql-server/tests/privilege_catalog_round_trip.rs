@@ -4,7 +4,7 @@ mod support;
 
 use std::net::SocketAddr;
 
-use support::{shutdown, start_sample_server};
+use support::{shutdown, start_persistent_server, start_sample_server};
 use tokio_postgres::{NoTls, error::SqlState};
 
 #[tokio::test]
@@ -479,6 +479,135 @@ async fn default_privileges_apply_to_future_objects_only() {
     assert!(
         sequence_granted.get::<_, bool>(0),
         "default USAGE should apply to future sequence"
+    );
+
+    shutdown(running).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn privilege_catalog_survives_restart() {
+    let data_dir = tempfile::TempDir::new().expect("temp data dir");
+
+    let running = start_persistent_server(data_dir.path(), "privilege_restart_setup").await;
+    let client = &running.client;
+    client
+        .batch_execute("CREATE ROLE tester SUPERUSER LOGIN")
+        .await
+        .expect("register admin role");
+    client
+        .batch_execute("CREATE ROLE analyst LOGIN")
+        .await
+        .expect("create analyst role");
+    client
+        .batch_execute("CREATE TABLE priv_restart (id INT, secret TEXT)")
+        .await
+        .expect("create privilege table");
+    client
+        .batch_execute("CREATE SEQUENCE priv_restart_seq")
+        .await
+        .expect("create privilege sequence");
+    client
+        .batch_execute("GRANT SELECT(id) ON TABLE priv_restart TO analyst")
+        .await
+        .expect("grant column select");
+    client
+        .batch_execute("GRANT USAGE ON SEQUENCE priv_restart_seq TO analyst")
+        .await
+        .expect("grant sequence usage");
+    client
+        .batch_execute(
+            "ALTER DEFAULT PRIVILEGES FOR ROLE tester IN SCHEMA tenant \
+             GRANT SELECT ON TABLES TO analyst",
+        )
+        .await
+        .expect("grant default table select");
+    shutdown(running).await;
+
+    let running = start_persistent_server(data_dir.path(), "privilege_restart_verify").await;
+    let checks = running
+        .client
+        .query_one(
+            "SELECT \
+                has_column_privilege('analyst', 'priv_restart', 'id', 'SELECT'), \
+                has_column_privilege('analyst', 'priv_restart', 'secret', 'SELECT'), \
+                has_sequence_privilege('analyst', 'priv_restart_seq', 'USAGE')",
+            &[],
+        )
+        .await
+        .expect("privilege checks after restart");
+    assert!(checks.get::<_, bool>(0), "column grant should restart");
+    assert!(
+        !checks.get::<_, bool>(1),
+        "ungranted column should remain denied after restart"
+    );
+    assert!(checks.get::<_, bool>(2), "sequence grant should restart");
+
+    running
+        .client
+        .batch_execute("CREATE TABLE tenant.priv_restart_future (id INT)")
+        .await
+        .expect("create future table after restart");
+    let default_grant = running
+        .client
+        .query_one(
+            "SELECT has_table_privilege('analyst', 'priv_restart_future', 'SELECT')",
+            &[],
+        )
+        .await
+        .expect("default privilege check after restart");
+    assert!(
+        default_grant.get::<_, bool>(0),
+        "default privilege template should apply after restart"
+    );
+
+    shutdown(running).await;
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn privilege_catalog_rolls_back_when_metadata_slot_is_unsafe() {
+    use std::os::unix::fs::symlink;
+
+    let data_dir = tempfile::TempDir::new().expect("temp data dir");
+    let outside = data_dir.path().join("outside-privilege-meta");
+    std::fs::write(&outside, b"keep").expect("outside metadata target");
+
+    let running = start_persistent_server(data_dir.path(), "privilege_rollback_setup").await;
+    let client = &running.client;
+    client
+        .batch_execute("CREATE ROLE tester SUPERUSER LOGIN")
+        .await
+        .expect("register admin role");
+    client
+        .batch_execute("CREATE ROLE analyst LOGIN")
+        .await
+        .expect("create analyst role");
+    client
+        .batch_execute("CREATE TABLE privilege_rollback (id INT)")
+        .await
+        .expect("create rollback table");
+    symlink(&outside, data_dir.path().join("pg_privileges.meta.tmp"))
+        .expect("privilege temp symlink");
+
+    let err = client
+        .batch_execute("GRANT SELECT ON TABLE privilege_rollback TO analyst")
+        .await
+        .expect_err("unsafe privilege metadata slot rejects GRANT");
+    assert!(
+        err.as_db_error()
+            .is_some_and(|db| db.message().contains("runtime metadata file")),
+        "unexpected error: {err}"
+    );
+    let visible = client
+        .query_one(
+            "SELECT has_table_privilege('analyst', 'privilege_rollback', 'SELECT')",
+            &[],
+        )
+        .await
+        .expect("rollback privilege check");
+    assert!(
+        !visible.get::<_, bool>(0),
+        "failed GRANT must not remain in memory after metadata failure"
     );
 
     shutdown(running).await;

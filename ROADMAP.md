@@ -80,9 +80,9 @@ file focused on what still blocks production.
 
 ### Catalog, Roles, Privileges
 
-- Persist privilege and default-privilege state through restart with durable
-  catalog rows; role and membership restart sidecar evidence lives in
-  `DONE.md`.
+- Replace role, membership, privilege, default-privilege, and RLS runtime
+  sidecars with typed catalog rows and migrations before v1.0; restart
+  persistence evidence for the current sidecars lives in `DONE.md`.
 - Finish role-scoped RLS policies, `INSERT ... SELECT` checks, update new-row
   checks, and tenant certification artifacts.
 - Broaden dependency tracking for every object kind and every `DROP ... CASCADE`

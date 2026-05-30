@@ -834,6 +834,8 @@ where
         self.state.row_security.insert(oid, Arc::new(row_security));
         self.state.persist_table_runtime_constraints_metadata()?;
         self.state.persist_row_security_metadata()?;
+        let before_grants = self.state.privilege_catalog.list_grants();
+        let before_default_grants = self.state.privilege_catalog.list_default_grants();
         self.state.privilege_catalog.apply_default_privileges(
             &self.current_user,
             namespace,
@@ -847,6 +849,14 @@ where
                 crate::auth::PrivilegeObjectKind::Sequence,
                 seq_name,
             );
+        }
+        let grants_changed = before_grants != self.state.privilege_catalog.list_grants()
+            || before_default_grants != self.state.privilege_catalog.list_default_grants();
+        if grants_changed && let Err(err) = self.state.persist_privilege_metadata() {
+            self.state
+                .privilege_catalog
+                .install_snapshot(before_grants, before_default_grants);
+            return Err(err);
         }
         if let Some(partition) = partition {
             self.state.time_partitions.insert(
@@ -974,12 +984,22 @@ where
         }
         self.state.row_security.insert(oid, Arc::new(row_security));
         self.state.persist_row_security_metadata()?;
+        let before_grants = self.state.privilege_catalog.list_grants();
+        let before_default_grants = self.state.privilege_catalog.list_default_grants();
         self.state.privilege_catalog.apply_default_privileges(
             &self.current_user,
             namespace,
             crate::auth::PrivilegeObjectKind::Table,
             table_name,
         );
+        let grants_changed = before_grants != self.state.privilege_catalog.list_grants()
+            || before_default_grants != self.state.privilege_catalog.list_default_grants();
+        if grants_changed && let Err(err) = self.state.persist_privilege_metadata() {
+            self.state
+                .privilege_catalog
+                .install_snapshot(before_grants, before_default_grants);
+            return Err(err);
+        }
         runtime
             .materialized_rows
             .store(materialized_rows, std::sync::atomic::Ordering::Release);

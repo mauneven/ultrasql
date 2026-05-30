@@ -94,12 +94,22 @@ where
         self.state
             .sequences
             .insert(sequence_name.clone(), Arc::new(seq));
+        let before_grants = self.state.privilege_catalog.list_grants();
+        let before_default_grants = self.state.privilege_catalog.list_default_grants();
         self.state.privilege_catalog.apply_default_privileges(
             &self.current_user,
             namespace,
             crate::auth::PrivilegeObjectKind::Sequence,
             sequence_name,
         );
+        let grants_changed = before_grants != self.state.privilege_catalog.list_grants()
+            || before_default_grants != self.state.privilege_catalog.list_default_grants();
+        if grants_changed && let Err(err) = self.state.persist_privilege_metadata() {
+            self.state
+                .privilege_catalog
+                .install_snapshot(before_grants, before_default_grants);
+            return Err(err);
+        }
         self.plan_cache_invalidate();
         Ok(result_encoder::run_ddl_command("CREATE SEQUENCE"))
     }

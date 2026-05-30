@@ -635,6 +635,71 @@ fn parse_role_optional_i64(
     })
 }
 
+fn privilege_object_kind_name(kind: auth::PrivilegeObjectKind) -> &'static str {
+    match kind {
+        auth::PrivilegeObjectKind::Table => "table",
+        auth::PrivilegeObjectKind::Schema => "schema",
+        auth::PrivilegeObjectKind::Database => "database",
+        auth::PrivilegeObjectKind::Sequence => "sequence",
+        auth::PrivilegeObjectKind::Function => "function",
+    }
+}
+
+fn parse_privilege_object_kind(
+    raw: &str,
+    line_no: usize,
+) -> Result<auth::PrivilegeObjectKind, ServerError> {
+    match raw {
+        "table" => Ok(auth::PrivilegeObjectKind::Table),
+        "schema" => Ok(auth::PrivilegeObjectKind::Schema),
+        "database" => Ok(auth::PrivilegeObjectKind::Database),
+        "sequence" => Ok(auth::PrivilegeObjectKind::Sequence),
+        "function" => Ok(auth::PrivilegeObjectKind::Function),
+        _ => Err(ServerError::ddl(format!(
+            "privilege metadata line {} bad object kind",
+            line_no + 1
+        ))),
+    }
+}
+
+fn privilege_kind_name(kind: auth::PrivilegeKind) -> &'static str {
+    match kind {
+        auth::PrivilegeKind::Select => "select",
+        auth::PrivilegeKind::Insert => "insert",
+        auth::PrivilegeKind::Update => "update",
+        auth::PrivilegeKind::Delete => "delete",
+        auth::PrivilegeKind::Truncate => "truncate",
+        auth::PrivilegeKind::References => "references",
+        auth::PrivilegeKind::Trigger => "trigger",
+        auth::PrivilegeKind::Usage => "usage",
+        auth::PrivilegeKind::Create => "create",
+        auth::PrivilegeKind::Connect => "connect",
+        auth::PrivilegeKind::Temporary => "temporary",
+        auth::PrivilegeKind::Execute => "execute",
+    }
+}
+
+fn parse_privilege_kind(raw: &str, line_no: usize) -> Result<auth::PrivilegeKind, ServerError> {
+    match raw {
+        "select" => Ok(auth::PrivilegeKind::Select),
+        "insert" => Ok(auth::PrivilegeKind::Insert),
+        "update" => Ok(auth::PrivilegeKind::Update),
+        "delete" => Ok(auth::PrivilegeKind::Delete),
+        "truncate" => Ok(auth::PrivilegeKind::Truncate),
+        "references" => Ok(auth::PrivilegeKind::References),
+        "trigger" => Ok(auth::PrivilegeKind::Trigger),
+        "usage" => Ok(auth::PrivilegeKind::Usage),
+        "create" => Ok(auth::PrivilegeKind::Create),
+        "connect" => Ok(auth::PrivilegeKind::Connect),
+        "temporary" => Ok(auth::PrivilegeKind::Temporary),
+        "execute" => Ok(auth::PrivilegeKind::Execute),
+        _ => Err(ServerError::ddl(format!(
+            "privilege metadata line {} bad privilege kind",
+            line_no + 1
+        ))),
+    }
+}
+
 fn rls_permissiveness_name(value: RuntimeRlsPermissiveness) -> &'static str {
     match value {
         RuntimeRlsPermissiveness::Permissive => "permissive",
@@ -4248,6 +4313,7 @@ impl Server {
         server.rebuild_domain_runtime_constraint_sidecars()?;
         server.rebuild_table_runtime_constraint_sidecars()?;
         server.rebuild_role_metadata()?;
+        server.rebuild_privilege_metadata()?;
         server.rebuild_row_security_sidecars()?;
         server.rebuild_materialized_view_runtime_sidecars()?;
         Ok(server)
@@ -4920,6 +4986,123 @@ impl Server {
             roles.push(auth::RoleEntry::bootstrap_superuser());
         }
         self.role_catalog.install_snapshot(roles, memberships);
+        Ok(())
+    }
+
+    fn privilege_metadata_path(&self) -> Option<std::path::PathBuf> {
+        self.data_dir
+            .as_ref()
+            .map(|dir| dir.join("pg_privileges.meta"))
+    }
+
+    pub(crate) fn persist_privilege_metadata(&self) -> Result<(), ServerError> {
+        let Some(path) = self.privilege_metadata_path() else {
+            return Ok(());
+        };
+        let mut grants = self.privilege_catalog.list_grants();
+        grants.sort_by(|left, right| {
+            privilege_object_kind_name(left.object_kind)
+                .cmp(privilege_object_kind_name(right.object_kind))
+                .then_with(|| left.object_name.cmp(&right.object_name))
+                .then_with(|| left.grantee.cmp(&right.grantee))
+                .then_with(|| {
+                    privilege_kind_name(left.privilege).cmp(privilege_kind_name(right.privilege))
+                })
+                .then_with(|| left.column_name.cmp(&right.column_name))
+        });
+        let mut default_grants = self.privilege_catalog.list_default_grants();
+        default_grants.sort_by(|left, right| {
+            left.owner_role
+                .cmp(&right.owner_role)
+                .then_with(|| left.schema_name.cmp(&right.schema_name))
+                .then_with(|| {
+                    privilege_object_kind_name(left.object_kind)
+                        .cmp(privilege_object_kind_name(right.object_kind))
+                })
+                .then_with(|| left.grantee.cmp(&right.grantee))
+                .then_with(|| {
+                    privilege_kind_name(left.privilege).cmp(privilege_kind_name(right.privilege))
+                })
+        });
+
+        let mut out = String::from("# ultrasql privilege runtime v1\n");
+        for grant in grants {
+            out.push_str(&format!(
+                "grant\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
+                privilege_object_kind_name(grant.object_kind),
+                metadata_escape(&grant.object_name),
+                metadata_escape(&grant.grantee),
+                privilege_kind_name(grant.privilege),
+                metadata_escape(grant.column_name.as_deref().unwrap_or("")),
+                metadata_escape(&grant.grantor),
+                grant.grant_option
+            ));
+        }
+        for grant in default_grants {
+            out.push_str(&format!(
+                "default\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
+                metadata_escape(&grant.owner_role),
+                metadata_escape(grant.schema_name.as_deref().unwrap_or("")),
+                privilege_object_kind_name(grant.object_kind),
+                metadata_escape(&grant.grantee),
+                privilege_kind_name(grant.privilege),
+                metadata_escape(&grant.grantor),
+                grant.grant_option
+            ));
+        }
+        write_runtime_metadata_file(&path, &out)
+    }
+
+    fn rebuild_privilege_metadata(&self) -> Result<(), ServerError> {
+        let Some(path) = self.privilege_metadata_path() else {
+            return Ok(());
+        };
+        let Some(text) = read_runtime_metadata_file(&path)? else {
+            return Ok(());
+        };
+
+        let mut grants = Vec::new();
+        let mut default_grants = Vec::new();
+        for (line_no, line) in text.lines().enumerate() {
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            let parts = line.split('\t').collect::<Vec<_>>();
+            match parts.first().copied() {
+                Some("grant") if parts.len() == 8 => {
+                    let column_name = metadata_unescape(parts[5])?;
+                    grants.push(auth::PrivilegeGrant {
+                        object_kind: parse_privilege_object_kind(parts[1], line_no)?,
+                        object_name: metadata_unescape(parts[2])?,
+                        grantee: metadata_unescape(parts[3])?,
+                        privilege: parse_privilege_kind(parts[4], line_no)?,
+                        column_name: (!column_name.is_empty()).then_some(column_name),
+                        grantor: metadata_unescape(parts[6])?,
+                        grant_option: parse_role_bool(parts[7], line_no, "grant_option")?,
+                    });
+                }
+                Some("default") if parts.len() == 8 => {
+                    let schema_name = metadata_unescape(parts[2])?;
+                    default_grants.push(auth::DefaultPrivilegeGrant {
+                        owner_role: metadata_unescape(parts[1])?,
+                        schema_name: (!schema_name.is_empty()).then_some(schema_name),
+                        object_kind: parse_privilege_object_kind(parts[3], line_no)?,
+                        grantee: metadata_unescape(parts[4])?,
+                        privilege: parse_privilege_kind(parts[5], line_no)?,
+                        grantor: metadata_unescape(parts[6])?,
+                        grant_option: parse_role_bool(parts[7], line_no, "grant_option")?,
+                    });
+                }
+                _ => {
+                    return Err(ServerError::ddl(format!(
+                        "malformed privilege metadata line {}",
+                        line_no + 1
+                    )));
+                }
+            }
+        }
+        self.privilege_catalog
+            .install_snapshot(grants, default_grants);
         Ok(())
     }
 

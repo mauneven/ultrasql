@@ -35,6 +35,8 @@ where
             ));
         };
         self.validate_grantees(grantees)?;
+        let before_grants = self.state.privilege_catalog.list_grants();
+        let before_default_grants = self.state.privilege_catalog.list_default_grants();
         self.state.privilege_catalog.grant_many(
             "ultrasql",
             convert_object_kind(*object_kind),
@@ -43,6 +45,12 @@ where
             &convert_privileges(privileges),
             *grant_option,
         );
+        if let Err(err) = self.state.persist_privilege_metadata() {
+            self.state
+                .privilege_catalog
+                .install_snapshot(before_grants, before_default_grants);
+            return Err(err);
+        }
         self.plan_cache_invalidate();
         Ok(result_encoder::run_ddl_command("GRANT"))
     }
@@ -64,12 +72,20 @@ where
             ));
         };
         self.validate_grantees(grantees)?;
+        let before_grants = self.state.privilege_catalog.list_grants();
+        let before_default_grants = self.state.privilege_catalog.list_default_grants();
         self.state.privilege_catalog.revoke_many(
             convert_object_kind(*object_kind),
             objects,
             grantees,
             &convert_privileges(privileges),
         );
+        if let Err(err) = self.state.persist_privilege_metadata() {
+            self.state
+                .privilege_catalog
+                .install_snapshot(before_grants, before_default_grants);
+            return Err(err);
+        }
         self.plan_cache_invalidate();
         Ok(result_encoder::run_ddl_command("REVOKE"))
     }
@@ -96,6 +112,8 @@ where
         self.validate_grantees(grantees)?;
         let owner_roles = self.default_privilege_owner_roles(target_roles)?;
         let privilege_requests = convert_privileges(privileges);
+        let before_grants = self.state.privilege_catalog.list_grants();
+        let before_default_grants = self.state.privilege_catalog.list_default_grants();
         match operation {
             LogicalDefaultPrivilegeOperation::Grant => {
                 self.state
@@ -119,6 +137,12 @@ where
                     &privilege_requests,
                 );
             }
+        }
+        if let Err(err) = self.state.persist_privilege_metadata() {
+            self.state
+                .privilege_catalog
+                .install_snapshot(before_grants, before_default_grants);
+            return Err(err);
         }
         self.plan_cache_invalidate();
         Ok(result_encoder::run_ddl_command("ALTER DEFAULT PRIVILEGES"))
