@@ -34,6 +34,24 @@ fn embeddings_catalog() -> InMemoryCatalog {
     cat
 }
 
+fn money_catalog() -> InMemoryCatalog {
+    let schema = Schema::new([
+        Field::required("amount", DataType::Money),
+        Field::required("qty", DataType::Int32),
+        Field::required(
+            "price",
+            DataType::Decimal {
+                precision: Some(10),
+                scale: Some(3),
+            },
+        ),
+    ])
+    .expect("schema ok");
+    let mut cat = InMemoryCatalog::new();
+    cat.register("ledger", TableMeta::new(schema));
+    cat
+}
+
 fn fact_events_catalog() -> InMemoryCatalog {
     let schema = Schema::new([
         Field::required("tenant_id", DataType::Int32),
@@ -878,6 +896,30 @@ fn binds_money_scalar_multiplication() {
         let plan = parse_and_bind(sql, &cat).expect("bind ok");
         assert_eq!(plan.schema().field_at(0).data_type, DataType::Money);
     }
+}
+
+#[test]
+fn binds_money_runtime_casts() {
+    let cat = money_catalog();
+    let plan = parse_and_bind(
+        "SELECT amount::numeric, amount::text, qty::money, price::money FROM ledger",
+        &cat,
+    )
+    .expect("bind ok");
+    let schema = plan.schema();
+    assert_eq!(
+        schema.field_at(0).data_type,
+        DataType::Decimal {
+            precision: None,
+            scale: Some(2)
+        }
+    );
+    assert_eq!(
+        schema.field_at(1).data_type,
+        DataType::Text { max_len: None }
+    );
+    assert_eq!(schema.field_at(2).data_type, DataType::Money);
+    assert_eq!(schema.field_at(3).data_type, DataType::Money);
 }
 
 #[test]

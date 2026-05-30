@@ -30,7 +30,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use num_traits::ToPrimitive;
 use serde_json::{Map as JsonMap, Number as JsonNumber, Value as JsonValue};
 use ultrasql_core::{
-    DataType, Oid, SparseVector, Value, bpchar_semantic_text, timetz_utc_micros,
+    DataType, Oid, SparseVector, Value, bpchar_semantic_text, parse_money_text, timetz_utc_micros,
     xml_content_is_well_formed, xml_document_is_well_formed, xml_xpath_element_fragments,
 };
 use ultrasql_planner::{BinaryOp, ScalarExpr, UnaryOp, catalog::builtin_type_oid};
@@ -381,6 +381,8 @@ fn eval_function_call(
         "__ultrasql_cast_regclass" => eval_cast_regclass(args),
         "__ultrasql_cast_regtype" => eval_cast_regtype(args),
         "__ultrasql_cast_text" => eval_cast_text(args),
+        "__ultrasql_cast_money" => eval_cast_money(args),
+        "__ultrasql_cast_numeric" => eval_cast_numeric(args),
         "l2_distance" => eval_vector_metric(args, VectorDistanceOp::L2),
         "cosine_distance" => eval_vector_metric(args, VectorDistanceOp::Cosine),
         "inner_product" | "dot_product" => eval_vector_metric(args, VectorDistanceOp::InnerProduct),
@@ -988,6 +990,59 @@ fn eval_cast_text(args: &[Value]) -> Result<Value, EvalError> {
         return Ok(Value::Null);
     }
     Ok(Value::Text(args[0].to_string()))
+}
+
+fn eval_cast_money(args: &[Value]) -> Result<Value, EvalError> {
+    if args.len() != 1 {
+        return Err(EvalError::Type(format!(
+            "money cast: expected 1 arg, got {}",
+            args.len()
+        )));
+    }
+    match &args[0] {
+        Value::Null => Ok(Value::Null),
+        Value::Money(cents) => Ok(Value::Money(*cents)),
+        Value::Int16(v) => int_to_money(i64::from(*v)),
+        Value::Int32(v) => int_to_money(i64::from(*v)),
+        Value::Int64(v) => int_to_money(*v),
+        Value::Decimal { .. } => parse_money_text(&args[0].to_string())
+            .map_err(|err| EvalError::Type(format!("money cast: {err}"))),
+        other => Err(EvalError::Type(format!(
+            "money cast: numeric argument required, got {:?}",
+            other.data_type()
+        ))),
+    }
+}
+
+fn int_to_money(value: i64) -> Result<Value, EvalError> {
+    value
+        .checked_mul(100)
+        .map(Value::Money)
+        .ok_or(EvalError::Overflow)
+}
+
+fn eval_cast_numeric(args: &[Value]) -> Result<Value, EvalError> {
+    if args.len() != 1 {
+        return Err(EvalError::Type(format!(
+            "numeric cast: expected 1 arg, got {}",
+            args.len()
+        )));
+    }
+    match &args[0] {
+        Value::Null => Ok(Value::Null),
+        Value::Money(cents) => Ok(Value::Decimal {
+            value: *cents,
+            scale: 2,
+        }),
+        Value::Decimal { value, scale } => Ok(Value::Decimal {
+            value: *value,
+            scale: *scale,
+        }),
+        other => Err(EvalError::Type(format!(
+            "numeric cast: money argument required, got {:?}",
+            other.data_type()
+        ))),
+    }
 }
 
 fn resolve_regtype_text(text: &str) -> Option<Oid> {
@@ -5476,6 +5531,27 @@ mod tests {
         assert_eq!(
             eval_fn("__ultrasql_cast_text", vec![Value::Null]),
             Value::Null
+        );
+        assert_eq!(
+            eval_fn("__ultrasql_cast_numeric", vec![Value::Money(1234)]),
+            Value::Decimal {
+                value: 1234,
+                scale: 2
+            }
+        );
+        assert_eq!(
+            eval_fn("__ultrasql_cast_money", vec![Value::Int32(12)]),
+            Value::Money(1200)
+        );
+        assert_eq!(
+            eval_fn(
+                "__ultrasql_cast_money",
+                vec![Value::Decimal {
+                    value: 12_345,
+                    scale: 3
+                }]
+            ),
+            Value::Money(1235)
         );
         assert!(eval_fn_err("pg_size_pretty", vec![]).contains("expected 1 arg"));
         assert_eq!(eval_fn("pg_size_pretty", vec![Value::Null]), Value::Null);

@@ -666,6 +666,14 @@ fn bind_runtime_cast(
     actual_type: &DataType,
 ) -> Option<ScalarExpr> {
     let name = match target_type {
+        DataType::Money
+            if actual_type.is_integer() || matches!(actual_type, DataType::Decimal { .. }) =>
+        {
+            "__ultrasql_cast_money"
+        }
+        DataType::Decimal { .. } if matches!(actual_type, DataType::Money) => {
+            "__ultrasql_cast_numeric"
+        }
         DataType::Oid if actual_type.is_oid_alias() || actual_type.is_integer() => {
             "__ultrasql_cast_oid"
         }
@@ -675,17 +683,30 @@ fn bind_runtime_cast(
         DataType::RegType if actual_type.is_oid_alias() || actual_type.is_integer() => {
             "__ultrasql_cast_regtype"
         }
-        DataType::Text { .. }
-            if actual_type.is_oid_alias() || matches!(actual_type, DataType::PgLsn) =>
-        {
-            "__ultrasql_cast_text"
-        }
+        DataType::Text { .. } => "__ultrasql_cast_text",
         _ => return None,
+    };
+    let data_type = if matches!(
+        (target_type, actual_type),
+        (
+            DataType::Decimal {
+                precision: None,
+                scale: None
+            },
+            DataType::Money
+        )
+    ) {
+        DataType::Decimal {
+            precision: None,
+            scale: Some(2),
+        }
+    } else {
+        target_type.clone()
     };
     Some(ScalarExpr::FunctionCall {
         name: name.to_owned(),
         args: vec![expr],
-        data_type: target_type.clone(),
+        data_type,
     })
 }
 

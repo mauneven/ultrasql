@@ -140,5 +140,40 @@ async fn money_cast_insert_select_and_extended_wire_type() {
         ]]
     );
 
+    client
+        .batch_execute("CREATE TABLE money_casts (amount MONEY, qty INT, price NUMERIC(10,3))")
+        .await
+        .expect("create money casts");
+    client
+        .batch_execute("INSERT INTO money_casts VALUES ('$12.34'::money, 12, 12.345)")
+        .await
+        .expect("insert money casts");
+    let casts = client
+        .simple_query(
+            "SELECT amount::numeric, amount::text, qty::money, price::money FROM money_casts",
+        )
+        .await
+        .expect("money casts");
+    let values: Vec<Vec<String>> = casts
+        .into_iter()
+        .filter_map(|message| match message {
+            tokio_postgres::SimpleQueryMessage::Row(row) => Some(
+                (0..row.len())
+                    .filter_map(|idx| row.get(idx).map(str::to_owned))
+                    .collect(),
+            ),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        values,
+        vec![vec![
+            "12.34".to_owned(),
+            "$12.34".to_owned(),
+            "$12.00".to_owned(),
+            "$12.35".to_owned()
+        ]]
+    );
+
     shutdown(running).await;
 }
