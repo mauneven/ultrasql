@@ -339,6 +339,12 @@ as a concise evidence ledger; roadmap stays for open gates only.
   `cargo test -p ultrasql-executor parameter_` and
   `cargo clippy -p ultrasql-executor --lib --all-features -- -W
   clippy::expect_used -W clippy::unwrap_used`.
+- Fused filter/SUM and cached SUM/AVG operators now build output schemas
+  infallibly and return typed executor errors for single-row NULL construction
+  invariants instead of panicking in scalar aggregate fast paths. Evidence:
+  `cargo test -p ultrasql-executor filter_sum` and
+  `cargo clippy -p ultrasql-executor --lib --all-features -- -W
+  clippy::expect_used -W clippy::unwrap_used`.
 
 ## Core SQL And Wire Protocol
 

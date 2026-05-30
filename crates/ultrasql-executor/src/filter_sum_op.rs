@@ -35,15 +35,35 @@ use std::sync::Arc;
 
 use ultrasql_core::{DataType, Field, Schema};
 use ultrasql_storage::column_cache::CachedColumns;
-use ultrasql_vec::Batch;
 use ultrasql_vec::column::{Column, NumericColumn};
 use ultrasql_vec::jit::{JitConfig, filter_sum_i32_widening_gt_jit, filter_sum_i64_gt_jit};
 use ultrasql_vec::kernels::{
     CmpOp, cmp_i32_scalar, cmp_i64_scalar, filter_sum_i32_widening_gt, filter_sum_i64_gt,
     sum_i32_widening, sum_i32_widening_with_mask, sum_i64_with_mask,
 };
+use ultrasql_vec::{Batch, Bitmap};
 
 use crate::{ExecError, Operator};
+
+fn single_output_schema(output_name: String, data_type: DataType) -> Schema {
+    Schema::new_with_duplicate_names([Field::required(output_name, data_type)])
+}
+
+fn null_i64_column() -> Result<Column, ExecError> {
+    let mut nulls = Bitmap::new(1, false);
+    nulls.set(0, false);
+    NumericColumn::with_nulls(vec![0_i64], nulls)
+        .map(Column::Int64)
+        .map_err(|_| ExecError::Internal("single-row Int64 NULL length mismatch"))
+}
+
+fn null_f64_column() -> Result<Column, ExecError> {
+    let mut nulls = Bitmap::new(1, false);
+    nulls.set(0, false);
+    NumericColumn::with_nulls(vec![0.0_f64], nulls)
+        .map(Column::Float64)
+        .map_err(|_| ExecError::Internal("single-row Float64 NULL length mismatch"))
+}
 
 /// Fused filter + SUM operator over an `Int32` predicate and
 /// `Int32` sum column. See module docs.
@@ -112,8 +132,7 @@ impl FilterSumI32Scan {
         sum_col: usize,
         output_name: String,
     ) -> Self {
-        let output_schema = Schema::new([Field::required(output_name, DataType::Int64)])
-            .expect("output schema is trivially well-formed");
+        let output_schema = single_output_schema(output_name, DataType::Int64);
         Self {
             inner,
             predicate_col,
@@ -157,8 +176,7 @@ impl FilterSumI64Scan {
         sum_col: usize,
         output_name: String,
     ) -> Self {
-        let output_schema = Schema::new([Field::required(output_name, DataType::Int64)])
-            .expect("output schema is trivially well-formed");
+        let output_schema = single_output_schema(output_name, DataType::Int64);
         Self {
             inner,
             predicate_col,
@@ -238,8 +256,7 @@ impl CachedFilterSumI32Scan {
         sum_col: usize,
         output_name: String,
     ) -> Self {
-        let output_schema = Schema::new([Field::required(output_name, DataType::Int64)])
-            .expect("output schema is trivially well-formed");
+        let output_schema = single_output_schema(output_name, DataType::Int64);
         Self {
             columns,
             predicate_col,
@@ -283,8 +300,7 @@ impl CachedFilterSumI64Scan {
         sum_col: usize,
         output_name: String,
     ) -> Self {
-        let output_schema = Schema::new([Field::required(output_name, DataType::Int64)])
-            .expect("output schema is trivially well-formed");
+        let output_schema = single_output_schema(output_name, DataType::Int64);
         Self {
             columns,
             predicate_col,
@@ -339,9 +355,7 @@ impl Operator for CachedFilterSumI32Scan {
         };
 
         let result_col = if n_rows == 0 {
-            let mut nulls = ultrasql_vec::Bitmap::new(1, false);
-            nulls.set(0, false);
-            Column::Int64(NumericColumn::with_nulls(vec![0_i64], nulls).expect("matching lengths"))
+            null_i64_column()?
         } else {
             Column::Int64(NumericColumn::from_data(vec![total]))
         };
@@ -392,9 +406,7 @@ impl Operator for CachedFilterSumI64Scan {
         };
 
         let result_col = if n_rows == 0 {
-            let mut nulls = ultrasql_vec::Bitmap::new(1, false);
-            nulls.set(0, false);
-            Column::Int64(NumericColumn::with_nulls(vec![0_i64], nulls).expect("matching lengths"))
+            null_i64_column()?
         } else {
             Column::Int64(NumericColumn::from_data(vec![total]))
         };
@@ -438,8 +450,7 @@ impl std::fmt::Debug for CachedSumI32Scan {
 impl CachedSumI32Scan {
     #[must_use]
     pub fn new(columns: Arc<CachedColumns>, sum_col: usize, output_name: String) -> Self {
-        let output_schema = Schema::new([Field::required(output_name, DataType::Int64)])
-            .expect("output schema is trivially well-formed");
+        let output_schema = single_output_schema(output_name, DataType::Int64);
         Self {
             columns,
             sum_col,
@@ -466,9 +477,7 @@ impl Operator for CachedSumI32Scan {
         let n_rows = col.len();
         let total = sum_i32_widening(col);
         let result_col = if n_rows == 0 {
-            let mut nulls = ultrasql_vec::Bitmap::new(1, false);
-            nulls.set(0, false);
-            Column::Int64(NumericColumn::with_nulls(vec![0_i64], nulls).expect("matching lengths"))
+            null_i64_column()?
         } else {
             Column::Int64(NumericColumn::from_data(vec![total]))
         };
@@ -513,8 +522,7 @@ impl std::fmt::Debug for CachedAvgI32Scan {
 impl CachedAvgI32Scan {
     #[must_use]
     pub fn new(columns: Arc<CachedColumns>, sum_col: usize, output_name: String) -> Self {
-        let output_schema = Schema::new([Field::required(output_name, DataType::Float64)])
-            .expect("output schema is trivially well-formed");
+        let output_schema = single_output_schema(output_name, DataType::Float64);
         Self {
             columns,
             sum_col,
@@ -552,11 +560,7 @@ impl Operator for CachedAvgI32Scan {
             c
         });
         let result_col = if non_null == 0 {
-            let mut nulls = ultrasql_vec::Bitmap::new(1, false);
-            nulls.set(0, false);
-            Column::Float64(
-                NumericColumn::with_nulls(vec![0.0_f64], nulls).expect("matching lengths"),
-            )
+            null_f64_column()?
         } else {
             let total = sum_i32_widening(col);
             // Cast through f64 once; matches PostgreSQL's
@@ -641,9 +645,7 @@ impl Operator for FilterSumI32Scan {
             Column::Int64(NumericColumn::from_data(vec![total]))
         } else {
             // Emit a single NULL row.
-            let mut nulls = ultrasql_vec::Bitmap::new(1, false);
-            nulls.set(0, false);
-            Column::Int64(NumericColumn::with_nulls(vec![0_i64], nulls).expect("matching lengths"))
+            null_i64_column()?
         };
         let batch = Batch::new([result_col]).map_err(ExecError::from)?;
         Ok(Some(batch))
@@ -702,9 +704,7 @@ impl Operator for FilterSumI64Scan {
         let result_col = if saw_any {
             Column::Int64(NumericColumn::from_data(vec![total]))
         } else {
-            let mut nulls = ultrasql_vec::Bitmap::new(1, false);
-            nulls.set(0, false);
-            Column::Int64(NumericColumn::with_nulls(vec![0_i64], nulls).expect("matching lengths"))
+            null_i64_column()?
         };
         let batch = Batch::new([result_col]).map_err(ExecError::from)?;
         Ok(Some(batch))
