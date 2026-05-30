@@ -472,6 +472,13 @@ as a concise evidence ledger; roadmap stays for open gates only.
   clippy::expect_used -W clippy::unwrap_used`, and
   `cargo clippy -p ultrasql-parser --all-targets --all-features -- -D
   warnings`.
+- Storage heap fast-path header reads now avoid fixed-slice `expect`
+  conversions and unchecked integer-width casts in the touched scan/vacuum
+  item-id decode paths. Evidence: `cargo test -p ultrasql-storage heap`,
+  `cargo test -p ultrasql-storage
+  heap::tests::wal_emission::vacuum_heap_reclaims_committed_dead_tuples`, and
+  `cargo clippy -p ultrasql-storage --all-targets --all-features -- -D
+  warnings`.
 
 ## Core SQL And Wire Protocol
 

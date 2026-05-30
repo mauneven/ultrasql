@@ -86,8 +86,12 @@ impl<L: PageLoader> HeapAccess<L> {
                     if raw & 0b11 != 1 {
                         continue;
                     }
-                    let length = ((raw >> 2) & 0x7FFF) as usize;
-                    let offset = ((raw >> 17) & 0x7FFF) as usize;
+                    let Ok(length) = usize::try_from((raw >> 2) & 0x7FFF) else {
+                        continue;
+                    };
+                    let Ok(offset) = usize::try_from((raw >> 17) & 0x7FFF) else {
+                        continue;
+                    };
                     if length < TUPLE_HEADER_SIZE {
                         continue;
                     }
@@ -99,8 +103,16 @@ impl<L: PageLoader> HeapAccess<L> {
                     }
                     let slot_bytes = &page_bytes[offset..end];
                     // xmax lives at bytes 8..16 in the tuple header.
-                    let xmax_raw =
-                        u64::from_le_bytes(slot_bytes[8..16].try_into().expect("8-byte slice"));
+                    let xmax_raw = u64::from_le_bytes([
+                        slot_bytes[8],
+                        slot_bytes[9],
+                        slot_bytes[10],
+                        slot_bytes[11],
+                        slot_bytes[12],
+                        slot_bytes[13],
+                        slot_bytes[14],
+                        slot_bytes[15],
+                    ]);
                     if xmax_raw == 0 {
                         // Alive tuple — no xmax.
                         continue;
@@ -206,8 +218,14 @@ impl<L: PageLoader> HeapAccess<L> {
                     if raw & 0b11 != 1 {
                         continue;
                     }
-                    let length = ((raw >> 2) & 0x7FFF) as usize;
-                    let offset = ((raw >> 17) & 0x7FFF) as usize;
+                    let Ok(length) = usize::try_from((raw >> 2) & 0x7FFF) else {
+                        ok = false;
+                        break;
+                    };
+                    let Ok(offset) = usize::try_from((raw >> 17) & 0x7FFF) else {
+                        ok = false;
+                        break;
+                    };
                     if length < TUPLE_HEADER_SIZE
                         || offset
                             .checked_add(length)

@@ -216,11 +216,7 @@ impl<L: PageLoader> HeapAccess<L> {
         {
             let bytes = page.as_bytes_mut();
             let xmax_at = old_off + 8;
-            let existing_xmax = u64::from_le_bytes(
-                bytes[xmax_at..xmax_at + 8]
-                    .try_into()
-                    .expect("8-byte slice"),
-            );
+            let existing_xmax = read_u64_le(bytes, xmax_at)?;
             if existing_xmax != 0 {
                 return Err(HeapError::MalformedHeader("update on deleted tuple"));
             }
@@ -326,11 +322,7 @@ impl<L: PageLoader> HeapAccess<L> {
         // and `Xid::INVALID == 0`, so read the 8-byte xmax field
         // and compare to zero. Eight bytes — one cache-line touch.
         let xmax_at = slot_offset + 8;
-        let existing_xmax = u64::from_le_bytes(
-            page_bytes[xmax_at..xmax_at + 8]
-                .try_into()
-                .expect("8-byte slice"),
-        );
+        let existing_xmax = read_u64_le(page_bytes, xmax_at)?;
         if existing_xmax != 0 {
             return Err(HeapError::MalformedHeader("update on deleted tuple"));
         }
@@ -502,4 +494,17 @@ impl<L: PageLoader> HeapAccess<L> {
             .map_err(|_| HeapError::MalformedHeader("itemid length overflow"))?;
         Ok((offset, length))
     }
+}
+
+#[inline]
+fn read_u64_le(bytes: &[u8], offset: usize) -> Result<u64, HeapError> {
+    let end = offset
+        .checked_add(8)
+        .ok_or(HeapError::MalformedHeader("u64 field offset overflow"))?;
+    let window = bytes
+        .get(offset..end)
+        .ok_or(HeapError::MalformedHeader("u64 field outside tuple"))?;
+    Ok(u64::from_le_bytes([
+        window[0], window[1], window[2], window[3], window[4], window[5], window[6], window[7],
+    ]))
 }

@@ -108,8 +108,10 @@ impl<L: PageLoader> HeapAccess<L> {
                     // ItemIdFlags::Normal == 1; skip Unused / Dead / Redirect.
                     continue;
                 }
-                let length = ((raw >> 2) & 0x7FFF) as usize;
-                let offset = ((raw >> 17) & 0x7FFF) as usize;
+                let length = usize::try_from((raw >> 2) & 0x7FFF)
+                    .map_err(|_| HeapError::MalformedHeader("slot length overflow"))?;
+                let offset = usize::try_from((raw >> 17) & 0x7FFF)
+                    .map_err(|_| HeapError::MalformedHeader("slot offset overflow"))?;
                 if length < TUPLE_HEADER_SIZE
                     || offset
                         .checked_add(length)
@@ -122,12 +124,27 @@ impl<L: PageLoader> HeapAccess<L> {
                 // Minimal-decode visibility cache lookup. Reads only
                 // `xmin` (bytes 0..8), `xmax` (8..16), `infomask`
                 // (24..26) — see the comment above the loop.
-                let xmin_raw =
-                    u64::from_le_bytes(slot_bytes[0..8].try_into().expect("8-byte slice"));
-                let xmax_raw =
-                    u64::from_le_bytes(slot_bytes[8..16].try_into().expect("8-byte slice"));
-                let infomask_bits =
-                    u16::from_le_bytes(slot_bytes[24..26].try_into().expect("2-byte slice"));
+                let xmin_raw = u64::from_le_bytes([
+                    slot_bytes[0],
+                    slot_bytes[1],
+                    slot_bytes[2],
+                    slot_bytes[3],
+                    slot_bytes[4],
+                    slot_bytes[5],
+                    slot_bytes[6],
+                    slot_bytes[7],
+                ]);
+                let xmax_raw = u64::from_le_bytes([
+                    slot_bytes[8],
+                    slot_bytes[9],
+                    slot_bytes[10],
+                    slot_bytes[11],
+                    slot_bytes[12],
+                    slot_bytes[13],
+                    slot_bytes[14],
+                    slot_bytes[15],
+                ]);
+                let infomask_bits = u16::from_le_bytes([slot_bytes[24], slot_bytes[25]]);
                 let xmin_xid = Xid::new(xmin_raw);
 
                 // Fast path: xmax invalid (alive tuple) AND cached
