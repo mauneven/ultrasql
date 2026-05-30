@@ -48,6 +48,45 @@ async fn create_sequence_nextval_currval_setval_and_drop() {
     graceful_shutdown(running).await;
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn dropped_sequence_stays_dropped_after_restart() {
+    let data_dir = tempfile::TempDir::new().expect("temp data dir");
+
+    let running = start_persistent_server(data_dir.path(), "sequence_drop_restart_setup").await;
+    running
+        .client
+        .batch_execute("CREATE SEQUENCE seq_drop_restart START WITH 7")
+        .await
+        .expect("create sequence");
+    assert_eq!(
+        simple_i64(&running.client, "SELECT nextval('seq_drop_restart')").await,
+        7
+    );
+    running
+        .client
+        .batch_execute("DROP SEQUENCE seq_drop_restart")
+        .await
+        .expect("drop sequence");
+    graceful_shutdown(running).await;
+
+    let running = start_persistent_server(data_dir.path(), "sequence_drop_restart_verify").await;
+    running
+        .client
+        .simple_query("SELECT nextval('seq_drop_restart')")
+        .await
+        .expect_err("dropped sequence must not restart");
+    running
+        .client
+        .batch_execute("CREATE SEQUENCE seq_drop_restart START WITH 11")
+        .await
+        .expect("recreate sequence after restart");
+    assert_eq!(
+        simple_i64(&running.client, "SELECT nextval('seq_drop_restart')").await,
+        11
+    );
+    graceful_shutdown(running).await;
+}
+
 #[tokio::test]
 async fn alter_sequence_changes_increment() {
     let running = start_sample_server("sequence_test").await;
