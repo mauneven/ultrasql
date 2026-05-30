@@ -5447,6 +5447,26 @@ impl Server {
         self.write_materialized_view_metadata(&records)
     }
 
+    pub(crate) fn remove_materialized_view_runtime_metadata(
+        &self,
+        dropped_tables: &[String],
+    ) -> Result<(), ServerError> {
+        if dropped_tables.is_empty() {
+            return Ok(());
+        }
+        let mut records = self.load_materialized_view_metadata()?;
+        let before = records.len();
+        records.retain(|record| {
+            !dropped_tables
+                .iter()
+                .any(|table| record.view_table.eq_ignore_ascii_case(table))
+        });
+        if records.len() != before {
+            self.write_materialized_view_metadata(&records)?;
+        }
+        Ok(())
+    }
+
     fn rebuild_materialized_view_runtime_sidecars(&self) -> Result<(), ServerError> {
         for record in self.load_materialized_view_metadata()? {
             let Some(view_entry) = self.persistent_catalog.lookup_table(&record.view_table) else {

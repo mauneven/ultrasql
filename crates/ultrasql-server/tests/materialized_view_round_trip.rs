@@ -300,3 +300,46 @@ async fn drop_materialized_view_clears_runtime_dependency() {
 
     shutdown(running).await;
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn drop_materialized_view_removes_restart_metadata() {
+    let data_dir = tempfile::TempDir::new().unwrap();
+    let metadata_path = data_dir.path().join("pg_materialized_views.meta");
+
+    let running = start_persistent_server(data_dir.path(), "materialized_view_drop_meta").await;
+    running
+        .client
+        .batch_execute("CREATE TABLE mv_meta_src (id INT NOT NULL, amount INT NOT NULL)")
+        .await
+        .expect("create source");
+    running
+        .client
+        .batch_execute("INSERT INTO mv_meta_src VALUES (1, 10)")
+        .await
+        .expect("seed source");
+    running
+        .client
+        .batch_execute(
+            "CREATE MATERIALIZED VIEW mv_meta_copy AS SELECT id, amount FROM mv_meta_src",
+        )
+        .await
+        .expect("create materialized view");
+    let metadata = std::fs::read_to_string(&metadata_path).expect("metadata exists");
+    assert!(
+        metadata.contains("mv_meta_copy"),
+        "materialized-view metadata should record view before drop: {metadata}"
+    );
+
+    running
+        .client
+        .batch_execute("DROP TABLE mv_meta_copy")
+        .await
+        .expect("drop materialized view");
+    shutdown_persistent(running).await;
+
+    let metadata = std::fs::read_to_string(&metadata_path).expect("metadata still exists");
+    assert!(
+        !metadata.contains("mv_meta_copy"),
+        "dropped materialized view must be removed from metadata: {metadata}"
+    );
+}
