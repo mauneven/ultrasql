@@ -266,6 +266,82 @@ async fn drop_sequence_removes_sequence_privilege_grants() {
     shutdown(running).await;
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn drop_table_removes_owned_sequence_privilege_grants() {
+    let data_dir = tempfile::TempDir::new().expect("temp data dir");
+    let metadata_path = data_dir.path().join("pg_privileges.meta");
+    let sequence_name = "privilege_owned_seq_id_seq";
+
+    let running = start_persistent_server(data_dir.path(), "privilege_owned_sequence").await;
+    let client = &running.client;
+    client
+        .batch_execute("CREATE ROLE tester SUPERUSER LOGIN")
+        .await
+        .expect("register admin role");
+    client
+        .batch_execute("CREATE ROLE analyst LOGIN")
+        .await
+        .expect("create analyst role");
+    client
+        .batch_execute("CREATE TABLE privilege_owned_seq (id SERIAL)")
+        .await
+        .expect("create serial table");
+    client
+        .batch_execute("GRANT USAGE ON SEQUENCE privilege_owned_seq_id_seq TO analyst")
+        .await
+        .expect("grant owned sequence usage");
+    let before_drop = std::fs::read_to_string(&metadata_path).expect("privilege metadata exists");
+    assert!(
+        before_drop.contains(sequence_name),
+        "privilege metadata should record owned-sequence grant before drop: {before_drop}"
+    );
+
+    client
+        .batch_execute("DROP TABLE privilege_owned_seq")
+        .await
+        .expect("drop serial table");
+    let stale = client
+        .query_one(
+            "SELECT has_sequence_privilege('analyst', 'privilege_owned_seq_id_seq', 'USAGE')",
+            &[],
+        )
+        .await
+        .expect("owned sequence privilege check after table drop");
+    assert!(
+        !stale.get::<_, bool>(0),
+        "dropping a table must clear grants on its owned sequence"
+    );
+    shutdown(running).await;
+
+    let after_drop = std::fs::read_to_string(&metadata_path).expect("privilege metadata exists");
+    assert!(
+        !after_drop.contains(sequence_name),
+        "owned sequence grants must be removed from privilege metadata: {after_drop}"
+    );
+
+    let running =
+        start_persistent_server(data_dir.path(), "privilege_owned_sequence_recreate").await;
+    running
+        .client
+        .batch_execute("CREATE TABLE privilege_owned_seq (id SERIAL)")
+        .await
+        .expect("recreate serial table");
+    let recreated = running
+        .client
+        .query_one(
+            "SELECT has_sequence_privilege('analyst', 'privilege_owned_seq_id_seq', 'USAGE')",
+            &[],
+        )
+        .await
+        .expect("owned sequence privilege check after table recreate");
+    assert!(
+        !recreated.get::<_, bool>(0),
+        "recreated owned sequence must not inherit stale grant"
+    );
+
+    shutdown(running).await;
+}
+
 #[tokio::test]
 async fn column_privileges_gate_select_insert_and_update_targets() {
     let running = start_sample_server("column_privilege_catalog_test").await;

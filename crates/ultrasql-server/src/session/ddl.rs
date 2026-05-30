@@ -1882,7 +1882,26 @@ where
                 self.state.columnar_storage.remove(name);
                 if let Some((_, constraints)) = self.state.table_constraints.remove(&entry.oid) {
                     for seq_name in constraints.sequence_defaults.iter().flatten() {
+                        if let Some(seq) = self.state.sequences.get(seq_name).map(|seq| seq.clone())
+                        {
+                            seq.emit_wal(
+                                SequenceOpKind::Drop,
+                                seq_name,
+                                RelationId::INVALID,
+                                ultrasql_core::Xid::INVALID,
+                                self.state.heap.wal_sink().map(|sink| sink.as_ref()),
+                            )
+                            .map_err(|e| {
+                                ServerError::ddl(format!("DROP TABLE owned sequence WAL: {e}"))
+                            })?;
+                        }
                         self.state.sequences.remove(seq_name);
+                        self.sequence_state.forget(seq_name);
+                        privilege_grants_removed |=
+                            self.state.privilege_catalog.remove_object_grants(
+                                crate::auth::PrivilegeObjectKind::Sequence,
+                                seq_name,
+                            );
                     }
                 }
                 self.state.row_security.remove(&entry.oid);
