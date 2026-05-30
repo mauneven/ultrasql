@@ -32,6 +32,9 @@ pub enum ObjectStoreError {
     /// Requested byte range cannot be represented.
     #[error("{0}")]
     InvalidRange(String),
+    /// Request signing failed.
+    #[error("{0}")]
+    Signing(String),
     /// Object listing returned no matches.
     #[error("{0}")]
     NoMatches(String),
@@ -478,7 +481,7 @@ fn get_response(
 ) -> Result<ObjectResponse> {
     let mut builder = ureq::get(&request.url);
     if let Some(credentials) = credentials_for(request.scheme) {
-        for (name, value) in signed_headers(&request, &credentials) {
+        for (name, value) in signed_headers(&request, &credentials)? {
             builder = builder.header(name, value);
         }
     } else {
@@ -703,7 +706,7 @@ fn default_region(fallback: &str) -> String {
 fn signed_headers(
     request: &ObjectRequest,
     credentials: &Credentials,
-) -> Vec<(&'static str, String)> {
+) -> Result<Vec<(&'static str, String)>> {
     let now = Utc::now();
     let amz_date = now.format("%Y%m%dT%H%M%SZ").to_string();
     let date = now.format("%Y%m%d").to_string();
@@ -754,8 +757,8 @@ fn signed_headers(
         &date,
         &credentials.region,
         request.scheme.service(),
-    );
-    let signature = hex::encode(hmac_sha256(&signing_key, string_to_sign.as_bytes()));
+    )?;
+    let signature = hex::encode(hmac_sha256(&signing_key, string_to_sign.as_bytes())?);
     let authorization = format!(
         "AWS4-HMAC-SHA256 Credential={}/{}, SignedHeaders={}, Signature={}",
         credentials.access_key, scope, signed_header_names, signature
@@ -771,21 +774,21 @@ fn signed_headers(
     if let Some(token) = &credentials.session_token {
         headers.push(("x-amz-security-token", token.clone()));
     }
-    headers
+    Ok(headers)
 }
 
-fn signing_key(secret: &str, date: &str, region: &str, service: &str) -> Vec<u8> {
-    let k_date = hmac_sha256(format!("AWS4{secret}").as_bytes(), date.as_bytes());
-    let k_region = hmac_sha256(&k_date, region.as_bytes());
-    let k_service = hmac_sha256(&k_region, service.as_bytes());
+fn signing_key(secret: &str, date: &str, region: &str, service: &str) -> Result<Vec<u8>> {
+    let k_date = hmac_sha256(format!("AWS4{secret}").as_bytes(), date.as_bytes())?;
+    let k_region = hmac_sha256(&k_date, region.as_bytes())?;
+    let k_service = hmac_sha256(&k_region, service.as_bytes())?;
     hmac_sha256(&k_service, b"aws4_request")
 }
 
-fn hmac_sha256(key: &[u8], msg: &[u8]) -> Vec<u8> {
+fn hmac_sha256(key: &[u8], msg: &[u8]) -> Result<Vec<u8>> {
     let mut mac = Hmac::<Sha256>::new_from_slice(key)
-        .expect("HMAC-SHA256 accepts signing keys of any length");
+        .map_err(|_| ObjectStoreError::Signing("cannot initialize AWS signing HMAC".to_owned()))?;
     mac.update(msg);
-    mac.finalize().into_bytes().to_vec()
+    Ok(mac.finalize().into_bytes().to_vec())
 }
 
 fn sha256_hex(bytes: &[u8]) -> String {
@@ -1049,7 +1052,7 @@ mod tests {
             region: "auto".to_owned(),
         };
 
-        let headers = signed_headers(&request, &credentials);
+        let headers = signed_headers(&request, &credentials).unwrap();
 
         assert!(headers.iter().any(|(name, value)| {
             *name == "authorization"

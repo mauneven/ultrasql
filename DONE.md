@@ -388,6 +388,11 @@ as a concise evidence ledger; roadmap stays for open gates only.
   `cargo test -p ultrasql-wal writer`,
   `cargo test -p ultrasql-wal record`, and
   `cargo clippy -p ultrasql-wal --all-targets --all-features -- -D warnings`.
+- Object-store AWS v4 signing now propagates HMAC initialization failures as
+  `ObjectStoreError::Signing` instead of using a production `expect`. Evidence:
+  `cargo test -p ultrasql-objectstore --lib` and
+  `cargo clippy -p ultrasql-objectstore --all-targets --all-features -- -D
+  warnings`.
 
 ## Core SQL And Wire Protocol
 
