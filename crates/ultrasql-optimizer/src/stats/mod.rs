@@ -132,6 +132,11 @@ impl InMemoryStatsCatalog {
         self.entries.insert(key, stats);
     }
 
+    /// Remove statistics for a relation.
+    pub fn remove(&mut self, table: &str) -> Option<RelationStats> {
+        self.entries.remove(&table.to_lowercase())
+    }
+
     /// Analyze a table and register its statistics.
     ///
     /// This method triggers the AnalyzeRunner to compute statistics for the
@@ -203,6 +208,16 @@ mod tests {
         assert!(cat.lookup_relation("users").is_some());
         assert!(cat.lookup_relation("USERS").is_some());
         assert!(cat.lookup_relation("Users").is_some());
+    }
+
+    /// Removing a table clears its case-folded entry.
+    #[test]
+    fn remove_is_case_insensitive() {
+        let mut cat = InMemoryStatsCatalog::new();
+        cat.register(make_stats("Users", 42));
+        assert!(cat.remove("users").is_some());
+        assert!(cat.lookup_relation("USERS").is_none());
+        assert!(cat.remove("users").is_none());
     }
 
     /// Multiple tables can coexist in the catalog.

@@ -1880,6 +1880,10 @@ where
                     }
                 }
                 self.state.columnar_storage.remove(name);
+                let folded_name = name.to_ascii_lowercase();
+                self.state.stats_catalog.write().remove(&folded_name);
+                self.state.table_modifications.remove(&folded_name);
+                self.state.pending_analyze_tables.remove(&folded_name);
                 if let Some((_, constraints)) = self.state.table_constraints.remove(&entry.oid) {
                     for seq_name in constraints.sequence_defaults.iter().flatten() {
                         if let Some(seq) = self.state.sequences.get(seq_name).map(|seq| seq.clone())

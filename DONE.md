@@ -680,6 +680,9 @@ as a concise evidence ledger; roadmap stays for open gates only.
   durable `pg_privileges.meta`, so a recreated table cannot inherit stale ACLs
   by name. Evidence:
   `cargo test -p ultrasql-server --test privilege_catalog_round_trip`.
+- Dropped tables clear runtime optimizer statistics, modification counters, and
+  pending auto-analyze work, so recreated names cannot inherit stale planner
+  evidence. Evidence: `cargo test -p ultrasql-server --test analyze_round_trip`.
 - Dropped sequences remove sequence privilege grants from memory and durable
   `pg_privileges.meta`, so a recreated sequence cannot inherit stale ACLs by
   name. Evidence:

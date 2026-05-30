@@ -104,6 +104,52 @@ async fn analyze_table_returns_command_tag() {
     shutdown(client, server_handle).await;
 }
 
+#[tokio::test]
+async fn drop_table_clears_runtime_analyze_state() {
+    let (client, server, _conn, server_handle) = start_server_and_connect().await;
+    client
+        .batch_execute("CREATE TABLE analyze_drop (id INT NOT NULL)")
+        .await
+        .expect("create analyze table");
+    client
+        .batch_execute("INSERT INTO analyze_drop VALUES (1), (2), (3)")
+        .await
+        .expect("seed analyze table");
+    client
+        .batch_execute("ANALYZE analyze_drop")
+        .await
+        .expect("analyze table");
+    assert!(
+        server.lookup_relation_stats("analyze_drop").is_some(),
+        "ANALYZE should register stats before drop"
+    );
+    server
+        .table_modifications
+        .insert("analyze_drop".to_owned(), 99);
+    server
+        .pending_analyze_tables
+        .insert("analyze_drop".to_owned(), ());
+
+    client
+        .batch_execute("DROP TABLE analyze_drop")
+        .await
+        .expect("drop analyzed table");
+
+    assert!(
+        server.lookup_relation_stats("analyze_drop").is_none(),
+        "DROP TABLE must clear stale relation stats"
+    );
+    assert!(
+        !server.table_modifications.contains_key("analyze_drop"),
+        "DROP TABLE must clear modification counters"
+    );
+    assert!(
+        !server.pending_analyze_tables.contains_key("analyze_drop"),
+        "DROP TABLE must clear pending auto-analyze work"
+    );
+    shutdown(client, server_handle).await;
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn analyze_statistics_hydrate_optimizer_after_restart() {
     let data_dir = tempfile::TempDir::new().expect("temp dir");
