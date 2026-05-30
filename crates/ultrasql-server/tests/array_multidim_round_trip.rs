@@ -76,6 +76,20 @@ async fn multidimensional_arrays_store_dimensions_and_wire_oid() {
     );
     assert_eq!(flattened, vec![vec![Some("1:2:3:4".to_owned())]]);
 
+    let sliced = simple_rows(
+        client
+            .simple_query(
+                "SELECT matrix[2:], array_to_string(matrix[1:1], ':') \
+                 FROM array_probe WHERE id = 1",
+            )
+            .await
+            .expect("array slice multidimensional array"),
+    );
+    assert_eq!(
+        sliced,
+        vec![vec![Some("{{3,4}}".to_owned()), Some("1:2".to_owned()),]]
+    );
+
     let unnested = simple_rows(
         client
             .simple_query("SELECT * FROM unnest([[1, 2], [3, 4]])")

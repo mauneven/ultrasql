@@ -1358,6 +1358,27 @@ fn binds_multidimensional_array_literal_and_numeric_common_type() {
 }
 
 #[test]
+fn binds_array_slice_as_array_typed_function() {
+    let cat = InMemoryCatalog::new();
+    let plan = parse_and_bind("SELECT [10, 20, 30, 40][2:3]", &cat).expect("bind ok");
+    let LogicalPlan::Project { exprs, schema, .. } = &plan else {
+        panic!("expected Project, got {plan:?}");
+    };
+    assert_eq!(
+        schema.field_at(0).data_type,
+        DataType::Array(Box::new(DataType::Int32))
+    );
+    let ScalarExpr::FunctionCall {
+        name, data_type, ..
+    } = &exprs[0].0
+    else {
+        panic!("expected array slice function, got {:?}", exprs[0].0);
+    };
+    assert_eq!(name, "__ultrasql_array_slice");
+    assert_eq!(data_type, &DataType::Array(Box::new(DataType::Int32)));
+}
+
+#[test]
 fn rejects_ragged_multidimensional_array_literal() {
     let cat = InMemoryCatalog::new();
     let err = parse_and_bind("SELECT [[1, 2], [3]]", &cat).unwrap_err();

@@ -58,6 +58,20 @@ pub(super) fn bind_expr_with_ctes(
             index,
             ..
         } => bind_array_subscript(array_expr, index, input, catalog, cte_catalog, scope),
+        Expr::ArraySlice {
+            expr: array_expr,
+            lower,
+            upper,
+            ..
+        } => bind_array_slice(
+            array_expr,
+            lower.as_deref(),
+            upper.as_deref(),
+            input,
+            catalog,
+            cte_catalog,
+            scope,
+        ),
         Expr::Unary {
             op, expr: inner, ..
         } => bind_unary(*op, inner, input, catalog, cte_catalog, scope),
@@ -3159,6 +3173,57 @@ fn bind_array_subscript(
         args: vec![array, index],
         data_type: element_type,
     })
+}
+
+fn bind_array_slice(
+    array_expr: &Expr,
+    lower: Option<&Expr>,
+    upper: Option<&Expr>,
+    input: &Schema,
+    catalog: &dyn Catalog,
+    cte_catalog: &[(String, Schema)],
+    scope: &mut ScopeStack,
+) -> Result<ScalarExpr, PlanError> {
+    let array = bind_expr_with_ctes(array_expr, input, catalog, cte_catalog, scope)?;
+    let array_type = array.data_type();
+    let DataType::Array(_) = array_type else {
+        return Err(PlanError::TypeMismatch(format!(
+            "array slice requires array input, got {array_type}"
+        )));
+    };
+    let lower = bind_optional_array_bound(lower, input, catalog, cte_catalog, scope)?;
+    let upper = bind_optional_array_bound(upper, input, catalog, cte_catalog, scope)?;
+    Ok(ScalarExpr::FunctionCall {
+        name: "__ultrasql_array_slice".to_owned(),
+        args: vec![array, lower, upper],
+        data_type: array_type,
+    })
+}
+
+fn bind_optional_array_bound(
+    bound: Option<&Expr>,
+    input: &Schema,
+    catalog: &dyn Catalog,
+    cte_catalog: &[(String, Schema)],
+    scope: &mut ScopeStack,
+) -> Result<ScalarExpr, PlanError> {
+    let Some(bound) = bound else {
+        return Ok(ScalarExpr::Literal {
+            value: Value::Null,
+            data_type: DataType::Null,
+        });
+    };
+    let bound = bind_expr_with_ctes(bound, input, catalog, cte_catalog, scope)?;
+    let bound_type = bound.data_type();
+    if !matches!(
+        bound_type,
+        DataType::Int16 | DataType::Int32 | DataType::Int64 | DataType::Null
+    ) {
+        return Err(PlanError::TypeMismatch(format!(
+            "array slice bound must be integer, got {bound_type}"
+        )));
+    }
+    Ok(bound)
 }
 
 pub(super) fn bind_unary(

@@ -194,8 +194,8 @@ as a concise evidence ledger; roadmap stays for open gates only.
   `jsonb_path_query`, `jsonb_path_exists`, JSON_TABLE subset paths, and
   whole-row `row_to_json`.
 - Native arrays support multi-dimensional rectangular text/runtime round trips,
-  GIN-facing operators, `array_agg`, `array_length`, `array_cat`,
-  `array_to_string`, `string_to_array`, and wire-visible `unnest`.
+  GIN-facing operators, array subscripts/slices, `array_agg`, `array_length`,
+  `array_cat`, `array_to_string`, `string_to_array`, and wire-visible `unnest`.
 - `CREATE TYPE ... AS ENUM`, `CREATE TYPE ... AS (composite)`, and
   `CREATE DOMAIN` have durable catalog storage, restart round trips, and wire
   type OID coverage.

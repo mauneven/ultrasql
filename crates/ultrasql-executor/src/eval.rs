@@ -375,6 +375,7 @@ fn eval_function_call(
         "string_to_array" => eval_string_to_array(args),
         "array_cat" => eval_array_cat(args),
         "__ultrasql_array_subscript" => eval_array_subscript(args),
+        "__ultrasql_array_slice" => eval_array_slice(args),
         "__ultrasql_eq_any_array" => eval_eq_any_array(args),
         "__ultrasql_cast_oid" => eval_cast_oid(args),
         "__ultrasql_cast_regclass" => eval_cast_regclass(args),
@@ -1090,6 +1091,63 @@ fn eval_array_subscript(args: &[Value]) -> Result<Value, EvalError> {
     let zero_idx =
         usize::try_from(index - 1).map_err(|_| EvalError::Type("array index overflow".into()))?;
     Ok(elements.get(zero_idx).cloned().unwrap_or(Value::Null))
+}
+
+fn eval_array_slice(args: &[Value]) -> Result<Value, EvalError> {
+    if args.len() != 3 {
+        return Err(EvalError::Type(format!(
+            "array slice: expected 3 args, got {}",
+            args.len()
+        )));
+    }
+    let Value::Array {
+        element_type,
+        elements,
+    } = &args[0]
+    else {
+        return if matches!(args[0], Value::Null) {
+            Ok(Value::Null)
+        } else {
+            Err(EvalError::Type(format!(
+                "array slice: array argument required, got {:?}",
+                args[0].data_type()
+            )))
+        };
+    };
+    let lower = optional_array_slice_bound(&args[1], "lower")?;
+    let upper = optional_array_slice_bound(&args[2], "upper")?;
+    let len = i64::try_from(elements.len())
+        .map_err(|_| EvalError::Type("array slice length overflow".to_owned()))?;
+    let lower = lower.unwrap_or(1);
+    let upper = upper.unwrap_or(len);
+    if len == 0 || lower > upper || upper < 1 || lower > len {
+        return Ok(Value::Array {
+            element_type: element_type.clone(),
+            elements: Vec::new(),
+        });
+    }
+    let start = lower.max(1);
+    let end = upper.min(len);
+    let start_idx =
+        usize::try_from(start - 1).map_err(|_| EvalError::Type("array slice overflow".into()))?;
+    let end_exclusive =
+        usize::try_from(end).map_err(|_| EvalError::Type("array slice overflow".into()))?;
+    Ok(Value::Array {
+        element_type: element_type.clone(),
+        elements: elements[start_idx..end_exclusive].to_vec(),
+    })
+}
+
+fn optional_array_slice_bound(value: &Value, name: &'static str) -> Result<Option<i64>, EvalError> {
+    if matches!(value, Value::Null) {
+        return Ok(None);
+    }
+    value.as_i64().map(Some).ok_or_else(|| {
+        EvalError::Type(format!(
+            "array slice: {name} bound must be integer, got {:?}",
+            value.data_type()
+        ))
+    })
 }
 
 fn eval_eq_any_array(args: &[Value]) -> Result<Value, EvalError> {
@@ -5605,6 +5663,26 @@ mod tests {
                 vec![array.clone(), Value::Int32(3)]
             ),
             Value::Int32(30)
+        );
+        assert_eq!(
+            eval_fn(
+                "__ultrasql_array_slice",
+                vec![array.clone(), Value::Int32(1), Value::Int32(2)]
+            ),
+            Value::Array {
+                element_type: DataType::Int32,
+                elements: vec![Value::Int32(10), Value::Null],
+            }
+        );
+        assert_eq!(
+            eval_fn(
+                "__ultrasql_array_slice",
+                vec![array.clone(), Value::Int32(3), Value::Null]
+            ),
+            Value::Array {
+                element_type: DataType::Int32,
+                elements: vec![Value::Int32(30)],
+            }
         );
         assert_eq!(
             eval_fn(
