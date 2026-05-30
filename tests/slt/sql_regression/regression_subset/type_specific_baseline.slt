@@ -114,7 +114,7 @@ SELECT id FROM slt_pg_type_specific WHERE array_length(nums, 1) = 3
 ----
 1
 
-# ultrasql:skip full PostgreSQL type-specific regression breadth needs exhaustive numeric overflow, text collation, timezone abbreviation, SQL/JSON, and array slice parity
+# ultrasql:skip full PostgreSQL type-specific regression breadth needs exhaustive numeric overflow, text collation, timezone abbreviation, and SQL/JSON parity
 query I nosort
 SELECT COUNT(*) FROM pg_type WHERE typname IN ('numeric', 'text', 'date', 'jsonb', '_int4')
 ----

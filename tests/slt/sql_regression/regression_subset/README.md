@@ -39,7 +39,7 @@ rows written in SQLLogicTest format; they do not vendor the full upstream
 regression suite. Unsupported catalog-wide sanity checks and user-defined
 operator DDL stay as explicit `# ultrasql:skip` debt in the relevant shard.
 The type-specific shard likewise keeps full numeric overflow, collation,
-timezone-abbreviation, SQL/JSON, and array-slice breadth as visible skip debt.
+timezone-abbreviation, and SQL/JSON breadth as visible skip debt.
 
 Run with PostgreSQL reference:
 
