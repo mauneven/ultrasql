@@ -520,10 +520,11 @@ impl<L: PageLoader> Iterator for HeapScan<'_, L> {
             // acquires + releases the per-frame `RwLock<Page>` read
             // path under `parking_lot` (a CAS on the fast path); no
             // DashMap probe and no atomic-refcount bump per slot.
-            let guard = self
-                .current_guard
-                .as_ref()
-                .expect("guard set above before slot read");
+            let Some(guard) = self.current_guard.as_ref() else {
+                return Some(Err(HeapError::MalformedHeader(
+                    "heap scan guard missing before slot read",
+                )));
+            };
             let owned = match HeapAccess::<L>::copy_slot_bytes(guard, slot) {
                 Ok(v) => v,
                 // Skip non-normal slots (Unused/Dead/Redirect).

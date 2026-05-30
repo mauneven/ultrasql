@@ -129,6 +129,11 @@ as a concise evidence ledger; roadmap stays for open gates only.
   `cargo test -p ultrasql-storage --lib page_backed_ivfflat -- --nocapture`
   and
   `cargo clippy -p ultrasql-storage --all-targets --all-features -- -D warnings`.
+- Heap scan no longer uses a production `expect` for the held page guard; an
+  impossible missing-guard state now returns a typed `HeapError` instead of
+  panicking. Evidence: `cargo test -p ultrasql-storage --lib heap -- --nocapture`
+  and
+  `cargo clippy -p ultrasql-storage --all-targets --all-features -- -D warnings`.
 - Backup/restore smoke runner covers `ultrasql --basebackup`,
   `ultrasql --pg-dump`, `ultrasql --pg-restore`, row counts, and indexed lookup.
 - Backup/restore dump-format certification now covers custom, directory, and
