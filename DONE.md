@@ -152,6 +152,9 @@ as a concise evidence ledger; roadmap stays for open gates only.
   of silently treating them as NULL non-matches. Evidence:
   `cargo test -p ultrasql-executor hash_join` and
   `cargo test -p ultrasql-executor merge_join`.
+- `GatherMerge` now propagates merge-key evaluation failures instead of
+  silently comparing them as NULL. Evidence:
+  `cargo test -p ultrasql-executor gather`.
 
 ## Core SQL And Wire Protocol
 

@@ -192,7 +192,7 @@ impl Operator for GatherMerge {
                 fill_child_head(child, &self.schema)?;
             }
 
-            let Some(best_idx) = best_child(&self.children, &self.keys) else {
+            let Some(best_idx) = best_child(&self.children, &self.keys)? else {
                 self.eof = true;
                 break;
             };
@@ -239,7 +239,7 @@ fn fill_child_head(child: &mut MergeChild, schema: &Schema) -> Result<(), ExecEr
     Ok(())
 }
 
-fn best_child(children: &[MergeChild], keys: &[CompiledKey]) -> Option<usize> {
+fn best_child(children: &[MergeChild], keys: &[CompiledKey]) -> Result<Option<usize>, ExecError> {
     let mut best: Option<usize> = None;
     for (idx, child) in children.iter().enumerate() {
         let Some(row) = child.rows.front() else {
@@ -253,24 +253,34 @@ fn best_child(children: &[MergeChild], keys: &[CompiledKey]) -> Option<usize> {
             .rows
             .front()
             .expect("best child has a head row");
-        if compare_rows(row, best_row, keys) == Ordering::Less {
+        if compare_rows(row, best_row, keys)? == Ordering::Less {
             best = Some(idx);
         }
     }
-    best
+    Ok(best)
 }
 
-fn compare_rows(left: &[Value], right: &[Value], keys: &[CompiledKey]) -> Ordering {
+fn compare_rows(
+    left: &[Value],
+    right: &[Value],
+    keys: &[CompiledKey],
+) -> Result<Ordering, ExecError> {
     for key in keys {
-        let left_value = key.eval.eval(left).unwrap_or(Value::Null);
-        let right_value = key.eval.eval(right).unwrap_or(Value::Null);
+        let left_value = key
+            .eval
+            .eval(left)
+            .map_err(|err| ExecError::TypeMismatch(err.to_string()))?;
+        let right_value = key
+            .eval
+            .eval(right)
+            .map_err(|err| ExecError::TypeMismatch(err.to_string()))?;
         let ord = compare_values_nullable(&left_value, &right_value, key.nulls_first);
         let ord = if key.asc { ord } else { ord.reverse() };
         if ord != Ordering::Equal {
-            return ord;
+            return Ok(ord);
         }
     }
-    Ordering::Equal
+    Ok(Ordering::Equal)
 }
 
 fn sum_row_hints(children: &[Box<dyn Operator>]) -> Option<usize> {
@@ -283,8 +293,8 @@ fn sum_row_hints(children: &[Box<dyn Operator>]) -> Option<usize> {
 
 #[cfg(test)]
 mod tests {
-    use ultrasql_core::{DataType, Field};
-    use ultrasql_planner::ScalarExpr;
+    use ultrasql_core::{DataType, Field, Value};
+    use ultrasql_planner::{BinaryOp, ScalarExpr};
     use ultrasql_vec::column::{Column, NumericColumn};
 
     use super::*;
@@ -330,6 +340,30 @@ mod tests {
         }
     }
 
+    fn lit_i32(v: i32) -> ScalarExpr {
+        ScalarExpr::Literal {
+            value: Value::Int32(v),
+            data_type: DataType::Int32,
+        }
+    }
+
+    fn divide_id_by_zero_key() -> SortKey {
+        SortKey {
+            expr: ScalarExpr::Binary {
+                op: BinaryOp::Div,
+                left: Box::new(ScalarExpr::Column {
+                    name: "id".into(),
+                    index: 0,
+                    data_type: DataType::Int32,
+                }),
+                right: Box::new(lit_i32(0)),
+                data_type: DataType::Int32,
+            },
+            asc: true,
+            nulls_first: false,
+        }
+    }
+
     #[test]
     fn gather_round_robins_worker_batches() {
         let schema = schema_i32();
@@ -361,6 +395,25 @@ mod tests {
         let mut gather =
             GatherMerge::try_new(children, vec![sort_key_id(true)], schema).expect("merge ok");
         assert_eq!(drain_i32(&mut gather), vec![0, 1, 2, 3, 4, 5, 7]);
+    }
+
+    #[test]
+    fn gather_merge_key_eval_error_propagates() {
+        let schema = schema_i32();
+        let children = vec![
+            scan(&schema, vec![batch_i32(&[1])]),
+            scan(&schema, vec![batch_i32(&[2])]),
+        ];
+        let mut gather = GatherMerge::try_new(children, vec![divide_id_by_zero_key()], schema)
+            .expect("merge ok");
+
+        let err = gather
+            .next_batch()
+            .expect_err("merge key division must error");
+        assert!(
+            err.to_string().contains("division by zero"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]
