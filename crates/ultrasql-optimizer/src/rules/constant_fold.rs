@@ -132,6 +132,65 @@ fn fold_join_condition(
     }
 }
 
+fn fold_window_func(
+    func: &ultrasql_planner::LogicalWindowFunc,
+) -> (ultrasql_planner::LogicalWindowFunc, bool) {
+    use ultrasql_planner::LogicalWindowFunc;
+
+    match func {
+        LogicalWindowFunc::Lag {
+            expr,
+            offset,
+            default,
+        } => fold_expr(expr).map_or_else(
+            || (func.clone(), false),
+            |expr| {
+                (
+                    LogicalWindowFunc::Lag {
+                        expr,
+                        offset: *offset,
+                        default: default.clone(),
+                    },
+                    true,
+                )
+            },
+        ),
+        LogicalWindowFunc::Lead {
+            expr,
+            offset,
+            default,
+        } => fold_expr(expr).map_or_else(
+            || (func.clone(), false),
+            |expr| {
+                (
+                    LogicalWindowFunc::Lead {
+                        expr,
+                        offset: *offset,
+                        default: default.clone(),
+                    },
+                    true,
+                )
+            },
+        ),
+        LogicalWindowFunc::FirstValue(expr) => fold_expr(expr).map_or_else(
+            || (func.clone(), false),
+            |expr| (LogicalWindowFunc::FirstValue(expr), true),
+        ),
+        LogicalWindowFunc::LastValue(expr) => fold_expr(expr).map_or_else(
+            || (func.clone(), false),
+            |expr| (LogicalWindowFunc::LastValue(expr), true),
+        ),
+        LogicalWindowFunc::NthValue { expr, n } => fold_expr(expr).map_or_else(
+            || (func.clone(), false),
+            |expr| (LogicalWindowFunc::NthValue { expr, n: *n }, true),
+        ),
+        LogicalWindowFunc::RowNumber
+        | LogicalWindowFunc::Rank
+        | LogicalWindowFunc::DenseRank
+        | LogicalWindowFunc::Ntile(_) => (func.clone(), false),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Plan-level fold dispatch
 // ---------------------------------------------------------------------------
@@ -205,14 +264,17 @@ fn fold_plan(plan: &LogicalPlan) -> Result<Option<LogicalPlan>, OptimizeError> {
             // and the function-internal exprs. The output column shape
             // is fixed by the binder so the schema never changes.
             let new_input = fold_plan(input)?;
-            if new_input.is_none() {
+            let (new_partition, partition_changed) = fold_expr_list(partition_by);
+            let (new_order_by, order_changed) = fold_sort_keys(order_by);
+            let (new_func, func_changed) = fold_window_func(func);
+            if new_input.is_none() && !partition_changed && !order_changed && !func_changed {
                 return Ok(None);
             }
             Ok(Some(LogicalPlan::Window {
                 input: Box::new(new_input.unwrap_or_else(|| *input.clone())),
-                partition_by: partition_by.clone(),
-                order_by: order_by.clone(),
-                func: func.clone(),
+                partition_by: new_partition,
+                order_by: new_order_by,
+                func: new_func,
                 output_name: output_name.clone(),
                 schema: schema.clone(),
             }))
@@ -810,7 +872,7 @@ const fn bool_literal(b: bool) -> ScalarExpr {
 #[cfg(test)]
 mod tests {
     use ultrasql_core::{DataType, Value};
-    use ultrasql_planner::{BinaryOp, ScalarExpr, UnaryOp};
+    use ultrasql_planner::{BinaryOp, LogicalWindowFunc, ScalarExpr, SortKey, UnaryOp};
 
     use super::*;
     use crate::rules::RewriteRule;
@@ -1065,6 +1127,50 @@ mod tests {
         if let Some(LogicalPlan::Filter { predicate, .. }) = result {
             assert_eq!(predicate, lit_bool(true));
         }
+    }
+
+    #[test]
+    fn rule_folds_window_partition_order_and_function_exprs() {
+        use ultrasql_core::{Field, Schema};
+
+        let input_schema =
+            Schema::new([Field::required("id", DataType::Int32)]).expect("input schema ok");
+        let output_schema = Schema::new([
+            Field::required("id", DataType::Int32),
+            Field::required("first_value", DataType::Int32),
+        ])
+        .expect("output schema ok");
+        let plan = LogicalPlan::Window {
+            input: Box::new(LogicalPlan::Scan {
+                table: "t".into(),
+                schema: input_schema,
+                projection: None,
+            }),
+            partition_by: vec![add_i32(lit_i32(1), lit_i32(2))],
+            order_by: vec![SortKey {
+                expr: add_i32(lit_i32(3), lit_i32(4)),
+                asc: true,
+                nulls_first: false,
+            }],
+            func: LogicalWindowFunc::FirstValue(add_i32(lit_i32(5), lit_i32(6))),
+            output_name: "first_value".into(),
+            schema: output_schema,
+        };
+
+        let result = ConstantFold.apply(&plan).expect("constant fold succeeds");
+        let Some(LogicalPlan::Window {
+            partition_by,
+            order_by,
+            func,
+            ..
+        }) = result
+        else {
+            panic!("window expressions should fold");
+        };
+
+        assert_eq!(partition_by, vec![lit_i32(3)]);
+        assert_eq!(order_by[0].expr, lit_i32(7));
+        assert_eq!(func, LogicalWindowFunc::FirstValue(lit_i32(11)));
     }
 
     #[test]

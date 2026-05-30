@@ -166,6 +166,11 @@ as a concise evidence ledger; roadmap stays for open gates only.
   surface typed `PlanError`s. Evidence:
   `cargo test -p ultrasql-planner binder::tests`,
   `cargo test -p ultrasql-planner expr_bind`, and the non-test panic audit.
+- Constant folding now rewrites window `PARTITION BY`, window `ORDER BY`, and
+  value expressions inside `LAG`, `LEAD`, `FIRST_VALUE`, `LAST_VALUE`, and
+  `NTH_VALUE` even when the window input is already a fixed point. Evidence:
+  `cargo test -p ultrasql-optimizer constant_fold` and
+  `cargo test -p ultrasql-optimizer`.
 
 ## Core SQL And Wire Protocol
 
