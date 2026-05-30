@@ -73,7 +73,7 @@ pub(super) fn lower_recursive_cte(
     let mut seen_keys: std::collections::HashSet<Vec<u8>> = std::collections::HashSet::new();
     if dedup {
         for b in &accumulator {
-            for k in batch_row_keys(b) {
+            for k in batch_row_keys(b)? {
                 seen_keys.insert(k);
             }
         }
@@ -200,7 +200,7 @@ pub(super) fn lower_recursive_cte(
 /// when rows are equal under SQL semantics; for the v0.5 type set
 /// (Int32, Int64, Float32, Float64, Bool, Text) the encoding is the
 
-pub(super) fn batch_row_keys(batch: &Batch) -> Vec<Vec<u8>> {
+pub(super) fn batch_row_keys(batch: &Batch) -> Result<Vec<Vec<u8>>, ServerError> {
     let n_rows = batch.rows();
     let mut keys: Vec<Vec<u8>> = (0..n_rows).map(|_| Vec::with_capacity(64)).collect();
     for col in batch.columns() {
@@ -228,11 +228,7 @@ pub(super) fn batch_row_keys(batch: &Batch) -> Vec<Vec<u8>> {
                     } else {
                         key.push(0x00);
                         let s = c.value(row_idx);
-                        key.extend_from_slice(
-                            &u32::try_from(s.len())
-                                .expect("CTE distinct key string length under u32::MAX")
-                                .to_le_bytes(),
-                        );
+                        key.extend_from_slice(&cte_key_text_len(s)?.to_le_bytes());
                         key.extend_from_slice(s.as_bytes());
                     }
                 }
@@ -242,11 +238,7 @@ pub(super) fn batch_row_keys(batch: &Batch) -> Vec<Vec<u8>> {
                     } else {
                         key.push(0x00);
                         let s = c.decode_at(row_idx);
-                        key.extend_from_slice(
-                            &u32::try_from(s.len())
-                                .expect("CTE distinct key string length under u32::MAX")
-                                .to_le_bytes(),
-                        );
+                        key.extend_from_slice(&cte_key_text_len(s)?.to_le_bytes());
                         key.extend_from_slice(s.as_bytes());
                     }
                 }
@@ -276,7 +268,12 @@ pub(super) fn batch_row_keys(batch: &Batch) -> Vec<Vec<u8>> {
             }
         }
     }
-    keys
+    Ok(keys)
+}
+
+fn cte_key_text_len(text: &str) -> Result<u32, ServerError> {
+    u32::try_from(text.len())
+        .map_err(|_| ServerError::unsupported("recursive CTE distinct key text too large"))
 }
 
 /// Return a sub-batch of `batch` containing only rows whose encoded
@@ -286,7 +283,7 @@ pub(super) fn filter_unseen_rows(
     batch: &Batch,
     seen: &mut std::collections::HashSet<Vec<u8>>,
 ) -> Result<Option<Batch>, ServerError> {
-    let keys = batch_row_keys(batch);
+    let keys = batch_row_keys(batch)?;
     let mut keep_mask = Vec::with_capacity(keys.len());
     for k in keys {
         if seen.insert(k) {
@@ -305,10 +302,10 @@ pub(super) fn filter_unseen_rows(
     let mut cols: Vec<Column> = Vec::with_capacity(batch.columns().len());
     for col in batch.columns() {
         let new_col = match col {
-            Column::Int32(c) => Column::Int32(filter_numeric(c, &keep_mask)),
-            Column::Int64(c) => Column::Int64(filter_numeric(c, &keep_mask)),
-            Column::Float32(c) => Column::Float32(filter_numeric(c, &keep_mask)),
-            Column::Float64(c) => Column::Float64(filter_numeric(c, &keep_mask)),
+            Column::Int32(c) => Column::Int32(filter_numeric(c, &keep_mask)?),
+            Column::Int64(c) => Column::Int64(filter_numeric(c, &keep_mask)?),
+            Column::Float32(c) => Column::Float32(filter_numeric(c, &keep_mask)?),
+            Column::Float64(c) => Column::Float64(filter_numeric(c, &keep_mask)?),
             Column::Bool(c) => {
                 let data: Vec<bool> = c
                     .data()
@@ -319,7 +316,7 @@ pub(super) fn filter_unseen_rows(
                 let nulls = c.nulls().map(|source| filter_bitmap(source, &keep_mask));
                 let col = match nulls {
                     Some(nulls) => ultrasql_vec::column::BoolColumn::with_nulls(data, nulls)
-                        .expect("filtered bool validity length matches data length"),
+                        .map_err(cte_filter_error)?,
                     None => ultrasql_vec::column::BoolColumn::from_data(data),
                 };
                 Column::Bool(col)
@@ -349,7 +346,7 @@ pub(super) fn filter_unseen_rows(
 pub(super) fn filter_numeric<T: Copy>(
     col: &ultrasql_vec::column::NumericColumn<T>,
     keep_mask: &[bool],
-) -> ultrasql_vec::column::NumericColumn<T> {
+) -> Result<ultrasql_vec::column::NumericColumn<T>, ServerError> {
     let data: Vec<T> = col
         .data()
         .iter()
@@ -357,10 +354,15 @@ pub(super) fn filter_numeric<T: Copy>(
         .filter_map(|(v, k)| k.then_some(*v))
         .collect();
     match col.nulls().map(|source| filter_bitmap(source, keep_mask)) {
-        Some(nulls) => ultrasql_vec::column::NumericColumn::with_nulls(data, nulls)
-            .expect("filtered numeric validity length matches data length"),
-        None => ultrasql_vec::column::NumericColumn::from_data(data),
+        Some(nulls) => {
+            ultrasql_vec::column::NumericColumn::with_nulls(data, nulls).map_err(cte_filter_error)
+        }
+        None => Ok(ultrasql_vec::column::NumericColumn::from_data(data)),
     }
+}
+
+fn cte_filter_error(err: ultrasql_vec::column::ColumnError) -> ServerError {
+    ServerError::unsupported(format!("recursive CTE filter: {err}"))
 }
 
 fn filter_bitmap(source: &ultrasql_vec::Bitmap, keep_mask: &[bool]) -> ultrasql_vec::Bitmap {
@@ -474,7 +476,7 @@ mod tests {
     #[test]
     fn row_keys_and_unseen_filter_preserve_nulls_across_column_kinds() {
         let batch = mixed_batch();
-        let keys = batch_row_keys(&batch);
+        let keys = batch_row_keys(&batch).expect("keys");
         assert_eq!(keys.len(), 3);
         assert_eq!(keys[0], keys[2]);
         assert_ne!(keys[0], keys[1]);

@@ -241,6 +241,12 @@ as a concise evidence ledger; roadmap stays for open gates only.
   `cargo test -p ultrasql-server wire_writer` and
   `cargo clippy -p ultrasql-server --lib --all-features -- -W
   clippy::expect_used -W clippy::unwrap_used`.
+- Recursive CTE DISTINCT key encoding and unseen-row filtering now return
+  typed server errors for oversized text keys or impossible filtered-column
+  length mismatches instead of relying on production `expect` paths. Evidence:
+  `cargo test -p ultrasql-server cte_helpers` and
+  `cargo clippy -p ultrasql-server --lib --all-features -- -W
+  clippy::expect_used -W clippy::unwrap_used`.
 
 ## Core SQL And Wire Protocol
 
