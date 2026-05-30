@@ -10,7 +10,9 @@ use std::collections::BTreeMap;
 use std::fmt;
 use std::sync::Arc;
 
-use ultrasql_core::{DataType, Field, RelationId, Schema};
+#[cfg(test)]
+use ultrasql_core::{DataType, Field};
+use ultrasql_core::{RelationId, Schema};
 use ultrasql_executor::{ExecError, Operator};
 use ultrasql_planner::{AggregateFunc, LogicalAggregateExpr, LogicalPlan, ScalarExpr};
 use ultrasql_vec::Batch;
@@ -501,7 +503,7 @@ fn i64_from_i128(value: i128) -> Result<i64, ExecError> {
         .map_err(|_| ExecError::TypeMismatch("TPC-H Q1 decimal overflow".to_owned()))
 }
 
-#[allow(dead_code)]
+#[cfg(test)]
 fn q1_schema() -> Schema {
     Schema::new([
         Field::required("l_returnflag", DataType::Text { max_len: None }),

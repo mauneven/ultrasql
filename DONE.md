@@ -280,6 +280,11 @@ as a concise evidence ledger; roadmap stays for open gates only.
   `cargo test -p ultrasql-server pipeline::tests` and
   `cargo clippy -p ultrasql-server --lib --all-features -- -W
   clippy::expect_used -W clippy::unwrap_used`.
+- TPC-H Q1 static schema helper is now compiled only for tests, keeping
+  test-only schema assertions out of production panic audits. Evidence:
+  `cargo test -p ultrasql-server pipeline::tests::tpch_sidecars` and
+  `cargo clippy -p ultrasql-server --lib --all-features -- -W
+  clippy::expect_used -W clippy::unwrap_used`.
 
 ## Core SQL And Wire Protocol
 
