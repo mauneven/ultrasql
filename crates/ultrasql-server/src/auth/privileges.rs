@@ -221,6 +221,15 @@ impl InMemoryPrivilegeCatalog {
         }
     }
 
+    /// Remove all explicit grants attached to one object.
+    pub fn remove_object_grants(&self, object_kind: PrivilegeObjectKind, object: &str) -> bool {
+        let object_name = normalize_object_name(object_kind, object);
+        let mut grants = self.grants.write();
+        let before = grants.len();
+        grants.retain(|key, _| key.object_kind != object_kind || key.object_name != object_name);
+        grants.len() != before
+    }
+
     /// Add default privileges applied to future objects owned by listed roles.
     pub fn grant_default_many(&self, update: DefaultPrivilegeUpdate<'_>) {
         let grantor = update.grantor.to_ascii_lowercase();
@@ -640,6 +649,61 @@ mod tests {
             "secret",
             PrivilegeKind::Select
         ));
+    }
+
+    #[test]
+    fn remove_object_grants_clears_object_and_column_entries() {
+        let catalog = InMemoryPrivilegeCatalog::new();
+        catalog.grant_many(
+            "ultrasql",
+            PrivilegeObjectKind::Table,
+            &["public.t".to_owned()],
+            &["analyst".to_owned()],
+            &[
+                PrivilegeRequest {
+                    privilege: PrivilegeKind::Select,
+                    columns: Vec::new(),
+                },
+                PrivilegeRequest {
+                    privilege: PrivilegeKind::Update,
+                    columns: vec!["id".to_owned()],
+                },
+            ],
+            false,
+        );
+        catalog.grant_many(
+            "ultrasql",
+            PrivilegeObjectKind::Sequence,
+            &["t".to_owned()],
+            &["analyst".to_owned()],
+            &[PrivilegeRequest {
+                privilege: PrivilegeKind::Usage,
+                columns: Vec::new(),
+            }],
+            false,
+        );
+
+        assert!(catalog.remove_object_grants(PrivilegeObjectKind::Table, "t"));
+        assert!(!catalog.has_privilege(
+            "analyst",
+            PrivilegeObjectKind::Table,
+            "t",
+            PrivilegeKind::Select
+        ));
+        assert!(!catalog.has_column_privilege(
+            "analyst",
+            PrivilegeObjectKind::Table,
+            "t",
+            "id",
+            PrivilegeKind::Update
+        ));
+        assert!(catalog.has_privilege(
+            "analyst",
+            PrivilegeObjectKind::Sequence,
+            "t",
+            PrivilegeKind::Usage
+        ));
+        assert!(!catalog.remove_object_grants(PrivilegeObjectKind::Table, "t"));
     }
 
     #[test]

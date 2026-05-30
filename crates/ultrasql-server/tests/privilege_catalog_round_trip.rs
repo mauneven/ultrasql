@@ -89,6 +89,96 @@ async fn grant_revoke_privileges_update_catalog_checks() {
     shutdown(running).await;
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn drop_table_removes_table_privilege_grants() {
+    let data_dir = tempfile::TempDir::new().expect("temp data dir");
+    let metadata_path = data_dir.path().join("pg_privileges.meta");
+
+    let running = start_persistent_server(data_dir.path(), "privilege_drop_table").await;
+    let client = &running.client;
+    client
+        .batch_execute("CREATE ROLE tester SUPERUSER LOGIN")
+        .await
+        .expect("register admin role");
+    client
+        .batch_execute("CREATE ROLE analyst LOGIN")
+        .await
+        .expect("create analyst role");
+    client
+        .batch_execute("CREATE TABLE privilege_drop (id INT, secret TEXT)")
+        .await
+        .expect("create privilege table");
+    client
+        .batch_execute("GRANT SELECT ON TABLE privilege_drop TO analyst")
+        .await
+        .expect("grant table select");
+    client
+        .batch_execute("GRANT UPDATE(id) ON TABLE privilege_drop TO analyst")
+        .await
+        .expect("grant column update");
+    let before_drop = std::fs::read_to_string(&metadata_path).expect("privilege metadata exists");
+    assert!(
+        before_drop.contains("privilege_drop"),
+        "privilege metadata should record grants before drop: {before_drop}"
+    );
+
+    client
+        .batch_execute("DROP TABLE privilege_drop")
+        .await
+        .expect("drop privilege table");
+    let stale = client
+        .query_one(
+            "SELECT \
+                has_table_privilege('analyst', 'privilege_drop', 'SELECT'), \
+                has_column_privilege('analyst', 'privilege_drop', 'id', 'UPDATE')",
+            &[],
+        )
+        .await
+        .expect("privilege checks after drop");
+    assert!(
+        !stale.get::<_, bool>(0),
+        "dropped table must clear object-level grants"
+    );
+    assert!(
+        !stale.get::<_, bool>(1),
+        "dropped table must clear column-level grants"
+    );
+    shutdown(running).await;
+
+    let after_drop = std::fs::read_to_string(&metadata_path).expect("privilege metadata exists");
+    assert!(
+        !after_drop.contains("privilege_drop"),
+        "dropped table grants must be removed from privilege metadata: {after_drop}"
+    );
+
+    let running = start_persistent_server(data_dir.path(), "privilege_drop_table_recreate").await;
+    running
+        .client
+        .batch_execute("CREATE TABLE privilege_drop (id INT, secret TEXT)")
+        .await
+        .expect("recreate privilege table");
+    let recreated = running
+        .client
+        .query_one(
+            "SELECT \
+                has_table_privilege('analyst', 'privilege_drop', 'SELECT'), \
+                has_column_privilege('analyst', 'privilege_drop', 'id', 'UPDATE')",
+            &[],
+        )
+        .await
+        .expect("privilege checks after recreate");
+    assert!(
+        !recreated.get::<_, bool>(0),
+        "recreated table must not inherit stale object grant"
+    );
+    assert!(
+        !recreated.get::<_, bool>(1),
+        "recreated table must not inherit stale column grant"
+    );
+
+    shutdown(running).await;
+}
+
 #[tokio::test]
 async fn column_privileges_gate_select_insert_and_update_targets() {
     let running = start_sample_server("column_privilege_catalog_test").await;

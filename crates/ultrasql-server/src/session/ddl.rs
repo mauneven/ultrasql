@@ -1868,6 +1868,7 @@ where
             self.state
                 .commit_transaction(ddl_txn, true, "DROP TABLE catalog transaction")?;
         }
+        let mut privilege_grants_removed = false;
         for name in &drop_names {
             if let Some(entry) = self.state.persistent_catalog.lookup_table(name) {
                 if *cascade {
@@ -1885,6 +1886,10 @@ where
                     }
                 }
                 self.state.row_security.remove(&entry.oid);
+                privilege_grants_removed |= self
+                    .state
+                    .privilege_catalog
+                    .remove_object_grants(crate::auth::PrivilegeObjectKind::Table, name);
                 self.state
                     .persistent_catalog
                     .clear_descriptions_for_object(entry.oid);
@@ -1894,6 +1899,9 @@ where
         }
         self.state.persist_table_runtime_constraints_metadata()?;
         self.state.persist_row_security_metadata()?;
+        if privilege_grants_removed {
+            self.state.persist_privilege_metadata()?;
+        }
         self.state
             .remove_materialized_view_runtime_metadata(&drop_names)?;
         // Any cached plan that referenced this name is now invalid;
