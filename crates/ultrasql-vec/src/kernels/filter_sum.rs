@@ -315,17 +315,30 @@ fn filter_sum_scalar_branchless(xs: &[i64], ys: &[i64]) -> i64 {
         // Process two halves of the 8-lane chunk on independent
         // accumulators. LLVM will widen each half to a SIMD register
         // and hoist the cmp/and/add chain.
-        let x_chunk: &[i64; 8] = cx.try_into().expect("chunks_exact(8) yields 8 lanes");
-        let y_chunk: &[i64; 8] = cy.try_into().expect("chunks_exact(8) yields 8 lanes");
+        let &[x0, x1, x2, x3, x4, x5, x6, x7] = cx else {
+            continue;
+        };
+        let &[y0, y1, y2, y3, y4, y5, y6, y7] = cy else {
+            continue;
+        };
 
-        for j in 0..4_usize {
-            let m = (i64::from(y_chunk[j] > 0)).wrapping_neg();
-            s0 = s0.wrapping_add(x_chunk[j] & m);
-        }
-        for j in 4..8_usize {
-            let m = (i64::from(y_chunk[j] > 0)).wrapping_neg();
-            s1 = s1.wrapping_add(x_chunk[j] & m);
-        }
+        let m0 = (i64::from(y0 > 0)).wrapping_neg();
+        let m1 = (i64::from(y1 > 0)).wrapping_neg();
+        let m2 = (i64::from(y2 > 0)).wrapping_neg();
+        let m3 = (i64::from(y3 > 0)).wrapping_neg();
+        s0 = s0.wrapping_add(x0 & m0);
+        s0 = s0.wrapping_add(x1 & m1);
+        s0 = s0.wrapping_add(x2 & m2);
+        s0 = s0.wrapping_add(x3 & m3);
+
+        let m4 = (i64::from(y4 > 0)).wrapping_neg();
+        let m5 = (i64::from(y5 > 0)).wrapping_neg();
+        let m6 = (i64::from(y6 > 0)).wrapping_neg();
+        let m7 = (i64::from(y7 > 0)).wrapping_neg();
+        s1 = s1.wrapping_add(x4 & m4);
+        s1 = s1.wrapping_add(x5 & m5);
+        s1 = s1.wrapping_add(x6 & m6);
+        s1 = s1.wrapping_add(x7 & m7);
     }
 
     // Tail.

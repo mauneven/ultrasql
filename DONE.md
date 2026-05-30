@@ -445,6 +445,11 @@ as a concise evidence ledger; roadmap stays for open gates only.
   `cargo test -p ultrasql-vec not_bool_scalar_mismatched_validity_fails_closed`,
   `cargo test -p ultrasql-vec not_bool`, and
   `cargo clippy -p ultrasql-vec --all-targets --all-features -- -D warnings`.
+- Vector filter-sum scalar hot loop now uses fixed-width slice patterns instead
+  of production `expect` conversions on `chunks_exact(8)` lanes, preserving
+  branchless wrapping semantics while removing a panic path from the benchmarked
+  kernel. Evidence: `cargo test -p ultrasql-vec filter_sum` and
+  `cargo clippy -p ultrasql-vec --all-targets --all-features -- -D warnings`.
 
 ## Core SQL And Wire Protocol
 
