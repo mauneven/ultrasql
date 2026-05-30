@@ -50,6 +50,7 @@ use crate::eval::Eval;
 use crate::filter_op::batch_to_rows;
 use crate::row_codec::RowCodec;
 use crate::seq_scan::build_batch;
+use crate::value_key::{decimal_values_equal, hash_decimal_key};
 use crate::work_mem::{WorkMemBudget, temp_file_limit};
 use crate::{ExecError, Operator, OperatorSpillProfile};
 
@@ -999,20 +1000,6 @@ fn build_join_key(evals: &[Eval], row: &[Value]) -> Result<Option<JoinKey>, Exec
 #[derive(Clone, Debug)]
 struct OrderedValue(Value);
 
-fn canonical_decimal_key(value: i64, scale: i32) -> (i128, i64) {
-    let mut significand = i128::from(value);
-    if significand == 0 {
-        return (0, 0);
-    }
-
-    let mut scale = i64::from(scale);
-    while significand % 10 == 0 {
-        significand /= 10;
-        scale -= 1;
-    }
-    (significand, scale)
-}
-
 impl PartialEq for OrderedValue {
     fn eq(&self, other: &Self) -> bool {
         match (&self.0, &other.0) {
@@ -1031,10 +1018,7 @@ impl PartialEq for OrderedValue {
                     value: right_value,
                     scale: right_scale,
                 },
-            ) => {
-                canonical_decimal_key(*left_value, *left_scale)
-                    == canonical_decimal_key(*right_value, *right_scale)
-            }
+            ) => decimal_values_equal(*left_value, *left_scale, *right_value, *right_scale),
             (Value::Char(a), Value::Text(b)) => bpchar_semantic_text(a) == b,
             (Value::Text(a), Value::Char(b)) => a == bpchar_semantic_text(b),
             _ => self.0 == other.0,
@@ -1138,9 +1122,7 @@ impl std::hash::Hash for OrderedValue {
             }
             Value::Decimal { value, scale } => {
                 state.write_u8(12);
-                let (value, scale) = canonical_decimal_key(*value, *scale);
-                value.hash(state);
-                scale.hash(state);
+                hash_decimal_key(state, *value, *scale);
             }
             Value::Interval {
                 months,

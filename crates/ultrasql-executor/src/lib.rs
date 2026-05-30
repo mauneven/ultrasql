@@ -105,6 +105,7 @@ mod sort;
 pub mod sort_aggregate;
 mod top_k;
 pub mod unique;
+mod value_key;
 mod values_scan;
 pub mod vec_ops;
 pub mod window_agg;

@@ -34,6 +34,7 @@ use ultrasql_vec::Batch;
 
 use crate::filter_op::batch_to_rows;
 use crate::seq_scan::build_batch;
+use crate::value_key::{decimal_values_equal, hash_decimal_key};
 use crate::{ExecError, Operator};
 
 const BATCH_TARGET_ROWS: usize = 4096;
@@ -74,6 +75,16 @@ impl PartialEq for KeyValue {
             (Value::Vector(a), Value::Vector(b)) | (Value::HalfVec(a), Value::HalfVec(b)) => {
                 a.len() == b.len() && a.iter().zip(b).all(|(l, r)| l.to_bits() == r.to_bits())
             }
+            (
+                Value::Decimal {
+                    value: left_value,
+                    scale: left_scale,
+                },
+                Value::Decimal {
+                    value: right_value,
+                    scale: right_scale,
+                },
+            ) => decimal_values_equal(*left_value, *left_scale, *right_value, *right_scale),
             _ => self.0 == other.0,
         }
     }
@@ -174,8 +185,7 @@ impl Hash for KeyValue {
             }
             Value::Decimal { value, scale } => {
                 state.write_u8(12);
-                value.hash(state);
-                scale.hash(state);
+                hash_decimal_key(state, *value, *scale);
             }
             Value::Interval {
                 months,
@@ -634,6 +644,12 @@ mod tests {
             RowKey::from_row(&[Value::Char("a".into())]),
             RowKey::from_row(&[Value::Char("a   ".into())])
         );
+        let mut decimal_seen = HashSet::new();
+        assert!(decimal_seen.insert(RowKey::from_row(&[Value::Decimal {
+            value: 10,
+            scale: 1,
+        }])));
+        assert!(!decimal_seen.insert(RowKey::from_row(&[Value::Decimal { value: 1, scale: 0 }])));
         assert_eq!(
             RowKey::from_row(&[Value::TimeTz {
                 micros: 3_600_000_000,

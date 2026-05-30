@@ -189,6 +189,11 @@ as a concise evidence ledger; roadmap stays for open gates only.
   negatives. Evidence:
   `cargo test -p ultrasql-executor hash_join_matches_decimal_keys_across_scales`
   and `cargo test -p ultrasql-executor hash_join`.
+- DISTINCT and set-operation row keys now share the same decimal `NUMERIC`
+  canonicalization as hash join keys, covering hash DISTINCT, sort DISTINCT row
+  equality, UNION, INTERSECT, and EXCEPT key semantics. Evidence:
+  `cargo test -p ultrasql-executor unique` and
+  `cargo test -p ultrasql-executor set_op`.
 
 ## Core SQL And Wire Protocol
 

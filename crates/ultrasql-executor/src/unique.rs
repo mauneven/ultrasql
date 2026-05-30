@@ -29,6 +29,7 @@ use ultrasql_vec::column::Column;
 
 use crate::filter_op::batch_to_rows;
 use crate::seq_scan::build_batch;
+use crate::value_key::{decimal_values_equal, hash_decimal_key};
 use crate::{ExecError, Operator};
 
 /// The deduplication algorithm.
@@ -58,6 +59,16 @@ impl PartialEq for KeyValue {
             (Value::Vector(a), Value::Vector(b)) | (Value::HalfVec(a), Value::HalfVec(b)) => {
                 a.len() == b.len() && a.iter().zip(b).all(|(l, r)| l.to_bits() == r.to_bits())
             }
+            (
+                Value::Decimal {
+                    value: left_value,
+                    scale: left_scale,
+                },
+                Value::Decimal {
+                    value: right_value,
+                    scale: right_scale,
+                },
+            ) => decimal_values_equal(*left_value, *left_scale, *right_value, *right_scale),
             _ => self.0 == other.0,
         }
     }
@@ -158,8 +169,7 @@ impl Hash for KeyValue {
             }
             Value::Decimal { value, scale } => {
                 state.write_u8(12);
-                value.hash(state);
-                scale.hash(state);
+                hash_decimal_key(state, *value, *scale);
             }
             Value::Interval {
                 months,
@@ -451,6 +461,16 @@ fn rows_equal_for_distinct(a: &[Value], b: &[Value]) -> bool {
         (Value::Null, Value::Null) => true,
         (Value::Float32(x), Value::Float32(y)) => x.to_bits() == y.to_bits(),
         (Value::Float64(x), Value::Float64(y)) => x.to_bits() == y.to_bits(),
+        (
+            Value::Decimal {
+                value: left_value,
+                scale: left_scale,
+            },
+            Value::Decimal {
+                value: right_value,
+                scale: right_scale,
+            },
+        ) => decimal_values_equal(*left_value, *left_scale, *right_value, *right_scale),
         _ => av == bv,
     })
 }
@@ -636,6 +656,20 @@ mod tests {
             KeyValue(Value::Char("x".to_owned())),
             KeyValue(Value::Char("x   ".to_owned()))
         );
+        assert_eq!(
+            KeyValue(Value::Decimal {
+                value: 10,
+                scale: 1
+            }),
+            KeyValue(Value::Decimal { value: 1, scale: 0 })
+        );
+        assert_eq!(
+            key_hash(Value::Decimal {
+                value: 10,
+                scale: 1
+            }),
+            key_hash(Value::Decimal { value: 1, scale: 0 })
+        );
 
         let row_a = RowKey::from_row(&[Value::Null, Value::Int32(1)]);
         let row_b = RowKey::from_row(&[Value::Null, Value::Int32(1)]);
@@ -656,6 +690,13 @@ mod tests {
         assert!(!rows_equal_for_distinct(
             &[Value::Int32(1)],
             &[Value::Int32(1), Value::Int32(2)]
+        ));
+        assert!(rows_equal_for_distinct(
+            &[Value::Decimal {
+                value: 10,
+                scale: 1,
+            }],
+            &[Value::Decimal { value: 1, scale: 0 }]
         ));
     }
 
