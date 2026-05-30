@@ -1099,6 +1099,10 @@ impl PersistentCatalog {
                 total_statistics = total_statistics.saturating_add(1);
             }
         }
+        statistics.retain(|(starelid, _), _| {
+            starelid.raw() < crate::memory::FIRST_USER_OID || tables_by_oid.contains_key(starelid)
+        });
+        total_statistics = u32::try_from(statistics.len()).unwrap_or(u32::MAX);
 
         let statistic_ext_blocks = heap.block_count(pg_statistic_ext_rel);
         let mut statistic_ext = initial.statistic_ext;
@@ -1118,6 +1122,11 @@ impl PersistentCatalog {
                 total_statistic_ext = total_statistic_ext.saturating_add(1);
             }
         }
+        statistic_ext.retain(|_, row| {
+            row.stxrelid.raw() < crate::memory::FIRST_USER_OID
+                || tables_by_oid.contains_key(&row.stxrelid)
+        });
+        total_statistic_ext = u32::try_from(statistic_ext.len()).unwrap_or(u32::MAX);
 
         let description_blocks = heap.block_count(pg_description_rel);
         let mut descriptions = initial.descriptions;
@@ -3372,6 +3381,12 @@ mod tests {
                     stanullfrac: 0.75,
                     stadistinct: 2.0,
                 },
+                StatisticRow {
+                    starelid: Oid::new(999_999),
+                    staattnum: 1,
+                    stanullfrac: 0.0,
+                    stadistinct: 1.0,
+                },
             ],
             &heap,
             Xid::new(2),
@@ -3381,7 +3396,7 @@ mod tests {
 
         let cat2 = PersistentCatalog::new();
         let stats = cat2.bootstrap_from_heap(&heap).expect("bootstrap");
-        assert_eq!(stats.statistics, 3);
+        assert_eq!(stats.statistics, 2);
 
         let snap = cat2.snapshot();
         assert_eq!(snap.statistics.len(), 2);

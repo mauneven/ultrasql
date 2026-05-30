@@ -212,3 +212,68 @@ async fn analyze_statistics_hydrate_optimizer_after_restart() {
 
     graceful_shutdown(running).await;
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn dropped_table_statistics_do_not_survive_restart() {
+    let data_dir = tempfile::TempDir::new().expect("temp dir");
+
+    let running = start_persistent_server(data_dir.path(), "analyze_drop_restart_setup").await;
+    running
+        .client
+        .batch_execute("CREATE TABLE analyze_drop_restart (id INT NOT NULL)")
+        .await
+        .expect("create analyze table");
+    running
+        .client
+        .batch_execute("INSERT INTO analyze_drop_restart VALUES (1), (2), (3)")
+        .await
+        .expect("seed analyze table");
+    running
+        .client
+        .batch_execute("ANALYZE analyze_drop_restart")
+        .await
+        .expect("analyze table");
+    let table_oid_row = running
+        .client
+        .query_one(
+            "SELECT oid FROM pg_catalog.pg_class WHERE relname = 'analyze_drop_restart'",
+            &[],
+        )
+        .await
+        .expect("pg_class oid before drop");
+    let table_oid: i64 = table_oid_row.get(0);
+    let before_drop = running
+        .client
+        .query(
+            &format!("SELECT staattnum FROM pg_catalog.pg_statistic WHERE starelid = {table_oid}"),
+            &[],
+        )
+        .await
+        .expect("pg_statistic before drop");
+    assert!(
+        !before_drop.is_empty(),
+        "ANALYZE should publish pg_statistic rows before drop"
+    );
+
+    running
+        .client
+        .batch_execute("DROP TABLE analyze_drop_restart")
+        .await
+        .expect("drop analyzed table");
+    graceful_shutdown(running).await;
+
+    let running = start_persistent_server(data_dir.path(), "analyze_drop_restart_verify").await;
+    let after_drop = running
+        .client
+        .query(
+            &format!("SELECT staattnum FROM pg_catalog.pg_statistic WHERE starelid = {table_oid}"),
+            &[],
+        )
+        .await
+        .expect("pg_statistic after restart");
+    assert!(
+        after_drop.is_empty(),
+        "dropped table statistics must not survive restart: {after_drop:?}"
+    );
+    graceful_shutdown(running).await;
+}
