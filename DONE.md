@@ -210,6 +210,9 @@ as a concise evidence ledger; roadmap stays for open gates only.
 - Work-memory reservation release no longer uses a production `expect` in the
   RAII drop path; the saturating atomic release remains behavior-compatible.
   Evidence: `cargo test -p ultrasql-executor work_mem`.
+- Vectorized pipeline builder now resolves terminal schema with a typed
+  `ExecError::Internal` instead of a production `expect`. Evidence:
+  `cargo test -p ultrasql-executor push_pipeline`.
 
 ## Core SQL And Wire Protocol
 

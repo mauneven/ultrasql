@@ -433,7 +433,9 @@ impl VectorizedPipelineBuilder {
         let schema = self
             .operators
             .last()
-            .expect("non-empty checked above")
+            .ok_or(ExecError::Internal(
+                "VectorizedPipelineBuilder: no terminal operator provided",
+            ))?
             .schema()
             .clone();
         Ok(VectorizedPipeline {
