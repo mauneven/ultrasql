@@ -672,7 +672,9 @@ impl<'src> Parser<'src> {
             let t = self.lexer.next_token()?;
             self.peeked = Some(t);
         }
-        Ok(self.peeked.as_ref().expect("just set"))
+        self.peeked
+            .as_ref()
+            .ok_or(ParseError::UnexpectedEof { expected: "token" })
     }
 
     /// Look `distance` tokens past the buffered peek. `distance == 1`

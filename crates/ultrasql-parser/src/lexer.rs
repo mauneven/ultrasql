@@ -599,7 +599,9 @@ impl<'src> Lexer<'src> {
             Token::new(kind, Span::from_usize(start, s.pos))
         };
 
-        let b0 = self.peek().expect("checked by caller");
+        let Some(b0) = self.peek() else {
+            return Ok(Token::new(TokenKind::Eof, Span::from_usize(start, start)));
+        };
         let b1 = self.peek_at(1);
         let b2 = self.peek_at(2);
 

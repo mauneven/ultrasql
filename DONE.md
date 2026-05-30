@@ -465,6 +465,13 @@ as a concise evidence ledger; roadmap stays for open gates only.
   `cargo test -p ultrasql-vec column_text_value_dictionary_out_of_bounds_returns_none`,
   `cargo test -p ultrasql-vec column`, and
   `cargo clippy -p ultrasql-vec --all-targets --all-features -- -D warnings`.
+- Parser lexer, lookahead, table-function, `OVERLAPS`, and vector typed-literal
+  paths now return typed lexer/parser errors instead of relying on production
+  `expect` invariants. Evidence: `cargo test -p ultrasql-parser --lib`,
+  `cargo clippy -p ultrasql-parser --lib --all-features -- -W
+  clippy::expect_used -W clippy::unwrap_used`, and
+  `cargo clippy -p ultrasql-parser --all-targets --all-features -- -D
+  warnings`.
 
 ## Core SQL And Wire Protocol
 

@@ -729,10 +729,11 @@ impl Parser<'_> {
         // `name (` after a single-identifier name signals a table
         // function — `generate_series(1, 10)`, `unnest(array)`, etc.
         if name.parts.len() == 1 && self.peek()?.kind == TokenKind::LParen {
-            let func_name =
-                name.parts.into_iter().next().expect(
-                    "parse_table_ref: ObjectName::parts.len() == 1 implies a leading element",
-                );
+            let Some(func_name) = name.parts.into_iter().next() else {
+                return Err(ParseError::UnexpectedEof {
+                    expected: "table function name",
+                });
+            };
             if func_name.value.eq_ignore_ascii_case("json_table") {
                 return self.parse_json_table_ref(func_name);
             }

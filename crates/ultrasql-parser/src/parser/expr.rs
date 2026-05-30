@@ -362,8 +362,20 @@ impl<'src> Parser<'src> {
                         let re = self.parse_expr()?;
                         let rp2 = self.expect(TokenKind::RParen, ")")?;
                         let mut iter = fields.into_iter();
-                        let ls = iter.next().expect("len checked above");
-                        let le = iter.next().expect("len checked above");
+                        let Some(ls) = iter.next() else {
+                            return Err(ParseError::Expected {
+                                expected: "left OVERLAPS start expression",
+                                found: TokenKind::KwOverlaps,
+                                offset: lp.span.start as usize,
+                            });
+                        };
+                        let Some(le) = iter.next() else {
+                            return Err(ParseError::Expected {
+                                expected: "left OVERLAPS end expression",
+                                found: TokenKind::KwOverlaps,
+                                offset: lp.span.start as usize,
+                            });
+                        };
                         return Ok(Expr::Overlaps {
                             left_start: Box::new(ls),
                             left_end: Box::new(le),
@@ -1062,10 +1074,13 @@ impl<'src> Parser<'src> {
 
     fn parse_vector_family_typed_literal(&mut self) -> Result<Expr, ParseError> {
         let type_tok = self.advance()?;
-        let base = type_tok
-            .text(self.source)
-            .and_then(vector_family_type_base)
-            .expect("caller checked vector-family typed literal");
+        let Some(base) = type_tok.text(self.source).and_then(vector_family_type_base) else {
+            return Err(ParseError::Expected {
+                expected: "vector-family typed literal",
+                found: type_tok.kind,
+                offset: type_tok.span.start as usize,
+            });
+        };
         let mut type_name = base.to_owned();
         let mut span_end = type_tok.span.end;
         if self.peek()?.kind == TokenKind::LParen {
