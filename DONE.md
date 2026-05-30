@@ -345,6 +345,13 @@ as a concise evidence ledger; roadmap stays for open gates only.
   `cargo test -p ultrasql-executor filter_sum` and
   `cargo clippy -p ultrasql-executor --lib --all-features -- -W
   clippy::expect_used -W clippy::unwrap_used`.
+- Row-codec varlena length prefixes, vector dimension lengths, and decimal
+  base-10000 grouping now use typed conversion helpers instead of production
+  `expect` calls for `u32 -> usize` and small-constant conversions. Evidence:
+  `cargo test -p ultrasql-executor row_codec`,
+  `cargo clippy -p ultrasql-executor --all-targets --all-features -- -D
+  warnings`, and `rg "u32 fits in usize|small const"
+  crates/ultrasql-executor/src/row_codec.rs` returning no matches.
 
 ## Core SQL And Wire Protocol
 

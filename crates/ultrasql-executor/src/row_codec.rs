@@ -26,11 +26,23 @@ const VECTOR_DIMS_WIDTH: usize = std::mem::size_of::<u32>();
 const VECTOR_ELEMENT_WIDTH: usize = std::mem::size_of::<f32>();
 const NUMERIC_NBASE: u16 = 10_000;
 const NUMERIC_DEC_DIGITS: i32 = 4;
+const NUMERIC_DEC_DIGITS_USIZE: usize = 4;
 const NUMERIC_DSCALE_MAX: i32 = 0x3fff;
 const NUMERIC_POS: u16 = 0x0000;
 const NUMERIC_NEG: u16 = 0x4000;
 const NUMERIC_BINARY_HEADER_WIDTH: usize = 8;
 const NUMERIC_DIGIT_WIDTH: usize = std::mem::size_of::<u16>();
+
+fn u32_payload_len_to_usize(len: u32) -> Result<usize, RowCodecError> {
+    usize::try_from(len).map_err(|_| RowCodecError::LengthOverflow { len })
+}
+
+fn checked_payload_end(cursor: usize, len: usize, have: usize) -> Result<usize, RowCodecError> {
+    cursor.checked_add(len).ok_or(RowCodecError::Truncated {
+        needed: usize::MAX,
+        have,
+    })
+}
 
 /// Binary codec bound to a fixed [`Schema`].
 ///
@@ -927,10 +939,9 @@ impl RowCodec {
                             have: bytes.len(),
                         }
                     })?;
-                    let str_len = usize::try_from(u32::from_le_bytes(len_raw))
-                        .expect("u32 fits in usize on all supported targets");
+                    let str_len = u32_payload_len_to_usize(u32::from_le_bytes(len_raw))?;
                     cursor += 4;
-                    let str_end = cursor + str_len;
+                    let str_end = checked_payload_end(cursor, str_len, bytes.len())?;
                     if bytes.len() < str_end {
                         return Err(RowCodecError::Truncated {
                             needed: str_end,
@@ -968,10 +979,9 @@ impl RowCodec {
                             have: bytes.len(),
                         }
                     })?;
-                    let byte_len = usize::try_from(u32::from_le_bytes(len_raw))
-                        .expect("u32 fits in usize on all supported targets");
+                    let byte_len = u32_payload_len_to_usize(u32::from_le_bytes(len_raw))?;
                     cursor = len_end;
-                    let byte_end = cursor + byte_len;
+                    let byte_end = checked_payload_end(cursor, byte_len, bytes.len())?;
                     if bytes.len() < byte_end {
                         return Err(RowCodecError::Truncated {
                             needed: byte_end,
@@ -1786,10 +1796,9 @@ impl RowCodec {
                             have: bytes.len(),
                         }
                     })?;
-                    let byte_len = usize::try_from(u32::from_le_bytes(len_raw))
-                        .expect("u32 fits in usize on all supported targets");
+                    let byte_len = u32_payload_len_to_usize(u32::from_le_bytes(len_raw))?;
                     cursor = len_end;
-                    let byte_end = cursor + byte_len;
+                    let byte_end = checked_payload_end(cursor, byte_len, bytes.len())?;
                     if bytes.len() < byte_end {
                         return Err(RowCodecError::Truncated {
                             needed: byte_end,
@@ -1868,10 +1877,9 @@ impl RowCodec {
                             have: bytes.len(),
                         }
                     })?;
-                    let str_len = usize::try_from(u32::from_le_bytes(len_raw))
-                        .expect("u32 fits in usize on all supported targets");
+                    let str_len = u32_payload_len_to_usize(u32::from_le_bytes(len_raw))?;
                     cursor += 4;
-                    let str_end = cursor + str_len;
+                    let str_end = checked_payload_end(cursor, str_len, bytes.len())?;
                     if bytes.len() < str_end {
                         return Err(RowCodecError::Truncated {
                             needed: str_end,
@@ -2521,13 +2529,12 @@ fn decimal_to_numeric_parts(
         .map_err(|_| numeric_type_error(column, ty, "numeric display scale out of range"))?;
     let digit_len = magnitude_digits.len();
     let integer_digits = digit_len.saturating_sub(dscale_usize);
-    let groups_before_decimal =
-        integer_digits.div_ceil(usize::try_from(NUMERIC_DEC_DIGITS).expect("small const"));
+    let groups_before_decimal = integer_digits.div_ceil(NUMERIC_DEC_DIGITS_USIZE);
     let mut grouped = String::new();
 
     if groups_before_decimal > 0 {
         let padded_integer_digits = groups_before_decimal
-            .checked_mul(usize::try_from(NUMERIC_DEC_DIGITS).expect("small const"))
+            .checked_mul(NUMERIC_DEC_DIGITS_USIZE)
             .ok_or_else(|| numeric_type_error(column, ty, "numeric payload too large"))?;
         for _ in 0..padded_integer_digits.saturating_sub(integer_digits) {
             grouped.push('0');
@@ -2544,9 +2551,9 @@ fn decimal_to_numeric_parts(
         } else {
             grouped.push_str(&magnitude_digits[digit_len - dscale_usize..]);
         }
-        let rem = grouped.len() % usize::try_from(NUMERIC_DEC_DIGITS).expect("small const");
+        let rem = grouped.len() % NUMERIC_DEC_DIGITS_USIZE;
         if rem != 0 {
-            for _ in 0..usize::try_from(NUMERIC_DEC_DIGITS).expect("small const") - rem {
+            for _ in 0..NUMERIC_DEC_DIGITS_USIZE - rem {
                 grouped.push('0');
             }
         }
@@ -2554,7 +2561,7 @@ fn decimal_to_numeric_parts(
 
     let mut digits = grouped
         .as_bytes()
-        .chunks_exact(usize::try_from(NUMERIC_DEC_DIGITS).expect("small const"))
+        .chunks_exact(NUMERIC_DEC_DIGITS_USIZE)
         .map(decimal_group_to_u16)
         .collect::<Option<Vec<_>>>()
         .ok_or_else(|| numeric_type_error(column, ty, "invalid numeric digit group"))?;
@@ -2856,9 +2863,8 @@ fn skip_varlena_payload(bytes: &[u8], cursor: &mut usize) -> Result<(), RowCodec
 
 fn read_varlena_slice<'a>(bytes: &'a [u8], cursor: &mut usize) -> Result<&'a [u8], RowCodecError> {
     let len_raw = read_fixed::<4>(bytes, cursor)?;
-    let value_len =
-        usize::try_from(u32::from_le_bytes(len_raw)).expect("u32 fits in usize on all targets");
-    let end = cursor.saturating_add(value_len);
+    let value_len = u32_payload_len_to_usize(u32::from_le_bytes(len_raw))?;
+    let end = checked_payload_end(*cursor, value_len, bytes.len())?;
     if bytes.len() < end {
         return Err(RowCodecError::Truncated {
             needed: end,
@@ -2888,7 +2894,7 @@ fn skip_vector_value(
             got: format!("vector({dims})"),
         });
     }
-    let dims_usize = usize::try_from(dims).expect("u32 fits in usize on supported targets");
+    let dims_usize = u32_payload_len_to_usize(dims)?;
     let byte_len =
         dims_usize
             .checked_mul(VECTOR_ELEMENT_WIDTH)
@@ -2942,7 +2948,7 @@ fn decode_vector_value(
             got: format!("vector({dims})"),
         });
     }
-    let dims_usize = usize::try_from(dims).expect("u32 fits in usize on supported targets");
+    let dims_usize = u32_payload_len_to_usize(dims)?;
     let byte_len = dims_usize
         .checked_mul(VECTOR_ELEMENT_WIDTH)
         .ok_or_else(|| RowCodecError::UnsupportedType {
@@ -3085,10 +3091,9 @@ fn decode_varlena_text(
                 needed: len_end,
                 have: bytes.len(),
             })?;
-    let str_len =
-        usize::try_from(u32::from_le_bytes(len_raw)).expect("u32 fits in usize on all targets");
+    let str_len = u32_payload_len_to_usize(u32::from_le_bytes(len_raw))?;
     *cursor += 4;
-    let str_end = *cursor + str_len;
+    let str_end = checked_payload_end(*cursor, str_len, bytes.len())?;
     if bytes.len() < str_end {
         return Err(RowCodecError::Truncated {
             needed: str_end,
@@ -3149,6 +3154,12 @@ pub enum RowCodecError {
         needed: usize,
         /// Actual byte count.
         have: usize,
+    },
+    /// A length prefix does not fit the host address space.
+    #[error("payload length prefix does not fit usize: {len}")]
+    LengthOverflow {
+        /// The raw little-endian `u32` length prefix.
+        len: u32,
     },
     /// Unsupported type.
     #[error("unsupported type at column {column}: {ty}")]
