@@ -114,6 +114,25 @@ async fn orm_startup_runtime_parameters_round_trip() {
         .expect("SHOW search_path list");
     assert_eq!(row.get::<_, String>(0), "public, \"$user\"");
 
+    client
+        .batch_execute("SET lc_monetary = 'C'")
+        .await
+        .expect("SET lc_monetary succeeds");
+    let row = client
+        .query_one("SHOW lc_monetary", &[])
+        .await
+        .expect("SHOW lc_monetary");
+    assert_eq!(row.get::<_, String>(0), "C");
+    client
+        .batch_execute("RESET lc_monetary")
+        .await
+        .expect("RESET lc_monetary succeeds");
+    let row = client
+        .query_one("SHOW lc_monetary", &[])
+        .await
+        .expect("SHOW reset lc_monetary");
+    assert_eq!(row.get::<_, String>(0), "C");
+
     let row = client
         .query_one("SHOW transaction isolation level", &[])
         .await

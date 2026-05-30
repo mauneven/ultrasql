@@ -761,6 +761,10 @@ where
                 self.session_settings.remove("intervalstyle");
                 Ok(result_encoder::run_ddl_command("RESET"))
             }
+            "lc_monetary" => {
+                self.session_settings.remove("lc_monetary");
+                Ok(result_encoder::run_ddl_command("RESET"))
+            }
             "timezone" => {
                 self.session_settings.remove("timezone");
                 Ok(result_encoder::run_ddl_command("RESET"))
@@ -833,6 +837,11 @@ where
                 }
                 _ => Err(ServerError::Unsupported("invalid intervalstyle")),
             },
+            "lc_monetary" => {
+                self.session_settings
+                    .insert("lc_monetary".to_owned(), value.to_owned());
+                Ok(())
+            }
             "timezone" => {
                 self.session_settings
                     .insert("timezone".to_owned(), value.to_owned());
@@ -894,6 +903,11 @@ where
                 .get("intervalstyle")
                 .cloned()
                 .unwrap_or_else(|| "postgres".to_owned()),
+            "lc_monetary" => self
+                .session_settings
+                .get("lc_monetary")
+                .cloned()
+                .unwrap_or_else(|| "C".to_owned()),
             "max_identifier_length" => "63".to_owned(),
             "server_version" => crate::REPORTED_SERVER_VERSION.to_owned(),
             "server_version_num" => "140000".to_owned(),
@@ -3167,6 +3181,9 @@ mod tests {
             .apply_session_variable("intervalstyle", "iso_8601")
             .expect("intervalstyle");
         session
+            .apply_session_variable("lc_monetary", "C")
+            .expect("lc_monetary");
+        session
             .apply_session_variable("timezone", "America/Bogota")
             .expect("timezone");
         session
@@ -3202,6 +3219,14 @@ mod tests {
                     .expect("show custom")
             ),
             "acme"
+        );
+        assert_eq!(
+            first_data_row_text(
+                &session
+                    .show_session_variable("lc_monetary", false)
+                    .expect("show lc_monetary")
+            ),
+            "C"
         );
         assert_eq!(
             first_data_row_text(
@@ -3260,6 +3285,7 @@ mod tests {
             "client_encoding",
             "search_path",
             "intervalstyle",
+            "lc_monetary",
             "timezone",
             "synchronous_commit",
             "ultrasql.tenant",

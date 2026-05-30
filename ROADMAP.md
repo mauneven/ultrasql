@@ -63,8 +63,9 @@ file focused on what still blocks production.
 
 - `NUMERIC(p,s)` / `DECIMAL(p,s)`: arbitrary-precision runtime arithmetic and
   variable-scale bare-`NUMERIC` columnar result preservation remain open.
-- `MONEY`: `lc_monetary` formatting/input, locale round-trip tests,
-  explicit typmod/precision edge casts, and range-parity evidence remain open.
+- `MONEY`: locale-sensitive formatting/input beyond deterministic
+  `lc_monetary` GUC round trips, explicit typmod/precision edge casts, and
+  range-parity evidence remain open.
 - Date/time: named time-zone database support plus broader `DateStyle` and
   locale variants.
 - Arrays: broader coercion breadth and every supported element family.

@@ -175,7 +175,7 @@ as a concise evidence ledger; roadmap stays for open gates only.
   persistence, checked unary signs, checked addition/subtraction, checked
   integer division, rounded floating-point division, checked scalar
   multiplication, money ratio division, runtime money/numeric/text casts, and
-  behavior tests exist.
+  deterministic `lc_monetary` GUC round trips, and behavior tests exist.
 - `CHAR(n)` / `bpchar` parser, binder, row codec, executor, OID 1042, COPY,
   catalog persistence, blank padding, assignment/cast truncation, and
   trailing-space comparison semantics exist.
