@@ -30,6 +30,12 @@ pub enum ColumnError {
     /// UTF-8 value bytes fail string validation.
     #[error("invalid UTF-8 value bytes")]
     InvalidUtf8,
+    /// UTF-8 values exceeded the 32-bit offset capacity.
+    #[error("UTF-8 values buffer length {len} exceeds u32 offset capacity")]
+    Utf8ValuesTooLarge {
+        /// Value-buffer length that did not fit in `u32`.
+        len: usize,
+    },
 }
 
 /// A column of one of UltraSQL's primitive types.
@@ -106,18 +112,22 @@ impl Column {
     pub fn text_value(&self, row: usize) -> Option<&str> {
         match self {
             Self::Utf8(c) => {
-                if c.nulls().is_some_and(|n| !n.get(row)) {
+                if row >= c.len() || bitmap_row_is_null(c.nulls(), row) {
                     None
                 } else {
-                    Some(c.value(row))
+                    c.try_value(row)
                 }
             }
             Self::DictionaryUtf8(c) => {
-                if c.codes.nulls().is_some_and(|n| !n.get(row)) {
-                    None
-                } else {
-                    Some(c.decode_at(row))
+                if row >= c.len() || bitmap_row_is_null(c.codes.nulls(), row) {
+                    return None;
                 }
+                let code = *c.codes.data().get(row)?;
+                if code == u32::MAX {
+                    return None;
+                }
+                let dict_index = usize::try_from(code).ok()?;
+                c.dict.get(dict_index).map(String::as_str)
             }
             _ => None,
         }
@@ -293,21 +303,23 @@ impl StringColumn {
     /// Build a non-nullable UTF-8 string column.
     #[must_use]
     pub fn from_data<I: IntoIterator<Item = String>>(rows: I) -> Self {
-        let mut offsets: Vec<u32> = vec![0];
-        let mut values: Vec<u8> = Vec::new();
-        for s in rows {
-            values.extend_from_slice(s.as_bytes());
-            offsets.push(
-                u32::try_from(values.len()).expect(
-                    "Utf8Column offsets bounded to u32; data above 4 GiB rejected upstream",
-                ),
-            );
+        match Self::try_from_data(rows) {
+            Ok(column) => column,
+            Err(_) => Self::empty(),
         }
-        Self {
+    }
+
+    /// Try to build a non-nullable UTF-8 string column.
+    ///
+    /// Returns [`ColumnError::Utf8ValuesTooLarge`] if the contiguous values
+    /// buffer cannot be addressed by 32-bit offsets.
+    pub fn try_from_data<I: IntoIterator<Item = String>>(rows: I) -> Result<Self, ColumnError> {
+        let (offsets, values, _) = build_string_buffers(rows)?;
+        Ok(Self {
             offsets,
             values,
             nulls: None,
-        }
+        })
     }
 
     /// Build a nullable UTF-8 string column.
@@ -318,18 +330,7 @@ impl StringColumn {
     where
         I: IntoIterator<Item = String>,
     {
-        let mut offsets: Vec<u32> = vec![0];
-        let mut values: Vec<u8> = Vec::new();
-        let mut row_count = 0usize;
-        for s in rows {
-            values.extend_from_slice(s.as_bytes());
-            offsets.push(
-                u32::try_from(values.len()).expect(
-                    "Utf8Column offsets bounded to u32; data above 4 GiB rejected upstream",
-                ),
-            );
-            row_count += 1;
-        }
+        let (offsets, values, row_count) = build_string_buffers(rows)?;
         if nulls.len() != row_count {
             return Err(ColumnError::LengthMismatch {
                 bitmap: nulls.len(),
@@ -425,15 +426,60 @@ impl StringColumn {
         self.len() == 0
     }
 
-    /// Borrowed string at row `i`. The returned `&str` panics on
-    /// non-UTF-8 — but every constructor in this module accepts only
-    /// `String` so the panic is unreachable.
+    /// Checked borrowed string at row `i`.
+    ///
+    /// Returns `None` if `i` is out of bounds or if internal buffers do not
+    /// satisfy the UTF-8/offset invariants.
+    #[must_use]
+    pub fn try_value(&self, i: usize) -> Option<&str> {
+        let start = usize::try_from(*self.offsets.get(i)?).ok()?;
+        let end = usize::try_from(*self.offsets.get(i + 1)?).ok()?;
+        if start > end || end > self.values.len() {
+            return None;
+        }
+        std::str::from_utf8(&self.values[start..end]).ok()
+    }
+
+    /// Borrowed string at row `i`.
+    ///
+    /// Prefer [`Self::try_value`] for externally supplied row indexes. This
+    /// convenience accessor fails closed to the empty string if invariants are
+    /// violated.
     #[must_use]
     pub fn value(&self, i: usize) -> &str {
-        let start = self.offsets[i] as usize;
-        let end = self.offsets[i + 1] as usize;
-        std::str::from_utf8(&self.values[start..end])
-            .expect("StringColumn invariant: values are UTF-8 by construction")
+        self.try_value(i).unwrap_or("")
+    }
+
+    fn empty() -> Self {
+        Self {
+            offsets: vec![0],
+            values: Vec::new(),
+            nulls: None,
+        }
+    }
+}
+
+fn build_string_buffers<I: IntoIterator<Item = String>>(
+    rows: I,
+) -> Result<(Vec<u32>, Vec<u8>, usize), ColumnError> {
+    let mut offsets: Vec<u32> = vec![0];
+    let mut values: Vec<u8> = Vec::new();
+    let mut row_count = 0usize;
+    for s in rows {
+        values.extend_from_slice(s.as_bytes());
+        let offset = u32::try_from(values.len())
+            .map_err(|_| ColumnError::Utf8ValuesTooLarge { len: values.len() })?;
+        offsets.push(offset);
+        row_count += 1;
+    }
+    Ok((offsets, values, row_count))
+}
+
+fn bitmap_row_is_null(nulls: Option<&Bitmap>, row: usize) -> bool {
+    match nulls {
+        Some(bitmap) if row < bitmap.len() => !bitmap.get(row),
+        Some(_) => true,
+        None => false,
     }
 }
 
@@ -502,5 +548,18 @@ mod tests {
         let c = StringColumn::from_data(Vec::<String>::new());
         assert_eq!(c.len(), 0);
         assert!(c.is_empty());
+    }
+
+    #[test]
+    fn column_text_value_utf8_out_of_bounds_returns_none() {
+        let c = Column::Utf8(StringColumn::from_data(vec!["alpha".to_string()]));
+        assert_eq!(c.text_value(1), None);
+    }
+
+    #[test]
+    fn column_text_value_dictionary_out_of_bounds_returns_none() {
+        let dict = DictionaryColumn::from_strings([Some("alpha")]).unwrap();
+        let c = Column::DictionaryUtf8(dict);
+        assert_eq!(c.text_value(1), None);
     }
 }

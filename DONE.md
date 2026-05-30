@@ -458,6 +458,13 @@ as a concise evidence ledger; roadmap stays for open gates only.
   `cargo test -p ultrasql-vec predicate_mask_65536_ignores_extra_dict_entries`,
   `cargo test -p ultrasql-vec dict`, and
   `cargo clippy -p ultrasql-vec --all-targets --all-features -- -D warnings`.
+- Vector string columns now use checked UTF-8 buffer construction and checked
+  row access, removing production `expect` paths and returning `None` for
+  out-of-bounds text access through the generic `Column` API. Evidence:
+  `cargo test -p ultrasql-vec column_text_value_utf8_out_of_bounds_returns_none`,
+  `cargo test -p ultrasql-vec column_text_value_dictionary_out_of_bounds_returns_none`,
+  `cargo test -p ultrasql-vec column`, and
+  `cargo clippy -p ultrasql-vec --all-targets --all-features -- -D warnings`.
 
 ## Core SQL And Wire Protocol
 
