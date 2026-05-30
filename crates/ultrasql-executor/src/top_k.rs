@@ -198,7 +198,10 @@ impl Operator for TopK {
             self.sorted = Some(rows.into_iter());
         }
 
-        let iter = self.sorted.as_mut().expect("just-set above");
+        let iter = self
+            .sorted
+            .as_mut()
+            .ok_or(ExecError::Internal("top-k output iterator missing"))?;
         let chunk: Vec<Vec<Value>> = iter.by_ref().take(BATCH_TARGET_ROWS).collect();
         if chunk.is_empty() {
             self.eof = true;

@@ -202,6 +202,11 @@ as a concise evidence ledger; roadmap stays for open gates only.
   canonicalization, keeping sorted GROUP BY boundaries aligned with hash GROUP
   BY semantics for mixed-scale equal values. Evidence:
   `cargo test -p ultrasql-executor sort_aggregate`.
+- Sort and top-k output cursors now return typed internal executor errors
+  instead of panicking on missing iterator state; external sort run selection
+  also avoids `expect` on stale heads. Evidence:
+  `cargo test -p ultrasql-executor sort` and
+  `cargo test -p ultrasql-executor top_k`.
 
 ## Core SQL And Wire Protocol
 

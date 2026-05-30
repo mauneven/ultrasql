@@ -153,7 +153,10 @@ impl Operator for Sort {
             return self.next_external_batch();
         }
 
-        let iter = self.sorted.as_mut().expect("just-set above");
+        let iter = self
+            .sorted
+            .as_mut()
+            .ok_or(ExecError::Internal("sort output iterator missing"))?;
         let chunk: Vec<Vec<Value>> = iter.by_ref().take(BATCH_TARGET_ROWS).collect();
 
         if chunk.is_empty() {
@@ -249,7 +252,10 @@ impl Sort {
     }
 
     fn next_external_batch(&mut self) -> Result<Option<Batch>, ExecError> {
-        let external = self.external.as_mut().expect("checked above");
+        let external = self
+            .external
+            .as_mut()
+            .ok_or(ExecError::Internal("external sort cursor missing"))?;
         let mut chunk = Vec::new();
         while chunk.len() < BATCH_TARGET_ROWS {
             let Some(row) = external.pop_next(&self.keys)? else {
@@ -314,10 +320,9 @@ impl ExternalSortCursor {
                 best = Some(idx);
                 continue;
             };
-            let best_head = self.runs[best_idx]
-                .head
-                .as_ref()
-                .expect("best points at non-empty head");
+            let Some(best_head) = self.runs[best_idx].head.as_ref() else {
+                continue;
+            };
             if compare_key_vecs(&head.key_values, &best_head.key_values, keys) == Ordering::Less {
                 best = Some(idx);
             }
