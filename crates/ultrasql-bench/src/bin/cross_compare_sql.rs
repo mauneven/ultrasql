@@ -462,17 +462,20 @@ async fn main() -> Result<()> {
         let handle = std::thread::Builder::new()
             .name("ultrasql-bench-server".to_string())
             .spawn(move || {
-                let runtime = tokio::runtime::Builder::new_current_thread()
+                let Ok(runtime) = tokio::runtime::Builder::new_current_thread()
                     .enable_all()
                     .build()
-                    .expect("benchmark server runtime should build");
+                else {
+                    eprintln!("ultrasqld task failed to build runtime");
+                    return;
+                };
                 runtime.block_on(async move {
                     if let Err(e) = serve_listener(listener, state).await {
                         eprintln!("ultrasqld task exited: {e}");
                     }
                 });
             })
-            .expect("benchmark server thread should spawn");
+            .context("spawn benchmark server thread")?;
         (bound, Some(handle))
     };
 
@@ -1557,7 +1560,7 @@ async fn run_object_parquet_range_smoke(
     let mock = BenchMockS3::range_only(vec![(
         "/lake/parquet/object_range.parquet",
         object_bytes.clone(),
-    )]);
+    )])?;
     let _endpoint_override = override_s3_endpoint_for_process(mock.endpoint.clone());
 
     let (client, conn_handle) = connect_sql_server(server).await?;
@@ -1723,12 +1726,17 @@ struct BenchMockS3 {
 }
 
 impl BenchMockS3 {
-    fn range_only(objects: Vec<(&str, Vec<u8>)>) -> Self {
-        let listener = TcpListener::bind("127.0.0.1:0").expect("bind object range mock");
+    fn range_only(objects: Vec<(&str, Vec<u8>)>) -> Result<Self> {
+        let listener = TcpListener::bind("127.0.0.1:0").context("bind object range mock")?;
         listener
             .set_nonblocking(true)
-            .expect("object range mock nonblocking");
-        let endpoint = format!("http://{}", listener.local_addr().expect("mock addr"));
+            .context("object range mock nonblocking")?;
+        let endpoint = format!(
+            "http://{}",
+            listener
+                .local_addr()
+                .context("read object range mock addr")?
+        );
         let shutdown = Arc::new(AtomicBool::new(false));
         let thread_shutdown = Arc::clone(&shutdown);
         let requests = Arc::new(Mutex::new(Vec::new()));
@@ -1750,12 +1758,12 @@ impl BenchMockS3 {
                 }
             }
         });
-        Self {
+        Ok(Self {
             endpoint,
             shutdown,
             handle: Some(handle),
             requests,
-        }
+        })
     }
 
     fn requests(&self) -> Vec<BenchMockS3Request> {
@@ -1769,13 +1777,11 @@ impl BenchMockS3 {
 impl Drop for BenchMockS3 {
     fn drop(&mut self) {
         self.shutdown.store(true, Ordering::Release);
-        let _ = TcpStream::connect(
-            self.endpoint
-                .strip_prefix("http://")
-                .expect("mock endpoint prefix"),
-        );
+        if let Some(addr) = self.endpoint.strip_prefix("http://") {
+            let _ = TcpStream::connect(addr);
+        }
         if let Some(handle) = self.handle.take() {
-            handle.join().expect("object range mock thread joins");
+            let _ = handle.join();
         }
     }
 }

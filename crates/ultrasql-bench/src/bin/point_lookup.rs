@@ -238,10 +238,12 @@ fn gen_probe_keys(probes: usize, n_i64: i64, probe_seed: u64) -> Vec<i64> {
 /// B-tree page the measurement run hits is already resident in the
 /// buffer pool, eliminating cold-cache outliers in run 1.
 fn warmup(tree: &BTree<BlankLoader>, keys: &[i64], warmup_probes: usize) {
+    if keys.is_empty() {
+        return;
+    }
     let mut hits: i64 = 0;
-    let mut warmup_keys = keys.iter().cycle();
-    for _ in 0..warmup_probes {
-        let k = *warmup_keys.next().expect("non-empty key vec");
+    for probe in 0..warmup_probes {
+        let k = keys[probe % keys.len()];
         if let Some(t) = tree.lookup::<i64>(k).unwrap_or(None) {
             hits = hits.wrapping_add(i64::from(t.page.block.raw()));
         }

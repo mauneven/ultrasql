@@ -769,3 +769,9 @@ as a concise evidence ledger; roadmap stays for open gates only.
   `BETWEEN`, and `LIKE`.
 - Type-specific regression baseline covers numeric, text, date/time/timetz,
   timestamp, JSON/JSONB, and arrays.
+- Tooling panic-path audit tightened benchmark and SQLLogicTest binaries:
+  benchmark server/mock setup now returns context errors instead of panics,
+  CLI reference engines reject non-CLI targets with typed errors, hex encoding
+  avoids fallible formatting, empty point-lookup warmup is guarded, and
+  PostgreSQL regression provenance now asserts active row-value `IN` coverage
+  instead of stale skip debt.

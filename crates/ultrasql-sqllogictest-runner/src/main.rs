@@ -392,7 +392,7 @@ async fn connect_ultrasql_target(cli: &Cli) -> Result<(Client, Option<InProcessS
             Ok((client, None))
         }
         Mode::InProcess => {
-            let addr: SocketAddr = "127.0.0.1:0".parse().expect("literal socket address");
+            let addr = SocketAddr::from(([127, 0, 0, 1], 0));
             let (listener, bound) = ultrasql_server::bind_listener(addr)
                 .await
                 .context("bind in-process UltraSQL listener")?;
@@ -483,10 +483,12 @@ impl CliReference {
     }
 
     fn run_sql(&self, sql: &str) -> Result<String> {
-        let command = self
-            .engine
-            .command()
-            .expect("CLI comparison engines have commands");
+        let command = self.engine.command().with_context(|| {
+            format!(
+                "reference engine {} does not expose a CLI command",
+                self.engine.suffix()
+            )
+        })?;
         let output = Command::new(command)
             .arg("-batch")
             .arg("-bail")
@@ -748,9 +750,12 @@ fn benchmark_cli_engine(
     cases: &[TestCase],
     runs: u32,
 ) -> Result<EngineBenchmark> {
-    let command = engine
-        .command()
-        .expect("CLI comparison engines have commands");
+    let command = engine.command().with_context(|| {
+        format!(
+            "reference engine {} does not expose a CLI command",
+            engine.suffix()
+        )
+    })?;
     let db_path = temp_reference_db_path(engine)?;
     let mut script = String::new();
     let mut statements = 0_u64;

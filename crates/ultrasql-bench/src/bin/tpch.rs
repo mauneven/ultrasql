@@ -643,13 +643,13 @@ fn hash_cargo_lock() -> String {
 }
 
 fn hex_encode(bytes: &[u8]) -> String {
-    bytes
-        .iter()
-        .fold(String::with_capacity(bytes.len() * 2), |mut acc, b| {
-            use std::fmt::Write as _;
-            write!(acc, "{b:02x}").expect("String write is infallible");
-            acc
-        })
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for &byte in bytes {
+        out.push(char::from(HEX[usize::from(byte >> 4)]));
+        out.push(char::from(HEX[usize::from(byte & 0x0f)]));
+    }
+    out
 }
 
 /// Returns an ISO-8601 timestamp string for right now, using `BENCH_TIMESTAMP`

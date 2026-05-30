@@ -288,8 +288,8 @@ fn sql_regression_subset_preserves_public_provenance() {
     let shard = subset.join("select_basics.slt");
     let text = fs::read_to_string(&shard).expect("read engine-specific shard");
     assert!(
-        text.contains("# ultrasql:skip row-value IN support not implemented yet"),
-        "{} must keep unsupported PostgreSQL regression coverage as explicit skip",
+        text.contains("WHERE (id, score) IN ((1, 42), (3, 10), (5, 0))"),
+        "{} must keep row-value IN PostgreSQL regression coverage active",
         shard.display()
     );
 }
