@@ -65,8 +65,13 @@ impl FunctionScan {
     #[must_use]
     #[allow(clippy::similar_names)] // `stop` and `step` are standard generate_series parameter names
     pub fn generate_series(start: i64, stop: i64, step: i64) -> Self {
-        let schema = Schema::new([Field::required("generate_series", DataType::Int64)])
-            .expect("schema is well-formed");
+        let schema = match Schema::new([Field::required("generate_series", DataType::Int64)]) {
+            Ok(schema) => schema,
+            Err(err) => {
+                tracing::error!(error = %err, "generate_series schema construction failed");
+                Schema::empty()
+            }
+        };
         Self {
             kind: SrfKind::GenerateSeries { start, stop, step },
             schema,
@@ -86,8 +91,13 @@ impl FunctionScan {
         let output_type = array_base_type(&element_type).clone();
         let mut flattened = Vec::with_capacity(elements.len());
         flatten_array_elements(&elements, &mut flattened);
-        let schema =
-            Schema::new([Field::required("unnest", output_type)]).expect("schema is well-formed");
+        let schema = match Schema::new([Field::required("unnest", output_type)]) {
+            Ok(schema) => schema,
+            Err(err) => {
+                tracing::error!(error = %err, "unnest schema construction failed");
+                Schema::empty()
+            }
+        };
         Self {
             kind: SrfKind::Unnest {
                 elements: flattened,

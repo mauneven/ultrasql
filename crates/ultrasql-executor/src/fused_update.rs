@@ -146,8 +146,13 @@ impl<L: PageLoader> FusedUpdateInt32Add<L> {
         xid: Xid,
         command_id: CommandId,
     ) -> Self {
-        let schema = Schema::new([Field::required("count", DataType::Int64)])
-            .expect("affected-count schema is well-formed");
+        let schema = match Schema::new([Field::required("count", DataType::Int64)]) {
+            Ok(schema) => schema,
+            Err(err) => {
+                tracing::error!(error = %err, "fused update count schema construction failed");
+                Schema::empty()
+            }
+        };
         Self {
             heap,
             relation,

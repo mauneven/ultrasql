@@ -309,6 +309,11 @@ as a concise evidence ledger; roadmap stays for open gates only.
   `cargo test -p ultrasql-executor modify` and
   `cargo clippy -p ultrasql-executor --lib --all-features -- -W
   clippy::expect_used -W clippy::unwrap_used`.
+- Executor SRF and fused-update result schema constructors now log and return
+  an empty schema instead of panicking on impossible static schema failures.
+  Evidence:
+  `cargo test -p ultrasql-executor function_scan` and
+  `cargo test -p ultrasql-executor fused_update`.
 
 ## Core SQL And Wire Protocol
 
