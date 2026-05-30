@@ -173,8 +173,8 @@ as a concise evidence ledger; roadmap stays for open gates only.
   rejected at bind time with SQLSTATE `42804`; arbitrary precision remains open.
 - `MONEY` type surface, signed-cent storage, OID 790, wire, COPY, catalog
   persistence, checked unary signs, checked addition/subtraction, checked
-  integer division, rounded floating-point division, money ratio division, and
-  behavior tests exist.
+  integer division, rounded floating-point division, checked scalar
+  multiplication, money ratio division, and behavior tests exist.
 - `CHAR(n)` / `bpchar` parser, binder, row codec, executor, OID 1042, COPY,
   catalog persistence, blank padding, assignment/cast truncation, and
   trailing-space comparison semantics exist.

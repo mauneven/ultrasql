@@ -867,6 +867,20 @@ fn binds_money_division_matrix() {
 }
 
 #[test]
+fn binds_money_scalar_multiplication() {
+    let cat = InMemoryCatalog::new();
+    for sql in [
+        "SELECT '$1.25'::money * 3",
+        "SELECT 3 * '$1.25'::money",
+        "SELECT '$1.25'::money * 1.5::float8",
+        "SELECT 1.5::float8 * '$1.25'::money",
+    ] {
+        let plan = parse_and_bind(sql, &cat).expect("bind ok");
+        assert_eq!(plan.schema().field_at(0).data_type, DataType::Money);
+    }
+}
+
+#[test]
 fn binds_money_unary_signs() {
     let cat = InMemoryCatalog::new();
     let plan = parse_and_bind("SELECT -('$1.25'::money), +'$2.00'::money", &cat).expect("bind ok");

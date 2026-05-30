@@ -219,6 +219,11 @@ pub(super) fn binary_result_type(
 fn money_arithmetic_type(op: BinaryOp, left: &DataType, right: &DataType) -> Option<DataType> {
     match (op, left, right) {
         (BinaryOp::Add | BinaryOp::Sub, DataType::Money, DataType::Money) => Some(DataType::Money),
+        (BinaryOp::Mul, DataType::Money, ty) | (BinaryOp::Mul, ty, DataType::Money)
+            if ty.is_integer() || ty.is_float() =>
+        {
+            Some(DataType::Money)
+        }
         (BinaryOp::Div, DataType::Money, DataType::Money) => Some(DataType::Float64),
         (BinaryOp::Div, DataType::Money, ty) if ty.is_integer() => Some(DataType::Money),
         (BinaryOp::Div, DataType::Money, ty) if ty.is_float() => Some(DataType::Money),

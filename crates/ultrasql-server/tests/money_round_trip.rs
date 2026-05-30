@@ -116,5 +116,29 @@ async fn money_cast_insert_select_and_extended_wire_type() {
         .collect();
     assert_eq!(values, vec!["$2.51".to_owned()]);
 
+    let multiplication = client
+        .simple_query("SELECT '$1.25'::money * 3, 3 * '$1.25'::money, '$1.25'::money * 1.5::float8")
+        .await
+        .expect("money scalar multiplication");
+    let values: Vec<Vec<String>> = multiplication
+        .into_iter()
+        .filter_map(|message| match message {
+            tokio_postgres::SimpleQueryMessage::Row(row) => Some(
+                (0..row.len())
+                    .filter_map(|idx| row.get(idx).map(str::to_owned))
+                    .collect(),
+            ),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        values,
+        vec![vec![
+            "$3.75".to_owned(),
+            "$3.75".to_owned(),
+            "$1.88".to_owned()
+        ]]
+    );
+
     shutdown(running).await;
 }

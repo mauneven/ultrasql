@@ -4053,8 +4053,39 @@ fn money_arith(left: &Value, right: &Value, op: ArithOp) -> Result<Option<Value>
         (Value::Money(cents), Value::Float64(divisor), ArithOp::Div) => {
             money_float_div(*cents, *divisor).map(Some)
         }
+        (Value::Money(cents), Value::Int16(multiplier), ArithOp::Mul) => {
+            money_integer_mul(*cents, i64::from(*multiplier)).map(Some)
+        }
+        (Value::Money(cents), Value::Int32(multiplier), ArithOp::Mul) => {
+            money_integer_mul(*cents, i64::from(*multiplier)).map(Some)
+        }
+        (Value::Money(cents), Value::Int64(multiplier), ArithOp::Mul) => {
+            money_integer_mul(*cents, *multiplier).map(Some)
+        }
+        (Value::Int16(multiplier), Value::Money(cents), ArithOp::Mul) => {
+            money_integer_mul(*cents, i64::from(*multiplier)).map(Some)
+        }
+        (Value::Int32(multiplier), Value::Money(cents), ArithOp::Mul) => {
+            money_integer_mul(*cents, i64::from(*multiplier)).map(Some)
+        }
+        (Value::Int64(multiplier), Value::Money(cents), ArithOp::Mul) => {
+            money_integer_mul(*cents, *multiplier).map(Some)
+        }
+        (Value::Money(cents), Value::Float32(multiplier), ArithOp::Mul) => {
+            money_float_mul(*cents, f64::from(*multiplier)).map(Some)
+        }
+        (Value::Money(cents), Value::Float64(multiplier), ArithOp::Mul) => {
+            money_float_mul(*cents, *multiplier).map(Some)
+        }
+        (Value::Float32(multiplier), Value::Money(cents), ArithOp::Mul) => {
+            money_float_mul(*cents, f64::from(*multiplier)).map(Some)
+        }
+        (Value::Float64(multiplier), Value::Money(cents), ArithOp::Mul) => {
+            money_float_mul(*cents, *multiplier).map(Some)
+        }
         (Value::Money(_), Value::Money(_), _) => Err(EvalError::Type(
-            "money arithmetic supports addition, subtraction, and division".to_owned(),
+            "money arithmetic supports addition, subtraction, multiplication, and division"
+                .to_owned(),
         )),
         _ => Ok(None),
     }
@@ -4079,12 +4110,26 @@ fn money_integer_div(cents: i64, divisor: i64) -> Result<Value, EvalError> {
         .ok_or(EvalError::Overflow)
 }
 
+fn money_integer_mul(cents: i64, multiplier: i64) -> Result<Value, EvalError> {
+    cents
+        .checked_mul(multiplier)
+        .map(Value::Money)
+        .ok_or(EvalError::Overflow)
+}
+
+fn money_float_mul(cents: i64, multiplier: f64) -> Result<Value, EvalError> {
+    rounded_money_from_f64(cents_to_f64(cents) * multiplier)
+}
+
 fn money_float_div(cents: i64, divisor: f64) -> Result<Value, EvalError> {
     if divisor == 0.0 {
         return Err(EvalError::DivByZero);
     }
-    let divided = cents_to_f64(cents) / divisor;
-    divided
+    rounded_money_from_f64(cents_to_f64(cents) / divisor)
+}
+
+fn rounded_money_from_f64(cents: f64) -> Result<Value, EvalError> {
+    cents
         .round()
         .to_i64()
         .map(Value::Money)
@@ -6509,6 +6554,42 @@ mod tests {
         assert_eq!(
             rounded.eval(&[]).expect("money float div"),
             Value::Money(251)
+        );
+    }
+
+    #[test]
+    fn money_scalar_multiplication_evaluates() {
+        let money_int = Eval::new(ScalarExpr::Binary {
+            op: BinaryOp::Mul,
+            left: Box::new(lit_money(125)),
+            right: Box::new(lit_i32(3)),
+            data_type: DataType::Money,
+        });
+        assert_eq!(
+            money_int.eval(&[]).expect("money int mul"),
+            Value::Money(375)
+        );
+
+        let int_money = Eval::new(ScalarExpr::Binary {
+            op: BinaryOp::Mul,
+            left: Box::new(lit_i32(3)),
+            right: Box::new(lit_money(125)),
+            data_type: DataType::Money,
+        });
+        assert_eq!(
+            int_money.eval(&[]).expect("int money mul"),
+            Value::Money(375)
+        );
+
+        let money_float = Eval::new(ScalarExpr::Binary {
+            op: BinaryOp::Mul,
+            left: Box::new(lit_money(125)),
+            right: Box::new(lit_f64(1.5)),
+            data_type: DataType::Money,
+        });
+        assert_eq!(
+            money_float.eval(&[]).expect("money float mul"),
+            Value::Money(188)
         );
     }
 

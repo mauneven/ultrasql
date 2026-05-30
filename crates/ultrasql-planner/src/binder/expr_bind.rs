@@ -3323,15 +3323,19 @@ const fn binary_operator_uses_raw_text_pattern(op: BinaryOp) -> bool {
 
 fn coerce_binary_literals(op: BinaryOp, left: &mut ScalarExpr, right: &mut ScalarExpr) {
     if binary_operator_uses_raw_text_pattern(op)
-        || money_division_keeps_operand_types(op, left, right)
+        || money_scalar_arithmetic_keeps_operand_types(op, left, right)
     {
         return;
     }
     coerce_literal_to_match(left, right);
 }
 
-fn money_division_keeps_operand_types(op: BinaryOp, left: &ScalarExpr, right: &ScalarExpr) -> bool {
-    matches!(op, BinaryOp::Div)
+fn money_scalar_arithmetic_keeps_operand_types(
+    op: BinaryOp,
+    left: &ScalarExpr,
+    right: &ScalarExpr,
+) -> bool {
+    matches!(op, BinaryOp::Mul | BinaryOp::Div)
         && (matches!(left.data_type(), DataType::Money)
             || matches!(right.data_type(), DataType::Money))
 }
