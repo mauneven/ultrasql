@@ -147,12 +147,12 @@ impl Drop for WorkMemReservation<'_> {
     fn drop(&mut self) {
         // Saturating sub is safe: the reservation was added atomically so
         // used >= self.bytes at this point under normal operation.
-        self.budget
+        let _ = self
+            .budget
             .used
             .fetch_update(Ordering::AcqRel, Ordering::Relaxed, |prev| {
                 Some(prev.saturating_sub(self.bytes))
-            })
-            .expect("fetch_update with Some closure always succeeds");
+            });
     }
 }
 

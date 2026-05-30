@@ -207,6 +207,9 @@ as a concise evidence ledger; roadmap stays for open gates only.
   also avoids `expect` on stale heads. Evidence:
   `cargo test -p ultrasql-executor sort` and
   `cargo test -p ultrasql-executor top_k`.
+- Work-memory reservation release no longer uses a production `expect` in the
+  RAII drop path; the saturating atomic release remains behavior-compatible.
+  Evidence: `cargo test -p ultrasql-executor work_mem`.
 
 ## Core SQL And Wire Protocol
 
