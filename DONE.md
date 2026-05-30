@@ -134,6 +134,10 @@ as a concise evidence ledger; roadmap stays for open gates only.
   panicking. Evidence: `cargo test -p ultrasql-storage --lib heap -- --nocapture`
   and
   `cargo clippy -p ultrasql-storage --all-targets --all-features -- -D warnings`.
+- Storage strict production panic audit now passes
+  `cargo clippy -p ultrasql-storage --lib --all-features -- -D clippy::unwrap_used -D clippy::expect_used`;
+  remaining infallible `PageRead`/`PageWrite`/`Page::header` invariants have
+  narrow documented lint allows because those APIs cannot return `Result`.
 - Backup/restore smoke runner covers `ultrasql --basebackup`,
   `ultrasql --pg-dump`, `ultrasql --pg-restore`, row counts, and indexed lookup.
 - Backup/restore dump-format certification now covers custom, directory, and

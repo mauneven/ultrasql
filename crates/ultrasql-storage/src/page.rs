@@ -397,6 +397,10 @@ impl Page {
 
     /// Decode the current header. Note that this re-parses on every
     /// call; callers in hot loops should cache the header locally.
+    #[allow(
+        clippy::expect_used,
+        reason = "Page is constructed only through validated bytes or new_heap; this is the infallible invariant accessor"
+    )]
     pub fn header(&self) -> PageHeader {
         // Safety: `Self` only exists for pages whose header has been
         // validated by `from_bytes` or initialized by `new_heap`.

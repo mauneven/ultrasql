@@ -765,6 +765,10 @@ impl std::fmt::Debug for PageRead<'_> {
 
 impl std::ops::Deref for PageRead<'_> {
     type Target = Page;
+    #[allow(
+        clippy::expect_used,
+        reason = "PageGuard installs Some(Page) before exposing PageRead; Deref cannot return Result"
+    )]
     fn deref(&self) -> &Self::Target {
         self.inner
             .as_ref()
@@ -787,6 +791,10 @@ impl std::fmt::Debug for PageWrite<'_> {
 
 impl std::ops::Deref for PageWrite<'_> {
     type Target = Page;
+    #[allow(
+        clippy::expect_used,
+        reason = "PageGuard installs Some(Page) before exposing PageWrite; Deref cannot return Result"
+    )]
     fn deref(&self) -> &Self::Target {
         self.inner
             .as_ref()
@@ -795,6 +803,10 @@ impl std::ops::Deref for PageWrite<'_> {
 }
 
 impl std::ops::DerefMut for PageWrite<'_> {
+    #[allow(
+        clippy::expect_used,
+        reason = "PageGuard installs Some(Page) before exposing PageWrite; DerefMut cannot return Result"
+    )]
     fn deref_mut(&mut self) -> &mut Self::Target {
         self.inner
             .as_mut()
