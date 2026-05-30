@@ -311,6 +311,56 @@ fn describe_statement_emits_parameter_then_row_description() {
 }
 
 #[test]
+fn explicit_cast_parameter_infers_text_oid_for_binary_bind() {
+    let catalog = fixture_catalog();
+    let mut state = ExtendedConnState::new();
+    handle_parse(
+        &mut state,
+        "s".to_string(),
+        "SELECT $1::VARCHAR = 'sqlalchemy_cert'".to_string(),
+        vec![],
+        &catalog,
+    )
+    .expect("parse ok");
+    let msgs = handle_describe_statement(
+        &state,
+        "s",
+        Some(&catalog as &dyn ultrasql_planner::Catalog),
+    )
+    .expect("describe ok");
+    assert!(matches!(
+        &msgs[0],
+        BackendMessage::ParameterDescription { type_oids } if type_oids == &vec![PG_OID_TEXT]
+    ));
+
+    handle_bind(
+        &mut state,
+        String::new(),
+        "s",
+        &[1],
+        &[Some(b"sqlalchemy_cert".to_vec())],
+        vec![],
+        Some(&catalog as &dyn ultrasql_planner::Catalog),
+    )
+    .expect("bind ok");
+    let portal = state.portals.get("").expect("unnamed portal");
+    let plan = portal.plan.as_ref().expect("bound plan");
+    let mut saw_text = false;
+    let mut saw_bytea = false;
+    walk_plan_exprs(plan, &mut |expr| {
+        if let ScalarExpr::Literal { value, .. } = expr {
+            match value {
+                Value::Text(text) if text == "sqlalchemy_cert" => saw_text = true,
+                Value::Bytea(_) => saw_bytea = true,
+                _ => {}
+            }
+        }
+    });
+    assert!(saw_text, "cast parameter should decode as text");
+    assert!(!saw_bytea, "cast parameter must not fall back to bytea");
+}
+
+#[test]
 fn describe_portal_for_select_returns_row_description() {
     let catalog = fixture_catalog();
     let mut state = ExtendedConnState::new();

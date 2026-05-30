@@ -392,12 +392,30 @@ fn infer_in_expr(expr: &ScalarExpr, target_type: Option<DataType>, out: &mut [Da
             infer_in_expr(expr, None, out);
             infer_into(subplan, None, out);
         }
-        ScalarExpr::FunctionCall { args, .. } => {
+        ScalarExpr::FunctionCall {
+            name,
+            args,
+            data_type,
+        } => {
+            let arg_target = runtime_cast_parameter_target(name, data_type);
             for a in args {
-                infer_in_expr(a, None, out);
+                infer_in_expr(a, arg_target.clone(), out);
             }
         }
     }
+}
+
+fn runtime_cast_parameter_target(name: &str, data_type: &DataType) -> Option<DataType> {
+    matches!(
+        name,
+        "__ultrasql_cast_money"
+            | "__ultrasql_cast_numeric"
+            | "__ultrasql_cast_oid"
+            | "__ultrasql_cast_regclass"
+            | "__ultrasql_cast_regtype"
+            | "__ultrasql_cast_text"
+    )
+    .then(|| data_type.clone())
 }
 
 /// Walk every `ScalarExpr` reachable from `plan`, calling `f` on each.
