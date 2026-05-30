@@ -1064,13 +1064,56 @@ mod tests {
             .write_all(format!("{method} {path} HTTP/1.1\r\nhost: localhost\r\n\r\n").as_bytes())
             .await
             .expect("write request");
-        let mut response = Vec::new();
-        client
-            .read_to_end(&mut response)
-            .await
-            .expect("read response");
+        let response = read_ops_test_response(&mut client).await;
         server.await.expect("ops task");
         String::from_utf8(response).expect("utf8 response")
+    }
+
+    async fn read_ops_test_response(client: &mut TcpStream) -> Vec<u8> {
+        let mut response = Vec::new();
+        let mut chunk = [0_u8; 1024];
+        loop {
+            match client.read(&mut chunk).await {
+                Ok(0) => break,
+                Ok(read) => {
+                    response.extend_from_slice(&chunk[..read]);
+                    if ops_test_response_complete(&response) {
+                        break;
+                    }
+                }
+                Err(err)
+                    if err.kind() == std::io::ErrorKind::ConnectionReset
+                        && ops_test_response_complete(&response) =>
+                {
+                    break;
+                }
+                Err(err) => panic!("read response: {err}"),
+            }
+        }
+        response
+    }
+
+    fn ops_test_response_complete(response: &[u8]) -> bool {
+        let Some(header_end) = response.windows(4).position(|window| window == b"\r\n\r\n") else {
+            return false;
+        };
+        let body_start = header_end + 4;
+        let Some(content_length) = ops_test_content_length(&response[..header_end]) else {
+            return false;
+        };
+        response.len().saturating_sub(body_start) >= content_length
+    }
+
+    fn ops_test_content_length(header: &[u8]) -> Option<usize> {
+        let header = std::str::from_utf8(header).ok()?;
+        header.lines().find_map(|line| {
+            let (name, value) = line.split_once(':')?;
+            if name.eq_ignore_ascii_case("content-length") {
+                value.trim().parse().ok()
+            } else {
+                None
+            }
+        })
     }
 
     #[test]
