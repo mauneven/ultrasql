@@ -364,8 +364,14 @@ pub fn build_sample_database(catalog: &mut InMemoryCatalog) -> SampleTables {
         Field::required("id", DataType::Int32),
         Field::nullable("name", DataType::Text { max_len: None }),
         Field::nullable("score", DataType::Float64),
-    ])
-    .expect("sample schema is well-formed");
+    ]);
+    let schema = match schema {
+        Ok(schema) => schema,
+        Err(err) => {
+            tracing::error!(error = %err, "sample schema construction failed");
+            return tables;
+        }
+    };
 
     let ids = NumericColumn::from_data(vec![1_i32, 2, 3]);
     let names = StringColumn::from_data(vec![
@@ -379,8 +385,14 @@ pub fn build_sample_database(catalog: &mut InMemoryCatalog) -> SampleTables {
         Column::Int32(ids),
         Column::Utf8(names),
         Column::Float64(scores),
-    ])
-    .expect("sample batch is well-formed");
+    ]);
+    let batch = match batch {
+        Ok(batch) => batch,
+        Err(err) => {
+            tracing::error!(error = %err, "sample batch construction failed");
+            return tables;
+        }
+    };
 
     tables.register(catalog, "users", schema, vec![batch]);
     tables

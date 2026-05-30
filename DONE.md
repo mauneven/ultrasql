@@ -274,6 +274,12 @@ as a concise evidence ledger; roadmap stays for open gates only.
   `cargo test -p ultrasql-server projection_summary` and
   `cargo clippy -p ultrasql-server --lib --all-features -- -W
   clippy::expect_used -W clippy::unwrap_used`.
+- Sample database bootstrap now logs and returns an empty sample registry if
+  static fixture schema or batch construction fails, preserving API
+  compatibility while removing production `expect` paths. Evidence:
+  `cargo test -p ultrasql-server pipeline::tests` and
+  `cargo clippy -p ultrasql-server --lib --all-features -- -W
+  clippy::expect_used -W clippy::unwrap_used`.
 
 ## Core SQL And Wire Protocol
 
