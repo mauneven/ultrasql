@@ -168,6 +168,9 @@ pub enum LockError {
     /// `try_acquire` found a conflicting grant; the lock was not taken.
     #[error("lock held by another transaction")]
     Conflict,
+    /// A fastpath relation-lock reference count overflowed.
+    #[error("fastpath lock reference count overflow")]
+    FastpathOverflow,
 }
 
 /// A point-in-time snapshot of who holds and waits on a particular
@@ -338,14 +341,14 @@ impl LockManager {
             .spawn(move || {
                 detector_loop(&t_table, &t_states, &t_stop, interval);
             })
-            .expect("failed to spawn deadlock detector thread");
+            .ok();
 
         Self {
             table,
             xid_states,
             deadlock_interval: interval,
             detector_stop: stop,
-            detector_handle: Mutex::new(Some(handle)),
+            detector_handle: Mutex::new(handle),
         }
     }
 
@@ -364,7 +367,7 @@ impl LockManager {
         // Only AccessShare on Relation qualifies for the fastpath.
         if req.mode.is_access_share() {
             if let LockTag::Relation(_) = req.tag {
-                FASTPATH.with(|fp| {
+                return FASTPATH.with(|fp| {
                     let mut cache = fp.borrow_mut();
                     // Search for an existing entry for this (tag, mode).
                     if let Some(entry) = cache
@@ -374,7 +377,7 @@ impl LockManager {
                         entry.count = entry
                             .count
                             .checked_add(1)
-                            .expect("fastpath refcount overflow: invariant violated");
+                            .ok_or(LockError::FastpathOverflow)?;
                     } else {
                         cache.push(FastpathEntry {
                             tag: req.tag,
@@ -382,8 +385,8 @@ impl LockManager {
                             count: 1,
                         });
                     }
+                    Ok(())
                 });
-                return Ok(());
             }
         }
         self.acquire(req)
@@ -641,13 +644,10 @@ impl Drop for LockManager {
     fn drop(&mut self) {
         self.detector_stop.store(true, Ordering::Release);
         // Wake the detector if it is sleeping so it exits promptly.
-        let handle = self
-            .detector_handle
-            .lock()
-            .take()
-            .expect("detector handle already taken: invariant violated");
-        // Best-effort join; ignore the result.
-        let _ = handle.join();
+        if let Some(handle) = self.detector_handle.lock().take() {
+            // Best-effort join; ignore the result.
+            let _ = handle.join();
+        }
     }
 }
 
@@ -779,17 +779,14 @@ fn dfs_find_cycle(
                 if on_stack.contains(&neighbor) {
                     // Extract the cycle: everything from `neighbor`'s
                     // position in `on_stack` to the current end.
-                    let cycle_start = on_stack
-                        .iter()
-                        .position(|&x| x == neighbor)
-                        .expect("neighbor must be on stack: invariant verified above");
+                    let Some(cycle_start) = on_stack.iter().position(|&x| x == neighbor) else {
+                        continue;
+                    };
                     let cycle: Vec<Xid> = on_stack[cycle_start..].to_vec();
                     // Pick youngest (largest raw XID) as victim.
-                    let victim = cycle
-                        .iter()
-                        .copied()
-                        .max_by_key(|x| x.raw())
-                        .expect("cycle is non-empty");
+                    let Some(victim) = cycle.iter().copied().max_by_key(|x| x.raw()) else {
+                        continue;
+                    };
                     if let Some(state) = xid_states.get(&victim) {
                         state.mark_victim();
                     }

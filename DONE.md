@@ -479,6 +479,14 @@ as a concise evidence ledger; roadmap stays for open gates only.
   heap::tests::wal_emission::vacuum_heap_reclaims_committed_dead_tuples`, and
   `cargo clippy -p ultrasql-storage --all-targets --all-features -- -D
   warnings`.
+- Transaction lock manager fastpath refcount overflow now returns a typed
+  `LockError`, detector-thread spawn failure no longer panics during manager
+  construction, drop tolerates an already-missing detector handle, and deadlock
+  DFS cycle extraction avoids invariant `expect`s. Evidence:
+  `cargo test -p ultrasql-txn lock -- --nocapture`, `cargo clippy -p
+  ultrasql-txn --lib --all-features -- -W clippy::expect_used -W
+  clippy::unwrap_used`, and `cargo clippy -p ultrasql-txn --all-targets
+  --all-features -- -D warnings`.
 
 ## Core SQL And Wire Protocol
 
