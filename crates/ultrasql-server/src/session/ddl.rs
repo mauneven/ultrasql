@@ -1884,6 +1884,7 @@ where
                         self.state.sequences.remove(seq_name);
                     }
                 }
+                self.state.row_security.remove(&entry.oid);
                 self.state
                     .persistent_catalog
                     .clear_descriptions_for_object(entry.oid);
@@ -1892,6 +1893,7 @@ where
             self.state.persistent_catalog.drop_table(name)?;
         }
         self.state.persist_table_runtime_constraints_metadata()?;
+        self.state.persist_row_security_metadata()?;
         self.state
             .remove_materialized_view_runtime_metadata(&drop_names)?;
         // Any cached plan that referenced this name is now invalid;

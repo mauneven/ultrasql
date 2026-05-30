@@ -384,6 +384,40 @@ async fn rls_tenant_policy_survives_restart() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn drop_table_removes_rls_restart_metadata() {
+    let data_dir = tempfile::TempDir::new().unwrap();
+    let metadata_path = data_dir.path().join("pg_row_security.meta");
+
+    let running = start_persistent_server(data_dir.path(), "rls_drop_metadata").await;
+    for sql in [
+        "CREATE TABLE rls_drop_docs (tenant_id TEXT NOT NULL, doc_id TEXT NOT NULL)",
+        "CREATE POLICY rls_drop_docs_tenant ON rls_drop_docs \
+            USING (tenant_id = current_setting('ultrasql.tenant_id', true))",
+        "ALTER TABLE rls_drop_docs ENABLE ROW LEVEL SECURITY",
+    ] {
+        running.client.batch_execute(sql).await.expect(sql);
+    }
+    let metadata = std::fs::read_to_string(&metadata_path).expect("RLS metadata exists");
+    assert!(
+        metadata.contains("rls_drop_docs"),
+        "RLS metadata should record table before drop: {metadata}"
+    );
+
+    running
+        .client
+        .batch_execute("DROP TABLE rls_drop_docs")
+        .await
+        .expect("drop RLS table");
+    graceful_shutdown(running).await;
+
+    let metadata = std::fs::read_to_string(&metadata_path).expect("RLS metadata exists");
+    assert!(
+        !metadata.contains("rls_drop_docs"),
+        "dropped table must be removed from RLS metadata: {metadata}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn rls_policy_roles_scope_visibility_and_restart() {
     let data_dir = tempfile::TempDir::new().unwrap();
 
