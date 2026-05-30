@@ -187,6 +187,52 @@ async fn serial_column_creates_sequence_default_and_updates_currval() {
 }
 
 #[tokio::test]
+async fn drop_sequence_restricts_and_cascade_detaches_serial_default() {
+    let running = start_sample_server("sequence_test").await;
+    let client = &running.client;
+
+    client
+        .batch_execute("CREATE TABLE t_seq_dep (id SERIAL, v INT)")
+        .await
+        .expect("create serial table");
+    client
+        .batch_execute("INSERT INTO t_seq_dep (v) VALUES (10)")
+        .await
+        .expect("insert using serial default");
+
+    let restricted = client
+        .batch_execute("DROP SEQUENCE t_seq_dep_id_seq")
+        .await
+        .expect_err("sequence default dependency must restrict drop");
+    assert_eq!(restricted.code().expect("SQLSTATE").code(), "2BP01");
+
+    client
+        .batch_execute("DROP SEQUENCE t_seq_dep_id_seq CASCADE")
+        .await
+        .expect("cascade detaches serial default");
+    client
+        .batch_execute("INSERT INTO t_seq_dep (id, v) VALUES (7, 70)")
+        .await
+        .expect("explicit insert still works after default detached");
+    client
+        .simple_query("SELECT nextval('t_seq_dep_id_seq')")
+        .await
+        .expect_err("dropped sequence is gone");
+
+    let rows = client
+        .query("SELECT id, v FROM t_seq_dep ORDER BY v", &[])
+        .await
+        .expect("select rows after sequence cascade");
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0].get::<_, i32>(0), 1);
+    assert_eq!(rows[0].get::<_, i32>(1), 10);
+    assert_eq!(rows[1].get::<_, i32>(0), 7);
+    assert_eq!(rows[1].get::<_, i32>(1), 70);
+
+    graceful_shutdown(running).await;
+}
+
+#[tokio::test]
 async fn generated_always_identity_uses_sequence_and_rejects_explicit_values() {
     let running = start_sample_server("sequence_test").await;
     let client = &running.client;

@@ -1,5 +1,6 @@
 //! Sequence DDL and SQL function surface.
 
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use tokio::io::{AsyncRead, AsyncWrite};
@@ -159,6 +160,7 @@ where
         let LogicalPlan::DropSequence {
             sequences,
             if_exists,
+            cascade,
             ..
         } = plan
         else {
@@ -166,9 +168,43 @@ where
                 "execute_drop_sequence called with non-DropSequence plan",
             ));
         };
+        let mut drop_set = HashSet::with_capacity(sequences.len());
         for name in sequences {
-            let existing = self.state.sequences.get(name).map(|seq| seq.clone());
-            if let Some(seq) = existing {
+            if self.state.sequences.contains_key(name) {
+                drop_set.insert(name.to_ascii_lowercase());
+            } else if !*if_exists {
+                return Err(ServerError::Catalog(
+                    ultrasql_catalog::CatalogError::not_found(name.clone()),
+                ));
+            }
+        }
+        if drop_set.is_empty() {
+            return Ok(result_encoder::run_ddl_command("DROP SEQUENCE"));
+        }
+        if *cascade {
+            let before_constraints = self.table_runtime_constraint_snapshot();
+            if self.detach_sequence_default_dependencies(&drop_set)
+                && let Err(err) = self.state.persist_table_runtime_constraints_metadata()
+            {
+                self.restore_table_runtime_constraints(before_constraints);
+                return Err(err);
+            }
+        } else {
+            for name in &drop_set {
+                let dependents = self.sequence_default_dependents(name);
+                if !dependents.is_empty() {
+                    return Err(ServerError::DependentObjectsStillExist(format!(
+                        "cannot drop sequence {name} because other objects depend on it: {}",
+                        dependents.join(", ")
+                    )));
+                }
+            }
+        }
+        for name in sequences {
+            if !drop_set.contains(&name.to_ascii_lowercase()) {
+                continue;
+            }
+            if let Some(seq) = self.state.sequences.get(name).map(|seq| seq.clone()) {
                 seq.emit_wal(
                     SequenceOpKind::Drop,
                     name,
@@ -178,15 +214,77 @@ where
                 )
                 .map_err(|e| ServerError::ddl(format!("DROP SEQUENCE WAL: {e}")))?;
             }
-            if self.state.sequences.remove(name).is_none() && !*if_exists {
-                return Err(ServerError::Catalog(
-                    ultrasql_catalog::CatalogError::not_found(name.clone()),
-                ));
-            }
+            self.state.sequences.remove(name);
             self.sequence_state.forget(name);
         }
         self.plan_cache_invalidate();
         Ok(result_encoder::run_ddl_command("DROP SEQUENCE"))
+    }
+
+    fn sequence_default_dependents(&self, sequence_name: &str) -> Vec<String> {
+        let snapshot = self.state.catalog_snapshot();
+        let mut out = Vec::new();
+        for item in self.state.table_constraints.iter() {
+            if item
+                .value()
+                .sequence_defaults
+                .iter()
+                .flatten()
+                .any(|name| name.eq_ignore_ascii_case(sequence_name))
+            {
+                let table_name = snapshot.tables_by_oid.get(item.key()).map_or_else(
+                    || format!("relation {}", item.key().raw()),
+                    |table| table.name.clone(),
+                );
+                out.push(format!("{table_name} column default"));
+            }
+        }
+        out.sort();
+        out
+    }
+
+    fn detach_sequence_default_dependencies(&self, drop_set: &HashSet<String>) -> bool {
+        let mut updates = Vec::new();
+        for item in self.state.table_constraints.iter() {
+            let mut next = item.value().as_ref().clone();
+            let mut changed = false;
+            for default in &mut next.sequence_defaults {
+                if default
+                    .as_ref()
+                    .is_some_and(|name| drop_set.contains(&name.to_ascii_lowercase()))
+                {
+                    *default = None;
+                    changed = true;
+                }
+            }
+            if changed {
+                updates.push((*item.key(), Arc::new(next)));
+            }
+        }
+        let changed = !updates.is_empty();
+        for (oid, constraints) in updates {
+            self.state.table_constraints.insert(oid, constraints);
+        }
+        changed
+    }
+
+    fn table_runtime_constraint_snapshot(
+        &self,
+    ) -> Vec<(ultrasql_core::Oid, Arc<crate::TableRuntimeConstraints>)> {
+        self.state
+            .table_constraints
+            .iter()
+            .map(|item| (*item.key(), Arc::clone(item.value())))
+            .collect()
+    }
+
+    fn restore_table_runtime_constraints(
+        &self,
+        snapshot: Vec<(ultrasql_core::Oid, Arc<crate::TableRuntimeConstraints>)>,
+    ) {
+        for (oid, constraints) in snapshot {
+            self.state.table_constraints.insert(oid, constraints);
+        }
     }
 
     pub(crate) fn try_dispatch_sequence_select(

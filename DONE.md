@@ -665,6 +665,10 @@ as a concise evidence ledger; roadmap stays for open gates only.
   materialized views, and direct materialized-view drops clear runtime
   maintenance state. Evidence:
   `cargo test -p ultrasql-server --test materialized_view_round_trip`.
+- `DROP SEQUENCE` dependency tracking now treats SERIAL/identity column defaults
+  as dependents: `RESTRICT` blocks sequence drops while defaults reference the
+  sequence, and `CASCADE` detaches those defaults before removing the sequence.
+  Evidence: `cargo test -p ultrasql-server --test sequence_round_trip`.
 
 ## Security And Client Certification
 
