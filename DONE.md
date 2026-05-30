@@ -439,6 +439,12 @@ as a concise evidence ledger; roadmap stays for open gates only.
   `cargo test -p ultrasql-vec upper_text`, `cargo check --workspace
   --all-targets`, and `cargo clippy -p ultrasql-vec --all-targets
   --all-features -- -D warnings`.
+- Vector boolean NOT kernels now fail closed on mismatched validity bitmaps
+  instead of panicking before result construction. Evidence:
+  `cargo test -p ultrasql-vec not_bool_mismatched_validity_fails_closed`,
+  `cargo test -p ultrasql-vec not_bool_scalar_mismatched_validity_fails_closed`,
+  `cargo test -p ultrasql-vec not_bool`, and
+  `cargo clippy -p ultrasql-vec --all-targets --all-features -- -D warnings`.
 
 ## Core SQL And Wire Protocol
 

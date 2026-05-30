@@ -91,23 +91,25 @@ pub fn neg_f64_scalar(
 /// validity bitmap: the data bit at a null row is forced to `0` but the
 /// validity bit stays `0`, so callers reading the column see `NULL`.
 ///
-/// # Panics
-///
-/// Panics if `validity.is_some()` and the validity length disagrees with
-/// `column.len()` (via the `NumericColumn::with_nulls` invariant inside
-/// the helper).
+/// If the optional validity bitmap length disagrees with `column.len()`, the
+/// kernel fails closed by returning an all-NULL column of the input length.
 #[must_use]
 pub fn not_bool(column: &BoolColumn, validity: Option<&Bitmap>) -> BoolColumn {
     let n = column.len();
     let mut out: Vec<bool> = column.data().iter().map(|&b| b == 0).collect();
     if let Some(bm) = validity {
+        if bm.len() != n {
+            return all_null_bool(n);
+        }
         for (i, slot) in out.iter_mut().enumerate().take(n) {
             if !bm.get(i) {
                 *slot = false;
             }
         }
-        BoolColumn::with_nulls(out, bm.clone())
-            .expect("validity length matches column length by invariant")
+        match BoolColumn::with_nulls(out, bm.clone()) {
+            Ok(column) => column,
+            Err(_) => all_null_bool(n),
+        }
     } else {
         BoolColumn::from_data(out)
     }
@@ -122,15 +124,27 @@ pub fn not_bool_scalar(column: &BoolColumn, validity: Option<&Bitmap>) -> BoolCo
         out.push(b == 0);
     }
     if let Some(bm) = validity {
+        if bm.len() != n {
+            return all_null_bool(n);
+        }
         for (i, slot) in out.iter_mut().enumerate().take(n) {
             if !bm.get(i) {
                 *slot = false;
             }
         }
-        BoolColumn::with_nulls(out, bm.clone())
-            .expect("validity length matches column length by invariant")
+        match BoolColumn::with_nulls(out, bm.clone()) {
+            Ok(column) => column,
+            Err(_) => all_null_bool(n),
+        }
     } else {
         BoolColumn::from_data(out)
+    }
+}
+
+fn all_null_bool(len: usize) -> BoolColumn {
+    match BoolColumn::with_nulls(vec![false; len], Bitmap::new(len, false)) {
+        Ok(column) => column,
+        Err(_) => BoolColumn::from_data(Vec::new()),
     }
 }
 
@@ -199,6 +213,32 @@ mod tests {
         assert!(!nulls.get(0));
         assert!(nulls.get(1));
         assert!(nulls.get(2));
+    }
+
+    #[test]
+    fn not_bool_mismatched_validity_fails_closed() {
+        let c = BoolColumn::from_data(vec![true, false, true]);
+        let bm = Bitmap::new(2, true);
+        let out = not_bool(&c, Some(&bm));
+        assert_eq!(out.data(), &[0_u8, 0, 0]);
+        let nulls = out.nulls().expect("nullable output");
+        assert_eq!(nulls.len(), 3);
+        assert!(!nulls.get(0));
+        assert!(!nulls.get(1));
+        assert!(!nulls.get(2));
+    }
+
+    #[test]
+    fn not_bool_scalar_mismatched_validity_fails_closed() {
+        let c = BoolColumn::from_data(vec![true, false, true]);
+        let bm = Bitmap::new(2, true);
+        let out = not_bool_scalar(&c, Some(&bm));
+        assert_eq!(out.data(), &[0_u8, 0, 0]);
+        let nulls = out.nulls().expect("nullable output");
+        assert_eq!(nulls.len(), 3);
+        assert!(!nulls.get(0));
+        assert!(!nulls.get(1));
+        assert!(!nulls.get(2));
     }
 
     #[test]
