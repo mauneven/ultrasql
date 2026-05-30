@@ -143,6 +143,11 @@ as a concise evidence ledger; roadmap stays for open gates only.
   truncated catalog heap bytes. Evidence:
   `cargo test -p ultrasql-catalog encoding::tests::truncated_payload_is_caught -- --nocapture`
   and `cargo clippy -p ultrasql-catalog --all-targets --all-features -- -D warnings`.
+- Catalog binary decoder length fields now use `Reader::usize_len`, so decoded
+  `u32` lengths return typed `DecodeError::LengthOverflow` on unsupported
+  targets instead of `expect`. Evidence:
+  `cargo test -p ultrasql-catalog encoding::tests::truncated_payload_is_caught -- --nocapture`
+  and `cargo clippy -p ultrasql-catalog --all-targets --all-features -- -D warnings`.
 - Backup/restore smoke runner covers `ultrasql --basebackup`,
   `ultrasql --pg-dump`, `ultrasql --pg-restore`, row counts, and indexed lookup.
 - Backup/restore dump-format certification now covers custom, directory, and

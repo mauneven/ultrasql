@@ -67,6 +67,15 @@ pub enum DecodeError {
     #[error("invalid UTF-8 in string field")]
     InvalidUtf8,
 
+    /// A decoded length cannot fit in memory on this target.
+    #[error("length {len} at offset {offset} does not fit usize")]
+    LengthOverflow {
+        /// Decoded length value.
+        len: u32,
+        /// Byte offset of the length field.
+        offset: usize,
+    },
+
     /// The decoded `Schema` could not be constructed from its
     /// `Field`s — duplicate column names typically.
     #[error("schema rebuild failed: {0}")]
@@ -174,6 +183,11 @@ impl<'a> Reader<'a> {
     }
     fn u32(&mut self) -> Result<u32, DecodeError> {
         Ok(u32::from_le_bytes(self.fixed()?))
+    }
+    fn usize_len(&mut self) -> Result<usize, DecodeError> {
+        let offset = self.pos;
+        let len = self.u32()?;
+        usize::try_from(len).map_err(|_| DecodeError::LengthOverflow { len, offset })
     }
     fn i64(&mut self) -> Result<i64, DecodeError> {
         Ok(i64::from_le_bytes(self.fixed()?))
@@ -418,8 +432,7 @@ fn decode_data_type(r: &mut Reader<'_>) -> Result<DataType, DecodeError> {
         DT_ENUM => {
             let oid = Oid::new(r.u32()?);
             let name = r.str()?;
-            let label_count =
-                usize::try_from(r.u32()?).expect("u32 fits in usize on supported targets");
+            let label_count = r.usize_len()?;
             let mut labels = Vec::with_capacity(label_count);
             for _ in 0..label_count {
                 labels.push(r.str()?);
@@ -433,8 +446,7 @@ fn decode_data_type(r: &mut Reader<'_>) -> Result<DataType, DecodeError> {
         DT_COMPOSITE => {
             let oid = Oid::new(r.u32()?);
             let name = r.str()?;
-            let field_count =
-                usize::try_from(r.u32()?).expect("u32 fits in usize on supported targets");
+            let field_count = r.usize_len()?;
             let mut fields = Vec::with_capacity(field_count);
             for _ in 0..field_count {
                 let field_name = r.str()?;
@@ -877,7 +889,7 @@ pub fn decode_index_row(bytes: &[u8]) -> Result<IndexRow, DecodeError> {
     let indisunique = r.bool()?;
     let indisprimary = r.bool()?;
     let indisvalid = r.bool()?;
-    let key_len = usize::try_from(r.u32()?).expect("u32 length fits usize on supported targets");
+    let key_len = r.usize_len()?;
     let mut indkey = Vec::with_capacity(key_len);
     for _ in 0..key_len {
         indkey.push(r.i16()?);
@@ -886,14 +898,12 @@ pub fn decode_index_row(bytes: &[u8]) -> Result<IndexRow, DecodeError> {
         ("btree".to_owned(), vec![None; indkey.len()], Vec::new())
     } else {
         let indmethod = r.str()?;
-        let opclass_len =
-            usize::try_from(r.u32()?).expect("u32 length fits usize on supported targets");
+        let opclass_len = r.usize_len()?;
         let mut indopclasses = Vec::with_capacity(opclass_len);
         for _ in 0..opclass_len {
             indopclasses.push(if r.bool()? { Some(r.str()?) } else { None });
         }
-        let option_len =
-            usize::try_from(r.u32()?).expect("u32 length fits usize on supported targets");
+        let option_len = r.usize_len()?;
         let mut indoptions = Vec::with_capacity(option_len);
         for _ in 0..option_len {
             indoptions.push((r.str()?, r.str()?));
@@ -949,7 +959,7 @@ fn write_i16_vec(w: &mut Writer<'_>, values: &[i16]) {
 }
 
 fn read_i16_vec(r: &mut Reader<'_>) -> Result<Vec<i16>, DecodeError> {
-    let len = usize::try_from(r.u32()?).expect("u32 length fits usize on supported targets");
+    let len = r.usize_len()?;
     let mut values = Vec::with_capacity(len);
     for _ in 0..len {
         values.push(r.i16()?);
@@ -1117,7 +1127,7 @@ pub fn decode_statistic_ext_row(bytes: &[u8]) -> Result<StatisticExtRow, DecodeE
     let oid = Oid::new(r.u32()?);
     let stxname = r.str()?;
     let stxrelid = Oid::new(r.u32()?);
-    let key_len = usize::try_from(r.u32()?).expect("u32 length fits usize on supported targets");
+    let key_len = r.usize_len()?;
     let mut stxkeys = Vec::with_capacity(key_len);
     for _ in 0..key_len {
         stxkeys.push(r.i16()?);
