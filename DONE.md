@@ -263,6 +263,11 @@ as a concise evidence ledger; roadmap stays for open gates only.
   `cargo test -p ultrasql-server csv_scan` and
   `cargo clippy -p ultrasql-server --lib --all-features -- -W
   clippy::expect_used -W clippy::unwrap_used`.
+- Swapped hash-join lowering now propagates schema-construction failures as
+  `ServerError::Execute` instead of panicking on `Schema::new`. Evidence:
+  `cargo test -p ultrasql-server join` and
+  `cargo clippy -p ultrasql-server --lib --all-features -- -W
+  clippy::expect_used -W clippy::unwrap_used`.
 
 ## Core SQL And Wire Protocol
 

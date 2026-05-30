@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use ultrasql_core::{DataType, Schema};
 use ultrasql_executor::{
-    HashJoin, MemTableScan, MergeJoin, NestedLoopJoin, Operator, Project, RightFactory,
+    ExecError, HashJoin, MemTableScan, MergeJoin, NestedLoopJoin, Operator, Project, RightFactory,
     WorkMemBudget,
 };
 use ultrasql_planner::{
@@ -293,7 +293,7 @@ fn build_swapped_inner_hash_join(
     } = args;
     let left_width = left_schema.len();
     let right_width = right_schema.len();
-    let swapped_schema = concat_schemas(&right_schema, &left_schema);
+    let swapped_schema = concat_schemas(&right_schema, &left_schema)?;
     let join = HashJoin::new_multi(
         right,
         left,
@@ -321,7 +321,7 @@ fn attach_work_mem(join: HashJoin, work_mem: &Option<Arc<WorkMemBudget>>) -> Has
     }
 }
 
-fn concat_schemas(left: &Schema, right: &Schema) -> Schema {
+fn concat_schemas(left: &Schema, right: &Schema) -> Result<Schema, ServerError> {
     let mut fields = Vec::with_capacity(left.len() + right.len());
     let left_names: std::collections::HashSet<String> = left
         .fields()
@@ -344,7 +344,8 @@ fn concat_schemas(left: &Schema, right: &Schema) -> Schema {
             nullable: field.nullable,
         });
     }
-    Schema::new(fields).expect("join schema concatenation must stay valid")
+    Schema::new(fields)
+        .map_err(|err| ServerError::Execute(ExecError::TypeMismatch(format!("join schema: {err}"))))
 }
 
 /// Drain `right` into a memory-resident batch list, then wrap the
