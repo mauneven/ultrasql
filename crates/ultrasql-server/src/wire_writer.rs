@@ -96,6 +96,9 @@ pub(crate) fn write_data_row_typed(
     schema: &Schema,
     row: usize,
 ) -> Result<(), ServerError> {
+    if batch_columns.len() != schema.len() {
+        return Err(wire_schema_column_mismatch_error());
+    }
     let row_start = sink.len();
     sink.put_u8(DATA_ROW_TAG);
     let length_index = sink.len();
@@ -314,6 +317,10 @@ fn write_cell_typed(
 
 fn wire_typed_cell_error() -> ServerError {
     ServerError::Execute(ExecError::Internal("wire typed cell encoding failed"))
+}
+
+fn wire_schema_column_mismatch_error() -> ServerError {
+    ServerError::Execute(ExecError::Internal("wire row schema-column mismatch"))
 }
 
 /// Whether the given row is SQL NULL per the column's optional null
@@ -635,6 +642,28 @@ mod tests {
 
         assert!(
             err.to_string().contains("wire typed cell encoding failed"),
+            "{err}"
+        );
+        assert!(
+            actual.is_empty(),
+            "failed row encoding must not leave partial wire bytes"
+        );
+    }
+
+    #[test]
+    fn write_data_row_typed_rejects_schema_column_mismatch_without_partial_row() {
+        let schema = Schema::new([Field::required("id", DataType::Int32)]).unwrap();
+        let cols = vec![
+            Column::Int32(NumericColumn::from_data(vec![1])),
+            Column::Int32(NumericColumn::from_data(vec![2])),
+        ];
+        let mut actual = BytesMut::new();
+
+        let err = write_data_row_typed(&mut actual, &cols, &schema, 0)
+            .expect_err("schema/column mismatch must be a typed wire error");
+
+        assert!(
+            err.to_string().contains("wire row schema-column mismatch"),
             "{err}"
         );
         assert!(

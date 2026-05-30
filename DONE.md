@@ -225,6 +225,11 @@ as a concise evidence ledger; roadmap stays for open gates only.
   corrupt `TIMETZ` physical payloads without a panic. Evidence:
   `cargo test -p ultrasql-server
   write_data_row_typed_rejects_invalid_timetz_payload_without_partial_row`.
+- SELECT wire streaming now validates schema and batch column arity before
+  touching the output buffer, returning a typed server error instead of
+  panicking through `Schema::field_at` on malformed operator output. Evidence:
+  `cargo test -p ultrasql-server
+  write_data_row_typed_rejects_schema_column_mismatch_without_partial_row`.
 
 ## Core SQL And Wire Protocol
 
