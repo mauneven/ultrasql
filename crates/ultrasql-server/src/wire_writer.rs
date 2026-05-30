@@ -99,6 +99,9 @@ pub(crate) fn write_data_row_typed(
     if batch_columns.len() != schema.len() {
         return Err(wire_schema_column_mismatch_error());
     }
+    if batch_columns.iter().any(|col| row >= col.len()) {
+        return Err(wire_row_index_out_of_bounds_error());
+    }
     let row_start = sink.len();
     sink.put_u8(DATA_ROW_TAG);
     let length_index = sink.len();
@@ -321,6 +324,10 @@ fn wire_typed_cell_error() -> ServerError {
 
 fn wire_schema_column_mismatch_error() -> ServerError {
     ServerError::Execute(ExecError::Internal("wire row schema-column mismatch"))
+}
+
+fn wire_row_index_out_of_bounds_error() -> ServerError {
+    ServerError::Execute(ExecError::Internal("wire row index out of bounds"))
 }
 
 /// Whether the given row is SQL NULL per the column's optional null
@@ -664,6 +671,25 @@ mod tests {
 
         assert!(
             err.to_string().contains("wire row schema-column mismatch"),
+            "{err}"
+        );
+        assert!(
+            actual.is_empty(),
+            "failed row encoding must not leave partial wire bytes"
+        );
+    }
+
+    #[test]
+    fn write_data_row_typed_rejects_row_index_out_of_bounds_without_partial_row() {
+        let schema = Schema::new([Field::required("id", DataType::Int32)]).unwrap();
+        let cols = vec![Column::Int32(NumericColumn::from_data(vec![1]))];
+        let mut actual = BytesMut::new();
+
+        let err = write_data_row_typed(&mut actual, &cols, &schema, 1)
+            .expect_err("row index past column length must be a typed wire error");
+
+        assert!(
+            err.to_string().contains("wire row index out of bounds"),
             "{err}"
         );
         assert!(
