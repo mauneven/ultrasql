@@ -111,7 +111,7 @@ impl<L: PageLoader> HeapAccess<L> {
             xid,
             prev_lsn,
             0,
-            payload.encode(),
+            payload.encode()?,
         );
         // FPW must succeed; if the sink rejects it the page mutation must not
         // proceed or the WAL would be missing the page image needed for recovery.

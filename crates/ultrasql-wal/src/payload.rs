@@ -199,7 +199,7 @@ impl HeapInsertPayload {
     /// the 24-bit wire field.
     pub fn encode(&self) -> Result<Vec<u8>, PayloadError> {
         let tuple_len = u32::try_from(self.tuple_bytes.len())
-            .expect("tuple_bytes length fits in u32 — enforced at construction");
+            .map_err(|_| PayloadError::Malformed("heap_insert tuple_len overflow"))?;
         let mut out = vec![0_u8; TID_SIZE + 4 + self.tuple_bytes.len()];
         let mut tid_buf = [0_u8; TID_SIZE];
         encode_tid(&mut tid_buf, self.tid)?;
@@ -300,7 +300,7 @@ impl HeapUpdatePayload {
     pub fn encode(&self) -> Result<Vec<u8>, PayloadError> {
         const FIXED: usize = TID_SIZE + TID_SIZE + 1 + 3 + 4; // 32
         let new_len = u32::try_from(self.new_tuple_bytes.len())
-            .expect("new_tuple_bytes length fits in u32 — enforced at construction");
+            .map_err(|_| PayloadError::Malformed("heap_update new_len overflow"))?;
         let mut out = vec![0_u8; FIXED + self.new_tuple_bytes.len()];
         let mut buf = [0_u8; TID_SIZE];
         encode_tid(&mut buf, self.old_tid)?;
@@ -569,7 +569,8 @@ impl HeapUpdateInPlaceBatchPayload {
         );
         write_u16_le(
             &mut out[PAGE_ID_SIZE + 12..PAGE_ID_SIZE + 14],
-            u16::try_from(Self::IMAGE_LEN).expect("image len fits u16"),
+            u16::try_from(Self::IMAGE_LEN)
+                .map_err(|_| PayloadError::Malformed("heap_update_in_place_batch image_len"))?,
         );
         write_u16_le(&mut out[PAGE_ID_SIZE + 14..PAGE_ID_SIZE + 16], 0);
         write_u32_le(&mut out[PAGE_ID_SIZE + 16..Self::FIXED], entry_count);
@@ -995,26 +996,23 @@ pub struct FullPageWritePayload {
 impl FullPageWritePayload {
     /// Encode this payload into a freshly-allocated byte vector.
     ///
-    /// # Panics
+    /// # Errors
     ///
-    /// Panics if `page_bytes.len() != PAGE_SIZE`. Callers must ensure the
-    /// page image is exactly [`PAGE_SIZE`] bytes before encoding.
-    pub fn encode(&self) -> Vec<u8> {
+    /// Returns [`PayloadError::Malformed`] if `page_bytes.len() != PAGE_SIZE`.
+    pub fn encode(&self) -> Result<Vec<u8>, PayloadError> {
         const FIXED: usize = PAGE_ID_SIZE + 4;
-        assert_eq!(
-            self.page_bytes.len(),
-            PAGE_SIZE,
-            "FullPageWritePayload::encode: page_bytes must be exactly PAGE_SIZE bytes"
-        );
+        if self.page_bytes.len() != PAGE_SIZE {
+            return Err(PayloadError::Malformed("fpw page_bytes length"));
+        }
         let page_bytes_len =
-            u32::try_from(PAGE_SIZE).expect("PAGE_SIZE fits in u32 — invariant of the type system");
+            u32::try_from(PAGE_SIZE).map_err(|_| PayloadError::Malformed("fpw page size"))?;
         let mut out = vec![0_u8; FIXED + PAGE_SIZE];
         let mut pid_buf = [0_u8; PAGE_ID_SIZE];
         encode_page_id(&mut pid_buf, self.page);
         out[..PAGE_ID_SIZE].copy_from_slice(&pid_buf);
         write_u32_le(&mut out[PAGE_ID_SIZE..PAGE_ID_SIZE + 4], page_bytes_len);
         out[FIXED..].copy_from_slice(&self.page_bytes);
-        out
+        Ok(out)
     }
 
     /// Decode a `FullPageWritePayload` from a byte slice.
@@ -2155,7 +2153,10 @@ mod tests {
             page: page_id(1, 0),
             page_bytes: vec![0_u8; PAGE_SIZE],
         };
-        assert_eq!(FullPageWritePayload::decode(&p.encode()).unwrap(), p);
+        assert_eq!(
+            FullPageWritePayload::decode(&p.encode().unwrap()).unwrap(),
+            p
+        );
     }
 
     #[test]
@@ -2164,7 +2165,10 @@ mod tests {
             page: page_id(7, 255),
             page_bytes: full_page(),
         };
-        assert_eq!(FullPageWritePayload::decode(&p.encode()).unwrap(), p);
+        assert_eq!(
+            FullPageWritePayload::decode(&p.encode().unwrap()).unwrap(),
+            p
+        );
     }
 
     #[test]
@@ -2290,7 +2294,7 @@ mod tests {
             page: page_id(1, 0),
             page_bytes: full_page(),
         };
-        let mut raw = p.encode();
+        let mut raw = p.encode().unwrap();
         raw.truncate(raw.len() - 1);
         let err = FullPageWritePayload::decode(&raw).unwrap_err();
         assert!(matches!(err, PayloadError::Truncated { .. }), "got {err:?}");

@@ -616,7 +616,7 @@ mod tests {
             page: page_id(5, 10),
             page_bytes: vec![0xAB_u8; PAGE_SIZE],
         };
-        let rec = make_record(RecordType::FullPageWrite, fpw_payload.encode());
+        let rec = make_record(RecordType::FullPageWrite, fpw_payload.encode().unwrap());
         dispatch_record(&mock, &rec).unwrap();
 
         // Commit

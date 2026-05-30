@@ -373,6 +373,15 @@ as a concise evidence ledger; roadmap stays for open gates only.
   impossible conversion failures. Evidence:
   `cargo test -p ultrasql-core --lib` and
   `cargo clippy -p ultrasql-core --all-targets --all-features -- -D warnings`.
+- WAL typed payload encoders now reject oversized heap tuple lengths and
+  malformed full-page-write page images with `PayloadError` instead of
+  panicking; storage FPW emission propagates the typed encode error. Evidence:
+  `cargo test -p ultrasql-wal payload`,
+  `cargo test -p ultrasql-wal applier`,
+  `cargo test -p ultrasql-storage wal_emit`,
+  `cargo clippy -p ultrasql-wal --all-targets --all-features -- -D warnings`,
+  and `cargo clippy -p ultrasql-storage --all-targets --all-features -- -D
+  warnings`.
 
 ## Core SQL And Wire Protocol
 
