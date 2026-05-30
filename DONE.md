@@ -285,6 +285,12 @@ as a concise evidence ledger; roadmap stays for open gates only.
   `cargo test -p ultrasql-server pipeline::tests::tpch_sidecars` and
   `cargo clippy -p ultrasql-server --lib --all-features -- -W
   clippy::expect_used -W clippy::unwrap_used`.
+- Time-partition INSERT affected-row schema construction now logs and falls
+  back to an empty schema instead of panicking on an impossible static schema
+  failure. Evidence:
+  `cargo test -p ultrasql-server time_partition` and
+  `cargo clippy -p ultrasql-server --lib --all-features -- -W
+  clippy::expect_used -W clippy::unwrap_used`.
 
 ## Core SQL And Wire Protocol
 

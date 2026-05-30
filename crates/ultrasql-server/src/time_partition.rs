@@ -308,8 +308,13 @@ fn partition_key_us(row: &[Value], idx: usize) -> Result<i64, ExecError> {
 }
 
 fn affected_rows_schema() -> Schema {
-    Schema::new([Field::required("affected_rows", DataType::Int64)])
-        .expect("affected_rows schema is valid")
+    match Schema::new([Field::required("affected_rows", DataType::Int64)]) {
+        Ok(schema) => schema,
+        Err(err) => {
+            tracing::error!(error = %err, "time-partition affected_rows schema failed");
+            Schema::empty()
+        }
+    }
 }
 
 fn check_not_null_violations(row: &[Value], schema: &Schema) -> Result<(), ExecError> {
