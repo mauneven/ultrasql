@@ -28,7 +28,6 @@ SELECT id, score FROM slt_pg_select WHERE score IS NOT NULL ORDER BY score DESC,
 2
 3
 
-# ultrasql:skip row-value IN support not implemented yet
 query I rowsort
 SELECT id FROM slt_pg_select WHERE (id, score) IN ((1, 42), (3, 10), (5, 0))
 ----

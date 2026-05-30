@@ -110,3 +110,36 @@ async fn select_where_is_not_null_round_trip() {
 
     shutdown(running).await;
 }
+
+/// Row-value `IN` compares tuple fields and preserves SQL NULL semantics.
+#[tokio::test]
+async fn select_where_row_value_in_round_trip() {
+    let running = start_sample_server("select_constants_test").await;
+    let client = &running.client;
+
+    client
+        .batch_execute("CREATE TABLE row_value_in (id INT NOT NULL, score INT)")
+        .await
+        .expect("create table");
+    client
+        .batch_execute(
+            "INSERT INTO row_value_in VALUES \
+             (1, 42), (2, 3), (3, 10), (4, 7), (5, NULL)",
+        )
+        .await
+        .expect("insert rows");
+
+    let rows = client
+        .query(
+            "SELECT id FROM row_value_in \
+             WHERE (id, score) IN ((1, 42), (3, 10), (5, 0)) \
+             ORDER BY id",
+            &[],
+        )
+        .await
+        .expect("row-value IN query");
+    let ids: Vec<i32> = rows.iter().map(|row| row.get::<_, i32>(0)).collect();
+    assert_eq!(ids, vec![1, 3]);
+
+    shutdown(running).await;
+}

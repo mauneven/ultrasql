@@ -157,6 +157,9 @@ as a concise evidence ledger; roadmap stays for open gates only.
 - Parser, binder, optimizer, executor, storage, MVCC, WAL, catalog, protocol,
   server, CLI, and benchmark crates have working public surfaces and regression
   tests.
+- Row-value `IN` over tuple lists now binds through row constructors, evaluates
+  record equality with SQL three-valued field semantics, passes wire coverage,
+  and removes the public select-regression skip.
 
 ## Type And Function Surface
 

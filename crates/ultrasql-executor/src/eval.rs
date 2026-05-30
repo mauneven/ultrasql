@@ -3173,8 +3173,8 @@ fn apply_binary(op: BinaryOp, lv: Value, rv: Value) -> Result<Value, EvalError> 
         // ------------------------------------------------------------------
         // Comparison
         // ------------------------------------------------------------------
-        BinaryOp::Eq => value_compare(&lv, &rv, |c| c == std::cmp::Ordering::Equal),
-        BinaryOp::NotEq => value_compare(&lv, &rv, |c| c != std::cmp::Ordering::Equal),
+        BinaryOp::Eq => value_eq(&lv, &rv),
+        BinaryOp::NotEq => value_not_eq(&lv, &rv),
         BinaryOp::Lt => value_compare(&lv, &rv, |c| c == std::cmp::Ordering::Less),
         BinaryOp::LtEq => value_compare(&lv, &rv, |c| {
             matches!(c, std::cmp::Ordering::Less | std::cmp::Ordering::Equal)
@@ -4472,6 +4472,55 @@ fn value_compare(
     Ok(Value::Bool(test(ord)))
 }
 
+fn value_eq(lv: &Value, rv: &Value) -> Result<Value, EvalError> {
+    sql_eq_3vl(lv, rv).map(bool_or_null)
+}
+
+fn value_not_eq(lv: &Value, rv: &Value) -> Result<Value, EvalError> {
+    sql_eq_3vl(lv, rv).map(|result| bool_or_null(result.map(|eq| !eq)))
+}
+
+fn bool_or_null(value: Option<bool>) -> Value {
+    value.map_or(Value::Null, Value::Bool)
+}
+
+fn sql_eq_3vl(lv: &Value, rv: &Value) -> Result<Option<bool>, EvalError> {
+    if matches!((lv, rv), (Value::Null, _) | (_, Value::Null)) {
+        return Ok(None);
+    }
+    match (lv, rv) {
+        (Value::Record(left), Value::Record(right)) => record_eq_3vl(left, right),
+        (Value::Record(_), _) | (_, Value::Record(_)) => Err(EvalError::Type(format!(
+            "record comparison type mismatch: {lv:?} and {rv:?}"
+        ))),
+        _ => compare_values(lv, rv).map(|ordering| Some(ordering == std::cmp::Ordering::Equal)),
+    }
+}
+
+fn record_eq_3vl(
+    left: &[(String, Value)],
+    right: &[(String, Value)],
+) -> Result<Option<bool>, EvalError> {
+    if left.len() != right.len() {
+        return Err(EvalError::Type(format!(
+            "record arity mismatch: {} and {}",
+            left.len(),
+            right.len()
+        )));
+    }
+
+    let mut saw_unknown = false;
+    for ((_, left_value), (_, right_value)) in left.iter().zip(right.iter()) {
+        match sql_eq_3vl(left_value, right_value)? {
+            Some(true) => {}
+            Some(false) => return Ok(Some(false)),
+            None => saw_unknown = true,
+        }
+    }
+
+    Ok((!saw_unknown).then_some(true))
+}
+
 /// Total ordering for Value pairs of the same type.
 ///
 /// Only types that have a natural total order are supported. Mismatched
@@ -4847,6 +4896,25 @@ mod tests {
                     .collect(),
             },
             data_type: DataType::Array(Box::new(DataType::Text { max_len: None })),
+        }
+    }
+
+    fn lit_record(values: Vec<Value>) -> ScalarExpr {
+        ScalarExpr::Literal {
+            data_type: DataType::Record(
+                values
+                    .iter()
+                    .enumerate()
+                    .map(|(idx, value)| (format!("f{}", idx + 1), value.data_type()))
+                    .collect(),
+            ),
+            value: Value::Record(
+                values
+                    .into_iter()
+                    .enumerate()
+                    .map(|(idx, value)| (format!("f{}", idx + 1), value))
+                    .collect(),
+            ),
         }
     }
 
@@ -6622,6 +6690,30 @@ mod tests {
     fn null_eq_null_returns_null() {
         let ev = Eval::new(binop(BinaryOp::Eq, lit_null(), lit_null()));
         assert_eq!(ev.eval(&[]).unwrap(), Value::Null);
+    }
+
+    #[test]
+    fn record_eq_uses_three_valued_field_semantics() {
+        let equal = Eval::new(binop(
+            BinaryOp::Eq,
+            lit_record(vec![Value::Int32(5), Value::Int32(10)]),
+            lit_record(vec![Value::Int32(5), Value::Int32(10)]),
+        ));
+        assert_eq!(equal.eval(&[]).unwrap(), Value::Bool(true));
+
+        let unknown = Eval::new(binop(
+            BinaryOp::Eq,
+            lit_record(vec![Value::Int32(5), Value::Null]),
+            lit_record(vec![Value::Int32(5), Value::Int32(10)]),
+        ));
+        assert_eq!(unknown.eval(&[]).unwrap(), Value::Null);
+
+        let different = Eval::new(binop(
+            BinaryOp::Eq,
+            lit_record(vec![Value::Int32(5), Value::Null]),
+            lit_record(vec![Value::Int32(6), Value::Null]),
+        ));
+        assert_eq!(different.eval(&[]).unwrap(), Value::Bool(false));
     }
 
     // -----------------------------------------------------------------------
