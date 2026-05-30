@@ -59,8 +59,11 @@ use ultrasql_core::{BlockNumber, Error, PageId, RelationId, Result, SegmentId};
 use crate::buffer_pool::PageLoader;
 use crate::page::{Page, PageError};
 
-fn page_size_u64() -> u64 {
-    u64::try_from(PAGE_SIZE).expect("PAGE_SIZE fits in u64 on supported targets")
+const PAGE_SIZE_U64: u64 = 8_192;
+const _: () = assert!(PAGE_SIZE == 8_192);
+
+const fn page_size_u64() -> u64 {
+    PAGE_SIZE_U64
 }
 
 /// Default number of pages per segment file (1 GiB at 8 KiB pages).

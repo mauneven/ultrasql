@@ -393,6 +393,13 @@ as a concise evidence ledger; roadmap stays for open gates only.
   `cargo test -p ultrasql-objectstore --lib` and
   `cargo clippy -p ultrasql-objectstore --all-targets --all-features -- -D
   warnings`.
+- Storage page allocation and in-page item-id decoding now avoid heap-vector
+  conversion and fixed-slice `expect` paths; segment page-size arithmetic uses
+  an explicit compile-time checked `u64` constant. Evidence:
+  `cargo test -p ultrasql-storage page`,
+  `cargo test -p ultrasql-storage segment`, and
+  `cargo clippy -p ultrasql-storage --all-targets --all-features -- -D
+  warnings`.
 
 ## Core SQL And Wire Protocol
 

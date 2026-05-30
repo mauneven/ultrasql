@@ -360,10 +360,7 @@ impl Page {
     /// Allocate a freshly-initialized empty heap page.
     #[must_use]
     pub fn new_heap() -> Self {
-        let bytes: Box<[u8; PAGE_SIZE]> = vec![0_u8; PAGE_SIZE]
-            .into_boxed_slice()
-            .try_into()
-            .expect("allocation matches PAGE_SIZE");
+        let bytes: Box<[u8; PAGE_SIZE]> = Box::new([0_u8; PAGE_SIZE]);
         let mut page = Self { bytes };
         PageHeader::fresh_heap().encode(&mut page.bytes);
         page
@@ -650,7 +647,12 @@ impl Page {
 
     fn read_item_id(&self, slot: SlotIndex) -> ItemId {
         let off = Self::item_id_offset(slot);
-        let raw = read_u32_le(&self.bytes[off..off + ITEMID_SIZE]).expect("in-page read");
+        let raw = u32::from_le_bytes([
+            self.bytes[off],
+            self.bytes[off + 1],
+            self.bytes[off + 2],
+            self.bytes[off + 3],
+        ]);
         ItemId::from_raw(raw)
     }
 
