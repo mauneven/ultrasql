@@ -158,6 +158,9 @@ as a concise evidence ledger; roadmap stays for open gates only.
 - `WindowAgg` now propagates partition-key, order-key, and window value
   expression failures instead of silently returning NULL/default values.
   Evidence: `cargo test -p ultrasql-executor window_agg`.
+- `TidBitmap` now returns checked `ExecError` values for out-of-range row
+  setting and capacity-mismatch merges instead of panicking. Evidence:
+  `cargo test -p ultrasql-executor bitmap_heap_scan`.
 
 ## Core SQL And Wire Protocol
 

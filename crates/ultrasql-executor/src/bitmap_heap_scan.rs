@@ -58,12 +58,18 @@ impl TidBitmap {
 
     /// Set the bit for row `i`.
     ///
-    /// # Panics
+    /// # Errors
     ///
-    /// Panics if `i >= capacity`.
-    pub fn set(&mut self, i: usize) {
-        assert!(i < self.capacity, "TidBitmap: row index {i} out of range");
+    /// Returns [`ExecError::TypeMismatch`] if `i >= capacity`.
+    pub fn set(&mut self, i: usize) -> Result<(), ExecError> {
+        if i >= self.capacity {
+            return Err(ExecError::TypeMismatch(format!(
+                "TidBitmap: row index {i} out of range for capacity {}",
+                self.capacity
+            )));
+        }
         self.words[i / 64] |= 1_u64 << (i % 64);
+        Ok(())
     }
 
     /// Test bit `i`.
@@ -79,32 +85,30 @@ impl TidBitmap {
 
     /// Merge with `other` using bitwise OR (union of matching rows).
     ///
-    /// # Panics
+    /// # Errors
     ///
-    /// Panics if the two bitmaps have different capacities.
-    pub fn or_merge(&mut self, other: &Self) {
-        assert_eq!(
-            self.capacity, other.capacity,
-            "TidBitmap::or_merge: capacity mismatch"
-        );
+    /// Returns [`ExecError::TypeMismatch`] when the two bitmaps have different
+    /// capacities.
+    pub fn or_merge(&mut self, other: &Self) -> Result<(), ExecError> {
+        ensure_same_capacity("TidBitmap::or_merge", self.capacity, other.capacity)?;
         for (w, &v) in self.words.iter_mut().zip(other.words.iter()) {
             *w |= v;
         }
+        Ok(())
     }
 
     /// Merge with `other` using bitwise AND (intersection of matching rows).
     ///
-    /// # Panics
+    /// # Errors
     ///
-    /// Panics if the two bitmaps have different capacities.
-    pub fn and_merge(&mut self, other: &Self) {
-        assert_eq!(
-            self.capacity, other.capacity,
-            "TidBitmap::and_merge: capacity mismatch"
-        );
+    /// Returns [`ExecError::TypeMismatch`] when the two bitmaps have different
+    /// capacities.
+    pub fn and_merge(&mut self, other: &Self) -> Result<(), ExecError> {
+        ensure_same_capacity("TidBitmap::and_merge", self.capacity, other.capacity)?;
         for (w, &v) in self.words.iter_mut().zip(other.words.iter()) {
             *w &= v;
         }
+        Ok(())
     }
 
     /// Iterate over set row indices in ascending order.
@@ -116,6 +120,19 @@ impl TidBitmap {
             current: self.words.first().copied().unwrap_or(0),
         }
     }
+}
+
+fn ensure_same_capacity(
+    operation: &'static str,
+    left: usize,
+    right: usize,
+) -> Result<(), ExecError> {
+    if left == right {
+        return Ok(());
+    }
+    Err(ExecError::TypeMismatch(format!(
+        "{operation}: capacity mismatch ({left} != {right})"
+    )))
 }
 
 struct TidBitmapIter<'a> {
@@ -179,15 +196,20 @@ impl BitmapIndexScan {
     }
 
     /// Run the index scan and return a `TidBitmap` of matching rows.
-    pub fn scan(&self) -> TidBitmap {
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ExecError::TypeMismatch`] if bitmap construction observes an
+    /// impossible row index outside the bitmap capacity.
+    pub fn scan(&self) -> Result<TidBitmap, ExecError> {
         let n = self.rows.len();
         let mut bm = TidBitmap::new(n);
         for (i, row) in self.rows.iter().enumerate() {
             if (self.predicate)(row) {
-                bm.set(i);
+                bm.set(i)?;
             }
         }
-        bm
+        Ok(bm)
     }
 }
 
@@ -255,7 +277,9 @@ impl Operator for BitmapHeapScan {
             self.iter_pos = Some(Box::new(indices.into_iter()));
         }
 
-        let iter = self.iter_pos.as_mut().expect("just set");
+        let iter = self.iter_pos.as_mut().ok_or(ExecError::Internal(
+            "bitmap heap scan iterator missing after initialization",
+        ))?;
         let mut chunk: Vec<Vec<Value>> = Vec::with_capacity(BATCH_TARGET_ROWS);
         for idx in iter.by_ref().take(BATCH_TARGET_ROWS) {
             if idx < self.rows.len() {
@@ -412,10 +436,10 @@ mod tests {
     #[test]
     fn tid_bitmap_set_and_get() {
         let mut bm = TidBitmap::new(128);
-        bm.set(0);
-        bm.set(63);
-        bm.set(64);
-        bm.set(127);
+        bm.set(0).expect("set row 0");
+        bm.set(63).expect("set row 63");
+        bm.set(64).expect("set row 64");
+        bm.set(127).expect("set row 127");
         assert!(bm.get(0));
         assert!(bm.get(63));
         assert!(bm.get(64));
@@ -428,19 +452,29 @@ mod tests {
     fn tid_bitmap_iter_ones_ascending() {
         let mut bm = TidBitmap::new(200);
         for i in [5_usize, 13, 64, 100, 199] {
-            bm.set(i);
+            bm.set(i).expect("set row");
         }
         let got: Vec<usize> = bm.iter_ones().collect();
         assert_eq!(got, vec![5, 13, 64, 100, 199]);
     }
 
     #[test]
+    fn tid_bitmap_rejects_out_of_range_set_without_panic() {
+        let mut bm = TidBitmap::new(2);
+        let err = bm.set(2).expect_err("out of range row must error");
+        assert!(
+            err.to_string().contains("row index 2 out of range"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
     fn tid_bitmap_or_merge() {
         let mut a = TidBitmap::new(64);
         let mut b = TidBitmap::new(64);
-        a.set(1);
-        b.set(3);
-        a.or_merge(&b);
+        a.set(1).expect("set a");
+        b.set(3).expect("set b");
+        a.or_merge(&b).expect("or merge");
         assert!(a.get(1));
         assert!(a.get(3));
     }
@@ -449,14 +483,33 @@ mod tests {
     fn tid_bitmap_and_merge() {
         let mut a = TidBitmap::new(64);
         let mut b = TidBitmap::new(64);
-        a.set(1);
-        a.set(2);
-        b.set(2);
-        b.set(3);
-        a.and_merge(&b);
+        a.set(1).expect("set a1");
+        a.set(2).expect("set a2");
+        b.set(2).expect("set b2");
+        b.set(3).expect("set b3");
+        a.and_merge(&b).expect("and merge");
         assert!(!a.get(1));
         assert!(a.get(2));
         assert!(!a.get(3));
+    }
+
+    #[test]
+    fn tid_bitmap_rejects_capacity_mismatch_merge_without_panic() {
+        let mut a = TidBitmap::new(64);
+        let b = TidBitmap::new(65);
+
+        let or_err = a.or_merge(&b).expect_err("or capacity mismatch must error");
+        assert!(
+            or_err.to_string().contains("capacity mismatch"),
+            "unexpected error: {or_err}"
+        );
+        let and_err = a
+            .and_merge(&b)
+            .expect_err("and capacity mismatch must error");
+        assert!(
+            and_err.to_string().contains("capacity mismatch"),
+            "unexpected error: {and_err}"
+        );
     }
 
     // ---- BitmapIndexScan + BitmapHeapScan ----
@@ -474,10 +527,10 @@ mod tests {
             all_rows.clone(),
             Box::new(|row| matches!(&row[0], Value::Int32(v) if v % 5 == 0)),
         );
-        let mut bm1 = scan1.scan();
-        let bm2 = scan2.scan();
+        let mut bm1 = scan1.scan().expect("scan 1");
+        let bm2 = scan2.scan().expect("scan 2");
         // Combine with OR (rows divisible by 3 OR by 5).
-        bm1.or_merge(&bm2);
+        bm1.or_merge(&bm2).expect("or merge");
 
         let mut heap_scan = BitmapHeapScan::new(all_rows, bm1, schema_id_val());
 
@@ -507,7 +560,7 @@ mod tests {
             all_rows.clone(),
             Box::new(|_| true), // all rows
         );
-        let bm = scan.scan();
+        let bm = scan.scan().expect("scan");
         let mut heap_scan = BitmapHeapScan::new(all_rows, bm, schema_id_val());
         let mut batch_sizes = Vec::new();
         while let Some(b) = heap_scan.next_batch().unwrap() {
