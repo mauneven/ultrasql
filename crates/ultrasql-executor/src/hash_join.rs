@@ -999,6 +999,20 @@ fn build_join_key(evals: &[Eval], row: &[Value]) -> Result<Option<JoinKey>, Exec
 #[derive(Clone, Debug)]
 struct OrderedValue(Value);
 
+fn canonical_decimal_key(value: i64, scale: i32) -> (i128, i64) {
+    let mut significand = i128::from(value);
+    if significand == 0 {
+        return (0, 0);
+    }
+
+    let mut scale = i64::from(scale);
+    while significand % 10 == 0 {
+        significand /= 10;
+        scale -= 1;
+    }
+    (significand, scale)
+}
+
 impl PartialEq for OrderedValue {
     fn eq(&self, other: &Self) -> bool {
         match (&self.0, &other.0) {
@@ -1007,6 +1021,19 @@ impl PartialEq for OrderedValue {
             (Value::Float64(a), Value::Float64(b)) => a.to_bits() == b.to_bits(),
             (Value::Vector(a), Value::Vector(b)) | (Value::HalfVec(a), Value::HalfVec(b)) => {
                 a.len() == b.len() && a.iter().zip(b).all(|(l, r)| l.to_bits() == r.to_bits())
+            }
+            (
+                Value::Decimal {
+                    value: left_value,
+                    scale: left_scale,
+                },
+                Value::Decimal {
+                    value: right_value,
+                    scale: right_scale,
+                },
+            ) => {
+                canonical_decimal_key(*left_value, *left_scale)
+                    == canonical_decimal_key(*right_value, *right_scale)
             }
             (Value::Char(a), Value::Text(b)) => bpchar_semantic_text(a) == b,
             (Value::Text(a), Value::Char(b)) => a == bpchar_semantic_text(b),
@@ -1111,6 +1138,7 @@ impl std::hash::Hash for OrderedValue {
             }
             Value::Decimal { value, scale } => {
                 state.write_u8(12);
+                let (value, scale) = canonical_decimal_key(*value, *scale);
                 value.hash(state);
                 scale.hash(state);
             }
@@ -1219,6 +1247,25 @@ mod tests {
         Schema::new([Field::required("val", DataType::Int32)]).expect("schema ok")
     }
 
+    fn decimal_type(scale: i32) -> DataType {
+        DataType::Decimal {
+            precision: None,
+            scale: Some(scale),
+        }
+    }
+
+    fn schema_decimal(name: &str, scale: i32) -> Schema {
+        Schema::new([Field::required(name, decimal_type(scale))]).expect("schema ok")
+    }
+
+    fn schema_joined_decimals(left_scale: i32, right_scale: i32) -> Schema {
+        Schema::new([
+            Field::required("id", decimal_type(left_scale)),
+            Field::required("val", decimal_type(right_scale)),
+        ])
+        .expect("schema ok")
+    }
+
     fn schema_id_val() -> Schema {
         Schema::new([
             Field::required("id", DataType::Int32),
@@ -1249,6 +1296,10 @@ mod tests {
         Batch::new([Column::Int32(NumericColumn::from_data(rows.to_vec()))]).expect("batch ok")
     }
 
+    fn decimal_batch(rows: &[i64]) -> Batch {
+        Batch::new([Column::Int64(NumericColumn::from_data(rows.to_vec()))]).expect("batch ok")
+    }
+
     fn i32_pair_batch(rows: &[(i32, i32)]) -> Batch {
         let first = rows.iter().map(|(a, _)| *a).collect::<Vec<_>>();
         let second = rows.iter().map(|(_, b)| *b).collect::<Vec<_>>();
@@ -1268,6 +1319,14 @@ mod tests {
             name: name.into(),
             index,
             data_type: DataType::Int32,
+        }
+    }
+
+    fn col_decimal(name: &str, index: usize, scale: i32) -> ScalarExpr {
+        ScalarExpr::Column {
+            name: name.into(),
+            index,
+            data_type: decimal_type(scale),
         }
     }
 
@@ -1349,6 +1408,26 @@ mod tests {
         out
     }
 
+    fn drain_decimal_pairs(op: &mut dyn Operator) -> Vec<((i64, i32), (i64, i32))> {
+        let schema = op.schema().clone();
+        let mut out = Vec::new();
+        while let Some(batch) = op.next_batch().expect("no error") {
+            let rows = crate::filter_op::batch_to_rows(&batch, &schema).expect("decode ok");
+            for row in rows {
+                let left = match &row[0] {
+                    Value::Decimal { value, scale } => (*value, *scale),
+                    other => panic!("unexpected left value: {other:?}"),
+                };
+                let right = match &row[1] {
+                    Value::Decimal { value, scale } => (*value, *scale),
+                    other => panic!("unexpected right value: {other:?}"),
+                };
+                out.push((left, right));
+            }
+        }
+        out
+    }
+
     // -------------------------------------------------------------------------
     // Test 1: INNER hash join happy path
     // -------------------------------------------------------------------------
@@ -1372,6 +1451,26 @@ mod tests {
         let mut rows = drain_rows(&mut op);
         rows.sort_unstable();
         assert_eq!(rows, vec![(2, 2), (3, 3)]);
+    }
+
+    #[test]
+    fn hash_join_matches_decimal_keys_across_scales() {
+        let left_schema = schema_decimal("id", 1);
+        let right_schema = schema_decimal("val", 0);
+        let left = MemTableScan::new(left_schema.clone(), vec![decimal_batch(&[10, 25])]);
+        let right = MemTableScan::new(right_schema.clone(), vec![decimal_batch(&[1, 3])]);
+        let mut op = HashJoin::new(
+            Box::new(left),
+            Box::new(right),
+            col_decimal("id", 0, 1),
+            col_decimal("val", 0, 0),
+            LogicalJoinType::Inner,
+            schema_joined_decimals(1, 0),
+            left_schema,
+            right_schema,
+        );
+
+        assert_eq!(drain_decimal_pairs(&mut op), vec![((10, 1), (1, 0))]);
     }
 
     #[test]

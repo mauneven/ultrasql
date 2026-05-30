@@ -184,6 +184,11 @@ as a concise evidence ledger; roadmap stays for open gates only.
   comparisons. Evidence:
   `cargo test -p ultrasql-executor decimal_compare_handles_large_scale_gap_without_overflow`
   and `cargo test -p ultrasql-executor eval`.
+- Hash join keys now canonicalize decimal `NUMERIC` values before equality and
+  hashing, so values such as `1.0` and `1` match without scale-sensitive false
+  negatives. Evidence:
+  `cargo test -p ultrasql-executor hash_join_matches_decimal_keys_across_scales`
+  and `cargo test -p ultrasql-executor hash_join`.
 
 ## Core SQL And Wire Protocol
 
