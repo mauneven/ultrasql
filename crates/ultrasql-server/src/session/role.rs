@@ -214,7 +214,7 @@ fn build_role_entry(
         entry.connection_limit = value;
     }
     if let Some(password) = &options.password {
-        entry.password = hash_role_password(password.as_deref());
+        entry.password = hash_role_password(password.as_deref())?;
     }
     if let Some(value) = &options.valid_until {
         entry.valid_until = parse_valid_until(value)?;
@@ -230,7 +230,8 @@ fn build_role_changes(options: &LogicalRoleOptions) -> Result<RoleEntryChanges, 
         password: options
             .password
             .as_ref()
-            .map(|password| hash_role_password(password.as_deref())),
+            .map(|password| hash_role_password(password.as_deref()))
+            .transpose()?,
         is_superuser: options.superuser,
         inherit: options.inherit,
         create_role: options.create_role,
@@ -247,11 +248,14 @@ fn build_role_changes(options: &LogicalRoleOptions) -> Result<RoleEntryChanges, 
     })
 }
 
-fn hash_role_password(password: Option<&str>) -> Option<PasswordHash> {
-    password.map(|plaintext| {
-        let salt = PasswordHash::random_salt();
-        PasswordHash::hash_password(plaintext, &salt, DEFAULT_ITERATIONS)
-    })
+fn hash_role_password(password: Option<&str>) -> Result<Option<PasswordHash>, ServerError> {
+    let Some(plaintext) = password else {
+        return Ok(None);
+    };
+    let salt = PasswordHash::random_salt();
+    PasswordHash::hash_password(plaintext, &salt, DEFAULT_ITERATIONS)
+        .map(Some)
+        .map_err(|err| ServerError::ddl(format!("role password hashing failed: {err}")))
 }
 
 fn validate_connection_limit(value: i32) -> Result<(), ServerError> {

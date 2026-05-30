@@ -297,6 +297,12 @@ as a concise evidence ledger; roadmap stays for open gates only.
   `cargo test -p ultrasql-server catalog_views` and
   `cargo clippy -p ultrasql-server --lib --all-features -- -W
   clippy::expect_used -W clippy::unwrap_used`.
+- SCRAM password hashing and proof verification now propagate HMAC/PBKDF2
+  initialization failures through `AuthError`/`ServerError` instead of using
+  production `expect` in auth crypto paths. Evidence:
+  `cargo test -p ultrasql-server scram` and
+  `cargo clippy -p ultrasql-server --lib --all-features -- -W
+  clippy::expect_used -W clippy::unwrap_used`.
 
 ## Core SQL And Wire Protocol
 

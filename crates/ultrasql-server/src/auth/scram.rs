@@ -23,7 +23,7 @@
 //! use ultrasql_server::auth::pg_authid::PasswordHash;
 //! // Derive keys from a password.
 //! let salt = PasswordHash::random_salt();
-//! let ph   = PasswordHash::hash_password("s3cr3t", &salt, 4096);
+//! let ph   = PasswordHash::hash_password("s3cr3t", &salt, 4096).expect("hash password");
 //! let mut server = ScramSha256Server::new(
 //!     ph.stored_key, ph.server_key, ph.salt.clone(), ph.iterations,
 //! );
@@ -73,16 +73,20 @@ pub enum AuthError {
     /// A base64 payload could not be decoded.
     #[error("base64 decode error")]
     Base64,
+
+    /// Cryptographic primitive initialization failed.
+    #[error("crypto error: {0}")]
+    Crypto(&'static str),
 }
 
 // ── Internal helpers ──────────────────────────────────────────────────────────
 
 /// Compute `HMAC-SHA-256(key, data)` and return the 32-byte tag.
-fn hmac_sha256(key: &[u8], data: &[u8]) -> [u8; 32] {
-    let mut mac =
-        Hmac::<Sha256>::new_from_slice(key).expect("HMAC accepts any key length; infallible");
+fn hmac_sha256(key: &[u8], data: &[u8]) -> Result<[u8; 32], AuthError> {
+    let mut mac = Hmac::<Sha256>::new_from_slice(key)
+        .map_err(|_| AuthError::Crypto("HMAC-SHA-256 key initialization failed"))?;
     mac.update(data);
-    mac.finalize().into_bytes().into()
+    Ok(mac.finalize().into_bytes().into())
 }
 
 /// XOR two 32-byte arrays in place: `a ^= b`.
@@ -134,19 +138,18 @@ impl PasswordHash {
     /// Derive `StoredKey` and `ServerKey` from a plaintext `password`,
     /// `salt`, and `iterations` using PBKDF2-HMAC-SHA-256.
     ///
-    /// # Panics
+    /// # Errors
     ///
-    /// Never panics. PBKDF2 with HMAC-SHA-256 is always valid for any
-    /// combination of password, salt, and positive iteration count.
-    #[must_use]
-    pub fn hash_password(password: &str, salt: &[u8], iterations: u32) -> Self {
+    /// Returns [`AuthError::Crypto`] if the underlying HMAC/PBKDF2 primitive
+    /// rejects its parameters.
+    pub fn hash_password(password: &str, salt: &[u8], iterations: u32) -> Result<Self, AuthError> {
         // SaltedPassword = PBKDF2(password, salt, iterations, hashlen)
         let mut salted_password = [0u8; SHA256_OUTPUT_LEN];
         pbkdf2::pbkdf2::<Hmac<Sha256>>(password.as_bytes(), salt, iterations, &mut salted_password)
-            .expect("PBKDF2 with SHA-256 always succeeds for valid iteration count");
+            .map_err(|_| AuthError::Crypto("PBKDF2-HMAC-SHA-256 failed"))?;
 
         // ClientKey = HMAC(SaltedPassword, "Client Key")
-        let client_key = hmac_sha256(&salted_password, b"Client Key");
+        let client_key = hmac_sha256(&salted_password, b"Client Key")?;
 
         // StoredKey = H(ClientKey)
         let stored_key: [u8; SHA256_OUTPUT_LEN] = {
@@ -155,14 +158,14 @@ impl PasswordHash {
         };
 
         // ServerKey = HMAC(SaltedPassword, "Server Key")
-        let server_key = hmac_sha256(&salted_password, b"Server Key");
+        let server_key = hmac_sha256(&salted_password, b"Server Key")?;
 
-        Self {
+        Ok(Self {
             salt: salt.to_vec(),
             iterations,
             stored_key,
             server_key,
-        }
+        })
     }
 
     /// Generate a cryptographically random 16-byte salt.
@@ -350,7 +353,7 @@ impl ScramSha256Server {
         );
 
         // ClientSignature = HMAC(StoredKey, AuthMessage)
-        let client_signature = hmac_sha256(&self.stored_key, auth_message.as_bytes());
+        let client_signature = hmac_sha256(&self.stored_key, auth_message.as_bytes())?;
 
         // ClientKey = ClientProof XOR ClientSignature
         let mut recovered_client_key = proof_bytes;
@@ -369,7 +372,7 @@ impl ScramSha256Server {
 
         // Build server-final-message: v=<ServerSignature-b64>
         // ServerSignature = HMAC(ServerKey, AuthMessage)
-        let server_signature = hmac_sha256(&self.server_key, auth_message.as_bytes());
+        let server_signature = hmac_sha256(&self.server_key, auth_message.as_bytes())?;
         let server_final = format!("v={}", B64.encode(server_signature));
 
         Ok(server_final.into_bytes())
@@ -418,12 +421,16 @@ mod tests {
 
     // ── PasswordHash tests ────────────────────────────────────────────────────
 
+    fn hash_password(password: &str, salt: &[u8], iterations: u32) -> PasswordHash {
+        PasswordHash::hash_password(password, salt, iterations).expect("hash password")
+    }
+
     #[test]
     fn password_hash_has_correct_field_lengths() {
         let salt = PasswordHash::random_salt();
         assert_eq!(salt.len(), SALT_LEN, "random_salt returns 16 bytes");
 
-        let ph = PasswordHash::hash_password("hunter2", &salt, DEFAULT_ITERATIONS);
+        let ph = hash_password("hunter2", &salt, DEFAULT_ITERATIONS);
         assert_eq!(ph.salt, salt);
         assert_eq!(ph.iterations, DEFAULT_ITERATIONS);
         assert_eq!(ph.stored_key.len(), SHA256_OUTPUT_LEN);
@@ -433,8 +440,8 @@ mod tests {
     #[test]
     fn same_password_and_salt_produce_same_keys() {
         let salt = b"fixed16bytesalt!";
-        let ph1 = PasswordHash::hash_password("password", salt, 4096);
-        let ph2 = PasswordHash::hash_password("password", salt, 4096);
+        let ph1 = hash_password("password", salt, 4096);
+        let ph2 = hash_password("password", salt, 4096);
         assert_eq!(ph1.stored_key, ph2.stored_key);
         assert_eq!(ph1.server_key, ph2.server_key);
     }
@@ -442,8 +449,8 @@ mod tests {
     #[test]
     fn different_passwords_produce_different_keys() {
         let salt = b"fixed16bytesalt!";
-        let ph1 = PasswordHash::hash_password("correct", salt, 4096);
-        let ph2 = PasswordHash::hash_password("wrong", salt, 4096);
+        let ph1 = hash_password("correct", salt, 4096);
+        let ph2 = hash_password("wrong", salt, 4096);
         assert_ne!(ph1.stored_key, ph2.stored_key);
         assert_ne!(ph1.server_key, ph2.server_key);
     }
@@ -451,8 +458,8 @@ mod tests {
     #[test]
     fn different_iteration_counts_produce_different_keys() {
         let salt = b"fixed16bytesalt!";
-        let ph1 = PasswordHash::hash_password("password", salt, 4096);
-        let ph2 = PasswordHash::hash_password("password", salt, 8192);
+        let ph1 = hash_password("password", salt, 4096);
+        let ph2 = hash_password("password", salt, 8192);
         assert_ne!(ph1.stored_key, ph2.stored_key);
     }
 
@@ -476,7 +483,7 @@ mod tests {
     fn known_vector_stored_key_and_server_key() {
         // Salt from RFC 7677 appendix: W22ZaJ0SNY7soEsUEjb6gQ==
         let salt = B64.decode("W22ZaJ0SNY7soEsUEjb6gQ==").expect("decode salt");
-        let ph = PasswordHash::hash_password("pencil", &salt, 4096);
+        let ph = hash_password("pencil", &salt, 4096);
 
         // SaltedPassword = PBKDF2(SHA-256, "pencil", salt, 4096, 32)
         // = c2f3ac59ef35f7c85c0ca7d13b4bddff ...
@@ -488,7 +495,7 @@ mod tests {
         assert_ne!(ph.stored_key, ph.server_key);
 
         // Idempotence across two calls.
-        let ph2 = PasswordHash::hash_password("pencil", &salt, 4096);
+        let ph2 = hash_password("pencil", &salt, 4096);
         assert_eq!(ph.stored_key, ph2.stored_key);
         assert_eq!(ph.server_key, ph2.server_key);
     }
@@ -542,7 +549,7 @@ mod tests {
         .expect("pbkdf2 ok");
 
         // ClientKey = HMAC(SaltedPassword, "Client Key")
-        let client_key = hmac_sha256(&salted_password, b"Client Key");
+        let client_key = hmac_sha256(&salted_password, b"Client Key").expect("client key hmac");
 
         // StoredKey = H(ClientKey)
         let stored_key: [u8; 32] = {
@@ -560,7 +567,8 @@ mod tests {
         let auth_message = format!("{client_first_bare},{server_first},{cfm_without_proof}");
 
         // ClientSignature = HMAC(StoredKey, AuthMessage)
-        let client_signature = hmac_sha256(&stored_key, auth_message.as_bytes());
+        let client_signature =
+            hmac_sha256(&stored_key, auth_message.as_bytes()).expect("client signature hmac");
 
         // ClientProof = ClientKey XOR ClientSignature
         let mut client_proof = client_key;
@@ -573,7 +581,7 @@ mod tests {
     fn full_round_trip_succeeds_with_correct_password() {
         let password = "s3cr3t_pw";
         let salt = b"random_salt_16by";
-        let ph = PasswordHash::hash_password(password, salt, DEFAULT_ITERATIONS);
+        let ph = hash_password(password, salt, DEFAULT_ITERATIONS);
         let mut server =
             ScramSha256Server::new(ph.stored_key, ph.server_key, ph.salt.clone(), ph.iterations);
 
@@ -607,7 +615,7 @@ mod tests {
         let password = "correct_horse";
         let wrong_password = "wrong_horse";
         let salt = b"random_salt_16by";
-        let ph = PasswordHash::hash_password(password, salt, DEFAULT_ITERATIONS);
+        let ph = hash_password(password, salt, DEFAULT_ITERATIONS);
         let mut server =
             ScramSha256Server::new(ph.stored_key, ph.server_key, ph.salt.clone(), ph.iterations);
 
@@ -629,7 +637,7 @@ mod tests {
 
     #[test]
     fn out_of_order_call_returns_error() {
-        let ph = PasswordHash::hash_password("pw", b"salt_16_bytes___", DEFAULT_ITERATIONS);
+        let ph = hash_password("pw", b"salt_16_bytes___", DEFAULT_ITERATIONS);
         let mut server =
             ScramSha256Server::new(ph.stored_key, ph.server_key, ph.salt.clone(), ph.iterations);
 
@@ -642,7 +650,7 @@ mod tests {
 
     #[test]
     fn double_server_first_returns_out_of_order() {
-        let ph = PasswordHash::hash_password("pw", b"salt_16_bytes___", DEFAULT_ITERATIONS);
+        let ph = hash_password("pw", b"salt_16_bytes___", DEFAULT_ITERATIONS);
         let mut server =
             ScramSha256Server::new(ph.stored_key, ph.server_key, ph.salt.clone(), ph.iterations);
 
@@ -659,7 +667,7 @@ mod tests {
 
     #[test]
     fn nonce_mismatch_returns_error() {
-        let ph = PasswordHash::hash_password("pw", b"salt_16_bytes___", DEFAULT_ITERATIONS);
+        let ph = hash_password("pw", b"salt_16_bytes___", DEFAULT_ITERATIONS);
         let mut server =
             ScramSha256Server::new(ph.stored_key, ph.server_key, ph.salt.clone(), ph.iterations);
 

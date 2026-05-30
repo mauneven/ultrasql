@@ -424,7 +424,7 @@ mod tests {
     fn make_catalog() -> InMemoryAuthCatalog {
         let cat = InMemoryAuthCatalog::new();
         let salt = PasswordHash::random_salt();
-        let ph = PasswordHash::hash_password("secret", &salt, 4096);
+        let ph = PasswordHash::hash_password("secret", &salt, 4096).expect("hash password");
         let mut alice = test_role(1, "alice", true);
         alice.password = Some(ph);
         cat.add_role(alice);
@@ -481,7 +481,7 @@ mod tests {
     fn add_role_overwrites_existing() {
         let cat = make_catalog();
         let salt = PasswordHash::random_salt();
-        let ph2 = PasswordHash::hash_password("new_secret", &salt, 4096);
+        let ph2 = PasswordHash::hash_password("new_secret", &salt, 4096).expect("hash password");
         let mut replacement = test_role(1, "alice", true);
         replacement.password = Some(ph2);
         replacement.is_superuser = true;
