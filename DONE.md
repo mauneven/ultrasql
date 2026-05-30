@@ -139,6 +139,10 @@ as a concise evidence ledger; roadmap stays for open gates only.
 - Constant `SELECT` result execution now propagates scalar evaluation failures
   instead of silently returning NULL. Evidence:
   `cargo test -p ultrasql-executor result_propagates_constant_eval_errors`.
+- `ORDER BY` full-sort and bounded top-k paths now propagate sort-key
+  evaluation failures instead of silently treating them as NULL. Evidence:
+  `cargo test -p ultrasql-executor sort` and
+  `cargo test -p ultrasql-executor top_k`.
 
 ## Core SQL And Wire Protocol
 

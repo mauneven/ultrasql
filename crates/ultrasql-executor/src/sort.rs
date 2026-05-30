@@ -205,7 +205,7 @@ impl Sort {
             }
         }
 
-        let sorted_rows = sorted_rows_from(rows, &self.keys);
+        let sorted_rows = sorted_rows_from(rows, &self.keys)?;
         self.sorted = Some(sorted_rows.into_iter());
         Ok(())
     }
@@ -237,7 +237,7 @@ impl Sort {
         }
 
         if runs.is_empty() {
-            let sorted_rows = sorted_rows_from(rows, &self.keys);
+            let sorted_rows = sorted_rows_from(rows, &self.keys)?;
             self.sorted = Some(sorted_rows.into_iter());
         } else {
             if !rows.is_empty() {
@@ -356,7 +356,7 @@ fn read_sort_head(
     let Some(row) = spill.read_next_row(codec)? else {
         return Ok(None);
     };
-    let key_values = eval_sort_keys(&row, keys);
+    let key_values = eval_sort_keys(&row, keys)?;
     Ok(Some(SortHead { row, key_values }))
 }
 
@@ -366,7 +366,7 @@ fn write_sorted_run(
     keys: &[CompiledKey],
     label: &'static str,
 ) -> Result<RowSpillFile, ExecError> {
-    let sorted_rows = sorted_rows_from(std::mem::take(rows), keys);
+    let sorted_rows = sorted_rows_from(std::mem::take(rows), keys)?;
     let mut spill = RowSpillFile::new(label)?;
     for row in sorted_rows {
         spill.append_row(codec, &row)?;
@@ -374,21 +374,28 @@ fn write_sorted_run(
     Ok(spill)
 }
 
-fn sorted_rows_from(rows: Vec<Vec<Value>>, keys: &[CompiledKey]) -> Vec<Vec<Value>> {
+fn sorted_rows_from(
+    rows: Vec<Vec<Value>>,
+    keys: &[CompiledKey],
+) -> Result<Vec<Vec<Value>>, ExecError> {
     let mut annotated: Vec<(Vec<Value>, Vec<Value>)> = rows
         .into_iter()
         .map(|row| {
-            let key_vals = eval_sort_keys(&row, keys);
-            (row, key_vals)
+            let key_vals = eval_sort_keys(&row, keys)?;
+            Ok((row, key_vals))
         })
-        .collect();
+        .collect::<Result<_, ExecError>>()?;
     annotated.sort_by(|(_, ak), (_, bk)| compare_key_vecs(ak, bk, keys));
-    annotated.into_iter().map(|(row, _)| row).collect()
+    Ok(annotated.into_iter().map(|(row, _)| row).collect())
 }
 
-fn eval_sort_keys(row: &[Value], keys: &[CompiledKey]) -> Vec<Value> {
+fn eval_sort_keys(row: &[Value], keys: &[CompiledKey]) -> Result<Vec<Value>, ExecError> {
     keys.iter()
-        .map(|key| key.eval.eval(row).unwrap_or(Value::Null))
+        .map(|key| {
+            key.eval
+                .eval(row)
+                .map_err(|err| ExecError::TypeMismatch(err.to_string()))
+        })
         .collect()
 }
 
@@ -525,7 +532,7 @@ mod tests {
     use std::cmp::Ordering;
 
     use ultrasql_core::{DataType, Field, Schema, Value};
-    use ultrasql_planner::{ScalarExpr, SortKey};
+    use ultrasql_planner::{BinaryOp, ScalarExpr, SortKey};
     use ultrasql_vec::Batch;
     use ultrasql_vec::column::{Column, NumericColumn};
 
@@ -573,6 +580,18 @@ mod tests {
         }
     }
 
+    fn divide_by_zero_key() -> ScalarExpr {
+        ScalarExpr::Binary {
+            op: BinaryOp::Div,
+            left: Box::new(col_a()),
+            right: Box::new(ScalarExpr::Literal {
+                value: Value::Int32(0),
+                data_type: DataType::Int32,
+            }),
+            data_type: DataType::Int32,
+        }
+    }
+
     fn drain_rows(op: &mut dyn Operator) -> Vec<(i32, i64)> {
         let mut out = Vec::new();
         while let Some(b) = op.next_batch().expect("no error") {
@@ -606,6 +625,24 @@ mod tests {
         let mut sort = Sort::new(Box::new(scan), keys, schema);
         let rows = drain_rows(&mut sort);
         assert_eq!(rows, vec![(1, 10), (2, 20), (3, 30), (4, 40)]);
+    }
+
+    #[test]
+    fn sort_key_eval_error_propagates() {
+        let schema = schema_i32_i64();
+        let input = vec![make_batch(&[(1, 10), (2, 20)])];
+        let scan = MemTableScan::new(schema.clone(), input);
+        let keys = vec![SortKey {
+            expr: divide_by_zero_key(),
+            asc: true,
+            nulls_first: false,
+        }];
+        let mut sort = Sort::new(Box::new(scan), keys, schema);
+        let err = sort.next_batch().expect_err("sort key error must surface");
+        assert!(
+            err.to_string().contains("division by zero"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]

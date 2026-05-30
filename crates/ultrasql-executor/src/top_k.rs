@@ -177,7 +177,7 @@ impl Operator for TopK {
                             &self.keys,
                             self.exact_vector_key.as_ref(),
                             self.cap,
-                        ) {
+                        )? {
                             TopKDrainMode::ExactVector => {
                                 self.exact_vector_kernel_batches =
                                     self.exact_vector_kernel_batches.saturating_add(1);
@@ -365,19 +365,19 @@ fn drain_top_k_batch(
     keys: &[CompiledKey],
     exact_vector_key: Option<&ExactVectorTopKKey>,
     cap: usize,
-) -> TopKDrainMode {
+) -> Result<TopKDrainMode, ExecError> {
     if let Some(exact) = exact_vector_key
         && drain_exact_vector_top_k_batch(kept, &rows, keys, exact, cap)
     {
-        return TopKDrainMode::ExactVector;
+        return Ok(TopKDrainMode::ExactVector);
     }
     let mode = if exact_vector_key.is_some() {
         TopKDrainMode::GenericFallback
     } else {
         TopKDrainMode::Generic
     };
-    drain_generic_top_k_batch(kept, rows, keys, cap);
-    mode
+    drain_generic_top_k_batch(kept, rows, keys, cap)?;
+    Ok(mode)
 }
 
 fn drain_generic_top_k_batch(
@@ -385,14 +385,19 @@ fn drain_generic_top_k_batch(
     rows: Vec<Vec<Value>>,
     keys: &[CompiledKey],
     cap: usize,
-) {
+) -> Result<(), ExecError> {
     for row in rows {
         let key_vals: Vec<Value> = keys
             .iter()
-            .map(|k| k.eval.eval(&row).unwrap_or(Value::Null))
-            .collect();
+            .map(|k| {
+                k.eval
+                    .eval(&row)
+                    .map_err(|err| ExecError::TypeMismatch(err.to_string()))
+            })
+            .collect::<Result<_, _>>()?;
         keep_if_top_k(kept, row, key_vals, keys, cap);
     }
+    Ok(())
 }
 
 fn drain_exact_vector_top_k_batch(
@@ -614,6 +619,42 @@ mod tests {
             pulls.load(Ordering::SeqCst),
             2,
             "presorted top-k must stop as soon as cap rows are available"
+        );
+    }
+
+    #[test]
+    fn generic_top_k_key_eval_error_propagates() {
+        let schema = Schema::new([Field::required("id", DataType::Int32)]).expect("schema ok");
+        let child = CountingScan {
+            schema: schema.clone(),
+            batches: vec![i32_batch(&[1, 2, 3])],
+            next: 0,
+            pulls: Arc::new(AtomicUsize::new(0)),
+        };
+        let key = SortKey {
+            expr: ScalarExpr::Binary {
+                op: BinaryOp::Div,
+                left: Box::new(ScalarExpr::Column {
+                    name: "id".to_owned(),
+                    index: 0,
+                    data_type: DataType::Int32,
+                }),
+                right: Box::new(ScalarExpr::Literal {
+                    value: Value::Int32(0),
+                    data_type: DataType::Int32,
+                }),
+                data_type: DataType::Int32,
+            },
+            asc: true,
+            nulls_first: false,
+        };
+        let mut top_k = TopK::new(Box::new(child), vec![key], schema, 2);
+        let err = top_k
+            .next_batch()
+            .expect_err("top-k key error must surface");
+        assert!(
+            err.to_string().contains("division by zero"),
+            "unexpected error: {err}"
         );
     }
 
