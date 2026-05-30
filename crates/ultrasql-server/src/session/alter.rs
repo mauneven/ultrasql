@@ -725,11 +725,10 @@ where
     ///   replace this body with the proper fast-path without touching
     ///   any caller.
     ///
-    /// `CASCADE` walks the in-memory runtime foreign-key graph built by
-    /// `CREATE TABLE`. Referencing child tables are added recursively;
-    /// omitting `CASCADE` raises `2BP01` when such dependencies exist.
-    /// Warm-restart reconstruction of those runtime constraints is still
-    /// open, so the dependency walk is limited to the current process.
+    /// `CASCADE` walks the runtime foreign-key graph built by `CREATE TABLE`
+    /// and rebuilt from durable table-runtime metadata on WAL-backed restart.
+    /// Referencing child tables are added recursively; omitting `CASCADE`
+    /// raises `2BP01` when such dependencies exist.
     ///
     /// Multi-table `TRUNCATE` truncates every table inside a single
     /// autocommit transaction so the operation is atomic — either all

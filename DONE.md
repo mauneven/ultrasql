@@ -128,6 +128,11 @@ as a concise evidence ledger; roadmap stays for open gates only.
   `crates/ultrasql-server/tests/analyze_round_trip.rs` covers `ANALYZE`
   statistics surviving restart as both `pg_statistic` rows and cost-model
   `lookup_relation_stats` entries.
+- Durable table-runtime expression and constraint bootstrap is certified for
+  restart: defaults, generated stored expressions, CHECK constraints, foreign
+  keys, exclusion constraints, identity defaults, domain checks, and
+  `TRUNCATE ... CASCADE` FK dependency walks all have restart coverage under
+  `crates/ultrasql-server/tests/*_round_trip.rs`.
 - Catalog upgrade story is documented and enforced with `catalog.version = 1`.
 - Security/ethics audit docs cover no proprietary tests, no closed-source
   code, and no fake benchmark claims.

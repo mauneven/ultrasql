@@ -29,7 +29,6 @@ file focused on what still blocks production.
 
 - Serializable isolation remains `relation-level SSI`, `not predicate-precise`
   SSI. Implement predicate-precise SSI before broad serializable claims.
-- Durable expression/default/constraint bootstrap must survive restart.
 - Full public regression import still open for parser, type coercion,
   aggregate/window, and upstream isolation schedules.
 

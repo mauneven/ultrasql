@@ -33,6 +33,10 @@ use std::time::Duration;
 use tokio_postgres::NoTls;
 use ultrasql_server::{Server, bind_listener, serve_listener};
 
+mod support;
+
+use support::{shutdown as persistent_shutdown, start_persistent_server};
+
 /// Spin up an in-process server on an ephemeral TCP port and return a
 /// connected `tokio-postgres` client plus the join handles so the test
 /// can shut everything down cleanly.
@@ -298,6 +302,64 @@ async fn truncate_cascade_empties_runtime_foreign_key_children() {
     assert_eq!(select_count(&client, "trunc_child_c").await, 0);
 
     shutdown(client, server_handle).await;
+}
+
+/// Restart rebuilds FK runtime metadata, so `TRUNCATE ... CASCADE`
+/// still finds child tables after process restart.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn truncate_cascade_uses_foreign_key_runtime_after_restart() {
+    let data_dir = tempfile::TempDir::new().expect("temp dir");
+
+    let running = start_persistent_server(data_dir.path(), "truncate_restart_test").await;
+    running
+        .client
+        .batch_execute("CREATE TABLE trunc_parent_restart (id INT PRIMARY KEY)")
+        .await
+        .expect("create parent");
+    running
+        .client
+        .batch_execute(
+            "CREATE TABLE trunc_child_restart (
+             parent_id INT REFERENCES trunc_parent_restart(id),
+             v INT)",
+        )
+        .await
+        .expect("create child");
+    running
+        .client
+        .batch_execute("INSERT INTO trunc_parent_restart VALUES (1), (2)")
+        .await
+        .expect("insert parents");
+    running
+        .client
+        .batch_execute("INSERT INTO trunc_child_restart VALUES (1, 10), (2, 20)")
+        .await
+        .expect("insert children");
+    persistent_shutdown(running).await;
+
+    let running = start_persistent_server(data_dir.path(), "truncate_restart_test").await;
+    let err = running
+        .client
+        .batch_execute("TRUNCATE TABLE trunc_parent_restart")
+        .await
+        .expect_err("restart-rebuilt FK blocks parent truncate without cascade");
+    assert_eq!(err.code().expect("SQLSTATE").code(), "2BP01");
+
+    running
+        .client
+        .batch_execute("TRUNCATE TABLE trunc_parent_restart CASCADE")
+        .await
+        .expect("truncate cascade succeeds after restart");
+    assert_eq!(
+        select_count(&running.client, "trunc_parent_restart").await,
+        0
+    );
+    assert_eq!(
+        select_count(&running.client, "trunc_child_restart").await,
+        0
+    );
+
+    persistent_shutdown(running).await;
 }
 
 /// `TRUNCATE` on an empty relation is a no-op and must succeed.
