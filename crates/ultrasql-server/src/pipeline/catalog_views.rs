@@ -371,7 +371,13 @@ fn normalized_name(name: &str) -> String {
 }
 
 fn schema(fields: impl IntoIterator<Item = Field>) -> Schema {
-    Schema::new(fields).expect("virtual catalog schema has unique columns")
+    match Schema::new(fields) {
+        Ok(schema) => schema,
+        Err(err) => {
+            tracing::error!(error = %err, "virtual catalog schema construction failed");
+            Schema::empty()
+        }
+    }
 }
 
 fn text() -> DataType {
@@ -395,8 +401,13 @@ fn v_oid(v: u32) -> Value {
 }
 
 fn v_oid_i32(v: i32) -> Value {
-    let raw = u32::try_from(v).expect("PostgreSQL built-in OID constants fit u32");
-    v_oid(raw)
+    match u32::try_from(v) {
+        Ok(raw) => v_oid(raw),
+        Err(err) => {
+            tracing::error!(value = v, error = %err, "virtual catalog OID conversion failed");
+            v_oid(0)
+        }
+    }
 }
 
 fn namespace_oid(schema_name: &str) -> i64 {

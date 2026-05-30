@@ -291,6 +291,12 @@ as a concise evidence ledger; roadmap stays for open gates only.
   `cargo test -p ultrasql-server time_partition` and
   `cargo clippy -p ultrasql-server --lib --all-features -- -W
   clippy::expect_used -W clippy::unwrap_used`.
+- Virtual catalog schema construction and signed built-in OID conversion now
+  log and return safe fallback values instead of panicking on static catalog
+  mistakes. Evidence:
+  `cargo test -p ultrasql-server catalog_views` and
+  `cargo clippy -p ultrasql-server --lib --all-features -- -W
+  clippy::expect_used -W clippy::unwrap_used`.
 
 ## Core SQL And Wire Protocol
 
