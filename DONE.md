@@ -214,6 +214,14 @@ as a concise evidence ledger; roadmap stays for open gates only.
   surface typed `PlanError`s. Evidence:
   `cargo test -p ultrasql-planner binder::tests`,
   `cargo test -p ultrasql-planner expr_bind`, and the non-test panic audit.
+- Planner binder strict panic audit now also covers `FROM` list binding,
+  local file expansion for `read_parquet`/`read_arrow`/CSV header fallback,
+  window offset conversion, and `SHOW` schema construction. These paths now
+  return typed `PlanError`s instead of relying on non-test `expect`. Evidence:
+  `cargo test -p ultrasql-planner --lib binder::from -- --nocapture`,
+  `cargo test -p ultrasql-planner --lib binder::tests -- --nocapture`,
+  `cargo clippy -p ultrasql-planner --lib --all-features -- -D clippy::unwrap_used -D clippy::expect_used`,
+  and `cargo clippy -p ultrasql-planner --all-targets --all-features -- -D warnings`.
 - Constant folding now rewrites window `PARTITION BY`, window `ORDER BY`, and
   value expressions inside `LAG`, `LEAD`, `FIRST_VALUE`, `LAST_VALUE`, and
   `NTH_VALUE` even when the window input is already a fixed point. Evidence:

@@ -50,8 +50,15 @@ pub(super) fn bind_from(
         ));
     }
 
-    let mut iter = from_items.iter();
-    let first = iter.next().expect("at least one item checked above");
+    let Some(first) = from_items.first() else {
+        return Ok((
+            LogicalPlan::Empty {
+                schema: Schema::empty(),
+            },
+            vec![],
+        ));
+    };
+    let iter = from_items.iter().skip(1);
     let (mut plan, mut from_scope) = bind_table_ref(first, catalog, cte_catalog, outer_scope)?;
 
     for item in iter {
@@ -443,10 +450,7 @@ fn bind_read_parquet_table_function(
     let arrow_schema = if path_specs_use_object_store("read_parquet", &path_specs)? {
         read_parquet_object_schema(&path_specs)?
     } else {
-        let first_path = expand_file_path_specs("read_parquet", &path_specs)?
-            .into_iter()
-            .next()
-            .expect("path expansion returns at least one file");
+        let first_path = first_expanded_file("read_parquet", &path_specs)?;
         read_parquet_arrow_schema(&first_path)?
     };
     let fields = arrow_schema
@@ -1339,10 +1343,7 @@ fn read_arrow_schema_from_path_specs(
         return Ok(reader.schema());
     }
 
-    let first_path = expand_file_path_specs("read_arrow", path_specs)?
-        .into_iter()
-        .next()
-        .expect("path expansion returns at least one file");
+    let first_path = first_expanded_file("read_arrow", path_specs)?;
     let file = open_local_regular_file("read_arrow", &first_path)?;
     let reader = ArrowFileReader::try_new(file, None).map_err(|err| {
         PlanError::TypeMismatch(format!(
@@ -1369,12 +1370,9 @@ fn read_csv_header_from_first_record(path_specs: &[String]) -> Result<Vec<String
     let (display, bytes) = if path_specs_use_object_store("read_csv", path_specs)? {
         read_first_object_csv_sample(path_specs)?
     } else {
-        let paths = expand_file_path_specs("read_csv", path_specs)?;
-        let first = paths
-            .first()
-            .expect("expand_file_path_specs returns non-empty paths");
+        let first = first_expanded_file("read_csv", path_specs)?;
         let display = first.display().to_string();
-        let bytes = read_local_csv_header_sample(&display, first)?;
+        let bytes = read_local_csv_header_sample(&display, &first)?;
         (display, bytes)
     };
     let text = String::from_utf8(bytes).map_err(|err| {
@@ -1578,6 +1576,15 @@ fn expand_file_path_specs(
         paths.extend(expand_file_paths(function_name, pattern)?);
     }
     Ok(paths)
+}
+
+fn first_expanded_file(function_name: &str, patterns: &[String]) -> Result<PathBuf, PlanError> {
+    expand_file_path_specs(function_name, patterns)?
+        .into_iter()
+        .next()
+        .ok_or_else(|| {
+            PlanError::TypeMismatch(format!("{function_name}: path expansion produced no files"))
+        })
 }
 
 fn expand_file_paths(function_name: &str, pattern: &str) -> Result<Vec<PathBuf>, PlanError> {

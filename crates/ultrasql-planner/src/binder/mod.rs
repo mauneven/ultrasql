@@ -263,7 +263,7 @@ fn bind_set_var(stmt: &SetVarStmt) -> Result<LogicalPlan, PlanError> {
             name.clone(),
             DataType::Text { max_len: None },
         )])
-        .expect("SHOW schema is well-formed")
+        .map_err(|err| PlanError::TypeMismatch(format!("SHOW schema: {err}")))?
     } else {
         Schema::empty()
     };

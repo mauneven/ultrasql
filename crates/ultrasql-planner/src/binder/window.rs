@@ -406,9 +406,11 @@ fn bind_usize_literal(
         ScalarExpr::Literal {
             value: Value::Int32(v),
             ..
-        } if v >= 0 => Ok(
-            usize::try_from(v).expect("non-negative i32 fits in usize on all supported targets")
-        ),
+        } if v >= 0 => usize::try_from(v).map_err(|_| {
+            PlanError::TypeMismatch(format!(
+                "{func_name}: argument {arg_index} value {v} exceeds usize range"
+            ))
+        }),
         ScalarExpr::Literal {
             value: Value::Int64(v),
             ..
