@@ -660,6 +660,11 @@ as a concise evidence ledger; roadmap stays for open gates only.
 - Portable scalar helpers now cover `COALESCE`, `IFNULL` / `NVL`,
   `NULLIF`, `LEAST`, `GREATEST`, and SQLite-style multi-argument scalar
   `MIN` / `MAX` through wire round-trip tests.
+- `DROP TABLE` dependency tracking now treats append-only materialized views as
+  dependents: `RESTRICT` blocks source-table drops, `CASCADE` drops dependent
+  materialized views, and direct materialized-view drops clear runtime
+  maintenance state. Evidence:
+  `cargo test -p ultrasql-server --test materialized_view_round_trip`.
 
 ## Security And Client Certification
 

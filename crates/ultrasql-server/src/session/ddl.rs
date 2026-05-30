@@ -1793,15 +1793,29 @@ where
                 "execute_drop_table called with non-DropTable plan",
             ));
         };
-        let drop_set: HashSet<String> = tables
+        let initial_drop_set: HashSet<String> = tables
             .iter()
             .map(|name| name.to_ascii_lowercase())
             .collect();
+        let mut drop_set = initial_drop_set.clone();
+        let mut drop_names = tables.clone();
+        if *cascade {
+            for name in self.materialized_view_cascade_drop_names(&mut drop_set) {
+                if !drop_names
+                    .iter()
+                    .any(|existing| existing.eq_ignore_ascii_case(&name))
+                {
+                    drop_names.push(name);
+                }
+            }
+        }
         for name in tables {
             let Some(entry) = self.state.persistent_catalog.lookup_table(name) else {
                 continue;
             };
-            let dependents = self.foreign_key_dependents(entry.oid, &drop_set);
+            let mut dependents = self.foreign_key_dependents(entry.oid, &drop_set);
+            dependents.extend(self.materialized_view_dependents(name, &initial_drop_set));
+            dependents.sort();
             if !dependents.is_empty() && !*cascade {
                 return Err(ServerError::DependentObjectsStillExist(format!(
                     "cannot drop table {name} because other objects depend on it: {}",
@@ -1810,7 +1824,7 @@ where
             }
         }
         let mut durable_drop_entries = Vec::new();
-        for name in tables {
+        for name in &drop_names {
             let Some(entry) = self.state.persistent_catalog.lookup_table(name) else {
                 continue;
             };
@@ -1854,7 +1868,7 @@ where
             self.state
                 .commit_transaction(ddl_txn, true, "DROP TABLE catalog transaction")?;
         }
-        for name in tables {
+        for name in &drop_names {
             if let Some(entry) = self.state.persistent_catalog.lookup_table(name) {
                 if *cascade {
                     self.drop_foreign_key_dependencies(entry.oid, &drop_set);
@@ -1874,6 +1888,7 @@ where
                     .persistent_catalog
                     .clear_descriptions_for_object(entry.oid);
             }
+            self.state.materialized_views.remove(name);
             self.state.persistent_catalog.drop_table(name)?;
         }
         // Any cached plan that referenced this name is now invalid;
@@ -1901,6 +1916,45 @@ where
                 if fk.target_oid == target_oid {
                     out.push(format!("{}.{}", table.name, fk.name));
                 }
+            }
+        }
+        out.sort();
+        out
+    }
+
+    fn materialized_view_dependents(
+        &self,
+        target_table: &str,
+        drop_set: &HashSet<String>,
+    ) -> Vec<String> {
+        let mut out = Vec::new();
+        for item in self.state.materialized_views.iter() {
+            let runtime = item.value();
+            if runtime.source_table.eq_ignore_ascii_case(target_table)
+                && !drop_set.contains(&runtime.view_table.to_ascii_lowercase())
+            {
+                out.push(runtime.view_table.clone());
+            }
+        }
+        out.sort();
+        out
+    }
+
+    fn materialized_view_cascade_drop_names(&self, drop_set: &mut HashSet<String>) -> Vec<String> {
+        let mut out = Vec::new();
+        loop {
+            let mut changed = false;
+            for item in self.state.materialized_views.iter() {
+                let runtime = item.value();
+                let source = runtime.source_table.to_ascii_lowercase();
+                let view = runtime.view_table.to_ascii_lowercase();
+                if drop_set.contains(&source) && drop_set.insert(view) {
+                    out.push(runtime.view_table.clone());
+                    changed = true;
+                }
+            }
+            if !changed {
+                break;
             }
         }
         out.sort();

@@ -214,3 +214,89 @@ async fn materialized_view_keeps_maintaining_source_after_restart() {
     assert_eq!(rows[2].get::<_, i32>(1), 30);
     shutdown_persistent(running).await;
 }
+
+#[tokio::test]
+async fn drop_source_restricts_and_cascade_drops_materialized_view_dependency() {
+    let running = start_server_and_connect().await;
+    let client = &running.client;
+
+    client
+        .batch_execute("CREATE TABLE mv_drop_src (id INT NOT NULL, amount INT NOT NULL)")
+        .await
+        .expect("create source");
+    client
+        .batch_execute("INSERT INTO mv_drop_src VALUES (1, 10)")
+        .await
+        .expect("seed source");
+    client
+        .batch_execute(
+            "CREATE MATERIALIZED VIEW mv_drop_copy AS SELECT id, amount FROM mv_drop_src",
+        )
+        .await
+        .expect("create materialized view");
+
+    let restricted = client
+        .batch_execute("DROP TABLE mv_drop_src")
+        .await
+        .expect_err("source drop must be restricted by materialized view");
+    assert_eq!(restricted.code().expect("SQLSTATE").code(), "2BP01");
+
+    client
+        .batch_execute("DROP TABLE mv_drop_src CASCADE")
+        .await
+        .expect("cascade drops materialized view dependency");
+
+    let source_err = client
+        .batch_execute("SELECT * FROM mv_drop_src")
+        .await
+        .expect_err("source table dropped");
+    assert_eq!(source_err.code().expect("SQLSTATE").code(), "42P01");
+    let view_err = client
+        .batch_execute("SELECT * FROM mv_drop_copy")
+        .await
+        .expect_err("dependent materialized view dropped");
+    assert_eq!(view_err.code().expect("SQLSTATE").code(), "42P01");
+
+    shutdown(running).await;
+}
+
+#[tokio::test]
+async fn drop_materialized_view_clears_runtime_dependency() {
+    let running = start_server_and_connect().await;
+    let client = &running.client;
+
+    client
+        .batch_execute("CREATE TABLE mv_direct_drop_src (id INT NOT NULL, amount INT NOT NULL)")
+        .await
+        .expect("create source");
+    client
+        .batch_execute("INSERT INTO mv_direct_drop_src VALUES (1, 10)")
+        .await
+        .expect("seed source");
+    client
+        .batch_execute(
+            "CREATE MATERIALIZED VIEW mv_direct_drop_copy AS \
+             SELECT id, amount FROM mv_direct_drop_src",
+        )
+        .await
+        .expect("create materialized view");
+
+    client
+        .batch_execute("DROP TABLE mv_direct_drop_copy")
+        .await
+        .expect("drop materialized view");
+    client
+        .batch_execute("INSERT INTO mv_direct_drop_src VALUES (2, 20)")
+        .await
+        .expect("source insert after view drop must not maintain stale runtime");
+
+    let rows = client
+        .query("SELECT id, amount FROM mv_direct_drop_src ORDER BY id", &[])
+        .await
+        .expect("source remains queryable");
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[1].get::<_, i32>(0), 2);
+    assert_eq!(rows[1].get::<_, i32>(1), 20);
+
+    shutdown(running).await;
+}
