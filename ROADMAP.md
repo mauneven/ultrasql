@@ -83,7 +83,6 @@ file focused on what still blocks production.
 - Replace role, membership, privilege, default-privilege, and RLS runtime
   sidecars with typed catalog rows and migrations before v1.0; restart
   persistence evidence for the current sidecars lives in `DONE.md`.
-- Finish RLS tenant certification artifacts.
 - Broaden dependency tracking for every object kind and every `DROP ... CASCADE`
   / `RESTRICT` path.
 - Keep security gates ethical: no proprietary tests, no closed-source

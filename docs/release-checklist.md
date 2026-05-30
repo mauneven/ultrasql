@@ -45,6 +45,8 @@ pgAdmin, DBeaver, and DataGrip schema-browser catalog query families; Flyway,
 Liquibase, and Alembic migration version-table runs in nontransactional DDL
 mode; it is stored as `target/driver-certification.json` and uploaded by CI.
 Before final release sign-off, record the latest green CI workflow run id.
+RLS tenant certification is part of `benchmarks/certify.sh smoke` and writes
+`benchmarks/results/latest/rls_tenant_certification.json`.
 
 ## Release artifact gate
 
@@ -124,6 +126,7 @@ Before tagging v1.0, attach:
 - latest green CI workflow run id,
 - release workflow run id,
 - latest full benchmark certification manifest,
+- RLS tenant certification artifact,
 - TPC-H SF10 and ClickBench artifacts or explicit setup-missing reasons,
 - Firebolt Core local artifacts or explicit Docker/setup-missing reasons,
 - AI/vector same-host pgvector certification artifact,

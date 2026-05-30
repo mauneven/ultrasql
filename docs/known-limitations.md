@@ -35,13 +35,14 @@ completed evidence.
 
 ## Security and administration
 
-- Role/privilege persistence is incomplete; roles and ACLs still use in-memory
-  catalogs.
+- Role, privilege, default-privilege, and RLS persistence currently use runtime
+  sidecar metadata; typed catalog rows and migrations remain open.
 - GUI schema-browser introspection query families are certified for pgAdmin,
   DBeaver, and DataGrip, but full desktop UI launch/click smoke, admin-tool
   mutation workflows, and less common admin paths remain open.
 - Row-level security covers the documented tenant policy shape with
-  owner/bypass/restart semantics; broader policy combinations remain open.
+  owner/bypass/restart semantics, role-scoped policies, mutation checks, and a
+  release certification artifact; broader policy combinations remain open.
 
 ## Replication and backup
 

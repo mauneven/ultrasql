@@ -19,6 +19,8 @@ fn certification_runner_splits_smoke_and_full_profiles() {
     assert!(script.contains("smoke)"));
     assert!(script.contains("full)"));
     assert!(script.contains("target/release/regression-gate --stage current --smoke"));
+    assert!(script.contains("rls-tenant"));
+    assert!(script.contains("benchmarks/rls_tenant_certify.sh"));
     assert!(script.contains("VECTOR_ANN_ROWS=512"));
     assert!(script.contains("benchmarks/tpch_sf10_certify.sh"));
     assert!(script.contains("benchmarks/tpch_sf1_postgres_certify.sh"));
@@ -31,6 +33,19 @@ fn certification_runner_splits_smoke_and_full_profiles() {
     assert!(script.contains("late-materialization"));
     assert!(script.contains("benchmarks/late_materialization.sh"));
     assert!(script.contains("benchmark_certification_manifest.json"));
+}
+
+#[test]
+fn rls_tenant_certification_runner_writes_release_artifact() {
+    let script = repo_file("benchmarks/rls_tenant_certify.sh");
+
+    assert!(script.contains("rls_tenant_certification.json"));
+    assert!(script.contains("cargo test -p \"$TEST_PACKAGE\" --test \"$TEST_TARGET\""));
+    assert!(script.contains("INSERT SELECT"));
+    assert!(script.contains("UPDATE new-row WITH CHECK"));
+    assert!(script.contains("role scoping"));
+    assert!(script.contains("restart persistence"));
+    assert!(script.contains("not a benchmark claim"));
 }
 
 #[test]

@@ -689,6 +689,11 @@ as a concise evidence ledger; roadmap stays for open gates only.
   checks exist, supports nested RLS/user filters for TID scans, and preserves
   old rows on rejected tenant changes. Evidence:
   `cargo test -p ultrasql-server --test rls_round_trip rls_update_checks_new_rows_and_preserves_old_row_on_failure -- --nocapture`.
+- RLS tenant certification is part of `benchmarks/certify.sh smoke` through
+  `benchmarks/rls_tenant_certify.sh`, which writes
+  `benchmarks/results/latest/rls_tenant_certification.json` after the wire-level
+  RLS suite verifies read filtering, mutation checks, role scoping,
+  owner/bypass semantics, restrictive policies, and restart persistence.
 - Driver certification covers `libpq`, `psycopg2`, `psycopg3`,
   `node-postgres`, `pgx`, `lib/pq`, `JDBC`, `Npgsql`, and
   `tokio-postgres`.

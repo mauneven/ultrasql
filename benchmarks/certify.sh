@@ -4,7 +4,7 @@
 # Usage:
 #   benchmarks/certify.sh smoke
 #   benchmarks/certify.sh full
-#   benchmarks/certify.sh full tpch,tpch-sf1-postgres,clickbench,vector-ann,ai-vector-pgvector,ai-gauntlet,csv-gauntlet,object-parquet-range,late-materialization,firebolt-aggregate,firebolt-sparse-pruning,firebolt-vector,chaos-recovery
+#   benchmarks/certify.sh full tpch,tpch-sf1-postgres,clickbench,vector-ann,ai-vector-pgvector,ai-gauntlet,csv-gauntlet,object-parquet-range,late-materialization,firebolt-aggregate,firebolt-sparse-pruning,firebolt-vector,rls-tenant,chaos-recovery
 #
 # Smoke is PR-safe: tiny datasets, crash/correctness checks, no external
 # benchmark assets. Full is nightly/manual: it attempts the full certification
@@ -26,10 +26,10 @@ mkdir -p "$RAW_DIR"
 
 case "$profile" in
     smoke)
-        suites=(regression-gate vector-ann sysbench)
+        suites=(regression-gate rls-tenant vector-ann sysbench)
         ;;
     full)
-        suites=(tpch tpch-sf1-postgres clickbench tpcb tpcc sysbench vector-topk vector-ann ai-vector-pgvector ai-gauntlet csv-gauntlet object-parquet-range late-materialization firebolt-aggregate firebolt-sparse-pruning firebolt-vector chaos-recovery)
+        suites=(tpch tpch-sf1-postgres clickbench tpcb tpcc sysbench vector-topk vector-ann ai-vector-pgvector ai-gauntlet csv-gauntlet object-parquet-range late-materialization firebolt-aggregate firebolt-sparse-pruning firebolt-vector rls-tenant chaos-recovery)
         ;;
     *)
         echo "certify.sh: profile must be smoke or full, got '$profile'" >&2
@@ -186,6 +186,12 @@ run_chaos_recovery_full() {
     CHAOS_PROFILE=full CHAOS_OUT_DIR="$OUT_DIR" benchmarks/chaos_recovery.sh full
 }
 
+run_rls_tenant_certification() {
+    RLS_TENANT_PROFILE="$profile" \
+        RLS_TENANT_OUT_DIR="$OUT_DIR" \
+        benchmarks/rls_tenant_certify.sh "$profile"
+}
+
 for suite in "${suites[@]}"; do
     case "$suite" in
         regression-gate)
@@ -259,6 +265,9 @@ for suite in "${suites[@]}"; do
             else
                 run_suite "$suite" run_chaos_recovery_full
             fi
+            ;;
+        rls-tenant)
+            run_suite "$suite" run_rls_tenant_certification
             ;;
         sysbench)
             if [[ "$profile" == "smoke" ]]; then

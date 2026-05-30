@@ -1,0 +1,40 @@
+{
+  "command": [
+    "cargo",
+    "test",
+    "-p",
+    "ultrasql-server",
+    "--test",
+    "rls_round_trip",
+    "--",
+    "--nocapture"
+  ],
+  "exit_code": 0,
+  "generated_at_unix": 1780138758,
+  "host": {
+    "cores": 10,
+    "cpu": "arm",
+    "machine": "arm64",
+    "os": "macOS-26.5-arm64-arm-64bit-Mach-O"
+  },
+  "log_file": "target/rls-tenant-cert/rls_round_trip.log",
+  "passed": true,
+  "policy": "RLS tenant certification is a correctness/security artifact. It requires the wire-level RLS suite to pass for reads, inserts, INSERT SELECT, updates, role scoping, bypass semantics, restrictive policies, and restart persistence. It is not a benchmark claim.",
+  "profile": "smoke",
+  "reason": null,
+  "required_check_count": 9,
+  "required_checks": [
+    "read filtering by current tenant setting",
+    "same-tenant INSERT allowed",
+    "cross-tenant INSERT rejected",
+    "INSERT ... SELECT WITH CHECK enforced atomically",
+    "UPDATE new-row WITH CHECK enforced",
+    "restrictive policies narrow permissive policies",
+    "role-scoped policies honor inherited roles",
+    "owner, superuser, and BYPASSRLS semantics",
+    "policy metadata and owner/bypass semantics survive restart"
+  ],
+  "schema_version": 1,
+  "status": "passed",
+  "suite": "rls_tenant_certification"
+}
