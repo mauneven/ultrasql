@@ -176,6 +176,9 @@ as a concise evidence ledger; roadmap stays for open gates only.
   shared by full sort and top-k. Evidence:
   `cargo test -p ultrasql-executor sort` and
   `cargo test -p ultrasql-executor top_k`.
+- Optimizer statistics now order decimal `NUMERIC` values by exact scaled
+  magnitude and canonicalize equal decimal keys before MCV/histogram grouping.
+  Evidence: `cargo test -p ultrasql-optimizer value_ord`.
 
 ## Core SQL And Wire Protocol
 

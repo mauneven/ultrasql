@@ -8,7 +8,8 @@
 //!
 //! - **NULL** sorts *last* (consistent with PostgreSQL `NULLS LAST`).
 //! - **Numeric cross-type comparisons** widen to `f64`; integers widen
-//!   losslessly via [`i64::from`] before conversion to `f64`.
+//!   losslessly via [`i64::from`] before conversion to `f64`. Decimal values
+//!   compare exactly against other decimals.
 //! - **NaN** sorts last among floats.
 //! - **Mixed-type comparisons** (e.g., Int32 vs Text) fall back to a
 //!   stable discriminant ordering so the result is always a total
@@ -24,7 +25,8 @@ use ultrasql_core::{Value, bpchar_semantic_text, timetz_utc_micros};
 /// Compare two [`Value`]s under the statistics layer's total ordering.
 ///
 /// - `NULL` is greater than every non-NULL value (sorts last).
-/// - Numeric values are compared by widening to `f64`.
+/// - Numeric values are compared by widening to `f64`; decimal pairs compare
+///   with exact scale-aware ordering.
 /// - `Text` values are compared lexicographically.
 /// - `Bytea` values are compared lexicographically.
 /// - Mixed types fall back to discriminant ordering.
@@ -35,6 +37,16 @@ pub(super) fn compare_values(a: &Value, b: &Value) -> Ordering {
         (_, Value::Null) => Ordering::Less,
 
         // Numeric: widen to f64 for comparison.
+        (
+            Value::Decimal {
+                value: left_value,
+                scale: left_scale,
+            },
+            Value::Decimal {
+                value: right_value,
+                scale: right_scale,
+            },
+        ) => compare_decimals(*left_value, *left_scale, *right_value, *right_scale),
         (lhs, rhs) if both_numeric(lhs, rhs) => {
             let fa = to_f64(lhs);
             let fb = to_f64(rhs);
@@ -249,9 +261,11 @@ pub(super) fn value_key(v: &Value) -> Vec<u8> {
             out
         }
         Value::Decimal { value, scale } => {
+            let normalized = DecimalMagnitude::new(*value, *scale);
             let mut out = vec![14];
-            out.extend_from_slice(&value.to_be_bytes());
-            out.extend_from_slice(&scale.to_be_bytes());
+            out.push(u8::from(normalized.negative));
+            out.extend_from_slice(&normalized.scale.to_be_bytes());
+            out.extend_from_slice(normalized.digits.as_bytes());
             out
         }
         Value::Money(cents) => {
@@ -366,6 +380,90 @@ fn to_f64(v: &Value) -> f64 {
     }
 }
 
+fn compare_decimals(l: i64, l_scale: i32, r: i64, r_scale: i32) -> Ordering {
+    match (l.cmp(&0), r.cmp(&0)) {
+        (Ordering::Equal, Ordering::Equal) => return Ordering::Equal,
+        (Ordering::Equal, Ordering::Less) | (Ordering::Greater, Ordering::Less) => {
+            return Ordering::Greater;
+        }
+        (Ordering::Less, Ordering::Equal) | (Ordering::Less, Ordering::Greater) => {
+            return Ordering::Less;
+        }
+        _ => {}
+    }
+
+    let left = DecimalMagnitude::new(l, l_scale);
+    let right = DecimalMagnitude::new(r, r_scale);
+    let magnitude_order = left.cmp_abs(&right);
+    if left.negative {
+        magnitude_order.reverse()
+    } else {
+        magnitude_order
+    }
+}
+
+#[derive(Debug)]
+struct DecimalMagnitude {
+    negative: bool,
+    digits: String,
+    scale: i64,
+    integer_digits: i64,
+}
+
+impl DecimalMagnitude {
+    fn new(value: i64, scale: i32) -> Self {
+        if value == 0 {
+            return Self {
+                negative: false,
+                digits: "0".to_owned(),
+                scale: 0,
+                integer_digits: 1,
+            };
+        }
+
+        let mut magnitude = i128::from(value);
+        let negative = magnitude < 0;
+        if negative {
+            magnitude = -magnitude;
+        }
+
+        let mut scale = i64::from(scale);
+        while magnitude % 10 == 0 {
+            magnitude /= 10;
+            scale = scale.saturating_sub(1);
+        }
+
+        let digits = magnitude.to_string();
+        let digit_count = i64::try_from(digits.len()).unwrap_or(i64::MAX);
+        Self {
+            negative,
+            digits,
+            scale,
+            integer_digits: digit_count.saturating_sub(scale),
+        }
+    }
+
+    fn cmp_abs(&self, other: &Self) -> Ordering {
+        match self.integer_digits.cmp(&other.integer_digits) {
+            Ordering::Equal => {}
+            non_equal => return non_equal,
+        }
+
+        let max_len = self.digits.len().max(other.digits.len());
+        let left = self.digits.as_bytes();
+        let right = other.digits.as_bytes();
+        for idx in 0..max_len {
+            let l = left.get(idx).copied().unwrap_or(b'0');
+            let r = right.get(idx).copied().unwrap_or(b'0');
+            match l.cmp(&r) {
+                Ordering::Equal => {}
+                non_equal => return non_equal,
+            }
+        }
+        Ordering::Equal
+    }
+}
+
 fn compare_value_slices(a: &[Value], b: &[Value]) -> Ordering {
     for (left, right) in a.iter().zip(b) {
         let ordering = compare_values(left, right);
@@ -462,8 +560,36 @@ mod tests {
     }
 
     #[test]
+    fn decimal_values_compare_by_numeric_magnitude() {
+        assert_eq!(
+            compare_values(
+                &Value::Decimal { value: 1, scale: 0 },
+                &Value::Decimal { value: 2, scale: 0 },
+            ),
+            Ordering::Less
+        );
+        assert_eq!(
+            compare_values(
+                &Value::Decimal {
+                    value: 10,
+                    scale: 1,
+                },
+                &Value::Decimal { value: 1, scale: 0 },
+            ),
+            Ordering::Equal
+        );
+    }
+
+    #[test]
     fn value_key_same_for_equal_values() {
         assert_eq!(value_key(&Value::Int32(42)), value_key(&Value::Int32(42)));
         assert_ne!(value_key(&Value::Int32(42)), value_key(&Value::Int32(43)));
+        assert_eq!(
+            value_key(&Value::Decimal {
+                value: 10,
+                scale: 1,
+            }),
+            value_key(&Value::Decimal { value: 1, scale: 0 })
+        );
     }
 }
