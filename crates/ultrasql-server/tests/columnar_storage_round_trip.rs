@@ -93,6 +93,37 @@ async fn committed_row_store_writes_build_columnar_shadow_for_olap_scan() {
 }
 
 #[tokio::test]
+async fn direct_scalar_aggregate_skips_nullable_inputs() {
+    let (_server, client, _conn, server_handle) = start_server_and_connect().await;
+
+    client
+        .batch_execute("CREATE TABLE nullable_facts (id INT NOT NULL, v INT)")
+        .await
+        .expect("create nullable_facts table");
+    client
+        .batch_execute(
+            "INSERT INTO nullable_facts VALUES
+             (1, 10), (2, NULL), (3, 30), (4, NULL)",
+        )
+        .await
+        .expect("insert nullable facts");
+
+    let sum = client
+        .query_one("SELECT SUM(v) FROM nullable_facts", &[])
+        .await
+        .expect("sum over nullable facts");
+    assert_eq!(sum.get::<_, i64>(0), 40);
+
+    let avg = client
+        .query_one("SELECT AVG(v) FROM nullable_facts", &[])
+        .await
+        .expect("avg over nullable facts");
+    assert_eq!(avg.get::<_, f64>(0), 20.0);
+
+    shutdown(client, server_handle).await;
+}
+
+#[tokio::test]
 async fn committed_dml_invalidates_columnar_shadow_before_rebuild() {
     let (server, client, _conn, server_handle) = start_server_and_connect().await;
 

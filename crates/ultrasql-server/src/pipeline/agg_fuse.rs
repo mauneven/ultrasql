@@ -175,8 +175,8 @@ pub(super) fn try_lower_cached_scalar_aggregate_i32(
 ///
 /// Matched shapes:
 ///
-/// * `SUM(col)` over a non-NULL `Int32` or `Int64` column.
-/// * `AVG(col)` over a non-NULL `Int32` or `Int64` column.
+/// * `SUM(col)` over an `Int32` or `Int64` column.
+/// * `AVG(col)` over an `Int32` or `Int64` column.
 /// * `COUNT(*)` over any relation.
 ///
 /// Returns `Ok(None)` when:
@@ -198,11 +198,8 @@ pub(super) fn try_lower_cached_scalar_aggregate_i32(
 /// would be the (unreachable) failure of [`super::scan::lower_heap_scan`]
 /// itself.
 ///
-/// NULL fallback: the constructed [`DirectScalarAggScan`] returns
-/// [`ultrasql_executor::ExecError::Unsupported`] when an upstream batch
-/// carries a column with a validity bitmap. This is a runtime guard;
-/// the bench data is non-null so the runtime path stays on the SIMD
-/// kernel.
+/// NULL handling stays inside [`DirectScalarAggScan`]: dense batches use the
+/// vector kernel, nullable batches run a compact validity-aware fold.
 
 pub(super) fn try_lower_direct_scalar_aggregate(
     input: &LogicalPlan,

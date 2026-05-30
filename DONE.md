@@ -160,6 +160,9 @@ as a concise evidence ledger; roadmap stays for open gates only.
 - Row-value `IN` over tuple lists now binds through row constructors, evaluates
   record equality with SQL three-valued field semantics, passes wire coverage,
   and removes the public select-regression skip.
+- Direct scalar aggregate fast path for `SUM` / `AVG` now handles nullable
+  `INT` / `BIGINT` inputs by skipping NULL rows while keeping dense batches on
+  the SIMD kernel path.
 
 ## Type And Function Surface
 

@@ -7,11 +7,11 @@
 //!   └── Scan { table }
 //! ```
 //!
-//! over a single `Int32` or `Int64` column with no NULL values and
+//! over a single `Int32` or `Int64` column and
 //! lowers it to [`DirectScalarAggScan`] — a single-pass operator that
 //! drives its child a batch at a time, pulls the typed numeric column
 //! directly, and accumulates through one of the SIMD kernels in
-//! [`ultrasql_vec::kernels`]:
+//! [`ultrasql_vec::kernels`] for dense batches:
 //!
 //! * `SUM(int)`   → `sum_i32_widening` / `sum_i64`            → `Int64` output
 //! * `AVG(int)`   → `sum_*` + `count_i64` (column length)     → `Float64` output
@@ -28,13 +28,9 @@
 //! * the per-batch projection allocation, since the result schema is
 //!   fixed (`Int64` or `Float64`, single column).
 //!
-//! NULL handling: when the input column carries a validity bitmap the
-//! operator falls back to the slow path by returning `ExecError::Unsupported`
-//! — the lowerer's contract is to only construct this operator for
-//! columns that the caller has verified non-null. The bench shape
-//! (`(id INT NOT NULL, x INT)` with monotonically generated values) is
-//! always non-null; richer null-aware kernels remain on the
-//! `HashAggregate` slow path until a workload demonstrates the need.
+//! NULL handling: dense batches stay on the SIMD kernel path. Nullable
+//! batches use a compact per-row validity fold that skips invalid rows
+//! and counts only non-null rows for `SUM` / `AVG`.
 //!
 //! Output schema mirrors PostgreSQL's widening rules:
 //!
@@ -234,20 +230,9 @@ impl Operator for DirectScalarAggScan {
                             "DirectScalarAggScan: expected Int32 column".to_owned(),
                         ));
                     };
-                    // Null bitmap fallback: the lowerer is supposed
-                    // to only construct this operator over columns
-                    // that the caller has verified non-null. A
-                    // batch that carries a validity bitmap is the
-                    // result of an upstream operator we did not
-                    // expect; punt to keep correctness intact.
-                    if c.nulls().is_some() {
-                        return Err(ExecError::Unsupported(
-                            "DirectScalarAggScan: NULL-aware path not implemented; \
-                             fall back to HashAggregate",
-                        ));
-                    }
-                    total_sum = total_sum.wrapping_add(sum_i32_widening(c));
-                    count_rows = count_rows.saturating_add(c.len());
+                    let (delta, non_nulls) = sum_i32_nullable(c);
+                    total_sum = total_sum.wrapping_add(delta);
+                    count_rows = count_rows.saturating_add(non_nulls);
                 }
                 InputKind::Int64 { col_idx } => {
                     let cols = batch.columns();
@@ -263,14 +248,9 @@ impl Operator for DirectScalarAggScan {
                             "DirectScalarAggScan: expected Int64 column".to_owned(),
                         ));
                     };
-                    if c.nulls().is_some() {
-                        return Err(ExecError::Unsupported(
-                            "DirectScalarAggScan: NULL-aware path not implemented; \
-                             fall back to HashAggregate",
-                        ));
-                    }
-                    total_sum = total_sum.wrapping_add(sum_i64(c));
-                    count_rows = count_rows.saturating_add(c.len());
+                    let (delta, non_nulls) = sum_i64_nullable(c);
+                    total_sum = total_sum.wrapping_add(delta);
+                    count_rows = count_rows.saturating_add(non_nulls);
                 }
             }
         }
@@ -331,6 +311,40 @@ fn null_float64_row() -> Column {
     let mut nulls = ultrasql_vec::Bitmap::new(1, false);
     nulls.set(0, false);
     Column::Float64(NumericColumn::with_nulls(vec![0.0_f64], nulls).expect("matching lengths"))
+}
+
+fn sum_i32_nullable(c: &NumericColumn<i32>) -> (i64, usize) {
+    match c.nulls() {
+        None => (sum_i32_widening(c), c.len()),
+        Some(nulls) => {
+            let mut sum = 0_i64;
+            let mut count = 0_usize;
+            for (idx, value) in c.data().iter().copied().enumerate() {
+                if nulls.get(idx) {
+                    sum = sum.wrapping_add(i64::from(value));
+                    count = count.saturating_add(1);
+                }
+            }
+            (sum, count)
+        }
+    }
+}
+
+fn sum_i64_nullable(c: &NumericColumn<i64>) -> (i64, usize) {
+    match c.nulls() {
+        None => (sum_i64(c), c.len()),
+        Some(nulls) => {
+            let mut sum = 0_i64;
+            let mut count = 0_usize;
+            for (idx, value) in c.data().iter().copied().enumerate() {
+                if nulls.get(idx) {
+                    sum = sum.wrapping_add(value);
+                    count = count.saturating_add(1);
+                }
+            }
+            (sum, count)
+        }
+    }
 }
 
 #[cfg(test)]
@@ -510,6 +524,48 @@ mod tests {
     }
 
     #[test]
+    fn direct_scalar_sum_skips_nulls() {
+        let scan = nullable_int32_scan("x", vec![10, 20, 30, 40], &[true, false, true, false]);
+        let mut agg = DirectScalarAggScan::sum_int32(Box::new(scan), 0, "sum".into());
+
+        let batch = agg.next_batch().expect("ok").expect("row");
+
+        match &batch.columns()[0] {
+            Column::Int64(c) => assert_eq!(c.data(), &[40]),
+            other => panic!("expected Int64, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn direct_scalar_avg_skips_nulls() {
+        let scan = nullable_int64_scan("x", vec![10, 20, 30, 40], &[true, false, true, false]);
+        let mut agg = DirectScalarAggScan::avg_int64(Box::new(scan), 0, "avg".into());
+
+        let batch = agg.next_batch().expect("ok").expect("row");
+
+        match &batch.columns()[0] {
+            Column::Float64(c) => assert_eq!(c.data(), &[20.0]),
+            other => panic!("expected Float64, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn direct_scalar_sum_all_nulls_emits_null() {
+        let scan = nullable_int64_scan("x", vec![10, 20], &[false, false]);
+        let mut agg = DirectScalarAggScan::sum_int64(Box::new(scan), 0, "sum".into());
+
+        let batch = agg.next_batch().expect("ok").expect("row");
+
+        match &batch.columns()[0] {
+            Column::Int64(c) => {
+                let nulls = c.nulls().expect("null bitmap present");
+                assert!(!nulls.get(0));
+            }
+            other => panic!("expected Int64, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn direct_scalar_agg_reports_bad_column_shapes() {
         let mut out_of_range = DirectScalarAggScan::sum_int32(
             Box::new(make_int32_scan("x", vec![1])),
@@ -540,25 +596,5 @@ mod tests {
             .next_batch()
             .expect_err("wrong Int64 type must fail");
         assert!(err.to_string().contains("expected Int64 column"));
-
-        let mut nullable_i32 = DirectScalarAggScan::sum_int32(
-            Box::new(nullable_int32_scan("x", vec![1, 2], &[true, false])),
-            0,
-            "sum".into(),
-        );
-        let err = nullable_i32
-            .next_batch()
-            .expect_err("nullable Int32 fast path must fail");
-        assert!(err.to_string().contains("NULL-aware path not implemented"));
-
-        let mut nullable_i64 = DirectScalarAggScan::sum_int64(
-            Box::new(nullable_int64_scan("x", vec![1, 2], &[true, false])),
-            0,
-            "sum".into(),
-        );
-        let err = nullable_i64
-            .next_batch()
-            .expect_err("nullable Int64 fast path must fail");
-        assert!(err.to_string().contains("NULL-aware path not implemented"));
     }
 }
