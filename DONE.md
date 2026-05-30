@@ -669,6 +669,10 @@ as a concise evidence ledger; roadmap stays for open gates only.
   `pg_materialized_views.meta`, preventing stale restart sidecar records after
   direct view drops or source-table cascades. Evidence:
   `cargo test -p ultrasql-server --test materialized_view_round_trip`.
+- Dropped tables are removed from durable `pg_table_runtime.meta`, preventing
+  stale default, identity, generated-column, check, FK, exclusion, and index
+  sidecar records after `DROP TABLE`. Evidence:
+  `cargo test -p ultrasql-server --test drop_restart_round_trip`.
 - `DROP SEQUENCE` dependency tracking now treats SERIAL/identity column defaults
   as dependents: `RESTRICT` blocks sequence drops while defaults reference the
   sequence, and `CASCADE` detaches those defaults before removing the sequence.

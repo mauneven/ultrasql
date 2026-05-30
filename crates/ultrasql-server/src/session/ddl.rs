@@ -1891,6 +1891,7 @@ where
             self.state.materialized_views.remove(name);
             self.state.persistent_catalog.drop_table(name)?;
         }
+        self.state.persist_table_runtime_constraints_metadata()?;
         self.state
             .remove_materialized_view_runtime_metadata(&drop_names)?;
         // Any cached plan that referenced this name is now invalid;
