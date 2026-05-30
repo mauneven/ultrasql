@@ -227,6 +227,16 @@ as a concise evidence ledger; roadmap stays for open gates only.
   `NTH_VALUE` even when the window input is already a fixed point. Evidence:
   `cargo test -p ultrasql-optimizer constant_fold` and
   `cargo test -p ultrasql-optimizer`.
+- Optimizer strict panic audit now covers common-subexpression elimination,
+  constant-fold numeric extraction/comparison, IN-list OR rebuilds, and
+  subquery-decorrelation correlation/schema helpers. These paths now no-op or
+  return `OptimizeError::RuleFailed` instead of relying on non-test
+  `unwrap`/`expect`. Evidence:
+  `cargo test -p ultrasql-optimizer --lib -- --nocapture`,
+  `cargo clippy -p ultrasql-optimizer --lib --all-features -- -D clippy::unwrap_used -D clippy::expect_used`,
+  `cargo clippy -p ultrasql-optimizer --all-targets --all-features -- -D warnings`,
+  and
+  `cargo clippy -p ultrasql-server --lib --all-features -- -D clippy::unwrap_used -D clippy::expect_used`.
 - Decimal sort comparison no longer treats scale-normalization overflow as
   equality; high-scale `NUMERIC` ordering uses overflow-safe digit alignment
   shared by full sort and top-k. Evidence:

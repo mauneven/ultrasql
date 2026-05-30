@@ -82,8 +82,15 @@ fn eliminate(plan: &LogicalPlan) -> Result<Option<LogicalPlan>, OptimizeError> {
         // ---------------------------------------------------------------
         LogicalPlan::Filter { input, predicate } => {
             let exprs = vec![predicate.clone()];
-            if let Some((new_exprs, inject)) = maybe_hoist(exprs, input) {
-                let new_pred = new_exprs.into_iter().next().expect("exactly one expr");
+            if let Some((new_exprs, inject)) = maybe_hoist(exprs, input)? {
+                let new_pred =
+                    new_exprs
+                        .into_iter()
+                        .next()
+                        .ok_or_else(|| OptimizeError::RuleFailed {
+                            rule: "common_subexpr_elimination",
+                            detail: "predicate rewrite produced no expression".to_owned(),
+                        })?;
                 return Ok(Some(LogicalPlan::Filter {
                     input: Box::new(LogicalPlan::Project {
                         schema: inject.schema.clone(),
@@ -112,7 +119,7 @@ fn eliminate(plan: &LogicalPlan) -> Result<Option<LogicalPlan>, OptimizeError> {
             let raw_exprs: Vec<ScalarExpr> = exprs.iter().map(|(e, _)| e.clone()).collect();
             let names: Vec<String> = exprs.iter().map(|(_, n)| n.clone()).collect();
 
-            if let Some((new_raw, inject)) = maybe_hoist(raw_exprs, input) {
+            if let Some((new_raw, inject)) = maybe_hoist(raw_exprs, input)? {
                 let new_exprs: Vec<(ScalarExpr, String)> = new_raw.into_iter().zip(names).collect();
                 return Ok(Some(LogicalPlan::Project {
                     schema: schema.clone(),
@@ -213,10 +220,10 @@ struct InjectedProject {
 fn maybe_hoist(
     mut exprs: Vec<ScalarExpr>,
     input: &LogicalPlan,
-) -> Option<(Vec<ScalarExpr>, InjectedProject)> {
+) -> Result<Option<(Vec<ScalarExpr>, InjectedProject)>, OptimizeError> {
     let total_nodes = exprs.iter().map(expr_size).sum::<usize>();
     if total_nodes > MAX_CSE_TOTAL_NODES {
-        return None;
+        return Ok(None);
     }
 
     // Step 1: count all sub-tree occurrences.
@@ -232,7 +239,7 @@ fn maybe_hoist(
         .collect();
 
     if candidates.is_empty() {
-        return None;
+        return Ok(None);
     }
 
     // Step 3: order by descending size (hoist largest first to avoid
@@ -282,15 +289,18 @@ fn maybe_hoist(
         let dt = e.data_type();
         schema_fields.push(Field::nullable(n.as_str(), dt));
     }
-    let schema = Schema::new(schema_fields).expect("cse inject schema ok");
+    let schema = Schema::new(schema_fields).map_err(|err| OptimizeError::RuleFailed {
+        rule: "common_subexpr_elimination",
+        detail: format!("CSE injection schema: {err}"),
+    })?;
 
-    Some((
+    Ok(Some((
         exprs,
         InjectedProject {
             exprs: inject_exprs,
             schema,
         },
-    ))
+    )))
 }
 
 // ============================================================================

@@ -262,8 +262,8 @@ fn rewrite_scalar_subquery_filter(
         let (outer_predicates, post_join_predicates) =
             split_outer_only_conjuncts(&rewritten_predicate, outer_width);
         let outer_input = filter_with_conjuncts(outer.clone(), outer_predicates);
-        let join_condition = build_correlation_condition(&right.corr_pairs, outer_width);
-        let join_schema = concat_schemas(outer_input.schema(), right.plan.schema());
+        let join_condition = build_correlation_condition(&right.corr_pairs, outer_width)?;
+        let join_schema = concat_schemas(outer_input.schema(), right.plan.schema())?;
         let join = LogicalPlan::Join {
             left: Box::new(outer_input),
             right: Box::new(right.plan),
@@ -282,7 +282,7 @@ fn rewrite_scalar_subquery_filter(
         "__scalar_subquery".to_owned(),
     )?;
     let right = alias_first_column(*subplan, "__scalar_subquery")?;
-    let join_schema = concat_schemas(outer.schema(), right.schema());
+    let join_schema = concat_schemas(outer.schema(), right.schema())?;
     let join = LogicalPlan::Join {
         left: Box::new(outer.clone()),
         right: Box::new(right),
@@ -309,9 +309,9 @@ fn rewrite_project_with_scalar_subquery(
             let mut predicates = vec![build_correlation_condition_against_right_schema(
                 &right.corr_pairs,
                 outer_width,
-            )];
+            )?];
             predicates.extend(right.residual_predicates);
-            let join_schema = concat_schemas(input.schema(), right.plan.schema());
+            let join_schema = concat_schemas(input.schema(), right.plan.schema())?;
             let join = LogicalPlan::Join {
                 left: Box::new(input.clone()),
                 right: Box::new(right.plan),
@@ -339,7 +339,7 @@ fn rewrite_project_with_scalar_subquery(
             "__scalar_subquery".to_owned(),
         ) {
             let right = alias_first_column(*subplan, "__scalar_subquery")?;
-            let join_schema = concat_schemas(input.schema(), right.schema());
+            let join_schema = concat_schemas(input.schema(), right.schema())?;
             let join = LogicalPlan::Join {
                 left: Box::new(input.clone()),
                 right: Box::new(right),
@@ -672,7 +672,7 @@ fn rewrite_exists_filter_expr(outer: &LogicalPlan, predicate: &ScalarExpr) -> Op
     if exists_input.residual_predicates.is_empty() {
         let right =
             distinct_correlation_keys(exists_input.clean_subplan, &exists_input.corr_pairs)?;
-        let join_condition = build_correlation_condition(&exists_input.corr_pairs, outer_width);
+        let join_condition = build_correlation_condition(&exists_input.corr_pairs, outer_width)?;
         let join = LogicalPlan::Join {
             left: Box::new(outer.clone()),
             right: Box::new(right),
@@ -696,7 +696,7 @@ fn rewrite_exists_filter_expr(outer: &LogicalPlan, predicate: &ScalarExpr) -> Op
     let mut join_predicates = vec![build_correlation_condition_against_right_schema(
         &corr_pairs,
         outer_width,
-    )];
+    )?];
     join_predicates.extend(residual_predicates);
     let join_condition = conjuncts_to_and(join_predicates);
     let join = LogicalPlan::Join {
@@ -967,7 +967,7 @@ fn rewrite_correlated_in_subquery(
     let mut predicates = vec![build_correlation_condition_against_right_schema(
         &corr_pairs,
         outer_width,
-    )];
+    )?];
     predicates.push(ScalarExpr::Binary {
         op: BinaryOp::Eq,
         left: Box::new(outer_expr.clone()),
@@ -1295,7 +1295,7 @@ fn alias_first_column(input: LogicalPlan, name: &str) -> Option<LogicalPlan> {
     })
 }
 
-fn build_correlation_condition(pairs: &[CorrPair], outer_width: usize) -> ScalarExpr {
+fn build_correlation_condition(pairs: &[CorrPair], outer_width: usize) -> Option<ScalarExpr> {
     let mut predicates = pairs
         .iter()
         .enumerate()
@@ -1313,19 +1313,19 @@ fn build_correlation_condition(pairs: &[CorrPair], outer_width: usize) -> Scalar
             }),
             data_type: DataType::Bool,
         });
-    let first = predicates.next().expect("at least one correlation pair");
-    predicates.fold(first, |left, right| ScalarExpr::Binary {
+    let first = predicates.next()?;
+    Some(predicates.fold(first, |left, right| ScalarExpr::Binary {
         op: BinaryOp::And,
         left: Box::new(left),
         right: Box::new(right),
         data_type: DataType::Bool,
-    })
+    }))
 }
 
 fn build_correlation_condition_against_right_schema(
     pairs: &[CorrPair],
     outer_width: usize,
-) -> ScalarExpr {
+) -> Option<ScalarExpr> {
     let mut predicates = pairs.iter().map(|pair| ScalarExpr::Binary {
         op: BinaryOp::Eq,
         left: Box::new(ScalarExpr::Column {
@@ -1340,13 +1340,13 @@ fn build_correlation_condition_against_right_schema(
         }),
         data_type: DataType::Bool,
     });
-    let first = predicates.next().expect("at least one correlation pair");
-    predicates.fold(first, |left, right| ScalarExpr::Binary {
+    let first = predicates.next()?;
+    Some(predicates.fold(first, |left, right| ScalarExpr::Binary {
         op: BinaryOp::And,
         left: Box::new(left),
         right: Box::new(right),
         data_type: DataType::Bool,
-    })
+    }))
 }
 
 fn filter_with_conjuncts(input: LogicalPlan, conjuncts: Vec<ScalarExpr>) -> LogicalPlan {
@@ -1771,7 +1771,7 @@ fn rewrite_filter(outer: &LogicalPlan, kind: SubqueryKind) -> Option<LogicalPlan
             let outer_width = outer.schema().len();
 
             // Build join schema: outer columns ++ sub columns.
-            let join_schema = concat_schemas(outer.schema(), sub_schema);
+            let join_schema = concat_schemas(outer.schema(), sub_schema)?;
 
             // Join condition: no explicit predicate (correlated predicate is
             // assumed to already be embedded in the sub plan as a Filter).
@@ -1809,7 +1809,7 @@ fn rewrite_filter(outer: &LogicalPlan, kind: SubqueryKind) -> Option<LogicalPlan
             let outer_width = outer.schema().len();
 
             // Build join schema: outer columns ++ sub columns.
-            let join_schema = concat_schemas(outer.schema(), sub_schema);
+            let join_schema = concat_schemas(outer.schema(), sub_schema)?;
 
             // Join condition: outer_expr = inner_col.
             let inner_col_in_join = shift_column_index(&inner_col, outer_width);
@@ -1846,7 +1846,7 @@ fn rewrite_filter(outer: &LogicalPlan, kind: SubqueryKind) -> Option<LogicalPlan
 // ============================================================================
 
 /// Concatenate two schemas into one.
-fn concat_schemas(left: &Schema, right: &Schema) -> Schema {
+fn concat_schemas(left: &Schema, right: &Schema) -> Option<Schema> {
     let mut fields: Vec<Field> = Vec::with_capacity(left.len() + right.len());
     let mut names = std::collections::HashSet::with_capacity(left.len() + right.len());
     for i in 0..left.len() {
@@ -1868,7 +1868,7 @@ fn concat_schemas(left: &Schema, right: &Schema) -> Schema {
             nullable: field.nullable,
         });
     }
-    Schema::new(fields).expect("concat_schemas: invariants hold for non-empty schemas")
+    Schema::new(fields).ok()
 }
 
 /// Generate a synthetic column name for a right-side schema column at `idx`.

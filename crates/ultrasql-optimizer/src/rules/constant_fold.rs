@@ -730,13 +730,13 @@ fn eval_arith(op: BinaryOp, lv: &Value, rv: &Value, result_type: &DataType) -> O
         (Value::Int64(a), Value::Int64(b)) => eval_arith_i64(op, *a, *b),
         (Value::Float32(a), Value::Float32(b)) => eval_arith_f32(op, *a, *b),
         (Value::Float64(a), Value::Float64(b)) => eval_arith_f64(op, *a, *b),
-        (a, b) if a.as_i64().is_some() && b.as_i64().is_some() => {
-            eval_arith_i64(op, a.as_i64().unwrap(), b.as_i64().unwrap())
-        }
-        (a, b) if a.as_f64().is_some() && b.as_f64().is_some() => {
-            eval_arith_f64(op, a.as_f64().unwrap(), b.as_f64().unwrap())
-        }
-        _ => None,
+        (a, b) => match (a.as_i64(), b.as_i64()) {
+            (Some(a), Some(b)) => eval_arith_i64(op, a, b),
+            _ => match (a.as_f64(), b.as_f64()) {
+                (Some(a), Some(b)) => eval_arith_f64(op, a, b),
+                _ => None,
+            },
+        },
     };
     result.map(|v| ScalarExpr::Literal {
         value: v,
@@ -837,13 +837,13 @@ fn cmp_values(a: &Value, b: &Value) -> Option<std::cmp::Ordering> {
         (Value::Int64(x), Value::Int64(y)) => x.partial_cmp(y),
         (Value::Float32(x), Value::Float32(y)) => x.partial_cmp(y),
         (Value::Float64(x), Value::Float64(y)) => x.partial_cmp(y),
-        (a, b) if a.as_i64().is_some() && b.as_i64().is_some() => {
-            a.as_i64().unwrap().partial_cmp(&b.as_i64().unwrap())
-        }
-        (a, b) if a.as_f64().is_some() && b.as_f64().is_some() => {
-            a.as_f64().unwrap().partial_cmp(&b.as_f64().unwrap())
-        }
-        _ => None,
+        (a, b) => match (a.as_i64(), b.as_i64()) {
+            (Some(a), Some(b)) => a.partial_cmp(&b),
+            _ => match (a.as_f64(), b.as_f64()) {
+                (Some(a), Some(b)) => a.partial_cmp(&b),
+                _ => None,
+            },
+        },
     }
 }
 

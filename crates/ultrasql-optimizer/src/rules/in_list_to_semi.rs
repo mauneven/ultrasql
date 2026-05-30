@@ -186,7 +186,7 @@ fn try_collapse_or_list(expr: &ScalarExpr) -> Option<ScalarExpr> {
     // canonical OR-tree. The structure is unchanged but the pattern is
     // recognised.
     // TODO(future RFC): lower to ScalarExpr::InList when that variant lands.
-    let rebuilt = rebuild_or_tree(disjuncts);
+    let rebuilt = rebuild_or_tree(disjuncts)?;
     if &rebuilt == expr {
         None
     } else {
@@ -212,10 +212,9 @@ fn split_or(expr: &ScalarExpr) -> Vec<ScalarExpr> {
 }
 
 /// Fold a slice of disjuncts back into a left-deep OR tree.
-fn rebuild_or_tree(disjuncts: Vec<ScalarExpr>) -> ScalarExpr {
-    assert!(!disjuncts.is_empty());
+fn rebuild_or_tree(disjuncts: Vec<ScalarExpr>) -> Option<ScalarExpr> {
     let mut it = disjuncts.into_iter();
-    let mut result = it.next().expect("non-empty");
+    let mut result = it.next()?;
     for d in it {
         result = ScalarExpr::Binary {
             op: BinaryOp::Or,
@@ -224,7 +223,7 @@ fn rebuild_or_tree(disjuncts: Vec<ScalarExpr>) -> ScalarExpr {
             data_type: ultrasql_core::DataType::Bool,
         };
     }
-    result
+    Some(result)
 }
 
 // ---------------------------------------------------------------------------
