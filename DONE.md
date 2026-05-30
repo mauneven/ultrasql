@@ -138,6 +138,11 @@ as a concise evidence ledger; roadmap stays for open gates only.
   `cargo clippy -p ultrasql-storage --lib --all-features -- -D clippy::unwrap_used -D clippy::expect_used`;
   remaining infallible `PageRead`/`PageWrite`/`Page::header` invariants have
   narrow documented lint allows because those APIs cannot return `Result`.
+- Catalog binary decoder fixed-width reads now use the checked `Reader::fixed`
+  helper instead of `try_into().unwrap()`, preserving typed `DecodeError` on
+  truncated catalog heap bytes. Evidence:
+  `cargo test -p ultrasql-catalog encoding::tests::truncated_payload_is_caught -- --nocapture`
+  and `cargo clippy -p ultrasql-catalog --all-targets --all-features -- -D warnings`.
 - Backup/restore smoke runner covers `ultrasql --basebackup`,
   `ultrasql --pg-dump`, `ultrasql --pg-restore`, row counts, and indexed lookup.
 - Backup/restore dump-format certification now covers custom, directory, and

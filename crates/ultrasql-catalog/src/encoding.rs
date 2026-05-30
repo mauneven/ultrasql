@@ -159,26 +159,33 @@ impl<'a> Reader<'a> {
         self.pos += n;
         Ok(out)
     }
+    fn fixed<const N: usize>(&mut self) -> Result<[u8; N], DecodeError> {
+        let bytes = self.take(N)?;
+        bytes.try_into().map_err(|_| DecodeError::UnexpectedEnd {
+            needed: N,
+            have: bytes.len(),
+        })
+    }
     fn u8(&mut self) -> Result<u8, DecodeError> {
         Ok(self.take(1)?[0])
     }
     fn i16(&mut self) -> Result<i16, DecodeError> {
-        Ok(i16::from_le_bytes(self.take(2)?.try_into().unwrap()))
+        Ok(i16::from_le_bytes(self.fixed()?))
     }
     fn u32(&mut self) -> Result<u32, DecodeError> {
-        Ok(u32::from_le_bytes(self.take(4)?.try_into().unwrap()))
+        Ok(u32::from_le_bytes(self.fixed()?))
     }
     fn i64(&mut self) -> Result<i64, DecodeError> {
-        Ok(i64::from_le_bytes(self.take(8)?.try_into().unwrap()))
+        Ok(i64::from_le_bytes(self.fixed()?))
     }
     fn i32(&mut self) -> Result<i32, DecodeError> {
-        Ok(i32::from_le_bytes(self.take(4)?.try_into().unwrap()))
+        Ok(i32::from_le_bytes(self.fixed()?))
     }
     fn f32(&mut self) -> Result<f32, DecodeError> {
-        Ok(f32::from_le_bytes(self.take(4)?.try_into().unwrap()))
+        Ok(f32::from_le_bytes(self.fixed()?))
     }
     fn f64(&mut self) -> Result<f64, DecodeError> {
-        Ok(f64::from_le_bytes(self.take(8)?.try_into().unwrap()))
+        Ok(f64::from_le_bytes(self.fixed()?))
     }
     fn bool(&mut self) -> Result<bool, DecodeError> {
         match self.u8()? {
