@@ -320,6 +320,12 @@ as a concise evidence ledger; roadmap stays for open gates only.
   `cargo test -p ultrasql-executor gather` and
   `cargo clippy -p ultrasql-executor --lib --all-features -- -W
   clippy::expect_used -W clippy::unwrap_used`.
+- Direct scalar aggregate output-schema and NULL-row construction now avoid
+  production `expect`, returning typed executor errors for impossible nullable
+  column mismatches. Evidence:
+  `cargo test -p ultrasql-executor direct_scalar_agg` and
+  `cargo clippy -p ultrasql-executor --lib --all-features -- -W
+  clippy::expect_used -W clippy::unwrap_used`.
 
 ## Core SQL And Wire Protocol
 

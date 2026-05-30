@@ -174,8 +174,13 @@ impl DirectScalarAggScan {
         output_type: DataType,
         output_name: String,
     ) -> Self {
-        let output_schema = Schema::new([Field::required(output_name, output_type)])
-            .expect("trivial single-column schema is well-formed");
+        let output_schema = match Schema::new([Field::required(output_name, output_type)]) {
+            Ok(schema) => schema,
+            Err(err) => {
+                tracing::error!(error = %err, "direct scalar aggregate schema construction failed");
+                Schema::empty()
+            }
+        };
         Self {
             child,
             kind,
@@ -261,7 +266,7 @@ impl Operator for DirectScalarAggScan {
         let result_col = match self.kind {
             DirectScalarAggKind::Sum => {
                 if count_rows == 0 {
-                    null_int64_row()
+                    null_int64_row()?
                 } else {
                     Column::Int64(NumericColumn::from_data(vec![total_sum]))
                 }
@@ -272,7 +277,7 @@ impl Operator for DirectScalarAggScan {
             }
             DirectScalarAggKind::Avg => {
                 if count_rows == 0 {
-                    null_float64_row()
+                    null_float64_row()?
                 } else {
                     // Widen through f64 once. Matches PostgreSQL's
                     // `AVG(INT) → DOUBLE PRECISION` widening rule
@@ -300,17 +305,21 @@ impl Operator for DirectScalarAggScan {
 }
 
 /// Build a single-row `Int64` column carrying SQL `NULL`.
-fn null_int64_row() -> Column {
+fn null_int64_row() -> Result<Column, ExecError> {
     let mut nulls = ultrasql_vec::Bitmap::new(1, false);
     nulls.set(0, false);
-    Column::Int64(NumericColumn::with_nulls(vec![0_i64], nulls).expect("matching lengths"))
+    NumericColumn::with_nulls(vec![0_i64], nulls)
+        .map(Column::Int64)
+        .map_err(|err| ExecError::TypeMismatch(format!("direct scalar SUM NULL row: {err}")))
 }
 
 /// Build a single-row `Float64` column carrying SQL `NULL`.
-fn null_float64_row() -> Column {
+fn null_float64_row() -> Result<Column, ExecError> {
     let mut nulls = ultrasql_vec::Bitmap::new(1, false);
     nulls.set(0, false);
-    Column::Float64(NumericColumn::with_nulls(vec![0.0_f64], nulls).expect("matching lengths"))
+    NumericColumn::with_nulls(vec![0.0_f64], nulls)
+        .map(Column::Float64)
+        .map_err(|err| ExecError::TypeMismatch(format!("direct scalar AVG NULL row: {err}")))
 }
 
 fn sum_i32_nullable(c: &NumericColumn<i32>) -> (i64, usize) {
