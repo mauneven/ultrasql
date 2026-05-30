@@ -62,7 +62,7 @@ pub fn len_text_scalar(column: &StringColumn, validity: Option<&Bitmap>) -> Nume
     let mut data: Vec<i64> = Vec::with_capacity(n);
     for i in 0..n {
         let bytes = column.value(i).as_bytes();
-        data.push(i64::try_from(bytes.len()).expect("row byte length fits in i64"));
+        data.push(i64::try_from(bytes.len()).unwrap_or(i64::MAX));
     }
     finalize_numeric_i64(data, column.nulls(), validity, n)
 }
@@ -229,44 +229,32 @@ fn finalize_string_with(
         let src_offsets = column.offsets();
         for i in 0..n {
             if bm.get(i) {
-                let start = usize::try_from(src_offsets[i]).expect("offset fits in usize");
-                let end = usize::try_from(src_offsets[i + 1]).expect("offset fits in usize");
+                let Ok(start) = usize::try_from(src_offsets[i]) else {
+                    return all_null_strings(n);
+                };
+                let Ok(end) = usize::try_from(src_offsets[i + 1]) else {
+                    return all_null_strings(n);
+                };
+                if end > values.len() || start > end {
+                    return all_null_strings(n);
+                }
                 new_values.extend_from_slice(&values[start..end]);
             }
-            let len_u32 =
-                u32::try_from(new_values.len()).expect("text kernel total bytes fit in u32 offset");
+            let Ok(len_u32) = u32::try_from(new_values.len()) else {
+                return all_null_strings(n);
+            };
             new_offsets.push(len_u32);
         }
-        let rows: Vec<String> = (0..n)
-            .map(|i| {
-                let start = usize::try_from(new_offsets[i]).expect("offset fits in usize");
-                let end = usize::try_from(new_offsets[i + 1]).expect("offset fits in usize");
-                // `new_values` here is exclusively ASCII-stable transforms of
-                // the source UTF-8 bytes (or zero-length null slots), so the
-                // bytes are valid UTF-8.
-                std::str::from_utf8(&new_values[start..end])
-                    .expect("ASCII case fold preserves UTF-8")
-                    .to_string()
-            })
-            .collect();
-        match StringColumn::with_nulls(rows, bm.clone()) {
+
+        match StringColumn::from_parts(new_offsets, new_values, Some(bm.clone())) {
             Ok(c) => c,
             Err(ColumnError::LengthMismatch { column, .. }) => all_null_strings(column),
             Err(_) => StringColumn::from_data(Vec::<String>::new()),
         }
     } else {
         // No nulls — reuse the source column's offsets verbatim.
-        let src_offsets = column.offsets();
-        let rows: Vec<String> = (0..n)
-            .map(|i| {
-                let start = usize::try_from(src_offsets[i]).expect("offset fits in usize");
-                let end = usize::try_from(src_offsets[i + 1]).expect("offset fits in usize");
-                std::str::from_utf8(&values[start..end])
-                    .expect("ASCII case fold preserves UTF-8")
-                    .to_string()
-            })
-            .collect();
-        StringColumn::from_data(rows)
+        StringColumn::from_parts(column.offsets().to_vec(), values, None)
+            .unwrap_or_else(|_| all_null_strings(n))
     }
 }
 

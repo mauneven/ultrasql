@@ -431,6 +431,14 @@ as a concise evidence ledger; roadmap stays for open gates only.
   `cargo test -p ultrasql-vec min_f64`,
   `cargo test -p ultrasql-vec range_mask_i64`, and
   `cargo clippy -p ultrasql-vec --all-targets --all-features -- -D warnings`.
+- Vector text kernels no longer use production `expect` paths while rebuilding
+  ASCII case-folded string columns; offset/UTF-8 validation now flows through
+  `StringColumn::from_parts` and fails closed on impossible invariant breaks.
+  Evidence: `cargo test -p ultrasql-vec len_text`,
+  `cargo test -p ultrasql-vec lower_text`,
+  `cargo test -p ultrasql-vec upper_text`, `cargo check --workspace
+  --all-targets`, and `cargo clippy -p ultrasql-vec --all-targets
+  --all-features -- -D warnings`.
 
 ## Core SQL And Wire Protocol
 
