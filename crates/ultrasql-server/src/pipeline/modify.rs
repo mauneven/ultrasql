@@ -1684,7 +1684,9 @@ pub(super) fn try_build_fused_update(
 
     let rel = RelationId(entry.oid);
     if exact_int32_pair {
-        let target_col = u8::try_from(*target_col_usize).expect("target_col fits in u8");
+        let Ok(target_col) = u8::try_from(*target_col_usize) else {
+            return Ok(None);
+        };
         let block_count = ctx.heap.block_count(rel).max(entry.n_blocks);
         let op = FusedUpdateInt32Add::new(
             Arc::clone(&ctx.heap),
@@ -1967,7 +1969,10 @@ pub(super) fn try_build_fused_delete(
                 ultrasql_vec::kernels::CmpOp::Ge => FusedCmp::Ge,
             };
             Some(FusedPredicate {
-                col_index: u8::try_from(pred_col_idx).expect("col idx fits in u8"),
+                col_index: match u8::try_from(pred_col_idx) {
+                    Ok(col_index) => col_index,
+                    Err(_) => return Ok(None),
+                },
                 op: fused_cmp,
                 literal: lit,
             })

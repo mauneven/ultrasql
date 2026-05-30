@@ -247,6 +247,11 @@ as a concise evidence ledger; roadmap stays for open gates only.
   `cargo test -p ultrasql-server cte_helpers` and
   `cargo clippy -p ultrasql-server --lib --all-features -- -W
   clippy::expect_used -W clippy::unwrap_used`.
+- Fused UPDATE/DELETE lowering now treats out-of-range hot-path column indexes
+  as a non-match for the fused path instead of relying on `expect` after
+  `usize -> u8` conversions. Evidence:
+  `cargo clippy -p ultrasql-server --lib --all-features -- -W
+  clippy::expect_used -W clippy::unwrap_used`.
 
 ## Core SQL And Wire Protocol
 
