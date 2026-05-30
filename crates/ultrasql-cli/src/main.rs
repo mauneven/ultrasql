@@ -1322,7 +1322,7 @@ async fn http_ops_endpoint(method: &str, endpoint: &str, path: &str) -> Result<O
     })
 }
 
-fn run_waldump(path: &PathBuf) -> Result<()> {
+fn run_waldump(path: &Path) -> Result<()> {
     let bytes = read_regular_file_capped(path, "WAL file", waldump_file_limit_bytes())?;
     println!("file: {}", path.display());
     println!("bytes: {}", bytes.len());

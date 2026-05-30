@@ -613,8 +613,11 @@ fn read_location_bytes(location: &str) -> Result<Vec<u8>> {
 }
 
 fn read_local_regular_bytes(path: &Path) -> Result<Vec<u8>> {
+    read_local_regular_bytes_with_limit(path, iceberg_local_read_limit_bytes())
+}
+
+fn read_local_regular_bytes_with_limit(path: &Path, limit: u64) -> Result<Vec<u8>> {
     let metadata = ensure_local_regular_file(path)?;
-    let limit = iceberg_local_read_limit_bytes();
     if metadata.len() > limit {
         return Err(IcebergError::Io(format!(
             "iceberg_scan local file exceeds limit: {} size={} limit={limit}",
@@ -1083,24 +1086,14 @@ mod tests {
 
     #[test]
     fn read_local_regular_bytes_rejects_configured_oversized_file() {
-        let _env_guard = iceberg_env_test_lock();
-        // SAFETY: iceberg_env_test_lock serializes process-env mutation in
-        // this module's tests.
-        unsafe {
-            std::env::set_var("ULTRASQL_ICEBERG_LOCAL_READ_LIMIT_BYTES", "3");
-        }
         let temp = tempfile::tempdir().expect("tempdir");
         let metadata = temp.path().join("oversized.metadata.json");
         fs::write(&metadata, b"abcd").expect("write oversized metadata");
 
-        let err = read_local_regular_bytes(&metadata).expect_err("oversized metadata rejected");
+        let err = read_local_regular_bytes_with_limit(&metadata, 3)
+            .expect_err("oversized metadata rejected");
 
         assert!(err.to_string().contains("local file exceeds limit"));
-        // SAFETY: iceberg_env_test_lock serializes process-env mutation in
-        // this module's tests.
-        unsafe {
-            std::env::remove_var("ULTRASQL_ICEBERG_LOCAL_READ_LIMIT_BYTES");
-        }
     }
 
     #[test]
@@ -1467,12 +1460,5 @@ mod tests {
             fs::write(table_dir.join(file_name), b"PAR1").expect("write data placeholder");
         }
         writer.flush().expect("flush manifest");
-    }
-
-    fn iceberg_env_test_lock() -> std::sync::MutexGuard<'static, ()> {
-        static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
-        LOCK.get_or_init(|| std::sync::Mutex::new(()))
-            .lock()
-            .expect("iceberg env test lock")
     }
 }

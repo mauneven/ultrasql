@@ -1787,7 +1787,7 @@ mod tests {
             .expect_err("second file read should be lazy");
         let message = err.to_string();
         assert!(
-            message.contains("cannot open") && message.contains("second.parquet"),
+            message.contains("cannot inspect") && message.contains("second.parquet"),
             "unexpected lazy read error: {message}"
         );
     }

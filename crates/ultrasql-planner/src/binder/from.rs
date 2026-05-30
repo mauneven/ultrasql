@@ -2262,7 +2262,11 @@ mod tests {
             &path,
             format!(
                 "{}\n1\n",
-                "a".repeat(READ_CSV_HEADER_SAMPLE_BYTES as usize + 1)
+                "a".repeat(
+                    usize::try_from(READ_CSV_HEADER_SAMPLE_BYTES)
+                        .expect("CSV header sample limit fits usize")
+                        + 1,
+                )
             ),
         )
         .expect("write csv");

@@ -438,6 +438,13 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn build_server_config_rejects_symlinked_pem_files() {
+        let _env_guard = tls_env_test_lock();
+        // SAFETY: tls_env_test_lock serializes process-env mutation in this
+        // module's tests.
+        unsafe {
+            std::env::remove_var("ULTRASQL_TLS_PEM_LIMIT_BYTES");
+        }
+
         use std::io::Write;
         use std::os::unix::fs::symlink;
 

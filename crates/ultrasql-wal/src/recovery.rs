@@ -256,7 +256,10 @@ pub fn recover_with_target(
 }
 
 fn read_segment_bytes(path: &Path) -> Result<Vec<u8>, RecoveryError> {
-    let limit = recovery_segment_read_limit_bytes();
+    read_segment_bytes_with_limit(path, recovery_segment_read_limit_bytes())
+}
+
+fn read_segment_bytes_with_limit(path: &Path, limit: u64) -> Result<Vec<u8>, RecoveryError> {
     let file = open_recovery_segment(path)?;
     let file_len = file.metadata()?.len();
     if file_len > limit {
@@ -410,28 +413,16 @@ mod tests {
 
     #[test]
     fn recovery_rejects_configured_oversized_segment() {
-        let _env_guard = recovery_env_test_lock();
-        // SAFETY: recovery_env_test_lock serializes process-env mutation in
-        // this module's tests.
-        unsafe {
-            std::env::set_var("ULTRASQL_WAL_RECOVERY_SEGMENT_LIMIT_BYTES", "3");
-        }
-
         let dir = TempDir::new().unwrap();
-        std::fs::write(dir.path().join("segment_0000000000"), [0_u8; 4]).unwrap();
+        let path = dir.path().join("segment_0000000000");
+        std::fs::write(&path, [0_u8; 4]).unwrap();
 
-        let err = recover(dir.path(), |_| Ok(())).unwrap_err();
+        let err = read_segment_bytes_with_limit(&path, 3).unwrap_err();
         assert!(
             err.to_string()
                 .contains("WAL segment exceeds recovery read limit"),
             "{err}"
         );
-
-        // SAFETY: recovery_env_test_lock serializes process-env mutation in
-        // this module's tests.
-        unsafe {
-            std::env::remove_var("ULTRASQL_WAL_RECOVERY_SEGMENT_LIMIT_BYTES");
-        }
     }
 
     fn commit_record(xid: Xid, commit_timestamp_micros: u64) -> WalRecord {
@@ -440,11 +431,5 @@ mod tests {
             commit_timestamp_micros,
         };
         WalRecord::new(RecordType::Commit, xid, Lsn::ZERO, 0, payload.encode())
-    }
-
-    fn recovery_env_test_lock() -> std::sync::MutexGuard<'static, ()> {
-        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-        LOCK.lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 }
