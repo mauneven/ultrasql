@@ -127,10 +127,9 @@ pub fn filter_eq_f64(column: &NumericColumn<f64>, scalar: f64) -> Bitmap {
     let mut chunks = data.chunks_exact(64);
     let full = chunks.len();
     for (word, chunk) in words.iter_mut().zip(&mut chunks) {
-        let c: &[f64; 64] = chunk
-            .try_into()
-            .expect("chunks_exact(64) yields 64-element slices");
-        *word = pack_eq_f64_64(c, sbits);
+        if let Ok(c) = <&[f64; 64]>::try_from(chunk) {
+            *word = pack_eq_f64_64(c, sbits);
+        }
     }
     let rest = chunks.remainder();
     if !rest.is_empty() {
@@ -165,10 +164,9 @@ where
     let mut chunks = data.chunks_exact(64);
     let full = chunks.len();
     for (word, chunk) in words.iter_mut().zip(&mut chunks) {
-        let c: &[i32; 64] = chunk
-            .try_into()
-            .expect("chunks_exact(64) yields 64-element slices");
-        *word = pack_cmp_64_i32(c, scalar, &cmp);
+        if let Ok(c) = <&[i32; 64]>::try_from(chunk) {
+            *word = pack_cmp_64_i32(c, scalar, &cmp);
+        }
     }
     let rest = chunks.remainder();
     if !rest.is_empty() {
@@ -189,10 +187,9 @@ where
     let mut chunks = data.chunks_exact(64);
     let full = chunks.len();
     for (word, chunk) in words.iter_mut().zip(&mut chunks) {
-        let c: &[i64; 64] = chunk
-            .try_into()
-            .expect("chunks_exact(64) yields 64-element slices");
-        *word = pack_cmp_64_i64(c, scalar, &cmp);
+        if let Ok(c) = <&[i64; 64]>::try_from(chunk) {
+            *word = pack_cmp_64_i64(c, scalar, &cmp);
+        }
     }
     let rest = chunks.remainder();
     if !rest.is_empty() {

@@ -421,6 +421,16 @@ as a concise evidence ledger; roadmap stays for open gates only.
   `cargo test -p ultrasql-vec auto_encoding`, `cargo check --workspace
   --all-targets`, and `cargo clippy -p ultrasql-vec --all-targets
   --all-features -- -D warnings`.
+- Vector filter/compare/min chunk packing no longer uses fixed-slice
+  `expect` conversions on `chunks_exact`; impossible conversion failures now
+  skip the word instead of panicking. Evidence:
+  `cargo test -p ultrasql-vec filter_eq`,
+  `cargo test -p ultrasql-vec eq_i32`,
+  `cargo test -p ultrasql-vec cmp_i32`,
+  `cargo test -p ultrasql-vec cmp_gt_i64`,
+  `cargo test -p ultrasql-vec min_f64`,
+  `cargo test -p ultrasql-vec range_mask_i64`, and
+  `cargo clippy -p ultrasql-vec --all-targets --all-features -- -D warnings`.
 
 ## Core SQL And Wire Protocol
 

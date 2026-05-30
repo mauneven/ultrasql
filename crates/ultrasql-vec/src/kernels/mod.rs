@@ -142,13 +142,9 @@ fn eq_i32_pack_into(a: &[i32], b: &[i32], words: &mut [u64]) {
     for (out_word, (ca, cb)) in words.iter_mut().zip((&mut chunks_a).zip(&mut chunks_b)) {
         // Fixed-size views give LLVM enough info to drop bounds
         // checks across the eight 8-lane sub-compares below.
-        let ca: &[i32; 64] = ca
-            .try_into()
-            .expect("chunks_exact(64) yields 64-element slices");
-        let cb: &[i32; 64] = cb
-            .try_into()
-            .expect("chunks_exact(64) yields 64-element slices");
-        *out_word = pack_eq_64(ca, cb);
+        if let (Ok(ca), Ok(cb)) = (<&[i32; 64]>::try_from(ca), <&[i32; 64]>::try_from(cb)) {
+            *out_word = pack_eq_64(ca, cb);
+        }
     }
 
     // Trailing partial word, up to 63 lanes.
@@ -317,7 +313,9 @@ fn min_f64_dense(data: &[f64]) -> Option<f64> {
     let chunks = data.chunks_exact(4);
     let rem = chunks.remainder();
     for c in chunks {
-        let arr: &[f64; 4] = c.try_into().expect("chunks_exact(4) yields 4 elements");
+        let Ok(arr) = <&[f64; 4]>::try_from(c) else {
+            continue;
+        };
         // `is_nan() ^ true` is `!is_nan()`. We OR all the
         // non-NaN flags into `saw_value` to know if the column has
         // any usable value at the end.
@@ -556,10 +554,9 @@ fn cmp_gt_i64_pack_into(a: &[i64], scalar: i64, words: &mut [u64]) {
     let mut chunks = a.chunks_exact(64);
     let full_words = chunks.len();
     for (out_word, c) in words.iter_mut().zip(&mut chunks) {
-        let arr: &[i64; 64] = c
-            .try_into()
-            .expect("chunks_exact(64) yields 64-element slices");
-        *out_word = pack_cmp_gt_64(arr, scalar);
+        if let Ok(arr) = <&[i64; 64]>::try_from(c) {
+            *out_word = pack_cmp_gt_64(arr, scalar);
+        }
     }
 
     // Trailing partial word, up to 63 lanes.
@@ -796,10 +793,9 @@ fn cmp_i32_pack_into(a: &[i32], scalar: i32, op: CmpOp, words: &mut [u64]) {
     let mut chunks = a.chunks_exact(64);
     let full_words = chunks.len();
     for (out_word, c) in words.iter_mut().zip(&mut chunks) {
-        let arr: &[i32; 64] = c
-            .try_into()
-            .expect("chunks_exact(64) yields 64-element slices");
-        *out_word = pack_cmp_i32_64(arr, scalar, op);
+        if let Ok(arr) = <&[i32; 64]>::try_from(c) {
+            *out_word = pack_cmp_i32_64(arr, scalar, op);
+        }
     }
     let rest = chunks.remainder();
     if !rest.is_empty() {
@@ -836,10 +832,9 @@ fn cmp_i64_pack_into(a: &[i64], scalar: i64, op: CmpOp, words: &mut [u64]) {
     let mut chunks = a.chunks_exact(64);
     let full_words = chunks.len();
     for (out_word, c) in words.iter_mut().zip(&mut chunks) {
-        let arr: &[i64; 64] = c
-            .try_into()
-            .expect("chunks_exact(64) yields 64-element slices");
-        *out_word = pack_cmp_i64_64(arr, scalar, op);
+        if let Ok(arr) = <&[i64; 64]>::try_from(c) {
+            *out_word = pack_cmp_i64_64(arr, scalar, op);
+        }
     }
     let rest = chunks.remainder();
     if !rest.is_empty() {
