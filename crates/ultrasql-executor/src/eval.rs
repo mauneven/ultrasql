@@ -169,8 +169,13 @@ pub(crate) fn eval_expr(
 
         ScalarExpr::Parameter { index, .. } => {
             // Parameter indices are 1-based; convert to 0-based for slice access.
-            let zero_idx = usize::try_from(index.saturating_sub(1))
-                .expect("parameter index fits usize on all supported targets");
+            let zero_idx = index
+                .checked_sub(1)
+                .and_then(|idx| usize::try_from(idx).ok())
+                .ok_or(EvalError::ParameterIndex {
+                    index: *index,
+                    len: params.len(),
+                })?;
             params
                 .get(zero_idx)
                 .cloned()
@@ -7096,6 +7101,16 @@ mod tests {
         let err = ev.eval(&[]).unwrap_err();
         assert!(
             matches!(err, EvalError::ParameterIndex { index: 3, len: 1 }),
+            "unexpected: {err}"
+        );
+    }
+
+    #[test]
+    fn zero_parameter_index_returns_error() {
+        let ev = Eval::with_params(param(0), vec![Value::Int32(99)]);
+        let err = ev.eval(&[]).unwrap_err();
+        assert!(
+            matches!(err, EvalError::ParameterIndex { index: 0, len: 1 }),
             "unexpected: {err}"
         );
     }

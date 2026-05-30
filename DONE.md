@@ -333,6 +333,12 @@ as a concise evidence ledger; roadmap stays for open gates only.
   `cargo test -p ultrasql-executor seq_scan` and
   `cargo clippy -p ultrasql-executor --lib --all-features -- -W
   clippy::expect_used -W clippy::unwrap_used`.
+- Scalar parameter evaluation now rejects `$0` and out-of-range bind indexes
+  with `EvalError::ParameterIndex` instead of depending on saturating
+  subtraction plus a production `expect`. Evidence:
+  `cargo test -p ultrasql-executor parameter_` and
+  `cargo clippy -p ultrasql-executor --lib --all-features -- -W
+  clippy::expect_used -W clippy::unwrap_used`.
 
 ## Core SQL And Wire Protocol
 
