@@ -168,6 +168,10 @@ as a concise evidence ledger; roadmap stays for open gates only.
 - `CHAR(n)` / `bpchar` parser, binder, row codec, executor, OID 1042, COPY,
   catalog persistence, blank padding, assignment/cast truncation, and
   trailing-space comparison semantics exist.
+- `VARCHAR(n)` now enforces character-length bounds through heap row encoding,
+  returns SQLSTATE `22001` on overlength wire inserts, preserves the bound in
+  durable table metadata, and removes the parser/type regression skip for
+  overlength `INSERT`.
 - `DATE`, `TIME`, `TIMETZ`, `TIMESTAMP`, `TIMESTAMPTZ`, and `INTERVAL` runtime
   types exist. `TIMETZ` has parser, binder, row codec, executor, COPY, catalog
   persistence, OID 1266, ISO display, casts, coercions, and offset comparison.

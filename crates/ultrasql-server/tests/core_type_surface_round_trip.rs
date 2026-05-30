@@ -3,7 +3,7 @@
 
 mod support;
 
-use support::{shutdown, start_sample_server};
+use support::{shutdown, start_persistent_server, start_sample_server};
 use tokio_postgres::SimpleQueryMessage;
 
 #[tokio::test]
@@ -71,6 +71,49 @@ async fn core_scalar_types_round_trip_over_postgres_wire() {
         _ => None,
     });
     assert_eq!(payload, Some("\\xdeadbeef"));
+
+    let err = client
+        .batch_execute(
+            "INSERT INTO core_type_surface VALUES (
+                1, 2, 3, 1.0, 2.0, 'x', 'too-long-varchar', '\\x00'::bytea, TRUE
+             )",
+        )
+        .await
+        .expect_err("overlength varchar insert must fail");
+    assert_eq!(
+        err.code().map(tokio_postgres::error::SqlState::code),
+        Some("22001")
+    );
+
+    shutdown(running).await;
+}
+
+#[tokio::test]
+async fn varchar_length_limit_survives_restart() {
+    let data_dir = tempfile::TempDir::new().expect("temp dir");
+    let running = start_persistent_server(data_dir.path(), "varchar_restart").await;
+    running
+        .client
+        .batch_execute("CREATE TABLE varchar_restart (label VARCHAR(3) NOT NULL)")
+        .await
+        .expect("create varchar table");
+    running
+        .client
+        .batch_execute("INSERT INTO varchar_restart VALUES ('abc')")
+        .await
+        .expect("insert bounded varchar before restart");
+    shutdown(running).await;
+
+    let running = start_persistent_server(data_dir.path(), "varchar_restart").await;
+    let err = running
+        .client
+        .batch_execute("INSERT INTO varchar_restart VALUES ('abcd')")
+        .await
+        .expect_err("overlength varchar insert must fail after restart");
+    assert_eq!(
+        err.code().map(tokio_postgres::error::SqlState::code),
+        Some("22001")
+    );
 
     shutdown(running).await;
 }

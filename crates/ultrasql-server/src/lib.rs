@@ -678,7 +678,10 @@ fn data_type_token(ty: &DataType) -> Option<String> {
         DataType::Money => Some("money".to_owned()),
         DataType::Float32 => Some("f32".to_owned()),
         DataType::Float64 => Some("f64".to_owned()),
-        DataType::Text { .. } => Some("text".to_owned()),
+        DataType::Text {
+            max_len: Some(max_len),
+        } => Some(format!("varchar:{max_len}")),
+        DataType::Text { max_len: None } => Some("text".to_owned()),
         DataType::Char { len: Some(len) } => Some(format!("char:{len}")),
         DataType::Char { len: None } => Some("char".to_owned()),
         DataType::Bit { len: Some(len) } => Some(format!("bit:{len}")),
@@ -707,6 +710,14 @@ fn data_type_from_token(token: &str) -> Option<DataType> {
             .parse::<u32>()
             .ok()
             .map(|len| DataType::Char { len: Some(len) });
+    }
+    if let Some(max_len_text) = token.strip_prefix("varchar:") {
+        return max_len_text
+            .parse::<u32>()
+            .ok()
+            .map(|max_len| DataType::Text {
+                max_len: Some(max_len),
+            });
     }
     if let Some(len_text) = token.strip_prefix("bit:") {
         return len_text

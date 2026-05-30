@@ -473,7 +473,8 @@ impl RowCodec {
                         &field.data_type,
                     )?;
                 }
-                (DataType::Text { .. }, Value::Text(s)) => {
+                (DataType::Text { max_len }, Value::Text(s)) => {
+                    validate_varchar_storage_text(s, *max_len, col_idx, &field.data_type)?;
                     encode_varlena_text(&mut payload, s, col_idx, &field.data_type)?;
                 }
                 (DataType::Enum { labels, .. }, Value::Text(s))
@@ -2937,6 +2938,29 @@ fn encode_varlena_text(
     Ok(())
 }
 
+fn validate_varchar_storage_text(
+    text: &str,
+    max_len: Option<u32>,
+    column: usize,
+    ty: &DataType,
+) -> Result<(), RowCodecError> {
+    let Some(max_len) = max_len else {
+        return Ok(());
+    };
+    let max_len_usize = usize::try_from(max_len).map_err(|_| RowCodecError::UnsupportedType {
+        column,
+        ty: ty.clone(),
+    })?;
+    if text.chars().nth(max_len_usize).is_some() {
+        return Err(RowCodecError::StringDataRightTruncation {
+            column,
+            ty: ty.clone(),
+            detail: format!("value too long for type character varying({max_len})"),
+        });
+    }
+    Ok(())
+}
+
 fn normalize_jsonb_storage_text(
     text: &str,
     column: usize,
@@ -3104,6 +3128,9 @@ mod tests {
     fn schema_text() -> Schema {
         Schema::new([Field::required("s", DataType::Text { max_len: None })]).unwrap()
     }
+    fn schema_varchar3() -> Schema {
+        Schema::new([Field::required("s", DataType::Text { max_len: Some(3) })]).unwrap()
+    }
     fn schema_char4() -> Schema {
         Schema::new([Field::required("c", DataType::Char { len: Some(4) })]).unwrap()
     }
@@ -3197,6 +3224,15 @@ mod tests {
             let row = vec![Value::Text(s.to_owned())];
             assert_eq!(codec.decode(&codec.encode(&row).unwrap()).unwrap(), row);
         }
+    }
+
+    #[test]
+    fn bounded_varchar_rejects_overlength_text_assignment() {
+        let codec = RowCodec::new(schema_varchar3());
+        assert!(matches!(
+            codec.encode(&[Value::Text("abcd".to_owned())]),
+            Err(RowCodecError::StringDataRightTruncation { column: 0, .. })
+        ));
     }
 
     #[test]
