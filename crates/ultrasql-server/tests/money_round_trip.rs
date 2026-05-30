@@ -103,5 +103,18 @@ async fn money_cast_insert_select_and_extended_wire_type() {
         .collect();
     assert_eq!(values, vec![vec!["2.5".to_owned(), "$2.50".to_owned()]]);
 
+    let rounded_division = client
+        .simple_query("SELECT '$5.01'::money / 2.0::float8")
+        .await
+        .expect("money float division");
+    let values: Vec<String> = rounded_division
+        .into_iter()
+        .filter_map(|message| match message {
+            tokio_postgres::SimpleQueryMessage::Row(row) => row.get(0).map(str::to_owned),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(values, vec!["$2.51".to_owned()]);
+
     shutdown(running).await;
 }

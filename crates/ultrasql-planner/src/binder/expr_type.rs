@@ -221,6 +221,7 @@ fn money_arithmetic_type(op: BinaryOp, left: &DataType, right: &DataType) -> Opt
         (BinaryOp::Add | BinaryOp::Sub, DataType::Money, DataType::Money) => Some(DataType::Money),
         (BinaryOp::Div, DataType::Money, DataType::Money) => Some(DataType::Float64),
         (BinaryOp::Div, DataType::Money, ty) if ty.is_integer() => Some(DataType::Money),
+        (BinaryOp::Div, DataType::Money, ty) if ty.is_float() => Some(DataType::Money),
         _ => None,
     }
 }

@@ -861,6 +861,9 @@ fn binds_money_division_matrix() {
 
     let divided = parse_and_bind("SELECT '$5.01'::money / 2", &cat).expect("bind ok");
     assert_eq!(divided.schema().field_at(0).data_type, DataType::Money);
+
+    let rounded = parse_and_bind("SELECT '$5.01'::money / 2.0::float8", &cat).expect("bind ok");
+    assert_eq!(rounded.schema().field_at(0).data_type, DataType::Money);
 }
 
 #[test]

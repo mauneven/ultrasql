@@ -4047,6 +4047,12 @@ fn money_arith(left: &Value, right: &Value, op: ArithOp) -> Result<Option<Value>
         (Value::Money(cents), Value::Int64(divisor), ArithOp::Div) => {
             money_integer_div(*cents, *divisor).map(Some)
         }
+        (Value::Money(cents), Value::Float32(divisor), ArithOp::Div) => {
+            money_float_div(*cents, f64::from(*divisor)).map(Some)
+        }
+        (Value::Money(cents), Value::Float64(divisor), ArithOp::Div) => {
+            money_float_div(*cents, *divisor).map(Some)
+        }
         (Value::Money(_), Value::Money(_), _) => Err(EvalError::Type(
             "money arithmetic supports addition, subtraction, and division".to_owned(),
         )),
@@ -4069,6 +4075,18 @@ fn money_integer_div(cents: i64, divisor: i64) -> Result<Value, EvalError> {
     }
     cents
         .checked_div(divisor)
+        .map(Value::Money)
+        .ok_or(EvalError::Overflow)
+}
+
+fn money_float_div(cents: i64, divisor: f64) -> Result<Value, EvalError> {
+    if divisor == 0.0 {
+        return Err(EvalError::DivByZero);
+    }
+    let divided = cents_to_f64(cents) / divisor;
+    divided
+        .round()
+        .to_i64()
         .map(Value::Money)
         .ok_or(EvalError::Overflow)
 }
@@ -6481,6 +6499,17 @@ mod tests {
             data_type: DataType::Money,
         });
         assert!(matches!(zero_int.eval(&[]), Err(EvalError::DivByZero)));
+
+        let rounded = Eval::new(ScalarExpr::Binary {
+            op: BinaryOp::Div,
+            left: Box::new(lit_money(501)),
+            right: Box::new(lit_f64(2.0)),
+            data_type: DataType::Money,
+        });
+        assert_eq!(
+            rounded.eval(&[]).expect("money float div"),
+            Value::Money(251)
+        );
     }
 
     #[test]
