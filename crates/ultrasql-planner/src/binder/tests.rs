@@ -773,6 +773,16 @@ fn binds_create_table_numeric_typmods_like_postgres() {
 }
 
 #[test]
+fn rejects_zero_numeric_precision() {
+    let cat = InMemoryCatalog::new();
+    let err = parse_and_bind("CREATE TABLE t (n NUMERIC(0,2))", &cat).expect_err("must reject");
+    let PlanError::TypeMismatch(message) = err else {
+        panic!("expected TypeMismatch, got {err:?}");
+    };
+    assert!(message.contains("NUMERIC precision"));
+}
+
+#[test]
 fn binds_text_literal_cast_to_numeric_with_literal_scale() {
     let cat = InMemoryCatalog::new();
     let plan = parse_and_bind("SELECT '12.340'::numeric AS amount", &cat).expect("bind ok");

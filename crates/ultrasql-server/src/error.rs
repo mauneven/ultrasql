@@ -225,6 +225,7 @@ impl ServerError {
             | Self::Catalog(ultrasql_catalog::CatalogError::AlreadyExists(_)) => "42P07",
             Self::Plan(ultrasql_planner::PlanError::DuplicateColumn(_)) => "42701", // duplicate_column
             Self::Plan(ultrasql_planner::PlanError::ColumnNotFound(_)) => "42703", // undefined_column
+            Self::Plan(ultrasql_planner::PlanError::TypeMismatch(_)) => "42804", // datatype_mismatch
             // undefined_table — coarse planner fallback plus the catalog
             // NotFound that surfaces when DROP / ALTER fails to resolve a name
             Self::Plan(_) | Self::Catalog(ultrasql_catalog::CatalogError::NotFound(_)) => "42P01",

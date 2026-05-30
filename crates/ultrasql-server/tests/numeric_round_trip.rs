@@ -75,3 +75,18 @@ async fn numeric_precision_overflow_reports_sqlstate() {
     );
     shutdown(running).await;
 }
+
+#[tokio::test]
+async fn numeric_zero_precision_is_rejected() {
+    let running = start_sample_server("numeric_round_trip").await;
+    let err = running
+        .client
+        .batch_execute("CREATE TABLE numeric_bad_precision (amount NUMERIC(0,2))")
+        .await
+        .expect_err("zero precision numeric must fail");
+    assert_eq!(
+        err.code().map(tokio_postgres::error::SqlState::code),
+        Some("42804")
+    );
+    shutdown(running).await;
+}

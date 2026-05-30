@@ -36,6 +36,8 @@ use crate::plan::{
     LogicalTimePartition, LogicalUniqueConstraint,
 };
 
+const MAX_NUMERIC_PRECISION: u32 = 131_072;
+
 struct RawUniqueConstraint {
     name: String,
     columns: Vec<String>,
@@ -1160,15 +1162,7 @@ pub(super) fn resolve_type_name(t: &TypeName) -> Result<DataType, PlanError> {
         // The row codec stores values in PostgreSQL's base-10000 numeric
         // payload shape; executor arithmetic still narrows runtime values
         // to the current Decimal representation.
-        "decimal" | "numeric" => {
-            let precision = t.type_modifiers.first().copied();
-            let scale = match t.type_modifiers.as_slice() {
-                [] => None,
-                [_] => Some(0),
-                [_, s, ..] => i32::try_from(*s).ok(),
-            };
-            Ok(DataType::Decimal { precision, scale })
-        }
+        "decimal" | "numeric" => resolve_decimal_type(t),
         "money" => Ok(DataType::Money),
         "oid" => Ok(DataType::Oid),
         "regclass" => Ok(DataType::RegClass),
@@ -1250,6 +1244,38 @@ fn resolve_varbit_type(max_len: Option<u32>) -> Result<DataType, PlanError> {
         ));
     }
     Ok(DataType::VarBit { max_len })
+}
+
+fn resolve_decimal_type(t: &TypeName) -> Result<DataType, PlanError> {
+    if t.type_modifiers.len() > 2 {
+        return Err(PlanError::TypeMismatch(
+            "NUMERIC accepts at most precision and scale modifiers".to_owned(),
+        ));
+    }
+    let precision = t.type_modifiers.first().copied();
+    if matches!(precision, Some(0)) {
+        return Err(PlanError::TypeMismatch(
+            "NUMERIC precision must be at least 1".to_owned(),
+        ));
+    }
+    if matches!(precision, Some(p) if p > MAX_NUMERIC_PRECISION) {
+        return Err(PlanError::TypeMismatch(format!(
+            "NUMERIC precision must be at most {MAX_NUMERIC_PRECISION}"
+        )));
+    }
+    let modifiers = t.type_modifiers.as_slice();
+    let scale = match modifiers {
+        [] => None,
+        [_] => Some(0),
+        [_, s] => {
+            let scale = i32::try_from(*s).map_err(|_| {
+                PlanError::TypeMismatch("NUMERIC scale does not fit int32".to_owned())
+            })?;
+            Some(scale)
+        }
+        _ => unreachable!("modifier length checked above"),
+    };
+    Ok(DataType::Decimal { precision, scale })
 }
 
 fn resolve_vector_family_type(
