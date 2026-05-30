@@ -114,6 +114,11 @@ as a concise evidence ledger; roadmap stays for open gates only.
 - Chaos testing: random kill, WAL truncation, disk full recovery is implemented
   through `benchmarks/chaos_recovery.sh` and writes
   `benchmarks/results/latest/chaos_recovery_manifest.json`.
+- Heap WAL append failures after page mutation now return typed
+  `HeapError::Wal` and poison the buffer pool instead of panicking or letting
+  later page access/flush continue with unlogged dirty bytes. Evidence:
+  `cargo test -p ultrasql-storage --lib` and
+  `cargo clippy -p ultrasql-storage --all-targets --all-features -- -D warnings`.
 - Backup/restore smoke runner covers `ultrasql --basebackup`,
   `ultrasql --pg-dump`, `ultrasql --pg-restore`, row counts, and indexed lookup.
 - Backup/restore dump-format certification now covers custom, directory, and

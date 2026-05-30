@@ -20,7 +20,7 @@ use ultrasql_mvcc::tuple_header::{InfoMask, TUPLE_HEADER_SIZE};
 use ultrasql_mvcc::{Snapshot, Visibility, is_visible};
 
 use super::*;
-use crate::buffer_pool::BufferPool;
+use crate::buffer_pool::{BufferPool, BufferPoolError};
 use crate::page::Page;
 
 /// Test loader that materializes blank heap pages on first miss
@@ -1591,12 +1591,11 @@ mod wal_emission {
     // -------------------------------------------------------------------
 
     // -------------------------------------------------------------------
-    // 9. WAL append failure after a committed page mutation panics
+    // 9. WAL append failure after a committed page mutation is reported
     // -------------------------------------------------------------------
 
     /// A WAL sink that always rejects every record. Used to verify that
-    /// the heap panics rather than silently returning `Err` once a page
-    /// mutation is committed.
+    /// the heap propagates WAL sink failure instead of panicking.
     struct RejectingWalSink;
 
     impl WalSink for RejectingWalSink {
@@ -1616,17 +1615,12 @@ mod wal_emission {
     }
 
     #[test]
-    fn wal_append_failure_during_insert_panics() {
+    fn wal_append_failure_during_insert_returns_wal_error() {
         let heap = make_heap(8);
         let sink = RejectingWalSink;
 
-        // The page mutation will succeed, then sink.append will return
-        // Err. The heap must panic rather than returning that Err to the
-        // caller, because the on-page state has already been committed.
-        // AssertUnwindSafe is safe here: the test does not share any
-        // mutable state across the unwind boundary.
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            heap.insert(
+        let err = heap
+            .insert(
                 rel(),
                 b"will-write-then-wal-fail",
                 InsertOptions {
@@ -1637,10 +1631,19 @@ mod wal_emission {
                     wal: Some(&sink),
                 },
             )
-        }));
+            .unwrap_err();
         assert!(
-            result.is_err(),
-            "heap insert must panic when WAL append fails after a committed page mutation"
+            matches!(err, HeapError::Wal(WalSinkError::Rejected(_))),
+            "heap insert should return Wal error, got {err:?}"
+        );
+
+        let poisoned = heap.insert(rel(), b"blocked-after-wal-failure", opts(43));
+        assert!(
+            matches!(
+                poisoned,
+                Err(HeapError::BufferPool(BufferPoolError::Poisoned))
+            ),
+            "heap should reject later page access after WAL failure, got {poisoned:?}"
         );
     }
 

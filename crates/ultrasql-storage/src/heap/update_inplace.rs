@@ -636,6 +636,7 @@ impl<L: PageLoader> HeapAccess<L> {
             if let Some(sink) = wal {
                 if !wal_scratch.is_empty() {
                     let lsn = Self::emit_update_in_place_batch_wal(
+                        &self.pool,
                         sink,
                         src_page_id,
                         xid,
@@ -1106,6 +1107,7 @@ impl<L: PageLoader> HeapAccess<L> {
 
         if let Some(sink) = wal {
             let lsn = Self::emit_update_in_place_wal(
+                &self.pool,
                 sink,
                 tid,
                 xid,

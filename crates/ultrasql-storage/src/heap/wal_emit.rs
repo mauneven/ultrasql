@@ -23,6 +23,26 @@ use crate::wal_sink::WalSink;
 use super::{HeapAccess, HeapError, HeapTuple, InsertOptions, UpdateOptions, UpdateOutcome};
 
 impl<L: PageLoader> HeapAccess<L> {
+    /// Append a WAL record after its page mutation has already landed.
+    ///
+    /// A rejection here means dirty page bytes may exist without a WAL record
+    /// that can replay them. Mark the pool poisoned before returning so the
+    /// service rejects later page access and can restart from a consistent WAL
+    /// position instead of continuing with unsafe state.
+    pub(super) fn append_after_page_mutation(
+        pool: &Arc<BufferPool<L>>,
+        sink: &dyn WalSink,
+        record: WalRecord,
+    ) -> Result<Lsn, HeapError> {
+        match sink.append(record) {
+            Ok(lsn) => Ok(lsn),
+            Err(err) => {
+                pool.poison_after_wal_error();
+                Err(HeapError::Wal(err))
+            }
+        }
+    }
+
     /// Stamp the page-LSN field of `page_id` with `lsn`.
     ///
     /// This must be called **after** the WAL append that assigned `lsn` so
@@ -113,11 +133,9 @@ impl<L: PageLoader> HeapAccess<L> {
             0,
             payload.encode()?,
         )?;
-        // FPW must succeed; if the sink rejects it the page mutation must not
-        // proceed or the WAL would be missing the page image needed for recovery.
-        let lsn: Lsn = sink
-            .append(record)
-            .expect("FPW wal append must succeed before a page mutation; failure is unrecoverable");
+        // FPW is emitted before the mutation. If the sink rejects it, no page
+        // bytes have changed yet, so normal error propagation is safe.
+        let lsn: Lsn = sink.append(record)?;
         // Stamp the page LSN with the FPW LSN so we don't emit duplicate FPWs
         // for subsequent mutations in the same checkpoint cycle.
         Self::stamp_page_lsn(pool, page_id, lsn)?;
@@ -133,8 +151,9 @@ impl<L: PageLoader> HeapAccess<L> {
     ///
     /// This function must be called **after** the page guard has been dropped
     /// so no buffer-pool pin is held during WAL I/O. If the sink rejects the
-    /// record after the page has been written the process panics: the page
-    /// state has already diverged from the WAL and continuing risks data loss.
+    /// record after the page has been written, the buffer pool is poisoned and
+    /// [`HeapError::Wal`] is returned; callers must treat that as fatal and
+    /// restart from WAL before accepting more work.
     pub(super) fn emit_insert_wal(
         pool: &Arc<BufferPool<L>>,
         tid: TupleId,
@@ -161,13 +180,7 @@ impl<L: PageLoader> HeapAccess<L> {
                 0,
                 payload_bytes,
             )?;
-            // SAFETY of panic: the page has already been mutated. If the
-            // sink rejects the record the on-disk state has diverged from
-            // the WAL; panicking and restarting from the WAL is the only
-            // correct recovery path.
-            let lsn: Lsn = sink.append(record).expect(
-                "wal append must succeed after a committed page mutation; failure is unrecoverable",
-            );
+            let lsn: Lsn = Self::append_after_page_mutation(pool, sink, record)?;
             // Stamp the page LSN now that the WAL record is durable.
             // WAL append happened before stamp so page LSN is never ahead of WAL.
             Self::stamp_page_lsn(pool, tid.page, lsn)?;
@@ -186,7 +199,8 @@ impl<L: PageLoader> HeapAccess<L> {
     ///
     /// This function must be called **after** all page guards have been
     /// dropped. If the sink rejects the record after both the old and new
-    /// versions have been written the process panics (same reasoning as
+    /// versions have been written, the buffer pool is poisoned and
+    /// [`HeapError::Wal`] is returned (same reasoning as
     /// [`Self::emit_insert_wal`]).
     ///
     /// When the old and new pages differ (non-HOT), both pages are stamped
@@ -222,12 +236,7 @@ impl<L: PageLoader> HeapAccess<L> {
             .encode()?;
             let record =
                 WalRecord::new(RecordType::HeapUpdate, opts.xid, prev_lsn, 0, payload_bytes)?;
-            // SAFETY of panic: both old and new page versions have been
-            // written. If the sink rejects the record the WAL has diverged
-            // from the page state; the only correct response is to abort.
-            let lsn: Lsn = sink.append(record).expect(
-                "wal append must succeed after a committed page mutation; failure is unrecoverable",
-            );
+            let lsn: Lsn = Self::append_after_page_mutation(pool, sink, record)?;
             // Stamp the new page with the WAL LSN.
             Self::stamp_page_lsn(pool, outcome.new_tid.page, lsn)?;
             // For non-HOT updates the old and new pages differ; stamp
@@ -256,9 +265,10 @@ impl<L: PageLoader> HeapAccess<L> {
     /// still has every applied row covered up to the cut.
     ///
     /// Failure semantics match `emit_update_wal`: a sink rejection
-    /// after the page mutation has committed panics, because the
-    /// only correct response is to crash and replay from the WAL.
+    /// after the page mutation poisons the buffer pool and returns a
+    /// fatal WAL error so the service can restart from the WAL.
     pub(super) fn emit_update_in_place_wal(
+        pool: &Arc<BufferPool<L>>,
         sink: &dyn WalSink,
         tid: TupleId,
         writer_xid: Xid,
@@ -282,9 +292,7 @@ impl<L: PageLoader> HeapAccess<L> {
             0,
             payload_bytes,
         )?;
-        let lsn: Lsn = sink.append(record).expect(
-            "wal append must succeed after a committed page mutation; failure is unrecoverable",
-        );
+        let lsn: Lsn = Self::append_after_page_mutation(pool, sink, record)?;
         Ok(lsn)
     }
 
@@ -297,6 +305,7 @@ impl<L: PageLoader> HeapAccess<L> {
     /// CRC before replay; a flushed page image is protected by the
     /// page LSN check, matching the existing FPW + redo contract.
     pub(super) fn emit_update_in_place_batch_wal(
+        pool: &Arc<BufferPool<L>>,
         sink: &dyn WalSink,
         page_id: PageId,
         writer_xid: Xid,
@@ -328,9 +337,7 @@ impl<L: PageLoader> HeapAccess<L> {
             0,
             payload_bytes,
         )?;
-        let lsn: Lsn = sink.append(record).expect(
-            "wal append must succeed after a committed page mutation; failure is unrecoverable",
-        );
+        let lsn: Lsn = Self::append_after_page_mutation(pool, sink, record)?;
         Ok(lsn)
     }
 
@@ -341,6 +348,7 @@ impl<L: PageLoader> HeapAccess<L> {
     /// as a distinct type so VACUUM / recovery telemetry can branch
     /// on path origin.
     pub(super) fn emit_delete_in_place_wal(
+        pool: &Arc<BufferPool<L>>,
         sink: &dyn WalSink,
         tid: TupleId,
         xmax: Xid,
@@ -355,9 +363,7 @@ impl<L: PageLoader> HeapAccess<L> {
             0,
             payload_bytes,
         )?;
-        let lsn: Lsn = sink.append(record).expect(
-            "wal append must succeed after a committed page mutation; failure is unrecoverable",
-        );
+        let lsn: Lsn = Self::append_after_page_mutation(pool, sink, record)?;
         Ok(lsn)
     }
 }

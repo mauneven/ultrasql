@@ -55,12 +55,12 @@ pub enum WalSinkError {
 /// # Failure contract
 ///
 /// An implementation that returns `Err` from `append` **after** the caller
-/// has applied a page mutation will cause the calling thread to panic and
-/// tear down. Implementations should reserve `Err` for pre-mutation
-/// conditions (encoding rejection, queue-full before any page change).
-/// Once the on-disk page state has diverged from the WAL there is no safe
-/// way to continue; the only correct response is to abort the process so
-/// recovery starts from a consistent WAL position.
+/// has applied a page mutation will cause the caller to poison the buffer
+/// pool and return a fatal storage error. Implementations should reserve
+/// `Err` for true WAL failures (disk full, closed queue, checksum writer
+/// failure). Once page state has diverged from the WAL there is no safe way
+/// to continue accepting work; the owning service must restart so recovery
+/// starts from a consistent WAL position.
 ///
 /// # Thread safety
 ///

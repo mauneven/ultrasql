@@ -159,9 +159,9 @@ impl<L: PageLoader> HeapAccess<L> {
     ///
     /// Payload encoding runs before the page mutation so an encode failure
     /// short-circuits without touching the page. If encoding succeeds but
-    /// the WAL append later fails the process panics: the page state has
-    /// already diverged from the WAL and continuing would risk silent data
-    /// loss.
+    /// the WAL append later fails, the buffer pool is poisoned and
+    /// [`HeapError::Wal`] is returned; callers must restart from WAL before
+    /// accepting more work.
     pub fn delete(&self, tid: TupleId, opts: DeleteOptions<'_>) -> Result<(), HeapError> {
         // Encode the WAL payload BEFORE the page mutation so that an encode
         // failure cleanly aborts without touching the page.
@@ -204,12 +204,10 @@ impl<L: PageLoader> HeapAccess<L> {
         }
 
         // Append the WAL record outside the pin scope. If append returns
-        // Err the page has already been mutated; the only safe response is
-        // to panic and let the process restart from a consistent WAL state.
+        // Err the page has already been mutated; poison the buffer pool and
+        // return a fatal WAL error so the service can restart from WAL.
         if let Some((sink, record)) = wal_record {
-            let lsn: Lsn = sink.append(record).expect(
-                "wal append must succeed after a committed page mutation; failure is unrecoverable",
-            );
+            let lsn: Lsn = Self::append_after_page_mutation(&self.pool, sink, record)?;
             // Stamp the page LSN so recovery knows the on-page state was
             // logged at this LSN. WAL append completes before stamp so the
             // page LSN is never ahead of the WAL.
@@ -335,10 +333,7 @@ impl<L: PageLoader> HeapAccess<L> {
                     let prev_lsn = sink.last_lsn_for(opts.xmax);
                     let record =
                         WalRecord::new(RecordType::HeapDelete, opts.xmax, prev_lsn, 0, payload)?;
-                    last_lsn = sink.append(record).expect(
-                        "wal append must succeed after a committed page mutation; \
-                         failure is unrecoverable",
-                    );
+                    last_lsn = Self::append_after_page_mutation(&self.pool, sink, record)?;
                 }
                 Self::stamp_page_lsn(&self.pool, page_id, last_lsn)?;
             }
@@ -543,7 +538,8 @@ impl<L: PageLoader> HeapAccess<L> {
             if let Some(sink) = wal {
                 let mut last_lsn = ultrasql_core::Lsn::ZERO;
                 for tid in wal_scratch.iter().copied() {
-                    let lsn = Self::emit_delete_in_place_wal(sink, tid, xid, command_id)?;
+                    let lsn =
+                        Self::emit_delete_in_place_wal(&self.pool, sink, tid, xid, command_id)?;
                     last_lsn = lsn;
                 }
                 if !wal_scratch.is_empty() {

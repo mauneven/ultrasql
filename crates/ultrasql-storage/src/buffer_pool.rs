@@ -75,6 +75,11 @@ pub enum BufferPoolError {
         /// The page that was contended.
         page_id: PageId,
     },
+
+    /// A post-mutation WAL append failed, so the pool may hold dirty
+    /// pages that are not covered by durable WAL records.
+    #[error("buffer pool poisoned after WAL append failure")]
+    Poisoned,
 }
 
 /// Page loader callback.
@@ -166,6 +171,13 @@ pub struct BufferPool<L: PageLoader> {
     /// resident maximum. A single monotonic allocator per relation prevents
     /// two split paths from reusing the same page id.
     btree_block_allocators: Mutex<HashMap<RelationId, Arc<AtomicU32>>>,
+    /// Set after a post-mutation WAL append failure.
+    ///
+    /// At that point an in-memory page may contain bytes not described by
+    /// WAL. The only safe production response is to reject further page
+    /// access and let the owning service restart from the last consistent
+    /// WAL position.
+    poisoned: AtomicBool,
 }
 
 impl<L: PageLoader> std::fmt::Debug for BufferPool<L> {
@@ -247,6 +259,7 @@ impl<L: PageLoader> BufferPool<L> {
             relation_counters: DashMap::new(),
             btree_latches: Mutex::new(HashMap::new()),
             btree_block_allocators: Mutex::new(HashMap::new()),
+            poisoned: AtomicBool::new(false),
         }
     }
 
@@ -279,6 +292,7 @@ impl<L: PageLoader> BufferPool<L> {
             relation_counters: DashMap::new(),
             btree_latches: Mutex::new(HashMap::new()),
             btree_block_allocators: Mutex::new(HashMap::new()),
+            poisoned: AtomicBool::new(false),
         }
     }
 
@@ -293,6 +307,18 @@ impl<L: PageLoader> BufferPool<L> {
     #[must_use]
     pub fn wal_sink(&self) -> Option<&Arc<dyn WalSink>> {
         self.wal_sink.as_ref()
+    }
+
+    /// Reject future page access after a WAL append failure that happened
+    /// after a page mutation.
+    pub(crate) fn poison_after_wal_error(&self) {
+        self.poisoned.store(true, Ordering::Release);
+    }
+
+    /// Return whether this pool has seen a fatal WAL ordering failure.
+    #[must_use]
+    pub fn is_poisoned(&self) -> bool {
+        self.poisoned.load(Ordering::Acquire)
     }
 
     /// Return fixed frame capacity for pressure-based checkpoint decisions.
@@ -384,6 +410,12 @@ impl<L: PageLoader> BufferPool<L> {
         &self,
         mut writer: impl FnMut(PageId, &Page) -> Result<()>,
     ) -> Result<usize> {
+        if self.is_poisoned() {
+            return Err(Error::Corruption(
+                "buffer pool poisoned after WAL append failure".into(),
+            ));
+        }
+
         let durable = self
             .wal_sink
             .as_ref()
@@ -457,6 +489,10 @@ impl<L: PageLoader> BufferPool<L> {
     /// at most one write guard at a time on a given page (enforced by
     /// the frame's `RwLock`).
     pub fn get_page(self: &Arc<Self>, page_id: PageId) -> Result<PageGuard<L>, BufferPoolError> {
+        if self.is_poisoned() {
+            return Err(BufferPoolError::Poisoned);
+        }
+
         self.counters.gets.fetch_add(1, Ordering::Relaxed);
 
         if let Some(frame_idx) = self.lookup(page_id) {
@@ -848,6 +884,30 @@ mod tests {
             w.set_lsn(123);
         }
         assert_eq!(pool.stats().dirty, 1);
+    }
+
+    #[test]
+    fn poisoned_pool_rejects_page_access_and_flush() {
+        let pool = Arc::new(BufferPool::new(2, BlankLoader));
+        {
+            let g = pool.get_page(pid(0)).unwrap();
+            g.write().set_lsn(123);
+        }
+
+        pool.poison_after_wal_error();
+
+        let err = pool.get_page(pid(0)).unwrap_err();
+        assert!(matches!(err, BufferPoolError::Poisoned));
+
+        let mut writer_called = false;
+        let err = pool
+            .try_flush_dirty(|_, _| {
+                writer_called = true;
+                Ok(())
+            })
+            .unwrap_err();
+        assert!(matches!(err, ultrasql_core::Error::Corruption(_)));
+        assert!(!writer_called, "poisoned pool must not flush pages");
     }
 
     #[test]
