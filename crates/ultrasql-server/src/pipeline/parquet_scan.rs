@@ -1680,7 +1680,7 @@ fn wildcard_match(pattern: &str, text: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{ParquetPredicate, ParquetTableScan, open_regular_parquet_file};
+    use super::{ParquetPredicate, ParquetTableScan};
     use std::fs;
     use std::sync::Arc;
 
@@ -1749,6 +1749,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn parquet_scan_rejects_symlinked_input_file() {
+        use super::open_regular_parquet_file;
         use std::os::unix::fs::symlink;
 
         let dir = tempfile::tempdir().expect("tempdir");

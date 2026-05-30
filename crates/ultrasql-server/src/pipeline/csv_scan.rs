@@ -1235,7 +1235,7 @@ mod tests {
 
     use ultrasql_executor::Operator as _;
 
-    use super::{CSV_BATCH_TARGET_ROWS, CsvRejectSink, CsvTableScan, read_csv_sample_from_path};
+    use super::{CSV_BATCH_TARGET_ROWS, CsvTableScan};
 
     #[test]
     fn csv_scan_construction_does_not_parse_past_first_batch() {
@@ -1285,6 +1285,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn csv_scan_rejects_symlinked_input_and_reject_sink() {
+        use super::{CsvRejectSink, read_csv_sample_from_path};
         use std::os::unix::fs::symlink;
 
         let dir = tempfile::tempdir().expect("tempdir");
