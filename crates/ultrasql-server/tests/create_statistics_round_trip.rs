@@ -72,6 +72,46 @@ async fn create_statistics_returns_command_tag() {
 }
 
 #[tokio::test]
+async fn drop_table_clears_statistic_ext_rows() {
+    let (client, _conn, server_handle) = start_server_and_connect().await;
+    client
+        .batch_execute("CREATE TABLE stat_ext_drop (a INT NOT NULL, b INT NOT NULL)")
+        .await
+        .expect("create");
+    client
+        .batch_execute("CREATE STATISTICS stat_ext_drop_ab ON a, b FROM stat_ext_drop")
+        .await
+        .expect("CREATE STATISTICS");
+    let before_drop = client
+        .query(
+            "SELECT stxname FROM pg_catalog.pg_statistic_ext \
+             WHERE stxname = 'stat_ext_drop_ab'",
+            &[],
+        )
+        .await
+        .expect("pg_statistic_ext before drop");
+    assert_eq!(before_drop.len(), 1);
+
+    client
+        .batch_execute("DROP TABLE stat_ext_drop")
+        .await
+        .expect("drop table with extended stats");
+    let after_drop = client
+        .query(
+            "SELECT stxname FROM pg_catalog.pg_statistic_ext \
+             WHERE stxname = 'stat_ext_drop_ab'",
+            &[],
+        )
+        .await
+        .expect("pg_statistic_ext after drop");
+    assert!(
+        after_drop.is_empty(),
+        "DROP TABLE must clear extended statistics rows: {after_drop:?}"
+    );
+    shutdown(client, server_handle).await;
+}
+
+#[tokio::test]
 async fn vacuum_returns_command_tag() {
     let (client, _conn, server_handle) = start_server_and_connect().await;
     client.batch_execute("VACUUM").await.expect("VACUUM");

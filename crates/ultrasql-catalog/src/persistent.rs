@@ -2331,6 +2331,25 @@ impl PersistentCatalog {
         self.rebuild_snapshot();
     }
 
+    /// Remove every extended-statistics row attached to one relation.
+    pub fn remove_statistic_ext_for_relation(&self, stxrelid: Oid) -> usize {
+        let _guard = self.write_lock.lock();
+        let keys: Vec<_> = self
+            .pg_statistic_ext
+            .iter()
+            .filter(|entry| entry.value().stxrelid == stxrelid)
+            .map(|entry| *entry.key())
+            .collect();
+        let removed = keys.len();
+        for key in keys {
+            self.pg_statistic_ext.remove(&key);
+        }
+        if removed != 0 {
+            self.rebuild_snapshot();
+        }
+        removed
+    }
+
     /// Insert one `pg_statistic_ext` row and publish a new snapshot.
     pub fn create_statistic_ext(&self, row: StatisticExtRow) -> Result<(), CatalogError> {
         let _guard = self.write_lock.lock();
@@ -3092,6 +3111,33 @@ mod tests {
         let row = snap.statistic_ext.get(&oid).expect("statistic ext row");
         assert_eq!(row.stxname, "s_ab");
         assert_eq!(row.stxkeys, vec![1, 2]);
+    }
+
+    #[test]
+    fn statistic_ext_remove_by_relation_updates_snapshot() {
+        let cat = PersistentCatalog::new();
+        let table_oid = Oid::new(42_001);
+        let keep_oid = Oid::new(42_099);
+        for (oid, name, stxrelid) in [
+            (Oid::new(42_002), "s_ab", table_oid),
+            (Oid::new(42_003), "s_bc", table_oid),
+            (keep_oid, "s_keep", Oid::new(42_098)),
+        ] {
+            cat.create_statistic_ext(StatisticExtRow {
+                oid,
+                stxname: name.to_owned(),
+                stxrelid,
+                stxkeys: vec![1, 2],
+                stxkind: vec!['d'],
+            })
+            .expect("create statistic ext");
+        }
+
+        assert_eq!(cat.remove_statistic_ext_for_relation(table_oid), 2);
+        let snap = cat.snapshot();
+        assert_eq!(snap.statistic_ext.len(), 1);
+        assert!(snap.statistic_ext.contains_key(&keep_oid));
+        assert_eq!(cat.remove_statistic_ext_for_relation(table_oid), 0);
     }
 
     /// `alter_table_add_column` on the persistent catalog extends the

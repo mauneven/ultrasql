@@ -1885,6 +1885,9 @@ where
                 self.state
                     .persistent_catalog
                     .replace_statistics(entry.oid, std::iter::empty());
+                self.state
+                    .persistent_catalog
+                    .remove_statistic_ext_for_relation(entry.oid);
                 self.state.table_modifications.remove(&folded_name);
                 self.state.pending_analyze_tables.remove(&folded_name);
                 if let Some((_, constraints)) = self.state.table_constraints.remove(&entry.oid) {

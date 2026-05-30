@@ -687,6 +687,9 @@ as a concise evidence ledger; roadmap stays for open gates only.
   live catalog snapshot and ignored during restart bootstrap unless their
   relation still exists. Evidence:
   `cargo test -p ultrasql-server --test analyze_round_trip`.
+- `DROP TABLE` now removes live `pg_statistic_ext` rows immediately, so
+  extended statistics for dropped relations disappear before restart. Evidence:
+  `cargo test -p ultrasql-server --test create_statistics_round_trip`.
 - Dropped sequences remove sequence privilege grants from memory and durable
   `pg_privileges.meta`, so a recreated sequence cannot inherit stale ACLs by
   name. Evidence:
