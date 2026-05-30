@@ -518,9 +518,7 @@ fn peek_record_length(bytes: &[u8]) -> Result<u64, WalWriterError> {
         )));
     }
     let total = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
-    let header_size_u32 = u32::try_from(crate::record::RECORD_HEADER_SIZE)
-        .expect("RECORD_HEADER_SIZE is a compile-time-known constant well below u32::MAX");
-    if total < header_size_u32 {
+    if total < crate::record::RECORD_HEADER_SIZE_U32 {
         return Err(WalWriterError::Encode(WalRecordError::Malformed(
             "total_length too small",
         )));

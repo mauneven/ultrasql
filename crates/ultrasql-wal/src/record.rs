@@ -29,6 +29,8 @@ const FLAGS_OFFSET: usize = 25;
 
 /// Size of [`WalRecordHeader`] in bytes.
 pub const RECORD_HEADER_SIZE: usize = 28;
+/// Size of [`WalRecordHeader`] in bytes as encoded in the `u32` length field.
+pub const RECORD_HEADER_SIZE_U32: u32 = 28;
 
 /// Hard ceiling on a single record's encoded size.
 ///

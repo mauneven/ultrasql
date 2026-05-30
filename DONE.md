@@ -382,6 +382,12 @@ as a concise evidence ledger; roadmap stays for open gates only.
   `cargo clippy -p ultrasql-wal --all-targets --all-features -- -D warnings`,
   and `cargo clippy -p ultrasql-storage --all-targets --all-features -- -D
   warnings`.
+- WAL writer record-length peeking now compares against an explicit on-disk
+  header-size constant instead of a runtime `try_from(...).expect(...)`
+  conversion. Evidence:
+  `cargo test -p ultrasql-wal writer`,
+  `cargo test -p ultrasql-wal record`, and
+  `cargo clippy -p ultrasql-wal --all-targets --all-features -- -D warnings`.
 
 ## Core SQL And Wire Protocol
 
