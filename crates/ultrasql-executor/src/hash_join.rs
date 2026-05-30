@@ -565,7 +565,7 @@ impl HashJoin {
                     continue;
                 }
 
-                if let Some(key) = build_join_key(&self.left_key_evals, &row) {
+                if let Some(key) = build_join_key(&self.left_key_evals, &row)? {
                     hash_table
                         .entry(key)
                         .or_default()
@@ -640,7 +640,7 @@ impl HashJoin {
             };
             let rows = batch_to_rows(&batch, &self.right_schema)?;
             for row in rows {
-                if let Some(key) = build_join_key(&self.right_key_evals, &row) {
+                if let Some(key) = build_join_key(&self.right_key_evals, &row)? {
                     hash_table
                         .entry(key)
                         .or_default()
@@ -670,7 +670,7 @@ impl HashJoin {
         };
         let rows = batch_to_rows(&batch, &self.right_schema)?;
         for right_row in rows {
-            let Some(probe_key) = build_join_key(&self.right_key_evals, &right_row) else {
+            let Some(probe_key) = build_join_key(&self.right_key_evals, &right_row)? else {
                 continue;
             };
             let indices = self
@@ -732,11 +732,11 @@ impl HashJoin {
             .ok_or(ExecError::Internal("hash join spill missing"))?;
 
         for right_row in right_rows {
-            let Some(probe_key) = build_join_key(&self.right_key_evals, &right_row) else {
+            let Some(probe_key) = build_join_key(&self.right_key_evals, &right_row)? else {
                 continue;
             };
             spill.scan_rows(&left_codec, |left_row| {
-                let Some(build_key) = build_join_key(&self.left_key_evals, &left_row) else {
+                let Some(build_key) = build_join_key(&self.left_key_evals, &left_row)? else {
                     return Ok(());
                 };
                 if build_key != probe_key {
@@ -754,7 +754,7 @@ impl HashJoin {
     }
 
     fn right_build_matches_left_row(&self, left_row: &[Value]) -> Result<bool, ExecError> {
-        let Some(probe_key) = build_join_key(&self.left_key_evals, left_row) else {
+        let Some(probe_key) = build_join_key(&self.left_key_evals, left_row)? else {
             return Ok(false);
         };
         let Some(indices) = self
@@ -966,24 +966,28 @@ enum JoinKey {
     Multi(Vec<OrderedValue>),
 }
 
-fn build_join_key(evals: &[Eval], row: &[Value]) -> Option<JoinKey> {
+fn build_join_key(evals: &[Eval], row: &[Value]) -> Result<Option<JoinKey>, ExecError> {
     if let [eval] = evals {
-        let value = eval.eval(row).unwrap_or(Value::Null);
+        let value = eval
+            .eval(row)
+            .map_err(|err| ExecError::TypeMismatch(err.to_string()))?;
         if value.is_null() {
-            return None;
+            return Ok(None);
         }
-        return Some(JoinKey::Single(OrderedValue(value)));
+        return Ok(Some(JoinKey::Single(OrderedValue(value))));
     }
 
     let mut values = Vec::with_capacity(evals.len());
     for eval in evals {
-        let value = eval.eval(row).unwrap_or(Value::Null);
+        let value = eval
+            .eval(row)
+            .map_err(|err| ExecError::TypeMismatch(err.to_string()))?;
         if value.is_null() {
-            return None;
+            return Ok(None);
         }
         values.push(OrderedValue(value));
     }
-    Some(JoinKey::Multi(values))
+    Ok(Some(JoinKey::Multi(values)))
 }
 
 /// A wrapper around [`Value`] that implements `Hash + Eq` so it can serve
@@ -1267,6 +1271,22 @@ mod tests {
         }
     }
 
+    fn lit_i32(v: i32) -> ScalarExpr {
+        ScalarExpr::Literal {
+            value: Value::Int32(v),
+            data_type: DataType::Int32,
+        }
+    }
+
+    fn divide_i32_by_zero(name: &str) -> ScalarExpr {
+        ScalarExpr::Binary {
+            op: BinaryOp::Div,
+            left: Box::new(col_idx0_i32(name)),
+            right: Box::new(lit_i32(0)),
+            data_type: DataType::Int32,
+        }
+    }
+
     fn drain_rows(op: &mut dyn Operator) -> Vec<(i32, i32)> {
         let schema = op.schema().clone();
         let mut out = Vec::new();
@@ -1352,6 +1372,50 @@ mod tests {
         let mut rows = drain_rows(&mut op);
         rows.sort_unstable();
         assert_eq!(rows, vec![(2, 2), (3, 3)]);
+    }
+
+    #[test]
+    fn hash_join_build_key_eval_error_propagates() {
+        let left = MemTableScan::new(schema_id(), vec![i32_batch(&[1])]);
+        let right = MemTableScan::new(schema_val(), vec![i32_batch(&[1])]);
+        let mut op = HashJoin::new(
+            Box::new(left),
+            Box::new(right),
+            divide_i32_by_zero("id"),
+            col_idx0_i32("val"),
+            LogicalJoinType::Inner,
+            schema_id_val(),
+            schema_id(),
+            schema_val(),
+        );
+
+        let err = op.next_batch().expect_err("build key division must error");
+        assert!(
+            err.to_string().contains("division by zero"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn hash_join_probe_key_eval_error_propagates() {
+        let left = MemTableScan::new(schema_id(), vec![i32_batch(&[1])]);
+        let right = MemTableScan::new(schema_val(), vec![i32_batch(&[1])]);
+        let mut op = HashJoin::new(
+            Box::new(left),
+            Box::new(right),
+            col_idx0_i32("id"),
+            divide_i32_by_zero("val"),
+            LogicalJoinType::Inner,
+            schema_id_val(),
+            schema_id(),
+            schema_val(),
+        );
+
+        let err = op.next_batch().expect_err("probe key division must error");
+        assert!(
+            err.to_string().contains("division by zero"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]

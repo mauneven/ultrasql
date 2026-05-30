@@ -148,6 +148,10 @@ as a concise evidence ledger; roadmap stays for open gates only.
   silently treating them as NULL. Evidence:
   `cargo test -p ultrasql-executor hash_aggregate` and
   `cargo test -p ultrasql-executor sort_aggregate`.
+- `HashJoin` and `MergeJoin` now propagate join-key evaluation failures instead
+  of silently treating them as NULL non-matches. Evidence:
+  `cargo test -p ultrasql-executor hash_join` and
+  `cargo test -p ultrasql-executor merge_join`.
 
 ## Core SQL And Wire Protocol
 

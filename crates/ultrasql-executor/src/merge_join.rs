@@ -164,14 +164,8 @@ impl MergeJoin {
         let mut right_matched = vec![false; right_rows.len()];
 
         while li < left_rows.len() && ri < right_rows.len() {
-            let lk = self
-                .left_key_eval
-                .eval(&left_rows[li])
-                .unwrap_or(Value::Null);
-            let rk = self
-                .right_key_eval
-                .eval(&right_rows[ri])
-                .unwrap_or(Value::Null);
+            let lk = eval_join_key(&self.left_key_eval, &left_rows[li])?;
+            let rk = eval_join_key(&self.right_key_eval, &right_rows[ri])?;
 
             // NULL keys never match — skip them.
             if lk.is_null() {
@@ -194,10 +188,7 @@ impl MergeJoin {
                     // Collect the range of right rows with the same key.
                     let ri_start = ri;
                     while ri < right_rows.len() {
-                        let rk2 = self
-                            .right_key_eval
-                            .eval(&right_rows[ri])
-                            .unwrap_or(Value::Null);
+                        let rk2 = eval_join_key(&self.right_key_eval, &right_rows[ri])?;
                         if compare_values_nullable(&lk, &rk2, false) != Ordering::Equal {
                             break;
                         }
@@ -206,10 +197,7 @@ impl MergeJoin {
                     // Collect the range of left rows with the same key.
                     let li_start = li;
                     while li < left_rows.len() {
-                        let lk2 = self
-                            .left_key_eval
-                            .eval(&left_rows[li])
-                            .unwrap_or(Value::Null);
+                        let lk2 = eval_join_key(&self.left_key_eval, &left_rows[li])?;
                         if compare_values_nullable(&rk, &lk2, false) != Ordering::Equal {
                             break;
                         }
@@ -254,6 +242,11 @@ impl MergeJoin {
     }
 }
 
+fn eval_join_key(eval: &Eval, row: &[Value]) -> Result<Value, ExecError> {
+    eval.eval(row)
+        .map_err(|err| ExecError::TypeMismatch(err.to_string()))
+}
+
 fn concat_rows(left: &[Value], right: &[Value]) -> Vec<Value> {
     let mut row = Vec::with_capacity(left.len() + right.len());
     row.extend_from_slice(left);
@@ -264,7 +257,7 @@ fn concat_rows(left: &[Value], right: &[Value]) -> Vec<Value> {
 #[cfg(test)]
 mod tests {
     use ultrasql_core::{DataType, Field, Schema, Value};
-    use ultrasql_planner::{LogicalJoinType, ScalarExpr};
+    use ultrasql_planner::{BinaryOp, LogicalJoinType, ScalarExpr};
     use ultrasql_vec::Batch;
     use ultrasql_vec::column::{Column, NumericColumn};
 
@@ -297,6 +290,22 @@ mod tests {
         ScalarExpr::Column {
             name: name.into(),
             index: 0,
+            data_type: DataType::Int32,
+        }
+    }
+
+    fn lit_i32(v: i32) -> ScalarExpr {
+        ScalarExpr::Literal {
+            value: Value::Int32(v),
+            data_type: DataType::Int32,
+        }
+    }
+
+    fn divide_i32_by_zero(name: &str) -> ScalarExpr {
+        ScalarExpr::Binary {
+            op: BinaryOp::Div,
+            left: Box::new(col_i32(name)),
+            right: Box::new(lit_i32(0)),
             data_type: DataType::Int32,
         }
     }
@@ -338,6 +347,28 @@ mod tests {
         let mut rows = drain_pairs(&mut op);
         rows.sort_unstable();
         assert_eq!(rows, vec![(2, 2), (3, 3)]);
+    }
+
+    #[test]
+    fn merge_join_key_eval_error_propagates() {
+        let left = MemTableScan::new(schema_id(), vec![i32_batch(&[1])]);
+        let right = MemTableScan::new(schema_val(), vec![i32_batch(&[1])]);
+        let mut op = MergeJoin::new(
+            Box::new(left),
+            Box::new(right),
+            divide_i32_by_zero("id"),
+            col_i32("val"),
+            LogicalJoinType::Inner,
+            schema_joined(),
+            schema_id(),
+            schema_val(),
+        );
+
+        let err = op.next_batch().expect_err("merge key division must error");
+        assert!(
+            err.to_string().contains("division by zero"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]
