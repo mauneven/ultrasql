@@ -97,6 +97,10 @@ pub enum HeapError {
     /// Encoding a typed WAL payload failed.
     #[error("wal payload encoding: {0}")]
     WalPayload(#[from] PayloadError),
+
+    /// Encoding a full WAL record failed.
+    #[error("wal record encoding: {0}")]
+    WalRecord(#[from] ultrasql_wal::WalRecordError),
 }
 
 /// Options threaded into an insert.

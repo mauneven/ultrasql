@@ -335,9 +335,11 @@ mod tests {
     #[test]
     fn recover_with_lsn_target_stops_before_later_records() {
         let dir = TempDir::new().unwrap();
-        let first = WalRecord::new(RecordType::Nop, Xid::new(10), Lsn::ZERO, 0, Vec::new());
+        let first = WalRecord::new(RecordType::Nop, Xid::new(10), Lsn::ZERO, 0, Vec::new())
+            .expect("test WAL record should fit size limits");
         let first_bytes = first.encode();
-        let second = WalRecord::new(RecordType::Nop, Xid::new(11), Lsn::ZERO, 0, Vec::new());
+        let second = WalRecord::new(RecordType::Nop, Xid::new(11), Lsn::ZERO, 0, Vec::new())
+            .expect("test WAL record should fit size limits");
         let target = Lsn::new(u64::try_from(first_bytes.len()).unwrap());
         let mut segment = first_bytes;
         segment.extend_from_slice(&second.encode());
@@ -431,5 +433,6 @@ mod tests {
             commit_timestamp_micros,
         };
         WalRecord::new(RecordType::Commit, xid, Lsn::ZERO, 0, payload.encode())
+            .expect("test WAL record should fit size limits")
     }
 }

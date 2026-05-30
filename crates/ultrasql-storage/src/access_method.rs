@@ -457,7 +457,8 @@ impl HashIndex {
         .encode()
         .map_err(|e| AccessMethodError::Storage(format!("hash WAL payload encode: {e}")))?;
         let prev_lsn = sink.last_lsn_for(xid);
-        let record = WalRecord::new(RecordType::HashOp, xid, prev_lsn, 0, payload);
+        let record = WalRecord::new(RecordType::HashOp, xid, prev_lsn, 0, payload)
+            .map_err(|e| AccessMethodError::Storage(format!("hash WAL record encode: {e}")))?;
         sink.append(record)
             .map(|_| ())
             .map_err(|e| AccessMethodError::Storage(format!("hash WAL append: {e}")))
@@ -1523,7 +1524,8 @@ impl HnswIndex {
         .encode()
         .map_err(|e| AccessMethodError::Storage(format!("hnsw WAL payload encode: {e}")))?;
         let prev_lsn = sink.last_lsn_for(xid);
-        let record = WalRecord::new(RecordType::HnswOp, xid, prev_lsn, 0, payload);
+        let record = WalRecord::new(RecordType::HnswOp, xid, prev_lsn, 0, payload)
+            .map_err(|e| AccessMethodError::Storage(format!("hnsw WAL record encode: {e}")))?;
         sink.append(record)
             .map(|_| ())
             .map_err(|e| AccessMethodError::Storage(format!("hnsw WAL append: {e}")))
@@ -2185,7 +2187,10 @@ impl PageBackedHnswIndex {
             AccessMethodError::Storage(format!("page-backed hnsw WAL payload encode: {e}"))
         })?;
         let prev_lsn = sink.last_lsn_for(xid);
-        let record = WalRecord::new(RecordType::HnswOp, xid, prev_lsn, 0, payload);
+        let record =
+            WalRecord::new(RecordType::HnswOp, xid, prev_lsn, 0, payload).map_err(|e| {
+                AccessMethodError::Storage(format!("page-backed hnsw WAL record encode: {e}"))
+            })?;
         sink.append(record)
             .map_err(|e| AccessMethodError::Storage(format!("page-backed hnsw WAL append: {e}")))
     }
@@ -3942,7 +3947,10 @@ impl PageBackedIvfFlatIndex {
             AccessMethodError::Storage(format!("page-backed ivfflat WAL payload encode: {e}"))
         })?;
         let prev_lsn = sink.last_lsn_for(xid);
-        let record = WalRecord::new(RecordType::IvfFlatOp, xid, prev_lsn, 0, payload);
+        let record =
+            WalRecord::new(RecordType::IvfFlatOp, xid, prev_lsn, 0, payload).map_err(|e| {
+                AccessMethodError::Storage(format!("page-backed ivfflat WAL record encode: {e}"))
+            })?;
         sink.append(record)
             .map_err(|e| AccessMethodError::Storage(format!("page-backed ivfflat WAL append: {e}")))
     }
@@ -4989,7 +4997,8 @@ mod tests {
         ) {
             let index = PageBackedHnswIndex::new(RelationId::new(8805), 3, HnswMetric::L2, 4, 16)
                 .expect("hnsw config");
-            let record = WalRecord::new(RecordType::HnswOp, Xid::new(15), Lsn::ZERO, 0, payload);
+            let record = WalRecord::new(RecordType::HnswOp, Xid::new(15), Lsn::ZERO, 0, payload)
+                .expect("test WAL record should fit size limits");
 
             let replay = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 index.apply_wal_record(&record)
@@ -5008,7 +5017,8 @@ mod tests {
             let index =
                 PageBackedIvfFlatIndex::new(RelationId::new(9903), 3, HnswMetric::L2, 2, 1)
                     .expect("ivfflat config");
-            let record = WalRecord::new(RecordType::IvfFlatOp, Xid::new(16), Lsn::ZERO, 0, payload);
+            let record = WalRecord::new(RecordType::IvfFlatOp, Xid::new(16), Lsn::ZERO, 0, payload)
+                .expect("test WAL record should fit size limits");
 
             let replay = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 index.apply_wal_record(&record)

@@ -111,7 +111,7 @@ impl<L: PageLoader> BTree<L> {
                 child_or_value: cv,
             }
             .encode()?;
-            let record = WalRecord::new(RecordType::BTreeOp, xid, prev_lsn, 0, payload);
+            let record = WalRecord::new(RecordType::BTreeOp, xid, prev_lsn, 0, payload)?;
             let lsn: Lsn = sink.append(record).expect(
                 "wal append must succeed after a committed btree page mutation; failure is unrecoverable",
             );
@@ -134,7 +134,7 @@ impl<L: PageLoader> BTree<L> {
                     child_or_value: cv,
                 }
                 .encode()?;
-                let record = WalRecord::new(RecordType::BTreeOp, xid, prev_lsn, 0, payload);
+                let record = WalRecord::new(RecordType::BTreeOp, xid, prev_lsn, 0, payload)?;
                 sink.append(record).expect(
                     "wal append must succeed after a committed btree split; failure is unrecoverable",
                 );

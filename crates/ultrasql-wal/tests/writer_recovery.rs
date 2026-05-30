@@ -28,6 +28,7 @@ fn build_record(i: u32) -> WalRecord {
         0,
         payload,
     )
+    .expect("test WAL record should fit size limits")
 }
 
 const fn writer_config(segment_size: u64) -> WalWriterConfig {
@@ -222,7 +223,8 @@ fn multi_producer_appends_all_recover() {
                 let id = c.fetch_add(1, Ordering::Relaxed);
                 let payload = id.to_le_bytes().to_vec();
                 let rec =
-                    WalRecord::new(RecordType::HeapInsert, Xid::new(1), Lsn::ZERO, 0, payload);
+                    WalRecord::new(RecordType::HeapInsert, Xid::new(1), Lsn::ZERO, 0, payload)
+                        .expect("test WAL record should fit size limits");
                 // Buffer is sized generously above; appends never fail.
                 buf.append(&rec).unwrap();
             }

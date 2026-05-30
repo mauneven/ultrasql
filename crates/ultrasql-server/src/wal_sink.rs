@@ -105,14 +105,16 @@ mod tests {
             Lsn::ZERO,
             0,
             b"row".to_vec(),
-        );
+        )
+        .expect("test WAL record should fit size limits");
         let fpi_record = WalRecord::new(
             RecordType::FullPageWrite,
             Xid::new(7),
             Lsn::ZERO,
             0,
             vec![0; 32],
-        );
+        )
+        .expect("test WAL record should fit size limits");
         let expected_bytes =
             u64::from(heap_record.header.total_length) + u64::from(fpi_record.header.total_length);
 

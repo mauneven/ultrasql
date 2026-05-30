@@ -582,6 +582,7 @@ mod tests {
             0,
             payload.to_vec(),
         )
+        .expect("test WAL record should fit size limits")
     }
 
     #[test]

@@ -546,7 +546,8 @@ impl Sequence {
         .encode()
         .map_err(|e| SequenceError::Wal(e.to_string()))?;
         let prev_lsn = wal.last_lsn_for(xid);
-        let record = WalRecord::new(RecordType::SequenceOp, xid, prev_lsn, 0, payload);
+        let record = WalRecord::new(RecordType::SequenceOp, xid, prev_lsn, 0, payload)
+            .map_err(|e| SequenceError::Wal(e.to_string()))?;
         wal.append(record)
             .map(|_| ())
             .map_err(|e| SequenceError::Wal(e.to_string()))

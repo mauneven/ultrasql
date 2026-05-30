@@ -65,7 +65,8 @@ fn server_init_retains_wal_writer_and_flushes_on_drop() {
         let sink = pool
             .wal_sink()
             .expect("WAL-backed server must install buffer-pool WAL sink");
-        let record = WalRecord::new(RecordType::Nop, Xid::FIRST_USER, Lsn::ZERO, 0, Vec::new());
+        let record = WalRecord::new(RecordType::Nop, Xid::FIRST_USER, Lsn::ZERO, 0, Vec::new())
+            .expect("test WAL record should fit size limits");
         sink.append(record).unwrap()
     };
 
@@ -339,9 +340,11 @@ fn server_init_honors_recovery_target_lsn_before_installing_wal_writer() {
     let wal_dir = data_dir.path().join("pg_wal");
     fs::create_dir_all(&wal_dir).unwrap();
 
-    let first = WalRecord::new(RecordType::Nop, Xid::new(10), Lsn::ZERO, 0, Vec::new());
+    let first = WalRecord::new(RecordType::Nop, Xid::new(10), Lsn::ZERO, 0, Vec::new())
+        .expect("test WAL record should fit size limits");
     let first_bytes = first.encode();
-    let second = WalRecord::new(RecordType::Nop, Xid::new(11), Lsn::ZERO, 0, Vec::new());
+    let second = WalRecord::new(RecordType::Nop, Xid::new(11), Lsn::ZERO, 0, Vec::new())
+        .expect("test WAL record should fit size limits");
     let target = Lsn::new(u64::try_from(first_bytes.len()).unwrap());
     let mut segment = first_bytes;
     segment.extend_from_slice(&second.encode());
@@ -359,13 +362,10 @@ fn server_init_honors_recovery_target_lsn_before_installing_wal_writer() {
         .wal_sink()
         .expect("recovered persistent server must install WAL sink");
     let appended = sink
-        .append(WalRecord::new(
-            RecordType::Nop,
-            Xid::new(12),
-            Lsn::ZERO,
-            0,
-            Vec::new(),
-        ))
+        .append(
+            WalRecord::new(RecordType::Nop, Xid::new(12), Lsn::ZERO, 0, Vec::new())
+                .expect("test WAL record should fit size limits"),
+        )
         .unwrap();
 
     assert_eq!(appended, target);

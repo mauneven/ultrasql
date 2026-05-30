@@ -193,7 +193,7 @@ impl<L: PageLoader> BTree<L> {
                 child_or_value: tuple_bytes,
             }
             .encode()?;
-            let record = WalRecord::new(RecordType::BTreeOp, xid, prev_lsn, 0, payload);
+            let record = WalRecord::new(RecordType::BTreeOp, xid, prev_lsn, 0, payload)?;
             let lsn: Lsn = sink.append(record).expect(
                 "wal append must succeed after a committed btree delete; failure is unrecoverable",
             );

@@ -400,6 +400,13 @@ as a concise evidence ledger; roadmap stays for open gates only.
   `cargo test -p ultrasql-storage segment`, and
   `cargo clippy -p ultrasql-storage --all-targets --all-features -- -D
   warnings`.
+- WAL record construction is now fallible and rejects oversized payloads with a
+  typed error instead of panicking. Storage, server, CLI, and benchmark callers
+  now propagate record-encoding failures before append. Evidence:
+  `cargo test -p ultrasql-wal record`,
+  `cargo test -p ultrasql-storage wal`,
+  `cargo check --workspace --all-targets`, and clippy for the touched WAL,
+  storage, server, CLI, and bench crates.
 
 ## Core SQL And Wire Protocol
 

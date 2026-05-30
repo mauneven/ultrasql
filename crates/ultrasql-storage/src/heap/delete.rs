@@ -189,7 +189,7 @@ impl<L: PageLoader> HeapAccess<L> {
                 prev_lsn,
                 0,
                 payload_bytes,
-            );
+            )?;
             Some((sink, record))
         } else {
             None
@@ -334,7 +334,7 @@ impl<L: PageLoader> HeapAccess<L> {
                 for payload in payloads {
                     let prev_lsn = sink.last_lsn_for(opts.xmax);
                     let record =
-                        WalRecord::new(RecordType::HeapDelete, opts.xmax, prev_lsn, 0, payload);
+                        WalRecord::new(RecordType::HeapDelete, opts.xmax, prev_lsn, 0, payload)?;
                     last_lsn = sink.append(record).expect(
                         "wal append must succeed after a committed page mutation; \
                          failure is unrecoverable",

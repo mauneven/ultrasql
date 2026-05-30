@@ -2288,7 +2288,8 @@ mod tests {
         }
         .encode()
         .expect("heap insert payload encodes");
-        let record = WalRecord::new(RecordType::HeapInsert, Xid::new(42), Lsn::ZERO, 0, payload);
+        let record = WalRecord::new(RecordType::HeapInsert, Xid::new(42), Lsn::ZERO, 0, payload)
+            .expect("test WAL record should fit size limits");
 
         let lines = waldump_record_lines(&record.encode());
 
@@ -2725,7 +2726,8 @@ mod tests {
 
         let dir = tempfile::tempdir().expect("tempdir");
         let wal = dir.path().join("000000010000000000000001");
-        let record = WalRecord::new(RecordType::Nop, Xid::new(1), Lsn::ZERO, 0, Vec::new());
+        let record = WalRecord::new(RecordType::Nop, Xid::new(1), Lsn::ZERO, 0, Vec::new())
+            .expect("test WAL record should fit size limits");
         fs::write(&wal, record.encode()).expect("write WAL");
 
         run_waldump(&wal).expect("waldump");

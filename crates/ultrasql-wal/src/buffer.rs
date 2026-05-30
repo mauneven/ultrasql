@@ -199,6 +199,7 @@ mod tests {
 
     fn rec(rt: RecordType, payload: &[u8], prev: Lsn) -> WalRecord {
         WalRecord::new(rt, Xid::new(1), prev, 0, payload.to_vec())
+            .expect("test WAL record should fit size limits")
     }
 
     #[test]

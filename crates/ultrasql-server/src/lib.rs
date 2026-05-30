@@ -3693,7 +3693,8 @@ impl Server {
             commit_lsn: Lsn::ZERO,
             commit_timestamp_micros: unix_timestamp_micros(),
         };
-        let record = WalRecord::new(RecordType::Commit, xid, Lsn::ZERO, 0, payload.encode());
+        let record = WalRecord::new(RecordType::Commit, xid, Lsn::ZERO, 0, payload.encode())
+            .map_err(|e| ServerError::ddl(format!("commit WAL record encode: {e}")))?;
         wal.append(record)
             .map(Some)
             .map_err(|e| ServerError::ddl(format!("commit WAL append: {e}")))

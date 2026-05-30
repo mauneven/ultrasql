@@ -535,6 +535,7 @@ mod tests {
     /// Build a [`WalRecord`] that wraps an already-encoded payload.
     fn make_record(record_type: RecordType, payload_bytes: Vec<u8>) -> WalRecord {
         WalRecord::new(record_type, Xid::new(1), Lsn::ZERO, 0, payload_bytes)
+            .expect("test WAL record should fit size limits")
     }
 
     /// Open a writer, apply `f`, then shut it down and return the dir.

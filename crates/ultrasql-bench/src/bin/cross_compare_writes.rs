@@ -356,7 +356,8 @@ impl Engine {
         // intended payload. We don't have the assigned tid yet, but
         // production code logs the tid too — for the bench the
         // payload bytes alone are enough to characterize the cost.
-        let rec = WalRecord::new(RecordType::HeapInsert, xid, Lsn::ZERO, 0, payload.clone());
+        let rec = WalRecord::new(RecordType::HeapInsert, xid, Lsn::ZERO, 0, payload.clone())
+            .map_err(|e| anyhow::anyhow!("wal record encode: {e}"))?;
         self.wal_buffer
             .append(&rec)
             .map_err(|e| anyhow::anyhow!("wal buffer append: {e}"))?;
@@ -379,7 +380,8 @@ impl Engine {
         let mut payload = Vec::with_capacity(12);
         payload.extend_from_slice(&tid.page.block.raw().to_le_bytes());
         payload.extend_from_slice(&tid.slot.to_le_bytes());
-        let rec = WalRecord::new(RecordType::HeapDelete, xmax, Lsn::ZERO, 0, payload);
+        let rec = WalRecord::new(RecordType::HeapDelete, xmax, Lsn::ZERO, 0, payload)
+            .map_err(|e| anyhow::anyhow!("wal record encode: {e}"))?;
         self.wal_buffer
             .append(&rec)
             .map_err(|e| anyhow::anyhow!("wal buffer append: {e}"))?;

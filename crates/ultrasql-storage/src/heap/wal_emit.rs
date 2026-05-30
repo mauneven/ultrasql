@@ -112,7 +112,7 @@ impl<L: PageLoader> HeapAccess<L> {
             prev_lsn,
             0,
             payload.encode()?,
-        );
+        )?;
         // FPW must succeed; if the sink rejects it the page mutation must not
         // proceed or the WAL would be missing the page image needed for recovery.
         let lsn: Lsn = sink
@@ -160,7 +160,7 @@ impl<L: PageLoader> HeapAccess<L> {
                 prev_lsn,
                 0,
                 payload_bytes,
-            );
+            )?;
             // SAFETY of panic: the page has already been mutated. If the
             // sink rejects the record the on-disk state has diverged from
             // the WAL; panicking and restarting from the WAL is the only
@@ -221,7 +221,7 @@ impl<L: PageLoader> HeapAccess<L> {
             }
             .encode()?;
             let record =
-                WalRecord::new(RecordType::HeapUpdate, opts.xid, prev_lsn, 0, payload_bytes);
+                WalRecord::new(RecordType::HeapUpdate, opts.xid, prev_lsn, 0, payload_bytes)?;
             // SAFETY of panic: both old and new page versions have been
             // written. If the sink rejects the record the WAL has diverged
             // from the page state; the only correct response is to abort.
@@ -281,7 +281,7 @@ impl<L: PageLoader> HeapAccess<L> {
             prev_lsn,
             0,
             payload_bytes,
-        );
+        )?;
         let lsn: Lsn = sink.append(record).expect(
             "wal append must succeed after a committed page mutation; failure is unrecoverable",
         );
@@ -327,7 +327,7 @@ impl<L: PageLoader> HeapAccess<L> {
             prev_lsn,
             0,
             payload_bytes,
-        );
+        )?;
         let lsn: Lsn = sink.append(record).expect(
             "wal append must succeed after a committed page mutation; failure is unrecoverable",
         );
@@ -354,7 +354,7 @@ impl<L: PageLoader> HeapAccess<L> {
             prev_lsn,
             0,
             payload_bytes,
-        );
+        )?;
         let lsn: Lsn = sink.append(record).expect(
             "wal append must succeed after a committed page mutation; failure is unrecoverable",
         );

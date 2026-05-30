@@ -54,6 +54,7 @@ fn insert_record(seq: u32) -> WalRecord {
         0,
         payload.encode().expect("HeapInsertPayload must encode"),
     )
+    .expect("test WAL record should fit size limits")
 }
 
 fn delete_record(seq: u32) -> WalRecord {
@@ -72,6 +73,7 @@ fn delete_record(seq: u32) -> WalRecord {
         0,
         payload.encode().expect("HeapDeletePayload must encode"),
     )
+    .expect("test WAL record should fit size limits")
 }
 
 /// Wait until `writer.flushed_lsn() >= target` or deadline elapses.

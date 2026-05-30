@@ -67,6 +67,15 @@ pub enum WalRecordError {
     #[error("wal record malformed: {0}")]
     Malformed(&'static str),
 
+    /// The encoded record would exceed the supported WAL record ceiling.
+    #[error("wal record too large: payload {payload_len} bytes exceeds max {max_payload_len}")]
+    TooLarge {
+        /// Payload bytes supplied by the caller.
+        payload_len: usize,
+        /// Largest payload accepted by the record encoder.
+        max_payload_len: usize,
+    },
+
     /// The record's CRC does not match the recomputed value.
     #[error("wal crc mismatch: expected {expected:08x}, got {actual:08x}")]
     CrcMismatch {
@@ -190,16 +199,24 @@ pub struct WalRecord {
 
 impl WalRecord {
     /// Construct a new record. The CRC is computed automatically.
-    #[must_use]
     pub fn new(
         record_type: RecordType,
         xid: Xid,
         prev_lsn: Lsn,
         flags: u8,
         payload: Vec<u8>,
-    ) -> Self {
-        let total = u32::try_from(RECORD_HEADER_SIZE + payload.len())
-            .expect("WAL record under u32::MAX bytes — payload length validated upstream");
+    ) -> Result<Self, WalRecordError> {
+        let total_len = RECORD_HEADER_SIZE
+            .checked_add(payload.len())
+            .ok_or(WalRecordError::Malformed("total_length overflow"))?;
+        if total_len > MAX_RECORD_BYTES {
+            return Err(WalRecordError::TooLarge {
+                payload_len: payload.len(),
+                max_payload_len: MAX_RECORD_BYTES - RECORD_HEADER_SIZE,
+            });
+        }
+        let total = u32::try_from(total_len)
+            .map_err(|_| WalRecordError::Malformed("total_length overflow"))?;
         let mut header = WalRecordHeader {
             total_length: total,
             crc: 0,
@@ -209,7 +226,7 @@ impl WalRecord {
             flags,
         };
         header.crc = compute_record_crc(&header, &payload);
-        Self { header, payload }
+        Ok(Self { header, payload })
     }
 
     /// Encode the record into a freshly-allocated `Vec<u8>`.
@@ -321,6 +338,7 @@ mod tests {
 
     fn rec(rt: RecordType, payload: &[u8]) -> WalRecord {
         WalRecord::new(rt, Xid::new(42), Lsn::new(100), 0, payload.to_vec())
+            .expect("test WAL record should fit size limits")
     }
 
     #[test]
@@ -455,6 +473,17 @@ mod tests {
         bytes[RTYPE_OFFSET] = RecordType::HeapInsert as u8;
         let err = WalRecord::decode(&bytes).unwrap_err();
         assert!(matches!(err, WalRecordError::Malformed(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn oversized_constructor_returns_error() {
+        let payload = vec![0_u8; MAX_RECORD_BYTES - RECORD_HEADER_SIZE + 1];
+        let err =
+            WalRecord::new(RecordType::HeapInsert, Xid::new(1), Lsn::ZERO, 0, payload).unwrap_err();
+        assert!(
+            matches!(err, WalRecordError::TooLarge { .. }),
+            "got {err:?}"
+        );
     }
 
     proptest! {

@@ -184,7 +184,8 @@ fn corrupt_first_vector_wal_payload(data_dir: &Path, record_type: RecordType) {
                     record.header.prev_lsn,
                     record.header.flags,
                     payload,
-                );
+                )
+                .expect("test WAL record should fit original size limits");
                 assert_eq!(rewritten.header.total_length, record.header.total_length);
                 let encoded = rewritten.encode();
                 assert_eq!(encoded.len(), used);
