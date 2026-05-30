@@ -60,8 +60,11 @@ impl Operator for ResultOp {
         let row: Vec<Value> = self
             .exprs
             .iter()
-            .map(|ev| ev.eval(&[]).unwrap_or(Value::Null))
-            .collect();
+            .map(|ev| {
+                ev.eval(&[])
+                    .map_err(|err| ExecError::TypeMismatch(err.to_string()))
+            })
+            .collect::<Result<_, _>>()?;
 
         let batch = build_batch(&[row], &self.schema)?;
         Ok(Some(batch))
@@ -75,7 +78,7 @@ impl Operator for ResultOp {
 #[cfg(test)]
 mod tests {
     use ultrasql_core::{DataType, Field, Schema, Value};
-    use ultrasql_planner::ScalarExpr;
+    use ultrasql_planner::{BinaryOp, ScalarExpr};
 
     use super::ResultOp;
     use crate::Operator;
@@ -96,6 +99,15 @@ mod tests {
 
     fn schema_one_i32() -> Schema {
         Schema::new([Field::required("val", DataType::Int32)]).expect("schema ok")
+    }
+
+    fn divide_by_zero_expr() -> ScalarExpr {
+        ScalarExpr::Binary {
+            op: BinaryOp::Div,
+            left: Box::new(lit_i32(1)),
+            right: Box::new(lit_i32(0)),
+            data_type: DataType::Int32,
+        }
     }
 
     #[test]
@@ -127,5 +139,18 @@ mod tests {
         op.next_batch().expect("no error");
         assert!(op.next_batch().expect("no error").is_none());
         assert!(op.next_batch().expect("no error").is_none());
+    }
+
+    #[test]
+    fn result_propagates_constant_eval_errors() {
+        let schema = Schema::new([Field::required("val", DataType::Int32)]).expect("schema ok");
+        let mut op = ResultOp::new(vec![divide_by_zero_expr()], schema);
+        let err = op
+            .next_batch()
+            .expect_err("constant eval error must surface");
+        assert!(
+            err.to_string().contains("division by zero"),
+            "unexpected error: {err}"
+        );
     }
 }
