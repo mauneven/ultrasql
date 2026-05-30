@@ -775,3 +775,8 @@ as a concise evidence ledger; roadmap stays for open gates only.
   avoids fallible formatting, empty point-lookup warmup is guarded, and
   PostgreSQL regression provenance now asserts active row-value `IN` coverage
   instead of stale skip debt.
+- Production panic audit now passes for workspace libs and bins under
+  `cargo clippy --workspace --lib --bins --all-features -- -D clippy::panic
+  -D clippy::todo -D clippy::unimplemented`; benchmark setup failures now emit
+  contextual stderr and exit with status 2 instead of unwinding through the
+  regression gate.

@@ -32,7 +32,10 @@ use serde::{Deserialize, Serialize};
 pub fn require_bench_ok<T, E: std::fmt::Display>(result: Result<T, E>, context: &str) -> T {
     match result {
         Ok(value) => value,
-        Err(error) => panic!("benchmark setup failed: {context}: {error}"),
+        Err(error) => {
+            eprintln!("benchmark setup failed: {context}: {error}");
+            std::process::exit(2);
+        }
     }
 }
 
