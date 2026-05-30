@@ -171,6 +171,51 @@ async fn drop_role_rejects_granted_privileges_until_revoked() {
     shutdown(running).await;
 }
 
+#[tokio::test]
+async fn drop_role_rejects_rls_policy_roles_until_policy_table_is_dropped() {
+    let running = start_sample_server("role_ddl_test").await;
+    let client = &running.client;
+
+    client
+        .batch_execute("CREATE ROLE tester SUPERUSER LOGIN")
+        .await
+        .expect("register tester role");
+    client
+        .batch_execute("CREATE ROLE rls_policy_reader LOGIN")
+        .await
+        .expect("create policy role");
+    client
+        .batch_execute("CREATE TABLE role_rls_policy_table (tenant_id TEXT NOT NULL)")
+        .await
+        .expect("create RLS table");
+    client
+        .batch_execute(
+            "CREATE POLICY role_rls_policy_reader_policy \
+             ON role_rls_policy_table \
+             FOR SELECT TO rls_policy_reader \
+             USING (tenant_id = current_setting('ultrasql.tenant_id', true))",
+        )
+        .await
+        .expect("create policy referencing role");
+
+    let restricted = client
+        .batch_execute("DROP ROLE rls_policy_reader")
+        .await
+        .expect_err("RLS policy role reference must block DROP ROLE");
+    assert_eq!(restricted.code().expect("SQLSTATE").code(), "2BP01");
+
+    client
+        .batch_execute("DROP TABLE role_rls_policy_table")
+        .await
+        .expect("drop table with policy");
+    client
+        .batch_execute("DROP ROLE rls_policy_reader")
+        .await
+        .expect("drop role after policy table removed");
+
+    shutdown(running).await;
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn role_catalog_survives_restart() {
     let data_dir = tempfile::TempDir::new().expect("temp data dir");

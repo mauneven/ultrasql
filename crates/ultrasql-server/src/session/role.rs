@@ -131,10 +131,22 @@ where
 
         for item in self.state.row_security.iter() {
             let runtime = item.value();
-            if runtime.owner_role.eq_ignore_ascii_case(&role)
-                && let Some(table) = snapshot.tables_by_oid.get(item.key())
-            {
-                dependencies.push(format!("table {}", table.name));
+            if let Some(table) = snapshot.tables_by_oid.get(item.key()) {
+                if runtime.owner_role.eq_ignore_ascii_case(&role) {
+                    dependencies.push(format!("table {}", table.name));
+                }
+                for policy in &runtime.policies {
+                    if policy
+                        .roles
+                        .iter()
+                        .any(|policy_role| policy_role.eq_ignore_ascii_case(&role))
+                    {
+                        dependencies.push(format!(
+                            "row security policy {} on table {}",
+                            policy.name, table.name
+                        ));
+                    }
+                }
             }
         }
 
