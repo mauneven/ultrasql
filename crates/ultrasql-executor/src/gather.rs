@@ -199,7 +199,9 @@ impl Operator for GatherMerge {
             let row = self.children[best_idx]
                 .rows
                 .pop_front()
-                .expect("best_child only returns a child with a head row");
+                .ok_or(ExecError::Internal(
+                    "gather merge selected child without head row",
+                ))?;
             out_rows.push(row);
         }
 
@@ -249,10 +251,9 @@ fn best_child(children: &[MergeChild], keys: &[CompiledKey]) -> Result<Option<us
             best = Some(idx);
             continue;
         };
-        let best_row = children[best_idx]
-            .rows
-            .front()
-            .expect("best child has a head row");
+        let best_row = children[best_idx].rows.front().ok_or(ExecError::Internal(
+            "gather merge best child missing head row",
+        ))?;
         if compare_rows(row, best_row, keys)? == Ordering::Less {
             best = Some(idx);
         }

@@ -314,6 +314,12 @@ as a concise evidence ledger; roadmap stays for open gates only.
   Evidence:
   `cargo test -p ultrasql-executor function_scan` and
   `cargo test -p ultrasql-executor fused_update`.
+- `GatherMerge` now reports typed internal executor errors when child head-row
+  state is inconsistent instead of panicking on selected children without a
+  buffered row. Evidence:
+  `cargo test -p ultrasql-executor gather` and
+  `cargo clippy -p ultrasql-executor --lib --all-features -- -W
+  clippy::expect_used -W clippy::unwrap_used`.
 
 ## Core SQL And Wire Protocol
 
