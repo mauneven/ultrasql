@@ -1266,7 +1266,7 @@ fn parse_timetz_literal(text: &str) -> Option<(i64, i32)> {
     clippy::cast_sign_loss,
     reason = "civil-from-days arithmetic; doe / yoe fit in i32 by construction"
 )]
-fn civil_from_days(days_since_2000_01_01: i32) -> (i32, u32, u32) {
+fn civil_from_days(days_since_2000_01_01: i32) -> Result<(i32, u32, u32), PlanError> {
     let z = days_since_2000_01_01 + 10_957;
     let z = z + 719_468;
     let era = if z >= 0 {
@@ -1286,9 +1286,9 @@ fn civil_from_days(days_since_2000_01_01: i32) -> (i32, u32, u32) {
         mp as i32 - 9
     };
     let year = if month_i32 <= 2 { y + 1 } else { y };
-    let month =
-        u32::try_from(month_i32).expect("civil_from_days month stays in 1..=12 by construction");
-    (year, month, day)
+    let month = u32::try_from(month_i32)
+        .map_err(|_| PlanError::TypeMismatch("date interval month overflow".to_owned()))?;
+    Ok((year, month, day))
 }
 
 fn is_leap_year(year: i32) -> bool {
@@ -1306,7 +1306,7 @@ fn days_in_month(year: i32, month: u32) -> u32 {
 }
 
 fn add_months_to_date(date_days: i32, month_delta: i32) -> Result<i32, PlanError> {
-    let (year, month, day) = civil_from_days(date_days);
+    let (year, month, day) = civil_from_days(date_days)?;
     let total_months = year
         .checked_mul(12)
         .and_then(|v| v.checked_add(i32::try_from(month).ok()? - 1))

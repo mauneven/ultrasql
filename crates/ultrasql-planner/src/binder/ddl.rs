@@ -200,8 +200,7 @@ pub(super) fn bind_create_table(
             }
         }
     }
-    let columns =
-        Schema::new(fields).expect("column dedup precheck guarantees Schema::new cannot fail");
+    let columns = Schema::new(fields).map_err(|err| PlanError::TypeMismatch(err.to_string()))?;
     let mut bound_defaults = Vec::with_capacity(defaults.len());
     for (idx, default) in defaults.into_iter().enumerate() {
         let Some(expr) = default else {
@@ -377,7 +376,7 @@ pub(super) fn bind_create_domain(
     let mut not_null = false;
     let mut check_ordinal = 0usize;
     let check_scope = Schema::new([Field::nullable("value", base_type.clone())])
-        .expect("single VALUE field is a valid domain-check scope");
+        .map_err(|err| PlanError::TypeMismatch(err.to_string()))?;
     let mut checks = Vec::new();
     for constraint in &s.constraints {
         match constraint {

@@ -161,6 +161,11 @@ as a concise evidence ledger; roadmap stays for open gates only.
 - `TidBitmap` now returns checked `ExecError` values for out-of-range row
   setting and capacity-mismatch merges instead of panicking. Evidence:
   `cargo test -p ultrasql-executor bitmap_heap_scan`.
+- Planner production binder paths no longer use non-test `unwrap`/`expect`:
+  `CREATE TABLE`, `CREATE DOMAIN`, and date-interval month conversion now
+  surface typed `PlanError`s. Evidence:
+  `cargo test -p ultrasql-planner binder::tests`,
+  `cargo test -p ultrasql-planner expr_bind`, and the non-test panic audit.
 
 ## Core SQL And Wire Protocol
 
