@@ -6238,8 +6238,14 @@ where
                 return Ok(());
             }
             joined = sessions.join_next(), if !sessions.is_empty() => {
-                if let Err(e) = joined.expect("non-empty JoinSet yields one task") {
-                    warn!(target: "ultrasqld", error = %e, "session task failed");
+                match joined {
+                    Some(Ok(())) => {}
+                    Some(Err(e)) => {
+                        warn!(target: "ultrasqld", error = %e, "session task failed");
+                    }
+                    None => {
+                        debug!(target: "ultrasqld", "session set drained before join");
+                    }
                 }
                 continue;
             }

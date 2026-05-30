@@ -252,6 +252,11 @@ as a concise evidence ledger; roadmap stays for open gates only.
   `usize -> u8` conversions. Evidence:
   `cargo clippy -p ultrasql-server --lib --all-features -- -W
   clippy::expect_used -W clippy::unwrap_used`.
+- Listener session draining now handles a drained `JoinSet` with an explicit
+  match instead of relying on a production `expect` in the accept loop.
+  Evidence:
+  `cargo clippy -p ultrasql-server --lib --all-features -- -W
+  clippy::expect_used -W clippy::unwrap_used`.
 
 ## Core SQL And Wire Protocol
 
