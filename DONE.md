@@ -450,6 +450,14 @@ as a concise evidence ledger; roadmap stays for open gates only.
   branchless wrapping semantics while removing a panic path from the benchmarked
   kernel. Evidence: `cargo test -p ultrasql-vec filter_sum` and
   `cargo clippy -p ultrasql-vec --all-targets --all-features -- -D warnings`.
+- Vector i64 dictionary predicate masks now clamp oversized public dictionary
+  inputs to their fixed mask capacity instead of indexing past the end, and
+  dictionary filter kernels no longer use production `expect` conversions for
+  8-lane chunk packing. Evidence:
+  `cargo test -p ultrasql-vec predicate_mask_256_ignores_extra_dict_entries`,
+  `cargo test -p ultrasql-vec predicate_mask_65536_ignores_extra_dict_entries`,
+  `cargo test -p ultrasql-vec dict`, and
+  `cargo clippy -p ultrasql-vec --all-targets --all-features -- -D warnings`.
 
 ## Core SQL And Wire Protocol
 

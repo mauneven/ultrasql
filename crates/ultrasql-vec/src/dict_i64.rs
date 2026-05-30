@@ -338,7 +338,7 @@ impl PredicateMask256 {
     pub fn from_predicate<F: Fn(i64) -> bool>(dict: &[i64], pred: F) -> Self {
         let mut mask = [0_i64; 256];
         let mut mask_bits = [0_u8; 32];
-        for (i, &v) in dict.iter().enumerate() {
+        for (i, &v) in dict.iter().take(256).enumerate() {
             if pred(v) {
                 mask[i] = -1_i64;
                 mask_bits[i >> 3] |= 1_u8 << (i & 7);
@@ -392,11 +392,8 @@ impl PredicateMask65536 {
     /// Construct a mask from a custom predicate over the dictionary.
     #[must_use]
     pub fn from_predicate<F: Fn(i64) -> bool>(dict: &[i64], pred: F) -> Self {
-        let mut mask: Box<[i64; 65_536]> = vec![0_i64; 65_536]
-            .into_boxed_slice()
-            .try_into()
-            .expect("vec! produced exactly 65_536 elements");
-        for (i, &v) in dict.iter().enumerate() {
+        let mut mask: Box<[i64; 65_536]> = Box::new([0_i64; 65_536]);
+        for (i, &v) in dict.iter().take(65_536).enumerate() {
             if pred(v) {
                 mask[i] = -1_i64;
             }
@@ -743,21 +740,22 @@ fn filter_sum_dict_scalar(xs: &[i64], codes: &[u8], mask: &[i64; 256]) -> i64 {
     let rem_x = chunks_x.remainder();
     let rem_c = chunks_c.remainder();
     for (cx, cc) in chunks_x.zip(chunks_c) {
-        // SAFETY-of-indexing: chunks_exact(8) yields exactly 8 lanes;
-        // `usize::from(u8)` is always within `0..256` which fits the
-        // 256-entry mask.
-        let x: &[i64; 8] = cx.try_into().expect("chunks_exact(8) yields 8 lanes");
-        let c: &[u8; 8] = cc.try_into().expect("chunks_exact(8) yields 8 lanes");
+        let &[x0, x1, x2, x3, x4, x5, x6, x7] = cx else {
+            continue;
+        };
+        let &[c0, c1, c2, c3, c4, c5, c6, c7] = cc else {
+            continue;
+        };
 
         // Two halves on independent accumulators.
-        s0 = s0.wrapping_add(x[0] & mask[usize::from(c[0])]);
-        s0 = s0.wrapping_add(x[1] & mask[usize::from(c[1])]);
-        s0 = s0.wrapping_add(x[2] & mask[usize::from(c[2])]);
-        s0 = s0.wrapping_add(x[3] & mask[usize::from(c[3])]);
-        s1 = s1.wrapping_add(x[4] & mask[usize::from(c[4])]);
-        s1 = s1.wrapping_add(x[5] & mask[usize::from(c[5])]);
-        s1 = s1.wrapping_add(x[6] & mask[usize::from(c[6])]);
-        s1 = s1.wrapping_add(x[7] & mask[usize::from(c[7])]);
+        s0 = s0.wrapping_add(x0 & mask[usize::from(c0)]);
+        s0 = s0.wrapping_add(x1 & mask[usize::from(c1)]);
+        s0 = s0.wrapping_add(x2 & mask[usize::from(c2)]);
+        s0 = s0.wrapping_add(x3 & mask[usize::from(c3)]);
+        s1 = s1.wrapping_add(x4 & mask[usize::from(c4)]);
+        s1 = s1.wrapping_add(x5 & mask[usize::from(c5)]);
+        s1 = s1.wrapping_add(x6 & mask[usize::from(c6)]);
+        s1 = s1.wrapping_add(x7 & mask[usize::from(c7)]);
     }
 
     for (xv, cv) in rem_x.iter().zip(rem_c.iter()) {
@@ -792,17 +790,21 @@ fn filter_sum_dict_tbl_scalar(xs: &[i64], codes: &[u8], mask16: &[u8; 16]) -> i6
     let rem_x = chunks_x.remainder();
     let rem_c = chunks_c.remainder();
     for (cx, cc) in chunks_x.zip(chunks_c) {
-        let x: &[i64; 8] = cx.try_into().expect("chunks_exact(8) yields 8 lanes");
-        let c: &[u8; 8] = cc.try_into().expect("chunks_exact(8) yields 8 lanes");
+        let &[x0, x1, x2, x3, x4, x5, x6, x7] = cx else {
+            continue;
+        };
+        let &[c0, c1, c2, c3, c4, c5, c6, c7] = cc else {
+            continue;
+        };
 
-        s0 = s0.wrapping_add(x[0] & mask_i64[usize::from(c[0] & 0x0F)]);
-        s0 = s0.wrapping_add(x[1] & mask_i64[usize::from(c[1] & 0x0F)]);
-        s0 = s0.wrapping_add(x[2] & mask_i64[usize::from(c[2] & 0x0F)]);
-        s0 = s0.wrapping_add(x[3] & mask_i64[usize::from(c[3] & 0x0F)]);
-        s1 = s1.wrapping_add(x[4] & mask_i64[usize::from(c[4] & 0x0F)]);
-        s1 = s1.wrapping_add(x[5] & mask_i64[usize::from(c[5] & 0x0F)]);
-        s1 = s1.wrapping_add(x[6] & mask_i64[usize::from(c[6] & 0x0F)]);
-        s1 = s1.wrapping_add(x[7] & mask_i64[usize::from(c[7] & 0x0F)]);
+        s0 = s0.wrapping_add(x0 & mask_i64[usize::from(c0 & 0x0F)]);
+        s0 = s0.wrapping_add(x1 & mask_i64[usize::from(c1 & 0x0F)]);
+        s0 = s0.wrapping_add(x2 & mask_i64[usize::from(c2 & 0x0F)]);
+        s0 = s0.wrapping_add(x3 & mask_i64[usize::from(c3 & 0x0F)]);
+        s1 = s1.wrapping_add(x4 & mask_i64[usize::from(c4 & 0x0F)]);
+        s1 = s1.wrapping_add(x5 & mask_i64[usize::from(c5 & 0x0F)]);
+        s1 = s1.wrapping_add(x6 & mask_i64[usize::from(c6 & 0x0F)]);
+        s1 = s1.wrapping_add(x7 & mask_i64[usize::from(c7 & 0x0F)]);
     }
 
     for (xv, cv) in rem_x.iter().zip(rem_c.iter()) {
@@ -831,17 +833,21 @@ fn filter_sum_dict_u16_scalar(xs: &[i64], codes: &[u16], mask: &[i64]) -> i64 {
     let rem_x = chunks_x.remainder();
     let rem_c = chunks_c.remainder();
     for (cx, cc) in chunks_x.zip(chunks_c) {
-        let x: &[i64; 8] = cx.try_into().expect("chunks_exact(8) yields 8 lanes");
-        let c: &[u16; 8] = cc.try_into().expect("chunks_exact(8) yields 8 lanes");
+        let &[x0, x1, x2, x3, x4, x5, x6, x7] = cx else {
+            continue;
+        };
+        let &[c0, c1, c2, c3, c4, c5, c6, c7] = cc else {
+            continue;
+        };
 
-        s0 = s0.wrapping_add(x[0] & mask[usize::from(c[0])]);
-        s0 = s0.wrapping_add(x[1] & mask[usize::from(c[1])]);
-        s0 = s0.wrapping_add(x[2] & mask[usize::from(c[2])]);
-        s0 = s0.wrapping_add(x[3] & mask[usize::from(c[3])]);
-        s1 = s1.wrapping_add(x[4] & mask[usize::from(c[4])]);
-        s1 = s1.wrapping_add(x[5] & mask[usize::from(c[5])]);
-        s1 = s1.wrapping_add(x[6] & mask[usize::from(c[6])]);
-        s1 = s1.wrapping_add(x[7] & mask[usize::from(c[7])]);
+        s0 = s0.wrapping_add(x0 & mask[usize::from(c0)]);
+        s0 = s0.wrapping_add(x1 & mask[usize::from(c1)]);
+        s0 = s0.wrapping_add(x2 & mask[usize::from(c2)]);
+        s0 = s0.wrapping_add(x3 & mask[usize::from(c3)]);
+        s1 = s1.wrapping_add(x4 & mask[usize::from(c4)]);
+        s1 = s1.wrapping_add(x5 & mask[usize::from(c5)]);
+        s1 = s1.wrapping_add(x6 & mask[usize::from(c6)]);
+        s1 = s1.wrapping_add(x7 & mask[usize::from(c7)]);
     }
 
     for (xv, cv) in rem_x.iter().zip(rem_c.iter()) {
@@ -935,6 +941,23 @@ mod tests {
         assert_eq!(r.mask[2], -1);
         assert_eq!(r.mask[3], -1);
         assert_eq!(r.mask[4], 0);
+    }
+
+    #[test]
+    fn predicate_mask_256_ignores_extra_dict_entries() {
+        let dict: Vec<i64> = (0_i64..300).collect();
+        let mask = PredicateMask256::from_predicate(&dict, |v| v >= 255);
+        assert_eq!(mask.mask[254], 0);
+        assert_eq!(mask.mask[255], -1);
+        assert_eq!(mask.mask_bits[31] & 0x80, 0x80);
+    }
+
+    #[test]
+    fn predicate_mask_65536_ignores_extra_dict_entries() {
+        let dict: Vec<i64> = (0_i64..65_537).collect();
+        let mask = PredicateMask65536::from_predicate(&dict, |v| v >= 65_535);
+        assert_eq!(mask.mask[65_534], 0);
+        assert_eq!(mask.mask[65_535], -1);
     }
 
     // ---- Kernel correctness ----
