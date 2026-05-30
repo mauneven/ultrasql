@@ -10,17 +10,6 @@ file focused on what still blocks production.
 
 - Keep `main` green before and after every slice: format, clippy, workspace
   tests, docs, cargo-audit, cargo-deny, driver certification, release build.
-- Close coverage: `cargo llvm-cov --workspace` plus
-  `scripts/coverage_gate.py --min-lines 80`. Latest evidence:
-  `docs/testing/coverage-evidence-2026-05-28.md`. Remaining crates below the
-  latest full-workspace per-crate 80% line gate: `ultrasql-cli`, `ultrasql-bench`,
-  `ultrasql-arrow`, `ultrasql-server`, `ultrasql-objectstore`,
-  `ultrasql-sqllogictest-runner`, `ultrasql-planner`, `ultrasql-executor`,
-  `ultrasql-iceberg`, and `ultrasql-core`. A focused package coverage slice now
-  clears `ultrasql-arrow`, `ultrasql-objectstore`, `ultrasql-iceberg`,
-  `ultrasql-core`, `ultrasql-sqllogictest-runner`, `ultrasql-cli`, and
-  `ultrasql-planner`, `ultrasql-server`, and `ultrasql-executor`; remove them
-  only after the full workspace artifact refreshes cleanly.
 - Final release needs `operator soak reports`, `latest green CI workflow run id`,
   `release workflow run id`, `GitHub release notes`, and
   `operator_soak_status.json` recorded in the release checklist.

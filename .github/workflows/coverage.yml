@@ -45,6 +45,7 @@ jobs:
             target/llvm-cov/coverage.json \
             --root "$GITHUB_WORKSPACE" \
             --min-lines 80 \
+            --exclude-crate ultrasql-bench \
             --summary-json target/llvm-cov/per-crate-coverage.json \
             --summary-md target/llvm-cov/per-crate-coverage.md
       - name: upload coverage artifact

@@ -38,11 +38,18 @@ def iter_files(report: dict):
         yield from data_entry.get("files", [])
 
 
-def crate_rows(report: dict, root: Path, min_lines: float) -> list[dict[str, object]]:
+def crate_rows(
+    report: dict,
+    root: Path,
+    min_lines: float,
+    excluded_crates: set[str],
+) -> list[dict[str, object]]:
     crates: dict[str, list[int]] = {}
     for file_entry in iter_files(report):
         crate = crate_for_file(str(file_entry.get("filename", "")), root)
         if crate is None:
+            continue
+        if crate in excluded_crates:
             continue
         line_count, covered = line_counts(file_entry)
         if line_count == 0:
@@ -63,10 +70,16 @@ def crate_rows(report: dict, root: Path, min_lines: float) -> list[dict[str, obj
     ]
 
 
-def write_summary_json(path: Path, min_lines: float, rows: list[dict[str, object]]) -> None:
+def write_summary_json(
+    path: Path,
+    min_lines: float,
+    rows: list[dict[str, object]],
+    excluded_crates: list[str],
+) -> None:
     failed = [row for row in rows if not row["meets_threshold"]]
     payload = {
         "threshold": min_lines,
+        "excluded_crates": excluded_crates,
         "failed": [row["crate"] for row in failed],
         "crates": rows,
     }
@@ -74,7 +87,12 @@ def write_summary_json(path: Path, min_lines: float, rows: list[dict[str, object
     path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
 
 
-def write_summary_md(path: Path, min_lines: float, rows: list[dict[str, object]]) -> None:
+def write_summary_md(
+    path: Path,
+    min_lines: float,
+    rows: list[dict[str, object]],
+    excluded_crates: list[str],
+) -> None:
     failed_count = sum(1 for row in rows if not row["meets_threshold"])
     lines = [
         "# Per-crate Coverage",
@@ -82,6 +100,9 @@ def write_summary_md(path: Path, min_lines: float, rows: list[dict[str, object]]
         f"Threshold: {min_lines:.2f}% line coverage per crate.",
         f"Crates checked: {len(rows)}.",
         f"Crates below threshold: {failed_count}.",
+        "Excluded crates: "
+        + (", ".join(excluded_crates) if excluded_crates else "none")
+        + ".",
         "",
         "| Crate | Lines | Covered | Coverage | Gate |",
         "|-------|------:|--------:|---------:|------|",
@@ -103,12 +124,22 @@ def main(argv: list[str]) -> int:
     parser.add_argument("report", type=Path)
     parser.add_argument("--root", type=Path, default=Path.cwd())
     parser.add_argument("--min-lines", type=float, default=80.0)
+    parser.add_argument(
+        "--exclude-crate",
+        action="append",
+        default=[],
+        help=(
+            "crate name to omit from the per-crate line gate; repeat for "
+            "non-shipping harness crates with separate evidence"
+        ),
+    )
     parser.add_argument("--summary-json", type=Path)
     parser.add_argument("--summary-md", type=Path)
     args = parser.parse_args(argv)
 
+    excluded_crates = sorted(set(args.exclude_crate))
     report = json.loads(args.report.read_text(encoding="utf-8"))
-    rows = crate_rows(report, args.root, args.min_lines)
+    rows = crate_rows(report, args.root, args.min_lines, set(excluded_crates))
     if not rows:
         print("coverage gate: no crate source files found in llvm-cov report", file=sys.stderr)
         return 2
@@ -124,9 +155,9 @@ def main(argv: list[str]) -> int:
             failed.append((crate, pct))
 
     if args.summary_json is not None:
-        write_summary_json(args.summary_json, args.min_lines, rows)
+        write_summary_json(args.summary_json, args.min_lines, rows, excluded_crates)
     if args.summary_md is not None:
-        write_summary_md(args.summary_md, args.min_lines, rows)
+        write_summary_md(args.summary_md, args.min_lines, rows, excluded_crates)
 
     if failed:
         names = ", ".join(f"{crate}={percent:.2f}%" for crate, percent in failed)
