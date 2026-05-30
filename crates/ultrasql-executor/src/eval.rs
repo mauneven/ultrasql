@@ -4870,7 +4870,12 @@ fn compare_values(lv: &Value, rv: &Value) -> Result<std::cmp::Ordering, EvalErro
                 "comparison type mismatch: {lv:?} and {rv:?}"
             )));
         };
-        return compare_decimal_values(left_value, left_scale, right_value, right_scale);
+        return Ok(compare_decimal_values(
+            left_value,
+            left_scale,
+            right_value,
+            right_scale,
+        ));
     }
 
     match (lv, rv) {
@@ -4921,7 +4926,7 @@ fn compare_values(lv: &Value, rv: &Value) -> Result<std::cmp::Ordering, EvalErro
                 value: rv,
                 scale: rs,
             },
-        ) => compare_decimal_values(*lv, *ls, *rv, *rs),
+        ) => Ok(compare_decimal_values(*lv, *ls, *rv, *rs)),
         (Value::Date(l), Value::Date(r)) => Ok(l.cmp(r)),
         (Value::Time(l), Value::Time(r)) => Ok(l.cmp(r)),
         (
@@ -5027,35 +5032,79 @@ fn compare_decimal_values(
     left_scale: i32,
     right_value: i64,
     right_scale: i32,
-) -> Result<std::cmp::Ordering, EvalError> {
-    if left_scale == right_scale {
-        return Ok(left_value.cmp(&right_value));
+) -> std::cmp::Ordering {
+    match (left_value.cmp(&0), right_value.cmp(&0)) {
+        (std::cmp::Ordering::Equal, std::cmp::Ordering::Equal) => {
+            return std::cmp::Ordering::Equal;
+        }
+        (std::cmp::Ordering::Equal, std::cmp::Ordering::Less)
+        | (std::cmp::Ordering::Greater, std::cmp::Ordering::Less) => {
+            return std::cmp::Ordering::Greater;
+        }
+        (std::cmp::Ordering::Less, std::cmp::Ordering::Equal)
+        | (std::cmp::Ordering::Less, std::cmp::Ordering::Greater) => {
+            return std::cmp::Ordering::Less;
+        }
+        _ => {}
     }
-    let common_scale = left_scale.max(right_scale);
-    let left = rescale_decimal_for_compare(left_value, left_scale, common_scale)?;
-    let right = rescale_decimal_for_compare(right_value, right_scale, common_scale)?;
-    Ok(left.cmp(&right))
+
+    let left = DecimalMagnitude::new(left_value, left_scale);
+    let right = DecimalMagnitude::new(right_value, right_scale);
+    let magnitude_order = left.cmp_abs(&right);
+    if left.negative {
+        magnitude_order.reverse()
+    } else {
+        magnitude_order
+    }
 }
 
-fn rescale_decimal_for_compare(
-    value: i64,
-    current_scale: i32,
-    target_scale: i32,
-) -> Result<i128, EvalError> {
-    let scale_delta = target_scale - current_scale;
-    if scale_delta < 0 {
-        return Err(EvalError::Type(
-            "decimal comparison scale underflow".to_owned(),
-        ));
+#[derive(Debug)]
+struct DecimalMagnitude {
+    negative: bool,
+    digits: String,
+    integer_digits: i64,
+}
+
+impl DecimalMagnitude {
+    fn new(value: i64, scale: i32) -> Self {
+        let mut magnitude = i128::from(value);
+        let negative = magnitude < 0;
+        if negative {
+            magnitude = -magnitude;
+        }
+        let mut scale = i64::from(scale);
+        while magnitude != 0 && magnitude % 10 == 0 {
+            magnitude /= 10;
+            scale = scale.saturating_sub(1);
+        }
+        let digits = magnitude.to_string();
+        let digit_count = i64::try_from(digits.len()).unwrap_or(i64::MAX);
+        Self {
+            negative,
+            digits,
+            integer_digits: digit_count.saturating_sub(scale),
+        }
     }
-    let factor = pow10_i128(
-        u32::try_from(scale_delta)
-            .map_err(|_| EvalError::Type("decimal comparison scale overflow".to_owned()))?,
-    )
-    .ok_or_else(|| EvalError::Type("decimal comparison scale overflow".to_owned()))?;
-    i128::from(value)
-        .checked_mul(factor)
-        .ok_or_else(|| EvalError::Type("decimal comparison overflow".to_owned()))
+
+    fn cmp_abs(&self, other: &Self) -> std::cmp::Ordering {
+        match self.integer_digits.cmp(&other.integer_digits) {
+            std::cmp::Ordering::Equal => {}
+            non_equal => return non_equal,
+        }
+
+        let max_len = self.digits.len().max(other.digits.len());
+        let left = self.digits.as_bytes();
+        let right = other.digits.as_bytes();
+        for idx in 0..max_len {
+            let l = left.get(idx).copied().unwrap_or(b'0');
+            let r = right.get(idx).copied().unwrap_or(b'0');
+            match l.cmp(&r) {
+                std::cmp::Ordering::Equal => {}
+                non_equal => return non_equal,
+            }
+        }
+        std::cmp::Ordering::Equal
+    }
 }
 
 fn pow10_i128(exp: u32) -> Option<i128> {
@@ -7155,6 +7204,12 @@ mod tests {
     #[test]
     fn decimal_compares_float_literal() {
         let ev = Eval::new(binop(BinaryOp::Lt, lit_decimal(123, 2), lit_f64(2.0)));
+        assert_eq!(ev.eval(&[]).unwrap(), Value::Bool(true));
+    }
+
+    #[test]
+    fn decimal_compare_handles_large_scale_gap_without_overflow() {
+        let ev = Eval::new(binop(BinaryOp::Gt, lit_decimal(1, 0), lit_decimal(2, 100)));
         assert_eq!(ev.eval(&[]).unwrap(), Value::Bool(true));
     }
 

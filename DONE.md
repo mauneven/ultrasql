@@ -179,6 +179,11 @@ as a concise evidence ledger; roadmap stays for open gates only.
 - Optimizer statistics now order decimal `NUMERIC` values by exact scaled
   magnitude and canonicalize equal decimal keys before MCV/histogram grouping.
   Evidence: `cargo test -p ultrasql-optimizer value_ord`.
+- SQL predicate evaluation now compares high-scale decimal `NUMERIC` values
+  without rescale overflow, preserving exact ordering for mixed-scale
+  comparisons. Evidence:
+  `cargo test -p ultrasql-executor decimal_compare_handles_large_scale_gap_without_overflow`
+  and `cargo test -p ultrasql-executor eval`.
 
 ## Core SQL And Wire Protocol
 
