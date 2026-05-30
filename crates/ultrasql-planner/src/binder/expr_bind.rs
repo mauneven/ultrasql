@@ -795,9 +795,7 @@ pub(super) fn make_binary(
     mut left: ScalarExpr,
     mut right: ScalarExpr,
 ) -> Result<ScalarExpr, PlanError> {
-    if !binary_operator_uses_raw_text_pattern(op) {
-        coerce_literal_to_match(&mut left, &mut right);
-    }
+    coerce_binary_literals(op, &mut left, &mut right);
     let data_type = binary_result_type(op, left.data_type(), right.data_type())?;
     Ok(ScalarExpr::Binary {
         op,
@@ -3296,9 +3294,7 @@ pub(super) fn bind_binary(
 ) -> Result<ScalarExpr, PlanError> {
     let mut l = bind_expr_with_ctes(left, input, catalog, cte_catalog, scope)?;
     let mut r = bind_expr_with_ctes(right, input, catalog, cte_catalog, scope)?;
-    if !binary_operator_uses_raw_text_pattern(op) {
-        coerce_literal_to_match(&mut l, &mut r);
-    }
+    coerce_binary_literals(op, &mut l, &mut r);
     if let Some(folded) = try_fold_literal_binary(op, &l, &r)? {
         return Ok(folded);
     }
@@ -3323,6 +3319,21 @@ const fn binary_operator_uses_raw_text_pattern(op: BinaryOp) -> bool {
             | BinaryOp::RegexNotMatch
             | BinaryOp::RegexNotIMatch
     )
+}
+
+fn coerce_binary_literals(op: BinaryOp, left: &mut ScalarExpr, right: &mut ScalarExpr) {
+    if binary_operator_uses_raw_text_pattern(op)
+        || money_division_keeps_operand_types(op, left, right)
+    {
+        return;
+    }
+    coerce_literal_to_match(left, right);
+}
+
+fn money_division_keeps_operand_types(op: BinaryOp, left: &ScalarExpr, right: &ScalarExpr) -> bool {
+    matches!(op, BinaryOp::Div)
+        && (matches!(left.data_type(), DataType::Money)
+            || matches!(right.data_type(), DataType::Money))
 }
 
 #[cfg(test)]

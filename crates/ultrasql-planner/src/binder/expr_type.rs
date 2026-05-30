@@ -18,8 +18,8 @@ pub(super) fn binary_result_type(
             if matches!(op, BinaryOp::Add) && network_integer_add_type(&lt, &rt).is_some() {
                 return Ok(DataType::Inet);
             }
-            if matches!(op, BinaryOp::Add) && is_money_arithmetic(&lt, &rt) {
-                return Ok(DataType::Money);
+            if let Some(money_type) = money_arithmetic_type(op, &lt, &rt) {
+                return Ok(money_type);
             }
             if matches!(lt, DataType::Null) {
                 Ok(rt)
@@ -41,8 +41,8 @@ pub(super) fn binary_result_type(
                 Ok(DataType::Inet)
             } else if lt.is_ip_network() && rt.is_ip_network() {
                 Ok(DataType::Int64)
-            } else if is_money_arithmetic(&lt, &rt) {
-                Ok(DataType::Money)
+            } else if let Some(money_type) = money_arithmetic_type(op, &lt, &rt) {
+                Ok(money_type)
             } else if matches!(lt, DataType::Null) {
                 Ok(rt)
             } else if matches!(rt, DataType::Null) {
@@ -216,8 +216,13 @@ pub(super) fn binary_result_type(
     }
 }
 
-fn is_money_arithmetic(left: &DataType, right: &DataType) -> bool {
-    matches!((left, right), (DataType::Money, DataType::Money))
+fn money_arithmetic_type(op: BinaryOp, left: &DataType, right: &DataType) -> Option<DataType> {
+    match (op, left, right) {
+        (BinaryOp::Add | BinaryOp::Sub, DataType::Money, DataType::Money) => Some(DataType::Money),
+        (BinaryOp::Div, DataType::Money, DataType::Money) => Some(DataType::Float64),
+        (BinaryOp::Div, DataType::Money, ty) if ty.is_integer() => Some(DataType::Money),
+        _ => None,
+    }
 }
 
 fn network_integer_add_type(left: &DataType, right: &DataType) -> Option<DataType> {

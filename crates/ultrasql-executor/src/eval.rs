@@ -4037,11 +4037,46 @@ fn money_arith(left: &Value, right: &Value, op: ArithOp) -> Result<Option<Value>
             .map(Value::Money)
             .map(Some)
             .ok_or(EvalError::Overflow),
+        (Value::Money(l), Value::Money(r), ArithOp::Div) => money_ratio(*l, *r).map(Some),
+        (Value::Money(cents), Value::Int16(divisor), ArithOp::Div) => {
+            money_integer_div(*cents, i64::from(*divisor)).map(Some)
+        }
+        (Value::Money(cents), Value::Int32(divisor), ArithOp::Div) => {
+            money_integer_div(*cents, i64::from(*divisor)).map(Some)
+        }
+        (Value::Money(cents), Value::Int64(divisor), ArithOp::Div) => {
+            money_integer_div(*cents, *divisor).map(Some)
+        }
         (Value::Money(_), Value::Money(_), _) => Err(EvalError::Type(
-            "money arithmetic supports addition and subtraction".to_owned(),
+            "money arithmetic supports addition, subtraction, and division".to_owned(),
         )),
         _ => Ok(None),
     }
+}
+
+fn money_ratio(left_cents: i64, right_cents: i64) -> Result<Value, EvalError> {
+    if right_cents == 0 {
+        return Err(EvalError::DivByZero);
+    }
+    Ok(Value::Float64(
+        cents_to_f64(left_cents) / cents_to_f64(right_cents),
+    ))
+}
+
+fn money_integer_div(cents: i64, divisor: i64) -> Result<Value, EvalError> {
+    if divisor == 0 {
+        return Err(EvalError::DivByZero);
+    }
+    cents
+        .checked_div(divisor)
+        .map(Value::Money)
+        .ok_or(EvalError::Overflow)
+}
+
+fn cents_to_f64(cents: i64) -> f64 {
+    #[allow(clippy::cast_precision_loss)]
+    let value = cents as f64;
+    value
 }
 
 fn decimal_float_operands(left: &Value, right: &Value) -> Option<(f64, f64)> {
@@ -6411,6 +6446,41 @@ mod tests {
             data_type: DataType::Money,
         });
         assert_eq!(sub.eval(&[]).expect("money sub"), Value::Money(375));
+    }
+
+    #[test]
+    fn money_division_matrix_evaluates() {
+        let ratio = Eval::new(ScalarExpr::Binary {
+            op: BinaryOp::Div,
+            left: Box::new(lit_money(500)),
+            right: Box::new(lit_money(200)),
+            data_type: DataType::Float64,
+        });
+        assert_eq!(ratio.eval(&[]).expect("money ratio"), Value::Float64(2.5));
+
+        let divided = Eval::new(ScalarExpr::Binary {
+            op: BinaryOp::Div,
+            left: Box::new(lit_money(501)),
+            right: Box::new(lit_i32(2)),
+            data_type: DataType::Money,
+        });
+        assert_eq!(divided.eval(&[]).expect("money int div"), Value::Money(250));
+
+        let zero_money = Eval::new(ScalarExpr::Binary {
+            op: BinaryOp::Div,
+            left: Box::new(lit_money(500)),
+            right: Box::new(lit_money(0)),
+            data_type: DataType::Float64,
+        });
+        assert!(matches!(zero_money.eval(&[]), Err(EvalError::DivByZero)));
+
+        let zero_int = Eval::new(ScalarExpr::Binary {
+            op: BinaryOp::Div,
+            left: Box::new(lit_money(500)),
+            right: Box::new(lit_i32(0)),
+            data_type: DataType::Money,
+        });
+        assert!(matches!(zero_int.eval(&[]), Err(EvalError::DivByZero)));
     }
 
     #[test]

@@ -854,6 +854,16 @@ fn binds_money_addition_and_subtraction() {
 }
 
 #[test]
+fn binds_money_division_matrix() {
+    let cat = InMemoryCatalog::new();
+    let ratio = parse_and_bind("SELECT '$5.00'::money / '$2.00'::money", &cat).expect("bind ok");
+    assert_eq!(ratio.schema().field_at(0).data_type, DataType::Float64);
+
+    let divided = parse_and_bind("SELECT '$5.01'::money / 2", &cat).expect("bind ok");
+    assert_eq!(divided.schema().field_at(0).data_type, DataType::Money);
+}
+
+#[test]
 fn binds_money_unary_signs() {
     let cat = InMemoryCatalog::new();
     let plan = parse_and_bind("SELECT -('$1.25'::money), +'$2.00'::money", &cat).expect("bind ok");
