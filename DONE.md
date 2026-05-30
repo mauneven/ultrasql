@@ -124,6 +124,11 @@ as a concise evidence ledger; roadmap stays for open gates only.
   later page access rejected. Evidence: `cargo test -p ultrasql-storage --lib`
   and
   `cargo clippy -p ultrasql-storage --all-targets --all-features -- -D warnings`.
+- Page-backed IVFFlat metadata initialization now propagates
+  `AccessMethodError` instead of panicking in the constructor. Evidence:
+  `cargo test -p ultrasql-storage --lib page_backed_ivfflat -- --nocapture`
+  and
+  `cargo clippy -p ultrasql-storage --all-targets --all-features -- -D warnings`.
 - Backup/restore smoke runner covers `ultrasql --basebackup`,
   `ultrasql --pg-dump`, `ultrasql --pg-restore`, row counts, and indexed lookup.
 - Backup/restore dump-format certification now covers custom, directory, and

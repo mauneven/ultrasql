@@ -3406,15 +3406,10 @@ impl PageBackedIvfFlatIndex {
         let dims = usize::try_from(dims).map_err(|_| {
             AccessMethodError::Storage("page-backed ivfflat dims do not fit usize".to_owned())
         })?;
+        let storage =
+            PageBackedIvfFlatStorage::new(index_rel, dims, metric, lists, probes, payload_kind)?;
         Ok(Self {
-            storage: Mutex::new(PageBackedIvfFlatStorage::new(
-                index_rel,
-                dims,
-                metric,
-                lists,
-                probes,
-                payload_kind,
-            )),
+            storage: Mutex::new(storage),
             index_rel,
             dims,
             metric,
@@ -3964,7 +3959,7 @@ impl PageBackedIvfFlatStorage {
         lists: usize,
         probes: usize,
         payload_kind: AnnPayloadKind,
-    ) -> Self {
+    ) -> Result<Self, AccessMethodError> {
         let ctx = IvfFlatPageContext {
             index_rel,
             dims,
@@ -3984,8 +3979,8 @@ impl PageBackedIvfFlatStorage {
         };
         storage
             .sync_pages(ctx, Lsn::ZERO)
-            .expect("fresh page-backed ivfflat metadata must fit block numbers");
-        storage
+            .map_err(|err| AccessMethodError::Storage(format!("ivfflat metadata init: {err}")))?;
+        Ok(storage)
     }
 
     fn clear(&mut self, ctx: IvfFlatPageContext) -> Result<(), AccessMethodError> {
