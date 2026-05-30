@@ -135,6 +135,42 @@ async fn drop_role_rejects_owned_table_until_object_is_dropped() {
     shutdown(running).await;
 }
 
+#[tokio::test]
+async fn drop_role_rejects_granted_privileges_until_revoked() {
+    let running = start_sample_server("role_ddl_test").await;
+    let client = &running.client;
+
+    client
+        .batch_execute("CREATE ROLE grant_target LOGIN")
+        .await
+        .expect("create grant target");
+    client
+        .batch_execute("CREATE TABLE role_grant_table (id INT)")
+        .await
+        .expect("create grant table");
+    client
+        .batch_execute("GRANT SELECT ON TABLE role_grant_table TO grant_target")
+        .await
+        .expect("grant table privilege");
+
+    let restricted = client
+        .batch_execute("DROP ROLE grant_target")
+        .await
+        .expect_err("privilege grant must block DROP ROLE");
+    assert_eq!(restricted.code().expect("SQLSTATE").code(), "2BP01");
+
+    client
+        .batch_execute("REVOKE SELECT ON TABLE role_grant_table FROM grant_target")
+        .await
+        .expect("revoke table privilege");
+    client
+        .batch_execute("DROP ROLE grant_target")
+        .await
+        .expect("drop role after revoke");
+
+    shutdown(running).await;
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn role_catalog_survives_restart() {
     let data_dir = tempfile::TempDir::new().expect("temp data dir");
