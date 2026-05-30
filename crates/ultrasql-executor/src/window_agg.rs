@@ -380,7 +380,7 @@ impl WindowAgg {
             let mut buf = Vec::with_capacity(n_total * order_key_count);
             for row in &all_rows {
                 for kv in &self.order_key_evals {
-                    buf.push(kv.eval(row).unwrap_or(Value::Null));
+                    buf.push(eval_window_expr(kv, row)?);
                 }
             }
             buf
@@ -406,7 +406,7 @@ impl WindowAgg {
             for (idx, row) in all_rows.iter().enumerate() {
                 let mut key: Vec<Value> = Vec::with_capacity(key_count);
                 for kv in &self.partition_key_evals {
-                    key.push(kv.eval(row).unwrap_or(Value::Null));
+                    key.push(eval_window_expr(kv, row)?);
                 }
                 let part_idx = match part_by_key.entry(key) {
                     std::collections::hash_map::Entry::Occupied(entry) => *entry.get(),
@@ -447,7 +447,7 @@ impl WindowAgg {
 
             let n = sorted_indices.len();
             let values: Vec<Value> = match &self.func {
-                WindowFunc::RowNumber => (1..=n).map(|i| Value::Int64(i as i64)).collect(),
+                WindowFunc::RowNumber => Ok((1..=n).map(|i| Value::Int64(i as i64)).collect()),
                 WindowFunc::Rank => {
                     let mut out_ranks = vec![1_i64; n];
                     let mut base_rank = 1_usize;
@@ -462,7 +462,7 @@ impl WindowAgg {
                         }
                         out_ranks[pos] = base_rank as i64;
                     }
-                    out_ranks.into_iter().map(Value::Int64).collect()
+                    Ok(out_ranks.into_iter().map(Value::Int64).collect())
                 }
                 WindowFunc::DenseRank => {
                     let mut out = Vec::with_capacity(n);
@@ -480,7 +480,7 @@ impl WindowAgg {
                         }
                         out.push(Value::Int64(dense));
                     }
-                    out
+                    Ok(out)
                 }
                 WindowFunc::Lag {
                     expr,
@@ -495,12 +495,10 @@ impl WindowAgg {
                         .enumerate()
                         .map(|(pos, &_idx)| {
                             if pos < offset {
-                                default.clone()
+                                Ok(default.clone())
                             } else {
                                 let prev_idx = sorted_indices[pos - offset];
-                                interp
-                                    .eval(&all_rows[prev_idx])
-                                    .unwrap_or_else(|_| default.clone())
+                                eval_window_expr(&interp, &all_rows[prev_idx])
                             }
                         })
                         .collect()
@@ -518,29 +516,31 @@ impl WindowAgg {
                         .enumerate()
                         .map(|(pos, &_idx)| {
                             if pos + offset >= n {
-                                default.clone()
+                                Ok(default.clone())
                             } else {
                                 let next_idx = sorted_indices[pos + offset];
-                                interp
-                                    .eval(&all_rows[next_idx])
-                                    .unwrap_or_else(|_| default.clone())
+                                eval_window_expr(&interp, &all_rows[next_idx])
                             }
                         })
                         .collect()
                 }
                 WindowFunc::FirstValue(expr) => {
                     let interp = Eval::new(expr.clone());
-                    let first = sorted_indices.first().map_or(Value::Null, |&i| {
-                        interp.eval(&all_rows[i]).unwrap_or(Value::Null)
-                    });
-                    vec![first; n]
+                    let first = sorted_indices
+                        .first()
+                        .map(|&i| eval_window_expr(&interp, &all_rows[i]))
+                        .transpose()?
+                        .unwrap_or(Value::Null);
+                    Ok(vec![first; n])
                 }
                 WindowFunc::LastValue(expr) => {
                     let interp = Eval::new(expr.clone());
-                    let last = sorted_indices.last().map_or(Value::Null, |&i| {
-                        interp.eval(&all_rows[i]).unwrap_or(Value::Null)
-                    });
-                    vec![last; n]
+                    let last = sorted_indices
+                        .last()
+                        .map(|&i| eval_window_expr(&interp, &all_rows[i]))
+                        .transpose()?
+                        .unwrap_or(Value::Null);
+                    Ok(vec![last; n])
                 }
                 WindowFunc::NthValue { expr, n: nth } => {
                     let interp = Eval::new(expr.clone());
@@ -549,13 +549,13 @@ impl WindowAgg {
                         Value::Null
                     } else {
                         let idx = sorted_indices[nth - 1];
-                        interp.eval(&all_rows[idx]).unwrap_or(Value::Null)
+                        eval_window_expr(&interp, &all_rows[idx])?
                     };
-                    vec![val; n]
+                    Ok(vec![val; n])
                 }
                 WindowFunc::Ntile(bucket_count) => {
                     let bucket_count = *bucket_count;
-                    (0..n)
+                    Ok((0..n)
                         .map(|pos| {
                             let bucket = if bucket_count == 0 {
                                 1
@@ -564,9 +564,9 @@ impl WindowAgg {
                             };
                             Value::Int64(bucket as i64)
                         })
-                        .collect()
+                        .collect())
                 }
-            };
+            }?;
 
             // Scatter the partition's window values back into the
             // global buffer at each row's original index.
@@ -589,6 +589,11 @@ impl WindowAgg {
 
         Ok(output)
     }
+}
+
+fn eval_window_expr(eval: &Eval, row: &[Value]) -> Result<Value, ExecError> {
+    eval.eval(row)
+        .map_err(|err| ExecError::TypeMismatch(err.to_string()))
 }
 
 /// `true` iff `keys` is monotonically non-decreasing.
@@ -844,7 +849,7 @@ fn merge_into(left: &[(i64, u32)], right: &[(i64, u32)], out: &mut [(i64, u32)])
 )]
 mod tests {
     use ultrasql_core::{DataType, Field, Schema, Value};
-    use ultrasql_planner::ScalarExpr;
+    use ultrasql_planner::{BinaryOp, ScalarExpr};
     use ultrasql_vec::Batch;
     use ultrasql_vec::bitmap::Bitmap;
     use ultrasql_vec::column::{Column, NumericColumn};
@@ -943,6 +948,26 @@ mod tests {
         }
     }
 
+    fn lit_i32(v: i32) -> ScalarExpr {
+        ScalarExpr::Literal {
+            value: Value::Int32(v),
+            data_type: DataType::Int32,
+        }
+    }
+
+    fn divide_i32_by_zero(name: &str, index: usize) -> ScalarExpr {
+        ScalarExpr::Binary {
+            op: BinaryOp::Div,
+            left: Box::new(ScalarExpr::Column {
+                name: name.into(),
+                index,
+                data_type: DataType::Int32,
+            }),
+            right: Box::new(lit_i32(0)),
+            data_type: DataType::Int32,
+        }
+    }
+
     fn drain_window_col(op: &mut dyn Operator) -> Vec<i64> {
         let schema = op.schema().clone();
         let mut out = Vec::new();
@@ -1037,6 +1062,88 @@ mod tests {
         let rns = drain_window_col(&mut op);
 
         assert_eq!(rns, vec![2, 1, 1, 2]);
+    }
+
+    #[test]
+    fn window_order_key_eval_error_propagates() {
+        let scan = MemTableScan::new(schema_id_val(), vec![make_batch(&[(1, 10)])]);
+        let mut op = WindowAgg::new(
+            Box::new(scan),
+            vec![],
+            vec![divide_i32_by_zero("val", 1)],
+            WindowFunc::RowNumber,
+            schema_with_window(),
+        );
+
+        let err = op.next_batch().expect_err("order key division must error");
+        assert!(
+            err.to_string().contains("division by zero"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn window_partition_key_eval_error_propagates() {
+        let scan = MemTableScan::new(schema_id_val(), vec![make_batch(&[(1, 10)])]);
+        let mut op = WindowAgg::new(
+            Box::new(scan),
+            vec![divide_i32_by_zero("id", 0)],
+            vec![],
+            WindowFunc::RowNumber,
+            schema_with_window(),
+        );
+
+        let err = op
+            .next_batch()
+            .expect_err("partition key division must error");
+        assert!(
+            err.to_string().contains("division by zero"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn window_first_value_eval_error_propagates() {
+        let scan = MemTableScan::new(schema_id_val(), vec![make_batch(&[(1, 10)])]);
+        let mut op = WindowAgg::new(
+            Box::new(scan),
+            vec![],
+            vec![],
+            WindowFunc::FirstValue(divide_i32_by_zero("id", 0)),
+            schema_with_value_window(DataType::Int32),
+        );
+
+        let err = op
+            .next_batch()
+            .expect_err("first_value expression division must error");
+        assert!(
+            err.to_string().contains("division by zero"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn window_lag_eval_error_propagates() {
+        let scan = MemTableScan::new(schema_id_val(), vec![make_batch(&[(1, 10), (2, 20)])]);
+        let mut op = WindowAgg::new(
+            Box::new(scan),
+            vec![],
+            vec![col_val()],
+            WindowFunc::Lag {
+                expr: divide_i32_by_zero("id", 0),
+                offset: 1,
+                default: Value::Int32(0),
+            },
+            schema_with_value_window(DataType::Int32),
+        );
+
+        let err = op
+            .next_batch()
+            .expect_err("lag expression division must error");
+        assert!(
+            err.to_string().contains("division by zero"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]

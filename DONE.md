@@ -155,6 +155,9 @@ as a concise evidence ledger; roadmap stays for open gates only.
 - `GatherMerge` now propagates merge-key evaluation failures instead of
   silently comparing them as NULL. Evidence:
   `cargo test -p ultrasql-executor gather`.
+- `WindowAgg` now propagates partition-key, order-key, and window value
+  expression failures instead of silently returning NULL/default values.
+  Evidence: `cargo test -p ultrasql-executor window_agg`.
 
 ## Core SQL And Wire Protocol
 
