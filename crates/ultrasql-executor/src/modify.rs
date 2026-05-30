@@ -572,8 +572,13 @@ impl<L: PageLoader> ModifyTable<L> {
     /// Output schema shared across all `ModifyTable` instances: a single
     /// `Int64` column named `"affected_rows"`.
     fn affected_rows_schema() -> Schema {
-        Schema::new([Field::required("affected_rows", DataType::Int64)])
-            .expect("affected_rows schema is trivially well-formed")
+        match Schema::new([Field::required("affected_rows", DataType::Int64)]) {
+            Ok(schema) => schema,
+            Err(err) => {
+                tracing::error!(error = %err, "modify affected_rows schema failed");
+                Schema::empty()
+            }
+        }
     }
 
     /// Construct a `ModifyTable` operator.
