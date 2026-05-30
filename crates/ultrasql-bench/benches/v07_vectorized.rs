@@ -270,7 +270,8 @@ fn bench_dict_filter_vs_raw(c: &mut Criterion) {
             })
         })
         .collect();
-    let dict = DictionaryColumn::from_strings(strings);
+    let dict =
+        DictionaryColumn::from_strings(strings).expect("bench dictionary should fit u32 codes");
     let target_code = dict.code_for("alpha").expect("alpha in dict");
 
     // Equivalent i64 column for raw filter comparison

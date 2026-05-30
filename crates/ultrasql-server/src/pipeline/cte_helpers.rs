@@ -464,11 +464,10 @@ mod tests {
                 )
                 .expect("utf8 nulls"),
             ),
-            Column::DictionaryUtf8(DictionaryColumn::from_strings([
-                Some("dict"),
-                None,
-                Some("dict"),
-            ])),
+            Column::DictionaryUtf8(
+                DictionaryColumn::from_strings([Some("dict"), None, Some("dict")])
+                    .expect("test dictionary should fit u32 codes"),
+            ),
         ])
         .expect("mixed batch")
     }

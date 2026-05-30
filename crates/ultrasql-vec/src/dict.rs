@@ -20,7 +20,23 @@
 use std::collections::HashMap;
 
 use crate::bitmap::Bitmap;
-use crate::column::{NumericColumn, StringColumn};
+use crate::column::{ColumnError, NumericColumn, StringColumn};
+
+/// Errors raised while building dictionary-encoded string columns.
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+pub enum DictionaryError {
+    /// The number of distinct values does not fit the on-disk/in-memory code
+    /// width.
+    #[error("dictionary has too many distinct values: {distinct} exceeds u32::MAX")]
+    TooManyDistinctValues {
+        /// Distinct values seen before assigning the next code.
+        distinct: usize,
+    },
+
+    /// The generated validity bitmap does not match the code buffer length.
+    #[error("dictionary code bitmap: {0}")]
+    Column(#[from] ColumnError),
+}
 
 // ============================================================================
 // DictionaryColumn
@@ -54,7 +70,7 @@ impl DictionaryColumn {
     /// # Performance
     ///
     /// Uses a `HashMap` for deduplication; one pass over the input.
-    pub fn from_strings<'a, I>(iter: I) -> Self
+    pub fn from_strings<'a, I>(iter: I) -> Result<Self, DictionaryError>
     where
         I: IntoIterator<Item = Option<&'a str>>,
     {
@@ -73,7 +89,11 @@ impl DictionaryColumn {
                     let code = if let Some(&c) = map.get(s) {
                         c
                     } else {
-                        let c = dict.len().try_into().expect("dict size fits u32");
+                        let c = u32::try_from(dict.len()).map_err(|_| {
+                            DictionaryError::TooManyDistinctValues {
+                                distinct: dict.len(),
+                            }
+                        })?;
                         dict.push(s.to_owned());
                         map.insert(s.to_owned(), c);
                         c
@@ -91,10 +111,10 @@ impl DictionaryColumn {
             for pos in &null_positions {
                 bm.set(*pos, false);
             }
-            NumericColumn::with_nulls(code_data, bm).expect("validity length matches data length")
+            NumericColumn::with_nulls(code_data, bm)?
         };
 
-        Self { dict, codes }
+        Ok(Self { dict, codes })
     }
 
     /// Number of rows.
@@ -127,7 +147,7 @@ impl DictionaryColumn {
         self.dict
             .iter()
             .position(|s| s == value)
-            .map(|i| i.try_into().expect("dict position fits u32"))
+            .and_then(|i| u32::try_from(i).ok())
     }
 }
 
@@ -226,7 +246,10 @@ where
     I: IntoIterator<Item = Option<&'a str>>,
 {
     let rows: Vec<Option<String>> = iter.into_iter().map(|v| v.map(str::to_owned)).collect();
-    let dict = DictionaryColumn::from_strings(rows.iter().map(|v| v.as_deref()));
+    let dict = match DictionaryColumn::from_strings(rows.iter().map(|v| v.as_deref())) {
+        Ok(dict) => dict,
+        Err(_) => return StringEncoding::Raw(raw_string_column_from_rows(&rows)),
+    };
     let non_null_rows = rows.iter().filter(|v| v.is_some()).count();
 
     if policy.should_dictionary_encode(rows.len(), non_null_rows, dict.dict.len()) {
@@ -238,11 +261,7 @@ where
 
 fn raw_string_column_from_rows(rows: &[Option<String>]) -> StringColumn {
     if rows.iter().all(Option::is_some) {
-        return StringColumn::from_data(rows.iter().map(|v| {
-            v.as_ref()
-                .expect("all rows are Some after all(Option::is_some)")
-                .clone()
-        }));
+        return StringColumn::from_data(rows.iter().filter_map(Clone::clone));
     }
 
     let mut nulls = Bitmap::new(rows.len(), true);
@@ -256,7 +275,16 @@ fn raw_string_column_from_rows(rows: &[Option<String>]) -> StringColumn {
             }
         }
     }
-    StringColumn::with_nulls(values, nulls).expect("null bitmap length equals row count")
+    match StringColumn::with_nulls(values, nulls) {
+        Ok(column) => column,
+        Err(err) => {
+            debug_assert!(
+                false,
+                "raw dictionary fallback built mismatched string nulls: {err}"
+            );
+            StringColumn::from_data(std::iter::empty::<String>())
+        }
+    }
 }
 
 // ============================================================================
@@ -323,7 +351,7 @@ pub fn group_by_dict(column: &DictionaryColumn) -> Vec<(u32, Vec<usize>)> {
         .into_iter()
         .enumerate()
         .filter(|(_, rows)| !rows.is_empty())
-        .map(|(code, rows)| (code.try_into().expect("code fits u32"), rows))
+        .filter_map(|(code, rows)| u32::try_from(code).ok().map(|code| (code, rows)))
         .collect()
 }
 
@@ -335,11 +363,18 @@ pub fn group_by_dict(column: &DictionaryColumn) -> Vec<(u32, Vec<usize>)> {
 mod tests {
     use super::*;
 
+    fn dict<'a, I>(iter: I) -> DictionaryColumn
+    where
+        I: IntoIterator<Item = Option<&'a str>>,
+    {
+        DictionaryColumn::from_strings(iter).expect("test dictionary should fit u32 codes")
+    }
+
     // ---- DictionaryColumn::from_strings ----
 
     #[test]
     fn from_strings_deduplicates_values() {
-        let col = DictionaryColumn::from_strings(
+        let col = dict(
             ["alpha", "beta", "alpha", "gamma", "beta"]
                 .iter()
                 .map(|s| Some(*s)),
@@ -351,7 +386,7 @@ mod tests {
 
     #[test]
     fn from_strings_codes_point_to_correct_dict_entries() {
-        let col = DictionaryColumn::from_strings(["x", "y", "x"].iter().map(|s| Some(*s)));
+        let col = dict(["x", "y", "x"].iter().map(|s| Some(*s)));
         assert_eq!(col.decode_at(0), "x");
         assert_eq!(col.decode_at(1), "y");
         assert_eq!(col.decode_at(2), "x");
@@ -359,7 +394,7 @@ mod tests {
 
     #[test]
     fn from_strings_handles_nulls() {
-        let col = DictionaryColumn::from_strings([Some("a"), None, Some("b"), None, Some("a")]);
+        let col = dict([Some("a"), None, Some("b"), None, Some("a")]);
         assert_eq!(col.len(), 5);
         let nulls = col.codes.nulls().expect("nullable column");
         assert!(nulls.get(0));
@@ -371,7 +406,7 @@ mod tests {
 
     #[test]
     fn decode_at_returns_correct_string() {
-        let col = DictionaryColumn::from_strings(["cat", "dog", "cat"].iter().map(|s| Some(*s)));
+        let col = dict(["cat", "dog", "cat"].iter().map(|s| Some(*s)));
         assert_eq!(col.decode_at(0), "cat");
         assert_eq!(col.decode_at(1), "dog");
         assert_eq!(col.decode_at(2), "cat");
@@ -379,7 +414,7 @@ mod tests {
 
     #[test]
     fn code_for_returns_correct_index() {
-        let col = DictionaryColumn::from_strings(["a", "b", "c"].iter().map(|s| Some(*s)));
+        let col = dict(["a", "b", "c"].iter().map(|s| Some(*s)));
         assert_eq!(col.code_for("a"), Some(0));
         assert_eq!(col.code_for("b"), Some(1));
         assert_eq!(col.code_for("c"), Some(2));
@@ -390,8 +425,7 @@ mod tests {
 
     #[test]
     fn filter_eq_dict_code_basic() {
-        let col =
-            DictionaryColumn::from_strings(["a", "b", "a", "c", "b"].iter().map(|s| Some(*s)));
+        let col = dict(["a", "b", "a", "c", "b"].iter().map(|s| Some(*s)));
         let code_a = col.code_for("a").unwrap();
         let mask = filter_eq_dict_code(&col, code_a);
         assert!(mask.get(0));
@@ -403,7 +437,7 @@ mod tests {
 
     #[test]
     fn filter_eq_dict_code_excludes_nulls() {
-        let col = DictionaryColumn::from_strings([Some("a"), None, Some("a")]);
+        let col = dict([Some("a"), None, Some("a")]);
         let code_a = col.code_for("a").unwrap();
         let mask = filter_eq_dict_code(&col, code_a);
         assert!(mask.get(0));
@@ -413,7 +447,7 @@ mod tests {
 
     #[test]
     fn filter_eq_dict_code_no_match_returns_all_zero() {
-        let col = DictionaryColumn::from_strings(["x", "y"].iter().map(|s| Some(*s)));
+        let col = dict(["x", "y"].iter().map(|s| Some(*s)));
         let mask = filter_eq_dict_code(&col, 99); // code 99 does not exist
         assert_eq!(mask.count_ones(), 0);
     }
@@ -422,8 +456,7 @@ mod tests {
 
     #[test]
     fn group_by_dict_produces_correct_groups() {
-        let col =
-            DictionaryColumn::from_strings(["a", "b", "a", "c", "b", "a"].iter().map(|s| Some(*s)));
+        let col = dict(["a", "b", "a", "c", "b", "a"].iter().map(|s| Some(*s)));
         let groups = group_by_dict(&col);
         // 3 groups: a, b, c
         assert_eq!(groups.len(), 3);
@@ -435,7 +468,7 @@ mod tests {
 
     #[test]
     fn group_by_dict_excludes_null_rows() {
-        let col = DictionaryColumn::from_strings([Some("x"), None, Some("x")]);
+        let col = dict([Some("x"), None, Some("x")]);
         let groups = group_by_dict(&col);
         assert_eq!(groups.len(), 1);
         let (_, rows) = &groups[0];
@@ -444,7 +477,7 @@ mod tests {
 
     #[test]
     fn dict_round_trip_empty() {
-        let col = DictionaryColumn::from_strings(std::iter::empty::<Option<&str>>());
+        let col = dict(std::iter::empty::<Option<&str>>());
         assert!(col.is_empty());
         assert!(col.dict.is_empty());
         assert_eq!(group_by_dict(&col).len(), 0);

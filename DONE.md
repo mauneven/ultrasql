@@ -413,6 +413,14 @@ as a concise evidence ledger; roadmap stays for open gates only.
   `cargo test -p ultrasql-vec prop_par_matches_serial`,
   `cargo test -p ultrasql-vec prop_dict_kernel_matches_dense`, and
   `cargo clippy -p ultrasql-vec --all-targets --all-features -- -D warnings`.
+- Vector string dictionary construction now returns typed
+  `DictionaryError`s for code-width and generated-bitmap failures; callers use
+  explicit fallbacks instead of constructor `expect` paths. Evidence:
+  `cargo test -p ultrasql-vec from_strings`,
+  `cargo test -p ultrasql-vec group_by_dict`,
+  `cargo test -p ultrasql-vec auto_encoding`, `cargo check --workspace
+  --all-targets`, and `cargo clippy -p ultrasql-vec --all-targets
+  --all-features -- -D warnings`.
 
 ## Core SQL And Wire Protocol
 

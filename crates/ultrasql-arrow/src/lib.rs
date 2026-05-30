@@ -590,7 +590,8 @@ mod tests {
         )
         .expect("bool nulls");
         let dictionary =
-            DictionaryColumn::from_strings([Some("red"), None, Some("red"), Some("blue")]);
+            DictionaryColumn::from_strings([Some("red"), None, Some("red"), Some("blue")])
+                .expect("test dictionary should fit u32 codes");
         let batch = Batch::new([
             Column::Bool(bools),
             Column::Float32(NumericColumn::from_data(vec![1.5_f32, 2.5, 3.5, 4.5])),

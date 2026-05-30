@@ -2555,12 +2555,10 @@ mod tests {
             )
             .expect("utf8"),
         );
-        let dict = Column::DictionaryUtf8(DictionaryColumn::from_strings([
-            Some("a"),
-            None,
-            Some("c"),
-            Some("d"),
-        ]));
+        let dict = Column::DictionaryUtf8(
+            DictionaryColumn::from_strings([Some("a"), None, Some("c"), Some("d")])
+                .expect("test dictionary should fit u32 codes"),
+        );
         assert_eq!(column_non_null_count(&int32), 3);
         assert_eq!(column_non_null_count(&int64), 3);
         assert_eq!(column_non_null_count(&float32), 3);
