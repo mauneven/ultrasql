@@ -148,6 +148,11 @@ as a concise evidence ledger; roadmap stays for open gates only.
   targets instead of `expect`. Evidence:
   `cargo test -p ultrasql-catalog encoding::tests::truncated_payload_is_caught -- --nocapture`
   and `cargo clippy -p ultrasql-catalog --all-targets --all-features -- -D warnings`.
+- Catalog bootstrap schema invariants now use one documented `static_schema`
+  helper instead of repeated production `expect` calls at every system-table
+  schema site. Evidence:
+  `cargo test -p ultrasql-catalog --lib bootstrap -- --nocapture` and
+  `cargo clippy -p ultrasql-catalog --all-targets --all-features -- -D warnings`.
 - Backup/restore smoke runner covers `ultrasql --basebackup`,
   `ultrasql --pg-dump`, `ultrasql --pg-restore`, row counts, and indexed lookup.
 - Backup/restore dump-format certification now covers custom, directory, and

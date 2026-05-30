@@ -93,167 +93,201 @@ pub const PG_STATISTIC_EXT_OID: u32 = 3381;
 // Schema builders
 // ---------------------------------------------------------------------------
 
+#[allow(
+    clippy::expect_used,
+    reason = "bootstrap system schemas are static field lists; duplicate-name failure is a source invariant"
+)]
+fn static_schema<const N: usize>(fields: [Field; N], invariant: &str) -> Schema {
+    Schema::new(fields).expect(invariant)
+}
+
 /// Schema for `pg_namespace` (abridged to v0.8 column set).
 fn pg_namespace_schema() -> Schema {
-    Schema::new([
-        Field::required("oid", DataType::Int64),
-        Field::required("nspname", DataType::Text { max_len: None }),
-        Field::required("nspowner", DataType::Int64),
-    ])
-    .expect("pg_namespace schema invariants hold")
+    static_schema(
+        [
+            Field::required("oid", DataType::Int64),
+            Field::required("nspname", DataType::Text { max_len: None }),
+            Field::required("nspowner", DataType::Int64),
+        ],
+        "pg_namespace schema invariants hold",
+    )
 }
 
 /// Schema for `pg_class` (abridged to v0.8 column set).
 fn pg_class_schema() -> Schema {
-    Schema::new([
-        Field::required("oid", DataType::Int64),
-        Field::required("relname", DataType::Text { max_len: None }),
-        Field::required("relnamespace", DataType::Int64),
-        Field::required("relkind", DataType::Text { max_len: Some(1) }),
-        Field::required("relpages", DataType::Int32),
-        Field::required("reltuples", DataType::Float64),
-        Field::required("relfilenode", DataType::Int32),
-        Field::required("relhasindex", DataType::Bool),
-    ])
-    .expect("pg_class schema invariants hold")
+    static_schema(
+        [
+            Field::required("oid", DataType::Int64),
+            Field::required("relname", DataType::Text { max_len: None }),
+            Field::required("relnamespace", DataType::Int64),
+            Field::required("relkind", DataType::Text { max_len: Some(1) }),
+            Field::required("relpages", DataType::Int32),
+            Field::required("reltuples", DataType::Float64),
+            Field::required("relfilenode", DataType::Int32),
+            Field::required("relhasindex", DataType::Bool),
+        ],
+        "pg_class schema invariants hold",
+    )
 }
 
 /// Schema for `pg_attribute` (abridged to v0.8 column set).
 fn pg_attribute_schema() -> Schema {
-    Schema::new([
-        Field::required("attrelid", DataType::Int64),
-        Field::required("attname", DataType::Text { max_len: None }),
-        Field::required("atttypid", DataType::Int32),
-        Field::required("attnum", DataType::Int16),
-        Field::required("attnotnull", DataType::Bool),
-        Field::required("atthasdef", DataType::Bool),
-        Field::required("attisdropped", DataType::Bool),
-    ])
-    .expect("pg_attribute schema invariants hold")
+    static_schema(
+        [
+            Field::required("attrelid", DataType::Int64),
+            Field::required("attname", DataType::Text { max_len: None }),
+            Field::required("atttypid", DataType::Int32),
+            Field::required("attnum", DataType::Int16),
+            Field::required("attnotnull", DataType::Bool),
+            Field::required("atthasdef", DataType::Bool),
+            Field::required("attisdropped", DataType::Bool),
+        ],
+        "pg_attribute schema invariants hold",
+    )
 }
 
 /// Schema for `pg_attrdef` (abridged to v0.9 column set).
 fn pg_attrdef_schema() -> Schema {
-    Schema::new([
-        Field::required("oid", DataType::Int64),
-        Field::required("adrelid", DataType::Int64),
-        Field::required("adnum", DataType::Int16),
-        Field::required("adbin", DataType::Text { max_len: None }),
-    ])
-    .expect("pg_attrdef schema invariants hold")
+    static_schema(
+        [
+            Field::required("oid", DataType::Int64),
+            Field::required("adrelid", DataType::Int64),
+            Field::required("adnum", DataType::Int16),
+            Field::required("adbin", DataType::Text { max_len: None }),
+        ],
+        "pg_attrdef schema invariants hold",
+    )
 }
 
 /// Schema for `pg_type` (abridged to enum-compatible v1 column set).
 fn pg_type_schema() -> Schema {
-    Schema::new([
-        Field::required("oid", DataType::Int64),
-        Field::required("typname", DataType::Text { max_len: None }),
-        Field::required("typnamespace", DataType::Int64),
-        Field::required("typtype", DataType::Text { max_len: Some(1) }),
-        Field::required("typcategory", DataType::Text { max_len: Some(1) }),
-        Field::required("typlen", DataType::Int16),
-        Field::required("typelem", DataType::Int32),
-    ])
-    .expect("pg_type schema invariants hold")
+    static_schema(
+        [
+            Field::required("oid", DataType::Int64),
+            Field::required("typname", DataType::Text { max_len: None }),
+            Field::required("typnamespace", DataType::Int64),
+            Field::required("typtype", DataType::Text { max_len: Some(1) }),
+            Field::required("typcategory", DataType::Text { max_len: Some(1) }),
+            Field::required("typlen", DataType::Int16),
+            Field::required("typelem", DataType::Int32),
+        ],
+        "pg_type schema invariants hold",
+    )
 }
 
 /// Schema for `pg_enum` (abridged to enum-compatible v1 column set).
 fn pg_enum_schema() -> Schema {
-    Schema::new([
-        Field::required("oid", DataType::Int64),
-        Field::required("enumtypid", DataType::Int64),
-        Field::required("enumsortorder", DataType::Float32),
-        Field::required("enumlabel", DataType::Text { max_len: None }),
-    ])
-    .expect("pg_enum schema invariants hold")
+    static_schema(
+        [
+            Field::required("oid", DataType::Int64),
+            Field::required("enumtypid", DataType::Int64),
+            Field::required("enumsortorder", DataType::Float32),
+            Field::required("enumlabel", DataType::Text { max_len: None }),
+        ],
+        "pg_enum schema invariants hold",
+    )
 }
 
 /// Schema for `pg_index` (abridged to v0.8 column set).
 fn pg_index_schema() -> Schema {
-    Schema::new([
-        Field::required("indexrelid", DataType::Int64),
-        Field::required("indrelid", DataType::Int64),
-        Field::required("indnatts", DataType::Int16),
-        Field::required("indisunique", DataType::Bool),
-        Field::required("indisprimary", DataType::Bool),
-        Field::required("indisvalid", DataType::Bool),
-    ])
-    .expect("pg_index schema invariants hold")
+    static_schema(
+        [
+            Field::required("indexrelid", DataType::Int64),
+            Field::required("indrelid", DataType::Int64),
+            Field::required("indnatts", DataType::Int16),
+            Field::required("indisunique", DataType::Bool),
+            Field::required("indisprimary", DataType::Bool),
+            Field::required("indisvalid", DataType::Bool),
+        ],
+        "pg_index schema invariants hold",
+    )
 }
 
 /// Schema for `pg_constraint` (abridged to v0.8 column set).
 fn pg_constraint_schema() -> Schema {
-    Schema::new([
-        Field::required("oid", DataType::Int64),
-        Field::required("conname", DataType::Text { max_len: None }),
-        Field::required("conrelid", DataType::Int64),
-        Field::required("contype", DataType::Text { max_len: Some(1) }),
-        Field::required("condeferrable", DataType::Bool),
-        Field::required("condeferred", DataType::Bool),
-        Field::required("confrelid", DataType::Int64),
-    ])
-    .expect("pg_constraint schema invariants hold")
+    static_schema(
+        [
+            Field::required("oid", DataType::Int64),
+            Field::required("conname", DataType::Text { max_len: None }),
+            Field::required("conrelid", DataType::Int64),
+            Field::required("contype", DataType::Text { max_len: Some(1) }),
+            Field::required("condeferrable", DataType::Bool),
+            Field::required("condeferred", DataType::Bool),
+            Field::required("confrelid", DataType::Int64),
+        ],
+        "pg_constraint schema invariants hold",
+    )
 }
 
 /// Schema for `pg_sequence` (abridged to v0.8 column set).
 fn pg_sequence_schema() -> Schema {
-    Schema::new([
-        Field::required("seqrelid", DataType::Int64),
-        Field::required("seqtypid", DataType::Int32),
-        Field::required("seqstart", DataType::Int64),
-        Field::required("seqincrement", DataType::Int64),
-        Field::required("seqmax", DataType::Int64),
-        Field::required("seqmin", DataType::Int64),
-        Field::required("seqcache", DataType::Int64),
-        Field::required("seqcycle", DataType::Bool),
-    ])
-    .expect("pg_sequence schema invariants hold")
+    static_schema(
+        [
+            Field::required("seqrelid", DataType::Int64),
+            Field::required("seqtypid", DataType::Int32),
+            Field::required("seqstart", DataType::Int64),
+            Field::required("seqincrement", DataType::Int64),
+            Field::required("seqmax", DataType::Int64),
+            Field::required("seqmin", DataType::Int64),
+            Field::required("seqcache", DataType::Int64),
+            Field::required("seqcycle", DataType::Bool),
+        ],
+        "pg_sequence schema invariants hold",
+    )
 }
 
 /// Schema for `pg_depend` (abridged to v0.8 column set).
 fn pg_depend_schema() -> Schema {
-    Schema::new([
-        Field::required("classid", DataType::Int64),
-        Field::required("objid", DataType::Int64),
-        Field::required("refclassid", DataType::Int64),
-        Field::required("refobjid", DataType::Int64),
-        Field::required("deptype", DataType::Text { max_len: Some(1) }),
-    ])
-    .expect("pg_depend schema invariants hold")
+    static_schema(
+        [
+            Field::required("classid", DataType::Int64),
+            Field::required("objid", DataType::Int64),
+            Field::required("refclassid", DataType::Int64),
+            Field::required("refobjid", DataType::Int64),
+            Field::required("deptype", DataType::Text { max_len: Some(1) }),
+        ],
+        "pg_depend schema invariants hold",
+    )
 }
 
 /// Schema for `pg_description` (abridged to v0.8 column set).
 fn pg_description_schema() -> Schema {
-    Schema::new([
-        Field::required("objoid", DataType::Int64),
-        Field::required("classoid", DataType::Int64),
-        Field::required("objsubid", DataType::Int32),
-        Field::required("description", DataType::Text { max_len: None }),
-    ])
-    .expect("pg_description schema invariants hold")
+    static_schema(
+        [
+            Field::required("objoid", DataType::Int64),
+            Field::required("classoid", DataType::Int64),
+            Field::required("objsubid", DataType::Int32),
+            Field::required("description", DataType::Text { max_len: None }),
+        ],
+        "pg_description schema invariants hold",
+    )
 }
 
 /// Schema for `pg_statistic` (abridged to v0.8 column set).
 fn pg_statistic_schema() -> Schema {
-    Schema::new([
-        Field::required("starelid", DataType::Int64),
-        Field::required("staattnum", DataType::Int16),
-        Field::required("stanullfrac", DataType::Float32),
-        Field::required("stadistinct", DataType::Float32),
-    ])
-    .expect("pg_statistic schema invariants hold")
+    static_schema(
+        [
+            Field::required("starelid", DataType::Int64),
+            Field::required("staattnum", DataType::Int16),
+            Field::required("stanullfrac", DataType::Float32),
+            Field::required("stadistinct", DataType::Float32),
+        ],
+        "pg_statistic schema invariants hold",
+    )
 }
 
 /// Schema for `pg_statistic_ext` (abridged to v0.8 column set).
 fn pg_statistic_ext_schema() -> Schema {
-    Schema::new([
-        Field::required("oid", DataType::Int64),
-        Field::required("stxname", DataType::Text { max_len: None }),
-        Field::required("stxrelid", DataType::Int64),
-        Field::required("stxkeys", DataType::Text { max_len: None }),
-        Field::required("stxkind", DataType::Text { max_len: None }),
-    ])
-    .expect("pg_statistic_ext schema invariants hold")
+    static_schema(
+        [
+            Field::required("oid", DataType::Int64),
+            Field::required("stxname", DataType::Text { max_len: None }),
+            Field::required("stxrelid", DataType::Int64),
+            Field::required("stxkeys", DataType::Text { max_len: None }),
+            Field::required("stxkind", DataType::Text { max_len: None }),
+        ],
+        "pg_statistic_ext schema invariants hold",
+    )
 }
 
 // ---------------------------------------------------------------------------
