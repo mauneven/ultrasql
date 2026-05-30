@@ -171,6 +171,11 @@ as a concise evidence ledger; roadmap stays for open gates only.
   `NTH_VALUE` even when the window input is already a fixed point. Evidence:
   `cargo test -p ultrasql-optimizer constant_fold` and
   `cargo test -p ultrasql-optimizer`.
+- Decimal sort comparison no longer treats scale-normalization overflow as
+  equality; high-scale `NUMERIC` ordering uses overflow-safe digit alignment
+  shared by full sort and top-k. Evidence:
+  `cargo test -p ultrasql-executor sort` and
+  `cargo test -p ultrasql-executor top_k`.
 
 ## Core SQL And Wire Protocol
 

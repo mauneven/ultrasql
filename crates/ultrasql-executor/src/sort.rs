@@ -496,31 +496,71 @@ pub fn compare_values_nullable(a: &Value, b: &Value, nulls_first: bool) -> Order
 }
 
 fn compare_decimals(l: i64, l_scale: i32, r: i64, r_scale: i32) -> Ordering {
-    if l_scale == r_scale {
-        return l.cmp(&r);
+    match (l.cmp(&0), r.cmp(&0)) {
+        (Ordering::Equal, Ordering::Equal) => return Ordering::Equal,
+        (Ordering::Equal, Ordering::Less) | (Ordering::Greater, Ordering::Less) => {
+            return Ordering::Greater;
+        }
+        (Ordering::Less, Ordering::Equal) | (Ordering::Less, Ordering::Greater) => {
+            return Ordering::Less;
+        }
+        _ => {}
     }
-    let common_scale = l_scale.max(r_scale);
-    let Some(l_scaled) = scale_decimal_to(l, l_scale, common_scale) else {
-        return Ordering::Equal;
-    };
-    let Some(r_scaled) = scale_decimal_to(r, r_scale, common_scale) else {
-        return Ordering::Equal;
-    };
-    l_scaled.cmp(&r_scaled)
+
+    let left = DecimalMagnitude::new(l, l_scale);
+    let right = DecimalMagnitude::new(r, r_scale);
+    let magnitude_order = left.cmp_abs(&right);
+    if l < 0 {
+        magnitude_order.reverse()
+    } else {
+        magnitude_order
+    }
 }
 
-fn scale_decimal_to(value: i64, from_scale: i32, to_scale: i32) -> Option<i128> {
-    let diff = u32::try_from(to_scale - from_scale).ok()?;
-    let multiplier = checked_pow10_i128(diff)?;
-    i128::from(value).checked_mul(multiplier)
+#[derive(Debug)]
+struct DecimalMagnitude {
+    digits: String,
+    integer_digits: i64,
 }
 
-fn checked_pow10_i128(exp: u32) -> Option<i128> {
-    let mut out = 1_i128;
-    for _ in 0..exp {
-        out = out.checked_mul(10)?;
+impl DecimalMagnitude {
+    fn new(value: i64, scale: i32) -> Self {
+        let mut magnitude = i128::from(value);
+        if magnitude < 0 {
+            magnitude = -magnitude;
+        }
+        let mut scale = i64::from(scale);
+        while magnitude != 0 && magnitude % 10 == 0 {
+            magnitude /= 10;
+            scale = scale.saturating_sub(1);
+        }
+        let digits = magnitude.to_string();
+        let digit_count = i64::try_from(digits.len()).unwrap_or(i64::MAX);
+        Self {
+            digits,
+            integer_digits: digit_count.saturating_sub(scale),
+        }
     }
-    Some(out)
+
+    fn cmp_abs(&self, other: &Self) -> Ordering {
+        match self.integer_digits.cmp(&other.integer_digits) {
+            Ordering::Equal => {}
+            non_equal => return non_equal,
+        }
+
+        let max_len = self.digits.len().max(other.digits.len());
+        let left = self.digits.as_bytes();
+        let right = other.digits.as_bytes();
+        for idx in 0..max_len {
+            let l = left.get(idx).copied().unwrap_or(b'0');
+            let r = right.get(idx).copied().unwrap_or(b'0');
+            match l.cmp(&r) {
+                Ordering::Equal => {}
+                non_equal => return non_equal,
+            }
+        }
+        Ordering::Equal
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -536,7 +576,7 @@ mod tests {
     use ultrasql_vec::Batch;
     use ultrasql_vec::column::{Column, NumericColumn};
 
-    use super::{Sort, compare_values_nullable};
+    use super::{Sort, compare_decimals, compare_values_nullable};
     use crate::filter_op::batch_to_rows;
     use crate::mem_table_scan::MemTableScan;
     use crate::seq_scan::build_batch;
@@ -643,6 +683,12 @@ mod tests {
             err.to_string().contains("division by zero"),
             "unexpected error: {err}"
         );
+    }
+
+    #[test]
+    fn decimal_compare_does_not_treat_scale_overflow_as_equal() {
+        assert_eq!(compare_decimals(1, 0, 2, 100), Ordering::Greater);
+        assert_eq!(compare_decimals(-1, 0, -2, 100), Ordering::Less);
     }
 
     #[test]
