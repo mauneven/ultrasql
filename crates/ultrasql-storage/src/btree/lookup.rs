@@ -194,9 +194,7 @@ impl<L: PageLoader> BTree<L> {
             }
             .encode()?;
             let record = WalRecord::new(RecordType::BTreeOp, xid, prev_lsn, 0, payload)?;
-            let lsn: Lsn = sink.append(record).expect(
-                "wal append must succeed after a committed btree delete; failure is unrecoverable",
-            );
+            let lsn: Lsn = Self::append_after_page_mutation(&self.pool, sink, record)?;
             Self::stamp_page_lsn(&self.pool, self.page_id(deleted_leaf), lsn)?;
         }
         Ok(true)

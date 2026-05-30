@@ -31,7 +31,9 @@ impl<L: PageLoader> BTree<L> {
     /// that received the new entry, and one `BTreeOpKind::Split` record for
     /// each page split propagated up the tree. Records are emitted after the
     /// relevant page guards are released, consistent with the heap's WAL
-    /// protocol.
+    /// protocol. A post-mutation WAL append failure poisons the buffer pool
+    /// and returns [`BTreeError::Wal`]; callers must restart from WAL before
+    /// accepting more work.
     ///
     /// Pass `None` for `wal` during recovery replay (the WAL is the source of
     /// truth) or in tests that do not care about WAL output.
@@ -112,9 +114,7 @@ impl<L: PageLoader> BTree<L> {
             }
             .encode()?;
             let record = WalRecord::new(RecordType::BTreeOp, xid, prev_lsn, 0, payload)?;
-            let lsn: Lsn = sink.append(record).expect(
-                "wal append must succeed after a committed btree page mutation; failure is unrecoverable",
-            );
+            let lsn: Lsn = Self::append_after_page_mutation(&self.pool, sink, record)?;
             // Stamp the leaf page LSN.
             Self::stamp_page_lsn(&self.pool, self.page_id(leaf_block), lsn)?;
         }
@@ -135,13 +135,30 @@ impl<L: PageLoader> BTree<L> {
                 }
                 .encode()?;
                 let record = WalRecord::new(RecordType::BTreeOp, xid, prev_lsn, 0, payload)?;
-                sink.append(record).expect(
-                    "wal append must succeed after a committed btree split; failure is unrecoverable",
-                );
+                Self::append_after_page_mutation(&self.pool, sink, record)?;
             }
             self.propagate_split(path, sep_key, new_right)?;
         }
         Ok(())
+    }
+
+    /// Append a B-tree WAL record after the page mutation has landed.
+    ///
+    /// If the sink rejects the record, the index may contain dirty page bytes
+    /// that recovery cannot replay. Poisoning the shared buffer pool prevents
+    /// later page access or flush before the service restarts from WAL.
+    pub(super) fn append_after_page_mutation(
+        pool: &std::sync::Arc<BufferPool<L>>,
+        sink: &dyn WalSink,
+        record: WalRecord,
+    ) -> Result<Lsn, BTreeError> {
+        match sink.append(record) {
+            Ok(lsn) => Ok(lsn),
+            Err(err) => {
+                pool.poison_after_wal_error();
+                Err(BTreeError::Wal(err))
+            }
+        }
     }
 
     /// Stamp `page_id`'s LSN field with `lsn`.

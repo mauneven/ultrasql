@@ -9,15 +9,17 @@
 )]
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering as AtomicOrdering};
 use std::thread;
 
 use ultrasql_core::endian::write_i64_le;
 use ultrasql_core::{BlockNumber, PageId, RelationId, TupleId, Xid};
+use ultrasql_wal::WalRecord;
 
 use super::*;
-use crate::buffer_pool::{BufferPool, PageLoader};
+use crate::buffer_pool::{BufferPool, BufferPoolError, PageLoader};
 use crate::page::Page;
+use crate::wal_sink::{WalSink, WalSinkError};
 
 /// In-memory loader for B-tree tests.
 ///
@@ -228,6 +230,138 @@ fn delete_logged_emits_btree_delete_record() {
     let records = sink.records();
     assert_eq!(records.len(), 1);
     assert_eq!(records[0].1.header.record_type, RecordType::BTreeOp);
+}
+
+struct RejectingWalSink;
+
+impl WalSink for RejectingWalSink {
+    fn append(&self, _record: WalRecord) -> Result<ultrasql_core::Lsn, WalSinkError> {
+        Err(WalSinkError::Rejected(
+            "test: btree sink intentionally rejects records".into(),
+        ))
+    }
+
+    fn durable_lsn(&self) -> ultrasql_core::Lsn {
+        ultrasql_core::Lsn::ZERO
+    }
+
+    fn last_lsn_for(&self, _xid: Xid) -> ultrasql_core::Lsn {
+        ultrasql_core::Lsn::ZERO
+    }
+}
+
+struct RejectSecondWalSink {
+    calls: AtomicUsize,
+}
+
+impl RejectSecondWalSink {
+    const fn new() -> Self {
+        Self {
+            calls: AtomicUsize::new(0),
+        }
+    }
+}
+
+impl WalSink for RejectSecondWalSink {
+    fn append(&self, _record: WalRecord) -> Result<ultrasql_core::Lsn, WalSinkError> {
+        let call = self.calls.fetch_add(1, AtomicOrdering::Relaxed);
+        if call == 0 {
+            Ok(ultrasql_core::Lsn::new(1))
+        } else {
+            Err(WalSinkError::Rejected(
+                "test: btree sink rejects second record".into(),
+            ))
+        }
+    }
+
+    fn durable_lsn(&self) -> ultrasql_core::Lsn {
+        ultrasql_core::Lsn::ZERO
+    }
+
+    fn last_lsn_for(&self, _xid: Xid) -> ultrasql_core::Lsn {
+        ultrasql_core::Lsn::ZERO
+    }
+}
+
+#[test]
+fn insert_wal_append_failure_returns_error_and_poisons_pool() {
+    let mut tree = make_tree();
+    let sink = RejectingWalSink;
+
+    let err = tree
+        .insert::<i64>(7, tid(1, 0), Xid::new(1), Some(&sink))
+        .unwrap_err();
+    assert!(
+        matches!(err, BTreeError::Wal(WalSinkError::Rejected(_))),
+        "btree insert should return Wal error, got {err:?}"
+    );
+
+    let lookup = tree.lookup::<i64>(7);
+    assert!(
+        matches!(
+            lookup,
+            Err(BTreeError::BufferPool(BufferPoolError::Poisoned))
+        ),
+        "btree should reject later page access after WAL failure, got {lookup:?}"
+    );
+}
+
+#[test]
+fn split_wal_append_failure_returns_error_and_poisons_pool() {
+    let mut tree = make_tree();
+    for key in 0_i64..i64::try_from(MAX_LEAF_ENTRIES).unwrap() {
+        let block = u32::try_from(key).unwrap();
+        tree.insert::<i64>(key, tid(block, 0), Xid::new(1), None)
+            .unwrap();
+    }
+    let sink = RejectSecondWalSink::new();
+
+    let split_key = i64::try_from(MAX_LEAF_ENTRIES).unwrap();
+    let err = tree
+        .insert::<i64>(
+            split_key,
+            tid(u32::try_from(split_key).unwrap(), 0),
+            Xid::new(2),
+            Some(&sink),
+        )
+        .unwrap_err();
+    assert!(
+        matches!(err, BTreeError::Wal(WalSinkError::Rejected(_))),
+        "btree split should return Wal error, got {err:?}"
+    );
+
+    let lookup = tree.lookup::<i64>(split_key);
+    assert!(
+        matches!(
+            lookup,
+            Err(BTreeError::BufferPool(BufferPoolError::Poisoned))
+        ),
+        "btree should reject later page access after split WAL failure, got {lookup:?}"
+    );
+}
+
+#[test]
+fn delete_wal_append_failure_returns_error_and_poisons_pool() {
+    let mut tree = make_tree();
+    let sink = RejectingWalSink;
+    tree.insert::<i64>(7, tid(1, 0), Xid::new(1), None).unwrap();
+
+    let err = tree
+        .delete_logged::<i64>(7, tid(1, 0), Xid::new(2), Some(&sink))
+        .unwrap_err();
+    assert!(
+        matches!(err, BTreeError::Wal(WalSinkError::Rejected(_))),
+        "btree delete should return Wal error, got {err:?}"
+    );
+
+    let lookup = tree.lookup::<i64>(7);
+    assert!(
+        matches!(
+            lookup,
+            Err(BTreeError::BufferPool(BufferPoolError::Poisoned))
+        ),
+        "btree should reject later page access after WAL failure, got {lookup:?}"
+    );
 }
 
 #[test]
