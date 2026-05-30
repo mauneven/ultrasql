@@ -326,6 +326,13 @@ as a concise evidence ledger; roadmap stays for open gates only.
   `cargo test -p ultrasql-executor direct_scalar_agg` and
   `cargo clippy -p ultrasql-executor --lib --all-features -- -W
   clippy::expect_used -W clippy::unwrap_used`.
+- Sequential scan builder setup, TID-prefixed schema construction, and
+  column-cache slicing now avoid production `expect`/`unreachable` paths,
+  surfacing typed executor errors for unsupported builder types and cache
+  slice invariants. Evidence:
+  `cargo test -p ultrasql-executor seq_scan` and
+  `cargo clippy -p ultrasql-executor --lib --all-features -- -W
+  clippy::expect_used -W clippy::unwrap_used`.
 
 ## Core SQL And Wire Protocol
 

@@ -70,6 +70,9 @@ pub struct SeqScan<L: PageLoader + 'static, O: XidStatusOracle + ?Sized + 'stati
     /// either populating the cache or operating outside the cache
     /// (e.g. TID-prefixed scans).
     cache_read: Option<CacheReadState>,
+    /// Deferred constructor error for public constructors that cannot
+    /// return `Result`. `next_batch` surfaces it before heap access.
+    init_error: Option<String>,
     /// When `Some`, the scan is **populating** the column cache as
     /// it walks the heap: every decoded row is appended to these
     /// per-column accumulators **in addition** to the per-batch
@@ -258,13 +261,7 @@ where
         oracle: Arc<O>,
         codec: RowCodec,
     ) -> Self {
-        let mut fields: Vec<Field> = Vec::with_capacity(codec.schema().len() + 2);
-        fields.push(Field::required("tid_block", DataType::Int32));
-        fields.push(Field::required("tid_slot", DataType::Int32));
-        for i in 0..codec.schema().len() {
-            fields.push(codec.schema().field_at(i).clone());
-        }
-        let output_schema = Schema::new(fields).expect("TID-prefixed schema is well-formed");
+        let output_schema = tid_prefixed_schema(&codec);
         Self::build(
             heap,
             relation,
@@ -291,13 +288,7 @@ where
         vm: Arc<VisibilityMap>,
         codec: RowCodec,
     ) -> Self {
-        let mut fields: Vec<Field> = Vec::with_capacity(codec.schema().len() + 2);
-        fields.push(Field::required("tid_block", DataType::Int32));
-        fields.push(Field::required("tid_slot", DataType::Int32));
-        for i in 0..codec.schema().len() {
-            fields.push(codec.schema().field_at(i).clone());
-        }
-        let output_schema = Schema::new(fields).expect("TID-prefixed schema is well-formed");
+        let output_schema = tid_prefixed_schema(&codec);
         Self::build(
             heap,
             relation,
@@ -395,10 +386,18 @@ where
         // The TID-prefixed scan keeps its builders unconditionally:
         // `with_tids` is incompatible with cache reads (it is
         // explicitly excluded from `cache_eligible`).
+        let mut init_error: Option<String> = None;
         let builders = if cache_hit {
             Vec::new()
         } else {
-            build_initial_builders(&codec, with_tids)
+            match build_initial_builders(&codec, with_tids) {
+                Ok(builders) => builders,
+                Err(err) => {
+                    tracing::error!(error = %err, "seq scan builder initialisation failed");
+                    init_error = Some(err.to_string());
+                    Vec::new()
+                }
+            }
         };
 
         // Decide whether this scan should populate the cache as a
@@ -407,10 +406,16 @@ where
         // (c) the relation is empty (no point caching nothing).
         let cache_build = if cache_eligible && !cache_hit && block_count > 0 {
             let target_version = heap.column_cache.relation_version(relation);
-            Some(CacheBuildState {
-                builders: build_initial_builders(&codec, false),
-                target_version,
-            })
+            match build_initial_builders(&codec, false) {
+                Ok(builders) => Some(CacheBuildState {
+                    builders,
+                    target_version,
+                }),
+                Err(err) => {
+                    tracing::warn!(error = %err, "seq scan column-cache build disabled");
+                    None
+                }
+            }
         } else {
             None
         };
@@ -418,6 +423,7 @@ where
         Self {
             builders,
             cache_read,
+            init_error,
             cache_build,
             heap,
             snapshot: snapshot_box,
@@ -452,30 +458,46 @@ where
     }
 }
 
+fn tid_prefixed_schema(codec: &RowCodec) -> Schema {
+    let mut fields: Vec<Field> = Vec::with_capacity(codec.schema().len() + 2);
+    fields.push(Field::required("tid_block", DataType::Int32));
+    fields.push(Field::required("tid_slot", DataType::Int32));
+    for i in 0..codec.schema().len() {
+        fields.push(codec.schema().field_at(i).clone());
+    }
+    Schema::new_with_duplicate_names(fields)
+}
+
+fn builder_init_error(error: impl std::fmt::Display) -> ExecError {
+    ExecError::TypeMismatch(format!("seq scan builder initialisation failed: {error}"))
+}
+
 /// Build a fresh `Vec<ColumnBuilder>` matching the codec's schema,
 /// optionally prepending two `Int32` builders for `tid_block` /
 /// `tid_slot`. Sized to [`BATCH_TARGET_ROWS`] capacity.
-fn build_initial_builders(codec: &RowCodec, with_tids: bool) -> Vec<ColumnBuilder> {
+fn build_initial_builders(
+    codec: &RowCodec,
+    with_tids: bool,
+) -> Result<Vec<ColumnBuilder>, ExecError> {
     let mut out: Vec<ColumnBuilder> = Vec::new();
     if with_tids {
-        let tid_schema = Schema::new([
+        let tid_schema = Schema::new_with_duplicate_names([
             Field::required("tid_block", DataType::Int32),
             Field::required("tid_slot", DataType::Int32),
-        ])
-        .expect("tid schema is well-formed");
+        ]);
         let tid_codec = RowCodec::new(tid_schema);
         out.extend(
             tid_codec
                 .new_builders(BATCH_TARGET_ROWS)
-                .expect("Int32 is supported"),
+                .map_err(builder_init_error)?,
         );
     }
     out.extend(
         codec
             .new_builders(BATCH_TARGET_ROWS)
-            .expect("codec schema types are supported"),
+            .map_err(builder_init_error)?,
     );
-    out
+    Ok(out)
 }
 
 impl<L, O> Operator for SeqScan<L, O>
@@ -502,6 +524,9 @@ where
         // `CacheReadState`.
         if self.cache_read.is_some() {
             return self.next_batch_from_cache();
+        }
+        if let Some(error) = self.init_error.as_ref() {
+            return Err(ExecError::TypeMismatch(error.clone()));
         }
 
         let tid_offset = usize::from(self.with_tids) * 2;
@@ -603,7 +628,7 @@ where
         // fresh — see report below. This is the only per-batch
         // allocation the streaming path performs (excluding the
         // backing batch itself).
-        let replacement = build_initial_builders(&self.codec, self.with_tids);
+        let replacement = build_initial_builders(&self.codec, self.with_tids)?;
         let finished = std::mem::replace(&mut self.builders, replacement);
         let batch = RowCodec::finish_batch(finished).map_err(ExecError::from)?;
 
@@ -668,7 +693,7 @@ where
         let end = (state.cursor + CACHE_REPLAY_BATCH_ROWS).min(total_rows);
         let mut batch_cols: Vec<Column> = Vec::with_capacity(state.columns.columns.len());
         for col in &state.columns.columns {
-            batch_cols.push(slice_column(col, state.cursor, end));
+            batch_cols.push(slice_column(col, state.cursor, end)?);
         }
         state.cursor = end;
         let batch = Batch::new(batch_cols).map_err(ExecError::from)?;
@@ -717,7 +742,7 @@ fn payload_prefix(payload: &[u8]) -> String {
 /// for the variable-width `Utf8` arm. Used by the column-cache
 /// fast path to materialise a batch from cached data without
 /// re-decoding from heap bytes.
-fn slice_column(col: &Column, start: usize, end: usize) -> Column {
+fn slice_column(col: &Column, start: usize, end: usize) -> Result<Column, ExecError> {
     use ultrasql_vec::bitmap::Bitmap;
     use ultrasql_vec::column::NumericColumn;
 
@@ -731,46 +756,39 @@ fn slice_column(col: &Column, start: usize, end: usize) -> Column {
         })
     }
 
+    fn nullable_numeric<T>(
+        data: Vec<T>,
+        nulls: Option<Bitmap>,
+        wrap: impl FnOnce(NumericColumn<T>) -> Column,
+    ) -> Result<Column, ExecError> {
+        match nulls {
+            Some(n) => NumericColumn::with_nulls(data, n)
+                .map(wrap)
+                .map_err(|_| ExecError::Internal("cached column null bitmap length mismatch")),
+            None => Ok(wrap(NumericColumn::from_data(data))),
+        }
+    }
+
     match col {
         Column::Int32(c) => {
             let data = c.data()[start..end].to_vec();
             let nulls = slice_nulls(c.nulls(), start, end);
-            match nulls {
-                Some(n) => {
-                    Column::Int32(NumericColumn::with_nulls(data, n).expect("matching lengths"))
-                }
-                None => Column::Int32(NumericColumn::from_data(data)),
-            }
+            nullable_numeric(data, nulls, Column::Int32)
         }
         Column::Int64(c) => {
             let data = c.data()[start..end].to_vec();
             let nulls = slice_nulls(c.nulls(), start, end);
-            match nulls {
-                Some(n) => {
-                    Column::Int64(NumericColumn::with_nulls(data, n).expect("matching lengths"))
-                }
-                None => Column::Int64(NumericColumn::from_data(data)),
-            }
+            nullable_numeric(data, nulls, Column::Int64)
         }
         Column::Float32(c) => {
             let data = c.data()[start..end].to_vec();
             let nulls = slice_nulls(c.nulls(), start, end);
-            match nulls {
-                Some(n) => {
-                    Column::Float32(NumericColumn::with_nulls(data, n).expect("matching lengths"))
-                }
-                None => Column::Float32(NumericColumn::from_data(data)),
-            }
+            nullable_numeric(data, nulls, Column::Float32)
         }
         Column::Float64(c) => {
             let data = c.data()[start..end].to_vec();
             let nulls = slice_nulls(c.nulls(), start, end);
-            match nulls {
-                Some(n) => {
-                    Column::Float64(NumericColumn::with_nulls(data, n).expect("matching lengths"))
-                }
-                None => Column::Float64(NumericColumn::from_data(data)),
-            }
+            nullable_numeric(data, nulls, Column::Float64)
         }
         // Bool / Utf8 cache slicing is intentionally not
         // implemented: `schema_all_fixed_numeric` keeps these out of
@@ -779,9 +797,9 @@ fn slice_column(col: &Column, start: usize, end: usize) -> Column {
         // regression where the eligibility check is loosened
         // without finishing the slice paths.
         Column::Bool(_) | Column::Utf8(_) | Column::DictionaryUtf8(_) => {
-            unreachable!(
-                "column cache does not yet support Bool / Utf8 — gated by schema_all_fixed_numeric"
-            )
+            Err(ExecError::TypeMismatch(
+                "column cache supports only fixed-width numeric columns".to_owned(),
+            ))
         }
     }
 }
@@ -1272,7 +1290,7 @@ mod tests {
     use ultrasql_storage::heap::{HeapAccess, InsertOptions};
     use ultrasql_storage::page::Page;
     use ultrasql_vec::bitmap::Bitmap;
-    use ultrasql_vec::column::{Column, NumericColumn};
+    use ultrasql_vec::column::{BoolColumn, Column, NumericColumn};
 
     use super::{SeqScan, build_batch, payload_prefix, schema_all_fixed_numeric, slice_column};
     use crate::row_codec::RowCodec;
@@ -1523,7 +1541,7 @@ mod tests {
         let int_col = Column::Int32(
             NumericColumn::with_nulls(vec![1, 2, 3, 4, 5], nulls.clone()).expect("int col"),
         );
-        match slice_column(&int_col, 1, 4) {
+        match slice_column(&int_col, 1, 4).expect("slice") {
             Column::Int32(c) => {
                 assert_eq!(c.data(), &[2, 3, 4]);
                 assert!(c.nulls().is_some_and(|n| n.get(0) && !n.get(1) && n.get(2)));
@@ -1534,10 +1552,15 @@ mod tests {
             &Column::Float64(NumericColumn::from_data(vec![1.0, 2.0, 3.0, 4.0])),
             1,
             3,
-        ) {
+        )
+        .expect("slice")
+        {
             Column::Float64(c) => assert_eq!(c.data(), &[2.0, 3.0]),
             other => panic!("expected float64 column, got {other:?}"),
         }
+        let unsupported = slice_column(&Column::Bool(BoolColumn::from_data(vec![true])), 0, 1)
+            .expect_err("bool cache slice must fail cleanly");
+        assert!(matches!(unsupported, ExecError::TypeMismatch(_)));
 
         let numeric_schema = Schema::new([
             Field::required("i2", DataType::Int16),
