@@ -77,7 +77,7 @@ pub(crate) fn write_data_row(sink: &mut BytesMut, batch_columns: &[Column], row:
     let payload_start = sink.len();
     sink.put_i16(i16_from_usize(batch_columns.len()));
     for col in batch_columns {
-        write_cell(sink, col, row);
+        write_cell(sink, col, row).unwrap();
     }
     let payload_end = sink.len();
     let payload_len = payload_end - payload_start;
@@ -255,10 +255,10 @@ pub(crate) fn write_int32_int64_pair_data_rows(
 
 /// Emit one column cell. NULL is encoded as length `-1` with no value
 /// bytes; everything else gets a length-prefixed text-format payload.
-fn write_cell(sink: &mut BytesMut, col: &Column, row: usize) {
+fn write_cell(sink: &mut BytesMut, col: &Column, row: usize) -> Result<(), ServerError> {
     if is_null(col, row) {
         sink.put_i32(-1);
-        return;
+        return Ok(());
     }
     match col {
         Column::Int32(c) => write_length_prefixed_int32(sink, c.data()[row]),
@@ -273,14 +273,12 @@ fn write_cell(sink: &mut BytesMut, col: &Column, row: usize) {
         // fresh `Vec<u8>` — the allocator can be removed in a follow-up
         // but is not on the `select_scan_10k` critical path.
         Column::Float32(_) | Column::Float64(_) | Column::Utf8(_) | Column::DictionaryUtf8(_) => {
-            // Safe to expect-unwrap: the null branch above already
-            // handled the `None` case.
-            let bytes =
-                encode_text_value(col, row).expect("non-null cell must encode to Some(bytes)");
+            let bytes = encode_text_value(col, row).ok_or_else(wire_physical_cell_error)?;
             sink.put_i32(i32_from_usize(bytes.len()));
             sink.put_slice(&bytes);
         }
     }
+    Ok(())
 }
 
 /// Emit one typed column cell. Most columns still use the allocation-free
@@ -313,9 +311,13 @@ fn write_cell_typed(
             sink.put_i32(i32_from_usize(bytes.len()));
             sink.put_slice(&bytes);
         }
-        _ => write_cell(sink, col, row),
+        _ => write_cell(sink, col, row)?,
     }
     Ok(())
+}
+
+fn wire_physical_cell_error() -> ServerError {
+    ServerError::Execute(ExecError::Internal("wire physical cell encoding failed"))
 }
 
 fn wire_typed_cell_error() -> ServerError {
@@ -448,14 +450,14 @@ fn format_i32_into(scratch: &mut [u8; 12], value: i32) -> &[u8] {
     // 5-digit positive integers in the `select_scan_10k` workload)
     // executes 1 lookup + 1 fallback or 2 lookups.
     while n >= 100 {
-        let r = usize::try_from(n % 100).expect("n % 100 < 100");
+        let r = decimal_pair_index_u32(n % 100);
         n /= 100;
         idx -= 2;
         scratch[idx] = DIGIT_PAIRS[2 * r];
         scratch[idx + 1] = DIGIT_PAIRS[2 * r + 1];
     }
     if n >= 10 {
-        let r = usize::try_from(n).expect("n < 100 here");
+        let r = decimal_pair_index_u32(n);
         idx -= 2;
         scratch[idx] = DIGIT_PAIRS[2 * r];
         scratch[idx + 1] = DIGIT_PAIRS[2 * r + 1];
@@ -465,7 +467,7 @@ fn format_i32_into(scratch: &mut [u8; 12], value: i32) -> &[u8] {
         // dance keeps the no-`as`-casts rule (`AGENTS.md §3.3`)
         // honoured; the compiler sees the bound and elides the
         // panic branch.
-        let digit = u8::try_from(n).expect("n < 10");
+        let digit = decimal_digit_u32(n);
         scratch[idx] = b'0' + digit;
     }
     if negative {
@@ -484,20 +486,20 @@ fn format_i64_into(scratch: &mut [u8; 20], value: i64) -> &[u8] {
     let mut n: u64 = value.unsigned_abs();
     let mut idx = scratch.len();
     while n >= 100 {
-        let r = usize::try_from(n % 100).expect("n % 100 < 100");
+        let r = decimal_pair_index_u64(n % 100);
         n /= 100;
         idx -= 2;
         scratch[idx] = DIGIT_PAIRS[2 * r];
         scratch[idx + 1] = DIGIT_PAIRS[2 * r + 1];
     }
     if n >= 10 {
-        let r = usize::try_from(n).expect("n < 100 here");
+        let r = decimal_pair_index_u64(n);
         idx -= 2;
         scratch[idx] = DIGIT_PAIRS[2 * r];
         scratch[idx + 1] = DIGIT_PAIRS[2 * r + 1];
     } else {
         idx -= 1;
-        let digit = u8::try_from(n).expect("n < 10");
+        let digit = decimal_digit_u64(n);
         scratch[idx] = b'0' + digit;
     }
     if negative {
@@ -505,6 +507,22 @@ fn format_i64_into(scratch: &mut [u8; 20], value: i64) -> &[u8] {
         scratch[idx] = b'-';
     }
     &scratch[idx..]
+}
+
+fn decimal_pair_index_u32(value: u32) -> usize {
+    usize::from(u8::try_from(value).unwrap_or(0))
+}
+
+fn decimal_pair_index_u64(value: u64) -> usize {
+    usize::from(u8::try_from(value).unwrap_or(0))
+}
+
+fn decimal_digit_u32(value: u32) -> u8 {
+    u8::try_from(value).unwrap_or(0)
+}
+
+fn decimal_digit_u64(value: u64) -> u8 {
+    u8::try_from(value).unwrap_or(0)
 }
 
 #[cfg(test)]

@@ -235,6 +235,12 @@ as a concise evidence ledger; roadmap stays for open gates only.
   instead of panicking on malformed batch row counts. Evidence:
   `cargo test -p ultrasql-server
   write_data_row_typed_rejects_row_index_out_of_bounds_without_partial_row`.
+- SELECT wire physical cell fallback and integer text formatting no longer
+  depend on production `expect` paths; existing byte-equivalence tests keep
+  the hot writer output unchanged. Evidence:
+  `cargo test -p ultrasql-server wire_writer` and
+  `cargo clippy -p ultrasql-server --lib --all-features -- -W
+  clippy::expect_used -W clippy::unwrap_used`.
 
 ## Core SQL And Wire Protocol
 
