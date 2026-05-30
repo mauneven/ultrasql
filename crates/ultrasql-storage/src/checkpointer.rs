@@ -89,6 +89,8 @@ impl Checkpointer {
     /// Spawn the checkpointer background thread.
     ///
     /// The thread periodically flushes dirty pages from `pool` via `writer`.
+    /// If the OS refuses to spawn the thread, this returns an inert handle;
+    /// [`Self::shutdown`] then returns `Ok(0)`.
     /// When a WAL `sink` is supplied, only pages whose page-LSN is ≤
     /// `sink.durable_lsn()` are flushed; this preserves the WAL-ahead-of-data
     /// invariant. Pass `None` to flush all dirty pages regardless of LSN.
@@ -119,12 +121,9 @@ impl Checkpointer {
         let handle = thread::Builder::new()
             .name(String::from("ultrasql-checkpointer"))
             .spawn(move || Self::run(&pool_clone, writer, config, &thread_shared))
-            .expect("checkpointer: failed to spawn thread");
+            .ok();
 
-        Self {
-            shared,
-            handle: Some(handle),
-        }
+        Self { shared, handle }
     }
 
     /// Signal the background thread to stop and wait for it to exit.
@@ -142,13 +141,13 @@ impl Checkpointer {
         }
         self.shared.wake.notify_all();
 
-        let handle = self
-            .handle
-            .take()
-            .expect("checkpointer: handle already consumed");
-        handle
-            .join()
-            .map_err(|_| std::io::Error::other("checkpointer background thread panicked"))
+        if let Some(handle) = self.handle.take() {
+            handle
+                .join()
+                .map_err(|_| std::io::Error::other("checkpointer background thread panicked"))
+        } else {
+            Ok(0)
+        }
     }
 
     /// Background thread body.

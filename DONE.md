@@ -487,6 +487,13 @@ as a concise evidence ledger; roadmap stays for open gates only.
   ultrasql-txn --lib --all-features -- -W clippy::expect_used -W
   clippy::unwrap_used`, and `cargo clippy -p ultrasql-txn --all-targets
   --all-features -- -D warnings`.
+- Storage checkpointer spawn failure now returns an inert handle instead of
+  panicking, and shutdown returns `Ok(0)` when no background handle exists.
+  Evidence: `cargo test -p ultrasql-storage spawn_and_shutdown_clean --
+  --ignored --nocapture`, `cargo test -p ultrasql-storage
+  checkpointer_flushes_dirty_pages -- --ignored --nocapture`, and
+  `cargo clippy -p ultrasql-storage --all-targets --all-features -- -D
+  warnings`.
 
 ## Core SQL And Wire Protocol
 
