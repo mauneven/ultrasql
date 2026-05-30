@@ -976,7 +976,9 @@ fn first_csv_record_with_options(
         buffer.push_str(line);
         match parse_csv_records_with_options(&buffer, options) {
             Ok(mut records) if records.len() == 1 => {
-                return Ok(records.pop().expect("records length checked"));
+                return records.pop().ok_or_else(|| {
+                    format!("read_csv parse {display}: first-record buffer produced no records")
+                });
             }
             Ok(records) if records.is_empty() => buffer.clear(),
             Ok(_) => {
@@ -994,7 +996,9 @@ fn first_csv_record_with_options(
     let mut records = parse_csv_records_with_options(&buffer, options)
         .map_err(|err| format!("read_csv parse {display}: {err}"))?;
     if records.len() == 1 {
-        Ok(records.pop().expect("records length checked"))
+        records.pop().ok_or_else(|| {
+            format!("read_csv parse {display}: first-record buffer produced no records")
+        })
     } else {
         Err(format!(
             "read_csv parse {display}: first-record buffer produced {} records",

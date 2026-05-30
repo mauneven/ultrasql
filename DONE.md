@@ -257,6 +257,12 @@ as a concise evidence ledger; roadmap stays for open gates only.
   Evidence:
   `cargo clippy -p ultrasql-server --lib --all-features -- -W
   clippy::expect_used -W clippy::unwrap_used`.
+- CSV header sniffing now reports an explicit parse error if the CSV parser
+  ever returns no record after a single-record length check, removing
+  production `expect` from `read_csv` setup. Evidence:
+  `cargo test -p ultrasql-server csv_scan` and
+  `cargo clippy -p ultrasql-server --lib --all-features -- -W
+  clippy::expect_used -W clippy::unwrap_used`.
 
 ## Core SQL And Wire Protocol
 
