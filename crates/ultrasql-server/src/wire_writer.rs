@@ -32,9 +32,11 @@
 
 use bytes::{BufMut, BytesMut};
 use ultrasql_core::{DataType, Schema};
+use ultrasql_executor::ExecError;
 use ultrasql_vec::Bitmap;
 use ultrasql_vec::column::Column;
 
+use crate::error::ServerError;
 use crate::result_encoder::{encode_text_value, encode_text_value_typed};
 
 /// PostgreSQL `DataRow` message type tag (`'D'`).
@@ -93,7 +95,8 @@ pub(crate) fn write_data_row_typed(
     batch_columns: &[Column],
     schema: &Schema,
     row: usize,
-) {
+) -> Result<(), ServerError> {
+    let row_start = sink.len();
     sink.put_u8(DATA_ROW_TAG);
     let length_index = sink.len();
     sink.put_i32(0);
@@ -101,12 +104,16 @@ pub(crate) fn write_data_row_typed(
     sink.put_i16(i16_from_usize(batch_columns.len()));
     for (idx, col) in batch_columns.iter().enumerate() {
         let logical_type = &schema.field_at(idx).data_type;
-        write_cell_typed(sink, col, row, logical_type);
+        if let Err(err) = write_cell_typed(sink, col, row, logical_type) {
+            sink.truncate(row_start);
+            return Err(err);
+        }
     }
     let payload_end = sink.len();
     let payload_len = payload_end - payload_start;
     let length = i32_from_usize(payload_len + 4);
     sink[length_index..length_index + 4].copy_from_slice(&length.to_be_bytes());
+    Ok(())
 }
 
 /// Start a two-column PostgreSQL `DataRow` and return the row tag offset.
@@ -272,10 +279,15 @@ fn write_cell(sink: &mut BytesMut, col: &Column, row: usize) {
 
 /// Emit one typed column cell. Most columns still use the allocation-free
 /// physical writer; logical wrappers call the typed encoder.
-fn write_cell_typed(sink: &mut BytesMut, col: &Column, row: usize, logical_type: &DataType) {
+fn write_cell_typed(
+    sink: &mut BytesMut,
+    col: &Column,
+    row: usize,
+    logical_type: &DataType,
+) -> Result<(), ServerError> {
     if is_null(col, row) {
         sink.put_i32(-1);
-        return;
+        return Ok(());
     }
     match (logical_type, col) {
         (ty, _)
@@ -291,12 +303,17 @@ fn write_cell_typed(sink: &mut BytesMut, col: &Column, row: usize, logical_type:
             ) || ty.is_vector_family() =>
         {
             let bytes = encode_text_value_typed(col, row, logical_type)
-                .expect("non-null typed cell must encode to Some(bytes)");
+                .ok_or_else(wire_typed_cell_error)?;
             sink.put_i32(i32_from_usize(bytes.len()));
             sink.put_slice(&bytes);
         }
         _ => write_cell(sink, col, row),
     }
+    Ok(())
+}
+
+fn wire_typed_cell_error() -> ServerError {
+    ServerError::Execute(ExecError::Internal("wire typed cell encoding failed"))
 }
 
 /// Whether the given row is SQL NULL per the column's optional null
@@ -602,9 +619,28 @@ mod tests {
         encode_backend(&canonical_msg, &mut canonical);
 
         let mut actual = BytesMut::new();
-        write_data_row_typed(&mut actual, &cols, &schema, 0);
+        write_data_row_typed(&mut actual, &cols, &schema, 0).unwrap();
 
         assert_eq!(&actual[..], &canonical[..]);
+    }
+
+    #[test]
+    fn write_data_row_typed_rejects_invalid_timetz_payload_without_partial_row() {
+        let schema = Schema::new([Field::required("observed_at", DataType::TimeTz)]).unwrap();
+        let cols = vec![Column::Int64(NumericColumn::from_data(vec![-1]))];
+        let mut actual = BytesMut::new();
+
+        let err = write_data_row_typed(&mut actual, &cols, &schema, 0)
+            .expect_err("invalid TIMETZ payload must be a typed wire error");
+
+        assert!(
+            err.to_string().contains("wire typed cell encoding failed"),
+            "{err}"
+        );
+        assert!(
+            actual.is_empty(),
+            "failed row encoding must not leave partial wire bytes"
+        );
     }
 
     #[test]

@@ -378,7 +378,7 @@ pub fn stream_select(op: &mut dyn Operator, sink: &mut BytesMut) -> Result<u64, 
             continue;
         }
         for row in 0..row_count {
-            write_data_row_typed(sink, columns, &schema, row);
+            write_data_row_typed(sink, columns, &schema, row)?;
         }
         rows = rows.saturating_add(u64::try_from(row_count).unwrap_or(u64::MAX));
     }

@@ -220,6 +220,11 @@ as a concise evidence ledger; roadmap stays for open gates only.
 - Row codec fixed-width `Int64` builder fast paths now use the shared
   `read_fixed` typed truncation helper instead of production `try_into`
   `expect` calls. Evidence: `cargo test -p ultrasql-executor row_codec`.
+- SELECT wire streaming now returns a typed server error and rolls back the
+  partial row buffer when a logical typed cell cannot be rendered, covering
+  corrupt `TIMETZ` physical payloads without a panic. Evidence:
+  `cargo test -p ultrasql-server
+  write_data_row_typed_rejects_invalid_timetz_payload_without_partial_row`.
 
 ## Core SQL And Wire Protocol
 
