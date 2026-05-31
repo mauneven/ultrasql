@@ -184,6 +184,31 @@ fn privilege_metadata_rejects_unknown_role_refs_on_rebuild() {
     }
 }
 
+#[test]
+fn privilege_metadata_rejects_unknown_column_refs_on_rebuild() {
+    let data_dir = tempfile::TempDir::new().expect("temp data dir");
+    std::fs::write(
+        data_dir.path().join("pg_privileges.meta"),
+        concat!(
+            "# ultrasql privilege runtime v1\n",
+            "grant\ttable\tusers\tpublic\tupdate\tmissing_column\tultrasql\tfalse\n"
+        ),
+    )
+    .expect("write privilege metadata with unknown column");
+
+    let err = match Server::init(data_dir.path()) {
+        Ok(_) => panic!("unknown column privilege metadata should be rejected"),
+        Err(err) => err,
+    };
+    let message = err.to_string();
+    assert!(
+        message.contains("unknown privilege metadata column")
+            && message.contains("missing_column")
+            && message.contains("line 2"),
+        "expected unknown column rejection, got {message}"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn drop_table_removes_table_privilege_grants() {
     let data_dir = tempfile::TempDir::new().expect("temp data dir");

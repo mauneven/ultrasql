@@ -830,6 +830,50 @@ fn validate_privilege_metadata_grantee(
     validate_privilege_metadata_role(known_roles, grantee, line_no, "grantee")
 }
 
+fn privilege_metadata_object_key(name: &str) -> String {
+    let folded = name.trim().to_ascii_lowercase();
+    folded
+        .rsplit_once('.')
+        .map_or(folded.as_str(), |(_, last)| last)
+        .to_owned()
+}
+
+fn privilege_metadata_table_has_column(
+    snapshot: &CatalogSnapshot,
+    fallback: &InMemoryCatalog,
+    object_name: &str,
+    column_name: &str,
+) -> Option<bool> {
+    let table_name = privilege_metadata_object_key(object_name);
+    if let Some(table) = snapshot.tables.get(&table_name) {
+        return Some(table.schema.find(column_name).is_some());
+    }
+    PlannerCatalog::lookup_table(fallback, &table_name)
+        .map(|table| table.schema.find(column_name).is_some())
+}
+
+fn validate_privilege_metadata_column(
+    snapshot: &CatalogSnapshot,
+    fallback: &InMemoryCatalog,
+    grant: &auth::PrivilegeGrant,
+    line_no: usize,
+) -> Result<(), ServerError> {
+    if grant.object_kind != auth::PrivilegeObjectKind::Table {
+        return Ok(());
+    }
+    let Some(column_name) = grant.column_name.as_deref() else {
+        return Ok(());
+    };
+    match privilege_metadata_table_has_column(snapshot, fallback, &grant.object_name, column_name) {
+        Some(true) | None => Ok(()),
+        Some(false) => Err(ServerError::ddl(format!(
+            "unknown privilege metadata column '{column_name}' for table '{}' on line {}",
+            grant.object_name,
+            line_no + 1
+        ))),
+    }
+}
+
 fn rls_permissiveness_name(value: RuntimeRlsPermissiveness) -> &'static str {
     match value {
         RuntimeRlsPermissiveness::Permissive => "permissive",
@@ -5438,6 +5482,7 @@ impl Server {
             .into_iter()
             .map(|role| role.name)
             .collect::<std::collections::HashSet<_>>();
+        let snapshot = self.catalog_snapshot();
         for (line_no, line) in text.lines().enumerate() {
             if line.is_empty() || line.starts_with('#') {
                 continue;
@@ -5478,6 +5523,7 @@ impl Server {
                         line_no,
                         "grantor",
                     )?;
+                    validate_privilege_metadata_column(&snapshot, &self.catalog, &grant, line_no)?;
                     grants.push(grant);
                 }
                 Some("default") if parts.len() == 8 => {

@@ -1208,5 +1208,7 @@ as a concise evidence ledger; roadmap stays for open gates only.
   `privilege_catalog_rolls_back_when_metadata_slot_is_unsafe`. The privilege
   metadata loader rejects duplicate grant/default-grant keys and unknown
   role references instead of silently applying last-row-wins or ghost-role
-  ACL state. Evidence:
+  ACL state; table column-level grants are validated against known table
+  schemas before restart install, preventing stale column ACL resurrection.
+  Evidence:
   `cargo test -p ultrasql-server --test privilege_catalog_round_trip privilege_metadata_rejects -- --nocapture`.
