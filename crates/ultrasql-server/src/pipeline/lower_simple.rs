@@ -91,6 +91,7 @@ pub fn lower_plan(
         | LogicalPlan::CreateTypeEnum { .. }
         | LogicalPlan::CreateTypeComposite { .. }
         | LogicalPlan::CreateDomain { .. }
+        | LogicalPlan::CreateOperator { .. }
         | LogicalPlan::CreateIndex { .. }
         | LogicalPlan::DropIndex { .. }
         | LogicalPlan::CreatePolicy { .. }

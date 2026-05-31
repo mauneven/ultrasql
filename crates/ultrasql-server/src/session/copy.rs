@@ -1090,6 +1090,7 @@ where
             catalog_snapshot: Arc::clone(&snapshot),
             table_constraints: Arc::clone(&self.state.table_constraints),
             sequences: Arc::clone(&self.state.sequences),
+            operators: Arc::clone(&self.state.operators),
             role_catalog: Arc::clone(&self.state.role_catalog),
             privilege_catalog: Arc::clone(&self.state.privilege_catalog),
             row_security: Arc::clone(&self.state.row_security),

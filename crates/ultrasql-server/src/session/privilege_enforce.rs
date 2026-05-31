@@ -322,6 +322,7 @@ where
             | LogicalPlan::CreateTypeEnum { .. }
             | LogicalPlan::CreateTypeComposite { .. }
             | LogicalPlan::CreateDomain { .. }
+            | LogicalPlan::CreateOperator { .. }
             | LogicalPlan::CreateIndex { .. }
             | LogicalPlan::DropIndex { .. }
             | LogicalPlan::CreatePolicy { .. }

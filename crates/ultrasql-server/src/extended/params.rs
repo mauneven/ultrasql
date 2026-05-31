@@ -79,6 +79,7 @@ fn infer_into(
         | LogicalPlan::CreateTypeEnum { .. }
         | LogicalPlan::CreateTypeComposite { .. }
         | LogicalPlan::CreateDomain { .. }
+        | LogicalPlan::CreateOperator { .. }
         | LogicalPlan::CreateIndex { .. }
         | LogicalPlan::DropIndex { .. }
         | LogicalPlan::CreateRole { .. }
@@ -435,6 +436,7 @@ pub(super) fn walk_plan_exprs<F: FnMut(&ScalarExpr)>(plan: &LogicalPlan, f: &mut
         | LogicalPlan::CreateTypeEnum { .. }
         | LogicalPlan::CreateTypeComposite { .. }
         | LogicalPlan::CreateDomain { .. }
+        | LogicalPlan::CreateOperator { .. }
         | LogicalPlan::CreateIndex { .. }
         | LogicalPlan::DropIndex { .. }
         | LogicalPlan::CreateRole { .. }

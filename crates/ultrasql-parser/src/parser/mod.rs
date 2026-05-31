@@ -389,6 +389,14 @@ impl<'src> Parser<'src> {
             TokenKind::Identifier
                 if tok
                     .text(self.source)
+                    .is_some_and(|text| text.eq_ignore_ascii_case("operator")) =>
+            {
+                self.parse_create_operator(start)
+                    .map(|s| Statement::CreateOperator(Box::new(s)))
+            }
+            TokenKind::Identifier
+                if tok
+                    .text(self.source)
                     .is_some_and(|text| text.eq_ignore_ascii_case("materialized")) =>
             {
                 self.parse_create_materialized_view(start)
@@ -440,7 +448,7 @@ impl<'src> Parser<'src> {
                 .parse_create_sequence(start)
                 .map(|s| Statement::CreateSequence(Box::new(s))),
             other => Err(ParseError::Expected {
-                expected: "TABLE, TYPE, DOMAIN, MATERIALIZED VIEW, SCHEMA, INDEX, UNIQUE, AGGREGATING, POLICY, ROLE, USER, or SEQUENCE after CREATE",
+                expected: "TABLE, TYPE, DOMAIN, OPERATOR, MATERIALIZED VIEW, SCHEMA, INDEX, UNIQUE, AGGREGATING, POLICY, ROLE, USER, or SEQUENCE after CREATE",
                 found: other,
                 offset: tok.span.start as usize,
             }),

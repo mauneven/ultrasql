@@ -1087,6 +1087,10 @@ as a concise evidence ledger; roadmap stays for open gates only.
   key, duplicate-key rejection, FK rejection, and check-on-update.
 - Operator regression baseline covers comparison lexer/evaluator surfaces,
   `BETWEEN`, and `LIKE`.
+- `CREATE OPERATOR === (...)` now parses, binds, records a runtime
+  `pg_operator` row backed by built-in `bool_eq`, and removes the final local
+  skip from the curated index/constraint/operator regression shard. Evidence:
+  `cargo run -p ultrasql-sqllogictest-runner -- --mode in-process tests/slt/sql_regression/regression_subset/index_constraint_operator_baseline.slt`.
 - Type-specific regression baseline covers numeric, text, date/time/timetz,
   timestamp, JSON/JSONB, and arrays.
 - `pg_type` now exposes built-in array type rows such as `_int4`, with

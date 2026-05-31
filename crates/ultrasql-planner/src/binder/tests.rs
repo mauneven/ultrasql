@@ -3691,6 +3691,7 @@ fn collect_window_funcs<'a>(plan: &'a LogicalPlan, out: &mut Vec<&'a LogicalWind
         | LogicalPlan::CreateTypeEnum { .. }
         | LogicalPlan::CreateTypeComposite { .. }
         | LogicalPlan::CreateDomain { .. }
+        | LogicalPlan::CreateOperator { .. }
         | LogicalPlan::CreateIndex { .. }
         | LogicalPlan::DropIndex { .. }
         | LogicalPlan::CreatePolicy { .. }

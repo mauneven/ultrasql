@@ -483,6 +483,7 @@ fn fold_plan(plan: &LogicalPlan) -> Result<Option<LogicalPlan>, OptimizeError> {
         | LogicalPlan::CreateTypeEnum { .. }
         | LogicalPlan::CreateTypeComposite { .. }
         | LogicalPlan::CreateDomain { .. }
+        | LogicalPlan::CreateOperator { .. }
         | LogicalPlan::CreateIndex { .. }
         | LogicalPlan::CreatePolicy { .. }
         | LogicalPlan::CreateRole { .. }

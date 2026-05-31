@@ -446,6 +446,7 @@ pub(crate) fn row_description_for_plan_with_formats(
             | LogicalPlan::CreateTypeEnum { .. }
             | LogicalPlan::CreateTypeComposite { .. }
             | LogicalPlan::CreateDomain { .. }
+            | LogicalPlan::CreateOperator { .. }
             | LogicalPlan::CreateIndex { .. }
             | LogicalPlan::DropIndex { .. }
             | LogicalPlan::CreateRole { .. }

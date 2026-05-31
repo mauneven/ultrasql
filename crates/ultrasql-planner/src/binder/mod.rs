@@ -82,9 +82,10 @@ use self::aggregate::{
 };
 use self::ddl::{
     bind_alter_role, bind_alter_sequence, bind_alter_table, bind_comment, bind_copy,
-    bind_create_domain, bind_create_index, bind_create_materialized_view, bind_create_policy,
-    bind_create_role, bind_create_sequence, bind_create_table, bind_create_type, bind_drop_index,
-    bind_drop_role, bind_drop_sequence, bind_drop_table, bind_truncate,
+    bind_create_domain, bind_create_index, bind_create_materialized_view, bind_create_operator,
+    bind_create_policy, bind_create_role, bind_create_sequence, bind_create_table,
+    bind_create_type, bind_drop_index, bind_drop_role, bind_drop_sequence, bind_drop_table,
+    bind_truncate,
 };
 use self::dml::{bind_delete, bind_insert, bind_update};
 use self::expr_bind::{bind_expr, bind_expr_with_ctes};
@@ -123,6 +124,7 @@ pub fn bind(stmt: &Statement, catalog: &dyn Catalog) -> Result<LogicalPlan, Plan
         Statement::CreateMaterializedView(s) => bind_create_materialized_view(s, catalog),
         Statement::CreateType(s) => bind_create_type(s, catalog),
         Statement::CreateDomain(s) => bind_create_domain(s, catalog),
+        Statement::CreateOperator(s) => bind_create_operator(s, catalog),
         Statement::CreatePolicy(s) => bind_create_policy(s, catalog),
         Statement::CreateRole(s) => bind_create_role(s),
         Statement::Grant(s) => bind_grant_privileges(s),

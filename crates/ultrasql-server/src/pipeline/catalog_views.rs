@@ -128,6 +128,7 @@ pub(crate) fn virtual_catalog_schema(name: &str) -> Option<Schema> {
         "pg_catalog.pg_constraint" => Some(schema_pg_constraint()),
         "pg_catalog.pg_policy" => Some(schema_pg_policy()),
         "pg_catalog.pg_sequence" => Some(schema_pg_sequence()),
+        "pg_catalog.pg_operator" => Some(schema_pg_operator()),
         "pg_catalog.pg_depend" => Some(schema_pg_depend()),
         "pg_catalog.pg_description" => Some(schema_pg_description()),
         "pg_catalog.pg_statistic" => Some(schema_pg_statistic()),
@@ -217,6 +218,7 @@ fn virtual_rows(name: &str, ctx: &LowerCtx<'_>) -> Option<(Schema, Vec<Vec<Value
         "pg_catalog.pg_constraint" => Some((schema_pg_constraint(), rows_pg_constraint(ctx))),
         "pg_catalog.pg_policy" => Some((schema_pg_policy(), rows_pg_policy(ctx))),
         "pg_catalog.pg_sequence" => Some((schema_pg_sequence(), rows_pg_sequence(ctx))),
+        "pg_catalog.pg_operator" => Some((schema_pg_operator(), rows_pg_operator(ctx))),
         "pg_catalog.pg_depend" => Some((schema_pg_depend(), rows_pg_depend(ctx))),
         "pg_catalog.pg_description" => Some((schema_pg_description(), rows_pg_description(ctx))),
         "pg_catalog.pg_statistic" => Some((schema_pg_statistic(), rows_pg_statistic(ctx))),
@@ -357,6 +359,7 @@ fn normalized_name(name: &str) -> String {
         | "pg_constraint"
         | "pg_policy"
         | "pg_sequence"
+        | "pg_operator"
         | "pg_depend"
         | "pg_description"
         | "pg_tables"
@@ -1734,6 +1737,75 @@ fn rows_pg_sequence(ctx: &LowerCtx<'_>) -> Vec<Vec<Value>> {
         ]);
     }
     rows
+}
+
+fn schema_pg_operator() -> Schema {
+    schema([
+        Field::required("oid", DataType::Oid),
+        Field::required("oprname", text()),
+        Field::required("oprnamespace", DataType::Oid),
+        Field::required("oprowner", DataType::Oid),
+        Field::required("oprkind", DataType::Text { max_len: Some(1) }),
+        Field::required("oprcanmerge", DataType::Bool),
+        Field::required("oprcanhash", DataType::Bool),
+        Field::required("oprleft", DataType::Oid),
+        Field::required("oprright", DataType::Oid),
+        Field::required("oprresult", DataType::Oid),
+        Field::required("oprcom", DataType::Oid),
+        Field::required("oprnegate", DataType::Oid),
+        Field::required("oprcode", DataType::Oid),
+        Field::required("oprrest", DataType::Oid),
+        Field::required("oprjoin", DataType::Oid),
+    ])
+}
+
+fn rows_pg_operator(ctx: &LowerCtx<'_>) -> Vec<Vec<Value>> {
+    let mut operators: Vec<crate::RuntimeOperator> = ctx
+        .operators
+        .iter()
+        .map(|entry| entry.value().as_ref().clone())
+        .collect();
+    operators.sort_by(|a, b| a.oid.cmp(&b.oid).then_with(|| a.name.cmp(&b.name)));
+    operators
+        .into_iter()
+        .map(|operator| {
+            let kind = match (&operator.left_type, &operator.right_type) {
+                (Some(_), Some(_)) => "b",
+                (None, Some(_)) => "l",
+                (Some(_), None) => "r",
+                (None, None) => "b",
+            };
+            vec![
+                Value::Oid(Oid::new(operator.oid)),
+                v_text(&operator.name),
+                Value::Oid(Oid::new(namespace_oid_u32(&operator.namespace))),
+                Value::Oid(Oid::new(10)),
+                v_text(kind),
+                Value::Bool(false),
+                Value::Bool(false),
+                Value::Oid(Oid::new(
+                    operator
+                        .left_type
+                        .as_ref()
+                        .map_or(0, pg_type_oid_for_data_type),
+                )),
+                Value::Oid(Oid::new(
+                    operator
+                        .right_type
+                        .as_ref()
+                        .map_or(0, pg_type_oid_for_data_type),
+                )),
+                Value::Oid(Oid::new(pg_type_oid_for_data_type(&operator.result_type))),
+                Value::Oid(Oid::new(0)),
+                Value::Oid(Oid::new(0)),
+                Value::Oid(Oid::new(
+                    pg_proc_oid_by_name(&operator.procedure).unwrap_or(0),
+                )),
+                Value::Oid(Oid::new(0)),
+                Value::Oid(Oid::new(0)),
+            ]
+        })
+        .collect()
 }
 
 fn schema_pg_depend() -> Schema {
@@ -3433,6 +3505,113 @@ fn pg_proc_oid(offset: usize) -> Option<i64> {
     PG_PROC_BASE_OID.checked_add(offset).map(i64::from)
 }
 
+fn pg_proc_oid_by_name(name: &str) -> Option<u32> {
+    pg_proc_builtins()
+        .iter()
+        .enumerate()
+        .find(|(_, builtin)| builtin.name.eq_ignore_ascii_case(name))
+        .and_then(|(offset, _)| {
+            let offset = u32::try_from(offset).ok()?;
+            PG_PROC_BASE_OID.checked_add(offset)
+        })
+}
+
+fn namespace_oid_u32(namespace: &str) -> u32 {
+    if namespace.eq_ignore_ascii_case("pg_catalog") {
+        11
+    } else {
+        2200
+    }
+}
+
+fn pg_type_oid_for_data_type(data_type: &DataType) -> u32 {
+    match data_type {
+        DataType::Bool => 16,
+        DataType::Int16 => 21,
+        DataType::Int32 => 23,
+        DataType::Int64 => 20,
+        DataType::Float32 => 700,
+        DataType::Float64 => 701,
+        DataType::Decimal { .. } => 1700,
+        DataType::Money => 790,
+        DataType::Oid => 26,
+        DataType::RegClass => 2205,
+        DataType::RegType => 2206,
+        DataType::PgLsn => 3220,
+        DataType::Text { .. } => 25,
+        DataType::Char { .. } => 1042,
+        DataType::Bytea => 17,
+        DataType::Date => 1082,
+        DataType::Timestamp => 1114,
+        DataType::TimestampTz => 1184,
+        DataType::Time => 1083,
+        DataType::TimeTz => 1266,
+        DataType::Json => 114,
+        DataType::Jsonb => 3802,
+        DataType::Xml => 142,
+        DataType::Uuid => 2950,
+        DataType::Bit { .. } => 1560,
+        DataType::VarBit { .. } => 1562,
+        DataType::Inet => 869,
+        DataType::Cidr => 650,
+        DataType::MacAddr => 829,
+        DataType::MacAddr8 => 774,
+        DataType::Array(inner) => pg_array_type_oid_for_data_type(inner),
+        DataType::Range(range) => pg_range_type_oid(*range),
+        DataType::Domain { oid, .. }
+        | DataType::Enum { oid, .. }
+        | DataType::Composite { oid, .. } => oid.raw(),
+        _ => 25,
+    }
+}
+
+fn pg_array_type_oid_for_data_type(data_type: &DataType) -> u32 {
+    match data_type {
+        DataType::Bool => 1000,
+        DataType::Int16 => 1005,
+        DataType::Int32 => 1007,
+        DataType::Int64 => 1016,
+        DataType::Float32 => 1021,
+        DataType::Float64 => 1022,
+        DataType::Decimal { .. } => 1231,
+        DataType::Money => 791,
+        DataType::Oid => 1028,
+        DataType::RegClass => 2210,
+        DataType::RegType => 2211,
+        DataType::PgLsn => 3221,
+        DataType::Text { .. } => 1009,
+        DataType::Char { .. } => 1014,
+        DataType::Bytea => 1001,
+        DataType::Date => 1182,
+        DataType::Timestamp => 1115,
+        DataType::TimestampTz => 1185,
+        DataType::Time => 1183,
+        DataType::TimeTz => 1270,
+        DataType::Json => 199,
+        DataType::Jsonb => 3807,
+        DataType::Xml => 143,
+        DataType::Uuid => 2951,
+        DataType::Bit { .. } => 1561,
+        DataType::VarBit { .. } => 1563,
+        DataType::Inet => 1041,
+        DataType::Cidr => 651,
+        DataType::MacAddr => 1040,
+        DataType::MacAddr8 => 775,
+        _ => 1009,
+    }
+}
+
+fn pg_range_type_oid(range: RangeType) -> u32 {
+    match range {
+        RangeType::Int4 => 3904,
+        RangeType::Num => 3906,
+        RangeType::Timestamp => 3908,
+        RangeType::TimestampTz => 3910,
+        RangeType::Date => 3912,
+        RangeType::Int8 => 3926,
+    }
+}
+
 struct PgProcBuiltin {
     name: &'static str,
     return_type_oid: u32,
@@ -3675,6 +3854,12 @@ const fn pg_proc_builtins() -> &'static [PgProcBuiltin] {
             name: "xpath_exists",
             return_type_oid: PROC_TYPE_BOOL,
             arg_type_oids: &[PROC_TYPE_TEXT, PROC_TYPE_XML, PROC_TYPE_TEXT_ARRAY],
+            volatility: "i",
+        },
+        PgProcBuiltin {
+            name: "bool_eq",
+            return_type_oid: PROC_TYPE_BOOL,
+            arg_type_oids: &[PROC_TYPE_BOOL, PROC_TYPE_BOOL],
             volatility: "i",
         },
     ]

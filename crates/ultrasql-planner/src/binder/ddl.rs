@@ -12,10 +12,10 @@ use ultrasql_parser::ast::{
     AlterRoleStmt, AlterSequenceStmt, AlterTableAction, AlterTableStmt, BinaryOp, ColumnConstraint,
     CommentStmt, CommentTarget, CopyDirection as AstCopyDirection, CopyFormat as AstCopyFormat,
     CopyOption, CopySource as AstCopySource, CopyStmt, CreateDomainStmt, CreateIndexStmt,
-    CreateMaterializedViewStmt, CreatePolicyStmt, CreateRoleStmt, CreateSequenceStmt,
-    CreateTableStmt, CreateTypeKind, CreateTypeStmt, DomainConstraint, DropIndexStmt, DropRoleStmt,
-    DropSequenceStmt, DropTableStmt, Expr, Identifier, Literal, ObjectName,
-    PolicyCommand as AstPolicyCommand, PolicyPermissiveness as AstPolicyPermissiveness,
+    CreateMaterializedViewStmt, CreateOperatorStmt, CreatePolicyStmt, CreateRoleStmt,
+    CreateSequenceStmt, CreateTableStmt, CreateTypeKind, CreateTypeStmt, DomainConstraint,
+    DropIndexStmt, DropRoleStmt, DropSequenceStmt, DropTableStmt, Expr, Identifier, Literal,
+    ObjectName, PolicyCommand as AstPolicyCommand, PolicyPermissiveness as AstPolicyPermissiveness,
     ReferentialAction as AstReferentialAction, RoleOption as AstRoleOption,
     RoleStmtKind as AstRoleStmtKind, SequenceOption, TableConstraint, TruncateStmt, TypeName,
 };
@@ -438,6 +438,61 @@ pub(super) fn bind_create_domain(
         checks,
         schema: Schema::empty(),
     })
+}
+
+pub(super) fn bind_create_operator(
+    s: &CreateOperatorStmt,
+    catalog: &dyn Catalog,
+) -> Result<LogicalPlan, PlanError> {
+    if s.name.is_empty() {
+        return Err(PlanError::TypeMismatch(
+            "operator name must not be empty".to_owned(),
+        ));
+    }
+    if s.left_arg.is_none() && s.right_arg.is_none() {
+        return Err(PlanError::TypeMismatch(format!(
+            "operator '{}' must declare LEFTARG or RIGHTARG",
+            s.name
+        )));
+    }
+    let left_type = s
+        .left_arg
+        .as_ref()
+        .map(|ty| resolve_type_name_with_catalog(ty, catalog))
+        .transpose()?;
+    let right_type = s
+        .right_arg
+        .as_ref()
+        .map(|ty| resolve_type_name_with_catalog(ty, catalog))
+        .transpose()?;
+    let procedure = object_name_simple(&s.procedure);
+    let result_type = resolve_operator_procedure(&s.name, &left_type, &right_type, &procedure)?;
+    Ok(LogicalPlan::CreateOperator {
+        operator_name: s.name.clone(),
+        namespace: String::from("public"),
+        left_type,
+        right_type,
+        procedure,
+        result_type,
+        schema: Schema::empty(),
+    })
+}
+
+fn resolve_operator_procedure(
+    operator_name: &str,
+    left_type: &Option<DataType>,
+    right_type: &Option<DataType>,
+    procedure: &str,
+) -> Result<DataType, PlanError> {
+    match (procedure, left_type, right_type) {
+        ("bool_eq", Some(DataType::Bool), Some(DataType::Bool)) => Ok(DataType::Bool),
+        ("bool_eq", _, _) => Err(PlanError::TypeMismatch(format!(
+            "CREATE OPERATOR {operator_name}: bool_eq requires boolean LEFTARG and RIGHTARG"
+        ))),
+        _ => Err(PlanError::NotSupported(
+            "CREATE OPERATOR currently supports built-in bool_eq",
+        )),
+    }
 }
 
 fn bind_time_partition(

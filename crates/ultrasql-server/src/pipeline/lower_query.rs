@@ -315,6 +315,7 @@ fn lower_query_inner(
         | LogicalPlan::CreateTypeEnum { .. }
         | LogicalPlan::CreateTypeComposite { .. }
         | LogicalPlan::CreateDomain { .. }
+        | LogicalPlan::CreateOperator { .. }
         | LogicalPlan::CreateIndex { .. }
         | LogicalPlan::DropIndex { .. }
         | LogicalPlan::CreatePolicy { .. }
@@ -673,6 +674,7 @@ fn profile_operator_name(plan: &LogicalPlan) -> &'static str {
         LogicalPlan::CreateTypeEnum { .. } => "CreateTypeEnum",
         LogicalPlan::CreateTypeComposite { .. } => "CreateTypeComposite",
         LogicalPlan::CreateDomain { .. } => "CreateDomain",
+        LogicalPlan::CreateOperator { .. } => "CreateOperator",
         LogicalPlan::CreateIndex { .. } => "CreateIndex",
         LogicalPlan::DropIndex { .. } => "DropIndex",
         LogicalPlan::CreatePolicy { .. } => "CreatePolicy",
@@ -1154,6 +1156,7 @@ pub(super) fn lower_cte(
         catalog_snapshot: Arc::clone(&ctx.catalog_snapshot),
         table_constraints: Arc::clone(&ctx.table_constraints),
         sequences: Arc::clone(&ctx.sequences),
+        operators: Arc::clone(&ctx.operators),
         role_catalog: Arc::clone(&ctx.role_catalog),
         privilege_catalog: Arc::clone(&ctx.privilege_catalog),
         row_security: Arc::clone(&ctx.row_security),

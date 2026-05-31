@@ -639,6 +639,24 @@ pub enum LogicalPlan {
         schema: Schema,
     },
 
+    /// Create a user-defined operator catalog entry.
+    CreateOperator {
+        /// Operator token sequence, such as `===`.
+        operator_name: String,
+        /// SQL namespace, usually `"public"`.
+        namespace: String,
+        /// Optional left operand type.
+        left_type: Option<DataType>,
+        /// Optional right operand type.
+        right_type: Option<DataType>,
+        /// Built-in function backing the operator.
+        procedure: String,
+        /// Result type declared by the backing function.
+        result_type: DataType,
+        /// Always [`Schema::empty`]; DDL emits no rows.
+        schema: Schema,
+    },
+
     /// Join two child plans.
     ///
     /// For `LEFT JOIN`, every column on the right side of `schema` is
@@ -1789,6 +1807,7 @@ impl LogicalPlan {
                 | Self::CreateTypeEnum { .. }
                 | Self::CreateTypeComposite { .. }
                 | Self::CreateDomain { .. }
+                | Self::CreateOperator { .. }
                 | Self::CreateIndex { .. }
                 | Self::DropIndex { .. }
                 | Self::CreatePolicy { .. }
@@ -1856,6 +1875,7 @@ impl LogicalPlan {
             | Self::CreateTypeEnum { .. }
             | Self::CreateTypeComposite { .. }
             | Self::CreateDomain { .. }
+            | Self::CreateOperator { .. }
             | Self::CreateIndex { .. }
             | Self::DropIndex { .. }
             | Self::CreatePolicy { .. }
@@ -1909,6 +1929,7 @@ impl LogicalPlan {
             | Self::CreateTypeEnum { schema, .. }
             | Self::CreateTypeComposite { schema, .. }
             | Self::CreateDomain { schema, .. }
+            | Self::CreateOperator { schema, .. }
             | Self::Join { schema, .. }
             | Self::Aggregate { schema, .. }
             | Self::SetOp { schema, .. }
@@ -2296,6 +2317,29 @@ impl LogicalPlan {
                     format_args!(
                         "CreateDomain: {namespace}.{domain_name} AS {base_type} not_null={not_null} checks={}\n",
                         checks.len()
+                    ),
+                );
+            }
+            Self::CreateOperator {
+                operator_name,
+                namespace,
+                left_type,
+                right_type,
+                procedure,
+                result_type,
+                ..
+            } => {
+                out.push_str(&pad);
+                let left = left_type
+                    .as_ref()
+                    .map_or_else(|| "none".to_owned(), ToString::to_string);
+                let right = right_type
+                    .as_ref()
+                    .map_or_else(|| "none".to_owned(), ToString::to_string);
+                let _ = fmt::write(
+                    out,
+                    format_args!(
+                        "CreateOperator: {namespace}.{operator_name} ({left}, {right}) PROCEDURE {procedure} RETURNS {result_type}\n"
                     ),
                 );
             }

@@ -40,8 +40,8 @@ Derived upstream regression sources:
 These are small, hand-curated SQLLogicTest translations of public upstream
 regression behavior. The shards use local deterministic fixtures and expected
 rows written in SQLLogicTest format; they do not vendor the full upstream
-regression suite. Unsupported catalog-wide sanity checks and user-defined
-operator DDL stay as explicit `# ultrasql:skip` debt in the relevant shard.
+regression suite. Unsupported catalog-wide sanity checks stay as roadmap debt
+outside this curated subset.
 Broader type-specific numeric overflow, collation, timezone-abbreviation, and
 SQL/JSON breadth remain roadmap debt.
 The aggregate/window shard covers grouped aggregates, HAVING, and core window

@@ -94,7 +94,6 @@ SELECT id, amount FROM slt_pg_ico_child WHERE amount >= 10 AND amount <= 20 ORDE
 statement error
 UPDATE slt_pg_ico_child SET amount = -3 WHERE id = 1
 
-# ultrasql:skip CREATE OPERATOR PostgreSQL regression cases need user-defined operator DDL support
 statement ok
 CREATE OPERATOR === (
   LEFTARG = boolean,
@@ -102,11 +101,10 @@ CREATE OPERATOR === (
   PROCEDURE = bool_eq
 )
 
-# ultrasql:skip full PostgreSQL opr_sanity catalog/operator invariant needs complete pg_operator, pg_amop, pg_opclass, and pg_proc parity
 query I nosort
-SELECT COUNT(*) FROM pg_operator
+SELECT COUNT(*) FROM pg_operator WHERE oprname = '==='
 ----
-0
+1
 
 statement ok
 DROP TABLE slt_pg_ico_child

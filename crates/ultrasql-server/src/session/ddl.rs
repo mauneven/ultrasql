@@ -53,6 +53,33 @@ const COLUMN_COLLATION_OPTION_PREFIX: &str = "ultrasql.attcollation.";
 
 const PG_OID_INT8: u32 = 20;
 
+fn operator_signature(
+    namespace: &str,
+    name: &str,
+    left_type: &Option<DataType>,
+    right_type: &Option<DataType>,
+) -> String {
+    let left = left_type
+        .as_ref()
+        .map_or_else(|| "none".to_owned(), ToString::to_string);
+    let right = right_type
+        .as_ref()
+        .map_or_else(|| "none".to_owned(), ToString::to_string);
+    format!("{namespace}.{name}({left},{right})")
+}
+
+fn runtime_operator_oid(signature: &str) -> u32 {
+    const USER_OPERATOR_OID_BASE: u32 = 80_000;
+    const USER_OPERATOR_OID_SPACE: u32 = 1_000_000;
+    let hash = signature
+        .as_bytes()
+        .iter()
+        .fold(0x811c_9dc5_u32, |acc, byte| {
+            (acc ^ u32::from(*byte)).wrapping_mul(0x0100_0193)
+        });
+    USER_OPERATOR_OID_BASE + (hash % USER_OPERATOR_OID_SPACE)
+}
+
 struct CreateIndexProgressGuard<'a> {
     recorder: &'a crate::workload::WorkloadRecorder,
     pid: u32,
@@ -474,6 +501,50 @@ where
             .commit_transaction(ddl_txn, true, "CREATE DOMAIN catalog-write transaction")?;
         self.plan_cache_invalidate();
         Ok(run_ddl_command("CREATE DOMAIN"))
+    }
+
+    /// Register a user-defined operator in the runtime catalog.
+    pub(crate) fn execute_create_operator(
+        &self,
+        plan: &LogicalPlan,
+    ) -> Result<SelectResult, ServerError> {
+        let LogicalPlan::CreateOperator {
+            operator_name,
+            namespace,
+            left_type,
+            right_type,
+            procedure,
+            result_type,
+            ..
+        } = plan
+        else {
+            return Err(ServerError::Unsupported(
+                "execute_create_operator called with non-CreateOperator plan",
+            ));
+        };
+        let key = operator_signature(namespace, operator_name, left_type, right_type);
+        let operator = crate::RuntimeOperator {
+            oid: runtime_operator_oid(&key),
+            name: operator_name.clone(),
+            namespace: namespace.clone(),
+            left_type: left_type.clone(),
+            right_type: right_type.clone(),
+            procedure: procedure.clone(),
+            result_type: result_type.clone(),
+        };
+        match self.state.operators.entry(key) {
+            dashmap::mapref::entry::Entry::Occupied(_) => {
+                return Err(ServerError::ddl(format!(
+                    "operator '{}' already exists for declared argument types",
+                    operator_name
+                )));
+            }
+            dashmap::mapref::entry::Entry::Vacant(slot) => {
+                slot.insert(Arc::new(operator));
+            }
+        }
+        self.plan_cache_invalidate();
+        Ok(run_ddl_command("CREATE OPERATOR"))
     }
 
     fn domain_checks_for_columns(

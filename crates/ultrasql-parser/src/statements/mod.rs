@@ -8,6 +8,7 @@ pub(crate) mod alter_table;
 pub(crate) mod comment;
 pub(crate) mod copy;
 pub(crate) mod create_index;
+pub(crate) mod create_operator;
 pub(crate) mod create_role;
 pub(crate) mod create_schema;
 pub(crate) mod create_sequence;

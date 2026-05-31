@@ -30,9 +30,9 @@ file focused on what still blocks production.
 - Serializable isolation has column-range SSI for supported scalar comparisons
   plus relation-level fallback, but is `not fully predicate-precise` SSI.
   Implement page/tuple/gap precision before broad serializable claims.
-- Full public regression breadth still open for broader parser/type coercion
-  and upstream isolation schedules. Active aggregate/window, type-coercion, and
-  `regtype` text-output evidence lives in `DONE.md`.
+- Full public regression breadth still open for broader upstream parser, type,
+  catalog-sanity, and isolation schedules. The curated regression subset is
+  active without local skip debt; evidence lives in `DONE.md`.
 
 ### Performance Certification
 
@@ -86,8 +86,8 @@ file focused on what still blocks production.
 
 ### Catalog, Roles, Privileges
 
-- Replace role, membership, privilege, default-privilege, and RLS runtime
-  sidecars with typed catalog rows and migrations before v1.0; restart
+- Replace role, membership, privilege, default-privilege, operator, and RLS
+  runtime sidecars with typed catalog rows and migrations before v1.0; restart
   persistence evidence for the current sidecars lives in `DONE.md`.
 - Broaden remaining dependency tracking for every object kind and every
   `DROP ... CASCADE` / `RESTRICT` path.

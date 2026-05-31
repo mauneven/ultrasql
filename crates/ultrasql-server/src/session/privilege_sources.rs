@@ -77,6 +77,7 @@ pub(super) fn plan_sources(plan: &LogicalPlan) -> Vec<Option<ColumnSource>> {
         | LogicalPlan::CreateTypeEnum { schema, .. }
         | LogicalPlan::CreateTypeComposite { schema, .. }
         | LogicalPlan::CreateDomain { schema, .. }
+        | LogicalPlan::CreateOperator { schema, .. }
         | LogicalPlan::CreateIndex { schema, .. }
         | LogicalPlan::DropIndex { schema, .. }
         | LogicalPlan::CreatePolicy { schema, .. }

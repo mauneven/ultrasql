@@ -66,6 +66,8 @@ pub enum Statement {
     CreateType(Box<CreateTypeStmt>),
     /// `CREATE DOMAIN name AS base_type [constraints...]`.
     CreateDomain(Box<CreateDomainStmt>),
+    /// `CREATE OPERATOR name (...)`.
+    CreateOperator(Box<CreateOperatorStmt>),
     /// `CREATE POLICY name ON table [TO roles] USING (...) WITH CHECK (...)`.
     CreatePolicy(Box<CreatePolicyStmt>),
     /// `CREATE ROLE name ...` / `CREATE USER name ...`.
@@ -203,6 +205,7 @@ impl Statement {
             Self::CreateMaterializedView(s) => s.span,
             Self::CreateType(s) => s.span,
             Self::CreateDomain(s) => s.span,
+            Self::CreateOperator(s) => s.span,
             Self::CreatePolicy(s) => s.span,
             Self::CreateRole(s) => s.span,
             Self::Grant(s) => s.span,
@@ -440,6 +443,21 @@ pub struct CreateDomainStmt {
     pub data_type: TypeName,
     /// Domain constraints in declaration order.
     pub constraints: Vec<DomainConstraint>,
+    /// Source span of the entire statement.
+    pub span: Span,
+}
+
+/// `CREATE OPERATOR name (...)`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CreateOperatorStmt {
+    /// Operator token sequence, such as `===`.
+    pub name: String,
+    /// Optional left operand type. Omitted only for prefix operators.
+    pub left_arg: Option<TypeName>,
+    /// Optional right operand type. Omitted only for postfix operators.
+    pub right_arg: Option<TypeName>,
+    /// Function/procedure implementing the operator.
+    pub procedure: ObjectName,
     /// Source span of the entire statement.
     pub span: Span,
 }

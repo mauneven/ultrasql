@@ -219,6 +219,8 @@ pub struct LowerCtx<'a> {
         Arc<dashmap::DashMap<ultrasql_core::Oid, Arc<crate::TableRuntimeConstraints>>>,
     /// Runtime sequence registry keyed by folded sequence name.
     pub sequences: Arc<dashmap::DashMap<String, Arc<ultrasql_storage::sequence::Sequence>>>,
+    /// Runtime user-defined operator registry keyed by signature.
+    pub operators: Arc<dashmap::DashMap<String, Arc<crate::RuntimeOperator>>>,
     /// Runtime role catalog backing virtual auth views.
     pub role_catalog: Arc<crate::auth::InMemoryAuthCatalog>,
     /// Runtime privilege catalog backing GRANT/REVOKE behavior.

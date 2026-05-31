@@ -527,6 +527,7 @@ where
                 | LogicalPlan::CreateTypeEnum { .. }
                 | LogicalPlan::CreateTypeComposite { .. }
                 | LogicalPlan::CreateDomain { .. }
+                | LogicalPlan::CreateOperator { .. }
                 | LogicalPlan::CreateIndex { .. }
                 | LogicalPlan::DropIndex { .. }
                 | LogicalPlan::CreatePolicy { .. }
@@ -566,6 +567,9 @@ where
             }
             LogicalPlan::CreateDomain { .. } => {
                 return self.execute_create_domain(&plan, &catalog_snapshot);
+            }
+            LogicalPlan::CreateOperator { .. } => {
+                return self.execute_create_operator(&plan);
             }
             LogicalPlan::CreateIndex { .. } => {
                 return self.execute_create_index(&plan, &catalog_snapshot);
@@ -679,6 +683,7 @@ where
                 | LogicalPlan::CreateTypeEnum { .. }
                 | LogicalPlan::CreateTypeComposite { .. }
                 | LogicalPlan::CreateDomain { .. }
+                | LogicalPlan::CreateOperator { .. }
                 | LogicalPlan::CreateIndex { .. }
                 | LogicalPlan::DropIndex { .. }
                 | LogicalPlan::CreatePolicy { .. }
@@ -717,6 +722,7 @@ where
                 self.execute_create_type_composite(plan, catalog_snapshot)
             }
             LogicalPlan::CreateDomain { .. } => self.execute_create_domain(plan, catalog_snapshot),
+            LogicalPlan::CreateOperator { .. } => self.execute_create_operator(plan),
             LogicalPlan::CreateIndex { .. } => self.execute_create_index(plan, catalog_snapshot),
             LogicalPlan::DropIndex { .. } => self.execute_drop_index(plan),
             LogicalPlan::CreatePolicy { .. } => self.execute_create_policy(plan, catalog_snapshot),
@@ -1882,6 +1888,7 @@ where
                     Arc::clone(catalog_snapshot),
                     Arc::clone(&self.state.table_constraints),
                     Arc::clone(&self.state.sequences),
+                    Arc::clone(&self.state.operators),
                     Arc::clone(&self.state.role_catalog),
                     Arc::clone(&self.state.privilege_catalog),
                     Arc::clone(&self.state.row_security),
@@ -1916,6 +1923,7 @@ where
                     Arc::clone(catalog_snapshot),
                     Arc::clone(&self.state.table_constraints),
                     Arc::clone(&self.state.sequences),
+                    Arc::clone(&self.state.operators),
                     Arc::clone(&self.state.role_catalog),
                     Arc::clone(&self.state.privilege_catalog),
                     Arc::clone(&self.state.row_security),
@@ -2665,6 +2673,7 @@ where
             catalog_snapshot,
             Arc::clone(&self.state.table_constraints),
             Arc::clone(&self.state.sequences),
+            Arc::clone(&self.state.operators),
             Arc::clone(&self.state.role_catalog),
             Arc::clone(&self.state.privilege_catalog),
             Arc::clone(&self.state.row_security),
