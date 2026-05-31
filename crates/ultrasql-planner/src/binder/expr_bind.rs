@@ -1536,7 +1536,7 @@ fn builtin_return_type(func_name: &str, args: &[ScalarExpr]) -> Result<DataType,
         "to_tsquery" | "plainto_tsquery" | "websearch_to_tsquery" | "phraseto_tsquery" => {
             Ok(DataType::TsQuery)
         }
-        "ts_rank" => Ok(DataType::Float64),
+        "ts_rank" | "ts_rank_cd" => Ok(DataType::Float64),
         "ts_headline" => Ok(DataType::Text { max_len: None }),
         "row_to_json" | "json_build_object" | "jsonb_set" => Ok(DataType::Jsonb),
         "jsonb_path_exists"
@@ -1771,6 +1771,7 @@ pub(super) fn is_supported_builtin(func_name: &str) -> bool {
             | "websearch_to_tsquery"
             | "phraseto_tsquery"
             | "ts_rank"
+            | "ts_rank_cd"
             | "ts_headline"
             | "row_to_json"
             | "json_build_object"
@@ -1872,7 +1873,7 @@ fn validate_builtin_args(func_name: &str, args: &mut [ScalarExpr]) -> Result<(),
         | "plainto_tsquery"
         | "websearch_to_tsquery"
         | "phraseto_tsquery" => validate_text_search_constructor_args(func_name, args),
-        "ts_rank" => validate_ts_rank_args(args),
+        "ts_rank" | "ts_rank_cd" => validate_ts_rank_args(func_name, args),
         "ts_headline" => validate_ts_headline_args(args),
         "xmlparse" => validate_xmlparse_args(args),
         "xmlserialize" => validate_xmlserialize_args(args),
@@ -2118,18 +2119,18 @@ fn validate_text_search_constructor_args(
     }
 }
 
-fn validate_ts_rank_args(args: &[ScalarExpr]) -> Result<(), PlanError> {
+fn validate_ts_rank_args(func_name: &str, args: &[ScalarExpr]) -> Result<(), PlanError> {
     match args.len() {
         2 => {
-            validate_tsvector_arg("ts_rank", &args[0])?;
-            validate_tsquery_arg("ts_rank", &args[1])
+            validate_tsvector_arg(func_name, &args[0])?;
+            validate_tsquery_arg(func_name, &args[1])
         }
         3 => {
-            validate_tsvector_arg("ts_rank", &args[1])?;
-            validate_tsquery_arg("ts_rank", &args[2])
+            validate_tsvector_arg(func_name, &args[1])?;
+            validate_tsquery_arg(func_name, &args[2])
         }
         n => Err(PlanError::TypeMismatch(format!(
-            "ts_rank: expected 2 or 3 arguments, got {n}"
+            "{func_name}: expected 2 or 3 arguments, got {n}"
         ))),
     }
 }
@@ -4285,6 +4286,7 @@ mod typed_literal_tests {
             ("to_tsquery", Vec::new(), DataType::TsQuery),
             ("plainto_tsquery", Vec::new(), DataType::TsQuery),
             ("ts_rank", Vec::new(), DataType::Float64),
+            ("ts_rank_cd", Vec::new(), DataType::Float64),
             ("ts_headline", Vec::new(), text.clone()),
             ("row_to_json", Vec::new(), DataType::Jsonb),
             ("jsonb_path_exists", Vec::new(), DataType::Bool),

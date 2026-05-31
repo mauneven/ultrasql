@@ -32,7 +32,7 @@ async fn full_text_constructors_match_and_rank_over_wire() {
                     to_tsquery('Quick fox'), \
                     to_tsvector('The Quick brown fox') @@ plainto_tsquery('quick fox'), \
                     to_tsvector('The Quick brown fox') @@ plainto_tsquery('missing'), \
-                    ts_rank(to_tsvector('The Quick brown fox'), plainto_tsquery('quick missing')) > 0.4, \
+                    ts_rank_cd(to_tsvector('The Quick brown fox'), plainto_tsquery('quick missing')) > 0.4, \
                     ts_headline('The Quick brown fox.', plainto_tsquery('quick fox'))",
             )
             .await

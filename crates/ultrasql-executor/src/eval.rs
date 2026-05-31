@@ -326,7 +326,7 @@ fn eval_function_call(
         "to_tsquery" | "plainto_tsquery" | "websearch_to_tsquery" | "phraseto_tsquery" => {
             eval_plain_tsquery(name, args)
         }
-        "ts_rank" => eval_ts_rank(args),
+        "ts_rank" | "ts_rank_cd" => eval_ts_rank(name, args),
         "ts_headline" => eval_ts_headline(args),
         "ifnull" | "nvl" => eval_ifnull(args),
         "nullif" => eval_nullif(args),
@@ -4384,13 +4384,13 @@ fn eval_plain_tsquery(func_name: &str, args: &[Value]) -> Result<Value, EvalErro
     Ok(Value::Text(text_search_terms(text).join(" & ")))
 }
 
-fn eval_ts_rank(args: &[Value]) -> Result<Value, EvalError> {
+fn eval_ts_rank(func_name: &str, args: &[Value]) -> Result<Value, EvalError> {
     let (vector, query) = match args.len() {
         2 => (&args[0], &args[1]),
         3 => (&args[1], &args[2]),
         n => {
             return Err(EvalError::Type(format!(
-                "ts_rank: expected 2 or 3 args, got {n}"
+                "{func_name}: expected 2 or 3 args, got {n}"
             )));
         }
     };
@@ -4399,7 +4399,7 @@ fn eval_ts_rank(args: &[Value]) -> Result<Value, EvalError> {
             return Ok(Value::Null);
         }
         return Err(EvalError::Type(format!(
-            "ts_rank: text-backed TSVECTOR and TSQUERY required, got {:?} and {:?}",
+            "{func_name}: text-backed TSVECTOR and TSQUERY required, got {:?} and {:?}",
             vector.data_type(),
             query.data_type()
         )));
@@ -7895,7 +7895,7 @@ mod tests {
         assert_eq!(query, Value::Text("quick & fox".into()));
 
         let rank = Eval::new(call(
-            "ts_rank",
+            "ts_rank_cd",
             vec![
                 lit_text("the:1 quick:2 brown:3 fox:4"),
                 lit_text("quick & missing"),
