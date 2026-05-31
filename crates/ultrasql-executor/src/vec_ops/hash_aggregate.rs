@@ -232,10 +232,17 @@ impl VectorizedSink for AccumulateSink {
                 count: 0,
                 sums: vec![0; self.aggregates.len()],
             });
-            state.count += 1;
+            state.count = state.count.checked_add(1).ok_or_else(|| {
+                ExecError::NumericFieldOverflow("COUNT(*) overflow in vectorized aggregate".into())
+            })?;
             for (agg_i, src) in sum_sources.iter().enumerate() {
                 if let Some(data) = src {
-                    state.sums[agg_i] = state.sums[agg_i].wrapping_add(data[row]);
+                    state.sums[agg_i] =
+                        state.sums[agg_i].checked_add(data[row]).ok_or_else(|| {
+                            ExecError::NumericFieldOverflow(
+                                "SUM(bigint) overflow in vectorized aggregate".into(),
+                            )
+                        })?;
                 }
             }
         }
@@ -345,6 +352,20 @@ mod tests {
         let idx2 = keys.iter().position(|&k| k == 2).unwrap();
         assert_eq!(sums[idx1], 40); // 10 + 30
         assert_eq!(sums[idx2], 20);
+    }
+
+    #[test]
+    fn sum_overflow_returns_typed_error() {
+        let scan = MemTableScan::new(schema_key_val(), vec![batch_kv(&[(1, i64::MAX), (1, 1)])]);
+        let child = VectorizedSeqScan::new(Box::new(scan));
+        let mut agg =
+            VectorizedHashAggregate::new(Box::new(child), 0, vec![AggSpec::Sum(1)], agg_schema(1));
+        let mut sink = CollectSink::new();
+
+        let err = agg
+            .drive(&mut sink)
+            .expect_err("SUM overflow must not wrap");
+        assert!(matches!(err, ExecError::NumericFieldOverflow(_)), "{err:?}");
     }
 
     #[test]
