@@ -141,6 +141,13 @@ pub enum ToastError {
         /// Chunk sequence that could not be represented.
         seq: usize,
     },
+
+    /// The per-relation TOAST value OID counter has no next valid value.
+    #[error("TOAST value OID counter exhausted for relation {rel}")]
+    OidExhausted {
+        /// TOAST relation whose counter is exhausted.
+        rel: u32,
+    },
 }
 
 /// Pointer to an external TOAST value.
@@ -248,7 +255,7 @@ impl<L: PageLoader> ToastTable<L> {
             }
         };
 
-        let value_oid = self.next_oid.fetch_add(1, Ordering::Relaxed);
+        let value_oid = self.allocate_value_oid()?;
         let mut tids = Vec::new();
 
         let opts = InsertOptions {
@@ -274,6 +281,27 @@ impl<L: PageLoader> ToastTable<L> {
             raw_size,
             compressed_size,
         })
+    }
+
+    fn allocate_value_oid(&self) -> Result<u64, ToastError> {
+        loop {
+            let current = self.next_oid.load(Ordering::Relaxed);
+            if current == 0 || current == u64::MAX {
+                return Err(ToastError::OidExhausted {
+                    rel: self.rel.oid().raw(),
+                });
+            }
+            let next = current.checked_add(1).ok_or(ToastError::OidExhausted {
+                rel: self.rel.oid().raw(),
+            })?;
+            match self
+                .next_oid
+                .compare_exchange(current, next, Ordering::AcqRel, Ordering::Relaxed)
+            {
+                Ok(_) => return Ok(current),
+                Err(_) => continue,
+            }
+        }
     }
 
     /// Fetch and reassemble the value identified by `ptr`.
@@ -628,5 +656,16 @@ mod tests {
 
         let err = table.fetch(&ptr).unwrap_err();
         assert!(matches!(err, ToastError::SizeMismatch { .. }));
+    }
+
+    #[test]
+    fn store_rejects_value_oid_exhaustion_without_wrapping() {
+        let table = make_toast(12);
+        table.next_oid.store(u64::MAX, Ordering::Relaxed);
+        let data: Vec<u8> = vec![7u8; 3000];
+
+        let err = table.store(&data).unwrap_err();
+        assert!(matches!(err, ToastError::OidExhausted { .. }));
+        assert_eq!(table.next_oid.load(Ordering::Relaxed), u64::MAX);
     }
 }

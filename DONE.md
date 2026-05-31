@@ -2142,3 +2142,6 @@ as a concise evidence ledger; roadmap stays for open gates only.
 - TOAST storage now rejects values that cannot fit the on-disk 32-bit size
   fields and validates fetched chunk bytes against pointer metadata. Evidence:
   `cargo test -p ultrasql-storage toast::tests --lib -- --nocapture`.
+- TOAST external value IDs now use a checked compare-exchange allocator and
+  reject counter exhaustion before wrapping into invalid/reserved IDs. Evidence:
+  `cargo test -p ultrasql-storage toast::tests::store_rejects_value_oid_exhaustion_without_wrapping --lib -- --nocapture`.
