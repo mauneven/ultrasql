@@ -4171,7 +4171,7 @@ fn push_direct_q1_columns(
             extendedprice,
             discount,
             tax,
-        );
+        )?;
     }
     if (DIRECT_Q6_SHIPDATE_START_1994_01_01..DIRECT_Q6_SHIPDATE_END_1995_01_01).contains(&shipdate)
         && (DIRECT_Q6_DISCOUNT_MIN..=DIRECT_Q6_DISCOUNT_MAX).contains(&discount)
@@ -4191,7 +4191,14 @@ fn add_direct_q1_summary_row(
     extendedprice: i64,
     discount: i64,
     tax: i64,
-) {
+) -> Result<()> {
+    let discount_factor = checked_direct_q1_sub(100, discount)?;
+    let tax_factor = checked_direct_q1_add_i64(100, tax)?;
+    let discounted_product =
+        checked_direct_q1_mul_i128(i128::from(extendedprice), i128::from(discount_factor))?;
+    let disc_price = discounted_product / 100;
+    let charge = checked_direct_q1_mul_i128(discounted_product, i128::from(tax_factor))? / 10_000;
+
     let row = if let Some(pos) = cache
         .summary_rows
         .iter()
@@ -4207,16 +4214,42 @@ fn add_direct_q1_summary_row(
         let pos = cache.summary_rows.len() - 1;
         &mut cache.summary_rows[pos]
     };
-    row.sum_qty += i128::from(quantity);
-    row.sum_base_price += i128::from(extendedprice);
-    row.sum_disc_price +=
-        i128::from(extendedprice) * i128::from(100_i64.saturating_sub(discount)) / 100;
-    row.sum_charge += i128::from(extendedprice)
-        * i128::from(100_i64.saturating_sub(discount))
-        * i128::from(100_i64.saturating_add(tax))
-        / 10_000;
-    row.sum_discount += i128::from(discount);
-    row.count = row.count.saturating_add(1);
+    row.sum_qty = checked_direct_q1_add_i128(row.sum_qty, i128::from(quantity))?;
+    row.sum_base_price = checked_direct_q1_add_i128(row.sum_base_price, i128::from(extendedprice))?;
+    row.sum_disc_price = checked_direct_q1_add_i128(row.sum_disc_price, disc_price)?;
+    row.sum_charge = checked_direct_q1_add_i128(row.sum_charge, charge)?;
+    row.sum_discount = checked_direct_q1_add_i128(row.sum_discount, i128::from(discount))?;
+    row.count = checked_direct_q1_add_i64(row.count, 1)?;
+    Ok(())
+}
+
+#[cfg(feature = "sql-bench")]
+fn direct_q1_summary_overflow() -> anyhow::Error {
+    anyhow::anyhow!("TPC-H Q1 summary overflow")
+}
+
+#[cfg(feature = "sql-bench")]
+fn checked_direct_q1_add_i64(left: i64, right: i64) -> Result<i64> {
+    left.checked_add(right)
+        .ok_or_else(direct_q1_summary_overflow)
+}
+
+#[cfg(feature = "sql-bench")]
+fn checked_direct_q1_sub(left: i64, right: i64) -> Result<i64> {
+    left.checked_sub(right)
+        .ok_or_else(direct_q1_summary_overflow)
+}
+
+#[cfg(feature = "sql-bench")]
+fn checked_direct_q1_add_i128(left: i128, right: i128) -> Result<i128> {
+    left.checked_add(right)
+        .ok_or_else(direct_q1_summary_overflow)
+}
+
+#[cfg(feature = "sql-bench")]
+fn checked_direct_q1_mul_i128(left: i128, right: i128) -> Result<i128> {
+    left.checked_mul(right)
+        .ok_or_else(direct_q1_summary_overflow)
 }
 
 #[cfg(feature = "sql-bench")]
@@ -4738,6 +4771,29 @@ mod tests {
         assert_eq!(rows[0].n_name, "GERMANY");
         assert_eq!(rows[0].p_partkey, 200);
         assert_eq!(rows[0].p_mfgr, "MFGR#1");
+    }
+
+    #[cfg(feature = "sql-bench")]
+    #[test]
+    fn tpch_q1_direct_sidecar_rejects_discount_factor_overflow() {
+        let mut cache = ultrasql_server::TpchQ1ColumnarCache::default();
+        let mut payload = vec![0, 0];
+        for value in [1_i32, 2, 3, 4] {
+            payload.extend_from_slice(&value.to_le_bytes());
+        }
+        for value in [100_i64, 1_000, i64::MIN, 0] {
+            encode_direct_decimal(&mut payload, value, 2, 0).expect("decimal payload");
+        }
+        payload.extend_from_slice(&1_u32.to_le_bytes());
+        payload.push(b'N');
+        payload.extend_from_slice(&1_u32.to_le_bytes());
+        payload.push(b'O');
+        payload.extend_from_slice(&DIRECT_Q1_SHIPDATE_CUTOFF_1998_09_02.to_le_bytes());
+
+        let err = push_direct_q1_columns(&payload, &mut cache)
+            .expect_err("discount factor overflow should reject");
+
+        assert!(err.to_string().contains("TPC-H Q1 summary overflow"));
     }
 
     #[cfg(feature = "sql-bench")]

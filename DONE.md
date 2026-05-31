@@ -1981,3 +1981,7 @@ as a concise evidence ledger; roadmap stays for open gates only.
   `cargo test -p ultrasql-server pipeline::tpch_q1::tests --lib -- --nocapture`,
   `cargo test -p ultrasql-server pipeline::tests::tpch_sidecars --lib -- --nocapture`,
   and `cargo test -p ultrasql-bench tpch_q1 --lib -- --nocapture`.
+- TPC-H direct-load Q1 summary sidecars now reject malformed discount/tax
+  factors and checked `i128` accumulation overflow instead of saturating the
+  factor math before cached execution. Evidence:
+  `cargo test -p ultrasql-bench --features sql-bench tpch::load::tests --lib -- --nocapture`.
