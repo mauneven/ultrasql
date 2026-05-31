@@ -58,7 +58,12 @@ impl RoleConnectionLimiter {
             }
         }
 
-        counts.insert(role, active.saturating_add(1));
+        let next_active = active.checked_add(1).ok_or_else(|| ConnectionLimitError {
+            role: role.clone(),
+            limit,
+            active,
+        })?;
+        counts.insert(role, next_active);
         Ok(())
     }
 
@@ -113,5 +118,24 @@ mod tests {
             .try_acquire("app", 1)
             .expect_err("existing session consumes later limit");
         assert_eq!(err.active, 1);
+    }
+
+    #[test]
+    fn active_counter_overflow_rejects_login() {
+        let limiter = RoleConnectionLimiter::new();
+        limiter.counts.lock().insert("app".to_owned(), u32::MAX);
+
+        let err = limiter
+            .try_acquire("app", -1)
+            .expect_err("overflow must reject login");
+
+        assert_eq!(
+            err,
+            ConnectionLimitError {
+                role: "app".to_owned(),
+                limit: -1,
+                active: u32::MAX,
+            }
+        );
     }
 }

@@ -174,6 +174,12 @@ as a concise evidence ledger; roadmap stays for open gates only.
   `cargo test -p ultrasql-server auth::pg_authid::tests --lib -- --nocapture`,
   `cargo clippy -p ultrasql-server --lib --all-features -- -D clippy::unwrap_used -D clippy::expect_used`,
   and `cargo clippy -p ultrasql-server --all-targets --all-features -- -D warnings`.
+- Per-role connection-limit accounting now rejects active-session counter
+  overflow instead of accepting an untracked extra session after `u32::MAX`.
+  Evidence:
+  `cargo test -p ultrasql-server auth::connection_limit::tests --lib -- --nocapture`,
+  `cargo clippy -p ultrasql-server --lib --all-features -- -D clippy::unwrap_used -D clippy::expect_used`,
+  and `cargo clippy -p ultrasql-server --all-targets --all-features -- -D warnings`.
 - Backup/restore smoke runner covers `ultrasql --basebackup`,
   `ultrasql --pg-dump`, `ultrasql --pg-restore`, row counts, and indexed lookup.
 - Backup/restore dump-format certification now covers custom, directory, and
