@@ -2125,6 +2125,15 @@ fn rows_pg_settings(ctx: &LowerCtx<'_>) -> Vec<Vec<Value>> {
             v_text("internal"),
         ],
         vec![
+            v_text("server_version_num"),
+            v_text("140000"),
+            Value::Null,
+            v_text("Preset Options"),
+            v_text("Server version number reported to drivers."),
+            v_text("integer"),
+            v_text("internal"),
+        ],
+        vec![
             v_text("server_encoding"),
             v_text("UTF8"),
             Value::Null,
@@ -2195,6 +2204,15 @@ fn rows_pg_settings(ctx: &LowerCtx<'_>) -> Vec<Vec<Value>> {
             v_text("Sets the locale for formatting monetary amounts."),
             v_text("string"),
             v_text("user"),
+        ],
+        vec![
+            v_text("max_identifier_length"),
+            v_text("63"),
+            Value::Null,
+            v_text("Preset Options"),
+            v_text("Shows the maximum identifier length in bytes."),
+            v_text("integer"),
+            v_text("internal"),
         ],
         vec![
             v_text("search_path"),

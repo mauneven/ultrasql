@@ -654,6 +654,10 @@ as a concise evidence ledger; roadmap stays for open gates only.
   setting and reset state while preserving the `ms` unit, so the enforced
   timeout is visible through catalog introspection. Evidence:
   `cargo test -p ultrasql-server --test catalog_views_round_trip pg_settings_reflects_statement_timeout -- --nocapture`.
+- `pg_catalog.pg_settings` now exposes static driver defaults for
+  `server_version_num` and `max_identifier_length`, matching the `SHOW` surface
+  many clients probe during startup. Evidence:
+  `cargo test -p ultrasql-server --test catalog_views_round_trip pg_settings_exposes_static_driver_defaults -- --nocapture`.
 - `pg_catalog.pg_collation` now exposes base `default`, `C`, and `POSIX`
   catalog rows instead of an empty relation, unblocking ORM and GUI
   introspection probes that join collation metadata. Evidence:

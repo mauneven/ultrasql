@@ -1169,6 +1169,29 @@ async fn pg_settings_reflects_statement_timeout() {
 }
 
 #[tokio::test]
+async fn pg_settings_exposes_static_driver_defaults() {
+    let (_server, client, _conn, server_handle) = start_server_and_connect().await;
+
+    for (name, expected) in [
+        ("max_identifier_length", "63"),
+        ("server_version_num", "140000"),
+    ] {
+        let row = client
+            .query_one(
+                "SELECT setting \
+                 FROM pg_catalog.pg_settings \
+                 WHERE name = $1",
+                &[&name],
+            )
+            .await
+            .expect("pg_settings static driver default");
+        assert_eq!(row.get::<_, String>(0), expected, "{name}");
+    }
+
+    shutdown(client, server_handle).await;
+}
+
+#[tokio::test]
 async fn pg_stat_activity_reflects_session_identity() {
     let (_server, client, _conn, server_handle) = start_server_and_connect().await;
 
