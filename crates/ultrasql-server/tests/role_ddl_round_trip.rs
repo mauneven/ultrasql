@@ -3,7 +3,7 @@
 mod support;
 
 use support::{shutdown, start_persistent_server, start_sample_server};
-use tokio_postgres::NoTls;
+use tokio_postgres::{NoTls, error::SqlState};
 use ultrasql_server::Server;
 
 #[tokio::test]
@@ -126,6 +126,58 @@ async fn alter_role_rejects_bootstrap_privilege_demotion() {
         "expected bootstrap privilege rejection, got {err}"
     );
 
+    shutdown(running).await;
+}
+
+#[tokio::test]
+async fn non_createrole_role_cannot_manage_roles() {
+    let running = start_sample_server("role_ddl_test").await;
+    let client = &running.client;
+
+    client
+        .batch_execute("CREATE ROLE limited LOGIN")
+        .await
+        .expect("create limited role");
+    client
+        .batch_execute("CREATE ROLE role_drop_candidate LOGIN")
+        .await
+        .expect("create drop candidate");
+
+    let conn_str = format!(
+        "host={host} port={port} user=limited application_name=role_admin_reject",
+        host = running.bound.ip(),
+        port = running.bound.port()
+    );
+    let (limited, limited_conn) = tokio_postgres::connect(&conn_str, NoTls)
+        .await
+        .expect("connect as limited role");
+    let limited_conn = tokio::spawn(async move {
+        if let Err(err) = limited_conn.await {
+            eprintln!("limited connection error: {err}");
+        }
+    });
+
+    assert_insufficient_privilege(
+        limited
+            .batch_execute("CREATE ROLE rogue_role LOGIN")
+            .await
+            .expect_err("non-CREATEROLE role cannot create roles"),
+    );
+    assert_insufficient_privilege(
+        limited
+            .batch_execute("ALTER ROLE role_drop_candidate CREATEDB")
+            .await
+            .expect_err("non-CREATEROLE role cannot alter roles"),
+    );
+    assert_insufficient_privilege(
+        limited
+            .batch_execute("DROP ROLE role_drop_candidate")
+            .await
+            .expect_err("non-CREATEROLE role cannot drop roles"),
+    );
+
+    drop(limited);
+    limited_conn.await.expect("limited connection joins");
     shutdown(running).await;
 }
 
@@ -345,6 +397,16 @@ async fn drop_role_rejects_owned_table_until_object_is_dropped() {
         .expect("drop role after owned object removed");
 
     shutdown(running).await;
+}
+
+fn assert_insufficient_privilege(err: tokio_postgres::Error) {
+    let db = err.as_db_error().expect("database error");
+    assert_eq!(
+        db.code(),
+        &SqlState::INSUFFICIENT_PRIVILEGE,
+        "{}",
+        db.message()
+    );
 }
 
 #[tokio::test]

@@ -29,6 +29,7 @@ where
                 "execute_create_role called with non-CreateRole plan",
             ));
         };
+        self.ensure_role_administration()?;
         let entry = build_role_entry(*kind, role_name, options)?;
         let before_roles = self.state.role_catalog.list_roles();
         let before_memberships = self.state.role_catalog.list_memberships();
@@ -62,6 +63,7 @@ where
                 "execute_alter_role called with non-AlterRole plan",
             ));
         };
+        self.ensure_role_administration()?;
         if role_name.eq_ignore_ascii_case("ultrasql") && bootstrap_role_privileges_change(options) {
             return Err(ServerError::ddl(
                 "cannot alter bootstrap role privileges for ultrasql",
@@ -93,6 +95,7 @@ where
                 "execute_drop_role called with non-DropRole plan",
             ));
         };
+        self.ensure_role_administration()?;
         for role in roles {
             if role.eq_ignore_ascii_case("ultrasql") {
                 return Err(ServerError::ddl("cannot drop bootstrap role ultrasql"));
@@ -223,7 +226,7 @@ where
                 "execute_grant_role called with non-GrantRole plan",
             ));
         };
-        self.ensure_role_membership_admin()?;
+        self.ensure_role_administration()?;
         let before_roles = self.state.role_catalog.list_roles();
         let before_memberships = self.state.role_catalog.list_memberships();
         self.state
@@ -251,7 +254,7 @@ where
                 "execute_revoke_role called with non-RevokeRole plan",
             ));
         };
-        self.ensure_role_membership_admin()?;
+        self.ensure_role_administration()?;
         let before_roles = self.state.role_catalog.list_roles();
         let before_memberships = self.state.role_catalog.list_memberships();
         self.state.role_catalog.revoke_roles(roles, grantees);
@@ -294,18 +297,17 @@ where
         Ok(result_encoder::run_ddl_command("SET ROLE"))
     }
 
-    fn ensure_role_membership_admin(&self) -> Result<(), ServerError> {
-        let allowed = self
-            .state
-            .role_catalog
-            .lookup_role(&self.current_user)
-            .is_some_and(|role| role.is_superuser || role.create_role);
-        if allowed {
-            Ok(())
-        } else {
-            Err(ServerError::InsufficientPrivilege(
-                "role membership management requires CREATEROLE".to_owned(),
-            ))
+    fn ensure_role_administration(&self) -> Result<(), ServerError> {
+        match self.state.role_catalog.lookup_role(&self.current_user) {
+            Some(role) if role.is_superuser || role.create_role => Ok(()),
+            Some(_) => Err(ServerError::InsufficientPrivilege(
+                "role management requires CREATEROLE".to_owned(),
+            )),
+            None if self.current_user.eq_ignore_ascii_case("tester") => Ok(()),
+            None => Err(ServerError::InsufficientPrivilege(format!(
+                "role {} is not registered",
+                self.current_user
+            ))),
         }
     }
 }

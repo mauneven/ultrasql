@@ -944,7 +944,8 @@ as a concise evidence ledger; roadmap stays for open gates only.
   catalog and `pg_roles` / `pg_user` visibility. `DROP ROLE` rejects the
   bootstrap `ultrasql` role before mutating catalog state, preserving the auth
   restart invariant. `ALTER ROLE ultrasql` rejects privilege/login/validity
-  demotion while still allowing password rotation.
+  demotion while still allowing password rotation. Catalogued non-`CREATEROLE`
+  roles cannot create, alter, drop, grant, or revoke roles.
 - `GRANT / REVOKE` on tables, schemas, databases, sequences, and functions work
   through privilege catalog checks.
 - Column-level privileges enforce `SELECT`, `INSERT`, and `UPDATE` target
