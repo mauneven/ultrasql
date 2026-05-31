@@ -23,7 +23,7 @@ use crate::filter_op::batch_to_rows;
 use crate::seq_scan::build_batch;
 use crate::sort::{Sort, try_compare_values_nullable};
 use crate::work_mem::WorkMemBudget;
-use crate::{ExecError, Operator, OperatorSpillProfile};
+use crate::{ExecError, Operator, OperatorSpillProfile, eval_error_to_exec_error};
 
 const BATCH_TARGET_ROWS: usize = 4096;
 
@@ -392,11 +392,7 @@ fn drain_generic_top_k_batch(
     for row in rows {
         let key_vals: Vec<Value> = keys
             .iter()
-            .map(|k| {
-                k.eval
-                    .eval(&row)
-                    .map_err(|err| ExecError::TypeMismatch(err.to_string()))
-            })
+            .map(|k| k.eval.eval(&row).map_err(eval_error_to_exec_error))
             .collect::<Result<_, _>>()?;
         keep_if_top_k(kept, row, key_vals, keys, cap)?;
     }
@@ -688,10 +684,7 @@ mod tests {
         let err = top_k
             .next_batch()
             .expect_err("top-k key error must surface");
-        assert!(
-            err.to_string().contains("division by zero"),
-            "unexpected error: {err}"
-        );
+        assert!(matches!(err, ExecError::DivisionByZero(_)), "{err:?}");
     }
 
     #[test]
