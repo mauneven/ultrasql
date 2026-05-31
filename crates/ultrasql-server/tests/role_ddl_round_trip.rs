@@ -241,6 +241,59 @@ async fn expired_role_cannot_connect() {
     shutdown(running).await;
 }
 
+#[tokio::test]
+async fn connection_limit_rejects_second_live_session() {
+    let running = start_sample_server("role_ddl_test").await;
+    let client = &running.client;
+
+    client
+        .batch_execute("CREATE ROLE one_slot LOGIN CONNECTION LIMIT 1")
+        .await
+        .expect("create limited role");
+
+    let conn_str = format!(
+        "host={host} port={port} user=one_slot application_name=connection_limit_test",
+        host = running.bound.ip(),
+        port = running.bound.port()
+    );
+    let (first, first_conn) = tokio_postgres::connect(&conn_str, NoTls)
+        .await
+        .expect("first limited connection");
+    let first_conn = tokio::spawn(async move {
+        if let Err(err) = first_conn.await {
+            eprintln!("first limited connection error: {err}");
+        }
+    });
+
+    let err = match tokio_postgres::connect(&conn_str, NoTls).await {
+        Ok(_) => panic!("second limited connection must fail"),
+        Err(err) => err,
+    };
+    let db = err.as_db_error().expect("startup ErrorResponse");
+    assert_eq!(db.code().code(), "53300");
+    assert!(
+        db.message().contains("connection limit"),
+        "expected connection limit rejection, got {}",
+        db.message()
+    );
+
+    drop(first);
+    first_conn.await.expect("first limited connection joins");
+
+    let (second, second_conn) = tokio_postgres::connect(&conn_str, NoTls)
+        .await
+        .expect("slot releases after disconnect");
+    let second_conn = tokio::spawn(async move {
+        if let Err(err) = second_conn.await {
+            eprintln!("second limited connection error: {err}");
+        }
+    });
+    drop(second);
+    second_conn.await.expect("second limited connection joins");
+
+    shutdown(running).await;
+}
+
 #[test]
 fn role_metadata_rejects_duplicate_role_names_on_rebuild() {
     let data_dir = tempfile::TempDir::new().expect("temp data dir");

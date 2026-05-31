@@ -315,7 +315,8 @@ mod tests {
 
     #[test]
     fn create_role_options_parse() {
-        let stmt = parse_create("CREATE ROLE analytics NOLOGIN CREATEDB CREATEROLE");
+        let stmt =
+            parse_create("CREATE ROLE analytics NOLOGIN CREATEDB CREATEROLE CONNECTION LIMIT 7");
         assert_eq!(stmt.kind, RoleStmtKind::Role);
         assert_eq!(stmt.name.value, "analytics");
         assert_eq!(
@@ -323,7 +324,8 @@ mod tests {
             vec![
                 RoleOption::Login(false),
                 RoleOption::CreateDb(true),
-                RoleOption::CreateRole(true)
+                RoleOption::CreateRole(true),
+                RoleOption::ConnectionLimit(7)
             ]
         );
     }

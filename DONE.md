@@ -947,6 +947,8 @@ as a concise evidence ledger; roadmap stays for open gates only.
   demotion while still allowing password rotation. Catalogued non-`CREATEROLE`
   roles cannot create, alter, drop, grant, or revoke roles. Known `NOLOGIN`
   and expired `VALID UNTIL` roles are rejected during startup authentication.
+  `CONNECTION LIMIT` parses through role DDL and is enforced at startup with
+  per-role live-session accounting that releases slots on disconnect.
 - `GRANT / REVOKE` on tables, schemas, databases, sequences, and functions work
   through privilege catalog checks; table privilege DDL now requires table
   ownership or superuser and records the actual grantor.

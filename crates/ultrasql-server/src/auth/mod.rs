@@ -20,12 +20,14 @@
 //! components synchronously from an async context. This keeps the crypto
 //! and access-control logic unit-testable without a runtime.
 
+pub mod connection_limit;
 pub mod hba;
 pub mod md5;
 pub mod pg_authid;
 pub mod privileges;
 pub mod scram;
 
+pub use connection_limit::{ConnectionLimitError, RoleConnectionLimiter};
 pub use hba::{HbaConfig, HbaConnectionKind, HbaDatabaseMatch, HbaMethod, HbaRule, HbaUserMatch};
 pub use pg_authid::{
     AuthCatalog, InMemoryAuthCatalog, PasswordHash, RoleEntry, RoleEntryChanges, RoleMembership,

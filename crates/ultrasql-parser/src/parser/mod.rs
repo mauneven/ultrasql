@@ -562,10 +562,10 @@ impl<'src> Parser<'src> {
         expected: &'static str,
     ) -> Result<Token, ParseError> {
         let tok = *self.peek()?;
-        if tok.kind == TokenKind::Identifier
-            && tok
-                .text(self.source)
-                .is_some_and(|text| text.eq_ignore_ascii_case(word))
+        if tok
+            .text(self.source)
+            .is_some_and(|text| text.eq_ignore_ascii_case(word))
+            && (tok.kind == TokenKind::Identifier || tok.kind.is_keyword())
         {
             return self.advance();
         }

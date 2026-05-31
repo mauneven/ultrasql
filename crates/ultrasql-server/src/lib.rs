@@ -2763,6 +2763,8 @@ pub struct Server {
     pub auth: AuthConfig,
     /// Same-process role catalog backing role DDL and virtual auth views.
     pub role_catalog: Arc<auth::InMemoryAuthCatalog>,
+    /// Same-process per-role live-session counter for `CONNECTION LIMIT`.
+    pub role_connection_limiter: Arc<auth::RoleConnectionLimiter>,
     /// Same-process privilege catalog backing GRANT/REVOKE behavior.
     pub privilege_catalog: Arc<auth::InMemoryPrivilegeCatalog>,
     /// Async pub-sub hub backing `LISTEN` / `NOTIFY` / `UNLISTEN`.
@@ -4133,6 +4135,7 @@ impl Server {
             two_phase,
             auth: AuthConfig::Trust,
             role_catalog: Arc::new(auth::InMemoryAuthCatalog::with_bootstrap_superuser()),
+            role_connection_limiter: Arc::new(auth::RoleConnectionLimiter::new()),
             privilege_catalog: sample_privilege_catalog(),
             notify_hub: Arc::new(notify::NotifyHub::new()),
             cancel_registry: Arc::new(cancel::CancelRegistry::new()),
@@ -4611,6 +4614,7 @@ impl Server {
             two_phase,
             auth: AuthConfig::Trust,
             role_catalog: Arc::new(auth::InMemoryAuthCatalog::with_bootstrap_superuser()),
+            role_connection_limiter: Arc::new(auth::RoleConnectionLimiter::new()),
             privilege_catalog: sample_privilege_catalog(),
             notify_hub: Arc::new(notify::NotifyHub::new()),
             cancel_registry: Arc::new(cancel::CancelRegistry::new()),

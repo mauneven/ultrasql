@@ -93,6 +93,11 @@ pub(crate) struct Session<RW> {
     /// into every [`crate::pipeline::LowerCtx`] built for an Execute /
     /// Simple Query so the executor can poll it between batches.
     pub(super) cancel_flag: ultrasql_executor::CancelFlag,
+    /// Catalogued role whose startup connection slot was admitted.
+    ///
+    /// `None` means startup failed before admission, or the peer used a
+    /// legacy uncatalogued trust user. `Drop` releases the slot when present.
+    pub(super) connection_limit_role: Option<String>,
     /// Session-local JIT enable flag, controlled by `SET jit`.
     pub(super) jit_enabled: bool,
     /// Session-local row threshold, controlled by `SET jit_above_cost`.
@@ -158,6 +163,7 @@ where
             pid,
             secret,
             cancel_flag,
+            connection_limit_role: None,
             jit_enabled: false,
             jit_above_rows: ultrasql_vec::jit::DEFAULT_JIT_ABOVE_ROWS,
             statement_timeout_ms: 0,
@@ -198,6 +204,9 @@ impl<RW> Drop for Session<RW> {
             .release_all(&self.state.txn_manager.lock_manager);
         self.state.notify_hub.deregister_connection(self.pid);
         self.state.cancel_registry.deregister(self.pid);
+        if let Some(role) = self.connection_limit_role.take() {
+            self.state.role_connection_limiter.release(&role);
+        }
         self.state.workload_recorder.deregister_session(self.pid);
     }
 }

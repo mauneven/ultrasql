@@ -225,6 +225,29 @@ where
                     .await;
                 return Err(ServerError::AuthFailed);
             }
+            if let Err(err) = self
+                .state
+                .role_connection_limiter
+                .try_acquire(&role.name, role.connection_limit)
+            {
+                let _ = self
+                    .send(&BackendMessage::ErrorResponse {
+                        fields: vec![
+                            (b'S', "FATAL".to_string()),
+                            (b'C', "53300".to_string()),
+                            (
+                                b'M',
+                                format!(
+                                    "role {} connection limit {} exceeded; {} sessions already active",
+                                    err.role, err.limit, err.active
+                                ),
+                            ),
+                        ],
+                    })
+                    .await;
+                return Err(ServerError::AuthFailed);
+            }
+            self.connection_limit_role = Some(role.name);
         }
         if self.state.logging_config.log_connections {
             let user = params
