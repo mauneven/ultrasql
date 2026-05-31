@@ -359,6 +359,12 @@ as a concise evidence ledger; roadmap stays for open gates only.
   `cargo test -p ultrasql-core xml_xpath_subset_filters_children_without_entity_resolution --lib -- --nocapture`
   and
   `cargo test -p ultrasql-server --test xml_round_trip xml_functions_validate_securely_and_extract_simple_xpath -- --nocapture`.
+- XML XPath now supports bounded `translate(path-or-literal, from, to)` over
+  the existing secure selector with XPath first-match replacement/removal
+  semantics and no external XML access. Evidence:
+  `cargo test -p ultrasql-core xml_xpath_subset_filters_children_without_entity_resolution --lib -- --nocapture`
+  and
+  `cargo test -p ultrasql-server --test xml_round_trip xml_functions_validate_securely_and_extract_simple_xpath -- --nocapture`.
 - XML XPath now supports bounded `concat(path-or-literal, ...)` over path
   first-string values and quoted string literals. Evidence:
   `cargo test -p ultrasql-core xml_xpath_subset_filters_children_without_entity_resolution --lib -- --nocapture`

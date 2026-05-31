@@ -297,6 +297,8 @@ async fn xml_functions_validate_securely_and_extract_simple_xpath() {
                         xpath('substring(/root/item, 5)', XML '<root><item>Ada Lovelace</item></root>'), \
                         xpath('substring(/root/item, 1, 3)', XML '<root><item>Ada Lovelace</item></root>'), \
                         xpath('substring-before(/root/item, \"x\")', XML '<root><item>Ada Lovelace</item></root>'), \
+                        xpath('translate(/root/item, \"abc\", \"ABC\")', XML '<root><item>database</item></root>'), \
+                        xpath('translate(/root/item, \"ae\", \"\")', XML '<root><item>database</item></root>'), \
                         xpath('concat(/root/first, \" \", /root/last)', XML '<root><first>Ada</first><last>Lovelace</last></root>'), \
                         xpath('concat(\"prefix-\", /root/missing)', XML '<root><first>Ada</first></root>'), \
                         xpath('number(/root/value)', XML '<root><value> 42.5 </value></root>'), \
@@ -354,6 +356,8 @@ async fn xml_functions_validate_securely_and_extract_simple_xpath() {
             "{Lovelace}".to_owned(),
             "{Ada}".to_owned(),
             r#"{""}"#.to_owned(),
+            "{dAtABAse}".to_owned(),
+            "{dtbs}".to_owned(),
             r#"{"Ada Lovelace"}"#.to_owned(),
             "{prefix-}".to_owned(),
             "{42.5}".to_owned(),

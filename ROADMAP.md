@@ -91,6 +91,7 @@ file focused on what still blocks production.
   `string-length()` / `contains(path, literal)` / `starts-with(path, literal)` /
   `substring-before(path, literal)` / `substring-after(path, literal)` /
   `substring(path-or-literal, start[, length])` /
+  `translate(path-or-literal, from, to)` /
   `concat(path-or-literal, ...)` subset, numeric `number()` / `floor()` /
   `ceiling()` / `round()` / `sum()` subset, plus full `XMLTABLE` beyond the
   completed typed scalar/default projection subset.

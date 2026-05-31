@@ -1351,6 +1351,24 @@ pub fn xml_xpath_element_fragments_with_namespaces(
             arguments.length,
         )]);
     }
+    if let Some(arguments) = xml_xpath_translate_arguments(path) {
+        let value = match arguments.source {
+            XmlXPathValueArgument::Path(inner_path) => {
+                let matches = xml_xpath_element_fragments_with_namespaces(
+                    inner_path,
+                    document,
+                    namespace_bindings,
+                )?;
+                xml_xpath_first_string_value(&matches)
+            }
+            XmlXPathValueArgument::Literal(value) => value,
+        };
+        return Some(vec![xml_xpath_translate_value(
+            &value,
+            &arguments.from,
+            &arguments.to,
+        )]);
+    }
     if let Some(arguments) = xml_xpath_concat_arguments(path) {
         let mut out = String::new();
         for argument in arguments {
@@ -1547,6 +1565,13 @@ struct XmlXPathSubstringArguments<'a> {
     length: Option<f64>,
 }
 
+#[derive(Debug)]
+struct XmlXPathTranslateArguments<'a> {
+    source: XmlXPathValueArgument<'a>,
+    from: String,
+    to: String,
+}
+
 fn xml_xpath_substring_arguments(path: &str) -> Option<XmlXPathSubstringArguments<'_>> {
     let trimmed = path.trim();
     let inner = trimmed
@@ -1567,6 +1592,25 @@ fn xml_xpath_substring_arguments(path: &str) -> Option<XmlXPathSubstringArgument
             .map(|part| part.trim().parse::<f64>())
             .transpose()
             .ok()?,
+    })
+}
+
+fn xml_xpath_translate_arguments(path: &str) -> Option<XmlXPathTranslateArguments<'_>> {
+    let trimmed = path.trim();
+    let inner = trimmed
+        .strip_prefix("translate")?
+        .trim_start()
+        .strip_prefix('(')?
+        .strip_suffix(')')?
+        .trim();
+    let parts = xml_xpath_top_level_comma_split(inner)?;
+    if parts.len() != 3 {
+        return None;
+    }
+    Some(XmlXPathTranslateArguments {
+        source: xml_xpath_value_argument(parts[0])?,
+        from: unquote_xml_path_literal(parts[1].trim())?,
+        to: unquote_xml_path_literal(parts[2].trim())?,
     })
 }
 
@@ -2118,6 +2162,23 @@ fn xml_xpath_substring_value(value: &str, start: f64, length: Option<f64>) -> St
             (position >= start && end.is_none_or(|end| position < end)).then_some(ch)
         })
         .collect()
+}
+
+fn xml_xpath_translate_value(value: &str, from: &str, to: &str) -> String {
+    let from_chars: Vec<char> = from.chars().collect();
+    let to_chars: Vec<char> = to.chars().collect();
+    let mut out = String::with_capacity(value.len());
+    for ch in value.chars() {
+        match from_chars.iter().position(|candidate| *candidate == ch) {
+            Some(idx) => {
+                if let Some(replacement) = to_chars.get(idx) {
+                    out.push(*replacement);
+                }
+            }
+            None => out.push(ch),
+        }
+    }
+    out
 }
 
 fn xml_element_string_value(text: &str, element: &XmlElement) -> String {
@@ -3742,6 +3803,20 @@ mod tests {
                 r#"<root><item>Ada Lovelace</item></root>"#
             ),
             Some(vec![String::new()])
+        );
+        assert_eq!(
+            xml_xpath_element_fragments(
+                r#"translate(/root/item, "abc", "ABC")"#,
+                r#"<root><item>database</item></root>"#
+            ),
+            Some(vec!["dAtABAse".to_owned()])
+        );
+        assert_eq!(
+            xml_xpath_element_fragments(
+                r#"translate(/root/item, "ae", "")"#,
+                r#"<root><item>database</item></root>"#
+            ),
+            Some(vec!["dtbs".to_owned()])
         );
         assert_eq!(
             xml_xpath_element_fragments(
