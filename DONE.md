@@ -2208,3 +2208,6 @@ as a concise evidence ledger; roadmap stays for open gates only.
   bounds instead of saturating decode offsets on malformed tuple payloads.
   Evidence:
   `cargo test -p ultrasql-executor row_codec::tests::checked_fixed_end_rejects_overflow --lib -- --nocapture`.
+- Binary COPY payload decoding now checks extension, field, and fixed-width
+  offsets instead of saturating malformed input positions. Evidence:
+  `cargo test -p ultrasql-server session::copy::tests::binary_copy_end_rejects_overflow --lib -- --nocapture`.

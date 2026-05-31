@@ -1811,12 +1811,7 @@ fn decode_binary_copy_payload(
     }
     let ext_len = usize::try_from(ext_len)
         .map_err(|_| ServerError::CopyFormat("invalid binary COPY extension".to_string()))?;
-    pos = pos.saturating_add(ext_len);
-    if pos > bytes.len() {
-        return Err(ServerError::CopyFormat(
-            "truncated binary COPY extension".to_string(),
-        ));
-    }
+    pos = binary_copy_end(pos, ext_len, bytes.len(), "binary COPY extension")?;
 
     let mut payloads = Vec::new();
     loop {
@@ -1845,12 +1840,7 @@ fn decode_binary_copy_payload(
                 let len = usize::try_from(len).map_err(|_| {
                     ServerError::CopyFormat("invalid binary COPY field length".to_string())
                 })?;
-                let end = pos.saturating_add(len);
-                if end > bytes.len() {
-                    return Err(ServerError::CopyFormat(
-                        "truncated binary COPY field".to_string(),
-                    ));
-                }
+                let end = binary_copy_end(pos, len, bytes.len(), "binary COPY field")?;
                 let target_idx = columns.get(stream_idx).copied().unwrap_or(stream_idx);
                 let dtype = &entry.schema.field_at(target_idx).data_type;
                 let value = decode_binary_copy_cell(
@@ -1875,20 +1865,14 @@ fn decode_binary_copy_payload(
 }
 
 fn read_i16_be(bytes: &[u8], pos: &mut usize) -> Result<i16, ServerError> {
-    let end = pos.saturating_add(2);
-    if end > bytes.len() {
-        return Err(ServerError::CopyFormat("truncated binary COPY".to_string()));
-    }
+    let end = binary_copy_end(*pos, 2, bytes.len(), "binary COPY")?;
     let out = i16::from_be_bytes([bytes[*pos], bytes[*pos + 1]]);
     *pos = end;
     Ok(out)
 }
 
 fn read_i32_be(bytes: &[u8], pos: &mut usize) -> Result<i32, ServerError> {
-    let end = pos.saturating_add(4);
-    if end > bytes.len() {
-        return Err(ServerError::CopyFormat("truncated binary COPY".to_string()));
-    }
+    let end = binary_copy_end(*pos, 4, bytes.len(), "binary COPY")?;
     let out = i32::from_be_bytes([
         bytes[*pos],
         bytes[*pos + 1],
@@ -1897,6 +1881,21 @@ fn read_i32_be(bytes: &[u8], pos: &mut usize) -> Result<i32, ServerError> {
     ]);
     *pos = end;
     Ok(out)
+}
+
+fn binary_copy_end(
+    pos: usize,
+    len: usize,
+    total: usize,
+    context: &str,
+) -> Result<usize, ServerError> {
+    let end = pos.checked_add(len).ok_or_else(|| {
+        ServerError::CopyFormat(format!("{context} offset overflow: pos={pos} len={len}"))
+    })?;
+    if end > total {
+        return Err(ServerError::CopyFormat(format!("truncated {context}")));
+    }
+    Ok(end)
 }
 
 fn decode_binary_copy_cell(
@@ -3220,6 +3219,12 @@ b"#
     fn copy_binary_take_limit_rejects_overflow() {
         let err = copy_binary_take_limit(u64::MAX).unwrap_err();
         assert!(err.to_string().contains("read limit is too large"));
+    }
+
+    #[test]
+    fn binary_copy_end_rejects_overflow() {
+        let err = binary_copy_end(usize::MAX, 1, 0, "binary COPY field").unwrap_err();
+        assert!(err.to_string().contains("offset overflow"));
     }
 
     fn copy_env_test_lock() -> std::sync::MutexGuard<'static, ()> {
