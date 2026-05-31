@@ -590,6 +590,40 @@ async fn primary_key_allows_update_of_non_key_columns() {
     graceful_shutdown(running).await;
 }
 
+/// Runtime errors inside ON CONFLICT DO UPDATE assignments keep their
+/// SQLSTATE and leave the existing row unchanged.
+#[tokio::test]
+async fn on_conflict_assignment_runtime_cast_error_returns_22p02() {
+    let running = start_sample_server("constraint_conflict_cast_test").await;
+    let client = &running.client;
+
+    client
+        .batch_execute(
+            "CREATE TABLE t (id INT PRIMARY KEY, raw TEXT, v INT);
+             INSERT INTO t VALUES (1, 'not-int', 0)",
+        )
+        .await
+        .expect("setup");
+
+    let err = client
+        .batch_execute(
+            "INSERT INTO t VALUES (1, 'not-int', 9)
+             ON CONFLICT (id) DO UPDATE SET v = CAST(excluded.raw AS INTEGER)",
+        )
+        .await
+        .expect_err("ON CONFLICT assignment runtime cast rejects row");
+    let sqlstate = err.code().expect("server-sent SQLSTATE present");
+    assert_eq!(sqlstate.code(), "22P02");
+
+    let row = client
+        .query_one("SELECT v FROM t WHERE id = 1", &[])
+        .await
+        .expect("select after rejected ON CONFLICT assignment");
+    assert_eq!(row.get::<_, i32>(0), 0);
+
+    graceful_shutdown(running).await;
+}
+
 #[tokio::test]
 async fn primary_key_survives_add_column_then_update() {
     let running = start_sample_server("constraint_pk_alter_update_test").await;

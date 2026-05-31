@@ -1828,6 +1828,10 @@ as a concise evidence ledger; roadmap stays for open gates only.
   preserve their typed SQLSTATEs and are evaluated before heap mutation, so the
   rejected insert leaves no row behind. Evidence:
   `cargo test -p ultrasql-server --test returning_round_trip insert_returning_runtime_error_is_atomic -- --nocapture`.
+- Runtime errors inside `ON CONFLICT DO UPDATE SET` assignment evaluation now
+  preserve their typed SQLSTATEs and leave the existing row unchanged.
+  Evidence:
+  `cargo test -p ultrasql-server --test constraint_round_trip on_conflict_assignment_runtime_cast_error_returns_22p02 -- --nocapture`.
 - Runtime scalar/temporal text casts to integer, float, boolean, date, time,
   timestamp, timestamptz, and timetz now report SQLSTATE `22P02` for invalid
   column text. Evidence:

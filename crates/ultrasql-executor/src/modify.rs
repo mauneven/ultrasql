@@ -1529,7 +1529,7 @@ impl<L: PageLoader + Send + Sync + std::fmt::Debug + 'static> ModifyTable<L> {
             }
             new_row[*col_idx] = evaluator
                 .eval(&eval_row)
-                .map_err(|e| ExecError::TypeMismatch(e.to_string()))?;
+                .map_err(eval_error_to_exec_error)?;
         }
         self.apply_generated_stored(&mut new_row)?;
         check_not_null_violations(&new_row, self.codec.schema())?;
