@@ -1071,6 +1071,12 @@ async fn pg_settings_reflects_active_transaction_isolation() {
 async fn pg_stat_activity_reflects_session_identity() {
     let (_server, client, _conn, server_handle) = start_server_and_connect().await;
 
+    let startup_app = client
+        .query_one("SHOW application_name", &[])
+        .await
+        .expect("startup application_name");
+    assert_eq!(startup_app.get::<_, String>(0), "catalog_views_test");
+
     client
         .batch_execute("SET application_name = 'activity_probe'")
         .await

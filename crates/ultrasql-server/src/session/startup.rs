@@ -109,6 +109,16 @@ where
             .map_or("tester", |(_, value)| value.as_str());
         self.auth_user = startup_user.to_ascii_lowercase();
         self.current_user = self.auth_user.clone();
+        let startup_application_name = params
+            .iter()
+            .find(|(key, _)| key == "application_name")
+            .map_or("", |(_, value)| value.as_str());
+        if !startup_application_name.is_empty() {
+            self.session_settings.insert(
+                "application_name".to_owned(),
+                startup_application_name.to_owned(),
+            );
+        }
 
         // Authentication. The default `Trust` policy short-circuits to
         // `AuthenticationOk`. The `Md5` policy runs the standard
@@ -204,7 +214,7 @@ where
             ("integer_datetimes", "on"),
             ("standard_conforming_strings", "on"),
             ("extra_float_digits", "1"),
-            ("application_name", ""),
+            ("application_name", startup_application_name),
             ("is_superuser", "off"),
             ("session_authorization", startup_user),
             ("in_hot_standby", "off"),
