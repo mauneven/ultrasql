@@ -6,7 +6,8 @@
 use ultrasql_core::{
     BitString, DataType, Lsn, NetworkValue, Oid, Value, decode_pg_money_binary,
     decode_pg_numeric_binary, encode_pg_money_binary, encode_pg_numeric_binary, parse_decimal_text,
-    parse_money_text, parse_time_text, parse_timetz_text, unpack_timetz,
+    parse_money_text, parse_time_text, parse_timestamp_text, parse_timestamptz_text,
+    parse_timetz_text, unpack_timetz,
 };
 use ultrasql_planner::LogicalPlan;
 use ultrasql_protocol::{BackendMessage, FieldDescription};
@@ -129,6 +130,12 @@ fn decode_param_text(bytes: &[u8], oid: Option<u32>) -> Result<Value, DecodeErro
         PG_OID_XML => validate_xml_text_param(s).map(Value::Xml),
         PG_OID_TIME => parse_time_text(s)
             .map(Value::Time)
+            .ok_or(DecodeError::BadBytes),
+        PG_OID_TIMESTAMP => parse_timestamp_text(s)
+            .map(Value::Timestamp)
+            .ok_or(DecodeError::BadBytes),
+        PG_OID_TIMESTAMPTZ => parse_timestamptz_text(s)
+            .map(Value::TimestampTz)
             .ok_or(DecodeError::BadBytes),
         PG_OID_TIMETZ => parse_timetz_text(s)
             .map(|(micros, offset_seconds)| Value::TimeTz {
@@ -716,6 +723,10 @@ mod tests {
             Value::Xml("<root><copy/></root>".to_owned())
         );
         assert!(decode_param_text(br#"<root>"#, Some(142)).is_err());
+        assert_eq!(
+            decode_param_text(b"2000-07-01 00:00:00 America/New_York", Some(1184)).unwrap(),
+            Value::TimestampTz(15_739_200_000_000)
+        );
     }
 
     #[test]

@@ -14,7 +14,7 @@
 use ultrasql_core::{
     BitString, DataType, GeometryType, GeometryValue, MAX_VECTOR_DIMS, Oid, RangeType, RangeValue,
     Value, coerce_bpchar_text, composite_text_matches_arity, parse_decimal_text, parse_money_text,
-    parse_time_text, parse_timetz_text,
+    parse_time_text, parse_timestamptz_text, parse_timetz_text,
 };
 use ultrasql_parser::ast::{BinaryOp, Expr, Literal, ObjectName, UnaryOp};
 
@@ -1311,15 +1311,7 @@ fn parse_timestamp_literal(text: &str) -> Option<i64> {
 }
 
 fn parse_timestamptz_literal(text: &str) -> Option<i64> {
-    let trimmed = text.trim();
-    let split = trimmed.find(' ').or_else(|| trimmed.find('T'))?;
-    let date = &trimmed[..split];
-    let time = &trimmed[split + 1..];
-    let days = i64::from(parse_date_literal(date)?);
-    let (micros, offset_seconds) = parse_timetz_literal(time)?;
-    days.checked_mul(MICROS_PER_DAY)?
-        .checked_add(micros)?
-        .checked_sub(i64::from(offset_seconds).checked_mul(1_000_000)?)
+    parse_timestamptz_text(text)
 }
 
 fn parse_time_of_day_micros(text: &str) -> Option<i64> {
@@ -4732,6 +4724,10 @@ mod typed_literal_tests {
         assert_eq!(
             parse_timestamptz_literal("2000-01-02 03:04:05 EST"),
             Some(115_445_000_000)
+        );
+        assert_eq!(
+            parse_timestamptz_literal("2000-07-01 00:00:00 America/New_York"),
+            parse_timestamp_literal("2000-07-01 04:00:00")
         );
     }
 

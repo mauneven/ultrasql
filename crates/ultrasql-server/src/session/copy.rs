@@ -44,7 +44,7 @@ use ultrasql_core::{
     BitString, DataType, NetworkValue, RelationId, Schema, Value, coerce_bpchar_text,
     decode_pg_money_binary, decode_pg_numeric_binary, encode_pg_money_binary,
     encode_pg_numeric_binary, parse_decimal_text, parse_money_text, parse_time_text,
-    parse_timetz_text,
+    parse_timestamptz_text, parse_timetz_text,
 };
 use ultrasql_executor::RowCodec;
 use ultrasql_parser::Parser;
@@ -2338,27 +2338,11 @@ fn parse_copy_timestamp(s: &str, column_idx: usize) -> Result<i64, ServerError> 
 
 fn parse_copy_timestamptz(s: &str, column_idx: usize) -> Result<i64, ServerError> {
     let raw = s.trim();
-    let split = raw.find(' ').or_else(|| raw.find('T')).ok_or_else(|| {
+    parse_timestamptz_text(raw).ok_or_else(|| {
         ServerError::CopyFormat(format!(
             "column {column_idx}: invalid timestamptz literal {raw:?}"
         ))
-    })?;
-    let date_micros = i64::from(parse_copy_date(&raw[..split], column_idx)?)
-        .checked_mul(MICROS_PER_DAY)
-        .ok_or_else(|| {
-            ServerError::CopyFormat(format!("column {column_idx}: timestamptz overflow"))
-        })?;
-    let (time_micros, offset_seconds) = parse_timetz_text(&raw[split + 1..]).ok_or_else(|| {
-        ServerError::CopyFormat(format!(
-            "column {column_idx}: invalid timestamptz literal {raw:?}"
-        ))
-    })?;
-    date_micros
-        .checked_add(time_micros)
-        .and_then(|v| v.checked_sub(i64::from(offset_seconds).checked_mul(1_000_000)?))
-        .ok_or_else(|| {
-            ServerError::CopyFormat(format!("column {column_idx}: timestamptz overflow"))
-        })
+    })
 }
 
 fn parse_copy_time(s: &str, column_idx: usize) -> Result<i64, ServerError> {
@@ -2853,6 +2837,16 @@ b"#
             )
             .expect("timestamptz"),
             Value::TimestampTz(-946_684_799_000_000)
+        );
+        assert_eq!(
+            decode_copy_cell(
+                Some(b"2000-07-01 00:00:00 America/New_York"),
+                &DataType::TimestampTz,
+                0,
+                &mut cache,
+            )
+            .expect("named-zone timestamptz"),
+            Value::TimestampTz(15_739_200_000_000)
         );
         assert_eq!(
             decode_copy_cell(Some(b"xy"), &DataType::Char { len: Some(4) }, 0, &mut cache,)

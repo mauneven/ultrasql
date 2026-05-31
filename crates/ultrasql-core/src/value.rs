@@ -13,6 +13,8 @@
 use std::fmt;
 use std::hash::{Hash, Hasher};
 
+use chrono::{Days, LocalResult, NaiveDate, NaiveTime, Offset, TimeZone};
+
 use crate::bit_string::BitString;
 use crate::bpchar::{bpchar_semantic_text, coerce_bpchar_text};
 use crate::id::{Lsn, Oid};
@@ -2308,6 +2310,11 @@ fn extract_numbers(text: &str) -> Option<Vec<f64>> {
 }
 
 fn parse_date_days(text: &str) -> Option<i32> {
+    let (year, month, day) = parse_date_parts(text)?;
+    days_from_civil(year, month, day)
+}
+
+fn parse_date_parts(text: &str) -> Option<(i32, u32, u32)> {
     let mut parts = text.split('-');
     let year = parts.next()?.parse::<i32>().ok()?;
     let month = parts.next()?.parse::<u32>().ok()?;
@@ -2315,7 +2322,7 @@ fn parse_date_days(text: &str) -> Option<i32> {
     if parts.next().is_some() {
         return None;
     }
-    days_from_civil(year, month, day)
+    Some((year, month, day))
 }
 
 /// Parse PostgreSQL ISO `DATE` text into days since UltraSQL's date epoch.
@@ -2441,6 +2448,24 @@ pub fn parse_timestamp_text(text: &str) -> Option<i64> {
     days.checked_mul(MICROS_PER_DAY)?.checked_add(micros)
 }
 
+/// Parse PostgreSQL-style `TIMESTAMPTZ` text into UTC microseconds since
+/// UltraSQL's timestamp epoch.
+#[must_use]
+pub fn parse_timestamptz_text(text: &str) -> Option<i64> {
+    let (date, time) = split_timestamp_text(text)?;
+    let days = i64::from(parse_date_text(date)?);
+    let (time_token, zone_token) = split_time_and_optional_zone(time)?;
+    let micros = parse_time_token(time_token)?;
+    let offset_seconds = match zone_token {
+        Some(zone) => parse_timezone_offset(zone)
+            .or_else(|| parse_named_timezone_offset(date, micros, zone))?,
+        None => 0,
+    };
+    days.checked_mul(MICROS_PER_DAY)?
+        .checked_add(micros)?
+        .checked_sub(i64::from(offset_seconds).checked_mul(MICROS_PER_SECOND)?)
+}
+
 /// Parse PostgreSQL-style `TIMETZ` text into time-of-day and UTC offset.
 #[must_use]
 pub fn parse_timetz_text(text: &str) -> Option<(i64, i32)> {
@@ -2448,6 +2473,16 @@ pub fn parse_timetz_text(text: &str) -> Option<(i64, i32)> {
 }
 
 fn parse_time_and_optional_offset(text: &str) -> Option<(i64, Option<i32>)> {
+    let (time_token, zone_token) = split_time_and_optional_zone(text)?;
+    let micros = parse_time_token(time_token)?;
+    let offset = match zone_token {
+        Some(zone) => Some(parse_timezone_offset(zone)?),
+        None => None,
+    };
+    Some((micros, offset))
+}
+
+fn split_time_and_optional_zone(text: &str) -> Option<(&str, Option<&str>)> {
     let trimmed = text.trim();
     if trimmed.is_empty() {
         return None;
@@ -2460,12 +2495,7 @@ fn parse_time_and_optional_offset(text: &str) -> Option<(i64, Option<i32>)> {
         [first, second, third, ..] if looks_like_iso_date(first) => (*second, Some(*third)),
         _ => return None,
     };
-    let micros = parse_time_token(time_token)?;
-    let offset = match zone_token {
-        Some(zone) => Some(parse_timezone_offset(zone)?),
-        None => None,
-    };
-    Some((micros, offset))
+    Some((time_token, zone_token))
 }
 
 fn looks_like_iso_date(text: &str) -> bool {
@@ -2578,6 +2608,31 @@ fn parse_timezone_abbreviation(lower: &str) -> Option<i32> {
         _ => return None,
     };
     Some(hours * 3_600)
+}
+
+fn parse_named_timezone_offset(date_text: &str, micros: i64, zone: &str) -> Option<i32> {
+    let timezone = zone.parse::<chrono_tz::Tz>().ok()?;
+    let (year, month, day) = parse_date_parts(date_text)?;
+    let mut date = NaiveDate::from_ymd_opt(year, month, day)?;
+    let mut local_micros = micros;
+    if local_micros == MICROS_PER_DAY {
+        date = date.checked_add_days(Days::new(1))?;
+        local_micros = 0;
+    }
+    let hour = u32::try_from(local_micros / MICROS_PER_HOUR).ok()?;
+    let rem = local_micros % MICROS_PER_HOUR;
+    let minute = u32::try_from(rem / MICROS_PER_MINUTE).ok()?;
+    let rem = rem % MICROS_PER_MINUTE;
+    let second = u32::try_from(rem / MICROS_PER_SECOND).ok()?;
+    let micros = u32::try_from(rem % MICROS_PER_SECOND).ok()?;
+    let time = NaiveTime::from_hms_micro_opt(hour, minute, second, micros)?;
+    let local = date.and_time(time);
+    let resolved = match timezone.from_local_datetime(&local) {
+        LocalResult::Single(value) => value,
+        LocalResult::Ambiguous(earliest, _) => earliest,
+        LocalResult::None => return None,
+    };
+    Some(resolved.offset().fix().local_minus_utc())
 }
 
 /// Pack `TIMETZ` into an `i64` batch payload.
@@ -3217,6 +3272,14 @@ mod tests {
         assert_eq!(
             parse_time_text("2000-01-01 04:05:06.789 -08"),
             Some(14_706_789_000)
+        );
+        assert_eq!(
+            parse_timestamptz_text("2000-01-01 00:00:00 America/New_York"),
+            Some(18_000_000_000)
+        );
+        assert_eq!(
+            parse_timestamptz_text("2000-07-01 00:00:00 America/New_York"),
+            parse_timestamp_text("2000-07-01 04:00:00")
         );
         assert_eq!(parse_timetz_text("04:05 zulu"), Some((14_700_000_000, 0)));
         assert_eq!(
