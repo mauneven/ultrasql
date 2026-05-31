@@ -161,3 +161,54 @@ async fn qualified_object_ddl_uses_created_schema_namespace() {
 
     shutdown(running).await;
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn qualified_sequence_schema_survives_restart() {
+    let data_dir = tempfile::TempDir::new().expect("temp data dir");
+
+    let running = start_persistent_server(data_dir.path(), "schema_sequence_setup").await;
+    running
+        .client
+        .batch_execute("CREATE SCHEMA app; CREATE SEQUENCE app.event_seq")
+        .await
+        .expect("create qualified sequence");
+
+    let before = running
+        .client
+        .query_one(
+            "SELECT schemaname FROM pg_catalog.pg_sequences WHERE sequencename = 'event_seq'",
+            &[],
+        )
+        .await
+        .expect("query sequence schema before restart")
+        .get::<_, String>(0);
+    assert_eq!(before, "app");
+    shutdown(running).await;
+
+    let running = start_persistent_server(data_dir.path(), "schema_sequence_verify").await;
+    let after = running
+        .client
+        .query_one(
+            "SELECT schemaname FROM pg_catalog.pg_sequences WHERE sequencename = 'event_seq'",
+            &[],
+        )
+        .await
+        .expect("query sequence schema after restart")
+        .get::<_, String>(0);
+    assert_eq!(after, "app");
+
+    let restricted = running
+        .client
+        .batch_execute("DROP SCHEMA app RESTRICT")
+        .await
+        .expect_err("sequence dependency must block DROP SCHEMA RESTRICT");
+    assert_eq!(restricted.code().expect("SQLSTATE").code(), "2BP01");
+
+    running
+        .client
+        .batch_execute("DROP SEQUENCE event_seq; DROP SCHEMA app RESTRICT")
+        .await
+        .expect("drop sequence then schema");
+
+    shutdown(running).await;
+}

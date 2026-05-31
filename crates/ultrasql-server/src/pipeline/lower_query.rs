@@ -1161,6 +1161,7 @@ pub(super) fn lower_cte(
         table_constraints: Arc::clone(&ctx.table_constraints),
         sequences: Arc::clone(&ctx.sequences),
         sequence_owners: Arc::clone(&ctx.sequence_owners),
+        sequence_namespaces: Arc::clone(&ctx.sequence_namespaces),
         schemas: Arc::clone(&ctx.schemas),
         operators: Arc::clone(&ctx.operators),
         role_catalog: Arc::clone(&ctx.role_catalog),

@@ -96,14 +96,16 @@ where
         self.state
             .sequences
             .insert(sequence_name.clone(), Arc::new(seq));
-        self.state.sequence_owners.insert(
-            sequence_name.to_ascii_lowercase(),
-            self.current_user.to_ascii_lowercase(),
-        );
+        let sequence_key = sequence_name.to_ascii_lowercase();
+        self.state
+            .sequence_owners
+            .insert(sequence_key.clone(), self.current_user.to_ascii_lowercase());
+        self.state
+            .sequence_namespaces
+            .insert(sequence_key.clone(), namespace.to_ascii_lowercase());
         if let Err(err) = self.state.persist_sequence_owner_metadata() {
-            self.state
-                .sequence_owners
-                .remove(&sequence_name.to_ascii_lowercase());
+            self.state.sequence_owners.remove(&sequence_key);
+            self.state.sequence_namespaces.remove(&sequence_key);
             return Err(err);
         }
         let before_grants = self.state.privilege_catalog.list_grants();
@@ -229,6 +231,9 @@ where
             self.state.sequences.remove(name);
             self.state
                 .sequence_owners
+                .remove(&name.to_ascii_lowercase());
+            self.state
+                .sequence_namespaces
                 .remove(&name.to_ascii_lowercase());
             self.sequence_state.forget(name);
             privilege_grants_removed |= self

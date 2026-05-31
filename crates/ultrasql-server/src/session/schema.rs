@@ -122,6 +122,16 @@ where
                 dependents.push(format!("table {}", table.name));
             }
         }
+        for item in self.state.sequence_namespaces.iter() {
+            if item.value().eq_ignore_ascii_case(schema_name) {
+                dependents.push(format!("sequence {}", item.key()));
+            }
+        }
+        for ty in snapshot.enum_types_by_oid.values() {
+            if ty.schema_name.eq_ignore_ascii_case(schema_name) {
+                dependents.push(format!("type {}", ty.name));
+            }
+        }
         for ty in snapshot.composite_types_by_oid.values() {
             if ty.schema_name.eq_ignore_ascii_case(schema_name) {
                 dependents.push(format!("type {}", ty.name));

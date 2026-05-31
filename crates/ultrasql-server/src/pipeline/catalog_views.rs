@@ -2154,8 +2154,12 @@ fn rows_pg_sequences(ctx: &LowerCtx<'_>) -> Vec<Vec<Value>> {
                 .sequence_owners
                 .get(&name)
                 .map_or_else(|| "ultrasql".to_owned(), |entry| entry.value().clone());
+            let namespace = ctx
+                .sequence_namespaces
+                .get(&name)
+                .map_or_else(|| "public".to_owned(), |entry| entry.value().clone());
             vec![
-                v_text("public"),
+                v_text(namespace),
                 v_text(name),
                 v_text(owner),
                 v_text("bigint"),
@@ -4304,9 +4308,13 @@ fn rows_information_schema_sequences(ctx: &LowerCtx<'_>) -> Vec<Vec<Value>> {
     seqs.into_iter()
         .map(|(name, seq)| {
             let opts = seq.options_snapshot();
+            let namespace = ctx
+                .sequence_namespaces
+                .get(&name)
+                .map_or_else(|| "public".to_owned(), |entry| entry.value().clone());
             vec![
                 v_text("ultrasql"),
-                v_text("public"),
+                v_text(namespace),
                 v_text(name),
                 v_text("bigint"),
                 Value::Null,

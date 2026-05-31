@@ -947,6 +947,11 @@ as a concise evidence ledger; roadmap stays for open gates only.
   schemas. Evidence: `cargo test -p ultrasql-server --test
   schema_ddl_round_trip` and `cargo test -p ultrasql-server
   undefined_schema_is_query_scoped_invalid_schema_name`.
+- Qualified sequences now keep their schema in runtime metadata and catalog
+  views across restart; `DROP SCHEMA ... RESTRICT` now sees sequence and enum
+  dependencies instead of leaving orphaned namespace references. Evidence:
+  `cargo test -p ultrasql-server --test schema_ddl_round_trip
+  qualified_sequence_schema_survives_restart`.
 - `DROP ROLE` now rejects roles that still own live tables or still appear in
   object/default privilege grants, avoiding stale ownership and ACL references.
   Evidence: `cargo test -p ultrasql-server --test role_ddl_round_trip`.

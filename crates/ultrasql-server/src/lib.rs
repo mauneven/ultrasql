@@ -2747,6 +2747,8 @@ pub struct Server {
     pub sequences: Arc<dashmap::DashMap<String, Arc<ultrasql_storage::sequence::Sequence>>>,
     /// Runtime sequence owners keyed by folded sequence name.
     pub sequence_owners: Arc<dashmap::DashMap<String, String>>,
+    /// Runtime sequence namespaces keyed by folded sequence name.
+    pub sequence_namespaces: Arc<dashmap::DashMap<String, String>>,
     /// Runtime SQL schemas keyed by folded schema name.
     pub schemas: Arc<dashmap::DashMap<String, Arc<RuntimeSchema>>>,
     /// Same-process user-defined operator registry keyed by signature.
@@ -4018,6 +4020,7 @@ impl Server {
             table_constraints: Arc::clone(&self.table_constraints),
             sequences: Arc::clone(&self.sequences),
             sequence_owners: Arc::clone(&self.sequence_owners),
+            sequence_namespaces: Arc::clone(&self.sequence_namespaces),
             schemas: Arc::clone(&self.schemas),
             operators: Arc::clone(&self.operators),
             role_catalog: Arc::clone(&self.role_catalog),
@@ -4148,6 +4151,7 @@ impl Server {
             row_security: Arc::new(dashmap::DashMap::new()),
             sequences: Arc::new(dashmap::DashMap::new()),
             sequence_owners: Arc::new(dashmap::DashMap::new()),
+            sequence_namespaces: Arc::new(dashmap::DashMap::new()),
             schemas: Arc::new(dashmap::DashMap::new()),
             operators: Arc::new(dashmap::DashMap::new()),
             materialized_views: Arc::new(dashmap::DashMap::new()),
@@ -4554,6 +4558,7 @@ impl Server {
         let vm = Arc::new(VisibilityMap::new());
         let sequences = Arc::new(dashmap::DashMap::new());
         let sequence_owners = Arc::new(dashmap::DashMap::new());
+        let sequence_namespaces = Arc::new(dashmap::DashMap::new());
         let schemas = Arc::new(dashmap::DashMap::new());
 
         // 4. Replay existing WAL before accepting new appends. The recovery
@@ -4629,6 +4634,7 @@ impl Server {
             row_security: Arc::new(dashmap::DashMap::new()),
             sequences,
             sequence_owners,
+            sequence_namespaces,
             schemas,
             operators: Arc::new(dashmap::DashMap::new()),
             materialized_views: Arc::new(dashmap::DashMap::new()),
@@ -5742,13 +5748,18 @@ impl Server {
             .collect::<Vec<_>>();
         owners.sort_by(|left, right| left.0.cmp(&right.0));
 
-        let mut out = String::from("# ultrasql sequence owners v1\n");
+        let mut out = String::from("# ultrasql sequence owners v2\n");
         for (sequence_name, owner_role) in owners {
             if self.sequences.contains_key(&sequence_name) {
+                let namespace = self
+                    .sequence_namespaces
+                    .get(&sequence_name)
+                    .map_or_else(|| "public".to_owned(), |entry| entry.value().clone());
                 out.push_str(&format!(
-                    "sequence\t{}\t{}\n",
+                    "sequence\t{}\t{}\t{}\n",
                     metadata_escape(&sequence_name),
-                    metadata_escape(&owner_role)
+                    metadata_escape(&owner_role),
+                    metadata_escape(&namespace)
                 ));
             }
         }
@@ -5770,7 +5781,8 @@ impl Server {
                 continue;
             }
             let parts = line.split('\t').collect::<Vec<_>>();
-            if parts.len() != 3 || parts.first().copied() != Some("sequence") {
+            if !(parts.len() == 3 || parts.len() == 4) || parts.first().copied() != Some("sequence")
+            {
                 return Err(ServerError::ddl(format!(
                     "malformed sequence owner metadata line {}",
                     line_no + 1
@@ -5778,10 +5790,21 @@ impl Server {
             }
             let sequence_name = metadata_unescape(parts[1])?.to_ascii_lowercase();
             let owner_role = metadata_unescape(parts[2])?.to_ascii_lowercase();
-            if sequence_name.is_empty() || owner_role.is_empty() {
+            let namespace = parts
+                .get(3)
+                .map_or_else(|| Ok("public".to_owned()), |part| metadata_unescape(part))
+                .map(|schema| schema.to_ascii_lowercase())?;
+            if sequence_name.is_empty() || owner_role.is_empty() || namespace.is_empty() {
                 return Err(ServerError::ddl(format!(
                     "empty sequence owner metadata field on line {}",
                     line_no + 1
+                )));
+            }
+            if !builtin_schema_name(&namespace) && !self.schemas.contains_key(&namespace) {
+                return Err(ServerError::ddl(format!(
+                    "sequence owner metadata line {} references missing schema '{}'",
+                    line_no + 1,
+                    namespace
                 )));
             }
             if !seen_sequences.insert(sequence_name.clone()) {
@@ -5799,11 +5822,14 @@ impl Server {
                 );
                 continue;
             }
-            owners.push((sequence_name, owner_role));
+            owners.push((sequence_name, owner_role, namespace));
         }
         self.sequence_owners.clear();
-        for (sequence_name, owner_role) in owners {
-            self.sequence_owners.insert(sequence_name, owner_role);
+        self.sequence_namespaces.clear();
+        for (sequence_name, owner_role, namespace) in owners {
+            self.sequence_owners
+                .insert(sequence_name.clone(), owner_role);
+            self.sequence_namespaces.insert(sequence_name, namespace);
         }
         Ok(())
     }
@@ -7778,6 +7804,7 @@ fn run_plan_in_txn(
     table_constraints: Arc<dashmap::DashMap<ultrasql_core::Oid, Arc<TableRuntimeConstraints>>>,
     sequences: Arc<dashmap::DashMap<String, Arc<ultrasql_storage::sequence::Sequence>>>,
     sequence_owners: Arc<dashmap::DashMap<String, String>>,
+    sequence_namespaces: Arc<dashmap::DashMap<String, String>>,
     schemas: Arc<dashmap::DashMap<String, Arc<RuntimeSchema>>>,
     operators: Arc<dashmap::DashMap<String, Arc<RuntimeOperator>>>,
     role_catalog: Arc<auth::InMemoryAuthCatalog>,
@@ -7826,6 +7853,7 @@ fn run_plan_in_txn(
         table_constraints,
         sequences,
         sequence_owners,
+        sequence_namespaces,
         schemas,
         operators,
         role_catalog,
