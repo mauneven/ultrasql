@@ -486,6 +486,17 @@ fn checked_direct_quantity_add_i64(left: i64, right: i64) -> Result<i64> {
 }
 
 #[cfg(feature = "sql-bench")]
+fn direct_sidecar_count_overflow() -> anyhow::Error {
+    anyhow::anyhow!("TPC-H sidecar count overflow")
+}
+
+#[cfg(feature = "sql-bench")]
+fn checked_direct_count_add_i64(left: i64, right: i64) -> Result<i64> {
+    left.checked_add(right)
+        .ok_or_else(direct_sidecar_count_overflow)
+}
+
+#[cfg(feature = "sql-bench")]
 fn q3_fields(table: &str, line: &str, expected: usize) -> Result<Vec<String>> {
     let fields = parse_tbl_line(line).ok_or_else(|| anyhow::anyhow!("{table}: empty row"))?;
     if fields.len() != expected {
@@ -1685,9 +1696,9 @@ impl TpchQ12BuildState {
             .entry(shipmode.to_owned())
             .or_default();
         if high_priority {
-            counts.0 = counts.0.saturating_add(1);
+            counts.0 = checked_direct_count_add_i64(counts.0, 1)?;
         } else {
-            counts.1 = counts.1.saturating_add(1);
+            counts.1 = checked_direct_count_add_i64(counts.1, 1)?;
         }
         Ok(())
     }
@@ -5561,6 +5572,24 @@ mod tests {
         assert_eq!(rows[1].l_shipmode, "SHIP");
         assert_eq!(rows[1].high_line_count, 0);
         assert_eq!(rows[1].low_line_count, 1);
+    }
+
+    #[cfg(feature = "sql-bench")]
+    #[test]
+    fn tpch_q12_sidecar_rejects_count_overflow() {
+        let mut state = TpchQ12BuildState::default();
+        state
+            .ingest("orders", "10|1|O|1.00|1993-01-01|1-URGENT|clerk|0|comment")
+            .expect("urgent order");
+        state
+            .counts_by_shipmode
+            .insert("MAIL".to_owned(), (i64::MAX, 0));
+
+        let err = state
+            .ingest_lineitem_values(10, -2200, -2195, -2191, "MAIL")
+            .expect_err("count overflow should reject");
+
+        assert!(err.to_string().contains("TPC-H sidecar count overflow"));
     }
 
     #[cfg(feature = "sql-bench")]
