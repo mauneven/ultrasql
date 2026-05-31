@@ -1357,6 +1357,12 @@ pub fn xml_xpath_element_fragments_with_namespaces(
         let number = xml_xpath_number_function_value(inner_path, document, namespace_bindings)?;
         return Some(vec![xml_xpath_format_number(number.ceil())]);
     }
+    if let Some(inner_path) = xml_xpath_function_argument(path, "round") {
+        let number = xml_xpath_number_function_value(inner_path, document, namespace_bindings)?;
+        return Some(vec![xml_xpath_format_number(xml_xpath_round_number(
+            number,
+        ))]);
+    }
     if let Some(inner_path) = xml_xpath_count_argument(path) {
         let matches =
             xml_xpath_element_fragments_with_namespaces(inner_path, document, namespace_bindings)?;
@@ -1947,6 +1953,14 @@ fn xml_xpath_format_number(value: f64) -> String {
         "-Infinity".to_owned()
     } else {
         value.to_string()
+    }
+}
+
+fn xml_xpath_round_number(value: f64) -> f64 {
+    if value.is_finite() {
+        (value + 0.5).floor()
+    } else {
+        value
     }
 }
 
@@ -3521,6 +3535,20 @@ mod tests {
                 r#"<root><value>42.5</value></root>"#
             ),
             Some(vec!["NaN".to_owned()])
+        );
+        assert_eq!(
+            xml_xpath_element_fragments(
+                "round(/root/value)",
+                r#"<root><value>42.5</value></root>"#
+            ),
+            Some(vec!["43".to_owned()])
+        );
+        assert_eq!(
+            xml_xpath_element_fragments(
+                "round(/root/value)",
+                r#"<root><value>-42.5</value></root>"#
+            ),
+            Some(vec!["-42".to_owned()])
         );
         let nested = r#"<root><group><item id="1"><name>A</name></item><item id="2"><name>B</name></item></group><name>C</name></root>"#;
         assert_eq!(

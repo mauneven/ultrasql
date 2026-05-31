@@ -2799,7 +2799,7 @@ const XPATH_SUPPORTED_SUBSET: &str = concat!(
     "wildcards, text(), count(), string(), boolean(), not(), name(), ",
     "local-name(), normalize-space(), string-length(), contains(), ",
     "starts-with(), substring-before(), substring-after(), concat(), ",
-    "number(), floor(), ceiling(), namespaces, descendant paths, and basic ",
+    "number(), floor(), ceiling(), round(), namespaces, descendant paths, and basic ",
     "child::, attribute::, descendant::, and self::node() axes"
 );
 
