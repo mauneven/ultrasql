@@ -82,20 +82,9 @@ file focused on what still blocks production.
 - Full-text search remaining: native lexeme/query storage beyond the current
   text-backed representation, dictionaries, full ranking/headline parity, and
   GIN planner integration.
-- XML remaining surface: XPath axes/functions beyond the supported child,
-  attribute, descendant, self-node, wildcard, text, namespace, and bounded
-  positional predicate subset (`[n]`, `[position()=n]`, `[last()]`,
-  `[position()=last()]`) plus direct `text()="literal"` and
-  `child="literal"` equality predicates, `true()` / `false()` / `count()` /
-  `string()` /
-  `boolean()` / `not()` / `name()` / `local-name()` / `normalize-space()` /
-  `string-length()` / `contains(path, literal)` / `starts-with(path, literal)` /
-  `substring-before(path, literal)` / `substring-after(path, literal)` /
-  `substring(path-or-literal, start[, length])` /
-  `translate(path-or-literal, from, to)` /
-  `concat(path-or-literal, ...)` subset, numeric `number()` / `floor()` /
-  `ceiling()` / `round()` / `sum()` subset, plus full `XMLTABLE` beyond the
-  completed typed scalar/default projection subset.
+- XML remaining surface: XPath axes/functions beyond the bounded secure subset
+  recorded in `DONE.md`, plus full `XMLTABLE` beyond the completed typed
+  scalar/default projection subset.
 - Locale/collation remaining: ICU-backed collations, `CREATE COLLATION`,
   index/expression collation catalog deparse, and non-bytewise sort/search
   behavior beyond the supported built-in `default`/`C`/`POSIX` subset.
