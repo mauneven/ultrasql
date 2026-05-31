@@ -630,6 +630,10 @@ as a concise evidence ledger; roadmap stays for open gates only.
   `SET`, `SHOW`, and `RESET`; non-ISO output formatting remains tracked in
   `ROADMAP.md`. Evidence:
   `cargo test -p ultrasql-server --test system_functions_round_trip orm_startup_runtime_parameters_round_trip`.
+- `pg_catalog.pg_collation` now exposes base `default`, `C`, and `POSIX`
+  catalog rows instead of an empty relation, unblocking ORM and GUI
+  introspection probes that join collation metadata. Evidence:
+  `cargo test -p ultrasql-server --test catalog_views_round_trip active_record_column_definitions_probe_uses_catalog_helpers`.
 - `BIT(n)` / `BIT VARYING(n)` storage, row codec, operators, wire OIDs, COPY,
   and end-to-end tests exist.
 - `INET`, `CIDR`, `MACADDR`, and `MACADDR8` storage, operators, wire OIDs,

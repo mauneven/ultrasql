@@ -77,8 +77,9 @@ file focused on what still blocks production.
   integration beyond the current text-backed constructor / match subset.
 - XML remaining surface: namespaces, full XPath axes/functions, `XMLTABLE`,
   and function catalog parity beyond the supported secure subset.
-- Locale/collation: ICU-backed collations, `CREATE COLLATION`, and `COLLATE`
-  in definitions and `ORDER BY`.
+- Locale/collation remaining: ICU-backed collations, `CREATE COLLATION`, and
+  `COLLATE` in definitions and `ORDER BY` beyond the base
+  `pg_collation` catalog rows.
 
 ### Catalog, Roles, Privileges
 

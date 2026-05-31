@@ -782,6 +782,19 @@ async fn active_record_type_map_probe_left_joins_pg_range() {
 async fn active_record_column_definitions_probe_uses_catalog_helpers() {
     let (_server, client, _conn, server_handle) = start_server_and_connect().await;
 
+    let collations = client
+        .query(
+            "SELECT oid, collname FROM pg_catalog.pg_collation ORDER BY oid",
+            &[],
+        )
+        .await
+        .expect("pg_collation base rows");
+    assert_eq!(collations.len(), 3);
+    assert_eq!(collations[0].get::<_, u32>(0), 100);
+    assert_eq!(collations[0].get::<_, String>(1), "default");
+    assert_eq!(collations[1].get::<_, String>(1), "C");
+    assert_eq!(collations[2].get::<_, String>(1), "POSIX");
+
     client
         .batch_execute("CREATE TABLE rails_cert (id INT NOT NULL, label TEXT NOT NULL)")
         .await

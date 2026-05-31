@@ -178,7 +178,7 @@ fn virtual_rows(name: &str, ctx: &LowerCtx<'_>) -> Option<(Schema, Vec<Vec<Value
         "pg_catalog.pg_type" => Some((schema_pg_type(), rows_pg_type(ctx))),
         "pg_catalog.pg_am" => Some((schema_pg_am(), rows_pg_am())),
         "pg_catalog.pg_range" => Some((schema_pg_range(), Vec::new())),
-        "pg_catalog.pg_collation" => Some((schema_pg_collation(), Vec::new())),
+        "pg_catalog.pg_collation" => Some((schema_pg_collation(), rows_pg_collation())),
         "pg_catalog.pg_enum" => Some((schema_pg_enum(), rows_pg_enum(ctx))),
         "pg_catalog.pg_index" => Some((schema_pg_index(), rows_pg_index(ctx))),
         "pg_catalog.pg_inherits" => Some((schema_pg_inherits(), Vec::new())),
@@ -1077,6 +1077,14 @@ fn schema_pg_collation() -> Schema {
         Field::required("oid", DataType::Oid),
         Field::required("collname", text()),
     ])
+}
+
+fn rows_pg_collation() -> Vec<Vec<Value>> {
+    vec![
+        vec![Value::Oid(Oid::new(100)), v_text("default")],
+        vec![Value::Oid(Oid::new(950)), v_text("C")],
+        vec![Value::Oid(Oid::new(951)), v_text("POSIX")],
+    ]
 }
 
 fn type_category_text(ty: &DataType) -> &'static str {
