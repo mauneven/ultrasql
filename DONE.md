@@ -2201,3 +2201,6 @@ as a concise evidence ledger; roadmap stays for open gates only.
 - Object-store range readers now check cursor advancement and byte-count
   conversion instead of saturating remote object stream positions. Evidence:
   `cargo test -p ultrasql-server pipeline::object_stream::tests::object_stream_pos_add_rejects_overflow --lib -- --nocapture`.
+- Remote Parquet range readers now check cursor advancement and read-length
+  conversion instead of saturating object-store range positions. Evidence:
+  `cargo test -p ultrasql-server pipeline::parquet_scan::tests::object_range_cursor_rejects_position_overflow --lib -- --nocapture`.

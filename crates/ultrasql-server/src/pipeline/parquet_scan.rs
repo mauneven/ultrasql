@@ -356,7 +356,7 @@ impl Read for ObjectRangeReadCursor {
             return Ok(0);
         }
         let remaining = self.len - self.pos;
-        let requested = remaining.min(u64::try_from(buf.len()).unwrap_or(u64::MAX));
+        let requested = remaining.min(parquet_range_read_len(buf.len(), &self.display)?);
         let bytes = read_object_range(&self.location, self.pos, requested).map_err(|err| {
             io::Error::other(format!(
                 "read_parquet range GET {} bytes {}+{}: {err}",
@@ -365,11 +365,20 @@ impl Read for ObjectRangeReadCursor {
         })?;
         let read = bytes.len().min(buf.len());
         buf[..read].copy_from_slice(&bytes[..read]);
-        self.pos = self
-            .pos
-            .saturating_add(u64::try_from(read).unwrap_or(u64::MAX));
+        let read_len = parquet_range_read_len(read, &self.display)?;
+        self.pos = parquet_range_pos_add(self.pos, read_len, &self.display)?;
         Ok(read)
     }
+}
+
+fn parquet_range_read_len(len: usize, display: &str) -> io::Result<u64> {
+    u64::try_from(len)
+        .map_err(|_| io::Error::other(format!("{display}: range read byte count exceeds u64")))
+}
+
+fn parquet_range_pos_add(pos: u64, read_len: u64, display: &str) -> io::Result<u64> {
+    pos.checked_add(read_len)
+        .ok_or_else(|| io::Error::other(format!("{display}: range cursor position overflow")))
 }
 
 fn validate_object_range(
@@ -1744,6 +1753,13 @@ mod tests {
             "part-??.parquet",
             "part-001.parquet"
         ));
+    }
+
+    #[test]
+    fn object_range_cursor_rejects_position_overflow() {
+        let err =
+            super::parquet_range_pos_add(u64::MAX, 1, "s3://bucket/file.parquet").unwrap_err();
+        assert!(err.to_string().contains("range cursor position overflow"));
     }
 
     #[cfg(unix)]
