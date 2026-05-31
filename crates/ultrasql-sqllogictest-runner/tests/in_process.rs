@@ -457,6 +457,7 @@ fn sql_regression_type_specific_baseline_is_imported_and_provenanced() {
         "INT[]",
         "array_length",
         "jsonb_path_exists",
+        "_int4",
     ] {
         assert!(
             text.contains(surface),
@@ -465,8 +466,8 @@ fn sql_regression_type_specific_baseline_is_imported_and_provenanced() {
         );
     }
     assert!(
-        text.contains("# ultrasql:skip full PostgreSQL type-specific regression breadth"),
-        "{} must keep full type regression breadth debt explicit",
+        !text.contains("# ultrasql:skip full PostgreSQL type-specific regression breadth"),
+        "{} must keep pg_type array-row coverage active instead of a stale skip",
         shard.display()
     );
     let case_count = count_slt_cases(&text);

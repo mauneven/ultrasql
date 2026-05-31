@@ -1089,6 +1089,9 @@ as a concise evidence ledger; roadmap stays for open gates only.
   `BETWEEN`, and `LIKE`.
 - Type-specific regression baseline covers numeric, text, date/time/timetz,
   timestamp, JSON/JSONB, and arrays.
+- `pg_type` now exposes built-in array type rows such as `_int4`, with
+  `typelem` pointing back to the element type and public type-specific
+  regression coverage active.
 - Aggregate/window regression baseline covers grouped `COUNT` / `SUM` /
   `AVG` / `MIN` / `MAX`, `HAVING`, and core window functions:
   `row_number`, `rank`, `dense_rank`, `lag`, `lead`, `first_value`,

@@ -268,7 +268,7 @@ async fn pg_type_probe_matches_psycopg_typeinfo_shape() {
             "int4".to_owned(),
             "23".to_owned(),
             "1007".to_owned(),
-            "23".to_owned(),
+            "integer".to_owned(),
             ",".to_owned(),
         ]]
     );

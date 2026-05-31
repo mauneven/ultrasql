@@ -1105,6 +1105,32 @@ fn rows_pg_type(ctx: &LowerCtx<'_>) -> Vec<Vec<Value>> {
             },
         )
         .collect::<Vec<_>>();
+    rows.extend(BUILTINS.iter().filter_map(
+        |(element_oid, element_name, _typtype, _typcategory, _typlen, _typelem, array_oid)| {
+            if *array_oid == 0 {
+                return None;
+            }
+            Some(vec![
+                v_oid_i32(*array_oid),
+                v_text(format!("_{element_name}")),
+                Value::Int64(PG_CATALOG_OID),
+                Value::Int64(10),
+                v_text("b"),
+                v_text("A"),
+                Value::Int16(-1),
+                Value::Int32(*element_oid),
+                v_oid(0),
+                v_text(","),
+                v_text("array_in"),
+                v_oid(0),
+                v_oid(if matches!(*element_oid, PG_TYPE_TEXT | PG_TYPE_BPCHAR) {
+                    PG_COLLATION_DEFAULT_OID
+                } else {
+                    0
+                }),
+            ])
+        },
+    ));
     let mut enums = ctx
         .catalog_snapshot
         .enum_types_by_oid
