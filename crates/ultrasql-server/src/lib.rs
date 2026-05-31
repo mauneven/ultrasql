@@ -4660,6 +4660,12 @@ impl Server {
                 }),
             );
         }
+        if let Some(oid) = checks.keys().copied().next() {
+            return Err(ServerError::Ddl(format!(
+                "orphan domain-runtime check metadata on oid {}",
+                oid.raw()
+            )));
+        }
         Ok(())
     }
 
