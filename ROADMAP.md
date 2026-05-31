@@ -77,8 +77,8 @@ file focused on what still blocks production.
 - Arrays: broader coercion breadth and every supported element family beyond
   the completed metadata/scalar/mutation subset.
 - JSON/JSONB: full SQL/JSON path parity beyond the supported subset, including
-  full `datetime(template)` grammar beyond the supported ISO templates and
-  non-ISO date/time coercions.
+  full `datetime(template)` grammar beyond the supported ISO second/minute
+  templates and non-ISO date/time coercions.
 - Full-text search remaining: native lexeme/query storage beyond the current
   text-backed representation, dictionaries, full ranking/headline parity, and
   GIN planner integration.

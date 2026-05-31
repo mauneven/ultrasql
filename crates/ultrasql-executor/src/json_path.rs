@@ -574,10 +574,19 @@ fn json_path_datetime_template(text: &str, template: &str) -> JsonValue {
         "YYYYMMDD" => parse_compact_date_template(text)
             .map(format_date_days)
             .map_or(JsonValue::Null, JsonValue::String),
+        "YYYY-MM-DD HH24:MI" => parse_iso_minute_timestamp_template(text, b' ')
+            .map(format_json_timestamp)
+            .map_or(JsonValue::Null, JsonValue::String),
+        "YYYY-MM-DD\"T\"HH24:MI" => parse_iso_minute_timestamp_template(text, b'T')
+            .map(format_json_timestamp)
+            .map_or(JsonValue::Null, JsonValue::String),
         "YYYY-MM-DD HH24:MI:SS" => parse_iso_second_timestamp_template(text, b' ')
             .map(format_json_timestamp)
             .map_or(JsonValue::Null, JsonValue::String),
         "YYYY-MM-DD\"T\"HH24:MI:SS" => parse_iso_second_timestamp_template(text, b'T')
+            .map(format_json_timestamp)
+            .map_or(JsonValue::Null, JsonValue::String),
+        "YYYYMMDDHH24MI" => parse_compact_minute_timestamp_template(text)
             .map(format_json_timestamp)
             .map_or(JsonValue::Null, JsonValue::String),
         "YYYYMMDDHH24MISS" => parse_compact_second_timestamp_template(text)
@@ -598,6 +607,22 @@ fn parse_compact_date_template(text: &str) -> Option<i32> {
     parse_date_text(&format!("{year:04}-{month:02}-{day:02}"))
 }
 
+fn parse_iso_minute_timestamp_template(text: &str, separator: u8) -> Option<i64> {
+    let text = text.trim();
+    let bytes = text.as_bytes();
+    if bytes.len() != 16
+        || bytes.get(4) != Some(&b'-')
+        || bytes.get(7) != Some(&b'-')
+        || bytes.get(10) != Some(&separator)
+        || bytes.get(13) != Some(&b':')
+    {
+        return None;
+    }
+    let date = parse_date_text(text.get(..10)?)?;
+    let micros = parse_time_text(&format!("{}:00", text.get(11..)?))?;
+    timestamp_micros(date, micros)
+}
+
 fn parse_iso_second_timestamp_template(text: &str, separator: u8) -> Option<i64> {
     let text = text.trim();
     let bytes = text.as_bytes();
@@ -612,6 +637,21 @@ fn parse_iso_second_timestamp_template(text: &str, separator: u8) -> Option<i64>
     }
     let date = parse_date_text(text.get(..10)?)?;
     let micros = parse_time_text(text.get(11..)?)?;
+    timestamp_micros(date, micros)
+}
+
+fn parse_compact_minute_timestamp_template(text: &str) -> Option<i64> {
+    let text = text.trim();
+    if text.len() != 12 {
+        return None;
+    }
+    let year = parse_fixed_i32(text, 0, 4)?;
+    let month = parse_fixed_u32(text, 4, 2)?;
+    let day = parse_fixed_u32(text, 6, 2)?;
+    let hour = parse_fixed_u32(text, 8, 2)?;
+    let minute = parse_fixed_u32(text, 10, 2)?;
+    let date = parse_date_text(&format!("{year:04}-{month:02}-{day:02}"))?;
+    let micros = parse_time_text(&format!("{hour:02}:{minute:02}:00"))?;
     timestamp_micros(date, micros)
 }
 
@@ -1650,6 +1690,9 @@ mod tests {
             "hm": "12:30",
             "ymd": "20230815",
             "compact_ts": "20230815123456",
+            "compact_minute_ts": "202308151234",
+            "iso_minute": "2023-08-15 12:34",
+            "iso_t_minute": "2023-08-15T12:34",
             "iso_t": "2023-08-15T12:34:56",
             "bad": "not-time"
         });
@@ -1707,6 +1750,26 @@ mod tests {
         assert_eq!(
             select(&document, &compact_timestamp),
             vec![serde_json::json!("2023-08-15T12:34:56")]
+        );
+
+        let compact_minute =
+            parse_json_path("$.compact_minute_ts.datetime(\"YYYYMMDDHH24MI\")").unwrap();
+        assert_eq!(
+            select(&document, &compact_minute),
+            vec![serde_json::json!("2023-08-15T12:34:00")]
+        );
+
+        let iso_minute = parse_json_path("$.iso_minute.datetime(\"YYYY-MM-DD HH24:MI\")").unwrap();
+        assert_eq!(
+            select(&document, &iso_minute),
+            vec![serde_json::json!("2023-08-15T12:34:00")]
+        );
+
+        let iso_t_minute =
+            parse_json_path(r#"$.iso_t_minute.datetime("YYYY-MM-DD\"T\"HH24:MI")"#).unwrap();
+        assert_eq!(
+            select(&document, &iso_t_minute),
+            vec![serde_json::json!("2023-08-15T12:34:00")]
         );
 
         let quoted_literal =
