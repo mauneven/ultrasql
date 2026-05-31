@@ -1999,7 +1999,7 @@ fn finalise_percentile_cont(values: &[f64], fraction: Option<f64>, asc: bool) ->
         return Value::Null;
     }
     let mut sorted = values.to_vec();
-    sorted.sort_by(f64::total_cmp);
+    sorted.sort_by(|a, b| crate::sort::compare_f64_sql(*a, *b));
     if !asc {
         sorted.reverse();
     }
@@ -2922,6 +2922,20 @@ mod tests {
             err.to_string().contains("division by zero"),
             "unexpected error: {err}"
         );
+    }
+
+    #[test]
+    fn hash_agg_percentile_cont_orders_any_nan_after_finite_values() {
+        let state = AggState::PercentileCont {
+            values: vec![f64::from_bits(0xfff8_0000_0000_0000), 1.0, 2.0],
+            fraction: Some(0.0),
+            asc: true,
+        };
+
+        let Value::Float64(value) = finalise(&state).expect("percentile finalises") else {
+            panic!("expected percentile value");
+        };
+        assert_eq!(value, 1.0);
     }
 
     #[test]

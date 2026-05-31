@@ -20,6 +20,7 @@ use ultrasql_vec::column::{Column, NumericColumn};
 
 use crate::ExecError;
 use crate::push_pipeline::{SinkVerdict, VectorizedOperator, VectorizedSink};
+use crate::sort::compare_f64_sql;
 
 /// Sort direction for a sort key.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -177,7 +178,7 @@ fn compare_rows(cols: &[ColData], key: &SortKeySpec, a: usize, b: usize) -> std:
         match &cols[ci] {
             ColData::I32(v) => v[a].cmp(&v[b]),
             ColData::I64(v) => v[a].cmp(&v[b]),
-            ColData::F64(v) => v[a].partial_cmp(&v[b]).unwrap_or(std::cmp::Ordering::Equal),
+            ColData::F64(v) => compare_f64_sql(v[a], v[b]),
             ColData::Empty => std::cmp::Ordering::Equal,
         }
     } else {
@@ -238,11 +239,30 @@ mod tests {
         Batch::new([Column::Int64(NumericColumn::from_data(data.to_vec()))]).unwrap()
     }
 
+    fn schema_f64() -> Schema {
+        Schema::new([Field::required("v", DataType::Float64)]).expect("schema ok")
+    }
+
+    fn batch_f64(data: &[f64]) -> Batch {
+        Batch::new([Column::Float64(NumericColumn::from_data(data.to_vec()))]).unwrap()
+    }
+
     fn drain_i64_all(batches: Vec<Batch>) -> Vec<i64> {
         let mut out = Vec::new();
         for b in batches {
             match &b.columns()[0] {
                 Column::Int64(c) => out.extend_from_slice(c.data()),
+                other => panic!("unexpected {other:?}"),
+            }
+        }
+        out
+    }
+
+    fn drain_f64_all(batches: Vec<Batch>) -> Vec<f64> {
+        let mut out = Vec::new();
+        for b in batches {
+            match &b.columns()[0] {
+                Column::Float64(c) => out.extend_from_slice(c.data()),
                 other => panic!("unexpected {other:?}"),
             }
         }
@@ -282,6 +302,24 @@ mod tests {
         sort.drive(&mut sink).unwrap();
         let rows = drain_i64_all(sink.finish());
         assert_eq!(rows, vec![9, 5, 4, 3, 1, 1]);
+    }
+
+    #[test]
+    fn sort_float_nan_after_finite_values() {
+        let scan = MemTableScan::new(schema_f64(), vec![batch_f64(&[f64::NAN, -1.0, 1.0])]);
+        let child = VectorizedSeqScan::new(Box::new(scan));
+        let key = SortKeySpec {
+            col_idx: 0,
+            direction: SortDirection::Asc,
+            nulls_first: false,
+        };
+        let mut sort = VectorizedSort::new(Box::new(child), vec![key], schema_f64());
+        let mut sink = CollectSink::new();
+        sort.drive(&mut sink).unwrap();
+        let rows = drain_f64_all(sink.finish());
+        assert_eq!(rows[0], -1.0);
+        assert_eq!(rows[1], 1.0);
+        assert!(rows[2].is_nan());
     }
 
     #[test]

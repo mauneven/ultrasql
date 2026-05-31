@@ -423,7 +423,7 @@ fn finalise_percentile_cont(values: &[f64], fraction: Option<f64>, asc: bool) ->
         return Value::Null;
     }
     let mut sorted = values.to_vec();
-    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    sorted.sort_by(|a, b| crate::sort::compare_f64_sql(*a, *b));
     if !asc {
         sorted.reverse();
     }
@@ -1418,6 +1418,19 @@ mod tests {
         // median of [1,2,3,4,5] = 3.0
         let result = finalise_stat(&state);
         assert_eq!(result, Value::Float64(3.0));
+    }
+
+    #[test]
+    fn stat_percentile_cont_orders_nan_after_finite_values() {
+        let mut state = init_stat_state(&StatAggFunc::PercentileCont(0.0));
+        for &x in &[f64::NAN, 1.0, 2.0] {
+            accumulate_stat(&mut state, x);
+        }
+
+        let Value::Float64(value) = finalise_stat(&state) else {
+            panic!("expected percentile value");
+        };
+        assert_eq!(value, 1.0);
     }
 
     #[test]

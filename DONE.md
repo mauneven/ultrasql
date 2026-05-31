@@ -250,10 +250,18 @@ as a concise evidence ledger; roadmap stays for open gates only.
   `cargo test -p ultrasql-executor sort_aggregate`.
 - `PERCENTILE_DISC` finalization now uses checked scalar ordering and reports
   unsupported ordered-set value families as typed executor errors instead of
-  silently treating them as equal. `PERCENTILE_CONT` now uses deterministic
-  `f64::total_cmp` ordering instead of `partial_cmp(...).unwrap_or(Equal)`.
-  Evidence:
+  silently treating them as equal. Evidence:
   `cargo test -p ultrasql-executor hash_aggregate --lib -- --nocapture` and
+  `cargo clippy -p ultrasql-executor --all-targets --all-features -- -D warnings`.
+- Executor float ordering now uses one SQL-style NaN-high comparator across
+  full sort, vectorized sort, `HashAggregate` `PERCENTILE_CONT`, and
+  `SortAggregate` `PERCENTILE_CONT`; finite values keep numeric order and every
+  NaN sorts after finite values. Evidence:
+  `cargo test -p ultrasql-executor sort::tests::float_nan_sorts_after_finite_values --lib -- --nocapture`,
+  `cargo test -p ultrasql-executor vec_ops::sort::tests::sort_float_nan_after_finite_values --lib -- --nocapture`,
+  `cargo test -p ultrasql-executor hash_aggregate::tests::hash_agg_percentile_cont_orders_any_nan_after_finite_values --lib -- --nocapture`,
+  `cargo test -p ultrasql-executor sort_aggregate::tests::stat_percentile_cont_orders_nan_after_finite_values --lib -- --nocapture`,
+  `cargo test -p ultrasql-executor --lib -- --nocapture`, and
   `cargo clippy -p ultrasql-executor --all-targets --all-features -- -D warnings`.
 - `HashJoin` and `MergeJoin` now propagate join-key evaluation failures instead
   of silently treating them as NULL non-matches. Evidence:

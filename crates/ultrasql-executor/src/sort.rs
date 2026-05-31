@@ -516,8 +516,8 @@ fn compare_non_null_values(a: &Value, b: &Value) -> Option<Ordering> {
         | (Value::RegClass(l), Value::RegClass(r))
         | (Value::RegType(l), Value::RegType(r)) => l.cmp(r),
         (Value::PgLsn(l), Value::PgLsn(r)) => l.cmp(r),
-        (Value::Float32(l), Value::Float32(r)) => l.partial_cmp(r).unwrap_or(Ordering::Equal),
-        (Value::Float64(l), Value::Float64(r)) => l.partial_cmp(r).unwrap_or(Ordering::Equal),
+        (Value::Float32(l), Value::Float32(r)) => compare_f32_sql(*l, *r),
+        (Value::Float64(l), Value::Float64(r)) => compare_f64_sql(*l, *r),
         (Value::Money(l), Value::Money(r)) => l.cmp(r),
         (Value::Uuid(l), Value::Uuid(r)) => l.cmp(r),
         (Value::Text(l), Value::Text(r)) => l.cmp(r),
@@ -589,6 +589,29 @@ fn compare_non_null_values(a: &Value, b: &Value) -> Option<Ordering> {
 fn interval_total_micros(months: i32, days: i32, microseconds: i64) -> i128 {
     const MICROS_PER_DAY: i128 = 86_400_000_000;
     (i128::from(months) * 30 + i128::from(days)) * MICROS_PER_DAY + i128::from(microseconds)
+}
+
+/// Compare `REAL` values using SQL-compatible NaN ordering.
+///
+/// Finite values keep normal numeric order; `NaN` sorts after every finite
+/// value and compares equal to other `NaN` values for ordering purposes.
+#[allow(unreachable_pub)]
+pub fn compare_f32_sql(left: f32, right: f32) -> Ordering {
+    compare_f64_sql(f64::from(left), f64::from(right))
+}
+
+/// Compare `DOUBLE PRECISION` values using SQL-compatible NaN ordering.
+///
+/// Finite values keep normal numeric order; `NaN` sorts after every finite
+/// value and compares equal to other `NaN` values for ordering purposes.
+#[allow(unreachable_pub)]
+pub fn compare_f64_sql(left: f64, right: f64) -> Ordering {
+    match (left.is_nan(), right.is_nan()) {
+        (true, true) => Ordering::Equal,
+        (true, false) => Ordering::Greater,
+        (false, true) => Ordering::Less,
+        (false, false) => left.partial_cmp(&right).unwrap_or(Ordering::Equal),
+    }
 }
 
 fn compare_decimals(l: i64, l_scale: i32, r: i64, r_scale: i32) -> Ordering {
@@ -817,6 +840,18 @@ mod tests {
     fn bytea_values_compare_lexicographically() {
         assert_eq!(
             compare_values_nullable(&Value::Bytea(vec![0x02]), &Value::Bytea(vec![0x01]), false),
+            Ordering::Greater
+        );
+    }
+
+    #[test]
+    fn float_nan_sorts_after_finite_values() {
+        assert_eq!(
+            compare_values_nullable(&Value::Float64(f64::NAN), &Value::Float64(1.0), false),
+            Ordering::Greater
+        );
+        assert_eq!(
+            compare_values_nullable(&Value::Float32(f32::NAN), &Value::Float32(1.0), false),
             Ordering::Greater
         );
     }
