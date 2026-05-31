@@ -79,6 +79,7 @@ impl VectorizedSort {
 impl VectorizedOperator for VectorizedSort {
     fn drive(&mut self, sink: &mut dyn VectorizedSink) -> Result<(), ExecError> {
         const BATCH_SIZE: usize = 4096;
+        validate_sort_keys(&self.sort_keys, self.schema.len())?;
         // Accumulate all rows.
         let mut collect = CollectAllSink {
             batches: Vec::new(),
@@ -148,6 +149,18 @@ impl VectorizedOperator for VectorizedSort {
 }
 
 // ---- Internal helpers ----
+
+fn validate_sort_keys(keys: &[SortKeySpec], width: usize) -> Result<(), ExecError> {
+    for key in keys {
+        if key.col_idx >= width {
+            return Err(ExecError::TypeMismatch(format!(
+                "VectorizedSort: sort key column {} out of range (schema width {width})",
+                key.col_idx
+            )));
+        }
+    }
+    Ok(())
+}
 
 struct CollectAllSink {
     batches: Vec<Batch>,
@@ -335,5 +348,23 @@ mod tests {
         let mut sink = CollectSink::new();
         sort.drive(&mut sink).unwrap();
         assert!(sink.finish().is_empty());
+    }
+
+    #[test]
+    fn sort_key_out_of_range_errors() {
+        let scan = MemTableScan::new(schema_val(), vec![batch_i64(&[2, 1])]);
+        let child = VectorizedSeqScan::new(Box::new(scan));
+        let key = SortKeySpec {
+            col_idx: 1,
+            direction: SortDirection::Asc,
+            nulls_first: false,
+        };
+        let mut sort = VectorizedSort::new(Box::new(child), vec![key], schema_val());
+        let mut sink = CollectSink::new();
+
+        let err = sort
+            .drive(&mut sink)
+            .expect_err("invalid sort key must not be ignored");
+        assert!(matches!(err, ExecError::TypeMismatch(_)), "{err:?}");
     }
 }

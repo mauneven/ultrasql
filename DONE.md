@@ -1872,6 +1872,9 @@ as a concise evidence ledger; roadmap stays for open gates only.
 - Vectorized hash aggregate now uses checked arithmetic for `COUNT(*)` and
   `SUM(bigint)` instead of wrapping on overflow. Evidence:
   `cargo test -p ultrasql-executor sum_overflow_returns_typed_error --lib -- --nocapture`.
+- Vectorized sort now rejects out-of-range sort-key columns instead of treating
+  them as all-equal comparisons. Evidence:
+  `cargo test -p ultrasql-executor sort_key_out_of_range_errors --lib -- --nocapture`.
 - Runtime scalar/temporal text casts to integer, float, boolean, date, time,
   timestamp, timestamptz, and timetz now report SQLSTATE `22P02` for invalid
   column text. Evidence:
