@@ -742,6 +742,9 @@ fn bind_runtime_cast(
     actual_type: &DataType,
 ) -> Option<ScalarExpr> {
     let name = match target_type {
+        DataType::Int16 if actual_type.is_integer() => "__ultrasql_cast_int2",
+        DataType::Int32 if actual_type.is_integer() => "__ultrasql_cast_int4",
+        DataType::Int64 if actual_type.is_integer() => "__ultrasql_cast_int8",
         DataType::Money
             if actual_type.is_integer() || matches!(actual_type, DataType::Decimal { .. }) =>
         {

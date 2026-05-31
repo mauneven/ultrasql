@@ -1716,3 +1716,9 @@ as a concise evidence ledger; roadmap stays for open gates only.
   unless a reject artifact is enabled. The reader reuses internal record/line
   buffers and captures raw text only for quarantine/error reporting. Evidence:
   `cargo test -p ultrasql-server csv_record_reader_captures_raw_rows_only_for_rejects --lib -- --nocapture`.
+- Runtime integer casts now support column/expression casts among `SMALLINT`,
+  `INTEGER`, and `BIGINT` with checked overflow instead of rejecting every
+  non-literal integer cast. Evidence:
+  `cargo test -p ultrasql-executor cast_size_and_array_error_edges_cover_scalar_compat_paths --lib -- --nocapture`
+  and
+  `cargo test -p ultrasql-server --test core_type_surface_round_trip core_scalar_types_round_trip_over_postgres_wire -- --nocapture`.

@@ -72,6 +72,23 @@ async fn core_scalar_types_round_trip_over_postgres_wire() {
     });
     assert_eq!(payload, Some("\\xdeadbeef"));
 
+    let cast_row = client
+        .query_one(
+            "SELECT
+                CAST(i AS BIGINT),
+                CAST(b AS INTEGER),
+                CAST(i AS SMALLINT),
+                CAST(s AS BIGINT)
+             FROM core_type_surface",
+            &[],
+        )
+        .await
+        .expect("runtime integer casts from columns");
+    assert_eq!(cast_row.get::<_, i64>(0), 8);
+    assert_eq!(cast_row.get::<_, i32>(1), 9);
+    assert_eq!(cast_row.get::<_, i16>(2), 8);
+    assert_eq!(cast_row.get::<_, i64>(3), 7);
+
     let err = client
         .batch_execute(
             "INSERT INTO core_type_surface VALUES (

@@ -409,6 +409,9 @@ fn eval_function_call(
         "__ultrasql_array_subscript" => eval_array_subscript(args),
         "__ultrasql_array_slice" => eval_array_slice(args),
         "__ultrasql_eq_any_array" => eval_eq_any_array(args),
+        "__ultrasql_cast_int2" => eval_cast_int16(args),
+        "__ultrasql_cast_int4" => eval_cast_int32(args),
+        "__ultrasql_cast_int8" => eval_cast_int64(args),
         "__ultrasql_cast_oid" => eval_cast_oid(args),
         "__ultrasql_cast_regclass" => eval_cast_regclass(args),
         "__ultrasql_cast_regtype" => eval_cast_regtype(args),
@@ -990,6 +993,52 @@ fn eval_pg_get_serial_sequence(args: &[Value]) -> Result<Value, EvalError> {
         }
     }
     Ok(Value::Null)
+}
+
+fn eval_cast_int16(args: &[Value]) -> Result<Value, EvalError> {
+    let Some(raw) = integer_cast_arg("smallint cast", args)? else {
+        return Ok(Value::Null);
+    };
+    i16::try_from(raw)
+        .map(Value::Int16)
+        .map_err(|_| EvalError::Type(format!("smallint cast: value out of range: {raw}")))
+}
+
+fn eval_cast_int32(args: &[Value]) -> Result<Value, EvalError> {
+    let Some(raw) = integer_cast_arg("integer cast", args)? else {
+        return Ok(Value::Null);
+    };
+    i32::try_from(raw)
+        .map(Value::Int32)
+        .map_err(|_| EvalError::Type(format!("integer cast: value out of range: {raw}")))
+}
+
+fn eval_cast_int64(args: &[Value]) -> Result<Value, EvalError> {
+    let Some(raw) = integer_cast_arg("bigint cast", args)? else {
+        return Ok(Value::Null);
+    };
+    i64::try_from(raw)
+        .map(Value::Int64)
+        .map_err(|_| EvalError::Type(format!("bigint cast: value out of range: {raw}")))
+}
+
+fn integer_cast_arg(func: &str, args: &[Value]) -> Result<Option<i128>, EvalError> {
+    if args.len() != 1 {
+        return Err(EvalError::Type(format!(
+            "{func}: expected 1 arg, got {}",
+            args.len()
+        )));
+    }
+    match &args[0] {
+        Value::Null => Ok(None),
+        Value::Int16(v) => Ok(Some(i128::from(*v))),
+        Value::Int32(v) => Ok(Some(i128::from(*v))),
+        Value::Int64(v) => Ok(Some(i128::from(*v))),
+        other => Err(EvalError::Type(format!(
+            "{func}: integer argument required, got {:?}",
+            other.data_type()
+        ))),
+    }
 }
 
 fn eval_cast_oid(args: &[Value]) -> Result<Value, EvalError> {
@@ -6456,6 +6505,32 @@ mod tests {
 
     #[test]
     fn cast_size_and_array_error_edges_cover_scalar_compat_paths() {
+        assert!(eval_fn_err("__ultrasql_cast_int2", vec![]).contains("expected 1 arg"));
+        assert_eq!(
+            eval_fn("__ultrasql_cast_int2", vec![Value::Null]),
+            Value::Null
+        );
+        assert_eq!(
+            eval_fn("__ultrasql_cast_int2", vec![Value::Int32(7)]),
+            Value::Int16(7)
+        );
+        assert!(
+            eval_fn_err("__ultrasql_cast_int2", vec![Value::Int32(40_000)])
+                .contains("out of range")
+        );
+        assert_eq!(
+            eval_fn("__ultrasql_cast_int4", vec![Value::Int64(9)]),
+            Value::Int32(9)
+        );
+        assert_eq!(
+            eval_fn("__ultrasql_cast_int8", vec![Value::Int16(11)]),
+            Value::Int64(11)
+        );
+        assert!(
+            eval_fn_err("__ultrasql_cast_int8", vec![Value::Text("x".into())])
+                .contains("integer argument")
+        );
+
         assert!(eval_fn_err("__ultrasql_cast_oid", vec![]).contains("expected 1 arg"));
         assert_eq!(
             eval_fn("__ultrasql_cast_oid", vec![Value::Null]),
