@@ -166,7 +166,11 @@ impl Operator for FunctionScan {
                         break;
                     }
                     data.push(self.current);
-                    self.current = self.current.wrapping_add(step_val);
+                    let Some(next) = self.current.checked_add(step_val) else {
+                        self.eof = true;
+                        break;
+                    };
+                    self.current = next;
                 }
 
                 if data.is_empty() {
@@ -228,6 +232,21 @@ mod tests {
         out
     }
 
+    fn first_batch_i64(op: &mut dyn Operator) -> Vec<i64> {
+        let schema = op.schema().clone();
+        let Some(batch) = op.next_batch().expect("ok") else {
+            return Vec::new();
+        };
+        batch_to_rows(&batch, &schema)
+            .expect("decode")
+            .into_iter()
+            .filter_map(|row| match row.into_iter().next() {
+                Some(Value::Int64(value)) => Some(value),
+                _ => None,
+            })
+            .collect()
+    }
+
     #[test]
     fn generate_series_ascending() {
         let mut op = FunctionScan::generate_series(1, 5, 1);
@@ -253,6 +272,20 @@ mod tests {
         let mut op = FunctionScan::generate_series(0, 6, 2);
         let vals = drain_i64(&mut op);
         assert_eq!(vals, vec![0, 2, 4, 6]);
+    }
+
+    #[test]
+    fn generate_series_positive_step_stops_before_overflow() {
+        let mut op = FunctionScan::generate_series(i64::MAX - 1, i64::MAX, 2);
+        let vals = first_batch_i64(&mut op);
+        assert_eq!(vals, vec![i64::MAX - 1]);
+    }
+
+    #[test]
+    fn generate_series_negative_step_stops_before_overflow() {
+        let mut op = FunctionScan::generate_series(i64::MIN + 1, i64::MIN, -2);
+        let vals = first_batch_i64(&mut op);
+        assert_eq!(vals, vec![i64::MIN + 1]);
     }
 
     #[test]

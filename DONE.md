@@ -221,6 +221,11 @@ as a concise evidence ledger; roadmap stays for open gates only.
   `cargo test -p ultrasql-server serializable::tests::serializable_read_locks_keep_empty_and_semantics --lib -- --nocapture`,
   and
   `cargo test -p ultrasql-server --test isolation_suite_round_trip serializable_empty_strict_range_does_not_false_abort_wire -- --nocapture`.
+- `generate_series` no longer wraps signed `i64` boundaries into the opposite
+  range when `start + step` overflows; it emits the last valid row and marks the
+  scan exhausted. Evidence:
+  `cargo test -p ultrasql-executor generate_series --lib -- --nocapture` and
+  `cargo test -p ultrasql-server --test function_scan_round_trip generate_series -- --nocapture`.
 - Constant `SELECT` result execution now propagates scalar evaluation failures
   instead of silently returning NULL. Evidence:
   `cargo test -p ultrasql-executor result_propagates_constant_eval_errors`.
