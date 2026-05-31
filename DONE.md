@@ -2180,3 +2180,6 @@ as a concise evidence ledger; roadmap stays for open gates only.
 - Local external file reads now reject unbounded read limits and check
   byte-count conversion instead of using a saturated sentinel read. Evidence:
   `cargo test -p ultrasql-server pipeline::external_scan::tests::external_local_sources_reject_unbounded_read_limit --lib -- --nocapture`.
+- JSON/NDJSON record readers now reject unbounded record limits and check
+  record length arithmetic instead of saturating byte counts. Evidence:
+  `cargo test -p ultrasql-server pipeline::external_scan::tests::read_json_rejects_unbounded_record_limit --lib -- --nocapture`.
