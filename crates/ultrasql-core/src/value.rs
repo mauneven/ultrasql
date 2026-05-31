@@ -1381,7 +1381,11 @@ pub fn xml_xpath_element_fragments_with_namespaces(
     let steps = parse_xml_path(path)?;
     let root = xml_root_element(document)?;
     let mut current = match &steps[0] {
-        XmlPathStep::Element { descendant, .. } => {
+        XmlPathStep::Element {
+            descendant,
+            position_filter,
+            ..
+        } => {
             if *descendant {
                 let mut matches = Vec::new();
                 if xml_step_matches(&root, &steps[0], namespace_bindings) {
@@ -1390,9 +1394,9 @@ pub fn xml_xpath_element_fragments_with_namespaces(
                 let mut step_matches =
                     |element: &XmlElement| xml_step_matches(element, &steps[0], namespace_bindings);
                 collect_xml_descendant_elements(document, &root, &mut matches, &mut step_matches);
-                matches
+                xml_apply_position_filter(matches, position_filter.as_ref())
             } else if xml_step_matches(&root, &steps[0], namespace_bindings) {
-                vec![root]
+                xml_apply_position_filter(vec![root], position_filter.as_ref())
             } else {
                 Vec::new()
             }
@@ -1403,24 +1407,30 @@ pub fn xml_xpath_element_fragments_with_namespaces(
     for (idx, step) in steps[1..].iter().enumerate() {
         let terminal = idx + 2 == steps.len();
         match step {
-            XmlPathStep::Element { descendant, .. } => {
+            XmlPathStep::Element {
+                descendant,
+                position_filter,
+                ..
+            } => {
                 let mut next = Vec::new();
                 for element in &current {
                     if *descendant {
+                        let mut matches = Vec::new();
                         let mut step_matches =
                             |child: &XmlElement| xml_step_matches(child, step, namespace_bindings);
                         collect_xml_descendant_elements(
                             document,
                             element,
-                            &mut next,
+                            &mut matches,
                             &mut step_matches,
                         );
+                        next.extend(xml_apply_position_filter(matches, position_filter.as_ref()));
                     } else {
-                        for child in xml_direct_child_elements(document, element) {
-                            if xml_step_matches(&child, step, namespace_bindings) {
-                                next.push(child);
-                            }
-                        }
+                        let matches = xml_direct_child_elements(document, element)
+                            .into_iter()
+                            .filter(|child| xml_step_matches(child, step, namespace_bindings))
+                            .collect();
+                        next.extend(xml_apply_position_filter(matches, position_filter.as_ref()));
                     }
                 }
                 current = next;
@@ -1586,11 +1596,18 @@ enum XmlPathStep {
     Element {
         name: String,
         attr_filter: Option<(String, String)>,
+        position_filter: Option<XmlPositionPredicate>,
         descendant: bool,
     },
     Attribute(String),
     Text,
     SelfNode,
+}
+
+#[derive(Clone, Debug)]
+enum XmlPositionPredicate {
+    Index(usize),
+    Last,
 }
 
 #[derive(Clone, Debug)]
@@ -1677,17 +1694,29 @@ fn parse_xml_path(path: &str) -> Option<Vec<XmlPathStep>> {
         } else {
             (segment, descendant)
         };
-        let (name, attr_filter) = if let Some(open) = segment.find('[') {
+        let (name, attr_filter, position_filter) = if let Some(open) = segment.find('[') {
             let predicate = segment.get(open + 1..segment.len().checked_sub(1)?)?.trim();
-            if !segment.ends_with(']') || !predicate.starts_with('@') {
+            if !segment.ends_with(']') {
                 return None;
             }
-            let (attr_name, attr_value) = predicate[1..].split_once('=')?;
-            let attr_name = attr_name.trim();
-            let attr_value = unquote_xml_path_literal(attr_value.trim())?;
-            (&segment[..open], Some((attr_name.to_owned(), attr_value)))
+            if let Some(attr_predicate) = predicate.strip_prefix('@') {
+                let (attr_name, attr_value) = attr_predicate.split_once('=')?;
+                let attr_name = attr_name.trim();
+                let attr_value = unquote_xml_path_literal(attr_value.trim())?;
+                (
+                    &segment[..open],
+                    Some((attr_name.to_owned(), attr_value)),
+                    None,
+                )
+            } else {
+                (
+                    &segment[..open],
+                    None,
+                    Some(parse_xml_position_predicate(predicate)?),
+                )
+            }
         } else {
-            (segment, None)
+            (segment, None, None)
         };
         if !xml_path_name_is_valid(name) {
             return None;
@@ -1700,11 +1729,33 @@ fn parse_xml_path(path: &str) -> Option<Vec<XmlPathStep>> {
         steps.push(XmlPathStep::Element {
             name: name.to_owned(),
             attr_filter,
+            position_filter,
             descendant,
         });
         cursor = segment_end;
     }
     if steps.is_empty() { None } else { Some(steps) }
+}
+
+fn parse_xml_position_predicate(predicate: &str) -> Option<XmlPositionPredicate> {
+    let predicate = predicate.trim();
+    if predicate == "last()" {
+        return Some(XmlPositionPredicate::Last);
+    }
+    if let Ok(index) = predicate.parse::<usize>() {
+        return (index > 0).then_some(XmlPositionPredicate::Index(index));
+    }
+    let (left, right) = predicate.split_once('=')?;
+    if left.trim() != "position()" {
+        return None;
+    }
+    let right = right.trim();
+    if right == "last()" {
+        Some(XmlPositionPredicate::Last)
+    } else {
+        let index = right.parse::<usize>().ok()?;
+        (index > 0).then_some(XmlPositionPredicate::Index(index))
+    }
 }
 
 fn unquote_xml_path_literal(text: &str) -> Option<String> {
@@ -1889,6 +1940,21 @@ fn collect_xml_descendant_elements<F>(
             out.push(child.clone());
         }
         collect_xml_descendant_elements(text, &child, out, matches);
+    }
+}
+
+fn xml_apply_position_filter(
+    elements: Vec<XmlElement>,
+    filter: Option<&XmlPositionPredicate>,
+) -> Vec<XmlElement> {
+    match filter {
+        None => elements,
+        Some(XmlPositionPredicate::Index(index)) => elements
+            .into_iter()
+            .nth(index.saturating_sub(1))
+            .into_iter()
+            .collect(),
+        Some(XmlPositionPredicate::Last) => elements.into_iter().last().into_iter().collect(),
     }
 }
 
@@ -3597,6 +3663,23 @@ mod tests {
                 r#"<root><value>1</value><value>bad</value></root>"#
             ),
             Some(vec!["NaN".to_owned()])
+        );
+        let positioned = r#"<root><item>a</item><item>b</item><item>c</item></root>"#;
+        assert_eq!(
+            xml_xpath_element_fragments("/root/item[position()=1]", positioned),
+            Some(vec!["<item>a</item>".to_owned()])
+        );
+        assert_eq!(
+            xml_xpath_element_fragments("/root/item[2]", positioned),
+            Some(vec!["<item>b</item>".to_owned()])
+        );
+        assert_eq!(
+            xml_xpath_element_fragments("/root/item[last()]", positioned),
+            Some(vec!["<item>c</item>".to_owned()])
+        );
+        assert_eq!(
+            xml_xpath_element_fragments("/root/item[position()=last()]", positioned),
+            Some(vec!["<item>c</item>".to_owned()])
         );
         let nested = r#"<root><group><item id="1"><name>A</name></item><item id="2"><name>B</name></item></group><name>C</name></root>"#;
         assert_eq!(

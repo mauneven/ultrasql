@@ -81,9 +81,10 @@ file focused on what still blocks production.
   GIN planner integration.
 - XML remaining surface: XPath axes/functions beyond the supported child,
   attribute, descendant, self-node, wildcard, text, namespace, and bounded
-  `true()` / `false()` / `count()` / `string()` / `boolean()` / `not()` /
-  `name()` / `local-name()` / `normalize-space()` / `string-length()` /
-  `contains(path, literal)` / `starts-with(path, literal)` /
+  positional predicate subset (`[n]`, `[position()=n]`, `[last()]`,
+  `[position()=last()]`), `true()` / `false()` / `count()` / `string()` /
+  `boolean()` / `not()` / `name()` / `local-name()` / `normalize-space()` /
+  `string-length()` / `contains(path, literal)` / `starts-with(path, literal)` /
   `substring-before(path, literal)` / `substring-after(path, literal)` /
   `concat(path-or-literal, ...)` subset, numeric `number()` / `floor()` /
   `ceiling()` / `round()` / `sum()` subset, plus full `XMLTABLE` beyond the

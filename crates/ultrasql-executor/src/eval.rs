@@ -2796,11 +2796,12 @@ fn parse_xml_value(
 
 const XPATH_SUPPORTED_SUBSET: &str = concat!(
     "supported subset is absolute element paths with optional @attr equality, ",
-    "wildcards, text(), true(), false(), count(), string(), boolean(), not(), name(), ",
-    "local-name(), normalize-space(), string-length(), contains(), ",
-    "starts-with(), substring-before(), substring-after(), concat(), ",
-    "number(), floor(), ceiling(), round(), sum(), namespaces, descendant ",
-    "paths, and basic child::, attribute::, descendant::, and self::node() axes"
+    "position predicates, wildcards, text(), true(), false(), count(), ",
+    "string(), boolean(), not(), name(), local-name(), normalize-space(), ",
+    "string-length(), contains(), starts-with(), substring-before(), ",
+    "substring-after(), concat(), number(), floor(), ceiling(), round(), ",
+    "sum(), namespaces, descendant paths, and basic child::, attribute::, ",
+    "descendant::, and self::node() axes"
 );
 
 fn eval_xpath_exists(args: &[Value]) -> Result<Value, EvalError> {

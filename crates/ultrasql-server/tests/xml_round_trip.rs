@@ -306,6 +306,10 @@ async fn xml_functions_validate_securely_and_extract_simple_xpath() {
                         xpath('sum(/root/value)', XML '<root><value>1.5</value><value>2.25</value></root>'), \
                         xpath('sum(/root/missing)', XML '<root><value>1.5</value></root>'), \
                         xpath('sum(/root/value)', XML '<root><value>1</value><value>bad</value></root>'), \
+                        xpath('/root/item[position()=1]', XML '<root><item>a</item><item>b</item><item>c</item></root>'), \
+                        xpath('/root/item[2]', XML '<root><item>a</item><item>b</item><item>c</item></root>'), \
+                        xpath('/root/item[last()]', XML '<root><item>a</item><item>b</item><item>c</item></root>'), \
+                        xpath('/root/item[position()=last()]', XML '<root><item>a</item><item>b</item><item>c</item></root>'), \
                         xpath('count(/root/item)', XML '<root><item/><item/><other/></root>'), \
                         xpath('/r:root/r:item/@x:id', XML '<r:root xmlns:r=\"urn:r\" xmlns:x=\"urn:x\"><r:item x:id=\"7\">z</r:item></r:root>'), \
                         xpath_exists('/r:root/item:child', XML '<root xmlns=\"urn:root\" xmlns:i=\"urn:item\"><i:child i:id=\"7\">z</i:child></root>', ARRAY[ARRAY['r','urn:root'],ARRAY['item','urn:item']]), \
@@ -355,6 +359,10 @@ async fn xml_functions_validate_securely_and_extract_simple_xpath() {
             "{3.75}".to_owned(),
             "{0}".to_owned(),
             "{NaN}".to_owned(),
+            "{<item>a</item>}".to_owned(),
+            "{<item>b</item>}".to_owned(),
+            "{<item>c</item>}".to_owned(),
+            "{<item>c</item>}".to_owned(),
             "{2}".to_owned(),
             "{7}".to_owned(),
             "t".to_owned(),
