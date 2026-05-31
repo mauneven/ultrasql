@@ -1783,6 +1783,10 @@ as a concise evidence ledger; roadmap stays for open gates only.
   `cargo test -p ultrasql-executor build_batch_covers_sql_storage_families_and_null_bitmaps --lib -- --nocapture`,
   and
   `cargo test -p ultrasql-server --test numeric_round_trip -- --nocapture`.
+- Runtime bare `NUMERIC` text casts that exceed the current scaled-`i64`
+  runtime range now fail with SQLSTATE `22003` instead of surfacing as an
+  internal execution error. Evidence:
+  `cargo test -p ultrasql-server --test numeric_round_trip runtime_numeric_text_overflow_reports_sqlstate -- --nocapture`.
 - Bare `NUMERIC` heap scans now preserve per-row display scale from the stored
   PostgreSQL numeric payload. The row codec keeps dynamic numeric scan builders
   text-backed, materializes them back to `Value::Decimal` for downstream DML,

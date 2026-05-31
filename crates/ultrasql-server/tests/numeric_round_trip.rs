@@ -195,6 +195,32 @@ async fn numeric_precision_overflow_reports_sqlstate() {
 }
 
 #[tokio::test]
+async fn runtime_numeric_text_overflow_reports_sqlstate() {
+    let running = start_sample_server("numeric_runtime_text_overflow").await;
+    let client = &running.client;
+
+    client
+        .batch_execute("CREATE TABLE numeric_text_overflow (raw TEXT NOT NULL)")
+        .await
+        .expect("create numeric text overflow table");
+    client
+        .batch_execute("INSERT INTO numeric_text_overflow VALUES ('9223372036854775808')")
+        .await
+        .expect("insert oversized numeric text");
+
+    let err = client
+        .simple_query("SELECT CAST(raw AS NUMERIC) FROM numeric_text_overflow")
+        .await
+        .expect_err("oversized runtime numeric text must fail");
+    assert_eq!(
+        err.code().map(tokio_postgres::error::SqlState::code),
+        Some("22003")
+    );
+
+    shutdown(running).await;
+}
+
+#[tokio::test]
 async fn numeric_zero_precision_is_rejected() {
     let running = start_sample_server("numeric_round_trip").await;
     let err = running

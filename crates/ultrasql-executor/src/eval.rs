@@ -1379,8 +1379,8 @@ fn eval_cast_numeric(args: &[Value]) -> Result<Value, EvalError> {
             coerce_numeric_typmod(*value, *scale, precision, target_scale)
         }
         Value::Text(text) | Value::Char(text) => {
-            let Value::Decimal { value, scale } = parse_decimal_text(text, target_scale)
-                .map_err(|err| EvalError::Type(format!("numeric cast: invalid syntax: {err}")))?
+            let Value::Decimal { value, scale } =
+                parse_decimal_text(text, target_scale).map_err(numeric_cast_parse_error)?
             else {
                 return Err(EvalError::Type(
                     "numeric cast: decimal parser returned non-decimal".to_owned(),
@@ -1440,8 +1440,7 @@ fn coerce_numeric_typmod(
         let Value::Decimal {
             value: rounded,
             scale,
-        } = parse_decimal_text(&rendered, Some(target_scale))
-            .map_err(|err| EvalError::Type(format!("numeric cast: invalid typmod: {err}")))?
+        } = parse_decimal_text(&rendered, Some(target_scale)).map_err(numeric_cast_parse_error)?
         else {
             return Err(EvalError::Type(
                 "numeric cast: decimal parser returned non-decimal".to_owned(),
@@ -1453,6 +1452,15 @@ fn coerce_numeric_typmod(
     };
     validate_numeric_precision(value, scale, precision, target_scale)?;
     Ok(Value::Decimal { value, scale })
+}
+
+fn numeric_cast_parse_error(err: impl std::fmt::Display) -> EvalError {
+    let message = err.to_string();
+    if message.contains("overflow") || message.contains("out of range") {
+        EvalError::NumericFieldOverflow("numeric value out of range".to_owned())
+    } else {
+        EvalError::Type(format!("numeric cast: invalid syntax: {message}"))
+    }
 }
 
 fn validate_numeric_precision(
