@@ -77,8 +77,8 @@ file focused on what still blocks production.
 - Full-text search remaining: native lexeme/query storage beyond the current
   text-backed representation, headline, dictionaries, full ranking parity, and
   GIN planner integration.
-- XML remaining surface: remaining XPath axes/functions and `XMLTABLE` beyond
-  the supported secure subset.
+- XML remaining surface: XPath axes/functions beyond the supported child,
+  attribute, text, namespace, and descendant subset, plus `XMLTABLE`.
 - Locale/collation remaining: ICU-backed collations, `CREATE COLLATION`,
   index/expression collation catalog deparse, and non-bytewise sort/search
   behavior beyond the supported built-in `default`/`C`/`POSIX` subset.

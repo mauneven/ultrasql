@@ -1219,19 +1219,45 @@ pub fn xml_xpath_element_fragments_with_namespaces(
     }
     let steps = parse_xml_path(path)?;
     let root = xml_root_element(document)?;
-    if !xml_step_matches(&root, &steps[0], namespace_bindings) {
-        return Some(Vec::new());
-    }
-    let mut current = vec![root];
+    let mut current = match &steps[0] {
+        XmlPathStep::Element { descendant, .. } => {
+            if *descendant {
+                let mut matches = Vec::new();
+                if xml_step_matches(&root, &steps[0], namespace_bindings) {
+                    matches.push(root.clone());
+                }
+                let mut step_matches =
+                    |element: &XmlElement| xml_step_matches(element, &steps[0], namespace_bindings);
+                collect_xml_descendant_elements(document, &root, &mut matches, &mut step_matches);
+                matches
+            } else if xml_step_matches(&root, &steps[0], namespace_bindings) {
+                vec![root]
+            } else {
+                Vec::new()
+            }
+        }
+        XmlPathStep::Attribute(_) | XmlPathStep::Text => return None,
+    };
     for (idx, step) in steps[1..].iter().enumerate() {
         let terminal = idx + 2 == steps.len();
         match step {
-            XmlPathStep::Element { .. } => {
+            XmlPathStep::Element { descendant, .. } => {
                 let mut next = Vec::new();
                 for element in &current {
-                    for child in xml_direct_child_elements(document, element) {
-                        if xml_step_matches(&child, step, namespace_bindings) {
-                            next.push(child);
+                    if *descendant {
+                        let mut step_matches =
+                            |child: &XmlElement| xml_step_matches(child, step, namespace_bindings);
+                        collect_xml_descendant_elements(
+                            document,
+                            element,
+                            &mut next,
+                            &mut step_matches,
+                        );
+                    } else {
+                        for child in xml_direct_child_elements(document, element) {
+                            if xml_step_matches(&child, step, namespace_bindings) {
+                                next.push(child);
+                            }
                         }
                     }
                 }
@@ -1286,6 +1312,7 @@ enum XmlPathStep {
     Element {
         name: String,
         attr_filter: Option<(String, String)>,
+        descendant: bool,
     },
     Attribute(String),
     Text,
@@ -1303,33 +1330,50 @@ struct XmlElement {
 }
 
 fn parse_xml_path(path: &str) -> Option<Vec<XmlPathStep>> {
-    let body = path.trim().strip_prefix('/')?;
-    if body.is_empty() || body.starts_with('/') {
+    let path = path.trim();
+    if !path.starts_with('/') {
         return None;
     }
-    let raw_segments = body.split('/').collect::<Vec<_>>();
     let mut steps = Vec::new();
-    for (idx, raw_segment) in raw_segments.iter().enumerate() {
-        let terminal = idx + 1 == raw_segments.len();
-        let segment = raw_segment.trim();
+    let mut cursor = 0_usize;
+    while cursor < path.len() {
+        let descendant = if path[cursor..].starts_with("//") {
+            cursor += 2;
+            true
+        } else if path[cursor..].starts_with('/') {
+            cursor += 1;
+            false
+        } else {
+            return None;
+        };
+        if cursor >= path.len() {
+            return None;
+        }
+        let relative_end = path[cursor..].find('/');
+        let segment_end = relative_end.map_or(path.len(), |offset| cursor + offset);
+        let terminal = segment_end == path.len();
+        let segment = path[cursor..segment_end].trim();
         if segment.is_empty() || segment == "." || segment == ".." {
             return None;
         }
         if segment == "text()" {
-            if !terminal {
+            if descendant || !terminal {
                 return None;
             }
             steps.push(XmlPathStep::Text);
+            cursor = segment_end;
             continue;
         }
         if let Some(attr_name) = segment.strip_prefix('@') {
-            if !terminal
+            if descendant
+                || !terminal
                 || attr_name.is_empty()
                 || xml_name_len(attr_name.as_bytes()) != attr_name.len()
             {
                 return None;
             }
             steps.push(XmlPathStep::Attribute(attr_name.to_owned()));
+            cursor = segment_end;
             continue;
         }
         let (name, attr_filter) = if let Some(open) = segment.find('[') {
@@ -1355,7 +1399,9 @@ fn parse_xml_path(path: &str) -> Option<Vec<XmlPathStep>> {
         steps.push(XmlPathStep::Element {
             name: name.to_owned(),
             attr_filter,
+            descendant,
         });
+        cursor = segment_end;
     }
     if steps.is_empty() { None } else { Some(steps) }
 }
@@ -1529,6 +1575,22 @@ fn xml_direct_child_elements(text: &str, parent: &XmlElement) -> Vec<XmlElement>
     out
 }
 
+fn collect_xml_descendant_elements<F>(
+    text: &str,
+    parent: &XmlElement,
+    out: &mut Vec<XmlElement>,
+    matches: &mut F,
+) where
+    F: FnMut(&XmlElement) -> bool,
+{
+    for child in xml_direct_child_elements(text, parent) {
+        if matches(&child) {
+            out.push(child.clone());
+        }
+        collect_xml_descendant_elements(text, &child, out, matches);
+    }
+}
+
 fn xml_direct_text(text: &str, element: &XmlElement) -> Option<String> {
     let mut out = String::new();
     let mut cursor = element.content_start;
@@ -1643,7 +1705,10 @@ fn xml_step_matches(
     step: &XmlPathStep,
     namespace_bindings: &[(String, String)],
 ) -> bool {
-    let XmlPathStep::Element { name, attr_filter } = step else {
+    let XmlPathStep::Element {
+        name, attr_filter, ..
+    } = step
+    else {
         return false;
     };
     xml_name_matches(
@@ -2699,6 +2764,19 @@ mod tests {
         assert_eq!(
             xml_xpath_element_fragments("/root/item/name/text()", doc),
             Some(vec!["A".to_owned(), "B".to_owned()])
+        );
+        let nested = r#"<root><group><item id="1"><name>A</name></item><item id="2"><name>B</name></item></group><name>C</name></root>"#;
+        assert_eq!(
+            xml_xpath_element_fragments(r#"//item[@id="2"]/name"#, nested),
+            Some(vec!["<name>B</name>".to_owned()])
+        );
+        assert_eq!(
+            xml_xpath_element_fragments("/root//name", nested),
+            Some(vec![
+                "<name>A</name>".to_owned(),
+                "<name>B</name>".to_owned(),
+                "<name>C</name>".to_owned()
+            ])
         );
         let namespaced =
             r#"<r:root xmlns:r="urn:r" xmlns:x="urn:x"><r:item x:id="7">Z</r:item></r:root>"#;

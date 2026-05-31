@@ -239,6 +239,12 @@ as a concise evidence ledger; roadmap stays for open gates only.
   `cargo test -p ultrasql-planner binds_xml_scalar_functions_with_precise_return_types --lib -- --nocapture`,
   and
   `cargo test -p ultrasql-server --test xml_round_trip xml_functions_validate_securely_and_extract_simple_xpath -- --nocapture`.
+- XML XPath now supports the descendant `//` abbreviation for bounded element
+  paths, including attribute filters and nested terminal selections, without
+  expanding the DTD/entity surface. Evidence:
+  `cargo test -p ultrasql-core xml_xpath_subset_filters_children_without_entity_resolution --lib -- --nocapture`
+  and
+  `cargo test -p ultrasql-server --test xml_round_trip xml_functions_validate_securely_and_extract_simple_xpath -- --nocapture`.
 - `pg_catalog.pg_proc` now advertises the supported XML function surface:
   `xml_is_well_formed`, `xml_is_well_formed_content`,
   `xml_is_well_formed_document`, `xpath`, and `xpath_exists`, including the
@@ -775,10 +781,10 @@ as a concise evidence ledger; roadmap stays for open gates only.
   (`xml_is_well_formed`, `xml_is_well_formed_content`,
   `xml_is_well_formed_document`) plus a deterministic `xpath` /
   `xpath_exists` subset for absolute element paths with optional attribute
-  equality filters, terminal `@attr` selection, and terminal `text()` selection.
-  Prefixed XML element and attribute names are covered in the subset; namespace
-  URI mapping remains open. DTD declarations, external entity expansion,
-  unknown entity references, and pre-root junk are rejected.
+  equality filters, terminal `@attr` selection, terminal `text()` selection,
+  namespace URI mapping arrays, and the descendant `//` abbreviation. DTD
+  declarations, external entity expansion, unknown entity references, and
+  pre-root junk are rejected.
 - XML syntax now covers `XMLPARSE(DOCUMENT|CONTENT ...)` and
   `XMLSERIALIZE(DOCUMENT|CONTENT ... AS TEXT)`, with malformed `DOCUMENT`
   inputs rejected through the wire path. Evidence:
