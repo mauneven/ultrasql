@@ -608,6 +608,27 @@ impl LockManager {
         })
     }
 
+    /// Return a point-in-time snapshot of every central lock-table
+    /// entry that currently has grants or waiters.
+    pub fn snapshot(&self) -> Vec<(LockTag, LockTableSnapshot)> {
+        let mut out = Vec::new();
+        for entry in self.table.iter() {
+            let tag = *entry.key();
+            let state = entry.value().inner.lock();
+            if state.grants.is_empty() && state.waiters.is_empty() {
+                continue;
+            }
+            out.push((
+                tag,
+                LockTableSnapshot {
+                    grants: state.grants.clone(),
+                    waiters: state.waiters.iter().copied().collect(),
+                },
+            ));
+        }
+        out
+    }
+
     // ── private helpers ───────────────────────────────────────────────────
 
     fn ensure_xid_state(&self, xid: Xid) {

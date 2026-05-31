@@ -10,6 +10,7 @@ use ultrasql_core::{DataType, Field, Oid, Schema, Value};
 use ultrasql_executor::{MemTableScan, Operator, build_batch};
 use ultrasql_mvcc::{Visibility, XidStatusOracle, is_visible};
 use ultrasql_planner::LogicalReferentialAction;
+use ultrasql_txn::{LockMode, LockTag};
 
 use crate::error::ServerError;
 
@@ -215,7 +216,7 @@ fn virtual_rows(name: &str, ctx: &LowerCtx<'_>) -> Option<(Schema, Vec<Vec<Value
         "pg_catalog.pg_stat_statements" => {
             Some((schema_pg_stat_statements(), rows_pg_stat_statements(ctx)))
         }
-        "pg_catalog.pg_locks" => Some((schema_pg_locks(), Vec::new())),
+        "pg_catalog.pg_locks" => Some((schema_pg_locks(), rows_pg_locks(ctx))),
         "pg_catalog.pg_stat_activity" => Some((schema_pg_stat_activity(), rows_pg_stat_activity())),
         "pg_catalog.pg_stat_user_tables" => {
             Some((schema_pg_stat_user_tables(), rows_pg_stat_user_tables(ctx)))
@@ -2245,10 +2246,116 @@ fn schema_pg_locks() -> Schema {
         Field::nullable("relation", DataType::Int64),
         Field::nullable("page", DataType::Int32),
         Field::nullable("tuple", DataType::Int16),
-        Field::required("pid", DataType::Int32),
+        Field::nullable("virtualxid", text()),
+        Field::nullable("transactionid", DataType::Int64),
+        Field::nullable("classid", DataType::Int64),
+        Field::nullable("objid", DataType::Int64),
+        Field::nullable("objsubid", DataType::Int16),
+        Field::nullable("virtualtransaction", text()),
+        Field::nullable("pid", DataType::Int32),
         Field::nullable("mode", text()),
         Field::required("granted", DataType::Bool),
+        Field::required("fastpath", DataType::Bool),
+        Field::nullable("waitstart", DataType::TimestampTz),
     ])
+}
+
+fn rows_pg_locks(ctx: &LowerCtx<'_>) -> Vec<Vec<Value>> {
+    let mut rows = Vec::new();
+    for (tag, snapshot) in ctx.oracle.lock_manager.snapshot() {
+        for (xid, mode) in snapshot.grants {
+            rows.push(pg_lock_row(tag, xid.raw(), mode, true));
+        }
+        for (xid, mode) in snapshot.waiters {
+            rows.push(pg_lock_row(tag, xid.raw(), mode, false));
+        }
+    }
+    rows
+}
+
+fn pg_lock_row(tag: LockTag, owner_xid: u64, mode: LockMode, granted: bool) -> Vec<Value> {
+    let pid = advisory_owner_pid(owner_xid)
+        .map(Value::Int32)
+        .unwrap_or(Value::Null);
+    let virtualtransaction = v_text(format!("0/{owner_xid}"));
+    let mode = v_text(lock_mode_name(mode));
+    let granted = Value::Bool(granted);
+    let fastpath = Value::Bool(false);
+    let waitstart = Value::Null;
+    match tag {
+        LockTag::Relation(relation) => vec![
+            v_text("relation"),
+            Value::Int64(1),
+            Value::Int64(i64::from(relation.oid().raw())),
+            Value::Null,
+            Value::Null,
+            Value::Null,
+            Value::Null,
+            Value::Null,
+            Value::Null,
+            Value::Null,
+            virtualtransaction,
+            pid,
+            mode,
+            granted,
+            fastpath,
+            waitstart,
+        ],
+        LockTag::Tuple(tid) => vec![
+            v_text("tuple"),
+            Value::Int64(1),
+            Value::Int64(i64::from(tid.page.relation.oid().raw())),
+            Value::Int32(i32::try_from(tid.page.block.raw()).unwrap_or(i32::MAX)),
+            Value::Int16(i16::try_from(tid.slot).unwrap_or(i16::MAX)),
+            Value::Null,
+            Value::Null,
+            Value::Null,
+            Value::Null,
+            Value::Null,
+            virtualtransaction,
+            pid,
+            mode,
+            granted,
+            fastpath,
+            waitstart,
+        ],
+        LockTag::Advisory { classid, objid } => vec![
+            v_text("advisory"),
+            Value::Int64(1),
+            Value::Null,
+            Value::Null,
+            Value::Null,
+            Value::Null,
+            Value::Null,
+            Value::Int64(i64::from(classid)),
+            Value::Int64(i64::from(objid)),
+            Value::Int16(1),
+            virtualtransaction,
+            pid,
+            mode,
+            granted,
+            fastpath,
+            waitstart,
+        ],
+    }
+}
+
+fn advisory_owner_pid(owner_xid: u64) -> Option<i32> {
+    let pid = u64::MAX.checked_sub(owner_xid)?;
+    i32::try_from(pid).ok()
+}
+
+fn lock_mode_name(mode: LockMode) -> &'static str {
+    match mode {
+        LockMode::AccessShare => "AccessShareLock",
+        LockMode::RowShare => "RowShareLock",
+        LockMode::RowExclusive => "RowExclusiveLock",
+        LockMode::ShareUpdateExclusive => "ShareUpdateExclusiveLock",
+        LockMode::Share => "ShareLock",
+        LockMode::ShareRowExclusive => "ShareRowExclusiveLock",
+        LockMode::Exclusive => "ExclusiveLock",
+        LockMode::AccessExclusive => "AccessExclusiveLock",
+    }
 }
 
 fn schema_pg_stat_activity() -> Schema {

@@ -815,6 +815,10 @@ as a concise evidence ledger; roadmap stays for open gates only.
   replication and psql introspection joins no longer see an empty link table.
   Evidence:
   `cargo test -p ultrasql-server --test logical_replication_round_trip create_publication_records_committed_dml_stream -- --nocapture`.
+- `pg_catalog.pg_locks` now exposes central lock-table grants and waiters,
+  including advisory lock `classid` / `objid`, mode, granted state, and owner
+  pid when it can be derived from a session-level advisory lock. Evidence:
+  `cargo test -p ultrasql-server --test advisory_lock_round_trip try_advisory_lock_conflicts_across_sessions_and_unlocks -- --nocapture`.
 - `GUI introspection probes` exist for `pgAdmin`, `DBeaver`, and `DataGrip`.
 - Migration tool certification covers `Flyway`, `Liquibase`, and `Alembic`.
 

@@ -27,6 +27,22 @@ async fn try_advisory_lock_conflicts_across_sessions_and_unlocks() {
         .await
         .expect("session a try lock");
     assert!(row.get::<_, bool>(0));
+    let locks = b
+        .query(
+            "SELECT locktype, classid, objid, mode, granted \
+             FROM pg_catalog.pg_locks \
+             WHERE locktype = 'advisory' \
+             ORDER BY classid, objid",
+            &[],
+        )
+        .await
+        .expect("pg_locks advisory rows");
+    assert_eq!(locks.len(), 1);
+    assert_eq!(locks[0].get::<_, String>(0), "advisory");
+    assert_eq!(locks[0].get::<_, i64>(1), 0);
+    assert_eq!(locks[0].get::<_, i64>(2), 9001);
+    assert_eq!(locks[0].get::<_, String>(3), "ExclusiveLock");
+    assert!(locks[0].get::<_, bool>(4));
 
     let row = b
         .query_one("SELECT pg_try_advisory_lock(9001)", &[])
