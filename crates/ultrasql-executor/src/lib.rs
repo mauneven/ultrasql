@@ -291,7 +291,12 @@ pub enum ExecError {
     GeneratedAlwaysViolation(String),
 }
 
-pub(crate) fn eval_error_to_exec_error(error: EvalError) -> ExecError {
+/// Convert scalar-expression interpreter errors into stable executor errors.
+///
+/// Server lowering code uses this helper for expression evaluation that
+/// happens outside executor operators, so runtime casts, numeric overflow,
+/// division by zero, and XML parser failures keep their SQLSTATE mapping.
+pub fn eval_error_to_exec_error(error: EvalError) -> ExecError {
     match error {
         EvalError::NumericFieldOverflow(detail) => ExecError::NumericFieldOverflow(detail),
         EvalError::Overflow => {

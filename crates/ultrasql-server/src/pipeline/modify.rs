@@ -12,6 +12,7 @@ use ultrasql_executor::{
     Eval, Filter, InsertConflictAction, InsertIndexEncoder, InsertIndexMaintainer, ModifyKind,
     ModifyTable, Operator, Project, RowCodec, RowConstraintCheck, RowUpdateConstraintCheck,
     SeqScan, SequenceDefault, ValuesScan, VectorIndexEncoder, VectorIndexMaintainer,
+    eval_error_to_exec_error,
 };
 use ultrasql_planner::{
     BinaryOp, LogicalIndexMethod, LogicalOnConflict, LogicalPlan, LogicalReferentialAction,
@@ -1255,7 +1256,7 @@ fn referential_default_value(
     };
     Eval::new(default.clone())
         .eval(&[])
-        .map_err(|e| ultrasql_executor::ExecError::TypeMismatch(e.to_string()))
+        .map_err(eval_error_to_exec_error)
 }
 
 fn validate_referential_action_row(
@@ -1273,7 +1274,7 @@ fn validate_referential_action_row(
     for check in &constraints.checks {
         match Eval::new(check.expr.clone())
             .eval(row)
-            .map_err(|e| ultrasql_executor::ExecError::TypeMismatch(e.to_string()))?
+            .map_err(eval_error_to_exec_error)?
         {
             Value::Bool(true) | Value::Null => {}
             Value::Bool(false) => {

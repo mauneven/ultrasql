@@ -1124,6 +1124,42 @@ async fn foreign_key_on_delete_set_default_updates_child_rows() {
     graceful_shutdown(running).await;
 }
 
+#[tokio::test]
+async fn foreign_key_on_delete_set_default_runtime_error_returns_sqlstate() {
+    let running = start_sample_server("fk_set_default_runtime_error").await;
+    let client = &running.client;
+
+    client
+        .batch_execute("CREATE TABLE parent (id INT PRIMARY KEY)")
+        .await
+        .expect("create parent");
+    client
+        .batch_execute(
+            "CREATE TABLE child (\
+             parent_id INT DEFAULT (1 / 0) REFERENCES parent(id) ON DELETE SET DEFAULT, \
+             v INT)",
+        )
+        .await
+        .expect("create child");
+    client
+        .batch_execute("INSERT INTO parent VALUES (1)")
+        .await
+        .expect("insert parent");
+    client
+        .batch_execute("INSERT INTO child VALUES (1, 10)")
+        .await
+        .expect("insert child");
+
+    let err = client
+        .batch_execute("DELETE FROM parent WHERE id = 1")
+        .await
+        .expect_err("SET DEFAULT runtime expression rejects delete");
+    let sqlstate = err.code().expect("server-sent SQLSTATE present");
+    assert_eq!(sqlstate.code(), "22012");
+
+    graceful_shutdown(running).await;
+}
+
 /// `ON UPDATE CASCADE` propagates parent key changes into child rows and
 /// keeps child indexes in sync.
 #[tokio::test]

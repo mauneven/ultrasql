@@ -1824,6 +1824,10 @@ as a concise evidence ledger; roadmap stays for open gates only.
 - Runtime errors inside omitted-column `DEFAULT` expression evaluation now
   preserve their typed SQLSTATEs and do not insert the row. Evidence:
   `cargo test -p ultrasql-server --test constraint_round_trip default_expression_runtime_error_returns_sqlstate -- --nocapture`.
+- Runtime errors inside referential `ON DELETE/UPDATE SET DEFAULT` default
+  expression evaluation now preserve typed SQLSTATEs instead of collapsing to
+  `XX000`. Evidence:
+  `cargo test -p ultrasql-server --test constraint_round_trip foreign_key_on_delete_set_default_runtime_error_returns_sqlstate -- --nocapture`.
 - Runtime errors inside `INSERT ... RETURNING` expression evaluation now
   preserve their typed SQLSTATEs and are evaluated before heap mutation, so the
   rejected insert leaves no row behind. Evidence:
