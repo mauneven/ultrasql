@@ -1,6 +1,6 @@
 //! SQL/JSON path subset shared by scalar JSON functions and table functions.
 
-use serde_json::Value as JsonValue;
+use serde_json::{Number as JsonNumber, Value as JsonValue};
 
 /// Parsed SQL/JSON path expression.
 #[derive(Clone, Debug, PartialEq)]
@@ -15,6 +15,13 @@ enum JsonPathStep {
     Wildcard,
     Recursive,
     Filter(JsonPathPredicate),
+    Method(JsonPathMethod),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum JsonPathMethod {
+    Size,
+    Type,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -80,51 +87,69 @@ pub fn parse_json_path(path: &str) -> Result<JsonPath, JsonPathError> {
 
 /// Select every JSON value matched by `path`.
 #[must_use]
-pub fn select_json_path<'a>(root: &'a JsonValue, path: &JsonPath) -> Vec<&'a JsonValue> {
+pub fn select_json_path(root: &JsonValue, path: &JsonPath) -> Vec<JsonValue> {
     select_json_path_with_vars(root, path, None)
 }
 
 /// Select every JSON value matched by `path`, resolving `$name` literals
 /// from `vars` when predicates compare against variables.
 #[must_use]
-pub fn select_json_path_with_vars<'a>(
-    root: &'a JsonValue,
+pub fn select_json_path_with_vars(
+    root: &JsonValue,
     path: &JsonPath,
     vars: Option<&JsonValue>,
-) -> Vec<&'a JsonValue> {
-    select_steps(vec![root], &path.steps, vars)
+) -> Vec<JsonValue> {
+    select_steps(vec![root.clone()], &path.steps, vars)
 }
 
-fn select_steps<'a>(
-    mut current: Vec<&'a JsonValue>,
+fn select_steps(
+    mut current: Vec<JsonValue>,
     steps: &[JsonPathStep],
     vars: Option<&JsonValue>,
-) -> Vec<&'a JsonValue> {
+) -> Vec<JsonValue> {
     for step in steps {
         let mut next = Vec::new();
-        for value in current {
-            match (step, value) {
-                (JsonPathStep::Key(key), JsonValue::Object(object)) => {
+        for item in current {
+            match step {
+                JsonPathStep::Key(key) => {
+                    let JsonValue::Object(object) = &item else {
+                        continue;
+                    };
                     if let Some(value) = object.get(key) {
-                        next.push(value);
+                        next.push(value.clone());
                     }
                 }
-                (JsonPathStep::Index(index), JsonValue::Array(values)) => {
+                JsonPathStep::Index(index) => {
+                    let JsonValue::Array(values) = &item else {
+                        continue;
+                    };
                     if let Some(value) = values.get(*index) {
-                        next.push(value);
+                        next.push(value.clone());
                     }
                 }
-                (JsonPathStep::Wildcard, JsonValue::Array(values)) => next.extend(values),
-                (JsonPathStep::Wildcard, JsonValue::Object(object)) => {
-                    next.extend(object.values());
+                JsonPathStep::Wildcard => match &item {
+                    JsonValue::Array(values) => {
+                        next.extend(values.iter().cloned());
+                    }
+                    JsonValue::Object(object) => {
+                        next.extend(object.values().cloned());
+                    }
+                    JsonValue::Null
+                    | JsonValue::Bool(_)
+                    | JsonValue::Number(_)
+                    | JsonValue::String(_) => {}
+                },
+                JsonPathStep::Recursive => {
+                    collect_recursive(&item, &mut next);
                 }
-                (JsonPathStep::Recursive, _) => collect_recursive(value, &mut next),
-                (JsonPathStep::Filter(predicate), _)
-                    if predicate_matches(value, predicate, vars) =>
-                {
-                    next.push(value);
+                JsonPathStep::Filter(predicate) => {
+                    if predicate_matches(&item, predicate, vars) {
+                        next.push(item);
+                    }
                 }
-                _ => {}
+                JsonPathStep::Method(method) => {
+                    next.push(apply_json_path_method(*method, &item));
+                }
             }
         }
         current = next;
@@ -132,8 +157,8 @@ fn select_steps<'a>(
     current
 }
 
-fn collect_recursive<'a>(value: &'a JsonValue, out: &mut Vec<&'a JsonValue>) {
-    out.push(value);
+fn collect_recursive(value: &JsonValue, out: &mut Vec<JsonValue>) {
+    out.push(value.clone());
     match value {
         JsonValue::Array(values) => {
             for child in values {
@@ -154,7 +179,7 @@ fn predicate_matches(
     predicate: &JsonPathPredicate,
     vars: Option<&JsonValue>,
 ) -> bool {
-    let selected = select_steps(vec![value], &predicate.path, vars);
+    let selected = select_steps(vec![value.clone()], &predicate.path, vars);
     let Some(op) = predicate.op else {
         return !selected.is_empty();
     };
@@ -206,6 +231,34 @@ fn compare_json_value(left: &JsonValue, op: JsonPathCompareOp, right: &JsonValue
             )
         }
         _ => false,
+    }
+}
+
+fn apply_json_path_method(method: JsonPathMethod, value: &JsonValue) -> JsonValue {
+    match method {
+        JsonPathMethod::Size => {
+            let size = match value {
+                JsonValue::Array(values) => values.len(),
+                JsonValue::Object(object) => object.len(),
+                JsonValue::Null
+                | JsonValue::Bool(_)
+                | JsonValue::Number(_)
+                | JsonValue::String(_) => 1,
+            };
+            JsonValue::Number(JsonNumber::from(u64::try_from(size).unwrap_or(u64::MAX)))
+        }
+        JsonPathMethod::Type => JsonValue::String(json_path_type_name(value).to_owned()),
+    }
+}
+
+fn json_path_type_name(value: &JsonValue) -> &'static str {
+    match value {
+        JsonValue::Null => "null",
+        JsonValue::Bool(_) => "boolean",
+        JsonValue::Number(_) => "number",
+        JsonValue::String(_) => "string",
+        JsonValue::Array(_) => "array",
+        JsonValue::Object(_) => "object",
     }
 }
 
@@ -265,7 +318,14 @@ impl<'a> JsonPathParser<'a> {
                     } else if self.consume_byte(b'"') {
                         steps.push(JsonPathStep::Key(self.parse_quoted_string_body()?));
                     } else {
-                        steps.push(JsonPathStep::Key(self.parse_identifier()?));
+                        let identifier = self.parse_identifier()?;
+                        if self.consume_byte(b'(') {
+                            self.skip_ws();
+                            self.expect_byte(b')', "expected ) after jsonpath method")?;
+                            steps.push(JsonPathStep::Method(json_path_method(&identifier)?));
+                        } else {
+                            steps.push(JsonPathStep::Key(identifier));
+                        }
                     }
                 }
                 Some(b'[') => steps.push(self.parse_bracket_step()?),
@@ -526,6 +586,16 @@ impl<'a> JsonPathParser<'a> {
     }
 }
 
+fn json_path_method(name: &str) -> Result<JsonPathMethod, JsonPathError> {
+    match name {
+        "size" => Ok(JsonPathMethod::Size),
+        "type" => Ok(JsonPathMethod::Type),
+        _ => Err(JsonPathError::new(format!(
+            "unsupported jsonpath method {name}"
+        ))),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -543,29 +613,23 @@ mod tests {
         });
 
         let path = parse_json_path(r#"$.items[*] ? (@.meta.kind == "guide").id"#).unwrap();
-        let got: Vec<_> = select_json_path(&document, &path)
-            .into_iter()
-            .cloned()
-            .collect();
+        let got = select_json_path(&document, &path);
         assert_eq!(got, vec![serde_json::json!(1), serde_json::json!(3)]);
 
         let quoted = parse_json_path(r#"$."weird-key".id"#).unwrap();
         assert_eq!(
             select_json_path(&document, &quoted),
-            vec![&serde_json::json!(9)]
+            vec![serde_json::json!(9)]
         );
 
         let escaped = parse_json_path(r#"$."snowman-\u2603".id"#).unwrap();
         assert_eq!(
             select_json_path(&document, &escaped),
-            vec![&serde_json::json!(10)]
+            vec![serde_json::json!(10)]
         );
 
         let recursive = parse_json_path("$.**.kind").unwrap();
-        let mut got: Vec<_> = select_json_path(&document, &recursive)
-            .into_iter()
-            .cloned()
-            .collect();
+        let mut got = select_json_path(&document, &recursive);
         got.sort_by_key(JsonValue::to_string);
         assert_eq!(
             got,
@@ -574,6 +638,33 @@ mod tests {
                 serde_json::json!("guide"),
                 serde_json::json!("paper"),
             ]
+        );
+    }
+
+    #[test]
+    fn path_supports_basic_methods() {
+        let document = serde_json::json!({
+            "items": [1, 2, 3],
+            "meta": {"ok": true},
+            "scalar": 7
+        });
+
+        let size = parse_json_path("$.items.size()").unwrap();
+        assert_eq!(
+            select_json_path(&document, &size),
+            vec![serde_json::json!(3)]
+        );
+
+        let object_type = parse_json_path("$.meta.type()").unwrap();
+        assert_eq!(
+            select_json_path(&document, &object_type),
+            vec![serde_json::json!("object")]
+        );
+
+        let scalar_size = parse_json_path("$.scalar.size()").unwrap();
+        assert_eq!(
+            select_json_path(&document, &scalar_size),
+            vec![serde_json::json!(1)]
         );
     }
 }

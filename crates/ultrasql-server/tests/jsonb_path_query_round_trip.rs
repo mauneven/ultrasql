@@ -186,6 +186,36 @@ async fn jsonb_path_query_supports_variable_literals() {
 }
 
 #[tokio::test]
+async fn jsonb_path_query_supports_basic_methods() {
+    let running = start_sample_server("jsonb_path_query_test").await;
+    let client = &running.client;
+
+    let messages = client
+        .simple_query(
+            "SELECT value FROM jsonb_path_query(\
+             '{\"items\":[1,2,3],\"meta\":{\"ok\":true}}'::jsonb, \
+             '$.items.size()') \
+             UNION ALL \
+             SELECT value FROM jsonb_path_query(\
+             '{\"items\":[1,2,3],\"meta\":{\"ok\":true}}'::jsonb, \
+             '$.meta.type()')",
+        )
+        .await
+        .expect("jsonb_path_query basic methods");
+    let rows: Vec<String> = messages
+        .into_iter()
+        .filter_map(|message| match message {
+            SimpleQueryMessage::Row(row) => row.get(0).map(str::to_owned),
+            _ => None,
+        })
+        .collect();
+
+    assert_eq!(rows, vec!["3".to_owned(), "\"object\"".to_owned()]);
+
+    shutdown(running).await;
+}
+
+#[tokio::test]
 async fn jsonb_path_exists_evaluates_sql_json_predicates() {
     let running = start_sample_server("jsonb_path_query_test").await;
     let client = &running.client;
