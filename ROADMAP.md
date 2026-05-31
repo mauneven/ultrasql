@@ -68,8 +68,7 @@ file focused on what still blocks production.
 - `NUMERIC(p,s)` / `DECIMAL(p,s)`: arbitrary-precision runtime arithmetic
   remains open beyond the scaled-`i64` surface.
 - `MONEY`: locale-sensitive formatting/input beyond deterministic
-  `lc_monetary` GUC round trips, explicit typmod/precision edge casts, and
-  range-parity evidence remain open.
+  `lc_monetary` GUC round trips remains open.
 - Date/time remaining: full timezone edge parity beyond the completed
   timestamp/timestamptz `AT TIME ZONE`, fixed-offset `TIMETZ AT TIME ZONE`,
   deterministic abbreviation parser, IANA timestamptz parser/session display,

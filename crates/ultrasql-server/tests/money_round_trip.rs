@@ -234,3 +234,50 @@ async fn money_and_numeric_runtime_casts_from_columns() {
 
     shutdown(running).await;
 }
+
+#[tokio::test]
+async fn money_runtime_range_errors_use_precise_sqlstates() {
+    let running = start_sample_server("money_runtime_range_errors").await;
+    let client = &running.client;
+
+    client
+        .batch_execute(
+            "CREATE TABLE money_edges (
+                amount MONEY NOT NULL,
+                bump MONEY NOT NULL,
+                divisor INT NOT NULL
+            )",
+        )
+        .await
+        .expect("create money edge table");
+    client
+        .batch_execute(
+            "INSERT INTO money_edges VALUES (
+                '$92233720368547758.07'::money,
+                '$0.01'::money,
+                0
+            )",
+        )
+        .await
+        .expect("insert money edge row");
+
+    let overflow = client
+        .simple_query("SELECT amount + bump FROM money_edges")
+        .await
+        .expect_err("money addition overflow must fail");
+    assert_eq!(
+        overflow.code().map(tokio_postgres::error::SqlState::code),
+        Some("22003")
+    );
+
+    let div_zero = client
+        .simple_query("SELECT amount / divisor FROM money_edges")
+        .await
+        .expect_err("money division by zero must fail");
+    assert_eq!(
+        div_zero.code().map(tokio_postgres::error::SqlState::code),
+        Some("22012")
+    );
+
+    shutdown(running).await;
+}

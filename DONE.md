@@ -842,6 +842,9 @@ as a concise evidence ledger; roadmap stays for open gates only.
   integer division, rounded floating-point division, checked scalar
   multiplication, money ratio division, runtime money/numeric/text casts, and
   deterministic `lc_monetary` GUC round trips, and behavior tests exist.
+  Runtime money addition overflow now reports SQLSTATE `22003`, and runtime
+  division by zero reports SQLSTATE `22012`. Evidence:
+  `cargo test -p ultrasql-server --test money_round_trip money_runtime_range_errors_use_precise_sqlstates -- --nocapture`.
 - `CHAR(n)` / `bpchar` parser, binder, row codec, executor, OID 1042, COPY,
   catalog persistence, blank padding, assignment/cast truncation, and
   trailing-space comparison semantics exist.

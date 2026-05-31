@@ -96,6 +96,8 @@ impl Operator for ProjectExprs {
 fn eval_error_to_exec(error: EvalError) -> ExecError {
     match error {
         EvalError::NumericFieldOverflow(detail) => ExecError::NumericFieldOverflow(detail),
+        EvalError::Overflow => ExecError::NumericFieldOverflow("numeric value out of range".into()),
+        EvalError::DivByZero => ExecError::DivisionByZero("division by zero".into()),
         other => ExecError::TypeMismatch(other.to_string()),
     }
 }

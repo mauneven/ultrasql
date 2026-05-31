@@ -168,8 +168,8 @@ pub use sinks::{CountSink, SumSink};
 /// upstream layers (a planner that mis-types a column reference, a kernel
 /// that produced a batch wider than its declared schema) surface as
 /// [`ExecError::TypeMismatch`] or [`ExecError::Internal`]. Hot-path
-/// arithmetic overflow and resource limits will land as additional
-/// variants once the corresponding operators arrive; the enum is therefore
+/// arithmetic overflow and resource limits use typed variants whenever
+/// callers can map them to stable SQLSTATE values; the enum is therefore
 /// `#[non_exhaustive]`.
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
@@ -189,6 +189,11 @@ pub enum ExecError {
     /// to PostgreSQL SQLSTATE `22003`.
     #[error("{0}")]
     NumericFieldOverflow(String),
+
+    /// A numeric expression attempted division by zero. The server maps
+    /// this to PostgreSQL SQLSTATE `22012`.
+    #[error("{0}")]
+    DivisionByZero(String),
 
     /// A batch was produced that exceeds the configured maximum row
     /// count. The executor caps batches at 4096 rows

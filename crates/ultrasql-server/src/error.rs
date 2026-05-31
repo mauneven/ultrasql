@@ -274,6 +274,9 @@ impl ServerError {
             // numeric_value_out_of_range — assignment exceeds
             // declared NUMERIC/DECIMAL precision.
             Self::Execute(ultrasql_executor::ExecError::NumericFieldOverflow(_)) => "22003",
+            // division_by_zero — scalar runtime arithmetic detected a
+            // zero divisor.
+            Self::Execute(ultrasql_executor::ExecError::DivisionByZero(_)) => "22012",
             // query_canceled — operator polled the `CancelFlag` between
             // batches and short-circuited after a peer `CancelRequest`
             // flipped it. Mirrors PostgreSQL's `query_canceled`.
