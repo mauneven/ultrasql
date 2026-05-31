@@ -231,6 +231,12 @@ as a concise evidence ledger; roadmap stays for open gates only.
   `cargo test -p ultrasql-planner binds_xml_scalar_functions_with_precise_return_types --lib -- --nocapture`,
   and
   `cargo test -p ultrasql-server --test xml_round_trip xml_functions_validate_securely_and_extract_simple_xpath -- --nocapture`.
+- `pg_catalog.pg_proc` now advertises the supported XML function surface:
+  `xml_is_well_formed`, `xml_is_well_formed_content`,
+  `xml_is_well_formed_document`, `xpath`, and `xpath_exists`, including the
+  namespace-array overloads. `format_type(143)` now renders `xml[]`.
+  Evidence:
+  `cargo test -p ultrasql-server --test catalog_views_round_trip pg_proc_advertises_supported_xml_functions -- --nocapture`.
 - `GatherMerge` now propagates merge-key evaluation failures instead of
   silently comparing them as NULL. Evidence:
   `cargo test -p ultrasql-executor gather`.

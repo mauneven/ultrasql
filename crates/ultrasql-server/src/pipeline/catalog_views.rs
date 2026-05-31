@@ -28,6 +28,8 @@ const PROC_TYPE_INT8: u32 = 20;
 const PROC_TYPE_TEXT: u32 = 25;
 const PROC_TYPE_OID: u32 = 26;
 const PROC_TYPE_TEXT_ARRAY: u32 = 1009;
+const PROC_TYPE_XML: u32 = 142;
+const PROC_TYPE_XML_ARRAY: u32 = 143;
 const PROC_TYPE_UUID: u32 = 2950;
 const PG_TYPE_BOOL: i32 = 16;
 const PG_TYPE_BOOL_ARRAY: i32 = 1000;
@@ -3398,6 +3400,8 @@ fn pg_type_name_from_oid(oid: u32) -> &'static str {
         PROC_TYPE_TEXT => "text",
         PROC_TYPE_OID => "oid",
         PROC_TYPE_TEXT_ARRAY => "ARRAY",
+        PROC_TYPE_XML => "xml",
+        PROC_TYPE_XML_ARRAY => "xml[]",
         PROC_TYPE_UUID => "uuid",
         _ => "text",
     }
@@ -3572,6 +3576,48 @@ const fn pg_proc_builtins() -> &'static [PgProcBuiltin] {
             return_type_oid: PROC_TYPE_TEXT,
             arg_type_oids: &[],
             volatility: "s",
+        },
+        PgProcBuiltin {
+            name: "xml_is_well_formed",
+            return_type_oid: PROC_TYPE_BOOL,
+            arg_type_oids: &[PROC_TYPE_TEXT],
+            volatility: "i",
+        },
+        PgProcBuiltin {
+            name: "xml_is_well_formed_content",
+            return_type_oid: PROC_TYPE_BOOL,
+            arg_type_oids: &[PROC_TYPE_TEXT],
+            volatility: "i",
+        },
+        PgProcBuiltin {
+            name: "xml_is_well_formed_document",
+            return_type_oid: PROC_TYPE_BOOL,
+            arg_type_oids: &[PROC_TYPE_TEXT],
+            volatility: "i",
+        },
+        PgProcBuiltin {
+            name: "xpath",
+            return_type_oid: PROC_TYPE_XML_ARRAY,
+            arg_type_oids: &[PROC_TYPE_TEXT, PROC_TYPE_XML],
+            volatility: "i",
+        },
+        PgProcBuiltin {
+            name: "xpath",
+            return_type_oid: PROC_TYPE_XML_ARRAY,
+            arg_type_oids: &[PROC_TYPE_TEXT, PROC_TYPE_XML, PROC_TYPE_TEXT_ARRAY],
+            volatility: "i",
+        },
+        PgProcBuiltin {
+            name: "xpath_exists",
+            return_type_oid: PROC_TYPE_BOOL,
+            arg_type_oids: &[PROC_TYPE_TEXT, PROC_TYPE_XML],
+            volatility: "i",
+        },
+        PgProcBuiltin {
+            name: "xpath_exists",
+            return_type_oid: PROC_TYPE_BOOL,
+            arg_type_oids: &[PROC_TYPE_TEXT, PROC_TYPE_XML, PROC_TYPE_TEXT_ARRAY],
+            volatility: "i",
         },
     ]
 }

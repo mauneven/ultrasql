@@ -76,8 +76,8 @@ file focused on what still blocks production.
 - Full-text search remaining: native lexeme/query storage beyond the current
   text-backed representation, headline, dictionaries, full ranking parity, and
   GIN planner integration.
-- XML remaining surface: remaining XPath axes/functions, `XMLTABLE`, and
-  function catalog parity beyond the supported secure subset.
+- XML remaining surface: remaining XPath axes/functions and `XMLTABLE` beyond
+  the supported secure subset.
 - Locale/collation remaining: ICU-backed collations, `CREATE COLLATION`, and
   `COLLATE` in definitions and `ORDER BY` beyond the base
   `pg_collation` catalog rows.

@@ -705,6 +705,7 @@ fn eval_format_type(args: &[Value]) -> Result<Value, EvalError> {
         790 => "money",
         114 => "json",
         142 => "xml",
+        143 => "xml[]",
         650 => "cidr",
         829 => "macaddr",
         869 => "inet",

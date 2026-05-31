@@ -1703,6 +1703,69 @@ async fn psql_list_functions_probe_filters_builtin_pg_proc() {
 }
 
 #[tokio::test]
+async fn pg_proc_advertises_supported_xml_functions() {
+    let (_server, client, _conn, server_handle) = start_server_and_connect().await;
+
+    let rows = client
+        .query(
+            "SELECT proname, pronargs, pg_catalog.format_type(prorettype, NULL), proretset \
+             FROM pg_catalog.pg_proc \
+             WHERE proname IN ( \
+                'xml_is_well_formed', \
+                'xml_is_well_formed_content', \
+                'xml_is_well_formed_document', \
+                'xpath', \
+                'xpath_exists') \
+             ORDER BY proname, pronargs",
+            &[],
+        )
+        .await
+        .expect("xml pg_proc rows");
+
+    let got = rows
+        .iter()
+        .map(|row| {
+            (
+                row.get::<_, String>(0),
+                row.get::<_, i16>(1),
+                row.get::<_, String>(2),
+                row.get::<_, bool>(3),
+            )
+        })
+        .collect::<Vec<_>>();
+
+    assert_eq!(
+        got,
+        vec![
+            (
+                "xml_is_well_formed".to_owned(),
+                1,
+                "boolean".to_owned(),
+                false
+            ),
+            (
+                "xml_is_well_formed_content".to_owned(),
+                1,
+                "boolean".to_owned(),
+                false,
+            ),
+            (
+                "xml_is_well_formed_document".to_owned(),
+                1,
+                "boolean".to_owned(),
+                false,
+            ),
+            ("xpath".to_owned(), 2, "xml[]".to_owned(), false),
+            ("xpath".to_owned(), 3, "xml[]".to_owned(), false),
+            ("xpath_exists".to_owned(), 2, "boolean".to_owned(), false),
+            ("xpath_exists".to_owned(), 3, "boolean".to_owned(), false),
+        ]
+    );
+
+    shutdown(client, server_handle).await;
+}
+
+#[tokio::test]
 async fn psql_list_roles_probe_accepts_empty_pg_auth_members() {
     let (_server, client, _conn, server_handle) = start_server_and_connect().await;
 
