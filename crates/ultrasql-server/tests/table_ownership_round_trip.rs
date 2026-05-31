@@ -19,6 +19,7 @@ async fn non_owner_cannot_alter_truncate_or_drop_table() {
         "SET ROLE ddl_owner",
         "CREATE TABLE ddl_owned_table (id INT NOT NULL)",
         "INSERT INTO ddl_owned_table VALUES (1)",
+        "CREATE INDEX ddl_owned_idx ON ddl_owned_table (id)",
         "RESET ROLE",
     ] {
         client.batch_execute(sql).await.expect(sql);
@@ -26,6 +27,18 @@ async fn non_owner_cannot_alter_truncate_or_drop_table() {
 
     let (attacker, attacker_conn) =
         connect_as(running.bound, "ddl_attacker", "table_ownership_attacker").await;
+    assert_insufficient_privilege(
+        attacker
+            .batch_execute("CREATE INDEX ddl_attacker_idx ON ddl_owned_table (id)")
+            .await
+            .expect_err("non-owner cannot create index on table"),
+    );
+    assert_insufficient_privilege(
+        attacker
+            .batch_execute("DROP INDEX ddl_owned_idx")
+            .await
+            .expect_err("non-owner cannot drop table index"),
+    );
     assert_insufficient_privilege(
         attacker
             .batch_execute("ALTER TABLE ddl_owned_table ADD COLUMN stolen INT")

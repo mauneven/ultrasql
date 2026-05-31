@@ -1208,6 +1208,7 @@ where
                 table_name.clone(),
             ))
         })?;
+        self.ensure_table_owner_or_superuser(table.oid, table_name)?;
 
         if *method == LogicalIndexMethod::Aggregating {
             if *unique {
@@ -1844,6 +1845,15 @@ where
         let mut entries = Vec::with_capacity(indexes.len());
         for name in indexes {
             if let Some(entry) = self.state.persistent_catalog.lookup_index(name) {
+                let table_name = self
+                    .state
+                    .persistent_catalog
+                    .lookup_table_by_oid(entry.table_oid)
+                    .map_or_else(
+                        || format!("oid {}", entry.table_oid.raw()),
+                        |table| table.name,
+                    );
+                self.ensure_table_owner_or_superuser(entry.table_oid, &table_name)?;
                 if entry.is_unique && entry.name.ends_with("_pkey") {
                     return Err(ServerError::DependentObjectsStillExist(format!(
                         "cannot drop index {} because primary key constraint depends on it",
