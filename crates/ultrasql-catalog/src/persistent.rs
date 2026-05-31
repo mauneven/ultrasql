@@ -1678,6 +1678,53 @@ impl PersistentCatalog {
         Ok(())
     }
 
+    /// Append a durable `pg_class` tombstone for a dropped index.
+    ///
+    /// `pg_index` rows are append-only today. Bootstrap only rebuilds indexes
+    /// whose latest `pg_class` row is `RelKind::Index`, so a dropped marker on
+    /// the index relation suppresses older index metadata after restart.
+    pub fn persist_index_drop_tombstone<L: PageLoader>(
+        &self,
+        entry: &IndexEntry,
+        heap: &HeapAccess<L>,
+        xmin: ultrasql_core::Xid,
+        command_id: ultrasql_core::CommandId,
+    ) -> Result<(), CatalogError> {
+        use ultrasql_storage::heap::InsertOptions;
+
+        let pg_class_rel = RelationId::new(bootstrap::PG_CLASS_OID);
+        let wal = heap.wal_sink().map(|sink| sink.as_ref());
+        let class_row = ClassRow {
+            oid: entry.oid,
+            relname: entry.name.clone(),
+            relnamespace: Oid::new(bootstrap::PUBLIC_OID),
+            relkind: RelKind::Dropped,
+            relpages: 0,
+            reltuples: 0.0,
+            relfilenode: entry.root_block.raw(),
+            relhasindex: false,
+            reloptions: Vec::new(),
+        };
+        let class_bytes = class_row
+            .encode()
+            .map_err(|e| CatalogError::schema_conflict(format!("encode pg_class: {e}")))?;
+        heap.insert(
+            pg_class_rel,
+            &class_bytes,
+            InsertOptions {
+                xmin,
+                command_id,
+                wal,
+                fsm: None,
+                vm: None,
+            },
+        )
+        .map_err(|e| {
+            CatalogError::schema_conflict(format!("pg_class index tombstone insert: {e}"))
+        })?;
+        Ok(())
+    }
+
     /// Append one `pg_constraint` row to the persistent catalog heap.
     pub fn persist_constraint_row<L: PageLoader>(
         &self,

@@ -1765,6 +1765,84 @@ where
         Ok(run_ddl_command("CREATE INDEX"))
     }
 
+    /// Drop one or more indexes and their dependent runtime metadata.
+    pub(crate) fn execute_drop_index(
+        &self,
+        plan: &LogicalPlan,
+    ) -> Result<SelectResult, ServerError> {
+        let LogicalPlan::DropIndex {
+            indexes, if_exists, ..
+        } = plan
+        else {
+            return Err(ServerError::Unsupported(
+                "execute_drop_index called with non-DropIndex plan",
+            ));
+        };
+
+        let mut entries = Vec::with_capacity(indexes.len());
+        for name in indexes {
+            if let Some(entry) = self.state.persistent_catalog.lookup_index(name) {
+                entries.push(entry);
+            } else if !*if_exists {
+                return Err(ultrasql_catalog::CatalogError::not_found(name.clone()).into());
+            }
+        }
+        if entries.is_empty() {
+            return Ok(run_ddl_command("DROP INDEX"));
+        }
+
+        let ddl_txn = self
+            .state
+            .txn_manager
+            .begin(ultrasql_txn::IsolationLevel::ReadCommitted);
+        let ddl_xid = ddl_txn.xid;
+        let ddl_command_id = ddl_txn.current_command;
+        let persist_result = entries.iter().try_for_each(|entry| {
+            self.state.persistent_catalog.persist_index_drop_tombstone(
+                entry,
+                self.state.heap.as_ref(),
+                ddl_xid,
+                ddl_command_id,
+            )
+        });
+        if let Err(e) = persist_result {
+            if let Err(abort_err) = self.state.txn_manager.abort(ddl_txn) {
+                tracing::warn!(
+                    error = %abort_err,
+                    "abort of DROP INDEX catalog txn failed",
+                );
+            }
+            return Err(e.into());
+        }
+        self.state
+            .commit_transaction(ddl_txn, true, "DROP INDEX catalog transaction")?;
+
+        let mut runtime_metadata_removed = false;
+        for entry in entries {
+            if let Some(mut constraints) = self
+                .state
+                .table_constraints
+                .get(&entry.table_oid)
+                .map(|guard| guard.value().as_ref().clone())
+                && constraints.indexes.remove(&entry.oid).is_some()
+            {
+                self.state
+                    .table_constraints
+                    .insert(entry.table_oid, Arc::new(constraints));
+                runtime_metadata_removed = true;
+            }
+            self.state
+                .persistent_catalog
+                .clear_descriptions_for_object(entry.oid);
+            self.state.persistent_catalog.drop_index(&entry.name)?;
+        }
+        if runtime_metadata_removed {
+            self.state.persist_table_runtime_constraints_metadata()?;
+        }
+        self.plan_cache_invalidate();
+        Ok(run_ddl_command("DROP INDEX"))
+    }
+
     /// Drop one or more tables.
     ///
     /// The binder has already filtered names through the catalog —

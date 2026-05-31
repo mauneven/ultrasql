@@ -316,6 +316,7 @@ fn lower_query_inner(
         | LogicalPlan::CreateTypeComposite { .. }
         | LogicalPlan::CreateDomain { .. }
         | LogicalPlan::CreateIndex { .. }
+        | LogicalPlan::DropIndex { .. }
         | LogicalPlan::CreatePolicy { .. }
         | LogicalPlan::CreateRole { .. }
         | LogicalPlan::AlterRole { .. }
@@ -673,6 +674,7 @@ fn profile_operator_name(plan: &LogicalPlan) -> &'static str {
         LogicalPlan::CreateTypeComposite { .. } => "CreateTypeComposite",
         LogicalPlan::CreateDomain { .. } => "CreateDomain",
         LogicalPlan::CreateIndex { .. } => "CreateIndex",
+        LogicalPlan::DropIndex { .. } => "DropIndex",
         LogicalPlan::CreatePolicy { .. } => "CreatePolicy",
         LogicalPlan::CreateRole { .. } => "CreateRole",
         LogicalPlan::AlterRole { .. } => "AlterRole",

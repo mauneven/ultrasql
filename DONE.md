@@ -694,6 +694,10 @@ as a concise evidence ledger; roadmap stays for open gates only.
   `pg_description` rows immediately, so catalog views cannot expose comments
   for dropped objects before restart. Evidence:
   `cargo test -p ultrasql-server --test comment_restart_round_trip`.
+- `DROP INDEX` is now bound, dispatched, persisted with a durable catalog
+  tombstone, clears live index comments, and stays dropped after restart.
+  Evidence: `cargo test -p ultrasql-server --test drop_index_round_trip` and
+  `cargo test -p ultrasql-planner drop_index`.
 - Dropped sequences remove sequence privilege grants from memory and durable
   `pg_privileges.meta`, so a recreated sequence cannot inherit stale ACLs by
   name. Evidence:

@@ -14,6 +14,10 @@ pub enum PlanError {
     #[error("table not found: '{0}'")]
     TableNotFound(String),
 
+    /// The named index does not exist in the catalog.
+    #[error("index not found: '{0}'")]
+    IndexNotFound(String),
+
     /// A referenced column does not exist in the scope.
     #[error("column not found: '{0}'")]
     ColumnNotFound(String),

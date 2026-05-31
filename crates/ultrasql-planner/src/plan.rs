@@ -796,6 +796,18 @@ pub enum LogicalPlan {
         schema: Schema,
     },
 
+    /// Drop one or more indexes.
+    DropIndex {
+        /// Lowercase index names to drop, in the user's order.
+        indexes: Vec<String>,
+        /// Whether `IF EXISTS` was specified.
+        if_exists: bool,
+        /// Whether `CASCADE` was specified.
+        cascade: bool,
+        /// Always [`Schema::empty`].
+        schema: Schema,
+    },
+
     /// Drop one or more base tables and (cascading) their indexes.
     ///
     /// The binder lowercases every name and validates that — for the
@@ -1775,6 +1787,7 @@ impl LogicalPlan {
                 | Self::CreateTypeComposite { .. }
                 | Self::CreateDomain { .. }
                 | Self::CreateIndex { .. }
+                | Self::DropIndex { .. }
                 | Self::CreatePolicy { .. }
                 | Self::CreateRole { .. }
                 | Self::AlterRole { .. }
@@ -1841,6 +1854,7 @@ impl LogicalPlan {
             | Self::CreateTypeComposite { .. }
             | Self::CreateDomain { .. }
             | Self::CreateIndex { .. }
+            | Self::DropIndex { .. }
             | Self::CreatePolicy { .. }
             | Self::CreateRole { .. }
             | Self::AlterRole { .. }
@@ -1898,6 +1912,7 @@ impl LogicalPlan {
             | Self::Cte { schema, .. }
             | Self::LockRows { schema, .. }
             | Self::CreateIndex { schema, .. }
+            | Self::DropIndex { schema, .. }
             | Self::CreatePolicy { schema, .. }
             | Self::CreateRole { schema, .. }
             | Self::AlterRole { schema, .. }
@@ -2472,6 +2487,23 @@ impl LogicalPlan {
                                 .collect::<Vec<_>>()
                                 .join(",")
                         }
+                    ),
+                );
+            }
+            Self::DropIndex {
+                indexes,
+                if_exists,
+                cascade,
+                ..
+            } => {
+                out.push_str(&pad);
+                let inx = if *if_exists { " IF EXISTS" } else { "" };
+                let csc = if *cascade { " CASCADE" } else { "" };
+                let _ = fmt::write(
+                    out,
+                    format_args!(
+                        "DropIndex{inx}: indexes=[{names}]{csc}\n",
+                        names = indexes.join(", ")
                     ),
                 );
             }
@@ -3417,6 +3449,15 @@ mod tests {
                     schema: empty(),
                 },
                 "CreateUniqueIndex Concurrently IF NOT EXISTS:",
+            ),
+            (
+                LogicalPlan::DropIndex {
+                    indexes: vec!["users_expr_idx".to_owned()],
+                    if_exists: true,
+                    cascade: true,
+                    schema: empty(),
+                },
+                "DropIndex IF EXISTS: indexes=[users_expr_idx] CASCADE",
             ),
             (
                 LogicalPlan::AlterTable {

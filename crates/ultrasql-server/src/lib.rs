@@ -2245,6 +2245,10 @@ impl PlannerCatalog for CombinedCatalog<'_> {
         PlannerCatalog::lookup_type(self.snapshot, name).or_else(|| self.fallback.lookup_type(name))
     }
 
+    fn lookup_index(&self, name: &str) -> bool {
+        PlannerCatalog::lookup_index(self.snapshot, name)
+    }
+
     fn lookup_table_oid(&self, name: &str) -> Option<Oid> {
         PlannerCatalog::lookup_table_oid(self.snapshot, name)
     }

@@ -318,6 +318,7 @@ impl<'s> CostModel<'s> {
             | LogicalPlan::AlterDefaultPrivileges { .. }
             | LogicalPlan::GrantRole { .. }
             | LogicalPlan::RevokeRole { .. }
+            | LogicalPlan::DropIndex { .. }
             | LogicalPlan::DropTable { .. }
             | LogicalPlan::AlterTable { .. }
             | LogicalPlan::CreateSequence { .. }

@@ -323,6 +323,7 @@ where
             | LogicalPlan::CreateTypeComposite { .. }
             | LogicalPlan::CreateDomain { .. }
             | LogicalPlan::CreateIndex { .. }
+            | LogicalPlan::DropIndex { .. }
             | LogicalPlan::CreatePolicy { .. }
             | LogicalPlan::CreateRole { .. }
             | LogicalPlan::AlterRole { .. }

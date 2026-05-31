@@ -13,7 +13,7 @@ use ultrasql_parser::ast::{
     CommentStmt, CommentTarget, CopyDirection as AstCopyDirection, CopyFormat as AstCopyFormat,
     CopyOption, CopySource as AstCopySource, CopyStmt, CreateDomainStmt, CreateIndexStmt,
     CreateMaterializedViewStmt, CreatePolicyStmt, CreateRoleStmt, CreateSequenceStmt,
-    CreateTableStmt, CreateTypeKind, CreateTypeStmt, DomainConstraint, DropRoleStmt,
+    CreateTableStmt, CreateTypeKind, CreateTypeStmt, DomainConstraint, DropIndexStmt, DropRoleStmt,
     DropSequenceStmt, DropTableStmt, Expr, Identifier, Literal, ObjectName,
     PolicyCommand as AstPolicyCommand, PolicyPermissiveness as AstPolicyPermissiveness,
     ReferentialAction as AstReferentialAction, RoleOption as AstRoleOption,
@@ -2115,6 +2115,28 @@ pub(super) fn bind_drop_table(
     }
     Ok(LogicalPlan::DropTable {
         tables,
+        if_exists: s.if_exists,
+        cascade: s.cascade,
+        schema: Schema::empty(),
+    })
+}
+
+/// Bind `DROP INDEX [IF EXISTS] name [, ...]`.
+pub(super) fn bind_drop_index(
+    s: &DropIndexStmt,
+    catalog: &dyn Catalog,
+) -> Result<LogicalPlan, PlanError> {
+    let mut indexes = Vec::with_capacity(s.names.len());
+    for obj in &s.names {
+        let name = object_name_simple(obj);
+        if catalog.lookup_index(&name) {
+            indexes.push(name);
+        } else if !s.if_exists {
+            return Err(PlanError::IndexNotFound(name));
+        }
+    }
+    Ok(LogicalPlan::DropIndex {
+        indexes,
         if_exists: s.if_exists,
         cascade: s.cascade,
         schema: Schema::empty(),

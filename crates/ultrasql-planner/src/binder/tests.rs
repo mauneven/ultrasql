@@ -23,6 +23,12 @@ fn users_catalog() -> InMemoryCatalog {
     cat
 }
 
+fn users_index_catalog() -> InMemoryCatalog {
+    let mut cat = users_catalog();
+    cat.register_index("users_id_idx");
+    cat
+}
+
 fn embeddings_catalog() -> InMemoryCatalog {
     let schema = Schema::new([
         Field::required("id", DataType::Int32),
@@ -3516,6 +3522,42 @@ fn drop_table_without_if_exists_rejects_missing_relation() {
 }
 
 #[test]
+fn binds_drop_index_with_known_index() {
+    let cat = users_index_catalog();
+    let plan = parse_and_bind("DROP INDEX users_id_idx", &cat).expect("drop index binds");
+    let LogicalPlan::DropIndex {
+        indexes, if_exists, ..
+    } = plan
+    else {
+        panic!("expected DropIndex plan");
+    };
+    assert_eq!(indexes, vec!["users_id_idx".to_string()]);
+    assert!(!if_exists);
+}
+
+#[test]
+fn drop_index_if_exists_silently_omits_missing_indexes() {
+    let cat = users_index_catalog();
+    let plan = parse_and_bind("DROP INDEX IF EXISTS users_id_idx, nope", &cat)
+        .expect("drop index if exists binds");
+    let LogicalPlan::DropIndex {
+        indexes, if_exists, ..
+    } = plan
+    else {
+        panic!("expected DropIndex plan");
+    };
+    assert!(if_exists);
+    assert_eq!(indexes, vec!["users_id_idx".to_string()]);
+}
+
+#[test]
+fn drop_index_without_if_exists_rejects_missing_index() {
+    let cat = users_catalog();
+    let err = parse_and_bind("DROP INDEX nonexistent_idx", &cat).unwrap_err();
+    assert!(matches!(err, PlanError::IndexNotFound(_)), "got {err:?}");
+}
+
+#[test]
 fn binds_alter_table_add_column_resolves_field() {
     let plan = parse_bind_ok("ALTER TABLE users ADD COLUMN extra INTEGER");
     let LogicalPlan::AlterTable {
@@ -3628,6 +3670,7 @@ fn collect_window_funcs<'a>(plan: &'a LogicalPlan, out: &mut Vec<&'a LogicalWind
         | LogicalPlan::CreateTypeComposite { .. }
         | LogicalPlan::CreateDomain { .. }
         | LogicalPlan::CreateIndex { .. }
+        | LogicalPlan::DropIndex { .. }
         | LogicalPlan::CreatePolicy { .. }
         | LogicalPlan::CreateRole { .. }
         | LogicalPlan::AlterRole { .. }

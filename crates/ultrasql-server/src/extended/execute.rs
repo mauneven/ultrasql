@@ -71,6 +71,7 @@ pub fn execute_portal(
             | LogicalPlan::CreateTypeEnum { .. }
             | LogicalPlan::CreateTypeComposite { .. }
             | LogicalPlan::CreateDomain { .. }
+            | LogicalPlan::DropIndex { .. }
             | LogicalPlan::CreateRole { .. }
             | LogicalPlan::AlterRole { .. }
             | LogicalPlan::DropRole { .. }

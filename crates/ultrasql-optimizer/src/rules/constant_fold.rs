@@ -498,6 +498,7 @@ fn fold_plan(plan: &LogicalPlan) -> Result<Option<LogicalPlan>, OptimizeError> {
         | LogicalPlan::CreateSequence { .. }
         | LogicalPlan::AlterSequence { .. }
         | LogicalPlan::DropSequence { .. }
+        | LogicalPlan::DropIndex { .. }
         | LogicalPlan::Comment { .. }
         | LogicalPlan::Begin { .. }
         | LogicalPlan::Commit { .. }

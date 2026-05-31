@@ -188,6 +188,7 @@ pub fn outer_join_subtree_is_barrier(plan: &LogicalPlan) -> bool {
         | LogicalPlan::CreateSequence { .. }
         | LogicalPlan::AlterSequence { .. }
         | LogicalPlan::DropSequence { .. }
+        | LogicalPlan::DropIndex { .. }
         | LogicalPlan::Comment { .. }
         | LogicalPlan::Begin { .. }
         | LogicalPlan::Commit { .. }
@@ -449,6 +450,7 @@ pub fn reorder_inner_joins_with_stats(plan: &LogicalPlan, stats: &dyn StatsSourc
         | LogicalPlan::CreateTypeComposite { .. }
         | LogicalPlan::CreateDomain { .. }
         | LogicalPlan::CreateIndex { .. }
+        | LogicalPlan::DropIndex { .. }
         | LogicalPlan::CreatePolicy { .. }
         | LogicalPlan::CreateRole { .. }
         | LogicalPlan::AlterRole { .. }

@@ -726,6 +726,7 @@ fn plan_node_type(plan: &LogicalPlan) -> &'static str {
         LogicalPlan::CreateTypeComposite { .. } => "CreateTypeComposite",
         LogicalPlan::CreateDomain { .. } => "CreateDomain",
         LogicalPlan::CreateIndex { .. } => "CreateIndex",
+        LogicalPlan::DropIndex { .. } => "DropIndex",
         LogicalPlan::CreatePolicy { .. } => "CreatePolicy",
         LogicalPlan::CreateRole { .. } => "CreateRole",
         LogicalPlan::AlterRole { .. } => "AlterRole",

@@ -12,7 +12,7 @@
 //! `ultrasql-catalog` via an RFC; defining it locally here keeps the
 //! current bring-up from blocking on that decision.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use ultrasql_core::{DataType, Oid, Schema};
 
@@ -89,6 +89,12 @@ pub trait Catalog: Send + Sync {
         None
     }
 
+    /// Return whether a case-insensitive index name exists.
+    fn lookup_index(&self, name: &str) -> bool {
+        let _ = name;
+        false
+    }
+
     /// Resolve a relation name to its catalog OID.
     fn lookup_table_oid(&self, name: &str) -> Option<Oid> {
         let _ = name;
@@ -112,6 +118,7 @@ pub trait Catalog: Send + Sync {
 pub struct InMemoryCatalog {
     tables: HashMap<String, TableMeta>,
     types: HashMap<String, DataType>,
+    indexes: HashSet<String>,
 }
 
 impl InMemoryCatalog {
@@ -121,6 +128,7 @@ impl InMemoryCatalog {
         Self {
             tables: HashMap::new(),
             types: HashMap::new(),
+            indexes: HashSet::new(),
         }
     }
 
@@ -135,6 +143,11 @@ impl InMemoryCatalog {
     pub fn register_type(&mut self, name: &str, data_type: DataType) -> Option<DataType> {
         self.types.insert(name.to_ascii_lowercase(), data_type)
     }
+
+    /// Register an index name for DDL binding tests and lightweight tools.
+    pub fn register_index(&mut self, name: &str) -> bool {
+        self.indexes.insert(name.to_ascii_lowercase())
+    }
 }
 
 impl Catalog for InMemoryCatalog {
@@ -144,6 +157,10 @@ impl Catalog for InMemoryCatalog {
 
     fn lookup_type(&self, name: &str) -> Option<DataType> {
         self.types.get(&name.to_ascii_lowercase()).cloned()
+    }
+
+    fn lookup_index(&self, name: &str) -> bool {
+        self.indexes.contains(&name.to_ascii_lowercase())
     }
 
     fn lookup_type_oid(&self, name: &str) -> Option<Oid> {
@@ -236,6 +253,10 @@ impl Catalog for ultrasql_catalog::CatalogSnapshot {
                     .get(&key)
                     .map(ultrasql_catalog::DomainTypeEntry::data_type)
             })
+    }
+
+    fn lookup_index(&self, name: &str) -> bool {
+        self.indexes.contains_key(&name.to_ascii_lowercase())
     }
 
     fn lookup_table_oid(&self, name: &str) -> Option<Oid> {

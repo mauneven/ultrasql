@@ -490,6 +490,7 @@ where
                 | LogicalPlan::CreateTypeComposite { .. }
                 | LogicalPlan::CreateDomain { .. }
                 | LogicalPlan::CreateIndex { .. }
+                | LogicalPlan::DropIndex { .. }
                 | LogicalPlan::CreatePolicy { .. }
                 | LogicalPlan::CreateRole { .. }
                 | LogicalPlan::AlterRole { .. }
@@ -530,6 +531,9 @@ where
             }
             LogicalPlan::CreateIndex { .. } => {
                 return self.execute_create_index(&plan, &catalog_snapshot);
+            }
+            LogicalPlan::DropIndex { .. } => {
+                return self.execute_drop_index(&plan);
             }
             LogicalPlan::CreatePolicy { .. } => {
                 return self.execute_create_policy(&plan, &catalog_snapshot);
@@ -638,6 +642,7 @@ where
                 | LogicalPlan::CreateTypeComposite { .. }
                 | LogicalPlan::CreateDomain { .. }
                 | LogicalPlan::CreateIndex { .. }
+                | LogicalPlan::DropIndex { .. }
                 | LogicalPlan::CreatePolicy { .. }
                 | LogicalPlan::CreateRole { .. }
                 | LogicalPlan::AlterRole { .. }
@@ -675,6 +680,7 @@ where
             }
             LogicalPlan::CreateDomain { .. } => self.execute_create_domain(plan, catalog_snapshot),
             LogicalPlan::CreateIndex { .. } => self.execute_create_index(plan, catalog_snapshot),
+            LogicalPlan::DropIndex { .. } => self.execute_drop_index(plan),
             LogicalPlan::CreatePolicy { .. } => self.execute_create_policy(plan, catalog_snapshot),
             LogicalPlan::CreateRole { .. } => self.execute_create_role(plan),
             LogicalPlan::AlterRole { .. } => self.execute_alter_role(plan),
