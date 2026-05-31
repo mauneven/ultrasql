@@ -1975,3 +1975,9 @@ as a concise evidence ledger; roadmap stays for open gates only.
   `cargo test -p ultrasql-executor filter_op::tests::batch_to_rows --lib -- --nocapture`,
   and
   `cargo test -p ultrasql-server --test numeric_round_trip -- --nocapture`.
+- Fused TPC-H Q1 heap, columnar, and summary fast paths now reject decimal
+  aggregate overflow instead of panicking in debug builds or wrapping release
+  totals. Evidence:
+  `cargo test -p ultrasql-server pipeline::tpch_q1::tests --lib -- --nocapture`,
+  `cargo test -p ultrasql-server pipeline::tests::tpch_sidecars --lib -- --nocapture`,
+  and `cargo test -p ultrasql-bench tpch_q1 --lib -- --nocapture`.

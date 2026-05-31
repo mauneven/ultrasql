@@ -48,31 +48,38 @@ impl Q1Groups {
         extendedprice: i64,
         discount: i64,
         tax: i64,
-    ) {
+    ) -> Result<(), ExecError> {
+        let discount_factor = checked_q1_sub(100, discount)?;
+        let tax_factor = checked_q1_add(100, tax)?;
+        let disc_price = checked_q1_mul_div2(extendedprice, discount_factor, 100)?;
+        let charge = checked_q1_mul_div3(extendedprice, discount_factor, tax_factor, 10_000)?;
+
         let state = self.state_for((returnflag, linestatus));
-        state.sum_qty += quantity;
-        state.sum_base_price += extendedprice;
-        state.sum_disc_price += extendedprice * 100_i64.saturating_sub(discount) / 100;
-        state.sum_charge +=
-            extendedprice * 100_i64.saturating_sub(discount) * 100_i64.saturating_add(tax) / 10_000;
-        state.sum_discount += discount;
-        state.count = state.count.saturating_add(1);
+        state.sum_qty = checked_q1_add(state.sum_qty, quantity)?;
+        state.sum_base_price = checked_q1_add(state.sum_base_price, extendedprice)?;
+        state.sum_disc_price = checked_q1_add(state.sum_disc_price, disc_price)?;
+        state.sum_charge = checked_q1_add(state.sum_charge, charge)?;
+        state.sum_discount = checked_q1_add(state.sum_discount, discount)?;
+        state.count = checked_q1_add(state.count, 1)?;
+        Ok(())
     }
 
-    fn add_state(&mut self, key: (u8, u8), state: Q1State) {
+    fn add_state(&mut self, key: (u8, u8), state: Q1State) -> Result<(), ExecError> {
         let target = self.state_for(key);
-        target.sum_qty += state.sum_qty;
-        target.sum_base_price += state.sum_base_price;
-        target.sum_disc_price += state.sum_disc_price;
-        target.sum_charge += state.sum_charge;
-        target.sum_discount += state.sum_discount;
-        target.count = target.count.saturating_add(state.count);
+        target.sum_qty = checked_q1_add(target.sum_qty, state.sum_qty)?;
+        target.sum_base_price = checked_q1_add(target.sum_base_price, state.sum_base_price)?;
+        target.sum_disc_price = checked_q1_add(target.sum_disc_price, state.sum_disc_price)?;
+        target.sum_charge = checked_q1_add(target.sum_charge, state.sum_charge)?;
+        target.sum_discount = checked_q1_add(target.sum_discount, state.sum_discount)?;
+        target.count = checked_q1_add(target.count, state.count)?;
+        Ok(())
     }
 
-    fn merge(&mut self, other: Self) {
+    fn merge(&mut self, other: Self) -> Result<(), ExecError> {
         for (key, state) in other.entries {
-            self.add_state(key, state);
+            self.add_state(key, state)?;
         }
+        Ok(())
     }
 
     fn into_btree_map(self) -> BTreeMap<(u8, u8), Q1State> {
@@ -91,6 +98,42 @@ impl Q1Groups {
         self.entries.push((key, Q1State::default()));
         &mut self.entries[pos].1
     }
+}
+
+fn q1_decimal_overflow() -> ExecError {
+    ExecError::TypeMismatch("TPC-H Q1 decimal overflow".to_owned())
+}
+
+fn checked_q1_add(left: i64, right: i64) -> Result<i64, ExecError> {
+    left.checked_add(right).ok_or_else(q1_decimal_overflow)
+}
+
+fn checked_q1_sub(left: i64, right: i64) -> Result<i64, ExecError> {
+    left.checked_sub(right).ok_or_else(q1_decimal_overflow)
+}
+
+fn checked_q1_mul_div2(left: i64, right: i64, divisor: i64) -> Result<i64, ExecError> {
+    if let Some(product) = left.checked_mul(right) {
+        return Ok(product / divisor);
+    }
+    let product = i128::from(left)
+        .checked_mul(i128::from(right))
+        .ok_or_else(q1_decimal_overflow)?;
+    i64::try_from(product / i128::from(divisor)).map_err(|_| q1_decimal_overflow())
+}
+
+fn checked_q1_mul_div3(left: i64, mid: i64, right: i64, divisor: i64) -> Result<i64, ExecError> {
+    if let Some(product) = left
+        .checked_mul(mid)
+        .and_then(|value| value.checked_mul(right))
+    {
+        return Ok(product / divisor);
+    }
+    let product = i128::from(left)
+        .checked_mul(i128::from(mid))
+        .and_then(|value| value.checked_mul(i128::from(right)))
+        .ok_or_else(q1_decimal_overflow)?;
+    i64::try_from(product / i128::from(divisor)).map_err(|_| q1_decimal_overflow())
 }
 
 pub(super) fn try_lower_tpch_q1(
@@ -223,7 +266,7 @@ impl Operator for TpchQ1Operator {
             return Ok(Some(build_q1_batch(groups)?));
         }
 
-        let mut groups: BTreeMap<(u8, u8), Q1State> = BTreeMap::new();
+        let mut groups = Q1Groups::default();
         tracing::info!("using fused TPC-H Q1 scan/aggregate");
         let progress = matches!(
             std::env::var("ULTRASQL_TPCH_PROGRESS").ok().as_deref(),
@@ -246,24 +289,27 @@ impl Operator for TpchQ1Operator {
                     if let Some(row) = decode_lineitem_q1(payload).map_err(|_| {
                         ultrasql_storage::heap::HeapError::MalformedHeader("TPC-H Q1 decode")
                     })? {
-                        let group = groups.entry((row.returnflag, row.linestatus)).or_default();
-                        group.sum_qty += row.quantity;
-                        group.sum_base_price += row.extendedprice;
-                        group.sum_disc_price +=
-                            row.extendedprice * 100_i64.saturating_sub(row.discount) / 100;
-                        group.sum_charge += row.extendedprice
-                            * 100_i64.saturating_sub(row.discount)
-                            * 100_i64.saturating_add(row.tax)
-                            / 10_000;
-                        group.sum_discount += row.discount;
-                        group.count = group.count.saturating_add(1);
+                        groups
+                            .add_row(
+                                row.returnflag,
+                                row.linestatus,
+                                row.quantity,
+                                row.extendedprice,
+                                row.discount,
+                                row.tax,
+                            )
+                            .map_err(|_| {
+                                ultrasql_storage::heap::HeapError::MalformedHeader(
+                                    "TPC-H Q1 aggregate overflow",
+                                )
+                            })?;
                     }
                     Ok(())
                 },
             )
             .map_err(|e| ExecError::TypeMismatch(format!("TPC-H Q1 heap scan: {e}")))?;
 
-        Ok(Some(build_q1_batch(groups)?))
+        Ok(Some(build_q1_batch(groups.into_btree_map())?))
     }
 
     fn schema(&self) -> &Schema {
@@ -291,7 +337,7 @@ fn aggregate_q1_columnar(
     }
 
     if len < 1_000_000 {
-        return Ok(aggregate_q1_columnar_range(cache, 0, len).into_btree_map());
+        return Ok(aggregate_q1_columnar_range(cache, 0, len)?.into_btree_map());
     }
 
     let workers = std::thread::available_parallelism()
@@ -299,7 +345,7 @@ fn aggregate_q1_columnar(
         .min(8)
         .min(len);
     if workers <= 1 {
-        return Ok(aggregate_q1_columnar_range(cache, 0, len).into_btree_map());
+        return Ok(aggregate_q1_columnar_range(cache, 0, len)?.into_btree_map());
     }
 
     let chunk = len.div_ceil(workers);
@@ -319,7 +365,7 @@ fn aggregate_q1_columnar(
             let partial = handle
                 .join()
                 .map_err(|_| ExecError::Internal("TPC-H Q1 worker panicked"))?;
-            merged.merge(partial);
+            merged.merge(partial?)?;
         }
         Ok::<Q1Groups, ExecError>(merged)
     })?;
@@ -330,7 +376,7 @@ fn aggregate_q1_columnar_range(
     cache: &crate::TpchQ1ColumnarCache,
     start: usize,
     end: usize,
-) -> Q1Groups {
+) -> Result<Q1Groups, ExecError> {
     let mut groups = Q1Groups::default();
     for idx in start..end {
         if cache.shipdate[idx] > LINEITEM_SHIPDATE_CUTOFF_1998_09_02 {
@@ -343,9 +389,9 @@ fn aggregate_q1_columnar_range(
             cache.extendedprice[idx],
             cache.discount[idx],
             cache.tax[idx],
-        );
+        )?;
     }
-    groups
+    Ok(groups)
 }
 
 #[derive(Debug)]
@@ -488,12 +534,14 @@ fn build_q1_batch_from_summary_rows(
     let mut groups: BTreeMap<(u8, u8), Q1State> = BTreeMap::new();
     for row in rows {
         let group = groups.entry((row.returnflag, row.linestatus)).or_default();
-        group.sum_qty += i64_from_i128(row.sum_qty)?;
-        group.sum_base_price += i64_from_i128(row.sum_base_price)?;
-        group.sum_disc_price += i64_from_i128(row.sum_disc_price)?;
-        group.sum_charge += i64_from_i128(row.sum_charge)?;
-        group.sum_discount += i64_from_i128(row.sum_discount)?;
-        group.count = group.count.saturating_add(row.count);
+        group.sum_qty = checked_q1_add(group.sum_qty, i64_from_i128(row.sum_qty)?)?;
+        group.sum_base_price =
+            checked_q1_add(group.sum_base_price, i64_from_i128(row.sum_base_price)?)?;
+        group.sum_disc_price =
+            checked_q1_add(group.sum_disc_price, i64_from_i128(row.sum_disc_price)?)?;
+        group.sum_charge = checked_q1_add(group.sum_charge, i64_from_i128(row.sum_charge)?)?;
+        group.sum_discount = checked_q1_add(group.sum_discount, i64_from_i128(row.sum_discount)?)?;
+        group.count = checked_q1_add(group.count, row.count)?;
     }
     build_q1_batch(groups)
 }
@@ -809,6 +857,47 @@ mod tests {
         let mut bad = q1_cache();
         bad.tax.pop();
         assert!(aggregate_q1_columnar(&bad).is_err());
+    }
+
+    #[test]
+    fn q1_columnar_aggregation_rejects_decimal_overflow() {
+        let mut overflowing = large_q1_cache(2);
+        overflowing.quantity = vec![i64::MAX, 1];
+
+        let err = aggregate_q1_columnar(&overflowing).expect_err("sum overflow should reject");
+
+        assert!(err.to_string().contains("TPC-H Q1 decimal overflow"));
+    }
+
+    #[test]
+    fn q1_summary_rows_reject_decimal_overflow() {
+        let rows = vec![
+            TpchQ1SummaryRow {
+                returnflag: b'N',
+                linestatus: b'O',
+                sum_qty: i128::from(i64::MAX),
+                sum_base_price: 1,
+                sum_disc_price: 1,
+                sum_charge: 1,
+                sum_discount: 1,
+                count: 1,
+            },
+            TpchQ1SummaryRow {
+                returnflag: b'N',
+                linestatus: b'O',
+                sum_qty: 1,
+                sum_base_price: 1,
+                sum_disc_price: 1,
+                sum_charge: 1,
+                sum_discount: 1,
+                count: 1,
+            },
+        ];
+
+        let err =
+            build_q1_batch_from_summary_rows(rows).expect_err("summary overflow should reject");
+
+        assert!(err.to_string().contains("TPC-H Q1 decimal overflow"));
     }
 
     #[test]
