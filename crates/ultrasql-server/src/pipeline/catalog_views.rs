@@ -28,11 +28,14 @@ const PG_PROC_BASE_OID: u32 = 9_000;
 const PROC_TYPE_BOOL: u32 = 16;
 const PROC_TYPE_INT4: u32 = 23;
 const PROC_TYPE_INT8: u32 = 20;
+const PROC_TYPE_FLOAT8: u32 = 701;
 const PROC_TYPE_TEXT: u32 = 25;
 const PROC_TYPE_OID: u32 = 26;
 const PROC_TYPE_TEXT_ARRAY: u32 = 1009;
 const PROC_TYPE_XML: u32 = 142;
 const PROC_TYPE_XML_ARRAY: u32 = 143;
+const PROC_TYPE_TSVECTOR: u32 = 3614;
+const PROC_TYPE_TSQUERY: u32 = 3615;
 const PROC_TYPE_UUID: u32 = 2950;
 const PG_TYPE_BOOL: i32 = 16;
 const PG_TYPE_BOOL_ARRAY: i32 = 1000;
@@ -3684,11 +3687,14 @@ fn pg_type_name_from_oid(oid: u32) -> &'static str {
         PROC_TYPE_BOOL => "boolean",
         PROC_TYPE_INT4 => "integer",
         PROC_TYPE_INT8 => "bigint",
+        PROC_TYPE_FLOAT8 => "double precision",
         PROC_TYPE_TEXT => "text",
         PROC_TYPE_OID => "oid",
         PROC_TYPE_TEXT_ARRAY => "ARRAY",
         PROC_TYPE_XML => "xml",
         PROC_TYPE_XML_ARRAY => "xml[]",
+        PROC_TYPE_TSVECTOR => "tsvector",
+        PROC_TYPE_TSQUERY => "tsquery",
         PROC_TYPE_UUID => "uuid",
         _ => "text",
     }
@@ -3910,6 +3916,102 @@ const fn pg_proc_builtins() -> &'static [PgProcBuiltin] {
             name: "bool_eq",
             return_type_oid: PROC_TYPE_BOOL,
             arg_type_oids: &[PROC_TYPE_BOOL, PROC_TYPE_BOOL],
+            volatility: "i",
+        },
+        PgProcBuiltin {
+            name: "to_tsvector",
+            return_type_oid: PROC_TYPE_TSVECTOR,
+            arg_type_oids: &[PROC_TYPE_TEXT],
+            volatility: "i",
+        },
+        PgProcBuiltin {
+            name: "to_tsvector",
+            return_type_oid: PROC_TYPE_TSVECTOR,
+            arg_type_oids: &[PROC_TYPE_TEXT, PROC_TYPE_TEXT],
+            volatility: "i",
+        },
+        PgProcBuiltin {
+            name: "to_tsquery",
+            return_type_oid: PROC_TYPE_TSQUERY,
+            arg_type_oids: &[PROC_TYPE_TEXT],
+            volatility: "i",
+        },
+        PgProcBuiltin {
+            name: "to_tsquery",
+            return_type_oid: PROC_TYPE_TSQUERY,
+            arg_type_oids: &[PROC_TYPE_TEXT, PROC_TYPE_TEXT],
+            volatility: "i",
+        },
+        PgProcBuiltin {
+            name: "plainto_tsquery",
+            return_type_oid: PROC_TYPE_TSQUERY,
+            arg_type_oids: &[PROC_TYPE_TEXT],
+            volatility: "i",
+        },
+        PgProcBuiltin {
+            name: "plainto_tsquery",
+            return_type_oid: PROC_TYPE_TSQUERY,
+            arg_type_oids: &[PROC_TYPE_TEXT, PROC_TYPE_TEXT],
+            volatility: "i",
+        },
+        PgProcBuiltin {
+            name: "websearch_to_tsquery",
+            return_type_oid: PROC_TYPE_TSQUERY,
+            arg_type_oids: &[PROC_TYPE_TEXT],
+            volatility: "i",
+        },
+        PgProcBuiltin {
+            name: "websearch_to_tsquery",
+            return_type_oid: PROC_TYPE_TSQUERY,
+            arg_type_oids: &[PROC_TYPE_TEXT, PROC_TYPE_TEXT],
+            volatility: "i",
+        },
+        PgProcBuiltin {
+            name: "phraseto_tsquery",
+            return_type_oid: PROC_TYPE_TSQUERY,
+            arg_type_oids: &[PROC_TYPE_TEXT],
+            volatility: "i",
+        },
+        PgProcBuiltin {
+            name: "phraseto_tsquery",
+            return_type_oid: PROC_TYPE_TSQUERY,
+            arg_type_oids: &[PROC_TYPE_TEXT, PROC_TYPE_TEXT],
+            volatility: "i",
+        },
+        PgProcBuiltin {
+            name: "ts_rank",
+            return_type_oid: PROC_TYPE_FLOAT8,
+            arg_type_oids: &[PROC_TYPE_TSVECTOR, PROC_TYPE_TSQUERY],
+            volatility: "i",
+        },
+        PgProcBuiltin {
+            name: "ts_rank_cd",
+            return_type_oid: PROC_TYPE_FLOAT8,
+            arg_type_oids: &[PROC_TYPE_TSVECTOR, PROC_TYPE_TSQUERY],
+            volatility: "i",
+        },
+        PgProcBuiltin {
+            name: "ts_headline",
+            return_type_oid: PROC_TYPE_TEXT,
+            arg_type_oids: &[PROC_TYPE_TEXT, PROC_TYPE_TSQUERY],
+            volatility: "i",
+        },
+        PgProcBuiltin {
+            name: "ts_headline",
+            return_type_oid: PROC_TYPE_TEXT,
+            arg_type_oids: &[PROC_TYPE_TEXT, PROC_TYPE_TEXT, PROC_TYPE_TSQUERY],
+            volatility: "i",
+        },
+        PgProcBuiltin {
+            name: "numnode",
+            return_type_oid: PROC_TYPE_INT4,
+            arg_type_oids: &[PROC_TYPE_TSQUERY],
+            volatility: "i",
+        },
+        PgProcBuiltin {
+            name: "querytree",
+            return_type_oid: PROC_TYPE_TEXT,
+            arg_type_oids: &[PROC_TYPE_TSQUERY],
             volatility: "i",
         },
     ]

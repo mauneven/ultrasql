@@ -739,6 +739,8 @@ fn builtin_type_display_name(oid: u32) -> Option<&'static str> {
         1700 => Some("numeric"),
         2950 => Some("uuid"),
         3220 => Some("pg_lsn"),
+        3614 => Some("tsvector"),
+        3615 => Some("tsquery"),
         3802 => Some("jsonb"),
         2205 => Some("regclass"),
         2206 => Some("regtype"),
@@ -6271,6 +6273,8 @@ mod tests {
             (1560, "bit"),
             (1562, "bit varying"),
             (3220, "pg_lsn"),
+            (3614, "tsvector"),
+            (3615, "tsquery"),
             (2205, "regclass"),
             (2206, "regtype"),
         ] {

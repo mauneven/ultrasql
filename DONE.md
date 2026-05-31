@@ -851,8 +851,10 @@ as a concise evidence ledger; roadmap stays for open gates only.
   `TSVECTOR` and `TSQUERY` now have dedicated logical types, PostgreSQL OIDs
   `3614` / `3615`, array OIDs `3643` / `3645`, `pg_type` rows, and
   RowDescription coverage while retaining the current text-backed value
-  representation. Evidence:
-  `cargo test -p ultrasql-server --test full_text_round_trip`.
+  representation. `pg_catalog.pg_proc` advertises the supported full-text
+  function signatures for introspection. Evidence:
+  `cargo test -p ultrasql-server --test full_text_round_trip`;
+  `cargo test -p ultrasql-server --test catalog_views_round_trip pg_proc_advertises_supported_full_text_functions -- --nocapture`.
 - `DROP TABLE` dependency tracking now treats append-only materialized views as
   dependents: `RESTRICT` blocks source-table drops, `CASCADE` drops dependent
   materialized views, and direct materialized-view drops clear runtime
