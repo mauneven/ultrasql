@@ -1814,6 +1814,10 @@ as a concise evidence ledger; roadmap stays for open gates only.
 - `INSERT ... VALUES` expression evaluation now preserves typed cast errors
   instead of collapsing invalid VALUES casts to `XX000`. Evidence:
   `cargo test -p ultrasql-server --test core_type_surface_round_trip core_scalar_types_round_trip_over_postgres_wire -- --nocapture`.
+- Runtime errors inside `CHECK` predicate evaluation now preserve their typed
+  SQLSTATEs instead of collapsing to `XX000`; boolean-false checks still return
+  `23514`. Evidence:
+  `cargo test -p ultrasql-server --test constraint_round_trip check_constraint_runtime_cast_error_returns_22p02 -- --nocapture`.
 - Runtime scalar/temporal text casts to integer, float, boolean, date, time,
   timestamp, timestamptz, and timetz now report SQLSTATE `22P02` for invalid
   column text. Evidence:

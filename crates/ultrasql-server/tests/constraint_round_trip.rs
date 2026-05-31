@@ -384,6 +384,34 @@ async fn check_constraint_rejects_insert_with_23514() {
     graceful_shutdown(running).await;
 }
 
+/// Runtime errors inside CHECK predicates keep their SQLSTATE instead
+/// of becoming an internal execution failure.
+#[tokio::test]
+async fn check_constraint_runtime_cast_error_returns_22p02() {
+    let running = start_sample_server("constraint_test").await;
+    let client = &running.client;
+
+    client
+        .batch_execute("CREATE TABLE t (raw TEXT CHECK (CAST(raw AS INTEGER) > 0))")
+        .await
+        .expect("create");
+
+    let err = client
+        .batch_execute("INSERT INTO t VALUES ('not-int')")
+        .await
+        .expect_err("CHECK runtime cast rejects row");
+    let sqlstate = err.code().expect("server-sent SQLSTATE present");
+    assert_eq!(sqlstate.code(), "22P02");
+
+    let rows = client
+        .query("SELECT raw FROM t", &[])
+        .await
+        .expect("select after rejected CHECK cast");
+    assert!(rows.is_empty());
+
+    graceful_shutdown(running).await;
+}
+
 /// CHECK constraints also run after UPDATE assignments.
 #[tokio::test]
 async fn check_constraint_rejects_update_and_preserves_row() {

@@ -47,7 +47,7 @@ use crate::eval::Eval;
 use crate::filter_op::batch_to_rows;
 use crate::row_codec::{RowCodec, RowCodecError};
 use crate::seq_scan::build_batch;
-use crate::{ExecError, Operator};
+use crate::{ExecError, Operator, eval_error_to_exec_error};
 
 /// Enforce schema-level NOT-NULL constraints over a decoded `INSERT`
 /// row before it is encoded and handed to the heap.
@@ -1793,7 +1793,7 @@ impl<L: PageLoader + Send + Sync + std::fmt::Debug + 'static> ModifyTable<L> {
             match check
                 .evaluator
                 .eval(row)
-                .map_err(|e| ExecError::TypeMismatch(e.to_string()))?
+                .map_err(eval_error_to_exec_error)?
             {
                 Value::Bool(true) | Value::Null => {}
                 Value::Bool(false) => return Err(ExecError::CheckViolation(check.name.clone())),
