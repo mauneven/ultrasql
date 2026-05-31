@@ -291,6 +291,7 @@ fn binds_xml_scalar_functions_with_precise_return_types() {
             xml_is_well_formed_content('<a/><b/>'), \
             xpath_exists('/root/item', XML '<root><item/></root>'), \
             xpath('/root/item', XML '<root><item/></root>'), \
+            xpath('/r:root', XML '<root xmlns=\"urn:root\"/>', ARRAY[ARRAY['r','urn:root']]), \
             XMLPARSE(DOCUMENT '<root/>'), \
             XMLSERIALIZE(CONTENT XML '<root/>' AS TEXT)",
     );
@@ -304,8 +305,12 @@ fn binds_xml_scalar_functions_with_precise_return_types() {
         exprs[3].0.data_type(),
         DataType::Array(Box::new(DataType::Xml))
     );
-    assert_eq!(exprs[4].0.data_type(), DataType::Xml);
-    assert_eq!(exprs[5].0.data_type(), DataType::Text { max_len: None });
+    assert_eq!(
+        exprs[4].0.data_type(),
+        DataType::Array(Box::new(DataType::Xml))
+    );
+    assert_eq!(exprs[5].0.data_type(), DataType::Xml);
+    assert_eq!(exprs[6].0.data_type(), DataType::Text { max_len: None });
 }
 
 // -----------------------------------------------------------------------

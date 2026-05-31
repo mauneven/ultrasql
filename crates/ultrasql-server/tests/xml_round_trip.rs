@@ -271,7 +271,9 @@ async fn xml_functions_validate_securely_and_extract_simple_xpath() {
                         xpath('/root/item[@id=\"2\"]/name', XML '<root><item id=\"1\"/><item id=\"2\"><name>b</name></item></root>'), \
                         xpath('/root/item/@id', XML '<root><item id=\"1\">a</item><item id=\"2\">b</item></root>'), \
                         xpath('/root/item/text()', XML '<root><item id=\"1\">a</item><item id=\"2\">b</item></root>'), \
-                        xpath('/r:root/r:item/@x:id', XML '<r:root xmlns:r=\"urn:r\" xmlns:x=\"urn:x\"><r:item x:id=\"7\">z</r:item></r:root>')",
+                        xpath('/r:root/r:item/@x:id', XML '<r:root xmlns:r=\"urn:r\" xmlns:x=\"urn:x\"><r:item x:id=\"7\">z</r:item></r:root>'), \
+                        xpath_exists('/r:root/item:child', XML '<root xmlns=\"urn:root\" xmlns:i=\"urn:item\"><i:child i:id=\"7\">z</i:child></root>', ARRAY[ARRAY['r','urn:root'],ARRAY['item','urn:item']]), \
+                        xpath('/r:root/item:child/@item:id', XML '<root xmlns=\"urn:root\" xmlns:i=\"urn:item\"><i:child i:id=\"7\">z</i:child></root>', ARRAY[ARRAY['r','urn:root'],ARRAY['item','urn:item']])",
                 )
                 .await
                 .expect("xpath functions"),
@@ -282,6 +284,8 @@ async fn xml_functions_validate_securely_and_extract_simple_xpath() {
             "{<name>b</name>}".to_owned(),
             "{1,2}".to_owned(),
             "{a,b}".to_owned(),
+            "{7}".to_owned(),
+            "t".to_owned(),
             "{7}".to_owned(),
         ]]
     );

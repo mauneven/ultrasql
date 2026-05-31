@@ -1906,9 +1906,23 @@ fn validate_xmlserialize_args(args: &[ScalarExpr]) -> Result<(), PlanError> {
 }
 
 fn validate_xpath_args(func_name: &str, args: &[ScalarExpr]) -> Result<(), PlanError> {
-    validate_exact_arg_count(func_name, args, 2)?;
+    if !(2..=3).contains(&args.len()) {
+        return Err(PlanError::TypeMismatch(format!(
+            "{func_name}: expected 2 or 3 arguments, got {}",
+            args.len()
+        )));
+    }
     validate_text_or_xml_arg(func_name, &args[0])?;
-    validate_text_or_xml_arg(func_name, &args[1])
+    validate_text_or_xml_arg(func_name, &args[1])?;
+    if let Some(namespace_arg) = args.get(2) {
+        let data_type = namespace_arg.data_type();
+        if !matches!(data_type, DataType::Null | DataType::Array(_)) {
+            return Err(PlanError::TypeMismatch(format!(
+                "{func_name}: namespace argument must be text[][], got {data_type}"
+            )));
+        }
+    }
+    Ok(())
 }
 
 fn validate_network_inspector_args(func_name: &str, args: &[ScalarExpr]) -> Result<(), PlanError> {
@@ -4145,6 +4159,19 @@ mod typed_literal_tests {
             validate_builtin_args(
                 "xpath",
                 &mut [null_arg(text.clone()), null_arg(DataType::Xml)],
+            )
+            .is_ok()
+        );
+        assert!(
+            validate_builtin_args(
+                "xpath",
+                &mut [
+                    null_arg(text.clone()),
+                    null_arg(DataType::Xml),
+                    null_arg(DataType::Array(Box::new(DataType::Array(Box::new(
+                        text.clone()
+                    ))))),
+                ],
             )
             .is_ok()
         );

@@ -220,6 +220,15 @@ as a concise evidence ledger; roadmap stays for open gates only.
   `cargo test -p ultrasql-executor json_path::tests::path_supports_iso_datetime_methods --lib -- --nocapture`,
   and
   `cargo test -p ultrasql-server --test jsonb_path_query_round_trip jsonb_path_query_supports_iso_datetime_methods -- --nocapture`.
+- XML `xpath` and `xpath_exists` now accept PostgreSQL-style namespace mapping
+  arrays for the supported secure XPath subset. The XML walker carries
+  inherited namespace context, resolves alias-to-URI matches for elements and
+  attributes, and preserves raw-name behavior when no mapping is supplied.
+  Evidence:
+  `cargo test -p ultrasql-core xml_xpath --lib -- --nocapture`,
+  `cargo test -p ultrasql-planner binds_xml_scalar_functions_with_precise_return_types --lib -- --nocapture`,
+  and
+  `cargo test -p ultrasql-server --test xml_round_trip xml_functions_validate_securely_and_extract_simple_xpath -- --nocapture`.
 - `GatherMerge` now propagates merge-key evaluation failures instead of
   silently comparing them as NULL. Evidence:
   `cargo test -p ultrasql-executor gather`.

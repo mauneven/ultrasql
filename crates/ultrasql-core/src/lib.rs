@@ -61,6 +61,7 @@ pub use value::{
     format_timetz, pack_timetz, parse_date_text, parse_time_text, parse_timestamp_text,
     parse_timetz_text, timetz_utc_micros, unpack_timetz, xml_content_is_well_formed,
     xml_document_is_well_formed, xml_xpath_element_fragments,
+    xml_xpath_element_fragments_with_namespaces,
 };
 
 /// Version of the on-disk page format. Bumping this is an RFC-level change.

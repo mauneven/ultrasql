@@ -1198,13 +1198,28 @@ pub fn xml_content_is_well_formed(text: &str) -> bool {
 /// `Some(Vec::new())`.
 #[must_use]
 pub fn xml_xpath_element_fragments(path: &str, document: &str) -> Option<Vec<String>> {
+    xml_xpath_element_fragments_with_namespaces(path, document, &[])
+}
+
+/// Return fragments selected by the supported XPath subset using explicit
+/// namespace alias-to-URI bindings.
+///
+/// Bindings use `(alias, uri)` pairs matching PostgreSQL's `xpath(...,
+/// nsarray)` contract. Empty bindings preserve the legacy raw-name matching
+/// behavior for unqualified paths.
+#[must_use]
+pub fn xml_xpath_element_fragments_with_namespaces(
+    path: &str,
+    document: &str,
+    namespace_bindings: &[(String, String)],
+) -> Option<Vec<String>> {
     let document = document.trim();
     if !xml_document_is_well_formed(document) {
         return None;
     }
     let steps = parse_xml_path(path)?;
     let root = xml_root_element(document)?;
-    if !xml_step_matches(&root, &steps[0]) {
+    if !xml_step_matches(&root, &steps[0], namespace_bindings) {
         return Some(Vec::new());
     }
     let mut current = vec![root];
@@ -1215,7 +1230,7 @@ pub fn xml_xpath_element_fragments(path: &str, document: &str) -> Option<Vec<Str
                 let mut next = Vec::new();
                 for element in &current {
                     for child in xml_direct_child_elements(document, element) {
-                        if xml_step_matches(&child, step) {
+                        if xml_step_matches(&child, step, namespace_bindings) {
                             next.push(child);
                         }
                     }
@@ -1233,7 +1248,15 @@ pub fn xml_xpath_element_fragments(path: &str, document: &str) -> Option<Vec<Str
                             element
                                 .attrs
                                 .iter()
-                                .filter(|(attr_name, _)| attr_name == name)
+                                .filter(|(attr_name, _)| {
+                                    xml_name_matches(
+                                        attr_name,
+                                        &element.namespaces,
+                                        name,
+                                        namespace_bindings,
+                                        false,
+                                    )
+                                })
                                 .map(|(_, value)| value.clone())
                         })
                         .collect(),
@@ -1272,6 +1295,7 @@ enum XmlPathStep {
 struct XmlElement {
     name: String,
     attrs: Vec<(String, String)>,
+    namespaces: Vec<(String, String)>,
     open_start: usize,
     content_start: usize,
     close_start: usize,
@@ -1360,13 +1384,17 @@ fn xml_root_element(text: &str) -> Option<XmlElement> {
             }
             b'!' => return None,
             b'/' => return None,
-            _ => return read_xml_element_at(text, open),
+            _ => return read_xml_element_at(text, open, &[]),
         }
     }
     None
 }
 
-fn read_xml_element_at(text: &str, open: usize) -> Option<XmlElement> {
+fn read_xml_element_at(
+    text: &str,
+    open: usize,
+    inherited_namespaces: &[(String, String)],
+) -> Option<XmlElement> {
     if text.as_bytes().get(open) != Some(&b'<') {
         return None;
     }
@@ -1386,11 +1414,13 @@ fn read_xml_element_at(text: &str, open: usize) -> Option<XmlElement> {
     }
     let name = content[..name_len].to_owned();
     let attrs = xml_parse_attributes(&content[name_len..])?;
+    let namespaces = xml_namespace_context(inherited_namespaces, &attrs);
     let content_start = tag_close + 1;
     if self_closing {
         return Some(XmlElement {
             name,
             attrs,
+            namespaces,
             open_start: open,
             content_start,
             close_start: content_start,
@@ -1425,6 +1455,7 @@ fn read_xml_element_at(text: &str, open: usize) -> Option<XmlElement> {
                         return Some(XmlElement {
                             name,
                             attrs,
+                            namespaces,
                             open_start: open,
                             content_start,
                             close_start: tag_open,
@@ -1487,7 +1518,7 @@ fn xml_direct_child_elements(text: &str, parent: &XmlElement) -> Vec<XmlElement>
             }
             b'/' => break,
             _ => {
-                let Some(element) = read_xml_element_at(text, open) else {
+                let Some(element) = read_xml_element_at(text, open, &parent.namespaces) else {
                     break;
                 };
                 cursor = element.close_end;
@@ -1525,7 +1556,7 @@ fn xml_direct_text(text: &str, element: &XmlElement) -> Option<String> {
             }
             b'/' => break,
             _ => {
-                let child = read_xml_element_at(text, open)?;
+                let child = read_xml_element_at(text, open, &element.namespaces)?;
                 cursor = child.close_end;
             }
         }
@@ -1533,19 +1564,108 @@ fn xml_direct_text(text: &str, element: &XmlElement) -> Option<String> {
     (!out.is_empty()).then_some(out)
 }
 
-fn xml_step_matches(element: &XmlElement, step: &XmlPathStep) -> bool {
+fn xml_namespace_context(
+    inherited: &[(String, String)],
+    attrs: &[(String, String)],
+) -> Vec<(String, String)> {
+    let mut namespaces = inherited.to_vec();
+    for (name, value) in attrs {
+        if name == "xmlns" {
+            xml_upsert_namespace(&mut namespaces, "", value);
+        } else if let Some(prefix) = name.strip_prefix("xmlns:")
+            && !prefix.is_empty()
+        {
+            xml_upsert_namespace(&mut namespaces, prefix, value);
+        }
+    }
+    namespaces
+}
+
+fn xml_upsert_namespace(namespaces: &mut Vec<(String, String)>, prefix: &str, uri: &str) {
+    if let Some((_, existing_uri)) = namespaces
+        .iter_mut()
+        .find(|(existing_prefix, _)| existing_prefix == prefix)
+    {
+        *existing_uri = uri.to_owned();
+    } else {
+        namespaces.push((prefix.to_owned(), uri.to_owned()));
+    }
+}
+
+fn xml_name_matches(
+    actual: &str,
+    actual_namespaces: &[(String, String)],
+    expected: &str,
+    namespace_bindings: &[(String, String)],
+    default_namespace_applies: bool,
+) -> bool {
+    let (expected_prefix, expected_local) = xml_split_qname(expected);
+    if namespace_bindings.is_empty() || expected_prefix.is_empty() {
+        return actual == expected;
+    }
+    let Some(expected_uri) = xml_namespace_uri(namespace_bindings, expected_prefix) else {
+        return false;
+    };
+    let (actual_prefix, actual_local) = xml_split_qname(actual);
+    if actual_local != expected_local {
+        return false;
+    }
+    xml_namespace_uri_for_name(actual_namespaces, actual_prefix, default_namespace_applies)
+        .is_some_and(|actual_uri| actual_uri == expected_uri)
+}
+
+fn xml_split_qname(name: &str) -> (&str, &str) {
+    name.split_once(':')
+        .map_or(("", name), |(prefix, local)| (prefix, local))
+}
+
+fn xml_namespace_uri<'a>(namespaces: &'a [(String, String)], prefix: &str) -> Option<&'a str> {
+    namespaces
+        .iter()
+        .rev()
+        .find(|(candidate, _)| candidate == prefix)
+        .map(|(_, uri)| uri.as_str())
+}
+
+fn xml_namespace_uri_for_name<'a>(
+    namespaces: &'a [(String, String)],
+    prefix: &str,
+    default_namespace_applies: bool,
+) -> Option<&'a str> {
+    if prefix.is_empty() && !default_namespace_applies {
+        return None;
+    }
+    xml_namespace_uri(namespaces, prefix)
+}
+
+fn xml_step_matches(
+    element: &XmlElement,
+    step: &XmlPathStep,
+    namespace_bindings: &[(String, String)],
+) -> bool {
     let XmlPathStep::Element { name, attr_filter } = step else {
         return false;
     };
-    element.name == *name
-        && attr_filter
-            .as_ref()
-            .is_none_or(|(expected_name, expected_value)| {
-                element
-                    .attrs
-                    .iter()
-                    .any(|(name, value)| name == expected_name && value == expected_value)
+    xml_name_matches(
+        &element.name,
+        &element.namespaces,
+        name,
+        namespace_bindings,
+        true,
+    ) && attr_filter
+        .as_ref()
+        .is_none_or(|(expected_name, expected_value)| {
+            element.attrs.iter().any(|(name, value)| {
+                value == expected_value
+                    && xml_name_matches(
+                        name,
+                        &element.namespaces,
+                        expected_name,
+                        namespace_bindings,
+                        false,
+                    )
             })
+        })
 }
 
 fn xml_tag_end(text: &str, start: usize) -> Option<usize> {
@@ -2600,6 +2720,33 @@ mod tests {
         assert!(!Value::xml_document_is_well_formed(
             r#"<!DOCTYPE root [<!ENTITY xxe SYSTEM "file:///etc/passwd">]><root/>"#
         ));
+    }
+
+    #[test]
+    fn xml_xpath_subset_resolves_namespace_uri_aliases() {
+        let doc =
+            r#"<root xmlns="urn:root" xmlns:i="urn:item"><i:child i:id="7">z</i:child></root>"#;
+        let namespaces = vec![
+            ("r".to_owned(), "urn:root".to_owned()),
+            ("item".to_owned(), "urn:item".to_owned()),
+        ];
+
+        assert_eq!(
+            xml_xpath_element_fragments_with_namespaces(
+                "/r:root/item:child/@item:id",
+                doc,
+                &namespaces
+            ),
+            Some(vec!["7".to_owned()])
+        );
+        assert_eq!(
+            xml_xpath_element_fragments_with_namespaces(
+                "/r:root/item:child/text()",
+                doc,
+                &namespaces
+            ),
+            Some(vec!["z".to_owned()])
+        );
     }
 
     #[test]

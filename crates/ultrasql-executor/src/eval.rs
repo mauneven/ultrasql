@@ -31,7 +31,8 @@ use num_traits::ToPrimitive;
 use serde_json::{Map as JsonMap, Number as JsonNumber, Value as JsonValue};
 use ultrasql_core::{
     DataType, Oid, SparseVector, Value, bpchar_semantic_text, parse_money_text, timetz_utc_micros,
-    xml_content_is_well_formed, xml_document_is_well_formed, xml_xpath_element_fragments,
+    xml_content_is_well_formed, xml_document_is_well_formed,
+    xml_xpath_element_fragments_with_namespaces,
 };
 use ultrasql_planner::{BinaryOp, ScalarExpr, UnaryOp, catalog::builtin_type_oid};
 
@@ -2385,9 +2386,9 @@ fn parse_xml_value(
 }
 
 fn eval_xpath_exists(args: &[Value]) -> Result<Value, EvalError> {
-    if args.len() != 2 {
+    if !(2..=3).contains(&args.len()) {
         return Err(EvalError::Type(format!(
-            "xpath_exists: expected 2 args, got {}",
+            "xpath_exists: expected 2 or 3 args, got {}",
             args.len()
         )));
     }
@@ -2397,19 +2398,21 @@ fn eval_xpath_exists(args: &[Value]) -> Result<Value, EvalError> {
     let Some(document) = xml_text_arg("xpath_exists", args, 1)? else {
         return Ok(Value::Null);
     };
-    let fragments = xml_xpath_element_fragments(path, document).ok_or_else(|| {
-        EvalError::Type(
+    let namespaces = xpath_namespace_arg("xpath_exists", args.get(2))?;
+    let fragments = xml_xpath_element_fragments_with_namespaces(path, document, &namespaces)
+        .ok_or_else(|| {
+            EvalError::Type(
             "xpath_exists: supported subset is absolute element paths with optional @attr equality"
                 .to_owned(),
         )
-    })?;
+        })?;
     Ok(Value::Bool(!fragments.is_empty()))
 }
 
 fn eval_xpath(args: &[Value]) -> Result<Value, EvalError> {
-    if args.len() != 2 {
+    if !(2..=3).contains(&args.len()) {
         return Err(EvalError::Type(format!(
-            "xpath: expected 2 args, got {}",
+            "xpath: expected 2 or 3 args, got {}",
             args.len()
         )));
     }
@@ -2419,16 +2422,77 @@ fn eval_xpath(args: &[Value]) -> Result<Value, EvalError> {
     let Some(document) = xml_text_arg("xpath", args, 1)? else {
         return Ok(Value::Null);
     };
-    let fragments = xml_xpath_element_fragments(path, document).ok_or_else(|| {
-        EvalError::Type(
-            "xpath: supported subset is absolute element paths with optional @attr equality"
-                .to_owned(),
-        )
-    })?;
+    let namespaces = xpath_namespace_arg("xpath", args.get(2))?;
+    let fragments = xml_xpath_element_fragments_with_namespaces(path, document, &namespaces)
+        .ok_or_else(|| {
+            EvalError::Type(
+                "xpath: supported subset is absolute element paths with optional @attr equality"
+                    .to_owned(),
+            )
+        })?;
     Ok(Value::Array {
         element_type: DataType::Xml,
         elements: fragments.into_iter().map(Value::Xml).collect(),
     })
+}
+
+fn xpath_namespace_arg(
+    function: &str,
+    value: Option<&Value>,
+) -> Result<Vec<(String, String)>, EvalError> {
+    let Some(value) = value else {
+        return Ok(Vec::new());
+    };
+    if matches!(value, Value::Null) {
+        return Ok(Vec::new());
+    }
+    let Value::Array { elements, .. } = value else {
+        return Err(EvalError::Type(format!(
+            "{function}: namespace argument must be text[][]"
+        )));
+    };
+    elements
+        .iter()
+        .map(|row| {
+            let Value::Array { elements, .. } = row else {
+                return Err(EvalError::Type(format!(
+                    "{function}: namespace rows must be text[2]"
+                )));
+            };
+            let [prefix, uri] = elements.as_slice() else {
+                return Err(EvalError::Type(format!(
+                    "{function}: namespace rows must contain prefix and URI"
+                )));
+            };
+            let Some(prefix) = xml_namespace_text(function, prefix)? else {
+                return Err(EvalError::Type(format!(
+                    "{function}: namespace prefix cannot be NULL"
+                )));
+            };
+            let Some(uri) = xml_namespace_text(function, uri)? else {
+                return Err(EvalError::Type(format!(
+                    "{function}: namespace URI cannot be NULL"
+                )));
+            };
+            if prefix.is_empty() || uri.is_empty() {
+                return Err(EvalError::Type(format!(
+                    "{function}: namespace prefix and URI cannot be empty"
+                )));
+            }
+            Ok((prefix.to_owned(), uri.to_owned()))
+        })
+        .collect()
+}
+
+fn xml_namespace_text<'a>(function: &str, value: &'a Value) -> Result<Option<&'a str>, EvalError> {
+    match value {
+        Value::Text(text) => Ok(Some(text.as_str())),
+        Value::Null => Ok(None),
+        other => Err(EvalError::Type(format!(
+            "{function}: namespace values must be text, got {:?}",
+            other.data_type()
+        ))),
+    }
 }
 
 fn eval_network_host(args: &[Value]) -> Result<Value, EvalError> {
