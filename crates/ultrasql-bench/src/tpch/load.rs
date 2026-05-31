@@ -456,6 +456,25 @@ fn checked_direct_scaled_product(left: i64, right: i64) -> Result<i64> {
 }
 
 #[cfg(feature = "sql-bench")]
+fn direct_sidecar_value_overflow() -> anyhow::Error {
+    anyhow::anyhow!("TPC-H sidecar value overflow")
+}
+
+#[cfg(feature = "sql-bench")]
+fn checked_direct_value_add(left: i64, right: i64) -> Result<i64> {
+    left.checked_add(right)
+        .ok_or_else(direct_sidecar_value_overflow)
+}
+
+#[cfg(feature = "sql-bench")]
+fn checked_direct_value_product(left: i64, right: i64) -> Result<i64> {
+    let product = i128::from(left)
+        .checked_mul(i128::from(right))
+        .ok_or_else(direct_sidecar_value_overflow)?;
+    i64::try_from(product).map_err(|_| direct_sidecar_value_overflow())
+}
+
+#[cfg(feature = "sql-bench")]
 fn q3_fields(table: &str, line: &str, expected: usize) -> Result<Vec<String>> {
     let fields = parse_tbl_line(line).ok_or_else(|| anyhow::anyhow!("{table}: empty row"))?;
     if fields.len() != expected {
@@ -1524,9 +1543,10 @@ impl TpchQ11BuildState {
         let partkey = q11_parse_i32(&fields, 0, "ps_partkey")?;
         let availqty = q11_parse_i64(&fields, 2, "ps_availqty")?;
         let supplycost = q11_parse_decimal2(&fields[3], "ps_supplycost")?;
-        let value = supplycost * availqty;
-        *self.value_by_part.entry(partkey).or_default() += value;
-        self.total_value += value;
+        let value = checked_direct_value_product(supplycost, availqty)?;
+        let part_value = self.value_by_part.entry(partkey).or_default();
+        *part_value = checked_direct_value_add(*part_value, value)?;
+        self.total_value = checked_direct_value_add(self.total_value, value)?;
         Ok(())
     }
 }
@@ -5477,6 +5497,27 @@ mod tests {
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].ps_partkey, 5);
         assert_eq!(rows[0].value, 8_000);
+    }
+
+    #[cfg(feature = "sql-bench")]
+    #[test]
+    fn tpch_q11_sidecar_rejects_value_overflow() {
+        let mut state = TpchQ11BuildState::default();
+        state
+            .ingest("nation", "1|GERMANY|0|comment")
+            .expect("nation");
+        state
+            .ingest(
+                "supplier",
+                "3|Supplier#3|address|1|11-111-1111|0.00|comment",
+            )
+            .expect("supplier");
+
+        let err = state
+            .ingest("partsupp", "5|3|2|92233720368547758.07|overflowing value")
+            .expect_err("partsupp value overflow should reject");
+
+        assert!(err.to_string().contains("TPC-H sidecar value overflow"));
     }
 
     #[cfg(feature = "sql-bench")]
