@@ -852,6 +852,14 @@ as a concise evidence ledger; roadmap stays for open gates only.
   `ParameterStatus`, visible through `SHOW application_name`, and reflected in
   `pg_catalog.pg_stat_activity` along with the current session user. Evidence:
   `cargo test -p ultrasql-server --test catalog_views_round_trip pg_stat_activity_reflects_session_identity -- --nocapture`.
+- Operator statistics catalog views have tested base coverage for
+  `pg_stat_user_tables`, `pg_statio_user_tables`, `pg_stat_user_indexes`,
+  `pg_stat_progress_create_index`, `pg_stat_database`, `pg_stat_bgwriter`,
+  `pg_stat_progress_vacuum`, `pg_stat_progress_analyze`, `pg_stat_wal`, and
+  `pg_stat_replication`. Evidence:
+  `cargo test -p ultrasql-server --test catalog_views_round_trip`;
+  `cargo test -p ultrasql-server --test wal_stats_round_trip`;
+  `cargo test -p ultrasql-server --test replication_stats_round_trip`.
 - `GUI introspection probes` exist for `pgAdmin`, `DBeaver`, and `DataGrip`.
 - Migration tool certification covers `Flyway`, `Liquibase`, and `Alembic`.
 
