@@ -17,7 +17,7 @@ pub enum AstIsolationLevel {
     ReadCommitted,
     /// `REPEATABLE READ` — the transaction sees a snapshot fixed at `BEGIN`.
     RepeatableRead,
-    /// `SERIALIZABLE` — full serializable snapshot isolation.
+    /// `SERIALIZABLE` — serializable isolation requested by the client.
     Serializable,
 }
 

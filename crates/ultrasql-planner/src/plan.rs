@@ -293,7 +293,7 @@ pub enum TxnIsolationLevel {
     ReadCommitted,
     /// `REPEATABLE READ` — snapshot fixed at transaction start.
     RepeatableRead,
-    /// `SERIALIZABLE` — full SSI.
+    /// `SERIALIZABLE` — serializable isolation requested by the client.
     Serializable,
 }
 

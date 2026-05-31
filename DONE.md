@@ -184,6 +184,10 @@ as a concise evidence ledger; roadmap stays for open gates only.
 - Catalog upgrade story is documented and enforced with `catalog.version = 1`.
 - Security/ethics audit docs cover no proprietary tests, no closed-source
   code, and no fake benchmark claims.
+- Serializable isolation comments now avoid full-SSI overclaims: parser,
+  planner, and transaction-manager docs describe it as a client-requested
+  isolation level with relation-level SSI integration until predicate-precise
+  SSI lands.
 - Constant `SELECT` result execution now propagates scalar evaluation failures
   instead of silently returning NULL. Evidence:
   `cargo test -p ultrasql-executor result_propagates_constant_eval_errors`.

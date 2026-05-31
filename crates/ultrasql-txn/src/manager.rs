@@ -58,7 +58,7 @@ use crate::ssi::{PredicateLockTag, SsiError, SsiManager};
 ///
 /// v0.5 implements snapshot semantics for [`Self::ReadCommitted`] and
 /// [`Self::RepeatableRead`]. [`Self::Serializable`] currently uses the
-/// same snapshot strategy as [`Self::RepeatableRead`]; full predicate
+/// same snapshot strategy as [`Self::RepeatableRead`]; predicate-precise
 /// locking is tracked as an RFC follow-up. The enum value still carries
 /// through so callers and tests can branch on the requested level.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -70,13 +70,15 @@ pub enum IsolationLevel {
     /// life of the transaction. `refresh_snapshot` only bumps the
     /// command id.
     RepeatableRead,
-    /// True Serializable Snapshot Isolation (SSI).
+    /// Serializable Snapshot Isolation (SSI) request.
     ///
     /// Uses the same fixed snapshot strategy as [`Self::RepeatableRead`]
     /// for reads, and additionally registers the transaction with
-    /// [`SsiManager`] to track rw-anti-dependency edges. On commit,
-    /// the SSI manager checks for dangerous structures (T1 → T2 → T3
-    /// cycles); if a cycle is found, the commit fails with
+    /// [`SsiManager`] to track rw-anti-dependency edges. The current
+    /// server integration records relation-level predicate tags, not
+    /// predicate-precise PostgreSQL SSI. On commit, the SSI manager
+    /// checks for dangerous structures (T1 → T2 → T3 cycles); if a
+    /// cycle is found, the commit fails with
     /// [`TxnError::SerializationFailure`].
     Serializable,
 }
@@ -237,7 +239,7 @@ impl TransactionManager {
         }
     }
 
-    /// Construct a manager with full SSI support.
+    /// Construct a manager with SSI conflict-graph support.
     ///
     /// Transactions begun with [`IsolationLevel::Serializable`] will be
     /// registered in `ssi` and their commits will undergo the
