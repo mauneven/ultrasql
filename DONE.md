@@ -1865,6 +1865,10 @@ as a concise evidence ledger; roadmap stays for open gates only.
   now preserve typed executor errors instead of collapsing to `TypeMismatch`.
   Evidence:
   `cargo test -p ultrasql-executor gather_merge_key_eval_error_propagates --lib -- --nocapture`.
+- Vectorized filter row-fallback predicates now propagate typed evaluation
+  errors and reject non-boolean predicate values instead of silently dropping
+  rows. Evidence:
+  `cargo test -p ultrasql-executor general_filter_propagates_eval_errors --lib -- --nocapture`.
 - Runtime scalar/temporal text casts to integer, float, boolean, date, time,
   timestamp, timestamptz, and timetz now report SQLSTATE `22P02` for invalid
   column text. Evidence:

@@ -16,11 +16,11 @@ use ultrasql_vec::{
     filter_eq_i64,
 };
 
-use crate::ExecError;
 use crate::eval::Eval;
 use crate::filter_op::batch_to_rows;
 use crate::push_pipeline::{SinkVerdict, VectorizedOperator, VectorizedSink};
 use crate::seq_scan::build_batch;
+use crate::{ExecError, eval_error_to_exec_error};
 
 /// Vectorized filter operator.
 ///
@@ -93,10 +93,19 @@ impl VectorizedSink for FilterSink<'_> {
         } else {
             let rows = batch_to_rows(&batch, &self.schema)?;
             let interpreter = Eval::new(self.predicate.clone());
-            let survivors: Vec<Vec<Value>> = rows
-                .into_iter()
-                .filter(|row| matches!(interpreter.eval(row), Ok(Value::Bool(true))))
-                .collect();
+            let mut survivors = Vec::with_capacity(rows.len());
+            for row in rows {
+                match interpreter.eval(&row).map_err(eval_error_to_exec_error)? {
+                    Value::Bool(true) => survivors.push(row),
+                    Value::Bool(false) | Value::Null => {}
+                    other => {
+                        return Err(ExecError::TypeMismatch(format!(
+                            "vectorized filter predicate must evaluate to Bool or Null, got {:?}",
+                            other.data_type()
+                        )));
+                    }
+                }
+            }
 
             if survivors.is_empty() {
                 return Ok(SinkVerdict::Continue);
@@ -235,6 +244,30 @@ mod tests {
         }
     }
 
+    fn pred_divide_id_by_zero() -> ScalarExpr {
+        ScalarExpr::Binary {
+            op: BinaryOp::Gt,
+            left: Box::new(ScalarExpr::Binary {
+                op: BinaryOp::Div,
+                left: Box::new(ScalarExpr::Column {
+                    name: "id".into(),
+                    index: 0,
+                    data_type: DataType::Int32,
+                }),
+                right: Box::new(ScalarExpr::Literal {
+                    value: Value::Int32(0),
+                    data_type: DataType::Int32,
+                }),
+                data_type: DataType::Int32,
+            }),
+            right: Box::new(ScalarExpr::Literal {
+                value: Value::Int32(0),
+                data_type: DataType::Int32,
+            }),
+            data_type: DataType::Bool,
+        }
+    }
+
     fn drain_i32(batches: Vec<Batch>) -> Vec<i32> {
         let mut out = Vec::new();
         for b in batches {
@@ -268,6 +301,19 @@ mod tests {
         let mut sink = CollectSink::new();
         filter.drive(&mut sink).unwrap();
         assert!(sink.finish().is_empty());
+    }
+
+    #[test]
+    fn general_filter_propagates_eval_errors() {
+        let scan = MemTableScan::new(schema_id(), vec![batch_i32(&[1, 2, 3])]);
+        let child = VectorizedSeqScan::new(Box::new(scan));
+        let mut filter = VectorizedFilter::new(Box::new(child), pred_divide_id_by_zero());
+        let mut sink = CollectSink::new();
+
+        let err = filter
+            .drive(&mut sink)
+            .expect_err("division by zero must not be filtered out");
+        assert!(matches!(err, ExecError::DivisionByZero(_)), "{err:?}");
     }
 
     #[test]
