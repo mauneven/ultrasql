@@ -135,6 +135,26 @@ fn role_metadata_rejects_duplicate_memberships_on_rebuild() {
     );
 }
 
+#[test]
+fn role_metadata_rejects_memberships_with_unknown_roles_on_rebuild() {
+    let data_dir = tempfile::TempDir::new().expect("temp data dir");
+    std::fs::write(
+        data_dir.path().join("pg_auth.meta"),
+        concat!(
+            "# ultrasql auth runtime v1\n",
+            "role\tparent\t17000\t\tfalse\ttrue\tfalse\tfalse\ttrue\tfalse\tfalse\t-1\t\n",
+            "member\tparent\tmissing_child\tparent\tfalse\n"
+        ),
+    )
+    .expect("write dangling membership metadata");
+
+    let err = Server::init(data_dir.path()).expect_err("dangling membership metadata rejected");
+    assert!(
+        err.to_string().contains("unknown role membership metadata"),
+        "expected dangling membership metadata rejection, got {err}"
+    );
+}
+
 #[tokio::test]
 async fn drop_role_rejects_owned_table_until_object_is_dropped() {
     let running = start_sample_server("role_ddl_test").await;

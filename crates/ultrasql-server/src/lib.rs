@@ -5188,6 +5188,24 @@ impl Server {
         if roles.is_empty() {
             roles.push(auth::RoleEntry::bootstrap_superuser());
         }
+        let role_names = roles
+            .iter()
+            .map(|role| role.name.to_ascii_lowercase())
+            .collect::<std::collections::HashSet<_>>();
+        for membership in &memberships {
+            for (field, role_name) in [
+                ("role", &membership.role),
+                ("member", &membership.member),
+                ("grantor", &membership.grantor),
+            ] {
+                if !role_names.contains(&role_name.to_ascii_lowercase()) {
+                    return Err(ServerError::ddl(format!(
+                        "unknown role membership metadata {field} '{}'",
+                        role_name
+                    )));
+                }
+            }
+        }
         self.role_catalog.install_snapshot(roles, memberships);
         Ok(())
     }
