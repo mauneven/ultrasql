@@ -2098,6 +2098,12 @@ fn parse_date_days(text: &str) -> Option<i32> {
     days_from_civil(year, month, day)
 }
 
+/// Parse PostgreSQL ISO `DATE` text into days since UltraSQL's date epoch.
+#[must_use]
+pub fn parse_date_text(text: &str) -> Option<i32> {
+    parse_date_days(text.trim())
+}
+
 #[allow(
     clippy::cast_possible_truncation,
     clippy::cast_possible_wrap,
@@ -2121,6 +2127,12 @@ fn days_from_civil(year: i32, month: u32, day: u32) -> Option<i32> {
 fn format_date(days_since_2000_01_01: i32) -> String {
     let (year, month, day) = civil_from_days(days_since_2000_01_01);
     format!("{year:04}-{month:02}-{day:02}")
+}
+
+/// Format days since UltraSQL's date epoch as PostgreSQL ISO `DATE` text.
+#[must_use]
+pub fn format_date_days(days_since_2000_01_01: i32) -> String {
+    format_date(days_since_2000_01_01)
 }
 
 /// Format `TIME` in PostgreSQL's default ISO style.
@@ -2199,6 +2211,16 @@ pub fn parse_time_text(text: &str) -> Option<i64> {
     parse_time_and_optional_offset(text).map(|(micros, _)| micros)
 }
 
+/// Parse PostgreSQL ISO `TIMESTAMP WITHOUT TIME ZONE` text into
+/// microseconds since UltraSQL's timestamp epoch.
+#[must_use]
+pub fn parse_timestamp_text(text: &str) -> Option<i64> {
+    let (date, time) = split_timestamp_text(text)?;
+    let days = i64::from(parse_date_text(date)?);
+    let micros = parse_time_text(time)?;
+    days.checked_mul(MICROS_PER_DAY)?.checked_add(micros)
+}
+
 /// Parse PostgreSQL-style `TIMETZ` text into time-of-day and UTC offset.
 #[must_use]
 pub fn parse_timetz_text(text: &str) -> Option<(i64, i32)> {
@@ -2229,6 +2251,17 @@ fn parse_time_and_optional_offset(text: &str) -> Option<(i64, Option<i32>)> {
 fn looks_like_iso_date(text: &str) -> bool {
     let bytes = text.as_bytes();
     bytes.len() >= 10 && bytes.get(4) == Some(&b'-') && bytes.get(7) == Some(&b'-')
+}
+
+fn split_timestamp_text(text: &str) -> Option<(&str, &str)> {
+    let trimmed = text.trim();
+    let split_at = trimmed
+        .char_indices()
+        .find_map(|(idx, ch)| (ch == 'T' || ch.is_ascii_whitespace()).then_some(idx))?;
+    let date = trimmed[..split_at].trim();
+    let time =
+        trimmed[split_at..].trim_start_matches(|ch: char| ch == 'T' || ch.is_ascii_whitespace());
+    (!date.is_empty() && !time.is_empty()).then_some((date, time))
 }
 
 fn split_inline_timezone(token: &str) -> (&str, Option<&str>) {
@@ -2452,6 +2485,22 @@ mod tests {
             .to_string(),
             "04:05:06.789-08"
         );
+    }
+
+    #[test]
+    fn iso_date_and_timestamp_text_helpers_round_trip() {
+        assert_eq!(parse_date_text(" 2000-01-02 "), Some(1));
+        assert_eq!(format_date_days(1), "2000-01-02");
+        assert_eq!(
+            parse_timestamp_text("2000-01-01T01:02:03.456789"),
+            Some(3_723_456_789)
+        );
+        assert_eq!(
+            parse_timestamp_text("2000-01-01 01:02:03.456789-08"),
+            Some(3_723_456_789)
+        );
+        assert_eq!(parse_timestamp_text("2000-01-01"), None);
+        assert_eq!(parse_timestamp_text("2000-01-01 bad"), None);
     }
 
     #[test]

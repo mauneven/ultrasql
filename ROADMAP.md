@@ -70,8 +70,8 @@ file focused on what still blocks production.
   changes for non-ISO `DateStyle` and locale variants beyond current
   `DateStyle` GUC validation / round trips.
 - Arrays: broader coercion breadth and every supported element family.
-- JSON/JSONB: full SQL/JSON path parity beyond the supported subset
-  (date/time methods).
+- JSON/JSONB: full SQL/JSON path parity beyond the supported subset, including
+  remaining `datetime(template)` grammar and non-ISO date/time coercions.
 - Full-text search remaining: native lexeme/query storage beyond the current
   text-backed representation, headline, dictionaries, full ranking parity, and
   GIN planner integration.

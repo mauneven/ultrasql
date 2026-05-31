@@ -211,6 +211,15 @@ as a concise evidence ledger; roadmap stays for open gates only.
   `cargo test -p ultrasql-executor json_path::tests::path_supports_decimal_method_with_precision_and_scale --lib -- --nocapture`
   and
   `cargo test -p ultrasql-server --test jsonb_path_query_round_trip jsonb_path_query_supports_decimal_method -- --nocapture`.
+- SQL/JSON path now supports ISO `date()`, `time([precision])`,
+  `time_tz([precision])`, `timestamp([precision])`,
+  `timestamp_tz([precision])`, auto `datetime()`, and
+  `datetime("HH24:MI")` parsing/evaluation with bounded fractional precision
+  and wire-level `jsonb_path_query` coverage. Evidence:
+  `cargo test -p ultrasql-core iso_date_and_timestamp_text_helpers_round_trip --lib -- --nocapture`,
+  `cargo test -p ultrasql-executor json_path::tests::path_supports_iso_datetime_methods --lib -- --nocapture`,
+  and
+  `cargo test -p ultrasql-server --test jsonb_path_query_round_trip jsonb_path_query_supports_iso_datetime_methods -- --nocapture`.
 - `GatherMerge` now propagates merge-key evaluation failures instead of
   silently comparing them as NULL. Evidence:
   `cargo test -p ultrasql-executor gather`.

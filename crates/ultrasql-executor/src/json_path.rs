@@ -2,9 +2,14 @@
 
 use regex::RegexBuilder;
 use serde_json::{Map as JsonMap, Number as JsonNumber, Value as JsonValue};
-use ultrasql_core::{Value as SqlValue, parse_decimal_text};
+use ultrasql_core::{
+    MICROS_PER_DAY, Value as SqlValue, format_date_days, format_time_micros,
+    format_timestamp_micros, format_timetz, parse_date_text, parse_decimal_text, parse_time_text,
+    parse_timestamp_text, parse_timetz_text,
+};
 
 const JSON_PATH_DECIMAL_ARG_MAX: u32 = 1_000;
+const JSON_PATH_TIME_PRECISION_MAX: u32 = 6;
 
 /// Parsed SQL/JSON path expression.
 #[derive(Clone, Debug, PartialEq)]
@@ -36,12 +41,16 @@ enum JsonPathStep {
     Method(JsonPathMethod),
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 enum JsonPathMethod {
     Abs,
     Bigint,
     Boolean,
     Ceiling,
+    Date,
+    DateTime {
+        template: Option<String>,
+    },
     Decimal {
         precision: Option<u32>,
         scale: Option<u32>,
@@ -53,6 +62,18 @@ enum JsonPathMethod {
     Number,
     Size,
     String,
+    Time {
+        precision: Option<u32>,
+    },
+    TimeTz {
+        precision: Option<u32>,
+    },
+    Timestamp {
+        precision: Option<u32>,
+    },
+    TimestampTz {
+        precision: Option<u32>,
+    },
     Type,
 }
 
@@ -217,7 +238,7 @@ fn select_steps(
                     }
                 }
                 JsonPathStep::Method(method) => {
-                    next.extend(apply_json_path_method(*method, &item));
+                    next.extend(apply_json_path_method(method, &item));
                 }
             }
         }
@@ -335,7 +356,7 @@ fn compare_json_value(left: &JsonValue, op: JsonPathCompareOp, right: &JsonValue
     }
 }
 
-fn apply_json_path_method(method: JsonPathMethod, value: &JsonValue) -> Vec<JsonValue> {
+fn apply_json_path_method(method: &JsonPathMethod, value: &JsonValue) -> Vec<JsonValue> {
     match method {
         JsonPathMethod::Abs => vec![json_path_numeric_method(value, f64::abs)],
         JsonPathMethod::Bigint => vec![
@@ -347,8 +368,12 @@ fn apply_json_path_method(method: JsonPathMethod, value: &JsonValue) -> Vec<Json
             vec![json_path_boolean(value).map_or(JsonValue::Null, JsonValue::Bool)]
         }
         JsonPathMethod::Ceiling => vec![json_path_numeric_method(value, f64::ceil)],
+        JsonPathMethod::Date => vec![json_path_date(value)],
+        JsonPathMethod::DateTime { template } => {
+            vec![json_path_datetime(value, template.as_deref())]
+        }
         JsonPathMethod::Decimal { precision, scale } => {
-            vec![json_path_decimal(value, precision, scale)]
+            vec![json_path_decimal(value, *precision, *scale)]
         }
         JsonPathMethod::Double => vec![json_path_double(value)],
         JsonPathMethod::Floor => vec![json_path_numeric_method(value, f64::floor)],
@@ -374,6 +399,12 @@ fn apply_json_path_method(method: JsonPathMethod, value: &JsonValue) -> Vec<Json
         }
         JsonPathMethod::String => {
             vec![json_path_string(value).map_or(JsonValue::Null, JsonValue::String)]
+        }
+        JsonPathMethod::Time { precision } => vec![json_path_time(value, *precision)],
+        JsonPathMethod::TimeTz { precision } => vec![json_path_timetz(value, *precision)],
+        JsonPathMethod::Timestamp { precision } => vec![json_path_timestamp(value, *precision)],
+        JsonPathMethod::TimestampTz { precision } => {
+            vec![json_path_timestamptz(value, *precision)]
         }
         JsonPathMethod::Type => vec![JsonValue::String(json_path_type_name(value).to_owned())],
     }
@@ -433,6 +464,206 @@ fn json_path_decimal_to_json(value: i64, scale: i32) -> JsonValue {
     match serde_json::from_str::<JsonValue>(&rendered) {
         Ok(value @ JsonValue::Number(_)) => value,
         Ok(_) | Err(_) => JsonValue::Null,
+    }
+}
+
+fn json_path_date(value: &JsonValue) -> JsonValue {
+    let Some(text) = json_path_string(value) else {
+        return JsonValue::Null;
+    };
+    parse_date_text(&text)
+        .map(format_date_days)
+        .map_or(JsonValue::Null, JsonValue::String)
+}
+
+fn json_path_time(value: &JsonValue, precision: Option<u32>) -> JsonValue {
+    let Some(text) = json_path_string(value) else {
+        return JsonValue::Null;
+    };
+    let Some(micros) = json_path_parse_time_text(&text) else {
+        return JsonValue::Null;
+    };
+    round_time_micros(micros, precision)
+        .map(format_time_micros)
+        .map_or(JsonValue::Null, JsonValue::String)
+}
+
+fn json_path_timetz(value: &JsonValue, precision: Option<u32>) -> JsonValue {
+    let Some(text) = json_path_string(value) else {
+        return JsonValue::Null;
+    };
+    let Some((micros, offset_seconds)) = json_path_parse_timetz_text(&text) else {
+        return JsonValue::Null;
+    };
+    round_time_micros(micros, precision)
+        .map(|micros| format_timetz(micros, offset_seconds))
+        .map_or(JsonValue::Null, JsonValue::String)
+}
+
+fn json_path_timestamp(value: &JsonValue, precision: Option<u32>) -> JsonValue {
+    let Some(text) = json_path_string(value) else {
+        return JsonValue::Null;
+    };
+    let Some(micros) = parse_timestamp_text(&text) else {
+        return JsonValue::Null;
+    };
+    round_signed_micros(micros, precision)
+        .map(format_json_timestamp)
+        .map_or(JsonValue::Null, JsonValue::String)
+}
+
+fn json_path_timestamptz(value: &JsonValue, precision: Option<u32>) -> JsonValue {
+    let Some(text) = json_path_string(value) else {
+        return JsonValue::Null;
+    };
+    let Some((days, micros, offset_seconds)) = parse_json_path_timestamptz_text(&text) else {
+        return JsonValue::Null;
+    };
+    let Some(rounded_micros) = round_time_micros(micros, precision) else {
+        return JsonValue::Null;
+    };
+    let Some((days, micros)) = normalize_date_time(days, rounded_micros) else {
+        return JsonValue::Null;
+    };
+    JsonValue::String(format!(
+        "{}T{}",
+        format_date_days(days),
+        format_timetz(micros, offset_seconds)
+    ))
+}
+
+fn json_path_datetime(value: &JsonValue, template: Option<&str>) -> JsonValue {
+    let Some(text) = json_path_string(value) else {
+        return JsonValue::Null;
+    };
+    if let Some(template) = template {
+        return json_path_datetime_template(&text, template);
+    }
+    let trimmed = text.trim();
+    if let Some(days) = parse_date_text(trimmed) {
+        return JsonValue::String(format_date_days(days));
+    }
+    if json_path_time_has_explicit_zone(trimmed) {
+        if let Some((micros, offset_seconds)) = json_path_parse_timetz_text(trimmed) {
+            return JsonValue::String(format_timetz(micros, offset_seconds));
+        }
+    }
+    if let Some(micros) = json_path_parse_time_text(trimmed) {
+        return JsonValue::String(format_time_micros(micros));
+    }
+    if let Some((days, micros, offset_seconds)) = parse_json_path_timestamptz_text(trimmed) {
+        return JsonValue::String(format!(
+            "{}T{}",
+            format_date_days(days),
+            format_timetz(micros, offset_seconds)
+        ));
+    }
+    parse_timestamp_text(trimmed)
+        .map(format_json_timestamp)
+        .map_or(JsonValue::Null, JsonValue::String)
+}
+
+fn json_path_datetime_template(text: &str, template: &str) -> JsonValue {
+    match template {
+        "HH24:MI" => json_path_parse_time_text(text)
+            .map(|micros| format_time_micros(micros - (micros % 60_000_000)))
+            .map_or(JsonValue::Null, JsonValue::String),
+        _ => JsonValue::Null,
+    }
+}
+
+fn json_path_parse_time_text(text: &str) -> Option<i64> {
+    let trimmed = text.trim();
+    if looks_like_json_path_iso_date(trimmed.split_whitespace().next().unwrap_or_default()) {
+        return None;
+    }
+    parse_time_text(trimmed)
+}
+
+fn json_path_parse_timetz_text(text: &str) -> Option<(i64, i32)> {
+    let trimmed = text.trim();
+    if looks_like_json_path_iso_date(trimmed.split_whitespace().next().unwrap_or_default()) {
+        return None;
+    }
+    parse_timetz_text(trimmed)
+}
+
+fn parse_json_path_timestamptz_text(text: &str) -> Option<(i32, i64, i32)> {
+    let (date, time) = split_json_path_timestamp_text(text)?;
+    if !json_path_time_has_explicit_zone(time) {
+        return None;
+    }
+    let days = parse_date_text(date)?;
+    let (micros, offset_seconds) = parse_timetz_text(time)?;
+    Some((days, micros, offset_seconds))
+}
+
+fn split_json_path_timestamp_text(text: &str) -> Option<(&str, &str)> {
+    let trimmed = text.trim();
+    let split_at = trimmed
+        .char_indices()
+        .find_map(|(idx, ch)| (ch == 'T' || ch.is_ascii_whitespace()).then_some(idx))?;
+    let date = trimmed[..split_at].trim();
+    let time =
+        trimmed[split_at..].trim_start_matches(|ch: char| ch == 'T' || ch.is_ascii_whitespace());
+    (!date.is_empty() && !time.is_empty()).then_some((date, time))
+}
+
+fn normalize_date_time(days: i32, micros: i64) -> Option<(i32, i64)> {
+    let day_delta = micros.div_euclid(MICROS_PER_DAY);
+    let micros = micros.rem_euclid(MICROS_PER_DAY);
+    let days = i64::from(days).checked_add(day_delta)?;
+    Some((i32::try_from(days).ok()?, micros))
+}
+
+fn round_time_micros(micros: i64, precision: Option<u32>) -> Option<i64> {
+    if !(0..=MICROS_PER_DAY).contains(&micros) {
+        return None;
+    }
+    round_signed_micros(micros, precision)
+}
+
+fn round_signed_micros(micros: i64, precision: Option<u32>) -> Option<i64> {
+    let Some(precision) = precision else {
+        return Some(micros);
+    };
+    if precision > JSON_PATH_TIME_PRECISION_MAX {
+        return None;
+    }
+    let factor = 10_i64.pow(JSON_PATH_TIME_PRECISION_MAX - precision);
+    if factor == 1 {
+        return Some(micros);
+    }
+    let half = factor / 2;
+    let adjusted = if micros >= 0 {
+        micros.checked_add(half)?
+    } else {
+        micros.checked_sub(half)?
+    };
+    adjusted.checked_div(factor)?.checked_mul(factor)
+}
+
+fn format_json_timestamp(micros: i64) -> String {
+    format_timestamp_micros(micros).replace(' ', "T")
+}
+
+fn looks_like_json_path_iso_date(text: &str) -> bool {
+    let bytes = text.as_bytes();
+    bytes.len() >= 10 && bytes.get(4) == Some(&b'-') && bytes.get(7) == Some(&b'-')
+}
+
+fn json_path_time_has_explicit_zone(text: &str) -> bool {
+    let mut tokens = text.split_whitespace();
+    let Some(first) = tokens.next() else {
+        return false;
+    };
+    match (tokens.next(), tokens.next()) {
+        (None, None) => first
+            .char_indices()
+            .skip(1)
+            .any(|(_, ch)| matches!(ch, '+' | '-')),
+        (Some(_), None) if !looks_like_json_path_iso_date(first) => true,
+        _ => false,
     }
 }
 
@@ -856,11 +1087,30 @@ impl<'a> JsonPathParser<'a> {
 
     fn parse_method_call(&mut self, name: &str) -> Result<JsonPathMethod, JsonPathError> {
         self.skip_ws();
-        if name == "decimal" {
-            return self.parse_decimal_method();
+        match name {
+            "date" => {
+                self.expect_byte(b')', "expected ) after jsonpath method")?;
+                Ok(JsonPathMethod::Date)
+            }
+            "datetime" => self.parse_datetime_method(),
+            "decimal" => self.parse_decimal_method(),
+            "time" => self
+                .parse_precision_method()
+                .map(|precision| JsonPathMethod::Time { precision }),
+            "time_tz" => self
+                .parse_precision_method()
+                .map(|precision| JsonPathMethod::TimeTz { precision }),
+            "timestamp" => self
+                .parse_precision_method()
+                .map(|precision| JsonPathMethod::Timestamp { precision }),
+            "timestamp_tz" => self
+                .parse_precision_method()
+                .map(|precision| JsonPathMethod::TimestampTz { precision }),
+            _ => {
+                self.expect_byte(b')', "expected ) after jsonpath method")?;
+                json_path_method(name)
+            }
         }
-        self.expect_byte(b')', "expected ) after jsonpath method")?;
-        json_path_method(name)
     }
 
     fn parse_decimal_method(&mut self) -> Result<JsonPathMethod, JsonPathError> {
@@ -883,6 +1133,49 @@ impl<'a> JsonPathParser<'a> {
             precision: Some(precision),
             scale,
         })
+    }
+
+    fn parse_datetime_method(&mut self) -> Result<JsonPathMethod, JsonPathError> {
+        if self.consume_byte(b')') {
+            return Ok(JsonPathMethod::DateTime { template: None });
+        }
+        self.expect_byte(b'"', "expected datetime template")?;
+        let template = self.parse_quoted_string_body()?;
+        self.skip_ws();
+        self.expect_byte(b')', "expected ) after jsonpath method")?;
+        Ok(JsonPathMethod::DateTime {
+            template: Some(template),
+        })
+    }
+
+    fn parse_precision_method(&mut self) -> Result<Option<u32>, JsonPathError> {
+        if self.consume_byte(b')') {
+            return Ok(None);
+        }
+        let precision = self.parse_time_precision_arg()?;
+        self.skip_ws();
+        self.expect_byte(b')', "expected ) after jsonpath method")?;
+        Ok(Some(precision))
+    }
+
+    fn parse_time_precision_arg(&mut self) -> Result<u32, JsonPathError> {
+        self.skip_ws();
+        let start = self.pos;
+        while self.peek_byte().is_some_and(|byte| byte.is_ascii_digit()) {
+            self.pos += 1;
+        }
+        if start == self.pos {
+            return Err(self.err("expected datetime precision"));
+        }
+        let value = self.text[start..self.pos]
+            .parse::<u32>()
+            .map_err(|err| self.err(format!("bad datetime precision: {err}")))?;
+        if value > JSON_PATH_TIME_PRECISION_MAX {
+            return Err(self.err(format!(
+                "datetime precision must be between 0 and {JSON_PATH_TIME_PRECISION_MAX}"
+            )));
+        }
+        Ok(value)
     }
 
     fn parse_decimal_method_arg(
@@ -1270,6 +1563,64 @@ mod tests {
         assert_eq!(select(&document, &overflow), vec![serde_json::Value::Null]);
 
         let bad = parse_json_path("$.bad.decimal()").unwrap();
+        assert_eq!(select(&document, &bad), vec![serde_json::Value::Null]);
+    }
+
+    #[test]
+    fn path_supports_iso_datetime_methods() {
+        let document = serde_json::json!({
+            "date": "2023-08-15",
+            "time": "12:34:56.789",
+            "timetz": "12:34:56.789 +05:30",
+            "timestamp": "2023-08-15 12:34:56.789",
+            "timestamptz": "2023-08-15 12:34:56.789 +05:30",
+            "hm": "12:30",
+            "bad": "not-time"
+        });
+
+        let date = parse_json_path("$.date.date()").unwrap();
+        assert_eq!(
+            select(&document, &date),
+            vec![serde_json::json!("2023-08-15")]
+        );
+
+        let time = parse_json_path("$.time.time(2)").unwrap();
+        assert_eq!(
+            select(&document, &time),
+            vec![serde_json::json!("12:34:56.79")]
+        );
+
+        let timetz = parse_json_path("$.timetz.time_tz(2)").unwrap();
+        assert_eq!(
+            select(&document, &timetz),
+            vec![serde_json::json!("12:34:56.79+05:30")]
+        );
+
+        let timestamp = parse_json_path("$.timestamp.timestamp(2)").unwrap();
+        assert_eq!(
+            select(&document, &timestamp),
+            vec![serde_json::json!("2023-08-15T12:34:56.79")]
+        );
+
+        let timestamptz = parse_json_path("$.timestamptz.timestamp_tz(2)").unwrap();
+        assert_eq!(
+            select(&document, &timestamptz),
+            vec![serde_json::json!("2023-08-15T12:34:56.79+05:30")]
+        );
+
+        let datetime = parse_json_path("$.timestamp.datetime()").unwrap();
+        assert_eq!(
+            select(&document, &datetime),
+            vec![serde_json::json!("2023-08-15T12:34:56.789")]
+        );
+
+        let template = parse_json_path("$.hm.datetime(\"HH24:MI\")").unwrap();
+        assert_eq!(
+            select(&document, &template),
+            vec![serde_json::json!("12:30:00")]
+        );
+
+        let bad = parse_json_path("$.bad.time()").unwrap();
         assert_eq!(select(&document, &bad), vec![serde_json::Value::Null]);
     }
 

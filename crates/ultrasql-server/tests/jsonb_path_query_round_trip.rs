@@ -403,6 +403,58 @@ async fn jsonb_path_query_supports_decimal_method() {
 }
 
 #[tokio::test]
+async fn jsonb_path_query_supports_iso_datetime_methods() {
+    let running = start_sample_server("jsonb_path_query_test").await;
+    let client = &running.client;
+
+    let messages = client
+        .simple_query(
+            "SELECT value FROM jsonb_path_query(\
+             '{\"values\":[\"2023-08-15\",\"12:34:56.789\",\
+             \"2023-08-15 12:34:56.789 +05:30\",\"bad\"]}'::jsonb, \
+             '$.values[*].datetime()')",
+        )
+        .await
+        .expect("jsonb_path_query datetime method");
+    let rows: Vec<String> = messages
+        .into_iter()
+        .filter_map(|message| match message {
+            SimpleQueryMessage::Row(row) => row.get(0).map(str::to_owned),
+            _ => None,
+        })
+        .collect();
+
+    assert_eq!(
+        rows,
+        vec![
+            "\"2023-08-15\"".to_owned(),
+            "\"12:34:56.789\"".to_owned(),
+            "\"2023-08-15T12:34:56.789+05:30\"".to_owned(),
+            "null".to_owned(),
+        ]
+    );
+
+    let rounded = client
+        .simple_query(
+            "SELECT value FROM jsonb_path_query(\
+             '{\"time\":\"12:34:56.789\",\"ts\":\"2023-08-15 12:34:56.789\"}'::jsonb, \
+             '$.** ? (@.type() == \"string\").time(2)')",
+        )
+        .await
+        .expect("jsonb_path_query time precision method");
+    let rows: Vec<String> = rounded
+        .into_iter()
+        .filter_map(|message| match message {
+            SimpleQueryMessage::Row(row) => row.get(0).map(str::to_owned),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(rows, vec!["\"12:34:56.79\"".to_owned(), "null".to_owned()]);
+
+    shutdown(running).await;
+}
+
+#[tokio::test]
 async fn jsonb_path_query_supports_predicate_boolean_algebra() {
     let running = start_sample_server("jsonb_path_query_test").await;
     let client = &running.client;
