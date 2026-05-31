@@ -11,7 +11,7 @@ use ultrasql_mvcc::{TupleHeader, XidStatusOracle};
 use crate::buffer_pool::PageLoader;
 use crate::vm::VisibilityMap;
 
-use super::{HeapAccess, HeapError};
+use super::{HeapAccess, HeapError, checked_heap_count_add, checked_heap_u32_count_add};
 
 /// Statistics returned by [`HeapAccess::vacuum_heap`].
 #[derive(Clone, Copy, Debug, Default)]
@@ -161,9 +161,15 @@ impl<L: PageLoader> HeapAccess<L> {
                 page.compact();
             }
 
-            let reclaimed = u32::try_from(dead_slots.len()).unwrap_or(u32::MAX);
-            stats.tuples_reclaimed = stats.tuples_reclaimed.saturating_add(reclaimed);
-            stats.pages_compacted = stats.pages_compacted.saturating_add(1);
+            let reclaimed = u32::try_from(dead_slots.len())
+                .map_err(|_| HeapError::MalformedHeader("vacuum stat overflow"))?;
+            stats.tuples_reclaimed = checked_heap_u32_count_add(
+                stats.tuples_reclaimed,
+                reclaimed,
+                "vacuum stat overflow",
+            )?;
+            stats.pages_compacted =
+                checked_heap_u32_count_add(stats.pages_compacted, 1, "vacuum stat overflow")?;
         }
 
         Ok(stats)
@@ -253,7 +259,7 @@ impl<L: PageLoader> HeapAccess<L> {
 
             if all_visible {
                 vm.mark_all_visible(rel, block_number);
-                marked = marked.saturating_add(1);
+                marked = checked_heap_u32_count_add(marked, 1, "visibility mark count overflow")?;
             } else {
                 vm.clear(rel, block_number);
             }
@@ -299,20 +305,30 @@ impl<L: PageLoader> HeapAccess<L> {
             let before = log.entries.len();
             log.entries.retain(|e| e.writer_xid >= oldest_active_xid);
             let after = log.entries.len();
-            total_trimmed += before - after;
-            let before_slots: usize = log
-                .int32_pair_batches
-                .iter()
-                .map(super::Int32PairUndoBatch::slot_len)
-                .sum();
+            let trimmed_entries = before
+                .checked_sub(after)
+                .ok_or(HeapError::MalformedHeader("undo trim count underflow"))?;
+            total_trimmed =
+                checked_heap_count_add(total_trimmed, trimmed_entries, "undo trim count overflow")?;
+            let before_slots: usize =
+                log.int32_pair_batches
+                    .iter()
+                    .try_fold(0_usize, |total, batch| {
+                        checked_heap_count_add(total, batch.slot_len(), "undo slot count overflow")
+                    })?;
             log.int32_pair_batches
                 .retain(|batch| batch.writer_xid >= oldest_active_xid);
-            let after_slots: usize = log
-                .int32_pair_batches
-                .iter()
-                .map(super::Int32PairUndoBatch::slot_len)
-                .sum();
-            total_trimmed += before_slots - after_slots;
+            let after_slots: usize =
+                log.int32_pair_batches
+                    .iter()
+                    .try_fold(0_usize, |total, batch| {
+                        checked_heap_count_add(total, batch.slot_len(), "undo slot count overflow")
+                    })?;
+            let trimmed_slots = before_slots
+                .checked_sub(after_slots)
+                .ok_or(HeapError::MalformedHeader("undo trim count underflow"))?;
+            total_trimmed =
+                checked_heap_count_add(total_trimmed, trimmed_slots, "undo trim count overflow")?;
         }
         Ok(total_trimmed)
     }

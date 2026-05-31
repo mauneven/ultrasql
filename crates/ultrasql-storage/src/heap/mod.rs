@@ -441,6 +441,17 @@ fn checked_heap_count_add(
 }
 
 #[inline]
+fn checked_heap_u32_count_add(
+    current: u32,
+    delta: u32,
+    error: &'static str,
+) -> Result<u32, HeapError> {
+    current
+        .checked_add(delta)
+        .ok_or(HeapError::MalformedHeader(error))
+}
+
+#[inline]
 fn checked_tuple_space_needed(tuple_size: usize) -> Result<usize, HeapError> {
     tuple_size
         .checked_add(crate::page::ITEMID_SIZE)

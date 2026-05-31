@@ -2167,3 +2167,7 @@ as a concise evidence ledger; roadmap stays for open gates only.
   space and block-counter advances instead of wrapping/clamping edge cases.
   Evidence:
   `cargo test -p ultrasql-storage heap::tests::heap_tuple_space_needed_rejects_overflow --lib -- --nocapture`.
+- VACUUM heap stats, visibility-map mark counts, and undo-log trim totals now
+  reject overflow/underflow instead of saturating or wrapping maintenance
+  evidence. Evidence:
+  `cargo test -p ultrasql-storage heap::tests::heap_u32_count_add_rejects_overflow --lib -- --nocapture`.

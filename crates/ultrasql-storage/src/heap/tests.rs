@@ -117,6 +117,15 @@ fn heap_tuple_space_needed_rejects_overflow() {
     ));
 }
 
+#[test]
+fn heap_u32_count_add_rejects_overflow() {
+    let err = checked_heap_u32_count_add(u32::MAX, 1, "vacuum stat overflow").unwrap_err();
+    assert!(matches!(
+        err,
+        HeapError::MalformedHeader("vacuum stat overflow")
+    ));
+}
+
 #[derive(Debug, Default)]
 struct CountingOracle {
     inner: MapOracle,
