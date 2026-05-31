@@ -34,6 +34,7 @@ where
             session: self,
             catalog_snapshot,
             requirements: BTreeSet::new(),
+            table_requirements: BTreeSet::new(),
             cte_names: Vec::new(),
         };
         collector.collect_plan(plan, true);
@@ -41,6 +42,23 @@ where
             .state
             .role_catalog
             .inherited_role_names(&self.current_user);
+        for requirement in &collector.table_requirements {
+            if self.owns_table_for_column_privilege(&requirement.table, catalog_snapshot) {
+                continue;
+            }
+            if !self.state.privilege_catalog.has_privilege_for_roles(
+                &roles,
+                PrivilegeObjectKind::Table,
+                &requirement.table,
+                requirement.privilege,
+            ) {
+                return Err(ServerError::InsufficientPrivilege(format!(
+                    "{} privilege on table {}",
+                    privilege_name(requirement.privilege),
+                    requirement.table
+                )));
+            }
+        }
         for requirement in collector.requirements {
             if requirement.privilege == PrivilegeKind::Select
                 && self.public_catalog_table(&requirement.table, catalog_snapshot)
@@ -130,10 +148,17 @@ struct ColumnPrivilegeRequirement {
     privilege: PrivilegeKind,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
+struct TablePrivilegeRequirement {
+    table: String,
+    privilege: PrivilegeKind,
+}
+
 struct ColumnPrivilegeCollector<'a, RW> {
     session: &'a Session<RW>,
     catalog_snapshot: &'a CatalogSnapshot,
     requirements: BTreeSet<ColumnPrivilegeRequirement>,
+    table_requirements: BTreeSet<TablePrivilegeRequirement>,
     cte_names: Vec<String>,
 }
 
@@ -277,6 +302,7 @@ where
                 returning,
                 ..
             } => {
+                self.require_table(table, PrivilegeKind::Delete);
                 if let Some(schema) = self.table_schema(table) {
                     self.collect_target_exprs(table, &schema, returning);
                 }
@@ -545,6 +571,21 @@ where
             privilege,
         });
     }
+
+    fn require_table(&mut self, table: &str, privilege: PrivilegeKind) {
+        if self
+            .cte_names
+            .iter()
+            .rev()
+            .any(|name| name.eq_ignore_ascii_case(table))
+        {
+            return;
+        }
+        self.table_requirements.insert(TablePrivilegeRequirement {
+            table: table.to_ascii_lowercase(),
+            privilege,
+        });
+    }
 }
 
 #[cfg(test)]
@@ -607,6 +648,7 @@ mod tests {
             session,
             catalog_snapshot: snapshot,
             requirements: BTreeSet::new(),
+            table_requirements: BTreeSet::new(),
             cte_names: Vec::new(),
         }
     }

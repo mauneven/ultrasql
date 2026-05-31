@@ -355,6 +355,68 @@ async fn sequence_owner_can_grant_and_revoke_sequence_privileges() {
 }
 
 #[tokio::test]
+async fn delete_requires_table_delete_privilege() {
+    let running = start_sample_server("delete_privilege_gate").await;
+    let client = &running.client;
+
+    client
+        .batch_execute(
+            "CREATE ROLE tester SUPERUSER LOGIN; \
+             CREATE ROLE delete_acl_owner LOGIN; \
+             CREATE ROLE delete_acl_user LOGIN; \
+             SET ROLE delete_acl_owner; \
+             CREATE TABLE delete_acl_docs (id INT); \
+             INSERT INTO delete_acl_docs VALUES (1), (2); \
+             RESET ROLE",
+        )
+        .await
+        .expect("create delete privilege table");
+
+    let (user, user_conn) =
+        connect_as(running.bound, "delete_acl_user", "delete_acl_user_blocked").await;
+    assert_insufficient_privilege(
+        user.batch_execute("DELETE FROM delete_acl_docs")
+            .await
+            .expect_err("DELETE privilege required"),
+    );
+    drop(user);
+    user_conn.await.expect("blocked delete connection joins");
+
+    let (owner, owner_conn) =
+        connect_as(running.bound, "delete_acl_owner", "delete_acl_owner_grant").await;
+    owner
+        .batch_execute("GRANT DELETE ON TABLE delete_acl_docs TO delete_acl_user")
+        .await
+        .expect("owner grants DELETE");
+    drop(owner);
+    owner_conn.await.expect("owner grant connection joins");
+
+    let (user, user_conn) =
+        connect_as(running.bound, "delete_acl_user", "delete_acl_user_allowed").await;
+    user.batch_execute("DELETE FROM delete_acl_docs")
+        .await
+        .expect("DELETE grant permits delete");
+    drop(user);
+    user_conn.await.expect("allowed delete connection joins");
+
+    let remaining = client
+        .query_one("SELECT COUNT(*) FROM delete_acl_docs", &[])
+        .await
+        .expect("query rows after delete")
+        .get::<_, i64>(0);
+    assert_eq!(remaining, 0);
+
+    client
+        .batch_execute(
+            "DROP TABLE delete_acl_docs; DROP ROLE delete_acl_owner; DROP ROLE delete_acl_user",
+        )
+        .await
+        .expect("cleanup delete privilege test");
+
+    shutdown(running).await;
+}
+
+#[tokio::test]
 async fn non_superuser_cannot_alter_default_privileges_for_privileged_role() {
     let running = start_sample_server("privilege_catalog_test").await;
     let client = &running.client;

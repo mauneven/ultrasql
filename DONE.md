@@ -989,6 +989,11 @@ as a concise evidence ledger; roadmap stays for open gates only.
   requires `UPDATE`, with owner/superuser bypass. Evidence:
   `cargo test -p ultrasql-server --test sequence_round_trip
   sequence_functions_enforce_usage_and_update_privileges -- --nocapture`.
+- `DELETE` now requires table-level `DELETE` privilege for non-owner roles,
+  closing the column-only privilege bypass for `DELETE FROM table` without a
+  predicate or `RETURNING` list. Evidence: `cargo test -p ultrasql-server
+  --test privilege_catalog_round_trip delete_requires_table_delete_privilege
+  -- --nocapture`.
 - `DROP ROLE` now rejects roles that still own live tables or still appear in
   object/default privilege grants, avoiding stale ownership and ACL references.
   Evidence: `cargo test -p ultrasql-server --test role_ddl_round_trip`.
