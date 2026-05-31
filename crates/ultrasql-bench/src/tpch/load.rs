@@ -420,6 +420,17 @@ fn checked_direct_discounted_revenue(extendedprice: i64, discount: i64) -> Resul
 }
 
 #[cfg(feature = "sql-bench")]
+fn checked_direct_discounted_revenue_x100(extendedprice: i64, discount: i64) -> Result<i64> {
+    let factor = 100_i64
+        .checked_sub(discount)
+        .ok_or_else(direct_sidecar_revenue_overflow)?;
+    let product = i128::from(extendedprice)
+        .checked_mul(i128::from(factor))
+        .ok_or_else(direct_sidecar_revenue_overflow)?;
+    i64::try_from(product).map_err(|_| direct_sidecar_revenue_overflow())
+}
+
+#[cfg(feature = "sql-bench")]
 fn q3_fields(table: &str, line: &str, expected: usize) -> Result<Vec<String>> {
     let fields = parse_tbl_line(line).ok_or_else(|| anyhow::anyhow!("{table}: empty row"))?;
     if fields.len() != expected {
@@ -1926,8 +1937,9 @@ impl TpchQ15BuildState {
         {
             return Ok(());
         }
-        let revenue = extendedprice * 100_i64.saturating_sub(discount);
-        *self.revenue_by_supplier.entry(suppkey).or_default() += revenue;
+        let revenue = checked_direct_discounted_revenue_x100(extendedprice, discount)?;
+        let entry = self.revenue_by_supplier.entry(suppkey).or_default();
+        *entry = checked_direct_revenue_add(*entry, revenue)?;
         Ok(())
     }
 }
@@ -5489,6 +5501,24 @@ mod tests {
         assert_eq!(rows[0].s_suppkey, 3);
         assert_eq!(rows[0].total_revenue, 900_000);
         assert_eq!(rows[0].s_name, "Supplier#3");
+    }
+
+    #[cfg(feature = "sql-bench")]
+    #[test]
+    fn tpch_q15_sidecar_rejects_discount_factor_overflow() {
+        let mut state = TpchQ15BuildState::default();
+        state
+            .ingest(
+                "supplier",
+                "3|Supplier#3|address|1|11-111-1111|0.00|comment",
+            )
+            .expect("supplier");
+
+        let err = state
+            .ingest_lineitem_values(3, 10_000, i64::MIN, -1_461)
+            .expect_err("discount factor overflow should reject");
+
+        assert!(err.to_string().contains("TPC-H sidecar revenue overflow"));
     }
 
     #[cfg(feature = "sql-bench")]
