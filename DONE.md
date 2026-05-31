@@ -99,6 +99,8 @@ as a concise evidence ledger; roadmap stays for open gates only.
   parameters, avoiding unknown-binary fallback to `bytea` for casted text slots.
 - Extended-query parameter slot math now uses checked one-based conversions in
   Bind, Describe, LIMIT/OFFSET rebinding, and substitution.
+- Extended-query portal resumption now checks emitted-row counter overflow
+  instead of saturating the final `CommandComplete` row count.
 - Focused `ultrasql-executor` coverage now exercises scalar compatibility
   functions, physical lowering edge families, row encoding/decoding,
   projection/filter/sort/unique/set/window/hash aggregate behavior, modify-table

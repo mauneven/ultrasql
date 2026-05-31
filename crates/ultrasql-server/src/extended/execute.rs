@@ -20,11 +20,10 @@ use super::{ExecuteOutcome, ExtendedConnState, SuspendedPortal};
 ///
 /// Streams every row through the same execution path the Simple Query
 /// dispatcher uses. `max_rows = 0` means "all rows" (the spec's
-/// `INT32_MAX` shortcut). Any positive value caps the output; v0.5 does
-/// not yet support resumption, so the portal is closed at the row cap
-/// and a `PortalSuspended` is returned (the next `Execute` will see no
-/// rows because the portal has no state to resume from). Documented as
-/// a follow-up.
+/// `INT32_MAX` shortcut). Any positive value caps the output and returns
+/// `PortalSuspended`; the in-flight operator plus partial batch are kept
+/// in session state so a later `Execute` on the same portal resumes at
+/// the first un-emitted row.
 ///
 /// # Errors
 ///
@@ -188,7 +187,7 @@ pub fn execute_portal(
                 columns.push(encoded);
             }
             messages.push(BackendMessage::DataRow { columns });
-            emitted = emitted.saturating_add(1);
+            increment_u64_row_count(&mut emitted)?;
         }
     }
 
@@ -238,7 +237,7 @@ fn execute_modify_returning(
                 columns.push(encoded);
             }
             messages.push(BackendMessage::DataRow { columns });
-            emitted = emitted.saturating_add(1);
+            increment_u64_row_count(&mut emitted)?;
         }
     }
     messages.push(BackendMessage::CommandComplete {
@@ -318,13 +317,16 @@ fn resume_suspended_portal(
                 columns.push(encoded);
             }
             messages.push(BackendMessage::DataRow { columns });
-            emitted_this_call = emitted_this_call.saturating_add(1);
+            emitted_this_call =
+                emitted_this_call
+                    .checked_add(1)
+                    .ok_or(ServerError::Unsupported(
+                        "extended query row count overflow",
+                    ))?;
         }
     }
 
-    sus.emitted = sus
-        .emitted
-        .saturating_add(u64::try_from(emitted_this_call).unwrap_or(u64::MAX));
+    sus.emitted = add_emitted_rows(sus.emitted, emitted_this_call)?;
 
     if suspended {
         sus.leftover = current;
@@ -337,4 +339,69 @@ fn resume_suspended_portal(
     }
 
     Ok(ExecuteOutcome { messages })
+}
+
+fn increment_u64_row_count(count: &mut u64) -> Result<(), ServerError> {
+    *count = count.checked_add(1).ok_or(ServerError::Unsupported(
+        "extended query row count overflow",
+    ))?;
+    Ok(())
+}
+
+fn add_emitted_rows(total: u64, delta: usize) -> Result<u64, ServerError> {
+    let delta = u64::try_from(delta)
+        .map_err(|_| ServerError::Unsupported("extended query row count exceeds protocol limit"))?;
+    total.checked_add(delta).ok_or(ServerError::Unsupported(
+        "extended query row count overflow",
+    ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ultrasql_core::{DataType, Field, Schema};
+    use ultrasql_executor::ExecError;
+    use ultrasql_vec::Batch;
+    use ultrasql_vec::column::{Column, NumericColumn};
+
+    #[derive(Debug)]
+    struct TestOperator {
+        schema: Schema,
+    }
+
+    impl Operator for TestOperator {
+        fn next_batch(&mut self) -> Result<Option<Batch>, ExecError> {
+            Ok(None)
+        }
+
+        fn schema(&self) -> &Schema {
+            &self.schema
+        }
+    }
+
+    #[test]
+    fn resume_rejects_emitted_counter_overflow() {
+        let schema = Schema::new([Field::nullable("v", DataType::Int32)]).expect("schema");
+        let leftover =
+            Batch::new([Column::Int32(NumericColumn::from_data(vec![1]))]).expect("batch");
+        let sus = SuspendedPortal {
+            op: Box::new(TestOperator {
+                schema: schema.clone(),
+            }),
+            leftover: Some((leftover, 0)),
+            emitted: u64::MAX,
+            result_formats: Vec::new(),
+            text_options: TextEncodingOptions::default(),
+        };
+        let mut state = ExtendedConnState::new();
+
+        let err = resume_suspended_portal(&mut state, "p", 0, sus)
+            .expect_err("resumed row counter must not saturate");
+
+        assert!(
+            matches!(err, ServerError::Unsupported(message) if message.contains("row count overflow")),
+            "unexpected error: {err:?}"
+        );
+        assert!(!state.suspended.contains_key("p"));
+    }
 }
