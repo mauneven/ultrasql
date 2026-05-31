@@ -25,10 +25,15 @@ enum JsonPathMethod {
 }
 
 #[derive(Clone, Debug, PartialEq)]
-struct JsonPathPredicate {
-    path: Vec<JsonPathStep>,
-    op: Option<JsonPathCompareOp>,
-    literal: Option<JsonPathLiteral>,
+enum JsonPathPredicate {
+    Path {
+        path: Vec<JsonPathStep>,
+        op: Option<JsonPathCompareOp>,
+        literal: Option<JsonPathLiteral>,
+    },
+    And(Box<JsonPathPredicate>, Box<JsonPathPredicate>),
+    Or(Box<JsonPathPredicate>, Box<JsonPathPredicate>),
+    Not(Box<JsonPathPredicate>),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -179,16 +184,27 @@ fn predicate_matches(
     predicate: &JsonPathPredicate,
     vars: Option<&JsonValue>,
 ) -> bool {
-    let selected = select_steps(vec![value.clone()], &predicate.path, vars);
-    let Some(op) = predicate.op else {
-        return !selected.is_empty();
-    };
-    let Some(literal) = &predicate.literal else {
-        return false;
-    };
-    selected
-        .iter()
-        .any(|candidate| compare_json_path_literal(candidate, op, literal, vars))
+    match predicate {
+        JsonPathPredicate::Path { path, op, literal } => {
+            let selected = select_steps(vec![value.clone()], path, vars);
+            let Some(op) = op else {
+                return !selected.is_empty();
+            };
+            let Some(literal) = literal else {
+                return false;
+            };
+            selected
+                .iter()
+                .any(|candidate| compare_json_path_literal(candidate, *op, literal, vars))
+        }
+        JsonPathPredicate::And(left, right) => {
+            predicate_matches(value, left, vars) && predicate_matches(value, right, vars)
+        }
+        JsonPathPredicate::Or(left, right) => {
+            predicate_matches(value, left, vars) || predicate_matches(value, right, vars)
+        }
+        JsonPathPredicate::Not(inner) => !predicate_matches(value, inner, vars),
+    }
 }
 
 fn compare_json_path_literal(
@@ -303,6 +319,7 @@ impl<'a> JsonPathParser<'a> {
             self.skip_ws();
             if self.is_eof()
                 || (relative && (self.peek_byte() == Some(b')') || self.starts_compare_op()))
+                || (relative && self.starts_boolean_op())
             {
                 return Ok(steps);
             }
@@ -369,6 +386,58 @@ impl<'a> JsonPathParser<'a> {
         self.skip_ws();
         self.expect_byte(b'(', "expected ( after ?")?;
         self.skip_ws();
+        let predicate = self.parse_predicate_expr()?;
+        self.skip_ws();
+        self.expect_byte(b')', "expected )")?;
+        Ok(predicate)
+    }
+
+    fn parse_predicate_expr(&mut self) -> Result<JsonPathPredicate, JsonPathError> {
+        self.parse_predicate_or()
+    }
+
+    fn parse_predicate_or(&mut self) -> Result<JsonPathPredicate, JsonPathError> {
+        let mut predicate = self.parse_predicate_and()?;
+        loop {
+            self.skip_ws();
+            if !self.consume_token("||") {
+                return Ok(predicate);
+            }
+            let right = self.parse_predicate_and()?;
+            predicate = JsonPathPredicate::Or(Box::new(predicate), Box::new(right));
+        }
+    }
+
+    fn parse_predicate_and(&mut self) -> Result<JsonPathPredicate, JsonPathError> {
+        let mut predicate = self.parse_predicate_not()?;
+        loop {
+            self.skip_ws();
+            if !self.consume_token("&&") {
+                return Ok(predicate);
+            }
+            let right = self.parse_predicate_not()?;
+            predicate = JsonPathPredicate::And(Box::new(predicate), Box::new(right));
+        }
+    }
+
+    fn parse_predicate_not(&mut self) -> Result<JsonPathPredicate, JsonPathError> {
+        self.skip_ws();
+        if self.consume_byte(b'!') {
+            return self
+                .parse_predicate_not()
+                .map(|predicate| JsonPathPredicate::Not(Box::new(predicate)));
+        }
+        self.parse_predicate_atom()
+    }
+
+    fn parse_predicate_atom(&mut self) -> Result<JsonPathPredicate, JsonPathError> {
+        self.skip_ws();
+        if self.consume_byte(b'(') {
+            let predicate = self.parse_predicate_expr()?;
+            self.skip_ws();
+            self.expect_byte(b')', "expected ) in predicate")?;
+            return Ok(predicate);
+        }
         self.expect_byte(b'@', "filter path must start with @")?;
         let path = self.parse_steps(true)?;
         self.skip_ws();
@@ -380,8 +449,7 @@ impl<'a> JsonPathParser<'a> {
             None
         };
         self.skip_ws();
-        self.expect_byte(b')', "expected )")?;
-        Ok(JsonPathPredicate { path, op, literal })
+        Ok(JsonPathPredicate::Path { path, op, literal })
     }
 
     fn parse_compare_op(&mut self) -> Option<JsonPathCompareOp> {
@@ -405,6 +473,10 @@ impl<'a> JsonPathParser<'a> {
         [">=", "<=", "==", "!=", ">", "<"]
             .iter()
             .any(|token| self.text[self.pos..].starts_with(token))
+    }
+
+    fn starts_boolean_op(&self) -> bool {
+        self.text[self.pos..].starts_with("&&") || self.text[self.pos..].starts_with("||")
     }
 
     fn parse_literal(&mut self) -> Result<JsonPathLiteral, JsonPathError> {
@@ -549,6 +621,15 @@ impl<'a> JsonPathParser<'a> {
         }
     }
 
+    fn consume_token(&mut self, token: &str) -> bool {
+        if self.text[self.pos..].starts_with(token) {
+            self.pos += token.len();
+            true
+        } else {
+            false
+        }
+    }
+
     fn consume_keyword(&mut self, keyword: &str) -> bool {
         let rest = &self.text[self.pos..];
         if !rest.starts_with(keyword) {
@@ -665,6 +746,38 @@ mod tests {
         assert_eq!(
             select_json_path(&document, &scalar_size),
             vec![serde_json::json!(1)]
+        );
+    }
+
+    #[test]
+    fn path_supports_predicate_boolean_algebra() {
+        let document = serde_json::json!({
+            "items": [
+                {"id": 1, "score": 12, "meta": {"kind": "guide"}},
+                {"id": 2, "score": 25, "meta": {"kind": "paper"}},
+                {"id": 3, "score": 31, "meta": {"kind": "guide"}}
+            ]
+        });
+
+        let and_path =
+            parse_json_path(r#"$.items[*] ? (@.score >= 20 && @.meta.kind == "guide").id"#)
+                .unwrap();
+        assert_eq!(
+            select_json_path(&document, &and_path),
+            vec![serde_json::json!(3)]
+        );
+
+        let or_path =
+            parse_json_path(r#"$.items[*] ? (@.score < 15 || @.meta.kind == "paper").id"#).unwrap();
+        assert_eq!(
+            select_json_path(&document, &or_path),
+            vec![serde_json::json!(1), serde_json::json!(2)]
+        );
+
+        let not_path = parse_json_path(r#"$.items[*] ? (!(@.meta.kind == "paper")).id"#).unwrap();
+        assert_eq!(
+            select_json_path(&document, &not_path),
+            vec![serde_json::json!(1), serde_json::json!(3)]
         );
     }
 }

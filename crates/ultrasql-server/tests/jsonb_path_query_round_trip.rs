@@ -216,6 +216,70 @@ async fn jsonb_path_query_supports_basic_methods() {
 }
 
 #[tokio::test]
+async fn jsonb_path_query_supports_predicate_boolean_algebra() {
+    let running = start_sample_server("jsonb_path_query_test").await;
+    let client = &running.client;
+
+    let document = "'{\"items\":[\
+        {\"id\":1,\"score\":12,\"meta\":{\"kind\":\"guide\"}},\
+        {\"id\":2,\"score\":25,\"meta\":{\"kind\":\"paper\"}},\
+        {\"id\":3,\"score\":31,\"meta\":{\"kind\":\"guide\"}}\
+    ]}'::jsonb";
+
+    let and_rows = client
+        .simple_query(&format!(
+            "SELECT value FROM jsonb_path_query(\
+             {document}, '$.items[*] ? (@.score >= 20 && @.meta.kind == \"guide\").id')"
+        ))
+        .await
+        .expect("jsonb_path_query boolean and");
+    let rows: Vec<String> = and_rows
+        .into_iter()
+        .filter_map(|message| match message {
+            SimpleQueryMessage::Row(row) => row.get(0).map(str::to_owned),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(rows, vec!["3".to_owned()]);
+
+    let or_rows = client
+        .simple_query(&format!(
+            "SELECT value FROM jsonb_path_query(\
+             {document}, '$.items[*] ? (@.score < 15 || @.meta.kind == \"paper\").id') \
+             ORDER BY value"
+        ))
+        .await
+        .expect("jsonb_path_query boolean or");
+    let rows: Vec<String> = or_rows
+        .into_iter()
+        .filter_map(|message| match message {
+            SimpleQueryMessage::Row(row) => row.get(0).map(str::to_owned),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(rows, vec!["1".to_owned(), "2".to_owned()]);
+
+    let not_rows = client
+        .simple_query(&format!(
+            "SELECT value FROM jsonb_path_query(\
+             {document}, '$.items[*] ? (!(@.meta.kind == \"paper\")).id') \
+             ORDER BY value"
+        ))
+        .await
+        .expect("jsonb_path_query boolean not");
+    let rows: Vec<String> = not_rows
+        .into_iter()
+        .filter_map(|message| match message {
+            SimpleQueryMessage::Row(row) => row.get(0).map(str::to_owned),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(rows, vec!["1".to_owned(), "3".to_owned()]);
+
+    shutdown(running).await;
+}
+
+#[tokio::test]
 async fn jsonb_path_exists_evaluates_sql_json_predicates() {
     let running = start_sample_server("jsonb_path_query_test").await;
     let client = &running.client;
