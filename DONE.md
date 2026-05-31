@@ -967,6 +967,10 @@ as a concise evidence ledger; roadmap stays for open gates only.
 - Row-security metadata reload rejects policy role lists that reference unknown
   roles, avoiding ghost-role policies after restart. Evidence:
   `cargo test -p ultrasql-server --test rls_round_trip rls_metadata_rejects_unknown_policy_roles_on_rebuild -- --nocapture`.
+- Row-security metadata reload validates persisted `USING` and `WITH CHECK`
+  column indexes/names against the target table schema before install,
+  avoiding stale or tampered predicate bindings after restart. Evidence:
+  `cargo test -p ultrasql-server --test rls_round_trip rls_metadata_rejects_invalid_policy_columns_on_rebuild -- --nocapture`.
 - Role-scoped RLS policies parse `CREATE POLICY ... TO role`, enforce inherited
   role membership, persist across restart, and fail closed when no scoped policy
   applies. Evidence:

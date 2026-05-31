@@ -569,6 +569,53 @@ async fn rls_metadata_rejects_unknown_policy_roles_on_rebuild() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn rls_metadata_rejects_invalid_policy_columns_on_rebuild() {
+    let data_dir = tempfile::TempDir::new().unwrap();
+    let metadata_path = data_dir.path().join("pg_row_security.meta");
+
+    let running = start_persistent_server(data_dir.path(), "rls_bad_column_setup").await;
+    for sql in [
+        "CREATE TABLE rls_bad_column_docs (tenant_id TEXT NOT NULL, doc_id TEXT NOT NULL)",
+        "CREATE POLICY rls_bad_column_docs_tenant ON rls_bad_column_docs \
+            USING (tenant_id = current_setting('ultrasql.tenant_id', true))",
+        "ALTER TABLE rls_bad_column_docs ENABLE ROW LEVEL SECURITY",
+    ] {
+        running.client.batch_execute(sql).await.expect(sql);
+    }
+    graceful_shutdown(running).await;
+
+    let metadata = std::fs::read_to_string(&metadata_path).expect("RLS metadata exists");
+    let mut changed = false;
+    let tampered = metadata
+        .lines()
+        .map(|line| {
+            if changed || !line.starts_with("policy\t") {
+                return line.to_owned();
+            }
+            let mut parts = line.split('\t').collect::<Vec<_>>();
+            parts[5] = "99";
+            changed = true;
+            parts.join("\t")
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        changed,
+        "RLS metadata should include policy row: {metadata}"
+    );
+    std::fs::write(&metadata_path, format!("{tampered}\n")).expect("bad RLS column metadata");
+
+    let err = match Server::init(data_dir.path()) {
+        Ok(_) => panic!("invalid RLS policy column should be rejected"),
+        Err(err) => err,
+    };
+    assert!(
+        err.to_string().contains("RLS metadata") && err.to_string().contains("column index"),
+        "expected invalid RLS column rejection, got {err}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn rls_policy_roles_scope_visibility_and_restart() {
     let data_dir = tempfile::TempDir::new().unwrap();
 

@@ -930,6 +930,35 @@ fn validate_rls_metadata_policy_roles(
     Ok(())
 }
 
+fn validate_rls_metadata_expr(
+    table: &TableEntry,
+    expr: Option<&RuntimeTenantPolicyExpr>,
+    line_no: usize,
+    clause: &str,
+) -> Result<(), ServerError> {
+    let Some(expr) = expr else {
+        return Ok(());
+    };
+    let Some(field) = table.schema.field(expr.column_index) else {
+        return Err(ServerError::Ddl(format!(
+            "RLS metadata line {} {clause} column index {} out of bounds for table '{}' with {} columns",
+            line_no + 1,
+            expr.column_index,
+            table.name,
+            table.schema.len()
+        )));
+    };
+    if field.name.eq_ignore_ascii_case(&expr.column_name) {
+        return Ok(());
+    }
+    Err(ServerError::Ddl(format!(
+        "RLS metadata line {} {clause} column '{}' does not match table column '{}'",
+        line_no + 1,
+        expr.column_name,
+        field.name
+    )))
+}
+
 fn rls_expr_fields(expr: Option<&RuntimeTenantPolicyExpr>) -> (String, String, String) {
     expr.map_or_else(
         || (String::new(), String::new(), String::new()),
@@ -5858,13 +5887,24 @@ impl Server {
                         Vec::new()
                     };
                     validate_rls_metadata_policy_roles(&known_roles, &mut roles, line_no)?;
+                    let using = parse_rls_expr(parts[5], parts[6], parts[7])?;
+                    let with_check = parse_rls_expr(parts[8], parts[9], parts[10])?;
+                    if let Some(table) = snapshot.tables_by_oid.get(&oid) {
+                        validate_rls_metadata_expr(table, using.as_ref(), line_no, "USING")?;
+                        validate_rls_metadata_expr(
+                            table,
+                            with_check.as_ref(),
+                            line_no,
+                            "WITH CHECK",
+                        )?;
+                    }
                     let policy = RuntimeRlsPolicy {
                         name: policy_name,
                         permissiveness: parse_rls_permissiveness(parts[3])?,
                         command: parse_rls_command(parts[4])?,
                         roles,
-                        using: parse_rls_expr(parts[5], parts[6], parts[7])?,
-                        with_check: parse_rls_expr(parts[8], parts[9], parts[10])?,
+                        using,
+                        with_check,
                     };
                     rows.entry(oid)
                         .or_insert_with(|| (String::new(), TableRowSecurity::default()))
