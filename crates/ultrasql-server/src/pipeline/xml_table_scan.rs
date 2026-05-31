@@ -6,7 +6,9 @@
 
 use serde_json::Value as JsonValue;
 use ultrasql_core::{
-    DataType, Field, Schema, Value, xml_document_is_well_formed, xml_xpath_element_fragments,
+    DataType, Field, Schema, Value, pack_timetz, parse_date_text, parse_decimal_text,
+    parse_money_text, parse_time_text, parse_timestamp_text, parse_timestamptz_text,
+    parse_timetz_text, xml_document_is_well_formed, xml_xpath_element_fragments,
 };
 use ultrasql_executor::{Eval, MemTableScan, Operator};
 use ultrasql_planner::ScalarExpr;
@@ -145,22 +147,54 @@ fn xml_table_data_type(type_name: &str) -> Result<DataType, ServerError> {
             "XMLTABLE array column types are not supported".to_owned(),
         ));
     }
-    let base = type_name
-        .split_once('(')
-        .map_or(type_name, |(base, _)| base)
-        .to_ascii_lowercase();
+    let (base, modifiers) = split_xml_table_type(type_name)?;
     match base.as_str() {
         "bool" | "boolean" => Ok(DataType::Bool),
         "smallint" | "int2" => Ok(DataType::Int16),
         "int" | "integer" | "int4" => Ok(DataType::Int32),
         "bigint" | "int8" => Ok(DataType::Int64),
         "float" | "float8" | "double" => Ok(DataType::Float64),
+        "numeric" | "decimal" => Ok(DataType::Decimal {
+            precision: modifiers.first().copied(),
+            scale: modifiers
+                .get(1)
+                .map(|value| {
+                    i32::try_from(*value).map_err(|err| {
+                        ServerError::CopyFormat(format!("XMLTABLE numeric scale: {err}"))
+                    })
+                })
+                .transpose()?,
+        }),
+        "money" => Ok(DataType::Money),
+        "date" => Ok(DataType::Date),
+        "time" | "time without time zone" => Ok(DataType::Time),
+        "timetz" | "time with time zone" => Ok(DataType::TimeTz),
+        "timestamp" | "timestamp without time zone" => Ok(DataType::Timestamp),
+        "timestamptz" | "timestamp with time zone" => Ok(DataType::TimestampTz),
         "text" | "varchar" | "char" | "character" => Ok(DataType::Text { max_len: None }),
         "xml" => Ok(DataType::Xml),
         other => Err(ServerError::CopyFormat(format!(
             "XMLTABLE column type {other} is not supported"
         ))),
     }
+}
+
+fn split_xml_table_type(type_name: &str) -> Result<(String, Vec<u32>), ServerError> {
+    let trimmed = type_name.trim();
+    let Some((base, rest)) = trimmed.split_once('(') else {
+        return Ok((trimmed.to_ascii_lowercase(), Vec::new()));
+    };
+    let modifiers = rest
+        .strip_suffix(')')
+        .ok_or_else(|| ServerError::CopyFormat(format!("XMLTABLE type {type_name}: bad typmod")))?
+        .split(',')
+        .map(|part| {
+            part.trim().parse::<u32>().map_err(|err| {
+                ServerError::CopyFormat(format!("XMLTABLE type {type_name}: bad typmod: {err}"))
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok((base.trim().to_ascii_lowercase(), modifiers))
 }
 
 fn xml_table_schema(columns: &[XmlTableColumn]) -> Result<Schema, ServerError> {
@@ -265,6 +299,25 @@ fn xml_value_to_sql(value: &str, data_type: &DataType) -> Result<Value, ServerEr
             }),
         DataType::Int64 => Ok(trimmed.parse::<i64>().map_or(Value::Null, Value::Int64)),
         DataType::Float64 => Ok(trimmed.parse::<f64>().map_or(Value::Null, Value::Float64)),
+        DataType::Decimal { scale, .. } => Ok(parse_decimal_text(trimmed, *scale)
+            .ok()
+            .unwrap_or(Value::Null)),
+        DataType::Money => Ok(parse_money_text(trimmed).ok().unwrap_or(Value::Null)),
+        DataType::Date => Ok(parse_date_text(trimmed).map_or(Value::Null, Value::Date)),
+        DataType::Time => Ok(parse_time_text(trimmed).map_or(Value::Null, Value::Time)),
+        DataType::TimeTz => Ok(parse_timetz_text(trimmed).map_or(
+            Value::Null,
+            |(micros, offset_seconds)| Value::TimeTz {
+                micros,
+                offset_seconds,
+            },
+        )),
+        DataType::Timestamp => {
+            Ok(parse_timestamp_text(trimmed).map_or(Value::Null, Value::Timestamp))
+        }
+        DataType::TimestampTz => {
+            Ok(parse_timestamptz_text(trimmed).map_or(Value::Null, Value::TimestampTz))
+        }
         DataType::Text { .. } => Ok(Value::Text(value.to_owned())),
         DataType::Xml => {
             if xml_document_is_well_formed(value) {
@@ -366,6 +419,40 @@ fn values_to_column(
             }
             f64_column(values, validity)
         }
+        DataType::Date => {
+            let mut values = Vec::with_capacity(rows.len());
+            let mut validity = Bitmap::new(rows.len(), true);
+            for (row_idx, row) in rows.iter().enumerate() {
+                match row.get(idx) {
+                    Some(Value::Date(value)) => values.push(*value),
+                    Some(Value::Null) | None => {
+                        values.push(0);
+                        validity.set(row_idx, false);
+                    }
+                    other => return Err(type_mismatch(idx, "date", other)),
+                }
+            }
+            i32_column(values, validity)
+        }
+        DataType::Decimal { .. }
+        | DataType::Money
+        | DataType::Time
+        | DataType::Timestamp
+        | DataType::TimestampTz
+        | DataType::TimeTz => {
+            let mut values = Vec::with_capacity(rows.len());
+            let mut validity = Bitmap::new(rows.len(), true);
+            for (row_idx, row) in rows.iter().enumerate() {
+                match numeric_payload(row.get(idx), data_type)? {
+                    Some(value) => values.push(value),
+                    None => {
+                        values.push(0_i64);
+                        validity.set(row_idx, false);
+                    }
+                }
+            }
+            i64_column(values, validity)
+        }
         DataType::Text { .. } | DataType::Xml => {
             let mut values = Vec::with_capacity(rows.len());
             let mut validity = Bitmap::new(rows.len(), true);
@@ -386,6 +473,30 @@ fn values_to_column(
         other => Err(ServerError::CopyFormat(format!(
             "XMLTABLE column type {other:?} is not supported"
         ))),
+    }
+}
+
+fn numeric_payload(
+    value: Option<&Value>,
+    data_type: &DataType,
+) -> Result<Option<i64>, ServerError> {
+    match (value, data_type) {
+        (Some(Value::Decimal { value, .. }), DataType::Decimal { .. }) => Ok(Some(*value)),
+        (Some(Value::Money(value)), DataType::Money) => Ok(Some(*value)),
+        (Some(Value::Time(value)), DataType::Time) => Ok(Some(*value)),
+        (Some(Value::Timestamp(value)), DataType::Timestamp) => Ok(Some(*value)),
+        (Some(Value::TimestampTz(value)), DataType::TimestampTz) => Ok(Some(*value)),
+        (
+            Some(Value::TimeTz {
+                micros,
+                offset_seconds,
+            }),
+            DataType::TimeTz,
+        ) => pack_timetz(*micros, *offset_seconds)
+            .map(Some)
+            .ok_or_else(|| ServerError::CopyFormat("XMLTABLE timetz out of range".to_owned())),
+        (Some(Value::Null) | None, _) => Ok(None),
+        (other, _) => Err(type_mismatch(0, &data_type.to_string(), other)),
     }
 }
 

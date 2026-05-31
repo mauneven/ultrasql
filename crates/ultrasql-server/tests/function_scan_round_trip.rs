@@ -800,6 +800,49 @@ async fn xmltable_projects_declared_columns_from_xml_literal() {
 }
 
 #[tokio::test]
+async fn xmltable_projects_temporal_numeric_and_money_columns() {
+    let (client, _conn, server_handle) = start_server_and_connect().await;
+
+    let messages = client
+        .simple_query(
+            "SELECT observed_on, observed_at, amount, paid \
+             FROM XMLTABLE(\
+                 '/root/item' PASSING XML '<root><item><d>2024-02-03</d><ts>2000-07-01 00:00:00 America/New_York</ts><amount>12.34</amount><paid>$5.67</paid></item></root>' \
+                 COLUMNS (\
+                     observed_on date PATH 'd/text()', \
+                     observed_at timestamptz PATH 'ts/text()', \
+                     amount numeric(8,2) PATH 'amount/text()', \
+                     paid money PATH 'paid/text()'\
+                 )\
+             ) xt",
+        )
+        .await
+        .expect("XMLTABLE typed scalar projection");
+    let values = messages
+        .into_iter()
+        .filter_map(|message| match message {
+            tokio_postgres::SimpleQueryMessage::Row(row) => Some(
+                (0..4)
+                    .map(|idx| row.get(idx).expect("column").to_owned())
+                    .collect::<Vec<_>>(),
+            ),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        values,
+        vec![vec![
+            "2024-02-03".to_owned(),
+            "2000-07-01 04:00:00+00".to_owned(),
+            "12.34".to_owned(),
+            "$5.67".to_owned(),
+        ]]
+    );
+
+    shutdown(client, server_handle).await;
+}
+
+#[tokio::test]
 async fn read_csv_single_file_exposes_header_columns_and_rows() {
     let dir = tempfile::tempdir().expect("tempdir");
     let csv_path = dir.path().join("people.csv");
