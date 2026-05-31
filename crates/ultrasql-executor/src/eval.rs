@@ -1408,9 +1408,9 @@ fn eval_eq_any_array(args: &[Value]) -> Result<Value, EvalError> {
 }
 
 fn eval_array_position(args: &[Value]) -> Result<Value, EvalError> {
-    if args.len() != 2 {
+    if !(2..=3).contains(&args.len()) {
         return Err(EvalError::Type(format!(
-            "array_position: expected 2 args, got {}",
+            "array_position: expected 2 or 3 args, got {}",
             args.len()
         )));
     }
@@ -1427,7 +1427,24 @@ fn eval_array_position(args: &[Value]) -> Result<Value, EvalError> {
     if matches!(args[1], Value::Null) {
         return Ok(Value::Null);
     }
-    for (idx, element) in elements.iter().enumerate() {
+    let start_idx = match args.get(2) {
+        Some(Value::Null) => return Ok(Value::Null),
+        Some(value) => {
+            let Some(start) = value.as_i64() else {
+                return Err(EvalError::Type(format!(
+                    "array_position: integer start required, got {:?}",
+                    value.data_type()
+                )));
+            };
+            if start < 1 {
+                return Ok(Value::Null);
+            }
+            usize::try_from(start - 1)
+                .map_err(|_| EvalError::Type("array_position start overflow".to_owned()))?
+        }
+        None => 0,
+    };
+    for (idx, element) in elements.iter().enumerate().skip(start_idx) {
         if matches!(element, Value::Null) {
             continue;
         }
@@ -6611,6 +6628,13 @@ mod tests {
         );
         assert_eq!(
             eval_fn("array_position", vec![array.clone(), Value::Int32(30)]),
+            Value::Int32(3)
+        );
+        assert_eq!(
+            eval_fn(
+                "array_position",
+                vec![array.clone(), Value::Int32(30), Value::Int32(3)]
+            ),
             Value::Int32(3)
         );
         assert_eq!(

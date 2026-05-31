@@ -171,6 +171,14 @@ async fn multidimensional_arrays_store_dimensions_and_wire_oid() {
         ]]
     );
 
+    let positioned = simple_rows(
+        client
+            .simple_query("SELECT array_position(ARRAY[1,2,1], 1, 2)")
+            .await
+            .expect("array_position start argument"),
+    );
+    assert_eq!(positioned, vec![vec![Some("3".to_owned())]]);
+
     let stmt = client
         .prepare("SELECT matrix FROM array_probe WHERE id = 1")
         .await
