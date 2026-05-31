@@ -26,8 +26,9 @@
 //! # Overflow / NaN policy
 //!
 //! - Integer kernels use **wrapping** semantics (matching `i64::wrapping_add`,
-//!   `i32::wrapping_mul`, …). This is the SQL integer semantics this crate
-//!   ships with; overflow-aware arithmetic lives in a separate kernel family.
+//!   `i32::wrapping_mul`, …). These are low-level vector kernels; SQL-facing
+//!   callers must route through checked executor paths when overflow needs a
+//!   stable SQLSTATE.
 //! - Float kernels use **IEEE-754** semantics for arithmetic. For three-way
 //!   compare we use `f32::total_cmp` / `f64::total_cmp`, which produces a
 //!   total order that is deterministic across `NaN` payloads and across
