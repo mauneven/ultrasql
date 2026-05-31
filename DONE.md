@@ -1091,6 +1091,11 @@ as a concise evidence ledger; roadmap stays for open gates only.
   `pg_operator` row backed by built-in `bool_eq`, and removes the final local
   skip from the curated index/constraint/operator regression shard. Evidence:
   `cargo run -p ultrasql-sqllogictest-runner -- --mode in-process tests/slt/sql_regression/regression_subset/index_constraint_operator_baseline.slt`.
+- `CREATE OPERATOR` runtime catalog metadata now persists to
+  `pg_operator_runtime.meta` and reloads on `Server::init`, so custom operator
+  `pg_operator` rows survive restart until typed catalog rows replace the
+  sidecar before v1.0. Evidence:
+  `cargo test -p ultrasql-server --test operator_catalog_round_trip create_operator_catalog_survives_restart -- --nocapture`.
 - Type-specific regression baseline covers numeric, text, date/time/timetz,
   timestamp, JSON/JSONB, and arrays.
 - `pg_type` now exposes built-in array type rows such as `_int4`, with
