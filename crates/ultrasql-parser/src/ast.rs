@@ -764,6 +764,8 @@ pub struct ColumnDef {
     pub name: Identifier,
     /// Declared SQL type.
     pub data_type: TypeName,
+    /// Optional column collation from `COLLATE name`.
+    pub collation: Option<ObjectName>,
     /// Column-level constraints.
     pub constraints: Vec<ColumnConstraint>,
     /// Source span.

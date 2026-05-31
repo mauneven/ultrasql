@@ -993,6 +993,57 @@ async fn active_record_column_definitions_probe_uses_catalog_helpers() {
 }
 
 #[tokio::test]
+async fn create_table_column_collate_default_is_validated_and_visible() {
+    let (_server, client, _conn, server_handle) = start_server_and_connect().await;
+
+    client
+        .batch_execute("CREATE TABLE collate_default (name TEXT COLLATE default)")
+        .await
+        .expect("create table with default column collation");
+
+    let attcollation = client
+        .query_one(
+            "SELECT a.attcollation \
+             FROM pg_attribute a \
+             WHERE a.attrelid = '\"collate_default\"'::regclass \
+               AND a.attname = 'name'",
+            &[],
+        )
+        .await
+        .expect("column collation oid")
+        .get::<_, u32>(0);
+    assert_eq!(attcollation, 100);
+
+    let err = client
+        .batch_execute("CREATE TABLE collate_c (name TEXT COLLATE \"C\")")
+        .await
+        .expect_err("non-default explicit column collation rejected");
+    let message = err
+        .as_db_error()
+        .map(tokio_postgres::error::DbError::message)
+        .unwrap_or_default();
+    assert!(
+        message.contains("explicit non-default column COLLATE"),
+        "unexpected error: {err}"
+    );
+
+    let err = client
+        .batch_execute("CREATE TABLE collate_int (id INT COLLATE default)")
+        .await
+        .expect_err("non-text column collation rejected");
+    let message = err
+        .as_db_error()
+        .map(tokio_postgres::error::DbError::message)
+        .unwrap_or_default();
+    assert!(
+        message.contains("COLLATE applies to text types"),
+        "unexpected error: {err}"
+    );
+
+    shutdown(client, server_handle).await;
+}
+
+#[tokio::test]
 async fn active_record_primary_keys_probe_uses_pg_index_indkey() {
     let (_server, client, _conn, server_handle) = start_server_and_connect().await;
 

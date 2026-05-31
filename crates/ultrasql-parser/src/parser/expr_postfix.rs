@@ -28,7 +28,7 @@ impl<'src> Parser<'src> {
         })
     }
 
-    fn parse_collation_name(&mut self) -> Result<ObjectName, ParseError> {
+    pub(crate) fn parse_collation_name(&mut self) -> Result<ObjectName, ParseError> {
         let first = self.parse_collation_identifier()?;
         let mut parts = vec![first.clone()];
         let start = first.span.start;

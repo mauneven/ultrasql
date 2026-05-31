@@ -26,6 +26,13 @@ use super::{
 
 const MICROS_PER_DAY: i64 = 86_400_000_000;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum BuiltinCollation {
+    Default,
+    C,
+    Posix,
+}
+
 pub(super) fn bind_expr(
     expr: &Expr,
     input: &Schema,
@@ -569,7 +576,7 @@ pub(super) fn bind_collated_expr(
     collation: &ObjectName,
     bound: ScalarExpr,
 ) -> Result<ScalarExpr, PlanError> {
-    validate_supported_collation(collation)?;
+    resolve_builtin_collation(collation)?;
     let data_type = bound.data_type();
     if !data_type.is_textlike() {
         return Err(PlanError::TypeMismatch(format!(
@@ -579,7 +586,9 @@ pub(super) fn bind_collated_expr(
     Ok(bound)
 }
 
-fn validate_supported_collation(collation: &ObjectName) -> Result<(), PlanError> {
+pub(super) fn resolve_builtin_collation(
+    collation: &ObjectName,
+) -> Result<BuiltinCollation, PlanError> {
     let parts: Vec<String> = collation
         .parts
         .iter()
@@ -594,12 +603,13 @@ fn validate_supported_collation(collation: &ObjectName) -> Result<(), PlanError>
             )));
         }
     };
-    if matches!(name, "default" | "c" | "posix") {
-        Ok(())
-    } else {
-        Err(PlanError::TypeMismatch(format!(
+    match name {
+        "default" => Ok(BuiltinCollation::Default),
+        "c" => Ok(BuiltinCollation::C),
+        "posix" => Ok(BuiltinCollation::Posix),
+        _ => Err(PlanError::TypeMismatch(format!(
             "unsupported collation {collation}"
-        )))
+        ))),
     }
 }
 

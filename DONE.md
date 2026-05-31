@@ -707,6 +707,13 @@ as a concise evidence ledger; roadmap stays for open gates only.
   collation OID for textlike columns and textlike domains instead of hardcoded
   zero, while non-collatable types remain zero. Evidence:
   `cargo test -p ultrasql-server --test catalog_views_round_trip active_record_column_definitions_probe_uses_catalog_helpers -- --nocapture`.
+- Column definitions now parse and validate `COLLATE default` /
+  `COLLATE pg_catalog.default` for textlike columns, reject non-text column
+  collations, and reject explicit non-default `C`/`POSIX` column collations
+  until per-column non-default collation persistence lands. Evidence:
+  `cargo test -p ultrasql-parser statements::create_table::tests::create_table_parses_column_collation --lib -- --nocapture`
+  and
+  `cargo test -p ultrasql-server --test catalog_views_round_trip create_table_column_collate_default_is_validated_and_visible -- --nocapture`.
 - `BIT(n)` / `BIT VARYING(n)` storage, row codec, operators, wire OIDs, COPY,
   and end-to-end tests exist.
 - `INET`, `CIDR`, `MACADDR`, and `MACADDR8` storage, operators, wire OIDs,

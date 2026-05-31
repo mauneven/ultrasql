@@ -293,6 +293,11 @@ impl Parser<'_> {
     pub(crate) fn parse_column_def(&mut self) -> Result<ColumnDef, ParseError> {
         let name = self.parse_identifier()?;
         let data_type = self.parse_ddl_type_name()?;
+        let collation = if self.match_kw(TokenKind::KwCollate) {
+            Some(self.parse_collation_name()?)
+        } else {
+            None
+        };
         let mut constraint_list = Vec::new();
 
         // Consume any column-level constraints.
@@ -457,6 +462,7 @@ impl Parser<'_> {
             span: Span::new(name.span.start, end),
             name,
             data_type,
+            collation,
             constraints: constraint_list,
         })
     }
@@ -810,6 +816,24 @@ mod tests {
         assert_eq!(stmt.columns[0].data_type.name.value, "vector");
         assert_eq!(stmt.columns[0].data_type.type_modifiers, vec![3]);
         assert!(!stmt.columns[0].data_type.is_array);
+    }
+
+    #[test]
+    fn create_table_parses_column_collation() {
+        let stmt = parse_create_table(
+            "CREATE TABLE labels (name TEXT COLLATE pg_catalog.default NOT NULL)",
+        );
+        let collation = stmt.columns[0]
+            .collation
+            .as_ref()
+            .expect("column collation");
+        assert_eq!(collation.parts.len(), 2);
+        assert_eq!(collation.parts[0].value, "pg_catalog");
+        assert_eq!(collation.parts[1].value, "default");
+        assert!(matches!(
+            stmt.columns[0].constraints[0],
+            ColumnConstraint::NotNull { .. }
+        ));
     }
 
     #[test]

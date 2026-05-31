@@ -20,7 +20,7 @@ use ultrasql_parser::ast::{
     RoleStmtKind as AstRoleStmtKind, SequenceOption, TableConstraint, TruncateStmt, TypeName,
 };
 
-use super::expr_bind::coerce_literal_to_type;
+use super::expr_bind::{BuiltinCollation, coerce_literal_to_type, resolve_builtin_collation};
 use super::{
     Catalog, LogicalAlterTableAction, LogicalPlan, PlanError, ScalarExpr, ScopeStack, bind_expr,
     bind_select, object_name_simple,
@@ -103,6 +103,7 @@ pub(super) fn bind_create_table(
         }
         let (dtype, serial_default) =
             resolve_column_type(&table_name, &name, &col.data_type, catalog)?;
+        validate_column_collation(&name, &dtype, col.collation.as_ref())?;
         let identity = column_identity(&col.constraints)?;
         let generated_stored = column_generated_stored(&col.constraints)?;
         if identity.is_some() && serial_default.is_some() {
@@ -296,6 +297,35 @@ pub(super) fn bind_create_table(
         if_not_exists: s.if_not_exists,
         schema: Schema::empty(),
     })
+}
+
+fn validate_column_collation(
+    column_name: &str,
+    data_type: &DataType,
+    collation: Option<&ObjectName>,
+) -> Result<(), PlanError> {
+    let Some(collation) = collation else {
+        return Ok(());
+    };
+    if !column_type_is_collatable(data_type) {
+        return Err(PlanError::TypeMismatch(format!(
+            "COLLATE applies to text types, column '{column_name}' has type {data_type}"
+        )));
+    }
+    match resolve_builtin_collation(collation)? {
+        BuiltinCollation::Default => Ok(()),
+        BuiltinCollation::C | BuiltinCollation::Posix => Err(PlanError::NotSupported(
+            "CREATE TABLE: explicit non-default column COLLATE persistence is not implemented",
+        )),
+    }
+}
+
+fn column_type_is_collatable(data_type: &DataType) -> bool {
+    match data_type {
+        DataType::Text { .. } | DataType::Char { .. } => true,
+        DataType::Domain { base_type, .. } => column_type_is_collatable(base_type),
+        _ => false,
+    }
 }
 
 pub(super) fn bind_create_type(
