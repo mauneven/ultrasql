@@ -53,6 +53,7 @@ struct RawCheckConstraint<'a> {
 struct RawForeignKeyConstraint {
     name: String,
     columns: Vec<String>,
+    target_object: ObjectName,
     target_table: String,
     target_columns: Vec<String>,
     on_delete: LogicalReferentialAction,
@@ -798,6 +799,7 @@ fn collect_column_constraints<'a>(
                 foreign_keys.push(RawForeignKeyConstraint {
                     name: named_or(name.as_ref(), || format!("{table}_{col}_fkey")),
                     columns: vec![col.clone()],
+                    target_object: target_table.clone(),
                     target_table: object_name_simple(target_table),
                     target_columns: target_columns
                         .iter()
@@ -889,6 +891,7 @@ fn collect_table_constraints<'a>(
                 foreign_keys.push(RawForeignKeyConstraint {
                     name: named_or(name.as_ref(), || format!("{}_fkey", cols.join("_"))),
                     columns: cols,
+                    target_object: target_table.clone(),
                     target_table: object_name_simple(target_table),
                     target_columns: target_columns
                         .iter()
@@ -1049,9 +1052,7 @@ fn bind_foreign_key_constraints(
                 raw.target_columns.len()
             )));
         }
-        let target = catalog
-            .lookup_table(&raw.target_table)
-            .ok_or_else(|| PlanError::TableNotFound(raw.target_table.clone()))?;
+        let target = lookup_table_object(catalog, &raw.target_object, &raw.target_table)?;
         let mut columns = Vec::with_capacity(raw.columns.len());
         let mut target_columns = Vec::with_capacity(raw.target_columns.len());
         for (src, dst) in raw.columns.iter().zip(raw.target_columns.iter()) {

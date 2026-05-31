@@ -655,6 +655,42 @@ async fn foreign_key_rejects_missing_parent_and_restricts_parent_key() {
     graceful_shutdown(running).await;
 }
 
+#[tokio::test]
+async fn foreign_key_respects_schema_qualifier() {
+    let running = start_sample_server("constraint_fk_schema_qualifier_guard").await;
+    let client = &running.client;
+
+    client
+        .batch_execute(
+            "CREATE SCHEMA app; \
+             CREATE TABLE fk_guard_parent (id INT PRIMARY KEY)",
+        )
+        .await
+        .expect("create public parent and separate schema");
+
+    client
+        .batch_execute(
+            "CREATE TABLE fk_guard_child (\
+                parent_id INT REFERENCES app.fk_guard_parent(id), \
+                v INT\
+             )",
+        )
+        .await
+        .expect_err("qualified FOREIGN KEY target must not resolve public table");
+
+    client
+        .query("SELECT parent_id FROM fk_guard_child", &[])
+        .await
+        .expect_err("rejected child table must not be created");
+
+    client
+        .batch_execute("DROP TABLE fk_guard_parent; DROP SCHEMA app")
+        .await
+        .expect("cleanup FOREIGN KEY qualifier guard");
+
+    graceful_shutdown(running).await;
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn foreign_key_survives_restart() {
     let data_dir = tempfile::TempDir::new().unwrap();
