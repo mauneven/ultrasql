@@ -199,6 +199,12 @@ as a concise evidence ledger; roadmap stays for open gates only.
 - Constant `SELECT` result execution now propagates scalar evaluation failures
   instead of silently returning NULL. Evidence:
   `cargo test -p ultrasql-executor result_propagates_constant_eval_errors`.
+- Planner binder tests are green again after tightening decimal and typed-literal
+  behavior: numeric typmod coercion honors the requested target scale, bare
+  `numeric` text casts preserve literal scale in the result type, `tsvector`
+  typed literals bind as `TsVector`, and schema DDL variants are covered in the
+  window-function plan walker. Evidence:
+  `cargo test -p ultrasql-planner --lib -- --nocapture`.
 - `ORDER BY` full-sort and bounded top-k paths now propagate sort-key
   evaluation failures instead of silently treating them as NULL. Evidence:
   `cargo test -p ultrasql-executor sort` and
@@ -909,6 +915,11 @@ as a concise evidence ledger; roadmap stays for open gates only.
   constraint-backed indexes, preventing direct index drops from weakening
   declared constraints. Evidence:
   `cargo test -p ultrasql-server --test drop_index_round_trip`.
+- Explicitly qualified `DROP TABLE schema.name` now checks the catalog table's
+  stored schema before planning the drop, preventing a wrong-qualified statement
+  from dropping a same-name table in another namespace. Evidence:
+  `cargo test -p ultrasql-server --test drop_table_round_trip
+  drop_table_respects_schema_qualifier -- --nocapture`.
 - Committed `pg_constraint` rows are now installed into the live catalog map
   before restart, so same-session `DROP INDEX` also rejects inline and
   `ALTER TABLE ADD UNIQUE` constraint indexes. Evidence:
