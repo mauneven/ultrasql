@@ -689,6 +689,12 @@ as a concise evidence ledger; roadmap stays for open gates only.
 - `DATE`, `TIME`, `TIMETZ`, `TIMESTAMP`, `TIMESTAMPTZ`, and `INTERVAL` runtime
   types exist. `TIMETZ` has parser, binder, row codec, executor, COPY, catalog
   persistence, OID 1266, ISO display, casts, coercions, and offset comparison.
+- `TIMETZ` / `TIMESTAMPTZ` literals now accept deterministic fixed-offset time
+  zone abbreviations such as `EST`, `EDT`, `PST`, `PDT`, `CET`, and `EET`
+  without claiming full IANA time-zone database behavior. Evidence:
+  `cargo test -p ultrasql-planner time_and_timetz_literals_parse_postgres_shapes --lib -- --nocapture`
+  and
+  `cargo test -p ultrasql-server --test timetz_round_trip timetz_and_temporal_display_round_trip -- --nocapture`.
 - `DateStyle` now accepts and round-trips PostgreSQL-style `ISO`, `SQL`,
   `Postgres`, `German` plus `MDY` / `DMY` / `YMD` session settings through
   `SET`, `SHOW`, and `RESET`; non-ISO output formatting remains tracked in

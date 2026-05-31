@@ -2529,6 +2529,9 @@ fn parse_timezone_offset(token: &str) -> Option<i32> {
     if matches!(lower.as_str(), "z" | "zulu" | "utc") {
         return Some(0);
     }
+    if let Some(offset) = parse_timezone_abbreviation(&lower) {
+        return Some(offset);
+    }
     let sign = match token.as_bytes().first()? {
         b'+' => 1_i32,
         b'-' => -1_i32,
@@ -2559,6 +2562,22 @@ fn parse_timezone_offset(token: &str) -> Option<i32> {
         .checked_add(minutes.checked_mul(60)?)?
         .checked_add(seconds)?;
     sign.checked_mul(total)
+}
+
+fn parse_timezone_abbreviation(lower: &str) -> Option<i32> {
+    let hours = match lower {
+        "gmt" | "ut" | "wet" => 0,
+        "west" | "cet" => 1,
+        "cest" | "eet" => 2,
+        "eest" => 3,
+        "edt" => -4,
+        "est" | "cdt" => -5,
+        "cst" | "mdt" => -6,
+        "mst" | "pdt" => -7,
+        "pst" => -8,
+        _ => return None,
+    };
+    Some(hours * 3_600)
 }
 
 /// Pack `TIMETZ` into an `i64` batch payload.

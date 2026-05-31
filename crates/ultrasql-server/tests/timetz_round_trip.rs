@@ -91,5 +91,32 @@ async fn timetz_and_temporal_display_round_trip() {
         vec![vec!["04:05:06".to_owned(), "04:05:06-08".to_owned()]]
     );
 
+    let abbrev_rows = client
+        .simple_query(
+            "SELECT \
+                TIME WITH TIME ZONE '04:05:06 EST', \
+                TIMESTAMP WITH TIME ZONE '2000-01-02 03:04:05 EST'",
+        )
+        .await
+        .expect("select temporal abbreviation casts");
+    let abbrev_values: Vec<Vec<String>> = abbrev_rows
+        .into_iter()
+        .filter_map(|message| match message {
+            SimpleQueryMessage::Row(row) => Some(
+                (0..2)
+                    .map(|idx| row.get(idx).expect("column").to_owned())
+                    .collect(),
+            ),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        abbrev_values,
+        vec![vec![
+            "04:05:06-05".to_owned(),
+            "2000-01-02 08:04:05+00".to_owned()
+        ]]
+    );
+
     shutdown(running).await;
 }

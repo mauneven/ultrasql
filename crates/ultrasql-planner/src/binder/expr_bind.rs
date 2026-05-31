@@ -3662,9 +3662,10 @@ mod typed_literal_tests {
         days_since_epoch, decimal_from_numeric_value, dense_vector_family_kind, fold_date_interval,
         is_supported_builtin, literal_numeric_as_f64, money_from_literal_value, parse_date_literal,
         parse_decimal_literal, parse_interval_literal, parse_pg_identifier_path,
-        parse_time_of_day_micros, parse_timestamp_literal, parse_timetz_literal, pow10_i64,
-        resolve_cast_type, scaled_decimal_text_to_i64, try_fold_literal_binary,
-        validate_builtin_args, vector_family_cast_matches, vector_metric_family_kind,
+        parse_time_of_day_micros, parse_timestamp_literal, parse_timestamptz_literal,
+        parse_timetz_literal, pow10_i64, resolve_cast_type, scaled_decimal_text_to_i64,
+        try_fold_literal_binary, validate_builtin_args, vector_family_cast_matches,
+        vector_metric_family_kind,
     };
 
     fn lit(value: Value) -> ScalarExpr {
@@ -4623,6 +4624,14 @@ mod typed_literal_tests {
         assert_eq!(
             parse_timetz_literal("04:05:06.789-08:00"),
             Some((14_706_789_000, -28_800))
+        );
+        assert_eq!(
+            parse_timetz_literal("04:05:06.789 EST"),
+            Some((14_706_789_000, -18_000))
+        );
+        assert_eq!(
+            parse_timestamptz_literal("2000-01-02 03:04:05 EST"),
+            Some(115_445_000_000)
         );
     }
 
