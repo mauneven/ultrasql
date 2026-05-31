@@ -282,7 +282,7 @@ impl Operator for AppendScan {
 
 pub(crate) fn chunk_table_name(parent: &str, start_us: i64) -> String {
     let suffix = if start_us < 0 {
-        format!("m{}", start_us.wrapping_abs())
+        format!("m{}", start_us.unsigned_abs())
     } else {
         start_us.to_string()
     };
@@ -324,4 +324,17 @@ fn check_not_null_violations(row: &[Value], schema: &Schema) -> Result<(), ExecE
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::chunk_table_name;
+
+    #[test]
+    fn chunk_table_name_handles_min_timestamp_without_wrapping_minus() {
+        assert_eq!(
+            chunk_table_name("metrics", i64::MIN),
+            "__ultrasql_metrics_chunk_m9223372036854775808"
+        );
+    }
 }

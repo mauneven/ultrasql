@@ -232,6 +232,13 @@ as a concise evidence ledger; roadmap stays for open gates only.
   `cargo test -p ultrasql-server --test function_scan_round_trip generate_series -- --nocapture`,
   and
   `cargo clippy -p ultrasql-executor -p ultrasql-server --all-targets --all-features -- -D warnings`.
+- Time-partition chunk naming now handles `i64::MIN` timestamp buckets with
+  unsigned magnitude instead of `wrapping_abs`, avoiding unstable internal
+  names such as `m-9223372036854775808`. Evidence:
+  `cargo test -p ultrasql-server chunk_table_name_handles_min_timestamp_without_wrapping_minus --lib -- --nocapture`,
+  `cargo test -p ultrasql-server --test time_partition_round_trip -- --nocapture`,
+  and
+  `cargo clippy -p ultrasql-server --all-targets --all-features -- -D warnings`.
 - Constant `SELECT` result execution now propagates scalar evaluation failures
   instead of silently returning NULL. Evidence:
   `cargo test -p ultrasql-executor result_propagates_constant_eval_errors`.
