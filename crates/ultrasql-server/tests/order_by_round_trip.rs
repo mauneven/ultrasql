@@ -113,6 +113,31 @@ async fn order_by_asc_returns_rows_in_ascending_order() {
     shutdown(client, server_handle).await;
 }
 
+/// Runtime errors in ORDER BY expression keys keep their SQLSTATE.
+#[tokio::test]
+async fn order_by_runtime_cast_error_returns_22p02() {
+    let (client, _conn_handle, server_handle) = start_server_and_connect().await;
+
+    client
+        .batch_execute(
+            "CREATE TABLE order_by_cast_items (id INT NOT NULL, raw TEXT NOT NULL);
+             INSERT INTO order_by_cast_items VALUES (1, 'not-int')",
+        )
+        .await
+        .expect("setup");
+
+    let err = client
+        .simple_query("SELECT id FROM order_by_cast_items ORDER BY CAST(raw AS INTEGER)")
+        .await
+        .expect_err("ORDER BY runtime cast rejects row");
+    assert_eq!(
+        err.code().map(tokio_postgres::error::SqlState::code),
+        Some("22P02")
+    );
+
+    shutdown(client, server_handle).await;
+}
+
 /// `ORDER BY val DESC` returns rows in non-increasing order of `val`.
 #[tokio::test]
 async fn order_by_desc_returns_rows_in_descending_order() {

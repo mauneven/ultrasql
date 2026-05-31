@@ -28,7 +28,7 @@ use crate::row_codec::RowCodec;
 use crate::row_spill::{RowSpillFile, encoded_row_bytes};
 use crate::seq_scan::build_batch;
 use crate::work_mem::WorkMemBudget;
-use crate::{ExecError, Operator, OperatorSpillProfile};
+use crate::{ExecError, Operator, OperatorSpillProfile, eval_error_to_exec_error};
 
 /// Maximum rows per emitted batch, matching the `ARCHITECTURE.md` §9 contract.
 const BATCH_TARGET_ROWS: usize = 4096;
@@ -399,11 +399,7 @@ fn sorted_rows_from(
 
 fn eval_sort_keys(row: &[Value], keys: &[CompiledKey]) -> Result<Vec<Value>, ExecError> {
     keys.iter()
-        .map(|key| {
-            key.eval
-                .eval(row)
-                .map_err(|err| ExecError::TypeMismatch(err.to_string()))
-        })
+        .map(|key| key.eval.eval(row).map_err(eval_error_to_exec_error))
         .collect()
 }
 
