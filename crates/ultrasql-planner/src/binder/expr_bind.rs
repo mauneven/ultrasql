@@ -33,6 +33,16 @@ pub(super) enum BuiltinCollation {
     Posix,
 }
 
+impl BuiltinCollation {
+    pub(super) const fn oid(self) -> u32 {
+        match self {
+            Self::Default => 100,
+            Self::C => 950,
+            Self::Posix => 951,
+        }
+    }
+}
+
 pub(super) fn bind_expr(
     expr: &Expr,
     input: &Schema,

@@ -225,11 +225,18 @@ where
                 table_name.to_owned(),
             ))
         })?;
-        let pairs = options
+        let mut pairs = options
             .iter()
             .map(|option| (option.name.clone(), option.value.clone()))
             .collect::<Vec<_>>();
         crate::validate_autovacuum_reloptions(&pairs)?;
+        pairs.extend(
+            entry
+                .options
+                .iter()
+                .filter(|(name, _)| name.starts_with("ultrasql."))
+                .cloned(),
+        );
         let updated_entry = self
             .state
             .persistent_catalog

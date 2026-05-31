@@ -1014,18 +1014,23 @@ async fn create_table_column_collate_default_is_validated_and_visible() {
         .get::<_, u32>(0);
     assert_eq!(attcollation, 100);
 
-    let err = client
+    client
         .batch_execute("CREATE TABLE collate_c (name TEXT COLLATE \"C\")")
         .await
-        .expect_err("non-default explicit column collation rejected");
-    let message = err
-        .as_db_error()
-        .map(tokio_postgres::error::DbError::message)
-        .unwrap_or_default();
-    assert!(
-        message.contains("explicit non-default column COLLATE"),
-        "unexpected error: {err}"
-    );
+        .expect("create table with C column collation");
+    let row = client
+        .query_one(
+            "SELECT a.attcollation, c.collname \
+             FROM pg_attribute a \
+             JOIN pg_collation c ON a.attcollation = c.oid \
+             WHERE a.attrelid = '\"collate_c\"'::regclass \
+               AND a.attname = 'name'",
+            &[],
+        )
+        .await
+        .expect("C column collation metadata");
+    assert_eq!(row.get::<_, u32>(0), 950);
+    assert_eq!(row.get::<_, String>(1), "C");
 
     let err = client
         .batch_execute("CREATE TABLE collate_int (id INT COLLATE default)")
@@ -1039,6 +1044,38 @@ async fn create_table_column_collate_default_is_validated_and_visible() {
         message.contains("COLLATE applies to text types"),
         "unexpected error: {err}"
     );
+
+    shutdown(client, server_handle).await;
+}
+
+#[tokio::test]
+async fn explicit_column_collation_survives_restart() {
+    let data_dir = tempfile::TempDir::new().expect("temp dir");
+    let (_server, client, _conn, server_handle) =
+        start_server_and_connect_with(Server::init(data_dir.path()).expect("server init")).await;
+
+    client
+        .batch_execute("CREATE TABLE collate_restart (name TEXT COLLATE \"POSIX\")")
+        .await
+        .expect("create table with POSIX column collation");
+
+    shutdown(client, server_handle).await;
+
+    let (_server, client, _conn, server_handle) =
+        start_server_and_connect_with(Server::init(data_dir.path()).expect("server restart")).await;
+    let row = client
+        .query_one(
+            "SELECT a.attcollation, c.collname \
+             FROM pg_attribute a \
+             JOIN pg_collation c ON a.attcollation = c.oid \
+             WHERE a.attrelid = '\"collate_restart\"'::regclass \
+               AND a.attname = 'name'",
+            &[],
+        )
+        .await
+        .expect("POSIX column collation after restart");
+    assert_eq!(row.get::<_, u32>(0), 951);
+    assert_eq!(row.get::<_, String>(1), "POSIX");
 
     shutdown(client, server_handle).await;
 }

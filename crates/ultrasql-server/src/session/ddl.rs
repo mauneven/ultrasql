@@ -49,6 +49,8 @@ use crate::{
     run_plan_in_txn,
 };
 
+const COLUMN_COLLATION_OPTION_PREFIX: &str = "ultrasql.attcollation.";
+
 const PG_OID_INT8: u32 = 20;
 
 struct CreateIndexProgressGuard<'a> {
@@ -527,6 +529,7 @@ where
             table_name,
             namespace,
             columns,
+            column_collations,
             defaults,
             sequence_defaults,
             sequence_options,
@@ -556,7 +559,8 @@ where
             ));
         }
         let oid = self.state.persistent_catalog.next_oid();
-        let entry = TableEntry::new(oid, table_name.clone(), namespace.clone(), columns.clone());
+        let entry = TableEntry::new(oid, table_name.clone(), namespace.clone(), columns.clone())
+            .with_options(column_collation_options(column_collations));
         for unique in unique_constraints {
             crate::index_key::IndexKeyEncoding::for_columns(&entry.schema, &unique.columns)?;
         }
@@ -2251,6 +2255,21 @@ fn index_options_as_pairs(options: &[LogicalIndexOption]) -> Vec<(String, String
     options
         .iter()
         .map(|option| (option.name.clone(), option.value.clone()))
+        .collect()
+}
+
+fn column_collation_options(collations: &[Option<u32>]) -> Vec<(String, String)> {
+    collations
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, collation)| {
+            collation.map(|oid| {
+                (
+                    format!("{COLUMN_COLLATION_OPTION_PREFIX}{idx}"),
+                    oid.to_string(),
+                )
+            })
+        })
         .collect()
 }
 

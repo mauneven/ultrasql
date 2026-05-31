@@ -541,6 +541,9 @@ pub enum LogicalPlan {
         /// Resolved column metadata — the row shape of the relation
         /// being created.
         columns: Schema,
+        /// Explicit per-column collation OIDs from `COLLATE name`.
+        /// `None` means the type's default collation applies.
+        column_collations: Vec<Option<u32>>,
         /// Per-column default expressions. Same length as `columns`;
         /// `None` means omitted INSERT values become SQL NULL.
         defaults: Vec<Option<ScalarExpr>>,
@@ -3325,6 +3328,7 @@ mod tests {
                     table_name: "users".to_owned(),
                     namespace: "public".to_owned(),
                     columns: users_schema(),
+                    column_collations: vec![None, None],
                     defaults: vec![None, None],
                     sequence_defaults: vec![None, None],
                     sequence_options: vec![None, None],

@@ -20,7 +20,7 @@ use ultrasql_parser::ast::{
     RoleStmtKind as AstRoleStmtKind, SequenceOption, TableConstraint, TruncateStmt, TypeName,
 };
 
-use super::expr_bind::{BuiltinCollation, coerce_literal_to_type, resolve_builtin_collation};
+use super::expr_bind::{coerce_literal_to_type, resolve_builtin_collation};
 use super::{
     Catalog, LogicalAlterTableAction, LogicalPlan, PlanError, ScalarExpr, ScopeStack, bind_expr,
     bind_select, object_name_simple,
@@ -84,6 +84,7 @@ pub(super) fn bind_create_table(
         return Err(PlanError::NotSupported("CREATE TABLE: zero columns"));
     }
     let mut fields: Vec<Field> = Vec::with_capacity(s.columns.len());
+    let mut column_collations: Vec<Option<u32>> = Vec::with_capacity(s.columns.len());
     let mut defaults: Vec<Option<&Expr>> = Vec::with_capacity(s.columns.len());
     let mut sequence_defaults: Vec<Option<String>> = Vec::with_capacity(s.columns.len());
     let mut sequence_options: Vec<Option<LogicalSequenceOptions>> =
@@ -103,7 +104,7 @@ pub(super) fn bind_create_table(
         }
         let (dtype, serial_default) =
             resolve_column_type(&table_name, &name, &col.data_type, catalog)?;
-        validate_column_collation(&name, &dtype, col.collation.as_ref())?;
+        let collation = bind_column_collation(&name, &dtype, col.collation.as_ref())?;
         let identity = column_identity(&col.constraints)?;
         let generated_stored = column_generated_stored(&col.constraints)?;
         if identity.is_some() && serial_default.is_some() {
@@ -164,6 +165,7 @@ pub(super) fn bind_create_table(
             ));
         }
         defaults.push(default);
+        column_collations.push(collation);
         sequence_defaults.push(sequence_default);
         sequence_options.push(sequence_option);
         identity_always.push(identity_is_always);
@@ -284,6 +286,7 @@ pub(super) fn bind_create_table(
         table_name,
         namespace,
         columns,
+        column_collations,
         defaults: bound_defaults,
         sequence_defaults,
         sequence_options,
@@ -299,25 +302,20 @@ pub(super) fn bind_create_table(
     })
 }
 
-fn validate_column_collation(
+fn bind_column_collation(
     column_name: &str,
     data_type: &DataType,
     collation: Option<&ObjectName>,
-) -> Result<(), PlanError> {
+) -> Result<Option<u32>, PlanError> {
     let Some(collation) = collation else {
-        return Ok(());
+        return Ok(None);
     };
     if !column_type_is_collatable(data_type) {
         return Err(PlanError::TypeMismatch(format!(
             "COLLATE applies to text types, column '{column_name}' has type {data_type}"
         )));
     }
-    match resolve_builtin_collation(collation)? {
-        BuiltinCollation::Default => Ok(()),
-        BuiltinCollation::C | BuiltinCollation::Posix => Err(PlanError::NotSupported(
-            "CREATE TABLE: explicit non-default column COLLATE persistence is not implemented",
-        )),
-    }
+    Ok(Some(resolve_builtin_collation(collation)?.oid()))
 }
 
 fn column_type_is_collatable(data_type: &DataType) -> bool {

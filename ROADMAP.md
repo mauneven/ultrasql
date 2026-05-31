@@ -79,7 +79,7 @@ file focused on what still blocks production.
 - XML remaining surface: remaining XPath axes/functions and `XMLTABLE` beyond
   the supported secure subset.
 - Locale/collation remaining: ICU-backed collations, `CREATE COLLATION`,
-  explicit column/index `COLLATE` persistence, and non-bytewise sort/search
+  index/expression collation catalog deparse, and non-bytewise sort/search
   behavior beyond the supported built-in `default`/`C`/`POSIX` subset.
 
 ### Catalog, Roles, Privileges

@@ -22,6 +22,7 @@ const PUBLIC_OID: i64 = 2200;
 const PG_CLASS_OID: i64 = 1259;
 const PG_CONSTRAINT_OID: i64 = 2606;
 const PG_COLLATION_DEFAULT_OID: u32 = 100;
+const COLUMN_COLLATION_OPTION_PREFIX: &str = "ultrasql.attcollation.";
 const PG_PROC_BASE_OID: u32 = 9_000;
 const PROC_TYPE_BOOL: u32 = 16;
 const PROC_TYPE_INT4: u32 = 23;
@@ -507,6 +508,21 @@ fn type_collation_oid(dt: &DataType) -> u32 {
     }
 }
 
+fn attribute_collation_oid(entry: &ultrasql_catalog::TableEntry, idx: usize) -> u32 {
+    let key = format!("{COLUMN_COLLATION_OPTION_PREFIX}{idx}");
+    entry
+        .options
+        .iter()
+        .find_map(|(name, value)| {
+            if name == &key {
+                value.parse::<u32>().ok()
+            } else {
+                None
+            }
+        })
+        .unwrap_or_else(|| type_collation_oid(&entry.schema.field_at(idx).data_type))
+}
+
 fn range_type_oid(range_type: RangeType) -> i32 {
     match range_type {
         RangeType::Int4 => PG_TYPE_INT4RANGE,
@@ -765,7 +781,7 @@ fn rows_pg_attribute(ctx: &LowerCtx<'_>) -> Vec<Vec<Value>> {
                 Value::Bool(column_default_expr(ctx, entry.oid, idx).is_some()),
                 Value::Bool(false),
                 Value::Int32(-1),
-                v_oid(type_collation_oid(&field.data_type)),
+                v_oid(attribute_collation_oid(&entry, idx)),
                 v_text(""),
                 v_text(""),
                 Value::Null,
