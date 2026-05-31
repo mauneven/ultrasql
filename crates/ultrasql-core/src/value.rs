@@ -1363,6 +1363,11 @@ pub fn xml_xpath_element_fragments_with_namespaces(
             number,
         ))]);
     }
+    if let Some(inner_path) = xml_xpath_function_argument(path, "sum") {
+        let matches =
+            xml_xpath_element_fragments_with_namespaces(inner_path, document, namespace_bindings)?;
+        return Some(vec![xml_xpath_format_number(xml_xpath_sum_value(&matches))]);
+    }
     if let Some(inner_path) = xml_xpath_count_argument(path) {
         let matches =
             xml_xpath_element_fragments_with_namespaces(inner_path, document, namespace_bindings)?;
@@ -1962,6 +1967,18 @@ fn xml_xpath_round_number(value: f64) -> f64 {
     } else {
         value
     }
+}
+
+fn xml_xpath_sum_value(matches: &[String]) -> f64 {
+    let mut sum = 0.0_f64;
+    for fragment in matches {
+        let value = xml_xpath_string_value(fragment);
+        let Ok(number) = value.trim().parse::<f64>() else {
+            return f64::NAN;
+        };
+        sum += number;
+    }
+    sum
 }
 
 fn xml_collect_string_value(text: &str, element: &XmlElement, out: &mut String) {
@@ -3549,6 +3566,24 @@ mod tests {
                 r#"<root><value>-42.5</value></root>"#
             ),
             Some(vec!["-42".to_owned()])
+        );
+        assert_eq!(
+            xml_xpath_element_fragments(
+                "sum(/root/value)",
+                r#"<root><value>1.5</value><value>2.25</value></root>"#
+            ),
+            Some(vec!["3.75".to_owned()])
+        );
+        assert_eq!(
+            xml_xpath_element_fragments("sum(/root/missing)", r#"<root><value>1.5</value></root>"#),
+            Some(vec!["0".to_owned()])
+        );
+        assert_eq!(
+            xml_xpath_element_fragments(
+                "sum(/root/value)",
+                r#"<root><value>1</value><value>bad</value></root>"#
+            ),
+            Some(vec!["NaN".to_owned()])
         );
         let nested = r#"<root><group><item id="1"><name>A</name></item><item id="2"><name>B</name></item></group><name>C</name></root>"#;
         assert_eq!(

@@ -85,8 +85,9 @@ file focused on what still blocks production.
   `normalize-space()` / `string-length()` / `contains(path, literal)` /
   `starts-with(path, literal)` / `substring-before(path, literal)` /
   `substring-after(path, literal)` / `concat(path-or-literal, ...)` subset,
-  numeric `number()` / `floor()` / `ceiling()` / `round()` subset, plus full
-  `XMLTABLE` beyond the completed typed scalar/default projection subset.
+  numeric `number()` / `floor()` / `ceiling()` / `round()` / `sum()` subset,
+  plus full `XMLTABLE` beyond the completed typed scalar/default projection
+  subset.
 - Locale/collation remaining: ICU-backed collations, `CREATE COLLATION`,
   index/expression collation catalog deparse, and non-bytewise sort/search
   behavior beyond the supported built-in `default`/`C`/`POSIX` subset.
