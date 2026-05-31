@@ -5121,6 +5121,7 @@ impl Server {
         let mut memberships = Vec::new();
         let mut seen_role_names = std::collections::HashSet::new();
         let mut seen_role_oids = std::collections::HashSet::new();
+        let mut seen_membership_keys = std::collections::HashSet::new();
         for (line_no, line) in text.lines().enumerate() {
             if line.is_empty() || line.starts_with('#') {
                 continue;
@@ -5160,9 +5161,18 @@ impl Server {
                     });
                 }
                 Some("member") if parts.len() == 5 => {
+                    let role = metadata_unescape(parts[1])?;
+                    let member = metadata_unescape(parts[2])?;
+                    let key = (role.to_ascii_lowercase(), member.to_ascii_lowercase());
+                    if !seen_membership_keys.insert(key) {
+                        return Err(ServerError::ddl(format!(
+                            "duplicate role membership metadata on line {}",
+                            line_no + 1
+                        )));
+                    }
                     memberships.push(auth::RoleMembership {
-                        role: metadata_unescape(parts[1])?,
-                        member: metadata_unescape(parts[2])?,
+                        role,
+                        member,
                         grantor: metadata_unescape(parts[3])?,
                         admin_option: parse_role_bool(parts[4], line_no, "admin_option")?,
                     });
