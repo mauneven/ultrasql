@@ -2782,8 +2782,7 @@ impl TpchQ21BuildState {
         }
     }
 
-    #[must_use]
-    fn finish_rows(&self) -> Vec<ultrasql_server::TpchQ21ResultRow> {
+    fn finish_rows(&self) -> Result<Vec<ultrasql_server::TpchQ21ResultRow>> {
         let mut count_by_supplier_name = std::collections::HashMap::<String, i64>::new();
         for (&orderkey, order) in &self.orders {
             if !self.final_orders.contains(&orderkey) || order.suppliers.len() < 2 {
@@ -2803,9 +2802,10 @@ impl TpchQ21BuildState {
                 if !self.saudi_nationkeys.contains(&supplier.nationkey) {
                     continue;
                 }
-                *count_by_supplier_name
+                let supplier_count = count_by_supplier_name
                     .entry(supplier.name.clone())
-                    .or_default() += late_count;
+                    .or_default();
+                *supplier_count = checked_direct_count_add_i64(*supplier_count, late_count)?;
             }
         }
         let mut rows: Vec<ultrasql_server::TpchQ21ResultRow> = count_by_supplier_name
@@ -2819,7 +2819,7 @@ impl TpchQ21BuildState {
                 .then_with(|| left.s_name.cmp(&right.s_name))
         });
         rows.truncate(100);
-        rows
+        Ok(rows)
     }
 
     fn ingest_nation(&mut self, line: &str) -> Result<()> {
@@ -2883,7 +2883,8 @@ impl TpchQ21BuildState {
         let order = self.orders.entry(orderkey).or_default();
         order.suppliers.insert(suppkey);
         if receiptdate > commitdate {
-            *order.late_count_by_supplier.entry(suppkey).or_default() += 1;
+            let late_count = order.late_count_by_supplier.entry(suppkey).or_default();
+            *late_count = checked_direct_count_add_i64(*late_count, 1)?;
         }
         Ok(())
     }
@@ -3326,7 +3327,7 @@ pub(crate) async fn load_ultrasql_direct_into_server(
     let q18_rows = q18_state.finish_rows();
     let q19_rows = q19_state.finish_rows();
     let q20_rows = q20_state.finish_rows();
-    let q21_rows = q21_state.finish_rows();
+    let q21_rows = q21_state.finish_rows()?;
     if tpch_progress_enabled() {
         eprintln!(
             "ultrasql tpch direct load: built Q2 sidecar ({} result rows)",
@@ -6019,10 +6020,56 @@ mod tests {
             .ingest_lineitem_values(10, 8, 2, 2)
             .expect("other supplier");
 
-        let rows = state.finish_rows();
+        let rows = state.finish_rows().expect("finish rows");
 
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].s_name, "Supplier#7");
         assert_eq!(rows[0].numwait, 1);
+    }
+
+    #[cfg(feature = "sql-bench")]
+    #[test]
+    fn tpch_q21_sidecar_rejects_late_count_overflow() {
+        let mut state = TpchQ21BuildState::default();
+        state
+            .orders
+            .entry(10)
+            .or_default()
+            .late_count_by_supplier
+            .insert(7, i64::MAX);
+
+        let err = state
+            .ingest_lineitem_values(10, 7, 1, 2)
+            .expect_err("late count overflow should reject");
+
+        assert!(err.to_string().contains("TPC-H sidecar count overflow"));
+    }
+
+    #[cfg(feature = "sql-bench")]
+    #[test]
+    fn tpch_q21_sidecar_rejects_final_count_overflow() {
+        let mut state = TpchQ21BuildState::default();
+        state.saudi_nationkeys.insert(4);
+        state.suppliers.insert(
+            7,
+            TpchQ21Supplier {
+                name: "Supplier#7".to_owned(),
+                nationkey: 4,
+            },
+        );
+        for (orderkey, other_suppkey, late_count) in [(10, 8, i64::MAX), (11, 9, 1)] {
+            state.final_orders.insert(orderkey);
+            let mut order = TpchQ21Order::default();
+            order.suppliers.insert(7);
+            order.suppliers.insert(other_suppkey);
+            order.late_count_by_supplier.insert(7, late_count);
+            state.orders.insert(orderkey, order);
+        }
+
+        let err = state
+            .finish_rows()
+            .expect_err("final count overflow should reject");
+
+        assert!(err.to_string().contains("TPC-H sidecar count overflow"));
     }
 }

@@ -2041,6 +2041,10 @@ as a concise evidence ledger; roadmap stays for open gates only.
   `(part, supplier)` quantity accumulation overflow instead of panicking or
   wrapping cached lineitem totals. Evidence:
   `cargo test -p ultrasql-bench --features sql-bench tpch::load::tests --lib -- --nocapture`.
+- TPC-H direct-load Q21 supplier-wait sidecar now rejects late-count overflow
+  and final per-supplier wait-count aggregation overflow with typed errors
+  instead of panicking or wrapping cached counts. Evidence:
+  `cargo test -p ultrasql-bench --features sql-bench tpch::load::tests --lib -- --nocapture`.
 - TPC-H direct-load Q14 promo-volume sidecar now rejects malformed discount
   factors and checked `i128` promo/total volume accumulation overflow instead
   of accepting saturated factor math. Evidence:
