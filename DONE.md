@@ -2174,3 +2174,6 @@ as a concise evidence ledger; roadmap stays for open gates only.
 - TLS PEM loading now rejects unbounded read limits and checks byte-count
   conversion instead of using a saturated sentinel read. Evidence:
   `cargo test -p ultrasql-server tls::tests::read_regular_pem_file_rejects_unbounded_limit --lib -- --nocapture`.
+- Replication metadata loading now rejects unbounded read limits and checks
+  byte-count conversion instead of using a saturated sentinel read. Evidence:
+  `cargo test -p ultrasql-server replication::tests::logical_metadata_rejects_unbounded_read_limit --lib -- --nocapture`.

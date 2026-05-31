@@ -545,9 +545,9 @@ fn read_regular_text_file(path: &Path, context: &str) -> Result<String, ServerEr
     }
 
     let mut text = String::new();
-    let mut limited = file.take(limit.saturating_add(1));
+    let mut limited = file.take(replication_metadata_take_limit(limit)?);
     limited.read_to_string(&mut text).map_err(ServerError::Io)?;
-    let bytes_read = u64::try_from(text.len()).unwrap_or(u64::MAX);
+    let bytes_read = replication_metadata_bytes_read_len(text.len())?;
     if bytes_read > limit {
         return Err(ServerError::Io(replication_metadata_limit_error(
             path, bytes_read, limit,
@@ -562,6 +562,24 @@ fn replication_metadata_file_limit_bytes() -> u64 {
         .and_then(|value| value.parse::<u64>().ok())
         .filter(|&limit| limit > 0)
         .unwrap_or(DEFAULT_REPLICATION_METADATA_FILE_LIMIT_BYTES)
+}
+
+fn replication_metadata_take_limit(limit: u64) -> Result<u64, ServerError> {
+    limit.checked_add(1).ok_or_else(|| {
+        ServerError::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("replication metadata read limit is too large: limit={limit}"),
+        ))
+    })
+}
+
+fn replication_metadata_bytes_read_len(len: usize) -> Result<u64, ServerError> {
+    u64::try_from(len).map_err(|_| {
+        ServerError::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("replication metadata byte count exceeds u64: bytes={len}"),
+        ))
+    })
 }
 
 fn replication_metadata_limit_error(path: &Path, bytes: u64, limit: u64) -> std::io::Error {
@@ -1136,6 +1154,28 @@ mod tests {
         assert!(err.to_string().contains("exceeds read limit"));
     }
 
+    #[test]
+    fn logical_metadata_rejects_unbounded_read_limit() {
+        let _env_guard = replication_env_test_lock();
+        // SAFETY: replication_env_test_lock serializes process-env mutation in
+        // this module's tests.
+        unsafe {
+            std::env::set_var(REPLICATION_METADATA_FILE_LIMIT_ENV, u64::MAX.to_string());
+        }
+        let file = tempfile::NamedTempFile::new().expect("metadata file");
+        fs::write(file.path(), "name=pub_events\n").expect("metadata");
+
+        let err = read_regular_text_file(file.path(), "logical publication metadata file")
+            .expect_err("unbounded metadata limit rejected");
+
+        assert!(err.to_string().contains("metadata read limit is too large"));
+        // SAFETY: replication_env_test_lock serializes process-env mutation in
+        // this module's tests.
+        unsafe {
+            std::env::remove_var(REPLICATION_METADATA_FILE_LIMIT_ENV);
+        }
+    }
+
     #[cfg(unix)]
     #[test]
     fn logical_metadata_persist_rejects_swapped_symlinked_kind_directory() {
@@ -1486,5 +1526,12 @@ mod tests {
                 .expect("second cascade receive"),
             0
         );
+    }
+
+    fn replication_env_test_lock() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+        LOCK.get_or_init(|| std::sync::Mutex::new(()))
+            .lock()
+            .expect("replication env test lock")
     }
 }
