@@ -2579,9 +2579,7 @@ pub(super) fn bind_copy(s: &CopyStmt, catalog: &dyn Catalog) -> Result<LogicalPl
         "COPY requires table or query target",
     ))?;
     let relation = object_name_simple(table_name);
-    let table_meta = catalog
-        .lookup_table(&relation)
-        .ok_or_else(|| PlanError::TableNotFound(relation.clone()))?;
+    let table_meta = lookup_table_object(catalog, table_name, &relation)?;
 
     let columns: Vec<usize> = if s.columns.is_empty() {
         Vec::new()

@@ -1370,3 +1370,7 @@ as a concise evidence ledger; roadmap stays for open gates only.
   Evidence:
   `cargo test -p ultrasql-server --test schema_ddl_round_trip -- --nocapture`
   and `cargo test -p ultrasql-planner --lib -- --nocapture`.
+- Schema-qualified `COPY TO/FROM` now rejects wrong-qualified table targets
+  instead of exporting from or importing into a same-name table in another
+  schema. Evidence:
+  `cargo test -p ultrasql-server --test copy_round_trip -- --nocapture`.

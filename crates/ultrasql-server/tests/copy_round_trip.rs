@@ -413,6 +413,44 @@ async fn copy_to_stdout_text_emits_rows() {
     shutdown(running).await;
 }
 
+#[tokio::test]
+async fn copy_respects_schema_qualifier() {
+    let running = start_sample_server("copy_schema_qualifier_guard").await;
+    let client = &running.client;
+
+    client
+        .batch_execute(
+            "CREATE SCHEMA app; \
+             CREATE TABLE guarded_copy (id INT, label TEXT); \
+             INSERT INTO guarded_copy VALUES (8, 'public')",
+        )
+        .await
+        .expect("create public table and separate schema");
+
+    let copy_out = client.copy_out("COPY app.guarded_copy TO STDOUT").await;
+    assert!(
+        copy_out.is_err(),
+        "qualified COPY TO must not resolve public table"
+    );
+
+    let copy_in = client
+        .copy_in::<_, Bytes>("COPY app.guarded_copy FROM STDIN")
+        .await;
+    assert!(
+        copy_in.is_err(),
+        "qualified COPY FROM must not resolve public table"
+    );
+
+    assert_eq!(select_count(client, "guarded_copy").await, 1);
+
+    client
+        .batch_execute("DROP TABLE guarded_copy; DROP SCHEMA app")
+        .await
+        .expect("cleanup COPY qualifier guard");
+
+    shutdown(running).await;
+}
+
 /// The exact bytes pushed through `COPY FROM STDIN` come back through
 /// `COPY TO STDOUT`. This is the integration "byte-equality of the
 /// round-tripped text payload" property the workplan asks for.
