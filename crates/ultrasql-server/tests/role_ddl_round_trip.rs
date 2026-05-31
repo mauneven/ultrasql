@@ -92,6 +92,24 @@ async fn create_alter_drop_role_and_user_update_catalog_views() {
     shutdown(running).await;
 }
 
+#[tokio::test]
+async fn drop_role_rejects_bootstrap_role() {
+    let running = start_sample_server("role_ddl_test").await;
+    let client = &running.client;
+
+    let err = client
+        .batch_execute("DROP ROLE ultrasql")
+        .await
+        .expect_err("bootstrap role must not be droppable");
+    assert!(
+        err.as_db_error()
+            .is_some_and(|db| db.message().contains("cannot drop bootstrap role")),
+        "expected bootstrap role rejection, got {err}"
+    );
+
+    shutdown(running).await;
+}
+
 #[test]
 fn role_metadata_rejects_duplicate_role_names_on_rebuild() {
     let data_dir = tempfile::TempDir::new().expect("temp data dir");

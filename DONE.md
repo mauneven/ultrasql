@@ -941,7 +941,9 @@ as a concise evidence ledger; roadmap stays for open gates only.
 ## Security And Client Certification
 
 - `CREATE ROLE / USER`, `ALTER ROLE`, and `DROP ROLE` work through the role
-  catalog and `pg_roles` / `pg_user` visibility.
+  catalog and `pg_roles` / `pg_user` visibility. `DROP ROLE` rejects the
+  bootstrap `ultrasql` role before mutating catalog state, preserving the auth
+  restart invariant.
 - `GRANT / REVOKE` on tables, schemas, databases, sequences, and functions work
   through privilege catalog checks.
 - Column-level privileges enforce `SELECT`, `INSERT`, and `UPDATE` target

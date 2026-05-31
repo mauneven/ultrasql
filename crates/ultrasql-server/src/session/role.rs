@@ -89,6 +89,9 @@ where
             ));
         };
         for role in roles {
+            if role.eq_ignore_ascii_case("ultrasql") {
+                return Err(ServerError::ddl("cannot drop bootstrap role ultrasql"));
+            }
             if self.state.role_catalog.lookup_role(role).is_none() {
                 continue;
             }
