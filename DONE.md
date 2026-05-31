@@ -710,6 +710,10 @@ as a concise evidence ledger; roadmap stays for open gates only.
   `XMLSERIALIZE(DOCUMENT|CONTENT ... AS TEXT)`, with malformed `DOCUMENT`
   inputs rejected through the wire path. Evidence:
   `cargo test -p ultrasql-server --test xml_round_trip xml_functions_validate_securely_and_extract_simple_xpath`.
+- `XMLSERIALIZE` now returns a typed executor error if its parser contract is
+  ever violated instead of relying on a production `unreachable!`. Evidence:
+  `cargo test -p ultrasql-executor null_helpers_extrema_xml_and_unknown_function_paths --lib -- --nocapture`;
+  `cargo clippy -p ultrasql-executor --lib --all-features -- -D warnings`.
 - Ordered-set aggregates `PERCENTILE_CONT` and `PERCENTILE_DISC` have plan shape
   and wire coverage.
 - Portable scalar helpers now cover `COALESCE`, `IFNULL` / `NVL`,

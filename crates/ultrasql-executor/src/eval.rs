@@ -2350,7 +2350,10 @@ fn eval_xmlserialize(args: &[Value]) -> Result<Value, EvalError> {
     }
     let parsed = parse_xml_value("xmlserialize", mode, text)?;
     let Value::Xml(text) = parsed else {
-        unreachable!("parse_xml_value returns XML")
+        return Err(EvalError::Type(format!(
+            "xmlserialize: expected XML parser output, got {:?}",
+            parsed.data_type()
+        )));
     };
     Ok(Value::Text(text))
 }
