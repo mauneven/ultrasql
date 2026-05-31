@@ -1258,7 +1258,11 @@ async fn pg_stat_activity_lists_open_sessions() {
 
     let rows = client_a
         .query(
-            "SELECT usename, application_name, state, query \
+            "SELECT usename, application_name, state, query, \
+                    backend_start IS NOT NULL, \
+                    query_start IS NOT NULL, \
+                    state_change IS NOT NULL, \
+                    wait_event_type, wait_event \
              FROM pg_catalog.pg_stat_activity \
              WHERE application_name IN ('activity_a', 'activity_b') \
              ORDER BY application_name",
@@ -1277,10 +1281,20 @@ async fn pg_stat_activity_lists_open_sessions() {
             .is_some_and(|query| query.contains("pg_stat_activity")),
         "current activity query should be visible"
     );
+    assert!(rows[0].get::<_, bool>(4));
+    assert!(rows[0].get::<_, bool>(5));
+    assert!(rows[0].get::<_, bool>(6));
+    assert_eq!(rows[0].get::<_, Option<String>>(7), None);
+    assert_eq!(rows[0].get::<_, Option<String>>(8), None);
     assert_eq!(rows[1].get::<_, String>(0), "activity_b");
     assert_eq!(rows[1].get::<_, String>(1), "activity_b");
     assert_eq!(rows[1].get::<_, String>(2), "idle");
     assert_eq!(rows[1].get::<_, Option<String>>(3), None);
+    assert!(rows[1].get::<_, bool>(4));
+    assert!(!rows[1].get::<_, bool>(5));
+    assert!(rows[1].get::<_, bool>(6));
+    assert_eq!(rows[1].get::<_, Option<String>>(7), None);
+    assert_eq!(rows[1].get::<_, Option<String>>(8), None);
 
     drop(client_b);
     tokio::time::sleep(Duration::from_millis(20)).await;

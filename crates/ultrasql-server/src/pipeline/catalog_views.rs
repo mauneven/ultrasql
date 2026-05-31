@@ -2581,6 +2581,12 @@ fn schema_pg_stat_activity() -> Schema {
         Field::nullable("application_name", text()),
         Field::required("state", text()),
         Field::nullable("query", text()),
+        Field::nullable("backend_start", DataType::TimestampTz),
+        Field::nullable("xact_start", DataType::TimestampTz),
+        Field::nullable("query_start", DataType::TimestampTz),
+        Field::nullable("state_change", DataType::TimestampTz),
+        Field::nullable("wait_event_type", text()),
+        Field::nullable("wait_event", text()),
     ])
 }
 
@@ -2598,6 +2604,12 @@ fn rows_pg_stat_activity(ctx: &LowerCtx<'_>) -> Vec<Vec<Value>> {
                     session.application_name.map_or(Value::Null, v_text),
                     v_text(session.state),
                     session.query.map_or(Value::Null, v_text),
+                    Value::TimestampTz(session.backend_start),
+                    session.xact_start.map_or(Value::Null, Value::TimestampTz),
+                    session.query_start.map_or(Value::Null, Value::TimestampTz),
+                    Value::TimestampTz(session.state_change),
+                    session.wait_event_type.map_or(Value::Null, v_text),
+                    session.wait_event.map_or(Value::Null, v_text),
                 ]
             })
             .collect();
@@ -2615,6 +2627,12 @@ fn rows_pg_stat_activity(ctx: &LowerCtx<'_>) -> Vec<Vec<Value>> {
         v_text(ctx.current_user.clone()),
         application_name,
         v_text("active"),
+        Value::Null,
+        Value::Null,
+        Value::Null,
+        Value::Null,
+        Value::Null,
+        Value::Null,
         Value::Null,
     ]]
 }

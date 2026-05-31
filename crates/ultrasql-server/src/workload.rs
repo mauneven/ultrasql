@@ -2,7 +2,7 @@
 
 use std::collections::{HashMap, VecDeque, hash_map::DefaultHasher};
 use std::hash::{Hash, Hasher};
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use ultrasql_planner::LogicalPlan;
 
@@ -10,6 +10,9 @@ const LATENCY_BUCKETS_US: [u64; 9] = [
     100, 500, 1_000, 5_000, 10_000, 50_000, 100_000, 500_000, 1_000_000,
 ];
 const LATENCY_BUCKET_COUNT: usize = LATENCY_BUCKETS_US.len() + 1;
+const MICROS_PER_DAY: i64 = 86_400_000_000;
+const UNIX_TO_ENGINE_EPOCH_DAYS: i64 = 10_957;
+const UNIX_TO_ENGINE_EPOCH_MICROS: i64 = UNIX_TO_ENGINE_EPOCH_DAYS * MICROS_PER_DAY;
 
 /// Aggregated pg_stat_statements-style metrics for one normalized query.
 #[derive(Clone, Debug, PartialEq)]
@@ -174,6 +177,18 @@ pub struct ActiveSessionSnapshot {
     pub usename: String,
     /// Session application name, if the client supplied or set one.
     pub application_name: Option<String>,
+    /// Backend startup timestamp in engine microseconds.
+    pub backend_start: i64,
+    /// Transaction start timestamp in engine microseconds, if known.
+    pub xact_start: Option<i64>,
+    /// Current query start timestamp in engine microseconds, if active.
+    pub query_start: Option<i64>,
+    /// Last state-change timestamp in engine microseconds.
+    pub state_change: i64,
+    /// Current wait class, if blocked.
+    pub wait_event_type: Option<String>,
+    /// Current wait event, if blocked.
+    pub wait_event: Option<String>,
     /// Current coarse backend state.
     pub state: String,
     /// Current query text, if exposed.
@@ -468,6 +483,7 @@ impl WorkloadRecorder {
 
     /// Register one live client session for `pg_stat_activity`.
     pub fn register_session(&self, pid: u32, usename: impl Into<String>) {
+        let now = current_engine_timestamp_micros();
         self.active_sessions.lock().insert(
             pid,
             ActiveSessionSnapshot {
@@ -476,6 +492,12 @@ impl WorkloadRecorder {
                 datname: "ultrasql".to_string(),
                 usename: usename.into(),
                 application_name: None,
+                backend_start: now,
+                xact_start: None,
+                query_start: None,
+                state_change: now,
+                wait_event_type: None,
+                wait_event: None,
                 state: "idle".to_string(),
                 query: None,
             },
@@ -499,7 +521,10 @@ impl WorkloadRecorder {
     /// Mark one live session as executing `query`.
     pub fn set_session_active(&self, pid: u32, query: impl Into<String>) {
         if let Some(row) = self.active_sessions.lock().get_mut(&pid) {
+            let now = current_engine_timestamp_micros();
             row.state = "active".to_string();
+            row.query_start = Some(now);
+            row.state_change = now;
             row.query = Some(query.into());
         }
     }
@@ -507,7 +532,9 @@ impl WorkloadRecorder {
     /// Mark one live session as idle and clear the exposed query text.
     pub fn set_session_idle(&self, pid: u32) {
         if let Some(row) = self.active_sessions.lock().get_mut(&pid) {
+            row.state_change = current_engine_timestamp_micros();
             row.state = "idle".to_string();
+            row.query_start = None;
             row.query = None;
         }
     }
@@ -635,6 +662,15 @@ fn stable_hash<T: Hash>(value: &T) -> u64 {
 
 fn duration_as_micros_saturated(duration: Duration) -> u64 {
     u64::try_from(duration.as_micros()).unwrap_or(u64::MAX)
+}
+
+fn current_engine_timestamp_micros() -> i64 {
+    let unix_micros = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_micros())
+        .unwrap_or(0);
+    let unix_micros = i64::try_from(unix_micros).unwrap_or(i64::MAX);
+    unix_micros.saturating_sub(UNIX_TO_ENGINE_EPOCH_MICROS)
 }
 
 fn u32_to_i32_saturated(value: u32) -> i32 {
