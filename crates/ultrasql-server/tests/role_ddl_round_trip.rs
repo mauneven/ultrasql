@@ -912,6 +912,31 @@ async fn drop_role_rejects_role_membership_edges_until_revoked() {
     shutdown(running).await;
 }
 
+#[tokio::test]
+async fn revoke_role_rejects_unknown_roles() {
+    let running = start_sample_server("role_ddl_test").await;
+    let client = &running.client;
+
+    client
+        .batch_execute("CREATE ROLE membership_child LOGIN")
+        .await
+        .expect("create member role");
+
+    let missing_granted = client
+        .batch_execute("REVOKE missing_parent FROM membership_child")
+        .await
+        .expect_err("missing granted role must reject REVOKE ROLE");
+    assert_eq!(missing_granted.code().expect("SQLSTATE").code(), "42704");
+
+    let missing_member = client
+        .batch_execute("REVOKE membership_child FROM missing_member")
+        .await
+        .expect_err("missing member role must reject REVOKE ROLE");
+    assert_eq!(missing_member.code().expect("SQLSTATE").code(), "42704");
+
+    shutdown(running).await;
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn role_catalog_survives_restart() {
     let data_dir = tempfile::TempDir::new().expect("temp data dir");

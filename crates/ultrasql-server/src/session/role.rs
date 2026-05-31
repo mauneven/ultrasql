@@ -265,6 +265,8 @@ where
             ));
         };
         self.ensure_role_administration()?;
+        self.ensure_role_references_exist(roles)?;
+        self.ensure_role_references_exist(grantees)?;
         let before_roles = self.state.role_catalog.list_roles();
         let before_memberships = self.state.role_catalog.list_memberships();
         self.state.role_catalog.revoke_roles(roles, grantees);
@@ -306,6 +308,17 @@ where
             }
         }
         Ok(result_encoder::run_ddl_command("SET ROLE"))
+    }
+
+    fn ensure_role_references_exist(&self, roles: &[String]) -> Result<(), ServerError> {
+        for role in roles {
+            if self.state.role_catalog.lookup_role(role).is_none() {
+                return Err(ServerError::UndefinedObject(format!(
+                    "role '{role}' does not exist"
+                )));
+            }
+        }
+        Ok(())
     }
 
     fn ensure_role_administration(&self) -> Result<(), ServerError> {

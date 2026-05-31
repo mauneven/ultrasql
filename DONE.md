@@ -941,6 +941,9 @@ as a concise evidence ledger; roadmap stays for open gates only.
   endpoints in role memberships, avoiding implicit membership deletion during
   role removal. Evidence:
   `cargo test -p ultrasql-server --test role_ddl_round_trip`.
+- `REVOKE role FROM role` now rejects unknown granted/member role references
+  with SQLSTATE `42704` instead of silently succeeding. Evidence:
+  `cargo test -p ultrasql-server --test role_ddl_round_trip`.
 
 ## Security And Client Certification
 
