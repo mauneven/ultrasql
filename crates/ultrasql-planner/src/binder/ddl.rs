@@ -1196,6 +1196,10 @@ fn object_name_namespace(name: &ObjectName) -> String {
     }
 }
 
+fn object_name_explicit_namespace(name: &ObjectName) -> Option<String> {
+    (name.parts.len() >= 2).then(|| object_name_namespace(name))
+}
+
 /// Resolve a parser [`TypeName`] to an UltraSQL [`DataType`].
 ///
 /// The v0.5 type surface is intentionally narrow; types outside the
@@ -1461,9 +1465,11 @@ pub(super) fn bind_create_sequence(s: &CreateSequenceStmt) -> Result<LogicalPlan
 
 pub(super) fn bind_alter_sequence(s: &AlterSequenceStmt) -> Result<LogicalPlan, PlanError> {
     let sequence_name = object_name_simple(&s.name);
+    let namespace = object_name_explicit_namespace(&s.name);
     let options = bind_sequence_change(&s.options)?;
     Ok(LogicalPlan::AlterSequence {
         sequence_name,
+        namespace,
         options,
         schema: Schema::empty(),
     })
@@ -1471,8 +1477,10 @@ pub(super) fn bind_alter_sequence(s: &AlterSequenceStmt) -> Result<LogicalPlan, 
 
 pub(super) fn bind_drop_sequence(s: &DropSequenceStmt) -> Result<LogicalPlan, PlanError> {
     let sequences = s.names.iter().map(object_name_simple).collect();
+    let sequence_namespaces = s.names.iter().map(object_name_explicit_namespace).collect();
     Ok(LogicalPlan::DropSequence {
         sequences,
+        sequence_namespaces,
         if_exists: s.if_exists,
         cascade: s.cascade,
         schema: Schema::empty(),

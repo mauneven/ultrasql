@@ -399,6 +399,40 @@ async fn alter_sequence_changes_increment() {
 }
 
 #[tokio::test]
+async fn alter_and_drop_sequence_respect_schema_qualifier() {
+    let running = start_sample_server("sequence_schema_qualifier_guard").await;
+    let client = &running.client;
+
+    client
+        .batch_execute(
+            "CREATE SCHEMA app; \
+             CREATE SEQUENCE guarded_seq START WITH 5",
+        )
+        .await
+        .expect("create public sequence and separate schema");
+
+    client
+        .batch_execute("ALTER SEQUENCE app.guarded_seq INCREMENT BY 10")
+        .await
+        .expect_err("qualified ALTER SEQUENCE must not resolve public sequence");
+    assert_eq!(simple_i64(client, "SELECT nextval('guarded_seq')").await, 5);
+    assert_eq!(simple_i64(client, "SELECT nextval('guarded_seq')").await, 6);
+
+    client
+        .batch_execute("DROP SEQUENCE app.guarded_seq")
+        .await
+        .expect_err("qualified DROP SEQUENCE must not resolve public sequence");
+    assert_eq!(simple_i64(client, "SELECT nextval('guarded_seq')").await, 7);
+
+    client
+        .batch_execute("DROP SEQUENCE guarded_seq; DROP SCHEMA app")
+        .await
+        .expect("cleanup sequence qualifier guard");
+
+    graceful_shutdown(running).await;
+}
+
+#[tokio::test]
 async fn alter_sequence_start_and_restart_follow_postgres_shape() {
     let running = start_sample_server("sequence_test").await;
     let client = &running.client;

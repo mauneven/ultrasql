@@ -1037,6 +1037,8 @@ pub enum LogicalPlan {
     AlterSequence {
         /// Case-folded sequence name.
         sequence_name: String,
+        /// Explicit SQL namespace from a qualified name, or `None` for bare names.
+        namespace: Option<String>,
         /// Partial option changes.
         options: LogicalSequenceChange,
         /// Always [`Schema::empty`].
@@ -1047,6 +1049,8 @@ pub enum LogicalPlan {
     DropSequence {
         /// Case-folded sequence names.
         sequences: Vec<String>,
+        /// Explicit namespaces aligned with `sequences`; `None` means bare name.
+        sequence_namespaces: Vec<Option<String>>,
         /// Whether `IF EXISTS` was specified.
         if_exists: bool,
         /// Whether `CASCADE` was specified.
@@ -3718,6 +3722,7 @@ mod tests {
             (
                 LogicalPlan::AlterSequence {
                     sequence_name: "users_id_seq".to_owned(),
+                    namespace: None,
                     options: LogicalSequenceChange {
                         increment: Some(10),
                         ..LogicalSequenceChange::default()
@@ -3729,6 +3734,7 @@ mod tests {
             (
                 LogicalPlan::DropSequence {
                     sequences: vec!["users_id_seq".to_owned()],
+                    sequence_namespaces: vec![None],
                     if_exists: true,
                     cascade: true,
                     schema: empty(),

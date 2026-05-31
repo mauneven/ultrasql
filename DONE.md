@@ -1386,3 +1386,8 @@ as a concise evidence ledger; roadmap stays for open gates only.
   through binding, so `REFERENCES schema.table(...)` cannot silently bind a
   same-name table in another schema. Evidence:
   `cargo test -p ultrasql-server --test constraint_round_trip -- --nocapture`.
+- Schema-qualified `ALTER SEQUENCE` and `DROP SEQUENCE` now carry explicit
+  namespaces through the logical plan and reject wrong-qualified sequence
+  targets instead of altering or dropping a same-name sequence in another
+  schema. Evidence:
+  `cargo test -p ultrasql-server --test sequence_round_trip -- --nocapture`.

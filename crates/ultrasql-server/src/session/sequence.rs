@@ -21,6 +21,13 @@ use crate::result_encoder::{self, SelectResult};
 
 const PG_OID_INT8: u32 = 20;
 
+fn display_sequence_target(sequence_name: &str, namespace: Option<&str>) -> String {
+    namespace.map_or_else(
+        || sequence_name.to_owned(),
+        |namespace| format!("{namespace}.{sequence_name}"),
+    )
+}
+
 impl<RW> Session<RW>
 where
     RW: AsyncRead + AsyncWrite + Unpin,
@@ -136,6 +143,7 @@ where
     ) -> Result<SelectResult, ServerError> {
         let LogicalPlan::AlterSequence {
             sequence_name,
+            namespace,
             options,
             ..
         } = plan
@@ -144,6 +152,7 @@ where
                 "execute_alter_sequence called with non-AlterSequence plan",
             ));
         };
+        self.ensure_sequence_namespace_matches(sequence_name, namespace.as_deref())?;
         let seq = self
             .state
             .sequences
@@ -175,6 +184,7 @@ where
     ) -> Result<SelectResult, ServerError> {
         let LogicalPlan::DropSequence {
             sequences,
+            sequence_namespaces,
             if_exists,
             cascade,
             ..
@@ -185,12 +195,17 @@ where
             ));
         };
         let mut drop_set = HashSet::with_capacity(sequences.len());
-        for name in sequences {
-            if self.state.sequences.contains_key(name) {
+        for (idx, name) in sequences.iter().enumerate() {
+            let namespace = sequence_namespaces
+                .get(idx)
+                .and_then(std::option::Option::as_deref);
+            if self.sequence_namespace_matches(name, namespace) {
                 drop_set.insert(name.to_ascii_lowercase());
             } else if !*if_exists {
                 return Err(ServerError::Catalog(
-                    ultrasql_catalog::CatalogError::not_found(name.clone()),
+                    ultrasql_catalog::CatalogError::not_found(display_sequence_target(
+                        name, namespace,
+                    )),
                 ));
             }
         }
@@ -253,6 +268,38 @@ where
         self.state.persist_sequence_owner_metadata()?;
         self.plan_cache_invalidate();
         Ok(result_encoder::run_ddl_command("DROP SEQUENCE"))
+    }
+
+    fn ensure_sequence_namespace_matches(
+        &self,
+        sequence_name: &str,
+        namespace: Option<&str>,
+    ) -> Result<(), ServerError> {
+        if self.sequence_namespace_matches(sequence_name, namespace) {
+            return Ok(());
+        }
+        Err(ServerError::Catalog(
+            ultrasql_catalog::CatalogError::not_found(display_sequence_target(
+                sequence_name,
+                namespace,
+            )),
+        ))
+    }
+
+    fn sequence_namespace_matches(&self, sequence_name: &str, namespace: Option<&str>) -> bool {
+        if !self.state.sequences.contains_key(sequence_name) {
+            return false;
+        }
+        let Some(namespace) = namespace else {
+            return true;
+        };
+        self.state
+            .sequence_namespaces
+            .get(&sequence_name.to_ascii_lowercase())
+            .map_or_else(
+                || namespace.eq_ignore_ascii_case("public"),
+                |actual| actual.eq_ignore_ascii_case(namespace),
+            )
     }
 
     fn sequence_default_dependents(&self, sequence_name: &str) -> Vec<String> {
