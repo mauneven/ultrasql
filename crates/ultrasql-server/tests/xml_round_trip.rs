@@ -280,6 +280,8 @@ async fn xml_functions_validate_securely_and_extract_simple_xpath() {
                         xpath('/root/item/self::node()', XML '<root><item id=\"1\">a</item><item id=\"2\">b</item></root>'), \
                         xpath('string(/root/item/name)', XML '<root><item><name>Ada</name></item></root>'), \
                         xpath('boolean(/root/item)', XML '<root><item/></root>'), \
+                        xpath('true()', XML '<root/>'), \
+                        xpath('false()', XML '<root/>'), \
                         xpath('not(/root/missing)', XML '<root><item/></root>'), \
                         xpath('not(/root/item)', XML '<root><item/></root>'), \
                         xpath('name(/root/item)', XML '<root><item/></root>'), \
@@ -327,6 +329,8 @@ async fn xml_functions_validate_securely_and_extract_simple_xpath() {
             r#"{"<item id=\"1\">a</item>","<item id=\"2\">b</item>"}"#.to_owned(),
             "{Ada}".to_owned(),
             "{true}".to_owned(),
+            "{true}".to_owned(),
+            "{false}".to_owned(),
             "{true}".to_owned(),
             "{false}".to_owned(),
             "{item}".to_owned(),

@@ -318,6 +318,11 @@ as a concise evidence ledger; roadmap stays for open gates only.
   `cargo test -p ultrasql-core xml_xpath_subset_filters_children_without_entity_resolution --lib -- --nocapture`
   and
   `cargo test -p ultrasql-server --test xml_round_trip xml_functions_validate_securely_and_extract_simple_xpath -- --nocapture`.
+- XML XPath now supports boolean literal functions `true()` and `false()`.
+  Evidence:
+  `cargo test -p ultrasql-core xml_xpath_subset_filters_children_without_entity_resolution --lib -- --nocapture`
+  and
+  `cargo test -p ultrasql-server --test xml_round_trip xml_functions_validate_securely_and_extract_simple_xpath -- --nocapture`.
 - XML XPath now supports explicit `child::`, `attribute::`, `descendant::`,
   terminal `.`, and terminal `self::node()` steps in the secure local subset,
   reusing the existing element walker without entity expansion or external
@@ -895,11 +900,12 @@ as a concise evidence ledger; roadmap stays for open gates only.
   `xpath_exists` subset for absolute element paths with optional attribute
   equality filters, element wildcards, terminal `@attr` / `@*` selection,
   terminal `text()` selection, namespace URI mapping arrays, the descendant
-  `//` abbreviation, bounded `count()` / `string()` / `boolean()` / `not()` /
-  `name()` / `local-name()` / `normalize-space()` / `string-length()`, and
-  bounded `contains(path, literal)` / `starts-with(path, literal)` predicates,
-  bounded `substring-before(path, literal)` / `substring-after(path, literal)`
-  string slicing, bounded `concat(path-or-literal, ...)`, plus explicit
+  `//` abbreviation, boolean `true()` / `false()`, bounded `count()` /
+  `string()` / `boolean()` / `not()` / `name()` / `local-name()` /
+  `normalize-space()` / `string-length()`, bounded `contains(path, literal)` /
+  `starts-with(path, literal)` predicates, bounded
+  `substring-before(path, literal)` / `substring-after(path, literal)` string
+  slicing, bounded `concat(path-or-literal, ...)`, plus explicit
   bounded numeric `number()` / `floor()` / `ceiling()` / `round()` / `sum()`,
   explicit `child::`, `attribute::`, `descendant::`, and terminal self-node
   steps. DTD declarations, external entity expansion, unknown entity
