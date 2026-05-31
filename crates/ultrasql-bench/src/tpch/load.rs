@@ -4224,7 +4224,11 @@ fn push_direct_q1_columns(
         && (DIRECT_Q6_DISCOUNT_MIN..=DIRECT_Q6_DISCOUNT_MAX).contains(&discount)
         && quantity < DIRECT_Q6_QUANTITY_LIMIT
     {
-        cache.q6_revenue += i128::from(extendedprice) * i128::from(discount) / 100;
+        let revenue = i128::from(extendedprice)
+            .checked_mul(i128::from(discount))
+            .ok_or_else(direct_sidecar_revenue_overflow)?
+            / 100;
+        cache.q6_revenue = checked_direct_revenue_add_i128(cache.q6_revenue, revenue)?;
     }
     Ok(())
 }
@@ -4841,6 +4845,32 @@ mod tests {
             .expect_err("discount factor overflow should reject");
 
         assert!(err.to_string().contains("TPC-H Q1 summary overflow"));
+    }
+
+    #[cfg(feature = "sql-bench")]
+    #[test]
+    fn tpch_q6_direct_sidecar_rejects_revenue_overflow() {
+        let mut cache = ultrasql_server::TpchQ1ColumnarCache {
+            q6_revenue: i128::MAX,
+            ..ultrasql_server::TpchQ1ColumnarCache::default()
+        };
+        let mut payload = vec![0, 0];
+        for value in [1_i32, 2, 3, 4] {
+            payload.extend_from_slice(&value.to_le_bytes());
+        }
+        for value in [1_00_i64, 10_000, 5, 0] {
+            encode_direct_decimal(&mut payload, value, 2, 0).expect("decimal payload");
+        }
+        payload.extend_from_slice(&1_u32.to_le_bytes());
+        payload.push(b'N');
+        payload.extend_from_slice(&1_u32.to_le_bytes());
+        payload.push(b'O');
+        payload.extend_from_slice(&DIRECT_Q6_SHIPDATE_START_1994_01_01.to_le_bytes());
+
+        let err = push_direct_q1_columns(&payload, &mut cache)
+            .expect_err("q6 revenue overflow should reject");
+
+        assert!(err.to_string().contains("TPC-H sidecar revenue overflow"));
     }
 
     #[cfg(feature = "sql-bench")]
