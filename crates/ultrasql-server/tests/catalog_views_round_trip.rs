@@ -1166,8 +1166,24 @@ async fn psql_list_tables_probe_uses_pg_class_owner() {
 }
 
 #[tokio::test]
-async fn psql_list_functions_probe_accepts_empty_pg_proc() {
+async fn psql_list_functions_probe_filters_builtin_pg_proc() {
     let (_server, client, _conn, server_handle) = start_server_and_connect().await;
+
+    let builtin_rows = client
+        .query(
+            "SELECT proname, prokind \
+             FROM pg_catalog.pg_proc \
+             WHERE proname IN ('pg_get_userbyid', 'version') \
+             ORDER BY proname",
+            &[],
+        )
+        .await
+        .expect("builtin pg_proc rows");
+    assert_eq!(builtin_rows.len(), 2);
+    assert_eq!(builtin_rows[0].get::<_, String>(0), "pg_get_userbyid");
+    assert_eq!(builtin_rows[0].get::<_, String>(1), "f");
+    assert_eq!(builtin_rows[1].get::<_, String>(0), "version");
+    assert_eq!(builtin_rows[1].get::<_, String>(1), "f");
 
     let rows = client
         .query(

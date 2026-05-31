@@ -20,6 +20,7 @@ const INFORMATION_SCHEMA_OID: i64 = 12;
 const PUBLIC_OID: i64 = 2200;
 const PG_CLASS_OID: i64 = 1259;
 const PG_CONSTRAINT_OID: i64 = 2606;
+const PG_PROC_BASE_OID: u32 = 9_000;
 const PG_TYPE_BOOL: i32 = 16;
 const PG_TYPE_BOOL_ARRAY: i32 = 1000;
 const PG_TYPE_INT2: i32 = 21;
@@ -259,7 +260,7 @@ fn virtual_rows(name: &str, ctx: &LowerCtx<'_>) -> Option<(Schema, Vec<Vec<Value
             schema_pg_publication_tables(),
             rows_pg_publication_tables(ctx),
         )),
-        "pg_catalog.pg_proc" => Some((schema_pg_proc(), Vec::new())),
+        "pg_catalog.pg_proc" => Some((schema_pg_proc(), rows_pg_proc())),
         "pg_catalog.pg_database" => Some((schema_pg_database(), rows_pg_database())),
         "information_schema.tables" => Some((
             schema_information_schema_tables(),
@@ -2821,6 +2822,63 @@ fn schema_pg_proc() -> Schema {
         Field::required("pronamespace", DataType::Int64),
         Field::required("prokind", DataType::Text { max_len: Some(1) }),
     ])
+}
+
+fn rows_pg_proc() -> Vec<Vec<Value>> {
+    pg_proc_builtin_names()
+        .iter()
+        .enumerate()
+        .filter_map(|(offset, name)| {
+            let offset = u32::try_from(offset).ok()?;
+            Some(vec![
+                Value::Int64(i64::from(PG_PROC_BASE_OID.saturating_add(offset))),
+                v_text(*name),
+                Value::Int64(PG_CATALOG_OID),
+                v_text("f"),
+            ])
+        })
+        .collect()
+}
+
+const fn pg_proc_builtin_names() -> &'static [&'static str] {
+    &[
+        "array_length",
+        "col_description",
+        "current_catalog",
+        "current_database",
+        "current_schema",
+        "current_schemas",
+        "current_user",
+        "format_type",
+        "gen_random_uuid",
+        "has_column_privilege",
+        "has_database_privilege",
+        "has_function_privilege",
+        "has_schema_privilege",
+        "has_sequence_privilege",
+        "has_table_privilege",
+        "obj_description",
+        "pg_encoding_to_char",
+        "pg_function_is_visible",
+        "pg_get_constraintdef",
+        "pg_get_expr",
+        "pg_get_function_arguments",
+        "pg_get_function_result",
+        "pg_get_indexdef",
+        "pg_get_serial_sequence",
+        "pg_get_statisticsobjdef_columns",
+        "pg_get_userbyid",
+        "pg_is_other_temp_schema",
+        "pg_relation_is_publishable",
+        "pg_relation_size",
+        "pg_size_pretty",
+        "pg_table_is_visible",
+        "pg_typeof",
+        "session_user",
+        "set_config",
+        "shobj_description",
+        "version",
+    ]
 }
 
 fn schema_pg_database() -> Schema {

@@ -792,6 +792,9 @@ as a concise evidence ledger; roadmap stays for open gates only.
   `Hibernate ORM`, `GORM`, `Prisma`, and `Diesel`.
 - psql meta-command coverage exists for `\d`, `\dt`, `\di`, `\df`, `\dv`,
   `\du`, `\l`, and `\dn`.
+- `pg_catalog.pg_proc` exposes stable rows for core builtin introspection
+  functions while stock `\df` still filters system routines out. Evidence:
+  `cargo test -p ultrasql-server --test catalog_views_round_trip psql_list_functions_probe_filters_builtin_pg_proc -- --nocapture`.
 - `GUI introspection probes` exist for `pgAdmin`, `DBeaver`, and `DataGrip`.
 - Migration tool certification covers `Flyway`, `Liquibase`, and `Alembic`.
 
