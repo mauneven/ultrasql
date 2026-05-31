@@ -43,7 +43,7 @@
 use ultrasql_core::{DataType, Field, Schema};
 use ultrasql_vec::Batch;
 use ultrasql_vec::column::{Column, NumericColumn};
-use ultrasql_vec::kernels::{sum_i32_widening, sum_i64};
+use ultrasql_vec::kernels::sum_i32_widening;
 
 use crate::{ExecError, Operator};
 
@@ -200,15 +200,12 @@ impl Operator for DirectScalarAggScan {
 
         // Accumulator state.
         //
-        // `total_sum` carries the SUM (Int32 widens to i64;
-        // Int64 stays i64 with wrapping semantics that match
-        // PostgreSQL's overflow behaviour under the legacy
-        // `SUM(BIGINT) → BIGINT` widening rule). `count_rows`
-        // tracks COUNT(*) when the operator was constructed for
-        // CountStar, and the non-null row count for AVG. Both
-        // start at zero; the AVG/SUM division below substitutes
-        // a NULL row when the row count is zero (PostgreSQL
-        // `SUM([])` and `AVG([])` are both NULL on empty input).
+        // `total_sum` carries the SUM. Int32 widens to i64 and Int64
+        // stays i64; overflow is a typed execution error instead of a
+        // wrapped SQL-visible result. `count_rows` tracks COUNT(*) when
+        // the operator was constructed for CountStar, and the non-null
+        // row count for AVG. Both start at zero; the AVG/SUM division
+        // below substitutes a NULL row when the row count is zero.
         let mut total_sum: i64 = 0;
         let mut count_rows: usize = 0;
 
@@ -235,8 +232,8 @@ impl Operator for DirectScalarAggScan {
                             "DirectScalarAggScan: expected Int32 column".to_owned(),
                         ));
                     };
-                    let (delta, non_nulls) = sum_i32_nullable(c);
-                    total_sum = total_sum.wrapping_add(delta);
+                    let (delta, non_nulls) = sum_i32_nullable(c)?;
+                    total_sum = checked_sum(total_sum, delta, "DirectScalarAggScan SUM(INT)")?;
                     count_rows = count_rows.saturating_add(non_nulls);
                 }
                 InputKind::Int64 { col_idx } => {
@@ -253,8 +250,8 @@ impl Operator for DirectScalarAggScan {
                             "DirectScalarAggScan: expected Int64 column".to_owned(),
                         ));
                     };
-                    let (delta, non_nulls) = sum_i64_nullable(c);
-                    total_sum = total_sum.wrapping_add(delta);
+                    let (delta, non_nulls) = sum_i64_nullable(c)?;
+                    total_sum = checked_sum(total_sum, delta, "DirectScalarAggScan SUM(BIGINT)")?;
                     count_rows = count_rows.saturating_add(non_nulls);
                 }
             }
@@ -322,36 +319,47 @@ fn null_float64_row() -> Result<Column, ExecError> {
         .map_err(|err| ExecError::TypeMismatch(format!("direct scalar AVG NULL row: {err}")))
 }
 
-fn sum_i32_nullable(c: &NumericColumn<i32>) -> (i64, usize) {
+fn checked_sum(acc: i64, delta: i64, context: &str) -> Result<i64, ExecError> {
+    acc.checked_add(delta)
+        .ok_or_else(|| ExecError::NumericFieldOverflow(format!("{context} overflow")))
+}
+
+fn sum_i32_nullable(c: &NumericColumn<i32>) -> Result<(i64, usize), ExecError> {
     match c.nulls() {
-        None => (sum_i32_widening(c), c.len()),
+        None => Ok((sum_i32_widening(c), c.len())),
         Some(nulls) => {
             let mut sum = 0_i64;
             let mut count = 0_usize;
             for (idx, value) in c.data().iter().copied().enumerate() {
                 if nulls.get(idx) {
-                    sum = sum.wrapping_add(i64::from(value));
+                    sum = checked_sum(sum, i64::from(value), "DirectScalarAggScan SUM(INT)")?;
                     count = count.saturating_add(1);
                 }
             }
-            (sum, count)
+            Ok((sum, count))
         }
     }
 }
 
-fn sum_i64_nullable(c: &NumericColumn<i64>) -> (i64, usize) {
+fn sum_i64_nullable(c: &NumericColumn<i64>) -> Result<(i64, usize), ExecError> {
     match c.nulls() {
-        None => (sum_i64(c), c.len()),
+        None => {
+            let mut sum = 0_i64;
+            for value in c.data().iter().copied() {
+                sum = checked_sum(sum, value, "DirectScalarAggScan SUM(BIGINT)")?;
+            }
+            Ok((sum, c.len()))
+        }
         Some(nulls) => {
             let mut sum = 0_i64;
             let mut count = 0_usize;
             for (idx, value) in c.data().iter().copied().enumerate() {
                 if nulls.get(idx) {
-                    sum = sum.wrapping_add(value);
+                    sum = checked_sum(sum, value, "DirectScalarAggScan SUM(BIGINT)")?;
                     count = count.saturating_add(1);
                 }
             }
-            (sum, count)
+            Ok((sum, count))
         }
     }
 }
@@ -428,6 +436,18 @@ mod tests {
             Column::Int64(c) => assert_eq!(c.data(), &[60]),
             other => panic!("expected Int64, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn sum_int64_overflow_returns_typed_error() {
+        let scan = make_int64_scan("x", vec![i64::MAX, 1]);
+        let mut agg = DirectScalarAggScan::sum_int64(Box::new(scan), 0, "sum".into());
+
+        let err = agg
+            .next_batch()
+            .expect_err("SUM(BIGINT) overflow must not wrap");
+
+        assert!(matches!(err, ExecError::NumericFieldOverflow(_)), "{err:?}");
     }
 
     #[test]
