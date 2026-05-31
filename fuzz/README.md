@@ -16,6 +16,9 @@ cargo install cargo-fuzz
 | Target | Contract |
 |---|---|
 | `parser_fuzz` | `Parser::parse_statements` never panics on any input |
+| `planner_fuzz` | Parser + binder/planner lowering either succeeds or returns typed errors without panics |
+| `protocol_fuzz` | Wire-protocol decoders parse, request more bytes, or return typed protocol errors |
+| `wal_record_fuzz` | WAL record decoder accepts valid payloads or returns typed decode errors |
 
 ## Running
 
@@ -26,31 +29,39 @@ cargo +nightly fuzz run parser_fuzz
 # Bounded run (60 s)
 cargo +nightly fuzz run parser_fuzz -- -max_total_time=60
 
+# Run every release-gate target with the nightly CI budget
+for target in parser_fuzz planner_fuzz protocol_fuzz wal_record_fuzz; do
+  cargo +nightly fuzz run "$target" -- -max_total_time=900 -rss_limit_mb=4096 -max_len=1024
+done
+
 # Minimize a crash reproducer
 cargo +nightly fuzz tmin parser_fuzz artifacts/parser_fuzz/<crash-file>
 ```
 
 ## Corpus
 
-Seed inputs live in `corpus/parser_fuzz/`. They cover a representative slice of the
-SQL grammar: DDL, DML, CTEs, set operations, expressions, malformed inputs, and
-Unicode. cargo-fuzz merges new interesting inputs into this directory automatically.
+Seed inputs live under `corpus/<target>/`. Parser seeds cover a representative
+slice of the SQL grammar: DDL, DML, CTEs, set operations, expressions, malformed
+inputs, and Unicode. Protocol and WAL seeds cover decoder edge shapes,
+including truncated or malformed payloads. cargo-fuzz merges new interesting
+inputs into this directory automatically.
 
 ## Crash reproducers
 
-Any crash found during fuzzing is written to `artifacts/parser_fuzz/`. To reproduce:
+Any crash found during fuzzing is written to `artifacts/<target>/`. To reproduce:
 
 ```sh
-cargo +nightly fuzz run parser_fuzz artifacts/parser_fuzz/<crash-file>
+cargo +nightly fuzz run <target> artifacts/<target>/<crash-file>
 ```
 
 Commit crash reproducers alongside a bug fix so they become permanent regression tests.
 
 ## ROADMAP gate
 
-ROADMAP §"v0.2 — Planner updates" requires `parser_fuzz` to be 24h CI-clean before
-v0.2 can ship. The pre-push hook runs a 15-second smoke of this target when a nightly
-toolchain is available.
+The v1.0 release gate requires parser, planner, protocol, and WAL decoder fuzz
+targets to record one clean week of nightly or manual CI evidence. Pull requests
+run a 60-second smoke for changed fuzz surfaces; scheduled and manual workflows
+run 900-second sessions for every target.
 
 ## Structure
 
@@ -59,9 +70,15 @@ fuzz/
 ├── Cargo.toml                    standalone crate (excluded from workspace)
 ├── README.md                     this file
 ├── fuzz_targets/
-│   └── parser_fuzz.rs            fuzz entry point
+│   ├── parser_fuzz.rs            parser fuzz entry point
+│   ├── planner_fuzz.rs           parser + binder fuzz entry point
+│   ├── protocol_fuzz.rs          wire codec fuzz entry point
+│   └── wal_record_fuzz.rs        WAL record decoder fuzz entry point
 ├── corpus/
-│   └── parser_fuzz/              seed SQL inputs (committed)
+│   ├── parser_fuzz/              seed SQL inputs (committed)
+│   ├── planner_fuzz/             planner seed SQL inputs (committed)
+│   ├── protocol_fuzz/            wire-protocol seeds (committed)
+│   └── wal_record_fuzz/          WAL record seeds (committed)
 └── artifacts/
-    └── parser_fuzz/              crash reproducers (not committed; gitignored)
+    └── <target>/                 crash reproducers (not committed; gitignored)
 ```

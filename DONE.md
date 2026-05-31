@@ -2237,3 +2237,8 @@ as a concise evidence ledger; roadmap stays for open gates only.
   publication. Evidence:
   `cargo test -p ultrasql-bench --test release_hardening ci_split_matches_release_policy -- --nocapture`,
   `cargo test -p ultrasql-bench --test release_hardening packaging_and_docs_site_surface_is_release_ready -- --nocapture`.
+- Fuzz docs and release-hardening checks now match the active v1.0 fuzz surface:
+  parser, planner, protocol, and WAL record targets are listed, each target has
+  a committed seed corpus directory, and the documented gate requires one clean
+  week of nightly/manual evidence. Evidence:
+  `cargo test -p ultrasql-bench --test release_hardening ci_split_matches_release_policy -- --nocapture`.

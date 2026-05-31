@@ -199,6 +199,7 @@ fn ci_split_matches_release_policy() {
     let ci = repo_file(".github/workflows/ci.yml");
     let bench = repo_file(".github/workflows/bench.yml");
     let fuzz = repo_file(".github/workflows/fuzz.yml");
+    let fuzz_docs = repo_file("fuzz/README.md");
     let sanitizers = repo_file(".github/workflows/sanitizers.yml");
     let docs = repo_file("docs/release-checklist.md");
 
@@ -209,6 +210,22 @@ fn ci_split_matches_release_policy() {
     assert!(bench.contains("benchmarks/certify.sh smoke"));
     assert!(bench.contains("benchmarks/certify.sh full"));
     assert!(fuzz.contains("-max_total_time=900"));
+    for target in [
+        "parser_fuzz",
+        "planner_fuzz",
+        "protocol_fuzz",
+        "wal_record_fuzz",
+    ] {
+        assert!(fuzz.contains(target), "fuzz workflow missing {target}");
+        assert!(fuzz_docs.contains(target), "fuzz README missing {target}");
+        let corpus_dir = repo_path(&format!("fuzz/corpus/{target}"));
+        let has_seed = fs::read_dir(&corpus_dir)
+            .unwrap_or_else(|err| panic!("read {}: {err}", corpus_dir.display()))
+            .next()
+            .is_some();
+        assert!(has_seed, "fuzz corpus missing seed for {target}");
+    }
+    assert!(fuzz_docs.contains("one clean week"));
     assert!(sanitizers.contains("cargo +nightly test --workspace -Zbuild-std"));
     assert!(sanitizers.contains("cargo +nightly test \\"));
     assert!(sanitizers.contains("-p ultrasql-executor"));
