@@ -47,6 +47,20 @@ ORDER BY p.id
 0
 NULL
 
+query II nosort
+SELECT p.id, COALESCE(SUM(c.amount), 0)
+FROM slt_pg_join_parent p
+LEFT JOIN slt_pg_join_child c ON c.pid = p.id
+GROUP BY p.id
+ORDER BY p.id
+----
+1
+25
+2
+20
+3
+0
+
 query T nosort
 SELECT name
 FROM slt_pg_join_parent p

@@ -2584,6 +2584,49 @@ fn binds_decimal_arithmetic_around_aggregate_with_decimal_type() {
 }
 
 #[test]
+fn binds_coalesce_around_aggregate_projection() {
+    let schema = Schema::new([Field::required("amount", DataType::Int32)]).expect("schema ok");
+    let mut cat = InMemoryCatalog::new();
+    cat.register("sales", TableMeta::new(schema));
+
+    let plan = parse_and_bind("SELECT COALESCE(SUM(amount), 0) AS total FROM sales", &cat)
+        .expect("bind ok");
+
+    let LogicalPlan::Project {
+        input,
+        exprs,
+        schema,
+    } = &plan
+    else {
+        panic!("expected top-level Project, got {plan:?}");
+    };
+    assert_eq!(schema.field_at(0).name, "total");
+    assert_eq!(schema.field_at(0).data_type, DataType::Int64);
+
+    let ScalarExpr::FunctionCall {
+        name,
+        args,
+        data_type,
+    } = &exprs[0].0
+    else {
+        panic!("expected coalesce projection, got {:?}", exprs[0].0);
+    };
+    assert_eq!(name, "coalesce");
+    assert_eq!(*data_type, DataType::Int64);
+    assert!(matches!(args[0], ScalarExpr::Column { index: 0, .. }));
+
+    let LogicalPlan::Aggregate { aggregates, .. } = input.as_ref() else {
+        panic!("expected Aggregate under Project");
+    };
+    assert_eq!(aggregates.len(), 1);
+    assert_eq!(aggregates[0].func, AggregateFunc::Sum);
+
+    let ifnull_plan = parse_and_bind("SELECT IFNULL(SUM(amount), 0) AS total FROM sales", &cat)
+        .expect("bind generic scalar wrapper ok");
+    assert_eq!(ifnull_plan.schema().field_at(0).data_type, DataType::Int64);
+}
+
+#[test]
 fn binds_distinct_sum_arguments_to_distinct_aggregate_columns() {
     let schema = Schema::new([
         Field::required("volume", DataType::Float64),

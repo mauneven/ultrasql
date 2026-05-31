@@ -574,7 +574,7 @@ impl HashAggregate {
         &mut self,
         plan: GroupedVecPlan,
     ) -> Result<Vec<Vec<Value>>, ExecError> {
-        let mut table: HashMap<Option<i64>, i64> = HashMap::new();
+        let mut table: HashMap<Option<i64>, Option<i64>> = HashMap::new();
         loop {
             if let Some(flag) = self.cancel_flag.as_ref()
                 && flag.is_set()
@@ -599,7 +599,9 @@ impl HashAggregate {
             };
             output.push(vec![
                 key_value,
-                finalize_grouped_sum(sum, &plan.result_type),
+                sum.map_or(Value::Null, |sum| {
+                    finalize_grouped_sum(sum, &plan.result_type)
+                }),
             ]);
         }
         Ok(output)
@@ -913,7 +915,7 @@ fn numeric_storage_kind(data_type: &DataType) -> bool {
 fn grouped_vectorized_step(
     plan: &GroupedVecPlan,
     batch: &Batch,
-    table: &mut HashMap<Option<i64>, i64>,
+    table: &mut HashMap<Option<i64>, Option<i64>>,
 ) -> Result<(), ExecError> {
     let cols = batch.columns();
     for row in 0..batch.rows() {
@@ -921,7 +923,7 @@ fn grouped_vectorized_step(
             GroupedKey::Int32 => read_i32_key(cols.get(plan.key_index), row)?,
             GroupedKey::Int64 => read_i64_key(cols.get(plan.key_index), row)?,
         };
-        let Some(delta) = (match plan.agg {
+        let delta = match plan.agg {
             GroupedAgg::SumColumn { index } => read_numeric_value(cols.get(index), row)?,
             GroupedAgg::SumMul {
                 left_index,
@@ -940,13 +942,16 @@ fn grouped_vectorized_step(
                     _ => None,
                 }
             }
-        }) else {
-            continue;
         };
-        let entry = table.entry(key).or_insert(0);
-        *entry = entry
-            .checked_add(delta)
-            .ok_or_else(|| ExecError::TypeMismatch("grouped aggregate sum overflow".to_owned()))?;
+        let entry = table.entry(key).or_insert(None);
+        if let Some(delta) = delta {
+            *entry = Some(match *entry {
+                Some(current) => current.checked_add(delta).ok_or_else(|| {
+                    ExecError::TypeMismatch("grouped aggregate sum overflow".to_owned())
+                })?,
+                None => delta,
+            });
+        }
     }
     Ok(())
 }
@@ -2672,8 +2677,9 @@ mod tests {
         let grouped_batch = Batch::new([int32, int64]).expect("grouped batch");
         let mut table = std::collections::HashMap::new();
         grouped_vectorized_step(&grouped_plan, &grouped_batch, &mut table).expect("grouped step");
-        assert_eq!(table.get(&Some(1)), Some(&10));
-        assert_eq!(table.get(&Some(3)), Some(&30));
+        assert_eq!(table.get(&Some(1)), Some(&Some(10)));
+        assert_eq!(table.get(&None), Some(&None));
+        assert_eq!(table.get(&Some(3)), Some(&Some(30)));
         assert_eq!(
             finalize_grouped_sum(
                 123,
@@ -3042,6 +3048,52 @@ mod tests {
         let rows = drain_all(&mut op);
 
         assert_eq!(rows, vec![vec![Value::Int64(7)]]);
+    }
+
+    #[test]
+    fn hash_agg_grouped_sum_keeps_null_only_groups_on_fast_path() {
+        let schema = Schema::new([
+            Field::required("group", DataType::Int32),
+            Field::nullable("amount", DataType::Int64),
+        ])
+        .expect("schema ok");
+        let mut amount_validity = Bitmap::new(3, true);
+        amount_validity.set(1, false);
+        let batch = Batch::new([
+            Column::Int32(NumericColumn::from_data(vec![1, 2, 3])),
+            Column::Int64(
+                NumericColumn::with_nulls(vec![10, 0, 30], amount_validity)
+                    .expect("amount column ok"),
+            ),
+        ])
+        .expect("batch ok");
+        let scan = MemTableScan::new(schema, vec![batch]);
+        let out_schema = Schema::new([
+            Field::required("group", DataType::Int32),
+            Field::nullable("total", DataType::Int64),
+        ])
+        .expect("schema ok");
+
+        let mut op = HashAggregate::new(
+            Box::new(scan),
+            vec![col("group", 0, DataType::Int32)],
+            vec![sum_agg("amount", 1)],
+            out_schema,
+        );
+        let mut rows = drain_all(&mut op);
+        rows.sort_by_key(|row| match row[0] {
+            Value::Int32(v) => v,
+            _ => i32::MAX,
+        });
+
+        assert_eq!(
+            rows,
+            vec![
+                vec![Value::Int32(1), Value::Int64(10)],
+                vec![Value::Int32(2), Value::Null],
+                vec![Value::Int32(3), Value::Int64(30)],
+            ]
+        );
     }
 
     #[test]

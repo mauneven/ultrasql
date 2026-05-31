@@ -4,8 +4,12 @@
 use ultrasql_core::{DataType, Field, Schema};
 use ultrasql_parser::ast::{Expr, NullsOrder, OrderItem, SelectItem, SortDirection};
 
-use super::expr_bind::{bind_collated_expr, coerce_literal_to_match, is_supported_builtin};
-use super::expr_type::binary_result_type;
+use super::expr_bind::{
+    bind_collated_expr, builtin_return_type, coerce_args_to_common_type,
+    coerce_common_builtin_args, coerce_literal_to_match, common_scalar_return_type,
+    is_supported_builtin, validate_builtin_args,
+};
+use super::expr_type::{binary_result_type, comparable};
 use super::{
     AggregateFunc, Catalog, LogicalAggregateExpr, LogicalPlan, PlanError, ScalarExpr, ScopeEntry,
     ScopeStack, SortKey, bind_expr_with_ctes, derive_output_name, schema_for_qualified_binding,
@@ -36,19 +40,24 @@ pub(super) fn expr_has_aggregate(expr: &Expr) -> bool {
             ..
         } => {
             let func_name = name.parts.last().map_or("", |p| p.value.as_str());
-            is_aggregate_name(func_name)
+            let is_current_aggregate = is_aggregate_name(func_name)
                 && !is_scalar_min_max_call(
                     func_name,
                     args.len(),
                     *distinct,
                     within_group.is_some(),
                     over.is_some(),
-                )
+                );
+            is_current_aggregate || args.iter().any(expr_has_aggregate)
         }
         Expr::Unary { expr: inner, .. }
         | Expr::Paren { expr: inner, .. }
         | Expr::IsNull { expr: inner, .. }
         | Expr::Collate { expr: inner, .. } => expr_has_aggregate(inner),
+        Expr::Coalesce { args, .. } | Expr::Greatest { args, .. } | Expr::Least { args, .. } => {
+            args.iter().any(expr_has_aggregate)
+        }
+        Expr::NullIf { a, b, .. } => expr_has_aggregate(a) || expr_has_aggregate(b),
         Expr::Binary { left, right, .. } => expr_has_aggregate(left) || expr_has_aggregate(right),
         _ => false,
     }
@@ -428,6 +437,16 @@ fn collect_aggregates(
         Expr::Collate { expr: inner, .. } => {
             collect_aggregates(inner, alias, input_schema, out, catalog, cte_catalog, scope)
         }
+        Expr::Coalesce { args, .. } | Expr::Greatest { args, .. } | Expr::Least { args, .. } => {
+            for arg in args {
+                collect_aggregates(arg, None, input_schema, out, catalog, cte_catalog, scope)?;
+            }
+            Ok(())
+        }
+        Expr::NullIf { a, b, .. } => {
+            collect_aggregates(a, None, input_schema, out, catalog, cte_catalog, scope)?;
+            collect_aggregates(b, None, input_schema, out, catalog, cte_catalog, scope)
+        }
         Expr::Binary { left, right, .. } => {
             collect_aggregates(left, None, input_schema, out, catalog, cte_catalog, scope)?;
             collect_aggregates(right, None, input_schema, out, catalog, cte_catalog, scope)
@@ -632,7 +651,18 @@ fn bind_expr_or_agg_ref(
                     });
                 }
             }
-            bind_expr_with_ctes(expr, agg_schema, catalog, cte_catalog, scope)
+            let mut bound_args: Vec<ScalarExpr> = args
+                .iter()
+                .map(|arg| bind_expr_or_agg_ref(arg, None, agg_schema, catalog, cte_catalog, scope))
+                .collect::<Result<_, _>>()?;
+            validate_builtin_args(&func_name, &mut bound_args)?;
+            let return_type = builtin_return_type(&func_name, &bound_args)?;
+            coerce_common_builtin_args(&func_name, &mut bound_args, &return_type);
+            Ok(ScalarExpr::FunctionCall {
+                name: func_name,
+                args: bound_args,
+                data_type: return_type,
+            })
         }
         // Composite expressions: walk into binary / unary / paren so
         // nested aggregate calls (`100.00 * SUM(l_extendedprice * …)
@@ -676,8 +706,55 @@ fn bind_expr_or_agg_ref(
                 bind_expr_or_agg_ref(inner, alias_name, agg_schema, catalog, cte_catalog, scope)?;
             bind_collated_expr(collation, bound)
         }
+        Expr::Coalesce { args, .. } => {
+            bind_common_scalar_wrapper("coalesce", args, agg_schema, catalog, cte_catalog, scope)
+        }
+        Expr::Greatest { args, .. } => {
+            bind_common_scalar_wrapper("greatest", args, agg_schema, catalog, cte_catalog, scope)
+        }
+        Expr::Least { args, .. } => {
+            bind_common_scalar_wrapper("least", args, agg_schema, catalog, cte_catalog, scope)
+        }
+        Expr::NullIf { a, b, .. } => {
+            let mut left = bind_expr_or_agg_ref(a, None, agg_schema, catalog, cte_catalog, scope)?;
+            let mut right = bind_expr_or_agg_ref(b, None, agg_schema, catalog, cte_catalog, scope)?;
+            coerce_literal_to_match(&mut left, &mut right);
+            let left_type = left.data_type();
+            let right_type = right.data_type();
+            if !comparable(&left_type, &right_type) {
+                return Err(PlanError::TypeMismatch(format!(
+                    "nullif: cannot compare {left_type} and {right_type}"
+                )));
+            }
+            Ok(ScalarExpr::FunctionCall {
+                name: "nullif".to_owned(),
+                args: vec![left, right],
+                data_type: left_type,
+            })
+        }
         _ => bind_expr_with_ctes(expr, agg_schema, catalog, cte_catalog, scope),
     }
+}
+
+fn bind_common_scalar_wrapper(
+    func_name: &str,
+    args: &[Expr],
+    agg_schema: &Schema,
+    catalog: &dyn Catalog,
+    cte_catalog: &[(String, Schema)],
+    scope: &mut ScopeStack,
+) -> Result<ScalarExpr, PlanError> {
+    let mut bound_args: Vec<ScalarExpr> = args
+        .iter()
+        .map(|arg| bind_expr_or_agg_ref(arg, None, agg_schema, catalog, cte_catalog, scope))
+        .collect::<Result<_, _>>()?;
+    let return_type = common_scalar_return_type(func_name, &bound_args)?;
+    coerce_args_to_common_type(&mut bound_args, &return_type);
+    Ok(ScalarExpr::FunctionCall {
+        name: func_name.to_owned(),
+        args: bound_args,
+        data_type: return_type,
+    })
 }
 
 pub(super) fn bind_projection_with_scope(

@@ -623,7 +623,10 @@ pub(super) fn resolve_builtin_collation(
     }
 }
 
-fn common_scalar_return_type(func_name: &str, args: &[ScalarExpr]) -> Result<DataType, PlanError> {
+pub(super) fn common_scalar_return_type(
+    func_name: &str,
+    args: &[ScalarExpr],
+) -> Result<DataType, PlanError> {
     if args.is_empty() {
         return Err(PlanError::TypeMismatch(format!(
             "{func_name}: expected at least 1 argument, got 0"
@@ -671,13 +674,17 @@ fn common_scalar_pair_type(
     )))
 }
 
-fn coerce_args_to_common_type(args: &mut [ScalarExpr], target: &DataType) {
+pub(super) fn coerce_args_to_common_type(args: &mut [ScalarExpr], target: &DataType) {
     for arg in args {
         coerce_literal_to_type(arg, target);
     }
 }
 
-fn coerce_common_builtin_args(func_name: &str, args: &mut [ScalarExpr], target: &DataType) {
+pub(super) fn coerce_common_builtin_args(
+    func_name: &str,
+    args: &mut [ScalarExpr],
+    target: &DataType,
+) {
     if matches!(
         func_name,
         "ifnull" | "nvl" | "least" | "greatest" | "min" | "max"
@@ -1501,7 +1508,10 @@ fn literal_numeric_as_f64(value: &Value) -> Option<f64> {
 /// Statically infer the return type of a builtin scalar function.
 /// The set must stay in sync with the executor's `eval_function_call`
 /// dispatcher in [`crates/ultrasql-executor/src/eval.rs`].
-fn builtin_return_type(func_name: &str, args: &[ScalarExpr]) -> Result<DataType, PlanError> {
+pub(super) fn builtin_return_type(
+    func_name: &str,
+    args: &[ScalarExpr],
+) -> Result<DataType, PlanError> {
     match func_name {
         "ifnull" | "nvl" => common_scalar_return_type(func_name, args),
         "nullif" => {
@@ -1860,7 +1870,10 @@ pub(super) fn is_supported_builtin(func_name: &str) -> bool {
     )
 }
 
-fn validate_builtin_args(func_name: &str, args: &mut [ScalarExpr]) -> Result<(), PlanError> {
+pub(super) fn validate_builtin_args(
+    func_name: &str,
+    args: &mut [ScalarExpr],
+) -> Result<(), PlanError> {
     match func_name {
         "ifnull" | "nvl" | "nullif" => validate_exact_arg_count(func_name, args, 2),
         "least" | "greatest" => validate_min_arg_count(func_name, args, 1),
