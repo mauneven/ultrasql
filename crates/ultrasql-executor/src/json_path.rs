@@ -68,6 +68,7 @@ enum JsonPathCompareOp {
     LtEq,
     Gt,
     GtEq,
+    StartsWith,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -270,6 +271,11 @@ fn compare_json_path_literal(
     vars: Option<&JsonValue>,
 ) -> bool {
     match (value, literal) {
+        (JsonValue::String(left), JsonPathLiteral::String(right))
+            if op == JsonPathCompareOp::StartsWith =>
+        {
+            left.starts_with(right)
+        }
         (JsonValue::String(left), JsonPathLiteral::String(right)) => compare_ord(left, op, right),
         (JsonValue::Number(left), JsonPathLiteral::Number(right)) => left
             .as_f64()
@@ -290,6 +296,11 @@ fn compare_json_path_literal(
 
 fn compare_json_value(left: &JsonValue, op: JsonPathCompareOp, right: &JsonValue) -> bool {
     match (left, right) {
+        (JsonValue::String(left), JsonValue::String(right))
+            if op == JsonPathCompareOp::StartsWith =>
+        {
+            left.starts_with(right)
+        }
         (JsonValue::String(left), JsonValue::String(right)) => compare_ord(left, op, right),
         (JsonValue::Number(left), JsonValue::Number(right)) => left
             .as_f64()
@@ -464,6 +475,7 @@ fn compare_ord<T: Ord>(left: &T, op: JsonPathCompareOp, right: &T) -> bool {
         JsonPathCompareOp::LtEq => left <= right,
         JsonPathCompareOp::Gt => left > right,
         JsonPathCompareOp::GtEq => left >= right,
+        JsonPathCompareOp::StartsWith => false,
     }
 }
 
@@ -478,6 +490,7 @@ fn compare_f64(left: f64, op: JsonPathCompareOp, right: f64) -> bool {
         JsonPathCompareOp::LtEq => left <= right,
         JsonPathCompareOp::Gt => left > right,
         JsonPathCompareOp::GtEq => left >= right,
+        JsonPathCompareOp::StartsWith => false,
     }
 }
 
@@ -496,7 +509,7 @@ impl<'a> JsonPathParser<'a> {
         loop {
             self.skip_ws();
             if self.is_eof()
-                || (relative && (self.peek_byte() == Some(b')') || self.starts_compare_op()))
+                || (relative && (self.peek_byte() == Some(b')') || self.starts_predicate_op()))
                 || (relative && self.starts_boolean_op())
             {
                 return Ok(steps);
@@ -619,7 +632,7 @@ impl<'a> JsonPathParser<'a> {
         self.expect_byte(b'@', "filter path must start with @")?;
         let path = self.parse_steps(true)?;
         self.skip_ws();
-        let op = self.parse_compare_op();
+        let op = self.parse_predicate_op();
         let literal = if op.is_some() {
             self.skip_ws();
             Some(self.parse_literal()?)
@@ -628,6 +641,11 @@ impl<'a> JsonPathParser<'a> {
         };
         self.skip_ws();
         Ok(JsonPathPredicate::Path { path, op, literal })
+    }
+
+    fn parse_predicate_op(&mut self) -> Option<JsonPathCompareOp> {
+        self.parse_compare_op()
+            .or_else(|| self.parse_starts_with_op())
     }
 
     fn parse_compare_op(&mut self) -> Option<JsonPathCompareOp> {
@@ -647,10 +665,23 @@ impl<'a> JsonPathParser<'a> {
         None
     }
 
-    fn starts_compare_op(&self) -> bool {
+    fn parse_starts_with_op(&mut self) -> Option<JsonPathCompareOp> {
+        let saved = self.pos;
+        if self.consume_keyword("starts") {
+            self.skip_ws();
+            if self.consume_keyword("with") {
+                return Some(JsonPathCompareOp::StartsWith);
+            }
+        }
+        self.pos = saved;
+        None
+    }
+
+    fn starts_predicate_op(&self) -> bool {
         [">=", "<=", "==", "!=", ">", "<"]
             .iter()
             .any(|token| self.text[self.pos..].starts_with(token))
+            || self.starts_keyword("starts")
     }
 
     fn starts_boolean_op(&self) -> bool {
@@ -809,21 +840,24 @@ impl<'a> JsonPathParser<'a> {
     }
 
     fn consume_keyword(&mut self, keyword: &str) -> bool {
+        if !self.starts_keyword(keyword) {
+            return false;
+        }
+        self.pos += keyword.len();
+        true
+    }
+
+    fn starts_keyword(&self, keyword: &str) -> bool {
         let rest = &self.text[self.pos..];
         if !rest.starts_with(keyword) {
             return false;
         }
         let end = self.pos + keyword.len();
-        if self
+        !self
             .text
             .as_bytes()
             .get(end)
             .is_some_and(|byte| byte.is_ascii_alphanumeric() || *byte == b'_')
-        {
-            return false;
-        }
-        self.pos = end;
-        true
     }
 
     fn peek_byte(&self) -> Option<u8> {
@@ -1056,6 +1090,23 @@ mod tests {
         let not_path = parse_json_path(r#"$.items[*] ? (!(@.meta.kind == "paper")).id"#).unwrap();
         assert_eq!(
             select(&document, &not_path),
+            vec![serde_json::json!(1), serde_json::json!(3)]
+        );
+    }
+
+    #[test]
+    fn path_supports_starts_with_predicates() {
+        let document = serde_json::json!({
+            "items": [
+                {"id": 1, "name": "Alpha"},
+                {"id": 2, "name": "Beta"},
+                {"id": 3, "name": "Alpine"}
+            ]
+        });
+
+        let path = parse_json_path(r#"$.items[*] ? (@.name starts with "Al").id"#).unwrap();
+        assert_eq!(
+            select(&document, &path),
             vec![serde_json::json!(1), serde_json::json!(3)]
         );
     }

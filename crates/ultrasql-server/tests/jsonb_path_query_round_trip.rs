@@ -438,6 +438,34 @@ async fn jsonb_path_query_supports_predicate_boolean_algebra() {
 }
 
 #[tokio::test]
+async fn jsonb_path_query_supports_starts_with_predicates() {
+    let running = start_sample_server("jsonb_path_query_test").await;
+    let client = &running.client;
+
+    let messages = client
+        .simple_query(
+            "SELECT value FROM jsonb_path_query(\
+             '{\"items\":[{\"id\":1,\"name\":\"Alpha\"},\
+             {\"id\":2,\"name\":\"Beta\"},{\"id\":3,\"name\":\"Alpine\"}]}'::jsonb, \
+             '$.items[*] ? (@.name starts with \"Al\").id') \
+             ORDER BY value",
+        )
+        .await
+        .expect("jsonb_path_query starts with predicate");
+    let rows: Vec<String> = messages
+        .into_iter()
+        .filter_map(|message| match message {
+            SimpleQueryMessage::Row(row) => row.get(0).map(str::to_owned),
+            _ => None,
+        })
+        .collect();
+
+    assert_eq!(rows, vec!["1".to_owned(), "3".to_owned()]);
+
+    shutdown(running).await;
+}
+
+#[tokio::test]
 async fn jsonb_path_exists_evaluates_sql_json_predicates() {
     let running = start_sample_server("jsonb_path_query_test").await;
     let client = &running.client;
