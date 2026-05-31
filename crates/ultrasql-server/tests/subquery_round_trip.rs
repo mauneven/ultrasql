@@ -182,6 +182,47 @@ async fn uncorrelated_in_and_scalar_subqueries_lower_before_execution() {
 }
 
 #[tokio::test]
+async fn uncorrelated_not_in_returns_no_rows_when_subquery_contains_null() {
+    let (client, _conn, server_handle) = start_server_and_connect().await;
+    client
+        .batch_execute("CREATE TABLE sq_supplier_nulls (s_suppkey INT NOT NULL)")
+        .await
+        .expect("create supplier");
+    client
+        .batch_execute("CREATE TABLE sq_blocked_nulls (b_suppkey INT)")
+        .await
+        .expect("create blocked");
+    client
+        .batch_execute("INSERT INTO sq_supplier_nulls VALUES (1), (2), (3)")
+        .await
+        .expect("insert suppliers");
+    client
+        .batch_execute("INSERT INTO sq_blocked_nulls VALUES (2), (NULL)")
+        .await
+        .expect("insert blocked");
+
+    let rows = client
+        .simple_query(
+            "SELECT s_suppkey
+             FROM sq_supplier_nulls
+             WHERE s_suppkey NOT IN (SELECT b_suppkey FROM sq_blocked_nulls)
+             ORDER BY s_suppkey",
+        )
+        .await
+        .expect("NOT IN query succeeds");
+    let not_in_keys: Vec<i32> = rows
+        .iter()
+        .filter_map(|m| match m {
+            tokio_postgres::SimpleQueryMessage::Row(row) => row.get(0)?.parse().ok(),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(not_in_keys, Vec::<i32>::new());
+
+    shutdown(client, server_handle).await;
+}
+
+#[tokio::test]
 async fn correlated_in_and_not_in_lower_before_execution() {
     let (client, _conn, server_handle) = start_server_and_connect().await;
     client
@@ -254,6 +295,72 @@ async fn correlated_in_and_not_in_lower_before_execution() {
         })
         .collect();
     assert_eq!(not_in_keys, vec![2, 4]);
+
+    shutdown(client, server_handle).await;
+}
+
+#[tokio::test]
+async fn correlated_not_in_uses_group_local_null_semantics() {
+    let (client, _conn, server_handle) = start_server_and_connect().await;
+    client
+        .batch_execute(
+            "CREATE TABLE sq_outer_pair_nulls (
+                 outer_id INT,
+                 outer_group INT NOT NULL
+             )",
+        )
+        .await
+        .expect("create outer pair");
+    client
+        .batch_execute(
+            "CREATE TABLE sq_inner_pair_nulls (
+                 inner_id INT,
+                 inner_group INT NOT NULL
+             )",
+        )
+        .await
+        .expect("create inner pair");
+    client
+        .batch_execute(
+            "INSERT INTO sq_outer_pair_nulls VALUES
+                 (1, 10),
+                 (2, 10),
+                 (3, 20),
+                 (4, 30),
+                 (NULL, 20),
+                 (NULL, 30)",
+        )
+        .await
+        .expect("insert outer rows");
+    client
+        .batch_execute("INSERT INTO sq_inner_pair_nulls VALUES (1, 10), (NULL, 10), (5, 20)")
+        .await
+        .expect("insert inner rows");
+
+    let rows = client
+        .simple_query(
+            "SELECT COALESCE(outer_id, -1), outer_group
+             FROM sq_outer_pair_nulls o
+             WHERE outer_id NOT IN (
+                 SELECT inner_id
+                 FROM sq_inner_pair_nulls i
+                 WHERE i.inner_group = o.outer_group
+             )
+             ORDER BY outer_group, 1",
+        )
+        .await
+        .expect("correlated NOT IN query succeeds");
+    let mut not_in_rows: Vec<(i32, i32)> = rows
+        .iter()
+        .filter_map(|m| match m {
+            tokio_postgres::SimpleQueryMessage::Row(row) => {
+                Some((row.get(0)?.parse().ok()?, row.get(1)?.parse().ok()?))
+            }
+            _ => None,
+        })
+        .collect();
+    not_in_rows.sort_unstable();
+    assert_eq!(not_in_rows, vec![(-1, 30), (3, 20), (4, 30)]);
 
     shutdown(client, server_handle).await;
 }

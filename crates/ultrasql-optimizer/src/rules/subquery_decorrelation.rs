@@ -15,8 +15,9 @@
 //!   `sub`, logical `Anti` join against outer.
 //! - uncorrelated `expr IN (SELECT col FROM sub)` → distinct subquery values,
 //!   logical `Semi` join.
-//! - uncorrelated `expr NOT IN (SELECT col FROM sub)` → distinct subquery
-//!   values, logical `Anti` join.
+//! - uncorrelated `expr NOT IN (SELECT col FROM sub)` → distinct non-NULL
+//!   subquery values, logical `Anti` joins, and NULL-presence probes that
+//!   preserve SQL three-valued logic.
 //! - uncorrelated scalar subquery in a predicate → cross join the scalar
 //!   subplan, replace the subquery expression with its joined column, filter,
 //!   then project outer columns.
@@ -25,12 +26,10 @@
 //!   replace the scalar subquery with the joined aggregate column, filter, then
 //!   project outer columns.
 //!
-//! NOTE: the `NOT IN` with NULL-handling caveat: SQL's `x NOT IN (SELECT y …)`
-//! returns UNKNOWN (not TRUE) when the subquery produces any NULL in `y`.
-//! This lowering emits a warning in the doc but does not attempt to preserve
-//! that three-valued-logic exactly in v0.6; the full NULL-safe NOT IN lowering
-//! (`NOT EXISTS(SELECT 1 … WHERE y IS NOT DISTINCT FROM x)`) is deferred to
-//! v0.7 when the planner carries richer subquery node types.
+//! `NOT IN` needs extra care because SQL returns UNKNOWN, not TRUE, when the
+//! subquery produces a NULL. The rule handles supported `NOT IN` shapes by
+//! separating non-NULL value matching from NULL-presence probes; if a matching
+//! correlated group (or an uncorrelated subquery) contains NULL, no row passes.
 //!
 //! ## Correlation detection
 //!
@@ -927,6 +926,9 @@ fn rewrite_in_subquery_filter_expr(
     if subplan.schema().len() != 1 {
         return None;
     }
+    if *negated {
+        return rewrite_uncorrelated_not_in_subquery(&outer, expr, *subplan.clone(), data_type);
+    }
     let right = distinct_single_column(*subplan.clone())?;
     let outer_width = outer.schema().len();
     let right_col = ScalarExpr::Column {
@@ -954,6 +956,52 @@ fn rewrite_in_subquery_filter_expr(
     Some(join)
 }
 
+fn rewrite_uncorrelated_not_in_subquery(
+    outer: &LogicalPlan,
+    outer_expr: &ScalarExpr,
+    subplan: LogicalPlan,
+    data_type: &DataType,
+) -> Option<LogicalPlan> {
+    if subplan.schema().len() != 1 {
+        return None;
+    }
+
+    let non_null_values = distinct_single_column(filter_column_null(subplan.clone(), 0, true)?)?;
+    let null_probe = filter_column_null(subplan, 0, false)?;
+    let outer_width = outer.schema().len();
+    let right_col = ScalarExpr::Column {
+        name: non_null_values.schema().field_at(0).name.clone(),
+        index: outer_width,
+        data_type: data_type.clone(),
+    };
+    let value_miss = anti_join(
+        outer.clone(),
+        non_null_values.clone(),
+        LogicalJoinCondition::On(ScalarExpr::Binary {
+            op: BinaryOp::Eq,
+            left: Box::new(outer_expr.clone()),
+            right: Box::new(right_col),
+            data_type: DataType::Bool,
+        }),
+        outer.schema(),
+    );
+    let left_not_null_when_subquery_nonempty = anti_join(
+        value_miss,
+        non_null_values,
+        LogicalJoinCondition::On(ScalarExpr::IsNull {
+            expr: Box::new(outer_expr.clone()),
+            negated: false,
+        }),
+        outer.schema(),
+    );
+    Some(anti_join(
+        left_not_null_when_subquery_nonempty,
+        null_probe,
+        LogicalJoinCondition::None,
+        outer.schema(),
+    ))
+}
+
 fn rewrite_correlated_in_subquery(
     outer: &LogicalPlan,
     outer_expr: &ScalarExpr,
@@ -961,6 +1009,9 @@ fn rewrite_correlated_in_subquery(
     negated: bool,
     data_type: &DataType,
 ) -> Option<LogicalPlan> {
+    if negated {
+        return rewrite_correlated_not_in_subquery(outer, outer_expr, subplan, data_type);
+    }
     let (right, corr_pairs, value_index, value_name) =
         build_correlated_in_right(subplan, data_type)?;
     let outer_width = outer.schema().len();
@@ -981,14 +1032,69 @@ fn rewrite_correlated_in_subquery(
     Some(LogicalPlan::Join {
         left: Box::new(outer.clone()),
         right: Box::new(right),
-        join_type: if negated {
-            LogicalJoinType::Anti
-        } else {
-            LogicalJoinType::Semi
-        },
+        join_type: LogicalJoinType::Semi,
         condition: LogicalJoinCondition::On(conjuncts_to_and(predicates)),
         schema: outer.schema().clone(),
     })
+}
+
+fn rewrite_correlated_not_in_subquery(
+    outer: &LogicalPlan,
+    outer_expr: &ScalarExpr,
+    subplan: LogicalPlan,
+    data_type: &DataType,
+) -> Option<LogicalPlan> {
+    let (right, corr_pairs, value_index, value_name) =
+        build_correlated_in_right(subplan, data_type)?;
+    let non_null_values = filter_column_null(right.clone(), value_index, true)?;
+    let null_values = filter_column_null(right, value_index, false)?;
+    let outer_width = outer.schema().len();
+
+    let mut value_predicates = vec![build_correlation_condition_against_right_schema(
+        &corr_pairs,
+        outer_width,
+    )?];
+    value_predicates.push(ScalarExpr::Binary {
+        op: BinaryOp::Eq,
+        left: Box::new(outer_expr.clone()),
+        right: Box::new(ScalarExpr::Column {
+            name: value_name,
+            index: outer_width + value_index,
+            data_type: data_type.clone(),
+        }),
+        data_type: DataType::Bool,
+    });
+    let value_miss = anti_join(
+        outer.clone(),
+        non_null_values.clone(),
+        LogicalJoinCondition::On(conjuncts_to_and(value_predicates)),
+        outer.schema(),
+    );
+
+    let mut left_null_predicates = vec![build_correlation_condition_against_right_schema(
+        &corr_pairs,
+        outer_width,
+    )?];
+    left_null_predicates.push(ScalarExpr::IsNull {
+        expr: Box::new(outer_expr.clone()),
+        negated: false,
+    });
+    let left_not_null_when_group_nonempty = anti_join(
+        value_miss,
+        non_null_values,
+        LogicalJoinCondition::On(conjuncts_to_and(left_null_predicates)),
+        outer.schema(),
+    );
+
+    Some(anti_join(
+        left_not_null_when_group_nonempty,
+        null_values,
+        LogicalJoinCondition::On(build_correlation_condition_against_right_schema(
+            &corr_pairs,
+            outer_width,
+        )?),
+        outer.schema(),
+    ))
 }
 
 fn build_correlated_in_right(
@@ -1271,6 +1377,40 @@ fn distinct_single_column(input: LogicalPlan) -> Option<LogicalPlan> {
         aggregates: Vec::new(),
         schema,
     })
+}
+
+fn filter_column_null(
+    input: LogicalPlan,
+    column_index: usize,
+    negated: bool,
+) -> Option<LogicalPlan> {
+    let field = input.schema().fields().get(column_index)?.clone();
+    Some(LogicalPlan::Filter {
+        input: Box::new(input),
+        predicate: ScalarExpr::IsNull {
+            expr: Box::new(ScalarExpr::Column {
+                name: field.name,
+                index: column_index,
+                data_type: field.data_type,
+            }),
+            negated,
+        },
+    })
+}
+
+fn anti_join(
+    left: LogicalPlan,
+    right: LogicalPlan,
+    condition: LogicalJoinCondition,
+    schema: &Schema,
+) -> LogicalPlan {
+    LogicalPlan::Join {
+        left: Box::new(left),
+        right: Box::new(right),
+        join_type: LogicalJoinType::Anti,
+        condition,
+        schema: schema.clone(),
+    }
 }
 
 fn alias_first_column(input: LogicalPlan, name: &str) -> Option<LogicalPlan> {

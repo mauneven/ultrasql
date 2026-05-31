@@ -243,6 +243,13 @@ as a concise evidence ledger; roadmap stays for open gates only.
   of silently treating them as NULL non-matches. Evidence:
   `cargo test -p ultrasql-executor hash_join` and
   `cargo test -p ultrasql-executor merge_join`.
+- `NOT IN` subquery decorrelation now preserves SQL NULL semantics for the
+  supported uncorrelated and equality-correlated shapes: subquery NULLs suppress
+  the matching result set, outer NULLs are suppressed when the subquery group is
+  non-empty, and empty groups still pass. Evidence:
+  `cargo test -p ultrasql-server --test subquery_round_trip -- --nocapture`
+  and
+  `cargo test -p ultrasql-optimizer subquery_decorrelation --lib -- --nocapture`.
 - SQL/JSON path now supports bounded `decimal([precision[,scale]])` method
   parsing and evaluation with existing exact decimal rounding, precision
   overflow mapped to JSON null, and wire-level `jsonb_path_query` coverage.
