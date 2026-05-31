@@ -12,7 +12,9 @@ use tracing::{debug, error, info, warn};
 use ultrasql_catalog::{
     CatalogSnapshot, IndexEntry, MutableCatalog, PersistentCatalog, StatisticExtRow, TableEntry,
 };
-use ultrasql_core::{BlockNumber, DataType, PageId, RelationId, Value, Xid};
+use ultrasql_core::{
+    BlockNumber, DataType, PageId, RelationId, Value, Xid, timestamptz_display_in_timezone,
+};
 use ultrasql_mvcc::XidStatusOracle;
 use ultrasql_optimizer::{
     InMemoryStatsCatalog, PlanCache, PlanCacheConfig, PlanCacheKey, StatsCatalog, StatsSource,
@@ -925,8 +927,13 @@ where
                 Ok(())
             }
             "timezone" => {
+                let normalized = value.trim();
+                if normalized.is_empty() || timestamptz_display_in_timezone(0, normalized).is_none()
+                {
+                    return Err(ServerError::Unsupported("invalid timezone"));
+                }
                 self.session_settings
-                    .insert("timezone".to_owned(), value.to_owned());
+                    .insert("timezone".to_owned(), normalized.to_owned());
                 Ok(())
             }
             "standard_conforming_strings" => match value.to_ascii_lowercase().as_str() {
@@ -3300,6 +3307,9 @@ mod tests {
             .apply_session_variable("timezone", "America/Bogota")
             .expect("timezone");
         session
+            .apply_session_variable("timezone", "+02:30")
+            .expect("fixed timezone");
+        session
             .apply_session_variable("standard_conforming_strings", "on")
             .expect("strings");
         session
@@ -3323,7 +3333,7 @@ mod tests {
                     .show_session_variable("timezone", false)
                     .expect("show timezone")
             ),
-            "America/Bogota"
+            "+02:30"
         );
         assert_eq!(
             first_data_row_text(
@@ -3380,6 +3390,11 @@ mod tests {
                 .is_err()
         );
         assert!(session.apply_session_variable("datestyle", "moon").is_err());
+        assert!(
+            session
+                .apply_session_variable("timezone", "No/SuchZone")
+                .is_err()
+        );
         assert!(
             session
                 .apply_session_variable("intervalstyle", "bad")

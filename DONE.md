@@ -717,6 +717,10 @@ as a concise evidence ledger; roadmap stays for open gates only.
   `ROADMAP.md`. Evidence:
   `cargo test -p ultrasql-server --test timetz_round_trip timetz_and_temporal_display_round_trip -- --nocapture`;
   `cargo test -p ultrasql-server --test system_functions_round_trip orm_startup_runtime_parameters_round_trip`.
+- `TimeZone` session GUC values are now validated through the same fixed-offset
+  and IANA resolver used by timestamp display, so invalid zones are rejected
+  before they can silently fall back to UTC. Evidence:
+  `cargo test -p ultrasql-server session::execute::tests::session_variable_surface_sets_shows_and_resets_supported_gucs --lib -- --nocapture`.
 - `SHOW transaction isolation level` now reflects the active transaction
   isolation (`read committed`, `repeatable read`, or `serializable`) instead
   of always returning the idle default. Evidence:
