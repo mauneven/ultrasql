@@ -7852,6 +7852,8 @@ fn run_plan_in_txn(
     {
         return Ok(result);
     }
+    let text_options =
+        result_encoder::TextEncodingOptions::from_session_settings(session_settings.as_ref());
     record_serializable_predicate_locks(plan, txn, &catalog_snapshot, oracle.as_ref());
     record_serializable_write_conflicts(plan, txn, &catalog_snapshot, oracle.as_ref());
     acquire_simple_lock_rows(
@@ -7911,7 +7913,11 @@ fn run_plan_in_txn(
             if returning.is_empty() {
                 run_modify_command(op.as_mut(), "INSERT")
             } else {
-                run_modify_returning(op.as_mut(), "INSERT")
+                result_encoder::run_modify_returning_with_options(
+                    op.as_mut(),
+                    "INSERT",
+                    &text_options,
+                )
             }
         }
         LogicalPlan::Update { returning, .. } => {
@@ -7919,7 +7925,11 @@ fn run_plan_in_txn(
             if returning.is_empty() {
                 run_modify_command(op.as_mut(), "UPDATE")
             } else {
-                run_modify_returning(op.as_mut(), "UPDATE")
+                result_encoder::run_modify_returning_with_options(
+                    op.as_mut(),
+                    "UPDATE",
+                    &text_options,
+                )
             }
         }
         LogicalPlan::Delete { returning, .. } => {
@@ -7927,7 +7937,11 @@ fn run_plan_in_txn(
             if returning.is_empty() {
                 run_modify_command(op.as_mut(), "DELETE")
             } else {
-                run_modify_returning(op.as_mut(), "DELETE")
+                result_encoder::run_modify_returning_with_options(
+                    op.as_mut(),
+                    "DELETE",
+                    &text_options,
+                )
             }
         }
         _ => {
@@ -7938,7 +7952,7 @@ fn run_plan_in_txn(
             // directly into a single `BytesMut`. The session dispatches
             // the body in one `write_all` + `flush` rather than the
             // per-message loop the legacy `run_select` requires.
-            run_select_streamed(op.as_mut(), stream_buf)
+            result_encoder::run_select_streamed_with_options(op.as_mut(), stream_buf, &text_options)
         }
     }
 }

@@ -8,7 +8,9 @@ use ultrasql_protocol::BackendMessage;
 
 use crate::error::ServerError;
 use crate::pipeline::{LowerCtx, lower_query};
-use crate::result_encoder::{encode_text_value_typed, run_modify_command};
+use crate::result_encoder::{
+    TextEncodingOptions, encode_text_value_typed_with_options, run_modify_command,
+};
 
 use super::codec::encode_binary_value_typed;
 use super::handlers::resolve_param_format;
@@ -101,6 +103,7 @@ pub fn execute_portal(
     } else {
         lower_query(&plan, ctx)?
     };
+    let text_options = TextEncodingOptions::from_session_settings(ctx.session_settings.as_ref());
 
     // INSERT/UPDATE/DELETE either produce a row count tag or, when
     // `RETURNING` is present, a row stream plus the DML-specific
@@ -114,7 +117,12 @@ pub fn execute_portal(
                 messages: sel.messages,
             });
         }
-        return execute_modify_returning(op.as_mut(), &portal.result_formats, "INSERT");
+        return execute_modify_returning(
+            op.as_mut(),
+            &portal.result_formats,
+            "INSERT",
+            &text_options,
+        );
     }
     if let LogicalPlan::Update { returning, .. } = &plan {
         if returning.is_empty() {
@@ -123,7 +131,12 @@ pub fn execute_portal(
                 messages: sel.messages,
             });
         }
-        return execute_modify_returning(op.as_mut(), &portal.result_formats, "UPDATE");
+        return execute_modify_returning(
+            op.as_mut(),
+            &portal.result_formats,
+            "UPDATE",
+            &text_options,
+        );
     }
     if let LogicalPlan::Delete { returning, .. } = &plan {
         if returning.is_empty() {
@@ -132,7 +145,12 @@ pub fn execute_portal(
                 messages: sel.messages,
             });
         }
-        return execute_modify_returning(op.as_mut(), &portal.result_formats, "DELETE");
+        return execute_modify_returning(
+            op.as_mut(),
+            &portal.result_formats,
+            "DELETE",
+            &text_options,
+        );
     }
 
     // SELECT-like path. Drain row by row. Honor `result_formats` per
@@ -166,7 +184,7 @@ pub fn execute_portal(
             for (col_idx, col) in batch.columns().iter().enumerate() {
                 let fmt = resolve_param_format(&portal.result_formats, col_idx);
                 let logical_type = &output_schema.field_at(col_idx).data_type;
-                let encoded = encode_result_value(col, row, logical_type, fmt);
+                let encoded = encode_result_value(col, row, logical_type, fmt, &text_options);
                 columns.push(encoded);
             }
             messages.push(BackendMessage::DataRow { columns });
@@ -187,6 +205,7 @@ pub fn execute_portal(
                 leftover,
                 emitted,
                 result_formats: portal.result_formats.clone(),
+                text_options,
             },
         );
     } else {
@@ -202,6 +221,7 @@ fn execute_modify_returning(
     op: &mut dyn Operator,
     result_formats: &[i16],
     command: &str,
+    text_options: &TextEncodingOptions,
 ) -> Result<ExecuteOutcome, ServerError> {
     let output_schema = op.schema().clone();
     let mut messages: Vec<BackendMessage> = Vec::with_capacity(8);
@@ -214,7 +234,7 @@ fn execute_modify_returning(
             for (col_idx, col) in batch.columns().iter().enumerate() {
                 let fmt = resolve_param_format(result_formats, col_idx);
                 let logical_type = &output_schema.field_at(col_idx).data_type;
-                let encoded = encode_result_value(col, row, logical_type, fmt);
+                let encoded = encode_result_value(col, row, logical_type, fmt, text_options);
                 columns.push(encoded);
             }
             messages.push(BackendMessage::DataRow { columns });
@@ -232,11 +252,12 @@ fn encode_result_value(
     row: usize,
     logical_type: &ultrasql_core::DataType,
     format: i16,
+    text_options: &TextEncodingOptions,
 ) -> Option<Vec<u8>> {
     if format == 1 {
         encode_binary_value_typed(col, row, logical_type)
     } else {
-        encode_text_value_typed(col, row, logical_type)
+        encode_text_value_typed_with_options(col, row, logical_type, text_options)
     }
 }
 
@@ -293,7 +314,7 @@ fn resume_suspended_portal(
             for (col_idx, col) in batch.columns().iter().enumerate() {
                 let fmt = resolve_param_format(&sus.result_formats, col_idx);
                 let logical_type = &output_schema.field_at(col_idx).data_type;
-                let encoded = encode_result_value(col, row, logical_type, fmt);
+                let encoded = encode_result_value(col, row, logical_type, fmt, &sus.text_options);
                 columns.push(encoded);
             }
             messages.push(BackendMessage::DataRow { columns });

@@ -20,9 +20,11 @@
 //! [`Batch`]: ultrasql_vec::Batch
 
 use bytes::BytesMut;
+use std::collections::HashMap;
 use ultrasql_core::{
     DataType, Schema, Value, format_time_micros, format_timestamp_micros,
-    format_timestamptz_micros_utc, format_timetz, unpack_timetz,
+    format_timestamptz_micros_in_timezone, format_timestamptz_micros_utc, format_timetz,
+    unpack_timetz,
 };
 use ultrasql_executor::Operator;
 use ultrasql_protocol::{BackendMessage, FieldDescription, encode_backend};
@@ -30,7 +32,7 @@ use ultrasql_vec::column::Column;
 
 use crate::error::ServerError;
 use crate::wire_writer::{
-    write_data_row_typed, write_int32_int64_pair_data_rows, write_int32_pair_data_rows,
+    write_data_row_typed_with_options, write_int32_int64_pair_data_rows, write_int32_pair_data_rows,
 };
 
 /// PostgreSQL type OID for `bool`. Pulled from `pg_type.dat`.
@@ -164,6 +166,32 @@ const PG_OID_TIMESTAMPTZ_ARRAY: u32 = 1185;
 /// PostgreSQL format code 0 = text.
 const FORMAT_TEXT: i16 = 0;
 
+/// Text-format display settings owned by one query execution.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct TextEncodingOptions {
+    timezone: Option<String>,
+}
+
+impl TextEncodingOptions {
+    /// Build text display settings from session GUC values.
+    #[must_use]
+    pub(crate) fn from_session_settings(settings: &HashMap<String, String>) -> Self {
+        let timezone = settings
+            .get("timezone")
+            .map(|value| value.trim())
+            .filter(|value| !value.is_empty())
+            .map(ToOwned::to_owned);
+        Self { timezone }
+    }
+
+    pub(crate) fn format_timestamptz(&self, micros: i64) -> String {
+        self.timezone
+            .as_deref()
+            .and_then(|timezone| format_timestamptz_micros_in_timezone(micros, timezone))
+            .unwrap_or_else(|| format_timestamptz_micros_utc(micros))
+    }
+}
+
 /// Outcome of draining a single `SELECT` execution: the messages to
 /// send to the client, in transmission order.
 ///
@@ -258,7 +286,16 @@ pub fn run_modify_returning(
     op: &mut dyn Operator,
     command: &str,
 ) -> Result<SelectResult, ServerError> {
-    let mut result = run_select(op)?;
+    run_modify_returning_with_options(op, command, &TextEncodingOptions::default())
+}
+
+/// Session-aware variant of [`run_modify_returning`].
+pub(crate) fn run_modify_returning_with_options(
+    op: &mut dyn Operator,
+    command: &str,
+    options: &TextEncodingOptions,
+) -> Result<SelectResult, ServerError> {
+    let mut result = run_select_with_options(op, options)?;
     let tag = modify_command_tag(command, result.rows);
     let Some(BackendMessage::CommandComplete { tag: current_tag }) = result.messages.last_mut()
     else {
@@ -283,6 +320,14 @@ pub fn run_modify_returning(
 /// and the txn-error / fallback paths in `lib.rs`). The hot path for
 /// Simple Query SELECT now goes through [`stream_select`].
 pub fn run_select(op: &mut dyn Operator) -> Result<SelectResult, ServerError> {
+    run_select_with_options(op, &TextEncodingOptions::default())
+}
+
+/// Session-aware variant of [`run_select`].
+pub(crate) fn run_select_with_options(
+    op: &mut dyn Operator,
+    options: &TextEncodingOptions,
+) -> Result<SelectResult, ServerError> {
     let schema = op.schema().clone();
     let row_desc = build_row_description(&schema);
     let mut messages = Vec::with_capacity(8);
@@ -295,10 +340,11 @@ pub fn run_select(op: &mut dyn Operator) -> Result<SelectResult, ServerError> {
         for row in 0..row_count {
             let mut columns = Vec::with_capacity(batch.width());
             for (idx, col) in batch.columns().iter().enumerate() {
-                columns.push(encode_text_value_typed(
+                columns.push(encode_text_value_typed_with_options(
                     col,
                     row,
                     &schema.field_at(idx).data_type,
+                    options,
                 ));
             }
             messages.push(BackendMessage::DataRow { columns });
@@ -351,6 +397,15 @@ fn modify_command_tag(command: &str, affected: u64) -> String {
 /// the same count is embedded in the `CommandComplete` tag that this
 /// function already wrote into `sink`.
 pub fn stream_select(op: &mut dyn Operator, sink: &mut BytesMut) -> Result<u64, ServerError> {
+    stream_select_with_options(op, sink, &TextEncodingOptions::default())
+}
+
+/// Session-aware variant of [`stream_select`].
+pub(crate) fn stream_select_with_options(
+    op: &mut dyn Operator,
+    sink: &mut BytesMut,
+    options: &TextEncodingOptions,
+) -> Result<u64, ServerError> {
     let schema = op.schema().clone();
     let row_desc = build_row_description(&schema);
     encode_backend(&row_desc, sink);
@@ -386,7 +441,7 @@ pub fn stream_select(op: &mut dyn Operator, sink: &mut BytesMut) -> Result<u64, 
             continue;
         }
         for row in 0..row_count {
-            write_data_row_typed(sink, columns, &schema, row)?;
+            write_data_row_typed_with_options(sink, columns, &schema, row, options)?;
         }
         rows = rows.saturating_add(u64::try_from(row_count).unwrap_or(u64::MAX));
     }
@@ -421,6 +476,15 @@ pub fn run_select_streamed(
     op: &mut dyn Operator,
     sink: &mut BytesMut,
 ) -> Result<SelectResult, ServerError> {
+    run_select_streamed_with_options(op, sink, &TextEncodingOptions::default())
+}
+
+/// Session-aware variant of [`run_select_streamed`].
+pub(crate) fn run_select_streamed_with_options(
+    op: &mut dyn Operator,
+    sink: &mut BytesMut,
+    options: &TextEncodingOptions,
+) -> Result<SelectResult, ServerError> {
     // Initial capacity: when the operator advertises its row count
     // (column-cache replay, materialised CTE, LIMIT n) we can size
     // the buffer to the exact wire-byte budget upfront and skip
@@ -454,7 +518,7 @@ pub fn run_select_streamed(
     };
     let mut body = std::mem::take(sink);
     prepare_stream_sink(&mut body, initial_cap);
-    match stream_select(op, &mut body) {
+    match stream_select_with_options(op, &mut body, options) {
         Ok(rows) => Ok(SelectResult {
             messages: Vec::new(),
             streamed_body: Some(body),
@@ -598,10 +662,21 @@ pub(crate) fn encode_text_value(col: &Column, row: usize) -> Option<Vec<u8>> {
 /// Batch columns use compact physical layouts: `DATE` shares `Int32`,
 /// `DECIMAL` shares `Int64`. Wire text must expose SQL values, not storage
 /// integers.
+#[cfg(test)]
 pub(crate) fn encode_text_value_typed(
     col: &Column,
     row: usize,
     logical_type: &DataType,
+) -> Option<Vec<u8>> {
+    encode_text_value_typed_with_options(col, row, logical_type, &TextEncodingOptions::default())
+}
+
+/// Session-aware variant of [`encode_text_value_typed`].
+pub(crate) fn encode_text_value_typed_with_options(
+    col: &Column,
+    row: usize,
+    logical_type: &DataType,
+    options: &TextEncodingOptions,
 ) -> Option<Vec<u8>> {
     if let Some(nulls) = column_nulls(col) {
         if !nulls.get(row) {
@@ -629,7 +704,7 @@ pub(crate) fn encode_text_value_typed(
             Some(format_timestamp_micros(c.data()[row]).into_bytes())
         }
         (DataType::TimestampTz, Column::Int64(c)) => {
-            Some(format_timestamptz_micros_utc(c.data()[row]).into_bytes())
+            Some(options.format_timestamptz(c.data()[row]).into_bytes())
         }
         (DataType::TimeTz, Column::Int64(c)) => unpack_timetz(c.data()[row])
             .map(|(micros, offset_seconds)| format_timetz(micros, offset_seconds).into_bytes()),
@@ -850,7 +925,8 @@ const fn pg_type_size(ty: &DataType) -> i16 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ultrasql_core::{Field, Schema};
+    use std::collections::HashMap;
+    use ultrasql_core::{Field, Schema, parse_timestamptz_text};
     use ultrasql_executor::MemTableScan;
     use ultrasql_vec::Batch;
     use ultrasql_vec::column::{Column, NumericColumn, StringColumn};
@@ -995,6 +1071,25 @@ mod tests {
         match &result.messages[1] {
             BackendMessage::DataRow { columns } => {
                 assert_eq!(columns[0], Some(b"[1,2.5,-3]".to_vec()));
+            }
+            other => panic!("expected DataRow, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn run_select_with_options_applies_session_timezone() {
+        let schema = Schema::new([Field::required("observed_at", DataType::TimestampTz)]).unwrap();
+        let micros = parse_timestamptz_text("2000-07-01 00:00:00+00").unwrap();
+        let batch = Batch::new([Column::Int64(NumericColumn::from_data(vec![micros]))]).unwrap();
+        let mut scan = MemTableScan::new(schema, vec![batch]);
+        let mut settings = HashMap::new();
+        settings.insert("timezone".to_owned(), "America/New_York".to_owned());
+        let options = TextEncodingOptions::from_session_settings(&settings);
+        let result = run_select_with_options(&mut scan, &options).expect("ok");
+
+        match &result.messages[1] {
+            BackendMessage::DataRow { columns } => {
+                assert_eq!(columns[0], Some(b"2000-06-30 20:00:00-04".to_vec()));
             }
             other => panic!("expected DataRow, got {other:?}"),
         }

@@ -2403,11 +2403,29 @@ pub fn format_timestamp_micros(micros: i64) -> String {
     format!("{} {}", format_date(days), format_time_micros(time))
 }
 
-/// Format `TIMESTAMP WITH TIME ZONE` using UltraSQL's current UTC
-/// session timezone.
+/// Format `TIMESTAMP WITH TIME ZONE` using UTC display.
 #[must_use]
 pub fn format_timestamptz_micros_utc(micros: i64) -> String {
     format!("{}+00", format_timestamp_micros(micros))
+}
+
+/// Format `TIMESTAMP WITH TIME ZONE` using an explicit display offset.
+#[must_use]
+pub fn format_timestamptz_micros_with_offset(micros: i64, offset_seconds: i32) -> Option<String> {
+    let local_micros =
+        micros.checked_add(i64::from(offset_seconds).checked_mul(MICROS_PER_SECOND)?)?;
+    Some(format!(
+        "{}{}",
+        format_timestamp_micros(local_micros),
+        format_timezone_offset(offset_seconds)
+    ))
+}
+
+/// Format `TIMESTAMP WITH TIME ZONE` using a fixed-offset or IANA timezone.
+#[must_use]
+pub fn format_timestamptz_micros_in_timezone(micros: i64, timezone: &str) -> Option<String> {
+    let offset_seconds = resolve_timestamptz_display_offset(micros, timezone)?;
+    format_timestamptz_micros_with_offset(micros, offset_seconds)
 }
 
 /// Format `TIME WITH TIME ZONE` in PostgreSQL ISO style.
@@ -2630,6 +2648,35 @@ fn parse_timezone_abbreviation(lower: &str) -> Option<i32> {
         _ => return None,
     };
     Some(hours * 3_600)
+}
+
+fn resolve_timestamptz_display_offset(micros: i64, timezone: &str) -> Option<i32> {
+    if let Some(offset) = parse_timezone_offset(timezone.trim()) {
+        return Some(offset);
+    }
+    let timezone = timezone.parse::<chrono_tz::Tz>().ok()?;
+    let utc = naive_datetime_from_timestamp_micros(micros)?;
+    Some(
+        timezone
+            .offset_from_utc_datetime(&utc)
+            .fix()
+            .local_minus_utc(),
+    )
+}
+
+fn naive_datetime_from_timestamp_micros(micros: i64) -> Option<chrono::NaiveDateTime> {
+    let days = micros.div_euclid(MICROS_PER_DAY);
+    let time_micros = micros.rem_euclid(MICROS_PER_DAY);
+    let (year, month, day) = civil_from_days(i32::try_from(days).ok()?);
+    let date = NaiveDate::from_ymd_opt(year, u32::try_from(month).ok()?, u32::try_from(day).ok()?)?;
+    let hour = u32::try_from(time_micros / MICROS_PER_HOUR).ok()?;
+    let rem = time_micros % MICROS_PER_HOUR;
+    let minute = u32::try_from(rem / MICROS_PER_MINUTE).ok()?;
+    let rem = rem % MICROS_PER_MINUTE;
+    let second = u32::try_from(rem / MICROS_PER_SECOND).ok()?;
+    let micros = u32::try_from(rem % MICROS_PER_SECOND).ok()?;
+    let time = NaiveTime::from_hms_micro_opt(hour, minute, second, micros)?;
+    Some(date.and_time(time))
 }
 
 fn parse_named_timezone_offset(date_text: &str, micros: i64, zone: &str) -> Option<i32> {

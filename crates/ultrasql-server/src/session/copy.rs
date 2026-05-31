@@ -324,6 +324,9 @@ where
         let rel = RelationId(entry.oid);
         let block_count = self.state.heap.block_count(rel).max(entry.n_blocks);
         let codec = RowCodec::new(entry.schema.clone());
+        let text_options = crate::result_encoder::TextEncodingOptions::from_session_settings(
+            &self.session_settings,
+        );
 
         let mut rows_sent: u64 = 0;
         let mut wire_buf = BytesMut::with_capacity(8 * 1024);
@@ -369,15 +372,22 @@ where
                 let cells: Vec<Option<Vec<u8>>> = if columns.is_empty() {
                     row.iter()
                         .zip(entry.schema.fields())
-                        .map(|(value, field)| value_to_copy_cell(value, &field.data_type))
+                        .map(|(value, field)| {
+                            value_to_copy_cell_with_options(value, &field.data_type, &text_options)
+                        })
                         .collect()
                 } else {
                     columns
                         .iter()
                         .map(|&i| {
                             let field = entry.schema.field_at(i);
-                            row.get(i)
-                                .and_then(|value| value_to_copy_cell(value, &field.data_type))
+                            row.get(i).and_then(|value| {
+                                value_to_copy_cell_with_options(
+                                    value,
+                                    &field.data_type,
+                                    &text_options,
+                                )
+                            })
                         })
                         .collect()
                 };
@@ -1123,9 +1133,12 @@ where
             work_mem: Arc::new(ultrasql_executor::work_mem::WorkMemBudget::new(u64::MAX)),
             profile_operators: false,
         };
-        let result = match crate::pipeline::lower_query(input, &ctx)
-            .and_then(|mut op| crate::result_encoder::run_select(op.as_mut()))
-        {
+        let text_options = crate::result_encoder::TextEncodingOptions::from_session_settings(
+            ctx.session_settings.as_ref(),
+        );
+        let result = match crate::pipeline::lower_query(input, &ctx).and_then(|mut op| {
+            crate::result_encoder::run_select_with_options(op.as_mut(), &text_options)
+        }) {
             Ok(result) => result,
             Err(e) => {
                 if let Err(abort_err) = self.state.txn_manager.abort(txn) {
@@ -1187,6 +1200,9 @@ where
         let codec = RowCodec::new(entry.schema.clone());
         let mut out = Vec::new();
         let stream_schema = projected_schema(entry, columns)?;
+        let text_options = crate::result_encoder::TextEncodingOptions::from_session_settings(
+            &self.session_settings,
+        );
         if opts.header {
             let header_cells: Vec<Option<Vec<u8>>> = stream_schema
                 .fields()
@@ -1216,7 +1232,8 @@ where
             let row = codec
                 .decode(&tuple.data)
                 .map_err(|e| ServerError::CopyFormat(format!("COPY TO file row decode: {e}")))?;
-            let cells = copy_cells_from_row(&row, &entry.schema, columns);
+            let cells =
+                copy_cells_from_row_with_options(&row, &entry.schema, columns, &text_options);
             match opts.format {
                 ServerCopyFormat::Text => out.extend_from_slice(&encode_text_row(&cells, opts)),
                 ServerCopyFormat::Csv => out.extend_from_slice(&encode_csv_row(&cells, opts)),
@@ -1520,19 +1537,37 @@ fn projected_schema(entry: &TableEntry, columns: &[usize]) -> Result<Schema, Ser
     Schema::new(fields).map_err(|e| ServerError::CopyFormat(format!("COPY schema: {e}")))
 }
 
+#[cfg(test)]
 fn copy_cells_from_row(row: &[Value], schema: &Schema, columns: &[usize]) -> Vec<Option<Vec<u8>>> {
+    copy_cells_from_row_with_options(
+        row,
+        schema,
+        columns,
+        &crate::result_encoder::TextEncodingOptions::default(),
+    )
+}
+
+fn copy_cells_from_row_with_options(
+    row: &[Value],
+    schema: &Schema,
+    columns: &[usize],
+    text_options: &crate::result_encoder::TextEncodingOptions,
+) -> Vec<Option<Vec<u8>>> {
     if columns.is_empty() {
         row.iter()
             .zip(schema.fields())
-            .map(|(value, field)| value_to_copy_cell(value, &field.data_type))
+            .map(|(value, field)| {
+                value_to_copy_cell_with_options(value, &field.data_type, text_options)
+            })
             .collect()
     } else {
         columns
             .iter()
             .map(|&i| {
                 let field = schema.field_at(i);
-                row.get(i)
-                    .and_then(|value| value_to_copy_cell(value, &field.data_type))
+                row.get(i).and_then(|value| {
+                    value_to_copy_cell_with_options(value, &field.data_type, text_options)
+                })
             })
             .collect()
     }
@@ -2010,7 +2045,11 @@ fn decode_copy_cells_to_payload(
 }
 
 /// Encode a runtime [`Value`] as a `CopyData` cell (`None` is SQL NULL).
-fn value_to_copy_cell(value: &Value, dtype: &DataType) -> Option<Vec<u8>> {
+fn value_to_copy_cell_with_options(
+    value: &Value,
+    dtype: &DataType,
+    text_options: &crate::result_encoder::TextEncodingOptions,
+) -> Option<Vec<u8>> {
     match (dtype, value) {
         (_, Value::Null) => None,
         (DataType::Date, Value::Int32(v) | Value::Date(v)) => {
@@ -2034,7 +2073,7 @@ fn value_to_copy_cell(value: &Value, dtype: &DataType) -> Option<Vec<u8>> {
             Some(Value::Timestamp(*v).to_string().into_bytes())
         }
         (DataType::TimestampTz, Value::Int64(v) | Value::TimestampTz(v)) => {
-            Some(Value::TimestampTz(*v).to_string().into_bytes())
+            Some(text_options.format_timestamptz(*v).into_bytes())
         }
         (
             DataType::TimeTz,

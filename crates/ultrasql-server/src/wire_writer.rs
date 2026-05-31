@@ -37,7 +37,9 @@ use ultrasql_vec::Bitmap;
 use ultrasql_vec::column::Column;
 
 use crate::error::ServerError;
-use crate::result_encoder::{encode_text_value, encode_text_value_typed};
+use crate::result_encoder::{
+    TextEncodingOptions, encode_text_value, encode_text_value_typed_with_options,
+};
 
 /// PostgreSQL `DataRow` message type tag (`'D'`).
 const DATA_ROW_TAG: u8 = b'D';
@@ -90,11 +92,29 @@ pub(crate) fn write_data_row(sink: &mut BytesMut, batch_columns: &[Column], row:
 /// `DATE` and `DECIMAL` are stored as integer batch columns, so this path keeps
 /// their PostgreSQL text output semantic while preserving the integer fast paths
 /// for true integer schemas.
+#[cfg(test)]
 pub(crate) fn write_data_row_typed(
     sink: &mut BytesMut,
     batch_columns: &[Column],
     schema: &Schema,
     row: usize,
+) -> Result<(), ServerError> {
+    write_data_row_typed_with_options(
+        sink,
+        batch_columns,
+        schema,
+        row,
+        &TextEncodingOptions::default(),
+    )
+}
+
+/// Session-aware variant of [`write_data_row_typed`].
+pub(crate) fn write_data_row_typed_with_options(
+    sink: &mut BytesMut,
+    batch_columns: &[Column],
+    schema: &Schema,
+    row: usize,
+    options: &TextEncodingOptions,
 ) -> Result<(), ServerError> {
     if batch_columns.len() != schema.len() {
         return Err(wire_schema_column_mismatch_error());
@@ -110,7 +130,7 @@ pub(crate) fn write_data_row_typed(
     sink.put_i16(i16_from_usize(batch_columns.len()));
     for (idx, col) in batch_columns.iter().enumerate() {
         let logical_type = &schema.field_at(idx).data_type;
-        if let Err(err) = write_cell_typed(sink, col, row, logical_type) {
+        if let Err(err) = write_cell_typed(sink, col, row, logical_type, options) {
             sink.truncate(row_start);
             return Err(err);
         }
@@ -288,6 +308,7 @@ fn write_cell_typed(
     col: &Column,
     row: usize,
     logical_type: &DataType,
+    options: &TextEncodingOptions,
 ) -> Result<(), ServerError> {
     if is_null(col, row) {
         sink.put_i32(-1);
@@ -306,7 +327,7 @@ fn write_cell_typed(
                     | DataType::TimestampTz
             ) || ty.is_vector_family() =>
         {
-            let bytes = encode_text_value_typed(col, row, logical_type)
+            let bytes = encode_text_value_typed_with_options(col, row, logical_type, options)
                 .ok_or_else(wire_typed_cell_error)?;
             sink.put_i32(i32_from_usize(bytes.len()));
             sink.put_slice(&bytes);

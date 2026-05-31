@@ -308,6 +308,8 @@ pub struct SuspendedPortal {
     /// Per-result-column format codes carried over from the original
     /// Bind so the resumed Execute encodes columns identically.
     pub result_formats: Vec<i16>,
+    /// Text display settings captured from the session at first Execute.
+    pub(crate) text_options: crate::result_encoder::TextEncodingOptions,
 }
 
 impl ExtendedConnState {

@@ -145,6 +145,41 @@ async fn timetz_and_temporal_display_round_trip() {
         ]]
     );
 
+    client
+        .batch_execute("SET TimeZone TO 'America/New_York'")
+        .await
+        .expect("set session timezone");
+    let session_zone_rows = client
+        .simple_query(
+            "SELECT \
+                TIMESTAMP WITH TIME ZONE '2000-01-01 00:00:00+00', \
+                TIMESTAMP WITH TIME ZONE '2000-07-01 00:00:00+00'",
+        )
+        .await
+        .expect("select timestamptz with session timezone");
+    let session_zone_values: Vec<Vec<String>> = session_zone_rows
+        .into_iter()
+        .filter_map(|message| match message {
+            SimpleQueryMessage::Row(row) => Some(
+                (0..2)
+                    .map(|idx| row.get(idx).expect("column").to_owned())
+                    .collect(),
+            ),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        session_zone_values,
+        vec![vec![
+            "1999-12-31 19:00:00-05".to_owned(),
+            "2000-06-30 20:00:00-04".to_owned(),
+        ]]
+    );
+
+    client
+        .batch_execute("RESET TimeZone")
+        .await
+        .expect("reset session timezone");
     let named_timetz_rows = client
         .simple_query(
             "SELECT \
