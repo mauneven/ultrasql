@@ -206,6 +206,7 @@ fn ci_split_matches_release_policy() {
     assert!(ci.contains("cargo fmt --all -- --check"));
     assert!(ci.contains("cargo clippy --workspace --all-targets --all-features -- -D warnings"));
     assert!(ci.contains("python3 -m unittest discover -s tests/scripts -p 'test_*.py'"));
+    assert!(ci.contains("SCRIPT_TESTS_RESULT"));
     assert!(ci.contains("cargo test  --workspace --all-features"));
     assert!(bench.contains("benchmarks/certify.sh smoke"));
     assert!(bench.contains("benchmarks/certify.sh full"));

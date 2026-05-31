@@ -2247,3 +2247,7 @@ as a concise evidence ledger; roadmap stays for open gates only.
   target matrices instead of documenting parser-only fuzz or broad storage Miri
   commands. Evidence:
   `cargo test -p ultrasql-bench --test release_hardening ci_split_matches_release_policy -- --nocapture`.
+- The aggregate `ci-passed` job now requires the `script_tests` job, so installer
+  and release-helper hardening tests are branch-protection relevant instead of
+  advisory-only. Evidence:
+  `cargo test -p ultrasql-bench --test release_hardening ci_split_matches_release_policy -- --nocapture`.

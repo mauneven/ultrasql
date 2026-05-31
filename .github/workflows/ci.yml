@@ -203,12 +203,13 @@ jobs:
     name: ci-passed
     if: always()
     runs-on: ubuntu-latest
-    needs: [fmt, clippy, test, driver_certification, doc, deny, audit]
+    needs: [fmt, clippy, script_tests, test, driver_certification, doc, deny, audit]
     steps:
       - name: check all required jobs succeeded
         env:
           FMT_RESULT:         ${{ needs.fmt.result }}
           CLIPPY_RESULT:      ${{ needs.clippy.result }}
+          SCRIPT_TESTS_RESULT: ${{ needs.script_tests.result }}
           TEST_RESULT:        ${{ needs.test.result }}
           DRIVER_CERT_RESULT: ${{ needs.driver_certification.result }}
           DOC_RESULT:         ${{ needs.doc.result }}
@@ -217,6 +218,7 @@ jobs:
         run: |
           if [ "$FMT_RESULT"    != "success" ] \
           || [ "$CLIPPY_RESULT" != "success" ] \
+          || [ "$SCRIPT_TESTS_RESULT" != "success" ] \
           || [ "$TEST_RESULT"   != "success" ] \
           || [ "$DRIVER_CERT_RESULT" != "success" ] \
           || [ "$DOC_RESULT"    != "success" ] \
