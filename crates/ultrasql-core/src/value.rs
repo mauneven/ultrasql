@@ -1207,10 +1207,10 @@ pub fn xml_content_is_well_formed(text: &str) -> bool {
 ///
 /// Supported paths are absolute child paths such as `/root/item/name` with
 /// optional equality filters on element attributes:
-/// `/root/item[@id="42"]`. Element wildcards, terminal `@attr`/`@*`, and
-/// `text()` selections are also supported, plus `count(/supported/path)`.
-/// Unsupported path syntax returns `None`. Missing matches return
-/// `Some(Vec::new())`.
+/// `/root/item[@id="42"]`. Element wildcards, terminal `@attr`/`@*`,
+/// `text()` selections, basic explicit axes, and bounded scalar functions
+/// are also supported. Unsupported path syntax returns `None`. Missing matches
+/// return `Some(Vec::new())`.
 #[must_use]
 pub fn xml_xpath_element_fragments(path: &str, document: &str) -> Option<Vec<String>> {
     xml_xpath_element_fragments_with_namespaces(path, document, &[])
@@ -1231,6 +1231,25 @@ pub fn xml_xpath_element_fragments_with_namespaces(
     let document = document.trim();
     if !xml_document_is_well_formed(document) {
         return None;
+    }
+    if let Some(inner_path) = xml_xpath_function_argument(path, "string") {
+        let matches =
+            xml_xpath_element_fragments_with_namespaces(inner_path, document, namespace_bindings)?;
+        return Some(vec![matches.first().map_or_else(String::new, |fragment| {
+            xml_xpath_string_value(fragment)
+        })]);
+    }
+    if let Some(inner_path) = xml_xpath_function_argument(path, "boolean") {
+        let matches =
+            xml_xpath_element_fragments_with_namespaces(inner_path, document, namespace_bindings)?;
+        return Some(vec![(!matches.is_empty()).to_string()]);
+    }
+    if let Some(inner_path) = xml_xpath_function_argument(path, "name") {
+        let matches =
+            xml_xpath_element_fragments_with_namespaces(inner_path, document, namespace_bindings)?;
+        return Some(vec![matches.first().map_or_else(String::new, |fragment| {
+            xml_xpath_name_value(fragment)
+        })]);
     }
     if let Some(inner_path) = xml_xpath_count_argument(path) {
         let matches =
@@ -1329,9 +1348,15 @@ pub fn xml_xpath_element_fragments_with_namespaces(
 }
 
 fn xml_xpath_count_argument(path: &str) -> Option<&str> {
-    let inner = path
-        .trim()
-        .strip_prefix("count(")?
+    xml_xpath_function_argument(path, "count")
+}
+
+fn xml_xpath_function_argument<'a>(path: &'a str, function: &str) -> Option<&'a str> {
+    let trimmed = path.trim();
+    let inner = trimmed
+        .strip_prefix(function)?
+        .trim_start()
+        .strip_prefix('(')?
         .strip_suffix(')')?
         .trim();
     inner.starts_with('/').then_some(inner)
@@ -1681,6 +1706,64 @@ fn xml_direct_text(text: &str, element: &XmlElement) -> Option<String> {
         }
     }
     (!out.is_empty()).then_some(out)
+}
+
+fn xml_xpath_string_value(fragment: &str) -> String {
+    let trimmed = fragment.trim();
+    let Some(root) = xml_root_element(trimmed) else {
+        return fragment.to_owned();
+    };
+    let mut out = String::new();
+    xml_collect_string_value(trimmed, &root, &mut out);
+    out
+}
+
+fn xml_collect_string_value(text: &str, element: &XmlElement, out: &mut String) {
+    let mut cursor = element.content_start;
+    while cursor < element.close_start {
+        let Some(relative) = text[cursor..element.close_start].find('<') else {
+            out.push_str(&text[cursor..element.close_start]);
+            break;
+        };
+        let open = cursor + relative;
+        out.push_str(&text[cursor..open]);
+        let Some(next) = text.as_bytes().get(open + 1).copied() else {
+            break;
+        };
+        match next {
+            b'?' => {
+                let Some(end) = text[open + 2..element.close_start].find("?>") else {
+                    break;
+                };
+                cursor = open + 2 + end + 2;
+            }
+            b'!' if text[open..].starts_with("<!--") => {
+                let Some(end) = text[open + 4..element.close_start].find("-->") else {
+                    break;
+                };
+                cursor = open + 4 + end + 3;
+            }
+            b'!' if text[open..].starts_with("<![CDATA[") => {
+                let Some(end) = text[open + 9..element.close_start].find("]]>") else {
+                    break;
+                };
+                out.push_str(&text[open + 9..open + 9 + end]);
+                cursor = open + 9 + end + 3;
+            }
+            b'/' => break,
+            _ => {
+                let Some(child) = read_xml_element_at(text, open, &element.namespaces) else {
+                    break;
+                };
+                xml_collect_string_value(text, &child, out);
+                cursor = child.close_end;
+            }
+        }
+    }
+}
+
+fn xml_xpath_name_value(fragment: &str) -> String {
+    xml_root_element(fragment.trim()).map_or_else(String::new, |root| root.name)
 }
 
 fn xml_namespace_context(
@@ -3049,6 +3132,18 @@ mod tests {
         assert_eq!(
             xml_xpath_element_fragments("count(/root/item)", doc),
             Some(vec!["2".to_owned()])
+        );
+        assert_eq!(
+            xml_xpath_element_fragments("string(/root/item/name)", doc),
+            Some(vec!["A".to_owned()])
+        );
+        assert_eq!(
+            xml_xpath_element_fragments("boolean(/root/item)", doc),
+            Some(vec!["true".to_owned()])
+        );
+        assert_eq!(
+            xml_xpath_element_fragments("name(/root/item)", doc),
+            Some(vec!["item".to_owned()])
         );
         let nested = r#"<root><group><item id="1"><name>A</name></item><item id="2"><name>B</name></item></group><name>C</name></root>"#;
         assert_eq!(

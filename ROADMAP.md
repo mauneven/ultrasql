@@ -81,8 +81,8 @@ file focused on what still blocks production.
   GIN planner integration.
 - XML remaining surface: XPath axes/functions beyond the supported child,
   attribute, descendant, self-node, wildcard, text, namespace, and bounded
-  `count()` subset, plus full `XMLTABLE` beyond the completed typed
-  scalar/default projection subset.
+  `count()` / `string()` / `boolean()` / `name()` subset, plus full `XMLTABLE`
+  beyond the completed typed scalar/default projection subset.
 - Locale/collation remaining: ICU-backed collations, `CREATE COLLATION`,
   index/expression collation catalog deparse, and non-bytewise sort/search
   behavior beyond the supported built-in `default`/`C`/`POSIX` subset.
