@@ -1244,6 +1244,11 @@ pub fn xml_xpath_element_fragments_with_namespaces(
             xml_xpath_element_fragments_with_namespaces(inner_path, document, namespace_bindings)?;
         return Some(vec![(!matches.is_empty()).to_string()]);
     }
+    if let Some(inner_path) = xml_xpath_function_argument(path, "not") {
+        let matches =
+            xml_xpath_element_fragments_with_namespaces(inner_path, document, namespace_bindings)?;
+        return Some(vec![matches.is_empty().to_string()]);
+    }
     if let Some(inner_path) = xml_xpath_function_argument(path, "name") {
         let matches =
             xml_xpath_element_fragments_with_namespaces(inner_path, document, namespace_bindings)?;
@@ -3140,6 +3145,14 @@ mod tests {
         assert_eq!(
             xml_xpath_element_fragments("boolean(/root/item)", doc),
             Some(vec!["true".to_owned()])
+        );
+        assert_eq!(
+            xml_xpath_element_fragments("not(/root/missing)", doc),
+            Some(vec!["true".to_owned()])
+        );
+        assert_eq!(
+            xml_xpath_element_fragments("not(/root/item)", doc),
+            Some(vec!["false".to_owned()])
         );
         assert_eq!(
             xml_xpath_element_fragments("name(/root/item)", doc),
