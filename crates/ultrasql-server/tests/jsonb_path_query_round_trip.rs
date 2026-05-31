@@ -374,6 +374,35 @@ async fn jsonb_path_query_supports_keyvalue_method() {
 }
 
 #[tokio::test]
+async fn jsonb_path_query_supports_decimal_method() {
+    let running = start_sample_server("jsonb_path_query_test").await;
+    let client = &running.client;
+
+    let messages = client
+        .simple_query(
+            "SELECT value FROM jsonb_path_query(\
+             '{\"values\":[\"1234.5678\",\"42.5\",\"bad\"]}'::jsonb, \
+             '$.values[*].decimal(6, 2)')",
+        )
+        .await
+        .expect("jsonb_path_query decimal method");
+    let rows: Vec<String> = messages
+        .into_iter()
+        .filter_map(|message| match message {
+            SimpleQueryMessage::Row(row) => row.get(0).map(str::to_owned),
+            _ => None,
+        })
+        .collect();
+
+    assert_eq!(
+        rows,
+        vec!["1234.57".to_owned(), "42.5".to_owned(), "null".to_owned(),]
+    );
+
+    shutdown(running).await;
+}
+
+#[tokio::test]
 async fn jsonb_path_query_supports_predicate_boolean_algebra() {
     let running = start_sample_server("jsonb_path_query_test").await;
     let client = &running.client;

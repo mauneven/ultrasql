@@ -2,6 +2,9 @@
 
 use regex::RegexBuilder;
 use serde_json::{Map as JsonMap, Number as JsonNumber, Value as JsonValue};
+use ultrasql_core::{Value as SqlValue, parse_decimal_text};
+
+const JSON_PATH_DECIMAL_ARG_MAX: u32 = 1_000;
 
 /// Parsed SQL/JSON path expression.
 #[derive(Clone, Debug, PartialEq)]
@@ -39,6 +42,10 @@ enum JsonPathMethod {
     Bigint,
     Boolean,
     Ceiling,
+    Decimal {
+        precision: Option<u32>,
+        scale: Option<u32>,
+    },
     Double,
     Floor,
     Integer,
@@ -340,6 +347,9 @@ fn apply_json_path_method(method: JsonPathMethod, value: &JsonValue) -> Vec<Json
             vec![json_path_boolean(value).map_or(JsonValue::Null, JsonValue::Bool)]
         }
         JsonPathMethod::Ceiling => vec![json_path_numeric_method(value, f64::ceil)],
+        JsonPathMethod::Decimal { precision, scale } => {
+            vec![json_path_decimal(value, precision, scale)]
+        }
         JsonPathMethod::Double => vec![json_path_double(value)],
         JsonPathMethod::Floor => vec![json_path_numeric_method(value, f64::floor)],
         JsonPathMethod::Integer => vec![
@@ -375,6 +385,55 @@ fn json_path_numeric_method(value: &JsonValue, op: impl FnOnce(f64) -> f64) -> J
 
 fn json_path_double(value: &JsonValue) -> JsonValue {
     json_path_number_from_f64(json_path_f64(value))
+}
+
+fn json_path_decimal(value: &JsonValue, precision: Option<u32>, scale: Option<u32>) -> JsonValue {
+    let Some(text) = json_path_decimal_text(value) else {
+        return JsonValue::Null;
+    };
+    let target_scale = match scale {
+        Some(scale) => match i32::try_from(scale) {
+            Ok(scale) => Some(scale),
+            Err(_) => return JsonValue::Null,
+        },
+        None => None,
+    };
+    let Ok(SqlValue::Decimal {
+        value,
+        scale: actual_scale,
+    }) = parse_decimal_text(&text, target_scale)
+    else {
+        return JsonValue::Null;
+    };
+    if precision.is_some_and(|precision| !json_path_decimal_fits_precision(value, precision)) {
+        return JsonValue::Null;
+    }
+    json_path_decimal_to_json(value, actual_scale)
+}
+
+fn json_path_decimal_text(value: &JsonValue) -> Option<String> {
+    match value {
+        JsonValue::Number(number) => Some(number.to_string()),
+        JsonValue::String(text) => Some(text.trim().to_owned()),
+        JsonValue::Null | JsonValue::Bool(_) | JsonValue::Array(_) | JsonValue::Object(_) => None,
+    }
+}
+
+fn json_path_decimal_fits_precision(value: i64, precision: u32) -> bool {
+    let digits = if value == 0 {
+        1
+    } else {
+        i128::from(value).abs().to_string().len()
+    };
+    usize::try_from(precision).is_ok_and(|precision| digits <= precision)
+}
+
+fn json_path_decimal_to_json(value: i64, scale: i32) -> JsonValue {
+    let rendered = SqlValue::Decimal { value, scale }.to_string();
+    match serde_json::from_str::<JsonValue>(&rendered) {
+        Ok(value @ JsonValue::Number(_)) => value,
+        Ok(_) | Err(_) => JsonValue::Null,
+    }
 }
 
 fn json_path_boolean(value: &JsonValue) -> Option<bool> {
@@ -558,9 +617,7 @@ impl<'a> JsonPathParser<'a> {
                     } else {
                         let identifier = self.parse_identifier()?;
                         if self.consume_byte(b'(') {
-                            self.skip_ws();
-                            self.expect_byte(b')', "expected ) after jsonpath method")?;
-                            steps.push(JsonPathStep::Method(json_path_method(&identifier)?));
+                            steps.push(JsonPathStep::Method(self.parse_method_call(&identifier)?));
                         } else {
                             steps.push(JsonPathStep::Key(identifier));
                         }
@@ -795,6 +852,62 @@ impl<'a> JsonPathParser<'a> {
             None
         };
         Ok(JsonPathLiteral::Regex { pattern, flags })
+    }
+
+    fn parse_method_call(&mut self, name: &str) -> Result<JsonPathMethod, JsonPathError> {
+        self.skip_ws();
+        if name == "decimal" {
+            return self.parse_decimal_method();
+        }
+        self.expect_byte(b')', "expected ) after jsonpath method")?;
+        json_path_method(name)
+    }
+
+    fn parse_decimal_method(&mut self) -> Result<JsonPathMethod, JsonPathError> {
+        if self.consume_byte(b')') {
+            return Ok(JsonPathMethod::Decimal {
+                precision: None,
+                scale: None,
+            });
+        }
+        let precision = self.parse_decimal_method_arg("decimal precision", false)?;
+        self.skip_ws();
+        let scale = if self.consume_byte(b',') {
+            Some(self.parse_decimal_method_arg("decimal scale", true)?)
+        } else {
+            Some(0)
+        };
+        self.skip_ws();
+        self.expect_byte(b')', "expected ) after jsonpath method")?;
+        Ok(JsonPathMethod::Decimal {
+            precision: Some(precision),
+            scale,
+        })
+    }
+
+    fn parse_decimal_method_arg(
+        &mut self,
+        label: &str,
+        allow_zero: bool,
+    ) -> Result<u32, JsonPathError> {
+        self.skip_ws();
+        let start = self.pos;
+        while self.peek_byte().is_some_and(|byte| byte.is_ascii_digit()) {
+            self.pos += 1;
+        }
+        if start == self.pos {
+            return Err(self.err(format!("expected {label}")));
+        }
+        let value = self.text[start..self.pos]
+            .parse::<u32>()
+            .map_err(|err| self.err(format!("bad {label}: {err}")))?;
+        if (!allow_zero && value == 0) || value > JSON_PATH_DECIMAL_ARG_MAX {
+            return Err(self.err(format!(
+                "{label} must be between {} and {JSON_PATH_DECIMAL_ARG_MAX}",
+                u8::from(!allow_zero)
+            )));
+        }
+        Ok(value)
     }
 
     fn validate_regex_flags(&self, flags: &str) -> Result<(), JsonPathError> {
@@ -1124,6 +1237,40 @@ mod tests {
 
         let bad_bool = parse_json_path("$.bad.boolean()").unwrap();
         assert_eq!(select(&document, &bad_bool), vec![serde_json::Value::Null]);
+    }
+
+    #[test]
+    fn path_supports_decimal_method_with_precision_and_scale() {
+        let document = serde_json::json!({
+            "exact": "1234.5678",
+            "whole": "42.5",
+            "overflow": "1234.5678",
+            "bad": "maybe"
+        });
+
+        let rounded = parse_json_path("$.exact.decimal(6, 2)").unwrap();
+        assert_eq!(
+            select(&document, &rounded),
+            vec![serde_json::json!(1234.57)]
+        );
+
+        let integer_scale = parse_json_path("$.whole.decimal(3)").unwrap();
+        assert_eq!(
+            select(&document, &integer_scale),
+            vec![serde_json::json!(43)]
+        );
+
+        let preserved = parse_json_path("$.exact.decimal()").unwrap();
+        assert_eq!(
+            select(&document, &preserved),
+            vec![serde_json::json!(1234.5678)]
+        );
+
+        let overflow = parse_json_path("$.overflow.decimal(5, 2)").unwrap();
+        assert_eq!(select(&document, &overflow), vec![serde_json::Value::Null]);
+
+        let bad = parse_json_path("$.bad.decimal()").unwrap();
+        assert_eq!(select(&document, &bad), vec![serde_json::Value::Null]);
     }
 
     #[test]

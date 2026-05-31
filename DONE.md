@@ -204,6 +204,13 @@ as a concise evidence ledger; roadmap stays for open gates only.
   of silently treating them as NULL non-matches. Evidence:
   `cargo test -p ultrasql-executor hash_join` and
   `cargo test -p ultrasql-executor merge_join`.
+- SQL/JSON path now supports bounded `decimal([precision[,scale]])` method
+  parsing and evaluation with existing exact decimal rounding, precision
+  overflow mapped to JSON null, and wire-level `jsonb_path_query` coverage.
+  Evidence:
+  `cargo test -p ultrasql-executor json_path::tests::path_supports_decimal_method_with_precision_and_scale --lib -- --nocapture`
+  and
+  `cargo test -p ultrasql-server --test jsonb_path_query_round_trip jsonb_path_query_supports_decimal_method -- --nocapture`.
 - `GatherMerge` now propagates merge-key evaluation failures instead of
   silently comparing them as NULL. Evidence:
   `cargo test -p ultrasql-executor gather`.
