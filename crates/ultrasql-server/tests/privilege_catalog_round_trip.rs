@@ -915,6 +915,10 @@ async fn default_privileges_apply_to_future_objects_only() {
         .await
         .expect("create analyst role");
     client
+        .batch_execute("CREATE SCHEMA tenant")
+        .await
+        .expect("create tenant schema");
+    client
         .batch_execute(
             "ALTER DEFAULT PRIVILEGES FOR ROLE tester IN SCHEMA tenant \
              GRANT SELECT ON TABLES TO analyst",
@@ -1021,6 +1025,10 @@ async fn privilege_catalog_survives_restart() {
         .batch_execute("CREATE ROLE analyst LOGIN")
         .await
         .expect("create analyst role");
+    client
+        .batch_execute("CREATE SCHEMA tenant")
+        .await
+        .expect("create tenant schema");
     client
         .batch_execute("CREATE TABLE priv_restart (id INT, secret TEXT)")
         .await
