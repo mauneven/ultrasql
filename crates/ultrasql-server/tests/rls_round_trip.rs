@@ -111,6 +111,28 @@ async fn rls_tenant_policy_filters_reads_and_checks_inserts() {
         )
         .await
         .expect("create tenant rls policy");
+    let policy_rows = client
+        .query(
+            "SELECT polcmd, polpermissive, polqual, polwithcheck \
+             FROM pg_catalog.pg_policy \
+             WHERE polname = 'tenant_docs_isolation'",
+            &[],
+        )
+        .await
+        .expect("query pg_policy row");
+    assert_eq!(policy_rows.len(), 1);
+    assert_eq!(policy_rows[0].get::<_, String>(0), "*");
+    assert!(policy_rows[0].get::<_, bool>(1));
+    let polqual: Option<String> = policy_rows[0].get(2);
+    let polwithcheck: Option<String> = policy_rows[0].get(3);
+    assert_eq!(
+        polqual,
+        Some("tenant_id = current_setting('ultrasql.tenant_id', true)".to_owned())
+    );
+    assert_eq!(
+        polwithcheck,
+        Some("tenant_id = current_setting('ultrasql.tenant_id', true)".to_owned())
+    );
     client
         .batch_execute("ALTER TABLE tenant_docs ENABLE ROW LEVEL SECURITY")
         .await

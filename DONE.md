@@ -763,6 +763,10 @@ as a concise evidence ledger; roadmap stays for open gates only.
   role membership, persist across restart, and fail closed when no scoped policy
   applies. Evidence:
   `cargo test -p ultrasql-server --test rls_round_trip rls_policy_roles_scope_visibility_and_restart -- --nocapture`.
+- `pg_catalog.pg_policy` exposes live row-security policy metadata, including
+  command, permissiveness, role OIDs, `USING`, and `WITH CHECK` expressions.
+  Evidence:
+  `cargo test -p ultrasql-server --test rls_round_trip rls_tenant_policy_filters_reads_and_checks_inserts -- --nocapture`.
 - RLS `INSERT ... SELECT` now enforces target-table `WITH CHECK` predicates on
   every produced row through the mutation operator, skips unchecked fused insert
   paths when a row-security check exists, and rejects mixed-tenant source rows

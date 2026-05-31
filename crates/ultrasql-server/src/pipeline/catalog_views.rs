@@ -183,7 +183,7 @@ fn virtual_rows(name: &str, ctx: &LowerCtx<'_>) -> Option<(Schema, Vec<Vec<Value
         "pg_catalog.pg_index" => Some((schema_pg_index(), rows_pg_index(ctx))),
         "pg_catalog.pg_inherits" => Some((schema_pg_inherits(), Vec::new())),
         "pg_catalog.pg_constraint" => Some((schema_pg_constraint(), rows_pg_constraint(ctx))),
-        "pg_catalog.pg_policy" => Some((schema_pg_policy(), Vec::new())),
+        "pg_catalog.pg_policy" => Some((schema_pg_policy(), rows_pg_policy(ctx))),
         "pg_catalog.pg_sequence" => Some((schema_pg_sequence(), rows_pg_sequence(ctx))),
         "pg_catalog.pg_depend" => Some((schema_pg_depend(), rows_pg_depend(ctx))),
         "pg_catalog.pg_description" => Some((schema_pg_description(), rows_pg_description(ctx))),
@@ -1417,6 +1417,86 @@ fn schema_pg_policy() -> Schema {
         Field::nullable("polqual", text()),
         Field::nullable("polwithcheck", text()),
     ])
+}
+
+fn rows_pg_policy(ctx: &LowerCtx<'_>) -> Vec<Vec<Value>> {
+    let roles = ctx
+        .role_catalog
+        .list_roles()
+        .into_iter()
+        .map(|role| (role.name, i64::from(role.oid)))
+        .collect::<std::collections::HashMap<_, _>>();
+    let mut policies = ctx
+        .row_security
+        .iter()
+        .map(|item| (*item.key(), item.value().clone()))
+        .collect::<Vec<_>>();
+    policies.sort_by_key(|(oid, _)| oid.raw());
+
+    let mut rows = Vec::new();
+    for (table_oid, runtime) in policies {
+        if !ctx.catalog_snapshot.tables_by_oid.contains_key(&table_oid) {
+            continue;
+        }
+        let mut table_policies = runtime.policies.clone();
+        table_policies.sort_by(|left, right| left.name.cmp(&right.name));
+        for policy in table_policies {
+            rows.push(vec![
+                v_text(policy.name),
+                v_i64(table_oid.raw()),
+                v_text(policy_command_code(policy.command)),
+                Value::Bool(matches!(
+                    policy.permissiveness,
+                    crate::RuntimeRlsPermissiveness::Permissive
+                )),
+                Value::Array {
+                    element_type: DataType::Int64,
+                    elements: policy_role_oids(&policy.roles, &roles),
+                },
+                policy_expr_text(policy.using.as_ref()),
+                policy_expr_text(policy.with_check.as_ref()),
+            ]);
+        }
+    }
+    rows
+}
+
+fn policy_command_code(command: crate::RuntimeRlsCommand) -> &'static str {
+    match command {
+        crate::RuntimeRlsCommand::All => "*",
+        crate::RuntimeRlsCommand::Select => "r",
+        crate::RuntimeRlsCommand::Insert => "a",
+        crate::RuntimeRlsCommand::Update => "w",
+        crate::RuntimeRlsCommand::Delete => "d",
+    }
+}
+
+fn policy_role_oids(
+    policy_roles: &[String],
+    role_oids: &std::collections::HashMap<String, i64>,
+) -> Vec<Value> {
+    if policy_roles.is_empty() {
+        return vec![Value::Int64(0)];
+    }
+    policy_roles
+        .iter()
+        .map(|role| {
+            if role == "public" {
+                Value::Int64(0)
+            } else {
+                Value::Int64(role_oids.get(role).copied().unwrap_or(0))
+            }
+        })
+        .collect()
+}
+
+fn policy_expr_text(expr: Option<&crate::RuntimeTenantPolicyExpr>) -> Value {
+    expr.map_or(Value::Null, |expr| {
+        v_text(format!(
+            "{} = current_setting('{}', true)",
+            expr.column_name, expr.setting_name
+        ))
+    })
 }
 
 fn schema_pg_sequence() -> Schema {
