@@ -441,6 +441,34 @@ async fn vector_distance_operators_execute_in_sql() {
 }
 
 #[tokio::test]
+async fn vector_sum_and_avg_aggregate_over_wire() {
+    let (client, _conn, server_handle) = start_server_and_connect().await;
+
+    client
+        .batch_execute("CREATE TABLE embeddings (id INT NOT NULL, embedding VECTOR(3))")
+        .await
+        .expect("create vector table");
+    client
+        .batch_execute(
+            "INSERT INTO embeddings VALUES \
+             (1, '[1,2,3]'), \
+             (2, '[3,4,5]'), \
+             (3, NULL)",
+        )
+        .await
+        .expect("insert vector rows");
+
+    let messages = client
+        .simple_query("SELECT sum(embedding), avg(embedding) FROM embeddings")
+        .await
+        .expect("select vector aggregates");
+    let rows = simple_rows(&messages);
+    assert_eq!(rows, vec![vec!["[4,6,8]".to_owned(), "[2,3,4]".to_owned()]]);
+
+    shutdown(client, server_handle).await;
+}
+
+#[tokio::test]
 async fn pgvector_metric_functions_run_on_halfvec_and_sparsevec() {
     let (client, _conn, server_handle) = start_server_and_connect().await;
 

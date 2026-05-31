@@ -126,12 +126,15 @@ fn aggregate_return_type(func: AggregateFunc, arg_type: DataType) -> DataType {
         AggregateFunc::Sum => match arg_type {
             DataType::Int16 | DataType::Int32 | DataType::Int64 => DataType::Int64,
             DataType::Float32 | DataType::Float64 => DataType::Float64,
+            DataType::Vector { .. } | DataType::HalfVec { .. } => arg_type,
             other if other.is_numeric() => other,
             _ => DataType::Null,
         },
         AggregateFunc::Avg => {
             if arg_type.is_numeric() {
                 DataType::Float64
+            } else if matches!(arg_type, DataType::Vector { .. } | DataType::HalfVec { .. }) {
+                arg_type
             } else {
                 DataType::Null
             }

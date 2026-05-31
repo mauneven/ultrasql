@@ -131,7 +131,7 @@ file focused on what still blocks production.
   unavailable fallback, and `WAL replay fuzz/property tests`.
 - pgvector parity: larger exact top-k profiles, filtered exact search,
   SQL-level HNSW/restart correctness, IVFFlat recall/latency, vector
-  arithmetic, aggregates such as `avg(vector)`, and broader cast/function cert.
+  arithmetic beyond dense `sum`/`avg`, and broader cast/function cert.
 
 ### AI Gauntlet
 

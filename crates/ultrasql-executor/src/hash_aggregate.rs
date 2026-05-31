@@ -36,6 +36,7 @@ use ultrasql_planner::{AggregateFunc, LogicalAggregateExpr, ScalarExpr};
 use ultrasql_vec::column::{Column, NumericColumn};
 use ultrasql_vec::{Batch, count_i64, max_i64, min_i64, sum_i64};
 
+use crate::aggregate_math::{add_dense_vector_values, divide_dense_vector_values};
 use crate::eval::Eval;
 use crate::filter_op::batch_to_rows;
 use crate::row_codec::RowCodec;
@@ -2129,6 +2130,12 @@ fn add_values(a: Value, b: Value) -> Result<Value, ExecError> {
         (Value::Float64(x), Value::Float32(y)) | (Value::Float32(y), Value::Float64(x)) => {
             Ok(Value::Float64(x + f64::from(y)))
         }
+        (Value::Vector(x), Value::Vector(y)) => {
+            add_dense_vector_values(x, y, "vector").map(Value::Vector)
+        }
+        (Value::HalfVec(x), Value::HalfVec(y)) => {
+            add_dense_vector_values(x, y, "halfvec").map(Value::HalfVec)
+        }
         (a, b) => Err(ExecError::TypeMismatch(format!(
             "sum type mismatch: {a:?} and {b:?}"
         ))),
@@ -2143,6 +2150,8 @@ fn divide_value(sum: Value, count: i64) -> Value {
         Value::Decimal { value, scale } => {
             Value::Float64(decimal_to_f64(value, scale) / count as f64)
         }
+        Value::Vector(values) => Value::Vector(divide_dense_vector_values(values, count)),
+        Value::HalfVec(values) => Value::HalfVec(divide_dense_vector_values(values, count)),
         other => other,
     }
 }
@@ -3283,6 +3292,75 @@ mod tests {
             }
             other => panic!("expected Float64 results, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn scalar_avg_vector_skips_nulls_and_returns_dense_vector() {
+        let vector_type = DataType::Vector { dims: Some(3) };
+        let schema =
+            Schema::new([Field::nullable("embedding", vector_type.clone())]).expect("schema ok");
+        let mut valid = Bitmap::new(3, true);
+        valid.set(2, false);
+        let batch = Batch::new([Column::Utf8(
+            StringColumn::with_nulls(
+                vec![
+                    "[1,2,3]".to_owned(),
+                    "[3,4,5]".to_owned(),
+                    "[99,99,99]".to_owned(),
+                ],
+                valid,
+            )
+            .expect("string column ok"),
+        )])
+        .expect("batch ok");
+        let out_schema = Schema::new([Field::nullable("avg_embedding", vector_type.clone())])
+            .expect("schema ok");
+        let avg_embedding = LogicalAggregateExpr {
+            func: AggregateFunc::Avg,
+            arg: Some(col("embedding", 0, vector_type.clone())),
+            direct_arg: None,
+            order_by: None,
+            distinct: false,
+            output_name: "avg_embedding".into(),
+            data_type: vector_type,
+        };
+
+        let scan = MemTableScan::new(schema, vec![batch]);
+        let mut op = HashAggregate::new(Box::new(scan), vec![], vec![avg_embedding], out_schema);
+        let rows = drain_all(&mut op);
+
+        assert_eq!(rows, vec![vec![Value::Vector(vec![2.0, 3.0, 4.0])]]);
+    }
+
+    #[test]
+    fn scalar_avg_vector_dimension_mismatch_errors() {
+        let vector_type = DataType::Vector { dims: None };
+        let schema =
+            Schema::new([Field::nullable("embedding", vector_type.clone())]).expect("schema ok");
+        let batch = Batch::new([Column::Utf8(StringColumn::from_data(
+            ["[1,2]", "[1,2,3]"].map(str::to_owned),
+        ))])
+        .expect("batch ok");
+        let out_schema = Schema::new([Field::nullable("avg_embedding", vector_type.clone())])
+            .expect("schema ok");
+        let avg_embedding = LogicalAggregateExpr {
+            func: AggregateFunc::Avg,
+            arg: Some(col("embedding", 0, vector_type.clone())),
+            direct_arg: None,
+            order_by: None,
+            distinct: false,
+            output_name: "avg_embedding".into(),
+            data_type: vector_type,
+        };
+
+        let scan = MemTableScan::new(schema, vec![batch]);
+        let mut op = HashAggregate::new(Box::new(scan), vec![], vec![avg_embedding], out_schema);
+        let err = op.next_batch().expect_err("dimension mismatch must fail");
+
+        assert!(
+            err.to_string().contains("dimension mismatch"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]

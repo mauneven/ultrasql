@@ -2479,6 +2479,37 @@ fn binds_count_star() {
 }
 
 #[test]
+fn binds_vector_sum_and_avg_with_vector_return_type() {
+    let cat = embeddings_catalog();
+    let plan = parse_and_bind(
+        "SELECT sum(embedding), avg(embedding) FROM embeddings",
+        &cat,
+    )
+    .expect("bind ok");
+
+    fn find_agg(plan: &LogicalPlan) -> Option<&LogicalPlan> {
+        match plan {
+            LogicalPlan::Aggregate { .. } => Some(plan),
+            LogicalPlan::Project { input, .. }
+            | LogicalPlan::Filter { input, .. }
+            | LogicalPlan::Sort { input, .. }
+            | LogicalPlan::Limit { input, .. } => find_agg(input),
+            _ => None,
+        }
+    }
+
+    let agg = find_agg(&plan).expect("should contain Aggregate node");
+    let LogicalPlan::Aggregate { aggregates, .. } = agg else {
+        panic!("expected Aggregate");
+    };
+    assert_eq!(aggregates.len(), 2);
+    assert_eq!(aggregates[0].func, AggregateFunc::Sum);
+    assert_eq!(aggregates[1].func, AggregateFunc::Avg);
+    assert_eq!(aggregates[0].data_type, DataType::Vector { dims: Some(3) });
+    assert_eq!(aggregates[1].data_type, DataType::Vector { dims: Some(3) });
+}
+
+#[test]
 fn binds_having_filters_post_aggregate() {
     let cat = users_catalog();
     let plan = parse_and_bind(

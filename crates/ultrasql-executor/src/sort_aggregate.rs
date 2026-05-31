@@ -31,6 +31,7 @@ use ultrasql_core::{DataType, Schema, Value};
 use ultrasql_planner::{AggregateFunc, LogicalAggregateExpr, ScalarExpr};
 use ultrasql_vec::Batch;
 
+use crate::aggregate_math::{add_dense_vector_values, divide_dense_vector_values};
 use crate::eval::Eval;
 use crate::filter_op::batch_to_rows;
 use crate::seq_scan::build_batch;
@@ -551,6 +552,12 @@ fn add_values(a: Value, b: Value) -> Result<Value, ExecError> {
         (Value::Int64(x), Value::Int64(y)) => Ok(Value::Int64(x.wrapping_add(y))),
         (Value::Float32(x), Value::Float32(y)) => Ok(Value::Float64(f64::from(x) + f64::from(y))),
         (Value::Float64(x), Value::Float64(y)) => Ok(Value::Float64(x + y)),
+        (Value::Vector(x), Value::Vector(y)) => {
+            add_dense_vector_values(x, y, "vector").map(Value::Vector)
+        }
+        (Value::HalfVec(x), Value::HalfVec(y)) => {
+            add_dense_vector_values(x, y, "halfvec").map(Value::HalfVec)
+        }
         (a, b) => Err(ExecError::TypeMismatch(format!(
             "sum type mismatch: {a:?} and {b:?}"
         ))),
@@ -564,6 +571,8 @@ fn divide_value(sum: Value, count: i64) -> Value {
         Value::Decimal { value, scale } => {
             Value::Float64(decimal_to_f64(value, scale) / count as f64)
         }
+        Value::Vector(values) => Value::Vector(divide_dense_vector_values(values, count)),
+        Value::HalfVec(values) => Value::HalfVec(divide_dense_vector_values(values, count)),
         other => other,
     }
 }
@@ -1274,6 +1283,52 @@ mod tests {
             }
         );
         assert_eq!(rows[0][9], Value::Jsonb(r#"["a","b"]"#.to_owned()));
+    }
+
+    #[test]
+    fn sort_agg_avg_vector_skips_nulls_and_returns_dense_vector() {
+        let vector_type = DataType::Vector { dims: Some(3) };
+        let input_schema = Schema::new([
+            Field::required("group", DataType::Int32),
+            Field::nullable("embedding", vector_type.clone()),
+        ])
+        .expect("schema");
+        let mut valid = ultrasql_vec::bitmap::Bitmap::new(3, true);
+        valid.set(2, false);
+        let batch = Batch::new([
+            Column::Int32(NumericColumn::from_data(vec![1, 1, 1])),
+            Column::Utf8(
+                StringColumn::with_nulls(
+                    vec![
+                        "[1,2,3]".to_owned(),
+                        "[3,4,5]".to_owned(),
+                        "[99,99,99]".to_owned(),
+                    ],
+                    valid,
+                )
+                .expect("string column ok"),
+            ),
+        ])
+        .expect("batch");
+        let scan = MemTableScan::new(input_schema, vec![batch]);
+        let out_schema = Schema::new([
+            Field::required("group", DataType::Int32),
+            Field::nullable("avg_embedding", vector_type.clone()),
+        ])
+        .expect("schema");
+        let aggs = vec![agg(
+            AggregateFunc::Avg,
+            Some(col("embedding", 1, vector_type.clone())),
+            "avg_embedding",
+            vector_type,
+        )];
+        let mut op = SortAggregate::new(Box::new(scan), vec![col_group()], aggs, out_schema);
+        let rows = drain_all(&mut op);
+
+        assert_eq!(
+            rows,
+            vec![vec![Value::Int32(1), Value::Vector(vec![2.0, 3.0, 4.0])]]
+        );
     }
 
     #[test]

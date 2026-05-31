@@ -1430,6 +1430,15 @@ as a concise evidence ledger; roadmap stays for open gates only.
   are measured with matching answer checksums. The ClickHouse artifact
   `benchmarks/results/latest/raw/vector_topk_exact_10k_8d_k10-clickhouse_vector.json`
   records `status=not_available` with `reason=clickhouse_not_found`.
+- Dense vector `sum(vector)` and `avg(vector)` now bind with vector return
+  types, execute through both hash and sort aggregate paths, skip NULL inputs,
+  return explicit dimension-mismatch errors, and round-trip over the SQL wire.
+  Evidence:
+  `cargo test -p ultrasql-executor scalar_avg_vector --lib -- --nocapture`,
+  `cargo test -p ultrasql-executor sort_agg_avg_vector_skips_nulls_and_returns_dense_vector --lib -- --nocapture`,
+  `cargo test -p ultrasql-planner binds_vector_sum_and_avg_with_vector_return_type --lib -- --nocapture`,
+  and
+  `cargo test -p ultrasql-server --test vector_type_round_trip vector_sum_and_avg_aggregate_over_wire -- --nocapture`.
 - Page-backed HNSW and IVFFlat SQL paths exist, survive restart, and have
   crash/corrupt/torn-WAL, rebuild, EXPLAIN, insert/update/delete/VACUUM, and WAL
   payload fuzz/property tests.

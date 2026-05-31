@@ -65,6 +65,7 @@
     clippy::cast_possible_wrap
 )]
 
+mod aggregate_math;
 pub mod bitmap_heap_scan;
 pub mod cte_scan;
 pub mod direct_scalar_agg;
