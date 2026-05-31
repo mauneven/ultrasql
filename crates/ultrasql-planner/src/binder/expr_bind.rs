@@ -1594,8 +1594,11 @@ fn builtin_return_type(func_name: &str, args: &[ScalarExpr]) -> Result<DataType,
         | "shobj_description"
         | "col_description"
         | "pg_get_serial_sequence" => Ok(DataType::Text { max_len: None }),
-        "array_length" => Ok(DataType::Int32),
+        "array_length" | "array_ndims" | "array_lower" | "array_upper" | "cardinality" => {
+            Ok(DataType::Int32)
+        }
         "array_position" => Ok(DataType::Int32),
+        "array_dims" => Ok(DataType::Text { max_len: None }),
         "array_to_string" => Ok(DataType::Text { max_len: None }),
         "string_to_array" | "array_cat" => {
             Ok(DataType::Array(Box::new(DataType::Text { max_len: None })))
@@ -1771,6 +1774,11 @@ pub(super) fn is_supported_builtin(func_name: &str) -> bool {
             | "current_schemas"
             | "pg_size_pretty"
             | "array_length"
+            | "array_ndims"
+            | "array_lower"
+            | "array_upper"
+            | "array_dims"
+            | "cardinality"
             | "array_position"
             | "array_to_string"
             | "string_to_array"

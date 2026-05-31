@@ -386,6 +386,11 @@ fn eval_function_call(
         "pg_get_serial_sequence" => eval_pg_get_serial_sequence(args),
         "pg_size_pretty" => eval_pg_size_pretty(args),
         "array_length" => eval_array_length(args),
+        "array_ndims" => eval_array_ndims(args),
+        "array_lower" => eval_array_bound(args, ArrayBound::Lower),
+        "array_upper" => eval_array_bound(args, ArrayBound::Upper),
+        "array_dims" => eval_array_dims(args),
+        "cardinality" => eval_array_cardinality(args),
         "array_position" => eval_array_position(args),
         "array_to_string" => eval_array_to_string(args),
         "string_to_array" => eval_string_to_array(args),
@@ -1141,6 +1146,133 @@ fn eval_array_length(args: &[Value]) -> Result<Value, EvalError> {
     let len =
         i32::try_from(*len).map_err(|_| EvalError::Type("array_length overflow".to_owned()))?;
     Ok(Value::Int32(len))
+}
+
+fn eval_array_ndims(args: &[Value]) -> Result<Value, EvalError> {
+    if args.len() != 1 {
+        return Err(EvalError::Type(format!(
+            "array_ndims: expected 1 arg, got {}",
+            args.len()
+        )));
+    }
+    let Some(dimensions) = array_dimensions_for_function("array_ndims", &args[0])? else {
+        return Ok(Value::Null);
+    };
+    let ndims = i32::try_from(dimensions.len())
+        .map_err(|_| EvalError::Type("array_ndims overflow".into()))?;
+    Ok(Value::Int32(ndims))
+}
+
+#[derive(Debug, Clone, Copy)]
+enum ArrayBound {
+    Lower,
+    Upper,
+}
+
+fn eval_array_bound(args: &[Value], bound: ArrayBound) -> Result<Value, EvalError> {
+    let function_name = match bound {
+        ArrayBound::Lower => "array_lower",
+        ArrayBound::Upper => "array_upper",
+    };
+    if args.len() != 2 {
+        return Err(EvalError::Type(format!(
+            "{function_name}: expected 2 args, got {}",
+            args.len()
+        )));
+    }
+    let Some(dimensions) = array_dimensions_for_function(function_name, &args[0])? else {
+        return Ok(Value::Null);
+    };
+    let Some(dim) = args[1].as_i64() else {
+        return if matches!(args[1], Value::Null) {
+            Ok(Value::Null)
+        } else {
+            Err(EvalError::Type(format!(
+                "{function_name}: integer dimension required, got {:?}",
+                args[1].data_type()
+            )))
+        };
+    };
+    if dim < 1 {
+        return Ok(Value::Null);
+    }
+    let dimension_idx =
+        usize::try_from(dim - 1).map_err(|_| EvalError::Type("array dimension overflow".into()))?;
+    let Some(len) = dimensions.get(dimension_idx) else {
+        return Ok(Value::Null);
+    };
+    if *len == 0 {
+        return Ok(Value::Null);
+    }
+    let value = match bound {
+        ArrayBound::Lower => 1,
+        ArrayBound::Upper => {
+            i32::try_from(*len).map_err(|_| EvalError::Type("array_upper overflow".to_owned()))?
+        }
+    };
+    Ok(Value::Int32(value))
+}
+
+fn eval_array_dims(args: &[Value]) -> Result<Value, EvalError> {
+    if args.len() != 1 {
+        return Err(EvalError::Type(format!(
+            "array_dims: expected 1 arg, got {}",
+            args.len()
+        )));
+    }
+    let Some(dimensions) = array_dimensions_for_function("array_dims", &args[0])? else {
+        return Ok(Value::Null);
+    };
+    if dimensions.contains(&0) {
+        return Ok(Value::Null);
+    }
+    let mut output = String::new();
+    for len in dimensions {
+        output.push_str("[1:");
+        output.push_str(&len.to_string());
+        output.push(']');
+    }
+    Ok(Value::Text(output))
+}
+
+fn eval_array_cardinality(args: &[Value]) -> Result<Value, EvalError> {
+    if args.len() != 1 {
+        return Err(EvalError::Type(format!(
+            "cardinality: expected 1 arg, got {}",
+            args.len()
+        )));
+    }
+    let Some(dimensions) = array_dimensions_for_function("cardinality", &args[0])? else {
+        return Ok(Value::Null);
+    };
+    let mut total = 1usize;
+    for len in dimensions {
+        total = total
+            .checked_mul(len)
+            .ok_or_else(|| EvalError::Type("cardinality overflow".to_owned()))?;
+    }
+    let total =
+        i32::try_from(total).map_err(|_| EvalError::Type("cardinality overflow".to_owned()))?;
+    Ok(Value::Int32(total))
+}
+
+fn array_dimensions_for_function(
+    function_name: &str,
+    value: &Value,
+) -> Result<Option<Vec<usize>>, EvalError> {
+    if matches!(value, Value::Null) {
+        return Ok(None);
+    }
+    let Value::Array { .. } = value else {
+        return Err(EvalError::Type(format!(
+            "{function_name}: array argument required, got {:?}",
+            value.data_type()
+        )));
+    };
+    value
+        .array_dimensions()
+        .map(Some)
+        .ok_or_else(|| EvalError::Type(format!("{function_name}: ragged array value")))
 }
 
 fn eval_array_subscript(args: &[Value]) -> Result<Value, EvalError> {
@@ -7381,6 +7513,40 @@ mod tests {
                 element_type: DataType::Text { max_len: None },
                 elements: vec![Value::Text("green".into())]
             }
+        );
+
+        let matrix = Value::Array {
+            element_type: DataType::Array(Box::new(DataType::Int32)),
+            elements: vec![
+                Value::Array {
+                    element_type: DataType::Int32,
+                    elements: vec![Value::Int32(1), Value::Int32(2)],
+                },
+                Value::Array {
+                    element_type: DataType::Int32,
+                    elements: vec![Value::Int32(3), Value::Int32(4)],
+                },
+            ],
+        };
+        assert_eq!(
+            eval_fn("cardinality", vec![matrix.clone()]),
+            Value::Int32(4)
+        );
+        assert_eq!(
+            eval_fn("array_ndims", vec![matrix.clone()]),
+            Value::Int32(2)
+        );
+        assert_eq!(
+            eval_fn("array_lower", vec![matrix.clone(), Value::Int32(1)]),
+            Value::Int32(1)
+        );
+        assert_eq!(
+            eval_fn("array_upper", vec![matrix.clone(), Value::Int32(2)]),
+            Value::Int32(2)
+        );
+        assert_eq!(
+            eval_fn("array_dims", vec![matrix]),
+            Value::Text("[1:2][1:2]".into())
         );
     }
 

@@ -1527,6 +1527,28 @@ fn binds_array_append_prepend_remove_return_array_type() {
 }
 
 #[test]
+fn binds_array_metadata_functions_return_scalar_types() {
+    let cat = InMemoryCatalog::new();
+    let plan = parse_and_bind(
+        "SELECT cardinality([[1, 2], [3, 4]]), \
+                array_ndims([[1, 2], [3, 4]]), \
+                array_lower([[1, 2], [3, 4]], 1), \
+                array_upper([[1, 2], [3, 4]], 2), \
+                array_dims([[1, 2], [3, 4]])",
+        &cat,
+    )
+    .expect("bind ok");
+    let schema = plan.schema();
+    for idx in 0..4 {
+        assert_eq!(schema.field_at(idx).data_type, DataType::Int32);
+    }
+    assert_eq!(
+        schema.field_at(4).data_type,
+        DataType::Text { max_len: None }
+    );
+}
+
+#[test]
 fn rejects_ragged_multidimensional_array_literal() {
     let cat = InMemoryCatalog::new();
     let err = parse_and_bind("SELECT [[1, 2], [3]]", &cat).unwrap_err();

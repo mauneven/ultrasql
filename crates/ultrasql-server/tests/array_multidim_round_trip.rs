@@ -126,6 +126,31 @@ async fn multidimensional_arrays_store_dimensions_and_wire_oid() {
         ]]
     );
 
+    let metadata = simple_rows(
+        client
+            .simple_query(
+                "SELECT \
+                    cardinality(matrix), \
+                    array_ndims(matrix), \
+                    array_lower(matrix, 1), \
+                    array_upper(matrix, 2), \
+                    array_dims(matrix) \
+                 FROM array_probe WHERE id = 1",
+            )
+            .await
+            .expect("array metadata functions"),
+    );
+    assert_eq!(
+        metadata,
+        vec![vec![
+            Some("4".to_owned()),
+            Some("2".to_owned()),
+            Some("1".to_owned()),
+            Some("2".to_owned()),
+            Some("[1:2][1:2]".to_owned()),
+        ]]
+    );
+
     let stmt = client
         .prepare("SELECT matrix FROM array_probe WHERE id = 1")
         .await
