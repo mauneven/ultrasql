@@ -955,7 +955,7 @@ as a concise evidence ledger; roadmap stays for open gates only.
   per-role live-session accounting that releases slots on disconnect.
   Catalogued `CREATEROLE` roles cannot grant `SUPERUSER`, `REPLICATION`, or
   `BYPASSRLS`; those privilege-bearing role attributes require superuser, and
-  altering existing superuser roles also requires superuser. Privileged role
+  altering existing privileged roles also requires superuser. Privileged role
   memberships, `SET ROLE` into privileged roles, and default-privilege
   administration for privileged owner roles require superuser.
 - `GRANT / REVOKE` on tables, schemas, databases, sequences, and functions work

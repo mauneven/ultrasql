@@ -369,10 +369,10 @@ where
             .state
             .role_catalog
             .lookup_role(role_name)
-            .is_some_and(|role| role.is_superuser)
+            .is_some_and(|role| role_is_privileged_membership_target(&role))
         {
             return Err(ServerError::InsufficientPrivilege(
-                "altering superuser roles requires SUPERUSER".to_owned(),
+                "altering privileged roles requires SUPERUSER".to_owned(),
             ));
         }
         Ok(())
