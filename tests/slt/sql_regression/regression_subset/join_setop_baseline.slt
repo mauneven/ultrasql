@@ -75,23 +75,26 @@ query I rowsort
 SELECT id FROM slt_pg_join_parent WHERE id <= 2
 UNION
 SELECT pid FROM slt_pg_join_child WHERE pid >= 2
+ORDER BY id
 ----
 1
 2
 4
 
-query I rowsort
+query I nosort
 SELECT id FROM slt_pg_join_parent
 INTERSECT
 SELECT pid FROM slt_pg_join_child
+ORDER BY id
 ----
 1
 2
 
-query I rowsort
+query I nosort
 SELECT id FROM slt_pg_join_parent
 EXCEPT
 SELECT pid FROM slt_pg_join_child
+ORDER BY id
 ----
 3
 

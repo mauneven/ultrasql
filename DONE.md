@@ -1492,11 +1492,12 @@ as a concise evidence ledger; roadmap stays for open gates only.
   `cargo test -p ultrasql-sqllogictest-runner sql_regression_subset_runs_all_active_shards_in_process --test in_process -- --nocapture`.
 - Join/set-operation regression baseline covers deterministic inner join, left
   join with aggregate over null-extended rows, correlated `EXISTS`, `UNION`,
-  `INTERSECT`, `EXCEPT`, and scalar wrappers around aggregates such as
-  `COALESCE(SUM(...), 0)`. This also fixed hash and sort aggregate `SUM`
-  seed widening so single-row `SUM(int4)` emits the planned `Int64` result type
-  instead of leaking `Int32`, plus the grouped hash-aggregate vectorized path so
-  all-null `SUM` groups survive as `NULL` instead of being dropped. Evidence:
+  `INTERSECT`, `EXCEPT`, set-operation `ORDER BY` over output columns, and
+  scalar wrappers around aggregates such as `COALESCE(SUM(...), 0)`. This also
+  fixed hash and sort aggregate `SUM` seed widening so single-row `SUM(int4)`
+  emits the planned `Int64` result type instead of leaking `Int32`, plus the
+  grouped hash-aggregate vectorized path so all-null `SUM` groups survive as
+  `NULL` instead of being dropped. Evidence:
   `cargo run -p ultrasql-sqllogictest-runner -- --mode in-process tests/slt/sql_regression/regression_subset/join_setop_baseline.slt`.
 - Transaction isolation baseline covers `acid.sql`, Hermitage G1a/PMP/G2, and
   manager-level Hermitage matrix.

@@ -2708,6 +2708,23 @@ fn binds_union_all_arity_match() {
 }
 
 #[test]
+fn binds_set_operation_order_by_output_column() {
+    let cat = users_catalog();
+    let plan = parse_and_bind(
+        "SELECT id FROM users UNION SELECT id FROM users ORDER BY id",
+        &cat,
+    )
+    .expect("bind ok");
+
+    let LogicalPlan::Sort { input, keys } = &plan else {
+        panic!("expected Sort above set operation, got {plan:?}");
+    };
+    assert_eq!(keys.len(), 1);
+    assert!(matches!(keys[0].expr, ScalarExpr::Column { index: 0, .. }));
+    assert!(matches!(input.as_ref(), LogicalPlan::SetOp { .. }));
+}
+
+#[test]
 fn binds_union_distinct_with_arity_mismatch_is_rejected() {
     let cat = users_catalog();
     // id (1 col) UNION id, name (2 cols) should fail.

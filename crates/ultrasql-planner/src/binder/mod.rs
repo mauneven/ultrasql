@@ -429,12 +429,15 @@ pub(super) fn bind_select(
         cte_plans.push((cte_name, cte.recursive, cte_plan));
     }
 
-    let mut plan = bind_select_body(select, catalog, &cte_catalog, scope)?;
-
-    for tail in &select.set_ops {
-        let right_plan = bind_select_with_ctes(&tail.right, catalog, &cte_catalog, scope)?;
-        plan = bind_set_op(plan, tail.op, tail.quantifier, right_plan)?;
-    }
+    let body_select;
+    let body_select_ref = if select.set_ops.is_empty() {
+        select
+    } else {
+        body_select = select_without_set_tail_modifiers(select);
+        &body_select
+    };
+    let mut plan = bind_select_body(body_select_ref, catalog, &cte_catalog, scope)?;
+    plan = bind_set_ops_and_modifiers(plan, select, catalog, &cte_catalog, scope)?;
 
     for (cte_name, recursive, def_plan) in cte_plans.into_iter().rev() {
         let body_schema = plan.schema().clone();
@@ -586,12 +589,15 @@ pub(super) fn bind_select_with_ctes(
         nested_cte_plans.push((cte_name, cte.recursive, cte_plan));
     }
 
-    let mut plan = bind_select_body(select, catalog, &nested_cte_catalog, scope)?;
-
-    for tail in &select.set_ops {
-        let right_plan = bind_select_with_ctes(&tail.right, catalog, &nested_cte_catalog, scope)?;
-        plan = bind_set_op(plan, tail.op, tail.quantifier, right_plan)?;
-    }
+    let body_select;
+    let body_select_ref = if select.set_ops.is_empty() {
+        select
+    } else {
+        body_select = select_without_set_tail_modifiers(select);
+        &body_select
+    };
+    let mut plan = bind_select_body(body_select_ref, catalog, &nested_cte_catalog, scope)?;
+    plan = bind_set_ops_and_modifiers(plan, select, catalog, &nested_cte_catalog, scope)?;
 
     for (cte_name, recursive, def_plan) in nested_cte_plans.into_iter().rev() {
         let body_schema = plan.schema().clone();
@@ -604,6 +610,90 @@ pub(super) fn bind_select_with_ctes(
         };
     }
 
+    Ok(plan)
+}
+
+fn select_without_set_tail_modifiers(select: &SelectStmt) -> SelectStmt {
+    let mut stripped = select.clone();
+    stripped.order_by.clear();
+    stripped.limit = None;
+    stripped.offset = None;
+    stripped
+}
+
+fn bind_set_ops_and_modifiers(
+    mut plan: LogicalPlan,
+    select: &SelectStmt,
+    catalog: &dyn Catalog,
+    cte_catalog: &[(String, Schema)],
+    scope: &mut ScopeStack,
+) -> Result<LogicalPlan, PlanError> {
+    if select.set_ops.is_empty() {
+        return Ok(plan);
+    }
+
+    let mut final_tail_order_by = Vec::new();
+    let mut final_tail_limit = None;
+    let mut final_tail_offset = None;
+    let tail_count = select.set_ops.len();
+    for (idx, tail) in select.set_ops.iter().enumerate() {
+        let mut right_select = (*tail.right).clone();
+        if idx + 1 == tail_count {
+            final_tail_order_by = std::mem::take(&mut right_select.order_by);
+            final_tail_limit = right_select.limit.take();
+            final_tail_offset = right_select.offset.take();
+        }
+        let right_plan = bind_select_with_ctes(&right_select, catalog, cte_catalog, scope)?;
+        plan = bind_set_op(plan, tail.op, tail.quantifier, right_plan)?;
+    }
+
+    let order_by = if select.order_by.is_empty() {
+        &final_tail_order_by
+    } else {
+        &select.order_by
+    };
+    let limit = select.limit.as_ref().or(final_tail_limit.as_ref());
+    let offset = select.offset.as_ref().or(final_tail_offset.as_ref());
+    bind_set_result_modifiers(plan, order_by, limit, offset, catalog, cte_catalog, scope)
+}
+
+fn bind_set_result_modifiers(
+    mut plan: LogicalPlan,
+    order_by: &[ultrasql_parser::ast::OrderItem],
+    limit: Option<&AstExpr>,
+    offset: Option<&AstExpr>,
+    catalog: &dyn Catalog,
+    cte_catalog: &[(String, Schema)],
+    scope: &mut ScopeStack,
+) -> Result<LogicalPlan, PlanError> {
+    if !order_by.is_empty() {
+        let keys = bind_order_by(order_by, plan.schema(), catalog, cte_catalog, scope)?;
+        plan = LogicalPlan::Sort {
+            input: Box::new(plan),
+            keys,
+        };
+    }
+
+    let limit_val = limit
+        .map(|expr| bind_unsigned_literal(expr, "LIMIT"))
+        .transpose()?;
+    let offset_val = offset
+        .map(|expr| bind_unsigned_literal(expr, "OFFSET"))
+        .transpose()?
+        .unwrap_or(0);
+    if let Some(n) = limit_val {
+        plan = LogicalPlan::Limit {
+            input: Box::new(plan),
+            n,
+            offset: offset_val,
+        };
+    } else if offset_val != 0 {
+        plan = LogicalPlan::Limit {
+            input: Box::new(plan),
+            n: u64::MAX,
+            offset: offset_val,
+        };
+    }
     Ok(plan)
 }
 
