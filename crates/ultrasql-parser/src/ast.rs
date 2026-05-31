@@ -1666,6 +1666,19 @@ pub enum TableRef {
         /// Source span.
         span: Span,
     },
+    /// SQL/XML `XMLTABLE(...)` table function.
+    XmlTable {
+        /// Input XML expression.
+        context: Expr,
+        /// Row-pattern XPath expression.
+        row_path: String,
+        /// Declared output columns.
+        columns: Vec<XmlTableColumn>,
+        /// Optional alias for the produced relation.
+        alias: Option<Identifier>,
+        /// Source span.
+        span: Span,
+    },
 }
 
 /// One column declared inside a `JSON_TABLE ... COLUMNS (...)` clause.
@@ -1696,6 +1709,31 @@ pub enum JsonTableColumnKind {
         /// Declared SQL output type, normally boolean.
         data_type: TypeName,
         /// Optional column path. Defaults to `$.name`.
+        path: Option<String>,
+    },
+}
+
+/// One column declared inside an `XMLTABLE ... COLUMNS (...)` clause.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct XmlTableColumn {
+    /// Output column name.
+    pub name: Identifier,
+    /// Column behavior.
+    pub kind: XmlTableColumnKind,
+    /// Source span.
+    pub span: Span,
+}
+
+/// Supported `XMLTABLE` column forms.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum XmlTableColumnKind {
+    /// `name FOR ORDINALITY`.
+    Ordinality,
+    /// `name type [PATH path_expression]`.
+    Value {
+        /// Declared SQL output type.
+        data_type: TypeName,
+        /// Optional XPath expression. Defaults to the column name.
         path: Option<String>,
     },
 }

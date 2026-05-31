@@ -761,6 +761,45 @@ async fn json_table_projects_declared_columns_from_jsonb_literal() {
 }
 
 #[tokio::test]
+async fn xmltable_projects_declared_columns_from_xml_literal() {
+    let (client, _conn, server_handle) = start_server_and_connect().await;
+
+    let rows = client
+        .query(
+            "SELECT ord, id, name \
+             FROM XMLTABLE(\
+                 '/root/item' PASSING XML '<root><item id=\"2\"><name>Grace</name></item><item id=\"1\"><name>Ada</name></item></root>' \
+                 COLUMNS (\
+                     ord FOR ORDINALITY, \
+                     id bigint PATH '@id', \
+                     name text PATH 'name/text()'\
+                 )\
+             ) xt \
+             ORDER BY id",
+            &[],
+        )
+        .await
+        .expect("XMLTABLE over xml literal");
+
+    let values: Vec<(i64, i64, String)> = rows
+        .iter()
+        .map(|row| {
+            (
+                row.get::<_, i64>(0),
+                row.get::<_, i64>(1),
+                row.get::<_, String>(2),
+            )
+        })
+        .collect();
+    assert_eq!(
+        values,
+        vec![(2, 1, "Ada".to_string()), (1, 2, "Grace".to_string())]
+    );
+
+    shutdown(client, server_handle).await;
+}
+
+#[tokio::test]
 async fn read_csv_single_file_exposes_header_columns_and_rows() {
     let dir = tempfile::tempdir().expect("tempdir");
     let csv_path = dir.path().join("people.csv");

@@ -803,10 +803,16 @@ as a concise evidence ledger; roadmap stays for open gates only.
   (`xml_is_well_formed`, `xml_is_well_formed_content`,
   `xml_is_well_formed_document`) plus a deterministic `xpath` /
   `xpath_exists` subset for absolute element paths with optional attribute
-  equality filters, terminal `@attr` selection, terminal `text()` selection,
-  namespace URI mapping arrays, and the descendant `//` abbreviation. DTD
-  declarations, external entity expansion, unknown entity references, and
-  pre-root junk are rejected.
+  equality filters, element wildcards, terminal `@attr` / `@*` selection,
+  terminal `text()` selection, namespace URI mapping arrays, and the descendant
+  `//` abbreviation. DTD declarations, external entity expansion, unknown entity
+  references, and pre-root junk are rejected.
+- `XMLTABLE` now has a first secure table-function subset: constant XML input,
+  element row XPath, scalar column `PATH`, and `FOR ORDINALITY`, lowered through
+  the same local XML validator and XPath engine as `xpath`. Evidence:
+  `cargo test -p ultrasql-parser select_xmltable_in_from_parses_columns_clause --lib -- --nocapture`;
+  `cargo test -p ultrasql-planner bind_from_covers_table_ref_families_and_join_scope_shapes --lib -- --nocapture`;
+  `cargo test -p ultrasql-server --test function_scan_round_trip xmltable_projects_declared_columns_from_xml_literal -- --nocapture`.
 - XML syntax now covers `XMLPARSE(DOCUMENT|CONTENT ...)` and
   `XMLSERIALIZE(DOCUMENT|CONTENT ... AS TEXT)`, with malformed `DOCUMENT`
   inputs rejected through the wire path. Evidence:

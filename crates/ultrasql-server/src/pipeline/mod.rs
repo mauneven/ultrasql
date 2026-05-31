@@ -128,6 +128,7 @@ mod tpch_q6;
 mod tpch_q7;
 mod tpch_q8;
 mod tpch_q9;
+mod xml_table_scan;
 
 #[cfg(test)]
 mod tests;

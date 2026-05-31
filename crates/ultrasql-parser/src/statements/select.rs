@@ -24,6 +24,7 @@ use crate::ast::{
     Cte, Distinct, Expr, Identifier, JoinCondition, JoinOp, JsonTableColumn, JsonTableColumnKind,
     Literal, LockStrength, LockWaitPolicy, LockingClause, NullsOrder, ObjectName, OrderItem,
     SelectItem, SelectStmt, SetOp, SetOpTail, SetQuantifier, SortDirection, TableRef,
+    XmlTableColumn, XmlTableColumnKind,
 };
 use crate::parser::{ParseError, Parser};
 use crate::span::Span;
@@ -737,6 +738,9 @@ impl Parser<'_> {
             if func_name.value.eq_ignore_ascii_case("json_table") {
                 return self.parse_json_table_ref(func_name);
             }
+            if func_name.value.eq_ignore_ascii_case("xmltable") {
+                return self.parse_xml_table_ref(func_name);
+            }
             self.advance()?; // (
             let mut args = Vec::new();
             if self.peek()?.kind != TokenKind::RParen {
@@ -789,7 +793,7 @@ impl Parser<'_> {
         self.expect(TokenKind::LParen, "(")?;
         let context = self.parse_expr()?;
         self.expect(TokenKind::Comma, ",")?;
-        let row_path = self.parse_json_table_string_literal("JSON_TABLE row path")?;
+        let row_path = self.parse_table_function_string_literal("JSON_TABLE row path")?;
 
         if self.match_kw(TokenKind::KwAs) {
             let _ = self.parse_identifier()?;
@@ -859,10 +863,75 @@ impl Parser<'_> {
         })
     }
 
+    fn parse_xml_table_ref(&mut self, name: Identifier) -> Result<TableRef, ParseError> {
+        self.expect(TokenKind::LParen, "(")?;
+        let row_path = self.parse_table_function_string_literal("XMLTABLE row path")?;
+        self.expect_ident_keyword("PASSING")?;
+        let context = self.parse_expr()?;
+        self.expect_ident_keyword("COLUMNS")?;
+        self.expect(TokenKind::LParen, "(")?;
+        let mut columns = Vec::new();
+        loop {
+            columns.push(self.parse_xml_table_column()?);
+            if self.peek()?.kind == TokenKind::Comma {
+                self.advance()?;
+            } else {
+                break;
+            }
+        }
+        self.expect(TokenKind::RParen, ")")?;
+        let rp = self.expect(TokenKind::RParen, ")")?;
+        let alias = if self.match_kw(TokenKind::KwAs)
+            || (matches!(
+                self.peek()?.kind,
+                TokenKind::Identifier | TokenKind::QuotedIdentifier
+            ) && !self.next_token_is_reserved_clause())
+        {
+            Some(self.parse_identifier()?)
+        } else {
+            None
+        };
+        let end = alias.as_ref().map_or(rp.span.end, |a| a.span.end);
+        Ok(TableRef::XmlTable {
+            context,
+            row_path,
+            columns,
+            alias,
+            span: Span::new(name.span.start, end),
+        })
+    }
+
+    fn parse_xml_table_column(&mut self) -> Result<XmlTableColumn, ParseError> {
+        let name = self.parse_identifier()?;
+        if self.match_kw(TokenKind::KwFor) {
+            self.expect_ident_keyword("ORDINALITY")?;
+            let end = self.peek()?.span.start;
+            return Ok(XmlTableColumn {
+                span: Span::new(name.span.start, end),
+                name,
+                kind: XmlTableColumnKind::Ordinality,
+            });
+        }
+
+        let data_type = self.parse_ddl_type_name()?;
+        let path = if self.peek_is_ident_keyword("PATH")? {
+            self.advance()?;
+            Some(self.parse_table_function_string_literal("XMLTABLE column path")?)
+        } else {
+            None
+        };
+        let end = self.peek()?.span.start;
+        Ok(XmlTableColumn {
+            span: Span::new(name.span.start, end),
+            name,
+            kind: XmlTableColumnKind::Value { data_type, path },
+        })
+    }
+
     fn parse_optional_json_table_path(&mut self) -> Result<Option<String>, ParseError> {
         if self.peek_is_ident_keyword("PATH")? {
             self.advance()?;
-            Ok(Some(self.parse_json_table_string_literal(
+            Ok(Some(self.parse_table_function_string_literal(
                 "JSON_TABLE column path",
             )?))
         } else {
@@ -870,7 +939,7 @@ impl Parser<'_> {
         }
     }
 
-    fn parse_json_table_string_literal(
+    fn parse_table_function_string_literal(
         &mut self,
         expected: &'static str,
     ) -> Result<String, ParseError> {
@@ -1112,7 +1181,8 @@ impl TableRefSpan for TableRef {
             | Self::Join { span, .. }
             | Self::Subquery { span, .. }
             | Self::Function { span, .. }
-            | Self::JsonTable { span, .. } => *span,
+            | Self::JsonTable { span, .. }
+            | Self::XmlTable { span, .. } => *span,
         }
     }
 }
@@ -1520,6 +1590,32 @@ mod tests {
         assert_eq!(columns.len(), 4);
     }
 
+    #[test]
+    fn select_xmltable_in_from_parses_columns_clause() {
+        let stmt = parse(
+            "SELECT * FROM XMLTABLE(\
+             '/root/item' PASSING XML '<root><item id=\"1\"><name>Ada</name></item></root>' \
+             COLUMNS (\
+                 ord FOR ORDINALITY, \
+                 id bigint PATH '@id', \
+                 name text PATH 'name/text()'\
+             )) xt",
+        );
+        let Statement::Select(s) = stmt else { panic!() };
+        let TableRef::XmlTable {
+            row_path,
+            columns,
+            alias,
+            ..
+        } = &s.from[0]
+        else {
+            panic!("expected XMLTABLE table ref");
+        };
+        assert_eq!(row_path, "/root/item");
+        assert_eq!(alias.as_ref().expect("alias").value, "xt");
+        assert_eq!(columns.len(), 3);
+    }
+
     // -------- GROUP BY / HAVING ------------------------------------------- //
 
     #[test]
@@ -1715,7 +1811,8 @@ mod tests {
             TableRef::Named { .. }
             | TableRef::Subquery { .. }
             | TableRef::Function { .. }
-            | TableRef::JsonTable { .. } => true,
+            | TableRef::JsonTable { .. }
+            | TableRef::XmlTable { .. } => true,
             TableRef::Join { left, right, .. } => {
                 // Right must be a leaf.
                 matches!(
@@ -1724,6 +1821,7 @@ mod tests {
                         | TableRef::Subquery { .. }
                         | TableRef::Function { .. }
                         | TableRef::JsonTable { .. }
+                        | TableRef::XmlTable { .. }
                 ) && is_left_deep(left)
             }
         }

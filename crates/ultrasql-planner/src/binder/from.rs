@@ -22,7 +22,9 @@ use ultrasql_objectstore::{
     ObjectLocation, expand_object_store_specs, is_object_store_uri, read_first_object_bytes,
     read_object_range, read_object_range_with_metadata,
 };
-use ultrasql_parser::ast::{JoinCondition, JoinOp, JsonTableColumnKind, TableRef, TypeName};
+use ultrasql_parser::ast::{
+    JoinCondition, JoinOp, JsonTableColumnKind, TableRef, TypeName, XmlTableColumnKind,
+};
 
 const READ_CSV_HEADER_SAMPLE_BYTES: u64 = 64 * 1024;
 const JSON_STREAM_CHUNK_BYTES: u64 = 64 * 1024;
@@ -190,6 +192,21 @@ fn bind_table_ref(
             cte_catalog,
             scope,
         ),
+        TableRef::XmlTable {
+            context,
+            row_path,
+            columns,
+            alias,
+            ..
+        } => bind_xml_table_ref(
+            context,
+            row_path,
+            columns,
+            alias.as_ref(),
+            catalog,
+            cte_catalog,
+            scope,
+        ),
     }
 }
 
@@ -335,7 +352,7 @@ fn bind_table_function(
         "sniff_csv" => bind_sniff_csv_table_function(&bound_args, &qualifier)?,
         _ => {
             return Err(PlanError::NotSupported(
-                "table function (only generate_series, unnest, json_each, jsonb_path_query, json_table, read_csv, read_parquet, read_json, read_ndjson, read_arrow, read_iceberg, iceberg_scan, and sniff_csv supported)",
+                "table function (only generate_series, unnest, json_each, jsonb_path_query, json_table, xmltable, read_csv, read_parquet, read_json, read_ndjson, read_arrow, read_iceberg, iceberg_scan, and sniff_csv supported)",
             ));
         }
     };
@@ -422,6 +439,72 @@ fn bind_json_table_ref(
     ];
     let plan = LogicalPlan::FunctionScan {
         name: "json_table".to_owned(),
+        args,
+        schema,
+    };
+    Ok((plan, from_scope))
+}
+
+fn bind_xml_table_ref(
+    context: &ultrasql_parser::ast::Expr,
+    row_path: &str,
+    columns: &[ultrasql_parser::ast::XmlTableColumn],
+    alias: Option<&ultrasql_parser::ast::Identifier>,
+    catalog: &dyn Catalog,
+    cte_catalog: &[(String, Schema)],
+    scope: &mut ScopeStack,
+) -> Result<(LogicalPlan, Vec<ScopeEntry>), PlanError> {
+    let empty_schema = Schema::empty();
+    let context = bind_expr_with_ctes(context, &empty_schema, catalog, cte_catalog, scope)?;
+    let qualifier = alias.map_or_else(|| "xmltable".to_owned(), |a| a.value.clone());
+    let mut fields = Vec::with_capacity(columns.len());
+    let mut spec_columns = Vec::with_capacity(columns.len());
+    for column in columns {
+        match &column.kind {
+            XmlTableColumnKind::Ordinality => {
+                fields.push(Field::required(column.name.value.clone(), DataType::Int64));
+                spec_columns.push(serde_json::json!({
+                    "name": column.name.value,
+                    "kind": "ordinality",
+                }));
+            }
+            XmlTableColumnKind::Value { data_type, path } => {
+                let data_type_resolved = resolve_type_name(data_type)?;
+                if matches!(data_type_resolved, DataType::Array(_)) {
+                    return Err(PlanError::NotSupported(
+                        "XMLTABLE array column types are not supported in this slice",
+                    ));
+                }
+                fields.push(Field::nullable(
+                    column.name.value.clone(),
+                    data_type_resolved,
+                ));
+                spec_columns.push(serde_json::json!({
+                    "name": column.name.value,
+                    "kind": "value",
+                    "type": json_table_type_name(data_type),
+                    "path": path,
+                }));
+            }
+        }
+    }
+    let schema = Schema::new(fields.clone())
+        .map_err(|err| PlanError::TypeMismatch(format!("XMLTABLE schema: {err}")))?;
+    let from_scope = scope_entries(&qualifier, fields);
+    let spec = serde_json::json!({ "columns": spec_columns }).to_string();
+    let args = vec![
+        context,
+        ScalarExpr::Literal {
+            value: Value::Text(row_path.to_owned()),
+            data_type: DataType::Text { max_len: None },
+        },
+        ScalarExpr::Literal {
+            value: Value::Text(spec),
+            data_type: DataType::Text { max_len: None },
+        },
+    ];
+    let plan = LogicalPlan::FunctionScan {
+        name: "xml_table".to_owned(),
         args,
         schema,
     };
@@ -2151,6 +2234,20 @@ mod tests {
                     ("id", DataType::Int64),
                     ("name", DataType::Text { max_len: None }),
                     ("has_name", DataType::Bool),
+                ],
+            ),
+            (
+                "SELECT * FROM XMLTABLE(\
+                 '/root/item' PASSING XML '<root><item id=\"1\"><name>Ada</name></item></root>' \
+                 COLUMNS (\
+                     ord FOR ORDINALITY, \
+                     id bigint PATH '@id', \
+                     name text PATH 'name/text()'\
+                 )) xt",
+                vec![
+                    ("ord", DataType::Int64),
+                    ("id", DataType::Int64),
+                    ("name", DataType::Text { max_len: None }),
                 ],
             ),
         ] {
