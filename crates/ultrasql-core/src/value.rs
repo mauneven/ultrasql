@@ -1193,9 +1193,9 @@ pub fn xml_content_is_well_formed(text: &str) -> bool {
 ///
 /// Supported paths are absolute child paths such as `/root/item/name` with
 /// optional equality filters on element attributes:
-/// `/root/item[@id="42"]`. Terminal `@attr` and `text()` selections are also
-/// supported. Unsupported path syntax returns `None`. Missing matches return
-/// `Some(Vec::new())`.
+/// `/root/item[@id="42"]`. Element wildcards, terminal `@attr`/`@*`, and
+/// `text()` selections are also supported. Unsupported path syntax returns
+/// `None`. Missing matches return `Some(Vec::new())`.
 #[must_use]
 pub fn xml_xpath_element_fragments(path: &str, document: &str) -> Option<Vec<String>> {
     xml_xpath_element_fragments_with_namespaces(path, document, &[])
@@ -1275,12 +1275,11 @@ pub fn xml_xpath_element_fragments_with_namespaces(
                                 .attrs
                                 .iter()
                                 .filter(|(attr_name, _)| {
-                                    xml_name_matches(
+                                    xml_attribute_matches(
                                         attr_name,
                                         &element.namespaces,
                                         name,
                                         namespace_bindings,
-                                        false,
                                     )
                                 })
                                 .map(|(_, value)| value.clone())
@@ -1365,10 +1364,7 @@ fn parse_xml_path(path: &str) -> Option<Vec<XmlPathStep>> {
             continue;
         }
         if let Some(attr_name) = segment.strip_prefix('@') {
-            if descendant
-                || !terminal
-                || attr_name.is_empty()
-                || xml_name_len(attr_name.as_bytes()) != attr_name.len()
+            if descendant || !terminal || attr_name.is_empty() || !xml_path_name_is_valid(attr_name)
             {
                 return None;
             }
@@ -1388,11 +1384,11 @@ fn parse_xml_path(path: &str) -> Option<Vec<XmlPathStep>> {
         } else {
             (segment, None)
         };
-        if xml_name_len(name.as_bytes()) != name.len() {
+        if !xml_path_name_is_valid(name) {
             return None;
         }
         if let Some((attr_name, _)) = &attr_filter
-            && xml_name_len(attr_name.as_bytes()) != attr_name.len()
+            && !xml_path_name_is_valid(attr_name)
         {
             return None;
         }
@@ -1676,6 +1672,51 @@ fn xml_name_matches(
         .is_some_and(|actual_uri| actual_uri == expected_uri)
 }
 
+fn xml_path_name_is_valid(name: &str) -> bool {
+    !name.is_empty() && (name == "*" || xml_name_len(name.as_bytes()) == name.len())
+}
+
+fn xml_element_name_matches(
+    actual: &str,
+    actual_namespaces: &[(String, String)],
+    expected: &str,
+    namespace_bindings: &[(String, String)],
+) -> bool {
+    expected == "*"
+        || xml_name_matches(
+            actual,
+            actual_namespaces,
+            expected,
+            namespace_bindings,
+            true,
+        )
+}
+
+fn xml_attribute_matches(
+    actual: &str,
+    actual_namespaces: &[(String, String)],
+    expected: &str,
+    namespace_bindings: &[(String, String)],
+) -> bool {
+    if expected == "*" {
+        return !xml_is_namespace_attribute(actual);
+    }
+    xml_name_matches(
+        actual,
+        actual_namespaces,
+        expected,
+        namespace_bindings,
+        false,
+    )
+}
+
+fn xml_is_namespace_attribute(name: &str) -> bool {
+    name == "xmlns"
+        || name
+            .strip_prefix("xmlns:")
+            .is_some_and(|prefix| !prefix.is_empty())
+}
+
 fn xml_split_qname(name: &str) -> (&str, &str) {
     name.split_once(':')
         .map_or(("", name), |(prefix, local)| (prefix, local))
@@ -1711,26 +1752,20 @@ fn xml_step_matches(
     else {
         return false;
     };
-    xml_name_matches(
-        &element.name,
-        &element.namespaces,
-        name,
-        namespace_bindings,
-        true,
-    ) && attr_filter
-        .as_ref()
-        .is_none_or(|(expected_name, expected_value)| {
-            element.attrs.iter().any(|(name, value)| {
-                value == expected_value
-                    && xml_name_matches(
-                        name,
-                        &element.namespaces,
-                        expected_name,
-                        namespace_bindings,
-                        false,
-                    )
+    xml_element_name_matches(&element.name, &element.namespaces, name, namespace_bindings)
+        && attr_filter
+            .as_ref()
+            .is_none_or(|(expected_name, expected_value)| {
+                element.attrs.iter().any(|(name, value)| {
+                    value == expected_value
+                        && xml_attribute_matches(
+                            name,
+                            &element.namespaces,
+                            expected_name,
+                            namespace_bindings,
+                        )
+                })
             })
-        })
 }
 
 fn xml_tag_end(text: &str, start: usize) -> Option<usize> {
@@ -2765,6 +2800,18 @@ mod tests {
             xml_xpath_element_fragments("/root/item/name/text()", doc),
             Some(vec!["A".to_owned(), "B".to_owned()])
         );
+        assert_eq!(
+            xml_xpath_element_fragments("/root/*", doc),
+            Some(vec![
+                r#"<item id="1"><name>A</name></item>"#.to_owned(),
+                r#"<item id="2"><name>B</name></item>"#.to_owned(),
+                "<empty/>".to_owned(),
+            ])
+        );
+        assert_eq!(
+            xml_xpath_element_fragments("/root/*/@*", doc),
+            Some(vec!["1".to_owned(), "2".to_owned()])
+        );
         let nested = r#"<root><group><item id="1"><name>A</name></item><item id="2"><name>B</name></item></group><name>C</name></root>"#;
         assert_eq!(
             xml_xpath_element_fragments(r#"//item[@id="2"]/name"#, nested),
@@ -2787,6 +2834,10 @@ mod tests {
         assert_eq!(
             xml_xpath_element_fragments("/r:root/r:item/text()", namespaced),
             Some(vec!["Z".to_owned()])
+        );
+        assert_eq!(
+            xml_xpath_element_fragments("/r:root/@*", namespaced),
+            Some(Vec::new())
         );
         assert_eq!(
             xml_xpath_element_fragments("/root/missing", doc),

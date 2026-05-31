@@ -79,7 +79,7 @@ file focused on what still blocks production.
   text-backed representation, headline, dictionaries, full ranking parity, and
   GIN planner integration.
 - XML remaining surface: XPath axes/functions beyond the supported child,
-  attribute, text, namespace, and descendant subset, plus `XMLTABLE`.
+  wildcard, attribute, text, namespace, and descendant subset, plus `XMLTABLE`.
 - Locale/collation remaining: ICU-backed collations, `CREATE COLLATION`,
   index/expression collation catalog deparse, and non-bytewise sort/search
   behavior beyond the supported built-in `default`/`C`/`POSIX` subset.

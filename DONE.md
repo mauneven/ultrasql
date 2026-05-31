@@ -251,6 +251,13 @@ as a concise evidence ledger; roadmap stays for open gates only.
   `cargo test -p ultrasql-core xml_xpath_subset_filters_children_without_entity_resolution --lib -- --nocapture`
   and
   `cargo test -p ultrasql-server --test xml_round_trip xml_functions_validate_securely_and_extract_simple_xpath -- --nocapture`.
+- XML XPath now supports element and terminal attribute wildcards (`*`, `@*`)
+  in the secure local subset. Attribute wildcards skip namespace declaration
+  attributes instead of exposing namespace bindings as normal values.
+  Evidence:
+  `cargo test -p ultrasql-core xml_xpath --lib -- --nocapture`
+  and
+  `cargo test -p ultrasql-server --test xml_round_trip -- --nocapture`.
 - `pg_catalog.pg_proc` now advertises the supported XML function surface:
   `xml_is_well_formed`, `xml_is_well_formed_content`,
   `xml_is_well_formed_document`, `xpath`, and `xpath_exists`, including the

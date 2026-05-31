@@ -2396,6 +2396,11 @@ fn parse_xml_value(
     Err(EvalError::Type(format!("{function}: expected {shape}")))
 }
 
+const XPATH_SUPPORTED_SUBSET: &str = concat!(
+    "supported subset is absolute element paths with optional @attr equality, ",
+    "wildcards, text(), namespaces, and descendant paths"
+);
+
 fn eval_xpath_exists(args: &[Value]) -> Result<Value, EvalError> {
     if !(2..=3).contains(&args.len()) {
         return Err(EvalError::Type(format!(
@@ -2411,12 +2416,7 @@ fn eval_xpath_exists(args: &[Value]) -> Result<Value, EvalError> {
     };
     let namespaces = xpath_namespace_arg("xpath_exists", args.get(2))?;
     let fragments = xml_xpath_element_fragments_with_namespaces(path, document, &namespaces)
-        .ok_or_else(|| {
-            EvalError::Type(
-            "xpath_exists: supported subset is absolute element paths with optional @attr equality"
-                .to_owned(),
-        )
-        })?;
+        .ok_or_else(|| EvalError::Type(format!("xpath_exists: {XPATH_SUPPORTED_SUBSET}")))?;
     Ok(Value::Bool(!fragments.is_empty()))
 }
 
@@ -2435,12 +2435,7 @@ fn eval_xpath(args: &[Value]) -> Result<Value, EvalError> {
     };
     let namespaces = xpath_namespace_arg("xpath", args.get(2))?;
     let fragments = xml_xpath_element_fragments_with_namespaces(path, document, &namespaces)
-        .ok_or_else(|| {
-            EvalError::Type(
-                "xpath: supported subset is absolute element paths with optional @attr equality"
-                    .to_owned(),
-            )
-        })?;
+        .ok_or_else(|| EvalError::Type(format!("xpath: {XPATH_SUPPORTED_SUBSET}")))?;
     Ok(Value::Array {
         element_type: DataType::Xml,
         elements: fragments.into_iter().map(Value::Xml).collect(),
