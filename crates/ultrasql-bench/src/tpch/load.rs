@@ -670,8 +670,7 @@ impl TpchQ5BuildState {
         let _quantity = read_direct_decimal_i64(payload, &mut off, "l_quantity")?;
         let extendedprice = read_direct_decimal_i64(payload, &mut off, "l_extendedprice")?;
         let discount = read_direct_decimal_i64(payload, &mut off, "l_discount")?;
-        self.add_lineitem_revenue(orderkey, suppkey, extendedprice, discount);
-        Ok(())
+        self.add_lineitem_revenue(orderkey, suppkey, extendedprice, discount)
     }
 
     fn add_lineitem_revenue(
@@ -680,18 +679,20 @@ impl TpchQ5BuildState {
         suppkey: i32,
         extendedprice: i64,
         discount: i64,
-    ) {
+    ) -> Result<()> {
         let Some(&customer_nationkey) = self.qualifying_orders.get(&orderkey) else {
-            return;
+            return Ok(());
         };
         if self.asia_suppliers.get(&suppkey) != Some(&customer_nationkey) {
-            return;
+            return Ok(());
         }
-        let revenue = extendedprice * 100_i64.saturating_sub(discount) / 100;
-        *self
+        let revenue = checked_direct_discounted_revenue(extendedprice, discount)?;
+        let entry = self
             .revenue_by_nation
             .entry(customer_nationkey)
-            .or_default() += revenue;
+            .or_default();
+        *entry = checked_direct_revenue_add(*entry, revenue)?;
+        Ok(())
     }
 }
 
@@ -4994,6 +4995,45 @@ mod tests {
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].n_name, "JAPAN");
         assert_eq!(rows[0].revenue, 9_500);
+    }
+
+    #[cfg(feature = "sql-bench")]
+    #[test]
+    fn tpch_q5_sidecar_rejects_discount_factor_overflow() {
+        let mut state = TpchQ5BuildState::default();
+        state.ingest("region", "1|ASIA|comment").expect("region");
+        state
+            .ingest("nation", "10|JAPAN|1|comment")
+            .expect("nation");
+        state
+            .ingest(
+                "supplier",
+                "3|Supplier#3|address|10|11-111-1111|0.00|comment",
+            )
+            .expect("supplier");
+        state
+            .ingest(
+                "customer",
+                "1|Customer#1|address|10|11-111-1111|0.00|BUILDING|comment",
+            )
+            .expect("customer");
+        state
+            .ingest("orders", "10|1|O|100.00|1994-06-01|5-LOW|Clerk#1|0|comment")
+            .expect("orders");
+
+        let mut payload = vec![0, 0];
+        for value in [10_i32, 2, 3, 1] {
+            payload.extend_from_slice(&value.to_le_bytes());
+        }
+        for value in [100_i64, 10_000, i64::MIN, 0] {
+            encode_direct_decimal(&mut payload, value, 2, 0).expect("decimal payload");
+        }
+
+        let err = state
+            .ingest_lineitem_payload(&payload)
+            .expect_err("discount factor overflow should reject");
+
+        assert!(err.to_string().contains("TPC-H sidecar revenue overflow"));
     }
 
     #[cfg(feature = "sql-bench")]
