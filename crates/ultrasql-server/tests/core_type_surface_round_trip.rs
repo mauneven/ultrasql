@@ -243,6 +243,14 @@ async fn core_scalar_types_round_trip_over_postgres_wire() {
         filter_err.code().map(tokio_postgres::error::SqlState::code),
         Some("22P02")
     );
+    let result_err = client
+        .simple_query("SELECT CAST('not-int' AS INTEGER)")
+        .await
+        .expect_err("invalid scalar constant cast must fail");
+    assert_eq!(
+        result_err.code().map(tokio_postgres::error::SqlState::code),
+        Some("22P02")
+    );
 
     client
         .batch_execute(

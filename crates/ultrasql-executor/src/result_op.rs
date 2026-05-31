@@ -14,7 +14,7 @@ use ultrasql_vec::Batch;
 
 use crate::eval::Eval;
 use crate::seq_scan::build_batch;
-use crate::{ExecError, Operator};
+use crate::{ExecError, Operator, eval_error_to_exec_error};
 
 /// Single-row constant projection operator.
 ///
@@ -60,10 +60,7 @@ impl Operator for ResultOp {
         let row: Vec<Value> = self
             .exprs
             .iter()
-            .map(|ev| {
-                ev.eval(&[])
-                    .map_err(|err| ExecError::TypeMismatch(err.to_string()))
-            })
+            .map(|ev| ev.eval(&[]).map_err(eval_error_to_exec_error))
             .collect::<Result<_, _>>()?;
 
         let batch = build_batch(&[row], &self.schema)?;
