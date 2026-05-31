@@ -415,6 +415,12 @@ fn checked_direct_revenue_add_i128(left: i128, right: i128) -> Result<i128> {
 }
 
 #[cfg(feature = "sql-bench")]
+fn checked_direct_revenue_sub(left: i64, right: i64) -> Result<i64> {
+    left.checked_sub(right)
+        .ok_or_else(direct_sidecar_revenue_overflow)
+}
+
+#[cfg(feature = "sql-bench")]
 fn checked_direct_discounted_revenue(extendedprice: i64, discount: i64) -> Result<i64> {
     let product = checked_direct_discounted_product_i128(extendedprice, discount)?;
     i64::try_from(product / 100).map_err(|_| direct_sidecar_revenue_overflow())
@@ -439,6 +445,14 @@ fn checked_direct_discounted_product_i128(extendedprice: i64, discount: i64) -> 
     i128::from(extendedprice)
         .checked_mul(i128::from(factor))
         .ok_or_else(direct_sidecar_revenue_overflow)
+}
+
+#[cfg(feature = "sql-bench")]
+fn checked_direct_scaled_product(left: i64, right: i64) -> Result<i64> {
+    let product = i128::from(left)
+        .checked_mul(i128::from(right))
+        .ok_or_else(direct_sidecar_revenue_overflow)?;
+    i64::try_from(product / 100).map_err(|_| direct_sidecar_revenue_overflow())
 }
 
 #[cfg(feature = "sql-bench")]
@@ -1198,8 +1212,7 @@ impl TpchQ9BuildState {
             quantity,
             extendedprice,
             discount,
-        );
-        Ok(())
+        )
     }
 
     fn add_lineitem_profit(
@@ -1210,25 +1223,28 @@ impl TpchQ9BuildState {
         quantity: i64,
         extendedprice: i64,
         discount: i64,
-    ) {
+    ) -> Result<()> {
         if !self.green_parts.contains(&partkey) {
-            return;
+            return Ok(());
         }
         let Some(nation) = self.suppliers.get(&suppkey) else {
-            return;
+            return Ok(());
         };
         let Some(&o_year) = self.orders.get(&orderkey) else {
-            return;
+            return Ok(());
         };
         let Some(&supplycost) = self.partsupp_cost.get(&(partkey, suppkey)) else {
-            return;
+            return Ok(());
         };
-        let revenue = extendedprice * 100_i64.saturating_sub(discount) / 100;
-        let cost = supplycost * quantity / 100;
-        *self
+        let revenue = checked_direct_discounted_revenue(extendedprice, discount)?;
+        let cost = checked_direct_scaled_product(supplycost, quantity)?;
+        let profit = checked_direct_revenue_sub(revenue, cost)?;
+        let entry = self
             .profit_by_key
             .entry((nation.clone(), o_year))
-            .or_default() += revenue - cost;
+            .or_default();
+        *entry = checked_direct_revenue_add(*entry, profit)?;
+        Ok(())
     }
 }
 
@@ -5324,6 +5340,47 @@ mod tests {
         assert_eq!(rows[0].nation, "BRAZIL");
         assert_eq!(rows[0].o_year, 1995);
         assert_eq!(rows[0].sum_profit, 5_500);
+    }
+
+    #[cfg(feature = "sql-bench")]
+    #[test]
+    fn tpch_q9_sidecar_rejects_discount_factor_overflow() {
+        let mut state = TpchQ9BuildState::default();
+        state
+            .ingest("nation", "2|BRAZIL|1|comment")
+            .expect("nation");
+        state
+            .ingest(
+                "supplier",
+                "3|Supplier#3|address|2|11-111-1111|0.00|comment",
+            )
+            .expect("supplier");
+        state
+            .ingest(
+                "part",
+                "5|forest green part|MFGR#1|brand|TYPE|15|container|123.45|comment",
+            )
+            .expect("part");
+        state
+            .ingest("partsupp", "5|3|1|40.00|comment")
+            .expect("partsupp");
+        state
+            .ingest("orders", "10|4|O|100.00|1995-06-01|5-LOW|Clerk#1|0|comment")
+            .expect("orders");
+
+        let mut payload = vec![0, 0];
+        for value in [10_i32, 5, 3, 1] {
+            payload.extend_from_slice(&value.to_le_bytes());
+        }
+        for value in [100_i64, 10_000, i64::MIN] {
+            encode_direct_decimal(&mut payload, value, 2, 0).expect("decimal payload");
+        }
+
+        let err = state
+            .ingest_lineitem_payload(&payload)
+            .expect_err("discount factor overflow should reject");
+
+        assert!(err.to_string().contains("TPC-H sidecar revenue overflow"));
     }
 
     #[cfg(feature = "sql-bench")]
