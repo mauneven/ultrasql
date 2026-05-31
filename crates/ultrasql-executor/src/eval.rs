@@ -421,6 +421,10 @@ fn eval_function_call(
         "__ultrasql_cast_timestamp" => eval_cast_timestamp(args),
         "__ultrasql_cast_timestamptz" => eval_cast_timestamptz(args),
         "__ultrasql_cast_timetz" => eval_cast_timetz(args),
+        "__ultrasql_cast_uuid" => eval_cast_uuid(args),
+        "__ultrasql_cast_json" => eval_cast_json(args),
+        "__ultrasql_cast_jsonb" => eval_cast_jsonb(args),
+        "__ultrasql_cast_xml" => eval_cast_xml(args),
         "__ultrasql_cast_oid" => eval_cast_oid(args),
         "__ultrasql_cast_regclass" => eval_cast_regclass(args),
         "__ultrasql_cast_regtype" => eval_cast_regtype(args),
@@ -1184,6 +1188,42 @@ fn eval_cast_timetz(args: &[Value]) -> Result<Value, EvalError> {
             offset_seconds,
         })
         .ok_or_else(|| EvalError::Type(format!("timetz cast: invalid syntax: {text}")))
+}
+
+fn eval_cast_uuid(args: &[Value]) -> Result<Value, EvalError> {
+    let Some(text) = textlike_cast_arg("uuid cast", args)? else {
+        return Ok(Value::Null);
+    };
+    Value::parse_uuid(text.trim())
+        .map(Value::Uuid)
+        .ok_or_else(|| EvalError::Type(format!("uuid cast: invalid syntax: {text}")))
+}
+
+fn eval_cast_json(args: &[Value]) -> Result<Value, EvalError> {
+    let Some(text) = textlike_cast_arg("json cast", args)? else {
+        return Ok(Value::Null);
+    };
+    serde_json::from_str::<JsonValue>(text)
+        .map(|_| Value::Json(text.to_owned()))
+        .map_err(|err| EvalError::Type(format!("json cast: invalid JSON: {err}")))
+}
+
+fn eval_cast_jsonb(args: &[Value]) -> Result<Value, EvalError> {
+    let Some(text) = textlike_cast_arg("jsonb cast", args)? else {
+        return Ok(Value::Null);
+    };
+    let parsed = serde_json::from_str::<JsonValue>(text)
+        .map_err(|err| EvalError::Type(format!("jsonb cast: invalid JSON: {err}")))?;
+    json_value_to_jsonb(parsed, "jsonb cast")
+}
+
+fn eval_cast_xml(args: &[Value]) -> Result<Value, EvalError> {
+    let Some(text) = textlike_cast_arg("xml cast", args)? else {
+        return Ok(Value::Null);
+    };
+    Value::validate_xml_text(text)
+        .map(Value::Xml)
+        .ok_or_else(|| EvalError::Type(format!("xml cast: invalid XML document: {text}")))
 }
 
 fn textlike_cast_arg<'a>(func: &str, args: &'a [Value]) -> Result<Option<&'a str>, EvalError> {
@@ -6787,6 +6827,37 @@ mod tests {
                 micros: timetz_micros,
                 offset_seconds: timetz_offset,
             }
+        );
+        assert_eq!(
+            eval_fn(
+                "__ultrasql_cast_uuid",
+                vec![Value::Text("12345678-9abc-def0-1234-56789abcdef0".into())]
+            ),
+            Value::Uuid(
+                Value::parse_uuid("12345678-9abc-def0-1234-56789abcdef0").expect("uuid parses")
+            )
+        );
+        assert_eq!(
+            eval_fn(
+                "__ultrasql_cast_json",
+                vec![Value::Text("{\"a\":1}".into())]
+            ),
+            Value::Json("{\"a\":1}".into())
+        );
+        assert_eq!(
+            eval_fn(
+                "__ultrasql_cast_jsonb",
+                vec![Value::Text("{\"a\":1}".into())]
+            ),
+            Value::Jsonb("{\"a\":1}".into())
+        );
+        assert_eq!(
+            eval_fn("__ultrasql_cast_xml", vec![Value::Text("<root/>".into())]),
+            Value::Xml("<root/>".into())
+        );
+        assert!(
+            eval_fn_err("__ultrasql_cast_jsonb", vec![Value::Text("{bad".into())])
+                .contains("invalid JSON")
         );
 
         assert!(eval_fn_err("__ultrasql_cast_oid", vec![]).contains("expected 1 arg"));

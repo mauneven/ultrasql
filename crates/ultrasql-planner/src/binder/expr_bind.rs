@@ -763,6 +763,10 @@ fn bind_runtime_cast(
         DataType::Timestamp if actual_type.is_textlike() => "__ultrasql_cast_timestamp",
         DataType::TimestampTz if actual_type.is_textlike() => "__ultrasql_cast_timestamptz",
         DataType::TimeTz if actual_type.is_textlike() => "__ultrasql_cast_timetz",
+        DataType::Uuid if actual_type.is_textlike() => "__ultrasql_cast_uuid",
+        DataType::Json if actual_type.is_textlike() => "__ultrasql_cast_json",
+        DataType::Jsonb if actual_type.is_textlike() => "__ultrasql_cast_jsonb",
+        DataType::Xml if actual_type.is_textlike() => "__ultrasql_cast_xml",
         DataType::Money
             if actual_type.is_integer() || matches!(actual_type, DataType::Decimal { .. }) =>
         {

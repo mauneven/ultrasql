@@ -1747,3 +1747,10 @@ as a concise evidence ledger; roadmap stays for open gates only.
   `cargo test -p ultrasql-executor cast_size_and_array_error_edges_cover_scalar_compat_paths --lib -- --nocapture`
   and
   `cargo test -p ultrasql-server --test core_type_surface_round_trip core_scalar_types_round_trip_over_postgres_wire -- --nocapture`.
+- Runtime structured text casts now parse textlike column/expression values into
+  `UUID`, `JSON`, `JSONB`, and `XML`, using the same UUID parser, JSON
+  validation/JSONB normalization, and XML well-formedness checks as literals.
+  Evidence:
+  `cargo test -p ultrasql-executor cast_size_and_array_error_edges_cover_scalar_compat_paths --lib -- --nocapture`
+  and
+  `cargo test -p ultrasql-server --test core_type_surface_round_trip core_scalar_types_round_trip_over_postgres_wire -- --nocapture`.

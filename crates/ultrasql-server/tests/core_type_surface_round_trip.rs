@@ -187,6 +187,56 @@ async fn core_scalar_types_round_trip_over_postgres_wire() {
         ]]
     );
 
+    client
+        .batch_execute(
+            "CREATE TABLE structured_text_cast_surface (
+                as_uuid TEXT NOT NULL,
+                as_json TEXT NOT NULL,
+                as_jsonb TEXT NOT NULL,
+                as_xml TEXT NOT NULL
+             );
+             INSERT INTO structured_text_cast_surface
+             VALUES (
+                '12345678-9abc-def0-1234-56789abcdef0',
+                '{\"a\":1}',
+                '{\"a\":1}',
+                '<root/>'
+             )",
+        )
+        .await
+        .expect("create structured text cast table");
+    let structured_cast_rows = client
+        .simple_query(
+            "SELECT
+                CAST(as_uuid AS UUID),
+                CAST(as_json AS JSON),
+                CAST(as_jsonb AS JSONB),
+                CAST(as_xml AS XML)
+             FROM structured_text_cast_surface",
+        )
+        .await
+        .expect("runtime structured text casts from columns");
+    let structured_values: Vec<Vec<String>> = structured_cast_rows
+        .into_iter()
+        .filter_map(|message| match message {
+            SimpleQueryMessage::Row(row) => Some(
+                (0..4)
+                    .map(|idx| row.get(idx).expect("structured cast column").to_owned())
+                    .collect(),
+            ),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        structured_values,
+        vec![vec![
+            "12345678-9abc-def0-1234-56789abcdef0".to_owned(),
+            "{\"a\":1}".to_owned(),
+            "{\"a\":1}".to_owned(),
+            "<root/>".to_owned()
+        ]]
+    );
+
     let err = client
         .batch_execute(
             "INSERT INTO core_type_surface VALUES (
