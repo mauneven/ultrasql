@@ -830,6 +830,9 @@ as a concise evidence ledger; roadmap stays for open gates only.
   stale default, identity, generated-column, check, FK, exclusion, and index
   sidecar records after `DROP TABLE`. Evidence:
   `cargo test -p ultrasql-server --test drop_restart_round_trip`.
+- Table runtime metadata reload rejects duplicate table OIDs or table names,
+  avoiding ambiguous restart constraints from tampered sidecar rows. Evidence:
+  `cargo test -p ultrasql-server --test drop_restart_round_trip table_runtime_metadata_rejects_duplicate_table_rows_on_rebuild -- --nocapture`.
 - Dropped tables are removed from durable `pg_row_security.meta`, preventing
   stale row-level-security policies from surviving restart after `DROP TABLE`.
   Evidence: `cargo test -p ultrasql-server --test rls_round_trip`.

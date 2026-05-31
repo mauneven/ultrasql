@@ -4815,6 +4815,8 @@ impl Server {
             std::collections::HashMap::new();
         let mut exclusions: std::collections::HashMap<Oid, Vec<RuntimeExclusionConstraint>> =
             std::collections::HashMap::new();
+        let mut seen_table_oids = std::collections::HashSet::new();
+        let mut seen_table_names = std::collections::HashSet::new();
         for (line_no, line) in text.lines().enumerate() {
             if line.is_empty() || line.starts_with('#') {
                 continue;
@@ -4828,7 +4830,16 @@ impl Server {
                             line_no + 1
                         ))
                     })?);
-                    table_names.insert(oid, metadata_unescape(parts[1])?);
+                    let table_name = metadata_unescape(parts[1])?;
+                    if !seen_table_oids.insert(oid)
+                        || !seen_table_names.insert(table_name.to_ascii_lowercase())
+                    {
+                        return Err(ServerError::Ddl(format!(
+                            "duplicate table-runtime metadata on line {}",
+                            line_no + 1
+                        )));
+                    }
+                    table_names.insert(oid, table_name);
                 }
                 Some("sequence_default") if parts.len() == 4 => {
                     let oid = Oid::new(parts[1].parse::<u32>().map_err(|err| {
