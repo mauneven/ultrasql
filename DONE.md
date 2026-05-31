@@ -854,6 +854,13 @@ as a concise evidence ledger; roadmap stays for open gates only.
   `cargo test -p ultrasql-planner time_and_timetz_literals_parse_postgres_shapes --lib -- --nocapture`
   and
   `cargo test -p ultrasql-server --test timetz_round_trip timetz_and_temporal_display_round_trip -- --nocapture`.
+- `TIMESTAMP AT TIME ZONE` and `TIMESTAMPTZ AT TIME ZONE` now bind and execute
+  through a checked `timezone(zone, source)` runtime path for fixed-offset and
+  IANA zones, returning `TIMESTAMPTZ` for local timestamps and `TIMESTAMP` for
+  instants rendered in a target zone. Evidence:
+  `cargo test -p ultrasql-planner binds_at_time_zone_with_timestamp_return_types --lib -- --nocapture`;
+  `cargo test -p ultrasql-executor date_json_xml_bit_and_network_helpers_cover_scalar_edges --lib -- --nocapture`;
+  `cargo test -p ultrasql-server --test timetz_round_trip timetz_and_temporal_display_round_trip -- --nocapture`.
 - `DateStyle` now accepts and round-trips PostgreSQL-style `ISO`, `SQL`,
   `Postgres`, `German` plus `MDY` / `DMY` / `YMD` session settings through
   `SET`, `SHOW`, and `RESET`; `DATE`, `TIMESTAMP`, and `TIMESTAMPTZ` text

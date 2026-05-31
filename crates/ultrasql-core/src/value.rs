@@ -3155,6 +3155,17 @@ pub fn timestamptz_display_in_timezone(micros: i64, timezone: &str) -> Option<Ti
     })
 }
 
+/// Interpret timestamp micros as local wall time in a fixed or IANA timezone.
+#[must_use]
+pub fn timestamp_micros_at_timezone(micros: i64, timezone: &str) -> Option<i64> {
+    let trimmed = timezone.trim();
+    let (year, month, day, time_micros) = timestamp_parts_from_micros(micros)?;
+    let date_text = format!("{year:04}-{month:02}-{day:02}");
+    let offset_seconds = parse_timezone_offset(trimmed)
+        .or_else(|| parse_named_timezone_offset(&date_text, time_micros, trimmed))?;
+    micros.checked_sub(i64::from(offset_seconds).checked_mul(MICROS_PER_SECOND)?)
+}
+
 /// Format a UTC offset in PostgreSQL text form.
 #[must_use]
 pub fn format_timezone_offset_seconds(offset_seconds: i32) -> String {

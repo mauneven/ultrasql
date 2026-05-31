@@ -145,6 +145,33 @@ async fn timetz_and_temporal_display_round_trip() {
         ]]
     );
 
+    let at_time_zone_rows = client
+        .simple_query(
+            "SELECT \
+                TIMESTAMP '2000-07-01 12:00:00' AT TIME ZONE 'America/New_York', \
+                TIMESTAMP WITH TIME ZONE '2000-07-01 16:00:00+00' AT TIME ZONE 'America/New_York'",
+        )
+        .await
+        .expect("select AT TIME ZONE conversions");
+    let at_time_zone_values: Vec<Vec<String>> = at_time_zone_rows
+        .into_iter()
+        .filter_map(|message| match message {
+            SimpleQueryMessage::Row(row) => Some(
+                (0..2)
+                    .map(|idx| row.get(idx).expect("column").to_owned())
+                    .collect(),
+            ),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        at_time_zone_values,
+        vec![vec![
+            "2000-07-01 16:00:00+00".to_owned(),
+            "2000-07-01 12:00:00".to_owned(),
+        ]]
+    );
+
     client
         .batch_execute("SET TimeZone TO 'America/New_York'")
         .await

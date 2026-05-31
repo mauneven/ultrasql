@@ -30,7 +30,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use num_traits::ToPrimitive;
 use serde_json::{Map as JsonMap, Number as JsonNumber, Value as JsonValue};
 use ultrasql_core::{
-    DataType, Oid, SparseVector, Value, bpchar_semantic_text, parse_money_text, timetz_utc_micros,
+    DataType, Oid, SparseVector, Value, bpchar_semantic_text, parse_money_text,
+    timestamp_micros_at_timezone, timestamptz_display_in_timezone, timetz_utc_micros,
     xml_content_is_well_formed, xml_document_is_well_formed,
     xml_xpath_element_fragments_with_namespaces,
 };
@@ -272,6 +273,7 @@ fn eval_function_call(
         "now" | "current_timestamp" => eval_now(args, return_type),
         "current_date" => eval_current_date(args),
         "age" => eval_age(args),
+        "timezone" => eval_timezone(args),
         "date_trunc" => eval_date_trunc(args),
         "to_timestamp" => eval_to_timestamp(args),
         "make_date" => eval_make_date(args),
@@ -3554,6 +3556,31 @@ fn eval_age(args: &[Value]) -> Result<Value, EvalError> {
     })
 }
 
+fn eval_timezone(args: &[Value]) -> Result<Value, EvalError> {
+    if args.len() != 2 {
+        return Err(EvalError::Type(format!(
+            "timezone: expected 2 args, got {}",
+            args.len()
+        )));
+    }
+    let Some(zone) = text_arg("timezone", args, 0)? else {
+        return Ok(Value::Null);
+    };
+    match &args[1] {
+        Value::Timestamp(micros) => timestamp_micros_at_timezone(*micros, zone)
+            .map(Value::TimestampTz)
+            .ok_or_else(|| EvalError::Type("timezone: invalid timezone conversion".to_owned())),
+        Value::TimestampTz(micros) => timestamptz_display_in_timezone(*micros, zone)
+            .map(|display| Value::Timestamp(display.local_micros))
+            .ok_or_else(|| EvalError::Type("timezone: invalid timezone conversion".to_owned())),
+        Value::Null => Ok(Value::Null),
+        other => Err(EvalError::Type(format!(
+            "timezone: argument 2 must be timestamp or timestamptz, got {:?}",
+            other.data_type()
+        ))),
+    }
+}
+
 fn eval_date_bin(args: &[Value]) -> Result<Value, EvalError> {
     if args.len() != 3 {
         return Err(EvalError::Type(format!(
@@ -5952,7 +5979,10 @@ fn regex_match(haystack: &str, pattern: &str, case_insensitive: bool) -> Result<
 #[cfg(test)]
 mod tests {
     use proptest::prelude::*;
-    use ultrasql_core::{BitString, DataType, Field, NetworkValue, Oid, Schema, Value};
+    use ultrasql_core::{
+        BitString, DataType, Field, NetworkValue, Oid, Schema, Value, parse_timestamp_text,
+        parse_timestamptz_text,
+    };
     use ultrasql_planner::{BinaryOp, LogicalPlan, ScalarExpr, UnaryOp};
 
     use super::{Eval, EvalError, eval_function_call};
@@ -7329,6 +7359,42 @@ mod tests {
                 ],
             )
             .contains("month stride")
+        );
+
+        let local_noon = parse_timestamp_text("2000-07-01 12:00:00").expect("timestamp parses");
+        let utc_from_new_york = parse_timestamptz_text("2000-07-01 12:00:00 America/New_York")
+            .expect("timestamptz parses");
+        assert_eq!(
+            Eval::new(call(
+                "timezone",
+                vec![
+                    lit_text("America/New_York"),
+                    ScalarExpr::Literal {
+                        value: Value::Timestamp(local_noon),
+                        data_type: DataType::Timestamp,
+                    },
+                ],
+                DataType::TimestampTz,
+            ))
+            .eval(&[])
+            .expect("timestamp AT TIME ZONE evaluates"),
+            Value::TimestampTz(utc_from_new_york)
+        );
+        assert_eq!(
+            Eval::new(call(
+                "timezone",
+                vec![
+                    lit_text("America/New_York"),
+                    ScalarExpr::Literal {
+                        value: Value::TimestampTz(utc_from_new_york),
+                        data_type: DataType::TimestampTz,
+                    },
+                ],
+                DataType::Timestamp,
+            ))
+            .eval(&[])
+            .expect("timestamptz AT TIME ZONE evaluates"),
+            Value::Timestamp(local_noon)
         );
 
         let bits = Value::BitString(BitString::parse("1010").expect("bits"));

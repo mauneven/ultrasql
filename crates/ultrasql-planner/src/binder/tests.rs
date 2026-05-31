@@ -313,6 +313,20 @@ fn binds_xml_scalar_functions_with_precise_return_types() {
     assert_eq!(exprs[6].0.data_type(), DataType::Text { max_len: None });
 }
 
+#[test]
+fn binds_at_time_zone_with_timestamp_return_types() {
+    let plan = parse_bind_ok(
+        "SELECT \
+            TIMESTAMP '2000-07-01 00:00:00' AT TIME ZONE 'America/New_York', \
+            TIMESTAMPTZ '2000-07-01 04:00:00+00' AT TIME ZONE 'America/New_York'",
+    );
+    let LogicalPlan::Project { exprs, .. } = &plan else {
+        panic!("expected Project, got {plan:?}");
+    };
+    assert_eq!(exprs[0].0.data_type(), DataType::TimestampTz);
+    assert_eq!(exprs[1].0.data_type(), DataType::Timestamp);
+}
+
 // -----------------------------------------------------------------------
 // INSERT — happy paths
 // -----------------------------------------------------------------------

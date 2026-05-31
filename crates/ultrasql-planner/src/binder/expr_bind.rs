@@ -75,6 +75,9 @@ pub(super) fn bind_expr_with_ctes(
             let bound = bind_expr_with_ctes(inner, input, catalog, cte_catalog, scope)?;
             bind_collated_expr(collation, bound)
         }
+        Expr::AtTimeZone {
+            expr: inner, zone, ..
+        } => bind_at_time_zone(inner, zone, input, catalog, cte_catalog, scope),
         Expr::ArrayLiteral { elements, .. } => {
             bind_array_literal(elements, input, catalog, cte_catalog, scope)
         }
@@ -1529,6 +1532,7 @@ pub(super) fn builtin_return_type(
         "now" | "current_timestamp" | "date_trunc" | "to_timestamp" | "date_bin" => {
             Ok(DataType::TimestampTz)
         }
+        "timezone" => timezone_return_type(args),
         "age" => Ok(DataType::Interval),
         "abs" => Ok(DataType::Int64),
         "ceil" | "floor" | "round" | "trunc" | "mod" | "power" | "sqrt" | "exp" | "ln" | "log"
@@ -3641,6 +3645,49 @@ fn bind_array_slice(
         args: vec![array, lower, upper],
         data_type: array_type,
     })
+}
+
+fn bind_at_time_zone(
+    expr: &Expr,
+    zone: &Expr,
+    input: &Schema,
+    catalog: &dyn Catalog,
+    cte_catalog: &[(String, Schema)],
+    scope: &mut ScopeStack,
+) -> Result<ScalarExpr, PlanError> {
+    let source = bind_expr_with_ctes(expr, input, catalog, cte_catalog, scope)?;
+    let mut zone = bind_expr_with_ctes(zone, input, catalog, cte_catalog, scope)?;
+    coerce_literal_to_type(&mut zone, &DataType::Text { max_len: None });
+    let args = vec![zone, source];
+    let data_type = timezone_return_type(&args)?;
+    Ok(ScalarExpr::FunctionCall {
+        name: "timezone".to_owned(),
+        args,
+        data_type,
+    })
+}
+
+fn timezone_return_type(args: &[ScalarExpr]) -> Result<DataType, PlanError> {
+    if args.len() != 2 {
+        return Err(PlanError::TypeMismatch(format!(
+            "timezone: expected 2 arguments, got {}",
+            args.len()
+        )));
+    }
+    let zone_type = args[0].data_type();
+    if !zone_type.is_textlike() && !matches!(zone_type, DataType::Null) {
+        return Err(PlanError::TypeMismatch(format!(
+            "timezone: zone must be text, got {zone_type}"
+        )));
+    }
+    match args[1].data_type() {
+        DataType::Timestamp => Ok(DataType::TimestampTz),
+        DataType::TimestampTz => Ok(DataType::Timestamp),
+        DataType::Null => Ok(DataType::Null),
+        other => Err(PlanError::TypeMismatch(format!(
+            "timezone: source must be timestamp or timestamptz, got {other}"
+        ))),
+    }
 }
 
 fn bind_optional_array_bound(
