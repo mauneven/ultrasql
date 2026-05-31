@@ -298,6 +298,12 @@ as a concise evidence ledger; roadmap stays for open gates only.
   `cargo test -p ultrasql-executor json_path::tests::path_supports_iso_datetime_methods --lib -- --nocapture`
   and
   `cargo test -p ultrasql-server --test jsonb_path_query_round_trip jsonb_path_query_supports_iso_datetime_methods -- --nocapture`.
+- SQL/JSON `datetime(template)` now covers exact six-digit fractional second
+  ISO timestamp forms `YYYY-MM-DD HH24:MI:SS.FF6` and
+  `YYYY-MM-DD"T"HH24:MI:SS.FF6`. Evidence:
+  `cargo test -p ultrasql-executor json_path::tests::path_supports_iso_datetime_methods --lib -- --nocapture`
+  and
+  `cargo test -p ultrasql-server --test jsonb_path_query_round_trip jsonb_path_query_supports_iso_datetime_methods -- --nocapture`.
 - XML `xpath` and `xpath_exists` now accept PostgreSQL-style namespace mapping
   arrays for the supported secure XPath subset. The XML walker carries
   inherited namespace context, resolves alias-to-URI matches for elements and

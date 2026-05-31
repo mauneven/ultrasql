@@ -580,6 +580,12 @@ fn json_path_datetime_template(text: &str, template: &str) -> JsonValue {
         "YYYY-MM-DD\"T\"HH24:MI" => parse_iso_minute_timestamp_template(text, b'T')
             .map(format_json_timestamp)
             .map_or(JsonValue::Null, JsonValue::String),
+        "YYYY-MM-DD HH24:MI:SS.FF6" => parse_iso_ff6_timestamp_template(text, b' ')
+            .map(format_json_timestamp)
+            .map_or(JsonValue::Null, JsonValue::String),
+        "YYYY-MM-DD\"T\"HH24:MI:SS.FF6" => parse_iso_ff6_timestamp_template(text, b'T')
+            .map(format_json_timestamp)
+            .map_or(JsonValue::Null, JsonValue::String),
         "YYYY-MM-DD HH24:MI:SS" => parse_iso_second_timestamp_template(text, b' ')
             .map(format_json_timestamp)
             .map_or(JsonValue::Null, JsonValue::String),
@@ -620,6 +626,24 @@ fn parse_iso_minute_timestamp_template(text: &str, separator: u8) -> Option<i64>
     }
     let date = parse_date_text(text.get(..10)?)?;
     let micros = parse_time_text(&format!("{}:00", text.get(11..)?))?;
+    timestamp_micros(date, micros)
+}
+
+fn parse_iso_ff6_timestamp_template(text: &str, separator: u8) -> Option<i64> {
+    let text = text.trim();
+    let bytes = text.as_bytes();
+    if bytes.len() != 26
+        || bytes.get(4) != Some(&b'-')
+        || bytes.get(7) != Some(&b'-')
+        || bytes.get(10) != Some(&separator)
+        || bytes.get(13) != Some(&b':')
+        || bytes.get(16) != Some(&b':')
+        || bytes.get(19) != Some(&b'.')
+    {
+        return None;
+    }
+    let date = parse_date_text(text.get(..10)?)?;
+    let micros = parse_time_text(text.get(11..)?)?;
     timestamp_micros(date, micros)
 }
 
@@ -1693,6 +1717,8 @@ mod tests {
             "compact_minute_ts": "202308151234",
             "iso_minute": "2023-08-15 12:34",
             "iso_t_minute": "2023-08-15T12:34",
+            "iso_ff6": "2023-08-15 12:34:56.789123",
+            "iso_t_ff6": "2023-08-15T12:34:56.789123",
             "iso_t": "2023-08-15T12:34:56",
             "bad": "not-time"
         });
@@ -1770,6 +1796,19 @@ mod tests {
         assert_eq!(
             select(&document, &iso_t_minute),
             vec![serde_json::json!("2023-08-15T12:34:00")]
+        );
+
+        let iso_ff6 = parse_json_path("$.iso_ff6.datetime(\"YYYY-MM-DD HH24:MI:SS.FF6\")").unwrap();
+        assert_eq!(
+            select(&document, &iso_ff6),
+            vec![serde_json::json!("2023-08-15T12:34:56.789123")]
+        );
+
+        let iso_t_ff6 =
+            parse_json_path(r#"$.iso_t_ff6.datetime("YYYY-MM-DD\"T\"HH24:MI:SS.FF6")"#).unwrap();
+        assert_eq!(
+            select(&document, &iso_t_ff6),
+            vec![serde_json::json!("2023-08-15T12:34:56.789123")]
         );
 
         let quoted_literal =
