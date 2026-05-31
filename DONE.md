@@ -920,6 +920,11 @@ as a concise evidence ledger; roadmap stays for open gates only.
   from dropping a same-name table in another namespace. Evidence:
   `cargo test -p ultrasql-server --test drop_table_round_trip
   drop_table_respects_schema_qualifier -- --nocapture`.
+- Explicitly qualified `FROM schema.name` now checks the catalog table's stored
+  schema before binding scans, preventing a wrong-qualified `SELECT` from
+  reading a same-name table in another namespace. Evidence:
+  `cargo test -p ultrasql-server --test schema_ddl_round_trip
+  select_respects_schema_qualifier -- --nocapture`.
 - Committed `pg_constraint` rows are now installed into the live catalog map
   before restart, so same-session `DROP INDEX` also rejects inline and
   `ALTER TABLE ADD UNIQUE` constraint indexes. Evidence:

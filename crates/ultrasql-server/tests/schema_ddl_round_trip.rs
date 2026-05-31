@@ -284,6 +284,43 @@ async fn qualified_object_ddl_uses_created_schema_namespace() {
     shutdown(running).await;
 }
 
+#[tokio::test]
+async fn select_respects_schema_qualifier() {
+    let running = start_sample_server("schema_select_qualifier_guard").await;
+
+    running
+        .client
+        .batch_execute(
+            "CREATE SCHEMA app; \
+             CREATE TABLE guarded_select (id INT); \
+             INSERT INTO guarded_select VALUES (9)",
+        )
+        .await
+        .expect("create public table and separate schema");
+
+    running
+        .client
+        .query("SELECT id FROM app.guarded_select", &[])
+        .await
+        .expect_err("qualified SELECT must not resolve public table");
+
+    let row = running
+        .client
+        .query_one("SELECT id FROM guarded_select", &[])
+        .await
+        .expect("public table remains readable")
+        .get::<_, i32>(0);
+    assert_eq!(row, 9);
+
+    running
+        .client
+        .batch_execute("DROP TABLE guarded_select; DROP SCHEMA app")
+        .await
+        .expect("cleanup select qualifier guard");
+
+    shutdown(running).await;
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn qualified_sequence_schema_survives_restart() {
     let data_dir = tempfile::TempDir::new().expect("temp data dir");
