@@ -1782,6 +1782,22 @@ where
         let mut entries = Vec::with_capacity(indexes.len());
         for name in indexes {
             if let Some(entry) = self.state.persistent_catalog.lookup_index(name) {
+                if entry.is_unique && entry.name.ends_with("_pkey") {
+                    return Err(ServerError::DependentObjectsStillExist(format!(
+                        "cannot drop index {} because primary key constraint depends on it",
+                        entry.name
+                    )));
+                }
+                if let Some(dependency) = self
+                    .state
+                    .persistent_catalog
+                    .constraint_dependency_for_index(entry.table_oid, &entry.name)
+                {
+                    return Err(ServerError::DependentObjectsStillExist(format!(
+                        "cannot drop index {} because constraint {} depends on it",
+                        entry.name, dependency.conname
+                    )));
+                }
                 entries.push(entry);
             } else if !*if_exists {
                 return Err(ultrasql_catalog::CatalogError::not_found(name.clone()).into());

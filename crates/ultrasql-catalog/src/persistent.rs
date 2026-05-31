@@ -1755,6 +1755,32 @@ impl PersistentCatalog {
         Ok(())
     }
 
+    /// Return a constraint that depends on an index name for one table.
+    ///
+    /// Constraint-created indexes use the constraint name as the index name in
+    /// the current catalog. Dropping those indexes directly would leave
+    /// `pg_constraint` rows that claim enforcement still exists.
+    #[must_use]
+    pub fn constraint_dependency_for_index(
+        &self,
+        table_oid: Oid,
+        index_name: &str,
+    ) -> Option<ConstraintRow> {
+        let key = fold_name(index_name);
+        self.pg_constraint
+            .iter()
+            .find(|row| {
+                let row = row.value();
+                row.conrelid == table_oid
+                    && fold_name(&row.conname) == key
+                    && matches!(
+                        row.contype,
+                        ConType::PrimaryKey | ConType::Unique | ConType::Exclusion
+                    )
+            })
+            .map(|row| row.value().clone())
+    }
+
     /// Append `pg_class` / `pg_sequence` rows for one sequence.
     pub fn persist_sequence_rows<L: PageLoader>(
         &self,

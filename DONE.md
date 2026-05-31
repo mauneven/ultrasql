@@ -698,6 +698,10 @@ as a concise evidence ledger; roadmap stays for open gates only.
   tombstone, clears live index comments, and stays dropped after restart.
   Evidence: `cargo test -p ultrasql-server --test drop_index_round_trip` and
   `cargo test -p ultrasql-planner drop_index`.
+- `DROP INDEX` now rejects primary-key and catalog-recorded
+  constraint-backed indexes, preventing direct index drops from weakening
+  declared constraints. Evidence:
+  `cargo test -p ultrasql-server --test drop_index_round_trip`.
 - Dropped sequences remove sequence privilege grants from memory and durable
   `pg_privileges.meta`, so a recreated sequence cannot inherit stale ACLs by
   name. Evidence:
