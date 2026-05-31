@@ -2106,3 +2106,6 @@ as a concise evidence ledger; roadmap stays for open gates only.
   with SQLSTATE `22003` instead of saturating client-visible row totals.
   Evidence:
   `cargo test -p ultrasql-server result_encoder::tests --lib -- --nocapture`.
+- Direct scalar aggregate fast paths now use checked COUNT/AVG row counters and
+  nullable-input counts instead of silent saturation. Evidence:
+  `cargo test -p ultrasql-executor direct_scalar_agg::tests --lib -- --nocapture`.

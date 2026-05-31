@@ -207,7 +207,7 @@ impl Operator for DirectScalarAggScan {
         // row count for AVG. Both start at zero; the AVG/SUM division
         // below substitutes a NULL row when the row count is zero.
         let mut total_sum: i64 = 0;
-        let mut count_rows: usize = 0;
+        let mut count_rows: i64 = 0;
 
         while let Some(batch) = self.child.next_batch()? {
             let rows = batch.rows();
@@ -216,7 +216,7 @@ impl Operator for DirectScalarAggScan {
             }
             match self.input {
                 InputKind::Count => {
-                    count_rows = count_rows.saturating_add(rows);
+                    checked_count_increment(&mut count_rows, rows)?;
                 }
                 InputKind::Int32 { col_idx } => {
                     let cols = batch.columns();
@@ -234,7 +234,7 @@ impl Operator for DirectScalarAggScan {
                     };
                     let (delta, non_nulls) = sum_i32_nullable(c)?;
                     total_sum = checked_sum(total_sum, delta, "DirectScalarAggScan SUM(INT)")?;
-                    count_rows = count_rows.saturating_add(non_nulls);
+                    checked_count_increment(&mut count_rows, non_nulls)?;
                 }
                 InputKind::Int64 { col_idx } => {
                     let cols = batch.columns();
@@ -252,7 +252,7 @@ impl Operator for DirectScalarAggScan {
                     };
                     let (delta, non_nulls) = sum_i64_nullable(c)?;
                     total_sum = checked_sum(total_sum, delta, "DirectScalarAggScan SUM(BIGINT)")?;
-                    count_rows = count_rows.saturating_add(non_nulls);
+                    checked_count_increment(&mut count_rows, non_nulls)?;
                 }
             }
         }
@@ -269,8 +269,7 @@ impl Operator for DirectScalarAggScan {
                 }
             }
             DirectScalarAggKind::CountStar => {
-                let count_i64 = i64::try_from(count_rows).unwrap_or(i64::MAX);
-                Column::Int64(NumericColumn::from_data(vec![count_i64]))
+                Column::Int64(NumericColumn::from_data(vec![count_rows]))
             }
             DirectScalarAggKind::Avg => {
                 if count_rows == 0 {
@@ -324,6 +323,23 @@ fn checked_sum(acc: i64, delta: i64, context: &str) -> Result<i64, ExecError> {
         .ok_or_else(|| ExecError::NumericFieldOverflow(format!("{context} overflow")))
 }
 
+fn checked_count_increment(count: &mut i64, delta: usize) -> Result<(), ExecError> {
+    let delta = i64::try_from(delta).map_err(|_| {
+        ExecError::NumericFieldOverflow("DirectScalarAggScan COUNT overflow".to_owned())
+    })?;
+    *count = count.checked_add(delta).ok_or_else(|| {
+        ExecError::NumericFieldOverflow("DirectScalarAggScan COUNT overflow".to_owned())
+    })?;
+    Ok(())
+}
+
+fn checked_local_count_increment(count: &mut usize) -> Result<(), ExecError> {
+    *count = count.checked_add(1).ok_or_else(|| {
+        ExecError::NumericFieldOverflow("DirectScalarAggScan COUNT overflow".to_owned())
+    })?;
+    Ok(())
+}
+
 fn sum_i32_nullable(c: &NumericColumn<i32>) -> Result<(i64, usize), ExecError> {
     match c.nulls() {
         None => Ok((sum_i32_widening(c), c.len())),
@@ -333,7 +349,7 @@ fn sum_i32_nullable(c: &NumericColumn<i32>) -> Result<(i64, usize), ExecError> {
             for (idx, value) in c.data().iter().copied().enumerate() {
                 if nulls.get(idx) {
                     sum = checked_sum(sum, i64::from(value), "DirectScalarAggScan SUM(INT)")?;
-                    count = count.saturating_add(1);
+                    checked_local_count_increment(&mut count)?;
                 }
             }
             Ok((sum, count))
@@ -356,7 +372,7 @@ fn sum_i64_nullable(c: &NumericColumn<i64>) -> Result<(i64, usize), ExecError> {
             for (idx, value) in c.data().iter().copied().enumerate() {
                 if nulls.get(idx) {
                     sum = checked_sum(sum, value, "DirectScalarAggScan SUM(BIGINT)")?;
-                    count = count.saturating_add(1);
+                    checked_local_count_increment(&mut count)?;
                 }
             }
             Ok((sum, count))
@@ -448,6 +464,15 @@ mod tests {
             .expect_err("SUM(BIGINT) overflow must not wrap");
 
         assert!(matches!(err, ExecError::NumericFieldOverflow(_)), "{err:?}");
+    }
+
+    #[test]
+    fn count_increment_overflow_returns_typed_error() {
+        let mut count = i64::MAX;
+        let err = checked_count_increment(&mut count, 1)
+            .expect_err("direct scalar count overflow must not saturate");
+        assert!(matches!(err, ExecError::NumericFieldOverflow(_)));
+        assert_eq!(count, i64::MAX);
     }
 
     #[test]
