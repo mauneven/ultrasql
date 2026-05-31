@@ -15,7 +15,7 @@ use ultrasql_vec::Batch;
 
 use crate::eval::Eval;
 use crate::seq_scan::build_batch;
-use crate::{ExecError, Operator};
+use crate::{ExecError, Operator, eval_error_to_exec_error};
 
 /// Leaf operator materialising a list of scalar-expression rows.
 ///
@@ -81,11 +81,15 @@ impl Operator for ValuesScan {
             let mut value_row: Vec<Value> = Vec::with_capacity(expr_row.len());
             for (col_idx, expr) in expr_row.iter().enumerate() {
                 let evaluator = Eval::new(expr.clone());
-                let val = evaluator.eval(empty_row).map_err(|e| {
-                    ExecError::TypeMismatch(format!(
-                        "values scan: row {row_idx} col {col_idx}: {e}"
-                    ))
-                })?;
+                let val =
+                    evaluator.eval(empty_row).map_err(|error| {
+                        match eval_error_to_exec_error(error) {
+                            ExecError::TypeMismatch(detail) => ExecError::TypeMismatch(format!(
+                                "values scan: row {row_idx} col {col_idx}: {detail}"
+                            )),
+                            typed => typed,
+                        }
+                    })?;
                 value_row.push(val);
             }
             decoded.push(value_row);

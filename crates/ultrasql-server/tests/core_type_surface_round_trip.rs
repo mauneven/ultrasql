@@ -251,6 +251,20 @@ async fn core_scalar_types_round_trip_over_postgres_wire() {
         result_err.code().map(tokio_postgres::error::SqlState::code),
         Some("22P02")
     );
+    client
+        .batch_execute("CREATE TABLE values_invalid_text_cast_surface (x INTEGER)")
+        .await
+        .expect("create invalid values cast table");
+    let values_err = client
+        .simple_query(
+            "INSERT INTO values_invalid_text_cast_surface VALUES (CAST('not-int' AS INTEGER))",
+        )
+        .await
+        .expect_err("invalid scalar values cast must fail");
+    assert_eq!(
+        values_err.code().map(tokio_postgres::error::SqlState::code),
+        Some("22P02")
+    );
 
     client
         .batch_execute(
