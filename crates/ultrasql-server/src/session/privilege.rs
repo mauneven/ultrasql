@@ -2,7 +2,7 @@
 
 use tokio::io::{AsyncRead, AsyncWrite};
 use ultrasql_planner::{
-    Catalog as PlannerCatalog, LogicalDefaultPrivilegeOperation, LogicalPlan, LogicalPrivilegeKind,
+    LogicalDefaultPrivilegeOperation, LogicalPlan, LogicalPrivilegeKind,
     LogicalPrivilegeObjectKind, LogicalPrivilegeSpec,
 };
 
@@ -200,6 +200,7 @@ where
         object_kind: LogicalPrivilegeObjectKind,
         objects: &[String],
     ) -> Result<(), ServerError> {
+        self.ensure_privilege_objects_exist(object_kind, objects)?;
         if self
             .state
             .role_catalog
@@ -218,13 +219,23 @@ where
         }
     }
 
+    fn ensure_privilege_objects_exist(
+        &self,
+        object_kind: LogicalPrivilegeObjectKind,
+        objects: &[String],
+    ) -> Result<(), ServerError> {
+        if object_kind == LogicalPrivilegeObjectKind::Table {
+            for table in objects {
+                self.table_oid_for_privilege_object(table)?;
+            }
+        }
+        Ok(())
+    }
+
     fn ensure_table_privilege_owner(&self, tables: &[String]) -> Result<(), ServerError> {
-        let snapshot = self.state.catalog_snapshot();
         let current_user = self.current_user.to_ascii_lowercase();
         for table in tables {
-            let Some(table_oid) = PlannerCatalog::lookup_table_oid(snapshot.as_ref(), table) else {
-                return Err(ServerError::ddl(format!("table '{table}' does not exist")));
-            };
+            let table_oid = self.table_oid_for_privilege_object(table)?;
             let owns_table = self
                 .state
                 .row_security
@@ -237,6 +248,23 @@ where
             }
         }
         Ok(())
+    }
+
+    fn table_oid_for_privilege_object(
+        &self,
+        table: &str,
+    ) -> Result<ultrasql_core::Oid, ServerError> {
+        let snapshot = self.state.catalog_snapshot();
+        let table_name = privilege_object_simple_name(table);
+        let Some(meta) = snapshot.tables.get(table_name) else {
+            return Err(ServerError::ddl(format!("table '{table}' does not exist")));
+        };
+        if let Some(namespace) = privilege_object_namespace(table)
+            && !meta.schema_name.eq_ignore_ascii_case(namespace)
+        {
+            return Err(ServerError::ddl(format!("table '{table}' does not exist")));
+        }
+        Ok(meta.oid)
     }
 
     fn ensure_schema_privilege_owner(&self, schemas: &[String]) -> Result<(), ServerError> {
@@ -298,6 +326,16 @@ fn convert_object_kind(kind: LogicalPrivilegeObjectKind) -> PrivilegeObjectKind 
         LogicalPrivilegeObjectKind::Sequence => PrivilegeObjectKind::Sequence,
         LogicalPrivilegeObjectKind::Function => PrivilegeObjectKind::Function,
     }
+}
+
+fn privilege_object_simple_name(object: &str) -> &str {
+    object.rsplit('.').next().unwrap_or(object)
+}
+
+fn privilege_object_namespace(object: &str) -> Option<&str> {
+    let mut parts = object.rsplit('.');
+    parts.next()?;
+    parts.next()
 }
 
 fn convert_privileges(privileges: &[LogicalPrivilegeSpec]) -> Vec<PrivilegeRequest> {

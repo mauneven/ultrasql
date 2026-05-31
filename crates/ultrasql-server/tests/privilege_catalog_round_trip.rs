@@ -536,6 +536,49 @@ async fn schema_usage_is_required_for_table_access() {
 }
 
 #[tokio::test]
+async fn grant_table_respects_schema_qualifier() {
+    let running = start_sample_server("privilege_table_schema_qualifier_guard").await;
+    let client = &running.client;
+
+    client
+        .batch_execute(
+            "CREATE ROLE tester SUPERUSER LOGIN; \
+             CREATE ROLE qualifier_reader LOGIN; \
+             CREATE SCHEMA app; \
+             CREATE TABLE grant_qualifier_guard (id INT)",
+        )
+        .await
+        .expect("create public table and separate schema");
+
+    client
+        .batch_execute("GRANT SELECT ON TABLE app.grant_qualifier_guard TO qualifier_reader")
+        .await
+        .expect_err("qualified GRANT must not target public same-name table");
+
+    let visible = client
+        .query_one(
+            "SELECT has_table_privilege('qualifier_reader', 'app.grant_qualifier_guard', 'SELECT')",
+            &[],
+        )
+        .await
+        .expect("privilege check after rejected qualified grant")
+        .get::<_, bool>(0);
+    assert!(!visible, "rejected qualified GRANT must not persist");
+
+    client
+        .batch_execute(
+            "DROP TABLE grant_qualifier_guard; \
+             DROP SCHEMA app; \
+             DROP ROLE tester; \
+             DROP ROLE qualifier_reader",
+        )
+        .await
+        .expect("cleanup table privilege qualifier guard");
+
+    shutdown(running).await;
+}
+
+#[tokio::test]
 async fn non_superuser_cannot_alter_default_privileges_for_privileged_role() {
     let running = start_sample_server("privilege_catalog_test").await;
     let client = &running.client;

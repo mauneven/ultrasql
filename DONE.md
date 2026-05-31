@@ -1391,3 +1391,7 @@ as a concise evidence ledger; roadmap stays for open gates only.
   targets instead of altering or dropping a same-name sequence in another
   schema. Evidence:
   `cargo test -p ultrasql-server --test sequence_round_trip -- --nocapture`.
+- Table privilege DDL now validates table object existence and explicit schema
+  qualifiers before the superuser administration bypass, preventing ghost
+  grants such as `GRANT ... ON TABLE missing_schema.same_name`. Evidence:
+  `cargo test -p ultrasql-server --test privilege_catalog_round_trip -- --nocapture`.
