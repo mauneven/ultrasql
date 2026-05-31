@@ -2129,3 +2129,6 @@ as a concise evidence ledger; roadmap stays for open gates only.
 - WAL recovery scanning now checks decoded record-end and recovered-record
   count arithmetic instead of silently saturating scanner state. Evidence:
   `cargo test -p ultrasql-wal recovery::tests::recovery_record_ --lib -- --nocapture`.
+- Work-memory reservations now reject atomic counter overflow even when tests
+  configure `u64::MAX` as the budget limit. Evidence:
+  `cargo test -p ultrasql-executor work_mem::tests --lib -- --nocapture`.

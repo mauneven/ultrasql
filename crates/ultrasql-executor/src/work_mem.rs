@@ -86,7 +86,11 @@ impl WorkMemBudget {
         // within the limit.
         let mut current = self.used.load(Ordering::Relaxed);
         loop {
-            let new_total = current.saturating_add(bytes);
+            let Some(new_total) = current.checked_add(bytes) else {
+                return Err(ExecError::Unsupported(
+                    "work_mem budget exceeded; operator must spill",
+                ));
+            };
             if new_total > self.limit_bytes {
                 return Err(ExecError::Unsupported(
                     "work_mem budget exceeded; operator must spill",
@@ -174,6 +178,21 @@ mod tests {
         let budget = WorkMemBudget::new(1024);
         let err = budget.reserve(1025).expect_err("must fail");
         assert!(matches!(err, ExecError::Unsupported(_)));
+    }
+
+    #[test]
+    fn reserve_rejects_counter_overflow_even_with_max_limit() {
+        let budget = WorkMemBudget::new(u64::MAX);
+        let first = budget.reserve(u64::MAX).expect("max reservation fits");
+
+        let err = budget
+            .reserve(1)
+            .expect_err("counter overflow must not saturate");
+        assert!(matches!(err, ExecError::Unsupported(_)));
+        assert_eq!(budget.used_bytes(), u64::MAX);
+
+        drop(first);
+        assert_eq!(budget.used_bytes(), 0);
     }
 
     #[test]
