@@ -881,6 +881,10 @@ as a concise evidence ledger; roadmap stays for open gates only.
   sessions parked inside an explicit transaction and returns to `idle` after
   `COMMIT` or `ROLLBACK`. Evidence:
   `cargo test -p ultrasql-server --test catalog_views_round_trip pg_stat_activity_lists_open_sessions -- --nocapture`.
+- Idle `pg_catalog.pg_stat_activity` sessions now expose a basic client wait
+  event (`Client` / `ClientRead`) and clear wait-event columns while actively
+  executing a statement. Evidence:
+  `cargo test -p ultrasql-server --test catalog_views_round_trip pg_stat_activity_lists_open_sessions -- --nocapture`.
 - `GUI introspection probes` exist for `pgAdmin`, `DBeaver`, and `DataGrip`.
 - Migration tool certification covers `Flyway`, `Liquibase`, and `Alembic`.
 

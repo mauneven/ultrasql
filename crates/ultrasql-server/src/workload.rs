@@ -13,6 +13,8 @@ const LATENCY_BUCKET_COUNT: usize = LATENCY_BUCKETS_US.len() + 1;
 const MICROS_PER_DAY: i64 = 86_400_000_000;
 const UNIX_TO_ENGINE_EPOCH_DAYS: i64 = 10_957;
 const UNIX_TO_ENGINE_EPOCH_MICROS: i64 = UNIX_TO_ENGINE_EPOCH_DAYS * MICROS_PER_DAY;
+const WAIT_EVENT_TYPE_CLIENT: &str = "Client";
+const WAIT_EVENT_CLIENT_READ: &str = "ClientRead";
 
 /// Aggregated pg_stat_statements-style metrics for one normalized query.
 #[derive(Clone, Debug, PartialEq)]
@@ -496,8 +498,8 @@ impl WorkloadRecorder {
                 xact_start: None,
                 query_start: None,
                 state_change: now,
-                wait_event_type: None,
-                wait_event: None,
+                wait_event_type: Some(WAIT_EVENT_TYPE_CLIENT.to_string()),
+                wait_event: Some(WAIT_EVENT_CLIENT_READ.to_string()),
                 state: "idle".to_string(),
                 query: None,
             },
@@ -539,6 +541,8 @@ impl WorkloadRecorder {
             row.state = "active".to_string();
             row.query_start = Some(now);
             row.state_change = now;
+            row.wait_event_type = None;
+            row.wait_event = None;
             row.query = Some(query.into());
         }
     }
@@ -553,6 +557,8 @@ impl WorkloadRecorder {
                 "idle".to_string()
             };
             row.query_start = None;
+            row.wait_event_type = Some(WAIT_EVENT_TYPE_CLIENT.to_string());
+            row.wait_event = Some(WAIT_EVENT_CLIENT_READ.to_string());
             row.query = None;
         }
     }

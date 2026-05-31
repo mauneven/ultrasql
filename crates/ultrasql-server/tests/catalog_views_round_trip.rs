@@ -1293,8 +1293,14 @@ async fn pg_stat_activity_lists_open_sessions() {
     assert!(rows[1].get::<_, bool>(4));
     assert!(!rows[1].get::<_, bool>(5));
     assert!(rows[1].get::<_, bool>(6));
-    assert_eq!(rows[1].get::<_, Option<String>>(7), None);
-    assert_eq!(rows[1].get::<_, Option<String>>(8), None);
+    assert_eq!(
+        rows[1].get::<_, Option<String>>(7).as_deref(),
+        Some("Client")
+    );
+    assert_eq!(
+        rows[1].get::<_, Option<String>>(8).as_deref(),
+        Some("ClientRead")
+    );
 
     let row = client_a
         .query_one(
