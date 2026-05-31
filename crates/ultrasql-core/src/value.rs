@@ -2531,6 +2531,16 @@ mod tests {
             xml_xpath_element_fragments("/root/item/name/text()", doc),
             Some(vec!["A".to_owned(), "B".to_owned()])
         );
+        let namespaced =
+            r#"<r:root xmlns:r="urn:r" xmlns:x="urn:x"><r:item x:id="7">Z</r:item></r:root>"#;
+        assert_eq!(
+            xml_xpath_element_fragments("/r:root/r:item/@x:id", namespaced),
+            Some(vec!["7".to_owned()])
+        );
+        assert_eq!(
+            xml_xpath_element_fragments("/r:root/r:item/text()", namespaced),
+            Some(vec!["Z".to_owned()])
+        );
         assert_eq!(
             xml_xpath_element_fragments("/root/missing", doc),
             Some(Vec::new())

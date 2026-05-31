@@ -75,8 +75,8 @@ file focused on what still blocks production.
 - Full-text search remaining: dedicated `TSVECTOR` / `TSQUERY` type
   OIDs/storage, headline, dictionaries, full ranking parity, and GIN planner
   integration beyond the current text-backed constructor / match subset.
-- XML remaining surface: namespaces, remaining XPath axes/functions, `XMLTABLE`,
-  and function catalog parity beyond the supported secure subset.
+- XML remaining surface: namespace URI mapping, remaining XPath axes/functions,
+  `XMLTABLE`, and function catalog parity beyond the supported secure subset.
 - Locale/collation remaining: ICU-backed collations, `CREATE COLLATION`, and
   `COLLATE` in definitions and `ORDER BY` beyond the base
   `pg_collation` catalog rows.
