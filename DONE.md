@@ -2098,3 +2098,7 @@ as a concise evidence ledger; roadmap stays for open gates only.
   enqueueing logical replication changes, and extended-query explicit
   transactions propagate the failure into failed-transaction state. Evidence:
   `cargo test -p ultrasql-server session::execute::tests::plan_shape_predicates_and_command_tags_cover_dml_edges --lib -- --nocapture`.
+- Append-only materialized-view row offsets and flush counters now use checked
+  arithmetic and atomic checked advancement instead of saturating or wrapping
+  source offsets. Evidence:
+  `cargo test -p ultrasql-server session::execute::tests::materialized_view_row_flush_rejects_counter_overflow --lib -- --nocapture`.

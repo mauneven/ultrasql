@@ -407,7 +407,10 @@ where
                         self.flush_pending_dml_effects();
                         return Err(e);
                     }
-                    self.flush_pending_materialized_view_rows();
+                    if let Err(e) = self.flush_pending_materialized_view_rows() {
+                        self.flush_pending_dml_effects();
+                        return Err(e);
+                    }
                     self.flush_pending_dml_effects();
                 }
                 Ok(SelectResult {

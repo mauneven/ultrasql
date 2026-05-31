@@ -87,6 +87,17 @@ impl RlsPlanOptionExt for Option<LogicalPlan> {
     }
 }
 
+fn materialized_view_row_count_overflow() -> ServerError {
+    ServerError::Execute(ultrasql_executor::ExecError::NumericFieldOverflow(
+        "materialized view row count overflow".to_owned(),
+    ))
+}
+
+fn checked_materialized_view_row_add(left: u64, right: u64) -> Result<u64, ServerError> {
+    left.checked_add(right)
+        .ok_or_else(materialized_view_row_count_overflow)
+}
+
 fn bool_literal(value: bool) -> ScalarExpr {
     ScalarExpr::Literal {
         value: Value::Bool(value),
@@ -2572,7 +2583,7 @@ where
             "materialized-view insert maintenance transaction",
         )?;
         self.pending_materialized_view_rows.extend(rows);
-        self.flush_pending_materialized_view_rows();
+        self.flush_pending_materialized_view_rows()?;
         Ok(())
     }
 
@@ -2606,7 +2617,7 @@ where
             "materialized-view table maintenance transaction",
         )?;
         self.pending_materialized_view_rows.extend(rows);
-        self.flush_pending_materialized_view_rows();
+        self.flush_pending_materialized_view_rows()?;
         Ok(())
     }
 
@@ -2676,8 +2687,8 @@ where
             .iter()
             .filter(|(pending_view, _)| pending_view.view_table == view.view_table)
             .map(|(_, rows)| *rows)
-            .fold(0_u64, u64::saturating_add);
-        let offset = committed.saturating_add(pending);
+            .try_fold(0_u64, checked_materialized_view_row_add)?;
+        let offset = checked_materialized_view_row_add(committed, pending)?;
         let source = LogicalPlan::Limit {
             input: Box::new(view.source.clone()),
             n: u64::MAX,
@@ -2836,7 +2847,7 @@ where
         }
     }
 
-    pub(crate) fn flush_pending_materialized_view_rows(&mut self) {
+    pub(crate) fn flush_pending_materialized_view_rows(&mut self) -> Result<(), ServerError> {
         let drained = std::mem::take(&mut self.pending_materialized_view_rows);
         for (view, rows) in drained {
             if rows == 0 {
@@ -2844,8 +2855,13 @@ where
             }
             let previous = view
                 .materialized_rows
-                .fetch_add(rows, std::sync::atomic::Ordering::AcqRel);
-            let total = previous.saturating_add(rows);
+                .fetch_update(
+                    std::sync::atomic::Ordering::AcqRel,
+                    std::sync::atomic::Ordering::Acquire,
+                    |current| current.checked_add(rows),
+                )
+                .map_err(|_| materialized_view_row_count_overflow())?;
+            let total = checked_materialized_view_row_add(previous, rows)?;
             if let Err(err) = self
                 .state
                 .persist_materialized_view_runtime_metadata(&view, total)
@@ -2858,6 +2874,7 @@ where
             }
             self.state.note_table_modifications(&view.view_table, rows);
         }
+        Ok(())
     }
 
     pub(crate) fn run_post_response_maintenance(&mut self) {
@@ -3607,6 +3624,32 @@ mod tests {
         assert_eq!(
             Session::<tokio::io::DuplexStream>::parse_command_rows_tag(&[]),
             0
+        );
+    }
+
+    #[test]
+    fn materialized_view_row_flush_rejects_counter_overflow() {
+        let mut session = test_session();
+        let runtime = Arc::new(crate::MaterializedViewRuntime {
+            view_table: "mv_t".to_owned(),
+            source_table: "t".to_owned(),
+            source: scan_plan(),
+            materialized_rows: std::sync::atomic::AtomicU64::new(u64::MAX),
+        });
+        session
+            .pending_materialized_view_rows
+            .push((Arc::clone(&runtime), 1));
+
+        let err = session
+            .flush_pending_materialized_view_rows()
+            .expect_err("materialized view row counter overflow must not wrap");
+
+        assert_eq!(err.sqlstate(), "22003");
+        assert_eq!(
+            runtime
+                .materialized_rows
+                .load(std::sync::atomic::Ordering::Acquire),
+            u64::MAX
         );
     }
 
