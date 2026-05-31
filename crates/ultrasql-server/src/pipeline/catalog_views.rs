@@ -294,7 +294,10 @@ fn virtual_rows(name: &str, ctx: &LowerCtx<'_>) -> Option<(Schema, Vec<Vec<Value
             schema_information_schema_sequences(),
             rows_information_schema_sequences(ctx),
         )),
-        "information_schema.routines" => Some((schema_information_schema_routines(), Vec::new())),
+        "information_schema.routines" => Some((
+            schema_information_schema_routines(),
+            rows_information_schema_routines(),
+        )),
         "information_schema.triggers" => Some((schema_information_schema_triggers(), Vec::new())),
         _ => None,
     }
@@ -2829,15 +2832,20 @@ fn rows_pg_proc() -> Vec<Vec<Value>> {
         .iter()
         .enumerate()
         .filter_map(|(offset, name)| {
-            let offset = u32::try_from(offset).ok()?;
+            let oid = pg_proc_oid(offset)?;
             Some(vec![
-                Value::Int64(i64::from(PG_PROC_BASE_OID.saturating_add(offset))),
+                Value::Int64(oid),
                 v_text(*name),
                 Value::Int64(PG_CATALOG_OID),
                 v_text("f"),
             ])
         })
         .collect()
+}
+
+fn pg_proc_oid(offset: usize) -> Option<i64> {
+    let offset = u32::try_from(offset).ok()?;
+    PG_PROC_BASE_OID.checked_add(offset).map(i64::from)
 }
 
 const fn pg_proc_builtin_names() -> &'static [&'static str] {
@@ -3291,6 +3299,32 @@ fn schema_information_schema_routines() -> Schema {
         Field::required("sql_data_access", text()),
         Field::required("security_type", text()),
     ])
+}
+
+fn rows_information_schema_routines() -> Vec<Vec<Value>> {
+    pg_proc_builtin_names()
+        .iter()
+        .enumerate()
+        .filter_map(|(offset, name)| {
+            let oid = pg_proc_oid(offset)?;
+            Some(vec![
+                v_text("ultrasql"),
+                v_text("pg_catalog"),
+                v_text(format!("{name}_{oid}")),
+                v_text("ultrasql"),
+                v_text("pg_catalog"),
+                v_text(*name),
+                v_text("FUNCTION"),
+                Value::Null,
+                Value::Null,
+                Value::Null,
+                Value::Null,
+                v_text("NO"),
+                v_text("READS SQL DATA"),
+                v_text("INVOKER"),
+            ])
+        })
+        .collect()
 }
 
 fn schema_information_schema_triggers() -> Schema {

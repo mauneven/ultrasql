@@ -558,7 +558,12 @@ async fn pg_catalog_and_information_schema_reflect_runtime_objects() {
         )
         .await
         .expect("information_schema.routines query");
-    assert!(routines.is_empty());
+    assert!(
+        routines.iter().any(|row| {
+            row.get::<_, String>(0) == "pg_catalog" && row.get::<_, String>(1) == "version"
+        }),
+        "information_schema.routines should expose builtin routines"
+    );
 
     let triggers = client
         .query(
