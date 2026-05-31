@@ -2700,10 +2700,12 @@ impl TpchQ20BuildState {
         {
             return Ok(());
         }
-        *self
+        let part_supplier_quantity = self
             .quantity_by_part_supplier
             .entry((partkey, suppkey))
-            .or_default() += quantity;
+            .or_default();
+        *part_supplier_quantity =
+            checked_direct_quantity_add_i64(*part_supplier_quantity, quantity)?;
         Ok(())
     }
 }
@@ -5845,6 +5847,27 @@ mod tests {
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].s_name, "Supplier#7");
         assert_eq!(rows[0].s_address, "addr");
+    }
+
+    #[cfg(feature = "sql-bench")]
+    #[test]
+    fn tpch_q20_sidecar_rejects_quantity_overflow() {
+        let mut state = TpchQ20BuildState::default();
+        state
+            .ingest(
+                "part",
+                "5|forest green part|mfgr|Brand#1|TYPE|3|SM BOX|1.00|comment",
+            )
+            .expect("part");
+        state
+            .ingest_lineitem_values(5, 7, i64::MAX, DIRECT_Q6_SHIPDATE_START_1994_01_01)
+            .expect("first line");
+
+        let err = state
+            .ingest_lineitem_values(5, 7, 1, DIRECT_Q6_SHIPDATE_START_1994_01_01)
+            .expect_err("quantity overflow should reject");
+
+        assert!(err.to_string().contains("TPC-H sidecar quantity overflow"));
     }
 
     #[cfg(feature = "sql-bench")]

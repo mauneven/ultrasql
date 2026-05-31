@@ -2026,6 +2026,10 @@ as a concise evidence ledger; roadmap stays for open gates only.
   discount factors and checked aggregate revenue overflow instead of saturating
   or wrapping cached revenue. Evidence:
   `cargo test -p ultrasql-bench --features sql-bench tpch::load::tests --lib -- --nocapture`.
+- TPC-H direct-load Q20 supplier-availability sidecar now rejects checked
+  `(part, supplier)` quantity accumulation overflow instead of panicking or
+  wrapping cached lineitem totals. Evidence:
+  `cargo test -p ultrasql-bench --features sql-bench tpch::load::tests --lib -- --nocapture`.
 - TPC-H direct-load Q14 promo-volume sidecar now rejects malformed discount
   factors and checked `i128` promo/total volume accumulation overflow instead
   of accepting saturated factor math. Evidence:
