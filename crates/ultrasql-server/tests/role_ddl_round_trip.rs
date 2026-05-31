@@ -335,6 +335,27 @@ async fn role_catalog_survives_restart() {
         "NOLOGIN parent should survive restart"
     );
 
+    let membership = running
+        .client
+        .query_one(
+            "SELECT granted.rolname, member.rolname, grantor.rolname, m.admin_option \
+             FROM pg_catalog.pg_auth_members m \
+             JOIN pg_catalog.pg_roles granted ON granted.oid = m.roleid \
+             JOIN pg_catalog.pg_roles member ON member.oid = m.member \
+             JOIN pg_catalog.pg_roles grantor ON grantor.oid = m.grantor \
+             WHERE granted.rolname = 'parent' AND member.rolname = 'persisted'",
+            &[],
+        )
+        .await
+        .expect("persisted role membership visible after restart");
+    assert_eq!(membership.get::<_, String>(0), "parent");
+    assert_eq!(membership.get::<_, String>(1), "persisted");
+    assert_eq!(membership.get::<_, String>(2), "tester");
+    assert!(
+        membership.get::<_, bool>(3),
+        "ADMIN OPTION should survive restart"
+    );
+
     let conn_str = format!(
         "host={host} port={port} user=persisted application_name=role_restart_member",
         host = running.bound.ip(),

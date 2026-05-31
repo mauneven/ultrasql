@@ -756,6 +756,9 @@ as a concise evidence ledger; roadmap stays for open gates only.
 - Role inheritance and `SET ROLE` support transitive membership, cycle
   rejection, `INHERIT` / `NOINHERIT`, `RESET ROLE`, `current_user`, and
   `session_user`.
+- `pg_catalog.pg_auth_members` exposes durable role-membership edges with
+  role, member, grantor, and admin-option OIDs. Evidence:
+  `cargo test -p ultrasql-server --test role_ddl_round_trip role_catalog_survives_restart -- --nocapture`.
 - Default privileges apply matching templates for future tables and sequences.
 - Persistent RLS policies cover owner, superuser, `BYPASSRLS`, and restart
   semantics for the documented RAG tenant policy shape.

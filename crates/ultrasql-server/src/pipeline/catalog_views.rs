@@ -4,6 +4,8 @@
 //! binder. They are deliberately read-only and statement-local: a SELECT sees
 //! the snapshot captured at statement start, matching normal catalog lookup.
 
+use std::collections::HashMap;
+
 use ultrasql_core::{DataType, Field, Oid, Schema, Value};
 use ultrasql_executor::{MemTableScan, Operator, build_batch};
 use ultrasql_mvcc::{Visibility, XidStatusOracle, is_visible};
@@ -196,7 +198,7 @@ fn virtual_rows(name: &str, ctx: &LowerCtx<'_>) -> Option<(Schema, Vec<Vec<Value
         "pg_catalog.pg_views" => Some((schema_pg_views(), Vec::new())),
         "pg_catalog.pg_sequences" => Some((schema_pg_sequences(), rows_pg_sequences(ctx))),
         "pg_catalog.pg_roles" => Some((schema_pg_roles(), rows_pg_roles(ctx))),
-        "pg_catalog.pg_auth_members" => Some((schema_pg_auth_members(), Vec::new())),
+        "pg_catalog.pg_auth_members" => Some((schema_pg_auth_members(), rows_pg_auth_members(ctx))),
         "pg_catalog.pg_user" => Some((schema_pg_user(), rows_pg_user(ctx))),
         "pg_catalog.pg_get_keywords" => Some((schema_pg_get_keywords(), rows_pg_get_keywords())),
         "pg_catalog.pg_settings" => Some((schema_pg_settings(), rows_pg_settings(ctx))),
@@ -1420,12 +1422,7 @@ fn schema_pg_policy() -> Schema {
 }
 
 fn rows_pg_policy(ctx: &LowerCtx<'_>) -> Vec<Vec<Value>> {
-    let roles = ctx
-        .role_catalog
-        .list_roles()
-        .into_iter()
-        .map(|role| (role.name, i64::from(role.oid)))
-        .collect::<std::collections::HashMap<_, _>>();
+    let roles = role_oid_map(ctx);
     let mut policies = ctx
         .row_security
         .iter()
@@ -1471,10 +1468,7 @@ fn policy_command_code(command: crate::RuntimeRlsCommand) -> &'static str {
     }
 }
 
-fn policy_role_oids(
-    policy_roles: &[String],
-    role_oids: &std::collections::HashMap<String, i64>,
-) -> Vec<Value> {
+fn policy_role_oids(policy_roles: &[String], role_oids: &HashMap<String, i64>) -> Vec<Value> {
     if policy_roles.is_empty() {
         return vec![Value::Int64(0)];
     }
@@ -1860,6 +1854,25 @@ fn schema_pg_auth_members() -> Schema {
     ])
 }
 
+fn rows_pg_auth_members(ctx: &LowerCtx<'_>) -> Vec<Vec<Value>> {
+    let roles = role_oid_map(ctx);
+    ctx.role_catalog
+        .list_memberships()
+        .into_iter()
+        .filter_map(|membership| {
+            let roleid = roles.get(&membership.role).copied()?;
+            let member = roles.get(&membership.member).copied()?;
+            let grantor = roles.get(&membership.grantor).copied()?;
+            Some(vec![
+                Value::Int64(roleid),
+                Value::Int64(member),
+                Value::Int64(grantor),
+                Value::Bool(membership.admin_option),
+            ])
+        })
+        .collect()
+}
+
 fn schema_pg_user() -> Schema {
     schema([
         Field::required("usename", text()),
@@ -1892,6 +1905,14 @@ fn rows_pg_user(ctx: &LowerCtx<'_>) -> Vec<Vec<Value>> {
                 Value::Null,
             ]
         })
+        .collect()
+}
+
+fn role_oid_map(ctx: &LowerCtx<'_>) -> HashMap<String, i64> {
+    ctx.role_catalog
+        .list_roles()
+        .into_iter()
+        .map(|role| (role.name, i64::from(role.oid)))
         .collect()
 }
 
