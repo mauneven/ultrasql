@@ -554,7 +554,7 @@ pub struct ModifyTable<L: PageLoader> {
     returning_evaluators: Vec<Eval>,
     child: Box<dyn Operator>,
     done: bool,
-    affected: u64,
+    affected: i64,
 }
 
 impl<L: PageLoader> std::fmt::Debug for ModifyTable<L> {
@@ -579,6 +579,16 @@ impl<L: PageLoader> ModifyTable<L> {
                 Schema::empty()
             }
         }
+    }
+
+    fn add_affected_rows(&mut self, rows: usize) -> Result<(), ExecError> {
+        let delta = i64::try_from(rows).map_err(|_| {
+            ExecError::NumericFieldOverflow("DML affected row count overflow".to_owned())
+        })?;
+        self.affected = self.affected.checked_add(delta).ok_or_else(|| {
+            ExecError::NumericFieldOverflow("DML affected row count overflow".to_owned())
+        })?;
+        Ok(())
     }
 
     /// Construct a `ModifyTable` operator.
@@ -1030,8 +1040,7 @@ impl<L: PageLoader + Send + Sync + std::fmt::Debug + 'static> Operator for Modif
                             returning_rows.push(self.evaluate_returning_row(&row)?);
                         }
                     }
-                    let n_u64 = u64::try_from(n).unwrap_or(u64::MAX);
-                    self.affected = self.affected.saturating_add(n_u64);
+                    self.add_affected_rows(n)?;
                 }
                 ModifyKind::Update { .. } => {
                     // Columnar fast path: `UPDATE t SET col_i = col_i ± lit`
@@ -1275,8 +1284,7 @@ impl<L: PageLoader + Send + Sync + std::fmt::Debug + 'static> Operator for Modif
                             }
                         }
                     }
-                    let n_u64 = u64::try_from(n).unwrap_or(u64::MAX);
-                    self.affected = self.affected.saturating_add(n_u64);
+                    self.add_affected_rows(n)?;
                 }
             }
         }
@@ -1318,8 +1326,7 @@ impl<L: PageLoader + Send + Sync + std::fmt::Debug + 'static> Operator for Modif
                     &outcomes,
                 )?;
             }
-            let n_u64 = u64::try_from(n).unwrap_or(u64::MAX);
-            self.affected = self.affected.saturating_add(n_u64);
+            self.add_affected_rows(n)?;
         }
 
         if returning_active {
@@ -1327,8 +1334,7 @@ impl<L: PageLoader + Send + Sync + std::fmt::Debug + 'static> Operator for Modif
         }
 
         // Emit the affected-row-count batch.
-        let affected_i64 = i64::try_from(self.affected).unwrap_or(i64::MAX);
-        let batch = Batch::new([Column::Int64(NumericColumn::from_data(vec![affected_i64]))])
+        let batch = Batch::new([Column::Int64(NumericColumn::from_data(vec![self.affected]))])
             .map_err(ExecError::from)?;
         Ok(Some(batch))
     }
@@ -2505,6 +2511,33 @@ mod tests {
 
         // Verify 3 rows are present in the heap.
         assert_eq!(heap.block_count(rel()), 1, "one block should be allocated");
+    }
+
+    #[test]
+    fn insert_rejects_affected_row_counter_overflow() {
+        let heap = make_heap();
+        let schema = schema_i32_text();
+        let rows = vec![vec![lit_i32(1), lit_text("alice")]];
+        let source = ValuesScan::new(rows, schema.clone());
+
+        let mut op = ModifyTable::new(
+            Arc::clone(&heap),
+            rel(),
+            schema,
+            ModifyKind::Insert,
+            Xid::new(10),
+            CommandId::FIRST,
+            Xid::new(10),
+            CommandId::FIRST,
+            None,
+            Box::new(source),
+        );
+        op.affected = i64::MAX;
+
+        let err = op
+            .next_batch()
+            .expect_err("affected row count overflow must not clamp");
+        assert!(matches!(err, ExecError::NumericFieldOverflow(_)));
     }
 
     // -----------------------------------------------------------------------

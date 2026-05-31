@@ -2090,3 +2090,7 @@ as a concise evidence ledger; roadmap stays for open gates only.
   and grouped vectorized `SUM(INT)` now reports typed overflow instead of
   clamping to `i32::MAX`. Evidence:
   `cargo test -p ultrasql-executor hash_aggregate::tests --lib -- --nocapture`.
+- DML affected-row accounting now uses checked `i64` increments shared by
+  INSERT, UPDATE, and DELETE instead of silently saturating command counts.
+  Evidence:
+  `cargo test -p ultrasql-executor modify::tests --lib -- --nocapture`.
