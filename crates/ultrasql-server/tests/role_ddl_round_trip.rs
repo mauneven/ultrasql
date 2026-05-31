@@ -157,6 +157,50 @@ fn role_metadata_rejects_zero_role_oids_on_rebuild() {
 }
 
 #[test]
+fn role_metadata_rejects_missing_bootstrap_role_on_rebuild() {
+    let data_dir = tempfile::TempDir::new().expect("temp data dir");
+    std::fs::write(
+        data_dir.path().join("pg_auth.meta"),
+        concat!(
+            "# ultrasql auth runtime v1\n",
+            "role\tapp_only\t17000\t\tfalse\ttrue\tfalse\tfalse\ttrue\tfalse\tfalse\t-1\t\n"
+        ),
+    )
+    .expect("write auth metadata without bootstrap role");
+
+    let err = match Server::init(data_dir.path()) {
+        Ok(_) => panic!("auth metadata without bootstrap role should be rejected"),
+        Err(err) => err,
+    };
+    assert!(
+        err.to_string().contains("missing bootstrap role metadata"),
+        "expected missing bootstrap role rejection, got {err}"
+    );
+}
+
+#[test]
+fn role_metadata_rejects_wrong_bootstrap_oid_on_rebuild() {
+    let data_dir = tempfile::TempDir::new().expect("temp data dir");
+    std::fs::write(
+        data_dir.path().join("pg_auth.meta"),
+        concat!(
+            "# ultrasql auth runtime v1\n",
+            "role\tultrasql\t17000\t\ttrue\ttrue\ttrue\ttrue\ttrue\tfalse\tfalse\t-1\t\n"
+        ),
+    )
+    .expect("write auth metadata with wrong bootstrap oid");
+
+    let err = match Server::init(data_dir.path()) {
+        Ok(_) => panic!("wrong bootstrap OID metadata should be rejected"),
+        Err(err) => err,
+    };
+    assert!(
+        err.to_string().contains("invalid bootstrap role metadata"),
+        "expected invalid bootstrap OID rejection, got {err}"
+    );
+}
+
+#[test]
 fn role_metadata_rejects_duplicate_memberships_on_rebuild() {
     let data_dir = tempfile::TempDir::new().expect("temp data dir");
     std::fs::write(

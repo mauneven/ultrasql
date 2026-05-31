@@ -1206,7 +1206,8 @@ as a concise evidence ledger; roadmap stays for open gates only.
   loader rejects duplicate role names, role OIDs, and role-membership keys
   instead of silently applying last-row-wins state; it also rejects dangling
   membership role/member/grantor references, empty role names/refs, and zero
-  role OIDs. Evidence:
+  role OIDs. It requires the bootstrap `ultrasql` role to remain present with
+  its fixed OID before installing a restart snapshot. Evidence:
   `cargo test -p ultrasql-server --test role_ddl_round_trip -- --nocapture`.
 - Privilege catalog restart persistence is covered by `pg_privileges.meta`:
   `GRANT`, `REVOKE`, `ALTER DEFAULT PRIVILEGES`, and default-privilege

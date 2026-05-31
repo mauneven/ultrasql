@@ -5464,6 +5464,24 @@ impl Server {
                 }
             }
         }
+        match roles
+            .iter()
+            .find(|role| role.name.eq_ignore_ascii_case("ultrasql"))
+        {
+            Some(role) if role.oid == auth::pg_authid::BOOTSTRAP_ROLE_OID => {}
+            Some(role) => {
+                return Err(ServerError::ddl(format!(
+                    "invalid bootstrap role metadata oid {}, expected {}",
+                    role.oid,
+                    auth::pg_authid::BOOTSTRAP_ROLE_OID
+                )));
+            }
+            None => {
+                return Err(ServerError::ddl(
+                    "missing bootstrap role metadata 'ultrasql'",
+                ));
+            }
+        }
         self.role_catalog.install_snapshot(roles, memberships);
         Ok(())
     }
