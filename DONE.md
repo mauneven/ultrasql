@@ -101,6 +101,8 @@ as a concise evidence ledger; roadmap stays for open gates only.
   Bind, Describe, LIMIT/OFFSET rebinding, and substitution.
 - Extended-query portal resumption now checks emitted-row counter overflow
   instead of saturating the final `CommandComplete` row count.
+- Logical replication metadata restore now rejects exhausted confirmed LSN state
+  before seeding the next in-process logical LSN.
 - Focused `ultrasql-executor` coverage now exercises scalar compatibility
   functions, physical lowering edge families, row encoding/decoding,
   projection/filter/sort/unique/set/window/hash aggregate behavior, modify-table

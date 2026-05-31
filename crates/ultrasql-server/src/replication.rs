@@ -438,8 +438,11 @@ impl LogicalReplicationRuntime {
                 self.logical_slots.insert(slot.name.clone(), slot);
             }
         }
-        self.next_lsn
-            .store(max_confirmed.saturating_add(1).max(1), Ordering::Release);
+        let next_lsn = max_confirmed
+            .checked_add(1)
+            .ok_or(ServerError::ddl("logical replication LSN space exhausted"))?
+            .max(1);
+        self.next_lsn.store(next_lsn, Ordering::Release);
         Ok(())
     }
 
@@ -1241,6 +1244,27 @@ mod tests {
             .expect("decode after reopen");
         assert_eq!(changes.len(), 1);
         assert_eq!(changes[0].lsn, 2);
+    }
+
+    #[test]
+    fn logical_metadata_rejects_exhausted_confirmed_lsn() {
+        let dir = tempfile::TempDir::new().expect("metadata dir");
+        let slots_dir = dir.path().join("logical_slots");
+        fs::create_dir_all(&slots_dir).expect("slot dir");
+        fs::write(
+            slots_dir.join("slot_events"),
+            "name=slot_events\nconfirmed_lsn=18446744073709551615\n",
+        )
+        .expect("slot metadata");
+
+        let err = LogicalReplicationRuntime::open_metadata(dir.path())
+            .expect_err("exhausted LSN metadata must be rejected");
+
+        assert!(
+            err.to_string()
+                .contains("logical replication LSN space exhausted"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]
