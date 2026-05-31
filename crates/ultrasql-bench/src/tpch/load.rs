@@ -475,6 +475,17 @@ fn checked_direct_value_product(left: i64, right: i64) -> Result<i64> {
 }
 
 #[cfg(feature = "sql-bench")]
+fn direct_sidecar_quantity_overflow() -> anyhow::Error {
+    anyhow::anyhow!("TPC-H sidecar quantity overflow")
+}
+
+#[cfg(feature = "sql-bench")]
+fn checked_direct_quantity_add_i64(left: i64, right: i64) -> Result<i64> {
+    left.checked_add(right)
+        .ok_or_else(direct_sidecar_quantity_overflow)
+}
+
+#[cfg(feature = "sql-bench")]
 fn q3_fields(table: &str, line: &str, expected: usize) -> Result<Vec<String>> {
     let fields = parse_tbl_line(line).ok_or_else(|| anyhow::anyhow!("{table}: empty row"))?;
     if fields.len() != expected {
@@ -2357,7 +2368,8 @@ impl TpchQ18BuildState {
     }
 
     fn ingest_lineitem_values(&mut self, orderkey: i32, quantity: i64) -> Result<()> {
-        *self.quantity_by_order.entry(orderkey).or_default() += quantity;
+        let order_quantity = self.quantity_by_order.entry(orderkey).or_default();
+        *order_quantity = checked_direct_quantity_add_i64(*order_quantity, quantity)?;
         Ok(())
     }
 }
@@ -5756,6 +5768,21 @@ mod tests {
         assert_eq!(rows[0].c_name, "Customer#1");
         assert_eq!(rows[0].o_orderkey, 10);
         assert_eq!(rows[0].sum_quantity, 35_000);
+    }
+
+    #[cfg(feature = "sql-bench")]
+    #[test]
+    fn tpch_q18_sidecar_rejects_quantity_overflow() {
+        let mut state = TpchQ18BuildState::default();
+        state
+            .ingest_lineitem_values(10, i64::MAX)
+            .expect("first line");
+
+        let err = state
+            .ingest_lineitem_values(10, 1)
+            .expect_err("quantity overflow should reject");
+
+        assert!(err.to_string().contains("TPC-H sidecar quantity overflow"));
     }
 
     #[cfg(feature = "sql-bench")]
