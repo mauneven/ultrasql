@@ -2136,3 +2136,6 @@ as a concise evidence ledger; roadmap stays for open gates only.
   command-tag arithmetic and return SQLSTATE `22003` on overflow instead of
   saturating. Evidence:
   `cargo test -p ultrasql-server session::copy::tests::copy_row_count_helpers_reject_overflow --lib -- --nocapture`.
+- Parquet COPY now reuses checked COPY row-count helpers for import/export
+  command counts instead of saturating. Evidence:
+  `cargo test -p ultrasql-server session::parquet_copy::tests::parquet_copy_row_count_helpers_reject_overflow --lib -- --nocapture`.

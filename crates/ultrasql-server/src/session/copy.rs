@@ -80,19 +80,23 @@ fn copy_rows_from_usize(rows: usize, context: &str) -> Result<u64, ServerError> 
     u64::try_from(rows).map_err(|_| copy_row_count_overflow(context))
 }
 
-fn add_copy_rows(rows: &mut u64, delta: u64, context: &str) -> Result<(), ServerError> {
+pub(super) fn add_copy_rows(rows: &mut u64, delta: u64, context: &str) -> Result<(), ServerError> {
     *rows = rows
         .checked_add(delta)
         .ok_or_else(|| copy_row_count_overflow(context))?;
     Ok(())
 }
 
-fn add_copy_batch_rows(rows: &mut u64, batch_len: usize, context: &str) -> Result<(), ServerError> {
+pub(super) fn add_copy_batch_rows(
+    rows: &mut u64,
+    batch_len: usize,
+    context: &str,
+) -> Result<(), ServerError> {
     let delta = copy_rows_from_usize(batch_len, context)?;
     add_copy_rows(rows, delta, context)
 }
 
-fn increment_copy_rows(rows: &mut u64, context: &str) -> Result<(), ServerError> {
+pub(super) fn increment_copy_rows(rows: &mut u64, context: &str) -> Result<(), ServerError> {
     add_copy_rows(rows, 1, context)
 }
 

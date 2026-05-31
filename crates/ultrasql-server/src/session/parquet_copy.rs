@@ -19,6 +19,7 @@ use ultrasql_executor::RowCodec;
 use ultrasql_txn::IsolationLevel;
 
 use super::Session;
+use super::copy::{add_copy_batch_rows, increment_copy_rows};
 use crate::error::ServerError;
 
 const PARQUET_COPY_BATCH_ROWS: usize = 4096;
@@ -66,7 +67,7 @@ where
                         ServerError::CopyFormat(format!("COPY TO parquet {path}: {err}"))
                     })?;
                 }
-                rows = rows.saturating_add(1);
+                increment_copy_rows(&mut rows, "COPY TO parquet")?;
             }
             if !batch.is_empty() {
                 let record_batch = batch.take_record_batch(Arc::clone(&arrow_schema))?;
@@ -138,17 +139,19 @@ where
                     })?;
                     payload_batch.push(payload);
                     if payload_batch.len() == PARQUET_COPY_BATCH_ROWS {
-                        let batch_len = u64::try_from(payload_batch.len()).unwrap_or(u64::MAX);
+                        add_copy_batch_rows(
+                            &mut rows_inserted,
+                            payload_batch.len(),
+                            "COPY FROM parquet",
+                        )?;
                         self.flush_copy_insert_batch(entry, &payload_batch, &txn)?;
-                        rows_inserted = rows_inserted.saturating_add(batch_len);
                         payload_batch.clear();
                     }
                 }
             }
             if !payload_batch.is_empty() {
-                let batch_len = u64::try_from(payload_batch.len()).unwrap_or(u64::MAX);
+                add_copy_batch_rows(&mut rows_inserted, payload_batch.len(), "COPY FROM parquet")?;
                 self.flush_copy_insert_batch(entry, &payload_batch, &txn)?;
-                rows_inserted = rows_inserted.saturating_add(batch_len);
                 payload_batch.clear();
             }
             Ok(rows_inserted)
@@ -594,7 +597,17 @@ fn char_cell(array: &dyn Array, row_index: usize, len: Option<u32>) -> Result<Va
 
 #[cfg(test)]
 mod tests {
+    use super::super::copy::add_copy_rows;
     use super::*;
+
+    #[test]
+    fn parquet_copy_row_count_helpers_reject_overflow() {
+        let mut rows = u64::MAX;
+        let err = add_copy_rows(&mut rows, 1, "COPY parquet")
+            .expect_err("parquet COPY row counter overflow must not saturate");
+        assert_eq!(err.sqlstate(), "22003");
+        assert_eq!(rows, u64::MAX);
+    }
 
     #[cfg(unix)]
     #[test]
