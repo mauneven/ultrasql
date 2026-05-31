@@ -36,7 +36,7 @@ use ultrasql_vec::Batch;
 use crate::eval::Eval;
 use crate::filter_op::batch_to_rows;
 use crate::seq_scan::build_batch;
-use crate::{ExecError, Operator};
+use crate::{ExecError, Operator, eval_error_to_exec_error};
 
 /// Maximum rows per emitted batch, matching the `ARCHITECTURE.md` section 9 contract.
 const BATCH_TARGET_ROWS: usize = 4096;
@@ -277,7 +277,7 @@ impl NestedLoopJoin {
                 "join condition must evaluate to Bool or Null, got {:?}",
                 other.data_type()
             ))),
-            Err(e) => Err(ExecError::TypeMismatch(e.to_string())),
+            Err(error) => Err(eval_error_to_exec_error(error)),
         }
     }
 }

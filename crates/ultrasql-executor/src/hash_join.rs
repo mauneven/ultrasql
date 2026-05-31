@@ -52,7 +52,7 @@ use crate::row_codec::RowCodec;
 use crate::seq_scan::build_batch;
 use crate::value_key::{decimal_values_equal, hash_decimal_key};
 use crate::work_mem::{WorkMemBudget, temp_file_limit};
-use crate::{ExecError, Operator, OperatorSpillProfile};
+use crate::{ExecError, Operator, OperatorSpillProfile, eval_error_to_exec_error};
 
 /// Maximum rows per emitted batch, matching the `ARCHITECTURE.md` section 9 contract.
 const BATCH_TARGET_ROWS: usize = 4096;
@@ -791,7 +791,7 @@ impl HashJoin {
                 "hash join residual must evaluate to Bool or Null, got {:?}",
                 other.data_type()
             ))),
-            Err(error) => Err(ExecError::TypeMismatch(error.to_string())),
+            Err(error) => Err(eval_error_to_exec_error(error)),
         }
     }
 
@@ -816,7 +816,7 @@ impl HashJoin {
                 "hash join residual must evaluate to Bool or Null, got {:?}",
                 other.data_type()
             ))),
-            Err(error) => Err(ExecError::TypeMismatch(error.to_string())),
+            Err(error) => Err(eval_error_to_exec_error(error)),
         }
     }
 }
@@ -969,9 +969,7 @@ enum JoinKey {
 
 fn build_join_key(evals: &[Eval], row: &[Value]) -> Result<Option<JoinKey>, ExecError> {
     if let [eval] = evals {
-        let value = eval
-            .eval(row)
-            .map_err(|err| ExecError::TypeMismatch(err.to_string()))?;
+        let value = eval.eval(row).map_err(eval_error_to_exec_error)?;
         if value.is_null() {
             return Ok(None);
         }
@@ -980,9 +978,7 @@ fn build_join_key(evals: &[Eval], row: &[Value]) -> Result<Option<JoinKey>, Exec
 
     let mut values = Vec::with_capacity(evals.len());
     for eval in evals {
-        let value = eval
-            .eval(row)
-            .map_err(|err| ExecError::TypeMismatch(err.to_string()))?;
+        let value = eval.eval(row).map_err(eval_error_to_exec_error)?;
         if value.is_null() {
             return Ok(None);
         }

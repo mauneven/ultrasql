@@ -260,6 +260,38 @@ async fn inner_non_equi_join_falls_back_to_nested_loop() {
     shutdown(client, server_handle).await;
 }
 
+/// Runtime errors inside JOIN predicates keep their SQLSTATE instead of
+/// collapsing to an internal execution failure.
+#[tokio::test]
+async fn join_predicate_runtime_cast_error_returns_22p02() {
+    let (client, _conn_handle, server_handle) = start_server_and_connect().await;
+
+    client
+        .batch_execute(
+            "CREATE TABLE join_cast_left (lid INT NOT NULL, lraw TEXT NOT NULL);
+             CREATE TABLE join_cast_right (rid INT NOT NULL);
+             INSERT INTO join_cast_left VALUES (1, 'not-int');
+             INSERT INTO join_cast_right VALUES (2)",
+        )
+        .await
+        .expect("setup");
+
+    let err = client
+        .simple_query(
+            "SELECT lid, rid
+             FROM join_cast_left INNER JOIN join_cast_right
+             ON CAST(lraw AS INTEGER) < rid",
+        )
+        .await
+        .expect_err("JOIN predicate runtime cast rejects row");
+    assert_eq!(
+        err.code().map(tokio_postgres::error::SqlState::code),
+        Some("22P02")
+    );
+
+    shutdown(client, server_handle).await;
+}
+
 /// A join with a `WHERE` clause that the binder pushes around the
 /// join: `SELECT ... FROM t1 JOIN t2 ON ... WHERE t1.lval = 5`. The
 /// rows that survive are those whose left `lval` equals 5 *and* have a
