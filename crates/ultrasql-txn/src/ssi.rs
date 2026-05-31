@@ -364,18 +364,30 @@ fn predicate_lock_covers(held: &PredicateLockTag, requested: &PredicateLockTag) 
         (PredicateLockTag::Relation(hr), PredicateLockTag::Relation(rr)) => hr == rr,
         (PredicateLockTag::Relation(hr), PredicateLockTag::Page(rp)) => *hr == rp.relation,
         (PredicateLockTag::Relation(hr), PredicateLockTag::Tuple(rt)) => *hr == rt.page.relation,
-        (PredicateLockTag::Relation(hr), PredicateLockTag::ColumnRange { relation, .. }) => {
-            hr == relation
-        }
+        (
+            PredicateLockTag::Relation(hr),
+            PredicateLockTag::ColumnRange {
+                relation,
+                low,
+                high,
+                ..
+            },
+        ) => hr == relation && !range_is_empty(*low, *high),
         (PredicateLockTag::Page(hp), PredicateLockTag::Page(rp)) => hp == rp,
         (PredicateLockTag::Page(hp), PredicateLockTag::Relation(rr)) => hp.relation == *rr,
         (PredicateLockTag::Page(hp), PredicateLockTag::Tuple(rt)) => *hp == rt.page,
         (PredicateLockTag::Tuple(ht), PredicateLockTag::Relation(rr)) => ht.page.relation == *rr,
         (PredicateLockTag::Tuple(ht), PredicateLockTag::Page(rp)) => ht.page == *rp,
         (PredicateLockTag::Tuple(ht), PredicateLockTag::Tuple(rt)) => ht == rt,
-        (PredicateLockTag::ColumnRange { relation, .. }, PredicateLockTag::Relation(rr)) => {
-            *relation == *rr
-        }
+        (
+            PredicateLockTag::ColumnRange {
+                relation,
+                low,
+                high,
+                ..
+            },
+            PredicateLockTag::Relation(rr),
+        ) => *relation == *rr && !range_is_empty(*low, *high),
         (
             PredicateLockTag::ColumnRange {
                 relation: held_rel,
@@ -404,6 +416,9 @@ fn ranges_overlap(
     right_low: Option<i64>,
     right_high: Option<i64>,
 ) -> bool {
+    if range_is_empty(left_low, left_high) || range_is_empty(right_low, right_high) {
+        return false;
+    }
     if let (Some(left_high), Some(right_low)) = (left_high, right_low)
         && left_high < right_low
     {
@@ -415,6 +430,10 @@ fn ranges_overlap(
         return false;
     }
     true
+}
+
+const fn range_is_empty(low: Option<i64>, high: Option<i64>) -> bool {
+    matches!((low, high), (Some(low), Some(high)) if low > high)
 }
 
 // ─── tests ────────────────────────────────────────────────────────────────────
@@ -654,6 +673,20 @@ mod tests {
         let other_column =
             mgr.find_predicate_lock_holders(&column_range_tag(7, 1, Some(10), Some(20)));
         assert!(other_column.is_empty());
+    }
+
+    #[test]
+    fn empty_column_range_predicate_matches_nothing() {
+        let mgr = SsiManager::new();
+        let t1 = xid(25);
+        mgr.register_xid(t1);
+        mgr.add_predicate_lock(t1, column_range_tag(7, 0, Some(10), Some(9)));
+
+        assert!(
+            mgr.find_predicate_lock_holders(&column_range_tag(7, 0, Some(9), Some(10)))
+                .is_empty()
+        );
+        assert!(mgr.find_predicate_lock_holders(&rel_tag(7)).is_empty());
     }
 
     #[test]

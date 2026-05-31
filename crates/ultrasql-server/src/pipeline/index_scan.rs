@@ -43,6 +43,19 @@ impl IndexKeyRange {
             high: Some(k),
         }
     }
+
+    /// Empty key range.
+    pub(crate) const fn empty() -> Self {
+        Self {
+            low: Some(1),
+            high: Some(0),
+        }
+    }
+
+    /// Whether this inclusive range cannot contain any key.
+    pub(crate) const fn is_empty(self) -> bool {
+        matches!((self.low, self.high), (Some(low), Some(high)) if low > high)
+    }
 }
 
 /// Try to lower a `Filter { Scan(table), predicate }` shape into an
@@ -181,7 +194,7 @@ fn try_brin_index_scan(
     let Some(_widen) = key_type_for_btree(table_entry, col_idx) else {
         return Ok(None);
     };
-    if range.low.zip(range.high).is_some_and(|(lo, hi)| lo > hi) {
+    if range.is_empty() {
         let codec = RowCodec::new(table_entry.schema.clone());
         let scan = Box::new(IndexScan::new(Vec::new(), codec));
         return Ok(Some(Box::new(Filter::new(scan, predicate.clone()))));
@@ -1105,18 +1118,22 @@ pub(crate) fn match_simple_comparison(expr: &ScalarExpr) -> Option<(usize, Index
     };
     let range = match op_normalised {
         BinaryOp::Eq => IndexKeyRange::point(raw_lit),
-        BinaryOp::Lt => IndexKeyRange {
-            low: None,
-            high: raw_lit.checked_sub(1),
-        },
+        BinaryOp::Lt => raw_lit
+            .checked_sub(1)
+            .map_or_else(IndexKeyRange::empty, |high| IndexKeyRange {
+                low: None,
+                high: Some(high),
+            }),
         BinaryOp::LtEq => IndexKeyRange {
             low: None,
             high: Some(raw_lit),
         },
-        BinaryOp::Gt => IndexKeyRange {
-            low: raw_lit.checked_add(1),
-            high: None,
-        },
+        BinaryOp::Gt => raw_lit
+            .checked_add(1)
+            .map_or_else(IndexKeyRange::empty, |low| IndexKeyRange {
+                low: Some(low),
+                high: None,
+            }),
         BinaryOp::GtEq => IndexKeyRange {
             low: Some(raw_lit),
             high: None,
@@ -1326,6 +1343,11 @@ fn probe_index_ordered(
     ascending: bool,
     ctx: &LowerCtx<'_>,
 ) -> Result<Vec<Vec<u8>>, ServerError> {
+    if range.is_empty() {
+        ctx.workload_recorder
+            .record_index_usage(index_entry.oid.raw(), 0, 0);
+        return Ok(Vec::new());
+    }
     let entries = probe_index_entries_ordered(index_entry, range, ascending, ctx)?;
     let tuples_read = usize_to_u64_saturating(entries.len());
     let mut payloads = fetch_visible_index_payloads(entries.into_iter().map(|(_, tid)| tid), ctx)?;
@@ -1352,6 +1374,11 @@ fn probe_index_ordered_limited(
     ctx: &LowerCtx<'_>,
 ) -> Result<Vec<Vec<u8>>, ServerError> {
     if limit == 0 {
+        return Ok(Vec::new());
+    }
+    if range.is_empty() {
+        ctx.workload_recorder
+            .record_index_usage(index_entry.oid.raw(), 0, 0);
         return Ok(Vec::new());
     }
     let index_rel = RelationId::new(index_entry.oid.raw());
@@ -1485,6 +1512,9 @@ pub(super) fn probe_index_entries_ordered(
     ascending: bool,
     ctx: &LowerCtx<'_>,
 ) -> Result<Vec<(i64, TupleId)>, ServerError> {
+    if range.is_empty() {
+        return Ok(Vec::new());
+    }
     let index_rel = RelationId::new(index_entry.oid.raw());
     let pool = ctx.heap.buffer_pool();
     let btree: BTree<BlankPageLoader> =

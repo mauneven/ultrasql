@@ -210,6 +210,17 @@ as a concise evidence ledger; roadmap stays for open gates only.
   `cargo test -p ultrasql-server serializable::tests::serializable_delete_conflicts_split_supported_disjunctions --lib -- --nocapture`,
   and
   `cargo test -p ultrasql-server --test isolation_suite_round_trip serializable_disjoint_in_list_ranges_both_commit_wire -- --nocapture`.
+- Empty scalar ranges now stay empty across indexable predicate normalization,
+  B-tree/BRIN probing, and SSI overlap checks. Strict-bound overflow such as
+  `id > i64::MAX` no longer becomes an unbounded range, and impossible
+  serializable predicates no longer create false read/write conflicts. Evidence:
+  `cargo test -p ultrasql-server match_simple_comparison_clamps_strict_overflow_to_empty_range --lib -- --nocapture`,
+  `cargo test -p ultrasql-txn empty_column_range_predicate_matches_nothing --lib -- --nocapture`,
+  `cargo test -p ultrasql-server serializable::tests::serializable_read_locks_skip_empty_supported_ranges --lib -- --nocapture`,
+  `cargo test -p ultrasql-server serializable::tests::serializable_delete_conflicts_skip_empty_supported_ranges --lib -- --nocapture`,
+  `cargo test -p ultrasql-server serializable::tests::serializable_read_locks_keep_empty_and_semantics --lib -- --nocapture`,
+  and
+  `cargo test -p ultrasql-server --test isolation_suite_round_trip serializable_empty_strict_range_does_not_false_abort_wire -- --nocapture`.
 - Constant `SELECT` result execution now propagates scalar evaluation failures
   instead of silently returning NULL. Evidence:
   `cargo test -p ultrasql-executor result_propagates_constant_eval_errors`.

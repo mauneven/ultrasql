@@ -398,6 +398,78 @@ async fn serializable_disjoint_in_list_ranges_both_commit_wire() {
     shutdown(running).await;
 }
 
+#[tokio::test]
+async fn serializable_empty_strict_range_does_not_false_abort_wire() {
+    let running = start_sample_server("serializable_empty_strict_range").await;
+    let (peer, peer_handle) =
+        connect_peer(running.bound, "serializable_empty_strict_range_peer").await;
+
+    running
+        .client
+        .batch_execute(
+            "CREATE TABLE serializable_empty_range (id BIGINT NOT NULL, value INT NOT NULL);\
+             INSERT INTO serializable_empty_range VALUES (1, 10), (2, 20);\
+             CREATE INDEX serializable_empty_range_id_idx ON serializable_empty_range (id)",
+        )
+        .await
+        .expect("seed indexed serializable empty-range table");
+
+    running
+        .client
+        .batch_execute("BEGIN ISOLATION LEVEL SERIALIZABLE")
+        .await
+        .expect("begin a");
+    peer.batch_execute("BEGIN ISOLATION LEVEL SERIALIZABLE")
+        .await
+        .expect("begin b");
+
+    assert_eq!(
+        scalar_i64(
+            &running.client,
+            "SELECT COUNT(*) FROM serializable_empty_range WHERE id > 9223372036854775807",
+        )
+        .await,
+        0
+    );
+    assert_eq!(
+        scalar_i64(
+            &peer,
+            "SELECT COUNT(*) FROM serializable_empty_range WHERE id >= 1",
+        )
+        .await,
+        2
+    );
+
+    running
+        .client
+        .batch_execute("UPDATE serializable_empty_range SET value = value + 1 WHERE id = 2")
+        .await
+        .expect("update a");
+    peer.batch_execute("UPDATE serializable_empty_range SET value = value + 1 WHERE id = 1")
+        .await
+        .expect("update b");
+
+    let a_commit = running.client.batch_execute("COMMIT").await;
+    let b_commit = peer.batch_execute("COMMIT").await;
+
+    assert!(
+        a_commit.is_ok() && b_commit.is_ok(),
+        "empty strict serializable range must not create a false abort: a={a_commit:?}, b={b_commit:?}"
+    );
+
+    assert_eq!(
+        scalar_i64(
+            &running.client,
+            "SELECT SUM(value) FROM serializable_empty_range"
+        )
+        .await,
+        32
+    );
+
+    close_peer(peer, peer_handle).await;
+    shutdown(running).await;
+}
+
 async fn setup_hermitage_table(client: &Client) {
     client
         .batch_execute("CREATE TABLE isolation_hermitage (id INT NOT NULL, value INT)")

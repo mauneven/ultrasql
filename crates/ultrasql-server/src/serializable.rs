@@ -182,8 +182,12 @@ fn update_write_conflict_tags(
     input: &LogicalPlan,
     catalog_snapshot: &CatalogSnapshot,
 ) -> Vec<PredicateLockTag> {
-    let mut tags = input_write_conflict_tags(entry, input, catalog_snapshot)
-        .unwrap_or_else(|| table_column_range_write_tags(entry));
+    let Some(mut tags) = input_write_conflict_tags(entry, input, catalog_snapshot) else {
+        return table_column_range_write_tags(entry);
+    };
+    if tags.is_empty() {
+        return Vec::new();
+    }
     for (column, _expr) in assignments {
         if !column_supports_range_lock(entry, *column) {
             continue;
@@ -200,8 +204,12 @@ fn delete_write_conflict_tags(
     input: &LogicalPlan,
     catalog_snapshot: &CatalogSnapshot,
 ) -> Vec<PredicateLockTag> {
-    let tags = input_write_conflict_tags(entry, input, catalog_snapshot)
-        .unwrap_or_else(|| table_column_range_write_tags(entry));
+    let Some(tags) = input_write_conflict_tags(entry, input, catalog_snapshot) else {
+        return table_column_range_write_tags(entry);
+    };
+    if tags.is_empty() {
+        return Vec::new();
+    }
     finish_write_tags(entry, tags)
 }
 
@@ -215,6 +223,9 @@ fn input_write_conflict_tags(
             let tags = column_range_tags_for_filter(input, predicate, catalog_snapshot)?;
             if tags.iter().any(|tag| !tag_matches_entry(tag, entry)) {
                 return None;
+            }
+            if tags.is_empty() {
+                return Some(Vec::new());
             }
             let locked_columns = tags
                 .iter()
@@ -246,30 +257,51 @@ fn column_range_tags_for_filter(
         return None;
     };
     let entry = catalog_snapshot.tables.get(table)?;
-    let mut tags = Vec::new();
-    collect_column_range_tags_for_predicate(entry, predicate, &mut tags)?;
+    let mut tags = column_range_tags_for_predicate_expr(entry, predicate)?;
     dedup_predicate_tags(&mut tags);
-    (!tags.is_empty()).then_some(tags)
+    Some(tags)
 }
 
-fn collect_column_range_tags_for_predicate(
+fn column_range_tags_for_predicate_expr(
     entry: &TableEntry,
     predicate: &ScalarExpr,
-    out: &mut Vec<PredicateLockTag>,
-) -> Option<()> {
+) -> Option<Vec<PredicateLockTag>> {
     if let Some((column, range)) = pipeline::match_indexable_predicate(predicate) {
-        out.push(column_range_tag(entry, column, range.low, range.high)?);
-        return Some(());
+        let tag = column_range_tag(entry, column, range.low, range.high)?;
+        return if column_range_tag_is_empty(&tag) {
+            Some(Vec::new())
+        } else {
+            Some(vec![tag])
+        };
     }
     match predicate {
         ScalarExpr::Binary {
-            op: BinaryOp::And | BinaryOp::Or,
+            op: BinaryOp::And,
             left,
             right,
             ..
         } => {
-            collect_column_range_tags_for_predicate(entry, left, out)?;
-            collect_column_range_tags_for_predicate(entry, right, out)
+            let mut left_tags = column_range_tags_for_predicate_expr(entry, left)?;
+            if left_tags.is_empty() {
+                return Some(Vec::new());
+            }
+            let right_tags = column_range_tags_for_predicate_expr(entry, right)?;
+            if right_tags.is_empty() {
+                return Some(Vec::new());
+            }
+            left_tags.extend(right_tags);
+            Some(left_tags)
+        }
+        ScalarExpr::Binary {
+            op: BinaryOp::Or,
+            left,
+            right,
+            ..
+        } => {
+            let mut left_tags = column_range_tags_for_predicate_expr(entry, left)?;
+            let right_tags = column_range_tags_for_predicate_expr(entry, right)?;
+            left_tags.extend(right_tags);
+            Some(left_tags)
         }
         _ => None,
     }
@@ -345,6 +377,15 @@ fn column_range_tag_column(tag: &PredicateLockTag) -> Option<u16> {
     match tag {
         PredicateLockTag::ColumnRange { column, .. } => Some(*column),
         _ => None,
+    }
+}
+
+fn column_range_tag_is_empty(tag: &PredicateLockTag) -> bool {
+    match tag {
+        PredicateLockTag::ColumnRange { low, high, .. } => {
+            matches!((low, high), (Some(low), Some(high)) if low > high)
+        }
+        _ => false,
     }
 }
 
@@ -601,6 +642,74 @@ mod tests {
                     high: None,
                 },
             ]
+        );
+    }
+
+    #[test]
+    fn serializable_read_locks_skip_empty_supported_ranges() {
+        let predicate = binary(
+            BinaryOp::And,
+            binary(BinaryOp::Gt, col(0, "a"), lit_i32(10)),
+            binary(BinaryOp::Lt, col(0, "a"), lit_i32(5)),
+        );
+        let plan = LogicalPlan::Filter {
+            input: Box::new(scan()),
+            predicate,
+        };
+        let snapshot = test_snapshot();
+        let mut tags = Vec::new();
+
+        collect_serializable_read_locks(&plan, &snapshot, &mut tags);
+        dedup_predicate_tags(&mut tags);
+
+        assert!(tags.is_empty(), "empty predicate must not lock relation");
+    }
+
+    #[test]
+    fn serializable_delete_conflicts_skip_empty_supported_ranges() {
+        let predicate = binary(
+            BinaryOp::And,
+            binary(BinaryOp::Gt, col(0, "a"), lit_i32(10)),
+            binary(BinaryOp::Lt, col(0, "a"), lit_i32(5)),
+        );
+        let input = LogicalPlan::Filter {
+            input: Box::new(scan()),
+            predicate,
+        };
+        let snapshot = test_snapshot();
+        let entry = snapshot.tables.get("t").expect("table exists");
+
+        assert!(
+            delete_write_conflict_tags(entry, &input, &snapshot).is_empty(),
+            "empty write predicate must not report write-conflict tags"
+        );
+    }
+
+    #[test]
+    fn serializable_read_locks_keep_empty_and_semantics() {
+        let empty_a = binary(
+            BinaryOp::And,
+            binary(BinaryOp::Gt, col(0, "a"), lit_i32(10)),
+            binary(BinaryOp::Lt, col(0, "a"), lit_i32(5)),
+        );
+        let predicate = binary(
+            BinaryOp::And,
+            empty_a,
+            binary(BinaryOp::Eq, col(1, "b"), lit_i32(1)),
+        );
+        let plan = LogicalPlan::Filter {
+            input: Box::new(scan()),
+            predicate,
+        };
+        let snapshot = test_snapshot();
+        let mut tags = Vec::new();
+
+        collect_serializable_read_locks(&plan, &snapshot, &mut tags);
+        dedup_predicate_tags(&mut tags);
+
+        assert!(
+            tags.is_empty(),
+            "empty conjunction must not retain sibling range tags"
         );
     }
 

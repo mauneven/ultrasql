@@ -584,6 +584,45 @@ fn match_simple_comparison_normalises_strict_bounds() {
     assert_eq!(range.high, Some(4));
 }
 
+#[test]
+fn match_simple_comparison_clamps_strict_overflow_to_empty_range() {
+    let id_col = ScalarExpr::Column {
+        name: "id".into(),
+        index: 0,
+        data_type: DataType::Int64,
+    };
+
+    let gt_max = ScalarExpr::Binary {
+        op: BinaryOp::Gt,
+        left: Box::new(id_col.clone()),
+        right: Box::new(ScalarExpr::Literal {
+            value: Value::Int64(i64::MAX),
+            data_type: DataType::Int64,
+        }),
+        data_type: DataType::Bool,
+    };
+    let (_, range) = match_simple_comparison(&gt_max).expect("gt max matches");
+    assert!(
+        range.is_empty(),
+        "id > i64::MAX must normalize to an empty range, got {range:?}"
+    );
+
+    let lt_min = ScalarExpr::Binary {
+        op: BinaryOp::Lt,
+        left: Box::new(id_col),
+        right: Box::new(ScalarExpr::Literal {
+            value: Value::Int64(i64::MIN),
+            data_type: DataType::Int64,
+        }),
+        data_type: DataType::Bool,
+    };
+    let (_, range) = match_simple_comparison(&lt_min).expect("lt min matches");
+    assert!(
+        range.is_empty(),
+        "id < i64::MIN must normalize to an empty range, got {range:?}"
+    );
+}
+
 // ---------------------------------------------------------------------
 // CTE lowering tests
 //
