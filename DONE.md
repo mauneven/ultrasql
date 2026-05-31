@@ -2183,3 +2183,6 @@ as a concise evidence ledger; roadmap stays for open gates only.
 - JSON/NDJSON record readers now reject unbounded record limits and check
   record length arithmetic instead of saturating byte counts. Evidence:
   `cargo test -p ultrasql-server pipeline::external_scan::tests::read_json_rejects_unbounded_record_limit --lib -- --nocapture`.
+- Catalog-version marker reads now check sentinel read limits and byte-count
+  conversion instead of saturating tiny control-file reads. Evidence:
+  `cargo test -p ultrasql-server catalog_version::tests::catalog_marker_take_limit_rejects_overflow --lib -- --nocapture`.

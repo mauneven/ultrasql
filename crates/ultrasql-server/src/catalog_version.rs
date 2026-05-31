@@ -105,9 +105,11 @@ fn read_catalog_version_marker(path: &Path) -> Result<String, ServerError> {
     }
 
     let mut raw = String::new();
-    let mut limited = file.take(CATALOG_VERSION_MARKER_LIMIT_BYTES.saturating_add(1));
+    let mut limited = file.take(catalog_marker_take_limit(
+        CATALOG_VERSION_MARKER_LIMIT_BYTES,
+    )?);
     limited.read_to_string(&mut raw).map_err(ServerError::Io)?;
-    let bytes_read = u64::try_from(raw.len()).unwrap_or(u64::MAX);
+    let bytes_read = catalog_marker_bytes_read_len(raw.len())?;
     if bytes_read > CATALOG_VERSION_MARKER_LIMIT_BYTES {
         return Err(ServerError::Ddl(format!(
             "catalog version marker {} exceeds read limit: bytes={} limit={}",
@@ -119,6 +121,22 @@ fn read_catalog_version_marker(path: &Path) -> Result<String, ServerError> {
     Ok(raw)
 }
 
+fn catalog_marker_take_limit(limit: u64) -> Result<u64, ServerError> {
+    limit.checked_add(1).ok_or_else(|| {
+        ServerError::Ddl(format!(
+            "catalog version marker read limit is too large: limit={limit}"
+        ))
+    })
+}
+
+fn catalog_marker_bytes_read_len(len: usize) -> Result<u64, ServerError> {
+    u64::try_from(len).map_err(|_| {
+        ServerError::Ddl(format!(
+            "catalog version marker byte count exceeds u64: bytes={len}"
+        ))
+    })
+}
+
 #[cfg_attr(not(unix), allow(unused_variables))]
 fn open_catalog_version_marker(path: &Path) -> Result<File, ServerError> {
     let mut options = OpenOptions::new();
@@ -126,4 +144,15 @@ fn open_catalog_version_marker(path: &Path) -> Result<File, ServerError> {
     #[cfg(unix)]
     options.custom_flags(libc::O_NOFOLLOW);
     options.open(path).map_err(ServerError::Io)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn catalog_marker_take_limit_rejects_overflow() {
+        let err = catalog_marker_take_limit(u64::MAX).unwrap_err();
+        assert!(err.to_string().contains("read limit is too large"));
+    }
 }
