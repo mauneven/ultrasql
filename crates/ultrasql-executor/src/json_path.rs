@@ -40,6 +40,7 @@ enum JsonPathLiteral {
     Number(f64),
     Bool(bool),
     Null,
+    Variable(String),
 }
 
 /// Error raised while parsing a SQL/JSON path.
@@ -80,10 +81,25 @@ pub fn parse_json_path(path: &str) -> Result<JsonPath, JsonPathError> {
 /// Select every JSON value matched by `path`.
 #[must_use]
 pub fn select_json_path<'a>(root: &'a JsonValue, path: &JsonPath) -> Vec<&'a JsonValue> {
-    select_steps(vec![root], &path.steps)
+    select_json_path_with_vars(root, path, None)
 }
 
-fn select_steps<'a>(mut current: Vec<&'a JsonValue>, steps: &[JsonPathStep]) -> Vec<&'a JsonValue> {
+/// Select every JSON value matched by `path`, resolving `$name` literals
+/// from `vars` when predicates compare against variables.
+#[must_use]
+pub fn select_json_path_with_vars<'a>(
+    root: &'a JsonValue,
+    path: &JsonPath,
+    vars: Option<&JsonValue>,
+) -> Vec<&'a JsonValue> {
+    select_steps(vec![root], &path.steps, vars)
+}
+
+fn select_steps<'a>(
+    mut current: Vec<&'a JsonValue>,
+    steps: &[JsonPathStep],
+    vars: Option<&JsonValue>,
+) -> Vec<&'a JsonValue> {
     for step in steps {
         let mut next = Vec::new();
         for value in current {
@@ -103,7 +119,9 @@ fn select_steps<'a>(mut current: Vec<&'a JsonValue>, steps: &[JsonPathStep]) -> 
                     next.extend(object.values());
                 }
                 (JsonPathStep::Recursive, _) => collect_recursive(value, &mut next),
-                (JsonPathStep::Filter(predicate), _) if predicate_matches(value, predicate) => {
+                (JsonPathStep::Filter(predicate), _)
+                    if predicate_matches(value, predicate, vars) =>
+                {
                     next.push(value);
                 }
                 _ => {}
@@ -131,8 +149,12 @@ fn collect_recursive<'a>(value: &'a JsonValue, out: &mut Vec<&'a JsonValue>) {
     }
 }
 
-fn predicate_matches(value: &JsonValue, predicate: &JsonPathPredicate) -> bool {
-    let selected = select_steps(vec![value], &predicate.path);
+fn predicate_matches(
+    value: &JsonValue,
+    predicate: &JsonPathPredicate,
+    vars: Option<&JsonValue>,
+) -> bool {
+    let selected = select_steps(vec![value], &predicate.path, vars);
     let Some(op) = predicate.op else {
         return !selected.is_empty();
     };
@@ -141,13 +163,14 @@ fn predicate_matches(value: &JsonValue, predicate: &JsonPathPredicate) -> bool {
     };
     selected
         .iter()
-        .any(|candidate| compare_json_path_literal(candidate, op, literal))
+        .any(|candidate| compare_json_path_literal(candidate, op, literal, vars))
 }
 
 fn compare_json_path_literal(
     value: &JsonValue,
     op: JsonPathCompareOp,
     literal: &JsonPathLiteral,
+    vars: Option<&JsonValue>,
 ) -> bool {
     match (value, literal) {
         (JsonValue::String(left), JsonPathLiteral::String(right)) => compare_ord(left, op, right),
@@ -156,6 +179,27 @@ fn compare_json_path_literal(
             .is_some_and(|left| compare_f64(left, op, *right)),
         (JsonValue::Bool(left), JsonPathLiteral::Bool(right)) => compare_ord(left, op, right),
         (JsonValue::Null, JsonPathLiteral::Null) => {
+            matches!(
+                op,
+                JsonPathCompareOp::Eq | JsonPathCompareOp::LtEq | JsonPathCompareOp::GtEq
+            )
+        }
+        (_, JsonPathLiteral::Variable(name)) => vars
+            .and_then(|vars| vars.get(name))
+            .is_some_and(|right| compare_json_value(value, op, right)),
+        _ => false,
+    }
+}
+
+fn compare_json_value(left: &JsonValue, op: JsonPathCompareOp, right: &JsonValue) -> bool {
+    match (left, right) {
+        (JsonValue::String(left), JsonValue::String(right)) => compare_ord(left, op, right),
+        (JsonValue::Number(left), JsonValue::Number(right)) => left
+            .as_f64()
+            .zip(right.as_f64())
+            .is_some_and(|(left, right)| compare_f64(left, op, right)),
+        (JsonValue::Bool(left), JsonValue::Bool(right)) => compare_ord(left, op, right),
+        (JsonValue::Null, JsonValue::Null) => {
             matches!(
                 op,
                 JsonPathCompareOp::Eq | JsonPathCompareOp::LtEq | JsonPathCompareOp::GtEq
@@ -306,6 +350,9 @@ impl<'a> JsonPathParser<'a> {
     fn parse_literal(&mut self) -> Result<JsonPathLiteral, JsonPathError> {
         if self.consume_byte(b'"') {
             return self.parse_quoted_string_body().map(JsonPathLiteral::String);
+        }
+        if self.consume_byte(b'$') {
+            return self.parse_identifier().map(JsonPathLiteral::Variable);
         }
         for (token, literal) in [
             ("true", JsonPathLiteral::Bool(true)),

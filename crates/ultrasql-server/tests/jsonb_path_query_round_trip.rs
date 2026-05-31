@@ -130,6 +130,35 @@ async fn jsonb_path_query_accepts_strict_and_lax_prefixes() {
 }
 
 #[tokio::test]
+async fn jsonb_path_exists_supports_variable_literals() {
+    let running = start_sample_server("jsonb_path_query_test").await;
+    let client = &running.client;
+
+    let messages = client
+        .simple_query(
+            "SELECT \
+                jsonb_path_exists('{\"items\":[{\"score\":12},{\"score\":25}]}'::jsonb, \
+                    '$.items[*] ? (@.score >= $min)', '{\"min\":20}'::jsonb), \
+                jsonb_path_exists('{\"items\":[{\"kind\":\"guide\"}]}'::jsonb, \
+                    '$.items[*] ? (@.kind == $kind)', '{\"kind\":\"paper\"}'::jsonb)",
+        )
+        .await
+        .expect("jsonb_path_exists variables");
+    let row = messages
+        .into_iter()
+        .find_map(|message| match message {
+            SimpleQueryMessage::Row(row) => Some(row),
+            _ => None,
+        })
+        .expect("jsonb_path_exists variables row");
+
+    assert_eq!(row.get(0), Some("t"));
+    assert_eq!(row.get(1), Some("f"));
+
+    shutdown(running).await;
+}
+
+#[tokio::test]
 async fn jsonb_path_exists_evaluates_sql_json_predicates() {
     let running = start_sample_server("jsonb_path_query_test").await;
     let client = &running.client;

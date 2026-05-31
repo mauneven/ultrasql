@@ -1877,9 +1877,9 @@ fn validate_has_privilege_args(func_name: &str, args: &[ScalarExpr]) -> Result<(
 }
 
 fn validate_jsonb_path_exists_args(args: &[ScalarExpr]) -> Result<(), PlanError> {
-    if args.len() != 2 {
+    if !(2..=3).contains(&args.len()) {
         return Err(PlanError::TypeMismatch(format!(
-            "jsonb_path_exists: expected 2 arguments, got {}",
+            "jsonb_path_exists: expected 2 or 3 arguments, got {}",
             args.len()
         )));
     }
