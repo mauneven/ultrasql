@@ -65,6 +65,7 @@ where
             ));
         };
         self.ensure_role_administration()?;
+        self.ensure_superuser_target_alteration(role_name)?;
         self.ensure_privileged_role_attributes(options)?;
         if role_name.eq_ignore_ascii_case("ultrasql") && bootstrap_role_privileges_change(options) {
             return Err(ServerError::ddl(
@@ -320,12 +321,35 @@ where
         if !role_options_grant_privileged_attributes(options) {
             return Ok(());
         }
+        if self.current_role_is_superuser() {
+            return Ok(());
+        }
+        Err(ServerError::InsufficientPrivilege(
+            "setting SUPERUSER, REPLICATION, or BYPASSRLS requires SUPERUSER".to_owned(),
+        ))
+    }
+
+    fn ensure_superuser_target_alteration(&self, role_name: &str) -> Result<(), ServerError> {
+        if self.current_role_is_superuser() {
+            return Ok(());
+        }
+        if self
+            .state
+            .role_catalog
+            .lookup_role(role_name)
+            .is_some_and(|role| role.is_superuser)
+        {
+            return Err(ServerError::InsufficientPrivilege(
+                "altering superuser roles requires SUPERUSER".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn current_role_is_superuser(&self) -> bool {
         match self.state.role_catalog.lookup_role(&self.current_user) {
-            Some(role) if role.is_superuser => Ok(()),
-            None if self.current_user.eq_ignore_ascii_case("tester") => Ok(()),
-            _ => Err(ServerError::InsufficientPrivilege(
-                "setting SUPERUSER, REPLICATION, or BYPASSRLS requires SUPERUSER".to_owned(),
-            )),
+            Some(role) => role.is_superuser,
+            None => self.current_user.eq_ignore_ascii_case("tester"),
         }
     }
 }
