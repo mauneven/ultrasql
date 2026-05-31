@@ -1768,7 +1768,7 @@ impl TpchQ13BuildState {
 
     fn ingest_customer(&mut self, line: &str) -> Result<()> {
         let _fields = q13_fields("customer", line, 8)?;
-        self.total_customers = self.total_customers.saturating_add(1);
+        self.total_customers = checked_direct_count_add_i64(self.total_customers, 1)?;
         Ok(())
     }
 
@@ -1780,11 +1780,12 @@ impl TpchQ13BuildState {
         let custkey = q13_parse_i32(&fields, 1, "o_custkey")?;
         match self.order_count_by_customer.entry(custkey) {
             std::collections::hash_map::Entry::Occupied(mut entry) => {
-                *entry.get_mut() = entry.get().saturating_add(1);
+                *entry.get_mut() = checked_direct_count_add_i64(*entry.get(), 1)?;
             }
             std::collections::hash_map::Entry::Vacant(entry) => {
                 entry.insert(1);
-                self.customers_with_order_count = self.customers_with_order_count.saturating_add(1);
+                self.customers_with_order_count =
+                    checked_direct_count_add_i64(self.customers_with_order_count, 1)?;
             }
         }
         Ok(())
@@ -5631,6 +5632,55 @@ mod tests {
         assert_eq!(rows[0].custdist, 2);
         assert_eq!(rows[1].c_count, 0);
         assert_eq!(rows[1].custdist, 1);
+    }
+
+    #[cfg(feature = "sql-bench")]
+    #[test]
+    fn tpch_q13_sidecar_rejects_customer_count_overflow() {
+        let mut state = TpchQ13BuildState {
+            total_customers: i64::MAX,
+            ..TpchQ13BuildState::default()
+        };
+
+        let err = state
+            .ingest("customer", "1|name|addr|1|13-111|1.00|MKT|comment")
+            .expect_err("customer count overflow should reject");
+
+        assert!(err.to_string().contains("TPC-H sidecar count overflow"));
+    }
+
+    #[cfg(feature = "sql-bench")]
+    #[test]
+    fn tpch_q13_sidecar_rejects_order_count_overflow() {
+        let mut state = TpchQ13BuildState::default();
+        state.order_count_by_customer.insert(1, i64::MAX);
+
+        let err = state
+            .ingest(
+                "orders",
+                "10|1|O|1.00|1993-01-01|1-URGENT|clerk|0|plain comment",
+            )
+            .expect_err("order count overflow should reject");
+
+        assert!(err.to_string().contains("TPC-H sidecar count overflow"));
+    }
+
+    #[cfg(feature = "sql-bench")]
+    #[test]
+    fn tpch_q13_sidecar_rejects_customer_with_order_count_overflow() {
+        let mut state = TpchQ13BuildState {
+            customers_with_order_count: i64::MAX,
+            ..TpchQ13BuildState::default()
+        };
+
+        let err = state
+            .ingest(
+                "orders",
+                "10|1|O|1.00|1993-01-01|1-URGENT|clerk|0|plain comment",
+            )
+            .expect_err("customers-with-orders count overflow should reject");
+
+        assert!(err.to_string().contains("TPC-H sidecar count overflow"));
     }
 
     #[cfg(feature = "sql-bench")]

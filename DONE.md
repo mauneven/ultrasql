@@ -2017,6 +2017,10 @@ as a concise evidence ledger; roadmap stays for open gates only.
 - TPC-H direct-load Q12 shipmode sidecar now rejects high/low priority count
   overflow instead of silently saturating cached line counts. Evidence:
   `cargo test -p ultrasql-bench --features sql-bench tpch::load::tests --lib -- --nocapture`.
+- TPC-H direct-load Q13 customer-distribution sidecar now rejects total
+  customer, per-customer order, and customers-with-orders count overflow
+  instead of silently saturating cached counters. Evidence:
+  `cargo test -p ultrasql-bench --features sql-bench tpch::load::tests --lib -- --nocapture`.
 - TPC-H direct-load Q15 supplier sidecar revenue now rejects malformed
   discount factors and checked supplier revenue accumulation overflow instead
   of panicking or wrapping cached revenue. Evidence:
