@@ -4823,6 +4823,7 @@ impl Server {
         let mut seen_generated_keys = std::collections::HashSet::new();
         let mut seen_check_keys = std::collections::HashSet::new();
         let mut seen_foreign_key_keys = std::collections::HashSet::new();
+        let mut seen_exclusion_keys = std::collections::HashSet::new();
         for (line_no, line) in text.lines().enumerate() {
             if line.is_empty() || line.starts_with('#') {
                 continue;
@@ -5010,6 +5011,13 @@ impl Server {
                             line_no + 1
                         ))
                     })?);
+                    let name = metadata_unescape(parts[2])?;
+                    if !seen_exclusion_keys.insert((oid, name.to_ascii_lowercase())) {
+                        return Err(ServerError::Ddl(format!(
+                            "duplicate table-runtime exclusion metadata on line {}",
+                            line_no + 1
+                        )));
+                    }
                     let mut elements = Vec::new();
                     if !parts[4].is_empty() {
                         for raw in parts[4].split(',') {
@@ -5039,7 +5047,7 @@ impl Server {
                         .entry(oid)
                         .or_default()
                         .push(RuntimeExclusionConstraint {
-                            name: metadata_unescape(parts[2])?,
+                            name,
                             method: parse_index_method(parts[3])?,
                             elements,
                         });

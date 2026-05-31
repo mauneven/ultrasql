@@ -306,6 +306,45 @@ async fn table_runtime_metadata_rejects_duplicate_foreign_key_rows_on_rebuild() 
     );
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn table_runtime_metadata_rejects_duplicate_exclusion_rows_on_rebuild() {
+    let data_dir = tempfile::TempDir::new().unwrap();
+    let metadata_path = data_dir.path().join("pg_table_runtime.meta");
+
+    let running =
+        start_persistent_server(data_dir.path(), "table_runtime_duplicate_exclusion").await;
+    running
+        .client
+        .batch_execute(
+            "CREATE TABLE table_runtime_exclusion_dup (\
+             room INT NOT NULL, \
+             during INT4RANGE NOT NULL, \
+             CONSTRAINT table_runtime_exclusion_no_overlap \
+             EXCLUDE USING gist (room WITH =, during WITH &&))",
+        )
+        .await
+        .expect("create table with exclusion metadata");
+    shutdown(running).await;
+
+    let mut metadata =
+        std::fs::read_to_string(&metadata_path).expect("table runtime metadata exists");
+    let exclusion_line = metadata
+        .lines()
+        .find(|line| line.starts_with("exclusion\t"))
+        .expect("exclusion metadata row")
+        .to_owned();
+    metadata.push_str(&exclusion_line);
+    metadata.push('\n');
+    std::fs::write(&metadata_path, metadata).expect("duplicate exclusion metadata");
+
+    let err = Server::init(data_dir.path()).expect_err("duplicate exclusion metadata rejected");
+    assert!(
+        err.to_string()
+            .contains("duplicate table-runtime exclusion metadata"),
+        "expected duplicate table-runtime exclusion metadata rejection, got {err}"
+    );
+}
+
 async fn assert_undefined_table(client: &tokio_postgres::Client, sql: &str) {
     let err = client.query(sql, &[]).await.expect_err("query should fail");
     let db_error = err.as_db_error().expect("server returns SQLSTATE");
