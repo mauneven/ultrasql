@@ -828,6 +828,10 @@ as a concise evidence ledger; roadmap stays for open gates only.
   avoiding ambiguous restart maintenance state from tampered sidecar rows.
   Evidence:
   `cargo test -p ultrasql-server --test materialized_view_round_trip materialized_view_metadata_rejects_duplicate_views_on_rebuild -- --nocapture`.
+- Materialized-view metadata reload rejects missing or mismatched view/source
+  table references, avoiding silent restart loss of append maintenance from
+  tampered sidecar rows. Evidence:
+  `cargo test -p ultrasql-server --test materialized_view_round_trip materialized_view_metadata_rejects_mismatched_source_on_rebuild -- --nocapture`.
 - Append-only materialized views now report `pg_class.relkind = 'm'`, appear in
   `pg_catalog.pg_matviews`, stay out of `pg_catalog.pg_tables`, and keep that
   catalog shape after restart. Evidence:

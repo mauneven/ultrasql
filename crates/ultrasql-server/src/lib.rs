@@ -5943,24 +5943,37 @@ impl Server {
 
     fn rebuild_materialized_view_runtime_sidecars(&self) -> Result<(), ServerError> {
         for record in self.load_materialized_view_metadata()? {
-            let Some(view_entry) = self.persistent_catalog.lookup_table(&record.view_table) else {
-                continue;
-            };
-            let Some(source_entry) = self.persistent_catalog.lookup_table(&record.source_table)
-            else {
-                continue;
-            };
+            let view_entry = self
+                .persistent_catalog
+                .lookup_table(&record.view_table)
+                .ok_or_else(|| {
+                    ServerError::Ddl(format!(
+                        "invalid materialized-view metadata for '{}'",
+                        record.view_table
+                    ))
+                })?;
+            let source_entry = self
+                .persistent_catalog
+                .lookup_table(&record.source_table)
+                .ok_or_else(|| {
+                    ServerError::Ddl(format!(
+                        "invalid materialized-view metadata for '{}'",
+                        record.view_table
+                    ))
+                })?;
             if view_entry.oid != record.view_oid || source_entry.oid != record.source_oid {
-                continue;
+                return Err(ServerError::Ddl(format!(
+                    "invalid materialized-view metadata for '{}'",
+                    record.view_table
+                )));
             }
             let Some(source) =
                 materialized_view_source_plan_from_metadata(&source_entry, &view_entry, &record)
             else {
-                tracing::warn!(
-                    view = %record.view_table,
-                    "materialized-view metadata references invalid projection",
-                );
-                continue;
+                return Err(ServerError::Ddl(format!(
+                    "invalid materialized-view metadata for '{}'",
+                    record.view_table
+                )));
             };
             self.materialized_views.insert(
                 record.view_table.clone(),
