@@ -43,7 +43,7 @@ use crate::eval::Eval;
 use crate::filter_op::batch_to_rows;
 use crate::seq_scan::build_batch;
 use crate::sort::compare_values_nullable;
-use crate::{ExecError, Operator};
+use crate::{ExecError, Operator, eval_error_to_exec_error};
 
 const BATCH_TARGET_ROWS: usize = 4096;
 
@@ -592,8 +592,7 @@ impl WindowAgg {
 }
 
 fn eval_window_expr(eval: &Eval, row: &[Value]) -> Result<Value, ExecError> {
-    eval.eval(row)
-        .map_err(|err| ExecError::TypeMismatch(err.to_string()))
+    eval.eval(row).map_err(eval_error_to_exec_error)
 }
 
 /// `true` iff `keys` is monotonically non-decreasing.

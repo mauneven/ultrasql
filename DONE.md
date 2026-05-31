@@ -1853,6 +1853,10 @@ as a concise evidence ledger; roadmap stays for open gates only.
   evaluation now preserve typed executor errors instead of collapsing to
   `TypeMismatch`. Evidence:
   `cargo test -p ultrasql-executor generic_top_k_key_eval_error_propagates --lib -- --nocapture`.
+- Runtime errors inside window partition/order/value/default expression
+  evaluation now preserve their typed SQLSTATEs instead of collapsing to
+  `XX000`. Evidence:
+  `cargo test -p ultrasql-server --test window_round_trip window_order_key_runtime_cast_error_returns_22p02 -- --nocapture`.
 - Runtime scalar/temporal text casts to integer, float, boolean, date, time,
   timestamp, timestamptz, and timetz now report SQLSTATE `22P02` for invalid
   column text. Evidence:

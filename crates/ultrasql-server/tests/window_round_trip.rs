@@ -108,6 +108,33 @@ async fn row_number_orders_within_partition() {
 }
 
 #[tokio::test]
+async fn window_order_key_runtime_cast_error_returns_22p02() {
+    let (client, _conn, server_handle) = start_server_and_connect().await;
+
+    client
+        .batch_execute(
+            "CREATE TABLE wn_cast_input (id INTEGER NOT NULL, raw TEXT NOT NULL);
+             INSERT INTO wn_cast_input VALUES (1, 'not-int')",
+        )
+        .await
+        .expect("setup");
+
+    let err = client
+        .simple_query(
+            "SELECT row_number() OVER (ORDER BY CAST(raw AS INTEGER))
+             FROM wn_cast_input",
+        )
+        .await
+        .expect_err("window order-key runtime cast rejects row");
+    assert_eq!(
+        err.code().map(tokio_postgres::error::SqlState::code),
+        Some("22P02")
+    );
+
+    shutdown(client, server_handle).await;
+}
+
+#[tokio::test]
 async fn rank_and_dense_rank_handle_ties() {
     let (client, _conn, server_handle) = start_server_and_connect().await;
     client
