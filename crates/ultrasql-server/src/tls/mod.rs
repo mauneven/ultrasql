@@ -183,20 +183,17 @@ const DEFAULT_TLS_PEM_LIMIT_BYTES: u64 = 8 * 1024 * 1024;
 fn read_regular_pem_file(path: &Path) -> Result<Vec<u8>, TlsError> {
     let metadata = std::fs::symlink_metadata(path)?;
     if !metadata.file_type().is_file() {
-        return Err(TlsError::Io(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            format!("TLS PEM path {} is not a regular file", path.display()),
+        return Err(tls_invalid_input(format!(
+            "TLS PEM path {} is not a regular file",
+            path.display()
         )));
     }
     let limit = tls_pem_limit_bytes();
     if metadata.len() > limit {
-        return Err(TlsError::Io(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            format!(
-                "TLS PEM file exceeds limit: {} size={} limit={limit}",
-                path.display(),
-                metadata.len()
-            ),
+        return Err(tls_invalid_input(format!(
+            "TLS PEM file exceeds limit: {} size={} limit={limit}",
+            path.display(),
+            metadata.len()
         )));
     }
     let mut options = std::fs::OpenOptions::new();
@@ -218,19 +215,34 @@ fn read_regular_pem_file(path: &Path) -> Result<Vec<u8>, TlsError> {
         TlsError::Io(err)
     })?;
     let mut bytes = Vec::new();
-    let mut limited = std::io::Read::take(file, limit.saturating_add(1));
+    let mut limited = std::io::Read::take(file, tls_take_limit(limit)?);
     std::io::Read::read_to_end(&mut limited, &mut bytes)?;
-    let read_len = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
+    let read_len = tls_bytes_read_len(bytes.len())?;
     if read_len > limit {
-        return Err(TlsError::Io(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            format!(
-                "TLS PEM file exceeds limit: {} size={read_len} limit={limit}",
-                path.display()
-            ),
+        return Err(tls_invalid_input(format!(
+            "TLS PEM file exceeds limit: {} size={read_len} limit={limit}",
+            path.display()
         )));
     }
     Ok(bytes)
+}
+
+fn tls_take_limit(limit: u64) -> Result<u64, TlsError> {
+    limit
+        .checked_add(1)
+        .ok_or_else(|| tls_invalid_input(format!("TLS PEM read limit is too large: limit={limit}")))
+}
+
+fn tls_bytes_read_len(len: usize) -> Result<u64, TlsError> {
+    u64::try_from(len)
+        .map_err(|_| tls_invalid_input(format!("TLS PEM byte count exceeds u64: bytes={len}")))
+}
+
+fn tls_invalid_input(message: String) -> TlsError {
+    TlsError::Io(std::io::Error::new(
+        std::io::ErrorKind::InvalidInput,
+        message,
+    ))
 }
 
 fn tls_pem_limit_bytes() -> u64 {
@@ -500,6 +512,27 @@ mod tests {
         let err = read_regular_pem_file(pem.path()).expect_err("oversized PEM rejected");
 
         assert!(err.to_string().contains("TLS PEM file exceeds limit"));
+        // SAFETY: tls_env_test_lock serializes process-env mutation in this
+        // module's tests.
+        unsafe {
+            std::env::remove_var("ULTRASQL_TLS_PEM_LIMIT_BYTES");
+        }
+    }
+
+    #[test]
+    fn read_regular_pem_file_rejects_unbounded_limit() {
+        let _env_guard = tls_env_test_lock();
+        // SAFETY: tls_env_test_lock serializes process-env mutation in this
+        // module's tests.
+        unsafe {
+            std::env::set_var("ULTRASQL_TLS_PEM_LIMIT_BYTES", u64::MAX.to_string());
+        }
+        let pem = tempfile::NamedTempFile::new().expect("pem file");
+        std::fs::write(pem.path(), b"ok").expect("write pem");
+
+        let err = read_regular_pem_file(pem.path()).expect_err("unbounded PEM limit rejected");
+
+        assert!(err.to_string().contains("TLS PEM read limit is too large"));
         // SAFETY: tls_env_test_lock serializes process-env mutation in this
         // module's tests.
         unsafe {

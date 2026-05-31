@@ -2171,3 +2171,6 @@ as a concise evidence ledger; roadmap stays for open gates only.
   reject overflow/underflow instead of saturating or wrapping maintenance
   evidence. Evidence:
   `cargo test -p ultrasql-storage heap::tests::heap_u32_count_add_rejects_overflow --lib -- --nocapture`.
+- TLS PEM loading now rejects unbounded read limits and checks byte-count
+  conversion instead of using a saturated sentinel read. Evidence:
+  `cargo test -p ultrasql-server tls::tests::read_regular_pem_file_rejects_unbounded_limit --lib -- --nocapture`.
