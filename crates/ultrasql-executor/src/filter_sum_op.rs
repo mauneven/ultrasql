@@ -36,10 +36,10 @@ use std::sync::Arc;
 use ultrasql_core::{DataType, Field, Schema};
 use ultrasql_storage::column_cache::CachedColumns;
 use ultrasql_vec::column::{Column, NumericColumn};
-use ultrasql_vec::jit::{JitConfig, filter_sum_i32_widening_gt_jit, filter_sum_i64_gt_jit};
+use ultrasql_vec::jit::{JitConfig, filter_sum_i32_widening_gt_jit};
 use ultrasql_vec::kernels::{
-    CmpOp, cmp_i32_scalar, cmp_i64_scalar, filter_sum_i32_widening_gt, filter_sum_i64_gt,
-    sum_i32_widening, sum_i32_widening_with_mask, sum_i64_with_mask,
+    CmpOp, cmp_i32_scalar, cmp_i64_scalar, filter_sum_i32_widening_gt, sum_i32_widening,
+    sum_i32_widening_with_mask,
 };
 use ultrasql_vec::{Batch, Bitmap};
 
@@ -63,6 +63,34 @@ fn null_f64_column() -> Result<Column, ExecError> {
     NumericColumn::with_nulls(vec![0.0_f64], nulls)
         .map(Column::Float64)
         .map_err(|_| ExecError::Internal("single-row Float64 NULL length mismatch"))
+}
+
+fn checked_sum_i64(acc: i64, delta: i64, context: &str) -> Result<i64, ExecError> {
+    acc.checked_add(delta)
+        .ok_or_else(|| ExecError::NumericFieldOverflow(format!("{context} overflow")))
+}
+
+fn filter_sum_i64_gt_checked(col: &NumericColumn<i64>, threshold: i64) -> Result<i64, ExecError> {
+    let mut total = 0_i64;
+    for value in col
+        .data()
+        .iter()
+        .copied()
+        .filter(|value| *value > threshold)
+    {
+        total = checked_sum_i64(total, value, "FilterSumI64Scan SUM(BIGINT)")?;
+    }
+    Ok(total)
+}
+
+fn sum_i64_with_mask_checked(col: &NumericColumn<i64>, mask: &Bitmap) -> Result<i64, ExecError> {
+    let mut total = 0_i64;
+    for (idx, value) in col.data().iter().copied().enumerate() {
+        if mask.get(idx) {
+            total = checked_sum_i64(total, value, "FilterSumI64Scan SUM(BIGINT)")?;
+        }
+    }
+    Ok(total)
 }
 
 /// Fused filter + SUM operator over an `Int32` predicate and
@@ -102,7 +130,6 @@ pub struct FilterSumI64Scan {
     sum_col: usize,
     output_schema: Schema,
     done: bool,
-    jit: JitConfig,
 }
 
 impl std::fmt::Debug for FilterSumI32Scan {
@@ -185,14 +212,13 @@ impl FilterSumI64Scan {
             sum_col,
             output_schema,
             done: false,
-            jit: JitConfig::OFF,
         }
     }
 
-    /// Enable runtime-compiled kernels for this operator.
+    /// Accept the statement JIT policy for API symmetry. `BIGINT`
+    /// sums stay on the checked scalar path so overflow remains exact.
     #[must_use]
-    pub fn with_jit(mut self, jit: JitConfig) -> Self {
-        self.jit = jit;
+    pub fn with_jit(self, _jit: JitConfig) -> Self {
         self
     }
 }
@@ -228,7 +254,6 @@ pub struct CachedFilterSumI64Scan {
     sum_col: usize,
     output_schema: Schema,
     done: bool,
-    jit: JitConfig,
 }
 
 impl std::fmt::Debug for CachedFilterSumI32Scan {
@@ -309,14 +334,13 @@ impl CachedFilterSumI64Scan {
             sum_col,
             output_schema,
             done: false,
-            jit: JitConfig::OFF,
         }
     }
 
-    /// Enable runtime-compiled kernels for this operator.
+    /// Accept the statement JIT policy for API symmetry. `BIGINT`
+    /// sums stay on the checked scalar path so overflow remains exact.
     #[must_use]
-    pub fn with_jit(mut self, jit: JitConfig) -> Self {
-        self.jit = jit;
+    pub fn with_jit(self, _jit: JitConfig) -> Self {
         self
     }
 }
@@ -394,15 +418,10 @@ impl Operator for CachedFilterSumI64Scan {
         let n_rows = pred_col.len();
         let total = if self.predicate_col == self.sum_col && matches!(self.predicate_op, CmpOp::Gt)
         {
-            if self.jit.should_jit(n_rows) {
-                filter_sum_i64_gt_jit(sum_col.data(), self.predicate_threshold)
-                    .unwrap_or_else(|| filter_sum_i64_gt(sum_col.data(), self.predicate_threshold))
-            } else {
-                filter_sum_i64_gt(sum_col.data(), self.predicate_threshold)
-            }
+            filter_sum_i64_gt_checked(sum_col, self.predicate_threshold)?
         } else {
             let mask = cmp_i64_scalar(pred_col, self.predicate_threshold, self.predicate_op);
-            sum_i64_with_mask(sum_col, &mask)
+            sum_i64_with_mask_checked(sum_col, &mask)?
         };
 
         let result_col = if n_rows == 0 {
@@ -622,10 +641,14 @@ impl Operator for FilterSumI32Scan {
                 } else {
                     filter_sum_i32_widening_gt(sum_col.data(), self.predicate_threshold)
                 };
-                total = total.wrapping_add(delta);
+                total = checked_sum_i64(total, delta, "FilterSumI32Scan SUM(INT)")?;
             } else {
                 let mask = cmp_i32_scalar(pred_col, self.predicate_threshold, self.predicate_op);
-                total = total.wrapping_add(sum_i32_widening_with_mask(sum_col, &mask));
+                total = checked_sum_i64(
+                    total,
+                    sum_i32_widening_with_mask(sum_col, &mask),
+                    "FilterSumI32Scan SUM(INT)",
+                )?;
             }
             saw_any |= true;
         }
@@ -685,17 +708,12 @@ impl Operator for FilterSumI64Scan {
                 }
             };
             if fused_self {
-                let delta = if self.jit.should_jit(sum_col.len()) {
-                    filter_sum_i64_gt_jit(sum_col.data(), self.predicate_threshold).unwrap_or_else(
-                        || filter_sum_i64_gt(sum_col.data(), self.predicate_threshold),
-                    )
-                } else {
-                    filter_sum_i64_gt(sum_col.data(), self.predicate_threshold)
-                };
-                total = total.wrapping_add(delta);
+                let delta = filter_sum_i64_gt_checked(sum_col, self.predicate_threshold)?;
+                total = checked_sum_i64(total, delta, "FilterSumI64Scan SUM(BIGINT)")?;
             } else {
                 let mask = cmp_i64_scalar(pred_col, self.predicate_threshold, self.predicate_op);
-                total = total.wrapping_add(sum_i64_with_mask(sum_col, &mask));
+                let delta = sum_i64_with_mask_checked(sum_col, &mask)?;
+                total = checked_sum_i64(total, delta, "FilterSumI64Scan SUM(BIGINT)")?;
             }
             saw_any |= true;
         }
@@ -815,7 +833,7 @@ mod tests {
     }
 
     #[test]
-    fn cached_filter_sum_i64_uses_jit_when_enabled() {
+    fn cached_filter_sum_i64_accepts_jit_policy_with_checked_sum() {
         let schema = Schema::new([Field::required("x", DataType::Int64)]).expect("schema");
         let columns = CachedColumns::new(
             0,
@@ -880,6 +898,21 @@ mod tests {
     }
 
     #[test]
+    fn filter_sum_i64_overflow_returns_typed_error() {
+        let scan = MemTableScan::new(
+            schema_i64_pair(),
+            vec![i64_pair_batch(&[(1, i64::MAX), (2, 1)])],
+        );
+        let mut op = FilterSumI64Scan::new(Box::new(scan), 0, 0, CmpOp::Gt, 1, "sum".to_owned());
+
+        let err = op
+            .next_batch()
+            .expect_err("filtered SUM(BIGINT) overflow must not wrap");
+
+        assert!(matches!(err, ExecError::NumericFieldOverflow(_)), "{err:?}");
+    }
+
+    #[test]
     fn cached_filter_sum_i32_cross_column_and_type_error() {
         let columns = cached_i32(vec![
             Column::Int32(NumericColumn::from_data(vec![1, 2, 3])),
@@ -921,6 +954,25 @@ mod tests {
         let mut op = CachedFilterSumI64Scan::new(columns, 0, 0, CmpOp::Gt, 1, "sum".to_owned());
         let batch = op.next_batch().expect("ok").expect("row");
         assert!(output_is_null(&batch));
+    }
+
+    #[test]
+    fn cached_filter_sum_i64_overflow_returns_typed_error() {
+        let columns = Arc::new(CachedColumns::new(
+            0,
+            schema_i64_pair(),
+            vec![
+                Column::Int64(NumericColumn::from_data(vec![1_i64, 2])),
+                Column::Int64(NumericColumn::from_data(vec![i64::MAX, 1])),
+            ],
+        ));
+        let mut op = CachedFilterSumI64Scan::new(columns, 0, 0, CmpOp::Gt, 1, "sum".to_owned());
+
+        let err = op
+            .next_batch()
+            .expect_err("cached filtered SUM(BIGINT) overflow must not wrap");
+
+        assert!(matches!(err, ExecError::NumericFieldOverflow(_)), "{err:?}");
     }
 
     #[test]

@@ -1918,6 +1918,10 @@ as a concise evidence ledger; roadmap stays for open gates only.
   `NumericFieldOverflow` instead of returning wrapped SQL-visible totals.
   Evidence:
   `cargo test -p ultrasql-executor sum_int64_overflow_returns_typed_error --lib -- --nocapture`.
+- Fused streaming and cached `FilterSumI64` now reject filtered
+  `SUM(BIGINT)` overflow with typed `NumericFieldOverflow` instead of wrapping
+  JIT/kernel totals. Evidence:
+  `cargo test -p ultrasql-executor filter_sum_i64_overflow_returns_typed_error --lib -- --nocapture`.
 - Vectorized terminal `SumSink` now rejects `Int64` and sample-count overflow
   instead of wrapping benchmark/query sink totals. Evidence:
   `cargo test -p ultrasql-executor sum_sink_rejects_i64_overflow --lib -- --nocapture`.
