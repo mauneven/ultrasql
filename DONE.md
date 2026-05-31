@@ -2157,3 +2157,6 @@ as a concise evidence ledger; roadmap stays for open gates only.
 - Time-partition INSERT affected-row accounting now rejects counter and
   `i64` command-result overflow instead of clamping to `i64::MAX`. Evidence:
   `cargo test -p ultrasql-server time_partition::tests --lib -- --nocapture`.
+- EXPLAIN ANALYZE drain counters now check row, batch, and memory arithmetic
+  instead of saturating observed execution evidence. Evidence:
+  `cargo test -p ultrasql-server session::explain::tests --lib -- --nocapture`.

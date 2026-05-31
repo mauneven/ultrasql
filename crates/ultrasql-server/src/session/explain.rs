@@ -26,7 +26,7 @@ use std::time::Instant;
 use tokio::io::{AsyncRead, AsyncWrite};
 use ultrasql_catalog::CatalogSnapshot;
 use ultrasql_core::{DataType, Field, Value};
-use ultrasql_executor::Operator;
+use ultrasql_executor::{ExecError, Operator};
 use ultrasql_planner::{BinaryOp, ExplainFormat, LogicalIndexMethod, LogicalPlan, ScalarExpr};
 use ultrasql_protocol::messages::{BackendMessage, FieldDescription};
 use ultrasql_storage::access_method::HnswMetric;
@@ -808,16 +808,39 @@ fn drain_explain_operator(op: &mut dyn Operator) -> Result<ExplainScanActuals, S
     let mut batches = 0_u64;
     let mut peak_output_memory_bytes = 0_u64;
     while let Some(batch) = op.next_batch()? {
-        batches = batches.saturating_add(1);
-        rows = rows.saturating_add(u64::try_from(batch.rows()).unwrap_or(u64::MAX));
-        peak_output_memory_bytes = peak_output_memory_bytes
-            .max(u64::try_from(estimate_batch_memory(&batch)).unwrap_or(u64::MAX));
+        batches = checked_explain_counter_add(batches, 1, "batches")?;
+        rows = checked_explain_counter_add(rows, batch.rows(), "rows")?;
+        peak_output_memory_bytes = peak_output_memory_bytes.max(usize_to_explain_u64(
+            estimate_batch_memory(&batch),
+            "memory bytes",
+        )?);
     }
     Ok(ExplainScanActuals {
         rows,
         batches,
         peak_output_memory_bytes,
         operator_profile: None,
+    })
+}
+
+fn checked_explain_counter_add(
+    current: u64,
+    delta: usize,
+    label: &'static str,
+) -> Result<u64, ServerError> {
+    let delta = usize_to_explain_u64(delta, label)?;
+    current.checked_add(delta).ok_or_else(|| {
+        ServerError::Execute(ExecError::TypeMismatch(format!(
+            "EXPLAIN ANALYZE {label} counter overflow"
+        )))
+    })
+}
+
+fn usize_to_explain_u64(value: usize, label: &'static str) -> Result<u64, ServerError> {
+    u64::try_from(value).map_err(|_| {
+        ServerError::Execute(ExecError::TypeMismatch(format!(
+            "EXPLAIN ANALYZE {label} value exceeds u64"
+        )))
     })
 }
 
@@ -1510,5 +1533,11 @@ mod tests {
         assert_eq!(format_parquet_row_groups_json(None), "null");
         assert_eq!(format_parquet_columns_read(None), "not applicable");
         assert_eq!(format_parquet_columns_read_json(None), "null");
+    }
+
+    #[test]
+    fn explain_counter_add_rejects_overflow() {
+        let err = checked_explain_counter_add(u64::MAX, 1, "rows").unwrap_err();
+        assert!(matches!(err, ServerError::Execute(_)));
     }
 }
