@@ -109,6 +109,38 @@ pub enum ToastError {
         /// Relation this table serves.
         table_rel: u32,
     },
+
+    /// A TOAST value or stored representation cannot fit the on-disk
+    /// 32-bit size fields.
+    #[error("TOAST {context} value is too large: {len} bytes exceeds {max} bytes")]
+    ValueTooLarge {
+        /// Which byte length was being converted.
+        context: &'static str,
+        /// The attempted byte length.
+        len: usize,
+        /// Maximum representable byte length.
+        max: u32,
+    },
+
+    /// Reassembled chunk bytes did not match the pointer metadata.
+    #[error("TOAST value_oid {oid} assembled {actual} bytes, expected {expected}")]
+    SizeMismatch {
+        /// OID of the value being fetched.
+        oid: u64,
+        /// Actual byte count assembled from chunks.
+        actual: usize,
+        /// Expected byte count recorded by the pointer.
+        expected: usize,
+    },
+
+    /// A chunk sequence number cannot fit the on-disk 32-bit field.
+    #[error("TOAST value_oid {oid} has too many chunks: sequence {seq} exceeds u32")]
+    TooManyChunks {
+        /// OID of the value being written or fetched.
+        oid: u64,
+        /// Chunk sequence that could not be represented.
+        seq: usize,
+    },
 }
 
 /// Pointer to an external TOAST value.
@@ -202,13 +234,13 @@ impl<L: PageLoader> ToastTable<L> {
     /// into chunks of at most [`TOAST_MAX_CHUNK_SIZE`] bytes each and
     /// stored as heap tuples in `self.rel`.
     pub fn store(&self, bytes: &[u8]) -> Result<ToastPointer, ToastError> {
-        let raw_size = u32::try_from(bytes.len()).unwrap_or(u32::MAX);
+        let raw_size = toast_size_from_len(bytes.len(), "raw")?;
 
         // Try lz4 compression.
         let (stored_bytes, compressed_size) = {
             let compressed = compress_prepend_size(bytes);
             if bytes.len().saturating_sub(compressed.len()) >= COMPRESSION_SAVINGS_THRESHOLD {
-                let csz = u32::try_from(compressed.len()).unwrap_or(u32::MAX);
+                let csz = toast_size_from_len(compressed.len(), "compressed")?;
                 (compressed, csz)
             } else {
                 let rsz = raw_size;
@@ -228,7 +260,8 @@ impl<L: PageLoader> ToastTable<L> {
         };
 
         for (seq, chunk) in stored_bytes.chunks(TOAST_MAX_CHUNK_SIZE).enumerate() {
-            let chunk_tuple = build_chunk_tuple(value_oid, seq as u32, chunk);
+            let chunk_seq = chunk_seq_from_index(value_oid, seq)?;
+            let chunk_tuple = build_chunk_tuple(value_oid, chunk_seq, chunk);
             let tid = self.heap.insert(self.rel, &chunk_tuple, opts)?;
             tids.push(tid);
         }
@@ -290,23 +323,60 @@ impl<L: PageLoader> ToastTable<L> {
         // Sort by sequence number and reassemble.
         chunks.sort_by_key(|(seq, _)| *seq);
 
-        let expected_chunks = (ptr.compressed_size as usize).div_ceil(TOAST_MAX_CHUNK_SIZE);
+        let compressed_size = toast_size_to_usize(ptr.compressed_size, "pointer compressed")?;
+        let expected_chunks = compressed_size.div_ceil(TOAST_MAX_CHUNK_SIZE);
         if chunks.len() < expected_chunks {
+            let seq = chunk_seq_from_index(ptr.value_oid, chunks.len())?;
             return Err(ToastError::MissingChunk {
                 oid: ptr.value_oid,
-                seq: chunks.len() as u32,
+                seq,
             });
         }
 
-        let mut assembled: Vec<u8> = Vec::with_capacity(ptr.compressed_size as usize);
+        let mut assembled: Vec<u8> = Vec::with_capacity(compressed_size.min(TOAST_MAX_CHUNK_SIZE));
         for (expected_seq, (seq, payload)) in chunks.into_iter().enumerate() {
-            if seq != expected_seq as u32 {
+            if expected_seq >= expected_chunks {
+                let actual = match assembled.len().checked_add(payload.len()) {
+                    Some(len) => len,
+                    None => usize::MAX,
+                };
+                return Err(ToastError::SizeMismatch {
+                    oid: ptr.value_oid,
+                    actual,
+                    expected: compressed_size,
+                });
+            }
+            let expected_seq = chunk_seq_from_index(ptr.value_oid, expected_seq)?;
+            if seq != expected_seq {
                 return Err(ToastError::MissingChunk {
                     oid: ptr.value_oid,
-                    seq: expected_seq as u32,
+                    seq: expected_seq,
+                });
+            }
+            let next_len =
+                assembled
+                    .len()
+                    .checked_add(payload.len())
+                    .ok_or(ToastError::SizeMismatch {
+                        oid: ptr.value_oid,
+                        actual: usize::MAX,
+                        expected: compressed_size,
+                    })?;
+            if next_len > compressed_size {
+                return Err(ToastError::SizeMismatch {
+                    oid: ptr.value_oid,
+                    actual: next_len,
+                    expected: compressed_size,
                 });
             }
             assembled.extend_from_slice(&payload);
+        }
+        if assembled.len() != compressed_size {
+            return Err(ToastError::SizeMismatch {
+                oid: ptr.value_oid,
+                actual: assembled.len(),
+                expected: compressed_size,
+            });
         }
 
         // Decompress if the data was compressed.
@@ -373,6 +443,26 @@ fn build_chunk_tuple(value_oid: u64, chunk_seq: u32, payload: &[u8]) -> Vec<u8> 
     buf.extend_from_slice(&chunk_seq.to_le_bytes());
     buf.extend_from_slice(payload);
     buf
+}
+
+fn toast_size_from_len(len: usize, context: &'static str) -> Result<u32, ToastError> {
+    u32::try_from(len).map_err(|_| ToastError::ValueTooLarge {
+        context,
+        len,
+        max: u32::MAX,
+    })
+}
+
+fn toast_size_to_usize(size: u32, context: &'static str) -> Result<usize, ToastError> {
+    usize::try_from(size).map_err(|_| ToastError::ValueTooLarge {
+        context,
+        len: usize::MAX,
+        max: u32::MAX,
+    })
+}
+
+fn chunk_seq_from_index(oid: u64, seq: usize) -> Result<u32, ToastError> {
+    u32::try_from(seq).map_err(|_| ToastError::TooManyChunks { oid, seq })
 }
 
 fn read_u64_le(bytes: &[u8]) -> u64 {
@@ -519,5 +609,24 @@ mod tests {
         let a = table.store(&a_data).unwrap();
         let b = table.store(&b_data).unwrap();
         assert_ne!(a.value_oid, b.value_oid);
+    }
+
+    #[test]
+    fn toast_size_conversion_rejects_u32_overflow() {
+        let too_large = usize::try_from(u64::from(u32::MAX) + 1).unwrap();
+        let err = toast_size_from_len(too_large, "raw").unwrap_err();
+        assert!(matches!(err, ToastError::ValueTooLarge { .. }));
+    }
+
+    #[test]
+    fn fetch_rejects_pointer_size_smaller_than_stored_payload() {
+        let table = make_toast(11);
+        let data: Vec<u8> = (0u8..=255).cycle().take(3000).collect();
+        let mut ptr = table.store(&data).unwrap();
+        ptr.raw_size = 1;
+        ptr.compressed_size = 1;
+
+        let err = table.fetch(&ptr).unwrap_err();
+        assert!(matches!(err, ToastError::SizeMismatch { .. }));
     }
 }

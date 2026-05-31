@@ -2139,3 +2139,6 @@ as a concise evidence ledger; roadmap stays for open gates only.
 - Parquet COPY now reuses checked COPY row-count helpers for import/export
   command counts instead of saturating. Evidence:
   `cargo test -p ultrasql-server session::parquet_copy::tests::parquet_copy_row_count_helpers_reject_overflow --lib -- --nocapture`.
+- TOAST storage now rejects values that cannot fit the on-disk 32-bit size
+  fields and validates fetched chunk bytes against pointer metadata. Evidence:
+  `cargo test -p ultrasql-storage toast::tests --lib -- --nocapture`.
