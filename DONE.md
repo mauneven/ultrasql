@@ -962,6 +962,10 @@ as a concise evidence ledger; roadmap stays for open gates only.
   namespace. Evidence: `cargo test -p ultrasql-server --test
   privilege_catalog_round_trip
   drop_schema_removes_schema_scoped_default_privileges`.
+- `DROP SCHEMA` now enforces schema owner or superuser authorization before
+  dependency checks and metadata removal, so non-owner roles cannot remove a
+  namespace they do not own. Evidence: `cargo test -p ultrasql-server --test
+  schema_ddl_round_trip non_owner_cannot_drop_schema -- --nocapture`.
 - `DROP ROLE` now rejects roles that still own live tables or still appear in
   object/default privilege grants, avoiding stale ownership and ACL references.
   Evidence: `cargo test -p ultrasql-server --test role_ddl_round_trip`.

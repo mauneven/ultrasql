@@ -93,6 +93,9 @@ where
             return Ok(result_encoder::run_ddl_command("DROP SCHEMA"));
         }
         for name in &drop_set {
+            self.ensure_schema_owner_or_superuser(name)?;
+        }
+        for name in &drop_set {
             let dependents = self.schema_dependents(name);
             if !dependents.is_empty() {
                 let action = if *cascade { "cascade" } else { "restrict" };

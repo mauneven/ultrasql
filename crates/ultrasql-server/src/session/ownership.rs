@@ -38,4 +38,31 @@ where
             )))
         }
     }
+
+    pub(super) fn ensure_schema_owner_or_superuser(
+        &self,
+        schema_name: &str,
+    ) -> Result<(), ServerError> {
+        let current_user = self.current_user.to_ascii_lowercase();
+        if self
+            .state
+            .role_catalog
+            .lookup_role(&current_user)
+            .is_some_and(|role| role.is_superuser)
+        {
+            return Ok(());
+        }
+        let owns_schema = self
+            .state
+            .schemas
+            .get(schema_name)
+            .is_some_and(|schema| schema.owner_role.eq_ignore_ascii_case(&current_user));
+        if owns_schema {
+            Ok(())
+        } else {
+            Err(ServerError::InsufficientPrivilege(format!(
+                "permission denied to drop schema {schema_name}"
+            )))
+        }
+    }
 }

@@ -2,7 +2,7 @@
 
 mod support;
 
-use support::{shutdown, start_persistent_server, start_sample_server};
+use support::{connect_as, shutdown, start_persistent_server, start_sample_server};
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn create_drop_schema_survives_restart_and_blocks_owner_drop() {
@@ -85,6 +85,66 @@ async fn drop_schema_if_exists_tolerates_missing_schema() {
         .batch_execute("DROP SCHEMA IF EXISTS missing_schema")
         .await
         .expect("missing DROP SCHEMA IF EXISTS is no-op");
+
+    shutdown(running).await;
+}
+
+#[tokio::test]
+async fn non_owner_cannot_drop_schema() {
+    let running = start_sample_server("schema_ddl_owner_guard").await;
+
+    running
+        .client
+        .batch_execute(
+            "CREATE ROLE schema_owner LOGIN; \
+             CREATE ROLE schema_attacker LOGIN",
+        )
+        .await
+        .expect("create schema test roles");
+
+    let (owner, owner_conn) = connect_as(running.bound, "schema_owner", "schema_drop_owner").await;
+    owner
+        .batch_execute("CREATE SCHEMA private_app")
+        .await
+        .expect("owner creates schema");
+    drop(owner);
+    owner_conn.await.expect("owner connection joins");
+
+    let (attacker, attacker_conn) =
+        connect_as(running.bound, "schema_attacker", "schema_drop_attacker").await;
+    let err = attacker
+        .batch_execute("DROP SCHEMA private_app")
+        .await
+        .expect_err("non-owner cannot drop schema");
+    assert_eq!(err.code().expect("SQLSTATE").code(), "42501");
+    drop(attacker);
+    attacker_conn.await.expect("attacker connection joins");
+
+    let exists = running
+        .client
+        .query_one(
+            "SELECT COUNT(*) FROM pg_catalog.pg_namespace WHERE nspname = 'private_app'",
+            &[],
+        )
+        .await
+        .expect("query schema after rejected drop")
+        .get::<_, i64>(0);
+    assert_eq!(exists, 1);
+
+    let (owner, owner_conn) =
+        connect_as(running.bound, "schema_owner", "schema_drop_owner_cleanup").await;
+    owner
+        .batch_execute("DROP SCHEMA private_app")
+        .await
+        .expect("owner can drop schema");
+    drop(owner);
+    owner_conn.await.expect("owner cleanup connection joins");
+
+    running
+        .client
+        .batch_execute("DROP ROLE schema_owner; DROP ROLE schema_attacker")
+        .await
+        .expect("drop schema test roles");
 
     shutdown(running).await;
 }

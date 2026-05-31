@@ -34,6 +34,28 @@ pub(crate) async fn start_sample_server(application_name: &str) -> RunningServer
     start_server(Arc::new(Server::with_sample_database()), application_name).await
 }
 
+#[allow(dead_code)]
+pub(crate) async fn connect_as(
+    bound: SocketAddr,
+    user: &str,
+    application_name: &str,
+) -> (tokio_postgres::Client, tokio::task::JoinHandle<()>) {
+    let conn_str = format!(
+        "host={host} port={port} user={user} application_name={application_name}",
+        host = bound.ip(),
+        port = bound.port()
+    );
+    let (client, connection) = tokio_postgres::connect(&conn_str, NoTls)
+        .await
+        .expect("tokio-postgres connect");
+    let handle = tokio::spawn(async move {
+        if let Err(e) = connection.await {
+            eprintln!("connection error: {e}");
+        }
+    });
+    (client, handle)
+}
+
 async fn start_server(server: Arc<Server>, application_name: &str) -> RunningServer {
     let addr: SocketAddr = "127.0.0.1:0".parse().expect("addr parses");
     let (listener, bound) = bind_listener(addr).await.expect("bind");
