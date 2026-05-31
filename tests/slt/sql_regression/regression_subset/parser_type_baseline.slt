@@ -90,7 +90,6 @@ CREATE TABLE slt_pg_type_names (
   b BOOLEAN
 )
 
-# ultrasql:skip full PostgreSQL type_sanity catalog invariant needs complete pg_type/pg_cast/pg_proc parity and regtype text output parity
 query T nosort
 SELECT 'int4'::regtype::text
 ----

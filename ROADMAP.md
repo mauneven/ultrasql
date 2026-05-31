@@ -30,9 +30,9 @@ file focused on what still blocks production.
 - Serializable isolation has column-range SSI for supported scalar comparisons
   plus relation-level fallback, but is `not fully predicate-precise` SSI.
   Implement page/tuple/gap precision before broad serializable claims.
-- Full public regression import still open for parser, type coercion, and
-  upstream isolation schedules. Aggregate/window baseline evidence lives in
-  `DONE.md`.
+- Full public regression breadth still open for broader parser/type coercion
+  and upstream isolation schedules. Active aggregate/window and `regtype`
+  text-output evidence lives in `DONE.md`.
 
 ### Performance Certification
 

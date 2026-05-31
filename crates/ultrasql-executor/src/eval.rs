@@ -692,40 +692,44 @@ fn eval_format_type(args: &[Value]) -> Result<Value, EvalError> {
             args[0].data_type()
         )));
     };
-    let name = match oid {
-        16 => "boolean",
-        17 => "bytea",
-        20 => "bigint",
-        21 => "smallint",
-        23 => "integer",
-        25 => "text",
-        26 => "oid",
-        700 => "real",
-        701 => "double precision",
-        790 => "money",
-        114 => "json",
-        142 => "xml",
-        143 => "xml[]",
-        650 => "cidr",
-        829 => "macaddr",
-        869 => "inet",
-        1042 => "character",
-        1082 => "date",
-        1083 => "time without time zone",
-        1114 => "timestamp without time zone",
-        1184 => "timestamp with time zone",
-        1266 => "time with time zone",
-        1560 => "bit",
-        1562 => "bit varying",
-        1700 => "numeric",
-        2950 => "uuid",
-        3220 => "pg_lsn",
-        3802 => "jsonb",
-        2205 => "regclass",
-        2206 => "regtype",
-        _ => "text",
-    };
+    let name = builtin_type_display_name(oid).unwrap_or("text");
     Ok(Value::Text(name.to_owned()))
+}
+
+fn builtin_type_display_name(oid: u32) -> Option<&'static str> {
+    match oid {
+        16 => Some("boolean"),
+        17 => Some("bytea"),
+        20 => Some("bigint"),
+        21 => Some("smallint"),
+        23 => Some("integer"),
+        25 => Some("text"),
+        26 => Some("oid"),
+        700 => Some("real"),
+        701 => Some("double precision"),
+        790 => Some("money"),
+        114 => Some("json"),
+        142 => Some("xml"),
+        143 => Some("xml[]"),
+        650 => Some("cidr"),
+        829 => Some("macaddr"),
+        869 => Some("inet"),
+        1042 => Some("character"),
+        1082 => Some("date"),
+        1083 => Some("time without time zone"),
+        1114 => Some("timestamp without time zone"),
+        1184 => Some("timestamp with time zone"),
+        1266 => Some("time with time zone"),
+        1560 => Some("bit"),
+        1562 => Some("bit varying"),
+        1700 => Some("numeric"),
+        2950 => Some("uuid"),
+        3220 => Some("pg_lsn"),
+        3802 => Some("jsonb"),
+        2205 => Some("regclass"),
+        2206 => Some("regtype"),
+        _ => None,
+    }
 }
 
 fn eval_pg_get_expr(args: &[Value]) -> Result<Value, EvalError> {
@@ -1005,6 +1009,12 @@ fn eval_cast_text(args: &[Value]) -> Result<Value, EvalError> {
     }
     if matches!(args[0], Value::Null) {
         return Ok(Value::Null);
+    }
+    if let Value::RegType(oid) = &args[0] {
+        return Ok(Value::Text(
+            builtin_type_display_name(oid.raw())
+                .map_or_else(|| oid.raw().to_string(), str::to_owned),
+        ));
     }
     Ok(Value::Text(args[0].to_string()))
 }
@@ -5918,6 +5928,17 @@ mod tests {
         assert_eq!(
             eval_fn("__ultrasql_cast_text", vec![Value::Null]),
             Value::Null
+        );
+        assert_eq!(
+            eval_fn("__ultrasql_cast_text", vec![Value::RegType(Oid::new(23))]),
+            Value::Text("integer".into())
+        );
+        assert_eq!(
+            eval_fn(
+                "__ultrasql_cast_text",
+                vec![Value::RegType(Oid::new(999_999))]
+            ),
+            Value::Text("999999".into())
         );
         assert_eq!(
             eval_fn("__ultrasql_cast_numeric", vec![Value::Money(1234)]),

@@ -1077,6 +1077,8 @@ as a concise evidence ledger; roadmap stays for open gates only.
 
 - Curated PostgreSQL parser/type baseline imports public SQLLogicTest cases from
   `char.sql`, `varchar.sql`, `numeric.sql`, and `type_sanity.sql`.
+- Public parser/type baseline now keeps `SELECT 'int4'::regtype::text`
+  active and returns canonical `integer` text instead of leaking raw OID `23`.
 - Transaction isolation baseline covers `acid.sql`, Hermitage G1a/PMP/G2, and
   manager-level Hermitage matrix.
 - Index regression baseline covers `CREATE INDEX`, `CREATE UNIQUE INDEX`,

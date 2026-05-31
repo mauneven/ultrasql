@@ -331,6 +331,7 @@ fn sql_regression_parser_type_baseline_is_imported_and_provenanced() {
         "DECIMAL(5,1)",
         "pg_typeof",
         "::regtype",
+        "integer",
     ] {
         assert!(
             text.contains(surface),
@@ -339,8 +340,8 @@ fn sql_regression_parser_type_baseline_is_imported_and_provenanced() {
         );
     }
     assert!(
-        text.contains("# ultrasql:skip full PostgreSQL type_sanity catalog invariant"),
-        "{} must keep catalog breadth debt explicit",
+        !text.contains("# ultrasql:skip full PostgreSQL type_sanity catalog invariant"),
+        "{} must keep active regtype text coverage instead of a stale skip",
         shard.display()
     );
     let case_count = count_slt_cases(&text);
