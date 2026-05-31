@@ -30,6 +30,7 @@ where
             ));
         };
         self.ensure_role_administration()?;
+        self.ensure_privileged_role_attributes(options)?;
         let entry = build_role_entry(*kind, role_name, options)?;
         let before_roles = self.state.role_catalog.list_roles();
         let before_memberships = self.state.role_catalog.list_memberships();
@@ -64,6 +65,7 @@ where
             ));
         };
         self.ensure_role_administration()?;
+        self.ensure_privileged_role_attributes(options)?;
         if role_name.eq_ignore_ascii_case("ultrasql") && bootstrap_role_privileges_change(options) {
             return Err(ServerError::ddl(
                 "cannot alter bootstrap role privileges for ultrasql",
@@ -310,6 +312,22 @@ where
             ))),
         }
     }
+
+    fn ensure_privileged_role_attributes(
+        &self,
+        options: &LogicalRoleOptions,
+    ) -> Result<(), ServerError> {
+        if !role_options_grant_privileged_attributes(options) {
+            return Ok(());
+        }
+        match self.state.role_catalog.lookup_role(&self.current_user) {
+            Some(role) if role.is_superuser => Ok(()),
+            None if self.current_user.eq_ignore_ascii_case("tester") => Ok(()),
+            _ => Err(ServerError::InsufficientPrivilege(
+                "setting SUPERUSER, REPLICATION, or BYPASSRLS requires SUPERUSER".to_owned(),
+            )),
+        }
+    }
 }
 
 fn build_role_entry(
@@ -399,6 +417,12 @@ fn bootstrap_role_privileges_change(options: &LogicalRoleOptions) -> bool {
         || options.can_login.is_some()
         || options.connection_limit.is_some()
         || options.valid_until.is_some()
+}
+
+fn role_options_grant_privileged_attributes(options: &LogicalRoleOptions) -> bool {
+    matches!(options.superuser, Some(true))
+        || matches!(options.replication, Some(true))
+        || matches!(options.bypass_rls, Some(true))
 }
 
 fn hash_role_password(password: Option<&str>) -> Result<Option<PasswordHash>, ServerError> {

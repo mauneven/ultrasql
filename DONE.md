@@ -949,6 +949,8 @@ as a concise evidence ledger; roadmap stays for open gates only.
   and expired `VALID UNTIL` roles are rejected during startup authentication.
   `CONNECTION LIMIT` parses through role DDL and is enforced at startup with
   per-role live-session accounting that releases slots on disconnect.
+  Catalogued `CREATEROLE` roles cannot grant `SUPERUSER`, `REPLICATION`, or
+  `BYPASSRLS`; those privilege-bearing role attributes require superuser.
 - `GRANT / REVOKE` on tables, schemas, databases, sequences, and functions work
   through privilege catalog checks; table privilege DDL now requires table
   ownership or superuser and records the actual grantor.
