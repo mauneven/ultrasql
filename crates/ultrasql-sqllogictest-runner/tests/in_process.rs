@@ -477,6 +477,59 @@ fn sql_regression_type_specific_baseline_is_imported_and_provenanced() {
 }
 
 #[test]
+fn sql_regression_aggregate_window_baseline_is_imported_and_provenanced() {
+    let subset = repo_root().join("tests/slt/sql_regression/regression_subset");
+    let manifest =
+        fs::read_to_string(subset.join("IMPORT_MANIFEST.txt")).expect("read PostgreSQL manifest");
+    let readme = fs::read_to_string(subset.join("README.md")).expect("read PostgreSQL README");
+    let shard = subset.join("aggregate_window_baseline.slt");
+    let text = fs::read_to_string(&shard).expect("read aggregate/window shard");
+
+    for source in [
+        "derived_from=src/test/regress/sql/aggregates.sql",
+        "derived_from=src/test/regress/sql/window.sql",
+    ] {
+        assert!(manifest.contains(source), "manifest:\n{manifest}");
+    }
+    assert!(
+        manifest.contains("file=aggregate_window_baseline.slt"),
+        "manifest:\n{manifest}"
+    );
+    assert!(
+        readme.contains("aggregate_window_baseline.slt"),
+        "README:\n{readme}"
+    );
+    assert!(
+        text.contains("PostgreSQL regression-derived aggregate/window baseline"),
+        "{} must document reviewed scope",
+        shard.display()
+    );
+    for surface in [
+        "GROUP BY",
+        "HAVING",
+        "COUNT(*)",
+        "SUM(amount)",
+        "AVG(amount)",
+        "row_number() OVER",
+        "rank() OVER",
+        "lag(amount, 1, 0) OVER",
+        "ntile(2) OVER",
+    ] {
+        assert!(
+            text.contains(surface),
+            "{} missing {surface}",
+            shard.display()
+        );
+    }
+    let case_count = count_slt_cases(&text);
+    assert!(
+        (12..=36).contains(&case_count),
+        "{} must stay as a small reviewed shard, got {case_count} cases",
+        shard.display()
+    );
+}
+
+#[test]
 fn skip_directive_requires_explicit_reason() {
     let bin = env!("CARGO_BIN_EXE_ultrasql-sqllogictest-runner");
     let suite = temp_artifact_path("ultrasql-slt-empty-skip", "test");

@@ -1,0 +1,168 @@
+# PostgreSQL regression-derived aggregate/window baseline shard.
+# Source: PostgreSQL src/test/regress/sql/aggregates.sql and window.sql at
+# commit ddd12d1a5c4d980c5f31dc7d096012547b724e55.
+# License/provenance live beside this file in IMPORT_MANIFEST.txt and
+# LICENSE.upstream.
+
+statement ok
+CREATE TABLE slt_pg_aggregate_window (
+  id INT NOT NULL,
+  grp TEXT,
+  amount INT,
+  flag BOOLEAN
+)
+
+statement ok
+INSERT INTO slt_pg_aggregate_window VALUES
+  (1, 'a', 10, true),
+  (2, 'a', 20, false),
+  (3, 'a', NULL, true),
+  (4, 'b', 5, true),
+  (5, 'b', 15, false),
+  (6, 'b', 15, true),
+  (7, 'c', NULL, false)
+
+query TIIIII rowsort
+SELECT grp, COUNT(*), COUNT(amount), SUM(amount), MIN(amount), MAX(amount)
+FROM slt_pg_aggregate_window
+GROUP BY grp
+----
+a
+3
+2
+30
+10
+20
+b
+3
+3
+35
+5
+15
+c
+1
+0
+NULL
+NULL
+NULL
+
+query TI rowsort
+SELECT grp, SUM(amount)
+FROM slt_pg_aggregate_window
+GROUP BY grp
+HAVING SUM(amount) >= 30
+----
+a
+30
+b
+35
+
+query I nosort
+SELECT COUNT(*) FROM slt_pg_aggregate_window HAVING COUNT(*) = 7
+----
+7
+
+query I nosort
+SELECT SUM(amount) FROM slt_pg_aggregate_window WHERE grp = 'a'
+----
+30
+
+query I nosort
+SELECT AVG(amount) FROM slt_pg_aggregate_window WHERE grp = 'a'
+----
+15
+
+query IIII rowsort
+SELECT id, amount, row_number() OVER (PARTITION BY grp ORDER BY amount, id), ntile(2) OVER (PARTITION BY grp ORDER BY amount, id)
+FROM slt_pg_aggregate_window
+WHERE grp = 'b' AND amount IS NOT NULL
+ORDER BY id
+----
+4
+5
+1
+1
+5
+15
+2
+1
+6
+15
+3
+2
+
+query IIII rowsort
+SELECT id, amount, rank() OVER (PARTITION BY grp ORDER BY amount), dense_rank() OVER (PARTITION BY grp ORDER BY amount)
+FROM slt_pg_aggregate_window
+WHERE grp = 'b' AND amount IS NOT NULL
+ORDER BY id
+----
+4
+5
+1
+1
+5
+15
+2
+2
+6
+15
+2
+2
+
+query III nosort
+SELECT id, amount, lag(amount, 1, 0) OVER (PARTITION BY grp ORDER BY amount, id)
+FROM slt_pg_aggregate_window
+WHERE grp = 'a' AND amount IS NOT NULL
+ORDER BY id
+----
+1
+10
+0
+2
+20
+10
+
+query III nosort
+SELECT id, amount, lead(amount, 1, 0) OVER (PARTITION BY grp ORDER BY amount, id)
+FROM slt_pg_aggregate_window
+WHERE grp = 'a' AND amount IS NOT NULL
+ORDER BY id
+----
+1
+10
+20
+2
+20
+0
+
+query IIII nosort
+SELECT id, amount, first_value(amount) OVER (PARTITION BY grp ORDER BY amount, id), last_value(amount) OVER (PARTITION BY grp ORDER BY amount, id)
+FROM slt_pg_aggregate_window
+WHERE grp = 'a' AND amount IS NOT NULL
+ORDER BY id
+----
+1
+10
+10
+20
+2
+20
+10
+20
+
+query III nosort
+SELECT id, amount, nth_value(amount, 2) OVER (PARTITION BY grp ORDER BY amount, id)
+FROM slt_pg_aggregate_window
+WHERE grp = 'a' AND amount IS NOT NULL
+ORDER BY id
+----
+1
+10
+20
+2
+20
+20
+
+statement ok
+DROP TABLE slt_pg_aggregate_window

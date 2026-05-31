@@ -12,6 +12,7 @@ Imported files:
 - `parser_type_baseline.slt`
 - `index_constraint_operator_baseline.slt`
 - `type_specific_baseline.slt`
+- `aggregate_window_baseline.slt`
 
 Derived upstream regression sources:
 
@@ -27,6 +28,8 @@ Derived upstream regression sources:
 - `src/test/regress/sql/json.sql`
 - `src/test/regress/sql/jsonb.sql`
 - `src/test/regress/sql/arrays.sql`
+- `src/test/regress/sql/aggregates.sql`
+- `src/test/regress/sql/window.sql`
 - `src/test/regress/sql/type_sanity.sql`
 - `src/test/regress/sql/create_index.sql`
 - `src/test/regress/sql/constraints.sql`
@@ -40,6 +43,8 @@ regression suite. Unsupported catalog-wide sanity checks and user-defined
 operator DDL stay as explicit `# ultrasql:skip` debt in the relevant shard.
 The type-specific shard likewise keeps full numeric overflow, collation,
 timezone-abbreviation, and SQL/JSON breadth as visible skip debt.
+The aggregate/window shard covers grouped aggregates, HAVING, and core window
+functions with deterministic local fixtures.
 
 Run with PostgreSQL reference:
 

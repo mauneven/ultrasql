@@ -1087,6 +1087,10 @@ as a concise evidence ledger; roadmap stays for open gates only.
   `BETWEEN`, and `LIKE`.
 - Type-specific regression baseline covers numeric, text, date/time/timetz,
   timestamp, JSON/JSONB, and arrays.
+- Aggregate/window regression baseline covers grouped `COUNT` / `SUM` /
+  `AVG` / `MIN` / `MAX`, `HAVING`, and core window functions:
+  `row_number`, `rank`, `dense_rank`, `lag`, `lead`, `first_value`,
+  `last_value`, `nth_value`, and `ntile`.
 - Tooling panic-path audit tightened benchmark and SQLLogicTest binaries:
   benchmark server/mock setup now returns context errors instead of panics,
   CLI reference engines reject non-CLI targets with typed errors, hex encoding
