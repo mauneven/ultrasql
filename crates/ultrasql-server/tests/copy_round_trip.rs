@@ -913,3 +913,36 @@ async fn copy_from_stdin_text_money_accepts_currency_format() {
 
     shutdown(running).await;
 }
+
+#[tokio::test]
+async fn copy_to_text_money_uses_lc_monetary_template() {
+    let running = start_sample_server("copy_test").await;
+    let client = &running.client;
+    let euro = "\u{20ac}";
+
+    client
+        .batch_execute("CREATE TABLE copy_money_locale (id INT, amount MONEY)")
+        .await
+        .expect("create table");
+    client
+        .batch_execute("INSERT INTO copy_money_locale VALUES (1, '$1,234.56'::money)")
+        .await
+        .expect("insert money");
+    client
+        .batch_execute("SET lc_monetary = 'de_DE.UTF-8'")
+        .await
+        .expect("set monetary locale");
+
+    let stream = client
+        .copy_out("COPY copy_money_locale TO STDOUT")
+        .await
+        .expect("copy_out");
+    let copied = collect_copy_out(stream).await;
+
+    assert_eq!(
+        String::from_utf8(copied).expect("copy output utf8"),
+        format!("1\t1.234,56 {euro}\n")
+    );
+
+    shutdown(running).await;
+}

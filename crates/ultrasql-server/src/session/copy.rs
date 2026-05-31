@@ -2064,7 +2064,7 @@ fn value_to_copy_cell_with_options(
             .into_bytes(),
         ),
         (DataType::Money, Value::Int64(v) | Value::Money(v)) => {
-            Some(Value::Money(*v).to_string().into_bytes())
+            Some(text_options.format_money(*v).into_bytes())
         }
         (DataType::Time, Value::Int64(v) | Value::Time(v)) => {
             Some(Value::Time(*v).to_string().into_bytes())

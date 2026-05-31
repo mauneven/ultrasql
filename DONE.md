@@ -845,6 +845,14 @@ as a concise evidence ledger; roadmap stays for open gates only.
   Runtime money addition overflow now reports SQLSTATE `22003`, and runtime
   division by zero reports SQLSTATE `22012`. Evidence:
   `cargo test -p ultrasql-server --test money_round_trip money_runtime_range_errors_use_precise_sqlstates -- --nocapture`.
+- `MONEY` text input now accepts deterministic common locale forms such as
+  euro suffix decimal-comma text and Brazilian `R$` decimal-comma text. Server
+  result/COPY text output applies built-in deterministic `lc_monetary`
+  templates for `de_DE`, `fr_FR`, `pt_BR`, and `en_GB`, while unknown locales
+  fall back to the `C` template. Evidence:
+  `cargo test -p ultrasql-core money --lib -- --nocapture`,
+  `cargo test -p ultrasql-server --test money_round_trip -- --nocapture`, and
+  `cargo test -p ultrasql-server --test copy_round_trip money -- --nocapture`.
 - `CHAR(n)` / `bpchar` parser, binder, row codec, executor, OID 1042, COPY,
   catalog persistence, blank padding, assignment/cast truncation, and
   trailing-space comparison semantics exist.

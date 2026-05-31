@@ -47,7 +47,8 @@ pub use id::{
     BlockNumber, CommandId, Lsn, Oid, PageId, RelationId, SegmentId, TableId, TupleId, Xid,
 };
 pub use money::{
-    MoneyError, decode_pg_money_binary, encode_pg_money_binary, format_money_text, parse_money_text,
+    MoneyError, decode_pg_money_binary, encode_pg_money_binary, format_money_text,
+    format_money_text_with_locale, parse_money_text,
 };
 pub use network::{InetAddr, MacAddr, MacAddr8, NetworkValue};
 pub use schema::{Field, Schema};

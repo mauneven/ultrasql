@@ -281,3 +281,62 @@ async fn money_runtime_range_errors_use_precise_sqlstates() {
 
     shutdown(running).await;
 }
+
+#[tokio::test]
+async fn money_lc_monetary_formats_and_parses_common_locale_text() {
+    let running = start_sample_server("money_lc_monetary_locale_text").await;
+    let client = &running.client;
+    let euro = "\u{20ac}";
+
+    client
+        .batch_execute("CREATE TABLE money_locale (id INT, amount MONEY)")
+        .await
+        .expect("create money locale table");
+    client
+        .batch_execute(&format!(
+            "INSERT INTO money_locale VALUES \
+             (1, '$1,234.56'::money), \
+             (2, '1.234,56 {euro}'::money)"
+        ))
+        .await
+        .expect("insert locale money");
+
+    client
+        .batch_execute("SET lc_monetary = 'de_DE.UTF-8'")
+        .await
+        .expect("set de_DE monetary locale");
+    let german_rows = client
+        .simple_query("SELECT amount FROM money_locale ORDER BY id")
+        .await
+        .expect("select german money");
+    let german_values: Vec<String> = german_rows
+        .into_iter()
+        .filter_map(|message| match message {
+            tokio_postgres::SimpleQueryMessage::Row(row) => row.get(0).map(str::to_owned),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        german_values,
+        vec![format!("1.234,56 {euro}"), format!("1.234,56 {euro}")]
+    );
+
+    client
+        .batch_execute("SET lc_monetary = 'pt_BR'")
+        .await
+        .expect("set pt_BR monetary locale");
+    let brazil_rows = client
+        .simple_query("SELECT amount FROM money_locale WHERE id = 1")
+        .await
+        .expect("select brazil money");
+    let brazil_values: Vec<String> = brazil_rows
+        .into_iter()
+        .filter_map(|message| match message {
+            tokio_postgres::SimpleQueryMessage::Row(row) => row.get(0).map(str::to_owned),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(brazil_values, vec!["R$ 1.234,56".to_owned()]);
+
+    shutdown(running).await;
+}

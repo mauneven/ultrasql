@@ -23,10 +23,11 @@ use bytes::BytesMut;
 use chrono::{Datelike, NaiveDate};
 use std::collections::HashMap;
 use ultrasql_core::{
-    DataType, Schema, Value, date_parts_from_days, format_date_days, format_time_micros,
-    format_timestamp_micros, format_timestamptz_micros_in_timezone, format_timestamptz_micros_utc,
-    format_timetz, format_timezone_offset_seconds, timestamp_parts_from_micros,
-    timestamptz_display_in_timezone, unpack_timetz,
+    DataType, Schema, Value, date_parts_from_days, format_date_days, format_money_text,
+    format_money_text_with_locale, format_time_micros, format_timestamp_micros,
+    format_timestamptz_micros_in_timezone, format_timestamptz_micros_utc, format_timetz,
+    format_timezone_offset_seconds, timestamp_parts_from_micros, timestamptz_display_in_timezone,
+    unpack_timetz,
 };
 use ultrasql_executor::Operator;
 use ultrasql_protocol::{BackendMessage, FieldDescription, encode_backend};
@@ -172,6 +173,7 @@ const FORMAT_TEXT: i16 = 0;
 #[derive(Clone, Debug, Default)]
 pub(crate) struct TextEncodingOptions {
     timezone: Option<String>,
+    lc_monetary: Option<String>,
     datestyle: DateStyleOptions,
 }
 
@@ -189,8 +191,14 @@ impl TextEncodingOptions {
             .map(String::as_str)
             .map(DateStyleOptions::parse)
             .unwrap_or_default();
+        let lc_monetary = settings
+            .get("lc_monetary")
+            .map(|value| value.trim())
+            .filter(|value| !value.is_empty())
+            .map(ToOwned::to_owned);
         Self {
             timezone,
+            lc_monetary,
             datestyle,
         }
     }
@@ -224,6 +232,13 @@ impl TextEncodingOptions {
             "{} {}",
             self.datestyle.format_timestamp(display.local_micros),
             zone
+        )
+    }
+
+    pub(crate) fn format_money(&self, cents: i64) -> String {
+        self.lc_monetary.as_deref().map_or_else(
+            || format_money_text(cents),
+            |locale| format_money_text_with_locale(cents, locale),
         )
     }
 }
@@ -866,7 +881,7 @@ pub(crate) fn encode_text_value_typed_with_options(
             .to_string()
             .into(),
         ),
-        (DataType::Money, Column::Int64(c)) => Some(Value::Money(c.data()[row]).to_string().into()),
+        (DataType::Money, Column::Int64(c)) => Some(options.format_money(c.data()[row]).into()),
         (DataType::Oid | DataType::RegClass | DataType::RegType, Column::Int64(c)) => {
             u32::try_from(c.data()[row])
                 .ok()

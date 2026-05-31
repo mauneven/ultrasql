@@ -2,9 +2,9 @@
 //!
 //! UltraSQL stores `MONEY` as PostgreSQL's `Cash` shape: a signed
 //! 64-bit integer counting fractional currency units. This v0.8 surface
-//! uses a deterministic cents scale for text, COPY, and wire tests;
-//! locale-sensitive `lc_monetary` formatting remains a higher-level
-//! session setting concern.
+//! uses a deterministic cents scale for storage, COPY, and wire tests.
+//! Session-level text rendering can select a small deterministic set of
+//! locale templates through `lc_monetary`; storage stays locale-free.
 
 use crate::{Value, parse_decimal_text};
 
@@ -46,15 +46,13 @@ pub fn parse_money_text(raw: &str) -> Result<Value, MoneyError> {
     }
 
     text = consume_sign(text, &mut negative);
-    if let Some(rest) = text.strip_prefix('$') {
-        text = rest.trim_start();
-    }
+    text = strip_currency_markers(text);
     text = consume_sign(text, &mut negative);
+    text = strip_currency_markers(text);
 
-    let cleaned: String = text.chars().filter(|ch| *ch != ',').collect();
-    if cleaned.is_empty() {
+    let Some(cleaned) = normalize_money_number(text) else {
         return Err(MoneyError::new(format!("invalid money literal {raw:?}")));
-    }
+    };
     let decimal_text = if negative {
         format!("-{cleaned}")
     } else {
@@ -66,6 +64,98 @@ pub fn parse_money_text(raw: &str) -> Result<Value, MoneyError> {
         return Err(MoneyError::new("money parser returned non-decimal value"));
     };
     Ok(Value::Money(value))
+}
+
+fn strip_currency_markers(mut text: &str) -> &str {
+    loop {
+        let before = text;
+        text = text.trim();
+        for marker in ["USD", "EUR", "GBP", "BRL", "R$"] {
+            if let Some(rest) = strip_ascii_prefix(text, marker) {
+                text = rest.trim_start();
+            }
+            if let Some(rest) = strip_ascii_suffix(text, marker) {
+                text = rest.trim_end();
+            }
+        }
+        for symbol in ['$', '\u{20ac}', '\u{00a3}', '\u{00a5}'] {
+            if let Some(rest) = text.strip_prefix(symbol) {
+                text = rest.trim_start();
+            }
+            if let Some(rest) = text.strip_suffix(symbol) {
+                text = rest.trim_end();
+            }
+        }
+        if text == before {
+            return text;
+        }
+    }
+}
+
+fn strip_ascii_prefix<'a>(text: &'a str, marker: &str) -> Option<&'a str> {
+    let prefix = text.get(..marker.len())?;
+    prefix
+        .eq_ignore_ascii_case(marker)
+        .then_some(&text[marker.len()..])
+}
+
+fn strip_ascii_suffix<'a>(text: &'a str, marker: &str) -> Option<&'a str> {
+    let start = text.len().checked_sub(marker.len())?;
+    let suffix = text.get(start..)?;
+    suffix
+        .eq_ignore_ascii_case(marker)
+        .then_some(&text[..start])
+}
+
+fn normalize_money_number(text: &str) -> Option<String> {
+    let compact: String = text.chars().filter(|ch| !ch.is_whitespace()).collect();
+    if compact.is_empty()
+        || !compact
+            .chars()
+            .all(|ch| ch.is_ascii_digit() || ch == '.' || ch == ',')
+    {
+        return None;
+    }
+
+    let last_dot = compact.rfind('.');
+    let last_comma = compact.rfind(',');
+    let decimal_sep = match (last_dot, last_comma) {
+        (Some(dot), Some(comma)) => Some(if dot > comma { '.' } else { ',' }),
+        (None, Some(comma)) if comma_marks_fraction(&compact, comma) => Some(','),
+        _ => Some('.'),
+    };
+
+    let mut normalized = String::with_capacity(compact.len());
+    let mut saw_decimal = false;
+    for ch in compact.chars() {
+        if ch.is_ascii_digit() {
+            normalized.push(ch);
+        } else if Some(ch) == decimal_sep {
+            if saw_decimal {
+                return None;
+            }
+            saw_decimal = true;
+            normalized.push('.');
+        } else if ch == '.' || ch == ',' {
+            // Treat the non-decimal punctuation as a thousands separator.
+        } else {
+            return None;
+        }
+    }
+    if normalized.is_empty() || normalized == "." {
+        None
+    } else {
+        Some(normalized)
+    }
+}
+
+fn comma_marks_fraction(text: &str, comma: usize) -> bool {
+    let before_has_digit = text[..comma].chars().any(|ch| ch.is_ascii_digit());
+    let digits_after = text[comma + 1..]
+        .chars()
+        .filter(|ch| ch.is_ascii_digit())
+        .count();
+    before_has_digit && (1..=2).contains(&digits_after)
 }
 
 fn consume_sign<'a>(text: &'a str, negative: &mut bool) -> &'a str {
@@ -96,10 +186,67 @@ pub fn format_money_text(cents: i64) -> String {
     out
 }
 
+/// Format signed cents using a deterministic `lc_monetary` template.
+///
+/// The helper intentionally avoids host locale APIs so release artifacts are
+/// reproducible across CI runners and containers. Unknown locales fall back to
+/// the `C` / `en_US` dollar template used by [`format_money_text`].
+#[must_use]
+pub fn format_money_text_with_locale(cents: i64, lc_monetary: &str) -> String {
+    let locale = normalize_locale_name(lc_monetary);
+    match locale.as_str() {
+        "de" | "de_de" | "de_at" | "de_ch" => {
+            format_money_with_template(cents, "", " \u{20ac}", '.', ',')
+        }
+        "fr" | "fr_fr" | "fr_ca" | "fr_be" | "fr_ch" => {
+            format_money_with_template(cents, "", " \u{20ac}", ' ', ',')
+        }
+        "pt_br" => format_money_with_template(cents, "R$ ", "", '.', ','),
+        "en_gb" => format_money_with_template(cents, "\u{00a3}", "", ',', '.'),
+        _ => format_money_text(cents),
+    }
+}
+
+fn normalize_locale_name(value: &str) -> String {
+    value
+        .trim()
+        .split(['.', '@'])
+        .next()
+        .unwrap_or(value)
+        .replace('-', "_")
+        .to_ascii_lowercase()
+}
+
+fn format_money_with_template(
+    cents: i64,
+    prefix: &str,
+    suffix: &str,
+    group_sep: char,
+    decimal_sep: char,
+) -> String {
+    let magnitude = i128::from(cents).abs();
+    let dollars = magnitude / 100;
+    let cents_part = magnitude % 100;
+    let mut out = String::new();
+    if cents < 0 {
+        out.push('-');
+    }
+    out.push_str(prefix);
+    push_grouped_digits_with_separator(&mut out, &dollars.to_string(), group_sep);
+    out.push(decimal_sep);
+    out.push_str(&format!("{cents_part:02}"));
+    out.push_str(suffix);
+    out
+}
+
 fn push_grouped_digits(out: &mut String, digits: &str) {
+    push_grouped_digits_with_separator(out, digits, ',');
+}
+
+fn push_grouped_digits_with_separator(out: &mut String, digits: &str, separator: char) {
     for (idx, ch) in digits.chars().enumerate() {
         if idx > 0 && (digits.len() - idx) % 3 == 0 {
-            out.push(',');
+            out.push(separator);
         }
         out.push(ch);
     }
@@ -130,6 +277,11 @@ mod tests {
         assert_eq!(parse_money_text("$-0.015"), Ok(Value::Money(-2)));
         assert_eq!(parse_money_text("(+$2.00)"), Ok(Value::Money(-200)));
         assert_eq!(
+            parse_money_text("1.234,565 \u{20ac}"),
+            Ok(Value::Money(123_457))
+        );
+        assert_eq!(parse_money_text("R$ 1.234,56"), Ok(Value::Money(123_456)));
+        assert_eq!(
             parse_money_text(""),
             Err(MoneyError::new("empty money literal"))
         );
@@ -141,6 +293,26 @@ mod tests {
         assert_eq!(format_money_text(0), "$0.00");
         assert_eq!(format_money_text(123_456_789), "$1,234,567.89");
         assert_eq!(format_money_text(-123_456_789), "-$1,234,567.89");
+    }
+
+    #[test]
+    fn format_money_text_with_locale_uses_deterministic_templates() {
+        assert_eq!(
+            format_money_text_with_locale(123_456, "de_DE.UTF-8"),
+            "1.234,56 \u{20ac}"
+        );
+        assert_eq!(
+            format_money_text_with_locale(-123_456, "fr_FR"),
+            "-1 234,56 \u{20ac}"
+        );
+        assert_eq!(
+            format_money_text_with_locale(123_456, "pt_BR"),
+            "R$ 1.234,56"
+        );
+        assert_eq!(
+            format_money_text_with_locale(123_456, "unknown"),
+            "$1,234.56"
+        );
     }
 
     #[test]
