@@ -211,6 +211,36 @@ async fn nologin_role_cannot_connect() {
     shutdown(running).await;
 }
 
+#[tokio::test]
+async fn expired_role_cannot_connect() {
+    let running = start_sample_server("role_ddl_test").await;
+    let client = &running.client;
+
+    client
+        .batch_execute("CREATE ROLE expired_login LOGIN VALID UNTIL '1970-01-01T00:00:00Z'")
+        .await
+        .expect("create expired role");
+
+    let conn_str = format!(
+        "host={host} port={port} user=expired_login application_name=expired_login_reject",
+        host = running.bound.ip(),
+        port = running.bound.port()
+    );
+    let err = match tokio_postgres::connect(&conn_str, NoTls).await {
+        Ok(_) => panic!("expired role connection must fail"),
+        Err(err) => err,
+    };
+    let db = err.as_db_error().expect("startup ErrorResponse");
+    assert_eq!(db.code().code(), "28000");
+    assert!(
+        db.message().contains("expired"),
+        "expected expired role rejection, got {}",
+        db.message()
+    );
+
+    shutdown(running).await;
+}
+
 #[test]
 fn role_metadata_rejects_duplicate_role_names_on_rebuild() {
     let data_dir = tempfile::TempDir::new().expect("temp data dir");

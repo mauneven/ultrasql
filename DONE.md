@@ -946,7 +946,7 @@ as a concise evidence ledger; roadmap stays for open gates only.
   restart invariant. `ALTER ROLE ultrasql` rejects privilege/login/validity
   demotion while still allowing password rotation. Catalogued non-`CREATEROLE`
   roles cannot create, alter, drop, grant, or revoke roles. Known `NOLOGIN`
-  roles are rejected during startup authentication.
+  and expired `VALID UNTIL` roles are rejected during startup authentication.
 - `GRANT / REVOKE` on tables, schemas, databases, sequences, and functions work
   through privilege catalog checks; table privilege DDL now requires table
   ownership or superuser and records the actual grantor.

@@ -191,22 +191,40 @@ where
                 }
             }
         }
-        if let Some(role) = self.state.role_catalog.lookup_role(&self.auth_user)
-            && !role.can_login
-        {
-            let _ = self
-                .send(&BackendMessage::ErrorResponse {
-                    fields: vec![
-                        (b'S', "FATAL".to_string()),
-                        (b'C', "28000".to_string()),
-                        (
-                            b'M',
-                            format!("role {} is not permitted to log in", self.auth_user),
-                        ),
-                    ],
-                })
-                .await;
-            return Err(ServerError::AuthFailed);
+        if let Some(role) = self.state.role_catalog.lookup_role(&self.auth_user) {
+            if !role.can_login {
+                let _ = self
+                    .send(&BackendMessage::ErrorResponse {
+                        fields: vec![
+                            (b'S', "FATAL".to_string()),
+                            (b'C', "28000".to_string()),
+                            (
+                                b'M',
+                                format!("role {} is not permitted to log in", self.auth_user),
+                            ),
+                        ],
+                    })
+                    .await;
+                return Err(ServerError::AuthFailed);
+            }
+            if role
+                .valid_until
+                .is_some_and(|valid_until| valid_until <= chrono::Utc::now().timestamp_micros())
+            {
+                let _ = self
+                    .send(&BackendMessage::ErrorResponse {
+                        fields: vec![
+                            (b'S', "FATAL".to_string()),
+                            (b'C', "28000".to_string()),
+                            (
+                                b'M',
+                                format!("role {} password has expired", self.auth_user),
+                            ),
+                        ],
+                    })
+                    .await;
+                return Err(ServerError::AuthFailed);
+            }
         }
         if self.state.logging_config.log_connections {
             let user = params
