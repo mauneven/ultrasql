@@ -5331,6 +5331,8 @@ impl Server {
         };
 
         self.operators.clear();
+        let mut seen_oids = std::collections::HashSet::new();
+        let mut seen_signatures = std::collections::HashSet::new();
         for (line_no, line) in text.lines().enumerate() {
             if line.is_empty() || line.starts_with('#') {
                 continue;
@@ -5348,6 +5350,13 @@ impl Server {
                     line_no + 1
                 ))
             })?;
+            if !seen_oids.insert(oid) {
+                return Err(ServerError::ddl(format!(
+                    "duplicate operator metadata oid {} on line {}",
+                    oid,
+                    line_no + 1
+                )));
+            }
             let namespace = metadata_unescape(parts[2])?;
             let name = metadata_unescape(parts[3])?;
             let left_type =
@@ -5379,6 +5388,13 @@ impl Server {
                 &operator.left_type,
                 &operator.right_type,
             );
+            if !seen_signatures.insert(signature.clone()) {
+                return Err(ServerError::ddl(format!(
+                    "duplicate operator metadata signature '{}' on line {}",
+                    signature,
+                    line_no + 1
+                )));
+            }
             self.operators.insert(signature, Arc::new(operator));
         }
         Ok(())

@@ -60,3 +60,23 @@ fn operator_catalog_rejects_unknown_runtime_procedure_on_rebuild() {
         "expected operator metadata rejection, got {err}"
     );
 }
+
+#[test]
+fn operator_catalog_rejects_duplicate_runtime_signature_on_rebuild() {
+    let data_dir = tempfile::TempDir::new().expect("temp data dir");
+    std::fs::write(
+        data_dir.path().join("pg_operator_runtime.meta"),
+        concat!(
+            "# ultrasql operator runtime v1\n",
+            "operator\t90000\tpg_catalog\t===\tbool\tbool\tbool_eq\tbool\n",
+            "operator\t90001\tpg_catalog\t===\tbool\tbool\tbool_eq\tbool\n"
+        ),
+    )
+    .expect("write duplicate operator metadata");
+
+    let err = Server::init(data_dir.path()).expect_err("duplicate operator metadata rejected");
+    assert!(
+        err.to_string().contains("duplicate operator metadata"),
+        "expected duplicate metadata rejection, got {err}"
+    );
+}

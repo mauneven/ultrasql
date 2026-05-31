@@ -1095,10 +1095,11 @@ as a concise evidence ledger; roadmap stays for open gates only.
   `pg_operator_runtime.meta` and reloads on `Server::init`, so custom operator
   `pg_operator` rows survive restart until typed catalog rows replace the
   sidecar before v1.0. The loader rejects tampered rows whose procedure/type
-  signature is outside the DDL-supported subset. Evidence:
+  signature is outside the DDL-supported subset, plus duplicate OIDs or
+  duplicate operator signatures. Evidence:
   `cargo test -p ultrasql-server --test operator_catalog_round_trip create_operator_catalog_survives_restart -- --nocapture`
   and
-  `cargo test -p ultrasql-server --test operator_catalog_round_trip operator_catalog_rejects_unknown_runtime_procedure_on_rebuild -- --nocapture`.
+  `cargo test -p ultrasql-server --test operator_catalog_round_trip -- --nocapture`.
 - Type-specific regression baseline covers numeric, text, date/time/timetz,
   timestamp, JSON/JSONB, and arrays.
 - `pg_type` now exposes built-in array type rows such as `_int4`, with
