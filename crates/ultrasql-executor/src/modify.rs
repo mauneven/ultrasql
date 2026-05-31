@@ -1430,9 +1430,7 @@ impl<L: PageLoader + Send + Sync + std::fmt::Debug + 'static> ModifyTable<L> {
                     self.codec.schema().field_at(*col_idx).name.clone(),
                 ));
             }
-            let val = evaluator
-                .eval(orig_row)
-                .map_err(|e| ExecError::TypeMismatch(e.to_string()))?;
+            let val = evaluator.eval(orig_row).map_err(eval_error_to_exec_error)?;
             if *col_idx >= relation_cols {
                 return Err(ExecError::TypeMismatch(format!(
                     "UPDATE assignment column index {col_idx} out of range (relation has {relation_cols} columns)"

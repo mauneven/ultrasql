@@ -191,6 +191,37 @@ async fn update_null_into_not_null_column_returns_23502_and_preserves_row() {
     graceful_shutdown(running).await;
 }
 
+/// Runtime errors inside UPDATE assignments keep their SQLSTATE and do
+/// not mutate the row.
+#[tokio::test]
+async fn update_assignment_runtime_cast_error_returns_22p02() {
+    let running = start_sample_server("constraint_update_cast_test").await;
+    let client = &running.client;
+
+    client
+        .batch_execute(
+            "CREATE TABLE t (id INT, raw TEXT);
+             INSERT INTO t VALUES (1, 'not-int')",
+        )
+        .await
+        .expect("setup");
+
+    let err = client
+        .batch_execute("UPDATE t SET id = CAST(raw AS INTEGER)")
+        .await
+        .expect_err("UPDATE assignment runtime cast rejects row");
+    let sqlstate = err.code().expect("server-sent SQLSTATE present");
+    assert_eq!(sqlstate.code(), "22P02");
+
+    let row = client
+        .query_one("SELECT id FROM t", &[])
+        .await
+        .expect("select after rejected UPDATE assignment");
+    assert_eq!(row.get::<_, i32>(0), 1);
+
+    graceful_shutdown(running).await;
+}
+
 /// Omitted columns with DEFAULT expressions get the default value, while
 /// explicit NULL remains NULL on nullable columns.
 #[tokio::test]
