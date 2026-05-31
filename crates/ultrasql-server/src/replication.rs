@@ -1156,24 +1156,10 @@ mod tests {
 
     #[test]
     fn logical_metadata_rejects_unbounded_read_limit() {
-        let _env_guard = replication_env_test_lock();
-        // SAFETY: replication_env_test_lock serializes process-env mutation in
-        // this module's tests.
-        unsafe {
-            std::env::set_var(REPLICATION_METADATA_FILE_LIMIT_ENV, u64::MAX.to_string());
-        }
-        let file = tempfile::NamedTempFile::new().expect("metadata file");
-        fs::write(file.path(), "name=pub_events\n").expect("metadata");
-
-        let err = read_regular_text_file(file.path(), "logical publication metadata file")
+        let err = replication_metadata_take_limit(u64::MAX)
             .expect_err("unbounded metadata limit rejected");
 
         assert!(err.to_string().contains("metadata read limit is too large"));
-        // SAFETY: replication_env_test_lock serializes process-env mutation in
-        // this module's tests.
-        unsafe {
-            std::env::remove_var(REPLICATION_METADATA_FILE_LIMIT_ENV);
-        }
     }
 
     #[cfg(unix)]
@@ -1526,12 +1512,5 @@ mod tests {
                 .expect("second cascade receive"),
             0
         );
-    }
-
-    fn replication_env_test_lock() -> std::sync::MutexGuard<'static, ()> {
-        static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
-        LOCK.get_or_init(|| std::sync::Mutex::new(()))
-            .lock()
-            .expect("replication env test lock")
     }
 }
