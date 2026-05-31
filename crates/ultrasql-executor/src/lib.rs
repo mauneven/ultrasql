@@ -201,6 +201,11 @@ pub enum ExecError {
     #[error("{0}")]
     InvalidTextRepresentation(String),
 
+    /// A runtime parameter value is invalid for the called SQL surface.
+    /// The server maps this to SQLSTATE `22023`.
+    #[error("{0}")]
+    InvalidParameterValue(String),
+
     /// XML parser rejected a document value. The server maps this to
     /// PostgreSQL SQLSTATE `2200M`.
     #[error("{0}")]

@@ -686,6 +686,22 @@ async fn generate_series_with_step_skips() {
 }
 
 #[tokio::test]
+async fn generate_series_zero_step_is_invalid_parameter() {
+    let (client, _conn, server_handle) = start_server_and_connect().await;
+
+    let err = client
+        .query("SELECT * FROM generate_series(1, 10, 0)", &[])
+        .await
+        .expect_err("zero step must be rejected");
+    assert_eq!(
+        err.code().map(tokio_postgres::error::SqlState::code),
+        Some("22023")
+    );
+
+    shutdown(client, server_handle).await;
+}
+
+#[tokio::test]
 async fn generate_series_descending_emits_descending() {
     let (client, _conn, server_handle) = start_server_and_connect().await;
 

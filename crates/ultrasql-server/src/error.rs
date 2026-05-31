@@ -280,6 +280,9 @@ impl ServerError {
             // invalid_text_representation — runtime cast parser rejected
             // a text value for the requested SQL type.
             Self::Execute(ultrasql_executor::ExecError::InvalidTextRepresentation(_)) => "22P02",
+            // invalid_parameter_value — runtime parameter rejected by a
+            // SQL surface such as generate_series(..., step => 0).
+            Self::Execute(ultrasql_executor::ExecError::InvalidParameterValue(_)) => "22023",
             // invalid_xml_document — XML cast parser rejected a document
             // value.
             Self::Execute(ultrasql_executor::ExecError::InvalidXmlDocument(_)) => "2200M",

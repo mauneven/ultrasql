@@ -226,6 +226,12 @@ as a concise evidence ledger; roadmap stays for open gates only.
   scan exhausted. Evidence:
   `cargo test -p ultrasql-executor generate_series --lib -- --nocapture` and
   `cargo test -p ultrasql-server --test function_scan_round_trip generate_series -- --nocapture`.
+- `generate_series(..., step => 0)` now raises typed invalid-parameter SQLSTATE
+  `22023` instead of silently returning an empty result. Evidence:
+  `cargo test -p ultrasql-server --test function_scan_round_trip generate_series_zero_step_is_invalid_parameter -- --nocapture`,
+  `cargo test -p ultrasql-server --test function_scan_round_trip generate_series -- --nocapture`,
+  and
+  `cargo clippy -p ultrasql-executor -p ultrasql-server --all-targets --all-features -- -D warnings`.
 - Constant `SELECT` result execution now propagates scalar evaluation failures
   instead of silently returning NULL. Evidence:
   `cargo test -p ultrasql-executor result_propagates_constant_eval_errors`.

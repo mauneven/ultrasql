@@ -7,7 +7,7 @@
 //!
 //! `generate_series(start, stop, step)` emits integer rows from `start` to
 //! `stop` (inclusive) stepping by `step`. Negative `step` allows
-//! descending series. A zero `step` returns no rows (matching PostgreSQL).
+//! descending series. A zero `step` returns [`ExecError::InvalidParameterValue`].
 //!
 //! The output schema has a single `Int64` column named `generate_series`.
 //!
@@ -78,7 +78,7 @@ impl FunctionScan {
             current: start,
             position: 0,
             cancel_flag: None,
-            eof: step == 0, // zero step immediately exhausted
+            eof: false,
         }
     }
 
@@ -152,8 +152,9 @@ impl Operator for FunctionScan {
                 let step_val = *step;
 
                 if step_val == 0 {
-                    self.eof = true;
-                    return Ok(None);
+                    return Err(ExecError::InvalidParameterValue(
+                        "generate_series step size cannot equal zero".to_owned(),
+                    ));
                 }
 
                 let mut data: Vec<i64> = Vec::with_capacity(BATCH_TARGET_ROWS);
@@ -262,9 +263,12 @@ mod tests {
     }
 
     #[test]
-    fn generate_series_zero_step_emits_nothing() {
+    fn generate_series_zero_step_errors() {
         let mut op = FunctionScan::generate_series(1, 10, 0);
-        assert!(op.next_batch().expect("ok").is_none());
+        assert!(matches!(
+            op.next_batch(),
+            Err(ExecError::InvalidParameterValue(_))
+        ));
     }
 
     #[test]
