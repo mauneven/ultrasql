@@ -1805,6 +1805,9 @@ as a concise evidence ledger; roadmap stays for open gates only.
   `cargo test -p ultrasql-server --test numeric_round_trip -- --nocapture`,
   `cargo test -p ultrasql-server --test money_round_trip -- --nocapture`, and
   `cargo test -p ultrasql-executor cast_size_and_array_error_edges_cover_scalar_compat_paths --lib -- --nocapture`.
+- Filter predicate evaluation now preserves those typed cast errors instead of
+  collapsing invalid runtime predicate casts to `XX000`. Evidence:
+  `cargo test -p ultrasql-server --test core_type_surface_round_trip core_scalar_types_round_trip_over_postgres_wire -- --nocapture`.
 - Runtime scalar/temporal text casts to integer, float, boolean, date, time,
   timestamp, timestamptz, and timetz now report SQLSTATE `22P02` for invalid
   column text. Evidence:

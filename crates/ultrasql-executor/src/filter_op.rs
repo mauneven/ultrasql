@@ -38,7 +38,7 @@ use ultrasql_vec::{Batch, DictionaryEncodingPolicy, StringEncoding, encode_strin
 
 use crate::eval::Eval;
 use crate::seq_scan::build_batch;
-use crate::{ExecError, Operator};
+use crate::{ExecError, Operator, eval_error_to_exec_error};
 
 /// General predicate filter operator.
 ///
@@ -237,10 +237,7 @@ impl Operator for Filter {
         let rows = batch_to_rows(&input, &self.schema)?;
         let mut survivors: Vec<Vec<Value>> = Vec::with_capacity(rows.len());
         for row in &rows {
-            let result = self
-                .predicate
-                .eval(row)
-                .map_err(|e| ExecError::TypeMismatch(e.to_string()))?;
+            let result = self.predicate.eval(row).map_err(eval_error_to_exec_error)?;
             match result {
                 Value::Bool(true) => survivors.push(row.clone()),
                 Value::Bool(false) | Value::Null => {

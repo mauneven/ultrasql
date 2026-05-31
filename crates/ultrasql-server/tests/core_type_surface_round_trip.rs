@@ -233,6 +233,16 @@ async fn core_scalar_types_round_trip_over_postgres_wire() {
             "{query}"
         );
     }
+    let filter_err = client
+        .simple_query(
+            "SELECT 1 FROM scalar_invalid_text_cast_surface WHERE CAST(as_int AS INTEGER) = 1",
+        )
+        .await
+        .expect_err("invalid scalar runtime text cast in filter must fail");
+    assert_eq!(
+        filter_err.code().map(tokio_postgres::error::SqlState::code),
+        Some("22P02")
+    );
 
     client
         .batch_execute(

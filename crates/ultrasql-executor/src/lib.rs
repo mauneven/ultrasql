@@ -291,6 +291,21 @@ pub enum ExecError {
     GeneratedAlwaysViolation(String),
 }
 
+pub(crate) fn eval_error_to_exec_error(error: EvalError) -> ExecError {
+    match error {
+        EvalError::NumericFieldOverflow(detail) => ExecError::NumericFieldOverflow(detail),
+        EvalError::Overflow => {
+            ExecError::NumericFieldOverflow("numeric value out of range".to_owned())
+        }
+        EvalError::DivByZero => ExecError::DivisionByZero("division by zero".to_owned()),
+        EvalError::InvalidTextRepresentation(detail) => {
+            ExecError::InvalidTextRepresentation(detail)
+        }
+        EvalError::InvalidXmlDocument(detail) => ExecError::InvalidXmlDocument(detail),
+        other => ExecError::TypeMismatch(other.to_string()),
+    }
+}
+
 /// A per-query cancel signal threaded through long-running operators.
 ///
 /// The flag is cloned from the connection's cancel-registry entry when
