@@ -214,8 +214,10 @@ as a concise evidence ledger; roadmap stays for open gates only.
 - SQL/JSON path now supports ISO `date()`, `time([precision])`,
   `time_tz([precision])`, `timestamp([precision])`,
   `timestamp_tz([precision])`, auto `datetime()`, and
-  `datetime("HH24:MI")` parsing/evaluation with bounded fractional precision
-  and wire-level `jsonb_path_query` coverage. Evidence:
+  `datetime("HH24:MI")` parsing/evaluation with bounded fractional precision.
+  Common ISO `datetime(template)` forms now cover `YYYY-MM-DD`, `YYYYMMDD`,
+  `YYYY-MM-DD HH24:MI:SS`, `YYYY-MM-DD"T"HH24:MI:SS`, and
+  `YYYYMMDDHH24MISS`, with wire-level `jsonb_path_query` coverage. Evidence:
   `cargo test -p ultrasql-core iso_date_and_timestamp_text_helpers_round_trip --lib -- --nocapture`,
   `cargo test -p ultrasql-executor json_path::tests::path_supports_iso_datetime_methods --lib -- --nocapture`,
   and
