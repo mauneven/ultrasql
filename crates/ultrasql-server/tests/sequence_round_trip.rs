@@ -380,6 +380,54 @@ async fn sequence_functions_require_schema_usage_privilege() {
 }
 
 #[tokio::test]
+async fn grant_sequence_respects_schema_qualifier() {
+    let running = start_sample_server("sequence_grant_schema_qualifier_guard").await;
+
+    running
+        .client
+        .batch_execute(
+            "CREATE ROLE tester SUPERUSER LOGIN; \
+             CREATE ROLE seq_qualifier_reader LOGIN; \
+             CREATE SCHEMA app; \
+             CREATE SEQUENCE seq_grant_guard START WITH 31",
+        )
+        .await
+        .expect("create public sequence and separate schema");
+
+    running
+        .client
+        .batch_execute("GRANT USAGE ON SEQUENCE app.seq_grant_guard TO seq_qualifier_reader")
+        .await
+        .expect_err("qualified sequence GRANT must not target public same-name sequence");
+
+    let (reader, reader_conn) = connect_as(
+        running.bound,
+        "seq_qualifier_reader",
+        "sequence_qualifier_reader",
+    )
+    .await;
+    reader
+        .simple_query("SELECT nextval('seq_grant_guard')")
+        .await
+        .expect_err("rejected qualified sequence GRANT must not persist");
+    drop(reader);
+    reader_conn.await.expect("sequence reader joins");
+
+    running
+        .client
+        .batch_execute(
+            "DROP SEQUENCE seq_grant_guard; \
+             DROP SCHEMA app; \
+             DROP ROLE tester; \
+             DROP ROLE seq_qualifier_reader",
+        )
+        .await
+        .expect("cleanup sequence privilege qualifier guard");
+
+    graceful_shutdown(running).await;
+}
+
+#[tokio::test]
 async fn alter_sequence_changes_increment() {
     let running = start_sample_server("sequence_test").await;
     let client = &running.client;

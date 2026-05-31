@@ -36,12 +36,13 @@ where
         };
         self.validate_grantees(grantees)?;
         self.ensure_privilege_administration(*object_kind, objects)?;
+        let privilege_objects = self.privilege_object_keys(*object_kind, objects)?;
         let before_grants = self.state.privilege_catalog.list_grants();
         let before_default_grants = self.state.privilege_catalog.list_default_grants();
         self.state.privilege_catalog.grant_many(
             &self.current_user,
             convert_object_kind(*object_kind),
-            objects,
+            &privilege_objects,
             grantees,
             &convert_privileges(privileges),
             *grant_option,
@@ -74,11 +75,12 @@ where
         };
         self.validate_grantees(grantees)?;
         self.ensure_privilege_administration(*object_kind, objects)?;
+        let privilege_objects = self.privilege_object_keys(*object_kind, objects)?;
         let before_grants = self.state.privilege_catalog.list_grants();
         let before_default_grants = self.state.privilege_catalog.list_default_grants();
         self.state.privilege_catalog.revoke_many(
             convert_object_kind(*object_kind),
-            objects,
+            &privilege_objects,
             grantees,
             &convert_privileges(privileges),
         );
@@ -228,8 +230,26 @@ where
             for table in objects {
                 self.table_oid_for_privilege_object(table)?;
             }
+        } else if object_kind == LogicalPrivilegeObjectKind::Sequence {
+            for sequence in objects {
+                self.sequence_key_for_privilege_object(sequence)?;
+            }
         }
         Ok(())
+    }
+
+    fn privilege_object_keys(
+        &self,
+        object_kind: LogicalPrivilegeObjectKind,
+        objects: &[String],
+    ) -> Result<Vec<String>, ServerError> {
+        if object_kind == LogicalPrivilegeObjectKind::Sequence {
+            return objects
+                .iter()
+                .map(|sequence| self.sequence_key_for_privilege_object(sequence))
+                .collect();
+        }
+        Ok(objects.to_vec())
     }
 
     fn ensure_table_privilege_owner(&self, tables: &[String]) -> Result<(), ServerError> {
@@ -288,7 +308,7 @@ where
     fn ensure_sequence_privilege_owner(&self, sequences: &[String]) -> Result<(), ServerError> {
         let current_user = self.current_user.to_ascii_lowercase();
         for sequence in sequences {
-            let sequence_key = sequence.to_ascii_lowercase();
+            let sequence_key = self.sequence_key_for_privilege_object(sequence)?;
             let owns_sequence = self
                 .state
                 .sequence_owners
@@ -301,6 +321,28 @@ where
             }
         }
         Ok(())
+    }
+
+    fn sequence_key_for_privilege_object(&self, sequence: &str) -> Result<String, ServerError> {
+        let sequence_key = privilege_object_simple_name(sequence).to_ascii_lowercase();
+        if !self.state.sequences.contains_key(&sequence_key) {
+            return Err(ServerError::ddl(format!(
+                "sequence '{sequence}' does not exist"
+            )));
+        }
+        if let Some(namespace) = privilege_object_namespace(sequence) {
+            let actual_namespace = self
+                .state
+                .sequence_namespaces
+                .get(&sequence_key)
+                .map_or_else(|| "public".to_owned(), |entry| entry.value().clone());
+            if !actual_namespace.eq_ignore_ascii_case(namespace) {
+                return Err(ServerError::ddl(format!(
+                    "sequence '{sequence}' does not exist"
+                )));
+            }
+        }
+        Ok(sequence_key)
     }
 
     fn auth_role_is_superuser_for_privilege(&self) -> bool {

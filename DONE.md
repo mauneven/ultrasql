@@ -1395,3 +1395,7 @@ as a concise evidence ledger; roadmap stays for open gates only.
   qualifiers before the superuser administration bypass, preventing ghost
   grants such as `GRANT ... ON TABLE missing_schema.same_name`. Evidence:
   `cargo test -p ultrasql-server --test privilege_catalog_round_trip -- --nocapture`.
+- Sequence privilege DDL now validates explicit schema qualifiers before the
+  superuser administration bypass and stores valid qualified sequence grants
+  under the canonical sequence key. Evidence:
+  `cargo test -p ultrasql-server --test sequence_round_trip -- --nocapture`.
