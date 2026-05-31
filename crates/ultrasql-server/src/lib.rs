@@ -2488,9 +2488,12 @@ pub struct Server {
     pub logical_replication: Arc<replication::LogicalReplicationRuntime>,
     /// Same-process workload recorder for query timings and slow logs.
     pub workload_recorder: Arc<workload::WorkloadRecorder>,
-    /// Accumulated tuple modifications since the last analyze pass,
+    /// Accumulated tuple modifications since the last VACUUM pass,
     /// keyed by folded table name.
     pub table_modifications: dashmap::DashMap<String, u64>,
+    /// Accumulated tuple modifications since the last ANALYZE scheduling pass,
+    /// keyed by folded table name.
+    pub table_analyze_modifications: dashmap::DashMap<String, u64>,
     /// Tables that crossed the autovacuum ANALYZE threshold and are
     /// waiting for the next maintenance pass.
     pub pending_analyze_tables: dashmap::DashMap<String, ()>,
@@ -3872,6 +3875,7 @@ impl Server {
             logical_replication: Arc::new(replication::LogicalReplicationRuntime::new()),
             workload_recorder: Arc::new(workload::WorkloadRecorder::new()),
             table_modifications: dashmap::DashMap::new(),
+            table_analyze_modifications: dashmap::DashMap::new(),
             pending_analyze_tables: dashmap::DashMap::new(),
             autovacuum_config: AutovacuumConfig::default(),
             logging_config: LoggingConfig::default(),
@@ -4348,6 +4352,7 @@ impl Server {
             )?),
             workload_recorder: Arc::new(workload::WorkloadRecorder::new()),
             table_modifications: dashmap::DashMap::new(),
+            table_analyze_modifications: dashmap::DashMap::new(),
             pending_analyze_tables: dashmap::DashMap::new(),
             autovacuum_config: AutovacuumConfig::default(),
             logging_config: LoggingConfig::default(),
@@ -6387,19 +6392,26 @@ impl Server {
 
         let folded = table.to_ascii_lowercase();
         self.columnar_storage.mark_dirty(&folded);
-        let current = {
+        {
             let mut entry = self.table_modifications.entry(folded.clone()).or_insert(0);
+            *entry = entry.saturating_add(modified_rows);
+        }
+        let analyze_current = {
+            let mut entry = self
+                .table_analyze_modifications
+                .entry(folded.clone())
+                .or_insert(0);
             *entry = entry.saturating_add(modified_rows);
             *entry
         };
         let threshold = self.auto_analyze_threshold(&folded);
-        if current < threshold {
+        if analyze_current < threshold {
             return;
         }
 
         // Reset counter first so concurrent DML can accumulate for the
         // next cycle while the maintenance pass drains this table.
-        self.table_modifications.insert(folded.clone(), 0);
+        self.table_analyze_modifications.insert(folded.clone(), 0);
         self.pending_analyze_tables.insert(folded, ());
     }
 

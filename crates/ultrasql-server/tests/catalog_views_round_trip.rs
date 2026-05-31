@@ -8,7 +8,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use tokio_postgres::NoTls;
-use ultrasql_server::{Server, WalArchiveConfig, bind_listener, serve_listener};
+use ultrasql_server::{AutovacuumConfig, Server, WalArchiveConfig, bind_listener, serve_listener};
 
 async fn start_server_and_connect() -> (
     Arc<Server>,
@@ -605,6 +605,51 @@ async fn pg_catalog_and_information_schema_reflect_runtime_objects() {
         .await
         .expect("information_schema.triggers query");
     assert!(triggers.is_empty());
+
+    shutdown(client, server_handle).await;
+}
+
+#[tokio::test]
+async fn pg_stat_user_tables_tracks_background_maintenance() {
+    let mut server = Server::with_sample_database();
+    server.set_autovacuum_config(AutovacuumConfig {
+        vacuum_threshold: 1,
+        vacuum_scale_factor_ppm: 0,
+        analyze_threshold: 1,
+        analyze_scale_factor_ppm: 0,
+    });
+    let (server, client, _conn, server_handle) = start_server_and_connect_with(server).await;
+
+    client
+        .batch_execute("CREATE TABLE auto_stat_t (id INT)")
+        .await
+        .expect("create autovacuum stats table");
+    client
+        .batch_execute("INSERT INTO auto_stat_t VALUES (1), (2)")
+        .await
+        .expect("insert autovacuum stats rows");
+    client
+        .batch_execute("DELETE FROM auto_stat_t WHERE id = 1")
+        .await
+        .expect("delete autovacuum stats row");
+
+    server.run_autovacuum_cycle();
+
+    let rows = client
+        .query(
+            "SELECT last_autovacuum IS NOT NULL, autovacuum_count, \
+                    last_autoanalyze IS NOT NULL, autoanalyze_count \
+             FROM pg_catalog.pg_stat_user_tables \
+             WHERE relname = 'auto_stat_t'",
+            &[],
+        )
+        .await
+        .expect("pg_stat_user_tables background maintenance counters");
+    assert_eq!(rows.len(), 1);
+    assert!(rows[0].get::<_, bool>(0));
+    assert_eq!(rows[0].get::<_, i64>(1), 1);
+    assert!(rows[0].get::<_, bool>(2));
+    assert_eq!(rows[0].get::<_, i64>(3), 1);
 
     shutdown(client, server_handle).await;
 }

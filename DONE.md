@@ -888,9 +888,14 @@ as a concise evidence ledger; roadmap stays for open gates only.
 - `pg_catalog.pg_stat_user_tables` now exposes table maintenance counters:
   `last_vacuum`, `last_autovacuum`, `vacuum_count`, `autovacuum_count`,
   `last_analyze`, `last_autoanalyze`, `analyze_count`, and
-  `autoanalyze_count`, with manual `VACUUM` and `ANALYZE` updating
-  timestamp/count evidence. Evidence:
-  `cargo test -p ultrasql-server --test catalog_views_round_trip pg_catalog_and_information_schema_reflect_runtime_objects -- --nocapture`.
+  `autoanalyze_count`, with manual `VACUUM` / `ANALYZE` and background
+  autovacuum / autoanalyze updating timestamp/count evidence. Evidence:
+  `cargo test -p ultrasql-server --test catalog_views_round_trip pg_catalog_and_information_schema_reflect_runtime_objects -- --nocapture`;
+  `cargo test -p ultrasql-server --test catalog_views_round_trip pg_stat_user_tables_tracks_background_maintenance -- --nocapture`.
+- Autovacuum and autoanalyze scheduling now use separate modification
+  counters, so scheduling autoanalyze no longer clears the VACUUM trigger
+  evidence for the same committed row changes. Evidence:
+  `cargo test -p ultrasql-server --test catalog_views_round_trip pg_stat_user_tables_tracks_background_maintenance -- --nocapture`.
 - `GUI introspection probes` exist for `pgAdmin`, `DBeaver`, and `DataGrip`.
 - Migration tool certification covers `Flyway`, `Liquibase`, and `Alembic`.
 
