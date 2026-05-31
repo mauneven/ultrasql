@@ -115,6 +115,9 @@ where
             ));
         };
         self.validate_grantees(grantees)?;
+        for schema in schemas {
+            self.ensure_schema_exists_for_privilege(schema)?;
+        }
         let owner_roles = self.default_privilege_owner_roles(target_roles)?;
         let privilege_requests = convert_privileges(privileges);
         let before_grants = self.state.privilege_catalog.list_grants();

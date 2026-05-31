@@ -1481,6 +1481,47 @@ async fn drop_schema_removes_schema_scoped_default_privileges() {
     shutdown(running).await;
 }
 
+#[tokio::test]
+async fn default_privileges_reject_missing_schema() {
+    let running = start_sample_server("default_privilege_missing_schema").await;
+    let client = &running.client;
+
+    client
+        .batch_execute("CREATE ROLE tester SUPERUSER LOGIN; CREATE ROLE analyst LOGIN")
+        .await
+        .expect("create default privilege roles");
+
+    client
+        .batch_execute(
+            "ALTER DEFAULT PRIVILEGES FOR ROLE tester IN SCHEMA missing_schema \
+             GRANT SELECT ON TABLES TO analyst",
+        )
+        .await
+        .expect_err("default privileges must reject missing schemas");
+
+    client
+        .batch_execute(
+            "CREATE SCHEMA missing_schema; CREATE TABLE missing_schema.future_acl (id INT)",
+        )
+        .await
+        .expect("create schema and table after rejected default privilege");
+
+    let granted = client
+        .query_one(
+            "SELECT has_table_privilege('analyst', 'future_acl', 'SELECT')",
+            &[],
+        )
+        .await
+        .expect("default privilege check after rejected missing schema grant")
+        .get::<_, bool>(0);
+    assert!(
+        !granted,
+        "rejected missing-schema default privilege must not affect future tables"
+    );
+
+    shutdown(running).await;
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn privilege_catalog_survives_restart() {
     let data_dir = tempfile::TempDir::new().expect("temp data dir");

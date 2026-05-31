@@ -1408,3 +1408,7 @@ as a concise evidence ledger; roadmap stays for open gates only.
   administration bypass while preserving built-in schema grants, preventing
   ghost grants on missing schemas. Evidence:
   `cargo test -p ultrasql-server --test privilege_catalog_round_trip -- --nocapture`.
+- Schema-scoped default privilege DDL now validates every explicit `IN SCHEMA`
+  target before mutating ACL metadata, preventing missing-schema default grants
+  from applying to future schemas/tables. Evidence:
+  `cargo test -p ultrasql-server --test privilege_catalog_round_trip -- --nocapture`.
