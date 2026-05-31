@@ -1131,6 +1131,44 @@ async fn pg_settings_reflects_runtime_gucs() {
 }
 
 #[tokio::test]
+async fn pg_settings_reflects_statement_timeout() {
+    let (_server, client, _conn, server_handle) = start_server_and_connect().await;
+
+    client
+        .batch_execute("SET statement_timeout = 250")
+        .await
+        .expect("set statement_timeout");
+    let row = client
+        .query_one(
+            "SELECT setting, unit \
+             FROM pg_catalog.pg_settings \
+             WHERE name = 'statement_timeout'",
+            &[],
+        )
+        .await
+        .expect("pg_settings statement_timeout");
+    assert_eq!(row.get::<_, String>(0), "250");
+    assert_eq!(row.get::<_, String>(1), "ms");
+
+    client
+        .batch_execute("RESET statement_timeout")
+        .await
+        .expect("reset statement_timeout");
+    let row = client
+        .query_one(
+            "SELECT setting \
+             FROM pg_catalog.pg_settings \
+             WHERE name = 'statement_timeout'",
+            &[],
+        )
+        .await
+        .expect("pg_settings reset statement_timeout");
+    assert_eq!(row.get::<_, String>(0), "0");
+
+    shutdown(client, server_handle).await;
+}
+
+#[tokio::test]
 async fn pg_stat_activity_reflects_session_identity() {
     let (_server, client, _conn, server_handle) = start_server_and_connect().await;
 

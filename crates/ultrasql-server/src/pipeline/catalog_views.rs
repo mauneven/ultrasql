@@ -2224,6 +2224,15 @@ fn rows_pg_settings(ctx: &LowerCtx<'_>) -> Vec<Vec<Value>> {
             v_text("user"),
         ],
         vec![
+            v_text("statement_timeout"),
+            v_text(session_setting(ctx, "statement_timeout", "0")),
+            v_text("ms"),
+            v_text("Client Connection Defaults / Statement Behavior"),
+            v_text("Sets the maximum allowed duration of any statement."),
+            v_text("integer"),
+            v_text("user"),
+        ],
+        vec![
             v_text("TimeZone"),
             v_text(session_setting(ctx, "timezone", "UTC")),
             Value::Null,

@@ -782,6 +782,7 @@ where
             }
             "statement_timeout" => {
                 self.statement_timeout_ms = 0;
+                self.session_settings.remove("statement_timeout");
                 Ok(result_encoder::run_ddl_command("RESET"))
             }
             "extra_float_digits" => {
@@ -840,7 +841,10 @@ where
                 Ok(())
             }
             "statement_timeout" => {
-                self.statement_timeout_ms = parse_statement_timeout_ms(value)?;
+                let parsed = parse_statement_timeout_ms(value)?;
+                self.statement_timeout_ms = parsed;
+                self.session_settings
+                    .insert("statement_timeout".to_owned(), parsed.to_string());
                 Ok(())
             }
             "extra_float_digits" => {

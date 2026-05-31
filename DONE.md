@@ -650,6 +650,10 @@ as a concise evidence ledger; roadmap stays for open gates only.
   values as `SHOW`, including application name, client message level, date,
   interval, float, monetary, and time-zone settings. Evidence:
   `cargo test -p ultrasql-server --test catalog_views_round_trip pg_settings_reflects_runtime_gucs -- --nocapture`.
+- `pg_catalog.pg_settings.statement_timeout` now reflects the session timeout
+  setting and reset state while preserving the `ms` unit, so the enforced
+  timeout is visible through catalog introspection. Evidence:
+  `cargo test -p ultrasql-server --test catalog_views_round_trip pg_settings_reflects_statement_timeout -- --nocapture`.
 - `pg_catalog.pg_collation` now exposes base `default`, `C`, and `POSIX`
   catalog rows instead of an empty relation, unblocking ORM and GUI
   introspection probes that join collation metadata. Evidence:
