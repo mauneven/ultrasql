@@ -132,6 +132,48 @@ async fn core_scalar_types_round_trip_over_postgres_wire() {
     assert!(text_cast_row.get::<_, bool>(1));
     assert_eq!(text_cast_row.get::<_, f64>(2), 3.5);
 
+    client
+        .batch_execute(
+            "CREATE TABLE temporal_text_cast_surface (
+                as_date TEXT NOT NULL,
+                as_time TEXT NOT NULL,
+                as_timestamp TEXT NOT NULL
+             );
+             INSERT INTO temporal_text_cast_surface
+             VALUES ('2023-08-15', '04:05:06', '2023-08-15 04:05:06')",
+        )
+        .await
+        .expect("create temporal text cast table");
+    let temporal_cast_rows = client
+        .simple_query(
+            "SELECT
+                CAST(as_date AS DATE),
+                CAST(as_time AS TIME),
+                CAST(as_timestamp AS TIMESTAMP)
+             FROM temporal_text_cast_surface",
+        )
+        .await
+        .expect("runtime temporal text casts from columns");
+    let temporal_values: Vec<Vec<String>> = temporal_cast_rows
+        .into_iter()
+        .filter_map(|message| match message {
+            SimpleQueryMessage::Row(row) => Some(
+                (0..3)
+                    .map(|idx| row.get(idx).expect("temporal cast column").to_owned())
+                    .collect(),
+            ),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        temporal_values,
+        vec![vec![
+            "2023-08-15".to_owned(),
+            "04:05:06".to_owned(),
+            "2023-08-15 04:05:06".to_owned()
+        ]]
+    );
+
     let err = client
         .batch_execute(
             "INSERT INTO core_type_surface VALUES (

@@ -758,6 +758,9 @@ fn bind_runtime_cast(
             "__ultrasql_cast_float8"
         }
         DataType::Bool if actual_type.is_textlike() => "__ultrasql_cast_bool",
+        DataType::Date if actual_type.is_textlike() => "__ultrasql_cast_date",
+        DataType::Time if actual_type.is_textlike() => "__ultrasql_cast_time",
+        DataType::Timestamp if actual_type.is_textlike() => "__ultrasql_cast_timestamp",
         DataType::Money
             if actual_type.is_integer() || matches!(actual_type, DataType::Decimal { .. }) =>
         {

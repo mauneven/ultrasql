@@ -30,9 +30,10 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use num_traits::ToPrimitive;
 use serde_json::{Map as JsonMap, Number as JsonNumber, Value as JsonValue};
 use ultrasql_core::{
-    DataType, Oid, SparseVector, Value, bpchar_semantic_text, parse_money_text,
-    timestamp_micros_at_timezone, timestamptz_display_in_timezone, timetz_at_timezone,
-    timetz_utc_micros, xml_content_is_well_formed, xml_document_is_well_formed,
+    DataType, Oid, SparseVector, Value, bpchar_semantic_text, parse_date_text, parse_money_text,
+    parse_time_text, parse_timestamp_text, timestamp_micros_at_timezone,
+    timestamptz_display_in_timezone, timetz_at_timezone, timetz_utc_micros,
+    xml_content_is_well_formed, xml_document_is_well_formed,
     xml_xpath_element_fragments_with_namespaces,
 };
 use ultrasql_planner::{BinaryOp, ScalarExpr, UnaryOp, catalog::builtin_type_oid};
@@ -415,6 +416,9 @@ fn eval_function_call(
         "__ultrasql_cast_float4" => eval_cast_float32(args),
         "__ultrasql_cast_float8" => eval_cast_float64(args),
         "__ultrasql_cast_bool" => eval_cast_bool(args),
+        "__ultrasql_cast_date" => eval_cast_date(args),
+        "__ultrasql_cast_time" => eval_cast_time(args),
+        "__ultrasql_cast_timestamp" => eval_cast_timestamp(args),
         "__ultrasql_cast_oid" => eval_cast_oid(args),
         "__ultrasql_cast_regclass" => eval_cast_regclass(args),
         "__ultrasql_cast_regtype" => eval_cast_regtype(args),
@@ -1129,6 +1133,50 @@ fn parse_bool_cast_text(text: &str) -> Option<bool> {
             Some(false)
         }
         _ => None,
+    }
+}
+
+fn eval_cast_date(args: &[Value]) -> Result<Value, EvalError> {
+    let Some(text) = textlike_cast_arg("date cast", args)? else {
+        return Ok(Value::Null);
+    };
+    parse_date_text(text.trim())
+        .map(Value::Date)
+        .ok_or_else(|| EvalError::Type(format!("date cast: invalid syntax: {text}")))
+}
+
+fn eval_cast_time(args: &[Value]) -> Result<Value, EvalError> {
+    let Some(text) = textlike_cast_arg("time cast", args)? else {
+        return Ok(Value::Null);
+    };
+    parse_time_text(text.trim())
+        .map(Value::Time)
+        .ok_or_else(|| EvalError::Type(format!("time cast: invalid syntax: {text}")))
+}
+
+fn eval_cast_timestamp(args: &[Value]) -> Result<Value, EvalError> {
+    let Some(text) = textlike_cast_arg("timestamp cast", args)? else {
+        return Ok(Value::Null);
+    };
+    parse_timestamp_text(text.trim())
+        .map(Value::Timestamp)
+        .ok_or_else(|| EvalError::Type(format!("timestamp cast: invalid syntax: {text}")))
+}
+
+fn textlike_cast_arg<'a>(func: &str, args: &'a [Value]) -> Result<Option<&'a str>, EvalError> {
+    if args.len() != 1 {
+        return Err(EvalError::Type(format!(
+            "{func}: expected 1 arg, got {}",
+            args.len()
+        )));
+    }
+    match &args[0] {
+        Value::Null => Ok(None),
+        Value::Text(text) | Value::Char(text) => Ok(Some(text)),
+        other => Err(EvalError::Type(format!(
+            "{func}: text argument required, got {:?}",
+            other.data_type()
+        ))),
     }
 }
 
@@ -6129,8 +6177,8 @@ fn regex_match(haystack: &str, pattern: &str, case_insensitive: bool) -> Result<
 mod tests {
     use proptest::prelude::*;
     use ultrasql_core::{
-        BitString, DataType, Field, NetworkValue, Oid, Schema, Value, parse_timestamp_text,
-        parse_timestamptz_text,
+        BitString, DataType, Field, NetworkValue, Oid, Schema, Value, parse_date_text,
+        parse_time_text, parse_timestamp_text, parse_timestamptz_text,
     };
     use ultrasql_planner::{BinaryOp, LogicalPlan, ScalarExpr, UnaryOp};
 
@@ -6670,6 +6718,30 @@ mod tests {
         );
         assert!(
             eval_fn_err("__ultrasql_cast_bool", vec![Value::Text("maybe".into())])
+                .contains("invalid syntax")
+        );
+        assert_eq!(
+            eval_fn(
+                "__ultrasql_cast_date",
+                vec![Value::Text("2023-08-15".into())]
+            ),
+            Value::Date(parse_date_text("2023-08-15").expect("date parses"))
+        );
+        assert_eq!(
+            eval_fn("__ultrasql_cast_time", vec![Value::Char("04:05:06".into())]),
+            Value::Time(parse_time_text("04:05:06").expect("time parses"))
+        );
+        assert_eq!(
+            eval_fn(
+                "__ultrasql_cast_timestamp",
+                vec![Value::Text("2023-08-15 04:05:06".into())]
+            ),
+            Value::Timestamp(
+                parse_timestamp_text("2023-08-15 04:05:06").expect("timestamp parses")
+            )
+        );
+        assert!(
+            eval_fn_err("__ultrasql_cast_date", vec![Value::Text("bad".into())])
                 .contains("invalid syntax")
         );
 
