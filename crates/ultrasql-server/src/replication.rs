@@ -376,7 +376,15 @@ impl LogicalReplicationRuntime {
         publications.sort();
         let mut changes = self.changes.lock();
         for publication in publications {
-            let lsn = self.next_lsn.fetch_add(1, Ordering::AcqRel);
+            let Ok(lsn) =
+                self.next_lsn
+                    .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+                        current.checked_add(1)
+                    })
+            else {
+                tracing::error!("logical replication LSN space exhausted; skipping CDC record");
+                return;
+            };
             changes.push(LogicalChange {
                 lsn,
                 publication,
@@ -1265,6 +1273,20 @@ mod tests {
                 .contains("logical replication LSN space exhausted"),
             "unexpected error: {err}"
         );
+    }
+
+    #[test]
+    fn logical_recording_does_not_wrap_exhausted_next_lsn() {
+        let runtime = LogicalReplicationRuntime::new();
+        runtime
+            .create_publication("pub_events", vec!["events".to_string()])
+            .expect("publication");
+        runtime.next_lsn.store(u64::MAX, Ordering::Release);
+
+        runtime.record_committed_dml("events", LogicalChangeKind::Insert, 1);
+
+        assert!(runtime.changes_since(0).is_empty());
+        assert_eq!(runtime.next_lsn.load(Ordering::Acquire), u64::MAX);
     }
 
     #[test]

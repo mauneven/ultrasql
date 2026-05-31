@@ -103,6 +103,8 @@ as a concise evidence ledger; roadmap stays for open gates only.
   instead of saturating the final `CommandComplete` row count.
 - Logical replication metadata restore now rejects exhausted confirmed LSN state
   before seeding the next in-process logical LSN.
+- Logical replication live LSN allocation now uses checked atomic advancement
+  and refuses to wrap exhausted CDC sequence state.
 - Focused `ultrasql-executor` coverage now exercises scalar compatibility
   functions, physical lowering edge families, row encoding/decoding,
   projection/filter/sort/unique/set/window/hash aggregate behavior, modify-table
