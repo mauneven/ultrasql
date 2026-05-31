@@ -32,10 +32,11 @@ anomaly matrix at `TransactionManager` level.
 
 UltraSQL installs SSI by default in server mode and records conflicts for
 serializable transactions. The current server integration uses column-range SSI
-for supported scalar comparisons plus relation-level fallback, but it is not
-fully predicate-precise. That means it can avoid some false aborts for disjoint
-bounded predicates and still pass the covered write-skew scenario, but it is
-not yet full page/tuple/gap precision or full isolationtester breadth.
+for supported scalar comparisons and fully supported `AND` / `OR` predicate
+trees plus relation-level fallback, but it is not fully predicate-precise. That
+means it can avoid some false aborts for disjoint bounded predicates and still
+pass the covered write-skew scenario, but it is not yet full page/tuple/gap
+precision or full isolationtester breadth.
 
 Do not describe this as full SSI breadth until full predicate-precise locks,
 the full isolationtester schedule, and matching expected outputs are

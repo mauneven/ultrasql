@@ -261,17 +261,18 @@ fn collect_column_range_tags_for_predicate(
         out.push(column_range_tag(entry, column, range.low, range.high)?);
         return Some(());
     }
-    let ScalarExpr::Binary {
-        op: BinaryOp::And,
-        left,
-        right,
-        ..
-    } = predicate
-    else {
-        return None;
-    };
-    collect_column_range_tags_for_predicate(entry, left, out)?;
-    collect_column_range_tags_for_predicate(entry, right, out)
+    match predicate {
+        ScalarExpr::Binary {
+            op: BinaryOp::And | BinaryOp::Or,
+            left,
+            right,
+            ..
+        } => {
+            collect_column_range_tags_for_predicate(entry, left, out)?;
+            collect_column_range_tags_for_predicate(entry, right, out)
+        }
+        _ => None,
+    }
 }
 
 fn table_column_range_write_tags(entry: &TableEntry) -> Vec<PredicateLockTag> {
@@ -523,6 +524,81 @@ mod tests {
                     column: 1,
                     low: Some(9),
                     high: Some(9),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn serializable_read_locks_split_supported_disjunctions() {
+        let predicate = binary(
+            BinaryOp::Or,
+            binary(BinaryOp::Eq, col(0, "a"), lit_i32(7)),
+            binary(BinaryOp::Eq, col(0, "a"), lit_i32(9)),
+        );
+        let plan = LogicalPlan::Filter {
+            input: Box::new(scan()),
+            predicate,
+        };
+        let snapshot = test_snapshot();
+        let mut tags = Vec::new();
+
+        collect_serializable_read_locks(&plan, &snapshot, &mut tags);
+        dedup_predicate_tags(&mut tags);
+
+        assert_eq!(
+            tags,
+            vec![
+                PredicateLockTag::ColumnRange {
+                    relation: RelationId(Oid::new(42)),
+                    column: 0,
+                    low: Some(7),
+                    high: Some(7),
+                },
+                PredicateLockTag::ColumnRange {
+                    relation: RelationId(Oid::new(42)),
+                    column: 0,
+                    low: Some(9),
+                    high: Some(9),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn serializable_delete_conflicts_split_supported_disjunctions() {
+        let predicate = binary(
+            BinaryOp::Or,
+            binary(BinaryOp::Eq, col(0, "a"), lit_i32(7)),
+            binary(BinaryOp::Eq, col(0, "a"), lit_i32(9)),
+        );
+        let input = LogicalPlan::Filter {
+            input: Box::new(scan()),
+            predicate,
+        };
+        let snapshot = test_snapshot();
+        let entry = snapshot.tables.get("t").expect("table exists");
+
+        assert_eq!(
+            delete_write_conflict_tags(entry, &input, &snapshot),
+            vec![
+                PredicateLockTag::ColumnRange {
+                    relation: RelationId(Oid::new(42)),
+                    column: 0,
+                    low: Some(7),
+                    high: Some(7),
+                },
+                PredicateLockTag::ColumnRange {
+                    relation: RelationId(Oid::new(42)),
+                    column: 0,
+                    low: Some(9),
+                    high: Some(9),
+                },
+                PredicateLockTag::ColumnRange {
+                    relation: RelationId(Oid::new(42)),
+                    column: 1,
+                    low: None,
+                    high: None,
                 },
             ]
         );

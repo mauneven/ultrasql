@@ -28,9 +28,9 @@ file focused on what still blocks production.
 ### Correctness Debt
 
 - Serializable isolation has column-range SSI for supported scalar comparisons
-  and fully supported multi-column `AND` predicates plus relation-level
-  fallback, but is `not fully predicate-precise` SSI. Implement page/tuple/gap
-  precision before broad serializable claims.
+  and fully supported multi-column `AND` / `OR` predicate trees plus
+  relation-level fallback, but is `not fully predicate-precise` SSI. Implement
+  page/tuple/gap precision before broad serializable claims.
 - Full public regression breadth still open for broader upstream parser, type,
   catalog-sanity, and isolation schedules. The curated regression subset is
   active without local skip debt; evidence lives in `DONE.md`.
