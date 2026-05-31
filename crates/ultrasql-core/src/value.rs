@@ -1256,6 +1256,7 @@ pub fn xml_xpath_element_fragments_with_namespaces(
                 Vec::new()
             }
         }
+        XmlPathStep::SelfNode => vec![root],
         XmlPathStep::Attribute(_) | XmlPathStep::Text => return None,
     };
     for (idx, step) in steps[1..].iter().enumerate() {
@@ -1315,6 +1316,7 @@ pub fn xml_xpath_element_fragments_with_namespaces(
                         .collect(),
                 );
             }
+            XmlPathStep::SelfNode => {}
             XmlPathStep::Attribute(_) | XmlPathStep::Text => return None,
         }
     }
@@ -1344,6 +1346,7 @@ enum XmlPathStep {
     },
     Attribute(String),
     Text,
+    SelfNode,
 }
 
 #[derive(Clone, Debug)]
@@ -1381,14 +1384,31 @@ fn parse_xml_path(path: &str) -> Option<Vec<XmlPathStep>> {
         let segment_end = relative_end.map_or(path.len(), |offset| cursor + offset);
         let terminal = segment_end == path.len();
         let segment = path[cursor..segment_end].trim();
-        if segment.is_empty() || segment == "." || segment == ".." {
+        if segment.is_empty() || segment == ".." {
             return None;
+        }
+        if segment == "." || segment == "self::node()" {
+            if descendant {
+                return None;
+            }
+            steps.push(XmlPathStep::SelfNode);
+            cursor = segment_end;
+            continue;
         }
         if segment == "text()" {
             if descendant || !terminal {
                 return None;
             }
             steps.push(XmlPathStep::Text);
+            cursor = segment_end;
+            continue;
+        }
+        if let Some(attr_name) = segment.strip_prefix("attribute::") {
+            if descendant || !terminal || attr_name.is_empty() || !xml_path_name_is_valid(attr_name)
+            {
+                return None;
+            }
+            steps.push(XmlPathStep::Attribute(attr_name.to_owned()));
             cursor = segment_end;
             continue;
         }
@@ -1401,6 +1421,18 @@ fn parse_xml_path(path: &str) -> Option<Vec<XmlPathStep>> {
             cursor = segment_end;
             continue;
         }
+        let (segment, descendant) = if let Some(name) = segment.strip_prefix("child::") {
+            (name, descendant)
+        } else if let Some(name) = segment.strip_prefix("descendant::") {
+            if descendant {
+                return None;
+            }
+            (name, true)
+        } else if segment.contains("::") {
+            return None;
+        } else {
+            (segment, descendant)
+        };
         let (name, attr_filter) = if let Some(open) = segment.find('[') {
             let predicate = segment.get(open + 1..segment.len().checked_sub(1)?)?.trim();
             if !segment.ends_with(']') || !predicate.starts_with('@') {
