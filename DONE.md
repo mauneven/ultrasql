@@ -2154,3 +2154,6 @@ as a concise evidence ledger; roadmap stays for open gates only.
 - Row spill and hash-join spill accounting now share checked byte helpers so
   temp-file-limit enforcement cannot be bypassed by saturating counters.
   Evidence: `cargo test -p ultrasql-executor row_spill::tests --lib -- --nocapture`.
+- Time-partition INSERT affected-row accounting now rejects counter and
+  `i64` command-result overflow instead of clamping to `i64::MAX`. Evidence:
+  `cargo test -p ultrasql-server time_partition::tests --lib -- --nocapture`.

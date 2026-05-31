@@ -198,7 +198,7 @@ impl Operator for TimePartitionInsert {
                 let key = partition_key_us(&row, self.runtime.partition_column_index)?;
                 let start = bucket_start(key, self.runtime.chunk_interval_us);
                 by_chunk.entry(start).or_default().push(row);
-                affected = affected.saturating_add(1);
+                increment_affected_rows(&mut affected)?;
             }
         }
 
@@ -228,9 +228,7 @@ impl Operator for TimePartitionInsert {
                 .map_err(|e| ExecError::TypeMismatch(e.to_string()))?;
         }
 
-        let rows = vec![vec![Value::Int64(
-            i64::try_from(affected).unwrap_or(i64::MAX),
-        )]];
+        let rows = vec![vec![affected_rows_value(affected)?]];
         build_batch(&rows, &self.schema).map(Some)
     }
 
@@ -317,6 +315,19 @@ fn affected_rows_schema() -> Schema {
     }
 }
 
+fn increment_affected_rows(affected: &mut u64) -> Result<(), ExecError> {
+    *affected = affected.checked_add(1).ok_or_else(|| {
+        ExecError::TypeMismatch("time partition affected row overflow".to_owned())
+    })?;
+    Ok(())
+}
+
+fn affected_rows_value(affected: u64) -> Result<Value, ExecError> {
+    i64::try_from(affected)
+        .map(Value::Int64)
+        .map_err(|_| ExecError::TypeMismatch("time partition affected rows exceed i64".to_owned()))
+}
+
 fn check_not_null_violations(row: &[Value], schema: &Schema) -> Result<(), ExecError> {
     for (value, field) in row.iter().zip(schema.fields()) {
         if !field.nullable && matches!(value, Value::Null) {
@@ -328,7 +339,7 @@ fn check_not_null_violations(row: &[Value], schema: &Schema) -> Result<(), ExecE
 
 #[cfg(test)]
 mod tests {
-    use super::chunk_table_name;
+    use super::{affected_rows_value, chunk_table_name};
 
     #[test]
     fn chunk_table_name_handles_min_timestamp_without_wrapping_minus() {
@@ -336,5 +347,12 @@ mod tests {
             chunk_table_name("metrics", i64::MIN),
             "__ultrasql_metrics_chunk_m9223372036854775808"
         );
+    }
+
+    #[test]
+    fn affected_rows_value_rejects_i64_overflow() {
+        let too_many = u64::try_from(i64::MAX).unwrap() + 1;
+        let err = affected_rows_value(too_many).unwrap_err();
+        assert!(matches!(err, ultrasql_executor::ExecError::TypeMismatch(_)));
     }
 }
