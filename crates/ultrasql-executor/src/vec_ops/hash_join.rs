@@ -166,27 +166,11 @@ impl VectorizedSink for ProbeHashSink<'_> {
             return Ok(SinkVerdict::Continue);
         }
 
-        // Materialise output batch
         let probe_cols = batch.columns();
-        let mut out_cols: Vec<Column> = probe_cols.to_vec();
-
-        // Append build columns
-        let n_out = joined.len();
         let n_build_cols = self.build_schema.len();
-        for bc in 0..n_build_cols {
-            // Gather rows from the build side for this column
-            let col_data: Vec<i64> = joined
-                .iter()
-                .map(|&(_, bi, ri)| {
-                    let build_batch = &self.build_batches[bi];
-                    get_i64_col(build_batch, bc).map_or(0, |c| c.data()[ri])
-                })
-                .collect();
-            out_cols.push(Column::Int64(NumericColumn::from_data(col_data)));
-        }
 
         // Project probe columns to matched rows
-        let mut final_cols: Vec<Column> = Vec::with_capacity(out_cols.len());
+        let mut final_cols: Vec<Column> = Vec::with_capacity(probe_cols.len() + n_build_cols);
         for probe_col in probe_cols {
             let selected: Column = match probe_col {
                 Column::Int32(c) => Column::Int32(NumericColumn::from_data(
@@ -203,12 +187,12 @@ impl VectorizedSink for ProbeHashSink<'_> {
             };
             final_cols.push(selected);
         }
-        // Append build columns (already have the correct matched rows)
+
+        // Append build columns using their original runtime type.
         for bc in 0..n_build_cols {
-            final_cols.push(out_cols[probe_cols.len() + bc].clone());
+            final_cols.push(gather_build_column(self.build_batches, &joined, bc)?);
         }
 
-        let _ = n_out;
         let out_batch = Batch::new(final_cols).map_err(ExecError::from)?;
         let _ = &self.output_schema;
         self.inner.consume(out_batch)
@@ -230,6 +214,75 @@ fn get_i64_col(batch: &Batch, idx: usize) -> Result<&NumericColumn<i64>, ExecErr
         ))),
         None => Err(ExecError::TypeMismatch(format!(
             "column index {idx} out of range"
+        ))),
+    }
+}
+
+fn gather_build_column(
+    build_batches: &[Batch],
+    joined: &[(usize, usize, usize)],
+    col_idx: usize,
+) -> Result<Column, ExecError> {
+    let Some((_, first_batch, _)) = joined.first() else {
+        return Err(ExecError::Internal(
+            "hash join gather called without matches",
+        ));
+    };
+    let first_col = build_batches
+        .get(*first_batch)
+        .and_then(|batch| batch.columns().get(col_idx))
+        .ok_or_else(|| ExecError::TypeMismatch(format!("build column {col_idx} out of range")))?;
+
+    match first_col {
+        Column::Int32(_) => {
+            let mut values = Vec::with_capacity(joined.len());
+            for &(_, bi, ri) in joined {
+                match build_batches
+                    .get(bi)
+                    .and_then(|batch| batch.columns().get(col_idx))
+                {
+                    Some(Column::Int32(column)) => values.push(column.data()[ri]),
+                    Some(other) => {
+                        return Err(ExecError::TypeMismatch(format!(
+                            "build column {col_idx} changed type from Int32 to {:?}",
+                            other.data_type()
+                        )));
+                    }
+                    None => {
+                        return Err(ExecError::TypeMismatch(format!(
+                            "build column {col_idx} out of range"
+                        )));
+                    }
+                }
+            }
+            Ok(Column::Int32(NumericColumn::from_data(values)))
+        }
+        Column::Int64(_) => {
+            let mut values = Vec::with_capacity(joined.len());
+            for &(_, bi, ri) in joined {
+                match build_batches
+                    .get(bi)
+                    .and_then(|batch| batch.columns().get(col_idx))
+                {
+                    Some(Column::Int64(column)) => values.push(column.data()[ri]),
+                    Some(other) => {
+                        return Err(ExecError::TypeMismatch(format!(
+                            "build column {col_idx} changed type from Int64 to {:?}",
+                            other.data_type()
+                        )));
+                    }
+                    None => {
+                        return Err(ExecError::TypeMismatch(format!(
+                            "build column {col_idx} out of range"
+                        )));
+                    }
+                }
+            }
+            Ok(Column::Int64(NumericColumn::from_data(values)))
+        }
+        other => Err(ExecError::TypeMismatch(format!(
+            "VectorizedHashJoin: unsupported build column type {:?}",
+            other.data_type()
         ))),
     }
 }
@@ -269,11 +322,42 @@ mod tests {
         .unwrap()
     }
 
+    fn schema_key_i32_val() -> Schema {
+        Schema::new([
+            Field::required("key", DataType::Int64),
+            Field::required("val", DataType::Int32),
+        ])
+        .expect("schema ok")
+    }
+
+    fn batch_kv_i32(rows: &[(i64, i32)]) -> Batch {
+        Batch::new([
+            Column::Int64(NumericColumn::from_data(
+                rows.iter().map(|(k, _)| *k).collect(),
+            )),
+            Column::Int32(NumericColumn::from_data(
+                rows.iter().map(|(_, v)| *v).collect(),
+            )),
+        ])
+        .unwrap()
+    }
+
     fn drain_i64(batches: Vec<Batch>, col: usize) -> Vec<i64> {
         let mut out = Vec::new();
         for b in batches {
             match &b.columns()[col] {
                 Column::Int64(c) => out.extend_from_slice(c.data()),
+                other => panic!("unexpected {other:?}"),
+            }
+        }
+        out
+    }
+
+    fn drain_i32(batches: Vec<Batch>, col: usize) -> Vec<i32> {
+        let mut out = Vec::new();
+        for b in batches {
+            match &b.columns()[col] {
+                Column::Int32(c) => out.extend_from_slice(c.data()),
                 other => panic!("unexpected {other:?}"),
             }
         }
@@ -305,6 +389,27 @@ mod tests {
         let b_keys = drain_i64(batches, 2);
         assert_eq!(p_keys, vec![2]);
         assert_eq!(b_keys, vec![2]);
+    }
+
+    #[test]
+    fn hash_join_preserves_int32_build_payloads() {
+        let probe = MemTableScan::new(schema_key_val(), vec![batch_kv(&[(2, 20)])]);
+        let build = MemTableScan::new(schema_key_i32_val(), vec![batch_kv_i32(&[(2, 200)])]);
+        let out_schema = Schema::new([
+            Field::required("p_key", DataType::Int64),
+            Field::required("p_val", DataType::Int64),
+            Field::required("b_key", DataType::Int64),
+            Field::required("b_val", DataType::Int32),
+        ])
+        .expect("schema ok");
+        let probe_op = VectorizedSeqScan::new(Box::new(probe));
+        let mut join =
+            VectorizedHashJoin::new(Box::new(probe_op), Box::new(build), 0, 0, out_schema);
+        let mut sink = CollectSink::new();
+        join.drive(&mut sink).unwrap();
+        let batches = sink.finish();
+
+        assert_eq!(drain_i32(batches, 3), vec![200]);
     }
 
     #[test]

@@ -1875,6 +1875,10 @@ as a concise evidence ledger; roadmap stays for open gates only.
 - Vectorized sort now rejects out-of-range sort-key columns instead of treating
   them as all-equal comparisons. Evidence:
   `cargo test -p ultrasql-executor sort_key_out_of_range_errors --lib -- --nocapture`.
+- Vectorized hash join now preserves supported build-side payload column types
+  when materialising matches instead of coercing unsupported build columns to
+  zero-valued `Int64` columns. Evidence:
+  `cargo test -p ultrasql-executor hash_join_preserves_int32_build_payloads --lib -- --nocapture`.
 - Runtime scalar/temporal text casts to integer, float, boolean, date, time,
   timestamp, timestamptz, and timetz now report SQLSTATE `22P02` for invalid
   column text. Evidence:
