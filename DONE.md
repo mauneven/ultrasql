@@ -93,6 +93,10 @@ as a concise evidence ledger; roadmap stays for open gates only.
   80.06%. Evidence: `docs/testing/coverage-evidence-2026-05-29-server.md`.
 - Parser parameter validation now rejects `$0` before binding so extended-query
   substitution cannot receive an invalid zero-based placeholder.
+- Extended-query Parse now rejects prepared statements with more than the wire
+  protocol's signed-16-bit parameter slots before caching session state.
+- Extended-query binary Bind now preserves explicit cast target types on
+  parameters, avoiding unknown-binary fallback to `bytea` for casted text slots.
 - Focused `ultrasql-executor` coverage now exercises scalar compatibility
   functions, physical lowering edge families, row encoding/decoding,
   projection/filter/sort/unique/set/window/hash aggregate behavior, modify-table

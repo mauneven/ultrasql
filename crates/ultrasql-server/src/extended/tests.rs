@@ -265,6 +265,26 @@ fn counting_zero_parameters_returns_zero() {
     assert_eq!(state.statements.get("s").unwrap().n_params, 0);
 }
 
+#[test]
+fn parse_rejects_parameter_slots_beyond_protocol_count() {
+    let catalog = fixture_catalog();
+    let mut state = ExtendedConnState::new();
+    let err = handle_parse(
+        &mut state,
+        "s".to_string(),
+        "SELECT $32768".to_string(),
+        vec![],
+        &catalog,
+    )
+    .expect_err("extended protocol cannot describe more than i16::MAX parameters");
+
+    assert!(
+        matches!(err, ServerError::Unsupported(message) if message.contains("parameter count exceeds protocol limit")),
+        "unexpected error: {err:?}"
+    );
+    assert!(!state.statements.contains_key("s"));
+}
+
 // ── Close / describe ─────────────────────────────────────────────────────
 
 #[test]

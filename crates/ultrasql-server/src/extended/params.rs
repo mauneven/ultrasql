@@ -288,6 +288,10 @@ fn scan_schema(plan: &LogicalPlan) -> Option<&ultrasql_core::Schema> {
     }
 }
 
+fn zero_based_parameter_slot(index: u32) -> Option<usize> {
+    usize::try_from(index.checked_sub(1)?).ok()
+}
+
 /// Infer parameter types from a boolean predicate at the top of a
 /// `Filter` / join `On`.
 ///
@@ -311,12 +315,12 @@ fn infer_expr_types_from_predicate(expr: &ScalarExpr, out: &mut [DataType]) {
                 // Column = Parameter, or Parameter = Column.
                 match (left.as_ref(), right.as_ref()) {
                     (ScalarExpr::Column { data_type, .. }, ScalarExpr::Parameter { index, .. })
-                    | (ScalarExpr::Parameter { index, .. }, ScalarExpr::Column { data_type, .. }) =>
-                    {
-                        let slot = usize::try_from(index.saturating_sub(1)).unwrap_or(usize::MAX);
-                        if let Some(s) = out.get_mut(slot) {
-                            if matches!(s, DataType::Null) {
-                                *s = data_type.clone();
+                    | (ScalarExpr::Parameter { index, .. }, ScalarExpr::Column { data_type, .. }) => {
+                        if let Some(slot) = zero_based_parameter_slot(*index) {
+                            if let Some(s) = out.get_mut(slot) {
+                                if matches!(s, DataType::Null) {
+                                    *s = data_type.clone();
+                                }
                             }
                         }
                     }
@@ -345,12 +349,18 @@ fn infer_expr_types_from_predicate(expr: &ScalarExpr, out: &mut [DataType]) {
 /// INSERT cell or an UPDATE assignment); a bare `Parameter` borrows it.
 fn infer_in_expr(expr: &ScalarExpr, target_type: Option<DataType>, out: &mut [DataType]) {
     match expr {
-        ScalarExpr::Parameter { index, .. } => {
-            if let Some(t) = target_type {
-                let slot = usize::try_from(index.saturating_sub(1)).unwrap_or(usize::MAX);
-                if let Some(s) = out.get_mut(slot) {
-                    if matches!(s, DataType::Null) {
-                        *s = t;
+        ScalarExpr::Parameter { index, data_type } => {
+            let inferred = if matches!(data_type, DataType::Null) {
+                target_type
+            } else {
+                Some(data_type.clone())
+            };
+            if let Some(t) = inferred {
+                if let Some(slot) = zero_based_parameter_slot(*index) {
+                    if let Some(s) = out.get_mut(slot) {
+                        if matches!(s, DataType::Null) {
+                            *s = t;
+                        }
                     }
                 }
             }

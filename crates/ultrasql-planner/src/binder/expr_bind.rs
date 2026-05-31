@@ -718,6 +718,12 @@ fn bind_cast_expr(
         return Ok(bound);
     }
     coerce_literal_to_type(&mut bound, &target_type);
+    if let ScalarExpr::Parameter { index, .. } = bound {
+        return Ok(ScalarExpr::Parameter {
+            index,
+            data_type: target_type,
+        });
+    }
     let actual_type = bound.data_type();
     if cast_result_matches(&target_type, &actual_type) || matches!(actual_type, DataType::Null) {
         return Ok(bound);

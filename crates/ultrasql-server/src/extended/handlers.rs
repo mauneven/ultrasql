@@ -18,6 +18,8 @@ use super::params::{count_parameters_in_plan, infer_parameter_types};
 use super::substitute::substitute_parameters_in_plan;
 use super::{BoundPortal, ExtendedConnState, PreparedStatement};
 
+const EXTENDED_PARAMETER_LIMIT: u32 = 32_767;
+
 // ---------------------------------------------------------------------------
 // Parse: parse + bind + count parameters.
 // ---------------------------------------------------------------------------
@@ -49,6 +51,7 @@ pub fn handle_parse(
         match bind(&stmt, bind_ctx) {
             Ok(plan) => {
                 let n = count_parameters_in_plan(&plan);
+                validate_extended_parameter_count(n)?;
                 (Some(plan), n, Vec::new())
             }
             Err(err) if is_non_literal_limit_offset(&err) => {
@@ -58,11 +61,9 @@ pub fn handle_parse(
                 let shape_plan = bind(&shape_stmt, bind_ctx)?;
                 let plan_params = count_parameters_in_plan(&shape_plan);
                 let limit_params = limit_offset_params.iter().copied().max().unwrap_or(0);
-                (
-                    Some(shape_plan),
-                    plan_params.max(limit_params),
-                    limit_offset_params,
-                )
+                let n_params = plan_params.max(limit_params);
+                validate_extended_parameter_count(n_params)?;
+                (Some(shape_plan), n_params, limit_offset_params)
             }
             Err(err) => return Err(err.into()),
         }
@@ -80,6 +81,15 @@ pub fn handle_parse(
         },
     );
     Ok(BackendMessage::ParseComplete)
+}
+
+fn validate_extended_parameter_count(n_params: u32) -> Result<(), ServerError> {
+    if n_params > EXTENDED_PARAMETER_LIMIT {
+        return Err(ServerError::Unsupported(
+            "extended query parameter count exceeds protocol limit",
+        ));
+    }
+    Ok(())
 }
 
 fn is_non_literal_limit_offset(err: &PlanError) -> bool {
