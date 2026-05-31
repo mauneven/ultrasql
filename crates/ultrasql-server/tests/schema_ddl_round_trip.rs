@@ -335,6 +335,52 @@ async fn qualified_sequence_schema_survives_restart() {
     shutdown(running).await;
 }
 
+#[tokio::test]
+async fn drop_schema_cascade_removes_qualified_sequences() {
+    let running = start_sample_server("schema_sequence_cascade").await;
+
+    running
+        .client
+        .batch_execute(
+            "CREATE SCHEMA app; \
+             CREATE SEQUENCE app.event_seq START WITH 4; \
+             GRANT USAGE ON SEQUENCE event_seq TO PUBLIC; \
+             DROP SCHEMA app CASCADE",
+        )
+        .await
+        .expect("drop schema cascade removes sequence dependency");
+
+    let schema_count = running
+        .client
+        .query_one(
+            "SELECT COUNT(*) FROM pg_catalog.pg_namespace WHERE nspname = 'app'",
+            &[],
+        )
+        .await
+        .expect("query dropped schema")
+        .get::<_, i64>(0);
+    assert_eq!(schema_count, 0);
+
+    let sequence_count = running
+        .client
+        .query_one(
+            "SELECT COUNT(*) FROM pg_catalog.pg_sequences WHERE sequencename = 'event_seq'",
+            &[],
+        )
+        .await
+        .expect("query dropped sequence")
+        .get::<_, i64>(0);
+    assert_eq!(sequence_count, 0);
+
+    running
+        .client
+        .simple_query("SELECT nextval('event_seq')")
+        .await
+        .expect_err("schema cascade must remove sequence state");
+
+    shutdown(running).await;
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn qualified_relation_and_type_schemas_survive_restart() {
     let data_dir = tempfile::TempDir::new().expect("temp data dir");

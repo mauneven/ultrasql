@@ -957,6 +957,12 @@ as a concise evidence ledger; roadmap stays for open gates only.
   dependencies instead of leaving orphaned namespace references. Evidence:
   `cargo test -p ultrasql-server --test schema_ddl_round_trip
   qualified_sequence_schema_survives_restart`.
+- `DROP SCHEMA ... CASCADE` now removes qualified sequences in the dropped
+  runtime schema, emits sequence-drop WAL, clears sequence owner/namespace
+  metadata, removes sequence ACLs, and rejects unsupported table/type/operator
+  dependents before mutating state. Evidence:
+  `cargo test -p ultrasql-server --test schema_ddl_round_trip
+  drop_schema_cascade_removes_qualified_sequences -- --nocapture`.
 - Qualified table, materialized-view, enum, and domain schema names now survive
   restart by storing stable runtime namespace OIDs in catalog rows and remapping
   them after schema metadata loads. Evidence: `cargo test -p ultrasql-server
