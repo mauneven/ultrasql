@@ -415,6 +415,10 @@ async fn drop_role_rejects_granted_privileges_until_revoked() {
     let client = &running.client;
 
     client
+        .batch_execute("CREATE ROLE tester SUPERUSER LOGIN")
+        .await
+        .expect("register tester role");
+    client
         .batch_execute("CREATE ROLE grant_target LOGIN")
         .await
         .expect("create grant target");

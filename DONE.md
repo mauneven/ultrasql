@@ -947,7 +947,8 @@ as a concise evidence ledger; roadmap stays for open gates only.
   demotion while still allowing password rotation. Catalogued non-`CREATEROLE`
   roles cannot create, alter, drop, grant, or revoke roles.
 - `GRANT / REVOKE` on tables, schemas, databases, sequences, and functions work
-  through privilege catalog checks.
+  through privilege catalog checks; table privilege DDL now requires table
+  ownership or superuser and records the actual grantor.
 - Column-level privileges enforce `SELECT`, `INSERT`, and `UPDATE` target
   access.
 - Role inheritance and `SET ROLE` support transitive membership, cycle

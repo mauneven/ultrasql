@@ -14,6 +14,10 @@ async fn grant_revoke_privileges_update_catalog_checks() {
     let client = &running.client;
 
     client
+        .batch_execute("CREATE ROLE tester SUPERUSER LOGIN")
+        .await
+        .expect("register admin role");
+    client
         .batch_execute("CREATE ROLE analyst NOLOGIN")
         .await
         .expect("create analyst role");
@@ -85,6 +89,91 @@ async fn grant_revoke_privileges_update_catalog_checks() {
     assert!(
         row.get::<_, bool>(6),
         "function EXECUTE grant should persist"
+    );
+
+    shutdown(running).await;
+}
+
+#[tokio::test]
+async fn non_owner_cannot_grant_or_revoke_table_privileges() {
+    let running = start_sample_server("privilege_catalog_test").await;
+    let client = &running.client;
+
+    client
+        .batch_execute("CREATE ROLE tester SUPERUSER LOGIN")
+        .await
+        .expect("register admin role");
+    client
+        .batch_execute("CREATE ROLE acl_owner LOGIN")
+        .await
+        .expect("create owner role");
+    client
+        .batch_execute("CREATE ROLE limited_acl LOGIN")
+        .await
+        .expect("create limited role");
+    client
+        .batch_execute("CREATE ROLE analyst LOGIN")
+        .await
+        .expect("create analyst role");
+    client
+        .batch_execute("SET ROLE acl_owner")
+        .await
+        .expect("set owner role");
+    client
+        .batch_execute("CREATE TABLE owned_acl_target (id INT)")
+        .await
+        .expect("create owner table");
+    client
+        .batch_execute("RESET ROLE")
+        .await
+        .expect("reset role");
+
+    let (limited, limited_conn) = connect_as(running.bound, "limited_acl", "non_owner_acl").await;
+    assert_insufficient_privilege(
+        limited
+            .batch_execute("GRANT SELECT ON TABLE owned_acl_target TO analyst")
+            .await
+            .expect_err("non-owner cannot grant table privileges"),
+    );
+    assert_insufficient_privilege(
+        limited
+            .batch_execute("REVOKE SELECT ON TABLE owned_acl_target FROM analyst")
+            .await
+            .expect_err("non-owner cannot revoke table privileges"),
+    );
+    drop(limited);
+    limited_conn.await.expect("limited connection joins");
+
+    let visible = client
+        .query_one(
+            "SELECT has_table_privilege('analyst', 'owned_acl_target', 'SELECT')",
+            &[],
+        )
+        .await
+        .expect("privilege visibility check");
+    assert!(
+        !visible.get::<_, bool>(0),
+        "failed non-owner GRANT must not persist"
+    );
+
+    let (owner, owner_conn) = connect_as(running.bound, "acl_owner", "owner_acl").await;
+    owner
+        .batch_execute("GRANT SELECT ON TABLE owned_acl_target TO analyst")
+        .await
+        .expect("owner can grant table privileges");
+    drop(owner);
+    owner_conn.await.expect("owner connection joins");
+
+    let granted = client
+        .query_one(
+            "SELECT has_table_privilege('analyst', 'owned_acl_target', 'SELECT')",
+            &[],
+        )
+        .await
+        .expect("owner grant visibility check");
+    assert!(
+        granted.get::<_, bool>(0),
+        "owner GRANT must persist table privilege"
     );
 
     shutdown(running).await;

@@ -2,7 +2,7 @@
 
 use tokio::io::{AsyncRead, AsyncWrite};
 use ultrasql_planner::{
-    LogicalDefaultPrivilegeOperation, LogicalPlan, LogicalPrivilegeKind,
+    Catalog as PlannerCatalog, LogicalDefaultPrivilegeOperation, LogicalPlan, LogicalPrivilegeKind,
     LogicalPrivilegeObjectKind, LogicalPrivilegeSpec,
 };
 
@@ -35,10 +35,11 @@ where
             ));
         };
         self.validate_grantees(grantees)?;
+        self.ensure_privilege_administration(*object_kind, objects)?;
         let before_grants = self.state.privilege_catalog.list_grants();
         let before_default_grants = self.state.privilege_catalog.list_default_grants();
         self.state.privilege_catalog.grant_many(
-            "ultrasql",
+            &self.current_user,
             convert_object_kind(*object_kind),
             objects,
             grantees,
@@ -72,6 +73,7 @@ where
             ));
         };
         self.validate_grantees(grantees)?;
+        self.ensure_privilege_administration(*object_kind, objects)?;
         let before_grants = self.state.privilege_catalog.list_grants();
         let before_default_grants = self.state.privilege_catalog.list_default_grants();
         self.state.privilege_catalog.revoke_many(
@@ -180,6 +182,48 @@ where
             }
         }
         Ok(owner_roles)
+    }
+
+    fn ensure_privilege_administration(
+        &self,
+        object_kind: LogicalPrivilegeObjectKind,
+        objects: &[String],
+    ) -> Result<(), ServerError> {
+        if self
+            .state
+            .role_catalog
+            .lookup_role(&self.current_user)
+            .is_some_and(|role| role.is_superuser)
+        {
+            return Ok(());
+        }
+        match object_kind {
+            LogicalPrivilegeObjectKind::Table => self.ensure_table_privilege_owner(objects),
+            _ => Err(ServerError::InsufficientPrivilege(
+                "privilege management requires object ownership or superuser".to_owned(),
+            )),
+        }
+    }
+
+    fn ensure_table_privilege_owner(&self, tables: &[String]) -> Result<(), ServerError> {
+        let snapshot = self.state.catalog_snapshot();
+        let current_user = self.current_user.to_ascii_lowercase();
+        for table in tables {
+            let Some(table_oid) = PlannerCatalog::lookup_table_oid(snapshot.as_ref(), table) else {
+                return Err(ServerError::ddl(format!("table '{table}' does not exist")));
+            };
+            let owns_table = self
+                .state
+                .row_security
+                .get(&table_oid)
+                .is_some_and(|runtime| runtime.owner_role.eq_ignore_ascii_case(&current_user));
+            if !owns_table {
+                return Err(ServerError::InsufficientPrivilege(format!(
+                    "permission denied to manage privileges on table {table}"
+                )));
+            }
+        }
+        Ok(())
     }
 }
 
