@@ -431,6 +431,34 @@ pub fn run_ddl_command(tag: &str) -> SelectResult {
     }
 }
 
+fn row_count_overflow(context: &str) -> ServerError {
+    ServerError::Execute(ultrasql_executor::ExecError::NumericFieldOverflow(format!(
+        "{context} row count overflow"
+    )))
+}
+
+fn checked_row_count_delta(row_count: usize, context: &str) -> Result<u64, ServerError> {
+    u64::try_from(row_count).map_err(|_| row_count_overflow(context))
+}
+
+fn checked_add_rows(rows: &mut u64, row_count: usize, context: &str) -> Result<(), ServerError> {
+    let delta = checked_row_count_delta(row_count, context)?;
+    *rows = rows
+        .checked_add(delta)
+        .ok_or_else(|| row_count_overflow(context))?;
+    Ok(())
+}
+
+fn checked_add_affected(affected: &mut i64, delta: i64) -> Result<(), ServerError> {
+    if delta < 0 {
+        return Err(row_count_overflow("DML affected"));
+    }
+    *affected = affected
+        .checked_add(delta)
+        .ok_or_else(|| row_count_overflow("DML affected"))?;
+    Ok(())
+}
+
 /// Drive a `ModifyTable` operator to completion and emit the
 /// Row-count `CommandComplete` tag.
 ///
@@ -453,12 +481,12 @@ pub fn run_modify_command(
         if let Some(Column::Int64(c)) = batch.columns().first() {
             let data = c.data();
             if !data.is_empty() {
-                affected = affected.saturating_add(data[0]);
+                checked_add_affected(&mut affected, data[0])?;
             }
         }
     }
-    let tag = modify_command_tag(command, u64::try_from(affected.max(0)).unwrap_or(0));
-    let rows = u64::try_from(affected.max(0)).unwrap_or(0);
+    let rows = u64::try_from(affected).map_err(|_| row_count_overflow("DML affected"))?;
+    let tag = modify_command_tag(command, rows);
     Ok(SelectResult {
         messages: vec![BackendMessage::CommandComplete { tag }],
         streamed_body: None,
@@ -537,7 +565,7 @@ pub(crate) fn run_select_with_options(
             }
             messages.push(BackendMessage::DataRow { columns });
         }
-        rows = rows.saturating_add(u64::try_from(row_count).unwrap_or(u64::MAX));
+        checked_add_rows(&mut rows, row_count, "SELECT")?;
     }
 
     messages.push(BackendMessage::CommandComplete {
@@ -613,7 +641,7 @@ pub(crate) fn stream_select_with_options(
             && b.nulls().is_none()
         {
             write_int32_pair_data_rows(sink, a.data(), b.data());
-            rows = rows.saturating_add(u64::try_from(row_count).unwrap_or(u64::MAX));
+            checked_add_rows(&mut rows, row_count, "SELECT")?;
             continue;
         }
         // Fast path: `(Int32, Int64)` is the
@@ -625,13 +653,13 @@ pub(crate) fn stream_select_with_options(
             && let [Column::Int32(a), Column::Int64(b)] = columns
         {
             write_int32_int64_pair_data_rows(sink, a.data(), a.nulls(), b.data(), b.nulls());
-            rows = rows.saturating_add(u64::try_from(row_count).unwrap_or(u64::MAX));
+            checked_add_rows(&mut rows, row_count, "SELECT")?;
             continue;
         }
         for row in 0..row_count {
             write_data_row_typed_with_options(sink, columns, &schema, row, options)?;
         }
-        rows = rows.saturating_add(u64::try_from(row_count).unwrap_or(u64::MAX));
+        checked_add_rows(&mut rows, row_count, "SELECT")?;
     }
 
     let tag = format!("SELECT {rows}");
@@ -1304,6 +1332,15 @@ mod tests {
             modify.messages.last(),
             Some(BackendMessage::CommandComplete { tag }) if tag == "UPDATE 5"
         ));
+        let overflow_schema = Schema::new([Field::required("affected", DataType::Int64)]).unwrap();
+        let overflow_batches = vec![
+            Batch::new([Column::Int64(NumericColumn::from_data(vec![i64::MAX]))]).unwrap(),
+            Batch::new([Column::Int64(NumericColumn::from_data(vec![1]))]).unwrap(),
+        ];
+        let mut overflow_scan = MemTableScan::new(overflow_schema, overflow_batches);
+        let err = run_modify_command(&mut overflow_scan, "update")
+            .expect_err("DML command tag row count overflow must not clamp");
+        assert_eq!(err.sqlstate(), "22003");
 
         let returning_schema = Schema::new([Field::required("id", DataType::Int32)]).unwrap();
         let returning_batch =

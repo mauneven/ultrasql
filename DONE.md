@@ -2102,3 +2102,7 @@ as a concise evidence ledger; roadmap stays for open gates only.
   arithmetic and atomic checked advancement instead of saturating or wrapping
   source offsets. Evidence:
   `cargo test -p ultrasql-server session::execute::tests::materialized_view_row_flush_rejects_counter_overflow --lib -- --nocapture`.
+- Result encoding now rejects DML command-tag and SELECT row-count overflow
+  with SQLSTATE `22003` instead of saturating client-visible row totals.
+  Evidence:
+  `cargo test -p ultrasql-server result_encoder::tests --lib -- --nocapture`.
