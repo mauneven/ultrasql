@@ -127,6 +127,40 @@ async fn table_runtime_metadata_rejects_duplicate_default_rows_on_rebuild() {
     );
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn table_runtime_metadata_rejects_duplicate_sequence_default_rows_on_rebuild() {
+    let data_dir = tempfile::TempDir::new().unwrap();
+    let metadata_path = data_dir.path().join("pg_table_runtime.meta");
+
+    let running =
+        start_persistent_server(data_dir.path(), "table_runtime_duplicate_sequence_default").await;
+    running
+        .client
+        .batch_execute("CREATE TABLE table_runtime_seq_dup (id SERIAL, v INT)")
+        .await
+        .expect("create table with sequence default metadata");
+    shutdown(running).await;
+
+    let mut metadata =
+        std::fs::read_to_string(&metadata_path).expect("table runtime metadata exists");
+    let sequence_line = metadata
+        .lines()
+        .find(|line| line.starts_with("sequence_default\t"))
+        .expect("sequence default metadata row")
+        .to_owned();
+    metadata.push_str(&sequence_line);
+    metadata.push('\n');
+    std::fs::write(&metadata_path, metadata).expect("duplicate sequence default metadata");
+
+    let err =
+        Server::init(data_dir.path()).expect_err("duplicate sequence default metadata rejected");
+    assert!(
+        err.to_string()
+            .contains("duplicate table-runtime sequence default metadata"),
+        "expected duplicate table-runtime sequence default metadata rejection, got {err}"
+    );
+}
+
 async fn assert_undefined_table(client: &tokio_postgres::Client, sql: &str) {
     let err = client.query(sql, &[]).await.expect_err("query should fail");
     let db_error = err.as_db_error().expect("server returns SQLSTATE");
