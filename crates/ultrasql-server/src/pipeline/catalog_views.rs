@@ -2650,6 +2650,10 @@ fn schema_pg_stat_user_tables() -> Schema {
         Field::nullable("last_autovacuum", DataType::TimestampTz),
         Field::nullable("last_analyze", DataType::TimestampTz),
         Field::nullable("last_autoanalyze", DataType::TimestampTz),
+        Field::required("vacuum_count", DataType::Int64),
+        Field::required("autovacuum_count", DataType::Int64),
+        Field::required("analyze_count", DataType::Int64),
+        Field::required("autoanalyze_count", DataType::Int64),
     ])
 }
 
@@ -2661,6 +2665,9 @@ fn rows_pg_stat_user_tables(ctx: &LowerCtx<'_>) -> Vec<Vec<Value>> {
         })
         .map(|entry| {
             let (live_tuples, dead_tuples) = table_tuple_counts(ctx, &entry);
+            let maintenance = ctx
+                .workload_recorder
+                .table_maintenance_stats(entry.oid.raw());
             vec![
                 v_i64(entry.oid.raw()),
                 v_text(entry.schema_name),
@@ -2669,10 +2676,18 @@ fn rows_pg_stat_user_tables(ctx: &LowerCtx<'_>) -> Vec<Vec<Value>> {
                 Value::Int64(0),
                 Value::Int64(live_tuples),
                 Value::Int64(dead_tuples),
+                maintenance
+                    .last_vacuum
+                    .map_or(Value::Null, Value::TimestampTz),
+                maintenance
+                    .last_autovacuum
+                    .map_or(Value::Null, Value::TimestampTz),
                 Value::Null,
                 Value::Null,
-                Value::Null,
-                Value::Null,
+                Value::Int64(u64_to_i64_saturating(maintenance.vacuum_count)),
+                Value::Int64(u64_to_i64_saturating(maintenance.autovacuum_count)),
+                Value::Int64(0),
+                Value::Int64(0),
             ]
         })
         .collect()

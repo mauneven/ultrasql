@@ -401,6 +401,19 @@ async fn pg_catalog_and_information_schema_reflect_runtime_objects() {
     assert_eq!(vacuumed_stats.len(), 1);
     assert_eq!(vacuumed_stats[0].get::<_, i64>(0), 2);
     assert_eq!(vacuumed_stats[0].get::<_, i64>(1), 0);
+    let maintenance_stats = client
+        .query(
+            "SELECT last_vacuum IS NOT NULL, vacuum_count, autovacuum_count \
+             FROM pg_catalog.pg_stat_user_tables \
+             WHERE relname = 'stat_t'",
+            &[],
+        )
+        .await
+        .expect("pg_stat_user_tables vacuum counters after vacuum");
+    assert_eq!(maintenance_stats.len(), 1);
+    assert!(maintenance_stats[0].get::<_, bool>(0));
+    assert_eq!(maintenance_stats[0].get::<_, i64>(1), 1);
+    assert_eq!(maintenance_stats[0].get::<_, i64>(2), 0);
     let table_io = client
         .query(
             "SELECT heap_blks_read, heap_blks_hit \

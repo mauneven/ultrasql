@@ -126,6 +126,19 @@ pub struct VacuumProgressSnapshot {
     pub heap_blks_vacuumed: i64,
 }
 
+/// Per-table maintenance statistics for `pg_stat_user_tables`.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct TableMaintenanceStats {
+    /// Last manual VACUUM completion timestamp in engine microseconds.
+    pub last_vacuum: Option<i64>,
+    /// Last background autovacuum completion timestamp in engine microseconds.
+    pub last_autovacuum: Option<i64>,
+    /// Number of manual VACUUM completions.
+    pub vacuum_count: u64,
+    /// Number of background autovacuum completions.
+    pub autovacuum_count: u64,
+}
+
 /// One active `pg_stat_progress_analyze` row.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AnalyzeProgressSnapshot {
@@ -263,6 +276,7 @@ pub struct WorkloadRecorder {
     analyze_progress: parking_lot::Mutex<HashMap<u32, AnalyzeProgressSnapshot>>,
     create_index_progress: parking_lot::Mutex<HashMap<u32, CreateIndexProgressSnapshot>>,
     active_sessions: parking_lot::Mutex<HashMap<u32, ActiveSessionSnapshot>>,
+    table_maintenance: parking_lot::Mutex<HashMap<u32, TableMaintenanceStats>>,
     index_usage: parking_lot::Mutex<HashMap<u32, IndexUsageStats>>,
     slow_log_capacity: usize,
 }
@@ -286,6 +300,7 @@ impl WorkloadRecorder {
             analyze_progress: parking_lot::Mutex::new(HashMap::new()),
             create_index_progress: parking_lot::Mutex::new(HashMap::new()),
             active_sessions: parking_lot::Mutex::new(HashMap::new()),
+            table_maintenance: parking_lot::Mutex::new(HashMap::new()),
             index_usage: parking_lot::Mutex::new(HashMap::new()),
             slow_log_capacity: 1024,
         }
@@ -425,6 +440,32 @@ impl WorkloadRecorder {
     /// Clear one active VACUUM progress row.
     pub fn finish_vacuum(&self, pid: u32) {
         self.vacuum_progress.lock().remove(&pid);
+    }
+
+    /// Record one completed manual VACUUM for a relation.
+    pub fn record_table_vacuum(&self, relid: u32) {
+        let mut table_maintenance = self.table_maintenance.lock();
+        let stats = table_maintenance.entry(relid).or_default();
+        stats.last_vacuum = Some(current_engine_timestamp_micros());
+        stats.vacuum_count = stats.vacuum_count.saturating_add(1);
+    }
+
+    /// Record one completed background autovacuum for a relation.
+    pub fn record_table_autovacuum(&self, relid: u32) {
+        let mut table_maintenance = self.table_maintenance.lock();
+        let stats = table_maintenance.entry(relid).or_default();
+        stats.last_autovacuum = Some(current_engine_timestamp_micros());
+        stats.autovacuum_count = stats.autovacuum_count.saturating_add(1);
+    }
+
+    /// Return maintenance stats for one relation.
+    #[must_use]
+    pub fn table_maintenance_stats(&self, relid: u32) -> TableMaintenanceStats {
+        self.table_maintenance
+            .lock()
+            .get(&relid)
+            .cloned()
+            .unwrap_or_default()
     }
 
     /// Return active VACUUM progress rows ordered by pid.

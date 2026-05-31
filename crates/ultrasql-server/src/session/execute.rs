@@ -2256,6 +2256,9 @@ where
             })();
             self.state.workload_recorder.finish_vacuum(self.pid);
             result?;
+            self.state
+                .workload_recorder
+                .record_table_vacuum(entry.oid.raw());
         }
         Ok(result_encoder::SelectResult {
             messages: vec![BackendMessage::CommandComplete {

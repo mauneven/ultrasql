@@ -163,8 +163,9 @@ file focused on what still blocks production.
 - Add or verify required secrets: `NPM_TOKEN`, `HOMEBREW_TAP_TOKEN`,
   `AUR_SSH_PRIVATE_KEY`, `CHOCOLATEY_API_KEY`, package signing, and Windows
   code-signing material.
-- Finish VACUUM/autovacuum scheduling, freeze policy, bloat metrics, and
-  production docs.
+- Finish VACUUM/autovacuum scheduling, freeze policy, deeper bloat metrics,
+  and production docs; completed table maintenance counters are tracked in
+  `DONE.md`.
 - Finish streaming replication, synchronous replication modes, backup/PITR
   restore drills, logical replication, and `pgoutput`.
 - Broaden remaining `pg_stat_*` operator views, lock/io wait-event population,

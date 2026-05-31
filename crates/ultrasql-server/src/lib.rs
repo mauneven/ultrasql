@@ -4162,6 +4162,8 @@ impl Server {
                 .vacuum_heap(RelationId(entry.oid), oldest, self.txn_manager.as_ref())
             {
                 Ok(stats) => {
+                    self.workload_recorder
+                        .record_table_autovacuum(entry.oid.raw());
                     if stats.tuples_reclaimed > 0 {
                         tracing::debug!(
                             table = %entry.name,
