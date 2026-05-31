@@ -810,8 +810,7 @@ impl TpchQ7BuildState {
         let _returnflag = read_direct_one_byte_text(payload, &mut off, "l_returnflag")?;
         let _linestatus = read_direct_one_byte_text(payload, &mut off, "l_linestatus")?;
         let shipdate = read_direct_i32(payload, &mut off, "l_shipdate")?;
-        self.add_lineitem_revenue(orderkey, suppkey, extendedprice, discount, shipdate);
-        Ok(())
+        self.add_lineitem_revenue(orderkey, suppkey, extendedprice, discount, shipdate)
     }
 
     fn add_lineitem_revenue(
@@ -821,31 +820,33 @@ impl TpchQ7BuildState {
         extendedprice: i64,
         discount: i64,
         shipdate: i32,
-    ) {
+    ) -> Result<()> {
         if !(DIRECT_Q6_SHIPDATE_END_1995_01_01..DIRECT_Q7_SHIPDATE_END_EXCLUSIVE_1997_01_01)
             .contains(&shipdate)
         {
-            return;
+            return Ok(());
         }
         let Some(supp_nation) = self.pair_suppliers.get(&suppkey) else {
-            return;
+            return Ok(());
         };
         let Some(cust_nation) = self.pair_orders.get(&orderkey) else {
-            return;
+            return Ok(());
         };
         if supp_nation == cust_nation {
-            return;
+            return Ok(());
         }
         let l_year = if shipdate < DIRECT_Q7_YEAR_1996_START_1996_01_01 {
             1995
         } else {
             1996
         };
-        let revenue = extendedprice * 100_i64.saturating_sub(discount) / 100;
-        *self
+        let revenue = checked_direct_discounted_revenue(extendedprice, discount)?;
+        let entry = self
             .revenue_by_key
             .entry((supp_nation.clone(), cust_nation.clone(), l_year))
-            .or_default() += revenue;
+            .or_default();
+        *entry = checked_direct_revenue_add(*entry, revenue)?;
+        Ok(())
     }
 }
 
@@ -5085,6 +5086,52 @@ mod tests {
         assert_eq!(rows[0].cust_nation, "GERMANY");
         assert_eq!(rows[0].l_year, 1995);
         assert_eq!(rows[0].revenue, 9_500);
+    }
+
+    #[cfg(feature = "sql-bench")]
+    #[test]
+    fn tpch_q7_sidecar_rejects_discount_factor_overflow() {
+        let mut state = TpchQ7BuildState::default();
+        state
+            .ingest("nation", "1|FRANCE|0|comment")
+            .expect("france");
+        state
+            .ingest("nation", "2|GERMANY|0|comment")
+            .expect("germany");
+        state
+            .ingest(
+                "supplier",
+                "3|Supplier#3|address|1|11-111-1111|0.00|comment",
+            )
+            .expect("supplier");
+        state
+            .ingest(
+                "customer",
+                "4|Customer#4|address|2|11-111-1111|0.00|BUILDING|comment",
+            )
+            .expect("customer");
+        state
+            .ingest("orders", "10|4|O|100.00|1995-06-01|5-LOW|Clerk#1|0|comment")
+            .expect("orders");
+
+        let mut payload = vec![0, 0];
+        for value in [10_i32, 2, 3, 1] {
+            payload.extend_from_slice(&value.to_le_bytes());
+        }
+        for value in [100_i64, 10_000, i64::MIN, 0] {
+            encode_direct_decimal(&mut payload, value, 2, 0).expect("decimal payload");
+        }
+        payload.extend_from_slice(&1_u32.to_le_bytes());
+        payload.push(b'N');
+        payload.extend_from_slice(&1_u32.to_le_bytes());
+        payload.push(b'O');
+        payload.extend_from_slice(&(-1_700_i32).to_le_bytes());
+
+        let err = state
+            .ingest_lineitem_payload(&payload)
+            .expect_err("discount factor overflow should reject");
+
+        assert!(err.to_string().contains("TPC-H sidecar revenue overflow"));
     }
 
     #[cfg(feature = "sql-bench")]
