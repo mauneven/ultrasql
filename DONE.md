@@ -239,6 +239,16 @@ as a concise evidence ledger; roadmap stays for open gates only.
   `cargo test -p ultrasql-server --test time_partition_round_trip -- --nocapture`,
   and
   `cargo clippy -p ultrasql-server --all-targets --all-features -- -D warnings`.
+- Signed `i64::MIN` integer literals now fold exactly for SQL function
+  arguments instead of flowing through the out-of-range decimal placeholder as
+  `-9223372036854775807`. Literal casts also keep constant-folded values before
+  runtime cast fallback, preserving numeric scale and array constant semantics.
+  Evidence:
+  `cargo test -p ultrasql-server --test function_scan_round_trip generate_series_accepts_i64_min_boundary -- --nocapture`,
+  `cargo test -p ultrasql-server --test function_scan_round_trip generate_series -- --nocapture`,
+  `cargo test -p ultrasql-planner --lib`,
+  and
+  `cargo clippy -p ultrasql-planner -p ultrasql-server --all-targets --all-features -- -D warnings`.
 - Constant `SELECT` result execution now propagates scalar evaluation failures
   instead of silently returning NULL. Evidence:
   `cargo test -p ultrasql-executor result_propagates_constant_eval_errors`.

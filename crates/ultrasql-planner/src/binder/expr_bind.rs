@@ -719,11 +719,11 @@ fn bind_cast_expr(
     }
     coerce_literal_to_type(&mut bound, &target_type);
     let actual_type = bound.data_type();
-    if let Some(runtime_cast) = bind_runtime_cast(bound.clone(), &target_type, &actual_type) {
-        return Ok(runtime_cast);
-    }
     if cast_result_matches(&target_type, &actual_type) || matches!(actual_type, DataType::Null) {
         return Ok(bound);
+    }
+    if let Some(runtime_cast) = bind_runtime_cast(bound.clone(), &target_type, &actual_type) {
+        return Ok(runtime_cast);
     }
     if target_type.is_vector_family() {
         return Err(PlanError::TypeMismatch(format!(
@@ -2815,6 +2815,20 @@ fn fold_signed_literal(expr: &mut ScalarExpr) {
     }
 }
 
+fn parse_negative_i64_boundary(text: &str) -> Option<i64> {
+    let unsigned = text.replace('_', "");
+    let magnitude = unsigned.parse::<u128>().ok()?;
+    let max_plus_one = (i64::MAX as u128).checked_add(1)?;
+    (magnitude == max_plus_one).then_some(i64::MIN)
+}
+
+fn parse_negative_i64_boundary_expr(expr: &Expr) -> Option<i64> {
+    let Expr::Literal(Literal::Integer { text, .. }) = expr else {
+        return None;
+    };
+    parse_negative_i64_boundary(text)
+}
+
 pub(super) fn coerce_literal_to_type(expr: &mut ScalarExpr, target: &DataType) {
     fold_signed_literal(expr);
     if let DataType::Domain { base_type, .. } = target {
@@ -3778,6 +3792,14 @@ pub(super) fn bind_unary(
     cte_catalog: &[(String, Schema)],
     scope: &mut ScopeStack,
 ) -> Result<ScalarExpr, PlanError> {
+    if matches!(op, UnaryOp::Neg)
+        && let Some(value) = parse_negative_i64_boundary_expr(inner)
+    {
+        return Ok(ScalarExpr::Literal {
+            value: Value::Int64(value),
+            data_type: DataType::Int64,
+        });
+    }
     let bound = bind_expr_with_ctes(inner, input, catalog, cte_catalog, scope)?;
     let inner_ty = bound.data_type();
     let data_type = match op {
@@ -3898,11 +3920,11 @@ mod typed_literal_tests {
         coerce_literal_to_match, coerce_literal_to_type, common_scalar_return_type,
         days_since_epoch, decimal_from_numeric_value, dense_vector_family_kind, fold_date_interval,
         is_supported_builtin, literal_numeric_as_f64, money_from_literal_value, parse_date_literal,
-        parse_decimal_literal, parse_interval_literal, parse_pg_identifier_path,
-        parse_time_of_day_micros, parse_timestamp_literal, parse_timestamptz_literal,
-        parse_timetz_literal, pow10_i64, resolve_cast_type, scaled_decimal_text_to_i64,
-        try_fold_literal_binary, validate_builtin_args, vector_family_cast_matches,
-        vector_metric_family_kind,
+        parse_decimal_literal, parse_interval_literal, parse_negative_i64_boundary,
+        parse_pg_identifier_path, parse_time_of_day_micros, parse_timestamp_literal,
+        parse_timestamptz_literal, parse_timetz_literal, pow10_i64, resolve_cast_type,
+        scaled_decimal_text_to_i64, try_fold_literal_binary, validate_builtin_args,
+        vector_family_cast_matches, vector_metric_family_kind,
     };
 
     fn lit(value: Value) -> ScalarExpr {
@@ -5091,6 +5113,19 @@ mod typed_literal_tests {
         };
         assert_eq!(data_type, DataType::Date);
         assert_eq!(value, Value::Date(days_since_epoch(2000, 2, 29)));
+    }
+
+    #[test]
+    fn negative_i64_boundary_literal_folds_exactly() {
+        assert_eq!(
+            parse_negative_i64_boundary("9223372036854775808"),
+            Some(i64::MIN)
+        );
+        assert_eq!(
+            parse_negative_i64_boundary("9_223_372_036_854_775_808"),
+            Some(i64::MIN)
+        );
+        assert_eq!(parse_negative_i64_boundary("9223372036854775809"), None);
     }
 
     #[test]

@@ -716,6 +716,23 @@ async fn generate_series_descending_emits_descending() {
 }
 
 #[tokio::test]
+async fn generate_series_accepts_i64_min_boundary() {
+    let (client, _conn, server_handle) = start_server_and_connect().await;
+
+    let rows = client
+        .query(
+            "SELECT * FROM generate_series(-9223372036854775808, -9223372036854775808)",
+            &[],
+        )
+        .await
+        .expect("generate_series at i64::MIN");
+    let values: Vec<i64> = rows.iter().map(|r| r.get::<_, i64>(0)).collect();
+    assert_eq!(values, vec![i64::MIN]);
+
+    shutdown(client, server_handle).await;
+}
+
+#[tokio::test]
 async fn unnest_string_to_array_emits_text_rows() {
     let (client, _conn, server_handle) = start_server_and_connect().await;
 
