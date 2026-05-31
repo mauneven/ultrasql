@@ -116,6 +116,21 @@ fn parse_bool_guc(value: &str) -> Result<bool, ServerError> {
     }
 }
 
+fn isolation_level_name(isolation: IsolationLevel) -> &'static str {
+    match isolation {
+        IsolationLevel::ReadCommitted => "read committed",
+        IsolationLevel::RepeatableRead => "repeatable read",
+        IsolationLevel::Serializable => "serializable",
+    }
+}
+
+fn shown_transaction_isolation(txn_state: &TxnState) -> &'static str {
+    match txn_state {
+        TxnState::Idle => isolation_level_name(IsolationLevel::ReadCommitted),
+        TxnState::InTransaction(txn) | TxnState::Failed(txn) => isolation_level_name(txn.isolation),
+    }
+}
+
 fn parse_statement_timeout_ms(value: &str) -> Result<u64, ServerError> {
     let trimmed = value.trim();
     if let Some(stripped) = trimmed.strip_prefix('-') {
@@ -964,7 +979,7 @@ where
                 .get("timezone")
                 .cloned()
                 .unwrap_or_else(|| "UTC".to_owned()),
-            "transaction_isolation" => "read committed".to_owned(),
+            "transaction_isolation" => shown_transaction_isolation(&self.txn_state).to_owned(),
             "standard_conforming_strings" => "on".to_owned(),
             "synchronous_commit" => "on".to_owned(),
             _ if name.contains('.') => self

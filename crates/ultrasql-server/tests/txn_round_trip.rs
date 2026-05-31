@@ -1355,15 +1355,38 @@ async fn set_transaction_isolation_level_round_trip() {
         .batch_execute("SET TRANSACTION ISOLATION LEVEL SERIALIZABLE")
         .await
         .expect("SET TRANSACTION ISOLATION LEVEL SERIALIZABLE");
+    let row = client
+        .query_one("SHOW transaction isolation level", &[])
+        .await
+        .expect("SHOW transaction isolation level after SERIALIZABLE");
+    assert_eq!(row.get::<_, String>(0), "serializable");
+
     client
         .batch_execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ")
         .await
         .expect("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ");
+    let row = client
+        .query_one("SHOW transaction isolation level", &[])
+        .await
+        .expect("SHOW transaction isolation level after REPEATABLE READ");
+    assert_eq!(row.get::<_, String>(0), "repeatable read");
+
     client
         .batch_execute("SET TRANSACTION ISOLATION LEVEL READ COMMITTED")
         .await
         .expect("SET TRANSACTION ISOLATION LEVEL READ COMMITTED");
+    let row = client
+        .query_one("SHOW transaction isolation level", &[])
+        .await
+        .expect("SHOW transaction isolation level after READ COMMITTED");
+    assert_eq!(row.get::<_, String>(0), "read committed");
+
     client.batch_execute("COMMIT").await.expect("COMMIT");
+    let row = client
+        .query_one("SHOW transaction isolation level", &[])
+        .await
+        .expect("SHOW transaction isolation level after COMMIT");
+    assert_eq!(row.get::<_, String>(0), "read committed");
 
     // Outside a transaction is allowed to round-trip with a warning;
     // tokio-postgres surfaces the CommandComplete tag, not the notice.
