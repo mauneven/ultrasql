@@ -486,6 +486,12 @@ fn checked_direct_quantity_add_i64(left: i64, right: i64) -> Result<i64> {
 }
 
 #[cfg(feature = "sql-bench")]
+fn checked_direct_quantity_add_i128(left: i128, right: i128) -> Result<i128> {
+    left.checked_add(right)
+        .ok_or_else(direct_sidecar_quantity_overflow)
+}
+
+#[cfg(feature = "sql-bench")]
 fn direct_sidecar_count_overflow() -> anyhow::Error {
     anyhow::anyhow!("TPC-H sidecar count overflow")
 }
@@ -2249,8 +2255,9 @@ impl TpchQ17BuildState {
             return Ok(());
         }
         let stats = self.stats_by_part.entry(partkey).or_default();
-        stats.sum_quantity += i128::from(quantity);
-        stats.count = stats.count.saturating_add(1);
+        stats.sum_quantity =
+            checked_direct_quantity_add_i128(stats.sum_quantity, i128::from(quantity))?;
+        stats.count = checked_direct_count_add_i64(stats.count, 1)?;
         self.lines.push(TpchQ17Line {
             partkey,
             quantity,
@@ -5825,6 +5832,46 @@ mod tests {
 
         assert_eq!(rows.len(), 1);
         assert!((rows[0].avg_yearly - 10.0).abs() < f64::EPSILON);
+    }
+
+    #[cfg(feature = "sql-bench")]
+    #[test]
+    fn tpch_q17_sidecar_rejects_stats_count_overflow() {
+        let mut state = TpchQ17BuildState::default();
+        state.qualifying_parts.insert(5);
+        state.stats_by_part.insert(
+            5,
+            TpchQ17PartStats {
+                sum_quantity: 0,
+                count: i64::MAX,
+            },
+        );
+
+        let err = state
+            .ingest_lineitem_values(5, 1, 10)
+            .expect_err("stats count overflow should reject");
+
+        assert!(err.to_string().contains("TPC-H sidecar count overflow"));
+    }
+
+    #[cfg(feature = "sql-bench")]
+    #[test]
+    fn tpch_q17_sidecar_rejects_quantity_sum_overflow() {
+        let mut state = TpchQ17BuildState::default();
+        state.qualifying_parts.insert(5);
+        state.stats_by_part.insert(
+            5,
+            TpchQ17PartStats {
+                sum_quantity: i128::MAX,
+                count: 0,
+            },
+        );
+
+        let err = state
+            .ingest_lineitem_values(5, 1, 10)
+            .expect_err("quantity sum overflow should reject");
+
+        assert!(err.to_string().contains("TPC-H sidecar quantity overflow"));
     }
 
     #[cfg(feature = "sql-bench")]

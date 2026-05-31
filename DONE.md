@@ -2025,6 +2025,10 @@ as a concise evidence ledger; roadmap stays for open gates only.
   discount factors and checked supplier revenue accumulation overflow instead
   of panicking or wrapping cached revenue. Evidence:
   `cargo test -p ultrasql-bench --features sql-bench tpch::load::tests --lib -- --nocapture`.
+- TPC-H direct-load Q17 small-quantity sidecar now rejects checked part stats
+  count overflow and `i128` quantity-sum overflow instead of silently
+  saturating or panicking while building cached averages. Evidence:
+  `cargo test -p ultrasql-bench --features sql-bench tpch::load::tests --lib -- --nocapture`.
 - TPC-H direct-load Q18 large-order sidecar now rejects checked order quantity
   accumulation overflow instead of panicking or wrapping cached quantity totals.
   Evidence:
