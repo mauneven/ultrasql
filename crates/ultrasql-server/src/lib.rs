@@ -5070,10 +5070,17 @@ impl Server {
         }
         for (oid, table_name) in table_names {
             let Some(table) = snapshot.tables_by_oid.get(&oid) else {
-                continue;
+                return Err(ServerError::Ddl(format!(
+                    "unknown table-runtime metadata table '{}' on oid {}",
+                    table_name,
+                    oid.raw()
+                )));
             };
             if table.name != table_name {
-                continue;
+                return Err(ServerError::Ddl(format!(
+                    "table-runtime metadata table '{}' does not match catalog table '{}'",
+                    table_name, table.name
+                )));
             }
             let width = table.schema.fields().len();
             let mut runtime = self
