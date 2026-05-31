@@ -396,14 +396,23 @@ pub fn replay_into(
     let mut record_lsn = ultrasql_core::Lsn::ZERO;
     crate::recovery::recover(wal_dir, |record| {
         let current_lsn = record_lsn;
-        record_lsn = ultrasql_core::Lsn::new(
-            record_lsn
-                .raw()
-                .saturating_add(u64::from(record.header.total_length)),
-        );
+        record_lsn = advance_replay_lsn(record_lsn, record.header.total_length)?;
         dispatch_record_at_lsn(target, record, current_lsn)
             .map_err(|e| RecoveryError::Applier(e.to_string()))
     })
+}
+
+fn advance_replay_lsn(
+    current: ultrasql_core::Lsn,
+    record_len: u32,
+) -> Result<ultrasql_core::Lsn, RecoveryError> {
+    current
+        .raw()
+        .checked_add(u64::from(record_len))
+        .map(ultrasql_core::Lsn::new)
+        .ok_or(RecoveryError::Record(
+            crate::record::WalRecordError::Malformed("replay lsn overflow"),
+        ))
 }
 
 // ---------------------------------------------------------------------------
@@ -426,7 +435,7 @@ mod tests {
         HashOpPayload, HeapUpdateInPlaceBatchEntry, HeapUpdateInPlaceBatchPayload,
         HeapUpdatePayload, SequenceOpKind, SequenceOpPayload,
     };
-    use crate::record::{RecordType, WalRecord};
+    use crate::record::{RecordType, WalRecord, WalRecordError};
     use crate::writer::{WalWriter, WalWriterConfig};
 
     // ── MockHeap ─────────────────────────────────────────────────────────────
@@ -845,6 +854,19 @@ mod tests {
         assert_eq!(mock.inserts.lock().len(), 0);
         assert_eq!(mock.commits.lock().len(), 0);
         assert_eq!(mock.deletes.lock().len(), 0);
+    }
+
+    #[test]
+    fn replay_lsn_advance_rejects_overflow() {
+        let err = super::advance_replay_lsn(Lsn::new(u64::MAX), 1)
+            .expect_err("replay LSN overflow must not saturate");
+        assert!(
+            matches!(
+                err,
+                RecoveryError::Record(WalRecordError::Malformed("replay lsn overflow"))
+            ),
+            "{err:?}"
+        );
     }
 
     // ── Test 6: proptest round-trip ───────────────────────────────────────────

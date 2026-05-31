@@ -2123,3 +2123,6 @@ as a concise evidence ledger; roadmap stays for open gates only.
   buffering records, returning a typed overflow error instead of panicking or
   wrapping near `u64::MAX`. Evidence:
   `cargo test -p ultrasql-wal buffer::tests::append_rejects_lsn_overflow_without_buffering_bytes --lib -- --nocapture`.
+- WAL replay now checks record-position LSN advancement instead of saturating
+  recovery state near `u64::MAX`. Evidence:
+  `cargo test -p ultrasql-wal applier::tests::replay_lsn_advance_rejects_overflow --lib -- --nocapture`.
