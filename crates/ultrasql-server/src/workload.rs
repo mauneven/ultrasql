@@ -204,6 +204,8 @@ pub struct ActiveSessionSnapshot {
     pub backend_start: i64,
     /// Transaction start timestamp in engine microseconds, if known.
     pub xact_start: Option<i64>,
+    /// Whether `xact_start` belongs only to the currently active statement.
+    pub implicit_xact_start: bool,
     /// Current query start timestamp in engine microseconds, if active.
     pub query_start: Option<i64>,
     /// Last state-change timestamp in engine microseconds.
@@ -561,6 +563,7 @@ impl WorkloadRecorder {
                 application_name: None,
                 backend_start: now,
                 xact_start: None,
+                implicit_xact_start: false,
                 query_start: None,
                 state_change: now,
                 wait_event_type: Some(WAIT_EVENT_TYPE_CLIENT.to_string()),
@@ -589,6 +592,7 @@ impl WorkloadRecorder {
     pub fn set_session_transaction_start(&self, pid: u32) {
         if let Some(row) = self.active_sessions.lock().get_mut(&pid) {
             row.xact_start = Some(current_engine_timestamp_micros());
+            row.implicit_xact_start = false;
         }
     }
 
@@ -596,6 +600,7 @@ impl WorkloadRecorder {
     pub fn clear_session_transaction_start(&self, pid: u32) {
         if let Some(row) = self.active_sessions.lock().get_mut(&pid) {
             row.xact_start = None;
+            row.implicit_xact_start = false;
         }
     }
 
@@ -604,6 +609,10 @@ impl WorkloadRecorder {
         if let Some(row) = self.active_sessions.lock().get_mut(&pid) {
             let now = current_engine_timestamp_micros();
             row.state = "active".to_string();
+            if row.xact_start.is_none() {
+                row.xact_start = Some(now);
+                row.implicit_xact_start = true;
+            }
             row.query_start = Some(now);
             row.state_change = now;
             row.wait_event_type = None;
@@ -616,6 +625,10 @@ impl WorkloadRecorder {
     pub fn set_session_idle(&self, pid: u32) {
         if let Some(row) = self.active_sessions.lock().get_mut(&pid) {
             row.state_change = current_engine_timestamp_micros();
+            if row.implicit_xact_start {
+                row.xact_start = None;
+                row.implicit_xact_start = false;
+            }
             row.state = if row.xact_start.is_some() {
                 "idle in transaction".to_string()
             } else {

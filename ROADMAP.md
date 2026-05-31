@@ -170,7 +170,8 @@ file focused on what still blocks production.
   restore drills, logical replication, and `pgoutput`.
 - Broaden remaining `pg_stat_*` operator views, lock/io wait-event population,
   deeper lock/query timing precision, and production dashboards; completed
-  activity lifecycle states and client-read waits are tracked in `DONE.md`.
+  activity lifecycle states, client-read waits, and xact/query start timing are
+  tracked in `DONE.md`.
 
 ## P4 - Later SQL Surface
 

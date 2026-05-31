@@ -1335,6 +1335,7 @@ async fn pg_stat_activity_lists_open_sessions() {
         .query(
             "SELECT usename, application_name, state, query, \
                     backend_start IS NOT NULL, \
+                    xact_start IS NOT NULL, \
                     query_start IS NOT NULL, \
                     state_change IS NOT NULL, \
                     wait_event_type, wait_event \
@@ -1359,21 +1360,23 @@ async fn pg_stat_activity_lists_open_sessions() {
     assert!(rows[0].get::<_, bool>(4));
     assert!(rows[0].get::<_, bool>(5));
     assert!(rows[0].get::<_, bool>(6));
-    assert_eq!(rows[0].get::<_, Option<String>>(7), None);
+    assert!(rows[0].get::<_, bool>(7));
     assert_eq!(rows[0].get::<_, Option<String>>(8), None);
+    assert_eq!(rows[0].get::<_, Option<String>>(9), None);
     assert_eq!(rows[1].get::<_, String>(0), "activity_b");
     assert_eq!(rows[1].get::<_, String>(1), "activity_b");
     assert_eq!(rows[1].get::<_, String>(2), "idle");
     assert_eq!(rows[1].get::<_, Option<String>>(3), None);
     assert!(rows[1].get::<_, bool>(4));
     assert!(!rows[1].get::<_, bool>(5));
-    assert!(rows[1].get::<_, bool>(6));
+    assert!(!rows[1].get::<_, bool>(6));
+    assert!(rows[1].get::<_, bool>(7));
     assert_eq!(
-        rows[1].get::<_, Option<String>>(7).as_deref(),
+        rows[1].get::<_, Option<String>>(8).as_deref(),
         Some("Client")
     );
     assert_eq!(
-        rows[1].get::<_, Option<String>>(8).as_deref(),
+        rows[1].get::<_, Option<String>>(9).as_deref(),
         Some("ClientRead")
     );
 
