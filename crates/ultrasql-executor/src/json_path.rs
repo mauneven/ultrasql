@@ -629,6 +629,20 @@ impl<'a> JsonPathParser<'a> {
             self.expect_byte(b')', "expected ) in predicate")?;
             return Ok(predicate);
         }
+        if self.consume_keyword("exists") {
+            self.skip_ws();
+            self.expect_byte(b'(', "expected ( after exists")?;
+            self.skip_ws();
+            self.expect_byte(b'@', "exists path must start with @")?;
+            let path = self.parse_steps(true)?;
+            self.skip_ws();
+            self.expect_byte(b')', "expected ) after exists path")?;
+            return Ok(JsonPathPredicate::Path {
+                path,
+                op: None,
+                literal: None,
+            });
+        }
         self.expect_byte(b'@', "filter path must start with @")?;
         let path = self.parse_steps(true)?;
         self.skip_ws();
@@ -1105,6 +1119,23 @@ mod tests {
         });
 
         let path = parse_json_path(r#"$.items[*] ? (@.name starts with "Al").id"#).unwrap();
+        assert_eq!(
+            select(&document, &path),
+            vec![serde_json::json!(1), serde_json::json!(3)]
+        );
+    }
+
+    #[test]
+    fn path_supports_exists_predicates() {
+        let document = serde_json::json!({
+            "items": [
+                {"id": 1, "meta": {"kind": "guide"}},
+                {"id": 2},
+                {"id": 3, "meta": {"kind": "paper"}}
+            ]
+        });
+
+        let path = parse_json_path("$.items[*] ? (exists(@.meta.kind)).id").unwrap();
         assert_eq!(
             select(&document, &path),
             vec![serde_json::json!(1), serde_json::json!(3)]

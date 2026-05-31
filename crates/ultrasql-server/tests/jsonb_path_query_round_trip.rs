@@ -466,6 +466,34 @@ async fn jsonb_path_query_supports_starts_with_predicates() {
 }
 
 #[tokio::test]
+async fn jsonb_path_query_supports_exists_predicates() {
+    let running = start_sample_server("jsonb_path_query_test").await;
+    let client = &running.client;
+
+    let messages = client
+        .simple_query(
+            "SELECT value FROM jsonb_path_query(\
+             '{\"items\":[{\"id\":1,\"meta\":{\"kind\":\"guide\"}},\
+             {\"id\":2},{\"id\":3,\"meta\":{\"kind\":\"paper\"}}]}'::jsonb, \
+             '$.items[*] ? (exists(@.meta.kind)).id') \
+             ORDER BY value",
+        )
+        .await
+        .expect("jsonb_path_query exists predicate");
+    let rows: Vec<String> = messages
+        .into_iter()
+        .filter_map(|message| match message {
+            SimpleQueryMessage::Row(row) => row.get(0).map(str::to_owned),
+            _ => None,
+        })
+        .collect();
+
+    assert_eq!(rows, vec!["1".to_owned(), "3".to_owned()]);
+
+    shutdown(running).await;
+}
+
+#[tokio::test]
 async fn jsonb_path_exists_evaluates_sql_json_predicates() {
     let running = start_sample_server("jsonb_path_query_test").await;
     let client = &running.client;
