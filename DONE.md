@@ -1934,6 +1934,12 @@ as a concise evidence ledger; roadmap stays for open gates only.
   handles the typed overflow. Evidence:
   `cargo test -p ultrasql-server projection_summary --lib -- --nocapture` and
   `cargo test -p ultrasql-server --test projection_summary_round_trip -- --nocapture`.
+- `generate_series` lowering now rejects malformed `Unary(Neg, i64::MIN)`
+  input instead of silently wrapping the negation, while the normal folded
+  `i64::MIN` literal path remains supported. Evidence:
+  `cargo test -p ultrasql-server pipeline::scan::tests --lib -- --nocapture`
+  and
+  `cargo test -p ultrasql-server --test function_scan_round_trip generate_series -- --nocapture`.
 - Vectorized terminal `SumSink` now rejects `Int64` and sample-count overflow
   instead of wrapping benchmark/query sink totals. Evidence:
   `cargo test -p ultrasql-executor sum_sink_rejects_i64_overflow --lib -- --nocapture`.

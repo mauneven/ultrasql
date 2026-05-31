@@ -233,7 +233,9 @@ pub(super) fn lower_function_scan(
                 op: ultrasql_planner::UnaryOp::Neg,
                 expr,
                 ..
-            } => to_i64(expr).map(i64::wrapping_neg),
+            } => to_i64(expr)?.checked_neg().ok_or(ServerError::Unsupported(
+                "generate_series: negation overflow",
+            )),
             _ => Err(ServerError::Unsupported(
                 "generate_series: arguments must be integer literals",
             )),
@@ -515,7 +517,7 @@ mod tests {
 
     use super::*;
     use ultrasql_core::{DataType, Field, Schema, Value};
-    use ultrasql_planner::BinaryOp;
+    use ultrasql_planner::{BinaryOp, UnaryOp};
     use ultrasql_vec::column::Column;
 
     fn text_lit(value: String) -> ScalarExpr {
@@ -646,6 +648,29 @@ mod tests {
             .expect("projected csv batch");
         assert_eq!(batch.width(), 2);
         assert_eq!(batch.rows(), 1);
+    }
+
+    #[test]
+    fn generate_series_lowering_rejects_negated_i64_min_ast() {
+        let bad_start = ScalarExpr::Unary {
+            op: UnaryOp::Neg,
+            expr: Box::new(ScalarExpr::Literal {
+                value: Value::Int64(i64::MIN),
+                data_type: DataType::Int64,
+            }),
+            data_type: DataType::Int64,
+        };
+        let stop = ScalarExpr::Literal {
+            value: Value::Int64(0),
+            data_type: DataType::Int64,
+        };
+
+        let result = lower_function_scan("generate_series", &[bad_start, stop], None);
+
+        assert!(
+            matches!(result, Err(ServerError::Unsupported(message)) if message.contains("negation overflow")),
+            "generate_series lowering must reject i64::MIN negation, got {result:?}"
+        );
     }
 
     #[test]
