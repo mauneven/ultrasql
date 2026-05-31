@@ -323,7 +323,7 @@ fn eval_function_call(
         "format" => eval_format(args),
         "regexp_replace" => eval_regexp_replace(args),
         "to_tsvector" => eval_to_tsvector(args),
-        "plainto_tsquery" | "websearch_to_tsquery" | "phraseto_tsquery" => {
+        "to_tsquery" | "plainto_tsquery" | "websearch_to_tsquery" | "phraseto_tsquery" => {
             eval_plain_tsquery(name, args)
         }
         "ts_rank" => eval_ts_rank(args),
@@ -7886,7 +7886,7 @@ mod tests {
         assert_eq!(vector, Value::Text("the:1 quick:2 brown:3 fox:4".into()));
 
         let query = Eval::new(call(
-            "plainto_tsquery",
+            "to_tsquery",
             vec![lit_text("Quick fox")],
             DataType::Text { max_len: None },
         ))

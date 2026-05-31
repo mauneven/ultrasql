@@ -1533,7 +1533,9 @@ fn builtin_return_type(func_name: &str, args: &[ScalarExpr]) -> Result<DataType,
         | "reverse" | "md5" | "sha256" | "quote_ident" | "quote_literal" | "format"
         | "regexp_replace" => Ok(DataType::Text { max_len: None }),
         "to_tsvector" => Ok(DataType::TsVector),
-        "plainto_tsquery" | "websearch_to_tsquery" | "phraseto_tsquery" => Ok(DataType::TsQuery),
+        "to_tsquery" | "plainto_tsquery" | "websearch_to_tsquery" | "phraseto_tsquery" => {
+            Ok(DataType::TsQuery)
+        }
         "ts_rank" => Ok(DataType::Float64),
         "ts_headline" => Ok(DataType::Text { max_len: None }),
         "row_to_json" | "json_build_object" | "jsonb_set" => Ok(DataType::Jsonb),
@@ -1764,6 +1766,7 @@ pub(super) fn is_supported_builtin(func_name: &str) -> bool {
             | "format"
             | "regexp_replace"
             | "to_tsvector"
+            | "to_tsquery"
             | "plainto_tsquery"
             | "websearch_to_tsquery"
             | "phraseto_tsquery"
@@ -1864,9 +1867,11 @@ fn validate_builtin_args(func_name: &str, args: &mut [ScalarExpr]) -> Result<(),
         "vector_norm" | "l2_norm" => validate_vector_norm_args(func_name, args),
         "vector_dims" => validate_vector_dims_args(args),
         "jsonb_path_exists" => validate_jsonb_path_exists_args(args),
-        "to_tsvector" | "plainto_tsquery" | "websearch_to_tsquery" | "phraseto_tsquery" => {
-            validate_text_search_constructor_args(func_name, args)
-        }
+        "to_tsvector"
+        | "to_tsquery"
+        | "plainto_tsquery"
+        | "websearch_to_tsquery"
+        | "phraseto_tsquery" => validate_text_search_constructor_args(func_name, args),
         "ts_rank" => validate_ts_rank_args(args),
         "ts_headline" => validate_ts_headline_args(args),
         "xmlparse" => validate_xmlparse_args(args),
@@ -4277,6 +4282,7 @@ mod typed_literal_tests {
             ("set_bit", Vec::new(), DataType::VarBit { max_len: None }),
             ("lower", Vec::new(), text.clone()),
             ("to_tsvector", Vec::new(), DataType::TsVector),
+            ("to_tsquery", Vec::new(), DataType::TsQuery),
             ("plainto_tsquery", Vec::new(), DataType::TsQuery),
             ("ts_rank", Vec::new(), DataType::Float64),
             ("ts_headline", Vec::new(), text.clone()),

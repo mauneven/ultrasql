@@ -29,7 +29,7 @@ async fn full_text_constructors_match_and_rank_over_wire() {
             .simple_query(
                 "SELECT \
                     to_tsvector('The Quick brown fox'), \
-                    plainto_tsquery('Quick fox'), \
+                    to_tsquery('Quick fox'), \
                     to_tsvector('The Quick brown fox') @@ plainto_tsquery('quick fox'), \
                     to_tsvector('The Quick brown fox') @@ plainto_tsquery('missing'), \
                     ts_rank(to_tsvector('The Quick brown fox'), plainto_tsquery('quick missing')) > 0.4, \
