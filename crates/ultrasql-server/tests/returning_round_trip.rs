@@ -49,6 +49,34 @@ async fn insert_returning_works_over_extended_query() {
 }
 
 #[tokio::test]
+async fn insert_returning_runtime_error_is_atomic() {
+    let running = start_sample_server("returning_error_test").await;
+    let client = &running.client;
+
+    client
+        .batch_execute("CREATE TABLE t (id INT NOT NULL, raw TEXT NOT NULL)")
+        .await
+        .expect("create");
+
+    let err = client
+        .simple_query("INSERT INTO t VALUES (1, 'not-int') RETURNING CAST(raw AS INTEGER)")
+        .await
+        .expect_err("RETURNING runtime cast rejects insert");
+    assert_eq!(
+        err.code().map(tokio_postgres::error::SqlState::code),
+        Some("22P02")
+    );
+
+    let count = client
+        .query_one("SELECT COUNT(*) FROM t", &[])
+        .await
+        .expect("select after rejected INSERT RETURNING");
+    assert_eq!(count.get::<_, i64>(0), 0);
+
+    shutdown(running).await;
+}
+
+#[tokio::test]
 async fn update_returning_works_over_extended_query() {
     let running = start_sample_server("returning_test").await;
     let client = &running.client;

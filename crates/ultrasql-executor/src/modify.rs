@@ -1105,11 +1105,6 @@ impl<L: PageLoader + Send + Sync + std::fmt::Debug + 'static> Operator for Modif
                         .collect();
                     let mut seen_keys: Vec<HashSet<i64>> =
                         self.insert_indexes.iter().map(|_| HashSet::new()).collect();
-                    let mut inserted_rows: Vec<Vec<Value>> = if returning_active {
-                        Vec::with_capacity(rows.len())
-                    } else {
-                        Vec::new()
-                    };
                     let conflict_action = self.insert_conflict_action.clone();
                     self.validate_insert_conflict_arbiter(conflict_action.as_ref())?;
                     for row in &rows {
@@ -1229,13 +1224,13 @@ impl<L: PageLoader + Send + Sync + std::fmt::Debug + 'static> Operator for Modif
                             }
                             vector_index_keys[idx].push(key);
                         }
+                        if returning_active {
+                            returning_rows.push(self.evaluate_returning_row(target_row)?);
+                        }
                         let payload = self
                             .codec
                             .encode(target_row)
                             .map_err(row_codec_error_to_exec)?;
-                        if returning_active {
-                            inserted_rows.push(target_row.to_vec());
-                        }
                         payloads.push(payload);
                     }
                     let n = payloads.len();
@@ -1278,11 +1273,6 @@ impl<L: PageLoader + Send + Sync + std::fmt::Debug + 'static> Operator for Modif
                                 };
                                 index.insert_vector(vector, tid)?;
                             }
-                        }
-                    }
-                    if returning_active {
-                        for row in inserted_rows {
-                            returning_rows.push(self.evaluate_returning_row(&row)?);
                         }
                     }
                     let n_u64 = u64::try_from(n).unwrap_or(u64::MAX);
@@ -1605,10 +1595,7 @@ impl<L: PageLoader + Send + Sync + std::fmt::Debug + 'static> ModifyTable<L> {
     fn evaluate_returning_row(&self, row: &[Value]) -> Result<Vec<Value>, ExecError> {
         self.returning_evaluators
             .iter()
-            .map(|eval| {
-                eval.eval(row)
-                    .map_err(|e| ExecError::TypeMismatch(e.to_string()))
-            })
+            .map(|eval| eval.eval(row).map_err(eval_error_to_exec_error))
             .collect()
     }
 

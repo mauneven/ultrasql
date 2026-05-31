@@ -1824,6 +1824,10 @@ as a concise evidence ledger; roadmap stays for open gates only.
 - Runtime errors inside omitted-column `DEFAULT` expression evaluation now
   preserve their typed SQLSTATEs and do not insert the row. Evidence:
   `cargo test -p ultrasql-server --test constraint_round_trip default_expression_runtime_error_returns_sqlstate -- --nocapture`.
+- Runtime errors inside `INSERT ... RETURNING` expression evaluation now
+  preserve their typed SQLSTATEs and are evaluated before heap mutation, so the
+  rejected insert leaves no row behind. Evidence:
+  `cargo test -p ultrasql-server --test returning_round_trip insert_returning_runtime_error_is_atomic -- --nocapture`.
 - Runtime scalar/temporal text casts to integer, float, boolean, date, time,
   timestamp, timestamptz, and timetz now report SQLSTATE `22P02` for invalid
   column text. Evidence:
