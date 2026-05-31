@@ -963,6 +963,32 @@ async fn active_record_column_definitions_probe_uses_catalog_helpers() {
     assert_eq!(rows[1].get::<_, String>(8), "");
     assert_eq!(rows[1].get::<_, String>(9), "");
 
+    let collation_rows = client
+        .query(
+            "SELECT a.attname, a.attcollation, t.typcollation, c.collname \
+             FROM pg_attribute a \
+             JOIN pg_type t ON a.atttypid = t.oid \
+             LEFT JOIN pg_collation c ON a.attcollation = c.oid \
+             WHERE a.attrelid = '\"rails_cert\"'::regclass \
+               AND a.attnum > 0 AND NOT a.attisdropped \
+             ORDER BY a.attnum",
+            &[],
+        )
+        .await
+        .expect("column collation metadata");
+    assert_eq!(collation_rows.len(), 2);
+    assert_eq!(collation_rows[0].get::<_, String>(0), "id");
+    assert_eq!(collation_rows[0].get::<_, u32>(1), 0);
+    assert_eq!(collation_rows[0].get::<_, u32>(2), 0);
+    assert_eq!(collation_rows[0].get::<_, Option<String>>(3), None);
+    assert_eq!(collation_rows[1].get::<_, String>(0), "label");
+    assert_eq!(collation_rows[1].get::<_, u32>(1), 100);
+    assert_eq!(collation_rows[1].get::<_, u32>(2), 100);
+    assert_eq!(
+        collation_rows[1].get::<_, Option<String>>(3).as_deref(),
+        Some("default")
+    );
+
     shutdown(client, server_handle).await;
 }
 

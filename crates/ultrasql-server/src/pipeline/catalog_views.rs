@@ -21,6 +21,7 @@ const INFORMATION_SCHEMA_OID: i64 = 12;
 const PUBLIC_OID: i64 = 2200;
 const PG_CLASS_OID: i64 = 1259;
 const PG_CONSTRAINT_OID: i64 = 2606;
+const PG_COLLATION_DEFAULT_OID: u32 = 100;
 const PG_PROC_BASE_OID: u32 = 9_000;
 const PROC_TYPE_BOOL: u32 = 16;
 const PROC_TYPE_INT4: u32 = 23;
@@ -498,6 +499,14 @@ fn type_oid(dt: &DataType) -> i32 {
     }
 }
 
+fn type_collation_oid(dt: &DataType) -> u32 {
+    match dt {
+        DataType::Text { .. } | DataType::Char { .. } => PG_COLLATION_DEFAULT_OID,
+        DataType::Domain { base_type, .. } => type_collation_oid(base_type),
+        _ => 0,
+    }
+}
+
 fn range_type_oid(range_type: RangeType) -> i32 {
     match range_type {
         RangeType::Int4 => PG_TYPE_INT4RANGE,
@@ -756,7 +765,7 @@ fn rows_pg_attribute(ctx: &LowerCtx<'_>) -> Vec<Vec<Value>> {
                 Value::Bool(column_default_expr(ctx, entry.oid, idx).is_some()),
                 Value::Bool(false),
                 Value::Int32(-1),
-                v_oid(0),
+                v_oid(type_collation_oid(&field.data_type)),
                 v_text(""),
                 v_text(""),
                 Value::Null,
@@ -781,7 +790,7 @@ fn rows_pg_attribute(ctx: &LowerCtx<'_>) -> Vec<Vec<Value>> {
                 Value::Bool(false),
                 Value::Bool(false),
                 Value::Int32(-1),
-                v_oid(0),
+                v_oid(type_collation_oid(&field.data_type)),
                 v_text(""),
                 v_text(""),
                 Value::Null,
@@ -1071,7 +1080,11 @@ fn rows_pg_type(ctx: &LowerCtx<'_>) -> Vec<Vec<Value>> {
                     v_text(","),
                     v_text(format!("{name}in")),
                     v_oid(0),
-                    v_oid(0),
+                    v_oid(if matches!(*oid, PG_TYPE_TEXT | PG_TYPE_BPCHAR) {
+                        PG_COLLATION_DEFAULT_OID
+                    } else {
+                        0
+                    }),
                 ]
             },
         )
@@ -1148,7 +1161,7 @@ fn rows_pg_type(ctx: &LowerCtx<'_>) -> Vec<Vec<Value>> {
             v_text(","),
             v_text("domain_in"),
             v_oid_i32(type_oid(&entry.base_type)),
-            v_oid(0),
+            v_oid(type_collation_oid(&entry.base_type)),
         ]);
     }
     rows
@@ -1231,7 +1244,10 @@ fn schema_pg_collation() -> Schema {
 
 fn rows_pg_collation() -> Vec<Vec<Value>> {
     vec![
-        vec![Value::Oid(Oid::new(100)), v_text("default")],
+        vec![
+            Value::Oid(Oid::new(PG_COLLATION_DEFAULT_OID)),
+            v_text("default"),
+        ],
         vec![Value::Oid(Oid::new(950)), v_text("C")],
         vec![Value::Oid(Oid::new(951)), v_text("POSIX")],
     ]

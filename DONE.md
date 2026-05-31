@@ -703,6 +703,10 @@ as a concise evidence ledger; roadmap stays for open gates only.
   `cargo test -p ultrasql-parser parser::tests::postfix::collate --lib -- --nocapture`
   and
   `cargo test -p ultrasql-server --test order_by_round_trip order_by_builtin_collate_uses_bytewise_order -- --nocapture`.
+- `pg_attribute.attcollation` and `pg_type.typcollation` now report the default
+  collation OID for textlike columns and textlike domains instead of hardcoded
+  zero, while non-collatable types remain zero. Evidence:
+  `cargo test -p ultrasql-server --test catalog_views_round_trip active_record_column_definitions_probe_uses_catalog_helpers -- --nocapture`.
 - `BIT(n)` / `BIT VARYING(n)` storage, row codec, operators, wire OIDs, COPY,
   and end-to-end tests exist.
 - `INET`, `CIDR`, `MACADDR`, and `MACADDR8` storage, operators, wire OIDs,
