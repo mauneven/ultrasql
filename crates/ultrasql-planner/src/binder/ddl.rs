@@ -1565,9 +1565,7 @@ pub(super) fn bind_comment(
     let target = match &s.target {
         CommentTarget::Table(name) => {
             let table = object_name_simple(name);
-            if catalog.lookup_table(&table).is_none() {
-                return Err(PlanError::TableNotFound(table));
-            }
+            lookup_table_object(catalog, name, &table)?;
             LogicalCommentTarget::Table { table }
         }
         CommentTarget::Index(name) => LogicalCommentTarget::Index {
@@ -1595,10 +1593,12 @@ fn bind_comment_column_target(
         .parts
         .last()
         .map_or_else(String::new, |p| p.value.to_ascii_lowercase());
-    let table = name.parts[name.parts.len() - 2].value.to_ascii_lowercase();
-    let meta = catalog
-        .lookup_table(&table)
-        .ok_or_else(|| PlanError::TableNotFound(table.clone()))?;
+    let table_obj = ObjectName {
+        parts: name.parts[..name.parts.len() - 1].to_vec(),
+        span: name.span,
+    };
+    let table = object_name_simple(&table_obj);
+    let meta = lookup_table_object(catalog, &table_obj, &table)?;
     let Some(idx) = meta
         .schema
         .fields()

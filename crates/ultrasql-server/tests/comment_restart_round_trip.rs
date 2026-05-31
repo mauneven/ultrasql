@@ -83,6 +83,63 @@ async fn cleared_table_comment_stays_cleared_after_restart() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn comment_respects_schema_qualifier() {
+    let data_dir = tempfile::TempDir::new().unwrap();
+    let running = start_persistent_server(data_dir.path(), "comment_qualifier_guard").await;
+
+    running
+        .client
+        .batch_execute(
+            "CREATE SCHEMA app; \
+             CREATE TABLE guarded_comment (id INT, label TEXT)",
+        )
+        .await
+        .expect("create public table and separate schema");
+
+    let table_oid = running
+        .server
+        .catalog_snapshot()
+        .tables
+        .get("guarded_comment")
+        .expect("table before rejected comments")
+        .oid;
+
+    running
+        .client
+        .batch_execute("COMMENT ON TABLE app.guarded_comment IS 'wrong table docs'")
+        .await
+        .expect_err("qualified table comment must not resolve public table");
+
+    running
+        .client
+        .batch_execute("COMMENT ON COLUMN app.guarded_comment.label IS 'wrong column docs'")
+        .await
+        .expect_err("qualified column comment must not resolve public table");
+
+    let snapshot = running.server.catalog_snapshot();
+    assert!(
+        !snapshot
+            .descriptions
+            .contains_key(&(table_oid, Oid::new(PG_CLASS_OID), 0)),
+        "wrong-qualified table comment must not write public table description"
+    );
+    assert!(
+        !snapshot
+            .descriptions
+            .contains_key(&(table_oid, Oid::new(PG_CLASS_OID), 2)),
+        "wrong-qualified column comment must not write public column description"
+    );
+
+    running
+        .client
+        .batch_execute("DROP TABLE guarded_comment; DROP SCHEMA app")
+        .await
+        .expect("cleanup COMMENT qualifier guard");
+
+    shutdown(running).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn dropped_table_comment_does_not_survive_restart() {
     let data_dir = tempfile::TempDir::new().unwrap();
     let dropped_oid;

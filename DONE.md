@@ -1378,3 +1378,7 @@ as a concise evidence ledger; roadmap stays for open gates only.
   instead of attaching RLS metadata to a same-name table in another schema.
   Evidence:
   `cargo test -p ultrasql-server --test rls_round_trip -- --nocapture`.
+- Schema-qualified `COMMENT ON TABLE/COLUMN` now rejects wrong-qualified table
+  targets instead of writing `pg_description` metadata for a same-name table in
+  another schema. Evidence:
+  `cargo test -p ultrasql-server --test comment_restart_round_trip -- --nocapture`.
