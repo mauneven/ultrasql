@@ -465,6 +465,39 @@ async fn truncate_accepts_table_truncate_privilege() {
 }
 
 #[tokio::test]
+async fn grant_schema_rejects_missing_schema() {
+    let running = start_sample_server("schema_privilege_missing_guard").await;
+    let client = &running.client;
+
+    client
+        .batch_execute("CREATE ROLE schema_ghost_reader LOGIN")
+        .await
+        .expect("create schema ghost roles");
+
+    client
+        .batch_execute("GRANT USAGE ON SCHEMA missing_schema TO schema_ghost_reader")
+        .await
+        .expect_err("schema GRANT must reject missing schemas");
+
+    let visible = client
+        .query_one(
+            "SELECT has_schema_privilege('schema_ghost_reader', 'missing_schema', 'USAGE')",
+            &[],
+        )
+        .await
+        .expect("schema privilege check after rejected grant")
+        .get::<_, bool>(0);
+    assert!(!visible, "rejected schema GRANT must not persist");
+
+    client
+        .batch_execute("DROP ROLE schema_ghost_reader")
+        .await
+        .expect("cleanup schema ghost roles");
+
+    shutdown(running).await;
+}
+
+#[tokio::test]
 async fn schema_usage_is_required_for_table_access() {
     let running = start_sample_server("schema_usage_gate").await;
     let client = &running.client;

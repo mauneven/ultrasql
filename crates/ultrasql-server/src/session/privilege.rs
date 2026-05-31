@@ -10,6 +10,7 @@ use super::Session;
 use crate::auth::{
     AuthCatalog, DefaultPrivilegeUpdate, PrivilegeKind, PrivilegeObjectKind, PrivilegeRequest,
 };
+use crate::builtin_schema_name;
 use crate::error::ServerError;
 use crate::result_encoder::{self, SelectResult};
 
@@ -230,6 +231,10 @@ where
             for table in objects {
                 self.table_oid_for_privilege_object(table)?;
             }
+        } else if object_kind == LogicalPrivilegeObjectKind::Schema {
+            for schema in objects {
+                self.ensure_schema_exists_for_privilege(schema)?;
+            }
         } else if object_kind == LogicalPrivilegeObjectKind::Sequence {
             for sequence in objects {
                 self.sequence_key_for_privilege_object(sequence)?;
@@ -290,6 +295,7 @@ where
     fn ensure_schema_privilege_owner(&self, schemas: &[String]) -> Result<(), ServerError> {
         let current_user = self.current_user.to_ascii_lowercase();
         for schema in schemas {
+            self.ensure_schema_exists_for_privilege(schema)?;
             let folded = schema.to_ascii_lowercase();
             let owns_schema = self
                 .state
@@ -303,6 +309,16 @@ where
             }
         }
         Ok(())
+    }
+
+    fn ensure_schema_exists_for_privilege(&self, schema: &str) -> Result<(), ServerError> {
+        let folded = schema.to_ascii_lowercase();
+        if builtin_schema_name(&folded) || self.state.schemas.contains_key(&folded) {
+            return Ok(());
+        }
+        Err(ServerError::ddl(format!(
+            "schema '{schema}' does not exist"
+        )))
     }
 
     fn ensure_sequence_privilege_owner(&self, sequences: &[String]) -> Result<(), ServerError> {

@@ -1399,3 +1399,7 @@ as a concise evidence ledger; roadmap stays for open gates only.
   superuser administration bypass and stores valid qualified sequence grants
   under the canonical sequence key. Evidence:
   `cargo test -p ultrasql-server --test sequence_round_trip -- --nocapture`.
+- Schema privilege DDL now validates schema existence before the superuser
+  administration bypass while preserving built-in schema grants, preventing
+  ghost grants on missing schemas. Evidence:
+  `cargo test -p ultrasql-server --test privilege_catalog_round_trip -- --nocapture`.
