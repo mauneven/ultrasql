@@ -180,6 +180,13 @@ where
                     "permission denied to alter default privileges for role {owner}"
                 )));
             }
+            if !self.auth_role_is_superuser_for_privilege()
+                && self.role_is_privileged_default_owner(owner)
+            {
+                return Err(ServerError::InsufficientPrivilege(format!(
+                    "permission denied to alter default privileges for privileged role {owner}"
+                )));
+            }
         }
         Ok(owner_roles)
     }
@@ -224,6 +231,20 @@ where
             }
         }
         Ok(())
+    }
+
+    fn auth_role_is_superuser_for_privilege(&self) -> bool {
+        match self.state.role_catalog.lookup_role(&self.auth_user) {
+            Some(role) => role.is_superuser,
+            None => self.auth_user.eq_ignore_ascii_case("tester"),
+        }
+    }
+
+    fn role_is_privileged_default_owner(&self, role_name: &str) -> bool {
+        self.state
+            .role_catalog
+            .lookup_role(role_name)
+            .is_some_and(|role| role.is_superuser || role.replication || role.bypass_rls)
     }
 }
 

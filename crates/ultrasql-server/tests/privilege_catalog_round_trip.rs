@@ -179,6 +179,39 @@ async fn non_owner_cannot_grant_or_revoke_table_privileges() {
     shutdown(running).await;
 }
 
+#[tokio::test]
+async fn non_superuser_cannot_alter_default_privileges_for_privileged_role() {
+    let running = start_sample_server("privilege_catalog_test").await;
+    let client = &running.client;
+
+    client
+        .batch_execute(
+            "CREATE ROLE tester SUPERUSER LOGIN; \
+             CREATE ROLE delegated_admin CREATEROLE LOGIN; \
+             CREATE ROLE other_admin SUPERUSER LOGIN; \
+             CREATE ROLE analyst LOGIN; \
+             GRANT other_admin TO delegated_admin",
+        )
+        .await
+        .expect("create delegated and privileged roles");
+
+    let (delegated, delegated_conn) =
+        connect_as(running.bound, "delegated_admin", "default_privilege_reject").await;
+    assert_insufficient_privilege(
+        delegated
+            .batch_execute(
+                "ALTER DEFAULT PRIVILEGES FOR ROLE other_admin \
+                 GRANT SELECT ON TABLES TO analyst",
+            )
+            .await
+            .expect_err("non-superuser cannot alter privileged role default privileges"),
+    );
+    drop(delegated);
+    delegated_conn.await.expect("delegated connection joins");
+
+    shutdown(running).await;
+}
+
 #[test]
 fn privilege_metadata_rejects_duplicate_grant_keys_on_rebuild() {
     let data_dir = tempfile::TempDir::new().expect("temp data dir");
