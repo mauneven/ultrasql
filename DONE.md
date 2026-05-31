@@ -690,6 +690,10 @@ as a concise evidence ledger; roadmap stays for open gates only.
 - `DROP TABLE` now removes live `pg_statistic_ext` rows immediately, so
   extended statistics for dropped relations disappear before restart. Evidence:
   `cargo test -p ultrasql-server --test create_statistics_round_trip`.
+- `DROP TABLE` now clears live table, column, and dependent-index
+  `pg_description` rows immediately, so catalog views cannot expose comments
+  for dropped objects before restart. Evidence:
+  `cargo test -p ultrasql-server --test comment_restart_round_trip`.
 - Dropped sequences remove sequence privilege grants from memory and durable
   `pg_privileges.meta`, so a recreated sequence cannot inherit stale ACLs by
   name. Evidence:

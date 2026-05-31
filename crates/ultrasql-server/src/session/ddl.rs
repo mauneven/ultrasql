@@ -1874,6 +1874,13 @@ where
                 if *cascade {
                     self.drop_foreign_key_dependencies(entry.oid, &drop_set);
                 }
+                let dependent_index_oids = self
+                    .state
+                    .persistent_catalog
+                    .list_indexes_for_table(entry.oid)
+                    .into_iter()
+                    .map(|index| index.oid)
+                    .collect::<Vec<_>>();
                 if let Some((_, runtime)) = self.state.time_partitions.remove(name) {
                     for chunk in runtime.chunks.iter() {
                         let _ = self.state.persistent_catalog.drop_table(&chunk.table_name);
@@ -1922,6 +1929,11 @@ where
                 self.state
                     .persistent_catalog
                     .clear_descriptions_for_object(entry.oid);
+                for index_oid in dependent_index_oids {
+                    self.state
+                        .persistent_catalog
+                        .clear_descriptions_for_object(index_oid);
+                }
             }
             self.state.materialized_views.remove(name);
             self.state.persistent_catalog.drop_table(name)?;
