@@ -259,6 +259,8 @@ fn walk_plan_for_max_param(plan: &LogicalPlan, max_idx: &mut u32) {
         | LogicalPlan::AlterDefaultPrivileges { .. }
         | LogicalPlan::GrantRole { .. }
         | LogicalPlan::RevokeRole { .. }
+        | LogicalPlan::CreateSchema { .. }
+        | LogicalPlan::DropSchema { .. }
         | LogicalPlan::DropTable { .. }
         | LogicalPlan::AlterTable { .. }
         | LogicalPlan::CreateSequence { .. }

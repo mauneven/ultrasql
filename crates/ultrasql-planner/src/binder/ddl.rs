@@ -13,11 +13,12 @@ use ultrasql_parser::ast::{
     CommentStmt, CommentTarget, CopyDirection as AstCopyDirection, CopyFormat as AstCopyFormat,
     CopyOption, CopySource as AstCopySource, CopyStmt, CreateDomainStmt, CreateIndexStmt,
     CreateMaterializedViewStmt, CreateOperatorStmt, CreatePolicyStmt, CreateRoleStmt,
-    CreateSequenceStmt, CreateTableStmt, CreateTypeKind, CreateTypeStmt, DomainConstraint,
-    DropIndexStmt, DropRoleStmt, DropSequenceStmt, DropTableStmt, Expr, Identifier, Literal,
-    ObjectName, PolicyCommand as AstPolicyCommand, PolicyPermissiveness as AstPolicyPermissiveness,
-    ReferentialAction as AstReferentialAction, RoleOption as AstRoleOption,
-    RoleStmtKind as AstRoleStmtKind, SequenceOption, TableConstraint, TruncateStmt, TypeName,
+    CreateSchemaStmt, CreateSequenceStmt, CreateTableStmt, CreateTypeKind, CreateTypeStmt,
+    DomainConstraint, DropIndexStmt, DropRoleStmt, DropSchemaStmt, DropSequenceStmt, DropTableStmt,
+    Expr, Identifier, Literal, ObjectName, PolicyCommand as AstPolicyCommand,
+    PolicyPermissiveness as AstPolicyPermissiveness, ReferentialAction as AstReferentialAction,
+    RoleOption as AstRoleOption, RoleStmtKind as AstRoleStmtKind, SequenceOption, TableConstraint,
+    TruncateStmt, TypeName,
 };
 
 use super::expr_bind::{coerce_literal_to_type, resolve_builtin_collation};
@@ -1473,6 +1474,27 @@ pub(super) fn bind_drop_sequence(s: &DropSequenceStmt) -> Result<LogicalPlan, Pl
     let sequences = s.names.iter().map(object_name_simple).collect();
     Ok(LogicalPlan::DropSequence {
         sequences,
+        if_exists: s.if_exists,
+        cascade: s.cascade,
+        schema: Schema::empty(),
+    })
+}
+
+pub(super) fn bind_create_schema(s: &CreateSchemaStmt) -> Result<LogicalPlan, PlanError> {
+    Ok(LogicalPlan::CreateSchema {
+        schema_name: s.name.value.to_ascii_lowercase(),
+        if_not_exists: s.if_not_exists,
+        schema: Schema::empty(),
+    })
+}
+
+pub(super) fn bind_drop_schema(s: &DropSchemaStmt) -> Result<LogicalPlan, PlanError> {
+    Ok(LogicalPlan::DropSchema {
+        schemas: s
+            .names
+            .iter()
+            .map(|name| name.value.to_ascii_lowercase())
+            .collect(),
         if_exists: s.if_exists,
         cascade: s.cascade,
         schema: Schema::empty(),

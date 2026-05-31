@@ -103,6 +103,8 @@ pub fn lower_plan(
         | LogicalPlan::AlterDefaultPrivileges { .. }
         | LogicalPlan::GrantRole { .. }
         | LogicalPlan::RevokeRole { .. }
+        | LogicalPlan::CreateSchema { .. }
+        | LogicalPlan::DropSchema { .. }
         | LogicalPlan::DropTable { .. }
         | LogicalPlan::AlterTable { .. }
         | LogicalPlan::CreateSequence { .. }

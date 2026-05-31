@@ -76,6 +76,8 @@ pub fn execute_portal(
             | LogicalPlan::CreateRole { .. }
             | LogicalPlan::AlterRole { .. }
             | LogicalPlan::DropRole { .. }
+            | LogicalPlan::CreateSchema { .. }
+            | LogicalPlan::DropSchema { .. }
             | LogicalPlan::CreateSequence { .. }
             | LogicalPlan::AlterSequence { .. }
             | LogicalPlan::DropSequence { .. }

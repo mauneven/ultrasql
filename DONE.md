@@ -933,6 +933,14 @@ as a concise evidence ledger; roadmap stays for open gates only.
   sequences until those sequences are dropped. Evidence:
   `cargo test -p ultrasql-server --test sequence_round_trip` and
   `cargo test -p ultrasql-server --test role_ddl_round_trip`.
+- `CREATE SCHEMA`, `CREATE SCHEMA IF NOT EXISTS`, `DROP SCHEMA`, and
+  `DROP SCHEMA IF EXISTS` now execute through the wire path, survive restart
+  through runtime schema metadata, surface in `pg_namespace` /
+  `information_schema.schemata`, and block `DROP ROLE` while a role owns a
+  live schema. Evidence:
+  `cargo test -p ultrasql-server --test schema_ddl_round_trip`,
+  `cargo test -p ultrasql-server --test catalog_views_round_trip`, and
+  `cargo test -p ultrasql-server --test role_ddl_round_trip`.
 - `DROP ROLE` now rejects roles that still own live tables or still appear in
   object/default privilege grants, avoiding stale ownership and ACL references.
   Evidence: `cargo test -p ultrasql-server --test role_ddl_round_trip`.

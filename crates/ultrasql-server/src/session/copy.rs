@@ -1091,6 +1091,7 @@ where
             table_constraints: Arc::clone(&self.state.table_constraints),
             sequences: Arc::clone(&self.state.sequences),
             sequence_owners: Arc::clone(&self.state.sequence_owners),
+            schemas: Arc::clone(&self.state.schemas),
             operators: Arc::clone(&self.state.operators),
             role_catalog: Arc::clone(&self.state.role_catalog),
             privilege_catalog: Arc::clone(&self.state.privilege_catalog),

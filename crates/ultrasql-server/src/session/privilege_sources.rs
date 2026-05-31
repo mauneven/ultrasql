@@ -89,6 +89,8 @@ pub(super) fn plan_sources(plan: &LogicalPlan) -> Vec<Option<ColumnSource>> {
         | LogicalPlan::AlterDefaultPrivileges { schema, .. }
         | LogicalPlan::GrantRole { schema, .. }
         | LogicalPlan::RevokeRole { schema, .. }
+        | LogicalPlan::CreateSchema { schema, .. }
+        | LogicalPlan::DropSchema { schema, .. }
         | LogicalPlan::DropTable { schema, .. }
         | LogicalPlan::AlterTable { schema, .. }
         | LogicalPlan::CreateSequence { schema, .. }

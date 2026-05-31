@@ -12,6 +12,7 @@ use ultrasql_mvcc::{Visibility, XidStatusOracle, is_visible};
 use ultrasql_planner::LogicalReferentialAction;
 use ultrasql_txn::{IsolationLevel, LockMode, LockTag};
 
+use crate::auth::pg_authid::AuthCatalog;
 use crate::error::ServerError;
 
 use super::LowerCtx;
@@ -204,7 +205,7 @@ pub(super) fn try_virtual_catalog_scan(
 
 fn virtual_rows(name: &str, ctx: &LowerCtx<'_>) -> Option<(Schema, Vec<Vec<Value>>)> {
     match name {
-        "pg_catalog.pg_namespace" => Some((schema_pg_namespace(), rows_pg_namespace())),
+        "pg_catalog.pg_namespace" => Some((schema_pg_namespace(), rows_pg_namespace(ctx))),
         "pg_catalog.pg_class" => Some((schema_pg_class(), rows_pg_class(ctx))),
         "pg_catalog.pg_attribute" => Some((schema_pg_attribute(), rows_pg_attribute(ctx))),
         "pg_catalog.pg_attrdef" => Some((schema_pg_attrdef(), rows_pg_attrdef(ctx))),
@@ -324,7 +325,7 @@ fn virtual_rows(name: &str, ctx: &LowerCtx<'_>) -> Option<(Schema, Vec<Vec<Value
         )),
         "information_schema.schemata" => Some((
             schema_information_schema_schemata(),
-            rows_information_schema_schemata(),
+            rows_information_schema_schemata(ctx),
         )),
         "information_schema.sequences" => Some((
             schema_information_schema_sequences(),
@@ -458,7 +459,43 @@ fn namespace_oid(schema_name: &str) -> i64 {
     match schema_name {
         "pg_catalog" => PG_CATALOG_OID,
         "information_schema" => INFORMATION_SCHEMA_OID,
-        _ => PUBLIC_OID,
+        "public" => PUBLIC_OID,
+        other => i64::from(crate::runtime_schema_oid(other)),
+    }
+}
+
+fn namespace_owner_oid(ctx: &LowerCtx<'_>, owner_role: &str) -> i64 {
+    ctx.role_catalog
+        .lookup_role(owner_role)
+        .map_or(10, |role| i64::from(role.oid))
+}
+
+fn runtime_schema_rows(ctx: &LowerCtx<'_>) -> Vec<(String, String, i64)> {
+    let mut rows = ctx
+        .schemas
+        .iter()
+        .map(|entry| {
+            let schema = entry.value();
+            (
+                schema.name.clone(),
+                schema.owner_role.clone(),
+                i64::from(crate::runtime_schema_oid(&schema.name)),
+            )
+        })
+        .collect::<Vec<_>>();
+    rows.sort_by(|left, right| left.0.cmp(&right.0));
+    rows
+}
+
+fn namespace_oid_u32(namespace: &str) -> u32 {
+    if namespace.eq_ignore_ascii_case("pg_catalog") {
+        u32::try_from(PG_CATALOG_OID).unwrap_or(0)
+    } else if namespace.eq_ignore_ascii_case("information_schema") {
+        u32::try_from(INFORMATION_SCHEMA_OID).unwrap_or(0)
+    } else if namespace.eq_ignore_ascii_case("public") {
+        u32::try_from(PUBLIC_OID).unwrap_or(0)
+    } else {
+        crate::runtime_schema_oid(&namespace.to_ascii_lowercase())
     }
 }
 
@@ -611,8 +648,8 @@ fn schema_pg_namespace() -> Schema {
     ])
 }
 
-fn rows_pg_namespace() -> Vec<Vec<Value>> {
-    vec![
+fn rows_pg_namespace(ctx: &LowerCtx<'_>) -> Vec<Vec<Value>> {
+    let mut rows = vec![
         vec![
             Value::Int64(PG_CATALOG_OID),
             v_text("pg_catalog"),
@@ -631,7 +668,20 @@ fn rows_pg_namespace() -> Vec<Vec<Value>> {
             Value::Int64(10),
             Value::Null,
         ],
-    ]
+    ];
+    rows.extend(
+        runtime_schema_rows(ctx)
+            .into_iter()
+            .map(|(name, owner_role, oid)| {
+                vec![
+                    Value::Int64(oid),
+                    v_text(name),
+                    Value::Int64(namespace_owner_oid(ctx, &owner_role)),
+                    Value::Null,
+                ]
+            }),
+    );
+    rows
 }
 
 fn schema_pg_class() -> Schema {
@@ -3520,14 +3570,6 @@ fn pg_proc_oid_by_name(name: &str) -> Option<u32> {
         })
 }
 
-fn namespace_oid_u32(namespace: &str) -> u32 {
-    if namespace.eq_ignore_ascii_case("pg_catalog") {
-        11
-    } else {
-        2200
-    }
-}
-
 fn pg_type_oid_for_data_type(data_type: &DataType) -> u32 {
     match data_type {
         DataType::Bool => 16,
@@ -4187,8 +4229,8 @@ fn schema_information_schema_schemata() -> Schema {
     ])
 }
 
-fn rows_information_schema_schemata() -> Vec<Vec<Value>> {
-    vec![
+fn rows_information_schema_schemata(ctx: &LowerCtx<'_>) -> Vec<Vec<Value>> {
+    let mut rows = vec![
         vec![
             v_text("ultrasql"),
             v_text("pg_catalog"),
@@ -4216,7 +4258,23 @@ fn rows_information_schema_schemata() -> Vec<Vec<Value>> {
             Value::Null,
             Value::Null,
         ],
-    ]
+    ];
+    rows.extend(
+        runtime_schema_rows(ctx)
+            .into_iter()
+            .map(|(name, owner_role, _)| {
+                vec![
+                    v_text("ultrasql"),
+                    v_text(name),
+                    v_text(owner_role),
+                    Value::Null,
+                    Value::Null,
+                    Value::Null,
+                    Value::Null,
+                ]
+            }),
+    );
+    rows
 }
 
 fn schema_information_schema_sequences() -> Schema {

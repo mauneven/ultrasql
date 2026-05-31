@@ -38,6 +38,7 @@ mod privilege_enforce;
 mod privilege_sources;
 mod role;
 mod run;
+mod schema;
 mod sequence;
 mod startup;
 mod timeout;

@@ -221,6 +221,8 @@ pub struct LowerCtx<'a> {
     pub sequences: Arc<dashmap::DashMap<String, Arc<ultrasql_storage::sequence::Sequence>>>,
     /// Runtime sequence owners keyed by folded sequence name.
     pub sequence_owners: Arc<dashmap::DashMap<String, String>>,
+    /// Runtime SQL schemas keyed by folded schema name.
+    pub schemas: Arc<dashmap::DashMap<String, Arc<crate::RuntimeSchema>>>,
     /// Runtime user-defined operator registry keyed by signature.
     pub operators: Arc<dashmap::DashMap<String, Arc<crate::RuntimeOperator>>>,
     /// Runtime role catalog backing virtual auth views.

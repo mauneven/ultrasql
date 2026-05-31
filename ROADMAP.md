@@ -87,8 +87,9 @@ file focused on what still blocks production.
 ### Catalog, Roles, Privileges
 
 - Replace restart-persisted role, membership, privilege, default-privilege,
-  operator, and RLS runtime sidecars with typed catalog rows and migrations
-  before v1.0; current sidecar evidence lives in `DONE.md`.
+  schema, sequence-owner, operator, and RLS runtime sidecars with typed catalog
+  rows and migrations before v1.0; current sidecar evidence lives in
+  `DONE.md`.
 - Broaden remaining dependency tracking for every object kind and every
   `DROP ... CASCADE` / `RESTRICT` path.
 - Keep security gates ethical: no proprietary tests, no closed-source

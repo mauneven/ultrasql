@@ -137,6 +137,8 @@ pub(super) fn plan_contains_outer_column(plan: &LogicalPlan) -> bool {
         | LogicalPlan::AlterDefaultPrivileges { .. }
         | LogicalPlan::GrantRole { .. }
         | LogicalPlan::RevokeRole { .. }
+        | LogicalPlan::CreateSchema { .. }
+        | LogicalPlan::DropSchema { .. }
         | LogicalPlan::DropTable { .. }
         | LogicalPlan::AlterTable { .. }
         | LogicalPlan::CreateSequence { .. }

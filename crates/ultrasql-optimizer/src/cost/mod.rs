@@ -319,6 +319,8 @@ impl<'s> CostModel<'s> {
             | LogicalPlan::AlterDefaultPrivileges { .. }
             | LogicalPlan::GrantRole { .. }
             | LogicalPlan::RevokeRole { .. }
+            | LogicalPlan::CreateSchema { .. }
+            | LogicalPlan::DropSchema { .. }
             | LogicalPlan::DropIndex { .. }
             | LogicalPlan::DropTable { .. }
             | LogicalPlan::AlterTable { .. }

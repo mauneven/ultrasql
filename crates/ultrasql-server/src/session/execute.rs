@@ -539,6 +539,8 @@ where
                 | LogicalPlan::AlterDefaultPrivileges { .. }
                 | LogicalPlan::GrantRole { .. }
                 | LogicalPlan::RevokeRole { .. }
+                | LogicalPlan::CreateSchema { .. }
+                | LogicalPlan::DropSchema { .. }
                 | LogicalPlan::CreateSequence { .. }
                 | LogicalPlan::AlterSequence { .. }
                 | LogicalPlan::DropSequence { .. }
@@ -603,6 +605,12 @@ where
             }
             LogicalPlan::RevokeRole { .. } => {
                 return self.execute_revoke_role(&plan);
+            }
+            LogicalPlan::CreateSchema { .. } => {
+                return self.execute_create_schema(&plan);
+            }
+            LogicalPlan::DropSchema { .. } => {
+                return self.execute_drop_schema(&plan);
             }
             LogicalPlan::CreateSequence { .. } => {
                 return self.execute_create_sequence(&plan);
@@ -695,6 +703,8 @@ where
                 | LogicalPlan::AlterDefaultPrivileges { .. }
                 | LogicalPlan::GrantRole { .. }
                 | LogicalPlan::RevokeRole { .. }
+                | LogicalPlan::CreateSchema { .. }
+                | LogicalPlan::DropSchema { .. }
                 | LogicalPlan::CreateSequence { .. }
                 | LogicalPlan::AlterSequence { .. }
                 | LogicalPlan::DropSequence { .. }
@@ -736,6 +746,8 @@ where
             }
             LogicalPlan::GrantRole { .. } => self.execute_grant_role(plan),
             LogicalPlan::RevokeRole { .. } => self.execute_revoke_role(plan),
+            LogicalPlan::CreateSchema { .. } => self.execute_create_schema(plan),
+            LogicalPlan::DropSchema { .. } => self.execute_drop_schema(plan),
             LogicalPlan::CreateSequence { .. } => self.execute_create_sequence(plan),
             LogicalPlan::AlterSequence { .. } => self.execute_alter_sequence(plan),
             LogicalPlan::DropSequence { .. } => self.execute_drop_sequence(plan),
@@ -1889,6 +1901,7 @@ where
                     Arc::clone(&self.state.table_constraints),
                     Arc::clone(&self.state.sequences),
                     Arc::clone(&self.state.sequence_owners),
+                    Arc::clone(&self.state.schemas),
                     Arc::clone(&self.state.operators),
                     Arc::clone(&self.state.role_catalog),
                     Arc::clone(&self.state.privilege_catalog),
@@ -1925,6 +1938,7 @@ where
                     Arc::clone(&self.state.table_constraints),
                     Arc::clone(&self.state.sequences),
                     Arc::clone(&self.state.sequence_owners),
+                    Arc::clone(&self.state.schemas),
                     Arc::clone(&self.state.operators),
                     Arc::clone(&self.state.role_catalog),
                     Arc::clone(&self.state.privilege_catalog),
@@ -2676,6 +2690,7 @@ where
             Arc::clone(&self.state.table_constraints),
             Arc::clone(&self.state.sequences),
             Arc::clone(&self.state.sequence_owners),
+            Arc::clone(&self.state.schemas),
             Arc::clone(&self.state.operators),
             Arc::clone(&self.state.role_catalog),
             Arc::clone(&self.state.privilege_catalog),

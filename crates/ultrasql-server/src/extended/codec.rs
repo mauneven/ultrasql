@@ -452,6 +452,8 @@ pub(crate) fn row_description_for_plan_with_formats(
             | LogicalPlan::CreateRole { .. }
             | LogicalPlan::AlterRole { .. }
             | LogicalPlan::DropRole { .. }
+            | LogicalPlan::CreateSchema { .. }
+            | LogicalPlan::DropSchema { .. }
             | LogicalPlan::DropTable { .. }
             | LogicalPlan::AlterTable { .. }
             | LogicalPlan::CreateSequence { .. }

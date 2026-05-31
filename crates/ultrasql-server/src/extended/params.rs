@@ -90,6 +90,8 @@ fn infer_into(
         | LogicalPlan::AlterDefaultPrivileges { .. }
         | LogicalPlan::GrantRole { .. }
         | LogicalPlan::RevokeRole { .. }
+        | LogicalPlan::CreateSchema { .. }
+        | LogicalPlan::DropSchema { .. }
         | LogicalPlan::DropTable { .. }
         | LogicalPlan::AlterTable { .. }
         | LogicalPlan::CreateSequence { .. }
@@ -447,6 +449,8 @@ pub(super) fn walk_plan_exprs<F: FnMut(&ScalarExpr)>(plan: &LogicalPlan, f: &mut
         | LogicalPlan::AlterDefaultPrivileges { .. }
         | LogicalPlan::GrantRole { .. }
         | LogicalPlan::RevokeRole { .. }
+        | LogicalPlan::CreateSchema { .. }
+        | LogicalPlan::DropSchema { .. }
         | LogicalPlan::DropTable { .. }
         | LogicalPlan::AlterTable { .. }
         | LogicalPlan::CreateSequence { .. }

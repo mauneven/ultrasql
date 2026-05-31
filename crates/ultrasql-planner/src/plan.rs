@@ -997,6 +997,28 @@ pub enum LogicalPlan {
         schema: Schema,
     },
 
+    /// `CREATE SCHEMA [IF NOT EXISTS] name`.
+    CreateSchema {
+        /// Folded schema name.
+        schema_name: String,
+        /// Whether `IF NOT EXISTS` was specified.
+        if_not_exists: bool,
+        /// Always [`Schema::empty`].
+        schema: Schema,
+    },
+
+    /// `DROP SCHEMA [IF EXISTS] name [, ...]`.
+    DropSchema {
+        /// Folded schema names.
+        schemas: Vec<String>,
+        /// Whether `IF EXISTS` was specified.
+        if_exists: bool,
+        /// Whether `CASCADE` was specified.
+        cascade: bool,
+        /// Always [`Schema::empty`].
+        schema: Schema,
+    },
+
     /// `CREATE SEQUENCE [IF NOT EXISTS] name ...`.
     CreateSequence {
         /// Case-folded sequence name.
@@ -1819,6 +1841,8 @@ impl LogicalPlan {
                 | Self::AlterDefaultPrivileges { .. }
                 | Self::GrantRole { .. }
                 | Self::RevokeRole { .. }
+                | Self::CreateSchema { .. }
+                | Self::DropSchema { .. }
                 | Self::DropTable { .. }
                 | Self::AlterTable { .. }
                 | Self::CreateSequence { .. }
@@ -1887,6 +1911,8 @@ impl LogicalPlan {
             | Self::AlterDefaultPrivileges { .. }
             | Self::GrantRole { .. }
             | Self::RevokeRole { .. }
+            | Self::CreateSchema { .. }
+            | Self::DropSchema { .. }
             | Self::DropTable { .. }
             | Self::AlterTable { .. }
             | Self::CreateSequence { .. }
@@ -1946,6 +1972,8 @@ impl LogicalPlan {
             | Self::AlterDefaultPrivileges { schema, .. }
             | Self::GrantRole { schema, .. }
             | Self::RevokeRole { schema, .. }
+            | Self::CreateSchema { schema, .. }
+            | Self::DropSchema { schema, .. }
             | Self::DropTable { schema, .. }
             | Self::AlterTable { schema, .. }
             | Self::CreateSequence { schema, .. }
@@ -2813,6 +2841,29 @@ impl LogicalPlan {
                         roles.join(", "),
                         grantees.join(", ")
                     ),
+                );
+            }
+            Self::CreateSchema {
+                schema_name,
+                if_not_exists,
+                ..
+            } => {
+                out.push_str(&pad);
+                let ine = if *if_not_exists { " IF NOT EXISTS" } else { "" };
+                let _ = fmt::write(out, format_args!("CreateSchema{ine}: {schema_name}\n"));
+            }
+            Self::DropSchema {
+                schemas,
+                if_exists,
+                cascade,
+                ..
+            } => {
+                out.push_str(&pad);
+                let ie = if *if_exists { " IF EXISTS" } else { "" };
+                let csc = if *cascade { " CASCADE" } else { "" };
+                let _ = fmt::write(
+                    out,
+                    format_args!("DropSchema{ie}: schemas=[{}]{csc}\n", schemas.join(", ")),
                 );
             }
             Self::CreateSequence {

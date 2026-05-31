@@ -206,6 +206,12 @@ where
             }
         }
 
+        for schema in self.state.schemas.iter() {
+            if schema.value().owner_role.eq_ignore_ascii_case(&role) {
+                dependencies.push(format!("schema {}", schema.key()));
+            }
+        }
+
         for membership in self.state.role_catalog.list_memberships() {
             if membership.role.eq_ignore_ascii_case(&role) {
                 dependencies.push(format!("role membership granted to {}", membership.member));

@@ -327,6 +327,8 @@ fn lower_query_inner(
         | LogicalPlan::AlterDefaultPrivileges { .. }
         | LogicalPlan::GrantRole { .. }
         | LogicalPlan::RevokeRole { .. }
+        | LogicalPlan::CreateSchema { .. }
+        | LogicalPlan::DropSchema { .. }
         | LogicalPlan::DropTable { .. }
         | LogicalPlan::AlterTable { .. }
         | LogicalPlan::CreateSequence { .. }
@@ -686,6 +688,8 @@ fn profile_operator_name(plan: &LogicalPlan) -> &'static str {
         LogicalPlan::AlterDefaultPrivileges { .. } => "AlterDefaultPrivileges",
         LogicalPlan::GrantRole { .. } => "GrantRole",
         LogicalPlan::RevokeRole { .. } => "RevokeRole",
+        LogicalPlan::CreateSchema { .. } => "CreateSchema",
+        LogicalPlan::DropSchema { .. } => "DropSchema",
         LogicalPlan::DropTable { .. } => "DropTable",
         LogicalPlan::AlterTable { .. } => "AlterTable",
         LogicalPlan::CreateSequence { .. } => "CreateSequence",
@@ -1157,6 +1161,7 @@ pub(super) fn lower_cte(
         table_constraints: Arc::clone(&ctx.table_constraints),
         sequences: Arc::clone(&ctx.sequences),
         sequence_owners: Arc::clone(&ctx.sequence_owners),
+        schemas: Arc::clone(&ctx.schemas),
         operators: Arc::clone(&ctx.operators),
         role_catalog: Arc::clone(&ctx.role_catalog),
         privilege_catalog: Arc::clone(&ctx.privilege_catalog),
