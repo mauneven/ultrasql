@@ -245,6 +245,7 @@ async fn xml_functions_validate_securely_and_extract_simple_xpath() {
                         xml_is_well_formed_document('junk<root/>'), \
                         xml_is_well_formed_document('<!DOCTYPE root SYSTEM \"file:///tmp/x\"><root/>'), \
                         xml_is_well_formed_document('<root>&unknown;</root>'), \
+                        xml_is_well_formed('<a/><b/>'), \
                         xml_is_well_formed_content('<a/><b/>')",
                 )
                 .await
@@ -255,6 +256,7 @@ async fn xml_functions_validate_securely_and_extract_simple_xpath() {
             "f".to_owned(),
             "f".to_owned(),
             "f".to_owned(),
+            "t".to_owned(),
             "t".to_owned(),
         ]]
     );
