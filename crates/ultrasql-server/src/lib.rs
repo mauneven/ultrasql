@@ -5759,10 +5759,17 @@ impl Server {
         }
         for (oid, (table_name, runtime)) in rows {
             let Some(table) = snapshot.tables_by_oid.get(&oid) else {
-                continue;
+                return Err(ServerError::Ddl(format!(
+                    "unknown RLS table metadata '{}' on oid {}",
+                    table_name,
+                    oid.raw()
+                )));
             };
             if table.name != table_name {
-                continue;
+                return Err(ServerError::Ddl(format!(
+                    "RLS table metadata '{}' does not match catalog table '{}'",
+                    table_name, table.name
+                )));
             }
             self.row_security.insert(oid, Arc::new(runtime));
         }

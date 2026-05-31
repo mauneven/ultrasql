@@ -956,6 +956,10 @@ as a concise evidence ledger; roadmap stays for open gates only.
   rows. Evidence:
   `cargo test -p ultrasql-server --test rls_round_trip rls_metadata_rejects_duplicate_table_rows_on_rebuild -- --nocapture` and
   `cargo test -p ultrasql-server --test rls_round_trip rls_metadata_rejects_duplicate_policy_names_on_rebuild -- --nocapture`.
+- Row-security metadata reload rejects table rows whose OID no longer exists in
+  the catalog snapshot, avoiding silent restart skips for tampered sidecars.
+  Evidence:
+  `cargo test -p ultrasql-server --test rls_round_trip rls_metadata_rejects_unknown_table_rows_on_rebuild -- --nocapture`.
 - Role-scoped RLS policies parse `CREATE POLICY ... TO role`, enforce inherited
   role membership, persist across restart, and fail closed when no scoped policy
   applies. Evidence:
