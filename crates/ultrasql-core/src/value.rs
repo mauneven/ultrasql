@@ -1189,12 +1189,13 @@ pub fn xml_content_is_well_formed(text: &str) -> bool {
     xml_document_is_well_formed(&wrapped)
 }
 
-/// Return element fragments selected by a small, deterministic XPath subset.
+/// Return fragments selected by a small, deterministic XPath subset.
 ///
 /// Supported paths are absolute child paths such as `/root/item/name` with
 /// optional equality filters on element attributes:
-/// `/root/item[@id="42"]`. Unsupported path syntax returns `None`. Missing
-/// matches return `Some(Vec::new())`.
+/// `/root/item[@id="42"]`. Terminal `@attr` and `text()` selections are also
+/// supported. Unsupported path syntax returns `None`. Missing matches return
+/// `Some(Vec::new())`.
 #[must_use]
 pub fn xml_xpath_element_fragments(path: &str, document: &str) -> Option<Vec<String>> {
     let document = document.trim();
@@ -1207,18 +1208,46 @@ pub fn xml_xpath_element_fragments(path: &str, document: &str) -> Option<Vec<Str
         return Some(Vec::new());
     }
     let mut current = vec![root];
-    for step in &steps[1..] {
-        let mut next = Vec::new();
-        for element in &current {
-            for child in xml_direct_child_elements(document, element) {
-                if xml_step_matches(&child, step) {
-                    next.push(child);
+    for (idx, step) in steps[1..].iter().enumerate() {
+        let terminal = idx + 2 == steps.len();
+        match step {
+            XmlPathStep::Element { .. } => {
+                let mut next = Vec::new();
+                for element in &current {
+                    for child in xml_direct_child_elements(document, element) {
+                        if xml_step_matches(&child, step) {
+                            next.push(child);
+                        }
+                    }
+                }
+                current = next;
+                if current.is_empty() {
+                    break;
                 }
             }
-        }
-        current = next;
-        if current.is_empty() {
-            break;
+            XmlPathStep::Attribute(name) if terminal => {
+                return Some(
+                    current
+                        .iter()
+                        .flat_map(|element| {
+                            element
+                                .attrs
+                                .iter()
+                                .filter(|(attr_name, _)| attr_name == name)
+                                .map(|(_, value)| value.clone())
+                        })
+                        .collect(),
+                );
+            }
+            XmlPathStep::Text if terminal => {
+                return Some(
+                    current
+                        .iter()
+                        .filter_map(|element| xml_direct_text(document, element))
+                        .collect(),
+                );
+            }
+            XmlPathStep::Attribute(_) | XmlPathStep::Text => return None,
         }
     }
     Some(
@@ -1230,9 +1259,13 @@ pub fn xml_xpath_element_fragments(path: &str, document: &str) -> Option<Vec<Str
 }
 
 #[derive(Clone, Debug)]
-struct XmlPathStep {
-    name: String,
-    attr_filter: Option<(String, String)>,
+enum XmlPathStep {
+    Element {
+        name: String,
+        attr_filter: Option<(String, String)>,
+    },
+    Attribute(String),
+    Text,
 }
 
 #[derive(Clone, Debug)]
@@ -1250,11 +1283,30 @@ fn parse_xml_path(path: &str) -> Option<Vec<XmlPathStep>> {
     if body.is_empty() || body.starts_with('/') {
         return None;
     }
+    let raw_segments = body.split('/').collect::<Vec<_>>();
     let mut steps = Vec::new();
-    for raw_segment in body.split('/') {
+    for (idx, raw_segment) in raw_segments.iter().enumerate() {
+        let terminal = idx + 1 == raw_segments.len();
         let segment = raw_segment.trim();
-        if segment.is_empty() || segment == "." || segment == ".." || segment == "text()" {
+        if segment.is_empty() || segment == "." || segment == ".." {
             return None;
+        }
+        if segment == "text()" {
+            if !terminal {
+                return None;
+            }
+            steps.push(XmlPathStep::Text);
+            continue;
+        }
+        if let Some(attr_name) = segment.strip_prefix('@') {
+            if !terminal
+                || attr_name.is_empty()
+                || xml_name_len(attr_name.as_bytes()) != attr_name.len()
+            {
+                return None;
+            }
+            steps.push(XmlPathStep::Attribute(attr_name.to_owned()));
+            continue;
         }
         let (name, attr_filter) = if let Some(open) = segment.find('[') {
             let predicate = segment.get(open + 1..segment.len().checked_sub(1)?)?.trim();
@@ -1276,7 +1328,7 @@ fn parse_xml_path(path: &str) -> Option<Vec<XmlPathStep>> {
         {
             return None;
         }
-        steps.push(XmlPathStep {
+        steps.push(XmlPathStep::Element {
             name: name.to_owned(),
             attr_filter,
         });
@@ -1446,10 +1498,47 @@ fn xml_direct_child_elements(text: &str, parent: &XmlElement) -> Vec<XmlElement>
     out
 }
 
+fn xml_direct_text(text: &str, element: &XmlElement) -> Option<String> {
+    let mut out = String::new();
+    let mut cursor = element.content_start;
+    while cursor < element.close_start {
+        let Some(relative) = text[cursor..element.close_start].find('<') else {
+            out.push_str(&text[cursor..element.close_start]);
+            break;
+        };
+        let open = cursor + relative;
+        out.push_str(&text[cursor..open]);
+        let next = text.as_bytes().get(open + 1).copied()?;
+        match next {
+            b'?' => {
+                let end = text[open + 2..element.close_start].find("?>")?;
+                cursor = open + 2 + end + 2;
+            }
+            b'!' if text[open..].starts_with("<!--") => {
+                let end = text[open + 4..element.close_start].find("-->")?;
+                cursor = open + 4 + end + 3;
+            }
+            b'!' if text[open..].starts_with("<![CDATA[") => {
+                let end = text[open + 9..element.close_start].find("]]>")?;
+                out.push_str(&text[open + 9..open + 9 + end]);
+                cursor = open + 9 + end + 3;
+            }
+            b'/' => break,
+            _ => {
+                let child = read_xml_element_at(text, open)?;
+                cursor = child.close_end;
+            }
+        }
+    }
+    (!out.is_empty()).then_some(out)
+}
+
 fn xml_step_matches(element: &XmlElement, step: &XmlPathStep) -> bool {
-    element.name == step.name
-        && step
-            .attr_filter
+    let XmlPathStep::Element { name, attr_filter } = step else {
+        return false;
+    };
+    element.name == *name
+        && attr_filter
             .as_ref()
             .is_none_or(|(expected_name, expected_value)| {
                 element
@@ -2433,6 +2522,14 @@ mod tests {
         assert_eq!(
             xml_xpath_element_fragments(r#"/root/item[@id="2"]/name"#, doc),
             Some(vec!["<name>B</name>".to_owned()])
+        );
+        assert_eq!(
+            xml_xpath_element_fragments("/root/item/@id", doc),
+            Some(vec!["1".to_owned(), "2".to_owned()])
+        );
+        assert_eq!(
+            xml_xpath_element_fragments("/root/item/name/text()", doc),
+            Some(vec!["A".to_owned(), "B".to_owned()])
         );
         assert_eq!(
             xml_xpath_element_fragments("/root/missing", doc),

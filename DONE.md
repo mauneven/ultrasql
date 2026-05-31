@@ -703,8 +703,9 @@ as a concise evidence ledger; roadmap stays for open gates only.
   (`xml_is_well_formed`, `xml_is_well_formed_content`,
   `xml_is_well_formed_document`) plus a deterministic `xpath` /
   `xpath_exists` subset for absolute element paths with optional attribute
-  equality filters. DTD declarations, external entity expansion, unknown entity
-  references, and pre-root junk are rejected.
+  equality filters, terminal `@attr` selection, and terminal `text()` selection.
+  DTD declarations, external entity expansion, unknown entity references, and
+  pre-root junk are rejected.
 - XML syntax now covers `XMLPARSE(DOCUMENT|CONTENT ...)` and
   `XMLSERIALIZE(DOCUMENT|CONTENT ... AS TEXT)`, with malformed `DOCUMENT`
   inputs rejected through the wire path. Evidence:

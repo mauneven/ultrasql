@@ -268,7 +268,9 @@ async fn xml_functions_validate_securely_and_extract_simple_xpath() {
                     "SELECT \
                         xpath_exists('/root/item[@id=\"2\"]', XML '<root><item id=\"1\"/><item id=\"2\"><name>b</name></item></root>'), \
                         xpath_exists('/root/missing', XML '<root><item id=\"1\"/></root>'), \
-                        xpath('/root/item[@id=\"2\"]/name', XML '<root><item id=\"1\"/><item id=\"2\"><name>b</name></item></root>')",
+                        xpath('/root/item[@id=\"2\"]/name', XML '<root><item id=\"1\"/><item id=\"2\"><name>b</name></item></root>'), \
+                        xpath('/root/item/@id', XML '<root><item id=\"1\">a</item><item id=\"2\">b</item></root>'), \
+                        xpath('/root/item/text()', XML '<root><item id=\"1\">a</item><item id=\"2\">b</item></root>')",
                 )
                 .await
                 .expect("xpath functions"),
@@ -277,6 +279,8 @@ async fn xml_functions_validate_securely_and_extract_simple_xpath() {
             "t".to_owned(),
             "f".to_owned(),
             "{<name>b</name>}".to_owned(),
+            "{1,2}".to_owned(),
+            "{a,b}".to_owned(),
         ]]
     );
 
