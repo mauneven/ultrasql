@@ -98,6 +98,12 @@ where
                 "execute_alter_table called with non-AlterTable plan",
             ));
         };
+        let entry = snapshot.tables.get(table_name).ok_or_else(|| {
+            ServerError::Plan(ultrasql_planner::PlanError::TableNotFound(
+                table_name.to_owned(),
+            ))
+        })?;
+        self.ensure_table_owner_or_superuser(entry.oid, table_name)?;
         match action {
             LogicalAlterTableAction::AddColumn { column } => {
                 self.execute_alter_add_column(table_name, column.clone(), snapshot)
@@ -760,6 +766,12 @@ where
             ));
         };
         let tables = self.collect_truncate_tables(tables, *cascade, snapshot)?;
+        for name in &tables {
+            let entry = snapshot.tables.get(name).ok_or_else(|| {
+                ServerError::Plan(ultrasql_planner::PlanError::TableNotFound(name.clone()))
+            })?;
+            self.ensure_table_owner_or_superuser(entry.oid, name)?;
+        }
 
         // Single autocommit txn so the multi-table case is atomic. A
         // partial failure aborts the txn and every delete it stamped

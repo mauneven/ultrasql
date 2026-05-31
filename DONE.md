@@ -949,6 +949,10 @@ as a concise evidence ledger; roadmap stays for open gates only.
 - `GRANT / REVOKE` on tables, schemas, databases, sequences, and functions work
   through privilege catalog checks; table privilege DDL now requires table
   ownership or superuser and records the actual grantor.
+- Table-mutating DDL now reuses a shared owner/superuser guard: non-owners
+  cannot `ALTER TABLE`, `TRUNCATE`, `DROP TABLE`, or `CREATE POLICY` against
+  another role's table. Evidence:
+  `cargo test -p ultrasql-server --test table_ownership_round_trip -- --nocapture`.
 - Column-level privileges enforce `SELECT`, `INSERT`, and `UPDATE` target
   access.
 - Role inheritance and `SET ROLE` support transitive membership, cycle

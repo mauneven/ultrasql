@@ -31,6 +31,7 @@ mod io;
 mod jsonb_ingest;
 mod meta_stmt;
 mod notify;
+mod ownership;
 mod parquet_copy;
 mod privilege;
 mod privilege_enforce;
