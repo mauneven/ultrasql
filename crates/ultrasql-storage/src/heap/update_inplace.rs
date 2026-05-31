@@ -12,7 +12,9 @@ use ultrasql_mvcc::{Snapshot, TupleHeader, Visibility, XidStatusOracle, is_visib
 use crate::buffer_pool::PageLoader;
 use crate::wal_sink::WalSink;
 
-use super::{HeapAccess, HeapError, Int32PairUndoBatch, UndoEntry, UndoRelationLog};
+use super::{
+    HeapAccess, HeapError, Int32PairUndoBatch, UndoEntry, UndoRelationLog, checked_heap_count_add,
+};
 
 struct Int32PairRangeUpdate {
     total_updated: usize,
@@ -784,9 +786,9 @@ impl<L: PageLoader> HeapAccess<L> {
             Ok::<(), HeapError>(())
         })?;
 
-        let total_updated = updates.iter().fold(0_usize, |total, update| {
-            total.saturating_add(update.total_updated)
-        });
+        let total_updated = updates.iter().try_fold(0_usize, |total, update| {
+            checked_heap_count_add(total, update.total_updated, "updated tuple count overflow")
+        })?;
         let mut compact_undo_scratch =
             Vec::with_capacity(usize_from_u32(block_count, "block count overflow")?);
         for mut update in updates {

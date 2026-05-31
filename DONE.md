@@ -2160,3 +2160,6 @@ as a concise evidence ledger; roadmap stays for open gates only.
 - EXPLAIN ANALYZE drain counters now check row, batch, and memory arithmetic
   instead of saturating observed execution evidence. Evidence:
   `cargo test -p ultrasql-server session::explain::tests --lib -- --nocapture`.
+- Heap bulk UPDATE and parallel DELETE row-count aggregation now rejects
+  overflow instead of clamping write-impact evidence. Evidence:
+  `cargo test -p ultrasql-storage heap::tests::heap_count_add_rejects_overflow --lib -- --nocapture`.

@@ -429,6 +429,17 @@ impl Int32PairUndoBatch {
     }
 }
 
+#[inline]
+fn checked_heap_count_add(
+    current: usize,
+    delta: usize,
+    error: &'static str,
+) -> Result<usize, HeapError> {
+    current
+        .checked_add(delta)
+        .ok_or(HeapError::MalformedHeader(error))
+}
+
 impl<L: PageLoader> std::fmt::Debug for HeapAccess<L> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("HeapAccess")

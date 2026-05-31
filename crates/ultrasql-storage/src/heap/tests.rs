@@ -99,6 +99,15 @@ fn make_heap(capacity: usize) -> HeapAccess<MapLoader> {
     HeapAccess::new(pool)
 }
 
+#[test]
+fn heap_count_add_rejects_overflow() {
+    let err = checked_heap_count_add(usize::MAX, 1, "updated tuple count overflow").unwrap_err();
+    assert!(matches!(
+        err,
+        HeapError::MalformedHeader("updated tuple count overflow")
+    ));
+}
+
 #[derive(Debug, Default)]
 struct CountingOracle {
     inner: MapOracle,

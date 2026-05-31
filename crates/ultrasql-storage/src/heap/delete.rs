@@ -17,7 +17,7 @@ use ultrasql_wal::record::RecordType;
 use crate::buffer_pool::{PageGuard, PageLoader};
 use crate::wal_sink::WalSink;
 
-use super::{DeleteOptions, HeapAccess, HeapError};
+use super::{DeleteOptions, HeapAccess, HeapError, checked_heap_count_add};
 
 #[inline]
 fn read_le_u16(bytes: &[u8], start: usize, error: &'static str) -> Result<u16, HeapError> {
@@ -645,9 +645,11 @@ impl<L: PageLoader> HeapAccess<L> {
             }
 
             for handle in handles {
-                total_deleted = total_deleted.saturating_add(handle.join().map_err(|_| {
-                    HeapError::MalformedHeader("parallel delete worker panicked")
-                })??);
+                let deleted = handle
+                    .join()
+                    .map_err(|_| HeapError::MalformedHeader("parallel delete worker panicked"))??;
+                total_deleted =
+                    checked_heap_count_add(total_deleted, deleted, "deleted tuple count overflow")?;
             }
             Ok::<(), HeapError>(())
         })?;

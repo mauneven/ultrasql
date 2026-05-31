@@ -12,7 +12,10 @@ use ultrasql_mvcc::{Snapshot, XidStatusOracle};
 use crate::buffer_pool::PageLoader;
 
 use super::scan::{HeapScan, VisibleHeapScan};
-use super::{HeapAccess, HeapError, InsertOptions, UpdateOptions, UpdateOutcome, UpdatePayload};
+use super::{
+    HeapAccess, HeapError, InsertOptions, UpdateOptions, UpdateOutcome, UpdatePayload,
+    checked_heap_count_add,
+};
 
 impl<L: PageLoader> HeapAccess<L> {
     /// Replace a tuple's payload with HOT-chain support.
@@ -376,7 +379,7 @@ impl<L: PageLoader> HeapAccess<L> {
                 // `opts.wal` is `None` this is a no-op (the bulk DML
                 // path on cross_compare_sql).
                 let mut had_hot_outcome = hot_count > 0;
-                total = total.saturating_add(hot_count);
+                total = checked_heap_count_add(total, hot_count, "updated tuple count overflow")?;
                 for (old_tid, new_tid) in hot_outcomes {
                     let outcome = UpdateOutcome {
                         old_tid,
@@ -499,7 +502,7 @@ impl<L: PageLoader> HeapAccess<L> {
                     },
                 ));
             }
-            total = total.saturating_add(fallback.len());
+            total = checked_heap_count_add(total, fallback.len(), "updated tuple count overflow")?;
             self.column_cache.bump_version(rel);
         }
 
