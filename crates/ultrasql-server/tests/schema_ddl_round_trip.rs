@@ -444,6 +444,51 @@ async fn alter_table_respects_schema_qualifier() {
     shutdown(running).await;
 }
 
+#[tokio::test]
+async fn create_index_respects_schema_qualifier() {
+    let running = start_sample_server("schema_index_qualifier_guard").await;
+
+    running
+        .client
+        .batch_execute(
+            "CREATE SCHEMA app; \
+             CREATE TABLE guarded_index (id INT); \
+             INSERT INTO guarded_index VALUES (7)",
+        )
+        .await
+        .expect("create public table and separate schema");
+
+    running
+        .client
+        .batch_execute("CREATE INDEX guarded_index_id_idx ON app.guarded_index(id)")
+        .await
+        .expect_err("qualified CREATE INDEX must not resolve public table");
+
+    let rows = running
+        .client
+        .query(
+            "SELECT indexname \
+             FROM pg_catalog.pg_indexes \
+             WHERE tablename = 'guarded_index' \
+             AND indexname = 'guarded_index_id_idx'",
+            &[],
+        )
+        .await
+        .expect("pg_indexes query after rejected qualified CREATE INDEX");
+    assert!(
+        rows.is_empty(),
+        "wrong-qualified CREATE INDEX must not create an index on public table"
+    );
+
+    running
+        .client
+        .batch_execute("DROP TABLE guarded_index; DROP SCHEMA app")
+        .await
+        .expect("cleanup CREATE INDEX qualifier guard");
+
+    shutdown(running).await;
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn qualified_sequence_schema_survives_restart() {
     let data_dir = tempfile::TempDir::new().expect("temp data dir");

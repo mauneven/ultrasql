@@ -1364,8 +1364,9 @@ as a concise evidence ledger; roadmap stays for open gates only.
   Evidence:
   `cargo test -p ultrasql-server --test privilege_catalog_round_trip privilege_metadata_rejects -- --nocapture`.
 - Schema-qualified table DDL/DML hardening now covers `SELECT`, `INSERT`,
-  `UPDATE`, `DELETE`, `DROP TABLE`, `TRUNCATE`, and `ALTER TABLE`, preventing
-  wrong-qualified statements from mutating same-name tables in another schema.
+  `UPDATE`, `DELETE`, `DROP TABLE`, `TRUNCATE`, `ALTER TABLE`, and
+  `CREATE INDEX`, preventing wrong-qualified statements from mutating same-name
+  tables in another schema.
   Evidence:
   `cargo test -p ultrasql-server --test schema_ddl_round_trip -- --nocapture`
   and `cargo test -p ultrasql-planner --lib -- --nocapture`.
