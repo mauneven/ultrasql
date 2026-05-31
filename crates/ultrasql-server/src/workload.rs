@@ -518,6 +518,20 @@ impl WorkloadRecorder {
         }
     }
 
+    /// Mark one live session as owning an explicit transaction.
+    pub fn set_session_transaction_start(&self, pid: u32) {
+        if let Some(row) = self.active_sessions.lock().get_mut(&pid) {
+            row.xact_start = Some(current_engine_timestamp_micros());
+        }
+    }
+
+    /// Clear the explicit transaction timestamp for one live session.
+    pub fn clear_session_transaction_start(&self, pid: u32) {
+        if let Some(row) = self.active_sessions.lock().get_mut(&pid) {
+            row.xact_start = None;
+        }
+    }
+
     /// Mark one live session as executing `query`.
     pub fn set_session_active(&self, pid: u32, query: impl Into<String>) {
         if let Some(row) = self.active_sessions.lock().get_mut(&pid) {

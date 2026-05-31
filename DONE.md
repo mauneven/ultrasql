@@ -873,6 +873,10 @@ as a concise evidence ledger; roadmap stays for open gates only.
   `wait_event_type`, and `wait_event`, with active sessions showing a current
   `query_start` and idle sessions clearing it. Evidence:
   `cargo test -p ultrasql-server --test catalog_views_round_trip pg_stat_activity_lists_open_sessions -- --nocapture`.
+- `pg_catalog.pg_stat_activity.xact_start` now tracks explicit transaction
+  lifecycle: null while idle, non-null after `BEGIN`, and cleared after
+  `COMMIT` or `ROLLBACK`. Evidence:
+  `cargo test -p ultrasql-server --test catalog_views_round_trip pg_stat_activity_lists_open_sessions -- --nocapture`.
 - `GUI introspection probes` exist for `pgAdmin`, `DBeaver`, and `DataGrip`.
 - Migration tool certification covers `Flyway`, `Liquibase`, and `Alembic`.
 

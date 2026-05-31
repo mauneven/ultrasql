@@ -168,7 +168,7 @@ file focused on what still blocks production.
 - Finish streaming replication, synchronous replication modes, backup/PITR
   restore drills, logical replication, and `pgoutput`.
 - Broaden remaining `pg_stat_*` operator views, activity wait-event population,
-  backend timing precision, and production dashboards; completed base
+  deeper lock/query timing precision, and production dashboards; completed base
   statistics views are tracked in `DONE.md`.
 
 ## P4 - Later SQL Surface

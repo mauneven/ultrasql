@@ -114,6 +114,9 @@ where
                 rows: 0,
             }),
             TxnState::InTransaction(mut txn) => {
+                self.state
+                    .workload_recorder
+                    .clear_session_transaction_start(self.pid);
                 self.state.txn_manager.refresh_snapshot(&mut txn);
                 if !self.pending_table_modifications.is_empty()
                     && let Err(e) = self.state.validate_deferred_foreign_keys(&txn)
@@ -155,6 +158,9 @@ where
                 })
             }
             TxnState::Failed(txn) => {
+                self.state
+                    .workload_recorder
+                    .clear_session_transaction_start(self.pid);
                 let xid = txn.xid;
                 if let Err(e) = self.state.heap.rollback_in_place_updates(xid) {
                     tracing::warn!(error = %e, "in-place update rollback failed");
@@ -261,6 +267,9 @@ where
             TxnState::Idle => {
                 let txn = self.state.txn_manager.begin(iso);
                 self.txn_state = TxnState::InTransaction(txn);
+                self.state
+                    .workload_recorder
+                    .set_session_transaction_start(self.pid);
                 None
             }
             TxnState::InTransaction(_) | TxnState::Failed(_) => {
@@ -348,6 +357,9 @@ where
                 rows: 0,
             }),
             TxnState::InTransaction(mut txn) => {
+                self.state
+                    .workload_recorder
+                    .clear_session_transaction_start(self.pid);
                 self.state.txn_manager.refresh_snapshot(&mut txn);
                 let modified_tables = self
                     .pending_table_modifications
@@ -408,6 +420,9 @@ where
                 })
             }
             TxnState::Failed(txn) => {
+                self.state
+                    .workload_recorder
+                    .clear_session_transaction_start(self.pid);
                 let xid = txn.xid;
                 if let Err(e) = self.state.heap.rollback_in_place_updates(xid) {
                     tracing::warn!(error = %e, "in-place update rollback failed");
@@ -443,6 +458,9 @@ where
                 rows: 0,
             }),
             TxnState::InTransaction(txn) | TxnState::Failed(txn) => {
+                self.state
+                    .workload_recorder
+                    .clear_session_transaction_start(self.pid);
                 let xid = txn.xid;
                 if let Err(e) = self.state.heap.rollback_in_place_updates(xid) {
                     tracing::warn!(error = %e, "in-place update rollback failed");
