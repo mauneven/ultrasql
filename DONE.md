@@ -949,6 +949,10 @@ as a concise evidence ledger; roadmap stays for open gates only.
   longer carries a nested production `unreachable!` arm. Evidence:
   `cargo test -p ultrasql-executor apply_binary_rejects_logical_ops_without_panicking --lib -- --nocapture`;
   `cargo clippy -p ultrasql-executor --lib --all-features -- -D clippy::panic`.
+- Release workflow now has a packaging invariant validator and the Docker
+  publish job emits clean `linux/amd64` plus `linux/arm64` GHCR manifests while
+  keeping provenance and SBOM attestation manifest rows disabled. Evidence:
+  `python3 scripts/validate-release-workflow.py`.
 - Ordered-set aggregates `PERCENTILE_CONT` and `PERCENTILE_DISC` have plan shape
   and wire coverage.
 - Portable scalar helpers now cover `COALESCE`, `IFNULL` / `NVL`,

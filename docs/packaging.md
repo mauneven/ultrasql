@@ -19,7 +19,7 @@ mkdocs build --strict
 ## Docker
 
 The Docker image is built from `Dockerfile` and published by the release
-workflow to:
+workflow for `linux/amd64` and `linux/arm64` to:
 
 ```text
 ghcr.io/mauneven/ultrasql:<tag>
