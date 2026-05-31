@@ -4,43 +4,23 @@
 //! across files keeps every unit under the 600-line ceiling without
 //! changing semantics.
 
-#![allow(unused_imports)]
-
 use std::sync::Arc;
 use std::time::Instant;
 
-use bytes::BytesMut;
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
-use tracing::{debug, error, info, warn};
-use ultrasql_catalog::{
-    CatalogSnapshot, IndexEntry, MutableCatalog, PersistentCatalog, TableEntry,
-};
-use ultrasql_core::{DataType, PageId, RelationId, Value};
-use ultrasql_optimizer::{NoStats, PlanCache, PlanCacheConfig, PlanCacheKey, StatsSource};
-use ultrasql_parser::Parser;
-use ultrasql_planner::{
-    Catalog as PlannerCatalog, InMemoryCatalog, LogicalAlterTableAction, LogicalPlan, TableMeta,
-    bind,
-};
-use ultrasql_protocol::{BackendMessage, FrontendMessage, decode_frontend, encode_backend};
-use ultrasql_storage::btree::BTree;
-use ultrasql_storage::buffer_pool::{BufferPool, PageLoader};
-use ultrasql_storage::heap::{DeleteOptions, HeapAccess, UpdateOptions};
-use ultrasql_storage::page::Page;
-use ultrasql_txn::{IsolationLevel, Transaction, TransactionManager};
+use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
+use ultrasql_catalog::CatalogSnapshot;
+use ultrasql_planner::LogicalPlan;
+use ultrasql_protocol::BackendMessage;
+use ultrasql_txn::IsolationLevel;
 
 use super::Session;
 use super::timeout::StatementTimeoutGuard;
 use crate::error::ServerError;
-use crate::extended;
-use crate::pipeline::{self, LowerCtx, SampleTables};
-use crate::result_encoder::{
-    self, SelectResult, run_ddl_command, run_modify_command, run_select, run_select_streamed,
-};
+use crate::pipeline::{self};
 use crate::workload::{WorkloadQueryRecord, plan_hash_for_plan};
 use crate::{
-    BlankPageLoader, CombinedCatalog, Server, TxnState, decode_key_column, notice_warning,
-    record_serializable_predicate_locks, record_serializable_write_conflicts, run_plan_in_txn,
+    CombinedCatalog, TxnState, record_serializable_predicate_locks,
+    record_serializable_write_conflicts,
 };
 
 impl<RW> Session<RW>

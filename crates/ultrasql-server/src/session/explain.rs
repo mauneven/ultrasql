@@ -1347,7 +1347,7 @@ mod tests {
     use ultrasql_executor::MemTableScan;
     use ultrasql_planner::{
         AggregateFunc, LogicalAggregateExpr, LogicalJoinCondition, LogicalJoinType, LogicalSetOp,
-        LogicalSetQuantifier, SortKey,
+        LogicalSetQuantifier,
     };
     use ultrasql_vec::column::{Column, NumericColumn, StringColumn};
 

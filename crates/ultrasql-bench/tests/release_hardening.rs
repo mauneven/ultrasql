@@ -740,6 +740,23 @@ fn principal_files_keep_hygiene_guards() {
             "heap delete hot-path decode must return HeapError instead of {needle}"
         );
     }
+
+    for path in [
+        "crates/ultrasql-server/src/session/mod.rs",
+        "crates/ultrasql-server/src/session/alter.rs",
+        "crates/ultrasql-server/src/session/copy.rs",
+        "crates/ultrasql-server/src/session/ddl.rs",
+        "crates/ultrasql-server/src/session/ext.rs",
+        "crates/ultrasql-server/src/session/io.rs",
+        "crates/ultrasql-server/src/session/startup.rs",
+        "crates/ultrasql-server/src/session/txn.rs",
+    ] {
+        let source = repo_file(path);
+        assert!(
+            !source.contains("#![allow(unused_imports)]"),
+            "{path} must prune stale imports instead of suppressing unused imports"
+        );
+    }
 }
 
 #[test]

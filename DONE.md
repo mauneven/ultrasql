@@ -2277,3 +2277,10 @@ as a concise evidence ledger; roadmap stays for open gates only.
   `bash -n benchmarks/vector_topk_exact.sh`,
   `bash -n benchmarks/ai_benchmark_gauntlet.sh`,
   `bash -n benchmarks/certify.sh`.
+- Session production split modules no longer carry module-wide
+  `#![allow(unused_imports)]` suppressions. Stale imports were pruned from the
+  session hot-path files, and release hardening now guards against reintroducing
+  those suppressions. Evidence:
+  `cargo clippy -p ultrasql-server --all-targets --all-features -- -D warnings`,
+  `cargo test -p ultrasql-server --lib session:: -- --nocapture`,
+  `cargo test -p ultrasql-bench --test release_hardening -- --nocapture`.

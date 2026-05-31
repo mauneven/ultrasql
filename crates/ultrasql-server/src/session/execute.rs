@@ -6,46 +6,28 @@
 
 use std::sync::Arc;
 
-use bytes::BytesMut;
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
-use tracing::{debug, error, info, warn};
-use ultrasql_catalog::{
-    CatalogSnapshot, IndexEntry, MutableCatalog, PersistentCatalog, StatisticExtRow, TableEntry,
-};
+use tokio::io::{AsyncRead, AsyncWrite};
+use ultrasql_catalog::{CatalogSnapshot, StatisticExtRow, TableEntry};
 use ultrasql_core::{
-    BlockNumber, DataType, PageId, RelationId, Value, Xid, timestamptz_display_in_timezone,
+    BlockNumber, DataType, RelationId, Value, Xid, timestamptz_display_in_timezone,
 };
 use ultrasql_mvcc::XidStatusOracle;
-use ultrasql_optimizer::{
-    InMemoryStatsCatalog, PlanCache, PlanCacheConfig, PlanCacheKey, StatsCatalog, StatsSource,
-};
+use ultrasql_optimizer::{InMemoryStatsCatalog, PlanCacheKey, StatsCatalog, StatsSource};
 use ultrasql_parser::Parser;
-use ultrasql_planner::{
-    BinaryOp, Catalog as PlannerCatalog, InMemoryCatalog, LogicalAlterTableAction, LogicalPlan,
-    LogicalSetVariableAction, ScalarExpr, TableMeta, bind,
-};
-use ultrasql_protocol::{
-    BackendMessage, FieldDescription, FrontendMessage, decode_frontend, encode_backend,
-};
+use ultrasql_planner::{BinaryOp, LogicalPlan, LogicalSetVariableAction, ScalarExpr, bind};
+use ultrasql_protocol::{BackendMessage, FieldDescription};
 use ultrasql_storage::access_method::{AccessMethod, BrinIndex};
 use ultrasql_storage::btree::BTree;
-use ultrasql_storage::buffer_pool::{BufferPool, PageLoader};
-use ultrasql_storage::heap::{DeleteOptions, HeapAccess, UpdateOptions};
-use ultrasql_storage::page::Page;
-use ultrasql_txn::{IsolationLevel, Transaction, TransactionManager};
+use ultrasql_txn::{IsolationLevel, Transaction};
 
 use super::{PendingLogicalChange, Session};
 use crate::auth::AuthCatalog;
 use crate::error::ServerError;
-use crate::extended;
-use crate::pipeline::{self, LowerCtx, SampleTables};
 use crate::replication::LogicalChangeKind;
-use crate::result_encoder::{
-    self, SelectResult, run_ddl_command, run_modify_command, run_select, run_select_streamed,
-};
+use crate::result_encoder::{self, SelectResult, run_ddl_command};
 use crate::{
-    BlankPageLoader, CombinedCatalog, Server, TxnState, decode_key_column, notice_warning,
-    run_plan_in_txn, try_run_cached_int32_pair_select, try_run_cached_scalar_aggregate_select,
+    CombinedCatalog, TxnState, run_plan_in_txn, try_run_cached_int32_pair_select,
+    try_run_cached_scalar_aggregate_select,
 };
 
 #[derive(Debug)]
@@ -3142,10 +3124,14 @@ impl StatsSource for ServerStatsSource<'_> {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use super::*;
     use tokio::io::duplex;
     use ultrasql_core::{Field, Schema};
     use ultrasql_planner::{AggregateFunc, LogicalAggregateExpr, LogicalSetVariableAction};
+
+    use crate::Server;
 
     fn test_schema() -> Schema {
         Schema::new([

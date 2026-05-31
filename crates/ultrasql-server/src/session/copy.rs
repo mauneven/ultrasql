@@ -28,8 +28,6 @@
 //! Server: ReadyForQuery
 //! ```
 
-#![allow(unused_imports)]
-
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::Path;

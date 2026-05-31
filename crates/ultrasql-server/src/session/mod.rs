@@ -6,8 +6,6 @@
 //! constructor; every other method lives in a sibling file that
 //! reopens the same `impl<RW> Session<RW>` block.
 
-#![allow(unused_imports)]
-
 use std::sync::Arc;
 
 use bytes::BytesMut;

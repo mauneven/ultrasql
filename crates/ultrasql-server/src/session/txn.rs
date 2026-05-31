@@ -4,41 +4,15 @@
 //! across files keeps every unit under the 600-line ceiling without
 //! changing semantics.
 
-#![allow(unused_imports)]
-
-use std::sync::Arc;
-
-use bytes::BytesMut;
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
-use tracing::{debug, error, info, warn};
-use ultrasql_catalog::{
-    CatalogSnapshot, IndexEntry, MutableCatalog, PersistentCatalog, TableEntry,
-};
-use ultrasql_core::{DataType, PageId, RelationId, Value};
-use ultrasql_optimizer::{NoStats, PlanCache, PlanCacheConfig, PlanCacheKey, StatsSource};
-use ultrasql_parser::Parser;
-use ultrasql_planner::{
-    Catalog as PlannerCatalog, InMemoryCatalog, LogicalAlterTableAction, LogicalPlan, TableMeta,
-    TxnIsolationLevel, bind,
-};
-use ultrasql_protocol::{BackendMessage, FrontendMessage, decode_frontend, encode_backend};
-use ultrasql_storage::btree::BTree;
-use ultrasql_storage::buffer_pool::{BufferPool, PageLoader};
-use ultrasql_storage::heap::{DeleteOptions, HeapAccess, UpdateOptions};
-use ultrasql_storage::page::Page;
-use ultrasql_txn::{IsolationLevel, Transaction, TransactionManager};
+use tokio::io::{AsyncRead, AsyncWrite};
+use ultrasql_planner::{LogicalPlan, TxnIsolationLevel};
+use ultrasql_protocol::BackendMessage;
+use ultrasql_txn::IsolationLevel;
 
 use super::Session;
 use crate::error::ServerError;
-use crate::extended;
-use crate::pipeline::{self, LowerCtx, SampleTables};
-use crate::result_encoder::{
-    self, SelectResult, run_ddl_command, run_modify_command, run_select, run_select_streamed,
-};
-use crate::{
-    BlankPageLoader, CombinedCatalog, Server, TxnState, decode_key_column, notice_warning,
-    run_plan_in_txn,
-};
+use crate::result_encoder::SelectResult;
+use crate::{TxnState, notice_warning};
 
 impl<RW> Session<RW>
 where
@@ -607,8 +581,12 @@ where
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use super::*;
     use tokio::io::{DuplexStream, duplex};
+
+    use crate::Server;
 
     fn test_session() -> Session<DuplexStream> {
         let (io, _peer) = duplex(64);

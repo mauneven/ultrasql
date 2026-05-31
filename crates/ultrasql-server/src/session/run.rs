@@ -5,43 +5,21 @@
 //! changing semantics.
 
 use std::io::{Error as IoError, ErrorKind, IoSlice};
-use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use bytes::BytesMut;
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
-use tracing::{debug, error, info, warn};
-use ultrasql_catalog::{
-    CatalogSnapshot, IndexEntry, MutableCatalog, PersistentCatalog, TableEntry,
-};
-use ultrasql_core::{DataType, PageId, RelationId, Value};
-use ultrasql_optimizer::{NoStats, PlanCache, PlanCacheConfig, PlanCacheKey, StatsSource};
+use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
+use tracing::debug;
 use ultrasql_parser::Parser;
-use ultrasql_planner::{
-    Catalog as PlannerCatalog, InMemoryCatalog, LogicalAlterTableAction, LogicalPlan, TableMeta,
-    bind,
-};
-use ultrasql_protocol::{BackendMessage, FrontendMessage, decode_frontend, encode_backend};
-use ultrasql_storage::btree::BTree;
-use ultrasql_storage::buffer_pool::{BufferPool, PageLoader};
-use ultrasql_storage::heap::{DeleteOptions, HeapAccess, UpdateOptions};
-use ultrasql_storage::page::Page;
-use ultrasql_txn::{IsolationLevel, Transaction, TransactionManager};
+use ultrasql_protocol::{BackendMessage, FrontendMessage, encode_backend};
 
 use super::Session;
 use super::notify::ReadOrNotify;
 use super::timeout::StatementTimeoutGuard;
+use crate::TxnState;
 use crate::error::ServerError;
-use crate::extended;
-use crate::pipeline::{self, LowerCtx, SampleTables};
-use crate::result_encoder::{
-    self, SelectResult, run_ddl_command, run_modify_command, run_select, run_select_streamed,
-};
+use crate::result_encoder::SelectResult;
 use crate::workload::{self, WorkloadQueryRecord};
-use crate::{
-    BlankPageLoader, CombinedCatalog, Server, TxnState, decode_key_column, notice_warning,
-    run_plan_in_txn,
-};
 
 const SHARED_STREAM_COPY_LIMIT_BYTES: usize = 16 * 1024 * 1024;
 

@@ -15,7 +15,7 @@ use ultrasql_wal::payload::SequenceOpKind;
 
 use super::Session;
 use crate::TxnState;
-use crate::auth::{AuthCatalog, PrivilegeKind, PrivilegeObjectKind};
+use crate::auth::{PrivilegeKind, PrivilegeObjectKind};
 use crate::error::ServerError;
 use crate::result_encoder::{self, SelectResult};
 
