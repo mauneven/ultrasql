@@ -1,6 +1,6 @@
 //! SQL/JSON path subset shared by scalar JSON functions and table functions.
 
-use serde_json::{Number as JsonNumber, Value as JsonValue};
+use serde_json::{Map as JsonMap, Number as JsonNumber, Value as JsonValue};
 
 /// Parsed SQL/JSON path expression.
 #[derive(Clone, Debug, PartialEq)]
@@ -41,6 +41,7 @@ enum JsonPathMethod {
     Double,
     Floor,
     Integer,
+    KeyValue,
     Number,
     Size,
     String,
@@ -202,7 +203,7 @@ fn select_steps(
                     }
                 }
                 JsonPathStep::Method(method) => {
-                    next.push(apply_json_path_method(*method, &item));
+                    next.extend(apply_json_path_method(*method, &item));
                 }
             }
         }
@@ -305,22 +306,27 @@ fn compare_json_value(left: &JsonValue, op: JsonPathCompareOp, right: &JsonValue
     }
 }
 
-fn apply_json_path_method(method: JsonPathMethod, value: &JsonValue) -> JsonValue {
+fn apply_json_path_method(method: JsonPathMethod, value: &JsonValue) -> Vec<JsonValue> {
     match method {
-        JsonPathMethod::Abs => json_path_numeric_method(value, f64::abs),
-        JsonPathMethod::Bigint => json_path_bigint(value)
-            .map(JsonNumber::from)
-            .map_or(JsonValue::Null, JsonValue::Number),
+        JsonPathMethod::Abs => vec![json_path_numeric_method(value, f64::abs)],
+        JsonPathMethod::Bigint => vec![
+            json_path_bigint(value)
+                .map(JsonNumber::from)
+                .map_or(JsonValue::Null, JsonValue::Number),
+        ],
         JsonPathMethod::Boolean => {
-            json_path_boolean(value).map_or(JsonValue::Null, JsonValue::Bool)
+            vec![json_path_boolean(value).map_or(JsonValue::Null, JsonValue::Bool)]
         }
-        JsonPathMethod::Ceiling => json_path_numeric_method(value, f64::ceil),
-        JsonPathMethod::Double => json_path_double(value),
-        JsonPathMethod::Floor => json_path_numeric_method(value, f64::floor),
-        JsonPathMethod::Integer => json_path_integer(value)
-            .map(JsonNumber::from)
-            .map_or(JsonValue::Null, JsonValue::Number),
-        JsonPathMethod::Number => json_path_number_from_f64(json_path_f64(value)),
+        JsonPathMethod::Ceiling => vec![json_path_numeric_method(value, f64::ceil)],
+        JsonPathMethod::Double => vec![json_path_double(value)],
+        JsonPathMethod::Floor => vec![json_path_numeric_method(value, f64::floor)],
+        JsonPathMethod::Integer => vec![
+            json_path_integer(value)
+                .map(JsonNumber::from)
+                .map_or(JsonValue::Null, JsonValue::Number),
+        ],
+        JsonPathMethod::KeyValue => json_path_keyvalue(value),
+        JsonPathMethod::Number => vec![json_path_number_from_f64(json_path_f64(value))],
         JsonPathMethod::Size => {
             let size = match value {
                 JsonValue::Array(values) => values.len(),
@@ -330,12 +336,14 @@ fn apply_json_path_method(method: JsonPathMethod, value: &JsonValue) -> JsonValu
                 | JsonValue::Number(_)
                 | JsonValue::String(_) => 1,
             };
-            JsonValue::Number(JsonNumber::from(u64::try_from(size).unwrap_or(u64::MAX)))
+            vec![JsonValue::Number(JsonNumber::from(
+                u64::try_from(size).unwrap_or(u64::MAX),
+            ))]
         }
         JsonPathMethod::String => {
-            json_path_string(value).map_or(JsonValue::Null, JsonValue::String)
+            vec![json_path_string(value).map_or(JsonValue::Null, JsonValue::String)]
         }
-        JsonPathMethod::Type => JsonValue::String(json_path_type_name(value).to_owned()),
+        JsonPathMethod::Type => vec![JsonValue::String(json_path_type_name(value).to_owned())],
     }
 }
 
@@ -375,6 +383,22 @@ fn json_path_bigint(value: &JsonValue) -> Option<i64> {
         JsonValue::String(text) => text.trim().parse::<i64>().ok(),
         JsonValue::Null | JsonValue::Bool(_) | JsonValue::Array(_) | JsonValue::Object(_) => None,
     }
+}
+
+fn json_path_keyvalue(value: &JsonValue) -> Vec<JsonValue> {
+    let JsonValue::Object(object) = value else {
+        return Vec::new();
+    };
+    object
+        .iter()
+        .map(|(key, value)| {
+            let mut row = JsonMap::new();
+            row.insert("id".to_owned(), JsonValue::Number(JsonNumber::from(0_i64)));
+            row.insert("key".to_owned(), JsonValue::String(key.clone()));
+            row.insert("value".to_owned(), value.clone());
+            JsonValue::Object(row)
+        })
+        .collect()
 }
 
 fn json_path_f64(value: &JsonValue) -> Option<f64> {
@@ -830,6 +854,7 @@ fn json_path_method(name: &str) -> Result<JsonPathMethod, JsonPathError> {
         "double" => Ok(JsonPathMethod::Double),
         "floor" => Ok(JsonPathMethod::Floor),
         "integer" => Ok(JsonPathMethod::Integer),
+        "keyvalue" => Ok(JsonPathMethod::KeyValue),
         "number" => Ok(JsonPathMethod::Number),
         "size" => Ok(JsonPathMethod::Size),
         "string" => Ok(JsonPathMethod::String),
@@ -985,6 +1010,25 @@ mod tests {
 
         let bad_bool = parse_json_path("$.bad.boolean()").unwrap();
         assert_eq!(select(&document, &bad_bool), vec![serde_json::Value::Null]);
+    }
+
+    #[test]
+    fn path_supports_keyvalue_method() {
+        let document = serde_json::json!({
+            "object": {"x": "20", "y": 32}
+        });
+
+        let keyvalue = parse_json_path("$.object.keyvalue()").unwrap();
+        let mut got = select(&document, &keyvalue);
+        got.sort_by_key(JsonValue::to_string);
+
+        assert_eq!(
+            got,
+            vec![
+                serde_json::json!({"id": 0, "key": "x", "value": "20"}),
+                serde_json::json!({"id": 0, "key": "y", "value": 32}),
+            ]
+        );
     }
 
     #[test]

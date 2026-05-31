@@ -342,6 +342,38 @@ async fn jsonb_path_query_supports_conversion_methods() {
 }
 
 #[tokio::test]
+async fn jsonb_path_query_supports_keyvalue_method() {
+    let running = start_sample_server("jsonb_path_query_test").await;
+    let client = &running.client;
+
+    let messages = client
+        .simple_query(
+            "SELECT value FROM jsonb_path_query(\
+             '{\"x\":\"20\",\"y\":32}'::jsonb, '$.keyvalue()')",
+        )
+        .await
+        .expect("jsonb_path_query keyvalue");
+    let mut rows: Vec<String> = messages
+        .into_iter()
+        .filter_map(|message| match message {
+            SimpleQueryMessage::Row(row) => row.get(0).map(str::to_owned),
+            _ => None,
+        })
+        .collect();
+    rows.sort();
+
+    assert_eq!(
+        rows,
+        vec![
+            "{\"id\":0,\"key\":\"x\",\"value\":\"20\"}".to_owned(),
+            "{\"id\":0,\"key\":\"y\",\"value\":32}".to_owned(),
+        ]
+    );
+
+    shutdown(running).await;
+}
+
+#[tokio::test]
 async fn jsonb_path_query_supports_predicate_boolean_algebra() {
     let running = start_sample_server("jsonb_path_query_test").await;
     let client = &running.client;
