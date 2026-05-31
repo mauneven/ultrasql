@@ -379,3 +379,48 @@ async fn drop_materialized_view_removes_restart_metadata() {
         "dropped materialized view must be removed from metadata: {metadata}"
     );
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn materialized_view_metadata_rejects_duplicate_views_on_rebuild() {
+    let data_dir = tempfile::TempDir::new().unwrap();
+    let metadata_path = data_dir.path().join("pg_materialized_views.meta");
+
+    let running =
+        start_persistent_server(data_dir.path(), "materialized_view_duplicate_meta").await;
+    running
+        .client
+        .batch_execute("CREATE TABLE mv_duplicate_src (id INT NOT NULL, amount INT NOT NULL)")
+        .await
+        .expect("create source");
+    running
+        .client
+        .batch_execute("INSERT INTO mv_duplicate_src VALUES (1, 10)")
+        .await
+        .expect("seed source");
+    running
+        .client
+        .batch_execute(
+            "CREATE MATERIALIZED VIEW mv_duplicate_copy AS SELECT id, amount FROM mv_duplicate_src",
+        )
+        .await
+        .expect("create materialized view");
+    shutdown_persistent(running).await;
+
+    let mut metadata = std::fs::read_to_string(&metadata_path).expect("metadata exists");
+    let view_line = metadata
+        .lines()
+        .find(|line| !line.is_empty() && !line.starts_with('#'))
+        .expect("materialized-view metadata row")
+        .to_owned();
+    metadata.push_str(&view_line);
+    metadata.push('\n');
+    std::fs::write(&metadata_path, metadata).expect("duplicate materialized-view metadata");
+
+    let err =
+        Server::init(data_dir.path()).expect_err("duplicate materialized-view metadata rejected");
+    assert!(
+        err.to_string()
+            .contains("duplicate materialized-view metadata"),
+        "expected duplicate materialized-view metadata rejection, got {err}"
+    );
+}

@@ -5665,6 +5665,8 @@ impl Server {
             return Ok(Vec::new());
         };
         let mut records = Vec::new();
+        let mut seen_view_names = std::collections::HashSet::new();
+        let mut seen_view_oids = std::collections::HashSet::new();
         for (line_no, line) in text.lines().enumerate() {
             if line.is_empty() || line.starts_with('#') {
                 continue;
@@ -5683,6 +5685,15 @@ impl Server {
                     line_no + 1
                 ))
             })?;
+            let view_table = parts[0].to_owned();
+            if !seen_view_names.insert(view_table.to_ascii_lowercase())
+                || !seen_view_oids.insert(view_oid)
+            {
+                return Err(ServerError::Ddl(format!(
+                    "duplicate materialized-view metadata on line {}",
+                    line_no + 1
+                )));
+            }
             let source_oid = parts[3].parse::<u32>().map_err(|err| {
                 ServerError::Ddl(format!(
                     "materialized-view metadata line {} bad source oid: {err}",
@@ -5711,7 +5722,7 @@ impl Server {
                     .collect::<Result<Vec<_>, _>>()?
             };
             records.push(MaterializedViewMetadataRecord {
-                view_table: parts[0].to_owned(),
+                view_table,
                 view_oid: ultrasql_core::Oid::new(view_oid),
                 source_table: parts[2].to_owned(),
                 source_oid: ultrasql_core::Oid::new(source_oid),
