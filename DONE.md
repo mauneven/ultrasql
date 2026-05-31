@@ -2116,3 +2116,6 @@ as a concise evidence ledger; roadmap stays for open gates only.
   `usize` -> `i64` conversion instead of clamping command counts to
   `i64::MAX`. Evidence:
   `cargo test -p ultrasql-executor affected_rows --lib -- --nocapture`.
+- In-memory WAL test sink now rejects LSN allocator overflow before recording
+  a duplicate saturated LSN. Evidence:
+  `cargo test -p ultrasql-storage wal_sink::test_support::tests::append_rejects_lsn_overflow_without_recording_duplicate --lib --features testing -- --nocapture`.

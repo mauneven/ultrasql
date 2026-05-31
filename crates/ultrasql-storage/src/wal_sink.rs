@@ -172,9 +172,13 @@ pub mod test_support {
     }
 
     impl Inner {
-        const fn next(&mut self) -> Lsn {
-            self.next_lsn = self.next_lsn.saturating_add(1);
-            Lsn::new(self.next_lsn)
+        fn next(&mut self) -> Result<Lsn, WalSinkError> {
+            let next = self
+                .next_lsn
+                .checked_add(1)
+                .ok_or_else(|| WalSinkError::Rejected("in-memory WAL LSN overflow".to_owned()))?;
+            self.next_lsn = next;
+            Ok(Lsn::new(next))
         }
     }
 
@@ -210,7 +214,7 @@ pub mod test_support {
         #[allow(clippy::significant_drop_tightening)]
         fn append(&self, record: WalRecord) -> Result<Lsn, WalSinkError> {
             let mut inner = self.inner.lock();
-            let lsn = inner.next();
+            let lsn = inner.next()?;
             let xid_raw = record.header.xid.raw();
             inner.last_lsn.insert(xid_raw, lsn);
             inner.records.push((lsn, record));
@@ -234,6 +238,39 @@ pub mod test_support {
                 .get(&xid.raw())
                 .copied()
                 .unwrap_or(Lsn::ZERO)
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use ultrasql_core::{Lsn, Xid};
+        use ultrasql_wal::{RecordType, WalRecord};
+
+        use super::{InMemoryWalSink, Inner};
+        use crate::WalSink;
+
+        fn nop_record() -> WalRecord {
+            WalRecord::new(RecordType::Nop, Xid::new(7), Lsn::ZERO, 0, Vec::new())
+                .expect("test WAL record")
+        }
+
+        #[test]
+        fn append_rejects_lsn_overflow_without_recording_duplicate() {
+            let sink = InMemoryWalSink {
+                inner: parking_lot::Mutex::new(Inner {
+                    next_lsn: u64::MAX,
+                    ..Inner::default()
+                }),
+            };
+
+            let err = sink
+                .append(nop_record())
+                .expect_err("LSN overflow must not saturate");
+            assert!(matches!(err, super::WalSinkError::Rejected(_)), "{err:?}");
+            assert!(
+                sink.records().is_empty(),
+                "failed append must not record duplicate LSN"
+            );
         }
     }
 }
