@@ -157,6 +157,23 @@ fn binds_search_path_list_set_local() {
 }
 
 #[test]
+fn binds_datestyle_list_set() {
+    let plan = parse_bind_ok("SET datestyle TO SQL, DMY");
+    let LogicalPlan::SetVariable {
+        name,
+        action,
+        value,
+        ..
+    } = plan
+    else {
+        panic!("expected SetVariable");
+    };
+    assert_eq!(name, "datestyle");
+    assert_eq!(action, LogicalSetVariableAction::Set);
+    assert_eq!(value.as_deref(), Some("sql, dmy"));
+}
+
+#[test]
 fn rejects_invalid_column_privilege_specs() {
     let cat = users_catalog();
     let err = parse_and_bind("GRANT SELECT(id) ON DATABASE ultrasql TO analyst", &cat)

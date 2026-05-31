@@ -247,7 +247,7 @@ fn bind_set_var(stmt: &SetVarStmt) -> Result<LogicalPlan, PlanError> {
         ) => {
             if v.len() == 1 {
                 Some(set_value_to_string(&v[0])?)
-            } else if name == "search_path" {
+            } else if name == "search_path" || name == "datestyle" {
                 Some(
                     v.iter()
                         .map(set_search_path_value_to_string)

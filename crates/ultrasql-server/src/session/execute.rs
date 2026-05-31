@@ -128,6 +128,29 @@ fn parse_statement_timeout_ms(value: &str) -> Result<u64, ServerError> {
         .map_err(|_| ServerError::Unsupported("invalid statement_timeout"))
 }
 
+fn normalize_datestyle(value: &str) -> Result<String, ServerError> {
+    let mut style = None;
+    let mut order = None;
+    for part in value
+        .split(|ch: char| ch == ',' || ch.is_ascii_whitespace())
+        .filter(|part| !part.is_empty())
+    {
+        match part.to_ascii_lowercase().as_str() {
+            "iso" => style = Some("ISO"),
+            "postgres" => style = Some("Postgres"),
+            "sql" => style = Some("SQL"),
+            "german" => style = Some("German"),
+            "mdy" => order = Some("MDY"),
+            "dmy" => order = Some("DMY"),
+            "ymd" => order = Some("YMD"),
+            _ => return Err(ServerError::Unsupported("invalid datestyle")),
+        }
+    }
+    let style = style.unwrap_or("ISO");
+    let order = order.unwrap_or(if style == "German" { "DMY" } else { "MDY" });
+    Ok(format!("{style}, {order}"))
+}
+
 fn starts_with_keyword_pair(sql: &str, first: &str, second: &str) -> bool {
     let mut words = sql.split_whitespace();
     words
@@ -759,6 +782,10 @@ where
                 Ok(result_encoder::run_ddl_command("RESET"))
             }
             "client_encoding" => Ok(result_encoder::run_ddl_command("RESET")),
+            "datestyle" => {
+                self.session_settings.remove("datestyle");
+                Ok(result_encoder::run_ddl_command("RESET"))
+            }
             "search_path" => {
                 self.session_settings.remove("search_path");
                 Ok(result_encoder::run_ddl_command("RESET"))
@@ -830,6 +857,12 @@ where
                 "utf8" | "utf-8" | "unicode" => Ok(()),
                 _ => Err(ServerError::Unsupported("invalid client_encoding")),
             },
+            "datestyle" => {
+                let normalized = normalize_datestyle(value)?;
+                self.session_settings
+                    .insert("datestyle".to_owned(), normalized);
+                Ok(())
+            }
             "search_path" => {
                 self.session_settings
                     .insert("search_path".to_owned(), value.to_owned());
@@ -903,7 +936,11 @@ where
                 .get("client_min_messages")
                 .cloned()
                 .unwrap_or_else(|| "notice".to_owned()),
-            "datestyle" => "ISO, MDY".to_owned(),
+            "datestyle" => self
+                .session_settings
+                .get("datestyle")
+                .cloned()
+                .unwrap_or_else(|| "ISO, MDY".to_owned()),
             "intervalstyle" => self
                 .session_settings
                 .get("intervalstyle")
@@ -3190,6 +3227,9 @@ mod tests {
             .apply_session_variable("client_encoding", "UTF8")
             .expect("encoding");
         session
+            .apply_session_variable("datestyle", "SQL, DMY")
+            .expect("datestyle");
+        session
             .apply_session_variable("search_path", "app, public")
             .expect("search path");
         session
@@ -3246,6 +3286,14 @@ mod tests {
         assert_eq!(
             first_data_row_text(
                 &session
+                    .show_session_variable("datestyle", false)
+                    .expect("show datestyle")
+            ),
+            "SQL, DMY"
+        );
+        assert_eq!(
+            first_data_row_text(
+                &session
                     .show_session_variable("server_version", true)
                     .expect("show version")
             ),
@@ -3273,6 +3321,7 @@ mod tests {
                 .apply_session_variable("client_encoding", "LATIN1")
                 .is_err()
         );
+        assert!(session.apply_session_variable("datestyle", "moon").is_err());
         assert!(
             session
                 .apply_session_variable("intervalstyle", "bad")
@@ -3298,6 +3347,7 @@ mod tests {
             "application_name",
             "client_min_messages",
             "client_encoding",
+            "datestyle",
             "search_path",
             "intervalstyle",
             "lc_monetary",

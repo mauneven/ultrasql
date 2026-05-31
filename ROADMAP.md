@@ -66,8 +66,9 @@ file focused on what still blocks production.
 - `MONEY`: locale-sensitive formatting/input beyond deterministic
   `lc_monetary` GUC round trips, explicit typmod/precision edge casts, and
   range-parity evidence remain open.
-- Date/time: named time-zone database support plus broader `DateStyle` and
-  locale variants.
+- Date/time remaining: named time-zone database support plus date/time display
+  changes for non-ISO `DateStyle` and locale variants beyond current
+  `DateStyle` GUC validation / round trips.
 - Arrays: broader coercion breadth and every supported element family.
 - JSON/JSONB: full SQL/JSON path parity beyond the supported subset
   (strict/lax modes, variables, methods, full predicate algebra).

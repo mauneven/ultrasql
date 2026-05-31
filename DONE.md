@@ -625,6 +625,11 @@ as a concise evidence ledger; roadmap stays for open gates only.
 - `DATE`, `TIME`, `TIMETZ`, `TIMESTAMP`, `TIMESTAMPTZ`, and `INTERVAL` runtime
   types exist. `TIMETZ` has parser, binder, row codec, executor, COPY, catalog
   persistence, OID 1266, ISO display, casts, coercions, and offset comparison.
+- `DateStyle` now accepts and round-trips PostgreSQL-style `ISO`, `SQL`,
+  `Postgres`, `German` plus `MDY` / `DMY` / `YMD` session settings through
+  `SET`, `SHOW`, and `RESET`; non-ISO output formatting remains tracked in
+  `ROADMAP.md`. Evidence:
+  `cargo test -p ultrasql-server --test system_functions_round_trip orm_startup_runtime_parameters_round_trip`.
 - `BIT(n)` / `BIT VARYING(n)` storage, row codec, operators, wire OIDs, COPY,
   and end-to-end tests exist.
 - `INET`, `CIDR`, `MACADDR`, and `MACADDR8` storage, operators, wire OIDs,

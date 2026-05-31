@@ -67,6 +67,25 @@ async fn orm_startup_runtime_parameters_round_trip() {
     assert_eq!(row.get::<_, String>(0), "iso_8601");
 
     client
+        .batch_execute("SET datestyle TO SQL, DMY")
+        .await
+        .expect("ORM startup SET datestyle succeeds");
+    let row = client
+        .query_one("SHOW datestyle", &[])
+        .await
+        .expect("SHOW datestyle");
+    assert_eq!(row.get::<_, String>(0), "SQL, DMY");
+    client
+        .batch_execute("RESET datestyle")
+        .await
+        .expect("RESET datestyle succeeds");
+    let row = client
+        .query_one("SHOW datestyle", &[])
+        .await
+        .expect("SHOW reset datestyle");
+    assert_eq!(row.get::<_, String>(0), "ISO, MDY");
+
+    client
         .batch_execute("SET SESSION timezone TO 'UTC'")
         .await
         .expect("Rails startup SET timezone succeeds");
