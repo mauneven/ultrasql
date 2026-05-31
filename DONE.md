@@ -840,6 +840,9 @@ as a concise evidence ledger; roadmap stays for open gates only.
   the catalog snapshot, avoiding silent restart skips for tampered sidecars.
   Evidence:
   `cargo test -p ultrasql-server --test drop_restart_round_trip table_runtime_metadata_rejects_unknown_table_rows_on_rebuild -- --nocapture`.
+- Table runtime metadata reload rejects orphan constraint rows whose table OID is
+  not applied by a matching table metadata row. Evidence:
+  `cargo test -p ultrasql-server --test drop_restart_round_trip table_runtime_metadata_rejects_orphan_constraint_rows_on_rebuild -- --nocapture`.
 - Table runtime metadata reload rejects duplicate column default rows for the
   same table and column, avoiding last-row-wins restart defaults. Evidence:
   `cargo test -p ultrasql-server --test drop_restart_round_trip table_runtime_metadata_rejects_duplicate_default_rows_on_rebuild -- --nocapture`.

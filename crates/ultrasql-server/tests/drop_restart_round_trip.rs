@@ -122,6 +122,39 @@ async fn table_runtime_metadata_rejects_unknown_table_rows_on_rebuild() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn table_runtime_metadata_rejects_orphan_constraint_rows_on_rebuild() {
+    let data_dir = tempfile::TempDir::new().unwrap();
+    let metadata_path = data_dir.path().join("pg_table_runtime.meta");
+
+    let running = start_persistent_server(data_dir.path(), "table_runtime_orphan_constraint").await;
+    running
+        .client
+        .batch_execute("CREATE TABLE table_runtime_orphan (id INT, v INT DEFAULT 7)")
+        .await
+        .expect("create table with runtime metadata");
+    shutdown(running).await;
+
+    let mut metadata =
+        std::fs::read_to_string(&metadata_path).expect("table runtime metadata exists");
+    let default_line = metadata
+        .lines()
+        .find(|line| line.starts_with("default\t"))
+        .expect("default metadata row");
+    let mut parts = default_line.split('\t').collect::<Vec<_>>();
+    parts[1] = "424242";
+    metadata.push_str(&parts.join("\t"));
+    metadata.push('\n');
+    std::fs::write(&metadata_path, metadata).expect("orphan constraint metadata");
+
+    let err = Server::init(data_dir.path()).expect_err("orphan constraint metadata rejected");
+    assert!(
+        err.to_string()
+            .contains("orphan table-runtime metadata rows"),
+        "expected orphan table-runtime metadata rejection, got {err}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn table_runtime_metadata_rejects_duplicate_default_rows_on_rebuild() {
     let data_dir = tempfile::TempDir::new().unwrap();
     let metadata_path = data_dir.path().join("pg_table_runtime.meta");

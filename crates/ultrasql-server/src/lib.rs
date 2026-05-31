@@ -5149,6 +5149,22 @@ impl Server {
             }
             self.table_constraints.insert(oid, Arc::new(runtime));
         }
+        if let Some(oid) = sequence_defaults
+            .keys()
+            .chain(defaults.keys())
+            .chain(identity_always.keys())
+            .chain(generated_stored.keys())
+            .chain(checks.keys())
+            .chain(foreign_keys.keys())
+            .chain(exclusions.keys())
+            .copied()
+            .next()
+        {
+            return Err(ServerError::Ddl(format!(
+                "orphan table-runtime metadata rows on oid {}",
+                oid.raw()
+            )));
+        }
         Ok(())
     }
 
