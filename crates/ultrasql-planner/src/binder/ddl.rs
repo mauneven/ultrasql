@@ -2269,9 +2269,7 @@ pub(super) fn bind_alter_table(
     catalog: &dyn Catalog,
 ) -> Result<LogicalPlan, PlanError> {
     let table_name = object_name_simple(&s.name);
-    let meta = catalog
-        .lookup_table(&table_name)
-        .ok_or_else(|| PlanError::TableNotFound(table_name.clone()))?;
+    let meta = lookup_table_object(catalog, &s.name, &table_name)?;
     let table_schema = &meta.schema;
 
     let action = match &s.action {
@@ -2472,10 +2470,24 @@ pub(super) fn bind_truncate(
 }
 
 fn table_object_exists(catalog: &dyn Catalog, obj: &ObjectName, name: &str) -> bool {
+    lookup_table_object(catalog, obj, name).is_ok()
+}
+
+fn lookup_table_object(
+    catalog: &dyn Catalog,
+    obj: &ObjectName,
+    name: &str,
+) -> Result<TableMeta, PlanError> {
     let requested_namespace = object_name_namespace(obj);
-    catalog.lookup_table(name).is_some_and(|meta| {
-        obj.parts.len() < 2 || meta.schema_name.eq_ignore_ascii_case(&requested_namespace)
-    })
+    let meta = catalog
+        .lookup_table(name)
+        .ok_or_else(|| PlanError::TableNotFound(name.to_owned()))?;
+    if obj.parts.len() >= 2 && !meta.schema_name.eq_ignore_ascii_case(&requested_namespace) {
+        return Err(PlanError::TableNotFound(format!(
+            "{requested_namespace}.{name}"
+        )));
+    }
+    Ok(meta)
 }
 
 // ---------------------------------------------------------------------------

@@ -401,6 +401,49 @@ async fn truncate_respects_schema_qualifier() {
     shutdown(running).await;
 }
 
+#[tokio::test]
+async fn alter_table_respects_schema_qualifier() {
+    let running = start_sample_server("schema_alter_qualifier_guard").await;
+
+    running
+        .client
+        .batch_execute(
+            "CREATE SCHEMA app; \
+             CREATE TABLE guarded_alter (id INT); \
+             INSERT INTO guarded_alter VALUES (6)",
+        )
+        .await
+        .expect("create public table and separate schema");
+
+    running
+        .client
+        .batch_execute("ALTER TABLE app.guarded_alter ADD COLUMN leaked INT")
+        .await
+        .expect_err("qualified ALTER TABLE must not resolve public table");
+
+    running
+        .client
+        .query("SELECT leaked FROM guarded_alter", &[])
+        .await
+        .expect_err("public table must not gain wrong-qualified column");
+
+    let row = running
+        .client
+        .query_one("SELECT id FROM guarded_alter", &[])
+        .await
+        .expect("public table survives wrong-qualified ALTER")
+        .get::<_, i32>(0);
+    assert_eq!(row, 6);
+
+    running
+        .client
+        .batch_execute("DROP TABLE guarded_alter; DROP SCHEMA app")
+        .await
+        .expect("cleanup ALTER qualifier guard");
+
+    shutdown(running).await;
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn qualified_sequence_schema_survives_restart() {
     let data_dir = tempfile::TempDir::new().expect("temp data dir");
