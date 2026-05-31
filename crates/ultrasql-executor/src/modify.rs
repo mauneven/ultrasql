@@ -1680,9 +1680,7 @@ impl<L: PageLoader + Send + Sync + std::fmt::Debug + 'static> ModifyTable<L> {
             let Some(evaluator) = self.generated_stored.get(idx).and_then(Option::as_ref) else {
                 continue;
             };
-            row[idx] = evaluator
-                .eval(row)
-                .map_err(|e| ExecError::TypeMismatch(e.to_string()))?;
+            row[idx] = evaluator.eval(row).map_err(eval_error_to_exec_error)?;
         }
         Ok(())
     }

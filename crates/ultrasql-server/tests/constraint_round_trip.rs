@@ -349,6 +349,39 @@ async fn generated_stored_column_is_computed_and_recomputed() {
     graceful_shutdown(running).await;
 }
 
+/// Runtime errors inside generated stored expressions keep their SQLSTATE
+/// and do not insert the row.
+#[tokio::test]
+async fn generated_stored_runtime_cast_error_returns_22p02() {
+    let running = start_sample_server("constraint_generated_cast_test").await;
+    let client = &running.client;
+
+    client
+        .batch_execute(
+            "CREATE TABLE t (
+                raw TEXT,
+                v INT GENERATED ALWAYS AS (CAST(raw AS INTEGER)) STORED
+             )",
+        )
+        .await
+        .expect("create");
+
+    let err = client
+        .batch_execute("INSERT INTO t (raw) VALUES ('not-int')")
+        .await
+        .expect_err("generated stored runtime cast rejects row");
+    let sqlstate = err.code().expect("server-sent SQLSTATE present");
+    assert_eq!(sqlstate.code(), "22P02");
+
+    let rows = client
+        .query("SELECT raw, v FROM t", &[])
+        .await
+        .expect("select after rejected generated stored insert");
+    assert!(rows.is_empty());
+
+    graceful_shutdown(running).await;
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn generated_stored_column_survives_restart() {
     let data_dir = tempfile::TempDir::new().unwrap();
