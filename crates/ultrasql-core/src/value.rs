@@ -1345,6 +1345,18 @@ pub fn xml_xpath_element_fragments_with_namespaces(
         }
         return Some(vec![out]);
     }
+    if let Some(inner_path) = xml_xpath_function_argument(path, "number") {
+        let number = xml_xpath_number_function_value(inner_path, document, namespace_bindings)?;
+        return Some(vec![xml_xpath_format_number(number)]);
+    }
+    if let Some(inner_path) = xml_xpath_function_argument(path, "floor") {
+        let number = xml_xpath_number_function_value(inner_path, document, namespace_bindings)?;
+        return Some(vec![xml_xpath_format_number(number.floor())]);
+    }
+    if let Some(inner_path) = xml_xpath_function_argument(path, "ceiling") {
+        let number = xml_xpath_number_function_value(inner_path, document, namespace_bindings)?;
+        return Some(vec![xml_xpath_format_number(number.ceil())]);
+    }
     if let Some(inner_path) = xml_xpath_count_argument(path) {
         let matches =
             xml_xpath_element_fragments_with_namespaces(inner_path, document, namespace_bindings)?;
@@ -1913,6 +1925,29 @@ fn xml_xpath_first_string_value(matches: &[String]) -> String {
     matches
         .first()
         .map_or_else(String::new, |fragment| xml_xpath_string_value(fragment))
+}
+
+fn xml_xpath_number_function_value(
+    inner_path: &str,
+    document: &str,
+    namespace_bindings: &[(String, String)],
+) -> Option<f64> {
+    let matches =
+        xml_xpath_element_fragments_with_namespaces(inner_path, document, namespace_bindings)?;
+    let value = xml_xpath_first_string_value(&matches);
+    Some(value.trim().parse::<f64>().unwrap_or(f64::NAN))
+}
+
+fn xml_xpath_format_number(value: f64) -> String {
+    if value.is_nan() {
+        "NaN".to_owned()
+    } else if value.is_infinite() && value.is_sign_positive() {
+        "Infinity".to_owned()
+    } else if value.is_infinite() {
+        "-Infinity".to_owned()
+    } else {
+        value.to_string()
+    }
 }
 
 fn xml_collect_string_value(text: &str, element: &XmlElement, out: &mut String) {
@@ -3458,6 +3493,34 @@ mod tests {
                 r#"<root><first>Ada</first></root>"#
             ),
             Some(vec!["prefix-".to_owned()])
+        );
+        assert_eq!(
+            xml_xpath_element_fragments(
+                "number(/root/value)",
+                r#"<root><value> 42.5 </value></root>"#
+            ),
+            Some(vec!["42.5".to_owned()])
+        );
+        assert_eq!(
+            xml_xpath_element_fragments(
+                "floor(/root/value)",
+                r#"<root><value>42.5</value></root>"#
+            ),
+            Some(vec!["42".to_owned()])
+        );
+        assert_eq!(
+            xml_xpath_element_fragments(
+                "ceiling(/root/value)",
+                r#"<root><value>42.5</value></root>"#
+            ),
+            Some(vec!["43".to_owned()])
+        );
+        assert_eq!(
+            xml_xpath_element_fragments(
+                "number(/root/missing)",
+                r#"<root><value>42.5</value></root>"#
+            ),
+            Some(vec!["NaN".to_owned()])
         );
         let nested = r#"<root><group><item id="1"><name>A</name></item><item id="2"><name>B</name></item></group><name>C</name></root>"#;
         assert_eq!(
