@@ -97,8 +97,8 @@ fn privilege_metadata_rejects_duplicate_grant_keys_on_rebuild() {
         data_dir.path().join("pg_privileges.meta"),
         concat!(
             "# ultrasql privilege runtime v1\n",
-            "grant\ttable\tdup_acl\tanalyst\tselect\t\tultrasql\tfalse\n",
-            "grant\ttable\tdup_acl\tanalyst\tselect\t\tultrasql\ttrue\n"
+            "grant\ttable\tdup_acl\tpublic\tselect\t\tultrasql\tfalse\n",
+            "grant\ttable\tdup_acl\tpublic\tselect\t\tultrasql\ttrue\n"
         ),
     )
     .expect("write duplicate privilege metadata");
@@ -130,6 +130,58 @@ fn privilege_metadata_rejects_duplicate_default_grant_keys_on_rebuild() {
             .contains("duplicate default privilege metadata"),
         "expected duplicate default privilege metadata rejection, got {err}"
     );
+}
+
+#[test]
+fn privilege_metadata_rejects_unknown_role_refs_on_rebuild() {
+    let cases = [
+        (
+            "grant grantee",
+            "grant\ttable\tacl_target\tmissing_role\tselect\t\tultrasql\tfalse\n",
+            "missing_role",
+        ),
+        (
+            "grant grantor",
+            "grant\ttable\tacl_target\tpublic\tselect\t\tmissing_role\tfalse\n",
+            "missing_role",
+        ),
+        (
+            "default owner",
+            "default\tmissing_role\t\ttable\tpublic\tselect\tultrasql\tfalse\n",
+            "missing_role",
+        ),
+        (
+            "default grantee",
+            "default\tultrasql\t\ttable\tmissing_role\tselect\tultrasql\tfalse\n",
+            "missing_role",
+        ),
+        (
+            "default grantor",
+            "default\tultrasql\t\ttable\tpublic\tselect\tmissing_role\tfalse\n",
+            "missing_role",
+        ),
+    ];
+
+    for (case, row, role) in cases {
+        let data_dir = tempfile::TempDir::new().expect("temp data dir");
+        std::fs::write(
+            data_dir.path().join("pg_privileges.meta"),
+            format!("# ultrasql privilege runtime v1\n{row}"),
+        )
+        .expect("write privilege metadata with unknown role");
+
+        let err = match Server::init(data_dir.path()) {
+            Ok(_) => panic!("{case} should reject unknown role refs"),
+            Err(err) => err,
+        };
+        let message = err.to_string();
+        assert!(
+            message.contains("unknown privilege metadata role")
+                && message.contains(role)
+                && message.contains("line 2"),
+            "{case} expected unknown role rejection for {role}, got {message}"
+        );
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

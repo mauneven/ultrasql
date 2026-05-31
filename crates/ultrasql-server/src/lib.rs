@@ -804,6 +804,32 @@ fn parse_privilege_kind(raw: &str, line_no: usize) -> Result<auth::PrivilegeKind
     }
 }
 
+fn validate_privilege_metadata_role(
+    known_roles: &std::collections::HashSet<String>,
+    role: &str,
+    line_no: usize,
+    field: &str,
+) -> Result<(), ServerError> {
+    if known_roles.contains(&role.to_ascii_lowercase()) {
+        return Ok(());
+    }
+    Err(ServerError::ddl(format!(
+        "unknown privilege metadata role '{role}' in {field} on line {}",
+        line_no + 1
+    )))
+}
+
+fn validate_privilege_metadata_grantee(
+    known_roles: &std::collections::HashSet<String>,
+    grantee: &str,
+    line_no: usize,
+) -> Result<(), ServerError> {
+    if grantee.eq_ignore_ascii_case("public") {
+        return Ok(());
+    }
+    validate_privilege_metadata_role(known_roles, grantee, line_no, "grantee")
+}
+
 fn rls_permissiveness_name(value: RuntimeRlsPermissiveness) -> &'static str {
     match value {
         RuntimeRlsPermissiveness::Permissive => "permissive",
@@ -5406,6 +5432,12 @@ impl Server {
         let mut default_grants = Vec::new();
         let mut seen_grant_keys = std::collections::HashSet::new();
         let mut seen_default_grant_keys = std::collections::HashSet::new();
+        let known_roles = self
+            .role_catalog
+            .list_roles()
+            .into_iter()
+            .map(|role| role.name)
+            .collect::<std::collections::HashSet<_>>();
         for (line_no, line) in text.lines().enumerate() {
             if line.is_empty() || line.starts_with('#') {
                 continue;
@@ -5439,6 +5471,13 @@ impl Server {
                             line_no + 1
                         )));
                     }
+                    validate_privilege_metadata_grantee(&known_roles, &grant.grantee, line_no)?;
+                    validate_privilege_metadata_role(
+                        &known_roles,
+                        &grant.grantor,
+                        line_no,
+                        "grantor",
+                    )?;
                     grants.push(grant);
                 }
                 Some("default") if parts.len() == 8 => {
@@ -5468,6 +5507,19 @@ impl Server {
                             line_no + 1
                         )));
                     }
+                    validate_privilege_metadata_role(
+                        &known_roles,
+                        &grant.owner_role,
+                        line_no,
+                        "owner",
+                    )?;
+                    validate_privilege_metadata_grantee(&known_roles, &grant.grantee, line_no)?;
+                    validate_privilege_metadata_role(
+                        &known_roles,
+                        &grant.grantor,
+                        line_no,
+                        "grantor",
+                    )?;
                     default_grants.push(grant);
                 }
                 _ => {
