@@ -130,7 +130,7 @@ pub fn median(values: &[f64]) -> f64 {
         return 0.0;
     }
     let mut sorted = values.to_vec();
-    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    crate::sort_f64_nan_last(&mut sorted);
     let n = sorted.len();
     if n % 2 == 1 {
         sorted[n / 2]
@@ -147,7 +147,7 @@ pub fn p95(values: &[f64]) -> f64 {
         return 0.0;
     }
     let mut sorted = values.to_vec();
-    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    crate::sort_f64_nan_last(&mut sorted);
     // Nearest-rank: ceil(0.95 * n) - 1, clamped to valid range.
     let n = sorted.len();
     let rank = (95_usize * n).div_ceil(100).min(n) - 1;

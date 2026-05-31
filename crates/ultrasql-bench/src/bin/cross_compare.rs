@@ -256,7 +256,7 @@ where
 
 fn median(xs: &[f64]) -> f64 {
     let mut s = xs.to_vec();
-    s.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    ultrasql_bench::sort_f64_nan_last(&mut s);
     let n = s.len();
     if n == 0 {
         return 0.0;

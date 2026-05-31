@@ -669,7 +669,7 @@ fn merge_latest_results(
         }
         // Sort here is informational only; `build_tables` re-sorts
         // ascending (fastest first) before rendering.
-        rows.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+        rows.sort_by(|a, b| ultrasql_bench::compare_f64_nan_last(a.1, b.1));
         eprintln!(
             "readme-render: write-side {bench_id} — {} engines from latest results",
             rows.len()
@@ -763,7 +763,7 @@ fn merge_latest_raw_results(
         if rows.len() < 2 {
             continue;
         }
-        rows.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+        rows.sort_by(|a, b| ultrasql_bench::compare_f64_nan_last(a.1, b.1));
         write_side.insert(workload.to_string(), rows);
     }
     for workload in raw_firebolt_generic_ids {
@@ -775,7 +775,7 @@ fn merge_latest_raw_results(
             entry.retain(|(existing_engine, _)| existing_engine != &engine);
             entry.push((engine, latency_us));
         }
-        entry.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+        entry.sort_by(|a, b| ultrasql_bench::compare_f64_nan_last(a.1, b.1));
     }
 }
 
@@ -840,7 +840,7 @@ fn build_tables(
         // slowest row sets the scale for the ASCII relative-time bar
         // rendered alongside each engine.
         rows.retain(|(engine, _)| is_publishable_readme_row(engine));
-        rows.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+        rows.sort_by(|a, b| ultrasql_bench::compare_f64_nan_last(a.1, b.1));
 
         let table = render_table(static_table.heading, &rows);
         tables.insert(static_table.id.to_string(), table);

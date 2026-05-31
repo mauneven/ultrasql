@@ -1427,6 +1427,13 @@ as a concise evidence ledger; roadmap stays for open gates only.
 
 - Benchmark policy: published claims must trace to committed scripts, raw
   artifacts, and recorded host descriptions.
+- Benchmark latency/result sorting now uses a shared NaN-last helper across the
+  registry, TPC-B/TPC-C/Sysbench/TPC-H helpers, cross-compare binaries,
+  result rendering, and README rendering, so invalid competitor or harness
+  samples cannot be silently treated as equal while computing medians,
+  percentiles, or rankings. Evidence:
+  `cargo test -p ultrasql-bench --lib -- --nocapture` and
+  `cargo clippy -p ultrasql-bench --all-targets --all-features -- -D warnings`.
 - SQL-surface benchmark work made UltraSQL lead the tracked low-tier workloads
   in the committed matrix; no blanket claim is allowed beyond recorded
   artifacts.

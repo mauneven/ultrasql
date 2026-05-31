@@ -789,7 +789,7 @@ async fn main() -> Result<()> {
     }
 
     // Compute median + min.
-    iters_us.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    ultrasql_bench::sort_f64_nan_last(&mut iters_us);
     let median_us = iters_us[iters_us.len() / 2];
     let min_us = iters_us[0];
     let p50_latency_us = percentile_nearest_rank(&iters_us, 0.50);
@@ -1359,7 +1359,7 @@ async fn simple_count(client: &tokio_postgres::Client, sql: &str) -> Result<i64>
 }
 
 fn sorted_f64(mut values: Vec<f64>) -> Vec<f64> {
-    values.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    ultrasql_bench::sort_f64_nan_last(&mut values);
     values
 }
 

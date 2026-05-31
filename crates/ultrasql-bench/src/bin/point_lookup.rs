@@ -153,7 +153,7 @@ fn median_f64(xs: &[f64]) -> f64 {
         return 0.0;
     }
     let mut s = xs.to_vec();
-    s.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    ultrasql_bench::sort_f64_nan_last(&mut s);
     let n = s.len();
     if n % 2 == 1 {
         s[n / 2]

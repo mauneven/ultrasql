@@ -49,7 +49,7 @@ async fn run(args: TpcbArgs) -> Result<()> {
     checker.shutdown();
 
     let mut latencies = measured.latency_us;
-    latencies.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    ultrasql_bench::sort_f64_nan_last(&mut latencies);
     let elapsed_secs = measured.elapsed.as_secs_f64();
     let throughput_per_sec = if elapsed_secs > 0.0 {
         measured.transactions as f64 / elapsed_secs

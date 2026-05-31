@@ -212,7 +212,7 @@ fn load_raw_file(path: &Path) -> Result<(String, String, EngineResult)> {
         samples: record.samples,
         iterations_us: {
             let mut v = record.iterations_us;
-            v.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+            ultrasql_bench::sort_f64_nan_last(&mut v);
             v
         },
         extras,

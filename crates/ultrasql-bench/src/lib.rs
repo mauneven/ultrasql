@@ -24,8 +24,30 @@
     reason = "bench harness: deterministic synthetic data + iteration math; no impact on engine crates"
 )]
 
+use std::cmp::Ordering;
+
 pub mod ai_gauntlet;
 pub mod ann_vector;
 pub mod registry;
 pub mod runs;
 pub mod tpch;
+
+/// Compare benchmark floating-point samples with NaN sorted after finite values.
+///
+/// Benchmark artifacts can contain `NaN` when a competitor reports an invalid
+/// metric. Sorting those samples as equal hides the bad value inside medians and
+/// rendered rankings, so report code uses this deterministic order everywhere.
+#[must_use]
+pub fn compare_f64_nan_last(left: f64, right: f64) -> Ordering {
+    match (left.is_nan(), right.is_nan()) {
+        (true, true) => Ordering::Equal,
+        (true, false) => Ordering::Greater,
+        (false, true) => Ordering::Less,
+        (false, false) => left.partial_cmp(&right).unwrap_or(Ordering::Equal),
+    }
+}
+
+/// Sort benchmark floating-point samples with invalid values last.
+pub fn sort_f64_nan_last(values: &mut [f64]) {
+    values.sort_by(|left, right| compare_f64_nan_last(*left, *right));
+}

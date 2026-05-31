@@ -403,7 +403,7 @@ pub fn median_f64(values: &[f64]) -> f64 {
         return 0.0;
     }
     let mut sorted = values.to_vec();
-    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    crate::sort_f64_nan_last(&mut sorted);
     let n = sorted.len();
     if n % 2 == 1 {
         sorted[n / 2]
@@ -421,7 +421,7 @@ pub fn p99_f64(values: &[f64]) -> f64 {
         return 0.0;
     }
     let mut sorted = values.to_vec();
-    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    crate::sort_f64_nan_last(&mut sorted);
     let n = sorted.len();
     let rank = (99_usize * n).div_ceil(100).min(n) - 1;
     sorted[rank]
@@ -1043,6 +1043,12 @@ mod tests {
     #[test]
     fn median_f64_even() {
         assert!((median_f64(&[1.0, 3.0, 2.0, 4.0]) - 2.5).abs() < 1e-9);
+    }
+
+    #[test]
+    fn median_f64_orders_nan_after_finite_samples() {
+        let negative_nan = f64::from_bits(0xfff8_0000_0000_0000);
+        assert_eq!(median_f64(&[negative_nan, 1.0, 2.0]), 2.0);
     }
 
     #[test]
