@@ -912,6 +912,24 @@ fn parse_rls_command(value: &str) -> Result<RuntimeRlsCommand, ServerError> {
     }
 }
 
+fn validate_rls_metadata_policy_roles(
+    known_roles: &std::collections::HashSet<String>,
+    roles: &mut [String],
+    line_no: usize,
+) -> Result<(), ServerError> {
+    for role in roles {
+        *role = role.to_ascii_lowercase();
+        if role == "public" || known_roles.contains(role.as_str()) {
+            continue;
+        }
+        return Err(ServerError::Ddl(format!(
+            "unknown RLS policy role '{role}' on line {}",
+            line_no + 1
+        )));
+    }
+    Ok(())
+}
+
 fn rls_expr_fields(expr: Option<&RuntimeTenantPolicyExpr>) -> (String, String, String) {
     expr.map_or_else(
         || (String::new(), String::new(), String::new()),
@@ -5775,6 +5793,12 @@ impl Server {
             std::collections::HashMap::new();
         let mut seen_table_oids = std::collections::HashSet::new();
         let mut seen_policy_keys = std::collections::HashSet::new();
+        let known_roles = self
+            .role_catalog
+            .list_roles()
+            .into_iter()
+            .map(|role| role.name)
+            .collect::<std::collections::HashSet<_>>();
         for (line_no, line) in text.lines().enumerate() {
             if line.is_empty() || line.starts_with('#') {
                 continue;
@@ -5828,11 +5852,12 @@ impl Server {
                             line_no + 1
                         )));
                     }
-                    let roles = if parts.len() == 12 {
+                    let mut roles = if parts.len() == 12 {
                         metadata_decode_list(&metadata_unescape(parts[11])?)?
                     } else {
                         Vec::new()
                     };
+                    validate_rls_metadata_policy_roles(&known_roles, &mut roles, line_no)?;
                     let policy = RuntimeRlsPolicy {
                         name: policy_name,
                         permissiveness: parse_rls_permissiveness(parts[3])?,
