@@ -3683,9 +3683,10 @@ fn timezone_return_type(args: &[ScalarExpr]) -> Result<DataType, PlanError> {
     match args[1].data_type() {
         DataType::Timestamp => Ok(DataType::TimestampTz),
         DataType::TimestampTz => Ok(DataType::Timestamp),
+        DataType::TimeTz => Ok(DataType::TimeTz),
         DataType::Null => Ok(DataType::Null),
         other => Err(PlanError::TypeMismatch(format!(
-            "timezone: source must be timestamp or timestamptz, got {other}"
+            "timezone: source must be timestamp, timestamptz, or timetz, got {other}"
         ))),
     }
 }

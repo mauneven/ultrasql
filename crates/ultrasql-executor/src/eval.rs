@@ -31,8 +31,8 @@ use num_traits::ToPrimitive;
 use serde_json::{Map as JsonMap, Number as JsonNumber, Value as JsonValue};
 use ultrasql_core::{
     DataType, Oid, SparseVector, Value, bpchar_semantic_text, parse_money_text,
-    timestamp_micros_at_timezone, timestamptz_display_in_timezone, timetz_utc_micros,
-    xml_content_is_well_formed, xml_document_is_well_formed,
+    timestamp_micros_at_timezone, timestamptz_display_in_timezone, timetz_at_timezone,
+    timetz_utc_micros, xml_content_is_well_formed, xml_document_is_well_formed,
     xml_xpath_element_fragments_with_namespaces,
 };
 use ultrasql_planner::{BinaryOp, ScalarExpr, UnaryOp, catalog::builtin_type_oid};
@@ -3573,9 +3573,18 @@ fn eval_timezone(args: &[Value]) -> Result<Value, EvalError> {
         Value::TimestampTz(micros) => timestamptz_display_in_timezone(*micros, zone)
             .map(|display| Value::Timestamp(display.local_micros))
             .ok_or_else(|| EvalError::Type("timezone: invalid timezone conversion".to_owned())),
+        Value::TimeTz {
+            micros,
+            offset_seconds,
+        } => timetz_at_timezone(*micros, *offset_seconds, zone)
+            .map(|(micros, offset_seconds)| Value::TimeTz {
+                micros,
+                offset_seconds,
+            })
+            .ok_or_else(|| EvalError::Type("timezone: invalid timezone conversion".to_owned())),
         Value::Null => Ok(Value::Null),
         other => Err(EvalError::Type(format!(
-            "timezone: argument 2 must be timestamp or timestamptz, got {:?}",
+            "timezone: argument 2 must be timestamp, timestamptz, or timetz, got {:?}",
             other.data_type()
         ))),
     }
@@ -7395,6 +7404,28 @@ mod tests {
             .eval(&[])
             .expect("timestamptz AT TIME ZONE evaluates"),
             Value::Timestamp(local_noon)
+        );
+        assert_eq!(
+            Eval::new(call(
+                "timezone",
+                vec![
+                    lit_text("UTC"),
+                    ScalarExpr::Literal {
+                        value: Value::TimeTz {
+                            micros: 14_706_000_000,
+                            offset_seconds: -18_000,
+                        },
+                        data_type: DataType::TimeTz,
+                    },
+                ],
+                DataType::TimeTz,
+            ))
+            .eval(&[])
+            .expect("timetz AT TIME ZONE evaluates"),
+            Value::TimeTz {
+                micros: 32_706_000_000,
+                offset_seconds: 0,
+            }
         );
 
         let bits = Value::BitString(BitString::parse("1010").expect("bits"));

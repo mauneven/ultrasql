@@ -71,9 +71,9 @@ file focused on what still blocks production.
   `lc_monetary` GUC round trips, explicit typmod/precision edge casts, and
   range-parity evidence remain open.
 - Date/time remaining: timezone conversion breadth and locale variants beyond
-  the completed timestamp/timestamptz `AT TIME ZONE`, `TIMESTAMPTZ` IANA
-  parser/session display, non-ISO `DateStyle` display, and date-prefixed
-  `TIMETZ` named-zone parser.
+  the completed timestamp/timestamptz `AT TIME ZONE`, fixed-offset
+  `TIMETZ AT TIME ZONE`, `TIMESTAMPTZ` IANA parser/session display, non-ISO
+  `DateStyle` display, and date-prefixed `TIMETZ` named-zone parser.
 - Arrays: broader coercion breadth and every supported element family beyond
   the completed metadata/scalar/mutation subset.
 - JSON/JSONB: full SQL/JSON path parity beyond the supported subset, including

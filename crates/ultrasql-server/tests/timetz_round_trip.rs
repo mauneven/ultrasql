@@ -149,7 +149,8 @@ async fn timetz_and_temporal_display_round_trip() {
         .simple_query(
             "SELECT \
                 TIMESTAMP '2000-07-01 12:00:00' AT TIME ZONE 'America/New_York', \
-                TIMESTAMP WITH TIME ZONE '2000-07-01 16:00:00+00' AT TIME ZONE 'America/New_York'",
+                TIMESTAMP WITH TIME ZONE '2000-07-01 16:00:00+00' AT TIME ZONE 'America/New_York', \
+                TIME WITH TIME ZONE '04:05:06-05' AT TIME ZONE 'UTC'",
         )
         .await
         .expect("select AT TIME ZONE conversions");
@@ -157,7 +158,7 @@ async fn timetz_and_temporal_display_round_trip() {
         .into_iter()
         .filter_map(|message| match message {
             SimpleQueryMessage::Row(row) => Some(
-                (0..2)
+                (0..3)
                     .map(|idx| row.get(idx).expect("column").to_owned())
                     .collect(),
             ),
@@ -169,6 +170,7 @@ async fn timetz_and_temporal_display_round_trip() {
         vec![vec![
             "2000-07-01 16:00:00+00".to_owned(),
             "2000-07-01 12:00:00".to_owned(),
+            "09:05:06+00".to_owned(),
         ]]
     );
 

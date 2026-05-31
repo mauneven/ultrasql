@@ -3166,6 +3166,22 @@ pub fn timestamp_micros_at_timezone(micros: i64, timezone: &str) -> Option<i64> 
     micros.checked_sub(i64::from(offset_seconds).checked_mul(MICROS_PER_SECOND)?)
 }
 
+/// Convert `TIMETZ` time-of-day plus offset into a fixed target timezone.
+#[must_use]
+pub fn timetz_at_timezone(
+    micros: i64,
+    source_offset_seconds: i32,
+    timezone: &str,
+) -> Option<(i64, i32)> {
+    let target_offset_seconds = parse_timezone_offset(timezone.trim())?;
+    let utc_micros =
+        micros.checked_sub(i64::from(source_offset_seconds).checked_mul(MICROS_PER_SECOND)?)?;
+    let target_micros = utc_micros
+        .checked_add(i64::from(target_offset_seconds).checked_mul(MICROS_PER_SECOND)?)?
+        .rem_euclid(MICROS_PER_DAY);
+    Some((target_micros, target_offset_seconds))
+}
+
 /// Format a UTC offset in PostgreSQL text form.
 #[must_use]
 pub fn format_timezone_offset_seconds(offset_seconds: i32) -> String {
