@@ -1196,8 +1196,9 @@ pub fn xml_content_is_well_formed(text: &str) -> bool {
 /// Supported paths are absolute child paths such as `/root/item/name` with
 /// optional equality filters on element attributes:
 /// `/root/item[@id="42"]`. Element wildcards, terminal `@attr`/`@*`, and
-/// `text()` selections are also supported. Unsupported path syntax returns
-/// `None`. Missing matches return `Some(Vec::new())`.
+/// `text()` selections are also supported, plus `count(/supported/path)`.
+/// Unsupported path syntax returns `None`. Missing matches return
+/// `Some(Vec::new())`.
 #[must_use]
 pub fn xml_xpath_element_fragments(path: &str, document: &str) -> Option<Vec<String>> {
     xml_xpath_element_fragments_with_namespaces(path, document, &[])
@@ -1218,6 +1219,11 @@ pub fn xml_xpath_element_fragments_with_namespaces(
     let document = document.trim();
     if !xml_document_is_well_formed(document) {
         return None;
+    }
+    if let Some(inner_path) = xml_xpath_count_argument(path) {
+        let matches =
+            xml_xpath_element_fragments_with_namespaces(inner_path, document, namespace_bindings)?;
+        return Some(vec![matches.len().to_string()]);
     }
     let steps = parse_xml_path(path)?;
     let root = xml_root_element(document)?;
@@ -1306,6 +1312,15 @@ pub fn xml_xpath_element_fragments_with_namespaces(
             .map(|element| document[element.open_start..element.close_end].to_owned())
             .collect(),
     )
+}
+
+fn xml_xpath_count_argument(path: &str) -> Option<&str> {
+    let inner = path
+        .trim()
+        .strip_prefix("count(")?
+        .strip_suffix(')')?
+        .trim();
+    inner.starts_with('/').then_some(inner)
 }
 
 #[derive(Clone, Debug)]
@@ -2892,6 +2907,10 @@ mod tests {
         assert_eq!(
             xml_xpath_element_fragments("/root/*/@*", doc),
             Some(vec!["1".to_owned(), "2".to_owned()])
+        );
+        assert_eq!(
+            xml_xpath_element_fragments("count(/root/item)", doc),
+            Some(vec!["2".to_owned()])
         );
         let nested = r#"<root><group><item id="1"><name>A</name></item><item id="2"><name>B</name></item></group><name>C</name></root>"#;
         assert_eq!(
