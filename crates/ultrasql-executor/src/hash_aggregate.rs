@@ -488,10 +488,10 @@ impl HashAggregate {
                     .aggregates
                     .iter()
                     .map(|agg| finalise(&init_state_for(agg)))
-                    .collect();
+                    .collect::<Result<_, _>>()?;
                 return Ok(vec![identity]);
             }
-            let row: Vec<Value> = states.iter().map(finalise).collect();
+            let row: Vec<Value> = states.iter().map(finalise).collect::<Result<_, _>>()?;
             return Ok(vec![row]);
         }
 
@@ -554,7 +554,7 @@ impl HashAggregate {
                 .aggregates
                 .iter()
                 .map(|agg| finalise(&init_state_for(agg)))
-                .collect();
+                .collect::<Result<_, _>>()?;
             return Ok(vec![identity]);
         }
 
@@ -563,7 +563,7 @@ impl HashAggregate {
         for (key, states) in table {
             let mut row = key.into_values(); // group key values first
             for state in &states {
-                row.push(finalise(state));
+                row.push(finalise(state)?);
             }
             output.push(row);
         }
@@ -681,7 +681,7 @@ impl HashAggregate {
             for (key, states) in table {
                 let mut row = key.into_values();
                 for state in &states {
-                    row.push(finalise(state));
+                    row.push(finalise(state)?);
                 }
                 output.push(row);
             }
@@ -1891,48 +1891,49 @@ fn value_as_f64(v: &Value) -> Option<f64> {
 }
 
 /// Finalise an [`AggState`] into its result [`Value`].
-fn finalise(state: &AggState) -> Value {
+fn finalise(state: &AggState) -> Result<Value, ExecError> {
     match state {
         AggState::Distinct { inner, .. } => finalise(inner),
-        AggState::CountStar(n) | AggState::Count(n) => Value::Int64(*n),
+        AggState::CountStar(n) | AggState::Count(n) => Ok(Value::Int64(*n)),
         AggState::Sum(acc) | AggState::Min(acc) | AggState::Max(acc) => {
-            acc.clone().unwrap_or(Value::Null)
+            Ok(acc.clone().unwrap_or(Value::Null))
         }
         AggState::Avg(sum, cnt) => {
             if *cnt == 0 {
-                return Value::Null;
+                return Ok(Value::Null);
             }
-            sum.as_ref()
-                .map_or(Value::Null, |s| divide_value(s.clone(), *cnt))
+            Ok(sum
+                .as_ref()
+                .map_or(Value::Null, |s| divide_value(s.clone(), *cnt)))
         }
-        AggState::BoolAnd(b) | AggState::BoolOr(b) => b.map_or(Value::Null, Value::Bool),
+        AggState::BoolAnd(b) | AggState::BoolOr(b) => Ok(b.map_or(Value::Null, Value::Bool)),
         AggState::StringAgg(parts, sep) => {
             if parts.is_empty() {
-                Value::Null
+                Ok(Value::Null)
             } else {
-                Value::Text(parts.join(sep))
+                Ok(Value::Text(parts.join(sep)))
             }
         }
         AggState::ArrayAgg(items) => {
             if items.is_empty() {
-                Value::Null
+                Ok(Value::Null)
             } else {
                 let element_type = items
                     .iter()
                     .find(|v| !v.is_null())
                     .map(Value::data_type)
                     .unwrap_or(DataType::Null);
-                Value::Array {
+                Ok(Value::Array {
                     element_type,
                     elements: items.clone(),
-                }
+                })
             }
         }
         AggState::JsonAgg(items) => {
             if items.is_empty() {
-                Value::Null
+                Ok(Value::Null)
             } else {
-                Value::Jsonb(json_agg_text(items))
+                Ok(Value::Jsonb(json_agg_text(items)))
             }
         }
         AggState::Corr {
@@ -1944,7 +1945,7 @@ fn finalise(state: &AggState) -> Value {
             sum_y2,
         } => {
             if *count < 2 {
-                return Value::Null;
+                return Ok(Value::Null);
             }
             let n = *count as f64;
             let numerator = n.mul_add(*sum_xy, -(*sum_x * *sum_y));
@@ -1952,9 +1953,9 @@ fn finalise(state: &AggState) -> Value {
             let y_term = n.mul_add(*sum_y2, -(*sum_y * *sum_y));
             let denominator = (x_term * y_term).sqrt();
             if denominator == 0.0 {
-                Value::Null
+                Ok(Value::Null)
             } else {
-                Value::Float64(numerator / denominator)
+                Ok(Value::Float64(numerator / denominator))
             }
         }
         AggState::Welford {
@@ -1971,16 +1972,16 @@ fn finalise(state: &AggState) -> Value {
             let n = *count;
             let denom = if *sample { n - 1 } else { n };
             if denom <= 0 {
-                return Value::Null;
+                return Ok(Value::Null);
             }
             let var = m2 / denom as f64;
-            Value::Float64(if *sqrt { var.sqrt() } else { var })
+            Ok(Value::Float64(if *sqrt { var.sqrt() } else { var }))
         }
         AggState::PercentileCont {
             values,
             fraction,
             asc,
-        } => finalise_percentile_cont(values, *fraction, *asc),
+        } => Ok(finalise_percentile_cont(values, *fraction, *asc)),
         AggState::PercentileDisc {
             values,
             fraction,
@@ -1998,7 +1999,7 @@ fn finalise_percentile_cont(values: &[f64], fraction: Option<f64>, asc: bool) ->
         return Value::Null;
     }
     let mut sorted = values.to_vec();
-    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    sorted.sort_by(f64::total_cmp);
     if !asc {
         sorted.reverse();
     }
@@ -2037,16 +2038,18 @@ fn finalise_percentile_disc(
     fraction: Option<f64>,
     asc: bool,
     nulls_first: bool,
-) -> Value {
+) -> Result<Value, ExecError> {
     let Some(fraction) = fraction else {
-        return Value::Null;
+        return Ok(Value::Null);
     };
     if values.is_empty() {
-        return Value::Null;
+        return Ok(Value::Null);
     }
     let mut sorted = values.to_vec();
+    validate_percentile_disc_values(&sorted, nulls_first)?;
     sorted.sort_by(|a, b| {
-        let ord = crate::sort::compare_values_nullable(a, b, nulls_first);
+        let ord = crate::sort::try_compare_values_nullable(a, b, nulls_first)
+            .unwrap_or(std::cmp::Ordering::Equal);
         if asc { ord } else { ord.reverse() }
     });
     #[allow(
@@ -2056,7 +2059,23 @@ fn finalise_percentile_disc(
         reason = "percentile_disc arithmetic; idx bounded by ceil(frac * len) <= len"
     )]
     let idx = (fraction * sorted.len() as f64).ceil() as usize;
-    sorted[idx.saturating_sub(1).min(sorted.len() - 1)].clone()
+    Ok(sorted[idx.saturating_sub(1).min(sorted.len() - 1)].clone())
+}
+
+fn validate_percentile_disc_values(values: &[Value], nulls_first: bool) -> Result<(), ExecError> {
+    let mut first_non_null: Option<&Value> = None;
+    for value in values {
+        if value.is_null() {
+            continue;
+        }
+        if let Some(first) = first_non_null {
+            crate::sort::try_compare_values_nullable(first, value, nulls_first)?;
+        } else {
+            crate::sort::try_compare_values_nullable(value, value, nulls_first)?;
+            first_non_null = Some(value);
+        }
+    }
+    Ok(())
 }
 
 fn json_agg_text(items: &[Value]) -> String {
@@ -2622,11 +2641,11 @@ mod tests {
             AggState::Max(None),
         ];
         vectorized_step(&plan, &batch, &mut states).expect("vectorized step");
-        assert_eq!(finalise(&states[0]), Value::Int64(4));
-        assert_eq!(finalise(&states[1]), Value::Int64(3));
-        assert_eq!(finalise(&states[2]), Value::Int64(80));
-        assert_eq!(finalise(&states[4]), Value::Int64(10));
-        assert_eq!(finalise(&states[5]), Value::Int64(40));
+        assert_eq!(finalise(&states[0]).expect("count star"), Value::Int64(4));
+        assert_eq!(finalise(&states[1]).expect("count"), Value::Int64(3));
+        assert_eq!(finalise(&states[2]).expect("sum"), Value::Int64(80));
+        assert_eq!(finalise(&states[4]).expect("min"), Value::Int64(10));
+        assert_eq!(finalise(&states[5]).expect("max"), Value::Int64(40));
 
         assert!(
             build_vectorized_plan(&[LogicalAggregateExpr {
@@ -2901,6 +2920,48 @@ mod tests {
             .expect_err("percentile order division must error");
         assert!(
             err.to_string().contains("division by zero"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn hash_agg_percentile_disc_rejects_unsupported_order_value() {
+        let scan = MemTableScan::new(
+            schema_group_val(),
+            vec![make_batch_i32_i64(&[(1, 10), (2, 20)])],
+        );
+        let array_expr = ScalarExpr::Literal {
+            value: Value::Array {
+                element_type: DataType::Int32,
+                elements: vec![Value::Int32(1)],
+            },
+            data_type: DataType::Array(Box::new(DataType::Int32)),
+        };
+        let out_schema = Schema::new([Field::nullable(
+            "p",
+            DataType::Array(Box::new(DataType::Int32)),
+        )])
+        .expect("schema ok");
+        let agg = LogicalAggregateExpr {
+            func: AggregateFunc::PercentileDisc,
+            arg: Some(array_expr.clone()),
+            direct_arg: Some(lit_f64(0.5)),
+            order_by: Some(SortKey {
+                expr: array_expr,
+                asc: true,
+                nulls_first: false,
+            }),
+            distinct: false,
+            output_name: "p".into(),
+            data_type: DataType::Array(Box::new(DataType::Int32)),
+        };
+        let mut op = HashAggregate::new(Box::new(scan), vec![], vec![agg], out_schema);
+
+        let err = op
+            .next_batch()
+            .expect_err("unsupported percentile_disc key must surface");
+        assert!(
+            err.to_string().contains("not orderable"),
             "unexpected error: {err}"
         );
     }
@@ -3313,7 +3374,7 @@ mod tests {
         accumulate_sum(&mut acc, &all_null_col).expect("sum ok");
         assert!(acc.is_none(), "all-NULL accumulator must stay None");
         let state = AggState::Sum(acc);
-        assert_eq!(finalise(&state), Value::Null);
+        assert_eq!(finalise(&state).expect("sum finalise"), Value::Null);
     }
 
     /// Test 2: AVG(i32) over 4096 rows. The vectorised path widens the i32

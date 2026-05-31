@@ -248,6 +248,13 @@ as a concise evidence ledger; roadmap stays for open gates only.
   silently treating them as NULL. Evidence:
   `cargo test -p ultrasql-executor hash_aggregate` and
   `cargo test -p ultrasql-executor sort_aggregate`.
+- `PERCENTILE_DISC` finalization now uses checked scalar ordering and reports
+  unsupported ordered-set value families as typed executor errors instead of
+  silently treating them as equal. `PERCENTILE_CONT` now uses deterministic
+  `f64::total_cmp` ordering instead of `partial_cmp(...).unwrap_or(Equal)`.
+  Evidence:
+  `cargo test -p ultrasql-executor hash_aggregate --lib -- --nocapture` and
+  `cargo clippy -p ultrasql-executor --all-targets --all-features -- -D warnings`.
 - `HashJoin` and `MergeJoin` now propagate join-key evaluation failures instead
   of silently treating them as NULL non-matches. Evidence:
   `cargo test -p ultrasql-executor hash_join` and
