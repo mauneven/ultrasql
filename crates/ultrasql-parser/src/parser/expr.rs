@@ -325,6 +325,12 @@ impl<'src> Parser<'src> {
                         text: raw.to_owned(),
                         offset: t.span.start as usize,
                     })?;
+                if n == 0 {
+                    return Err(ParseError::ParameterOutOfRange {
+                        text: raw.to_owned(),
+                        offset: t.span.start as usize,
+                    });
+                }
                 Ok(Expr::Parameter {
                     index: n,
                     span: t.span,

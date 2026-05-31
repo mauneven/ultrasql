@@ -91,6 +91,8 @@ as a concise evidence ledger; roadmap stays for open gates only.
   preservation. Package `cargo llvm-cov` plus
   `scripts/coverage_gate.py --min-lines 80` clears `ultrasql-server` at
   80.06%. Evidence: `docs/testing/coverage-evidence-2026-05-29-server.md`.
+- Parser parameter validation now rejects `$0` before binding so extended-query
+  substitution cannot receive an invalid zero-based placeholder.
 - Focused `ultrasql-executor` coverage now exercises scalar compatibility
   functions, physical lowering edge families, row encoding/decoding,
   projection/filter/sort/unique/set/window/hash aggregate behavior, modify-table

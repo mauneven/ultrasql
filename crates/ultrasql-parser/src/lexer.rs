@@ -519,8 +519,8 @@ impl<'src> Lexer<'src> {
                         break;
                     }
                 }
-                // $0 is valid in PostgreSQL (no semantic meaning) — we
-                // accept it; the binder catches misuse.
+                // Numeric validity is checked by the parser; the lexer
+                // only preserves the token span and source text.
                 Ok(Token::new(
                     TokenKind::Parameter,
                     Span::from_usize(start, self.pos),

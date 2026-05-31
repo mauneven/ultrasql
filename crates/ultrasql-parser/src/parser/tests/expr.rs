@@ -218,6 +218,15 @@ fn parameter_token() {
     assert!(matches!(expr, Expr::Parameter { index: 1, .. }));
 }
 
+#[test]
+fn parameter_zero_rejected() {
+    let err = parse_err("$0");
+    assert!(
+        matches!(err, ParseError::ParameterOutOfRange { ref text, .. } if text == "$0"),
+        "unexpected error: {err}"
+    );
+}
+
 // ── CASE expressions ────────────────────────────────────────────────────
 
 #[test]
