@@ -535,6 +535,11 @@ fn to_f64(v: &Value) -> Option<f64> {
     }
 }
 
+fn checked_sum_i64(acc: i64, delta: i64, context: &str) -> Result<i64, ExecError> {
+    acc.checked_add(delta)
+        .ok_or_else(|| ExecError::NumericFieldOverflow(format!("{context} overflow")))
+}
+
 fn add_values(a: Value, b: Value) -> Result<Value, ExecError> {
     match (a, b) {
         (
@@ -549,7 +554,9 @@ fn add_values(a: Value, b: Value) -> Result<Value, ExecError> {
         ) => add_decimal_values(x, xs, y, ys),
         (Value::Int16(x), Value::Int16(y)) => Ok(Value::Int64(i64::from(x) + i64::from(y))),
         (Value::Int32(x), Value::Int32(y)) => Ok(Value::Int64(i64::from(x) + i64::from(y))),
-        (Value::Int64(x), Value::Int64(y)) => Ok(Value::Int64(x.wrapping_add(y))),
+        (Value::Int64(x), Value::Int64(y)) => {
+            checked_sum_i64(x, y, "SortAggregate SUM(BIGINT)").map(Value::Int64)
+        }
         (Value::Float32(x), Value::Float32(y)) => Ok(Value::Float64(f64::from(x) + f64::from(y))),
         (Value::Float64(x), Value::Float64(y)) => Ok(Value::Float64(x + y)),
         (Value::Vector(x), Value::Vector(y)) => {
@@ -1126,6 +1133,32 @@ mod tests {
         let rows = drain_all(&mut op);
 
         assert_eq!(rows, vec![vec![Value::Int64(7)]]);
+    }
+
+    #[test]
+    fn sort_agg_sum_i64_overflow_returns_typed_error() {
+        let scan = MemTableScan::new(
+            schema_group_val(),
+            vec![make_batch(&[(0, i64::MAX), (0, 1)])],
+        );
+        let out_schema =
+            Schema::new([Field::required("total", DataType::Int64)]).expect("schema ok");
+        let sum_expr = agg(
+            AggregateFunc::Sum,
+            Some(col("val", 1, DataType::Int64)),
+            "total",
+            DataType::Int64,
+        );
+        let mut op = SortAggregate::new(Box::new(scan), vec![], vec![sum_expr], out_schema);
+
+        let err = op
+            .next_batch()
+            .expect_err("SortAggregate SUM(BIGINT) overflow must not wrap");
+
+        assert!(
+            matches!(err, crate::ExecError::NumericFieldOverflow(_)),
+            "{err:?}"
+        );
     }
 
     #[test]
