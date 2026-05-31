@@ -150,6 +150,68 @@ async fn non_owner_cannot_drop_schema() {
 }
 
 #[tokio::test]
+async fn schema_create_privilege_gates_qualified_object_ddl() {
+    let running = start_sample_server("schema_create_privilege_guard").await;
+
+    running
+        .client
+        .batch_execute(
+            "CREATE ROLE tester SUPERUSER LOGIN; \
+             CREATE ROLE schema_owner LOGIN; \
+             CREATE ROLE schema_writer LOGIN; \
+             CREATE ROLE schema_intruder LOGIN; \
+             SET ROLE schema_owner; \
+             CREATE SCHEMA private_ddl; \
+             RESET ROLE",
+        )
+        .await
+        .expect("create private schema and roles");
+
+    let (intruder, intruder_conn) =
+        connect_as(running.bound, "schema_intruder", "schema_create_intruder").await;
+    let err = intruder
+        .batch_execute("CREATE TABLE private_ddl.stolen (id INT)")
+        .await
+        .expect_err("non-owner without CREATE cannot create in schema");
+    assert_eq!(err.code().expect("SQLSTATE").code(), "42501");
+    drop(intruder);
+    intruder_conn.await.expect("intruder connection joins");
+
+    running
+        .client
+        .batch_execute("GRANT CREATE ON SCHEMA private_ddl TO schema_writer")
+        .await
+        .expect("grant create on schema");
+
+    let (writer, writer_conn) =
+        connect_as(running.bound, "schema_writer", "schema_create_writer").await;
+    writer
+        .batch_execute(
+            "CREATE TABLE private_ddl.allowed (id INT); \
+             CREATE SEQUENCE private_ddl.allowed_seq",
+        )
+        .await
+        .expect("granted role can create qualified objects");
+    drop(writer);
+    writer_conn.await.expect("writer connection joins");
+
+    running
+        .client
+        .batch_execute(
+            "DROP TABLE private_ddl.allowed; \
+             DROP SEQUENCE private_ddl.allowed_seq; \
+             DROP SCHEMA private_ddl; \
+             DROP ROLE schema_owner; \
+             DROP ROLE schema_writer; \
+             DROP ROLE schema_intruder",
+        )
+        .await
+        .expect("cleanup schema create privilege test");
+
+    shutdown(running).await;
+}
+
+#[tokio::test]
 async fn qualified_object_ddl_requires_existing_schema() {
     let running = start_sample_server("schema_ddl_unknown_namespace").await;
 

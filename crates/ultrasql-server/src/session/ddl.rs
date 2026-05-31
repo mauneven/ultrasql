@@ -271,6 +271,7 @@ where
             ));
         };
         self.ensure_schema_exists(namespace)?;
+        self.ensure_schema_create_privilege(namespace)?;
         if snapshot.enum_types.contains_key(type_name)
             || snapshot.composite_types.contains_key(type_name)
             || snapshot.tables.contains_key(type_name)
@@ -343,6 +344,7 @@ where
             ));
         };
         self.ensure_schema_exists(namespace)?;
+        self.ensure_schema_create_privilege(namespace)?;
         if snapshot.enum_types.contains_key(type_name)
             || snapshot.composite_types.contains_key(type_name)
             || snapshot.tables.contains_key(type_name)
@@ -406,6 +408,7 @@ where
             ));
         };
         self.ensure_schema_exists(namespace)?;
+        self.ensure_schema_create_privilege(namespace)?;
         if snapshot.enum_types.contains_key(domain_name)
             || snapshot.composite_types.contains_key(domain_name)
             || snapshot.domain_types.contains_key(domain_name)
@@ -499,6 +502,8 @@ where
                 "execute_create_operator called with non-CreateOperator plan",
             ));
         };
+        self.ensure_schema_exists(namespace)?;
+        self.ensure_schema_create_privilege(namespace)?;
         let key =
             crate::runtime_operator_signature(namespace, operator_name, left_type, right_type);
         let operator = crate::RuntimeOperator {
@@ -602,6 +607,7 @@ where
             ));
         };
         self.ensure_schema_exists(namespace)?;
+        self.ensure_schema_create_privilege(namespace)?;
         let exists_persistent = snapshot.tables.contains_key(table_name);
         let exists_fallback = self.state.catalog.lookup_table(table_name).is_some();
         if exists_persistent || exists_fallback {
@@ -986,6 +992,7 @@ where
             ));
         };
         self.ensure_schema_exists(namespace)?;
+        self.ensure_schema_create_privilege(namespace)?;
         let exists_persistent = snapshot.tables.contains_key(table_name);
         let exists_fallback = self.state.catalog.lookup_table(table_name).is_some();
         if exists_persistent || exists_fallback {

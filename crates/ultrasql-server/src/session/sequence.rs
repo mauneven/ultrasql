@@ -41,6 +41,7 @@ where
             ));
         };
         self.ensure_schema_exists(namespace)?;
+        self.ensure_schema_create_privilege(namespace)?;
         if self.state.sequences.contains_key(sequence_name) {
             if *if_not_exists {
                 return Ok(result_encoder::run_ddl_command("CREATE SEQUENCE"));
