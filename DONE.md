@@ -1861,6 +1861,10 @@ as a concise evidence ledger; roadmap stays for open gates only.
   preserve typed executor errors instead of collapsing to `TypeMismatch`.
   Evidence:
   `cargo test -p ultrasql-executor hybrid_search_filter_eval_error_stays_typed --lib -- --nocapture`.
+- Runtime errors inside parallel `GatherMerge` sort-key expression evaluation
+  now preserve typed executor errors instead of collapsing to `TypeMismatch`.
+  Evidence:
+  `cargo test -p ultrasql-executor gather_merge_key_eval_error_propagates --lib -- --nocapture`.
 - Runtime scalar/temporal text casts to integer, float, boolean, date, time,
   timestamp, timestamptz, and timetz now report SQLSTATE `22P02` for invalid
   column text. Evidence:

@@ -16,7 +16,7 @@ use crate::eval::Eval;
 use crate::filter_op::batch_to_rows;
 use crate::seq_scan::build_batch;
 use crate::sort::compare_values_nullable;
-use crate::{ExecError, Operator};
+use crate::{ExecError, Operator, eval_error_to_exec_error};
 
 const BATCH_TARGET_ROWS: usize = 4096;
 
@@ -267,14 +267,8 @@ fn compare_rows(
     keys: &[CompiledKey],
 ) -> Result<Ordering, ExecError> {
     for key in keys {
-        let left_value = key
-            .eval
-            .eval(left)
-            .map_err(|err| ExecError::TypeMismatch(err.to_string()))?;
-        let right_value = key
-            .eval
-            .eval(right)
-            .map_err(|err| ExecError::TypeMismatch(err.to_string()))?;
+        let left_value = key.eval.eval(left).map_err(eval_error_to_exec_error)?;
+        let right_value = key.eval.eval(right).map_err(eval_error_to_exec_error)?;
         let ord = compare_values_nullable(&left_value, &right_value, key.nulls_first);
         let ord = if key.asc { ord } else { ord.reverse() };
         if ord != Ordering::Equal {
@@ -411,10 +405,7 @@ mod tests {
         let err = gather
             .next_batch()
             .expect_err("merge key division must error");
-        assert!(
-            err.to_string().contains("division by zero"),
-            "unexpected error: {err}"
-        );
+        assert!(matches!(err, ExecError::DivisionByZero(_)), "{err:?}");
     }
 
     #[test]
