@@ -1886,6 +1886,9 @@ as a concise evidence ledger; roadmap stays for open gates only.
 - Vectorized hash aggregate now uses checked arithmetic for `COUNT(*)` and
   `SUM(bigint)` instead of wrapping on overflow. Evidence:
   `cargo test -p ultrasql-executor sum_overflow_returns_typed_error --lib -- --nocapture`.
+- Vectorized terminal `SumSink` now rejects `Int64` and sample-count overflow
+  instead of wrapping benchmark/query sink totals. Evidence:
+  `cargo test -p ultrasql-executor sum_sink_rejects_i64_overflow --lib -- --nocapture`.
 - Vectorized sort now rejects out-of-range sort-key columns instead of treating
   them as all-equal comparisons. Evidence:
   `cargo test -p ultrasql-executor sort_key_out_of_range_errors --lib -- --nocapture`.

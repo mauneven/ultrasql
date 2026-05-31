@@ -78,10 +78,15 @@ impl VectorizedSink for SumSink {
         match &cols[0] {
             Column::Int64(c) => {
                 for &v in c.data() {
-                    self.sum = self.sum.wrapping_add(v);
+                    self.sum = self.sum.checked_add(v).ok_or_else(|| {
+                        ExecError::NumericFieldOverflow("SumSink Int64 overflow".to_owned())
+                    })?;
                 }
-                self.samples += u64::try_from(c.data().len()).map_err(|_| {
+                let samples = u64::try_from(c.data().len()).map_err(|_| {
                     ExecError::TypeMismatch("SumSink: column length overflows u64".to_owned())
+                })?;
+                self.samples = self.samples.checked_add(samples).ok_or_else(|| {
+                    ExecError::NumericFieldOverflow("SumSink sample count overflow".to_owned())
                 })?;
             }
             other => {
@@ -195,6 +200,13 @@ mod tests {
         let mut sink = SumSink::new();
         let err = sink.consume(i32_batch(&[1, 2])).unwrap_err();
         assert!(matches!(err, crate::ExecError::TypeMismatch(_)));
+    }
+
+    #[test]
+    fn sum_sink_rejects_i64_overflow() {
+        let mut sink = SumSink::new();
+        let err = sink.consume(i64_batch(&[i64::MAX, 1])).unwrap_err();
+        assert!(matches!(err, crate::ExecError::NumericFieldOverflow(_)));
     }
 
     #[test]
