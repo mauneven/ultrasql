@@ -145,5 +145,29 @@ async fn timetz_and_temporal_display_round_trip() {
         ]]
     );
 
+    let named_timetz_rows = client
+        .simple_query(
+            "SELECT \
+                TIME WITH TIME ZONE '2000-01-01 04:05:06 America/New_York', \
+                TIME WITH TIME ZONE '2000-07-01 04:05:06 America/New_York'",
+        )
+        .await
+        .expect("select timetz named-zone casts");
+    let named_timetz_values: Vec<Vec<String>> = named_timetz_rows
+        .into_iter()
+        .filter_map(|message| match message {
+            SimpleQueryMessage::Row(row) => Some(
+                (0..2)
+                    .map(|idx| row.get(idx).expect("column").to_owned())
+                    .collect(),
+            ),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        named_timetz_values,
+        vec![vec!["04:05:06-05".to_owned(), "04:05:06-04".to_owned(),]]
+    );
+
     shutdown(running).await;
 }

@@ -691,10 +691,12 @@ as a concise evidence ledger; roadmap stays for open gates only.
   persistence, OID 1266, ISO display, casts, coercions, and offset comparison.
 - `TIMETZ` / `TIMESTAMPTZ` literals now accept deterministic fixed-offset time
   zone abbreviations such as `EST`, `EDT`, `PST`, `PDT`, `CET`, and `EET`
-  without claiming full IANA time-zone database behavior. `TIMESTAMPTZ`
-  literals, COPY text input, and extended text parameters now also resolve IANA
-  named zones through the bundled time-zone database, including DST-sensitive
-  offsets such as `America/New_York`. Evidence:
+  without claiming session-display parity. `TIMESTAMPTZ` literals, COPY text
+  input, and extended text parameters resolve IANA named zones through the
+  bundled time-zone database. `TIMETZ` literals resolve date-prefixed named
+  zones such as `2000-07-01 04:05 America/New_York`, making DST-sensitive
+  offsets deterministic. Evidence:
+  `cargo test -p ultrasql-core time_text_parser_and_timetz_pack_reject_bad_edges --lib -- --nocapture`;
   `cargo test -p ultrasql-planner time_and_timetz_literals_parse_postgres_shapes --lib -- --nocapture`
   and
   `cargo test -p ultrasql-server --test timetz_round_trip timetz_and_temporal_display_round_trip -- --nocapture`.

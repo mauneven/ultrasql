@@ -68,8 +68,8 @@ file focused on what still blocks production.
 - `MONEY`: locale-sensitive formatting/input beyond deterministic
   `lc_monetary` GUC round trips, explicit typmod/precision edge casts, and
   range-parity evidence remain open.
-- Date/time remaining: named time-zone semantics for `TIMETZ` and session
-  display/conversion beyond the completed `TIMESTAMPTZ` IANA parser, plus
+- Date/time remaining: session display/conversion beyond the completed
+  `TIMESTAMPTZ` IANA parser and date-prefixed `TIMETZ` named-zone parser, plus
   date/time display changes for non-ISO `DateStyle` and locale variants beyond
   current `DateStyle` GUC validation / round trips.
 - Arrays: broader coercion breadth and every supported element family beyond

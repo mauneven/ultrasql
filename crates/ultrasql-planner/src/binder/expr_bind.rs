@@ -4781,6 +4781,10 @@ mod typed_literal_tests {
             Some((14_706_789_000, -18_000))
         );
         assert_eq!(
+            parse_timetz_literal("2000-07-01 04:05:06.789 America/New_York"),
+            Some((14_706_789_000, -14_400))
+        );
+        assert_eq!(
             parse_timestamptz_literal("2000-01-02 03:04:05 EST"),
             Some(115_445_000_000)
         );

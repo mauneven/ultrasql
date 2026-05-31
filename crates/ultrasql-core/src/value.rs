@@ -2454,7 +2454,7 @@ pub fn parse_timestamp_text(text: &str) -> Option<i64> {
 pub fn parse_timestamptz_text(text: &str) -> Option<i64> {
     let (date, time) = split_timestamp_text(text)?;
     let days = i64::from(parse_date_text(date)?);
-    let (time_token, zone_token) = split_time_and_optional_zone(time)?;
+    let (_, time_token, zone_token) = split_time_and_optional_zone(time)?;
     let micros = parse_time_token(time_token)?;
     let offset_seconds = match zone_token {
         Some(zone) => parse_timezone_offset(zone)
@@ -2473,29 +2473,36 @@ pub fn parse_timetz_text(text: &str) -> Option<(i64, i32)> {
 }
 
 fn parse_time_and_optional_offset(text: &str) -> Option<(i64, Option<i32>)> {
-    let (time_token, zone_token) = split_time_and_optional_zone(text)?;
+    let (date_token, time_token, zone_token) = split_time_and_optional_zone(text)?;
     let micros = parse_time_token(time_token)?;
     let offset = match zone_token {
-        Some(zone) => Some(parse_timezone_offset(zone)?),
+        Some(zone) => Some(parse_timezone_offset(zone).or_else(|| {
+            date_token.and_then(|date| parse_named_timezone_offset(date, micros, zone))
+        })?),
         None => None,
     };
     Some((micros, offset))
 }
 
-fn split_time_and_optional_zone(text: &str) -> Option<(&str, Option<&str>)> {
+fn split_time_and_optional_zone(text: &str) -> Option<(Option<&str>, &str, Option<&str>)> {
     let trimmed = text.trim();
     if trimmed.is_empty() {
         return None;
     }
     let tokens: Vec<&str> = trimmed.split_whitespace().collect();
-    let (time_token, zone_token) = match tokens.as_slice() {
-        [single] => split_inline_timezone(single),
-        [first, second] if looks_like_iso_date(first) => (*second, None),
-        [first, second] => (*first, Some(*second)),
-        [first, second, third, ..] if looks_like_iso_date(first) => (*second, Some(*third)),
+    let (date_token, time_token, zone_token) = match tokens.as_slice() {
+        [single] => {
+            let (time, zone) = split_inline_timezone(single);
+            (None, time, zone)
+        }
+        [first, second] if looks_like_iso_date(first) => (Some(*first), *second, None),
+        [first, second] => (None, *first, Some(*second)),
+        [first, second, third, ..] if looks_like_iso_date(first) => {
+            (Some(*first), *second, Some(*third))
+        }
         _ => return None,
     };
-    Some((time_token, zone_token))
+    Some((date_token, time_token, zone_token))
 }
 
 fn looks_like_iso_date(text: &str) -> bool {
@@ -3280,6 +3287,14 @@ mod tests {
         assert_eq!(
             parse_timestamptz_text("2000-07-01 00:00:00 America/New_York"),
             parse_timestamp_text("2000-07-01 04:00:00")
+        );
+        assert_eq!(
+            parse_timetz_text("2000-01-01 04:05:06 America/New_York"),
+            Some((14_706_000_000, -18_000))
+        );
+        assert_eq!(
+            parse_timetz_text("2000-07-01 04:05:06 America/New_York"),
+            Some((14_706_000_000, -14_400))
         );
         assert_eq!(parse_timetz_text("04:05 zulu"), Some((14_700_000_000, 0)));
         assert_eq!(
