@@ -711,7 +711,10 @@ where
                     crate::extended::execute_portal(&mut self.extended, portal, max_rows, &ctx);
                 if let (Some(plan), Ok(outcome)) = (portal_plan.as_ref(), res.as_ref()) {
                     let rows = Self::parse_affected_rows_tag(&outcome.messages);
-                    self.note_dml_effect(plan, rows);
+                    if let Err(err) = self.note_dml_effect(plan, rows) {
+                        self.txn_state = TxnState::Failed(txn);
+                        return Err(err);
+                    }
                 }
                 self.txn_state = if res.is_ok() {
                     TxnState::InTransaction(txn)

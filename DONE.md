@@ -2094,3 +2094,7 @@ as a concise evidence ledger; roadmap stays for open gates only.
   INSERT, UPDATE, and DELETE instead of silently saturating command counts.
   Evidence:
   `cargo test -p ultrasql-executor modify::tests --lib -- --nocapture`.
+- Session pending-DML counters now reject overflow with SQLSTATE `22003` before
+  enqueueing logical replication changes, and extended-query explicit
+  transactions propagate the failure into failed-transaction state. Evidence:
+  `cargo test -p ultrasql-server session::execute::tests::plan_shape_predicates_and_command_tags_cover_dml_edges --lib -- --nocapture`.

@@ -1975,7 +1975,7 @@ where
                 );
                 let outcome = match outcome {
                     Ok(result) => {
-                        self.note_dml_effect(plan, result.rows);
+                        self.note_dml_effect(plan, result.rows)?;
                         match self.flush_dirty_heap_pages_after_dml_if_needed(plan, result.rows) {
                             Ok(()) => Ok(result),
                             Err(err) => Err(err),
@@ -2063,7 +2063,7 @@ where
                         .then(|| Self::dml_target_table(plan))
                         .flatten()
                         .map(str::to_ascii_lowercase);
-                    self.note_dml_effect(plan, rows);
+                    self.note_dml_effect(plan, rows)?;
                     if let Some(table) = &modified_table {
                         self.maintain_aggregating_indexes_for_tables_after_commit(
                             std::slice::from_ref(table),
@@ -2729,25 +2729,37 @@ where
         Ok(result.rows)
     }
 
-    pub(crate) fn note_dml_effect(&mut self, plan: &LogicalPlan, rows: u64) {
+    pub(crate) fn note_dml_effect(
+        &mut self,
+        plan: &LogicalPlan,
+        rows: u64,
+    ) -> Result<(), ServerError> {
         if rows == 0 {
-            return;
+            return Ok(());
         }
         let Some(table) = Self::dml_target_table(plan) else {
-            return;
+            return Ok(());
         };
+        let table = table.to_ascii_lowercase();
+        let current = self
+            .pending_table_modifications
+            .get(&table)
+            .copied()
+            .unwrap_or(0);
+        let total = current.checked_add(rows).ok_or_else(|| {
+            ServerError::Execute(ultrasql_executor::ExecError::NumericFieldOverflow(
+                "pending DML row count overflow".to_owned(),
+            ))
+        })?;
         if let Some(kind) = Self::dml_change_kind(plan) {
             self.pending_logical_changes.push(PendingLogicalChange {
-                table: table.to_ascii_lowercase(),
+                table: table.clone(),
                 kind,
                 rows_affected: rows,
             });
         }
-        let entry = self
-            .pending_table_modifications
-            .entry(table.to_ascii_lowercase())
-            .or_insert(0);
-        *entry = entry.saturating_add(rows);
+        self.pending_table_modifications.insert(table, total);
+        Ok(())
     }
 
     pub(crate) fn flush_dirty_heap_pages_after_dml_if_needed(
@@ -3539,6 +3551,15 @@ mod tests {
             Session::<tokio::io::DuplexStream>::dml_target_table(&insert_values),
             Some("t")
         );
+        let mut session = test_session();
+        session
+            .pending_table_modifications
+            .insert("t".to_owned(), u64::MAX);
+        let err = session
+            .note_dml_effect(&insert_values, 1)
+            .expect_err("pending DML counter overflow must not saturate");
+        assert_eq!(err.sqlstate(), "22003");
+        assert!(session.pending_logical_changes.is_empty());
         assert_eq!(
             Session::<tokio::io::DuplexStream>::dml_change_kind(&insert_values),
             Some(LogicalChangeKind::Insert)
