@@ -2234,6 +2234,7 @@ where
                     .tables
                     .get(table)
                     .ok_or_else(|| ultrasql_catalog::CatalogError::not_found(table.clone()))?;
+                self.ensure_table_owner_or_superuser(entry.oid, table)?;
                 (entry.oid, 0)
             }
             LogicalCommentTarget::Index { index } => {
@@ -2241,6 +2242,11 @@ where
                     .indexes
                     .get(index)
                     .ok_or_else(|| ultrasql_catalog::CatalogError::not_found(index.clone()))?;
+                let table_name = snapshot.tables_by_oid.get(&entry.table_oid).map_or_else(
+                    || format!("oid {}", entry.table_oid.raw()),
+                    |table| table.name.clone(),
+                );
+                self.ensure_table_owner_or_superuser(entry.table_oid, &table_name)?;
                 (entry.oid, 0)
             }
             LogicalCommentTarget::Column { table, attnum, .. } => {
@@ -2248,6 +2254,7 @@ where
                     .tables
                     .get(table)
                     .ok_or_else(|| ultrasql_catalog::CatalogError::not_found(table.clone()))?;
+                self.ensure_table_owner_or_superuser(entry.oid, table)?;
                 (entry.oid, *attnum)
             }
         };

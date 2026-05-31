@@ -41,6 +41,24 @@ async fn non_owner_cannot_alter_truncate_or_drop_table() {
     );
     assert_insufficient_privilege(
         attacker
+            .batch_execute("COMMENT ON TABLE ddl_owned_table IS 'stolen docs'")
+            .await
+            .expect_err("non-owner cannot comment on table"),
+    );
+    assert_insufficient_privilege(
+        attacker
+            .batch_execute("COMMENT ON COLUMN ddl_owned_table.id IS 'stolen docs'")
+            .await
+            .expect_err("non-owner cannot comment on table column"),
+    );
+    assert_insufficient_privilege(
+        attacker
+            .batch_execute("COMMENT ON INDEX ddl_owned_idx IS 'stolen docs'")
+            .await
+            .expect_err("non-owner cannot comment on table index"),
+    );
+    assert_insufficient_privilege(
+        attacker
             .batch_execute("ALTER TABLE ddl_owned_table ADD COLUMN stolen INT")
             .await
             .expect_err("non-owner cannot alter table"),

@@ -950,8 +950,9 @@ as a concise evidence ledger; roadmap stays for open gates only.
   through privilege catalog checks; table privilege DDL now requires table
   ownership or superuser and records the actual grantor.
 - Table-mutating DDL now reuses a shared owner/superuser guard: non-owners
-  cannot `CREATE INDEX`, `DROP INDEX`, `ALTER TABLE`, `TRUNCATE`, `DROP TABLE`,
-  or `CREATE POLICY` against another role's table. Evidence:
+  cannot `CREATE INDEX`, `DROP INDEX`, `COMMENT ON` table/index/column,
+  `ALTER TABLE`, `TRUNCATE`, `DROP TABLE`, or `CREATE POLICY` against another
+  role's table. Evidence:
   `cargo test -p ultrasql-server --test table_ownership_round_trip -- --nocapture`.
 - Column-level privileges enforce `SELECT`, `INSERT`, and `UPDATE` target
   access.
