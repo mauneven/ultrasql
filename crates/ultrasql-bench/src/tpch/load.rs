@@ -2435,8 +2435,8 @@ impl TpchQ19BuildState {
         if quantity < band.quantity_min || quantity > band.quantity_max {
             return Ok(());
         }
-        let revenue = extendedprice * 100_i64.saturating_sub(discount);
-        self.revenue = self.revenue.saturating_add(revenue);
+        let revenue = checked_direct_discounted_revenue_x100(extendedprice, discount)?;
+        self.revenue = checked_direct_revenue_add(self.revenue, revenue)?;
         Ok(())
     }
 }
@@ -5616,6 +5616,21 @@ mod tests {
 
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].revenue, 900_000);
+    }
+
+    #[cfg(feature = "sql-bench")]
+    #[test]
+    fn tpch_q19_sidecar_rejects_discount_factor_overflow() {
+        let mut state = TpchQ19BuildState::default();
+        state
+            .ingest("part", "5|name|mfgr|Brand#12|TYPE|3|SM BOX|1.00|comment")
+            .expect("part");
+
+        let err = state
+            .ingest_lineitem_values(5, 1_00, 10_000, i64::MIN, "AIR", "DELIVER IN PERSON")
+            .expect_err("discount factor overflow should reject");
+
+        assert!(err.to_string().contains("TPC-H sidecar revenue overflow"));
     }
 
     #[cfg(feature = "sql-bench")]
