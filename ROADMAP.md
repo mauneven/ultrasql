@@ -72,7 +72,8 @@ file focused on what still blocks production.
   deterministic offset/abbreviation parser, plus date/time display changes for
   non-ISO `DateStyle` and locale variants beyond current `DateStyle` GUC
   validation / round trips.
-- Arrays: broader coercion breadth and every supported element family.
+- Arrays: broader coercion breadth and every supported element family beyond
+  the completed scalar/mutation subset.
 - JSON/JSONB: full SQL/JSON path parity beyond the supported subset, including
   full `datetime(template)` grammar beyond the supported ISO templates and
   non-ISO date/time coercions.

@@ -390,6 +390,9 @@ fn eval_function_call(
         "array_to_string" => eval_array_to_string(args),
         "string_to_array" => eval_string_to_array(args),
         "array_cat" => eval_array_cat(args),
+        "array_append" => eval_array_append(args),
+        "array_prepend" => eval_array_prepend(args),
+        "array_remove" => eval_array_remove(args),
         "__ultrasql_array_subscript" => eval_array_subscript(args),
         "__ultrasql_array_slice" => eval_array_slice(args),
         "__ultrasql_eq_any_array" => eval_eq_any_array(args),
@@ -1428,6 +1431,115 @@ fn eval_array_cat(args: &[Value]) -> Result<Value, EvalError> {
             right.data_type()
         ))),
     }
+}
+
+fn eval_array_append(args: &[Value]) -> Result<Value, EvalError> {
+    if args.len() != 2 {
+        return Err(EvalError::Type(format!(
+            "array_append: expected 2 args, got {}",
+            args.len()
+        )));
+    }
+    append_array_element("array_append", &args[0], &args[1], false)
+}
+
+fn eval_array_prepend(args: &[Value]) -> Result<Value, EvalError> {
+    if args.len() != 2 {
+        return Err(EvalError::Type(format!(
+            "array_prepend: expected 2 args, got {}",
+            args.len()
+        )));
+    }
+    append_array_element("array_prepend", &args[1], &args[0], true)
+}
+
+fn append_array_element(
+    function_name: &str,
+    array_value: &Value,
+    element: &Value,
+    prepend: bool,
+) -> Result<Value, EvalError> {
+    let Value::Array {
+        element_type,
+        elements,
+    } = array_value
+    else {
+        return if matches!(array_value, Value::Null) {
+            Ok(Value::Null)
+        } else {
+            Err(EvalError::Type(format!(
+                "{function_name}: array argument required, got {:?}",
+                array_value.data_type()
+            )))
+        };
+    };
+    if !matches!(element, Value::Null) && element.data_type() != *element_type {
+        return Err(EvalError::Type(format!(
+            "{function_name}: element type mismatch, expected {:?}, got {:?}",
+            element_type,
+            element.data_type()
+        )));
+    }
+    let mut output = Vec::with_capacity(elements.len() + 1);
+    if prepend {
+        output.push(element.clone());
+        output.extend_from_slice(elements);
+    } else {
+        output.extend_from_slice(elements);
+        output.push(element.clone());
+    }
+    Ok(Value::Array {
+        element_type: element_type.clone(),
+        elements: output,
+    })
+}
+
+fn eval_array_remove(args: &[Value]) -> Result<Value, EvalError> {
+    if args.len() != 2 {
+        return Err(EvalError::Type(format!(
+            "array_remove: expected 2 args, got {}",
+            args.len()
+        )));
+    }
+    let Value::Array {
+        element_type,
+        elements,
+    } = &args[0]
+    else {
+        return if matches!(args[0], Value::Null) {
+            Ok(Value::Null)
+        } else {
+            Err(EvalError::Type(format!(
+                "array_remove: array argument required, got {:?}",
+                args[0].data_type()
+            )))
+        };
+    };
+    let needle = &args[1];
+    if !matches!(needle, Value::Null) && needle.data_type() != *element_type {
+        return Err(EvalError::Type(format!(
+            "array_remove: element type mismatch, expected {:?}, got {:?}",
+            element_type,
+            needle.data_type()
+        )));
+    }
+    let mut output = Vec::with_capacity(elements.len());
+    for element in elements {
+        let should_remove = if matches!(needle, Value::Null) {
+            matches!(element, Value::Null)
+        } else if matches!(element, Value::Null) {
+            false
+        } else {
+            compare_values(element, needle)? == std::cmp::Ordering::Equal
+        };
+        if !should_remove {
+            output.push(element.clone());
+        }
+    }
+    Ok(Value::Array {
+        element_type: element_type.clone(),
+        elements: output,
+    })
 }
 
 fn format_size_pretty(bytes: i64) -> String {
@@ -5479,15 +5591,19 @@ mod tests {
         }
     }
 
+    fn text_array_value(items: &[&str]) -> Value {
+        Value::Array {
+            element_type: DataType::Text { max_len: None },
+            elements: items
+                .iter()
+                .map(|item| Value::Text((*item).to_owned()))
+                .collect(),
+        }
+    }
+
     fn lit_text_array(items: &[&str]) -> ScalarExpr {
         ScalarExpr::Literal {
-            value: Value::Array {
-                element_type: DataType::Text { max_len: None },
-                elements: items
-                    .iter()
-                    .map(|item| Value::Text((*item).to_owned()))
-                    .collect(),
-            },
+            value: text_array_value(items),
             data_type: DataType::Array(Box::new(DataType::Text { max_len: None })),
         }
     }
@@ -7223,6 +7339,47 @@ mod tests {
             Value::Array {
                 element_type: DataType::Text { max_len: None },
                 elements: vec![Value::Text("red".into()), Value::Text("green".into())]
+            }
+        );
+
+        assert_eq!(
+            eval_fn(
+                "array_append",
+                vec![
+                    text_array_value(&["red", "green"]),
+                    Value::Text("blue".into())
+                ]
+            ),
+            Value::Array {
+                element_type: DataType::Text { max_len: None },
+                elements: vec![
+                    Value::Text("red".into()),
+                    Value::Text("green".into()),
+                    Value::Text("blue".into())
+                ]
+            }
+        );
+        assert_eq!(
+            eval_fn(
+                "array_prepend",
+                vec![Value::Text("red".into()), text_array_value(&["green"])]
+            ),
+            Value::Array {
+                element_type: DataType::Text { max_len: None },
+                elements: vec![Value::Text("red".into()), Value::Text("green".into())]
+            }
+        );
+        assert_eq!(
+            eval_fn(
+                "array_remove",
+                vec![
+                    text_array_value(&["red", "green", "red"]),
+                    Value::Text("red".into())
+                ]
+            ),
+            Value::Array {
+                element_type: DataType::Text { max_len: None },
+                elements: vec![Value::Text("green".into())]
             }
         );
     }

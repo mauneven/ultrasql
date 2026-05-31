@@ -106,6 +106,26 @@ async fn multidimensional_arrays_store_dimensions_and_wire_oid() {
         ]
     );
 
+    let mutated = simple_rows(
+        client
+            .simple_query(
+                "SELECT \
+                    array_append(ARRAY[1,2], 3), \
+                    array_prepend(0, ARRAY[1,2]), \
+                    array_remove(ARRAY[1,2,1], 1)",
+            )
+            .await
+            .expect("array append prepend remove"),
+    );
+    assert_eq!(
+        mutated,
+        vec![vec![
+            Some("{1,2,3}".to_owned()),
+            Some("{0,1,2}".to_owned()),
+            Some("{2}".to_owned()),
+        ]]
+    );
+
     let stmt = client
         .prepare("SELECT matrix FROM array_probe WHERE id = 1")
         .await

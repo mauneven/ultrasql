@@ -1600,6 +1600,8 @@ fn builtin_return_type(func_name: &str, args: &[ScalarExpr]) -> Result<DataType,
         "string_to_array" | "array_cat" => {
             Ok(DataType::Array(Box::new(DataType::Text { max_len: None })))
         }
+        "array_append" | "array_remove" => array_mutation_return_type(func_name, args, 0),
+        "array_prepend" => array_mutation_return_type(func_name, args, 1),
         "l2_distance" | "cosine_distance" | "inner_product" | "dot_product" | "l1_distance" => {
             Ok(DataType::Float64)
         }
@@ -1607,6 +1609,35 @@ fn builtin_return_type(func_name: &str, args: &[ScalarExpr]) -> Result<DataType,
         "vector_norm" | "l2_norm" => Ok(DataType::Float64),
         "vector_dims" => Ok(DataType::Int32),
         _ => Err(PlanError::NotSupported("non-aggregate function calls")),
+    }
+}
+
+fn array_mutation_return_type(
+    func_name: &str,
+    args: &[ScalarExpr],
+    array_arg_idx: usize,
+) -> Result<DataType, PlanError> {
+    if args.len() != 2 {
+        return Err(PlanError::TypeMismatch(format!(
+            "{func_name}: expected 2 arguments, got {}",
+            args.len()
+        )));
+    }
+    let array_type = args[array_arg_idx].data_type();
+    let DataType::Array(element_type) = &array_type else {
+        return Err(PlanError::TypeMismatch(format!(
+            "{func_name}: array argument required, got {array_type:?}"
+        )));
+    };
+    let value_type = args[1 - array_arg_idx].data_type();
+    if matches!(value_type, DataType::Null) || value_type == *element_type.as_ref() {
+        Ok(array_type)
+    } else {
+        Err(PlanError::TypeMismatch(format!(
+            "{func_name}: element type mismatch, expected {:?}, got {:?}",
+            element_type.as_ref(),
+            value_type
+        )))
     }
 }
 
@@ -1744,6 +1775,9 @@ pub(super) fn is_supported_builtin(func_name: &str) -> bool {
             | "array_to_string"
             | "string_to_array"
             | "array_cat"
+            | "array_append"
+            | "array_prepend"
+            | "array_remove"
             | "min"
             | "max"
             | "l2_distance"

@@ -788,7 +788,8 @@ as a concise evidence ledger; roadmap stays for open gates only.
   `cargo test -p ultrasql-server --test jsonb_path_query_round_trip jsonb_path_query_supports_like_regex_predicates -- --nocapture`.
 - Native arrays support multi-dimensional rectangular text/runtime round trips,
   GIN-facing operators, array subscripts/slices, `array_agg`, `array_length`,
-  `array_cat`, `array_to_string`, `string_to_array`, and wire-visible `unnest`.
+  `array_cat`, `array_append`, `array_prepend`, `array_remove`,
+  `array_to_string`, `string_to_array`, and wire-visible `unnest`.
 - `CREATE TYPE ... AS ENUM`, `CREATE TYPE ... AS (composite)`, and
   `CREATE DOMAIN` have durable catalog storage, restart round trips, and wire
   type OID coverage.
