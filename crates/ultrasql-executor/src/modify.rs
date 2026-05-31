@@ -1487,7 +1487,7 @@ impl<L: PageLoader + Send + Sync + std::fmt::Debug + 'static> ModifyTable<L> {
         if let Some(predicate) = predicate {
             match predicate
                 .eval(&eval_row)
-                .map_err(|e| ExecError::TypeMismatch(e.to_string()))?
+                .map_err(eval_error_to_exec_error)?
             {
                 Value::Bool(true) => {}
                 Value::Bool(false) | Value::Null => return Ok(None),
