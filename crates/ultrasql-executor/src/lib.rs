@@ -65,6 +65,7 @@
     clippy::cast_possible_wrap
 )]
 
+mod affected_rows;
 mod aggregate_math;
 pub mod bitmap_heap_scan;
 pub mod cte_scan;

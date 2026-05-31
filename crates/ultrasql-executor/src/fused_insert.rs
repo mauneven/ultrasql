@@ -6,8 +6,8 @@ use ultrasql_core::{CommandId, DataType, Field, RelationId, Schema, Xid};
 use ultrasql_storage::heap::{HeapAccess, InsertOptions};
 use ultrasql_storage::{PageLoader, WalSink};
 use ultrasql_vec::Batch;
-use ultrasql_vec::column::{Column, NumericColumn};
 
+use crate::affected_rows::affected_rows_batch;
 use crate::{ExecError, Operator};
 
 /// Inserts already-bound `(Int32, Int32)` literal rows without routing through
@@ -92,10 +92,7 @@ impl<L: PageLoader + Send + Sync + std::fmt::Debug + 'static> Operator for Fused
                 },
             )
             .map_err(|e| ExecError::TypeMismatch(e.to_string()))?;
-        let affected_i64 = i64::try_from(tids.len()).unwrap_or(i64::MAX);
-        let batch = Batch::new([Column::Int64(NumericColumn::from_data(vec![affected_i64]))])
-            .map_err(ExecError::from)?;
-        Ok(Some(batch))
+        Ok(Some(affected_rows_batch(tids.len(), "fused INSERT")?))
     }
 
     fn schema(&self) -> &Schema {

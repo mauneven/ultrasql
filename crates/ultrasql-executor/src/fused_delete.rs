@@ -29,8 +29,8 @@ use ultrasql_storage::heap::HeapAccess;
 use ultrasql_storage::vm::VisibilityMap;
 use ultrasql_txn::TransactionManager;
 use ultrasql_vec::Batch;
-use ultrasql_vec::column::{Column, NumericColumn};
 
+use crate::affected_rows::affected_rows_batch;
 use crate::fused_update::{FusedCmp, FusedPredicate};
 use crate::{ExecError, Operator};
 
@@ -141,10 +141,7 @@ impl<L: PageLoader + Send + Sync + std::fmt::Debug + 'static> Operator for Fused
         }
         .map_err(|e| ExecError::TypeMismatch(e.to_string()))?;
 
-        let affected_i64 = i64::try_from(n).unwrap_or(i64::MAX);
-        let batch = Batch::new([Column::Int64(NumericColumn::from_data(vec![affected_i64]))])
-            .map_err(ExecError::from)?;
-        Ok(Some(batch))
+        Ok(Some(affected_rows_batch(n, "fused DELETE")?))
     }
 
     fn schema(&self) -> &Schema {

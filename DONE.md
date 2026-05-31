@@ -2112,3 +2112,7 @@ as a concise evidence ledger; roadmap stays for open gates only.
 - SortAggregate now uses checked COUNT/AVG/statistical counters instead of
   saturating per-group row counts. Evidence:
   `cargo test -p ultrasql-executor sort_aggregate::tests --lib -- --nocapture`.
+- Fused INSERT/UPDATE/DELETE affected-row batches now share checked
+  `usize` -> `i64` conversion instead of clamping command counts to
+  `i64::MAX`. Evidence:
+  `cargo test -p ultrasql-executor affected_rows --lib -- --nocapture`.
