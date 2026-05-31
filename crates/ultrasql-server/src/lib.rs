@@ -1067,6 +1067,23 @@ fn parse_operator_data_type_token(
     })
 }
 
+fn validate_runtime_operator_metadata(
+    operator: &RuntimeOperator,
+    line_no: usize,
+) -> Result<(), ServerError> {
+    if operator.procedure == "bool_eq"
+        && operator.left_type == Some(DataType::Bool)
+        && operator.right_type == Some(DataType::Bool)
+        && operator.result_type == DataType::Bool
+    {
+        return Ok(());
+    }
+    Err(ServerError::ddl(format!(
+        "operator metadata line {} uses unsupported procedure/type signature",
+        line_no + 1
+    )))
+}
+
 fn binary_op_token(op: BinaryOp) -> &'static str {
     match op {
         BinaryOp::Add => "add",
@@ -5346,19 +5363,23 @@ impl Server {
                     result_token
                 ))
             })?;
-            let signature = runtime_operator_signature(&namespace, &name, &left_type, &right_type);
-            self.operators.insert(
-                signature,
-                Arc::new(RuntimeOperator {
-                    oid,
-                    name,
-                    namespace,
-                    left_type,
-                    right_type,
-                    procedure,
-                    result_type,
-                }),
+            let operator = RuntimeOperator {
+                oid,
+                name,
+                namespace,
+                left_type,
+                right_type,
+                procedure,
+                result_type,
+            };
+            validate_runtime_operator_metadata(&operator, line_no)?;
+            let signature = runtime_operator_signature(
+                &operator.namespace,
+                &operator.name,
+                &operator.left_type,
+                &operator.right_type,
             );
+            self.operators.insert(signature, Arc::new(operator));
         }
         Ok(())
     }

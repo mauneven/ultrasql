@@ -1,5 +1,7 @@
 mod support;
 
+use ultrasql_server::Server;
+
 use support::{shutdown, start_persistent_server};
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -41,4 +43,20 @@ async fn create_operator_catalog_survives_restart() {
         .get::<_, i64>(0);
     assert_eq!(after, 1, "operator catalog row should survive restart");
     shutdown(running).await;
+}
+
+#[test]
+fn operator_catalog_rejects_unknown_runtime_procedure_on_rebuild() {
+    let data_dir = tempfile::TempDir::new().expect("temp data dir");
+    std::fs::write(
+        data_dir.path().join("pg_operator_runtime.meta"),
+        "# ultrasql operator runtime v1\noperator\t90000\tpg_catalog\t===\tbool\tbool\tevil\tbool\n",
+    )
+    .expect("write tampered operator metadata");
+
+    let err = Server::init(data_dir.path()).expect_err("tampered operator metadata rejected");
+    assert!(
+        err.to_string().contains("operator metadata"),
+        "expected operator metadata rejection, got {err}"
+    );
 }
