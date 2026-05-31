@@ -36,7 +36,7 @@ use crate::eval::Eval;
 use crate::filter_op::batch_to_rows;
 use crate::seq_scan::build_batch;
 use crate::value_key::decimal_values_equal;
-use crate::{ExecError, Operator};
+use crate::{ExecError, Operator, eval_error_to_exec_error};
 
 const BATCH_TARGET_ROWS: usize = 4096;
 
@@ -137,7 +137,7 @@ fn accumulate(
         .map(|expr| {
             Eval::new(expr.clone())
                 .eval(row)
-                .map_err(|err| ExecError::TypeMismatch(err.to_string()))
+                .map_err(eval_error_to_exec_error)
         })
         .transpose()?;
 
@@ -385,7 +385,7 @@ fn percentile_fraction(
     };
     let value = Eval::new(direct_arg.clone())
         .eval(row)
-        .map_err(|err| ExecError::TypeMismatch(err.to_string()))?;
+        .map_err(eval_error_to_exec_error)?;
     if value.is_null() {
         return Ok(None);
     }
@@ -811,10 +811,7 @@ impl SortAggregate {
 fn eval_group_key_values(evals: &[Eval], row: &[Value]) -> Result<Vec<Value>, ExecError> {
     evals
         .iter()
-        .map(|eval| {
-            eval.eval(row)
-                .map_err(|err| ExecError::TypeMismatch(err.to_string()))
-        })
+        .map(|eval| eval.eval(row).map_err(eval_error_to_exec_error))
         .collect()
 }
 

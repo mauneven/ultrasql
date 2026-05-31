@@ -44,7 +44,7 @@ use crate::row_spill::RowSpillFile;
 use crate::seq_scan::build_batch;
 use crate::value_key::{decimal_values_equal, hash_decimal_key};
 use crate::work_mem::WorkMemBudget;
-use crate::{CancelFlag, ExecError, Operator, OperatorSpillProfile};
+use crate::{CancelFlag, ExecError, Operator, OperatorSpillProfile, eval_error_to_exec_error};
 
 /// Maximum rows per emitted batch, matching the `ARCHITECTURE.md` section 9 contract.
 const BATCH_TARGET_ROWS: usize = 4096;
@@ -705,10 +705,7 @@ fn partition_for_group_key_values(values: &[Value]) -> Result<usize, ExecError> 
 fn eval_group_key_values(evals: &[Eval], row: &[Value]) -> Result<Vec<Value>, ExecError> {
     evals
         .iter()
-        .map(|eval| {
-            eval.eval(row)
-                .map_err(|err| ExecError::TypeMismatch(err.to_string()))
-        })
+        .map(|eval| eval.eval(row).map_err(eval_error_to_exec_error))
         .collect()
 }
 
@@ -1635,7 +1632,7 @@ fn accumulate(
         .map(|expr| {
             Eval::new(expr.clone())
                 .eval(row)
-                .map_err(|err| ExecError::TypeMismatch(err.to_string()))
+                .map_err(eval_error_to_exec_error)
         })
         .transpose()?;
 
@@ -1833,7 +1830,7 @@ fn percentile_fraction(
     })?;
     let value = Eval::new(direct_arg.clone())
         .eval(row)
-        .map_err(|err| ExecError::TypeMismatch(err.to_string()))?;
+        .map_err(eval_error_to_exec_error)?;
     if value.is_null() {
         return Ok(None);
     }
@@ -1874,7 +1871,7 @@ fn percentile_sample(agg: &LogicalAggregateExpr, row: &[Value]) -> Result<Value,
         })?;
     Eval::new(sample_expr.clone())
         .eval(row)
-        .map_err(|err| ExecError::TypeMismatch(err.to_string()))
+        .map_err(eval_error_to_exec_error)
 }
 
 /// Coerce a numeric `Value` to `f64` for floating-point folds.

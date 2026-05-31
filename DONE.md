@@ -1845,6 +1845,10 @@ as a concise evidence ledger; roadmap stays for open gates only.
 - Runtime errors inside join predicate and join-key expression evaluation now
   preserve their typed SQLSTATEs instead of collapsing to `XX000`. Evidence:
   `cargo test -p ultrasql-server --test join_round_trip join_predicate_runtime_cast_error_returns_22p02 -- --nocapture`.
+- Runtime errors inside aggregate group-key, aggregate argument, and ordered-set
+  expression evaluation now preserve their typed SQLSTATEs instead of
+  collapsing to `XX000`. Evidence:
+  `cargo test -p ultrasql-server --test having_round_trip group_by_runtime_cast_error_returns_22p02 -- --nocapture`.
 - Runtime scalar/temporal text casts to integer, float, boolean, date, time,
   timestamp, timestamptz, and timetz now report SQLSTATE `22P02` for invalid
   column text. Evidence:
