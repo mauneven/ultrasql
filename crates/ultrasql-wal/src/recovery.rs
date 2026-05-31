@@ -188,8 +188,7 @@ pub fn recover_with_target(
         while offset < buf.len() {
             match WalRecord::decode(&buf[offset..]) {
                 Ok((record, used)) => {
-                    let used_u64 = u64::try_from(used).unwrap_or(u64::MAX);
-                    let record_end = stream_pos.saturating_add(used_u64);
+                    let record_end = checked_record_end(stream_pos, used)?;
                     if let Some(target_lsn) = target.target_lsn
                         && record_end > target_lsn.raw()
                     {
@@ -216,7 +215,7 @@ pub fn recover_with_target(
                     offset += used;
                     stream_pos = record_end;
                     last_good_pos = stream_pos;
-                    record_count = record_count.saturating_add(1);
+                    record_count = checked_record_count(record_count)?;
                     if decision == ReplayDecision::StopAfterRecord {
                         info!(
                             last_lsn = last_good_pos,
@@ -253,6 +252,25 @@ pub fn recover_with_target(
         "wal recovery complete"
     );
     Ok(Lsn::new(last_good_pos))
+}
+
+fn checked_record_end(stream_pos: u64, used: usize) -> Result<u64, RecoveryError> {
+    let used_u64 = u64::try_from(used).map_err(|_| {
+        RecoveryError::Record(WalRecordError::Malformed("recovery record length overflow"))
+    })?;
+    stream_pos
+        .checked_add(used_u64)
+        .ok_or(RecoveryError::Record(WalRecordError::Malformed(
+            "recovery lsn overflow",
+        )))
+}
+
+fn checked_record_count(record_count: u64) -> Result<u64, RecoveryError> {
+    record_count
+        .checked_add(1)
+        .ok_or(RecoveryError::Record(WalRecordError::Malformed(
+            "recovery record count overflow",
+        )))
 }
 
 fn read_segment_bytes(path: &Path) -> Result<Vec<u8>, RecoveryError> {
@@ -313,7 +331,7 @@ mod tests {
     use ultrasql_core::Xid;
 
     use crate::payload::CommitPayload;
-    use crate::{RecordType, WalRecord};
+    use crate::{RecordType, WalRecord, WalRecordError};
 
     use super::*;
 
@@ -424,6 +442,32 @@ mod tests {
             err.to_string()
                 .contains("WAL segment exceeds recovery read limit"),
             "{err}"
+        );
+    }
+
+    #[test]
+    fn recovery_record_end_rejects_stream_position_overflow() {
+        let err = super::checked_record_end(u64::MAX, 1)
+            .expect_err("record end overflow must not saturate");
+        assert!(
+            matches!(
+                err,
+                RecoveryError::Record(WalRecordError::Malformed("recovery lsn overflow"))
+            ),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn recovery_record_count_rejects_overflow() {
+        let err = super::checked_record_count(u64::MAX)
+            .expect_err("record count overflow must not saturate");
+        assert!(
+            matches!(
+                err,
+                RecoveryError::Record(WalRecordError::Malformed("recovery record count overflow"))
+            ),
+            "{err:?}"
         );
     }
 

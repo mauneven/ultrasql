@@ -2126,3 +2126,6 @@ as a concise evidence ledger; roadmap stays for open gates only.
 - WAL replay now checks record-position LSN advancement instead of saturating
   recovery state near `u64::MAX`. Evidence:
   `cargo test -p ultrasql-wal applier::tests::replay_lsn_advance_rejects_overflow --lib -- --nocapture`.
+- WAL recovery scanning now checks decoded record-end and recovered-record
+  count arithmetic instead of silently saturating scanner state. Evidence:
+  `cargo test -p ultrasql-wal recovery::tests::recovery_record_ --lib -- --nocapture`.
