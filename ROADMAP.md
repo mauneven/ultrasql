@@ -70,10 +70,10 @@ file focused on what still blocks production.
 - `MONEY`: locale-sensitive formatting/input beyond deterministic
   `lc_monetary` GUC round trips, explicit typmod/precision edge casts, and
   range-parity evidence remain open.
-- Date/time remaining: timezone conversion breadth and locale variants beyond
-  the completed timestamp/timestamptz `AT TIME ZONE`, fixed-offset
-  `TIMETZ AT TIME ZONE`, `TIMESTAMPTZ` IANA parser/session display, non-ISO
-  `DateStyle` display, and date-prefixed `TIMETZ` named-zone parser.
+- Date/time remaining: full timezone edge parity beyond the completed
+  timestamp/timestamptz `AT TIME ZONE`, fixed-offset `TIMETZ AT TIME ZONE`,
+  deterministic abbreviation parser, IANA timestamptz parser/session display,
+  DateStyle output, and date-prefixed `TIMETZ` named-zone parser.
 - Arrays: broader coercion breadth and every supported element family beyond
   the completed metadata/scalar/mutation subset.
 - JSON/JSONB: full SQL/JSON path parity beyond the supported subset, including
