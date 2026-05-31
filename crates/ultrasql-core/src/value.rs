@@ -1328,6 +1328,23 @@ pub fn xml_xpath_element_fragments_with_namespaces(
         };
         return Some(vec![after]);
     }
+    if let Some(arguments) = xml_xpath_concat_arguments(path) {
+        let mut out = String::new();
+        for argument in arguments {
+            match argument {
+                XmlXPathValueArgument::Path(inner_path) => {
+                    let matches = xml_xpath_element_fragments_with_namespaces(
+                        inner_path,
+                        document,
+                        namespace_bindings,
+                    )?;
+                    out.push_str(&xml_xpath_first_string_value(&matches));
+                }
+                XmlXPathValueArgument::Literal(value) => out.push_str(&value),
+            }
+        }
+        return Some(vec![out]);
+    }
     if let Some(inner_path) = xml_xpath_count_argument(path) {
         let matches =
             xml_xpath_element_fragments_with_namespaces(inner_path, document, namespace_bindings)?;
@@ -1455,6 +1472,71 @@ fn xml_xpath_string_literal_function_arguments<'a>(
     let right = inner[comma + 1..].trim();
     let literal = unquote_xml_path_literal(right)?;
     left.starts_with('/').then_some((left, literal))
+}
+
+#[derive(Debug)]
+enum XmlXPathValueArgument<'a> {
+    Path(&'a str),
+    Literal(String),
+}
+
+fn xml_xpath_concat_arguments(path: &str) -> Option<Vec<XmlXPathValueArgument<'_>>> {
+    let trimmed = path.trim();
+    let inner = trimmed
+        .strip_prefix("concat")?
+        .trim_start()
+        .strip_prefix('(')?
+        .strip_suffix(')')?
+        .trim();
+    let parts = xml_xpath_top_level_comma_split(inner)?;
+    (parts.len() >= 2)
+        .then(|| {
+            parts
+                .into_iter()
+                .map(xml_xpath_value_argument)
+                .collect::<Option<Vec<_>>>()
+        })
+        .flatten()
+}
+
+fn xml_xpath_value_argument(argument: &str) -> Option<XmlXPathValueArgument<'_>> {
+    let argument = argument.trim();
+    if argument.starts_with('/') {
+        Some(XmlXPathValueArgument::Path(argument))
+    } else {
+        unquote_xml_path_literal(argument).map(XmlXPathValueArgument::Literal)
+    }
+}
+
+fn xml_xpath_top_level_comma_split(text: &str) -> Option<Vec<&str>> {
+    let mut parts = Vec::new();
+    let mut start = 0;
+    let mut quote = None;
+    for (idx, ch) in text.char_indices() {
+        match quote {
+            Some(active) if ch == active => quote = None,
+            Some(_) => {}
+            None if matches!(ch, '\'' | '"') => quote = Some(ch),
+            None if ch == ',' => {
+                let part = text[start..idx].trim();
+                if part.is_empty() {
+                    return None;
+                }
+                parts.push(part);
+                start = idx + ch.len_utf8();
+            }
+            None => {}
+        }
+    }
+    if quote.is_some() {
+        return None;
+    }
+    let part = text[start..].trim();
+    if part.is_empty() {
+        return None;
+    }
+    parts.push(part);
+    Some(parts)
 }
 
 fn xml_xpath_top_level_comma(text: &str) -> Option<usize> {
@@ -3362,6 +3444,20 @@ mod tests {
                 r#"<root><item>Ada Lovelace</item></root>"#
             ),
             Some(vec![String::new()])
+        );
+        assert_eq!(
+            xml_xpath_element_fragments(
+                r#"concat(/root/first, " ", /root/last)"#,
+                r#"<root><first>Ada</first><last>Lovelace</last></root>"#
+            ),
+            Some(vec!["Ada Lovelace".to_owned()])
+        );
+        assert_eq!(
+            xml_xpath_element_fragments(
+                r#"concat("prefix-", /root/missing)"#,
+                r#"<root><first>Ada</first></root>"#
+            ),
+            Some(vec!["prefix-".to_owned()])
         );
         let nested = r#"<root><group><item id="1"><name>A</name></item><item id="2"><name>B</name></item></group><name>C</name></root>"#;
         assert_eq!(
