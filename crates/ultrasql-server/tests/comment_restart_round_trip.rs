@@ -91,17 +91,22 @@ async fn comment_respects_schema_qualifier() {
         .client
         .batch_execute(
             "CREATE SCHEMA app; \
-             CREATE TABLE guarded_comment (id INT, label TEXT)",
+             CREATE TABLE guarded_comment (id INT, label TEXT); \
+             CREATE INDEX guarded_comment_idx ON guarded_comment(id)",
         )
         .await
         .expect("create public table and separate schema");
 
-    let table_oid = running
-        .server
-        .catalog_snapshot()
+    let snapshot = running.server.catalog_snapshot();
+    let table_oid = snapshot
         .tables
         .get("guarded_comment")
         .expect("table before rejected comments")
+        .oid;
+    let index_oid = snapshot
+        .indexes
+        .get("guarded_comment_idx")
+        .expect("index before rejected comments")
         .oid;
 
     running
@@ -116,6 +121,12 @@ async fn comment_respects_schema_qualifier() {
         .await
         .expect_err("qualified column comment must not resolve public table");
 
+    running
+        .client
+        .batch_execute("COMMENT ON INDEX app.guarded_comment_idx IS 'wrong index docs'")
+        .await
+        .expect_err("qualified index comment must not resolve public index");
+
     let snapshot = running.server.catalog_snapshot();
     assert!(
         !snapshot
@@ -128,6 +139,12 @@ async fn comment_respects_schema_qualifier() {
             .descriptions
             .contains_key(&(table_oid, Oid::new(PG_CLASS_OID), 2)),
         "wrong-qualified column comment must not write public column description"
+    );
+    assert!(
+        !snapshot
+            .descriptions
+            .contains_key(&(index_oid, Oid::new(PG_CLASS_OID), 0)),
+        "wrong-qualified index comment must not write public index description"
     );
 
     running

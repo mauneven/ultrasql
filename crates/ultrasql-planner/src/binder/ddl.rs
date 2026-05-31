@@ -1579,6 +1579,7 @@ pub(super) fn bind_comment(
         }
         CommentTarget::Index(name) => LogicalCommentTarget::Index {
             index: object_name_simple(name),
+            namespace: object_name_explicit_namespace(name),
         },
         CommentTarget::Column(name) => bind_comment_column_target(name, catalog)?,
     };

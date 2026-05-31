@@ -1382,6 +1382,11 @@ as a concise evidence ledger; roadmap stays for open gates only.
   targets instead of writing `pg_description` metadata for a same-name table in
   another schema. Evidence:
   `cargo test -p ultrasql-server --test comment_restart_round_trip -- --nocapture`.
+- Schema-qualified `COMMENT ON INDEX` now carries explicit namespaces through
+  binding and validates them against the indexed table schema before writing
+  `pg_description`, preventing wrong-qualified index comments on public
+  same-name indexes. Evidence:
+  `cargo test -p ultrasql-server --test comment_restart_round_trip -- --nocapture`.
 - Schema-qualified foreign-key targets now retain the parsed target object
   through binding, so `REFERENCES schema.table(...)` cannot silently bind a
   same-name table in another schema. Evidence:

@@ -2291,12 +2291,18 @@ where
                 self.ensure_table_owner_or_superuser(entry.oid, table)?;
                 (entry.oid, 0)
             }
-            LogicalCommentTarget::Index { index } => {
+            LogicalCommentTarget::Index { index, namespace } => {
                 let entry = snapshot
                     .indexes
                     .get(index)
                     .ok_or_else(|| ultrasql_catalog::CatalogError::not_found(index.clone()))?;
-                let table_name = snapshot.tables_by_oid.get(&entry.table_oid).map_or_else(
+                let table = snapshot.tables_by_oid.get(&entry.table_oid);
+                if let Some(namespace) = namespace
+                    && !table.is_some_and(|table| table.schema_name.eq_ignore_ascii_case(namespace))
+                {
+                    return Err(ultrasql_catalog::CatalogError::not_found(index.clone()).into());
+                }
+                let table_name = table.map_or_else(
                     || format!("oid {}", entry.table_oid.raw()),
                     |table| table.name.clone(),
                 );

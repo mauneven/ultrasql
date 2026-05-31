@@ -1934,7 +1934,21 @@ fn binds_comment_on_table_and_column() {
     assert_eq!(
         target,
         crate::plan::LogicalCommentTarget::Index {
-            index: "users_name_idx".to_owned()
+            index: "users_name_idx".to_owned(),
+            namespace: None,
+        }
+    );
+
+    let qualified_index = parse_and_bind("COMMENT ON INDEX app.users_name_idx IS 'idx'", &cat)
+        .expect("qualified index comment");
+    let LogicalPlan::Comment { target, .. } = qualified_index else {
+        panic!("expected comment plan");
+    };
+    assert_eq!(
+        target,
+        crate::plan::LogicalCommentTarget::Index {
+            index: "users_name_idx".to_owned(),
+            namespace: Some("app".to_owned()),
         }
     );
 }

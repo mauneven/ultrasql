@@ -1433,6 +1433,8 @@ pub enum LogicalCommentTarget {
     Index {
         /// Folded index name.
         index: String,
+        /// Explicit namespace, if the statement qualified the index.
+        namespace: Option<String>,
     },
     /// `COMMENT ON COLUMN table.column`.
     Column {
@@ -2924,9 +2926,12 @@ impl LogicalPlan {
                         let action = if comment.is_some() { "SET" } else { "CLEAR" };
                         let _ = fmt::write(out, format_args!("Comment: TABLE {table} {action}\n"));
                     }
-                    LogicalCommentTarget::Index { index } => {
+                    LogicalCommentTarget::Index { index, namespace } => {
                         let action = if comment.is_some() { "SET" } else { "CLEAR" };
-                        let _ = fmt::write(out, format_args!("Comment: INDEX {index} {action}\n"));
+                        let target = namespace
+                            .as_ref()
+                            .map_or_else(|| index.clone(), |schema| format!("{schema}.{index}"));
+                        let _ = fmt::write(out, format_args!("Comment: INDEX {target} {action}\n"));
                     }
                     LogicalCommentTarget::Column { table, column, .. } => {
                         let action = if comment.is_some() { "SET" } else { "CLEAR" };
