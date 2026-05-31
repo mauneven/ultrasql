@@ -959,7 +959,8 @@ as a concise evidence ledger; roadmap stays for open gates only.
   `cargo test -p ultrasql-server --test role_ddl_round_trip role_catalog_survives_restart -- --nocapture`.
 - Default privileges apply matching templates for future tables and sequences.
 - Persistent RLS policies cover owner, superuser, `BYPASSRLS`, and restart
-  semantics for the documented RAG tenant policy shape.
+  semantics for the documented RAG tenant policy shape. `CREATE POLICY` now
+  requires table ownership or superuser before mutating policy metadata.
 - Row-security metadata reload rejects duplicate table rows and duplicate policy
   names for a table, avoiding ambiguous restart state from tampered sidecar
   rows. Evidence:

@@ -4,12 +4,12 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
-use tokio_postgres::{NoTls, SimpleQueryMessage};
+use tokio_postgres::{NoTls, SimpleQueryMessage, error::SqlState};
 use ultrasql_server::{Server, bind_listener, serve_listener};
 
 mod support;
 
-use support::{shutdown as graceful_shutdown, start_persistent_server};
+use support::{shutdown as graceful_shutdown, start_persistent_server, start_sample_server};
 
 async fn start_server_and_connect() -> (
     tokio_postgres::Client,
@@ -79,6 +79,16 @@ fn simple_rows(messages: &[SimpleQueryMessage]) -> Vec<Vec<String>> {
             _ => None,
         })
         .collect()
+}
+
+fn assert_insufficient_privilege(err: tokio_postgres::Error) {
+    let db = err.as_db_error().expect("database error");
+    assert_eq!(
+        db.code(),
+        &SqlState::INSUFFICIENT_PRIVILEGE,
+        "{}",
+        db.message()
+    );
 }
 
 #[tokio::test]
@@ -177,6 +187,41 @@ async fn rls_tenant_policy_filters_reads_and_checks_inserts() {
     assert_eq!(rows, vec![vec!["doc-b".to_owned()]]);
 
     shutdown(client, server_handle).await;
+}
+
+#[tokio::test]
+async fn non_owner_cannot_create_rls_policy() {
+    let running = start_sample_server("rls_policy_owner_test").await;
+    let client = &running.client;
+
+    for sql in [
+        "CREATE ROLE tester SUPERUSER LOGIN",
+        "CREATE ROLE app_owner LOGIN",
+        "CREATE ROLE rls_attacker LOGIN",
+        "SET ROLE app_owner",
+        "CREATE TABLE rls_policy_owned_docs (tenant_id TEXT NOT NULL)",
+        "RESET ROLE",
+    ] {
+        client.batch_execute(sql).await.expect(sql);
+    }
+
+    let (attacker, attacker_conn) =
+        connect_as(running.bound, "rls_attacker", "rls_policy_attacker").await;
+    assert_insufficient_privilege(
+        attacker
+            .batch_execute(
+                "CREATE POLICY rls_policy_owned_docs_attack \
+                 ON rls_policy_owned_docs \
+                 FOR SELECT TO public \
+                 USING (tenant_id = current_setting('ultrasql.tenant_id', true))",
+            )
+            .await
+            .expect_err("non-owner cannot create RLS policy"),
+    );
+    drop(attacker);
+    attacker_conn.await.expect("attacker connection joins");
+
+    graceful_shutdown(running).await;
 }
 
 #[tokio::test]
