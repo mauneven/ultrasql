@@ -329,6 +329,13 @@ as a concise evidence ledger; roadmap stays for open gates only.
   `cargo test -p ultrasql-core xml_xpath_subset_filters_children_without_entity_resolution --lib -- --nocapture`
   and
   `cargo test -p ultrasql-server --test xml_round_trip xml_functions_validate_securely_and_extract_simple_xpath -- --nocapture`.
+- XML XPath now supports direct `text()="literal"` and `child="literal"`
+  equality predicates for element steps. Direct text predicates compare only
+  the element's own text/CDATA; child equality compares the direct child's
+  XPath string value after namespace-aware name matching. Evidence:
+  `cargo test -p ultrasql-core xml_xpath_subset_filters_children_without_entity_resolution --lib -- --nocapture`
+  and
+  `cargo test -p ultrasql-server --test xml_round_trip xml_functions_validate_securely_and_extract_simple_xpath -- --nocapture`.
 - XML XPath now supports explicit `child::`, `attribute::`, `descendant::`,
   terminal `.`, and terminal `self::node()` steps in the secure local subset,
   reusing the existing element walker without entity expansion or external
@@ -913,7 +920,8 @@ as a concise evidence ledger; roadmap stays for open gates only.
   `substring-before(path, literal)` / `substring-after(path, literal)` string
   slicing, bounded `concat(path-or-literal, ...)`, direct positional
   predicates `[n]`, `[position()=n]`, `[last()]`, and `[position()=last()]`,
-  plus explicit
+  direct `text()="literal"` and `child="literal"` equality predicates, plus
+  explicit
   bounded numeric `number()` / `floor()` / `ceiling()` / `round()` / `sum()`,
   explicit `child::`, `attribute::`, `descendant::`, and terminal self-node
   steps. DTD declarations, external entity expansion, unknown entity

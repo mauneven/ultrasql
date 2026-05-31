@@ -82,7 +82,9 @@ file focused on what still blocks production.
 - XML remaining surface: XPath axes/functions beyond the supported child,
   attribute, descendant, self-node, wildcard, text, namespace, and bounded
   positional predicate subset (`[n]`, `[position()=n]`, `[last()]`,
-  `[position()=last()]`), `true()` / `false()` / `count()` / `string()` /
+  `[position()=last()]`) plus direct `text()="literal"` and
+  `child="literal"` equality predicates, `true()` / `false()` / `count()` /
+  `string()` /
   `boolean()` / `not()` / `name()` / `local-name()` / `normalize-space()` /
   `string-length()` / `contains(path, literal)` / `starts-with(path, literal)` /
   `substring-before(path, literal)` / `substring-after(path, literal)` /
