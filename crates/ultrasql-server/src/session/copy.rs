@@ -46,7 +46,7 @@ use ultrasql_core::{
     encode_pg_numeric_binary, parse_decimal_text, parse_money_text, parse_time_text,
     parse_timestamptz_text, parse_timetz_text,
 };
-use ultrasql_executor::RowCodec;
+use ultrasql_executor::{ExecError, RowCodec};
 use ultrasql_parser::Parser;
 use ultrasql_planner::{
     CopyDirection, CopyFormat as PlanCopyFormat, CopySource, LogicalPlan, bind,
@@ -69,6 +69,37 @@ const COPY_INSERT_BATCH_ROWS: usize = 4096;
 const COPY_AUTODETECT_SAMPLE_BYTES: usize = 64 * 1024;
 const DEFAULT_COPY_BINARY_FILE_LIMIT_BYTES: u64 = 128 * 1024 * 1024;
 const MICROS_PER_DAY: i64 = 86_400_000_000;
+
+fn copy_row_count_overflow(context: &str) -> ServerError {
+    ServerError::Execute(ExecError::NumericFieldOverflow(format!(
+        "{context} row count overflow"
+    )))
+}
+
+fn copy_rows_from_usize(rows: usize, context: &str) -> Result<u64, ServerError> {
+    u64::try_from(rows).map_err(|_| copy_row_count_overflow(context))
+}
+
+fn add_copy_rows(rows: &mut u64, delta: u64, context: &str) -> Result<(), ServerError> {
+    *rows = rows
+        .checked_add(delta)
+        .ok_or_else(|| copy_row_count_overflow(context))?;
+    Ok(())
+}
+
+fn add_copy_batch_rows(rows: &mut u64, batch_len: usize, context: &str) -> Result<(), ServerError> {
+    let delta = copy_rows_from_usize(batch_len, context)?;
+    add_copy_rows(rows, delta, context)
+}
+
+fn increment_copy_rows(rows: &mut u64, context: &str) -> Result<(), ServerError> {
+    add_copy_rows(rows, 1, context)
+}
+
+fn copy_add_row_counts(left: u64, right: u64, context: &str) -> Result<u64, ServerError> {
+    left.checked_add(right)
+        .ok_or_else(|| copy_row_count_overflow(context))
+}
 
 struct CopyRejectTarget {
     entry: TableEntry,
@@ -397,7 +428,7 @@ where
                     ServerCopyFormat::Binary | ServerCopyFormat::Parquet => Vec::new(),
                 };
                 encode_backend(&BackendMessage::CopyData(bytes), &mut wire_buf);
-                rows_sent = rows_sent.saturating_add(1);
+                increment_copy_rows(&mut rows_sent, "COPY TO STDOUT")?;
             }
             if let Some(e) = iter_err {
                 Err(e)
@@ -508,7 +539,17 @@ where
                             }
                         }
                         if payload_batch.len() == COPY_INSERT_BATCH_ROWS {
-                            let batch_len = u64::try_from(payload_batch.len()).unwrap_or(u64::MAX);
+                            if let Err(e) = add_copy_batch_rows(
+                                &mut rows_inserted,
+                                payload_batch.len(),
+                                "COPY FROM STDIN",
+                            ) {
+                                if let Err(abort_err) = self.state.txn_manager.abort(txn) {
+                                    warn!(error = %abort_err, "COPY FROM autocommit abort failed");
+                                }
+                                self.drain_copy_remainder().await?;
+                                return Err(e);
+                            }
                             if let Err(e) =
                                 self.flush_copy_insert_batch(entry, &payload_batch, &txn)
                             {
@@ -518,7 +559,6 @@ where
                                 self.drain_copy_remainder().await?;
                                 return Err(e);
                             }
-                            rows_inserted = rows_inserted.saturating_add(batch_len);
                             payload_batch.clear();
                         }
                     }
@@ -596,14 +636,20 @@ where
         }
 
         if !payload_batch.is_empty() {
-            let batch_len = u64::try_from(payload_batch.len()).unwrap_or(u64::MAX);
+            if let Err(e) =
+                add_copy_batch_rows(&mut rows_inserted, payload_batch.len(), "COPY FROM STDIN")
+            {
+                if let Err(abort_err) = self.state.txn_manager.abort(txn) {
+                    warn!(error = %abort_err, "COPY FROM autocommit abort failed");
+                }
+                return Err(e);
+            }
             if let Err(e) = self.flush_copy_insert_batch(entry, &payload_batch, &txn) {
                 if let Err(abort_err) = self.state.txn_manager.abort(txn) {
                     warn!(error = %abort_err, "COPY FROM autocommit abort failed");
                 }
                 return Err(e);
             }
-            rows_inserted = rows_inserted.saturating_add(batch_len);
         }
 
         if rows_inserted > 0 {
@@ -724,7 +770,8 @@ where
             .as_ref()
             .and_then(|state| state.target.as_ref())
             .map_or(0, |target| target.rows);
-        self.finalise_copy_from_commit(txn, rows.saturating_add(reject_rows), "COPY FROM file")?;
+        let rows_changed = copy_add_row_counts(rows, reject_rows, "COPY FROM file")?;
+        self.finalise_copy_from_commit(txn, rows_changed, "COPY FROM file")?;
         self.state.note_commit_for_gc();
         self.state.note_table_modifications(&entry.name, rows);
         if let Some(reject_target) = reject_state.and_then(|state| state.target) {
@@ -795,7 +842,7 @@ where
         err: &ServerError,
         txn: &Transaction,
     ) -> Result<(), ServerError> {
-        let next_bad_rows = state.bad_rows.saturating_add(1);
+        let next_bad_rows = copy_add_row_counts(state.bad_rows, 1, "COPY reject rows")?;
         if next_bad_rows > state.max_errors {
             return Err(ServerError::CopyFormat(format!(
                 "COPY max_errors exceeded: {next_bad_rows} bad rows (limit {})",
@@ -819,7 +866,7 @@ where
             .encode(&row)
             .map_err(|e| ServerError::CopyFormat(format!("COPY reject row encode: {e}")))?;
         target.payload_batch.push(payload);
-        target.rows = target.rows.saturating_add(1);
+        increment_copy_rows(&mut target.rows, "COPY reject target")?;
         if target.payload_batch.len() == COPY_INSERT_BATCH_ROWS {
             self.flush_copy_reject_batch(target, txn)?;
         }
@@ -917,9 +964,8 @@ where
             record.clear();
             payload_batch.push(payload);
             if payload_batch.len() == COPY_INSERT_BATCH_ROWS {
-                let batch_len = u64::try_from(payload_batch.len()).unwrap_or(u64::MAX);
+                add_copy_batch_rows(&mut rows_inserted, payload_batch.len(), "COPY FROM file")?;
                 self.flush_copy_insert_batch(entry, payload_batch, txn)?;
-                rows_inserted = rows_inserted.saturating_add(batch_len);
                 payload_batch.clear();
             }
         }
@@ -988,9 +1034,8 @@ where
         reject_state: Option<&mut CopyRejectState>,
     ) -> Result<u64, ServerError> {
         if !payload_batch.is_empty() {
-            let batch_len = u64::try_from(payload_batch.len()).unwrap_or(u64::MAX);
+            add_copy_batch_rows(&mut rows_inserted, payload_batch.len(), "COPY FROM file")?;
             self.flush_copy_insert_batch(entry, payload_batch, txn)?;
-            rows_inserted = rows_inserted.saturating_add(batch_len);
             payload_batch.clear();
         }
         if let Some(state) = reject_state {
@@ -1021,7 +1066,7 @@ where
                 &mut jsonb_shape_cache,
             )?
         };
-        let rows = u64::try_from(payloads.len()).unwrap_or(u64::MAX);
+        let rows = copy_rows_from_usize(payloads.len(), "binary COPY FROM")?;
         let txn = self.state.txn_manager.begin(IsolationLevel::ReadCommitted);
         self.flush_copy_insert_batch(entry, &payloads, &txn)?;
         self.finalise_copy_from_commit(txn, rows, "binary COPY FROM")?;
@@ -1239,7 +1284,7 @@ where
                 ServerCopyFormat::Csv => out.extend_from_slice(&encode_csv_row(&cells, opts)),
                 ServerCopyFormat::Binary | ServerCopyFormat::Parquet => {}
             }
-            rows = rows.saturating_add(1);
+            increment_copy_rows(&mut rows, "COPY TO file")?;
         }
         if let Err(e) = self.state.txn_manager.commit(txn) {
             warn!(error = %e, "COPY TO file scan commit failed");
@@ -1273,7 +1318,7 @@ where
                 .decode(&tuple.data)
                 .map_err(|e| ServerError::CopyFormat(format!("binary COPY row decode: {e}")))?;
             append_binary_copy_row(&mut out, &row, &entry.schema, columns, schema)?;
-            rows = rows.saturating_add(1);
+            increment_copy_rows(&mut rows, "binary COPY TO")?;
         }
         append_i16_be(&mut out, -1);
         if let Err(e) = self.state.txn_manager.commit(txn) {
@@ -1608,7 +1653,7 @@ fn copy_rows_from_select_result(
                     ));
                 }
             }
-            rows = rows.saturating_add(1);
+            increment_copy_rows(&mut rows, "COPY query")?;
         }
     }
     Ok((out, rows))
@@ -3136,6 +3181,19 @@ b"#
         assert_eq!(format_float_f32(f32::INFINITY), b"Infinity".to_vec());
         assert_eq!(format_float_f64(f64::NEG_INFINITY), b"-Infinity".to_vec());
         assert_eq!(format_float_f64(f64::NAN), b"NaN".to_vec());
+    }
+
+    #[test]
+    fn copy_row_count_helpers_reject_overflow() {
+        let mut rows = u64::MAX;
+        let err = add_copy_rows(&mut rows, 1, "COPY test")
+            .expect_err("COPY row counter overflow must not saturate");
+        assert_eq!(err.sqlstate(), "22003");
+        assert_eq!(rows, u64::MAX);
+
+        let mut rows = 1;
+        add_copy_batch_rows(&mut rows, 2, "COPY test").expect("small batch count");
+        assert_eq!(rows, 3);
     }
 
     fn copy_env_test_lock() -> std::sync::MutexGuard<'static, ()> {

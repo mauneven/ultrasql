@@ -2132,3 +2132,7 @@ as a concise evidence ledger; roadmap stays for open gates only.
 - Work-memory reservations now reject atomic counter overflow even when tests
   configure `u64::MAX` as the budget limit. Evidence:
   `cargo test -p ultrasql-executor work_mem::tests --lib -- --nocapture`.
+- Text, binary, file, STDIN, and query COPY row counters now use checked
+  command-tag arithmetic and return SQLSTATE `22003` on overflow instead of
+  saturating. Evidence:
+  `cargo test -p ultrasql-server session::copy::tests::copy_row_count_helpers_reject_overflow --lib -- --nocapture`.
