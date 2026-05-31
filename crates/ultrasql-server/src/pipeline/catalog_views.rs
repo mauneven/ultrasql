@@ -264,7 +264,9 @@ fn virtual_rows(name: &str, ctx: &LowerCtx<'_>) -> Option<(Schema, Vec<Vec<Value
         )),
         "pg_catalog.pg_publication" => Some((schema_pg_publication(), rows_pg_publication(ctx))),
         "pg_catalog.pg_subscription" => Some((schema_pg_subscription(), rows_pg_subscription(ctx))),
-        "pg_catalog.pg_publication_rel" => Some((schema_pg_publication_rel(), Vec::new())),
+        "pg_catalog.pg_publication_rel" => {
+            Some((schema_pg_publication_rel(), rows_pg_publication_rel(ctx)))
+        }
         "pg_catalog.pg_publication_tables" => Some((
             schema_pg_publication_tables(),
             rows_pg_publication_tables(ctx),
@@ -2789,7 +2791,7 @@ fn rows_pg_publication(ctx: &LowerCtx<'_>) -> Vec<Vec<Value>> {
         .enumerate()
         .map(|(idx, publication)| {
             vec![
-                Value::Int64(90_000 + i64::try_from(idx).unwrap_or(i64::MAX)),
+                Value::Int64(publication_oid(idx)),
                 v_text(publication.name),
                 Value::Int64(10),
                 Value::Bool(false),
@@ -2800,6 +2802,10 @@ fn rows_pg_publication(ctx: &LowerCtx<'_>) -> Vec<Vec<Value>> {
             ]
         })
         .collect()
+}
+
+fn publication_oid(idx: usize) -> i64 {
+    90_000 + i64::try_from(idx).unwrap_or(i64::MAX)
 }
 
 fn schema_pg_subscription() -> Schema {
@@ -2844,6 +2850,30 @@ fn schema_pg_publication_rel() -> Schema {
         Field::required("prpubid", DataType::Int64),
         Field::required("prrelid", DataType::Int64),
     ])
+}
+
+fn rows_pg_publication_rel(ctx: &LowerCtx<'_>) -> Vec<Vec<Value>> {
+    let public_table_oids = table_entries(ctx)
+        .into_iter()
+        .filter(|entry| entry.schema_name == "public")
+        .map(|entry| (entry.name, i64::from(entry.oid.raw())))
+        .collect::<HashMap<_, _>>();
+
+    ctx.logical_replication
+        .publications()
+        .into_iter()
+        .enumerate()
+        .flat_map(|(idx, publication)| {
+            let prpubid = publication_oid(idx);
+            let table_oids = publication
+                .tables()
+                .filter_map(|table| public_table_oids.get(table).copied())
+                .collect::<Vec<_>>();
+            table_oids
+                .into_iter()
+                .map(move |prrelid| vec![Value::Int64(prpubid), Value::Int64(prrelid)])
+        })
+        .collect()
 }
 
 fn schema_pg_publication_tables() -> Schema {

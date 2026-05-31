@@ -810,6 +810,11 @@ as a concise evidence ledger; roadmap stays for open gates only.
 - `information_schema.routines` is backed by the same builtin routine surface,
   giving SQL-standard introspection a non-empty system function view. Evidence:
   `cargo test -p ultrasql-server --test catalog_views_round_trip pg_catalog_and_information_schema_reflect_runtime_objects -- --nocapture`.
+- `pg_catalog.pg_publication_rel` now exposes relation links for existing
+  publications using stable publication OIDs plus catalog table OIDs, so
+  replication and psql introspection joins no longer see an empty link table.
+  Evidence:
+  `cargo test -p ultrasql-server --test logical_replication_round_trip create_publication_records_committed_dml_stream -- --nocapture`.
 - `GUI introspection probes` exist for `pgAdmin`, `DBeaver`, and `DataGrip`.
 - Migration tool certification covers `Flyway`, `Liquibase`, and `Alembic`.
 

@@ -107,6 +107,21 @@ async fn create_publication_records_committed_dml_stream() {
     assert_eq!(publication_table_rows.len(), 1);
     assert_eq!(publication_table_rows[0].get::<_, String>(0), "public");
     assert_eq!(publication_table_rows[0].get::<_, String>(1), "events");
+    let publication_rel_rows = client
+        .query(
+            "SELECT p.pubname, c.relname \
+             FROM pg_catalog.pg_publication p \
+             JOIN pg_catalog.pg_publication_rel pr ON p.oid = pr.prpubid \
+             JOIN pg_catalog.pg_class c ON pr.prrelid = c.oid \
+             WHERE p.pubname = 'pub_events' \
+             ORDER BY c.relname",
+            &[],
+        )
+        .await
+        .expect("pg_publication_rel row");
+    assert_eq!(publication_rel_rows.len(), 1);
+    assert_eq!(publication_rel_rows[0].get::<_, String>(0), "pub_events");
+    assert_eq!(publication_rel_rows[0].get::<_, String>(1), "events");
 
     client
         .batch_execute("INSERT INTO events VALUES (1, 10), (2, 20)")
