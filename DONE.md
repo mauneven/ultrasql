@@ -1129,7 +1129,10 @@ as a concise evidence ledger; roadmap stays for open gates only.
   `role_catalog_survives_restart` verifies role attributes and `SET ROLE`
   membership after `Server::init` restart, and
   `role_catalog_rolls_back_when_metadata_slot_is_unsafe` verifies unsafe
-  metadata slots do not leave failed role DDL in memory.
+  metadata slots do not leave failed role DDL in memory. The auth metadata
+  loader rejects duplicate role names or OIDs instead of silently applying
+  last-row-wins state. Evidence:
+  `cargo test -p ultrasql-server --test role_ddl_round_trip role_metadata_rejects_duplicate_role_names_on_rebuild -- --nocapture`.
 - Privilege catalog restart persistence is covered by `pg_privileges.meta`:
   `GRANT`, `REVOKE`, `ALTER DEFAULT PRIVILEGES`, and default-privilege
   application on future tables, materialized views, and sequences snapshot ACLs

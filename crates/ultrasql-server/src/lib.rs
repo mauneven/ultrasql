@@ -5119,6 +5119,8 @@ impl Server {
 
         let mut roles = Vec::new();
         let mut memberships = Vec::new();
+        let mut seen_role_names = std::collections::HashSet::new();
+        let mut seen_role_oids = std::collections::HashSet::new();
         for (line_no, line) in text.lines().enumerate() {
             if line.is_empty() || line.starts_with('#') {
                 continue;
@@ -5126,9 +5128,25 @@ impl Server {
             let parts = line.split('\t').collect::<Vec<_>>();
             match parts.first().copied() {
                 Some("role") if parts.len() == 13 => {
+                    let name = metadata_unescape(parts[1])?;
+                    if !seen_role_names.insert(name.to_ascii_lowercase()) {
+                        return Err(ServerError::ddl(format!(
+                            "duplicate role metadata name '{}' on line {}",
+                            name,
+                            line_no + 1
+                        )));
+                    }
+                    let oid = parse_role_u32(parts[2], line_no, "oid")?;
+                    if !seen_role_oids.insert(oid) {
+                        return Err(ServerError::ddl(format!(
+                            "duplicate role metadata oid {} on line {}",
+                            oid,
+                            line_no + 1
+                        )));
+                    }
                     roles.push(auth::RoleEntry {
-                        name: metadata_unescape(parts[1])?,
-                        oid: parse_role_u32(parts[2], line_no, "oid")?,
+                        name,
+                        oid,
                         password: parse_password_hash(&metadata_unescape(parts[3])?, line_no)?,
                         is_superuser: parse_role_bool(parts[4], line_no, "is_superuser")?,
                         inherit: parse_role_bool(parts[5], line_no, "inherit")?,

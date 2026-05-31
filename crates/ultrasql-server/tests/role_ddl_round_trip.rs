@@ -4,6 +4,7 @@ mod support;
 
 use support::{shutdown, start_persistent_server, start_sample_server};
 use tokio_postgres::NoTls;
+use ultrasql_server::Server;
 
 #[tokio::test]
 async fn create_alter_drop_role_and_user_update_catalog_views() {
@@ -89,6 +90,26 @@ async fn create_alter_drop_role_and_user_update_catalog_views() {
     assert_eq!(remaining.get::<_, i64>(0), 0);
 
     shutdown(running).await;
+}
+
+#[test]
+fn role_metadata_rejects_duplicate_role_names_on_rebuild() {
+    let data_dir = tempfile::TempDir::new().expect("temp data dir");
+    std::fs::write(
+        data_dir.path().join("pg_auth.meta"),
+        concat!(
+            "# ultrasql auth runtime v1\n",
+            "role\tdupe\t17000\t\tfalse\ttrue\tfalse\tfalse\ttrue\tfalse\tfalse\t-1\t\n",
+            "role\tDUPE\t17001\t\tfalse\ttrue\tfalse\tfalse\ttrue\tfalse\tfalse\t-1\t\n"
+        ),
+    )
+    .expect("write duplicate auth metadata");
+
+    let err = Server::init(data_dir.path()).expect_err("duplicate role metadata rejected");
+    assert!(
+        err.to_string().contains("duplicate role metadata"),
+        "expected duplicate role metadata rejection, got {err}"
+    );
 }
 
 #[tokio::test]
