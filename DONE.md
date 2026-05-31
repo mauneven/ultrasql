@@ -1824,6 +1824,9 @@ as a concise evidence ledger; roadmap stays for open gates only.
 - Fused `Int32` fast-path updates now use checked arithmetic and return
   SQLSTATE `22003` on overflow instead of wrapping values. Evidence:
   `cargo test -p ultrasql-server --test constraint_round_trip fused_update_int32_overflow_returns_22003 -- --nocapture`.
+- Generic `ModifyTable` `Int32` update fast-payload construction now rejects
+  overflow instead of emitting wrapped tuple bytes. Evidence:
+  `cargo test -p ultrasql-executor update_fast_payloads_reject_int32_overflow --lib -- --nocapture`.
 - Runtime errors inside omitted-column `DEFAULT` expression evaluation now
   preserve their typed SQLSTATEs and do not insert the row. Evidence:
   `cargo test -p ultrasql-server --test constraint_round_trip default_expression_runtime_error_returns_sqlstate -- --nocapture`.

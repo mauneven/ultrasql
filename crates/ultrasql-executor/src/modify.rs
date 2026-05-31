@@ -2081,10 +2081,9 @@ impl<L: PageLoader + Send + Sync + std::fmt::Debug + 'static> ModifyTable<L> {
 ///     bytes 5..9  val LE i32       unchanged unless target_col == 1
 /// ```
 ///
-/// The new value of the target column is `old + spec.delta`
-/// (`wrapping_add`, matching the slow-path `int32_arith(Add)` semantics
-/// the binder validated). No `batch_to_rows`, no `Eval`, no
-/// `RowCodec::encode` tree walk.
+/// The new value of the target column is `old + spec.delta` with overflow
+/// checked before any payload is emitted. No `batch_to_rows`, no `Eval`,
+/// no `RowCodec::encode` tree walk.
 fn build_update_edits_int32_pair(
     batch: &Batch,
     relation: RelationId,
@@ -2131,11 +2130,8 @@ fn build_update_edits_int32_pair(
         let id_v = id_data[i];
         let val_v = val_data[i];
         // Apply the assignment to the targeted column.
-        let (new_id, new_val) = if spec.target_col_in_relation == 0 {
-            (id_v.wrapping_add(spec.delta), val_v)
-        } else {
-            (id_v, val_v.wrapping_add(spec.delta))
-        };
+        let (new_id, new_val) =
+            checked_update_int32_pair_add(id_v, val_v, spec.target_col_in_relation, spec.delta)?;
         // Inline 9-byte payload assembled into a `SmallVec<[u8; 16]>`
         // so the per-row encode pays no heap allocation: the entire
         // body lives in the SmallVec's inline buffer.
@@ -2148,6 +2144,23 @@ fn build_update_edits_int32_pair(
         out.push((TupleId::new(page_id, slot_u16), payload));
     }
     Ok(out)
+}
+
+fn checked_update_int32_pair_add(
+    id: i32,
+    val: i32,
+    target_col: usize,
+    delta: i32,
+) -> Result<(i32, i32), ExecError> {
+    if target_col == 0 {
+        id.checked_add(delta)
+            .map(|new_id| (new_id, val))
+            .ok_or_else(|| ExecError::NumericFieldOverflow("Int32 id update overflow".into()))
+    } else {
+        val.checked_add(delta)
+            .map(|new_val| (id, new_val))
+            .ok_or_else(|| ExecError::NumericFieldOverflow("Int32 value update overflow".into()))
+    }
 }
 
 /// Extract every `TupleId` from a `Batch` whose first two columns
@@ -2769,6 +2782,28 @@ mod tests {
         assert!(extract_tid_and_row(&[Value::Text("bad".into())], rel()).is_err());
         assert!(extract_tid_and_row(&[Value::Int32(-1), Value::Int32(1)], rel()).is_err());
         assert!(extract_tid_and_row(&[Value::Int32(1), Value::Int32(70_000)], rel()).is_err());
+    }
+
+    #[test]
+    fn update_fast_payloads_reject_int32_overflow() {
+        let batch = Batch::new([
+            Column::Int32(NumericColumn::from_data(vec![2])),
+            Column::Int32(NumericColumn::from_data(vec![7])),
+            Column::Int32(NumericColumn::from_data(vec![10])),
+            Column::Int32(NumericColumn::from_data(vec![i32::MAX])),
+        ])
+        .expect("batch");
+
+        let err = build_update_edits_int32_pair(
+            &batch,
+            rel(),
+            UpdateFastPathInt32Pair {
+                target_col_in_relation: 1,
+                delta: 1,
+            },
+        )
+        .expect_err("overflow must reject fast update payload");
+        assert!(matches!(err, ExecError::NumericFieldOverflow(_)), "{err:?}");
     }
 
     #[test]
