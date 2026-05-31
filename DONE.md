@@ -2189,3 +2189,6 @@ as a concise evidence ledger; roadmap stays for open gates only.
 - COPY binary input loading now checks sentinel read limits and byte-count
   conversion instead of saturating local file reads. Evidence:
   `cargo test -p ultrasql-server session::copy::tests::copy_binary_take_limit_rejects_overflow --lib -- --nocapture`.
+- Heap bulk-load inserted-row accounting now rejects overflow instead of
+  saturating the reported inserted row count. Evidence:
+  `cargo test -p ultrasql-storage heap::tests::heap_u64_count_add_rejects_overflow --lib -- --nocapture`.

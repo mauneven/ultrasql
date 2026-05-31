@@ -22,7 +22,9 @@ use ultrasql_mvcc::tuple_header::TUPLE_HEADER_SIZE;
 use crate::buffer_pool::{BufferPool, PageGuard, PageLoader};
 use crate::page::PageError;
 
-use super::{HeapAccess, HeapError, InsertOptions, checked_tuple_space_needed};
+use super::{
+    HeapAccess, HeapError, InsertOptions, checked_heap_u64_count_add, checked_tuple_space_needed,
+};
 
 impl<L: PageLoader> HeapAccess<L> {
     /// Insert a tuple into the relation.
@@ -379,10 +381,7 @@ impl<L: PageLoader> HeapAccess<L> {
                 vm.mark_all_visible(page_id.relation, page_id.block);
             }
             row_idx += drained;
-            inserted = inserted.saturating_add(
-                u64::try_from(drained)
-                    .map_err(|_| HeapError::MalformedHeader("bulk load count overflow"))?,
-            );
+            inserted = checked_heap_u64_count_add(inserted, drained, "bulk load count overflow")?;
             insert_cursor.store(block, Ordering::Release);
         }
 

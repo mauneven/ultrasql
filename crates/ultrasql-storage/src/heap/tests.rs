@@ -126,6 +126,15 @@ fn heap_u32_count_add_rejects_overflow() {
     ));
 }
 
+#[test]
+fn heap_u64_count_add_rejects_overflow() {
+    let err = checked_heap_u64_count_add(u64::MAX, 1, "bulk load count overflow").unwrap_err();
+    assert!(matches!(
+        err,
+        HeapError::MalformedHeader("bulk load count overflow")
+    ));
+}
+
 #[derive(Debug, Default)]
 struct CountingOracle {
     inner: MapOracle,

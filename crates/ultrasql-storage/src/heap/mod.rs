@@ -452,6 +452,18 @@ fn checked_heap_u32_count_add(
 }
 
 #[inline]
+fn checked_heap_u64_count_add(
+    current: u64,
+    delta: usize,
+    error: &'static str,
+) -> Result<u64, HeapError> {
+    let delta = u64::try_from(delta).map_err(|_| HeapError::MalformedHeader(error))?;
+    current
+        .checked_add(delta)
+        .ok_or(HeapError::MalformedHeader(error))
+}
+
+#[inline]
 fn checked_tuple_space_needed(tuple_size: usize) -> Result<usize, HeapError> {
     tuple_size
         .checked_add(crate::page::ITEMID_SIZE)
