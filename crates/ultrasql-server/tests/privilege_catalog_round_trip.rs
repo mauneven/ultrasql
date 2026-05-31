@@ -1011,6 +1011,40 @@ async fn default_privileges_apply_to_future_objects_only() {
     shutdown(running).await;
 }
 
+#[tokio::test]
+async fn drop_schema_removes_schema_scoped_default_privileges() {
+    let running = start_sample_server("default_privilege_drop_schema_test").await;
+    let client = &running.client;
+
+    client
+        .batch_execute(
+            "CREATE ROLE tester SUPERUSER LOGIN; \
+             CREATE ROLE analyst LOGIN; \
+             CREATE SCHEMA tenant; \
+             ALTER DEFAULT PRIVILEGES FOR ROLE tester IN SCHEMA tenant \
+             GRANT SELECT ON TABLES TO analyst; \
+             DROP SCHEMA tenant; \
+             CREATE SCHEMA tenant; \
+             CREATE TABLE tenant.after_schema_recreate (id INT)",
+        )
+        .await
+        .expect("drop and recreate schema with prior default privileges");
+
+    let granted = client
+        .query_one(
+            "SELECT has_table_privilege('analyst', 'after_schema_recreate', 'SELECT')",
+            &[],
+        )
+        .await
+        .expect("default privilege cleanup check");
+    assert!(
+        !granted.get::<_, bool>(0),
+        "dropped schema must clear schema-scoped default privileges"
+    );
+
+    shutdown(running).await;
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn privilege_catalog_survives_restart() {
     let data_dir = tempfile::TempDir::new().expect("temp data dir");

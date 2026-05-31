@@ -107,6 +107,9 @@ where
             self.state
                 .privilege_catalog
                 .remove_object_grants(crate::auth::PrivilegeObjectKind::Schema, name);
+            self.state
+                .privilege_catalog
+                .remove_default_grants_for_schema(name);
         }
         self.state.persist_schema_metadata()?;
         self.state.persist_privilege_metadata()?;

@@ -230,6 +230,15 @@ impl InMemoryPrivilegeCatalog {
         grants.len() != before
     }
 
+    /// Remove every default privilege template scoped to one schema.
+    pub fn remove_default_grants_for_schema(&self, schema_name: &str) -> bool {
+        let schema_name = schema_name.to_ascii_lowercase();
+        let mut default_grants = self.default_grants.write();
+        let before = default_grants.len();
+        default_grants.retain(|key, _| key.schema_name.as_deref() != Some(schema_name.as_str()));
+        default_grants.len() != before
+    }
+
     /// Add default privileges applied to future objects owned by listed roles.
     pub fn grant_default_many(&self, update: DefaultPrivilegeUpdate<'_>) {
         let grantor = update.grantor.to_ascii_lowercase();

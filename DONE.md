@@ -957,6 +957,11 @@ as a concise evidence ledger; roadmap stays for open gates only.
   them after schema metadata loads. Evidence: `cargo test -p ultrasql-server
   --test schema_ddl_round_trip
   qualified_relation_and_type_schemas_survive_restart`.
+- `DROP SCHEMA` now clears schema-scoped default privilege templates, so a
+  recreated schema cannot inherit stale future-object grants from the dropped
+  namespace. Evidence: `cargo test -p ultrasql-server --test
+  privilege_catalog_round_trip
+  drop_schema_removes_schema_scoped_default_privileges`.
 - `DROP ROLE` now rejects roles that still own live tables or still appear in
   object/default privilege grants, avoiding stale ownership and ACL references.
   Evidence: `cargo test -p ultrasql-server --test role_ddl_round_trip`.
