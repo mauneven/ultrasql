@@ -1374,3 +1374,7 @@ as a concise evidence ledger; roadmap stays for open gates only.
   instead of exporting from or importing into a same-name table in another
   schema. Evidence:
   `cargo test -p ultrasql-server --test copy_round_trip -- --nocapture`.
+- Schema-qualified `CREATE POLICY` now rejects wrong-qualified table targets
+  instead of attaching RLS metadata to a same-name table in another schema.
+  Evidence:
+  `cargo test -p ultrasql-server --test rls_round_trip -- --nocapture`.

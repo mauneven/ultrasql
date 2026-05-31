@@ -574,9 +574,7 @@ pub(super) fn bind_create_policy(
     catalog: &dyn Catalog,
 ) -> Result<LogicalPlan, PlanError> {
     let table_name = object_name_simple(&s.table);
-    let meta = catalog
-        .lookup_table(&table_name)
-        .ok_or_else(|| PlanError::TableNotFound(table_name.clone()))?;
+    let meta = lookup_table_object(catalog, &s.table, &table_name)?;
     let using = s
         .using
         .as_ref()

@@ -225,6 +225,50 @@ async fn non_owner_cannot_create_rls_policy() {
 }
 
 #[tokio::test]
+async fn create_policy_respects_schema_qualifier() {
+    let running = start_sample_server("rls_policy_schema_qualifier_guard").await;
+    let client = &running.client;
+
+    client
+        .batch_execute(
+            "CREATE SCHEMA app; \
+             CREATE TABLE guarded_policy (tenant_id TEXT NOT NULL)",
+        )
+        .await
+        .expect("create public table and separate schema");
+
+    client
+        .batch_execute(
+            "CREATE POLICY guarded_policy_isolation \
+             ON app.guarded_policy \
+             USING (tenant_id = current_setting('ultrasql.tenant_id', true))",
+        )
+        .await
+        .expect_err("qualified CREATE POLICY must not resolve public table");
+
+    let rows = client
+        .query(
+            "SELECT polname \
+             FROM pg_catalog.pg_policy \
+             WHERE polname = 'guarded_policy_isolation'",
+            &[],
+        )
+        .await
+        .expect("query policy catalog after rejected qualified CREATE POLICY");
+    assert!(
+        rows.is_empty(),
+        "wrong-qualified CREATE POLICY must not attach policy to public table"
+    );
+
+    client
+        .batch_execute("DROP TABLE guarded_policy; DROP SCHEMA app")
+        .await
+        .expect("cleanup CREATE POLICY qualifier guard");
+
+    graceful_shutdown(running).await;
+}
+
+#[tokio::test]
 async fn rls_owner_and_bypass_roles_skip_policy_filtering() {
     let addr: SocketAddr = "127.0.0.1:0".parse().expect("addr parses");
     let (listener, bound) = bind_listener(addr).await.expect("bind");
