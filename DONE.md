@@ -2243,3 +2243,7 @@ as a concise evidence ledger; roadmap stays for open gates only.
   week of nightly/manual evidence. Evidence:
   `cargo test -p ultrasql-bench --test release_hardening ci_split_matches_release_policy -- --nocapture`,
   `for target in parser_fuzz planner_fuzz protocol_fuzz wal_record_fuzz; do cargo +nightly fuzz build "$target" || exit 1; done`.
+- Release checklist nightly/manual commands now mirror the actual fuzz and Miri
+  target matrices instead of documenting parser-only fuzz or broad storage Miri
+  commands. Evidence:
+  `cargo test -p ultrasql-bench --test release_hardening ci_split_matches_release_policy -- --nocapture`.

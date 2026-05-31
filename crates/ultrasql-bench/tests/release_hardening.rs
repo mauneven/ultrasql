@@ -218,6 +218,7 @@ fn ci_split_matches_release_policy() {
     ] {
         assert!(fuzz.contains(target), "fuzz workflow missing {target}");
         assert!(fuzz_docs.contains(target), "fuzz README missing {target}");
+        assert!(docs.contains(target), "release checklist missing {target}");
         let corpus_dir = repo_path(&format!("fuzz/corpus/{target}"));
         let has_seed = fs::read_dir(&corpus_dir)
             .unwrap_or_else(|err| panic!("read {}: {err}", corpus_dir.display()))
@@ -231,6 +232,7 @@ fn ci_split_matches_release_policy() {
     assert!(sanitizers.contains("-p ultrasql-executor"));
     assert!(sanitizers.contains("cargo +nightly miri setup"));
     assert!(sanitizers.contains("run miri smoke on memory-safety-sensitive crates"));
+    assert!(docs.contains("run miri smoke on memory-safety-sensitive crates"));
     assert!(sanitizers.contains(
         "cargo +nightly miri test -p ultrasql-storage page::tests::page_round_trips_via_from_bytes"
     ));

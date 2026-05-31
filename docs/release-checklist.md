@@ -87,13 +87,23 @@ Run on schedule or by `workflow_dispatch`:
 benchmarks/certify.sh full
 benchmarks/chaos_recovery.sh full
 cargo bench --workspace
-cargo +nightly fuzz run parser_fuzz -- -max_total_time=900 -rss_limit_mb=4096 -max_len=1024
-cargo +nightly miri test -p ultrasql-storage
+for target in parser_fuzz planner_fuzz protocol_fuzz wal_record_fuzz; do
+  cargo +nightly fuzz run "$target" -- -max_total_time=900 -rss_limit_mb=4096 -max_len=1024
+done
+# Mirrors .github/workflows/sanitizers.yml.
+cargo +nightly miri setup
+cargo +nightly miri test -p ultrasql-core endian::tests::u64_round_trip
+cargo +nightly miri test -p ultrasql-core value::tests::display_round_trip_for_simple_values
+cargo +nightly miri test -p ultrasql-storage page::tests::page_round_trips_via_from_bytes
+cargo +nightly miri test -p ultrasql-storage page::tests::insert_and_read_round_trip
+cargo +nightly miri test -p ultrasql-storage buffer_pool::tests::read_after_write_sees_update
+cargo +nightly miri test -p ultrasql-parser parser::tests::deeply_nested_parens_rejected_without_overflow
 ```
 
-The `bench`, `fuzz`, and `sanitizers` workflows own these slower gates. TPC-H,
-ClickBench, Firebolt Core, AI gauntlet, fuzz, and Miri evidence belongs here,
-not in the PR-critical path.
+The `bench`, `fuzz`, and `sanitizers` workflows own these slower gates. The Miri
+section is the same run miri smoke on memory-safety-sensitive crates block used
+by CI. TPC-H, ClickBench, Firebolt Core, AI gauntlet, fuzz, and Miri evidence
+belongs here, not in the PR-critical path.
 
 ## 69-83 Evidence Map
 
