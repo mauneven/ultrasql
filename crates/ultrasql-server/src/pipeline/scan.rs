@@ -8,7 +8,7 @@ use ultrasql_core::{DataType, Field, RelationId, Schema, Value};
 use ultrasql_executor::{
     CteScan, Eval, MemTableScan, Operator, ParallelSeqScan, Project, RowCodec, SeqScan,
     build_batch, choose_parallel_seq_scan_workers,
-    json_path::{parse_json_path, select_json_path},
+    json_path::{parse_json_path, select_json_path_with_vars},
 };
 use ultrasql_planner::{LogicalPlan, ScalarExpr};
 
@@ -310,9 +310,9 @@ fn lower_json_each(args: &[ScalarExpr]) -> Result<Box<dyn Operator>, ServerError
 }
 
 fn lower_jsonb_path_query(args: &[ScalarExpr]) -> Result<Box<dyn Operator>, ServerError> {
-    if args.len() != 2 {
+    if !(2..=3).contains(&args.len()) {
         return Err(ServerError::Unsupported(
-            "jsonb_path_query: expected jsonb document and path",
+            "jsonb_path_query: expected jsonb document, path, and optional vars",
         ));
     }
     let document_value = Eval::new(args[0].clone()).eval(&[]).map_err(|e| {
@@ -342,7 +342,28 @@ fn lower_jsonb_path_query(args: &[ScalarExpr]) -> Result<Box<dyn Operator>, Serv
     };
     let path = parse_json_path(&path)
         .map_err(|err| ServerError::CopyFormat(format!("jsonb_path_query invalid path: {err}")))?;
-    let selected = select_json_path(&document, &path);
+    let vars = if args.len() == 3 {
+        let vars_value = Eval::new(args[2].clone()).eval(&[]).map_err(|e| {
+            ServerError::Ddl(format!("jsonb_path_query vars evaluation failed: {e}"))
+        })?;
+        match vars_value {
+            Value::Json(text) | Value::Jsonb(text) | Value::Text(text) => {
+                Some(serde_json::from_str::<JsonValue>(&text).map_err(|err| {
+                    ServerError::CopyFormat(format!("jsonb_path_query parse vars jsonb: {err}"))
+                })?)
+            }
+            Value::Null => None,
+            other => {
+                return Err(ServerError::CopyFormat(format!(
+                    "jsonb_path_query: vars must be json/jsonb or text, got {:?}",
+                    other.data_type()
+                )));
+            }
+        }
+    } else {
+        None
+    };
+    let selected = select_json_path_with_vars(&document, &path, vars.as_ref());
     let schema = Schema::new([Field::nullable("value", DataType::Jsonb)])
         .map_err(|err| ServerError::CopyFormat(format!("jsonb_path_query schema: {err}")))?;
     let rows = selected

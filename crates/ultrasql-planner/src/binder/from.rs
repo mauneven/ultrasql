@@ -280,9 +280,9 @@ fn bind_table_function(
             )
         }
         "jsonb_path_query" => {
-            if bound_args.len() != 2 {
+            if !(2..=3).contains(&bound_args.len()) {
                 return Err(PlanError::NotSupported(
-                    "jsonb_path_query: expected jsonb document and path",
+                    "jsonb_path_query: expected jsonb document, path, and optional vars",
                 ));
             }
             let field = Field::nullable("value", DataType::Jsonb);

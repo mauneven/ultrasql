@@ -71,8 +71,7 @@ file focused on what still blocks production.
   `DateStyle` GUC validation / round trips.
 - Arrays: broader coercion breadth and every supported element family.
 - JSON/JSONB: full SQL/JSON path parity beyond the supported subset
-  (strict-mode error semantics, table-function variables, methods, full
-  predicate algebra).
+  (strict-mode error semantics, methods, full predicate algebra).
 - Full-text search remaining: dedicated `TSVECTOR` / `TSQUERY` type
   OIDs/storage, headline, dictionaries, full ranking parity, and GIN planner
   integration beyond the current text-backed constructor / match subset.
