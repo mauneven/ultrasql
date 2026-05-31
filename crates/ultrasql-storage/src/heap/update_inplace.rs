@@ -579,11 +579,7 @@ impl<L: PageLoader> HeapAccess<L> {
                     continue;
                 }
 
-                let (new_id, new_val) = if target_col == 0 {
-                    (id.wrapping_add(delta), val)
-                } else {
-                    (id, val.wrapping_add(delta))
-                };
+                let (new_id, new_val) = checked_int32_pair_add(id, val, target_col, delta)?;
 
                 if wal.is_some() {
                     let mut pre_bytes = [0u8; 9];
@@ -945,11 +941,7 @@ impl<L: PageLoader> HeapAccess<L> {
                     continue;
                 }
 
-                let (new_id, new_val) = if target_col == 0 {
-                    (id.wrapping_add(delta), val)
-                } else {
-                    (id, val.wrapping_add(delta))
-                };
+                let (new_id, new_val) = checked_int32_pair_add(id, val, target_col, delta)?;
 
                 page_undo_slots.push(src_slot)?;
                 src_bytes[offset + 8..offset + 16].copy_from_slice(&xid_bytes);
@@ -1087,11 +1079,7 @@ impl<L: PageLoader> HeapAccess<L> {
                 return Ok(0);
             }
 
-            let (new_id, new_val) = if target_col == 0 {
-                (id.wrapping_add(delta), val)
-            } else {
-                (id, val.wrapping_add(delta))
-            };
+            let (new_id, new_val) = checked_int32_pair_add(id, val, target_col, delta)?;
 
             pre_image.copy_from_slice(&bytes[payload_off..payload_off + 9]);
             bytes[offset + 8..offset + 16].copy_from_slice(&xid_bytes);
@@ -1145,4 +1133,21 @@ fn batch_slots(batch: &Int32PairUndoBatch) -> Vec<u16> {
     (0..batch.slot_count)
         .map(|offset| batch.first_slot.saturating_add(offset))
         .collect()
+}
+
+fn checked_int32_pair_add(
+    id: i32,
+    val: i32,
+    target_col: u8,
+    delta: i32,
+) -> Result<(i32, i32), HeapError> {
+    if target_col == 0 {
+        id.checked_add(delta)
+            .map(|new_id| (new_id, val))
+            .ok_or(HeapError::NumericOverflow("Int32 id update overflow"))
+    } else {
+        val.checked_add(delta)
+            .map(|new_val| (id, new_val))
+            .ok_or(HeapError::NumericOverflow("Int32 value update overflow"))
+    }
 }

@@ -90,6 +90,10 @@ pub enum HeapError {
     #[error("relation is out of blocks")]
     OutOfBlocks,
 
+    /// Fixed-width numeric fast path overflowed while computing a new value.
+    #[error("numeric overflow: {0}")]
+    NumericOverflow(&'static str),
+
     /// The [`WalSink`] rejected a record.
     #[error("wal sink: {0}")]
     Wal(#[from] WalSinkError),

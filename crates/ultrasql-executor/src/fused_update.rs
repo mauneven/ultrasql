@@ -104,7 +104,7 @@ pub struct FusedUpdateInt32Add<L: PageLoader> {
     /// 0 = assign to `id`, 1 = assign to `val`. Other indices are
     /// rejected at construction time.
     target_col: u8,
-    /// `wrapping_add(delta)` is applied to the target column.
+    /// `checked_add(delta)` is applied to the target column.
     /// Subtraction is normalised to `delta = -lit` upstream.
     delta: i32,
     xid: Xid,
@@ -289,9 +289,9 @@ impl<L: PageLoader + Send + Sync + std::fmt::Debug + 'static> Operator for Fused
                                 wal_sink,
                                 self.vm.as_deref(),
                             )
-                            .map_err(|e| ExecError::TypeMismatch(e.to_string()))?
+                            .map_err(heap_update_error_to_exec_error)?
                     }
-                    Err(e) => return Err(ExecError::TypeMismatch(e.to_string())),
+                    Err(e) => return Err(heap_update_error_to_exec_error(e)),
                 };
             }
             total
@@ -324,7 +324,7 @@ impl<L: PageLoader + Send + Sync + std::fmt::Debug + 'static> Operator for Fused
                     self.vm.as_deref(),
                 )
             }
-            .map_err(|e| ExecError::TypeMismatch(e.to_string()))?
+            .map_err(heap_update_error_to_exec_error)?
         };
 
         let affected_i64 = i64::try_from(n).unwrap_or(i64::MAX);
@@ -335,6 +335,13 @@ impl<L: PageLoader + Send + Sync + std::fmt::Debug + 'static> Operator for Fused
 
     fn schema(&self) -> &Schema {
         &self.schema
+    }
+}
+
+fn heap_update_error_to_exec_error(error: HeapError) -> ExecError {
+    match error {
+        HeapError::NumericOverflow(detail) => ExecError::NumericFieldOverflow(detail.to_owned()),
+        other => ExecError::TypeMismatch(other.to_string()),
     }
 }
 

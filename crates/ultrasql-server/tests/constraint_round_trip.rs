@@ -222,6 +222,35 @@ async fn update_assignment_runtime_cast_error_returns_22p02() {
     graceful_shutdown(running).await;
 }
 
+#[tokio::test]
+async fn fused_update_int32_overflow_returns_22003() {
+    let running = start_sample_server("constraint_update_overflow_test").await;
+    let client = &running.client;
+
+    client
+        .batch_execute(
+            "CREATE TABLE t (id INT, v INT);
+             INSERT INTO t VALUES (1, 2147483647)",
+        )
+        .await
+        .expect("setup");
+
+    let err = client
+        .batch_execute("UPDATE t SET v = v + 1 WHERE id = 1")
+        .await
+        .expect_err("fused UPDATE overflow rejects row");
+    let sqlstate = err.code().expect("server-sent SQLSTATE present");
+    assert_eq!(sqlstate.code(), "22003");
+
+    let row = client
+        .query_one("SELECT v FROM t WHERE id = 1", &[])
+        .await
+        .expect("select after rejected fused update");
+    assert_eq!(row.get::<_, i32>(0), i32::MAX);
+
+    graceful_shutdown(running).await;
+}
+
 /// Omitted columns with DEFAULT expressions get the default value, while
 /// explicit NULL remains NULL on nullable columns.
 #[tokio::test]
