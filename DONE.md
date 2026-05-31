@@ -1922,6 +1922,10 @@ as a concise evidence ledger; roadmap stays for open gates only.
   `SUM(BIGINT)` overflow with typed `NumericFieldOverflow` instead of wrapping
   JIT/kernel totals. Evidence:
   `cargo test -p ultrasql-executor filter_sum_i64_overflow_returns_typed_error --lib -- --nocapture`.
+- Generic `HashAggregate` vectorized and scalar `SUM(BIGINT)` paths now reject
+  overflow with typed `NumericFieldOverflow`; legacy wrap-equality tests were
+  narrowed to non-overflow data and overflow has dedicated coverage. Evidence:
+  `cargo test -p ultrasql-executor hash_aggregate --lib -- --nocapture`.
 - Vectorized terminal `SumSink` now rejects `Int64` and sample-count overflow
   instead of wrapping benchmark/query sink totals. Evidence:
   `cargo test -p ultrasql-executor sum_sink_rejects_i64_overflow --lib -- --nocapture`.

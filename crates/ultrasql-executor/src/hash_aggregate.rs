@@ -34,7 +34,7 @@ use serde_json::{Number as JsonNumber, Value as JsonValue};
 use ultrasql_core::{DataType, Schema, Value, bpchar_semantic_text, timetz_utc_micros};
 use ultrasql_planner::{AggregateFunc, LogicalAggregateExpr, ScalarExpr};
 use ultrasql_vec::column::{Column, NumericColumn};
-use ultrasql_vec::{Batch, count_i64, max_i64, min_i64, sum_i64};
+use ultrasql_vec::{Batch, count_i64, max_i64, min_i64};
 
 use crate::aggregate_math::{add_dense_vector_values, divide_dense_vector_values, widen_sum_seed};
 use crate::eval::Eval;
@@ -1046,9 +1046,8 @@ fn column_ref(expr: &ScalarExpr) -> Option<(usize, DataType)> {
 /// Each slot dispatches to a kernel that matches the column's runtime
 /// variant. Bit-identical results against the scalar path are guaranteed for
 /// the supported aggregate set:
-/// * `Sum`/`Avg` on integer columns keep an `i64` accumulator with wrapping
-///   semantics, matching [`add_values`] (which folds Int16/Int32/Int64
-///   through `wrapping_add`).
+/// * `Sum`/`Avg` on integer columns keep an `i64` accumulator and return
+///   `NumericFieldOverflow` instead of exposing wrapped totals.
 /// * `Sum`/`Avg` on float columns keep an `f64` accumulator, matching the
 ///   widening that `add_values` performs for Float32/Float64.
 /// * `Count(expr)` counts non-null entries via the column's optional bitmap.
@@ -1114,6 +1113,11 @@ fn column_non_null_count(col: &Column) -> i64 {
     i64::try_from(valid).unwrap_or(i64::MAX)
 }
 
+fn checked_sum_i64(acc: i64, delta: i64, context: &str) -> Result<i64, ExecError> {
+    acc.checked_add(delta)
+        .ok_or_else(|| ExecError::NumericFieldOverflow(format!("{context} overflow")))
+}
+
 /// Accumulate `SUM(col)` into the running `Value` accumulator. NULL entries
 /// are skipped. The accumulator stays `None` until at least one non-null row
 /// has been observed, matching the scalar SUM contract.
@@ -1123,13 +1127,15 @@ fn accumulate_sum(acc: &mut Option<Value>, col: &Column) -> Result<(), ExecError
             if c.is_empty() {
                 return Ok(());
             }
-            let (delta, saw) = sum_i64_nullable(c);
+            let (delta, saw) = sum_i64_nullable(c)?;
             if !saw {
                 return Ok(());
             }
             *acc = Some(match acc.take() {
                 None => Value::Int64(delta),
-                Some(Value::Int64(prev)) => Value::Int64(prev.wrapping_add(delta)),
+                Some(Value::Int64(prev)) => {
+                    Value::Int64(checked_sum_i64(prev, delta, "HashAggregate SUM(BIGINT)")?)
+                }
                 Some(other) => {
                     return Err(ExecError::TypeMismatch(format!(
                         "vectorized SUM accumulator/column type mismatch: {other:?} vs Int64"
@@ -1141,13 +1147,15 @@ fn accumulate_sum(acc: &mut Option<Value>, col: &Column) -> Result<(), ExecError
             if c.is_empty() {
                 return Ok(());
             }
-            let (delta, saw) = sum_i32_nullable_widened(c);
+            let (delta, saw) = sum_i32_nullable_widened(c)?;
             if !saw {
                 return Ok(());
             }
             *acc = Some(match acc.take() {
                 None => Value::Int64(delta),
-                Some(Value::Int64(prev)) => Value::Int64(prev.wrapping_add(delta)),
+                Some(Value::Int64(prev)) => {
+                    Value::Int64(checked_sum_i64(prev, delta, "HashAggregate SUM(INT)")?)
+                }
                 Some(other) => {
                     return Err(ExecError::TypeMismatch(format!(
                         "vectorized SUM accumulator/column type mismatch: {other:?} vs Int32"
@@ -1207,19 +1215,25 @@ fn accumulate_sum(acc: &mut Option<Value>, col: &Column) -> Result<(), ExecError
 /// — so we keep them as a `match`. Clippy's `map_or_else` suggestion would
 /// hide that distinction inside a closure body.
 #[allow(clippy::option_if_let_else)]
-fn sum_i64_nullable(c: &NumericColumn<i64>) -> (i64, bool) {
+fn sum_i64_nullable(c: &NumericColumn<i64>) -> Result<(i64, bool), ExecError> {
     match c.nulls() {
-        None => (sum_i64(c), !c.is_empty()),
+        None => {
+            let mut s = 0_i64;
+            for value in c.data().iter().copied() {
+                s = checked_sum_i64(s, value, "HashAggregate SUM(BIGINT)")?;
+            }
+            Ok((s, !c.is_empty()))
+        }
         Some(nulls) => {
             let mut s: i64 = 0;
             let mut saw = false;
             for (i, v) in c.data().iter().enumerate() {
                 if nulls.get(i) {
-                    s = s.wrapping_add(*v);
+                    s = checked_sum_i64(s, *v, "HashAggregate SUM(BIGINT)")?;
                     saw = true;
                 }
             }
-            (s, saw)
+            Ok((s, saw))
         }
     }
 }
@@ -1228,22 +1242,22 @@ fn sum_i64_nullable(c: &NumericColumn<i64>) -> (i64, bool) {
 /// to the hand-NEON [`ultrasql_vec::kernels::sum_i32_widening`] on
 /// aarch64 and to the scalar fold on every other target.
 #[allow(clippy::option_if_let_else)]
-fn sum_i32_nullable_widened(c: &NumericColumn<i32>) -> (i64, bool) {
+fn sum_i32_nullable_widened(c: &NumericColumn<i32>) -> Result<(i64, bool), ExecError> {
     match c.nulls() {
         None => {
             let s = ultrasql_vec::kernels::sum_i32_widening(c);
-            (s, !c.is_empty())
+            Ok((s, !c.is_empty()))
         }
         Some(nulls) => {
             let mut s: i64 = 0;
             let mut saw = false;
             for (i, &v) in c.data().iter().enumerate() {
                 if nulls.get(i) {
-                    s = s.wrapping_add(i64::from(v));
+                    s = checked_sum_i64(s, i64::from(v), "HashAggregate SUM(INT)")?;
                     saw = true;
                 }
             }
-            (s, saw)
+            Ok((s, saw))
         }
     }
 }
@@ -2137,14 +2151,16 @@ fn add_values(a: Value, b: Value) -> Result<Value, ExecError> {
         // Pure narrow-narrow promotions (first-step folding).
         (Value::Int16(x), Value::Int16(y)) => Ok(Value::Int64(i64::from(x) + i64::from(y))),
         (Value::Int32(x), Value::Int32(y)) => Ok(Value::Int64(i64::from(x) + i64::from(y))),
-        (Value::Int64(x), Value::Int64(y)) => Ok(Value::Int64(x.wrapping_add(y))),
+        (Value::Int64(x), Value::Int64(y)) => {
+            checked_sum_i64(x, y, "HashAggregate SUM(BIGINT)").map(Value::Int64)
+        }
         // Widened accumulator + narrower fresh row (the common case in
         // SUM / AVG once the accumulator has stepped through one input).
         (Value::Int64(x), Value::Int16(y)) | (Value::Int16(y), Value::Int64(x)) => {
-            Ok(Value::Int64(x.wrapping_add(i64::from(y))))
+            checked_sum_i64(x, i64::from(y), "HashAggregate SUM(INT)").map(Value::Int64)
         }
         (Value::Int64(x), Value::Int32(y)) | (Value::Int32(y), Value::Int64(x)) => {
-            Ok(Value::Int64(x.wrapping_add(i64::from(y))))
+            checked_sum_i64(x, i64::from(y), "HashAggregate SUM(INT)").map(Value::Int64)
         }
         (Value::Float32(x), Value::Float32(y)) => Ok(Value::Float64(f64::from(x) + f64::from(y))),
         (Value::Float64(x), Value::Float64(y)) => Ok(Value::Float64(x + y)),
@@ -3287,13 +3303,10 @@ mod tests {
     #[test]
     fn vectorized_sum_i64_matches_scalar() {
         let n = 4096_i64;
-        // Deterministic LCG-style values.
-        let values: Vec<i64> = (0..n)
-            .map(|i| {
-                i.wrapping_mul(2_862_933_555_777_941_757)
-                    .wrapping_add(0x1234_5678)
-            })
-            .collect();
+        // Deterministic values that exercise signed accumulation without
+        // crossing the overflow boundary. Overflow behavior has a dedicated
+        // typed-error test below.
+        let values: Vec<i64> = (0..n).map(|i| (i % 257) - 128).collect();
         let (schema, batch) = make_i64_batch(values.clone(), None);
         let out_schema =
             Schema::new([Field::nullable("total", DataType::Int64)]).expect("schema ok");
@@ -3332,8 +3345,63 @@ mod tests {
         );
 
         // Independent reference.
-        let want: i64 = values.iter().fold(0_i64, |a, b| a.wrapping_add(*b));
+        let want: i64 = values.iter().copied().sum();
         assert_eq!(rows_vec[0][0], Value::Int64(want));
+    }
+
+    #[test]
+    fn hash_aggregate_vectorized_sum_i64_overflow_returns_typed_error() {
+        let (schema, batch) = make_i64_batch(vec![i64::MAX, 1], None);
+        let out_schema =
+            Schema::new([Field::nullable("total", DataType::Int64)]).expect("schema ok");
+        let sum_val = LogicalAggregateExpr {
+            func: AggregateFunc::Sum,
+            arg: Some(col("val", 0, DataType::Int64)),
+            direct_arg: None,
+            order_by: None,
+            distinct: false,
+            output_name: "total".into(),
+            data_type: DataType::Int64,
+        };
+        let scan = MemTableScan::new(schema, vec![batch]);
+        let mut op = HashAggregate::new(Box::new(scan), vec![], vec![sum_val], out_schema);
+
+        let err = op
+            .next_batch()
+            .expect_err("vectorized SUM(BIGINT) overflow must not wrap");
+
+        assert!(
+            matches!(err, crate::ExecError::NumericFieldOverflow(_)),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn hash_aggregate_scalar_sum_i64_overflow_returns_typed_error() {
+        let (schema, batch) = make_i64_batch(vec![i64::MAX, 1], None);
+        let out_schema =
+            Schema::new([Field::nullable("total", DataType::Int64)]).expect("schema ok");
+        let sum_val = LogicalAggregateExpr {
+            func: AggregateFunc::Sum,
+            arg: Some(col("val", 0, DataType::Int64)),
+            direct_arg: None,
+            order_by: None,
+            distinct: false,
+            output_name: "total".into(),
+            data_type: DataType::Int64,
+        };
+        let scan = MemTableScan::new(schema, vec![batch]);
+        let mut op = HashAggregate::new(Box::new(scan), vec![], vec![sum_val], out_schema);
+        op.force_scalar_path();
+
+        let err = op
+            .next_batch()
+            .expect_err("scalar SUM(BIGINT) overflow must not wrap");
+
+        assert!(
+            matches!(err, crate::ExecError::NumericFieldOverflow(_)),
+            "{err:?}"
+        );
     }
 
     /// Companion NULL-handling check for the vectorised SUM path. The row-
