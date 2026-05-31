@@ -28,11 +28,11 @@ type LateMaterializationProjectShape<'a> =
     (&'a LogicalPlan, &'a [(ScalarExpr, String)], Option<u64>);
 
 #[derive(Clone, Copy, Debug)]
-pub(super) struct IndexKeyRange {
+pub(crate) struct IndexKeyRange {
     /// Inclusive lower bound, or `None` for unbounded below.
-    pub(super) low: Option<i64>,
+    pub(crate) low: Option<i64>,
     /// Inclusive upper bound, or `None` for unbounded above.
-    pub(super) high: Option<i64>,
+    pub(crate) high: Option<i64>,
 }
 
 impl IndexKeyRange {
@@ -1168,7 +1168,7 @@ const fn column_idx_for_int_key(expr: &ScalarExpr) -> Option<usize> {
 /// Lift an integer-typed literal to `i64`. `Int32` is sign-extended
 /// via the lossless `i64::from(i32)` widening conversion. Returns
 /// `None` for non-integer literals (text, float, NULL, …).
-pub(super) fn literal_as_i64(expr: &ScalarExpr) -> Option<i64> {
+pub(crate) fn literal_as_i64(expr: &ScalarExpr) -> Option<i64> {
     let ScalarExpr::Literal { value, .. } = expr else {
         return None;
     };

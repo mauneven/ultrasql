@@ -20,8 +20,9 @@
 //! - [`ssi`] — Serializable Snapshot Isolation (SSI) primitives: predicate
 //!   locks, rw-anti-dependency tracking, dangerous-structure detection, and
 //!   `SERIALIZABLE` conflict checks via [`TransactionManager::new_with_ssi`].
-//!   The server integration currently records relation-level SSI, not
-//!   predicate-precise PostgreSQL SSI.
+//!   The server integration records column-range predicate tags for supported
+//!   scalar comparisons and relation-level fallback tags for unsupported
+//!   predicates.
 //! - [`savepoint`] — Subtransaction / savepoint manager implementing
 //!   `SAVEPOINT`, `ROLLBACK TO SAVEPOINT`, `RELEASE SAVEPOINT`, with
 //!   rolled-back subtransaction tracking for MVCC visibility.

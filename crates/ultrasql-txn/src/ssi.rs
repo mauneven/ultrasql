@@ -7,9 +7,10 @@
 //! dangerous structure if one of the three transactions has committed. When
 //! a dangerous structure is detected the pivot transaction is aborted.
 //!
-//! The manager supports tuple, page, and relation predicate-lock tags. Current
-//! `ultrasql-server` plumbing records relation-level SSI, not predicate-precise
-//! PostgreSQL SSI; callers that want finer precision must issue the finer tags.
+//! The manager supports tuple, page, relation, and scalar column-range
+//! predicate-lock tags. `ultrasql-server` records column-range tags for the
+//! supported scalar comparison subset and relation-level fallback tags when a
+//! predicate cannot be bounded safely.
 //!
 //! # Public surface
 //!
@@ -47,6 +48,21 @@ pub enum PredicateLockTag {
     Tuple(TupleId),
     /// All tuples on one 8 KiB page.
     Page(PageId),
+    /// Scalar key range for one relation column.
+    ///
+    /// Bounds are inclusive. `None` means unbounded on that side. This tag is
+    /// used for predicate-aware SSI in the supported integer/bool/timestamp
+    /// comparison subset; unsupported predicates fall back to [`Self::Relation`].
+    ColumnRange {
+        /// Relation being read or written.
+        relation: RelationId,
+        /// Zero-based column index within the relation schema.
+        column: u16,
+        /// Inclusive lower bound, or unbounded below.
+        low: Option<i64>,
+        /// Inclusive upper bound, or unbounded above.
+        high: Option<i64>,
+    },
     /// All tuples in a relation.
     Relation(RelationId),
 }
@@ -340,17 +356,65 @@ impl SsiManager {
 ///
 /// Coverage is coarser-wins: a Relation lock covers everything in that
 /// relation; a Page lock covers all tuples on that page; a Tuple lock covers
-/// only the exact tuple.
+/// only the exact tuple. Broad writer requests are also treated as overlapping
+/// finer read locks in the same relation so a conservative writer fallback
+/// cannot miss a precise reader.
 fn predicate_lock_covers(held: &PredicateLockTag, requested: &PredicateLockTag) -> bool {
     match (held, requested) {
         (PredicateLockTag::Relation(hr), PredicateLockTag::Relation(rr)) => hr == rr,
         (PredicateLockTag::Relation(hr), PredicateLockTag::Page(rp)) => *hr == rp.relation,
         (PredicateLockTag::Relation(hr), PredicateLockTag::Tuple(rt)) => *hr == rt.page.relation,
+        (PredicateLockTag::Relation(hr), PredicateLockTag::ColumnRange { relation, .. }) => {
+            hr == relation
+        }
         (PredicateLockTag::Page(hp), PredicateLockTag::Page(rp)) => hp == rp,
+        (PredicateLockTag::Page(hp), PredicateLockTag::Relation(rr)) => hp.relation == *rr,
         (PredicateLockTag::Page(hp), PredicateLockTag::Tuple(rt)) => *hp == rt.page,
+        (PredicateLockTag::Tuple(ht), PredicateLockTag::Relation(rr)) => ht.page.relation == *rr,
+        (PredicateLockTag::Tuple(ht), PredicateLockTag::Page(rp)) => ht.page == *rp,
         (PredicateLockTag::Tuple(ht), PredicateLockTag::Tuple(rt)) => ht == rt,
+        (PredicateLockTag::ColumnRange { relation, .. }, PredicateLockTag::Relation(rr)) => {
+            *relation == *rr
+        }
+        (
+            PredicateLockTag::ColumnRange {
+                relation: held_rel,
+                column: held_col,
+                low: held_low,
+                high: held_high,
+            },
+            PredicateLockTag::ColumnRange {
+                relation: requested_rel,
+                column: requested_col,
+                low: requested_low,
+                high: requested_high,
+            },
+        ) => {
+            held_rel == requested_rel
+                && held_col == requested_col
+                && ranges_overlap(*held_low, *held_high, *requested_low, *requested_high)
+        }
         _ => false,
     }
+}
+
+fn ranges_overlap(
+    left_low: Option<i64>,
+    left_high: Option<i64>,
+    right_low: Option<i64>,
+    right_high: Option<i64>,
+) -> bool {
+    if let (Some(left_high), Some(right_low)) = (left_high, right_low)
+        && left_high < right_low
+    {
+        return false;
+    }
+    if let (Some(right_high), Some(left_low)) = (right_high, left_low)
+        && right_high < left_low
+    {
+        return false;
+    }
+    true
 }
 
 // ─── tests ────────────────────────────────────────────────────────────────────
@@ -377,6 +441,20 @@ mod tests {
     fn tuple_tag(rel: u32, block: u32, slot: u16) -> PredicateLockTag {
         let page = PageId::new(RelationId::new(rel), BlockNumber::new(block));
         PredicateLockTag::Tuple(TupleId::new(page, slot))
+    }
+
+    fn column_range_tag(
+        rel: u32,
+        column: u16,
+        low: Option<i64>,
+        high: Option<i64>,
+    ) -> PredicateLockTag {
+        PredicateLockTag::ColumnRange {
+            relation: RelationId::new(rel),
+            column,
+            low,
+            high,
+        }
     }
 
     // ── basic lifecycle ──────────────────────────────────────────────────────
@@ -558,6 +636,35 @@ mod tests {
         // Different slot → no match.
         let holders2 = mgr.find_predicate_lock_holders(&tuple_tag(1, 0, 8));
         assert!(!holders2.contains(&t1), "different slot should not match");
+    }
+
+    #[test]
+    fn column_range_predicate_matches_overlap_only() {
+        let mgr = SsiManager::new();
+        let t1 = xid(23);
+        mgr.register_xid(t1);
+        mgr.add_predicate_lock(t1, column_range_tag(7, 0, Some(10), Some(20)));
+
+        let overlapping = mgr.find_predicate_lock_holders(&column_range_tag(7, 0, Some(20), None));
+        assert_eq!(overlapping, vec![t1]);
+
+        let disjoint = mgr.find_predicate_lock_holders(&column_range_tag(7, 0, Some(21), None));
+        assert!(disjoint.is_empty());
+
+        let other_column =
+            mgr.find_predicate_lock_holders(&column_range_tag(7, 1, Some(10), Some(20)));
+        assert!(other_column.is_empty());
+    }
+
+    #[test]
+    fn broad_relation_write_matches_precise_column_reader() {
+        let mgr = SsiManager::new();
+        let t1 = xid(24);
+        mgr.register_xid(t1);
+        mgr.add_predicate_lock(t1, column_range_tag(7, 0, Some(10), Some(20)));
+
+        let holders = mgr.find_predicate_lock_holders(&rel_tag(7));
+        assert_eq!(holders, vec![t1]);
     }
 
     // ── commit triggers dangerous-structure check ─────────────────────────────

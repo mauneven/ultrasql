@@ -31,11 +31,12 @@ anomaly matrix at `TransactionManager` level.
 ## SSI Honesty
 
 UltraSQL installs SSI by default in server mode and records conflicts for
-serializable transactions, but the current server integration is relation-level
-SSI, not predicate-precise. That means it can abort conflicting serializable
-transactions conservatively and pass the covered write-skew scenario, but it is
-not yet predicate/page/tuple precision or full isolationtester breadth.
+serializable transactions. The current server integration uses column-range SSI
+for supported scalar comparisons plus relation-level fallback, but it is not
+fully predicate-precise. That means it can avoid some false aborts for disjoint
+bounded predicates and still pass the covered write-skew scenario, but it is
+not yet full page/tuple/gap precision or full isolationtester breadth.
 
-Do not describe this as full SSI breadth until predicate-precise locks,
+Do not describe this as full SSI breadth until full predicate-precise locks,
 the full isolationtester schedule, and matching expected outputs are
 green.

@@ -56,12 +56,12 @@ fn isolation_suite_keeps_public_provenance_and_ssi_honesty() {
     for text in [&docs, &roadmap, &limitations] {
         let normalized = normalize_ws(text);
         assert!(
-            normalized.contains("relation-level SSI"),
-            "SSI docs must state current granularity honestly:\n{text}"
+            normalized.contains("column-range SSI"),
+            "SSI docs must state supported column-range granularity honestly:\n{text}"
         );
         assert!(
-            normalized.contains("not predicate-precise"),
-            "SSI docs must not overclaim predicate precision:\n{text}"
+            normalized.contains("not fully predicate-precise"),
+            "SSI docs must not overclaim full predicate precision:\n{text}"
         );
     }
 }
@@ -248,6 +248,78 @@ async fn hermitage_g2_serializable_write_skew_aborts_one_wire() {
             .count(),
         1,
         "one serializable tx must fail with 40001: a={a_commit:?}, b={b_commit:?}"
+    );
+
+    close_peer(peer, peer_handle).await;
+    shutdown(running).await;
+}
+
+#[tokio::test]
+async fn serializable_indexed_disjoint_row_updates_both_commit_wire() {
+    let running = start_sample_server("serializable_disjoint_indexed_rows").await;
+    let (peer, peer_handle) =
+        connect_peer(running.bound, "serializable_disjoint_indexed_rows_peer").await;
+
+    running
+        .client
+        .batch_execute(
+            "CREATE TABLE serializable_disjoint (id INT NOT NULL, value INT NOT NULL);\
+             INSERT INTO serializable_disjoint VALUES (1, 10), (2, 20);\
+             CREATE INDEX serializable_disjoint_id_idx ON serializable_disjoint (id)",
+        )
+        .await
+        .expect("seed indexed serializable table");
+
+    running
+        .client
+        .batch_execute("BEGIN ISOLATION LEVEL SERIALIZABLE")
+        .await
+        .expect("begin a");
+    peer.batch_execute("BEGIN ISOLATION LEVEL SERIALIZABLE")
+        .await
+        .expect("begin b");
+
+    assert_eq!(
+        scalar_i32(
+            &running.client,
+            "SELECT value FROM serializable_disjoint WHERE id = 1",
+        )
+        .await,
+        10
+    );
+    assert_eq!(
+        scalar_i32(
+            &peer,
+            "SELECT value FROM serializable_disjoint WHERE id = 2",
+        )
+        .await,
+        20
+    );
+
+    running
+        .client
+        .batch_execute("UPDATE serializable_disjoint SET value = value + 1 WHERE id = 1")
+        .await
+        .expect("update a");
+    peer.batch_execute("UPDATE serializable_disjoint SET value = value + 1 WHERE id = 2")
+        .await
+        .expect("update b");
+
+    let a_commit = running.client.batch_execute("COMMIT").await;
+    let b_commit = peer.batch_execute("COMMIT").await;
+
+    assert!(
+        a_commit.is_ok() && b_commit.is_ok(),
+        "disjoint indexed serializable updates should both commit: a={a_commit:?}, b={b_commit:?}"
+    );
+
+    assert_eq!(
+        scalar_i64(
+            &running.client,
+            "SELECT SUM(value) FROM serializable_disjoint",
+        )
+        .await,
+        32
     );
 
     close_peer(peer, peer_handle).await;

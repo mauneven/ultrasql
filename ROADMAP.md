@@ -27,8 +27,9 @@ file focused on what still blocks production.
 
 ### Correctness Debt
 
-- Serializable isolation remains `relation-level SSI`, `not predicate-precise`
-  SSI. Implement predicate-precise SSI before broad serializable claims.
+- Serializable isolation has column-range SSI for supported scalar comparisons
+  plus relation-level fallback, but is `not fully predicate-precise` SSI.
+  Implement page/tuple/gap precision before broad serializable claims.
 - Full public regression import still open for parser, type coercion,
   aggregate/window, and upstream isolation schedules.
 

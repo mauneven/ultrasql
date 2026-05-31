@@ -184,10 +184,18 @@ as a concise evidence ledger; roadmap stays for open gates only.
 - Catalog upgrade story is documented and enforced with `catalog.version = 1`.
 - Security/ethics audit docs cover no proprietary tests, no closed-source
   code, and no fake benchmark claims.
-- Serializable isolation comments now avoid full-SSI overclaims: parser,
-  planner, and transaction-manager docs describe it as a client-requested
-  isolation level with relation-level SSI integration until predicate-precise
-  SSI lands.
+- Serializable isolation comments avoid full-SSI overclaims: parser, planner,
+  and transaction-manager docs describe it as a client-requested isolation
+  level with column-range SSI plus relation-level fallback until full
+  predicate-precise SSI lands.
+- Serializable SSI now records column-range predicate locks for supported
+  scalar comparisons plus relation-level fallback. This keeps Hermitage G2
+  write-skew abort coverage while allowing disjoint indexed row updates to
+  commit when their bounded predicates do not overlap. Evidence:
+  `cargo test -p ultrasql-txn ssi::tests:: --lib -- --nocapture`,
+  `cargo test -p ultrasql-server --test isolation_suite_round_trip hermitage_g2_serializable_write_skew_aborts_one_wire -- --nocapture`,
+  and
+  `cargo test -p ultrasql-server --test isolation_suite_round_trip serializable_indexed_disjoint_row_updates_both_commit_wire -- --nocapture`.
 - Constant `SELECT` result execution now propagates scalar evaluation failures
   instead of silently returning NULL. Evidence:
   `cargo test -p ultrasql-executor result_propagates_constant_eval_errors`.

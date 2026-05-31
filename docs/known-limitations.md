@@ -19,9 +19,10 @@ completed evidence.
   type breadth.
 - Transactional DDL is not complete; ORM schema-creation certification runs in
   autocommit mode until DDL inside explicit transaction blocks is implemented.
-- Serializable transactions use relation-level SSI, not predicate-precise SSI.
-  The covered Hermitage write-skew case aborts one transaction with SQLSTATE
-  `40001`, but broader isolation schedules remain open.
+- Serializable transactions use column-range SSI for supported scalar
+  comparisons plus relation-level fallback, but not fully predicate-precise
+  SSI. The covered Hermitage write-skew case aborts one transaction with
+  SQLSTATE `40001`, but broader isolation schedules remain open.
 - Broader aggregate coverage remains open beyond the covered `STDDEV`,
   `VARIANCE`, `CORR`, `PERCENTILE_CONT`, and
   `PERCENTILE_DISC` surfaces, including hypothetical-set aggregates,
