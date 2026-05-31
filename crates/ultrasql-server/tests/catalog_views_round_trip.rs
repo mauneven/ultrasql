@@ -1090,6 +1090,47 @@ async fn pg_settings_reflects_session_search_path() {
 }
 
 #[tokio::test]
+async fn pg_settings_reflects_runtime_gucs() {
+    let (_server, client, _conn, server_handle) = start_server_and_connect().await;
+
+    client
+        .batch_execute(
+            "SET application_name = 'catalog_settings_probe'; \
+             SET client_min_messages = warning; \
+             SET DateStyle TO SQL, DMY; \
+             SET extra_float_digits = 2; \
+             SET IntervalStyle = iso_8601; \
+             SET lc_monetary = 'C'; \
+             SET TimeZone = 'America/Bogota'",
+        )
+        .await
+        .expect("set runtime gucs");
+
+    for (name, expected) in [
+        ("application_name", "catalog_settings_probe"),
+        ("client_min_messages", "warning"),
+        ("DateStyle", "SQL, DMY"),
+        ("extra_float_digits", "2"),
+        ("IntervalStyle", "iso_8601"),
+        ("lc_monetary", "C"),
+        ("TimeZone", "America/Bogota"),
+    ] {
+        let row = client
+            .query_one(
+                "SELECT setting \
+                 FROM pg_catalog.pg_settings \
+                 WHERE name = $1",
+                &[&name],
+            )
+            .await
+            .expect("pg_settings runtime GUC");
+        assert_eq!(row.get::<_, String>(0), expected, "{name}");
+    }
+
+    shutdown(client, server_handle).await;
+}
+
+#[tokio::test]
 async fn pg_stat_activity_reflects_session_identity() {
     let (_server, client, _conn, server_handle) = start_server_and_connect().await;
 

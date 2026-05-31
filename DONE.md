@@ -646,6 +646,10 @@ as a concise evidence ledger; roadmap stays for open gates only.
   and default used by `SHOW search_path` instead of a hardcoded `public`.
   Evidence:
   `cargo test -p ultrasql-server --test catalog_views_round_trip pg_settings_reflects_session_search_path -- --nocapture`.
+- `pg_catalog.pg_settings` now exposes supported runtime GUCs with the same
+  values as `SHOW`, including application name, client message level, date,
+  interval, float, monetary, and time-zone settings. Evidence:
+  `cargo test -p ultrasql-server --test catalog_views_round_trip pg_settings_reflects_runtime_gucs -- --nocapture`.
 - `pg_catalog.pg_collation` now exposes base `default`, `C`, and `POSIX`
   catalog rows instead of an empty relation, unblocking ORM and GUI
   introspection probes that join collation metadata. Evidence:
