@@ -409,25 +409,36 @@ fn checked_direct_revenue_add(left: i64, right: i64) -> Result<i64> {
 }
 
 #[cfg(feature = "sql-bench")]
+fn checked_direct_revenue_add_i128(left: i128, right: i128) -> Result<i128> {
+    left.checked_add(right)
+        .ok_or_else(direct_sidecar_revenue_overflow)
+}
+
+#[cfg(feature = "sql-bench")]
 fn checked_direct_discounted_revenue(extendedprice: i64, discount: i64) -> Result<i64> {
-    let factor = 100_i64
-        .checked_sub(discount)
-        .ok_or_else(direct_sidecar_revenue_overflow)?;
-    let product = i128::from(extendedprice)
-        .checked_mul(i128::from(factor))
-        .ok_or_else(direct_sidecar_revenue_overflow)?;
+    let product = checked_direct_discounted_product_i128(extendedprice, discount)?;
     i64::try_from(product / 100).map_err(|_| direct_sidecar_revenue_overflow())
 }
 
 #[cfg(feature = "sql-bench")]
 fn checked_direct_discounted_revenue_x100(extendedprice: i64, discount: i64) -> Result<i64> {
+    let product = checked_direct_discounted_product_i128(extendedprice, discount)?;
+    i64::try_from(product).map_err(|_| direct_sidecar_revenue_overflow())
+}
+
+#[cfg(feature = "sql-bench")]
+fn checked_direct_discounted_revenue_i128(extendedprice: i64, discount: i64) -> Result<i128> {
+    Ok(checked_direct_discounted_product_i128(extendedprice, discount)? / 100)
+}
+
+#[cfg(feature = "sql-bench")]
+fn checked_direct_discounted_product_i128(extendedprice: i64, discount: i64) -> Result<i128> {
     let factor = 100_i64
         .checked_sub(discount)
         .ok_or_else(direct_sidecar_revenue_overflow)?;
-    let product = i128::from(extendedprice)
+    i128::from(extendedprice)
         .checked_mul(i128::from(factor))
-        .ok_or_else(direct_sidecar_revenue_overflow)?;
-    i64::try_from(product).map_err(|_| direct_sidecar_revenue_overflow())
+        .ok_or_else(direct_sidecar_revenue_overflow)
 }
 
 #[cfg(feature = "sql-bench")]
@@ -1815,10 +1826,10 @@ impl TpchQ14BuildState {
         {
             return Ok(());
         }
-        let volume = i128::from(extendedprice) * i128::from(100_i64.saturating_sub(discount)) / 100;
-        self.total_volume += volume;
+        let volume = checked_direct_discounted_revenue_i128(extendedprice, discount)?;
+        self.total_volume = checked_direct_revenue_add_i128(self.total_volume, volume)?;
         if self.promo_parts.contains(&partkey) {
-            self.promo_volume += volume;
+            self.promo_volume = checked_direct_revenue_add_i128(self.promo_volume, volume)?;
         }
         Ok(())
     }
@@ -5479,6 +5490,24 @@ mod tests {
 
         assert_eq!(rows.len(), 1);
         assert!((rows[0].promo_revenue - 50.0).abs() < f64::EPSILON);
+    }
+
+    #[cfg(feature = "sql-bench")]
+    #[test]
+    fn tpch_q14_sidecar_rejects_discount_factor_overflow() {
+        let mut state = TpchQ14BuildState::default();
+        state
+            .ingest(
+                "part",
+                "1|forest|mfgr|Brand#1|PROMO BRUSHED STEEL|1|SM BOX|1.00|comment",
+            )
+            .expect("promo part");
+
+        let err = state
+            .ingest_lineitem_values(1, 10_000, i64::MIN, -1_583)
+            .expect_err("discount factor overflow should reject");
+
+        assert!(err.to_string().contains("TPC-H sidecar revenue overflow"));
     }
 
     #[cfg(feature = "sql-bench")]
