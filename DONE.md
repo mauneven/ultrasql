@@ -994,6 +994,10 @@ as a concise evidence ledger; roadmap stays for open gates only.
   predicate or `RETURNING` list. Evidence: `cargo test -p ultrasql-server
   --test privilege_catalog_round_trip delete_requires_table_delete_privilege
   -- --nocapture`.
+- `TRUNCATE` now accepts explicit table-level `TRUNCATE` privilege for
+  non-owner roles while preserving owner/superuser bypass. Evidence:
+  `cargo test -p ultrasql-server --test privilege_catalog_round_trip
+  truncate_accepts_table_truncate_privilege -- --nocapture`.
 - `DROP ROLE` now rejects roles that still own live tables or still appear in
   object/default privilege grants, avoiding stale ownership and ACL references.
   Evidence: `cargo test -p ultrasql-server --test role_ddl_round_trip`.

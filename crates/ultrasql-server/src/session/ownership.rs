@@ -35,6 +35,39 @@ where
         }
     }
 
+    pub(super) fn ensure_table_owner_or_privilege_or_superuser(
+        &self,
+        table_oid: Oid,
+        table_name: &str,
+        privilege: PrivilegeKind,
+        action: &str,
+    ) -> Result<(), ServerError> {
+        let current_user = self.current_user.to_ascii_lowercase();
+        if self.current_user_is_superuser(&current_user) {
+            return Ok(());
+        }
+        let owns_table = self
+            .state
+            .row_security
+            .get(&table_oid)
+            .is_some_and(|runtime| runtime.owner_role.eq_ignore_ascii_case(&current_user));
+        if owns_table {
+            return Ok(());
+        }
+        let roles = self.state.role_catalog.inherited_role_names(&current_user);
+        if self.state.privilege_catalog.has_privilege_for_roles(
+            &roles,
+            PrivilegeObjectKind::Table,
+            table_name,
+            privilege,
+        ) {
+            return Ok(());
+        }
+        Err(ServerError::InsufficientPrivilege(format!(
+            "permission denied to {action} table {table_name}"
+        )))
+    }
+
     pub(super) fn ensure_schema_owner_or_superuser(
         &self,
         schema_name: &str,

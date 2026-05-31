@@ -770,7 +770,12 @@ where
             let entry = snapshot.tables.get(name).ok_or_else(|| {
                 ServerError::Plan(ultrasql_planner::PlanError::TableNotFound(name.clone()))
             })?;
-            self.ensure_table_owner_or_superuser(entry.oid, name)?;
+            self.ensure_table_owner_or_privilege_or_superuser(
+                entry.oid,
+                name,
+                crate::auth::PrivilegeKind::Truncate,
+                "truncate",
+            )?;
         }
 
         // Single autocommit txn so the multi-table case is atomic. A

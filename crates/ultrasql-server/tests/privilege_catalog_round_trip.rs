@@ -417,6 +417,54 @@ async fn delete_requires_table_delete_privilege() {
 }
 
 #[tokio::test]
+async fn truncate_accepts_table_truncate_privilege() {
+    let running = start_sample_server("truncate_privilege_gate").await;
+    let client = &running.client;
+
+    client
+        .batch_execute(
+            "CREATE ROLE tester SUPERUSER LOGIN; \
+             CREATE ROLE truncate_acl_owner LOGIN; \
+             CREATE ROLE truncate_acl_user LOGIN; \
+             SET ROLE truncate_acl_owner; \
+             CREATE TABLE truncate_acl_docs (id INT); \
+             INSERT INTO truncate_acl_docs VALUES (1), (2); \
+             GRANT TRUNCATE ON TABLE truncate_acl_docs TO truncate_acl_user; \
+             RESET ROLE",
+        )
+        .await
+        .expect("create truncate privilege table");
+
+    let (user, user_conn) = connect_as(
+        running.bound,
+        "truncate_acl_user",
+        "truncate_acl_user_allowed",
+    )
+    .await;
+    user.batch_execute("TRUNCATE TABLE truncate_acl_docs")
+        .await
+        .expect("TRUNCATE grant permits truncate");
+    drop(user);
+    user_conn.await.expect("truncate connection joins");
+
+    let remaining = client
+        .query_one("SELECT COUNT(*) FROM truncate_acl_docs", &[])
+        .await
+        .expect("query rows after truncate")
+        .get::<_, i64>(0);
+    assert_eq!(remaining, 0);
+
+    client
+        .batch_execute(
+            "DROP TABLE truncate_acl_docs; DROP ROLE truncate_acl_owner; DROP ROLE truncate_acl_user",
+        )
+        .await
+        .expect("cleanup truncate privilege test");
+
+    shutdown(running).await;
+}
+
+#[tokio::test]
 async fn non_superuser_cannot_alter_default_privileges_for_privileged_role() {
     let running = start_sample_server("privilege_catalog_test").await;
     let client = &running.client;
