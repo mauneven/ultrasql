@@ -2177,3 +2177,6 @@ as a concise evidence ledger; roadmap stays for open gates only.
 - Replication metadata loading now rejects unbounded read limits and checks
   byte-count conversion instead of using a saturated sentinel read. Evidence:
   `cargo test -p ultrasql-server replication::tests::logical_metadata_rejects_unbounded_read_limit --lib -- --nocapture`.
+- Local external file reads now reject unbounded read limits and check
+  byte-count conversion instead of using a saturated sentinel read. Evidence:
+  `cargo test -p ultrasql-server pipeline::external_scan::tests::external_local_sources_reject_unbounded_read_limit --lib -- --nocapture`.

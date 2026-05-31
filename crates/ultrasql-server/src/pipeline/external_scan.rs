@@ -444,7 +444,7 @@ fn read_local_external_file(function_name: &str, path: &Path) -> Result<Vec<u8>,
             path.display()
         ))
     })?;
-    let mut limited = file.take(limit.saturating_add(1));
+    let mut limited = file.take(external_local_take_limit(function_name, path, limit)?);
     let mut bytes = Vec::new();
     limited.read_to_end(&mut bytes).map_err(|err| {
         ServerError::CopyFormat(format!(
@@ -452,7 +452,7 @@ fn read_local_external_file(function_name: &str, path: &Path) -> Result<Vec<u8>,
             path.display()
         ))
     })?;
-    let bytes_read = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
+    let bytes_read = external_local_bytes_read_len(function_name, path, bytes.len())?;
     if bytes_read > limit {
         return Err(external_local_read_limit_error(
             function_name,
@@ -508,6 +508,34 @@ fn external_local_read_limit_bytes() -> u64 {
         .and_then(|value| value.parse::<u64>().ok())
         .filter(|&limit| limit > 0)
         .unwrap_or(DEFAULT_EXTERNAL_LOCAL_READ_LIMIT_BYTES)
+}
+
+fn external_local_take_limit(
+    function_name: &str,
+    path: &Path,
+    limit: u64,
+) -> Result<u64, ServerError> {
+    limit.checked_add(1).ok_or_else(|| {
+        ServerError::CopyFormat(format!(
+            "{function_name} local file read limit is too large: path={} limit={} env={}",
+            path.display(),
+            limit,
+            EXTERNAL_LOCAL_READ_LIMIT_ENV
+        ))
+    })
+}
+
+fn external_local_bytes_read_len(
+    function_name: &str,
+    path: &Path,
+    len: usize,
+) -> Result<u64, ServerError> {
+    u64::try_from(len).map_err(|_| {
+        ServerError::CopyFormat(format!(
+            "{function_name} local file byte count exceeds u64: path={} bytes={len}",
+            path.display()
+        ))
+    })
 }
 
 fn external_local_read_limit_error(
@@ -1469,6 +1497,34 @@ mod tests {
         // this module's tests.
         unsafe {
             std::env::remove_var("ULTRASQL_EXTERNAL_LOCAL_READ_LIMIT_BYTES");
+        }
+    }
+
+    #[test]
+    fn external_local_sources_reject_unbounded_read_limit() {
+        let _env_guard = external_env_test_lock();
+        // SAFETY: external_env_test_lock serializes process-env mutation in
+        // this module's tests.
+        unsafe {
+            std::env::set_var(EXTERNAL_LOCAL_READ_LIMIT_ENV, u64::MAX.to_string());
+        }
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("input.arrow");
+        fs::write(&path, b"ok").expect("write file");
+
+        let err = read_external_sources("read_arrow", &[path.to_string_lossy().to_string()])
+            .expect_err("unbounded local file limit rejected");
+
+        assert!(
+            err.to_string()
+                .contains("local file read limit is too large")
+        );
+
+        // SAFETY: external_env_test_lock serializes process-env mutation in
+        // this module's tests.
+        unsafe {
+            std::env::remove_var(EXTERNAL_LOCAL_READ_LIMIT_ENV);
         }
     }
 
