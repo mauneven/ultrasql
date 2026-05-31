@@ -1298,6 +1298,36 @@ pub fn xml_xpath_element_fragments_with_namespaces(
         let value = xml_xpath_first_string_value(&matches);
         return Some(vec![value.starts_with(&prefix).to_string()]);
     }
+    if let Some((inner_path, delimiter)) =
+        xml_xpath_string_literal_function_arguments(path, "substring-before")
+    {
+        let matches =
+            xml_xpath_element_fragments_with_namespaces(inner_path, document, namespace_bindings)?;
+        let value = xml_xpath_first_string_value(&matches);
+        let before = if delimiter.is_empty() {
+            String::new()
+        } else {
+            value
+                .find(&delimiter)
+                .map_or_else(String::new, |idx| value[..idx].to_owned())
+        };
+        return Some(vec![before]);
+    }
+    if let Some((inner_path, delimiter)) =
+        xml_xpath_string_literal_function_arguments(path, "substring-after")
+    {
+        let matches =
+            xml_xpath_element_fragments_with_namespaces(inner_path, document, namespace_bindings)?;
+        let value = xml_xpath_first_string_value(&matches);
+        let after = if delimiter.is_empty() {
+            value
+        } else {
+            value
+                .find(&delimiter)
+                .map_or_else(String::new, |idx| value[idx + delimiter.len()..].to_owned())
+        };
+        return Some(vec![after]);
+    }
     if let Some(inner_path) = xml_xpath_count_argument(path) {
         let matches =
             xml_xpath_element_fragments_with_namespaces(inner_path, document, namespace_bindings)?;
@@ -3311,6 +3341,27 @@ mod tests {
                 r#"<root><item>Ada Lovelace</item></root>"#
             ),
             Some(vec!["false".to_owned()])
+        );
+        assert_eq!(
+            xml_xpath_element_fragments(
+                r#"substring-before(/root/item, " ")"#,
+                r#"<root><item>Ada Lovelace</item></root>"#
+            ),
+            Some(vec!["Ada".to_owned()])
+        );
+        assert_eq!(
+            xml_xpath_element_fragments(
+                r#"substring-after(/root/item, " ")"#,
+                r#"<root><item>Ada Lovelace</item></root>"#
+            ),
+            Some(vec!["Lovelace".to_owned()])
+        );
+        assert_eq!(
+            xml_xpath_element_fragments(
+                r#"substring-before(/root/item, "x")"#,
+                r#"<root><item>Ada Lovelace</item></root>"#
+            ),
+            Some(vec![String::new()])
         );
         let nested = r#"<root><group><item id="1"><name>A</name></item><item id="2"><name>B</name></item></group><name>C</name></root>"#;
         assert_eq!(
