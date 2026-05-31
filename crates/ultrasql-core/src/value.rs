@@ -1256,6 +1256,32 @@ pub fn xml_xpath_element_fragments_with_namespaces(
             xml_xpath_name_value(fragment)
         })]);
     }
+    if let Some(inner_path) = xml_xpath_function_argument(path, "local-name") {
+        let matches =
+            xml_xpath_element_fragments_with_namespaces(inner_path, document, namespace_bindings)?;
+        return Some(vec![matches.first().map_or_else(String::new, |fragment| {
+            xml_xpath_local_name_value(fragment)
+        })]);
+    }
+    if let Some(inner_path) = xml_xpath_function_argument(path, "normalize-space") {
+        let matches =
+            xml_xpath_element_fragments_with_namespaces(inner_path, document, namespace_bindings)?;
+        return Some(vec![matches.first().map_or_else(String::new, |fragment| {
+            xml_xpath_normalize_space_value(fragment)
+        })]);
+    }
+    if let Some(inner_path) = xml_xpath_function_argument(path, "string-length") {
+        let matches =
+            xml_xpath_element_fragments_with_namespaces(inner_path, document, namespace_bindings)?;
+        return Some(vec![
+            matches
+                .first()
+                .map_or_else(String::new, |fragment| xml_xpath_string_value(fragment))
+                .chars()
+                .count()
+                .to_string(),
+        ]);
+    }
     if let Some(inner_path) = xml_xpath_count_argument(path) {
         let matches =
             xml_xpath_element_fragments_with_namespaces(inner_path, document, namespace_bindings)?;
@@ -1769,6 +1795,33 @@ fn xml_collect_string_value(text: &str, element: &XmlElement, out: &mut String) 
 
 fn xml_xpath_name_value(fragment: &str) -> String {
     xml_root_element(fragment.trim()).map_or_else(String::new, |root| root.name)
+}
+
+fn xml_xpath_local_name_value(fragment: &str) -> String {
+    let name = xml_xpath_name_value(fragment);
+    if let Some((_, local)) = name.rsplit_once(':') {
+        local.to_owned()
+    } else {
+        name
+    }
+}
+
+fn xml_xpath_normalize_space_value(fragment: &str) -> String {
+    let value = xml_xpath_string_value(fragment);
+    let mut out = String::new();
+    let mut saw_space = false;
+    for ch in value.chars() {
+        if ch.is_whitespace() {
+            saw_space = true;
+        } else {
+            if saw_space && !out.is_empty() {
+                out.push(' ');
+            }
+            out.push(ch);
+            saw_space = false;
+        }
+    }
+    out
 }
 
 fn xml_namespace_context(
@@ -2321,8 +2374,9 @@ fn unescape_array_text(text: &str) -> Option<String> {
 fn write_array_element(f: &mut fmt::Formatter<'_>, value: &Value) -> fmt::Result {
     match value {
         Value::Null => f.write_str("NULL"),
+        Value::Array { .. } => write!(f, "{value}"),
         Value::Text(s) | Value::Char(s) => write_array_text(f, s),
-        other => write!(f, "{other}"),
+        other => write_array_text(f, &other.to_string()),
     }
 }
 
@@ -3158,6 +3212,24 @@ mod tests {
             xml_xpath_element_fragments("name(/root/item)", doc),
             Some(vec!["item".to_owned()])
         );
+        assert_eq!(
+            xml_xpath_element_fragments("local-name(/root/item)", doc),
+            Some(vec!["item".to_owned()])
+        );
+        assert_eq!(
+            xml_xpath_element_fragments(
+                "normalize-space(/root/item)",
+                r#"<root><item>  Ada   Lovelace </item></root>"#
+            ),
+            Some(vec!["Ada Lovelace".to_owned()])
+        );
+        assert_eq!(
+            xml_xpath_element_fragments(
+                "string-length(/root/item)",
+                r#"<root><item>  Ada   Lovelace </item></root>"#
+            ),
+            Some(vec!["17".to_owned()])
+        );
         let nested = r#"<root><group><item id="1"><name>A</name></item><item id="2"><name>B</name></item></group><name>C</name></root>"#;
         assert_eq!(
             xml_xpath_element_fragments(r#"//item[@id="2"]/name"#, nested),
@@ -3180,6 +3252,10 @@ mod tests {
         assert_eq!(
             xml_xpath_element_fragments("/r:root/r:item/text()", namespaced),
             Some(vec!["Z".to_owned()])
+        );
+        assert_eq!(
+            xml_xpath_element_fragments("local-name(/r:root/r:item)", namespaced),
+            Some(vec!["item".to_owned()])
         );
         assert_eq!(
             xml_xpath_element_fragments("/r:root/@*", namespaced),
@@ -3282,6 +3358,18 @@ mod tests {
         assert_eq!(
             Value::parse_array(DataType::Text { max_len: None }, &value.to_string()),
             Some(value)
+        );
+
+        let xml = Value::Array {
+            element_type: DataType::Xml,
+            elements: vec![
+                Value::Xml(r#"<item id="1">a</item>"#.into()),
+                Value::Xml("Ada Lovelace".into()),
+            ],
+        };
+        assert_eq!(
+            xml.to_string(),
+            r#"{"<item id=\"1\">a</item>","Ada Lovelace"}"#
         );
     }
 

@@ -274,6 +274,15 @@ as a concise evidence ledger; roadmap stays for open gates only.
   `cargo test -p ultrasql-core xml_xpath_subset_filters_children_without_entity_resolution --lib -- --nocapture`
   and
   `cargo test -p ultrasql-server --test xml_round_trip xml_functions_validate_securely_and_extract_simple_xpath -- --nocapture`.
+- XML XPath now supports bounded scalar `local-name(/supported/path)`,
+  `normalize-space(/supported/path)`, and `string-length(/supported/path)`
+  functions over the existing secure selector. This also fixed text-array
+  rendering for XML scalar values that need PostgreSQL-style array quoting,
+  such as values with spaces or double quotes. Evidence:
+  `cargo test -p ultrasql-core xml_xpath_subset_filters_children_without_entity_resolution --lib -- --nocapture`,
+  `cargo test -p ultrasql-core array_display_and_parse_round_trip --lib -- --nocapture`,
+  and
+  `cargo test -p ultrasql-server --test xml_round_trip xml_functions_validate_securely_and_extract_simple_xpath -- --nocapture`.
 - XML XPath now supports explicit `child::`, `attribute::`, `descendant::`,
   terminal `.`, and terminal `self::node()` steps in the secure local subset,
   reusing the existing element walker without entity expansion or external
@@ -852,8 +861,9 @@ as a concise evidence ledger; roadmap stays for open gates only.
   equality filters, element wildcards, terminal `@attr` / `@*` selection,
   terminal `text()` selection, namespace URI mapping arrays, the descendant
   `//` abbreviation, bounded `count()` / `string()` / `boolean()` / `not()` /
-  `name()`, and explicit `child::`, `attribute::`, `descendant::`, and terminal
-  self-node steps. DTD declarations, external entity expansion, unknown entity
+  `name()` / `local-name()` / `normalize-space()` / `string-length()`, and
+  explicit `child::`, `attribute::`, `descendant::`, and terminal self-node
+  steps. DTD declarations, external entity expansion, unknown entity
   references, and pre-root junk are rejected.
 - `XMLTABLE` now has a first secure table-function subset: constant XML input,
   element row XPath, scalar column `PATH`, temporal/numeric/money scalar

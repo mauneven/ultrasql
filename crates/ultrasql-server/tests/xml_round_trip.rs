@@ -283,6 +283,9 @@ async fn xml_functions_validate_securely_and_extract_simple_xpath() {
                         xpath('not(/root/missing)', XML '<root><item/></root>'), \
                         xpath('not(/root/item)', XML '<root><item/></root>'), \
                         xpath('name(/root/item)', XML '<root><item/></root>'), \
+                        xpath('local-name(/root/item)', XML '<root><item/></root>'), \
+                        xpath('normalize-space(/root/item)', XML '<root><item>  Ada   Lovelace </item></root>'), \
+                        xpath('string-length(/root/item)', XML '<root><item>  Ada   Lovelace </item></root>'), \
                         xpath('count(/root/item)', XML '<root><item/><item/><other/></root>'), \
                         xpath('/r:root/r:item/@x:id', XML '<r:root xmlns:r=\"urn:r\" xmlns:x=\"urn:x\"><r:item x:id=\"7\">z</r:item></r:root>'), \
                         xpath_exists('/r:root/item:child', XML '<root xmlns=\"urn:root\" xmlns:i=\"urn:item\"><i:child i:id=\"7\">z</i:child></root>', ARRAY[ARRAY['r','urn:root'],ARRAY['item','urn:item']]), \
@@ -297,18 +300,21 @@ async fn xml_functions_validate_securely_and_extract_simple_xpath() {
             "{<name>b</name>}".to_owned(),
             "{1,2}".to_owned(),
             "{a,b}".to_owned(),
-            "{<item id=\"1\">a</item>,<other>b</other>}".to_owned(),
+            r#"{"<item id=\"1\">a</item>",<other>b</other>}"#.to_owned(),
             "{1,a}".to_owned(),
             "{<name>a</name>,<name>b</name>}".to_owned(),
             "{<name>b</name>}".to_owned(),
             "{1,2}".to_owned(),
             "{<name>a</name>,<name>b</name>}".to_owned(),
-            "{<item id=\"1\">a</item>,<item id=\"2\">b</item>}".to_owned(),
+            r#"{"<item id=\"1\">a</item>","<item id=\"2\">b</item>"}"#.to_owned(),
             "{Ada}".to_owned(),
             "{true}".to_owned(),
             "{true}".to_owned(),
             "{false}".to_owned(),
             "{item}".to_owned(),
+            "{item}".to_owned(),
+            r#"{"Ada Lovelace"}"#.to_owned(),
+            "{17}".to_owned(),
             "{2}".to_owned(),
             "{7}".to_owned(),
             "t".to_owned(),
