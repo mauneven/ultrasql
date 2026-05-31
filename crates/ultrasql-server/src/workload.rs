@@ -547,7 +547,11 @@ impl WorkloadRecorder {
     pub fn set_session_idle(&self, pid: u32) {
         if let Some(row) = self.active_sessions.lock().get_mut(&pid) {
             row.state_change = current_engine_timestamp_micros();
-            row.state = "idle".to_string();
+            row.state = if row.xact_start.is_some() {
+                "idle in transaction".to_string()
+            } else {
+                "idle".to_string()
+            };
             row.query_start = None;
             row.query = None;
         }

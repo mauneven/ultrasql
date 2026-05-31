@@ -1313,14 +1313,15 @@ async fn pg_stat_activity_lists_open_sessions() {
         .expect("begin activity_b transaction");
     let row = client_a
         .query_one(
-            "SELECT xact_start IS NOT NULL \
+            "SELECT state, xact_start IS NOT NULL \
              FROM pg_catalog.pg_stat_activity \
              WHERE application_name = 'activity_b'",
             &[],
         )
         .await
         .expect("active activity_b transaction start");
-    assert!(row.get::<_, bool>(0));
+    assert_eq!(row.get::<_, String>(0), "idle in transaction");
+    assert!(row.get::<_, bool>(1));
 
     client_b
         .batch_execute("COMMIT")
@@ -1328,14 +1329,15 @@ async fn pg_stat_activity_lists_open_sessions() {
         .expect("commit activity_b transaction");
     let row = client_a
         .query_one(
-            "SELECT xact_start IS NOT NULL \
+            "SELECT state, xact_start IS NOT NULL \
              FROM pg_catalog.pg_stat_activity \
              WHERE application_name = 'activity_b'",
             &[],
         )
         .await
         .expect("committed activity_b transaction start");
-    assert!(!row.get::<_, bool>(0));
+    assert_eq!(row.get::<_, String>(0), "idle");
+    assert!(!row.get::<_, bool>(1));
 
     client_b
         .batch_execute("BEGIN")
@@ -1343,14 +1345,15 @@ async fn pg_stat_activity_lists_open_sessions() {
         .expect("begin rollback activity_b transaction");
     let row = client_a
         .query_one(
-            "SELECT xact_start IS NOT NULL \
+            "SELECT state, xact_start IS NOT NULL \
              FROM pg_catalog.pg_stat_activity \
              WHERE application_name = 'activity_b'",
             &[],
         )
         .await
         .expect("rollback activity_b transaction start");
-    assert!(row.get::<_, bool>(0));
+    assert_eq!(row.get::<_, String>(0), "idle in transaction");
+    assert!(row.get::<_, bool>(1));
 
     client_b
         .batch_execute("ROLLBACK")
@@ -1358,14 +1361,15 @@ async fn pg_stat_activity_lists_open_sessions() {
         .expect("rollback activity_b transaction");
     let row = client_a
         .query_one(
-            "SELECT xact_start IS NOT NULL \
+            "SELECT state, xact_start IS NOT NULL \
              FROM pg_catalog.pg_stat_activity \
              WHERE application_name = 'activity_b'",
             &[],
         )
         .await
         .expect("rolled back activity_b transaction start");
-    assert!(!row.get::<_, bool>(0));
+    assert_eq!(row.get::<_, String>(0), "idle");
+    assert!(!row.get::<_, bool>(1));
 
     drop(client_b);
     tokio::time::sleep(Duration::from_millis(20)).await;
