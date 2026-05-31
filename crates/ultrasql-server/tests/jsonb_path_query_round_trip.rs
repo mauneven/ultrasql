@@ -494,6 +494,34 @@ async fn jsonb_path_query_supports_exists_predicates() {
 }
 
 #[tokio::test]
+async fn jsonb_path_query_supports_like_regex_predicates() {
+    let running = start_sample_server("jsonb_path_query_test").await;
+    let client = &running.client;
+
+    let messages = client
+        .simple_query(
+            "SELECT value FROM jsonb_path_query(\
+             '{\"items\":[{\"id\":1,\"name\":\"Alpha\"},\
+             {\"id\":2,\"name\":\"Beta\"},{\"id\":3,\"name\":\"alpine\"}]}'::jsonb, \
+             '$.items[*] ? (@.name like_regex \"^al\" flag \"i\").id') \
+             ORDER BY value",
+        )
+        .await
+        .expect("jsonb_path_query like_regex predicate");
+    let rows: Vec<String> = messages
+        .into_iter()
+        .filter_map(|message| match message {
+            SimpleQueryMessage::Row(row) => row.get(0).map(str::to_owned),
+            _ => None,
+        })
+        .collect();
+
+    assert_eq!(rows, vec!["1".to_owned(), "3".to_owned()]);
+
+    shutdown(running).await;
+}
+
+#[tokio::test]
 async fn jsonb_path_exists_evaluates_sql_json_predicates() {
     let running = start_sample_server("jsonb_path_query_test").await;
     let client = &running.client;

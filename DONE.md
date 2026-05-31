@@ -686,7 +686,8 @@ as a concise evidence ledger; roadmap stays for open gates only.
   `.string()`, `.double()`, `.number()`, `.integer()`, `.bigint()`, `.abs()`,
   `.floor()`, and `.ceiling()` SQL/JSON path methods now work in the shared
   path engine, and filter predicates support `&&`, `||`, `!`, nested predicate
-  parentheses, `exists(path)`, and string `starts with`. Evidence:
+  parentheses, `exists(path)`, string `starts with`, and `like_regex` with
+  validated `i` / `m` / `s` flags. Evidence:
   `cargo test -p ultrasql-server --test jsonb_path_query_round_trip jsonb_path_query_accepts_strict_and_lax_prefixes -- --nocapture`;
   `cargo test -p ultrasql-server --test jsonb_path_query_round_trip jsonb_path_strict_mode_reports_structural_errors -- --nocapture`;
   `cargo test -p ultrasql-server --test jsonb_path_query_round_trip jsonb_path_exists_supports_variable_literals -- --nocapture`;
@@ -697,7 +698,8 @@ as a concise evidence ledger; roadmap stays for open gates only.
   `cargo test -p ultrasql-server --test jsonb_path_query_round_trip jsonb_path_query_supports_conversion_methods -- --nocapture`;
   `cargo test -p ultrasql-server --test jsonb_path_query_round_trip jsonb_path_query_supports_predicate_boolean_algebra -- --nocapture`;
   `cargo test -p ultrasql-server --test jsonb_path_query_round_trip jsonb_path_query_supports_exists_predicates -- --nocapture`;
-  `cargo test -p ultrasql-server --test jsonb_path_query_round_trip jsonb_path_query_supports_starts_with_predicates -- --nocapture`.
+  `cargo test -p ultrasql-server --test jsonb_path_query_round_trip jsonb_path_query_supports_starts_with_predicates -- --nocapture`;
+  `cargo test -p ultrasql-server --test jsonb_path_query_round_trip jsonb_path_query_supports_like_regex_predicates -- --nocapture`.
 - Native arrays support multi-dimensional rectangular text/runtime round trips,
   GIN-facing operators, array subscripts/slices, `array_agg`, `array_length`,
   `array_cat`, `array_to_string`, `string_to_array`, and wire-visible `unnest`.

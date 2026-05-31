@@ -1,5 +1,6 @@
 //! SQL/JSON path subset shared by scalar JSON functions and table functions.
 
+use regex::RegexBuilder;
 use serde_json::{Map as JsonMap, Number as JsonNumber, Value as JsonValue};
 
 /// Parsed SQL/JSON path expression.
@@ -69,6 +70,7 @@ enum JsonPathCompareOp {
     Gt,
     GtEq,
     StartsWith,
+    LikeRegex,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -78,6 +80,10 @@ enum JsonPathLiteral {
     Bool(bool),
     Null,
     Variable(String),
+    Regex {
+        pattern: String,
+        flags: Option<String>,
+    },
 }
 
 /// Error raised while parsing a SQL/JSON path.
@@ -275,6 +281,11 @@ fn compare_json_path_literal(
             if op == JsonPathCompareOp::StartsWith =>
         {
             left.starts_with(right)
+        }
+        (JsonValue::String(left), JsonPathLiteral::Regex { pattern, flags })
+            if op == JsonPathCompareOp::LikeRegex =>
+        {
+            json_path_regex_matches(left, pattern, flags.as_deref())
         }
         (JsonValue::String(left), JsonPathLiteral::String(right)) => compare_ord(left, op, right),
         (JsonValue::Number(left), JsonPathLiteral::Number(right)) => left
@@ -475,7 +486,7 @@ fn compare_ord<T: Ord>(left: &T, op: JsonPathCompareOp, right: &T) -> bool {
         JsonPathCompareOp::LtEq => left <= right,
         JsonPathCompareOp::Gt => left > right,
         JsonPathCompareOp::GtEq => left >= right,
-        JsonPathCompareOp::StartsWith => false,
+        JsonPathCompareOp::StartsWith | JsonPathCompareOp::LikeRegex => false,
     }
 }
 
@@ -490,8 +501,27 @@ fn compare_f64(left: f64, op: JsonPathCompareOp, right: f64) -> bool {
         JsonPathCompareOp::LtEq => left <= right,
         JsonPathCompareOp::Gt => left > right,
         JsonPathCompareOp::GtEq => left >= right,
-        JsonPathCompareOp::StartsWith => false,
+        JsonPathCompareOp::StartsWith | JsonPathCompareOp::LikeRegex => false,
     }
+}
+
+fn json_path_regex_matches(value: &str, pattern: &str, flags: Option<&str>) -> bool {
+    let mut builder = RegexBuilder::new(pattern);
+    for flag in flags.unwrap_or_default().chars() {
+        match flag {
+            'i' => {
+                builder.case_insensitive(true);
+            }
+            'm' => {
+                builder.multi_line(true);
+            }
+            's' => {
+                builder.dot_matches_new_line(true);
+            }
+            _ => return false,
+        }
+    }
+    builder.build().is_ok_and(|regex| regex.is_match(value))
 }
 
 struct JsonPathParser<'a> {
@@ -647,9 +677,13 @@ impl<'a> JsonPathParser<'a> {
         let path = self.parse_steps(true)?;
         self.skip_ws();
         let op = self.parse_predicate_op();
-        let literal = if op.is_some() {
+        let literal = if let Some(op) = op {
             self.skip_ws();
-            Some(self.parse_literal()?)
+            if op == JsonPathCompareOp::LikeRegex {
+                Some(self.parse_regex_literal()?)
+            } else {
+                Some(self.parse_literal()?)
+            }
         } else {
             None
         };
@@ -660,6 +694,7 @@ impl<'a> JsonPathParser<'a> {
     fn parse_predicate_op(&mut self) -> Option<JsonPathCompareOp> {
         self.parse_compare_op()
             .or_else(|| self.parse_starts_with_op())
+            .or_else(|| self.parse_like_regex_op())
     }
 
     fn parse_compare_op(&mut self) -> Option<JsonPathCompareOp> {
@@ -691,11 +726,17 @@ impl<'a> JsonPathParser<'a> {
         None
     }
 
+    fn parse_like_regex_op(&mut self) -> Option<JsonPathCompareOp> {
+        self.consume_keyword("like_regex")
+            .then_some(JsonPathCompareOp::LikeRegex)
+    }
+
     fn starts_predicate_op(&self) -> bool {
         [">=", "<=", "==", "!=", ">", "<"]
             .iter()
             .any(|token| self.text[self.pos..].starts_with(token))
             || self.starts_keyword("starts")
+            || self.starts_keyword("like_regex")
     }
 
     fn starts_boolean_op(&self) -> bool {
@@ -738,6 +779,31 @@ impl<'a> JsonPathParser<'a> {
             .parse::<f64>()
             .map(JsonPathLiteral::Number)
             .map_err(|err| self.err(format!("bad number literal: {err}")))
+    }
+
+    fn parse_regex_literal(&mut self) -> Result<JsonPathLiteral, JsonPathError> {
+        self.expect_byte(b'"', "expected regex pattern")?;
+        let pattern = self.parse_quoted_string_body()?;
+        self.skip_ws();
+        let flags = if self.consume_keyword("flag") {
+            self.skip_ws();
+            self.expect_byte(b'"', "expected regex flags")?;
+            let flags = self.parse_quoted_string_body()?;
+            self.validate_regex_flags(&flags)?;
+            Some(flags)
+        } else {
+            None
+        };
+        Ok(JsonPathLiteral::Regex { pattern, flags })
+    }
+
+    fn validate_regex_flags(&self, flags: &str) -> Result<(), JsonPathError> {
+        for flag in flags.chars() {
+            if !matches!(flag, 'i' | 'm' | 's') {
+                return Err(self.err(format!("unsupported regex flag {flag}")));
+            }
+        }
+        Ok(())
     }
 
     fn parse_identifier(&mut self) -> Result<String, JsonPathError> {
@@ -1136,6 +1202,24 @@ mod tests {
         });
 
         let path = parse_json_path("$.items[*] ? (exists(@.meta.kind)).id").unwrap();
+        assert_eq!(
+            select(&document, &path),
+            vec![serde_json::json!(1), serde_json::json!(3)]
+        );
+    }
+
+    #[test]
+    fn path_supports_like_regex_predicates() {
+        let document = serde_json::json!({
+            "items": [
+                {"id": 1, "name": "Alpha"},
+                {"id": 2, "name": "Beta"},
+                {"id": 3, "name": "alpine"}
+            ]
+        });
+
+        let path =
+            parse_json_path(r#"$.items[*] ? (@.name like_regex "^al" flag "i").id"#).unwrap();
         assert_eq!(
             select(&document, &path),
             vec![serde_json::json!(1), serde_json::json!(3)]
