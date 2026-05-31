@@ -4820,6 +4820,7 @@ impl Server {
         let mut seen_sequence_default_keys = std::collections::HashSet::new();
         let mut seen_default_keys = std::collections::HashSet::new();
         let mut seen_identity_keys = std::collections::HashSet::new();
+        let mut seen_generated_keys = std::collections::HashSet::new();
         for (line_no, line) in text.lines().enumerate() {
             if line.is_empty() || line.starts_with('#') {
                 continue;
@@ -4926,6 +4927,12 @@ impl Server {
                             line_no + 1
                         ))
                     })?;
+                    if !seen_generated_keys.insert((oid, idx)) {
+                        return Err(ServerError::Ddl(format!(
+                            "duplicate table-runtime generated metadata on line {}",
+                            line_no + 1
+                        )));
+                    }
                     generated_stored.entry(oid).or_default().push((
                         idx,
                         decode_scalar_expr_field(&metadata_unescape(parts[3])?)?,

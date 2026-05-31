@@ -844,6 +844,9 @@ as a concise evidence ledger; roadmap stays for open gates only.
   same table and column, avoiding ambiguous restarted `GENERATED ALWAYS`
   enforcement. Evidence:
   `cargo test -p ultrasql-server --test drop_restart_round_trip table_runtime_metadata_rejects_duplicate_identity_rows_on_rebuild -- --nocapture`.
+- Table runtime metadata reload rejects duplicate generated-column rows for the
+  same table and column, avoiding last-row-wins restart expressions. Evidence:
+  `cargo test -p ultrasql-server --test drop_restart_round_trip table_runtime_metadata_rejects_duplicate_generated_rows_on_rebuild -- --nocapture`.
 - Dropped tables are removed from durable `pg_row_security.meta`, preventing
   stale row-level-security policies from surviving restart after `DROP TABLE`.
   Evidence: `cargo test -p ultrasql-server --test rls_round_trip`.
