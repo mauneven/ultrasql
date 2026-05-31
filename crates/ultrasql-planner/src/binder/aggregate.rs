@@ -4,7 +4,7 @@
 use ultrasql_core::{DataType, Field, Schema};
 use ultrasql_parser::ast::{Expr, NullsOrder, OrderItem, SelectItem, SortDirection};
 
-use super::expr_bind::{coerce_literal_to_match, is_supported_builtin};
+use super::expr_bind::{bind_collated_expr, coerce_literal_to_match, is_supported_builtin};
 use super::expr_type::binary_result_type;
 use super::{
     AggregateFunc, Catalog, LogicalAggregateExpr, LogicalPlan, PlanError, ScalarExpr, ScopeEntry,
@@ -47,7 +47,8 @@ pub(super) fn expr_has_aggregate(expr: &Expr) -> bool {
         }
         Expr::Unary { expr: inner, .. }
         | Expr::Paren { expr: inner, .. }
-        | Expr::IsNull { expr: inner, .. } => expr_has_aggregate(inner),
+        | Expr::IsNull { expr: inner, .. }
+        | Expr::Collate { expr: inner, .. } => expr_has_aggregate(inner),
         Expr::Binary { left, right, .. } => expr_has_aggregate(left) || expr_has_aggregate(right),
         _ => false,
     }
@@ -421,6 +422,9 @@ fn collect_aggregates(
         Expr::Paren { expr: inner, .. } | Expr::Unary { expr: inner, .. } => {
             collect_aggregates(inner, alias, input_schema, out, catalog, cte_catalog, scope)
         }
+        Expr::Collate { expr: inner, .. } => {
+            collect_aggregates(inner, alias, input_schema, out, catalog, cte_catalog, scope)
+        }
         Expr::Binary { left, right, .. } => {
             collect_aggregates(left, None, input_schema, out, catalog, cte_catalog, scope)?;
             collect_aggregates(right, None, input_schema, out, catalog, cte_catalog, scope)
@@ -659,6 +663,15 @@ fn bind_expr_or_agg_ref(
         }
         Expr::Paren { expr: inner, .. } => {
             bind_expr_or_agg_ref(inner, alias_name, agg_schema, catalog, cte_catalog, scope)
+        }
+        Expr::Collate {
+            expr: inner,
+            collation,
+            ..
+        } => {
+            let bound =
+                bind_expr_or_agg_ref(inner, alias_name, agg_schema, catalog, cte_catalog, scope)?;
+            bind_collated_expr(collation, bound)
         }
         _ => bind_expr_with_ctes(expr, agg_schema, catalog, cte_catalog, scope),
     }

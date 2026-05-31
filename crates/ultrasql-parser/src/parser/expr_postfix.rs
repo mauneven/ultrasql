@@ -7,11 +7,59 @@
 //! the Pratt loop continues operating on.
 
 use super::{ParseError, Parser};
-use crate::ast::Expr;
+use crate::ast::{Expr, Identifier, ObjectName};
 use crate::span::Span;
 use crate::token::TokenKind;
 
 impl<'src> Parser<'src> {
+    /// Parse `COLLATE collation_name` after `expr`.
+    ///
+    /// `COLLATE` is a high-precedence postfix decorator. The parser records
+    /// the name; the binder decides which collations runtime supports.
+    pub(super) fn parse_collate_postfix(&mut self, expr: Expr) -> Result<Expr, ParseError> {
+        let start = expr.span().start;
+        self.advance()?; // COLLATE
+        let collation = self.parse_collation_name()?;
+        let span = Span::new(start, collation.span.end);
+        Ok(Expr::Collate {
+            expr: Box::new(expr),
+            collation,
+            span,
+        })
+    }
+
+    fn parse_collation_name(&mut self) -> Result<ObjectName, ParseError> {
+        let first = self.parse_collation_identifier()?;
+        let mut parts = vec![first.clone()];
+        let start = first.span.start;
+        let mut end = first.span.end;
+        while self.peek()?.kind == TokenKind::Dot {
+            if self.lookahead_at(1)?.kind == TokenKind::Star {
+                break;
+            }
+            self.advance()?; // dot
+            let ident = self.parse_collation_identifier()?;
+            end = ident.span.end;
+            parts.push(ident);
+        }
+        Ok(ObjectName {
+            parts,
+            span: Span::new(start, end),
+        })
+    }
+
+    fn parse_collation_identifier(&mut self) -> Result<Identifier, ParseError> {
+        if self.peek()?.kind == TokenKind::KwDefault {
+            let tok = self.advance()?;
+            return Ok(Identifier {
+                value: "default".to_owned(),
+                quoted: false,
+                span: tok.span,
+            });
+        }
+        self.parse_identifier()
+    }
+
     /// Parse `BETWEEN [SYMMETRIC] low AND high` after `expr` and the (optional
     /// `NOT` and the) `BETWEEN` keyword have been consumed by the caller.
     ///

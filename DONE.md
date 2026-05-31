@@ -695,6 +695,14 @@ as a concise evidence ledger; roadmap stays for open gates only.
   catalog rows instead of an empty relation, unblocking ORM and GUI
   introspection probes that join collation metadata. Evidence:
   `cargo test -p ultrasql-server --test catalog_views_round_trip active_record_column_definitions_probe_uses_catalog_helpers`.
+- `COLLATE` now parses and binds in expression and `ORDER BY` positions for
+  built-in `default`, `C`, `POSIX`, and `pg_catalog`-qualified names. The
+  runtime validates unknown collations and non-text inputs instead of silently
+  ignoring them, while preserving the current bytewise ordering semantics.
+  Evidence:
+  `cargo test -p ultrasql-parser parser::tests::postfix::collate --lib -- --nocapture`
+  and
+  `cargo test -p ultrasql-server --test order_by_round_trip order_by_builtin_collate_uses_bytewise_order -- --nocapture`.
 - `BIT(n)` / `BIT VARYING(n)` storage, row codec, operators, wire OIDs, COPY,
   and end-to-end tests exist.
 - `INET`, `CIDR`, `MACADDR`, and `MACADDR8` storage, operators, wire OIDs,

@@ -105,6 +105,15 @@ fn rewrite_expr(expr: &Expr, out: &mut Vec<WindowExtraction>) -> Expr {
             expr: Box::new(rewrite_expr(expr, out)),
             span: *span,
         },
+        Expr::Collate {
+            expr,
+            collation,
+            span,
+        } => Expr::Collate {
+            expr: Box::new(rewrite_expr(expr, out)),
+            collation: collation.clone(),
+            span: *span,
+        },
         // Other shapes do not contain window calls in practice; leave
         // them untouched. The binder will fail with a useful error if a
         // window call appears in a context this rewriter does not

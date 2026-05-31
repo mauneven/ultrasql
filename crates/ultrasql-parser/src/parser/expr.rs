@@ -54,6 +54,11 @@ impl<'src> Parser<'src> {
                 left = self.parse_subscript_or_slice(left)?;
             }
 
+            // `expr COLLATE collation`
+            while self.peek()?.kind == TokenKind::KwCollate {
+                left = self.parse_collate_postfix(left)?;
+            }
+
             // `expr AT TIME ZONE zone`
             if self.peek()?.kind == TokenKind::KwAt
                 && self.lookahead_two_is(TokenKind::KwTime, TokenKind::KwZone)

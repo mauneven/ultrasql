@@ -230,3 +230,59 @@ async fn order_by_over_group_by_aggregate() {
 
     shutdown(client, server_handle).await;
 }
+
+/// Built-in collations parse and bind in expression and ORDER BY slots. The
+/// current runtime supports bytewise C/POSIX/default behavior; locale/ICU
+/// tailoring stays an explicit roadmap item.
+#[tokio::test]
+async fn order_by_builtin_collate_uses_bytewise_order() {
+    let (client, _conn_handle, server_handle) = start_server_and_connect().await;
+
+    client
+        .batch_execute("CREATE TABLE collate_items (name TEXT NOT NULL)")
+        .await
+        .expect("create table");
+    for value in ["b", "A", "a", "B"] {
+        client
+            .batch_execute(&format!("INSERT INTO collate_items VALUES ('{value}')"))
+            .await
+            .expect("insert");
+    }
+
+    let rows = client
+        .simple_query("SELECT name COLLATE \"C\" FROM collate_items ORDER BY name COLLATE \"C\"")
+        .await
+        .expect("query succeeds");
+    let names: Vec<String> = rows
+        .iter()
+        .filter_map(|m| match m {
+            tokio_postgres::SimpleQueryMessage::Row(row) => row.get(0).map(str::to_owned),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(names, vec!["A", "B", "a", "b"]);
+
+    client
+        .simple_query("SELECT name COLLATE pg_catalog.\"POSIX\" FROM collate_items LIMIT 1")
+        .await
+        .expect("schema-qualified POSIX collation binds");
+    client
+        .simple_query("SELECT name COLLATE default FROM collate_items LIMIT 1")
+        .await
+        .expect("default collation binds");
+
+    let err = client
+        .simple_query("SELECT name COLLATE missing_locale FROM collate_items LIMIT 1")
+        .await
+        .expect_err("unknown collation rejected");
+    let message = err
+        .as_db_error()
+        .map(tokio_postgres::error::DbError::message)
+        .unwrap_or_default();
+    assert!(
+        message.contains("unsupported collation"),
+        "unexpected error: {err}"
+    );
+
+    shutdown(client, server_handle).await;
+}

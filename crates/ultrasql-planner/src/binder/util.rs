@@ -69,6 +69,7 @@ pub(super) fn derive_output_name(ast: &Expr, bound: &ScalarExpr) -> String {
             .parts
             .last()
             .map_or_else(String::new, |p| p.value.clone()),
+        Expr::Collate { expr, .. } => derive_output_name(expr, bound),
         _ => bound.to_string(),
     }
 }

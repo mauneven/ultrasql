@@ -16,7 +16,7 @@ use ultrasql_core::{
     Value, coerce_bpchar_text, composite_text_matches_arity, parse_decimal_text, parse_money_text,
     parse_time_text, parse_timetz_text,
 };
-use ultrasql_parser::ast::{BinaryOp, Expr, Literal, UnaryOp};
+use ultrasql_parser::ast::{BinaryOp, Expr, Literal, ObjectName, UnaryOp};
 
 use super::expr_type::{binary_result_type, comparable, display_unary};
 use super::{
@@ -50,6 +50,14 @@ pub(super) fn bind_expr_with_ctes(
             data_type: DataType::Null,
         }),
         Expr::Paren { expr, .. } => bind_expr_with_ctes(expr, input, catalog, cte_catalog, scope),
+        Expr::Collate {
+            expr: inner,
+            collation,
+            ..
+        } => {
+            let bound = bind_expr_with_ctes(inner, input, catalog, cte_catalog, scope)?;
+            bind_collated_expr(collation, bound)
+        }
         Expr::ArrayLiteral { elements, .. } => {
             bind_array_literal(elements, input, catalog, cte_catalog, scope)
         }
@@ -555,6 +563,44 @@ fn bind_extremum_expr(
         args: bound_args,
         data_type: return_type,
     })
+}
+
+pub(super) fn bind_collated_expr(
+    collation: &ObjectName,
+    bound: ScalarExpr,
+) -> Result<ScalarExpr, PlanError> {
+    validate_supported_collation(collation)?;
+    let data_type = bound.data_type();
+    if !data_type.is_textlike() {
+        return Err(PlanError::TypeMismatch(format!(
+            "COLLATE applies to text types, got {data_type}"
+        )));
+    }
+    Ok(bound)
+}
+
+fn validate_supported_collation(collation: &ObjectName) -> Result<(), PlanError> {
+    let parts: Vec<String> = collation
+        .parts
+        .iter()
+        .map(|part| part.value.to_ascii_lowercase())
+        .collect();
+    let name = match parts.as_slice() {
+        [name] => name.as_str(),
+        [schema, name] if schema == "pg_catalog" => name.as_str(),
+        _ => {
+            return Err(PlanError::TypeMismatch(format!(
+                "unsupported collation {collation}"
+            )));
+        }
+    };
+    if matches!(name, "default" | "c" | "posix") {
+        Ok(())
+    } else {
+        Err(PlanError::TypeMismatch(format!(
+            "unsupported collation {collation}"
+        )))
+    }
 }
 
 fn common_scalar_return_type(func_name: &str, args: &[ScalarExpr]) -> Result<DataType, PlanError> {

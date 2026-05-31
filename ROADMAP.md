@@ -78,9 +78,9 @@ file focused on what still blocks production.
   GIN planner integration.
 - XML remaining surface: remaining XPath axes/functions and `XMLTABLE` beyond
   the supported secure subset.
-- Locale/collation remaining: ICU-backed collations, `CREATE COLLATION`, and
-  `COLLATE` in definitions and `ORDER BY` beyond the base
-  `pg_collation` catalog rows.
+- Locale/collation remaining: ICU-backed collations, `CREATE COLLATION`,
+  column/index definition collation persistence, and non-bytewise sort/search
+  behavior beyond the supported built-in `default`/`C`/`POSIX` subset.
 
 ### Catalog, Roles, Privileges
 

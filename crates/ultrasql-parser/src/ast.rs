@@ -2111,6 +2111,15 @@ pub enum Expr {
         /// Source span.
         span: Span,
     },
+    /// `expr COLLATE collation` — attach a collation to text comparison.
+    Collate {
+        /// Expression being collated.
+        expr: Box<Self>,
+        /// Collation name, optionally schema-qualified.
+        collation: ObjectName,
+        /// Source span.
+        span: Span,
+    },
     /// `(a, b) OVERLAPS (c, d)` — period overlap test.
     Overlaps {
         /// Start of the left period.
@@ -2167,6 +2176,7 @@ impl Expr {
             | Self::ArraySubscript { span, .. }
             | Self::ArraySlice { span, .. }
             | Self::AtTimeZone { span, .. }
+            | Self::Collate { span, .. }
             | Self::Overlaps { span, .. }
             | Self::Row { span, .. } => *span,
         }

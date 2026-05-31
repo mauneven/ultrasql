@@ -61,6 +61,32 @@ fn between_and_does_not_consume_outer_and() {
     ));
 }
 
+// ── COLLATE ─────────────────────────────────────────────────────────────
+
+#[test]
+fn collate_postfix_parses_expression() {
+    let expr = parse_expr("name COLLATE \"C\"");
+    let Expr::Collate {
+        expr, collation, ..
+    } = expr
+    else {
+        panic!("expected COLLATE expression")
+    };
+    assert!(matches!(*expr, Expr::Column { .. }));
+    assert_eq!(collation.to_string(), "C");
+}
+
+#[test]
+fn collate_postfix_allows_schema_qualified_name() {
+    let expr = parse_expr("name COLLATE pg_catalog.\"POSIX\"");
+    let Expr::Collate { collation, .. } = expr else {
+        panic!("expected COLLATE expression")
+    };
+    assert_eq!(collation.parts.len(), 2);
+    assert_eq!(collation.parts[0].value, "pg_catalog");
+    assert_eq!(collation.parts[1].value, "POSIX");
+}
+
 // ── IS DISTINCT FROM ────────────────────────────────────────────────────
 
 #[test]
