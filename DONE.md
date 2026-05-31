@@ -2251,3 +2251,9 @@ as a concise evidence ledger; roadmap stays for open gates only.
   and release-helper hardening tests are branch-protection relevant instead of
   advisory-only. Evidence:
   `cargo test -p ultrasql-bench --test release_hardening ci_split_matches_release_policy -- --nocapture`.
+- Local security dependency gates refreshed: `cargo audit --deny yanked` exits
+  clean with the existing allowed `paste` unmaintained warning through
+  `parquet`, and `cargo deny check advisories bans licenses sources` exits
+  clean with duplicate-version warnings only. Evidence:
+  `cargo audit --deny yanked`,
+  `cargo deny check advisories bans licenses sources`.
