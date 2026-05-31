@@ -2192,3 +2192,6 @@ as a concise evidence ledger; roadmap stays for open gates only.
 - Heap bulk-load inserted-row accounting now rejects overflow instead of
   saturating the reported inserted row count. Evidence:
   `cargo test -p ultrasql-storage heap::tests::heap_u64_count_add_rejects_overflow --lib -- --nocapture`.
+- Checkpointer shutdown accounting now returns an error on flushed-page count
+  overflow instead of saturating background flush evidence. Evidence:
+  `cargo test -p ultrasql-storage checkpointer::tests::checkpointer_flush_count_rejects_overflow --lib -- --nocapture`.

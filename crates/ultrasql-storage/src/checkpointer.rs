@@ -37,6 +37,7 @@
 //! consistent with the global latch order defined in ARCHITECTURE.md §14; the
 //! checkpointer introduces no new lock-ordering hazards.
 
+use std::io;
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
@@ -82,7 +83,7 @@ struct Shared {
 #[derive(Debug)]
 pub struct Checkpointer {
     shared: Arc<Shared>,
-    handle: Option<JoinHandle<u64>>,
+    handle: Option<JoinHandle<io::Result<u64>>>,
 }
 
 impl Checkpointer {
@@ -134,7 +135,7 @@ impl Checkpointer {
     /// # Errors
     ///
     /// Returns `Err` if the background thread panicked.
-    pub fn shutdown(mut self) -> Result<u64, std::io::Error> {
+    pub fn shutdown(mut self) -> Result<u64, io::Error> {
         {
             let mut stopping = self.shared.stopping.lock();
             *stopping = true;
@@ -144,7 +145,7 @@ impl Checkpointer {
         if let Some(handle) = self.handle.take() {
             handle
                 .join()
-                .map_err(|_| std::io::Error::other("checkpointer background thread panicked"))
+                .map_err(|_| io::Error::other("checkpointer background thread panicked"))?
         } else {
             Ok(0)
         }
@@ -160,7 +161,7 @@ impl Checkpointer {
         mut writer: F,
         config: CheckpointerConfig,
         shared: &Arc<Shared>,
-    ) -> u64
+    ) -> io::Result<u64>
     where
         L: PageLoader + 'static,
         F: FnMut(ultrasql_core::PageId, &Page) -> ultrasql_core::Result<()>,
@@ -186,8 +187,7 @@ impl Checkpointer {
             // Flush dirty pages.
             match pool.try_flush_dirty(&mut writer) {
                 Ok(n) => {
-                    let n_u64 = u64::try_from(n).unwrap_or(u64::MAX);
-                    total_flushed = total_flushed.saturating_add(n_u64);
+                    total_flushed = checked_checkpoint_flush_count_add(total_flushed, n)?;
                     if n > 0 {
                         debug!(pages = n, "checkpointer: flushed dirty pages");
                     }
@@ -204,8 +204,16 @@ impl Checkpointer {
             }
         }
 
-        total_flushed
+        Ok(total_flushed)
     }
+}
+
+fn checked_checkpoint_flush_count_add(current: u64, delta: usize) -> io::Result<u64> {
+    let delta = u64::try_from(delta)
+        .map_err(|_| io::Error::other("checkpointer flushed page count overflow"))?;
+    current
+        .checked_add(delta)
+        .ok_or_else(|| io::Error::other("checkpointer flushed page count overflow"))
 }
 
 impl Drop for Checkpointer {
@@ -217,8 +225,12 @@ impl Drop for Checkpointer {
                 *stopping = true;
             }
             self.shared.wake.notify_all();
-            if handle.join().is_err() {
-                warn!("checkpointer background thread panicked during Drop");
+            match handle.join() {
+                Ok(Ok(_)) => {}
+                Ok(Err(e)) => {
+                    warn!(error = %e, "checkpointer background thread returned error during Drop")
+                }
+                Err(_) => warn!("checkpointer background thread panicked during Drop"),
             }
         }
     }
@@ -245,6 +257,15 @@ mod tests {
 
     fn pid(block: u32) -> PageId {
         PageId::new(RelationId::new(1), BlockNumber::new(block))
+    }
+
+    #[test]
+    fn checkpointer_flush_count_rejects_overflow() {
+        let err = checked_checkpoint_flush_count_add(u64::MAX, 1).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("checkpointer flushed page count overflow")
+        );
     }
 
     /// Spawn with a no-op writer, wait briefly, then shut down. Must not panic.
