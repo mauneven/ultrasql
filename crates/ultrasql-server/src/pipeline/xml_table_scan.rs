@@ -32,6 +32,7 @@ enum XmlTableColumnKind {
     Value {
         data_type: DataType,
         path: Option<String>,
+        default: Option<String>,
     },
 }
 
@@ -118,6 +119,10 @@ fn parse_xml_table_column(value: &JsonValue) -> Result<XmlTableColumn, ServerErr
         .get("path")
         .and_then(JsonValue::as_str)
         .map(ToOwned::to_owned);
+    let default = value
+        .get("default")
+        .and_then(JsonValue::as_str)
+        .map(ToOwned::to_owned);
     let kind = match kind {
         "ordinality" => XmlTableColumnKind::Ordinality,
         "value" => {
@@ -130,6 +135,7 @@ fn parse_xml_table_column(value: &JsonValue) -> Result<XmlTableColumn, ServerErr
             XmlTableColumnKind::Value {
                 data_type: xml_table_data_type(type_name)?,
                 path,
+                default,
             }
         }
         other => {
@@ -229,15 +235,22 @@ fn xml_table_row(
                 })?;
                 row.push(Value::Int64(ord));
             }
-            XmlTableColumnKind::Value { data_type, path } => {
+            XmlTableColumnKind::Value {
+                data_type,
+                path,
+                default,
+            } => {
                 let path = path.as_deref().map_or_else(
                     || default_xml_column_path(&column.name, data_type),
                     ToOwned::to_owned,
                 );
                 let selected = select_xml_column(row_fragment, &path)?;
-                let value = selected
-                    .first()
-                    .map_or(Ok(Value::Null), |value| xml_value_to_sql(value, data_type))?;
+                let value = match selected.first() {
+                    Some(value) => xml_value_to_sql(value, data_type)?,
+                    None => default
+                        .as_deref()
+                        .map_or(Ok(Value::Null), |value| xml_value_to_sql(value, data_type))?,
+                };
                 row.push(value);
             }
         }

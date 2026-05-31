@@ -822,12 +822,14 @@ as a concise evidence ledger; roadmap stays for open gates only.
   references, and pre-root junk are rejected.
 - `XMLTABLE` now has a first secure table-function subset: constant XML input,
   element row XPath, scalar column `PATH`, temporal/numeric/money scalar
-  projections, and `FOR ORDINALITY`, lowered through the same local XML
-  validator and XPath engine as `xpath`. Evidence:
+  projections, string-literal `DEFAULT` values for missing scalar paths, and
+  `FOR ORDINALITY`, lowered through the same local XML validator and XPath
+  engine as `xpath`. Evidence:
   `cargo test -p ultrasql-parser select_xmltable_in_from_parses_columns_clause --lib -- --nocapture`;
   `cargo test -p ultrasql-planner bind_from_covers_table_ref_families_and_join_scope_shapes --lib -- --nocapture`;
   `cargo test -p ultrasql-server --test function_scan_round_trip xmltable_projects_declared_columns_from_xml_literal -- --nocapture`;
-  `cargo test -p ultrasql-server --test function_scan_round_trip xmltable_projects_temporal_numeric_and_money_columns -- --nocapture`.
+  `cargo test -p ultrasql-server --test function_scan_round_trip xmltable_projects_temporal_numeric_and_money_columns -- --nocapture`;
+  `cargo test -p ultrasql-server --test function_scan_round_trip xmltable_uses_defaults_for_missing_scalar_paths -- --nocapture`.
 - XML syntax now covers `XMLPARSE(DOCUMENT|CONTENT ...)` and
   `XMLSERIALIZE(DOCUMENT|CONTENT ... AS TEXT)`, with malformed `DOCUMENT`
   inputs rejected through the wire path. Evidence:

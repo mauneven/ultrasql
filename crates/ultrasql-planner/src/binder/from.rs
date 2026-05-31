@@ -468,7 +468,11 @@ fn bind_xml_table_ref(
                     "kind": "ordinality",
                 }));
             }
-            XmlTableColumnKind::Value { data_type, path } => {
+            XmlTableColumnKind::Value {
+                data_type,
+                path,
+                default,
+            } => {
                 let data_type_resolved = resolve_type_name(data_type)?;
                 if matches!(data_type_resolved, DataType::Array(_)) {
                     return Err(PlanError::NotSupported(
@@ -484,6 +488,7 @@ fn bind_xml_table_ref(
                     "kind": "value",
                     "type": json_table_type_name(data_type),
                     "path": path,
+                    "default": default,
                 }));
             }
         }

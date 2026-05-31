@@ -1735,6 +1735,8 @@ pub enum XmlTableColumnKind {
         data_type: TypeName,
         /// Optional XPath expression. Defaults to the column name.
         path: Option<String>,
+        /// Optional scalar literal used when the path returns no value.
+        default: Option<String>,
     },
 }
 

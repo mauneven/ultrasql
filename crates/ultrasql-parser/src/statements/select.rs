@@ -920,11 +920,20 @@ impl Parser<'_> {
         } else {
             None
         };
+        let default = if self.match_kw(TokenKind::KwDefault) {
+            Some(self.parse_table_function_string_literal("XMLTABLE column default")?)
+        } else {
+            None
+        };
         let end = self.peek()?.span.start;
         Ok(XmlTableColumn {
             span: Span::new(name.span.start, end),
             name,
-            kind: XmlTableColumnKind::Value { data_type, path },
+            kind: XmlTableColumnKind::Value {
+                data_type,
+                path,
+                default,
+            },
         })
     }
 
@@ -1353,7 +1362,7 @@ mod tests {
 
     use crate::ast::{
         Distinct, Expr, JoinCondition, JoinOp, SelectItem, SetOp, SetQuantifier, Statement,
-        TableRef,
+        TableRef, XmlTableColumnKind,
     };
     use crate::parser::Parser;
 
@@ -1598,7 +1607,8 @@ mod tests {
              COLUMNS (\
                  ord FOR ORDINALITY, \
                  id bigint PATH '@id', \
-                 name text PATH 'name/text()'\
+                 name text PATH 'name/text()', \
+                 score int PATH 'score/text()' DEFAULT '0'\
              )) xt",
         );
         let Statement::Select(s) = stmt else { panic!() };
@@ -1613,7 +1623,11 @@ mod tests {
         };
         assert_eq!(row_path, "/root/item");
         assert_eq!(alias.as_ref().expect("alias").value, "xt");
-        assert_eq!(columns.len(), 3);
+        assert_eq!(columns.len(), 4);
+        let XmlTableColumnKind::Value { default, .. } = &columns[3].kind else {
+            panic!("expected XMLTABLE value column");
+        };
+        assert_eq!(default.as_deref(), Some("0"));
     }
 
     // -------- GROUP BY / HAVING ------------------------------------------- //

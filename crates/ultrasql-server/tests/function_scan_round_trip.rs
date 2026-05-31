@@ -843,6 +843,33 @@ async fn xmltable_projects_temporal_numeric_and_money_columns() {
 }
 
 #[tokio::test]
+async fn xmltable_uses_defaults_for_missing_scalar_paths() {
+    let (client, _conn, server_handle) = start_server_and_connect().await;
+
+    let rows = client
+        .query(
+            "SELECT name, score \
+             FROM XMLTABLE(\
+                 '/root/item' PASSING XML '<root><item><name>Ada</name></item></root>' \
+                 COLUMNS (\
+                     name text PATH 'name/text()', \
+                     score int PATH 'score/text()' DEFAULT '0'\
+                 )\
+             ) xt",
+            &[],
+        )
+        .await
+        .expect("XMLTABLE default projection");
+    let values = rows
+        .iter()
+        .map(|row| (row.get::<_, String>(0), row.get::<_, i32>(1)))
+        .collect::<Vec<_>>();
+    assert_eq!(values, vec![("Ada".to_owned(), 0)]);
+
+    shutdown(client, server_handle).await;
+}
+
+#[tokio::test]
 async fn read_csv_single_file_exposes_header_columns_and_rows() {
     let dir = tempfile::tempdir().expect("tempdir");
     let csv_path = dir.path().join("people.csv");
