@@ -776,6 +776,9 @@ as a concise evidence ledger; roadmap stays for open gates only.
 - Domain runtime metadata reload rejects duplicate domain OIDs or schema/name
   keys before applying restart constraints. Evidence:
   `cargo test -p ultrasql-server --test domain_type_round_trip domain_metadata_rejects_duplicate_domain_rows_on_rebuild -- --nocapture`.
+- Domain runtime metadata reload rejects duplicate `CHECK` constraint names for
+  the same domain before applying restart constraints. Evidence:
+  `cargo test -p ultrasql-server --test domain_type_round_trip domain_metadata_rejects_duplicate_check_rows_on_rebuild -- --nocapture`.
 - `OID`, `REGCLASS`, `REGTYPE`, and `PG_LSN` parser/binder/runtime/storage/wire
   support exists.
 - Basic XML storage exists with validated text storage, OID 142 wire rendering,

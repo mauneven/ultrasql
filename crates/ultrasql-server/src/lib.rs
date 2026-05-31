@@ -4567,6 +4567,7 @@ impl Server {
             std::collections::HashMap::new();
         let mut seen_domain_oids = std::collections::HashSet::new();
         let mut seen_domain_names = std::collections::HashSet::new();
+        let mut seen_check_keys = std::collections::HashSet::new();
         for (line_no, line) in text.lines().enumerate() {
             if line.is_empty() || line.starts_with('#') {
                 continue;
@@ -4622,8 +4623,15 @@ impl Server {
                             line_no + 1
                         ))
                     })?);
+                    let name = metadata_unescape(parts[2])?;
+                    if !seen_check_keys.insert((oid, name.to_ascii_lowercase())) {
+                        return Err(ServerError::Ddl(format!(
+                            "duplicate domain-runtime check metadata on line {}",
+                            line_no + 1
+                        )));
+                    }
                     checks.entry(oid).or_default().push(RuntimeCheckConstraint {
-                        name: metadata_unescape(parts[2])?,
+                        name,
                         expr: decode_scalar_expr_field(&metadata_unescape(parts[3])?)?,
                     });
                 }
