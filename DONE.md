@@ -2119,3 +2119,7 @@ as a concise evidence ledger; roadmap stays for open gates only.
 - In-memory WAL test sink now rejects LSN allocator overflow before recording
   a duplicate saturated LSN. Evidence:
   `cargo test -p ultrasql-storage wal_sink::test_support::tests::append_rejects_lsn_overflow_without_recording_duplicate --lib --features testing -- --nocapture`.
+- Production WAL append buffer now checks byte-range LSN advancement before
+  buffering records, returning a typed overflow error instead of panicking or
+  wrapping near `u64::MAX`. Evidence:
+  `cargo test -p ultrasql-wal buffer::tests::append_rejects_lsn_overflow_without_buffering_bytes --lib -- --nocapture`.

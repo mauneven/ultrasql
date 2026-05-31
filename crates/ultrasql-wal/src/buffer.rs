@@ -42,6 +42,14 @@ pub enum WalBufferError {
         /// Configured capacity.
         capacity: usize,
     },
+    /// The append would advance the WAL byte-position beyond `u64::MAX`.
+    #[error("wal lsn overflow: current {current}, append {bytes} bytes")]
+    LsnOverflow {
+        /// Current next LSN.
+        current: u64,
+        /// Bytes in the record being appended.
+        bytes: u64,
+    },
 }
 
 /// In-memory WAL append buffer.
@@ -113,16 +121,36 @@ impl WalBuffer {
     /// observe a global ordering.
     pub fn append(&self, record: &WalRecord) -> Result<Lsn, WalBufferError> {
         let bytes = record.encode();
+        let byte_len = u64::try_from(bytes.len()).map_err(|_| WalBufferError::LsnOverflow {
+            current: u64::MAX,
+            bytes: u64::MAX,
+        })?;
         let lsn = {
             let mut inner = self.inner.lock();
-            if inner.bytes.len() + bytes.len() > self.capacity {
+            let used_after =
+                inner
+                    .bytes
+                    .len()
+                    .checked_add(bytes.len())
+                    .ok_or(WalBufferError::Full {
+                        used: inner.bytes.len(),
+                        capacity: self.capacity,
+                    })?;
+            if used_after > self.capacity {
                 return Err(WalBufferError::Full {
                     used: inner.bytes.len(),
                     capacity: self.capacity,
                 });
             }
             let lsn = inner.next_lsn;
-            inner.next_lsn += bytes.len() as u64;
+            inner.next_lsn =
+                inner
+                    .next_lsn
+                    .checked_add(byte_len)
+                    .ok_or(WalBufferError::LsnOverflow {
+                        current: inner.next_lsn,
+                        bytes: byte_len,
+                    })?;
             inner.bytes.extend_from_slice(&bytes);
             lsn
         };
@@ -141,7 +169,10 @@ impl WalBuffer {
         let bytes = std::mem::take(&mut inner.bytes);
         drop(inner);
 
-        let start_lsn = end_lsn - bytes.len() as u64;
+        let byte_len = u64::try_from(bytes.len()).expect("buffered WAL bytes fit in u64");
+        let start_lsn = end_lsn
+            .checked_sub(byte_len)
+            .expect("buffer LSN span covers buffered bytes");
         DrainedBatch {
             bytes,
             start_lsn: Lsn::new(start_lsn),
@@ -248,7 +279,8 @@ mod tests {
         }
         assert_eq!(payloads, vec![0, 1, 2, 3, 4]);
         assert_eq!(drained.start_lsn, Lsn::new(0));
-        assert_eq!(drained.end_lsn, Lsn::new(drained.bytes.len() as u64));
+        let drained_len = u64::try_from(drained.bytes.len()).expect("drained length fits u64");
+        assert_eq!(drained.end_lsn, Lsn::new(drained_len));
     }
 
     #[test]
@@ -259,6 +291,36 @@ mod tests {
             .append(&rec(RecordType::HeapInsert, b"abc", Lsn::ZERO))
             .unwrap_err();
         assert!(matches!(err, WalBufferError::Full { .. }));
+    }
+
+    #[test]
+    fn append_rejects_lsn_overflow_without_buffering_bytes() {
+        let record = rec(RecordType::HeapInsert, b"abc", Lsn::ZERO);
+        let record_len = u64::try_from(record.encode().len()).expect("record length fits u64");
+        let initial = Lsn::new(u64::MAX - record_len + 1);
+        let buf = WalBuffer::new(64 * 1024, initial);
+
+        let err = buf
+            .append(&record)
+            .expect_err("LSN overflow must return Err");
+        assert!(
+            matches!(
+                err,
+                WalBufferError::LsnOverflow { current, bytes }
+                    if current == initial.raw() && bytes == record_len
+            ),
+            "{err:?}"
+        );
+        assert_eq!(
+            buf.buffered_bytes(),
+            0,
+            "failed append must not buffer bytes"
+        );
+        assert_eq!(
+            buf.next_lsn(),
+            initial,
+            "failed append must not advance LSN"
+        );
     }
 
     #[test]
