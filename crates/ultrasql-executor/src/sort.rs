@@ -298,7 +298,7 @@ impl ExternalSortCursor {
     }
 
     fn pop_next(&mut self, keys: &[CompiledKey]) -> Result<Option<Vec<Value>>, ExecError> {
-        let Some(best_idx) = self.best_run_index(keys) else {
+        let Some(best_idx) = self.best_run_index(keys)? else {
             return Ok(None);
         };
         let head = self.runs[best_idx]
@@ -310,7 +310,7 @@ impl ExternalSortCursor {
         Ok(Some(head.row))
     }
 
-    fn best_run_index(&self, keys: &[CompiledKey]) -> Option<usize> {
+    fn best_run_index(&self, keys: &[CompiledKey]) -> Result<Option<usize>, ExecError> {
         let mut best: Option<usize> = None;
         for (idx, run) in self.runs.iter().enumerate() {
             let Some(head) = &run.head else {
@@ -323,11 +323,13 @@ impl ExternalSortCursor {
             let Some(best_head) = self.runs[best_idx].head.as_ref() else {
                 continue;
             };
-            if compare_key_vecs(&head.key_values, &best_head.key_values, keys) == Ordering::Less {
+            if try_compare_key_vecs(&head.key_values, &best_head.key_values, keys)?
+                == Ordering::Less
+            {
                 best = Some(idx);
             }
         }
-        best
+        Ok(best)
     }
 
     fn spill_profile(&self) -> OperatorSpillProfile {
@@ -390,6 +392,7 @@ fn sorted_rows_from(
             Ok((row, key_vals))
         })
         .collect::<Result<_, ExecError>>()?;
+    validate_sort_key_matrix(&annotated, keys)?;
     annotated.sort_by(|(_, ak), (_, bk)| compare_key_vecs(ak, bk, keys));
     Ok(annotated.into_iter().map(|(row, _)| row).collect())
 }
@@ -411,16 +414,48 @@ fn eval_sort_keys(row: &[Value], keys: &[CompiledKey]) -> Result<Vec<Value>, Exe
 /// per `nulls_first`: `true` places NULL before any non-NULL value;
 /// `false` places NULL after all non-NULL values.
 fn compare_key_vecs(ak: &[Value], bk: &[Value], keys: &[CompiledKey]) -> Ordering {
+    try_compare_key_vecs(ak, bk, keys).unwrap_or(Ordering::Equal)
+}
+
+fn try_compare_key_vecs(
+    ak: &[Value],
+    bk: &[Value],
+    keys: &[CompiledKey],
+) -> Result<Ordering, ExecError> {
     for (i, key) in keys.iter().enumerate() {
         let av = &ak[i];
         let bv = &bk[i];
-        let ord = compare_values_nullable(av, bv, key.nulls_first);
+        let ord = try_compare_values_nullable(av, bv, key.nulls_first)?;
         let ord = if key.asc { ord } else { ord.reverse() };
         if ord != Ordering::Equal {
-            return ord;
+            return Ok(ord);
         }
     }
-    Ordering::Equal
+    Ok(Ordering::Equal)
+}
+
+fn validate_sort_key_matrix(
+    annotated: &[(Vec<Value>, Vec<Value>)],
+    keys: &[CompiledKey],
+) -> Result<(), ExecError> {
+    for key_idx in 0..keys.len() {
+        let mut first_non_null: Option<&Value> = None;
+        for (_, key_values) in annotated {
+            let Some(value) = key_values.get(key_idx) else {
+                return Err(ExecError::Internal("sort key arity mismatch"));
+            };
+            if value.is_null() {
+                continue;
+            }
+            if let Some(first) = first_non_null {
+                try_compare_values_nullable(first, value, keys[key_idx].nulls_first)?;
+            } else {
+                try_compare_values_nullable(value, value, keys[key_idx].nulls_first)?;
+                first_non_null = Some(value);
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Compare two [`Value`]s with explicit NULL ordering.
@@ -431,22 +466,48 @@ fn compare_key_vecs(ak: &[Value], bk: &[Value], keys: &[CompiledKey]) -> Orderin
 /// - Non-NULL vs non-NULL: natural total order of the value type.
 #[allow(unreachable_pub)]
 pub fn compare_values_nullable(a: &Value, b: &Value, nulls_first: bool) -> Ordering {
+    try_compare_values_nullable(a, b, nulls_first).unwrap_or(Ordering::Equal)
+}
+
+/// Compare two [`Value`]s with explicit NULL ordering and checked type support.
+///
+/// Returns [`ExecError::TypeMismatch`] when non-NULL values do not share an
+/// order-compatible scalar family. Operators that can report execution errors
+/// should use this path instead of treating unsupported values as equal.
+#[allow(unreachable_pub)]
+pub fn try_compare_values_nullable(
+    a: &Value,
+    b: &Value,
+    nulls_first: bool,
+) -> Result<Ordering, ExecError> {
     match (a, b) {
-        (Value::Null, Value::Null) => Ordering::Equal,
+        (Value::Null, Value::Null) => Ok(Ordering::Equal),
         (Value::Null, _) => {
             if nulls_first {
-                Ordering::Less
+                Ok(Ordering::Less)
             } else {
-                Ordering::Greater
+                Ok(Ordering::Greater)
             }
         }
         (_, Value::Null) => {
             if nulls_first {
-                Ordering::Greater
+                Ok(Ordering::Greater)
             } else {
-                Ordering::Less
+                Ok(Ordering::Less)
             }
         }
+        _ => compare_non_null_values(a, b).ok_or_else(|| {
+            ExecError::TypeMismatch(format!(
+                "values of type {:?} and {:?} are not orderable together",
+                a.data_type(),
+                b.data_type()
+            ))
+        }),
+    }
+}
+
+fn compare_non_null_values(a: &Value, b: &Value) -> Option<Ordering> {
+    Some(match (a, b) {
         (Value::Bool(l), Value::Bool(r)) => l.cmp(r),
         (Value::Int16(l), Value::Int16(r)) => l.cmp(r),
         (Value::Int32(l), Value::Int32(r)) => l.cmp(r),
@@ -457,6 +518,8 @@ pub fn compare_values_nullable(a: &Value, b: &Value, nulls_first: bool) -> Order
         (Value::PgLsn(l), Value::PgLsn(r)) => l.cmp(r),
         (Value::Float32(l), Value::Float32(r)) => l.partial_cmp(r).unwrap_or(Ordering::Equal),
         (Value::Float64(l), Value::Float64(r)) => l.partial_cmp(r).unwrap_or(Ordering::Equal),
+        (Value::Money(l), Value::Money(r)) => l.cmp(r),
+        (Value::Uuid(l), Value::Uuid(r)) => l.cmp(r),
         (Value::Text(l), Value::Text(r)) => l.cmp(r),
         (Value::Json(l), Value::Json(r))
         | (Value::Jsonb(l), Value::Jsonb(r))
@@ -466,6 +529,19 @@ pub fn compare_values_nullable(a: &Value, b: &Value, nulls_first: bool) -> Order
         (Value::Char(l), Value::Char(r)) => bpchar_semantic_text(l).cmp(bpchar_semantic_text(r)),
         (Value::Char(l), Value::Text(r)) => bpchar_semantic_text(l).cmp(r),
         (Value::Text(l), Value::Char(r)) => l.as_str().cmp(bpchar_semantic_text(r)),
+        (Value::Bytea(l), Value::Bytea(r)) => l.cmp(r),
+        (
+            Value::BitVec {
+                dims: left_dims,
+                bytes: left_bytes,
+            },
+            Value::BitVec {
+                dims: right_dims,
+                bytes: right_bytes,
+            },
+        ) => left_dims
+            .cmp(right_dims)
+            .then_with(|| left_bytes.cmp(right_bytes)),
         (Value::BitString(l), Value::BitString(r)) => l.to_bit_text().cmp(&r.to_bit_text()),
         (Value::Network(l), Value::Network(r)) => (*l)
             .cmp_network(*r)
@@ -494,10 +570,25 @@ pub fn compare_values_nullable(a: &Value, b: &Value, nulls_first: bool) -> Order
                 scale: r_scale,
             },
         ) => compare_decimals(*l, *l_scale, *r, *r_scale),
-        // Mixed types or unsupported types: treat as equal to avoid panics.
-        // The planner/binder is responsible for preventing mixed-type keys.
-        _ => Ordering::Equal,
-    }
+        (
+            Value::Interval {
+                months: lm,
+                days: ld,
+                microseconds: lus,
+            },
+            Value::Interval {
+                months: rm,
+                days: rd,
+                microseconds: rus,
+            },
+        ) => interval_total_micros(*lm, *ld, *lus).cmp(&interval_total_micros(*rm, *rd, *rus)),
+        _ => return None,
+    })
+}
+
+fn interval_total_micros(months: i32, days: i32, microseconds: i64) -> i128 {
+    const MICROS_PER_DAY: i128 = 86_400_000_000;
+    (i128::from(months) * 30 + i128::from(days)) * MICROS_PER_DAY + i128::from(microseconds)
 }
 
 fn compare_decimals(l: i64, l_scale: i32, r: i64, r_scale: i32) -> Ordering {
@@ -581,7 +672,7 @@ mod tests {
     use ultrasql_vec::Batch;
     use ultrasql_vec::column::{Column, NumericColumn};
 
-    use super::{Sort, compare_decimals, compare_values_nullable};
+    use super::{Sort, compare_decimals, compare_values_nullable, try_compare_values_nullable};
     use crate::filter_op::batch_to_rows;
     use crate::mem_table_scan::MemTableScan;
     use crate::seq_scan::build_batch;
@@ -691,9 +782,61 @@ mod tests {
     }
 
     #[test]
+    fn sort_rejects_unsupported_order_value() {
+        let schema = schema_i32_i64();
+        let input = vec![make_batch(&[(1, 10), (2, 20)])];
+        let scan = MemTableScan::new(schema.clone(), input);
+        let keys = vec![SortKey {
+            expr: ScalarExpr::Literal {
+                value: Value::Array {
+                    element_type: DataType::Int32,
+                    elements: vec![Value::Int32(1)],
+                },
+                data_type: DataType::Array(Box::new(DataType::Int32)),
+            },
+            asc: true,
+            nulls_first: false,
+        }];
+        let mut sort = Sort::new(Box::new(scan), keys, schema);
+        let err = sort
+            .next_batch()
+            .expect_err("unsupported sort key must surface");
+        assert!(
+            err.to_string().contains("not orderable"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
     fn decimal_compare_does_not_treat_scale_overflow_as_equal() {
         assert_eq!(compare_decimals(1, 0, 2, 100), Ordering::Greater);
         assert_eq!(compare_decimals(-1, 0, -2, 100), Ordering::Less);
+    }
+
+    #[test]
+    fn bytea_values_compare_lexicographically() {
+        assert_eq!(
+            compare_values_nullable(&Value::Bytea(vec![0x02]), &Value::Bytea(vec![0x01]), false),
+            Ordering::Greater
+        );
+    }
+
+    #[test]
+    fn checked_compare_rejects_unsupported_order_values() {
+        let left = Value::Array {
+            element_type: DataType::Int32,
+            elements: vec![Value::Int32(1)],
+        };
+        let right = Value::Array {
+            element_type: DataType::Int32,
+            elements: vec![Value::Int32(2)],
+        };
+        let err = try_compare_values_nullable(&left, &right, false)
+            .expect_err("arrays are not orderable");
+        assert!(
+            err.to_string().contains("not orderable"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]

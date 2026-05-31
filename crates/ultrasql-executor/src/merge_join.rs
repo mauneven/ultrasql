@@ -36,7 +36,7 @@ use ultrasql_vec::Batch;
 use crate::eval::Eval;
 use crate::filter_op::batch_to_rows;
 use crate::seq_scan::build_batch;
-use crate::sort::compare_values_nullable;
+use crate::sort::try_compare_values_nullable;
 use crate::{ExecError, Operator};
 
 const BATCH_TARGET_ROWS: usize = 4096;
@@ -177,7 +177,7 @@ impl MergeJoin {
                 continue;
             }
 
-            match compare_values_nullable(&lk, &rk, false) {
+            match try_compare_values_nullable(&lk, &rk, false)? {
                 Ordering::Less => {
                     li += 1;
                 }
@@ -189,7 +189,7 @@ impl MergeJoin {
                     let ri_start = ri;
                     while ri < right_rows.len() {
                         let rk2 = eval_join_key(&self.right_key_eval, &right_rows[ri])?;
-                        if compare_values_nullable(&lk, &rk2, false) != Ordering::Equal {
+                        if try_compare_values_nullable(&lk, &rk2, false)? != Ordering::Equal {
                             break;
                         }
                         ri += 1;
@@ -198,7 +198,7 @@ impl MergeJoin {
                     let li_start = li;
                     while li < left_rows.len() {
                         let lk2 = eval_join_key(&self.left_key_eval, &left_rows[li])?;
-                        if compare_values_nullable(&rk, &lk2, false) != Ordering::Equal {
+                        if try_compare_values_nullable(&rk, &lk2, false)? != Ordering::Equal {
                             break;
                         }
                         li += 1;

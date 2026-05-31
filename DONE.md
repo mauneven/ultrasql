@@ -234,6 +234,15 @@ as a concise evidence ledger; roadmap stays for open gates only.
   evaluation failures instead of silently treating them as NULL. Evidence:
   `cargo test -p ultrasql-executor sort` and
   `cargo test -p ultrasql-executor top_k`.
+- Full sort, external-sort merge, bounded top-k, and merge join now use checked
+  scalar ordering for runtime values instead of silently treating unsupported or
+  mixed order families as equal. Common scalar types that were missing from the
+  comparator, including `bytea`, `uuid`, `money`, `bitvec`, and `interval`, now
+  have deterministic ordering. Evidence:
+  `cargo test -p ultrasql-executor sort::tests:: --lib -- --nocapture`,
+  `cargo test -p ultrasql-executor top_k --lib -- --nocapture`,
+  `cargo test -p ultrasql-executor merge_join --lib -- --nocapture`, and
+  `cargo clippy -p ultrasql-executor --all-targets --all-features -- -D warnings`.
 - `HashAggregate` and `SortAggregate` now propagate group-key,
   aggregate-argument, and ordered-set percentile expression failures instead of
   silently treating them as NULL. Evidence:

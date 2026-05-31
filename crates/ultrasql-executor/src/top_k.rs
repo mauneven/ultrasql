@@ -21,7 +21,7 @@ use ultrasql_vec::kernels::vector::{VectorMetric, exact_top_k_f32};
 use crate::eval::Eval;
 use crate::filter_op::batch_to_rows;
 use crate::seq_scan::build_batch;
-use crate::sort::{Sort, compare_values_nullable};
+use crate::sort::{Sort, try_compare_values_nullable};
 use crate::work_mem::WorkMemBudget;
 use crate::{ExecError, Operator, OperatorSpillProfile};
 
@@ -369,10 +369,10 @@ fn drain_top_k_batch(
     exact_vector_key: Option<&ExactVectorTopKKey>,
     cap: usize,
 ) -> Result<TopKDrainMode, ExecError> {
-    if let Some(exact) = exact_vector_key
-        && drain_exact_vector_top_k_batch(kept, &rows, keys, exact, cap)
-    {
-        return Ok(TopKDrainMode::ExactVector);
+    if let Some(exact) = exact_vector_key {
+        if drain_exact_vector_top_k_batch(kept, &rows, keys, exact, cap)? {
+            return Ok(TopKDrainMode::ExactVector);
+        }
     }
     let mode = if exact_vector_key.is_some() {
         TopKDrainMode::GenericFallback
@@ -398,7 +398,7 @@ fn drain_generic_top_k_batch(
                     .map_err(|err| ExecError::TypeMismatch(err.to_string()))
             })
             .collect::<Result<_, _>>()?;
-        keep_if_top_k(kept, row, key_vals, keys, cap);
+        keep_if_top_k(kept, row, key_vals, keys, cap)?;
     }
     Ok(())
 }
@@ -409,20 +409,20 @@ fn drain_exact_vector_top_k_batch(
     keys: &[CompiledKey],
     exact: &ExactVectorTopKKey,
     cap: usize,
-) -> bool {
+) -> Result<bool, ExecError> {
     let mut vectors: Vec<&[f32]> = Vec::with_capacity(rows.len());
     for row in rows {
         let Some(Value::Vector(vector) | Value::HalfVec(vector)) = row.get(exact.column_idx) else {
-            return false;
+            return Ok(false);
         };
         vectors.push(vector);
     }
     for hit in exact_top_k_f32(&vectors, &exact.probe, exact.metric, cap) {
         let row = rows[hit.row].clone();
         let key_vals = vec![Value::Float64(f64::from(hit.distance))];
-        keep_if_top_k(kept, row, key_vals, keys, cap);
+        keep_if_top_k(kept, row, key_vals, keys, cap)?;
     }
-    true
+    Ok(true)
 }
 
 fn keep_if_top_k(
@@ -431,41 +431,74 @@ fn keep_if_top_k(
     key_vals: Vec<Value>,
     keys: &[CompiledKey],
     cap: usize,
-) {
+) -> Result<(), ExecError> {
+    validate_key_values(kept, &key_vals, keys)?;
     if kept.len() < cap {
         kept.push((row, key_vals));
-        return;
+        return Ok(());
     }
 
-    let Some(worst_idx) = worst_index(kept, keys) else {
-        return;
+    let Some(worst_idx) = worst_index(kept, keys)? else {
+        return Ok(());
     };
-    if compare_key_vecs(&key_vals, &kept[worst_idx].1, keys) == Ordering::Less {
+    if compare_key_vecs_checked(&key_vals, &kept[worst_idx].1, keys)? == Ordering::Less {
         kept[worst_idx] = (row, key_vals);
     }
+    Ok(())
 }
 
-fn worst_index(kept: &[(Vec<Value>, Vec<Value>)], keys: &[CompiledKey]) -> Option<usize> {
+fn worst_index(
+    kept: &[(Vec<Value>, Vec<Value>)],
+    keys: &[CompiledKey],
+) -> Result<Option<usize>, ExecError> {
     let mut worst = 0usize;
     for idx in 1..kept.len() {
-        if compare_key_vecs(&kept[idx].1, &kept[worst].1, keys) == Ordering::Greater {
+        if compare_key_vecs_checked(&kept[idx].1, &kept[worst].1, keys)? == Ordering::Greater {
             worst = idx;
         }
     }
-    Some(worst)
+    Ok(Some(worst))
 }
 
 fn compare_key_vecs(ak: &[Value], bk: &[Value], keys: &[CompiledKey]) -> Ordering {
+    compare_key_vecs_checked(ak, bk, keys).unwrap_or(Ordering::Equal)
+}
+
+fn compare_key_vecs_checked(
+    ak: &[Value],
+    bk: &[Value],
+    keys: &[CompiledKey],
+) -> Result<Ordering, ExecError> {
     for (i, key) in keys.iter().enumerate() {
         let av = &ak[i];
         let bv = &bk[i];
-        let ord = compare_values_nullable(av, bv, key.nulls_first);
+        let ord = try_compare_values_nullable(av, bv, key.nulls_first)?;
         let ord = if key.asc { ord } else { ord.reverse() };
         if ord != Ordering::Equal {
-            return ord;
+            return Ok(ord);
         }
     }
-    Ordering::Equal
+    Ok(Ordering::Equal)
+}
+
+fn validate_key_values(
+    kept: &[(Vec<Value>, Vec<Value>)],
+    key_vals: &[Value],
+    keys: &[CompiledKey],
+) -> Result<(), ExecError> {
+    for (idx, value) in key_vals.iter().enumerate() {
+        if !value.is_null() {
+            try_compare_values_nullable(value, value, keys[idx].nulls_first)?;
+        }
+        if let Some(first) = kept
+            .iter()
+            .filter_map(|(_, existing)| existing.get(idx))
+            .find(|existing| !existing.is_null())
+        {
+            try_compare_values_nullable(first, value, keys[idx].nulls_first)?;
+        }
+    }
+    Ok(())
 }
 
 fn match_exact_vector_top_k_key(keys: &[SortKey]) -> Option<ExactVectorTopKKey> {
@@ -657,6 +690,36 @@ mod tests {
             .expect_err("top-k key error must surface");
         assert!(
             err.to_string().contains("division by zero"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn generic_top_k_rejects_unsupported_order_value() {
+        let schema = Schema::new([Field::required("id", DataType::Int32)]).expect("schema ok");
+        let child = CountingScan {
+            schema: schema.clone(),
+            batches: vec![i32_batch(&[1, 2, 3])],
+            next: 0,
+            pulls: Arc::new(AtomicUsize::new(0)),
+        };
+        let key = SortKey {
+            expr: ScalarExpr::Literal {
+                value: Value::Array {
+                    element_type: DataType::Int32,
+                    elements: vec![Value::Int32(1)],
+                },
+                data_type: DataType::Array(Box::new(DataType::Int32)),
+            },
+            asc: true,
+            nulls_first: false,
+        };
+        let mut top_k = TopK::new(Box::new(child), vec![key], schema, 2);
+        let err = top_k
+            .next_batch()
+            .expect_err("unsupported top-k key must surface");
+        assert!(
+            err.to_string().contains("not orderable"),
             "unexpected error: {err}"
         );
     }
