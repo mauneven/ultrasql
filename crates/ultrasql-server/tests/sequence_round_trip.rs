@@ -207,6 +207,109 @@ async fn non_owner_cannot_alter_or_drop_sequence() {
 }
 
 #[tokio::test]
+async fn sequence_functions_enforce_usage_and_update_privileges() {
+    let running = start_sample_server("sequence_function_acl").await;
+
+    running
+        .client
+        .batch_execute(
+            "CREATE ROLE tester SUPERUSER LOGIN; \
+             CREATE ROLE seq_fn_owner LOGIN; \
+             CREATE ROLE seq_fn_reader LOGIN; \
+             CREATE ROLE seq_fn_blocked LOGIN",
+        )
+        .await
+        .expect("create sequence function ACL roles");
+
+    let (owner, owner_conn) = connect_as(
+        running.bound,
+        "seq_fn_owner",
+        "sequence_function_owner_create",
+    )
+    .await;
+    owner
+        .batch_execute("CREATE SEQUENCE seq_fn_acl START WITH 10")
+        .await
+        .expect("owner creates sequence");
+    drop(owner);
+    owner_conn.await.expect("owner create connection joins");
+
+    let (blocked, blocked_conn) =
+        connect_as(running.bound, "seq_fn_blocked", "sequence_function_blocked").await;
+    let err = blocked
+        .simple_query("SELECT nextval('seq_fn_acl')")
+        .await
+        .expect_err("missing sequence USAGE rejects nextval");
+    assert_eq!(err.code().expect("SQLSTATE").code(), "42501");
+    drop(blocked);
+    blocked_conn.await.expect("blocked connection joins");
+
+    let (owner, owner_conn) = connect_as(
+        running.bound,
+        "seq_fn_owner",
+        "sequence_function_owner_grant",
+    )
+    .await;
+    owner
+        .batch_execute("GRANT USAGE ON SEQUENCE seq_fn_acl TO seq_fn_reader")
+        .await
+        .expect("owner grants USAGE");
+    drop(owner);
+    owner_conn.await.expect("owner grant connection joins");
+
+    let (reader, reader_conn) =
+        connect_as(running.bound, "seq_fn_reader", "sequence_function_reader").await;
+    assert_eq!(
+        simple_i64(&reader, "SELECT nextval('seq_fn_acl')").await,
+        10
+    );
+    assert_eq!(
+        simple_i64(&reader, "SELECT currval('seq_fn_acl')").await,
+        10
+    );
+    let err = reader
+        .simple_query("SELECT setval('seq_fn_acl', 50)")
+        .await
+        .expect_err("USAGE alone rejects setval");
+    assert_eq!(err.code().expect("SQLSTATE").code(), "42501");
+
+    let (owner, owner_conn) = connect_as(
+        running.bound,
+        "seq_fn_owner",
+        "sequence_function_owner_update",
+    )
+    .await;
+    owner
+        .batch_execute("GRANT UPDATE ON SEQUENCE seq_fn_acl TO seq_fn_reader")
+        .await
+        .expect("owner grants UPDATE");
+    drop(owner);
+    owner_conn
+        .await
+        .expect("owner update grant connection joins");
+
+    assert_eq!(
+        simple_i64(&reader, "SELECT setval('seq_fn_acl', 50)").await,
+        50
+    );
+    drop(reader);
+    reader_conn.await.expect("reader connection joins");
+
+    running
+        .client
+        .batch_execute(
+            "DROP SEQUENCE seq_fn_acl; \
+             DROP ROLE seq_fn_owner; \
+             DROP ROLE seq_fn_reader; \
+             DROP ROLE seq_fn_blocked",
+        )
+        .await
+        .expect("cleanup sequence function ACL test");
+
+    graceful_shutdown(running).await;
+}
+
+#[tokio::test]
 async fn alter_sequence_changes_increment() {
     let running = start_sample_server("sequence_test").await;
     let client = &running.client;

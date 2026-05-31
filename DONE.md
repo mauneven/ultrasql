@@ -984,6 +984,11 @@ as a concise evidence ledger; roadmap stays for open gates only.
   requiring superuser, while non-owners remain blocked. Evidence:
   `cargo test -p ultrasql-server --test privilege_catalog_round_trip
   sequence_owner_can_grant_and_revoke_sequence_privileges -- --nocapture`.
+- Sequence SQL functions now enforce ACLs: `nextval` requires `USAGE` or
+  `UPDATE`, `currval`/`lastval` require `USAGE` or `SELECT`, and `setval`
+  requires `UPDATE`, with owner/superuser bypass. Evidence:
+  `cargo test -p ultrasql-server --test sequence_round_trip
+  sequence_functions_enforce_usage_and_update_privileges -- --nocapture`.
 - `DROP ROLE` now rejects roles that still own live tables or still appear in
   object/default privilege grants, avoiding stale ownership and ACL references.
   Evidence: `cargo test -p ultrasql-server --test role_ddl_round_trip`.

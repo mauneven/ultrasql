@@ -15,6 +15,7 @@ use ultrasql_wal::payload::SequenceOpKind;
 
 use super::Session;
 use crate::TxnState;
+use crate::auth::{AuthCatalog, PrivilegeKind, PrivilegeObjectKind};
 use crate::error::ServerError;
 use crate::result_encoder::{self, SelectResult};
 
@@ -344,6 +345,10 @@ where
         expect_arity(args, 1)?;
         let seq_name = expect_sequence_name(&args[0])?;
         let seq = self.sequence_by_name(&seq_name)?;
+        self.ensure_sequence_function_privilege(
+            &seq_name,
+            &[PrivilegeKind::Usage, PrivilegeKind::Update],
+        )?;
         let value = seq
             .nextval_logged(
                 &seq_name,
@@ -360,6 +365,10 @@ where
         expect_arity(args, 1)?;
         let seq_name = expect_sequence_name(&args[0])?;
         self.sequence_by_name(&seq_name)?;
+        self.ensure_sequence_function_privilege(
+            &seq_name,
+            &[PrivilegeKind::Usage, PrivilegeKind::Select],
+        )?;
         self.sequence_state.currval(&seq_name).ok_or_else(|| {
             ServerError::ObjectNotInPrerequisiteState(
                 "currval of sequence called before nextval".to_owned(),
@@ -377,6 +386,10 @@ where
             ));
         };
         self.sequence_by_name(&seq_name)?;
+        self.ensure_sequence_function_privilege(
+            &seq_name,
+            &[PrivilegeKind::Usage, PrivilegeKind::Select],
+        )?;
         Ok(value)
     }
 
@@ -392,6 +405,7 @@ where
             true
         };
         let seq = self.sequence_by_name(&seq_name)?;
+        self.ensure_sequence_function_privilege(&seq_name, &[PrivilegeKind::Update])?;
         seq.setval_logged(
             value,
             is_called,
@@ -415,6 +429,45 @@ where
             .ok_or_else(|| {
                 ServerError::Catalog(ultrasql_catalog::CatalogError::not_found(name.to_owned()))
             })
+    }
+
+    fn ensure_sequence_function_privilege(
+        &self,
+        sequence_name: &str,
+        privileges: &[PrivilegeKind],
+    ) -> Result<(), ServerError> {
+        let current_user = self.current_user.to_ascii_lowercase();
+        if self
+            .state
+            .role_catalog
+            .lookup_role(&current_user)
+            .is_some_and(|role| role.is_superuser)
+        {
+            return Ok(());
+        }
+        let sequence_key = sequence_name.to_ascii_lowercase();
+        let owns_sequence = self
+            .state
+            .sequence_owners
+            .get(&sequence_key)
+            .is_some_and(|owner| owner.eq_ignore_ascii_case(&current_user));
+        if owns_sequence {
+            return Ok(());
+        }
+        let roles = self.state.role_catalog.inherited_role_names(&current_user);
+        if privileges.iter().any(|privilege| {
+            self.state.privilege_catalog.has_privilege_for_roles(
+                &roles,
+                PrivilegeObjectKind::Sequence,
+                &sequence_key,
+                *privilege,
+            )
+        }) {
+            return Ok(());
+        }
+        Err(ServerError::InsufficientPrivilege(format!(
+            "permission denied for sequence {sequence_name}"
+        )))
     }
 
     fn sequence_xid(&self) -> Xid {
