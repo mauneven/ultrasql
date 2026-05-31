@@ -514,6 +514,26 @@ async fn jsonb_path_query_supports_iso_datetime_methods() {
         ]
     );
 
+    let millisecond_templated = client
+        .simple_query(
+            "SELECT value FROM jsonb_path_query(\
+             '{\"date\":\"2023-08-15\",\"ts\":\"2023-08-15T12:34:56.789\"}'::jsonb, \
+             '$.** ? (@.type() == \"string\").datetime(\"YYYY-MM-DD\\\"T\\\"HH24:MI:SS.FF3\")')",
+        )
+        .await
+        .expect("jsonb_path_query millisecond datetime template method");
+    let rows: Vec<String> = millisecond_templated
+        .into_iter()
+        .filter_map(|message| match message {
+            SimpleQueryMessage::Row(row) => row.get(0).map(str::to_owned),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        rows,
+        vec!["null".to_owned(), "\"2023-08-15T12:34:56.789\"".to_owned()]
+    );
+
     shutdown(running).await;
 }
 

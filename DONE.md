@@ -298,9 +298,9 @@ as a concise evidence ledger; roadmap stays for open gates only.
   `cargo test -p ultrasql-executor json_path::tests::path_supports_iso_datetime_methods --lib -- --nocapture`
   and
   `cargo test -p ultrasql-server --test jsonb_path_query_round_trip jsonb_path_query_supports_iso_datetime_methods -- --nocapture`.
-- SQL/JSON `datetime(template)` now covers exact six-digit fractional second
-  ISO timestamp forms `YYYY-MM-DD HH24:MI:SS.FF6` and
-  `YYYY-MM-DD"T"HH24:MI:SS.FF6`. Evidence:
+- SQL/JSON `datetime(template)` now covers exact fractional second ISO
+  timestamp forms `YYYY-MM-DD HH24:MI:SS.FF1` through `.FF6` and
+  `YYYY-MM-DD"T"HH24:MI:SS.FF1` through `.FF6`. Evidence:
   `cargo test -p ultrasql-executor json_path::tests::path_supports_iso_datetime_methods --lib -- --nocapture`
   and
   `cargo test -p ultrasql-server --test jsonb_path_query_round_trip jsonb_path_query_supports_iso_datetime_methods -- --nocapture`.

@@ -564,6 +564,12 @@ fn json_path_datetime(value: &JsonValue, template: Option<&str>) -> JsonValue {
 }
 
 fn json_path_datetime_template(text: &str, template: &str) -> JsonValue {
+    if let Some((separator, precision)) = iso_fractional_timestamp_template(template) {
+        return parse_iso_fractional_timestamp_template(text, separator, precision)
+            .map(format_json_timestamp)
+            .map_or(JsonValue::Null, JsonValue::String);
+    }
+
     match template {
         "HH24:MI" => json_path_parse_time_text(text)
             .map(|micros| format_time_micros(micros - (micros % 60_000_000)))
@@ -578,12 +584,6 @@ fn json_path_datetime_template(text: &str, template: &str) -> JsonValue {
             .map(format_json_timestamp)
             .map_or(JsonValue::Null, JsonValue::String),
         "YYYY-MM-DD\"T\"HH24:MI" => parse_iso_minute_timestamp_template(text, b'T')
-            .map(format_json_timestamp)
-            .map_or(JsonValue::Null, JsonValue::String),
-        "YYYY-MM-DD HH24:MI:SS.FF6" => parse_iso_ff6_timestamp_template(text, b' ')
-            .map(format_json_timestamp)
-            .map_or(JsonValue::Null, JsonValue::String),
-        "YYYY-MM-DD\"T\"HH24:MI:SS.FF6" => parse_iso_ff6_timestamp_template(text, b'T')
             .map(format_json_timestamp)
             .map_or(JsonValue::Null, JsonValue::String),
         "YYYY-MM-DD HH24:MI:SS" => parse_iso_second_timestamp_template(text, b' ')
@@ -629,10 +629,34 @@ fn parse_iso_minute_timestamp_template(text: &str, separator: u8) -> Option<i64>
     timestamp_micros(date, micros)
 }
 
-fn parse_iso_ff6_timestamp_template(text: &str, separator: u8) -> Option<i64> {
+fn iso_fractional_timestamp_template(template: &str) -> Option<(u8, usize)> {
+    let (separator, precision_text) = template
+        .strip_prefix("YYYY-MM-DD HH24:MI:SS.FF")
+        .map(|precision| (b' ', precision))
+        .or_else(|| {
+            template
+                .strip_prefix("YYYY-MM-DD\"T\"HH24:MI:SS.FF")
+                .map(|precision| (b'T', precision))
+        })?;
+    if precision_text.len() != 1 {
+        return None;
+    }
+    let precision = usize::from(precision_text.as_bytes()[0].checked_sub(b'0')?);
+    if (1..=6).contains(&precision) {
+        Some((separator, precision))
+    } else {
+        None
+    }
+}
+
+fn parse_iso_fractional_timestamp_template(
+    text: &str,
+    separator: u8,
+    precision: usize,
+) -> Option<i64> {
     let text = text.trim();
     let bytes = text.as_bytes();
-    if bytes.len() != 26
+    if bytes.len() != 20 + precision
         || bytes.get(4) != Some(&b'-')
         || bytes.get(7) != Some(&b'-')
         || bytes.get(10) != Some(&separator)
@@ -1717,6 +1741,8 @@ mod tests {
             "compact_minute_ts": "202308151234",
             "iso_minute": "2023-08-15 12:34",
             "iso_t_minute": "2023-08-15T12:34",
+            "iso_ff3": "2023-08-15 12:34:56.789",
+            "iso_t_ff1": "2023-08-15T12:34:56.7",
             "iso_ff6": "2023-08-15 12:34:56.789123",
             "iso_t_ff6": "2023-08-15T12:34:56.789123",
             "iso_t": "2023-08-15T12:34:56",
@@ -1796,6 +1822,19 @@ mod tests {
         assert_eq!(
             select(&document, &iso_t_minute),
             vec![serde_json::json!("2023-08-15T12:34:00")]
+        );
+
+        let iso_ff3 = parse_json_path("$.iso_ff3.datetime(\"YYYY-MM-DD HH24:MI:SS.FF3\")").unwrap();
+        assert_eq!(
+            select(&document, &iso_ff3),
+            vec![serde_json::json!("2023-08-15T12:34:56.789")]
+        );
+
+        let iso_t_ff1 =
+            parse_json_path(r#"$.iso_t_ff1.datetime("YYYY-MM-DD\"T\"HH24:MI:SS.FF1")"#).unwrap();
+        assert_eq!(
+            select(&document, &iso_t_ff1),
+            vec![serde_json::json!("2023-08-15T12:34:56.7")]
         );
 
         let iso_ff6 = parse_json_path("$.iso_ff6.datetime(\"YYYY-MM-DD HH24:MI:SS.FF6\")").unwrap();
