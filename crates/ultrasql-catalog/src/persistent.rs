@@ -472,6 +472,17 @@ fn attnum_for_index(idx: usize, object: &str) -> Result<i16, CatalogError> {
     })
 }
 
+fn track_next_oid(highest_oid: &mut u32, oid: Oid, source: &str) -> Result<(), CatalogError> {
+    let next = oid.raw().checked_add(1).ok_or_else(|| {
+        CatalogError::schema_conflict(format!(
+            "catalog OID space exhausted after {source} oid {}",
+            oid.raw()
+        ))
+    })?;
+    *highest_oid = (*highest_oid).max(next);
+    Ok(())
+}
+
 impl Default for PersistentCatalog {
     fn default() -> Self {
         Self::new()
@@ -747,7 +758,7 @@ impl PersistentCatalog {
                 let row = decode_type_row(&tuple.data).map_err(|e| {
                     CatalogError::schema_conflict(format!("decode pg_type row: {e}"))
                 })?;
-                highest_oid = highest_oid.max(row.oid.raw().saturating_add(1));
+                track_next_oid(&mut highest_oid, row.oid, "pg_type")?;
                 if row.oid.raw() >= crate::memory::FIRST_USER_OID {
                     type_rows_by_oid.insert(row.oid, row);
                 }
@@ -765,7 +776,7 @@ impl PersistentCatalog {
                 let row = decode_enum_row(&tuple.data).map_err(|e| {
                     CatalogError::schema_conflict(format!("decode pg_enum row: {e}"))
                 })?;
-                highest_oid = highest_oid.max(row.oid.raw().saturating_add(1));
+                track_next_oid(&mut highest_oid, row.oid, "pg_enum")?;
                 if row.enumtypid.raw() >= crate::memory::FIRST_USER_OID {
                     enum_rows_by_type
                         .entry(row.enumtypid)
@@ -925,7 +936,7 @@ impl PersistentCatalog {
             if class_row.oid.raw() < crate::memory::FIRST_USER_OID {
                 continue;
             }
-            highest_oid = highest_oid.max(class_row.oid.raw().saturating_add(1));
+            track_next_oid(&mut highest_oid, class_row.oid, "pg_class")?;
             latest_class_by_oid.insert(class_row.oid, class_row);
         }
 
@@ -1009,10 +1020,10 @@ impl PersistentCatalog {
             }
         }
         for oid in constraint_rows.keys() {
-            highest_oid = highest_oid.max(oid.raw().saturating_add(1));
+            track_next_oid(&mut highest_oid, *oid, "pg_constraint")?;
         }
         for oid in sequence_rows.keys() {
-            highest_oid = highest_oid.max(oid.raw().saturating_add(1));
+            track_next_oid(&mut highest_oid, *oid, "pg_sequence")?;
         }
 
         let mut loaded_indexes: u32 = 0;
@@ -3420,6 +3431,32 @@ mod tests {
         assert_eq!(restored.schema.fields()[1].name, "amount");
         assert_eq!(restored.schema.fields()[1].data_type, DataType::Int64);
         assert!(restored.schema.fields()[1].nullable);
+    }
+
+    #[test]
+    fn bootstrap_rejects_max_oid_relation_without_successor() {
+        use ultrasql_core::{CommandId, Xid};
+
+        let heap = blank_heap();
+        let cat = PersistentCatalog::new();
+        let entry = TableEntry::new(
+            Oid::new(u32::MAX),
+            "max_oid_table".to_owned(),
+            "public".to_owned(),
+            sample_schema(),
+        );
+        cat.create_table(entry.clone()).expect("create table");
+        cat.persist_table_rows(&entry, &heap, Xid::new(1), CommandId::new(0))
+            .expect("persist table rows");
+
+        let cat2 = PersistentCatalog::new();
+        let err = cat2
+            .bootstrap_from_heap(&heap)
+            .expect_err("max oid row should reject restart");
+
+        assert!(
+            matches!(err, CatalogError::SchemaConflict(message) if message.contains("catalog OID space exhausted"))
+        );
     }
 
     #[test]

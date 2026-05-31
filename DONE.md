@@ -162,6 +162,12 @@ as a concise evidence ledger; roadmap stays for open gates only.
   `cargo test -p ultrasql-catalog --lib`,
   `cargo clippy -p ultrasql-catalog --lib --all-features -- -D clippy::unwrap_used -D clippy::expect_used`,
   and `cargo clippy -p ultrasql-catalog --all-targets --all-features -- -D warnings`.
+- Persistent catalog bootstrap now rejects restored `u32::MAX` object OIDs with
+  `CatalogError::SchemaConflict` instead of saturating the next-OID allocator
+  and risking post-restart OID collision. Evidence:
+  `cargo test -p ultrasql-catalog persistent::tests --lib -- --nocapture`,
+  `cargo clippy -p ultrasql-catalog --lib --all-features -- -D clippy::unwrap_used -D clippy::expect_used`,
+  and `cargo clippy -p ultrasql-catalog --all-targets --all-features -- -D warnings`.
 - Backup/restore smoke runner covers `ultrasql --basebackup`,
   `ultrasql --pg-dump`, `ultrasql --pg-restore`, row counts, and indexed lookup.
 - Backup/restore dump-format certification now covers custom, directory, and
