@@ -2257,3 +2257,13 @@ as a concise evidence ledger; roadmap stays for open gates only.
   clean with duplicate-version warnings only. Evidence:
   `cargo audit --deny yanked`,
   `cargo deny check advisories bans licenses sources`.
+- Local Miri smoke passed with the sanitizer workflow flags
+  `MIRIFLAGS="-Zmiri-strict-provenance -Zmiri-disable-isolation"` after
+  installing the nightly Miri component. Evidence:
+  `cargo +nightly miri setup`,
+  `cargo +nightly miri test -p ultrasql-core endian::tests::u64_round_trip`,
+  `cargo +nightly miri test -p ultrasql-core value::tests::display_round_trip_for_simple_values`,
+  `cargo +nightly miri test -p ultrasql-storage page::tests::page_round_trips_via_from_bytes`,
+  `cargo +nightly miri test -p ultrasql-storage page::tests::insert_and_read_round_trip`,
+  `cargo +nightly miri test -p ultrasql-storage buffer_pool::tests::read_after_write_sees_update`,
+  `cargo +nightly miri test -p ultrasql-parser parser::tests::deeply_nested_parens_rejected_without_overflow`.
