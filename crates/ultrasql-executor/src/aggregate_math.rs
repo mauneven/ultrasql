@@ -3,7 +3,18 @@
 //! Hash and sort aggregates keep independent state machines, but dense
 //! vector arithmetic must stay identical across both paths.
 
+use ultrasql_core::Value;
+
 use crate::ExecError;
+
+pub(crate) fn widen_sum_seed(value: Value) -> Value {
+    match value {
+        Value::Int16(value) => Value::Int64(i64::from(value)),
+        Value::Int32(value) => Value::Int64(i64::from(value)),
+        Value::Float32(value) => Value::Float64(f64::from(value)),
+        other => other,
+    }
+}
 
 pub(crate) fn add_dense_vector_values(
     left: Vec<f32>,

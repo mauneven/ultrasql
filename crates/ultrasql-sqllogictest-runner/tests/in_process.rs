@@ -401,6 +401,54 @@ fn sql_regression_parser_type_baseline_is_imported_and_provenanced() {
 }
 
 #[test]
+fn sql_regression_join_setop_baseline_is_imported_and_provenanced() {
+    let subset = repo_root().join("tests/slt/sql_regression/regression_subset");
+    let manifest =
+        fs::read_to_string(subset.join("IMPORT_MANIFEST.txt")).expect("read PostgreSQL manifest");
+    let readme = fs::read_to_string(subset.join("README.md")).expect("read PostgreSQL README");
+    let shard = subset.join("join_setop_baseline.slt");
+    let text = fs::read_to_string(&shard).expect("read join/set-op baseline shard");
+
+    assert!(
+        manifest.contains("derived_from=src/test/regress/sql/select.sql"),
+        "manifest:\n{manifest}"
+    );
+    assert!(
+        manifest.contains("file=join_setop_baseline.slt"),
+        "manifest:\n{manifest}"
+    );
+    assert!(
+        readme.contains("join_setop_baseline.slt"),
+        "README:\n{readme}"
+    );
+    assert!(
+        text.contains("PostgreSQL regression-derived join and set-operation baseline"),
+        "{} must document reviewed scope",
+        shard.display()
+    );
+    for surface in [
+        "JOIN slt_pg_join_child",
+        "LEFT JOIN slt_pg_join_child",
+        "WHERE EXISTS",
+        "UNION",
+        "INTERSECT",
+        "EXCEPT",
+    ] {
+        assert!(
+            text.contains(surface),
+            "{} missing {surface}",
+            shard.display()
+        );
+    }
+    let case_count = count_slt_cases(&text);
+    assert!(
+        (8..=24).contains(&case_count),
+        "{} must stay as a small reviewed shard, got {case_count} cases",
+        shard.display()
+    );
+}
+
+#[test]
 fn sql_regression_index_constraint_operator_baseline_is_imported_and_provenanced() {
     let subset = repo_root().join("tests/slt/sql_regression/regression_subset");
     let manifest =

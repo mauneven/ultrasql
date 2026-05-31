@@ -9,6 +9,7 @@ License: PostgreSQL license, included at `LICENSE.upstream`.
 Imported files:
 
 - `select_basics.slt`
+- `join_setop_baseline.slt`
 - `parser_type_baseline.slt`
 - `index_constraint_operator_baseline.slt`
 - `type_specific_baseline.slt`
@@ -43,6 +44,8 @@ regression behavior. The shards use local deterministic fixtures and expected
 rows written in SQLLogicTest format; they do not vendor the full upstream
 regression suite. Unsupported catalog-wide sanity checks stay as roadmap debt
 outside this curated subset.
+The join/set-operation shard covers deterministic join, left join, correlated
+`EXISTS`, `UNION`, `INTERSECT`, and `EXCEPT` behavior.
 Broader type-specific numeric overflow, collation, timezone-abbreviation, and
 SQL/JSON breadth remain roadmap debt.
 The aggregate/window shard covers grouped aggregates, HAVING, and core window

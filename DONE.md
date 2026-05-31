@@ -1487,9 +1487,15 @@ as a concise evidence ledger; roadmap stays for open gates only.
   Evidence:
   `cargo run -p ultrasql-sqllogictest-runner -- --mode in-process tests/slt/sql_regression/regression_subset/catalog_sanity_baseline.slt`.
 - The full active public regression subset is now executed by a cargo test,
-  not only checked for provenance. Current coverage is 7 shards / 103
+  not only checked for provenance. Current coverage is 8 shards / 115
   SQLLogicTest cases with zero skips. Evidence:
   `cargo test -p ultrasql-sqllogictest-runner sql_regression_subset_runs_all_active_shards_in_process --test in_process -- --nocapture`.
+- Join/set-operation regression baseline covers deterministic inner join, left
+  join with aggregate over null-extended rows, correlated `EXISTS`, `UNION`,
+  `INTERSECT`, and `EXCEPT`. This also fixed hash and sort aggregate `SUM`
+  seed widening so single-row `SUM(int4)` emits the planned `Int64` result
+  type instead of leaking `Int32`. Evidence:
+  `cargo run -p ultrasql-sqllogictest-runner -- --mode in-process tests/slt/sql_regression/regression_subset/join_setop_baseline.slt`.
 - Transaction isolation baseline covers `acid.sql`, Hermitage G1a/PMP/G2, and
   manager-level Hermitage matrix.
 - Index regression baseline covers `CREATE INDEX`, `CREATE UNIQUE INDEX`,

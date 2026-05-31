@@ -31,7 +31,7 @@ use ultrasql_core::{DataType, Schema, Value};
 use ultrasql_planner::{AggregateFunc, LogicalAggregateExpr, ScalarExpr};
 use ultrasql_vec::Batch;
 
-use crate::aggregate_math::{add_dense_vector_values, divide_dense_vector_values};
+use crate::aggregate_math::{add_dense_vector_values, divide_dense_vector_values, widen_sum_seed};
 use crate::eval::Eval;
 use crate::filter_op::batch_to_rows;
 use crate::seq_scan::build_batch;
@@ -154,7 +154,7 @@ fn accumulate(
             if let Some(v) = arg {
                 if !v.is_null() {
                     *acc = Some(match acc.take() {
-                        None => v,
+                        None => widen_sum_seed(v),
                         Some(e) => add_values(e, v)?,
                     });
                 }
@@ -164,7 +164,7 @@ fn accumulate(
             if let Some(v) = arg {
                 if !v.is_null() {
                     *sum = Some(match sum.take() {
-                        None => v,
+                        None => widen_sum_seed(v),
                         Some(e) => add_values(e, v)?,
                     });
                     *cnt = cnt.saturating_add(1);
@@ -1107,6 +1107,28 @@ mod tests {
             err.to_string().contains("division by zero"),
             "unexpected error: {err}"
         );
+    }
+
+    #[test]
+    fn sort_agg_sum_single_int32_row_widens_to_int64() {
+        let schema = Schema::new([Field::required("v", DataType::Int32)]).expect("schema ok");
+        let scan = MemTableScan::new(
+            schema,
+            vec![Batch::new([Column::Int32(NumericColumn::from_data(vec![7]))]).expect("batch ok")],
+        );
+        let out_schema =
+            Schema::new([Field::required("total", DataType::Int64)]).expect("schema ok");
+        let sum_expr = agg(
+            AggregateFunc::Sum,
+            Some(col("v", 0, DataType::Int32)),
+            "total",
+            DataType::Int64,
+        );
+
+        let mut op = SortAggregate::new(Box::new(scan), vec![], vec![sum_expr], out_schema);
+        let rows = drain_all(&mut op);
+
+        assert_eq!(rows, vec![vec![Value::Int64(7)]]);
     }
 
     #[test]

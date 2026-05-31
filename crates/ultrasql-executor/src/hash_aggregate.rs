@@ -36,7 +36,7 @@ use ultrasql_planner::{AggregateFunc, LogicalAggregateExpr, ScalarExpr};
 use ultrasql_vec::column::{Column, NumericColumn};
 use ultrasql_vec::{Batch, count_i64, max_i64, min_i64, sum_i64};
 
-use crate::aggregate_math::{add_dense_vector_values, divide_dense_vector_values};
+use crate::aggregate_math::{add_dense_vector_values, divide_dense_vector_values, widen_sum_seed};
 use crate::eval::Eval;
 use crate::filter_op::batch_to_rows;
 use crate::row_codec::RowCodec;
@@ -1662,7 +1662,7 @@ fn accumulate_value(state: &mut AggState, arg_val: Option<Value>) -> Result<(), 
             if let Some(v) = arg_val {
                 if !v.is_null() {
                     *acc = Some(match acc.take() {
-                        None => v,
+                        None => widen_sum_seed(v),
                         Some(existing) => add_values(existing, v)?,
                     });
                 }
@@ -1672,7 +1672,7 @@ fn accumulate_value(state: &mut AggState, arg_val: Option<Value>) -> Result<(), 
             if let Some(v) = arg_val {
                 if !v.is_null() {
                     *sum = Some(match sum.take() {
-                        None => v,
+                        None => widen_sum_seed(v),
                         Some(existing) => add_values(existing, v)?,
                     });
                     *cnt = cnt.saturating_add(1);
@@ -3017,6 +3017,31 @@ mod tests {
             Value::Int64(3),
             "COUNT(v) counts all non-null values"
         );
+    }
+
+    #[test]
+    fn hash_agg_sum_single_int32_row_widens_to_int64() {
+        let schema = Schema::new([Field::required("v", DataType::Int32)]).expect("schema ok");
+        let scan = MemTableScan::new(
+            schema,
+            vec![Batch::new([Column::Int32(NumericColumn::from_data(vec![7]))]).expect("batch ok")],
+        );
+        let out_schema =
+            Schema::new([Field::required("total", DataType::Int64)]).expect("schema ok");
+        let sum_expr = LogicalAggregateExpr {
+            func: AggregateFunc::Sum,
+            arg: Some(col("v", 0, DataType::Int32)),
+            direct_arg: None,
+            order_by: None,
+            distinct: false,
+            output_name: "total".into(),
+            data_type: DataType::Int64,
+        };
+
+        let mut op = HashAggregate::new(Box::new(scan), vec![], vec![sum_expr], out_schema);
+        let rows = drain_all(&mut op);
+
+        assert_eq!(rows, vec![vec![Value::Int64(7)]]);
     }
 
     #[test]

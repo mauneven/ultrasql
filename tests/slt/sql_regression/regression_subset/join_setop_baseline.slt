@@ -1,0 +1,88 @@
+# PostgreSQL regression-derived join and set-operation baseline shard.
+# Source: PostgreSQL src/test/regress/sql/select.sql at commit
+# ddd12d1a5c4d980c5f31dc7d096012547b724e55.
+# License/provenance live beside this file in IMPORT_MANIFEST.txt and
+# LICENSE.upstream.
+
+statement ok
+CREATE TABLE slt_pg_join_parent (id INT NOT NULL, name TEXT)
+
+statement ok
+CREATE TABLE slt_pg_join_child (pid INT NOT NULL, amount INT NOT NULL)
+
+statement ok
+INSERT INTO slt_pg_join_parent VALUES (1, 'alpha'), (2, 'beta'), (3, 'gamma')
+
+statement ok
+INSERT INTO slt_pg_join_child VALUES (1, 10), (1, 15), (2, 20), (4, 99)
+
+query ITI nosort
+SELECT p.id, p.name, c.amount
+FROM slt_pg_join_parent p
+JOIN slt_pg_join_child c ON c.pid = p.id
+WHERE c.amount >= 15
+ORDER BY p.id, c.amount
+----
+1
+alpha
+15
+2
+beta
+20
+
+query III nosort
+SELECT p.id, COUNT(c.amount), SUM(c.amount)
+FROM slt_pg_join_parent p
+LEFT JOIN slt_pg_join_child c ON c.pid = p.id
+GROUP BY p.id
+ORDER BY p.id
+----
+1
+2
+25
+2
+1
+20
+3
+0
+NULL
+
+query T nosort
+SELECT name
+FROM slt_pg_join_parent p
+WHERE EXISTS (
+  SELECT 1 FROM slt_pg_join_child c
+  WHERE c.pid = p.id AND c.amount = 20
+)
+----
+beta
+
+query I rowsort
+SELECT id FROM slt_pg_join_parent WHERE id <= 2
+UNION
+SELECT pid FROM slt_pg_join_child WHERE pid >= 2
+----
+1
+2
+4
+
+query I rowsort
+SELECT id FROM slt_pg_join_parent
+INTERSECT
+SELECT pid FROM slt_pg_join_child
+----
+1
+2
+
+query I rowsort
+SELECT id FROM slt_pg_join_parent
+EXCEPT
+SELECT pid FROM slt_pg_join_child
+----
+3
+
+statement ok
+DROP TABLE slt_pg_join_child
+
+statement ok
+DROP TABLE slt_pg_join_parent

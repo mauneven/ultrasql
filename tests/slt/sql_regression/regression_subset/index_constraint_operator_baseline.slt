@@ -111,3 +111,5 @@ DROP TABLE slt_pg_ico_child
 
 statement ok
 DROP TABLE slt_pg_ico_parent
+
+# ultrasql:skip full PostgreSQL opr_sanity catalog/operator invariant
