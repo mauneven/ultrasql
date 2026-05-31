@@ -821,6 +821,8 @@ pub enum LogicalPlan {
     DropIndex {
         /// Lowercase index names to drop, in the user's order.
         indexes: Vec<String>,
+        /// Explicit namespace per index, if the statement qualified it.
+        index_namespaces: Vec<Option<String>>,
         /// Whether `IF EXISTS` was specified.
         if_exists: bool,
         /// Whether `CASCADE` was specified.
@@ -2571,6 +2573,7 @@ impl LogicalPlan {
             }
             Self::DropIndex {
                 indexes,
+                index_namespaces,
                 if_exists,
                 cascade,
                 ..
@@ -2578,12 +2581,20 @@ impl LogicalPlan {
                 out.push_str(&pad);
                 let inx = if *if_exists { " IF EXISTS" } else { "" };
                 let csc = if *cascade { " CASCADE" } else { "" };
+                let names = indexes
+                    .iter()
+                    .enumerate()
+                    .map(|(idx, name)| {
+                        index_namespaces
+                            .get(idx)
+                            .and_then(Option::as_ref)
+                            .map_or_else(|| name.clone(), |namespace| format!("{namespace}.{name}"))
+                    })
+                    .collect::<Vec<_>>()
+                    .join(", ");
                 let _ = fmt::write(
                     out,
-                    format_args!(
-                        "DropIndex{inx}: indexes=[{names}]{csc}\n",
-                        names = indexes.join(", ")
-                    ),
+                    format_args!("DropIndex{inx}: indexes=[{names}]{csc}\n",),
                 );
             }
             Self::DropTable {
@@ -3556,6 +3567,7 @@ mod tests {
             (
                 LogicalPlan::DropIndex {
                     indexes: vec!["users_expr_idx".to_owned()],
+                    index_namespaces: vec![None],
                     if_exists: true,
                     cascade: true,
                     schema: empty(),

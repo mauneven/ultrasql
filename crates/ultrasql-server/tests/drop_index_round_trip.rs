@@ -169,3 +169,43 @@ async fn drop_index_rejects_live_unique_constraint_indexes() {
 
     shutdown(running).await;
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn drop_index_respects_schema_qualifier() {
+    let data_dir = tempfile::TempDir::new().expect("temp data dir");
+    let running = start_persistent_server(data_dir.path(), "drop_index_schema_guard").await;
+
+    running
+        .client
+        .batch_execute(
+            "CREATE SCHEMA app; \
+             CREATE TABLE drop_index_schema_guard (id INT); \
+             CREATE INDEX drop_index_schema_guard_idx ON drop_index_schema_guard(id)",
+        )
+        .await
+        .expect("create public indexed table and separate schema");
+
+    running
+        .client
+        .batch_execute("DROP INDEX app.drop_index_schema_guard_idx")
+        .await
+        .expect_err("wrong-qualified DROP INDEX must not drop public index");
+
+    let rows = running
+        .client
+        .query(
+            "SELECT indexname FROM pg_catalog.pg_indexes \
+             WHERE schemaname = 'public' \
+             AND indexname = 'drop_index_schema_guard_idx'",
+            &[],
+        )
+        .await
+        .expect("pg_indexes after rejected qualified DROP INDEX");
+    assert_eq!(
+        rows.len(),
+        1,
+        "public index must survive wrong-qualified DROP INDEX"
+    );
+
+    shutdown(running).await;
+}

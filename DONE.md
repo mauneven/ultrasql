@@ -1391,6 +1391,11 @@ as a concise evidence ledger; roadmap stays for open gates only.
   targets instead of altering or dropping a same-name sequence in another
   schema. Evidence:
   `cargo test -p ultrasql-server --test sequence_round_trip -- --nocapture`.
+- Schema-qualified `DROP INDEX` now preserves explicit index namespaces through
+  the logical plan and validates them against the indexed table schema before
+  privilege/dependency work, preventing wrong-qualified drops from deleting a
+  same-name public index. Evidence:
+  `cargo test -p ultrasql-server --test drop_index_round_trip -- --nocapture`.
 - Table privilege DDL now validates table object existence and explicit schema
   qualifiers before the superuser administration bypass, preventing ghost
   grants such as `GRANT ... ON TABLE missing_schema.same_name`. Evidence:

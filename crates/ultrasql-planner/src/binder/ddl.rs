@@ -2237,16 +2237,19 @@ pub(super) fn bind_drop_index(
     catalog: &dyn Catalog,
 ) -> Result<LogicalPlan, PlanError> {
     let mut indexes = Vec::with_capacity(s.names.len());
+    let mut index_namespaces = Vec::with_capacity(s.names.len());
     for obj in &s.names {
         let name = object_name_simple(obj);
         if catalog.lookup_index(&name) {
             indexes.push(name);
+            index_namespaces.push(object_name_explicit_namespace(obj));
         } else if !s.if_exists {
             return Err(PlanError::IndexNotFound(name));
         }
     }
     Ok(LogicalPlan::DropIndex {
         indexes,
+        index_namespaces,
         if_exists: s.if_exists,
         cascade: s.cascade,
         schema: Schema::empty(),

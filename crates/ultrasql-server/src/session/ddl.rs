@@ -1864,7 +1864,10 @@ where
         plan: &LogicalPlan,
     ) -> Result<SelectResult, ServerError> {
         let LogicalPlan::DropIndex {
-            indexes, if_exists, ..
+            indexes,
+            index_namespaces,
+            if_exists,
+            ..
         } = plan
         else {
             return Err(ServerError::Unsupported(
@@ -1873,16 +1876,29 @@ where
         };
 
         let mut entries = Vec::with_capacity(indexes.len());
-        for name in indexes {
+        for (idx, name) in indexes.iter().enumerate() {
             if let Some(entry) = self.state.persistent_catalog.lookup_index(name) {
-                let table_name = self
+                let table = self
                     .state
                     .persistent_catalog
-                    .lookup_table_by_oid(entry.table_oid)
-                    .map_or_else(
-                        || format!("oid {}", entry.table_oid.raw()),
-                        |table| table.name,
-                    );
+                    .lookup_table_by_oid(entry.table_oid);
+                if let Some(namespace) = index_namespaces.get(idx).and_then(Option::as_ref) {
+                    if !table
+                        .as_ref()
+                        .is_some_and(|table| table.schema_name.eq_ignore_ascii_case(namespace))
+                    {
+                        if !*if_exists {
+                            return Err(
+                                ultrasql_catalog::CatalogError::not_found(name.clone()).into()
+                            );
+                        }
+                        continue;
+                    }
+                }
+                let table_name = table.map_or_else(
+                    || format!("oid {}", entry.table_oid.raw()),
+                    |table| table.name,
+                );
                 self.ensure_table_owner_or_superuser(entry.table_oid, &table_name)?;
                 if entry.is_unique && entry.name.ends_with("_pkey") {
                     return Err(ServerError::DependentObjectsStillExist(format!(

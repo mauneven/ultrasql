@@ -3558,6 +3558,22 @@ fn binds_drop_index_with_known_index() {
 }
 
 #[test]
+fn binds_drop_index_preserves_explicit_namespace() {
+    let cat = users_index_catalog();
+    let plan = parse_and_bind("DROP INDEX app.users_id_idx", &cat).expect("drop index binds");
+    let LogicalPlan::DropIndex {
+        indexes,
+        index_namespaces,
+        ..
+    } = plan
+    else {
+        panic!("expected DropIndex plan");
+    };
+    assert_eq!(indexes, vec!["users_id_idx".to_string()]);
+    assert_eq!(index_namespaces, vec![Some("app".to_string())]);
+}
+
+#[test]
 fn drop_index_if_exists_silently_omits_missing_indexes() {
     let cat = users_index_catalog();
     let plan = parse_and_bind("DROP INDEX IF EXISTS users_id_idx, nope", &cat)
