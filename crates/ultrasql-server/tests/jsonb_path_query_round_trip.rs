@@ -216,6 +216,44 @@ async fn jsonb_path_query_supports_basic_methods() {
 }
 
 #[tokio::test]
+async fn jsonb_path_query_supports_numeric_methods() {
+    let running = start_sample_server("jsonb_path_query_test").await;
+    let client = &running.client;
+
+    let messages = client
+        .simple_query(
+            "SELECT value FROM jsonb_path_query('{\"v\":-7.5}'::jsonb, '$.v.abs()') \
+             UNION ALL \
+             SELECT value FROM jsonb_path_query('{\"v\":2.7}'::jsonb, '$.v.floor()') \
+             UNION ALL \
+             SELECT value FROM jsonb_path_query('{\"v\":2.2}'::jsonb, '$.v.ceiling()') \
+             UNION ALL \
+             SELECT value FROM jsonb_path_query('{\"v\":\"3.5\"}'::jsonb, '$.v.double()')",
+        )
+        .await
+        .expect("jsonb_path_query numeric methods");
+    let rows: Vec<String> = messages
+        .into_iter()
+        .filter_map(|message| match message {
+            SimpleQueryMessage::Row(row) => row.get(0).map(str::to_owned),
+            _ => None,
+        })
+        .collect();
+
+    assert_eq!(
+        rows,
+        vec![
+            "7.5".to_owned(),
+            "2.0".to_owned(),
+            "3.0".to_owned(),
+            "3.5".to_owned(),
+        ]
+    );
+
+    shutdown(running).await;
+}
+
+#[tokio::test]
 async fn jsonb_path_query_supports_predicate_boolean_algebra() {
     let running = start_sample_server("jsonb_path_query_test").await;
     let client = &running.client;

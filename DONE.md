@@ -679,14 +679,15 @@ as a concise evidence ledger; roadmap stays for open gates only.
   whole-row `row_to_json`; SQL/JSON path prefixes `lax` and `strict` are
   accepted with the current supported selection semantics, and
   `jsonb_path_exists` plus `jsonb_path_query` resolve predicate literal
-  variables from a JSON/JSONB `vars` argument. Basic `.size()` and `.type()`
-  SQL/JSON path methods now work in the shared path engine, and filter
-  predicates support `&&`, `||`, `!`, and nested predicate parentheses.
-  Evidence:
+  variables from a JSON/JSONB `vars` argument. Basic `.size()`, `.type()`,
+  `.abs()`, `.floor()`, `.ceiling()`, and `.double()` SQL/JSON path methods
+  now work in the shared path engine, and filter predicates support `&&`, `||`,
+  `!`, and nested predicate parentheses. Evidence:
   `cargo test -p ultrasql-server --test jsonb_path_query_round_trip jsonb_path_query_accepts_strict_and_lax_prefixes -- --nocapture`;
   `cargo test -p ultrasql-server --test jsonb_path_query_round_trip jsonb_path_exists_supports_variable_literals -- --nocapture`;
   `cargo test -p ultrasql-server --test jsonb_path_query_round_trip jsonb_path_query_supports_variable_literals -- --nocapture`;
   `cargo test -p ultrasql-server --test jsonb_path_query_round_trip jsonb_path_query_supports_basic_methods -- --nocapture`;
+  `cargo test -p ultrasql-server --test jsonb_path_query_round_trip jsonb_path_query_supports_numeric_methods -- --nocapture`;
   `cargo test -p ultrasql-server --test jsonb_path_query_round_trip jsonb_path_query_supports_predicate_boolean_algebra -- --nocapture`.
 - Native arrays support multi-dimensional rectangular text/runtime round trips,
   GIN-facing operators, array subscripts/slices, `array_agg`, `array_length`,

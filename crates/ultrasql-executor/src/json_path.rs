@@ -20,6 +20,10 @@ enum JsonPathStep {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum JsonPathMethod {
+    Abs,
+    Ceiling,
+    Double,
+    Floor,
     Size,
     Type,
 }
@@ -252,6 +256,10 @@ fn compare_json_value(left: &JsonValue, op: JsonPathCompareOp, right: &JsonValue
 
 fn apply_json_path_method(method: JsonPathMethod, value: &JsonValue) -> JsonValue {
     match method {
+        JsonPathMethod::Abs => json_path_numeric_method(value, f64::abs),
+        JsonPathMethod::Ceiling => json_path_numeric_method(value, f64::ceil),
+        JsonPathMethod::Double => json_path_double(value),
+        JsonPathMethod::Floor => json_path_numeric_method(value, f64::floor),
         JsonPathMethod::Size => {
             let size = match value {
                 JsonValue::Array(values) => values.len(),
@@ -265,6 +273,29 @@ fn apply_json_path_method(method: JsonPathMethod, value: &JsonValue) -> JsonValu
         }
         JsonPathMethod::Type => JsonValue::String(json_path_type_name(value).to_owned()),
     }
+}
+
+fn json_path_numeric_method(value: &JsonValue, op: impl FnOnce(f64) -> f64) -> JsonValue {
+    json_path_number_from_f64(json_path_f64(value).map(op))
+}
+
+fn json_path_double(value: &JsonValue) -> JsonValue {
+    json_path_number_from_f64(json_path_f64(value))
+}
+
+fn json_path_f64(value: &JsonValue) -> Option<f64> {
+    let parsed = match value {
+        JsonValue::Number(number) => number.as_f64(),
+        JsonValue::String(text) => text.parse::<f64>().ok(),
+        JsonValue::Null | JsonValue::Bool(_) | JsonValue::Array(_) | JsonValue::Object(_) => None,
+    }?;
+    parsed.is_finite().then_some(parsed)
+}
+
+fn json_path_number_from_f64(value: Option<f64>) -> JsonValue {
+    value
+        .and_then(JsonNumber::from_f64)
+        .map_or(JsonValue::Null, JsonValue::Number)
 }
 
 fn json_path_type_name(value: &JsonValue) -> &'static str {
@@ -669,6 +700,10 @@ impl<'a> JsonPathParser<'a> {
 
 fn json_path_method(name: &str) -> Result<JsonPathMethod, JsonPathError> {
     match name {
+        "abs" => Ok(JsonPathMethod::Abs),
+        "ceiling" => Ok(JsonPathMethod::Ceiling),
+        "double" => Ok(JsonPathMethod::Double),
+        "floor" => Ok(JsonPathMethod::Floor),
         "size" => Ok(JsonPathMethod::Size),
         "type" => Ok(JsonPathMethod::Type),
         _ => Err(JsonPathError::new(format!(
@@ -746,6 +781,47 @@ mod tests {
         assert_eq!(
             select_json_path(&document, &scalar_size),
             vec![serde_json::json!(1)]
+        );
+    }
+
+    #[test]
+    fn path_supports_numeric_methods() {
+        let document = serde_json::json!({
+            "negative": -7.5,
+            "floor": 2.7,
+            "ceiling": 2.2,
+            "text": "3.5",
+            "bad": "nan"
+        });
+
+        let abs = parse_json_path("$.negative.abs()").unwrap();
+        assert_eq!(
+            select_json_path(&document, &abs),
+            vec![serde_json::json!(7.5)]
+        );
+
+        let floor = parse_json_path("$.floor.floor()").unwrap();
+        assert_eq!(
+            select_json_path(&document, &floor),
+            vec![serde_json::json!(2.0)]
+        );
+
+        let ceiling = parse_json_path("$.ceiling.ceiling()").unwrap();
+        assert_eq!(
+            select_json_path(&document, &ceiling),
+            vec![serde_json::json!(3.0)]
+        );
+
+        let double = parse_json_path("$.text.double()").unwrap();
+        assert_eq!(
+            select_json_path(&document, &double),
+            vec![serde_json::json!(3.5)]
+        );
+
+        let bad = parse_json_path("$.bad.double()").unwrap();
+        assert_eq!(
+            select_json_path(&document, &bad),
+            vec![serde_json::Value::Null]
         );
     }
 
