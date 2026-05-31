@@ -3895,10 +3895,7 @@ fn apply_binary(op: BinaryOp, lv: Value, rv: Value) -> Result<Value, EvalError> 
             | BinaryOp::JsonHasAnyKey
             | BinaryOp::JsonHasAllKeys
             | BinaryOp::TextSearchMatch => return Ok(Value::Null),
-            // AND/OR handled in eval_and/eval_or and never reach here.
-            BinaryOp::And | BinaryOp::Or => {
-                unreachable!("AND/OR handled in short-circuit paths")
-            }
+            BinaryOp::And | BinaryOp::Or => return logical_op_dispatch_error(op),
         }
     }
 
@@ -4024,11 +4021,14 @@ fn apply_binary(op: BinaryOp, lv: Value, rv: Value) -> Result<Value, EvalError> 
             .ok_or_else(|| EvalError::Type(format!("&& not defined for {lv:?} and {rv:?}"))),
         BinaryOp::TextSearchMatch => text_search_match(&lv, &rv).map(Value::Bool),
 
-        // AND / OR are handled above; unreachable here.
-        BinaryOp::And | BinaryOp::Or => {
-            unreachable!("AND/OR handled in short-circuit paths")
-        }
+        BinaryOp::And | BinaryOp::Or => logical_op_dispatch_error(op),
     }
+}
+
+fn logical_op_dispatch_error(op: BinaryOp) -> Result<Value, EvalError> {
+    Err(EvalError::Type(format!(
+        "{op:?} must be evaluated by the short-circuit path"
+    )))
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -5169,22 +5169,36 @@ fn decimal_arith(
     op: ArithOp,
 ) -> Result<Value, EvalError> {
     match op {
-        ArithOp::Add | ArithOp::Sub | ArithOp::Mod => {
+        ArithOp::Add => {
             let common_scale = left_scale.max(right_scale);
             let left = rescale_decimal_value(left_value, left_scale, common_scale)?;
             let right = rescale_decimal_value(right_value, right_scale, common_scale)?;
-            let result = match op {
-                ArithOp::Add => left.checked_add(right).ok_or(EvalError::Overflow)?,
-                ArithOp::Sub => left.checked_sub(right).ok_or(EvalError::Overflow)?,
-                ArithOp::Mod => {
-                    if right == 0 {
-                        return Err(EvalError::DivByZero);
-                    }
-                    left % right
-                }
-                _ => unreachable!(),
-            };
+            let result = left.checked_add(right).ok_or(EvalError::Overflow)?;
             let value = i64::try_from(result).map_err(|_| EvalError::Overflow)?;
+            Ok(Value::Decimal {
+                value,
+                scale: common_scale,
+            })
+        }
+        ArithOp::Sub => {
+            let common_scale = left_scale.max(right_scale);
+            let left = rescale_decimal_value(left_value, left_scale, common_scale)?;
+            let right = rescale_decimal_value(right_value, right_scale, common_scale)?;
+            let result = left.checked_sub(right).ok_or(EvalError::Overflow)?;
+            let value = i64::try_from(result).map_err(|_| EvalError::Overflow)?;
+            Ok(Value::Decimal {
+                value,
+                scale: common_scale,
+            })
+        }
+        ArithOp::Mod => {
+            let common_scale = left_scale.max(right_scale);
+            let left = rescale_decimal_value(left_value, left_scale, common_scale)?;
+            let right = rescale_decimal_value(right_value, right_scale, common_scale)?;
+            if right == 0 {
+                return Err(EvalError::DivByZero);
+            }
+            let value = i64::try_from(left % right).map_err(|_| EvalError::Overflow)?;
             Ok(Value::Decimal {
                 value,
                 scale: common_scale,
@@ -8266,6 +8280,18 @@ mod tests {
     fn kleene_true_and_true_is_true() {
         let ev = Eval::new(binop(BinaryOp::And, lit_bool(true), lit_bool(true)));
         assert_eq!(ev.eval(&[]).unwrap(), Value::Bool(true));
+    }
+
+    #[test]
+    fn apply_binary_rejects_logical_ops_without_panicking() {
+        for op in [BinaryOp::And, BinaryOp::Or] {
+            let err = super::apply_binary(op, Value::Bool(true), Value::Bool(false))
+                .expect_err("logical operators are evaluated by short-circuit path");
+            assert!(
+                err.to_string().contains("short-circuit"),
+                "unexpected error: {err}"
+            );
+        }
     }
 
     // -----------------------------------------------------------------------

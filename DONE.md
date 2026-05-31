@@ -944,6 +944,11 @@ as a concise evidence ledger; roadmap stays for open gates only.
   ever violated instead of relying on a production `unreachable!`. Evidence:
   `cargo test -p ultrasql-executor null_helpers_extrema_xml_and_unknown_function_paths --lib -- --nocapture`;
   `cargo clippy -p ultrasql-executor --lib --all-features -- -D warnings`.
+- Executor binary dispatch now returns a typed error if an internal caller sends
+  `AND`/`OR` to the non-short-circuit fallback, and decimal arithmetic no
+  longer carries a nested production `unreachable!` arm. Evidence:
+  `cargo test -p ultrasql-executor apply_binary_rejects_logical_ops_without_panicking --lib -- --nocapture`;
+  `cargo clippy -p ultrasql-executor --lib --all-features -- -D clippy::panic`.
 - Ordered-set aggregates `PERCENTILE_CONT` and `PERCENTILE_DISC` have plan shape
   and wire coverage.
 - Portable scalar helpers now cover `COALESCE`, `IFNULL` / `NVL`,
