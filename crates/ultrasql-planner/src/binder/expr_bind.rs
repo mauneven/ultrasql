@@ -745,6 +745,8 @@ fn bind_runtime_cast(
         DataType::Int16 if actual_type.is_integer() => "__ultrasql_cast_int2",
         DataType::Int32 if actual_type.is_integer() => "__ultrasql_cast_int4",
         DataType::Int64 if actual_type.is_integer() => "__ultrasql_cast_int8",
+        DataType::Float32 if actual_type.is_numeric() => "__ultrasql_cast_float4",
+        DataType::Float64 if actual_type.is_numeric() => "__ultrasql_cast_float8",
         DataType::Money
             if actual_type.is_integer() || matches!(actual_type, DataType::Decimal { .. }) =>
         {

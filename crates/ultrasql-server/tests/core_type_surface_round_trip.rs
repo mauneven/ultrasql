@@ -89,6 +89,23 @@ async fn core_scalar_types_round_trip_over_postgres_wire() {
     assert_eq!(cast_row.get::<_, i16>(2), 8);
     assert_eq!(cast_row.get::<_, i64>(3), 7);
 
+    let float_cast_row = client
+        .query_one(
+            "SELECT
+                CAST(i AS DOUBLE PRECISION),
+                CAST(b AS REAL),
+                CAST(r AS DOUBLE PRECISION),
+                CAST(d AS REAL)
+             FROM core_type_surface",
+            &[],
+        )
+        .await
+        .expect("runtime float casts from columns");
+    assert_eq!(float_cast_row.get::<_, f64>(0), 8.0);
+    assert_eq!(float_cast_row.get::<_, f32>(1), 9.0);
+    assert_eq!(float_cast_row.get::<_, f64>(2), 1.5);
+    assert_eq!(float_cast_row.get::<_, f32>(3), 2.25);
+
     let err = client
         .batch_execute(
             "INSERT INTO core_type_surface VALUES (

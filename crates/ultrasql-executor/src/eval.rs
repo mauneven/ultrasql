@@ -412,6 +412,8 @@ fn eval_function_call(
         "__ultrasql_cast_int2" => eval_cast_int16(args),
         "__ultrasql_cast_int4" => eval_cast_int32(args),
         "__ultrasql_cast_int8" => eval_cast_int64(args),
+        "__ultrasql_cast_float4" => eval_cast_float32(args),
+        "__ultrasql_cast_float8" => eval_cast_float64(args),
         "__ultrasql_cast_oid" => eval_cast_oid(args),
         "__ultrasql_cast_regclass" => eval_cast_regclass(args),
         "__ultrasql_cast_regtype" => eval_cast_regtype(args),
@@ -1036,6 +1038,55 @@ fn integer_cast_arg(func: &str, args: &[Value]) -> Result<Option<i128>, EvalErro
         Value::Int64(v) => Ok(Some(i128::from(*v))),
         other => Err(EvalError::Type(format!(
             "{func}: integer argument required, got {:?}",
+            other.data_type()
+        ))),
+    }
+}
+
+fn eval_cast_float32(args: &[Value]) -> Result<Value, EvalError> {
+    let Some(raw) = numeric_cast_arg_f64("real cast", args)? else {
+        return Ok(Value::Null);
+    };
+    let value = raw
+        .to_string()
+        .parse::<f32>()
+        .map_err(|_| EvalError::Type(format!("real cast: value out of range: {raw}")))?;
+    if raw.is_finite() && !value.is_finite() {
+        return Err(EvalError::Type(format!(
+            "real cast: value out of range: {raw}"
+        )));
+    }
+    Ok(Value::Float32(value))
+}
+
+fn eval_cast_float64(args: &[Value]) -> Result<Value, EvalError> {
+    let Some(raw) = numeric_cast_arg_f64("double precision cast", args)? else {
+        return Ok(Value::Null);
+    };
+    Ok(Value::Float64(raw))
+}
+
+fn numeric_cast_arg_f64(func: &str, args: &[Value]) -> Result<Option<f64>, EvalError> {
+    if args.len() != 1 {
+        return Err(EvalError::Type(format!(
+            "{func}: expected 1 arg, got {}",
+            args.len()
+        )));
+    }
+    match &args[0] {
+        Value::Null => Ok(None),
+        Value::Int16(v) => Ok(Some(f64::from(*v))),
+        Value::Int32(v) => Ok(Some(f64::from(*v))),
+        Value::Int64(v) => v.to_string().parse::<f64>().map(Some).map_err(|_| {
+            EvalError::Type(format!(
+                "{func}: value out of range for double precision: {v}"
+            ))
+        }),
+        Value::Float32(v) => Ok(Some(f64::from(*v))),
+        Value::Float64(v) => Ok(Some(*v)),
+        Value::Decimal { value, scale } => Ok(Some(decimal_value_to_f64(*value, *scale))),
+        other => Err(EvalError::Type(format!(
+            "{func}: numeric argument required, got {:?}",
             other.data_type()
         ))),
     }
@@ -6529,6 +6580,33 @@ mod tests {
         assert!(
             eval_fn_err("__ultrasql_cast_int8", vec![Value::Text("x".into())])
                 .contains("integer argument")
+        );
+        assert!(eval_fn_err("__ultrasql_cast_float4", vec![]).contains("expected 1 arg"));
+        assert_eq!(
+            eval_fn("__ultrasql_cast_float4", vec![Value::Null]),
+            Value::Null
+        );
+        assert_eq!(
+            eval_fn("__ultrasql_cast_float4", vec![Value::Int64(12)]),
+            Value::Float32(12.0)
+        );
+        assert_eq!(
+            eval_fn("__ultrasql_cast_float8", vec![Value::Float32(1.5)]),
+            Value::Float64(1.5)
+        );
+        assert_eq!(
+            eval_fn(
+                "__ultrasql_cast_float8",
+                vec![Value::Decimal {
+                    value: 225,
+                    scale: 2
+                }]
+            ),
+            Value::Float64(2.25)
+        );
+        assert!(
+            eval_fn_err("__ultrasql_cast_float8", vec![Value::Text("x".into())])
+                .contains("numeric argument")
         );
 
         assert!(eval_fn_err("__ultrasql_cast_oid", vec![]).contains("expected 1 arg"));

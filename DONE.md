@@ -1722,3 +1722,10 @@ as a concise evidence ledger; roadmap stays for open gates only.
   `cargo test -p ultrasql-executor cast_size_and_array_error_edges_cover_scalar_compat_paths --lib -- --nocapture`
   and
   `cargo test -p ultrasql-server --test core_type_surface_round_trip core_scalar_types_round_trip_over_postgres_wire -- --nocapture`.
+- Runtime float casts now support numeric column/expression casts into `REAL`
+  and `DOUBLE PRECISION`, including integer, float, and fixed-scale decimal
+  inputs, with `REAL` overflow rejected instead of silently producing infinity.
+  Evidence:
+  `cargo test -p ultrasql-executor cast_size_and_array_error_edges_cover_scalar_compat_paths --lib -- --nocapture`
+  and
+  `cargo test -p ultrasql-server --test core_type_surface_round_trip core_scalar_types_round_trip_over_postgres_wire -- --nocapture`.
