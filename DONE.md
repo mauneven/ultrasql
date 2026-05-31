@@ -642,6 +642,11 @@ as a concise evidence ledger; roadmap stays for open gates only.
   and end-to-end tests exist.
 - `INET`, `CIDR`, `MACADDR`, and `MACADDR8` storage, operators, wire OIDs,
   COPY, and end-to-end tests exist.
+- Built-in range types (`int4range`, `int8range`, `numrange`, `daterange`,
+  `tsrange`, `tstzrange`) now appear in `pg_catalog.pg_type` and
+  `pg_catalog.pg_range` with PostgreSQL OIDs and subtype OIDs, and range
+  columns report range type OIDs instead of falling back to text. Evidence:
+  `cargo test -p ultrasql-server --test catalog_views_round_trip pg_range_lists_builtin_range_type_metadata -- --nocapture`.
 - JSON and JSONB have distinct runtime/catalog/wire identity, JSON validation
   with text preservation, JSONB normalization, COPY, extended params, operator
   evaluation, and regression tests.

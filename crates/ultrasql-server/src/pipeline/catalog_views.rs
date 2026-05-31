@@ -6,7 +6,7 @@
 
 use std::collections::HashMap;
 
-use ultrasql_core::{DataType, Field, Oid, Schema, Value};
+use ultrasql_core::{DataType, Field, Oid, RangeType, Schema, Value};
 use ultrasql_executor::{MemTableScan, Operator, build_batch};
 use ultrasql_mvcc::{Visibility, XidStatusOracle, is_visible};
 use ultrasql_planner::LogicalReferentialAction;
@@ -69,6 +69,18 @@ const PG_TYPE_NUMERIC: i32 = 1700;
 const PG_TYPE_NUMERIC_ARRAY: i32 = 1231;
 const PG_TYPE_MONEY: i32 = 790;
 const PG_TYPE_MONEY_ARRAY: i32 = 791;
+const PG_TYPE_INT4RANGE: i32 = 3904;
+const PG_TYPE_INT4RANGE_ARRAY: i32 = 3905;
+const PG_TYPE_NUMRANGE: i32 = 3906;
+const PG_TYPE_NUMRANGE_ARRAY: i32 = 3907;
+const PG_TYPE_TSRANGE: i32 = 3908;
+const PG_TYPE_TSRANGE_ARRAY: i32 = 3909;
+const PG_TYPE_TSTZRANGE: i32 = 3910;
+const PG_TYPE_TSTZRANGE_ARRAY: i32 = 3911;
+const PG_TYPE_DATERANGE: i32 = 3912;
+const PG_TYPE_DATERANGE_ARRAY: i32 = 3913;
+const PG_TYPE_INT8RANGE: i32 = 3926;
+const PG_TYPE_INT8RANGE_ARRAY: i32 = 3927;
 const PG_TYPE_DATE: i32 = 1082;
 const PG_TYPE_DATE_ARRAY: i32 = 1182;
 const PG_TYPE_TIMESTAMP: i32 = 1114;
@@ -189,7 +201,7 @@ fn virtual_rows(name: &str, ctx: &LowerCtx<'_>) -> Option<(Schema, Vec<Vec<Value
         "pg_catalog.pg_attrdef" => Some((schema_pg_attrdef(), rows_pg_attrdef(ctx))),
         "pg_catalog.pg_type" => Some((schema_pg_type(), rows_pg_type(ctx))),
         "pg_catalog.pg_am" => Some((schema_pg_am(), rows_pg_am())),
-        "pg_catalog.pg_range" => Some((schema_pg_range(), Vec::new())),
+        "pg_catalog.pg_range" => Some((schema_pg_range(), rows_pg_range())),
         "pg_catalog.pg_collation" => Some((schema_pg_collation(), rows_pg_collation())),
         "pg_catalog.pg_enum" => Some((schema_pg_enum(), rows_pg_enum(ctx))),
         "pg_catalog.pg_index" => Some((schema_pg_index(), rows_pg_index(ctx))),
@@ -468,10 +480,22 @@ fn type_oid(dt: &DataType) -> i32 {
         DataType::Jsonb => PG_TYPE_JSONB,
         DataType::Xml => PG_TYPE_XML,
         DataType::Bytea => PG_TYPE_BYTEA,
+        DataType::Range(range_type) => range_type_oid(*range_type),
         DataType::Enum { oid, .. }
         | DataType::Composite { oid, .. }
         | DataType::Domain { oid, .. } => i32::try_from(oid.raw()).unwrap_or(PG_TYPE_TEXT),
         _ => PG_TYPE_TEXT,
+    }
+}
+
+fn range_type_oid(range_type: RangeType) -> i32 {
+    match range_type {
+        RangeType::Int4 => PG_TYPE_INT4RANGE,
+        RangeType::Int8 => PG_TYPE_INT8RANGE,
+        RangeType::Num => PG_TYPE_NUMRANGE,
+        RangeType::Date => PG_TYPE_DATERANGE,
+        RangeType::Timestamp => PG_TYPE_TSRANGE,
+        RangeType::TimestampTz => PG_TYPE_TSTZRANGE,
     }
 }
 
@@ -944,6 +968,60 @@ fn rows_pg_type(ctx: &LowerCtx<'_>) -> Vec<Vec<Value>> {
             0,
             PG_TYPE_MACADDR8_ARRAY,
         ),
+        (
+            PG_TYPE_INT4RANGE,
+            "int4range",
+            "r",
+            "R",
+            -1,
+            0,
+            PG_TYPE_INT4RANGE_ARRAY,
+        ),
+        (
+            PG_TYPE_INT8RANGE,
+            "int8range",
+            "r",
+            "R",
+            -1,
+            0,
+            PG_TYPE_INT8RANGE_ARRAY,
+        ),
+        (
+            PG_TYPE_NUMRANGE,
+            "numrange",
+            "r",
+            "R",
+            -1,
+            0,
+            PG_TYPE_NUMRANGE_ARRAY,
+        ),
+        (
+            PG_TYPE_DATERANGE,
+            "daterange",
+            "r",
+            "R",
+            -1,
+            0,
+            PG_TYPE_DATERANGE_ARRAY,
+        ),
+        (
+            PG_TYPE_TSRANGE,
+            "tsrange",
+            "r",
+            "R",
+            -1,
+            0,
+            PG_TYPE_TSRANGE_ARRAY,
+        ),
+        (
+            PG_TYPE_TSTZRANGE,
+            "tstzrange",
+            "r",
+            "R",
+            -1,
+            0,
+            PG_TYPE_TSTZRANGE_ARRAY,
+        ),
     ];
 
     let mut rows = BUILTINS
@@ -1101,6 +1179,17 @@ fn schema_pg_range() -> Schema {
         Field::required("rngtypid", DataType::Oid),
         Field::required("rngsubtype", DataType::Oid),
     ])
+}
+
+fn rows_pg_range() -> Vec<Vec<Value>> {
+    vec![
+        vec![v_oid_i32(PG_TYPE_INT4RANGE), v_oid_i32(PG_TYPE_INT4)],
+        vec![v_oid_i32(PG_TYPE_INT8RANGE), v_oid_i32(PG_TYPE_INT8)],
+        vec![v_oid_i32(PG_TYPE_NUMRANGE), v_oid_i32(PG_TYPE_NUMERIC)],
+        vec![v_oid_i32(PG_TYPE_DATERANGE), v_oid_i32(PG_TYPE_DATE)],
+        vec![v_oid_i32(PG_TYPE_TSRANGE), v_oid_i32(PG_TYPE_TIMESTAMP)],
+        vec![v_oid_i32(PG_TYPE_TSTZRANGE), v_oid_i32(PG_TYPE_TIMESTAMPTZ)],
+    ]
 }
 
 fn schema_pg_collation() -> Schema {

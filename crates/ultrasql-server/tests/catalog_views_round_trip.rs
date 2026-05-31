@@ -784,6 +784,47 @@ async fn active_record_type_map_probe_left_joins_pg_range() {
 }
 
 #[tokio::test]
+async fn pg_range_lists_builtin_range_type_metadata() {
+    let (_server, client, _conn, server_handle) = start_server_and_connect().await;
+
+    let rows = client
+        .query(
+            "SELECT t.typname, t.oid, r.rngsubtype \
+             FROM pg_catalog.pg_type t \
+             JOIN pg_catalog.pg_range r ON r.rngtypid = t.oid \
+             WHERE t.typname IN ('int4range', 'int8range', 'numrange', 'daterange', 'tsrange', 'tstzrange') \
+             ORDER BY t.typname",
+            &[],
+        )
+        .await
+        .expect("pg_range builtin rows");
+
+    let actual = rows
+        .iter()
+        .map(|row| {
+            (
+                row.get::<_, String>(0),
+                row.get::<_, u32>(1),
+                row.get::<_, u32>(2),
+            )
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        actual,
+        vec![
+            ("daterange".to_owned(), 3912, 1082),
+            ("int4range".to_owned(), 3904, 23),
+            ("int8range".to_owned(), 3926, 20),
+            ("numrange".to_owned(), 3906, 1700),
+            ("tsrange".to_owned(), 3908, 1114),
+            ("tstzrange".to_owned(), 3910, 1184),
+        ]
+    );
+
+    shutdown(client, server_handle).await;
+}
+
+#[tokio::test]
 async fn active_record_column_definitions_probe_uses_catalog_helpers() {
     let (_server, client, _conn, server_handle) = start_server_and_connect().await;
 
