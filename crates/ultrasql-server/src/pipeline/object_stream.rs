@@ -58,8 +58,8 @@ impl ObjectRangeReader {
             self.eof = true;
             return Ok(());
         }
-        let read_len = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
-        self.pos = self.pos.saturating_add(read_len);
+        let read_len = object_stream_read_len(bytes.len(), &self.display)?;
+        self.pos = object_stream_pos_add(self.pos, read_len, &self.display)?;
         if self.object_size.is_some_and(|size| self.pos >= size)
             || self.object_size.is_none() && read_len < requested
         {
@@ -68,6 +68,16 @@ impl ObjectRangeReader {
         self.buffer = bytes;
         Ok(())
     }
+}
+
+fn object_stream_read_len(len: usize, display: &str) -> io::Result<u64> {
+    u64::try_from(len)
+        .map_err(|_| io::Error::other(format!("{display}: object stream byte count exceeds u64")))
+}
+
+fn object_stream_pos_add(pos: u64, read_len: u64, display: &str) -> io::Result<u64> {
+    pos.checked_add(read_len)
+        .ok_or_else(|| io::Error::other(format!("{display}: object stream position overflow")))
 }
 
 impl Read for ObjectRangeReader {
@@ -95,5 +105,16 @@ impl BufRead for ObjectRangeReader {
 
     fn consume(&mut self, amt: usize) {
         self.cursor = self.cursor.saturating_add(amt).min(self.buffer.len());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn object_stream_pos_add_rejects_overflow() {
+        let err = object_stream_pos_add(u64::MAX, 1, "s3://bucket/key").unwrap_err();
+        assert!(err.to_string().contains("object stream position overflow"));
     }
 }

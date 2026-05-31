@@ -2198,3 +2198,6 @@ as a concise evidence ledger; roadmap stays for open gates only.
 - Runtime metadata sidecar reads now check sentinel read limits and byte-count
   conversion instead of saturating data-dir metadata reads. Evidence:
   `cargo test -p ultrasql-server tests::recovery::runtime_metadata_read_limit_rejects_overflow --lib -- --nocapture`.
+- Object-store range readers now check cursor advancement and byte-count
+  conversion instead of saturating remote object stream positions. Evidence:
+  `cargo test -p ultrasql-server pipeline::object_stream::tests::object_stream_pos_add_rejects_overflow --lib -- --nocapture`.
