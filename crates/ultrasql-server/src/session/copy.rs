@@ -1468,11 +1468,11 @@ fn read_copy_input_file(path: &str) -> Result<Vec<u8>, ServerError> {
         )));
     }
     let mut bytes = Vec::new();
-    let mut limited = file.take(limit.saturating_add(1));
+    let mut limited = file.take(copy_binary_take_limit(limit)?);
     limited
         .read_to_end(&mut bytes)
         .map_err(|e| ServerError::Io(std::io::Error::other(format!("{path}: {e}"))))?;
-    let read_len = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
+    let read_len = copy_binary_bytes_read_len(bytes.len())?;
     if read_len > limit {
         return Err(ServerError::CopyFormat(format!(
             "COPY binary file exceeds limit: {path} size={read_len} limit={limit}"
@@ -1487,6 +1487,22 @@ fn copy_binary_file_limit_bytes() -> u64 {
         .and_then(|value| value.parse::<u64>().ok())
         .filter(|value| *value > 0)
         .unwrap_or(DEFAULT_COPY_BINARY_FILE_LIMIT_BYTES)
+}
+
+fn copy_binary_take_limit(limit: u64) -> Result<u64, ServerError> {
+    limit.checked_add(1).ok_or_else(|| {
+        ServerError::CopyFormat(format!(
+            "COPY binary file read limit is too large: limit={limit}"
+        ))
+    })
+}
+
+fn copy_binary_bytes_read_len(len: usize) -> Result<u64, ServerError> {
+    u64::try_from(len).map_err(|_| {
+        ServerError::CopyFormat(format!(
+            "COPY binary file byte count exceeds u64: bytes={len}"
+        ))
+    })
 }
 
 fn ensure_regular_copy_input(path: &str) -> Result<(), ServerError> {
@@ -3198,6 +3214,12 @@ b"#
         let mut rows = 1;
         add_copy_batch_rows(&mut rows, 2, "COPY test").expect("small batch count");
         assert_eq!(rows, 3);
+    }
+
+    #[test]
+    fn copy_binary_take_limit_rejects_overflow() {
+        let err = copy_binary_take_limit(u64::MAX).unwrap_err();
+        assert!(err.to_string().contains("read limit is too large"));
     }
 
     fn copy_env_test_lock() -> std::sync::MutexGuard<'static, ()> {

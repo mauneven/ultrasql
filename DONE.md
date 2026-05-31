@@ -2186,3 +2186,6 @@ as a concise evidence ledger; roadmap stays for open gates only.
 - Catalog-version marker reads now check sentinel read limits and byte-count
   conversion instead of saturating tiny control-file reads. Evidence:
   `cargo test -p ultrasql-server catalog_version::tests::catalog_marker_take_limit_rejects_overflow --lib -- --nocapture`.
+- COPY binary input loading now checks sentinel read limits and byte-count
+  conversion instead of saturating local file reads. Evidence:
+  `cargo test -p ultrasql-server session::copy::tests::copy_binary_take_limit_rejects_overflow --lib -- --nocapture`.
