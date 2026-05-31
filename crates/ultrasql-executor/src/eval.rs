@@ -345,6 +345,9 @@ fn eval_function_call(
         "xml_is_well_formed_document" => eval_xml_is_well_formed(args, XmlWellFormedMode::Document),
         "xpath_exists" => eval_xpath_exists(args),
         "xpath" => eval_xpath(args),
+        "host" => eval_network_host(args),
+        "family" => eval_network_family(args),
+        "masklen" => eval_network_masklen(args),
         "pg_advisory_lock"
         | "pg_try_advisory_lock"
         | "pg_try_advisory_xact_lock"
@@ -2426,6 +2429,51 @@ fn eval_xpath(args: &[Value]) -> Result<Value, EvalError> {
         element_type: DataType::Xml,
         elements: fragments.into_iter().map(Value::Xml).collect(),
     })
+}
+
+fn eval_network_host(args: &[Value]) -> Result<Value, EvalError> {
+    let Some(addr) = network_inet_arg("host", args)? else {
+        return Ok(Value::Null);
+    };
+    Ok(Value::Text(addr.addr().to_string()))
+}
+
+fn eval_network_family(args: &[Value]) -> Result<Value, EvalError> {
+    let Some(addr) = network_inet_arg("family", args)? else {
+        return Ok(Value::Null);
+    };
+    let family = if addr.max_prefix() == 32 { 4 } else { 6 };
+    Ok(Value::Int32(family))
+}
+
+fn eval_network_masklen(args: &[Value]) -> Result<Value, EvalError> {
+    let Some(addr) = network_inet_arg("masklen", args)? else {
+        return Ok(Value::Null);
+    };
+    Ok(Value::Int32(i32::from(addr.prefix())))
+}
+
+fn network_inet_arg(
+    function: &'static str,
+    args: &[Value],
+) -> Result<Option<ultrasql_core::InetAddr>, EvalError> {
+    if args.len() != 1 {
+        return Err(EvalError::Type(format!(
+            "{function}: expected 1 arg, got {}",
+            args.len()
+        )));
+    }
+    match &args[0] {
+        Value::Null => Ok(None),
+        Value::Network(network) => network
+            .inet_addr()
+            .map(Some)
+            .ok_or_else(|| EvalError::Type(format!("{function}: expected inet or cidr"))),
+        other => Err(EvalError::Type(format!(
+            "{function}: expected inet or cidr, got {:?}",
+            other.data_type()
+        ))),
+    }
 }
 
 fn xml_text_arg<'a>(

@@ -121,6 +121,26 @@ async fn network_types_storage_ops_and_wire_round_trip() {
         ]]
     );
 
+    let inspectors = simple_rows(
+        client
+            .simple_query(
+                "SELECT host(host), host(net), family(host), masklen(host), masklen(net) \
+                 FROM network_probe",
+            )
+            .await
+            .expect("select network inspector functions"),
+    );
+    assert_eq!(
+        inspectors,
+        vec![vec![
+            "192.168.1.5".to_owned(),
+            "192.168.1.0".to_owned(),
+            "4".to_owned(),
+            "24".to_owned(),
+            "24".to_owned(),
+        ]]
+    );
+
     let stmt = client
         .prepare("SELECT host, net, mac, mac8 FROM network_probe")
         .await

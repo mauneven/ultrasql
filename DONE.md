@@ -665,7 +665,9 @@ as a concise evidence ledger; roadmap stays for open gates only.
 - `BIT(n)` / `BIT VARYING(n)` storage, row codec, operators, wire OIDs, COPY,
   and end-to-end tests exist.
 - `INET`, `CIDR`, `MACADDR`, and `MACADDR8` storage, operators, wire OIDs,
-  COPY, and end-to-end tests exist.
+  COPY, network inspector functions (`host`, `family`, `masklen`), and
+  end-to-end tests exist. Evidence:
+  `cargo test -p ultrasql-server --test network_types_round_trip network_types_storage_ops_and_wire_round_trip -- --nocapture`.
 - Built-in range types (`int4range`, `int8range`, `numrange`, `daterange`,
   `tsrange`, `tstzrange`) now appear in `pg_catalog.pg_type` and
   `pg_catalog.pg_range` with PostgreSQL OIDs and subtype OIDs, and range

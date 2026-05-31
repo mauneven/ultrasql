@@ -1501,6 +1501,8 @@ fn builtin_return_type(func_name: &str, args: &[ScalarExpr]) -> Result<DataType,
         "xmlparse" => Ok(DataType::Xml),
         "xmlserialize" => Ok(DataType::Text { max_len: None }),
         "xpath" => Ok(DataType::Array(Box::new(DataType::Xml))),
+        "host" => Ok(DataType::Text { max_len: None }),
+        "family" | "masklen" => Ok(DataType::Int32),
         "pg_advisory_lock" | "pg_advisory_unlock_all" => Ok(DataType::Null),
         "pg_try_advisory_lock" | "pg_try_advisory_xact_lock" | "pg_advisory_unlock" => {
             Ok(DataType::Bool)
@@ -1644,6 +1646,9 @@ pub(super) fn is_supported_builtin(func_name: &str) -> bool {
             | "xml_is_well_formed_document"
             | "xpath"
             | "xpath_exists"
+            | "host"
+            | "family"
+            | "masklen"
             | "pg_advisory_lock"
             | "pg_try_advisory_lock"
             | "pg_try_advisory_xact_lock"
@@ -1724,6 +1729,7 @@ fn validate_builtin_args(func_name: &str, args: &mut [ScalarExpr]) -> Result<(),
             validate_xml_well_formed_args(func_name, args)
         }
         "xpath" | "xpath_exists" => validate_xpath_args(func_name, args),
+        "host" | "family" | "masklen" => validate_network_inspector_args(func_name, args),
         "has_table_privilege"
         | "has_schema_privilege"
         | "has_database_privilege"
@@ -1918,6 +1924,17 @@ fn validate_xpath_args(func_name: &str, args: &[ScalarExpr]) -> Result<(), PlanE
     validate_exact_arg_count(func_name, args, 2)?;
     validate_text_or_xml_arg(func_name, &args[0])?;
     validate_text_or_xml_arg(func_name, &args[1])
+}
+
+fn validate_network_inspector_args(func_name: &str, args: &[ScalarExpr]) -> Result<(), PlanError> {
+    validate_exact_arg_count(func_name, args, 1)?;
+    let data_type = args[0].data_type();
+    if matches!(data_type, DataType::Null) || data_type.is_ip_network() {
+        return Ok(());
+    }
+    Err(PlanError::TypeMismatch(format!(
+        "{func_name}: expected inet or cidr, got {data_type}"
+    )))
 }
 
 fn validate_text_search_constructor_args(
