@@ -642,6 +642,10 @@ as a concise evidence ledger; roadmap stays for open gates only.
   statement context, so catalog introspection matches `SHOW` inside explicit
   transactions. Evidence:
   `cargo test -p ultrasql-server --test catalog_views_round_trip pg_settings_reflects_active_transaction_isolation -- --nocapture`.
+- `pg_catalog.pg_settings.search_path` now reflects the current session value
+  and default used by `SHOW search_path` instead of a hardcoded `public`.
+  Evidence:
+  `cargo test -p ultrasql-server --test catalog_views_round_trip pg_settings_reflects_session_search_path -- --nocapture`.
 - `pg_catalog.pg_collation` now exposes base `default`, `C`, and `POSIX`
   catalog rows instead of an empty relation, unblocking ORM and GUI
   introspection probes that join collation metadata. Evidence:

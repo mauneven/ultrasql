@@ -1068,6 +1068,28 @@ async fn pg_settings_reflects_active_transaction_isolation() {
 }
 
 #[tokio::test]
+async fn pg_settings_reflects_session_search_path() {
+    let (_server, client, _conn, server_handle) = start_server_and_connect().await;
+
+    client
+        .batch_execute("SET search_path TO public, \"$user\"")
+        .await
+        .expect("set search_path");
+    let row = client
+        .query_one(
+            "SELECT setting \
+             FROM pg_catalog.pg_settings \
+             WHERE name = 'search_path'",
+            &[],
+        )
+        .await
+        .expect("pg_settings search_path");
+    assert_eq!(row.get::<_, String>(0), "public, \"$user\"");
+
+    shutdown(client, server_handle).await;
+}
+
+#[tokio::test]
 async fn pg_stat_activity_reflects_session_identity() {
     let (_server, client, _conn, server_handle) = start_server_and_connect().await;
 

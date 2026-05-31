@@ -2144,7 +2144,7 @@ fn rows_pg_settings(ctx: &LowerCtx<'_>) -> Vec<Vec<Value>> {
         ],
         vec![
             v_text("search_path"),
-            v_text("public"),
+            v_text(session_setting(ctx, "search_path", "\"$user\", public")),
             Value::Null,
             v_text("Client Connection Defaults / Statement Behavior"),
             v_text("Sets the schema search order."),
@@ -2290,6 +2290,13 @@ fn isolation_level_setting(isolation: IsolationLevel) -> &'static str {
         IsolationLevel::RepeatableRead => "repeatable read",
         IsolationLevel::Serializable => "serializable",
     }
+}
+
+fn session_setting(ctx: &LowerCtx<'_>, name: &str, default: &'static str) -> String {
+    ctx.session_settings
+        .get(name)
+        .cloned()
+        .unwrap_or_else(|| default.to_owned())
 }
 
 fn sensitive_setting_value(value: &str) -> Value {
