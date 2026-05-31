@@ -1333,6 +1333,24 @@ pub fn xml_xpath_element_fragments_with_namespaces(
         };
         return Some(vec![after]);
     }
+    if let Some(arguments) = xml_xpath_substring_arguments(path) {
+        let value = match arguments.source {
+            XmlXPathValueArgument::Path(inner_path) => {
+                let matches = xml_xpath_element_fragments_with_namespaces(
+                    inner_path,
+                    document,
+                    namespace_bindings,
+                )?;
+                xml_xpath_first_string_value(&matches)
+            }
+            XmlXPathValueArgument::Literal(value) => value,
+        };
+        return Some(vec![xml_xpath_substring_value(
+            &value,
+            arguments.start,
+            arguments.length,
+        )]);
+    }
     if let Some(arguments) = xml_xpath_concat_arguments(path) {
         let mut out = String::new();
         for argument in arguments {
@@ -1520,6 +1538,36 @@ fn xml_xpath_string_literal_function_arguments<'a>(
 enum XmlXPathValueArgument<'a> {
     Path(&'a str),
     Literal(String),
+}
+
+#[derive(Debug)]
+struct XmlXPathSubstringArguments<'a> {
+    source: XmlXPathValueArgument<'a>,
+    start: f64,
+    length: Option<f64>,
+}
+
+fn xml_xpath_substring_arguments(path: &str) -> Option<XmlXPathSubstringArguments<'_>> {
+    let trimmed = path.trim();
+    let inner = trimmed
+        .strip_prefix("substring")?
+        .trim_start()
+        .strip_prefix('(')?
+        .strip_suffix(')')?
+        .trim();
+    let parts = xml_xpath_top_level_comma_split(inner)?;
+    if !(2..=3).contains(&parts.len()) {
+        return None;
+    }
+    Some(XmlXPathSubstringArguments {
+        source: xml_xpath_value_argument(parts[0])?,
+        start: parts[1].trim().parse::<f64>().ok()?,
+        length: parts
+            .get(2)
+            .map(|part| part.trim().parse::<f64>())
+            .transpose()
+            .ok()?,
+    })
 }
 
 fn xml_xpath_concat_arguments(path: &str) -> Option<Vec<XmlXPathValueArgument<'_>>> {
@@ -2047,6 +2095,29 @@ fn xml_xpath_first_string_value(matches: &[String]) -> String {
     matches
         .first()
         .map_or_else(String::new, |fragment| xml_xpath_string_value(fragment))
+}
+
+#[allow(
+    clippy::cast_precision_loss,
+    reason = "XPath substring positions compare small 1-based char indexes as f64 by spec"
+)]
+fn xml_xpath_substring_value(value: &str, start: f64, length: Option<f64>) -> String {
+    if start.is_nan() || length.is_some_and(f64::is_nan) {
+        return String::new();
+    }
+    let start = xml_xpath_round_number(start);
+    let end = length.map(|length| xml_xpath_round_number(start + length));
+    if end.is_some_and(f64::is_nan) {
+        return String::new();
+    }
+    value
+        .chars()
+        .enumerate()
+        .filter_map(|(idx, ch)| {
+            let position = (idx + 1) as f64;
+            (position >= start && end.is_none_or(|end| position < end)).then_some(ch)
+        })
+        .collect()
 }
 
 fn xml_element_string_value(text: &str, element: &XmlElement) -> String {
@@ -3650,6 +3721,20 @@ mod tests {
                 r#"<root><item>Ada Lovelace</item></root>"#
             ),
             Some(vec!["Lovelace".to_owned()])
+        );
+        assert_eq!(
+            xml_xpath_element_fragments(
+                "substring(/root/item, 5)",
+                r#"<root><item>Ada Lovelace</item></root>"#
+            ),
+            Some(vec!["Lovelace".to_owned()])
+        );
+        assert_eq!(
+            xml_xpath_element_fragments(
+                "substring(/root/item, 1, 3)",
+                r#"<root><item>Ada Lovelace</item></root>"#
+            ),
+            Some(vec!["Ada".to_owned()])
         );
         assert_eq!(
             xml_xpath_element_fragments(

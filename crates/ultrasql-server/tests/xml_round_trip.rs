@@ -294,6 +294,8 @@ async fn xml_functions_validate_securely_and_extract_simple_xpath() {
                         xpath('starts-with(/root/missing, \"Ada\")', XML '<root><item>Ada Lovelace</item></root>'), \
                         xpath('substring-before(/root/item, \" \")', XML '<root><item>Ada Lovelace</item></root>'), \
                         xpath('substring-after(/root/item, \" \")', XML '<root><item>Ada Lovelace</item></root>'), \
+                        xpath('substring(/root/item, 5)', XML '<root><item>Ada Lovelace</item></root>'), \
+                        xpath('substring(/root/item, 1, 3)', XML '<root><item>Ada Lovelace</item></root>'), \
                         xpath('substring-before(/root/item, \"x\")', XML '<root><item>Ada Lovelace</item></root>'), \
                         xpath('concat(/root/first, \" \", /root/last)', XML '<root><first>Ada</first><last>Lovelace</last></root>'), \
                         xpath('concat(\"prefix-\", /root/missing)', XML '<root><first>Ada</first></root>'), \
@@ -349,6 +351,8 @@ async fn xml_functions_validate_securely_and_extract_simple_xpath() {
             "{false}".to_owned(),
             "{Ada}".to_owned(),
             "{Lovelace}".to_owned(),
+            "{Lovelace}".to_owned(),
+            "{Ada}".to_owned(),
             r#"{""}"#.to_owned(),
             r#"{"Ada Lovelace"}"#.to_owned(),
             "{prefix-}".to_owned(),
