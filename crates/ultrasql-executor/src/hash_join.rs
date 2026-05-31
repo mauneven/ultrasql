@@ -49,14 +49,16 @@ use ultrasql_vec::Batch;
 use crate::eval::Eval;
 use crate::filter_op::batch_to_rows;
 use crate::row_codec::RowCodec;
+use crate::row_spill::{
+    checked_spill_bytes_add, checked_temp_spill_total, spill_row_bytes_for_len,
+};
 use crate::seq_scan::build_batch;
 use crate::value_key::{decimal_values_equal, hash_decimal_key};
-use crate::work_mem::{WorkMemBudget, temp_file_limit};
+use crate::work_mem::WorkMemBudget;
 use crate::{ExecError, Operator, OperatorSpillProfile, eval_error_to_exec_error};
 
 /// Maximum rows per emitted batch, matching the `ARCHITECTURE.md` section 9 contract.
 const BATCH_TARGET_ROWS: usize = 4096;
-const SPILL_ROW_LEN_BYTES: u64 = 4;
 
 /// Hash equi-join operator.
 ///
@@ -138,12 +140,8 @@ impl HashJoinSpill {
         let len = u32::try_from(encoded.len()).map_err(|_| {
             ExecError::TypeMismatch("hash join spill row exceeds u32 length".to_owned())
         })?;
-        let row_bytes = u64::from(len).saturating_add(SPILL_ROW_LEN_BYTES);
-        if self.bytes.saturating_add(row_bytes) > temp_file_limit() {
-            return Err(ExecError::Unsupported(
-                "hash join spill exceeded temp_file_limit",
-            ));
-        }
+        let row_bytes = spill_row_bytes_for_len(encoded.len(), "hash join")?;
+        let next_bytes = checked_temp_spill_total(self.bytes, row_bytes, "hash join")?;
 
         let handle = self.file.as_file_mut();
         handle
@@ -152,7 +150,7 @@ impl HashJoinSpill {
         handle
             .write_all(encoded)
             .map_err(|error| spill_io_error("write row", error))?;
-        self.bytes = self.bytes.saturating_add(row_bytes);
+        self.bytes = next_bytes;
         Ok(())
     }
 
@@ -593,12 +591,9 @@ impl HashJoin {
         let Some(budget) = &self.work_mem else {
             return Ok(false);
         };
-        let row_bytes = u64::try_from(encoded_len)
-            .map_err(|_| {
-                ExecError::TypeMismatch("hash join build row too large to account".to_owned())
-            })?
-            .saturating_add(SPILL_ROW_LEN_BYTES);
-        self.build_memory_bytes = self.build_memory_bytes.saturating_add(row_bytes);
+        let row_bytes = spill_row_bytes_for_len(encoded_len, "hash join build")?;
+        self.build_memory_bytes =
+            checked_spill_bytes_add(self.build_memory_bytes, row_bytes, "hash join build")?;
         Ok(self.build_memory_bytes > budget.limit_bytes())
     }
 

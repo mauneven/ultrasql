@@ -47,10 +47,8 @@ impl RowSpillFile {
         let len = u32::try_from(encoded.len()).map_err(|_| {
             ExecError::TypeMismatch(format!("{} spill row exceeds u32 length", self.label))
         })?;
-        let row_bytes = u64::from(len).saturating_add(SPILL_ROW_LEN_BYTES);
-        if self.bytes.saturating_add(row_bytes) > temp_file_limit() {
-            return Err(ExecError::Unsupported("spill exceeded temp_file_limit"));
-        }
+        let row_bytes = spill_row_bytes_for_len(encoded.len(), self.label)?;
+        let next_bytes = checked_temp_spill_total(self.bytes, row_bytes, self.label)?;
 
         let handle = self.file.as_file_mut();
         handle
@@ -59,7 +57,7 @@ impl RowSpillFile {
         handle
             .write_all(encoded)
             .map_err(|error| spill_io_error(self.label, "write row", error))?;
-        self.bytes = self.bytes.saturating_add(row_bytes);
+        self.bytes = next_bytes;
         Ok(())
     }
 
@@ -126,9 +124,37 @@ pub(crate) fn encoded_row_bytes(
     label: &'static str,
 ) -> Result<u64, ExecError> {
     let encoded = encode_row(codec, row, label)?;
-    let len = u64::try_from(encoded.len())
-        .map_err(|_| ExecError::TypeMismatch(format!("{label} spill row too large to account")))?;
-    Ok(len.saturating_add(SPILL_ROW_LEN_BYTES))
+    spill_row_bytes_for_len(encoded.len(), label)
+}
+
+pub(crate) fn spill_row_bytes_for_len(encoded_len: usize, label: &str) -> Result<u64, ExecError> {
+    let len = u32::try_from(encoded_len)
+        .map_err(|_| ExecError::TypeMismatch(format!("{label} spill row exceeds u32 length")))?;
+    u64::from(len)
+        .checked_add(SPILL_ROW_LEN_BYTES)
+        .ok_or_else(|| ExecError::TypeMismatch(format!("{label} spill row byte overflow")))
+}
+
+pub(crate) fn checked_spill_bytes_add(
+    current: u64,
+    delta: u64,
+    label: &str,
+) -> Result<u64, ExecError> {
+    current
+        .checked_add(delta)
+        .ok_or_else(|| ExecError::TypeMismatch(format!("{label} spill byte counter overflow")))
+}
+
+pub(crate) fn checked_temp_spill_total(
+    current: u64,
+    delta: u64,
+    label: &str,
+) -> Result<u64, ExecError> {
+    let next = checked_spill_bytes_add(current, delta, label)?;
+    if next > temp_file_limit() {
+        return Err(ExecError::Unsupported("spill exceeded temp_file_limit"));
+    }
+    Ok(next)
 }
 
 fn encode_row(codec: &RowCodec, row: &[Value], label: &'static str) -> Result<Vec<u8>, ExecError> {
@@ -139,4 +165,22 @@ fn encode_row(codec: &RowCodec, row: &[Value], label: &'static str) -> Result<Ve
 
 fn spill_io_error(label: &str, action: &str, error: std::io::Error) -> ExecError {
     ExecError::TypeMismatch(format!("{label} spill {action} failed: {error}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn spill_row_bytes_rejects_u32_overflow() {
+        let too_large = usize::try_from(u64::from(u32::MAX) + 1).unwrap();
+        let err = spill_row_bytes_for_len(too_large, "test").unwrap_err();
+        assert!(matches!(err, ExecError::TypeMismatch(_)));
+    }
+
+    #[test]
+    fn spill_byte_add_rejects_u64_overflow() {
+        let err = checked_spill_bytes_add(u64::MAX, 1, "test").unwrap_err();
+        assert!(matches!(err, ExecError::TypeMismatch(_)));
+    }
 }

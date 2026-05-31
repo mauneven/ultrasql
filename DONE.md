@@ -2151,3 +2151,6 @@ as a concise evidence ledger; roadmap stays for open gates only.
 - WAL writer now rejects exhausted segment indexes and checks drain cursor,
   segment-size, and unflushed-byte counter arithmetic before writing. Evidence:
   `cargo test -p ultrasql-wal writer::tests --lib -- --nocapture`.
+- Row spill and hash-join spill accounting now share checked byte helpers so
+  temp-file-limit enforcement cannot be bypassed by saturating counters.
+  Evidence: `cargo test -p ultrasql-executor row_spill::tests --lib -- --nocapture`.
