@@ -1857,6 +1857,10 @@ as a concise evidence ledger; roadmap stays for open gates only.
   evaluation now preserve their typed SQLSTATEs instead of collapsing to
   `XX000`. Evidence:
   `cargo test -p ultrasql-server --test window_round_trip window_order_key_runtime_cast_error_returns_22p02 -- --nocapture`.
+- Runtime errors inside hybrid-search metadata and WHERE filter evaluation now
+  preserve typed executor errors instead of collapsing to `TypeMismatch`.
+  Evidence:
+  `cargo test -p ultrasql-executor hybrid_search_filter_eval_error_stays_typed --lib -- --nocapture`.
 - Runtime scalar/temporal text casts to integer, float, boolean, date, time,
   timestamp, timestamptz, and timetz now report SQLSTATE `22P02` for invalid
   column text. Evidence:

@@ -19,7 +19,7 @@ use ultrasql_vec::kernels::vector::{VectorMetric, cosine_distance_f32, dot_f32, 
 use crate::eval::Eval;
 use crate::filter_op::batch_to_rows;
 use crate::seq_scan::build_batch;
-use crate::{ExecError, Operator};
+use crate::{ExecError, Operator, eval_error_to_exec_error};
 
 const BATCH_TARGET_ROWS: usize = 4096;
 const BM25_K1: f64 = 1.2;
@@ -351,10 +351,7 @@ fn passes_filter(filter: &Option<Eval>, row: &[Value], label: &str) -> Result<bo
     let Some(filter) = filter else {
         return Ok(true);
     };
-    match filter
-        .eval(row)
-        .map_err(|e| ExecError::TypeMismatch(e.to_string()))?
-    {
+    match filter.eval(row).map_err(eval_error_to_exec_error)? {
         Value::Bool(pass) => Ok(pass),
         Value::Null => Ok(false),
         other => Err(ExecError::TypeMismatch(format!(
@@ -737,5 +734,34 @@ mod tests {
         let mut op = HybridSearch::new(Box::new(scan), schema, config);
 
         assert!(op.next_batch().expect("zero-limit eof").is_none());
+    }
+
+    #[test]
+    fn hybrid_search_filter_eval_error_stays_typed() {
+        let schema = schema();
+        let batch = build_batch(&rows(), &schema).expect("rows encode");
+        let scan = MemTableScan::new(schema.clone(), vec![batch]);
+        let where_predicate = ScalarExpr::Binary {
+            op: BinaryOp::Div,
+            left: Box::new(col("id", 0, DataType::Int32)),
+            right: Box::new(lit(Value::Int32(0), DataType::Int32)),
+            data_type: DataType::Int32,
+        };
+        let config = HybridSearchConfig {
+            text: None,
+            vector: None,
+            metadata_filter: None,
+            where_predicate: Some(where_predicate),
+            recency_column: None,
+            version_column: None,
+            limit: 1,
+            weights: HybridSearchWeights::default(),
+        };
+
+        let mut op = HybridSearch::new(Box::new(scan), schema, config);
+        let err = op
+            .next_batch()
+            .expect_err("hybrid filter division by zero must surface");
+        assert!(matches!(err, ExecError::DivisionByZero(_)), "{err:?}");
     }
 }
