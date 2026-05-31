@@ -340,6 +340,22 @@ async fn core_scalar_types_round_trip_over_postgres_wire() {
         );
     }
 
+    client
+        .batch_execute(
+            "CREATE TABLE xml_invalid_text_cast_surface (as_xml TEXT NOT NULL);
+             INSERT INTO xml_invalid_text_cast_surface VALUES ('<root>')",
+        )
+        .await
+        .expect("create invalid XML text cast table");
+    let xml_err = client
+        .simple_query("SELECT CAST(as_xml AS XML) FROM xml_invalid_text_cast_surface")
+        .await
+        .expect_err("invalid runtime XML text cast must fail");
+    assert_eq!(
+        xml_err.code().map(tokio_postgres::error::SqlState::code),
+        Some("2200M")
+    );
+
     let err = client
         .batch_execute(
             "INSERT INTO core_type_surface VALUES (

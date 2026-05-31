@@ -280,6 +280,9 @@ impl ServerError {
             // invalid_text_representation — runtime cast parser rejected
             // a text value for the requested SQL type.
             Self::Execute(ultrasql_executor::ExecError::InvalidTextRepresentation(_)) => "22P02",
+            // invalid_xml_document — XML cast parser rejected a document
+            // value.
+            Self::Execute(ultrasql_executor::ExecError::InvalidXmlDocument(_)) => "2200M",
             // query_canceled — operator polled the `CancelFlag` between
             // batches and short-circuited after a peer `CancelRequest`
             // flipped it. Mirrors PostgreSQL's `query_canceled`.

@@ -104,6 +104,9 @@ fn eval_error_to_exec(error: EvalError) -> ExecError {
         EvalError::Type(message) if is_invalid_text_representation(&message) => {
             ExecError::InvalidTextRepresentation(message)
         }
+        EvalError::Type(message) if is_invalid_xml_document(&message) => {
+            ExecError::InvalidXmlDocument(message)
+        }
         other => ExecError::TypeMismatch(other.to_string()),
     }
 }
@@ -132,6 +135,10 @@ fn is_invalid_text_representation(message: &str) -> bool {
         || message.starts_with("uuid cast: invalid syntax:")
         || message.starts_with("json cast: invalid JSON:")
         || message.starts_with("jsonb cast: invalid JSON:")
+}
+
+fn is_invalid_xml_document(message: &str) -> bool {
+    message.starts_with("xml cast: invalid XML document:")
 }
 
 /// Assemble a column-oriented batch column from a column-major

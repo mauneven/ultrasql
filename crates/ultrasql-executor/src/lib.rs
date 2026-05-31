@@ -201,6 +201,11 @@ pub enum ExecError {
     #[error("{0}")]
     InvalidTextRepresentation(String),
 
+    /// XML parser rejected a document value. The server maps this to
+    /// PostgreSQL SQLSTATE `2200M`.
+    #[error("{0}")]
+    InvalidXmlDocument(String),
+
     /// A batch was produced that exceeds the configured maximum row
     /// count. The executor caps batches at 4096 rows
     /// (see `ARCHITECTURE.md`); kernels that violate this are buggy.
