@@ -1929,6 +1929,11 @@ as a concise evidence ledger; roadmap stays for open gates only.
 - `SortAggregate` now rejects `SUM(BIGINT)` overflow with typed
   `NumericFieldOverflow` instead of returning wrapped totals. Evidence:
   `cargo test -p ultrasql-executor sort_aggregate --lib -- --nocapture`.
+- Cached grouped projection summaries now abandon the summary fast path on
+  `SUM(BIGINT)` overflow instead of caching wrapped totals; normal execution
+  handles the typed overflow. Evidence:
+  `cargo test -p ultrasql-server projection_summary --lib -- --nocapture` and
+  `cargo test -p ultrasql-server --test projection_summary_round_trip -- --nocapture`.
 - Vectorized terminal `SumSink` now rejects `Int64` and sample-count overflow
   instead of wrapping benchmark/query sink totals. Evidence:
   `cargo test -p ultrasql-executor sum_sink_rejects_i64_overflow --lib -- --nocapture`.

@@ -315,10 +315,10 @@ fn apply_projection_aggregate(
             let (column, _) = aggregate_column_arg(agg)?;
             match value_from_column(columns.get(column)?, row)? {
                 Value::Int32(v) => {
-                    *acc = Some(acc.unwrap_or(0).wrapping_add(i64::from(v)));
+                    *acc = Some(checked_projection_sum(*acc, i64::from(v))?);
                 }
                 Value::Int64(v) => {
-                    *acc = Some(acc.unwrap_or(0).wrapping_add(v));
+                    *acc = Some(checked_projection_sum(*acc, v)?);
                 }
                 Value::Null => {}
                 _ => return None,
@@ -327,6 +327,10 @@ fn apply_projection_aggregate(
         }
         _ => None,
     }
+}
+
+fn checked_projection_sum(acc: Option<i64>, delta: i64) -> Option<i64> {
+    acc.unwrap_or(0).checked_add(delta)
 }
 
 fn finalise_projection_state(state: &ProjectionAggState) -> Value {
@@ -468,4 +472,50 @@ fn require_identity_projection(exprs: &[(ScalarExpr, String)]) -> Option<()> {
         .enumerate()
         .all(|(idx, (expr, _))| matches!(expr, ScalarExpr::Column { index, .. } if *index == idx));
     identity.then_some(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ultrasql_core::Field;
+    use ultrasql_vec::Batch;
+    use ultrasql_vec::column::{Column, NumericColumn};
+
+    fn sum_amount_agg() -> LogicalAggregateExpr {
+        LogicalAggregateExpr {
+            func: AggregateFunc::Sum,
+            arg: Some(ScalarExpr::Column {
+                name: "amount".to_owned(),
+                index: 1,
+                data_type: DataType::Int64,
+            }),
+            direct_arg: None,
+            order_by: None,
+            distinct: false,
+            output_name: "total".to_owned(),
+            data_type: DataType::Int64,
+        }
+    }
+
+    #[test]
+    fn grouped_projection_sum_overflow_disables_summary() {
+        let batch = Batch::new([
+            Column::Int32(NumericColumn::from_data(vec![7, 7])),
+            Column::Int64(NumericColumn::from_data(vec![i64::MAX, 1])),
+        ])
+        .expect("batch");
+        let schema = Schema::new([
+            Field::required("bucket", DataType::Int32),
+            Field::required("amount", DataType::Int64),
+        ])
+        .expect("schema");
+        let aggregates = [sum_amount_agg()];
+
+        let rows = build_grouped_projection_rows(batch.columns(), &[0], &aggregates, &[]);
+
+        assert!(
+            rows.is_none(),
+            "projection summary must not cache wrapped SUM(BIGINT) rows for schema {schema:?}"
+        );
+    }
 }
