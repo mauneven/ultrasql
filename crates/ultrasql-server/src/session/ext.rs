@@ -457,7 +457,13 @@ where
         let started = Instant::now();
         let timeout_guard =
             StatementTimeoutGuard::arm(self.statement_timeout_ms, self.cancel_flag.clone());
+        if let Some((query, ..)) = workload_meta.as_ref() {
+            self.state
+                .workload_recorder
+                .set_session_active(self.pid, query.clone());
+        }
         let outcome = self.run_portal_routed(portal, max_rows);
+        self.state.workload_recorder.set_session_idle(self.pid);
         drop(timeout_guard);
         let elapsed = started.elapsed();
         if let Some((query, plan_hash, bind_param_count, bind_params_redacted)) = workload_meta {

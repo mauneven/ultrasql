@@ -476,7 +476,7 @@ impl WorkloadRecorder {
                 datname: "ultrasql".to_string(),
                 usename: usename.into(),
                 application_name: None,
-                state: "active".to_string(),
+                state: "idle".to_string(),
                 query: None,
             },
         );
@@ -493,6 +493,22 @@ impl WorkloadRecorder {
     pub fn update_session_application_name(&self, pid: u32, application_name: Option<String>) {
         if let Some(row) = self.active_sessions.lock().get_mut(&pid) {
             row.application_name = application_name;
+        }
+    }
+
+    /// Mark one live session as executing `query`.
+    pub fn set_session_active(&self, pid: u32, query: impl Into<String>) {
+        if let Some(row) = self.active_sessions.lock().get_mut(&pid) {
+            row.state = "active".to_string();
+            row.query = Some(query.into());
+        }
+    }
+
+    /// Mark one live session as idle and clear the exposed query text.
+    pub fn set_session_idle(&self, pid: u32) {
+        if let Some(row) = self.active_sessions.lock().get_mut(&pid) {
+            row.state = "idle".to_string();
+            row.query = None;
         }
     }
 

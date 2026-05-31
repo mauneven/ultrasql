@@ -1258,7 +1258,7 @@ async fn pg_stat_activity_lists_open_sessions() {
 
     let rows = client_a
         .query(
-            "SELECT usename, application_name \
+            "SELECT usename, application_name, state, query \
              FROM pg_catalog.pg_stat_activity \
              WHERE application_name IN ('activity_a', 'activity_b') \
              ORDER BY application_name",
@@ -1269,8 +1269,18 @@ async fn pg_stat_activity_lists_open_sessions() {
     assert_eq!(rows.len(), 2);
     assert_eq!(rows[0].get::<_, String>(0), "activity_a");
     assert_eq!(rows[0].get::<_, String>(1), "activity_a");
+    assert_eq!(rows[0].get::<_, String>(2), "active");
+    let current_query = rows[0].get::<_, Option<String>>(3);
+    assert!(
+        current_query
+            .as_deref()
+            .is_some_and(|query| query.contains("pg_stat_activity")),
+        "current activity query should be visible"
+    );
     assert_eq!(rows[1].get::<_, String>(0), "activity_b");
     assert_eq!(rows[1].get::<_, String>(1), "activity_b");
+    assert_eq!(rows[1].get::<_, String>(2), "idle");
+    assert_eq!(rows[1].get::<_, Option<String>>(3), None);
 
     drop(client_b);
     tokio::time::sleep(Duration::from_millis(20)).await;

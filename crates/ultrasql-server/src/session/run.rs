@@ -241,7 +241,11 @@ where
         let started = Instant::now();
         let timeout_guard =
             StatementTimeoutGuard::arm(self.statement_timeout_ms, self.cancel_flag.clone());
+        self.state
+            .workload_recorder
+            .set_session_active(self.pid, trimmed.to_string());
         let outcome = self.execute_query(trimmed);
+        self.state.workload_recorder.set_session_idle(self.pid);
         drop(timeout_guard);
         let elapsed = started.elapsed();
         let rows = outcome.as_ref().map_or(0, |result| result.rows);
@@ -316,7 +320,11 @@ where
             let started = Instant::now();
             let timeout_guard =
                 StatementTimeoutGuard::arm(self.statement_timeout_ms, self.cancel_flag.clone());
+            self.state
+                .workload_recorder
+                .set_session_active(self.pid, trimmed.to_string());
             let outcome = self.execute_query(trimmed);
+            self.state.workload_recorder.set_session_idle(self.pid);
             drop(timeout_guard);
             let elapsed = started.elapsed();
             let rows = outcome.as_ref().map_or(0, |result| result.rows);
