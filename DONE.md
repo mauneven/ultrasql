@@ -1093,6 +1093,9 @@ as a concise evidence ledger; roadmap stays for open gates only.
   `AVG` / `MIN` / `MAX`, `HAVING`, and core window functions:
   `row_number`, `rank`, `dense_rank`, `lag`, `lead`, `first_value`,
   `last_value`, `nth_value`, and `ntile`.
+- Type-coercion regression baseline covers explicit casts, assignment-compatible
+  inserts, NULL casts, `COALESCE`, `CASE`, text casts, boolean casts, and
+  overlength `VARCHAR` rejection.
 - Tooling panic-path audit tightened benchmark and SQLLogicTest binaries:
   benchmark server/mock setup now returns context errors instead of panics,
   CLI reference engines reject non-CLI targets with typed errors, hex encoding

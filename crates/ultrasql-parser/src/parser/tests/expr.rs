@@ -92,6 +92,27 @@ fn cast_expression_accepts_vector_family_type_modifiers() {
 }
 
 #[test]
+fn cast_expression_accepts_numeric_type_modifiers() {
+    for (sql, expected) in [
+        (
+            "SELECT CAST('12.30' AS NUMERIC(8,2)) FROM t",
+            "numeric(8,2)",
+        ),
+        ("SELECT CAST('12' AS DECIMAL(8)) FROM t", "decimal(8)"),
+    ] {
+        let stmt = parse(sql);
+        let Statement::Select(s) = stmt else { panic!() };
+        let SelectItem::Expr { expr, .. } = &s.projection[0] else {
+            panic!()
+        };
+        let Expr::Cast { target, .. } = expr else {
+            panic!("expected CAST expression for {sql}");
+        };
+        assert_eq!(target.value, expected);
+    }
+}
+
+#[test]
 fn xml_parse_and_serialize_syntax_lower_to_builtin_calls() {
     let stmt = parse(
         "SELECT \

@@ -13,6 +13,7 @@ Imported files:
 - `index_constraint_operator_baseline.slt`
 - `type_specific_baseline.slt`
 - `aggregate_window_baseline.slt`
+- `type_coercion_baseline.slt`
 
 Derived upstream regression sources:
 
@@ -45,6 +46,8 @@ The type-specific shard likewise keeps full numeric overflow, collation,
 timezone-abbreviation, and SQL/JSON breadth as visible skip debt.
 The aggregate/window shard covers grouped aggregates, HAVING, and core window
 functions with deterministic local fixtures.
+The type-coercion shard covers explicit casts, assignment-compatible inserts,
+NULL casts, `COALESCE`, and `CASE` coercion with deterministic local fixtures.
 
 Run with PostgreSQL reference:
 

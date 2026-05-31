@@ -1161,6 +1161,30 @@ impl<'src> Parser<'src> {
             let rp = self.expect(TokenKind::RParen, ")")?;
             target.value = format!("{base}({dim})");
             target.span = Span::new(target.span.start, rp.span.end);
+        } else if let Some(base) = decimal_cast_type_base(&target.value)
+            && self.peek()?.kind == TokenKind::LParen
+        {
+            self.advance()?; // (
+            let mut modifiers = Vec::new();
+            loop {
+                let modifier_tok = self.expect(TokenKind::Integer, "integer type modifier")?;
+                modifiers.push(modifier_tok.text(self.source).unwrap_or("").to_owned());
+                if self.peek()?.kind == TokenKind::Comma {
+                    self.advance()?;
+                    continue;
+                }
+                break;
+            }
+            let rp = self.expect(TokenKind::RParen, ")")?;
+            if modifiers.len() > 2 {
+                return Err(ParseError::Expected {
+                    expected: "at most precision and scale modifiers",
+                    found: TokenKind::Integer,
+                    offset: rp.span.start as usize,
+                });
+            }
+            target.value = format!("{base}({})", modifiers.join(","));
+            target.span = Span::new(target.span.start, rp.span.end);
         } else if let Some(base) = single_modifier_cast_type_base(&target.value)
             && self.peek()?.kind == TokenKind::LParen
         {
@@ -1172,6 +1196,16 @@ impl<'src> Parser<'src> {
             target.span = Span::new(target.span.start, rp.span.end);
         }
         Ok(target)
+    }
+}
+
+fn decimal_cast_type_base(text: &str) -> Option<&'static str> {
+    if text.eq_ignore_ascii_case("numeric") {
+        Some("numeric")
+    } else if text.eq_ignore_ascii_case("decimal") {
+        Some("decimal")
+    } else {
+        None
     }
 }
 

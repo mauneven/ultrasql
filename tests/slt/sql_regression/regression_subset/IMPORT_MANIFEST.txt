@@ -25,4 +25,5 @@ file=parser_type_baseline.slt
 file=index_constraint_operator_baseline.slt
 file=type_specific_baseline.slt
 file=aggregate_window_baseline.slt
+file=type_coercion_baseline.slt
 notes=hand-curated SQLLogicTest translations with local deterministic fixtures; no full upstream regression dump

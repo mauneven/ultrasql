@@ -531,6 +531,59 @@ fn sql_regression_aggregate_window_baseline_is_imported_and_provenanced() {
 }
 
 #[test]
+fn sql_regression_type_coercion_baseline_is_imported_and_provenanced() {
+    let subset = repo_root().join("tests/slt/sql_regression/regression_subset");
+    let manifest =
+        fs::read_to_string(subset.join("IMPORT_MANIFEST.txt")).expect("read PostgreSQL manifest");
+    let readme = fs::read_to_string(subset.join("README.md")).expect("read PostgreSQL README");
+    let shard = subset.join("type_coercion_baseline.slt");
+    let text = fs::read_to_string(&shard).expect("read type-coercion shard");
+
+    for source in [
+        "derived_from=src/test/regress/sql/numeric.sql",
+        "derived_from=src/test/regress/sql/char.sql",
+        "derived_from=src/test/regress/sql/varchar.sql",
+        "derived_from=src/test/regress/sql/select.sql",
+    ] {
+        assert!(manifest.contains(source), "manifest:\n{manifest}");
+    }
+    assert!(
+        manifest.contains("file=type_coercion_baseline.slt"),
+        "manifest:\n{manifest}"
+    );
+    assert!(
+        readme.contains("type_coercion_baseline.slt"),
+        "README:\n{readme}"
+    );
+    assert!(
+        text.contains("PostgreSQL regression-derived type-coercion baseline"),
+        "{} must document reviewed scope",
+        shard.display()
+    );
+    for surface in [
+        "CAST('42' AS INT)",
+        "CAST(42 AS TEXT)",
+        "CAST('12.30' AS NUMERIC(8,2))",
+        "CAST(NULL AS INT)",
+        "COALESCE(n, 0.00)",
+        "CASE WHEN flag",
+        "i + 1",
+    ] {
+        assert!(
+            text.contains(surface),
+            "{} missing {surface}",
+            shard.display()
+        );
+    }
+    let case_count = count_slt_cases(&text);
+    assert!(
+        (10..=32).contains(&case_count),
+        "{} must stay as a small reviewed shard, got {case_count} cases",
+        shard.display()
+    );
+}
+
+#[test]
 fn skip_directive_requires_explicit_reason() {
     let bin = env!("CARGO_BIN_EXE_ultrasql-sqllogictest-runner");
     let suite = temp_artifact_path("ultrasql-slt-empty-skip", "test");

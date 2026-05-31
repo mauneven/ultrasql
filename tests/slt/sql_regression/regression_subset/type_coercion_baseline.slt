@@ -1,0 +1,93 @@
+# PostgreSQL regression-derived type-coercion baseline shard.
+# Source: PostgreSQL src/test/regress/sql/numeric.sql, char.sql, varchar.sql,
+# and select.sql at commit ddd12d1a5c4d980c5f31dc7d096012547b724e55.
+# License/provenance live beside this file in IMPORT_MANIFEST.txt and
+# LICENSE.upstream.
+
+statement ok
+CREATE TABLE slt_pg_type_coercion (
+  id INT NOT NULL,
+  i BIGINT,
+  n NUMERIC(8,2),
+  label TEXT,
+  c CHAR(4),
+  v VARCHAR(5),
+  flag BOOLEAN
+)
+
+statement ok
+INSERT INTO slt_pg_type_coercion VALUES
+  (1, CAST('42' AS BIGINT), CAST('12.30' AS NUMERIC(8,2)), CAST(42 AS TEXT), CAST('ab' AS CHAR(4)), CAST('hello' AS VARCHAR(5)), CAST('true' AS BOOLEAN)),
+  (2, 8, 4.00, 'x', 'xy', 'abc', false),
+  (3, NULL, NULL, NULL, NULL, NULL, NULL)
+
+query I nosort
+SELECT CAST('42' AS INT)
+----
+42
+
+query T nosort
+SELECT CAST(42 AS TEXT)
+----
+42
+
+query T nosort
+SELECT pg_typeof(CAST('12.30' AS NUMERIC(8,2)))
+----
+numeric
+
+query I nosort
+SELECT CAST(NULL AS INT)
+----
+NULL
+
+query II rowsort
+SELECT id, i + 1 FROM slt_pg_type_coercion WHERE i IS NOT NULL ORDER BY id
+----
+1
+43
+2
+9
+
+query I rowsort
+SELECT id FROM slt_pg_type_coercion WHERE COALESCE(n, 0.00) >= 0.00 ORDER BY id
+----
+1
+2
+3
+
+query II rowsort
+SELECT id, CASE WHEN flag THEN i ELSE CAST(0 AS BIGINT) END
+FROM slt_pg_type_coercion
+WHERE id IN (1, 2)
+ORDER BY id
+----
+1
+42
+2
+0
+
+query IT nosort
+SELECT id, label FROM slt_pg_type_coercion WHERE label = CAST(42 AS TEXT)
+----
+1
+42
+
+query I nosort
+SELECT id FROM slt_pg_type_coercion WHERE c = 'ab' AND v = 'hello'
+----
+1
+
+query IB rowsort
+SELECT id, flag FROM slt_pg_type_coercion WHERE flag IS NOT NULL ORDER BY id
+----
+1
+true
+2
+false
+
+statement error
+INSERT INTO slt_pg_type_coercion VALUES (4, 1, 1.00, 'x', 'ok', 'toolong', true)
+
+statement ok
+DROP TABLE slt_pg_type_coercion

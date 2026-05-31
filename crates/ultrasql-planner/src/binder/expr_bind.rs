@@ -2314,6 +2314,16 @@ fn parse_decimal_literal(text: &str) -> Option<(i64, i32)> {
     Some((value, scale))
 }
 
+fn parse_bool_text(text: &str) -> Option<bool> {
+    match text.trim() {
+        "t" | "true" | "TRUE" | "T" | "1" | "y" | "Y" | "yes" | "YES" | "on" | "ON" => Some(true),
+        "f" | "false" | "FALSE" | "F" | "0" | "n" | "N" | "no" | "NO" | "off" | "OFF" => {
+            Some(false)
+        }
+        _ => None,
+    }
+}
+
 fn pow10_i64(exp: u32) -> Option<i64> {
     (0..exp).try_fold(1_i64, |acc, _| acc.checked_mul(10))
 }
@@ -2701,6 +2711,12 @@ pub(super) fn coerce_literal_to_type(expr: &mut ScalarExpr, target: &DataType) {
                 *data_type = DataType::Int64;
             }
         }
+        (DataType::Bool, Value::Text(text)) => {
+            if let Some(parsed) = parse_bool_text(text) {
+                *value = Value::Bool(parsed);
+                *data_type = DataType::Bool;
+            }
+        }
         (DataType::Float64, Value::Float32(v)) => {
             *value = Value::Float64(f64::from(*v));
             *data_type = DataType::Float64;
@@ -2814,10 +2830,7 @@ pub(super) fn coerce_literal_to_type(expr: &mut ScalarExpr, target: &DataType) {
                     value: decimal_value,
                     scale: decimal_scale,
                 };
-                *data_type = DataType::Decimal {
-                    precision: None,
-                    scale: Some(decimal_scale),
-                };
+                *data_type = target.clone();
             }
         }
         (DataType::Decimal { scale, .. }, _) => {
@@ -2827,10 +2840,7 @@ pub(super) fn coerce_literal_to_type(expr: &mut ScalarExpr, target: &DataType) {
                     value: decimal_value,
                     scale: decimal_scale,
                 };
-                *data_type = DataType::Decimal {
-                    precision: None,
-                    scale: Some(decimal_scale),
-                };
+                *data_type = target.clone();
             }
         }
         (DataType::Money, _) => {
@@ -3085,6 +3095,9 @@ fn resolve_cast_type(type_name: &str) -> Option<DataType> {
     if let Some(data_type) = parse_vector_family_type_name(&type_name) {
         return Some(data_type);
     }
+    if let Some(data_type) = parse_decimal_type_name(&type_name) {
+        return Some(data_type);
+    }
     if let Some(data_type) = parse_bpchar_type_name(&type_name) {
         return Some(data_type);
     }
@@ -3117,10 +3130,6 @@ fn resolve_cast_type(type_name: &str) -> Option<DataType> {
         "json" => Some(DataType::Json),
         "jsonb" => Some(DataType::Jsonb),
         "xml" => Some(DataType::Xml),
-        "numeric" | "decimal" => Some(DataType::Decimal {
-            precision: None,
-            scale: None,
-        }),
         "money" => Some(DataType::Money),
         "oid" => Some(DataType::Oid),
         "regnamespace" => Some(DataType::Oid),
@@ -3142,6 +3151,34 @@ fn resolve_cast_type(type_name: &str) -> Option<DataType> {
         "polygon" => Some(DataType::Geometry(GeometryType::Polygon)),
         _ => None,
     }
+}
+
+const MAX_CAST_NUMERIC_PRECISION: u32 = 131_072;
+
+fn parse_decimal_type_name(type_name: &str) -> Option<DataType> {
+    if matches!(type_name, "numeric" | "decimal") {
+        return Some(DataType::Decimal {
+            precision: None,
+            scale: None,
+        });
+    }
+    let (base, modifiers) = parse_type_modifiers(type_name)?;
+    if !matches!(base, "numeric" | "decimal") || modifiers.is_empty() || modifiers.len() > 2 {
+        return None;
+    }
+    let precision = *modifiers.first()?;
+    if precision == 0 || precision > MAX_CAST_NUMERIC_PRECISION {
+        return None;
+    }
+    let scale = match modifiers.as_slice() {
+        [_] => Some(0),
+        [_, scale] => Some(i32::try_from(*scale).ok()?),
+        _ => return None,
+    };
+    Some(DataType::Decimal {
+        precision: Some(precision),
+        scale,
+    })
 }
 
 fn resolve_cast_type_with_catalog(type_name: &str, catalog: &dyn Catalog) -> Option<DataType> {
@@ -3197,10 +3234,23 @@ fn parse_bit_type_name(type_name: &str) -> Option<DataType> {
 }
 
 fn parse_single_type_modifier(type_name: &str) -> Option<(&str, u32)> {
+    let (base, modifiers) = parse_type_modifiers(type_name)?;
+    let [len] = modifiers.as_slice() else {
+        return None;
+    };
+    Some((base, *len))
+}
+
+fn parse_type_modifiers(type_name: &str) -> Option<(&str, Vec<u32>)> {
     let (base, rest) = type_name.split_once('(')?;
-    let len_text = rest.strip_suffix(')')?;
-    let len = len_text.parse::<u32>().ok()?;
-    Some((base, len))
+    let raw = rest.strip_suffix(')')?;
+    let modifiers = raw
+        .split(',')
+        .map(str::trim)
+        .map(str::parse::<u32>)
+        .collect::<Result<Vec<_>, _>>()
+        .ok()?;
+    Some((base, modifiers))
 }
 
 fn parse_vector_family_type_name(type_name: &str) -> Option<DataType> {
@@ -3850,6 +3900,16 @@ mod typed_literal_tests {
                 Value::Int64(15),
             ),
             (
+                lit(Value::Text("true".to_owned())),
+                DataType::Bool,
+                Value::Bool(true),
+            ),
+            (
+                lit(Value::Text("off".to_owned())),
+                DataType::Bool,
+                Value::Bool(false),
+            ),
+            (
                 lit(Value::Float32(1.25)),
                 DataType::Float64,
                 Value::Float64(1.25),
@@ -4005,6 +4065,13 @@ mod typed_literal_tests {
             let expr = coerce(input, &target);
             assert_eq!(literal_value(&expr), expected, "{target}");
         }
+
+        let decimal_target = DataType::Decimal {
+            precision: Some(8),
+            scale: Some(2),
+        };
+        let decimal_expr = coerce(lit(Value::Text("12.34".to_owned())), &decimal_target);
+        assert_eq!(literal_type(&decimal_expr), decimal_target);
 
         let enum_expr = coerce(lit(Value::Text("ok".to_owned())), &enum_type);
         assert_eq!(literal_type(&enum_expr), enum_type);
@@ -4369,6 +4436,20 @@ mod typed_literal_tests {
                 DataType::Decimal {
                     precision: None,
                     scale: None,
+                },
+            ),
+            (
+                "numeric(8,2)",
+                DataType::Decimal {
+                    precision: Some(8),
+                    scale: Some(2),
+                },
+            ),
+            (
+                "decimal(8)",
+                DataType::Decimal {
+                    precision: Some(8),
+                    scale: Some(0),
                 },
             ),
             ("money", DataType::Money),
