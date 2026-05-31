@@ -5555,6 +5555,7 @@ impl Server {
         let snapshot = self.catalog_snapshot();
         let mut rows: std::collections::HashMap<ultrasql_core::Oid, (String, TableRowSecurity)> =
             std::collections::HashMap::new();
+        let mut seen_policy_keys = std::collections::HashSet::new();
         for (line_no, line) in text.lines().enumerate() {
             if line.is_empty() || line.starts_with('#') {
                 continue;
@@ -5594,13 +5595,21 @@ impl Server {
                             line_no + 1
                         ))
                     })?);
+                    let policy_name = metadata_unescape(parts[2])?;
+                    if !seen_policy_keys.insert((oid, policy_name.to_ascii_lowercase())) {
+                        return Err(ServerError::Ddl(format!(
+                            "duplicate RLS policy metadata '{}' on line {}",
+                            policy_name,
+                            line_no + 1
+                        )));
+                    }
                     let roles = if parts.len() == 12 {
                         metadata_decode_list(&metadata_unescape(parts[11])?)?
                     } else {
                         Vec::new()
                     };
                     let policy = RuntimeRlsPolicy {
-                        name: metadata_unescape(parts[2])?,
+                        name: policy_name,
                         permissiveness: parse_rls_permissiveness(parts[3])?,
                         command: parse_rls_command(parts[4])?,
                         roles,

@@ -898,6 +898,9 @@ as a concise evidence ledger; roadmap stays for open gates only.
 - Default privileges apply matching templates for future tables and sequences.
 - Persistent RLS policies cover owner, superuser, `BYPASSRLS`, and restart
   semantics for the documented RAG tenant policy shape.
+- Row-security metadata reload rejects duplicate policy names for a table,
+  avoiding ambiguous restart state from tampered sidecar rows. Evidence:
+  `cargo test -p ultrasql-server --test rls_round_trip rls_metadata_rejects_duplicate_policy_names_on_rebuild -- --nocapture`.
 - Role-scoped RLS policies parse `CREATE POLICY ... TO role`, enforce inherited
   role membership, persist across restart, and fail closed when no scoped policy
   applies. Evidence:

@@ -440,6 +440,39 @@ async fn drop_table_removes_rls_restart_metadata() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn rls_metadata_rejects_duplicate_policy_names_on_rebuild() {
+    let data_dir = tempfile::TempDir::new().unwrap();
+    let metadata_path = data_dir.path().join("pg_row_security.meta");
+
+    let running = start_persistent_server(data_dir.path(), "rls_duplicate_policy_setup").await;
+    for sql in [
+        "CREATE TABLE rls_duplicate_policy_docs (tenant_id TEXT NOT NULL, doc_id TEXT NOT NULL)",
+        "CREATE POLICY rls_duplicate_policy_docs_tenant ON rls_duplicate_policy_docs \
+            USING (tenant_id = current_setting('ultrasql.tenant_id', true))",
+        "ALTER TABLE rls_duplicate_policy_docs ENABLE ROW LEVEL SECURITY",
+    ] {
+        running.client.batch_execute(sql).await.expect(sql);
+    }
+    graceful_shutdown(running).await;
+
+    let mut metadata = std::fs::read_to_string(&metadata_path).expect("RLS metadata exists");
+    let policy_line = metadata
+        .lines()
+        .find(|line| line.starts_with("policy\t"))
+        .expect("policy metadata row")
+        .to_owned();
+    metadata.push_str(&policy_line);
+    metadata.push('\n');
+    std::fs::write(&metadata_path, metadata).expect("duplicate policy metadata");
+
+    let err = Server::init(data_dir.path()).expect_err("duplicate RLS policy metadata rejected");
+    assert!(
+        err.to_string().contains("duplicate RLS policy metadata"),
+        "expected duplicate RLS policy metadata rejection, got {err}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn rls_policy_roles_scope_visibility_and_restart() {
     let data_dir = tempfile::TempDir::new().unwrap();
 
