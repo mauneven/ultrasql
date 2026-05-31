@@ -2211,3 +2211,6 @@ as a concise evidence ledger; roadmap stays for open gates only.
 - Binary COPY payload decoding now checks extension, field, and fixed-width
   offsets instead of saturating malformed input positions. Evidence:
   `cargo test -p ultrasql-server session::copy::tests::binary_copy_end_rejects_overflow --lib -- --nocapture`.
+- SQL/JSON path unicode escape parsing now checks escape-window offsets
+  instead of saturating parser cursor arithmetic. Evidence:
+  `cargo test -p ultrasql-executor json_path::tests::checked_hex_escape_end_rejects_overflow --lib -- --nocapture`.

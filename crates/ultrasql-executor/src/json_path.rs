@@ -1434,11 +1434,9 @@ impl<'a> JsonPathParser<'a> {
 
     fn parse_hex4(&mut self) -> Result<u32, JsonPathError> {
         let bytes = self.text.as_bytes();
-        if self.pos.saturating_add(4) > bytes.len() {
-            return Err(self.err("incomplete unicode escape"));
-        }
+        let end = checked_hex_escape_end(self.pos, bytes.len())?;
         let mut value = 0_u32;
-        for idx in self.pos..self.pos + 4 {
+        for idx in self.pos..end {
             let digit = match bytes[idx] {
                 b'0'..=b'9' => u32::from(bytes[idx] - b'0'),
                 b'a'..=b'f' => u32::from(bytes[idx] - b'a' + 10),
@@ -1447,7 +1445,7 @@ impl<'a> JsonPathParser<'a> {
             };
             value = (value << 4) | digit;
         }
-        self.pos += 4;
+        self.pos = end;
         Ok(value)
     }
 
@@ -1546,12 +1544,30 @@ fn json_path_method(name: &str) -> Result<JsonPathMethod, JsonPathError> {
     }
 }
 
+fn checked_hex_escape_end(pos: usize, len: usize) -> Result<usize, JsonPathError> {
+    let end = pos.checked_add(4).ok_or_else(|| {
+        JsonPathError::new(format!("unicode escape offset overflow at byte {pos}"))
+    })?;
+    if end > len {
+        return Err(JsonPathError::new(format!(
+            "incomplete unicode escape at byte {pos}"
+        )));
+    }
+    Ok(end)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn select(root: &JsonValue, path: &JsonPath) -> Vec<JsonValue> {
         select_json_path(root, path).expect("json path select")
+    }
+
+    #[test]
+    fn checked_hex_escape_end_rejects_overflow() {
+        let err = checked_hex_escape_end(usize::MAX, 0).unwrap_err();
+        assert!(err.to_string().contains("unicode escape offset overflow"));
     }
 
     #[test]
