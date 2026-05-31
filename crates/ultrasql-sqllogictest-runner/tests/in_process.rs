@@ -496,8 +496,8 @@ fn sql_regression_index_constraint_operator_baseline_is_imported_and_provenanced
         );
     }
     assert!(
-        text.contains("# ultrasql:skip full PostgreSQL opr_sanity catalog/operator invariant"),
-        "{} must keep full catalog/operator sanity debt explicit",
+        !text.contains("# ultrasql:skip full PostgreSQL opr_sanity catalog/operator invariant"),
+        "{} must keep active operator sanity coverage instead of a stale EOF skip",
         shard.display()
     );
     let case_count = count_slt_cases(&text);

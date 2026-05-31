@@ -1704,3 +1704,11 @@ as a concise evidence ledger; roadmap stays for open gates only.
   and missing functions while preserving valid `ultrasql` database and
   `pg_proc` built-in function grants. Evidence:
   `cargo test -p ultrasql-server --test privilege_catalog_round_trip -- --nocapture`.
+- SQL regression roadmap drift cleanup removed the stale EOF
+  `ultrasql:skip full PostgreSQL opr_sanity catalog/operator invariant` from
+  the index/constraint/operator shard. The shard still executes with zero
+  skipped cases and provenance now rejects reintroducing that stale skip.
+  Evidence:
+  `cargo run -p ultrasql-sqllogictest-runner -- --mode in-process tests/slt/sql_regression/regression_subset/index_constraint_operator_baseline.slt`
+  and
+  `cargo test -p ultrasql-sqllogictest-runner --test in_process sql_regression_index_constraint_operator_baseline_is_imported_and_provenanced -- --nocapture`.
