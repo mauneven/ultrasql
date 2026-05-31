@@ -486,6 +486,7 @@ impl IndexFixture {
             catalog_snapshot: self.catalog.snapshot(),
             table_constraints: StdArc::new(dashmap::DashMap::new()),
             sequences: StdArc::new(dashmap::DashMap::new()),
+            sequence_owners: StdArc::new(dashmap::DashMap::new()),
             operators: StdArc::new(dashmap::DashMap::new()),
             role_catalog: StdArc::new(crate::auth::InMemoryAuthCatalog::with_bootstrap_superuser()),
             privilege_catalog: StdArc::new(crate::auth::InMemoryPrivilegeCatalog::new()),

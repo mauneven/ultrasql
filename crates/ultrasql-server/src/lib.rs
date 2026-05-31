@@ -2723,6 +2723,8 @@ pub struct Server {
     pub row_security: Arc<dashmap::DashMap<ultrasql_core::Oid, Arc<TableRowSecurity>>>,
     /// Same-process sequence registry keyed by folded sequence name.
     pub sequences: Arc<dashmap::DashMap<String, Arc<ultrasql_storage::sequence::Sequence>>>,
+    /// Runtime sequence owners keyed by folded sequence name.
+    pub sequence_owners: Arc<dashmap::DashMap<String, String>>,
     /// Same-process user-defined operator registry keyed by signature.
     pub operators: Arc<dashmap::DashMap<String, Arc<RuntimeOperator>>>,
     /// Same-process append-only materialized-view registry keyed by view name.
@@ -3991,6 +3993,7 @@ impl Server {
             catalog_snapshot,
             table_constraints: Arc::clone(&self.table_constraints),
             sequences: Arc::clone(&self.sequences),
+            sequence_owners: Arc::clone(&self.sequence_owners),
             operators: Arc::clone(&self.operators),
             role_catalog: Arc::clone(&self.role_catalog),
             privilege_catalog: Arc::clone(&self.privilege_catalog),
@@ -4119,6 +4122,7 @@ impl Server {
             domain_constraints: Arc::new(dashmap::DashMap::new()),
             row_security: Arc::new(dashmap::DashMap::new()),
             sequences: Arc::new(dashmap::DashMap::new()),
+            sequence_owners: Arc::new(dashmap::DashMap::new()),
             operators: Arc::new(dashmap::DashMap::new()),
             materialized_views: Arc::new(dashmap::DashMap::new()),
             columnar_storage: Arc::new(columnar_storage::ColumnarSecondaryStore::new()),
@@ -4523,6 +4527,7 @@ impl Server {
         let heap = Arc::new(HeapAccess::new(Arc::clone(&pool)));
         let vm = Arc::new(VisibilityMap::new());
         let sequences = Arc::new(dashmap::DashMap::new());
+        let sequence_owners = Arc::new(dashmap::DashMap::new());
 
         // 4. Replay existing WAL before accepting new appends. The recovery
         // target restores heap/index pages through `HeapAccess` and sequence
@@ -4596,6 +4601,7 @@ impl Server {
             domain_constraints: Arc::new(dashmap::DashMap::new()),
             row_security: Arc::new(dashmap::DashMap::new()),
             sequences,
+            sequence_owners,
             operators: Arc::new(dashmap::DashMap::new()),
             materialized_views: Arc::new(dashmap::DashMap::new()),
             columnar_storage: Arc::new(columnar_storage::ColumnarSecondaryStore::new()),
@@ -4635,6 +4641,7 @@ impl Server {
         server.rebuild_table_runtime_constraint_sidecars()?;
         server.rebuild_role_metadata()?;
         server.rebuild_privilege_metadata()?;
+        server.rebuild_sequence_owner_metadata()?;
         server.rebuild_operator_metadata()?;
         server.rebuild_row_security_sidecars()?;
         server.rebuild_materialized_view_runtime_sidecars()?;
@@ -5686,6 +5693,89 @@ impl Server {
         }
         self.privilege_catalog
             .install_snapshot(grants, default_grants);
+        Ok(())
+    }
+
+    fn sequence_owner_metadata_path(&self) -> Option<std::path::PathBuf> {
+        self.data_dir
+            .as_ref()
+            .map(|dir| dir.join("pg_sequence_owner.meta"))
+    }
+
+    pub(crate) fn persist_sequence_owner_metadata(&self) -> Result<(), ServerError> {
+        let Some(path) = self.sequence_owner_metadata_path() else {
+            return Ok(());
+        };
+        let mut owners = self
+            .sequence_owners
+            .iter()
+            .map(|entry| (entry.key().clone(), entry.value().clone()))
+            .collect::<Vec<_>>();
+        owners.sort_by(|left, right| left.0.cmp(&right.0));
+
+        let mut out = String::from("# ultrasql sequence owners v1\n");
+        for (sequence_name, owner_role) in owners {
+            if self.sequences.contains_key(&sequence_name) {
+                out.push_str(&format!(
+                    "sequence\t{}\t{}\n",
+                    metadata_escape(&sequence_name),
+                    metadata_escape(&owner_role)
+                ));
+            }
+        }
+        write_runtime_metadata_file(&path, &out)
+    }
+
+    fn rebuild_sequence_owner_metadata(&self) -> Result<(), ServerError> {
+        let Some(path) = self.sequence_owner_metadata_path() else {
+            return Ok(());
+        };
+        let Some(text) = read_runtime_metadata_file(&path)? else {
+            return Ok(());
+        };
+
+        let mut owners = Vec::new();
+        let mut seen_sequences = std::collections::HashSet::new();
+        for (line_no, line) in text.lines().enumerate() {
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            let parts = line.split('\t').collect::<Vec<_>>();
+            if parts.len() != 3 || parts.first().copied() != Some("sequence") {
+                return Err(ServerError::ddl(format!(
+                    "malformed sequence owner metadata line {}",
+                    line_no + 1
+                )));
+            }
+            let sequence_name = metadata_unescape(parts[1])?.to_ascii_lowercase();
+            let owner_role = metadata_unescape(parts[2])?.to_ascii_lowercase();
+            if sequence_name.is_empty() || owner_role.is_empty() {
+                return Err(ServerError::ddl(format!(
+                    "empty sequence owner metadata field on line {}",
+                    line_no + 1
+                )));
+            }
+            if !seen_sequences.insert(sequence_name.clone()) {
+                return Err(ServerError::ddl(format!(
+                    "duplicate sequence owner metadata '{}' on line {}",
+                    sequence_name,
+                    line_no + 1
+                )));
+            }
+            if !self.sequences.contains_key(&sequence_name) {
+                tracing::warn!(
+                    sequence = %sequence_name,
+                    line = line_no + 1,
+                    "ignoring stale sequence owner metadata for missing sequence",
+                );
+                continue;
+            }
+            owners.push((sequence_name, owner_role));
+        }
+        self.sequence_owners.clear();
+        for (sequence_name, owner_role) in owners {
+            self.sequence_owners.insert(sequence_name, owner_role);
+        }
         Ok(())
     }
 
@@ -7578,6 +7668,7 @@ fn run_plan_in_txn(
     catalog_snapshot: Arc<CatalogSnapshot>,
     table_constraints: Arc<dashmap::DashMap<ultrasql_core::Oid, Arc<TableRuntimeConstraints>>>,
     sequences: Arc<dashmap::DashMap<String, Arc<ultrasql_storage::sequence::Sequence>>>,
+    sequence_owners: Arc<dashmap::DashMap<String, String>>,
     operators: Arc<dashmap::DashMap<String, Arc<RuntimeOperator>>>,
     role_catalog: Arc<auth::InMemoryAuthCatalog>,
     privilege_catalog: Arc<auth::InMemoryPrivilegeCatalog>,
@@ -7624,6 +7715,7 @@ fn run_plan_in_txn(
         catalog_snapshot,
         table_constraints,
         sequences,
+        sequence_owners,
         operators,
         role_catalog,
         privilege_catalog,

@@ -95,6 +95,16 @@ where
         self.state
             .sequences
             .insert(sequence_name.clone(), Arc::new(seq));
+        self.state.sequence_owners.insert(
+            sequence_name.to_ascii_lowercase(),
+            self.current_user.to_ascii_lowercase(),
+        );
+        if let Err(err) = self.state.persist_sequence_owner_metadata() {
+            self.state
+                .sequence_owners
+                .remove(&sequence_name.to_ascii_lowercase());
+            return Err(err);
+        }
         let before_grants = self.state.privilege_catalog.list_grants();
         let before_default_grants = self.state.privilege_catalog.list_default_grants();
         self.state.privilege_catalog.apply_default_privileges(
@@ -216,6 +226,9 @@ where
                 .map_err(|e| ServerError::ddl(format!("DROP SEQUENCE WAL: {e}")))?;
             }
             self.state.sequences.remove(name);
+            self.state
+                .sequence_owners
+                .remove(&name.to_ascii_lowercase());
             self.sequence_state.forget(name);
             privilege_grants_removed |= self
                 .state
@@ -225,6 +238,7 @@ where
         if privilege_grants_removed {
             self.state.persist_privilege_metadata()?;
         }
+        self.state.persist_sequence_owner_metadata()?;
         self.plan_cache_invalidate();
         Ok(result_encoder::run_ddl_command("DROP SEQUENCE"))
     }

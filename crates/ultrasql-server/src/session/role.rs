@@ -200,6 +200,12 @@ where
             }
         }
 
+        for owner in self.state.sequence_owners.iter() {
+            if owner.value().eq_ignore_ascii_case(&role) {
+                dependencies.push(format!("sequence {}", owner.key()));
+            }
+        }
+
         for membership in self.state.role_catalog.list_memberships() {
             if membership.role.eq_ignore_ascii_case(&role) {
                 dependencies.push(format!("role membership granted to {}", membership.member));

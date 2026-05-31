@@ -2100,10 +2100,14 @@ fn rows_pg_sequences(ctx: &LowerCtx<'_>) -> Vec<Vec<Value>> {
     seqs.into_iter()
         .map(|(name, seq)| {
             let opts = seq.options_snapshot();
+            let owner = ctx
+                .sequence_owners
+                .get(&name)
+                .map_or_else(|| "ultrasql".to_owned(), |entry| entry.value().clone());
             vec![
                 v_text("public"),
                 v_text(name),
-                v_text("ultrasql"),
+                v_text(owner),
                 v_text("bigint"),
                 Value::Int64(opts.start),
                 Value::Int64(seq.min_value()),

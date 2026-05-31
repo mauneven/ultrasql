@@ -87,6 +87,52 @@ async fn dropped_sequence_stays_dropped_after_restart() {
     graceful_shutdown(running).await;
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn sequence_owner_survives_restart_in_catalog_views() {
+    let data_dir = tempfile::TempDir::new().expect("temp data dir");
+
+    let running = start_persistent_server(data_dir.path(), "sequence_owner_restart_setup").await;
+    running
+        .client
+        .batch_execute(
+            "CREATE ROLE tester SUPERUSER LOGIN; \
+             CREATE ROLE persisted_sequence_owner LOGIN; \
+             SET ROLE persisted_sequence_owner; \
+             CREATE SEQUENCE persisted_owner_sequence; \
+             RESET ROLE",
+        )
+        .await
+        .expect("create owned sequence");
+    let owner = running
+        .client
+        .query_one(
+            "SELECT sequenceowner \
+             FROM pg_catalog.pg_sequences \
+             WHERE sequencename = 'persisted_owner_sequence'",
+            &[],
+        )
+        .await
+        .expect("query sequence owner before restart")
+        .get::<_, String>(0);
+    assert_eq!(owner, "persisted_sequence_owner");
+    graceful_shutdown(running).await;
+
+    let running = start_persistent_server(data_dir.path(), "sequence_owner_restart_verify").await;
+    let owner = running
+        .client
+        .query_one(
+            "SELECT sequenceowner \
+             FROM pg_catalog.pg_sequences \
+             WHERE sequencename = 'persisted_owner_sequence'",
+            &[],
+        )
+        .await
+        .expect("query sequence owner after restart")
+        .get::<_, String>(0);
+    assert_eq!(owner, "persisted_sequence_owner");
+    graceful_shutdown(running).await;
+}
+
 #[tokio::test]
 async fn alter_sequence_changes_increment() {
     let running = start_sample_server("sequence_test").await;

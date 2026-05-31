@@ -713,6 +713,43 @@ async fn drop_role_rejects_owned_table_until_object_is_dropped() {
     shutdown(running).await;
 }
 
+#[tokio::test]
+async fn drop_role_rejects_owned_sequence_until_object_is_dropped() {
+    let running = start_sample_server("role_ddl_test").await;
+    let client = &running.client;
+
+    client
+        .batch_execute("CREATE ROLE tester SUPERUSER LOGIN")
+        .await
+        .expect("register tester role");
+    client
+        .batch_execute(
+            "CREATE ROLE sequence_owner LOGIN; \
+             SET ROLE sequence_owner; \
+             CREATE SEQUENCE role_owned_sequence; \
+             RESET ROLE",
+        )
+        .await
+        .expect("create owned sequence");
+
+    let restricted = client
+        .batch_execute("DROP ROLE sequence_owner")
+        .await
+        .expect_err("owned sequence must block DROP ROLE");
+    assert_eq!(restricted.code().expect("SQLSTATE").code(), "2BP01");
+
+    client
+        .batch_execute("DROP SEQUENCE role_owned_sequence")
+        .await
+        .expect("drop owned sequence");
+    client
+        .batch_execute("DROP ROLE sequence_owner")
+        .await
+        .expect("drop role after owned sequence removed");
+
+    shutdown(running).await;
+}
+
 fn assert_insufficient_privilege(err: tokio_postgres::Error) {
     let db = err.as_db_error().expect("database error");
     assert_eq!(
