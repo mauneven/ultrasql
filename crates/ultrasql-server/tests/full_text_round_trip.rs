@@ -1,0 +1,53 @@
+//! Wire-level full-text scalar surface coverage.
+
+mod support;
+
+use support::{shutdown, start_sample_server};
+use tokio_postgres::SimpleQueryMessage;
+
+fn simple_rows(messages: Vec<SimpleQueryMessage>) -> Vec<Vec<String>> {
+    messages
+        .into_iter()
+        .filter_map(|message| match message {
+            SimpleQueryMessage::Row(row) => Some(
+                (0..row.len())
+                    .map(|idx| row.get(idx).expect("column").to_owned())
+                    .collect(),
+            ),
+            _ => None,
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn full_text_constructors_match_and_rank_over_wire() {
+    let running = start_sample_server("full_text_test").await;
+    let client = &running.client;
+
+    let rows = simple_rows(
+        client
+            .simple_query(
+                "SELECT \
+                    to_tsvector('The Quick brown fox'), \
+                    plainto_tsquery('Quick fox'), \
+                    to_tsvector('The Quick brown fox') @@ plainto_tsquery('quick fox'), \
+                    to_tsvector('The Quick brown fox') @@ plainto_tsquery('missing'), \
+                    ts_rank(to_tsvector('The Quick brown fox'), plainto_tsquery('quick missing')) > 0.4",
+            )
+            .await
+            .expect("full-text query"),
+    );
+
+    assert_eq!(
+        rows,
+        vec![vec![
+            "the:1 quick:2 brown:3 fox:4".to_owned(),
+            "quick & fox".to_owned(),
+            "t".to_owned(),
+            "f".to_owned(),
+            "t".to_owned(),
+        ]]
+    );
+
+    shutdown(running).await;
+}

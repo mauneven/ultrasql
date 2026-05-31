@@ -1466,10 +1466,32 @@ fn builtin_return_type(func_name: &str, args: &[ScalarExpr]) -> Result<DataType,
         "length" | "position" | "bit_length" | "octet_length" | "get_bit" => Ok(DataType::Int32),
         "bit_count" => Ok(DataType::Int64),
         "set_bit" => Ok(DataType::VarBit { max_len: None }),
-        "lower" | "upper" | "trim" | "lpad" | "rpad" | "left" | "right" | "substr"
-        | "substring" | "replace" | "split_part" | "concat" | "concat_ws" | "repeat"
-        | "reverse" | "md5" | "sha256" | "quote_ident" | "quote_literal" | "format"
-        | "regexp_replace" => Ok(DataType::Text { max_len: None }),
+        "lower"
+        | "upper"
+        | "trim"
+        | "lpad"
+        | "rpad"
+        | "left"
+        | "right"
+        | "substr"
+        | "substring"
+        | "replace"
+        | "split_part"
+        | "concat"
+        | "concat_ws"
+        | "repeat"
+        | "reverse"
+        | "md5"
+        | "sha256"
+        | "quote_ident"
+        | "quote_literal"
+        | "format"
+        | "regexp_replace"
+        | "to_tsvector"
+        | "plainto_tsquery"
+        | "websearch_to_tsquery"
+        | "phraseto_tsquery" => Ok(DataType::Text { max_len: None }),
+        "ts_rank" => Ok(DataType::Float64),
         "row_to_json" | "json_build_object" | "jsonb_set" => Ok(DataType::Jsonb),
         "jsonb_path_exists"
         | "xml_is_well_formed"
@@ -1606,6 +1628,11 @@ pub(super) fn is_supported_builtin(func_name: &str) -> bool {
             | "quote_literal"
             | "format"
             | "regexp_replace"
+            | "to_tsvector"
+            | "plainto_tsquery"
+            | "websearch_to_tsquery"
+            | "phraseto_tsquery"
+            | "ts_rank"
             | "row_to_json"
             | "json_build_object"
             | "jsonb_set"
@@ -1687,6 +1714,10 @@ fn validate_builtin_args(func_name: &str, args: &mut [ScalarExpr]) -> Result<(),
         "vector_norm" | "l2_norm" => validate_vector_norm_args(func_name, args),
         "vector_dims" => validate_vector_dims_args(args),
         "jsonb_path_exists" => validate_jsonb_path_exists_args(args),
+        "to_tsvector" | "plainto_tsquery" | "websearch_to_tsquery" | "phraseto_tsquery" => {
+            validate_text_search_constructor_args(func_name, args)
+        }
+        "ts_rank" => validate_ts_rank_args(args),
         "xmlparse" => validate_xmlparse_args(args),
         "xmlserialize" => validate_xmlserialize_args(args),
         "xml_is_well_formed" | "xml_is_well_formed_content" | "xml_is_well_formed_document" => {
@@ -1889,6 +1920,38 @@ fn validate_xpath_args(func_name: &str, args: &[ScalarExpr]) -> Result<(), PlanE
     validate_text_or_xml_arg(func_name, &args[1])
 }
 
+fn validate_text_search_constructor_args(
+    func_name: &str,
+    args: &[ScalarExpr],
+) -> Result<(), PlanError> {
+    match args.len() {
+        1 => validate_text_arg(func_name, &args[0]),
+        2 => {
+            validate_text_arg(func_name, &args[0])?;
+            validate_text_arg(func_name, &args[1])
+        }
+        n => Err(PlanError::TypeMismatch(format!(
+            "{func_name}: expected 1 or 2 arguments, got {n}"
+        ))),
+    }
+}
+
+fn validate_ts_rank_args(args: &[ScalarExpr]) -> Result<(), PlanError> {
+    match args.len() {
+        2 => {
+            validate_text_arg("ts_rank", &args[0])?;
+            validate_text_arg("ts_rank", &args[1])
+        }
+        3 => {
+            validate_text_arg("ts_rank", &args[1])?;
+            validate_text_arg("ts_rank", &args[2])
+        }
+        n => Err(PlanError::TypeMismatch(format!(
+            "ts_rank: expected 2 or 3 arguments, got {n}"
+        ))),
+    }
+}
+
 fn validate_xml_mode_arg(func_name: &str, arg: &ScalarExpr) -> Result<(), PlanError> {
     let Some(mode) = literal_text_arg(arg) else {
         return Err(PlanError::TypeMismatch(format!(
@@ -1920,6 +1983,16 @@ fn validate_text_or_xml_arg(func_name: &str, arg: &ScalarExpr) -> Result<(), Pla
     }
     Err(PlanError::TypeMismatch(format!(
         "{func_name}: expected text or xml, got {data_type}"
+    )))
+}
+
+fn validate_text_arg(func_name: &str, arg: &ScalarExpr) -> Result<(), PlanError> {
+    let data_type = arg.data_type();
+    if matches!(data_type, DataType::Null) || data_type.is_textlike() {
+        return Ok(());
+    }
+    Err(PlanError::TypeMismatch(format!(
+        "{func_name}: expected text, got {data_type}"
     )))
 }
 
@@ -3914,6 +3987,9 @@ mod typed_literal_tests {
             ("bit_count", Vec::new(), DataType::Int64),
             ("set_bit", Vec::new(), DataType::VarBit { max_len: None }),
             ("lower", Vec::new(), text.clone()),
+            ("to_tsvector", Vec::new(), text.clone()),
+            ("plainto_tsquery", Vec::new(), text.clone()),
+            ("ts_rank", Vec::new(), DataType::Float64),
             ("row_to_json", Vec::new(), DataType::Jsonb),
             ("jsonb_path_exists", Vec::new(), DataType::Bool),
             (
@@ -3992,6 +4068,23 @@ mod typed_literal_tests {
         );
         assert!(validate_builtin_args("to_regtype", &mut [null_arg(text.clone())]).is_ok());
         assert!(validate_builtin_args("to_regtype", &mut [null_arg(DataType::Int32)]).is_err());
+        assert!(validate_builtin_args("to_tsvector", &mut [null_arg(text.clone())]).is_ok());
+        assert!(
+            validate_builtin_args(
+                "to_tsvector",
+                &mut [null_arg(text.clone()), null_arg(text.clone())]
+            )
+            .is_ok()
+        );
+        assert!(validate_builtin_args("to_tsvector", &mut [null_arg(DataType::Int32)]).is_err());
+        assert!(
+            validate_builtin_args(
+                "ts_rank",
+                &mut [null_arg(text.clone()), null_arg(text.clone())]
+            )
+            .is_ok()
+        );
+        assert!(validate_builtin_args("ts_rank", &mut [null_arg(text.clone())]).is_err());
         assert!(
             validate_builtin_args(
                 "has_column_privilege",

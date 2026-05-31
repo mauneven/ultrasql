@@ -321,6 +321,11 @@ fn eval_function_call(
         "quote_literal" => eval_quote_literal(args),
         "format" => eval_format(args),
         "regexp_replace" => eval_regexp_replace(args),
+        "to_tsvector" => eval_to_tsvector(args),
+        "plainto_tsquery" | "websearch_to_tsquery" | "phraseto_tsquery" => {
+            eval_plain_tsquery(name, args)
+        }
+        "ts_rank" => eval_ts_rank(args),
         "ifnull" | "nvl" => eval_ifnull(args),
         "nullif" => eval_nullif(args),
         "least" => eval_extremum(args, "least", ExtremumKind::Least, NullPolicy::Ignore),
@@ -3815,6 +3820,82 @@ fn text_search_terms(text: &str) -> Vec<String> {
         .collect()
 }
 
+fn text_search_payload_arg<'a>(
+    func_name: &str,
+    args: &'a [Value],
+) -> Result<Option<&'a str>, EvalError> {
+    let payload = match args.len() {
+        1 => &args[0],
+        2 => &args[1],
+        n => {
+            return Err(EvalError::Type(format!(
+                "{func_name}: expected 1 or 2 args, got {n}"
+            )));
+        }
+    };
+    match payload {
+        Value::Null => Ok(None),
+        Value::Text(text) | Value::Char(text) => Ok(Some(text.as_str())),
+        other => Err(EvalError::Type(format!(
+            "{func_name}: text argument required, got {:?}",
+            other.data_type()
+        ))),
+    }
+}
+
+fn eval_to_tsvector(args: &[Value]) -> Result<Value, EvalError> {
+    let Some(text) = text_search_payload_arg("to_tsvector", args)? else {
+        return Ok(Value::Null);
+    };
+    let lexemes = text_search_terms(text)
+        .into_iter()
+        .enumerate()
+        .map(|(idx, term)| format!("{term}:{}", idx + 1))
+        .collect::<Vec<_>>();
+    Ok(Value::Text(lexemes.join(" ")))
+}
+
+fn eval_plain_tsquery(func_name: &str, args: &[Value]) -> Result<Value, EvalError> {
+    let Some(text) = text_search_payload_arg(func_name, args)? else {
+        return Ok(Value::Null);
+    };
+    Ok(Value::Text(text_search_terms(text).join(" & ")))
+}
+
+fn eval_ts_rank(args: &[Value]) -> Result<Value, EvalError> {
+    let (vector, query) = match args.len() {
+        2 => (&args[0], &args[1]),
+        3 => (&args[1], &args[2]),
+        n => {
+            return Err(EvalError::Type(format!(
+                "ts_rank: expected 2 or 3 args, got {n}"
+            )));
+        }
+    };
+    let (Value::Text(vector), Value::Text(query)) = (vector, query) else {
+        if matches!(vector, Value::Null) || matches!(query, Value::Null) {
+            return Ok(Value::Null);
+        }
+        return Err(EvalError::Type(format!(
+            "ts_rank: text-backed TSVECTOR and TSQUERY required, got {:?} and {:?}",
+            vector.data_type(),
+            query.data_type()
+        )));
+    };
+    let vector_terms = text_search_terms(vector);
+    let query_terms = text_search_terms(query);
+    if query_terms.is_empty() {
+        return Ok(Value::Float64(0.0));
+    }
+    let matched = query_terms
+        .iter()
+        .filter(|term| vector_terms.contains(term))
+        .count();
+    let matched = u32::try_from(matched).map_or(f64::from(u32::MAX), f64::from);
+    let total = u32::try_from(query_terms.len()).map_or(f64::from(u32::MAX), f64::from);
+    Ok(Value::Float64(matched / total))
+}
+
 fn overlaps_values(left: &Value, right: &Value) -> Option<bool> {
     match (left, right) {
         (Value::Range(l), Value::Range(r)) => Some(l.overlaps(r)),
@@ -7083,6 +7164,39 @@ mod tests {
             lit_text("quick & fox"),
         ));
         assert_eq!(ev.eval(&[]).unwrap(), Value::Bool(true));
+    }
+
+    #[test]
+    fn text_search_constructor_functions_evaluate() {
+        let vector = Eval::new(call(
+            "to_tsvector",
+            vec![lit_text("The Quick brown fox")],
+            DataType::Text { max_len: None },
+        ))
+        .eval(&[])
+        .unwrap();
+        assert_eq!(vector, Value::Text("the:1 quick:2 brown:3 fox:4".into()));
+
+        let query = Eval::new(call(
+            "plainto_tsquery",
+            vec![lit_text("Quick fox")],
+            DataType::Text { max_len: None },
+        ))
+        .eval(&[])
+        .unwrap();
+        assert_eq!(query, Value::Text("quick & fox".into()));
+
+        let rank = Eval::new(call(
+            "ts_rank",
+            vec![
+                lit_text("the:1 quick:2 brown:3 fox:4"),
+                lit_text("quick & missing"),
+            ],
+            DataType::Float64,
+        ))
+        .eval(&[])
+        .unwrap();
+        assert_eq!(rank, Value::Float64(0.5));
     }
 
     // -----------------------------------------------------------------------
