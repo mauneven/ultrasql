@@ -196,6 +196,11 @@ as a concise evidence ledger; roadmap stays for open gates only.
   `cargo test -p ultrasql-server --test isolation_suite_round_trip hermitage_g2_serializable_write_skew_aborts_one_wire -- --nocapture`,
   and
   `cargo test -p ultrasql-server --test isolation_suite_round_trip serializable_indexed_disjoint_row_updates_both_commit_wire -- --nocapture`.
+- Serializable predicate locks now split fully supported multi-column `AND`
+  predicates into per-column range tags for reads and delete/update write
+  conflict targeting, while unsupported conjunction terms still force the
+  conservative relation fallback. Evidence:
+  `cargo test -p ultrasql-server serializable::tests:: --lib -- --nocapture`.
 - Constant `SELECT` result execution now propagates scalar evaluation failures
   instead of silently returning NULL. Evidence:
   `cargo test -p ultrasql-executor result_propagates_constant_eval_errors`.

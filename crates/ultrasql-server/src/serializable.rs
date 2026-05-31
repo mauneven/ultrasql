@@ -6,7 +6,7 @@
 
 use ultrasql_catalog::{CatalogSnapshot, TableEntry};
 use ultrasql_core::{DataType, RelationId};
-use ultrasql_planner::{LogicalPlan, ScalarExpr};
+use ultrasql_planner::{BinaryOp, LogicalPlan, ScalarExpr};
 use ultrasql_txn::{IsolationLevel, PredicateLockTag, Transaction, TransactionManager};
 
 use crate::pipeline;
@@ -43,8 +43,8 @@ fn collect_serializable_read_locks(
             }
         }
         LogicalPlan::Filter { input, predicate } => {
-            if let Some(tag) = column_range_tag_for_filter(input, predicate, catalog_snapshot) {
-                out.push(tag);
+            if let Some(tags) = column_range_tags_for_filter(input, predicate, catalog_snapshot) {
+                out.extend(tags);
             } else {
                 collect_serializable_read_locks(input, catalog_snapshot, out);
             }
@@ -210,45 +210,68 @@ fn input_write_conflict_tags(
     input: &LogicalPlan,
     catalog_snapshot: &CatalogSnapshot,
 ) -> Option<Vec<PredicateLockTag>> {
-    let tag = match input {
+    match input {
         LogicalPlan::Filter { input, predicate } => {
-            column_range_tag_for_filter(input, predicate, catalog_snapshot)?
+            let tags = column_range_tags_for_filter(input, predicate, catalog_snapshot)?;
+            if tags.iter().any(|tag| !tag_matches_entry(tag, entry)) {
+                return None;
+            }
+            let locked_columns = tags
+                .iter()
+                .filter_map(column_range_tag_column)
+                .collect::<Vec<_>>();
+            let mut out = tags;
+            for tag in table_column_range_write_tags_except_any(entry, &locked_columns) {
+                out.push(tag);
+            }
+            Some(out)
         }
         LogicalPlan::Project { input, .. }
         | LogicalPlan::Limit { input, .. }
         | LogicalPlan::Sort { input, .. }
         | LogicalPlan::LockRows { input, .. } => {
-            return input_write_conflict_tags(entry, input, catalog_snapshot);
+            input_write_conflict_tags(entry, input, catalog_snapshot)
         }
-        LogicalPlan::Scan { table, .. } if table.eq_ignore_ascii_case(&entry.name) => {
-            return None;
-        }
-        _ => return None,
-    };
-    if !tag_matches_entry(&tag, entry) {
-        return None;
+        LogicalPlan::Scan { table, .. } if table.eq_ignore_ascii_case(&entry.name) => None,
+        _ => None,
     }
-    let mut tags = vec![tag.clone()];
-    if let Some(locked_column) = column_range_tag_column(&tag) {
-        tags.extend(table_column_range_write_tags_except(
-            entry,
-            Some(locked_column),
-        ));
-    }
-    Some(tags)
 }
 
-fn column_range_tag_for_filter(
+fn column_range_tags_for_filter(
     input: &LogicalPlan,
     predicate: &ScalarExpr,
     catalog_snapshot: &CatalogSnapshot,
-) -> Option<PredicateLockTag> {
+) -> Option<Vec<PredicateLockTag>> {
     let LogicalPlan::Scan { table, .. } = input else {
         return None;
     };
     let entry = catalog_snapshot.tables.get(table)?;
-    let (column, range) = pipeline::match_indexable_predicate(predicate)?;
-    column_range_tag(entry, column, range.low, range.high)
+    let mut tags = Vec::new();
+    collect_column_range_tags_for_predicate(entry, predicate, &mut tags)?;
+    dedup_predicate_tags(&mut tags);
+    (!tags.is_empty()).then_some(tags)
+}
+
+fn collect_column_range_tags_for_predicate(
+    entry: &TableEntry,
+    predicate: &ScalarExpr,
+    out: &mut Vec<PredicateLockTag>,
+) -> Option<()> {
+    if let Some((column, range)) = pipeline::match_indexable_predicate(predicate) {
+        out.push(column_range_tag(entry, column, range.low, range.high)?);
+        return Some(());
+    }
+    let ScalarExpr::Binary {
+        op: BinaryOp::And,
+        left,
+        right,
+        ..
+    } = predicate
+    else {
+        return None;
+    };
+    collect_column_range_tags_for_predicate(entry, left, out)?;
+    collect_column_range_tags_for_predicate(entry, right, out)
 }
 
 fn table_column_range_write_tags(entry: &TableEntry) -> Vec<PredicateLockTag> {
@@ -259,6 +282,22 @@ fn table_column_range_write_tags_except(
     entry: &TableEntry,
     excluded_column: Option<u16>,
 ) -> Vec<PredicateLockTag> {
+    table_column_range_write_tags_except_matching(entry, |column| Some(column) == excluded_column)
+}
+
+fn table_column_range_write_tags_except_any(
+    entry: &TableEntry,
+    excluded_columns: &[u16],
+) -> Vec<PredicateLockTag> {
+    table_column_range_write_tags_except_matching(entry, |column| {
+        excluded_columns.contains(&column)
+    })
+}
+
+fn table_column_range_write_tags_except_matching(
+    entry: &TableEntry,
+    is_excluded: impl Fn(u16) -> bool,
+) -> Vec<PredicateLockTag> {
     let mut tags = entry
         .schema
         .fields()
@@ -266,7 +305,7 @@ fn table_column_range_write_tags_except(
         .enumerate()
         .filter_map(|(idx, _)| {
             let column = u16::try_from(idx).ok()?;
-            (Some(column) != excluded_column).then(|| column_range_tag(entry, idx, None, None))?
+            (!is_excluded(column)).then(|| column_range_tag(entry, idx, None, None))?
         })
         .collect::<Vec<_>>();
     tags.retain(|tag| matches!(tag, PredicateLockTag::ColumnRange { .. }));
@@ -344,4 +383,176 @@ const fn data_type_supports_range_lock(data_type: &DataType) -> bool {
             | DataType::Timestamp
             | DataType::TimestampTz
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+
+    use ultrasql_catalog::CatalogSnapshot;
+    use ultrasql_core::{Field, Oid, Schema, Value};
+    use ultrasql_planner::{BinaryOp, LogicalPlan, ScalarExpr};
+    use ultrasql_txn::PredicateLockTag;
+
+    use super::*;
+
+    fn test_schema() -> Schema {
+        Schema::new([
+            Field::required("a", DataType::Int32),
+            Field::required("b", DataType::Int32),
+        ])
+        .expect("test schema is valid")
+    }
+
+    fn test_snapshot() -> CatalogSnapshot {
+        let entry = TableEntry::new(Oid::new(42), "t", "public", test_schema());
+        let mut tables = HashMap::new();
+        tables.insert("t".to_owned(), entry.clone());
+        let mut tables_by_oid = HashMap::new();
+        tables_by_oid.insert(entry.oid, entry);
+        CatalogSnapshot {
+            tables,
+            tables_by_oid,
+            indexes: HashMap::new(),
+            indexes_by_table: HashMap::new(),
+            enum_types: HashMap::new(),
+            enum_types_by_oid: HashMap::new(),
+            composite_types: HashMap::new(),
+            composite_types_by_oid: HashMap::new(),
+            domain_types: HashMap::new(),
+            domain_types_by_oid: HashMap::new(),
+            descriptions: HashMap::new(),
+            statistics: HashMap::new(),
+            statistic_ext: HashMap::new(),
+        }
+    }
+
+    fn scan() -> LogicalPlan {
+        LogicalPlan::Scan {
+            table: "t".to_owned(),
+            schema: test_schema(),
+            projection: None,
+        }
+    }
+
+    fn col(index: usize, name: &str) -> ScalarExpr {
+        ScalarExpr::Column {
+            name: name.to_owned(),
+            index,
+            data_type: DataType::Int32,
+        }
+    }
+
+    fn lit_i32(value: i32) -> ScalarExpr {
+        ScalarExpr::Literal {
+            value: Value::Int32(value),
+            data_type: DataType::Int32,
+        }
+    }
+
+    fn binary(op: BinaryOp, left: ScalarExpr, right: ScalarExpr) -> ScalarExpr {
+        ScalarExpr::Binary {
+            op,
+            left: Box::new(left),
+            right: Box::new(right),
+            data_type: DataType::Bool,
+        }
+    }
+
+    #[test]
+    fn serializable_read_locks_split_supported_multi_column_conjunctions() {
+        let predicate = binary(
+            BinaryOp::And,
+            binary(BinaryOp::Eq, col(0, "a"), lit_i32(7)),
+            binary(BinaryOp::Eq, col(1, "b"), lit_i32(9)),
+        );
+        let plan = LogicalPlan::Filter {
+            input: Box::new(scan()),
+            predicate,
+        };
+        let snapshot = test_snapshot();
+        let mut tags = Vec::new();
+
+        collect_serializable_read_locks(&plan, &snapshot, &mut tags);
+        dedup_predicate_tags(&mut tags);
+
+        assert_eq!(
+            tags,
+            vec![
+                PredicateLockTag::ColumnRange {
+                    relation: RelationId(Oid::new(42)),
+                    column: 0,
+                    low: Some(7),
+                    high: Some(7),
+                },
+                PredicateLockTag::ColumnRange {
+                    relation: RelationId(Oid::new(42)),
+                    column: 1,
+                    low: Some(9),
+                    high: Some(9),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn serializable_delete_conflicts_split_supported_multi_column_conjunctions() {
+        let predicate = binary(
+            BinaryOp::And,
+            binary(BinaryOp::Eq, col(0, "a"), lit_i32(7)),
+            binary(BinaryOp::Eq, col(1, "b"), lit_i32(9)),
+        );
+        let input = LogicalPlan::Filter {
+            input: Box::new(scan()),
+            predicate,
+        };
+        let snapshot = test_snapshot();
+        let entry = snapshot.tables.get("t").expect("table exists");
+
+        assert_eq!(
+            delete_write_conflict_tags(entry, &input, &snapshot),
+            vec![
+                PredicateLockTag::ColumnRange {
+                    relation: RelationId(Oid::new(42)),
+                    column: 0,
+                    low: Some(7),
+                    high: Some(7),
+                },
+                PredicateLockTag::ColumnRange {
+                    relation: RelationId(Oid::new(42)),
+                    column: 1,
+                    low: Some(9),
+                    high: Some(9),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn serializable_read_locks_keep_relation_fallback_for_unsupported_conjunctions() {
+        let unsupported_rhs = binary(
+            BinaryOp::Eq,
+            binary(BinaryOp::Add, col(1, "b"), lit_i32(1)),
+            lit_i32(9),
+        );
+        let predicate = binary(
+            BinaryOp::And,
+            binary(BinaryOp::Eq, col(0, "a"), lit_i32(7)),
+            unsupported_rhs,
+        );
+        let plan = LogicalPlan::Filter {
+            input: Box::new(scan()),
+            predicate,
+        };
+        let snapshot = test_snapshot();
+        let mut tags = Vec::new();
+
+        collect_serializable_read_locks(&plan, &snapshot, &mut tags);
+        dedup_predicate_tags(&mut tags);
+
+        assert_eq!(
+            tags,
+            vec![PredicateLockTag::Relation(RelationId(Oid::new(42)))]
+        );
+    }
 }
