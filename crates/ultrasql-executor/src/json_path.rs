@@ -65,6 +65,9 @@ impl JsonPathError {
 pub fn parse_json_path(path: &str) -> Result<JsonPath, JsonPathError> {
     let mut parser = JsonPathParser::new(path);
     parser.skip_ws();
+    if parser.consume_keyword("lax") || parser.consume_keyword("strict") {
+        parser.skip_ws();
+    }
     parser.expect_byte(b'$', "path must start with $")?;
     let steps = parser.parse_steps(false)?;
     parser.skip_ws();
@@ -437,6 +440,24 @@ impl<'a> JsonPathParser<'a> {
         } else {
             false
         }
+    }
+
+    fn consume_keyword(&mut self, keyword: &str) -> bool {
+        let rest = &self.text[self.pos..];
+        if !rest.starts_with(keyword) {
+            return false;
+        }
+        let end = self.pos + keyword.len();
+        if self
+            .text
+            .as_bytes()
+            .get(end)
+            .is_some_and(|byte| byte.is_ascii_alphanumeric() || *byte == b'_')
+        {
+            return false;
+        }
+        self.pos = end;
+        true
     }
 
     fn peek_byte(&self) -> Option<u8> {
