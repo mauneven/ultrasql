@@ -832,6 +832,10 @@ as a concise evidence ledger; roadmap stays for open gates only.
   including advisory lock `classid` / `objid`, mode, granted state, and owner
   pid when it can be derived from a session-level advisory lock. Evidence:
   `cargo test -p ultrasql-server --test advisory_lock_round_trip try_advisory_lock_conflicts_across_sessions_and_unlocks -- --nocapture`.
+- `pg_catalog.pg_stat_activity` now reflects the current session identity and
+  `application_name` session setting instead of hardcoded user/application
+  values. Evidence:
+  `cargo test -p ultrasql-server --test catalog_views_round_trip pg_stat_activity_reflects_session_identity -- --nocapture`.
 - `GUI introspection probes` exist for `pgAdmin`, `DBeaver`, and `DataGrip`.
 - Migration tool certification covers `Flyway`, `Liquibase`, and `Alembic`.
 

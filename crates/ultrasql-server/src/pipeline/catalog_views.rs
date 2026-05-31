@@ -229,7 +229,9 @@ fn virtual_rows(name: &str, ctx: &LowerCtx<'_>) -> Option<(Schema, Vec<Vec<Value
             Some((schema_pg_stat_statements(), rows_pg_stat_statements(ctx)))
         }
         "pg_catalog.pg_locks" => Some((schema_pg_locks(), rows_pg_locks(ctx))),
-        "pg_catalog.pg_stat_activity" => Some((schema_pg_stat_activity(), rows_pg_stat_activity())),
+        "pg_catalog.pg_stat_activity" => {
+            Some((schema_pg_stat_activity(), rows_pg_stat_activity(ctx)))
+        }
         "pg_catalog.pg_stat_user_tables" => {
             Some((schema_pg_stat_user_tables(), rows_pg_stat_user_tables(ctx)))
         }
@@ -2485,13 +2487,18 @@ fn schema_pg_stat_activity() -> Schema {
     ])
 }
 
-fn rows_pg_stat_activity() -> Vec<Vec<Value>> {
+fn rows_pg_stat_activity(ctx: &LowerCtx<'_>) -> Vec<Vec<Value>> {
+    let application_name = ctx
+        .session_settings
+        .get("application_name")
+        .cloned()
+        .map_or(Value::Null, v_text);
     vec![vec![
         Value::Int64(1),
         v_text("ultrasql"),
         Value::Int32(0),
-        v_text("ultrasql"),
-        Value::Null,
+        v_text(ctx.current_user.clone()),
+        application_name,
         v_text("active"),
         Value::Null,
     ]]

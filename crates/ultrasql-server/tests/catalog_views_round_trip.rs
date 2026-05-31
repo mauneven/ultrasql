@@ -1068,6 +1068,30 @@ async fn pg_settings_reflects_active_transaction_isolation() {
 }
 
 #[tokio::test]
+async fn pg_stat_activity_reflects_session_identity() {
+    let (_server, client, _conn, server_handle) = start_server_and_connect().await;
+
+    client
+        .batch_execute("SET application_name = 'activity_probe'")
+        .await
+        .expect("set application_name");
+    let row = client
+        .query_one(
+            "SELECT usename, application_name, state \
+             FROM pg_catalog.pg_stat_activity \
+             WHERE datname = 'ultrasql'",
+            &[],
+        )
+        .await
+        .expect("pg_stat_activity current session");
+    assert_eq!(row.get::<_, String>(0), "tester");
+    assert_eq!(row.get::<_, String>(1), "activity_probe");
+    assert_eq!(row.get::<_, String>(2), "active");
+
+    shutdown(client, server_handle).await;
+}
+
+#[tokio::test]
 async fn psql_describe_table_statistics_probe_accepts_empty_pg_statistic_ext() {
     let (_server, client, _conn, server_handle) = start_server_and_connect().await;
 
