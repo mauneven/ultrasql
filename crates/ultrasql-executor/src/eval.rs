@@ -65,6 +65,10 @@ pub enum EvalError {
     #[error("division by zero")]
     DivByZero,
 
+    /// A numeric value exceeds declared precision.
+    #[error("{0}")]
+    NumericFieldOverflow(String),
+
     /// A column reference addressed an index outside the row's length.
     #[error("column index out of range: {index} (row has {len} columns)")]
     ColumnIndex {
@@ -1361,32 +1365,132 @@ fn int_to_money(value: i64) -> Result<Value, EvalError> {
 }
 
 fn eval_cast_numeric(args: &[Value]) -> Result<Value, EvalError> {
-    if args.len() != 1 {
+    if !matches!(args.len(), 1 | 3) {
         return Err(EvalError::Type(format!(
-            "numeric cast: expected 1 arg, got {}",
+            "numeric cast: expected 1 or 3 args, got {}",
             args.len()
         )));
     }
+    let (precision, target_scale) = numeric_cast_typmod(args)?;
     match &args[0] {
         Value::Null => Ok(Value::Null),
-        Value::Money(cents) => Ok(Value::Decimal {
-            value: *cents,
-            scale: 2,
-        }),
-        Value::Decimal { value, scale } => Ok(Value::Decimal {
-            value: *value,
-            scale: *scale,
-        }),
-        Value::Text(text) | Value::Char(text) => parse_decimal_text(text, None)
-            .map_err(|err| EvalError::Type(format!("numeric cast: invalid syntax: {err}"))),
+        Value::Money(cents) => coerce_numeric_typmod(*cents, 2, precision, target_scale),
+        Value::Decimal { value, scale } => {
+            coerce_numeric_typmod(*value, *scale, precision, target_scale)
+        }
+        Value::Text(text) | Value::Char(text) => {
+            let Value::Decimal { value, scale } = parse_decimal_text(text, target_scale)
+                .map_err(|err| EvalError::Type(format!("numeric cast: invalid syntax: {err}")))?
+            else {
+                return Err(EvalError::Type(
+                    "numeric cast: decimal parser returned non-decimal".to_owned(),
+                ));
+            };
+            coerce_numeric_typmod(value, scale, precision, target_scale)
+        }
         other => match numeric_to_decimal(other)? {
-            Some((value, scale)) => Ok(Value::Decimal { value, scale }),
+            Some((value, scale)) => coerce_numeric_typmod(value, scale, precision, target_scale),
             None => Err(EvalError::Type(format!(
                 "numeric cast: numeric argument required, got {:?}",
                 other.data_type()
             ))),
         },
     }
+}
+
+fn numeric_cast_typmod(args: &[Value]) -> Result<(Option<u32>, Option<i32>), EvalError> {
+    if args.len() == 1 {
+        return Ok((None, None));
+    }
+    let precision = match args.get(1) {
+        Some(Value::Null) => None,
+        Some(Value::Int32(value)) if *value > 0 => Some(u32::try_from(*value).map_err(|_| {
+            EvalError::Type(format!("numeric cast: precision out of range: {value}"))
+        })?),
+        Some(other) => {
+            return Err(EvalError::Type(format!(
+                "numeric cast: precision typmod must be positive integer or NULL, got {:?}",
+                other.data_type()
+            )));
+        }
+        None => None,
+    };
+    let scale = match args.get(2) {
+        Some(Value::Null) => None,
+        Some(Value::Int32(value)) => Some(*value),
+        Some(other) => {
+            return Err(EvalError::Type(format!(
+                "numeric cast: scale typmod must be integer or NULL, got {:?}",
+                other.data_type()
+            )));
+        }
+        None => None,
+    };
+    Ok((precision, scale))
+}
+
+fn coerce_numeric_typmod(
+    value: i64,
+    scale: i32,
+    precision: Option<u32>,
+    target_scale: Option<i32>,
+) -> Result<Value, EvalError> {
+    let (value, scale) = if let Some(target_scale) = target_scale {
+        let rendered = Value::Decimal { value, scale }.to_string();
+        let Value::Decimal {
+            value: rounded,
+            scale,
+        } = parse_decimal_text(&rendered, Some(target_scale))
+            .map_err(|err| EvalError::Type(format!("numeric cast: invalid typmod: {err}")))?
+        else {
+            return Err(EvalError::Type(
+                "numeric cast: decimal parser returned non-decimal".to_owned(),
+            ));
+        };
+        (rounded, scale)
+    } else {
+        (value, scale)
+    };
+    validate_numeric_precision(value, scale, precision, target_scale)?;
+    Ok(Value::Decimal { value, scale })
+}
+
+fn validate_numeric_precision(
+    value: i64,
+    scale: i32,
+    precision: Option<u32>,
+    declared_scale: Option<i32>,
+) -> Result<(), EvalError> {
+    let Some(precision) = precision else {
+        return Ok(());
+    };
+    let precision = usize::try_from(precision)
+        .map_err(|_| EvalError::NumericFieldOverflow("numeric precision out of range".into()))?;
+    let actual_scale = usize::try_from(scale.max(0))
+        .map_err(|_| EvalError::NumericFieldOverflow("numeric scale out of range".into()))?;
+    let declared_scale = usize::try_from(declared_scale.unwrap_or(0).max(0))
+        .map_err(|_| EvalError::NumericFieldOverflow("numeric scale out of range".into()))?;
+    let magnitude = i128::from(value)
+        .checked_abs()
+        .ok_or_else(|| EvalError::NumericFieldOverflow("numeric magnitude overflow".into()))?;
+    let total_digits = decimal_magnitude_digits(magnitude);
+    let integer_digits = total_digits.saturating_sub(actual_scale);
+    let max_integer_digits = precision.saturating_sub(declared_scale);
+    if total_digits > precision || integer_digits > max_integer_digits {
+        return Err(EvalError::NumericFieldOverflow(
+            "numeric field overflow".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn decimal_magnitude_digits(mut magnitude: i128) -> usize {
+    let mut digits = 1;
+    while magnitude >= 10 {
+        magnitude /= 10;
+        digits += 1;
+    }
+    digits
 }
 
 fn resolve_regtype_text(text: &str) -> Option<Oid> {
@@ -6880,6 +6984,41 @@ mod tests {
                 value: 42,
                 scale: 0
             }
+        );
+        assert_eq!(
+            eval_fn(
+                "__ultrasql_cast_numeric",
+                vec![
+                    Value::Text("12.345".into()),
+                    Value::Int32(5),
+                    Value::Int32(2)
+                ]
+            ),
+            Value::Decimal {
+                value: 1235,
+                scale: 2
+            }
+        );
+        assert_eq!(
+            eval_fn(
+                "__ultrasql_cast_numeric",
+                vec![Value::Int32(7), Value::Int32(5), Value::Int32(2)]
+            ),
+            Value::Decimal {
+                value: 700,
+                scale: 2
+            }
+        );
+        assert!(
+            eval_fn_err(
+                "__ultrasql_cast_numeric",
+                vec![
+                    Value::Text("1234.56".into()),
+                    Value::Int32(5),
+                    Value::Int32(2)
+                ]
+            )
+            .contains("numeric field overflow")
         );
         assert!(
             eval_fn_err("__ultrasql_cast_numeric", vec![Value::Text("bad".into())])

@@ -39,6 +39,76 @@ async fn numeric_arithmetic_casts_and_extended_wire_type() {
 }
 
 #[tokio::test]
+async fn runtime_numeric_typmod_casts_round_and_check_precision() {
+    let running = start_sample_server("numeric_runtime_typmod_casts").await;
+    let client = &running.client;
+
+    client
+        .batch_execute(
+            "CREATE TABLE runtime_numeric_casts (
+                text_value TEXT NOT NULL,
+                float_value DOUBLE PRECISION NOT NULL,
+                int_value INT NOT NULL,
+                numeric_value NUMERIC(6,3) NOT NULL
+            )",
+        )
+        .await
+        .expect("create runtime numeric cast table");
+    client
+        .batch_execute("INSERT INTO runtime_numeric_casts VALUES ('12.345', 3.456, 7, 12.345)")
+        .await
+        .expect("insert runtime numeric cast row");
+
+    let rows = client
+        .simple_query(
+            "SELECT
+                CAST(text_value AS NUMERIC(5,2)),
+                CAST(float_value AS NUMERIC(5,2)),
+                CAST(int_value AS NUMERIC(5,2)),
+                CAST(numeric_value AS NUMERIC(5,2))
+             FROM runtime_numeric_casts",
+        )
+        .await
+        .expect("runtime numeric typmod casts");
+    let values: Vec<Vec<String>> = rows
+        .into_iter()
+        .filter_map(|message| match message {
+            tokio_postgres::SimpleQueryMessage::Row(row) => Some(
+                (0..row.len())
+                    .filter_map(|idx| row.get(idx).map(str::to_owned))
+                    .collect(),
+            ),
+            _ => None,
+        })
+        .collect();
+
+    assert_eq!(
+        values,
+        vec![vec![
+            "12.35".to_owned(),
+            "3.46".to_owned(),
+            "7.00".to_owned(),
+            "12.35".to_owned()
+        ]]
+    );
+
+    client
+        .batch_execute("UPDATE runtime_numeric_casts SET text_value = '1234.56'")
+        .await
+        .expect("update runtime numeric overflow input");
+    let err = client
+        .simple_query("SELECT CAST(text_value AS NUMERIC(5,2)) FROM runtime_numeric_casts")
+        .await
+        .expect_err("numeric typmod overflow must fail");
+    assert_eq!(
+        err.code().map(tokio_postgres::error::SqlState::code),
+        Some("22003")
+    );
+
+    shutdown(running).await;
+}
+
+#[tokio::test]
 async fn numeric_precision_overflow_reports_sqlstate() {
     let data_dir = tempfile::TempDir::new().expect("temp dir");
     let running = start_persistent_server(data_dir.path(), "numeric_round_trip").await;

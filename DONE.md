@@ -1763,3 +1763,12 @@ as a concise evidence ledger; roadmap stays for open gates only.
   `cargo test -p ultrasql-server extended::codec::tests::binary_dynamic_numeric_result_encodes_text_backed_scale --lib -- --nocapture`,
   and
   `cargo test -p ultrasql-server --test money_round_trip money_and_numeric_runtime_casts_from_columns -- --nocapture`.
+- Runtime `NUMERIC(p,s)` typmod casts now carry precision/scale through hidden
+  checked cast arguments, round text/float/integer/decimal column values to the
+  declared scale, and surface precision overflow as SQLSTATE `22003`. Dynamic
+  decimal result batches from constant/values paths now preserve per-value
+  scale instead of reusing a stale schema scale. Evidence:
+  `cargo test -p ultrasql-executor cast_size_and_array_error_edges_cover_scalar_compat_paths --lib -- --nocapture`,
+  `cargo test -p ultrasql-executor build_batch_covers_sql_storage_families_and_null_bitmaps --lib -- --nocapture`,
+  and
+  `cargo test -p ultrasql-server --test numeric_round_trip -- --nocapture`.

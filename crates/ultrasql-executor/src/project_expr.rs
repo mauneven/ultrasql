@@ -13,7 +13,7 @@ use ultrasql_vec::bitmap::Bitmap;
 use ultrasql_vec::column::{BoolColumn, Column, NumericColumn};
 use ultrasql_vec::{Batch, DictionaryEncodingPolicy, StringEncoding, encode_strings_auto};
 
-use crate::eval::eval_expr;
+use crate::eval::{EvalError, eval_expr};
 use crate::filter_op::batch_to_rows;
 use crate::{ExecError, Operator};
 
@@ -68,8 +68,7 @@ impl Operator for ProjectExprs {
         let no_params: &[Value] = &[];
         for row in &rows {
             for (col_idx, expr) in self.exprs.iter().enumerate() {
-                let val = eval_expr(expr, row, no_params)
-                    .map_err(|e| ExecError::TypeMismatch(e.to_string()))?;
+                let val = eval_expr(expr, row, no_params).map_err(eval_error_to_exec)?;
                 out_values[col_idx].push(val);
             }
         }
@@ -91,6 +90,13 @@ impl Operator for ProjectExprs {
 
     fn profile_children(&self) -> Vec<&dyn Operator> {
         vec![self.child.as_ref()]
+    }
+}
+
+fn eval_error_to_exec(error: EvalError) -> ExecError {
+    match error {
+        EvalError::NumericFieldOverflow(detail) => ExecError::NumericFieldOverflow(detail),
+        other => ExecError::TypeMismatch(other.to_string()),
     }
 }
 

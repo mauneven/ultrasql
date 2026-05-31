@@ -1187,6 +1187,28 @@ pub fn build_batch(rows: &[Vec<Value>], schema: &Schema) -> Result<Batch, ExecEr
                 };
                 Column::Int32(col)
             }
+            DataType::Decimal { scale: None, .. } => {
+                let mut strings: Vec<Option<String>> = Vec::with_capacity(n_rows);
+                for (row_idx, row) in rows.iter().enumerate() {
+                    match &row[col_idx] {
+                        Value::Decimal { .. } => strings.push(Some(row[col_idx].to_string())),
+                        Value::Null => strings.push(None),
+                        other => {
+                            return Err(ExecError::TypeMismatch(format!(
+                                "expected Decimal at row {row_idx} col {col_idx}, got {:?}",
+                                other.data_type()
+                            )));
+                        }
+                    }
+                }
+                match encode_strings_auto(
+                    strings.iter().map(|value| value.as_deref()),
+                    DictionaryEncodingPolicy::default(),
+                ) {
+                    StringEncoding::Raw(c) => Column::Utf8(c),
+                    StringEncoding::Dictionary(c) => Column::DictionaryUtf8(c),
+                }
+            }
             DataType::Decimal { .. }
             | DataType::Money
             | DataType::Timestamp
@@ -1448,6 +1470,13 @@ mod tests {
                     scale: Some(2),
                 },
             ),
+            Field::nullable(
+                "dyn_dec",
+                DataType::Decimal {
+                    precision: None,
+                    scale: None,
+                },
+            ),
             Field::nullable("money", DataType::Money),
             Field::nullable("ts", DataType::Timestamp),
             Field::nullable("tstz", DataType::TimestampTz),
@@ -1512,6 +1541,10 @@ mod tests {
                 value: 1234,
                 scale: 2,
             },
+            Value::Decimal {
+                value: 166_667,
+                scale: 6,
+            },
             Value::Money(5678),
             Value::Timestamp(111),
             Value::TimestampTz(222),
@@ -1534,6 +1567,8 @@ mod tests {
             Column::Int64(c) => assert_eq!(c.data()[0], 1234),
             other => panic!("expected decimal int64 column, got {other:?}"),
         }
+        assert_eq!(batch.columns()[35].text_value(0), Some("0.166667"));
+        assert_eq!(batch.columns()[35].text_value(1), None);
 
         let bad = build_batch(&[vec![Value::Text("bad".into())]], &schema_i32_only())
             .expect_err("type mismatch");

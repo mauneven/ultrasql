@@ -810,11 +810,33 @@ fn bind_runtime_cast(
     } else {
         target_type.clone()
     };
+    let args = if let DataType::Decimal { precision, scale } = target_type {
+        vec![
+            expr,
+            runtime_typmod_i32(precision.and_then(|value| i32::try_from(value).ok())),
+            runtime_typmod_i32(*scale),
+        ]
+    } else {
+        vec![expr]
+    };
     Some(ScalarExpr::FunctionCall {
         name: name.to_owned(),
-        args: vec![expr],
+        args,
         data_type,
     })
+}
+
+fn runtime_typmod_i32(value: Option<i32>) -> ScalarExpr {
+    match value {
+        Some(value) => ScalarExpr::Literal {
+            value: Value::Int32(value),
+            data_type: DataType::Int32,
+        },
+        None => ScalarExpr::Literal {
+            value: Value::Null,
+            data_type: DataType::Null,
+        },
+    }
 }
 
 /// Bind `expr [NOT] BETWEEN [SYMMETRIC] low AND high` into an equivalent
