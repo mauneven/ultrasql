@@ -175,6 +175,25 @@ fn security_ethics_audit_lists_verifiable_release_checks() {
 }
 
 #[test]
+fn benchmark_certification_includes_public_sql_regression() {
+    let certify = repo_file("benchmarks/certify.sh");
+    let release = repo_file("docs/release-checklist.md");
+
+    for needle in [
+        "sql-regression",
+        "run_sql_regression_full",
+        "tests/slt/run_sql_regression.sh",
+        "ultrasql-sqllogictest-runner",
+    ] {
+        assert!(certify.contains(needle), "certify.sh missing {needle}");
+    }
+    assert!(
+        release.contains("SQL regression certification artifact"),
+        "release checklist missing SQL regression certification evidence"
+    );
+}
+
+#[test]
 fn committed_slt_speed_artifacts_do_not_publish_winners() {
     for path in [
         "benchmarks/results/latest/slt_speed_comparison.json",

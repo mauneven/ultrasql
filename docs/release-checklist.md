@@ -139,6 +139,7 @@ Before tagging v1.0, attach:
 - RLS tenant certification artifact,
 - TPC-H SF10 and ClickBench artifacts or explicit setup-missing reasons,
 - Firebolt Core local artifacts or explicit Docker/setup-missing reasons,
+- SQL regression certification artifact,
 - AI/vector same-host exact-vector artifacts for UltraSQL,
   PostgreSQL+pgvector, DuckDB, and ClickHouse,
 - backup/restore smoke manifest with custom, directory, and tar dump formats,

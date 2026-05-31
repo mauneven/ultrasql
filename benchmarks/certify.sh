@@ -4,7 +4,7 @@
 # Usage:
 #   benchmarks/certify.sh smoke
 #   benchmarks/certify.sh full
-#   benchmarks/certify.sh full tpch,tpch-sf1-postgres,clickbench,vector-ann,ai-vector-pgvector,ai-gauntlet,csv-gauntlet,object-parquet-range,late-materialization,firebolt-aggregate,firebolt-sparse-pruning,firebolt-vector,rls-tenant,chaos-recovery
+#   benchmarks/certify.sh full tpch,tpch-sf1-postgres,clickbench,sql-regression,vector-ann,ai-vector-pgvector,ai-gauntlet,csv-gauntlet,object-parquet-range,late-materialization,firebolt-aggregate,firebolt-sparse-pruning,firebolt-vector,rls-tenant,chaos-recovery
 #
 # Smoke is PR-safe: tiny datasets, crash/correctness checks, no external
 # benchmark assets. Full is nightly/manual: it attempts the full certification
@@ -29,7 +29,7 @@ case "$profile" in
         suites=(regression-gate rls-tenant vector-ann sysbench)
         ;;
     full)
-        suites=(tpch tpch-sf1-postgres clickbench tpcb tpcc sysbench vector-topk vector-ann ai-vector-pgvector ai-gauntlet csv-gauntlet object-parquet-range late-materialization firebolt-aggregate firebolt-sparse-pruning firebolt-vector rls-tenant chaos-recovery)
+        suites=(tpch tpch-sf1-postgres clickbench tpcb tpcc sysbench sql-regression vector-topk vector-ann ai-vector-pgvector ai-gauntlet csv-gauntlet object-parquet-range late-materialization firebolt-aggregate firebolt-sparse-pruning firebolt-vector rls-tenant chaos-recovery)
         ;;
     *)
         echo "certify.sh: profile must be smoke or full, got '$profile'" >&2
@@ -105,6 +105,65 @@ run_sysbench_smoke() {
         SYSBENCH_CONNECTIONS=4 \
         SYSBENCH_ALLOW_ULTRASQL_ONLY=1 \
         benchmarks/sysbench_certify.sh
+}
+
+run_sql_regression_full() {
+    local artifact="$OUT_DIR/sql_regression_certification.json"
+    local suites=(tests/slt/sql_regression/regression_subset/*.slt)
+    local reference_url="${ULTRASQL_SLT_REFERENCE_URL:-${POSTGRES_URL:-}}"
+
+    cargo run -p ultrasql-sqllogictest-runner -- --mode in-process "${suites[@]}"
+
+    if [[ -z "$reference_url" ]]; then
+        python3 - "$artifact" "${#suites[@]}" <<'PY'
+import json
+import pathlib
+import sys
+import time
+
+artifact, suite_count = sys.argv[1], int(sys.argv[2])
+doc = {
+    "schema_version": 1,
+    "suite": "sql_regression",
+    "status": "not_available",
+    "reason": "reference_url_missing",
+    "active_shards": suite_count,
+    "in_process_status": "passed",
+    "reference_engine": "postgres",
+    "generated_at_unix": int(time.time()),
+    "policy": (
+        "Active public SQL regression shards must pass in-process. "
+        "Full differential certification also requires ULTRASQL_SLT_REFERENCE_URL "
+        "or POSTGRES_URL for PostgreSQL comparison."
+    ),
+}
+pathlib.Path(artifact).write_text(json.dumps(doc, indent=2) + "\n", encoding="utf-8")
+print(json.dumps(doc, indent=2))
+PY
+        return 2
+    fi
+
+    tests/slt/run_sql_regression.sh
+    python3 - "$artifact" "${#suites[@]}" <<'PY'
+import json
+import pathlib
+import sys
+import time
+
+artifact, suite_count = sys.argv[1], int(sys.argv[2])
+doc = {
+    "schema_version": 1,
+    "suite": "sql_regression",
+    "status": "measured",
+    "active_shards": suite_count,
+    "in_process_status": "passed",
+    "reference_engine": "postgres",
+    "differential_status": "passed",
+    "generated_at_unix": int(time.time()),
+}
+pathlib.Path(artifact).write_text(json.dumps(doc, indent=2) + "\n", encoding="utf-8")
+print(json.dumps(doc, indent=2))
+PY
 }
 
 run_vector_ann_full() {
@@ -282,6 +341,9 @@ for suite in "${suites[@]}"; do
             else
                 run_suite "$suite" benchmarks/sysbench_certify.sh
             fi
+            ;;
+        sql-regression)
+            run_suite "$suite" run_sql_regression_full
             ;;
         tpch)
             run_suite "$suite" benchmarks/tpch_sf10_certify.sh

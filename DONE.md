@@ -1637,6 +1637,13 @@ as a concise evidence ledger; roadmap stays for open gates only.
   not only checked for provenance. Current coverage is 8 shards / 116
   SQLLogicTest cases with zero skips. Evidence:
   `cargo test -p ultrasql-sqllogictest-runner sql_regression_subset_runs_all_active_shards_in_process --test in_process -- --nocapture`.
+- Full benchmark certification now includes the active public SQL regression
+  subset as `sql-regression`; targeted local run passed 8 shards / 116 cases
+  in-process and wrote an explicit `reference_url_missing` setup artifact
+  instead of publishing a differential claim without PostgreSQL. Evidence:
+  `cargo test -p ultrasql-bench --test release_hardening benchmark_certification_includes_public_sql_regression -- --nocapture`,
+  `benchmarks/certify.sh full sql-regression`, and
+  `benchmarks/results/latest/sql_regression_certification.json`.
 - Join/set-operation regression baseline covers deterministic inner join, left
   join with aggregate over null-extended rows, correlated `EXISTS`, `UNION`,
   `INTERSECT`, `EXCEPT`, set-operation `ORDER BY` over output columns, and

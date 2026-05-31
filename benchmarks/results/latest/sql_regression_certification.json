@@ -1,0 +1,11 @@
+{
+  "schema_version": 1,
+  "suite": "sql_regression",
+  "status": "not_available",
+  "reason": "reference_url_missing",
+  "active_shards": 8,
+  "in_process_status": "passed",
+  "reference_engine": "postgres",
+  "generated_at_unix": 1780271791,
+  "policy": "Active public SQL regression shards must pass in-process. Full differential certification also requires ULTRASQL_SLT_REFERENCE_URL or POSTGRES_URL for PostgreSQL comparison."
+}
