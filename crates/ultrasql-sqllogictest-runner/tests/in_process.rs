@@ -295,6 +295,54 @@ fn sql_regression_subset_preserves_public_provenance() {
 }
 
 #[test]
+fn sql_regression_subset_runs_all_active_shards_in_process() {
+    let bin = env!("CARGO_BIN_EXE_ultrasql-sqllogictest-runner");
+    let subset = repo_root().join("tests/slt/sql_regression/regression_subset");
+    let mut suites = fs::read_dir(&subset)
+        .expect("read PostgreSQL regression subset")
+        .map(|entry| entry.expect("read PostgreSQL regression shard").path())
+        .filter(|path| {
+            path.extension()
+                .is_some_and(|ext| ext == std::ffi::OsStr::new("slt"))
+        })
+        .collect::<Vec<_>>();
+    suites.sort();
+    assert!(
+        !suites.is_empty(),
+        "{} has no active shards",
+        subset.display()
+    );
+
+    let expected_cases = suites
+        .iter()
+        .map(|suite| {
+            let text = fs::read_to_string(suite).expect("read SQLLogicTest shard");
+            count_slt_cases(&text)
+        })
+        .sum::<usize>();
+
+    let output = Command::new(bin)
+        .arg("--mode")
+        .arg("in-process")
+        .args(&suites)
+        .output()
+        .expect("run all active PostgreSQL regression subset shards");
+    assert!(
+        output.status.success(),
+        "runner failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains(&format!("passed={expected_cases}")),
+        "stdout:\n{stdout}"
+    );
+    assert!(stdout.contains("failed=0"), "stdout:\n{stdout}");
+    assert!(stdout.contains("skipped=0"), "stdout:\n{stdout}");
+}
+
+#[test]
 fn sql_regression_parser_type_baseline_is_imported_and_provenanced() {
     let subset = repo_root().join("tests/slt/sql_regression/regression_subset");
     let manifest =

@@ -1486,6 +1486,10 @@ as a concise evidence ledger; roadmap stays for open gates only.
   `pg_type`, and numeric/char typmod rendering through `format_type`.
   Evidence:
   `cargo run -p ultrasql-sqllogictest-runner -- --mode in-process tests/slt/sql_regression/regression_subset/catalog_sanity_baseline.slt`.
+- The full active public regression subset is now executed by a cargo test,
+  not only checked for provenance. Current coverage is 7 shards / 103
+  SQLLogicTest cases with zero skips. Evidence:
+  `cargo test -p ultrasql-sqllogictest-runner sql_regression_subset_runs_all_active_shards_in_process --test in_process -- --nocapture`.
 - Transaction isolation baseline covers `acid.sql`, Hermitage G1a/PMP/G2, and
   manager-level Hermitage matrix.
 - Index regression baseline covers `CREATE INDEX`, `CREATE UNIQUE INDEX`,
