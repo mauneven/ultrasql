@@ -4822,6 +4822,7 @@ impl Server {
         let mut seen_identity_keys = std::collections::HashSet::new();
         let mut seen_generated_keys = std::collections::HashSet::new();
         let mut seen_check_keys = std::collections::HashSet::new();
+        let mut seen_foreign_key_keys = std::collections::HashSet::new();
         for (line_no, line) in text.lines().enumerate() {
             if line.is_empty() || line.starts_with('#') {
                 continue;
@@ -4965,11 +4966,18 @@ impl Server {
                             line_no + 1
                         ))
                     })?);
+                    let name = metadata_unescape(parts[2])?;
+                    if !seen_foreign_key_keys.insert((oid, name.to_ascii_lowercase())) {
+                        return Err(ServerError::Ddl(format!(
+                            "duplicate table-runtime foreign-key metadata on line {}",
+                            line_no + 1
+                        )));
+                    }
                     foreign_keys
                         .entry(oid)
                         .or_default()
                         .push(RuntimeForeignKeyConstraint {
-                        name: metadata_unescape(parts[2])?,
+                        name,
                         columns: parse_usize_list_token(parts[3])?,
                         target_table: metadata_unescape(parts[4])?,
                         target_oid: Oid::new(parts[5].parse::<u32>().map_err(|err| {

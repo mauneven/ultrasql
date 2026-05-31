@@ -851,6 +851,10 @@ as a concise evidence ledger; roadmap stays for open gates only.
   the same table, avoiding repeated restart constraint state from tampered
   sidecar rows. Evidence:
   `cargo test -p ultrasql-server --test drop_restart_round_trip table_runtime_metadata_rejects_duplicate_check_rows_on_rebuild -- --nocapture`.
+- Table runtime metadata reload rejects duplicate `FOREIGN KEY` constraint names
+  for the same table, avoiding repeated restart referential actions from
+  tampered sidecar rows. Evidence:
+  `cargo test -p ultrasql-server --test drop_restart_round_trip table_runtime_metadata_rejects_duplicate_foreign_key_rows_on_rebuild -- --nocapture`.
 - Dropped tables are removed from durable `pg_row_security.meta`, preventing
   stale row-level-security policies from surviving restart after `DROP TABLE`.
   Evidence: `cargo test -p ultrasql-server --test rls_round_trip`.
