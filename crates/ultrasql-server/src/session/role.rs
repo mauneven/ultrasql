@@ -201,6 +201,12 @@ where
         }
 
         for membership in self.state.role_catalog.list_memberships() {
+            if membership.role.eq_ignore_ascii_case(&role) {
+                dependencies.push(format!("role membership granted to {}", membership.member));
+            }
+            if membership.member.eq_ignore_ascii_case(&role) {
+                dependencies.push(format!("role membership in {}", membership.role));
+            }
             if membership.grantor.eq_ignore_ascii_case(&role) {
                 dependencies.push(format!(
                     "role membership grant of {} to {}",

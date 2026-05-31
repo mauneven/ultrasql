@@ -824,6 +824,48 @@ async fn drop_role_rejects_membership_grantor_until_membership_is_revoked() {
     shutdown(running).await;
 }
 
+#[tokio::test]
+async fn drop_role_rejects_role_membership_edges_until_revoked() {
+    let running = start_sample_server("role_ddl_test").await;
+    let client = &running.client;
+
+    client
+        .batch_execute(
+            "CREATE ROLE membership_parent NOLOGIN; \
+             CREATE ROLE membership_child LOGIN; \
+             GRANT membership_parent TO membership_child",
+        )
+        .await
+        .expect("create membership edge");
+
+    let parent_restricted = client
+        .batch_execute("DROP ROLE membership_parent")
+        .await
+        .expect_err("granted role reference must block DROP ROLE");
+    assert_eq!(parent_restricted.code().expect("SQLSTATE").code(), "2BP01");
+
+    let child_restricted = client
+        .batch_execute("DROP ROLE membership_child")
+        .await
+        .expect_err("member role reference must block DROP ROLE");
+    assert_eq!(child_restricted.code().expect("SQLSTATE").code(), "2BP01");
+
+    client
+        .batch_execute("REVOKE membership_parent FROM membership_child")
+        .await
+        .expect("revoke membership");
+    client
+        .batch_execute("DROP ROLE membership_parent")
+        .await
+        .expect("drop parent after membership revoked");
+    client
+        .batch_execute("DROP ROLE membership_child")
+        .await
+        .expect("drop child after membership revoked");
+
+    shutdown(running).await;
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn role_catalog_survives_restart() {
     let data_dir = tempfile::TempDir::new().expect("temp data dir");
