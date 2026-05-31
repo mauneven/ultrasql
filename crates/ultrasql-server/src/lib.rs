@@ -4565,6 +4565,8 @@ impl Server {
             std::collections::HashMap::new();
         let mut checks: std::collections::HashMap<Oid, Vec<RuntimeCheckConstraint>> =
             std::collections::HashMap::new();
+        let mut seen_domain_oids = std::collections::HashSet::new();
+        let mut seen_domain_names = std::collections::HashSet::new();
         for (line_no, line) in text.lines().enumerate() {
             if line.is_empty() || line.starts_with('#') {
                 continue;
@@ -4591,12 +4593,23 @@ impl Server {
                             line_no + 1
                         ))
                     })?;
+                    let name = metadata_unescape(parts[1])?;
+                    let schema_name = metadata_unescape(parts[3])?;
+                    if !seen_domain_oids.insert(oid)
+                        || !seen_domain_names
+                            .insert((schema_name.to_ascii_lowercase(), name.to_ascii_lowercase()))
+                    {
+                        return Err(ServerError::Ddl(format!(
+                            "duplicate domain-runtime metadata on line {}",
+                            line_no + 1
+                        )));
+                    }
                     domains.insert(
                         oid,
                         DomainTypeEntry {
                             oid,
-                            name: metadata_unescape(parts[1])?,
-                            schema_name: metadata_unescape(parts[3])?,
+                            name,
+                            schema_name,
                             base_type,
                             not_null,
                         },

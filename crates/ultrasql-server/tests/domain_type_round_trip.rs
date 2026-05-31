@@ -6,6 +6,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio_postgres::SimpleQueryMessage;
 use ultrasql_protocol::{BackendMessage, FrontendMessage, decode_backend, encode_frontend};
+use ultrasql_server::Server;
 
 fn first_i64(rows: &[SimpleQueryMessage], col: usize) -> i64 {
     rows.iter()
@@ -183,4 +184,35 @@ async fn domain_catalog_constraints_coercions_and_wire_survive_restart() {
         .expect("select domain values after restart");
     assert_eq!(first_col_strings(&values), vec!["5", "7"]);
     shutdown(running).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn domain_metadata_rejects_duplicate_domain_rows_on_rebuild() {
+    let data_dir = tempfile::TempDir::new().unwrap();
+    let metadata_path = data_dir.path().join("pg_domain_runtime.meta");
+
+    let running = start_persistent_server(data_dir.path(), "domain_duplicate_meta").await;
+    running
+        .client
+        .batch_execute("CREATE DOMAIN duplicate_domain AS INT NOT NULL CHECK (VALUE > 0)")
+        .await
+        .expect("create domain type");
+    shutdown(running).await;
+
+    let mut metadata = std::fs::read_to_string(&metadata_path).expect("domain metadata exists");
+    let domain_line = metadata
+        .lines()
+        .find(|line| line.starts_with("domain\t"))
+        .expect("domain metadata row")
+        .to_owned();
+    metadata.push_str(&domain_line);
+    metadata.push('\n');
+    std::fs::write(&metadata_path, metadata).expect("duplicate domain metadata");
+
+    let err = Server::init(data_dir.path()).expect_err("duplicate domain metadata rejected");
+    assert!(
+        err.to_string()
+            .contains("duplicate domain-runtime metadata"),
+        "expected duplicate domain-runtime metadata rejection, got {err}"
+    );
 }
