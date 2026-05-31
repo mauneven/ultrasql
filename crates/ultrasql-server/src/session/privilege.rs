@@ -210,6 +210,7 @@ where
         }
         match object_kind {
             LogicalPrivilegeObjectKind::Table => self.ensure_table_privilege_owner(objects),
+            LogicalPrivilegeObjectKind::Schema => self.ensure_schema_privilege_owner(objects),
             _ => Err(ServerError::InsufficientPrivilege(
                 "privilege management requires object ownership or superuser".to_owned(),
             )),
@@ -231,6 +232,24 @@ where
             if !owns_table {
                 return Err(ServerError::InsufficientPrivilege(format!(
                     "permission denied to manage privileges on table {table}"
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    fn ensure_schema_privilege_owner(&self, schemas: &[String]) -> Result<(), ServerError> {
+        let current_user = self.current_user.to_ascii_lowercase();
+        for schema in schemas {
+            let folded = schema.to_ascii_lowercase();
+            let owns_schema = self
+                .state
+                .schemas
+                .get(&folded)
+                .is_some_and(|runtime| runtime.owner_role.eq_ignore_ascii_case(&current_user));
+            if !owns_schema {
+                return Err(ServerError::InsufficientPrivilege(format!(
+                    "permission denied to manage privileges on schema {schema}"
                 )));
             }
         }

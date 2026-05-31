@@ -976,6 +976,10 @@ as a concise evidence ledger; roadmap stays for open gates only.
   materialized views, sequences, enum/composite types, domains, and operators.
   Evidence: `cargo test -p ultrasql-server --test schema_ddl_round_trip
   schema_create_privilege_gates_qualified_object_ddl -- --nocapture`.
+- Runtime schema owners can now `GRANT` and `REVOKE` schema privileges without
+  requiring superuser, while non-owners remain blocked. Evidence:
+  `cargo test -p ultrasql-server --test privilege_catalog_round_trip
+  schema_owner_can_grant_and_revoke_schema_create_privilege -- --nocapture`.
 - `DROP ROLE` now rejects roles that still own live tables or still appear in
   object/default privilege grants, avoiding stale ownership and ACL references.
   Evidence: `cargo test -p ultrasql-server --test role_ddl_round_trip`.

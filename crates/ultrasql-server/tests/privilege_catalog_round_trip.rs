@@ -180,6 +180,91 @@ async fn non_owner_cannot_grant_or_revoke_table_privileges() {
 }
 
 #[tokio::test]
+async fn schema_owner_can_grant_and_revoke_schema_create_privilege() {
+    let running = start_sample_server("schema_privilege_owner").await;
+    let client = &running.client;
+
+    client
+        .batch_execute(
+            "CREATE ROLE tester SUPERUSER LOGIN; \
+             CREATE ROLE schema_acl_owner LOGIN; \
+             CREATE ROLE schema_acl_writer LOGIN; \
+             CREATE ROLE schema_acl_intruder LOGIN; \
+             SET ROLE schema_acl_owner; \
+             CREATE SCHEMA acl_schema; \
+             RESET ROLE",
+        )
+        .await
+        .expect("create schema ACL roles and schema");
+
+    let (intruder, intruder_conn) =
+        connect_as(running.bound, "schema_acl_intruder", "schema_acl_intruder").await;
+    assert_insufficient_privilege(
+        intruder
+            .batch_execute("GRANT CREATE ON SCHEMA acl_schema TO schema_acl_writer")
+            .await
+            .expect_err("non-owner cannot grant schema privileges"),
+    );
+    drop(intruder);
+    intruder_conn.await.expect("intruder connection joins");
+
+    let (owner, owner_conn) =
+        connect_as(running.bound, "schema_acl_owner", "schema_acl_owner").await;
+    owner
+        .batch_execute("GRANT CREATE ON SCHEMA acl_schema TO schema_acl_writer")
+        .await
+        .expect("schema owner can grant CREATE");
+    drop(owner);
+    owner_conn.await.expect("owner grant connection joins");
+
+    let (writer, writer_conn) =
+        connect_as(running.bound, "schema_acl_writer", "schema_acl_writer").await;
+    writer
+        .batch_execute("CREATE TABLE acl_schema.writer_ok (id INT)")
+        .await
+        .expect("schema CREATE grant permits qualified table create");
+    drop(writer);
+    writer_conn.await.expect("writer connection joins");
+
+    let (owner, owner_conn) =
+        connect_as(running.bound, "schema_acl_owner", "schema_acl_owner_revoke").await;
+    owner
+        .batch_execute("REVOKE CREATE ON SCHEMA acl_schema FROM schema_acl_writer")
+        .await
+        .expect("schema owner can revoke CREATE");
+    drop(owner);
+    owner_conn.await.expect("owner revoke connection joins");
+
+    let (writer, writer_conn) = connect_as(
+        running.bound,
+        "schema_acl_writer",
+        "schema_acl_writer_after_revoke",
+    )
+    .await;
+    assert_insufficient_privilege(
+        writer
+            .batch_execute("CREATE SEQUENCE acl_schema.blocked_seq")
+            .await
+            .expect_err("revoked CREATE prevents later object creation"),
+    );
+    drop(writer);
+    writer_conn.await.expect("writer revoke check joins");
+
+    client
+        .batch_execute(
+            "DROP TABLE acl_schema.writer_ok; \
+             DROP SCHEMA acl_schema; \
+             DROP ROLE schema_acl_owner; \
+             DROP ROLE schema_acl_writer; \
+             DROP ROLE schema_acl_intruder",
+        )
+        .await
+        .expect("cleanup schema privilege owner test");
+
+    shutdown(running).await;
+}
+
+#[tokio::test]
 async fn non_superuser_cannot_alter_default_privileges_for_privileged_role() {
     let running = start_sample_server("privilege_catalog_test").await;
     let client = &running.client;
