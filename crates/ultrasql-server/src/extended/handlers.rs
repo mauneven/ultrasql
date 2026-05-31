@@ -92,6 +92,36 @@ fn validate_extended_parameter_count(n_params: u32) -> Result<(), ServerError> {
     Ok(())
 }
 
+fn required_parameter_count(n_params: u32) -> Result<usize, ServerError> {
+    usize::try_from(n_params).map_err(|_| {
+        ServerError::Unsupported("extended query parameter count exceeds platform limit")
+    })
+}
+
+fn one_based_parameter_index(slot: usize) -> Result<u32, ServerError> {
+    let zero_based = u32::try_from(slot).map_err(|_| {
+        ServerError::Unsupported("extended query parameter index exceeds protocol limit")
+    })?;
+    zero_based.checked_add(1).ok_or(ServerError::Unsupported(
+        "extended query parameter index exceeds protocol limit",
+    ))
+}
+
+fn zero_based_parameter_index(index: u32) -> Result<usize, ServerError> {
+    let zero_based = index.checked_sub(1).ok_or(ServerError::Unsupported(
+        "extended query parameter index must be one-based",
+    ))?;
+    usize::try_from(zero_based).map_err(|_| {
+        ServerError::Unsupported("extended query parameter index exceeds platform limit")
+    })
+}
+
+fn bind_parameter_count(len: usize) -> Result<u32, ServerError> {
+    u32::try_from(len).map_err(|_| {
+        ServerError::Unsupported("extended query bind parameter count exceeds protocol limit")
+    })
+}
+
 fn is_non_literal_limit_offset(err: &PlanError) -> bool {
     matches!(
         err,
@@ -301,7 +331,7 @@ pub fn handle_bind(
     // as many parameters as the plan references; if a Parse oversupplied
     // OIDs (longer than `n_params`), we trust the client and accept the
     // extra slots silently.
-    let n_required = usize::try_from(stmt.n_params).unwrap_or(usize::MAX);
+    let n_required = required_parameter_count(stmt.n_params)?;
     if params.len() < n_required {
         return Err(ServerError::Unsupported(
             "Bind supplied fewer parameters than the prepared statement requires",
@@ -327,7 +357,7 @@ pub fn handle_bind(
     for (i, raw) in params.iter().enumerate() {
         let fmt = resolve_param_format(param_formats, i);
         let declared = stmt.param_type_oids.get(i).copied().filter(|o| *o != 0);
-        let one_based_index = u32::try_from(i).unwrap_or(u32::MAX).saturating_add(1);
+        let one_based_index = one_based_parameter_index(i)?;
         let oid = declared.or_else(|| {
             if stmt.limit_offset_param_indexes.contains(&one_based_index) {
                 return Some(pg_type_oid(&DataType::Int32));
@@ -358,7 +388,7 @@ pub fn handle_bind(
             .map(|p| substitute_parameters_in_plan(p, &values))
     } else {
         let (rewritten_sql, _) = rewrite_limit_offset_parameters(&stmt.sql, |index| {
-            let value_idx = usize::try_from(index.saturating_sub(1)).unwrap_or(usize::MAX);
+            let value_idx = zero_based_parameter_index(index)?;
             let value = values.get(value_idx).ok_or(ServerError::Unsupported(
                 "LIMIT/OFFSET parameter index exceeds supplied Bind values",
             ))?;
@@ -387,7 +417,7 @@ pub fn handle_bind(
             plan: bound_plan,
             sql: stmt.sql.clone(),
             plan_hash,
-            bind_param_count: u32::try_from(params.len()).unwrap_or(u32::MAX),
+            bind_param_count: bind_parameter_count(params.len())?,
             bind_params_redacted: !params.is_empty(),
             result_formats,
         },
@@ -424,7 +454,7 @@ pub fn handle_describe_statement(
         .statements
         .get(name)
         .ok_or(ServerError::Unsupported("Describe: statement not found"))?;
-    let n = usize::try_from(stmt.n_params).unwrap_or(usize::MAX);
+    let n = required_parameter_count(stmt.n_params)?;
     let inferred: Vec<DataType> = stmt
         .plan
         .as_ref()
@@ -432,19 +462,17 @@ pub fn handle_describe_statement(
         .unwrap_or_default();
     let mut oids = Vec::with_capacity(n);
     for i in 0..n {
-        let oid = stmt
-            .param_type_oids
-            .get(i)
-            .copied()
-            .filter(|o| *o != 0)
-            .unwrap_or_else(|| {
-                let one_based_index = u32::try_from(i).unwrap_or(u32::MAX).saturating_add(1);
-                if stmt.limit_offset_param_indexes.contains(&one_based_index) {
-                    return pg_type_oid(&DataType::Int32);
-                }
+        let oid = if let Some(oid) = stmt.param_type_oids.get(i).copied().filter(|o| *o != 0) {
+            oid
+        } else {
+            let one_based_index = one_based_parameter_index(i)?;
+            if stmt.limit_offset_param_indexes.contains(&one_based_index) {
+                pg_type_oid(&DataType::Int32)
+            } else {
                 let inferred_ty = inferred.get(i).cloned().unwrap_or(DataType::Null);
                 pg_type_oid(&inferred_ty)
-            });
+            }
+        };
         oids.push(oid);
     }
     let row_desc = stmt
@@ -512,6 +540,28 @@ mod tests {
 
         assert!(
             matches!(err, ServerError::Unsupported(message) if message.contains("index overflow")),
+            "unexpected error: {err:?}"
+        );
+    }
+
+    #[test]
+    fn one_based_parameter_index_rejects_u32_overflow() {
+        let slot = usize::try_from(u32::MAX).expect("u32 fits in usize on supported targets");
+        let err = one_based_parameter_index(slot)
+            .expect_err("one-based parameter index must not wrap past u32");
+
+        assert!(
+            matches!(err, ServerError::Unsupported(message) if message.contains("parameter index exceeds protocol limit")),
+            "unexpected error: {err:?}"
+        );
+    }
+
+    #[test]
+    fn zero_based_parameter_index_rejects_zero() {
+        let err = zero_based_parameter_index(0).expect_err("parameter indexes are one-based");
+
+        assert!(
+            matches!(err, ServerError::Unsupported(message) if message.contains("parameter index must be one-based")),
             "unexpected error: {err:?}"
         );
     }

@@ -32,16 +32,15 @@ pub(crate) fn substitute_parameters_in_plan(plan: &LogicalPlan, values: &[Value]
 /// Recursively rewrite parameters in `expr`.
 fn substitute_parameter_in_expr(expr: &ScalarExpr, values: &[Value]) -> ScalarExpr {
     match expr {
-        ScalarExpr::Parameter { index, .. } => {
-            let zero = usize::try_from(index.saturating_sub(1)).unwrap_or(usize::MAX);
-            values.get(zero).map_or_else(
+        ScalarExpr::Parameter { index, .. } => zero_based_parameter_slot(*index)
+            .and_then(|slot| values.get(slot))
+            .map_or_else(
                 || expr.clone(),
                 |v| ScalarExpr::Literal {
                     data_type: v.data_type(),
                     value: v.clone(),
                 },
-            )
-        }
+            ),
         ScalarExpr::Column { .. } | ScalarExpr::Literal { .. } | ScalarExpr::OuterColumn { .. } => {
             expr.clone()
         }
@@ -152,6 +151,10 @@ fn substitute_parameter_in_expr(expr: &ScalarExpr, values: &[Value]) -> ScalarEx
             data_type: data_type.clone(),
         },
     }
+}
+
+fn zero_based_parameter_slot(index: u32) -> Option<usize> {
+    usize::try_from(index.checked_sub(1)?).ok()
 }
 
 /// If `left` or `right` is a `Literal` and the other side is a `Column`
@@ -590,5 +593,41 @@ where
             assignments: assignments.iter().map(|(i, e)| (*i, f(e))).collect(),
             r#where: r#where.as_ref().map(f),
         },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ultrasql_core::{Field, Schema};
+
+    #[test]
+    fn substitute_ignores_zero_parameter_index() {
+        let schema = Schema::new([Field::nullable("p", DataType::Null)]).expect("schema");
+        let plan = LogicalPlan::Project {
+            input: Box::new(LogicalPlan::Empty {
+                schema: Schema::empty(),
+            }),
+            exprs: vec![(
+                ScalarExpr::Parameter {
+                    index: 0,
+                    data_type: DataType::Null,
+                },
+                "p".to_owned(),
+            )],
+            schema,
+        };
+
+        let substituted = substitute_parameters_in_plan(&plan, &[Value::Int32(7)]);
+        let LogicalPlan::Project { exprs, .. } = substituted else {
+            panic!("expected Project");
+        };
+        assert!(matches!(
+            exprs[0].0,
+            ScalarExpr::Parameter {
+                index: 0,
+                data_type: DataType::Null
+            }
+        ));
     }
 }

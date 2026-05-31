@@ -97,6 +97,8 @@ as a concise evidence ledger; roadmap stays for open gates only.
   protocol's signed-16-bit parameter slots before caching session state.
 - Extended-query binary Bind now preserves explicit cast target types on
   parameters, avoiding unknown-binary fallback to `bytea` for casted text slots.
+- Extended-query parameter slot math now uses checked one-based conversions in
+  Bind, Describe, LIMIT/OFFSET rebinding, and substitution.
 - Focused `ultrasql-executor` coverage now exercises scalar compatibility
   functions, physical lowering edge families, row encoding/decoding,
   projection/filter/sort/unique/set/window/hash aggregate behavior, modify-table
