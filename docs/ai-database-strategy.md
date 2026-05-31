@@ -99,8 +99,8 @@ claims auditable and gives operators enough information to tune production.
 
 Every AI claim needs raw artifacts:
 
-- Exact top-k across installed measured engines and vector extensions when
-  available.
+- Exact top-k across UltraSQL, PostgreSQL+pgvector, DuckDB, and ClickHouse
+  when strict release certification is requested.
 - HNSW recall/latency across rows, dimensions, filters, and update/restart
   cycles.
 - Hybrid BM25 + vector search with deterministic answer checksums.
@@ -112,8 +112,10 @@ Every AI claim needs raw artifacts:
   prompt/version dimensions.
 
 Missing measured engines are allowed only as explicit `not_available`
-artifacts with reason fields. No README, release note, or package metadata may
-rank a missing engine.
+artifacts with reason fields in smoke runs. Strict release certification sets
+`AI_GAUNTLET_REQUIRE_PGVECTOR=1`, `AI_GAUNTLET_REQUIRE_DUCKDB=1`, and
+`AI_GAUNTLET_REQUIRE_CLICKHOUSE=1`, so exact-vector gaps stop certification
+instead of becoming publishable claims.
 
 ## Implementation Slices
 

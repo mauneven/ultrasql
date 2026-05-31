@@ -112,7 +112,10 @@ run_vector_ann_full() {
 }
 
 run_vector_topk_full() {
-    benchmarks/vector_topk_exact.sh
+    VECTOR_TOPK_REQUIRE_PGVECTOR=1 \
+        VECTOR_TOPK_REQUIRE_DUCKDB=1 \
+        VECTOR_TOPK_REQUIRE_CLICKHOUSE=1 \
+        benchmarks/vector_topk_exact.sh
 }
 
 run_ai_vector_pgvector_full() {
@@ -124,7 +127,11 @@ run_ai_gauntlet_smoke() {
 }
 
 run_ai_gauntlet_full() {
-    AI_GAUNTLET_PROFILE=full benchmarks/ai_benchmark_gauntlet.sh full
+    AI_GAUNTLET_PROFILE=full \
+        AI_GAUNTLET_REQUIRE_PGVECTOR=1 \
+        AI_GAUNTLET_REQUIRE_DUCKDB=1 \
+        AI_GAUNTLET_REQUIRE_CLICKHOUSE=1 \
+        benchmarks/ai_benchmark_gauntlet.sh full
 }
 
 run_csv_gauntlet_smoke() {

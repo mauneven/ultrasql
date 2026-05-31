@@ -41,7 +41,11 @@ fn ai_gauntlet_declares_required_suites_and_artifacts() {
     assert!(script.contains("--workload hybrid-search-latency"));
     assert!(script.contains("--workload rag-retrieval-quality"));
     assert!(script.contains("AI_GAUNTLET_REQUIRE_PGVECTOR"));
+    assert!(script.contains("AI_GAUNTLET_REQUIRE_DUCKDB"));
+    assert!(script.contains("AI_GAUNTLET_REQUIRE_CLICKHOUSE"));
     assert!(script.contains("VECTOR_TOPK_REQUIRE_PGVECTOR=\"$REQUIRE_PGVECTOR\""));
+    assert!(script.contains("VECTOR_TOPK_REQUIRE_DUCKDB=\"$REQUIRE_DUCKDB\""));
+    assert!(script.contains("VECTOR_TOPK_REQUIRE_CLICKHOUSE=\"$REQUIRE_CLICKHOUSE\""));
     assert!(script.contains("VECTOR_TOPK_RENDER_RESULTS=0"));
     assert!(script.contains("ai_benchmark_gauntlet_manifest.json"));
     assert!(script.contains("has_failed"));
@@ -181,6 +185,10 @@ fn exact_topk_script_has_clickhouse_exact_scan_path() {
     assert!(script.contains("clickhouse_vector"));
     assert!(script.contains("arrayMap"));
     assert!(script.contains("CLICKHOUSE_BIN"));
+    assert!(script.contains("VECTOR_TOPK_REQUIRE_DUCKDB"));
+    assert!(script.contains("VECTOR_TOPK_REQUIRE_CLICKHOUSE"));
+    assert!(script.contains("requires measured DuckDB LIST artifact"));
+    assert!(script.contains("requires measured ClickHouse vector artifact"));
 }
 
 #[test]
@@ -194,4 +202,8 @@ fn certification_runner_exposes_ai_gauntlet_profiles() {
     assert!(script.contains("run_ai_gauntlet_full"));
     assert!(script.contains("benchmarks/ai_vector_pgvector_certify.sh"));
     assert!(script.contains("benchmarks/ai_benchmark_gauntlet.sh"));
+    assert!(script.contains("VECTOR_TOPK_REQUIRE_DUCKDB=1"));
+    assert!(script.contains("VECTOR_TOPK_REQUIRE_CLICKHOUSE=1"));
+    assert!(script.contains("AI_GAUNTLET_REQUIRE_DUCKDB=1"));
+    assert!(script.contains("AI_GAUNTLET_REQUIRE_CLICKHOUSE=1"));
 }

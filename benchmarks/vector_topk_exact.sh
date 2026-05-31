@@ -21,6 +21,8 @@ WARMUP="${WARMUP:-2}"
 PGDATABASE="${PGDATABASE:-ultrasql_bench}"
 PGUSER="${PGUSER:-$(id -un)}"
 REQUIRE_PGVECTOR="${VECTOR_TOPK_REQUIRE_PGVECTOR:-0}"
+REQUIRE_DUCKDB="${VECTOR_TOPK_REQUIRE_DUCKDB:-0}"
+REQUIRE_CLICKHOUSE="${VECTOR_TOPK_REQUIRE_CLICKHOUSE:-0}"
 AUTO_PGVECTOR="${VECTOR_TOPK_AUTO_PGVECTOR:-1}"
 PGVECTOR_IMAGE="${VECTOR_TOPK_PGVECTOR_IMAGE:-pgvector/pgvector:pg17}"
 PGVECTOR_CONTAINER="${VECTOR_TOPK_PGVECTOR_CONTAINER:-ultrasql-pgvector-topk}"
@@ -224,7 +226,7 @@ doc = {
     "index_size_status": "not_applicable_exact_scan",
     "iterations_us": samples,
     "answer": answer,
-    "policy": "Raw measured samples only; same-host certification requires paired UltraSQL and PostgreSQL+pgvector measured artifacts.",
+    "policy": "Raw measured samples only; same-host certification requires paired UltraSQL, PostgreSQL+pgvector, DuckDB, and ClickHouse measured artifacts when the corresponding require flags are enabled.",
 }
 print(json.dumps(doc, separators=(",", ":")))
 PY
@@ -654,6 +656,10 @@ if (( duck_status == 0 )); then
     echo "duckdb_list measured"
 elif (( duck_status == 1 )); then
     echo "duckdb_list unavailable; recorded not_available"
+    if [[ "$REQUIRE_DUCKDB" == "1" ]]; then
+        echo "VECTOR_TOPK_REQUIRE_DUCKDB=1 requires measured DuckDB LIST artifact" >&2
+        exit 2
+    fi
 else
     exit "$duck_status"
 fi
@@ -664,6 +670,10 @@ if (( clickhouse_status == 0 )); then
     echo "clickhouse_vector measured"
 elif (( clickhouse_status == 1 )); then
     echo "clickhouse_vector unavailable; recorded not_available"
+    if [[ "$REQUIRE_CLICKHOUSE" == "1" ]]; then
+        echo "VECTOR_TOPK_REQUIRE_CLICKHOUSE=1 requires measured ClickHouse vector artifact" >&2
+        exit 2
+    fi
 else
     exit "$clickhouse_status"
 fi

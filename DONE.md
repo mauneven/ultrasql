@@ -2267,3 +2267,13 @@ as a concise evidence ledger; roadmap stays for open gates only.
   `cargo +nightly miri test -p ultrasql-storage page::tests::insert_and_read_round_trip`,
   `cargo +nightly miri test -p ultrasql-storage buffer_pool::tests::read_after_write_sees_update`,
   `cargo +nightly miri test -p ultrasql-parser parser::tests::deeply_nested_parens_rejected_without_overflow`.
+- AI exact-vector certification now has strict competitor gates:
+  `VECTOR_TOPK_REQUIRE_PGVECTOR`, `VECTOR_TOPK_REQUIRE_DUCKDB`, and
+  `VECTOR_TOPK_REQUIRE_CLICKHOUSE` fail release certification when required
+  same-host PostgreSQL+pgvector, DuckDB, or ClickHouse artifacts are missing.
+  The AI gauntlet forwards the matching `AI_GAUNTLET_REQUIRE_*` flags, while
+  smoke profiles still record explicit `not_available` artifacts. Evidence:
+  `cargo test -p ultrasql-bench --test ai_benchmark_gauntlet_script -- --nocapture`,
+  `bash -n benchmarks/vector_topk_exact.sh`,
+  `bash -n benchmarks/ai_benchmark_gauntlet.sh`,
+  `bash -n benchmarks/certify.sh`.
