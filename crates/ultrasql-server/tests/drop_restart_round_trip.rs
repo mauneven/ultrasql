@@ -161,6 +161,42 @@ async fn table_runtime_metadata_rejects_duplicate_sequence_default_rows_on_rebui
     );
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn table_runtime_metadata_rejects_duplicate_identity_rows_on_rebuild() {
+    let data_dir = tempfile::TempDir::new().unwrap();
+    let metadata_path = data_dir.path().join("pg_table_runtime.meta");
+
+    let running =
+        start_persistent_server(data_dir.path(), "table_runtime_duplicate_identity").await;
+    running
+        .client
+        .batch_execute(
+            "CREATE TABLE table_runtime_identity_dup \
+             (id INT GENERATED ALWAYS AS IDENTITY, v INT)",
+        )
+        .await
+        .expect("create table with identity metadata");
+    shutdown(running).await;
+
+    let mut metadata =
+        std::fs::read_to_string(&metadata_path).expect("table runtime metadata exists");
+    let identity_line = metadata
+        .lines()
+        .find(|line| line.starts_with("identity_always\t"))
+        .expect("identity metadata row")
+        .to_owned();
+    metadata.push_str(&identity_line);
+    metadata.push('\n');
+    std::fs::write(&metadata_path, metadata).expect("duplicate identity metadata");
+
+    let err = Server::init(data_dir.path()).expect_err("duplicate identity metadata rejected");
+    assert!(
+        err.to_string()
+            .contains("duplicate table-runtime identity metadata"),
+        "expected duplicate table-runtime identity metadata rejection, got {err}"
+    );
+}
+
 async fn assert_undefined_table(client: &tokio_postgres::Client, sql: &str) {
     let err = client.query(sql, &[]).await.expect_err("query should fail");
     let db_error = err.as_db_error().expect("server returns SQLSTATE");
