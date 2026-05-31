@@ -415,6 +415,53 @@ async fn create_unique_partial_index_enforces_only_matching_rows() {
 }
 
 #[tokio::test]
+async fn partial_index_runtime_predicate_error_returns_sqlstate() {
+    let (client, _conn_handle, server_handle) = start_server_and_connect().await;
+    client
+        .batch_execute("CREATE TABLE t_partial_error (id INT NOT NULL, raw TEXT NOT NULL)")
+        .await
+        .expect("create table");
+    client
+        .batch_execute(
+            "CREATE INDEX idx_partial_error ON t_partial_error (id) \
+             WHERE CAST(raw AS INTEGER) > 0",
+        )
+        .await
+        .expect("create partial index");
+
+    let err = client
+        .batch_execute("INSERT INTO t_partial_error VALUES (1, 'not-an-int')")
+        .await
+        .expect_err("partial index predicate runtime cast must reject row");
+    let db_err = err.as_db_error().expect("DB error");
+    assert_eq!(db_err.code().code(), "22P02");
+
+    shutdown(client, server_handle).await;
+}
+
+#[tokio::test]
+async fn expression_index_runtime_key_error_returns_sqlstate() {
+    let (client, _conn_handle, server_handle) = start_server_and_connect().await;
+    client
+        .batch_execute("CREATE TABLE t_expr_error (raw TEXT NOT NULL)")
+        .await
+        .expect("create table");
+    client
+        .batch_execute("CREATE INDEX idx_expr_error ON t_expr_error ((CAST(raw AS INTEGER)))")
+        .await
+        .expect("create expression index");
+
+    let err = client
+        .batch_execute("INSERT INTO t_expr_error VALUES ('not-an-int')")
+        .await
+        .expect_err("expression index key runtime cast must reject row");
+    let db_err = err.as_db_error().expect("DB error");
+    assert_eq!(db_err.code().code(), "22P02");
+
+    shutdown(client, server_handle).await;
+}
+
+#[tokio::test]
 async fn create_unique_covering_index_keeps_include_columns_out_of_key() {
     let (client, _conn_handle, server_handle) = start_server_and_connect().await;
     client

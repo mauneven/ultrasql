@@ -1510,11 +1510,10 @@ fn build_one_insert_index_maintainer(
     let index_name = index.name.clone();
     let encoder: InsertIndexEncoder = Arc::new(move |row: &[Value]| {
         if let Some(predicate) = &predicate {
-            match Eval::new(predicate.clone()).eval(row).map_err(|e| {
-                ultrasql_executor::ExecError::TypeMismatch(format!(
-                    "index {index_name} partial predicate: {e}"
-                ))
-            })? {
+            match Eval::new(predicate.clone())
+                .eval(row)
+                .map_err(eval_error_to_exec_error)?
+            {
                 Value::Bool(true) => {}
                 Value::Bool(false) | Value::Null => return Ok(None),
                 other => {
@@ -1526,11 +1525,9 @@ fn build_one_insert_index_maintainer(
             }
         }
         if !key_exprs.is_empty() {
-            let value = Eval::new(key_exprs[0].clone()).eval(row).map_err(|e| {
-                ultrasql_executor::ExecError::TypeMismatch(format!(
-                    "index {index_name} expression key: {e}"
-                ))
-            })?;
+            let value = Eval::new(key_exprs[0].clone())
+                .eval(row)
+                .map_err(eval_error_to_exec_error)?;
             if method == LogicalIndexMethod::Hash {
                 return Ok(crate::hash_index_value(&value));
             }
