@@ -285,6 +285,58 @@ async fn createrole_role_cannot_alter_superuser_roles() {
 }
 
 #[tokio::test]
+async fn createrole_role_cannot_grant_or_set_privileged_roles() {
+    let running = start_sample_server("role_ddl_test").await;
+    let client = &running.client;
+
+    client
+        .batch_execute(
+            "CREATE ROLE delegated_admin CREATEROLE LOGIN; \
+             CREATE ROLE other_admin SUPERUSER LOGIN; \
+             GRANT other_admin TO delegated_admin",
+        )
+        .await
+        .expect("create delegated admin with privileged membership");
+
+    let conn_str = format!(
+        "host={host} port={port} user=delegated_admin application_name=privileged_membership_reject",
+        host = running.bound.ip(),
+        port = running.bound.port()
+    );
+    let (delegated, delegated_conn) = tokio_postgres::connect(&conn_str, NoTls)
+        .await
+        .expect("connect as delegated admin");
+    let delegated_conn = tokio::spawn(async move {
+        if let Err(err) = delegated_conn.await {
+            eprintln!("delegated admin connection error: {err}");
+        }
+    });
+
+    assert_insufficient_privilege(
+        delegated
+            .batch_execute("GRANT ultrasql TO delegated_admin")
+            .await
+            .expect_err("CREATEROLE cannot grant bootstrap superuser membership"),
+    );
+    assert_insufficient_privilege(
+        delegated
+            .batch_execute("GRANT other_admin TO delegated_admin")
+            .await
+            .expect_err("CREATEROLE cannot grant superuser membership"),
+    );
+    assert_insufficient_privilege(
+        delegated
+            .batch_execute("SET ROLE other_admin")
+            .await
+            .expect_err("non-superuser cannot set privileged role"),
+    );
+
+    drop(delegated);
+    delegated_conn.await.expect("delegated connection joins");
+    shutdown(running).await;
+}
+
+#[tokio::test]
 async fn nologin_role_cannot_connect() {
     let running = start_sample_server("role_ddl_test").await;
     let client = &running.client;

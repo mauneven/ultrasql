@@ -230,6 +230,7 @@ where
             ));
         };
         self.ensure_role_administration()?;
+        self.ensure_privileged_role_membership_grant(roles)?;
         let before_roles = self.state.role_catalog.list_roles();
         let before_memberships = self.state.role_catalog.list_memberships();
         self.state
@@ -291,6 +292,7 @@ where
                         "permission denied to set role {role}"
                     )));
                 }
+                self.ensure_set_role_target_not_privileged(role)?;
                 self.current_user = role.clone();
             }
             None => {
@@ -312,6 +314,30 @@ where
                 self.current_user
             ))),
         }
+    }
+
+    fn ensure_privileged_role_membership_grant(&self, roles: &[String]) -> Result<(), ServerError> {
+        if self.current_role_is_superuser() {
+            return Ok(());
+        }
+        if roles
+            .iter()
+            .any(|role| self.lookup_role_is_privileged(role.as_str()))
+        {
+            return Err(ServerError::InsufficientPrivilege(
+                "granting privileged role memberships requires SUPERUSER".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn ensure_set_role_target_not_privileged(&self, role: &str) -> Result<(), ServerError> {
+        if self.auth_role_is_superuser() || !self.lookup_role_is_privileged(role) {
+            return Ok(());
+        }
+        Err(ServerError::InsufficientPrivilege(
+            "setting privileged roles requires SUPERUSER".to_owned(),
+        ))
     }
 
     fn ensure_privileged_role_attributes(
@@ -346,11 +372,25 @@ where
         Ok(())
     }
 
+    fn auth_role_is_superuser(&self) -> bool {
+        match self.state.role_catalog.lookup_role(&self.auth_user) {
+            Some(role) => role.is_superuser,
+            None => self.auth_user.eq_ignore_ascii_case("tester"),
+        }
+    }
+
     fn current_role_is_superuser(&self) -> bool {
         match self.state.role_catalog.lookup_role(&self.current_user) {
             Some(role) => role.is_superuser,
             None => self.current_user.eq_ignore_ascii_case("tester"),
         }
+    }
+
+    fn lookup_role_is_privileged(&self, role: &str) -> bool {
+        self.state
+            .role_catalog
+            .lookup_role(role)
+            .is_some_and(|role| role_is_privileged_membership_target(&role))
     }
 }
 
@@ -447,6 +487,10 @@ fn role_options_grant_privileged_attributes(options: &LogicalRoleOptions) -> boo
     matches!(options.superuser, Some(true))
         || matches!(options.replication, Some(true))
         || matches!(options.bypass_rls, Some(true))
+}
+
+fn role_is_privileged_membership_target(role: &RoleEntry) -> bool {
+    role.is_superuser || role.replication || role.bypass_rls
 }
 
 fn hash_role_password(password: Option<&str>) -> Result<Option<PasswordHash>, ServerError> {
