@@ -845,8 +845,9 @@ as a concise evidence ledger; roadmap stays for open gates only.
   `MIN` / `MAX` through wire round-trip tests.
 - Text-backed full-text search now covers `to_tsvector`,
   `to_tsquery`, `plainto_tsquery`, `websearch_to_tsquery`, `phraseto_tsquery`,
-  `@@`, and deterministic `ts_rank`, `ts_rank_cd`, and `ts_headline` subsets
-  through binder, executor, and wire tests.
+  `@@`, deterministic `ts_rank`, `ts_rank_cd`, and `ts_headline` subsets, plus
+  `numnode` / `querytree` query-inspection helpers through binder, executor,
+  and wire tests.
   `TSVECTOR` and `TSQUERY` now have dedicated logical types, PostgreSQL OIDs
   `3614` / `3615`, array OIDs `3643` / `3645`, `pg_type` rows, and
   RowDescription coverage while retaining the current text-backed value

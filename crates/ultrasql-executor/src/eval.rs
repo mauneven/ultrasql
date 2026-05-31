@@ -328,6 +328,8 @@ fn eval_function_call(
         }
         "ts_rank" | "ts_rank_cd" => eval_ts_rank(name, args),
         "ts_headline" => eval_ts_headline(args),
+        "numnode" => eval_numnode(args),
+        "querytree" => eval_querytree(args),
         "ifnull" | "nvl" => eval_ifnull(args),
         "nullif" => eval_nullif(args),
         "least" => eval_extremum(args, "least", ExtremumKind::Least, NullPolicy::Ignore),
@@ -4365,6 +4367,26 @@ fn text_search_payload_arg<'a>(
     }
 }
 
+fn tsquery_payload_arg<'a>(
+    func_name: &str,
+    args: &'a [Value],
+) -> Result<Option<&'a str>, EvalError> {
+    let [payload] = args else {
+        return Err(EvalError::Type(format!(
+            "{func_name}: expected 1 arg, got {}",
+            args.len()
+        )));
+    };
+    match payload {
+        Value::Null => Ok(None),
+        Value::Text(text) => Ok(Some(text.as_str())),
+        other => Err(EvalError::Type(format!(
+            "{func_name}: text-backed TSQUERY required, got {:?}",
+            other.data_type()
+        ))),
+    }
+}
+
 fn eval_to_tsvector(args: &[Value]) -> Result<Value, EvalError> {
     let Some(text) = text_search_payload_arg("to_tsvector", args)? else {
         return Ok(Value::Null);
@@ -4441,6 +4463,22 @@ fn eval_ts_headline(args: &[Value]) -> Result<Value, EvalError> {
     };
     let terms = text_search_terms(query);
     Ok(Value::Text(highlight_text_search_terms(document, &terms)))
+}
+
+fn eval_numnode(args: &[Value]) -> Result<Value, EvalError> {
+    let Some(query) = tsquery_payload_arg("numnode", args)? else {
+        return Ok(Value::Null);
+    };
+    let node_count = i32::try_from(text_search_terms(query).len())
+        .map_err(|_| EvalError::Type("numnode: query node count overflow".to_owned()))?;
+    Ok(Value::Int32(node_count))
+}
+
+fn eval_querytree(args: &[Value]) -> Result<Value, EvalError> {
+    let Some(query) = tsquery_payload_arg("querytree", args)? else {
+        return Ok(Value::Null);
+    };
+    Ok(Value::Text(text_search_terms(query).join(" & ")))
 }
 
 fn highlight_text_search_terms(document: &str, terms: &[String]) -> String {
@@ -7917,6 +7955,24 @@ mod tests {
             headline,
             Value::Text("The <b>Quick</b> brown <b>fox</b>.".into())
         );
+
+        let node_count = Eval::new(call(
+            "numnode",
+            vec![lit_text("quick & missing")],
+            DataType::Int32,
+        ))
+        .eval(&[])
+        .unwrap();
+        assert_eq!(node_count, Value::Int32(2));
+
+        let querytree = Eval::new(call(
+            "querytree",
+            vec![lit_text("Quick & missing")],
+            DataType::Text { max_len: None },
+        ))
+        .eval(&[])
+        .unwrap();
+        assert_eq!(querytree, Value::Text("quick & missing".into()));
     }
 
     // -----------------------------------------------------------------------

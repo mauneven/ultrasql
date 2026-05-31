@@ -1538,6 +1538,8 @@ fn builtin_return_type(func_name: &str, args: &[ScalarExpr]) -> Result<DataType,
         }
         "ts_rank" | "ts_rank_cd" => Ok(DataType::Float64),
         "ts_headline" => Ok(DataType::Text { max_len: None }),
+        "numnode" => Ok(DataType::Int32),
+        "querytree" => Ok(DataType::Text { max_len: None }),
         "row_to_json" | "json_build_object" | "jsonb_set" => Ok(DataType::Jsonb),
         "jsonb_path_exists"
         | "xml_is_well_formed"
@@ -1773,6 +1775,8 @@ pub(super) fn is_supported_builtin(func_name: &str) -> bool {
             | "ts_rank"
             | "ts_rank_cd"
             | "ts_headline"
+            | "numnode"
+            | "querytree"
             | "row_to_json"
             | "json_build_object"
             | "jsonb_set"
@@ -1875,6 +1879,7 @@ fn validate_builtin_args(func_name: &str, args: &mut [ScalarExpr]) -> Result<(),
         | "phraseto_tsquery" => validate_text_search_constructor_args(func_name, args),
         "ts_rank" | "ts_rank_cd" => validate_ts_rank_args(func_name, args),
         "ts_headline" => validate_ts_headline_args(args),
+        "numnode" | "querytree" => validate_tsquery_inspector_args(func_name, args),
         "xmlparse" => validate_xmlparse_args(args),
         "xmlserialize" => validate_xmlserialize_args(args),
         "xml_is_well_formed" | "xml_is_well_formed_content" | "xml_is_well_formed_document" => {
@@ -2150,6 +2155,11 @@ fn validate_ts_headline_args(args: &[ScalarExpr]) -> Result<(), PlanError> {
             "ts_headline: expected 2 or 3 arguments, got {n}"
         ))),
     }
+}
+
+fn validate_tsquery_inspector_args(func_name: &str, args: &[ScalarExpr]) -> Result<(), PlanError> {
+    validate_exact_arg_count(func_name, args, 1)?;
+    validate_tsquery_arg(func_name, &args[0])
 }
 
 fn validate_tsvector_arg(func_name: &str, arg: &ScalarExpr) -> Result<(), PlanError> {
@@ -4288,6 +4298,8 @@ mod typed_literal_tests {
             ("ts_rank", Vec::new(), DataType::Float64),
             ("ts_rank_cd", Vec::new(), DataType::Float64),
             ("ts_headline", Vec::new(), text.clone()),
+            ("numnode", Vec::new(), DataType::Int32),
+            ("querytree", Vec::new(), text.clone()),
             ("row_to_json", Vec::new(), DataType::Jsonb),
             ("jsonb_path_exists", Vec::new(), DataType::Bool),
             (
@@ -4391,6 +4403,10 @@ mod typed_literal_tests {
             .is_ok()
         );
         assert!(validate_builtin_args("ts_headline", &mut [null_arg(text.clone())]).is_err());
+        assert!(validate_builtin_args("numnode", &mut [null_arg(DataType::TsQuery)]).is_ok());
+        assert!(validate_builtin_args("numnode", &mut [null_arg(text.clone())]).is_err());
+        assert!(validate_builtin_args("querytree", &mut [null_arg(DataType::TsQuery)]).is_ok());
+        assert!(validate_builtin_args("querytree", &mut [null_arg(text.clone())]).is_err());
         assert!(
             validate_builtin_args(
                 "has_column_privilege",
