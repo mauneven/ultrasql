@@ -189,6 +189,53 @@ async fn core_scalar_types_round_trip_over_postgres_wire() {
 
     client
         .batch_execute(
+            "CREATE TABLE scalar_invalid_text_cast_surface (
+                as_int TEXT NOT NULL,
+                as_bool TEXT NOT NULL,
+                as_float TEXT NOT NULL,
+                as_date TEXT NOT NULL,
+                as_time TEXT NOT NULL,
+                as_timestamp TEXT NOT NULL,
+                as_timestamptz TEXT NOT NULL,
+                as_timetz TEXT NOT NULL
+             );
+             INSERT INTO scalar_invalid_text_cast_surface
+             VALUES (
+                'not-int',
+                'maybe',
+                'not-float',
+                'not-date',
+                'not-time',
+                'not-timestamp',
+                'not-timestamptz',
+                'not-timetz'
+             )",
+        )
+        .await
+        .expect("create invalid scalar text cast table");
+    for query in [
+        "SELECT CAST(as_int AS INTEGER) FROM scalar_invalid_text_cast_surface",
+        "SELECT CAST(as_bool AS BOOLEAN) FROM scalar_invalid_text_cast_surface",
+        "SELECT CAST(as_float AS DOUBLE PRECISION) FROM scalar_invalid_text_cast_surface",
+        "SELECT CAST(as_date AS DATE) FROM scalar_invalid_text_cast_surface",
+        "SELECT CAST(as_time AS TIME) FROM scalar_invalid_text_cast_surface",
+        "SELECT CAST(as_timestamp AS TIMESTAMP) FROM scalar_invalid_text_cast_surface",
+        "SELECT CAST(as_timestamptz AS TIMESTAMP WITH TIME ZONE) FROM scalar_invalid_text_cast_surface",
+        "SELECT CAST(as_timetz AS TIME WITH TIME ZONE) FROM scalar_invalid_text_cast_surface",
+    ] {
+        let err = client
+            .simple_query(query)
+            .await
+            .expect_err("invalid scalar runtime text cast must fail");
+        assert_eq!(
+            err.code().map(tokio_postgres::error::SqlState::code),
+            Some("22P02"),
+            "{query}"
+        );
+    }
+
+    client
+        .batch_execute(
             "CREATE TABLE structured_text_cast_surface (
                 as_uuid TEXT NOT NULL,
                 as_json TEXT NOT NULL,

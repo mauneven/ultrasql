@@ -1795,6 +1795,10 @@ as a concise evidence ledger; roadmap stays for open gates only.
 - Runtime structured text casts to `UUID`, `JSON`, and `JSONB` now report
   SQLSTATE `22P02` for invalid column text. Evidence:
   `cargo test -p ultrasql-server --test core_type_surface_round_trip core_scalar_types_round_trip_over_postgres_wire -- --nocapture`.
+- Runtime scalar/temporal text casts to integer, float, boolean, date, time,
+  timestamp, timestamptz, and timetz now report SQLSTATE `22P02` for invalid
+  column text. Evidence:
+  `cargo test -p ultrasql-server --test core_type_surface_round_trip core_scalar_types_round_trip_over_postgres_wire -- --nocapture`.
 - Bare `NUMERIC` heap scans now preserve per-row display scale from the stored
   PostgreSQL numeric payload. The row codec keeps dynamic numeric scan builders
   text-backed, materializes them back to `Value::Decimal` for downstream DML,
