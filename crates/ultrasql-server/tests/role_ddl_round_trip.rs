@@ -181,6 +181,36 @@ async fn non_createrole_role_cannot_manage_roles() {
     shutdown(running).await;
 }
 
+#[tokio::test]
+async fn nologin_role_cannot_connect() {
+    let running = start_sample_server("role_ddl_test").await;
+    let client = &running.client;
+
+    client
+        .batch_execute("CREATE ROLE blocked_login NOLOGIN")
+        .await
+        .expect("create NOLOGIN role");
+
+    let conn_str = format!(
+        "host={host} port={port} user=blocked_login application_name=nologin_reject",
+        host = running.bound.ip(),
+        port = running.bound.port()
+    );
+    let err = match tokio_postgres::connect(&conn_str, NoTls).await {
+        Ok(_) => panic!("NOLOGIN role connection must fail"),
+        Err(err) => err,
+    };
+    let db = err.as_db_error().expect("startup ErrorResponse");
+    assert_eq!(db.code().code(), "28000");
+    assert!(
+        db.message().contains("not permitted to log in"),
+        "expected NOLOGIN rejection, got {}",
+        db.message()
+    );
+
+    shutdown(running).await;
+}
+
 #[test]
 fn role_metadata_rejects_duplicate_role_names_on_rebuild() {
     let data_dir = tempfile::TempDir::new().expect("temp data dir");

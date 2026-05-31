@@ -29,6 +29,7 @@ use ultrasql_storage::page::Page;
 use ultrasql_txn::{IsolationLevel, Transaction, TransactionManager};
 
 use super::Session;
+use crate::auth::pg_authid::AuthCatalog;
 use crate::error::ServerError;
 use crate::extended;
 use crate::pipeline::{self, LowerCtx, SampleTables};
@@ -189,6 +190,23 @@ where
                     return Err(ServerError::AuthFailed);
                 }
             }
+        }
+        if let Some(role) = self.state.role_catalog.lookup_role(&self.auth_user)
+            && !role.can_login
+        {
+            let _ = self
+                .send(&BackendMessage::ErrorResponse {
+                    fields: vec![
+                        (b'S', "FATAL".to_string()),
+                        (b'C', "28000".to_string()),
+                        (
+                            b'M',
+                            format!("role {} is not permitted to log in", self.auth_user),
+                        ),
+                    ],
+                })
+                .await;
+            return Err(ServerError::AuthFailed);
         }
         if self.state.logging_config.log_connections {
             let user = params
