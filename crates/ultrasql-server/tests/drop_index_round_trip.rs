@@ -110,3 +110,62 @@ async fn drop_index_rejects_constraint_backed_primary_key_index() {
 
     shutdown(running).await;
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn drop_index_rejects_live_unique_constraint_indexes() {
+    let data_dir = tempfile::TempDir::new().expect("temp data dir");
+    let running = start_persistent_server(data_dir.path(), "drop_index_unique_constraint").await;
+
+    running
+        .client
+        .batch_execute("CREATE TABLE drop_index_uq (id INT, email TEXT UNIQUE)")
+        .await
+        .expect("create inline unique table");
+    let inline_err = running
+        .client
+        .batch_execute("DROP INDEX drop_index_uq_email_key")
+        .await
+        .expect_err("inline unique constraint index drop must be restricted");
+    assert_eq!(inline_err.code().expect("SQLSTATE").code(), "2BP01");
+
+    running
+        .client
+        .batch_execute("INSERT INTO drop_index_uq (id, email) VALUES (1, 'a')")
+        .await
+        .expect("insert first inline unique row");
+    running
+        .client
+        .batch_execute("INSERT INTO drop_index_uq (id, email) VALUES (2, 'a')")
+        .await
+        .expect_err("inline unique enforcement must remain active");
+
+    running
+        .client
+        .batch_execute("CREATE TABLE drop_index_alter_uq (id INT, email TEXT)")
+        .await
+        .expect("create alter unique table");
+    running
+        .client
+        .batch_execute("ALTER TABLE drop_index_alter_uq ADD CONSTRAINT drop_index_alter_uq_email_key UNIQUE (email)")
+        .await
+        .expect("add alter unique constraint");
+    let alter_err = running
+        .client
+        .batch_execute("DROP INDEX drop_index_alter_uq_email_key")
+        .await
+        .expect_err("alter unique constraint index drop must be restricted");
+    assert_eq!(alter_err.code().expect("SQLSTATE").code(), "2BP01");
+
+    running
+        .client
+        .batch_execute("INSERT INTO drop_index_alter_uq (id, email) VALUES (1, 'b')")
+        .await
+        .expect("insert first alter unique row");
+    running
+        .client
+        .batch_execute("INSERT INTO drop_index_alter_uq (id, email) VALUES (2, 'b')")
+        .await
+        .expect_err("alter unique enforcement must remain active");
+
+    shutdown(running).await;
+}

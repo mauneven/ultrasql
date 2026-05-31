@@ -1755,6 +1755,31 @@ impl PersistentCatalog {
         Ok(())
     }
 
+    /// Publish committed `pg_constraint` rows to the live catalog side map.
+    ///
+    /// DDL callers invoke this only after the catalog-write transaction commits.
+    /// Bootstrap installs the same rows from heap during startup.
+    pub fn install_constraint_rows<I>(&self, rows: I)
+    where
+        I: IntoIterator<Item = ConstraintRow>,
+    {
+        for row in rows {
+            self.pg_constraint.insert(row.oid, row);
+        }
+    }
+
+    /// Remove live `pg_constraint` rows owned by one dropped table.
+    pub fn remove_constraints_for_table(&self, table_oid: Oid) {
+        let stale = self
+            .pg_constraint
+            .iter()
+            .filter_map(|row| (row.value().conrelid == table_oid).then_some(*row.key()))
+            .collect::<Vec<_>>();
+        for oid in stale {
+            self.pg_constraint.remove(&oid);
+        }
+    }
+
     /// Return a constraint that depends on an index name for one table.
     ///
     /// Constraint-created indexes use the constraint name as the index name in
@@ -2622,6 +2647,7 @@ impl MutableCatalog for PersistentCatalog {
                 self.indexes_by_name.remove(&fold_name(&idx.name));
             }
         }
+        self.remove_constraints_for_table(removed.oid);
         self.rebuild_snapshot();
         Ok(())
     }

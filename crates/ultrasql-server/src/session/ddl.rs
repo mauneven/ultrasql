@@ -832,6 +832,9 @@ where
         }
         self.state
             .commit_transaction(ddl_txn, true, "CREATE TABLE catalog-write transaction")?;
+        self.state
+            .persistent_catalog
+            .install_constraint_rows(persistent_constraint_rows);
         let mut row_security = self
             .state
             .row_security

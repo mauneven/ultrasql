@@ -702,6 +702,10 @@ as a concise evidence ledger; roadmap stays for open gates only.
   constraint-backed indexes, preventing direct index drops from weakening
   declared constraints. Evidence:
   `cargo test -p ultrasql-server --test drop_index_round_trip`.
+- Committed `pg_constraint` rows are now installed into the live catalog map
+  before restart, so same-session `DROP INDEX` also rejects inline and
+  `ALTER TABLE ADD UNIQUE` constraint indexes. Evidence:
+  `cargo test -p ultrasql-server --test drop_index_round_trip`.
 - Dropped sequences remove sequence privilege grants from memory and durable
   `pg_privileges.meta`, so a recreated sequence cannot inherit stale ACLs by
   name. Evidence:

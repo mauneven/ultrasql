@@ -207,6 +207,9 @@ where
             true,
             "ALTER TABLE ADD CONSTRAINT catalog transaction",
         )?;
+        self.state
+            .persistent_catalog
+            .install_constraint_rows([constraint_row]);
         self.plan_cache_invalidate();
         Ok(run_ddl_command("ALTER TABLE"))
     }
