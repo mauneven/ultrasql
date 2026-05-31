@@ -1045,6 +1045,29 @@ async fn psql_describe_table_policy_probe_accepts_empty_pg_policy() {
 }
 
 #[tokio::test]
+async fn pg_settings_reflects_active_transaction_isolation() {
+    let (_server, client, _conn, server_handle) = start_server_and_connect().await;
+
+    client
+        .batch_execute("BEGIN ISOLATION LEVEL REPEATABLE READ")
+        .await
+        .expect("begin repeatable read");
+    let row = client
+        .query_one(
+            "SELECT setting \
+             FROM pg_catalog.pg_settings \
+             WHERE name = 'transaction_isolation'",
+            &[],
+        )
+        .await
+        .expect("pg_settings transaction_isolation");
+    assert_eq!(row.get::<_, String>(0), "repeatable read");
+    client.batch_execute("COMMIT").await.expect("commit");
+
+    shutdown(client, server_handle).await;
+}
+
+#[tokio::test]
 async fn psql_describe_table_statistics_probe_accepts_empty_pg_statistic_ext() {
     let (_server, client, _conn, server_handle) = start_server_and_connect().await;
 

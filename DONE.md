@@ -638,6 +638,10 @@ as a concise evidence ledger; roadmap stays for open gates only.
   isolation (`read committed`, `repeatable read`, or `serializable`) instead
   of always returning the idle default. Evidence:
   `cargo test -p ultrasql-server --test txn_round_trip set_transaction_isolation_level_round_trip -- --nocapture`.
+- `pg_catalog.pg_settings` now exposes `transaction_isolation` from the active
+  statement context, so catalog introspection matches `SHOW` inside explicit
+  transactions. Evidence:
+  `cargo test -p ultrasql-server --test catalog_views_round_trip pg_settings_reflects_active_transaction_isolation -- --nocapture`.
 - `pg_catalog.pg_collation` now exposes base `default`, `C`, and `POSIX`
   catalog rows instead of an empty relation, unblocking ORM and GUI
   introspection probes that join collation metadata. Evidence:

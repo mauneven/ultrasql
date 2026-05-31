@@ -10,7 +10,7 @@ use ultrasql_core::{DataType, Field, Oid, RangeType, Schema, Value};
 use ultrasql_executor::{MemTableScan, Operator, build_batch};
 use ultrasql_mvcc::{Visibility, XidStatusOracle, is_visible};
 use ultrasql_planner::LogicalReferentialAction;
-use ultrasql_txn::{LockMode, LockTag};
+use ultrasql_txn::{IsolationLevel, LockMode, LockTag};
 
 use crate::error::ServerError;
 
@@ -2150,6 +2150,24 @@ fn rows_pg_settings(ctx: &LowerCtx<'_>) -> Vec<Vec<Value>> {
             v_text("user"),
         ],
         vec![
+            v_text("transaction_isolation"),
+            v_text(isolation_level_setting(ctx.isolation)),
+            Value::Null,
+            v_text("Client Connection Defaults / Statement Behavior"),
+            v_text("Sets the current transaction isolation level."),
+            v_text("enum"),
+            v_text("user"),
+        ],
+        vec![
+            v_text("standard_conforming_strings"),
+            v_text("on"),
+            Value::Null,
+            v_text("Version and Platform Compatibility"),
+            v_text("Causes string literals to treat backslashes literally."),
+            v_text("bool"),
+            v_text("user"),
+        ],
+        vec![
             v_text("work_mem"),
             v_text("4194304"),
             v_text("B"),
@@ -2262,6 +2280,14 @@ fn rows_pg_settings(ctx: &LowerCtx<'_>) -> Vec<Vec<Value>> {
             v_text("sighup"),
         ],
     ]
+}
+
+fn isolation_level_setting(isolation: IsolationLevel) -> &'static str {
+    match isolation {
+        IsolationLevel::ReadCommitted => "read committed",
+        IsolationLevel::RepeatableRead => "repeatable read",
+        IsolationLevel::Serializable => "serializable",
+    }
 }
 
 fn sensitive_setting_value(value: &str) -> Value {
