@@ -1382,8 +1382,9 @@ impl TpchQ10BuildState {
         let Some(&custkey) = self.qualifying_orders.get(&orderkey) else {
             return Ok(());
         };
-        let revenue = extendedprice * 100_i64.saturating_sub(discount) / 100;
-        *self.revenue_by_customer.entry(custkey).or_default() += revenue;
+        let revenue = checked_direct_discounted_revenue(extendedprice, discount)?;
+        let entry = self.revenue_by_customer.entry(custkey).or_default();
+        *entry = checked_direct_revenue_add(*entry, revenue)?;
         Ok(())
     }
 }
@@ -5308,6 +5309,40 @@ mod tests {
         assert_eq!(rows[0].c_custkey, 4);
         assert_eq!(rows[0].revenue, 9_500);
         assert_eq!(rows[0].n_name, "BRAZIL");
+    }
+
+    #[cfg(feature = "sql-bench")]
+    #[test]
+    fn tpch_q10_sidecar_rejects_discount_factor_overflow() {
+        let mut state = TpchQ10BuildState::default();
+        state
+            .ingest("nation", "2|BRAZIL|1|comment")
+            .expect("nation");
+        state
+            .ingest(
+                "customer",
+                "4|Customer#4|address|2|11-111-1111|100.00|BUILDING|comment",
+            )
+            .expect("customer");
+        state
+            .ingest("orders", "10|4|O|100.00|1993-10-15|5-LOW|Clerk#1|0|comment")
+            .expect("orders");
+
+        let mut payload = vec![0, 0];
+        for value in [10_i32, 5, 3, 1] {
+            payload.extend_from_slice(&value.to_le_bytes());
+        }
+        for value in [100_i64, 10_000, i64::MIN, 0] {
+            encode_direct_decimal(&mut payload, value, 2, 0).expect("decimal payload");
+        }
+        payload.extend_from_slice(&1_u32.to_le_bytes());
+        payload.push(b'R');
+
+        let err = state
+            .ingest_lineitem_payload(&payload)
+            .expect_err("discount factor overflow should reject");
+
+        assert!(err.to_string().contains("TPC-H sidecar revenue overflow"));
     }
 
     #[cfg(feature = "sql-bench")]

@@ -2001,3 +2001,7 @@ as a concise evidence ledger; roadmap stays for open gates only.
   discount factors and checked yearly total/Brazil volume accumulation overflow
   instead of panicking or wrapping cached volumes. Evidence:
   `cargo test -p ultrasql-bench --features sql-bench tpch::load::tests --lib -- --nocapture`.
+- TPC-H direct-load Q10 returned-customer sidecar revenue now rejects malformed
+  discount factors and checked customer revenue accumulation overflow instead
+  of panicking or wrapping cached revenue. Evidence:
+  `cargo test -p ultrasql-bench --features sql-bench tpch::load::tests --lib -- --nocapture`.
