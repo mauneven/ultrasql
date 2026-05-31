@@ -183,6 +183,14 @@ impl InMemoryAuthCatalog {
         self.roles.write().insert(entry.name.clone(), entry);
     }
 
+    fn allocate_role_oid(&self) -> Result<u32, CatalogError> {
+        self.next_oid
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                current.checked_add(1)
+            })
+            .map_err(|_| CatalogError::schema_conflict("role OID space exhausted"))
+    }
+
     /// Create a new role and allocate an OID if the caller supplied `0`.
     pub fn create_role(&self, mut entry: RoleEntry) -> Result<(), CatalogError> {
         entry.name = normalize_role_name(&entry.name);
@@ -191,7 +199,7 @@ impl InMemoryAuthCatalog {
             return Err(CatalogError::already_exists(entry.name));
         }
         if entry.oid == 0 {
-            entry.oid = self.next_oid.fetch_add(1, Ordering::Relaxed);
+            entry.oid = self.allocate_role_oid()?;
         }
         roles.insert(entry.name.clone(), entry);
         Ok(())
@@ -574,6 +582,20 @@ mod tests {
                 false,
             )
             .is_err()
+        );
+    }
+
+    #[test]
+    fn generated_role_oid_rejects_exhausted_snapshot() {
+        let cat = InMemoryAuthCatalog::new();
+        cat.install_snapshot(vec![test_role(u32::MAX, "max_role", true)], Vec::new());
+
+        let err = cat
+            .create_role(test_role(0, "next_role", true))
+            .expect_err("generated role oid should reject exhaustion");
+
+        assert!(
+            matches!(err, CatalogError::SchemaConflict(message) if message.contains("role OID space exhausted"))
         );
     }
 
