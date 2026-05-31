@@ -2109,3 +2109,6 @@ as a concise evidence ledger; roadmap stays for open gates only.
 - Direct scalar aggregate fast paths now use checked COUNT/AVG row counters and
   nullable-input counts instead of silent saturation. Evidence:
   `cargo test -p ultrasql-executor direct_scalar_agg::tests --lib -- --nocapture`.
+- SortAggregate now uses checked COUNT/AVG/statistical counters instead of
+  saturating per-group row counts. Evidence:
+  `cargo test -p ultrasql-executor sort_aggregate::tests --lib -- --nocapture`.

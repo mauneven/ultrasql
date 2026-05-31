@@ -143,11 +143,11 @@ fn accumulate(
 
     match state {
         AggState::CountStar(n) => {
-            *n = n.saturating_add(1);
+            increment_count(n, "SortAggregate COUNT(*)")?;
         }
         AggState::Count(n) => {
             if !matches!(arg, Some(Value::Null) | None) {
-                *n = n.saturating_add(1);
+                increment_count(n, "SortAggregate COUNT")?;
             }
         }
         AggState::Sum(acc) => {
@@ -167,7 +167,7 @@ fn accumulate(
                         None => widen_sum_seed(v),
                         Some(e) => add_values(e, v)?,
                     });
-                    *cnt = cnt.saturating_add(1);
+                    increment_count(cnt, "SortAggregate AVG")?;
                 }
             }
         }
@@ -240,7 +240,7 @@ fn accumulate(
                 if let Some(x) = to_f64(&v) {
                     *sum_x += x;
                     *sum_x2 += x * x;
-                    *cnt = cnt.saturating_add(1);
+                    increment_count(cnt, "SortAggregate statistical count")?;
                 }
             }
         }
@@ -254,7 +254,7 @@ fn accumulate(
                 *sxy += x * y;
                 *sx2 += x * x;
                 *sy2 += y * y;
-                *cnt = cnt.saturating_add(1);
+                increment_count(cnt, "SortAggregate CORR")?;
             }
         }
         AggState::PercentileCont {
@@ -538,6 +538,13 @@ fn to_f64(v: &Value) -> Option<f64> {
 fn checked_sum_i64(acc: i64, delta: i64, context: &str) -> Result<i64, ExecError> {
     acc.checked_add(delta)
         .ok_or_else(|| ExecError::NumericFieldOverflow(format!("{context} overflow")))
+}
+
+fn increment_count(count: &mut i64, context: &str) -> Result<(), ExecError> {
+    *count = count
+        .checked_add(1)
+        .ok_or_else(|| ExecError::NumericFieldOverflow(format!("{context} overflow")))?;
+    Ok(())
 }
 
 fn add_values(a: Value, b: Value) -> Result<Value, ExecError> {
@@ -871,12 +878,12 @@ pub(crate) const fn init_stat_state(func: &StatAggFunc) -> AggState {
 
 /// Accumulate a single f64 value into a statistical aggregate state.
 #[allow(dead_code)]
-pub(crate) fn accumulate_stat(state: &mut AggState, x: f64) {
+pub(crate) fn accumulate_stat(state: &mut AggState, x: f64) -> Result<(), ExecError> {
     match state {
         AggState::Variance(sx, sx2, cnt) | AggState::Stddev(sx, sx2, cnt) => {
             *sx += x;
             *sx2 += x * x;
-            *cnt = cnt.saturating_add(1);
+            increment_count(cnt, "SortAggregate statistical count")?;
         }
         AggState::PercentileCont { values, .. } => {
             values.push(x);
@@ -886,6 +893,7 @@ pub(crate) fn accumulate_stat(state: &mut AggState, x: f64) {
         }
         _ => {}
     }
+    Ok(())
 }
 
 /// Finalise a statistical aggregate state to a [`Value`].
@@ -902,7 +910,10 @@ mod tests {
     use ultrasql_vec::Batch;
     use ultrasql_vec::column::{BoolColumn, Column, NumericColumn, StringColumn};
 
-    use super::{SortAggregate, StatAggFunc, accumulate_stat, finalise_stat, init_stat_state};
+    use super::{
+        AggState, SortAggregate, StatAggFunc, accumulate, accumulate_stat, finalise_stat,
+        init_stat_state,
+    };
     use crate::Operator;
     use crate::filter_op::batch_to_rows;
     use crate::mem_table_scan::MemTableScan;
@@ -941,6 +952,18 @@ mod tests {
         LogicalAggregateExpr {
             func: AggregateFunc::CountStar,
             arg: None,
+            direct_arg: None,
+            order_by: None,
+            distinct: false,
+            output_name: "cnt".into(),
+            data_type: DataType::Int64,
+        }
+    }
+
+    fn count_val_agg() -> LogicalAggregateExpr {
+        LogicalAggregateExpr {
+            func: AggregateFunc::Count,
+            arg: Some(col("val", 0, DataType::Int64)),
             direct_arg: None,
             order_by: None,
             distinct: false,
@@ -1061,6 +1084,19 @@ mod tests {
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0][1], Value::Int64(2)); // group 1 has 2 rows
         assert_eq!(rows[1][1], Value::Int64(1)); // group 2 has 1 row
+    }
+
+    #[test]
+    fn sort_agg_count_overflow_returns_typed_error() {
+        let mut count_star = AggState::CountStar(i64::MAX);
+        let err = accumulate(&mut count_star, &count_star_agg(), &[])
+            .expect_err("COUNT(*) overflow must not saturate");
+        assert!(matches!(err, crate::ExecError::NumericFieldOverflow(_)));
+
+        let mut count = AggState::Count(i64::MAX);
+        let err = accumulate(&mut count, &count_val_agg(), &[Value::Int64(1)])
+            .expect_err("COUNT(expr) overflow must not saturate");
+        assert!(matches!(err, crate::ExecError::NumericFieldOverflow(_)));
     }
 
     #[test]
@@ -1429,7 +1465,7 @@ mod tests {
         // variance of [2, 4, 4, 4, 5, 5, 7, 9] = 4.571...
         let mut state = init_stat_state(&StatAggFunc::Variance);
         for &x in &[2.0_f64, 4.0, 4.0, 4.0, 5.0, 5.0, 7.0, 9.0] {
-            accumulate_stat(&mut state, x);
+            accumulate_stat(&mut state, x).expect("variance step");
         }
         let result = finalise_stat(&state);
         if let Value::Float64(v) = result {
@@ -1443,7 +1479,7 @@ mod tests {
     fn stat_percentile_cont_median() {
         let mut state = init_stat_state(&StatAggFunc::PercentileCont(0.5));
         for &x in &[1.0_f64, 2.0, 3.0, 4.0, 5.0] {
-            accumulate_stat(&mut state, x);
+            accumulate_stat(&mut state, x).expect("percentile step");
         }
         // median of [1,2,3,4,5] = 3.0
         let result = finalise_stat(&state);
@@ -1454,7 +1490,7 @@ mod tests {
     fn stat_percentile_cont_orders_nan_after_finite_values() {
         let mut state = init_stat_state(&StatAggFunc::PercentileCont(0.0));
         for &x in &[f64::NAN, 1.0, 2.0] {
-            accumulate_stat(&mut state, x);
+            accumulate_stat(&mut state, x).expect("percentile step");
         }
 
         let Value::Float64(value) = finalise_stat(&state) else {
@@ -1467,7 +1503,7 @@ mod tests {
     fn stat_helpers_cover_stddev_corr_and_percentile_disc() {
         let mut stddev = init_stat_state(&StatAggFunc::Stddev);
         for &x in &[2.0_f64, 4.0, 4.0, 4.0] {
-            accumulate_stat(&mut stddev, x);
+            accumulate_stat(&mut stddev, x).expect("stddev step");
         }
         let Value::Float64(value) = finalise_stat(&stddev) else {
             panic!("expected stddev");
@@ -1479,7 +1515,7 @@ mod tests {
 
         let mut disc = init_stat_state(&StatAggFunc::PercentileDisc(0.75));
         for &x in &[1.0_f64, 3.0, 2.0, 4.0] {
-            accumulate_stat(&mut disc, x);
+            accumulate_stat(&mut disc, x).expect("percentile disc step");
         }
         assert_eq!(finalise_stat(&disc), Value::Float64(3.0));
     }
