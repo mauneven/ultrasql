@@ -2212,7 +2212,11 @@ pub(super) fn bind_drop_table(
     let mut tables: Vec<String> = Vec::with_capacity(s.names.len());
     for obj in &s.names {
         let name = object_name_simple(obj);
-        if catalog.lookup_table(&name).is_some() {
+        let requested_namespace = object_name_namespace(obj);
+        let table_matches_namespace = catalog.lookup_table(&name).is_some_and(|meta| {
+            obj.parts.len() < 2 || meta.schema_name.eq_ignore_ascii_case(&requested_namespace)
+        });
+        if table_matches_namespace {
             tables.push(name);
         } else if !s.if_exists {
             return Err(PlanError::TableNotFound(name));

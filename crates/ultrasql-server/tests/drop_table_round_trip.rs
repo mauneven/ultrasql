@@ -129,3 +129,37 @@ async fn drop_table_on_undefined_relation_fails_with_42p01() {
 
     shutdown(running).await;
 }
+
+#[tokio::test]
+async fn drop_table_respects_schema_qualifier() {
+    let running = start_sample_server("drop_table_schema_guard").await;
+    let client = &running.client;
+
+    client
+        .batch_execute(
+            "CREATE SCHEMA app; \
+             CREATE TABLE guarded_drop (id INT NOT NULL); \
+             INSERT INTO guarded_drop VALUES (7)",
+        )
+        .await
+        .expect("create public table and separate schema");
+
+    client
+        .batch_execute("DROP TABLE app.guarded_drop")
+        .await
+        .expect_err("qualified DROP TABLE must not resolve public table");
+
+    let id = client
+        .query_one("SELECT id FROM guarded_drop", &[])
+        .await
+        .expect("public table survives wrong-qualified drop")
+        .get::<_, i32>(0);
+    assert_eq!(id, 7);
+
+    client
+        .batch_execute("DROP TABLE guarded_drop; DROP SCHEMA app")
+        .await
+        .expect("cleanup schema qualifier guard");
+
+    shutdown(running).await;
+}

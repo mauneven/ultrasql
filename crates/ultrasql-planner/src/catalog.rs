@@ -54,15 +54,26 @@ const PG_OID_XML: u32 = 142;
 /// optimizer can fetch the richer view through a different trait.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TableMeta {
+    /// Case-folded SQL namespace that owns this table.
+    pub schema_name: String,
     /// Ordered list of columns and their types.
     pub schema: Schema,
 }
 
 impl TableMeta {
-    /// Construct a `TableMeta` over a schema.
+    /// Construct a `TableMeta` over a schema in the `public` namespace.
     #[must_use]
-    pub const fn new(schema: Schema) -> Self {
-        Self { schema }
+    pub fn new(schema: Schema) -> Self {
+        Self::with_schema_name("public", schema)
+    }
+
+    /// Construct a `TableMeta` over a schema in a specific namespace.
+    #[must_use]
+    pub fn with_schema_name(schema_name: impl Into<String>, schema: Schema) -> Self {
+        Self {
+            schema_name: schema_name.into().to_ascii_lowercase(),
+            schema,
+        }
     }
 }
 
@@ -235,7 +246,7 @@ impl Catalog for ultrasql_catalog::CatalogSnapshot {
     fn lookup_table(&self, name: &str) -> Option<TableMeta> {
         self.tables
             .get(&name.to_ascii_lowercase())
-            .map(|entry| TableMeta::new(entry.schema.clone()))
+            .map(|entry| TableMeta::with_schema_name(&entry.schema_name, entry.schema.clone()))
     }
 
     fn lookup_type(&self, name: &str) -> Option<DataType> {
