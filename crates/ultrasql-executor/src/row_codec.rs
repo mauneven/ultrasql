@@ -44,6 +44,13 @@ fn checked_payload_end(cursor: usize, len: usize, have: usize) -> Result<usize, 
     })
 }
 
+fn checked_fixed_end(cursor: usize, width: usize, have: usize) -> Result<usize, RowCodecError> {
+    cursor.checked_add(width).ok_or(RowCodecError::Truncated {
+        needed: usize::MAX,
+        have,
+    })
+}
+
 /// Binary codec bound to a fixed [`Schema`].
 ///
 /// Caches a `fixed_width_lower_bound` and a `decode_shape` tag
@@ -1147,7 +1154,7 @@ impl RowCodec {
     ) -> Result<Value, RowCodecError> {
         match data_type {
             DataType::Bool => {
-                let needed = cursor.saturating_add(1);
+                let needed = checked_fixed_end(*cursor, 1, bytes.len())?;
                 if bytes.len() < needed {
                     return Err(RowCodecError::Truncated {
                         needed,
@@ -2860,7 +2867,7 @@ fn numeric_type_error(column: usize, ty: &DataType, got: &str) -> RowCodecError 
 }
 
 fn read_fixed<const N: usize>(bytes: &[u8], cursor: &mut usize) -> Result<[u8; N], RowCodecError> {
-    let needed = cursor.saturating_add(N);
+    let needed = checked_fixed_end(*cursor, N, bytes.len())?;
     if bytes.len() < needed {
         return Err(RowCodecError::Truncated {
             needed,
@@ -2878,7 +2885,7 @@ fn read_fixed<const N: usize>(bytes: &[u8], cursor: &mut usize) -> Result<[u8; N
 }
 
 fn skip_fixed(bytes: &[u8], cursor: &mut usize, width: usize) -> Result<(), RowCodecError> {
-    let needed = cursor.saturating_add(width);
+    let needed = checked_fixed_end(*cursor, width, bytes.len())?;
     if bytes.len() < needed {
         return Err(RowCodecError::Truncated {
             needed,
@@ -2962,7 +2969,7 @@ fn decode_vector_value(
     column: usize,
     ty: &DataType,
 ) -> Result<Value, RowCodecError> {
-    let dims_end = cursor.saturating_add(VECTOR_DIMS_WIDTH);
+    let dims_end = checked_fixed_end(*cursor, VECTOR_DIMS_WIDTH, bytes.len())?;
     if bytes.len() < dims_end {
         return Err(RowCodecError::Truncated {
             needed: dims_end,
@@ -3234,7 +3241,10 @@ mod tests {
         RangeValue, Schema, SparseVector, Value,
     };
 
-    use super::{ColumnBuilder, RowCodec, RowCodecError, VECTOR_DIMS_WIDTH, VECTOR_ELEMENT_WIDTH};
+    use super::{
+        ColumnBuilder, RowCodec, RowCodecError, VECTOR_DIMS_WIDTH, VECTOR_ELEMENT_WIDTH,
+        checked_fixed_end,
+    };
     use ultrasql_vec::column::Column;
 
     fn schema_bool() -> Schema {
@@ -3264,6 +3274,19 @@ mod tests {
     fn schema_char4() -> Schema {
         Schema::new([Field::required("c", DataType::Char { len: Some(4) })]).unwrap()
     }
+
+    #[test]
+    fn checked_fixed_end_rejects_overflow() {
+        let err = checked_fixed_end(usize::MAX, 1, 0).unwrap_err();
+        assert!(matches!(
+            err,
+            RowCodecError::Truncated {
+                needed: usize::MAX,
+                have: 0
+            }
+        ));
+    }
+
     fn schema_decimal(scale: Option<i32>) -> Schema {
         Schema::new([Field::required(
             "n",

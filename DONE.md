@@ -2204,3 +2204,7 @@ as a concise evidence ledger; roadmap stays for open gates only.
 - Remote Parquet range readers now check cursor advancement and read-length
   conversion instead of saturating object-store range positions. Evidence:
   `cargo test -p ultrasql-server pipeline::parquet_scan::tests::object_range_cursor_rejects_position_overflow --lib -- --nocapture`.
+- Row-codec generic fixed-width and vector decode helpers now check cursor
+  bounds instead of saturating decode offsets on malformed tuple payloads.
+  Evidence:
+  `cargo test -p ultrasql-executor row_codec::tests::checked_fixed_end_rejects_overflow --lib -- --nocapture`.
