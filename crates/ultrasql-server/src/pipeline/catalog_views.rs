@@ -21,6 +21,13 @@ const PUBLIC_OID: i64 = 2200;
 const PG_CLASS_OID: i64 = 1259;
 const PG_CONSTRAINT_OID: i64 = 2606;
 const PG_PROC_BASE_OID: u32 = 9_000;
+const PROC_TYPE_BOOL: u32 = 16;
+const PROC_TYPE_INT4: u32 = 23;
+const PROC_TYPE_INT8: u32 = 20;
+const PROC_TYPE_TEXT: u32 = 25;
+const PROC_TYPE_OID: u32 = 26;
+const PROC_TYPE_TEXT_ARRAY: u32 = 1009;
+const PROC_TYPE_UUID: u32 = 2950;
 const PG_TYPE_BOOL: i32 = 16;
 const PG_TYPE_BOOL_ARRAY: i32 = 1000;
 const PG_TYPE_INT2: i32 = 21;
@@ -2823,21 +2830,51 @@ fn schema_pg_proc() -> Schema {
         Field::required("oid", DataType::Int64),
         Field::required("proname", text()),
         Field::required("pronamespace", DataType::Int64),
+        Field::required("proowner", DataType::Int64),
+        Field::required("prolang", DataType::Int64),
         Field::required("prokind", DataType::Text { max_len: Some(1) }),
+        Field::required("proretset", DataType::Bool),
+        Field::required("provolatile", DataType::Text { max_len: Some(1) }),
+        Field::required("pronargs", DataType::Int16),
+        Field::required("pronargdefaults", DataType::Int16),
+        Field::required("prorettype", DataType::Int64),
+        Field::required("proargtypes", DataType::Array(Box::new(DataType::Oid))),
+        Field::nullable("proallargtypes", DataType::Array(Box::new(DataType::Oid))),
+        Field::nullable("proargnames", text_array()),
+        Field::nullable(
+            "proargmodes",
+            DataType::Array(Box::new(DataType::Text { max_len: Some(1) })),
+        ),
+        Field::required("prosrc", text()),
+        Field::nullable("proacl", text_array()),
     ])
 }
 
 fn rows_pg_proc() -> Vec<Vec<Value>> {
-    pg_proc_builtin_names()
+    pg_proc_builtins()
         .iter()
         .enumerate()
-        .filter_map(|(offset, name)| {
+        .filter_map(|(offset, builtin)| {
             let oid = pg_proc_oid(offset)?;
+            let pronargs = i16::try_from(builtin.arg_type_oids.len()).ok()?;
             Some(vec![
                 Value::Int64(oid),
-                v_text(*name),
+                v_text(builtin.name),
                 Value::Int64(PG_CATALOG_OID),
+                Value::Int64(10),
+                Value::Int64(14),
                 v_text("f"),
+                Value::Bool(false),
+                v_text(builtin.volatility),
+                Value::Int16(pronargs),
+                Value::Int16(0),
+                Value::Int64(i64::from(builtin.return_type_oid)),
+                proc_argtypes_value(builtin.arg_type_oids),
+                Value::Null,
+                Value::Null,
+                Value::Null,
+                v_text(builtin.name),
+                Value::Null,
             ])
         })
         .collect()
@@ -2848,44 +2885,206 @@ fn pg_proc_oid(offset: usize) -> Option<i64> {
     PG_PROC_BASE_OID.checked_add(offset).map(i64::from)
 }
 
-const fn pg_proc_builtin_names() -> &'static [&'static str] {
+struct PgProcBuiltin {
+    name: &'static str,
+    return_type_oid: u32,
+    arg_type_oids: &'static [u32],
+    volatility: &'static str,
+}
+
+fn proc_argtypes_value(arg_type_oids: &[u32]) -> Value {
+    Value::Array {
+        element_type: DataType::Oid,
+        elements: arg_type_oids
+            .iter()
+            .map(|oid| Value::Oid(Oid::new(*oid)))
+            .collect(),
+    }
+}
+
+fn pg_type_name_from_oid(oid: u32) -> &'static str {
+    match oid {
+        PROC_TYPE_BOOL => "boolean",
+        PROC_TYPE_INT4 => "integer",
+        PROC_TYPE_INT8 => "bigint",
+        PROC_TYPE_TEXT => "text",
+        PROC_TYPE_OID => "oid",
+        PROC_TYPE_TEXT_ARRAY => "ARRAY",
+        PROC_TYPE_UUID => "uuid",
+        _ => "text",
+    }
+}
+
+const fn pg_proc_builtins() -> &'static [PgProcBuiltin] {
     &[
-        "array_length",
-        "col_description",
-        "current_catalog",
-        "current_database",
-        "current_schema",
-        "current_schemas",
-        "current_user",
-        "format_type",
-        "gen_random_uuid",
-        "has_column_privilege",
-        "has_database_privilege",
-        "has_function_privilege",
-        "has_schema_privilege",
-        "has_sequence_privilege",
-        "has_table_privilege",
-        "obj_description",
-        "pg_encoding_to_char",
-        "pg_function_is_visible",
-        "pg_get_constraintdef",
-        "pg_get_expr",
-        "pg_get_function_arguments",
-        "pg_get_function_result",
-        "pg_get_indexdef",
-        "pg_get_serial_sequence",
-        "pg_get_statisticsobjdef_columns",
-        "pg_get_userbyid",
-        "pg_is_other_temp_schema",
-        "pg_relation_is_publishable",
-        "pg_relation_size",
-        "pg_size_pretty",
-        "pg_table_is_visible",
-        "pg_typeof",
-        "session_user",
-        "set_config",
-        "shobj_description",
-        "version",
+        PgProcBuiltin {
+            name: "col_description",
+            return_type_oid: PROC_TYPE_TEXT,
+            arg_type_oids: &[PROC_TYPE_OID, PROC_TYPE_INT4],
+            volatility: "s",
+        },
+        PgProcBuiltin {
+            name: "current_catalog",
+            return_type_oid: PROC_TYPE_TEXT,
+            arg_type_oids: &[],
+            volatility: "s",
+        },
+        PgProcBuiltin {
+            name: "current_database",
+            return_type_oid: PROC_TYPE_TEXT,
+            arg_type_oids: &[],
+            volatility: "s",
+        },
+        PgProcBuiltin {
+            name: "current_schema",
+            return_type_oid: PROC_TYPE_TEXT,
+            arg_type_oids: &[],
+            volatility: "s",
+        },
+        PgProcBuiltin {
+            name: "current_schemas",
+            return_type_oid: PROC_TYPE_TEXT_ARRAY,
+            arg_type_oids: &[PROC_TYPE_BOOL],
+            volatility: "s",
+        },
+        PgProcBuiltin {
+            name: "current_user",
+            return_type_oid: PROC_TYPE_TEXT,
+            arg_type_oids: &[],
+            volatility: "s",
+        },
+        PgProcBuiltin {
+            name: "format_type",
+            return_type_oid: PROC_TYPE_TEXT,
+            arg_type_oids: &[PROC_TYPE_OID, PROC_TYPE_INT4],
+            volatility: "s",
+        },
+        PgProcBuiltin {
+            name: "gen_random_uuid",
+            return_type_oid: PROC_TYPE_UUID,
+            arg_type_oids: &[],
+            volatility: "v",
+        },
+        PgProcBuiltin {
+            name: "obj_description",
+            return_type_oid: PROC_TYPE_TEXT,
+            arg_type_oids: &[PROC_TYPE_OID, PROC_TYPE_TEXT],
+            volatility: "s",
+        },
+        PgProcBuiltin {
+            name: "pg_encoding_to_char",
+            return_type_oid: PROC_TYPE_TEXT,
+            arg_type_oids: &[PROC_TYPE_INT4],
+            volatility: "i",
+        },
+        PgProcBuiltin {
+            name: "pg_function_is_visible",
+            return_type_oid: PROC_TYPE_BOOL,
+            arg_type_oids: &[PROC_TYPE_OID],
+            volatility: "s",
+        },
+        PgProcBuiltin {
+            name: "pg_get_constraintdef",
+            return_type_oid: PROC_TYPE_TEXT,
+            arg_type_oids: &[PROC_TYPE_OID, PROC_TYPE_BOOL],
+            volatility: "s",
+        },
+        PgProcBuiltin {
+            name: "pg_get_expr",
+            return_type_oid: PROC_TYPE_TEXT,
+            arg_type_oids: &[PROC_TYPE_TEXT, PROC_TYPE_OID],
+            volatility: "s",
+        },
+        PgProcBuiltin {
+            name: "pg_get_function_arguments",
+            return_type_oid: PROC_TYPE_TEXT,
+            arg_type_oids: &[PROC_TYPE_OID],
+            volatility: "s",
+        },
+        PgProcBuiltin {
+            name: "pg_get_function_result",
+            return_type_oid: PROC_TYPE_TEXT,
+            arg_type_oids: &[PROC_TYPE_OID],
+            volatility: "s",
+        },
+        PgProcBuiltin {
+            name: "pg_get_indexdef",
+            return_type_oid: PROC_TYPE_TEXT,
+            arg_type_oids: &[PROC_TYPE_OID],
+            volatility: "s",
+        },
+        PgProcBuiltin {
+            name: "pg_get_serial_sequence",
+            return_type_oid: PROC_TYPE_TEXT,
+            arg_type_oids: &[PROC_TYPE_TEXT, PROC_TYPE_TEXT],
+            volatility: "s",
+        },
+        PgProcBuiltin {
+            name: "pg_get_statisticsobjdef_columns",
+            return_type_oid: PROC_TYPE_TEXT,
+            arg_type_oids: &[PROC_TYPE_OID],
+            volatility: "s",
+        },
+        PgProcBuiltin {
+            name: "pg_get_userbyid",
+            return_type_oid: PROC_TYPE_TEXT,
+            arg_type_oids: &[PROC_TYPE_OID],
+            volatility: "s",
+        },
+        PgProcBuiltin {
+            name: "pg_is_other_temp_schema",
+            return_type_oid: PROC_TYPE_BOOL,
+            arg_type_oids: &[PROC_TYPE_OID],
+            volatility: "s",
+        },
+        PgProcBuiltin {
+            name: "pg_relation_is_publishable",
+            return_type_oid: PROC_TYPE_BOOL,
+            arg_type_oids: &[PROC_TYPE_OID],
+            volatility: "s",
+        },
+        PgProcBuiltin {
+            name: "pg_relation_size",
+            return_type_oid: PROC_TYPE_INT8,
+            arg_type_oids: &[PROC_TYPE_OID],
+            volatility: "v",
+        },
+        PgProcBuiltin {
+            name: "pg_size_pretty",
+            return_type_oid: PROC_TYPE_TEXT,
+            arg_type_oids: &[PROC_TYPE_INT8],
+            volatility: "i",
+        },
+        PgProcBuiltin {
+            name: "pg_table_is_visible",
+            return_type_oid: PROC_TYPE_BOOL,
+            arg_type_oids: &[PROC_TYPE_OID],
+            volatility: "s",
+        },
+        PgProcBuiltin {
+            name: "session_user",
+            return_type_oid: PROC_TYPE_TEXT,
+            arg_type_oids: &[],
+            volatility: "s",
+        },
+        PgProcBuiltin {
+            name: "set_config",
+            return_type_oid: PROC_TYPE_TEXT,
+            arg_type_oids: &[PROC_TYPE_TEXT, PROC_TYPE_TEXT, PROC_TYPE_BOOL],
+            volatility: "v",
+        },
+        PgProcBuiltin {
+            name: "shobj_description",
+            return_type_oid: PROC_TYPE_TEXT,
+            arg_type_oids: &[PROC_TYPE_OID, PROC_TYPE_TEXT],
+            volatility: "s",
+        },
+        PgProcBuiltin {
+            name: "version",
+            return_type_oid: PROC_TYPE_TEXT,
+            arg_type_oids: &[],
+            volatility: "s",
+        },
     ]
 }
 
@@ -3302,20 +3501,20 @@ fn schema_information_schema_routines() -> Schema {
 }
 
 fn rows_information_schema_routines() -> Vec<Vec<Value>> {
-    pg_proc_builtin_names()
+    pg_proc_builtins()
         .iter()
         .enumerate()
-        .filter_map(|(offset, name)| {
+        .filter_map(|(offset, builtin)| {
             let oid = pg_proc_oid(offset)?;
             Some(vec![
                 v_text("ultrasql"),
                 v_text("pg_catalog"),
-                v_text(format!("{name}_{oid}")),
+                v_text(format!("{}_{}", builtin.name, oid)),
                 v_text("ultrasql"),
                 v_text("pg_catalog"),
-                v_text(*name),
+                v_text(builtin.name),
                 v_text("FUNCTION"),
-                Value::Null,
+                v_text(pg_type_name_from_oid(builtin.return_type_oid)),
                 Value::Null,
                 Value::Null,
                 Value::Null,

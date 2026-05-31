@@ -1176,7 +1176,9 @@ async fn psql_list_functions_probe_filters_builtin_pg_proc() {
 
     let builtin_rows = client
         .query(
-            "SELECT proname, prokind \
+            "SELECT proname, prokind, pronargs, \
+                    pg_catalog.format_type(prorettype, NULL), \
+                    provolatile, proretset \
              FROM pg_catalog.pg_proc \
              WHERE proname IN ('pg_get_userbyid', 'version') \
              ORDER BY proname",
@@ -1187,8 +1189,16 @@ async fn psql_list_functions_probe_filters_builtin_pg_proc() {
     assert_eq!(builtin_rows.len(), 2);
     assert_eq!(builtin_rows[0].get::<_, String>(0), "pg_get_userbyid");
     assert_eq!(builtin_rows[0].get::<_, String>(1), "f");
+    assert_eq!(builtin_rows[0].get::<_, i16>(2), 1);
+    assert_eq!(builtin_rows[0].get::<_, String>(3), "text");
+    assert_eq!(builtin_rows[0].get::<_, String>(4), "s");
+    assert!(!builtin_rows[0].get::<_, bool>(5));
     assert_eq!(builtin_rows[1].get::<_, String>(0), "version");
     assert_eq!(builtin_rows[1].get::<_, String>(1), "f");
+    assert_eq!(builtin_rows[1].get::<_, i16>(2), 0);
+    assert_eq!(builtin_rows[1].get::<_, String>(3), "text");
+    assert_eq!(builtin_rows[1].get::<_, String>(4), "s");
+    assert!(!builtin_rows[1].get::<_, bool>(5));
 
     let rows = client
         .query(

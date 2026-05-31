@@ -795,6 +795,10 @@ as a concise evidence ledger; roadmap stays for open gates only.
 - `pg_catalog.pg_proc` exposes stable rows for core builtin introspection
   functions while stock `\df` still filters system routines out. Evidence:
   `cargo test -p ultrasql-server --test catalog_views_round_trip psql_list_functions_probe_filters_builtin_pg_proc -- --nocapture`.
+- `pg_catalog.pg_proc` also carries common typed routine metadata columns
+  (`pronargs`, `prorettype`, `proargtypes`, volatility, owner, language, ACL),
+  reducing driver/ORM catalog probe drift. Evidence:
+  `cargo test -p ultrasql-server --test catalog_views_round_trip psql_list_functions_probe_filters_builtin_pg_proc -- --nocapture`.
 - `information_schema.routines` is backed by the same builtin routine surface,
   giving SQL-standard introspection a non-empty system function view. Evidence:
   `cargo test -p ultrasql-server --test catalog_views_round_trip pg_catalog_and_information_schema_reflect_runtime_objects -- --nocapture`.

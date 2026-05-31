@@ -524,10 +524,6 @@ impl Session {
             return Ok(false);
         }
         if cmd == "\\df" || cmd.starts_with("\\df ") {
-            // UltraSQL has no `pg_proc` yet (functions are deferred to
-            // v0.8); emit an empty result with the standard column
-            // headers so scripts that pipe through \df see the
-            // expected shape.
             self.exec_sql(LIST_FUNCTIONS_SQL).await?;
             return Ok(false);
         }
