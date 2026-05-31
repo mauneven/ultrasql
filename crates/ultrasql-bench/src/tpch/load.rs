@@ -350,8 +350,7 @@ impl TpchQ3BuildState {
         let shipdate = parse_direct_date(&fields[10], 10).context("parse l_shipdate")?;
         let extendedprice = q3_parse_decimal2(&fields[5], "l_extendedprice")?;
         let discount = q3_parse_decimal2(&fields[6], "l_discount")?;
-        self.add_lineitem_revenue(orderkey, extendedprice, discount, shipdate);
-        Ok(())
+        self.add_lineitem_revenue(orderkey, extendedprice, discount, shipdate)
     }
 
     fn ingest_lineitem_payload(&mut self, payload: &[u8]) -> Result<()> {
@@ -368,8 +367,7 @@ impl TpchQ3BuildState {
         let _returnflag = read_direct_one_byte_text(payload, &mut off, "l_returnflag")?;
         let _linestatus = read_direct_one_byte_text(payload, &mut off, "l_linestatus")?;
         let shipdate = read_direct_i32(payload, &mut off, "l_shipdate")?;
-        self.add_lineitem_revenue(orderkey, extendedprice, discount, shipdate);
-        Ok(())
+        self.add_lineitem_revenue(orderkey, extendedprice, discount, shipdate)
     }
 
     fn add_lineitem_revenue(
@@ -378,14 +376,14 @@ impl TpchQ3BuildState {
         extendedprice: i64,
         discount: i64,
         shipdate: i32,
-    ) {
+    ) -> Result<()> {
         let Some(order) = self.qualifying_orders.get(&orderkey).copied() else {
-            return;
+            return Ok(());
         };
         if shipdate <= DIRECT_Q3_DATE_1995_03_15 {
-            return;
+            return Ok(());
         }
-        let revenue = extendedprice * 100_i64.saturating_sub(discount) / 100;
+        let revenue = checked_direct_discounted_revenue(extendedprice, discount)?;
         let agg = self
             .order_revenue
             .entry(orderkey)
@@ -394,8 +392,31 @@ impl TpchQ3BuildState {
                 shippriority: order.shippriority,
                 revenue: 0,
             });
-        agg.revenue += revenue;
+        agg.revenue = checked_direct_revenue_add(agg.revenue, revenue)?;
+        Ok(())
     }
+}
+
+#[cfg(feature = "sql-bench")]
+fn direct_sidecar_revenue_overflow() -> anyhow::Error {
+    anyhow::anyhow!("TPC-H sidecar revenue overflow")
+}
+
+#[cfg(feature = "sql-bench")]
+fn checked_direct_revenue_add(left: i64, right: i64) -> Result<i64> {
+    left.checked_add(right)
+        .ok_or_else(direct_sidecar_revenue_overflow)
+}
+
+#[cfg(feature = "sql-bench")]
+fn checked_direct_discounted_revenue(extendedprice: i64, discount: i64) -> Result<i64> {
+    let factor = 100_i64
+        .checked_sub(discount)
+        .ok_or_else(direct_sidecar_revenue_overflow)?;
+    let product = i128::from(extendedprice)
+        .checked_mul(i128::from(factor))
+        .ok_or_else(direct_sidecar_revenue_overflow)?;
+    i64::try_from(product / 100).map_err(|_| direct_sidecar_revenue_overflow())
 }
 
 #[cfg(feature = "sql-bench")]
@@ -4859,6 +4880,40 @@ mod tests {
 
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].revenue, 9_500);
+    }
+
+    #[cfg(feature = "sql-bench")]
+    #[test]
+    fn tpch_q3_sidecar_rejects_discount_factor_overflow() {
+        let mut state = TpchQ3BuildState::default();
+        state
+            .ingest(
+                "customer",
+                "1|Customer#1|address|1|11-111-1111|0.00|BUILDING|comment",
+            )
+            .expect("customer");
+        state
+            .ingest("orders", "10|1|O|100.00|1995-03-14|5-LOW|Clerk#1|0|comment")
+            .expect("orders");
+
+        let mut payload = vec![0, 0];
+        for value in [10_i32, 2, 3, 1] {
+            payload.extend_from_slice(&value.to_le_bytes());
+        }
+        for value in [100_i64, 10_000, i64::MIN, 0] {
+            encode_direct_decimal(&mut payload, value, 2, 0).expect("decimal payload");
+        }
+        payload.extend_from_slice(&1_u32.to_le_bytes());
+        payload.push(b'N');
+        payload.extend_from_slice(&1_u32.to_le_bytes());
+        payload.push(b'O');
+        payload.extend_from_slice(&(-1_752_i32).to_le_bytes());
+
+        let err = state
+            .ingest_lineitem_payload(&payload)
+            .expect_err("discount factor overflow should reject");
+
+        assert!(err.to_string().contains("TPC-H sidecar revenue overflow"));
     }
 
     #[cfg(feature = "sql-bench")]

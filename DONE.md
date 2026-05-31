@@ -1985,3 +1985,7 @@ as a concise evidence ledger; roadmap stays for open gates only.
   factors and checked `i128` accumulation overflow instead of saturating the
   factor math before cached execution. Evidence:
   `cargo test -p ultrasql-bench --features sql-bench tpch::load::tests --lib -- --nocapture`.
+- TPC-H direct-load Q3 sidecar revenue now rejects malformed discount factors
+  and checked revenue accumulation overflow instead of panicking or wrapping
+  cached revenue. Evidence:
+  `cargo test -p ultrasql-bench --features sql-bench tpch::load::tests --lib -- --nocapture`.
