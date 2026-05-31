@@ -1660,9 +1660,8 @@ fn binary_copy_cell_bytes(value: &Value, dtype: &DataType) -> Result<Vec<u8>, Se
             encode_pg_numeric_binary(*v, scale.unwrap_or(0))
                 .map_err(|err| ServerError::CopyFormat(format!("binary COPY numeric: {err}")))?
         }
-        (DataType::Text { .. }, Value::Text(v)) | (DataType::Char { .. }, Value::Char(v)) => {
-            v.as_bytes().to_vec()
-        }
+        (DataType::Text { .. } | DataType::TsVector | DataType::TsQuery, Value::Text(v))
+        | (DataType::Char { .. }, Value::Char(v)) => v.as_bytes().to_vec(),
         (DataType::Bit { .. } | DataType::VarBit { .. }, Value::BitString(bits)) => {
             bits.to_pg_binary()
         }
@@ -1895,9 +1894,11 @@ fn decode_binary_copy_cell(
                     ServerError::CopyFormat(format!("column {column_idx}: invalid {dtype} binary"))
                 })
         }
-        DataType::Text { .. } => std::str::from_utf8(bytes)
-            .map(|s| Value::Text(s.to_string()))
-            .map_err(|e| ServerError::CopyFormat(format!("column {column_idx}: {e}"))),
+        DataType::Text { .. } | DataType::TsVector | DataType::TsQuery => {
+            std::str::from_utf8(bytes)
+                .map(|s| Value::Text(s.to_string()))
+                .map_err(|e| ServerError::CopyFormat(format!("column {column_idx}: {e}")))
+        }
         DataType::Char { len } => std::str::from_utf8(bytes)
             .map_err(|e| ServerError::CopyFormat(format!("column {column_idx}: {e}")))
             .and_then(|s| {
@@ -2157,7 +2158,9 @@ fn decode_copy_cell(
         DataType::TimeTz => parse_copy_timetz(s, column_idx),
         DataType::Timestamp => parse_copy_timestamp(s, column_idx).map(Value::Timestamp),
         DataType::TimestampTz => parse_copy_timestamptz(s, column_idx).map(Value::TimestampTz),
-        DataType::Text { .. } => Ok(Value::Text(s.to_string())),
+        DataType::Text { .. } | DataType::TsVector | DataType::TsQuery => {
+            Ok(Value::Text(s.to_string()))
+        }
         DataType::Char { len } => coerce_bpchar_text(s, *len, false)
             .map(Value::Char)
             .map_err(|err| ServerError::CopyFormat(format!("column {column_idx}: {err}"))),

@@ -734,7 +734,10 @@ as a concise evidence ledger; roadmap stays for open gates only.
 - Text-backed full-text search now covers `to_tsvector`,
   `plainto_tsquery`, `websearch_to_tsquery`, `phraseto_tsquery`, `@@`, and a
   deterministic `ts_rank` subset through binder, executor, and wire tests.
-  Evidence:
+  `TSVECTOR` and `TSQUERY` now have dedicated logical types, PostgreSQL OIDs
+  `3614` / `3615`, array OIDs `3643` / `3645`, `pg_type` rows, and
+  RowDescription coverage while retaining the current text-backed value
+  representation. Evidence:
   `cargo test -p ultrasql-server --test full_text_round_trip`.
 - `DROP TABLE` dependency tracking now treats append-only materialized views as
   dependents: `RESTRICT` blocks source-table drops, `CASCADE` drops dependent

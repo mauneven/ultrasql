@@ -85,6 +85,10 @@ const PG_OID_JSON: u32 = 114;
 const PG_OID_JSONB: u32 = 3802;
 /// PostgreSQL type OID for `xml`.
 const PG_OID_XML: u32 = 142;
+/// PostgreSQL type OID for `tsvector`.
+const PG_OID_TSVECTOR: u32 = 3614;
+/// PostgreSQL type OID for `tsquery`.
+const PG_OID_TSQUERY: u32 = 3615;
 /// PostgreSQL type OID for `varchar`.
 const PG_OID_VARCHAR: u32 = 1043;
 /// PostgreSQL type OID for `bpchar` (`char(n)`).
@@ -163,6 +167,10 @@ const PG_OID_JSON_ARRAY: u32 = 199;
 const PG_OID_JSONB_ARRAY: u32 = 3807;
 /// PostgreSQL type OID for `xml[]`.
 const PG_OID_XML_ARRAY: u32 = 143;
+/// PostgreSQL type OID for `tsvector[]`.
+const PG_OID_TSVECTOR_ARRAY: u32 = 3643;
+/// PostgreSQL type OID for `tsquery[]`.
+const PG_OID_TSQUERY_ARRAY: u32 = 3645;
 /// PostgreSQL type OID for `date[]`.
 const PG_OID_DATE_ARRAY: u32 = 1182;
 /// PostgreSQL type OID for `time[]`.

@@ -302,6 +302,8 @@ const DT_REGCLASS: u8 = 0x27;
 const DT_REGTYPE: u8 = 0x28;
 const DT_PG_LSN: u8 = 0x29;
 const DT_XML: u8 = 0x2a;
+const DT_TSVECTOR: u8 = 0x2b;
+const DT_TSQUERY: u8 = 0x2c;
 
 fn encode_data_type(w: &mut Writer<'_>, ty: &DataType) -> Result<(), EncodeError> {
     match ty {
@@ -383,6 +385,8 @@ fn encode_data_type(w: &mut Writer<'_>, ty: &DataType) -> Result<(), EncodeError
         DataType::Json => w.u8(DT_JSON),
         DataType::Jsonb => w.u8(DT_JSONB),
         DataType::Xml => w.u8(DT_XML),
+        DataType::TsVector => w.u8(DT_TSVECTOR),
+        DataType::TsQuery => w.u8(DT_TSQUERY),
         DataType::Vector { dims } => {
             w.u8(DT_VECTOR);
             w.opt_u32(*dims);
@@ -506,6 +510,8 @@ fn decode_data_type(r: &mut Reader<'_>) -> Result<DataType, DecodeError> {
         DT_JSON => DataType::Json,
         DT_JSONB => DataType::Jsonb,
         DT_XML => DataType::Xml,
+        DT_TSVECTOR => DataType::TsVector,
+        DT_TSQUERY => DataType::TsQuery,
         DT_VECTOR => DataType::Vector { dims: r.opt_u32()? },
         DT_HALFVEC => DataType::HalfVec { dims: r.opt_u32()? },
         DT_SPARSEVEC => DataType::SparseVec { dims: r.opt_u32()? },

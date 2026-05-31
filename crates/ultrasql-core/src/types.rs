@@ -254,6 +254,15 @@ pub enum DataType {
     /// Textual XML. Values preserve the accepted input spelling.
     Xml,
 
+    /// Text search document vector. Values currently use the text-backed
+    /// lexeme representation while the logical type preserves wire/catalog
+    /// identity.
+    TsVector,
+
+    /// Text search query. Values currently use the text-backed query
+    /// representation while the logical type preserves wire/catalog identity.
+    TsQuery,
+
     /// SQL vector single-precision embedding vector.
     ///
     /// `None` represents the unconstrained `vector` type. `Some(n)`
@@ -390,6 +399,12 @@ impl DataType {
     #[must_use]
     pub const fn is_textlike(&self) -> bool {
         matches!(self, Self::Text { .. } | Self::Char { .. })
+    }
+
+    /// Full-text search category (`tsvector`, `tsquery`).
+    #[must_use]
+    pub const fn is_text_search(&self) -> bool {
+        matches!(self, Self::TsVector | Self::TsQuery)
     }
 
     /// User-defined enum category.
@@ -578,6 +593,8 @@ impl fmt::Display for DataType {
             Self::Json => f.write_str("json"),
             Self::Jsonb => f.write_str("jsonb"),
             Self::Xml => f.write_str("xml"),
+            Self::TsVector => f.write_str("tsvector"),
+            Self::TsQuery => f.write_str("tsquery"),
             Self::Vector { dims: Some(dims) } => write!(f, "vector({dims})"),
             Self::Vector { dims: None } => f.write_str("vector"),
             Self::HalfVec { dims: Some(dims) } => write!(f, "halfvec({dims})"),
@@ -680,6 +697,8 @@ mod tests {
         assert_eq!(DataType::Json.fixed_size(), None);
         assert_eq!(DataType::Jsonb.fixed_size(), None);
         assert_eq!(DataType::Xml.fixed_size(), None);
+        assert_eq!(DataType::TsVector.fixed_size(), None);
+        assert_eq!(DataType::TsQuery.fixed_size(), None);
     }
 
     #[test]
@@ -821,6 +840,8 @@ mod tests {
             "varchar(50)"
         );
         assert_eq!(DataType::Text { max_len: None }.to_string(), "text");
+        assert_eq!(DataType::TsVector.to_string(), "tsvector");
+        assert_eq!(DataType::TsQuery.to_string(), "tsquery");
         assert_eq!(
             DataType::Array(Box::new(DataType::Int32)).to_string(),
             "integer[]"
@@ -905,6 +926,8 @@ mod tests {
         assert!(DataType::Float64.is_numeric());
         assert!(!DataType::Float64.is_integer());
         assert!(DataType::Text { max_len: None }.is_textlike());
+        assert!(DataType::TsVector.is_text_search());
+        assert!(DataType::TsQuery.is_text_search());
         assert!(DataType::Timestamp.is_temporal());
         assert!(!DataType::Int32.is_temporal());
     }

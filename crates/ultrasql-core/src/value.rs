@@ -1849,7 +1849,7 @@ fn parse_array_element(element_type: &DataType, raw: &str) -> Option<Value> {
         DataType::PgLsn => Value::parse_pg_lsn_text(&text).map(Value::PgLsn),
         DataType::Float32 => text.parse::<f32>().ok().map(Value::Float32),
         DataType::Float64 => text.parse::<f64>().ok().map(Value::Float64),
-        DataType::Text { .. } => Some(Value::Text(text)),
+        DataType::Text { .. } | DataType::TsVector | DataType::TsQuery => Some(Value::Text(text)),
         DataType::Char { len } => coerce_bpchar_text(&text, *len, false).ok().map(Value::Char),
         DataType::Json => Some(Value::Json(text)),
         DataType::Jsonb => Some(Value::Jsonb(text)),

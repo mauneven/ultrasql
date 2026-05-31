@@ -51,3 +51,37 @@ async fn full_text_constructors_match_and_rank_over_wire() {
 
     shutdown(running).await;
 }
+
+#[tokio::test]
+async fn full_text_constructors_advertise_dedicated_type_oids() {
+    let running = start_sample_server("full_text_test").await;
+    let client = &running.client;
+
+    let stmt = client
+        .prepare("SELECT to_tsvector('quick fox'), plainto_tsquery('quick fox')")
+        .await
+        .expect("prepare full-text constructor oid query");
+    let columns = stmt.columns();
+
+    assert_eq!(columns[0].type_().oid(), 3614);
+    assert_eq!(columns[1].type_().oid(), 3615);
+
+    let rows = simple_rows(
+        client
+            .simple_query(
+                "SELECT typname, oid FROM pg_catalog.pg_type \
+                 WHERE typname IN ('tsquery', 'tsvector') ORDER BY typname",
+            )
+            .await
+            .expect("pg_type full-text rows"),
+    );
+    assert_eq!(
+        rows,
+        vec![
+            vec!["tsquery".to_owned(), "3615".to_owned()],
+            vec!["tsvector".to_owned(), "3614".to_owned()],
+        ]
+    );
+
+    shutdown(running).await;
+}

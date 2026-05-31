@@ -1045,6 +1045,8 @@ pub fn build_batch(rows: &[Vec<Value>], schema: &Schema) -> Result<Batch, ExecEr
             | DataType::Json
             | DataType::Jsonb
             | DataType::Xml
+            | DataType::TsVector
+            | DataType::TsQuery
             | DataType::PgLsn
             | DataType::Vector { .. }
             | DataType::HalfVec { .. }
@@ -1059,6 +1061,9 @@ pub fn build_batch(rows: &[Vec<Value>], schema: &Schema) -> Result<Batch, ExecEr
                 for (row_idx, row) in rows.iter().enumerate() {
                     match (&field.data_type, &row[col_idx]) {
                         (DataType::Text { .. }, Value::Text(s)) => strings.push(Some(s.clone())),
+                        (DataType::TsVector | DataType::TsQuery, Value::Text(s)) => {
+                            strings.push(Some(s.clone()));
+                        }
                         (DataType::Enum { labels, .. }, Value::Text(s))
                             if labels.iter().any(|label| label == s) =>
                         {

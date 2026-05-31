@@ -83,6 +83,10 @@ const PG_OID_JSON: u32 = 114;
 const PG_OID_JSONB: u32 = 3802;
 /// PostgreSQL type OID for `xml`.
 const PG_OID_XML: u32 = 142;
+/// PostgreSQL type OID for `tsvector`.
+const PG_OID_TSVECTOR: u32 = 3614;
+/// PostgreSQL type OID for `tsquery`.
+const PG_OID_TSQUERY: u32 = 3615;
 /// PostgreSQL type OID for `date`.
 const PG_OID_DATE: u32 = 1082;
 /// PostgreSQL type OID for `time`.
@@ -143,6 +147,10 @@ const PG_OID_JSON_ARRAY: u32 = 199;
 const PG_OID_JSONB_ARRAY: u32 = 3807;
 /// PostgreSQL type OID for `xml[]`.
 const PG_OID_XML_ARRAY: u32 = 143;
+/// PostgreSQL type OID for `tsvector[]`.
+const PG_OID_TSVECTOR_ARRAY: u32 = 3643;
+/// PostgreSQL type OID for `tsquery[]`.
+const PG_OID_TSQUERY_ARRAY: u32 = 3645;
 /// PostgreSQL type OID for `date[]`.
 const PG_OID_DATE_ARRAY: u32 = 1182;
 /// PostgreSQL type OID for `time[]`.
@@ -764,6 +772,8 @@ fn pg_type_oid(ty: &DataType) -> u32 {
         DataType::Json => PG_OID_JSON,
         DataType::Jsonb => PG_OID_JSONB,
         DataType::Xml => PG_OID_XML,
+        DataType::TsVector => PG_OID_TSVECTOR,
+        DataType::TsQuery => PG_OID_TSQUERY,
         DataType::Enum { oid, .. }
         | DataType::Composite { oid, .. }
         | DataType::Domain { oid, .. } => oid.raw(),
@@ -805,6 +815,8 @@ fn pg_array_type_oid(element: &DataType) -> u32 {
         DataType::Json => PG_OID_JSON_ARRAY,
         DataType::Jsonb => PG_OID_JSONB_ARRAY,
         DataType::Xml => PG_OID_XML_ARRAY,
+        DataType::TsVector => PG_OID_TSVECTOR_ARRAY,
+        DataType::TsQuery => PG_OID_TSQUERY_ARRAY,
         DataType::Array(inner) => pg_array_type_oid(inner),
         _ => PG_OID_TEXT_ARRAY,
     }

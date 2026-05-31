@@ -22,7 +22,8 @@ use super::{
     PG_OID_OID, PG_OID_OID_ARRAY, PG_OID_PG_LSN, PG_OID_PG_LSN_ARRAY, PG_OID_REGCLASS,
     PG_OID_REGCLASS_ARRAY, PG_OID_REGTYPE, PG_OID_REGTYPE_ARRAY, PG_OID_TEXT, PG_OID_TEXT_ARRAY,
     PG_OID_TIME, PG_OID_TIME_ARRAY, PG_OID_TIMESTAMP, PG_OID_TIMESTAMP_ARRAY, PG_OID_TIMESTAMPTZ,
-    PG_OID_TIMESTAMPTZ_ARRAY, PG_OID_TIMETZ, PG_OID_TIMETZ_ARRAY, PG_OID_UUID, PG_OID_UUID_ARRAY,
+    PG_OID_TIMESTAMPTZ_ARRAY, PG_OID_TIMETZ, PG_OID_TIMETZ_ARRAY, PG_OID_TSQUERY,
+    PG_OID_TSQUERY_ARRAY, PG_OID_TSVECTOR, PG_OID_TSVECTOR_ARRAY, PG_OID_UUID, PG_OID_UUID_ARRAY,
     PG_OID_VARBIT, PG_OID_VARBIT_ARRAY, PG_OID_VARCHAR, PG_OID_XML, PG_OID_XML_ARRAY,
 };
 
@@ -135,7 +136,9 @@ fn decode_param_text(bytes: &[u8], oid: Option<u32>) -> Result<Value, DecodeErro
                 offset_seconds,
             })
             .ok_or(DecodeError::BadBytes),
-        PG_OID_TEXT | PG_OID_VARCHAR | PG_OID_BPCHAR => Ok(Value::Text(s.to_string())),
+        PG_OID_TEXT | PG_OID_VARCHAR | PG_OID_BPCHAR | PG_OID_TSVECTOR | PG_OID_TSQUERY => {
+            Ok(Value::Text(s.to_string()))
+        }
         PG_OID_BYTEA => Ok(Value::Bytea(bytes.to_vec())),
         // No declared OID, or an OID we don't decode specially: best-effort
         // numeric-then-text fallback so libpq's `text` default still works
@@ -260,7 +263,7 @@ fn decode_param_binary(bytes: &[u8], oid: Option<u32>) -> Result<Value, DecodeEr
                 offset_seconds: i32::from_be_bytes([bytes[8], bytes[9], bytes[10], bytes[11]]),
             })
         }
-        PG_OID_TEXT | PG_OID_VARCHAR | PG_OID_BPCHAR => {
+        PG_OID_TEXT | PG_OID_VARCHAR | PG_OID_BPCHAR | PG_OID_TSVECTOR | PG_OID_TSQUERY => {
             let s = std::str::from_utf8(bytes).map_err(|_| DecodeError::BadBytes)?;
             Ok(Value::Text(s.to_string()))
         }
@@ -543,6 +546,8 @@ pub(super) fn pg_type_oid(ty: &DataType) -> u32 {
         DataType::Json => PG_OID_JSON,
         DataType::Jsonb => PG_OID_JSONB,
         DataType::Xml => PG_OID_XML,
+        DataType::TsVector => PG_OID_TSVECTOR,
+        DataType::TsQuery => PG_OID_TSQUERY,
         DataType::Enum { oid, .. }
         | DataType::Composite { oid, .. }
         | DataType::Domain { oid, .. } => oid.raw(),
@@ -584,6 +589,8 @@ fn pg_array_type_oid(element: &DataType) -> u32 {
         DataType::Json => PG_OID_JSON_ARRAY,
         DataType::Jsonb => PG_OID_JSONB_ARRAY,
         DataType::Xml => PG_OID_XML_ARRAY,
+        DataType::TsVector => PG_OID_TSVECTOR_ARRAY,
+        DataType::TsQuery => PG_OID_TSQUERY_ARRAY,
         DataType::Array(inner) => pg_array_type_oid(inner),
         _ => PG_OID_TEXT_ARRAY,
     }

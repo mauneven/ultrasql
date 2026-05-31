@@ -72,9 +72,9 @@ file focused on what still blocks production.
 - Arrays: broader coercion breadth and every supported element family.
 - JSON/JSONB: full SQL/JSON path parity beyond the supported subset
   (`decimal` and date/time methods).
-- Full-text search remaining: dedicated `TSVECTOR` / `TSQUERY` type
-  OIDs/storage, headline, dictionaries, full ranking parity, and GIN planner
-  integration beyond the current text-backed constructor / match subset.
+- Full-text search remaining: native lexeme/query storage beyond the current
+  text-backed representation, headline, dictionaries, full ranking parity, and
+  GIN planner integration.
 - XML remaining surface: namespace URI mapping, remaining XPath axes/functions,
   `XMLTABLE`, and function catalog parity beyond the supported secure subset.
 - Locale/collation remaining: ICU-backed collations, `CREATE COLLATION`, and

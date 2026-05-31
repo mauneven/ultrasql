@@ -99,6 +99,10 @@ const PG_TYPE_JSONB: i32 = 3802;
 const PG_TYPE_JSONB_ARRAY: i32 = 3807;
 const PG_TYPE_XML: i32 = 142;
 const PG_TYPE_XML_ARRAY: i32 = 143;
+const PG_TYPE_TSVECTOR: i32 = 3614;
+const PG_TYPE_TSVECTOR_ARRAY: i32 = 3643;
+const PG_TYPE_TSQUERY: i32 = 3615;
+const PG_TYPE_TSQUERY_ARRAY: i32 = 3645;
 const PG_TYPE_BYTEA: i32 = 17;
 const PG_TYPE_BYTEA_ARRAY: i32 = 1001;
 
@@ -481,6 +485,8 @@ fn type_oid(dt: &DataType) -> i32 {
         DataType::Json => PG_TYPE_JSON,
         DataType::Jsonb => PG_TYPE_JSONB,
         DataType::Xml => PG_TYPE_XML,
+        DataType::TsVector => PG_TYPE_TSVECTOR,
+        DataType::TsQuery => PG_TYPE_TSQUERY,
         DataType::Bytea => PG_TYPE_BYTEA,
         DataType::Range(range_type) => range_type_oid(*range_type),
         DataType::Enum { oid, .. }
@@ -537,6 +543,8 @@ fn data_type_name(dt: &DataType) -> std::borrow::Cow<'static, str> {
         DataType::Json => "json".into(),
         DataType::Jsonb => "jsonb".into(),
         DataType::Xml => "xml".into(),
+        DataType::TsVector => "tsvector".into(),
+        DataType::TsQuery => "tsquery".into(),
         DataType::Vector { .. } => "vector".into(),
         DataType::HalfVec { .. } => "halfvec".into(),
         DataType::SparseVec { .. } => "sparsevec".into(),
@@ -910,6 +918,24 @@ fn rows_pg_type(ctx: &LowerCtx<'_>) -> Vec<Vec<Value>> {
         (PG_TYPE_JSON, "json", "b", "U", -1, 0, PG_TYPE_JSON_ARRAY),
         (PG_TYPE_JSONB, "jsonb", "b", "U", -1, 0, PG_TYPE_JSONB_ARRAY),
         (PG_TYPE_XML, "xml", "b", "U", -1, 0, PG_TYPE_XML_ARRAY),
+        (
+            PG_TYPE_TSVECTOR,
+            "tsvector",
+            "b",
+            "U",
+            -1,
+            0,
+            PG_TYPE_TSVECTOR_ARRAY,
+        ),
+        (
+            PG_TYPE_TSQUERY,
+            "tsquery",
+            "b",
+            "U",
+            -1,
+            0,
+            PG_TYPE_TSQUERY_ARRAY,
+        ),
         (PG_TYPE_DATE, "date", "b", "D", 4, 0, PG_TYPE_DATE_ARRAY),
         (PG_TYPE_TIME, "time", "b", "D", 8, 0, PG_TYPE_TIME_ARRAY),
         (

@@ -130,7 +130,7 @@ fn sql_type_to_arrow(data_type: &DataType) -> Result<ArrowDataType> {
         DataType::Int64 => Ok(ArrowDataType::Int64),
         DataType::Float32 => Ok(ArrowDataType::Float32),
         DataType::Float64 => Ok(ArrowDataType::Float64),
-        DataType::Text { .. } => Ok(ArrowDataType::Utf8),
+        DataType::Text { .. } | DataType::TsVector | DataType::TsQuery => Ok(ArrowDataType::Utf8),
         other => Err(ArrowBridgeError::Unsupported(format!(
             "Arrow bridge unsupported UltraSQL type: {other}"
         ))),
@@ -177,8 +177,13 @@ fn column_to_arrow_array(field: &Field, column: Column) -> Result<ArrayRef> {
             let (data, nulls) = column.into_parts();
             Ok(Arc::new(Float64Array::new(data.into(), null_buffer(nulls))))
         }
-        (DataType::Text { .. }, Column::Utf8(column)) => utf8_to_arrow(column),
-        (DataType::Text { .. }, Column::DictionaryUtf8(column)) => {
+        (DataType::Text { .. } | DataType::TsVector | DataType::TsQuery, Column::Utf8(column)) => {
+            utf8_to_arrow(column)
+        }
+        (
+            DataType::Text { .. } | DataType::TsVector | DataType::TsQuery,
+            Column::DictionaryUtf8(column),
+        ) => {
             let rows = (0..column.len())
                 .map(|row| {
                     if column.codes.nulls().is_some_and(|nulls| !nulls.get(row)) {

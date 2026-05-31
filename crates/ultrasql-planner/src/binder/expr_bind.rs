@@ -1095,9 +1095,13 @@ fn bind_typed_literal(type_name: &str, value: &str, unit: Option<&str>) -> Scala
                 data_type: DataType::TimestampTz,
             },
         },
-        "tsvector" | "tsquery" => ScalarExpr::Literal {
+        "tsvector" => ScalarExpr::Literal {
             value: Value::Text(value.to_owned()),
-            data_type: DataType::Text { max_len: None },
+            data_type: DataType::TsVector,
+        },
+        "tsquery" => ScalarExpr::Literal {
+            value: Value::Text(value.to_owned()),
+            data_type: DataType::TsQuery,
         },
         _ => ScalarExpr::Literal {
             value: Value::Null,
@@ -1466,31 +1470,12 @@ fn builtin_return_type(func_name: &str, args: &[ScalarExpr]) -> Result<DataType,
         "length" | "position" | "bit_length" | "octet_length" | "get_bit" => Ok(DataType::Int32),
         "bit_count" => Ok(DataType::Int64),
         "set_bit" => Ok(DataType::VarBit { max_len: None }),
-        "lower"
-        | "upper"
-        | "trim"
-        | "lpad"
-        | "rpad"
-        | "left"
-        | "right"
-        | "substr"
-        | "substring"
-        | "replace"
-        | "split_part"
-        | "concat"
-        | "concat_ws"
-        | "repeat"
-        | "reverse"
-        | "md5"
-        | "sha256"
-        | "quote_ident"
-        | "quote_literal"
-        | "format"
-        | "regexp_replace"
-        | "to_tsvector"
-        | "plainto_tsquery"
-        | "websearch_to_tsquery"
-        | "phraseto_tsquery" => Ok(DataType::Text { max_len: None }),
+        "lower" | "upper" | "trim" | "lpad" | "rpad" | "left" | "right" | "substr"
+        | "substring" | "replace" | "split_part" | "concat" | "concat_ws" | "repeat"
+        | "reverse" | "md5" | "sha256" | "quote_ident" | "quote_literal" | "format"
+        | "regexp_replace" => Ok(DataType::Text { max_len: None }),
+        "to_tsvector" => Ok(DataType::TsVector),
+        "plainto_tsquery" | "websearch_to_tsquery" | "phraseto_tsquery" => Ok(DataType::TsQuery),
         "ts_rank" => Ok(DataType::Float64),
         "row_to_json" | "json_build_object" | "jsonb_set" => Ok(DataType::Jsonb),
         "jsonb_path_exists"
@@ -1956,17 +1941,37 @@ fn validate_text_search_constructor_args(
 fn validate_ts_rank_args(args: &[ScalarExpr]) -> Result<(), PlanError> {
     match args.len() {
         2 => {
-            validate_text_arg("ts_rank", &args[0])?;
-            validate_text_arg("ts_rank", &args[1])
+            validate_tsvector_arg("ts_rank", &args[0])?;
+            validate_tsquery_arg("ts_rank", &args[1])
         }
         3 => {
-            validate_text_arg("ts_rank", &args[1])?;
-            validate_text_arg("ts_rank", &args[2])
+            validate_tsvector_arg("ts_rank", &args[1])?;
+            validate_tsquery_arg("ts_rank", &args[2])
         }
         n => Err(PlanError::TypeMismatch(format!(
             "ts_rank: expected 2 or 3 arguments, got {n}"
         ))),
     }
+}
+
+fn validate_tsvector_arg(func_name: &str, arg: &ScalarExpr) -> Result<(), PlanError> {
+    let data_type = arg.data_type();
+    if matches!(data_type, DataType::Null | DataType::TsVector) {
+        return Ok(());
+    }
+    Err(PlanError::TypeMismatch(format!(
+        "{func_name}: expected tsvector, got {data_type}"
+    )))
+}
+
+fn validate_tsquery_arg(func_name: &str, arg: &ScalarExpr) -> Result<(), PlanError> {
+    let data_type = arg.data_type();
+    if matches!(data_type, DataType::Null | DataType::TsQuery) {
+        return Ok(());
+    }
+    Err(PlanError::TypeMismatch(format!(
+        "{func_name}: expected tsquery, got {data_type}"
+    )))
 }
 
 fn validate_xml_mode_arg(func_name: &str, arg: &ScalarExpr) -> Result<(), PlanError> {
@@ -3019,7 +3024,9 @@ fn resolve_cast_type(type_name: &str) -> Option<DataType> {
         "bool" | "boolean" => Some(DataType::Bool),
         "real" | "float4" => Some(DataType::Float32),
         "double" | "double precision" | "float" | "float8" => Some(DataType::Float64),
-        "text" | "tsvector" | "tsquery" => Some(DataType::Text { max_len: None }),
+        "text" => Some(DataType::Text { max_len: None }),
+        "tsvector" => Some(DataType::TsVector),
+        "tsquery" => Some(DataType::TsQuery),
         "bytea" => Some(DataType::Bytea),
         "date" => Some(DataType::Date),
         "time" | "time without time zone" => Some(DataType::Time),
@@ -4004,8 +4011,8 @@ mod typed_literal_tests {
             ("bit_count", Vec::new(), DataType::Int64),
             ("set_bit", Vec::new(), DataType::VarBit { max_len: None }),
             ("lower", Vec::new(), text.clone()),
-            ("to_tsvector", Vec::new(), text.clone()),
-            ("plainto_tsquery", Vec::new(), text.clone()),
+            ("to_tsvector", Vec::new(), DataType::TsVector),
+            ("plainto_tsquery", Vec::new(), DataType::TsQuery),
             ("ts_rank", Vec::new(), DataType::Float64),
             ("row_to_json", Vec::new(), DataType::Jsonb),
             ("jsonb_path_exists", Vec::new(), DataType::Bool),
@@ -4097,7 +4104,7 @@ mod typed_literal_tests {
         assert!(
             validate_builtin_args(
                 "ts_rank",
-                &mut [null_arg(text.clone()), null_arg(text.clone())]
+                &mut [null_arg(DataType::TsVector), null_arg(DataType::TsQuery)]
             )
             .is_ok()
         );
