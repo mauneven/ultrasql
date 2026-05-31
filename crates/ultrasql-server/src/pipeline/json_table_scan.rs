@@ -53,7 +53,8 @@ pub(super) fn lower_json_table_scan(args: &[ScalarExpr]) -> Result<Box<dyn Opera
     let document = parse_json_document(context)?;
     let row_steps = parse_json_path(&row_path)
         .map_err(|err| ServerError::CopyFormat(format!("JSON_TABLE row path: {err}")))?;
-    let row_items = select_json_path(&document, &row_steps);
+    let row_items = select_json_path(&document, &row_steps)
+        .map_err(|err| ServerError::CopyFormat(format!("JSON_TABLE row path: {err}")))?;
     let rows = row_items
         .iter()
         .enumerate()
@@ -198,7 +199,10 @@ fn json_table_row(
                 let steps = parse_json_path(&path).map_err(|err| {
                     ServerError::CopyFormat(format!("JSON_TABLE column path {path}: {err}"))
                 })?;
-                row.push(Value::Bool(!select_json_path(item, &steps).is_empty()));
+                let selected = select_json_path(item, &steps).map_err(|err| {
+                    ServerError::CopyFormat(format!("JSON_TABLE column path {path}: {err}"))
+                })?;
+                row.push(Value::Bool(!selected.is_empty()));
             }
             JsonTableColumnKind::Value { data_type, path } => {
                 let path = path
@@ -207,7 +211,9 @@ fn json_table_row(
                 let steps = parse_json_path(&path).map_err(|err| {
                     ServerError::CopyFormat(format!("JSON_TABLE column path {path}: {err}"))
                 })?;
-                let selected = select_json_path(item, &steps);
+                let selected = select_json_path(item, &steps).map_err(|err| {
+                    ServerError::CopyFormat(format!("JSON_TABLE column path {path}: {err}"))
+                })?;
                 let value = selected
                     .first()
                     .map_or(Ok(Value::Null), |value| json_value_to_sql(value, data_type))?;

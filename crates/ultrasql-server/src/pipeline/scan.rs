@@ -363,7 +363,8 @@ fn lower_jsonb_path_query(args: &[ScalarExpr]) -> Result<Box<dyn Operator>, Serv
     } else {
         None
     };
-    let selected = select_json_path_with_vars(&document, &path, vars.as_ref());
+    let selected = select_json_path_with_vars(&document, &path, vars.as_ref())
+        .map_err(|err| ServerError::CopyFormat(format!("jsonb_path_query: {err}")))?;
     let schema = Schema::new([Field::nullable("value", DataType::Jsonb)])
         .map_err(|err| ServerError::CopyFormat(format!("jsonb_path_query schema: {err}")))?;
     let rows = selected

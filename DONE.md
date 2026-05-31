@@ -679,13 +679,15 @@ as a concise evidence ledger; roadmap stays for open gates only.
 - JSON functions landed for `json_build_object`, `jsonb_set`, `json_each`,
   `jsonb_path_query`, `jsonb_path_exists`, JSON_TABLE subset paths, and
   whole-row `row_to_json`; SQL/JSON path prefixes `lax` and `strict` are
-  accepted with the current supported selection semantics, and
-  `jsonb_path_exists` plus `jsonb_path_query` resolve predicate literal
-  variables from a JSON/JSONB `vars` argument. Basic `.size()`, `.type()`,
-  `.abs()`, `.floor()`, `.ceiling()`, and `.double()` SQL/JSON path methods
-  now work in the shared path engine, and filter predicates support `&&`, `||`,
-  `!`, and nested predicate parentheses. Evidence:
+  accepted; strict mode reports structural errors for the supported selection
+  subset while lax mode suppresses them. `jsonb_path_exists` plus
+  `jsonb_path_query` resolve predicate literal variables from a JSON/JSONB
+  `vars` argument. Basic `.size()`, `.type()`, `.abs()`, `.floor()`,
+  `.ceiling()`, and `.double()` SQL/JSON path methods now work in the shared
+  path engine, and filter predicates support `&&`, `||`, `!`, and nested
+  predicate parentheses. Evidence:
   `cargo test -p ultrasql-server --test jsonb_path_query_round_trip jsonb_path_query_accepts_strict_and_lax_prefixes -- --nocapture`;
+  `cargo test -p ultrasql-server --test jsonb_path_query_round_trip jsonb_path_strict_mode_reports_structural_errors -- --nocapture`;
   `cargo test -p ultrasql-server --test jsonb_path_query_round_trip jsonb_path_exists_supports_variable_literals -- --nocapture`;
   `cargo test -p ultrasql-server --test jsonb_path_query_round_trip jsonb_path_query_supports_variable_literals -- --nocapture`;
   `cargo test -p ultrasql-server --test jsonb_path_query_round_trip jsonb_path_query_supports_basic_methods -- --nocapture`;

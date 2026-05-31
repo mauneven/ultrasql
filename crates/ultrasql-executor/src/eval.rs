@@ -2286,9 +2286,9 @@ fn eval_jsonb_path_exists(args: &[Value]) -> Result<Value, EvalError> {
     } else {
         None
     };
-    Ok(Value::Bool(
-        !select_json_path_with_vars(&document, &path, vars.as_ref()).is_empty(),
-    ))
+    let selected = select_json_path_with_vars(&document, &path, vars.as_ref())
+        .map_err(|err| EvalError::Type(format!("jsonb_path_exists: {err}")))?;
+    Ok(Value::Bool(!selected.is_empty()))
 }
 
 #[derive(Clone, Copy)]

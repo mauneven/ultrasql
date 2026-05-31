@@ -130,6 +130,48 @@ async fn jsonb_path_query_accepts_strict_and_lax_prefixes() {
 }
 
 #[tokio::test]
+async fn jsonb_path_strict_mode_reports_structural_errors() {
+    let running = start_sample_server("jsonb_path_query_test").await;
+    let client = &running.client;
+
+    let lax_rows = client
+        .simple_query(
+            "SELECT value FROM jsonb_path_query(\
+             '{\"items\":[{}]}'::jsonb, \
+             'lax $.items[*].missing')",
+        )
+        .await
+        .expect("lax jsonb_path_query missing key");
+    let rows: Vec<String> = lax_rows
+        .into_iter()
+        .filter_map(|message| match message {
+            SimpleQueryMessage::Row(row) => row.get(0).map(str::to_owned),
+            _ => None,
+        })
+        .collect();
+    assert!(rows.is_empty());
+
+    let strict_error = client
+        .simple_query(
+            "SELECT value FROM jsonb_path_query(\
+             '{\"items\":[{}]}'::jsonb, \
+             'strict $.items[*].missing')",
+        )
+        .await
+        .expect_err("strict jsonb_path_query missing key errors");
+    let strict_db_error = strict_error
+        .as_db_error()
+        .expect("strict jsonpath error carries server message");
+    assert!(
+        strict_db_error
+            .message()
+            .contains("strict jsonpath structural error")
+    );
+
+    shutdown(running).await;
+}
+
+#[tokio::test]
 async fn jsonb_path_exists_supports_variable_literals() {
     let running = start_sample_server("jsonb_path_query_test").await;
     let client = &running.client;
