@@ -193,8 +193,8 @@ impl VectorizedSink for ProbeHashSink<'_> {
             final_cols.push(gather_build_column(self.build_batches, &joined, bc)?);
         }
 
+        validate_output_columns(&final_cols, &self.output_schema)?;
         let out_batch = Batch::new(final_cols).map_err(ExecError::from)?;
-        let _ = &self.output_schema;
         self.inner.consume(out_batch)
     }
 
@@ -285,6 +285,27 @@ fn gather_build_column(
             other.data_type()
         ))),
     }
+}
+
+fn validate_output_columns(columns: &[Column], schema: &Schema) -> Result<(), ExecError> {
+    if columns.len() != schema.len() {
+        return Err(ExecError::TypeMismatch(format!(
+            "VectorizedHashJoin output width {} does not match schema width {}",
+            columns.len(),
+            schema.len()
+        )));
+    }
+    for (idx, column) in columns.iter().enumerate() {
+        let actual = column.data_type();
+        let expected = &schema.field_at(idx).data_type;
+        if &actual != expected {
+            return Err(ExecError::TypeMismatch(format!(
+                "VectorizedHashJoin output column {idx} type {:?} does not match schema type {:?}",
+                actual, expected
+            )));
+        }
+    }
+    Ok(())
 }
 
 // ============================================================================
@@ -410,6 +431,28 @@ mod tests {
         let batches = sink.finish();
 
         assert_eq!(drain_i32(batches, 3), vec![200]);
+    }
+
+    #[test]
+    fn hash_join_rejects_output_schema_mismatch() {
+        let probe = MemTableScan::new(schema_key_val(), vec![batch_kv(&[(2, 20)])]);
+        let build = MemTableScan::new(schema_key_i32_val(), vec![batch_kv_i32(&[(2, 200)])]);
+        let out_schema = Schema::new([
+            Field::required("p_key", DataType::Int64),
+            Field::required("p_val", DataType::Int64),
+            Field::required("b_key", DataType::Int64),
+            Field::required("b_val", DataType::Int64),
+        ])
+        .expect("schema ok");
+        let probe_op = VectorizedSeqScan::new(Box::new(probe));
+        let mut join =
+            VectorizedHashJoin::new(Box::new(probe_op), Box::new(build), 0, 0, out_schema);
+        let mut sink = CollectSink::new();
+
+        let err = join
+            .drive(&mut sink)
+            .expect_err("schema mismatch must not leak a malformed batch");
+        assert!(matches!(err, ExecError::TypeMismatch(_)), "{err:?}");
     }
 
     #[test]

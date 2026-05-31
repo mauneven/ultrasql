@@ -1879,6 +1879,9 @@ as a concise evidence ledger; roadmap stays for open gates only.
   when materialising matches instead of coercing unsupported build columns to
   zero-valued `Int64` columns. Evidence:
   `cargo test -p ultrasql-executor hash_join_preserves_int32_build_payloads --lib -- --nocapture`.
+- Vectorized hash join now validates emitted column types against the declared
+  output schema before pushing a batch downstream. Evidence:
+  `cargo test -p ultrasql-executor hash_join_rejects_output_schema_mismatch --lib -- --nocapture`.
 - Runtime scalar/temporal text casts to integer, float, boolean, date, time,
   timestamp, timestamptz, and timetz now report SQLSTATE `22P02` for invalid
   column text. Evidence:
