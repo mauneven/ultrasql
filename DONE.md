@@ -2085,3 +2085,8 @@ as a concise evidence ledger; roadmap stays for open gates only.
   accumulation overflow instead of panicking or wrapping inside the lineitem
   columnar cache. Evidence:
   `cargo test -p ultrasql-bench --features sql-bench tpch::load::tests --lib -- --nocapture`.
+- Hash aggregate scalar and vectorized `COUNT`, `COUNT(expr)`, and `AVG`
+  counters now use checked `i64` accumulation instead of silent saturation,
+  and grouped vectorized `SUM(INT)` now reports typed overflow instead of
+  clamping to `i32::MAX`. Evidence:
+  `cargo test -p ultrasql-executor hash_aggregate::tests --lib -- --nocapture`.

@@ -597,12 +597,11 @@ impl HashAggregate {
                 ),
                 (GroupedKey::Int64, Some(v)) => Value::Int64(v),
             };
-            output.push(vec![
-                key_value,
-                sum.map_or(Value::Null, |sum| {
-                    finalize_grouped_sum(sum, &plan.result_type)
-                }),
-            ]);
+            let sum_value = match sum {
+                Some(sum) => finalize_grouped_sum(sum, &plan.result_type)?,
+                None => Value::Null,
+            };
+            output.push(vec![key_value, sum_value]);
         }
         Ok(output)
     }
@@ -1017,15 +1016,17 @@ fn read_numeric_value(column: Option<&Column>, row: usize) -> Result<Option<i64>
     }
 }
 
-fn finalize_grouped_sum(sum: i64, data_type: &DataType) -> Value {
+fn finalize_grouped_sum(sum: i64, data_type: &DataType) -> Result<Value, ExecError> {
     match data_type {
-        DataType::Decimal { scale, .. } => Value::Decimal {
+        DataType::Decimal { scale, .. } => Ok(Value::Decimal {
             value: sum,
             scale: scale.unwrap_or(0),
-        },
-        DataType::Int64 => Value::Int64(sum),
-        DataType::Int32 => Value::Int32(i32::try_from(sum).unwrap_or(i32::MAX)),
-        _ => Value::Int64(sum),
+        }),
+        DataType::Int64 => Ok(Value::Int64(sum)),
+        DataType::Int32 => i32::try_from(sum)
+            .map(Value::Int32)
+            .map_err(|_| ExecError::NumericFieldOverflow("grouped INT sum overflow".to_owned())),
+        _ => Ok(Value::Int64(sum)),
     }
 }
 
@@ -1064,17 +1065,17 @@ fn vectorized_step(
     for (slot, state) in plan.iter().zip(states.iter_mut()) {
         match (slot, state) {
             (VecAggSlot::CountStar, AggState::CountStar(acc)) => {
-                *acc = acc.saturating_add(i64::try_from(n).unwrap_or(i64::MAX));
+                increment_count(acc, checked_count_delta(n, "HashAggregate COUNT(*)")?)?;
             }
             (VecAggSlot::Count(ci), AggState::Count(acc)) => {
-                *acc = acc.saturating_add(column_non_null_count(&cols[*ci]));
+                increment_count(acc, column_non_null_count(&cols[*ci])?)?;
             }
             (VecAggSlot::Sum(ci), AggState::Sum(acc)) => {
                 accumulate_sum(acc, &cols[*ci])?;
             }
             (VecAggSlot::Avg(ci), AggState::Avg(acc, cnt)) => {
                 accumulate_sum(acc, &cols[*ci])?;
-                *cnt = cnt.saturating_add(column_non_null_count(&cols[*ci]));
+                increment_count(cnt, column_non_null_count(&cols[*ci])?)?;
             }
             (VecAggSlot::Min(ci), AggState::Min(acc)) => {
                 update_extremum(acc, &cols[*ci], /* take_min = */ true)?;
@@ -1095,8 +1096,8 @@ fn vectorized_step(
     Ok(())
 }
 
-/// Count of non-null rows in `col`, as `i64` (saturating).
-fn column_non_null_count(col: &Column) -> i64 {
+/// Count of non-null rows in `col`, as `i64`.
+fn column_non_null_count(col: &Column) -> Result<i64, ExecError> {
     let total = col.len();
     let valid = match col {
         Column::Int32(c) => c.nulls().map_or(total, ultrasql_vec::Bitmap::count_ones),
@@ -1110,7 +1111,18 @@ fn column_non_null_count(col: &Column) -> i64 {
             .nulls()
             .map_or(total, ultrasql_vec::Bitmap::count_ones),
     };
-    i64::try_from(valid).unwrap_or(i64::MAX)
+    checked_count_delta(valid, "HashAggregate COUNT")
+}
+
+fn checked_count_delta(delta: usize, context: &str) -> Result<i64, ExecError> {
+    i64::try_from(delta).map_err(|_| ExecError::NumericFieldOverflow(format!("{context} overflow")))
+}
+
+fn increment_count(acc: &mut i64, delta: i64) -> Result<(), ExecError> {
+    *acc = acc.checked_add(delta).ok_or_else(|| {
+        ExecError::NumericFieldOverflow("HashAggregate COUNT overflow".to_owned())
+    })?;
+    Ok(())
 }
 
 fn checked_sum_i64(acc: i64, delta: i64, context: &str) -> Result<i64, ExecError> {
@@ -1667,11 +1679,11 @@ fn accumulate_value(state: &mut AggState, arg_val: Option<Value>) -> Result<(), 
     match state {
         AggState::Distinct { .. } => unreachable!("distinct wrapper handled before dispatch"),
         AggState::CountStar(n) => {
-            *n = n.saturating_add(1);
+            increment_count(n, 1)?;
         }
         AggState::Count(n) => {
             if !matches!(arg_val, Some(Value::Null) | None) {
-                *n = n.saturating_add(1);
+                increment_count(n, 1)?;
             }
         }
         AggState::Sum(acc) => {
@@ -1691,7 +1703,7 @@ fn accumulate_value(state: &mut AggState, arg_val: Option<Value>) -> Result<(), 
                         None => widen_sum_seed(v),
                         Some(existing) => add_values(existing, v)?,
                     });
-                    *cnt = cnt.saturating_add(1);
+                    increment_count(cnt, 1)?;
                 }
             }
         }
@@ -1771,7 +1783,7 @@ fn accumulate_value(state: &mut AggState, arg_val: Option<Value>) -> Result<(), 
                 && fields.len() >= 2
                 && let (Some(y), Some(x)) = (value_as_f64(&fields[0].1), value_as_f64(&fields[1].1))
             {
-                *count = count.saturating_add(1);
+                increment_count(count, 1)?;
                 *sum_x += x;
                 *sum_y += y;
                 *sum_xy += x * y;
@@ -1788,7 +1800,7 @@ fn accumulate_value(state: &mut AggState, arg_val: Option<Value>) -> Result<(), 
                     // even when `count` is large; avoids the
                     // catastrophic cancellation of the naive
                     // sum-of-squares minus square-of-sum recipe.
-                    *count = count.saturating_add(1);
+                    increment_count(count, 1)?;
                     let delta = x - *mean;
                     *mean += delta / *count as f64;
                     let delta2 = x - *mean;
@@ -2278,10 +2290,10 @@ mod tests {
     use ultrasql_vec::dict::DictionaryColumn;
 
     use super::{
-        AggState, GroupKey, HashAggregate, accumulate_sum, build_grouped_vectorized_plan,
-        build_vectorized_plan, column_non_null_count, finalise, finalize_grouped_sum,
-        grouped_vectorized_step, read_i32_key, read_i64_key, read_numeric_value, update_extremum,
-        vectorized_step,
+        AggState, GroupKey, HashAggregate, VecAggSlot, accumulate_sum, accumulate_value,
+        build_grouped_vectorized_plan, build_vectorized_plan, column_non_null_count, finalise,
+        finalize_grouped_sum, grouped_vectorized_step, read_i32_key, read_i64_key,
+        read_numeric_value, update_extremum, vectorized_step,
     };
     use crate::mem_table_scan::MemTableScan;
     use crate::{CancelFlag, Operator, WorkMemBudget};
@@ -2605,13 +2617,13 @@ mod tests {
             DictionaryColumn::from_strings([Some("a"), None, Some("c"), Some("d")])
                 .expect("test dictionary should fit u32 codes"),
         );
-        assert_eq!(column_non_null_count(&int32), 3);
-        assert_eq!(column_non_null_count(&int64), 3);
-        assert_eq!(column_non_null_count(&float32), 3);
-        assert_eq!(column_non_null_count(&float64), 3);
-        assert_eq!(column_non_null_count(&bools), 3);
-        assert_eq!(column_non_null_count(&utf8), 3);
-        assert_eq!(column_non_null_count(&dict), 3);
+        assert_eq!(column_non_null_count(&int32).expect("int32 count"), 3);
+        assert_eq!(column_non_null_count(&int64).expect("int64 count"), 3);
+        assert_eq!(column_non_null_count(&float32).expect("float32 count"), 3);
+        assert_eq!(column_non_null_count(&float64).expect("float64 count"), 3);
+        assert_eq!(column_non_null_count(&bools).expect("bool count"), 3);
+        assert_eq!(column_non_null_count(&utf8).expect("utf8 count"), 3);
+        assert_eq!(column_non_null_count(&dict).expect("dict count"), 3);
 
         let batch = Batch::new([
             int32.clone(),
@@ -2719,16 +2731,16 @@ mod tests {
                     precision: None,
                     scale: Some(2),
                 },
-            ),
+            )
+            .expect("decimal grouped sum"),
             Value::Decimal {
                 value: 123,
                 scale: 2
             }
         );
-        assert_eq!(
-            finalize_grouped_sum(i64::from(i32::MAX) + 1, &DataType::Int32),
-            Value::Int32(i32::MAX)
-        );
+        let err = finalize_grouped_sum(i64::from(i32::MAX) + 1, &DataType::Int32)
+            .expect_err("grouped INT sum overflow must not clamp");
+        assert!(matches!(err, crate::ExecError::NumericFieldOverflow(_)));
     }
 
     // -------------------------------------------------------------------------
@@ -3402,6 +3414,44 @@ mod tests {
             matches!(err, crate::ExecError::NumericFieldOverflow(_)),
             "{err:?}"
         );
+    }
+
+    #[test]
+    fn scalar_count_states_reject_i64_overflow() {
+        let mut count_star = AggState::CountStar(i64::MAX);
+        let err = accumulate_value(&mut count_star, None)
+            .expect_err("COUNT(*) overflow must not saturate");
+        assert!(matches!(err, crate::ExecError::NumericFieldOverflow(_)));
+
+        let mut count = AggState::Count(i64::MAX);
+        let err = accumulate_value(&mut count, Some(Value::Int32(1)))
+            .expect_err("COUNT(expr) overflow must not saturate");
+        assert!(matches!(err, crate::ExecError::NumericFieldOverflow(_)));
+
+        let mut avg = AggState::Avg(Some(Value::Int64(1)), i64::MAX);
+        let err = accumulate_value(&mut avg, Some(Value::Int64(1)))
+            .expect_err("AVG count overflow must not saturate");
+        assert!(matches!(err, crate::ExecError::NumericFieldOverflow(_)));
+    }
+
+    #[test]
+    fn vectorized_count_states_reject_i64_overflow() {
+        let batch = make_batch_i32_i64(&[(1, 10)]);
+
+        let mut count_star = [AggState::CountStar(i64::MAX)];
+        let err = vectorized_step(&[VecAggSlot::CountStar], &batch, &mut count_star)
+            .expect_err("vectorized COUNT(*) overflow must not saturate");
+        assert!(matches!(err, crate::ExecError::NumericFieldOverflow(_)));
+
+        let mut count = [AggState::Count(i64::MAX)];
+        let err = vectorized_step(&[VecAggSlot::Count(0)], &batch, &mut count)
+            .expect_err("vectorized COUNT(expr) overflow must not saturate");
+        assert!(matches!(err, crate::ExecError::NumericFieldOverflow(_)));
+
+        let mut avg = [AggState::Avg(Some(Value::Int64(10)), i64::MAX)];
+        let err = vectorized_step(&[VecAggSlot::Avg(1)], &batch, &mut avg)
+            .expect_err("vectorized AVG count overflow must not saturate");
+        assert!(matches!(err, crate::ExecError::NumericFieldOverflow(_)));
     }
 
     /// Companion NULL-handling check for the vectorised SUM path. The row-
