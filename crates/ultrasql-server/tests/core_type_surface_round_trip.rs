@@ -236,6 +236,34 @@ async fn core_scalar_types_round_trip_over_postgres_wire() {
 
     client
         .batch_execute(
+            "CREATE TABLE scalar_range_text_cast_surface (
+                as_smallint TEXT NOT NULL,
+                as_int TEXT NOT NULL,
+                as_bigint TEXT NOT NULL
+             );
+             INSERT INTO scalar_range_text_cast_surface
+             VALUES ('32768', '2147483648', '9223372036854775808')",
+        )
+        .await
+        .expect("create range scalar text cast table");
+    for query in [
+        "SELECT CAST(as_smallint AS SMALLINT) FROM scalar_range_text_cast_surface",
+        "SELECT CAST(as_int AS INTEGER) FROM scalar_range_text_cast_surface",
+        "SELECT CAST(as_bigint AS BIGINT) FROM scalar_range_text_cast_surface",
+    ] {
+        let err = client
+            .simple_query(query)
+            .await
+            .expect_err("out-of-range runtime integer text cast must fail");
+        assert_eq!(
+            err.code().map(tokio_postgres::error::SqlState::code),
+            Some("22003"),
+            "{query}"
+        );
+    }
+
+    client
+        .batch_execute(
             "CREATE TABLE structured_text_cast_surface (
                 as_uuid TEXT NOT NULL,
                 as_json TEXT NOT NULL,

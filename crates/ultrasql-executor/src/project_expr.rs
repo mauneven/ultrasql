@@ -98,11 +98,21 @@ fn eval_error_to_exec(error: EvalError) -> ExecError {
         EvalError::NumericFieldOverflow(detail) => ExecError::NumericFieldOverflow(detail),
         EvalError::Overflow => ExecError::NumericFieldOverflow("numeric value out of range".into()),
         EvalError::DivByZero => ExecError::DivisionByZero("division by zero".into()),
+        EvalError::Type(message) if is_numeric_value_out_of_range(&message) => {
+            ExecError::NumericFieldOverflow(message)
+        }
         EvalError::Type(message) if is_invalid_text_representation(&message) => {
             ExecError::InvalidTextRepresentation(message)
         }
         other => ExecError::TypeMismatch(other.to_string()),
     }
+}
+
+fn is_numeric_value_out_of_range(message: &str) -> bool {
+    message.starts_with("smallint cast: value out of range:")
+        || message.starts_with("integer cast: value out of range:")
+        || message.starts_with("bigint cast: value out of range:")
+        || message.starts_with("OID cast: value out of range:")
 }
 
 fn is_invalid_text_representation(message: &str) -> bool {
