@@ -2145,3 +2145,6 @@ as a concise evidence ledger; roadmap stays for open gates only.
 - TOAST external value IDs now use a checked compare-exchange allocator and
   reject counter exhaustion before wrapping into invalid/reserved IDs. Evidence:
   `cargo test -p ultrasql-storage toast::tests::store_rejects_value_oid_exhaustion_without_wrapping --lib -- --nocapture`.
+- Persistent CLOG now rejects XIDs that exceed the 32-bit block address space
+  instead of truncating page numbers and aliasing older status pages. Evidence:
+  `cargo test -p ultrasql-storage clog::tests --lib -- --nocapture`.

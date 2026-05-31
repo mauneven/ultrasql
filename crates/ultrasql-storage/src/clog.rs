@@ -84,6 +84,19 @@ pub enum ClogError {
     /// A page-level operation failed.
     #[error("page: {0}")]
     Page(#[from] PageError),
+
+    /// An XID maps past the CLOG relation's 32-bit block address space.
+    #[error("xid {xid} maps to CLOG page {page_num}, beyond u32 block address space")]
+    XidOutOfRange {
+        /// Transaction ID being addressed.
+        xid: u64,
+        /// Computed CLOG page number.
+        page_num: u64,
+    },
+
+    /// Recovery scanned the full 32-bit CLOG block address space.
+    #[error("CLOG recovery page counter exhausted")]
+    PageCounterExhausted,
 }
 
 /// Buffer-pool-backed persistent commit log.
@@ -131,7 +144,7 @@ impl<L: PageLoader> PersistentClog<L> {
         if xid == Xid::FROZEN || xid == Xid::BOOTSTRAP {
             return Ok(XidStatus::Committed);
         }
-        let (page_id, byte_off, shift) = Self::location(xid, self.rel);
+        let (page_id, byte_off, shift) = Self::location(xid, self.rel)?;
         let guard = self.pool.get_page(page_id)?;
         let page = guard.read();
         let data_byte = page.as_bytes()[PAGE_HEADER_SIZE + byte_off];
@@ -148,7 +161,7 @@ impl<L: PageLoader> PersistentClog<L> {
     /// `PageWrite` guard on drop.
     #[allow(clippy::significant_drop_tightening)]
     pub fn set_status(&self, xid: Xid, status: XidStatus) -> Result<(), ClogError> {
-        let (page_id, byte_off, shift) = Self::location(xid, self.rel);
+        let (page_id, byte_off, shift) = Self::location(xid, self.rel)?;
         let guard = self.pool.get_page(page_id)?;
         // `page` (PageWrite) must remain in scope until after we mutate
         // bytes, because `page` borrows from `guard` and `bytes` borrows
@@ -168,9 +181,9 @@ impl<L: PageLoader> PersistentClog<L> {
     /// Call this when assigning a new XID so that `status()` can be
     /// served from RAM without a loader round-trip on the first query.
     pub fn extend(&self, up_to_xid: Xid) -> Result<(), ClogError> {
-        let last_page = Self::page_number(up_to_xid);
+        let last_page = Self::page_number_u32(up_to_xid)?;
         for page_num in 0..=last_page {
-            let page_id = PageId::new(self.rel, BlockNumber::new(page_num as u32));
+            let page_id = PageId::new(self.rel, BlockNumber::new(page_num));
             // Materialise the page if absent. The blank heap page returned
             // by the loader has all-zero data bytes → all InProgress, which
             // is correct for unallocated XIDs.
@@ -190,10 +203,10 @@ impl<L: PageLoader> PersistentClog<L> {
         if oldest_in_progress.raw() == 0 {
             return Ok(0);
         }
-        let first_needed_page = Self::page_number(oldest_in_progress);
+        let first_needed_page = Self::page_number_u32(oldest_in_progress)?;
         let mut removed = 0u32;
         for page_num in 0..first_needed_page {
-            let page_id = PageId::new(self.rel, BlockNumber::new(page_num as u32));
+            let page_id = PageId::new(self.rel, BlockNumber::new(page_num));
             // Pin then immediately drop — the pool's eviction policy reclaims
             // the frame on the next eviction sweep.
             if self.pool.get_page(page_id).is_ok() {
@@ -228,11 +241,19 @@ impl<L: PageLoader> PersistentClog<L> {
                 // At least one non-InProgress XID is encoded in this byte.
                 // Scan the four bit-pairs from high to low.
                 for pair in (0u64..4).rev() {
-                    let shift = (pair * 2) as u32;
+                    let shift =
+                        u32::try_from(pair * 2).map_err(|_| ClogError::PageCounterExhausted)?;
                     let bits = (b >> shift) & 0b11;
                     if bits != STATUS_IN_PROGRESS {
-                        let global_xid =
-                            u64::from(page_num) * CLOG_XIDS_PER_PAGE + (byte_idx as u64) * 4 + pair;
+                        let byte_xid_offset = u64::try_from(byte_idx)
+                            .map_err(|_| ClogError::PageCounterExhausted)?
+                            .checked_mul(4)
+                            .ok_or(ClogError::PageCounterExhausted)?;
+                        let global_xid = u64::from(page_num)
+                            .checked_mul(CLOG_XIDS_PER_PAGE)
+                            .and_then(|base| base.checked_add(byte_xid_offset))
+                            .and_then(|base| base.checked_add(pair))
+                            .ok_or(ClogError::PageCounterExhausted)?;
                         let candidate = Xid::new(global_xid);
                         if candidate > highest {
                             highest = candidate;
@@ -243,7 +264,9 @@ impl<L: PageLoader> PersistentClog<L> {
             }
             drop(page);
             drop(guard);
-            page_num += 1;
+            page_num = page_num
+                .checked_add(1)
+                .ok_or(ClogError::PageCounterExhausted)?;
         }
         Ok(highest)
     }
@@ -257,15 +280,23 @@ impl<L: PageLoader> PersistentClog<L> {
         xid.raw() / CLOG_XIDS_PER_PAGE
     }
 
-    /// Compute `(page_id, byte_offset_in_data, bit_shift)` for `xid`.
-    const fn location(xid: Xid, rel: RelationId) -> (PageId, usize, u32) {
+    fn page_number_u32(xid: Xid) -> Result<u32, ClogError> {
         let page_num = Self::page_number(xid);
+        u32::try_from(page_num).map_err(|_| ClogError::XidOutOfRange {
+            xid: xid.raw(),
+            page_num,
+        })
+    }
+
+    /// Compute `(page_id, byte_offset_in_data, bit_shift)` for `xid`.
+    fn location(xid: Xid, rel: RelationId) -> Result<(PageId, usize, u32), ClogError> {
+        let page_num = Self::page_number_u32(xid)?;
         let local = xid.raw() % CLOG_XIDS_PER_PAGE;
         let bit_off = local * 2;
-        let byte_off = (bit_off / 8) as usize;
-        let shift = (bit_off % 8) as u32;
-        let page_id = PageId::new(rel, BlockNumber::new(page_num as u32));
-        (page_id, byte_off, shift)
+        let byte_off = usize::try_from(bit_off / 8).map_err(|_| ClogError::PageCounterExhausted)?;
+        let shift = u32::try_from(bit_off % 8).map_err(|_| ClogError::PageCounterExhausted)?;
+        let page_id = PageId::new(rel, BlockNumber::new(page_num));
+        Ok((page_id, byte_off, shift))
     }
 }
 
@@ -377,6 +408,26 @@ mod tests {
         assert_eq!(clog.status(xid).unwrap(), XidStatus::Committed);
         // Page-0 XID is unaffected.
         assert_eq!(clog.status(Xid::new(5)).unwrap(), XidStatus::InProgress);
+    }
+
+    #[test]
+    fn status_rejects_xid_beyond_block_address_space() {
+        let clog = make_clog();
+        let xid = Xid::new((u64::from(u32::MAX) + 1) * CLOG_XIDS_PER_PAGE);
+        let err = clog.status(xid).unwrap_err();
+        assert!(matches!(err, ClogError::XidOutOfRange { .. }));
+    }
+
+    #[test]
+    fn extend_and_trim_reject_xids_beyond_block_address_space() {
+        let clog = make_clog();
+        let xid = Xid::new((u64::from(u32::MAX) + 1) * CLOG_XIDS_PER_PAGE);
+
+        let extend_err = clog.extend(xid).unwrap_err();
+        assert!(matches!(extend_err, ClogError::XidOutOfRange { .. }));
+
+        let trim_err = clog.trim_below(xid).unwrap_err();
+        assert!(matches!(trim_err, ClogError::XidOutOfRange { .. }));
     }
 
     #[test]
