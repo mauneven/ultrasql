@@ -926,6 +926,7 @@ impl PersistentCatalog {
             latest_class_by_oid.insert(class_row.oid, class_row);
         }
 
+        let class_rows_by_oid = latest_class_by_oid.clone();
         let mut user_relations: u32 = 0;
         let mut user_index_classes: Vec<ClassRow> = Vec::new();
         for (_, class_row) in latest_class_by_oid {
@@ -1182,6 +1183,14 @@ impl PersistentCatalog {
             statistic_ext: total_statistic_ext,
         };
         self.install_snapshot(snap)?;
+        self.pg_class.clear();
+        for (oid, row) in class_rows_by_oid {
+            self.pg_class.insert(oid, row);
+        }
+        self.pg_type.clear();
+        for (oid, row) in type_rows_by_oid {
+            self.pg_type.insert(oid, row);
+        }
         self.pg_attribute.clear();
         for (key, row) in attribute_rows {
             self.pg_attribute.insert(key, row);
@@ -1915,11 +1924,7 @@ impl PersistentCatalog {
 
         let pg_class_rel = RelationId::new(bootstrap::PG_CLASS_OID);
         let pg_attribute_rel = RelationId::new(bootstrap::PG_ATTRIBUTE_OID);
-        let namespace_oid = if new_entry.schema_name == "pg_catalog" {
-            Oid::new(bootstrap::PG_CATALOG_OID)
-        } else {
-            Oid::new(bootstrap::PUBLIC_OID)
-        };
+        let namespace_oid = namespace_oid_for_schema(&new_entry.schema_name);
         let wal = heap.wal_sink().map(|sink| sink.as_ref());
         let class_row = ClassRow {
             oid: new_entry.oid,
@@ -2025,11 +2030,7 @@ impl PersistentCatalog {
 
         let pg_class_rel = RelationId::new(bootstrap::PG_CLASS_OID);
         let pg_attribute_rel = RelationId::new(bootstrap::PG_ATTRIBUTE_OID);
-        let namespace_oid = if entry.schema_name == "pg_catalog" {
-            Oid::new(bootstrap::PG_CATALOG_OID)
-        } else {
-            Oid::new(bootstrap::PUBLIC_OID)
-        };
+        let namespace_oid = namespace_oid_for_schema(&entry.schema_name);
         let wal = heap.wal_sink().map(|sink| sink.as_ref());
         let class_row = ClassRow {
             oid: entry.oid,
@@ -2131,11 +2132,7 @@ impl PersistentCatalog {
         let pg_class_rel = RelationId::new(bootstrap::PG_CLASS_OID);
         let pg_attribute_rel = RelationId::new(bootstrap::PG_ATTRIBUTE_OID);
 
-        let namespace_oid = if entry.schema_name == "pg_catalog" {
-            Oid::new(bootstrap::PG_CATALOG_OID)
-        } else {
-            Oid::new(bootstrap::PUBLIC_OID)
-        };
+        let namespace_oid = namespace_oid_for_schema(&entry.schema_name);
 
         let class_row = ClassRow {
             oid: entry.oid,
@@ -2468,6 +2465,79 @@ impl PersistentCatalog {
         self.rebuild_snapshot();
         Ok(())
     }
+
+    /// Refresh user object schema names after runtime schema metadata loads.
+    ///
+    /// Heap bootstrap runs before the server has loaded runtime schema
+    /// sidecars, so custom namespace OIDs cannot be named on the first pass.
+    /// This method translates those OIDs back into schema names and publishes
+    /// a fresh catalog snapshot before planning resumes.
+    pub fn refresh_runtime_schema_names(
+        &self,
+        namespace_names: &std::collections::HashMap<Oid, String>,
+    ) {
+        if namespace_names.is_empty() {
+            return;
+        }
+        let _guard = self.write_lock.lock();
+        for mut item in self.tables_by_name.iter_mut() {
+            if let Some(class_row) = self.pg_class.get(&item.oid)
+                && let Some(schema_name) = namespace_names.get(&class_row.relnamespace)
+            {
+                item.schema_name = schema_name.clone();
+            }
+        }
+        for mut item in self.tables_by_oid.iter_mut() {
+            if let Some(class_row) = self.pg_class.get(&item.oid)
+                && let Some(schema_name) = namespace_names.get(&class_row.relnamespace)
+            {
+                item.schema_name = schema_name.clone();
+            }
+        }
+        for mut item in self.enum_types_by_name.iter_mut() {
+            if let Some(type_row) = self.pg_type.get(&item.oid)
+                && let Some(schema_name) = namespace_names.get(&type_row.typnamespace)
+            {
+                item.schema_name = schema_name.clone();
+            }
+        }
+        for mut item in self.enum_types_by_oid.iter_mut() {
+            if let Some(type_row) = self.pg_type.get(&item.oid)
+                && let Some(schema_name) = namespace_names.get(&type_row.typnamespace)
+            {
+                item.schema_name = schema_name.clone();
+            }
+        }
+        for mut item in self.composite_types_by_name.iter_mut() {
+            if let Some(type_row) = self.pg_type.get(&item.oid)
+                && let Some(schema_name) = namespace_names.get(&type_row.typnamespace)
+            {
+                item.schema_name = schema_name.clone();
+            }
+        }
+        for mut item in self.composite_types_by_oid.iter_mut() {
+            if let Some(type_row) = self.pg_type.get(&item.oid)
+                && let Some(schema_name) = namespace_names.get(&type_row.typnamespace)
+            {
+                item.schema_name = schema_name.clone();
+            }
+        }
+        for mut item in self.domain_types_by_name.iter_mut() {
+            if let Some(type_row) = self.pg_type.get(&item.oid)
+                && let Some(schema_name) = namespace_names.get(&type_row.typnamespace)
+            {
+                item.schema_name = schema_name.clone();
+            }
+        }
+        for mut item in self.domain_types_by_oid.iter_mut() {
+            if let Some(type_row) = self.pg_type.get(&item.oid)
+                && let Some(schema_name) = namespace_names.get(&type_row.typnamespace)
+            {
+                item.schema_name = schema_name.clone();
+            }
+        }
+        self.rebuild_snapshot();
+    }
 }
 
 fn normalized_opclasses(entry: &IndexEntry) -> Vec<Option<String>> {
@@ -2568,11 +2638,21 @@ fn enum_row_from_label(enumtypid: Oid, label: &EnumLabelEntry) -> EnumRow {
 }
 
 fn namespace_oid_for_schema(schema_name: &str) -> Oid {
-    if schema_name == "pg_catalog" {
-        Oid::new(bootstrap::PG_CATALOG_OID)
-    } else {
-        Oid::new(bootstrap::PUBLIC_OID)
+    match schema_name {
+        "pg_catalog" => Oid::new(bootstrap::PG_CATALOG_OID),
+        "information_schema" => Oid::new(bootstrap::INFORMATION_SCHEMA_OID),
+        "public" => Oid::new(bootstrap::PUBLIC_OID),
+        other => Oid::new(runtime_schema_oid(other)),
     }
+}
+
+fn runtime_schema_oid(name: &str) -> u32 {
+    const USER_SCHEMA_OID_BASE: u32 = 70_000;
+    const USER_SCHEMA_OID_SPACE: u32 = 1_000_000;
+    let hash = name.as_bytes().iter().fold(0x811c_9dc5_u32, |acc, byte| {
+        (acc ^ u32::from(*byte)).wrapping_mul(0x0100_0193)
+    });
+    USER_SCHEMA_OID_BASE + (hash % USER_SCHEMA_OID_SPACE)
 }
 
 fn fold_name(name: &str) -> String {

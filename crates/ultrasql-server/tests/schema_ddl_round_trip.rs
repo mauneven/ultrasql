@@ -212,3 +212,55 @@ async fn qualified_sequence_schema_survives_restart() {
 
     shutdown(running).await;
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn qualified_relation_and_type_schemas_survive_restart() {
+    let data_dir = tempfile::TempDir::new().expect("temp data dir");
+
+    let running = start_persistent_server(data_dir.path(), "schema_object_restart_setup").await;
+    running
+        .client
+        .batch_execute(
+            "CREATE SCHEMA app; \
+             CREATE TABLE app.events (id INT); \
+             CREATE MATERIALIZED VIEW app.user_names AS SELECT id, name FROM users; \
+             CREATE TYPE app.mood AS ENUM ('ok'); \
+             CREATE DOMAIN app.positive_int AS INT CHECK (VALUE > 0)",
+        )
+        .await
+        .expect("create qualified relation and type objects");
+    shutdown(running).await;
+
+    let running = start_persistent_server(data_dir.path(), "schema_object_restart_verify").await;
+    let rels = running
+        .client
+        .query_one(
+            "SELECT COUNT(*) \
+             FROM pg_catalog.pg_class c \
+             JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace \
+             WHERE n.nspname = 'app' \
+               AND c.relname IN ('events', 'user_names')",
+            &[],
+        )
+        .await
+        .expect("query relation namespaces after restart")
+        .get::<_, i64>(0);
+    assert_eq!(rels, 2);
+
+    let types = running
+        .client
+        .query_one(
+            "SELECT COUNT(*) \
+             FROM pg_catalog.pg_type t \
+             JOIN pg_catalog.pg_namespace n ON n.oid = t.typnamespace \
+             WHERE n.nspname = 'app' \
+               AND t.typname IN ('mood', 'positive_int')",
+            &[],
+        )
+        .await
+        .expect("query type namespaces after restart")
+        .get::<_, i64>(0);
+    assert_eq!(types, 2);
+
+    shutdown(running).await;
+}

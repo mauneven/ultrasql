@@ -4676,6 +4676,7 @@ impl Server {
         server.rebuild_role_metadata()?;
         server.rebuild_privilege_metadata()?;
         server.rebuild_schema_metadata()?;
+        server.refresh_persistent_catalog_schema_names();
         server.rebuild_sequence_owner_metadata()?;
         server.rebuild_operator_metadata()?;
         server.rebuild_row_security_sidecars()?;
@@ -5912,6 +5913,21 @@ impl Server {
             self.schemas.insert(schema.name.clone(), Arc::new(schema));
         }
         Ok(())
+    }
+
+    fn refresh_persistent_catalog_schema_names(&self) {
+        let namespace_names = self
+            .schemas
+            .iter()
+            .map(|entry| {
+                (
+                    ultrasql_core::Oid::new(runtime_schema_oid(entry.key())),
+                    entry.key().clone(),
+                )
+            })
+            .collect::<std::collections::HashMap<_, _>>();
+        self.persistent_catalog
+            .refresh_runtime_schema_names(&namespace_names);
     }
 
     fn operator_metadata_path(&self) -> Option<std::path::PathBuf> {

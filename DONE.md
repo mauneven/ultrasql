@@ -952,6 +952,11 @@ as a concise evidence ledger; roadmap stays for open gates only.
   dependencies instead of leaving orphaned namespace references. Evidence:
   `cargo test -p ultrasql-server --test schema_ddl_round_trip
   qualified_sequence_schema_survives_restart`.
+- Qualified table, materialized-view, enum, and domain schema names now survive
+  restart by storing stable runtime namespace OIDs in catalog rows and remapping
+  them after schema metadata loads. Evidence: `cargo test -p ultrasql-server
+  --test schema_ddl_round_trip
+  qualified_relation_and_type_schemas_survive_restart`.
 - `DROP ROLE` now rejects roles that still own live tables or still appear in
   object/default privilege grants, avoiding stale ownership and ACL references.
   Evidence: `cargo test -p ultrasql-server --test role_ddl_round_trip`.
