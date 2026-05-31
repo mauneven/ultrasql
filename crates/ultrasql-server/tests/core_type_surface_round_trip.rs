@@ -134,13 +134,22 @@ async fn core_scalar_types_round_trip_over_postgres_wire() {
 
     client
         .batch_execute(
-            "CREATE TABLE temporal_text_cast_surface (
+            "SET TimeZone TO 'UTC';
+             CREATE TABLE temporal_text_cast_surface (
                 as_date TEXT NOT NULL,
                 as_time TEXT NOT NULL,
-                as_timestamp TEXT NOT NULL
+                as_timestamp TEXT NOT NULL,
+                as_timestamptz TEXT NOT NULL,
+                as_timetz TEXT NOT NULL
              );
              INSERT INTO temporal_text_cast_surface
-             VALUES ('2023-08-15', '04:05:06', '2023-08-15 04:05:06')",
+             VALUES (
+                '2023-08-15',
+                '04:05:06',
+                '2023-08-15 04:05:06',
+                '2023-08-15 04:05:06 UTC',
+                '04:05:06-05'
+             )",
         )
         .await
         .expect("create temporal text cast table");
@@ -149,7 +158,9 @@ async fn core_scalar_types_round_trip_over_postgres_wire() {
             "SELECT
                 CAST(as_date AS DATE),
                 CAST(as_time AS TIME),
-                CAST(as_timestamp AS TIMESTAMP)
+                CAST(as_timestamp AS TIMESTAMP),
+                CAST(as_timestamptz AS TIMESTAMP WITH TIME ZONE),
+                CAST(as_timetz AS TIME WITH TIME ZONE)
              FROM temporal_text_cast_surface",
         )
         .await
@@ -158,7 +169,7 @@ async fn core_scalar_types_round_trip_over_postgres_wire() {
         .into_iter()
         .filter_map(|message| match message {
             SimpleQueryMessage::Row(row) => Some(
-                (0..3)
+                (0..5)
                     .map(|idx| row.get(idx).expect("temporal cast column").to_owned())
                     .collect(),
             ),
@@ -170,7 +181,9 @@ async fn core_scalar_types_round_trip_over_postgres_wire() {
         vec![vec![
             "2023-08-15".to_owned(),
             "04:05:06".to_owned(),
-            "2023-08-15 04:05:06".to_owned()
+            "2023-08-15 04:05:06".to_owned(),
+            "2023-08-15 04:05:06+00".to_owned(),
+            "04:05:06-05".to_owned()
         ]]
     );
 

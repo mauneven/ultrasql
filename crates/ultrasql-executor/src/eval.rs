@@ -31,9 +31,9 @@ use num_traits::ToPrimitive;
 use serde_json::{Map as JsonMap, Number as JsonNumber, Value as JsonValue};
 use ultrasql_core::{
     DataType, Oid, SparseVector, Value, bpchar_semantic_text, parse_date_text, parse_money_text,
-    parse_time_text, parse_timestamp_text, timestamp_micros_at_timezone,
-    timestamptz_display_in_timezone, timetz_at_timezone, timetz_utc_micros,
-    xml_content_is_well_formed, xml_document_is_well_formed,
+    parse_time_text, parse_timestamp_text, parse_timestamptz_text, parse_timetz_text,
+    timestamp_micros_at_timezone, timestamptz_display_in_timezone, timetz_at_timezone,
+    timetz_utc_micros, xml_content_is_well_formed, xml_document_is_well_formed,
     xml_xpath_element_fragments_with_namespaces,
 };
 use ultrasql_planner::{BinaryOp, ScalarExpr, UnaryOp, catalog::builtin_type_oid};
@@ -419,6 +419,8 @@ fn eval_function_call(
         "__ultrasql_cast_date" => eval_cast_date(args),
         "__ultrasql_cast_time" => eval_cast_time(args),
         "__ultrasql_cast_timestamp" => eval_cast_timestamp(args),
+        "__ultrasql_cast_timestamptz" => eval_cast_timestamptz(args),
+        "__ultrasql_cast_timetz" => eval_cast_timetz(args),
         "__ultrasql_cast_oid" => eval_cast_oid(args),
         "__ultrasql_cast_regclass" => eval_cast_regclass(args),
         "__ultrasql_cast_regtype" => eval_cast_regtype(args),
@@ -1161,6 +1163,27 @@ fn eval_cast_timestamp(args: &[Value]) -> Result<Value, EvalError> {
     parse_timestamp_text(text.trim())
         .map(Value::Timestamp)
         .ok_or_else(|| EvalError::Type(format!("timestamp cast: invalid syntax: {text}")))
+}
+
+fn eval_cast_timestamptz(args: &[Value]) -> Result<Value, EvalError> {
+    let Some(text) = textlike_cast_arg("timestamptz cast", args)? else {
+        return Ok(Value::Null);
+    };
+    parse_timestamptz_text(text.trim())
+        .map(Value::TimestampTz)
+        .ok_or_else(|| EvalError::Type(format!("timestamptz cast: invalid syntax: {text}")))
+}
+
+fn eval_cast_timetz(args: &[Value]) -> Result<Value, EvalError> {
+    let Some(text) = textlike_cast_arg("timetz cast", args)? else {
+        return Ok(Value::Null);
+    };
+    parse_timetz_text(text.trim())
+        .map(|(micros, offset_seconds)| Value::TimeTz {
+            micros,
+            offset_seconds,
+        })
+        .ok_or_else(|| EvalError::Type(format!("timetz cast: invalid syntax: {text}")))
 }
 
 fn textlike_cast_arg<'a>(func: &str, args: &'a [Value]) -> Result<Option<&'a str>, EvalError> {
@@ -6178,7 +6201,7 @@ mod tests {
     use proptest::prelude::*;
     use ultrasql_core::{
         BitString, DataType, Field, NetworkValue, Oid, Schema, Value, parse_date_text,
-        parse_time_text, parse_timestamp_text, parse_timestamptz_text,
+        parse_time_text, parse_timestamp_text, parse_timestamptz_text, parse_timetz_text,
     };
     use ultrasql_planner::{BinaryOp, LogicalPlan, ScalarExpr, UnaryOp};
 
@@ -6743,6 +6766,27 @@ mod tests {
         assert!(
             eval_fn_err("__ultrasql_cast_date", vec![Value::Text("bad".into())])
                 .contains("invalid syntax")
+        );
+        assert_eq!(
+            eval_fn(
+                "__ultrasql_cast_timestamptz",
+                vec![Value::Text("2023-08-15 04:05:06 UTC".into())]
+            ),
+            Value::TimestampTz(
+                parse_timestamptz_text("2023-08-15 04:05:06 UTC").expect("timestamptz parses")
+            )
+        );
+        let (timetz_micros, timetz_offset) =
+            parse_timetz_text("04:05:06-05").expect("timetz parses");
+        assert_eq!(
+            eval_fn(
+                "__ultrasql_cast_timetz",
+                vec![Value::Text("04:05:06-05".into())]
+            ),
+            Value::TimeTz {
+                micros: timetz_micros,
+                offset_seconds: timetz_offset,
+            }
         );
 
         assert!(eval_fn_err("__ultrasql_cast_oid", vec![]).contains("expected 1 arg"));
