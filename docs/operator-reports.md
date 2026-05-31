@@ -51,10 +51,13 @@ The release gate is ready only when:
 
 - at least three valid reports exist,
 - each report is from a distinct `operator_id`,
+- every report covers the tagged release commit,
 - every report covers at least 30 continuous days,
+- `end_time_utc` is not in the future,
+- `failure_count` is zero,
 - `correctness_issue_count`, `critical_issue_count`, and
   `high_issue_count` are all zero.
 
 CI can run the validator in non-strict mode to publish current status. The
-release workflow runs it with `--strict`, so a tag cannot publish unless the
-operator soak reports satisfy the gate.
+release workflow runs it with `--strict --commit "$GITHUB_SHA"`, so a tag cannot
+publish unless the operator soak reports satisfy the gate for that exact commit.

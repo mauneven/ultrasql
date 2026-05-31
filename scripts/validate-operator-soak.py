@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
@@ -33,6 +34,7 @@ REQUIRED_FIELDS = [
     "log_bundle_path",
     "signed_off_by",
 ]
+GIT_COMMIT_RE = re.compile(r"^[0-9a-fA-F]{40}$")
 
 
 def parse_args() -> argparse.Namespace:
@@ -44,6 +46,14 @@ def parse_args() -> argparse.Namespace:
         "--out",
         default="benchmarks/results/latest/operator_soak_status.json",
         help="status JSON output path",
+    )
+    parser.add_argument(
+        "--commit",
+        help="expected 40-hex release commit every valid report must cover",
+    )
+    parser.add_argument(
+        "--now",
+        help="RFC3339 timestamp used as validation time; defaults to current UTC time",
     )
     parser.add_argument(
         "--strict",
@@ -69,7 +79,18 @@ def parse_count(value: Any, field: str) -> int:
     return value
 
 
-def validate_report(path: Path, min_days: float) -> dict[str, Any]:
+def parse_commit(value: Any) -> str:
+    if not isinstance(value, str) or not GIT_COMMIT_RE.fullmatch(value.strip()):
+        raise ValueError("must be a full 40-character hex git commit")
+    return value.strip().lower()
+
+
+def validate_report(
+    path: Path,
+    min_days: float,
+    expected_commit: str | None,
+    now: datetime,
+) -> dict[str, Any]:
     errors: list[str] = []
     try:
         report = json.loads(path.read_text())
@@ -97,6 +118,14 @@ def validate_report(path: Path, min_days: float) -> dict[str, Any]:
         elif isinstance(report[field], str) and not report[field].strip():
             errors.append(f"{field} must be non-empty")
 
+    commit = None
+    try:
+        commit = parse_commit(report.get("commit"))
+    except ValueError as err:
+        errors.append(f"commit {err}")
+    if commit is not None and expected_commit is not None and commit != expected_commit:
+        errors.append(f"commit expected commit {expected_commit}, got {commit}")
+
     start = end = None
     try:
         start = parse_time(report.get("start_time_utc"))
@@ -110,6 +139,10 @@ def validate_report(path: Path, min_days: float) -> dict[str, Any]:
     duration_days = 0.0
     if start and end:
         duration_days = (end - start).total_seconds() / 86_400.0
+        if end <= start:
+            errors.append("end_time_utc must be after start_time_utc")
+        if end > now:
+            errors.append("end_time_utc is in the future")
         if duration_days < min_days:
             errors.append(f"duration {duration_days:.3f} days is below {min_days:g}")
 
@@ -124,6 +157,9 @@ def validate_report(path: Path, min_days: float) -> dict[str, Any]:
         except ValueError as err:
             errors.append(str(err))
 
+    if isinstance(report.get("failure_count"), int) and report["failure_count"] != 0:
+        errors.append("failure_count must be zero for a continuous soak")
+
     for field in ["correctness_issue_count", "critical_issue_count", "high_issue_count"]:
         if isinstance(report.get(field), int) and report[field] != 0:
             errors.append(f"{field} must be zero for release sign-off")
@@ -131,7 +167,7 @@ def validate_report(path: Path, min_days: float) -> dict[str, Any]:
     return {
         "path": str(path),
         "operator_id": report.get("operator_id"),
-        "commit": report.get("commit"),
+        "commit": commit if commit is not None else report.get("commit"),
         "valid": not errors,
         "duration_days": round(duration_days, 6),
         "failure_count": report.get("failure_count"),
@@ -144,14 +180,31 @@ def validate_report(path: Path, min_days: float) -> dict[str, Any]:
 
 def main() -> int:
     args = parse_args()
+    expected_commit = None
+    if args.commit:
+        try:
+            expected_commit = parse_commit(args.commit)
+        except ValueError as err:
+            print(f"--commit {err}", file=sys.stderr)
+            return 2
+    try:
+        now = parse_time(args.now) if args.now else datetime.now(timezone.utc)
+    except Exception as err:  # noqa: BLE001 - CLI validation path.
+        print(f"--now {err}", file=sys.stderr)
+        return 2
     reports_dir = Path(args.reports_dir)
     paths = sorted(reports_dir.glob("*.json")) if reports_dir.exists() else []
-    reports = [validate_report(path, args.min_days) for path in paths]
+    reports = [
+        validate_report(path, args.min_days, expected_commit, now)
+        for path in paths
+    ]
     valid_reports = [report for report in reports if report["valid"]]
     unique_operators = sorted({report["operator_id"] for report in valid_reports})
+    valid_commits = sorted({report["commit"] for report in valid_reports})
     ready = (
         len(valid_reports) >= args.min_reports
         and len(unique_operators) >= args.min_reports
+        and len(valid_commits) == 1
     )
     status = "ready" if ready else "not_ready"
     reasons: list[str] = []
@@ -163,17 +216,30 @@ def main() -> int:
         reasons.append(
             f"{len(unique_operators)} independent operator(s), need {args.min_reports}"
         )
+    if len(valid_commits) != 1:
+        reasons.append(
+            f"{len(valid_commits)} valid release commit(s), need exactly 1"
+        )
+    if expected_commit is not None and valid_commits != [expected_commit]:
+        reasons.append(f"valid reports must cover expected commit {expected_commit}")
+    if expected_commit is not None and any(
+        report.get("commit") != expected_commit for report in reports
+    ):
+        reasons.append(f"one or more reports did not cover expected commit {expected_commit}")
 
     doc = {
         "schema_version": 1,
         "status": status,
         "ready": ready,
+        "release_commit": expected_commit,
+        "validated_at_utc": now.isoformat().replace("+00:00", "Z"),
         "min_reports": args.min_reports,
         "min_days": args.min_days,
         "reports_dir": str(reports_dir),
         "report_count": len(reports),
         "valid_report_count": len(valid_reports),
         "independent_operator_count": len(unique_operators),
+        "valid_release_commits": valid_commits,
         "reasons": reasons,
         "reports": reports,
     }

@@ -34,6 +34,7 @@ jobs:
             --reports-dir operator-reports \
             --min-reports 3 \
             --min-days 30 \
+            --commit "$GITHUB_SHA" \
             --out benchmarks/results/latest/operator_soak_status.json
       - name: summarize status
         run: |

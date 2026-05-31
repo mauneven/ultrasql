@@ -2218,3 +2218,10 @@ as a concise evidence ledger; roadmap stays for open gates only.
   output lengths before allocation instead of clamping to `usize::MAX`.
   Evidence:
   `cargo test -p ultrasql-executor eval::tests::generated_text_len_rejects_limit_overflow --lib -- --nocapture`.
+- Operator-soak validation now pins reports to the exact release commit, rejects
+  future report end times, and requires zero availability failures before the
+  v1.0 gate can become ready. The operator-soak and release workflows pass
+  `--commit "$GITHUB_SHA"` so a tag cannot reuse stale reports from another
+  commit. Evidence:
+  `python3 -m unittest discover -s tests/scripts -p 'test_*.py'`,
+  `cargo test -p ultrasql-bench --test release_hardening final_release_requires_operator_reports_green_workflows_and_notes -- --nocapture`.

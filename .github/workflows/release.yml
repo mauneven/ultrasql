@@ -82,6 +82,7 @@ jobs:
             --reports-dir operator-reports
             --min-reports 3
             --min-days 30
+            --commit "$GITHUB_SHA"
             --out target/operator_soak_status.json
           )
           if [[ "$RELEASE_TAG" != v0.* ]]; then
@@ -383,6 +384,7 @@ jobs:
             --reports-dir operator-reports
             --min-reports 3
             --min-days 30
+            --commit "$GITHUB_SHA"
             --out release/operator_soak_status.json
           )
           if [[ "$RELEASE_TAG" != v0.* ]]; then
