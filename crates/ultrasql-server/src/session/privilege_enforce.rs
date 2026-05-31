@@ -15,6 +15,7 @@ use super::privilege_sources::{
     ColumnSource, plan_sources, privilege_name, table_sources, target_columns,
 };
 use crate::auth::{AuthCatalog, PrivilegeKind, PrivilegeObjectKind};
+use crate::builtin_schema_name;
 use crate::error::ServerError;
 
 impl<RW> Session<RW>
@@ -43,6 +44,7 @@ where
             .role_catalog
             .inherited_role_names(&self.current_user);
         for requirement in &collector.table_requirements {
+            self.ensure_table_schema_usage(&requirement.table, catalog_snapshot, &roles)?;
             if self.owns_table_for_column_privilege(&requirement.table, catalog_snapshot) {
                 continue;
             }
@@ -60,6 +62,7 @@ where
             }
         }
         for requirement in collector.requirements {
+            self.ensure_table_schema_usage(&requirement.table, catalog_snapshot, &roles)?;
             if requirement.privilege == PrivilegeKind::Select
                 && self.public_catalog_table(&requirement.table, catalog_snapshot)
             {
@@ -84,6 +87,41 @@ where
             }
         }
         Ok(())
+    }
+
+    fn ensure_table_schema_usage(
+        &self,
+        table: &str,
+        catalog_snapshot: &CatalogSnapshot,
+        roles: &[String],
+    ) -> Result<(), ServerError> {
+        let Some(entry) = self.table_entry_for_privilege(table, catalog_snapshot) else {
+            return Ok(());
+        };
+        let schema_name = entry.schema_name.to_ascii_lowercase();
+        if builtin_schema_name(&schema_name) {
+            return Ok(());
+        }
+        let current_user = self.current_user.to_ascii_lowercase();
+        let owns_schema = self
+            .state
+            .schemas
+            .get(&schema_name)
+            .is_some_and(|schema| schema.owner_role.eq_ignore_ascii_case(&current_user));
+        if owns_schema {
+            return Ok(());
+        }
+        if self.state.privilege_catalog.has_privilege_for_roles(
+            roles,
+            PrivilegeObjectKind::Schema,
+            &schema_name,
+            PrivilegeKind::Usage,
+        ) {
+            return Ok(());
+        }
+        Err(ServerError::InsufficientPrivilege(format!(
+            "USAGE privilege on schema {schema_name}"
+        )))
     }
 
     fn public_catalog_table(&self, table: &str, catalog_snapshot: &CatalogSnapshot) -> bool {

@@ -465,6 +465,77 @@ async fn truncate_accepts_table_truncate_privilege() {
 }
 
 #[tokio::test]
+async fn schema_usage_is_required_for_table_access() {
+    let running = start_sample_server("schema_usage_gate").await;
+    let client = &running.client;
+
+    client
+        .batch_execute(
+            "CREATE ROLE tester SUPERUSER LOGIN; \
+             CREATE ROLE usage_acl_owner LOGIN; \
+             CREATE ROLE usage_acl_reader LOGIN; \
+             SET ROLE usage_acl_owner; \
+             CREATE SCHEMA usage_acl; \
+             CREATE TABLE usage_acl.docs (id INT); \
+             INSERT INTO usage_acl.docs VALUES (7); \
+             RESET ROLE; \
+             GRANT SELECT ON TABLE usage_acl.docs TO usage_acl_reader",
+        )
+        .await
+        .expect("create schema usage test table");
+
+    let (reader, reader_conn) = connect_as(
+        running.bound,
+        "usage_acl_reader",
+        "schema_usage_reader_blocked",
+    )
+    .await;
+    assert_insufficient_privilege(
+        reader
+            .query("SELECT id FROM usage_acl.docs", &[])
+            .await
+            .expect_err("schema USAGE required despite table SELECT"),
+    );
+    drop(reader);
+    reader_conn
+        .await
+        .expect("blocked schema usage reader joins");
+
+    client
+        .batch_execute("GRANT USAGE ON SCHEMA usage_acl TO usage_acl_reader")
+        .await
+        .expect("grant schema usage");
+
+    let (reader, reader_conn) = connect_as(
+        running.bound,
+        "usage_acl_reader",
+        "schema_usage_reader_allowed",
+    )
+    .await;
+    let row = reader
+        .query_one("SELECT id FROM usage_acl.docs", &[])
+        .await
+        .expect("schema USAGE plus table SELECT permits access");
+    assert_eq!(row.get::<_, i32>(0), 7);
+    drop(reader);
+    reader_conn
+        .await
+        .expect("allowed schema usage reader joins");
+
+    client
+        .batch_execute(
+            "DROP TABLE usage_acl.docs; \
+             DROP SCHEMA usage_acl; \
+             DROP ROLE usage_acl_owner; \
+             DROP ROLE usage_acl_reader",
+        )
+        .await
+        .expect("cleanup schema usage test");
+
+    shutdown(running).await;
+}
+
+#[tokio::test]
 async fn non_superuser_cannot_alter_default_privileges_for_privileged_role() {
     let running = start_sample_server("privilege_catalog_test").await;
     let client = &running.client;
@@ -1203,6 +1274,10 @@ async fn default_privileges_apply_to_future_objects_only() {
         .batch_execute("CREATE SCHEMA tenant")
         .await
         .expect("create tenant schema");
+    client
+        .batch_execute("GRANT USAGE ON SCHEMA tenant TO analyst")
+        .await
+        .expect("grant tenant schema usage");
     client
         .batch_execute(
             "ALTER DEFAULT PRIVILEGES FOR ROLE tester IN SCHEMA tenant \

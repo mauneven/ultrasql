@@ -998,6 +998,10 @@ as a concise evidence ledger; roadmap stays for open gates only.
   non-owner roles while preserving owner/superuser bypass. Evidence:
   `cargo test -p ultrasql-server --test privilege_catalog_round_trip
   truncate_accepts_table_truncate_privilege -- --nocapture`.
+- Table access inside runtime schemas now requires schema `USAGE` in addition
+  to table privileges unless the role owns the schema or is superuser. Evidence:
+  `cargo test -p ultrasql-server --test privilege_catalog_round_trip
+  schema_usage_is_required_for_table_access -- --nocapture`.
 - `DROP ROLE` now rejects roles that still own live tables or still appear in
   object/default privilege grants, avoiding stale ownership and ACL references.
   Evidence: `cargo test -p ultrasql-server --test role_ddl_round_trip`.
