@@ -498,6 +498,62 @@ async fn grant_schema_rejects_missing_schema() {
 }
 
 #[tokio::test]
+async fn grant_database_rejects_missing_database() {
+    let running = start_sample_server("database_privilege_missing_guard").await;
+    let client = &running.client;
+
+    client
+        .batch_execute("CREATE ROLE tester SUPERUSER LOGIN; CREATE ROLE db_ghost_reader LOGIN")
+        .await
+        .expect("create database ghost role");
+
+    client
+        .batch_execute("GRANT CONNECT ON DATABASE missing_db TO db_ghost_reader")
+        .await
+        .expect_err("database GRANT must reject missing databases");
+
+    let visible = client
+        .query_one(
+            "SELECT has_database_privilege('db_ghost_reader', 'missing_db', 'CONNECT')",
+            &[],
+        )
+        .await
+        .expect("database privilege check after rejected grant")
+        .get::<_, bool>(0);
+    assert!(!visible, "rejected database GRANT must not persist");
+
+    shutdown(running).await;
+}
+
+#[tokio::test]
+async fn grant_function_rejects_missing_function() {
+    let running = start_sample_server("function_privilege_missing_guard").await;
+    let client = &running.client;
+
+    client
+        .batch_execute("CREATE ROLE tester SUPERUSER LOGIN; CREATE ROLE fn_ghost_reader LOGIN")
+        .await
+        .expect("create function ghost role");
+
+    client
+        .batch_execute("GRANT EXECUTE ON FUNCTION missing_function() TO fn_ghost_reader")
+        .await
+        .expect_err("function GRANT must reject missing functions");
+
+    let visible = client
+        .query_one(
+            "SELECT has_function_privilege('fn_ghost_reader', 'missing_function()', 'EXECUTE')",
+            &[],
+        )
+        .await
+        .expect("function privilege check after rejected grant")
+        .get::<_, bool>(0);
+    assert!(!visible, "rejected function GRANT must not persist");
+
+    shutdown(running).await;
+}
+
+#[tokio::test]
 async fn schema_usage_is_required_for_table_access() {
     let running = start_sample_server("schema_usage_gate").await;
     let client = &running.client;

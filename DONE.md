@@ -1417,3 +1417,8 @@ as a concise evidence ledger; roadmap stays for open gates only.
   target before mutating ACL metadata, preventing missing-schema default grants
   from applying to future schemas/tables. Evidence:
   `cargo test -p ultrasql-server --test privilege_catalog_round_trip -- --nocapture`.
+- Database and function privilege DDL now validates object existence before the
+  superuser administration bypass, preventing ghost grants on missing databases
+  and missing functions while preserving valid `ultrasql` database and
+  `pg_proc` built-in function grants. Evidence:
+  `cargo test -p ultrasql-server --test privilege_catalog_round_trip -- --nocapture`.

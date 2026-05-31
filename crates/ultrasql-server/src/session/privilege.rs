@@ -242,6 +242,14 @@ where
             for sequence in objects {
                 self.sequence_key_for_privilege_object(sequence)?;
             }
+        } else if object_kind == LogicalPrivilegeObjectKind::Database {
+            for database in objects {
+                self.ensure_database_exists_for_privilege(database)?;
+            }
+        } else if object_kind == LogicalPrivilegeObjectKind::Function {
+            for function in objects {
+                self.ensure_function_exists_for_privilege(function)?;
+            }
         }
         Ok(())
     }
@@ -324,6 +332,25 @@ where
         )))
     }
 
+    fn ensure_database_exists_for_privilege(&self, database: &str) -> Result<(), ServerError> {
+        if database.eq_ignore_ascii_case("ultrasql") {
+            return Ok(());
+        }
+        Err(ServerError::UndefinedObject(format!(
+            "database '{database}' does not exist"
+        )))
+    }
+
+    fn ensure_function_exists_for_privilege(&self, function: &str) -> Result<(), ServerError> {
+        let function_name = privilege_function_simple_name(function);
+        if crate::pipeline::catalog_views::pg_proc_builtin_exists(&function_name) {
+            return Ok(());
+        }
+        Err(ServerError::UndefinedObject(format!(
+            "function '{function}' does not exist"
+        )))
+    }
+
     fn ensure_sequence_privilege_owner(&self, sequences: &[String]) -> Result<(), ServerError> {
         let current_user = self.current_user.to_ascii_lowercase();
         for sequence in sequences {
@@ -397,6 +424,21 @@ fn privilege_object_namespace(object: &str) -> Option<&str> {
     let mut parts = object.rsplit('.');
     parts.next()?;
     parts.next()
+}
+
+fn privilege_function_simple_name(function: &str) -> String {
+    let compact = function
+        .trim()
+        .to_ascii_lowercase()
+        .chars()
+        .filter(|ch| !ch.is_ascii_whitespace())
+        .collect::<String>();
+    let base = compact
+        .split_once('(')
+        .map_or(compact.as_str(), |(base, _)| base);
+    base.rsplit_once('.')
+        .map_or(base, |(_, name)| name)
+        .to_owned()
 }
 
 fn convert_privileges(privileges: &[LogicalPrivilegeSpec]) -> Vec<PrivilegeRequest> {

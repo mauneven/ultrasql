@@ -3915,6 +3915,12 @@ const fn pg_proc_builtins() -> &'static [PgProcBuiltin] {
     ]
 }
 
+pub(crate) fn pg_proc_builtin_exists(name: &str) -> bool {
+    pg_proc_builtins()
+        .iter()
+        .any(|builtin| builtin.name.eq_ignore_ascii_case(name))
+}
+
 fn schema_pg_database() -> Schema {
     schema([
         Field::required("datname", text()),
