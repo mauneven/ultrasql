@@ -865,6 +865,10 @@ as a concise evidence ledger; roadmap stays for open gates only.
   for the same table, avoiding repeated restart referential actions from
   tampered sidecar rows. Evidence:
   `cargo test -p ultrasql-server --test drop_restart_round_trip table_runtime_metadata_rejects_duplicate_foreign_key_rows_on_rebuild -- --nocapture`.
+- Table runtime metadata reload rejects `FOREIGN KEY` target name/OID mismatches,
+  avoiding silent restart loss of referential checks from tampered sidecars.
+  Evidence:
+  `cargo test -p ultrasql-server --test drop_restart_round_trip table_runtime_metadata_rejects_mismatched_foreign_key_target_on_rebuild -- --nocapture`.
 - Table runtime metadata reload rejects duplicate `EXCLUDE` constraint names for
   the same table, avoiding repeated restart exclusion checks from tampered
   sidecar rows. Evidence:

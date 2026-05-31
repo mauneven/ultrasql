@@ -5132,17 +5132,24 @@ impl Server {
                 runtime.checks = checks;
             }
             if let Some(foreign_keys) = foreign_keys.remove(&oid) {
-                runtime.foreign_keys = foreign_keys
-                    .into_iter()
-                    .filter_map(|mut fk| {
-                        let target = snapshot.tables.get(&fk.target_table)?;
-                        if target.oid != fk.target_oid {
-                            return None;
-                        }
-                        fk.target_oid = target.oid;
-                        Some(fk)
-                    })
-                    .collect();
+                let mut validated_foreign_keys = Vec::with_capacity(foreign_keys.len());
+                for mut fk in foreign_keys {
+                    let Some(target) = snapshot.tables.get(&fk.target_table) else {
+                        return Err(ServerError::Ddl(format!(
+                            "invalid table-runtime foreign-key target metadata for '{}'",
+                            fk.name
+                        )));
+                    };
+                    if target.oid != fk.target_oid {
+                        return Err(ServerError::Ddl(format!(
+                            "invalid table-runtime foreign-key target metadata for '{}'",
+                            fk.name
+                        )));
+                    }
+                    fk.target_oid = target.oid;
+                    validated_foreign_keys.push(fk);
+                }
+                runtime.foreign_keys = validated_foreign_keys;
             }
             if let Some(exclusions) = exclusions.remove(&oid) {
                 runtime.exclusion_constraints = exclusions;
