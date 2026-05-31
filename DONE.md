@@ -1798,6 +1798,13 @@ as a concise evidence ledger; roadmap stays for open gates only.
 - Runtime XML text casts now report SQLSTATE `2200M`
   (`invalid_xml_document`) for invalid document text. Evidence:
   `cargo test -p ultrasql-server --test core_type_surface_round_trip core_scalar_types_round_trip_over_postgres_wire -- --nocapture`.
+- Executor cast failures now use typed evaluation errors for invalid text,
+  invalid XML documents, and numeric range overflow instead of string-prefix
+  SQLSTATE routing in the projection layer. Evidence:
+  `cargo test -p ultrasql-server --test core_type_surface_round_trip -- --nocapture`,
+  `cargo test -p ultrasql-server --test numeric_round_trip -- --nocapture`,
+  `cargo test -p ultrasql-server --test money_round_trip -- --nocapture`, and
+  `cargo test -p ultrasql-executor cast_size_and_array_error_edges_cover_scalar_compat_paths --lib -- --nocapture`.
 - Runtime scalar/temporal text casts to integer, float, boolean, date, time,
   timestamp, timestamptz, and timetz now report SQLSTATE `22P02` for invalid
   column text. Evidence:

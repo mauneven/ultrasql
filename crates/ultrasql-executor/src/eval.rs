@@ -69,6 +69,14 @@ pub enum EvalError {
     #[error("{0}")]
     NumericFieldOverflow(String),
 
+    /// A textual value could not be parsed as the requested SQL type.
+    #[error("{0}")]
+    InvalidTextRepresentation(String),
+
+    /// An XML document value is not well formed.
+    #[error("{0}")]
+    InvalidXmlDocument(String),
+
     /// A column reference addressed an index outside the row's length.
     #[error("column index out of range: {index} (row has {len} columns)")]
     ColumnIndex {
@@ -1016,27 +1024,27 @@ fn eval_cast_int16(args: &[Value]) -> Result<Value, EvalError> {
     let Some(raw) = integer_cast_arg("smallint cast", args)? else {
         return Ok(Value::Null);
     };
-    i16::try_from(raw)
-        .map(Value::Int16)
-        .map_err(|_| EvalError::Type(format!("smallint cast: value out of range: {raw}")))
+    i16::try_from(raw).map(Value::Int16).map_err(|_| {
+        EvalError::NumericFieldOverflow(format!("smallint cast: value out of range: {raw}"))
+    })
 }
 
 fn eval_cast_int32(args: &[Value]) -> Result<Value, EvalError> {
     let Some(raw) = integer_cast_arg("integer cast", args)? else {
         return Ok(Value::Null);
     };
-    i32::try_from(raw)
-        .map(Value::Int32)
-        .map_err(|_| EvalError::Type(format!("integer cast: value out of range: {raw}")))
+    i32::try_from(raw).map(Value::Int32).map_err(|_| {
+        EvalError::NumericFieldOverflow(format!("integer cast: value out of range: {raw}"))
+    })
 }
 
 fn eval_cast_int64(args: &[Value]) -> Result<Value, EvalError> {
     let Some(raw) = integer_cast_arg("bigint cast", args)? else {
         return Ok(Value::Null);
     };
-    i64::try_from(raw)
-        .map(Value::Int64)
-        .map_err(|_| EvalError::Type(format!("bigint cast: value out of range: {raw}")))
+    i64::try_from(raw).map(Value::Int64).map_err(|_| {
+        EvalError::NumericFieldOverflow(format!("bigint cast: value out of range: {raw}"))
+    })
 }
 
 fn integer_cast_arg(func: &str, args: &[Value]) -> Result<Option<i128>, EvalError> {
@@ -1051,11 +1059,13 @@ fn integer_cast_arg(func: &str, args: &[Value]) -> Result<Option<i128>, EvalErro
         Value::Int16(v) => Ok(Some(i128::from(*v))),
         Value::Int32(v) => Ok(Some(i128::from(*v))),
         Value::Int64(v) => Ok(Some(i128::from(*v))),
-        Value::Text(text) | Value::Char(text) => text
-            .trim()
-            .parse::<i128>()
-            .map(Some)
-            .map_err(|_| EvalError::Type(format!("{func}: invalid integer syntax: {text}"))),
+        Value::Text(text) | Value::Char(text) => {
+            text.trim().parse::<i128>().map(Some).map_err(|_| {
+                EvalError::InvalidTextRepresentation(format!(
+                    "{func}: invalid integer syntax: {text}"
+                ))
+            })
+        }
         other => Err(EvalError::Type(format!(
             "{func}: integer argument required, got {:?}",
             other.data_type()
@@ -1105,11 +1115,13 @@ fn numeric_cast_arg_f64(func: &str, args: &[Value]) -> Result<Option<f64>, EvalE
         Value::Float32(v) => Ok(Some(f64::from(*v))),
         Value::Float64(v) => Ok(Some(*v)),
         Value::Decimal { value, scale } => Ok(Some(decimal_value_to_f64(*value, *scale))),
-        Value::Text(text) | Value::Char(text) => text
-            .trim()
-            .parse::<f64>()
-            .map(Some)
-            .map_err(|_| EvalError::Type(format!("{func}: invalid numeric syntax: {text}"))),
+        Value::Text(text) | Value::Char(text) => {
+            text.trim().parse::<f64>().map(Some).map_err(|_| {
+                EvalError::InvalidTextRepresentation(format!(
+                    "{func}: invalid numeric syntax: {text}"
+                ))
+            })
+        }
         other => Err(EvalError::Type(format!(
             "{func}: numeric argument required, got {:?}",
             other.data_type()
@@ -1126,9 +1138,13 @@ fn eval_cast_bool(args: &[Value]) -> Result<Value, EvalError> {
     }
     match &args[0] {
         Value::Null => Ok(Value::Null),
-        Value::Text(text) | Value::Char(text) => parse_bool_cast_text(text)
-            .map(Value::Bool)
-            .ok_or_else(|| EvalError::Type(format!("boolean cast: invalid syntax: {text}"))),
+        Value::Text(text) | Value::Char(text) => {
+            parse_bool_cast_text(text).map(Value::Bool).ok_or_else(|| {
+                EvalError::InvalidTextRepresentation(format!(
+                    "boolean cast: invalid syntax: {text}"
+                ))
+            })
+        }
         other => Err(EvalError::Type(format!(
             "boolean cast: text argument required, got {:?}",
             other.data_type()
@@ -1152,7 +1168,9 @@ fn eval_cast_date(args: &[Value]) -> Result<Value, EvalError> {
     };
     parse_date_text(text.trim())
         .map(Value::Date)
-        .ok_or_else(|| EvalError::Type(format!("date cast: invalid syntax: {text}")))
+        .ok_or_else(|| {
+            EvalError::InvalidTextRepresentation(format!("date cast: invalid syntax: {text}"))
+        })
 }
 
 fn eval_cast_time(args: &[Value]) -> Result<Value, EvalError> {
@@ -1161,7 +1179,9 @@ fn eval_cast_time(args: &[Value]) -> Result<Value, EvalError> {
     };
     parse_time_text(text.trim())
         .map(Value::Time)
-        .ok_or_else(|| EvalError::Type(format!("time cast: invalid syntax: {text}")))
+        .ok_or_else(|| {
+            EvalError::InvalidTextRepresentation(format!("time cast: invalid syntax: {text}"))
+        })
 }
 
 fn eval_cast_timestamp(args: &[Value]) -> Result<Value, EvalError> {
@@ -1170,7 +1190,9 @@ fn eval_cast_timestamp(args: &[Value]) -> Result<Value, EvalError> {
     };
     parse_timestamp_text(text.trim())
         .map(Value::Timestamp)
-        .ok_or_else(|| EvalError::Type(format!("timestamp cast: invalid syntax: {text}")))
+        .ok_or_else(|| {
+            EvalError::InvalidTextRepresentation(format!("timestamp cast: invalid syntax: {text}"))
+        })
 }
 
 fn eval_cast_timestamptz(args: &[Value]) -> Result<Value, EvalError> {
@@ -1179,7 +1201,11 @@ fn eval_cast_timestamptz(args: &[Value]) -> Result<Value, EvalError> {
     };
     parse_timestamptz_text(text.trim())
         .map(Value::TimestampTz)
-        .ok_or_else(|| EvalError::Type(format!("timestamptz cast: invalid syntax: {text}")))
+        .ok_or_else(|| {
+            EvalError::InvalidTextRepresentation(format!(
+                "timestamptz cast: invalid syntax: {text}"
+            ))
+        })
 }
 
 fn eval_cast_timetz(args: &[Value]) -> Result<Value, EvalError> {
@@ -1191,7 +1217,9 @@ fn eval_cast_timetz(args: &[Value]) -> Result<Value, EvalError> {
             micros,
             offset_seconds,
         })
-        .ok_or_else(|| EvalError::Type(format!("timetz cast: invalid syntax: {text}")))
+        .ok_or_else(|| {
+            EvalError::InvalidTextRepresentation(format!("timetz cast: invalid syntax: {text}"))
+        })
 }
 
 fn eval_cast_uuid(args: &[Value]) -> Result<Value, EvalError> {
@@ -1200,7 +1228,9 @@ fn eval_cast_uuid(args: &[Value]) -> Result<Value, EvalError> {
     };
     Value::parse_uuid(text.trim())
         .map(Value::Uuid)
-        .ok_or_else(|| EvalError::Type(format!("uuid cast: invalid syntax: {text}")))
+        .ok_or_else(|| {
+            EvalError::InvalidTextRepresentation(format!("uuid cast: invalid syntax: {text}"))
+        })
 }
 
 fn eval_cast_json(args: &[Value]) -> Result<Value, EvalError> {
@@ -1209,15 +1239,18 @@ fn eval_cast_json(args: &[Value]) -> Result<Value, EvalError> {
     };
     serde_json::from_str::<JsonValue>(text)
         .map(|_| Value::Json(text.to_owned()))
-        .map_err(|err| EvalError::Type(format!("json cast: invalid JSON: {err}")))
+        .map_err(|err| {
+            EvalError::InvalidTextRepresentation(format!("json cast: invalid JSON: {err}"))
+        })
 }
 
 fn eval_cast_jsonb(args: &[Value]) -> Result<Value, EvalError> {
     let Some(text) = textlike_cast_arg("jsonb cast", args)? else {
         return Ok(Value::Null);
     };
-    let parsed = serde_json::from_str::<JsonValue>(text)
-        .map_err(|err| EvalError::Type(format!("jsonb cast: invalid JSON: {err}")))?;
+    let parsed = serde_json::from_str::<JsonValue>(text).map_err(|err| {
+        EvalError::InvalidTextRepresentation(format!("jsonb cast: invalid JSON: {err}"))
+    })?;
     json_value_to_jsonb(parsed, "jsonb cast")
 }
 
@@ -1227,7 +1260,9 @@ fn eval_cast_xml(args: &[Value]) -> Result<Value, EvalError> {
     };
     Value::validate_xml_text(text)
         .map(Value::Xml)
-        .ok_or_else(|| EvalError::Type(format!("xml cast: invalid XML document: {text}")))
+        .ok_or_else(|| {
+            EvalError::InvalidXmlDocument(format!("xml cast: invalid XML document: {text}"))
+        })
 }
 
 fn textlike_cast_arg<'a>(func: &str, args: &'a [Value]) -> Result<Option<&'a str>, EvalError> {
@@ -1308,9 +1343,9 @@ fn eval_cast_regtype(args: &[Value]) -> Result<Value, EvalError> {
 }
 
 fn cast_i64_to_oid(raw: i64) -> Result<Oid, EvalError> {
-    u32::try_from(raw)
-        .map(Oid::new)
-        .map_err(|_| EvalError::Type(format!("OID cast: value out of range: {raw}")))
+    u32::try_from(raw).map(Oid::new).map_err(|_| {
+        EvalError::NumericFieldOverflow(format!("OID cast: value out of range: {raw}"))
+    })
 }
 
 fn eval_cast_text(args: &[Value]) -> Result<Value, EvalError> {
@@ -1345,15 +1380,25 @@ fn eval_cast_money(args: &[Value]) -> Result<Value, EvalError> {
         Value::Int16(v) => int_to_money(i64::from(*v)),
         Value::Int32(v) => int_to_money(i64::from(*v)),
         Value::Int64(v) => int_to_money(*v),
-        Value::Decimal { .. } => parse_money_text(&args[0].to_string())
-            .map_err(|err| EvalError::Type(format!("money cast: {err}"))),
+        Value::Decimal { .. } => {
+            parse_money_text(&args[0].to_string()).map_err(money_cast_parse_error)
+        }
         Value::Text(text) | Value::Char(text) => {
-            parse_money_text(text).map_err(|err| EvalError::Type(format!("money cast: {err}")))
+            parse_money_text(text).map_err(money_cast_parse_error)
         }
         other => Err(EvalError::Type(format!(
             "money cast: numeric argument required, got {:?}",
             other.data_type()
         ))),
+    }
+}
+
+fn money_cast_parse_error(err: impl std::fmt::Display) -> EvalError {
+    let message = err.to_string();
+    if message.contains("overflow") || message.contains("out of range") {
+        EvalError::NumericFieldOverflow("money value out of range".to_owned())
+    } else {
+        EvalError::InvalidTextRepresentation(format!("money cast: {message}"))
     }
 }
 
@@ -1459,7 +1504,7 @@ fn numeric_cast_parse_error(err: impl std::fmt::Display) -> EvalError {
     if message.contains("overflow") || message.contains("out of range") {
         EvalError::NumericFieldOverflow("numeric value out of range".to_owned())
     } else {
-        EvalError::Type(format!("numeric cast: invalid syntax: {message}"))
+        EvalError::InvalidTextRepresentation(format!("numeric cast: invalid syntax: {message}"))
     }
 }
 

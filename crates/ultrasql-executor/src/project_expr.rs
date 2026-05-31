@@ -98,47 +98,12 @@ fn eval_error_to_exec(error: EvalError) -> ExecError {
         EvalError::NumericFieldOverflow(detail) => ExecError::NumericFieldOverflow(detail),
         EvalError::Overflow => ExecError::NumericFieldOverflow("numeric value out of range".into()),
         EvalError::DivByZero => ExecError::DivisionByZero("division by zero".into()),
-        EvalError::Type(message) if is_numeric_value_out_of_range(&message) => {
-            ExecError::NumericFieldOverflow(message)
+        EvalError::InvalidTextRepresentation(detail) => {
+            ExecError::InvalidTextRepresentation(detail)
         }
-        EvalError::Type(message) if is_invalid_text_representation(&message) => {
-            ExecError::InvalidTextRepresentation(message)
-        }
-        EvalError::Type(message) if is_invalid_xml_document(&message) => {
-            ExecError::InvalidXmlDocument(message)
-        }
+        EvalError::InvalidXmlDocument(detail) => ExecError::InvalidXmlDocument(detail),
         other => ExecError::TypeMismatch(other.to_string()),
     }
-}
-
-fn is_numeric_value_out_of_range(message: &str) -> bool {
-    message.starts_with("smallint cast: value out of range:")
-        || message.starts_with("integer cast: value out of range:")
-        || message.starts_with("bigint cast: value out of range:")
-        || message.starts_with("OID cast: value out of range:")
-}
-
-fn is_invalid_text_representation(message: &str) -> bool {
-    message.starts_with("numeric cast: invalid syntax:")
-        || message.starts_with("money cast: invalid")
-        || message.starts_with("smallint cast: invalid integer syntax:")
-        || message.starts_with("integer cast: invalid integer syntax:")
-        || message.starts_with("bigint cast: invalid integer syntax:")
-        || message.starts_with("real cast: invalid numeric syntax:")
-        || message.starts_with("double precision cast: invalid numeric syntax:")
-        || message.starts_with("boolean cast: invalid syntax:")
-        || message.starts_with("date cast: invalid syntax:")
-        || message.starts_with("time cast: invalid syntax:")
-        || message.starts_with("timestamp cast: invalid syntax:")
-        || message.starts_with("timestamptz cast: invalid syntax:")
-        || message.starts_with("timetz cast: invalid syntax:")
-        || message.starts_with("uuid cast: invalid syntax:")
-        || message.starts_with("json cast: invalid JSON:")
-        || message.starts_with("jsonb cast: invalid JSON:")
-}
-
-fn is_invalid_xml_document(message: &str) -> bool {
-    message.starts_with("xml cast: invalid XML document:")
 }
 
 /// Assemble a column-oriented batch column from a column-major
