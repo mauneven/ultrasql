@@ -237,6 +237,34 @@ async fn core_scalar_types_round_trip_over_postgres_wire() {
         ]]
     );
 
+    client
+        .batch_execute(
+            "CREATE TABLE structured_invalid_text_cast_surface (
+                as_uuid TEXT NOT NULL,
+                as_json TEXT NOT NULL,
+                as_jsonb TEXT NOT NULL
+             );
+             INSERT INTO structured_invalid_text_cast_surface
+             VALUES ('not-a-uuid', '{bad', '{bad')",
+        )
+        .await
+        .expect("create invalid structured text cast table");
+    for query in [
+        "SELECT CAST(as_uuid AS UUID) FROM structured_invalid_text_cast_surface",
+        "SELECT CAST(as_json AS JSON) FROM structured_invalid_text_cast_surface",
+        "SELECT CAST(as_jsonb AS JSONB) FROM structured_invalid_text_cast_surface",
+    ] {
+        let err = client
+            .simple_query(query)
+            .await
+            .expect_err("invalid structured runtime text cast must fail");
+        assert_eq!(
+            err.code().map(tokio_postgres::error::SqlState::code),
+            Some("22P02"),
+            "{query}"
+        );
+    }
+
     let err = client
         .batch_execute(
             "INSERT INTO core_type_surface VALUES (

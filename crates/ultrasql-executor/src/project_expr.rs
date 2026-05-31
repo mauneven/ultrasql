@@ -108,6 +108,9 @@ fn eval_error_to_exec(error: EvalError) -> ExecError {
 fn is_invalid_text_representation(message: &str) -> bool {
     message.starts_with("numeric cast: invalid syntax:")
         || message.starts_with("money cast: invalid")
+        || message.starts_with("uuid cast: invalid syntax:")
+        || message.starts_with("json cast: invalid JSON:")
+        || message.starts_with("jsonb cast: invalid JSON:")
 }
 
 /// Assemble a column-oriented batch column from a column-major
