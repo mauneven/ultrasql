@@ -2212,11 +2212,7 @@ pub(super) fn bind_drop_table(
     let mut tables: Vec<String> = Vec::with_capacity(s.names.len());
     for obj in &s.names {
         let name = object_name_simple(obj);
-        let requested_namespace = object_name_namespace(obj);
-        let table_matches_namespace = catalog.lookup_table(&name).is_some_and(|meta| {
-            obj.parts.len() < 2 || meta.schema_name.eq_ignore_ascii_case(&requested_namespace)
-        });
-        if table_matches_namespace {
+        if table_object_exists(catalog, obj, &name) {
             tables.push(name);
         } else if !s.if_exists {
             return Err(PlanError::TableNotFound(name));
@@ -2462,9 +2458,9 @@ pub(super) fn bind_truncate(
     let mut table_names: Vec<String> = Vec::with_capacity(s.tables.len());
     for obj in &s.tables {
         let name = object_name_simple(obj);
-        catalog
-            .lookup_table(&name)
-            .ok_or_else(|| PlanError::TableNotFound(name.clone()))?;
+        if !table_object_exists(catalog, obj, &name) {
+            return Err(PlanError::TableNotFound(name));
+        }
         table_names.push(name);
     }
     Ok(LogicalPlan::Truncate {
@@ -2472,6 +2468,13 @@ pub(super) fn bind_truncate(
         restart_identity: s.restart_identity,
         cascade: s.cascade,
         schema: Schema::empty(),
+    })
+}
+
+fn table_object_exists(catalog: &dyn Catalog, obj: &ObjectName, name: &str) -> bool {
+    let requested_namespace = object_name_namespace(obj);
+    catalog.lookup_table(name).is_some_and(|meta| {
+        obj.parts.len() < 2 || meta.schema_name.eq_ignore_ascii_case(&requested_namespace)
     })
 }
 

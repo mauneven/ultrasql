@@ -930,6 +930,11 @@ as a concise evidence ledger; roadmap stays for open gates only.
   writes from mutating a same-name table in another namespace. Evidence:
   `cargo test -p ultrasql-server --test schema_ddl_round_trip
   dml_respects_schema_qualifier -- --nocapture`.
+- Explicitly qualified `TRUNCATE schema.name` now shares the same stored-schema
+  check as `DROP TABLE`, preventing wrong-qualified truncates from clearing a
+  same-name table in another namespace. Evidence:
+  `cargo test -p ultrasql-server --test schema_ddl_round_trip
+  truncate_respects_schema_qualifier -- --nocapture`.
 - Committed `pg_constraint` rows are now installed into the live catalog map
   before restart, so same-session `DROP INDEX` also rejects inline and
   `ALTER TABLE ADD UNIQUE` constraint indexes. Evidence:

@@ -364,6 +364,43 @@ async fn dml_respects_schema_qualifier() {
     shutdown(running).await;
 }
 
+#[tokio::test]
+async fn truncate_respects_schema_qualifier() {
+    let running = start_sample_server("schema_truncate_qualifier_guard").await;
+
+    running
+        .client
+        .batch_execute(
+            "CREATE SCHEMA app; \
+             CREATE TABLE guarded_truncate (id INT); \
+             INSERT INTO guarded_truncate VALUES (5)",
+        )
+        .await
+        .expect("create public table and separate schema");
+
+    running
+        .client
+        .batch_execute("TRUNCATE app.guarded_truncate")
+        .await
+        .expect_err("qualified TRUNCATE must not resolve public table");
+
+    let row = running
+        .client
+        .query_one("SELECT id FROM guarded_truncate", &[])
+        .await
+        .expect("public table survives wrong-qualified TRUNCATE")
+        .get::<_, i32>(0);
+    assert_eq!(row, 5);
+
+    running
+        .client
+        .batch_execute("DROP TABLE guarded_truncate; DROP SCHEMA app")
+        .await
+        .expect("cleanup TRUNCATE qualifier guard");
+
+    shutdown(running).await;
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn qualified_sequence_schema_survives_restart() {
     let data_dir = tempfile::TempDir::new().expect("temp data dir");
