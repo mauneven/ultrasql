@@ -926,7 +926,12 @@ where
         };
 
         let oid = self.state.persistent_catalog.next_oid();
-        let entry = TableEntry::new(oid, table_name.clone(), namespace.clone(), columns.clone());
+        let mut entry =
+            TableEntry::new(oid, table_name.clone(), namespace.clone(), columns.clone());
+        entry.options.push((
+            "ultrasql.relkind".to_owned(),
+            "materialized_view".to_owned(),
+        ));
         self.state.persistent_catalog.create_table(entry.clone())?;
 
         let runtime = Arc::new(crate::MaterializedViewRuntime {

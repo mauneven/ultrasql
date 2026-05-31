@@ -114,6 +114,7 @@ pub(crate) fn virtual_catalog_schema(name: &str) -> Option<Schema> {
         "pg_catalog.pg_tables" => Some(schema_pg_tables()),
         "pg_catalog.pg_indexes" => Some(schema_pg_indexes()),
         "pg_catalog.pg_views" => Some(schema_pg_views()),
+        "pg_catalog.pg_matviews" => Some(schema_pg_matviews()),
         "pg_catalog.pg_sequences" => Some(schema_pg_sequences()),
         "pg_catalog.pg_roles" => Some(schema_pg_roles()),
         "pg_catalog.pg_auth_members" => Some(schema_pg_auth_members()),
@@ -204,6 +205,7 @@ fn virtual_rows(name: &str, ctx: &LowerCtx<'_>) -> Option<(Schema, Vec<Vec<Value
         "pg_catalog.pg_tables" => Some((schema_pg_tables(), rows_pg_tables(ctx))),
         "pg_catalog.pg_indexes" => Some((schema_pg_indexes(), rows_pg_indexes(ctx))),
         "pg_catalog.pg_views" => Some((schema_pg_views(), Vec::new())),
+        "pg_catalog.pg_matviews" => Some((schema_pg_matviews(), rows_pg_matviews(ctx))),
         "pg_catalog.pg_sequences" => Some((schema_pg_sequences(), rows_pg_sequences(ctx))),
         "pg_catalog.pg_roles" => Some((schema_pg_roles(), rows_pg_roles(ctx))),
         "pg_catalog.pg_auth_members" => Some((schema_pg_auth_members(), rows_pg_auth_members(ctx))),
@@ -337,6 +339,7 @@ fn normalized_name(name: &str) -> String {
         | "pg_statistic"
         | "pg_statistic_ext"
         | "pg_views"
+        | "pg_matviews"
         | "pg_sequences"
         | "pg_roles"
         | "pg_auth_members"
@@ -525,6 +528,13 @@ fn table_entries(ctx: &LowerCtx<'_>) -> Vec<ultrasql_catalog::TableEntry> {
     entries
 }
 
+fn is_materialized_view_entry(entry: &ultrasql_catalog::TableEntry) -> bool {
+    entry
+        .options
+        .iter()
+        .any(|(key, value)| key == "ultrasql.relkind" && value == "materialized_view")
+}
+
 fn schema_pg_namespace() -> Schema {
     schema([
         Field::required("oid", DataType::Int64),
@@ -589,11 +599,16 @@ fn schema_pg_class() -> Schema {
 fn rows_pg_class(ctx: &LowerCtx<'_>) -> Vec<Vec<Value>> {
     let mut rows = Vec::new();
     for entry in table_entries(ctx) {
+        let relkind = if is_materialized_view_entry(&entry) {
+            "m"
+        } else {
+            "r"
+        };
         rows.push(pg_class_row(
             entry.oid.raw(),
             entry.name.clone(),
             namespace_oid(&entry.schema_name),
-            "r",
+            relkind,
             i32::try_from(entry.n_blocks).unwrap_or(i32::MAX),
             i32::try_from(entry.root_block.raw()).unwrap_or(i32::MAX),
             ctx.catalog_snapshot
@@ -1711,7 +1726,9 @@ fn rows_pg_tables(ctx: &LowerCtx<'_>) -> Vec<Vec<Value>> {
     table_entries(ctx)
         .into_iter()
         .filter(|entry| {
-            entry.schema_name != "pg_catalog" && entry.schema_name != "information_schema"
+            entry.schema_name != "pg_catalog"
+                && entry.schema_name != "information_schema"
+                && !is_materialized_view_entry(entry)
         })
         .map(|entry| {
             vec![
@@ -1769,6 +1786,40 @@ fn schema_pg_views() -> Schema {
         Field::required("viewowner", text()),
         Field::nullable("definition", text()),
     ])
+}
+
+fn schema_pg_matviews() -> Schema {
+    schema([
+        Field::required("schemaname", text()),
+        Field::required("matviewname", text()),
+        Field::required("matviewowner", text()),
+        Field::nullable("tablespace", text()),
+        Field::required("hasindexes", DataType::Bool),
+        Field::required("ispopulated", DataType::Bool),
+        Field::nullable("definition", text()),
+    ])
+}
+
+fn rows_pg_matviews(ctx: &LowerCtx<'_>) -> Vec<Vec<Value>> {
+    table_entries(ctx)
+        .into_iter()
+        .filter(is_materialized_view_entry)
+        .map(|entry| {
+            vec![
+                v_text(entry.schema_name.clone()),
+                v_text(entry.name.clone()),
+                v_text("ultrasql"),
+                Value::Null,
+                Value::Bool(
+                    ctx.catalog_snapshot
+                        .indexes_by_table
+                        .contains_key(&entry.oid),
+                ),
+                Value::Bool(true),
+                Value::Null,
+            ]
+        })
+        .collect()
 }
 
 fn schema_pg_sequences() -> Schema {
@@ -3136,7 +3187,9 @@ fn rows_information_schema_tables(ctx: &LowerCtx<'_>) -> Vec<Vec<Value>> {
     table_entries(ctx)
         .into_iter()
         .filter(|entry| {
-            entry.schema_name != "pg_catalog" && entry.schema_name != "information_schema"
+            entry.schema_name != "pg_catalog"
+                && entry.schema_name != "information_schema"
+                && !is_materialized_view_entry(entry)
         })
         .map(|entry| {
             vec![

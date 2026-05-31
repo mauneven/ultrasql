@@ -77,6 +77,29 @@ async fn materialized_view_snapshots_then_appends_from_source_inserts() {
         .await
         .expect("create materialized view");
 
+    let catalog_row = client
+        .query_one(
+            "SELECT c.relkind, m.matviewowner, m.ispopulated \
+             FROM pg_catalog.pg_class c \
+             JOIN pg_catalog.pg_matviews m ON m.matviewname = c.relname \
+             WHERE c.relname = 'mv_copy'",
+            &[],
+        )
+        .await
+        .expect("materialized view catalog row");
+    assert_eq!(catalog_row.get::<_, String>(0), "m");
+    assert_eq!(catalog_row.get::<_, String>(1), "ultrasql");
+    assert!(catalog_row.get::<_, bool>(2));
+
+    let table_rows = client
+        .query_one(
+            "SELECT COUNT(*) FROM pg_catalog.pg_tables WHERE tablename = 'mv_copy'",
+            &[],
+        )
+        .await
+        .expect("materialized view excluded from pg_tables");
+    assert_eq!(table_rows.get::<_, i64>(0), 0);
+
     let initial = client
         .query("SELECT id, amount FROM mv_copy ORDER BY id", &[])
         .await
@@ -163,6 +186,19 @@ async fn appended_materialized_view_rows_survive_restart() {
     shutdown_persistent(running).await;
 
     let running = start_persistent_server(data_dir.path(), "materialized_view_restart_test").await;
+    let catalog_row = running
+        .client
+        .query_one(
+            "SELECT c.relkind, m.ispopulated \
+             FROM pg_catalog.pg_class c \
+             JOIN pg_catalog.pg_matviews m ON m.matviewname = c.relname \
+             WHERE c.relname = 'mv_restart_copy'",
+            &[],
+        )
+        .await
+        .expect("materialized view catalog row after restart");
+    assert_eq!(catalog_row.get::<_, String>(0), "m");
+    assert!(catalog_row.get::<_, bool>(1));
     let rows = running
         .client
         .query("SELECT id, amount FROM mv_restart_copy ORDER BY id", &[])

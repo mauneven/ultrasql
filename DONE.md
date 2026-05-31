@@ -683,6 +683,10 @@ as a concise evidence ledger; roadmap stays for open gates only.
   `pg_materialized_views.meta`, preventing stale restart sidecar records after
   direct view drops or source-table cascades. Evidence:
   `cargo test -p ultrasql-server --test materialized_view_round_trip`.
+- Append-only materialized views now report `pg_class.relkind = 'm'`, appear in
+  `pg_catalog.pg_matviews`, stay out of `pg_catalog.pg_tables`, and keep that
+  catalog shape after restart. Evidence:
+  `cargo test -p ultrasql-server --test materialized_view_round_trip`.
 - Dropped tables are removed from durable `pg_table_runtime.meta`, preventing
   stale default, identity, generated-column, check, FK, exclusion, and index
   sidecar records after `DROP TABLE`. Evidence:
