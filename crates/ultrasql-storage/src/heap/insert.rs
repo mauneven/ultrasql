@@ -22,7 +22,7 @@ use ultrasql_mvcc::tuple_header::TUPLE_HEADER_SIZE;
 use crate::buffer_pool::{BufferPool, PageGuard, PageLoader};
 use crate::page::PageError;
 
-use super::{HeapAccess, HeapError, InsertOptions};
+use super::{HeapAccess, HeapError, InsertOptions, checked_tuple_space_needed};
 
 impl<L: PageLoader> HeapAccess<L> {
     /// Insert a tuple into the relation.
@@ -86,7 +86,8 @@ impl<L: PageLoader> HeapAccess<L> {
 
         // If an FSM is present, try its hint first before the linear scan.
         if let Some(fsm) = opts.fsm {
-            let min_free = u32::try_from(tuple_size + crate::page::ITEMID_SIZE).unwrap_or(u32::MAX);
+            let min_free = u32::try_from(checked_tuple_space_needed(tuple_size)?)
+                .map_err(|_| HeapError::MalformedHeader("tuple size overflow"))?;
             if let Some(hint_block) = fsm.find_block_with_at_least(rel, min_free) {
                 let page_id = PageId::new(rel, hint_block);
                 match self.try_insert_into(page_id, payload, opts, n_atts, tuple_size) {
@@ -276,7 +277,7 @@ impl<L: PageLoader> HeapAccess<L> {
                     counter.store(u32::MAX, Ordering::Release);
                     return Err(HeapError::OutOfBlocks);
                 }
-                block_count = new_block.saturating_add(1);
+                block_count = new_block.checked_add(1).ok_or(HeapError::OutOfBlocks)?;
                 cursor = new_block;
             }
 
@@ -296,14 +297,14 @@ impl<L: PageLoader> HeapAccess<L> {
 
             // (2) Page is full. Advance to the next known block, or
             // allocate a new one when we've walked past the tail.
-            cursor = cursor.saturating_add(1);
+            cursor = cursor.checked_add(1).ok_or(HeapError::OutOfBlocks)?;
             if cursor >= block_count {
                 let new_block = counter.fetch_add(1, Ordering::AcqRel);
                 if new_block == u32::MAX {
                     counter.store(u32::MAX, Ordering::Release);
                     return Err(HeapError::OutOfBlocks);
                 }
-                block_count = new_block.saturating_add(1);
+                block_count = new_block.checked_add(1).ok_or(HeapError::OutOfBlocks)?;
                 cursor = new_block;
             }
         }
@@ -365,11 +366,11 @@ impl<L: PageLoader> HeapAccess<L> {
             let drained =
                 Self::bulk_fill_local_page(page_id, &mut page, rows, row_idx, opts, n_atts)?;
             if drained == 0 {
+                let tuple_size = TUPLE_HEADER_SIZE
+                    .checked_add(rows[row_idx].len())
+                    .ok_or(HeapError::MalformedHeader("tuple size overflow"))?;
                 return Err(HeapError::Page(PageError::NoSpace {
-                    needed: rows[row_idx]
-                        .len()
-                        .saturating_add(TUPLE_HEADER_SIZE)
-                        .saturating_add(crate::page::ITEMID_SIZE),
+                    needed: checked_tuple_space_needed(tuple_size)?,
                     available: page.header().free_space(),
                 }));
             }
@@ -437,10 +438,11 @@ impl<L: PageLoader> HeapAccess<L> {
             let tuple_size = TUPLE_HEADER_SIZE
                 .checked_add(row.len())
                 .ok_or(HeapError::MalformedHeader("tuple size overflow"))?;
+            let needed = checked_tuple_space_needed(tuple_size)?;
 
             // Fast-path: skip pages that obviously cannot hold this tuple.
             let free = cur_upper.saturating_sub(cur_lower);
-            if free < tuple_size + ITEMID_SIZE {
+            if free < needed {
                 break;
             }
             let tuple_len_u32 = u32::try_from(tuple_size)
@@ -510,8 +512,9 @@ impl<L: PageLoader> HeapAccess<L> {
             let tuple_size = TUPLE_HEADER_SIZE
                 .checked_add(row.len())
                 .ok_or(HeapError::MalformedHeader("tuple size overflow"))?;
+            let needed = checked_tuple_space_needed(tuple_size)?;
             let free = cur_upper.saturating_sub(cur_lower);
-            if free < tuple_size + ITEMID_SIZE {
+            if free < needed {
                 break;
             }
             let tuple_len_u32 = u32::try_from(tuple_size)

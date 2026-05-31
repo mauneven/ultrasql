@@ -2163,3 +2163,7 @@ as a concise evidence ledger; roadmap stays for open gates only.
 - Heap bulk UPDATE and parallel DELETE row-count aggregation now rejects
   overflow instead of clamping write-impact evidence. Evidence:
   `cargo test -p ultrasql-storage heap::tests::heap_count_add_rejects_overflow --lib -- --nocapture`.
+- Heap INSERT and bulk-load page-fit arithmetic now checks tuple+item-id
+  space and block-counter advances instead of wrapping/clamping edge cases.
+  Evidence:
+  `cargo test -p ultrasql-storage heap::tests::heap_tuple_space_needed_rejects_overflow --lib -- --nocapture`.

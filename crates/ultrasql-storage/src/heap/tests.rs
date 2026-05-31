@@ -108,6 +108,15 @@ fn heap_count_add_rejects_overflow() {
     ));
 }
 
+#[test]
+fn heap_tuple_space_needed_rejects_overflow() {
+    let err = checked_tuple_space_needed(usize::MAX).unwrap_err();
+    assert!(matches!(
+        err,
+        HeapError::MalformedHeader("tuple size overflow")
+    ));
+}
+
 #[derive(Debug, Default)]
 struct CountingOracle {
     inner: MapOracle,

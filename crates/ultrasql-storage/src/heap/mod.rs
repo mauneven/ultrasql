@@ -440,6 +440,13 @@ fn checked_heap_count_add(
         .ok_or(HeapError::MalformedHeader(error))
 }
 
+#[inline]
+fn checked_tuple_space_needed(tuple_size: usize) -> Result<usize, HeapError> {
+    tuple_size
+        .checked_add(crate::page::ITEMID_SIZE)
+        .ok_or(HeapError::MalformedHeader("tuple size overflow"))
+}
+
 impl<L: PageLoader> std::fmt::Debug for HeapAccess<L> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("HeapAccess")
