@@ -2195,3 +2195,6 @@ as a concise evidence ledger; roadmap stays for open gates only.
 - Checkpointer shutdown accounting now returns an error on flushed-page count
   overflow instead of saturating background flush evidence. Evidence:
   `cargo test -p ultrasql-storage checkpointer::tests::checkpointer_flush_count_rejects_overflow --lib -- --nocapture`.
+- Runtime metadata sidecar reads now check sentinel read limits and byte-count
+  conversion instead of saturating data-dir metadata reads. Evidence:
+  `cargo test -p ultrasql-server tests::recovery::runtime_metadata_read_limit_rejects_overflow --lib -- --nocapture`.

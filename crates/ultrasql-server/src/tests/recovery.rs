@@ -11,7 +11,8 @@ use ultrasql_wal::payload::{SequenceOpKind, SequenceOpPayload};
 use ultrasql_wal::{HeapTarget, RecordType, WalRecord};
 
 use super::super::{
-    BlankPageLoader, Server, ServerRecoveryTarget, recovery_replay_target_from_data_dir,
+    BlankPageLoader, Server, ServerRecoveryTarget, capped_text_take_limit,
+    recovery_replay_target_from_data_dir,
 };
 
 fn recovery_target() -> ServerRecoveryTarget {
@@ -138,6 +139,12 @@ fn runtime_metadata_persist_refuses_symlinked_temp_file() {
         "expected metadata rejection, got {err}"
     );
     assert_eq!(fs::read_to_string(&outside).unwrap(), "keep");
+}
+
+#[test]
+fn runtime_metadata_read_limit_rejects_overflow() {
+    let err = capped_text_take_limit("runtime metadata file", u64::MAX).unwrap_err();
+    assert!(err.to_string().contains("read limit is too large"));
 }
 
 #[cfg(unix)]

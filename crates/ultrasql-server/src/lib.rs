@@ -3879,9 +3879,9 @@ fn read_capped_regular_text_file(
                 )));
             }
             let mut text = String::new();
-            let mut limited = file.take(limit.saturating_add(1));
+            let mut limited = file.take(capped_text_take_limit(context, limit)?);
             limited.read_to_string(&mut text).map_err(ServerError::Io)?;
-            let bytes_read = u64::try_from(text.len()).unwrap_or(u64::MAX);
+            let bytes_read = capped_text_bytes_read_len(path, context, text.len())?;
             if bytes_read > limit {
                 return Err(ServerError::ddl(format!(
                     "{context} {} exceeds read limit: bytes={} limit={}",
@@ -3899,6 +3899,21 @@ fn read_capped_regular_text_file(
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(err) => Err(ServerError::Io(err)),
     }
+}
+
+fn capped_text_take_limit(context: &str, limit: u64) -> Result<u64, ServerError> {
+    limit.checked_add(1).ok_or_else(|| {
+        ServerError::ddl(format!("{context} read limit is too large: limit={limit}"))
+    })
+}
+
+fn capped_text_bytes_read_len(path: &Path, context: &str, len: usize) -> Result<u64, ServerError> {
+    u64::try_from(len).map_err(|_| {
+        ServerError::ddl(format!(
+            "{context} {} byte count exceeds u64: bytes={len}",
+            path.display()
+        ))
+    })
 }
 
 #[cfg_attr(not(unix), allow(unused_variables))]
