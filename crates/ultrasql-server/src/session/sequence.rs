@@ -437,15 +437,16 @@ where
         privileges: &[PrivilegeKind],
     ) -> Result<(), ServerError> {
         let current_user = self.current_user.to_ascii_lowercase();
-        if self
-            .state
-            .role_catalog
-            .lookup_role(&current_user)
-            .is_some_and(|role| role.is_superuser)
-        {
+        if self.current_user_is_superuser(&current_user) {
             return Ok(());
         }
         let sequence_key = sequence_name.to_ascii_lowercase();
+        let schema_name = self
+            .state
+            .sequence_namespaces
+            .get(&sequence_key)
+            .map_or_else(|| "public".to_owned(), |entry| entry.value().clone());
+        self.ensure_schema_usage_privilege(&schema_name)?;
         let owns_sequence = self
             .state
             .sequence_owners

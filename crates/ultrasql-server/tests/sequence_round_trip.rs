@@ -310,6 +310,76 @@ async fn sequence_functions_enforce_usage_and_update_privileges() {
 }
 
 #[tokio::test]
+async fn sequence_functions_require_schema_usage_privilege() {
+    let running = start_sample_server("sequence_schema_usage_acl").await;
+
+    running
+        .client
+        .batch_execute(
+            "CREATE ROLE tester SUPERUSER LOGIN; \
+             CREATE ROLE seq_schema_owner LOGIN; \
+             CREATE ROLE seq_schema_reader LOGIN; \
+             SET ROLE seq_schema_owner; \
+             CREATE SCHEMA seq_schema_acl; \
+             CREATE SEQUENCE seq_schema_acl.seq_schema_private START WITH 21; \
+             RESET ROLE; \
+             GRANT USAGE ON SEQUENCE seq_schema_private TO seq_schema_reader",
+        )
+        .await
+        .expect("create private sequence usage test");
+
+    let (reader, reader_conn) = connect_as(
+        running.bound,
+        "seq_schema_reader",
+        "sequence_schema_usage_reader_blocked",
+    )
+    .await;
+    let err = reader
+        .simple_query("SELECT nextval('seq_schema_private')")
+        .await
+        .expect_err("schema USAGE required despite sequence USAGE");
+    assert_eq!(err.code().expect("SQLSTATE").code(), "42501");
+    drop(reader);
+    reader_conn
+        .await
+        .expect("blocked sequence schema usage reader joins");
+
+    running
+        .client
+        .batch_execute("GRANT USAGE ON SCHEMA seq_schema_acl TO seq_schema_reader")
+        .await
+        .expect("grant sequence schema usage");
+
+    let (reader, reader_conn) = connect_as(
+        running.bound,
+        "seq_schema_reader",
+        "sequence_schema_usage_reader_allowed",
+    )
+    .await;
+    assert_eq!(
+        simple_i64(&reader, "SELECT nextval('seq_schema_private')").await,
+        21
+    );
+    drop(reader);
+    reader_conn
+        .await
+        .expect("allowed sequence schema usage reader joins");
+
+    running
+        .client
+        .batch_execute(
+            "DROP SEQUENCE seq_schema_private; \
+             DROP SCHEMA seq_schema_acl; \
+             DROP ROLE seq_schema_owner; \
+             DROP ROLE seq_schema_reader",
+        )
+        .await
+        .expect("cleanup private sequence usage test");
+
+    graceful_shutdown(running).await;
+}
+
+#[tokio::test]
 async fn alter_sequence_changes_increment() {
     let running = start_sample_server("sequence_test").await;
     let client = &running.client;

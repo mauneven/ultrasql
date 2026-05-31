@@ -989,6 +989,12 @@ as a concise evidence ledger; roadmap stays for open gates only.
   requires `UPDATE`, with owner/superuser bypass. Evidence:
   `cargo test -p ultrasql-server --test sequence_round_trip
   sequence_functions_enforce_usage_and_update_privileges -- --nocapture`.
+- Sequence SQL functions now require schema `USAGE` for sequences in runtime
+  schemas before accepting sequence-level ACLs, matching the table-access
+  schema gate and keeping private-schema sequences hidden from granted sequence
+  users until the namespace is granted. Evidence:
+  `cargo test -p ultrasql-server --test sequence_round_trip
+  sequence_functions_require_schema_usage_privilege -- --nocapture`.
 - `DELETE` now requires table-level `DELETE` privilege for non-owner roles,
   closing the column-only privilege bypass for `DELETE FROM table` without a
   predicate or `RETURNING` list. Evidence: `cargo test -p ultrasql-server

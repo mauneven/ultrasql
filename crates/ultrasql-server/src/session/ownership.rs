@@ -124,6 +124,40 @@ where
         )))
     }
 
+    pub(super) fn ensure_schema_usage_privilege(
+        &self,
+        schema_name: &str,
+    ) -> Result<(), ServerError> {
+        let schema_name = schema_name.to_ascii_lowercase();
+        if builtin_schema_name(&schema_name) {
+            return Ok(());
+        }
+        let current_user = self.current_user.to_ascii_lowercase();
+        if self.current_user_is_superuser(&current_user) {
+            return Ok(());
+        }
+        let owns_schema = self
+            .state
+            .schemas
+            .get(&schema_name)
+            .is_some_and(|schema| schema.owner_role.eq_ignore_ascii_case(&current_user));
+        if owns_schema {
+            return Ok(());
+        }
+        let roles = self.state.role_catalog.inherited_role_names(&current_user);
+        if self.state.privilege_catalog.has_privilege_for_roles(
+            &roles,
+            PrivilegeObjectKind::Schema,
+            &schema_name,
+            PrivilegeKind::Usage,
+        ) {
+            return Ok(());
+        }
+        Err(ServerError::InsufficientPrivilege(format!(
+            "USAGE privilege on schema {schema_name}"
+        )))
+    }
+
     pub(super) fn ensure_sequence_owner_or_superuser(
         &self,
         sequence_name: &str,
@@ -147,7 +181,7 @@ where
         }
     }
 
-    fn current_user_is_superuser(&self, current_user: &str) -> bool {
+    pub(super) fn current_user_is_superuser(&self, current_user: &str) -> bool {
         self.state
             .role_catalog
             .lookup_role(current_user)
