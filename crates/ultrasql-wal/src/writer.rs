@@ -59,6 +59,17 @@ pub enum WalWriterError {
     /// abnormally.
     #[error("wal writer is already shut down")]
     Shutdown,
+
+    /// No segment index remains after `u32::MAX`.
+    #[error("wal segment index exhausted")]
+    SegmentIndexExhausted,
+
+    /// A writer-maintained byte counter overflowed.
+    #[error("wal writer counter overflow: {counter}")]
+    CounterOverflow {
+        /// Counter that overflowed.
+        counter: &'static str,
+    },
 }
 
 /// Tuning knobs for the writer thread.
@@ -434,14 +445,24 @@ impl WriterDriver {
             let record_len_usize = usize::try_from(record_len).map_err(|_| {
                 WalWriterError::Io(std::io::Error::other("record length exceeds usize"))
             })?;
-            let chunk = &bytes[cursor..cursor + record_len_usize];
+            let next_cursor = checked_writer_usize_add(cursor, record_len_usize, "drain cursor")?;
+            let chunk = bytes.get(cursor..next_cursor).ok_or_else(|| {
+                WalWriterError::Io(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "wal drain ended before record length",
+                ))
+            })?;
+            let next_current_size =
+                checked_writer_u64_add(self.current_size, record_len, "segment size")?;
+            let next_unflushed_bytes =
+                checked_writer_usize_add(self.unflushed_bytes, chunk.len(), "unflushed bytes")?;
             let file = self.current_file.as_mut().ok_or_else(|| {
                 WalWriterError::Io(std::io::Error::other("segment file unexpectedly closed"))
             })?;
             file.write_all(chunk)?;
-            self.current_size += record_len;
-            self.unflushed_bytes = self.unflushed_bytes.saturating_add(chunk.len());
-            cursor += chunk.len();
+            self.current_size = next_current_size;
+            self.unflushed_bytes = next_unflushed_bytes;
+            cursor = next_cursor;
         }
         self.pending_lsn = end_lsn;
         Ok(())
@@ -475,7 +496,7 @@ impl WriterDriver {
         self.current_index = self
             .current_index
             .checked_add(1)
-            .ok_or_else(|| WalWriterError::Io(std::io::Error::other("segment index overflow")))?;
+            .ok_or(WalWriterError::SegmentIndexExhausted)?;
         self.current_size = 0;
         debug!(
             prev_index = prev,
@@ -504,6 +525,26 @@ impl WriterDriver {
 
 fn duration_as_micros_saturated(duration: Duration) -> u64 {
     u64::try_from(duration.as_micros()).unwrap_or(u64::MAX)
+}
+
+fn checked_writer_u64_add(
+    current: u64,
+    delta: u64,
+    counter: &'static str,
+) -> Result<u64, WalWriterError> {
+    current
+        .checked_add(delta)
+        .ok_or(WalWriterError::CounterOverflow { counter })
+}
+
+fn checked_writer_usize_add(
+    current: usize,
+    delta: usize,
+    counter: &'static str,
+) -> Result<usize, WalWriterError> {
+    current
+        .checked_add(delta)
+        .ok_or(WalWriterError::CounterOverflow { counter })
 }
 
 /// Read the `total_length` u32 from the front of an encoded WAL
@@ -554,8 +595,11 @@ fn open_segment_file(path: &Path) -> std::io::Result<File> {
 /// reasoning.
 fn next_segment_index(dir: &Path) -> Result<u32, WalWriterError> {
     let segs = list_segments(dir)?;
-    let next = segs.last().map_or(0_u32, |&(idx, _)| idx.saturating_add(1));
-    Ok(next)
+    let Some(&(idx, _)) = segs.last() else {
+        return Ok(0);
+    };
+    idx.checked_add(1)
+        .ok_or(WalWriterError::SegmentIndexExhausted)
 }
 
 /// Force the file's contents and metadata to stable storage.
@@ -593,6 +637,21 @@ mod tests {
         std::fs::File::create(segment_path(dir.path(), 0)).unwrap();
         std::fs::File::create(segment_path(dir.path(), 3)).unwrap();
         assert_eq!(next_segment_index(dir.path()).unwrap(), 4);
+    }
+
+    #[test]
+    fn next_segment_index_rejects_exhaustion() {
+        let dir = TempDir::new().unwrap();
+        std::fs::File::create(segment_path(dir.path(), u32::MAX)).unwrap();
+
+        let err = next_segment_index(dir.path()).unwrap_err();
+        assert!(matches!(err, WalWriterError::SegmentIndexExhausted));
+    }
+
+    #[test]
+    fn writer_counter_add_rejects_overflow() {
+        let err = checked_writer_u64_add(u64::MAX, 1, "segment size").unwrap_err();
+        assert!(matches!(err, WalWriterError::CounterOverflow { .. }));
     }
 
     #[test]

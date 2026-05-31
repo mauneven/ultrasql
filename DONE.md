@@ -2148,3 +2148,6 @@ as a concise evidence ledger; roadmap stays for open gates only.
 - Persistent CLOG now rejects XIDs that exceed the 32-bit block address space
   instead of truncating page numbers and aliasing older status pages. Evidence:
   `cargo test -p ultrasql-storage clog::tests --lib -- --nocapture`.
+- WAL writer now rejects exhausted segment indexes and checks drain cursor,
+  segment-size, and unflushed-byte counter arithmetic before writing. Evidence:
+  `cargo test -p ultrasql-wal writer::tests --lib -- --nocapture`.
