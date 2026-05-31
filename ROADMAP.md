@@ -164,7 +164,8 @@ file focused on what still blocks production.
 - Promote package publication evidence from the `release workflow`:
   `docs.ultrasql.org`, `ghcr.io/mauneven/ultrasql`, `packages/npm`,
   `npm publish`, `Windows setup EXE`, `Chocolatey`, `AUR`,
-  `yay -S ultrasql-bin`, `Homebrew tap`, `Homebrew`, `Debian`, and `RPM`.
+  `yay -S ultrasql-bin`, `Homebrew tap`, `clean GHCR platform list`,
+  `Homebrew`, `Debian`, and `RPM`.
 - Homebrew core path: use the source-built formula as the base for upstream
   review once UltraSQL is stable/notable enough for plain `brew install
   ultrasql` without tapping `mauneven/tap`.
