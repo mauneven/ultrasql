@@ -1282,6 +1282,22 @@ pub fn xml_xpath_element_fragments_with_namespaces(
                 .to_string(),
         ]);
     }
+    if let Some((inner_path, needle)) =
+        xml_xpath_string_literal_function_arguments(path, "contains")
+    {
+        let matches =
+            xml_xpath_element_fragments_with_namespaces(inner_path, document, namespace_bindings)?;
+        let value = xml_xpath_first_string_value(&matches);
+        return Some(vec![value.contains(&needle).to_string()]);
+    }
+    if let Some((inner_path, prefix)) =
+        xml_xpath_string_literal_function_arguments(path, "starts-with")
+    {
+        let matches =
+            xml_xpath_element_fragments_with_namespaces(inner_path, document, namespace_bindings)?;
+        let value = xml_xpath_first_string_value(&matches);
+        return Some(vec![value.starts_with(&prefix).to_string()]);
+    }
     if let Some(inner_path) = xml_xpath_count_argument(path) {
         let matches =
             xml_xpath_element_fragments_with_namespaces(inner_path, document, namespace_bindings)?;
@@ -1391,6 +1407,38 @@ fn xml_xpath_function_argument<'a>(path: &'a str, function: &str) -> Option<&'a 
         .strip_suffix(')')?
         .trim();
     inner.starts_with('/').then_some(inner)
+}
+
+fn xml_xpath_string_literal_function_arguments<'a>(
+    path: &'a str,
+    function: &str,
+) -> Option<(&'a str, String)> {
+    let trimmed = path.trim();
+    let inner = trimmed
+        .strip_prefix(function)?
+        .trim_start()
+        .strip_prefix('(')?
+        .strip_suffix(')')?
+        .trim();
+    let comma = xml_xpath_top_level_comma(inner)?;
+    let left = inner[..comma].trim();
+    let right = inner[comma + 1..].trim();
+    let literal = unquote_xml_path_literal(right)?;
+    left.starts_with('/').then_some((left, literal))
+}
+
+fn xml_xpath_top_level_comma(text: &str) -> Option<usize> {
+    let mut quote = None;
+    for (idx, ch) in text.char_indices() {
+        match quote {
+            Some(active) if ch == active => quote = None,
+            Some(_) => {}
+            None if matches!(ch, '\'' | '"') => quote = Some(ch),
+            None if ch == ',' => return Some(idx),
+            None => {}
+        }
+    }
+    None
 }
 
 #[derive(Clone, Debug)]
@@ -1747,6 +1795,12 @@ fn xml_xpath_string_value(fragment: &str) -> String {
     let mut out = String::new();
     xml_collect_string_value(trimmed, &root, &mut out);
     out
+}
+
+fn xml_xpath_first_string_value(matches: &[String]) -> String {
+    matches
+        .first()
+        .map_or_else(String::new, |fragment| xml_xpath_string_value(fragment))
 }
 
 fn xml_collect_string_value(text: &str, element: &XmlElement, out: &mut String) {
@@ -3229,6 +3283,34 @@ mod tests {
                 r#"<root><item>  Ada   Lovelace </item></root>"#
             ),
             Some(vec!["17".to_owned()])
+        );
+        assert_eq!(
+            xml_xpath_element_fragments(
+                r#"contains(/root/item, "Ada")"#,
+                r#"<root><item>Ada Lovelace</item></root>"#
+            ),
+            Some(vec!["true".to_owned()])
+        );
+        assert_eq!(
+            xml_xpath_element_fragments(
+                r#"contains(/root/item, "Turing")"#,
+                r#"<root><item>Ada Lovelace</item></root>"#
+            ),
+            Some(vec!["false".to_owned()])
+        );
+        assert_eq!(
+            xml_xpath_element_fragments(
+                r#"starts-with(/root/item, "Ada")"#,
+                r#"<root><item>Ada Lovelace</item></root>"#
+            ),
+            Some(vec!["true".to_owned()])
+        );
+        assert_eq!(
+            xml_xpath_element_fragments(
+                r#"starts-with(/root/missing, "Ada")"#,
+                r#"<root><item>Ada Lovelace</item></root>"#
+            ),
+            Some(vec!["false".to_owned()])
         );
         let nested = r#"<root><group><item id="1"><name>A</name></item><item id="2"><name>B</name></item></group><name>C</name></root>"#;
         assert_eq!(
