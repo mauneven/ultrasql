@@ -705,6 +705,16 @@ fn parse_role_bool(raw: &str, line_no: usize, field: &str) -> Result<bool, Serve
     })
 }
 
+fn validate_role_metadata_name(name: &str, line_no: usize, field: &str) -> Result<(), ServerError> {
+    if !name.trim().is_empty() {
+        return Ok(());
+    }
+    Err(ServerError::ddl(format!(
+        "empty role metadata {field} on line {}",
+        line_no + 1
+    )))
+}
+
 fn parse_role_u32(raw: &str, line_no: usize, field: &str) -> Result<u32, ServerError> {
     raw.parse::<u32>().map_err(|err| {
         ServerError::ddl(format!(
@@ -5367,6 +5377,7 @@ impl Server {
             match parts.first().copied() {
                 Some("role") if parts.len() == 13 => {
                     let name = metadata_unescape(parts[1])?;
+                    validate_role_metadata_name(&name, line_no, "name")?;
                     if !seen_role_names.insert(name.to_ascii_lowercase()) {
                         return Err(ServerError::ddl(format!(
                             "duplicate role metadata name '{}' on line {}",
@@ -5400,6 +5411,10 @@ impl Server {
                 Some("member") if parts.len() == 5 => {
                     let role = metadata_unescape(parts[1])?;
                     let member = metadata_unescape(parts[2])?;
+                    validate_role_metadata_name(&role, line_no, "role")?;
+                    validate_role_metadata_name(&member, line_no, "member")?;
+                    let grantor = metadata_unescape(parts[3])?;
+                    validate_role_metadata_name(&grantor, line_no, "grantor")?;
                     let key = (role.to_ascii_lowercase(), member.to_ascii_lowercase());
                     if !seen_membership_keys.insert(key) {
                         return Err(ServerError::ddl(format!(
@@ -5410,7 +5425,7 @@ impl Server {
                     memberships.push(auth::RoleMembership {
                         role,
                         member,
-                        grantor: metadata_unescape(parts[3])?,
+                        grantor,
                         admin_option: parse_role_bool(parts[4], line_no, "admin_option")?,
                     });
                 }

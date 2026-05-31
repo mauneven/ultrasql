@@ -113,6 +113,28 @@ fn role_metadata_rejects_duplicate_role_names_on_rebuild() {
 }
 
 #[test]
+fn role_metadata_rejects_empty_role_names_on_rebuild() {
+    let data_dir = tempfile::TempDir::new().expect("temp data dir");
+    std::fs::write(
+        data_dir.path().join("pg_auth.meta"),
+        concat!(
+            "# ultrasql auth runtime v1\n",
+            "role\t\t17000\t\tfalse\ttrue\tfalse\tfalse\ttrue\tfalse\tfalse\t-1\t\n"
+        ),
+    )
+    .expect("write empty role metadata");
+
+    let err = match Server::init(data_dir.path()) {
+        Ok(_) => panic!("empty role metadata should be rejected"),
+        Err(err) => err,
+    };
+    assert!(
+        err.to_string().contains("empty role metadata name"),
+        "expected empty role metadata rejection, got {err}"
+    );
+}
+
+#[test]
 fn role_metadata_rejects_duplicate_memberships_on_rebuild() {
     let data_dir = tempfile::TempDir::new().expect("temp data dir");
     std::fs::write(
