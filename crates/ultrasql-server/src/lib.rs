@@ -4821,6 +4821,7 @@ impl Server {
         let mut seen_default_keys = std::collections::HashSet::new();
         let mut seen_identity_keys = std::collections::HashSet::new();
         let mut seen_generated_keys = std::collections::HashSet::new();
+        let mut seen_check_keys = std::collections::HashSet::new();
         for (line_no, line) in text.lines().enumerate() {
             if line.is_empty() || line.starts_with('#') {
                 continue;
@@ -4945,8 +4946,15 @@ impl Server {
                             line_no + 1
                         ))
                     })?);
+                    let name = metadata_unescape(parts[2])?;
+                    if !seen_check_keys.insert((oid, name.to_ascii_lowercase())) {
+                        return Err(ServerError::Ddl(format!(
+                            "duplicate table-runtime check metadata on line {}",
+                            line_no + 1
+                        )));
+                    }
                     checks.entry(oid).or_default().push(RuntimeCheckConstraint {
-                        name: metadata_unescape(parts[2])?,
+                        name,
                         expr: decode_scalar_expr_field(&metadata_unescape(parts[3])?)?,
                     });
                 }
