@@ -2241,4 +2241,5 @@ as a concise evidence ledger; roadmap stays for open gates only.
   parser, planner, protocol, and WAL record targets are listed, each target has
   a committed seed corpus directory, and the documented gate requires one clean
   week of nightly/manual evidence. Evidence:
-  `cargo test -p ultrasql-bench --test release_hardening ci_split_matches_release_policy -- --nocapture`.
+  `cargo test -p ultrasql-bench --test release_hardening ci_split_matches_release_policy -- --nocapture`,
+  `for target in parser_fuzz planner_fuzz protocol_fuzz wal_record_fuzz; do cargo +nightly fuzz build "$target" || exit 1; done`.
