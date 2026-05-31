@@ -682,16 +682,18 @@ as a concise evidence ledger; roadmap stays for open gates only.
   accepted; strict mode reports structural errors for the supported selection
   subset while lax mode suppresses them. `jsonb_path_exists` plus
   `jsonb_path_query` resolve predicate literal variables from a JSON/JSONB
-  `vars` argument. Basic `.size()`, `.type()`, `.abs()`, `.floor()`,
-  `.ceiling()`, and `.double()` SQL/JSON path methods now work in the shared
-  path engine, and filter predicates support `&&`, `||`, `!`, and nested
-  predicate parentheses. Evidence:
+  `vars` argument. Basic `.size()`, `.type()`, `.boolean()`, `.string()`,
+  `.double()`, `.number()`, `.integer()`, `.bigint()`, `.abs()`, `.floor()`,
+  and `.ceiling()` SQL/JSON path methods now work in the shared path engine,
+  and filter predicates support `&&`, `||`, `!`, and nested predicate
+  parentheses. Evidence:
   `cargo test -p ultrasql-server --test jsonb_path_query_round_trip jsonb_path_query_accepts_strict_and_lax_prefixes -- --nocapture`;
   `cargo test -p ultrasql-server --test jsonb_path_query_round_trip jsonb_path_strict_mode_reports_structural_errors -- --nocapture`;
   `cargo test -p ultrasql-server --test jsonb_path_query_round_trip jsonb_path_exists_supports_variable_literals -- --nocapture`;
   `cargo test -p ultrasql-server --test jsonb_path_query_round_trip jsonb_path_query_supports_variable_literals -- --nocapture`;
   `cargo test -p ultrasql-server --test jsonb_path_query_round_trip jsonb_path_query_supports_basic_methods -- --nocapture`;
   `cargo test -p ultrasql-server --test jsonb_path_query_round_trip jsonb_path_query_supports_numeric_methods -- --nocapture`;
+  `cargo test -p ultrasql-server --test jsonb_path_query_round_trip jsonb_path_query_supports_conversion_methods -- --nocapture`;
   `cargo test -p ultrasql-server --test jsonb_path_query_round_trip jsonb_path_query_supports_predicate_boolean_algebra -- --nocapture`.
 - Native arrays support multi-dimensional rectangular text/runtime round trips,
   GIN-facing operators, array subscripts/slices, `array_agg`, `array_length`,

@@ -296,6 +296,52 @@ async fn jsonb_path_query_supports_numeric_methods() {
 }
 
 #[tokio::test]
+async fn jsonb_path_query_supports_conversion_methods() {
+    let running = start_sample_server("jsonb_path_query_test").await;
+    let client = &running.client;
+
+    let messages = client
+        .simple_query(
+            "SELECT value FROM jsonb_path_query('[1,\"yes\",false]'::jsonb, '$[*].string()') \
+             UNION ALL \
+             SELECT value FROM jsonb_path_query('[1,\"off\",false,0]'::jsonb, '$[*].boolean()') \
+             UNION ALL \
+             SELECT value FROM jsonb_path_query('{\"v\":\"123.45\"}'::jsonb, '$.v.number()') \
+             UNION ALL \
+             SELECT value FROM jsonb_path_query('{\"v\":\"12345\"}'::jsonb, '$.v.integer()') \
+             UNION ALL \
+             SELECT value FROM jsonb_path_query('{\"v\":\"9876543219\"}'::jsonb, '$.v.bigint()')",
+        )
+        .await
+        .expect("jsonb_path_query conversion methods");
+    let rows: Vec<String> = messages
+        .into_iter()
+        .filter_map(|message| match message {
+            SimpleQueryMessage::Row(row) => row.get(0).map(str::to_owned),
+            _ => None,
+        })
+        .collect();
+
+    assert_eq!(
+        rows,
+        vec![
+            "\"1\"".to_owned(),
+            "\"yes\"".to_owned(),
+            "\"false\"".to_owned(),
+            "true".to_owned(),
+            "false".to_owned(),
+            "false".to_owned(),
+            "false".to_owned(),
+            "123.45".to_owned(),
+            "12345".to_owned(),
+            "9876543219".to_owned(),
+        ]
+    );
+
+    shutdown(running).await;
+}
+
+#[tokio::test]
 async fn jsonb_path_query_supports_predicate_boolean_algebra() {
     let running = start_sample_server("jsonb_path_query_test").await;
     let client = &running.client;

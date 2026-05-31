@@ -35,10 +35,15 @@ enum JsonPathStep {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum JsonPathMethod {
     Abs,
+    Bigint,
+    Boolean,
     Ceiling,
     Double,
     Floor,
+    Integer,
+    Number,
     Size,
+    String,
     Type,
 }
 
@@ -303,9 +308,19 @@ fn compare_json_value(left: &JsonValue, op: JsonPathCompareOp, right: &JsonValue
 fn apply_json_path_method(method: JsonPathMethod, value: &JsonValue) -> JsonValue {
     match method {
         JsonPathMethod::Abs => json_path_numeric_method(value, f64::abs),
+        JsonPathMethod::Bigint => json_path_bigint(value)
+            .map(JsonNumber::from)
+            .map_or(JsonValue::Null, JsonValue::Number),
+        JsonPathMethod::Boolean => {
+            json_path_boolean(value).map_or(JsonValue::Null, JsonValue::Bool)
+        }
         JsonPathMethod::Ceiling => json_path_numeric_method(value, f64::ceil),
         JsonPathMethod::Double => json_path_double(value),
         JsonPathMethod::Floor => json_path_numeric_method(value, f64::floor),
+        JsonPathMethod::Integer => json_path_integer(value)
+            .map(JsonNumber::from)
+            .map_or(JsonValue::Null, JsonValue::Number),
+        JsonPathMethod::Number => json_path_number_from_f64(json_path_f64(value)),
         JsonPathMethod::Size => {
             let size = match value {
                 JsonValue::Array(values) => values.len(),
@@ -317,6 +332,9 @@ fn apply_json_path_method(method: JsonPathMethod, value: &JsonValue) -> JsonValu
             };
             JsonValue::Number(JsonNumber::from(u64::try_from(size).unwrap_or(u64::MAX)))
         }
+        JsonPathMethod::String => {
+            json_path_string(value).map_or(JsonValue::Null, JsonValue::String)
+        }
         JsonPathMethod::Type => JsonValue::String(json_path_type_name(value).to_owned()),
     }
 }
@@ -327,6 +345,36 @@ fn json_path_numeric_method(value: &JsonValue, op: impl FnOnce(f64) -> f64) -> J
 
 fn json_path_double(value: &JsonValue) -> JsonValue {
     json_path_number_from_f64(json_path_f64(value))
+}
+
+fn json_path_boolean(value: &JsonValue) -> Option<bool> {
+    match value {
+        JsonValue::Bool(value) => Some(*value),
+        JsonValue::Number(number) => json_number_to_bool(number),
+        JsonValue::String(text) => json_string_to_bool(text),
+        JsonValue::Null | JsonValue::Array(_) | JsonValue::Object(_) => None,
+    }
+}
+
+fn json_path_string(value: &JsonValue) -> Option<String> {
+    match value {
+        JsonValue::Bool(value) => Some(value.to_string()),
+        JsonValue::Number(number) => Some(number.to_string()),
+        JsonValue::String(text) => Some(text.clone()),
+        JsonValue::Null | JsonValue::Array(_) | JsonValue::Object(_) => None,
+    }
+}
+
+fn json_path_integer(value: &JsonValue) -> Option<i32> {
+    json_path_bigint(value).and_then(|value| i32::try_from(value).ok())
+}
+
+fn json_path_bigint(value: &JsonValue) -> Option<i64> {
+    match value {
+        JsonValue::Number(number) => json_number_to_i64(number),
+        JsonValue::String(text) => text.trim().parse::<i64>().ok(),
+        JsonValue::Null | JsonValue::Bool(_) | JsonValue::Array(_) | JsonValue::Object(_) => None,
+    }
 }
 
 fn json_path_f64(value: &JsonValue) -> Option<f64> {
@@ -342,6 +390,35 @@ fn json_path_number_from_f64(value: Option<f64>) -> JsonValue {
     value
         .and_then(JsonNumber::from_f64)
         .map_or(JsonValue::Null, JsonValue::Number)
+}
+
+fn json_number_to_bool(number: &JsonNumber) -> Option<bool> {
+    if let Some(value) = number.as_i64() {
+        return Some(value != 0);
+    }
+    if let Some(value) = number.as_u64() {
+        return Some(value != 0);
+    }
+    let value = number.as_f64()?;
+    value.is_finite().then_some(value != 0.0)
+}
+
+fn json_string_to_bool(text: &str) -> Option<bool> {
+    match text.trim().to_ascii_lowercase().as_str() {
+        "true" | "t" | "yes" | "y" | "on" | "1" => Some(true),
+        "false" | "f" | "no" | "n" | "off" | "0" => Some(false),
+        _ => None,
+    }
+}
+
+fn json_number_to_i64(number: &JsonNumber) -> Option<i64> {
+    if let Some(value) = number.as_i64() {
+        return Some(value);
+    }
+    if let Some(value) = number.as_u64() {
+        return i64::try_from(value).ok();
+    }
+    number.to_string().parse::<i64>().ok()
 }
 
 fn json_path_type_name(value: &JsonValue) -> &'static str {
@@ -747,10 +824,15 @@ impl<'a> JsonPathParser<'a> {
 fn json_path_method(name: &str) -> Result<JsonPathMethod, JsonPathError> {
     match name {
         "abs" => Ok(JsonPathMethod::Abs),
+        "bigint" => Ok(JsonPathMethod::Bigint),
+        "boolean" => Ok(JsonPathMethod::Boolean),
         "ceiling" => Ok(JsonPathMethod::Ceiling),
         "double" => Ok(JsonPathMethod::Double),
         "floor" => Ok(JsonPathMethod::Floor),
+        "integer" => Ok(JsonPathMethod::Integer),
+        "number" => Ok(JsonPathMethod::Number),
         "size" => Ok(JsonPathMethod::Size),
+        "string" => Ok(JsonPathMethod::String),
         "type" => Ok(JsonPathMethod::Type),
         _ => Err(JsonPathError::new(format!(
             "unsupported jsonpath method {name}"
@@ -846,6 +928,63 @@ mod tests {
 
         let bad = parse_json_path("$.bad.double()").unwrap();
         assert_eq!(select(&document, &bad), vec![serde_json::Value::Null]);
+    }
+
+    #[test]
+    fn path_supports_conversion_methods() {
+        let document = serde_json::json!({
+            "truthy_number": 1,
+            "falsey_number": 0,
+            "truthy_text": "yes",
+            "falsey_text": "off",
+            "text": 12.5,
+            "numeric_text": "123.45",
+            "integer_text": "12345",
+            "bigint_text": "9876543219",
+            "bad": "maybe"
+        });
+
+        let truthy_number = parse_json_path("$.truthy_number.boolean()").unwrap();
+        assert_eq!(
+            select(&document, &truthy_number),
+            vec![serde_json::json!(true)]
+        );
+
+        let falsey_number = parse_json_path("$.falsey_number.boolean()").unwrap();
+        assert_eq!(
+            select(&document, &falsey_number),
+            vec![serde_json::json!(false)]
+        );
+
+        let truthy_text = parse_json_path("$.truthy_text.boolean()").unwrap();
+        assert_eq!(
+            select(&document, &truthy_text),
+            vec![serde_json::json!(true)]
+        );
+
+        let falsey_text = parse_json_path("$.falsey_text.boolean()").unwrap();
+        assert_eq!(
+            select(&document, &falsey_text),
+            vec![serde_json::json!(false)]
+        );
+
+        let string = parse_json_path("$.text.string()").unwrap();
+        assert_eq!(select(&document, &string), vec![serde_json::json!("12.5")]);
+
+        let number = parse_json_path("$.numeric_text.number()").unwrap();
+        assert_eq!(select(&document, &number), vec![serde_json::json!(123.45)]);
+
+        let integer = parse_json_path("$.integer_text.integer()").unwrap();
+        assert_eq!(select(&document, &integer), vec![serde_json::json!(12345)]);
+
+        let bigint = parse_json_path("$.bigint_text.bigint()").unwrap();
+        assert_eq!(
+            select(&document, &bigint),
+            vec![serde_json::json!(9_876_543_219_i64)]
+        );
+
+        let bad_bool = parse_json_path("$.bad.boolean()").unwrap();
+        assert_eq!(select(&document, &bad_bool), vec![serde_json::Value::Null]);
     }
 
     #[test]
