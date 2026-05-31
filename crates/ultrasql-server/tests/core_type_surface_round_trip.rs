@@ -106,6 +106,32 @@ async fn core_scalar_types_round_trip_over_postgres_wire() {
     assert_eq!(float_cast_row.get::<_, f64>(2), 1.5);
     assert_eq!(float_cast_row.get::<_, f32>(3), 2.25);
 
+    client
+        .batch_execute(
+            "CREATE TABLE text_cast_surface (
+                as_int TEXT NOT NULL,
+                as_bool TEXT NOT NULL,
+                as_float TEXT NOT NULL
+             );
+             INSERT INTO text_cast_surface VALUES ('42', 'true', '3.5')",
+        )
+        .await
+        .expect("create text cast table");
+    let text_cast_row = client
+        .query_one(
+            "SELECT
+                CAST(as_int AS INTEGER),
+                CAST(as_bool AS BOOLEAN),
+                CAST(as_float AS DOUBLE PRECISION)
+             FROM text_cast_surface",
+            &[],
+        )
+        .await
+        .expect("runtime text casts from columns");
+    assert_eq!(text_cast_row.get::<_, i32>(0), 42);
+    assert!(text_cast_row.get::<_, bool>(1));
+    assert_eq!(text_cast_row.get::<_, f64>(2), 3.5);
+
     let err = client
         .batch_execute(
             "INSERT INTO core_type_surface VALUES (

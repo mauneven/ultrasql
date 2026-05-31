@@ -414,6 +414,7 @@ fn eval_function_call(
         "__ultrasql_cast_int8" => eval_cast_int64(args),
         "__ultrasql_cast_float4" => eval_cast_float32(args),
         "__ultrasql_cast_float8" => eval_cast_float64(args),
+        "__ultrasql_cast_bool" => eval_cast_bool(args),
         "__ultrasql_cast_oid" => eval_cast_oid(args),
         "__ultrasql_cast_regclass" => eval_cast_regclass(args),
         "__ultrasql_cast_regtype" => eval_cast_regtype(args),
@@ -1036,6 +1037,11 @@ fn integer_cast_arg(func: &str, args: &[Value]) -> Result<Option<i128>, EvalErro
         Value::Int16(v) => Ok(Some(i128::from(*v))),
         Value::Int32(v) => Ok(Some(i128::from(*v))),
         Value::Int64(v) => Ok(Some(i128::from(*v))),
+        Value::Text(text) | Value::Char(text) => text
+            .trim()
+            .parse::<i128>()
+            .map(Some)
+            .map_err(|_| EvalError::Type(format!("{func}: invalid integer syntax: {text}"))),
         other => Err(EvalError::Type(format!(
             "{func}: integer argument required, got {:?}",
             other.data_type()
@@ -1085,10 +1091,44 @@ fn numeric_cast_arg_f64(func: &str, args: &[Value]) -> Result<Option<f64>, EvalE
         Value::Float32(v) => Ok(Some(f64::from(*v))),
         Value::Float64(v) => Ok(Some(*v)),
         Value::Decimal { value, scale } => Ok(Some(decimal_value_to_f64(*value, *scale))),
+        Value::Text(text) | Value::Char(text) => text
+            .trim()
+            .parse::<f64>()
+            .map(Some)
+            .map_err(|_| EvalError::Type(format!("{func}: invalid numeric syntax: {text}"))),
         other => Err(EvalError::Type(format!(
             "{func}: numeric argument required, got {:?}",
             other.data_type()
         ))),
+    }
+}
+
+fn eval_cast_bool(args: &[Value]) -> Result<Value, EvalError> {
+    if args.len() != 1 {
+        return Err(EvalError::Type(format!(
+            "boolean cast: expected 1 arg, got {}",
+            args.len()
+        )));
+    }
+    match &args[0] {
+        Value::Null => Ok(Value::Null),
+        Value::Text(text) | Value::Char(text) => parse_bool_cast_text(text)
+            .map(Value::Bool)
+            .ok_or_else(|| EvalError::Type(format!("boolean cast: invalid syntax: {text}"))),
+        other => Err(EvalError::Type(format!(
+            "boolean cast: text argument required, got {:?}",
+            other.data_type()
+        ))),
+    }
+}
+
+fn parse_bool_cast_text(text: &str) -> Option<bool> {
+    match text.trim() {
+        "t" | "true" | "TRUE" | "T" | "1" | "y" | "Y" | "yes" | "YES" | "on" | "ON" => Some(true),
+        "f" | "false" | "FALSE" | "F" | "0" | "n" | "N" | "no" | "NO" | "off" | "OFF" => {
+            Some(false)
+        }
+        _ => None,
     }
 }
 
@@ -6565,9 +6605,17 @@ mod tests {
             eval_fn("__ultrasql_cast_int2", vec![Value::Int32(7)]),
             Value::Int16(7)
         );
+        assert_eq!(
+            eval_fn("__ultrasql_cast_int4", vec![Value::Text("42".into())]),
+            Value::Int32(42)
+        );
         assert!(
             eval_fn_err("__ultrasql_cast_int2", vec![Value::Int32(40_000)])
                 .contains("out of range")
+        );
+        assert!(
+            eval_fn_err("__ultrasql_cast_int4", vec![Value::Text("x".into())])
+                .contains("invalid integer")
         );
         assert_eq!(
             eval_fn("__ultrasql_cast_int4", vec![Value::Int64(9)]),
@@ -6579,7 +6627,7 @@ mod tests {
         );
         assert!(
             eval_fn_err("__ultrasql_cast_int8", vec![Value::Text("x".into())])
-                .contains("integer argument")
+                .contains("invalid integer")
         );
         assert!(eval_fn_err("__ultrasql_cast_float4", vec![]).contains("expected 1 arg"));
         assert_eq!(
@@ -6595,6 +6643,10 @@ mod tests {
             Value::Float64(1.5)
         );
         assert_eq!(
+            eval_fn("__ultrasql_cast_float8", vec![Value::Text("3.5".into())]),
+            Value::Float64(3.5)
+        );
+        assert_eq!(
             eval_fn(
                 "__ultrasql_cast_float8",
                 vec![Value::Decimal {
@@ -6606,7 +6658,19 @@ mod tests {
         );
         assert!(
             eval_fn_err("__ultrasql_cast_float8", vec![Value::Text("x".into())])
-                .contains("numeric argument")
+                .contains("invalid numeric")
+        );
+        assert_eq!(
+            eval_fn("__ultrasql_cast_bool", vec![Value::Text("yes".into())]),
+            Value::Bool(true)
+        );
+        assert_eq!(
+            eval_fn("__ultrasql_cast_bool", vec![Value::Char(" off ".into())]),
+            Value::Bool(false)
+        );
+        assert!(
+            eval_fn_err("__ultrasql_cast_bool", vec![Value::Text("maybe".into())])
+                .contains("invalid syntax")
         );
 
         assert!(eval_fn_err("__ultrasql_cast_oid", vec![]).contains("expected 1 arg"));
