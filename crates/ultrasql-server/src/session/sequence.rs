@@ -152,6 +152,7 @@ where
                 ))
             })?
             .clone();
+        self.ensure_sequence_owner_or_superuser(sequence_name)?;
         let (storage, restart_value) = apply_sequence_change(seq.options_snapshot(), *options);
         seq.alter_options_logged(
             storage,
@@ -193,6 +194,9 @@ where
         }
         if drop_set.is_empty() {
             return Ok(result_encoder::run_ddl_command("DROP SEQUENCE"));
+        }
+        for name in &drop_set {
+            self.ensure_sequence_owner_or_superuser(name)?;
         }
         if *cascade {
             let before_constraints = self.table_runtime_constraint_snapshot();

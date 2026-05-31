@@ -636,6 +636,8 @@ where
         }
         self.state.persistent_catalog.create_table(entry.clone())?;
         let mut serial_sequence_rows = Vec::with_capacity(serial_sequences.len());
+        let sequence_owner = self.current_user.to_ascii_lowercase();
+        let sequence_namespace = namespace.to_ascii_lowercase();
         for (seq_name, options) in &serial_sequences {
             let seq = ultrasql_storage::sequence::Sequence::new(
                 super::sequence::to_storage_options(*options),
@@ -666,6 +668,13 @@ where
             )
             .map_err(|e| ServerError::ddl(format!("CREATE TABLE serial sequence WAL: {e}")))?;
             self.state.sequences.insert(seq_name.clone(), Arc::new(seq));
+            let sequence_key = seq_name.to_ascii_lowercase();
+            self.state
+                .sequence_owners
+                .insert(sequence_key.clone(), sequence_owner.clone());
+            self.state
+                .sequence_namespaces
+                .insert(sequence_key, sequence_namespace.clone());
         }
         let runtime_foreign_keys = foreign_keys
             .iter()
@@ -807,7 +816,10 @@ where
                     let _ = self.state.persistent_catalog.drop_table(table_name);
                     self.state.table_constraints.remove(&oid);
                     for (seq_name, _) in &serial_sequences {
+                        let sequence_key = seq_name.to_ascii_lowercase();
                         self.state.sequences.remove(seq_name);
+                        self.state.sequence_owners.remove(&sequence_key);
+                        self.state.sequence_namespaces.remove(&sequence_key);
                     }
                     return Err(e);
                 }
@@ -884,7 +896,10 @@ where
             let _ = self.state.persistent_catalog.drop_table(table_name);
             self.state.table_constraints.remove(&oid);
             for (seq_name, _) in &serial_sequences {
+                let sequence_key = seq_name.to_ascii_lowercase();
                 self.state.sequences.remove(seq_name);
+                self.state.sequence_owners.remove(&sequence_key);
+                self.state.sequence_namespaces.remove(&sequence_key);
             }
             return Err(e.into());
         }
@@ -905,6 +920,9 @@ where
         self.state.row_security.insert(oid, Arc::new(row_security));
         self.state.persist_table_runtime_constraints_metadata()?;
         self.state.persist_row_security_metadata()?;
+        if !serial_sequences.is_empty() {
+            self.state.persist_sequence_owner_metadata()?;
+        }
         let before_grants = self.state.privilege_catalog.list_grants();
         let before_default_grants = self.state.privilege_catalog.list_default_grants();
         self.state.privilege_catalog.apply_default_privileges(
@@ -2041,6 +2059,7 @@ where
                 .commit_transaction(ddl_txn, true, "DROP TABLE catalog transaction")?;
         }
         let mut privilege_grants_removed = false;
+        let mut sequence_owner_metadata_changed = false;
         for name in &drop_names {
             if let Some(entry) = self.state.persistent_catalog.lookup_table(name) {
                 if *cascade {
@@ -2084,7 +2103,11 @@ where
                                 ServerError::ddl(format!("DROP TABLE owned sequence WAL: {e}"))
                             })?;
                         }
+                        let sequence_key = seq_name.to_ascii_lowercase();
                         self.state.sequences.remove(seq_name);
+                        self.state.sequence_owners.remove(&sequence_key);
+                        self.state.sequence_namespaces.remove(&sequence_key);
+                        sequence_owner_metadata_changed = true;
                         self.sequence_state.forget(seq_name);
                         privilege_grants_removed |=
                             self.state.privilege_catalog.remove_object_grants(
@@ -2112,6 +2135,9 @@ where
         }
         self.state.persist_table_runtime_constraints_metadata()?;
         self.state.persist_row_security_metadata()?;
+        if sequence_owner_metadata_changed {
+            self.state.persist_sequence_owner_metadata()?;
+        }
         if privilege_grants_removed {
             self.state.persist_privilege_metadata()?;
         }

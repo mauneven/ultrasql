@@ -4,7 +4,9 @@ use tokio_postgres::NoTls;
 
 mod support;
 
-use support::{shutdown as graceful_shutdown, start_persistent_server, start_sample_server};
+use support::{
+    connect_as, shutdown as graceful_shutdown, start_persistent_server, start_sample_server,
+};
 
 async fn simple_i64(client: &tokio_postgres::Client, sql: &str) -> i64 {
     let rows = client.simple_query(sql).await.expect("simple query");
@@ -130,6 +132,77 @@ async fn sequence_owner_survives_restart_in_catalog_views() {
         .expect("query sequence owner after restart")
         .get::<_, String>(0);
     assert_eq!(owner, "persisted_sequence_owner");
+    graceful_shutdown(running).await;
+}
+
+#[tokio::test]
+async fn non_owner_cannot_alter_or_drop_sequence() {
+    let running = start_sample_server("sequence_owner_guard").await;
+
+    running
+        .client
+        .batch_execute(
+            "CREATE ROLE sequence_owner LOGIN; \
+             CREATE ROLE sequence_attacker LOGIN",
+        )
+        .await
+        .expect("create sequence test roles");
+
+    let (owner, owner_conn) = connect_as(
+        running.bound,
+        "sequence_owner",
+        "sequence_owner_guard_owner",
+    )
+    .await;
+    owner
+        .batch_execute("CREATE SEQUENCE private_sequence START WITH 5")
+        .await
+        .expect("owner creates sequence");
+    drop(owner);
+    owner_conn.await.expect("owner connection joins");
+
+    let (attacker, attacker_conn) = connect_as(
+        running.bound,
+        "sequence_attacker",
+        "sequence_owner_guard_attacker",
+    )
+    .await;
+    let alter_err = attacker
+        .batch_execute("ALTER SEQUENCE private_sequence INCREMENT BY 3")
+        .await
+        .expect_err("non-owner cannot alter sequence");
+    assert_eq!(alter_err.code().expect("SQLSTATE").code(), "42501");
+    let drop_err = attacker
+        .batch_execute("DROP SEQUENCE private_sequence")
+        .await
+        .expect_err("non-owner cannot drop sequence");
+    assert_eq!(drop_err.code().expect("SQLSTATE").code(), "42501");
+    drop(attacker);
+    attacker_conn.await.expect("attacker connection joins");
+
+    let (owner, owner_conn) = connect_as(
+        running.bound,
+        "sequence_owner",
+        "sequence_owner_guard_cleanup",
+    )
+    .await;
+    assert_eq!(
+        simple_i64(&owner, "SELECT nextval('private_sequence')").await,
+        5
+    );
+    owner
+        .batch_execute("DROP SEQUENCE private_sequence")
+        .await
+        .expect("owner can drop sequence");
+    drop(owner);
+    owner_conn.await.expect("owner cleanup connection joins");
+
+    running
+        .client
+        .batch_execute("DROP ROLE sequence_owner; DROP ROLE sequence_attacker")
+        .await
+        .expect("drop sequence test roles");
+
     graceful_shutdown(running).await;
 }
 

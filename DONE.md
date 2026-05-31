@@ -933,6 +933,11 @@ as a concise evidence ledger; roadmap stays for open gates only.
   sequences until those sequences are dropped. Evidence:
   `cargo test -p ultrasql-server --test sequence_round_trip` and
   `cargo test -p ultrasql-server --test role_ddl_round_trip`.
+- `ALTER SEQUENCE` and `DROP SEQUENCE` now enforce sequence owner or superuser
+  authorization before mutating sequence state, dependencies, WAL, owner
+  metadata, or ACL metadata; SERIAL/identity-created sequences are recorded and
+  cleaned up through the same owner/namespace metadata path. Evidence:
+  `cargo test -p ultrasql-server --test sequence_round_trip -- --nocapture`.
 - `CREATE SCHEMA`, `CREATE SCHEMA IF NOT EXISTS`, `DROP SCHEMA`, and
   `DROP SCHEMA IF EXISTS` now execute through the wire path, survive restart
   through runtime schema metadata, surface in `pg_namespace` /
