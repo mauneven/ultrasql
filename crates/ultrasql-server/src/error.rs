@@ -100,6 +100,11 @@ pub enum ServerError {
     #[error("{0}")]
     UndefinedObject(String),
 
+    /// A schema referenced by a qualified object name does not exist.
+    /// Maps to PostgreSQL SQLSTATE `3F000` (`invalid_schema_name`).
+    #[error("{0}")]
+    UndefinedSchema(String),
+
     /// An object cannot be dropped because another object depends on it.
     /// Maps to PostgreSQL SQLSTATE `2BP01`.
     #[error("{0}")]
@@ -207,6 +212,7 @@ impl ServerError {
                 | Self::Ddl(_)
                 | Self::Catalog(_)
                 | Self::UndefinedObject(_)
+                | Self::UndefinedSchema(_)
                 | Self::DependentObjectsStillExist(_)
                 | Self::TransactionAborted
                 | Self::SerializationFailure(_)
@@ -236,6 +242,7 @@ impl ServerError {
             // NotFound that surfaces when DROP / ALTER fails to resolve a name
             Self::Plan(_) | Self::Catalog(ultrasql_catalog::CatalogError::NotFound(_)) => "42P01",
             Self::UndefinedObject(_) => "42704", // undefined_object
+            Self::UndefinedSchema(_) => "3F000", // invalid_schema_name
             Self::Build(_) | Self::Unsupported(_) | Self::UnsupportedOwned(_) => "0A000", // feature_not_supported
             Self::UnsupportedProtocol { .. } => "08P01", // protocol_violation
             Self::DependentObjectsStillExist(_) => "2BP01", // dependent_objects_still_exist
@@ -337,5 +344,13 @@ mod tests {
             err.to_string(),
             "unsupported in v0.5: unsupported function 'foo'"
         );
+    }
+
+    #[test]
+    fn undefined_schema_is_query_scoped_invalid_schema_name() {
+        let err = ServerError::UndefinedSchema("schema \"missing\" does not exist".to_owned());
+
+        assert!(err.is_query_scoped());
+        assert_eq!(err.sqlstate(), "3F000");
     }
 }

@@ -88,3 +88,76 @@ async fn drop_schema_if_exists_tolerates_missing_schema() {
 
     shutdown(running).await;
 }
+
+#[tokio::test]
+async fn qualified_object_ddl_requires_existing_schema() {
+    let running = start_sample_server("schema_ddl_unknown_namespace").await;
+
+    let statements = [
+        "CREATE TABLE missing_schema.t (id INT)",
+        "CREATE SEQUENCE missing_schema.s",
+        "CREATE TYPE missing_schema.mood AS ENUM ('ok')",
+        "CREATE DOMAIN missing_schema.positive_int AS INT CHECK (VALUE > 0)",
+        "CREATE MATERIALIZED VIEW missing_schema.mv AS SELECT id, name FROM users",
+    ];
+    for sql in statements {
+        let err = running
+            .client
+            .batch_execute(sql)
+            .await
+            .expect_err("missing schema should reject qualified DDL");
+        assert_eq!(err.code().expect("SQLSTATE").code(), "3F000", "{sql}");
+    }
+
+    shutdown(running).await;
+}
+
+#[tokio::test]
+async fn qualified_object_ddl_uses_created_schema_namespace() {
+    let running = start_sample_server("schema_ddl_object_namespace").await;
+
+    running
+        .client
+        .batch_execute(
+            "CREATE SCHEMA app; \
+             CREATE TABLE app.events (id INT); \
+             CREATE SEQUENCE app.event_seq; \
+             CREATE TYPE app.mood AS ENUM ('ok'); \
+             CREATE DOMAIN app.positive_int AS INT CHECK (VALUE > 0); \
+             CREATE MATERIALIZED VIEW app.user_names AS SELECT id, name FROM users",
+        )
+        .await
+        .expect("qualified object DDL in existing schema");
+
+    let rels = running
+        .client
+        .query_one(
+            "SELECT COUNT(*) \
+             FROM pg_catalog.pg_class c \
+             JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace \
+             WHERE n.nspname = 'app' \
+               AND c.relname IN ('events', 'user_names')",
+            &[],
+        )
+        .await
+        .expect("query relation namespaces")
+        .get::<_, i64>(0);
+    assert_eq!(rels, 2);
+
+    let types = running
+        .client
+        .query_one(
+            "SELECT COUNT(*) \
+             FROM pg_catalog.pg_type t \
+             JOIN pg_catalog.pg_namespace n ON n.oid = t.typnamespace \
+             WHERE n.nspname = 'app' \
+               AND t.typname IN ('mood', 'positive_int')",
+            &[],
+        )
+        .await
+        .expect("query type namespaces")
+        .get::<_, i64>(0);
+    assert_eq!(types, 2);
+
+    shutdown(running).await;
+}

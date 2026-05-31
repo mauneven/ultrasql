@@ -270,6 +270,7 @@ where
                 "execute_create_type_enum called with non-CreateTypeEnum plan",
             ));
         };
+        self.ensure_schema_exists(namespace)?;
         if snapshot.enum_types.contains_key(type_name)
             || snapshot.composite_types.contains_key(type_name)
             || snapshot.tables.contains_key(type_name)
@@ -341,6 +342,7 @@ where
                 "execute_create_type_composite called with non-CreateTypeComposite plan",
             ));
         };
+        self.ensure_schema_exists(namespace)?;
         if snapshot.enum_types.contains_key(type_name)
             || snapshot.composite_types.contains_key(type_name)
             || snapshot.tables.contains_key(type_name)
@@ -403,6 +405,7 @@ where
                 "execute_create_domain called with non-CreateDomain plan",
             ));
         };
+        self.ensure_schema_exists(namespace)?;
         if snapshot.enum_types.contains_key(domain_name)
             || snapshot.composite_types.contains_key(domain_name)
             || snapshot.domain_types.contains_key(domain_name)
@@ -598,6 +601,7 @@ where
                 "execute_create_table called with non-CreateTable plan",
             ));
         };
+        self.ensure_schema_exists(namespace)?;
         let exists_persistent = snapshot.tables.contains_key(table_name);
         let exists_fallback = self.state.catalog.lookup_table(table_name).is_some();
         if exists_persistent || exists_fallback {
@@ -963,6 +967,7 @@ where
                 "execute_create_materialized_view called with wrong plan",
             ));
         };
+        self.ensure_schema_exists(namespace)?;
         let exists_persistent = snapshot.tables.contains_key(table_name);
         let exists_fallback = self.state.catalog.lookup_table(table_name).is_some();
         if exists_persistent || exists_fallback {

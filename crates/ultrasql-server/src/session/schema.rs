@@ -14,6 +14,16 @@ impl<RW> Session<RW>
 where
     RW: AsyncRead + AsyncWrite + Unpin,
 {
+    pub(crate) fn ensure_schema_exists(&self, schema_name: &str) -> Result<(), ServerError> {
+        let folded = schema_name.to_ascii_lowercase();
+        if builtin_schema_name(&folded) || self.state.schemas.contains_key(&folded) {
+            return Ok(());
+        }
+        Err(ServerError::UndefinedSchema(format!(
+            "schema \"{schema_name}\" does not exist"
+        )))
+    }
+
     pub(crate) fn execute_create_schema(
         &self,
         plan: &LogicalPlan,

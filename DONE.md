@@ -941,6 +941,12 @@ as a concise evidence ledger; roadmap stays for open gates only.
   `cargo test -p ultrasql-server --test schema_ddl_round_trip`,
   `cargo test -p ultrasql-server --test catalog_views_round_trip`, and
   `cargo test -p ultrasql-server --test role_ddl_round_trip`.
+- Qualified object DDL now rejects missing schemas with SQLSTATE `3F000`
+  before creating tables, sequences, enum/composite types, domains, or
+  materialized views, while allowing those objects inside runtime-created
+  schemas. Evidence: `cargo test -p ultrasql-server --test
+  schema_ddl_round_trip` and `cargo test -p ultrasql-server
+  undefined_schema_is_query_scoped_invalid_schema_name`.
 - `DROP ROLE` now rejects roles that still own live tables or still appear in
   object/default privilege grants, avoiding stale ownership and ACL references.
   Evidence: `cargo test -p ultrasql-server --test role_ddl_round_trip`.

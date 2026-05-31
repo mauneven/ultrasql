@@ -40,6 +40,7 @@ where
                 "execute_create_sequence called with non-CreateSequence plan",
             ));
         };
+        self.ensure_schema_exists(namespace)?;
         if self.state.sequences.contains_key(sequence_name) {
             if *if_not_exists {
                 return Ok(result_encoder::run_ddl_command("CREATE SEQUENCE"));
