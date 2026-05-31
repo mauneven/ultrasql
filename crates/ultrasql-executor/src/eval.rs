@@ -4411,10 +4411,9 @@ fn eval_plain_tsquery(func_name: &str, args: &[Value]) -> Result<Value, EvalErro
 fn eval_ts_rank(func_name: &str, args: &[Value]) -> Result<Value, EvalError> {
     let (vector, query) = match args.len() {
         2 => (&args[0], &args[1]),
-        3 => (&args[1], &args[2]),
         n => {
             return Err(EvalError::Type(format!(
-                "{func_name}: expected 2 or 3 args, got {n}"
+                "{func_name}: expected 2 args, got {n}"
             )));
         }
     };
@@ -7947,6 +7946,20 @@ mod tests {
         .eval(&[])
         .unwrap();
         assert_eq!(rank, Value::Float64(0.5));
+
+        let rank_extra_arg = Eval::new(call(
+            "ts_rank_cd",
+            vec![
+                lit_text("ignored"),
+                lit_text("the:1 quick:2 brown:3 fox:4"),
+                lit_text("quick & missing"),
+            ],
+            DataType::Float64,
+        ))
+        .eval(&[])
+        .unwrap_err()
+        .to_string();
+        assert!(rank_extra_arg.contains("expected 2 args"));
 
         let headline = Eval::new(call(
             "ts_headline",

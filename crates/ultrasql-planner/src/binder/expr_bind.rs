@@ -2125,19 +2125,14 @@ fn validate_text_search_constructor_args(
 }
 
 fn validate_ts_rank_args(func_name: &str, args: &[ScalarExpr]) -> Result<(), PlanError> {
-    match args.len() {
-        2 => {
-            validate_tsvector_arg(func_name, &args[0])?;
-            validate_tsquery_arg(func_name, &args[1])
-        }
-        3 => {
-            validate_tsvector_arg(func_name, &args[1])?;
-            validate_tsquery_arg(func_name, &args[2])
-        }
-        n => Err(PlanError::TypeMismatch(format!(
-            "{func_name}: expected 2 or 3 arguments, got {n}"
-        ))),
+    if args.len() != 2 {
+        return Err(PlanError::TypeMismatch(format!(
+            "{func_name}: expected 2 arguments, got {}",
+            args.len()
+        )));
     }
+    validate_tsvector_arg(func_name, &args[0])?;
+    validate_tsquery_arg(func_name, &args[1])
 }
 
 fn validate_ts_headline_args(args: &[ScalarExpr]) -> Result<(), PlanError> {
@@ -4393,6 +4388,17 @@ mod typed_literal_tests {
                 &mut [null_arg(DataType::TsVector), null_arg(DataType::TsQuery)]
             )
             .is_ok()
+        );
+        assert!(
+            validate_builtin_args(
+                "ts_rank",
+                &mut [
+                    null_arg(text.clone()),
+                    null_arg(DataType::TsVector),
+                    null_arg(DataType::TsQuery),
+                ]
+            )
+            .is_err()
         );
         assert!(validate_builtin_args("ts_rank", &mut [null_arg(text.clone())]).is_err());
         assert!(

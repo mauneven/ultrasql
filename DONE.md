@@ -852,7 +852,8 @@ as a concise evidence ledger; roadmap stays for open gates only.
   `3614` / `3615`, array OIDs `3643` / `3645`, `pg_type` rows, and
   RowDescription coverage while retaining the current text-backed value
   representation. `pg_catalog.pg_proc` advertises the supported full-text
-  function signatures for introspection. Evidence:
+  function signatures for introspection, and rank helpers reject unsupported
+  extra arguments instead of silently ignoring them. Evidence:
   `cargo test -p ultrasql-server --test full_text_round_trip`;
   `cargo test -p ultrasql-server --test catalog_views_round_trip pg_proc_advertises_supported_full_text_functions -- --nocapture`.
 - `DROP TABLE` dependency tracking now treats append-only materialized views as
