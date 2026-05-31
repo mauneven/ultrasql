@@ -1205,7 +1205,8 @@ as a concise evidence ledger; roadmap stays for open gates only.
   metadata slots do not leave failed role DDL in memory. The auth metadata
   loader rejects duplicate role names, role OIDs, and role-membership keys
   instead of silently applying last-row-wins state; it also rejects dangling
-  membership role/member/grantor references and empty role names/refs. Evidence:
+  membership role/member/grantor references, empty role names/refs, and zero
+  role OIDs. Evidence:
   `cargo test -p ultrasql-server --test role_ddl_round_trip -- --nocapture`.
 - Privilege catalog restart persistence is covered by `pg_privileges.meta`:
   `GRANT`, `REVOKE`, `ALTER DEFAULT PRIVILEGES`, and default-privilege

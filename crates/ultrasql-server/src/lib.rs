@@ -5386,6 +5386,12 @@ impl Server {
                         )));
                     }
                     let oid = parse_role_u32(parts[2], line_no, "oid")?;
+                    if oid == 0 {
+                        return Err(ServerError::ddl(format!(
+                            "invalid role metadata oid 0 on line {}",
+                            line_no + 1
+                        )));
+                    }
                     if !seen_role_oids.insert(oid) {
                         return Err(ServerError::ddl(format!(
                             "duplicate role metadata oid {} on line {}",
