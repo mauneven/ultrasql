@@ -78,7 +78,7 @@ file focused on what still blocks production.
   full `datetime(template)` grammar beyond the supported ISO templates and
   non-ISO date/time coercions.
 - Full-text search remaining: native lexeme/query storage beyond the current
-  text-backed representation, headline, dictionaries, full ranking parity, and
+  text-backed representation, dictionaries, full ranking/headline parity, and
   GIN planner integration.
 - XML remaining surface: XPath axes/functions beyond the supported child,
   wildcard, attribute, text, namespace, and descendant subset, plus full

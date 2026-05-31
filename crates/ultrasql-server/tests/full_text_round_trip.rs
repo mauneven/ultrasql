@@ -32,7 +32,8 @@ async fn full_text_constructors_match_and_rank_over_wire() {
                     plainto_tsquery('Quick fox'), \
                     to_tsvector('The Quick brown fox') @@ plainto_tsquery('quick fox'), \
                     to_tsvector('The Quick brown fox') @@ plainto_tsquery('missing'), \
-                    ts_rank(to_tsvector('The Quick brown fox'), plainto_tsquery('quick missing')) > 0.4",
+                    ts_rank(to_tsvector('The Quick brown fox'), plainto_tsquery('quick missing')) > 0.4, \
+                    ts_headline('The Quick brown fox.', plainto_tsquery('quick fox'))",
             )
             .await
             .expect("full-text query"),
@@ -46,6 +47,7 @@ async fn full_text_constructors_match_and_rank_over_wire() {
             "t".to_owned(),
             "f".to_owned(),
             "t".to_owned(),
+            "The <b>Quick</b> brown <b>fox</b>.".to_owned(),
         ]]
     );
 

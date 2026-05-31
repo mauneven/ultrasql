@@ -327,6 +327,7 @@ fn eval_function_call(
             eval_plain_tsquery(name, args)
         }
         "ts_rank" => eval_ts_rank(args),
+        "ts_headline" => eval_ts_headline(args),
         "ifnull" | "nvl" => eval_ifnull(args),
         "nullif" => eval_nullif(args),
         "least" => eval_extremum(args, "least", ExtremumKind::Least, NullPolicy::Ignore),
@@ -4417,6 +4418,63 @@ fn eval_ts_rank(args: &[Value]) -> Result<Value, EvalError> {
     Ok(Value::Float64(matched / total))
 }
 
+fn eval_ts_headline(args: &[Value]) -> Result<Value, EvalError> {
+    let (document, query) = match args.len() {
+        2 => (&args[0], &args[1]),
+        3 => (&args[1], &args[2]),
+        n => {
+            return Err(EvalError::Type(format!(
+                "ts_headline: expected 2 or 3 args, got {n}"
+            )));
+        }
+    };
+    let (Value::Text(document) | Value::Char(document), Value::Text(query)) = (document, query)
+    else {
+        if matches!(document, Value::Null) || matches!(query, Value::Null) {
+            return Ok(Value::Null);
+        }
+        return Err(EvalError::Type(format!(
+            "ts_headline: text document and text-backed TSQUERY required, got {:?} and {:?}",
+            document.data_type(),
+            query.data_type()
+        )));
+    };
+    let terms = text_search_terms(query);
+    Ok(Value::Text(highlight_text_search_terms(document, &terms)))
+}
+
+fn highlight_text_search_terms(document: &str, terms: &[String]) -> String {
+    let mut output = String::with_capacity(document.len());
+    let mut token_start = None;
+    for (idx, ch) in document.char_indices() {
+        if ch.is_alphanumeric() {
+            token_start.get_or_insert(idx);
+        } else if let Some(start) = token_start.take() {
+            push_headline_token(&mut output, &document[start..idx], terms);
+            output.push(ch);
+        } else {
+            output.push(ch);
+        }
+    }
+    if let Some(start) = token_start {
+        push_headline_token(&mut output, &document[start..], terms);
+    }
+    output
+}
+
+fn push_headline_token(output: &mut String, token: &str, terms: &[String]) {
+    if terms
+        .iter()
+        .any(|term| term.as_str() == token.to_ascii_lowercase())
+    {
+        output.push_str("<b>");
+        output.push_str(token);
+        output.push_str("</b>");
+    } else {
+        output.push_str(token);
+    }
+}
+
 fn overlaps_values(left: &Value, right: &Value) -> Option<bool> {
     match (left, right) {
         (Value::Range(l), Value::Range(r)) => Some(l.overlaps(r)),
@@ -7847,6 +7905,18 @@ mod tests {
         .eval(&[])
         .unwrap();
         assert_eq!(rank, Value::Float64(0.5));
+
+        let headline = Eval::new(call(
+            "ts_headline",
+            vec![lit_text("The Quick brown fox."), lit_text("quick & fox")],
+            DataType::Text { max_len: None },
+        ))
+        .eval(&[])
+        .unwrap();
+        assert_eq!(
+            headline,
+            Value::Text("The <b>Quick</b> brown <b>fox</b>.".into())
+        );
     }
 
     // -----------------------------------------------------------------------
