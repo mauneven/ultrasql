@@ -711,6 +711,9 @@ as a concise evidence ledger; roadmap stays for open gates only.
 - `DROP ROLE` now rejects roles that still appear in row-level-security policy
   role lists, avoiding stale policy-role references after role deletion.
   Evidence: `cargo test -p ultrasql-server --test role_ddl_round_trip`.
+- `DROP ROLE` now rejects roles that still appear as role-membership grantors,
+  avoiding stale membership grantor references after role deletion. Evidence:
+  `cargo test -p ultrasql-server --test role_ddl_round_trip`.
 
 ## Security And Client Certification
 

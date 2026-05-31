@@ -186,6 +186,15 @@ where
             }
         }
 
+        for membership in self.state.role_catalog.list_memberships() {
+            if membership.grantor.eq_ignore_ascii_case(&role) {
+                dependencies.push(format!(
+                    "role membership grant of {} to {}",
+                    membership.role, membership.member
+                ));
+            }
+        }
+
         dependencies.sort();
         dependencies.dedup();
         dependencies

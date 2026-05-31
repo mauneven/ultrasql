@@ -216,6 +216,68 @@ async fn drop_role_rejects_rls_policy_roles_until_policy_table_is_dropped() {
     shutdown(running).await;
 }
 
+#[tokio::test]
+async fn drop_role_rejects_membership_grantor_until_membership_is_revoked() {
+    let running = start_sample_server("role_ddl_test").await;
+    let client = &running.client;
+
+    client
+        .batch_execute("CREATE ROLE tester SUPERUSER LOGIN")
+        .await
+        .expect("register tester role");
+    client
+        .batch_execute("CREATE ROLE grant_admin CREATEROLE LOGIN")
+        .await
+        .expect("create membership grantor");
+    client
+        .batch_execute("CREATE ROLE membership_parent NOLOGIN")
+        .await
+        .expect("create parent role");
+    client
+        .batch_execute("CREATE ROLE membership_child LOGIN")
+        .await
+        .expect("create member role");
+
+    let conn_str = format!(
+        "host={host} port={port} user=grant_admin application_name=role_grantor_drop",
+        host = running.bound.ip(),
+        port = running.bound.port()
+    );
+    let (grant_admin, grant_admin_conn) = tokio_postgres::connect(&conn_str, NoTls)
+        .await
+        .expect("connect as grant_admin");
+    let grant_admin_conn = tokio::spawn(async move {
+        if let Err(err) = grant_admin_conn.await {
+            eprintln!("grant_admin connection error: {err}");
+        }
+    });
+    grant_admin
+        .batch_execute("GRANT membership_parent TO membership_child")
+        .await
+        .expect("grant membership as grant_admin");
+    drop(grant_admin);
+    grant_admin_conn
+        .await
+        .expect("grant_admin connection joins");
+
+    let restricted = client
+        .batch_execute("DROP ROLE grant_admin")
+        .await
+        .expect_err("membership grantor reference must block DROP ROLE");
+    assert_eq!(restricted.code().expect("SQLSTATE").code(), "2BP01");
+
+    client
+        .batch_execute("REVOKE membership_parent FROM membership_child")
+        .await
+        .expect("revoke membership");
+    client
+        .batch_execute("DROP ROLE grant_admin")
+        .await
+        .expect("drop grantor after membership revoked");
+
+    shutdown(running).await;
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn role_catalog_survives_restart() {
     let data_dir = tempfile::TempDir::new().expect("temp data dir");
