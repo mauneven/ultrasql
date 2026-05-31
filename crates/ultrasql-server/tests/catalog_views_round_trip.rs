@@ -1222,6 +1222,79 @@ async fn pg_stat_activity_reflects_session_identity() {
 }
 
 #[tokio::test]
+async fn pg_stat_activity_lists_open_sessions() {
+    let addr: SocketAddr = "127.0.0.1:0".parse().expect("addr parses");
+    let (listener, bound) = bind_listener(addr).await.expect("bind");
+    let server = Arc::new(Server::with_sample_database());
+    let server_handle = tokio::spawn(serve_listener(listener, Arc::clone(&server)));
+
+    let conn_a = format!(
+        "host={host} port={port} user=activity_a application_name=activity_a",
+        host = bound.ip(),
+        port = bound.port()
+    );
+    let (client_a, connection_a) = tokio_postgres::connect(&conn_a, NoTls)
+        .await
+        .expect("connect activity_a");
+    let conn_handle_a = tokio::spawn(async move {
+        if let Err(e) = connection_a.await {
+            eprintln!("connection a error: {e}");
+        }
+    });
+
+    let conn_b = format!(
+        "host={host} port={port} user=activity_b application_name=activity_b",
+        host = bound.ip(),
+        port = bound.port()
+    );
+    let (client_b, connection_b) = tokio_postgres::connect(&conn_b, NoTls)
+        .await
+        .expect("connect activity_b");
+    let conn_handle_b = tokio::spawn(async move {
+        if let Err(e) = connection_b.await {
+            eprintln!("connection b error: {e}");
+        }
+    });
+
+    let rows = client_a
+        .query(
+            "SELECT usename, application_name \
+             FROM pg_catalog.pg_stat_activity \
+             WHERE application_name IN ('activity_a', 'activity_b') \
+             ORDER BY application_name",
+            &[],
+        )
+        .await
+        .expect("pg_stat_activity open sessions");
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0].get::<_, String>(0), "activity_a");
+    assert_eq!(rows[0].get::<_, String>(1), "activity_a");
+    assert_eq!(rows[1].get::<_, String>(0), "activity_b");
+    assert_eq!(rows[1].get::<_, String>(1), "activity_b");
+
+    drop(client_b);
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    let rows = client_a
+        .query(
+            "SELECT application_name \
+             FROM pg_catalog.pg_stat_activity \
+             WHERE application_name IN ('activity_a', 'activity_b') \
+             ORDER BY application_name",
+            &[],
+        )
+        .await
+        .expect("pg_stat_activity after close");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].get::<_, String>(0), "activity_a");
+
+    drop(client_a);
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    server_handle.abort();
+    conn_handle_a.abort();
+    conn_handle_b.abort();
+}
+
+#[tokio::test]
 async fn psql_describe_table_statistics_probe_accepts_empty_pg_statistic_ext() {
     let (_server, client, _conn, server_handle) = start_server_and_connect().await;
 

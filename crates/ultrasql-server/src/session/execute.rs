@@ -791,6 +791,9 @@ where
             }
             "application_name" => {
                 self.session_settings.remove("application_name");
+                self.state
+                    .workload_recorder
+                    .update_session_application_name(self.pid, None);
                 Ok(result_encoder::run_ddl_command("RESET"))
             }
             "client_min_messages" => {
@@ -861,6 +864,9 @@ where
             "application_name" => {
                 self.session_settings
                     .insert("application_name".to_owned(), value.to_owned());
+                self.state
+                    .workload_recorder
+                    .update_session_application_name(self.pid, Some(value.to_owned()));
                 Ok(())
             }
             "client_min_messages" => match value.to_ascii_lowercase().as_str() {

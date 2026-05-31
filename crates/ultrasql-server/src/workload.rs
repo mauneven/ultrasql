@@ -161,6 +161,25 @@ pub struct CreateIndexProgressSnapshot {
     pub blocks_done: i64,
 }
 
+/// One active backend row for `pg_stat_activity`.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ActiveSessionSnapshot {
+    /// PostgreSQL backend pid announced in `BackendKeyData`.
+    pub pid: i32,
+    /// Database OID. UltraSQL exposes one database in this wave.
+    pub datid: i64,
+    /// Database name.
+    pub datname: String,
+    /// Startup user for this session.
+    pub usename: String,
+    /// Session application name, if the client supplied or set one.
+    pub application_name: Option<String>,
+    /// Current coarse backend state.
+    pub state: String,
+    /// Current query text, if exposed.
+    pub query: Option<String>,
+}
+
 /// Cumulative usage counters for one SQL index.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct IndexUsageStats {
@@ -226,6 +245,7 @@ pub struct WorkloadRecorder {
     vacuum_progress: parking_lot::Mutex<HashMap<u32, VacuumProgressSnapshot>>,
     analyze_progress: parking_lot::Mutex<HashMap<u32, AnalyzeProgressSnapshot>>,
     create_index_progress: parking_lot::Mutex<HashMap<u32, CreateIndexProgressSnapshot>>,
+    active_sessions: parking_lot::Mutex<HashMap<u32, ActiveSessionSnapshot>>,
     index_usage: parking_lot::Mutex<HashMap<u32, IndexUsageStats>>,
     slow_log_capacity: usize,
 }
@@ -248,6 +268,7 @@ impl WorkloadRecorder {
             vacuum_progress: parking_lot::Mutex::new(HashMap::new()),
             analyze_progress: parking_lot::Mutex::new(HashMap::new()),
             create_index_progress: parking_lot::Mutex::new(HashMap::new()),
+            active_sessions: parking_lot::Mutex::new(HashMap::new()),
             index_usage: parking_lot::Mutex::new(HashMap::new()),
             slow_log_capacity: 1024,
         }
@@ -437,6 +458,54 @@ impl WorkloadRecorder {
     pub fn create_index_progress(&self) -> Vec<CreateIndexProgressSnapshot> {
         let mut rows = self
             .create_index_progress
+            .lock()
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
+        rows.sort_by_key(|row| row.pid);
+        rows
+    }
+
+    /// Register one live client session for `pg_stat_activity`.
+    pub fn register_session(&self, pid: u32, usename: impl Into<String>) {
+        self.active_sessions.lock().insert(
+            pid,
+            ActiveSessionSnapshot {
+                pid: u32_to_i32_saturated(pid),
+                datid: 1,
+                datname: "ultrasql".to_string(),
+                usename: usename.into(),
+                application_name: None,
+                state: "active".to_string(),
+                query: None,
+            },
+        );
+    }
+
+    /// Update the startup user shown for one live session.
+    pub fn update_session_user(&self, pid: u32, usename: impl Into<String>) {
+        if let Some(row) = self.active_sessions.lock().get_mut(&pid) {
+            row.usename = usename.into();
+        }
+    }
+
+    /// Update the application name shown for one live session.
+    pub fn update_session_application_name(&self, pid: u32, application_name: Option<String>) {
+        if let Some(row) = self.active_sessions.lock().get_mut(&pid) {
+            row.application_name = application_name;
+        }
+    }
+
+    /// Remove one closed client session from `pg_stat_activity`.
+    pub fn deregister_session(&self, pid: u32) {
+        self.active_sessions.lock().remove(&pid);
+    }
+
+    /// Return live client sessions ordered by pid.
+    #[must_use]
+    pub fn active_sessions(&self) -> Vec<ActiveSessionSnapshot> {
+        let mut rows = self
+            .active_sessions
             .lock()
             .values()
             .cloned()

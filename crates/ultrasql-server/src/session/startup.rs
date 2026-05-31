@@ -109,6 +109,9 @@ where
             .map_or("tester", |(_, value)| value.as_str());
         self.auth_user = startup_user.to_ascii_lowercase();
         self.current_user = self.auth_user.clone();
+        self.state
+            .workload_recorder
+            .update_session_user(self.pid, self.auth_user.clone());
         let startup_application_name = params
             .iter()
             .find(|(key, _)| key == "application_name")
@@ -118,6 +121,12 @@ where
                 "application_name".to_owned(),
                 startup_application_name.to_owned(),
             );
+            self.state
+                .workload_recorder
+                .update_session_application_name(
+                    self.pid,
+                    Some(startup_application_name.to_owned()),
+                );
         }
 
         // Authentication. The default `Trust` policy short-circuits to

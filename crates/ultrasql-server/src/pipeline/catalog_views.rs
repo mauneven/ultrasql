@@ -2585,6 +2585,24 @@ fn schema_pg_stat_activity() -> Schema {
 }
 
 fn rows_pg_stat_activity(ctx: &LowerCtx<'_>) -> Vec<Vec<Value>> {
+    let sessions = ctx.workload_recorder.active_sessions();
+    if !sessions.is_empty() {
+        return sessions
+            .into_iter()
+            .map(|session| {
+                vec![
+                    Value::Int64(session.datid),
+                    v_text(session.datname),
+                    Value::Int32(session.pid),
+                    v_text(session.usename),
+                    session.application_name.map_or(Value::Null, v_text),
+                    v_text(session.state),
+                    session.query.map_or(Value::Null, v_text),
+                ]
+            })
+            .collect();
+    }
+
     let application_name = ctx
         .session_settings
         .get("application_name")

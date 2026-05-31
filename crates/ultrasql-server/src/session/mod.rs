@@ -144,6 +144,7 @@ where
         // live sender. Sending happens regardless of whether anyone is
         // listening; the receiver just buffers.
         let notify_rx = state.notify_hub.register_connection(pid);
+        state.workload_recorder.register_session(pid, "tester");
         Self {
             io,
             read_buf: BytesMut::with_capacity(READ_BUFFER_INITIAL),
@@ -196,5 +197,6 @@ impl<RW> Drop for Session<RW> {
             .release_all(&self.state.txn_manager.lock_manager);
         self.state.notify_hub.deregister_connection(self.pid);
         self.state.cancel_registry.deregister(self.pid);
+        self.state.workload_recorder.deregister_session(self.pid);
     }
 }

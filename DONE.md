@@ -860,6 +860,10 @@ as a concise evidence ledger; roadmap stays for open gates only.
   `cargo test -p ultrasql-server --test catalog_views_round_trip`;
   `cargo test -p ultrasql-server --test wal_stats_round_trip`;
   `cargo test -p ultrasql-server --test replication_stats_round_trip`.
+- `pg_catalog.pg_stat_activity` now lists all open sessions from a live
+  process-local registry, updates startup and `SET application_name` values,
+  and removes rows when sessions close. Evidence:
+  `cargo test -p ultrasql-server --test catalog_views_round_trip pg_stat_activity_lists_open_sessions -- --nocapture`.
 - `GUI introspection probes` exist for `pgAdmin`, `DBeaver`, and `DataGrip`.
 - Migration tool certification covers `Flyway`, `Liquibase`, and `Alembic`.
 
