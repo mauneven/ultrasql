@@ -62,6 +62,11 @@ where
                 "execute_alter_role called with non-AlterRole plan",
             ));
         };
+        if role_name.eq_ignore_ascii_case("ultrasql") && bootstrap_role_privileges_change(options) {
+            return Err(ServerError::ddl(
+                "cannot alter bootstrap role privileges for ultrasql",
+            ));
+        }
         let changes = build_role_changes(options)?;
         let before_roles = self.state.role_catalog.list_roles();
         let before_memberships = self.state.role_catalog.list_memberships();
@@ -382,6 +387,16 @@ fn build_role_changes(options: &LogicalRoleOptions) -> Result<RoleEntryChanges, 
             .map(|value| parse_valid_until(value))
             .transpose()?,
     })
+}
+
+fn bootstrap_role_privileges_change(options: &LogicalRoleOptions) -> bool {
+    options.superuser.is_some()
+        || options.inherit.is_some()
+        || options.create_role.is_some()
+        || options.create_db.is_some()
+        || options.can_login.is_some()
+        || options.connection_limit.is_some()
+        || options.valid_until.is_some()
 }
 
 fn hash_role_password(password: Option<&str>) -> Result<Option<PasswordHash>, ServerError> {

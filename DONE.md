@@ -943,7 +943,8 @@ as a concise evidence ledger; roadmap stays for open gates only.
 - `CREATE ROLE / USER`, `ALTER ROLE`, and `DROP ROLE` work through the role
   catalog and `pg_roles` / `pg_user` visibility. `DROP ROLE` rejects the
   bootstrap `ultrasql` role before mutating catalog state, preserving the auth
-  restart invariant.
+  restart invariant. `ALTER ROLE ultrasql` rejects privilege/login/validity
+  demotion while still allowing password rotation.
 - `GRANT / REVOKE` on tables, schemas, databases, sequences, and functions work
   through privilege catalog checks.
 - Column-level privileges enforce `SELECT`, `INSERT`, and `UPDATE` target
@@ -1209,7 +1210,8 @@ as a concise evidence ledger; roadmap stays for open gates only.
   instead of silently applying last-row-wins state; it also rejects dangling
   membership role/member/grantor references, empty role names/refs, and zero
   role OIDs. It requires the bootstrap `ultrasql` role to remain present with
-  its fixed OID before installing a restart snapshot. Evidence:
+  its fixed OID and critical admin/login attributes before installing a restart
+  snapshot. Evidence:
   `cargo test -p ultrasql-server --test role_ddl_round_trip -- --nocapture`.
 - Privilege catalog restart persistence is covered by `pg_privileges.meta`:
   `GRANT`, `REVOKE`, `ALTER DEFAULT PRIVILEGES`, and default-privilege

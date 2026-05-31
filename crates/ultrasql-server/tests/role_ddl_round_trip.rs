@@ -110,6 +110,25 @@ async fn drop_role_rejects_bootstrap_role() {
     shutdown(running).await;
 }
 
+#[tokio::test]
+async fn alter_role_rejects_bootstrap_privilege_demotion() {
+    let running = start_sample_server("role_ddl_test").await;
+    let client = &running.client;
+
+    let err = client
+        .batch_execute("ALTER ROLE ultrasql NOSUPERUSER")
+        .await
+        .expect_err("bootstrap role must not lose superuser");
+    assert!(
+        err.as_db_error().is_some_and(|db| db
+            .message()
+            .contains("cannot alter bootstrap role privileges")),
+        "expected bootstrap privilege rejection, got {err}"
+    );
+
+    shutdown(running).await;
+}
+
 #[test]
 fn role_metadata_rejects_duplicate_role_names_on_rebuild() {
     let data_dir = tempfile::TempDir::new().expect("temp data dir");
@@ -215,6 +234,29 @@ fn role_metadata_rejects_wrong_bootstrap_oid_on_rebuild() {
     assert!(
         err.to_string().contains("invalid bootstrap role metadata"),
         "expected invalid bootstrap OID rejection, got {err}"
+    );
+}
+
+#[test]
+fn role_metadata_rejects_demoted_bootstrap_role_on_rebuild() {
+    let data_dir = tempfile::TempDir::new().expect("temp data dir");
+    std::fs::write(
+        data_dir.path().join("pg_auth.meta"),
+        concat!(
+            "# ultrasql auth runtime v1\n",
+            "role\tultrasql\t10\t\tfalse\ttrue\ttrue\ttrue\ttrue\tfalse\tfalse\t-1\t\n"
+        ),
+    )
+    .expect("write demoted bootstrap metadata");
+
+    let err = match Server::init(data_dir.path()) {
+        Ok(_) => panic!("demoted bootstrap metadata should be rejected"),
+        Err(err) => err,
+    };
+    assert!(
+        err.to_string()
+            .contains("invalid bootstrap role metadata privileges"),
+        "expected invalid bootstrap privilege rejection, got {err}"
     );
 }
 

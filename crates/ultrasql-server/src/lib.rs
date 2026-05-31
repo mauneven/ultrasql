@@ -715,6 +715,22 @@ fn validate_role_metadata_name(name: &str, line_no: usize, field: &str) -> Resul
     )))
 }
 
+fn validate_bootstrap_role_metadata(role: &auth::RoleEntry) -> Result<(), ServerError> {
+    if role.is_superuser
+        && role.inherit
+        && role.create_role
+        && role.create_db
+        && role.can_login
+        && role.connection_limit == -1
+        && role.valid_until.is_none()
+    {
+        return Ok(());
+    }
+    Err(ServerError::ddl(
+        "invalid bootstrap role metadata privileges for ultrasql",
+    ))
+}
+
 fn parse_role_u32(raw: &str, line_no: usize, field: &str) -> Result<u32, ServerError> {
     raw.parse::<u32>().map_err(|err| {
         ServerError::ddl(format!(
@@ -5468,7 +5484,9 @@ impl Server {
             .iter()
             .find(|role| role.name.eq_ignore_ascii_case("ultrasql"))
         {
-            Some(role) if role.oid == auth::pg_authid::BOOTSTRAP_ROLE_OID => {}
+            Some(role) if role.oid == auth::pg_authid::BOOTSTRAP_ROLE_OID => {
+                validate_bootstrap_role_metadata(role)?;
+            }
             Some(role) => {
                 return Err(ServerError::ddl(format!(
                     "invalid bootstrap role metadata oid {}, expected {}",
