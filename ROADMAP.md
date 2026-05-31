@@ -153,8 +153,8 @@ file focused on what still blocks production.
 - Broaden `Columnar scan path` certification beyond the completed contract that
   heap rows remain the OLTP/MVCC source of truth while `HeapAccess::column_cache`
   provides the OLAP shadow path with committed DML invalidation.
-- CSV scans: remove row-buffer storage in the streaming wrapper and certify
-  larger cross-engine runs.
+- CSV scans: certify larger cross-engine runs and keep parser-buffer reuse
+  evidence current for local and object-store inputs.
 - Parquet/object-store scans: certify predicate/projection pushdown, object
   range reads, and lakehouse workloads against external engines.
 - Iceberg: deletes, time travel, catalog integration, and certification.

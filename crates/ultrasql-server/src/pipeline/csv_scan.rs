@@ -580,7 +580,7 @@ impl CsvReaderState {
     fn skip_header(&mut self, expected: &[String]) -> Result<(), ServerError> {
         let Some(record) = self
             .reader
-            .next_record()
+            .next_record(false)
             .map_err(|err| ServerError::CopyFormat(err.message))?
         else {
             return Err(ServerError::CopyFormat(format!(
@@ -601,14 +601,20 @@ impl CsvReaderState {
         &mut self,
         mut rejects: Option<&mut CsvRejectSink>,
     ) -> Result<Option<CsvOutputRow>, String> {
+        let capture_raw = rejects.is_some();
         loop {
-            let record = match self.reader.next_record() {
+            let record = match self.reader.next_record(capture_raw) {
                 Ok(Some(record)) => record,
                 Ok(None) => return Ok(None),
                 Err(err) => {
                     let row_number = self.next_physical_row_number()?;
                     if let Some(rejects) = rejects.as_deref_mut() {
-                        rejects.write_reject(&self.display, row_number, &err.message, &err.raw)?;
+                        rejects.write_reject(
+                            &self.display,
+                            row_number,
+                            &err.message,
+                            err.raw.as_deref().unwrap_or_default(),
+                        )?;
                         continue;
                     }
                     return Err(err.message);
@@ -623,7 +629,12 @@ impl CsvReaderState {
                     self.width
                 );
                 if let Some(rejects) = rejects.as_deref_mut() {
-                    rejects.write_reject(&self.display, row_number, &message, &record.raw)?;
+                    rejects.write_reject(
+                        &self.display,
+                        row_number,
+                        &message,
+                        record.raw.as_deref().unwrap_or_default(),
+                    )?;
                     continue;
                 }
                 return Err(message);
@@ -649,13 +660,13 @@ impl CsvReaderState {
 #[derive(Debug)]
 struct CsvRecord {
     values: Vec<String>,
-    raw: String,
+    raw: Option<String>,
 }
 
 #[derive(Debug)]
 struct CsvRowError {
     message: String,
-    raw: String,
+    raw: Option<String>,
 }
 
 #[derive(Debug)]
@@ -663,6 +674,8 @@ struct CsvRecordReader {
     display: String,
     source: CsvRecordSource,
     options: CsvParseOptions,
+    record_buffer: String,
+    line_buffer: String,
 }
 
 impl CsvRecordReader {
@@ -671,60 +684,66 @@ impl CsvRecordReader {
             display,
             source,
             options,
+            record_buffer: String::new(),
+            line_buffer: String::new(),
         }
     }
 
-    fn next_record(&mut self) -> Result<Option<CsvRecord>, CsvRowError> {
-        let mut buffer = String::new();
+    fn next_record(&mut self, capture_raw: bool) -> Result<Option<CsvRecord>, CsvRowError> {
+        self.record_buffer.clear();
         loop {
-            let mut line = String::new();
+            self.line_buffer.clear();
             let bytes = self
                 .source
-                .read_line(&mut line)
+                .read_line(&mut self.line_buffer)
                 .map_err(|err| CsvRowError {
                     message: format!("read_csv cannot read {}: {err}", self.display),
-                    raw: buffer.clone(),
+                    raw: self.capture_record_buffer(capture_raw),
                 })?;
             if bytes == 0 {
-                if buffer.is_empty() {
+                if self.record_buffer.is_empty() {
                     return Ok(None);
                 }
-                return self.parse_buffer(buffer);
+                return self.parse_record_buffer(capture_raw);
             }
-            buffer.push_str(&line);
-            match self.parse_complete_record(&buffer) {
+            self.record_buffer.push_str(&self.line_buffer);
+            match self.parse_complete_record(&self.record_buffer) {
                 Ok(Some(values)) => {
-                    return Ok(Some(CsvRecord {
-                        values,
-                        raw: buffer,
-                    }));
+                    let raw = self.capture_record_buffer(capture_raw);
+                    return Ok(Some(CsvRecord { values, raw }));
                 }
                 Ok(None) => {
-                    buffer.clear();
+                    self.record_buffer.clear();
                 }
                 Err(err) if err.contains("unterminated quoted field") => {}
                 Err(message) => {
-                    return Err(CsvRowError {
-                        message,
-                        raw: buffer,
-                    });
+                    let raw = self.capture_record_buffer(capture_raw);
+                    return Err(CsvRowError { message, raw });
                 }
             }
         }
     }
 
-    fn parse_buffer(&self, buffer: String) -> Result<Option<CsvRecord>, CsvRowError> {
-        match self.parse_complete_record(&buffer) {
+    fn parse_record_buffer(&mut self, capture_raw: bool) -> Result<Option<CsvRecord>, CsvRowError> {
+        match self.parse_complete_record(&self.record_buffer) {
             Ok(Some(values)) => Ok(Some(CsvRecord {
                 values,
-                raw: buffer,
+                raw: self.capture_record_buffer(capture_raw),
             })),
             Ok(None) => Ok(None),
             Err(message) => Err(CsvRowError {
                 message,
-                raw: buffer,
+                raw: self.capture_record_buffer(capture_raw),
             }),
         }
+    }
+
+    fn capture_record_buffer(&mut self, capture_raw: bool) -> Option<String> {
+        if capture_raw {
+            return Some(std::mem::take(&mut self.record_buffer));
+        }
+        self.record_buffer.clear();
+        None
     }
 
     fn parse_complete_record(&self, text: &str) -> Result<Option<Vec<String>>, String> {
@@ -1235,11 +1254,13 @@ fn sniff_csv_batch(sniff: &CsvSniff) -> Result<Batch, ExecError> {
 #[cfg(test)]
 mod tests {
     use std::fs;
+    use std::io::BufReader;
     use std::io::Write as _;
 
+    use ultrasql_core::csv::CsvParseOptions;
     use ultrasql_executor::Operator as _;
 
-    use super::{CSV_BATCH_TARGET_ROWS, CsvTableScan};
+    use super::{CSV_BATCH_TARGET_ROWS, CsvRecordReader, CsvRecordSource, CsvTableScan};
 
     #[test]
     fn csv_scan_construction_does_not_parse_past_first_batch() {
@@ -1284,6 +1305,38 @@ mod tests {
         assert_eq!(first.rows(), CSV_BATCH_TARGET_ROWS);
         assert_eq!(second.rows(), 1);
         assert!(scan.next_batch().expect("eof reads").is_none());
+    }
+
+    #[test]
+    fn csv_record_reader_captures_raw_rows_only_for_rejects() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let csv_path = dir.path().join("raw.csv");
+        fs::write(&csv_path, "id,name\n1,Ada\n").expect("write csv");
+
+        let file = fs::File::open(&csv_path).expect("open csv");
+        let mut reader = CsvRecordReader::new(
+            csv_path.display().to_string(),
+            CsvRecordSource::File(BufReader::new(file)),
+            CsvParseOptions::default(),
+        );
+        let record = reader
+            .next_record(false)
+            .expect("record parses")
+            .expect("record present");
+        assert_eq!(record.values, vec!["id".to_owned(), "name".to_owned()]);
+        assert!(record.raw.is_none());
+
+        let file = fs::File::open(&csv_path).expect("open csv again");
+        let mut reader = CsvRecordReader::new(
+            csv_path.display().to_string(),
+            CsvRecordSource::File(BufReader::new(file)),
+            CsvParseOptions::default(),
+        );
+        let record = reader
+            .next_record(true)
+            .expect("record parses")
+            .expect("record present");
+        assert_eq!(record.raw.as_deref(), Some("id,name\n"));
     }
 
     #[cfg(unix)]

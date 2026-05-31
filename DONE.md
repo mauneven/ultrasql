@@ -1712,3 +1712,7 @@ as a concise evidence ledger; roadmap stays for open gates only.
   `cargo run -p ultrasql-sqllogictest-runner -- --mode in-process tests/slt/sql_regression/regression_subset/index_constraint_operator_baseline.slt`
   and
   `cargo test -p ultrasql-sqllogictest-runner --test in_process sql_regression_index_constraint_operator_baseline_is_imported_and_provenanced -- --nocapture`.
+- CSV streaming scans no longer carry raw row text through successful rows
+  unless a reject artifact is enabled. The reader reuses internal record/line
+  buffers and captures raw text only for quarantine/error reporting. Evidence:
+  `cargo test -p ultrasql-server csv_record_reader_captures_raw_rows_only_for_rejects --lib -- --nocapture`.
