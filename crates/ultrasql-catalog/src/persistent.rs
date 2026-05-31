@@ -399,6 +399,8 @@ pub struct CatalogSnapshot {
     pub domain_types: std::collections::HashMap<String, DomainTypeEntry>,
     /// User-defined domain types keyed by `pg_type.oid`.
     pub domain_types_by_oid: std::collections::HashMap<Oid, DomainTypeEntry>,
+    /// Constraints keyed by `pg_constraint.oid`.
+    pub constraints: std::collections::HashMap<Oid, ConstraintRow>,
     /// Comments keyed by `(objoid, classoid, objsubid)`.
     pub descriptions: std::collections::HashMap<(Oid, Oid, i32), DescriptionRow>,
     /// `pg_statistic` rows keyed by `(starelid, staattnum)`.
@@ -491,6 +493,7 @@ impl PersistentCatalog {
             composite_types_by_oid: std::collections::HashMap::new(),
             domain_types: std::collections::HashMap::new(),
             domain_types_by_oid: std::collections::HashMap::new(),
+            constraints: std::collections::HashMap::new(),
             descriptions: std::collections::HashMap::new(),
             statistics: std::collections::HashMap::new(),
             statistic_ext: std::collections::HashMap::new(),
@@ -1168,6 +1171,7 @@ impl PersistentCatalog {
             composite_types_by_oid,
             domain_types,
             domain_types_by_oid,
+            constraints: constraint_rows.clone(),
             descriptions,
             statistics,
             statistic_ext,
@@ -1775,6 +1779,7 @@ impl PersistentCatalog {
         for row in rows {
             self.pg_constraint.insert(row.oid, row);
         }
+        self.rebuild_snapshot();
     }
 
     /// Remove live `pg_constraint` rows owned by one dropped table.
@@ -2308,6 +2313,11 @@ impl PersistentCatalog {
             .iter()
             .map(|r| (*r.key(), r.value().clone()))
             .collect();
+        let constraints: std::collections::HashMap<Oid, ConstraintRow> = self
+            .pg_constraint
+            .iter()
+            .map(|r| (*r.key(), r.value().clone()))
+            .collect();
         let statistics: std::collections::HashMap<(Oid, i16), StatisticRow> = self
             .pg_statistic
             .iter()
@@ -2329,6 +2339,7 @@ impl PersistentCatalog {
             composite_types_by_oid,
             domain_types,
             domain_types_by_oid,
+            constraints,
             descriptions,
             statistics,
             statistic_ext,
@@ -3197,6 +3208,7 @@ mod tests {
             composite_types_by_oid: snap_a.composite_types_by_oid.clone(),
             domain_types: snap_a.domain_types.clone(),
             domain_types_by_oid: snap_a.domain_types_by_oid.clone(),
+            constraints: snap_a.constraints.clone(),
             descriptions: snap_a.descriptions.clone(),
             statistics: snap_a.statistics.clone(),
             statistic_ext: snap_a.statistic_ext.clone(),

@@ -706,8 +706,48 @@ fn eval_format_type(args: &[Value]) -> Result<Value, EvalError> {
             args[0].data_type()
         )));
     };
-    let name = builtin_type_display_name(oid).unwrap_or("text");
-    Ok(Value::Text(name.to_owned()))
+    let typmod = format_type_typmod(&args[1])?;
+    let name = format_builtin_type(oid, typmod)
+        .unwrap_or_else(|| builtin_type_display_name(oid).unwrap_or("text").to_owned());
+    Ok(Value::Text(name))
+}
+
+fn format_type_typmod(value: &Value) -> Result<Option<i32>, EvalError> {
+    if matches!(value, Value::Null) {
+        return Ok(None);
+    }
+    let Some(raw) = integer_value_i128(value) else {
+        return Err(EvalError::Type(format!(
+            "format_type: typmod argument must be integer or null, got {:?}",
+            value.data_type()
+        )));
+    };
+    i32::try_from(raw)
+        .map(Some)
+        .map_err(|_| EvalError::Type("format_type: typmod argument out of range".to_owned()))
+}
+
+fn format_builtin_type(oid: u32, typmod: Option<i32>) -> Option<String> {
+    match (oid, typmod) {
+        (1700, Some(typmod)) => format_numeric_type(typmod),
+        (1042, Some(typmod)) => format_char_type(typmod),
+        _ => None,
+    }
+}
+
+fn format_numeric_type(typmod: i32) -> Option<String> {
+    let packed = u32::try_from(typmod.checked_sub(4)?).ok()?;
+    let precision = packed >> 16;
+    let scale = packed & u32::from(u16::MAX);
+    Some(format!("numeric({precision},{scale})"))
+}
+
+fn format_char_type(typmod: i32) -> Option<String> {
+    let len = typmod.checked_sub(4)?;
+    if len < 0 {
+        return None;
+    }
+    Some(format!("character({len})"))
 }
 
 fn builtin_type_display_name(oid: u32) -> Option<&'static str> {
@@ -6651,6 +6691,21 @@ mod tests {
         assert_eq!(
             eval_fn("format_type", vec![Value::Null, Value::Null]),
             Value::Null
+        );
+        let numeric_8_2_typmod = (8_i32 << 16) + 2 + 4;
+        assert_eq!(
+            eval_fn(
+                "format_type",
+                vec![Value::Oid(Oid::new(1700)), Value::Int32(numeric_8_2_typmod)]
+            ),
+            Value::Text("numeric(8,2)".into())
+        );
+        assert_eq!(
+            eval_fn(
+                "format_type",
+                vec![Value::Oid(Oid::new(1042)), Value::Int32(9)]
+            ),
+            Value::Text("character(5)".into())
         );
         assert!(eval_fn_err("format_type", vec![]).contains("expected 2 args"));
         assert!(

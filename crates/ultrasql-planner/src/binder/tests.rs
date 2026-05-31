@@ -1939,6 +1939,7 @@ fn binds_create_table_persistent_catalog_via_snapshot_adapter() {
         composite_types_by_oid: std::collections::HashMap::new(),
         domain_types: std::collections::HashMap::new(),
         domain_types_by_oid: std::collections::HashMap::new(),
+        constraints: std::collections::HashMap::new(),
         descriptions: std::collections::HashMap::new(),
         statistics: std::collections::HashMap::new(),
         statistic_ext: std::collections::HashMap::new(),

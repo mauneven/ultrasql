@@ -14,6 +14,7 @@ Imported files:
 - `type_specific_baseline.slt`
 - `aggregate_window_baseline.slt`
 - `type_coercion_baseline.slt`
+- `catalog_sanity_baseline.slt`
 
 Derived upstream regression sources:
 
@@ -48,6 +49,8 @@ The aggregate/window shard covers grouped aggregates, HAVING, and core window
 functions with deterministic local fixtures.
 The type-coercion shard covers explicit casts, assignment-compatible inserts,
 NULL casts, `COALESCE`, and `CASE` coercion with deterministic local fixtures.
+The catalog-sanity shard covers local pg_class, pg_attribute, pg_constraint,
+pg_type, and visibility probes derived from public catalog sanity checks.
 
 Run with PostgreSQL reference:
 

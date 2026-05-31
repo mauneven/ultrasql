@@ -458,6 +458,10 @@ fn v_oid_i32(v: i32) -> Value {
     }
 }
 
+fn relation_type_oid(rel_oid: Oid) -> u32 {
+    rel_oid.raw().checked_add(1_000_000_000).unwrap_or(0)
+}
+
 fn namespace_oid(schema_name: &str) -> i64 {
     match schema_name {
         "pg_catalog" => PG_CATALOG_OID,
@@ -692,6 +696,7 @@ fn schema_pg_class() -> Schema {
         Field::required("oid", DataType::Int64),
         Field::required("relname", text()),
         Field::required("relnamespace", DataType::Int64),
+        Field::required("reltype", DataType::Oid),
         Field::required("relkind", DataType::Text { max_len: Some(1) }),
         Field::required("relpages", DataType::Int32),
         Field::required("reltuples", DataType::Float64),
@@ -724,30 +729,33 @@ fn rows_pg_class(ctx: &LowerCtx<'_>) -> Vec<Vec<Value>> {
         } else {
             "r"
         };
-        rows.push(pg_class_row(
-            entry.oid.raw(),
-            entry.name.clone(),
-            namespace_oid(&entry.schema_name),
+        rows.push(pg_class_row(VirtualClassRow {
+            oid: entry.oid.raw(),
+            relname: entry.name.clone(),
+            relnamespace: namespace_oid(&entry.schema_name),
+            reltype: relation_type_oid(entry.oid),
             relkind,
-            i32::try_from(entry.n_blocks).unwrap_or(i32::MAX),
-            i32::try_from(entry.root_block.raw()).unwrap_or(i32::MAX),
-            ctx.catalog_snapshot
+            relpages: i32::try_from(entry.n_blocks).unwrap_or(i32::MAX),
+            relfilenode: i32::try_from(entry.root_block.raw()).unwrap_or(i32::MAX),
+            relhasindex: ctx
+                .catalog_snapshot
                 .indexes_by_table
                 .contains_key(&entry.oid),
-        ));
+        }));
     }
     let mut indexes: Vec<_> = ctx.catalog_snapshot.indexes.values().collect();
     indexes.sort_by(|a, b| a.name.cmp(&b.name));
     for index in indexes {
-        rows.push(pg_class_row(
-            index.oid.raw(),
-            index.name.clone(),
-            PUBLIC_OID,
-            "i",
-            0,
-            i32::try_from(index.root_block.raw()).unwrap_or(i32::MAX),
-            false,
-        ));
+        rows.push(pg_class_row(VirtualClassRow {
+            oid: index.oid.raw(),
+            relname: index.name.clone(),
+            relnamespace: PUBLIC_OID,
+            reltype: 0,
+            relkind: "i",
+            relpages: 0,
+            relfilenode: i32::try_from(index.root_block.raw()).unwrap_or(i32::MAX),
+            relhasindex: false,
+        }));
     }
     let mut composites = ctx
         .catalog_snapshot
@@ -756,37 +764,42 @@ fn rows_pg_class(ctx: &LowerCtx<'_>) -> Vec<Vec<Value>> {
         .collect::<Vec<_>>();
     composites.sort_by_key(|entry| entry.oid.raw());
     for entry in composites {
-        rows.push(pg_class_row(
-            entry.oid.raw(),
-            entry.name.clone(),
-            namespace_oid(&entry.schema_name),
-            "c",
-            0,
-            0,
-            false,
-        ));
+        rows.push(pg_class_row(VirtualClassRow {
+            oid: entry.oid.raw(),
+            relname: entry.name.clone(),
+            relnamespace: namespace_oid(&entry.schema_name),
+            reltype: entry.oid.raw(),
+            relkind: "c",
+            relpages: 0,
+            relfilenode: 0,
+            relhasindex: false,
+        }));
     }
     rows
 }
 
-fn pg_class_row(
+struct VirtualClassRow {
     oid: u32,
     relname: String,
     relnamespace: i64,
-    relkind: &str,
+    reltype: u32,
+    relkind: &'static str,
     relpages: i32,
     relfilenode: i32,
     relhasindex: bool,
-) -> Vec<Value> {
+}
+
+fn pg_class_row(row: VirtualClassRow) -> Vec<Value> {
     vec![
-        v_i64(oid),
-        v_text(relname),
-        Value::Int64(relnamespace),
-        v_text(relkind),
-        Value::Int32(relpages),
+        v_i64(row.oid),
+        v_text(row.relname),
+        Value::Int64(row.relnamespace),
+        v_oid(row.reltype),
+        v_text(row.relkind),
+        Value::Int32(row.relpages),
         Value::Float64(0.0),
-        Value::Int32(relfilenode),
-        Value::Bool(relhasindex),
+        Value::Int32(row.relfilenode),
+        Value::Bool(row.relhasindex),
         Value::Int32(0),
         Value::Bool(false),
         Value::Bool(false),
@@ -836,7 +849,7 @@ fn rows_pg_attribute(ctx: &LowerCtx<'_>) -> Vec<Vec<Value>> {
                 Value::Bool(!field.nullable),
                 Value::Bool(column_default_expr(ctx, entry.oid, idx).is_some()),
                 Value::Bool(false),
-                Value::Int32(-1),
+                Value::Int32(type_modifier(&field.data_type)),
                 v_oid(attribute_collation_oid(&entry, idx)),
                 v_text(""),
                 v_text(""),
@@ -861,7 +874,7 @@ fn rows_pg_attribute(ctx: &LowerCtx<'_>) -> Vec<Vec<Value>> {
                 Value::Bool(!field.nullable),
                 Value::Bool(false),
                 Value::Bool(false),
-                Value::Int32(-1),
+                Value::Int32(type_modifier(&field.data_type)),
                 v_oid(type_collation_oid(&field.data_type)),
                 v_text(""),
                 v_text(""),
@@ -880,6 +893,31 @@ fn schema_pg_attrdef() -> Schema {
         Field::required("adnum", DataType::Int16),
         Field::required("adbin", text()),
     ])
+}
+
+fn type_modifier(data_type: &DataType) -> i32 {
+    match data_type {
+        DataType::Decimal {
+            precision: Some(precision),
+            scale,
+        } => numeric_type_modifier(*precision, scale.unwrap_or(0)).unwrap_or(-1),
+        DataType::Char { len: Some(len) } => len
+            .checked_add(4)
+            .and_then(|typmod| i32::try_from(typmod).ok())
+            .unwrap_or(-1),
+        _ => -1,
+    }
+}
+
+fn numeric_type_modifier(precision: u32, scale: i32) -> Option<i32> {
+    if !(0..=i32::from(u16::MAX)).contains(&scale) {
+        return None;
+    }
+    let precision = i32::try_from(precision).ok()?;
+    precision
+        .checked_shl(16)?
+        .checked_add(scale)?
+        .checked_add(4)
 }
 
 fn rows_pg_attrdef(ctx: &LowerCtx<'_>) -> Vec<Vec<Value>> {
@@ -1187,6 +1225,23 @@ fn rows_pg_type(ctx: &LowerCtx<'_>) -> Vec<Vec<Value>> {
             ])
         },
     ));
+    for entry in table_entries(ctx) {
+        rows.push(vec![
+            v_oid(relation_type_oid(entry.oid)),
+            v_text(entry.name.clone()),
+            Value::Int64(namespace_oid(&entry.schema_name)),
+            Value::Int64(10),
+            v_text("c"),
+            v_text("C"),
+            Value::Int16(-1),
+            Value::Int32(0),
+            v_oid(0),
+            v_text(","),
+            v_text("record_in"),
+            v_oid(0),
+            v_oid(0),
+        ]);
+    }
     let mut enums = ctx
         .catalog_snapshot
         .enum_types_by_oid
@@ -1530,11 +1585,7 @@ fn virtual_constraints(ctx: &LowerCtx<'_>) -> Vec<VirtualConstraint> {
         out.push(VirtualConstraint {
             oid: 30_000 + i64::from(index.oid.raw()),
             name: index.name.clone(),
-            kind: if index.name.ends_with("_pkey") {
-                "p"
-            } else {
-                "u"
-            },
+            kind: unique_index_constraint_kind(ctx, index),
             table_oid: table.oid,
             index_oid: Some(index.oid),
             table_schema: table.schema_name.clone(),
@@ -1616,6 +1667,37 @@ fn virtual_constraints(ctx: &LowerCtx<'_>) -> Vec<VirtualConstraint> {
             ))
     });
     out
+}
+
+fn unique_index_constraint_kind(
+    ctx: &LowerCtx<'_>,
+    index: &ultrasql_catalog::IndexEntry,
+) -> &'static str {
+    ctx.catalog_snapshot
+        .constraints
+        .values()
+        .find(|row| row.conrelid == index.table_oid && row.conname == index.name)
+        .map_or_else(
+            || {
+                if index.name.ends_with("_pkey") {
+                    "p"
+                } else {
+                    "u"
+                }
+            },
+            constraint_kind,
+        )
+}
+
+fn constraint_kind(row: &ultrasql_catalog::persistent::ConstraintRow) -> &'static str {
+    match row.contype {
+        ultrasql_catalog::persistent::ConType::Check => "c",
+        ultrasql_catalog::persistent::ConType::ForeignKey => "f",
+        ultrasql_catalog::persistent::ConType::PrimaryKey => "p",
+        ultrasql_catalog::persistent::ConType::Unique => "u",
+        ultrasql_catalog::persistent::ConType::Trigger => "t",
+        ultrasql_catalog::persistent::ConType::Exclusion => "x",
+    }
 }
 
 fn attnums_text(columns: &[usize]) -> Value {

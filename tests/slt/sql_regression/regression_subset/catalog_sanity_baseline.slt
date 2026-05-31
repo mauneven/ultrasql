@@ -1,0 +1,78 @@
+# PostgreSQL regression-derived catalog sanity baseline shard.
+# Source: PostgreSQL src/test/regress/sql/type_sanity.sql and
+# opr_sanity.sql at commit ddd12d1a5c4d980c5f31dc7d096012547b724e55.
+# License/provenance live beside this file in IMPORT_MANIFEST.txt and
+# LICENSE.upstream.
+
+statement ok
+CREATE TABLE slt_pg_catalog_sanity (
+  id INT NOT NULL,
+  label TEXT,
+  amount NUMERIC(8,2),
+  CONSTRAINT slt_pg_catalog_sanity_pk PRIMARY KEY (id),
+  CONSTRAINT slt_pg_catalog_sanity_amount_check CHECK (amount >= 0)
+)
+
+query TTT nosort
+SELECT c.relname, c.relkind, n.nspname
+FROM pg_catalog.pg_class c
+JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+WHERE c.relname = 'slt_pg_catalog_sanity'
+----
+slt_pg_catalog_sanity
+r
+public
+
+query TTB nosort
+SELECT a.attname, pg_catalog.format_type(a.atttypid, a.atttypmod), a.attnotnull
+FROM pg_catalog.pg_attribute a
+WHERE a.attrelid = 'slt_pg_catalog_sanity'::regclass
+  AND a.attnum > 0
+  AND NOT a.attisdropped
+ORDER BY a.attnum
+----
+id
+integer
+true
+label
+text
+false
+amount
+numeric(8,2)
+false
+
+query TT nosort
+SELECT conname, contype
+FROM pg_catalog.pg_constraint
+WHERE conrelid = 'slt_pg_catalog_sanity'::regclass
+ORDER BY contype, conname
+----
+slt_pg_catalog_sanity_amount_check
+c
+slt_pg_catalog_sanity_pk
+p
+
+query TB rowsort
+SELECT typname, pg_catalog.pg_table_is_visible(c.oid)
+FROM pg_catalog.pg_type t
+JOIN pg_catalog.pg_class c ON c.reltype = t.oid
+WHERE c.relname = 'slt_pg_catalog_sanity'
+----
+slt_pg_catalog_sanity
+true
+
+query TT nosort
+SELECT typname, typtype
+FROM pg_catalog.pg_type
+WHERE typname IN ('int4', 'numeric', 'text')
+ORDER BY typname
+----
+int4
+b
+numeric
+b
+text
+b
+
+statement ok
+DROP TABLE slt_pg_catalog_sanity

@@ -463,6 +463,7 @@ mod tests {
             composite_types_by_oid: HashMap::new(),
             domain_types: HashMap::new(),
             domain_types_by_oid: HashMap::new(),
+            constraints: HashMap::new(),
             descriptions: HashMap::new(),
             statistics: HashMap::new(),
             statistic_ext: HashMap::new(),

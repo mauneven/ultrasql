@@ -1477,6 +1477,15 @@ as a concise evidence ledger; roadmap stays for open gates only.
   `char.sql`, `varchar.sql`, `numeric.sql`, and `type_sanity.sql`.
 - Public parser/type baseline now keeps `SELECT 'int4'::regtype::text`
   active and returns canonical `integer` text instead of leaking raw OID `23`.
+- Public catalog-sanity baseline imports a small PostgreSQL-derived shard from
+  `type_sanity.sql` / `opr_sanity.sql` covering `pg_class`, `pg_attribute`,
+  `pg_constraint`, `pg_type`, `pg_table_is_visible`, `format_type`, primary
+  key metadata, and CHECK metadata. This also fixed virtual catalog snapshots
+  to carry committed `pg_constraint` rows, explicit named primary keys to
+  expose `contype = 'p'`, table row types through `pg_class.reltype` /
+  `pg_type`, and numeric/char typmod rendering through `format_type`.
+  Evidence:
+  `cargo run -p ultrasql-sqllogictest-runner -- --mode in-process tests/slt/sql_regression/regression_subset/catalog_sanity_baseline.slt`.
 - Transaction isolation baseline covers `acid.sql`, Hermitage G1a/PMP/G2, and
   manager-level Hermitage matrix.
 - Index regression baseline covers `CREATE INDEX`, `CREATE UNIQUE INDEX`,

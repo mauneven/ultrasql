@@ -585,6 +585,75 @@ fn sql_regression_type_coercion_baseline_is_imported_and_provenanced() {
 }
 
 #[test]
+fn sql_regression_catalog_sanity_baseline_is_imported_and_provenanced() {
+    let bin = env!("CARGO_BIN_EXE_ultrasql-sqllogictest-runner");
+    let subset = repo_root().join("tests/slt/sql_regression/regression_subset");
+    let manifest =
+        fs::read_to_string(subset.join("IMPORT_MANIFEST.txt")).expect("read PostgreSQL manifest");
+    let readme = fs::read_to_string(subset.join("README.md")).expect("read PostgreSQL README");
+    let shard = subset.join("catalog_sanity_baseline.slt");
+    let text = fs::read_to_string(&shard).expect("read catalog sanity shard");
+
+    for source in [
+        "derived_from=src/test/regress/sql/type_sanity.sql",
+        "derived_from=src/test/regress/sql/opr_sanity.sql",
+    ] {
+        assert!(manifest.contains(source), "manifest:\n{manifest}");
+    }
+    assert!(
+        manifest.contains("file=catalog_sanity_baseline.slt"),
+        "manifest:\n{manifest}"
+    );
+    assert!(
+        readme.contains("catalog_sanity_baseline.slt"),
+        "README:\n{readme}"
+    );
+    assert!(
+        text.contains("PostgreSQL regression-derived catalog sanity baseline"),
+        "{} must document reviewed scope",
+        shard.display()
+    );
+    for surface in [
+        "pg_catalog.pg_class",
+        "pg_catalog.pg_attribute",
+        "pg_catalog.pg_constraint",
+        "pg_catalog.pg_type",
+        "pg_catalog.pg_table_is_visible",
+        "format_type",
+        "PRIMARY KEY",
+        "CHECK",
+    ] {
+        assert!(
+            text.contains(surface),
+            "{} missing {surface}",
+            shard.display()
+        );
+    }
+    let case_count = count_slt_cases(&text);
+    assert!(
+        (5..=20).contains(&case_count),
+        "{} must stay as a small reviewed shard, got {case_count} cases",
+        shard.display()
+    );
+
+    let output = Command::new(bin)
+        .arg("--mode")
+        .arg("in-process")
+        .arg(&shard)
+        .output()
+        .expect("run catalog sanity SQLLogicTest shard");
+    assert!(
+        output.status.success(),
+        "runner failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("passed=7"), "stdout:\n{stdout}");
+    assert!(stdout.contains("failed=0"), "stdout:\n{stdout}");
+}
+
+#[test]
 fn skip_directive_requires_explicit_reason() {
     let bin = env!("CARGO_BIN_EXE_ultrasql-sqllogictest-runner");
     let suite = temp_artifact_path("ultrasql-slt-empty-skip", "test");

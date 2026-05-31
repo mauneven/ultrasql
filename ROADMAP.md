@@ -32,8 +32,9 @@ file focused on what still blocks production.
   relation-level fallback, but is `not fully predicate-precise` SSI. Implement
   page/tuple/gap precision before broad serializable claims.
 - Full public regression breadth still open for broader upstream parser, type,
-  catalog-sanity, and isolation schedules. The curated regression subset is
-  active without local skip debt; evidence lives in `DONE.md`.
+  catalog-sanity beyond the active shard, and isolation schedules. The curated
+  regression subset is active without local skip debt; evidence lives in
+  `DONE.md`.
 
 ### Performance Certification
 
