@@ -3694,6 +3694,8 @@ fn collect_window_funcs<'a>(plan: &'a LogicalPlan, out: &mut Vec<&'a LogicalWind
         | LogicalPlan::CreateOperator { .. }
         | LogicalPlan::CreateIndex { .. }
         | LogicalPlan::DropIndex { .. }
+        | LogicalPlan::CreateSchema { .. }
+        | LogicalPlan::DropSchema { .. }
         | LogicalPlan::CreatePolicy { .. }
         | LogicalPlan::CreateRole { .. }
         | LogicalPlan::AlterRole { .. }

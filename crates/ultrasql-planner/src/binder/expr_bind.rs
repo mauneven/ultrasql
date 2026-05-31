@@ -2347,8 +2347,7 @@ fn infer_decimal_scale_from_text(text: &str) -> Option<i32> {
 fn decimal_from_numeric_value(value: &Value, target_scale: Option<i32>) -> Option<(i64, i32)> {
     let inferred_scale = infer_decimal_scale(value);
     let scale = match (target_scale, inferred_scale) {
-        (Some(target), Some(inferred)) => target.max(inferred),
-        (Some(target), None) => target,
+        (Some(target), _) => target,
         (None, Some(inferred)) => inferred,
         (None, None) => return None,
     };
@@ -2820,7 +2819,7 @@ pub(super) fn coerce_literal_to_type(expr: &mut ScalarExpr, target: &DataType) {
             *value = Value::Float32(narrow);
             *data_type = DataType::Float32;
         }
-        (DataType::Decimal { scale, .. }, Value::Text(text)) => {
+        (DataType::Decimal { precision, scale }, Value::Text(text)) => {
             if let Ok(Value::Decimal {
                 value: decimal_value,
                 scale: decimal_scale,
@@ -2830,17 +2829,23 @@ pub(super) fn coerce_literal_to_type(expr: &mut ScalarExpr, target: &DataType) {
                     value: decimal_value,
                     scale: decimal_scale,
                 };
-                *data_type = target.clone();
+                *data_type = DataType::Decimal {
+                    precision: *precision,
+                    scale: scale.or(Some(decimal_scale)),
+                };
             }
         }
-        (DataType::Decimal { scale, .. }, _) => {
+        (DataType::Decimal { precision, scale }, _) => {
             if let Some((decimal_value, decimal_scale)) = decimal_from_numeric_value(value, *scale)
             {
                 *value = Value::Decimal {
                     value: decimal_value,
                     scale: decimal_scale,
                 };
-                *data_type = target.clone();
+                *data_type = DataType::Decimal {
+                    precision: *precision,
+                    scale: scale.or(Some(decimal_scale)),
+                };
             }
         }
         (DataType::Money, _) => {
@@ -3780,7 +3785,7 @@ mod typed_literal_tests {
                 "tsvector",
                 "hello",
                 None,
-                DataType::Text { max_len: None },
+                DataType::TsVector,
                 Value::Text("hello".to_owned()),
             ),
             ("unknown_type", "x", None, DataType::Null, Value::Null),
@@ -4636,7 +4641,7 @@ mod typed_literal_tests {
     }
 
     #[test]
-    fn decimal_coercion_preserves_literal_fractional_precision() {
+    fn decimal_coercion_honors_target_scale() {
         let mut expr = ScalarExpr::Literal {
             value: Value::Float64(0.0001),
             data_type: DataType::Float64,
@@ -4651,12 +4656,12 @@ mod typed_literal_tests {
         let ScalarExpr::Literal { value, data_type } = expr else {
             panic!("expected literal");
         };
-        assert_eq!(value, Value::Decimal { value: 1, scale: 4 });
+        assert_eq!(value, Value::Decimal { value: 0, scale: 2 });
         assert_eq!(
             data_type,
             DataType::Decimal {
-                precision: None,
-                scale: Some(4)
+                precision: Some(15),
+                scale: Some(2)
             }
         );
     }
