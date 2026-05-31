@@ -211,6 +211,7 @@ where
         match object_kind {
             LogicalPrivilegeObjectKind::Table => self.ensure_table_privilege_owner(objects),
             LogicalPrivilegeObjectKind::Schema => self.ensure_schema_privilege_owner(objects),
+            LogicalPrivilegeObjectKind::Sequence => self.ensure_sequence_privilege_owner(objects),
             _ => Err(ServerError::InsufficientPrivilege(
                 "privilege management requires object ownership or superuser".to_owned(),
             )),
@@ -250,6 +251,24 @@ where
             if !owns_schema {
                 return Err(ServerError::InsufficientPrivilege(format!(
                     "permission denied to manage privileges on schema {schema}"
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    fn ensure_sequence_privilege_owner(&self, sequences: &[String]) -> Result<(), ServerError> {
+        let current_user = self.current_user.to_ascii_lowercase();
+        for sequence in sequences {
+            let sequence_key = sequence.to_ascii_lowercase();
+            let owns_sequence = self
+                .state
+                .sequence_owners
+                .get(&sequence_key)
+                .is_some_and(|owner| owner.eq_ignore_ascii_case(&current_user));
+            if !owns_sequence {
+                return Err(ServerError::InsufficientPrivilege(format!(
+                    "permission denied to manage privileges on sequence {sequence}"
                 )));
             }
         }

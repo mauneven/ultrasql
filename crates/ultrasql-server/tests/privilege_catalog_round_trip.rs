@@ -265,6 +265,96 @@ async fn schema_owner_can_grant_and_revoke_schema_create_privilege() {
 }
 
 #[tokio::test]
+async fn sequence_owner_can_grant_and_revoke_sequence_privileges() {
+    let running = start_sample_server("sequence_privilege_owner").await;
+    let client = &running.client;
+
+    client
+        .batch_execute(
+            "CREATE ROLE tester SUPERUSER LOGIN; \
+             CREATE ROLE seq_acl_owner LOGIN; \
+             CREATE ROLE seq_acl_reader LOGIN; \
+             CREATE ROLE seq_acl_intruder LOGIN",
+        )
+        .await
+        .expect("create sequence ACL roles");
+
+    let (owner, owner_conn) =
+        connect_as(running.bound, "seq_acl_owner", "seq_acl_owner_create").await;
+    owner
+        .batch_execute("CREATE SEQUENCE seq_acl_owned START WITH 10")
+        .await
+        .expect("owner creates sequence");
+    drop(owner);
+    owner_conn.await.expect("owner create connection joins");
+
+    let (intruder, intruder_conn) =
+        connect_as(running.bound, "seq_acl_intruder", "seq_acl_intruder").await;
+    assert_insufficient_privilege(
+        intruder
+            .batch_execute("GRANT USAGE ON SEQUENCE seq_acl_owned TO seq_acl_reader")
+            .await
+            .expect_err("non-owner cannot grant sequence privileges"),
+    );
+    drop(intruder);
+    intruder_conn.await.expect("intruder connection joins");
+
+    let (owner, owner_conn) =
+        connect_as(running.bound, "seq_acl_owner", "seq_acl_owner_grant").await;
+    owner
+        .batch_execute("GRANT USAGE ON SEQUENCE seq_acl_owned TO seq_acl_reader")
+        .await
+        .expect("sequence owner can grant USAGE");
+    drop(owner);
+    owner_conn.await.expect("owner grant connection joins");
+
+    let (reader, reader_conn) = connect_as(running.bound, "seq_acl_reader", "seq_acl_reader").await;
+    assert!(
+        reader
+            .query_one(
+                "SELECT has_sequence_privilege('seq_acl_reader', 'seq_acl_owned', 'USAGE')",
+                &[],
+            )
+            .await
+            .expect("query sequence privilege")
+            .get::<_, bool>(0)
+    );
+    drop(reader);
+    reader_conn.await.expect("reader connection joins");
+
+    let (owner, owner_conn) =
+        connect_as(running.bound, "seq_acl_owner", "seq_acl_owner_revoke").await;
+    owner
+        .batch_execute("REVOKE USAGE ON SEQUENCE seq_acl_owned FROM seq_acl_reader")
+        .await
+        .expect("sequence owner can revoke USAGE");
+    drop(owner);
+    owner_conn.await.expect("owner revoke connection joins");
+
+    let revoked = client
+        .query_one(
+            "SELECT has_sequence_privilege('seq_acl_reader', 'seq_acl_owned', 'USAGE')",
+            &[],
+        )
+        .await
+        .expect("query revoked sequence privilege")
+        .get::<_, bool>(0);
+    assert!(!revoked);
+
+    client
+        .batch_execute(
+            "DROP SEQUENCE seq_acl_owned; \
+             DROP ROLE seq_acl_owner; \
+             DROP ROLE seq_acl_reader; \
+             DROP ROLE seq_acl_intruder",
+        )
+        .await
+        .expect("cleanup sequence privilege owner test");
+
+    shutdown(running).await;
+}
+
+#[tokio::test]
 async fn non_superuser_cannot_alter_default_privileges_for_privileged_role() {
     let running = start_sample_server("privilege_catalog_test").await;
     let client = &running.client;

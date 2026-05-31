@@ -980,6 +980,10 @@ as a concise evidence ledger; roadmap stays for open gates only.
   requiring superuser, while non-owners remain blocked. Evidence:
   `cargo test -p ultrasql-server --test privilege_catalog_round_trip
   schema_owner_can_grant_and_revoke_schema_create_privilege -- --nocapture`.
+- Sequence owners can now `GRANT` and `REVOKE` sequence privileges without
+  requiring superuser, while non-owners remain blocked. Evidence:
+  `cargo test -p ultrasql-server --test privilege_catalog_round_trip
+  sequence_owner_can_grant_and_revoke_sequence_privileges -- --nocapture`.
 - `DROP ROLE` now rejects roles that still own live tables or still appear in
   object/default privilege grants, avoiding stale ownership and ACL references.
   Evidence: `cargo test -p ultrasql-server --test role_ddl_round_trip`.
