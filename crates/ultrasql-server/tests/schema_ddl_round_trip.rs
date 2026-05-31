@@ -321,6 +321,49 @@ async fn select_respects_schema_qualifier() {
     shutdown(running).await;
 }
 
+#[tokio::test]
+async fn dml_respects_schema_qualifier() {
+    let running = start_sample_server("schema_dml_qualifier_guard").await;
+
+    running
+        .client
+        .batch_execute(
+            "CREATE SCHEMA app; \
+             CREATE TABLE guarded_dml (id INT); \
+             INSERT INTO guarded_dml VALUES (1)",
+        )
+        .await
+        .expect("create public table and separate schema");
+
+    for sql in [
+        "INSERT INTO app.guarded_dml VALUES (2)",
+        "UPDATE app.guarded_dml SET id = 3",
+        "DELETE FROM app.guarded_dml",
+    ] {
+        running
+            .client
+            .batch_execute(sql)
+            .await
+            .expect_err("qualified DML must not resolve public table");
+    }
+
+    let row = running
+        .client
+        .query_one("SELECT id FROM guarded_dml", &[])
+        .await
+        .expect("public table survives wrong-qualified DML")
+        .get::<_, i32>(0);
+    assert_eq!(row, 1);
+
+    running
+        .client
+        .batch_execute("DROP TABLE guarded_dml; DROP SCHEMA app")
+        .await
+        .expect("cleanup DML qualifier guard");
+
+    shutdown(running).await;
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn qualified_sequence_schema_survives_restart() {
     let data_dir = tempfile::TempDir::new().expect("temp data dir");

@@ -925,6 +925,11 @@ as a concise evidence ledger; roadmap stays for open gates only.
   reading a same-name table in another namespace. Evidence:
   `cargo test -p ultrasql-server --test schema_ddl_round_trip
   select_respects_schema_qualifier -- --nocapture`.
+- Explicitly qualified `INSERT`, `UPDATE`, and `DELETE` targets now check the
+  catalog table's stored schema before binding DML, preventing wrong-qualified
+  writes from mutating a same-name table in another namespace. Evidence:
+  `cargo test -p ultrasql-server --test schema_ddl_round_trip
+  dml_respects_schema_qualifier -- --nocapture`.
 - Committed `pg_constraint` rows are now installed into the live catalog map
   before restart, so same-session `DROP INDEX` also rejects inline and
   `ALTER TABLE ADD UNIQUE` constraint indexes. Evidence:

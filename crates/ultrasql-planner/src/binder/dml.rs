@@ -5,8 +5,10 @@
 use ultrasql_core::{DataType, Field, Schema};
 use ultrasql_parser::ast::{
     Assignment, ConflictTarget as AstConflictTarget, DeleteStmt, Expr, InsertSource, InsertStmt,
-    OnConflict, UpdateStmt,
+    ObjectName, OnConflict, UpdateStmt,
 };
+
+use crate::catalog::TableMeta;
 
 use super::expr_bind::coerce_literal_to_type;
 use super::{
@@ -20,10 +22,7 @@ pub(super) fn bind_insert(
     scope: &mut ScopeStack,
 ) -> Result<LogicalPlan, PlanError> {
     // 1. Catalog lookup.
-    let table_name = object_name_simple(&s.table);
-    let meta = catalog
-        .lookup_table(&table_name)
-        .ok_or_else(|| PlanError::TableNotFound(table_name.clone()))?;
+    let (table_name, meta) = lookup_target_table(catalog, &s.table)?;
     let table_schema = &meta.schema;
 
     // 2. Resolve column list.
@@ -346,10 +345,7 @@ pub(super) fn bind_update(
         ));
     }
 
-    let table_name = object_name_simple(&s.table);
-    let meta = catalog
-        .lookup_table(&table_name)
-        .ok_or_else(|| PlanError::TableNotFound(table_name.clone()))?;
+    let (table_name, meta) = lookup_target_table(catalog, &s.table)?;
     let table_schema = &meta.schema;
 
     // Build Scan, then optionally wrap in Filter.
@@ -412,10 +408,7 @@ pub(super) fn bind_delete(
         ));
     }
 
-    let table_name = object_name_simple(&s.table);
-    let meta = catalog
-        .lookup_table(&table_name)
-        .ok_or_else(|| PlanError::TableNotFound(table_name.clone()))?;
+    let (table_name, meta) = lookup_target_table(catalog, &s.table)?;
     let table_schema = &meta.schema;
 
     // Build Scan, then optionally wrap in Filter.
@@ -449,4 +442,26 @@ pub(super) fn bind_delete(
         returning,
         schema: returning_schema,
     })
+}
+
+fn lookup_target_table(
+    catalog: &dyn Catalog,
+    object_name: &ObjectName,
+) -> Result<(String, TableMeta), PlanError> {
+    let table_name = object_name_simple(object_name);
+    let meta = catalog
+        .lookup_table(&table_name)
+        .ok_or_else(|| PlanError::TableNotFound(table_name.clone()))?;
+    if object_name.parts.len() >= 2 {
+        let namespace_index = object_name.parts.len() - 2;
+        let namespace = object_name.parts[namespace_index]
+            .value
+            .to_ascii_lowercase();
+        if !meta.schema_name.eq_ignore_ascii_case(&namespace) {
+            return Err(PlanError::TableNotFound(format!(
+                "{namespace}.{table_name}"
+            )));
+        }
+    }
+    Ok((table_name, meta))
 }
