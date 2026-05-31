@@ -944,6 +944,9 @@ as a concise evidence ledger; roadmap stays for open gates only.
 - `REVOKE role FROM role` now rejects unknown granted/member role references
   with SQLSTATE `42704` instead of silently succeeding. Evidence:
   `cargo test -p ultrasql-server --test role_ddl_round_trip`.
+- Privilege DDL now rejects unknown grantee/default-owner roles with SQLSTATE
+  `42704` instead of generic DDL failure. Evidence:
+  `cargo test -p ultrasql-server --test privilege_catalog_round_trip`.
 
 ## Security And Client Certification
 

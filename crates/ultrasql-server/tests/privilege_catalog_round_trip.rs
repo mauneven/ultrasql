@@ -212,6 +212,34 @@ async fn non_superuser_cannot_alter_default_privileges_for_privileged_role() {
     shutdown(running).await;
 }
 
+#[tokio::test]
+async fn privilege_ddl_rejects_unknown_roles_with_undefined_object() {
+    let running = start_sample_server("privilege_catalog_test").await;
+    let client = &running.client;
+
+    client
+        .batch_execute("CREATE TABLE missing_role_acl_target (id INT)")
+        .await
+        .expect("create grant target");
+
+    let missing_grantee = client
+        .batch_execute("GRANT SELECT ON TABLE missing_role_acl_target TO missing_acl_role")
+        .await
+        .expect_err("missing grantee must reject GRANT");
+    assert_eq!(missing_grantee.code().expect("SQLSTATE").code(), "42704");
+
+    let missing_owner = client
+        .batch_execute(
+            "ALTER DEFAULT PRIVILEGES FOR ROLE missing_acl_owner \
+             GRANT SELECT ON TABLES TO public",
+        )
+        .await
+        .expect_err("missing owner role must reject ALTER DEFAULT PRIVILEGES");
+    assert_eq!(missing_owner.code().expect("SQLSTATE").code(), "42704");
+
+    shutdown(running).await;
+}
+
 #[test]
 fn privilege_metadata_rejects_duplicate_grant_keys_on_rebuild() {
     let data_dir = tempfile::TempDir::new().expect("temp data dir");

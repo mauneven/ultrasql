@@ -156,7 +156,9 @@ where
                 continue;
             }
             if self.state.role_catalog.lookup_role(grantee).is_none() {
-                return Err(ServerError::ddl(format!("role '{grantee}' does not exist")));
+                return Err(ServerError::UndefinedObject(format!(
+                    "role '{grantee}' does not exist"
+                )));
             }
         }
         Ok(())
@@ -173,7 +175,9 @@ where
         };
         for owner in &owner_roles {
             if self.state.role_catalog.lookup_role(owner).is_none() {
-                return Err(ServerError::ddl(format!("role '{owner}' does not exist")));
+                return Err(ServerError::UndefinedObject(format!(
+                    "role '{owner}' does not exist"
+                )));
             }
             if !self.state.role_catalog.can_set_role(&self.auth_user, owner) {
                 return Err(ServerError::InsufficientPrivilege(format!(
