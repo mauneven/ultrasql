@@ -711,8 +711,11 @@ as a concise evidence ledger; roadmap stays for open gates only.
   `cargo test -p ultrasql-server --test timetz_round_trip timetz_and_temporal_display_round_trip -- --nocapture`.
 - `DateStyle` now accepts and round-trips PostgreSQL-style `ISO`, `SQL`,
   `Postgres`, `German` plus `MDY` / `DMY` / `YMD` session settings through
-  `SET`, `SHOW`, and `RESET`; non-ISO output formatting remains tracked in
+  `SET`, `SHOW`, and `RESET`; `DATE`, `TIMESTAMP`, and `TIMESTAMPTZ` text
+  output now honors `SQL`, `German`, and `Postgres` date styles for result
+  rows and COPY text/CSV paths. Locale variants remain tracked in
   `ROADMAP.md`. Evidence:
+  `cargo test -p ultrasql-server --test timetz_round_trip timetz_and_temporal_display_round_trip -- --nocapture`;
   `cargo test -p ultrasql-server --test system_functions_round_trip orm_startup_runtime_parameters_round_trip`.
 - `SHOW transaction isolation level` now reflects the active transaction
   isolation (`read committed`, `repeatable read`, or `serializable`) instead

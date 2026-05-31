@@ -14,6 +14,7 @@ use std::fmt;
 use std::hash::{Hash, Hasher};
 
 use chrono::{Days, LocalResult, NaiveDate, NaiveTime, Offset, TimeZone};
+use chrono_tz::OffsetName;
 
 use crate::bit_string::BitString;
 use crate::bpchar::{bpchar_semantic_text, coerce_bpchar_text};
@@ -31,6 +32,17 @@ const MICROS_PER_SECOND: i64 = 1_000_000;
 const TIMETZ_OFFSET_BITS: u32 = 18;
 const TIMETZ_OFFSET_BIAS_SECONDS: i32 = 86_400;
 const TIMETZ_OFFSET_MASK: i64 = (1_i64 << TIMETZ_OFFSET_BITS) - 1;
+
+/// Resolved display metadata for a `TIMESTAMP WITH TIME ZONE` instant.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TimestampTzDisplay {
+    /// Local timestamp micros after applying the display timezone offset.
+    pub local_micros: i64,
+    /// UTC offset in seconds at the displayed instant.
+    pub offset_seconds: i32,
+    /// Human timezone label for non-ISO styles when one is known.
+    pub zone_name: Option<String>,
+}
 
 /// Runtime representation for a PostgreSQL range value.
 ///
@@ -2377,6 +2389,13 @@ pub fn format_date_days(days_since_2000_01_01: i32) -> String {
     format_date(days_since_2000_01_01)
 }
 
+/// Return `(year, month, day)` for days since UltraSQL's date epoch.
+#[must_use]
+pub fn date_parts_from_days(days_since_2000_01_01: i32) -> Option<(i32, u32, u32)> {
+    let (year, month, day) = civil_from_days(days_since_2000_01_01);
+    Some((year, u32::try_from(month).ok()?, u32::try_from(day).ok()?))
+}
+
 /// Format `TIME` in PostgreSQL's default ISO style.
 #[must_use]
 pub fn format_time_micros(micros: i64) -> String {
@@ -2403,6 +2422,15 @@ pub fn format_timestamp_micros(micros: i64) -> String {
     format!("{} {}", format_date(days), format_time_micros(time))
 }
 
+/// Return `(year, month, day, time_micros)` for timestamp micros.
+#[must_use]
+pub fn timestamp_parts_from_micros(micros: i64) -> Option<(i32, u32, u32, i64)> {
+    let days = i32::try_from(micros.div_euclid(MICROS_PER_DAY)).ok()?;
+    let time = micros.rem_euclid(MICROS_PER_DAY);
+    let (year, month, day) = date_parts_from_days(days)?;
+    Some((year, month, day, time))
+}
+
 /// Format `TIMESTAMP WITH TIME ZONE` using UTC display.
 #[must_use]
 pub fn format_timestamptz_micros_utc(micros: i64) -> String {
@@ -2424,8 +2452,36 @@ pub fn format_timestamptz_micros_with_offset(micros: i64, offset_seconds: i32) -
 /// Format `TIMESTAMP WITH TIME ZONE` using a fixed-offset or IANA timezone.
 #[must_use]
 pub fn format_timestamptz_micros_in_timezone(micros: i64, timezone: &str) -> Option<String> {
-    let offset_seconds = resolve_timestamptz_display_offset(micros, timezone)?;
-    format_timestamptz_micros_with_offset(micros, offset_seconds)
+    let display = timestamptz_display_in_timezone(micros, timezone)?;
+    format_timestamptz_micros_with_offset(micros, display.offset_seconds)
+}
+
+/// Resolve timezone display metadata for a `TIMESTAMPTZ` instant.
+#[must_use]
+pub fn timestamptz_display_in_timezone(micros: i64, timezone: &str) -> Option<TimestampTzDisplay> {
+    let trimmed = timezone.trim();
+    if let Some(offset_seconds) = parse_timezone_offset(trimmed) {
+        return Some(TimestampTzDisplay {
+            local_micros: apply_timezone_offset(micros, offset_seconds)?,
+            offset_seconds,
+            zone_name: fixed_timezone_display_name(trimmed),
+        });
+    }
+    let timezone = trimmed.parse::<chrono_tz::Tz>().ok()?;
+    let utc = naive_datetime_from_timestamp_micros(micros)?;
+    let offset = timezone.offset_from_utc_datetime(&utc);
+    let offset_seconds = offset.fix().local_minus_utc();
+    Some(TimestampTzDisplay {
+        local_micros: apply_timezone_offset(micros, offset_seconds)?,
+        offset_seconds,
+        zone_name: offset.abbreviation().map(ToOwned::to_owned),
+    })
+}
+
+/// Format a UTC offset in PostgreSQL text form.
+#[must_use]
+pub fn format_timezone_offset_seconds(offset_seconds: i32) -> String {
+    format_timezone_offset(offset_seconds)
 }
 
 /// Format `TIME WITH TIME ZONE` in PostgreSQL ISO style.
@@ -2650,18 +2706,21 @@ fn parse_timezone_abbreviation(lower: &str) -> Option<i32> {
     Some(hours * 3_600)
 }
 
-fn resolve_timestamptz_display_offset(micros: i64, timezone: &str) -> Option<i32> {
-    if let Some(offset) = parse_timezone_offset(timezone.trim()) {
-        return Some(offset);
+fn apply_timezone_offset(micros: i64, offset_seconds: i32) -> Option<i64> {
+    micros.checked_add(i64::from(offset_seconds).checked_mul(MICROS_PER_SECOND)?)
+}
+
+fn fixed_timezone_display_name(token: &str) -> Option<String> {
+    let lower = token.to_ascii_lowercase();
+    if matches!(lower.as_str(), "z" | "zulu" | "utc") {
+        return Some("UTC".to_owned());
     }
-    let timezone = timezone.parse::<chrono_tz::Tz>().ok()?;
-    let utc = naive_datetime_from_timestamp_micros(micros)?;
-    Some(
-        timezone
-            .offset_from_utc_datetime(&utc)
-            .fix()
-            .local_minus_utc(),
-    )
+    if parse_timezone_abbreviation(&lower).is_some()
+        && !matches!(token.as_bytes().first(), Some(b'+' | b'-'))
+    {
+        return Some(token.to_ascii_uppercase());
+    }
+    None
 }
 
 fn naive_datetime_from_timestamp_micros(micros: i64) -> Option<chrono::NaiveDateTime> {

@@ -2053,7 +2053,7 @@ fn value_to_copy_cell_with_options(
     match (dtype, value) {
         (_, Value::Null) => None,
         (DataType::Date, Value::Int32(v) | Value::Date(v)) => {
-            Some(Value::Date(*v).to_string().into_bytes())
+            Some(text_options.format_date(*v).into_bytes())
         }
         (DataType::Decimal { scale, .. }, Value::Int64(v)) => Some(
             Value::Decimal {
@@ -2070,7 +2070,7 @@ fn value_to_copy_cell_with_options(
             Some(Value::Time(*v).to_string().into_bytes())
         }
         (DataType::Timestamp, Value::Int64(v) | Value::Timestamp(v)) => {
-            Some(Value::Timestamp(*v).to_string().into_bytes())
+            Some(text_options.format_timestamp(*v).into_bytes())
         }
         (DataType::TimestampTz, Value::Int64(v) | Value::TimestampTz(v)) => {
             Some(text_options.format_timestamptz(*v).into_bytes())

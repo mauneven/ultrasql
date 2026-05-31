@@ -180,6 +180,110 @@ async fn timetz_and_temporal_display_round_trip() {
         .batch_execute("RESET TimeZone")
         .await
         .expect("reset session timezone");
+
+    client
+        .batch_execute("SET TimeZone TO 'UTC'; SET DateStyle TO SQL, DMY")
+        .await
+        .expect("set SQL datestyle");
+    let sql_datestyle_rows = client
+        .simple_query(
+            "SELECT \
+                DATE '2000-01-02', \
+                TIMESTAMP '2000-01-02 03:04:05.006789', \
+                TIMESTAMP WITH TIME ZONE '2000-01-02 03:04:05+00'",
+        )
+        .await
+        .expect("select SQL datestyle values");
+    let sql_datestyle_values: Vec<Vec<String>> = sql_datestyle_rows
+        .into_iter()
+        .filter_map(|message| match message {
+            SimpleQueryMessage::Row(row) => Some(
+                (0..3)
+                    .map(|idx| row.get(idx).expect("column").to_owned())
+                    .collect(),
+            ),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        sql_datestyle_values,
+        vec![vec![
+            "02/01/2000".to_owned(),
+            "02/01/2000 03:04:05.006789".to_owned(),
+            "02/01/2000 03:04:05 UTC".to_owned(),
+        ]]
+    );
+
+    client
+        .batch_execute("SET DateStyle TO German, DMY")
+        .await
+        .expect("set German datestyle");
+    let german_datestyle_rows = client
+        .simple_query(
+            "SELECT \
+                DATE '2000-01-02', \
+                TIMESTAMP '2000-01-02 03:04:05.006789', \
+                TIMESTAMP WITH TIME ZONE '2000-01-02 03:04:05+00'",
+        )
+        .await
+        .expect("select German datestyle values");
+    let german_datestyle_values: Vec<Vec<String>> = german_datestyle_rows
+        .into_iter()
+        .filter_map(|message| match message {
+            SimpleQueryMessage::Row(row) => Some(
+                (0..3)
+                    .map(|idx| row.get(idx).expect("column").to_owned())
+                    .collect(),
+            ),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        german_datestyle_values,
+        vec![vec![
+            "02.01.2000".to_owned(),
+            "02.01.2000 03:04:05.006789".to_owned(),
+            "02.01.2000 03:04:05 UTC".to_owned(),
+        ]]
+    );
+
+    client
+        .batch_execute("SET DateStyle TO Postgres, DMY")
+        .await
+        .expect("set Postgres datestyle");
+    let postgres_datestyle_rows = client
+        .simple_query(
+            "SELECT \
+                DATE '2000-01-02', \
+                TIMESTAMP '2000-01-02 03:04:05.006789', \
+                TIMESTAMP WITH TIME ZONE '2000-01-02 03:04:05+00'",
+        )
+        .await
+        .expect("select Postgres datestyle values");
+    let postgres_datestyle_values: Vec<Vec<String>> = postgres_datestyle_rows
+        .into_iter()
+        .filter_map(|message| match message {
+            SimpleQueryMessage::Row(row) => Some(
+                (0..3)
+                    .map(|idx| row.get(idx).expect("column").to_owned())
+                    .collect(),
+            ),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        postgres_datestyle_values,
+        vec![vec![
+            "02-01-2000".to_owned(),
+            "Sun 02 Jan 03:04:05.006789 2000".to_owned(),
+            "Sun 02 Jan 03:04:05 2000 UTC".to_owned(),
+        ]]
+    );
+
+    client
+        .batch_execute("RESET DateStyle")
+        .await
+        .expect("reset datestyle");
     let named_timetz_rows = client
         .simple_query(
             "SELECT \

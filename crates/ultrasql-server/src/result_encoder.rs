@@ -20,11 +20,13 @@
 //! [`Batch`]: ultrasql_vec::Batch
 
 use bytes::BytesMut;
+use chrono::{Datelike, NaiveDate};
 use std::collections::HashMap;
 use ultrasql_core::{
-    DataType, Schema, Value, format_time_micros, format_timestamp_micros,
-    format_timestamptz_micros_in_timezone, format_timestamptz_micros_utc, format_timetz,
-    unpack_timetz,
+    DataType, Schema, Value, date_parts_from_days, format_date_days, format_time_micros,
+    format_timestamp_micros, format_timestamptz_micros_in_timezone, format_timestamptz_micros_utc,
+    format_timetz, format_timezone_offset_seconds, timestamp_parts_from_micros,
+    timestamptz_display_in_timezone, unpack_timetz,
 };
 use ultrasql_executor::Operator;
 use ultrasql_protocol::{BackendMessage, FieldDescription, encode_backend};
@@ -170,6 +172,7 @@ const FORMAT_TEXT: i16 = 0;
 #[derive(Clone, Debug, Default)]
 pub(crate) struct TextEncodingOptions {
     timezone: Option<String>,
+    datestyle: DateStyleOptions,
 }
 
 impl TextEncodingOptions {
@@ -181,14 +184,184 @@ impl TextEncodingOptions {
             .map(|value| value.trim())
             .filter(|value| !value.is_empty())
             .map(ToOwned::to_owned);
-        Self { timezone }
+        let datestyle = settings
+            .get("datestyle")
+            .map(String::as_str)
+            .map(DateStyleOptions::parse)
+            .unwrap_or_default();
+        Self {
+            timezone,
+            datestyle,
+        }
+    }
+
+    pub(crate) fn format_date(&self, days: i32) -> String {
+        self.datestyle.format_date(days)
+    }
+
+    pub(crate) fn format_timestamp(&self, micros: i64) -> String {
+        self.datestyle.format_timestamp(micros)
     }
 
     pub(crate) fn format_timestamptz(&self, micros: i64) -> String {
-        self.timezone
-            .as_deref()
-            .and_then(|timezone| format_timestamptz_micros_in_timezone(micros, timezone))
-            .unwrap_or_else(|| format_timestamptz_micros_utc(micros))
+        if self.datestyle.style == DateStyle::Iso {
+            return self
+                .timezone
+                .as_deref()
+                .and_then(|timezone| format_timestamptz_micros_in_timezone(micros, timezone))
+                .unwrap_or_else(|| format_timestamptz_micros_utc(micros));
+        }
+        let timezone = self.timezone.as_deref().unwrap_or("UTC");
+        let Some(display) = timestamptz_display_in_timezone(micros, timezone)
+            .or_else(|| timestamptz_display_in_timezone(micros, "UTC"))
+        else {
+            return format_timestamptz_micros_utc(micros);
+        };
+        let zone = display
+            .zone_name
+            .unwrap_or_else(|| format_timezone_offset_seconds(display.offset_seconds));
+        format!(
+            "{} {}",
+            self.datestyle.format_timestamp(display.local_micros),
+            zone
+        )
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DateStyle {
+    Iso,
+    Sql,
+    Postgres,
+    German,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DateOrder {
+    Mdy,
+    Dmy,
+    Ymd,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct DateStyleOptions {
+    style: DateStyle,
+    order: DateOrder,
+}
+
+impl Default for DateStyleOptions {
+    fn default() -> Self {
+        Self {
+            style: DateStyle::Iso,
+            order: DateOrder::Mdy,
+        }
+    }
+}
+
+impl DateStyleOptions {
+    fn parse(value: &str) -> Self {
+        let mut options = Self::default();
+        for part in value
+            .split(|ch: char| ch == ',' || ch.is_ascii_whitespace())
+            .filter(|part| !part.is_empty())
+        {
+            match part.to_ascii_lowercase().as_str() {
+                "iso" => options.style = DateStyle::Iso,
+                "sql" => options.style = DateStyle::Sql,
+                "postgres" => options.style = DateStyle::Postgres,
+                "german" => options.style = DateStyle::German,
+                "mdy" => options.order = DateOrder::Mdy,
+                "dmy" => options.order = DateOrder::Dmy,
+                "ymd" => options.order = DateOrder::Ymd,
+                _ => {}
+            }
+        }
+        if options.style == DateStyle::German {
+            options.order = DateOrder::Dmy;
+        }
+        options
+    }
+
+    fn format_date(&self, days: i32) -> String {
+        let Some((year, month, day)) = date_parts_from_days(days) else {
+            return format_date_days(days);
+        };
+        self.format_date_parts(year, month, day)
+    }
+
+    fn format_timestamp(&self, micros: i64) -> String {
+        let Some((year, month, day, time_micros)) = timestamp_parts_from_micros(micros) else {
+            return format_timestamp_micros(micros);
+        };
+        let time = format_time_micros(time_micros);
+        match self.style {
+            DateStyle::Iso | DateStyle::Sql | DateStyle::German => {
+                format!("{} {}", self.format_date_parts(year, month, day), time)
+            }
+            DateStyle::Postgres => {
+                let weekday = weekday_abbrev(year, month, day);
+                let month_name = month_abbrev(month);
+                if self.order == DateOrder::Dmy {
+                    format!("{weekday} {day:02} {month_name} {time} {year:04}")
+                } else {
+                    format!("{weekday} {month_name} {day:02} {time} {year:04}")
+                }
+            }
+        }
+    }
+
+    fn format_date_parts(&self, year: i32, month: u32, day: u32) -> String {
+        match self.style {
+            DateStyle::Iso => format!("{year:04}-{month:02}-{day:02}"),
+            DateStyle::German => format!("{day:02}.{month:02}.{year:04}"),
+            DateStyle::Sql => {
+                if self.order == DateOrder::Dmy {
+                    format!("{day:02}/{month:02}/{year:04}")
+                } else {
+                    format!("{month:02}/{day:02}/{year:04}")
+                }
+            }
+            DateStyle::Postgres => {
+                if self.order == DateOrder::Dmy {
+                    format!("{day:02}-{month:02}-{year:04}")
+                } else {
+                    format!("{month:02}-{day:02}-{year:04}")
+                }
+            }
+        }
+    }
+}
+
+fn weekday_abbrev(year: i32, month: u32, day: u32) -> &'static str {
+    let Some(date) = NaiveDate::from_ymd_opt(year, month, day) else {
+        return "";
+    };
+    match date.weekday() {
+        chrono::Weekday::Mon => "Mon",
+        chrono::Weekday::Tue => "Tue",
+        chrono::Weekday::Wed => "Wed",
+        chrono::Weekday::Thu => "Thu",
+        chrono::Weekday::Fri => "Fri",
+        chrono::Weekday::Sat => "Sat",
+        chrono::Weekday::Sun => "Sun",
+    }
+}
+
+const fn month_abbrev(month: u32) -> &'static str {
+    match month {
+        1 => "Jan",
+        2 => "Feb",
+        3 => "Mar",
+        4 => "Apr",
+        5 => "May",
+        6 => "Jun",
+        7 => "Jul",
+        8 => "Aug",
+        9 => "Sep",
+        10 => "Oct",
+        11 => "Nov",
+        12 => "Dec",
+        _ => "",
     }
 }
 
@@ -684,7 +857,7 @@ pub(crate) fn encode_text_value_typed_with_options(
         }
     }
     match (logical_type, col) {
-        (DataType::Date, Column::Int32(c)) => Some(Value::Date(c.data()[row]).to_string().into()),
+        (DataType::Date, Column::Int32(c)) => Some(options.format_date(c.data()[row]).into()),
         (DataType::Decimal { scale, .. }, Column::Int64(c)) => Some(
             Value::Decimal {
                 value: c.data()[row],
@@ -701,7 +874,7 @@ pub(crate) fn encode_text_value_typed_with_options(
         }
         (DataType::Time, Column::Int64(c)) => Some(format_time_micros(c.data()[row]).into_bytes()),
         (DataType::Timestamp, Column::Int64(c)) => {
-            Some(format_timestamp_micros(c.data()[row]).into_bytes())
+            Some(options.format_timestamp(c.data()[row]).into_bytes())
         }
         (DataType::TimestampTz, Column::Int64(c)) => {
             Some(options.format_timestamptz(c.data()[row]).into_bytes())
