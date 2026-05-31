@@ -1605,6 +1605,12 @@ fn builtin_return_type(func_name: &str, args: &[ScalarExpr]) -> Result<DataType,
         }
         "array_append" | "array_remove" => array_mutation_return_type(func_name, args, 0),
         "array_prepend" => array_mutation_return_type(func_name, args, 1),
+        "array_replace" => array_replace_return_type(func_name, args),
+        "trim_array" => array_argument_return_type(func_name, args, 0, 2),
+        "array_positions" => {
+            validate_array_element_argument(func_name, args, 0, 1, 2)?;
+            Ok(DataType::Array(Box::new(DataType::Int32)))
+        }
         "l2_distance" | "cosine_distance" | "inner_product" | "dot_product" | "l1_distance" => {
             Ok(DataType::Float64)
         }
@@ -1615,14 +1621,63 @@ fn builtin_return_type(func_name: &str, args: &[ScalarExpr]) -> Result<DataType,
     }
 }
 
+fn array_argument_return_type(
+    func_name: &str,
+    args: &[ScalarExpr],
+    array_arg_idx: usize,
+    expected_args: usize,
+) -> Result<DataType, PlanError> {
+    if args.len() != expected_args {
+        return Err(PlanError::TypeMismatch(format!(
+            "{func_name}: expected {expected_args} arguments, got {}",
+            args.len()
+        )));
+    }
+    let array_type = args[array_arg_idx].data_type();
+    if matches!(array_type, DataType::Array(_)) {
+        Ok(array_type)
+    } else {
+        Err(PlanError::TypeMismatch(format!(
+            "{func_name}: array argument required, got {array_type:?}"
+        )))
+    }
+}
+
 fn array_mutation_return_type(
     func_name: &str,
     args: &[ScalarExpr],
     array_arg_idx: usize,
 ) -> Result<DataType, PlanError> {
-    if args.len() != 2 {
+    validate_array_element_argument(func_name, args, array_arg_idx, 1 - array_arg_idx, 2)
+}
+
+fn array_replace_return_type(func_name: &str, args: &[ScalarExpr]) -> Result<DataType, PlanError> {
+    let array_type = validate_array_element_argument(func_name, args, 0, 1, 3)?;
+    let DataType::Array(element_type) = &array_type else {
+        return Ok(array_type);
+    };
+    let replacement_type = args[2].data_type();
+    if matches!(replacement_type, DataType::Null) || replacement_type == *element_type.as_ref() {
+        Ok(array_type)
+    } else {
+        Err(PlanError::TypeMismatch(format!(
+            "{func_name}: replacement type mismatch, expected {:?}, got {:?}",
+            element_type.as_ref(),
+            replacement_type
+        )))
+    }
+}
+
+fn validate_array_element_argument(
+    func_name: &str,
+    args: &[ScalarExpr],
+    array_arg_idx: usize,
+    value_arg_idx: usize,
+    expected_args: usize,
+) -> Result<DataType, PlanError> {
+    if args.len() != expected_args {
         return Err(PlanError::TypeMismatch(format!(
-            "{func_name}: expected 2 arguments, got {}",
+            "{func_name}: expected {expected_args} arguments, got {}",
             args.len()
         )));
     }
@@ -1632,7 +1687,7 @@ fn array_mutation_return_type(
             "{func_name}: array argument required, got {array_type:?}"
         )));
     };
-    let value_type = args[1 - array_arg_idx].data_type();
+    let value_type = args[value_arg_idx].data_type();
     if matches!(value_type, DataType::Null) || value_type == *element_type.as_ref() {
         Ok(array_type)
     } else {
@@ -1786,6 +1841,9 @@ pub(super) fn is_supported_builtin(func_name: &str) -> bool {
             | "array_append"
             | "array_prepend"
             | "array_remove"
+            | "array_replace"
+            | "array_positions"
+            | "trim_array"
             | "min"
             | "max"
             | "l2_distance"

@@ -1549,6 +1549,31 @@ fn binds_array_metadata_functions_return_scalar_types() {
 }
 
 #[test]
+fn binds_array_replace_positions_trim_return_array_types() {
+    let cat = InMemoryCatalog::new();
+    let plan = parse_and_bind(
+        "SELECT array_replace([1, 2, 1], 1, 9), \
+                array_positions([1, 2, 1], 1), \
+                trim_array([1, 2, 3], 1)",
+        &cat,
+    )
+    .expect("bind ok");
+    let schema = plan.schema();
+    assert_eq!(
+        schema.field_at(0).data_type,
+        DataType::Array(Box::new(DataType::Int32))
+    );
+    assert_eq!(
+        schema.field_at(1).data_type,
+        DataType::Array(Box::new(DataType::Int32))
+    );
+    assert_eq!(
+        schema.field_at(2).data_type,
+        DataType::Array(Box::new(DataType::Int32))
+    );
+}
+
+#[test]
 fn rejects_ragged_multidimensional_array_literal() {
     let cat = InMemoryCatalog::new();
     let err = parse_and_bind("SELECT [[1, 2], [3]]", &cat).unwrap_err();

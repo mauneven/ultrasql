@@ -151,6 +151,26 @@ async fn multidimensional_arrays_store_dimensions_and_wire_oid() {
         ]]
     );
 
+    let searched = simple_rows(
+        client
+            .simple_query(
+                "SELECT \
+                    array_replace(ARRAY[1,2,1], 1, 9), \
+                    array_positions(ARRAY[1,2,1], 1), \
+                    trim_array(ARRAY[1,2,3], 1)",
+            )
+            .await
+            .expect("array replace positions trim"),
+    );
+    assert_eq!(
+        searched,
+        vec![vec![
+            Some("{9,2,9}".to_owned()),
+            Some("{1,3}".to_owned()),
+            Some("{1,2}".to_owned()),
+        ]]
+    );
+
     let stmt = client
         .prepare("SELECT matrix FROM array_probe WHERE id = 1")
         .await

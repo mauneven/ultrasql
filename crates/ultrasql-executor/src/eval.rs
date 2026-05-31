@@ -398,6 +398,9 @@ fn eval_function_call(
         "array_append" => eval_array_append(args),
         "array_prepend" => eval_array_prepend(args),
         "array_remove" => eval_array_remove(args),
+        "array_replace" => eval_array_replace(args),
+        "array_positions" => eval_array_positions(args),
+        "trim_array" => eval_trim_array(args),
         "__ultrasql_array_subscript" => eval_array_subscript(args),
         "__ultrasql_array_slice" => eval_array_slice(args),
         "__ultrasql_eq_any_array" => eval_eq_any_array(args),
@@ -1605,13 +1608,7 @@ fn append_array_element(
             )))
         };
     };
-    if !matches!(element, Value::Null) && element.data_type() != *element_type {
-        return Err(EvalError::Type(format!(
-            "{function_name}: element type mismatch, expected {:?}, got {:?}",
-            element_type,
-            element.data_type()
-        )));
-    }
+    validate_array_element_value(function_name, element_type, element)?;
     let mut output = Vec::with_capacity(elements.len() + 1);
     if prepend {
         output.push(element.clone());
@@ -1648,22 +1645,10 @@ fn eval_array_remove(args: &[Value]) -> Result<Value, EvalError> {
         };
     };
     let needle = &args[1];
-    if !matches!(needle, Value::Null) && needle.data_type() != *element_type {
-        return Err(EvalError::Type(format!(
-            "array_remove: element type mismatch, expected {:?}, got {:?}",
-            element_type,
-            needle.data_type()
-        )));
-    }
+    validate_array_element_value("array_remove", element_type, needle)?;
     let mut output = Vec::with_capacity(elements.len());
     for element in elements {
-        let should_remove = if matches!(needle, Value::Null) {
-            matches!(element, Value::Null)
-        } else if matches!(element, Value::Null) {
-            false
-        } else {
-            compare_values(element, needle)? == std::cmp::Ordering::Equal
-        };
+        let should_remove = array_element_matches(element, needle)?;
         if !should_remove {
             output.push(element.clone());
         }
@@ -1672,6 +1657,153 @@ fn eval_array_remove(args: &[Value]) -> Result<Value, EvalError> {
         element_type: element_type.clone(),
         elements: output,
     })
+}
+
+fn eval_array_replace(args: &[Value]) -> Result<Value, EvalError> {
+    if args.len() != 3 {
+        return Err(EvalError::Type(format!(
+            "array_replace: expected 3 args, got {}",
+            args.len()
+        )));
+    }
+    let Value::Array {
+        element_type,
+        elements,
+    } = &args[0]
+    else {
+        return if matches!(args[0], Value::Null) {
+            Ok(Value::Null)
+        } else {
+            Err(EvalError::Type(format!(
+                "array_replace: array argument required, got {:?}",
+                args[0].data_type()
+            )))
+        };
+    };
+    let from = &args[1];
+    let to = &args[2];
+    validate_array_element_value("array_replace", element_type, from)?;
+    validate_array_element_value("array_replace", element_type, to)?;
+    let mut output = Vec::with_capacity(elements.len());
+    for element in elements {
+        if array_element_matches(element, from)? {
+            output.push(to.clone());
+        } else {
+            output.push(element.clone());
+        }
+    }
+    Ok(Value::Array {
+        element_type: element_type.clone(),
+        elements: output,
+    })
+}
+
+fn eval_array_positions(args: &[Value]) -> Result<Value, EvalError> {
+    if args.len() != 2 {
+        return Err(EvalError::Type(format!(
+            "array_positions: expected 2 args, got {}",
+            args.len()
+        )));
+    }
+    let Value::Array {
+        element_type,
+        elements,
+    } = &args[0]
+    else {
+        return if matches!(args[0], Value::Null) {
+            Ok(Value::Null)
+        } else {
+            Err(EvalError::Type(format!(
+                "array_positions: array argument required, got {:?}",
+                args[0].data_type()
+            )))
+        };
+    };
+    let needle = &args[1];
+    validate_array_element_value("array_positions", element_type, needle)?;
+    let mut positions = Vec::new();
+    for (idx, element) in elements.iter().enumerate() {
+        if array_element_matches(element, needle)? {
+            let position = i32::try_from(idx + 1)
+                .map_err(|_| EvalError::Type("array_positions overflow".to_owned()))?;
+            positions.push(Value::Int32(position));
+        }
+    }
+    Ok(Value::Array {
+        element_type: DataType::Int32,
+        elements: positions,
+    })
+}
+
+fn eval_trim_array(args: &[Value]) -> Result<Value, EvalError> {
+    if args.len() != 2 {
+        return Err(EvalError::Type(format!(
+            "trim_array: expected 2 args, got {}",
+            args.len()
+        )));
+    }
+    let Value::Array {
+        element_type,
+        elements,
+    } = &args[0]
+    else {
+        return if matches!(args[0], Value::Null) {
+            Ok(Value::Null)
+        } else {
+            Err(EvalError::Type(format!(
+                "trim_array: array argument required, got {:?}",
+                args[0].data_type()
+            )))
+        };
+    };
+    let Some(trim_count) = args[1].as_i64() else {
+        return if matches!(args[1], Value::Null) {
+            Ok(Value::Null)
+        } else {
+            Err(EvalError::Type(format!(
+                "trim_array: integer trim count required, got {:?}",
+                args[1].data_type()
+            )))
+        };
+    };
+    if trim_count < 0 {
+        return Err(EvalError::Type(
+            "trim_array: trim count must be non-negative".to_owned(),
+        ));
+    }
+    let trim_count = usize::try_from(trim_count)
+        .map_err(|_| EvalError::Type("trim_array trim count overflow".to_owned()))?;
+    let keep = elements.len().saturating_sub(trim_count);
+    Ok(Value::Array {
+        element_type: element_type.clone(),
+        elements: elements[..keep].to_vec(),
+    })
+}
+
+fn validate_array_element_value(
+    function_name: &str,
+    element_type: &DataType,
+    value: &Value,
+) -> Result<(), EvalError> {
+    if matches!(value, Value::Null) || value.data_type() == *element_type {
+        Ok(())
+    } else {
+        Err(EvalError::Type(format!(
+            "{function_name}: element type mismatch, expected {:?}, got {:?}",
+            element_type,
+            value.data_type()
+        )))
+    }
+}
+
+fn array_element_matches(element: &Value, needle: &Value) -> Result<bool, EvalError> {
+    if matches!(needle, Value::Null) {
+        Ok(matches!(element, Value::Null))
+    } else if matches!(element, Value::Null) {
+        Ok(false)
+    } else {
+        Ok(compare_values(element, needle)? == std::cmp::Ordering::Equal)
+    }
 }
 
 fn format_size_pretty(bytes: i64) -> String {
@@ -7547,6 +7679,38 @@ mod tests {
         assert_eq!(
             eval_fn("array_dims", vec![matrix]),
             Value::Text("[1:2][1:2]".into())
+        );
+
+        assert_eq!(
+            eval_fn(
+                "array_replace",
+                vec![
+                    text_array_value(&["red", "green", "red"]),
+                    Value::Text("red".into()),
+                    Value::Text("blue".into())
+                ]
+            ),
+            text_array_value(&["blue", "green", "blue"])
+        );
+        assert_eq!(
+            eval_fn(
+                "array_positions",
+                vec![
+                    text_array_value(&["red", "green", "red"]),
+                    Value::Text("red".into())
+                ]
+            ),
+            Value::Array {
+                element_type: DataType::Int32,
+                elements: vec![Value::Int32(1), Value::Int32(3)]
+            }
+        );
+        assert_eq!(
+            eval_fn(
+                "trim_array",
+                vec![text_array_value(&["red", "green", "blue"]), Value::Int32(1)]
+            ),
+            text_array_value(&["red", "green"])
         );
     }
 
