@@ -1940,6 +1940,11 @@ as a concise evidence ledger; roadmap stays for open gates only.
   `cargo test -p ultrasql-server pipeline::scan::tests --lib -- --nocapture`
   and
   `cargo test -p ultrasql-server --test function_scan_round_trip generate_series -- --nocapture`.
+- Extended-query `LIMIT`/`OFFSET` parameter rewriting now rejects parameter
+  indexes that overflow `u32` instead of saturating them to `$4294967295`.
+  Evidence:
+  `cargo test -p ultrasql-server extended::handlers --lib -- --nocapture` and
+  `cargo test -p ultrasql-server --test extended_query_round_trip prepared_limit_offset_parameters_round_trip -- --nocapture`.
 - Vectorized terminal `SumSink` now rejects `Int64` and sample-count overflow
   instead of wrapping benchmark/query sink totals. Evidence:
   `cargo test -p ultrasql-executor sum_sink_rejects_i64_overflow --lib -- --nocapture`.

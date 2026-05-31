@@ -188,8 +188,11 @@ where
                 let mut index = 0_u32;
                 while j < bytes.len() && bytes[j].is_ascii_digit() {
                     index = index
-                        .saturating_mul(10)
-                        .saturating_add(u32::from(bytes[j] - b'0'));
+                        .checked_mul(10)
+                        .and_then(|value| value.checked_add(u32::from(bytes[j] - b'0')))
+                        .ok_or(ServerError::Unsupported(
+                            "LIMIT/OFFSET parameter index overflow",
+                        ))?;
                     j += 1;
                 }
                 if j > i + 1 && index > 0 {
@@ -485,4 +488,21 @@ pub fn handle_close(
         }
     }
     BackendMessage::CloseComplete
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rewrite_limit_offset_parameters_rejects_index_overflow() {
+        let err =
+            rewrite_limit_offset_parameters("SELECT 1 LIMIT $42949672960", |_| Ok("1".to_owned()))
+                .expect_err("parameter indexes beyond u32 must not saturate");
+
+        assert!(
+            matches!(err, ServerError::Unsupported(message) if message.contains("index overflow")),
+            "unexpected error: {err:?}"
+        );
+    }
 }
