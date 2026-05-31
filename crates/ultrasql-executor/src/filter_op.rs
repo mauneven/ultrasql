@@ -27,7 +27,9 @@
 //! workloads land on the fast path.
 
 use num_traits::ToPrimitive;
-use ultrasql_core::{DataType, GeometryValue, Oid, RangeValue, Schema, Value, unpack_timetz};
+use ultrasql_core::{
+    DataType, GeometryValue, Oid, RangeValue, Schema, Value, parse_decimal_text, unpack_timetz,
+};
 use ultrasql_planner::{BinaryOp, ScalarExpr};
 use ultrasql_vec::bitmap::Bitmap;
 use ultrasql_vec::column::{BoolColumn, Column, NumericColumn, StringColumn};
@@ -1098,6 +1100,30 @@ pub fn batch_to_rows(batch: &Batch, schema: &Schema) -> Result<Vec<Vec<Value>>, 
                             scale: s,
                         });
                     }
+                }
+            }
+            (
+                Column::Utf8(_) | Column::DictionaryUtf8(_),
+                DataType::Decimal { scale: None, .. },
+            ) => {
+                for (row_idx, row) in rows.iter_mut().enumerate() {
+                    if column_is_null(col, row_idx) {
+                        row.push(Value::Null);
+                        continue;
+                    }
+                    let text = col.text_value(row_idx).ok_or_else(|| {
+                        ExecError::TypeMismatch(format!(
+                            "column {col_idx} ({name}): missing dynamic numeric text at row {row_idx}",
+                            name = field.name,
+                        ))
+                    })?;
+                    let value = parse_decimal_text(text, None).map_err(|err| {
+                        ExecError::TypeMismatch(format!(
+                            "column {col_idx} ({name}): invalid dynamic numeric text {text:?}: {err}",
+                            name = field.name,
+                        ))
+                    })?;
+                    row.push(value);
                 }
             }
             (Column::Int64(c), DataType::Timestamp) => {

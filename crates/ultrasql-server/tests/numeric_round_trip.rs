@@ -109,6 +109,54 @@ async fn runtime_numeric_typmod_casts_round_and_check_precision() {
 }
 
 #[tokio::test]
+async fn bare_numeric_heap_preserves_scale_across_restart() {
+    let data_dir = tempfile::TempDir::new().expect("temp dir");
+    let running = start_persistent_server(data_dir.path(), "numeric_bare_scale").await;
+    let client = &running.client;
+
+    client
+        .batch_execute("CREATE TABLE bare_numeric_scale (id INT, amount NUMERIC)")
+        .await
+        .expect("create bare numeric scale table");
+    client
+        .batch_execute("INSERT INTO bare_numeric_scale VALUES (1, 12.340), (2, 0.166667)")
+        .await
+        .expect("insert bare numeric scale rows");
+
+    let before = select_bare_numeric_scale(client).await;
+    assert_eq!(
+        before,
+        vec![
+            vec!["1".to_owned(), "12.340".to_owned()],
+            vec!["2".to_owned(), "0.166667".to_owned()]
+        ]
+    );
+    shutdown(running).await;
+
+    let running = start_persistent_server(data_dir.path(), "numeric_bare_scale").await;
+    let after = select_bare_numeric_scale(&running.client).await;
+    assert_eq!(after, before);
+    shutdown(running).await;
+}
+
+async fn select_bare_numeric_scale(client: &tokio_postgres::Client) -> Vec<Vec<String>> {
+    client
+        .simple_query("SELECT id, amount FROM bare_numeric_scale ORDER BY id")
+        .await
+        .expect("select bare numeric scale")
+        .into_iter()
+        .filter_map(|message| match message {
+            tokio_postgres::SimpleQueryMessage::Row(row) => Some(
+                (0..row.len())
+                    .filter_map(|idx| row.get(idx).map(str::to_owned))
+                    .collect(),
+            ),
+            _ => None,
+        })
+        .collect()
+}
+
+#[tokio::test]
 async fn numeric_precision_overflow_reports_sqlstate() {
     let data_dir = tempfile::TempDir::new().expect("temp dir");
     let running = start_persistent_server(data_dir.path(), "numeric_round_trip").await;

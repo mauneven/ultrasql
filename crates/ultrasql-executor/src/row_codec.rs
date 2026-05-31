@@ -1661,6 +1661,27 @@ impl RowCodec {
                     data.push(i32::from_le_bytes(raw));
                     nulls.push_valid();
                 }
+                (
+                    DataType::Decimal { scale: None, .. },
+                    ColumnBuilder::Utf8 {
+                        offsets,
+                        values,
+                        nulls,
+                    },
+                ) => {
+                    let value =
+                        decode_numeric_value(bytes, &mut cursor, col_idx, &field.data_type)?;
+                    let text = value.to_string();
+                    values.extend_from_slice(text.as_bytes());
+                    let new_end = u32::try_from(values.len()).map_err(|_| {
+                        RowCodecError::UnsupportedType {
+                            column: col_idx,
+                            ty: field.data_type.clone(),
+                        }
+                    })?;
+                    offsets.push(new_end);
+                    nulls.push_valid();
+                }
                 (DataType::Decimal { .. }, ColumnBuilder::Int64 { data, nulls }) => {
                     let value =
                         decode_numeric_scaled_i64(bytes, &mut cursor, col_idx, &field.data_type)?;
@@ -2072,6 +2093,15 @@ impl ColumnBuilder {
                 // operators that care about date comparisons (range
                 // filters, sort) still see a `DataType::Date` field.
                 data: Vec::with_capacity(capacity),
+                nulls: NullTracker::default(),
+            },
+            DataType::Decimal { scale: None, .. } => Self::Utf8 {
+                offsets: {
+                    let mut o = Vec::with_capacity(capacity + 1);
+                    o.push(0);
+                    o
+                },
+                values: Vec::with_capacity(capacity.saturating_mul(16)),
                 nulls: NullTracker::default(),
             },
             DataType::Decimal { .. }
@@ -3525,6 +3555,23 @@ mod tests {
             Column::Int64(c) => assert_eq!(c.data()[0], 1_234_567_890_123),
             other => panic!("expected decimal Int64 builder output, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn decode_into_builders_preserves_bare_decimal_scale() {
+        let schema = schema_decimal(None);
+        let codec = RowCodec::new(schema.clone());
+        let encoded = codec
+            .encode(&[Value::Decimal {
+                value: 166_667,
+                scale: 6,
+            }])
+            .unwrap();
+        let mut builders = vec![ColumnBuilder::new(&schema.field_at(0).data_type, 1, 0).unwrap()];
+
+        codec.decode_into_builders(&encoded, &mut builders).unwrap();
+        let batch = RowCodec::finish_batch(builders).unwrap();
+        assert_eq!(batch.columns()[0].text_value(0), Some("0.166667"));
     }
 
     #[test]

@@ -1772,3 +1772,12 @@ as a concise evidence ledger; roadmap stays for open gates only.
   `cargo test -p ultrasql-executor build_batch_covers_sql_storage_families_and_null_bitmaps --lib -- --nocapture`,
   and
   `cargo test -p ultrasql-server --test numeric_round_trip -- --nocapture`.
+- Bare `NUMERIC` heap scans now preserve per-row display scale from the stored
+  PostgreSQL numeric payload. The row codec keeps dynamic numeric scan builders
+  text-backed, materializes them back to `Value::Decimal` for downstream DML,
+  and restart tests prove `12.340` / `0.166667` survive durable heap storage.
+  Evidence:
+  `cargo test -p ultrasql-executor row_codec::tests::decode_into_builders --lib -- --nocapture`,
+  `cargo test -p ultrasql-executor filter_op::tests::batch_to_rows --lib -- --nocapture`,
+  and
+  `cargo test -p ultrasql-server --test numeric_round_trip -- --nocapture`.

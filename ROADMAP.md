@@ -65,8 +65,8 @@ file focused on what still blocks production.
 
 ### Type Surface
 
-- `NUMERIC(p,s)` / `DECIMAL(p,s)`: arbitrary-precision runtime arithmetic and
-  bare-`NUMERIC` heap per-row scale storage remain open.
+- `NUMERIC(p,s)` / `DECIMAL(p,s)`: arbitrary-precision runtime arithmetic
+  remains open beyond the scaled-`i64` surface.
 - `MONEY`: locale-sensitive formatting/input beyond deterministic
   `lc_monetary` GUC round trips, explicit typmod/precision edge casts, and
   range-parity evidence remain open.
