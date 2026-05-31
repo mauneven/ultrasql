@@ -6598,6 +6598,14 @@ impl Server {
             Ok(true)
         })();
         self.workload_recorder.finish_analyze(pid);
+        if matches!(result, Ok(true)) {
+            if pid == 0 {
+                self.workload_recorder
+                    .record_table_autoanalyze(entry.oid.raw());
+            } else {
+                self.workload_recorder.record_table_analyze(entry.oid.raw());
+            }
+        }
         result
     }
 

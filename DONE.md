@@ -887,7 +887,8 @@ as a concise evidence ledger; roadmap stays for open gates only.
   `cargo test -p ultrasql-server --test catalog_views_round_trip pg_stat_activity_lists_open_sessions -- --nocapture`.
 - `pg_catalog.pg_stat_user_tables` now exposes table maintenance counters:
   `last_vacuum`, `last_autovacuum`, `vacuum_count`, `autovacuum_count`,
-  `analyze_count`, and `autoanalyze_count`, with manual `VACUUM` updating
+  `last_analyze`, `last_autoanalyze`, `analyze_count`, and
+  `autoanalyze_count`, with manual `VACUUM` and `ANALYZE` updating
   timestamp/count evidence. Evidence:
   `cargo test -p ultrasql-server --test catalog_views_round_trip pg_catalog_and_information_schema_reflect_runtime_objects -- --nocapture`.
 - `GUI introspection probes` exist for `pgAdmin`, `DBeaver`, and `DataGrip`.

@@ -2682,12 +2682,16 @@ fn rows_pg_stat_user_tables(ctx: &LowerCtx<'_>) -> Vec<Vec<Value>> {
                 maintenance
                     .last_autovacuum
                     .map_or(Value::Null, Value::TimestampTz),
-                Value::Null,
-                Value::Null,
+                maintenance
+                    .last_analyze
+                    .map_or(Value::Null, Value::TimestampTz),
+                maintenance
+                    .last_autoanalyze
+                    .map_or(Value::Null, Value::TimestampTz),
                 Value::Int64(u64_to_i64_saturating(maintenance.vacuum_count)),
                 Value::Int64(u64_to_i64_saturating(maintenance.autovacuum_count)),
-                Value::Int64(0),
-                Value::Int64(0),
+                Value::Int64(u64_to_i64_saturating(maintenance.analyze_count)),
+                Value::Int64(u64_to_i64_saturating(maintenance.autoanalyze_count)),
             ]
         })
         .collect()

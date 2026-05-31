@@ -133,10 +133,18 @@ pub struct TableMaintenanceStats {
     pub last_vacuum: Option<i64>,
     /// Last background autovacuum completion timestamp in engine microseconds.
     pub last_autovacuum: Option<i64>,
+    /// Last manual ANALYZE completion timestamp in engine microseconds.
+    pub last_analyze: Option<i64>,
+    /// Last background autoanalyze completion timestamp in engine microseconds.
+    pub last_autoanalyze: Option<i64>,
     /// Number of manual VACUUM completions.
     pub vacuum_count: u64,
     /// Number of background autovacuum completions.
     pub autovacuum_count: u64,
+    /// Number of manual ANALYZE completions.
+    pub analyze_count: u64,
+    /// Number of background autoanalyze completions.
+    pub autoanalyze_count: u64,
 }
 
 /// One active `pg_stat_progress_analyze` row.
@@ -456,6 +464,22 @@ impl WorkloadRecorder {
         let stats = table_maintenance.entry(relid).or_default();
         stats.last_autovacuum = Some(current_engine_timestamp_micros());
         stats.autovacuum_count = stats.autovacuum_count.saturating_add(1);
+    }
+
+    /// Record one completed manual ANALYZE for a relation.
+    pub fn record_table_analyze(&self, relid: u32) {
+        let mut table_maintenance = self.table_maintenance.lock();
+        let stats = table_maintenance.entry(relid).or_default();
+        stats.last_analyze = Some(current_engine_timestamp_micros());
+        stats.analyze_count = stats.analyze_count.saturating_add(1);
+    }
+
+    /// Record one completed background autoanalyze for a relation.
+    pub fn record_table_autoanalyze(&self, relid: u32) {
+        let mut table_maintenance = self.table_maintenance.lock();
+        let stats = table_maintenance.entry(relid).or_default();
+        stats.last_autoanalyze = Some(current_engine_timestamp_micros());
+        stats.autoanalyze_count = stats.autoanalyze_count.saturating_add(1);
     }
 
     /// Return maintenance stats for one relation.

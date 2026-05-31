@@ -414,6 +414,23 @@ async fn pg_catalog_and_information_schema_reflect_runtime_objects() {
     assert!(maintenance_stats[0].get::<_, bool>(0));
     assert_eq!(maintenance_stats[0].get::<_, i64>(1), 1);
     assert_eq!(maintenance_stats[0].get::<_, i64>(2), 0);
+    client
+        .batch_execute("ANALYZE stat_t")
+        .await
+        .expect("analyze stats table");
+    let analyze_stats = client
+        .query(
+            "SELECT last_analyze IS NOT NULL, analyze_count, autoanalyze_count \
+             FROM pg_catalog.pg_stat_user_tables \
+             WHERE relname = 'stat_t'",
+            &[],
+        )
+        .await
+        .expect("pg_stat_user_tables analyze counters after analyze");
+    assert_eq!(analyze_stats.len(), 1);
+    assert!(analyze_stats[0].get::<_, bool>(0));
+    assert_eq!(analyze_stats[0].get::<_, i64>(1), 1);
+    assert_eq!(analyze_stats[0].get::<_, i64>(2), 0);
     let table_io = client
         .query(
             "SELECT heap_blks_read, heap_blks_hit \
