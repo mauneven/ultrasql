@@ -6,6 +6,7 @@ use std::net::SocketAddr;
 
 use support::{shutdown, start_persistent_server, start_sample_server};
 use tokio_postgres::{NoTls, error::SqlState};
+use ultrasql_server::Server;
 
 #[tokio::test]
 async fn grant_revoke_privileges_update_catalog_checks() {
@@ -87,6 +88,48 @@ async fn grant_revoke_privileges_update_catalog_checks() {
     );
 
     shutdown(running).await;
+}
+
+#[test]
+fn privilege_metadata_rejects_duplicate_grant_keys_on_rebuild() {
+    let data_dir = tempfile::TempDir::new().expect("temp data dir");
+    std::fs::write(
+        data_dir.path().join("pg_privileges.meta"),
+        concat!(
+            "# ultrasql privilege runtime v1\n",
+            "grant\ttable\tdup_acl\tanalyst\tselect\t\tultrasql\tfalse\n",
+            "grant\ttable\tdup_acl\tanalyst\tselect\t\tultrasql\ttrue\n"
+        ),
+    )
+    .expect("write duplicate privilege metadata");
+
+    let err = Server::init(data_dir.path()).expect_err("duplicate privilege metadata rejected");
+    assert!(
+        err.to_string().contains("duplicate privilege metadata"),
+        "expected duplicate privilege metadata rejection, got {err}"
+    );
+}
+
+#[test]
+fn privilege_metadata_rejects_duplicate_default_grant_keys_on_rebuild() {
+    let data_dir = tempfile::TempDir::new().expect("temp data dir");
+    std::fs::write(
+        data_dir.path().join("pg_privileges.meta"),
+        concat!(
+            "# ultrasql privilege runtime v1\n",
+            "default\tultrasql\t\ttable\tpublic\tselect\tultrasql\tfalse\n",
+            "default\tultrasql\t\ttable\tpublic\tselect\tultrasql\ttrue\n"
+        ),
+    )
+    .expect("write duplicate default privilege metadata");
+
+    let err =
+        Server::init(data_dir.path()).expect_err("duplicate default privilege metadata rejected");
+    assert!(
+        err.to_string()
+            .contains("duplicate default privilege metadata"),
+        "expected duplicate default privilege metadata rejection, got {err}"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

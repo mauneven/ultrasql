@@ -1138,4 +1138,7 @@ as a concise evidence ledger; roadmap stays for open gates only.
   application on future tables, materialized views, and sequences snapshot ACLs
   to the data directory with rollback on metadata-write failure. Evidence:
   `privilege_catalog_survives_restart` and
-  `privilege_catalog_rolls_back_when_metadata_slot_is_unsafe`.
+  `privilege_catalog_rolls_back_when_metadata_slot_is_unsafe`. The privilege
+  metadata loader rejects duplicate grant and default-grant keys instead of
+  silently applying last-row-wins ACL state. Evidence:
+  `cargo test -p ultrasql-server --test privilege_catalog_round_trip privilege_metadata_rejects_duplicate -- --nocapture`.

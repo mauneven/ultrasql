@@ -5256,6 +5256,8 @@ impl Server {
 
         let mut grants = Vec::new();
         let mut default_grants = Vec::new();
+        let mut seen_grant_keys = std::collections::HashSet::new();
+        let mut seen_default_grant_keys = std::collections::HashSet::new();
         for (line_no, line) in text.lines().enumerate() {
             if line.is_empty() || line.starts_with('#') {
                 continue;
@@ -5264,7 +5266,7 @@ impl Server {
             match parts.first().copied() {
                 Some("grant") if parts.len() == 8 => {
                     let column_name = metadata_unescape(parts[5])?;
-                    grants.push(auth::PrivilegeGrant {
+                    let grant = auth::PrivilegeGrant {
                         object_kind: parse_privilege_object_kind(parts[1], line_no)?,
                         object_name: metadata_unescape(parts[2])?,
                         grantee: metadata_unescape(parts[3])?,
@@ -5272,11 +5274,28 @@ impl Server {
                         column_name: (!column_name.is_empty()).then_some(column_name),
                         grantor: metadata_unescape(parts[6])?,
                         grant_option: parse_role_bool(parts[7], line_no, "grant_option")?,
-                    });
+                    };
+                    let key = (
+                        grant.object_kind,
+                        grant.object_name.to_ascii_lowercase(),
+                        grant.grantee.to_ascii_lowercase(),
+                        grant.privilege,
+                        grant
+                            .column_name
+                            .as_ref()
+                            .map(|column| column.to_ascii_lowercase()),
+                    );
+                    if !seen_grant_keys.insert(key) {
+                        return Err(ServerError::ddl(format!(
+                            "duplicate privilege metadata grant on line {}",
+                            line_no + 1
+                        )));
+                    }
+                    grants.push(grant);
                 }
                 Some("default") if parts.len() == 8 => {
                     let schema_name = metadata_unescape(parts[2])?;
-                    default_grants.push(auth::DefaultPrivilegeGrant {
+                    let grant = auth::DefaultPrivilegeGrant {
                         owner_role: metadata_unescape(parts[1])?,
                         schema_name: (!schema_name.is_empty()).then_some(schema_name),
                         object_kind: parse_privilege_object_kind(parts[3], line_no)?,
@@ -5284,7 +5303,24 @@ impl Server {
                         privilege: parse_privilege_kind(parts[5], line_no)?,
                         grantor: metadata_unescape(parts[6])?,
                         grant_option: parse_role_bool(parts[7], line_no, "grant_option")?,
-                    });
+                    };
+                    let key = (
+                        grant.owner_role.to_ascii_lowercase(),
+                        grant
+                            .schema_name
+                            .as_ref()
+                            .map(|schema| schema.to_ascii_lowercase()),
+                        grant.object_kind,
+                        grant.grantee.to_ascii_lowercase(),
+                        grant.privilege,
+                    );
+                    if !seen_default_grant_keys.insert(key) {
+                        return Err(ServerError::ddl(format!(
+                            "duplicate default privilege metadata grant on line {}",
+                            line_no + 1
+                        )));
+                    }
+                    default_grants.push(grant);
                 }
                 _ => {
                     return Err(ServerError::ddl(format!(
