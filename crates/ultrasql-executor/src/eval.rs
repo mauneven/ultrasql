@@ -43,6 +43,7 @@ use crate::json_path::{parse_json_path, select_json_path_with_vars};
 const MICROS_PER_DAY: i64 = 86_400_000_000;
 const UNIX_TO_ENGINE_EPOCH_DAYS: i64 = 10_957;
 const UNIX_TO_ENGINE_EPOCH_MICROS: i64 = UNIX_TO_ENGINE_EPOCH_DAYS * MICROS_PER_DAY;
+const MAX_EVAL_GENERATED_TEXT_CHARS: usize = 16 * 1024 * 1024;
 static UUID_FALLBACK_COUNTER: AtomicU64 = AtomicU64::new(1);
 
 // ---------------------------------------------------------------------------
@@ -2673,7 +2674,7 @@ fn eval_pad(args: &[Value], side: PadSide) -> Result<Value, EvalError> {
     } else {
         " "
     };
-    let target = usize::try_from(target_len.max(0)).unwrap_or(usize::MAX);
+    let target = generated_text_target_len(func, target_len)?;
     let current = text.chars().count();
     if target <= current {
         return Ok(Value::Text(text.chars().take(target).collect()));
@@ -2745,6 +2746,38 @@ fn eval_right(args: &[Value]) -> Result<Value, EvalError> {
 
 fn i64_abs_to_usize(value: i64) -> usize {
     usize::try_from(value.unsigned_abs()).unwrap_or(usize::MAX)
+}
+
+fn generated_text_target_len(func: &str, len: i64) -> Result<usize, EvalError> {
+    if len <= 0 {
+        return Ok(0);
+    }
+    let len = usize::try_from(len)
+        .map_err(|_| EvalError::Type(format!("{func}: output length exceeds supported maximum")))?;
+    if len > MAX_EVAL_GENERATED_TEXT_CHARS {
+        return Err(EvalError::Type(format!(
+            "{func}: output length exceeds supported maximum"
+        )));
+    }
+    Ok(len)
+}
+
+fn generated_text_repeat_count(func: &str, text: &str, count: i64) -> Result<usize, EvalError> {
+    if count <= 0 {
+        return Ok(0);
+    }
+    let count = usize::try_from(count)
+        .map_err(|_| EvalError::Type(format!("{func}: output length exceeds supported maximum")))?;
+    let chars = text.chars().count();
+    let output_chars = chars.checked_mul(count).ok_or_else(|| {
+        EvalError::Type(format!("{func}: output length exceeds supported maximum"))
+    })?;
+    if output_chars > MAX_EVAL_GENERATED_TEXT_CHARS {
+        return Err(EvalError::Type(format!(
+            "{func}: output length exceeds supported maximum"
+        )));
+    }
+    Ok(count)
 }
 
 fn eval_position(args: &[Value]) -> Result<Value, EvalError> {
@@ -2854,7 +2887,10 @@ fn eval_repeat(args: &[Value]) -> Result<Value, EvalError> {
     let Some(count) = int_arg("repeat", args, 1)? else {
         return Ok(Value::Null);
     };
-    let count = usize::try_from(count.max(0)).unwrap_or(usize::MAX);
+    if text.is_empty() {
+        return Ok(Value::Text(String::new()));
+    }
+    let count = generated_text_repeat_count("repeat", text, count)?;
     Ok(Value::Text(text.repeat(count)))
 }
 
@@ -6410,7 +6446,10 @@ mod tests {
     };
     use ultrasql_planner::{BinaryOp, LogicalPlan, ScalarExpr, UnaryOp};
 
-    use super::{Eval, EvalError, eval_function_call};
+    use super::{
+        Eval, EvalError, MAX_EVAL_GENERATED_TEXT_CHARS, eval_function_call,
+        generated_text_target_len,
+    };
 
     // -----------------------------------------------------------------------
     // Helper builders
@@ -6596,6 +6635,16 @@ mod tests {
         eval_function_call(name, &args, &DataType::Null)
             .expect_err("function error")
             .to_string()
+    }
+
+    #[test]
+    fn generated_text_len_rejects_limit_overflow() {
+        let err = generated_text_target_len(
+            "repeat",
+            i64::try_from(MAX_EVAL_GENERATED_TEXT_CHARS).unwrap() + 1,
+        )
+        .unwrap_err();
+        assert!(matches!(err, EvalError::Type(message) if message.contains("output length")));
     }
 
     fn inet(text: &str) -> Value {
@@ -7852,6 +7901,15 @@ mod tests {
                 vec![Value::Text("ha".to_owned()), Value::Int32(3)]
             ),
             Value::Text("hahaha".to_owned())
+        );
+        let too_large = Value::Int64(i64::try_from(MAX_EVAL_GENERATED_TEXT_CHARS).unwrap() + 1);
+        assert!(
+            eval_fn_err("lpad", vec![Value::Text("x".to_owned()), too_large.clone()])
+                .contains("output length")
+        );
+        assert!(
+            eval_fn_err("repeat", vec![Value::Text("x".to_owned()), too_large])
+                .contains("output length")
         );
         assert_eq!(
             eval_fn("reverse", vec![Value::Text("abc".to_owned())]),

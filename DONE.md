@@ -2214,3 +2214,7 @@ as a concise evidence ledger; roadmap stays for open gates only.
 - SQL/JSON path unicode escape parsing now checks escape-window offsets
   instead of saturating parser cursor arithmetic. Evidence:
   `cargo test -p ultrasql-executor json_path::tests::checked_hex_escape_end_rejects_overflow --lib -- --nocapture`.
+- Generated text functions (`lpad`, `rpad`, `repeat`) now reject oversized
+  output lengths before allocation instead of clamping to `usize::MAX`.
+  Evidence:
+  `cargo test -p ultrasql-executor eval::tests::generated_text_len_rejects_limit_overflow --lib -- --nocapture`.
