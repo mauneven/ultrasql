@@ -1636,9 +1636,7 @@ impl<L: PageLoader + Send + Sync + std::fmt::Debug + 'static> ModifyTable<L> {
                 continue;
             };
             if let Some(evaluator) = default {
-                row[idx] = evaluator
-                    .eval(&[])
-                    .map_err(|e| ExecError::TypeMismatch(e.to_string()))?;
+                row[idx] = evaluator.eval(&[]).map_err(eval_error_to_exec_error)?;
             }
         }
         Ok(())

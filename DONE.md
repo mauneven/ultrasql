@@ -1821,6 +1821,9 @@ as a concise evidence ledger; roadmap stays for open gates only.
 - Runtime errors inside `UPDATE SET` assignment evaluation now preserve their
   typed SQLSTATEs and leave the original row visible. Evidence:
   `cargo test -p ultrasql-server --test constraint_round_trip update_assignment_runtime_cast_error_returns_22p02 -- --nocapture`.
+- Runtime errors inside omitted-column `DEFAULT` expression evaluation now
+  preserve their typed SQLSTATEs and do not insert the row. Evidence:
+  `cargo test -p ultrasql-server --test constraint_round_trip default_expression_runtime_error_returns_sqlstate -- --nocapture`.
 - Runtime scalar/temporal text casts to integer, float, boolean, date, time,
   timestamp, timestamptz, and timetz now report SQLSTATE `22P02` for invalid
   column text. Evidence:

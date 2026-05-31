@@ -256,6 +256,33 @@ async fn insert_omitted_column_uses_default_expression() {
     graceful_shutdown(running).await;
 }
 
+/// Runtime errors inside DEFAULT expressions keep their SQLSTATE.
+#[tokio::test]
+async fn default_expression_runtime_error_returns_sqlstate() {
+    let running = start_sample_server("constraint_default_cast_test").await;
+    let client = &running.client;
+
+    client
+        .batch_execute("CREATE TABLE t (id INT NOT NULL, v INT DEFAULT (1 / 0))")
+        .await
+        .expect("create");
+
+    let err = client
+        .batch_execute("INSERT INTO t (id) VALUES (1)")
+        .await
+        .expect_err("DEFAULT runtime expression rejects row");
+    let sqlstate = err.code().expect("server-sent SQLSTATE present");
+    assert_eq!(sqlstate.code(), "22012");
+
+    let rows = client
+        .query("SELECT id, v FROM t", &[])
+        .await
+        .expect("select after rejected DEFAULT");
+    assert!(rows.is_empty());
+
+    graceful_shutdown(running).await;
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn default_expression_survives_restart() {
     let data_dir = tempfile::TempDir::new().unwrap();
