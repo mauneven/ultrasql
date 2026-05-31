@@ -5555,6 +5555,7 @@ impl Server {
         let snapshot = self.catalog_snapshot();
         let mut rows: std::collections::HashMap<ultrasql_core::Oid, (String, TableRowSecurity)> =
             std::collections::HashMap::new();
+        let mut seen_table_oids = std::collections::HashSet::new();
         let mut seen_policy_keys = std::collections::HashSet::new();
         for (line_no, line) in text.lines().enumerate() {
             if line.is_empty() || line.starts_with('#') {
@@ -5570,6 +5571,12 @@ impl Server {
                             line_no + 1
                         ))
                     })?);
+                    if !seen_table_oids.insert(oid) {
+                        return Err(ServerError::Ddl(format!(
+                            "duplicate RLS table metadata on line {}",
+                            line_no + 1
+                        )));
+                    }
                     let enabled = parts[3].parse::<bool>().map_err(|err| {
                         ServerError::Ddl(format!(
                             "RLS metadata line {} bad enabled flag: {err}",

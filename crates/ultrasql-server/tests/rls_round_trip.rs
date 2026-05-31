@@ -473,6 +473,37 @@ async fn rls_metadata_rejects_duplicate_policy_names_on_rebuild() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn rls_metadata_rejects_duplicate_table_rows_on_rebuild() {
+    let data_dir = tempfile::TempDir::new().unwrap();
+    let metadata_path = data_dir.path().join("pg_row_security.meta");
+
+    let running = start_persistent_server(data_dir.path(), "rls_duplicate_table_setup").await;
+    for sql in [
+        "CREATE TABLE rls_duplicate_table_docs (tenant_id TEXT NOT NULL, doc_id TEXT NOT NULL)",
+        "ALTER TABLE rls_duplicate_table_docs ENABLE ROW LEVEL SECURITY",
+    ] {
+        running.client.batch_execute(sql).await.expect(sql);
+    }
+    graceful_shutdown(running).await;
+
+    let mut metadata = std::fs::read_to_string(&metadata_path).expect("RLS metadata exists");
+    let table_line = metadata
+        .lines()
+        .find(|line| line.starts_with("table\t"))
+        .expect("table metadata row")
+        .to_owned();
+    metadata.push_str(&table_line);
+    metadata.push('\n');
+    std::fs::write(&metadata_path, metadata).expect("duplicate table metadata");
+
+    let err = Server::init(data_dir.path()).expect_err("duplicate RLS table metadata rejected");
+    assert!(
+        err.to_string().contains("duplicate RLS table metadata"),
+        "expected duplicate RLS table metadata rejection, got {err}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn rls_policy_roles_scope_visibility_and_restart() {
     let data_dir = tempfile::TempDir::new().unwrap();
 
