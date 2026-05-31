@@ -2225,3 +2225,10 @@ as a concise evidence ledger; roadmap stays for open gates only.
   commit. Evidence:
   `python3 -m unittest discover -s tests/scripts -p 'test_*.py'`,
   `cargo test -p ultrasql-bench --test release_hardening final_release_requires_operator_reports_green_workflows_and_notes -- --nocapture`.
+- macOS/Linux and Windows install scripts now validate repository and release
+  tag shape before network downloads, verify checksum digest format, and reject
+  tar/zip archive members outside the expected release payload before
+  extraction. Evidence:
+  `python3 -m unittest discover -s tests/scripts -p 'test_*.py'`,
+  `sh -n scripts/install.sh`,
+  `cargo test -p ultrasql-bench --test release_hardening -- --nocapture`.

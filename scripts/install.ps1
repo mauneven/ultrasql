@@ -7,11 +7,64 @@ param(
 
 $ErrorActionPreference = "Stop"
 
+function Fail-Install {
+    param([string]$Message)
+    throw "ultrasql install: $Message"
+}
+
+function Validate-Repo {
+    param([string]$Value)
+    if ($Value -notmatch '^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$') {
+        Fail-Install "invalid repository: $Value"
+    }
+}
+
+function Validate-ReleaseVersion {
+    param([string]$Value)
+    if ($Value -notmatch '^v[0-9][A-Za-z0-9._+\-]*$') {
+        Fail-Install "invalid release version: $Value"
+    }
+}
+
+function Validate-ZipMembers {
+    param(
+        [string]$ZipPath
+    )
+    Add-Type -AssemblyName System.IO.Compression.FileSystem
+    $allowed = @(
+        "ultrasqld.exe",
+        "ultrasql.exe",
+        "ultrasql-local.exe",
+        "ultrasql.node"
+    )
+    $zip = [System.IO.Compression.ZipFile]::OpenRead($ZipPath)
+    try {
+        foreach ($entry in $zip.Entries) {
+            $name = $entry.FullName.Replace('\', '/')
+            if ([string]::IsNullOrWhiteSpace($name) -or
+                $name.StartsWith('/') -or
+                $name.Contains('../') -or
+                $name.Contains('/..') -or
+                ($allowed -notcontains $name)) {
+                Fail-Install "archive contains unexpected path: $name"
+            }
+        }
+    }
+    finally {
+        $zip.Dispose()
+    }
+}
+
+Validate-Repo $Repo
+if ($Version -ne "latest") {
+    Validate-ReleaseVersion $Version
+}
+
 $arch = [System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture.ToString()
 switch ($arch) {
     "X64" { $target = "x86_64-pc-windows-msvc" }
     default {
-        throw "unsupported Windows architecture: $arch"
+        Fail-Install "unsupported Windows architecture: $arch"
     }
 }
 
@@ -27,8 +80,9 @@ if ($Version -eq "latest") {
 }
 
 if ([string]::IsNullOrWhiteSpace($Version)) {
-    throw "could not resolve release version"
+    Fail-Install "could not resolve release version"
 }
+Validate-ReleaseVersion $Version
 
 $asset = "ultrasql-$Version-$target.zip"
 $baseUrl = "https://github.com/$Repo/releases/download/$Version"
@@ -42,12 +96,16 @@ try {
     Invoke-WebRequest -Uri "$baseUrl/$asset.sha256" -OutFile $sumPath
 
     $expected = (Get-Content $sumPath -Raw).Trim().Split(" ", [System.StringSplitOptions]::RemoveEmptyEntries)[0].ToLowerInvariant()
+    if ($expected -notmatch '^[0-9a-f]{64}$') {
+        Fail-Install "checksum file does not contain a SHA-256 digest"
+    }
     $actual = (Get-FileHash -Algorithm SHA256 $zipPath).Hash.ToLowerInvariant()
     if ($actual -ne $expected) {
-        throw "checksum mismatch for $asset"
+        Fail-Install "checksum mismatch for $asset"
     }
 
     $extractDir = Join-Path $tmp "extract"
+    Validate-ZipMembers $zipPath
     Expand-Archive -Path $zipPath -DestinationPath $extractDir -Force
     New-Item -ItemType Directory -Force -Path $InstallDir | Out-Null
     Copy-Item (Join-Path $extractDir "ultrasqld.exe") $InstallDir -Force

@@ -47,8 +47,10 @@ ULTRASQL_INSTALL_DIR=/usr/local/bin \
   curl -fsSL https://raw.githubusercontent.com/mauneven/ultrasql/main/scripts/install.sh | sh
 ```
 
-The script downloads the platform archive and `.sha256` file, verifies the
-checksum, and installs the binaries. It does not edit shell startup files.
+The script validates the repository and release tag, downloads the platform
+archive and `.sha256` file, verifies the checksum, rejects archive paths outside
+the expected release directory, and installs the binaries. It does not edit
+shell startup files.
 
 ## npm / pnpm / Bun
 
@@ -202,6 +204,9 @@ Add the install directory to the user `PATH`:
 ```powershell
 & ([scriptblock]::Create((iwr https://raw.githubusercontent.com/mauneven/ultrasql/main/scripts/install.ps1 -UseB))) -AddToPath
 ```
+
+The PowerShell installer applies the same tag, checksum, and archive-member
+path checks before extracting the release zip.
 
 ## Windows setup EXE / Chocolatey
 

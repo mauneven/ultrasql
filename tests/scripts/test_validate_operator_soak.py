@@ -1,4 +1,5 @@
 import json
+import os
 import subprocess
 import sys
 import unittest
@@ -7,6 +8,8 @@ from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[2]
 SCRIPT = REPO / "scripts" / "validate-operator-soak.py"
+INSTALL_SH = REPO / "scripts" / "install.sh"
+INSTALL_PS1 = REPO / "scripts" / "install.ps1"
 COMMIT = "0123456789abcdef0123456789abcdef01234567"
 
 
@@ -137,6 +140,47 @@ class OperatorSoakValidatorTests(unittest.TestCase):
             self.assertTrue(
                 any("failure_count must be zero" in error for error in bad_report["errors"])
             )
+
+
+class InstallScriptHardeningTests(unittest.TestCase):
+    def test_install_sh_rejects_path_like_version_before_download(self) -> None:
+        with tempfile_dir() as tmp_path:
+            fake_bin = tmp_path / "bin"
+            fake_bin.mkdir()
+            for name in ["curl", "tar"]:
+                tool = fake_bin / name
+                tool.write_text(
+                    "#!/usr/bin/env sh\n"
+                    f"echo '{name} should not run for invalid version' >&2\n"
+                    "exit 99\n"
+                )
+                tool.chmod(0o755)
+            env = os.environ.copy()
+            env["PATH"] = f"{fake_bin}{os.pathsep}{env['PATH']}"
+            env["HOME"] = str(tmp_path)
+
+            proc = subprocess.run(
+                ["sh", str(INSTALL_SH), "v1/bad"],
+                cwd=REPO,
+                env=env,
+                check=False,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+
+            self.assertEqual(proc.returncode, 1)
+            self.assertIn("invalid release version", proc.stderr)
+            self.assertNotIn("curl should not run", proc.stderr)
+
+    def test_install_scripts_validate_archive_paths(self) -> None:
+        install_sh = INSTALL_SH.read_text()
+        install_ps1 = INSTALL_PS1.read_text()
+
+        for needle in ["validate_tar_members", "tar -tzf", "archive contains unexpected path"]:
+            self.assertIn(needle, install_sh)
+        for needle in ["Validate-ZipMembers", "System.IO.Compression.ZipFile", "archive contains unexpected path"]:
+            self.assertIn(needle, install_ps1)
 
 
 class tempfile_dir:
