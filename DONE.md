@@ -1754,3 +1754,12 @@ as a concise evidence ledger; roadmap stays for open gates only.
   `cargo test -p ultrasql-executor cast_size_and_array_error_edges_cover_scalar_compat_paths --lib -- --nocapture`
   and
   `cargo test -p ultrasql-server --test core_type_surface_round_trip core_scalar_types_round_trip_over_postgres_wire -- --nocapture`.
+- Runtime `MONEY` and `NUMERIC` casts now support column/expression inputs from
+  text, integer, float, decimal, and money families. Bare `NUMERIC` projection
+  preserves variable per-value scale in text and binary wire output instead of
+  collapsing `56.78` to `5678`. Evidence:
+  `cargo test -p ultrasql-executor cast_size_and_array_error_edges_cover_scalar_compat_paths --lib -- --nocapture`,
+  `cargo test -p ultrasql-executor build_column_covers_numeric_bool_temporal_and_oid_families --lib -- --nocapture`,
+  `cargo test -p ultrasql-server extended::codec::tests::binary_dynamic_numeric_result_encodes_text_backed_scale --lib -- --nocapture`,
+  and
+  `cargo test -p ultrasql-server --test money_round_trip money_and_numeric_runtime_casts_from_columns -- --nocapture`.

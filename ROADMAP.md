@@ -66,7 +66,7 @@ file focused on what still blocks production.
 ### Type Surface
 
 - `NUMERIC(p,s)` / `DECIMAL(p,s)`: arbitrary-precision runtime arithmetic and
-  variable-scale bare-`NUMERIC` columnar result preservation remain open.
+  broader typmod edge parity remain open.
 - `MONEY`: locale-sensitive formatting/input beyond deterministic
   `lc_monetary` GUC round trips, explicit typmod/precision edge casts, and
   range-parity evidence remain open.

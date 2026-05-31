@@ -197,6 +197,30 @@ fn build_column(dt: &DataType, values: Vec<Value>) -> Result<Column, ExecError> 
         DataType::Float32 => numeric_column!(f32, Value::Float32(v) => *v, 0.0_f32, Float32),
         DataType::Float64 => numeric_column!(f64, Value::Float64(v) => *v, 0.0_f64, Float64),
         DataType::Date => numeric_column!(i32, Value::Date(v) => *v, 0_i32, Int32),
+        DataType::Decimal { scale: None, .. } => {
+            let mut strings: Vec<Option<String>> = Vec::with_capacity(n);
+            for (i, v) in values.iter().enumerate() {
+                match v {
+                    Value::Null => strings.push(None),
+                    Value::Decimal { .. } => strings.push(Some(v.to_string())),
+                    other => {
+                        return Err(ExecError::TypeMismatch(format!(
+                            "projection: expected {dt:?} at row {i}, got {:?}",
+                            other.data_type()
+                        )));
+                    }
+                }
+            }
+            Ok(
+                match encode_strings_auto(
+                    strings.iter().map(|v| v.as_deref()),
+                    DictionaryEncodingPolicy::default(),
+                ) {
+                    StringEncoding::Raw(c) => Column::Utf8(c),
+                    StringEncoding::Dictionary(c) => Column::DictionaryUtf8(c),
+                },
+            )
+        }
         DataType::Decimal { .. } => numeric_column!(
             i64,
             Value::Decimal { value, .. } => *value,
@@ -598,6 +622,27 @@ mod tests {
             .expect("decimal"),
             &[1234],
             None,
+        );
+        assert_text_values(
+            build_column(
+                &DataType::Decimal {
+                    precision: None,
+                    scale: None,
+                },
+                vec![
+                    Value::Decimal {
+                        value: 5678,
+                        scale: 2,
+                    },
+                    Value::Null,
+                    Value::Decimal {
+                        value: 35,
+                        scale: 1,
+                    },
+                ],
+            )
+            .expect("dynamic decimal"),
+            &[Some("56.78"), None, Some("3.5")],
         );
         assert_i64_values(
             build_column(&DataType::Money, vec![Value::Money(999)]).expect("money"),

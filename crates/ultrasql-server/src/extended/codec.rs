@@ -379,6 +379,14 @@ pub(super) fn encode_binary_value_typed(
         (DataType::Decimal { scale, .. }, Column::Int64(c)) => {
             encode_pg_numeric_binary(c.data()[row], scale.unwrap_or(0)).ok()
         }
+        (DataType::Decimal { .. }, Column::Utf8(_) | Column::DictionaryUtf8(_)) => {
+            let Value::Decimal { value, scale } =
+                parse_decimal_text(col.text_value(row)?, None).ok()?
+            else {
+                return None;
+            };
+            encode_pg_numeric_binary(value, scale).ok()
+        }
         (DataType::Money, Column::Int64(c)) => Some(encode_pg_money_binary(c.data()[row]).to_vec()),
         (DataType::Oid | DataType::RegClass | DataType::RegType, Column::Int64(c)) => {
             u32::try_from(c.data()[row])
@@ -827,6 +835,23 @@ mod tests {
                 &DataType::Decimal {
                     precision: Some(12),
                     scale: Some(3)
+                }
+            )
+            .unwrap(),
+            pg_numeric_12_340()
+        );
+    }
+
+    #[test]
+    fn binary_dynamic_numeric_result_encodes_text_backed_scale() {
+        let column = Column::Utf8(StringColumn::from_data(["12.340".to_owned()]));
+        assert_eq!(
+            encode_binary_value_typed(
+                &column,
+                0,
+                &DataType::Decimal {
+                    precision: None,
+                    scale: None,
                 }
             )
             .unwrap(),

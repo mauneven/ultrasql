@@ -177,3 +177,60 @@ async fn money_cast_insert_select_and_extended_wire_type() {
 
     shutdown(running).await;
 }
+
+#[tokio::test]
+async fn money_and_numeric_runtime_casts_from_columns() {
+    let running = start_sample_server("money_runtime_casts").await;
+    let client = &running.client;
+
+    client
+        .batch_execute(
+            "CREATE TABLE runtime_casts (
+                amount_text TEXT NOT NULL,
+                numeric_text TEXT NOT NULL,
+                int_value INT NOT NULL,
+                float_value DOUBLE PRECISION NOT NULL
+            )",
+        )
+        .await
+        .expect("create runtime cast table");
+    client
+        .batch_execute("INSERT INTO runtime_casts VALUES ('$12.34', '56.78', 42, 3.5)")
+        .await
+        .expect("insert runtime cast row");
+
+    let rows = client
+        .simple_query(
+            "SELECT
+                CAST(amount_text AS MONEY),
+                CAST(numeric_text AS NUMERIC),
+                CAST(int_value AS NUMERIC),
+                CAST(float_value AS NUMERIC)
+             FROM runtime_casts",
+        )
+        .await
+        .expect("runtime money and numeric casts");
+    let values: Vec<Vec<String>> = rows
+        .into_iter()
+        .filter_map(|message| match message {
+            tokio_postgres::SimpleQueryMessage::Row(row) => Some(
+                (0..row.len())
+                    .filter_map(|idx| row.get(idx).map(str::to_owned))
+                    .collect(),
+            ),
+            _ => None,
+        })
+        .collect();
+
+    assert_eq!(
+        values,
+        vec![vec![
+            "$12.34".to_owned(),
+            "56.78".to_owned(),
+            "42".to_owned(),
+            "3.5".to_owned()
+        ]]
+    );
+
+    shutdown(running).await;
+}

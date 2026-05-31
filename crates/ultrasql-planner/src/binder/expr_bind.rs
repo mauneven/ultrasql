@@ -768,11 +768,17 @@ fn bind_runtime_cast(
         DataType::Jsonb if actual_type.is_textlike() => "__ultrasql_cast_jsonb",
         DataType::Xml if actual_type.is_textlike() => "__ultrasql_cast_xml",
         DataType::Money
-            if actual_type.is_integer() || matches!(actual_type, DataType::Decimal { .. }) =>
+            if actual_type.is_integer()
+                || actual_type.is_textlike()
+                || matches!(actual_type, DataType::Decimal { .. }) =>
         {
             "__ultrasql_cast_money"
         }
-        DataType::Decimal { .. } if matches!(actual_type, DataType::Money) => {
+        DataType::Decimal { .. }
+            if actual_type.is_numeric()
+                || actual_type.is_textlike()
+                || matches!(actual_type, DataType::Money) =>
+        {
             "__ultrasql_cast_numeric"
         }
         DataType::Oid if actual_type.is_oid_alias() || actual_type.is_integer() => {

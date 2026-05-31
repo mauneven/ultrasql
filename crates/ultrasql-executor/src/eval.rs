@@ -30,10 +30,10 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use num_traits::ToPrimitive;
 use serde_json::{Map as JsonMap, Number as JsonNumber, Value as JsonValue};
 use ultrasql_core::{
-    DataType, Oid, SparseVector, Value, bpchar_semantic_text, parse_date_text, parse_money_text,
-    parse_time_text, parse_timestamp_text, parse_timestamptz_text, parse_timetz_text,
-    timestamp_micros_at_timezone, timestamptz_display_in_timezone, timetz_at_timezone,
-    timetz_utc_micros, xml_content_is_well_formed, xml_document_is_well_formed,
+    DataType, Oid, SparseVector, Value, bpchar_semantic_text, parse_date_text, parse_decimal_text,
+    parse_money_text, parse_time_text, parse_timestamp_text, parse_timestamptz_text,
+    parse_timetz_text, timestamp_micros_at_timezone, timestamptz_display_in_timezone,
+    timetz_at_timezone, timetz_utc_micros, xml_content_is_well_formed, xml_document_is_well_formed,
     xml_xpath_element_fragments_with_namespaces,
 };
 use ultrasql_planner::{BinaryOp, ScalarExpr, UnaryOp, catalog::builtin_type_oid};
@@ -1343,6 +1343,9 @@ fn eval_cast_money(args: &[Value]) -> Result<Value, EvalError> {
         Value::Int64(v) => int_to_money(*v),
         Value::Decimal { .. } => parse_money_text(&args[0].to_string())
             .map_err(|err| EvalError::Type(format!("money cast: {err}"))),
+        Value::Text(text) | Value::Char(text) => {
+            parse_money_text(text).map_err(|err| EvalError::Type(format!("money cast: {err}")))
+        }
         other => Err(EvalError::Type(format!(
             "money cast: numeric argument required, got {:?}",
             other.data_type()
@@ -1374,10 +1377,15 @@ fn eval_cast_numeric(args: &[Value]) -> Result<Value, EvalError> {
             value: *value,
             scale: *scale,
         }),
-        other => Err(EvalError::Type(format!(
-            "numeric cast: money argument required, got {:?}",
-            other.data_type()
-        ))),
+        Value::Text(text) | Value::Char(text) => parse_decimal_text(text, None)
+            .map_err(|err| EvalError::Type(format!("numeric cast: invalid syntax: {err}"))),
+        other => match numeric_to_decimal(other)? {
+            Some((value, scale)) => Ok(Value::Decimal { value, scale }),
+            None => Err(EvalError::Type(format!(
+                "numeric cast: numeric argument required, got {:?}",
+                other.data_type()
+            ))),
+        },
     }
 }
 
@@ -6854,6 +6862,28 @@ mod tests {
         assert_eq!(
             eval_fn("__ultrasql_cast_xml", vec![Value::Text("<root/>".into())]),
             Value::Xml("<root/>".into())
+        );
+        assert_eq!(
+            eval_fn("__ultrasql_cast_money", vec![Value::Text("$12.34".into())]),
+            Value::Money(1234)
+        );
+        assert_eq!(
+            eval_fn("__ultrasql_cast_numeric", vec![Value::Text("56.78".into())]),
+            Value::Decimal {
+                value: 5678,
+                scale: 2
+            }
+        );
+        assert_eq!(
+            eval_fn("__ultrasql_cast_numeric", vec![Value::Int32(42)]),
+            Value::Decimal {
+                value: 42,
+                scale: 0
+            }
+        );
+        assert!(
+            eval_fn_err("__ultrasql_cast_numeric", vec![Value::Text("bad".into())])
+                .contains("invalid syntax")
         );
         assert!(
             eval_fn_err("__ultrasql_cast_jsonb", vec![Value::Text("{bad".into())])
