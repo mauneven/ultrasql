@@ -2232,3 +2232,8 @@ as a concise evidence ledger; roadmap stays for open gates only.
   `python3 -m unittest discover -s tests/scripts -p 'test_*.py'`,
   `sh -n scripts/install.sh`,
   `cargo test -p ultrasql-bench --test release_hardening -- --nocapture`.
+- CI and release gates now run the script hardening tests directly, so installer
+  and operator-soak validation regressions are caught before merge or tag
+  publication. Evidence:
+  `cargo test -p ultrasql-bench --test release_hardening ci_split_matches_release_policy -- --nocapture`,
+  `cargo test -p ultrasql-bench --test release_hardening packaging_and_docs_site_surface_is_release_ready -- --nocapture`.

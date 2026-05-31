@@ -204,6 +204,7 @@ fn ci_split_matches_release_policy() {
 
     assert!(ci.contains("cargo fmt --all -- --check"));
     assert!(ci.contains("cargo clippy --workspace --all-targets --all-features -- -D warnings"));
+    assert!(ci.contains("python3 -m unittest discover -s tests/scripts -p 'test_*.py'"));
     assert!(ci.contains("cargo test  --workspace --all-features"));
     assert!(bench.contains("benchmarks/certify.sh smoke"));
     assert!(bench.contains("benchmarks/certify.sh full"));
@@ -431,6 +432,7 @@ fn packaging_and_docs_site_surface_is_release_ready() {
         "*.tgz",
         "npm publish --access public",
         "show npm trusted publishing toolchain",
+        "python3 -m unittest discover -s tests/scripts -p 'test_*.py'",
         "render-aur-package.sh",
         "ultrasql-aur-${RELEASE_TAG}.tar.gz",
         "AUR_SSH_PRIVATE_KEY",
