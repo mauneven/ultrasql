@@ -195,6 +195,12 @@ pub enum ExecError {
     #[error("{0}")]
     DivisionByZero(String),
 
+    /// A textual literal or runtime text value could not be parsed as
+    /// the requested SQL type. The server maps this to PostgreSQL
+    /// SQLSTATE `22P02`.
+    #[error("{0}")]
+    InvalidTextRepresentation(String),
+
     /// A batch was produced that exceeds the configured maximum row
     /// count. The executor caps batches at 4096 rows
     /// (see `ARCHITECTURE.md`); kernels that violate this are buggy.

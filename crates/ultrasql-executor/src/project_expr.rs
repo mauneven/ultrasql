@@ -98,8 +98,16 @@ fn eval_error_to_exec(error: EvalError) -> ExecError {
         EvalError::NumericFieldOverflow(detail) => ExecError::NumericFieldOverflow(detail),
         EvalError::Overflow => ExecError::NumericFieldOverflow("numeric value out of range".into()),
         EvalError::DivByZero => ExecError::DivisionByZero("division by zero".into()),
+        EvalError::Type(message) if is_invalid_text_representation(&message) => {
+            ExecError::InvalidTextRepresentation(message)
+        }
         other => ExecError::TypeMismatch(other.to_string()),
     }
+}
+
+fn is_invalid_text_representation(message: &str) -> bool {
+    message.starts_with("numeric cast: invalid syntax:")
+        || message.starts_with("money cast: invalid")
 }
 
 /// Assemble a column-oriented batch column from a column-major

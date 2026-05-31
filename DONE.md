@@ -1787,6 +1787,11 @@ as a concise evidence ledger; roadmap stays for open gates only.
   runtime range now fail with SQLSTATE `22003` instead of surfacing as an
   internal execution error. Evidence:
   `cargo test -p ultrasql-server --test numeric_round_trip runtime_numeric_text_overflow_reports_sqlstate -- --nocapture`.
+- Runtime `NUMERIC` and `MONEY` casts from invalid text now report SQLSTATE
+  `22P02` instead of leaking an internal execution error. Evidence:
+  `cargo test -p ultrasql-server --test numeric_round_trip runtime_numeric_invalid_text_reports_sqlstate -- --nocapture`
+  and
+  `cargo test -p ultrasql-server --test money_round_trip runtime_money_invalid_text_reports_sqlstate -- --nocapture`.
 - Bare `NUMERIC` heap scans now preserve per-row display scale from the stored
   PostgreSQL numeric payload. The row codec keeps dynamic numeric scan builders
   text-backed, materializes them back to `Value::Decimal` for downstream DML,

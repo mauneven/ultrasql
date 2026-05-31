@@ -340,3 +340,29 @@ async fn money_lc_monetary_formats_and_parses_common_locale_text() {
 
     shutdown(running).await;
 }
+
+#[tokio::test]
+async fn runtime_money_invalid_text_reports_sqlstate() {
+    let running = start_sample_server("money_runtime_invalid_text").await;
+    let client = &running.client;
+
+    client
+        .batch_execute("CREATE TABLE money_invalid_text (raw TEXT NOT NULL)")
+        .await
+        .expect("create money invalid text table");
+    client
+        .batch_execute("INSERT INTO money_invalid_text VALUES ('not-money')")
+        .await
+        .expect("insert invalid money text");
+
+    let err = client
+        .simple_query("SELECT CAST(raw AS MONEY) FROM money_invalid_text")
+        .await
+        .expect_err("invalid runtime money text must fail");
+    assert_eq!(
+        err.code().map(tokio_postgres::error::SqlState::code),
+        Some("22P02")
+    );
+
+    shutdown(running).await;
+}

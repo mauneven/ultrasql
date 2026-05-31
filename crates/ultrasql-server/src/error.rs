@@ -277,6 +277,9 @@ impl ServerError {
             // division_by_zero — scalar runtime arithmetic detected a
             // zero divisor.
             Self::Execute(ultrasql_executor::ExecError::DivisionByZero(_)) => "22012",
+            // invalid_text_representation — runtime cast parser rejected
+            // a text value for the requested SQL type.
+            Self::Execute(ultrasql_executor::ExecError::InvalidTextRepresentation(_)) => "22P02",
             // query_canceled — operator polled the `CancelFlag` between
             // batches and short-circuited after a peer `CancelRequest`
             // flipped it. Mirrors PostgreSQL's `query_canceled`.
