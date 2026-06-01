@@ -34,7 +34,9 @@ use crate::cte_scan::CteScan;
 use crate::filter_op::Filter;
 use crate::hash_aggregate::HashAggregate;
 use crate::hash_join::HashJoin;
-use crate::join_layout::{concat_join_exec_schema, using_projection_indices};
+use crate::join_layout::{
+    concat_join_exec_schema, using_projection_exprs, using_projection_indices,
+};
 use crate::lock_rows::LockRows;
 use crate::merge_join::MergeJoin;
 use crate::nested_loop_join::{NestedLoopJoin, RightFactory};
@@ -512,6 +514,11 @@ fn build_join(
             let projection = using_projection_indices(pairs, left_schema.len(), right_schema.len());
             let exec_schema = concat_join_exec_schema(&left_schema, &right_schema, join_type)
                 .map_err(|err| BuildError::Type(format!("join schema: {err}")))?;
+            let projection_exprs = matches!(
+                join_type,
+                LogicalJoinType::RightOuter | LogicalJoinType::FullOuter
+            )
+            .then(|| using_projection_exprs(pairs, &left_schema, &right_schema, join_type));
             let joined = build_nlj(
                 left_op,
                 right_op,
@@ -521,6 +528,11 @@ fn build_join(
                 left_schema,
                 right_schema,
             )?;
+            if let Some(exprs) = projection_exprs {
+                return ProjectExprs::new(joined, &exprs, schema.clone())
+                    .map(|project| Box::new(project) as Box<dyn Operator>)
+                    .map_err(map_exec_error);
+            }
             Project::with_schema(joined, projection, schema.clone())
                 .map(|project| Box::new(project) as Box<dyn Operator>)
                 .map_err(map_exec_error)
@@ -853,6 +865,7 @@ mod tests {
             let right_rows = vec![
                 vec![Value::Int32(1), Value::Text("uno".to_string())],
                 vec![Value::Int32(2), Value::Text("dos".to_string())],
+                vec![Value::Int32(4), Value::Text("cuatro".to_string())],
             ];
             s.tables.insert(
                 "left_names".to_string(),
@@ -1495,6 +1508,42 @@ mod tests {
                 ],
             ]
         );
+    }
+
+    #[test]
+    fn full_join_using_coalesces_unmatched_right_key() {
+        let src = StaticSource::with_name_join_tables();
+        let join_schema = Schema::new([
+            Field::nullable("id", DataType::Int32),
+            Field::nullable("left_name", DataType::Text { max_len: None }),
+            Field::nullable("right_name", DataType::Text { max_len: None }),
+        ])
+        .expect("join schema ok");
+        let plan = LogicalPlan::Join {
+            left: Box::new(LogicalPlan::Scan {
+                table: "left_names".to_string(),
+                schema: left_names_schema(),
+                projection: None,
+            }),
+            right: Box::new(LogicalPlan::Scan {
+                table: "right_names".to_string(),
+                schema: right_names_schema(),
+                projection: None,
+            }),
+            join_type: LogicalJoinType::FullOuter,
+            condition: LogicalJoinCondition::Using(vec![(0, 0)]),
+            schema: join_schema,
+        };
+
+        let mut op = build_operator(&plan, &src).expect("full using join builds");
+        let mut rows = Vec::new();
+        while let Some(batch) = op.next_batch().expect("full using join executes") {
+            rows.extend(crate::filter_op::batch_to_rows(&batch, op.schema()).expect("decode"));
+        }
+
+        assert_eq!(rows[3][0], Value::Int32(4));
+        assert_eq!(rows[3][1], Value::Null);
+        assert_eq!(rows[3][2], Value::Text("cuatro".to_string()));
     }
 
     #[test]

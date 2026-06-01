@@ -486,6 +486,7 @@ fn sql_regression_join_setop_baseline_is_imported_and_provenanced() {
         "LEFT JOIN slt_pg_join_child",
         "NATURAL JOIN slt_pg_natural_right",
         "NATURAL LEFT JOIN slt_pg_natural_right",
+        "FULL JOIN slt_pg_natural_right USING (id)",
         "WHERE EXISTS",
         "UNION",
         "INTERSECT",

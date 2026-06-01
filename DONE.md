@@ -1643,11 +1643,11 @@ as a concise evidence ledger; roadmap stays for open gates only.
   Evidence:
   `cargo run -p ultrasql-sqllogictest-runner -- --mode in-process tests/slt/sql_regression/regression_subset/catalog_sanity_baseline.slt`.
 - The full active public regression subset is now executed by a cargo test,
-  not only checked for provenance. Current coverage is 9 shards / 141
+  not only checked for provenance. Current coverage is 9 shards / 142
   SQLLogicTest cases with zero skips. Evidence:
   `cargo test -p ultrasql-sqllogictest-runner sql_regression_subset_runs_all_active_shards_in_process --test in_process -- --nocapture`.
 - Full benchmark certification now includes the active public SQL regression
-  subset as `sql-regression`; targeted local run passed 9 shards / 141 cases
+  subset as `sql-regression`; targeted local run passed 9 shards / 142 cases
   in-process and wrote an explicit `reference_url_missing` setup artifact
   instead of publishing a differential claim without PostgreSQL. Evidence:
   `cargo test -p ultrasql-bench --test release_hardening benchmark_certification_includes_public_sql_regression -- --nocapture`,
@@ -1670,17 +1670,19 @@ as a concise evidence ledger; roadmap stays for open gates only.
   and `cargo clippy -p ultrasql-executor --all-targets --all-features -- -D warnings`.
 - Join/set-operation regression baseline covers deterministic inner join, left
   join with aggregate over null-extended rows, `NATURAL JOIN`, `NATURAL LEFT
-  JOIN`, correlated `EXISTS`, `UNION`, `INTERSECT`, `EXCEPT`, set-operation
-  `ORDER BY` over output columns, and scalar wrappers around aggregates such as
-  `COALESCE(SUM(...), 0)`. This also fixed hash and sort aggregate `SUM` seed
-  widening so single-row `SUM(int4)` emits the planned `Int64` result type
-  instead of leaking `Int32`, the grouped hash-aggregate vectorized path so
-  all-null `SUM` groups survive as `NULL` instead of being dropped, and
-  `USING`/`NATURAL` join output projection so shared columns collapse before
-  outer `SELECT` expressions read row positions. Evidence:
+  JOIN`, full `USING` join key coalescing, correlated `EXISTS`, `UNION`,
+  `INTERSECT`, `EXCEPT`, set-operation `ORDER BY` over output columns, and
+  scalar wrappers around aggregates such as `COALESCE(SUM(...), 0)`. This also
+  fixed hash and sort aggregate `SUM` seed widening so single-row `SUM(int4)`
+  emits the planned `Int64` result type instead of leaking `Int32`, the grouped
+  hash-aggregate vectorized path so all-null `SUM` groups survive as `NULL`
+  instead of being dropped, and `USING`/`NATURAL` join output projection so
+  shared columns collapse before outer `SELECT` expressions read row positions
+  and full/right joins coalesce unmatched right keys. Evidence:
   `cargo run -p ultrasql-sqllogictest-runner -- --mode in-process tests/slt/sql_regression/regression_subset/join_setop_baseline.slt`,
   `cargo test -p ultrasql-planner binds_natural_join_collapses_shared_columns_without_ambiguous_select --lib -- --nocapture`,
-  and `cargo test -p ultrasql-executor physical::tests::join_using_projects_common_column_once_before_select_exprs --lib -- --nocapture`.
+  `cargo test -p ultrasql-executor physical::tests::join_using_projects_common_column_once_before_select_exprs --lib -- --nocapture`,
+  and `cargo test -p ultrasql-executor physical::tests::full_join_using_coalesces_unmatched_right_key --lib -- --nocapture`.
 - Transaction isolation baseline covers `acid.sql`, Hermitage G1a/PMP/G2, and
   manager-level Hermitage matrix.
 - Index regression baseline covers `CREATE INDEX`, `CREATE UNIQUE INDEX`,

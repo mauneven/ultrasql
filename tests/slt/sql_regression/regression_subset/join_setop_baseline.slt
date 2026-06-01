@@ -137,6 +137,24 @@ dos
 gamma
 NULL
 
+query ITT nosort
+SELECT id, left_name, right_name
+FROM slt_pg_natural_left FULL JOIN slt_pg_natural_right USING (id)
+ORDER BY id
+----
+1
+alpha
+uno
+2
+beta
+dos
+3
+gamma
+NULL
+4
+NULL
+cuatro
+
 statement ok
 DROP TABLE slt_pg_natural_right
 

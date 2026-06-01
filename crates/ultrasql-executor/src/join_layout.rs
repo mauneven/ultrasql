@@ -8,7 +8,7 @@
 use std::collections::HashSet;
 
 use ultrasql_core::{Field, Result, Schema};
-use ultrasql_planner::LogicalJoinType;
+use ultrasql_planner::{LogicalJoinType, ScalarExpr};
 
 /// Return physical column indices for the logical output of a `USING` join.
 ///
@@ -80,6 +80,65 @@ pub fn concat_join_exec_schema(
         });
     }
     Schema::new(fields)
+}
+
+/// Return expression projection for the logical output of a `USING` join.
+///
+/// Right and full outer joins must coalesce common columns because unmatched
+/// right rows have `NULL` left-side values in the physical `left ++ right`
+/// row. Inner and left joins can use the left common column directly.
+#[must_use]
+pub fn using_projection_exprs(
+    pairs: &[(usize, usize)],
+    left: &Schema,
+    right: &Schema,
+    join_type: LogicalJoinType,
+) -> Vec<(ScalarExpr, String)> {
+    let left_using: HashSet<usize> = pairs.iter().map(|(left_idx, _)| *left_idx).collect();
+    let right_using: HashSet<usize> = pairs.iter().map(|(_, right_idx)| *right_idx).collect();
+    let mut out = Vec::with_capacity(left.len() + right.len() - right_using.len());
+    for (left_idx, right_idx) in pairs {
+        let left_field = left.field_at(*left_idx);
+        let right_field = right.field_at(*right_idx);
+        let left_expr = column_expr(left_field, *left_idx);
+        let expr = if matches!(
+            join_type,
+            LogicalJoinType::RightOuter | LogicalJoinType::FullOuter
+        ) {
+            ScalarExpr::FunctionCall {
+                name: "coalesce".to_owned(),
+                args: vec![left_expr, column_expr(right_field, left.len() + *right_idx)],
+                data_type: left_field.data_type.clone(),
+            }
+        } else {
+            left_expr
+        };
+        out.push((expr, left_field.name.clone()));
+    }
+    for left_idx in 0..left.len() {
+        if !left_using.contains(&left_idx) {
+            let field = left.field_at(left_idx);
+            out.push((column_expr(field, left_idx), field.name.clone()));
+        }
+    }
+    for right_idx in 0..right.len() {
+        if !right_using.contains(&right_idx) {
+            let field = right.field_at(right_idx);
+            out.push((
+                column_expr(field, left.len() + right_idx),
+                field.name.clone(),
+            ));
+        }
+    }
+    out
+}
+
+fn column_expr(field: &Field, index: usize) -> ScalarExpr {
+    ScalarExpr::Column {
+        name: field.name.clone(),
+        index,
+        data_type: field.data_type.clone(),
+    }
 }
 
 fn unique_join_field_name(base: &str, used_names: &mut HashSet<String>) -> String {

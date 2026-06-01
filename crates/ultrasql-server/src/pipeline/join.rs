@@ -4,9 +4,9 @@ use std::sync::Arc;
 
 use ultrasql_core::{DataType, Schema};
 use ultrasql_executor::{
-    ExecError, HashJoin, MemTableScan, MergeJoin, NestedLoopJoin, Operator, Project, RightFactory,
-    WorkMemBudget,
-    join_layout::{concat_join_exec_schema, using_projection_indices},
+    ExecError, HashJoin, MemTableScan, MergeJoin, NestedLoopJoin, Operator, Project, ProjectExprs,
+    RightFactory, WorkMemBudget,
+    join_layout::{concat_join_exec_schema, using_projection_exprs, using_projection_indices},
 };
 use ultrasql_planner::{
     BinaryOp, LogicalJoinCondition, LogicalJoinType, LogicalPlan, LogicalSetQuantifier, ScalarExpr,
@@ -211,6 +211,11 @@ pub(super) fn lower_join(args: LowerJoinArgs<'_>) -> Result<Box<dyn Operator>, S
                 .map_err(|err| {
                     ServerError::Execute(ExecError::TypeMismatch(format!("join schema: {err}")))
                 })?;
+            let projection_exprs = matches!(
+                join_type,
+                LogicalJoinType::RightOuter | LogicalJoinType::FullOuter
+            )
+            .then(|| using_projection_exprs(pairs, &left_schema, &right_schema, join_type));
             let joined = build_nested_loop_join(
                 left,
                 right,
@@ -220,6 +225,9 @@ pub(super) fn lower_join(args: LowerJoinArgs<'_>) -> Result<Box<dyn Operator>, S
                 left_schema,
                 right_schema,
             )?;
+            if let Some(exprs) = projection_exprs {
+                return Ok(Box::new(ProjectExprs::new(joined, &exprs, out_schema)?));
+            }
             Ok(Box::new(Project::with_schema(
                 joined, projection, out_schema,
             )?))
