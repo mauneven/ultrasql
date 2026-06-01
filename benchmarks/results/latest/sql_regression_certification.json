@@ -6,6 +6,6 @@
   "active_shards": 9,
   "in_process_status": "passed",
   "reference_engine": "postgres",
-  "generated_at_unix": 1780273522,
+  "generated_at_unix": 1780274860,
   "policy": "Active public SQL regression shards must pass in-process. Full differential certification also requires ULTRASQL_SLT_REFERENCE_URL or POSTGRES_URL for PostgreSQL comparison."
 }

@@ -267,9 +267,16 @@ impl Parser<'_> {
     /// Parse one explicit join clause, given the already-parsed LHS.
     fn parse_join(&mut self, lhs: TableRef) -> Result<TableRef, ParseError> {
         let start = lhs.ref_span().start;
+        let natural = self.match_kw(TokenKind::KwNatural);
 
         let op = match self.peek()?.kind {
             TokenKind::KwCross => {
+                if natural {
+                    return Err(ParseError::Unsupported {
+                        what: "NATURAL CROSS JOIN",
+                        offset: self.peek()?.span.start as usize,
+                    });
+                }
                 self.advance()?; // CROSS
                 self.expect(TokenKind::KwJoin, "JOIN")?;
                 JoinOp::Cross
@@ -301,15 +308,6 @@ impl Parser<'_> {
                 self.advance()?; // JOIN (bare — INNER implied)
                 JoinOp::Inner
             }
-            TokenKind::KwNatural => {
-                // NATURAL JOIN — not yet supported; reject rather than silently
-                // ignore the NATURAL qualifier.
-                let tok = self.advance()?;
-                return Err(ParseError::Unsupported {
-                    what: "NATURAL JOIN",
-                    offset: tok.span.start as usize,
-                });
-            }
             other => {
                 return Err(ParseError::Expected {
                     expected: "JOIN keyword",
@@ -323,6 +321,7 @@ impl Parser<'_> {
 
         let condition = match op {
             JoinOp::Cross => JoinCondition::None,
+            _ if natural => JoinCondition::Natural,
             _ => {
                 if self.peek()?.kind == TokenKind::KwOn {
                     self.advance()?; // ON
@@ -1480,6 +1479,40 @@ mod tests {
         };
         assert_eq!(cols.len(), 1);
         assert_eq!(cols[0].value, "id");
+    }
+
+    #[test]
+    fn select_natural_join() {
+        let stmt = parse("SELECT * FROM a NATURAL JOIN b");
+        let Statement::Select(s) = stmt else { panic!() };
+        let TableRef::Join { op, condition, .. } = &s.from[0] else {
+            panic!()
+        };
+        assert_eq!(*op, JoinOp::Inner);
+        assert!(matches!(condition, JoinCondition::Natural));
+    }
+
+    #[test]
+    fn select_natural_left_join() {
+        let stmt = parse("SELECT * FROM a NATURAL LEFT JOIN b");
+        let Statement::Select(s) = stmt else { panic!() };
+        let TableRef::Join { op, condition, .. } = &s.from[0] else {
+            panic!()
+        };
+        assert_eq!(*op, JoinOp::LeftOuter);
+        assert!(matches!(condition, JoinCondition::Natural));
+    }
+
+    #[test]
+    fn select_natural_cross_join_is_rejected() {
+        let err = parse_err("SELECT * FROM a NATURAL CROSS JOIN b");
+        assert!(matches!(
+            err,
+            crate::parser::ParseError::Unsupported {
+                what: "NATURAL CROSS JOIN",
+                ..
+            }
+        ));
     }
 
     #[test]

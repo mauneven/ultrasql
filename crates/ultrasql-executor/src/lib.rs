@@ -83,6 +83,7 @@ mod hash_aggregate;
 mod hash_join;
 pub mod hybrid_search;
 pub mod index_scan;
+pub mod join_layout;
 pub mod json_path;
 mod limit;
 pub mod lock_rows;

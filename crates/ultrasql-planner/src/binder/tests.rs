@@ -2399,6 +2399,55 @@ fn binds_using_join_folds_to_equality_and_collapses_columns() {
     );
 }
 
+#[test]
+fn binds_natural_join_collapses_shared_columns_without_ambiguous_select() {
+    let schema_a = Schema::new([
+        Field::required("id", DataType::Int32),
+        Field::nullable("left_name", DataType::Text { max_len: None }),
+    ])
+    .expect("schema ok");
+    let schema_b = Schema::new([
+        Field::required("id", DataType::Int32),
+        Field::nullable("right_name", DataType::Text { max_len: None }),
+    ])
+    .expect("schema ok");
+    let mut cat = InMemoryCatalog::new();
+    cat.register("a", TableMeta::new(schema_a));
+    cat.register("b", TableMeta::new(schema_b));
+
+    let plan = parse_and_bind(
+        "SELECT id, left_name, right_name FROM a NATURAL JOIN b",
+        &cat,
+    )
+    .expect("bind ok");
+
+    fn find_join(plan: &LogicalPlan) -> Option<&LogicalPlan> {
+        match plan {
+            LogicalPlan::Join { .. } => Some(plan),
+            LogicalPlan::Project { input, .. }
+            | LogicalPlan::Filter { input, .. }
+            | LogicalPlan::Sort { input, .. }
+            | LogicalPlan::Limit { input, .. } => find_join(input),
+            _ => None,
+        }
+    }
+    let join = find_join(&plan).expect("should contain a Join");
+    let LogicalPlan::Join {
+        condition, schema, ..
+    } = join
+    else {
+        panic!("expected Join");
+    };
+    assert!(
+        matches!(condition, LogicalJoinCondition::Using(pairs) if pairs.as_slice() == [(0, 0)]),
+        "natural join should bind as USING(id)"
+    );
+    assert_eq!(schema.len(), 3);
+    assert_eq!(schema.field_at(0).name, "id");
+    assert_eq!(schema.field_at(1).name, "left_name");
+    assert_eq!(schema.field_at(2).name, "right_name");
+}
+
 // -----------------------------------------------------------------------
 // GROUP BY / aggregate tests
 // -----------------------------------------------------------------------

@@ -34,6 +34,7 @@ use crate::cte_scan::CteScan;
 use crate::filter_op::Filter;
 use crate::hash_aggregate::HashAggregate;
 use crate::hash_join::HashJoin;
+use crate::join_layout::{concat_join_exec_schema, using_projection_indices};
 use crate::lock_rows::LockRows;
 use crate::merge_join::MergeJoin;
 use crate::nested_loop_join::{NestedLoopJoin, RightFactory};
@@ -508,15 +509,21 @@ fn build_join(
         LogicalJoinCondition::Using(pairs) => {
             // Translate USING pairs into a composite equality predicate.
             let cond = build_using_predicate(pairs, &left_schema, &right_schema);
-            build_nlj(
+            let projection = using_projection_indices(pairs, left_schema.len(), right_schema.len());
+            let exec_schema = concat_join_exec_schema(&left_schema, &right_schema, join_type)
+                .map_err(|err| BuildError::Type(format!("join schema: {err}")))?;
+            let joined = build_nlj(
                 left_op,
                 right_op,
                 cond,
                 join_type,
-                schema.clone(),
+                exec_schema,
                 left_schema,
                 right_schema,
-            )
+            )?;
+            Project::with_schema(joined, projection, schema.clone())
+                .map(|project| Box::new(project) as Box<dyn Operator>)
+                .map_err(map_exec_error)
         }
         LogicalJoinCondition::None => {
             // CROSS JOIN: no condition.
@@ -753,6 +760,22 @@ mod tests {
         .expect("schema is well-formed")
     }
 
+    fn left_names_schema() -> Schema {
+        Schema::new([
+            Field::required("id", DataType::Int32),
+            Field::required("left_name", DataType::Text { max_len: None }),
+        ])
+        .expect("schema is well-formed")
+    }
+
+    fn right_names_schema() -> Schema {
+        Schema::new([
+            Field::required("id", DataType::Int32),
+            Field::required("right_name", DataType::Text { max_len: None }),
+        ])
+        .expect("schema is well-formed")
+    }
+
     /// Pack `(id, val)` rows into a single batch.
     fn batch(rows: &[(i32, i64)]) -> Batch {
         let ids: Vec<i32> = rows.iter().map(|(i, _)| *i).collect();
@@ -813,6 +836,42 @@ mod tests {
                         (30, vec![0.5, 0.0, 0.0]),
                         (40, vec![0.0, 2.0, 0.0]),
                     ])],
+                ),
+            );
+            s
+        }
+
+        fn with_name_join_tables() -> Self {
+            let mut s = Self::new();
+            let left_schema = left_names_schema();
+            let right_schema = right_names_schema();
+            let left_rows = vec![
+                vec![Value::Int32(1), Value::Text("alpha".to_string())],
+                vec![Value::Int32(2), Value::Text("beta".to_string())],
+                vec![Value::Int32(3), Value::Text("gamma".to_string())],
+            ];
+            let right_rows = vec![
+                vec![Value::Int32(1), Value::Text("uno".to_string())],
+                vec![Value::Int32(2), Value::Text("dos".to_string())],
+            ];
+            s.tables.insert(
+                "left_names".to_string(),
+                (
+                    left_schema.clone(),
+                    vec![
+                        crate::seq_scan::build_batch(&left_rows, &left_schema)
+                            .expect("left batch ok"),
+                    ],
+                ),
+            );
+            s.tables.insert(
+                "right_names".to_string(),
+                (
+                    right_schema.clone(),
+                    vec![
+                        crate::seq_scan::build_batch(&right_rows, &right_schema)
+                            .expect("right batch ok"),
+                    ],
                 ),
             );
             s
@@ -1388,6 +1447,54 @@ mod tests {
         }
         // id=1 (1×1), id=2 (1×1), id=3 (1×1), id=7 (3×3 = 9) → total 12.
         assert_eq!(count, 12, "inner self-join row count");
+    }
+
+    #[test]
+    fn join_using_projects_common_column_once_before_select_exprs() {
+        let src = StaticSource::with_name_join_tables();
+        let join_schema = Schema::new([
+            Field::required("id", DataType::Int32),
+            Field::required("left_name", DataType::Text { max_len: None }),
+            Field::required("right_name", DataType::Text { max_len: None }),
+        ])
+        .expect("join schema ok");
+        let plan = LogicalPlan::Join {
+            left: Box::new(LogicalPlan::Scan {
+                table: "left_names".to_string(),
+                schema: left_names_schema(),
+                projection: None,
+            }),
+            right: Box::new(LogicalPlan::Scan {
+                table: "right_names".to_string(),
+                schema: right_names_schema(),
+                projection: None,
+            }),
+            join_type: LogicalJoinType::Inner,
+            condition: LogicalJoinCondition::Using(vec![(0, 0)]),
+            schema: join_schema,
+        };
+
+        let mut op = build_operator(&plan, &src).expect("using join builds");
+        let mut rows = Vec::new();
+        while let Some(batch) = op.next_batch().expect("using join executes") {
+            rows.extend(crate::filter_op::batch_to_rows(&batch, op.schema()).expect("decode"));
+        }
+
+        assert_eq!(
+            rows,
+            vec![
+                vec![
+                    Value::Int32(1),
+                    Value::Text("alpha".to_string()),
+                    Value::Text("uno".to_string())
+                ],
+                vec![
+                    Value::Int32(2),
+                    Value::Text("beta".to_string()),
+                    Value::Text("dos".to_string())
+                ],
+            ]
+        );
     }
 
     #[test]

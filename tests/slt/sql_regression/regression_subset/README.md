@@ -48,8 +48,9 @@ outside this curated subset.
 The expression/predicate shard covers `IS [NOT] DISTINCT FROM`,
 `IS [NOT] TRUE/FALSE/UNKNOWN`, `ILIKE`, `NULLIF`, `GREATEST`, `LEAST`, and
 `BETWEEN SYMMETRIC`.
-The join/set-operation shard covers deterministic join, left join, correlated
-`EXISTS`, `UNION`, `INTERSECT`, and `EXCEPT` behavior.
+The join/set-operation shard covers deterministic join, left join,
+`NATURAL JOIN`, `NATURAL LEFT JOIN`, correlated `EXISTS`, `UNION`,
+`INTERSECT`, and `EXCEPT` behavior.
 Broader type-specific numeric overflow, collation, timezone-abbreviation, and
 SQL/JSON breadth remain roadmap debt.
 The aggregate/window shard covers grouped aggregates, HAVING, and core window

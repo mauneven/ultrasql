@@ -1898,22 +1898,85 @@ fn bind_explicit_join(
         }
         JoinCondition::Using(cols) => {
             let pairs = resolve_using_pairs(cols, left_plan.schema(), right_plan.schema())?;
-            let schema =
-                build_using_schema(left_plan.schema(), right_plan.schema(), &pairs, join_type)?;
-            let left_len = left_scope.len();
-            let out_scope = merge_scopes(left_scope, right_scope, left_len);
-            Ok((
-                LogicalPlan::Join {
-                    left: Box::new(left_plan),
-                    right: Box::new(right_plan),
-                    join_type,
-                    condition: LogicalJoinCondition::Using(pairs),
-                    schema,
-                },
-                out_scope,
-            ))
+            bind_using_join(
+                left_plan,
+                right_plan,
+                left_scope,
+                right_scope,
+                join_type,
+                pairs,
+            )
+        }
+        JoinCondition::Natural => {
+            let pairs = resolve_natural_pairs(left_plan.schema(), right_plan.schema());
+            bind_using_join(
+                left_plan,
+                right_plan,
+                left_scope,
+                right_scope,
+                join_type,
+                pairs,
+            )
         }
     }
+}
+
+fn bind_using_join(
+    left_plan: LogicalPlan,
+    right_plan: LogicalPlan,
+    left_scope: Vec<ScopeEntry>,
+    right_scope: Vec<ScopeEntry>,
+    join_type: LogicalJoinType,
+    pairs: Vec<(usize, usize)>,
+) -> Result<(LogicalPlan, Vec<ScopeEntry>), PlanError> {
+    let schema = build_using_schema(left_plan.schema(), right_plan.schema(), &pairs, join_type)?;
+    let out_scope = build_using_scope(&left_scope, &right_scope, &pairs);
+    Ok((
+        LogicalPlan::Join {
+            left: Box::new(left_plan),
+            right: Box::new(right_plan),
+            join_type,
+            condition: LogicalJoinCondition::Using(pairs),
+            schema,
+        },
+        out_scope,
+    ))
+}
+
+fn build_using_scope(
+    left_scope: &[ScopeEntry],
+    right_scope: &[ScopeEntry],
+    pairs: &[(usize, usize)],
+) -> Vec<ScopeEntry> {
+    let left_using: std::collections::HashSet<usize> =
+        pairs.iter().map(|(left_idx, _)| *left_idx).collect();
+    let right_using: std::collections::HashSet<usize> =
+        pairs.iter().map(|(_, right_idx)| *right_idx).collect();
+    let mut out = Vec::with_capacity(left_scope.len() + right_scope.len() - right_using.len());
+    for (left_idx, _) in pairs {
+        if let Some(entry) = left_scope.get(*left_idx) {
+            push_scope_entry(&mut out, entry);
+        }
+    }
+    for (left_idx, entry) in left_scope.iter().enumerate() {
+        if !left_using.contains(&left_idx) {
+            push_scope_entry(&mut out, entry);
+        }
+    }
+    for (right_idx, entry) in right_scope.iter().enumerate() {
+        if !right_using.contains(&right_idx) {
+            push_scope_entry(&mut out, entry);
+        }
+    }
+    out
+}
+
+fn push_scope_entry(out: &mut Vec<ScopeEntry>, entry: &ScopeEntry) {
+    out.push(ScopeEntry {
+        qualifier: entry.qualifier.clone(),
+        field_index: out.len(),
+        field: entry.field.clone(),
+    });
 }
 
 fn resolve_using_pairs(
@@ -1935,6 +1998,16 @@ fn resolve_using_pairs(
         pairs.push((left_idx, right_idx));
     }
     Ok(pairs)
+}
+
+fn resolve_natural_pairs(left: &Schema, right: &Schema) -> Vec<(usize, usize)> {
+    let mut pairs = Vec::new();
+    for (left_idx, left_field) in left.fields().iter().enumerate() {
+        if let Some((right_idx, _)) = right.find(&left_field.name) {
+            pairs.push((left_idx, right_idx));
+        }
+    }
+    pairs
 }
 
 fn build_using_schema(

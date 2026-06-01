@@ -6,6 +6,7 @@ use ultrasql_core::{DataType, Schema};
 use ultrasql_executor::{
     ExecError, HashJoin, MemTableScan, MergeJoin, NestedLoopJoin, Operator, Project, RightFactory,
     WorkMemBudget,
+    join_layout::{concat_join_exec_schema, using_projection_indices},
 };
 use ultrasql_planner::{
     BinaryOp, LogicalJoinCondition, LogicalJoinType, LogicalPlan, LogicalSetQuantifier, ScalarExpr,
@@ -205,15 +206,23 @@ pub(super) fn lower_join(args: LowerJoinArgs<'_>) -> Result<Box<dyn Operator>, S
         }
         LogicalJoinCondition::Using(pairs) => {
             let cond = build_using_predicate(pairs, &left_schema, &right_schema);
-            build_nested_loop_join(
+            let projection = using_projection_indices(pairs, left_schema.len(), right_schema.len());
+            let exec_schema = concat_join_exec_schema(&left_schema, &right_schema, join_type)
+                .map_err(|err| {
+                    ServerError::Execute(ExecError::TypeMismatch(format!("join schema: {err}")))
+                })?;
+            let joined = build_nested_loop_join(
                 left,
                 right,
                 cond,
                 join_type,
-                out_schema,
+                exec_schema,
                 left_schema,
                 right_schema,
-            )
+            )?;
+            Ok(Box::new(Project::with_schema(
+                joined, projection, out_schema,
+            )?))
         }
         LogicalJoinCondition::None => build_nested_loop_join(
             left,

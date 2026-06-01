@@ -1762,6 +1762,8 @@ pub enum JoinCondition {
     On(Expr),
     /// `USING (col, …)`.
     Using(Vec<Identifier>),
+    /// `NATURAL JOIN`; binder resolves common column names to `USING`.
+    Natural,
     /// No condition (CROSS JOIN).
     None,
 }
