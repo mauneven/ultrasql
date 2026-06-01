@@ -46,8 +46,8 @@ rows written in SQLLogicTest format; they do not vendor the full upstream
 regression suite. Unsupported catalog-wide sanity checks stay as roadmap debt
 outside this curated subset.
 The expression/predicate shard covers `IS [NOT] DISTINCT FROM`,
-`IS [NOT] TRUE/FALSE/UNKNOWN`, `ILIKE`, `NULLIF`, `GREATEST`, `LEAST`, and
-`BETWEEN SYMMETRIC`.
+`IS [NOT] TRUE/FALSE/UNKNOWN`, `LIKE` backslash wildcard escaping, `ILIKE`,
+`NULLIF`, `GREATEST`, `LEAST`, and `BETWEEN SYMMETRIC`.
 The join/set-operation shard covers deterministic join, left join,
 `NATURAL JOIN`, `NATURAL LEFT JOIN`, full `USING` join key coalescing,
 correlated `EXISTS`, `UNION`, `INTERSECT`, and `EXCEPT` behavior.

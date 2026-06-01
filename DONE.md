@@ -1643,24 +1643,27 @@ as a concise evidence ledger; roadmap stays for open gates only.
   Evidence:
   `cargo run -p ultrasql-sqllogictest-runner -- --mode in-process tests/slt/sql_regression/regression_subset/catalog_sanity_baseline.slt`.
 - The full active public regression subset is now executed by a cargo test,
-  not only checked for provenance. Current coverage is 9 shards / 142
+  not only checked for provenance. Current coverage is 9 shards / 144
   SQLLogicTest cases with zero skips. Evidence:
   `cargo test -p ultrasql-sqllogictest-runner sql_regression_subset_runs_all_active_shards_in_process --test in_process -- --nocapture`.
 - Full benchmark certification now includes the active public SQL regression
-  subset as `sql-regression`; targeted local run passed 9 shards / 142 cases
+  subset as `sql-regression`; targeted local run passed 9 shards / 144 cases
   in-process and wrote an explicit `reference_url_missing` setup artifact
   instead of publishing a differential claim without PostgreSQL. Evidence:
   `cargo test -p ultrasql-bench --test release_hardening benchmark_certification_includes_public_sql_regression -- --nocapture`,
   `benchmarks/certify.sh full sql-regression`, and
   `benchmarks/results/latest/sql_regression_certification.json`.
 - Expression/predicate regression baseline covers `IS [NOT] DISTINCT FROM`,
-  `IS [NOT] TRUE/FALSE/UNKNOWN`, `ILIKE`, `NULLIF`, `GREATEST`, `LEAST`, and
-  `BETWEEN SYMMETRIC`. This also fixed `IS DISTINCT FROM`
-  binding/execution, boolean truth-test binding/execution, and filter fast-path
-  compaction so selected nullable columns keep their source validity bitmaps
-  instead of turning NULL values into typed zeroes. Evidence:
+  `IS [NOT] TRUE/FALSE/UNKNOWN`, `LIKE` backslash wildcard escaping, `ILIKE`,
+  `NULLIF`, `GREATEST`, `LEAST`, and `BETWEEN SYMMETRIC`. This also fixed
+  `IS DISTINCT FROM` binding/execution, boolean truth-test binding/execution,
+  `LIKE` matching to use a bounded dynamic-programming matcher with PostgreSQL
+  default backslash escaping for `%` and `_`, and filter fast-path compaction so
+  selected nullable columns keep their source validity bitmaps instead of
+  turning NULL values into typed zeroes. Evidence:
   `cargo test -p ultrasql-sqllogictest-runner --test in_process sql_regression_subset_runs_all_active_shards_in_process -- --nocapture`,
   `cargo test -p ultrasql-executor eval::tests::is_boolean_predicates_use_sql_truth_table --lib -- --nocapture`,
+  `cargo test -p ultrasql-executor eval::tests::like --lib -- --nocapture`,
   and `cargo test -p ultrasql-executor filter_op::tests::select_column_preserves_selected_nulls --lib -- --nocapture`.
 - Legacy `FilterEqI32` placeholder filtering now reuses the shared column
   selector, so nullable selected value columns keep their validity bitmaps

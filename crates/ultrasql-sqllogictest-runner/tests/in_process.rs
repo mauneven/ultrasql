@@ -329,6 +329,7 @@ fn sql_regression_expression_predicate_baseline_is_imported_and_provenanced() {
         "IS NOT FALSE",
         "IS UNKNOWN",
         "IS NOT UNKNOWN",
+        r"LIKE 'a\_b'",
         "ILIKE",
         "NULLIF",
         "GREATEST",

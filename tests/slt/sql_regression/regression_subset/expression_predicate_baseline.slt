@@ -36,6 +36,16 @@ SELECT id FROM slt_pg_expr_predicate WHERE label ILIKE 'a%'
 ----
 1
 
+query B nosort
+SELECT 'a_b' LIKE 'a\_b'
+----
+true
+
+query B nosort
+SELECT 'sale%2026' LIKE 'sale\%2026'
+----
+true
+
 query II rowsort
 SELECT id, NULLIF(a, b) FROM slt_pg_expr_predicate WHERE id IN (1, 2, 4)
 ----

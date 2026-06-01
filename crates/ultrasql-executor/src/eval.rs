@@ -6447,10 +6447,8 @@ fn pow10_i128(exp: u32) -> Option<i128> {
 /// Match `haystack` against a SQL LIKE/ILIKE `pattern`.
 ///
 /// `%` matches any sequence of characters (including empty). `_`
-/// matches exactly one character. All other characters are literal.
-///
-/// This is an O(n x m) recursive-descent implementation sufficient for
-/// v0.5; a compiled-regex or NFA-based path is a perf TODO.
+/// matches exactly one character. Backslash escapes `%`, `_`, and
+/// backslash itself to match PostgreSQL's default `LIKE` escape behavior.
 fn like_match(haystack: &str, pattern: &str, case_insensitive: bool) -> bool {
     // Collect to chars so we handle multi-byte UTF-8 correctly.
     let h: Vec<char> = if case_insensitive {
@@ -6461,46 +6459,70 @@ fn like_match(haystack: &str, pattern: &str, case_insensitive: bool) -> bool {
     } else {
         haystack.chars().collect()
     };
-    let p: Vec<char> = if case_insensitive {
-        pattern
-            .chars()
-            .map(|c| c.to_lowercase().next().unwrap_or(c))
-            .collect()
-    } else {
-        pattern.chars().collect()
-    };
-    like_match_chars(&h, &p)
+    let p = compile_like_pattern(pattern, case_insensitive);
+    like_match_tokens(&h, &p)
 }
 
-fn like_match_chars(h: &[char], p: &[char]) -> bool {
-    match p.first() {
-        None => h.is_empty(),
-        Some(&'%') => {
-            // '%' matches zero or more characters: try all possible split points.
-            for skip in 0..=h.len() {
-                if like_match_chars(&h[skip..], &p[1..]) {
-                    return true;
-                }
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum LikeToken {
+    AnySeq,
+    AnyOne,
+    Literal(char),
+}
+
+fn compile_like_pattern(pattern: &str, case_insensitive: bool) -> Vec<LikeToken> {
+    let mut tokens = Vec::with_capacity(pattern.chars().count());
+    let mut chars = pattern.chars();
+    while let Some(ch) = chars.next() {
+        match ch {
+            '%' => tokens.push(LikeToken::AnySeq),
+            '_' => tokens.push(LikeToken::AnyOne),
+            '\\' => {
+                let literal = chars.next().unwrap_or('\\');
+                tokens.push(LikeToken::Literal(fold_like_char(
+                    literal,
+                    case_insensitive,
+                )));
             }
-            false
-        }
-        Some(&'_') => {
-            // '_' matches exactly one character.
-            if h.is_empty() {
-                false
-            } else {
-                like_match_chars(&h[1..], &p[1..])
-            }
-        }
-        Some(pc) => {
-            // Literal character: must match exactly.
-            if h.first() == Some(pc) {
-                like_match_chars(&h[1..], &p[1..])
-            } else {
-                false
-            }
+            literal => tokens.push(LikeToken::Literal(fold_like_char(
+                literal,
+                case_insensitive,
+            ))),
         }
     }
+    tokens
+}
+
+fn fold_like_char(ch: char, case_insensitive: bool) -> char {
+    if case_insensitive {
+        ch.to_lowercase().next().unwrap_or(ch)
+    } else {
+        ch
+    }
+}
+
+fn like_match_tokens(haystack: &[char], pattern: &[LikeToken]) -> bool {
+    let mut prev = vec![false; pattern.len() + 1];
+    prev[0] = true;
+    for (idx, token) in pattern.iter().enumerate() {
+        if *token == LikeToken::AnySeq {
+            prev[idx + 1] = prev[idx];
+        }
+    }
+
+    for &ch in haystack {
+        let mut next = vec![false; pattern.len() + 1];
+        for (idx, token) in pattern.iter().enumerate() {
+            let col = idx + 1;
+            next[col] = match token {
+                LikeToken::AnySeq => next[col - 1] || prev[col],
+                LikeToken::AnyOne => prev[col - 1],
+                LikeToken::Literal(literal) => prev[col - 1] && ch == *literal,
+            }
+        }
+        prev = next;
+    }
+    prev[pattern.len()]
 }
 
 fn regex_match(haystack: &str, pattern: &str, case_insensitive: bool) -> Result<bool, EvalError> {
@@ -9464,6 +9486,24 @@ mod tests {
     fn like_underscore_single_char() {
         let ev = Eval::new(binop(BinaryOp::Like, lit_text("foo"), lit_text("f_o")));
         assert_eq!(ev.eval(&[]).unwrap(), Value::Bool(true));
+    }
+
+    #[test]
+    fn like_backslash_escapes_wildcards() {
+        let escaped_underscore =
+            Eval::new(binop(BinaryOp::Like, lit_text("a_b"), lit_text(r"a\_b")));
+        assert_eq!(escaped_underscore.eval(&[]).unwrap(), Value::Bool(true));
+
+        let escaped_percent = Eval::new(binop(
+            BinaryOp::Like,
+            lit_text("sale%2026"),
+            lit_text(r"sale\%2026"),
+        ));
+        assert_eq!(escaped_percent.eval(&[]).unwrap(), Value::Bool(true));
+
+        let wildcard_still_wild =
+            Eval::new(binop(BinaryOp::Like, lit_text("axb"), lit_text(r"a\_b")));
+        assert_eq!(wildcard_still_wild.eval(&[]).unwrap(), Value::Bool(false));
     }
 
     #[test]
