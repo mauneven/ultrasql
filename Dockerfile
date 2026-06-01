@@ -4,6 +4,9 @@ ARG RUST_VERSION=1.85
 
 FROM rust:${RUST_VERSION}-bookworm AS build
 WORKDIR /src
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends binutils lld \
+    && rm -rf /var/lib/apt/lists/*
 COPY . .
 RUN cargo build --locked --profile release-ship \
     --bin ultrasqld \
