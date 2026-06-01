@@ -150,7 +150,7 @@ impl Filter {
 
         let mut out_cols: Vec<Column> = Vec::with_capacity(cols.len());
         for col in cols {
-            out_cols.push(select_column(col, &mask, selected));
+            out_cols.push(select_column(col, &mask, selected)?);
         }
         Ok(TryFastPath::Handled(Batch::new(out_cols)?))
     }
@@ -558,51 +558,21 @@ fn merge_numeric_validity<T>(left: &NumericColumn<T>, right: &NumericColumn<T>) 
 /// length equals `selected` (the popcount of the mask, passed in to
 /// avoid re-counting once per column).
 ///
-/// Every per-type branch allocates a fresh non-nullable column. NULL
-/// inputs are dropped because the mask already excluded them (the
-/// comparison kernels AND the validity bitmap into the data-compare
-/// result — see `cmp_i32_scalar` / `cmp_i64_scalar`).
-fn select_column(column: &Column, mask: &Bitmap, selected: usize) -> Column {
+/// Every per-type branch allocates a fresh column and preserves the source
+/// column's validity bitmap for selected rows. A predicate mask only proves
+/// that the predicate's referenced columns passed SQL 3VL; unrelated projected
+/// columns may still be NULL and must stay NULL after compaction.
+pub(crate) fn select_column(
+    column: &Column,
+    mask: &Bitmap,
+    selected: usize,
+) -> Result<Column, ExecError> {
     match column {
-        Column::Int32(c) => {
-            let data = c.data();
-            let mut out = Vec::with_capacity(selected);
-            for i in mask.iter_ones() {
-                out.push(data[i]);
-            }
-            Column::Int32(NumericColumn::from_data(out))
-        }
-        Column::Int64(c) => {
-            let data = c.data();
-            let mut out = Vec::with_capacity(selected);
-            for i in mask.iter_ones() {
-                out.push(data[i]);
-            }
-            Column::Int64(NumericColumn::from_data(out))
-        }
-        Column::Float32(c) => {
-            let data = c.data();
-            let mut out = Vec::with_capacity(selected);
-            for i in mask.iter_ones() {
-                out.push(data[i]);
-            }
-            Column::Float32(NumericColumn::from_data(out))
-        }
-        Column::Float64(c) => {
-            let data = c.data();
-            let mut out = Vec::with_capacity(selected);
-            for i in mask.iter_ones() {
-                out.push(data[i]);
-            }
-            Column::Float64(NumericColumn::from_data(out))
-        }
-        Column::Bool(c) => {
-            let mut out = Vec::with_capacity(selected);
-            for i in mask.iter_ones() {
-                out.push(c.value(i));
-            }
-            Column::Bool(BoolColumn::from_data(out))
-        }
+        Column::Int32(c) => Ok(Column::Int32(select_numeric_column(c, mask, selected)?)),
+        Column::Int64(c) => Ok(Column::Int64(select_numeric_column(c, mask, selected)?)),
+        Column::Float32(c) => Ok(Column::Float32(select_numeric_column(c, mask, selected)?)),
+        Column::Float64(c) => Ok(Column::Float64(select_numeric_column(c, mask, selected)?)),
+        Column::Bool(c) => Ok(Column::Bool(select_bool_column(c, mask, selected)?)),
         Column::Utf8(_) | Column::DictionaryUtf8(_) => {
             let mut out: Vec<Option<String>> = Vec::with_capacity(selected);
             for i in mask.iter_ones() {
@@ -612,9 +582,66 @@ fn select_column(column: &Column, mask: &Bitmap, selected: usize) -> Column {
                 out.iter().map(|v| v.as_deref()),
                 DictionaryEncodingPolicy::default(),
             ) {
-                StringEncoding::Raw(c) => Column::Utf8(c),
-                StringEncoding::Dictionary(c) => Column::DictionaryUtf8(c),
+                StringEncoding::Raw(c) => Ok(Column::Utf8(c)),
+                StringEncoding::Dictionary(c) => Ok(Column::DictionaryUtf8(c)),
             }
+        }
+    }
+}
+
+fn select_numeric_column<T: Copy>(
+    column: &NumericColumn<T>,
+    mask: &Bitmap,
+    selected: usize,
+) -> Result<NumericColumn<T>, ExecError> {
+    let data = column.data();
+    let mut out = Vec::with_capacity(selected);
+    match column.nulls() {
+        Some(nulls) => {
+            let mut out_nulls = Bitmap::new(selected, false);
+            for (out_idx, input_idx) in mask.iter_ones().enumerate() {
+                out.push(data[input_idx]);
+                if nulls.get(input_idx) {
+                    out_nulls.set(out_idx, true);
+                }
+            }
+            NumericColumn::with_nulls(out, out_nulls).map_err(|err| {
+                ExecError::TypeMismatch(format!("filter selection validity mismatch: {err}"))
+            })
+        }
+        None => {
+            for input_idx in mask.iter_ones() {
+                out.push(data[input_idx]);
+            }
+            Ok(NumericColumn::from_data(out))
+        }
+    }
+}
+
+fn select_bool_column(
+    column: &BoolColumn,
+    mask: &Bitmap,
+    selected: usize,
+) -> Result<BoolColumn, ExecError> {
+    let mut out = Vec::with_capacity(selected);
+    match column.nulls() {
+        Some(nulls) => {
+            let mut out_nulls = Bitmap::new(selected, false);
+            for (out_idx, input_idx) in mask.iter_ones().enumerate() {
+                out.push(column.value(input_idx));
+                if nulls.get(input_idx) {
+                    out_nulls.set(out_idx, true);
+                }
+            }
+            BoolColumn::with_nulls(out, out_nulls).map_err(|err| {
+                ExecError::TypeMismatch(format!("filter selection validity mismatch: {err}"))
+            })
+        }
+        None => {
+            for input_idx in mask.iter_ones() {
+                out.push(column.value(input_idx));
+            }
+            Ok(BoolColumn::from_data(out))
         }
     }
 }
@@ -1355,7 +1382,9 @@ mod tests {
             &Column::Float32(NumericColumn::from_data(vec![1.0, 2.0, 3.0, 4.0])),
             &mask,
             2,
-        ) {
+        )
+        .expect("select float32")
+        {
             Column::Float32(c) => assert_eq!(c.data(), &[1.0, 3.0]),
             other => panic!("expected float32 column, got {other:?}"),
         }
@@ -1363,7 +1392,9 @@ mod tests {
             &Column::Float64(NumericColumn::from_data(vec![1.0, 2.0, 3.0, 4.0])),
             &mask,
             2,
-        ) {
+        )
+        .expect("select float64")
+        {
             Column::Float64(c) => assert_eq!(c.data(), &[1.0, 3.0]),
             other => panic!("expected float64 column, got {other:?}"),
         }
@@ -1371,7 +1402,9 @@ mod tests {
             &Column::Bool(BoolColumn::from_data(vec![true, false, true, false])),
             &mask,
             2,
-        ) {
+        )
+        .expect("select bool")
+        {
             Column::Bool(c) => {
                 assert!(c.value(0));
                 assert!(c.value(1));
@@ -1384,13 +1417,39 @@ mod tests {
             )),
             &mask,
             2,
-        );
+        )
+        .expect("select text");
         match &selected_text {
             Column::Utf8(_) | Column::DictionaryUtf8(_) => {
                 assert_eq!(selected_text.text_value(0), Some("a"));
                 assert_eq!(selected_text.text_value(1), Some("a"));
             }
             other => panic!("expected text column, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn select_column_preserves_selected_nulls() {
+        let mut mask = Bitmap::new(4, false);
+        mask.set(0, true);
+        mask.set(1, true);
+        mask.set(3, true);
+
+        let mut nulls = Bitmap::new(4, true);
+        nulls.set(1, false);
+        nulls.set(2, false);
+        let source = NumericColumn::with_nulls(vec![10_i32, 0, 0, 9], nulls)
+            .expect("source nullable column");
+
+        match select_column(&Column::Int32(source), &mask, 3).expect("select nullable int") {
+            Column::Int32(selected) => {
+                assert_eq!(selected.data(), &[10, 0, 9]);
+                let selected_nulls = selected.nulls().expect("selected stays nullable");
+                assert!(selected_nulls.get(0));
+                assert!(!selected_nulls.get(1));
+                assert!(selected_nulls.get(2));
+            }
+            other => panic!("expected int32 column, got {other:?}"),
         }
     }
 

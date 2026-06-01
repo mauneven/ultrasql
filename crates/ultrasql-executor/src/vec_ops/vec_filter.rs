@@ -10,14 +10,11 @@
 
 use ultrasql_core::{Schema, Value};
 use ultrasql_planner::{BinaryOp, ScalarExpr};
-use ultrasql_vec::column::{Column, NumericColumn};
-use ultrasql_vec::{
-    Batch, Bitmap, DictionaryEncodingPolicy, StringEncoding, encode_strings_auto, filter_eq_i32,
-    filter_eq_i64,
-};
+use ultrasql_vec::column::Column;
+use ultrasql_vec::{Batch, Bitmap, filter_eq_i32, filter_eq_i64};
 
 use crate::eval::Eval;
-use crate::filter_op::batch_to_rows;
+use crate::filter_op::{batch_to_rows, select_column};
 use crate::push_pipeline::{SinkVerdict, VectorizedOperator, VectorizedSink};
 use crate::seq_scan::build_batch;
 use crate::{ExecError, eval_error_to_exec_error};
@@ -163,42 +160,10 @@ fn try_simd_filter(batch: &Batch, predicate: &ScalarExpr) -> Result<Option<Bitma
 fn materialise_selection(batch: &Batch, mask: &Bitmap) -> Result<Batch, ExecError> {
     let cols = batch.columns();
     let mut out_cols: Vec<Column> = Vec::with_capacity(cols.len());
+    let selected = mask.count_ones();
 
     for col in cols {
-        let selected: Column = match col {
-            Column::Int32(c) => Column::Int32(NumericColumn::from_data(
-                mask.iter_ones().map(|i| c.data()[i]).collect(),
-            )),
-            Column::Int64(c) => Column::Int64(NumericColumn::from_data(
-                mask.iter_ones().map(|i| c.data()[i]).collect(),
-            )),
-            Column::Float32(c) => Column::Float32(NumericColumn::from_data(
-                mask.iter_ones().map(|i| c.data()[i]).collect(),
-            )),
-            Column::Float64(c) => Column::Float64(NumericColumn::from_data(
-                mask.iter_ones().map(|i| c.data()[i]).collect(),
-            )),
-            Column::Bool(c) => {
-                use ultrasql_vec::column::BoolColumn;
-                Column::Bool(BoolColumn::from_data(
-                    mask.iter_ones().map(|i| c.value(i)).collect(),
-                ))
-            }
-            Column::Utf8(_) | Column::DictionaryUtf8(_) => {
-                let rows: Vec<Option<String>> = mask
-                    .iter_ones()
-                    .map(|i| col.text_value(i).map(str::to_owned))
-                    .collect();
-                match encode_strings_auto(
-                    rows.iter().map(|v| v.as_deref()),
-                    DictionaryEncodingPolicy::default(),
-                ) {
-                    StringEncoding::Raw(c) => Column::Utf8(c),
-                    StringEncoding::Dictionary(c) => Column::DictionaryUtf8(c),
-                }
-            }
-        };
-        out_cols.push(selected);
+        out_cols.push(select_column(col, mask, selected)?);
     }
 
     Batch::new(out_cols).map_err(ExecError::from)
