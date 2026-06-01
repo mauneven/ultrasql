@@ -21,6 +21,7 @@ derived_from=src/test/regress/sql/constraints.sql
 derived_from=src/test/regress/sql/create_operator.sql
 derived_from=src/test/regress/sql/opr_sanity.sql
 file=select_basics.slt
+file=expression_predicate_baseline.slt
 file=join_setop_baseline.slt
 file=parser_type_baseline.slt
 file=index_constraint_operator_baseline.slt

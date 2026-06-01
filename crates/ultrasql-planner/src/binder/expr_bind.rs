@@ -559,8 +559,45 @@ pub(super) fn bind_expr_with_ctes(
             bind_extremum_expr("least", args, input, catalog, cte_catalog, scope)
         }
 
+        Expr::IsDistinctFrom {
+            left,
+            right,
+            negated,
+            ..
+        } => bind_is_distinct_from_expr(left, right, *negated, input, catalog, cte_catalog, scope),
+
         _ => Err(PlanError::NotSupported("expression variant")),
     }
+}
+
+fn bind_is_distinct_from_expr(
+    left: &Expr,
+    right: &Expr,
+    negated: bool,
+    input: &Schema,
+    catalog: &dyn Catalog,
+    cte_catalog: &[(String, Schema)],
+    scope: &mut ScopeStack,
+) -> Result<ScalarExpr, PlanError> {
+    let mut left = bind_expr_with_ctes(left, input, catalog, cte_catalog, scope)?;
+    let mut right = bind_expr_with_ctes(right, input, catalog, cte_catalog, scope)?;
+    coerce_literal_to_match(&mut left, &mut right);
+    let left_type = left.data_type();
+    let right_type = right.data_type();
+    if !comparable(&left_type, &right_type) {
+        return Err(PlanError::TypeMismatch(format!(
+            "IS DISTINCT FROM: cannot compare {left_type} and {right_type}"
+        )));
+    }
+    Ok(ScalarExpr::FunctionCall {
+        name: if negated {
+            "is_not_distinct_from".to_owned()
+        } else {
+            "is_distinct_from".to_owned()
+        },
+        args: vec![left, right],
+        data_type: DataType::Bool,
+    })
 }
 
 fn bind_extremum_expr(

@@ -348,6 +348,8 @@ fn eval_function_call(
         "querytree" => eval_querytree(args),
         "ifnull" | "nvl" => eval_ifnull(args),
         "nullif" => eval_nullif(args),
+        "is_distinct_from" => eval_is_distinct_from(args, false),
+        "is_not_distinct_from" => eval_is_distinct_from(args, true),
         "least" => eval_extremum(args, "least", ExtremumKind::Least, NullPolicy::Ignore),
         "greatest" => eval_extremum(args, "greatest", ExtremumKind::Greatest, NullPolicy::Ignore),
         "min" => eval_extremum(args, "min", ExtremumKind::Least, NullPolicy::Propagate),
@@ -515,6 +517,17 @@ fn eval_nullif(args: &[Value]) -> Result<Value, EvalError> {
     } else {
         Ok(args[0].clone())
     }
+}
+
+fn eval_is_distinct_from(args: &[Value], negated: bool) -> Result<Value, EvalError> {
+    if args.len() != 2 {
+        return Err(EvalError::Type(format!(
+            "is_distinct_from: expected 2 args, got {}",
+            args.len()
+        )));
+    }
+    let distinct = sql_is_distinct_from(&args[0], &args[1])?;
+    Ok(Value::Bool(if negated { !distinct } else { distinct }))
 }
 
 fn eval_extremum(
@@ -6069,6 +6082,37 @@ fn sql_eq_3vl(lv: &Value, rv: &Value) -> Result<Option<bool>, EvalError> {
         ))),
         _ => compare_values(lv, rv).map(|ordering| Some(ordering == std::cmp::Ordering::Equal)),
     }
+}
+
+fn sql_is_distinct_from(lv: &Value, rv: &Value) -> Result<bool, EvalError> {
+    match (lv, rv) {
+        (Value::Null, Value::Null) => Ok(false),
+        (Value::Null, _) | (_, Value::Null) => Ok(true),
+        (Value::Record(left), Value::Record(right)) => record_is_distinct_from(left, right),
+        (Value::Record(_), _) | (_, Value::Record(_)) => Err(EvalError::Type(format!(
+            "record comparison type mismatch: {lv:?} and {rv:?}"
+        ))),
+        _ => compare_values(lv, rv).map(|ordering| ordering != std::cmp::Ordering::Equal),
+    }
+}
+
+fn record_is_distinct_from(
+    left: &[(String, Value)],
+    right: &[(String, Value)],
+) -> Result<bool, EvalError> {
+    if left.len() != right.len() {
+        return Err(EvalError::Type(format!(
+            "record arity mismatch: {} and {}",
+            left.len(),
+            right.len()
+        )));
+    }
+    for ((_, left_value), (_, right_value)) in left.iter().zip(right.iter()) {
+        if sql_is_distinct_from(left_value, right_value)? {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 fn record_eq_3vl(

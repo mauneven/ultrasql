@@ -295,6 +295,55 @@ fn sql_regression_subset_preserves_public_provenance() {
 }
 
 #[test]
+fn sql_regression_expression_predicate_baseline_is_imported_and_provenanced() {
+    let subset = repo_root().join("tests/slt/sql_regression/regression_subset");
+    let manifest =
+        fs::read_to_string(subset.join("IMPORT_MANIFEST.txt")).expect("read PostgreSQL manifest");
+    let readme = fs::read_to_string(subset.join("README.md")).expect("read PostgreSQL README");
+    let shard = subset.join("expression_predicate_baseline.slt");
+    let text = fs::read_to_string(&shard).expect("read expression/predicate shard");
+
+    assert!(
+        manifest.contains("derived_from=src/test/regress/sql/select.sql"),
+        "manifest:\n{manifest}"
+    );
+    assert!(
+        manifest.contains("file=expression_predicate_baseline.slt"),
+        "manifest:\n{manifest}"
+    );
+    assert!(
+        readme.contains("expression_predicate_baseline.slt"),
+        "README:\n{readme}"
+    );
+    assert!(
+        text.contains("PostgreSQL regression-derived expression/predicate baseline"),
+        "{} must document reviewed scope",
+        shard.display()
+    );
+    for surface in [
+        "IS DISTINCT FROM",
+        "IS NOT DISTINCT FROM",
+        "ILIKE",
+        "NULLIF",
+        "GREATEST",
+        "LEAST",
+        "BETWEEN SYMMETRIC",
+    ] {
+        assert!(
+            text.contains(surface),
+            "{} missing {surface}",
+            shard.display()
+        );
+    }
+    let case_count = count_slt_cases(&text);
+    assert!(
+        (5..=16).contains(&case_count),
+        "{} must stay as a small reviewed shard, got {case_count} cases",
+        shard.display()
+    );
+}
+
+#[test]
 fn sql_regression_subset_runs_all_active_shards_in_process() {
     let bin = env!("CARGO_BIN_EXE_ultrasql-sqllogictest-runner");
     let subset = repo_root().join("tests/slt/sql_regression/regression_subset");
