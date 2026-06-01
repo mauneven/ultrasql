@@ -111,6 +111,9 @@ as a concise evidence ledger; roadmap stays for open gates only.
   `cargo test -p ultrasql-wal --lib -- --nocapture`,
   `cargo clippy -p ultrasql-wal --lib --all-features -- -D clippy::unwrap_used -D clippy::expect_used`,
   and `cargo clippy -p ultrasql-wal --all-targets --all-features -- -D warnings`.
+- Workspace production library panic audit now clears strict `unwrap`/`expect`
+  linting for lib targets across the full workspace. Evidence:
+  `cargo clippy --workspace --lib --all-features -- -D clippy::unwrap_used -D clippy::expect_used`.
 - Focused `ultrasql-executor` coverage now exercises scalar compatibility
   functions, physical lowering edge families, row encoding/decoding,
   projection/filter/sort/unique/set/window/hash aggregate behavior, modify-table
