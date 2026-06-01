@@ -151,5 +151,61 @@ class JdbcJarTests(unittest.TestCase):
             self.assertEqual(calls[1][-1], driver_certification.JDBC_URLS[1])
 
 
+class DriverRoleBootstrapTests(unittest.TestCase):
+    """Certification role bootstrap behavior."""
+
+    def test_prepare_driver_cert_role_uses_bootstrap_superuser(self) -> None:
+        """The harness must register driver_cert before driver checks run."""
+
+        calls: list[dict[str, object]] = []
+
+        def fake_run(
+            cmd: list[str],
+            *,
+            input: str,
+            text: bool,
+            stdout: int,
+            stderr: int,
+            check: bool,
+        ) -> subprocess.CompletedProcess[str]:
+            calls.append(
+                {
+                    "cmd": cmd,
+                    "input": input,
+                    "text": text,
+                    "stdout": stdout,
+                    "stderr": stderr,
+                    "check": check,
+                }
+            )
+            return subprocess.CompletedProcess(cmd, 0, "CREATE ROLE\n", "")
+
+        with (
+            mock.patch.object(
+                driver_certification,
+                "require_tool",
+                return_value="/usr/bin/psql",
+            ),
+            mock.patch.object(driver_certification.subprocess, "run", side_effect=fake_run),
+        ):
+            driver_certification.prepare_driver_cert_role(6543)
+
+        self.assertEqual(len(calls), 1)
+        command = calls[0]["cmd"]
+        self.assertIsInstance(command, list)
+        self.assertEqual(command[0], "/usr/bin/psql")
+        self.assertTrue(
+            any(
+                part.startswith("postgresql://ultrasql@127.0.0.1:6543/ultrasql")
+                for part in command
+            )
+        )
+        script = calls[0]["input"]
+        self.assertIsInstance(script, str)
+        self.assertIn("CREATE ROLE IF NOT EXISTS driver_cert SUPERUSER LOGIN", script)
+        self.assertTrue(calls[0]["text"])
+        self.assertFalse(calls[0]["check"])
+
+
 if __name__ == "__main__":
     unittest.main()

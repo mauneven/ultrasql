@@ -279,6 +279,43 @@ def dsn_uri(port: int, application_name: str) -> str:
     )
 
 
+def bootstrap_dsn_uri(port: int, application_name: str) -> str:
+    """Build a local admin URI used only to prepare certification state."""
+
+    return (
+        f"postgresql://ultrasql@{HOST}:{port}/ultrasql"
+        f"?sslmode=disable&application_name={application_name}"
+    )
+
+
+def prepare_driver_cert_role(port: int) -> None:
+    """Register the ephemeral certification login role."""
+
+    psql = require_tool("psql", "install PostgreSQL client tools")
+    script = "CREATE ROLE IF NOT EXISTS driver_cert SUPERUSER LOGIN;\n"
+    completed = subprocess.run(
+        [
+            psql,
+            "-X",
+            "--no-password",
+            "--set",
+            "ON_ERROR_STOP=1",
+            bootstrap_dsn_uri(port, "driver_cert_bootstrap"),
+        ],
+        input=script,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+    if completed.returncode != 0:
+        raise CertificationFailure(
+            "driver certification role bootstrap failed\n"
+            f"stdout:\n{completed.stdout}\n"
+            f"stderr:\n{completed.stderr}"
+        )
+
+
 def jdbc_url(port: int) -> str:
     """Build a JDBC URL for the PostgreSQL driver."""
 
@@ -1555,6 +1592,7 @@ def main() -> int:
     port = 0
     try:
         proc, port = start_ultrasqld(args.ultrasqld)
+        prepare_driver_cert_role(port)
         results = [
             certify_psql_meta_commands(port),
             certify_gui_introspection(port),

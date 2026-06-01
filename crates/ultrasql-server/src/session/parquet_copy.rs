@@ -598,7 +598,6 @@ fn char_cell(array: &dyn Array, row_index: usize, len: Option<u32>) -> Result<Va
 #[cfg(test)]
 mod tests {
     use super::super::copy::add_copy_rows;
-    use super::*;
 
     #[test]
     fn parquet_copy_row_count_helpers_reject_overflow() {
@@ -612,6 +611,8 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn parquet_file_helpers_reject_symlinks() {
+        use super::{create_parquet_output_file, open_parquet_input_file};
+        use std::fs;
         use std::os::unix::fs::symlink;
 
         let dir = tempfile::TempDir::new().expect("temp dir");
