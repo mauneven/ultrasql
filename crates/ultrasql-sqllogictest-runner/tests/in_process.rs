@@ -323,6 +323,12 @@ fn sql_regression_expression_predicate_baseline_is_imported_and_provenanced() {
     for surface in [
         "IS DISTINCT FROM",
         "IS NOT DISTINCT FROM",
+        "IS TRUE",
+        "IS NOT TRUE",
+        "IS FALSE",
+        "IS NOT FALSE",
+        "IS UNKNOWN",
+        "IS NOT UNKNOWN",
         "ILIKE",
         "NULLIF",
         "GREATEST",
@@ -337,7 +343,7 @@ fn sql_regression_expression_predicate_baseline_is_imported_and_provenanced() {
     }
     let case_count = count_slt_cases(&text);
     assert!(
-        (5..=16).contains(&case_count),
+        (5..=20).contains(&case_count),
         "{} must stay as a small reviewed shard, got {case_count} cases",
         shard.display()
     );

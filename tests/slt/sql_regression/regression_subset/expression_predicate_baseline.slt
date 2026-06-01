@@ -66,3 +66,51 @@ WHERE id IN (1, 2, 4)
 
 statement ok
 DROP TABLE slt_pg_expr_predicate
+
+statement ok
+CREATE TABLE slt_pg_bool_predicate (
+  id INT NOT NULL,
+  flag BOOL
+)
+
+statement ok
+INSERT INTO slt_pg_bool_predicate VALUES
+  (1, TRUE),
+  (2, FALSE),
+  (3, NULL)
+
+query I nosort
+SELECT id FROM slt_pg_bool_predicate WHERE flag IS TRUE
+----
+1
+
+query I rowsort
+SELECT id FROM slt_pg_bool_predicate WHERE flag IS NOT TRUE
+----
+2
+3
+
+query I nosort
+SELECT id FROM slt_pg_bool_predicate WHERE flag IS FALSE
+----
+2
+
+query I rowsort
+SELECT id FROM slt_pg_bool_predicate WHERE flag IS NOT FALSE
+----
+1
+3
+
+query I nosort
+SELECT id FROM slt_pg_bool_predicate WHERE flag IS UNKNOWN
+----
+3
+
+query I rowsort
+SELECT id FROM slt_pg_bool_predicate WHERE flag IS NOT UNKNOWN
+----
+1
+2
+
+statement ok
+DROP TABLE slt_pg_bool_predicate

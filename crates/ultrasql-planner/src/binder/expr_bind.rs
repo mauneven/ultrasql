@@ -33,6 +33,13 @@ pub(super) enum BuiltinCollation {
     Posix,
 }
 
+#[derive(Clone, Copy, Debug)]
+struct BooleanPredicate {
+    value: bool,
+    is_unknown: bool,
+    negated: bool,
+}
+
 impl BuiltinCollation {
     pub(super) const fn oid(self) -> u32 {
         match self {
@@ -559,6 +566,25 @@ pub(super) fn bind_expr_with_ctes(
             bind_extremum_expr("least", args, input, catalog, cte_catalog, scope)
         }
 
+        Expr::IsBoolean {
+            expr: inner,
+            value,
+            is_unknown,
+            negated,
+            ..
+        } => bind_is_boolean_expr(
+            inner,
+            BooleanPredicate {
+                value: *value,
+                is_unknown: *is_unknown,
+                negated: *negated,
+            },
+            input,
+            catalog,
+            cte_catalog,
+            scope,
+        ),
+
         Expr::IsDistinctFrom {
             left,
             right,
@@ -568,6 +594,41 @@ pub(super) fn bind_expr_with_ctes(
 
         _ => Err(PlanError::NotSupported("expression variant")),
     }
+}
+
+fn bind_is_boolean_expr(
+    inner: &Expr,
+    predicate: BooleanPredicate,
+    input: &Schema,
+    catalog: &dyn Catalog,
+    cte_catalog: &[(String, Schema)],
+    scope: &mut ScopeStack,
+) -> Result<ScalarExpr, PlanError> {
+    let mut bound = bind_expr_with_ctes(inner, input, catalog, cte_catalog, scope)?;
+    coerce_literal_to_type(&mut bound, &DataType::Bool);
+    let data_type = bound.data_type();
+    if !matches!(data_type, DataType::Bool | DataType::Null) {
+        return Err(PlanError::TypeMismatch(format!(
+            "IS boolean predicate requires boolean input, got {data_type}"
+        )));
+    }
+    if predicate.is_unknown {
+        return Ok(ScalarExpr::IsNull {
+            expr: Box::new(bound),
+            negated: predicate.negated,
+        });
+    }
+    let name = match (predicate.value, predicate.negated) {
+        (true, false) => "is_true",
+        (true, true) => "is_not_true",
+        (false, false) => "is_false",
+        (false, true) => "is_not_false",
+    };
+    Ok(ScalarExpr::FunctionCall {
+        name: name.to_owned(),
+        args: vec![bound],
+        data_type: DataType::Bool,
+    })
 }
 
 fn bind_is_distinct_from_expr(

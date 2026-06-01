@@ -350,6 +350,10 @@ fn eval_function_call(
         "nullif" => eval_nullif(args),
         "is_distinct_from" => eval_is_distinct_from(args, false),
         "is_not_distinct_from" => eval_is_distinct_from(args, true),
+        "is_true" => eval_is_boolean(args, BooleanTest::True),
+        "is_not_true" => eval_is_boolean(args, BooleanTest::NotTrue),
+        "is_false" => eval_is_boolean(args, BooleanTest::False),
+        "is_not_false" => eval_is_boolean(args, BooleanTest::NotFalse),
         "least" => eval_extremum(args, "least", ExtremumKind::Least, NullPolicy::Ignore),
         "greatest" => eval_extremum(args, "greatest", ExtremumKind::Greatest, NullPolicy::Ignore),
         "min" => eval_extremum(args, "min", ExtremumKind::Least, NullPolicy::Propagate),
@@ -488,6 +492,14 @@ enum NullPolicy {
     Propagate,
 }
 
+#[derive(Clone, Copy)]
+enum BooleanTest {
+    True,
+    NotTrue,
+    False,
+    NotFalse,
+}
+
 fn eval_ifnull(args: &[Value]) -> Result<Value, EvalError> {
     if args.len() != 2 {
         return Err(EvalError::Type(format!(
@@ -528,6 +540,28 @@ fn eval_is_distinct_from(args: &[Value], negated: bool) -> Result<Value, EvalErr
     }
     let distinct = sql_is_distinct_from(&args[0], &args[1])?;
     Ok(Value::Bool(if negated { !distinct } else { distinct }))
+}
+
+fn eval_is_boolean(args: &[Value], test: BooleanTest) -> Result<Value, EvalError> {
+    if args.len() != 1 {
+        return Err(EvalError::Type(format!(
+            "IS boolean predicate: expected 1 arg, got {}",
+            args.len()
+        )));
+    }
+    let result = match (&args[0], test) {
+        (Value::Bool(true), BooleanTest::True | BooleanTest::NotFalse) => true,
+        (Value::Bool(false), BooleanTest::False | BooleanTest::NotTrue) => true,
+        (Value::Null, BooleanTest::NotTrue | BooleanTest::NotFalse) => true,
+        (Value::Bool(_) | Value::Null, _) => false,
+        (other, _) => {
+            return Err(EvalError::Type(format!(
+                "IS boolean predicate expected boolean input, got {:?}",
+                other.data_type()
+            )));
+        }
+    };
+    Ok(Value::Bool(result))
 }
 
 fn eval_extremum(
@@ -9160,6 +9194,27 @@ mod tests {
     fn kleene_true_and_true_is_true() {
         let ev = Eval::new(binop(BinaryOp::And, lit_bool(true), lit_bool(true)));
         assert_eq!(ev.eval(&[]).unwrap(), Value::Bool(true));
+    }
+
+    #[test]
+    fn is_boolean_predicates_use_sql_truth_table() {
+        let eval_call = |name: &str, arg: ScalarExpr| {
+            Eval::new(call(name, vec![arg], DataType::Bool))
+                .eval(&[])
+                .unwrap()
+        };
+
+        assert_eq!(eval_call("is_true", lit_bool(true)), Value::Bool(true));
+        assert_eq!(eval_call("is_true", lit_bool(false)), Value::Bool(false));
+        assert_eq!(eval_call("is_true", lit_null()), Value::Bool(false));
+        assert_eq!(eval_call("is_not_true", lit_bool(false)), Value::Bool(true));
+        assert_eq!(eval_call("is_not_true", lit_null()), Value::Bool(true));
+
+        assert_eq!(eval_call("is_false", lit_bool(false)), Value::Bool(true));
+        assert_eq!(eval_call("is_false", lit_bool(true)), Value::Bool(false));
+        assert_eq!(eval_call("is_false", lit_null()), Value::Bool(false));
+        assert_eq!(eval_call("is_not_false", lit_bool(true)), Value::Bool(true));
+        assert_eq!(eval_call("is_not_false", lit_null()), Value::Bool(true));
     }
 
     #[test]
