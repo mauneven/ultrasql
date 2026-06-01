@@ -4,18 +4,18 @@ const test = require("node:test");
 const { assetForPlatform } = require("../scripts/platform");
 
 test("maps supported platforms to release assets", () => {
-  assert.deepEqual(assetForPlatform("0.0.7", "darwin", "arm64"), {
-    archive: "ultrasql-v0.0.7-aarch64-apple-darwin.tar.gz",
+  assert.deepEqual(assetForPlatform("0.0.8", "darwin", "arm64"), {
+    archive: "ultrasql-v0.0.8-aarch64-apple-darwin.tar.gz",
     binaryExtension: "",
     target: "aarch64-apple-darwin",
   });
-  assert.deepEqual(assetForPlatform("0.0.7", "linux", "x64"), {
-    archive: "ultrasql-v0.0.7-x86_64-unknown-linux-gnu.tar.gz",
+  assert.deepEqual(assetForPlatform("0.0.8", "linux", "x64"), {
+    archive: "ultrasql-v0.0.8-x86_64-unknown-linux-gnu.tar.gz",
     binaryExtension: "",
     target: "x86_64-unknown-linux-gnu",
   });
-  assert.deepEqual(assetForPlatform("0.0.7", "win32", "x64"), {
-    archive: "ultrasql-v0.0.7-x86_64-pc-windows-msvc.zip",
+  assert.deepEqual(assetForPlatform("0.0.8", "win32", "x64"), {
+    archive: "ultrasql-v0.0.8-x86_64-pc-windows-msvc.zip",
     binaryExtension: ".exe",
     target: "x86_64-pc-windows-msvc",
   });
@@ -23,7 +23,7 @@ test("maps supported platforms to release assets", () => {
 
 test("rejects unsupported platforms", () => {
   assert.throws(
-    () => assetForPlatform("0.0.7", "freebsd", "x64"),
+    () => assetForPlatform("0.0.8", "freebsd", "x64"),
     /unsupported platform/
   );
 });

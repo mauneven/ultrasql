@@ -8,23 +8,23 @@ const { downloadPlan, isInstalled, vendorDirFor } = require("../scripts/install"
 
 test("builds checksum-verified release download plan", () => {
   const plan = downloadPlan({
-    packageVersion: "0.0.7",
+    packageVersion: "0.0.8",
     platform: "linux",
     arch: "arm64",
     repo: "mauneven/ultrasql",
   });
 
-  assert.equal(plan.tag, "v0.0.7");
+  assert.equal(plan.tag, "v0.0.8");
   assert.equal(
     plan.assetUrl,
-    "https://github.com/mauneven/ultrasql/releases/download/v0.0.7/ultrasql-v0.0.7-aarch64-unknown-linux-gnu.tar.gz"
+    "https://github.com/mauneven/ultrasql/releases/download/v0.0.8/ultrasql-v0.0.8-aarch64-unknown-linux-gnu.tar.gz"
   );
   assert.equal(`${plan.assetUrl}.sha256`, plan.checksumUrl);
 });
 
 test("accepts explicit v-prefixed release version override", () => {
   const plan = downloadPlan({
-    packageVersion: "0.0.7",
+    packageVersion: "0.0.8",
     versionOverride: "v0.0.1",
     platform: "darwin",
     arch: "x64",
@@ -40,7 +40,7 @@ test("accepts explicit v-prefixed release version override", () => {
 
 test("native install check requires ultrasql.node when requested", () => {
   const plan = downloadPlan({
-    packageVersion: "0.0.7",
+    packageVersion: "0.0.8",
     platform: process.platform,
     arch: process.arch,
     repo: "mauneven/ultrasql",

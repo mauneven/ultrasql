@@ -123,15 +123,15 @@ console.log(db.get("SELECT x FROM t"));
 GitHub Release package fallback:
 
 ```bash
-npm install -g https://github.com/mauneven/ultrasql/releases/download/v0.0.7/ultrasql-0.0.7.tgz
-pnpm add -g https://github.com/mauneven/ultrasql/releases/download/v0.0.7/ultrasql-0.0.7.tgz
+npm install -g https://github.com/mauneven/ultrasql/releases/download/v0.0.8/ultrasql-0.0.8.tgz
+pnpm add -g https://github.com/mauneven/ultrasql/releases/download/v0.0.8/ultrasql-0.0.8.tgz
 ```
 
 Windows PowerShell or setup EXE:
 
 ```powershell
 iwr https://raw.githubusercontent.com/mauneven/ultrasql/main/scripts/install.ps1 -UseB | iex
-iwr https://github.com/mauneven/ultrasql/releases/download/v0.0.7/ultrasql-v0.0.7-x86_64-pc-windows-msvc-setup.exe -OutFile ultrasql-setup.exe
+iwr https://github.com/mauneven/ultrasql/releases/download/v0.0.8/ultrasql-v0.0.8-x86_64-pc-windows-msvc-setup.exe -OutFile ultrasql-setup.exe
 Start-Process .\ultrasql-setup.exe -Wait
 ```
 

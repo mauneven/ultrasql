@@ -97,7 +97,7 @@ By default, the package downloads the release tag that matches its npm version.
 Override the binary release tag when needed:
 
 ```bash
-ULTRASQL_VERSION=v0.0.7 pnpm exec ultrasqld --listen 127.0.0.1:5433
+ULTRASQL_VERSION=v0.0.8 pnpm exec ultrasqld --listen 127.0.0.1:5433
 ```
 
 Skip the binary download entirely:
