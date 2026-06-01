@@ -9,8 +9,9 @@
 use ultrasql_core::Schema;
 use ultrasql_vec::Batch;
 use ultrasql_vec::column::{Column, NumericColumn};
-use ultrasql_vec::kernels::{eq_i32, select_i32};
+use ultrasql_vec::kernels::eq_i32;
 
+use crate::filter_op::select_column;
 use crate::{ExecError, Operator};
 
 /// Filter on `column[col_idx] == const_i32` over an `i32` column.
@@ -82,18 +83,10 @@ impl FilterEqI32 {
         let constants = NumericColumn::from_data(vec![self.constant; key_col.len()]);
         let mask = eq_i32(key_col, &constants);
 
+        let selected = mask.count_ones();
         let mut out_cols = Vec::with_capacity(cols.len());
-        for (i, col) in cols.iter().enumerate() {
-            match col {
-                Column::Int32(c) => out_cols.push(Column::Int32(select_i32(c, &mask))),
-                Column::Int64(c) => out_cols.push(Column::Int64(select_i64(c, &mask))),
-                _ => {
-                    return Err(ExecError::TypeMismatch(format!(
-                        "FilterEqI32 does not yet support column type {:?} at index {i}",
-                        col.data_type()
-                    )));
-                }
-            }
+        for col in cols {
+            out_cols.push(select_column(col, &mask, selected)?);
         }
         Batch::new(out_cols).map_err(Into::into)
     }
@@ -110,20 +103,6 @@ impl Operator for FilterEqI32 {
     fn schema(&self) -> &Schema {
         &self.schema
     }
-}
-
-/// Local `select_i64` analogue. The `ultrasql-vec` crate exports
-/// `select_i32`; an `i64` variant is pending. Implemented here in the
-/// executor to avoid modifying the kernels crate from this scope; the
-/// signature mirrors `select_i32` exactly so the two paths fuse once
-/// the kernel arrives.
-fn select_i64(column: &NumericColumn<i64>, selection: &ultrasql_vec::Bitmap) -> NumericColumn<i64> {
-    let take = selection.count_ones();
-    let mut out = Vec::with_capacity(take);
-    for i in selection.iter_ones() {
-        out.push(column.data()[i]);
-    }
-    NumericColumn::from_data(out)
 }
 
 #[cfg(test)]
@@ -152,6 +131,18 @@ mod tests {
         .expect("batch is well-formed")
     }
 
+    fn nullable_pair_batch(ids: Vec<i32>, vals: Vec<i64>, valid_vals: Vec<bool>) -> Batch {
+        let mut nulls = ultrasql_vec::Bitmap::new(valid_vals.len(), false);
+        for (idx, valid) in valid_vals.into_iter().enumerate() {
+            nulls.set(idx, valid);
+        }
+        Batch::new([
+            Column::Int32(NumericColumn::from_data(ids)),
+            Column::Int64(NumericColumn::with_nulls(vals, nulls).expect("nullable values")),
+        ])
+        .expect("batch is well-formed")
+    }
+
     #[test]
     fn filter_keeps_matching_rows() {
         let scan = MemTableScan::new(
@@ -169,6 +160,30 @@ mod tests {
             other => panic!("unexpected types: {other:?}"),
         }
         assert!(filter.next_batch().unwrap().is_none());
+    }
+
+    #[test]
+    fn filter_preserves_nulls_in_selected_value_columns() {
+        let scan = MemTableScan::new(
+            schema(),
+            vec![nullable_pair_batch(
+                vec![7, 1, 7, 2],
+                vec![0, 2, 3, 4],
+                vec![false, true, true, true],
+            )],
+        );
+        let mut filter = FilterEqI32::new(Box::new(scan), 0, 7).unwrap();
+        let out = filter.next_batch().unwrap().unwrap();
+        match (&out.columns()[0], &out.columns()[1]) {
+            (Column::Int32(ids), Column::Int64(vals)) => {
+                assert_eq!(ids.data(), &[7, 7]);
+                assert_eq!(vals.data(), &[0, 3]);
+                let nulls = vals.nulls().expect("selected values stay nullable");
+                assert!(!nulls.get(0));
+                assert!(nulls.get(1));
+            }
+            other => panic!("unexpected types: {other:?}"),
+        }
     }
 
     #[test]
