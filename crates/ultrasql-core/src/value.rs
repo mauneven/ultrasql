@@ -4176,7 +4176,7 @@ mod tests {
             Value::parse_array(DataType::Bytea, r#"{"\\xdead"}"#)
                 .unwrap()
                 .to_string(),
-            r#"{\xdead}"#
+            r#"{"\\xdead"}"#
         );
         assert_eq!(
             Value::parse_array(DataType::Money, "{$1.25}")
