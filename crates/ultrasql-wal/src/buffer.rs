@@ -50,6 +50,20 @@ pub enum WalBufferError {
         /// Bytes in the record being appended.
         bytes: u64,
     },
+    /// Buffered bytes cannot be represented as a 64-bit LSN span.
+    #[error("wal buffered byte length overflow: {bytes} bytes")]
+    BufferedBytesOverflow {
+        /// Bytes currently being drained.
+        bytes: usize,
+    },
+    /// The buffered byte count is larger than the recorded end LSN.
+    #[error("wal lsn underflow during drain: end {end}, bytes {bytes}")]
+    LsnUnderflow {
+        /// Recorded end LSN.
+        end: u64,
+        /// Bytes being drained.
+        bytes: u64,
+    },
 }
 
 /// In-memory WAL append buffer.
@@ -163,21 +177,25 @@ impl WalBuffer {
     ///
     /// In production this is called by the flusher thread on every
     /// fsync window. The buffer reuses its allocation across drains.
-    pub fn drain(&self) -> DrainedBatch {
+    pub fn drain(&self) -> Result<DrainedBatch, WalBufferError> {
         let mut inner = self.inner.lock();
         let end_lsn = inner.next_lsn;
         let bytes = std::mem::take(&mut inner.bytes);
         drop(inner);
 
-        let byte_len = u64::try_from(bytes.len()).expect("buffered WAL bytes fit in u64");
+        let byte_len = u64::try_from(bytes.len())
+            .map_err(|_| WalBufferError::BufferedBytesOverflow { bytes: bytes.len() })?;
         let start_lsn = end_lsn
             .checked_sub(byte_len)
-            .expect("buffer LSN span covers buffered bytes");
-        DrainedBatch {
+            .ok_or(WalBufferError::LsnUnderflow {
+                end: end_lsn,
+                bytes: byte_len,
+            })?;
+        Ok(DrainedBatch {
             bytes,
             start_lsn: Lsn::new(start_lsn),
             end_lsn: Lsn::new(end_lsn),
-        }
+        })
     }
 
     /// Record that the flusher has made all bytes up to and including
@@ -267,7 +285,7 @@ mod tests {
             buf.append(&rec(RecordType::HeapInsert, &[i], Lsn::ZERO))
                 .unwrap();
         }
-        let drained = buf.drain();
+        let drained = buf.drain().expect("drain succeeds");
         // We can decode the records back out of the byte stream in
         // order to confirm the buffer is FIFO.
         let mut offset = 0;
@@ -281,6 +299,30 @@ mod tests {
         assert_eq!(drained.start_lsn, Lsn::new(0));
         let drained_len = u64::try_from(drained.bytes.len()).expect("drained length fits u64");
         assert_eq!(drained.end_lsn, Lsn::new(drained_len));
+    }
+
+    #[test]
+    fn drain_rejects_inconsistent_lsn_span_without_panicking() {
+        let buf = WalBuffer::new(64 * 1024, Lsn::new(0));
+        buf.append(&rec(RecordType::HeapInsert, b"x", Lsn::ZERO))
+            .unwrap();
+        let buffered = buf.buffered_bytes();
+        {
+            let mut inner = buf.inner.lock();
+            inner.next_lsn = 0;
+        }
+
+        let err = buf
+            .drain()
+            .expect_err("corrupt buffered LSN span should return a typed error");
+        assert!(
+            matches!(
+                err,
+                WalBufferError::LsnUnderflow { end, bytes }
+                    if end == 0 && bytes == u64::try_from(buffered).unwrap()
+            ),
+            "{err:?}"
+        );
     }
 
     #[test]
@@ -329,7 +371,7 @@ mod tests {
         buf.append(&rec(RecordType::HeapInsert, b"x", Lsn::ZERO))
             .unwrap();
         assert!(buf.buffered_bytes() > 0);
-        let _ = buf.drain();
+        let _ = buf.drain().expect("drain succeeds");
         assert_eq!(buf.buffered_bytes(), 0);
     }
 

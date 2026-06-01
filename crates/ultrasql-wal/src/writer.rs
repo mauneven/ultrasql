@@ -40,7 +40,7 @@ use parking_lot::{Condvar, Mutex};
 use tracing::{debug, error, info, warn};
 use ultrasql_core::Lsn;
 
-use crate::buffer::WalBuffer;
+use crate::buffer::{WalBuffer, WalBufferError};
 use crate::record::WalRecordError;
 use crate::segment::{list_segments, segment_path};
 
@@ -54,6 +54,10 @@ pub enum WalWriterError {
     /// A record from the buffer failed to encode or decode.
     #[error("wal writer record error: {0}")]
     Encode(#[from] WalRecordError),
+
+    /// The shared WAL append buffer reported a consistency or capacity error.
+    #[error("wal writer buffer error: {0}")]
+    Buffer(#[from] WalBufferError),
 
     /// The writer thread has already been shut down or terminated
     /// abnormally.
@@ -365,7 +369,7 @@ impl WriterDriver {
 
         loop {
             // Drain whatever is pending in the buffer first.
-            let drained = self.buffer.drain();
+            let drained = self.buffer.drain()?;
             if !drained.bytes.is_empty() {
                 self.write_drained(&drained.bytes, drained.end_lsn)?;
             }
@@ -389,7 +393,7 @@ impl WriterDriver {
             if stopping {
                 // Drain one last time in case appenders snuck in
                 // between the drain above and observing `stopping`.
-                let trailing = self.buffer.drain();
+                let trailing = self.buffer.drain()?;
                 if !trailing.bytes.is_empty() {
                     self.write_drained(&trailing.bytes, trailing.end_lsn)?;
                 }

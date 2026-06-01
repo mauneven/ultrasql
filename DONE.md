@@ -105,6 +105,12 @@ as a concise evidence ledger; roadmap stays for open gates only.
   before seeding the next in-process logical LSN.
 - Logical replication live LSN allocation now uses checked atomic advancement
   and refuses to wrap exhausted CDC sequence state.
+- WAL buffer drains now return typed `WalBufferError` values for buffered-byte
+  length overflow and inconsistent LSN-span underflow instead of panicking, and
+  the background writer propagates these as `WalWriterError::Buffer`. Evidence:
+  `cargo test -p ultrasql-wal --lib -- --nocapture`,
+  `cargo clippy -p ultrasql-wal --lib --all-features -- -D clippy::unwrap_used -D clippy::expect_used`,
+  and `cargo clippy -p ultrasql-wal --all-targets --all-features -- -D warnings`.
 - Focused `ultrasql-executor` coverage now exercises scalar compatibility
   functions, physical lowering edge families, row encoding/decoding,
   projection/filter/sort/unique/set/window/hash aggregate behavior, modify-table
@@ -1651,6 +1657,12 @@ as a concise evidence ledger; roadmap stays for open gates only.
   turning NULL values into typed zeroes. Evidence:
   `cargo test -p ultrasql-sqllogictest-runner --test in_process sql_regression_subset_runs_all_active_shards_in_process -- --nocapture`,
   `cargo test -p ultrasql-executor filter_op::tests::select_column_preserves_selected_nulls --lib -- --nocapture`.
+- Legacy `FilterEqI32` placeholder filtering now reuses the shared column
+  selector, so nullable selected value columns keep their validity bitmaps
+  instead of becoming non-null typed zeroes. Evidence:
+  `cargo test -p ultrasql-executor filter::tests --lib -- --nocapture`,
+  `cargo test -p ultrasql-executor vec_ops::vec_filter --lib -- --nocapture`,
+  and `cargo clippy -p ultrasql-executor --all-targets --all-features -- -D warnings`.
 - Join/set-operation regression baseline covers deterministic inner join, left
   join with aggregate over null-extended rows, correlated `EXISTS`, `UNION`,
   `INTERSECT`, `EXCEPT`, set-operation `ORDER BY` over output columns, and
