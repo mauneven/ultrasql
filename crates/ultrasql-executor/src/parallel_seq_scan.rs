@@ -84,7 +84,9 @@ where
         cancel_flag: Option<CancelFlag>,
         worker_count: usize,
     ) -> Self {
-        let workers = worker_count.max(1).min(block_count.max(1) as usize);
+        let workers = worker_count
+            .max(1)
+            .min(usize_from_u32_saturating(block_count.max(1)));
         let schema = codec.schema().clone();
         let (sender, receiver) = mpsc::channel();
         let blocks_per_worker = block_count.div_ceil(u32::try_from(workers).unwrap_or(u32::MAX));
@@ -199,15 +201,24 @@ pub fn choose_parallel_seq_scan_workers(block_count: u32, row_width: usize) -> u
         return 1;
     }
     let available = thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get);
-    let workers = available.min(8).min(block_count as usize);
+    let workers = available.min(8).min(usize_from_u32_saturating(block_count));
     if workers <= 1 {
         return 1;
     }
-    let row_width_penalty = (row_width.max(1) as f64).sqrt() / 8.0;
+    let row_width_penalty = f64_from_usize_saturating(row_width.max(1)).sqrt() / 8.0;
     let seq_cost =
         f64::from(block_count) + f64::from(block_count) * ROWS_PER_BLOCK_HINT * CPU_TUPLE_COST;
-    let parallel_cost = (seq_cost / workers as f64) + PARALLEL_SETUP_COST + row_width_penalty;
+    let parallel_cost =
+        (seq_cost / f64_from_usize_saturating(workers)) + PARALLEL_SETUP_COST + row_width_penalty;
     if parallel_cost < seq_cost { workers } else { 1 }
+}
+
+fn usize_from_u32_saturating(value: u32) -> usize {
+    usize::try_from(value).unwrap_or(usize::MAX)
+}
+
+fn f64_from_usize_saturating(value: usize) -> f64 {
+    f64::from(u32::try_from(value).unwrap_or(u32::MAX))
 }
 
 #[cfg(test)]
@@ -258,6 +269,11 @@ mod tests {
     #[test]
     fn worker_cost_gate_rejects_small_scans() {
         assert_eq!(choose_parallel_seq_scan_workers(4, 8), 1);
+    }
+
+    #[test]
+    fn worker_cost_gate_handles_max_block_count() {
+        assert!((1..=8).contains(&choose_parallel_seq_scan_workers(u32::MAX, 8)));
     }
 
     #[test]
