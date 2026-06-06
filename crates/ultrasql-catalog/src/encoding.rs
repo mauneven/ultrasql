@@ -228,7 +228,7 @@ impl<'a> Reader<'a> {
         }
     }
     fn str(&mut self) -> Result<String, DecodeError> {
-        let len = self.u32()? as usize;
+        let len = self.usize_len()?;
         let bytes = self.take(len)?;
         std::str::from_utf8(bytes)
             .map(str::to_owned)
