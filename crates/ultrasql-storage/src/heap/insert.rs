@@ -5,13 +5,6 @@
 //! `heap/mod.rs`. Splitting across files keeps each unit under the
 //! 600-line ceiling without changing semantics.
 
-#![allow(
-    clippy::cast_possible_truncation,
-    clippy::cast_possible_wrap,
-    clippy::cast_sign_loss,
-    clippy::cast_lossless,
-    reason = "on-disk format / fixed-width packing; narrowings bounded by PAGE_SIZE / relation size"
-)]
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
@@ -20,11 +13,37 @@ use ultrasql_mvcc::TupleHeader;
 use ultrasql_mvcc::tuple_header::TUPLE_HEADER_SIZE;
 
 use crate::buffer_pool::{BufferPool, PageGuard, PageLoader};
-use crate::page::PageError;
+use crate::page::{ITEMID_SIZE, ItemId, ItemIdFlags, PAGE_HEADER_SIZE, Page, PageError};
 
 use super::{
     HeapAccess, HeapError, InsertOptions, checked_heap_u64_count_add, checked_tuple_space_needed,
 };
+
+fn appended_slot_count(cur_lower: usize) -> Result<u16, HeapError> {
+    let slot_bytes = cur_lower
+        .checked_sub(PAGE_HEADER_SIZE)
+        .ok_or(HeapError::MalformedHeader("page lower before header"))?;
+    if slot_bytes % ITEMID_SIZE != 0 {
+        return Err(HeapError::MalformedHeader("slot array misaligned"));
+    }
+    u16::try_from(slot_bytes / ITEMID_SIZE)
+        .map_err(|_| HeapError::MalformedHeader("slot count overflow"))
+}
+
+fn item_offset_from_cursor(cur_upper: usize) -> Result<u32, HeapError> {
+    let offset = u32::try_from(cur_upper)
+        .map_err(|_| HeapError::Page(PageError::Malformed("tuple offset overflow")))?;
+    if offset > ItemId::MAX_OFFSET {
+        return Err(HeapError::Page(PageError::Malformed(
+            "tuple offset exceeds itemid",
+        )));
+    }
+    Ok(offset)
+}
+
+fn header_bound_from_cursor(value: usize, field: &'static str) -> Result<u16, HeapError> {
+    u16::try_from(value).map_err(|_| HeapError::MalformedHeader(field))
+}
 
 impl<L: PageLoader> HeapAccess<L> {
     /// Insert a tuple into the relation.
@@ -417,8 +436,6 @@ impl<L: PageLoader> HeapAccess<L> {
         opts: InsertOptions<'_>,
         n_atts: u16,
     ) -> Result<usize, HeapError> {
-        use crate::page::{ITEMID_SIZE, ItemId, ItemIdFlags, Page};
-
         let guard = pool.get_page(page_id)?;
         let mut page = guard.write();
         let mut filled: usize = 0;
@@ -430,8 +447,8 @@ impl<L: PageLoader> HeapAccess<L> {
         // tuple bulk insert this drops ~4 096 `header.decode` +
         // 4 096 `header.encode` round-trips down to one of each.
         let mut header = page.header();
-        let mut cur_lower = header.lower as usize;
-        let mut cur_upper = header.upper as usize;
+        let mut cur_lower = usize::from(header.lower);
+        let mut cur_upper = usize::from(header.upper);
 
         for row in &rows[row_idx..] {
             let tuple_size = TUPLE_HEADER_SIZE
@@ -456,14 +473,14 @@ impl<L: PageLoader> HeapAccess<L> {
             // `slot_count` as the new slot id. We compute it from the
             // local `lower` cursor and bake the final `ctid` into the
             // tuple header up front so no post-insert patch is needed.
-            let slot_count =
-                u16::try_from((cur_lower - crate::page::PAGE_HEADER_SIZE) / ITEMID_SIZE)
-                    .map_err(|_| HeapError::MalformedHeader("slot count overflow"))?;
+            let slot_count = appended_slot_count(cur_lower)?;
             let final_tid = TupleId::new(page_id, slot_count);
             let tuple_header = TupleHeader::fresh(opts.xmin, opts.command_id, final_tid, n_atts);
 
             // Reserve `tuple_size` bytes at the top of the page body.
-            cur_upper -= tuple_size;
+            cur_upper = cur_upper
+                .checked_sub(tuple_size)
+                .ok_or(HeapError::MalformedHeader("page upper underflow"))?;
             let page_bytes = page.as_bytes_mut();
             // Encode the tuple header directly into the page bytes
             // (zero scratch copy).
@@ -472,7 +489,11 @@ impl<L: PageLoader> HeapAccess<L> {
             page_bytes[cur_upper + TUPLE_HEADER_SIZE..cur_upper + tuple_size].copy_from_slice(row);
 
             // Write the slot's `ItemId` (4 bytes) inline.
-            let item = ItemId::new(cur_upper as u32, tuple_len_u32, ItemIdFlags::Normal);
+            let item = ItemId::new(
+                item_offset_from_cursor(cur_upper)?,
+                tuple_len_u32,
+                ItemIdFlags::Normal,
+            );
             let id_off = Page::item_id_offset(slot_count);
             page_bytes[id_off..id_off + ITEMID_SIZE]
                 .copy_from_slice(&item.into_raw().to_le_bytes());
@@ -484,8 +505,8 @@ impl<L: PageLoader> HeapAccess<L> {
 
         // Re-encode the page header once, outside the per-tuple loop.
         if filled > 0 {
-            header.lower = cur_lower as u16;
-            header.upper = cur_upper as u16;
+            header.lower = header_bound_from_cursor(cur_lower, "page lower overflow")?;
+            header.upper = header_bound_from_cursor(cur_upper, "page upper overflow")?;
             header.encode(page.as_bytes_mut());
         }
 
@@ -500,12 +521,10 @@ impl<L: PageLoader> HeapAccess<L> {
         opts: InsertOptions<'_>,
         n_atts: u16,
     ) -> Result<usize, HeapError> {
-        use crate::page::{ITEMID_SIZE, ItemId, ItemIdFlags, Page};
-
         let mut filled: usize = 0;
         let mut header = page.header();
-        let mut cur_lower = header.lower as usize;
-        let mut cur_upper = header.upper as usize;
+        let mut cur_lower = usize::from(header.lower);
+        let mut cur_upper = usize::from(header.upper);
 
         for row in &rows[row_idx..] {
             let tuple_size = TUPLE_HEADER_SIZE
@@ -524,18 +543,22 @@ impl<L: PageLoader> HeapAccess<L> {
                 )));
             }
 
-            let slot_count =
-                u16::try_from((cur_lower - crate::page::PAGE_HEADER_SIZE) / ITEMID_SIZE)
-                    .map_err(|_| HeapError::MalformedHeader("slot count overflow"))?;
+            let slot_count = appended_slot_count(cur_lower)?;
             let final_tid = TupleId::new(page_id, slot_count);
             let tuple_header = TupleHeader::fresh(opts.xmin, opts.command_id, final_tid, n_atts);
 
-            cur_upper -= tuple_size;
+            cur_upper = cur_upper
+                .checked_sub(tuple_size)
+                .ok_or(HeapError::MalformedHeader("page upper underflow"))?;
             let page_bytes = page.as_bytes_mut();
             tuple_header.encode(&mut page_bytes[cur_upper..cur_upper + TUPLE_HEADER_SIZE]);
             page_bytes[cur_upper + TUPLE_HEADER_SIZE..cur_upper + tuple_size].copy_from_slice(row);
 
-            let item = ItemId::new(cur_upper as u32, tuple_len_u32, ItemIdFlags::Normal);
+            let item = ItemId::new(
+                item_offset_from_cursor(cur_upper)?,
+                tuple_len_u32,
+                ItemIdFlags::Normal,
+            );
             let id_off = Page::item_id_offset(slot_count);
             page_bytes[id_off..id_off + ITEMID_SIZE]
                 .copy_from_slice(&item.into_raw().to_le_bytes());
@@ -545,8 +568,8 @@ impl<L: PageLoader> HeapAccess<L> {
         }
 
         if filled > 0 {
-            header.lower = cur_lower as u16;
-            header.upper = cur_upper as u16;
+            header.lower = header_bound_from_cursor(cur_lower, "page lower overflow")?;
+            header.upper = header_bound_from_cursor(cur_upper, "page upper overflow")?;
             header.encode(page.as_bytes_mut());
         }
 
