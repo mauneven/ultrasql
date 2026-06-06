@@ -4,13 +4,10 @@
 //! Helpers live in this module's root; tests are grouped by
 //! category into sub-modules.
 
-#![allow(unused_imports, dead_code)]
-
 use super::*;
 use bytes::BytesMut;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use ultrasql_catalog::IndexEntry;
-use ultrasql_protocol::{FrontendMessage, decode_frontend, encode_backend};
+use ultrasql_protocol::FrontendMessage;
 use ultrasql_txn::IsolationLevel;
 
 /// Read every backend message currently buffered on `io`, stopping

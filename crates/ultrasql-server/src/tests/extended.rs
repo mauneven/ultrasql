@@ -1,7 +1,5 @@
 //! Test sub-module; see `tests/mod.rs` for shared helpers.
 
-#![allow(unused_imports)]
-
 use super::*;
 
 /// Extended Query round-trip over the in-memory duplex transport.
