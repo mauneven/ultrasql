@@ -1,10 +1,15 @@
 {
   "profile": "smoke",
-  "generated_at_unix": 1780030789,
+  "generated_at_unix": 1780762568,
   "passed": true,
   "suites": [
     {
       "suite": "regression-gate",
+      "status": "passed",
+      "exit_code": 0
+    },
+    {
+      "suite": "rls-tenant",
       "status": "passed",
       "exit_code": 0
     },

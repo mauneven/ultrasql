@@ -5,19 +5,19 @@
   "connections": 4,
   "warmup_secs": 0,
   "duration_secs": 1,
-  "operations": 10026,
-  "reads": 5067,
-  "updates": 2919,
-  "inserts": 2040,
-  "throughput_per_sec": 10014.697572554776,
-  "p50_latency_us": 152.792,
-  "p95_latency_us": 1268.458,
-  "p99_latency_us": 1719.334,
+  "operations": 10110,
+  "reads": 5116,
+  "updates": 2938,
+  "inserts": 2056,
+  "throughput_per_sec": 10100.699780676943,
+  "p50_latency_us": 156.708,
+  "p95_latency_us": 1211.4579999999999,
+  "p99_latency_us": 1566.875,
   "correctness": {
     "passed": true,
-    "expected_row_count": 3040,
-    "actual_row_count": 3040,
+    "expected_row_count": 3056,
+    "actual_row_count": 3056,
     "warmup_inserts": 0,
-    "measured_inserts": 2040
+    "measured_inserts": 2056
   }
 }

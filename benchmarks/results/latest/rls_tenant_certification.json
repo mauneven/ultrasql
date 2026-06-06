@@ -10,12 +10,12 @@
     "--nocapture"
   ],
   "exit_code": 0,
-  "generated_at_unix": 1780138758,
+  "generated_at_unix": 1780762550,
   "host": {
     "cores": 10,
     "cpu": "arm",
     "machine": "arm64",
-    "os": "macOS-26.5-arm64-arm-64bit-Mach-O"
+    "os": "macOS-26.5.1-arm64-arm-64bit-Mach-O"
   },
   "log_file": "target/rls-tenant-cert/rls_round_trip.log",
   "passed": true,
