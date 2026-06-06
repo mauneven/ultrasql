@@ -327,6 +327,7 @@ impl ConnParams {
 // ---------------------------------------------------------------------------
 
 const PGPASS_FILE_LIMIT_BYTES: usize = 64 * 1024;
+const PGPASS_FILE_READ_LIMIT_BYTES: u64 = 64 * 1024 + 1;
 
 /// Look up a password from `~/.pgpass`.
 ///
@@ -382,7 +383,7 @@ fn read_pgpass_file(path: &Path) -> Option<String> {
         options.custom_flags(libc::O_NOFOLLOW);
     }
     let file = options.open(path).ok()?;
-    let mut limited = std::io::Read::take(file, (PGPASS_FILE_LIMIT_BYTES + 1) as u64);
+    let mut limited = std::io::Read::take(file, PGPASS_FILE_READ_LIMIT_BYTES);
     let mut content = String::new();
     std::io::Read::read_to_string(&mut limited, &mut content).ok()?;
     if content.len() > PGPASS_FILE_LIMIT_BYTES {
@@ -2194,6 +2195,14 @@ mod tests {
 
         let pw = pgpass_lookup_in_home(dir.path(), "localhost", 5432, "mydb", "bob");
         assert!(pw.is_none(), "wrong user must not match");
+    }
+
+    #[test]
+    fn pgpass_read_limit_is_one_byte_past_file_limit() {
+        assert_eq!(
+            PGPASS_FILE_READ_LIMIT_BYTES,
+            u64::try_from(PGPASS_FILE_LIMIT_BYTES + 1).expect("pgpass limit fits u64"),
+        );
     }
 
     #[cfg(unix)]
