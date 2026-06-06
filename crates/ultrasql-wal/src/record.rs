@@ -232,7 +232,8 @@ impl WalRecord {
     /// Encode the record into a freshly-allocated `Vec<u8>`.
     #[must_use]
     pub fn encode(&self) -> Vec<u8> {
-        let mut out = vec![0_u8; self.header.total_length as usize];
+        let total = trusted_total_length_to_usize(self.header.total_length);
+        let mut out = vec![0_u8; total];
         encode_header_into(&self.header, &mut out);
         out[RECORD_HEADER_SIZE..].copy_from_slice(&self.payload);
         out
@@ -242,7 +243,7 @@ impl WalRecord {
     /// header. Returns the decoded record and the byte count consumed.
     pub fn decode(bytes: &[u8]) -> Result<(Self, usize), WalRecordError> {
         let header = decode_header_from(bytes)?;
-        let total = header.total_length as usize;
+        let total = total_length_to_usize(header.total_length)?;
         if total < RECORD_HEADER_SIZE {
             return Err(WalRecordError::Malformed("total_length too small"));
         }
@@ -271,6 +272,18 @@ impl WalRecord {
             });
         }
         Ok((Self { header, payload }, total))
+    }
+}
+
+fn total_length_to_usize(total_length: u32) -> Result<usize, WalRecordError> {
+    usize::try_from(total_length)
+        .map_err(|_| WalRecordError::Malformed("total_length does not fit usize"))
+}
+
+fn trusted_total_length_to_usize(total_length: u32) -> usize {
+    match total_length_to_usize(total_length) {
+        Ok(total_length) => total_length,
+        Err(_) => panic!("WAL record total_length must fit usize on supported targets"),
     }
 }
 
