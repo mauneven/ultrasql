@@ -9,14 +9,6 @@
 //! check is self-consistent. Callers should use [`compute_page_checksum`],
 //! which handles the zero-field convention.
 
-#![allow(
-    clippy::cast_possible_truncation,
-    clippy::cast_possible_wrap,
-    clippy::cast_sign_loss,
-    clippy::cast_lossless,
-    reason = "on-disk format / fixed-width packing; narrowings bounded by PAGE_SIZE / relation size"
-)]
-
 use xxhash_rust::xxh3::xxh3_64;
 
 use ultrasql_core::constants::PAGE_SIZE;
@@ -36,7 +28,9 @@ pub fn compute_page_checksum(page: &[u8; PAGE_SIZE]) -> u32 {
     hasher_input.copy_from_slice(page);
     hasher_input[CHECKSUM_OFFSET..CHECKSUM_OFFSET + 4].fill(0);
     let h = xxh3_64(&hasher_input);
-    (h ^ (h >> 32)) as u32
+    let folded = h ^ (h >> u32::BITS);
+    let bytes = folded.to_le_bytes();
+    u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]])
 }
 
 #[cfg(test)]
@@ -71,7 +65,7 @@ mod tests {
     fn checksum_is_deterministic() {
         let mut p = [0_u8; PAGE_SIZE];
         for (i, byte) in p.iter_mut().enumerate() {
-            *byte = (i & 0xFF) as u8;
+            *byte = u8::try_from(i & 0xFF).expect("masked byte fits in u8");
         }
         assert_eq!(compute_page_checksum(&p), compute_page_checksum(&p));
     }
