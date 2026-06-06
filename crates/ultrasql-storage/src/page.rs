@@ -37,21 +37,6 @@
 //!   `[offset, offset+length)` with `offset >= pd_upper` and
 //!   `offset + length <= pd_special`.
 
-// AGENTS.md §3.3 boundary: this module implements the on-disk page
-// layout. Header / ItemId fields are explicit fixed-width (`u8`, `u16`,
-// `u32`) bit-packed values; the casts that narrow `usize` / `u32` here
-// are documented format invariants, not silent truncation. Per-call
-// `try_from` would introduce a panic path on every page mutation in
-// the hot path with no behavioural change (every callsite's input is
-// bounded by `PAGE_SIZE = 8192`). The allows are scoped to this file.
-#![allow(
-    clippy::cast_possible_truncation,
-    clippy::cast_possible_wrap,
-    clippy::cast_sign_loss,
-    clippy::cast_lossless,
-    reason = "on-disk page format: fields are fixed-width by design, every narrowing is bounded by PAGE_SIZE"
-)]
-
 use ultrasql_core::constants::PAGE_SIZE;
 use ultrasql_core::endian::{
     read_u16_le, read_u32_le, read_u64_le, write_u16_le, write_u32_le, write_u64_le,
@@ -61,16 +46,21 @@ use crate::checksum::{CHECKSUM_OFFSET, compute_page_checksum};
 
 /// Size of a [`PageHeader`] in bytes.
 pub const PAGE_HEADER_SIZE: usize = 24;
+const PAGE_HEADER_SIZE_U16: u16 = 24;
 
 /// Size of a single [`ItemId`] in bytes.
 pub const ITEMID_SIZE: usize = 4;
+const ITEMID_SIZE_U16: u16 = 4;
+const PAGE_SIZE_U16: u16 = 8_192;
 
 /// On-disk page-format version recognized by this crate.
 pub const PAGE_VERSION_CURRENT: u8 = 1;
 
 // --- compile-time invariants -----------------------------------------------
 const _: () = assert!(PAGE_SIZE.is_power_of_two());
+const _: () = assert!(PAGE_SIZE == 8_192);
 const _: () = assert!(PAGE_HEADER_SIZE <= 64);
+const _: () = assert!(PAGE_HEADER_SIZE == 24);
 const _: () = assert!(ITEMID_SIZE == 4);
 
 /// Errors that can arise when reading or writing a page.
@@ -146,6 +136,16 @@ impl PageKind {
             _ => return None,
         })
     }
+
+    const fn to_u16(self) -> u16 {
+        match self {
+            Self::Heap => 1,
+            Self::BTreeIndex => 2,
+            Self::FreeSpaceMap => 3,
+            Self::VisibilityMap => 4,
+            Self::Meta => 5,
+        }
+    }
 }
 
 /// Lifecycle flags on a slot's `ItemId`.
@@ -165,12 +165,21 @@ pub enum ItemIdFlags {
 }
 
 impl ItemIdFlags {
-    const fn from_bits(b: u8) -> Self {
-        match b & 0b11 {
+    const fn from_bits(bits: u32) -> Self {
+        match bits & 0b11 {
             0 => Self::Unused,
             1 => Self::Normal,
             2 => Self::Redirect,
             _ => Self::Dead,
+        }
+    }
+
+    const fn to_u32(self) -> u32 {
+        match self {
+            Self::Unused => 0,
+            Self::Normal => 1,
+            Self::Redirect => 2,
+            Self::Dead => 3,
         }
     }
 }
@@ -194,7 +203,7 @@ impl ItemId {
     pub const fn new(offset: u32, length: u32, flags: ItemIdFlags) -> Self {
         debug_assert!(offset <= Self::MAX_OFFSET, "ItemId offset too large");
         debug_assert!(length <= Self::MAX_LENGTH, "ItemId length too large");
-        let bits = (flags as u32) | (length << 2) | (offset << 17);
+        let bits = flags.to_u32() | (length << 2) | (offset << 17);
         Self(bits)
     }
 
@@ -213,7 +222,7 @@ impl ItemId {
     /// Lifecycle flags.
     #[must_use]
     pub const fn flags(self) -> ItemIdFlags {
-        ItemIdFlags::from_bits(self.0 as u8)
+        ItemIdFlags::from_bits(self.0)
     }
 
     /// Length in bytes of the slot's tuple.
@@ -268,9 +277,9 @@ impl PageHeader {
             checksum: 0,
             flags: 0,
             kind: PageKind::Heap,
-            lower: PAGE_HEADER_SIZE as u16,
-            upper: PAGE_SIZE as u16,
-            special: PAGE_SIZE as u16,
+            lower: PAGE_HEADER_SIZE_U16,
+            upper: PAGE_SIZE_U16,
+            special: PAGE_SIZE_U16,
             version: PAGE_VERSION_CURRENT,
         }
     }
@@ -293,9 +302,9 @@ impl PageHeader {
             return Err(PageError::UnsupportedVersion(version));
         }
 
-        let lo = lower as usize;
-        let up = upper as usize;
-        let sp = special as usize;
+        let lo = usize::from(lower);
+        let up = usize::from(upper);
+        let sp = usize::from(special);
         if lo < PAGE_HEADER_SIZE
             || up < lo
             || sp < up
@@ -323,7 +332,7 @@ impl PageHeader {
         write_u64_le(&mut bytes[0..8], self.lsn);
         write_u32_le(&mut bytes[8..12], self.checksum);
         write_u16_le(&mut bytes[12..14], self.flags);
-        write_u16_le(&mut bytes[14..16], self.kind as u16);
+        write_u16_le(&mut bytes[14..16], self.kind.to_u16());
         write_u16_le(&mut bytes[16..18], self.lower);
         write_u16_le(&mut bytes[18..20], self.upper);
         write_u16_le(&mut bytes[20..22], self.special);
@@ -334,13 +343,13 @@ impl PageHeader {
     /// Number of slots currently allocated on the page.
     #[must_use]
     pub const fn slot_count(&self) -> u16 {
-        ((self.lower as usize - PAGE_HEADER_SIZE) / ITEMID_SIZE) as u16
+        (self.lower - PAGE_HEADER_SIZE_U16) / ITEMID_SIZE_U16
     }
 
     /// Bytes of free space available for additional tuples.
     #[must_use]
-    pub const fn free_space(&self) -> usize {
-        (self.upper as usize) - (self.lower as usize)
+    pub fn free_space(&self) -> usize {
+        usize::from(self.upper) - usize::from(self.lower)
     }
 }
 
@@ -354,6 +363,44 @@ pub type SlotIndex = u16;
 #[derive(Debug)]
 pub struct Page {
     bytes: Box<[u8; PAGE_SIZE]>,
+}
+
+fn page_u16_from_usize(value: usize, field: &'static str) -> Result<u16, PageError> {
+    u16::try_from(value).map_err(|_| PageError::Malformed(field))
+}
+
+fn item_offset_from_usize(offset: usize) -> Result<u32, PageError> {
+    let offset =
+        u32::try_from(offset).map_err(|_| PageError::Malformed("tuple offset overflow"))?;
+    if offset > ItemId::MAX_OFFSET {
+        return Err(PageError::Malformed("tuple offset exceeds itemid"));
+    }
+    Ok(offset)
+}
+
+fn item_field_to_usize(field: u32, name: &'static str) -> Result<usize, PageError> {
+    usize::try_from(field).map_err(|_| PageError::Malformed(name))
+}
+
+fn invariant_item_field_to_usize(field: u32, name: &'static str) -> usize {
+    match item_field_to_usize(field, name) {
+        Ok(value) => value,
+        Err(_) => panic!("page invariant: item field fits usize"),
+    }
+}
+
+fn invariant_item_offset(offset: usize) -> u32 {
+    match item_offset_from_usize(offset) {
+        Ok(value) => value,
+        Err(_) => panic!("page invariant: tuple offset fits itemid"),
+    }
+}
+
+fn invariant_page_bound(value: usize) -> u16 {
+    match page_u16_from_usize(value, "page bound") {
+        Ok(value) => value,
+        Err(_) => panic!("page invariant: page bound fits u16"),
+    }
 }
 
 impl Page {
@@ -477,21 +524,26 @@ impl Page {
             });
         }
 
-        let new_upper = header.upper as usize - needed_data;
+        let new_upper = usize::from(header.upper) - needed_data;
         self.bytes[new_upper..new_upper + tuple.len()].copy_from_slice(tuple);
 
-        let item = ItemId::new(new_upper as u32, tuple_len, ItemIdFlags::Normal);
+        let item = ItemId::new(
+            item_offset_from_usize(new_upper)?,
+            tuple_len,
+            ItemIdFlags::Normal,
+        );
         let slot = if let Some(idx) = reuse {
             self.write_item_id(idx, item);
             idx
         } else {
             let idx = header.slot_count();
             self.write_item_id(idx, item);
-            header.lower = (header.lower as usize + ITEMID_SIZE) as u16;
+            header.lower =
+                page_u16_from_usize(usize::from(header.lower) + ITEMID_SIZE, "page lower")?;
             idx
         };
 
-        header.upper = new_upper as u16;
+        header.upper = page_u16_from_usize(new_upper, "page upper")?;
         header.encode(&mut self.bytes);
         Ok(slot)
     }
@@ -528,14 +580,18 @@ impl Page {
             });
         }
 
-        let new_upper = header.upper as usize - tuple.len();
+        let new_upper = usize::from(header.upper) - tuple.len();
         self.bytes[new_upper..new_upper + tuple.len()].copy_from_slice(tuple);
 
-        let item = ItemId::new(new_upper as u32, tuple_len, ItemIdFlags::Normal);
+        let item = ItemId::new(
+            item_offset_from_usize(new_upper)?,
+            tuple_len,
+            ItemIdFlags::Normal,
+        );
         let idx = header.slot_count();
         self.write_item_id(idx, item);
-        header.lower = (header.lower as usize + ITEMID_SIZE) as u16;
-        header.upper = new_upper as u16;
+        header.lower = page_u16_from_usize(usize::from(header.lower) + ITEMID_SIZE, "page lower")?;
+        header.upper = page_u16_from_usize(new_upper, "page upper")?;
         header.encode(&mut self.bytes);
         Ok(idx)
     }
@@ -555,8 +611,8 @@ impl Page {
         if !id.is_normal() {
             return Err(PageError::DeadSlot(slot));
         }
-        let off = id.offset() as usize;
-        let len = id.length() as usize;
+        let off = item_field_to_usize(id.offset(), "tuple offset")?;
+        let len = item_field_to_usize(id.length(), "tuple length")?;
         Ok(&self.bytes[off..off + len])
     }
 
@@ -588,7 +644,7 @@ impl Page {
         let count = header.slot_count();
         // Gather (slot, length) for every live tuple, in descending
         // offset order so we can rewrite from the top down.
-        let mut live: Vec<(SlotIndex, u32, u32)> = Vec::with_capacity(count as usize);
+        let mut live: Vec<(SlotIndex, u32, u32)> = Vec::with_capacity(usize::from(count));
         for slot in 0..count {
             let id = self.read_item_id(slot);
             if id.is_normal() {
@@ -600,17 +656,17 @@ impl Page {
         // and destination ranges disjoint within the rolling write.
         live.sort_by_key(|&(_, off, _)| std::cmp::Reverse(off));
 
-        let mut write_end = header.special as usize;
+        let mut write_end = usize::from(header.special);
         for (slot, off, len) in live {
-            let src = off as usize;
-            let length = len as usize;
+            let src = invariant_item_field_to_usize(off, "tuple offset");
+            let length = invariant_item_field_to_usize(len, "tuple length");
             let new_off = write_end - length;
             if new_off != src {
                 // copy_within is safe for overlapping ranges; the
                 // ordering above guarantees `new_off >= src`.
                 self.bytes.copy_within(src..src + length, new_off);
             }
-            let new_id = ItemId::new(new_off as u32, len, ItemIdFlags::Normal);
+            let new_id = ItemId::new(invariant_item_offset(new_off), len, ItemIdFlags::Normal);
             self.write_item_id(slot, new_id);
             write_end = new_off;
         }
@@ -623,7 +679,7 @@ impl Page {
             }
         }
 
-        header.upper = write_end as u16;
+        header.upper = invariant_page_bound(write_end);
         header.encode(&mut self.bytes);
     }
 
@@ -645,8 +701,8 @@ impl Page {
     /// the per-tuple `page.header()` round trip that
     /// [`Self::insert_tuple_appended`] performs.
     #[must_use]
-    pub(crate) const fn item_id_offset(slot: SlotIndex) -> usize {
-        PAGE_HEADER_SIZE + (slot as usize) * ITEMID_SIZE
+    pub(crate) fn item_id_offset(slot: SlotIndex) -> usize {
+        PAGE_HEADER_SIZE + usize::from(slot) * ITEMID_SIZE
     }
 
     fn read_item_id(&self, slot: SlotIndex) -> ItemId {
@@ -716,12 +772,14 @@ mod tests {
         for i in 0_u32..200 {
             let tup = i.to_le_bytes();
             let slot = page.insert_tuple(&tup).unwrap();
-            assert_eq!(slot, i as SlotIndex);
+            let expected_slot = SlotIndex::try_from(i).unwrap();
+            assert_eq!(slot, expected_slot);
         }
         let h = page.header();
         assert_eq!(h.slot_count(), 200);
         for i in 0_u32..200 {
-            assert_eq!(page.read_tuple(i as SlotIndex).unwrap(), &i.to_le_bytes());
+            let slot = SlotIndex::try_from(i).unwrap();
+            assert_eq!(page.read_tuple(slot).unwrap(), &i.to_le_bytes());
         }
     }
 
@@ -814,9 +872,9 @@ mod tests {
     fn malformed_header_rejected() {
         let mut bytes = [0_u8; PAGE_SIZE];
         // kind=0 is undefined.
-        write_u16_le(&mut bytes[16..18], PAGE_HEADER_SIZE as u16);
-        write_u16_le(&mut bytes[18..20], PAGE_SIZE as u16);
-        write_u16_le(&mut bytes[20..22], PAGE_SIZE as u16);
+        write_u16_le(&mut bytes[16..18], PAGE_HEADER_SIZE_U16);
+        write_u16_le(&mut bytes[18..20], PAGE_SIZE_U16);
+        write_u16_le(&mut bytes[20..22], PAGE_SIZE_U16);
         bytes[22] = PAGE_VERSION_CURRENT;
         let err = PageHeader::decode(&bytes).unwrap_err();
         assert!(matches!(err, PageError::Malformed(_)));
@@ -825,10 +883,10 @@ mod tests {
     #[test]
     fn unsupported_version_rejected() {
         let mut bytes = [0_u8; PAGE_SIZE];
-        write_u16_le(&mut bytes[14..16], PageKind::Heap as u16);
-        write_u16_le(&mut bytes[16..18], PAGE_HEADER_SIZE as u16);
-        write_u16_le(&mut bytes[18..20], PAGE_SIZE as u16);
-        write_u16_le(&mut bytes[20..22], PAGE_SIZE as u16);
+        write_u16_le(&mut bytes[14..16], PageKind::Heap.to_u16());
+        write_u16_le(&mut bytes[16..18], PAGE_HEADER_SIZE_U16);
+        write_u16_le(&mut bytes[18..20], PAGE_SIZE_U16);
+        write_u16_le(&mut bytes[20..22], PAGE_SIZE_U16);
         bytes[22] = 0xFF;
         let err = PageHeader::decode(&bytes).unwrap_err();
         assert!(matches!(err, PageError::UnsupportedVersion(0xFF)));
