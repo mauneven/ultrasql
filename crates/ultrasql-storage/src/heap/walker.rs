@@ -13,6 +13,7 @@ use ultrasql_mvcc::tuple_header::TUPLE_HEADER_SIZE;
 use ultrasql_mvcc::{Snapshot, TupleHeader, Visibility, XidStatusOracle, is_visible};
 
 use crate::buffer_pool::{BufferPool, PageLoader};
+use crate::page::ItemId;
 use crate::vm::VisibilityMap;
 
 use super::{HeapError, UndoRelationLog};
@@ -161,13 +162,14 @@ impl<L: PageLoader, O: XidStatusOracle + ?Sized> VisibleHeapWalker<'_, L, O> {
                 self.page_scratch[item_id_off + 2],
                 self.page_scratch[item_id_off + 3],
             ]);
-            let flags = raw & 0b11;
-            // ItemIdFlags::Normal == 1; skip Unused / Dead / Redirect.
-            if flags != 1 {
+            let item_id = ItemId::from_raw(raw);
+            if !item_id.is_normal() {
                 continue;
             }
-            let length = ((raw >> 2) & 0x7FFF) as usize;
-            let offset = ((raw >> 17) & 0x7FFF) as usize;
+            let length = usize::try_from(item_id.length())
+                .map_err(|_| HeapError::MalformedHeader("slot length out of range"))?;
+            let offset = usize::try_from(item_id.offset())
+                .map_err(|_| HeapError::MalformedHeader("slot offset out of range"))?;
             if length < TUPLE_HEADER_SIZE
                 || offset
                     .checked_add(length)
