@@ -24,6 +24,13 @@ const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
 /// FNV-1a 64-bit prime.
 const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
 
+fn offset_to_usize(offset: u32) -> usize {
+    match usize::try_from(offset) {
+        Ok(offset) => offset,
+        Err(_) => panic!("hash_text_bytes: offset {offset} does not fit usize"),
+    }
+}
+
 // ============================================================================
 // hash_i64
 // ============================================================================
@@ -74,22 +81,36 @@ pub fn hash_i64_scalar(column: &NumericColumn<i64>, validity: Option<&Bitmap>) -
 /// # Panics
 ///
 /// Panics if `offsets` has fewer than 2 entries (i.e. no rows) but
-/// `values` is non-empty.
+/// `values` is non-empty, if offsets are not nondecreasing, or if an
+/// offset range extends past `values`.
 #[must_use]
 pub fn hash_text_bytes(offsets: &[u32], values: &[u8], validity: Option<&Bitmap>) -> Vec<u64> {
     if offsets.len() < 2 {
+        assert!(
+            values.is_empty(),
+            "hash_text_bytes: values non-empty without offsets"
+        );
         return Vec::new();
     }
     let n = offsets.len() - 1;
     let mut out = Vec::with_capacity(n);
     for i in 0..n {
+        let start = offset_to_usize(offsets[i]);
+        let end = offset_to_usize(offsets[i + 1]);
+        assert!(
+            start <= end,
+            "hash_text_bytes: offsets must be nondecreasing"
+        );
+        assert!(
+            end <= values.len(),
+            "hash_text_bytes: offset end {end} exceeds values length {}",
+            values.len()
+        );
         let valid = validity.is_none_or(|bm| bm.get(i));
         if !valid {
             out.push(0);
             continue;
         }
-        let start = offsets[i] as usize;
-        let end = offsets[i + 1] as usize;
         out.push(fnv1a_bytes(&values[start..end]));
     }
     out
@@ -179,6 +200,24 @@ mod tests {
     fn hash_text_bytes_empty_returns_empty() {
         let h = hash_text_bytes(&[], &[], None);
         assert!(h.is_empty());
+    }
+
+    #[test]
+    #[should_panic(expected = "values non-empty without offsets")]
+    fn hash_text_bytes_rejects_values_without_offsets() {
+        let _ = hash_text_bytes(&[], b"orphan", None);
+    }
+
+    #[test]
+    #[should_panic(expected = "offsets must be nondecreasing")]
+    fn hash_text_bytes_rejects_decreasing_offsets() {
+        let _ = hash_text_bytes(&[3, 1], b"abc", None);
+    }
+
+    #[test]
+    #[should_panic(expected = "offset end 5 exceeds values length 3")]
+    fn hash_text_bytes_rejects_out_of_bounds_offsets() {
+        let _ = hash_text_bytes(&[0, 5], b"abc", None);
     }
 
     #[test]
