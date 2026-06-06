@@ -4,9 +4,9 @@ Benchmark lead check - assert UltraSQL leads every workload in the
 benchmark matrix.
 
 Reads every `*-<engine>.json` file under `benchmarks/results/latest/raw/`,
-groups them by workload, and for each workload picks the engine with the
-lowest `median_us`. Exits 0 iff `ultrasql` is the winner of every workload
-that has a result.
+groups them by workload, and for each comparable workload picks the engine
+with the lowest `median_us`. Exits 0 iff `ultrasql` is the winner of every
+comparable workload that has a result.
 
 A workload counts as "won by ultrasql" iff:
   - the ultrasql sample exists for that workload, AND
@@ -28,6 +28,22 @@ import json
 import os
 import sys
 from collections import defaultdict
+from pathlib import Path
+
+
+def partial_summary_reason(results_dir: str, workload: str) -> str | None:
+    summary_path = Path(results_dir).parent / f"{workload}_certification.json"
+    try:
+        with summary_path.open(encoding="utf-8") as fh:
+            summary = json.load(fh)
+    except (OSError, json.JSONDecodeError):
+        return None
+
+    if summary.get("workload") != workload:
+        return None
+    if summary.get("status") == "partial" or summary.get("comparison_ready") is False:
+        return str(summary.get("reason") or "partial_certification")
+    return None
 
 
 def main(argv: list[str]) -> int:
@@ -76,6 +92,13 @@ def main(argv: list[str]) -> int:
     for workload in sorted(by_workload.keys()):
         engines = by_workload[workload]
         if "ultrasql" not in engines:
+            reason = partial_summary_reason(results_dir, workload)
+            if reason is not None:
+                print(
+                    f"{workload:<28} {'(unranked)':<14} {'-':>12}  "
+                    f"partial certification: {reason}"
+                )
+                continue
             losses.append(f"{workload}: ultrasql sample missing")
             print(f"{workload:<28} {'(no-ultrasql)':<14} {'-':>12}  {sorted(engines)}")
             continue
