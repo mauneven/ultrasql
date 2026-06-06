@@ -77,13 +77,12 @@ impl RewriteRule for SubqueryDecorrelation {
 
 /// The shape of a subquery predicate extracted from a `Filter` node.
 ///
-/// Variants are constructed by legacy unit-test helpers
-/// (`make_exists_filter`, `make_in_subquery_filter`) to exercise the original
-/// lowering convention directly. Production rewrites now consume real
+/// Variants are constructed by legacy unit-test helpers to exercise the
+/// original lowering convention directly. Production rewrites consume real
 /// [`ScalarExpr::Exists`], [`ScalarExpr::InSubquery`], and
-/// [`ScalarExpr::ScalarSubquery`] nodes before this compatibility path runs.
+/// [`ScalarExpr::ScalarSubquery`] nodes.
 #[derive(Debug)]
-#[allow(dead_code)] // variants constructed by legacy test helpers
+#[cfg(test)]
 enum SubqueryKind {
     /// `EXISTS(sub)` — semi-join semantics.
     Exists {
@@ -110,10 +109,6 @@ fn decorrelate(plan: &LogicalPlan) -> Result<Option<LogicalPlan>, OptimizeError>
         LogicalPlan::Filter { input, predicate } => {
             if let Some(rewritten) = rewrite_filter_with_real_subquery_expr(input, predicate) {
                 return Ok(Some(rewritten));
-            }
-            // Try to match a subquery pattern in the predicate.
-            if let Some(kind) = extract_subquery(predicate) {
-                return Ok(rewrite_filter(input, kind));
             }
             // No match at this level; recurse into child.
             let new_input = decorrelate(input)?;
@@ -1853,52 +1848,12 @@ fn conjuncts_to_and(mut predicates: Vec<ScalarExpr>) -> ScalarExpr {
 }
 
 // ============================================================================
-// Subquery pattern matching
-// ============================================================================
-
-/// Attempt to extract a `SubqueryKind` from a scalar predicate.
-///
-/// We recognise two patterns that the test harness constructs to simulate
-/// what a full binder+subquery variant would produce:
-///
-/// 1. `ScalarExpr::Unary { op: Not, expr: Binary { op: Eq, left: outer_col,
-///    right: inner_col } }` with the right operand referencing a plan encoded
-///    in an `InSubquery`-shaped binary.
-///
-/// Because the real planner does not yet emit a `ScalarExpr::Subquery` variant,
-/// we represent subquery handles as `ScalarExpr::Parameter { index: 0xFFFF_XXXX }`
-/// tagged sentinels in tests. The production path would decode a proper variant.
-///
-/// For v0.6, we extract the pattern from `ScalarExpr::Binary` where one
-/// operand is a `Column` representing the subquery inner column and the other
-/// is the outer expression, and the plan tree is carried as a side channel in
-/// the `ExistsSubquery` or `InSubquery` wrappers.
-///
-/// Since `ScalarExpr` has no `Subquery` variant, we use the following test
-/// convention defined in this module:
-///
-/// - Encode `EXISTS(sub)` as a synthetic `ScalarExpr::IsNull { expr: Column
-///   { index: outer_schema_width, .. }, negated: true }` where the actual
-///   subquery plan is injected through `SUBQUERY_REGISTRY` (a thread-local
-///   in tests).
-///
-/// In practice, `extract_subquery` returns `None` for all normal plan shapes
-/// (where no test-sentinel columns appear), so the rule is a no-op on
-/// production plans until a proper `ScalarExpr::Subquery` variant lands.
-const fn extract_subquery(_predicate: &ScalarExpr) -> Option<SubqueryKind> {
-    // No `ScalarExpr::Subquery` variant exists yet in the planner.
-    // The real extraction is wired in through the test-level helpers below
-    // by using `TestablePlan` wrappers. This function always returns `None`
-    // for real predicates, making the rule a deterministic no-op in production.
-    None
-}
-
-// ============================================================================
 // Rewrite
 // ============================================================================
 
 /// Given a `Filter(input, subquery_pred)`, rewrite to a `LeftOuter` join
 /// followed by an `IS [NOT] NULL` filter.
+#[cfg(test)]
 fn rewrite_filter(outer: &LogicalPlan, kind: SubqueryKind) -> Option<LogicalPlan> {
     match kind {
         SubqueryKind::Exists { sub, negated } => {
@@ -2012,11 +1967,13 @@ fn concat_schemas(left: &Schema, right: &Schema) -> Option<Schema> {
 }
 
 /// Generate a synthetic column name for a right-side schema column at `idx`.
+#[cfg(test)]
 fn sub_schema_col_name(idx: usize) -> String {
     format!("__sub{idx}")
 }
 
 /// Shift a `ScalarExpr::Column` index by `offset`.
+#[cfg(test)]
 fn shift_column_index(expr: &ScalarExpr, offset: usize) -> ScalarExpr {
     match expr {
         ScalarExpr::Column {
