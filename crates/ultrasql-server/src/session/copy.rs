@@ -2416,7 +2416,8 @@ fn parse_copy_date(s: &str, column_idx: usize) -> Result<i32, ServerError> {
             "column {column_idx}: invalid date literal {raw:?}"
         )));
     }
-    Ok(days_since_epoch(year, month, day))
+    days_since_epoch(year, month, day)
+        .ok_or_else(|| ServerError::CopyFormat(format!("column {column_idx}: date overflow")))
 }
 
 fn parse_copy_timestamp(s: &str, column_idx: usize) -> Result<i64, ServerError> {
@@ -2483,12 +2484,16 @@ fn days_in_month(year: i32, month: u32) -> u32 {
     }
 }
 
-fn days_since_epoch(year: i32, month: u32, day: u32) -> i32 {
-    let y = if month <= 2 { year - 1 } else { year };
+fn days_since_epoch(year: i32, month: u32, day: u32) -> Option<i32> {
+    let y = if month <= 2 {
+        year.checked_sub(1)?
+    } else {
+        year
+    };
     let era = y.div_euclid(400);
     let yoe = y - era * 400;
-    let month_i32 = i32::try_from(month).expect("calendar month fits i32");
-    let day_i32 = i32::try_from(day).expect("calendar day fits i32");
+    let month_i32 = i32::try_from(month).ok()?;
+    let day_i32 = i32::try_from(day).ok()?;
     let month_offset = if month > 2 {
         month_i32 - 3
     } else {
@@ -2496,8 +2501,12 @@ fn days_since_epoch(year: i32, month: u32, day: u32) -> i32 {
     };
     let doy = (153 * month_offset + 2) / 5 + day_i32 - 1;
     let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
-    let days_from_1970_03_01 = era * 146_097 + doe - 719_468;
-    days_from_1970_03_01 - 10_957
+    let days_from_1970_03_01 = i64::from(era)
+        .checked_mul(146_097)?
+        .checked_add(i64::from(doe))?
+        .checked_sub(719_468)?;
+    let days_since_2000_01_01 = days_from_1970_03_01.checked_sub(10_957)?;
+    i32::try_from(days_since_2000_01_01).ok()
 }
 
 fn format_float_f32(v: f32) -> Vec<u8> {

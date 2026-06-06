@@ -1462,10 +1462,10 @@ fn parse_date_literal(text: &str) -> Option<i32> {
     let year: i32 = std::str::from_utf8(&bytes[..4]).ok()?.parse().ok()?;
     let month: u32 = std::str::from_utf8(&bytes[5..7]).ok()?.parse().ok()?;
     let day: u32 = std::str::from_utf8(&bytes[8..10]).ok()?.parse().ok()?;
-    if !(1..=12).contains(&month) || !(1..=31).contains(&day) {
+    if !(1..=12).contains(&month) || day == 0 || day > days_in_month(year, month) {
         return None;
     }
-    Some(days_since_epoch(year, month, day))
+    days_since_epoch(year, month, day)
 }
 
 fn parse_timestamp_literal(text: &str) -> Option<i64> {
@@ -1538,7 +1538,8 @@ fn add_months_to_date(date_days: i32, month_delta: i32) -> Result<i32, PlanError
     let new_month = u32::try_from(total_months.rem_euclid(12) + 1)
         .map_err(|_| PlanError::TypeMismatch("date interval month overflow".to_owned()))?;
     let new_day = day.min(days_in_month(new_year, new_month));
-    Ok(days_since_epoch(new_year, new_month, new_day))
+    days_since_epoch(new_year, new_month, new_day)
+        .ok_or_else(|| PlanError::TypeMismatch("date interval day overflow".to_owned()))
 }
 
 fn fold_date_interval(
@@ -2535,12 +2536,16 @@ fn dense_vector_family_kind(data_type: &DataType) -> Option<u8> {
 /// negative. The algorithm is Howard Hinnant's `days_from_civil`,
 /// rebased on 2000-03-01 internally then offset back to 2000-01-01.
 /// Source: <https://howardhinnant.github.io/date_algorithms.html>.
-fn days_since_epoch(year: i32, month: u32, day: u32) -> i32 {
-    let y = if month <= 2 { year - 1 } else { year };
+fn days_since_epoch(year: i32, month: u32, day: u32) -> Option<i32> {
+    let y = if month <= 2 {
+        year.checked_sub(1)?
+    } else {
+        year
+    };
     let era = y.div_euclid(400);
     let yoe = y - era * 400; // [0, 399]
-    let month_i32 = i32::try_from(month).expect("calendar month fits i32");
-    let day_i32 = i32::try_from(day).expect("calendar day fits i32");
+    let month_i32 = i32::try_from(month).ok()?;
+    let day_i32 = i32::try_from(day).ok()?;
     let month_offset = if month > 2 {
         month_i32 - 3
     } else {
@@ -2548,9 +2553,13 @@ fn days_since_epoch(year: i32, month: u32, day: u32) -> i32 {
     };
     let doy = (153 * month_offset + 2) / 5 + day_i32 - 1; // [0, 365]
     let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy; // [0, 146096]
-    let days_from_1970_03_01 = era * 146_097 + doe - 719_468;
+    let days_from_1970_03_01 = i64::from(era)
+        .checked_mul(146_097)?
+        .checked_add(i64::from(doe))?
+        .checked_sub(719_468)?;
     // Rebase from 1970-01-01 to 2000-01-01 (10_957 days).
-    days_from_1970_03_01 - 10_957
+    let days_since_2000_01_01 = days_from_1970_03_01.checked_sub(10_957)?;
+    i32::try_from(days_since_2000_01_01).ok()
 }
 
 /// Pick the narrowest signed integer type that fits a decimal literal.
@@ -4985,6 +4994,7 @@ mod typed_literal_tests {
         assert!(parse_date_literal("2000/01/01").is_none());
         assert!(parse_date_literal("2000-13-01").is_none());
         assert!(parse_date_literal("2000-01-32").is_none());
+        assert!(parse_date_literal("2000-02-30").is_none());
     }
 
     #[test]
@@ -5035,8 +5045,8 @@ mod typed_literal_tests {
 
     #[test]
     fn algorithm_handles_leap_year_february() {
-        let feb29 = days_since_epoch(2000, 2, 29);
-        let mar01 = days_since_epoch(2000, 3, 1);
+        let feb29 = days_since_epoch(2000, 2, 29).expect("valid leap day");
+        let mar01 = days_since_epoch(2000, 3, 1).expect("valid March day");
         assert_eq!(mar01 - feb29, 1, "2000-02-29 → 2000-03-01 is one day");
     }
 
@@ -5210,12 +5220,17 @@ mod typed_literal_tests {
 
     #[test]
     fn fold_date_interval_keeps_calendar_month_semantics() {
-        let folded = fold_date_interval(days_since_epoch(2000, 1, 31), 1, 0, 0).unwrap();
+        let folded =
+            fold_date_interval(days_since_epoch(2000, 1, 31).expect("valid date"), 1, 0, 0)
+                .unwrap();
         let super::ScalarExpr::Literal { value, data_type } = folded else {
             panic!("expected folded literal");
         };
         assert_eq!(data_type, DataType::Date);
-        assert_eq!(value, Value::Date(days_since_epoch(2000, 2, 29)));
+        assert_eq!(
+            value,
+            Value::Date(days_since_epoch(2000, 2, 29).expect("valid leap day"))
+        );
     }
 
     #[test]
