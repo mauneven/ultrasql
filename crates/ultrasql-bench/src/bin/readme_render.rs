@@ -104,15 +104,6 @@ struct BaselineEntry {
     /// UltraSQL median latency (µs). 0.0 is a placeholder.
     #[serde(default)]
     p99_us: f64,
-    /// Per-competitor median latency values recorded at the same time, keyed
-    /// by `Engine::as_str` (e.g. `"postgres17"`). 0.0 = placeholder.
-    ///
-    /// Reserved for future use: competitor rows may be driven from baseline
-    /// data when cross-engine recording is wired. Not yet consumed by the
-    /// renderer.
-    #[serde(default)]
-    #[allow(dead_code)]
-    competitors: HashMap<String, f64>,
 }
 
 /// Top-level baseline file structure (only fields we need).
@@ -535,10 +526,9 @@ fn load_baselines(dir: &Path) -> Result<HashMap<String, BaselineEntry>> {
         };
         for (id, entry) in file.benchmarks {
             // Keep the entry with the higher non-zero p99 (prefer measured data).
-            let existing = merged.entry(id).or_insert_with(|| BaselineEntry {
-                p99_us: 0.0,
-                competitors: HashMap::new(),
-            });
+            let existing = merged
+                .entry(id)
+                .or_insert_with(|| BaselineEntry { p99_us: 0.0 });
             if entry.p99_us > existing.p99_us {
                 *existing = entry;
             }
@@ -635,10 +625,7 @@ fn merge_latest_results(
             // Overwrite the existing baseline entry for this benchmark id.
             let entry = baseline
                 .entry((*bench_id).to_string())
-                .or_insert_with(|| BaselineEntry {
-                    p99_us: 0.0,
-                    competitors: HashMap::new(),
-                });
+                .or_insert_with(|| BaselineEntry { p99_us: 0.0 });
             entry.p99_us = median_us;
             eprintln!("readme-render: overlay {bench_id} from latest results → {median_us:.3} µs");
             break;

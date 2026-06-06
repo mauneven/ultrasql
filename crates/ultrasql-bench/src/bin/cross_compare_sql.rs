@@ -38,16 +38,6 @@
     clippy::cast_sign_loss,
     clippy::cast_lossless
 )]
-// Legacy per-iter OLAP helpers `run_select_iter` / `run_sum_iter` /
-// `run_avg_iter` / `run_filter_sum_iter` are retained for the
-// historical "fresh table per iter" measurement mode. The current
-// `--workload` dispatch routes every OLAP path through the
-// shared-table helpers `run_shared_select_scan` /
-// `run_shared_olap_aggregate` to match the per-engine competitor
-// scripts. Keep the older functions compiling so a follow-on
-// `--mode legacy-per-iter` flag can flip back if a reviewer needs
-// the old shape.
-#![allow(dead_code)]
 
 use std::collections::BTreeMap;
 use std::io::{Read, Write};
@@ -314,6 +304,7 @@ enum Workload {
 }
 
 impl Workload {
+    #[cfg(test)]
     fn registry_id(self, n_rows: usize) -> String {
         self.registry_id_with_shape(n_rows, DEFAULT_VECTOR_DIMS, DEFAULT_TOP_K)
     }
@@ -2143,69 +2134,6 @@ async fn run_insert_iter(server: SocketAddr, n_rows: usize, ix: usize) -> Result
     Ok(elapsed_us)
 }
 
-/// Run one SELECT iteration: load `n_rows` into a fresh table
-/// (outside the timed region), then time a full sequential scan that
-/// drains every row over the wire.
-async fn run_select_iter(server: SocketAddr, n_rows: usize, ix: usize) -> Result<f64> {
-    let conn_str = format!("host=127.0.0.1 port={} user=ultrasql_bench", server.port());
-    let (client, connection) = tokio_postgres::connect(&conn_str, NoTls)
-        .await
-        .context("tokio-postgres connect to ultrasqld")?;
-    let conn_handle = tokio::spawn(async move {
-        if let Err(e) = connection.await {
-            eprintln!("tokio-postgres connection error: {e}");
-        }
-    });
-
-    let table = format!("bench_select_{ix}");
-    client
-        .batch_execute(&format!("CREATE TABLE {table} (id INT NOT NULL, val INT)"))
-        .await
-        .with_context(|| format!("CREATE TABLE {table}"))?;
-
-    // Preload outside the timed region.
-    let mut sql = String::with_capacity(n_rows * 16 + 64);
-    sql.push_str("INSERT INTO ");
-    sql.push_str(&table);
-    sql.push_str(" VALUES ");
-    for j in 0..n_rows {
-        if j > 0 {
-            sql.push(',');
-        }
-        sql.push('(');
-        sql.push_str(&j.to_string());
-        sql.push(',');
-        sql.push_str(&(j * 10).to_string());
-        sql.push(')');
-    }
-    client
-        .batch_execute(&sql)
-        .await
-        .with_context(|| format!("preload INSERT into {table}"))?;
-
-    // Use `simple_query` (Simple Query protocol) rather than `query`
-    // (Extended Query Parse/Bind/Execute) — the server's Extended
-    // Query dispatch lands in Wave 3. The text-format rows are still
-    // fully decoded; we just count them as a sanity check.
-    let started = Instant::now();
-    let messages = client
-        .simple_query(&format!("SELECT id, val FROM {table}"))
-        .await
-        .with_context(|| format!("SELECT from {table}"))?;
-    let elapsed_us = started.elapsed().as_secs_f64() * 1e6;
-    let row_count = messages
-        .iter()
-        .filter(|m| matches!(m, tokio_postgres::SimpleQueryMessage::Row(_)))
-        .count();
-    if row_count != n_rows {
-        anyhow::bail!("row count mismatch: expected {n_rows}, observed {row_count}");
-    }
-
-    drop(client);
-    conn_handle.abort();
-    Ok(elapsed_us)
-}
-
 /// Maximum rows packed into a single `INSERT ... VALUES (...)` statement
 /// during preload. A 10 M row inline VALUES list would overrun
 /// tokio-postgres' per-message budget and would also stress the
@@ -2248,128 +2176,6 @@ async fn preload_chunked(
         start = end;
     }
     Ok(())
-}
-
-/// Run one iteration of `SELECT SUM(x) FROM t`.
-///
-/// Loads `n_rows` of `(id INT, x INT)` outside the timed region, then
-/// times a single whole-relation aggregate Simple-Query that returns
-/// exactly one `DataRow` with the SUM result.
-async fn run_sum_iter(server: SocketAddr, n_rows: usize, ix: usize) -> Result<f64> {
-    let conn_str = format!("host=127.0.0.1 port={} user=ultrasql_bench", server.port());
-    let (client, connection) = tokio_postgres::connect(&conn_str, NoTls)
-        .await
-        .context("tokio-postgres connect to ultrasqld")?;
-    let conn_handle = tokio::spawn(async move {
-        if let Err(e) = connection.await {
-            eprintln!("tokio-postgres connection error: {e}");
-        }
-    });
-
-    let table = format!("bench_sum_{ix}");
-    client
-        .batch_execute(&format!("CREATE TABLE {table} (id INT NOT NULL, x INT)"))
-        .await
-        .with_context(|| format!("CREATE TABLE {table}"))?;
-    preload_chunked(&client, &table, n_rows).await?;
-
-    let started = Instant::now();
-    let messages = client
-        .simple_query(&format!("SELECT SUM(x) FROM {table}"))
-        .await
-        .with_context(|| format!("SELECT SUM from {table}"))?;
-    let elapsed_us = started.elapsed().as_secs_f64() * 1e6;
-    let row_count = messages
-        .iter()
-        .filter(|m| matches!(m, tokio_postgres::SimpleQueryMessage::Row(_)))
-        .count();
-    if row_count != 1 {
-        anyhow::bail!("SUM row count mismatch: expected 1, observed {row_count}");
-    }
-
-    drop(client);
-    conn_handle.abort();
-    Ok(elapsed_us)
-}
-
-/// Run one iteration of `SELECT AVG(x) FROM t`. See [`run_sum_iter`]
-/// for the shape; only the aggregate function differs.
-async fn run_avg_iter(server: SocketAddr, n_rows: usize, ix: usize) -> Result<f64> {
-    let conn_str = format!("host=127.0.0.1 port={} user=ultrasql_bench", server.port());
-    let (client, connection) = tokio_postgres::connect(&conn_str, NoTls)
-        .await
-        .context("tokio-postgres connect to ultrasqld")?;
-    let conn_handle = tokio::spawn(async move {
-        if let Err(e) = connection.await {
-            eprintln!("tokio-postgres connection error: {e}");
-        }
-    });
-
-    let table = format!("bench_avg_{ix}");
-    client
-        .batch_execute(&format!("CREATE TABLE {table} (id INT NOT NULL, x INT)"))
-        .await
-        .with_context(|| format!("CREATE TABLE {table}"))?;
-    preload_chunked(&client, &table, n_rows).await?;
-
-    let started = Instant::now();
-    let messages = client
-        .simple_query(&format!("SELECT AVG(x) FROM {table}"))
-        .await
-        .with_context(|| format!("SELECT AVG from {table}"))?;
-    let elapsed_us = started.elapsed().as_secs_f64() * 1e6;
-    let row_count = messages
-        .iter()
-        .filter(|m| matches!(m, tokio_postgres::SimpleQueryMessage::Row(_)))
-        .count();
-    if row_count != 1 {
-        anyhow::bail!("AVG row count mismatch: expected 1, observed {row_count}");
-    }
-
-    drop(client);
-    conn_handle.abort();
-    Ok(elapsed_us)
-}
-
-/// Run one iteration of `SELECT SUM(x) FROM t WHERE x > <threshold>`.
-/// Threshold is `n_rows / 2` so roughly half the rows survive the
-/// predicate; this exercises `Filter` + `HashAggregate` on top of `SeqScan`.
-async fn run_filter_sum_iter(server: SocketAddr, n_rows: usize, ix: usize) -> Result<f64> {
-    let conn_str = format!("host=127.0.0.1 port={} user=ultrasql_bench", server.port());
-    let (client, connection) = tokio_postgres::connect(&conn_str, NoTls)
-        .await
-        .context("tokio-postgres connect to ultrasqld")?;
-    let conn_handle = tokio::spawn(async move {
-        if let Err(e) = connection.await {
-            eprintln!("tokio-postgres connection error: {e}");
-        }
-    });
-
-    let table = format!("bench_filter_sum_{ix}");
-    client
-        .batch_execute(&format!("CREATE TABLE {table} (id INT NOT NULL, x INT)"))
-        .await
-        .with_context(|| format!("CREATE TABLE {table}"))?;
-    preload_chunked(&client, &table, n_rows).await?;
-
-    let threshold = n_rows / 2;
-    let started = Instant::now();
-    let messages = client
-        .simple_query(&format!("SELECT SUM(x) FROM {table} WHERE x > {threshold}"))
-        .await
-        .with_context(|| format!("SELECT SUM(...) WHERE from {table}"))?;
-    let elapsed_us = started.elapsed().as_secs_f64() * 1e6;
-    let row_count = messages
-        .iter()
-        .filter(|m| matches!(m, tokio_postgres::SimpleQueryMessage::Row(_)))
-        .count();
-    if row_count != 1 {
-        anyhow::bail!("FILTER SUM row count mismatch: expected 1, observed {row_count}");
-    }
-
-    drop(client);
-    conn_handle.abort();
-    Ok(elapsed_us)
 }
 
 /// Run one bulk-DELETE iteration. Preload happens outside the timed

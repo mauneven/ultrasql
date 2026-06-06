@@ -26,7 +26,7 @@ use clap::{Parser, Subcommand, ValueEnum};
 use sha2::{Digest, Sha256};
 
 use ultrasql_bench::registry::HostInfo;
-use ultrasql_bench::tpch::{baseline, data_gen, load, queries, runner, schema};
+use ultrasql_bench::tpch::{baseline, data_gen, load, runner, schema};
 
 // ---------------------------------------------------------------------------
 // CLI
@@ -1094,10 +1094,20 @@ fn progress_enabled() -> bool {
     )
 }
 
-/// Ensure all 22 query texts can be fetched; used in integration testing.
-#[allow(dead_code)]
-fn all_query_texts() -> Vec<(&'static str, &'static str)> {
-    (1u8..=22)
-        .filter_map(|n| queries::query(n).map(|sql| (sql, sql)))
-        .collect()
+#[cfg(test)]
+mod tests {
+    use ultrasql_bench::tpch::queries;
+
+    #[test]
+    fn all_tpch_query_texts_are_available() {
+        for query_number in 1u8..=22 {
+            let query = queries::query(query_number)
+                .unwrap_or_else(|| panic!("missing TPC-H query {query_number}"));
+            assert!(
+                !query.trim().is_empty(),
+                "TPC-H query {query_number} must not be empty"
+            );
+        }
+        assert!(queries::query(23).is_none());
+    }
 }
