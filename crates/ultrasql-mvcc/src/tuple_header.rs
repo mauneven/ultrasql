@@ -213,8 +213,9 @@ impl TupleHeader {
         let data_offset = read_u16_le(&bytes[28..30]).ok()?;
         // 2 bytes of padding at 30..32 reserved.
         let rel = RelationId::new(read_u32_le(&bytes[32..36]).ok()?);
-        let block = BlockNumber::new(read_u32_le(&bytes[36..40]).ok()? & 0x00FF_FFFF);
-        let slot = (read_u32_le(&bytes[36..40]).ok()? >> 24) as u16;
+        let block_and_slot = read_u32_le(&bytes[36..40]).ok()?;
+        let block = BlockNumber::new(block_and_slot & 0x00FF_FFFF);
+        let slot = u16::try_from(block_and_slot >> 24).ok()?;
         let ctid = TupleId::new(PageId::new(rel, block), slot);
         Some((
             Self {
@@ -289,6 +290,21 @@ mod tests {
         let (decoded, n) = TupleHeader::decode(&bytes).unwrap();
         assert_eq!(n, TUPLE_HEADER_SIZE);
         assert_eq!(decoded, h);
+    }
+
+    #[test]
+    fn decode_preserves_max_packed_ctid_slot() {
+        let tid = TupleId::new(
+            PageId::new(RelationId::new(7), BlockNumber::new(0x00FF_FFFF)),
+            u16::from(u8::MAX),
+        );
+        let h = TupleHeader::fresh(Xid::new(100), CommandId::new(0), tid, 5);
+
+        let mut bytes = [0_u8; TUPLE_HEADER_SIZE];
+        h.encode(&mut bytes);
+        let (decoded, _) = TupleHeader::decode(&bytes).unwrap();
+
+        assert_eq!(decoded.ctid, tid);
     }
 
     #[test]
