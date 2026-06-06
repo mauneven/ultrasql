@@ -3420,6 +3420,7 @@ dependencies = [
  "clap",
  "criterion",
  "futures",
+ "num-traits",
  "parquet",
  "serde",
  "serde_json",

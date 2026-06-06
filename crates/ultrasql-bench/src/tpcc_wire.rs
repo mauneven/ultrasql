@@ -574,7 +574,7 @@ fn next_tx(
     workload: &TpccWorkloadState,
     rng: &mut SplitMix64,
 ) -> Result<TpccTx> {
-    let selector = (rng.next_u64() % 100) as u8;
+    let selector = u8::try_from(rng.next_u64() % 100).context("transaction selector in range")?;
     let kind = transaction_kind(selector);
     next_tx_for_kind(config, workload, rng, kind)
 }

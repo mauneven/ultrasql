@@ -2,14 +2,12 @@
 
 #![allow(clippy::print_stderr)]
 #![allow(clippy::print_stdout)]
-#![allow(clippy::cast_possible_truncation)]
-#![allow(clippy::cast_precision_loss)]
-#![allow(clippy::cast_sign_loss)]
 
 use std::path::PathBuf;
 use std::process::ExitCode;
 
 use clap::{Args, Parser, Subcommand, ValueEnum};
+use num_traits::ToPrimitive;
 use serde::Serialize;
 use ultrasql_bench::ai_gauntlet::{
     FilteredVectorConfig, VectorMemoryConfig, run_filtered_vector_search, run_vector_memory,
@@ -477,8 +475,13 @@ fn percentile(sorted_values: &[f64], quantile: f64) -> f64 {
     if sorted_values.is_empty() {
         return 0.0;
     }
-    let rank = (quantile.clamp(0.0, 1.0) * sorted_values.len() as f64).ceil();
-    let index = (rank.max(1.0) as usize).saturating_sub(1);
+    let sample_count = sorted_values.len().to_f64().unwrap_or(f64::INFINITY);
+    let rank = (quantile.clamp(0.0, 1.0) * sample_count).ceil();
+    let index = rank
+        .max(1.0)
+        .to_usize()
+        .unwrap_or(sorted_values.len())
+        .saturating_sub(1);
     sorted_values[index.min(sorted_values.len() - 1)]
 }
 
