@@ -22,25 +22,20 @@
 //! writers take an exclusive lock. The lock is held for at most one slice
 //! operation, so contention is negligible.
 
-#![allow(
-    clippy::cast_possible_truncation,
-    clippy::cast_possible_wrap,
-    clippy::cast_sign_loss,
-    clippy::cast_lossless,
-    reason = "on-disk format / fixed-width packing; narrowings bounded by PAGE_SIZE / relation size"
-)]
-
 use dashmap::DashMap;
 use parking_lot::RwLock;
 use ultrasql_core::constants::PAGE_SIZE;
 use ultrasql_core::{BlockNumber, RelationId};
+
+const PAGE_SIZE_U32: u32 = 8_192;
+const _: () = assert!(PAGE_SIZE == 8_192);
 
 /// Number of free-space categories.
 ///
 /// Category `c` represents "at least `c * PAGE_SIZE / 256` bytes free."
 /// Category 0 means full; 255 means at least `255 * PAGE_SIZE / 256` bytes
 /// free (an almost-empty page). This matches PostgreSQL's FSM encoding.
-const CATEGORY_COUNT: usize = 256;
+const CATEGORY_COUNT: u32 = 256;
 
 /// Per-relation, in-memory free-space map.
 ///
@@ -85,9 +80,9 @@ impl FreeSpaceMap {
     /// the block's category is updated.
     #[allow(clippy::significant_drop_tightening)]
     pub fn record_free_space(&self, rel: RelationId, block: BlockNumber, free_bytes: u32) {
-        let clamped = free_bytes.min(PAGE_SIZE as u32) as usize;
         // floor(free_bytes * 256 / PAGE_SIZE), clamped to 255.
-        let category = u8::try_from((clamped * CATEGORY_COUNT / PAGE_SIZE).min(255)).unwrap_or(255);
+        let clamped = free_bytes.min(PAGE_SIZE_U32);
+        let category = category_byte((clamped * CATEGORY_COUNT / PAGE_SIZE_U32).min(255));
 
         // `entry` must outlive `vec` because `vec` borrows from it.
         let entry = self
@@ -95,7 +90,9 @@ impl FreeSpaceMap {
             .entry(rel)
             .or_insert_with(|| RwLock::new(Vec::new()));
         let mut vec = entry.write();
-        let idx = block.raw() as usize;
+        let Some(idx) = block_index(block) else {
+            return;
+        };
         if idx >= vec.len() {
             vec.resize(idx + 1, 0);
         }
@@ -112,13 +109,17 @@ impl FreeSpaceMap {
     /// returns `None`.
     #[allow(clippy::significant_drop_tightening)]
     pub fn find_block_with_at_least(&self, rel: RelationId, min_free: u32) -> Option<BlockNumber> {
-        let min_clamped = min_free.min(PAGE_SIZE as u32) as usize;
+        let min_clamped = min_free.min(PAGE_SIZE_U32);
         // Smallest category `c` such that `c * PAGE_SIZE / 256 >= min_free`.
         // That is `c >= ceil(min_free * 256 / PAGE_SIZE)`.
         let min_category = if min_clamped == 0 {
             0u8
         } else {
-            u8::try_from((min_clamped * CATEGORY_COUNT).div_ceil(PAGE_SIZE).min(255)).unwrap_or(255)
+            category_byte(
+                (min_clamped * CATEGORY_COUNT)
+                    .div_ceil(PAGE_SIZE_U32)
+                    .min(255),
+            )
         };
 
         // `entry` must outlive `vec` because `vec` borrows from it.
@@ -126,7 +127,10 @@ impl FreeSpaceMap {
         let vec = entry.read();
         for (idx, &cat) in vec.iter().enumerate() {
             if cat >= min_category {
-                return Some(BlockNumber::new(idx as u32));
+                let Ok(raw) = u32::try_from(idx) else {
+                    continue;
+                };
+                return Some(BlockNumber::new(raw));
             }
         }
         None
@@ -140,11 +144,24 @@ impl FreeSpaceMap {
     pub fn invalidate_block(&self, rel: RelationId, block: BlockNumber) {
         if let Some(entry) = self.inner.get(&rel) {
             let mut vec = entry.write();
-            let idx = block.raw() as usize;
+            let Some(idx) = block_index(block) else {
+                return;
+            };
             if idx < vec.len() {
                 vec[idx] = 0;
             }
         }
+    }
+}
+
+fn block_index(block: BlockNumber) -> Option<usize> {
+    usize::try_from(block.raw()).ok()
+}
+
+fn category_byte(value: u32) -> u8 {
+    match u8::try_from(value.min(u32::from(u8::MAX))) {
+        Ok(category) => category,
+        Err(_) => unreachable!("FSM category is clamped to u8::MAX"),
     }
 }
 
@@ -228,9 +245,17 @@ mod tests {
     #[test]
     fn empty_page_category_is_max() {
         let fsm = FreeSpaceMap::new();
-        fsm.record_free_space(rel(7), blk(0), PAGE_SIZE as u32);
-        let found = fsm.find_block_with_at_least(rel(7), PAGE_SIZE as u32);
+        fsm.record_free_space(rel(7), blk(0), PAGE_SIZE_U32);
+        let found = fsm.find_block_with_at_least(rel(7), PAGE_SIZE_U32);
         assert_eq!(found, Some(blk(0)));
+    }
+
+    #[test]
+    fn category_helpers_clamp_and_convert_without_wrapping() {
+        assert_eq!(category_byte(0), 0);
+        assert_eq!(category_byte(255), 255);
+        assert_eq!(category_byte(u32::MAX), 255);
+        assert_eq!(block_index(blk(42)), Some(42));
     }
 
     #[test]
