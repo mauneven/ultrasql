@@ -29,12 +29,12 @@
 //! Block allocation
 //! ----------------
 //!
-//! For v0.5 the heap owns an internal per-relation atomic counter that
-//! grows whenever an insert fails to find free space in an existing
-//! block. The [`Catalog`] trait is stubbed here for a future
-//! `ultrasql-catalog` agent to implement; once wired, the catalog
-//! becomes the authoritative source of block counts and the internal
-//! counter goes away.
+//! The heap owns an internal per-relation atomic counter that grows
+//! whenever an insert fails to find free space in an existing block.
+//! The persistent catalog stores `n_blocks`/`relpages` as a durable size
+//! hint; server scan paths use the larger of the resident heap counter
+//! and the catalog hint so newly inserted rows and restart metadata are
+//! both covered.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
@@ -544,8 +544,9 @@ impl<L: PageLoader> HeapAccess<L> {
 
     /// Number of blocks the heap has allocated to `rel`.
     ///
-    /// This is the v0.5 stand-in for a catalog query. Callers that need
-    /// to drive a scan should pass this value to [`Self::scan`].
+    /// This is the resident block count. Callers that drive a scan from
+    /// catalog metadata should use the larger of this value and the
+    /// catalog's durable `n_blocks` hint.
     #[must_use]
     pub fn block_count(&self, rel: RelationId) -> u32 {
         self.block_counters
