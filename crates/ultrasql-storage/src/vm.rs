@@ -38,14 +38,6 @@
 //! `VisibilityMap` is `Send + Sync` through its `DashMap` sharding and
 //! per-relation `RwLock`.
 
-#![allow(
-    clippy::cast_possible_truncation,
-    clippy::cast_possible_wrap,
-    clippy::cast_sign_loss,
-    clippy::cast_lossless,
-    reason = "on-disk format / fixed-width packing; narrowings bounded by PAGE_SIZE / relation size"
-)]
-
 use dashmap::DashMap;
 use parking_lot::RwLock;
 use ultrasql_core::{BlockNumber, RelationId};
@@ -106,7 +98,9 @@ impl VisibilityMap {
             return;
         };
         let mut vec = entry.write();
-        let (byte_idx, shift) = Self::byte_index_and_shift(block);
+        let Some((byte_idx, shift)) = byte_index_and_shift(block) else {
+            return;
+        };
         if byte_idx >= vec.len() {
             return;
         }
@@ -117,21 +111,15 @@ impl VisibilityMap {
     // Internal helpers
     // ------------------------------------------------------------------
 
-    /// Byte index and bit-pair shift for `block`.
-    const fn byte_index_and_shift(block: BlockNumber) -> (usize, u32) {
-        let b = block.raw() as usize;
-        let byte_idx = (b * 2) / 8;
-        let shift = ((b * 2) % 8) as u32;
-        (byte_idx, shift)
-    }
-
     /// Read the 2 VM bits for `block` (bits 0–1 of the returned byte).
     fn get_bits(&self, rel: RelationId, block: BlockNumber) -> u8 {
         let Some(entry) = self.inner.get(&rel) else {
             return 0;
         };
         let vec = entry.read();
-        let (byte_idx, shift) = Self::byte_index_and_shift(block);
+        let Some((byte_idx, shift)) = byte_index_and_shift(block) else {
+            return 0;
+        };
         if byte_idx >= vec.len() {
             return 0;
         }
@@ -147,7 +135,9 @@ impl VisibilityMap {
             .entry(rel)
             .or_insert_with(|| RwLock::new(Vec::new()));
         let mut vec = entry.write();
-        let (byte_idx, shift) = Self::byte_index_and_shift(block);
+        let Some((byte_idx, shift)) = byte_index_and_shift(block) else {
+            return;
+        };
         if byte_idx >= vec.len() {
             if !set {
                 // Clearing a bit that does not exist is a no-op.
@@ -163,6 +153,15 @@ impl VisibilityMap {
     }
 }
 
+/// Byte index and bit-pair shift for `block`.
+fn byte_index_and_shift(block: BlockNumber) -> Option<(usize, u32)> {
+    let block = usize::try_from(block.raw()).ok()?;
+    let bit_offset = block.checked_mul(2)?;
+    let byte_idx = bit_offset / 8;
+    let shift = u32::try_from(bit_offset % 8).ok()?;
+    Some((byte_idx, shift))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -173,6 +172,13 @@ mod tests {
 
     fn blk(n: u32) -> BlockNumber {
         BlockNumber::new(n)
+    }
+
+    #[test]
+    fn byte_index_and_shift_converts_without_wrapping() {
+        assert_eq!(byte_index_and_shift(blk(0)), Some((0, 0)));
+        assert_eq!(byte_index_and_shift(blk(3)), Some((0, 6)));
+        assert_eq!(byte_index_and_shift(blk(4)), Some((1, 0)));
     }
 
     #[test]
