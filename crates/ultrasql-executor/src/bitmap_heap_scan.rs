@@ -135,6 +135,14 @@ fn ensure_same_capacity(
     )))
 }
 
+fn trailing_bit_index(word: u64) -> usize {
+    debug_assert_ne!(word, 0);
+    match usize::try_from(word.trailing_zeros()) {
+        Ok(bit) => bit,
+        Err(_) => unreachable!("u64 trailing-zero count must fit usize"),
+    }
+}
+
 struct TidBitmapIter<'a> {
     words: &'a [u64],
     capacity: usize,
@@ -147,7 +155,7 @@ impl Iterator for TidBitmapIter<'_> {
     fn next(&mut self) -> Option<usize> {
         loop {
             if self.current != 0 {
-                let bit = self.current.trailing_zeros() as usize;
+                let bit = trailing_bit_index(self.current);
                 let i = self.word_idx * 64 + bit;
                 self.current &= self.current - 1;
                 if i < self.capacity {
