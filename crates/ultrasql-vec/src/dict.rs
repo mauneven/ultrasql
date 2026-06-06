@@ -138,7 +138,16 @@ impl DictionaryColumn {
     pub fn decode_at(&self, i: usize) -> &str {
         let code = self.codes.data()[i];
         assert_ne!(code, u32::MAX, "decode_at called on null row {i}");
-        &self.dict[code as usize]
+        let Ok(idx) = usize::try_from(code) else {
+            panic!("dictionary code {code} does not fit usize");
+        };
+        match self.dict.get(idx) {
+            Some(value) => value,
+            None => panic!(
+                "dictionary code {code} out of range for dict size {}",
+                self.dict.len()
+            ),
+        }
     }
 
     /// Look up the dict code for `value`, or `None` if not present.
@@ -339,11 +348,12 @@ pub fn group_by_dict(column: &DictionaryColumn) -> Vec<(u32, Vec<usize>)> {
 
     for (i, &code) in data.iter().enumerate() {
         let valid = validity.is_none_or(|bm| bm.get(i));
-        if valid && code != u32::MAX {
-            let idx = code as usize;
-            if idx < dict_size {
-                groups[idx].push(i);
-            }
+        if valid
+            && code != u32::MAX
+            && let Ok(idx) = usize::try_from(code)
+            && idx < dict_size
+        {
+            groups[idx].push(i);
         }
     }
 
@@ -473,6 +483,29 @@ mod tests {
         assert_eq!(groups.len(), 1);
         let (_, rows) = &groups[0];
         assert_eq!(rows, &[0, 2]); // row 1 (null) excluded
+    }
+
+    #[test]
+    fn group_by_dict_skips_out_of_range_codes() {
+        let col = DictionaryColumn {
+            dict: vec!["a".to_owned(), "b".to_owned()],
+            codes: NumericColumn::from_data(vec![0, 2, 1]),
+        };
+
+        let groups = group_by_dict(&col);
+
+        assert_eq!(groups, vec![(0, vec![0]), (1, vec![2])]);
+    }
+
+    #[test]
+    #[should_panic(expected = "dictionary code 2 out of range")]
+    fn decode_at_reports_out_of_range_code() {
+        let col = DictionaryColumn {
+            dict: vec!["a".to_owned(), "b".to_owned()],
+            codes: NumericColumn::from_data(vec![2]),
+        };
+
+        let _ = col.decode_at(0);
     }
 
     #[test]
