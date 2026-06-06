@@ -25,7 +25,7 @@ use std::time::Instant;
 
 use tokio::io::{AsyncRead, AsyncWrite};
 use ultrasql_catalog::CatalogSnapshot;
-use ultrasql_core::{DataType, Field, Value};
+use ultrasql_core::{DataType, Value};
 use ultrasql_executor::{ExecError, Operator};
 use ultrasql_planner::{BinaryOp, ExplainFormat, LogicalIndexMethod, LogicalPlan, ScalarExpr};
 use ultrasql_protocol::messages::{BackendMessage, FieldDescription};
@@ -1337,13 +1337,10 @@ fn json_escape(input: &str) -> String {
         .collect()
 }
 
-#[allow(dead_code)]
-fn _silence_unused(_f: Field) {}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ultrasql_core::Schema;
+    use ultrasql_core::{Field, Schema};
     use ultrasql_executor::MemTableScan;
     use ultrasql_planner::{
         AggregateFunc, LogicalAggregateExpr, LogicalJoinCondition, LogicalJoinType, LogicalSetOp,

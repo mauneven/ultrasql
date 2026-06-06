@@ -31,7 +31,7 @@ use ultrasql_txn::TransactionManager;
 use ultrasql_vec::Batch;
 
 use crate::affected_rows::affected_rows_batch;
-use crate::fused_update::{FusedCmp, FusedPredicate};
+use crate::fused_update::FusedPredicate;
 use crate::{ExecError, Operator};
 
 pub struct FusedDeleteInt32Pair<L: PageLoader> {
@@ -148,7 +148,3 @@ impl<L: PageLoader + Send + Sync + std::fmt::Debug + 'static> Operator for Fused
         &self.schema
     }
 }
-
-#[allow(dead_code)]
-#[doc(hidden)]
-fn _unused_cmp_helper(_c: FusedCmp) {}
