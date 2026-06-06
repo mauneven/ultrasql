@@ -702,7 +702,7 @@ fn choose_costed_order_dp(
         let masks = states
             .keys()
             .copied()
-            .filter(|mask| mask.count_ones() as usize == size)
+            .filter(|mask| mask_has_size(*mask, size))
             .collect::<Vec<_>>();
         for mask in masks {
             let Some(state) = states.get(&mask).cloned() else {
@@ -801,6 +801,10 @@ fn choose_costed_order_greedy(
     }
 
     state.order
+}
+
+fn mask_has_size(mask: u64, size: usize) -> bool {
+    u32::try_from(size).is_ok_and(|target| mask.count_ones() == target)
 }
 
 fn build_join_extension(
@@ -1175,6 +1179,13 @@ mod tests {
         let e = choose_enumerator(10);
         let result = e.enumerate(&[], &[]);
         assert!(result.is_empty());
+    }
+
+    #[test]
+    fn mask_has_size_checks_target_width() {
+        assert!(mask_has_size(0b1011, 3));
+        assert!(!mask_has_size(0b1011, 2));
+        assert!(!mask_has_size(0b1011, usize::MAX));
     }
 
     // -----------------------------------------------------------------------
