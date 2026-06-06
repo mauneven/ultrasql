@@ -41,7 +41,7 @@ use ultrasql_wal::payload::{
 use crate::btree::{BTree, BTreeError};
 use crate::buffer_pool::PageLoader;
 use crate::heap::{HeapAccess, UndoEntry, UndoRelationLog};
-use crate::page::PageError;
+use crate::page::{ItemId, PageError};
 
 fn should_skip_redo(page: &crate::page::Page, record_lsn: Lsn) -> bool {
     let raw = record_lsn.raw();
@@ -54,6 +54,41 @@ fn stamp_replayed_lsn(page: &mut crate::page::Page, record_lsn: Lsn) {
     if raw != 0 && page.header().lsn < raw {
         page.set_lsn(raw);
     }
+}
+
+fn refused(operation: &'static str, detail: impl Into<String>) -> ApplyError {
+    ApplyError::Refused {
+        operation,
+        detail: detail.into(),
+    }
+}
+
+fn item_id_from_page_bytes(
+    page_bytes: &[u8],
+    slot: u16,
+    operation: &'static str,
+) -> Result<ItemId, ApplyError> {
+    let item_id_off = crate::page::PAGE_HEADER_SIZE + usize::from(slot) * crate::page::ITEMID_SIZE;
+    let item_id_end = item_id_off
+        .checked_add(crate::page::ITEMID_SIZE)
+        .ok_or_else(|| refused(operation, "itemid offset overflow"))?;
+    let item_bytes = page_bytes
+        .get(item_id_off..item_id_end)
+        .ok_or_else(|| refused(operation, "itemid slice out of bounds"))?;
+    let raw = u32::from_le_bytes(
+        item_bytes
+            .try_into()
+            .map_err(|_| refused(operation, "itemid slice"))?,
+    );
+    Ok(ItemId::from_raw(raw))
+}
+
+fn item_offset_usize(item: ItemId, operation: &'static str) -> Result<usize, ApplyError> {
+    usize::try_from(item.offset()).map_err(|_| refused(operation, "item offset overflow"))
+}
+
+fn item_length_usize(item: ItemId, operation: &'static str) -> Result<usize, ApplyError> {
+    usize::try_from(item.length()).map_err(|_| refused(operation, "item length overflow"))
 }
 
 impl<L: PageLoader + 'static> HeapTarget for HeapAccess<L> {
@@ -224,18 +259,9 @@ impl<L: PageLoader + 'static> HeapTarget for HeapAccess<L> {
             hdr.encode(&mut hdr_bytes);
             let page_bytes = page.as_bytes_mut();
             // Re-read item-id to get the slot offset.
-            let item_id_off = crate::page::PAGE_HEADER_SIZE
-                + usize::from(payload.old_tid.slot) * crate::page::ITEMID_SIZE;
-            let raw = u32::from_le_bytes(
-                page_bytes[item_id_off..item_id_off + crate::page::ITEMID_SIZE]
-                    .try_into()
-                    .map_err(|_| ApplyError::Refused {
-                        operation: "heap_update_old",
-                        detail: String::from("itemid slice"),
-                    })?,
-            );
-            let item = crate::page::ItemId::from_raw(raw);
-            let slot_off = item.offset() as usize;
+            let item =
+                item_id_from_page_bytes(page_bytes, payload.old_tid.slot, "heap_update_old")?;
+            let slot_off = item_offset_usize(item, "heap_update_old")?;
             page_bytes[slot_off..slot_off + TUPLE_HEADER_SIZE].copy_from_slice(&hdr_bytes);
             stamp_replayed_lsn(&mut page, record_lsn);
         }
@@ -307,18 +333,8 @@ impl<L: PageLoader + 'static> HeapTarget for HeapAccess<L> {
         hdr.encode(&mut hdr_bytes);
 
         let page_bytes = page.as_bytes_mut();
-        let item_id_off = crate::page::PAGE_HEADER_SIZE
-            + usize::from(payload.tid.slot) * crate::page::ITEMID_SIZE;
-        let raw = u32::from_le_bytes(
-            page_bytes[item_id_off..item_id_off + crate::page::ITEMID_SIZE]
-                .try_into()
-                .map_err(|_| ApplyError::Refused {
-                    operation: "heap_delete",
-                    detail: String::from("itemid slice"),
-                })?,
-        );
-        let item = crate::page::ItemId::from_raw(raw);
-        let slot_off = item.offset() as usize;
+        let item = item_id_from_page_bytes(page_bytes, payload.tid.slot, "heap_delete")?;
+        let slot_off = item_offset_usize(item, "heap_delete")?;
         page_bytes[slot_off..slot_off + TUPLE_HEADER_SIZE].copy_from_slice(&hdr_bytes);
         stamp_replayed_lsn(&mut page, record_lsn);
 
@@ -402,19 +418,9 @@ impl<L: PageLoader + 'static> HeapTarget for HeapAccess<L> {
         hdr.encode(&mut hdr_bytes);
 
         let page_bytes = page.as_bytes_mut();
-        let item_id_off = crate::page::PAGE_HEADER_SIZE
-            + usize::from(payload.tid.slot) * crate::page::ITEMID_SIZE;
-        let raw = u32::from_le_bytes(
-            page_bytes[item_id_off..item_id_off + crate::page::ITEMID_SIZE]
-                .try_into()
-                .map_err(|_| ApplyError::Refused {
-                    operation: "heap_update_in_place",
-                    detail: String::from("itemid slice"),
-                })?,
-        );
-        let item = crate::page::ItemId::from_raw(raw);
-        let slot_off = item.offset() as usize;
-        let slot_len = item.length() as usize;
+        let item = item_id_from_page_bytes(page_bytes, payload.tid.slot, "heap_update_in_place")?;
+        let slot_off = item_offset_usize(item, "heap_update_in_place")?;
+        let slot_len = item_length_usize(item, "heap_update_in_place")?;
         if slot_len < TUPLE_HEADER_SIZE + payload.post_image_bytes.len() {
             return Err(ApplyError::Refused {
                 operation: "heap_update_in_place",
@@ -518,19 +524,10 @@ impl<L: PageLoader + 'static> HeapTarget for HeapAccess<L> {
             hdr.encode(&mut hdr_bytes);
 
             let page_bytes = page.as_bytes_mut();
-            let item_id_off =
-                crate::page::PAGE_HEADER_SIZE + usize::from(entry.slot) * crate::page::ITEMID_SIZE;
-            let raw = u32::from_le_bytes(
-                page_bytes[item_id_off..item_id_off + crate::page::ITEMID_SIZE]
-                    .try_into()
-                    .map_err(|_| ApplyError::Refused {
-                        operation: "heap_update_in_place_batch",
-                        detail: String::from("itemid slice"),
-                    })?,
-            );
-            let item = crate::page::ItemId::from_raw(raw);
-            let slot_off = item.offset() as usize;
-            let slot_len = item.length() as usize;
+            let item =
+                item_id_from_page_bytes(page_bytes, entry.slot, "heap_update_in_place_batch")?;
+            let slot_off = item_offset_usize(item, "heap_update_in_place_batch")?;
+            let slot_len = item_length_usize(item, "heap_update_in_place_batch")?;
             if slot_len < TUPLE_HEADER_SIZE + entry.post_image.len() {
                 return Err(ApplyError::Refused {
                     operation: "heap_update_in_place_batch",
@@ -629,18 +626,8 @@ impl<L: PageLoader + 'static> HeapTarget for HeapAccess<L> {
         hdr.encode(&mut hdr_bytes);
 
         let page_bytes = page.as_bytes_mut();
-        let item_id_off = crate::page::PAGE_HEADER_SIZE
-            + usize::from(payload.tid.slot) * crate::page::ITEMID_SIZE;
-        let raw = u32::from_le_bytes(
-            page_bytes[item_id_off..item_id_off + crate::page::ITEMID_SIZE]
-                .try_into()
-                .map_err(|_| ApplyError::Refused {
-                    operation: "heap_delete_in_place",
-                    detail: String::from("itemid slice"),
-                })?,
-        );
-        let item = crate::page::ItemId::from_raw(raw);
-        let slot_off = item.offset() as usize;
+        let item = item_id_from_page_bytes(page_bytes, payload.tid.slot, "heap_delete_in_place")?;
+        let slot_off = item_offset_usize(item, "heap_delete_in_place")?;
         page_bytes[slot_off..slot_off + TUPLE_HEADER_SIZE].copy_from_slice(&hdr_bytes);
         stamp_replayed_lsn(&mut page, record_lsn);
         drop(page);
