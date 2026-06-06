@@ -14,9 +14,9 @@ use tempfile::NamedTempFile;
 
 use crate::registry::{BenchContext, BenchResult, median_f64, p99_f64, require_bench_ok};
 
-#[allow(dead_code)]
+#[cfg(not(test))]
 const PROD_ROWS: usize = 10_000;
-#[allow(dead_code)]
+#[cfg(not(test))]
 const SMOKE_ROWS: usize = 512;
 #[cfg(test)]
 const TEST_ROWS: usize = 128;

@@ -30,7 +30,7 @@ use ultrasql_storage::page::Page;
 use crate::registry::{BenchContext, BenchResult, median_f64, p99_f64, require_bench_ok};
 
 /// Full production rows per iteration.
-#[allow(dead_code)] // used only in non-test builds via smoke_row_count
+#[cfg(not(test))]
 const PROD_ROWS_PER_ITER: usize = 10_000;
 
 /// Reduced rows per iteration for fast unit tests.
@@ -38,7 +38,7 @@ const PROD_ROWS_PER_ITER: usize = 10_000;
 const TEST_ROWS_PER_ITER: usize = 32;
 
 /// Smoke-mode rows per iteration (used when `ULTRASQL_BENCH_SMOKE` is set).
-#[allow(dead_code)] // used only in non-test builds via smoke_row_count
+#[cfg(not(test))]
 const SMOKE_ROWS_PER_ITER: usize = 50;
 
 /// Relation ID used throughout this benchmark.
@@ -73,11 +73,10 @@ pub(crate) struct SetupState {
     /// Number of rows inserted during setup.
     pub(crate) rows: usize,
     /// Pool that backs `heap`; kept alive so the heap remains valid.
-    #[allow(dead_code)] // pool must outlive heap — dropping it would invalidate heap
+    #[cfg(test)]
     pub(crate) pool: Arc<BufferPool<BlankLoader>>,
     /// Heap accessor for the relation populated by [`setup`].
-    /// Used only in `#[cfg(test)]` to call `scan_visible` for post-state assertions.
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub(crate) heap: HeapAccess<BlankLoader>,
 }
 
@@ -105,7 +104,9 @@ pub(crate) fn setup(n: usize) -> SetupState {
     require_bench_ok(heap.insert_batch(REL, &rows, opts), "setup insert_batch");
     SetupState {
         rows: n,
+        #[cfg(test)]
         pool,
+        #[cfg(test)]
         heap,
     }
 }
@@ -236,6 +237,10 @@ mod tests {
 
         // Part 1: setup populates exactly TEST_ROWS_PER_ITER visible rows.
         let state = setup(TEST_ROWS_PER_ITER);
+        assert!(
+            Arc::strong_count(&state.pool) >= 2,
+            "setup state must retain the pool backing the heap"
+        );
 
         let blocks = state.heap.block_count(REL);
         let visible: Vec<_> = state

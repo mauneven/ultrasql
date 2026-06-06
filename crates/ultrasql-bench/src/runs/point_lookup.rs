@@ -16,7 +16,7 @@ use ultrasql_storage::page::Page;
 use crate::registry::{BenchContext, BenchResult, median_f64, p99_f64, require_bench_ok};
 
 /// Full production key count for the `BTree`.
-#[allow(dead_code)] // used only in non-test builds via smoke_row_count
+#[cfg(not(test))]
 const PROD_KEY_COUNT: usize = 1_000_000;
 
 /// Reduced key count for fast unit tests.
@@ -24,11 +24,11 @@ const PROD_KEY_COUNT: usize = 1_000_000;
 const TEST_KEY_COUNT: usize = 1_000;
 
 /// Smoke-mode key count (used when `ULTRASQL_BENCH_SMOKE` is set).
-#[allow(dead_code)] // used only in non-test builds via smoke_row_count
+#[cfg(not(test))]
 const SMOKE_KEY_COUNT: usize = 500;
 
 /// Number of point lookups per measured iteration (production).
-#[allow(dead_code)] // used only in non-test builds via smoke_row_count
+#[cfg(not(test))]
 const PROD_PROBES_PER_ITER: usize = 1_000;
 
 /// Fewer probes in test mode so tests are fast.
@@ -36,7 +36,7 @@ const PROD_PROBES_PER_ITER: usize = 1_000;
 const TEST_PROBES_PER_ITER: usize = 10;
 
 /// Smoke-mode probes per iteration.
-#[allow(dead_code)] // used only in non-test builds via smoke_row_count
+#[cfg(not(test))]
 const SMOKE_PROBES_PER_ITER: usize = 20;
 
 /// In-memory buffer-pool loader that returns blank heap pages.

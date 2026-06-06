@@ -61,9 +61,19 @@ fn smoke_mode_enabled() -> bool {
 /// dataset so it completes in milliseconds even in a debug build, while
 /// production runs and `--release` regression gates use the full sizes.
 #[must_use]
-#[allow(dead_code)] // called only from #[cfg(not(test))] branches in run modules
 pub(crate) fn smoke_row_count(prod: usize, smoke: usize) -> usize {
     if smoke_mode_enabled() { smoke } else { prod }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{enable_smoke_mode_for_process, smoke_row_count};
+
+    #[test]
+    fn smoke_row_count_uses_process_guard() {
+        let _guard = enable_smoke_mode_for_process();
+        assert_eq!(smoke_row_count(10_000, 512), 512);
+    }
 }
 
 pub mod btree_point_lookup;

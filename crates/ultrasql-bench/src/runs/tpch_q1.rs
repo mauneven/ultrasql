@@ -27,7 +27,7 @@ use std::time::Instant;
 use crate::registry::{BenchContext, BenchResult, median_f64, p99_f64};
 
 /// Full production row count: 100 000 lineitem rows.
-#[allow(dead_code)] // used only in non-test builds via smoke_row_count
+#[cfg(not(test))]
 const PROD_ROW_COUNT: usize = 100_000;
 
 /// Reduced row count for fast unit tests.
@@ -35,7 +35,7 @@ const PROD_ROW_COUNT: usize = 100_000;
 const TEST_ROW_COUNT: usize = 500;
 
 /// Smoke-mode row count (used when `ULTRASQL_BENCH_SMOKE` is set).
-#[allow(dead_code)] // used only in non-test builds via smoke_row_count
+#[cfg(not(test))]
 const SMOKE_ROW_COUNT: usize = 500;
 
 /// Epoch day cut-off: `1998-09-01` in "days since 1970-01-01".

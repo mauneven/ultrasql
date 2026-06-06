@@ -20,7 +20,7 @@ use ultrasql_vec::kernels::hash_i64;
 use crate::registry::{BenchContext, BenchResult, median_f64, p99_f64};
 
 /// Full production row count: 1 000 000 rows.
-#[allow(dead_code)] // used only in non-test builds via smoke_row_count
+#[cfg(not(test))]
 const PROD_ROW_COUNT: usize = 1_000_000;
 
 /// Reduced row count for fast unit tests.
@@ -28,7 +28,7 @@ const PROD_ROW_COUNT: usize = 1_000_000;
 const TEST_ROW_COUNT: usize = 2_000;
 
 /// Smoke-mode row count (used when `ULTRASQL_BENCH_SMOKE` is set).
-#[allow(dead_code)] // used only in non-test builds via smoke_row_count
+#[cfg(not(test))]
 const SMOKE_ROW_COUNT: usize = 500;
 
 /// Number of distinct `group_id` values.

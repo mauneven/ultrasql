@@ -17,7 +17,7 @@ use ultrasql_storage::page::Page;
 use crate::registry::{BenchContext, BenchResult, median_f64, p99_f64, require_bench_ok};
 
 /// Full production row count: 1 000 000 rows.
-#[allow(dead_code)] // used only in non-test builds via smoke_row_count
+#[cfg(not(test))]
 const PROD_ROW_COUNT: usize = 1_000_000;
 
 /// Reduced row count for fast unit tests.
@@ -25,7 +25,7 @@ const PROD_ROW_COUNT: usize = 1_000_000;
 const TEST_ROW_COUNT: usize = 500;
 
 /// Smoke-mode row count (used when `ULTRASQL_BENCH_SMOKE` is set).
-#[allow(dead_code)] // used only in non-test builds via smoke_row_count
+#[cfg(not(test))]
 const SMOKE_ROW_COUNT: usize = 200;
 
 /// Relation ID used throughout this benchmark.
