@@ -41,14 +41,6 @@
 //! [`ToastTable`] is `Send + Sync`: the OID counter uses atomics, and the
 //! underlying [`HeapAccess`] is already `Send + Sync`.
 
-#![allow(
-    clippy::cast_possible_truncation,
-    clippy::cast_possible_wrap,
-    clippy::cast_sign_loss,
-    clippy::cast_lossless,
-    reason = "on-disk format / fixed-width packing; narrowings bounded by PAGE_SIZE / relation size"
-)]
-
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
