@@ -29,8 +29,6 @@
 //! CURRENT ROW` (the SQL default for functions that use the frame).
 //! `RANGE` frames and explicit frame bounds are a v0.6 follow-up.
 
-#![allow(clippy::cast_possible_wrap)]
-
 use std::collections::{HashMap, VecDeque};
 use std::thread;
 
@@ -447,7 +445,9 @@ impl WindowAgg {
 
             let n = sorted_indices.len();
             let values: Vec<Value> = match &self.func {
-                WindowFunc::RowNumber => Ok((1..=n).map(|i| Value::Int64(i as i64)).collect()),
+                WindowFunc::RowNumber => Ok((1..=n)
+                    .map(|i| Value::Int64(i64_from_usize_clamped(i)))
+                    .collect()),
                 WindowFunc::Rank => {
                     let mut out_ranks = vec![1_i64; n];
                     let mut base_rank = 1_usize;
@@ -460,7 +460,7 @@ impl WindowAgg {
                             base_rank = pos + 1;
                             prev_pos = Some(pos);
                         }
-                        out_ranks[pos] = base_rank as i64;
+                        out_ranks[pos] = i64_from_usize_clamped(base_rank);
                     }
                     Ok(out_ranks.into_iter().map(Value::Int64).collect())
                 }
@@ -562,7 +562,7 @@ impl WindowAgg {
                             } else {
                                 (pos * bucket_count) / n + 1
                             };
-                            Value::Int64(bucket as i64)
+                            Value::Int64(i64_from_usize_clamped(bucket))
                         })
                         .collect())
                 }
@@ -649,6 +649,12 @@ const fn i64_from_usize_clamped(v: usize) -> i64 {
     }
 }
 
+/// Convert a `u32` row index to `usize` for vector addressing.
+#[inline]
+fn usize_from_u32(v: u32) -> usize {
+    usize::try_from(v).unwrap_or(usize::MAX)
+}
+
 /// Scatter ranks `1..=n` into a row-aligned `Vec<i64>`, indexed by the
 /// original row index carried in each sorted pair. Returns the rank
 /// vector in row order (i.e. `out[orig_idx] = rank`).
@@ -656,7 +662,7 @@ const fn i64_from_usize_clamped(v: usize) -> i64 {
 fn scatter_rank_from_pairs(sorted: &[(i64, u32)], total: usize) -> Vec<i64> {
     let mut window_col: Vec<i64> = vec![0; total];
     for (pos, &(_, idx)) in sorted.iter().enumerate() {
-        window_col[idx as usize] = i64_from_usize_clamped(pos + 1);
+        window_col[usize_from_u32(idx)] = i64_from_usize_clamped(pos + 1);
     }
     window_col
 }
