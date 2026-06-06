@@ -40,6 +40,7 @@
 //! * `AVG(BIGINT) → DOUBLE PRECISION`
 //! * `COUNT(*) → BIGINT`
 
+use num_traits::ToPrimitive;
 use ultrasql_core::{DataType, Field, Schema};
 use ultrasql_vec::Batch;
 use ultrasql_vec::column::{Column, NumericColumn};
@@ -278,8 +279,17 @@ impl Operator for DirectScalarAggScan {
                     // Widen through f64 once. Matches PostgreSQL's
                     // `AVG(INT) → DOUBLE PRECISION` widening rule
                     // and the binder's declared aggregate result type.
-                    #[allow(clippy::cast_precision_loss)]
-                    let avg = (total_sum as f64) / (count_rows as f64);
+                    let sum = total_sum.to_f64().ok_or_else(|| {
+                        ExecError::NumericFieldOverflow(
+                            "DirectScalarAggScan AVG sum conversion overflow".to_owned(),
+                        )
+                    })?;
+                    let count = count_rows.to_f64().ok_or_else(|| {
+                        ExecError::NumericFieldOverflow(
+                            "DirectScalarAggScan AVG count conversion overflow".to_owned(),
+                        )
+                    })?;
+                    let avg = sum / count;
                     Column::Float64(NumericColumn::from_data(vec![avg]))
                 }
             }

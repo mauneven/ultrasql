@@ -503,7 +503,6 @@ impl VectorizedSink for CollectSink {
 // ============================================================================
 
 #[cfg(test)]
-#[allow(clippy::cast_possible_wrap)]
 mod tests {
     use ultrasql_core::{DataType, Field, Schema};
     use ultrasql_vec::column::{Column, NumericColumn};
@@ -751,7 +750,9 @@ mod tests {
         let batches: Vec<Batch> = (0..N_ROWS)
             .step_by(BATCH_SZ)
             .map(|start| {
-                let xs: Vec<i64> = (start..start + BATCH_SZ).map(|i| i as i64).collect();
+                let xs: Vec<i64> = (start..start + BATCH_SZ)
+                    .map(|i| i64::try_from(i).expect("test index fits i64"))
+                    .collect();
                 let ys: Vec<i64> = xs.clone();
                 Batch::new([
                     Column::Int64(NumericColumn::from_data(xs)),
