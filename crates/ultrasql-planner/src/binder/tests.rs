@@ -4084,6 +4084,18 @@ fn rejects_malformed_window_function_calls() {
 }
 
 #[test]
+fn rejects_distinct_window_function_calls() {
+    let cat = users_catalog();
+    let sql = "SELECT first_value(DISTINCT score) OVER () FROM users";
+    let err = parse_and_bind(sql, &cat).expect_err(sql);
+    assert!(err.is_not_supported(), "{err:?}");
+    assert!(
+        err.to_string().contains("DISTINCT window function"),
+        "{err:?}"
+    );
+}
+
+#[test]
 fn statement_family_display_schema_and_pipeline_modes_are_stable() {
     let cases = [
         (

@@ -126,7 +126,6 @@ fn rewrite_expr(expr: &Expr, out: &mut Vec<WindowExtraction>) -> Expr {
 pub(super) struct WindowExtraction {
     pub name: ObjectName,
     pub args: Vec<Expr>,
-    #[allow(dead_code)] // reserved for v0.6 DISTINCT window aggregates
     pub distinct: bool,
     pub spec: WindowSpec,
     pub output_name: String,
@@ -149,6 +148,12 @@ pub(super) fn apply_window_extractions(
             .parts
             .last()
             .map_or(String::new(), |p| p.value.to_ascii_lowercase());
+
+        if ex.distinct {
+            return Err(PlanError::not_supported(format!(
+                "DISTINCT window function '{func_name}'"
+            )));
+        }
 
         let func = resolve_window_func(
             &func_name,
