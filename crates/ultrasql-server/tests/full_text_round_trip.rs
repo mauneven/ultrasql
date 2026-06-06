@@ -1,6 +1,6 @@
 //! Wire-level full-text scalar surface coverage.
 
-mod support;
+pub mod support;
 
 use support::{shutdown, start_sample_server};
 use tokio_postgres::SimpleQueryMessage;

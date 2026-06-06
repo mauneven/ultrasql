@@ -1,6 +1,6 @@
 //! Wire-level `DROP INDEX` coverage and restart persistence.
 
-mod support;
+pub mod support;
 
 use support::{shutdown, start_persistent_server};
 use ultrasql_catalog::bootstrap::PG_CLASS_OID;

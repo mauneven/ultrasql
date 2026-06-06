@@ -1,6 +1,6 @@
 //! Wire-level schema DDL, namespace catalog, and owner dependency coverage.
 
-mod support;
+pub mod support;
 
 use support::{connect_as, shutdown, start_persistent_server, start_sample_server};
 

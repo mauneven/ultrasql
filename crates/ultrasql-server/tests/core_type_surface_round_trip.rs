@@ -1,7 +1,7 @@
 //! Wire-level coverage for core PostgreSQL scalar types already supported by
 //! UltraSQL's parser, binder, row codec, executor, and protocol encoder.
 
-mod support;
+pub mod support;
 
 use support::{shutdown, start_persistent_server, start_sample_server};
 use tokio_postgres::SimpleQueryMessage;

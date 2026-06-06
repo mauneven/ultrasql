@@ -6,7 +6,7 @@
 
 use std::time::Duration;
 
-mod support;
+pub mod support;
 
 use support::{shutdown, start_sample_server};
 

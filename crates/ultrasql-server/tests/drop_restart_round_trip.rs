@@ -1,6 +1,6 @@
 //! Persistent `DROP TABLE` restart coverage through the PostgreSQL wire path.
 
-mod support;
+pub mod support;
 
 use support::{shutdown, start_persistent_server};
 use ultrasql_server::Server;

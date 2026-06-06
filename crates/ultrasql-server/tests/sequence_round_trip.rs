@@ -2,7 +2,7 @@
 
 use tokio_postgres::NoTls;
 
-mod support;
+pub mod support;
 
 use support::{
     connect_as, shutdown as graceful_shutdown, start_persistent_server, start_sample_server,

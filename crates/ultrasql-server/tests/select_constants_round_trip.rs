@@ -10,7 +10,7 @@
 //! parameter substitution, and `RowDescription` paths are exercised
 //! end-to-end.
 
-mod support;
+pub mod support;
 
 use support::{shutdown, start_sample_server};
 

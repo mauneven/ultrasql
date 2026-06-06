@@ -1,6 +1,6 @@
 //! End-to-end MONEY surface and PostgreSQL wire metadata.
 
-mod support;
+pub mod support;
 
 use support::{shutdown, start_sample_server};
 

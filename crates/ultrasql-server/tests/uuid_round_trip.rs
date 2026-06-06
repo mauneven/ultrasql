@@ -3,7 +3,7 @@
 use tokio_postgres::SimpleQueryMessage;
 use ultrasql_core::Value;
 
-mod support;
+pub mod support;
 
 use support::{shutdown, start_sample_server};
 

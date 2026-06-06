@@ -5,7 +5,7 @@
 //! parser, binder, planner, aggregate executor, and result encoder all stay
 //! covered together.
 
-mod support;
+pub mod support;
 
 use support::{shutdown, start_sample_server};
 use tokio_postgres::SimpleQueryMessage;

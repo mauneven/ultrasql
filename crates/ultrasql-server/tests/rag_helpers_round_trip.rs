@@ -9,7 +9,7 @@ use ultrasql_catalog::rag::{
     search_rag_answer_context_sql, search_rag_embeddings_sql,
 };
 
-mod support;
+pub mod support;
 
 use support::{shutdown, start_sample_server};
 

@@ -20,7 +20,7 @@
 //! - Schema arity mismatch is rejected before any heap write.
 
 use std::collections::HashSet;
-mod support;
+pub mod support;
 
 use support::{shutdown, start_sample_server};
 

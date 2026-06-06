@@ -33,7 +33,7 @@ use std::time::Duration;
 use tokio_postgres::NoTls;
 use ultrasql_server::{Server, bind_listener, serve_listener};
 
-mod support;
+pub mod support;
 
 use support::{shutdown as persistent_shutdown, start_persistent_server};
 

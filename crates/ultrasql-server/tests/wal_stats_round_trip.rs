@@ -1,4 +1,4 @@
-mod support;
+pub mod support;
 
 #[tokio::test]
 async fn pg_stat_wal_reports_live_append_counters() {

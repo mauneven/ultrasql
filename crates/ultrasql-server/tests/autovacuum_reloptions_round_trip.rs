@@ -1,6 +1,6 @@
 //! Per-table autovacuum reloption round trips.
 
-mod support;
+pub mod support;
 
 use support::{shutdown, start_sample_server};
 

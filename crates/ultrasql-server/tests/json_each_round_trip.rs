@@ -1,6 +1,6 @@
 //! Wire-level regression tests for SQL/JSON table functions.
 
-mod support;
+pub mod support;
 
 use support::{shutdown, start_sample_server};
 use tokio_postgres::SimpleQueryMessage;

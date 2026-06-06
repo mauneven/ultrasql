@@ -13,7 +13,7 @@
 //! Pinning these here means a regression on any link in the chain
 //! trips an integration test rather than the TPC-H runner.
 
-mod support;
+pub mod support;
 
 use support::{shutdown, start_sample_server};
 

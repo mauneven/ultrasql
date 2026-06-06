@@ -1,6 +1,6 @@
 //! End-to-end scalar system-function behavior tests.
 
-mod support;
+pub mod support;
 
 use support::{shutdown, start_sample_server};
 

@@ -16,7 +16,7 @@ use tokio_postgres::NoTls;
 use ultrasql_core::Value;
 use ultrasql_server::{RuntimeAggregatingIndex, Server, bind_listener, serve_listener};
 
-mod support;
+pub mod support;
 
 use support::{shutdown as graceful_shutdown, start_persistent_server};
 

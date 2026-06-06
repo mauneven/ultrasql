@@ -4,7 +4,7 @@
 //! Closes the v0.5 ROADMAP item "PREPARE / EXECUTE / DEALLOCATE
 //! Simple-Query round-trip".
 
-mod support;
+pub mod support;
 
 use support::{shutdown, start_sample_server};
 

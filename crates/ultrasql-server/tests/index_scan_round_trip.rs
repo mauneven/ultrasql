@@ -35,7 +35,7 @@ use ultrasql_core::{BlockNumber, PageId, RelationId, TupleId, Xid};
 use ultrasql_storage::access_method::BrinIndex;
 use ultrasql_storage::btree::BTree;
 
-mod support;
+pub mod support;
 
 use support::{shutdown as graceful_shutdown, start_persistent_server, start_sample_server};
 

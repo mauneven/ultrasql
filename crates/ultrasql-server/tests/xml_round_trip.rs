@@ -1,6 +1,6 @@
 //! End-to-end basic `XML` storage and wire rendering.
 
-mod support;
+pub mod support;
 
 use bytes::{Bytes, BytesMut};
 use futures::{SinkExt, StreamExt};

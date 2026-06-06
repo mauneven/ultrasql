@@ -1,6 +1,6 @@
 //! Wire-level coverage for role-management DDL.
 
-mod support;
+pub mod support;
 
 use support::{shutdown, start_persistent_server, start_sample_server};
 use tokio_postgres::{NoTls, error::SqlState};

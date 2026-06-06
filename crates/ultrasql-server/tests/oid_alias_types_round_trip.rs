@@ -1,6 +1,6 @@
 //! End-to-end `OID` / `REGCLASS` / `REGTYPE` / `PG_LSN` behavior.
 
-mod support;
+pub mod support;
 
 use bytes::BytesMut;
 use support::{shutdown, start_persistent_server};

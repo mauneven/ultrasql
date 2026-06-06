@@ -7,7 +7,7 @@ use tokio::sync::oneshot;
 use tokio_postgres::NoTls;
 use ultrasql_server::{Server, bind_listener, serve_listener_with_shutdown};
 
-mod support;
+pub mod support;
 
 use support::{shutdown as shutdown_persistent, start_persistent_server};
 

@@ -22,7 +22,7 @@
 //! but we go through the loopback TCP stack so the codec exercises real
 //! byte ordering on a real socket.
 
-mod support;
+pub mod support;
 
 use support::{shutdown, start_sample_server};
 

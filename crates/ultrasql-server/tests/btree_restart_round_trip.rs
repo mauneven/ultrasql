@@ -1,6 +1,6 @@
 //! Restart checks for durable B-tree index metadata and rebuilt pages.
 
-mod support;
+pub mod support;
 
 use support::{shutdown, start_persistent_server};
 

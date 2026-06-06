@@ -1,4 +1,4 @@
-mod support;
+pub mod support;
 
 use bytes::BytesMut;
 use support::{shutdown, start_persistent_server};

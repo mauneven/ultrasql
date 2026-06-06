@@ -1,3 +1,4 @@
+use std::fmt;
 use std::net::SocketAddr;
 use std::path::Path;
 use std::sync::Arc;
@@ -7,21 +8,24 @@ use tokio::sync::oneshot;
 use tokio_postgres::NoTls;
 use ultrasql_server::{Server, bind_listener, serve_listener_with_shutdown};
 
-pub(crate) struct RunningServer {
-    pub(crate) server: Arc<Server>,
-    pub(crate) client: tokio_postgres::Client,
-    #[allow(dead_code)]
-    pub(crate) bound: SocketAddr,
+pub struct RunningServer {
+    pub server: Arc<Server>,
+    pub client: tokio_postgres::Client,
+    pub bound: SocketAddr,
     conn_handle: tokio::task::JoinHandle<()>,
     server_handle: tokio::task::JoinHandle<Result<(), ultrasql_server::ServerError>>,
     shutdown_tx: oneshot::Sender<()>,
 }
 
-#[allow(dead_code)]
-pub(crate) async fn start_persistent_server(
-    data_dir: &Path,
-    application_name: &str,
-) -> RunningServer {
+impl fmt::Debug for RunningServer {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("RunningServer")
+            .field("bound", &self.bound)
+            .finish_non_exhaustive()
+    }
+}
+
+pub async fn start_persistent_server(data_dir: &Path, application_name: &str) -> RunningServer {
     start_server(
         Arc::new(Server::init(data_dir).expect("persistent server init")),
         application_name,
@@ -29,13 +33,11 @@ pub(crate) async fn start_persistent_server(
     .await
 }
 
-#[allow(dead_code)]
-pub(crate) async fn start_sample_server(application_name: &str) -> RunningServer {
+pub async fn start_sample_server(application_name: &str) -> RunningServer {
     start_server(Arc::new(Server::with_sample_database()), application_name).await
 }
 
-#[allow(dead_code)]
-pub(crate) async fn connect_as(
+pub async fn connect_as(
     bound: SocketAddr,
     user: &str,
     application_name: &str,
@@ -92,7 +94,7 @@ async fn start_server(server: Arc<Server>, application_name: &str) -> RunningSer
     }
 }
 
-pub(crate) async fn shutdown(running: RunningServer) {
+pub async fn shutdown(running: RunningServer) {
     let RunningServer {
         server,
         client,

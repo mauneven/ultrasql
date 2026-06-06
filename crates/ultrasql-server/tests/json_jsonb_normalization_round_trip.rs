@@ -1,6 +1,6 @@
 //! End-to-end JSON/JSONB storage-normalization checks.
 
-mod support;
+pub mod support;
 
 use bytes::Bytes;
 use futures::{SinkExt, StreamExt};

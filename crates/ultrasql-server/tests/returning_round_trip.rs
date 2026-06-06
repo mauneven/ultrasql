@@ -8,7 +8,7 @@
 
 use tokio_postgres::SimpleQueryMessage;
 
-mod support;
+pub mod support;
 
 use support::{shutdown, start_sample_server};
 

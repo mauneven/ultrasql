@@ -3,7 +3,7 @@
 use ultrasql_catalog::bootstrap::PG_CLASS_OID;
 use ultrasql_core::Oid;
 
-mod support;
+pub mod support;
 
 use support::{shutdown, start_persistent_server};
 

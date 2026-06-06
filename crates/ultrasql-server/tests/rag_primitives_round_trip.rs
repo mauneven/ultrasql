@@ -3,7 +3,7 @@
 use tokio_postgres::SimpleQueryMessage;
 use ultrasql_catalog::rag::{RagSchemaConfig, create_rag_table_statements};
 
-mod support;
+pub mod support;
 
 use support::{shutdown, start_sample_server};
 

@@ -1,4 +1,4 @@
-mod support;
+pub mod support;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn pg_statio_user_indexes_exposes_catalog_index_rows() {

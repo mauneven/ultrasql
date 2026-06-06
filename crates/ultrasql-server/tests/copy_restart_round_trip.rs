@@ -9,7 +9,7 @@ use bytes::Bytes;
 use futures::SinkExt;
 use parquet::arrow::ArrowWriter;
 
-mod support;
+pub mod support;
 
 use support::{shutdown, start_persistent_server};
 

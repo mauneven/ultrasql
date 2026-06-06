@@ -1,6 +1,6 @@
 //! Admin validation round-trip tests.
 
-mod support;
+pub mod support;
 
 use ultrasql_server::Server;
 

@@ -1,6 +1,6 @@
 //! End-to-end `INET` / `CIDR` / `MACADDR` / `MACADDR8` storage and operators.
 
-mod support;
+pub mod support;
 
 use bytes::Bytes;
 use futures::{SinkExt, StreamExt};

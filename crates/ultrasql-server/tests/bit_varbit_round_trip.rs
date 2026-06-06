@@ -1,6 +1,6 @@
 //! End-to-end `BIT` / `VARBIT` storage, operators, COPY, and wire metadata.
 
-mod support;
+pub mod support;
 
 use bytes::Bytes;
 use futures::{SinkExt, StreamExt};

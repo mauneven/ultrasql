@@ -1,6 +1,6 @@
 //! Wire-level ownership checks for table-mutating DDL.
 
-mod support;
+pub mod support;
 
 use std::net::SocketAddr;
 

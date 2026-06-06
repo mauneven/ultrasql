@@ -4,7 +4,7 @@
 //! (`23505`), DEFAULT, and the basic non-deferrable FOREIGN KEY
 //! (`23503`) slice wired for v0.8.
 
-mod support;
+pub mod support;
 
 use support::{shutdown as graceful_shutdown, start_persistent_server, start_sample_server};
 

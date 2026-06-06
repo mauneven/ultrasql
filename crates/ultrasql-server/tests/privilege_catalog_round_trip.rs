@@ -1,6 +1,6 @@
 //! Wire-level coverage for privilege DDL.
 
-mod support;
+pub mod support;
 
 use std::net::SocketAddr;
 

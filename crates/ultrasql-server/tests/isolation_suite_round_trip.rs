@@ -1,6 +1,6 @@
 //! Isolation-suite coverage derived from public ACID/Hermitage scenarios.
 
-mod support;
+pub mod support;
 
 use std::fs;
 use std::net::SocketAddr;

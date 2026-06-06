@@ -6,7 +6,7 @@
 //! Each test issues the aggregate against a known input and asserts
 //! the floating-point result inside a small tolerance.
 
-mod support;
+pub mod support;
 
 use support::{shutdown, start_sample_server};
 

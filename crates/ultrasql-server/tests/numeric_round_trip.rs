@@ -1,6 +1,6 @@
 //! End-to-end NUMERIC / DECIMAL arithmetic, casts, and wire metadata.
 
-mod support;
+pub mod support;
 
 use support::{shutdown, start_persistent_server, start_sample_server};
 

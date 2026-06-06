@@ -17,7 +17,7 @@
 //! - `DROP TABLE` against a never-defined name fails with SQLSTATE
 //!   `42P01` and leaves the session in idle status.
 
-mod support;
+pub mod support;
 
 use support::{shutdown, start_sample_server};
 
