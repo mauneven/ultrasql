@@ -6,6 +6,13 @@
 
 use std::fmt;
 
+fn small_u32_to_usize(value: u32) -> usize {
+    match usize::try_from(value) {
+        Ok(value) => value,
+        Err(_) => panic!("small bitmap count {value} does not fit usize"),
+    }
+}
+
 /// Packed bitmap with a logical length in bits.
 #[derive(Clone, PartialEq, Eq)]
 pub struct Bitmap {
@@ -108,7 +115,10 @@ impl Bitmap {
     /// Count set bits.
     #[must_use]
     pub fn count_ones(&self) -> usize {
-        self.bits.iter().map(|w| w.count_ones() as usize).sum()
+        self.bits
+            .iter()
+            .map(|w| small_u32_to_usize(w.count_ones()))
+            .sum()
     }
 
     /// Borrow the underlying u64 words.
@@ -169,7 +179,7 @@ impl Iterator for SetBitsIter<'_> {
     fn next(&mut self) -> Option<usize> {
         loop {
             if self.current != 0 {
-                let bit = self.current.trailing_zeros() as usize;
+                let bit = small_u32_to_usize(self.current.trailing_zeros());
                 let i = self.word_idx * 64 + bit;
                 self.current &= self.current - 1;
                 if i < self.len_bits {
