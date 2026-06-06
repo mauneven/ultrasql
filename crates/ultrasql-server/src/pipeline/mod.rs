@@ -9,8 +9,8 @@
 //!
 //! - `LogicalPlan::Scan` -> `MemTableScan` backed by per-table
 //!   pre-materialized batches loaded by [`SampleTables`] at startup.
-//! - `LogicalPlan::Filter` with predicate `col = i32_literal` ->
-//!   `FilterEqI32`.
+//! - `LogicalPlan::Filter` -> `Filter` backed by the executor scalar
+//!   expression evaluator plus vectorised comparison fast paths.
 //! - `LogicalPlan::Project` over pure column references ->
 //!   `Project`.
 //! - `LogicalPlan::Limit` -> `Limit` (`LIMIT n OFFSET m`,
@@ -35,19 +35,10 @@
 //! ## Why an inline lowerer
 //!
 //! The executor crate ships [`ultrasql_executor::physical::build_operator`],
-//! which performs the same lowering at a higher level. The lowerer
-//! here is intentionally separate for one reason: the v0.5
-//! `FilterEqI32` operator only handles numeric columns and rejects
-//! a batch that contains a Utf8 column at any position. The server's
-//! sample table includes a `name TEXT` column, so we push the
-//! projection-required-for-evaluation below the filter and pass the
-//! filter only columns it can chew through.
-//!
-//! Once the executor grows a general expression evaluator and the
-//! filter operator stops being type-fussy, this module collapses to a
-//! one-line delegation to
-//! [`ultrasql_executor::physical::build_operator`]; the integration
-//! point is `lower_plan` and its `SampleTables` parameter.
+//! which performs the same lowering at a higher level. The sample lowerer
+//! stays separate because it reads pre-built [`SampleTables`] batches instead
+//! of heap relations; the integration point is `lower_plan` and its
+//! `SampleTables` parameter.
 
 use std::collections::HashMap;
 use std::sync::Arc;

@@ -40,6 +40,22 @@ fn lowers_filter_eq_int() {
 }
 
 #[test]
+fn lowers_filter_then_project_non_predicate_column() {
+    let (catalog, tables) = fixture();
+    let p = plan("SELECT name FROM users WHERE id = 2", &catalog);
+    let mut op = lower_plan(&p, &tables).expect("lowers");
+    let batch = op.next_batch().unwrap().expect("first batch");
+    assert_eq!(batch.rows(), 1);
+    assert_eq!(batch.width(), 1);
+    let ultrasql_vec::column::Column::Utf8(names) = &batch.columns()[0] else {
+        panic!("name projection must stay Utf8");
+    };
+    let start = usize::try_from(names.offsets()[0]).expect("offset fits");
+    let end = usize::try_from(names.offsets()[1]).expect("offset fits");
+    assert_eq!(&names.values()[start..end], b"Grace");
+}
+
+#[test]
 fn lowers_limit() {
     let (catalog, tables) = fixture();
     let p = plan("SELECT id FROM users LIMIT 1", &catalog);

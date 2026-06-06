@@ -1,11 +1,9 @@
 //! Simple per-variant lowerers used by the top-level [`super::lower_plan`]
 //! dispatcher, plus the sample-database loader.
 
-use ultrasql_core::{DataType, Field, Schema, Value};
-use ultrasql_executor::{
-    FilterEqI32, Limit, MemTableScan, Operator, Project, ResultOp, SetOp, Sort,
-};
-use ultrasql_planner::{BinaryOp, InMemoryCatalog, LogicalPlan, ScalarExpr};
+use ultrasql_core::{DataType, Field, Schema};
+use ultrasql_executor::{Filter, Limit, MemTableScan, Operator, Project, ResultOp, SetOp, Sort};
+use ultrasql_planner::{InMemoryCatalog, LogicalPlan, ScalarExpr};
 use ultrasql_vec::Batch;
 use ultrasql_vec::column::{Column, NumericColumn, StringColumn};
 
@@ -22,7 +20,7 @@ pub fn lower_plan(
     tables: &SampleTables,
 ) -> Result<Box<dyn Operator>, ServerError> {
     match plan {
-        LogicalPlan::Scan { table, .. } => lower_scan(table, None, tables),
+        LogicalPlan::Scan { table, .. } => lower_scan(table, tables),
         LogicalPlan::Filter { input, predicate } => lower_filter(input, predicate, tables),
         LogicalPlan::Project {
             input,
@@ -180,110 +178,31 @@ pub fn lower_plan(
     }
 }
 
-/// Build a [`MemTableScan`] for a registered table, optionally with a
-/// projection pushed below the scan.
-///
-/// `projection` is supplied by [`lower_filter`] when it needs the
-/// scan to drop columns the filter cannot consume. With `None` the
-/// scan emits the table's natural shape.
-fn lower_scan(
-    table: &str,
-    projection: Option<&[usize]>,
-    tables: &SampleTables,
-) -> Result<Box<dyn Operator>, ServerError> {
+/// Build a [`MemTableScan`] for a registered table in its natural shape.
+fn lower_scan(table: &str, tables: &SampleTables) -> Result<Box<dyn Operator>, ServerError> {
     let sample = tables.lookup(table).ok_or_else(|| {
         ServerError::Plan(ultrasql_planner::PlanError::TableNotFound(
             table.to_string(),
         ))
     })?;
-    let scan: Box<dyn Operator> = Box::new(MemTableScan::new(
+    Ok(Box::new(MemTableScan::new(
         sample.schema.clone(),
         sample.batches.clone(),
-    ));
-    if let Some(indices) = projection {
-        let projected = Project::new(scan, indices.to_vec())?;
-        Ok(Box::new(projected))
-    } else {
-        Ok(scan)
-    }
+    )))
 }
 
 /// Lower a `Filter` node.
 ///
-/// Because [`FilterEqI32`] rejects non-numeric columns at runtime,
-/// the lowerer pushes a projection below the filter that keeps only
-/// the columns referenced by the parent operator and by the
-/// predicate itself. The pushed projection is also reflected in the
-/// indices the predicate references — column 0 of the pushed-down
-/// schema is the predicate's old `col_idx`, so the filter's
-/// `col_idx` becomes 0.
+/// The sample path uses the same general predicate operator as the heap-backed
+/// path, so filtering preserves the child's full row shape and any parent
+/// projection may still reference non-predicate columns.
 fn lower_filter(
     input: &LogicalPlan,
     predicate: &ScalarExpr,
     tables: &SampleTables,
 ) -> Result<Box<dyn Operator>, ServerError> {
-    let (col_idx, constant) = match_eq_i32(predicate).ok_or(ServerError::Unsupported(
-        "WHERE shape; v0.5 only supports `int_col = int_literal`",
-    ))?;
-    // The filter operator currently only knows how to walk Int32 /
-    // Int64 columns; any wider column type causes a runtime
-    // TypeMismatch. We project the scan down to just the predicate's
-    // single column before handing it to the filter so the sample
-    // table's `name TEXT` column never reaches the kernel.
-    let scan_table = match input {
-        LogicalPlan::Scan { table, .. } => table.as_str(),
-        _ => {
-            return Err(ServerError::Unsupported(
-                "WHERE only supported directly over a base table in v0.5",
-            ));
-        }
-    };
-    let scan = lower_scan(scan_table, Some(&[col_idx]), tables)?;
-    // After the pushed-down projection, the predicate column is
-    // always at index 0.
-    let filter = FilterEqI32::new(scan, 0, constant)?;
-    Ok(Box::new(filter))
-}
-
-/// Recognise a binary predicate `Column(int) = Literal(int)` (or its
-/// commuted form) and return the column index in the *input* schema
-/// and the literal. Any other shape returns `None` so the caller
-/// reports [`ServerError::Unsupported`].
-fn match_eq_i32(predicate: &ScalarExpr) -> Option<(usize, i32)> {
-    let ScalarExpr::Binary {
-        op: BinaryOp::Eq,
-        left,
-        right,
-        ..
-    } = predicate
-    else {
-        return None;
-    };
-    match (left.as_ref(), right.as_ref()) {
-        (
-            ScalarExpr::Column {
-                index,
-                data_type: DataType::Int32,
-                ..
-            },
-            ScalarExpr::Literal {
-                value: Value::Int32(v),
-                ..
-            },
-        )
-        | (
-            ScalarExpr::Literal {
-                value: Value::Int32(v),
-                ..
-            },
-            ScalarExpr::Column {
-                index,
-                data_type: DataType::Int32,
-                ..
-            },
-        ) => Some((*index, *v)),
-        _ => None,
-    }
+    let child = lower_plan(input, tables)?;
+    Ok(Box::new(Filter::new(child, predicate.clone())))
 }
 
 fn lower_project(
@@ -303,37 +222,6 @@ fn lower_project(
                     "SELECT expression; v0.5 only supports bare column references",
                 ));
             }
-        }
-    }
-
-    // If the immediate child is a Filter we've already projected the
-    // scan down to the predicate column at index 0. The parent
-    // projection's indices, however, were resolved against the
-    // *original* table schema. We rewrite them so they reference the
-    // pushed-down view.
-    if let LogicalPlan::Filter {
-        input: filter_input,
-        predicate,
-    } = input
-    {
-        if let Some((filter_col, _)) = match_eq_i32(predicate) {
-            // The pushed-down view has exactly one column at index 0:
-            // the predicate column. The parent projection therefore
-            // can only request that column; any other index would
-            // mean "give me a column that the scan already dropped",
-            // which we cannot fulfil with v0.5's operator set.
-            for &i in &indices {
-                if i != filter_col {
-                    return Err(ServerError::Unsupported(
-                        "v0.5 projection that survives a filter must reference \
-                         exactly the predicate's column",
-                    ));
-                }
-            }
-            let child = lower_filter(filter_input, predicate, tables)?;
-            // After the rewrite every output index is 0 in the child's schema.
-            let zeroed: Vec<usize> = vec![0; indices.len()];
-            return Ok(Box::new(Project::new(child, zeroed)?));
         }
     }
 
