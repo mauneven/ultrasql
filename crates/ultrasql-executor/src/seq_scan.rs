@@ -83,21 +83,17 @@ pub struct SeqScan<L: PageLoader + 'static, O: XidStatusOracle + ?Sized + 'stati
     cache_build: Option<CacheBuildState>,
     /// Shared heap access. The iterator borrows the inner
     /// `HeapAccess<L>` via this Arc.
-    #[allow(dead_code)]
     heap: Arc<HeapAccess<L>>,
     /// MVCC snapshot. Heap-allocated so its address is stable across
     /// moves of `Self`; the iterator carries a `'static`-extended
     /// borrow pointing here.
-    #[allow(dead_code)]
     snapshot: Box<Snapshot>,
     /// Transaction-status oracle. Same stability argument as
     /// `snapshot`.
-    #[allow(dead_code)]
     oracle: Arc<O>,
     /// Optional server-owned visibility map. When present and the
     /// relation has VM-certified pages, the heap walker skips per-tuple
     /// transaction-status probes on those pages.
-    #[allow(dead_code)]
     vm: Option<Arc<VisibilityMap>>,
     /// Static metadata captured at construction.
     relation: RelationId,
