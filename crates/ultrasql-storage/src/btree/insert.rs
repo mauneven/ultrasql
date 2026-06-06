@@ -239,7 +239,7 @@ impl<L: PageLoader> BTree<L> {
             pos_result.unwrap_or_else(|i| i)
         };
 
-        if (meta.n_keys as usize) < MAX_LEAF_ENTRIES {
+        if usize::from(meta.n_keys) < MAX_LEAF_ENTRIES {
             let mut new_entries = entries;
             new_entries.insert(pos, LeafEntry { key, value });
             write_leaf_entries(&mut w, &new_entries);
@@ -397,7 +397,7 @@ impl<L: PageLoader> BTree<L> {
         // separators in ascending order.
         let pos = entries.partition_point(|entry| entry.key <= sep_key);
 
-        if (meta.n_keys as usize) < MAX_INTERNAL_ENTRIES {
+        if usize::from(meta.n_keys) < MAX_INTERNAL_ENTRIES {
             let mut new_entries = entries;
             new_entries.insert(
                 pos,
