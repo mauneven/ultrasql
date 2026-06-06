@@ -2,14 +2,6 @@
 //! entries, page initialisation, and the descent / right-link helpers
 //! that route through the sibling chain on Lehman-Yao reads.
 
-#![allow(
-    clippy::cast_possible_truncation,
-    clippy::cast_possible_wrap,
-    clippy::cast_sign_loss,
-    clippy::cast_lossless,
-    reason = "on-disk format / fixed-width packing; narrowings bounded by PAGE_SIZE / relation size"
-)]
-
 use ultrasql_core::endian::{
     read_i64_le, read_u16_le, read_u32_le, write_i64_le, write_u16_le, write_u32_le,
 };
@@ -196,8 +188,9 @@ pub(super) struct InternalEntry {
 
 pub(super) fn read_leaf_entries(page: &Page, count: u16) -> Result<Vec<LeafEntry>, BTreeError> {
     let bytes = page.as_bytes();
-    let mut out = Vec::with_capacity(count as usize);
-    for i in 0..(count as usize) {
+    let count = usize::from(count);
+    let mut out = Vec::with_capacity(count);
+    for i in 0..count {
         let off = PAGE_HEADER_SIZE + i * LEAF_ENTRY_SIZE;
         if off + LEAF_ENTRY_SIZE > NODE_SPECIAL_OFFSET {
             return Err(BTreeError::MalformedNode("leaf entry out of range"));
@@ -238,8 +231,9 @@ pub(super) fn read_internal_entries(
     count: u16,
 ) -> Result<Vec<InternalEntry>, BTreeError> {
     let bytes = page.as_bytes();
-    let mut out = Vec::with_capacity(count as usize);
-    for i in 0..(count as usize) {
+    let count = usize::from(count);
+    let mut out = Vec::with_capacity(count);
+    for i in 0..count {
         let off = PAGE_HEADER_SIZE + i * INTERNAL_ENTRY_SIZE;
         if off + INTERNAL_ENTRY_SIZE > NODE_SPECIAL_OFFSET {
             return Err(BTreeError::MalformedNode("internal entry out of range"));
@@ -268,14 +262,18 @@ pub(super) fn write_internal_entries(page: &mut Page, entries: &[InternalEntry])
 pub(super) fn init_btree_page(page: &mut Page, meta: NodeMeta) -> Result<(), BTreeError> {
     // Reinitialise the page header so it represents a B-tree page
     // with the special area carved out at the tail.
+    let lower =
+        u16::try_from(PAGE_HEADER_SIZE).map_err(|_| BTreeError::MalformedNode("page header"))?;
+    let special = u16::try_from(NODE_SPECIAL_OFFSET)
+        .map_err(|_| BTreeError::MalformedNode("node special offset"))?;
     let new_header = PageHeader {
         lsn: 0,
         checksum: 0,
         flags: 0,
         kind: PageKind::BTreeIndex,
-        lower: PAGE_HEADER_SIZE as u16,
-        upper: NODE_SPECIAL_OFFSET as u16,
-        special: NODE_SPECIAL_OFFSET as u16,
+        lower,
+        upper: special,
+        special,
         version: page.header().version,
     };
     page.write_header(&new_header)?;
