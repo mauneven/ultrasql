@@ -86,7 +86,8 @@
 //! - [`BTree::insert`] enforces unique keys. [`BTree::insert_non_unique`]
 //!   stores duplicate keys as adjacent `(key, TupleId)` leaf entries for
 //!   plain secondary indexes.
-//! - Deletions are not yet implemented (insert + read-only at v0.5).
+//! - Deletes remove individual `(key, TupleId)` leaf entries without page
+//!   merge/rebalance; empty space is reclaimed by later inserts or vacuum.
 
 #![allow(clippy::type_complexity)]
 
