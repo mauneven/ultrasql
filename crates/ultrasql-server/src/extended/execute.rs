@@ -271,7 +271,6 @@ fn modify_command_tag(command: &str, affected: u64) -> String {
 /// Resume an `Execute` on a portal that previously emitted
 /// `PortalSuspended`. Drives the retained operator forward; on
 /// re-suspension, the portal is re-inserted into the suspension map.
-#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
 fn resume_suspended_portal(
     state: &mut ExtendedConnState,
     portal_name: &str,
