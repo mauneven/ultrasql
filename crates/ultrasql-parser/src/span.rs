@@ -62,7 +62,9 @@ impl Span {
     #[inline]
     #[must_use]
     pub fn slice(self, source: &str) -> Option<&str> {
-        source.get(self.start as usize..self.end as usize)
+        let start = usize::try_from(self.start).ok()?;
+        let end = usize::try_from(self.end).ok()?;
+        source.get(start..end)
     }
 
     /// Smallest span enclosing both `self` and `other`.
