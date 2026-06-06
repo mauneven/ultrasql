@@ -38,6 +38,7 @@ memmap2       = { workspace = true }
 libc          = { workspace = true }
 tracing       = { workspace = true }
 lz4_flex      = { workspace = true }
+num-traits    = { workspace = true }
 
 [dev-dependencies]
 ultrasql-mvcc    = { workspace = true, features = ["testing"] }

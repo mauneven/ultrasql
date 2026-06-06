@@ -26,19 +26,13 @@
 //!   concrete types. Full type-specific operator-class implementations are
 //!   deferred to v1.x.
 
-#![allow(
-    clippy::cast_possible_truncation,
-    clippy::cast_possible_wrap,
-    clippy::cast_sign_loss,
-    clippy::cast_lossless,
-    reason = "on-disk format / fixed-width packing; narrowings bounded by PAGE_SIZE / relation size"
-)]
 #![allow(clippy::significant_drop_tightening)]
 #![allow(clippy::option_if_let_else)]
 #![allow(clippy::type_complexity)]
 
 use std::collections::BTreeMap;
 
+use num_traits::ToPrimitive;
 use parking_lot::Mutex;
 use thiserror::Error;
 use ultrasql_core::constants::PAGE_SIZE;
@@ -308,7 +302,7 @@ impl HashIndex {
 
     fn bucket_index(&self, key: &[u8]) -> usize {
         let hash = Self::key_hash(key);
-        (hash as usize) & (self.num_buckets - 1)
+        hash_low_bits_usize(hash) & (self.num_buckets - 1)
     }
 
     /// Number of allocated overflow pages.
@@ -487,6 +481,20 @@ impl HashIndex {
         out.extend_from_slice(&tid.slot.to_le_bytes());
         out
     }
+}
+
+fn hash_low_bits_usize(hash: u64) -> usize {
+    const BITS_PER_BYTE: usize = 8;
+    let mut out = 0_usize;
+    for (idx, byte) in hash
+        .to_le_bytes()
+        .iter()
+        .take(std::mem::size_of::<usize>())
+        .enumerate()
+    {
+        out |= usize::from(*byte) << (idx * BITS_PER_BYTE);
+    }
+    out
 }
 
 impl AccessMethod for HashIndex {
@@ -1008,12 +1016,19 @@ impl AnnVectorPayload {
         let exact_f32 = vector.to_vec();
         let quantized = match kind {
             AnnPayloadKind::F32 => AnnQuantizedPayload::F32(exact_f32.clone()),
-            AnnPayloadKind::Bf16 => AnnQuantizedPayload::Bf16(
-                vector
+            AnnPayloadKind::Bf16 => {
+                let values = vector
                     .iter()
-                    .map(|value| (value.to_bits() >> 16) as u16)
-                    .collect(),
-            ),
+                    .map(|value| {
+                        u16::try_from(value.to_bits() >> 16).map_err(|_| {
+                            AccessMethodError::Storage(
+                                "ANN bf16 payload conversion overflow".to_owned(),
+                            )
+                        })
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                AnnQuantizedPayload::Bf16(values)
+            }
             AnnPayloadKind::Int8 => {
                 let max_abs = vector
                     .iter()
@@ -1028,9 +1043,13 @@ impl AnnVectorPayload {
                     .iter()
                     .map(|value| {
                         let quantized = (*value / scale).round().clamp(-127.0, 127.0);
-                        quantized as i8
+                        quantized.to_i8().ok_or_else(|| {
+                            AccessMethodError::Storage(
+                                "ANN int8 payload conversion overflow".to_owned(),
+                            )
+                        })
                     })
-                    .collect();
+                    .collect::<Result<Vec<_>, _>>()?;
                 AnnQuantizedPayload::Int8 { scale, values }
             }
         };
@@ -3226,7 +3245,7 @@ impl IvfFlatIndex {
                 if count == 0 {
                     continue;
                 }
-                let denom = count as f32;
+                let denom = count_to_f32(count);
                 for value in &mut sums[idx] {
                     *value /= denom;
                 }
@@ -3903,7 +3922,7 @@ impl PageBackedIvfFlatIndex {
                 if count == 0 {
                     continue;
                 }
-                let denom = count as f32;
+                let denom = count_to_f32(count);
                 for value in &mut sums[idx] {
                     *value /= denom;
                 }
@@ -4407,6 +4426,10 @@ impl AccessMethod for BrinIndex {
         // exact ranges during VACUUM.
         Ok(())
     }
+}
+
+fn count_to_f32(count: usize) -> f32 {
+    count.to_f32().unwrap_or(f32::MAX)
 }
 
 // ---------------------------------------------------------------------------
