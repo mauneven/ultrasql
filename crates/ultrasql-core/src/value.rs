@@ -2621,6 +2621,38 @@ fn hex_nibble(byte: u8) -> Option<u8> {
     }
 }
 
+fn write_decimal_text(f: &mut fmt::Formatter<'_>, value: i64, scale: i32) -> fmt::Result {
+    let sign = if value < 0 { "-" } else { "" };
+    let mag = value.unsigned_abs().to_string();
+    if scale <= 0 {
+        f.write_str(sign)?;
+        f.write_str(&mag)?;
+        let zeros = usize::try_from(scale.unsigned_abs()).map_err(|_| fmt::Error)?;
+        return write_zeros(f, zeros);
+    }
+
+    let scale =
+        usize::try_from(u32::try_from(scale).map_err(|_| fmt::Error)?).map_err(|_| fmt::Error)?;
+    f.write_str(sign)?;
+    if mag.len() > scale {
+        let split = mag.len() - scale;
+        f.write_str(&mag[..split])?;
+        f.write_str(".")?;
+        f.write_str(&mag[split..])
+    } else {
+        f.write_str("0.")?;
+        write_zeros(f, scale - mag.len())?;
+        f.write_str(&mag)
+    }
+}
+
+fn write_zeros(f: &mut fmt::Formatter<'_>, count: usize) -> fmt::Result {
+    for _ in 0..count {
+        f.write_str("0")?;
+    }
+    Ok(())
+}
+
 impl fmt::Display for Value {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -2656,18 +2688,7 @@ impl fmt::Display for Value {
                 // scaled integer; insert the decimal point `scale`
                 // digits from the right. Negative scale (allowed by
                 // the type) appends trailing zeros instead.
-                let sign = if *value < 0 { "-" } else { "" };
-                let mag = value.unsigned_abs();
-                if *scale <= 0 {
-                    let pow = u64::checked_pow(10, scale.unsigned_abs()).unwrap_or(1);
-                    write!(f, "{sign}{}", mag.saturating_mul(pow))
-                } else {
-                    let scale_u = u32::try_from(*scale).unwrap_or(0);
-                    let divisor = u64::checked_pow(10, scale_u).unwrap_or(1);
-                    let whole = mag / divisor;
-                    let frac = mag % divisor;
-                    write!(f, "{sign}{whole}.{frac:0width$}", width = scale_u as usize)
-                }
+                write_decimal_text(f, *value, *scale)
             }
             Self::Money(v) => f.write_str(&format_money_text(*v)),
             Self::Interval {
@@ -4211,6 +4232,26 @@ mod tests {
         assert_eq!(
             parse_money_text("($1.23)").expect("parenthesized negative parses"),
             Value::Money(-123)
+        );
+    }
+
+    #[test]
+    fn decimal_display_handles_scales_beyond_u64_powers() {
+        assert_eq!(
+            Value::Decimal {
+                value: 12,
+                scale: 25
+            }
+            .to_string(),
+            "0.0000000000000000000000012"
+        );
+        assert_eq!(
+            Value::Decimal {
+                value: -12,
+                scale: -20
+            }
+            .to_string(),
+            "-1200000000000000000000"
         );
     }
 
