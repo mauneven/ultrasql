@@ -1111,8 +1111,8 @@ mod tests {
     /// the contract "run each benchmark exactly once".
     #[test]
     fn smoke_runs_each_benchmark_exactly_once() {
-        // The stub_run fn in the registry always returns zeroes regardless of
-        // ctx.iterations, so we verify the context values directly.
+        // The smoke runner constructs this context before dispatching every
+        // registered benchmark, so verify the contract directly.
         let ctx = BenchContext {
             iterations: 1,
             warmup_iterations: 0,

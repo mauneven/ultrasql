@@ -1,4 +1,4 @@
-//! Real benchmark implementations replacing the `stub_run` placeholders.
+//! Real benchmark implementations for the registry's benchmark specs.
 //!
 //! Each sub-module exports a single `pub fn run(ctx: &BenchContext) -> BenchResult`
 //! that exercises genuine UltraSQL execution paths. The modules map 1-to-1 onto
