@@ -45,7 +45,6 @@ const BATCH_TARGET_ROWS: usize = 4096;
 // ---------------------------------------------------------------------------
 
 /// Per-group accumulator for a single aggregate function.
-#[allow(dead_code)]
 #[derive(Debug)]
 pub(crate) enum AggState {
     CountStar(i64),
@@ -837,7 +836,7 @@ fn eval_group_key_values(evals: &[Eval], row: &[Value]) -> Result<Vec<Value>, Ex
 ///
 /// These are constructed by callers that want the extended statistical
 /// aggregates and are mapped onto the internal [`AggState`] variants.
-#[allow(dead_code)]
+#[cfg(test)]
 #[derive(Debug)]
 pub(crate) enum StatAggFunc {
     /// Sample standard deviation.
@@ -855,7 +854,7 @@ pub(crate) enum StatAggFunc {
 /// Build an initial [`AggState`] for a statistical aggregate.
 ///
 /// Callers that want STDDEV etc. call this and manage the state directly.
-#[allow(dead_code)]
+#[cfg(test)]
 pub(crate) const fn init_stat_state(func: &StatAggFunc) -> AggState {
     match func {
         StatAggFunc::Stddev => AggState::Stddev(0.0, 0.0, 0),
@@ -876,7 +875,7 @@ pub(crate) const fn init_stat_state(func: &StatAggFunc) -> AggState {
 }
 
 /// Accumulate a single f64 value into a statistical aggregate state.
-#[allow(dead_code)]
+#[cfg(test)]
 pub(crate) fn accumulate_stat(state: &mut AggState, x: f64) -> Result<(), ExecError> {
     match state {
         AggState::Variance(sx, sx2, cnt) | AggState::Stddev(sx, sx2, cnt) => {
@@ -896,7 +895,7 @@ pub(crate) fn accumulate_stat(state: &mut AggState, x: f64) -> Result<(), ExecEr
 }
 
 /// Finalise a statistical aggregate state to a [`Value`].
-#[allow(dead_code)]
+#[cfg(test)]
 pub(crate) fn finalise_stat(state: &AggState) -> Value {
     finalise(state)
 }
