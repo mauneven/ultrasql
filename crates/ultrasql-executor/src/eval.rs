@@ -1162,7 +1162,9 @@ fn numeric_cast_arg_f64(func: &str, args: &[Value]) -> Result<Option<f64>, EvalE
         }),
         Value::Float32(v) => Ok(Some(f64::from(*v))),
         Value::Float64(v) => Ok(Some(*v)),
-        Value::Decimal { value, scale } => Ok(Some(decimal_value_to_f64(*value, *scale))),
+        Value::Decimal { value, scale } => decimal_value_to_f64(*value, *scale)
+            .map(Some)
+            .ok_or(EvalError::Overflow),
         Value::Text(text) | Value::Char(text) => {
             text.trim().parse::<f64>().map(Some).map_err(|_| {
                 EvalError::InvalidTextRepresentation(format!(
@@ -5508,7 +5510,7 @@ fn money_ratio(left_cents: i64, right_cents: i64) -> Result<Value, EvalError> {
         return Err(EvalError::DivByZero);
     }
     Ok(Value::Float64(
-        cents_to_f64(left_cents) / cents_to_f64(right_cents),
+        cents_to_f64(left_cents)? / cents_to_f64(right_cents)?,
     ))
 }
 
@@ -5530,14 +5532,14 @@ fn money_integer_mul(cents: i64, multiplier: i64) -> Result<Value, EvalError> {
 }
 
 fn money_float_mul(cents: i64, multiplier: f64) -> Result<Value, EvalError> {
-    rounded_money_from_f64(cents_to_f64(cents) * multiplier)
+    rounded_money_from_f64(cents_to_f64(cents)? * multiplier)
 }
 
 fn money_float_div(cents: i64, divisor: f64) -> Result<Value, EvalError> {
     if divisor == 0.0 {
         return Err(EvalError::DivByZero);
     }
-    rounded_money_from_f64(cents_to_f64(cents) / divisor)
+    rounded_money_from_f64(cents_to_f64(cents)? / divisor)
 }
 
 fn rounded_money_from_f64(cents: f64) -> Result<Value, EvalError> {
@@ -5548,34 +5550,30 @@ fn rounded_money_from_f64(cents: f64) -> Result<Value, EvalError> {
         .ok_or(EvalError::Overflow)
 }
 
-fn cents_to_f64(cents: i64) -> f64 {
-    #[allow(clippy::cast_precision_loss)]
-    let value = cents as f64;
-    value
+fn cents_to_f64(cents: i64) -> Result<f64, EvalError> {
+    cents.to_f64().ok_or(EvalError::Overflow)
 }
 
 fn decimal_float_operands(left: &Value, right: &Value) -> Option<(f64, f64)> {
     match (left, right) {
         (Value::Decimal { value, scale }, Value::Float32(r)) => {
-            Some((decimal_value_to_f64(*value, *scale), f64::from(*r)))
+            Some((decimal_value_to_f64(*value, *scale)?, f64::from(*r)))
         }
         (Value::Decimal { value, scale }, Value::Float64(r)) => {
-            Some((decimal_value_to_f64(*value, *scale), *r))
+            Some((decimal_value_to_f64(*value, *scale)?, *r))
         }
         (Value::Float32(l), Value::Decimal { value, scale }) => {
-            Some((f64::from(*l), decimal_value_to_f64(*value, *scale)))
+            Some((f64::from(*l), decimal_value_to_f64(*value, *scale)?))
         }
         (Value::Float64(l), Value::Decimal { value, scale }) => {
-            Some((*l, decimal_value_to_f64(*value, *scale)))
+            Some((*l, decimal_value_to_f64(*value, *scale)?))
         }
         _ => None,
     }
 }
 
-fn decimal_value_to_f64(value: i64, scale: i32) -> f64 {
-    #[allow(clippy::cast_precision_loss)]
-    let raw = value as f64;
-    raw / 10_f64.powi(scale)
+fn decimal_value_to_f64(value: i64, scale: i32) -> Option<f64> {
+    value.to_f64().map(|raw| raw / 10_f64.powi(scale))
 }
 
 fn numeric_to_decimal(value: &Value) -> Result<Option<(i64, i32)>, EvalError> {

@@ -2251,7 +2251,6 @@ fn pow10_i128(exp: u32) -> Option<i128> {
 }
 
 fn decimal_to_f64(value: i64, scale: i32) -> f64 {
-    #[allow(clippy::cast_precision_loss)]
     let raw = value as f64;
     raw / 10_f64.powi(scale)
 }
