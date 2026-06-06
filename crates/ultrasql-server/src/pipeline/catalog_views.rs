@@ -4581,8 +4581,3 @@ fn schema_information_schema_triggers() -> Schema {
         Field::required("action_timing", text()),
     ])
 }
-
-#[allow(dead_code)]
-fn _oid_value(oid: Oid) -> Value {
-    v_i64(oid.raw())
-}

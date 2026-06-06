@@ -1864,7 +1864,6 @@ fn validate_array_element_argument(
 /// Used by the `_` fallback in the expression-variant path to keep
 /// the diagnostic precise: unknown function names still report
 /// `non-aggregate function calls`.
-#[allow(dead_code)]
 pub(super) fn is_supported_builtin(func_name: &str) -> bool {
     matches!(
         func_name,

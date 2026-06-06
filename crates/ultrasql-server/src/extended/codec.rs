@@ -636,18 +636,6 @@ const fn pg_type_size(ty: &DataType) -> i16 {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Tag inference for the CommandComplete message.
-// ---------------------------------------------------------------------------
-
-/// Compute the `CommandComplete` tag for a plan. Used only when the
-/// plan is a SELECT-like shape (Insert/Update/Delete have their own
-/// tag-emitting paths through `run_modify_command`).
-#[allow(dead_code)] // Kept for future use when Execute paths grow.
-pub(super) fn select_tag(rows: u64) -> String {
-    format!("SELECT {rows}")
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

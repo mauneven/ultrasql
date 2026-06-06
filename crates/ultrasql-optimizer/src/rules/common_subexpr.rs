@@ -41,7 +41,7 @@ use std::collections::HashMap;
 use std::cmp::Reverse;
 
 use ultrasql_core::{Field, Schema};
-use ultrasql_planner::{LogicalPlan, ScalarExpr, SortKey};
+use ultrasql_planner::{LogicalPlan, ScalarExpr};
 
 use crate::error::OptimizeError;
 use crate::rules::RewriteRule;
@@ -445,16 +445,6 @@ fn substitute(
         | ScalarExpr::Exists { .. }
         | ScalarExpr::InSubquery { .. } => expr.clone(),
     }
-}
-
-// ============================================================================
-// Sort-key helpers (used when extending to Sort nodes)
-// ============================================================================
-
-/// Extract scalar expressions from a list of `SortKey`s.
-#[allow(dead_code)]
-fn sort_key_exprs(keys: &[SortKey]) -> Vec<ScalarExpr> {
-    keys.iter().map(|k| k.expr.clone()).collect()
 }
 
 // ============================================================================

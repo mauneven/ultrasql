@@ -18,7 +18,7 @@
 //!   is exact over the sample; it does not attempt to correct for the
 //!   sampling fraction.
 
-use ahash::{AHashMap, AHashSet};
+use ahash::AHashSet;
 use ultrasql_core::{DataType, Schema, Value};
 
 use crate::stats::StatsError;
@@ -272,18 +272,6 @@ fn value_width(v: &Value, ty: &DataType) -> u64 {
         Value::Bytea(b) => b.len() as u64,
         _ => ty.fixed_size().map_or(8, |s| s as u64),
     }
-}
-
-/// Per-column frequency map, used only in tests via `build_from_samples`.
-#[allow(dead_code)]
-fn frequency_map(values: &[Value]) -> AHashMap<Vec<u8>, u64> {
-    let mut map: AHashMap<Vec<u8>, u64> = AHashMap::new();
-    for v in values {
-        if !v.is_null() {
-            *map.entry(value_key(v)).or_insert(0) += 1;
-        }
-    }
-    map
 }
 
 #[cfg(test)]
