@@ -1,5 +1,5 @@
 use proptest::prelude::*;
-use ultrasql_core::{DataType, Field, Schema};
+use ultrasql_core::{DataType, Field, Schema, Value};
 use ultrasql_parser::Parser;
 use ultrasql_parser::ast::BinaryOp;
 

@@ -45,13 +45,11 @@
 //! wave. Until then a recursive CTE binding resolves the CTE's definition
 //! non-recursively.
 
-#[allow(unused_imports)] // Value is used in binder/tests.rs via `use super::*`
-use ultrasql_core::{DataType, Field, Schema, Value};
-#[allow(unused_imports)] // BinaryOp and UnaryOp are used in binder/tests.rs via `use super::*`
+use ultrasql_core::{DataType, Field, Schema};
 use ultrasql_parser::ast::{
-    BinaryOp, Distinct, ExplainFormat as AstExplainFormat, ExplainStmt, Expr as AstExpr, Literal,
+    Distinct, ExplainFormat as AstExplainFormat, ExplainStmt, Expr as AstExpr, Literal,
     LockStrength as AstLockStrength, LockWaitPolicy as AstLockWaitPolicy, SelectStmt, SetOp,
-    SetQuantifier, SetRoleStmt, SetScope, SetValue, SetVarStmt, Statement, UnaryOp,
+    SetQuantifier, SetRoleStmt, SetScope, SetValue, SetVarStmt, Statement,
 };
 
 use crate::catalog::Catalog;
