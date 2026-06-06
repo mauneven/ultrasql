@@ -137,7 +137,6 @@ struct SequenceState {
     ///
     /// TODO(sequence-persistent): use this to batch WAL writes when the
     /// session cache is refilled from the heap page.
-    #[allow(dead_code)]
     cache_size: u32,
 }
 
