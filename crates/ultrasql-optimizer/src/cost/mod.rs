@@ -1,10 +1,9 @@
 //! Cost model for UltraSQL's query optimizer.
 //!
 //! This module provides:
-//! - [`StatsSource`]: a minimal trait over table statistics. The real
-//!   `crate::stats::StatsCatalog` will implement this trait via a small
-//!   adapter (landing after wave 6b). During development [`NoStats`] is
-//!   used so the cost model is exercised even without `ANALYZE` data.
+//! - [`StatsSource`]: a minimal trait over table statistics. Server callers
+//!   adapt catalog-backed `ANALYZE` data to this trait, while [`NoStats`]
+//!   keeps the cost model available when no statistics exist yet.
 //! - [`CostEstimate`]: the output of the cost model for a single plan node.
 //! - [`CostGucs`]: cost GUCs (grand unified constants).
 //! - [`CostModel`]: the entry point; call [`CostModel::estimate`] on any
@@ -32,9 +31,8 @@ use crate::cost::operators::{
 
 /// Minimal statistics surface the cost model depends on.
 ///
-/// The real `crate::stats::StatsCatalog` implements this trait via a small
-/// adapter; this indirection keeps `cost/` buildable independently of
-/// `stats/` during wave 6b parallel development.
+/// Catalog-backed statistics implement this surface through an adapter. The
+/// indirection keeps `cost/` independent of the concrete statistics storage.
 ///
 /// All methods accept a `table` name (case-folded) and, where relevant, a
 /// 0-based `column` index.

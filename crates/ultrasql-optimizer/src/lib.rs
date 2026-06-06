@@ -11,9 +11,9 @@
 //! |--------|----------|
 //! | [`rules`] | [`rules::RewriteRule`] trait, [`rules::RuleSet`] registry, all built-in rules |
 //! | `error` | [`OptimizeError`] error type |
-//! | [`stats`] | Statistics context (stub; wave 6b) |
-//! | [`cost`] | Cost model (stub; wave 6b) |
-//! | [`enumeration`] | Join enumeration (stub; wave 6b) |
+//! | [`stats`] | Statistics catalog, `ANALYZE` support, histograms, and MCVs |
+//! | [`cost`] | Cost estimates, selectivity heuristics, and operator formulas |
+//! | [`enumeration`] | Join enumeration, memo search, and physical operator choice |
 //!
 //! ## Quick start
 //!
@@ -22,8 +22,12 @@
 //! use ultrasql_planner::LogicalPlan;
 //! use ultrasql_core::Schema;
 //!
+//! # fn main() -> Result<(), ultrasql_optimizer::OptimizeError> {
 //! let plan = LogicalPlan::Empty { schema: Schema::empty() };
-//! let optimized = Optimizer::new().optimize(plan).expect("optimize ok");
+//! let optimized = Optimizer::new().optimize(plan)?;
+//! # let _ = optimized;
+//! # Ok(())
+//! # }
 //! ```
 //!
 //! ## Server entry point ([`optimize`])
@@ -75,11 +79,12 @@ use ultrasql_planner::LogicalPlan;
 
 /// Run the canonical optimization pipeline against `plan`.
 ///
-/// Today this is the rule-based rewriter ([`Optimizer::new`] applied to
-/// `plan`). The function accepts the per-statement
-/// [`CatalogSnapshot`] and a [`StatsSource`] so future waves can extend
-/// the pipeline with cost-aware physical selection — the call shape is
-/// stable across that evolution.
+/// The pipeline first runs the fixed-point rule rewriter
+/// ([`Optimizer::new`] applied to `plan`) and then applies cost-aware
+/// inner-join reordering through [`reorder_inner_joins_with_stats`]. The
+/// function accepts the per-statement [`CatalogSnapshot`] and a
+/// [`StatsSource`] so callers pass the same planning context the server
+/// uses for catalog and statistics visibility.
 ///
 /// The function deliberately returns [`LogicalPlan`]: the optimizer
 /// participates only at the logical level. Lowering a `LogicalPlan` to a
@@ -127,8 +132,12 @@ pub fn optimize(
 /// use ultrasql_planner::LogicalPlan;
 /// use ultrasql_core::Schema;
 ///
+/// # fn main() -> Result<(), ultrasql_optimizer::OptimizeError> {
 /// let plan = LogicalPlan::Empty { schema: Schema::empty() };
-/// let optimized = Optimizer::new().optimize(plan).unwrap();
+/// let optimized = Optimizer::new().optimize(plan)?;
+/// # let _ = optimized;
+/// # Ok(())
+/// # }
 /// ```
 #[allow(missing_debug_implementations)]
 pub struct Optimizer {

@@ -40,12 +40,12 @@ use crate::enumeration::JoinEnumerator;
 /// candidate join orderings. The result is the cheapest left-deep tree for
 /// the given leaves and join conditions.
 ///
-/// Supply a custom cost model by constructing with `CostModel::new(&stats)` when statistics
-/// are available.
+/// Use [`crate::reorder_inner_joins_with_stats`] when catalog statistics are
+/// available and the caller wants stats-aware join ordering.
 #[derive(Debug, Default)]
 pub struct DpSize {
-    /// The stats source backing the cost model. We hold it as `NoStats` for
-    /// the default case; wave 6b adapter will allow injecting real stats.
+    /// Private field keeps construction explicit through [`DpSize::new`] or
+    /// [`Default`]. The standalone enumerator uses [`NoStats`] internally.
     _private: (),
 }
 
