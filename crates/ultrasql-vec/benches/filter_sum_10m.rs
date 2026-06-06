@@ -21,8 +21,6 @@
 //!     --warm-up-time 1 --measurement-time 5
 //! ```
 
-#![allow(clippy::cast_possible_wrap, clippy::cast_possible_truncation)]
-
 use criterion::{Criterion, black_box, criterion_group, criterion_main};
 use ultrasql_vec::column::NumericColumn;
 use ultrasql_vec::{
