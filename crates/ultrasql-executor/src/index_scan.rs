@@ -45,9 +45,6 @@ pub struct IndexScan {
     payloads: std::vec::IntoIter<Vec<u8>>,
     codec: RowCodec,
     eof: bool,
-    /// Decoded row buffer filled in chunks of 4096.
-    #[allow(dead_code)]
-    pending: Vec<Vec<Value>>,
 }
 
 impl IndexScan {
@@ -62,7 +59,6 @@ impl IndexScan {
             payloads: payloads.into_iter(),
             codec,
             eof: false,
-            pending: Vec::new(),
         }
     }
 }
