@@ -5,6 +5,7 @@
 //! [`ScalarExpr::Parameter`] node into a [`ScalarExpr::Literal`]. The
 //! substituted plan is what [`super::execute::execute_portal`] runs.
 
+use num_traits::ToPrimitive;
 use ultrasql_core::{DataType, Value};
 use ultrasql_planner::{
     BinaryOp, LogicalAggregateExpr, LogicalJoinCondition, LogicalOnConflict, LogicalPlan,
@@ -215,10 +216,10 @@ fn coerce_literal_to_type(expr: &mut ScalarExpr, target: &DataType) {
             *data_type = DataType::Float64;
         }
         (DataType::Float32, Value::Float64(v)) => {
-            #[allow(clippy::cast_possible_truncation)]
-            let narrow = *v as f32;
-            *value = Value::Float32(narrow);
-            *data_type = DataType::Float32;
+            if let Some(narrow) = v.to_f32() {
+                *value = Value::Float32(narrow);
+                *data_type = DataType::Float32;
+            }
         }
         // Int → Float widening (e.g. id (Int32) = 42 (Int32 lit) is fine;
         // this hits when comparing a Float column to an integer literal).
@@ -231,10 +232,10 @@ fn coerce_literal_to_type(expr: &mut ScalarExpr, target: &DataType) {
             *data_type = DataType::Float64;
         }
         (DataType::Float64, Value::Int64(v)) => {
-            #[allow(clippy::cast_precision_loss)]
-            let widened = *v as f64;
-            *value = Value::Float64(widened);
-            *data_type = DataType::Float64;
+            if let Some(widened) = v.to_f64() {
+                *value = Value::Float64(widened);
+                *data_type = DataType::Float64;
+            }
         }
         (DataType::Float32, Value::Int16(v)) => {
             *value = Value::Float32(f32::from(*v));

@@ -3659,6 +3659,7 @@ dependencies = [
  "ipnet",
  "libc",
  "md5",
+ "num-traits",
  "parking_lot",
  "parquet",
  "pbkdf2",
