@@ -69,7 +69,7 @@ use anyhow::{Context, Result, bail};
 use clap::Parser;
 use serde::{Deserialize, Serialize};
 use ultrasql_bench::registry::{
-    BenchContext, BenchResult, Engine, FloorMetric, HostInfo, Stage, median_f64, p99_f64,
+    BenchContext, BenchResult, Engine, FloorMetric, HostInfo, Stage, p99_f64,
 };
 
 // ---------------------------------------------------------------------------
@@ -507,7 +507,6 @@ fn check_regression(
         return;
     }
     // A regression means throughput is *lower* than baseline × (1 - tol/100).
-    // We invert: "current median µs" > "baseline median µs" × (1 + tol/100).
     // For throughput: current < baseline × (1 - tol/100) is a regression.
     let threshold = baseline_tput * (1.0 - tolerance_pct / 100.0);
     if throughput < threshold && throughput > 0.0 {
@@ -518,17 +517,23 @@ fn check_regression(
         ));
         return;
     }
-    // Also check latency regression via samples if available.
-    if !result.samples.is_empty() && entry.p99_us > 0.0 {
-        let current_median_us = median_f64(&result.samples);
-        let baseline_median_us = entry.p99_us;
-        let lat_threshold = baseline_median_us * (1.0 + tolerance_pct / 100.0);
-        if current_median_us > lat_threshold {
-            let pct_inc = (current_median_us / baseline_median_us - 1.0) * 100.0;
-            failures.push(format!(
-                "{id}: median latency {current_median_us:.1} µs > baseline \
-                 {baseline_median_us:.1} µs (+{pct_inc:.1}%)",
-            ));
+    // Also check tail-latency regression when a measured p99 baseline exists.
+    if entry.p99_us > 0.0 {
+        let current_p99_us = if result.samples.is_empty() {
+            result.p99_latency_us
+        } else {
+            p99_f64(&result.samples)
+        };
+        if current_p99_us > 0.0 {
+            let baseline_p99_us = entry.p99_us;
+            let lat_threshold = baseline_p99_us * (1.0 + tolerance_pct / 100.0);
+            if current_p99_us > lat_threshold {
+                let pct_inc = (current_p99_us / baseline_p99_us - 1.0) * 100.0;
+                failures.push(format!(
+                    "{id}: p99 latency {current_p99_us:.1} µs > baseline \
+                     {baseline_p99_us:.1} µs (+{pct_inc:.1}%)",
+                ));
+            }
         }
     }
 }
@@ -796,6 +801,27 @@ mod tests {
         assert!(
             failures[0].contains("ops/s"),
             "message should contain 'ops/s': {}",
+            failures[0]
+        );
+    }
+
+    #[test]
+    fn detects_5pct_regression_in_p99_latency() {
+        let baseline = make_baseline(100_000.0, 100.0, 0.0, "");
+        let result = make_result(100_000.0, vec![10.0, 10.0, 10.0, 200.0]);
+        let mut failures = Vec::new();
+        check_regression(
+            "point_lookup",
+            result.throughput_per_sec,
+            &result,
+            &baseline,
+            5.0,
+            &mut failures,
+        );
+        assert!(!failures.is_empty(), "expected p99 regression");
+        assert!(
+            failures[0].contains("p99 latency"),
+            "message should name p99 latency: {}",
             failures[0]
         );
     }
