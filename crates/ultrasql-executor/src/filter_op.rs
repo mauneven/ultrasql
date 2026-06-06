@@ -1,9 +1,7 @@
 //! General predicate filter operator.
 //!
-//! [`Filter`] is the production-quality filter operator backed by the
-//! full [`Eval`] expression interpreter. It replaces the placeholder
-//! [`FilterEqI32`](crate::FilterEqI32) for all predicate shapes except
-//! those where the specialised SIMD path is wired in.
+//! [`Filter`] is the production predicate operator backed by the full
+//! [`Eval`] expression interpreter and vectorised comparison fast paths.
 //!
 //! # Fast-path: simple comparisons
 //!

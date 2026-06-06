@@ -27,7 +27,6 @@
 //!   4096-row [`ultrasql_vec::Batch`]es.
 //! - [`RowCodec`] — stable v0.5 binary codec for translating between
 //!   `Vec<Value>` rows and the byte payloads stored on heap pages.
-//! - [`FilterEqI32`] — predicate filter for `col == const_i32` (placeholder).
 //! - [`Filter`] — general predicate filter backed by the [`Eval`] interpreter.
 //! - [`ValuesScan`] — leaf operator materialising a `VALUES (...)` list.
 //! - [`ModifyTable`] — INSERT/UPDATE/DELETE mutations through `HeapAccess`.
@@ -71,7 +70,6 @@ pub mod bitmap_heap_scan;
 pub mod cte_scan;
 pub mod direct_scalar_agg;
 pub mod eval;
-mod filter;
 pub(crate) mod filter_op;
 pub mod filter_sum_op;
 pub mod function_scan;
@@ -123,7 +121,6 @@ pub use bitmap_heap_scan::IndexOnlyScan;
 pub use cte_scan::CteScan;
 pub use direct_scalar_agg::{DirectScalarAggKind, DirectScalarAggScan};
 pub use eval::{Eval, EvalError};
-pub use filter::FilterEqI32;
 pub use filter_op::{Filter, batch_to_rows};
 pub use function_scan::FunctionScan;
 pub use fused_insert::FusedInsertInt32Pair;
@@ -454,11 +451,12 @@ pub trait Operator: Send + Debug {
 
 #[cfg(test)]
 mod tests {
-    use ultrasql_core::{DataType, Field, Schema};
+    use ultrasql_core::{DataType, Field, Schema, Value};
+    use ultrasql_planner::{BinaryOp, ScalarExpr};
     use ultrasql_vec::Batch;
     use ultrasql_vec::column::{Column, NumericColumn};
 
-    use crate::{FilterEqI32, Limit, MemTableScan, Operator, Project};
+    use crate::{Filter, Limit, MemTableScan, Operator, Project};
 
     /// Build the canonical `(id i32, val i64)` schema used across the
     /// executor tests.
@@ -494,13 +492,29 @@ mod tests {
         out
     }
 
+    fn pred_id_eq_7() -> ScalarExpr {
+        ScalarExpr::Binary {
+            op: BinaryOp::Eq,
+            left: Box::new(ScalarExpr::Column {
+                name: "id".into(),
+                index: 0,
+                data_type: DataType::Int32,
+            }),
+            right: Box::new(ScalarExpr::Literal {
+                value: Value::Int32(7),
+                data_type: DataType::Int32,
+            }),
+            data_type: DataType::Bool,
+        }
+    }
+
     #[test]
     fn pipeline_scan_filter_project_limit() {
         let schema = schema_id_val();
         let b1 = batch(&[(1, 10), (7, 20), (3, 30), (7, 40)]);
         let b2 = batch(&[(7, 50), (7, 60), (2, 70), (7, 80)]);
         let scan = MemTableScan::new(schema, vec![b1, b2]);
-        let filter = FilterEqI32::new(Box::new(scan), 0, 7).expect("filter constructs");
+        let filter = Filter::new(Box::new(scan), pred_id_eq_7());
         let project = Project::new(Box::new(filter), vec![1]).expect("project constructs");
         let mut limit = Limit::new(Box::new(project), 2);
 
@@ -516,7 +530,7 @@ mod tests {
     fn pipeline_emits_eof_repeatedly_after_drain() {
         let schema = schema_id_val();
         let scan = MemTableScan::new(schema, vec![batch(&[(7, 1)])]);
-        let filter = FilterEqI32::new(Box::new(scan), 0, 7).unwrap();
+        let filter = Filter::new(Box::new(scan), pred_id_eq_7());
         let project = Project::new(Box::new(filter), vec![1]).unwrap();
         let mut limit = Limit::new(Box::new(project), 10);
         let drained = drain_i64_col0(&mut limit);
@@ -531,7 +545,7 @@ mod tests {
     fn pipeline_preserves_projected_schema() {
         let schema = schema_id_val();
         let scan = MemTableScan::new(schema, vec![batch(&[(7, 1)])]);
-        let filter = FilterEqI32::new(Box::new(scan), 0, 7).unwrap();
+        let filter = Filter::new(Box::new(scan), pred_id_eq_7());
         let project = Project::new(Box::new(filter), vec![1]).unwrap();
         assert_eq!(project.schema().len(), 1);
         assert_eq!(project.schema().field_at(0).name, "val");
