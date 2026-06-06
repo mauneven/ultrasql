@@ -119,7 +119,7 @@ where
             return Ok(simple_tag("EXECUTE"));
         };
 
-        let expected = prepared.n_params as usize;
+        let expected = prepared_param_count(prepared.n_params)?;
         if stmt.args.len() != expected {
             return Err(ServerError::Plan(
                 ultrasql_planner::PlanError::TypeMismatch(format!(
@@ -229,6 +229,12 @@ fn literal_to_value(lit: &Literal) -> Result<Value, ServerError> {
 
 fn literal_arg_error(msg: String) -> ServerError {
     ServerError::Plan(ultrasql_planner::PlanError::TypeMismatch(msg))
+}
+
+fn prepared_param_count(n_params: u32) -> Result<usize, ServerError> {
+    usize::try_from(n_params).map_err(|_| {
+        ServerError::Unsupported("prepared statement parameter count exceeds platform limit")
+    })
 }
 
 /// Return the highest `$N` index referenced anywhere in `plan`, or
@@ -448,6 +454,12 @@ mod tests {
             rows: vec![vec![param(index)]],
             schema: schema(),
         }
+    }
+
+    #[test]
+    fn prepared_param_count_uses_checked_platform_conversion() {
+        assert_eq!(prepared_param_count(0).expect("zero"), 0);
+        assert_eq!(prepared_param_count(2).expect("two"), 2);
     }
 
     #[test]
