@@ -1489,12 +1489,6 @@ fn parse_timetz_literal(text: &str) -> Option<(i64, i32)> {
     parse_timetz_text(text)
 }
 
-#[allow(
-    clippy::cast_possible_truncation,
-    clippy::cast_possible_wrap,
-    clippy::cast_sign_loss,
-    reason = "civil-from-days arithmetic; doe / yoe fit in i32 by construction"
-)]
 fn civil_from_days(days_since_2000_01_01: i32) -> Result<(i32, u32, u32), PlanError> {
     let z = days_since_2000_01_01 + 10_957;
     let z = z + 719_468;
@@ -1503,20 +1497,18 @@ fn civil_from_days(days_since_2000_01_01: i32) -> Result<(i32, u32, u32), PlanEr
     } else {
         (z - 146_096) / 146_097
     };
-    let doe = (z - era * 146_097) as u32;
+    let doe = z - era * 146_097;
     let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
-    let y = (yoe as i32) + era * 400;
+    let y = yoe + era * 400;
     let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
     let mp = (5 * doy + 2) / 153;
-    let day = doy - (153 * mp + 2) / 5 + 1;
-    let month_i32 = if mp < 10 {
-        mp as i32 + 3
-    } else {
-        mp as i32 - 9
-    };
+    let day_i32 = doy - (153 * mp + 2) / 5 + 1;
+    let month_i32 = if mp < 10 { mp + 3 } else { mp - 9 };
     let year = if month_i32 <= 2 { y + 1 } else { y };
     let month = u32::try_from(month_i32)
         .map_err(|_| PlanError::TypeMismatch("date interval month overflow".to_owned()))?;
+    let day = u32::try_from(day_i32)
+        .map_err(|_| PlanError::TypeMismatch("date interval day overflow".to_owned()))?;
     Ok((year, month, day))
 }
 
@@ -2543,19 +2535,20 @@ fn dense_vector_family_kind(data_type: &DataType) -> Option<u8> {
 /// negative. The algorithm is Howard Hinnant's `days_from_civil`,
 /// rebased on 2000-03-01 internally then offset back to 2000-01-01.
 /// Source: <https://howardhinnant.github.io/date_algorithms.html>.
-#[allow(
-    clippy::cast_possible_wrap,
-    clippy::cast_possible_truncation,
-    clippy::cast_sign_loss,
-    reason = "Howard Hinnant civil_from_days algorithm: y - era*400 is provably in [0, 399], so the i32 → u32 cast cannot lose information; doe < 146_097 always fits in i32"
-)]
 fn days_since_epoch(year: i32, month: u32, day: u32) -> i32 {
     let y = if month <= 2 { year - 1 } else { year };
     let era = y.div_euclid(400);
-    let yoe = (y - era * 400) as u32; // [0, 399]
-    let doy = (153 * (if month > 2 { month - 3 } else { month + 9 }) + 2) / 5 + day - 1; // [0, 365]
+    let yoe = y - era * 400; // [0, 399]
+    let month_i32 = i32::try_from(month).expect("calendar month fits i32");
+    let day_i32 = i32::try_from(day).expect("calendar day fits i32");
+    let month_offset = if month > 2 {
+        month_i32 - 3
+    } else {
+        month_i32 + 9
+    };
+    let doy = (153 * month_offset + 2) / 5 + day_i32 - 1; // [0, 365]
     let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy; // [0, 146096]
-    let days_from_1970_03_01 = era * 146_097 + doe as i32 - 719_468;
+    let days_from_1970_03_01 = era * 146_097 + doe - 719_468;
     // Rebase from 1970-01-01 to 2000-01-01 (10_957 days).
     days_from_1970_03_01 - 10_957
 }

@@ -4183,12 +4183,6 @@ fn truncate_timestamp(unit: &str, micros: i64) -> Result<i64, EvalError> {
 /// Inverse of the Howard-Hinnant `days_from_civil` algorithm, rebased
 /// on the 2000-01-01 epoch the engine uses. Returns `(year, month, day)`
 /// in the standard 1-based calendar.
-#[allow(
-    clippy::cast_possible_truncation,
-    clippy::cast_possible_wrap,
-    clippy::cast_sign_loss,
-    reason = "civil-from-days arithmetic; doe / yoe fit in i32 by construction"
-)]
 fn civil_from_days(days_since_2000_01_01: i32) -> (i32, i32, i32) {
     let z = days_since_2000_01_01 + 10_957; // rebase to 1970-01-01
     let z = z + 719_468; // shift to year 0
@@ -4197,17 +4191,13 @@ fn civil_from_days(days_since_2000_01_01: i32) -> (i32, i32, i32) {
     } else {
         (z - 146_096) / 146_097
     };
-    let doe = (z - era * 146_097) as u32; // [0, 146096]
+    let doe = z - era * 146_097; // [0, 146096]
     let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365; // [0, 399]
-    let y = (yoe as i32) + era * 400;
+    let y = yoe + era * 400;
     let doy = doe - (365 * yoe + yoe / 4 - yoe / 100); // [0, 365]
     let mp = (5 * doy + 2) / 153; // [0, 11]
-    let d = (doy - (153 * mp + 2) / 5 + 1) as i32; // [1, 31]
-    let m = if mp < 10 {
-        mp as i32 + 3
-    } else {
-        mp as i32 - 9
-    }; // [1, 12]
+    let d = doy - (153 * mp + 2) / 5 + 1; // [1, 31]
+    let m = if mp < 10 { mp + 3 } else { mp - 9 }; // [1, 12]
     let final_y = if m <= 2 { y + 1 } else { y };
     (final_y, m, d)
 }
@@ -4235,11 +4225,6 @@ fn days_in_month(year: i32, month: u32) -> u32 {
     }
 }
 
-#[allow(
-    clippy::cast_possible_truncation,
-    clippy::cast_possible_wrap,
-    reason = "civil-to-days arithmetic follows Howard-Hinnant algorithm; casts stay within bounded intermediates"
-)]
 fn days_from_civil(year: i32, month: u32, day: u32) -> Result<i32, EvalError> {
     let y = if month <= 2 { year - 1 } else { year };
     let era = if y >= 0 { y } else { y - 399 } / 400;

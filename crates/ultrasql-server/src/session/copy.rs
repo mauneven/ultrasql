@@ -2483,19 +2483,20 @@ fn days_in_month(year: i32, month: u32) -> u32 {
     }
 }
 
-#[allow(
-    clippy::cast_possible_wrap,
-    clippy::cast_possible_truncation,
-    clippy::cast_sign_loss,
-    reason = "Howard Hinnant days_from_civil algorithm bounds yoe/doe before casts"
-)]
 fn days_since_epoch(year: i32, month: u32, day: u32) -> i32 {
     let y = if month <= 2 { year - 1 } else { year };
     let era = y.div_euclid(400);
-    let yoe = (y - era * 400) as u32;
-    let doy = (153 * (if month > 2 { month - 3 } else { month + 9 }) + 2) / 5 + day - 1;
+    let yoe = y - era * 400;
+    let month_i32 = i32::try_from(month).expect("calendar month fits i32");
+    let day_i32 = i32::try_from(day).expect("calendar day fits i32");
+    let month_offset = if month > 2 {
+        month_i32 - 3
+    } else {
+        month_i32 + 9
+    };
+    let doy = (153 * month_offset + 2) / 5 + day_i32 - 1;
     let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
-    let days_from_1970_03_01 = era * 146_097 + doe as i32 - 719_468;
+    let days_from_1970_03_01 = era * 146_097 + doe - 719_468;
     days_from_1970_03_01 - 10_957
 }
 
