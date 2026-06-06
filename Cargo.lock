@@ -3611,6 +3611,7 @@ dependencies = [
  "arrow-schema",
  "bytes",
  "libc",
+ "num-traits",
  "parquet",
  "proptest",
  "serde_json",

@@ -11,6 +11,7 @@
 //! builds) preserves the perf characteristics the original
 //! single-file layout had.
 
+use num_traits::ToPrimitive;
 use ultrasql_core::{
     BitString, DataType, GeometryType, GeometryValue, MAX_VECTOR_DIMS, Oid, RangeType, RangeValue,
     Value, coerce_bpchar_text, composite_text_matches_arity, parse_decimal_text, parse_money_text,
@@ -1641,18 +1642,17 @@ fn is_float_like_literal(value: &Value) -> bool {
     matches!(value, Value::Float32(_) | Value::Float64(_))
 }
 
-#[allow(clippy::cast_precision_loss)]
 fn literal_numeric_as_f64(value: &Value) -> Option<f64> {
     match value {
         Value::Int16(v) => Some(f64::from(*v)),
         Value::Int32(v) => Some(f64::from(*v)),
-        Value::Int64(v) => Some(*v as f64),
+        Value::Int64(v) => v.to_f64(),
         Value::Float32(v) => Some(f64::from(*v)),
         Value::Float64(v) => Some(*v),
         Value::Decimal {
             value: decimal_value,
             scale,
-        } => Some((*decimal_value as f64) / 10_f64.powi(*scale)),
+        } => decimal_value_to_f64(*decimal_value, *scale),
         _ => None,
     }
 }
@@ -2663,6 +2663,10 @@ fn decimal_from_numeric_value(value: &Value, target_scale: Option<i32>) -> Optio
     }
 }
 
+fn decimal_value_to_f64(value: i64, scale: i32) -> Option<f64> {
+    value.to_f64().map(|raw| raw / 10_f64.powi(scale))
+}
+
 fn money_from_literal_value(value: &Value) -> Option<i64> {
     match value {
         Value::Int16(v) => i64::from(*v).checked_mul(100),
@@ -2915,7 +2919,7 @@ fn fold_signed_literal(expr: &mut ScalarExpr) {
 fn parse_negative_i64_boundary(text: &str) -> Option<i64> {
     let unsigned = text.replace('_', "");
     let magnitude = unsigned.parse::<u128>().ok()?;
-    let max_plus_one = (i64::MAX as u128).checked_add(1)?;
+    let max_plus_one = u128::try_from(i64::MAX).ok()?.checked_add(1)?;
     (magnitude == max_plus_one).then_some(i64::MIN)
 }
 
@@ -3033,10 +3037,10 @@ pub(super) fn coerce_literal_to_type(expr: &mut ScalarExpr, target: &DataType) {
             *data_type = DataType::Float64;
         }
         (DataType::Float64, Value::Int64(v)) => {
-            #[allow(clippy::cast_precision_loss)]
-            let widened = *v as f64;
-            *value = Value::Float64(widened);
-            *data_type = DataType::Float64;
+            if let Some(widened) = v.to_f64() {
+                *value = Value::Float64(widened);
+                *data_type = DataType::Float64;
+            }
         }
         (
             DataType::Float64,
@@ -3045,32 +3049,32 @@ pub(super) fn coerce_literal_to_type(expr: &mut ScalarExpr, target: &DataType) {
                 scale,
             },
         ) => {
-            #[allow(clippy::cast_precision_loss)]
-            let widened = (*decimal_value as f64) / 10_f64.powi(*scale);
-            *value = Value::Float64(widened);
-            *data_type = DataType::Float64;
+            if let Some(widened) = decimal_value_to_f64(*decimal_value, *scale) {
+                *value = Value::Float64(widened);
+                *data_type = DataType::Float64;
+            }
         }
         (DataType::Float32, Value::Float64(v)) => {
-            #[allow(clippy::cast_possible_truncation)]
-            let narrow = *v as f32;
-            *value = Value::Float32(narrow);
-            *data_type = DataType::Float32;
+            if let Some(narrow) = v.to_f32() {
+                *value = Value::Float32(narrow);
+                *data_type = DataType::Float32;
+            }
         }
         (DataType::Float32, Value::Int16(v)) => {
             *value = Value::Float32(f32::from(*v));
             *data_type = DataType::Float32;
         }
         (DataType::Float32, Value::Int32(v)) => {
-            #[allow(clippy::cast_precision_loss)]
-            let widened = *v as f32;
-            *value = Value::Float32(widened);
-            *data_type = DataType::Float32;
+            if let Some(widened) = v.to_f32() {
+                *value = Value::Float32(widened);
+                *data_type = DataType::Float32;
+            }
         }
         (DataType::Float32, Value::Int64(v)) => {
-            #[allow(clippy::cast_precision_loss)]
-            let widened = *v as f32;
-            *value = Value::Float32(widened);
-            *data_type = DataType::Float32;
+            if let Some(widened) = v.to_f32() {
+                *value = Value::Float32(widened);
+                *data_type = DataType::Float32;
+            }
         }
         (DataType::Text { .. }, Value::Char(text)) => {
             *value = Value::Text(text.clone());
@@ -3118,10 +3122,12 @@ pub(super) fn coerce_literal_to_type(expr: &mut ScalarExpr, target: &DataType) {
                 scale,
             },
         ) => {
-            #[allow(clippy::cast_precision_loss, clippy::cast_possible_truncation)]
-            let narrow = ((*decimal_value as f64) / 10_f64.powi(*scale)) as f32;
-            *value = Value::Float32(narrow);
-            *data_type = DataType::Float32;
+            if let Some(narrow) =
+                decimal_value_to_f64(*decimal_value, *scale).and_then(|value| value.to_f32())
+            {
+                *value = Value::Float32(narrow);
+                *data_type = DataType::Float32;
+            }
         }
         (DataType::Decimal { precision, scale }, Value::Text(text)) => {
             if let Ok(Value::Decimal {
