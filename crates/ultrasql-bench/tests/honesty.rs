@@ -1,24 +1,16 @@
 //! Honesty tests: every registered `BenchSpec` must report numbers that are
 //! consistent with the work it actually performed.
 //!
-//! For each non-stub spec we run with the process-local smoke guard (tiny
-//! dataset) and a single iteration, then assert:
+//! For each spec we run with the process-local smoke guard (tiny dataset)
+//! and a single iteration, then assert:
 //!
 //! - `samples.len() == ctx.iterations` (the right number of samples was recorded)
 //! - `p99_us > 0` (real time elapsed — the bench is not a no-op)
 //! - No `NaN` or infinite value in `samples`
 //! - `throughput_per_sec > 0` (sanity: positive throughput follows from > 0 time)
 //!
-//! The stub benchmark (`tpcb_32conn`) is excluded because it returns an
-//! all-zero placeholder by design while its registry execution path is not
-//! yet implemented.
-
 use ultrasql_bench::registry::{BenchContext, HostInfo, REGISTRY};
 use ultrasql_bench::runs::enable_smoke_mode_for_process;
-
-/// Stubs that return all-zero / empty results while their real implementation
-/// is not yet wired. Completely excluded from all assertions.
-const STUB_IDS: &[&str] = &["tpcb_32conn"];
 
 fn smoke_ctx() -> BenchContext {
     BenchContext {
@@ -39,11 +31,6 @@ fn every_registered_spec_reports_honest_numbers() {
     let ctx = smoke_ctx();
 
     for spec in REGISTRY {
-        // Stubs are not expected to do real work; skip them entirely.
-        if STUB_IDS.contains(&spec.id) {
-            continue;
-        }
-
         let result = (spec.run)(&ctx);
 
         // Must produce exactly `ctx.iterations` samples.

@@ -428,29 +428,6 @@ pub fn p99_f64(values: &[f64]) -> f64 {
 }
 
 // ---------------------------------------------------------------------------
-// Stub implementations for the v0.6 starter set
-// ---------------------------------------------------------------------------
-
-/// Stub run function for benchmarks that are not yet implemented.
-///
-/// Returns placeholder zeros so the registry compiles and the gate can parse
-/// the baseline without a live UltraSQL execution path. All benchmarks
-/// previously using this stub have been wired to real implementations in
-/// [`crate::runs`]. The remaining stub (`tpcb_32conn`) uses its own
-/// module-level run function that also returns zeros.
-///
-/// Kept here for reference and future deferred benchmarks.
-#[allow(dead_code)]
-const fn stub_run(_ctx: &BenchContext) -> BenchResult {
-    BenchResult {
-        throughput_per_sec: 0.0,
-        p50_latency_us: 0.0,
-        p99_latency_us: 0.0,
-        samples: Vec::new(),
-    }
-}
-
-// ---------------------------------------------------------------------------
 // Registry
 // ---------------------------------------------------------------------------
 
@@ -461,8 +438,7 @@ const fn stub_run(_ctx: &BenchContext) -> BenchResult {
 ///
 /// To add a new benchmark:
 ///
-/// 1. Implement the run function (or use `stub_run` until the executor path
-///    exists).
+/// 1. Implement the run function.
 /// 2. Push a [`BenchSpec`] onto this slice.
 /// 3. Add a zero-value entry to the matching
 ///    `benchmarks/baselines/<stage>.json`.
@@ -870,8 +846,6 @@ static SPECS: [BenchSpec; 24] = [
                 FloorMetric::ThroughputRatio(WIN_THROUGHPUT_RATIO),
             ),
         ],
-        // TODO(v0.9-tpcb): real implementation in runs::tpcb once the
-        // async connection handler and multi-writer WAL path land.
         run: crate::runs::tpcb::run,
     },
     // ------------------------------------------------------------------
