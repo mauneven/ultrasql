@@ -612,20 +612,11 @@ fn is_non_decreasing(keys: &[i64]) -> bool {
 /// The window kernel uses `u32` row indices because every supported
 /// shape ships ≤ 2 ³² rows through one operator. A real overflow
 /// would corrupt the rank vector; saturation produces a well-defined
-/// (incorrect) result that the lowering tests already catch — and the
-/// branch-free conversion stays out of the hot inner loops where
-/// `as u32` would otherwise need a `try_into()` + panic propagation.
+/// (incorrect) result that the lowering tests already catch. This
+/// checked conversion stays out of the hot inner loops.
 #[inline]
-#[allow(
-    clippy::cast_possible_truncation,
-    reason = "clamped above to u32::MAX before narrowing; documented in the doc comment"
-)]
-const fn u32_from_usize_clamped(v: usize) -> u32 {
-    if v > u32::MAX as usize {
-        u32::MAX
-    } else {
-        v as u32
-    }
+fn u32_from_usize_clamped(v: usize) -> u32 {
+    u32::try_from(v).unwrap_or(u32::MAX)
 }
 
 /// Convert a `usize` to `i64` for the rank assignment.
@@ -635,18 +626,8 @@ const fn u32_from_usize_clamped(v: usize) -> u32 {
 /// >2³¹-row scan (impossible under our current memory layout). The
 /// conversion folds away on 64-bit hosts.
 #[inline]
-#[allow(
-    clippy::cast_possible_wrap,
-    clippy::cast_possible_truncation,
-    clippy::cast_sign_loss,
-    reason = "i64::MAX-as-usize comparison guards the v-as-i64 narrowing below"
-)]
-const fn i64_from_usize_clamped(v: usize) -> i64 {
-    if v > i64::MAX as usize {
-        i64::MAX
-    } else {
-        v as i64
-    }
+fn i64_from_usize_clamped(v: usize) -> i64 {
+    i64::try_from(v).unwrap_or(i64::MAX)
 }
 
 /// Convert a `u32` row index to `usize` for vector addressing.
@@ -1396,8 +1377,8 @@ mod tests {
                 state = state
                     .wrapping_mul(6364136223846793005)
                     .wrapping_add(1442695040888963407);
-                let k = (state >> 32) as i64 & 0x3FF;
-                (k, i as u32)
+                let k = i64::try_from(state >> 32).expect("upper u32 fits i64") & 0x3FF;
+                (k, super::u32_from_usize_clamped(i))
             })
             .collect();
         let mut expected = pairs.clone();
@@ -1409,7 +1390,14 @@ mod tests {
     #[test]
     fn parallel_sort_handles_already_sorted_input() {
         let n = super::PARALLEL_SORT_THRESHOLD * 2;
-        let pairs: Vec<(i64, u32)> = (0..n).map(|i| (i as i64, i as u32)).collect();
+        let pairs: Vec<(i64, u32)> = (0..n)
+            .map(|i| {
+                (
+                    super::i64_from_usize_clamped(i),
+                    super::u32_from_usize_clamped(i),
+                )
+            })
+            .collect();
         let expected = pairs.clone();
         let actual = super::parallel_sort_pairs(pairs);
         assert_eq!(actual, expected);
@@ -1418,7 +1406,14 @@ mod tests {
     #[test]
     fn parallel_sort_handles_reverse_sorted_input() {
         let n = super::PARALLEL_SORT_THRESHOLD + 1;
-        let pairs: Vec<(i64, u32)> = (0..n).map(|i| ((n - i) as i64, i as u32)).collect();
+        let pairs: Vec<(i64, u32)> = (0..n)
+            .map(|i| {
+                (
+                    super::i64_from_usize_clamped(n - i),
+                    super::u32_from_usize_clamped(i),
+                )
+            })
+            .collect();
         let mut expected = pairs.clone();
         expected.sort_unstable_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
         let actual = super::parallel_sort_pairs(pairs);
@@ -1431,7 +1426,9 @@ mod tests {
         // comparator falls through to the index break on every
         // compare.
         let n = super::PARALLEL_SORT_THRESHOLD + 8;
-        let pairs: Vec<(i64, u32)> = (0..n).map(|i| (42_i64, i as u32)).collect();
+        let pairs: Vec<(i64, u32)> = (0..n)
+            .map(|i| (42_i64, super::u32_from_usize_clamped(i)))
+            .collect();
         let expected = pairs.clone(); // already ordered by index
         let actual = super::parallel_sort_pairs(pairs);
         assert_eq!(actual, expected);
