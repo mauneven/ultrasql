@@ -40,14 +40,7 @@
 //!   build is part of the timed region because the equivalent SQL
 //!   engine query also re-evaluates the predicate per execution.
 
-#![allow(
-    clippy::print_stdout,
-    clippy::unnecessary_lazy_evaluations,
-    clippy::cast_possible_truncation,
-    clippy::cast_possible_wrap,
-    clippy::cast_sign_loss,
-    clippy::cast_lossless
-)]
+#![allow(clippy::print_stdout, clippy::unnecessary_lazy_evaluations)]
 
 use std::fs::File;
 use std::io::{BufRead, BufReader};
@@ -57,6 +50,7 @@ use std::time::Instant;
 
 use anyhow::{Context, Result, bail};
 use clap::{Parser, ValueEnum};
+use num_traits::ToPrimitive;
 use ultrasql_core::{BlockNumber, PageId, RelationId, TupleId, Xid};
 use ultrasql_storage::btree::BTree;
 use ultrasql_storage::buffer_pool::{BufferPool, PageLoader};
@@ -221,6 +215,18 @@ fn load_i64_csv(path: &PathBuf) -> Result<Vec<i64>> {
     Ok(out)
 }
 
+fn usize_to_f64(value: usize, context: &str) -> Result<f64> {
+    value
+        .to_f64()
+        .with_context(|| format!("{context} does not fit f64"))
+}
+
+fn u128_to_f64(value: u128, context: &str) -> Result<f64> {
+    value
+        .to_f64()
+        .with_context(|| format!("{context} does not fit f64"))
+}
+
 /// Run `iters` measured iterations of `body`, after `warmup` warmups,
 /// and emit a JSON object describing the distribution. The closure
 /// returns whatever the workload computed; we keep the last value so
@@ -232,7 +238,7 @@ fn time_iters<F, T: std::fmt::Display>(
     iters: usize,
     mut body: F,
     extra_fields: &[(&str, String)],
-) -> String
+) -> Result<String>
 where
     F: FnMut() -> T,
 {
@@ -247,11 +253,10 @@ where
         let v = body();
         let dt = t0.elapsed();
         let ns = dt.as_nanos();
-        // ns / 1000 with f64 precision; ns is u128.
-        us.push((ns as f64) / 1000.0);
+        us.push(u128_to_f64(ns, "iteration duration")? / 1000.0);
         last = format!("{v}");
     }
-    emit_json(workload, n_rows, &us, &last, extra_fields)
+    Ok(emit_json(workload, n_rows, &us, &last, extra_fields))
 }
 
 fn median(xs: &[f64]) -> f64 {
@@ -302,63 +307,63 @@ fn run_sum(args: &Args) -> Result<String> {
     let data = load_i64_csv(&args.data)?;
     let n = data.len();
     let col = NumericColumn::from_data(data);
-    Ok(time_iters(
+    time_iters(
         "sum",
         n,
         args.effective_warmup(),
         args.effective_iters(),
         || sum_i64(&col),
         &[],
-    ))
+    )
 }
 
 fn run_count(args: &Args) -> Result<String> {
     let data = load_i64_csv(&args.data)?;
     let n = data.len();
     let col = NumericColumn::from_data(data);
-    Ok(time_iters(
+    time_iters(
         "count",
         n,
         args.effective_warmup(),
         args.effective_iters(),
         || count_i64(&col),
         &[],
-    ))
+    )
 }
 
 fn run_min(args: &Args) -> Result<String> {
     let data = load_i64_csv(&args.data)?;
     let n = data.len();
     let col = NumericColumn::from_data(data);
-    Ok(time_iters(
+    time_iters(
         "min",
         n,
         args.effective_warmup(),
         args.effective_iters(),
         || min_i64(&col).map_or(0_i64, |v| v),
         &[],
-    ))
+    )
 }
 
 fn run_max(args: &Args) -> Result<String> {
     let data = load_i64_csv(&args.data)?;
     let n = data.len();
     let col = NumericColumn::from_data(data);
-    Ok(time_iters(
+    time_iters(
         "max",
         n,
         args.effective_warmup(),
         args.effective_iters(),
         || max_i64(&col).map_or(0_i64, |v| v),
         &[],
-    ))
+    )
 }
 
 fn run_minmax(args: &Args) -> Result<String> {
     let data = load_i64_csv(&args.data)?;
     let n = data.len();
     let col = NumericColumn::from_data(data);
-    Ok(time_iters(
+    time_iters(
         "minmax",
         n,
         args.effective_warmup(),
@@ -370,14 +375,14 @@ fn run_minmax(args: &Args) -> Result<String> {
             lo.wrapping_add(hi)
         },
         &[],
-    ))
+    )
 }
 
 fn run_avg(args: &Args) -> Result<String> {
     let data = load_i64_csv(&args.data)?;
     let n = data.len();
     let col = NumericColumn::from_data(data);
-    Ok(time_iters(
+    time_iters(
         "avg",
         n,
         args.effective_warmup(),
@@ -390,7 +395,7 @@ fn run_avg(args: &Args) -> Result<String> {
             i64::try_from(c).map_or(0_i64, |cc| if cc == 0 { 0 } else { s / cc })
         },
         &[],
-    ))
+    )
 }
 
 fn run_filter(args: &Args) -> Result<String> {
@@ -410,7 +415,7 @@ fn run_filter(args: &Args) -> Result<String> {
     let n = data_x.len();
     let col_x = NumericColumn::from_data(data_x);
     let col_y = NumericColumn::from_data(data_y);
-    Ok(time_iters(
+    time_iters(
         "filter",
         n,
         args.effective_warmup(),
@@ -420,7 +425,7 @@ fn run_filter(args: &Args) -> Result<String> {
             sum_i64_with_mask(&col_x, &mask)
         },
         &[],
-    ))
+    )
 }
 
 fn run_range(args: &Args) -> Result<String> {
@@ -429,7 +434,7 @@ fn run_range(args: &Args) -> Result<String> {
     let col = NumericColumn::from_data(data);
     let lo = args.range_lo;
     let hi = args.range_hi;
-    Ok(time_iters(
+    time_iters(
         "range",
         n,
         args.effective_warmup(),
@@ -439,7 +444,7 @@ fn run_range(args: &Args) -> Result<String> {
             m.count_ones()
         },
         &[("range_lo", lo.to_string()), ("range_hi", hi.to_string())],
-    ))
+    )
 }
 
 // --- point lookup --------------------------------------------------------
@@ -491,8 +496,8 @@ fn run_point(args: &Args) -> Result<String> {
     //    sequential (sequential inserts produce a degenerate
     //    rightmost-only insert path).
     let mut s: u64 = 0xDEAD_BEEF_CAFE_F00D;
-    // i64::try_from is infallible for n <= i64::MAX as usize; on 64-bit
-    // targets the practical n stays well under that.
+    // i64::try_from is infallible when n fits i64; practical workloads
+    // stay well under that limit.
     let n_i64 = i64::try_from(n).context("point_n exceeds i64::MAX")?;
     let mut perm: Vec<i64> = (0..n_i64).collect();
     for i in (1..perm.len()).rev() {
@@ -551,11 +556,12 @@ fn run_point(args: &Args) -> Result<String> {
         let dt = t0.elapsed();
         std::hint::black_box(hits);
         last_hits = hits;
-        us.push(dt.as_nanos() as f64 / 1000.0);
+        us.push(u128_to_f64(dt.as_nanos(), "point iteration duration")? / 1000.0);
     }
 
     let med_us = median(&us);
-    let ns_per_op = (med_us * 1000.0) / (probes as f64);
+    let probes_f = usize_to_f64(probes, "point probe count")?;
+    let ns_per_op = (med_us * 1000.0) / probes_f;
     let answer = format!("hits={last_hits}");
     Ok(emit_json(
         "point",
