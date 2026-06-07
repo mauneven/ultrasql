@@ -3545,7 +3545,8 @@ impl SplitMix64 {
     }
 
     fn next_i32(&mut self) -> i32 {
-        self.next_u64() as i32
+        let bytes = self.next_u64().to_le_bytes();
+        i32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]])
     }
 }
 
