@@ -50,7 +50,8 @@ const ITEMS: usize = 256;
 /// Runs the deterministic five-transaction TPC-C-shaped local benchmark.
 pub fn run(ctx: &BenchContext) -> BenchResult {
     let state = TpccState::new();
-    let mut samples = Vec::with_capacity(ctx.iterations as usize);
+    let iteration_count = usize::try_from(ctx.iterations).unwrap_or(0);
+    let mut samples = Vec::with_capacity(iteration_count);
     let mut seed = 0x1EAF_CAFE_BADC_0DE5_u64;
 
     for _ in 0..ctx.warmup_iterations {
