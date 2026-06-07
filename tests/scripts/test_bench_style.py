@@ -32,6 +32,7 @@ TPCH_Q22_COUNTRY_INDEX_CAST = re.compile(
 TPCC_CHOOSE_INDEX_CAST = re.compile(r"\bseed\s+as\s+usize\)\s*%\s*cardinality\b")
 TPCC_SEED_WIDTH_CAST = re.compile(r"\b(?:client|tx)\s+as\s+u64\b")
 CROSS_CONCURRENCY_THREAD_WIDTH_CAST = re.compile(r"\btid\s+as\s+u64\b")
+CROSS_CONCURRENCY_MEASURE_WIDTH_CAST = re.compile(r"\bmeasure_secs\s+as\s+usize\b")
 
 
 class BenchStyleTests(unittest.TestCase):
@@ -147,6 +148,16 @@ class BenchStyleTests(unittest.TestCase):
         for line_no, line in enumerate(path.read_text().splitlines(), start=1):
             code = line.split("//", maxsplit=1)[0]
             if CROSS_CONCURRENCY_THREAD_WIDTH_CAST.search(code):
+                offenders.append(f"{path.relative_to(REPO)}:{line_no}: {line.strip()}")
+
+        self.assertEqual([], offenders)
+
+    def test_cross_concurrency_uses_checked_measurement_width_conversions(self) -> None:
+        offenders: list[str] = []
+        path = REPO / "crates" / "ultrasql-bench" / "src" / "bin" / "cross_concurrency.rs"
+        for line_no, line in enumerate(path.read_text().splitlines(), start=1):
+            code = line.split("//", maxsplit=1)[0]
+            if CROSS_CONCURRENCY_MEASURE_WIDTH_CAST.search(code):
                 offenders.append(f"{path.relative_to(REPO)}:{line_no}: {line.strip()}")
 
         self.assertEqual([], offenders)

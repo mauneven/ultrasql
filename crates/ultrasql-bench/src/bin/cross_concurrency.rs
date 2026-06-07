@@ -485,7 +485,8 @@ fn run_insert(args: &Args) -> String {
         // T=1 achieves ~70 K inserts/s; we budget 4 K pages per thread
         // for the measured window plus headroom, capped at 256 K
         // frames total (~2 GiB resident) so we don't OOM the host.
-        let per_thread = (args.measure_secs as usize).saturating_mul(4_096) / args.repeats.max(1);
+        let measure_secs = usize::try_from(args.measure_secs).unwrap_or(usize::MAX);
+        let per_thread = measure_secs.saturating_mul(4_096) / args.repeats.max(1);
         let frames = args
             .threads
             .saturating_mul(per_thread)
