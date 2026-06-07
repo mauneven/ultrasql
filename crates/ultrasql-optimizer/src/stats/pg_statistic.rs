@@ -24,6 +24,17 @@ use crate::stats::column::ColumnStats;
 use crate::stats::histogram::EquiDepthHistogram;
 use crate::stats::mcv::MostCommonValues;
 
+#[must_use]
+fn catalog_float4(value: f64) -> f32 {
+    value.to_f32().unwrap_or_else(|| {
+        if value.is_sign_negative() {
+            f32::MIN
+        } else {
+            f32::MAX
+        }
+    })
+}
+
 /// `pg_statistic` catalog row (simplified, in-memory).
 ///
 /// Field names mirror the PostgreSQL catalog column names verbatim so
@@ -91,7 +102,7 @@ impl PgStatisticRow {
             stats.histogram.as_ref().map_or((0, None, None), |hist| {
                 (
                     2_u16,
-                    Some(vec![hist.samples_per_bucket as f64]),
+                    Some(vec![hist.samples_per_bucket.to_f64().unwrap_or(f64::MAX)]),
                     Some(hist.bounds.clone()),
                 )
             });
@@ -102,17 +113,9 @@ impl PgStatisticRow {
             stainherit: false,
             // Precision-loss casts (f64 → f32) are accepted: pg_statistic
             // stores stanullfrac / stadistinct as `f32` by design.
-            #[allow(
-                clippy::cast_possible_truncation,
-                reason = "pg_statistic stanullfrac is f32 in the catalog row schema"
-            )]
-            stanullfrac: stats.null_frac as f32,
+            stanullfrac: catalog_float4(stats.null_frac),
             stawidth: i32::try_from(stats.avg_width_bytes).unwrap_or(i32::MAX),
-            #[allow(
-                clippy::cast_possible_truncation,
-                reason = "pg_statistic stadistinct is f32 in the catalog row schema"
-            )]
-            stadistinct: stats.n_distinct as f32,
+            stadistinct: catalog_float4(stats.n_distinct),
             stakind1,
             stakind2,
             stanumbers1,
