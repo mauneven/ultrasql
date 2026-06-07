@@ -6,6 +6,10 @@ use ultrasql_wal::{RecordType, WalBuffer, WalRecord};
 
 const PAYLOAD_SIZES: &[usize] = &[0_usize, 64, 256, 1024, 4096];
 
+fn throughput_bytes(n: usize) -> u64 {
+    u64::try_from(n).expect("bench payload byte length must fit Criterion throughput")
+}
+
 fn bench_encode(c: &mut Criterion) {
     let mut group = c.benchmark_group("wal/encode");
     group.sample_size(20);
@@ -21,7 +25,7 @@ fn bench_encode(c: &mut Criterion) {
             payload,
         )
         .expect("bench WAL record should fit size limits");
-        group.throughput(Throughput::Bytes(n as u64));
+        group.throughput(Throughput::Bytes(throughput_bytes(n)));
         group.bench_with_input(BenchmarkId::from_parameter(n), &n, |b, _| {
             b.iter(|| {
                 let bytes = rec.encode();
@@ -48,7 +52,7 @@ fn bench_decode(c: &mut Criterion) {
         )
         .expect("bench WAL record should fit size limits");
         let encoded = rec.encode();
-        group.throughput(Throughput::Bytes(n as u64));
+        group.throughput(Throughput::Bytes(throughput_bytes(n)));
         group.bench_with_input(BenchmarkId::from_parameter(n), &n, |b, _| {
             b.iter(|| {
                 let (parsed, _) = WalRecord::decode(black_box(&encoded)).unwrap();
@@ -68,7 +72,7 @@ fn bench_buffer_append(c: &mut Criterion) {
         let payload = vec![0xFFu8; n];
         let rec = WalRecord::new(RecordType::HeapInsert, Xid::new(1), Lsn::ZERO, 0, payload)
             .expect("bench WAL record should fit size limits");
-        group.throughput(Throughput::Bytes(n as u64));
+        group.throughput(Throughput::Bytes(throughput_bytes(n)));
         group.bench_with_input(BenchmarkId::from_parameter(n), &n, |b, _| {
             b.iter_with_setup(
                 || WalBuffer::new(16 * 1024 * 1024, Lsn::ZERO),
