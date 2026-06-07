@@ -128,7 +128,7 @@ impl Parser<'_> {
                             return Err(ParseError::Expected {
                                 expected: "MINVALUE, MAXVALUE, or CYCLE after NO",
                                 found: other,
-                                offset: self.peek()?.span.start as usize,
+                                offset: self.peek()?.span.start_usize(),
                             });
                         }
                     }
@@ -159,14 +159,14 @@ impl Parser<'_> {
             return Err(ParseError::Expected {
                 expected: "integer",
                 found: tok.kind,
-                offset: tok.span.start as usize,
+                offset: tok.span.start_usize(),
             });
         }
         let t = self.advance()?;
         let text = t.text(self.source).unwrap_or("0");
         let n: i64 = text.parse().map_err(|_| ParseError::InvalidInteger {
             text: text.to_owned(),
-            offset: t.span.start as usize,
+            offset: t.span.start_usize(),
         })?;
         Ok(if negative { -n } else { n })
     }
@@ -178,14 +178,14 @@ impl Parser<'_> {
             return Err(ParseError::Expected {
                 expected: "integer",
                 found: tok.kind,
-                offset: tok.span.start as usize,
+                offset: tok.span.start_usize(),
             });
         }
         let t = self.advance()?;
         let text = t.text(self.source).unwrap_or("0");
         let n: u64 = text.parse().map_err(|_| ParseError::InvalidInteger {
             text: text.to_owned(),
-            offset: t.span.start as usize,
+            offset: t.span.start_usize(),
         })?;
         Ok(n)
     }
