@@ -251,7 +251,9 @@ fn stock_index(warehouse: usize, item: usize) -> usize {
 }
 
 fn choose(seed: u64, cardinality: usize) -> usize {
-    (seed as usize) % cardinality
+    let cardinality_u64 = u64::try_from(cardinality).unwrap_or(u64::MAX).max(1);
+    let reduced = seed % cardinality_u64;
+    usize::try_from(reduced).unwrap_or(0)
 }
 
 #[inline]
