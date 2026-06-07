@@ -68,7 +68,7 @@ fn generate_customers(n: usize) -> Vec<Customer> {
         s ^= s << 17;
         // Phone prefix: 70% chance of matching one of the 7 codes.
         let prefix_idx = if s % 10 < 7 {
-            (s as usize >> 8) % COUNTRY_CODES.len()
+            rng_index(s >> 8, COUNTRY_CODES.len())
         } else {
             COUNTRY_CODES.len() // sentinel "not matching"
         };
@@ -84,6 +84,12 @@ fn generate_customers(n: usize) -> Vec<Customer> {
         });
     }
     rows
+}
+
+fn rng_index(seed: u64, upper_bound: usize) -> usize {
+    let upper_bound_u64 = u64::try_from(upper_bound).unwrap_or(u64::MAX).max(1);
+    let reduced = seed % upper_bound_u64;
+    usize::try_from(reduced).unwrap_or(0)
 }
 
 /// Simulates whether customer `custkey` has an order.

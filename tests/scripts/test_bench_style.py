@@ -26,6 +26,9 @@ SQL_RNG_WIDTH_CAST = re.compile(r"next_u64\(\)\s+as\s+i32")
 BTREE_SHUFFLE_INDEX_CAST = re.compile(r"\bs\s+as\s+usize\)\s*%\s*\(i\s*\+\s*1\)")
 MIXED_OLTP_INDEX_CAST = re.compile(r"\bs\s+as\s+usize\s*>>\s*7\)\s*%")
 TPCB_INDEX_CAST = re.compile(r"\bs\s+as\s+usize\)\s*%\s*(?:accounts|tellers)\.len\(\)")
+TPCH_Q22_COUNTRY_INDEX_CAST = re.compile(
+    r"\bs\s+as\s+usize\s*>>\s*8\)\s*%\s*COUNTRY_CODES\.len\(\)"
+)
 
 
 class BenchStyleTests(unittest.TestCase):
@@ -99,6 +102,16 @@ class BenchStyleTests(unittest.TestCase):
         for line_no, line in enumerate(path.read_text().splitlines(), start=1):
             code = line.split("//", maxsplit=1)[0]
             if TPCB_INDEX_CAST.search(code):
+                offenders.append(f"{path.relative_to(REPO)}:{line_no}: {line.strip()}")
+
+        self.assertEqual([], offenders)
+
+    def test_tpch_q22_uses_checked_country_index_conversions(self) -> None:
+        offenders: list[str] = []
+        path = REPO / "crates" / "ultrasql-bench" / "src" / "runs" / "tpch_q22.rs"
+        for line_no, line in enumerate(path.read_text().splitlines(), start=1):
+            code = line.split("//", maxsplit=1)[0]
+            if TPCH_Q22_COUNTRY_INDEX_CAST.search(code):
                 offenders.append(f"{path.relative_to(REPO)}:{line_no}: {line.strip()}")
 
         self.assertEqual([], offenders)
