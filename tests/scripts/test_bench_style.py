@@ -58,6 +58,7 @@ INSERT_THROUGHPUT_ITERATION_WIDTH_CAST = re.compile(
 UPDATE_THROUGHPUT_ITERATION_WIDTH_CAST = re.compile(
     r"\bctx\.(?:iterations|warmup_iterations)\s+as\s+usize\b"
 )
+HONESTY_ITERATION_WIDTH_CAST = re.compile(r"\bctx\.iterations\s+as\s+usize\b")
 TPCH_Q1_ITERATION_WIDTH_CAST = re.compile(r"\bctx\.iterations\s+as\s+usize\b")
 
 
@@ -364,6 +365,16 @@ class BenchStyleTests(unittest.TestCase):
         for line_no, line in enumerate(path.read_text().splitlines(), start=1):
             code = line.split("//", maxsplit=1)[0]
             if UPDATE_THROUGHPUT_ITERATION_WIDTH_CAST.search(code):
+                offenders.append(f"{path.relative_to(REPO)}:{line_no}: {line.strip()}")
+
+        self.assertEqual([], offenders)
+
+    def test_honesty_uses_checked_iteration_width_conversions(self) -> None:
+        offenders: list[str] = []
+        path = REPO / "crates" / "ultrasql-bench" / "tests" / "honesty.rs"
+        for line_no, line in enumerate(path.read_text().splitlines(), start=1):
+            code = line.split("//", maxsplit=1)[0]
+            if HONESTY_ITERATION_WIDTH_CAST.search(code):
                 offenders.append(f"{path.relative_to(REPO)}:{line_no}: {line.strip()}")
 
         self.assertEqual([], offenders)

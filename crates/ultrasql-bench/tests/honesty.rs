@@ -36,7 +36,7 @@ fn every_registered_spec_reports_honest_numbers() {
         // Must produce exactly `ctx.iterations` samples.
         assert_eq!(
             result.samples.len(),
-            ctx.iterations as usize,
+            usize::try_from(ctx.iterations).unwrap_or(0),
             "spec '{}': samples.len() {} != ctx.iterations {}",
             spec.id,
             result.samples.len(),
