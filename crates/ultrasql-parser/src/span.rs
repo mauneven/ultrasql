@@ -36,6 +36,20 @@ impl Span {
         )
     }
 
+    /// Inclusive start offset as `usize` for slicing and diagnostics.
+    #[inline]
+    #[must_use]
+    pub fn start_usize(self) -> usize {
+        usize::try_from(self.start).unwrap_or(usize::MAX)
+    }
+
+    /// Exclusive end offset as `usize` for slicing and diagnostics.
+    #[inline]
+    #[must_use]
+    pub fn end_usize(self) -> usize {
+        usize::try_from(self.end).unwrap_or(usize::MAX)
+    }
+
     /// Length in bytes.
     #[inline]
     #[must_use]
@@ -132,6 +146,8 @@ mod tests {
         let s = Span::from_usize(10, 20);
         assert_eq!(s.start, 10);
         assert_eq!(s.end, 20);
+        assert_eq!(s.start_usize(), 10);
+        assert_eq!(s.end_usize(), 20);
 
         if let Ok(overflow) = usize::try_from(u64::from(u32::MAX) + 1) {
             let s = Span::from_usize(overflow, overflow);

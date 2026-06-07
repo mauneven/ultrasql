@@ -176,7 +176,7 @@ impl<'src> Parser<'src> {
                     return Err(ParseError::Expected {
                         expected: "';' or end of input",
                         found: other,
-                        offset: self.peek()?.span.start as usize,
+                        offset: self.peek()?.span.start_usize(),
                     });
                 }
             }
@@ -193,12 +193,12 @@ impl<'src> Parser<'src> {
     pub fn parse_statement_slices(&mut self) -> Result<Vec<&'src str>, ParseError> {
         let mut out = Vec::new();
         loop {
-            let start = self.peek()?.span.start as usize;
+            let start = self.peek()?.span.start_usize();
             if self.peek()?.kind == TokenKind::Eof {
                 return Ok(out);
             }
             let _ = self.parse_one()?;
-            let end = self.peek()?.span.start as usize;
+            let end = self.peek()?.span.start_usize();
             let slice = self.source[start..end].trim();
             if !slice.is_empty() {
                 out.push(slice);
@@ -212,7 +212,7 @@ impl<'src> Parser<'src> {
                     return Err(ParseError::Expected {
                         expected: "';' or end of input",
                         found: other,
-                        offset: self.peek()?.span.start as usize,
+                        offset: self.peek()?.span.start_usize(),
                     });
                 }
             }
@@ -292,7 +292,7 @@ impl<'src> Parser<'src> {
                             .ok_or(ParseError::Expected {
                                 expected: "ISOLATION LEVEL after SET TRANSACTION",
                                 found: next_tok.kind,
-                                offset: next_tok.span.start as usize,
+                                offset: next_tok.span.start_usize(),
                             })?;
                     Ok(Statement::SetTransaction {
                         isolation_level,
@@ -355,7 +355,7 @@ impl<'src> Parser<'src> {
                            RELEASE, EXPLAIN, PREPARE, EXECUTE, GRANT, REVOKE, DEALLOCATE, \
                            LISTEN, NOTIFY, UNLISTEN, or COPY",
                 found: other,
-                offset: head.span.start as usize,
+                offset: head.span.start_usize(),
             }),
         }
     }
@@ -450,7 +450,7 @@ impl<'src> Parser<'src> {
             other => Err(ParseError::Expected {
                 expected: "TABLE, TYPE, DOMAIN, OPERATOR, MATERIALIZED VIEW, SCHEMA, INDEX, UNIQUE, AGGREGATING, POLICY, ROLE, USER, or SEQUENCE after CREATE",
                 found: other,
-                offset: tok.span.start as usize,
+                offset: tok.span.start_usize(),
             }),
         }
     }
@@ -525,7 +525,7 @@ impl<'src> Parser<'src> {
         Err(ParseError::Expected {
             expected: "PERMISSIVE or RESTRICTIVE",
             found: tok.kind,
-            offset: tok.span.start as usize,
+            offset: tok.span.start_usize(),
         })
     }
 
@@ -541,7 +541,7 @@ impl<'src> Parser<'src> {
                 return Err(ParseError::Expected {
                     expected: "ALL, SELECT, INSERT, UPDATE, or DELETE",
                     found: other,
-                    offset: tok.span.start as usize,
+                    offset: tok.span.start_usize(),
                 });
             }
         };
@@ -572,7 +572,7 @@ impl<'src> Parser<'src> {
         Err(ParseError::Expected {
             expected,
             found: tok.kind,
-            offset: tok.span.start as usize,
+            offset: tok.span.start_usize(),
         })
     }
 
@@ -607,7 +607,7 @@ impl<'src> Parser<'src> {
             other => Err(ParseError::Expected {
                 expected: "TABLE, SCHEMA, INDEX, SEQUENCE, ROLE, or USER after DROP",
                 found: other,
-                offset: tok.span.start as usize,
+                offset: tok.span.start_usize(),
             }),
         }
     }
@@ -648,7 +648,7 @@ impl<'src> Parser<'src> {
             other => Err(ParseError::Expected {
                 expected: "DEFAULT PRIVILEGES, TABLE, SEQUENCE, ROLE, or USER after ALTER",
                 found: other,
-                offset: tok.span.start as usize,
+                offset: tok.span.start_usize(),
             }),
         }
     }
@@ -664,7 +664,7 @@ impl<'src> Parser<'src> {
             let offset = self
                 .peeked
                 .as_ref()
-                .map_or_else(|| self.lexer.offset(), |t| t.span.start as usize);
+                .map_or_else(|| self.lexer.offset(), |t| t.span.start_usize());
             return Err(ParseError::DepthExceeded {
                 limit: MAX_PARSE_DEPTH,
                 offset,
@@ -765,7 +765,7 @@ impl<'src> Parser<'src> {
         Err(ParseError::Expected {
             expected: name,
             found: head.kind,
-            offset: head.span.start as usize,
+            offset: head.span.start_usize(),
         })
     }
 
@@ -805,7 +805,7 @@ impl<'src> Parser<'src> {
                     other => Err(ParseError::Expected {
                         expected: "COMMITTED or UNCOMMITTED after READ",
                         found: other,
-                        offset: next.span.start as usize,
+                        offset: next.span.start_usize(),
                     }),
                 }
             }
@@ -821,7 +821,7 @@ impl<'src> Parser<'src> {
             other => Err(ParseError::Expected {
                 expected: "READ COMMITTED, REPEATABLE READ, or SERIALIZABLE",
                 found: other,
-                offset: tok.span.start as usize,
+                offset: tok.span.start_usize(),
             }),
         }
     }
