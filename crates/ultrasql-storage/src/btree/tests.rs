@@ -115,7 +115,8 @@ fn insert_1000_shuffled_keys() {
         s ^= s << 13;
         s ^= s >> 7;
         s ^= s << 17;
-        let j = (s as usize) % (i + 1);
+        let upper = u64::try_from(i + 1).expect("shuffle bound must fit u64");
+        let j = usize::try_from(s % upper).expect("shuffle index must fit usize");
         keys.swap(i, j);
     }
     for &k in &keys {
