@@ -406,17 +406,17 @@ pub(super) fn bind_expr_with_ctes(
             negated,
             symmetric,
             ..
-        } => bind_between(
+        } => bind_between(BindBetweenArgs {
             subject,
             low,
             high,
-            *negated,
-            *symmetric,
+            negated: *negated,
+            symmetric: *symmetric,
             input,
             catalog,
             cte_catalog,
             scope,
-        ),
+        }),
 
         // `CASE [operand] WHEN c THEN v … ELSE e END` lowers to a
         // `case` builtin so the executor's function dispatcher can
@@ -967,18 +967,30 @@ fn runtime_typmod_i32(value: Option<i32>) -> ScalarExpr {
 /// pipeline, and synthesising a Let-style binding would grow the plan
 /// language for no measurable benefit on the SQL surface UltraSQL
 /// implements today (pure column / literal predicates).
-#[allow(clippy::too_many_arguments)]
-pub(super) fn bind_between(
-    subject: &Expr,
-    low: &Expr,
-    high: &Expr,
+pub(super) struct BindBetweenArgs<'a> {
+    subject: &'a Expr,
+    low: &'a Expr,
+    high: &'a Expr,
     negated: bool,
     symmetric: bool,
-    input: &Schema,
-    catalog: &dyn Catalog,
-    cte_catalog: &[(String, Schema)],
-    scope: &mut ScopeStack,
-) -> Result<ScalarExpr, PlanError> {
+    input: &'a Schema,
+    catalog: &'a dyn Catalog,
+    cte_catalog: &'a [(String, Schema)],
+    scope: &'a mut ScopeStack,
+}
+
+pub(super) fn bind_between(args: BindBetweenArgs<'_>) -> Result<ScalarExpr, PlanError> {
+    let BindBetweenArgs {
+        subject,
+        low,
+        high,
+        negated,
+        symmetric,
+        input,
+        catalog,
+        cte_catalog,
+        scope,
+    } = args;
     let bound_expr = bind_expr_with_ctes(subject, input, catalog, cte_catalog, scope)?;
     let bound_low = bind_expr_with_ctes(low, input, catalog, cte_catalog, scope)?;
     let bound_high = bind_expr_with_ctes(high, input, catalog, cte_catalog, scope)?;
