@@ -139,7 +139,8 @@ impl AnalyzeRunner {
             let avg_width_bytes = if non_null_count == 0 {
                 0_u32
             } else {
-                u32::try_from(width_sums[col_idx] / non_null_count as u64).unwrap_or(u32::MAX)
+                u32::try_from(width_sums[col_idx] / usize_to_u64_saturating(non_null_count))
+                    .unwrap_or(u32::MAX)
             };
 
             // n_distinct.
@@ -268,10 +269,14 @@ fn compute_correlation(values: &[Value]) -> f64 {
 /// Estimate the storage width of a value in bytes.
 fn value_width(v: &Value, ty: &DataType) -> u64 {
     match v {
-        Value::Text(s) => s.len() as u64,
-        Value::Bytea(b) => b.len() as u64,
-        _ => ty.fixed_size().map_or(8, |s| s as u64),
+        Value::Text(s) => usize_to_u64_saturating(s.len()),
+        Value::Bytea(b) => usize_to_u64_saturating(b.len()),
+        _ => ty.fixed_size().map_or(8, usize_to_u64_saturating),
     }
+}
+
+fn usize_to_u64_saturating(value: usize) -> u64 {
+    u64::try_from(value).unwrap_or(u64::MAX)
 }
 
 #[cfg(test)]
