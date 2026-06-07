@@ -3,6 +3,10 @@
 use criterion::{BenchmarkId, Criterion, Throughput, black_box, criterion_group, criterion_main};
 use ultrasql_storage::Page;
 
+fn usize_to_u64(value: usize) -> u64 {
+    u64::try_from(value).expect("bench count must fit Criterion throughput")
+}
+
 fn bench_insert(c: &mut Criterion) {
     let mut group = c.benchmark_group("page/insert");
     group.sample_size(20);
@@ -10,7 +14,7 @@ fn bench_insert(c: &mut Criterion) {
     group.warm_up_time(std::time::Duration::from_secs(1));
     for &tuple_size in &[16_usize, 64, 256, 1024] {
         let tuple = vec![0xABu8; tuple_size];
-        group.throughput(Throughput::Bytes(tuple_size as u64));
+        group.throughput(Throughput::Bytes(usize_to_u64(tuple_size)));
         group.bench_with_input(
             BenchmarkId::from_parameter(tuple_size),
             &tuple_size,
@@ -38,7 +42,7 @@ fn bench_read(c: &mut Criterion) {
     while let Ok(s) = page.insert_tuple(&tuple) {
         slots.push(s);
     }
-    group.throughput(Throughput::Elements(slots.len() as u64));
+    group.throughput(Throughput::Elements(usize_to_u64(slots.len())));
     group.bench_function("scan_all_slots", |bencher| {
         bencher.iter(|| {
             for &s in &slots {
