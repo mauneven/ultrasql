@@ -52,7 +52,7 @@ pub fn run(ctx: &BenchContext) -> BenchResult {
 
     let median_us = median_f64(&samples);
     let p99_us = p99_f64(&samples);
-    let rows = ROW_COUNT as f64;
+    let rows = crate::runs::count_as_f64(ROW_COUNT);
     let throughput_per_sec = if median_us > 0.0 {
         rows / (median_us / 1_000_000.0)
     } else {

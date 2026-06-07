@@ -4,6 +4,9 @@ from pathlib import Path
 
 
 REPO = Path(__file__).resolve().parents[2]
+BENCH_RUN_FILES = sorted(
+    (REPO / "crates" / "ultrasql-bench" / "src" / "runs").glob("*.rs")
+)
 BENCH_FILES = [
     REPO / "crates" / "ultrasql-bench" / "src" / "bin" / "readme_render.rs",
     REPO / "crates" / "ultrasql-bench" / "src" / "bin" / "results_render.rs",
@@ -26,6 +29,9 @@ TPCH_DATA_GEN_FILE = (
 TPCH_LOAD_FILE = REPO / "crates" / "ultrasql-bench" / "src" / "tpch" / "load.rs"
 NUMERIC_AS_CAST = re.compile(
     r"\bas\s+(?:usize|u8|u16|u32|u64|i8|i16|i32|i64|isize|f32|f64)\b|clippy::cast_"
+)
+BENCH_RUN_NUMERIC_CAST = re.compile(
+    r"\bas\s+(?:usize|u8|u16|u32|u64|u128|i8|i16|i32|i64|isize|f32|f64)\b|clippy::cast_"
 )
 TPCH_DATA_GEN_CAST = re.compile(r"\bas\s+(?:usize|u32|u8|char)\b")
 TPCH_LOAD_DATE_CAST = re.compile(r"\bas\s+(?:u32|i32)\b")
@@ -108,6 +114,16 @@ class BenchStyleTests(unittest.TestCase):
             for line_no, line in enumerate(path.read_text().splitlines(), start=1):
                 code = line.split("//", maxsplit=1)[0]
                 if NUMERIC_AS_CAST.search(code):
+                    offenders.append(f"{path.relative_to(REPO)}:{line_no}: {line.strip()}")
+
+        self.assertEqual([], offenders)
+
+    def test_bench_runs_use_checked_numeric_conversions(self) -> None:
+        offenders: list[str] = []
+        for path in BENCH_RUN_FILES:
+            for line_no, line in enumerate(path.read_text().splitlines(), start=1):
+                code = line.split("//", maxsplit=1)[0]
+                if BENCH_RUN_NUMERIC_CAST.search(code):
                     offenders.append(f"{path.relative_to(REPO)}:{line_no}: {line.strip()}")
 
         self.assertEqual([], offenders)

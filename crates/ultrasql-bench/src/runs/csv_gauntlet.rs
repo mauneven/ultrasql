@@ -136,7 +136,7 @@ fn measure<T>(ctx: &BenchContext, rows: usize, mut timed_body: impl FnMut() -> T
     let median_us = median_f64(&samples);
     let p99_us = p99_f64(&samples);
     let throughput_per_sec = if median_us > 0.0 {
-        rows as f64 / (median_us / 1_000_000.0)
+        crate::runs::count_as_f64(rows) / (median_us / 1_000_000.0)
     } else {
         0.0
     };

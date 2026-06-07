@@ -24,6 +24,8 @@
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+use num_traits::ToPrimitive;
+
 static SMOKE_MODE_GUARDS: AtomicUsize = AtomicUsize::new(0);
 
 /// Process-local smoke-mode guard.
@@ -65,14 +67,23 @@ pub(crate) fn smoke_row_count(prod: usize, smoke: usize) -> usize {
     if smoke_mode_enabled() { smoke } else { prod }
 }
 
+pub(crate) fn count_as_f64(count: usize) -> f64 {
+    count.to_f64().unwrap_or(f64::MAX)
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{enable_smoke_mode_for_process, smoke_row_count};
+    use super::{count_as_f64, enable_smoke_mode_for_process, smoke_row_count};
 
     #[test]
     fn smoke_row_count_uses_process_guard() {
         let _guard = enable_smoke_mode_for_process();
         assert_eq!(smoke_row_count(10_000, 512), 512);
+    }
+
+    #[test]
+    fn count_as_f64_converts_small_counts() {
+        assert_eq!(count_as_f64(42), 42.0);
     }
 }
 

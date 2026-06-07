@@ -43,7 +43,7 @@ pub fn run(ctx: &BenchContext) -> BenchResult {
 
     let median_us = median_f64(&samples);
     let p99_us = p99_f64(&samples);
-    let tx_per_iter = (CLIENTS * TX_PER_CLIENT_ITER) as f64;
+    let tx_per_iter = crate::runs::count_as_f64(CLIENTS * TX_PER_CLIENT_ITER);
     let throughput_per_sec = if median_us > 0.0 {
         tx_per_iter / (median_us / 1_000_000.0)
     } else {

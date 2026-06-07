@@ -180,7 +180,7 @@ pub fn run(ctx: &BenchContext) -> BenchResult {
 
     let median_us = median_f64(&samples);
     let p99_us = p99_f64(&samples);
-    let ops = OPS_PER_ITER as f64;
+    let ops = crate::runs::count_as_f64(OPS_PER_ITER);
     let throughput_per_sec = if median_us > 0.0 {
         ops / (median_us / 1_000_000.0)
     } else {
@@ -327,9 +327,10 @@ mod tests {
             );
 
             // Ratio checks ±5 %.
-            let read_pct = expected_reads as f64 / OPS_PER_ITER as f64;
-            let update_pct = expected_updates as f64 / OPS_PER_ITER as f64;
-            let insert_pct = expected_inserts as f64 / OPS_PER_ITER as f64;
+            let total_ops = crate::runs::count_as_f64(OPS_PER_ITER);
+            let read_pct = crate::runs::count_as_f64(expected_reads) / total_ops;
+            let update_pct = crate::runs::count_as_f64(expected_updates) / total_ops;
+            let insert_pct = crate::runs::count_as_f64(expected_inserts) / total_ops;
             assert!(
                 (read_pct - 0.50).abs() <= 0.05,
                 "iter {iter}: read ratio {read_pct:.3} out of 50%±5% window"
