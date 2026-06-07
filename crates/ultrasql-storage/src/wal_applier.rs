@@ -100,12 +100,10 @@ impl<L: PageLoader + 'static> HeapTarget for HeapAccess<L> {
     /// by the page will match `payload.tid.slot`. If the slot already has
     /// valid data (the page was already flushed past this LSN) the insertion
     /// is skipped.
-    #[allow(clippy::significant_drop_tightening)]
     fn apply_insert(&self, payload: &HeapInsertPayload) -> Result<(), ApplyError> {
         self.apply_insert_at_lsn(payload, Lsn::ZERO)
     }
 
-    #[allow(clippy::significant_drop_tightening)]
     fn apply_insert_at_lsn(
         &self,
         payload: &HeapInsertPayload,
@@ -117,40 +115,42 @@ impl<L: PageLoader + 'static> HeapTarget for HeapAccess<L> {
         // Ensure the block counter reflects this block.
         self.advance_counter(rel, page_id.block)?;
 
-        // Obtain an exclusive pin on the page.
-        let guard = self
-            .pool
-            .get_page(page_id)
-            .map_err(|e| ApplyError::Refused {
-                operation: "heap_insert",
-                detail: format!("buffer pool: {e}"),
-            })?;
+        {
+            // Obtain an exclusive pin on the page.
+            let guard = self
+                .pool
+                .get_page(page_id)
+                .map_err(|e| ApplyError::Refused {
+                    operation: "heap_insert",
+                    detail: format!("buffer pool: {e}"),
+                })?;
 
-        let mut page = guard.write();
-        if should_skip_redo(&page, record_lsn) {
-            return Ok(());
-        }
+            let mut page = guard.write();
+            if should_skip_redo(&page, record_lsn) {
+                return Ok(());
+            }
 
-        // Idempotency check: if the page already has a slot at `tid.slot`
-        // with data, skip the insert (the page was flushed past this record).
-        let slot_count = page.header().slot_count();
-        if payload.tid.slot < slot_count {
-            if let Ok(existing) = page.read_tuple(payload.tid.slot) {
-                if !existing.is_empty() {
-                    // Slot already exists and has content; skip.
-                    stamp_replayed_lsn(&mut page, record_lsn);
-                    return Ok(());
+            // Idempotency check: if the page already has a slot at `tid.slot`
+            // with data, skip the insert (the page was flushed past this record).
+            let slot_count = page.header().slot_count();
+            if payload.tid.slot < slot_count {
+                if let Ok(existing) = page.read_tuple(payload.tid.slot) {
+                    if !existing.is_empty() {
+                        // Slot already exists and has content; skip.
+                        stamp_replayed_lsn(&mut page, record_lsn);
+                        return Ok(());
+                    }
                 }
             }
-        }
 
-        // Write the tuple bytes into the page.
-        page.insert_tuple(&payload.tuple_bytes)
-            .map_err(|e| ApplyError::Refused {
-                operation: "heap_insert",
-                detail: format!("insert_tuple: {e}"),
-            })?;
-        stamp_replayed_lsn(&mut page, record_lsn);
+            // Write the tuple bytes into the page.
+            page.insert_tuple(&payload.tuple_bytes)
+                .map_err(|e| ApplyError::Refused {
+                    operation: "heap_insert",
+                    detail: format!("insert_tuple: {e}"),
+                })?;
+            stamp_replayed_lsn(&mut page, record_lsn);
+        }
         Ok(())
     }
 
@@ -160,12 +160,10 @@ impl<L: PageLoader + 'static> HeapTarget for HeapAccess<L> {
     /// If the old and new tids are on the same page the update is performed
     /// under a single exclusive pin. If they are on different pages the new
     /// page is written first and then the old page is stamped.
-    #[allow(clippy::significant_drop_tightening)]
     fn apply_update(&self, payload: &HeapUpdatePayload) -> Result<(), ApplyError> {
         self.apply_update_at_lsn(payload, Lsn::ZERO)
     }
 
-    #[allow(clippy::significant_drop_tightening)]
     fn apply_update_at_lsn(
         &self,
         payload: &HeapUpdatePayload,
@@ -271,12 +269,10 @@ impl<L: PageLoader + 'static> HeapTarget for HeapAccess<L> {
 
     /// Apply a heap-delete record by stamping `xmax`/`cmax` into the tuple
     /// header at `payload.tid`.
-    #[allow(clippy::significant_drop_tightening)]
     fn apply_delete(&self, payload: &HeapDeletePayload) -> Result<(), ApplyError> {
         self.apply_delete_at_lsn(payload, Lsn::ZERO)
     }
 
-    #[allow(clippy::significant_drop_tightening)]
     fn apply_delete_at_lsn(
         &self,
         payload: &HeapDeletePayload,
@@ -285,58 +281,60 @@ impl<L: PageLoader + 'static> HeapTarget for HeapAccess<L> {
         let page_id = payload.tid.page;
         self.advance_counter(page_id.relation, page_id.block)?;
 
-        let guard = self
-            .pool
-            .get_page(page_id)
-            .map_err(|e| ApplyError::Refused {
-                operation: "heap_delete",
-                detail: format!("buffer pool: {e}"),
-            })?;
-
-        let mut page = guard.write();
-        if should_skip_redo(&page, record_lsn) {
-            return Ok(());
-        }
-        let existing = page.read_tuple(payload.tid.slot).map_err(|e| match e {
-            // If the slot doesn't exist, the record is already beyond
-            // what's on this page — treat as idempotent no-op.
-            PageError::InvalidSlot { .. } | PageError::DeadSlot(_) => ApplyError::Refused {
-                operation: "heap_delete",
-                detail: format!("read slot: {e}"),
-            },
-            other => ApplyError::Refused {
-                operation: "heap_delete",
-                detail: format!("read slot: {other}"),
-            },
-        })?;
-        if existing.len() < TUPLE_HEADER_SIZE {
-            return Err(ApplyError::Refused {
-                operation: "heap_delete",
-                detail: String::from("slot shorter than tuple header"),
-            });
-        }
-        let (mut hdr, _) =
-            TupleHeader::decode(&existing[..TUPLE_HEADER_SIZE]).ok_or_else(|| {
-                ApplyError::Refused {
+        {
+            let guard = self
+                .pool
+                .get_page(page_id)
+                .map_err(|e| ApplyError::Refused {
                     operation: "heap_delete",
-                    detail: String::from("header decode failed"),
-                }
+                    detail: format!("buffer pool: {e}"),
+                })?;
+
+            let mut page = guard.write();
+            if should_skip_redo(&page, record_lsn) {
+                return Ok(());
+            }
+            let existing = page.read_tuple(payload.tid.slot).map_err(|e| match e {
+                // If the slot doesn't exist, the record is already beyond
+                // what's on this page — treat as idempotent no-op.
+                PageError::InvalidSlot { .. } | PageError::DeadSlot(_) => ApplyError::Refused {
+                    operation: "heap_delete",
+                    detail: format!("read slot: {e}"),
+                },
+                other => ApplyError::Refused {
+                    operation: "heap_delete",
+                    detail: format!("read slot: {other}"),
+                },
             })?;
+            if existing.len() < TUPLE_HEADER_SIZE {
+                return Err(ApplyError::Refused {
+                    operation: "heap_delete",
+                    detail: String::from("slot shorter than tuple header"),
+                });
+            }
+            let (mut hdr, _) =
+                TupleHeader::decode(&existing[..TUPLE_HEADER_SIZE]).ok_or_else(|| {
+                    ApplyError::Refused {
+                        operation: "heap_delete",
+                        detail: String::from("header decode failed"),
+                    }
+                })?;
 
-        // Idempotency: if xmax is already set to the same xid, skip.
-        if hdr.xmax == payload.xmax {
+            // Idempotency: if xmax is already set to the same xid, skip.
+            if hdr.xmax == payload.xmax {
+                stamp_replayed_lsn(&mut page, record_lsn);
+                return Ok(());
+            }
+            hdr.mark_deleted(payload.xmax, payload.cmax);
+            let mut hdr_bytes = [0_u8; TUPLE_HEADER_SIZE];
+            hdr.encode(&mut hdr_bytes);
+
+            let page_bytes = page.as_bytes_mut();
+            let item = item_id_from_page_bytes(page_bytes, payload.tid.slot, "heap_delete")?;
+            let slot_off = item_offset_usize(item, "heap_delete")?;
+            page_bytes[slot_off..slot_off + TUPLE_HEADER_SIZE].copy_from_slice(&hdr_bytes);
             stamp_replayed_lsn(&mut page, record_lsn);
-            return Ok(());
         }
-        hdr.mark_deleted(payload.xmax, payload.cmax);
-        let mut hdr_bytes = [0_u8; TUPLE_HEADER_SIZE];
-        hdr.encode(&mut hdr_bytes);
-
-        let page_bytes = page.as_bytes_mut();
-        let item = item_id_from_page_bytes(page_bytes, payload.tid.slot, "heap_delete")?;
-        let slot_off = item_offset_usize(item, "heap_delete")?;
-        page_bytes[slot_off..slot_off + TUPLE_HEADER_SIZE].copy_from_slice(&hdr_bytes);
-        stamp_replayed_lsn(&mut page, record_lsn);
 
         Ok(())
     }
@@ -349,12 +347,10 @@ impl<L: PageLoader + 'static> HeapTarget for HeapAccess<L> {
     /// resolve the pre-image. Idempotent: a replayed record whose
     /// post-image already matches the slot bytes and whose xmax
     /// already equals `writer_xid` is a no-op.
-    #[allow(clippy::significant_drop_tightening)]
     fn apply_update_in_place(&self, payload: &HeapUpdateInPlacePayload) -> Result<(), ApplyError> {
         self.apply_update_in_place_at_lsn(payload, Lsn::ZERO)
     }
 
-    #[allow(clippy::significant_drop_tightening)]
     fn apply_update_in_place_at_lsn(
         &self,
         payload: &HeapUpdateInPlacePayload,
@@ -364,157 +360,52 @@ impl<L: PageLoader + 'static> HeapTarget for HeapAccess<L> {
         let rel = page_id.relation;
         self.advance_counter(rel, page_id.block)?;
 
-        let guard = self
-            .pool
-            .get_page(page_id)
-            .map_err(|e| ApplyError::Refused {
-                operation: "heap_update_in_place",
-                detail: format!("buffer pool: {e}"),
-            })?;
-        let mut page = guard.write();
-        if should_skip_redo(&page, record_lsn) {
-            return Ok(());
-        }
-        let existing = page
-            .read_tuple(payload.tid.slot)
-            .map_err(|e| ApplyError::Refused {
-                operation: "heap_update_in_place",
-                detail: format!("read slot: {e}"),
-            })?;
-        if existing.len() < TUPLE_HEADER_SIZE {
-            return Err(ApplyError::Refused {
-                operation: "heap_update_in_place",
-                detail: String::from("slot shorter than tuple header"),
-            });
-        }
-        let (mut hdr, _) =
-            TupleHeader::decode(&existing[..TUPLE_HEADER_SIZE]).ok_or_else(|| {
-                ApplyError::Refused {
-                    operation: "heap_update_in_place",
-                    detail: String::from("header decode failed"),
-                }
-            })?;
-
-        // Idempotency: if xmax + UPDATED_IN_PLACE bit are already set
-        // to this writer the record was already replayed. Confirm by
-        // also checking the slot bytes match the post image so a
-        // stale matching xmax across distinct cmax values still falls
-        // through to a full rewrite.
-        let post_matches = existing.len() == TUPLE_HEADER_SIZE + payload.post_image_bytes.len()
-            && &existing[TUPLE_HEADER_SIZE..] == payload.post_image_bytes.as_slice();
-        if post_matches
-            && hdr.xmax == payload.writer_xid
-            && hdr.infomask.contains(InfoMask::UPDATED_IN_PLACE)
         {
-            stamp_replayed_lsn(&mut page, record_lsn);
-            return Ok(());
-        }
-
-        hdr.xmax = payload.writer_xid;
-        hdr.cmax = payload.command_id;
-        hdr.infomask.set(InfoMask::UPDATED);
-        hdr.infomask.set(InfoMask::UPDATED_IN_PLACE);
-        let mut hdr_bytes = [0_u8; TUPLE_HEADER_SIZE];
-        hdr.encode(&mut hdr_bytes);
-
-        let page_bytes = page.as_bytes_mut();
-        let item = item_id_from_page_bytes(page_bytes, payload.tid.slot, "heap_update_in_place")?;
-        let slot_off = item_offset_usize(item, "heap_update_in_place")?;
-        let slot_len = item_length_usize(item, "heap_update_in_place")?;
-        if slot_len < TUPLE_HEADER_SIZE + payload.post_image_bytes.len() {
-            return Err(ApplyError::Refused {
-                operation: "heap_update_in_place",
-                detail: format!("slot length {slot_len} too small for header + post-image"),
-            });
-        }
-        page_bytes[slot_off..slot_off + TUPLE_HEADER_SIZE].copy_from_slice(&hdr_bytes);
-        let payload_off = slot_off + TUPLE_HEADER_SIZE;
-        page_bytes[payload_off..payload_off + payload.post_image_bytes.len()]
-            .copy_from_slice(&payload.post_image_bytes);
-        stamp_replayed_lsn(&mut page, record_lsn);
-        drop(page);
-        drop(guard);
-
-        // Rebuild the in-memory undo entry. Push idempotently: if an
-        // entry for the same `(tid, writer_xid, pre_image)` triple
-        // already exists, skip — recovery may walk the same record
-        // twice across restart cycles.
-        let log_handle = self
-            .undo_log
-            .entry(rel)
-            .or_insert_with(|| parking_lot::RwLock::new(UndoRelationLog::default()));
-        let mut log = log_handle.write();
-        let already = log.entries.iter().rev().any(|e| {
-            e.tid == payload.tid
-                && e.writer_xid == payload.writer_xid
-                && e.old_payload.as_slice() == payload.pre_image_bytes.as_slice()
-        });
-        if !already {
-            if payload.pre_image_bytes.len() != 9 {
-                return Err(ApplyError::Refused {
-                    operation: "heap_update_in_place",
-                    detail: format!(
-                        "invalid pre-image width: expected 9 bytes, got {}",
-                        payload.pre_image_bytes.len()
-                    ),
-                });
-            }
-            let mut pre = [0_u8; 9];
-            pre.copy_from_slice(&payload.pre_image_bytes);
-            log.entries.push(UndoEntry {
-                tid: payload.tid,
-                writer_xid: payload.writer_xid,
-                old_payload: pre,
-            });
-        }
-        drop(log);
-
-        self.column_cache.bump_version(rel);
-        Ok(())
-    }
-
-    #[allow(clippy::significant_drop_tightening)]
-    fn apply_update_in_place_batch_at_lsn(
-        &self,
-        payload: &HeapUpdateInPlaceBatchPayload,
-        record_lsn: Lsn,
-    ) -> Result<(), ApplyError> {
-        let page_id = payload.page;
-        let rel = page_id.relation;
-        self.advance_counter(rel, page_id.block)?;
-
-        let guard = self
-            .pool
-            .get_page(page_id)
-            .map_err(|e| ApplyError::Refused {
-                operation: "heap_update_in_place_batch",
-                detail: format!("buffer pool: {e}"),
-            })?;
-        let mut page = guard.write();
-        if should_skip_redo(&page, record_lsn) {
-            return Ok(());
-        }
-
-        for entry in &payload.entries {
-            let existing = page
-                .read_tuple(entry.slot)
+            let guard = self
+                .pool
+                .get_page(page_id)
                 .map_err(|e| ApplyError::Refused {
-                    operation: "heap_update_in_place_batch",
+                    operation: "heap_update_in_place",
+                    detail: format!("buffer pool: {e}"),
+                })?;
+            let mut page = guard.write();
+            if should_skip_redo(&page, record_lsn) {
+                return Ok(());
+            }
+            let existing = page
+                .read_tuple(payload.tid.slot)
+                .map_err(|e| ApplyError::Refused {
+                    operation: "heap_update_in_place",
                     detail: format!("read slot: {e}"),
                 })?;
             if existing.len() < TUPLE_HEADER_SIZE {
                 return Err(ApplyError::Refused {
-                    operation: "heap_update_in_place_batch",
+                    operation: "heap_update_in_place",
                     detail: String::from("slot shorter than tuple header"),
                 });
             }
             let (mut hdr, _) =
                 TupleHeader::decode(&existing[..TUPLE_HEADER_SIZE]).ok_or_else(|| {
                     ApplyError::Refused {
-                        operation: "heap_update_in_place_batch",
+                        operation: "heap_update_in_place",
                         detail: String::from("header decode failed"),
                     }
                 })?;
+
+            // Idempotency: if xmax + UPDATED_IN_PLACE bit are already set
+            // to this writer the record was already replayed. Confirm by
+            // also checking the slot bytes match the post image so a
+            // stale matching xmax across distinct cmax values still falls
+            // through to a full rewrite.
+            let post_matches = existing.len() == TUPLE_HEADER_SIZE + payload.post_image_bytes.len()
+                && &existing[TUPLE_HEADER_SIZE..] == payload.post_image_bytes.as_slice();
+            if post_matches
+                && hdr.xmax == payload.writer_xid
+                && hdr.infomask.contains(InfoMask::UPDATED_IN_PLACE)
+            {
+                stamp_replayed_lsn(&mut page, record_lsn);
+                return Ok(());
+            }
 
             hdr.xmax = payload.writer_xid;
             hdr.cmax = payload.command_id;
@@ -525,45 +416,152 @@ impl<L: PageLoader + 'static> HeapTarget for HeapAccess<L> {
 
             let page_bytes = page.as_bytes_mut();
             let item =
-                item_id_from_page_bytes(page_bytes, entry.slot, "heap_update_in_place_batch")?;
-            let slot_off = item_offset_usize(item, "heap_update_in_place_batch")?;
-            let slot_len = item_length_usize(item, "heap_update_in_place_batch")?;
-            if slot_len < TUPLE_HEADER_SIZE + entry.post_image.len() {
+                item_id_from_page_bytes(page_bytes, payload.tid.slot, "heap_update_in_place")?;
+            let slot_off = item_offset_usize(item, "heap_update_in_place")?;
+            let slot_len = item_length_usize(item, "heap_update_in_place")?;
+            if slot_len < TUPLE_HEADER_SIZE + payload.post_image_bytes.len() {
                 return Err(ApplyError::Refused {
-                    operation: "heap_update_in_place_batch",
+                    operation: "heap_update_in_place",
                     detail: format!("slot length {slot_len} too small for header + post-image"),
                 });
             }
             page_bytes[slot_off..slot_off + TUPLE_HEADER_SIZE].copy_from_slice(&hdr_bytes);
             let payload_off = slot_off + TUPLE_HEADER_SIZE;
-            page_bytes[payload_off..payload_off + entry.post_image.len()]
-                .copy_from_slice(&entry.post_image);
+            page_bytes[payload_off..payload_off + payload.post_image_bytes.len()]
+                .copy_from_slice(&payload.post_image_bytes);
+            stamp_replayed_lsn(&mut page, record_lsn);
         }
-        stamp_replayed_lsn(&mut page, record_lsn);
-        drop(page);
-        drop(guard);
 
-        let log_handle = self
-            .undo_log
-            .entry(rel)
-            .or_insert_with(|| parking_lot::RwLock::new(UndoRelationLog::default()));
-        let mut log = log_handle.write();
-        for entry in &payload.entries {
-            let tid = TupleId::new(page_id, entry.slot);
-            let already = log.entries.iter().rev().any(|existing| {
-                existing.tid == tid
-                    && existing.writer_xid == payload.writer_xid
-                    && existing.old_payload == entry.pre_image
+        // Rebuild the in-memory undo entry. Push idempotently: if an
+        // entry for the same `(tid, writer_xid, pre_image)` triple
+        // already exists, skip — recovery may walk the same record
+        // twice across restart cycles.
+        {
+            let log_handle = self
+                .undo_log
+                .entry(rel)
+                .or_insert_with(|| parking_lot::RwLock::new(UndoRelationLog::default()));
+            let mut log = log_handle.write();
+            let already = log.entries.iter().rev().any(|e| {
+                e.tid == payload.tid
+                    && e.writer_xid == payload.writer_xid
+                    && e.old_payload.as_slice() == payload.pre_image_bytes.as_slice()
             });
             if !already {
+                if payload.pre_image_bytes.len() != 9 {
+                    return Err(ApplyError::Refused {
+                        operation: "heap_update_in_place",
+                        detail: format!(
+                            "invalid pre-image width: expected 9 bytes, got {}",
+                            payload.pre_image_bytes.len()
+                        ),
+                    });
+                }
+                let mut pre = [0_u8; 9];
+                pre.copy_from_slice(&payload.pre_image_bytes);
                 log.entries.push(UndoEntry {
-                    tid,
+                    tid: payload.tid,
                     writer_xid: payload.writer_xid,
-                    old_payload: entry.pre_image,
+                    old_payload: pre,
                 });
             }
         }
-        drop(log);
+
+        self.column_cache.bump_version(rel);
+        Ok(())
+    }
+
+    fn apply_update_in_place_batch_at_lsn(
+        &self,
+        payload: &HeapUpdateInPlaceBatchPayload,
+        record_lsn: Lsn,
+    ) -> Result<(), ApplyError> {
+        let page_id = payload.page;
+        let rel = page_id.relation;
+        self.advance_counter(rel, page_id.block)?;
+
+        {
+            let guard = self
+                .pool
+                .get_page(page_id)
+                .map_err(|e| ApplyError::Refused {
+                    operation: "heap_update_in_place_batch",
+                    detail: format!("buffer pool: {e}"),
+                })?;
+            let mut page = guard.write();
+            if should_skip_redo(&page, record_lsn) {
+                return Ok(());
+            }
+
+            for entry in &payload.entries {
+                let existing = page
+                    .read_tuple(entry.slot)
+                    .map_err(|e| ApplyError::Refused {
+                        operation: "heap_update_in_place_batch",
+                        detail: format!("read slot: {e}"),
+                    })?;
+                if existing.len() < TUPLE_HEADER_SIZE {
+                    return Err(ApplyError::Refused {
+                        operation: "heap_update_in_place_batch",
+                        detail: String::from("slot shorter than tuple header"),
+                    });
+                }
+                let (mut hdr, _) =
+                    TupleHeader::decode(&existing[..TUPLE_HEADER_SIZE]).ok_or_else(|| {
+                        ApplyError::Refused {
+                            operation: "heap_update_in_place_batch",
+                            detail: String::from("header decode failed"),
+                        }
+                    })?;
+
+                hdr.xmax = payload.writer_xid;
+                hdr.cmax = payload.command_id;
+                hdr.infomask.set(InfoMask::UPDATED);
+                hdr.infomask.set(InfoMask::UPDATED_IN_PLACE);
+                let mut hdr_bytes = [0_u8; TUPLE_HEADER_SIZE];
+                hdr.encode(&mut hdr_bytes);
+
+                let page_bytes = page.as_bytes_mut();
+                let item =
+                    item_id_from_page_bytes(page_bytes, entry.slot, "heap_update_in_place_batch")?;
+                let slot_off = item_offset_usize(item, "heap_update_in_place_batch")?;
+                let slot_len = item_length_usize(item, "heap_update_in_place_batch")?;
+                if slot_len < TUPLE_HEADER_SIZE + entry.post_image.len() {
+                    return Err(ApplyError::Refused {
+                        operation: "heap_update_in_place_batch",
+                        detail: format!("slot length {slot_len} too small for header + post-image"),
+                    });
+                }
+                page_bytes[slot_off..slot_off + TUPLE_HEADER_SIZE].copy_from_slice(&hdr_bytes);
+                let payload_off = slot_off + TUPLE_HEADER_SIZE;
+                page_bytes[payload_off..payload_off + entry.post_image.len()]
+                    .copy_from_slice(&entry.post_image);
+            }
+            stamp_replayed_lsn(&mut page, record_lsn);
+        }
+
+        {
+            let log_handle = self
+                .undo_log
+                .entry(rel)
+                .or_insert_with(|| parking_lot::RwLock::new(UndoRelationLog::default()));
+            let mut log = log_handle.write();
+            for entry in &payload.entries {
+                let tid = TupleId::new(page_id, entry.slot);
+                let already = log.entries.iter().rev().any(|existing| {
+                    existing.tid == tid
+                        && existing.writer_xid == payload.writer_xid
+                        && existing.old_payload == entry.pre_image
+                });
+                if !already {
+                    log.entries.push(UndoEntry {
+                        tid,
+                        writer_xid: payload.writer_xid,
+                        old_payload: entry.pre_image,
+                    });
+                }
+            }
+        }
 
         self.column_cache.bump_version(rel);
         Ok(())
@@ -572,12 +570,10 @@ impl<L: PageLoader + 'static> HeapTarget for HeapAccess<L> {
     /// Apply an in-place DELETE record. Stamps `xmax`/`cmax`/
     /// `infomask | UPDATED` on the tuple header. Idempotent: an
     /// already-stamped slot with the same `xmax` is a no-op.
-    #[allow(clippy::significant_drop_tightening)]
     fn apply_delete_in_place(&self, payload: &HeapDeleteInPlacePayload) -> Result<(), ApplyError> {
         self.apply_delete_in_place_at_lsn(payload, Lsn::ZERO)
     }
 
-    #[allow(clippy::significant_drop_tightening)]
     fn apply_delete_in_place_at_lsn(
         &self,
         payload: &HeapDeleteInPlacePayload,
@@ -586,52 +582,53 @@ impl<L: PageLoader + 'static> HeapTarget for HeapAccess<L> {
         let page_id = payload.tid.page;
         self.advance_counter(page_id.relation, page_id.block)?;
 
-        let guard = self
-            .pool
-            .get_page(page_id)
-            .map_err(|e| ApplyError::Refused {
-                operation: "heap_delete_in_place",
-                detail: format!("buffer pool: {e}"),
-            })?;
-        let mut page = guard.write();
-        if should_skip_redo(&page, record_lsn) {
-            return Ok(());
-        }
-        let existing = page
-            .read_tuple(payload.tid.slot)
-            .map_err(|e| ApplyError::Refused {
-                operation: "heap_delete_in_place",
-                detail: format!("read slot: {e}"),
-            })?;
-        if existing.len() < TUPLE_HEADER_SIZE {
-            return Err(ApplyError::Refused {
-                operation: "heap_delete_in_place",
-                detail: String::from("slot shorter than tuple header"),
-            });
-        }
-        let (mut hdr, _) =
-            TupleHeader::decode(&existing[..TUPLE_HEADER_SIZE]).ok_or_else(|| {
-                ApplyError::Refused {
+        {
+            let guard = self
+                .pool
+                .get_page(page_id)
+                .map_err(|e| ApplyError::Refused {
                     operation: "heap_delete_in_place",
-                    detail: String::from("header decode failed"),
-                }
-            })?;
+                    detail: format!("buffer pool: {e}"),
+                })?;
+            let mut page = guard.write();
+            if should_skip_redo(&page, record_lsn) {
+                return Ok(());
+            }
+            let existing = page
+                .read_tuple(payload.tid.slot)
+                .map_err(|e| ApplyError::Refused {
+                    operation: "heap_delete_in_place",
+                    detail: format!("read slot: {e}"),
+                })?;
+            if existing.len() < TUPLE_HEADER_SIZE {
+                return Err(ApplyError::Refused {
+                    operation: "heap_delete_in_place",
+                    detail: String::from("slot shorter than tuple header"),
+                });
+            }
+            let (mut hdr, _) =
+                TupleHeader::decode(&existing[..TUPLE_HEADER_SIZE]).ok_or_else(|| {
+                    ApplyError::Refused {
+                        operation: "heap_delete_in_place",
+                        detail: String::from("header decode failed"),
+                    }
+                })?;
 
-        if hdr.xmax == payload.xmax {
+            if hdr.xmax == payload.xmax {
+                stamp_replayed_lsn(&mut page, record_lsn);
+                return Ok(());
+            }
+            hdr.mark_deleted(payload.xmax, payload.cmax);
+            let mut hdr_bytes = [0_u8; TUPLE_HEADER_SIZE];
+            hdr.encode(&mut hdr_bytes);
+
+            let page_bytes = page.as_bytes_mut();
+            let item =
+                item_id_from_page_bytes(page_bytes, payload.tid.slot, "heap_delete_in_place")?;
+            let slot_off = item_offset_usize(item, "heap_delete_in_place")?;
+            page_bytes[slot_off..slot_off + TUPLE_HEADER_SIZE].copy_from_slice(&hdr_bytes);
             stamp_replayed_lsn(&mut page, record_lsn);
-            return Ok(());
         }
-        hdr.mark_deleted(payload.xmax, payload.cmax);
-        let mut hdr_bytes = [0_u8; TUPLE_HEADER_SIZE];
-        hdr.encode(&mut hdr_bytes);
-
-        let page_bytes = page.as_bytes_mut();
-        let item = item_id_from_page_bytes(page_bytes, payload.tid.slot, "heap_delete_in_place")?;
-        let slot_off = item_offset_usize(item, "heap_delete_in_place")?;
-        page_bytes[slot_off..slot_off + TUPLE_HEADER_SIZE].copy_from_slice(&hdr_bytes);
-        stamp_replayed_lsn(&mut page, record_lsn);
-        drop(page);
-        drop(guard);
 
         self.column_cache.bump_version(page_id.relation);
         Ok(())
@@ -644,12 +641,10 @@ impl<L: PageLoader + 'static> HeapTarget for HeapAccess<L> {
     /// on disk was partially written at the time of the crash, the FPW record
     /// carries the consistent pre-mutation image so subsequent mutation records
     /// can be re-applied correctly.
-    #[allow(clippy::significant_drop_tightening)]
     fn apply_full_page_write(&self, payload: &FullPageWritePayload) -> Result<(), ApplyError> {
         self.apply_full_page_write_at_lsn(payload, Lsn::ZERO)
     }
 
-    #[allow(clippy::significant_drop_tightening)]
     fn apply_full_page_write_at_lsn(
         &self,
         payload: &FullPageWritePayload,
@@ -660,31 +655,34 @@ impl<L: PageLoader + 'static> HeapTarget for HeapAccess<L> {
         let page_id = payload.page;
         self.advance_counter(page_id.relation, page_id.block)?;
 
-        let guard = self
-            .pool
-            .get_page(page_id)
-            .map_err(|e| ApplyError::Refused {
-                operation: "fpw",
-                detail: format!("buffer pool: {e}"),
-            })?;
+        {
+            let guard = self
+                .pool
+                .get_page(page_id)
+                .map_err(|e| ApplyError::Refused {
+                    operation: "fpw",
+                    detail: format!("buffer pool: {e}"),
+                })?;
 
-        let mut page = guard.write();
-        if should_skip_redo(&page, record_lsn) {
-            return Ok(());
+            let mut page = guard.write();
+            if should_skip_redo(&page, record_lsn) {
+                return Ok(());
+            }
+            if payload.page_bytes.len() != PAGE_SIZE {
+                return Err(ApplyError::Refused {
+                    operation: "fpw",
+                    detail: format!(
+                        "page_bytes length {} != PAGE_SIZE {}",
+                        payload.page_bytes.len(),
+                        PAGE_SIZE
+                    ),
+                });
+            }
+            page.as_bytes_mut()
+                .copy_from_slice(&payload.page_bytes[..PAGE_SIZE]);
+            stamp_replayed_lsn(&mut page, record_lsn);
         }
-        if payload.page_bytes.len() != PAGE_SIZE {
-            return Err(ApplyError::Refused {
-                operation: "fpw",
-                detail: format!(
-                    "page_bytes length {} != PAGE_SIZE {}",
-                    payload.page_bytes.len(),
-                    PAGE_SIZE
-                ),
-            });
-        }
-        page.as_bytes_mut()
-            .copy_from_slice(&payload.page_bytes[..PAGE_SIZE]);
-        stamp_replayed_lsn(&mut page, record_lsn);
+
         Ok(())
     }
 
