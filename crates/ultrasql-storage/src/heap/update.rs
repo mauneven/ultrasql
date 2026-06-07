@@ -535,9 +535,6 @@ impl<L: PageLoader> HeapAccess<L> {
     /// [`Self::scan`] for executor code that holds a snapshot; the
     /// original `scan` is kept for tools that genuinely want every
     /// slot regardless of visibility.
-    ///
-    /// Resolves the former `TODO(visibility-aware scan)` in this
-    /// module's top-of-file doc comment.
     pub const fn scan_visible<'a, O: XidStatusOracle + ?Sized>(
         &'a self,
         rel: RelationId,
