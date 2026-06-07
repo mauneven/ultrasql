@@ -392,7 +392,6 @@ fn state_file_limit_error(path: &Path, bytes: u64, limit: u64) -> std::io::Error
     )
 }
 
-#[cfg_attr(not(unix), allow(unused_variables))]
 fn open_state_file_for_read(path: &Path) -> std::io::Result<File> {
     let mut options = OpenOptions::new();
     options.read(true);

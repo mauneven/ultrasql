@@ -316,7 +316,6 @@ fn recovery_segment_limit_error(path: &Path, bytes: u64, limit: u64) -> Recovery
     ))
 }
 
-#[cfg_attr(not(unix), allow(unused_variables))]
 fn open_recovery_segment(path: &Path) -> std::io::Result<File> {
     let mut opts = OpenOptions::new();
     opts.read(true);

@@ -484,7 +484,6 @@ fn ensure_regular_external_file(
     }
 }
 
-#[cfg_attr(not(unix), allow(unused_variables))]
 fn open_regular_external_file(path: &Path) -> std::io::Result<File> {
     let mut options = OpenOptions::new();
     options.read(true);

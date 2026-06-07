@@ -137,7 +137,6 @@ fn catalog_marker_bytes_read_len(len: usize) -> Result<u64, ServerError> {
     })
 }
 
-#[cfg_attr(not(unix), allow(unused_variables))]
 fn open_catalog_version_marker(path: &Path) -> Result<File, ServerError> {
     let mut options = OpenOptions::new();
     options.read(true);

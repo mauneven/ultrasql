@@ -595,7 +595,6 @@ fn replication_metadata_limit_error(path: &Path, bytes: u64, limit: u64) -> std:
     )
 }
 
-#[cfg_attr(not(unix), allow(unused_variables))]
 fn open_regular_metadata_file(path: &Path) -> std::io::Result<File> {
     let mut options = OpenOptions::new();
     options.read(true);

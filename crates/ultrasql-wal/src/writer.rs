@@ -582,7 +582,6 @@ fn peek_record_length(bytes: &[u8]) -> Result<u64, WalWriterError> {
 /// rather than silently overwriting unrelated files.
 ///
 /// On non-Unix targets the flag is unavailable and the open is plain.
-#[cfg_attr(not(unix), allow(unused_variables))]
 fn open_segment_file(path: &Path) -> std::io::Result<File> {
     let mut opts = OpenOptions::new();
     opts.create(true).append(true).read(false);

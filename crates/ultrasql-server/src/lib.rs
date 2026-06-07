@@ -3916,7 +3916,6 @@ fn capped_text_bytes_read_len(path: &Path, context: &str, len: usize) -> Result<
     })
 }
 
-#[cfg_attr(not(unix), allow(unused_variables))]
 fn open_no_follow_read(path: &Path) -> Result<std::fs::File, ServerError> {
     let mut options = std::fs::OpenOptions::new();
     options.read(true);

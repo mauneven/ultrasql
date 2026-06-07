@@ -510,7 +510,6 @@ fn csv_limit_error_message(operation: &str, path: &Path, bytes: u64, limit: u64)
     )
 }
 
-#[cfg_attr(not(unix), allow(unused_variables))]
 fn open_regular_utf8_file(path: &Path) -> std::io::Result<File> {
     let mut options = OpenOptions::new();
     options.read(true);
