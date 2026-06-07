@@ -17,6 +17,7 @@
 //!
 //! `stakind = 0` means the slot is unused.
 
+use num_traits::ToPrimitive;
 use ultrasql_core::Value;
 
 use crate::stats::column::ColumnStats;
@@ -151,16 +152,10 @@ impl PgStatisticRow {
             match (&self.stavalues2, &self.stanumbers2) {
                 (Some(bounds), Some(numbers)) => {
                     let samples_per_bucket = numbers.first().copied().map_or(0, |n| {
-                        // Histogram bucket counts are non-negative and well
-                        // within u64; saturate negative or overflowing
-                        // inputs rather than panicking.
-                        #[allow(
-                            clippy::cast_possible_truncation,
-                            clippy::cast_sign_loss,
-                            reason = "histogram sample counts are non-negative, bounded by row_count"
-                        )]
-                        {
-                            n.max(0.0) as u64
+                        if n.is_nan() || n <= 0.0 {
+                            0
+                        } else {
+                            n.to_u64().unwrap_or(u64::MAX)
                         }
                     });
                     let bucket_count =

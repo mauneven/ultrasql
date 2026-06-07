@@ -3581,6 +3581,7 @@ dependencies = [
  "ahash",
  "criterion",
  "dashmap",
+ "num-traits",
  "proptest",
  "smallvec",
  "thiserror",

@@ -18,6 +18,7 @@
 pub mod operators;
 pub mod selectivity;
 
+use num_traits::ToPrimitive;
 use ultrasql_planner::LogicalPlan;
 
 pub use crate::cost::operators::{annotate_parallel, cost_bitmap_heap_scan, cost_index_only_scan};
@@ -219,23 +220,16 @@ impl<'s> CostModel<'s> {
             LogicalPlan::Filter { input, predicate } => {
                 let input_est = self.estimate(input);
                 let table = extract_base_table(input);
+                let input_rows = if input_est.rows.is_nan() || input_est.rows <= 0.0 {
+                    0
+                } else {
+                    input_est.rows.to_u64().unwrap_or(u64::MAX)
+                };
                 let sel = selectivity::selectivity(
                     predicate,
                     self.stats,
                     table.as_deref().unwrap_or(""),
-                    // Use rows from input estimate; fall back to raw row_count.
-                    // `rows` is a non-negative f64 cardinality estimate; the
-                    // clamp keeps the conversion deterministic on any input.
-                    {
-                        #[allow(
-                            clippy::cast_possible_truncation,
-                            clippy::cast_sign_loss,
-                            reason = "clamped to [0.0, u64::MAX-as-f64] before narrowing"
-                        )]
-                        {
-                            input_est.rows.clamp(0.0, 1.844_674_407_370_955_2e19) as u64
-                        }
-                    },
+                    input_rows,
                 );
                 cost_filter(input_est, sel, &self.gucs)
             }
