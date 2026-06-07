@@ -51,6 +51,7 @@ use std::time::Instant;
 
 use anyhow::{Context, Result};
 use clap::{Parser, ValueEnum};
+use num_traits::ToPrimitive;
 
 /// Benchmark tier controlling dataset size and iteration counts.
 ///
@@ -626,7 +627,8 @@ where
         let t0 = Instant::now();
         body(&mut engine, &mut state)?;
         let dt = t0.elapsed();
-        us.push(dt.as_nanos() as f64 / 1000.0);
+        let elapsed_us = dt.as_nanos().to_f64().unwrap_or(f64::MAX) / 1000.0;
+        us.push(elapsed_us);
     }
     Ok(us)
 }

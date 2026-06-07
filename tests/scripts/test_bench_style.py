@@ -15,6 +15,9 @@ ANN_FILES = [
 SQL_BENCH_FILES = [
     REPO / "crates" / "ultrasql-bench" / "src" / "bin" / "cross_compare_sql.rs",
 ]
+CROSS_COMPARE_WRITES = (
+    REPO / "crates" / "ultrasql-bench" / "src" / "bin" / "cross_compare_writes.rs"
+)
 PUSH_VS_PULL_BENCH = REPO / "crates" / "ultrasql-bench" / "benches" / "push_vs_pull.rs"
 V07_VECTORIZED_BENCH = REPO / "crates" / "ultrasql-bench" / "benches" / "v07_vectorized.rs"
 TPCH_DATA_GEN_FILE = (
@@ -66,6 +69,9 @@ CROSS_CONCURRENCY_NUMERIC_CAST = re.compile(
     r"\bas\s+(?:usize|u8|u16|u32|u64|i8|i16|i32|i64|isize|f32|f64)\b|clippy::cast_"
 )
 CROSS_COMPARE_NUMERIC_CAST = re.compile(
+    r"\bas\s+(?:usize|u8|u16|u32|u64|u128|i8|i16|i32|i64|isize|f32|f64)\b|clippy::cast_"
+)
+CROSS_COMPARE_WRITES_NUMERIC_CAST = re.compile(
     r"\bas\s+(?:usize|u8|u16|u32|u64|u128|i8|i16|i32|i64|isize|f32|f64)\b|clippy::cast_"
 )
 SELECT_AVG_ITERATION_WIDTH_CAST = re.compile(r"\bctx\.iterations\s+as\s+usize\b")
@@ -367,6 +373,17 @@ class BenchStyleTests(unittest.TestCase):
             code = line.split("//", maxsplit=1)[0]
             if CROSS_COMPARE_NUMERIC_CAST.search(code):
                 offenders.append(f"{path.relative_to(REPO)}:{line_no}: {line.strip()}")
+
+        self.assertEqual([], offenders)
+
+    def test_cross_compare_writes_uses_checked_numeric_conversions(self) -> None:
+        offenders: list[str] = []
+        for line_no, line in enumerate(CROSS_COMPARE_WRITES.read_text().splitlines(), start=1):
+            code = line.split("//", maxsplit=1)[0]
+            if CROSS_COMPARE_WRITES_NUMERIC_CAST.search(code):
+                offenders.append(
+                    f"{CROSS_COMPARE_WRITES.relative_to(REPO)}:{line_no}: {line.strip()}"
+                )
 
         self.assertEqual([], offenders)
 
