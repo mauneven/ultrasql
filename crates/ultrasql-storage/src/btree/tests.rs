@@ -1,13 +1,5 @@
 //! Unit tests for the B+ tree.
 
-#![allow(
-    clippy::cast_possible_truncation,
-    clippy::cast_possible_wrap,
-    clippy::cast_sign_loss,
-    clippy::cast_lossless,
-    reason = "test: deterministic key generation with compile-time-bounded loop sizes"
-)]
-
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering as AtomicOrdering};
 use std::thread;

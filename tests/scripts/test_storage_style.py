@@ -20,7 +20,9 @@ STORAGE_EXTRAS_THROUGHPUT_CAST = re.compile(r"\bsize\s+as\s+u64\b")
 STORAGE_V08_BENCH_CASTS = re.compile(
     r"\bN\s+as\s+u64\b|\bN\s+as\s+i64\b|\bi\s+as\s+u32\b|clippy::cast_"
 )
-STORAGE_BTREE_SHUFFLE_CAST = re.compile(r"\bs\s+as\s+usize\b")
+STORAGE_BTREE_TEST_CASTS = re.compile(
+    r"\bas\s+(?:usize|u8|u16|u32|u64|i8|i16|i32|i64|isize|f32|f64)\b|clippy::cast_"
+)
 STORAGE_HEAP_TEST_CASTS = re.compile(
     r"\bN\s+as\s+usize\b|\(2 \* N\)\s+as\s+usize\b|\bi\s+as\s+u8\b|clippy::cast_"
 )
@@ -61,11 +63,11 @@ class StorageStyleTests(unittest.TestCase):
 
         self.assertEqual([], offenders)
 
-    def test_btree_shuffle_uses_checked_index_conversions(self) -> None:
+    def test_btree_tests_use_checked_integer_conversions(self) -> None:
         offenders: list[str] = []
         for line_no, line in enumerate(STORAGE_BTREE_TESTS.read_text().splitlines(), start=1):
             code = line.split("//", maxsplit=1)[0]
-            if STORAGE_BTREE_SHUFFLE_CAST.search(code):
+            if STORAGE_BTREE_TEST_CASTS.search(code):
                 offenders.append(f"{STORAGE_BTREE_TESTS.relative_to(REPO)}:{line_no}: {line.strip()}")
 
         self.assertEqual([], offenders)
