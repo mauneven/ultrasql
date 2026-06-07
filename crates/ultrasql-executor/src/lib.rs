@@ -138,8 +138,8 @@ pub use mem_table_scan::MemTableScan;
 pub use merge_join::{MergeJoin, MergeJoinConfig};
 pub use modify::{
     InsertConflictAction, InsertIndexEncoder, InsertIndexMaintainer, ModifyKind, ModifyTable,
-    RowConstraintCheck, RowUpdateConstraintCheck, SequenceDefault, SequenceNextvalObserver,
-    VectorIndexEncoder, VectorIndexMaintainer,
+    ModifyTableStamps, RowConstraintCheck, RowUpdateConstraintCheck, SequenceDefault,
+    SequenceNextvalObserver, VectorIndexEncoder, VectorIndexMaintainer,
 };
 pub use nested_loop_join::{NestedLoopJoin, RightFactory};
 pub use parallel_seq_scan::{

@@ -483,6 +483,37 @@ enum InsertConflict {
     InBatch,
 }
 
+/// MVCC metadata stamped by a [`ModifyTable`] mutation.
+///
+/// INSERT uses `insert_xmin` / `insert_command_id` for new tuple
+/// headers. UPDATE and DELETE use `delete_xmax` / `delete_cmax` for
+/// old tuple versions marked dead.
+#[derive(Clone, Copy, Debug)]
+pub struct ModifyTableStamps {
+    insert_xmin: Xid,
+    insert_command_id: CommandId,
+    delete_xmax: Xid,
+    delete_cmax: CommandId,
+}
+
+impl ModifyTableStamps {
+    /// Create MVCC stamp metadata for table mutation.
+    #[must_use]
+    pub fn new(
+        insert_xmin: Xid,
+        insert_command_id: CommandId,
+        delete_xmax: Xid,
+        delete_cmax: CommandId,
+    ) -> Self {
+        Self {
+            insert_xmin,
+            insert_command_id,
+            delete_xmax,
+            delete_cmax,
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // ModifyTable
 // ---------------------------------------------------------------------------
@@ -600,24 +631,17 @@ impl<L: PageLoader> ModifyTable<L> {
     /// - `relation_schema` — full column schema of the target relation
     ///   (used as the codec schema for INSERT).
     /// - `kind` — mutation kind.
-    /// - `insert_xmin` — XID to stamp as `xmin` on inserted tuples.
-    /// - `insert_command_id` — command id within the inserting transaction.
-    /// - `delete_xmax` — XID to stamp as `xmax` on deleted/updated tuples.
-    /// - `delete_cmax` — command id for deletes/updates.
+    /// - `stamps` — MVCC metadata to stamp on inserted/deleted tuple versions.
     /// - `wal` — optional WAL sink; `None` skips WAL emission.
     /// - `child` — source operator.
     #[must_use]
-    #[allow(clippy::too_many_arguments)]
     #[allow(clippy::similar_names)]
     pub fn new(
         heap: Arc<HeapAccess<L>>,
         relation: RelationId,
         relation_schema: Schema,
         kind: ModifyKind,
-        insert_xmin: Xid,
-        insert_command_id: CommandId,
-        delete_xmax: Xid,
-        delete_cmax: CommandId,
+        stamps: ModifyTableStamps,
         wal: Option<Arc<dyn WalSink>>,
         child: Box<dyn Operator>,
     ) -> Self {
@@ -646,10 +670,10 @@ impl<L: PageLoader> ModifyTable<L> {
             kind,
             update_evaluators,
             update_fast_path,
-            insert_xmin,
-            insert_command_id,
-            delete_xmax,
-            delete_cmax,
+            insert_xmin: stamps.insert_xmin,
+            insert_command_id: stamps.insert_command_id,
+            delete_xmax: stamps.delete_xmax,
+            delete_cmax: stamps.delete_cmax,
             wal,
             vm: None,
             insert_indexes: Vec::new(),
@@ -2284,10 +2308,10 @@ mod tests {
 
     use super::{
         DeleteIndexChange, InsertConflictAction, InsertIndexMaintainer, ModifyKind, ModifyTable,
-        UpdateFastPathInt32Pair, UpdateIndexChange, build_update_edits_int32_pair,
-        check_not_null_violations, columns_match_unordered, conflict_target_columns,
-        detect_update_int32_pair_fast_path, expand_insert_row, extract_tid_and_row,
-        extract_tids_from_batch, row_codec_error_to_exec, updated_ctid_target,
+        ModifyTableStamps, UpdateFastPathInt32Pair, UpdateIndexChange,
+        build_update_edits_int32_pair, check_not_null_violations, columns_match_unordered,
+        conflict_target_columns, detect_update_int32_pair_fast_path, expand_insert_row,
+        extract_tid_and_row, extract_tids_from_batch, row_codec_error_to_exec, updated_ctid_target,
     };
     use crate::eval::Eval;
     use crate::mem_table_scan::MemTableScan;
@@ -2418,6 +2442,15 @@ mod tests {
         TupleId::new(PageId::new(rel(), BlockNumber::new(block)), slot)
     }
 
+    fn stamps(xid: u64) -> ModifyTableStamps {
+        ModifyTableStamps::new(
+            Xid::new(xid),
+            CommandId::FIRST,
+            Xid::new(xid),
+            CommandId::FIRST,
+        )
+    }
+
     fn tid_row_schema(relation_schema: &Schema) -> Schema {
         let mut fields = vec![
             Field::required("tid_block", DataType::Int32),
@@ -2486,10 +2519,7 @@ mod tests {
             rel(),
             schema,
             ModifyKind::Insert,
-            Xid::new(10),
-            CommandId::FIRST,
-            Xid::new(10),
-            CommandId::FIRST,
+            stamps(10),
             Some(Arc::clone(&wal) as Arc<dyn ultrasql_storage::wal_sink::WalSink>),
             Box::new(source),
         );
@@ -2525,10 +2555,7 @@ mod tests {
             rel(),
             schema,
             ModifyKind::Insert,
-            Xid::new(10),
-            CommandId::FIRST,
-            Xid::new(10),
-            CommandId::FIRST,
+            stamps(10),
             None,
             Box::new(source),
         );
@@ -2561,10 +2588,7 @@ mod tests {
             rel(),
             schema,
             ModifyKind::Insert,
-            Xid::new(20),
-            CommandId::FIRST,
-            Xid::new(20),
-            CommandId::FIRST,
+            stamps(20),
             Some(Arc::clone(&wal) as Arc<dyn ultrasql_storage::wal_sink::WalSink>),
             Box::new(source),
         );
@@ -2590,10 +2614,7 @@ mod tests {
             rel(),
             schema,
             ModifyKind::Insert,
-            Xid::new(30),
-            CommandId::FIRST,
-            Xid::new(30),
-            CommandId::FIRST,
+            stamps(30),
             None,
             Box::new(source),
         );
@@ -2619,10 +2640,7 @@ mod tests {
             rel(),
             schema,
             ModifyKind::Insert,
-            Xid::new(1),
-            CommandId::FIRST,
-            Xid::new(1),
-            CommandId::FIRST,
+            stamps(1),
             None,
             Box::new(source),
         );
@@ -2658,10 +2676,7 @@ mod tests {
             rel(),
             schema,
             ModifyKind::Insert,
-            Xid::new(1),
-            CommandId::FIRST,
-            Xid::new(1),
-            CommandId::FIRST,
+            stamps(1),
             None,
             Box::new(source),
         )
@@ -2919,10 +2934,7 @@ mod tests {
             rel(),
             target_schema,
             ModifyKind::Insert,
-            Xid::new(11),
-            CommandId::FIRST,
-            Xid::new(11),
-            CommandId::FIRST,
+            stamps(11),
             Some(wal),
             Box::new(source),
         )
@@ -2979,10 +2991,7 @@ mod tests {
             ModifyKind::Update {
                 assignments: vec![(1, lit_text("new"))],
             },
-            Xid::new(2),
-            CommandId::FIRST,
-            Xid::new(2),
-            CommandId::FIRST,
+            stamps(2),
             None,
             Box::new(update_source),
         )
@@ -3013,10 +3022,7 @@ mod tests {
             rel(),
             schema,
             ModifyKind::Delete,
-            Xid::new(3),
-            CommandId::FIRST,
-            Xid::new(3),
-            CommandId::FIRST,
+            stamps(3),
             None,
             Box::new(delete_source),
         )
@@ -3042,10 +3048,7 @@ mod tests {
             ModifyKind::Update {
                 assignments: vec![(1, lit_text("computed"))],
             },
-            Xid::new(4),
-            CommandId::FIRST,
-            Xid::new(4),
-            CommandId::FIRST,
+            stamps(4),
             None,
             Box::new(child),
         );
@@ -3110,10 +3113,7 @@ mod tests {
             rel(),
             schema.clone(),
             ModifyKind::Insert,
-            Xid::new(5),
-            CommandId::FIRST,
-            Xid::new(5),
-            CommandId::FIRST,
+            stamps(5),
             None,
             Box::new(MemTableScan::new(schema.clone(), vec![])),
         )
@@ -3130,10 +3130,7 @@ mod tests {
             rel(),
             schema.clone(),
             ModifyKind::Insert,
-            Xid::new(6),
-            CommandId::FIRST,
-            Xid::new(6),
-            CommandId::FIRST,
+            stamps(6),
             None,
             Box::new(MemTableScan::new(schema.clone(), vec![])),
         )
@@ -3165,10 +3162,7 @@ mod tests {
             rel(),
             schema.clone(),
             ModifyKind::Insert,
-            Xid::new(7),
-            CommandId::FIRST,
-            Xid::new(7),
-            CommandId::FIRST,
+            stamps(7),
             None,
             Box::new(MemTableScan::new(schema.clone(), vec![])),
         )
@@ -3182,10 +3176,7 @@ mod tests {
             rel(),
             schema.clone(),
             ModifyKind::Insert,
-            Xid::new(8),
-            CommandId::FIRST,
-            Xid::new(8),
-            CommandId::FIRST,
+            stamps(8),
             None,
             Box::new(MemTableScan::new(schema, vec![])),
         )
@@ -3209,10 +3200,7 @@ mod tests {
             rel(),
             int64_schema,
             ModifyKind::Insert,
-            Xid::new(9),
-            CommandId::FIRST,
-            Xid::new(9),
-            CommandId::FIRST,
+            stamps(9),
             None,
             Box::new(MemTableScan::new(
                 Schema::new([Field::required("seq", DataType::Int64)]).expect("source"),
@@ -3273,10 +3261,7 @@ mod tests {
             rel(),
             schema.clone(),
             ModifyKind::Insert,
-            Xid::new(12),
-            CommandId::FIRST,
-            Xid::new(12),
-            CommandId::FIRST,
+            stamps(12),
             None,
             Box::new(MemTableScan::new(schema.clone(), vec![])),
         )
@@ -3327,10 +3312,7 @@ mod tests {
             ModifyKind::Update {
                 assignments: vec![(0, lit_i32(2))],
             },
-            Xid::new(13),
-            CommandId::FIRST,
-            Xid::new(13),
-            CommandId::FIRST,
+            stamps(13),
             None,
             Box::new(MemTableScan::new(tid_row_schema(&schema), vec![])),
         )
@@ -3374,10 +3356,7 @@ mod tests {
             rel(),
             schema,
             ModifyKind::Delete,
-            Xid::new(14),
-            CommandId::FIRST,
-            Xid::new(14),
-            CommandId::FIRST,
+            stamps(14),
             None,
             Box::new(MemTableScan::new(
                 Schema::new([

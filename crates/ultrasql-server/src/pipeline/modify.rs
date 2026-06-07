@@ -12,9 +12,9 @@ use ultrasql_executor::fused_update::{
 };
 use ultrasql_executor::{
     Eval, Filter, InsertConflictAction, InsertIndexEncoder, InsertIndexMaintainer, ModifyKind,
-    ModifyTable, Operator, Project, RowCodec, RowConstraintCheck, RowUpdateConstraintCheck,
-    SeqScan, SequenceDefault, ValuesScan, VectorIndexEncoder, VectorIndexMaintainer,
-    eval_error_to_exec_error,
+    ModifyTable, ModifyTableStamps, Operator, Project, RowCodec, RowConstraintCheck,
+    RowUpdateConstraintCheck, SeqScan, SequenceDefault, ValuesScan, VectorIndexEncoder,
+    VectorIndexMaintainer, eval_error_to_exec_error,
 };
 use ultrasql_planner::{
     BinaryOp, LogicalIndexMethod, LogicalOnConflict, LogicalPlan, LogicalReferentialAction,
@@ -187,10 +187,7 @@ pub(super) fn lower_real_insert(
         rel,
         entry.schema.clone(),
         ModifyKind::Insert,
-        ctx.xid,
-        ctx.command_id,
-        ctx.xid,
-        ctx.command_id,
+        ModifyTableStamps::new(ctx.xid, ctx.command_id, ctx.xid, ctx.command_id),
         ctx.heap.wal_sink().cloned(),
         child,
     )
@@ -2037,10 +2034,7 @@ pub(super) fn lower_real_update(
         rel,
         entry.schema.clone(),
         ModifyKind::Update { assignments },
-        ctx.xid,
-        ctx.command_id,
-        ctx.xid,
-        ctx.command_id,
+        ModifyTableStamps::new(ctx.xid, ctx.command_id, ctx.xid, ctx.command_id),
         ctx.heap.wal_sink().cloned(),
         child,
     )
@@ -2214,10 +2208,7 @@ pub(super) fn lower_real_delete(
         rel,
         entry.schema.clone(),
         ModifyKind::Delete,
-        ctx.xid,
-        ctx.command_id,
-        ctx.xid,
-        ctx.command_id,
+        ModifyTableStamps::new(ctx.xid, ctx.command_id, ctx.xid, ctx.command_id),
         ctx.heap.wal_sink().cloned(),
         child,
     )
