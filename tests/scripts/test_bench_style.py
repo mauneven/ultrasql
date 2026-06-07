@@ -5,6 +5,7 @@ from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[2]
 BENCH_FILES = [
+    REPO / "crates" / "ultrasql-bench" / "src" / "bin" / "readme_render.rs",
     REPO / "crates" / "ultrasql-bench" / "src" / "bin" / "results_render.rs",
 ]
 NUMERIC_AS_CAST = re.compile(

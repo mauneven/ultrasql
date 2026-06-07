@@ -51,6 +51,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use clap::Parser;
+use num_traits::ToPrimitive;
 use serde::Deserialize;
 
 // ---------------------------------------------------------------------------
@@ -396,7 +397,11 @@ fn format_pct_slower(this_us: f64, baseline_us: f64) -> String {
     if pct < 900.0 {
         format!("{pct:.1}% slower")
     } else {
-        let pct_int = pct.round() as u64;
+        let pct_int = if pct.is_nan() {
+            0
+        } else {
+            pct.round().to_u64().unwrap_or(u64::MAX)
+        };
         format!("{}% slower", thousands(pct_int))
     }
 }
