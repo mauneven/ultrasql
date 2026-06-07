@@ -12,14 +12,6 @@
 //! in a plain `HashSet` and filtered during the "expected state"
 //! computation.
 
-#![allow(
-    clippy::cast_possible_truncation,
-    clippy::cast_possible_wrap,
-    clippy::cast_sign_loss,
-    clippy::cast_lossless,
-    reason = "integration test: index arithmetic against compile-time loop bounds"
-)]
-
 use std::collections::HashSet;
 use std::sync::Arc;
 
@@ -103,6 +95,18 @@ fn make_persistent_heap(loader: loader::MapLoader) -> HeapAccess<loader::MapLoad
 
 const fn rel() -> RelationId {
     RelationId::new(1)
+}
+
+fn usize_to_u64(value: usize) -> u64 {
+    u64::try_from(value).expect("test count must fit u64")
+}
+
+fn usize_to_u16(value: usize) -> u16 {
+    u16::try_from(value).expect("test slot index must fit u16")
+}
+
+fn usize_to_i32(value: usize) -> i32 {
+    i32::try_from(value).expect("test row index must fit i32")
 }
 
 fn insert_opts(xid: Xid, sink: &dyn ultrasql_storage::wal_sink::WalSink) -> InsertOptions<'_> {
@@ -263,10 +267,13 @@ fn crash_recovery_visible_tuples_match_committed_only() {
     // Committed deletes: xid_raw % 10 == 1 AND odd: 1, 11, 21, 31, 41 → 5 deletes.
     // Updates don't change the net visible count (old xmax = committing xid,
     // new tuple xmin = same committing xid, both visible rules apply).
-    let n_committed_deletes: u64 =
-        (1..=N_XIDS).filter(|&x| x % 2 == 1 && x % 10 == 1).count() as u64;
+    let n_committed_deletes =
+        usize_to_u64((1..=N_XIDS).filter(|&x| x % 2 == 1 && x % 10 == 1).count());
     let n_committed = N_XIDS / 2; // 25 committed xids
-    let expected = n_committed * (INSERTS_PER_XID as u64) - n_committed_deletes;
+    let expected = n_committed
+        .checked_mul(usize_to_u64(INSERTS_PER_XID))
+        .and_then(|count| count.checked_sub(n_committed_deletes))
+        .expect("expected visible tuple count must fit u64");
 
     assert_eq!(
         visible, expected,
@@ -300,7 +307,7 @@ fn proptest_page_tuple_round_trips() {
             let mut tuple_bytes = vec![0_u8; TUPLE_HEADER_SIZE + payload.len()];
             let tid = TupleId::new(
                 PageId::new(RelationId::new(1), BlockNumber::new(0)),
-                i as u16,
+                usize_to_u16(i),
             );
             let hdr = TupleHeader::fresh(Xid::new(1), CommandId::FIRST, tid, 0);
             hdr.encode(&mut tuple_bytes[..TUPLE_HEADER_SIZE]);
@@ -323,7 +330,9 @@ fn proptest_page_tuple_round_trips() {
 
         // Read back every inserted tuple and compare bytes.
         for (slot, expected_bytes) in expected.iter().enumerate() {
-            let actual = page.read_tuple(slot as u16).expect("slot must be readable");
+            let actual = page
+                .read_tuple(usize_to_u16(slot))
+                .expect("slot must be readable");
             prop_assert_eq!(actual, expected_bytes.as_slice());
         }
     });
@@ -380,8 +389,8 @@ fn crash_recovery_in_place_update_restores_post_image_and_undo_log() {
     {
         let heap = make_persistent_heap(loader::MapLoader::new());
         for i in 0..ROWS {
-            let id = i as i32;
-            let val = i as i32 * 10;
+            let id = usize_to_i32(i);
+            let val = id.checked_mul(10).expect("test row value must fit i32");
             original_pairs.push((id, val));
             let bytes = pair_payload(id, val);
             heap.insert(rel(), &bytes, insert_opts(Xid::new(1), sink.as_ref()))
@@ -513,7 +522,9 @@ fn crash_recovery_in_place_delete_stamps_xmax() {
     {
         let heap = make_persistent_heap(loader::MapLoader::new());
         for i in 0..ROWS {
-            let bytes = pair_payload(i as i32, (i as i32) * 7);
+            let id = usize_to_i32(i);
+            let val = id.checked_mul(7).expect("test row value must fit i32");
+            let bytes = pair_payload(id, val);
             heap.insert(rel(), &bytes, insert_opts(Xid::new(1), sink.as_ref()))
                 .expect("insert");
         }
