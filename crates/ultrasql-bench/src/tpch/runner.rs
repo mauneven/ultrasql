@@ -13,6 +13,7 @@ use std::collections::BTreeSet;
 use anyhow::Result;
 #[cfg(not(feature = "sql-bench"))]
 use anyhow::bail;
+use num_traits::ToPrimitive;
 
 #[cfg(feature = "pg-runner")]
 use anyhow::Context;
@@ -567,7 +568,7 @@ pub fn geometric_mean(result: &RunResult) -> f64 {
             }
         })
         .sum();
-    let n = result.timings.len() as f64;
+    let n = result.timings.len().to_f64().unwrap_or(f64::MAX);
     (log_sum / n).exp()
 }
 

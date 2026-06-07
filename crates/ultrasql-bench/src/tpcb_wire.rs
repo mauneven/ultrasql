@@ -6,6 +6,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
+use num_traits::ToPrimitive;
 use serde::Serialize;
 use tokio::task::JoinSet;
 use tokio_postgres::{Client, NoTls};
@@ -52,7 +53,7 @@ async fn run(args: TpcbArgs) -> Result<()> {
     ultrasql_bench::sort_f64_nan_last(&mut latencies);
     let elapsed_secs = measured.elapsed.as_secs_f64();
     let throughput_per_sec = if elapsed_secs > 0.0 {
-        measured.transactions as f64 / elapsed_secs
+        measured.transactions.to_f64().unwrap_or(f64::MAX) / elapsed_secs
     } else {
         0.0
     };

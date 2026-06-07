@@ -380,7 +380,8 @@ pub fn run_filtered_vector_search(
     let ann_latencies = sorted_copy(&ann_iterations_us);
     let recall_at_k = mean(&recall_iterations);
     let candidate_expansion_count = expansion_iterations.iter().copied().max().unwrap_or(0);
-    let filter_selectivity = filtered_rows as f64 / config.rows as f64;
+    let filter_selectivity =
+        filtered_rows.to_f64().unwrap_or(f64::MAX) / config.rows.to_f64().unwrap_or(f64::MAX);
 
     Ok(FilteredVectorArtifact {
         schema_version: 1,
@@ -480,8 +481,9 @@ pub fn run_vector_memory(
 
     let index_size_bytes = checked_add(hnsw_index_size_bytes, ivfflat_index_size_bytes)?;
     let memory_bytes = checked_add(index_size_bytes, vector_data_bytes)?;
-    let bytes_per_vector = memory_bytes as f64 / config.rows as f64;
-    let index_bytes_per_vector = index_size_bytes as f64 / config.rows as f64;
+    let row_count = config.rows.to_f64().unwrap_or(f64::MAX);
+    let bytes_per_vector = memory_bytes.to_f64().unwrap_or(f64::MAX) / row_count;
+    let index_bytes_per_vector = index_size_bytes.to_f64().unwrap_or(f64::MAX) / row_count;
 
     Ok(VectorMemoryArtifact {
         schema_version: 1,
@@ -738,7 +740,7 @@ fn recall_at_k(exact: &[usize], ann: &[usize]) -> f64 {
         .take(exact.len())
         .filter(|row_id| exact_set.contains(row_id))
         .count();
-    matches as f64 / exact.len() as f64
+    matches.to_f64().unwrap_or(f64::MAX) / exact.len().to_f64().unwrap_or(f64::MAX)
 }
 
 fn sorted_copy(values: &[f64]) -> Vec<f64> {
@@ -765,7 +767,7 @@ fn mean(values: &[f64]) -> f64 {
     if values.is_empty() {
         0.0
     } else {
-        values.iter().sum::<f64>() / values.len() as f64
+        values.iter().sum::<f64>() / values.len().to_f64().unwrap_or(f64::MAX)
     }
 }
 

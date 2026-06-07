@@ -178,7 +178,7 @@ pub fn run_hnsw_ann_benchmark(
     let recall_at_k = if recall_iterations.is_empty() {
         0.0
     } else {
-        recall_iterations.iter().sum::<f64>() / recall_iterations.len() as f64
+        recall_iterations.iter().sum::<f64>() / recall_iterations.len().to_f64().unwrap_or(f64::MAX)
     };
     let median_us = median_sorted(&sorted_latencies);
     let min_us = sorted_latencies.first().copied().unwrap_or(0.0);
@@ -341,7 +341,7 @@ fn recall_at_k(exact: &[usize], ann: &[usize]) -> f64 {
         .take(exact.len())
         .filter(|row_id| exact_set.contains(row_id))
         .count();
-    matches as f64 / exact.len() as f64
+    matches.to_f64().unwrap_or(f64::MAX) / exact.len().to_f64().unwrap_or(f64::MAX)
 }
 
 fn percentile_nearest_rank(sorted_values: &[f64], quantile: f64) -> f64 {

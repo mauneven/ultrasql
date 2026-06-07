@@ -15,6 +15,12 @@ ANN_FILES = [
     REPO / "crates" / "ultrasql-bench" / "src" / "ai_gauntlet.rs",
     REPO / "crates" / "ultrasql-bench" / "src" / "ann_vector.rs",
 ]
+BENCH_HELPER_FILES = ANN_FILES + [
+    REPO / "crates" / "ultrasql-bench" / "src" / "sysbench_wire.rs",
+    REPO / "crates" / "ultrasql-bench" / "src" / "tpcb_wire.rs",
+    REPO / "crates" / "ultrasql-bench" / "src" / "tpcc_wire.rs",
+    REPO / "crates" / "ultrasql-bench" / "src" / "tpch" / "runner.rs",
+]
 SQL_BENCH_FILES = [
     REPO / "crates" / "ultrasql-bench" / "src" / "bin" / "cross_compare_sql.rs",
 ]
@@ -31,6 +37,9 @@ NUMERIC_AS_CAST = re.compile(
     r"\bas\s+(?:usize|u8|u16|u32|u64|i8|i16|i32|i64|isize|f32|f64)\b|clippy::cast_"
 )
 BENCH_RUN_NUMERIC_CAST = re.compile(
+    r"\bas\s+(?:usize|u8|u16|u32|u64|u128|i8|i16|i32|i64|isize|f32|f64)\b|clippy::cast_"
+)
+BENCH_HELPER_NUMERIC_CAST = re.compile(
     r"\bas\s+(?:usize|u8|u16|u32|u64|u128|i8|i16|i32|i64|isize|f32|f64)\b|clippy::cast_"
 )
 TPCH_DATA_GEN_CAST = re.compile(r"\bas\s+(?:usize|u32|u8|char)\b")
@@ -124,6 +133,16 @@ class BenchStyleTests(unittest.TestCase):
             for line_no, line in enumerate(path.read_text().splitlines(), start=1):
                 code = line.split("//", maxsplit=1)[0]
                 if BENCH_RUN_NUMERIC_CAST.search(code):
+                    offenders.append(f"{path.relative_to(REPO)}:{line_no}: {line.strip()}")
+
+        self.assertEqual([], offenders)
+
+    def test_bench_helpers_use_checked_numeric_conversions(self) -> None:
+        offenders: list[str] = []
+        for path in BENCH_HELPER_FILES:
+            for line_no, line in enumerate(path.read_text().splitlines(), start=1):
+                code = line.split("//", maxsplit=1)[0]
+                if BENCH_HELPER_NUMERIC_CAST.search(code):
                     offenders.append(f"{path.relative_to(REPO)}:{line_no}: {line.strip()}")
 
         self.assertEqual([], offenders)
