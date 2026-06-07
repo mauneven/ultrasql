@@ -10,7 +10,9 @@ AGGREGATE_FILES = [
     REPO / "crates" / "ultrasql-executor" / "src" / "hash_aggregate.rs",
     REPO / "crates" / "ultrasql-executor" / "src" / "sort_aggregate.rs",
 ]
-INTEGER_AS_CAST = re.compile(r"\bas\s+(?:usize|u8|u16|u32|u64|i8|i16|i32|i64|isize)\b")
+INTEGER_AS_CAST = re.compile(
+    r"\bas\s+(?:usize|u8|u16|u32|u64|i8|i16|i32|i64|isize)\b|clippy::cast_"
+)
 
 
 class ExecutorStyleTests(unittest.TestCase):

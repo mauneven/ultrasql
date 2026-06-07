@@ -1343,12 +1343,6 @@ const fn dims_compatible(left: Option<u32>, right: Option<u32>) -> bool {
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
-#[allow(
-    clippy::cast_possible_truncation,
-    clippy::cast_possible_wrap,
-    clippy::cast_sign_loss,
-    reason = "tests: index arithmetic against compile-time-known loop bounds"
-)]
 mod tests {
     use std::collections::HashMap;
     use std::sync::Arc;

@@ -827,12 +827,6 @@ fn merge_into(left: &[(i64, u32)], right: &[(i64, u32)], out: &mut [(i64, u32)])
 }
 
 #[cfg(test)]
-#[allow(
-    clippy::cast_possible_truncation,
-    clippy::cast_possible_wrap,
-    clippy::cast_sign_loss,
-    reason = "tests: ad-hoc index arithmetic against compile-time-known loop bounds"
-)]
 mod tests {
     use ultrasql_core::{DataType, Field, Schema, Value};
     use ultrasql_planner::{BinaryOp, ScalarExpr};
