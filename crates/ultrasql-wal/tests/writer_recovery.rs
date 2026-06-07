@@ -20,7 +20,7 @@ fn build_record(i: u32) -> WalRecord {
     // have something to detect; the first 4 bytes hold the index.
     let mut payload = i.to_le_bytes().to_vec();
     payload.extend_from_slice(b"-- payload contents for record ");
-    payload.extend_from_slice(&[(i & 0xFF) as u8; 8]);
+    payload.extend_from_slice(&[i.to_le_bytes()[0]; 8]);
     WalRecord::new(
         RecordType::HeapInsert,
         Xid::new(u64::from(i + 1)),
