@@ -234,7 +234,14 @@ pub fn build_operator(
             join_type,
             condition,
             schema,
-        } => build_join(left, right, *join_type, condition, schema, data_source),
+        } => build_join(BuildJoinArgs {
+            left,
+            right,
+            join_type: *join_type,
+            condition,
+            schema,
+            data_source,
+        }),
 
         LogicalPlan::Aggregate {
             input,
@@ -448,15 +455,24 @@ fn apply_offset_after_top_k(
 /// - `On` condition, `Inner`, `LeftOuter`, `Semi`, or `Anti`: [`HashJoin`].
 /// - `On` condition, any other type: [`MergeJoin`] (assumes pre-sorted input).
 /// - `Using` pairs or `None` (CROSS): [`NestedLoopJoin`].
-#[allow(clippy::too_many_arguments)]
-fn build_join(
-    left: &LogicalPlan,
-    right: &LogicalPlan,
+struct BuildJoinArgs<'a> {
+    left: &'a LogicalPlan,
+    right: &'a LogicalPlan,
     join_type: LogicalJoinType,
-    condition: &LogicalJoinCondition,
-    schema: &Schema,
-    data_source: &dyn DataSource,
-) -> Result<Box<dyn Operator>, BuildError> {
+    condition: &'a LogicalJoinCondition,
+    schema: &'a Schema,
+    data_source: &'a dyn DataSource,
+}
+
+fn build_join(args: BuildJoinArgs<'_>) -> Result<Box<dyn Operator>, BuildError> {
+    let BuildJoinArgs {
+        left,
+        right,
+        join_type,
+        condition,
+        schema,
+        data_source,
+    } = args;
     let left_schema = left.schema().clone();
     let right_schema = right.schema().clone();
     let left_op = build_operator(left, data_source)?;
@@ -498,15 +514,15 @@ fn build_join(
                 }
             }
             // Non-equi predicate: use NestedLoopJoin with predicate.
-            build_nlj(
+            build_nlj(BuildNestedLoopJoinArgs {
                 left_op,
                 right_op,
-                Some(pred.clone()),
+                condition: Some(pred.clone()),
                 join_type,
-                schema.clone(),
+                schema: schema.clone(),
                 left_schema,
                 right_schema,
-            )
+            })
         }
         LogicalJoinCondition::Using(pairs) => {
             // Translate USING pairs into a composite equality predicate.
@@ -519,15 +535,15 @@ fn build_join(
                 LogicalJoinType::RightOuter | LogicalJoinType::FullOuter
             )
             .then(|| using_projection_exprs(pairs, &left_schema, &right_schema, join_type));
-            let joined = build_nlj(
+            let joined = build_nlj(BuildNestedLoopJoinArgs {
                 left_op,
                 right_op,
-                cond,
+                condition: cond,
                 join_type,
-                exec_schema,
+                schema: exec_schema,
                 left_schema,
                 right_schema,
-            )?;
+            })?;
             if let Some(exprs) = projection_exprs {
                 return ProjectExprs::new(joined, &exprs, schema.clone())
                     .map(|project| Box::new(project) as Box<dyn Operator>)
@@ -539,15 +555,15 @@ fn build_join(
         }
         LogicalJoinCondition::None => {
             // CROSS JOIN: no condition.
-            build_nlj(
+            build_nlj(BuildNestedLoopJoinArgs {
                 left_op,
                 right_op,
-                None,
+                condition: None,
                 join_type,
-                schema.clone(),
+                schema: schema.clone(),
                 left_schema,
                 right_schema,
-            )
+            })
         }
     }
 }
@@ -665,8 +681,7 @@ fn build_using_predicate(
 /// The right child is materialised once and replayed via a factory closure
 /// that clones the `Arc`-backed batch list. This is O(|right|) per left row;
 /// a future wave will add operator spooling for cheaper right re-scans.
-#[allow(clippy::too_many_arguments)]
-fn build_nlj(
+struct BuildNestedLoopJoinArgs {
     left_op: Box<dyn Operator>,
     right_op: Box<dyn Operator>,
     condition: Option<ScalarExpr>,
@@ -674,7 +689,18 @@ fn build_nlj(
     schema: Schema,
     left_schema: Schema,
     right_schema: Schema,
-) -> Result<Box<dyn Operator>, BuildError> {
+}
+
+fn build_nlj(args: BuildNestedLoopJoinArgs) -> Result<Box<dyn Operator>, BuildError> {
+    let BuildNestedLoopJoinArgs {
+        left_op,
+        right_op,
+        condition,
+        join_type,
+        schema,
+        left_schema,
+        right_schema,
+    } = args;
     // Drain the right side into memory so we can replay it cheaply.
     let mut batches: Vec<Batch> = Vec::new();
     let mut right_op = right_op;
