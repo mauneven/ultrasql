@@ -11,6 +11,8 @@
 use std::path::Path;
 
 use anyhow::{Context, Result, bail};
+#[cfg(any(feature = "pg-runner", feature = "sql-bench"))]
+use num_traits::ToPrimitive;
 
 #[cfg(any(feature = "pg-runner", feature = "sql-bench"))]
 use bytes::Bytes;
@@ -1144,6 +1146,22 @@ fn q8_i64_to_f64(value: i64) -> f64 {
         })
 }
 
+#[cfg(any(feature = "pg-runner", feature = "sql-bench"))]
+fn tpch_u64_to_f64(value: u64) -> f64 {
+    value.to_f64().unwrap_or(f64::MAX)
+}
+
+#[cfg(feature = "sql-bench")]
+fn tpch_i128_to_f64(value: i128) -> f64 {
+    value.to_f64().unwrap_or_else(|| {
+        if value.is_negative() {
+            f64::MIN
+        } else {
+            f64::MAX
+        }
+    })
+}
+
 #[cfg(feature = "sql-bench")]
 #[derive(Debug, Default)]
 struct TpchQ9BuildState {
@@ -1846,7 +1864,7 @@ impl TpchQ14BuildState {
         let promo_revenue = if self.total_volume == 0 {
             0.0
         } else {
-            100.0 * self.promo_volume as f64 / self.total_volume as f64
+            100.0 * tpch_i128_to_f64(self.promo_volume) / tpch_i128_to_f64(self.total_volume)
         };
         vec![ultrasql_server::TpchQ14ResultRow { promo_revenue }]
     }
@@ -2218,7 +2236,7 @@ impl TpchQ17BuildState {
                 revenue_sum += i128::from(line.extendedprice);
             }
         }
-        let avg_yearly = revenue_sum as f64 / 700.0;
+        let avg_yearly = tpch_i128_to_f64(revenue_sum) / 700.0;
         vec![ultrasql_server::TpchQ17ResultRow { avg_yearly }]
     }
 
@@ -3095,7 +3113,7 @@ pub fn load_postgres(
 
     let elapsed = t0.elapsed().as_secs_f64();
     let rows_per_sec = if elapsed > 0.0 {
-        inserted as f64 / elapsed
+        tpch_u64_to_f64(inserted) / elapsed
     } else {
         0.0
     };
@@ -4185,7 +4203,7 @@ fn load_ultrasql_table_direct(
             if progress && total >= next_progress_rows {
                 let elapsed = t0.elapsed().as_secs_f64();
                 let rows_per_sec = if elapsed > 0.0 {
-                    total as f64 / elapsed
+                    tpch_u64_to_f64(total) / elapsed
                 } else {
                     0.0
                 };
@@ -4225,7 +4243,7 @@ fn load_ultrasql_table_direct(
 
     let elapsed = t0.elapsed().as_secs_f64();
     let rows_per_sec = if elapsed > 0.0 {
-        total as f64 / elapsed
+        tpch_u64_to_f64(total) / elapsed
     } else {
         0.0
     };
@@ -4572,14 +4590,14 @@ async fn load_ultrasql_table_copy(
             if progress && sent_bytes >= next_progress_bytes {
                 let elapsed = t0.elapsed().as_secs_f64();
                 let rows_per_sec = if elapsed > 0.0 {
-                    total as f64 / elapsed
+                    tpch_u64_to_f64(total) / elapsed
                 } else {
                     0.0
                 };
                 eprintln!(
                     "ultrasql tpch load: copying {table} ({} rows, {:.1} MiB sent, {:.0} rows/s)",
                     total,
-                    sent_bytes as f64 / (1024.0 * 1024.0),
+                    tpch_u64_to_f64(sent_bytes) / (1024.0 * 1024.0),
                     rows_per_sec
                 );
                 next_progress_bytes = sent_bytes.saturating_add(progress_bytes);
@@ -4602,7 +4620,7 @@ async fn load_ultrasql_table_copy(
         eprintln!(
             "ultrasql tpch load: finishing {table} COPY ({} rows, {:.1} MiB sent)",
             total,
-            sent_bytes as f64 / (1024.0 * 1024.0)
+            tpch_u64_to_f64(sent_bytes) / (1024.0 * 1024.0)
         );
     }
     let inserted = sink
@@ -4615,7 +4633,7 @@ async fn load_ultrasql_table_copy(
 
     let elapsed = t0.elapsed().as_secs_f64();
     let rows_per_sec = if elapsed > 0.0 {
-        inserted as f64 / elapsed
+        tpch_u64_to_f64(inserted) / elapsed
     } else {
         0.0
     };
@@ -4660,7 +4678,7 @@ async fn load_ultrasql_table_insert(
 
     let elapsed = t0.elapsed().as_secs_f64();
     let rows_per_sec = if elapsed > 0.0 {
-        inserted as f64 / elapsed
+        tpch_u64_to_f64(inserted) / elapsed
     } else {
         0.0
     };
