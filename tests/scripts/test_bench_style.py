@@ -36,6 +36,7 @@ CROSS_CONCURRENCY_MEASURE_WIDTH_CAST = re.compile(r"\bmeasure_secs\s+as\s+usize\
 SELECT_AVG_ITERATION_WIDTH_CAST = re.compile(r"\bctx\.iterations\s+as\s+usize\b")
 SELECT_SUM_ITERATION_WIDTH_CAST = re.compile(r"\bctx\.iterations\s+as\s+usize\b")
 FILTER_SUM_ITERATION_WIDTH_CAST = re.compile(r"\bctx\.iterations\s+as\s+usize\b")
+POINT_LOOKUP_ITERATION_WIDTH_CAST = re.compile(r"\bctx\.iterations\s+as\s+usize\b")
 
 
 class BenchStyleTests(unittest.TestCase):
@@ -191,6 +192,16 @@ class BenchStyleTests(unittest.TestCase):
         for line_no, line in enumerate(path.read_text().splitlines(), start=1):
             code = line.split("//", maxsplit=1)[0]
             if FILTER_SUM_ITERATION_WIDTH_CAST.search(code):
+                offenders.append(f"{path.relative_to(REPO)}:{line_no}: {line.strip()}")
+
+        self.assertEqual([], offenders)
+
+    def test_point_lookup_uses_checked_iteration_width_conversions(self) -> None:
+        offenders: list[str] = []
+        path = REPO / "crates" / "ultrasql-bench" / "src" / "runs" / "point_lookup.rs"
+        for line_no, line in enumerate(path.read_text().splitlines(), start=1):
+            code = line.split("//", maxsplit=1)[0]
+            if POINT_LOOKUP_ITERATION_WIDTH_CAST.search(code):
                 offenders.append(f"{path.relative_to(REPO)}:{line_no}: {line.strip()}")
 
         self.assertEqual([], offenders)
