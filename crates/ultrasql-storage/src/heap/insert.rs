@@ -422,11 +422,6 @@ impl<L: PageLoader> HeapAccess<L> {
     /// final post-batch free space (and the page guard is released
     /// before the FSM/VM lookup).
     ///
-    /// Clippy's `significant_drop_tightening` would prefer the
-    /// [`PageWrite`](crate::buffer_pool::PageWrite) be dropped before
-    /// the closing brace, but `page_bytes` borrows from `page`, so the
-    /// borrow checker requires the guard to live until function exit.
-    #[allow(clippy::significant_drop_tightening)]
     pub(super) fn batch_fill_page(
         pool: &Arc<BufferPool<L>>,
         page_id: PageId,
@@ -436,80 +431,86 @@ impl<L: PageLoader> HeapAccess<L> {
         opts: InsertOptions<'_>,
         n_atts: u16,
     ) -> Result<usize, HeapError> {
-        let guard = pool.get_page(page_id)?;
-        let mut page = guard.write();
-        let mut filled: usize = 0;
+        let filled = {
+            let guard = pool.get_page(page_id)?;
+            let mut page = guard.write();
+            let mut filled: usize = 0;
 
-        // Decode the page header ONCE and drive every per-row insert
-        // by mutating local `lower`/`upper`/`slot_count` cursors. The
-        // header is re-encoded into the page bytes a single time, at
-        // the end of the loop, instead of once per row. For a 4 096-
-        // tuple bulk insert this drops ~4 096 `header.decode` +
-        // 4 096 `header.encode` round-trips down to one of each.
-        let mut header = page.header();
-        let mut cur_lower = usize::from(header.lower);
-        let mut cur_upper = usize::from(header.upper);
+            // Decode the page header ONCE and drive every per-row insert
+            // by mutating local `lower`/`upper`/`slot_count` cursors. The
+            // header is re-encoded into the page bytes a single time, at
+            // the end of the loop, instead of once per row. For a 4 096-
+            // tuple bulk insert this drops ~4 096 `header.decode` +
+            // 4 096 `header.encode` round-trips down to one of each.
+            let mut header = page.header();
+            let mut cur_lower = usize::from(header.lower);
+            let mut cur_upper = usize::from(header.upper);
 
-        for row in &rows[row_idx..] {
-            let tuple_size = TUPLE_HEADER_SIZE
-                .checked_add(row.len())
-                .ok_or(HeapError::MalformedHeader("tuple size overflow"))?;
-            let needed = checked_tuple_space_needed(tuple_size)?;
+            for row in &rows[row_idx..] {
+                let tuple_size = TUPLE_HEADER_SIZE
+                    .checked_add(row.len())
+                    .ok_or(HeapError::MalformedHeader("tuple size overflow"))?;
+                let needed = checked_tuple_space_needed(tuple_size)?;
 
-            // Fast-path: skip pages that obviously cannot hold this tuple.
-            let free = cur_upper.saturating_sub(cur_lower);
-            if free < needed {
-                break;
+                // Fast-path: skip pages that obviously cannot hold this tuple.
+                let free = cur_upper.saturating_sub(cur_lower);
+                if free < needed {
+                    break;
+                }
+                let tuple_len_u32 = u32::try_from(tuple_size).map_err(|_| {
+                    HeapError::Page(PageError::Malformed("tuple too large for page"))
+                })?;
+                if tuple_len_u32 > ItemId::MAX_LENGTH {
+                    return Err(HeapError::Page(PageError::Malformed(
+                        "tuple length exceeds itemid",
+                    )));
+                }
+
+                // Slot is predictable: `insert_tuple_appended` always uses
+                // `slot_count` as the new slot id. We compute it from the
+                // local `lower` cursor and bake the final `ctid` into the
+                // tuple header up front so no post-insert patch is needed.
+                let slot_count = appended_slot_count(cur_lower)?;
+                let final_tid = TupleId::new(page_id, slot_count);
+                let tuple_header =
+                    TupleHeader::fresh(opts.xmin, opts.command_id, final_tid, n_atts);
+
+                // Reserve `tuple_size` bytes at the top of the page body.
+                cur_upper = cur_upper
+                    .checked_sub(tuple_size)
+                    .ok_or(HeapError::MalformedHeader("page upper underflow"))?;
+                let page_bytes = page.as_bytes_mut();
+                // Encode the tuple header directly into the page bytes
+                // (zero scratch copy).
+                tuple_header.encode(&mut page_bytes[cur_upper..cur_upper + TUPLE_HEADER_SIZE]);
+                // Copy the row body straight in.
+                page_bytes[cur_upper + TUPLE_HEADER_SIZE..cur_upper + tuple_size]
+                    .copy_from_slice(row);
+
+                // Write the slot's `ItemId` (4 bytes) inline.
+                let item = ItemId::new(
+                    item_offset_from_cursor(cur_upper)?,
+                    tuple_len_u32,
+                    ItemIdFlags::Normal,
+                );
+                let id_off = Page::item_id_offset(slot_count);
+                page_bytes[id_off..id_off + ITEMID_SIZE]
+                    .copy_from_slice(&item.into_raw().to_le_bytes());
+
+                cur_lower += ITEMID_SIZE;
+                out.push(final_tid);
+                filled += 1;
             }
-            let tuple_len_u32 = u32::try_from(tuple_size)
-                .map_err(|_| HeapError::Page(PageError::Malformed("tuple too large for page")))?;
-            if tuple_len_u32 > ItemId::MAX_LENGTH {
-                return Err(HeapError::Page(PageError::Malformed(
-                    "tuple length exceeds itemid",
-                )));
+
+            // Re-encode the page header once, outside the per-tuple loop.
+            if filled > 0 {
+                header.lower = header_bound_from_cursor(cur_lower, "page lower overflow")?;
+                header.upper = header_bound_from_cursor(cur_upper, "page upper overflow")?;
+                header.encode(page.as_bytes_mut());
             }
 
-            // Slot is predictable: `insert_tuple_appended` always uses
-            // `slot_count` as the new slot id. We compute it from the
-            // local `lower` cursor and bake the final `ctid` into the
-            // tuple header up front so no post-insert patch is needed.
-            let slot_count = appended_slot_count(cur_lower)?;
-            let final_tid = TupleId::new(page_id, slot_count);
-            let tuple_header = TupleHeader::fresh(opts.xmin, opts.command_id, final_tid, n_atts);
-
-            // Reserve `tuple_size` bytes at the top of the page body.
-            cur_upper = cur_upper
-                .checked_sub(tuple_size)
-                .ok_or(HeapError::MalformedHeader("page upper underflow"))?;
-            let page_bytes = page.as_bytes_mut();
-            // Encode the tuple header directly into the page bytes
-            // (zero scratch copy).
-            tuple_header.encode(&mut page_bytes[cur_upper..cur_upper + TUPLE_HEADER_SIZE]);
-            // Copy the row body straight in.
-            page_bytes[cur_upper + TUPLE_HEADER_SIZE..cur_upper + tuple_size].copy_from_slice(row);
-
-            // Write the slot's `ItemId` (4 bytes) inline.
-            let item = ItemId::new(
-                item_offset_from_cursor(cur_upper)?,
-                tuple_len_u32,
-                ItemIdFlags::Normal,
-            );
-            let id_off = Page::item_id_offset(slot_count);
-            page_bytes[id_off..id_off + ITEMID_SIZE]
-                .copy_from_slice(&item.into_raw().to_le_bytes());
-
-            cur_lower += ITEMID_SIZE;
-            out.push(final_tid);
-            filled += 1;
-        }
-
-        // Re-encode the page header once, outside the per-tuple loop.
-        if filled > 0 {
-            header.lower = header_bound_from_cursor(cur_lower, "page lower overflow")?;
-            header.upper = header_bound_from_cursor(cur_upper, "page upper overflow")?;
-            header.encode(page.as_bytes_mut());
-        }
-
+            filled
+        };
         Ok(filled)
     }
 
@@ -607,13 +608,6 @@ impl<L: PageLoader> HeapAccess<L> {
     /// the per-frame write lock is released the instant this
     /// function returns.
     ///
-    /// Clippy's `significant_drop_tightening` would prefer the
-    /// [`PageWrite`](crate::buffer_pool::PageWrite) be dropped before
-    /// the closing brace, but the `page_bytes` slice in this function
-    /// borrows from `page`, so the borrow checker requires the guard
-    /// to live until the slice is no longer in use — i.e. function
-    /// exit.
-    #[allow(clippy::significant_drop_tightening)]
     pub(super) fn insert_into_pinned(
         guard: &PageGuard<L>,
         page_id: PageId,
@@ -622,39 +616,43 @@ impl<L: PageLoader> HeapAccess<L> {
         n_atts: u16,
         tuple_size: usize,
     ) -> Result<TupleId, HeapError> {
-        let mut page = guard.write();
+        let final_tid = {
+            let mut page = guard.write();
 
-        // Skip pages that obviously cannot hold this tuple to save
-        // the construction of the header buffer.
-        let free = page.header().free_space();
-        if free < tuple_size + crate::page::ITEMID_SIZE {
-            return Err(HeapError::Page(PageError::NoSpace {
-                needed: tuple_size + crate::page::ITEMID_SIZE,
-                available: free,
-            }));
-        }
+            // Skip pages that obviously cannot hold this tuple to save
+            // the construction of the header buffer.
+            let free = page.header().free_space();
+            if free < tuple_size + crate::page::ITEMID_SIZE {
+                return Err(HeapError::Page(PageError::NoSpace {
+                    needed: tuple_size + crate::page::ITEMID_SIZE,
+                    available: free,
+                }));
+            }
 
-        // Build the tuple bytes: header || payload. We don't know
-        // the final slot yet, so the header's ctid initially points
-        // at slot 0; we patch it after `insert_tuple` returns the
-        // assigned slot.
-        let mut tuple_bytes = Vec::with_capacity(tuple_size);
-        tuple_bytes.resize(TUPLE_HEADER_SIZE, 0);
-        let tentative_tid = TupleId::new(page_id, 0);
-        let header = TupleHeader::fresh(opts.xmin, opts.command_id, tentative_tid, n_atts);
-        header.encode(&mut tuple_bytes[..TUPLE_HEADER_SIZE]);
-        tuple_bytes.extend_from_slice(payload);
+            // Build the tuple bytes: header || payload. We don't know
+            // the final slot yet, so the header's ctid initially points
+            // at slot 0; we patch it after `insert_tuple` returns the
+            // assigned slot.
+            let mut tuple_bytes = Vec::with_capacity(tuple_size);
+            tuple_bytes.resize(TUPLE_HEADER_SIZE, 0);
+            let tentative_tid = TupleId::new(page_id, 0);
+            let header = TupleHeader::fresh(opts.xmin, opts.command_id, tentative_tid, n_atts);
+            header.encode(&mut tuple_bytes[..TUPLE_HEADER_SIZE]);
+            tuple_bytes.extend_from_slice(payload);
 
-        let slot = page.insert_tuple(&tuple_bytes)?;
+            let slot = page.insert_tuple(&tuple_bytes)?;
 
-        // Patch the header's ctid to point at the assigned slot.
-        let final_tid = TupleId::new(page_id, slot);
-        let mut patched_header = header;
-        patched_header.ctid = final_tid;
-        let header_bytes = Self::collect_header_bytes(&patched_header);
-        let page_bytes = page.as_bytes_mut();
-        let (slot_offset, _) = Self::slot_window(page_bytes, slot)?;
-        page_bytes[slot_offset..slot_offset + TUPLE_HEADER_SIZE].copy_from_slice(&header_bytes);
+            // Patch the header's ctid to point at the assigned slot.
+            let final_tid = TupleId::new(page_id, slot);
+            let mut patched_header = header;
+            patched_header.ctid = final_tid;
+            let header_bytes = Self::collect_header_bytes(&patched_header);
+            let page_bytes = page.as_bytes_mut();
+            let (slot_offset, _) = Self::slot_window(page_bytes, slot)?;
+            page_bytes[slot_offset..slot_offset + TUPLE_HEADER_SIZE].copy_from_slice(&header_bytes);
+
+            final_tid
+        };
         Ok(final_tid)
     }
 }
