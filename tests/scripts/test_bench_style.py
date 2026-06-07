@@ -9,6 +9,7 @@ BENCH_FILES = [
     REPO / "crates" / "ultrasql-bench" / "src" / "bin" / "results_render.rs",
 ]
 ANN_FILES = [
+    REPO / "crates" / "ultrasql-bench" / "src" / "ai_gauntlet.rs",
     REPO / "crates" / "ultrasql-bench" / "src" / "ann_vector.rs",
 ]
 NUMERIC_AS_CAST = re.compile(
