@@ -116,6 +116,27 @@ struct CopyRejectState {
     target: Option<CopyRejectTarget>,
 }
 
+struct CopyTextFileStreamArgs<'a> {
+    entry: &'a TableEntry,
+    columns: &'a [usize],
+    schema: &'a Schema,
+    opts: &'a CopyOptions,
+    codec: &'a RowCodec,
+    txn: &'a Transaction,
+    reader: &'a mut dyn BufRead,
+    payload_batch: &'a mut Vec<Vec<u8>>,
+    reject_state: Option<&'a mut CopyRejectState>,
+    path: &'a str,
+}
+
+struct CopyRowDecodeContext<'a> {
+    entry: &'a TableEntry,
+    columns: &'a [usize],
+    schema: &'a Schema,
+    codec: &'a RowCodec,
+    jsonb_shape_cache: &'a mut JsonbShapeCache,
+}
+
 impl<RW> Session<RW>
 where
     RW: AsyncRead + AsyncWrite + Unpin,
@@ -521,12 +542,14 @@ where
                             let mut jsonb_shape_cache = self.jsonb_shape_cache.borrow_mut();
                             decode_one_copy_row(
                                 &buffer[start..end],
-                                entry,
-                                columns,
-                                schema,
-                                &codec,
                                 opts,
-                                &mut jsonb_shape_cache,
+                                CopyRowDecodeContext {
+                                    entry,
+                                    columns,
+                                    schema,
+                                    codec: &codec,
+                                    jsonb_shape_cache: &mut jsonb_shape_cache,
+                                },
                             )
                         };
                         start = end;
@@ -608,12 +631,14 @@ where
                     let mut jsonb_shape_cache = self.jsonb_shape_cache.borrow_mut();
                     decode_one_copy_row(
                         &line,
-                        entry,
-                        columns,
-                        schema,
-                        &codec,
                         opts,
-                        &mut jsonb_shape_cache,
+                        CopyRowDecodeContext {
+                            entry,
+                            columns,
+                            schema,
+                            codec: &codec,
+                            jsonb_shape_cache: &mut jsonb_shape_cache,
+                        },
                     )
                 };
                 match decoded {
@@ -747,18 +772,18 @@ where
         let mut payload_batch: Vec<Vec<u8>> = Vec::with_capacity(COPY_INSERT_BATCH_ROWS);
         let mut reject_state = self.copy_reject_state(&effective_opts)?;
 
-        let stream_result = self.copy_text_file_stream_into_table(
+        let stream_result = self.copy_text_file_stream_into_table(CopyTextFileStreamArgs {
             entry,
             columns,
             schema,
-            &effective_opts,
-            &codec,
-            &txn,
-            &mut reader,
-            &mut payload_batch,
-            reject_state.as_mut(),
+            opts: &effective_opts,
+            codec: &codec,
+            txn: &txn,
+            reader: &mut reader,
+            payload_batch: &mut payload_batch,
+            reject_state: reject_state.as_mut(),
             path,
-        );
+        });
         let rows = match stream_result {
             Ok(rows) => rows,
             Err(err) => {
@@ -888,20 +913,22 @@ where
         Ok(())
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn copy_text_file_stream_into_table(
         &self,
-        entry: &TableEntry,
-        columns: &[usize],
-        schema: &Schema,
-        opts: &CopyOptions,
-        codec: &RowCodec,
-        txn: &Transaction,
-        reader: &mut dyn BufRead,
-        payload_batch: &mut Vec<Vec<u8>>,
-        mut reject_state: Option<&mut CopyRejectState>,
-        path: &str,
+        args: CopyTextFileStreamArgs<'_>,
     ) -> Result<u64, ServerError> {
+        let CopyTextFileStreamArgs {
+            entry,
+            columns,
+            schema,
+            opts,
+            codec,
+            txn,
+            reader,
+            payload_batch,
+            mut reject_state,
+            path,
+        } = args;
         let mut rows_inserted = 0_u64;
         let mut header_skipped = !opts.header;
         let mut record = Vec::new();
@@ -937,12 +964,14 @@ where
                 let mut jsonb_shape_cache = self.jsonb_shape_cache.borrow_mut();
                 decode_one_copy_row(
                     &record,
-                    entry,
-                    columns,
-                    schema,
-                    codec,
                     opts,
-                    &mut jsonb_shape_cache,
+                    CopyRowDecodeContext {
+                        entry,
+                        columns,
+                        schema,
+                        codec,
+                        jsonb_shape_cache: &mut jsonb_shape_cache,
+                    },
                 )
             };
             let payload = match decoded {
@@ -988,12 +1017,14 @@ where
                     let mut jsonb_shape_cache = self.jsonb_shape_cache.borrow_mut();
                     decode_one_copy_row(
                         &record,
-                        entry,
-                        columns,
-                        schema,
-                        codec,
                         opts,
-                        &mut jsonb_shape_cache,
+                        CopyRowDecodeContext {
+                            entry,
+                            columns,
+                            schema,
+                            codec,
+                            jsonb_shape_cache: &mut jsonb_shape_cache,
+                        },
                     )
                 };
                 let payload = match decoded {
@@ -2024,27 +2055,15 @@ fn decode_binary_copy_cell(
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 fn decode_one_copy_row(
     line: &[u8],
-    entry: &TableEntry,
-    columns: &[usize],
-    schema: &Schema,
-    codec: &RowCodec,
     opts: &CopyOptions,
-    jsonb_shape_cache: &mut JsonbShapeCache,
+    mut context: CopyRowDecodeContext<'_>,
 ) -> Result<Vec<u8>, ServerError> {
     match opts.format {
         ServerCopyFormat::Csv if !line.contains(&b'"') => {
             let raw_cells = parse_unquoted_csv_row_slices(line, opts)?;
-            return decode_copy_cells_to_payload(
-                &raw_cells,
-                entry,
-                columns,
-                schema,
-                codec,
-                jsonb_shape_cache,
-            );
+            return decode_copy_cells_to_payload(&raw_cells, &mut context);
         }
         ServerCopyFormat::Text | ServerCopyFormat::Csv => {}
         ServerCopyFormat::Binary | ServerCopyFormat::Parquet => {
@@ -2059,18 +2078,17 @@ fn decode_one_copy_row(
         ServerCopyFormat::Binary | ServerCopyFormat::Parquet => unreachable!(),
     };
     let raw_cells = owned_cells.iter().map(Option::as_deref).collect::<Vec<_>>();
-    decode_copy_cells_to_payload(&raw_cells, entry, columns, schema, codec, jsonb_shape_cache)
+    decode_copy_cells_to_payload(&raw_cells, &mut context)
 }
 
-#[allow(clippy::too_many_arguments)]
 fn decode_copy_cells_to_payload(
     raw_cells: &[Option<&[u8]>],
-    entry: &TableEntry,
-    columns: &[usize],
-    schema: &Schema,
-    codec: &RowCodec,
-    jsonb_shape_cache: &mut JsonbShapeCache,
+    context: &mut CopyRowDecodeContext<'_>,
 ) -> Result<Vec<u8>, ServerError> {
+    let entry = context.entry;
+    let columns = context.columns;
+    let schema = context.schema;
+    let codec = context.codec;
     if raw_cells.len() != schema.len() {
         return Err(ServerError::CopyFormat(format!(
             "COPY FROM expected {} columns, got {}",
@@ -2083,13 +2101,18 @@ fn decode_copy_cells_to_payload(
     if columns.is_empty() {
         for (col_idx, raw) in raw_cells.iter().enumerate() {
             let field = entry.schema.field_at(col_idx);
-            row[col_idx] = decode_copy_cell(*raw, &field.data_type, col_idx, jsonb_shape_cache)?;
+            row[col_idx] =
+                decode_copy_cell(*raw, &field.data_type, col_idx, context.jsonb_shape_cache)?;
         }
     } else {
         for (stream_idx, (table_col_idx, raw)) in columns.iter().zip(raw_cells.iter()).enumerate() {
             let field = entry.schema.field_at(*table_col_idx);
-            row[*table_col_idx] =
-                decode_copy_cell(*raw, &field.data_type, stream_idx, jsonb_shape_cache)?;
+            row[*table_col_idx] = decode_copy_cell(
+                *raw,
+                &field.data_type,
+                stream_idx,
+                context.jsonb_shape_cache,
+            )?;
         }
     }
 
@@ -3124,41 +3147,35 @@ b"#
         let entry = entry_with_schema(table_schema.clone());
         let codec = RowCodec::new(table_schema.clone());
         let mut cache = JsonbShapeCache::default();
-        let payload = decode_copy_cells_to_payload(
-            &[Some(b"ada"), Some(b"7")],
-            &entry,
-            &[1, 0],
-            &stream_schema,
-            &codec,
-            &mut cache,
-        )
-        .expect("decode projected payload");
-        let decoded = codec.decode(&payload).expect("payload row");
-        assert_eq!(
-            decoded,
-            vec![Value::Int32(7), Value::Text("ada".to_owned()), Value::Null]
-        );
-        assert!(
-            decode_copy_cells_to_payload(
-                &[Some(b"ada")],
-                &entry,
-                &[1, 0],
-                &stream_schema,
-                &codec,
-                &mut cache,
-            )
-            .is_err()
-        );
+        {
+            let mut context = CopyRowDecodeContext {
+                entry: &entry,
+                columns: &[1, 0],
+                schema: &stream_schema,
+                codec: &codec,
+                jsonb_shape_cache: &mut cache,
+            };
+            let payload = decode_copy_cells_to_payload(&[Some(b"ada"), Some(b"7")], &mut context)
+                .expect("decode projected payload");
+            let decoded = codec.decode(&payload).expect("payload row");
+            assert_eq!(
+                decoded,
+                vec![Value::Int32(7), Value::Text("ada".to_owned()), Value::Null]
+            );
+            assert!(decode_copy_cells_to_payload(&[Some(b"ada")], &mut context).is_err());
+        }
 
         let opts = copy_opts(ServerCopyFormat::Csv);
         let payload = decode_one_copy_row(
             b"ada,7\n",
-            &entry,
-            &[1, 0],
-            &stream_schema,
-            &codec,
             &opts,
-            &mut cache,
+            CopyRowDecodeContext {
+                entry: &entry,
+                columns: &[1, 0],
+                schema: &stream_schema,
+                codec: &codec,
+                jsonb_shape_cache: &mut cache,
+            },
         )
         .expect("fast csv decode");
         assert_eq!(
@@ -3168,12 +3185,14 @@ b"#
         assert!(
             decode_one_copy_row(
                 b"ada,7\n",
-                &entry,
-                &[1, 0],
-                &stream_schema,
-                &codec,
                 &copy_opts(ServerCopyFormat::Binary),
-                &mut cache,
+                CopyRowDecodeContext {
+                    entry: &entry,
+                    columns: &[1, 0],
+                    schema: &stream_schema,
+                    codec: &codec,
+                    jsonb_shape_cache: &mut cache,
+                },
             )
             .is_err()
         );
