@@ -30,6 +30,7 @@ TPCH_Q22_COUNTRY_INDEX_CAST = re.compile(
     r"\bs\s+as\s+usize\s*>>\s*8\)\s*%\s*COUNTRY_CODES\.len\(\)"
 )
 TPCC_CHOOSE_INDEX_CAST = re.compile(r"\bseed\s+as\s+usize\)\s*%\s*cardinality\b")
+TPCC_SEED_WIDTH_CAST = re.compile(r"\b(?:client|tx)\s+as\s+u64\b")
 
 
 class BenchStyleTests(unittest.TestCase):
@@ -123,6 +124,16 @@ class BenchStyleTests(unittest.TestCase):
         for line_no, line in enumerate(path.read_text().splitlines(), start=1):
             code = line.split("//", maxsplit=1)[0]
             if TPCC_CHOOSE_INDEX_CAST.search(code):
+                offenders.append(f"{path.relative_to(REPO)}:{line_no}: {line.strip()}")
+
+        self.assertEqual([], offenders)
+
+    def test_tpcc_uses_checked_seed_width_conversions(self) -> None:
+        offenders: list[str] = []
+        path = REPO / "crates" / "ultrasql-bench" / "src" / "runs" / "tpcc.rs"
+        for line_no, line in enumerate(path.read_text().splitlines(), start=1):
+            code = line.split("//", maxsplit=1)[0]
+            if TPCC_SEED_WIDTH_CAST.search(code):
                 offenders.append(f"{path.relative_to(REPO)}:{line_no}: {line.strip()}")
 
         self.assertEqual([], offenders)

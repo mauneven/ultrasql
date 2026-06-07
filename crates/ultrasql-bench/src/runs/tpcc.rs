@@ -87,7 +87,10 @@ fn run_iteration(state: &TpccState, seed: u64) -> f64 {
         let mut handles = Vec::with_capacity(CLIENTS);
         for client in 0..CLIENTS {
             handles.push(scope.spawn(move || {
-                let client_seed = seed ^ ((client as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15));
+                let client_seed = seed
+                    ^ (u64::try_from(client)
+                        .unwrap_or(0)
+                        .wrapping_mul(0x9E37_79B9_7F4A_7C15));
                 run_client(state, client_seed)
             }));
         }
@@ -106,12 +109,13 @@ fn run_client(state: &TpccState, mut seed: u64) -> u64 {
     for tx in 0..TX_PER_CLIENT_ITER {
         seed = xorshift64(seed);
         let selector = (seed % 100) as u8;
+        let tx_seed = u64::try_from(tx).unwrap_or(0);
         checksum = checksum.wrapping_add(match transaction_kind(selector) {
-            TransactionKind::NewOrder => state.new_order(seed ^ tx as u64),
-            TransactionKind::Payment => state.payment(seed ^ tx as u64),
-            TransactionKind::OrderStatus => state.order_status(seed ^ tx as u64),
-            TransactionKind::Delivery => state.delivery(seed ^ tx as u64),
-            TransactionKind::StockLevel => state.stock_level(seed ^ tx as u64),
+            TransactionKind::NewOrder => state.new_order(seed ^ tx_seed),
+            TransactionKind::Payment => state.payment(seed ^ tx_seed),
+            TransactionKind::OrderStatus => state.order_status(seed ^ tx_seed),
+            TransactionKind::Delivery => state.delivery(seed ^ tx_seed),
+            TransactionKind::StockLevel => state.stock_level(seed ^ tx_seed),
         });
     }
     checksum
