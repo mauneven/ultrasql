@@ -127,28 +127,26 @@ impl VisibilityMap {
     }
 
     /// Set or clear the bits in `mask` for `block`.
-    #[allow(clippy::significant_drop_tightening)]
     fn set_bits(&self, rel: RelationId, block: BlockNumber, mask: u8, set: bool) {
-        // `entry` must outlive `vec` because `vec` borrows from it.
+        let Some((byte_idx, shift)) = byte_index_and_shift(block) else {
+            return;
+        };
         let entry = self
             .inner
             .entry(rel)
             .or_insert_with(|| RwLock::new(Vec::new()));
-        let mut vec = entry.write();
-        let Some((byte_idx, shift)) = byte_index_and_shift(block) else {
-            return;
-        };
-        if byte_idx >= vec.len() {
-            if !set {
-                // Clearing a bit that does not exist is a no-op.
-                return;
+        {
+            let mut vec = entry.write();
+            if byte_idx < vec.len() || set {
+                if byte_idx >= vec.len() {
+                    vec.resize(byte_idx + 1, 0);
+                }
+                if set {
+                    vec[byte_idx] |= mask << shift;
+                } else {
+                    vec[byte_idx] &= !(mask << shift);
+                }
             }
-            vec.resize(byte_idx + 1, 0);
-        }
-        if set {
-            vec[byte_idx] |= mask << shift;
-        } else {
-            vec[byte_idx] &= !(mask << shift);
         }
     }
 }
