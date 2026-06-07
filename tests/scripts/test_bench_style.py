@@ -37,6 +37,10 @@ TPCH_Q22_COUNTRY_INDEX_CAST = re.compile(
 TPCH_Q22_ITERATION_WIDTH_CAST = re.compile(r"\bctx\.iterations\s+as\s+usize\b")
 TPCC_CHOOSE_INDEX_CAST = re.compile(r"\bseed\s+as\s+usize\)\s*%\s*cardinality\b")
 TPCC_SEED_WIDTH_CAST = re.compile(r"\b(?:client|tx)\s+as\s+u64\b")
+TPCC_SELECTOR_WIDTH_CAST = re.compile(r"\(\s*seed\s*%\s*100\s*\)\s+as\s+u8\b")
+TPCC_CHECKSUM_WIDTH_CAST = re.compile(
+    r"\b(?:order_id|before|warehouse_ytd|district_ytd|balance|last_order|next_order|delivered_order)\s+as\s+u64\b"
+)
 TPCC_ITERATION_WIDTH_CAST = re.compile(r"\bctx\.iterations\s+as\s+usize\b")
 CROSS_CONCURRENCY_THREAD_WIDTH_CAST = re.compile(r"\btid\s+as\s+u64\b")
 CROSS_CONCURRENCY_MEASURE_WIDTH_CAST = re.compile(r"\bmeasure_secs\s+as\s+usize\b")
@@ -207,6 +211,26 @@ class BenchStyleTests(unittest.TestCase):
         for line_no, line in enumerate(path.read_text().splitlines(), start=1):
             code = line.split("//", maxsplit=1)[0]
             if TPCC_SEED_WIDTH_CAST.search(code):
+                offenders.append(f"{path.relative_to(REPO)}:{line_no}: {line.strip()}")
+
+        self.assertEqual([], offenders)
+
+    def test_tpcc_uses_checked_selector_width_conversions(self) -> None:
+        offenders: list[str] = []
+        path = REPO / "crates" / "ultrasql-bench" / "src" / "runs" / "tpcc.rs"
+        for line_no, line in enumerate(path.read_text().splitlines(), start=1):
+            code = line.split("//", maxsplit=1)[0]
+            if TPCC_SELECTOR_WIDTH_CAST.search(code):
+                offenders.append(f"{path.relative_to(REPO)}:{line_no}: {line.strip()}")
+
+        self.assertEqual([], offenders)
+
+    def test_tpcc_uses_checked_checksum_width_conversions(self) -> None:
+        offenders: list[str] = []
+        path = REPO / "crates" / "ultrasql-bench" / "src" / "runs" / "tpcc.rs"
+        for line_no, line in enumerate(path.read_text().splitlines(), start=1):
+            code = line.split("//", maxsplit=1)[0]
+            if TPCC_CHECKSUM_WIDTH_CAST.search(code):
                 offenders.append(f"{path.relative_to(REPO)}:{line_no}: {line.strip()}")
 
         self.assertEqual([], offenders)

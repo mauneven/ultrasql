@@ -109,7 +109,7 @@ fn run_client(state: &TpccState, mut seed: u64) -> u64 {
     let mut checksum = 0_u64;
     for tx in 0..TX_PER_CLIENT_ITER {
         seed = xorshift64(seed);
-        let selector = (seed % 100) as u8;
+        let selector = transaction_selector(seed);
         let tx_seed = u64::try_from(tx).unwrap_or(0);
         checksum = checksum.wrapping_add(match transaction_kind(selector) {
             TransactionKind::NewOrder => state.new_order(seed ^ tx_seed),
@@ -131,6 +131,10 @@ enum TransactionKind {
     StockLevel,
 }
 
+fn transaction_selector(seed: u64) -> u8 {
+    u8::try_from(seed % 100).unwrap_or(0)
+}
+
 fn transaction_kind(selector: u8) -> TransactionKind {
     match selector {
         0..=44 => TransactionKind::NewOrder,
@@ -139,6 +143,14 @@ fn transaction_kind(selector: u8) -> TransactionKind {
         92..=95 => TransactionKind::Delivery,
         _ => TransactionKind::StockLevel,
     }
+}
+
+fn checksum_usize(value: usize) -> u64 {
+    u64::try_from(value).unwrap_or(u64::MAX)
+}
+
+fn checksum_i64(value: i64) -> u64 {
+    u64::from_ne_bytes(value.to_ne_bytes())
 }
 
 struct TpccState {
@@ -176,7 +188,7 @@ impl TpccState {
         let order_id = self.district_next_order[district_index].fetch_add(1, Ordering::Relaxed);
         self.customer_last_order[customer_index].store(order_id, Ordering::Relaxed);
 
-        let mut checksum = order_id as u64;
+        let mut checksum = checksum_usize(order_id);
         for line in 0..5 {
             let item = choose(seed.rotate_left(line + 1), ITEMS);
             let stock_index = stock_index(warehouse, item);
@@ -184,7 +196,7 @@ impl TpccState {
             if before <= 0 {
                 self.stock_quantity[stock_index].store(100, Ordering::Relaxed);
             }
-            checksum = checksum.wrapping_add(before as u64);
+            checksum = checksum.wrapping_add(checksum_i64(before));
         }
         checksum
     }
@@ -199,7 +211,7 @@ impl TpccState {
         let warehouse_ytd = self.warehouse_ytd[warehouse].fetch_add(amount, Ordering::Relaxed);
         let district_ytd = self.district_ytd[district_index].fetch_add(amount, Ordering::Relaxed);
         let balance = self.customer_balance[customer_index].fetch_sub(amount, Ordering::Relaxed);
-        (warehouse_ytd as u64) ^ (district_ytd as u64) ^ (balance as u64)
+        checksum_i64(warehouse_ytd) ^ checksum_i64(district_ytd) ^ checksum_i64(balance)
     }
 
     fn order_status(&self, seed: u64) -> u64 {
@@ -211,7 +223,7 @@ impl TpccState {
         let balance = self.customer_balance[customer_index].load(Ordering::Relaxed);
         let last_order = self.customer_last_order[customer_index].load(Ordering::Relaxed);
         let next_order = self.district_next_order[district_index].load(Ordering::Relaxed);
-        (balance as u64) ^ (last_order as u64) ^ (next_order as u64)
+        checksum_i64(balance) ^ checksum_usize(last_order) ^ checksum_usize(next_order)
     }
 
     fn delivery(&self, seed: u64) -> u64 {
@@ -223,7 +235,7 @@ impl TpccState {
         let delivered_order =
             self.district_next_delivery[district_index].fetch_add(1, Ordering::Relaxed);
         let balance = self.customer_balance[customer_index].fetch_add(10, Ordering::Relaxed);
-        (delivered_order as u64) ^ (balance as u64)
+        checksum_usize(delivered_order) ^ checksum_i64(balance)
     }
 
     fn stock_level(&self, seed: u64) -> u64 {
