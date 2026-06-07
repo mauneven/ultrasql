@@ -36,11 +36,7 @@
 //! Results are logged to `target/criterion/`. The ratio printed at the end
 //! of each run is push_throughput / pull_throughput (higher = push wins).
 
-#![allow(
-    clippy::cast_possible_truncation,
-    clippy::cast_possible_wrap,
-    clippy::doc_markdown
-)]
+#![allow(clippy::doc_markdown)]
 
 use criterion::{Criterion, Throughput, black_box, criterion_group, criterion_main};
 use ultrasql_core::{DataType, Field, Schema, Value};
@@ -78,15 +74,25 @@ fn schema_x() -> Schema {
     Schema::new([Field::required("x", DataType::Int64)]).expect("schema ok")
 }
 
+fn bench_row_count(rows: usize) -> u64 {
+    u64::try_from(rows).expect("benchmark row count fits u64")
+}
+
+fn bench_row_index(index: usize) -> i64 {
+    i64::try_from(index).expect("benchmark row index fits i64")
+}
+
 /// Build the 1 M-row dataset as a `Vec<Batch>` of `BATCH_SIZE`-row batches.
 ///
-/// Each row `i` has `x = i as i64 % CARDINALITY`.
+/// Each row `i` has `x = i64::try_from(i) % CARDINALITY`.
 fn make_batches() -> Vec<Batch> {
     let mut batches = Vec::with_capacity(N_ROWS / BATCH_SIZE);
     let mut offset = 0usize;
     while offset < N_ROWS {
         let end = (offset + BATCH_SIZE).min(N_ROWS);
-        let xs: Vec<i64> = (offset..end).map(|i| (i as i64) % CARDINALITY).collect();
+        let xs: Vec<i64> = (offset..end)
+            .map(|i| bench_row_index(i) % CARDINALITY)
+            .collect();
         batches.push(Batch::new([Column::Int64(NumericColumn::from_data(xs))]).expect("batch ok"));
         offset = end;
     }
@@ -130,7 +136,7 @@ fn bench_push_scan_filter_sum(c: &mut Criterion) {
     group.sample_size(20);
     group.measurement_time(std::time::Duration::from_secs(5));
     group.warm_up_time(std::time::Duration::from_secs(2));
-    group.throughput(Throughput::Elements(N_ROWS as u64));
+    group.throughput(Throughput::Elements(bench_row_count(N_ROWS)));
 
     group.bench_function("push", |b| {
         b.iter(|| {
@@ -170,7 +176,7 @@ fn bench_pull_scan_filter_collect(c: &mut Criterion) {
     group.sample_size(20);
     group.measurement_time(std::time::Duration::from_secs(5));
     group.warm_up_time(std::time::Duration::from_secs(2));
-    group.throughput(Throughput::Elements(N_ROWS as u64));
+    group.throughput(Throughput::Elements(bench_row_count(N_ROWS)));
 
     group.bench_function("pull", |b| {
         b.iter(|| {
@@ -214,7 +220,7 @@ fn bench_push_vs_pull_side_by_side(c: &mut Criterion) {
     group.sample_size(20);
     group.measurement_time(std::time::Duration::from_secs(5));
     group.warm_up_time(std::time::Duration::from_secs(2));
-    group.throughput(Throughput::Elements(N_ROWS as u64));
+    group.throughput(Throughput::Elements(bench_row_count(N_ROWS)));
 
     // ---- Push ----
     group.bench_function("push", |b| {

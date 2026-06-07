@@ -15,6 +15,7 @@ ANN_FILES = [
 SQL_BENCH_FILES = [
     REPO / "crates" / "ultrasql-bench" / "src" / "bin" / "cross_compare_sql.rs",
 ]
+PUSH_VS_PULL_BENCH = REPO / "crates" / "ultrasql-bench" / "benches" / "push_vs_pull.rs"
 TPCH_DATA_GEN_FILE = (
     REPO / "crates" / "ultrasql-bench" / "src" / "tpch" / "data_gen.rs"
 )
@@ -31,6 +32,9 @@ SQL_PERCENTILE_INDEX_CAST = re.compile(
     r"sorted_values\.len\(\)\s+as\s+f64.*ceil\(\)\s+as\s+usize"
 )
 SQL_RNG_WIDTH_CAST = re.compile(r"next_u64\(\)\s+as\s+i32")
+PUSH_VS_PULL_BENCH_CASTS = re.compile(
+    r"\bas\s+(?:usize|u32|u64|i32|i64)\b|clippy::cast_"
+)
 BTREE_SHUFFLE_INDEX_CAST = re.compile(r"\bs\s+as\s+usize\)\s*%\s*\(i\s*\+\s*1\)")
 MIXED_OLTP_INDEX_CAST = re.compile(r"\bs\s+as\s+usize\s*>>\s*7\)\s*%")
 MIXED_OLTP_KIND_WIDTH_CAST = re.compile(r"\(\s*s\s*%\s*100\s*\)\s+as\s+u8\b")
@@ -134,6 +138,15 @@ class BenchStyleTests(unittest.TestCase):
                 code = line.split("//", maxsplit=1)[0]
                 if SQL_RNG_WIDTH_CAST.search(code):
                     offenders.append(f"{path.relative_to(REPO)}:{line_no}: {line.strip()}")
+
+        self.assertEqual([], offenders)
+
+    def test_push_vs_pull_bench_uses_checked_integer_conversions(self) -> None:
+        offenders: list[str] = []
+        for line_no, line in enumerate(PUSH_VS_PULL_BENCH.read_text().splitlines(), start=1):
+            code = line.split("//", maxsplit=1)[0]
+            if PUSH_VS_PULL_BENCH_CASTS.search(code):
+                offenders.append(f"{PUSH_VS_PULL_BENCH.relative_to(REPO)}:{line_no}: {line.strip()}")
 
         self.assertEqual([], offenders)
 
