@@ -464,6 +464,12 @@ const fn tid(block: u32, slot: u16) -> TupleId {
     )
 }
 
+fn shuffle_index(seed: u64, upper_bound: usize) -> usize {
+    let upper_bound_u64 = u64::try_from(upper_bound).unwrap_or(u64::MAX).max(1);
+    let reduced = seed % upper_bound_u64;
+    usize::try_from(reduced).unwrap_or(0)
+}
+
 fn run_point(args: &Args) -> Result<String> {
     // 1) Build a B-tree of `point_n` i64 keys. The buffer pool must
     //    be large enough to hold every dirty page because the v0.5
@@ -493,7 +499,7 @@ fn run_point(args: &Args) -> Result<String> {
         s ^= s << 13;
         s ^= s >> 7;
         s ^= s << 17;
-        let j = (s as usize) % (i + 1);
+        let j = shuffle_index(s, i + 1);
         perm.swap(i, j);
     }
     for &k in &perm {

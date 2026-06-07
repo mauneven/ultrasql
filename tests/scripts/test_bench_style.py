@@ -23,6 +23,7 @@ SQL_PERCENTILE_INDEX_CAST = re.compile(
     r"sorted_values\.len\(\)\s+as\s+f64.*ceil\(\)\s+as\s+usize"
 )
 SQL_RNG_WIDTH_CAST = re.compile(r"next_u64\(\)\s+as\s+i32")
+BTREE_SHUFFLE_INDEX_CAST = re.compile(r"\bs\s+as\s+usize\)\s*%\s*\(i\s*\+\s*1\)")
 
 
 class BenchStyleTests(unittest.TestCase):
@@ -62,6 +63,20 @@ class BenchStyleTests(unittest.TestCase):
             for line_no, line in enumerate(path.read_text().splitlines(), start=1):
                 code = line.split("//", maxsplit=1)[0]
                 if SQL_RNG_WIDTH_CAST.search(code):
+                    offenders.append(f"{path.relative_to(REPO)}:{line_no}: {line.strip()}")
+
+        self.assertEqual([], offenders)
+
+    def test_btree_bench_shuffle_uses_checked_index_conversion(self) -> None:
+        offenders: list[str] = []
+        paths = [
+            REPO / "crates" / "ultrasql-bench" / "src" / "bin" / "cross_compare.rs",
+            REPO / "crates" / "ultrasql-bench" / "src" / "runs" / "point_lookup.rs",
+        ]
+        for path in paths:
+            for line_no, line in enumerate(path.read_text().splitlines(), start=1):
+                code = line.split("//", maxsplit=1)[0]
+                if BTREE_SHUFFLE_INDEX_CAST.search(code):
                     offenders.append(f"{path.relative_to(REPO)}:{line_no}: {line.strip()}")
 
         self.assertEqual([], offenders)

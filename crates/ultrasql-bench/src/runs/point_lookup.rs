@@ -53,6 +53,12 @@ impl PageLoader for BlankLoader {
     }
 }
 
+fn shuffle_index(seed: u64, upper_bound: usize) -> usize {
+    let upper_bound_u64 = u64::try_from(upper_bound).unwrap_or(u64::MAX).max(1);
+    let reduced = seed % upper_bound_u64;
+    usize::try_from(reduced).unwrap_or(0)
+}
+
 /// Builds a `BTree<i64>` with `n` deterministically inserted keys.
 ///
 /// Keys are shuffled with an xorshift64 before insertion to avoid
@@ -76,7 +82,7 @@ fn build_tree(n: usize) -> BTree<BlankLoader> {
         s ^= s << 13;
         s ^= s >> 7;
         s ^= s << 17;
-        let j = (s as usize) % (i + 1);
+        let j = shuffle_index(s, i + 1);
         perm.swap(i, j);
     }
 
