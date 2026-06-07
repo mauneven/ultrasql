@@ -5,14 +5,6 @@
 //! advances the oldest-active xid threshold and asserts that the GC
 //! removes only entries whose writer is now invisible.
 
-#![allow(
-    clippy::cast_possible_truncation,
-    clippy::cast_possible_wrap,
-    clippy::cast_sign_loss,
-    clippy::cast_lossless,
-    reason = "integration test: index arithmetic against compile-time loop bounds"
-)]
-
 use std::collections::HashMap;
 use std::sync::Arc;
 

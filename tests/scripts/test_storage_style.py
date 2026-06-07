@@ -24,7 +24,7 @@ STORAGE_BTREE_SHUFFLE_CAST = re.compile(r"\bs\s+as\s+usize\b")
 STORAGE_HEAP_TEST_CASTS = re.compile(
     r"\bN\s+as\s+usize\b|\(2 \* N\)\s+as\s+usize\b|\bi\s+as\s+u8\b|clippy::cast_"
 )
-STORAGE_VACUUM_TEST_CASTS = re.compile(r"\bi\s+as\s+i32\b")
+STORAGE_VACUUM_TEST_CASTS = re.compile(r"\bi\s+as\s+i32\b|clippy::cast_")
 STORAGE_RECOVERY_SIM_TEST_CASTS = re.compile(
     r"count\(\)\s+as\s+u64|\bINSERTS_PER_XID\s+as\s+u64\b|\bi\s+as\s+u16\b|"
     r"\bslot\s+as\s+u16\b|\bi\s+as\s+i32\b|clippy::cast_"
