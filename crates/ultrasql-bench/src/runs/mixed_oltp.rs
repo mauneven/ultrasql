@@ -82,8 +82,11 @@ fn rng_index(seed: u64, upper_bound: usize) -> usize {
 /// Runs the mixed-OLTP benchmark.
 pub fn run(ctx: &BenchContext) -> BenchResult {
     // Budget: initial rows + ops_per_iter inserts per iteration.
-    let max_rows =
-        INITIAL_ROWS + OPS_PER_ITER * (ctx.iterations as usize + ctx.warmup_iterations as usize);
+    let iteration_count = usize::try_from(ctx.iterations).unwrap_or(0);
+    let warmup_iteration_count = usize::try_from(ctx.warmup_iterations).unwrap_or(0);
+    let max_rows = INITIAL_ROWS.saturating_add(
+        OPS_PER_ITER.saturating_mul(iteration_count.saturating_add(warmup_iteration_count)),
+    );
     let frames = (max_rows / 50).max(1) + 1_024;
     let pool = Arc::new(BufferPool::new(frames, BlankLoader));
     let heap = HeapAccess::new(Arc::clone(&pool));
@@ -165,7 +168,7 @@ pub fn run(ctx: &BenchContext) -> BenchResult {
         run_ops(&heap, &mut tids, seed);
     }
 
-    let mut samples: Vec<f64> = Vec::with_capacity(ctx.iterations as usize);
+    let mut samples: Vec<f64> = Vec::with_capacity(iteration_count);
     for _ in 0..ctx.iterations {
         seed = xorshift64(seed);
         samples.push(run_ops(&heap, &mut tids, seed));
@@ -210,7 +213,10 @@ mod tests {
             },
         };
         let result = run(&ctx);
-        assert_eq!(result.samples.len(), ctx.iterations as usize);
+        assert_eq!(
+            result.samples.len(),
+            usize::try_from(ctx.iterations).unwrap_or(0)
+        );
         assert!(result.throughput_per_sec > 0.0);
     }
 

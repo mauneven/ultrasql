@@ -25,6 +25,9 @@ SQL_PERCENTILE_INDEX_CAST = re.compile(
 SQL_RNG_WIDTH_CAST = re.compile(r"next_u64\(\)\s+as\s+i32")
 BTREE_SHUFFLE_INDEX_CAST = re.compile(r"\bs\s+as\s+usize\)\s*%\s*\(i\s*\+\s*1\)")
 MIXED_OLTP_INDEX_CAST = re.compile(r"\bs\s+as\s+usize\s*>>\s*7\)\s*%")
+MIXED_OLTP_ITERATION_WIDTH_CAST = re.compile(
+    r"\bctx\.(?:iterations|warmup_iterations)\s+as\s+usize\b"
+)
 TPCB_INDEX_CAST = re.compile(r"\bs\s+as\s+usize\)\s*%\s*(?:accounts|tellers)\.len\(\)")
 TPCB_ITERATION_WIDTH_CAST = re.compile(r"\bctx\.iterations\s+as\s+usize\b")
 TPCH_Q22_COUNTRY_INDEX_CAST = re.compile(
@@ -121,6 +124,16 @@ class BenchStyleTests(unittest.TestCase):
         for line_no, line in enumerate(path.read_text().splitlines(), start=1):
             code = line.split("//", maxsplit=1)[0]
             if MIXED_OLTP_INDEX_CAST.search(code):
+                offenders.append(f"{path.relative_to(REPO)}:{line_no}: {line.strip()}")
+
+        self.assertEqual([], offenders)
+
+    def test_mixed_oltp_uses_checked_iteration_width_conversions(self) -> None:
+        offenders: list[str] = []
+        path = REPO / "crates" / "ultrasql-bench" / "src" / "runs" / "mixed_oltp.rs"
+        for line_no, line in enumerate(path.read_text().splitlines(), start=1):
+            code = line.split("//", maxsplit=1)[0]
+            if MIXED_OLTP_ITERATION_WIDTH_CAST.search(code):
                 offenders.append(f"{path.relative_to(REPO)}:{line_no}: {line.strip()}")
 
         self.assertEqual([], offenders)
