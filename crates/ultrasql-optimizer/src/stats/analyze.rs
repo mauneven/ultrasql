@@ -19,6 +19,7 @@
 //!   sampling fraction.
 
 use ahash::AHashSet;
+use num_traits::ToPrimitive;
 use ultrasql_core::{DataType, Schema, Value};
 
 use crate::stats::StatsError;
@@ -134,7 +135,7 @@ impl AnalyzeRunner {
             let null_frac = if total_rows == 0 {
                 0.0
             } else {
-                null_counts[col_idx] as f64 / total_rows as f64
+                u64_to_f64_saturating(null_counts[col_idx]) / u64_to_f64_saturating(total_rows)
             };
             let avg_width_bytes = if non_null_count == 0 {
                 0_u32
@@ -217,9 +218,9 @@ fn compute_n_distinct(values: &[Value], total_rows: u64) -> f64 {
     // otherwise encode as negative fraction.
     let sample_n = values.len();
     if distinct <= sample_n / 10 {
-        distinct as f64
+        usize_to_f64_saturating(distinct)
     } else {
-        -(distinct as f64 / total_rows.max(1) as f64)
+        -(usize_to_f64_saturating(distinct) / u64_to_f64_saturating(total_rows.max(1)))
     }
 }
 
@@ -239,11 +240,11 @@ fn compute_correlation(values: &[Value]) -> f64 {
 
     let mut ranks: Vec<f64> = vec![0.0; n];
     for (rank, (orig_idx, _)) in index_value.iter().enumerate() {
-        ranks[*orig_idx] = rank as f64;
+        ranks[*orig_idx] = usize_to_f64_saturating(rank);
     }
 
     // Pearson r between positions [0..n) and ranks.
-    let n_f = n as f64;
+    let n_f = usize_to_f64_saturating(n);
     let pos_mean = (n_f - 1.0) / 2.0; // mean of 0, 1, ..., n-1
     let rank_mean: f64 = ranks.iter().copied().sum::<f64>() / n_f;
 
@@ -252,7 +253,7 @@ fn compute_correlation(values: &[Value]) -> f64 {
     let mut var_pos = 0.0_f64;
     let mut var_rank = 0.0_f64;
     for (i, r) in ranks.iter().enumerate() {
-        let dp = i as f64 - pos_mean;
+        let dp = usize_to_f64_saturating(i) - pos_mean;
         let dr = r - rank_mean;
         cov += dp * dr;
         var_pos += dp * dp;
@@ -277,6 +278,14 @@ fn value_width(v: &Value, ty: &DataType) -> u64 {
 
 fn usize_to_u64_saturating(value: usize) -> u64 {
     u64::try_from(value).unwrap_or(u64::MAX)
+}
+
+fn u64_to_f64_saturating(value: u64) -> f64 {
+    value.to_f64().unwrap_or(f64::MAX)
+}
+
+fn usize_to_f64_saturating(value: usize) -> f64 {
+    value.to_f64().unwrap_or(f64::MAX)
 }
 
 #[cfg(test)]

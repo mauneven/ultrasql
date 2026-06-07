@@ -9,6 +9,8 @@
 //! exact constants match PG's defaults so that the two optimizers can be
 //! compared on equal footing.
 
+use num_traits::ToPrimitive;
+
 use crate::cost::{CostEstimate, CostGucs, StatsSource};
 
 // ============================================================================
@@ -19,12 +21,9 @@ use crate::cost::{CostEstimate, CostGucs, StatsSource};
 ///
 /// Formula: `pages * seq_page_cost + rows * cpu_tuple_cost`.
 /// Startup cost is 0 because the first row is available immediately.
-///
-/// The `as f64` casts here are int-to-float conversions, not integer-width
-/// casts; they are permitted by AGENTS.md §3.3.
 pub fn cost_scan(stats: &dyn StatsSource, table: &str, gucs: &CostGucs) -> CostEstimate {
-    let rows = stats.row_count(table) as f64;
-    let pages = stats.page_count(table) as f64;
+    let rows = u64_to_f64_saturating(stats.row_count(table));
+    let pages = u64_to_f64_saturating(stats.page_count(table));
     CostEstimate {
         total_cost: pages.mul_add(gucs.seq_page_cost, rows * gucs.cpu_tuple_cost),
         startup_cost: 0.0,
@@ -52,7 +51,7 @@ pub fn cost_index_scan(
     selectivity: f64,
     gucs: &CostGucs,
 ) -> CostEstimate {
-    let total_rows = stats.row_count(table) as f64;
+    let total_rows = u64_to_f64_saturating(stats.row_count(table));
     let rows = total_rows * selectivity;
     // Conservative: 100 tuples per page.
     let pages = (rows / 100.0).ceil();
@@ -227,7 +226,7 @@ pub fn cost_bitmap_heap_scan(
     selectivity: f64,
     gucs: &CostGucs,
 ) -> CostEstimate {
-    let total_rows = stats.row_count(table) as f64;
+    let total_rows = u64_to_f64_saturating(stats.row_count(table));
     let rows = total_rows * selectivity;
     let heap_pages = (rows / 100.0).ceil();
     let startup = rows.mul_add(
@@ -266,7 +265,7 @@ pub fn cost_index_only_scan(
     selectivity: f64,
     gucs: &CostGucs,
 ) -> CostEstimate {
-    let total_rows = stats.row_count(table) as f64;
+    let total_rows = u64_to_f64_saturating(stats.row_count(table));
     let rows = total_rows * selectivity;
     let index_pages = (rows / 100.0).ceil();
     let startup = f64::from(index_height) * gucs.random_page_cost;
@@ -301,7 +300,7 @@ pub fn annotate_parallel(input: CostEstimate, workers: usize, gucs: &CostGucs) -
     if workers <= 1 {
         return input;
     }
-    let w = workers as f64;
+    let w = usize_to_f64_saturating(workers);
     CostEstimate {
         total_cost: input.total_cost / w,
         startup_cost: input.startup_cost + gucs.parallel_setup_cost,
@@ -326,6 +325,14 @@ pub fn cost_filter(input: CostEstimate, sel: f64, gucs: &CostGucs) -> CostEstima
         rows: input.rows * sel,
         width: input.width,
     }
+}
+
+fn u64_to_f64_saturating(value: u64) -> f64 {
+    value.to_f64().unwrap_or(f64::MAX)
+}
+
+fn usize_to_f64_saturating(value: usize) -> f64 {
+    value.to_f64().unwrap_or(f64::MAX)
 }
 
 // ============================================================================

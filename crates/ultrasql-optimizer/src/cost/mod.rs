@@ -241,7 +241,7 @@ impl<'s> CostModel<'s> {
 
             LogicalPlan::Limit { input, n, .. } => {
                 let mut est = self.estimate(input);
-                est.rows = est.rows.min(*n as f64);
+                est.rows = est.rows.min((*n).to_f64().unwrap_or(f64::MAX));
                 est
             }
 

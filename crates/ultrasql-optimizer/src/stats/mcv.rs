@@ -10,6 +10,7 @@
 use std::cmp::Reverse;
 
 use ahash::AHashMap;
+use num_traits::ToPrimitive;
 
 use ultrasql_core::Value;
 
@@ -63,13 +64,13 @@ impl MostCommonValues {
         pairs.sort_by_key(|b| Reverse(b.1));
         pairs.truncate(usize::from(top_k));
 
-        let total_f = total as f64;
+        let total_f = usize_to_f64_saturating(total);
         let mut values = Vec::with_capacity(pairs.len());
         let mut frequencies = Vec::with_capacity(pairs.len());
 
         for (v, count) in pairs {
             values.push(v);
-            let freq = count as f64 / total_f;
+            let freq = u64_to_f64_saturating(count) / total_f;
             frequencies.push(freq);
         }
 
@@ -99,6 +100,14 @@ impl MostCommonValues {
     pub fn covered_fraction(&self) -> f64 {
         self.frequencies.iter().copied().fold(0.0_f64, |a, b| a + b)
     }
+}
+
+fn u64_to_f64_saturating(value: u64) -> f64 {
+    value.to_f64().unwrap_or(f64::MAX)
+}
+
+fn usize_to_f64_saturating(value: usize) -> f64 {
+    value.to_f64().unwrap_or(f64::MAX)
 }
 
 #[cfg(test)]
@@ -164,7 +173,7 @@ mod tests {
         let total = samples().len();
         let mcv = MostCommonValues::build_from_samples(&samples(), 4);
         let f1 = mcv.frequency_of(&Value::Int32(1));
-        let expected = 5.0 / total as f64;
+        let expected = 5.0 / usize_to_f64_saturating(total);
         assert!(
             (f1 - expected).abs() < 1e-9,
             "expected {expected}, got {f1}"

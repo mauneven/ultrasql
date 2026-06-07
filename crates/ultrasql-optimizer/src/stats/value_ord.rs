@@ -8,8 +8,8 @@
 //!
 //! - **NULL** sorts *last* (consistent with PostgreSQL `NULLS LAST`).
 //! - **Numeric cross-type comparisons** widen to `f64`; integers widen
-//!   losslessly via [`i64::from`] before conversion to `f64`. Decimal values
-//!   compare exactly against other decimals.
+//!   through checked conversions. Decimal values compare exactly against
+//!   other decimals.
 //! - **NaN** sorts last among floats.
 //! - **Mixed-type comparisons** (e.g., Int32 vs Text) fall back to a
 //!   stable discriminant ordering so the result is always a total
@@ -20,6 +20,7 @@
 
 use std::cmp::Ordering;
 
+use num_traits::ToPrimitive;
 use ultrasql_core::{Value, bpchar_semantic_text, timetz_utc_micros};
 
 /// Compare two [`Value`]s under the statistics layer's total ordering.
@@ -373,11 +374,21 @@ fn to_f64(v: &Value) -> f64 {
     match v {
         Value::Int16(i) => f64::from(*i),
         Value::Int32(i) => f64::from(*i),
-        Value::Int64(i) => *i as f64,
+        Value::Int64(i) => i64_to_f64_saturating(*i),
         Value::Float32(f) => f64::from(*f),
         Value::Float64(f) => *f,
         _ => f64::NAN,
     }
+}
+
+fn i64_to_f64_saturating(value: i64) -> f64 {
+    value.to_f64().unwrap_or_else(|| {
+        if value.is_negative() {
+            f64::MIN
+        } else {
+            f64::MAX
+        }
+    })
 }
 
 fn compare_decimals(l: i64, l_scale: i32, r: i64, r_scale: i32) -> Ordering {
