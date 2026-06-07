@@ -348,10 +348,10 @@ fn finalise(state: &AggState) -> Value {
                 return Value::Null;
             }
             let n = *cnt as f64;
-            let num = n * sxy - sx * sy;
-            // Pearson correlation denominator: sqrt((n*sx2-sx^2)(n*sy2-sy^2))
-            #[allow(clippy::suspicious_operation_groupings)]
-            let den = ((n * sx2 - sx * sx) * (n * sy2 - sy * sy)).sqrt();
+            let num = n * *sxy - *sx * *sy;
+            let x_term = n * *sx2 - *sx * *sx;
+            let y_term = n * *sy2 - *sy * *sy;
+            let den = (x_term * y_term).sqrt();
             if den == 0.0 {
                 Value::Null
             } else {
