@@ -138,9 +138,8 @@ impl DictionaryColumn {
     pub fn decode_at(&self, i: usize) -> &str {
         let code = self.codes.data()[i];
         assert_ne!(code, u32::MAX, "decode_at called on null row {i}");
-        let Ok(idx) = usize::try_from(code) else {
-            panic!("dictionary code {code} does not fit usize");
-        };
+        let idx =
+            usize::try_from(code).expect("dictionary code must fit usize on supported targets");
         match self.dict.get(idx) {
             Some(value) => value,
             None => panic!(

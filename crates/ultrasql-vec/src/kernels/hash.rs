@@ -25,10 +25,7 @@ const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
 const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
 
 fn offset_to_usize(offset: u32) -> usize {
-    match usize::try_from(offset) {
-        Ok(offset) => offset,
-        Err(_) => panic!("hash_text_bytes: offset {offset} does not fit usize"),
-    }
+    usize::try_from(offset).expect("hash_text_bytes: offset must fit usize on supported targets")
 }
 
 // ============================================================================

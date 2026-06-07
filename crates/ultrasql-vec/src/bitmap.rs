@@ -7,10 +7,7 @@
 use std::fmt;
 
 fn small_u32_to_usize(value: u32) -> usize {
-    match usize::try_from(value) {
-        Ok(value) => value,
-        Err(_) => panic!("small bitmap count {value} does not fit usize"),
-    }
+    usize::try_from(value).expect("small bitmap count must fit usize on supported targets")
 }
 
 /// Packed bitmap with a logical length in bits.

@@ -383,24 +383,15 @@ fn item_field_to_usize(field: u32, name: &'static str) -> Result<usize, PageErro
 }
 
 fn invariant_item_field_to_usize(field: u32, name: &'static str) -> usize {
-    match item_field_to_usize(field, name) {
-        Ok(value) => value,
-        Err(_) => panic!("page invariant: item field fits usize"),
-    }
+    item_field_to_usize(field, name).expect("page invariant: item field fits usize")
 }
 
 fn invariant_item_offset(offset: usize) -> u32 {
-    match item_offset_from_usize(offset) {
-        Ok(value) => value,
-        Err(_) => panic!("page invariant: tuple offset fits itemid"),
-    }
+    item_offset_from_usize(offset).expect("page invariant: tuple offset fits itemid")
 }
 
 fn invariant_page_bound(value: usize) -> u16 {
-    match page_u16_from_usize(value, "page bound") {
-        Ok(value) => value,
-        Err(_) => panic!("page invariant: page bound fits u16"),
-    }
+    page_u16_from_usize(value, "page bound").expect("page invariant: page bound fits u16")
 }
 
 impl Page {
