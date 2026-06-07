@@ -31,6 +31,7 @@
 use std::sync::Arc;
 use std::time::Instant;
 
+use num_traits::ToPrimitive;
 use ultrasql_core::{BlockNumber, PageId, RelationId, TupleId, Xid};
 use ultrasql_storage::access_method::BrinIndex;
 use ultrasql_storage::btree::BTree;
@@ -966,11 +967,15 @@ async fn point_lookup_with_index_records_vacuum_certified_path() {
     let idx_median = median(idx_us);
     eprintln!(
         "point_lookup_bench: seq_median={seq_median} us, idx_median={idx_median} us, ratio={:.2}x",
-        seq_median as f64 / idx_median.max(1) as f64
+        u128_to_f64_saturating(seq_median) / u128_to_f64_saturating(idx_median.max(1))
     );
 
     assert!(seq_median > 0, "SeqScan timing should be non-zero");
     assert!(idx_median > 0, "index timing should be non-zero");
 
     graceful_shutdown(running).await;
+}
+
+fn u128_to_f64_saturating(value: u128) -> f64 {
+    value.to_f64().unwrap_or(f64::MAX)
 }

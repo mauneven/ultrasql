@@ -83,6 +83,7 @@ use std::sync::Arc;
 use std::sync::OnceLock;
 
 use base64::{Engine as _, engine::general_purpose::STANDARD as B64};
+use num_traits::ToPrimitive;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpListener;
 use tracing::{debug, error, info, warn};
@@ -2969,8 +2970,8 @@ impl AutovacuumConfig {
         if !value.is_finite() || value < 0.0 {
             return Err(format!("{name} must be a non-negative finite number"));
         }
-        let scaled = (value * AUTOVACUUM_SCALE_DENOMINATOR as f64).round();
-        if scaled > u64::MAX as f64 {
+        let scaled = (value * u64_to_f64_saturating(AUTOVACUUM_SCALE_DENOMINATOR)).round();
+        if scaled > u64_to_f64_saturating(u64::MAX) {
             return Err(format!("{name} is too large"));
         }
         format!("{scaled:.0}")
@@ -2981,13 +2982,15 @@ impl AutovacuumConfig {
     /// Return the configured VACUUM scale factor as a user-facing decimal.
     #[must_use]
     pub fn vacuum_scale_factor(self) -> f64 {
-        self.vacuum_scale_factor_ppm as f64 / AUTOVACUUM_SCALE_DENOMINATOR as f64
+        u64_to_f64_saturating(self.vacuum_scale_factor_ppm)
+            / u64_to_f64_saturating(AUTOVACUUM_SCALE_DENOMINATOR)
     }
 
     /// Return the configured ANALYZE scale factor as a user-facing decimal.
     #[must_use]
     pub fn analyze_scale_factor(self) -> f64 {
-        self.analyze_scale_factor_ppm as f64 / AUTOVACUUM_SCALE_DENOMINATOR as f64
+        u64_to_f64_saturating(self.analyze_scale_factor_ppm)
+            / u64_to_f64_saturating(AUTOVACUUM_SCALE_DENOMINATOR)
     }
 
     fn vacuum_threshold_for_rows(self, estimated_rows: u64) -> u64 {
@@ -3073,6 +3076,10 @@ fn scaled_threshold(base: u64, scale_factor_ppm: u64, estimated_rows: u64) -> u6
     let scaled = (u128::from(estimated_rows) * u128::from(scale_factor_ppm))
         / u128::from(AUTOVACUUM_SCALE_DENOMINATOR);
     base.saturating_add(u64::try_from(scaled).unwrap_or(u64::MAX))
+}
+
+fn u64_to_f64_saturating(value: u64) -> f64 {
+    value.to_f64().unwrap_or(f64::MAX)
 }
 
 /// Precomputed TPC-H Q1 aggregate group used by the certification loader.
@@ -8667,7 +8674,8 @@ fn build_cached_avg_column(
             if col.is_empty() {
                 null_float64_column()
             } else {
-                let avg = (sum_i32_widening(col) as f64) / (col.len() as f64);
+                let avg = i64_to_f64_saturating(sum_i32_widening(col))
+                    / usize_to_f64_saturating(col.len());
                 Some(Column::Float64(NumericColumn::from_data(vec![avg])))
             }
         }
@@ -8681,12 +8689,26 @@ fn build_cached_avg_column(
             if col.is_empty() {
                 null_float64_column()
             } else {
-                let avg = (sum_i64(col) as f64) / (col.len() as f64);
+                let avg = i64_to_f64_saturating(sum_i64(col)) / usize_to_f64_saturating(col.len());
                 Some(Column::Float64(NumericColumn::from_data(vec![avg])))
             }
         }
         _ => None,
     }
+}
+
+fn i64_to_f64_saturating(value: i64) -> f64 {
+    value.to_f64().unwrap_or_else(|| {
+        if value.is_negative() {
+            f64::MIN
+        } else {
+            f64::MAX
+        }
+    })
+}
+
+fn usize_to_f64_saturating(value: usize) -> f64 {
+    value.to_f64().unwrap_or(f64::MAX)
 }
 
 fn build_cached_filter_sum_column(

@@ -10,6 +10,7 @@ use std::collections::BTreeMap;
 use std::fmt;
 use std::sync::Arc;
 
+use num_traits::ToPrimitive;
 #[cfg(test)]
 use ultrasql_core::{DataType, Field};
 use ultrasql_core::{RelationId, Schema};
@@ -507,9 +508,10 @@ fn build_q1_batch(groups: BTreeMap<(u8, u8), Q1State>) -> Result<Batch, ExecErro
         sum_base_price.push(state.sum_base_price);
         sum_disc_price.push(state.sum_disc_price);
         sum_charge.push(state.sum_charge);
-        avg_qty.push(state.sum_qty as f64 / count as f64 / 100.0);
-        avg_price.push(state.sum_base_price as f64 / count as f64 / 100.0);
-        avg_disc.push(state.sum_discount as f64 / count as f64 / 100.0);
+        let count_f64 = i64_to_f64_saturating(count);
+        avg_qty.push(i64_to_f64_saturating(state.sum_qty) / count_f64 / 100.0);
+        avg_price.push(i64_to_f64_saturating(state.sum_base_price) / count_f64 / 100.0);
+        avg_disc.push(i64_to_f64_saturating(state.sum_discount) / count_f64 / 100.0);
         count_order.push(state.count);
     }
 
@@ -549,6 +551,16 @@ fn build_q1_batch_from_summary_rows(
 fn i64_from_i128(value: i128) -> Result<i64, ExecError> {
     i64::try_from(value)
         .map_err(|_| ExecError::TypeMismatch("TPC-H Q1 decimal overflow".to_owned()))
+}
+
+fn i64_to_f64_saturating(value: i64) -> f64 {
+    value.to_f64().unwrap_or_else(|| {
+        if value.is_negative() {
+            f64::MIN
+        } else {
+            f64::MAX
+        }
+    })
 }
 
 #[cfg(test)]
