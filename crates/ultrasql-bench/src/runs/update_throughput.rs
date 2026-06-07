@@ -184,19 +184,15 @@ mod tests {
     /// The test replicates the bench setup inline so it can inspect the final
     /// heap state via `scan_visible`.
     #[test]
-    #[allow(clippy::items_after_statements)] // const N_ITERS reads better near the loop it bounds
     fn update_bench_final_val_equals_original_plus_n_iterations() {
+        const N_ITERS: usize = 3;
+        const TEST_FRAMES: usize = 513;
+
         let _guard = crate::runs::enable_smoke_mode_for_process();
 
-        const N_ITERS: usize = 3;
-
-        // Replicate the benchmark's setup phase. `ROWS_PER_ITER` is 32
-        // in tests so the `(_ / 50).max(1)` arithmetic is redundant —
-        // we keep it for symmetry with the prod-path budgeting and
-        // silence clippy.
-        #[allow(clippy::unnecessary_min_or_max)]
-        let frames = (ROWS_PER_ITER / 50).max(1) + 512;
-        let pool = Arc::new(BufferPool::new(frames, BlankLoader));
+        // Replicate the benchmark's setup phase with enough test frames
+        // for one small heap page plus reserve.
+        let pool = Arc::new(BufferPool::new(TEST_FRAMES, BlankLoader));
         let heap = HeapAccess::new(Arc::clone(&pool));
 
         let insert_opts = InsertOptions {
