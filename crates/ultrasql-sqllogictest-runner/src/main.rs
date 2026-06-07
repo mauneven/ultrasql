@@ -957,15 +957,15 @@ fn write_benchmark_artifacts(
         };
         writeln!(
             &mut markdown,
-            "| `{}` | {} | {} | {} | {} | {} | {:.3} | {:.3} |",
+            "| `{}` | {} | {} | {} | {} | {} | {} | {} |",
             benchmark.engine,
             benchmark.ok,
             benchmark.statements,
             benchmark.query_records,
             benchmark.query_iterations,
             benchmark.skipped,
-            benchmark.total_ns as f64 / 1_000_000.0,
-            avg_ns as f64 / 1_000.0
+            format_thousandths(benchmark.total_ns, 1_000_000),
+            format_thousandths(avg_ns, 1_000)
         )?;
     }
     writeln!(&mut markdown)?;
@@ -975,6 +975,13 @@ fn write_benchmark_artifacts(
     )?;
     std::fs::write(markdown_path, markdown)?;
     Ok(())
+}
+
+fn format_thousandths(value: u128, units_per_whole: u128) -> String {
+    let whole = value / units_per_whole;
+    let remainder = value % units_per_whole;
+    let fractional = remainder.saturating_mul(1_000) / units_per_whole;
+    format!("{whole}.{fractional:03}")
 }
 
 fn escape_json(value: &str) -> String {
@@ -1776,6 +1783,7 @@ mod tests {
 
         let md = std::fs::read_to_string(&markdown).expect("read benchmark markdown");
         assert!(md.contains("fastest_engine: `ultra\"sql`"));
+        assert!(md.contains("| `ultra\"sql` | true | 2 | 1 | 4 | 0 | 0.004 | 1.000 |"));
         assert!(md.contains("| `slow` | false |"));
 
         let _ = std::fs::remove_file(output);
