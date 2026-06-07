@@ -8,6 +8,7 @@ STORAGE_PAGE_BENCH = REPO / "crates" / "ultrasql-storage" / "benches" / "page.rs
 STORAGE_EXTRAS_BENCH = (
     REPO / "crates" / "ultrasql-storage" / "benches" / "storage_extras.rs"
 )
+STORAGE_V08_BENCH = REPO / "crates" / "ultrasql-storage" / "benches" / "v08.rs"
 STORAGE_BTREE_TESTS = REPO / "crates" / "ultrasql-storage" / "src" / "btree" / "tests.rs"
 STORAGE_HEAP_TESTS = REPO / "crates" / "ultrasql-storage" / "src" / "heap" / "tests.rs"
 STORAGE_VACUUM_TESTS = REPO / "crates" / "ultrasql-storage" / "tests" / "vacuum.rs"
@@ -16,6 +17,9 @@ STORAGE_PAGE_THROUGHPUT_CAST = re.compile(
     r"\b(?:tuple_size|slots\.len\(\))\s+as\s+u64\b"
 )
 STORAGE_EXTRAS_THROUGHPUT_CAST = re.compile(r"\bsize\s+as\s+u64\b")
+STORAGE_V08_BENCH_CASTS = re.compile(
+    r"\bN\s+as\s+u64\b|\bN\s+as\s+i64\b|\bi\s+as\s+u32\b|clippy::cast_"
+)
 STORAGE_BTREE_SHUFFLE_CAST = re.compile(r"\bs\s+as\s+usize\b")
 STORAGE_HEAP_TEST_CASTS = re.compile(
     r"\bN\s+as\s+usize\b|\(2 \* N\)\s+as\s+usize\b|\bi\s+as\s+u8\b|clippy::cast_"
@@ -45,6 +49,15 @@ class StorageStyleTests(unittest.TestCase):
                 offenders.append(
                     f"{STORAGE_EXTRAS_BENCH.relative_to(REPO)}:{line_no}: {line.strip()}"
                 )
+
+        self.assertEqual([], offenders)
+
+    def test_v08_bench_uses_checked_integer_conversions(self) -> None:
+        offenders: list[str] = []
+        for line_no, line in enumerate(STORAGE_V08_BENCH.read_text().splitlines(), start=1):
+            code = line.split("//", maxsplit=1)[0]
+            if STORAGE_V08_BENCH_CASTS.search(code):
+                offenders.append(f"{STORAGE_V08_BENCH.relative_to(REPO)}:{line_no}: {line.strip()}")
 
         self.assertEqual([], offenders)
 

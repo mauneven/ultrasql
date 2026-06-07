@@ -5,12 +5,6 @@
 //!   cargo bench --bench v08 -p ultrasql-storage
 
 #![allow(clippy::items_after_statements)]
-#![allow(
-    clippy::cast_possible_wrap,
-    clippy::cast_possible_truncation,
-    clippy::cast_sign_loss,
-    clippy::cast_lossless
-)]
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicI64, Ordering};
@@ -48,15 +42,15 @@ fn bench_btree_multi_column(c: &mut Criterion) {
     group.measurement_time(std::time::Duration::from_secs(3));
     group.warm_up_time(std::time::Duration::from_secs(1));
 
-    const N: usize = 100_000; // 100K for CI; bump to 1M for local runs
-    group.throughput(Throughput::Elements(N as u64));
+    const N: u32 = 100_000; // 100K for CI; bump to 1M for local runs
+    group.throughput(Throughput::Elements(u64::from(N)));
 
     group.bench_function("insert", |b| {
         b.iter(|| {
             let am = BTreeAccessMethod::new(false);
-            for i in 0_i64..(N as i64) {
-                let key = i64_key(i);
-                am.insert(&key, tid(i as u32, 0)).unwrap();
+            for i in 0..N {
+                let key = i64_key(i64::from(i));
+                am.insert(&key, tid(i, 0)).unwrap();
             }
             black_box(am);
         });
@@ -65,17 +59,17 @@ fn bench_btree_multi_column(c: &mut Criterion) {
     // Pre-build index for lookup benchmark.
     let am = {
         let a = BTreeAccessMethod::new(false);
-        for i in 0_i64..(N as i64) {
-            a.insert(&i64_key(i), tid(i as u32, 0)).unwrap();
+        for i in 0..N {
+            a.insert(&i64_key(i64::from(i)), tid(i, 0)).unwrap();
         }
         a
     };
 
     group.bench_function("lookup", |b| {
-        let mut i = 0_i64;
+        let mut i = 0_u32;
         b.iter(|| {
-            let key = i64_key(i % (N as i64));
-            i += 1;
+            let key = i64_key(i64::from(i % N));
+            i = i.wrapping_add(1);
             black_box(am.lookup(&key).unwrap())
         });
     });
@@ -92,19 +86,19 @@ fn bench_hash_lookup(c: &mut Criterion) {
     group.sample_size(20);
     group.measurement_time(std::time::Duration::from_secs(3));
     group.warm_up_time(std::time::Duration::from_secs(1));
-    const N: usize = 100_000;
-    group.throughput(Throughput::Elements(N as u64));
+    const N: u32 = 100_000;
+    group.throughput(Throughput::Elements(u64::from(N)));
 
     let am = HashIndex::new(1024);
-    for i in 0_i64..(N as i64) {
-        am.insert(&i64_key(i), tid(i as u32, 0)).unwrap();
+    for i in 0..N {
+        am.insert(&i64_key(i64::from(i)), tid(i, 0)).unwrap();
     }
 
     group.bench_function("lookup_hit", |b| {
-        let mut i = 0_i64;
+        let mut i = 0_u32;
         b.iter(|| {
-            let key = i64_key(i % (N as i64));
-            i += 1;
+            let key = i64_key(i64::from(i % N));
+            i = i.wrapping_add(1);
             black_box(am.lookup(&key).unwrap())
         });
     });
