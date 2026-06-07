@@ -73,6 +73,12 @@ const fn xorshift64(s: u64) -> u64 {
     x
 }
 
+fn rng_index(seed: u64, upper_bound: usize) -> usize {
+    let upper_bound_u64 = u64::try_from(upper_bound).unwrap_or(u64::MAX).max(1);
+    let reduced = (seed >> 7) % upper_bound_u64;
+    usize::try_from(reduced).unwrap_or(0)
+}
+
 /// Runs the mixed-OLTP benchmark.
 pub fn run(ctx: &BenchContext) -> BenchResult {
     // Budget: initial rows + ops_per_iter inserts per iteration.
@@ -124,12 +130,12 @@ pub fn run(ctx: &BenchContext) -> BenchResult {
                 let kind = (s % 100) as u8;
                 if kind < 50 {
                     // Point read.
-                    let idx = (s as usize >> 7) % n_tids;
+                    let idx = rng_index(s, n_tids);
                     let result = h.fetch(current_tids[idx]);
                     std::hint::black_box(result.is_ok());
                 } else if kind < 80 {
                     // Update.
-                    let idx = (s as usize >> 7) % n_tids;
+                    let idx = rng_index(s, n_tids);
                     let old_tid = current_tids[idx];
                     let id = i32::try_from(idx).unwrap_or(i32::MAX);
                     let val = i64::from(id)
@@ -334,10 +340,10 @@ mod tests {
                 s = xorshift64(s);
                 let kind = (s % 100) as u8;
                 if kind < 50 {
-                    let idx = (s as usize >> 7) % n_tids;
+                    let idx = rng_index(s, n_tids);
                     let _ = heap.fetch(tids[idx]);
                 } else if kind < 80 {
-                    let idx = (s as usize >> 7) % n_tids;
+                    let idx = rng_index(s, n_tids);
                     let old_tid = tids[idx];
                     let id = i32::try_from(idx).unwrap_or(i32::MAX);
                     let val = i64::from(id)
