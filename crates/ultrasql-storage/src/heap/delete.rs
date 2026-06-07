@@ -796,34 +796,30 @@ impl<L: PageLoader> HeapAccess<L> {
     /// If the page module grows an in-place `update_tuple_header`
     /// helper, we should migrate to it.
     ///
-    /// Clippy's `significant_drop_tightening` would prefer the
-    /// [`PageWrite`](crate::buffer_pool::PageWrite) be dropped before
-    /// the closing brace, but `page_bytes` borrows from `page`, so
-    /// the borrow checker requires the guard to live until function
-    /// exit.
-    #[allow(clippy::significant_drop_tightening)]
     pub(super) fn delete_in_place(
         guard: &PageGuard<L>,
         tid: TupleId,
         xmax: Xid,
         cmax: CommandId,
     ) -> Result<(), HeapError> {
-        let mut page = guard.write();
-        let bytes = page.read_tuple(tid.slot)?;
-        if bytes.len() < TUPLE_HEADER_SIZE {
-            return Err(HeapError::MalformedHeader("slot shorter than header"));
-        }
-        let (mut header, _) = TupleHeader::decode(&bytes[..TUPLE_HEADER_SIZE])
-            .ok_or(HeapError::MalformedHeader("header decode failed"))?;
-        header.mark_deleted(xmax, cmax);
-        let header_bytes = Self::collect_header_bytes(&header);
+        {
+            let mut page = guard.write();
+            let bytes = page.read_tuple(tid.slot)?;
+            if bytes.len() < TUPLE_HEADER_SIZE {
+                return Err(HeapError::MalformedHeader("slot shorter than header"));
+            }
+            let (mut header, _) = TupleHeader::decode(&bytes[..TUPLE_HEADER_SIZE])
+                .ok_or(HeapError::MalformedHeader("header decode failed"))?;
+            header.mark_deleted(xmax, cmax);
+            let header_bytes = Self::collect_header_bytes(&header);
 
-        let page_bytes = page.as_bytes_mut();
-        let (slot_offset, slot_length) = Self::slot_window(page_bytes, tid.slot)?;
-        if slot_length < TUPLE_HEADER_SIZE {
-            return Err(HeapError::MalformedHeader("slot shorter than header"));
+            let page_bytes = page.as_bytes_mut();
+            let (slot_offset, slot_length) = Self::slot_window(page_bytes, tid.slot)?;
+            if slot_length < TUPLE_HEADER_SIZE {
+                return Err(HeapError::MalformedHeader("slot shorter than header"));
+            }
+            page_bytes[slot_offset..slot_offset + TUPLE_HEADER_SIZE].copy_from_slice(&header_bytes);
         }
-        page_bytes[slot_offset..slot_offset + TUPLE_HEADER_SIZE].copy_from_slice(&header_bytes);
         Ok(())
     }
 }
