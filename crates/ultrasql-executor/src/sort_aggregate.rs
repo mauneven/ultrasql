@@ -80,7 +80,6 @@ pub(crate) enum AggState {
     },
 }
 
-#[allow(clippy::missing_const_for_fn)]
 fn init_state(agg: &LogicalAggregateExpr) -> AggState {
     match agg.func {
         AggregateFunc::CountStar => AggState::CountStar(0),

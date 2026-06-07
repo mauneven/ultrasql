@@ -1533,7 +1533,6 @@ enum AggState {
 }
 
 /// Initialise one [`AggState`] for the given aggregate descriptor.
-#[allow(clippy::missing_const_for_fn)] // not const due to Vec::new() in variants
 fn init_state_for(agg: &LogicalAggregateExpr) -> AggState {
     if agg.distinct {
         return AggState::Distinct {
@@ -1566,8 +1565,7 @@ fn init_state_for(agg: &LogicalAggregateExpr) -> AggState {
     }
 }
 
-#[allow(clippy::missing_const_for_fn)] // not const due to Vec::new() in variants
-fn init_state_for_func(func: AggregateFunc) -> AggState {
+const fn init_state_for_func(func: AggregateFunc) -> AggState {
     match func {
         AggregateFunc::CountStar => AggState::CountStar(0),
         AggregateFunc::Count => AggState::Count(0),
