@@ -1034,8 +1034,12 @@ fn relation_size_from_literal_args(
         .heap
         .block_count(RelationId(entry.oid))
         .max(entry.n_blocks);
-    let bytes = u64::from(blocks).saturating_mul(PAGE_SIZE as u64);
+    let bytes = u64::from(blocks).saturating_mul(page_size_u64_saturating());
     Ok(Value::Int64(i64::try_from(bytes).unwrap_or(i64::MAX)))
+}
+
+fn page_size_u64_saturating() -> u64 {
+    u64::try_from(PAGE_SIZE).unwrap_or(u64::MAX)
 }
 
 fn resolve_relation_size_entry<'a>(
