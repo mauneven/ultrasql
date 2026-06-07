@@ -39,7 +39,7 @@ impl Parser<'_> {
                 return Err(ParseError::Expected {
                     expected: "SELECT inside COPY (...)",
                     found: self.peek()?.kind,
-                    offset: self.peek()?.span.start as usize,
+                    offset: self.peek()?.span.start_usize(),
                 });
             }
         } else {
@@ -72,7 +72,7 @@ impl Parser<'_> {
                 return Err(ParseError::Expected {
                     expected: "FROM or TO after COPY target",
                     found: other,
-                    offset: dir_tok.span.start as usize,
+                    offset: dir_tok.span.start_usize(),
                 });
             }
         };
@@ -95,14 +95,14 @@ impl Parser<'_> {
                 return Err(ParseError::Expected {
                     expected: "STDIN or server-side file path after COPY ... FROM",
                     found: src_tok.kind,
-                    offset: src_tok.span.start as usize,
+                    offset: src_tok.span.start_usize(),
                 });
             }
             (CopyDirection::To, _) => {
                 return Err(ParseError::Expected {
                     expected: "STDOUT or server-side file path after COPY ... TO",
                     found: src_tok.kind,
-                    offset: src_tok.span.start as usize,
+                    offset: src_tok.span.start_usize(),
                 });
             }
         };
@@ -111,7 +111,7 @@ impl Parser<'_> {
             return Err(ParseError::Expected {
                 expected: "COPY (SELECT ...) TO ...",
                 found: TokenKind::KwFrom,
-                offset: dir_tok.span.start as usize,
+                offset: dir_tok.span.start_usize(),
             });
         }
 
@@ -130,7 +130,7 @@ impl Parser<'_> {
                     return Err(ParseError::Expected {
                         expected: "at most one FORMAT option in COPY WITH",
                         found: TokenKind::KwFormat,
-                        offset: start_tok.span.start as usize,
+                        offset: start_tok.span.start_usize(),
                     });
                 }
                 format = *f;
@@ -168,7 +168,7 @@ impl Parser<'_> {
                     return Err(ParseError::Expected {
                         expected: "',' or ')' in COPY column list",
                         found: other,
-                        offset: self.peek()?.span.start as usize,
+                        offset: self.peek()?.span.start_usize(),
                     });
                 }
             }
@@ -193,7 +193,7 @@ impl Parser<'_> {
                     return Err(ParseError::Expected {
                         expected: "',' or ')' in COPY WITH options",
                         found: other,
-                        offset: self.peek()?.span.start as usize,
+                        offset: self.peek()?.span.start_usize(),
                     });
                 }
             }
@@ -221,7 +221,7 @@ impl Parser<'_> {
                                 return Err(ParseError::Expected {
                                     expected: "TEXT, CSV, BINARY, or PARQUET after FORMAT",
                                     found: fmt_tok.kind,
-                                    offset: fmt_tok.span.start as usize,
+                                    offset: fmt_tok.span.start_usize(),
                                 });
                             }
                         }
@@ -231,7 +231,7 @@ impl Parser<'_> {
                         return Err(ParseError::Expected {
                             expected: "TEXT, CSV, BINARY, or PARQUET after FORMAT",
                             found: fmt_tok.kind,
-                            offset: fmt_tok.span.start as usize,
+                            offset: fmt_tok.span.start_usize(),
                         });
                     }
                 };
@@ -246,13 +246,13 @@ impl Parser<'_> {
                 let first = chars.next().ok_or(ParseError::Expected {
                     expected: "single-character DELIMITER value",
                     found: TokenKind::String,
-                    offset: tok.span.start as usize,
+                    offset: tok.span.start_usize(),
                 })?;
                 if chars.next().is_some() {
                     return Err(ParseError::Expected {
                         expected: "single-character DELIMITER value",
                         found: TokenKind::String,
-                        offset: tok.span.start as usize,
+                        offset: tok.span.start_usize(),
                     });
                 }
                 Ok(CopyOption::Delimiter(first))
@@ -286,7 +286,7 @@ impl Parser<'_> {
                 Err(ParseError::Expected {
                     expected: COPY_WITH_OPTION_EXPECTED,
                     found: tok.kind,
-                    offset: tok.span.start as usize,
+                    offset: tok.span.start_usize(),
                 })
             }
             TokenKind::KwNull => {
@@ -298,7 +298,7 @@ impl Parser<'_> {
             other => Err(ParseError::Expected {
                 expected: COPY_WITH_OPTION_EXPECTED,
                 found: other,
-                offset: tok.span.start as usize,
+                offset: tok.span.start_usize(),
             }),
         }
     }
@@ -330,14 +330,14 @@ impl Parser<'_> {
             return Err(ParseError::Expected {
                 expected: "non-negative integer COPY option value",
                 found: tok.kind,
-                offset: tok.span.start as usize,
+                offset: tok.span.start_usize(),
             });
         }
         let raw = tok.text(self.source).unwrap_or("");
         let value = raw.parse::<u64>().map_err(|_| ParseError::Expected {
             expected: label,
             found: tok.kind,
-            offset: tok.span.start as usize,
+            offset: tok.span.start_usize(),
         })?;
         self.advance()?;
         Ok(value)
@@ -359,7 +359,7 @@ impl Parser<'_> {
             other => Err(ParseError::Expected {
                 expected: label,
                 found: other,
-                offset: tok.span.start as usize,
+                offset: tok.span.start_usize(),
             }),
         }
     }
