@@ -5,12 +5,6 @@
 //!   `cargo bench --package ultrasql-txn --bench txn_v04`
 
 #![allow(clippy::missing_docs_in_private_items)]
-#![allow(
-    clippy::cast_possible_truncation,
-    clippy::cast_sign_loss,
-    clippy::cast_lossless,
-    reason = "criterion benches use ad-hoc index math against compile-time-known small N constants; the cast costs aren't carried into production code"
-)]
 
 use std::sync::Arc;
 
@@ -21,6 +15,23 @@ use ultrasql_txn::{
     TransactionManager,
 };
 
+fn bench_capacity(count: u32) -> usize {
+    usize::try_from(count).expect("bench transaction count fits usize")
+}
+
+fn lcg(state: &mut u64) -> u64 {
+    *state = state
+        .wrapping_mul(6_364_136_223_846_793_005)
+        .wrapping_add(1_442_695_040_888_963_407);
+    *state
+}
+
+fn choose_index(state: &mut u64, len: usize) -> usize {
+    let len_u64 = u64::try_from(len).expect("bench xid count fits u64");
+    let index = lcg(state) % len_u64;
+    usize::try_from(index).expect("modulo by xid count fits usize")
+}
+
 // ─── SSI commit throughput ────────────────────────────────────────────────────
 
 /// Measure commit throughput for N serializable transactions going through
@@ -30,7 +41,7 @@ use ultrasql_txn::{
 ///   - `no_contention`: each XID has a unique predicate lock (no conflicts).
 ///   - `with_contention`: ~10% of XIDs share a rw-conflict edge.
 fn bench_ssi_via_txn_manager(c: &mut Criterion) {
-    const N: u64 = 500;
+    const N: u32 = 500;
 
     let mut group = c.benchmark_group("ssi_via_txn_manager");
     group.sample_size(20);
@@ -43,12 +54,12 @@ fn bench_ssi_via_txn_manager(c: &mut Criterion) {
             let ssi = Arc::new(SsiManager::new());
             let mgr = Arc::new(TransactionManager::new_with_ssi(Arc::clone(&ssi)));
 
-            let mut txns = Vec::with_capacity(N as usize);
-            for _ in 0..N {
+            let mut txns = Vec::with_capacity(bench_capacity(N));
+            for relation_id in 1..=N {
                 let t = mgr.begin(IsolationLevel::Serializable);
                 mgr.record_predicate_lock(
                     t.xid,
-                    PredicateLockTag::Relation(RelationId::new(t.xid.raw() as u32)),
+                    PredicateLockTag::Relation(RelationId::new(relation_id)),
                 );
                 txns.push(t);
             }
@@ -67,7 +78,7 @@ fn bench_ssi_via_txn_manager(c: &mut Criterion) {
             let ssi = Arc::new(SsiManager::new());
             let mgr = Arc::new(TransactionManager::new_with_ssi(Arc::clone(&ssi)));
 
-            let mut txns = Vec::with_capacity(N as usize);
+            let mut txns = Vec::with_capacity(bench_capacity(N));
             for _ in 0..N {
                 let t = mgr.begin(IsolationLevel::Serializable);
                 mgr.record_predicate_lock(t.xid, PredicateLockTag::Relation(RelationId::new(1)));
@@ -76,17 +87,11 @@ fn bench_ssi_via_txn_manager(c: &mut Criterion) {
 
             // Seed a deterministic pseudo-random stream with a simple LCG.
             let mut state: u64 = 0xDEAD_BEEF_CAFE_1337;
-            let lcg = |s: &mut u64| -> u64 {
-                *s = s
-                    .wrapping_mul(6_364_136_223_846_793_005)
-                    .wrapping_add(1_442_695_040_888_963_407);
-                *s
-            };
 
             let xids: Vec<Xid> = txns.iter().map(|t| t.xid).collect();
-            for i in 0..N as usize {
+            for i in 0..xids.len() {
                 if lcg(&mut state) % 10 == 0 {
-                    let j = (lcg(&mut state) as usize) % xids.len();
+                    let j = choose_index(&mut state, xids.len());
                     if j != i {
                         mgr.record_rw_conflict(xids[i], xids[j]);
                     }
