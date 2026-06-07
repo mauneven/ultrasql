@@ -10,6 +10,7 @@ STORAGE_EXTRAS_BENCH = (
 )
 STORAGE_BTREE_TESTS = REPO / "crates" / "ultrasql-storage" / "src" / "btree" / "tests.rs"
 STORAGE_HEAP_TESTS = REPO / "crates" / "ultrasql-storage" / "src" / "heap" / "tests.rs"
+STORAGE_VACUUM_TESTS = REPO / "crates" / "ultrasql-storage" / "tests" / "vacuum.rs"
 STORAGE_PAGE_THROUGHPUT_CAST = re.compile(
     r"\b(?:tuple_size|slots\.len\(\))\s+as\s+u64\b"
 )
@@ -18,6 +19,7 @@ STORAGE_BTREE_SHUFFLE_CAST = re.compile(r"\bs\s+as\s+usize\b")
 STORAGE_HEAP_TEST_CASTS = re.compile(
     r"\bN\s+as\s+usize\b|\(2 \* N\)\s+as\s+usize\b|\bi\s+as\s+u8\b|clippy::cast_"
 )
+STORAGE_VACUUM_TEST_CASTS = re.compile(r"\bi\s+as\s+i32\b")
 
 
 class StorageStyleTests(unittest.TestCase):
@@ -56,6 +58,15 @@ class StorageStyleTests(unittest.TestCase):
             code = line.split("//", maxsplit=1)[0]
             if STORAGE_HEAP_TEST_CASTS.search(code):
                 offenders.append(f"{STORAGE_HEAP_TESTS.relative_to(REPO)}:{line_no}: {line.strip()}")
+
+        self.assertEqual([], offenders)
+
+    def test_vacuum_tests_use_checked_integer_conversions(self) -> None:
+        offenders: list[str] = []
+        for line_no, line in enumerate(STORAGE_VACUUM_TESTS.read_text().splitlines(), start=1):
+            code = line.split("//", maxsplit=1)[0]
+            if STORAGE_VACUUM_TEST_CASTS.search(code):
+                offenders.append(f"{STORAGE_VACUUM_TESTS.relative_to(REPO)}:{line_no}: {line.strip()}")
 
         self.assertEqual([], offenders)
 

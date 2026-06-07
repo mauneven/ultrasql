@@ -110,6 +110,10 @@ fn make_heap() -> HeapAccess<MapLoader> {
     HeapAccess::new(pool)
 }
 
+fn usize_to_i32(value: usize) -> i32 {
+    i32::try_from(value).expect("test row index must fit i32")
+}
+
 fn visible_pairs(
     heap: &HeapAccess<MapLoader>,
     block_count: u32,
@@ -141,7 +145,8 @@ fn vacuum_undo_log_drops_only_below_threshold() {
     // Seed the relation with ROWS rows under xid 1 (committed).
     oracle.set_committed(Xid::new(1));
     for i in 0..ROWS {
-        let bytes = pair_payload(i as i32, (i as i32) * 3);
+        let id = usize_to_i32(i);
+        let bytes = pair_payload(id, id * 3);
         heap.insert(
             rel(),
             &bytes,
@@ -262,8 +267,12 @@ fn long_snapshot_survives_update_delete_and_vacuum() {
     let oracle = MapOracle::new();
     oracle.set_committed(Xid::new(1));
 
-    let expected_original: Vec<(i32, i32)> =
-        (0..ROWS).map(|i| (i as i32, (i as i32) * 10)).collect();
+    let expected_original: Vec<(i32, i32)> = (0..ROWS)
+        .map(|i| {
+            let id = usize_to_i32(i);
+            (id, id * 10)
+        })
+        .collect();
     for (id, val) in &expected_original {
         heap.insert(
             rel(),
