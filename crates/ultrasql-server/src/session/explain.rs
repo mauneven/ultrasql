@@ -37,7 +37,7 @@ use super::Session;
 use crate::error::ServerError;
 use crate::pipeline::LowerCtx;
 use crate::result_encoder::SelectResult;
-use crate::run_plan_in_txn;
+use crate::{RunPlanInTxnArgs, run_plan_in_txn};
 
 impl<RW> Session<RW>
 where
@@ -144,40 +144,40 @@ where
             .txn_manager
             .begin(ultrasql_txn::IsolationLevel::ReadCommitted);
         let mut stream_buf = bytes::BytesMut::new();
-        let outcome = run_plan_in_txn(
-            inner,
-            &txn,
-            Arc::clone(catalog_snapshot),
-            Arc::clone(&self.state.table_constraints),
-            Arc::clone(&self.state.sequences),
-            Arc::clone(&self.state.sequence_owners),
-            Arc::clone(&self.state.sequence_namespaces),
-            Arc::clone(&self.state.schemas),
-            Arc::clone(&self.state.operators),
-            Arc::clone(&self.state.role_catalog),
-            Arc::clone(&self.state.privilege_catalog),
-            Arc::clone(&self.state.row_security),
-            Arc::new(self.session_settings.clone()),
-            self.current_user.clone(),
-            self.auth_user.clone(),
-            Arc::clone(&self.state.persistent_catalog),
-            Arc::clone(&self.state.time_partitions),
-            Arc::clone(&self.state.workload_recorder),
-            self.state.autovacuum_config(),
-            self.state.logging_config(),
-            self.state.wal_archive_config(),
-            self.state.data_dir.clone(),
-            Arc::clone(&self.state.logical_replication),
-            Some(self.sequence_state.clone()),
-            Some(self.advisory_state.clone()),
-            &self.state.tables,
-            Arc::clone(&self.state.heap),
-            Arc::clone(&self.state.vm),
-            Arc::clone(&self.state.txn_manager),
-            self.jit_config(),
-            Some(self.cancel_flag.clone()),
-            &mut stream_buf,
-        );
+        let outcome = run_plan_in_txn(RunPlanInTxnArgs {
+            plan: inner,
+            txn: &txn,
+            catalog_snapshot: Arc::clone(catalog_snapshot),
+            table_constraints: Arc::clone(&self.state.table_constraints),
+            sequences: Arc::clone(&self.state.sequences),
+            sequence_owners: Arc::clone(&self.state.sequence_owners),
+            sequence_namespaces: Arc::clone(&self.state.sequence_namespaces),
+            schemas: Arc::clone(&self.state.schemas),
+            operators: Arc::clone(&self.state.operators),
+            role_catalog: Arc::clone(&self.state.role_catalog),
+            privilege_catalog: Arc::clone(&self.state.privilege_catalog),
+            row_security: Arc::clone(&self.state.row_security),
+            session_settings: Arc::new(self.session_settings.clone()),
+            current_user: self.current_user.clone(),
+            session_user: self.auth_user.clone(),
+            persistent_catalog: Arc::clone(&self.state.persistent_catalog),
+            time_partitions: Arc::clone(&self.state.time_partitions),
+            workload_recorder: Arc::clone(&self.state.workload_recorder),
+            autovacuum_config: self.state.autovacuum_config(),
+            logging_config: self.state.logging_config(),
+            wal_archive_config: self.state.wal_archive_config(),
+            data_dir: self.state.data_dir.clone(),
+            logical_replication: Arc::clone(&self.state.logical_replication),
+            sequence_state: Some(self.sequence_state.clone()),
+            advisory_state: Some(self.advisory_state.clone()),
+            tables: &self.state.tables,
+            heap: Arc::clone(&self.state.heap),
+            vm: Arc::clone(&self.state.vm),
+            oracle: Arc::clone(&self.state.txn_manager),
+            jit: self.jit_config(),
+            cancel_flag: Some(self.cancel_flag.clone()),
+            stream_buf: &mut stream_buf,
+        });
         // Always commit the read-only ANALYZE txn — we don't surface
         // its results, only the row count buried in the `SelectResult`.
         let rows = match outcome {

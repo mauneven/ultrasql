@@ -7815,21 +7815,9 @@ fn notice_warning(sqlstate: &str, message: &str) -> BackendMessage {
     }
 }
 
-/// Run a non-DDL, non-transaction-control plan inside the given
-/// transaction and return the assembled wire-message result.
-///
-/// Owns no state of its own: it captures everything it needs by
-/// argument so both the Simple Query and Extended Query paths can call
-/// it. The caller is responsible for committing or aborting `txn` based
-/// on whether this function returned `Ok` or `Err`.
-///
-/// `command_id` is taken from `txn.current_command` so each statement
-/// inside an explicit transaction sees its own writes via the MVCC
-/// `cmin < current_command` rule.
-#[allow(clippy::too_many_arguments)]
-fn run_plan_in_txn(
-    plan: &LogicalPlan,
-    txn: &Transaction,
+struct RunPlanInTxnArgs<'a> {
+    plan: &'a LogicalPlan,
+    txn: &'a Transaction,
     catalog_snapshot: Arc<CatalogSnapshot>,
     table_constraints: Arc<dashmap::DashMap<ultrasql_core::Oid, Arc<TableRuntimeConstraints>>>,
     sequences: Arc<dashmap::DashMap<String, Arc<ultrasql_storage::sequence::Sequence>>>,
@@ -7853,14 +7841,61 @@ fn run_plan_in_txn(
     logical_replication: Arc<replication::LogicalReplicationRuntime>,
     sequence_state: Option<SequenceSessionState>,
     advisory_state: Option<AdvisorySessionState>,
-    tables: &SampleTables,
+    tables: &'a SampleTables,
     heap: Arc<HeapAccess<BlankPageLoader>>,
     vm: Arc<VisibilityMap>,
     oracle: Arc<TransactionManager>,
     jit: ultrasql_vec::jit::JitConfig,
     cancel_flag: Option<ultrasql_executor::CancelFlag>,
-    stream_buf: &mut bytes::BytesMut,
-) -> Result<SelectResult, ServerError> {
+    stream_buf: &'a mut bytes::BytesMut,
+}
+
+/// Run a non-DDL, non-transaction-control plan inside the given
+/// transaction and return the assembled wire-message result.
+///
+/// Owns no state of its own: it captures everything it needs by
+/// argument so both the Simple Query and Extended Query paths can call
+/// it. The caller is responsible for committing or aborting `txn` based
+/// on whether this function returned `Ok` or `Err`.
+///
+/// `command_id` is taken from `txn.current_command` so each statement
+/// inside an explicit transaction sees its own writes via the MVCC
+/// `cmin < current_command` rule.
+fn run_plan_in_txn(args: RunPlanInTxnArgs<'_>) -> Result<SelectResult, ServerError> {
+    let RunPlanInTxnArgs {
+        plan,
+        txn,
+        catalog_snapshot,
+        table_constraints,
+        sequences,
+        sequence_owners,
+        sequence_namespaces,
+        schemas,
+        operators,
+        role_catalog,
+        privilege_catalog,
+        row_security,
+        session_settings,
+        current_user,
+        session_user,
+        persistent_catalog,
+        time_partitions,
+        workload_recorder,
+        autovacuum_config,
+        logging_config,
+        wal_archive_config,
+        data_dir,
+        logical_replication,
+        sequence_state,
+        advisory_state,
+        tables,
+        heap,
+        vm,
+        oracle,
+        jit,
+        cancel_flag,
+        stream_buf,
+    } = args;
     if let Some(result) =
         try_run_cached_int32_pair_select(plan, &catalog_snapshot, heap.as_ref(), stream_buf)
     {
