@@ -166,6 +166,29 @@ impl RecordType {
     }
 }
 
+impl From<RecordType> for u8 {
+    fn from(record_type: RecordType) -> Self {
+        match record_type {
+            RecordType::HeapInsert => 1,
+            RecordType::HeapUpdate => 2,
+            RecordType::HeapDelete => 3,
+            RecordType::FullPageWrite => 4,
+            RecordType::Commit => 5,
+            RecordType::Abort => 6,
+            RecordType::Checkpoint => 7,
+            RecordType::BTreeOp => 8,
+            RecordType::HeapUpdateInPlace => 9,
+            RecordType::HeapDeleteInPlace => 10,
+            RecordType::SequenceOp => 11,
+            RecordType::HashOp => 12,
+            RecordType::HnswOp => 13,
+            RecordType::IvfFlatOp => 14,
+            RecordType::HeapUpdateInPlaceBatch => 15,
+            RecordType::Nop => 255,
+        }
+    }
+}
+
 /// Decoded WAL record header.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct WalRecordHeader {
@@ -296,7 +319,7 @@ fn encode_header_into(header: &WalRecordHeader, bytes: &mut [u8]) {
         header.prev_lsn.raw(),
     );
     write_u64_le(&mut bytes[XID_OFFSET..XID_OFFSET + 8], header.xid.raw());
-    bytes[RTYPE_OFFSET] = header.record_type as u8;
+    bytes[RTYPE_OFFSET] = u8::from(header.record_type);
     bytes[FLAGS_OFFSET] = header.flags;
     for b in &mut bytes[FLAGS_OFFSET + 1..RECORD_HEADER_SIZE] {
         *b = 0;
@@ -428,7 +451,7 @@ mod tests {
             RecordType::HeapUpdateInPlaceBatch,
             RecordType::Nop,
         ] {
-            let raw = rt as u8;
+            let raw = u8::from(rt);
             let parsed = RecordType::from_u8(raw).unwrap();
             assert_eq!(parsed, rt);
         }
@@ -464,7 +487,7 @@ mod tests {
         // exact cap value.
         write_u32_le(&mut bytes[TOTAL_LEN_OFFSET..TOTAL_LEN_OFFSET + 4], u32::MAX);
         write_u32_le(&mut bytes[CRC_OFFSET..CRC_OFFSET + 4], 0xDEAD_BEEF);
-        bytes[RTYPE_OFFSET] = RecordType::HeapInsert as u8;
+        bytes[RTYPE_OFFSET] = u8::from(RecordType::HeapInsert);
         let err = WalRecord::decode(&bytes).unwrap_err();
         assert!(matches!(err, WalRecordError::Malformed(_)), "got {err:?}");
     }
@@ -481,7 +504,7 @@ mod tests {
             &mut bytes[TOTAL_LEN_OFFSET..TOTAL_LEN_OFFSET + 4],
             just_past,
         );
-        bytes[RTYPE_OFFSET] = RecordType::HeapInsert as u8;
+        bytes[RTYPE_OFFSET] = u8::from(RecordType::HeapInsert);
         let err = WalRecord::decode(&bytes).unwrap_err();
         assert!(matches!(err, WalRecordError::Malformed(_)), "got {err:?}");
     }
