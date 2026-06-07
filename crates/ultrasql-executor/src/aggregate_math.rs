@@ -78,11 +78,7 @@ pub(crate) fn add_dense_vector_values(
 
 pub(crate) fn divide_dense_vector_values(values: Vec<f32>, count: i64) -> Vec<f32> {
     debug_assert!(count > 0, "vector average count must be positive");
-    #[allow(
-        clippy::cast_precision_loss,
-        reason = "aggregate count becomes a dense-vector denominator"
-    )]
-    let denominator = count as f32;
+    let denominator = count.to_f32().unwrap_or(f32::MAX);
     values
         .into_iter()
         .map(|value| value / denominator)
