@@ -154,7 +154,7 @@ impl<'src> Parser<'src> {
             other => Err(ParseError::Expected {
                 expected: "NULL, TRUE, FALSE, UNKNOWN, or DISTINCT FROM after IS",
                 found: other,
-                offset: tok.span.start as usize,
+                offset: tok.span.start_usize(),
             }),
         }
     }

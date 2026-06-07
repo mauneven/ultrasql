@@ -257,7 +257,7 @@ impl<'src> Parser<'src> {
                     return Err(ParseError::Expected {
                         expected: "expression",
                         found: tok_kind,
-                        offset: tok_span.start as usize,
+                        offset: tok_span.start_usize(),
                     });
                 }
                 let kw_tok = self.advance()?;
@@ -323,12 +323,12 @@ impl<'src> Parser<'src> {
                     .parse()
                     .map_err(|_| ParseError::ParameterOutOfRange {
                         text: raw.to_owned(),
-                        offset: t.span.start as usize,
+                        offset: t.span.start_usize(),
                     })?;
                 if n == 0 {
                     return Err(ParseError::ParameterOutOfRange {
                         text: raw.to_owned(),
-                        offset: t.span.start as usize,
+                        offset: t.span.start_usize(),
                     });
                 }
                 Ok(Expr::Parameter {
@@ -363,7 +363,7 @@ impl<'src> Parser<'src> {
                             return Err(ParseError::Expected {
                                 expected: "exactly two expressions before OVERLAPS",
                                 found: TokenKind::KwOverlaps,
-                                offset: self.peek()?.span.start as usize,
+                                offset: self.peek()?.span.start_usize(),
                             });
                         }
                         self.advance()?; // OVERLAPS
@@ -377,14 +377,14 @@ impl<'src> Parser<'src> {
                             return Err(ParseError::Expected {
                                 expected: "left OVERLAPS start expression",
                                 found: TokenKind::KwOverlaps,
-                                offset: lp.span.start as usize,
+                                offset: lp.span.start_usize(),
                             });
                         };
                         let Some(le) = iter.next() else {
                             return Err(ParseError::Expected {
                                 expected: "left OVERLAPS end expression",
                                 found: TokenKind::KwOverlaps,
-                                offset: lp.span.start as usize,
+                                offset: lp.span.start_usize(),
                             });
                         };
                         return Ok(Expr::Overlaps {
@@ -467,7 +467,7 @@ impl<'src> Parser<'src> {
             other => Err(ParseError::Expected {
                 expected: "expression",
                 found: other,
-                offset: tok_span.start as usize,
+                offset: tok_span.start_usize(),
             }),
         }
     }
@@ -798,7 +798,7 @@ impl<'src> Parser<'src> {
             return Err(ParseError::Expected {
                 expected: "DOCUMENT or CONTENT",
                 found: tok.kind,
-                offset: tok.span.start as usize,
+                offset: tok.span.start_usize(),
             });
         }
         let raw = tok.text(self.source).unwrap_or("");
@@ -806,7 +806,7 @@ impl<'src> Parser<'src> {
             return Err(ParseError::Expected {
                 expected: "DOCUMENT or CONTENT",
                 found: tok.kind,
-                offset: tok.span.start as usize,
+                offset: tok.span.start_usize(),
             });
         }
         let value = raw.to_ascii_lowercase();
@@ -880,7 +880,7 @@ impl<'src> Parser<'src> {
                         return Err(ParseError::Expected {
                             expected: "FIRST or LAST after NULLS",
                             found: n.kind,
-                            offset: n.span.start as usize,
+                            offset: n.span.start_usize(),
                         });
                     }
                 } else {
@@ -945,7 +945,7 @@ impl<'src> Parser<'src> {
             other => Err(ParseError::Expected {
                 expected: "type name",
                 found: other,
-                offset: tok.span.start as usize,
+                offset: tok.span.start_usize(),
             }),
         }
     }
@@ -1089,7 +1089,7 @@ impl<'src> Parser<'src> {
             return Err(ParseError::Expected {
                 expected: "vector-family typed literal",
                 found: type_tok.kind,
-                offset: type_tok.span.start as usize,
+                offset: type_tok.span.start_usize(),
             });
         };
         let mut type_name = base.to_owned();
@@ -1107,7 +1107,7 @@ impl<'src> Parser<'src> {
             return Err(ParseError::Expected {
                 expected: "vector-family literal string",
                 found: str_tok.kind,
-                offset: str_tok.span.start as usize,
+                offset: str_tok.span.start_usize(),
             });
         }
         let raw = str_tok.text(self.source).unwrap_or("");
@@ -1186,7 +1186,7 @@ impl<'src> Parser<'src> {
                 return Err(ParseError::Expected {
                     expected: "at most precision and scale modifiers",
                     found: TokenKind::Integer,
-                    offset: rp.span.start as usize,
+                    offset: rp.span.start_usize(),
                 });
             }
             target.value = format!("{base}({})", modifiers.join(","));

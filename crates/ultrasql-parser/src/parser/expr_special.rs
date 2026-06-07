@@ -39,7 +39,7 @@ impl<'src> Parser<'src> {
             return Err(ParseError::Expected {
                 expected: "WHEN clause in CASE expression",
                 found: self.peek()?.kind,
-                offset: self.peek()?.span.start as usize,
+                offset: self.peek()?.span.start_usize(),
             });
         }
 

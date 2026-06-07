@@ -142,14 +142,14 @@ impl<'src> Parser<'src> {
             return Err(ParseError::Expected {
                 expected: "operator token inside OPERATOR(...)",
                 found: tok.kind,
-                offset: tok.span.start as usize,
+                offset: tok.span.start_usize(),
             });
         };
         if op != expected {
             return Err(ParseError::Expected {
                 expected: "matching OPERATOR(...) token",
                 found: tok.kind,
-                offset: tok.span.start as usize,
+                offset: tok.span.start_usize(),
             });
         }
         self.expect(TokenKind::RParen, ")")?;
