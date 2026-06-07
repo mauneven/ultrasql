@@ -36,7 +36,10 @@ use ultrasql_planner::{AggregateFunc, LogicalAggregateExpr, ScalarExpr};
 use ultrasql_vec::column::{Column, NumericColumn};
 use ultrasql_vec::{Batch, count_i64, max_i64, min_i64};
 
-use crate::aggregate_math::{add_dense_vector_values, divide_dense_vector_values, widen_sum_seed};
+use crate::aggregate_math::{
+    add_dense_vector_values, divide_dense_vector_values, percentile_cont_indexes,
+    percentile_disc_index, usize_to_f64, widen_sum_seed,
+};
 use crate::eval::Eval;
 use crate::filter_op::batch_to_rows;
 use crate::row_codec::RowCodec;
@@ -2025,32 +2028,13 @@ fn finalise_percentile_cont(values: &[f64], fraction: Option<f64>, asc: bool) ->
         sorted.reverse();
     }
     let n = sorted.len();
-    #[allow(
-        clippy::cast_precision_loss,
-        reason = "percentile arithmetic; sample count rarely above 2^53"
-    )]
-    let n_f64 = n as f64;
+    let n_f64 = usize_to_f64(n);
     let row_number = fraction * (n_f64 - 1.0);
-    #[allow(
-        clippy::cast_possible_truncation,
-        clippy::cast_sign_loss,
-        reason = "row_number bounded by [0, n - 1]"
-    )]
-    let lo = row_number.floor() as usize;
-    #[allow(
-        clippy::cast_possible_truncation,
-        clippy::cast_sign_loss,
-        reason = "row_number bounded by [0, n - 1]"
-    )]
-    let hi = row_number.ceil() as usize;
+    let (lo, hi) = percentile_cont_indexes(row_number, n);
     if lo == hi {
         return Value::Float64(sorted[lo]);
     }
-    #[allow(
-        clippy::cast_precision_loss,
-        reason = "lo is < 2^53 in practice; percentile interpolation"
-    )]
-    let frac_part = row_number - lo as f64;
+    let frac_part = row_number - usize_to_f64(lo);
     Value::Float64(sorted[hi].mul_add(frac_part, sorted[lo] * (1.0 - frac_part)))
 }
 
@@ -2073,14 +2057,8 @@ fn finalise_percentile_disc(
             .unwrap_or(std::cmp::Ordering::Equal);
         if asc { ord } else { ord.reverse() }
     });
-    #[allow(
-        clippy::cast_precision_loss,
-        clippy::cast_possible_truncation,
-        clippy::cast_sign_loss,
-        reason = "percentile_disc arithmetic; idx bounded by ceil(frac * len) <= len"
-    )]
-    let idx = (fraction * sorted.len() as f64).ceil() as usize;
-    Ok(sorted[idx.saturating_sub(1).min(sorted.len() - 1)].clone())
+    let idx = percentile_disc_index(fraction, sorted.len());
+    Ok(sorted[idx].clone())
 }
 
 fn validate_percentile_disc_values(values: &[Value], nulls_first: bool) -> Result<(), ExecError> {
@@ -3458,9 +3436,9 @@ mod tests {
     /// when every row is NULL.
     #[test]
     fn vectorized_sum_i64_honours_nulls() {
-        let n = 1024_i64;
-        let values: Vec<i64> = (0..n).collect();
-        let nulls_pat: Vec<bool> = (0..n as usize).map(|i| !i.is_multiple_of(17)).collect();
+        let n = 1024_usize;
+        let values: Vec<i64> = (0..i64::try_from(n).expect("n fits i64")).collect();
+        let nulls_pat: Vec<bool> = (0..n).map(|i| !i.is_multiple_of(17)).collect();
         let (schema, batch) = make_i64_batch(values.clone(), Some(nulls_pat.clone()));
         let out_schema =
             Schema::new([Field::nullable("total", DataType::Int64)]).expect("schema ok");
