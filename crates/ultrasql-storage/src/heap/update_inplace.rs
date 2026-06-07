@@ -21,6 +21,20 @@ struct Int32PairRangeUpdate {
     compact_undo: Vec<Int32PairUndoBatch>,
 }
 
+struct UpdateInt32PairRange<'a, O: ?Sized, P: ?Sized> {
+    rel: RelationId,
+    start_block: u32,
+    end_block: u32,
+    snapshot: &'a Snapshot,
+    oracle: &'a O,
+    predicate: &'a P,
+    target_col: u8,
+    delta: i32,
+    xid: Xid,
+    command_id: CommandId,
+    vm: Option<&'a crate::vm::VisibilityMap>,
+}
+
 #[derive(Debug)]
 struct PageUndoSlots {
     first_slot: u16,
@@ -760,19 +774,19 @@ impl<L: PageLoader> HeapAccess<L> {
             while start_block < block_count {
                 let end_block = start_block.saturating_add(chunk_blocks).min(block_count);
                 handles.push(scope.spawn(move || {
-                    self.update_int32_pair_range_no_wal(
+                    self.update_int32_pair_range_no_wal(UpdateInt32PairRange {
                         rel,
                         start_block,
                         end_block,
                         snapshot,
                         oracle,
-                        predicate_ref,
+                        predicate: predicate_ref,
                         target_col,
                         delta,
                         xid,
                         command_id,
                         vm,
-                    )
+                    })
                 }));
                 start_block = end_block;
             }
@@ -815,27 +829,29 @@ impl<L: PageLoader> HeapAccess<L> {
         Ok(total_updated)
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn update_int32_pair_range_no_wal<O, P>(
         &self,
-        rel: RelationId,
-        start_block: u32,
-        end_block: u32,
-        snapshot: &Snapshot,
-        oracle: &O,
-        predicate: &P,
-        target_col: u8,
-        delta: i32,
-        xid: Xid,
-        command_id: CommandId,
-        vm: Option<&crate::vm::VisibilityMap>,
+        request: UpdateInt32PairRange<'_, O, P>,
     ) -> Result<Int32PairRangeUpdate, HeapError>
     where
         O: XidStatusOracle + ?Sized,
-        P: Fn(i32, i32) -> bool,
+        P: Fn(i32, i32) -> bool + ?Sized,
     {
         use crate::page::{ITEMID_SIZE, PAGE_HEADER_SIZE};
 
+        let UpdateInt32PairRange {
+            rel,
+            start_block,
+            end_block,
+            snapshot,
+            oracle,
+            predicate,
+            target_col,
+            delta,
+            xid,
+            command_id,
+            vm,
+        } = request;
         let range_len = usize_from_u32(
             end_block.saturating_sub(start_block),
             "block range overflow",
