@@ -33,6 +33,7 @@
 
 use std::sync::Arc;
 
+use num_traits::ToPrimitive;
 use ultrasql_core::{DataType, Field, Schema};
 use ultrasql_storage::column_cache::CachedColumns;
 use ultrasql_vec::column::{Column, NumericColumn};
@@ -582,11 +583,7 @@ impl Operator for CachedAvgI32Scan {
             null_f64_column()?
         } else {
             let total = sum_i32_widening(col);
-            // Cast through f64 once; matches PostgreSQL's
-            // `AVG(int) → float8` widening rule under the bench's
-            // schema (the binder declares the aggregate's result
-            // type as Float64).
-            let avg = (total as f64) / (non_null as f64);
+            let avg = i64_to_f64_saturating(total) / usize_to_f64_saturating(non_null);
             Column::Float64(NumericColumn::from_data(vec![avg]))
         };
         let batch = Batch::new([result_col]).map_err(ExecError::from)?;
@@ -735,6 +732,20 @@ impl Operator for FilterSumI64Scan {
     fn estimated_row_count(&self) -> Option<usize> {
         Some(1)
     }
+}
+
+fn i64_to_f64_saturating(value: i64) -> f64 {
+    value.to_f64().unwrap_or_else(|| {
+        if value.is_negative() {
+            f64::MIN
+        } else {
+            f64::MAX
+        }
+    })
+}
+
+fn usize_to_f64_saturating(value: usize) -> f64 {
+    value.to_f64().unwrap_or(f64::MAX)
 }
 
 #[cfg(test)]

@@ -3843,7 +3843,9 @@ fn eval_to_timestamp(args: &[Value]) -> Result<Value, EvalError> {
         return Ok(Value::Null);
     };
     let unix_micros = (seconds * 1_000_000.0).round();
-    if !unix_micros.is_finite() || unix_micros < i64::MIN as f64 || unix_micros > i64::MAX as f64 {
+    let min_micros = i64::MIN.to_f64().ok_or(EvalError::Overflow)?;
+    let max_micros = i64::MAX.to_f64().ok_or(EvalError::Overflow)?;
+    if !unix_micros.is_finite() || unix_micros < min_micros || unix_micros > max_micros {
         return Err(EvalError::Type(
             "to_timestamp: timestamp overflow".to_owned(),
         ));

@@ -30,6 +30,7 @@ use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 
+use num_traits::ToPrimitive;
 use serde_json::{Number as JsonNumber, Value as JsonValue};
 use ultrasql_core::{DataType, Schema, Value, bpchar_semantic_text, timetz_utc_micros};
 use ultrasql_planner::{AggregateFunc, LogicalAggregateExpr, ScalarExpr};
@@ -1803,7 +1804,7 @@ fn accumulate_value(state: &mut AggState, arg_val: Option<Value>) -> Result<(), 
                     // sum-of-squares minus square-of-sum recipe.
                     increment_count(count, 1)?;
                     let delta = x - *mean;
-                    *mean += delta / *count as f64;
+                    *mean += delta / i64_to_f64_saturating(*count);
                     let delta2 = x - *mean;
                     *m2 += delta * delta2;
                 }
@@ -1906,7 +1907,7 @@ fn value_as_f64(v: &Value) -> Option<f64> {
     match v {
         Value::Int16(x) => Some(f64::from(*x)),
         Value::Int32(x) => Some(f64::from(*x)),
-        Value::Int64(x) => Some(*x as f64),
+        Value::Int64(x) => Some(i64_to_f64_saturating(*x)),
         Value::Float32(x) => Some(f64::from(*x)),
         Value::Float64(x) => Some(*x),
         Value::Decimal { value, scale } => Some(decimal_to_f64(*value, *scale)),
@@ -1971,7 +1972,7 @@ fn finalise(state: &AggState) -> Result<Value, ExecError> {
             if *count < 2 {
                 return Ok(Value::Null);
             }
-            let n = *count as f64;
+            let n = i64_to_f64_saturating(*count);
             let numerator = n.mul_add(*sum_xy, -(*sum_x * *sum_y));
             let x_term = n.mul_add(*sum_x2, -(*sum_x * *sum_x));
             let y_term = n.mul_add(*sum_y2, -(*sum_y * *sum_y));
@@ -1998,7 +1999,7 @@ fn finalise(state: &AggState) -> Result<Value, ExecError> {
             if denom <= 0 {
                 return Ok(Value::Null);
             }
-            let var = m2 / denom as f64;
+            let var = m2 / i64_to_f64_saturating(denom);
             Ok(Value::Float64(if *sqrt { var.sqrt() } else { var }))
         }
         AggState::PercentileCont {
@@ -2169,12 +2170,11 @@ fn add_values(a: Value, b: Value) -> Result<Value, ExecError> {
 
 /// Divide a running sum by the count to produce an average.
 fn divide_value(sum: Value, count: i64) -> Value {
+    let count_f64 = i64_to_f64_saturating(count);
     match sum {
-        Value::Int64(s) => Value::Float64(s as f64 / count as f64),
-        Value::Float64(s) => Value::Float64(s / count as f64),
-        Value::Decimal { value, scale } => {
-            Value::Float64(decimal_to_f64(value, scale) / count as f64)
-        }
+        Value::Int64(s) => Value::Float64(i64_to_f64_saturating(s) / count_f64),
+        Value::Float64(s) => Value::Float64(s / count_f64),
+        Value::Decimal { value, scale } => Value::Float64(decimal_to_f64(value, scale) / count_f64),
         Value::Vector(values) => Value::Vector(divide_dense_vector_values(values, count)),
         Value::HalfVec(values) => Value::HalfVec(divide_dense_vector_values(values, count)),
         other => other,
@@ -2227,8 +2227,18 @@ fn pow10_i128(exp: u32) -> Option<i128> {
 }
 
 fn decimal_to_f64(value: i64, scale: i32) -> f64 {
-    let raw = value as f64;
+    let raw = i64_to_f64_saturating(value);
     raw / 10_f64.powi(scale)
+}
+
+fn i64_to_f64_saturating(value: i64) -> f64 {
+    value.to_f64().unwrap_or_else(|| {
+        if value.is_negative() {
+            f64::MIN
+        } else {
+            f64::MAX
+        }
+    })
 }
 
 /// Returns `true` if `a < b` under the natural total order.

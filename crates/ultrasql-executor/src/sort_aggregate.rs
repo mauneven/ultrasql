@@ -26,6 +26,7 @@
 //!
 //! [`HashAggregate`]: crate::HashAggregate
 
+use num_traits::ToPrimitive;
 use serde_json::{Number as JsonNumber, Value as JsonValue};
 use ultrasql_core::{DataType, Schema, Value};
 use ultrasql_planner::{AggregateFunc, LogicalAggregateExpr, ScalarExpr};
@@ -334,7 +335,7 @@ fn finalise(state: &AggState) -> Value {
             if *cnt < 2 {
                 return Value::Null;
             }
-            let n = *cnt as f64;
+            let n = i64_to_f64_saturating(*cnt);
             let variance = (*sum_x2 - (*sum_x * *sum_x) / n) / (n - 1.0);
             Value::Float64(variance)
         }
@@ -342,7 +343,7 @@ fn finalise(state: &AggState) -> Value {
             if *cnt < 2 {
                 return Value::Null;
             }
-            let n = *cnt as f64;
+            let n = i64_to_f64_saturating(*cnt);
             let variance = (*sum_x2 - (*sum_x * *sum_x) / n) / (n - 1.0);
             Value::Float64(variance.sqrt())
         }
@@ -350,7 +351,7 @@ fn finalise(state: &AggState) -> Value {
             if *cnt < 2 {
                 return Value::Null;
             }
-            let n = *cnt as f64;
+            let n = i64_to_f64_saturating(*cnt);
             let num = n * *sxy - *sx * *sy;
             let x_term = n * *sx2 - *sx * *sx;
             let y_term = n * *sy2 - *sy * *sy;
@@ -503,7 +504,7 @@ fn to_f64(v: &Value) -> Option<f64> {
     match v {
         Value::Int16(x) => Some(f64::from(*x)),
         Value::Int32(x) => Some(f64::from(*x)),
-        Value::Int64(x) => Some(*x as f64),
+        Value::Int64(x) => Some(i64_to_f64_saturating(*x)),
         Value::Float32(x) => Some(f64::from(*x)),
         Value::Float64(x) => Some(*x),
         Value::Decimal { value, scale } => Some(decimal_to_f64(*value, *scale)),
@@ -555,12 +556,11 @@ fn add_values(a: Value, b: Value) -> Result<Value, ExecError> {
 }
 
 fn divide_value(sum: Value, count: i64) -> Value {
+    let count_f64 = i64_to_f64_saturating(count);
     match sum {
-        Value::Int64(s) => Value::Float64(s as f64 / count as f64),
-        Value::Float64(s) => Value::Float64(s / count as f64),
-        Value::Decimal { value, scale } => {
-            Value::Float64(decimal_to_f64(value, scale) / count as f64)
-        }
+        Value::Int64(s) => Value::Float64(i64_to_f64_saturating(s) / count_f64),
+        Value::Float64(s) => Value::Float64(s / count_f64),
+        Value::Decimal { value, scale } => Value::Float64(decimal_to_f64(value, scale) / count_f64),
         Value::Vector(values) => Value::Vector(divide_dense_vector_values(values, count)),
         Value::HalfVec(values) => Value::HalfVec(divide_dense_vector_values(values, count)),
         other => other,
@@ -613,8 +613,18 @@ fn pow10_i128(exp: u32) -> Option<i128> {
 }
 
 fn decimal_to_f64(value: i64, scale: i32) -> f64 {
-    let raw = value as f64;
+    let raw = i64_to_f64_saturating(value);
     raw / 10_f64.powi(scale)
+}
+
+fn i64_to_f64_saturating(value: i64) -> f64 {
+    value.to_f64().unwrap_or_else(|| {
+        if value.is_negative() {
+            f64::MIN
+        } else {
+            f64::MAX
+        }
+    })
 }
 
 fn value_lt(a: &Value, b: &Value) -> bool {

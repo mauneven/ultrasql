@@ -269,9 +269,10 @@ impl Operator for Filter {
         if child_rows == 0 {
             return Some(0);
         }
-        let estimated = (child_rows as f64 * self.selectivity_hint)
+        let child_rows_f64 = child_rows.to_f64().unwrap_or(f64::MAX);
+        let estimated = (child_rows_f64 * self.selectivity_hint)
             .ceil()
-            .clamp(1.0, child_rows as f64);
+            .clamp(1.0, child_rows_f64);
         Some(estimated.to_usize().unwrap_or(child_rows))
     }
 
