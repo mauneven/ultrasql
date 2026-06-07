@@ -24,21 +24,16 @@ impl Span {
         Self { start, end }
     }
 
-    /// Construct a span from `usize` offsets, truncating to `u32`. The
-    /// truncation is fine because SQL statements are bounded to a few
-    /// megabytes; spans never need 64-bit precision.
-    ///
-    /// `const fn` cannot call `u32::try_from`, hence the explicit `as`
-    /// casts gated by `#[allow]`. The truncation contract is documented
-    /// above and exercised by callers that cap input size upstream.
+    /// Construct a span from `usize` offsets, saturating at `u32::MAX`.
+    /// SQL statements are bounded to a few megabytes upstream, so normal
+    /// callers never reach saturation.
     #[inline]
     #[must_use]
-    #[allow(
-        clippy::cast_possible_truncation,
-        reason = "SQL statement size bounded upstream; truncating offsets to u32 is the documented contract"
-    )]
-    pub const fn from_usize(start: usize, end: usize) -> Self {
-        Self::new(start as u32, end as u32)
+    pub fn from_usize(start: usize, end: usize) -> Self {
+        Self::new(
+            u32_from_usize_saturating(start),
+            u32_from_usize_saturating(end),
+        )
     }
 
     /// Length in bytes.
@@ -85,6 +80,10 @@ impl Span {
     }
 }
 
+fn u32_from_usize_saturating(value: usize) -> u32 {
+    u32::try_from(value).unwrap_or(u32::MAX)
+}
+
 impl fmt::Debug for Span {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{}..{}", self.start, self.end)
@@ -129,9 +128,15 @@ mod tests {
     }
 
     #[test]
-    fn from_usize_truncates() {
+    fn from_usize_saturates() {
         let s = Span::from_usize(10, 20);
         assert_eq!(s.start, 10);
         assert_eq!(s.end, 20);
+
+        if let Ok(overflow) = usize::try_from(u64::from(u32::MAX) + 1) {
+            let s = Span::from_usize(overflow, overflow);
+            assert_eq!(s.start, u32::MAX);
+            assert_eq!(s.end, u32::MAX);
+        }
     }
 }
