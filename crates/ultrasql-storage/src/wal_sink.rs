@@ -207,17 +207,15 @@ pub mod test_support {
     }
 
     impl WalSink for InMemoryWalSink {
-        // `significant_drop_tightening` would suggest dropping the guard before
-        // the final `Ok(lsn)`, but `lsn` is a plain `Copy` value so keeping the
-        // guard alive until function exit is safe and keeps the push+lsn
-        // assignment under one lock acquisition.
-        #[allow(clippy::significant_drop_tightening)]
         fn append(&self, record: WalRecord) -> Result<Lsn, WalSinkError> {
-            let mut inner = self.inner.lock();
-            let lsn = inner.next()?;
-            let xid_raw = record.header.xid.raw();
-            inner.last_lsn.insert(xid_raw, lsn);
-            inner.records.push((lsn, record));
+            let lsn = {
+                let mut inner = self.inner.lock();
+                let lsn = inner.next()?;
+                let xid_raw = record.header.xid.raw();
+                inner.last_lsn.insert(xid_raw, lsn);
+                inner.records.push((lsn, record));
+                lsn
+            };
             Ok(lsn)
         }
 
