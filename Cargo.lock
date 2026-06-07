@@ -3490,6 +3490,7 @@ dependencies = [
  "chrono",
  "chrono-tz",
  "libc",
+ "num-traits",
  "proptest",
  "rstest",
  "smallvec",

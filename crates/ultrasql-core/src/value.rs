@@ -15,6 +15,7 @@ use std::hash::{Hash, Hasher};
 
 use chrono::{Days, LocalResult, NaiveDate, NaiveTime, Offset, TimeZone};
 use chrono_tz::OffsetName;
+use num_traits::ToPrimitive;
 
 use crate::bit_string::BitString;
 use crate::bpchar::{bpchar_semantic_text, coerce_bpchar_text};
@@ -32,6 +33,22 @@ const MICROS_PER_SECOND: i64 = 1_000_000;
 const TIMETZ_OFFSET_BITS: u32 = 18;
 const TIMETZ_OFFSET_BIAS_SECONDS: i32 = 86_400;
 const TIMETZ_OFFSET_MASK: i64 = (1_i64 << TIMETZ_OFFSET_BITS) - 1;
+
+#[must_use]
+fn i64_to_f64(value: i64) -> f64 {
+    value.to_f64().unwrap_or_else(|| {
+        if value.is_negative() {
+            f64::MIN
+        } else {
+            f64::MAX
+        }
+    })
+}
+
+#[must_use]
+fn usize_to_f64(value: usize) -> f64 {
+    value.to_f64().unwrap_or(f64::MAX)
+}
 
 /// Resolved display metadata for a `TIMESTAMP WITH TIME ZONE` instant.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -2141,10 +2158,6 @@ fn xml_xpath_first_string_value(matches: &[String]) -> String {
         .map_or_else(String::new, |fragment| xml_xpath_string_value(fragment))
 }
 
-#[allow(
-    clippy::cast_precision_loss,
-    reason = "XPath substring positions compare small 1-based char indexes as f64 by spec"
-)]
 fn xml_xpath_substring_value(value: &str, start: f64, length: Option<f64>) -> String {
     if start.is_nan() || length.is_some_and(f64::is_nan) {
         return String::new();
@@ -2158,7 +2171,7 @@ fn xml_xpath_substring_value(value: &str, start: f64, length: Option<f64>) -> St
         .chars()
         .enumerate()
         .filter_map(|(idx, ch)| {
-            let position = (idx + 1) as f64;
+            let position = usize_to_f64(idx.saturating_add(1));
             (position >= start && end.is_none_or(|end| position < end)).then_some(ch)
         })
         .collect()
@@ -2944,7 +2957,7 @@ fn parse_range_bound(range_type: RangeType, text: &str) -> Option<Option<f64>> {
     }
     let text = text.trim_matches('"').trim_matches('\'');
     match range_type {
-        RangeType::Int4 | RangeType::Int8 => text.parse::<i64>().ok().map(|v| Some(v as f64)),
+        RangeType::Int4 | RangeType::Int8 => text.parse::<i64>().ok().map(|v| Some(i64_to_f64(v))),
         RangeType::Num | RangeType::Timestamp | RangeType::TimestampTz => {
             text.parse::<f64>().ok().map(Some)
         }
