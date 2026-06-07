@@ -436,7 +436,8 @@ fn run_read_point_window(
         let tree_t = Arc::clone(tree);
         let counter_t = Arc::clone(counter);
         handles.push(thread::spawn(move || {
-            let seed = 0xCAFE_F00D_DEAD_BEEF_u64 ^ ((tid as u64).wrapping_mul(0xC2B2_AE35_u64));
+            let tid_seed = u64::try_from(tid).unwrap_or(0);
+            let seed = 0xCAFE_F00D_DEAD_BEEF_u64 ^ tid_seed.wrapping_mul(0xC2B2_AE35_u64);
             let n = run_read_point_thread(&tree_t, n_i64, seed, &stop_t);
             counter_t.store(n, Ordering::Release);
         }));
@@ -556,7 +557,7 @@ fn run_insert_thread(
         vm: None,
     };
     let mut payload = [0_u8; 16];
-    let mut id_counter: u64 = (tid as u64).wrapping_mul(10_000_000);
+    let mut id_counter: u64 = u64::try_from(tid).unwrap_or(0).wrapping_mul(10_000_000);
     let mut ops: u64 = 0;
     while !stop.load(Ordering::Acquire) {
         let id = id_counter;
