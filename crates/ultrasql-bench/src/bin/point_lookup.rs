@@ -42,14 +42,7 @@
 //! that by reporting only `ns_per_probe` and `total_wall_ns`, with the
 //! probe count explicit in the JSON output.
 
-#![allow(
-    clippy::print_stdout,
-    clippy::unnecessary_lazy_evaluations,
-    clippy::cast_possible_truncation,
-    clippy::cast_possible_wrap,
-    clippy::cast_sign_loss,
-    clippy::cast_lossless
-)]
+#![allow(clippy::print_stdout, clippy::unnecessary_lazy_evaluations)]
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -57,6 +50,7 @@ use std::time::Instant;
 
 use anyhow::{Context, Result};
 use clap::{Parser, ValueEnum};
+use num_traits::ToPrimitive;
 use ultrasql_core::{BlockNumber, PageId, RelationId, TupleId, Xid};
 
 /// Benchmark tier controlling B-tree size.
@@ -170,6 +164,18 @@ fn max_f64(xs: &[f64]) -> f64 {
     xs.iter().copied().fold(f64::NEG_INFINITY, f64::max)
 }
 
+fn usize_to_f64(value: usize, context: &str) -> Result<f64> {
+    value
+        .to_f64()
+        .with_context(|| format!("{context} does not fit f64"))
+}
+
+fn u128_to_f64(value: u128, context: &str) -> Result<f64> {
+    value
+        .to_f64()
+        .with_context(|| format!("{context} does not fit f64"))
+}
+
 /// Build a fresh `BTree<i64>` with `n` keys inserted in a shuffled
 /// order (seed `insert_seed`). Returns the populated tree and the wall
 /// time spent on the inserts.
@@ -210,10 +216,12 @@ fn build_tree(n: usize, insert_seed: u64) -> Result<(BTree<BlankLoader>, u128)> 
             .context("btree insert")?;
     }
     let build_ns = build_t0.elapsed().as_nanos();
+    let build_ns_f = u128_to_f64(build_ns, "build duration")?;
+    let n_f = usize_to_f64(n, "point lookup key count")?;
     eprintln!(
         "point_lookup: build complete in {:.2} s ({:.0} ns/insert)",
-        (build_ns as f64) / 1e9,
-        (build_ns as f64) / (n as f64)
+        build_ns_f / 1e9,
+        build_ns_f / n_f
     );
     Ok((tree, build_ns))
 }
@@ -292,7 +300,7 @@ struct ResultJsonInput<'a> {
     last_hits: i64,
 }
 
-fn format_result_json(input: ResultJsonInput<'_>) -> String {
+fn format_result_json(input: ResultJsonInput<'_>) -> Result<String> {
     let ResultJsonInput {
         n,
         probes,
@@ -302,8 +310,11 @@ fn format_result_json(input: ResultJsonInput<'_>) -> String {
         build_ns,
         last_hits,
     } = input;
-    let probes_f = probes as f64;
-    let per_probe_ns: Vec<f64> = run_ns.iter().map(|&t| (t as f64) / probes_f).collect();
+    let probes_f = usize_to_f64(probes, "probe count")?;
+    let per_probe_ns: Vec<f64> = run_ns
+        .iter()
+        .map(|&t| Ok(u128_to_f64(t, "run duration")? / probes_f))
+        .collect::<Result<_>>()?;
     let med_ns = median_f64(&per_probe_ns);
     let min_ns = min_f64(&per_probe_ns);
     let max_ns = max_f64(&per_probe_ns);
@@ -317,17 +328,17 @@ fn format_result_json(input: ResultJsonInput<'_>) -> String {
     let total_wall_ns_median = run_ns
         .iter()
         .copied()
-        .min_by(|a, b| {
-            let pa = (*a as f64) / probes_f;
-            let pb = (*b as f64) / probes_f;
+        .zip(per_probe_ns.iter().copied())
+        .min_by(|(_, pa), (_, pb)| {
             (pa - med_ns)
                 .abs()
                 .partial_cmp(&(pb - med_ns).abs())
                 .unwrap_or(std::cmp::Ordering::Equal)
         })
+        .map(|(total_ns, _)| total_ns)
         .unwrap_or(0);
 
-    format!(
+    Ok(format!(
         "{{\
 \"workload\":\"point-10m-probes\",\
 \"engine\":\"UltraSQL (kernel, BTree<i64>)\",\
@@ -346,7 +357,7 @@ fn format_result_json(input: ResultJsonInput<'_>) -> String {
 }}",
         run_list = run_ns_strs.join(","),
         per_probe_list = per_probe_strs.join(","),
-    )
+    ))
 }
 
 fn main() -> Result<()> {
@@ -367,7 +378,7 @@ fn main() -> Result<()> {
         run_ns: &run_ns,
         build_ns,
         last_hits,
-    });
+    })?;
     println!("{json}");
 
     if let Some(path) = &args.out {
