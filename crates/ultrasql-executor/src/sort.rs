@@ -460,8 +460,7 @@ fn validate_sort_key_matrix(
 /// - `nulls_first = false`: NULL is greater than any non-NULL value.
 /// - NULL vs NULL: `Equal`.
 /// - Non-NULL vs non-NULL: natural total order of the value type.
-#[allow(unreachable_pub)]
-pub fn compare_values_nullable(a: &Value, b: &Value, nulls_first: bool) -> Ordering {
+pub(crate) fn compare_values_nullable(a: &Value, b: &Value, nulls_first: bool) -> Ordering {
     try_compare_values_nullable(a, b, nulls_first).unwrap_or(Ordering::Equal)
 }
 
@@ -470,8 +469,7 @@ pub fn compare_values_nullable(a: &Value, b: &Value, nulls_first: bool) -> Order
 /// Returns [`ExecError::TypeMismatch`] when non-NULL values do not share an
 /// order-compatible scalar family. Operators that can report execution errors
 /// should use this path instead of treating unsupported values as equal.
-#[allow(unreachable_pub)]
-pub fn try_compare_values_nullable(
+pub(crate) fn try_compare_values_nullable(
     a: &Value,
     b: &Value,
     nulls_first: bool,
@@ -591,8 +589,7 @@ fn interval_total_micros(months: i32, days: i32, microseconds: i64) -> i128 {
 ///
 /// Finite values keep normal numeric order; `NaN` sorts after every finite
 /// value and compares equal to other `NaN` values for ordering purposes.
-#[allow(unreachable_pub)]
-pub fn compare_f32_sql(left: f32, right: f32) -> Ordering {
+pub(crate) fn compare_f32_sql(left: f32, right: f32) -> Ordering {
     compare_f64_sql(f64::from(left), f64::from(right))
 }
 
@@ -600,8 +597,7 @@ pub fn compare_f32_sql(left: f32, right: f32) -> Ordering {
 ///
 /// Finite values keep normal numeric order; `NaN` sorts after every finite
 /// value and compares equal to other `NaN` values for ordering purposes.
-#[allow(unreachable_pub)]
-pub fn compare_f64_sql(left: f64, right: f64) -> Ordering {
+pub(crate) fn compare_f64_sql(left: f64, right: f64) -> Ordering {
     match (left.is_nan(), right.is_nan()) {
         (true, true) => Ordering::Equal,
         (true, false) => Ordering::Greater,

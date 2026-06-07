@@ -34,7 +34,6 @@ use ultrasql_wal::applier::dispatch_record;
 // ---------------------------------------------------------------------------
 
 /// In-memory page loader shared with heap unit-test shape.
-#[allow(unreachable_pub)]
 mod loader {
     use std::collections::HashMap;
 
@@ -45,12 +44,12 @@ mod loader {
     use ultrasql_storage::page::Page;
 
     #[derive(Default)]
-    pub struct MapLoader {
+    pub(super) struct MapLoader {
         store: Mutex<HashMap<PageId, Box<[u8; PAGE_SIZE]>>>,
     }
 
     impl MapLoader {
-        pub fn new() -> Self {
+        pub(super) fn new() -> Self {
             Self::default()
         }
     }
