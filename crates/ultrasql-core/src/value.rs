@@ -3056,23 +3056,19 @@ pub fn parse_date_text(text: &str) -> Option<i32> {
     parse_date_days(text.trim())
 }
 
-#[allow(
-    clippy::cast_possible_truncation,
-    clippy::cast_possible_wrap,
-    clippy::cast_sign_loss,
-    reason = "civil date arithmetic; intermediate ranges are bounded by calendar algorithm"
-)]
 fn days_from_civil(year: i32, month: u32, day: u32) -> Option<i32> {
     if !(1..=12).contains(&month) || !(1..=31).contains(&day) {
         return None;
     }
+    let month = i32::try_from(month).ok()?;
+    let day = i32::try_from(day).ok()?;
     let y = year - i32::from(month <= 2);
     let era = if y >= 0 { y } else { y - 399 } / 400;
-    let yoe = (y - era * 400) as u32;
+    let yoe = y - era * 400;
     let mp = if month > 2 { month - 3 } else { month + 9 };
     let doy = (153 * mp + 2) / 5 + day - 1;
     let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
-    let days_since_0000 = era * 146_097 + doe as i32 - 719_468;
+    let days_since_0000 = era * 146_097 + doe - 719_468;
     Some(days_since_0000 - 10_957)
 }
 
@@ -3526,12 +3522,6 @@ pub fn timetz_utc_micros(micros: i64, offset_seconds: i32) -> i64 {
 
 /// Inverse of Howard Hinnant's `days_from_civil`, rebased on UltraSQL's
 /// 2000-01-01 date epoch.
-#[allow(
-    clippy::cast_possible_truncation,
-    clippy::cast_possible_wrap,
-    clippy::cast_sign_loss,
-    reason = "civil-from-days arithmetic; doe / yoe fit in i32 by construction"
-)]
 fn civil_from_days(days_since_2000_01_01: i32) -> (i32, i32, i32) {
     let z = days_since_2000_01_01 + 10_957;
     let z = z + 719_468;
@@ -3540,17 +3530,13 @@ fn civil_from_days(days_since_2000_01_01: i32) -> (i32, i32, i32) {
     } else {
         (z - 146_096) / 146_097
     };
-    let doe = (z - era * 146_097) as u32;
+    let doe = z - era * 146_097;
     let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
-    let y = (yoe as i32) + era * 400;
+    let y = yoe + era * 400;
     let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
     let mp = (5 * doy + 2) / 153;
-    let day = (doy - (153 * mp + 2) / 5 + 1) as i32;
-    let month = if mp < 10 {
-        mp as i32 + 3
-    } else {
-        mp as i32 - 9
-    };
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
     let year = if month <= 2 { y + 1 } else { y };
     (year, month, day)
 }
