@@ -39,10 +39,14 @@ const fn writer_config() -> WalWriterConfig {
     }
 }
 
+fn slot_for_seq(seq: u32) -> u16 {
+    u16::try_from(seq % 1024).expect("test slot modulo 1024 must fit u16")
+}
+
 fn insert_record(seq: u32) -> WalRecord {
     let rel = RelationId::new(1);
     let block = BlockNumber::new(seq / 1024);
-    let slot = (seq % 1024) as u16;
+    let slot = slot_for_seq(seq);
     let page_id = PageId::new(rel, block);
     let tid = TupleId::new(page_id, slot);
     let tuple_bytes = format!("tuple-{seq}").into_bytes();
@@ -60,7 +64,7 @@ fn insert_record(seq: u32) -> WalRecord {
 fn delete_record(seq: u32) -> WalRecord {
     let rel = RelationId::new(1);
     let page_id = PageId::new(rel, BlockNumber::new(seq / 1024));
-    let tid = TupleId::new(page_id, (seq % 1024) as u16);
+    let tid = TupleId::new(page_id, slot_for_seq(seq));
     let payload = HeapDeletePayload {
         tid,
         xmax: Xid::new(u64::from(seq + 1)),
