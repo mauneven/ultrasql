@@ -174,12 +174,20 @@ impl Default for CostGucs {
 /// ```
 ///
 /// [`estimate`]: CostModel::estimate
-#[allow(missing_debug_implementations)]
 pub struct CostModel<'s> {
     /// The statistics source used for cardinality and selectivity estimates.
     pub stats: &'s dyn StatsSource,
     /// The cost GUCs controlling relative hardware costs.
     pub gucs: CostGucs,
+}
+
+impl std::fmt::Debug for CostModel<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CostModel")
+            .field("stats", &"<dyn StatsSource>")
+            .field("gucs", &self.gucs)
+            .finish()
+    }
 }
 
 impl<'s> CostModel<'s> {

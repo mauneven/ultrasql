@@ -24,7 +24,6 @@ use ultrasql_wal::{RecordType, WalBuffer, WalRecord};
 
 /// Wraps an [`Arc<WalBuffer>`] and adds per-XID LSN tracking so the
 /// storage layer can chain WAL records into a per-transaction log.
-#[allow(missing_debug_implementations)] // DashMap does not impl Debug
 pub struct WalBufferSink {
     buffer: Arc<WalBuffer>,
     /// Last LSN assigned to each XID, updated on every successful append.
@@ -35,6 +34,19 @@ pub struct WalBufferSink {
     wal_fpi: AtomicU64,
     /// Cumulative serialized bytes accepted by this sink.
     wal_bytes: AtomicU64,
+}
+
+impl std::fmt::Debug for WalBufferSink {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let stats = self.stats();
+        f.debug_struct("WalBufferSink")
+            .field("buffer", &self.buffer)
+            .field("last_lsn_entries", &self.last_lsn.len())
+            .field("wal_records", &stats.wal_records)
+            .field("wal_fpi", &stats.wal_fpi)
+            .field("wal_bytes", &stats.wal_bytes)
+            .finish()
+    }
 }
 
 impl WalBufferSink {

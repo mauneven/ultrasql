@@ -139,7 +139,7 @@ pub fn optimize(
 /// # Ok(())
 /// # }
 /// ```
-#[allow(missing_debug_implementations)]
+#[derive(Debug)]
 pub struct Optimizer {
     rules: RuleSet,
     max_iterations: u32,

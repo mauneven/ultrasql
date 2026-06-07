@@ -152,7 +152,7 @@ impl From<&GroupExpr> for GroupKey {
 /// let id2 = memo.intern(scan);
 /// assert_eq!(id1, id2, "identical expressions share a group");
 /// ```
-#[allow(missing_debug_implementations)]
+#[derive(Debug)]
 pub struct Memo {
     groups: Vec<Group>,
     /// Maps `GroupKey -> group ID`.
