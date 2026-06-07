@@ -198,7 +198,7 @@ fn build_tree(n: usize, insert_seed: u64) -> Result<(BTree<BlankLoader>, u128)> 
         s ^= s << 13;
         s ^= s >> 7;
         s ^= s << 17;
-        let j = (s as usize) % (i + 1);
+        let j = usize::try_from(s).unwrap_or(0) % (i + 1);
         perm.swap(i, j);
     }
 

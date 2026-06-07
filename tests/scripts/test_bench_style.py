@@ -78,6 +78,7 @@ class BenchStyleTests(unittest.TestCase):
         offenders: list[str] = []
         paths = [
             REPO / "crates" / "ultrasql-bench" / "src" / "bin" / "cross_compare.rs",
+            REPO / "crates" / "ultrasql-bench" / "src" / "bin" / "point_lookup.rs",
             REPO / "crates" / "ultrasql-bench" / "src" / "runs" / "point_lookup.rs",
         ]
         for path in paths:
