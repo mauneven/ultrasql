@@ -76,9 +76,9 @@ fn run_iteration(seed: u64) -> f64 {
                 let mut s = seed ^ u64::try_from(client).unwrap_or(0);
                 for _ in 0..TX_PER_CLIENT_ITER {
                     s = xorshift64(s);
-                    let account = (s as usize) % accounts.len();
+                    let account = rng_index(s, accounts.len());
                     s = xorshift64(s);
-                    let teller = (s as usize) % tellers.len();
+                    let teller = rng_index(s, tellers.len());
                     let branch = teller % branches.len();
                     let delta = i64::try_from((s % 199) + 1).unwrap_or(1) - 100;
 
@@ -92,6 +92,12 @@ fn run_iteration(seed: u64) -> f64 {
     });
 
     start.elapsed().as_secs_f64() * 1_000_000.0
+}
+
+fn rng_index(seed: u64, upper_bound: usize) -> usize {
+    let upper_bound_u64 = u64::try_from(upper_bound).unwrap_or(u64::MAX).max(1);
+    let reduced = seed % upper_bound_u64;
+    usize::try_from(reduced).unwrap_or(0)
 }
 
 #[inline]
