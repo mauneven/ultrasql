@@ -32,12 +32,6 @@
 
 #![allow(clippy::print_stdout)]
 #![allow(clippy::print_stderr)]
-#![allow(
-    clippy::cast_possible_truncation,
-    clippy::cast_possible_wrap,
-    clippy::cast_sign_loss,
-    clippy::cast_lossless
-)]
 
 use std::collections::BTreeMap;
 use std::io::{Read, Write};
@@ -962,6 +956,18 @@ fn percentile_nearest_rank(sorted_values: &[f64], percentile: f64) -> f64 {
     sorted_values[idx]
 }
 
+fn usize_to_f64(value: usize, context: &str) -> Result<f64> {
+    value
+        .to_f64()
+        .with_context(|| format!("{context} does not fit f64"))
+}
+
+fn u64_to_f64(value: u64, context: &str) -> Result<f64> {
+    value
+        .to_f64()
+        .with_context(|| format!("{context} does not fit f64"))
+}
+
 fn sql_string(path: &Path) -> String {
     format!("'{}'", path.display().to_string().replace('\'', "''"))
 }
@@ -1205,14 +1211,15 @@ async fn run_ingestion_throughput_workload(args: &Args, workload_id: &str) -> Re
     shutdown_persistent_bench_server(client, conn_handle, server).await;
 
     let indexed_total_us = indexed.insert_us + indexed.commit_us;
+    let rows_f64 = usize_to_f64(args.rows, "ingestion row count")?;
     let rows_per_sec = if indexed_total_us > 0.0 {
-        args.rows as f64 * 1_000_000.0 / indexed_total_us
+        rows_f64 * 1_000_000.0 / indexed_total_us
     } else {
         0.0
     };
     let plain_total_us = plain.insert_us + plain.commit_us;
     let rows_per_sec_without_index = if plain_total_us > 0.0 {
-        args.rows as f64 * 1_000_000.0 / plain_total_us
+        rows_f64 * 1_000_000.0 / plain_total_us
     } else {
         0.0
     };
@@ -3044,14 +3051,14 @@ async fn run_shared_window_row_number(
 const VECTOR_PRELOAD_CHUNK_ROWS: usize = 1_000;
 
 fn vector_component(row_id: usize, dim: usize) -> i32 {
-    let row = row_id as u128;
-    let dim = dim as u128;
+    let row = u128::try_from(row_id).expect("vector row id fits u128");
+    let dim = u128::try_from(dim).expect("vector dimension fits u128");
     let value = ((row * 31) + (dim * 17) + ((row % 7) * 13)) % 101;
     i32::try_from(value).unwrap_or(0) - 50
 }
 
 fn vector_probe_component(dim: usize) -> i32 {
-    let dim = dim as u128;
+    let dim = u128::try_from(dim).expect("vector dimension fits u128");
     let value = ((dim * 7) + 3) % 23;
     i32::try_from(value).unwrap_or(0) - 11
 }
@@ -3292,11 +3299,12 @@ async fn run_shared_hybrid_search_latency(
 
     drop(client);
     conn_handle.abort();
+    let row_count_f64 = usize_to_f64(n_rows, "hybrid search row count")?;
     Ok(HybridSearchCertification {
         expected_ids,
         observed_ids,
         recall_at_k: 1.0,
-        filter_selectivity: 3.0 / n_rows as f64,
+        filter_selectivity: 3.0 / row_count_f64,
     })
 }
 
@@ -3508,7 +3516,8 @@ async fn run_mixed_oltp_iter(server: SocketAddr, n_rows: usize, ix: usize) -> Re
         count += 1;
     }
     let elapsed_us = started.elapsed().as_secs_f64() * 1e6;
-    let us_per_op = elapsed_us / count.max(1) as f64;
+    let op_count = u64_to_f64(count.max(1), "mixed OLTP operation count")?;
+    let us_per_op = elapsed_us / op_count;
 
     drop(client);
     conn_handle.abort();
@@ -3540,8 +3549,12 @@ impl SplitMix64 {
         // baselines' `random.random()` distribution closely enough that
         // the per-op mix matches across engines.
         let bits = self.next_u64() >> 11;
-        let scale = 1.0_f64 / (1_u64 << 53) as f64;
-        bits as f64 * scale
+        let scale_denominator = (1_u64 << 53)
+            .to_f64()
+            .expect("splitmix scale denominator fits f64 exactly");
+        let bits_f64 = bits.to_f64().expect("splitmix high bits fit f64 exactly");
+        let scale = 1.0_f64 / scale_denominator;
+        bits_f64 * scale
     }
 
     fn next_i32(&mut self) -> i32 {

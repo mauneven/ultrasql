@@ -32,7 +32,9 @@ ANN_VECTOR_COMPONENT_FLOAT_CAST = re.compile(r"\)\s+as\s+f32\s*/\s*(?:37|41)\.0"
 SQL_PERCENTILE_INDEX_CAST = re.compile(
     r"sorted_values\.len\(\)\s+as\s+f64.*ceil\(\)\s+as\s+usize"
 )
-SQL_RNG_WIDTH_CAST = re.compile(r"next_u64\(\)\s+as\s+i32")
+SQL_BENCH_NUMERIC_CAST = re.compile(
+    r"\bas\s+(?:usize|u8|u16|u32|u64|u128|i8|i16|i32|i64|isize|f32|f64)\b|clippy::cast_"
+)
 PUSH_VS_PULL_BENCH_CASTS = re.compile(
     r"\bas\s+(?:usize|u32|u64|i32|i64)\b|clippy::cast_"
 )
@@ -135,12 +137,12 @@ class BenchStyleTests(unittest.TestCase):
 
         self.assertEqual([], offenders)
 
-    def test_sql_bench_rng_avoids_integer_width_casts(self) -> None:
+    def test_sql_bench_uses_checked_numeric_conversions(self) -> None:
         offenders: list[str] = []
         for path in SQL_BENCH_FILES:
             for line_no, line in enumerate(path.read_text().splitlines(), start=1):
                 code = line.split("//", maxsplit=1)[0]
-                if SQL_RNG_WIDTH_CAST.search(code):
+                if SQL_BENCH_NUMERIC_CAST.search(code):
                     offenders.append(f"{path.relative_to(REPO)}:{line_no}: {line.strip()}")
 
         self.assertEqual([], offenders)
