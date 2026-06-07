@@ -384,7 +384,7 @@ fn run_read_point(args: &Args) -> Result<String> {
     let mut perm: Vec<i64> = (0..n_i64).collect();
     for i in (1..perm.len()).rev() {
         s = xorshift64(s);
-        let j = (s as usize) % (i + 1);
+        let j = usize::try_from(s).unwrap_or(0) % (i + 1);
         perm.swap(i, j);
     }
     for &k in &perm {
