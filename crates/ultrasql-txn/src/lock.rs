@@ -925,8 +925,8 @@ mod tests {
                 LockMode::Exclusive,
                 LockMode::AccessExclusive,
             ];
-            let ma = all[a as usize];
-            let mb = all[b as usize];
+            let ma = all[usize::from(a)];
+            let mb = all[usize::from(b)];
             prop_assert_eq!(ma.conflicts_with(mb), mb.conflicts_with(ma));
         }
     }

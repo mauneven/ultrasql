@@ -1031,7 +1031,8 @@ mod tests {
 
         // And they form a contiguous range starting at FIRST_USER.
         let first = Xid::FIRST_USER.raw();
-        let last = first + (N_THREADS * PER_THREAD) as u64 - 1;
+        let generated = u64::try_from(N_THREADS * PER_THREAD).expect("xid count fits u64");
+        let last = first + generated - 1;
         let min = sorted.first().copied().expect("non-empty");
         let max = sorted.last().copied().expect("non-empty");
         assert_eq!(min.raw(), first);
