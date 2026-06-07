@@ -990,8 +990,7 @@ mod tests {
 
         let nonce = SystemTime::now()
             .duration_since(UNIX_EPOCH)
-            .expect("clock")
-            .as_nanos();
+            .map_or(0, |duration| duration.as_nanos());
         let dir = std::env::temp_dir().join(format!(
             "ultrasql-csv-symlink-{}-{nonce}",
             std::process::id()
