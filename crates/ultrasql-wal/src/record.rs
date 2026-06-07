@@ -281,10 +281,8 @@ fn total_length_to_usize(total_length: u32) -> Result<usize, WalRecordError> {
 }
 
 fn trusted_total_length_to_usize(total_length: u32) -> usize {
-    match total_length_to_usize(total_length) {
-        Ok(total_length) => total_length,
-        Err(_) => panic!("WAL record total_length must fit usize on supported targets"),
-    }
+    total_length_to_usize(total_length)
+        .expect("WAL record total_length must fit usize on supported targets")
 }
 
 fn encode_header_into(header: &WalRecordHeader, bytes: &mut [u8]) {
