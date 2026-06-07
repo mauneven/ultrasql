@@ -1096,6 +1096,16 @@ impl BTreeOpKind {
     }
 }
 
+impl From<BTreeOpKind> for u8 {
+    fn from(kind: BTreeOpKind) -> Self {
+        match kind {
+            BTreeOpKind::Insert => 1,
+            BTreeOpKind::Split => 2,
+            BTreeOpKind::Delete => 3,
+        }
+    }
+}
+
 /// Payload for a `RecordType::BTreeOp` WAL record.
 ///
 /// Carries a single B-tree mutation sufficient for redo: the operation kind, the
@@ -1152,7 +1162,7 @@ impl BTreeOpPayload {
         // Then key_bytes, then 4 (cv_len), then cv_bytes.
         let total = 20 + self.key_bytes.len() + 4 + self.child_or_value.len();
         let mut out = vec![0_u8; total];
-        out[0] = self.op as u8;
+        out[0] = u8::from(self.op);
         // bytes 1-3: reserved zero (already zeroed)
         write_u32_le(&mut out[4..8], self.index_rel.oid().raw());
         let mut pid_buf = [0_u8; PAGE_ID_SIZE];
@@ -1256,6 +1266,16 @@ impl HashOpKind {
     }
 }
 
+impl From<HashOpKind> for u8 {
+    fn from(kind: HashOpKind) -> Self {
+        match kind {
+            HashOpKind::Insert => 1,
+            HashOpKind::Delete => 2,
+            HashOpKind::OverflowLink => 3,
+        }
+    }
+}
+
 /// Payload for a `RecordType::HashOp` WAL record.
 ///
 /// Carries the hash-index mutation shape independently from the B-tree WAL
@@ -1310,7 +1330,7 @@ impl HashOpPayload {
         }
         let total = 32 + self.key_bytes.len() + 4 + self.value_bytes.len();
         let mut out = vec![0_u8; total];
-        out[0] = self.op as u8;
+        out[0] = u8::from(self.op);
         write_u32_le(&mut out[4..8], self.index_rel.oid().raw());
         write_u32_le(&mut out[8..12], self.bucket);
         let mut pid_buf = [0_u8; PAGE_ID_SIZE];
@@ -1413,6 +1433,16 @@ impl HnswOpKind {
     }
 }
 
+impl From<HnswOpKind> for u8 {
+    fn from(kind: HnswOpKind) -> Self {
+        match kind {
+            HnswOpKind::Insert => 1,
+            HnswOpKind::Delete => 2,
+            HnswOpKind::Compact => 3,
+        }
+    }
+}
+
 /// Payload for a `RecordType::HnswOp` WAL record.
 ///
 /// The record logs runtime HNSW graph mutations in a redo-friendly shape:
@@ -1462,7 +1492,7 @@ impl HnswOpPayload {
             .map_err(|_| PayloadError::Malformed("hnsw_op vector_len overflow"))?;
         let total = 28 + vector_bytes_len;
         let mut out = vec![0_u8; total];
-        out[0] = self.op as u8;
+        out[0] = u8::from(self.op);
         write_u32_le(&mut out[4..8], self.index_rel.oid().raw());
         write_u32_le(&mut out[8..12], self.tid.page.relation.oid().raw());
         write_u32_le(&mut out[12..16], self.tid.page.block.raw());
@@ -1596,6 +1626,17 @@ impl IvfFlatOpKind {
     }
 }
 
+impl From<IvfFlatOpKind> for u8 {
+    fn from(kind: IvfFlatOpKind) -> Self {
+        match kind {
+            IvfFlatOpKind::Centroid => 1,
+            IvfFlatOpKind::Insert => 2,
+            IvfFlatOpKind::Delete => 3,
+            IvfFlatOpKind::Compact => 4,
+        }
+    }
+}
+
 /// Payload for a `RecordType::IvfFlatOp` WAL record.
 ///
 /// The record carries a redo-friendly logical mutation for page-backed
@@ -1647,7 +1688,7 @@ impl IvfFlatOpPayload {
             .map_err(|_| PayloadError::Malformed("ivfflat_op vector_len overflow"))?;
         let total = 32 + vector_bytes_len;
         let mut out = vec![0_u8; total];
-        out[0] = self.op as u8;
+        out[0] = u8::from(self.op);
         write_u32_le(&mut out[4..8], self.index_rel.oid().raw());
         write_u32_le(&mut out[8..12], self.tid.page.relation.oid().raw());
         write_u32_le(&mut out[12..16], self.tid.page.block.raw());
@@ -1792,6 +1833,18 @@ impl SequenceOpKind {
     }
 }
 
+impl From<SequenceOpKind> for u8 {
+    fn from(kind: SequenceOpKind) -> Self {
+        match kind {
+            SequenceOpKind::Create => 1,
+            SequenceOpKind::Advance => 2,
+            SequenceOpKind::Set => 3,
+            SequenceOpKind::Alter => 4,
+            SequenceOpKind::Drop => 5,
+        }
+    }
+}
+
 /// Payload for a `RecordType::SequenceOp` WAL record.
 ///
 /// Wire layout (little-endian, no implicit padding):
@@ -1850,7 +1903,7 @@ impl SequenceOpPayload {
         }
         let total = 12 + name_bytes.len() + 48;
         let mut out = vec![0_u8; total];
-        out[0] = self.op as u8;
+        out[0] = u8::from(self.op);
         write_u32_le(&mut out[4..8], self.seqrelid.oid().raw());
         write_u32_le(&mut out[8..12], name_len);
         out[12..12 + name_bytes.len()].copy_from_slice(name_bytes);
