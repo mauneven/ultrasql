@@ -666,8 +666,13 @@ fn row_matches_filter(row: &BenchVector, config: &FilteredVectorConfig) -> bool 
 fn vector_for_row(row_id: usize, dims: usize, seed: u64) -> Vec<f32> {
     (0..dims)
         .map(|dim| {
-            let value = mix(seed, row_id as u64, dim as u64, 0x9e37_79b9_7f4a_7c15) % 2_003;
-            (i32::try_from(value).unwrap_or(0) - 1_001) as f32 / 37.0
+            let value = mix(
+                seed,
+                usize_to_u64(row_id),
+                usize_to_u64(dim),
+                0x9e37_79b9_7f4a_7c15,
+            ) % 2_003;
+            centered_component(value, 37.0)
         })
         .collect()
 }
@@ -675,10 +680,24 @@ fn vector_for_row(row_id: usize, dims: usize, seed: u64) -> Vec<f32> {
 fn vector_for_probe(query_id: usize, dims: usize, seed: u64) -> Vec<f32> {
     (0..dims)
         .map(|dim| {
-            let value = mix(seed ^ 0xa5a5_a5a5_a5a5_a5a5, query_id as u64, dim as u64, 0) % 2_003;
-            (i32::try_from(value).unwrap_or(0) - 1_001) as f32 / 41.0
+            let value = mix(
+                seed ^ 0xa5a5_a5a5_a5a5_a5a5,
+                usize_to_u64(query_id),
+                usize_to_u64(dim),
+                0,
+            ) % 2_003;
+            centered_component(value, 41.0)
         })
         .collect()
+}
+
+fn usize_to_u64(value: usize) -> u64 {
+    u64::try_from(value).unwrap_or_default()
+}
+
+fn centered_component(value: u64, scale: f32) -> f32 {
+    let raw = i16::try_from(value).unwrap_or_default();
+    f32::from(raw - 1_001) / scale
 }
 
 fn mix(seed: u64, left: u64, right: u64, salt: u64) -> u64 {
