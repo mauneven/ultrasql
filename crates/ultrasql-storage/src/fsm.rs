@@ -78,25 +78,25 @@ impl FreeSpaceMap {
     /// If the page's block number is beyond the currently tracked range,
     /// the vector is extended with zeros (full) up to that block, then
     /// the block's category is updated.
-    #[allow(clippy::significant_drop_tightening)]
     pub fn record_free_space(&self, rel: RelationId, block: BlockNumber, free_bytes: u32) {
         // floor(free_bytes * 256 / PAGE_SIZE), clamped to 255.
         let clamped = free_bytes.min(PAGE_SIZE_U32);
         let category = category_byte((clamped * CATEGORY_COUNT / PAGE_SIZE_U32).min(255));
+        let Some(idx) = block_index(block) else {
+            return;
+        };
 
-        // `entry` must outlive `vec` because `vec` borrows from it.
         let entry = self
             .inner
             .entry(rel)
             .or_insert_with(|| RwLock::new(Vec::new()));
-        let mut vec = entry.write();
-        let Some(idx) = block_index(block) else {
-            return;
-        };
-        if idx >= vec.len() {
-            vec.resize(idx + 1, 0);
+        {
+            let mut vec = entry.write();
+            if idx >= vec.len() {
+                vec.resize(idx + 1, 0);
+            }
+            vec[idx] = category;
         }
-        vec[idx] = category;
     }
 
     /// Find any block in `rel` with at least `min_free` bytes available.
@@ -107,7 +107,6 @@ impl FreeSpaceMap {
     ///
     /// Callers should fall back to allocating a new block when this
     /// returns `None`.
-    #[allow(clippy::significant_drop_tightening)]
     pub fn find_block_with_at_least(&self, rel: RelationId, min_free: u32) -> Option<BlockNumber> {
         let min_clamped = min_free.min(PAGE_SIZE_U32);
         // Smallest category `c` such that `c * PAGE_SIZE / 256 >= min_free`.
@@ -122,18 +121,17 @@ impl FreeSpaceMap {
             )
         };
 
-        // `entry` must outlive `vec` because `vec` borrows from it.
         let entry = self.inner.get(&rel)?;
-        let vec = entry.read();
-        for (idx, &cat) in vec.iter().enumerate() {
-            if cat >= min_category {
-                let Ok(raw) = u32::try_from(idx) else {
-                    continue;
-                };
-                return Some(BlockNumber::new(raw));
-            }
+        {
+            let vec = entry.read();
+            vec.iter().enumerate().find_map(|(idx, &cat)| {
+                if cat < min_category {
+                    return None;
+                }
+                let raw = u32::try_from(idx).ok()?;
+                Some(BlockNumber::new(raw))
+            })
         }
-        None
     }
 
     /// Invalidate the free-space entry for a block.
