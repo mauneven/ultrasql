@@ -69,8 +69,10 @@ pub fn run(ctx: &BenchContext) -> BenchResult {
     // Budget: preload (10k rows ≈ 91 pages) plus one fresh page per
     // ~110 update fallbacks across every warmup + measured iteration.
     // Pad generously so the pool never has to evict.
-    let total_updates = ROWS_PER_ITER
-        .saturating_mul((ctx.iterations as usize).saturating_add(ctx.warmup_iterations as usize));
+    let iteration_count = usize::try_from(ctx.iterations).unwrap_or(0);
+    let warmup_iteration_count = usize::try_from(ctx.warmup_iterations).unwrap_or(0);
+    let total_updates =
+        ROWS_PER_ITER.saturating_mul(iteration_count.saturating_add(warmup_iteration_count));
     let frames = (ROWS_PER_ITER / 50)
         .saturating_add(total_updates / 50)
         .saturating_add(1024);
@@ -126,7 +128,7 @@ pub fn run(ctx: &BenchContext) -> BenchResult {
         timed_iter(&heap, &mut tids);
     }
 
-    let mut samples: Vec<f64> = Vec::with_capacity(ctx.iterations as usize);
+    let mut samples: Vec<f64> = Vec::with_capacity(iteration_count);
     for _ in 0..ctx.iterations {
         samples.push(timed_iter(&heap, &mut tids));
     }
@@ -174,7 +176,10 @@ mod tests {
     fn run_produces_two_samples_with_positive_throughput() {
         let ctx = test_ctx();
         let result = run(&ctx);
-        assert_eq!(result.samples.len(), ctx.iterations as usize);
+        assert_eq!(
+            result.samples.len(),
+            usize::try_from(ctx.iterations).unwrap_or(0)
+        );
         assert!(result.throughput_per_sec > 0.0);
     }
 
