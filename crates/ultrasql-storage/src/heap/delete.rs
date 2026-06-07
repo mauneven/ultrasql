@@ -63,6 +63,18 @@ fn itemid_window(item_raw: u32) -> Result<(usize, usize), HeapError> {
     Ok((usize::from(length), usize::from(offset)))
 }
 
+struct DeleteInt32PairRange<'a, O: ?Sized, P: ?Sized> {
+    rel: RelationId,
+    start_block: u32,
+    end_block: u32,
+    snapshot: &'a Snapshot,
+    oracle: &'a O,
+    predicate: &'a P,
+    xid: Xid,
+    command_id: CommandId,
+    vm: Option<&'a crate::vm::VisibilityMap>,
+}
+
 impl<L: PageLoader> HeapAccess<L> {
     /// Clear `xmax` stamps for an aborted transaction.
     ///
@@ -629,17 +641,17 @@ impl<L: PageLoader> HeapAccess<L> {
             while start_block < block_count {
                 let end_block = start_block.saturating_add(chunk_blocks).min(block_count);
                 handles.push(scope.spawn(move || {
-                    self.delete_int32_pair_range_no_wal(
+                    self.delete_int32_pair_range_no_wal(DeleteInt32PairRange {
                         rel,
                         start_block,
                         end_block,
                         snapshot,
                         oracle,
-                        predicate_ref,
+                        predicate: predicate_ref,
                         xid,
                         command_id,
                         vm,
-                    )
+                    })
                 }));
                 start_block = end_block;
             }
@@ -661,25 +673,27 @@ impl<L: PageLoader> HeapAccess<L> {
         Ok(total_deleted)
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn delete_int32_pair_range_no_wal<O, P>(
         &self,
-        rel: RelationId,
-        start_block: u32,
-        end_block: u32,
-        snapshot: &Snapshot,
-        oracle: &O,
-        predicate: &P,
-        xid: Xid,
-        command_id: CommandId,
-        vm: Option<&crate::vm::VisibilityMap>,
+        request: DeleteInt32PairRange<'_, O, P>,
     ) -> Result<usize, HeapError>
     where
         O: XidStatusOracle + ?Sized,
-        P: Fn(i32, i32) -> bool,
+        P: Fn(i32, i32) -> bool + ?Sized,
     {
         use crate::page::{ITEMID_SIZE, PAGE_HEADER_SIZE};
 
+        let DeleteInt32PairRange {
+            rel,
+            start_block,
+            end_block,
+            snapshot,
+            oracle,
+            predicate,
+            xid,
+            command_id,
+            vm,
+        } = request;
         let mut total_deleted: usize = 0;
         let mut xmin_cache: Option<(Xid, u16, bool)> = None;
         let xid_bytes = xid.raw().to_le_bytes();
