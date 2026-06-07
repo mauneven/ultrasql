@@ -1,11 +1,3 @@
-#![allow(
-    clippy::cast_possible_truncation,
-    clippy::cast_possible_wrap,
-    clippy::cast_sign_loss,
-    clippy::cast_lossless,
-    reason = "test: deterministic data generation with compile-time-bounded loop sizes"
-)]
-
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
@@ -124,6 +116,14 @@ fn update_int32_stamp(xid: u64) -> UpdateInt32PairStamp {
 fn make_heap(capacity: usize) -> HeapAccess<MapLoader> {
     let pool = Arc::new(BufferPool::new(capacity, MapLoader::new()));
     HeapAccess::new(pool)
+}
+
+fn u32_to_usize(value: u32) -> usize {
+    usize::try_from(value).expect("test count must fit usize")
+}
+
+fn usize_to_u8(value: usize) -> u8 {
+    u8::try_from(value).expect("proptest byte seed must fit u8")
 }
 
 #[test]
@@ -286,10 +286,15 @@ fn concurrent_inserts_from_two_threads_preserve_every_tuple() {
     const N: u32 = 200;
 
     let heap = Arc::new(make_heap(64));
+    let thread_count = u32_to_usize(N);
+    let expected_count = u32_to_usize(
+        N.checked_mul(2)
+            .expect("test tuple count must not overflow"),
+    );
     let h1 = {
         let heap = Arc::clone(&heap);
         thread::spawn(move || {
-            let mut out = Vec::with_capacity(N as usize);
+            let mut out = Vec::with_capacity(thread_count);
             for i in 0..N {
                 let payload = i.to_le_bytes().repeat(8);
                 out.push(heap.insert(rel(), &payload, opts(100)).unwrap());
@@ -300,7 +305,7 @@ fn concurrent_inserts_from_two_threads_preserve_every_tuple() {
     let h2 = {
         let heap = Arc::clone(&heap);
         thread::spawn(move || {
-            let mut out = Vec::with_capacity(N as usize);
+            let mut out = Vec::with_capacity(thread_count);
             for i in 0..N {
                 let payload = (i + N).to_le_bytes().repeat(8);
                 out.push(heap.insert(rel(), &payload, opts(200)).unwrap());
@@ -310,7 +315,7 @@ fn concurrent_inserts_from_two_threads_preserve_every_tuple() {
     };
     let mut all: Vec<TupleId> = h1.join().unwrap();
     all.extend(h2.join().unwrap());
-    assert_eq!(all.len(), (2 * N) as usize);
+    assert_eq!(all.len(), expected_count);
     // Every tid must be unique and fetchable.
     all.sort();
     let len_before_dedup = all.len();
@@ -326,7 +331,7 @@ fn concurrent_inserts_from_two_threads_preserve_every_tuple() {
         .scan(rel(), blocks)
         .collect::<Result<Vec<_>, _>>()
         .unwrap();
-    assert_eq!(scanned.len(), (2 * N) as usize);
+    assert_eq!(scanned.len(), expected_count);
 }
 
 #[test]
@@ -1713,7 +1718,7 @@ mod wal_emission {
             let xid = Xid::new(42);
 
             for i in 0..n {
-                let payload = (i as u8).to_le_bytes();
+                let payload = usize_to_u8(i).to_le_bytes();
                 heap.insert(
                     rel(),
                     &payload,
