@@ -27,7 +27,8 @@ const TX_PER_CLIENT_ITER: usize = 64;
 
 /// Runs a deterministic 32-client TPC-B-shaped local benchmark.
 pub fn run(ctx: &BenchContext) -> BenchResult {
-    let mut samples = Vec::with_capacity(ctx.iterations as usize);
+    let iteration_count = usize::try_from(ctx.iterations).unwrap_or(0);
+    let mut samples = Vec::with_capacity(iteration_count);
     let mut seed = 0x0BADC0DE_F00DFACE_u64;
 
     for _ in 0..ctx.warmup_iterations {
