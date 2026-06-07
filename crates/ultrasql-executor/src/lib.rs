@@ -142,13 +142,15 @@ pub use modify::{
     VectorIndexEncoder, VectorIndexMaintainer,
 };
 pub use nested_loop_join::{NestedLoopJoin, RightFactory};
-pub use parallel_seq_scan::{ParallelSeqScan, choose_parallel_seq_scan_workers};
+pub use parallel_seq_scan::{
+    ParallelSeqScan, ParallelSeqScanConfig, choose_parallel_seq_scan_workers,
+};
 pub use profile::{OperatorRuntimeProfile, OperatorSpillProfile, ProfiledOperator};
 pub use project::Project;
 pub use project_expr::ProjectExprs;
 pub use result_op::ResultOp;
 pub use row_codec::{RowCodec, RowCodecError};
-pub use seq_scan::{SeqScan, build_batch};
+pub use seq_scan::{SeqScan, SeqScanRangeWithVmConfig, build_batch};
 pub use set_op::SetOp;
 pub use sort::Sort;
 pub use sort_aggregate::SortAggregate;

@@ -6,8 +6,8 @@ use serde_json::Value as JsonValue;
 use ultrasql_catalog::TableEntry;
 use ultrasql_core::{DataType, Field, RelationId, Schema, Value};
 use ultrasql_executor::{
-    CteScan, Eval, MemTableScan, Operator, ParallelSeqScan, Project, RowCodec, SeqScan,
-    build_batch, choose_parallel_seq_scan_workers,
+    CteScan, Eval, MemTableScan, Operator, ParallelSeqScan, ParallelSeqScanConfig, Project,
+    RowCodec, SeqScan, build_batch, choose_parallel_seq_scan_workers,
     json_path::{parse_json_path, select_json_path_with_vars},
 };
 use ultrasql_planner::{LogicalPlan, ScalarExpr};
@@ -77,17 +77,17 @@ pub(super) fn lower_heap_scan(
     let codec = RowCodec::new(entry.schema.clone());
     let workers = choose_parallel_seq_scan_workers(block_count, entry.schema.len());
     if workers > 1 && projection.is_none() {
-        let scan = ParallelSeqScan::new_with_cancel(
-            Arc::clone(&ctx.heap),
-            rel,
+        let scan = ParallelSeqScan::new(ParallelSeqScanConfig {
+            heap: Arc::clone(&ctx.heap),
+            relation: rel,
             block_count,
-            ctx.snapshot.clone(),
-            Arc::clone(&ctx.oracle),
-            Arc::clone(&ctx.vm),
+            snapshot: ctx.snapshot.clone(),
+            oracle: Arc::clone(&ctx.oracle),
+            vm: Arc::clone(&ctx.vm),
             codec,
-            ctx.cancel_flag.clone(),
-            workers,
-        );
+            cancel_flag: ctx.cancel_flag.clone(),
+            worker_count: workers,
+        });
         return Ok(Box::new(scan));
     }
     let mut scan = SeqScan::new_with_vm(

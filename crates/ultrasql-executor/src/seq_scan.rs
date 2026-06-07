@@ -124,6 +124,57 @@ pub struct SeqScan<L: PageLoader + 'static, O: XidStatusOracle + ?Sized + 'stati
     cancel_flag: Option<CancelFlag>,
 }
 
+/// Construction inputs for a VM-backed range [`SeqScan`].
+///
+/// Parallel scan workers use this shape to scan a disjoint block interval
+/// without TID columns or column-cache participation.
+pub struct SeqScanRangeWithVmConfig<L: PageLoader + 'static, O: XidStatusOracle + ?Sized + 'static>
+{
+    /// Shared heap access method for the target relation.
+    pub heap: Arc<HeapAccess<L>>,
+    /// Relation to scan.
+    pub relation: RelationId,
+    /// First heap block assigned to this worker.
+    pub start_block: u32,
+    /// Exclusive end heap block assigned to this worker.
+    pub end_block: u32,
+    /// MVCC snapshot used for tuple visibility.
+    pub snapshot: Snapshot,
+    /// Transaction-status oracle used for MVCC checks.
+    pub oracle: Arc<O>,
+    /// Visibility map used to skip per-tuple status probes.
+    pub vm: Arc<VisibilityMap>,
+    /// Row codec for the relation payload schema.
+    pub codec: RowCodec,
+}
+
+impl<L: PageLoader + 'static, O: XidStatusOracle + ?Sized + 'static> std::fmt::Debug
+    for SeqScanRangeWithVmConfig<L, O>
+{
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SeqScanRangeWithVmConfig")
+            .field("relation", &self.relation)
+            .field("start_block", &self.start_block)
+            .field("end_block", &self.end_block)
+            .field("schema", self.codec.schema())
+            .finish_non_exhaustive()
+    }
+}
+
+struct SeqScanBuildConfig<L: PageLoader + 'static, O: XidStatusOracle + ?Sized + 'static> {
+    heap: Arc<HeapAccess<L>>,
+    relation: RelationId,
+    start_block: u32,
+    block_count: u32,
+    snapshot: Snapshot,
+    oracle: Arc<O>,
+    vm: Option<Arc<VisibilityMap>>,
+    codec: RowCodec,
+    with_tids: bool,
+    allow_cache: bool,
+    output_schema: Schema,
+}
+
 /// Cache-read state: a snapshot of cached columns for a relation,
 /// plus the row cursor we are streaming from.
 struct CacheReadState {
@@ -199,19 +250,19 @@ where
         codec: RowCodec,
     ) -> Self {
         let output_schema = codec.schema().clone();
-        Self::build(
+        Self::build(SeqScanBuildConfig {
             heap,
             relation,
-            0,
+            start_block: 0,
             block_count,
             snapshot,
             oracle,
-            None,
+            vm: None,
             codec,
-            false,
-            true,
+            with_tids: false,
+            allow_cache: true,
             output_schema,
-        )
+        })
     }
 
     /// Construct a `SeqScan` that uses a server-owned visibility map.
@@ -226,19 +277,19 @@ where
         codec: RowCodec,
     ) -> Self {
         let output_schema = codec.schema().clone();
-        Self::build(
+        Self::build(SeqScanBuildConfig {
             heap,
             relation,
-            0,
+            start_block: 0,
             block_count,
             snapshot,
             oracle,
-            Some(vm),
+            vm: Some(vm),
             codec,
-            false,
-            true,
+            with_tids: false,
+            allow_cache: true,
             output_schema,
-        )
+        })
     }
 
     /// Construct a `SeqScan` that emits two leading `Int32` columns
@@ -258,19 +309,19 @@ where
         codec: RowCodec,
     ) -> Self {
         let output_schema = tid_prefixed_schema(&codec);
-        Self::build(
+        Self::build(SeqScanBuildConfig {
             heap,
             relation,
-            0,
+            start_block: 0,
             block_count,
             snapshot,
             oracle,
-            None,
+            vm: None,
             codec,
-            true,
-            true,
+            with_tids: true,
+            allow_cache: true,
             output_schema,
-        )
+        })
     }
 
     /// Construct a TID-prefixed `SeqScan` that uses a visibility map.
@@ -285,67 +336,67 @@ where
         codec: RowCodec,
     ) -> Self {
         let output_schema = tid_prefixed_schema(&codec);
-        Self::build(
+        Self::build(SeqScanBuildConfig {
             heap,
             relation,
-            0,
+            start_block: 0,
             block_count,
             snapshot,
             oracle,
-            Some(vm),
+            vm: Some(vm),
             codec,
-            true,
-            true,
+            with_tids: true,
+            allow_cache: true,
             output_schema,
-        )
+        })
     }
 
     /// Construct a non-TID range scan for one parallel worker.
     #[must_use]
-    #[allow(clippy::too_many_arguments)]
-    pub fn new_range_with_vm(
-        heap: Arc<HeapAccess<L>>,
-        relation: RelationId,
-        start_block: u32,
-        end_block: u32,
-        snapshot: Snapshot,
-        oracle: Arc<O>,
-        vm: Arc<VisibilityMap>,
-        codec: RowCodec,
-    ) -> Self {
-        let output_schema = codec.schema().clone();
-        Self::build(
+    pub fn new_range_with_vm(config: SeqScanRangeWithVmConfig<L, O>) -> Self {
+        let SeqScanRangeWithVmConfig {
             heap,
             relation,
             start_block,
             end_block,
             snapshot,
             oracle,
-            Some(vm),
+            vm,
             codec,
-            false,
-            false,
+        } = config;
+        let output_schema = codec.schema().clone();
+        Self::build(SeqScanBuildConfig {
+            heap,
+            relation,
+            start_block,
+            block_count: end_block,
+            snapshot,
+            oracle,
+            vm: Some(vm),
+            codec,
+            with_tids: false,
+            allow_cache: false,
             output_schema,
-        )
+        })
     }
 
     /// Shared helper that builds the operator and the
     /// lifetime-extended iterator. Both `new` and `new_with_tids`
     /// funnel through here.
-    #[allow(clippy::too_many_arguments)]
-    fn build(
-        heap: Arc<HeapAccess<L>>,
-        relation: RelationId,
-        start_block: u32,
-        block_count: u32,
-        snapshot: Snapshot,
-        oracle: Arc<O>,
-        vm: Option<Arc<VisibilityMap>>,
-        codec: RowCodec,
-        with_tids: bool,
-        allow_cache: bool,
-        output_schema: Schema,
-    ) -> Self {
+    fn build(config: SeqScanBuildConfig<L, O>) -> Self {
+        let SeqScanBuildConfig {
+            heap,
+            relation,
+            start_block,
+            block_count,
+            snapshot,
+            oracle,
+            vm,
+            codec,
+            with_tids,
+            allow_cache,
+            output_schema,
+        } = config;
         let snapshot_box: Box<Snapshot> = Box::new(snapshot);
 
         // Column-cache eligibility:

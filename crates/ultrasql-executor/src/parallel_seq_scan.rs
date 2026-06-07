@@ -17,6 +17,7 @@ use ultrasql_storage::heap::HeapAccess;
 use ultrasql_storage::vm::VisibilityMap;
 use ultrasql_vec::Batch;
 
+use crate::seq_scan::SeqScanRangeWithVmConfig;
 use crate::{CancelFlag, ExecError, Operator, RowCodec, SeqScan};
 
 enum WorkerMessage {
@@ -35,6 +36,48 @@ pub struct ParallelSeqScan<L: PageLoader + 'static, O: XidStatusOracle + ?Sized 
     _marker: PhantomData<(L, O)>,
 }
 
+/// Construction inputs for [`ParallelSeqScan`].
+///
+/// The caller is responsible for choosing `worker_count` from relation size
+/// and row width so short scans do not pay thread setup overhead.
+pub struct ParallelSeqScanConfig<L: PageLoader + 'static, O: XidStatusOracle + ?Sized + 'static> {
+    /// Shared heap access method for the target relation.
+    pub heap: Arc<HeapAccess<L>>,
+    /// Relation to scan.
+    pub relation: RelationId,
+    /// Number of heap blocks to partition across workers.
+    pub block_count: u32,
+    /// MVCC snapshot used by each worker scan.
+    pub snapshot: Snapshot,
+    /// Transaction-status oracle shared by worker scans.
+    pub oracle: Arc<O>,
+    /// Visibility map shared by worker scans.
+    pub vm: Arc<VisibilityMap>,
+    /// Row codec for the relation payload schema.
+    pub codec: RowCodec,
+    /// Optional per-query cancel signal cloned into each worker.
+    pub cancel_flag: Option<CancelFlag>,
+    /// Requested worker count, clamped to the available block range.
+    pub worker_count: usize,
+}
+
+impl<L: PageLoader + 'static, O: XidStatusOracle + ?Sized + 'static> std::fmt::Debug
+    for ParallelSeqScanConfig<L, O>
+{
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ParallelSeqScanConfig")
+            .field("relation", &self.relation)
+            .field("block_count", &self.block_count)
+            .field("schema", self.codec.schema())
+            .field(
+                "cancelled",
+                &self.cancel_flag.as_ref().is_some_and(CancelFlag::is_set),
+            )
+            .field("worker_count", &self.worker_count)
+            .finish_non_exhaustive()
+    }
+}
+
 impl<L, O> ParallelSeqScan<L, O>
 where
     L: PageLoader + Send + Sync + std::fmt::Debug + 'static,
@@ -46,18 +89,8 @@ where
     /// use [`choose_parallel_seq_scan_workers`] to avoid paying thread
     /// setup on small scans.
     #[must_use]
-    #[allow(clippy::too_many_arguments)]
-    pub fn new(
-        heap: Arc<HeapAccess<L>>,
-        relation: RelationId,
-        block_count: u32,
-        snapshot: Snapshot,
-        oracle: Arc<O>,
-        vm: Arc<VisibilityMap>,
-        codec: RowCodec,
-        worker_count: usize,
-    ) -> Self {
-        Self::new_with_cancel(
+    pub fn new(config: ParallelSeqScanConfig<L, O>) -> Self {
+        let ParallelSeqScanConfig {
             heap,
             relation,
             block_count,
@@ -65,25 +98,9 @@ where
             oracle,
             vm,
             codec,
-            None,
+            cancel_flag,
             worker_count,
-        )
-    }
-
-    /// Spawn workers and thread cancellation into each worker scan.
-    #[must_use]
-    #[allow(clippy::too_many_arguments)]
-    pub fn new_with_cancel(
-        heap: Arc<HeapAccess<L>>,
-        relation: RelationId,
-        block_count: u32,
-        snapshot: Snapshot,
-        oracle: Arc<O>,
-        vm: Arc<VisibilityMap>,
-        codec: RowCodec,
-        cancel_flag: Option<CancelFlag>,
-        worker_count: usize,
-    ) -> Self {
+        } = config;
         let workers = worker_count
             .max(1)
             .min(usize_from_u32_saturating(block_count.max(1)));
@@ -109,16 +126,16 @@ where
             let worker_codec = codec.clone();
             let worker_cancel = cancel_flag.clone();
             thread::spawn(move || {
-                let mut scan = SeqScan::new_range_with_vm(
-                    worker_heap,
+                let mut scan = SeqScan::new_range_with_vm(SeqScanRangeWithVmConfig {
+                    heap: worker_heap,
                     relation,
-                    start,
-                    end,
-                    worker_snapshot,
-                    worker_oracle,
-                    worker_vm,
-                    worker_codec,
-                );
+                    start_block: start,
+                    end_block: end,
+                    snapshot: worker_snapshot,
+                    oracle: worker_oracle,
+                    vm: worker_vm,
+                    codec: worker_codec,
+                });
                 if let Some(flag) = worker_cancel {
                     scan = scan.with_cancel_flag(flag);
                 }
@@ -323,7 +340,17 @@ mod tests {
         )
         .unwrap();
 
-        let mut scan = ParallelSeqScan::new(heap, rel, 4, snapshot, oracle, vm, codec, 4);
+        let mut scan = ParallelSeqScan::new(ParallelSeqScanConfig {
+            heap,
+            relation: rel,
+            block_count: 4,
+            snapshot,
+            oracle,
+            vm,
+            codec,
+            cancel_flag: None,
+            worker_count: 4,
+        });
         let mut ids = Vec::new();
         while let Some(batch) = scan.next_batch().unwrap() {
             for row in batch_to_rows(&batch, &schema).unwrap() {
