@@ -38,7 +38,7 @@ use crate::join_layout::{
     concat_join_exec_schema, using_projection_exprs, using_projection_indices,
 };
 use crate::lock_rows::LockRows;
-use crate::merge_join::MergeJoin;
+use crate::merge_join::{MergeJoin, MergeJoinConfig};
 use crate::nested_loop_join::{NestedLoopJoin, RightFactory};
 use crate::project_expr::ProjectExprs;
 use crate::set_op::SetOp;
@@ -484,16 +484,16 @@ fn build_join(
                         )));
                     }
                     _ => {
-                        return Ok(Box::new(MergeJoin::new(
-                            left_op,
-                            right_op,
+                        return Ok(Box::new(MergeJoin::new(MergeJoinConfig {
+                            left: left_op,
+                            right: right_op,
                             left_key,
                             right_key,
                             join_type,
-                            schema.clone(),
+                            schema: schema.clone(),
                             left_schema,
                             right_schema,
-                        )));
+                        })));
                     }
                 }
             }

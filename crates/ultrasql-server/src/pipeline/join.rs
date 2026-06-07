@@ -4,8 +4,8 @@ use std::sync::Arc;
 
 use ultrasql_core::{DataType, Schema};
 use ultrasql_executor::{
-    ExecError, HashJoin, MemTableScan, MergeJoin, NestedLoopJoin, Operator, Project, ProjectExprs,
-    RightFactory, WorkMemBudget,
+    ExecError, HashJoin, MemTableScan, MergeJoin, MergeJoinConfig, NestedLoopJoin, Operator,
+    Project, ProjectExprs, RightFactory, WorkMemBudget,
     join_layout::{concat_join_exec_schema, using_projection_exprs, using_projection_indices},
 };
 use ultrasql_planner::{
@@ -92,16 +92,16 @@ pub(super) fn try_lower_merge_join(
     let left_op = lower_query(left_inner, ctx)?;
     let right_op = lower_query(right_inner, ctx)?;
 
-    Ok(Some(Box::new(MergeJoin::new(
-        left_op,
-        right_op,
+    Ok(Some(Box::new(MergeJoin::new(MergeJoinConfig {
+        left: left_op,
+        right: right_op,
         left_key,
         right_key,
         join_type,
-        out_schema.clone(),
-        left_inner_schema,
-        right_inner_schema,
-    ))))
+        schema: out_schema.clone(),
+        left_schema: left_inner_schema,
+        right_schema: right_inner_schema,
+    }))))
 }
 
 pub(super) struct LowerJoinArgs<'a> {

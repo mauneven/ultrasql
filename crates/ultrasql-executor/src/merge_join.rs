@@ -63,6 +63,42 @@ pub struct MergeJoin {
     eof: bool,
 }
 
+/// Construction inputs for [`MergeJoin`].
+///
+/// Inputs must already be sorted ascending on the corresponding key
+/// expressions.
+pub struct MergeJoinConfig {
+    /// Left input operator.
+    pub left: Box<dyn Operator>,
+    /// Right input operator.
+    pub right: Box<dyn Operator>,
+    /// Sort key expression evaluated over left rows.
+    pub left_key: ScalarExpr,
+    /// Sort key expression evaluated over right rows.
+    pub right_key: ScalarExpr,
+    /// Join type to execute.
+    pub join_type: LogicalJoinType,
+    /// Output schema.
+    pub schema: Schema,
+    /// Schema emitted by the left input.
+    pub left_schema: Schema,
+    /// Schema emitted by the right input.
+    pub right_schema: Schema,
+}
+
+impl std::fmt::Debug for MergeJoinConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MergeJoinConfig")
+            .field("left_key", &self.left_key)
+            .field("right_key", &self.right_key)
+            .field("join_type", &self.join_type)
+            .field("schema", &self.schema)
+            .field("left_schema", &self.left_schema)
+            .field("right_schema", &self.right_schema)
+            .finish_non_exhaustive()
+    }
+}
+
 impl MergeJoin {
     /// Construct a merge join operator.
     ///
@@ -73,17 +109,17 @@ impl MergeJoin {
     /// - `schema` — output schema (left columns then right columns).
     /// - `left_schema`, `right_schema` — child schemas for row decoding.
     #[must_use]
-    #[allow(clippy::too_many_arguments)]
-    pub fn new(
-        left: Box<dyn Operator>,
-        right: Box<dyn Operator>,
-        left_key: ScalarExpr,
-        right_key: ScalarExpr,
-        join_type: LogicalJoinType,
-        schema: Schema,
-        left_schema: Schema,
-        right_schema: Schema,
-    ) -> Self {
+    pub fn new(config: MergeJoinConfig) -> Self {
+        let MergeJoinConfig {
+            left,
+            right,
+            left_key,
+            right_key,
+            join_type,
+            schema,
+            left_schema,
+            right_schema,
+        } = config;
         Self {
             left,
             right,
@@ -260,7 +296,7 @@ mod tests {
     use ultrasql_vec::Batch;
     use ultrasql_vec::column::{Column, NumericColumn};
 
-    use super::MergeJoin;
+    use super::{MergeJoin, MergeJoinConfig};
     use crate::filter_op::batch_to_rows;
     use crate::mem_table_scan::MemTableScan;
     use crate::{ExecError, Operator};
@@ -309,6 +345,25 @@ mod tests {
         }
     }
 
+    fn new_join(
+        left: MemTableScan,
+        right: MemTableScan,
+        left_key: ScalarExpr,
+        right_key: ScalarExpr,
+        join_type: LogicalJoinType,
+    ) -> MergeJoin {
+        MergeJoin::new(MergeJoinConfig {
+            left: Box::new(left),
+            right: Box::new(right),
+            left_key,
+            right_key,
+            join_type,
+            schema: schema_joined(),
+            left_schema: schema_id(),
+            right_schema: schema_val(),
+        })
+    }
+
     fn drain_pairs(op: &mut dyn Operator) -> Vec<(i32, i32)> {
         let schema = op.schema().clone();
         let mut out = Vec::new();
@@ -333,15 +388,12 @@ mod tests {
     fn merge_join_inner_happy_path() {
         let left = MemTableScan::new(schema_id(), vec![i32_batch(&[1, 2, 3, 4])]);
         let right = MemTableScan::new(schema_val(), vec![i32_batch(&[2, 3, 5])]);
-        let mut op = MergeJoin::new(
-            Box::new(left),
-            Box::new(right),
+        let mut op = new_join(
+            left,
+            right,
             col_i32("id"),
             col_i32("val"),
             LogicalJoinType::Inner,
-            schema_joined(),
-            schema_id(),
-            schema_val(),
         );
         let mut rows = drain_pairs(&mut op);
         rows.sort_unstable();
@@ -352,15 +404,12 @@ mod tests {
     fn merge_join_key_eval_error_propagates() {
         let left = MemTableScan::new(schema_id(), vec![i32_batch(&[1])]);
         let right = MemTableScan::new(schema_val(), vec![i32_batch(&[1])]);
-        let mut op = MergeJoin::new(
-            Box::new(left),
-            Box::new(right),
+        let mut op = new_join(
+            left,
+            right,
             divide_i32_by_zero("id"),
             col_i32("val"),
             LogicalJoinType::Inner,
-            schema_joined(),
-            schema_id(),
-            schema_val(),
         );
 
         let err = op.next_batch().expect_err("merge key division must error");
@@ -374,15 +423,12 @@ mod tests {
     fn merge_join_left_outer_unmatched() {
         let left = MemTableScan::new(schema_id(), vec![i32_batch(&[1, 2])]);
         let right = MemTableScan::new(schema_val(), vec![i32_batch(&[2])]);
-        let mut op = MergeJoin::new(
-            Box::new(left),
-            Box::new(right),
+        let mut op = new_join(
+            left,
+            right,
             col_i32("id"),
             col_i32("val"),
             LogicalJoinType::LeftOuter,
-            schema_joined(),
-            schema_id(),
-            schema_val(),
         );
         let mut rows = drain_pairs(&mut op);
         rows.sort_unstable();
@@ -396,15 +442,12 @@ mod tests {
     fn merge_join_empty_input_returns_none() {
         let left = MemTableScan::new(schema_id(), vec![]);
         let right = MemTableScan::new(schema_val(), vec![i32_batch(&[1])]);
-        let mut op = MergeJoin::new(
-            Box::new(left),
-            Box::new(right),
+        let mut op = new_join(
+            left,
+            right,
             col_i32("id"),
             col_i32("val"),
             LogicalJoinType::Inner,
-            schema_joined(),
-            schema_id(),
-            schema_val(),
         );
         assert!(drain_pairs(&mut op).is_empty());
     }
@@ -413,15 +456,12 @@ mod tests {
     fn merge_join_cross_returns_unsupported() {
         let left = MemTableScan::new(schema_id(), vec![]);
         let right = MemTableScan::new(schema_val(), vec![]);
-        let mut op = MergeJoin::new(
-            Box::new(left),
-            Box::new(right),
+        let mut op = new_join(
+            left,
+            right,
             col_i32("id"),
             col_i32("val"),
             LogicalJoinType::Cross,
-            schema_joined(),
-            schema_id(),
-            schema_val(),
         );
         let err = op.next_batch().expect_err("cross must fail");
         assert!(matches!(err, ExecError::Unsupported(_)));

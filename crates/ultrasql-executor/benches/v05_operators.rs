@@ -10,8 +10,8 @@
 use criterion::{BatchSize, Criterion, criterion_group, criterion_main};
 use ultrasql_core::{DataType, Field, Schema};
 use ultrasql_executor::{
-    FunctionScan, HashAggregate, MemTableScan, Operator, Sort, SortAggregate, Unique,
-    merge_join::MergeJoin, unique::UniqueMode,
+    FunctionScan, HashAggregate, MemTableScan, MergeJoin, MergeJoinConfig, Operator, Sort,
+    SortAggregate, Unique, unique::UniqueMode,
 };
 use ultrasql_planner::{AggregateFunc, LogicalAggregateExpr, LogicalJoinType, ScalarExpr, SortKey};
 use ultrasql_vec::Batch;
@@ -221,24 +221,24 @@ fn bench_merge_join(c: &mut Criterion) {
                 let right_batch = int32_batch(N);
                 let left_scan = MemTableScan::new(left_schema.clone(), vec![left_batch]);
                 let right_scan = MemTableScan::new(right_schema.clone(), vec![right_batch]);
-                MergeJoin::new(
-                    Box::new(left_scan),
-                    Box::new(right_scan),
-                    ScalarExpr::Column {
+                MergeJoin::new(MergeJoinConfig {
+                    left: Box::new(left_scan),
+                    right: Box::new(right_scan),
+                    left_key: ScalarExpr::Column {
                         name: "v".into(),
                         index: 0,
                         data_type: DataType::Int32,
                     },
-                    ScalarExpr::Column {
+                    right_key: ScalarExpr::Column {
                         name: "v".into(),
                         index: 0,
                         data_type: DataType::Int32,
                     },
-                    LogicalJoinType::Inner,
-                    join_schema,
+                    join_type: LogicalJoinType::Inner,
+                    schema: join_schema,
                     left_schema,
                     right_schema,
-                )
+                })
             },
             |mut op| drain(&mut op),
             BatchSize::SmallInput,

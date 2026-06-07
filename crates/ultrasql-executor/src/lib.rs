@@ -135,7 +135,7 @@ pub use limit::Limit;
 pub use lock_rows::LockRows;
 pub use materialize::Materialize;
 pub use mem_table_scan::MemTableScan;
-pub use merge_join::MergeJoin;
+pub use merge_join::{MergeJoin, MergeJoinConfig};
 pub use modify::{
     InsertConflictAction, InsertIndexEncoder, InsertIndexMaintainer, ModifyKind, ModifyTable,
     RowConstraintCheck, RowUpdateConstraintCheck, SequenceDefault, SequenceNextvalObserver,
