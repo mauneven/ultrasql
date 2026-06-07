@@ -45,7 +45,7 @@ impl Parser<'_> {
             return Err(ParseError::Expected {
                 expected: "VALUES, DEFAULT VALUES, or SELECT",
                 found: tok.kind,
-                offset: tok.span.start as usize,
+                offset: tok.span.start_usize(),
             });
         };
 
@@ -98,7 +98,7 @@ impl Parser<'_> {
                     return Err(ParseError::Expected {
                         expected: "',' or ')'",
                         found: other,
-                        offset: self.peek()?.span.start as usize,
+                        offset: self.peek()?.span.start_usize(),
                     });
                 }
             }
@@ -147,7 +147,7 @@ impl Parser<'_> {
                     return Err(ParseError::Expected {
                         expected: "',' or ')'",
                         found: other,
-                        offset: self.peek()?.span.start as usize,
+                        offset: self.peek()?.span.start_usize(),
                     });
                 }
             }
@@ -194,7 +194,7 @@ impl Parser<'_> {
         let target = target.ok_or(ParseError::Expected {
             expected: "conflict target (column list) before DO UPDATE",
             found: TokenKind::KwDo,
-            offset: on_tok.span.start as usize,
+            offset: on_tok.span.start_usize(),
         })?;
 
         let end = self.peek()?.span.start;
@@ -221,7 +221,7 @@ impl Parser<'_> {
                     return Err(ParseError::Expected {
                         expected: "',' or ')'",
                         found: other,
-                        offset: self.peek()?.span.start as usize,
+                        offset: self.peek()?.span.start_usize(),
                     });
                 }
             }

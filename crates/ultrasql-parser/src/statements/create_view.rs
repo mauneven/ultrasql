@@ -54,7 +54,7 @@ impl Parser<'_> {
             Err(ParseError::Expected {
                 expected,
                 found: tok.kind,
-                offset: tok.span.start as usize,
+                offset: tok.span.start_usize(),
             })
         }
     }

@@ -110,7 +110,7 @@ impl Parser<'_> {
             other => Err(ParseError::Expected {
                 expected: "string literal containing the NOTIFY payload",
                 found: other,
-                offset: tok.span.start as usize,
+                offset: tok.span.start_usize(),
             }),
         }
     }

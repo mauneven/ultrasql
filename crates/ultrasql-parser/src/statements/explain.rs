@@ -51,7 +51,7 @@ impl Parser<'_> {
                                 return Err(ParseError::Expected {
                                     expected: "TEXT or JSON",
                                     found: other,
-                                    offset: fmt_tok.span.start as usize,
+                                    offset: fmt_tok.span.start_usize(),
                                 });
                             }
                         };
@@ -60,7 +60,7 @@ impl Parser<'_> {
                         return Err(ParseError::Expected {
                             expected: "FORMAT",
                             found: other,
-                            offset: opt_tok.span.start as usize,
+                            offset: opt_tok.span.start_usize(),
                         });
                     }
                 }

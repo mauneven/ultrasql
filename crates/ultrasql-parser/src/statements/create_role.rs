@@ -213,14 +213,14 @@ impl Parser<'_> {
             return Err(ParseError::Expected {
                 expected: "role option after NO",
                 found: tok.kind,
-                offset: tok.span.start as usize,
+                offset: tok.span.start_usize(),
             });
         };
         if tok.kind != TokenKind::Identifier {
             return Err(ParseError::Expected {
                 expected: "role option after NO",
                 found: tok.kind,
-                offset: tok.span.start as usize,
+                offset: tok.span.start_usize(),
             });
         }
         let option = match text.to_ascii_lowercase().as_str() {
@@ -235,7 +235,7 @@ impl Parser<'_> {
                 return Err(ParseError::Expected {
                     expected: "SUPERUSER, INHERIT, CREATEROLE, CREATEDB, LOGIN, REPLICATION, or BYPASSRLS after NO",
                     found: tok.kind,
-                    offset: tok.span.start as usize,
+                    offset: tok.span.start_usize(),
                 });
             }
         };
@@ -258,7 +258,7 @@ impl Parser<'_> {
             other => Err(ParseError::Expected {
                 expected,
                 found: self.peek()?.kind,
-                offset: other.span().start as usize,
+                offset: other.span().start_usize(),
             }),
         }
     }
@@ -273,7 +273,7 @@ impl Parser<'_> {
             return Err(ParseError::Expected {
                 expected: "integer",
                 found: tok.kind,
-                offset: tok.span.start as usize,
+                offset: tok.span.start_usize(),
             });
         }
         let token = self.advance()?;
@@ -282,7 +282,7 @@ impl Parser<'_> {
             .parse::<i32>()
             .map_err(|_| ParseError::InvalidInteger {
                 text: text.to_owned(),
-                offset: token.span.start as usize,
+                offset: token.span.start_usize(),
             })?;
         Ok(if negative { -parsed } else { parsed })
     }

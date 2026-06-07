@@ -70,7 +70,7 @@ impl Parser<'_> {
                 return Err(ParseError::Expected {
                     expected: "'=' or 'TO'",
                     found: other,
-                    offset: self.peek()?.span.start as usize,
+                    offset: self.peek()?.span.start_usize(),
                 });
             }
         }

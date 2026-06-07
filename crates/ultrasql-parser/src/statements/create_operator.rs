@@ -25,7 +25,7 @@ impl<'src> Parser<'src> {
                 _ => {
                     return Err(ParseError::Unsupported {
                         what: "CREATE OPERATOR option",
-                        offset: option.span.start as usize,
+                        offset: option.span.start_usize(),
                     });
                 }
             }
@@ -42,7 +42,7 @@ impl<'src> Parser<'src> {
                 return Err(ParseError::Expected {
                     expected: "PROCEDURE option",
                     found: TokenKind::RParen,
-                    offset: rp.span.start as usize,
+                    offset: rp.span.start_usize(),
                 });
             }
         };
@@ -61,7 +61,7 @@ impl<'src> Parser<'src> {
             return Err(ParseError::Expected {
                 expected: "operator name",
                 found: first.kind,
-                offset: first.span.start as usize,
+                offset: first.span.start_usize(),
             });
         }
         let mut end = first.span.start;
@@ -75,7 +75,7 @@ impl<'src> Parser<'src> {
                 return Err(ParseError::Expected {
                     expected: "contiguous operator name",
                     found: tok.kind,
-                    offset: tok.span.start as usize,
+                    offset: tok.span.start_usize(),
                 });
             }
             let raw = tok.text(self.source).unwrap_or("");

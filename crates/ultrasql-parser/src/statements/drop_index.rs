@@ -53,7 +53,7 @@ impl Parser<'_> {
                 return Err(ParseError::Expected {
                     expected: "INDEX or TABLE",
                     found: other,
-                    offset: tok.span.start as usize,
+                    offset: tok.span.start_usize(),
                 });
             }
         };

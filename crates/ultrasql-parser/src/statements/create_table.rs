@@ -91,7 +91,7 @@ impl Parser<'_> {
             return Err(ParseError::Expected {
                 expected: "RANGE",
                 found: strategy.kind,
-                offset: strategy.span.start as usize,
+                offset: strategy.span.start_usize(),
             });
         }
         self.expect(TokenKind::LParen, "(")?;
@@ -171,7 +171,7 @@ impl Parser<'_> {
                     found => Err(ParseError::Expected {
                         expected: "NULL or DEFAULT after SET",
                         found,
-                        offset: self.peek()?.span.start as usize,
+                        offset: self.peek()?.span.start_usize(),
                     }),
                 }
             }
@@ -183,7 +183,7 @@ impl Parser<'_> {
             found => Err(ParseError::Expected {
                 expected: "CASCADE, RESTRICT, SET NULL, SET DEFAULT, or NO ACTION",
                 found,
-                offset: self.peek()?.span.start as usize,
+                offset: self.peek()?.span.start_usize(),
             }),
         }
     }
@@ -208,7 +208,7 @@ impl Parser<'_> {
                     return Err(ParseError::Expected {
                         expected: "DELETE or UPDATE after ON",
                         found,
-                        offset: self.peek()?.span.start as usize,
+                        offset: self.peek()?.span.start_usize(),
                     });
                 }
             }
@@ -243,7 +243,7 @@ impl Parser<'_> {
                     return Err(ParseError::Expected {
                         expected: "DEFERRED or IMMEDIATE after INITIALLY",
                         found,
-                        offset: self.peek()?.span.start as usize,
+                        offset: self.peek()?.span.start_usize(),
                     });
                 }
             }
@@ -401,7 +401,7 @@ impl Parser<'_> {
                             return Err(ParseError::Expected {
                                 expected: "ALWAYS or BY DEFAULT",
                                 found,
-                                offset: self.peek()?.span.start as usize,
+                                offset: self.peek()?.span.start_usize(),
                             });
                         }
                     };
@@ -437,7 +437,7 @@ impl Parser<'_> {
                         return Err(ParseError::Expected {
                             expected: "IDENTITY or (expr) STORED",
                             found: tok.kind,
-                            offset: tok.span.start as usize,
+                            offset: tok.span.start_usize(),
                         });
                     }
                 }
@@ -449,7 +449,7 @@ impl Parser<'_> {
                         return Err(ParseError::Expected {
                             expected: "NOT NULL, NULL, DEFAULT, PRIMARY KEY, UNIQUE, CHECK, REFERENCES, or GENERATED after CONSTRAINT name",
                             found: tok.kind,
-                            offset: tok.span.start as usize,
+                            offset: tok.span.start_usize(),
                         });
                     }
                     break;
@@ -576,7 +576,7 @@ impl Parser<'_> {
                             return Err(ParseError::Expected {
                                 expected: "',' or ')' in EXCLUDE element list",
                                 found: other,
-                                offset: self.peek()?.span.start as usize,
+                                offset: self.peek()?.span.start_usize(),
                             });
                         }
                     }
@@ -585,7 +585,7 @@ impl Parser<'_> {
             other => Err(ParseError::Expected {
                 expected: "PRIMARY KEY, UNIQUE, FOREIGN KEY, CHECK, or EXCLUDE",
                 found: other,
-                offset: self.peek()?.span.start as usize,
+                offset: self.peek()?.span.start_usize(),
             }),
         }
     }
@@ -601,7 +601,7 @@ impl Parser<'_> {
                 return Err(ParseError::Expected {
                     expected: "=, &&, @>, or <@",
                     found: other,
-                    offset: tok.span.start as usize,
+                    offset: tok.span.start_usize(),
                 });
             }
         };
@@ -659,7 +659,7 @@ impl Parser<'_> {
                         let text = t.text(self.source).unwrap_or("0");
                         let n: u32 = text.parse().map_err(|_| ParseError::InvalidInteger {
                             text: text.to_owned(),
-                            offset: t.span.start as usize,
+                            offset: t.span.start_usize(),
                         })?;
                         mods.push(n);
                     }
@@ -667,7 +667,7 @@ impl Parser<'_> {
                         return Err(ParseError::Expected {
                             expected: "integer type modifier",
                             found: other,
-                            offset: n_tok.span.start as usize,
+                            offset: n_tok.span.start_usize(),
                         });
                     }
                 }
@@ -693,7 +693,7 @@ impl Parser<'_> {
                     .checked_add(1)
                     .ok_or(ParseError::InvalidInteger {
                         text: "array dimension count".to_owned(),
-                        offset: bracket.span.start as usize,
+                        offset: bracket.span.start_usize(),
                     })?;
         }
         let is_array = array_dimensions > 0;
@@ -726,7 +726,7 @@ impl Parser<'_> {
                     return Err(ParseError::Expected {
                         expected: "',' or ')'",
                         found: other,
-                        offset: self.peek()?.span.start as usize,
+                        offset: self.peek()?.span.start_usize(),
                     });
                 }
             }

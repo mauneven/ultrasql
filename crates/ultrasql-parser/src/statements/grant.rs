@@ -161,7 +161,7 @@ impl Parser<'_> {
                 return Err(ParseError::Expected {
                     expected: "ROLE or USER after FOR",
                     found: role_word.kind,
-                    offset: role_word.span.start as usize,
+                    offset: role_word.span.start_usize(),
                 });
             }
             self.advance()?;
@@ -183,7 +183,7 @@ impl Parser<'_> {
                 return Err(ParseError::Expected {
                     expected: "GRANT or REVOKE in ALTER DEFAULT PRIVILEGES",
                     found,
-                    offset: self.peek()?.span.start as usize,
+                    offset: self.peek()?.span.start_usize(),
                 });
             }
         };
@@ -318,7 +318,7 @@ impl Parser<'_> {
             return Err(ParseError::Expected {
                 expected: "privilege keyword",
                 found: tok.kind,
-                offset: tok.span.start as usize,
+                offset: tok.span.start_usize(),
             });
         };
         let kind = match word.as_str() {
@@ -339,7 +339,7 @@ impl Parser<'_> {
                 return Err(ParseError::Expected {
                     expected: "privilege keyword",
                     found: tok.kind,
-                    offset: tok.span.start as usize,
+                    offset: tok.span.start_usize(),
                 });
             }
         };
@@ -353,7 +353,7 @@ impl Parser<'_> {
             return Err(ParseError::Expected {
                 expected: "privilege object kind",
                 found: tok.kind,
-                offset: tok.span.start as usize,
+                offset: tok.span.start_usize(),
             });
         };
         let kind = match word.as_str() {
@@ -366,7 +366,7 @@ impl Parser<'_> {
                 return Err(ParseError::Expected {
                     expected: "TABLE, SCHEMA, DATABASE, SEQUENCE, or FUNCTION",
                     found: tok.kind,
-                    offset: tok.span.start as usize,
+                    offset: tok.span.start_usize(),
                 });
             }
         };

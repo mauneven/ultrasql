@@ -28,7 +28,7 @@ impl Parser<'_> {
                 return Err(ParseError::Expected {
                     expected: "TABLE, INDEX, or COLUMN after COMMENT ON",
                     found: other,
-                    offset: target_tok.span.start as usize,
+                    offset: target_tok.span.start_usize(),
                 });
             }
         };
@@ -68,7 +68,7 @@ impl Parser<'_> {
             other => Err(ParseError::Expected {
                 expected: "string literal or NULL after COMMENT ... IS",
                 found: other,
-                offset: tok.span.start as usize,
+                offset: tok.span.start_usize(),
             }),
         }
     }

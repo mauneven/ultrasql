@@ -35,7 +35,7 @@ impl Parser<'_> {
                     return Err(ParseError::Expected {
                         expected: "string literal containing the global transaction id",
                         found: other,
-                        offset: gid_tok.span.start as usize,
+                        offset: gid_tok.span.start_usize(),
                     });
                 }
             };
@@ -90,7 +90,7 @@ impl Parser<'_> {
                 return Err(ParseError::Expected {
                     expected: "string literal containing the global transaction id",
                     found: other,
-                    offset: gid_tok.span.start as usize,
+                    offset: gid_tok.span.start_usize(),
                 });
             }
         };
@@ -115,7 +115,7 @@ impl Parser<'_> {
                 return Err(ParseError::Expected {
                     expected: "string literal containing the global transaction id",
                     found: other,
-                    offset: gid_tok.span.start as usize,
+                    offset: gid_tok.span.start_usize(),
                 });
             }
         };

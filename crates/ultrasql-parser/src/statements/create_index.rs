@@ -143,7 +143,7 @@ impl Parser<'_> {
                 return Err(ParseError::Expected {
                     expected: "FIRST or LAST",
                     found: n.kind,
-                    offset: n.span.start as usize,
+                    offset: n.span.start_usize(),
                 });
             }
         } else {

@@ -32,7 +32,7 @@ impl Parser<'_> {
             return Err(ParseError::Expected {
                 expected: "ENUM or '(' after CREATE TYPE name AS",
                 found: tok.kind,
-                offset: tok.span.start as usize,
+                offset: tok.span.start_usize(),
             });
         };
         let end = self.expect(TokenKind::RParen, ")")?.span.end;
@@ -57,7 +57,7 @@ impl Parser<'_> {
                     return Err(ParseError::Expected {
                         expected: "',' or ')' after enum label",
                         found: other,
-                        offset: self.peek()?.span.start as usize,
+                        offset: self.peek()?.span.start_usize(),
                     });
                 }
             }
@@ -86,7 +86,7 @@ impl Parser<'_> {
                     return Err(ParseError::Expected {
                         expected: "',' or ')' after composite attribute",
                         found: other,
-                        offset: self.peek()?.span.start as usize,
+                        offset: self.peek()?.span.start_usize(),
                     });
                 }
             }
@@ -108,7 +108,7 @@ impl Parser<'_> {
             other => Err(ParseError::Expected {
                 expected: "string literal enum label",
                 found: other,
-                offset: tok.span.start as usize,
+                offset: tok.span.start_usize(),
             }),
         }
     }
@@ -166,7 +166,7 @@ impl Parser<'_> {
                         return Err(ParseError::Expected {
                             expected: "domain constraint after CONSTRAINT name",
                             found: tok.kind,
-                            offset: tok.span.start as usize,
+                            offset: tok.span.start_usize(),
                         });
                     }
                     break;
@@ -177,7 +177,7 @@ impl Parser<'_> {
                         return Err(ParseError::Expected {
                             expected: "domain constraint after CONSTRAINT name",
                             found: other,
-                            offset: tok.span.start as usize,
+                            offset: tok.span.start_usize(),
                         });
                     }
                     break;

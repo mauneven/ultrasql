@@ -133,7 +133,7 @@ impl Parser<'_> {
             other => Err(ParseError::Expected {
                 expected: "ADD, DROP, RENAME, or SET",
                 found: other,
-                offset: tok.span.start as usize,
+                offset: tok.span.start_usize(),
             }),
         }
     }

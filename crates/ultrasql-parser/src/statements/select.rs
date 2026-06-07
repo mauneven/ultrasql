@@ -274,7 +274,7 @@ impl Parser<'_> {
                 if natural {
                     return Err(ParseError::Unsupported {
                         what: "NATURAL CROSS JOIN",
-                        offset: self.peek()?.span.start as usize,
+                        offset: self.peek()?.span.start_usize(),
                     });
                 }
                 self.advance()?; // CROSS
@@ -312,7 +312,7 @@ impl Parser<'_> {
                 return Err(ParseError::Expected {
                     expected: "JOIN keyword",
                     found: other,
-                    offset: self.peek()?.span.start as usize,
+                    offset: self.peek()?.span.start_usize(),
                 });
             }
         };
@@ -336,7 +336,7 @@ impl Parser<'_> {
                     return Err(ParseError::Expected {
                         expected: "ON or USING",
                         found: self.peek()?.kind,
-                        offset: self.peek()?.span.start as usize,
+                        offset: self.peek()?.span.start_usize(),
                     });
                 }
             }
@@ -382,7 +382,7 @@ impl Parser<'_> {
                 let alias = self.parse_identifier().map_err(|_| ParseError::Expected {
                     expected: "alias for derived table (PostgreSQL requires AS alias)",
                     found: self.peek().map_or(TokenKind::Eof, |t| t.kind),
-                    offset: rp.span.end as usize,
+                    offset: rp.span.end_usize(),
                 })?;
 
                 let column_aliases = if self.peek()?.kind == TokenKind::LParen {
@@ -444,12 +444,12 @@ impl Parser<'_> {
             return Err(ParseError::Expected {
                 expected: "file path string literal",
                 found: self.peek()?.kind,
-                offset: arg.span().start as usize,
+                offset: arg.span().start_usize(),
             });
         };
         let function = file_table_function_name(value).ok_or(ParseError::Unsupported {
             what: "file table literal without supported external file extension",
-            offset: span.start as usize,
+            offset: span.start_usize(),
         })?;
         let alias = if self.match_kw(TokenKind::KwAs) {
             Some(self.parse_alias_identifier()?)
@@ -547,7 +547,7 @@ impl Parser<'_> {
                     return Err(ParseError::Expected {
                         expected: "UPDATE, SHARE, NO KEY UPDATE, or KEY SHARE after FOR",
                         found: other,
-                        offset: tok.span.start as usize,
+                        offset: tok.span.start_usize(),
                     });
                 }
             };
@@ -958,7 +958,7 @@ impl Parser<'_> {
             _ => Err(ParseError::Expected {
                 expected,
                 found: self.peek()?.kind,
-                offset: span.start as usize,
+                offset: span.start_usize(),
             }),
         }
     }
@@ -975,7 +975,7 @@ impl Parser<'_> {
         Err(ParseError::Expected {
             expected,
             found: tok.kind,
-            offset: tok.span.start as usize,
+            offset: tok.span.start_usize(),
         })
     }
 
@@ -1019,7 +1019,7 @@ impl Parser<'_> {
                     return Err(ParseError::Expected {
                         expected: "FIRST or LAST",
                         found: n.kind,
-                        offset: n.span.start as usize,
+                        offset: n.span.start_usize(),
                     });
                 }
             } else {
@@ -1097,7 +1097,7 @@ impl Parser<'_> {
             other => Err(ParseError::Expected {
                 expected: "identifier",
                 found: other,
-                offset: tok.span.start as usize,
+                offset: tok.span.start_usize(),
             }),
         }
     }
