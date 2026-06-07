@@ -12,10 +12,16 @@ ANN_FILES = [
     REPO / "crates" / "ultrasql-bench" / "src" / "ai_gauntlet.rs",
     REPO / "crates" / "ultrasql-bench" / "src" / "ann_vector.rs",
 ]
+SQL_BENCH_FILES = [
+    REPO / "crates" / "ultrasql-bench" / "src" / "bin" / "cross_compare_sql.rs",
+]
 NUMERIC_AS_CAST = re.compile(
     r"\bas\s+(?:usize|u8|u16|u32|u64|i8|i16|i32|i64|isize|f32|f64)\b"
 )
 NEAREST_RANK_INDEX_CAST = re.compile(r"rank\.max\(1\.0\)\s+as\s+usize")
+SQL_PERCENTILE_INDEX_CAST = re.compile(
+    r"sorted_values\.len\(\)\s+as\s+f64.*ceil\(\)\s+as\s+usize"
+)
 
 
 class BenchStyleTests(unittest.TestCase):
@@ -35,6 +41,16 @@ class BenchStyleTests(unittest.TestCase):
             for line_no, line in enumerate(path.read_text().splitlines(), start=1):
                 code = line.split("//", maxsplit=1)[0]
                 if NEAREST_RANK_INDEX_CAST.search(code):
+                    offenders.append(f"{path.relative_to(REPO)}:{line_no}: {line.strip()}")
+
+        self.assertEqual([], offenders)
+
+    def test_sql_bench_percentiles_use_checked_index_conversions(self) -> None:
+        offenders: list[str] = []
+        for path in SQL_BENCH_FILES:
+            for line_no, line in enumerate(path.read_text().splitlines(), start=1):
+                code = line.split("//", maxsplit=1)[0]
+                if SQL_PERCENTILE_INDEX_CAST.search(code):
                     offenders.append(f"{path.relative_to(REPO)}:{line_no}: {line.strip()}")
 
         self.assertEqual([], offenders)

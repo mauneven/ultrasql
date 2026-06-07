@@ -53,6 +53,7 @@ use anyhow::{Context, Result};
 use arrow_array::{Int64Array, RecordBatch, StringArray};
 use arrow_schema::{DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema};
 use clap::{Parser, ValueEnum};
+use num_traits::ToPrimitive;
 use parquet::arrow::{ArrowWriter, arrow_reader::ParquetRecordBatchReaderBuilder};
 use sha2::{Digest, Sha256};
 use tokio_postgres::NoTls;
@@ -952,7 +953,11 @@ fn required_csv_path(args: &Args) -> Result<&PathBuf> {
 }
 
 fn percentile_nearest_rank(sorted_values: &[f64], percentile: f64) -> f64 {
-    let rank = (sorted_values.len() as f64 * percentile).ceil() as usize;
+    let sample_count = sorted_values.len().to_f64().unwrap_or(f64::INFINITY);
+    let rank = (sample_count * percentile)
+        .ceil()
+        .to_usize()
+        .unwrap_or(usize::MAX);
     let idx = rank.saturating_sub(1).min(sorted_values.len() - 1);
     sorted_values[idx]
 }
