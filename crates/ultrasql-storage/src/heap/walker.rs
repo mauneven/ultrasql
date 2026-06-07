@@ -18,6 +18,12 @@ use crate::vm::VisibilityMap;
 
 use super::{HeapError, UndoRelationLog};
 
+/// Tuple yielded by [`VisibleHeapWalker::try_next`].
+///
+/// The payload slice borrows from the walker's internal scratch buffer and is
+/// invalidated by the next `try_next` call.
+pub type VisibleTuple<'a> = (TupleId, TupleHeader, &'a [u8]);
+
 /// Visibility-filtered sequential scan that yields borrowed slot
 /// payload slices.
 ///
@@ -101,8 +107,7 @@ impl<L: PageLoader, O: XidStatusOracle + ?Sized> VisibleHeapWalker<'_, L, O> {
     /// I/O / decode failure. The `payload_bytes` slice borrows from
     /// the walker's internal scratch buffer; the borrow is
     /// invalidated by the next call.
-    #[allow(clippy::type_complexity)]
-    pub fn try_next(&mut self) -> Result<Option<(TupleId, TupleHeader, &[u8])>, HeapError> {
+    pub fn try_next(&mut self) -> Result<Option<VisibleTuple<'_>>, HeapError> {
         loop {
             if self.current_block >= self.block_count {
                 return Ok(None);
