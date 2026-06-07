@@ -318,8 +318,13 @@ impl BlockNumber {
     #[inline]
     #[must_use]
     pub const fn byte_offset(self) -> u64 {
-        (self.0 as u64) << PAGE_SIZE_LOG2
+        u32_to_u64_const(self.0) << PAGE_SIZE_LOG2
     }
+}
+
+const fn u32_to_u64_const(value: u32) -> u64 {
+    let [b0, b1, b2, b3] = value.to_le_bytes();
+    u64::from_le_bytes([b0, b1, b2, b3, 0, 0, 0, 0])
 }
 
 impl fmt::Debug for BlockNumber {
