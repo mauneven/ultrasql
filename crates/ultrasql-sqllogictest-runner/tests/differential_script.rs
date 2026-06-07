@@ -188,7 +188,6 @@ fn write_executable(path: &Path, text: &str) {
 fn temp_dir(prefix: &str) -> PathBuf {
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .expect("system clock after Unix epoch")
-        .as_nanos();
+        .map_or(0, |duration| duration.as_nanos());
     std::env::temp_dir().join(format!("{prefix}-{}-{nanos}", process::id()))
 }
