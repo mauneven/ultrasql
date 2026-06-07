@@ -282,16 +282,26 @@ fn measure(tree: &BTree<BlankLoader>, keys: &[i64], runs: usize) -> (Vec<u128>, 
 /// Format the per-engine JSON result record. Mirrors the per-engine
 /// shape of `comparison-2026-05-12-m4-extended/results.json` so the
 /// downstream parser does not need a special case for this driver.
-#[allow(clippy::too_many_arguments)]
-fn format_result_json(
+struct ResultJsonInput<'a> {
     n: usize,
     probes: usize,
     runs: usize,
     warmup_probes: usize,
-    run_ns: &[u128],
+    run_ns: &'a [u128],
     build_ns: u128,
     last_hits: i64,
-) -> String {
+}
+
+fn format_result_json(input: ResultJsonInput<'_>) -> String {
+    let ResultJsonInput {
+        n,
+        probes,
+        runs,
+        warmup_probes,
+        run_ns,
+        build_ns,
+        last_hits,
+    } = input;
     let probes_f = probes as f64;
     let per_probe_ns: Vec<f64> = run_ns.iter().map(|&t| (t as f64) / probes_f).collect();
     let med_ns = median_f64(&per_probe_ns);
@@ -349,15 +359,15 @@ fn main() -> Result<()> {
     warmup(&tree, &keys, args.warmup_probes);
     let (run_ns, last_hits) = measure(&tree, &keys, args.runs);
 
-    let json = format_result_json(
-        point_n,
-        args.probes,
-        args.runs,
-        args.warmup_probes,
-        &run_ns,
+    let json = format_result_json(ResultJsonInput {
+        n: point_n,
+        probes: args.probes,
+        runs: args.runs,
+        warmup_probes: args.warmup_probes,
+        run_ns: &run_ns,
         build_ns,
         last_hits,
-    );
+    });
     println!("{json}");
 
     if let Some(path) = &args.out {
