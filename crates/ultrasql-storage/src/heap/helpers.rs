@@ -188,7 +188,6 @@ impl<L: PageLoader> HeapAccess<L> {
     /// field offsets (mirroring [`Self::stamp_updated_old_inline`]);
     /// no `TupleHeader::decode` / `encode` round trip on the per-row
     /// path.
-    #[allow(clippy::too_many_arguments)]
     #[inline]
     pub(super) fn try_hot_update_inplace(
         page: &mut PageWrite<'_>,
