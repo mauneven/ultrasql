@@ -160,19 +160,16 @@ impl<L: PageLoader> PersistentClog<L> {
     /// (the loader returns a zeroed heap page, meaning all XIDs start as
     /// `InProgress`). Pages are marked dirty automatically by the
     /// `PageWrite` guard on drop.
-    #[allow(clippy::significant_drop_tightening)]
     pub fn set_status(&self, xid: Xid, status: XidStatus) -> Result<(), ClogError> {
         let (page_id, byte_off, shift) = Self::location(xid, self.rel)?;
         let guard = self.pool.get_page(page_id)?;
-        // `page` (PageWrite) must remain in scope until after we mutate
-        // bytes, because `page` borrows from `guard` and `bytes` borrows
-        // from `page`. Clippy would prefer to drop it early, but the
-        // borrow checker requires it to outlive `bytes`.
-        let mut page = guard.write();
-        let bits = status_to_bits(status);
-        let idx = PAGE_HEADER_SIZE + byte_off;
-        let bytes = page.as_bytes_mut();
-        bytes[idx] = (bytes[idx] & !(0b11u8 << shift)) | (bits << shift);
+        {
+            let mut page = guard.write();
+            let bits = status_to_bits(status);
+            let idx = PAGE_HEADER_SIZE + byte_off;
+            let bytes = page.as_bytes_mut();
+            bytes[idx] = (bytes[idx] & !(0b11u8 << shift)) | (bits << shift);
+        }
         Ok(())
     }
 
