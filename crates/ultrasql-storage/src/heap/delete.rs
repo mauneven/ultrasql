@@ -75,6 +75,42 @@ struct DeleteInt32PairRange<'a, O: ?Sized, P: ?Sized> {
     vm: Option<&'a crate::vm::VisibilityMap>,
 }
 
+/// Page-major scan request for fused `(Int32, Int32)` DELETE.
+///
+/// The predicate receives the decoded `(id, value)` payload for each
+/// visible tuple. Callers provide the MVCC snapshot and oracle used to
+/// filter candidate rows before the predicate runs.
+pub struct DeleteInt32PairScan<'a, O: ?Sized, P> {
+    /// Relation to scan.
+    pub rel: RelationId,
+    /// Number of blocks to visit in `rel`.
+    pub block_count: u32,
+    /// MVCC snapshot used for tuple visibility.
+    pub snapshot: &'a Snapshot,
+    /// Commit-status oracle backing visibility checks.
+    pub oracle: &'a O,
+    /// Predicate over decoded `(Int32, Int32)` payload values.
+    pub predicate: P,
+}
+
+impl<O: ?Sized, P> std::fmt::Debug for DeleteInt32PairScan<'_, O, P> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DeleteInt32PairScan")
+            .field("rel", &self.rel)
+            .field("block_count", &self.block_count)
+            .finish_non_exhaustive()
+    }
+}
+
+/// MVCC stamp written by fused in-place DELETE helpers.
+#[derive(Clone, Copy, Debug)]
+pub struct DeleteInt32PairStamp {
+    /// XID stamped as `xmax` on deleted tuple versions.
+    pub xid: Xid,
+    /// Command id stamped as `cmax` on deleted tuple versions.
+    pub command_id: CommandId,
+}
+
 impl<L: PageLoader> HeapAccess<L> {
     /// Clear `xmax` stamps for an aborted transaction.
     ///
@@ -392,17 +428,11 @@ impl<L: PageLoader> HeapAccess<L> {
     /// retains the non-durable benchmark path for the executor's
     /// fused operator (the pipeline lowerer threads the live sink in
     /// when present).
-    #[allow(clippy::too_many_arguments)]
     #[inline]
     pub fn delete_int32_pair_inplace<O, P>(
         &self,
-        rel: RelationId,
-        block_count: u32,
-        snapshot: &Snapshot,
-        oracle: &O,
-        predicate: P,
-        xid: Xid,
-        command_id: CommandId,
+        scan: DeleteInt32PairScan<'_, O, P>,
+        stamp: DeleteInt32PairStamp,
         wal: Option<&dyn WalSink>,
         vm: Option<&crate::vm::VisibilityMap>,
     ) -> Result<usize, HeapError>
@@ -412,6 +442,14 @@ impl<L: PageLoader> HeapAccess<L> {
     {
         use crate::page::{ITEMID_SIZE, PAGE_HEADER_SIZE};
 
+        let DeleteInt32PairScan {
+            rel,
+            block_count,
+            snapshot,
+            oracle,
+            predicate,
+        } = scan;
+        let DeleteInt32PairStamp { xid, command_id } = stamp;
         let mut total_deleted: usize = 0;
         let mut xmin_cache: Option<(Xid, u16, bool)> = None;
 
@@ -578,16 +616,10 @@ impl<L: PageLoader> HeapAccess<L> {
     /// remains unchanged. Without WAL, each worker owns a disjoint page range
     /// and stamps matching visible tuples under the same MVCC rules as
     /// [`Self::delete_int32_pair_inplace`].
-    #[allow(clippy::too_many_arguments)]
     pub fn delete_int32_pair_inplace_parallel_no_wal<O, P>(
         &self,
-        rel: RelationId,
-        block_count: u32,
-        snapshot: &Snapshot,
-        oracle: &O,
-        predicate: P,
-        xid: Xid,
-        command_id: CommandId,
+        scan: DeleteInt32PairScan<'_, O, P>,
+        stamp: DeleteInt32PairStamp,
         vm: Option<&crate::vm::VisibilityMap>,
     ) -> Result<usize, HeapError>
     where
@@ -595,19 +627,28 @@ impl<L: PageLoader> HeapAccess<L> {
         P: Fn(i32, i32) -> bool + Sync,
     {
         let available_workers = std::thread::available_parallelism().map_or(1, |n| n.get());
+        let DeleteInt32PairScan {
+            rel,
+            block_count,
+            snapshot,
+            oracle,
+            predicate,
+        } = scan;
         if block_count < 2_048 || available_workers <= 1 {
             return self.delete_int32_pair_inplace(
-                rel,
-                block_count,
-                snapshot,
-                oracle,
-                predicate,
-                xid,
-                command_id,
+                DeleteInt32PairScan {
+                    rel,
+                    block_count,
+                    snapshot,
+                    oracle,
+                    predicate,
+                },
+                stamp,
                 None,
                 vm,
             );
         }
+        let DeleteInt32PairStamp { xid, command_id } = stamp;
 
         let block_count_usize = usize::try_from(block_count)
             .map_err(|_| HeapError::MalformedHeader("block count overflow"))?;
@@ -617,13 +658,14 @@ impl<L: PageLoader> HeapAccess<L> {
             .max(1);
         if workers <= 1 {
             return self.delete_int32_pair_inplace(
-                rel,
-                block_count,
-                snapshot,
-                oracle,
-                predicate,
-                xid,
-                command_id,
+                DeleteInt32PairScan {
+                    rel,
+                    block_count,
+                    snapshot,
+                    oracle,
+                    predicate,
+                },
+                stamp,
                 None,
                 vm,
             );

@@ -25,7 +25,7 @@ use std::sync::Arc;
 use ultrasql_core::{CommandId, DataType, Field, RelationId, Schema, Xid};
 use ultrasql_mvcc::Snapshot;
 use ultrasql_storage::PageLoader;
-use ultrasql_storage::heap::HeapAccess;
+use ultrasql_storage::heap::{DeleteInt32PairScan, DeleteInt32PairStamp, HeapAccess};
 use ultrasql_storage::vm::VisibilityMap;
 use ultrasql_txn::TransactionManager;
 use ultrasql_vec::Batch;
@@ -152,29 +152,23 @@ impl<L: PageLoader + Send + Sync + std::fmt::Debug + 'static> Operator for Fused
         };
         let wal_sink_arc = self.heap.wal_sink().cloned();
         let wal_sink: Option<&dyn ultrasql_storage::WalSink> = wal_sink_arc.as_deref();
+        let scan = DeleteInt32PairScan {
+            rel: self.relation,
+            block_count: self.block_count,
+            snapshot: &self.snapshot,
+            oracle: &*self.oracle,
+            predicate: predicate_fn,
+        };
+        let stamp = DeleteInt32PairStamp {
+            xid: self.xid,
+            command_id: self.command_id,
+        };
         let n = if wal_sink.is_some() {
-            self.heap.delete_int32_pair_inplace(
-                self.relation,
-                self.block_count,
-                &self.snapshot,
-                &*self.oracle,
-                predicate_fn,
-                self.xid,
-                self.command_id,
-                wal_sink,
-                self.vm.as_deref(),
-            )
+            self.heap
+                .delete_int32_pair_inplace(scan, stamp, wal_sink, self.vm.as_deref())
         } else {
-            self.heap.delete_int32_pair_inplace_parallel_no_wal(
-                self.relation,
-                self.block_count,
-                &self.snapshot,
-                &*self.oracle,
-                predicate_fn,
-                self.xid,
-                self.command_id,
-                self.vm.as_deref(),
-            )
+            self.heap
+                .delete_int32_pair_inplace_parallel_no_wal(scan, stamp, self.vm.as_deref())
         }
         .map_err(|e| ExecError::TypeMismatch(e.to_string()))?;
 

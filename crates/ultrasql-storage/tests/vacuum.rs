@@ -22,7 +22,9 @@ use ultrasql_core::{CommandId, PageId, RelationId, Result, Xid};
 use ultrasql_mvcc::Snapshot;
 use ultrasql_mvcc::status::test_support::MapOracle;
 use ultrasql_storage::buffer_pool::{BufferPool, PageLoader};
-use ultrasql_storage::heap::{HeapAccess, InsertOptions};
+use ultrasql_storage::heap::{
+    DeleteInt32PairScan, DeleteInt32PairStamp, HeapAccess, InsertOptions,
+};
 use ultrasql_storage::page::Page;
 
 #[derive(Default)]
@@ -306,13 +308,17 @@ fn long_snapshot_survives_update_delete_and_vacuum() {
     );
     let deleted = heap
         .delete_int32_pair_inplace(
-            rel(),
-            block_count,
-            &writer_delete,
-            &oracle,
-            |id, _val| id % 2 != 0 && id % 3 == 0,
-            Xid::new(3),
-            CommandId::FIRST,
+            DeleteInt32PairScan {
+                rel: rel(),
+                block_count,
+                snapshot: &writer_delete,
+                oracle: &oracle,
+                predicate: |id, _val| id % 2 != 0 && id % 3 == 0,
+            },
+            DeleteInt32PairStamp {
+                xid: Xid::new(3),
+                command_id: CommandId::FIRST,
+            },
             None,
             None,
         )

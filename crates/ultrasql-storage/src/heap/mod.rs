@@ -490,6 +490,8 @@ mod vacuum;
 mod wal_emit;
 mod walker;
 
+pub use delete::{DeleteInt32PairScan, DeleteInt32PairStamp};
+
 impl<L: PageLoader> HeapAccess<L> {
     /// Build a new heap access bound to `pool`.
     ///

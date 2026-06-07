@@ -26,7 +26,10 @@ use std::sync::Arc;
 use proptest::prelude::*;
 use ultrasql_core::{BlockNumber, CommandId, PageId, RelationId, TupleId, Xid};
 use ultrasql_storage::buffer_pool::BufferPool;
-use ultrasql_storage::heap::{DeleteOptions, HeapAccess, InsertOptions, UpdateOptions};
+use ultrasql_storage::heap::{
+    DeleteInt32PairScan, DeleteInt32PairStamp, DeleteOptions, HeapAccess, InsertOptions,
+    UpdateOptions,
+};
 use ultrasql_wal::applier::dispatch_record;
 
 // ---------------------------------------------------------------------------
@@ -519,13 +522,17 @@ fn crash_recovery_in_place_delete_stamps_xmax() {
         let sink_ref: &dyn ultrasql_storage::wal_sink::WalSink = sink.as_ref();
         let deleted = heap
             .delete_int32_pair_inplace(
-                rel(),
-                n_blocks,
-                &snap,
-                &oracle,
-                |_id, _val| true,
-                Xid::new(2),
-                CommandId::FIRST,
+                DeleteInt32PairScan {
+                    rel: rel(),
+                    block_count: n_blocks,
+                    snapshot: &snap,
+                    oracle: &oracle,
+                    predicate: |_id, _val| true,
+                },
+                DeleteInt32PairStamp {
+                    xid: Xid::new(2),
+                    command_id: CommandId::FIRST,
+                },
                 Some(sink_ref),
                 None,
             )
