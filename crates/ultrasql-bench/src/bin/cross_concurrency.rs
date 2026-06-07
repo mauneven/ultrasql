@@ -52,11 +52,7 @@
 #![allow(
     clippy::print_stdout,
     clippy::enum_variant_names,
-    clippy::unnecessary_lazy_evaluations,
-    clippy::cast_possible_truncation,
-    clippy::cast_possible_wrap,
-    clippy::cast_sign_loss,
-    clippy::cast_lossless
+    clippy::unnecessary_lazy_evaluations
 )]
 
 use std::io::BufRead;
@@ -68,6 +64,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use clap::{Parser, ValueEnum};
+use num_traits::ToPrimitive;
 use ultrasql_core::{BlockNumber, CommandId, PageId, RelationId, TupleId, Xid};
 use ultrasql_storage::btree::BTree;
 use ultrasql_storage::buffer_pool::{BufferPool, PageLoader};
@@ -171,8 +168,8 @@ fn main() -> Result<()> {
     let line = match args.workload {
         Workload::ConcReadSum => run_read_sum(&args)?,
         Workload::ConcReadPoint => run_read_point(&args)?,
-        Workload::ConcInsert => run_insert(&args),
-        Workload::ConcUpdate => run_update(&args),
+        Workload::ConcInsert => run_insert(&args)?,
+        Workload::ConcUpdate => run_update(&args)?,
     };
     println!("{line}");
     Ok(())
@@ -292,6 +289,20 @@ const fn make_tid(block: u32, slot: u16) -> TupleId {
     )
 }
 
+fn u64_to_f64(value: u64, context: &str) -> Result<f64> {
+    value
+        .to_f64()
+        .with_context(|| format!("{context} does not fit f64"))
+}
+
+fn ops_per_second(total_ops: u64, secs: f64, context: &str) -> Result<f64> {
+    if secs > 0.0 {
+        Ok(u64_to_f64(total_ops, context)? / secs)
+    } else {
+        Ok(0.0)
+    }
+}
+
 // --- conc-read-sum -------------------------------------------------------
 
 fn run_read_sum(args: &Args) -> Result<String> {
@@ -305,11 +316,7 @@ fn run_read_sum(args: &Args) -> Result<String> {
 
         // Measured pass.
         let (total_ops, secs) = run_read_sum_window(&data, total, args.threads, args.measure_secs);
-        let ops_per_sec = if secs > 0.0 {
-            (total_ops as f64) / secs
-        } else {
-            0.0
-        };
+        let ops_per_sec = ops_per_second(total_ops, secs, "read sum operation count")?;
         iters.push(ops_per_sec);
         eprintln!(
             "  rep {}/{}: {:.0} ops/s ({} total in {:.2} s)",
@@ -404,11 +411,7 @@ fn run_read_point(args: &Args) -> Result<String> {
         // Measured.
         let (total_ops, secs) =
             run_read_point_window(&tree, n_i64, args.threads, args.measure_secs);
-        let ops_per_sec = if secs > 0.0 {
-            (total_ops as f64) / secs
-        } else {
-            0.0
-        };
+        let ops_per_sec = ops_per_second(total_ops, secs, "read point operation count")?;
         iters.push(ops_per_sec);
         eprintln!(
             "  rep {}/{}: {:.0} ops/s ({} total in {:.2} s)",
@@ -474,7 +477,7 @@ fn run_read_point_thread(
 
 // --- conc-insert ---------------------------------------------------------
 
-fn run_insert(args: &Args) -> String {
+fn run_insert(args: &Args) -> Result<String> {
     let mut iters = Vec::with_capacity(args.repeats);
     for rep in 0..args.repeats {
         // Each iteration builds a fresh pool + heap, so each thread's
@@ -522,11 +525,7 @@ fn run_insert(args: &Args) -> String {
         }
         let total_ops: u64 = counters.iter().map(|c| c.load(Ordering::Acquire)).sum();
         let secs = elapsed.as_secs_f64();
-        let ops_per_sec = if secs > 0.0 {
-            (total_ops as f64) / secs
-        } else {
-            0.0
-        };
+        let ops_per_sec = ops_per_second(total_ops, secs, "insert operation count")?;
         iters.push(ops_per_sec);
         eprintln!(
             "  rep {}/{}: {:.0} ops/s ({} total in {:.2} s)",
@@ -539,7 +538,7 @@ fn run_insert(args: &Args) -> String {
         drop(heap);
         drop(pool);
     }
-    emit_json(args.workload, args.threads, args, &iters)
+    Ok(emit_json(args.workload, args.threads, args, &iters))
 }
 
 fn run_insert_thread(
@@ -581,7 +580,7 @@ fn run_insert_thread(
 
 // --- conc-update ---------------------------------------------------------
 
-fn run_update(args: &Args) -> String {
+fn run_update(args: &Args) -> Result<String> {
     let mut iters = Vec::with_capacity(args.repeats);
     for rep in 0..args.repeats {
         let stop = Arc::new(AtomicBool::new(false));
@@ -607,11 +606,7 @@ fn run_update(args: &Args) -> String {
         }
         let total_ops: u64 = counters.iter().map(|c| c.load(Ordering::Acquire)).sum();
         let secs = elapsed.as_secs_f64();
-        let ops_per_sec = if secs > 0.0 {
-            (total_ops as f64) / secs
-        } else {
-            0.0
-        };
+        let ops_per_sec = ops_per_second(total_ops, secs, "update operation count")?;
         iters.push(ops_per_sec);
         eprintln!(
             "  rep {}/{}: {:.0} ops/s ({} total in {:.2} s)",
@@ -622,7 +617,7 @@ fn run_update(args: &Args) -> String {
             secs
         );
     }
-    emit_json(args.workload, args.threads, args, &iters)
+    Ok(emit_json(args.workload, args.threads, args, &iters))
 }
 
 fn run_update_thread(rows: usize, tid: usize, stop: &AtomicBool) -> u64 {
