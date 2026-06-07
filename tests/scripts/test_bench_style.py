@@ -47,6 +47,7 @@ BTREE_POINT_LOOKUP_ITERATION_WIDTH_CAST = re.compile(
     r"\bctx\.iterations\s+as\s+usize\b"
 )
 HASH_AGGREGATE_ITERATION_WIDTH_CAST = re.compile(r"\bctx\.iterations\s+as\s+usize\b")
+HASH_AGGREGATE_GROUP_WIDTH_CAST = re.compile(r"\bGROUP_COUNT\s+as\s+usize\b")
 RANGE_SCAN_ITERATION_WIDTH_CAST = re.compile(r"\bctx\.iterations\s+as\s+usize\b")
 SORT_LARGE_ITERATION_WIDTH_CAST = re.compile(r"\bctx\.iterations\s+as\s+usize\b")
 DELETE_THROUGHPUT_ITERATION_WIDTH_CAST = re.compile(
@@ -294,6 +295,16 @@ class BenchStyleTests(unittest.TestCase):
         for line_no, line in enumerate(path.read_text().splitlines(), start=1):
             code = line.split("//", maxsplit=1)[0]
             if HASH_AGGREGATE_ITERATION_WIDTH_CAST.search(code):
+                offenders.append(f"{path.relative_to(REPO)}:{line_no}: {line.strip()}")
+
+        self.assertEqual([], offenders)
+
+    def test_hash_aggregate_uses_checked_group_width_conversions(self) -> None:
+        offenders: list[str] = []
+        path = REPO / "crates" / "ultrasql-bench" / "src" / "runs" / "hash_aggregate.rs"
+        for line_no, line in enumerate(path.read_text().splitlines(), start=1):
+            code = line.split("//", maxsplit=1)[0]
+            if HASH_AGGREGATE_GROUP_WIDTH_CAST.search(code):
                 offenders.append(f"{path.relative_to(REPO)}:{line_no}: {line.strip()}")
 
         self.assertEqual([], offenders)

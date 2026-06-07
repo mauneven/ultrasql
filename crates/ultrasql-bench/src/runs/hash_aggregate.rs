@@ -32,7 +32,7 @@ const TEST_ROW_COUNT: usize = 2_000;
 const SMOKE_ROW_COUNT: usize = 500;
 
 /// Number of distinct `group_id` values.
-const GROUP_COUNT: i32 = 1_000;
+const GROUP_COUNT: usize = 1_000;
 
 /// Builds two columns: `group_id` (i64, cycling through `GROUP_COUNT`)
 /// and `value` (i64, deterministic from the row index).
@@ -40,7 +40,7 @@ fn build_columns(n: usize) -> (Vec<i32>, Vec<i64>) {
     let mut group_ids: Vec<i32> = Vec::with_capacity(n);
     let mut values: Vec<i64> = Vec::with_capacity(n);
     for i in 0..n {
-        let gid = i32::try_from(i % (GROUP_COUNT as usize)).unwrap_or(0);
+        let gid = i32::try_from(i % GROUP_COUNT).unwrap_or(0);
         let val = i64::try_from(i).unwrap_or(0).wrapping_mul(999_983);
         group_ids.push(gid);
         values.push(val);
@@ -77,7 +77,7 @@ pub fn run(ctx: &BenchContext) -> BenchResult {
         std::hint::black_box(&hashes);
 
         // Accumulate aggregates.
-        let mut table: HashMap<i32, (i64, i64)> = HashMap::with_capacity(GROUP_COUNT as usize * 2);
+        let mut table: HashMap<i32, (i64, i64)> = HashMap::with_capacity(GROUP_COUNT * 2);
         for (i, &gid) in gids.iter().enumerate() {
             let val = vals[i];
             let entry = table.entry(gid).or_insert((0_i64, 0_i64));
