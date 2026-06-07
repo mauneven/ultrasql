@@ -52,7 +52,8 @@ pub fn run(ctx: &BenchContext) -> BenchResult {
     }
 
     // Measured iterations.
-    let mut samples: Vec<f64> = Vec::with_capacity(ctx.iterations as usize);
+    let iteration_count = usize::try_from(ctx.iterations).unwrap_or(0);
+    let mut samples: Vec<f64> = Vec::with_capacity(iteration_count);
     for _ in 0..ctx.iterations {
         samples.push(timed_iter(&x_col, &y_col));
     }
@@ -127,7 +128,7 @@ mod tests {
         let result = run(&ctx);
         assert_eq!(
             result.samples.len(),
-            ctx.iterations as usize,
+            usize::try_from(ctx.iterations).unwrap_or(0),
             "must produce one sample per measured iteration"
         );
         assert!(
