@@ -55,7 +55,6 @@
     clippy::trivially_copy_pass_by_ref,
     clippy::map_unwrap_or,
     clippy::similar_names,
-    clippy::many_single_char_names,
     clippy::items_after_statements,
     clippy::float_cmp,
     clippy::uninlined_format_args,
@@ -670,33 +669,41 @@ fn now_iso8601_with_override(override_ts: Option<&str>) -> String {
 /// This is a minimal Gregorian-calendar implementation covering years
 /// 1970–2099 sufficient for test reproducibility. It does not handle
 /// leap seconds.
-#[allow(clippy::many_single_char_names)]
-fn unix_to_parts(secs: u64) -> (u32, u32, u32, u32, u32, u32) {
-    let sec = u32::try_from(secs % 60).unwrap_or(0);
-    let min = u32::try_from((secs / 60) % 60).unwrap_or(0);
-    let hour = u32::try_from((secs / 3600) % 24).unwrap_or(0);
-    let days = secs / 86400;
+fn unix_to_parts(seconds: u64) -> (u32, u32, u32, u32, u32, u32) {
+    let second = u32::try_from(seconds % 60).unwrap_or(0);
+    let minute = u32::try_from((seconds / 60) % 60).unwrap_or(0);
+    let hour = u32::try_from((seconds / 3600) % 24).unwrap_or(0);
+    let days_since_epoch = seconds / 86400;
 
     // Shift epoch to 1 Mar 2000 (day 11017 from Unix epoch) to simplify
     // leap-year arithmetic using the 400-year cycle.
-    let z = days + 719_468;
-    let era = z / 146_097;
-    let doe = z - era * 146_097;
-    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146_096) / 365;
-    let y = yoe + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let d = doy - (153 * mp + 2) / 5 + 1;
-    let m = if mp < 10 { mp + 3 } else { mp - 9 };
-    let y = if m <= 2 { y + 1 } else { y };
+    let shifted_days = days_since_epoch + 719_468;
+    let era_index = shifted_days / 146_097;
+    let day_of_era = shifted_days - era_index * 146_097;
+    let year_of_era =
+        (day_of_era - day_of_era / 1460 + day_of_era / 36524 - day_of_era / 146_096) / 365;
+    let march_based_year = year_of_era + era_index * 400;
+    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
+    let march_month = (5 * day_of_year + 2) / 153;
+    let day = day_of_year - (153 * march_month + 2) / 5 + 1;
+    let month = if march_month < 10 {
+        march_month + 3
+    } else {
+        march_month - 9
+    };
+    let year = if month <= 2 {
+        march_based_year + 1
+    } else {
+        march_based_year
+    };
 
     (
-        u32::try_from(y).unwrap_or(1970),
-        u32::try_from(m).unwrap_or(1),
-        u32::try_from(d).unwrap_or(1),
+        u32::try_from(year).unwrap_or(1970),
+        u32::try_from(month).unwrap_or(1),
+        u32::try_from(day).unwrap_or(1),
         hour,
-        min,
-        sec,
+        minute,
+        second,
     )
 }
 
