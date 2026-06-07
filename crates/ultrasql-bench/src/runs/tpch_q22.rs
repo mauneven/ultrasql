@@ -48,15 +48,14 @@ const COUNTRY_CODES: [&str; 7] = ["13", "31", "23", "29", "30", "18", "17"];
 
 /// Synthetic customer row.
 ///
-/// Field names mirror the TPC-H `CUSTOMER` schema column names.
-#[allow(clippy::struct_field_names)]
+/// Fields correspond to TPC-H `CUSTOMER` columns.
 struct Customer {
     /// Customer key (1-based).
-    c_custkey: u64,
+    custkey: u64,
     /// First two characters of `c_phone`, mapped to country code index.
-    c_phone_prefix_idx: usize,
+    phone_prefix_idx: usize,
     /// Account balance scaled by 100 (cents).
-    c_acctbal: i64,
+    acctbal: i64,
 }
 
 /// Generates `n` synthetic customers using a deterministic PRNG.
@@ -79,9 +78,9 @@ fn generate_customers(n: usize) -> Vec<Customer> {
         // Account balance: -500..10000 (cents).
         let acctbal = i64::try_from(s % 10_501).unwrap_or(0) - 500;
         rows.push(Customer {
-            c_custkey: u64::try_from(i + 1).unwrap_or(1),
-            c_phone_prefix_idx: prefix_idx,
-            c_acctbal: acctbal,
+            custkey: u64::try_from(i + 1).unwrap_or(1),
+            phone_prefix_idx: prefix_idx,
+            acctbal,
         });
     }
     rows
@@ -104,8 +103,8 @@ fn q22_pass(customers: &[Customer]) -> HashMap<usize, (i64, i64)> {
     let mut sum_acctbal: i64 = 0;
     let mut count_pos: i64 = 0;
     for c in customers {
-        if c.c_phone_prefix_idx < COUNTRY_CODES.len() && c.c_acctbal > 0 {
-            sum_acctbal = sum_acctbal.wrapping_add(c.c_acctbal);
+        if c.phone_prefix_idx < COUNTRY_CODES.len() && c.acctbal > 0 {
+            sum_acctbal = sum_acctbal.wrapping_add(c.acctbal);
             count_pos = count_pos.wrapping_add(1);
         }
     }
@@ -118,18 +117,18 @@ fn q22_pass(customers: &[Customer]) -> HashMap<usize, (i64, i64)> {
     // Step 2: filter and group.
     let mut table: HashMap<usize, (i64, i64)> = HashMap::with_capacity(COUNTRY_CODES.len() * 2);
     for c in customers {
-        if c.c_phone_prefix_idx >= COUNTRY_CODES.len() {
+        if c.phone_prefix_idx >= COUNTRY_CODES.len() {
             continue;
         }
-        if c.c_acctbal <= avg_acctbal {
+        if c.acctbal <= avg_acctbal {
             continue;
         }
-        if has_order(c.c_custkey) {
+        if has_order(c.custkey) {
             continue; // NOT EXISTS filter
         }
-        let entry = table.entry(c.c_phone_prefix_idx).or_insert((0, 0));
+        let entry = table.entry(c.phone_prefix_idx).or_insert((0, 0));
         entry.0 = entry.0.wrapping_add(1);
-        entry.1 = entry.1.wrapping_add(c.c_acctbal);
+        entry.1 = entry.1.wrapping_add(c.acctbal);
     }
 
     table

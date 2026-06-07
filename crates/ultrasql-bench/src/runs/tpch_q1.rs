@@ -56,16 +56,15 @@ struct AggState {
 
 /// Synthesised lineitem row.
 ///
-/// Field names mirror the TPC-H `LINEITEM` schema column names.
-#[allow(clippy::struct_field_names)]
+/// Fields correspond to TPC-H `LINEITEM` columns.
 struct LineItem {
-    l_returnflag: u8,    // 'N', 'R', 'A'
-    l_linestatus: u8,    // 'O', 'F'
-    l_shipdate_day: i32, // days since 1970-01-01
-    l_quantity: i64,     // cents-scaled
-    l_extendedprice: i64,
-    l_discount: i64, // scaled by 100 (e.g. 5 = 5%)
-    l_tax: i64,      // scaled by 100
+    returnflag: u8,    // 'N', 'R', 'A'
+    linestatus: u8,    // 'O', 'F'
+    shipdate_day: i32, // days since 1970-01-01
+    quantity: i64,     // cents-scaled
+    extendedprice: i64,
+    discount: i64, // scaled by 100 (e.g. 5 = 5%)
+    tax: i64,      // scaled by 100
 }
 
 /// Generates `n` synthetic lineitem rows using a deterministic PRNG.
@@ -125,13 +124,13 @@ fn generate_lineitem(n: usize) -> Vec<LineItem> {
         let tax = i64::try_from(s % 9).unwrap_or(0);
 
         rows.push(LineItem {
-            l_returnflag: rf,
-            l_linestatus: ls,
-            l_shipdate_day: shipdate,
-            l_quantity: qty,
-            l_extendedprice: extprice,
-            l_discount: discount,
-            l_tax: tax,
+            returnflag: rf,
+            linestatus: ls,
+            shipdate_day: shipdate,
+            quantity: qty,
+            extendedprice: extprice,
+            discount,
+            tax,
         });
     }
     rows
@@ -144,22 +143,22 @@ fn q1_pass(rows: &[LineItem]) -> HashMap<(u8, u8), AggState> {
     let mut table: HashMap<(u8, u8), AggState> = HashMap::with_capacity(8);
 
     for r in rows {
-        if r.l_shipdate_day > CUTOFF_DAY {
+        if r.shipdate_day > CUTOFF_DAY {
             continue;
         }
-        let key = (r.l_returnflag, r.l_linestatus);
+        let key = (r.returnflag, r.linestatus);
         let agg = table.entry(key).or_default();
 
         agg.count = agg.count.wrapping_add(1);
-        agg.sum_qty = agg.sum_qty.wrapping_add(r.l_quantity);
-        agg.sum_base_price = agg.sum_base_price.wrapping_add(r.l_extendedprice);
+        agg.sum_qty = agg.sum_qty.wrapping_add(r.quantity);
+        agg.sum_base_price = agg.sum_base_price.wrapping_add(r.extendedprice);
 
         // disc_price = extendedprice * (100 - discount) / 100
-        let disc_price = r.l_extendedprice.wrapping_mul(100 - r.l_discount) / 100;
+        let disc_price = r.extendedprice.wrapping_mul(100 - r.discount) / 100;
         agg.sum_disc_price = agg.sum_disc_price.wrapping_add(disc_price);
 
         // charge = disc_price * (100 + tax) / 100
-        let charge = disc_price.wrapping_mul(100 + r.l_tax) / 100;
+        let charge = disc_price.wrapping_mul(100 + r.tax) / 100;
         agg.sum_charge = agg.sum_charge.wrapping_add(charge);
     }
 
