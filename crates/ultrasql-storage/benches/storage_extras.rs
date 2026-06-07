@@ -35,6 +35,10 @@ const fn rel(n: u32) -> RelationId {
     RelationId::new(n)
 }
 
+fn usize_to_u64(value: usize) -> u64 {
+    u64::try_from(value).expect("bench count must fit Criterion throughput")
+}
+
 // ---------------------------------------------------------------------------
 // TOAST benchmarks: store/fetch 1 KiB, 100 KiB, 1 MiB
 // ---------------------------------------------------------------------------
@@ -49,7 +53,7 @@ fn bench_toast(c: &mut Criterion) {
         let data: Vec<u8> = (0u8..=255).cycle().take(size).collect();
         let label = format!("{}KiB", size / 1024);
 
-        group.throughput(Throughput::Bytes(size as u64));
+        group.throughput(Throughput::Bytes(usize_to_u64(size)));
 
         group.bench_with_input(BenchmarkId::new("store", &label), &data, |b, data| {
             b.iter_batched(
