@@ -635,11 +635,10 @@ impl<L: PageLoader> ModifyTable<L> {
     /// - `wal` — optional WAL sink; `None` skips WAL emission.
     /// - `child` — source operator.
     #[must_use]
-    #[allow(clippy::similar_names)]
     pub fn new(
         heap: Arc<HeapAccess<L>>,
-        relation: RelationId,
-        relation_schema: Schema,
+        target_relation: RelationId,
+        target_schema: Schema,
         kind: ModifyKind,
         stamps: ModifyTableStamps,
         wal: Option<Arc<dyn WalSink>>,
@@ -658,15 +657,15 @@ impl<L: PageLoader> ModifyTable<L> {
         };
         let update_fast_path = match &kind {
             ModifyKind::Update { assignments } => {
-                detect_update_int32_pair_fast_path(assignments, &relation_schema)
+                detect_update_int32_pair_fast_path(assignments, &target_schema)
             }
             _ => None,
         };
         Self {
             heap,
-            relation,
+            relation: target_relation,
             schema: Self::affected_rows_schema(),
-            codec: RowCodec::new(relation_schema),
+            codec: RowCodec::new(target_schema),
             kind,
             update_evaluators,
             update_fast_path,
