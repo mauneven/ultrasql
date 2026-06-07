@@ -117,6 +117,47 @@ pub struct FusedUpdateInt32Add<L: PageLoader> {
     done: bool,
 }
 
+/// Construction inputs for [`FusedUpdateInt32Add`].
+///
+/// The lowering layer fills this only after it validates the relation,
+/// assignment, and optional predicate against the fused UPDATE shape.
+pub struct FusedUpdateInt32AddConfig<L: PageLoader> {
+    /// Shared heap access method for the target relation.
+    pub heap: Arc<HeapAccess<L>>,
+    /// Target relation identifier.
+    pub relation: RelationId,
+    /// Statement snapshot used for MVCC visibility.
+    pub snapshot: Snapshot,
+    /// Transaction manager used as the XID status oracle.
+    pub oracle: Arc<TransactionManager>,
+    /// Number of heap blocks to scan.
+    pub block_count: u32,
+    /// Optional Int32 comparison predicate.
+    pub predicate: Option<FusedPredicate>,
+    /// Target column index inside the `(Int32, Int32)` row shape.
+    pub target_col: u8,
+    /// Delta applied with checked Int32 addition.
+    pub delta: i32,
+    /// Transaction ID stamped into updated tuples.
+    pub xid: Xid,
+    /// Command ID stamped into updated tuples.
+    pub command_id: CommandId,
+}
+
+impl<L: PageLoader> std::fmt::Debug for FusedUpdateInt32AddConfig<L> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FusedUpdateInt32AddConfig")
+            .field("relation", &self.relation)
+            .field("block_count", &self.block_count)
+            .field("predicate", &self.predicate)
+            .field("target_col", &self.target_col)
+            .field("delta", &self.delta)
+            .field("xid", &self.xid)
+            .field("command_id", &self.command_id)
+            .finish_non_exhaustive()
+    }
+}
+
 impl<L: PageLoader> std::fmt::Debug for FusedUpdateInt32Add<L> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("FusedUpdateInt32Add")
@@ -133,19 +174,20 @@ impl<L: PageLoader> std::fmt::Debug for FusedUpdateInt32Add<L> {
 impl<L: PageLoader> FusedUpdateInt32Add<L> {
     /// Construct the fused operator. Caller guarantees the shape
     /// preconditions documented in the module header.
-    #[allow(clippy::too_many_arguments)]
-    pub fn new(
-        heap: Arc<HeapAccess<L>>,
-        relation: RelationId,
-        snapshot: Snapshot,
-        oracle: Arc<TransactionManager>,
-        block_count: u32,
-        predicate: Option<FusedPredicate>,
-        target_col: u8,
-        delta: i32,
-        xid: Xid,
-        command_id: CommandId,
-    ) -> Self {
+    #[must_use]
+    pub fn new(config: FusedUpdateInt32AddConfig<L>) -> Self {
+        let FusedUpdateInt32AddConfig {
+            heap,
+            relation,
+            snapshot,
+            oracle,
+            block_count,
+            predicate,
+            target_col,
+            delta,
+            xid,
+            command_id,
+        } = config;
         let schema = match Schema::new([Field::required("count", DataType::Int64)]) {
             Ok(schema) => schema,
             Err(err) => {
@@ -359,10 +401,10 @@ mod tests {
     use ultrasql_txn::TransactionManager;
     use ultrasql_vec::column::Column;
 
-    use super::{FusedCmp, FusedPredicate, FusedUpdateInt32Add};
+    use super::{FusedCmp, FusedPredicate, FusedUpdateInt32Add, FusedUpdateInt32AddConfig};
     use crate::Operator;
     use crate::filter_op::batch_to_rows;
-    use crate::fused_delete::FusedDeleteInt32Pair;
+    use crate::fused_delete::{FusedDeleteInt32Pair, FusedDeleteInt32PairConfig};
     use crate::fused_insert::FusedInsertInt32Pair;
     use crate::row_codec::RowCodec;
     use crate::seq_scan::SeqScan;
@@ -524,18 +566,18 @@ mod tests {
             op: FusedCmp::Ge,
             literal: 2,
         };
-        let mut op = FusedUpdateInt32Add::new(
-            Arc::clone(&heap),
-            rel(),
-            snapshot(xid),
-            Arc::clone(&oracle),
-            heap.block_count(rel()),
-            Some(predicate),
-            1,
-            5,
+        let mut op = FusedUpdateInt32Add::new(FusedUpdateInt32AddConfig {
+            heap: Arc::clone(&heap),
+            relation: rel(),
+            snapshot: snapshot(xid),
+            oracle: Arc::clone(&oracle),
+            block_count: heap.block_count(rel()),
+            predicate: Some(predicate),
+            target_col: 1,
+            delta: 5,
             xid,
-            CommandId::FIRST,
-        );
+            command_id: CommandId::FIRST,
+        });
 
         let batch = op.next_batch().expect("update").expect("batch");
         assert_eq!(affected_count(batch), 2);
@@ -554,18 +596,18 @@ mod tests {
         let xid = Xid::new(21);
         let locked = Arc::new(Mutex::new(Vec::new()));
         let locked_for_callback = Arc::clone(&locked);
-        let mut op = FusedUpdateInt32Add::new(
-            Arc::clone(&heap),
-            rel(),
-            snapshot(xid),
-            Arc::clone(&oracle),
-            heap.block_count(rel()),
-            None,
-            0,
-            100,
+        let mut op = FusedUpdateInt32Add::new(FusedUpdateInt32AddConfig {
+            heap: Arc::clone(&heap),
+            relation: rel(),
+            snapshot: snapshot(xid),
+            oracle: Arc::clone(&oracle),
+            block_count: heap.block_count(rel()),
+            predicate: None,
+            target_col: 0,
+            delta: 100,
             xid,
-            CommandId::FIRST,
-        )
+            command_id: CommandId::FIRST,
+        })
         .with_target_tids(vec![tids[1]])
         .with_target_tid_lock(
             move |tid| {
@@ -592,16 +634,16 @@ mod tests {
             op: FusedCmp::Lt,
             literal: 30,
         };
-        let mut op = FusedDeleteInt32Pair::new(
-            Arc::clone(&heap),
-            rel(),
-            snapshot(xid),
-            Arc::clone(&oracle),
-            heap.block_count(rel()),
-            Some(predicate),
+        let mut op = FusedDeleteInt32Pair::new(FusedDeleteInt32PairConfig {
+            heap: Arc::clone(&heap),
+            relation: rel(),
+            snapshot: snapshot(xid),
+            oracle: Arc::clone(&oracle),
+            block_count: heap.block_count(rel()),
+            predicate: Some(predicate),
             xid,
-            CommandId::FIRST,
-        );
+            command_id: CommandId::FIRST,
+        });
 
         let batch = op.next_batch().expect("delete").expect("batch");
         assert_eq!(affected_count(batch), 2);

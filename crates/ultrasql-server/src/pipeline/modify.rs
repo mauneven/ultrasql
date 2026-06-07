@@ -5,9 +5,11 @@ use std::sync::Arc;
 
 use ultrasql_catalog::{IndexEntry, TableEntry};
 use ultrasql_core::{BlockNumber, CommandId, DataType, RelationId, Schema, TupleId, Value, Xid};
-use ultrasql_executor::fused_delete::FusedDeleteInt32Pair;
+use ultrasql_executor::fused_delete::{FusedDeleteInt32Pair, FusedDeleteInt32PairConfig};
 use ultrasql_executor::fused_insert::FusedInsertInt32Pair;
-use ultrasql_executor::fused_update::{FusedCmp, FusedPredicate, FusedUpdateInt32Add};
+use ultrasql_executor::fused_update::{
+    FusedCmp, FusedPredicate, FusedUpdateInt32Add, FusedUpdateInt32AddConfig,
+};
 use ultrasql_executor::{
     Eval, Filter, InsertConflictAction, InsertIndexEncoder, InsertIndexMaintainer, ModifyKind,
     ModifyTable, Operator, Project, RowCodec, RowConstraintCheck, RowUpdateConstraintCheck,
@@ -1813,18 +1815,18 @@ pub(super) fn try_build_fused_update(
             return Ok(None);
         };
         let block_count = ctx.heap.block_count(rel).max(entry.n_blocks);
-        let op = FusedUpdateInt32Add::new(
-            Arc::clone(&ctx.heap),
-            rel,
-            ctx.snapshot.clone(),
-            Arc::clone(&ctx.oracle),
+        let op = FusedUpdateInt32Add::new(FusedUpdateInt32AddConfig {
+            heap: Arc::clone(&ctx.heap),
+            relation: rel,
+            snapshot: ctx.snapshot.clone(),
+            oracle: Arc::clone(&ctx.oracle),
             block_count,
             predicate,
             target_col,
             delta,
-            ctx.xid,
-            ctx.command_id,
-        );
+            xid: ctx.xid,
+            command_id: ctx.command_id,
+        });
         let op = if let Some(target_tids) = target_tids {
             let refresh_after_lock = ctx.isolation == ultrasql_txn::IsolationLevel::ReadCommitted;
             let lock_manager = Arc::clone(&ctx.oracle.lock_manager);
@@ -2116,16 +2118,16 @@ pub(super) fn try_build_fused_delete(
 
     let rel = RelationId(entry.oid);
     let block_count = ctx.heap.block_count(rel).max(entry.n_blocks);
-    let op = FusedDeleteInt32Pair::new(
-        Arc::clone(&ctx.heap),
-        rel,
-        ctx.snapshot.clone(),
-        Arc::clone(&ctx.oracle),
+    let op = FusedDeleteInt32Pair::new(FusedDeleteInt32PairConfig {
+        heap: Arc::clone(&ctx.heap),
+        relation: rel,
+        snapshot: ctx.snapshot.clone(),
+        oracle: Arc::clone(&ctx.oracle),
         block_count,
         predicate,
-        ctx.xid,
-        ctx.command_id,
-    )
+        xid: ctx.xid,
+        command_id: ctx.command_id,
+    })
     .with_visibility_map(Arc::clone(&ctx.vm));
     Ok(Some(Box::new(op)))
 }

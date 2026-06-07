@@ -48,6 +48,41 @@ pub struct FusedDeleteInt32Pair<L: PageLoader> {
     done: bool,
 }
 
+/// Construction inputs for [`FusedDeleteInt32Pair`].
+///
+/// The caller supplies only plans whose relation schema and optional
+/// predicate match the module-level fused DELETE shape.
+pub struct FusedDeleteInt32PairConfig<L: PageLoader> {
+    /// Shared heap access method for the target relation.
+    pub heap: Arc<HeapAccess<L>>,
+    /// Target relation identifier.
+    pub relation: RelationId,
+    /// Statement snapshot used for MVCC visibility.
+    pub snapshot: Snapshot,
+    /// Transaction manager used as the XID status oracle.
+    pub oracle: Arc<TransactionManager>,
+    /// Number of heap blocks to scan.
+    pub block_count: u32,
+    /// Optional Int32 comparison predicate.
+    pub predicate: Option<FusedPredicate>,
+    /// Transaction ID stamped into deleted tuples.
+    pub xid: Xid,
+    /// Command ID stamped into deleted tuples.
+    pub command_id: CommandId,
+}
+
+impl<L: PageLoader> std::fmt::Debug for FusedDeleteInt32PairConfig<L> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FusedDeleteInt32PairConfig")
+            .field("relation", &self.relation)
+            .field("block_count", &self.block_count)
+            .field("predicate", &self.predicate)
+            .field("xid", &self.xid)
+            .field("command_id", &self.command_id)
+            .finish_non_exhaustive()
+    }
+}
+
 impl<L: PageLoader> std::fmt::Debug for FusedDeleteInt32Pair<L> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("FusedDeleteInt32Pair")
@@ -59,17 +94,19 @@ impl<L: PageLoader> std::fmt::Debug for FusedDeleteInt32Pair<L> {
 }
 
 impl<L: PageLoader> FusedDeleteInt32Pair<L> {
-    #[allow(clippy::too_many_arguments)]
-    pub fn new(
-        heap: Arc<HeapAccess<L>>,
-        relation: RelationId,
-        snapshot: Snapshot,
-        oracle: Arc<TransactionManager>,
-        block_count: u32,
-        predicate: Option<FusedPredicate>,
-        xid: Xid,
-        command_id: CommandId,
-    ) -> Self {
+    /// Construct the fused DELETE operator from validated lowering inputs.
+    #[must_use]
+    pub fn new(config: FusedDeleteInt32PairConfig<L>) -> Self {
+        let FusedDeleteInt32PairConfig {
+            heap,
+            relation,
+            snapshot,
+            oracle,
+            block_count,
+            predicate,
+            xid,
+            command_id,
+        } = config;
         let schema = Schema::new_with_duplicate_names([Field::required("count", DataType::Int64)]);
         Self {
             heap,
