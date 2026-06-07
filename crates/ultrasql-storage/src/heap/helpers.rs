@@ -84,11 +84,6 @@ impl<L: PageLoader> HeapAccess<L> {
     /// When this function succeeds it has already patched the old
     /// tuple's header in place.
     ///
-    /// Clippy's `significant_drop_tightening` would prefer the
-    /// [`PageWrite`](crate::buffer_pool::PageWrite) be dropped before
-    /// the closing brace, but `page_bytes` borrows from `page`, so the
-    /// borrow checker requires the guard to live until function exit.
-    #[allow(clippy::significant_drop_tightening)]
     pub(super) fn try_hot_update(
         guard: &PageGuard<L>,
         old_tid: TupleId,
@@ -97,78 +92,81 @@ impl<L: PageLoader> HeapAccess<L> {
         n_atts: u16,
         new_tuple_size: usize,
     ) -> Result<Option<TupleId>, HeapError> {
-        let mut page = guard.write();
+        let new_tid = {
+            let mut page = guard.write();
 
-        // Verify the old tuple is alive before touching anything.
-        {
-            let bytes = page.read_tuple(old_tid.slot)?;
-            if bytes.len() < TUPLE_HEADER_SIZE {
-                return Err(HeapError::MalformedHeader("slot shorter than header"));
+            // Verify the old tuple is alive before touching anything.
+            {
+                let bytes = page.read_tuple(old_tid.slot)?;
+                if bytes.len() < TUPLE_HEADER_SIZE {
+                    return Err(HeapError::MalformedHeader("slot shorter than header"));
+                }
+                let (hdr, _) = TupleHeader::decode(&bytes[..TUPLE_HEADER_SIZE])
+                    .ok_or(HeapError::MalformedHeader("header decode failed"))?;
+                if !hdr.is_alive() {
+                    return Err(HeapError::MalformedHeader("update on deleted tuple"));
+                }
             }
-            let (hdr, _) = TupleHeader::decode(&bytes[..TUPLE_HEADER_SIZE])
-                .ok_or(HeapError::MalformedHeader("header decode failed"))?;
-            if !hdr.is_alive() {
-                return Err(HeapError::MalformedHeader("update on deleted tuple"));
+
+            // Check whether there is room for the new version on this page.
+            let free = page.header().free_space();
+            if free < new_tuple_size + crate::page::ITEMID_SIZE {
+                // Not enough room — signal fallback to caller.
+                return Ok(None);
             }
-        }
 
-        // Check whether there is room for the new version on this page.
-        let free = page.header().free_space();
-        if free < new_tuple_size + crate::page::ITEMID_SIZE {
-            // Not enough room — signal fallback to caller.
-            return Ok(None);
-        }
+            // Build the new tuple bytes (header + payload). We don't know
+            // the final slot yet so we use a tentative tid; it will be
+            // patched after insert_tuple returns.
+            let tentative_tid = TupleId::new(old_tid.page, 0);
+            let mut new_hdr = TupleHeader::fresh(opts.xid, opts.command_id, tentative_tid, n_atts);
+            // New version is marked HOT_UPDATED | UPDATED so index scans
+            // know the chain does not cross page boundaries.
+            new_hdr
+                .infomask
+                .set(InfoMask::HOT_UPDATED | InfoMask::UPDATED);
 
-        // Build the new tuple bytes (header + payload). We don't know
-        // the final slot yet so we use a tentative tid; it will be
-        // patched after insert_tuple returns.
-        let tentative_tid = TupleId::new(old_tid.page, 0);
-        let mut new_hdr = TupleHeader::fresh(opts.xid, opts.command_id, tentative_tid, n_atts);
-        // New version is marked HOT_UPDATED | UPDATED so index scans
-        // know the chain does not cross page boundaries.
-        new_hdr
-            .infomask
-            .set(InfoMask::HOT_UPDATED | InfoMask::UPDATED);
+            let mut new_tuple_bytes = Vec::with_capacity(new_tuple_size);
+            new_tuple_bytes.resize(TUPLE_HEADER_SIZE, 0);
+            new_hdr.encode(&mut new_tuple_bytes[..TUPLE_HEADER_SIZE]);
+            new_tuple_bytes.extend_from_slice(new_payload);
 
-        let mut new_tuple_bytes = Vec::with_capacity(new_tuple_size);
-        new_tuple_bytes.resize(TUPLE_HEADER_SIZE, 0);
-        new_hdr.encode(&mut new_tuple_bytes[..TUPLE_HEADER_SIZE]);
-        new_tuple_bytes.extend_from_slice(new_payload);
+            // HOT updates only ever create new tuple versions — never
+            // reuse a previously-deleted slot. Skip
+            // `Page::insert_tuple`'s O(slot_count) find-reusable-slot
+            // linear scan via the appended variant. For a 200-slot page
+            // with 200 HOT inserts this drops the scan cost from
+            // O(slot_count²) total to O(slot_count).
+            let new_slot = page.insert_tuple_appended(&new_tuple_bytes)?;
+            let new_tid = TupleId::new(old_tid.page, new_slot);
 
-        // HOT updates only ever create new tuple versions — never
-        // reuse a previously-deleted slot. Skip
-        // `Page::insert_tuple`'s O(slot_count) find-reusable-slot
-        // linear scan via the appended variant. For a 200-slot page
-        // with 200 HOT inserts this drops the scan cost from
-        // O(slot_count²) total to O(slot_count).
-        let new_slot = page.insert_tuple_appended(&new_tuple_bytes)?;
-        let new_tid = TupleId::new(old_tid.page, new_slot);
+            // Patch the new tuple's ctid to point at itself (terminal
+            // version in the chain).
+            let mut patched_new_hdr = new_hdr;
+            patched_new_hdr.ctid = new_tid;
+            let new_hdr_bytes = Self::collect_header_bytes(&patched_new_hdr);
+            let page_bytes = page.as_bytes_mut();
+            let (new_off, _) = Self::slot_window(page_bytes, new_slot)?;
+            page_bytes[new_off..new_off + TUPLE_HEADER_SIZE].copy_from_slice(&new_hdr_bytes);
 
-        // Patch the new tuple's ctid to point at itself (terminal
-        // version in the chain).
-        let mut patched_new_hdr = new_hdr;
-        patched_new_hdr.ctid = new_tid;
-        let new_hdr_bytes = Self::collect_header_bytes(&patched_new_hdr);
-        let page_bytes = page.as_bytes_mut();
-        let (new_off, _) = Self::slot_window(page_bytes, new_slot)?;
-        page_bytes[new_off..new_off + TUPLE_HEADER_SIZE].copy_from_slice(&new_hdr_bytes);
+            // Patch the old tuple's header in place: set xmax/cmax,
+            // HOT_UPDATED flag, and redirect ctid to the new version.
+            let (old_off, old_len) = Self::slot_window(page_bytes, old_tid.slot)?;
+            if old_len < TUPLE_HEADER_SIZE {
+                return Err(HeapError::MalformedHeader("old slot shorter than header"));
+            }
+            let (mut old_hdr, _) =
+                TupleHeader::decode(&page_bytes[old_off..old_off + TUPLE_HEADER_SIZE])
+                    .ok_or(HeapError::MalformedHeader("old header decode failed"))?;
+            old_hdr.xmax = opts.xid;
+            old_hdr.cmax = opts.command_id;
+            old_hdr.infomask.set(InfoMask::HOT_UPDATED);
+            old_hdr.ctid = new_tid;
+            let old_hdr_bytes = Self::collect_header_bytes(&old_hdr);
+            page_bytes[old_off..old_off + TUPLE_HEADER_SIZE].copy_from_slice(&old_hdr_bytes);
 
-        // Patch the old tuple's header in place: set xmax/cmax,
-        // HOT_UPDATED flag, and redirect ctid to the new version.
-        let (old_off, old_len) = Self::slot_window(page_bytes, old_tid.slot)?;
-        if old_len < TUPLE_HEADER_SIZE {
-            return Err(HeapError::MalformedHeader("old slot shorter than header"));
-        }
-        let (mut old_hdr, _) =
-            TupleHeader::decode(&page_bytes[old_off..old_off + TUPLE_HEADER_SIZE])
-                .ok_or(HeapError::MalformedHeader("old header decode failed"))?;
-        old_hdr.xmax = opts.xid;
-        old_hdr.cmax = opts.command_id;
-        old_hdr.infomask.set(InfoMask::HOT_UPDATED);
-        old_hdr.ctid = new_tid;
-        let old_hdr_bytes = Self::collect_header_bytes(&old_hdr);
-        page_bytes[old_off..old_off + TUPLE_HEADER_SIZE].copy_from_slice(&old_hdr_bytes);
-
+            new_tid
+        };
         Ok(Some(new_tid))
     }
 
@@ -278,11 +276,6 @@ impl<L: PageLoader> HeapAccess<L> {
     /// Sets `xmax`, `cmax`, `infomask |= UPDATED`, and `ctid = new_tid`
     /// on the old tuple identified by `old_tid`.
     ///
-    /// Clippy's `significant_drop_tightening` would prefer the
-    /// [`PageWrite`](crate::buffer_pool::PageWrite) be dropped before
-    /// the closing brace, but `page_bytes` borrows from `page`, so the
-    /// borrow checker requires the guard to live until function exit.
-    #[allow(clippy::significant_drop_tightening)]
     /// Tight inline variant of [`Self::stamp_updated_old`] that
     /// writes only the four header fields a non-HOT UPDATE actually
     /// changes (`xmax` / `cmax` / `infomask | UPDATED` / `ctid`) at
