@@ -18,9 +18,9 @@
 //! 90 MB  total per-pass (vs 160 MB for the naive i64+i64 path)
 //! ```
 //!
-//! On Apple M4 with ~110 GB/s aggregate DRAM bandwidth this drops the
-//! theoretical floor for the predicate evaluation from ~1.45 ms to
-//! ~0.82 ms.
+//! The benchmark harness in `crates/ultrasql-vec/benches` records the
+//! current timing on each host; this module keeps only the byte-count
+//! model so source docs do not go stale when hardware or kernels move.
 //!
 //! Predicate evaluation strategy
 //! -----------------------------
@@ -48,27 +48,10 @@
 //! byte-masks (0x00 / 0xFF) ready for sign-extension — see
 //! [`PredicateMask16`] / [`filter_sum_i64_where_dict_predicate_tbl`].
 //!
-//! Measured medians (Apple M4, 10 M rows, 256-entry dict; reproduce
-//! with `cargo bench -p ultrasql-vec --bench filter_sum_10m`):
-//!
-//! | variant                           | time     | bandwidth |
-//! | --------------------------------- | -------- | --------- |
-//! | naive serial NEON (i64+i64)       | 2.26 ms  |  71 GB/s  |
-//! | naive par_auto                    | 1.58 ms  |  101 GB/s |
-//! | **dict_u8 serial (this crate)**   | **1.52 ms** |  59 GB/s |
-//! | **dict_u8 par_5**                 | **958 µs**  |  94 GB/s |
-//! | **dict_u8 par_6**                 | **836 µs**  | 108 GB/s |
-//! | **dict_u8 par_8**                 | **887 µs**  | 101 GB/s |
-//! | **dict_u8 par_auto**              | **838 µs**  | 107 GB/s |
-//! | dict_u8 tbl16 serial (≤16 dict)   | 1.28 ms  |  70 GB/s  |
-//! | dict_u16 65k                      | 2.87 ms  |  31 GB/s  |
-//!
-//! The multi-thread sweet spot at 6–10 threads achieves ≈ 108 GB/s
-//! aggregate DRAM bandwidth — essentially the platform ceiling. The
-//! serial path is single-core bandwidth-bound at ~59 GB/s; the M4's
-//! single-core streaming peak is ~72 GB/s, so the serial kernel runs
-//! at ~82% of single-core ceiling with the remaining gap chargeable
-//! to the SIMD widening pipeline.
+//! Current performance is measured by
+//! `cargo bench -p ultrasql-vec --bench filter_sum_10m`; benchmark
+//! output, not inline module docs, is the source of truth for timing
+//! and bandwidth claims.
 
 #![allow(clippy::doc_markdown)]
 
@@ -307,13 +290,10 @@ impl DictI64U16 {
 /// two NEON registers and resolve each row's pass/fail decision
 /// without ever issuing an L1 load against the table.
 ///
-/// On Apple M4 the per-i64 gather path is ~6.8 ms per 10 M rows
-/// (gather-cycle-limited at ~3 cycles per i64 load × 16 loads per
-/// iteration). The bit-packed path uses `vqtbl2q_u8` + a per-lane
-/// variable shift to gather the same predicate result in two NEON
-/// instructions with **no memory access**, dropping the per-row
-/// predicate cost to ~0.3 cycles and exposing the underlying x-stream
-/// DRAM bandwidth as the binding resource.
+/// The bit-packed path uses `vqtbl2q_u8` + a per-lane variable shift
+/// to gather the same predicate result in two NEON instructions with
+/// no table memory access, leaving the `x` stream as the dominant
+/// memory traffic for the targeted predicate workloads.
 #[derive(Clone, Debug)]
 pub struct PredicateMask256 {
     /// `mask[i]` is `-1` if code `i` passes the predicate, else `0`.
@@ -376,11 +356,9 @@ impl PredicateMask256 {
 /// Precomputed lookup table over a 65 536-entry `i64` dictionary.
 ///
 /// Equivalent to [`PredicateMask256`] but indexed by `u16` codes. The
-/// table is 512 KB — much larger than the M4 L1 D-cache (192 KB per
-/// P-core) but comfortably under the L2 (16 MB shared); access cost
-/// rises from ~3 cycles to ~12 cycles per lookup, which is still
-/// hidden by DRAM-bandwidth-bound x-streaming for the predicate
-/// workloads we target.
+/// table is 512 KB, so it is expected to miss small L1 caches and rely
+/// on outer cache levels; the benchmark harness records whether that
+/// tradeoff remains profitable on a given host.
 #[derive(Clone, Debug)]
 pub struct PredicateMask65536 {
     /// `mask[i]` is `-1` if code `i` passes the predicate, else `0`.
@@ -491,8 +469,7 @@ impl PredicateMask16 {
 ///
 /// Memory traffic for `n` rows: `8 n` bytes from `x` + `n` bytes from
 /// `y.codes` = `9 n` bytes scanned. Versus `16 n` for the naive
-/// i64+i64 filter+sum, this is 1.78× less DRAM traffic — and on Apple
-/// M4 the predicate workload becomes bound by the `x` stream alone.
+/// `i64` + `i64` filter+sum, this is 1.78× less stream traffic.
 ///
 /// # Panics
 ///
@@ -645,10 +622,10 @@ pub fn filter_sum_par_auto_i64_where_dict_predicate(
     filter_sum_par_i64_where_dict_predicate(x, y, predicate, n_threads)
 }
 
-/// Below this row count the serial kernel wins for the dict path.
-/// Tuned empirically on Apple M4: the dict kernel scans 9 bytes per
-/// row vs 16 bytes for the dense i64 kernel, so the per-thread
-/// amortization point arrives a touch earlier.
+/// Below this row count the serial kernel wins for the dict path in
+/// the checked benchmark profile. The dict kernel scans 9 bytes per
+/// row vs 16 bytes for the dense `i64` kernel, so its per-thread
+/// amortization point arrives earlier.
 const PAR_DICT_SERIAL_THRESHOLD: usize = 65_536;
 
 /// Round dict partitions up to this many lanes — same alignment as
