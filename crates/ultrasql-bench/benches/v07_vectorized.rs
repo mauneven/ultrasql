@@ -15,13 +15,6 @@
 //! | `vec/dict_filter_vs_raw` | dictionary-code filter vs. direct `filter_eq_i64` |
 //! | `vec/filter_eq_i32_simd` | SIMD `filter_eq_i32` kernel throughput |
 
-#![allow(
-    clippy::cast_possible_truncation,
-    clippy::cast_possible_wrap,
-    clippy::cast_sign_loss,
-    dead_code
-)]
-
 use criterion::{BenchmarkId, Criterion, Throughput, black_box, criterion_group, criterion_main};
 use ultrasql_core::{DataType, Field, Schema, Value};
 use ultrasql_executor::mem_table_scan::MemTableScan;
@@ -46,11 +39,6 @@ const BATCH_SIZE: usize = 4096;
 // Helpers
 // ============================================================================
 
-/// Build a schema with a single `Int64` column named `"v"`.
-fn schema_i64(name: &'static str) -> Schema {
-    Schema::new([Field::required(name, DataType::Int64)]).expect("schema ok")
-}
-
 /// Build a schema with two `Int64` columns.
 fn schema_i64x2(a: &'static str, b: &'static str) -> Schema {
     Schema::new([
@@ -60,19 +48,16 @@ fn schema_i64x2(a: &'static str, b: &'static str) -> Schema {
     .expect("schema ok")
 }
 
-/// Produce `n` batches of `Int64` values cycling in `[0, cardinality)`.
-fn make_i64_batches(n_rows: usize, cardinality: i64) -> Vec<Batch> {
-    let mut batches = Vec::new();
-    let mut offset = 0usize;
-    while offset < n_rows {
-        let chunk = (offset..offset + BATCH_SIZE)
-            .map(|i| (i as i64) % cardinality)
-            .collect();
-        batches
-            .push(Batch::new([Column::Int64(NumericColumn::from_data(chunk))]).expect("batch ok"));
-        offset += BATCH_SIZE;
-    }
-    batches
+fn bench_row_count(rows: usize) -> u64 {
+    u64::try_from(rows).expect("benchmark row count fits u64")
+}
+
+fn bench_i64_index(index: usize) -> i64 {
+    i64::try_from(index).expect("benchmark row index fits i64")
+}
+
+fn bench_i32_index(index: usize) -> i32 {
+    i32::try_from(index).expect("benchmark row index fits i32")
 }
 
 /// Produce `n` batches of two `Int64` columns: key cycling in `[0, card)` and
@@ -82,9 +67,9 @@ fn make_kv_batches(n_rows: usize, key_cardinality: i64) -> Vec<Batch> {
     let mut offset = 0usize;
     while offset < n_rows {
         let keys: Vec<i64> = (offset..offset + BATCH_SIZE)
-            .map(|i| (i as i64) % key_cardinality)
+            .map(|i| bench_i64_index(i) % key_cardinality)
             .collect();
-        let vals: Vec<i64> = (offset..offset + BATCH_SIZE).map(|i| i as i64).collect();
+        let vals: Vec<i64> = (offset..offset + BATCH_SIZE).map(bench_i64_index).collect();
         batches.push(
             Batch::new([
                 Column::Int64(NumericColumn::from_data(keys)),
@@ -97,23 +82,6 @@ fn make_kv_batches(n_rows: usize, key_cardinality: i64) -> Vec<Batch> {
     batches
 }
 
-/// Produce `n` batches of 4096 `Int32` rows cycling in `[0, cardinality)`.
-fn make_i32_batches(n_rows: usize, cardinality: i32) -> Vec<Batch> {
-    let schema = Schema::new([Field::required("v", DataType::Int32)]).expect("schema ok");
-    let mut batches = Vec::new();
-    let mut offset = 0usize;
-    while offset < n_rows {
-        let chunk: Vec<i32> = (offset..offset + BATCH_SIZE)
-            .map(|i| (i as i32) % cardinality)
-            .collect();
-        batches
-            .push(Batch::new([Column::Int32(NumericColumn::from_data(chunk))]).expect("batch ok"));
-        offset += BATCH_SIZE;
-        let _ = &schema;
-    }
-    batches
-}
-
 // ============================================================================
 // Benchmark: VectorizedSeqScan + VectorizedFilter (1 M rows)
 // ============================================================================
@@ -121,7 +89,7 @@ fn make_i32_batches(n_rows: usize, cardinality: i32) -> Vec<Batch> {
 fn bench_seq_scan_filter_1m(c: &mut Criterion) {
     use ultrasql_planner::{BinaryOp, ScalarExpr};
 
-    let n_rows = 1_000_000;
+    let n_rows: usize = 1_000_000;
     let cardinality = 100i64;
     let batches = make_kv_batches(n_rows, cardinality);
     let schema = schema_i64x2("k", "v");
@@ -145,7 +113,7 @@ fn bench_seq_scan_filter_1m(c: &mut Criterion) {
     group.sample_size(20);
     group.measurement_time(std::time::Duration::from_secs(3));
     group.warm_up_time(std::time::Duration::from_secs(1));
-    group.throughput(Throughput::Elements(n_rows as u64));
+    group.throughput(Throughput::Elements(bench_row_count(n_rows)));
     group.bench_function("filter_k_eq_42", |b| {
         b.iter(|| {
             let scan = MemTableScan::new(schema.clone(), batches.clone());
@@ -164,7 +132,7 @@ fn bench_seq_scan_filter_1m(c: &mut Criterion) {
 // ============================================================================
 
 fn bench_hash_agg_1m(c: &mut Criterion) {
-    let n_rows = 1_000_000;
+    let n_rows: usize = 1_000_000;
     let n_groups = 100i64;
     let batches = make_kv_batches(n_rows, n_groups);
     let schema = schema_i64x2("k", "v");
@@ -179,7 +147,7 @@ fn bench_hash_agg_1m(c: &mut Criterion) {
     group.sample_size(20);
     group.measurement_time(std::time::Duration::from_secs(3));
     group.warm_up_time(std::time::Duration::from_secs(1));
-    group.throughput(Throughput::Elements(n_rows as u64));
+    group.throughput(Throughput::Elements(bench_row_count(n_rows)));
     group.bench_function("count_star_sum_v", |b| {
         b.iter(|| {
             let scan = MemTableScan::new(schema.clone(), batches.clone());
@@ -203,8 +171,8 @@ fn bench_hash_agg_1m(c: &mut Criterion) {
 // ============================================================================
 
 fn bench_hash_join_100k_x_1m(c: &mut Criterion) {
-    let n_build = 100_000;
-    let n_probe = 1_000_000;
+    let n_build: usize = 100_000;
+    let n_probe: usize = 1_000_000;
     let cardinality = 100_000i64;
 
     let build_batches = make_kv_batches(n_build, cardinality);
@@ -225,7 +193,7 @@ fn bench_hash_join_100k_x_1m(c: &mut Criterion) {
     group.sample_size(10);
     group.measurement_time(std::time::Duration::from_secs(3));
     group.warm_up_time(std::time::Duration::from_secs(1));
-    group.throughput(Throughput::Elements(n_probe as u64));
+    group.throughput(Throughput::Elements(bench_row_count(n_probe)));
     group.bench_function("inner_join_on_k", |b| {
         b.iter(|| {
             let build_scan = MemTableScan::new(build_schema.clone(), build_batches.clone());
@@ -275,7 +243,7 @@ fn bench_dict_filter_vs_raw(c: &mut Criterion) {
     let target_code = dict.code_for("alpha").expect("alpha in dict");
 
     // Equivalent i64 column for raw filter comparison
-    let raw_i64: Vec<i64> = (0..n as i64).map(|i| i % 100).collect();
+    let raw_i64: Vec<i64> = (0..n).map(|i| bench_i64_index(i) % 100).collect();
     let raw_col = NumericColumn::from_data(raw_i64);
     let target_i64 = 0i64;
 
@@ -283,7 +251,7 @@ fn bench_dict_filter_vs_raw(c: &mut Criterion) {
     group.sample_size(20);
     group.measurement_time(std::time::Duration::from_secs(3));
     group.warm_up_time(std::time::Duration::from_secs(1));
-    group.throughput(Throughput::Elements(n as u64));
+    group.throughput(Throughput::Elements(bench_row_count(n)));
 
     group.bench_function("dict_code_filter", |b| {
         b.iter(|| {
@@ -315,9 +283,9 @@ fn bench_filter_eq_i32_simd(c: &mut Criterion) {
     group.measurement_time(std::time::Duration::from_secs(3));
     group.warm_up_time(std::time::Duration::from_secs(1));
     for &n in sizes {
-        let data: Vec<i32> = (0..n as i32).map(|x| x % 100).collect();
+        let data: Vec<i32> = (0..n).map(|x| bench_i32_index(x) % 100).collect();
         let col = NumericColumn::from_data(data);
-        group.throughput(Throughput::Elements(n as u64));
+        group.throughput(Throughput::Elements(bench_row_count(n)));
         group.bench_with_input(BenchmarkId::from_parameter(n), &n, |b, _| {
             b.iter(|| {
                 let mask = filter_eq_i32(black_box(&col), black_box(42));

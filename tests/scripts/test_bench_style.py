@@ -16,6 +16,7 @@ SQL_BENCH_FILES = [
     REPO / "crates" / "ultrasql-bench" / "src" / "bin" / "cross_compare_sql.rs",
 ]
 PUSH_VS_PULL_BENCH = REPO / "crates" / "ultrasql-bench" / "benches" / "push_vs_pull.rs"
+V07_VECTORIZED_BENCH = REPO / "crates" / "ultrasql-bench" / "benches" / "v07_vectorized.rs"
 TPCH_DATA_GEN_FILE = (
     REPO / "crates" / "ultrasql-bench" / "src" / "tpch" / "data_gen.rs"
 )
@@ -33,6 +34,9 @@ SQL_PERCENTILE_INDEX_CAST = re.compile(
 )
 SQL_RNG_WIDTH_CAST = re.compile(r"next_u64\(\)\s+as\s+i32")
 PUSH_VS_PULL_BENCH_CASTS = re.compile(
+    r"\bas\s+(?:usize|u32|u64|i32|i64)\b|clippy::cast_"
+)
+V07_VECTORIZED_BENCH_CASTS = re.compile(
     r"\bas\s+(?:usize|u32|u64|i32|i64)\b|clippy::cast_"
 )
 BTREE_SHUFFLE_INDEX_CAST = re.compile(r"\bs\s+as\s+usize\)\s*%\s*\(i\s*\+\s*1\)")
@@ -147,6 +151,15 @@ class BenchStyleTests(unittest.TestCase):
             code = line.split("//", maxsplit=1)[0]
             if PUSH_VS_PULL_BENCH_CASTS.search(code):
                 offenders.append(f"{PUSH_VS_PULL_BENCH.relative_to(REPO)}:{line_no}: {line.strip()}")
+
+        self.assertEqual([], offenders)
+
+    def test_v07_vectorized_bench_uses_checked_integer_conversions(self) -> None:
+        offenders: list[str] = []
+        for line_no, line in enumerate(V07_VECTORIZED_BENCH.read_text().splitlines(), start=1):
+            code = line.split("//", maxsplit=1)[0]
+            if V07_VECTORIZED_BENCH_CASTS.search(code):
+                offenders.append(f"{V07_VECTORIZED_BENCH.relative_to(REPO)}:{line_no}: {line.strip()}")
 
         self.assertEqual([], offenders)
 
