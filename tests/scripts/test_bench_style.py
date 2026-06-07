@@ -22,7 +22,7 @@ TPCH_DATA_GEN_FILE = (
 )
 TPCH_LOAD_FILE = REPO / "crates" / "ultrasql-bench" / "src" / "tpch" / "load.rs"
 NUMERIC_AS_CAST = re.compile(
-    r"\bas\s+(?:usize|u8|u16|u32|u64|i8|i16|i32|i64|isize|f32|f64)\b"
+    r"\bas\s+(?:usize|u8|u16|u32|u64|i8|i16|i32|i64|isize|f32|f64)\b|clippy::cast_"
 )
 TPCH_DATA_GEN_CAST = re.compile(r"\bas\s+(?:usize|u32|u8|char)\b")
 TPCH_LOAD_DATE_CAST = re.compile(r"\bas\s+(?:u32|i32)\b")

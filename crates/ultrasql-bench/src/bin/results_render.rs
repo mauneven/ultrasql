@@ -59,11 +59,7 @@
     clippy::redundant_pub_crate,
     clippy::single_match_else,
     clippy::ptr_arg,
-    clippy::unnecessary_lazy_evaluations,
-    clippy::cast_possible_truncation,
-    clippy::cast_possible_wrap,
-    clippy::cast_sign_loss,
-    clippy::cast_lossless
+    clippy::unnecessary_lazy_evaluations
 )]
 
 use std::collections::HashMap;
