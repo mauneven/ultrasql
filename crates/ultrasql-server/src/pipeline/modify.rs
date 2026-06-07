@@ -709,20 +709,20 @@ fn build_referenced_by_delete_checks(
                         Ok(())
                     }
                     LogicalReferentialAction::SetNull | LogicalReferentialAction::SetDefault => {
-                        update_child_rows_for_delete_action(
-                            &heap,
-                            &child,
-                            &child_indexes,
-                            &child_rows,
-                            &child_columns,
-                            on_delete,
-                            &child_constraints,
-                            &sequences,
-                            sequence_state.as_ref(),
+                        update_child_rows_for_delete_action(UpdateChildRowsForDeleteActionArgs {
+                            heap: &heap,
+                            child: &child,
+                            indexes: &child_indexes,
+                            rows: &child_rows,
+                            child_columns: &child_columns,
+                            action: on_delete,
+                            constraints: &child_constraints,
+                            sequences: &sequences,
+                            sequence_state: sequence_state.as_ref(),
                             xid,
                             command_id,
-                            &vm,
-                        )
+                            vm: &vm,
+                        })
                     }
                 }
             }) as RowConstraintCheck);
@@ -884,34 +884,36 @@ fn build_referenced_by_update_checks(
                     LogicalReferentialAction::NoAction | LogicalReferentialAction::Restrict => Err(
                         ultrasql_executor::ExecError::ForeignKeyViolation(name.clone()),
                     ),
-                    LogicalReferentialAction::Cascade => cascade_update_child_rows(
-                        &heap,
-                        &child,
-                        &child_indexes,
-                        &child_rows,
-                        &child_columns,
-                        &target_columns,
-                        new_row,
-                        &child_constraints,
-                        xid,
-                        command_id,
-                        &vm,
-                    ),
-                    LogicalReferentialAction::SetNull | LogicalReferentialAction::SetDefault => {
-                        update_child_rows_for_delete_action(
-                            &heap,
-                            &child,
-                            &child_indexes,
-                            &child_rows,
-                            &child_columns,
-                            on_update,
-                            &child_constraints,
-                            &sequences,
-                            sequence_state.as_ref(),
+                    LogicalReferentialAction::Cascade => {
+                        cascade_update_child_rows(CascadeUpdateChildRowsArgs {
+                            heap: &heap,
+                            child: &child,
+                            indexes: &child_indexes,
+                            rows: &child_rows,
+                            child_columns: &child_columns,
+                            target_columns: &target_columns,
+                            new_parent_row: new_row,
+                            constraints: &child_constraints,
                             xid,
                             command_id,
-                            &vm,
-                        )
+                            vm: &vm,
+                        })
+                    }
+                    LogicalReferentialAction::SetNull | LogicalReferentialAction::SetDefault => {
+                        update_child_rows_for_delete_action(UpdateChildRowsForDeleteActionArgs {
+                            heap: &heap,
+                            child: &child,
+                            indexes: &child_indexes,
+                            rows: &child_rows,
+                            child_columns: &child_columns,
+                            action: on_update,
+                            constraints: &child_constraints,
+                            sequences: &sequences,
+                            sequence_state: sequence_state.as_ref(),
+                            xid,
+                            command_id,
+                            vm: &vm,
+                        })
                     }
                 }
             }) as RowUpdateConstraintCheck);
@@ -1067,21 +1069,38 @@ fn cascade_delete_child_rows(
     Ok(())
 }
 
-#[allow(clippy::too_many_arguments)]
-fn update_child_rows_for_delete_action(
-    heap: &ultrasql_storage::heap::HeapAccess<crate::BlankPageLoader>,
-    child: &TableEntry,
-    indexes: &[IndexEntry],
-    rows: &[(TupleId, Vec<Value>)],
-    child_columns: &[usize],
+struct UpdateChildRowsForDeleteActionArgs<'a> {
+    heap: &'a ultrasql_storage::heap::HeapAccess<crate::BlankPageLoader>,
+    child: &'a TableEntry,
+    indexes: &'a [IndexEntry],
+    rows: &'a [(TupleId, Vec<Value>)],
+    child_columns: &'a [usize],
     action: LogicalReferentialAction,
-    constraints: &crate::TableRuntimeConstraints,
-    sequences: &dashmap::DashMap<String, Arc<ultrasql_storage::sequence::Sequence>>,
-    sequence_state: Option<&crate::SequenceSessionState>,
+    constraints: &'a crate::TableRuntimeConstraints,
+    sequences: &'a dashmap::DashMap<String, Arc<ultrasql_storage::sequence::Sequence>>,
+    sequence_state: Option<&'a crate::SequenceSessionState>,
     xid: Xid,
     command_id: CommandId,
-    vm: &ultrasql_storage::vm::VisibilityMap,
+    vm: &'a ultrasql_storage::vm::VisibilityMap,
+}
+
+fn update_child_rows_for_delete_action(
+    args: UpdateChildRowsForDeleteActionArgs<'_>,
 ) -> Result<(), ultrasql_executor::ExecError> {
+    let UpdateChildRowsForDeleteActionArgs {
+        heap,
+        child,
+        indexes,
+        rows,
+        child_columns,
+        action,
+        constraints,
+        sequences,
+        sequence_state,
+        xid,
+        command_id,
+        vm,
+    } = args;
     if rows.is_empty() {
         return Ok(());
     }
@@ -1145,20 +1164,36 @@ fn update_child_rows_for_delete_action(
     Ok(())
 }
 
-#[allow(clippy::too_many_arguments)]
-fn cascade_update_child_rows(
-    heap: &ultrasql_storage::heap::HeapAccess<crate::BlankPageLoader>,
-    child: &TableEntry,
-    indexes: &[IndexEntry],
-    rows: &[(TupleId, Vec<Value>)],
-    child_columns: &[usize],
-    target_columns: &[usize],
-    new_parent_row: &[Value],
-    constraints: &crate::TableRuntimeConstraints,
+struct CascadeUpdateChildRowsArgs<'a> {
+    heap: &'a ultrasql_storage::heap::HeapAccess<crate::BlankPageLoader>,
+    child: &'a TableEntry,
+    indexes: &'a [IndexEntry],
+    rows: &'a [(TupleId, Vec<Value>)],
+    child_columns: &'a [usize],
+    target_columns: &'a [usize],
+    new_parent_row: &'a [Value],
+    constraints: &'a crate::TableRuntimeConstraints,
     xid: Xid,
     command_id: CommandId,
-    vm: &ultrasql_storage::vm::VisibilityMap,
+    vm: &'a ultrasql_storage::vm::VisibilityMap,
+}
+
+fn cascade_update_child_rows(
+    args: CascadeUpdateChildRowsArgs<'_>,
 ) -> Result<(), ultrasql_executor::ExecError> {
+    let CascadeUpdateChildRowsArgs {
+        heap,
+        child,
+        indexes,
+        rows,
+        child_columns,
+        target_columns,
+        new_parent_row,
+        constraints,
+        xid,
+        command_id,
+        vm,
+    } = args;
     if child_columns.len() != target_columns.len() {
         return Err(ultrasql_executor::ExecError::TypeMismatch(
             "foreign key column count mismatch during ON UPDATE CASCADE".to_owned(),
