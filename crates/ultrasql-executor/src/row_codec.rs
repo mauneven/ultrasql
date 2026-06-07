@@ -1969,8 +1969,7 @@ impl RowCodec {
 /// amortised cost. The [`Bitmap`] is materialised lazily on first
 /// observed null and finalised at `finish` time.
 #[derive(Debug, Default)]
-#[allow(clippy::redundant_pub_crate)]
-pub(crate) struct NullTracker {
+pub(super) struct NullTracker {
     words: Vec<u64>,
     len: usize,
     active: bool,
@@ -2033,8 +2032,7 @@ impl NullTracker {
 
 /// Per-column accumulator owning a typed `Vec<T>` plus a null tracker.
 #[derive(Debug)]
-#[allow(clippy::redundant_pub_crate)]
-pub(crate) enum ColumnBuilder {
+pub(super) enum ColumnBuilder {
     Bool {
         data: Vec<u8>,
         nulls: NullTracker,
