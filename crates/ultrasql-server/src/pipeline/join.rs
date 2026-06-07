@@ -4,8 +4,8 @@ use std::sync::Arc;
 
 use ultrasql_core::{DataType, Schema};
 use ultrasql_executor::{
-    ExecError, HashJoin, MemTableScan, MergeJoin, MergeJoinConfig, NestedLoopJoin, Operator,
-    Project, ProjectExprs, RightFactory, WorkMemBudget,
+    ExecError, HashJoin, HashJoinSchemas, MemTableScan, MergeJoin, MergeJoinConfig, NestedLoopJoin,
+    Operator, Project, ProjectExprs, RightFactory, WorkMemBudget,
     join_layout::{concat_join_exec_schema, using_projection_exprs, using_projection_indices},
 };
 use ultrasql_planner::{
@@ -170,9 +170,7 @@ pub(super) fn lower_join(args: LowerJoinArgs<'_>) -> Result<Box<dyn Operator>, S
                             right_keys,
                             residual,
                             join_type,
-                            out_schema,
-                            left_schema,
-                            right_schema,
+                            HashJoinSchemas::new(out_schema, left_schema, right_schema),
                         );
                         return Ok(Box::new(attach_work_mem(join, &work_mem)));
                     }
@@ -185,9 +183,7 @@ pub(super) fn lower_join(args: LowerJoinArgs<'_>) -> Result<Box<dyn Operator>, S
                         right_keys,
                         residual,
                         join_type,
-                        out_schema,
-                        left_schema,
-                        right_schema,
+                        HashJoinSchemas::new(out_schema, left_schema, right_schema),
                     );
                     return Ok(Box::new(attach_work_mem(join, &work_mem)));
                 }
@@ -317,9 +313,7 @@ fn build_swapped_inner_hash_join(
         right_keys,
         left_keys,
         LogicalJoinType::Inner,
-        swapped_schema,
-        right_schema,
-        left_schema,
+        HashJoinSchemas::new(swapped_schema, right_schema, left_schema),
     );
     let join = Box::new(attach_work_mem(join, &work_mem));
 

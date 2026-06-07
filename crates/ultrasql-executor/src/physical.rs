@@ -33,7 +33,7 @@ use ultrasql_vec::Batch;
 use crate::cte_scan::CteScan;
 use crate::filter_op::Filter;
 use crate::hash_aggregate::HashAggregate;
-use crate::hash_join::HashJoin;
+use crate::hash_join::{HashJoin, HashJoinSchemas};
 use crate::join_layout::{
     concat_join_exec_schema, using_projection_exprs, using_projection_indices,
 };
@@ -494,9 +494,7 @@ fn build_join(args: BuildJoinArgs<'_>) -> Result<Box<dyn Operator>, BuildError> 
                             left_key,
                             right_key,
                             join_type,
-                            schema.clone(),
-                            left_schema,
-                            right_schema,
+                            HashJoinSchemas::new(schema.clone(), left_schema, right_schema),
                         )));
                     }
                     _ => {

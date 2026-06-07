@@ -116,6 +116,30 @@ pub struct HashJoin {
     eof: bool,
 }
 
+/// Schema bundle used to assemble hash-join rows.
+///
+/// `output` is the row shape emitted by the join. `left` and `right`
+/// describe the child outputs before concatenation and are used for
+/// residual predicate offsets and NULL padding.
+#[derive(Clone, Debug)]
+pub struct HashJoinSchemas {
+    output: Schema,
+    left: Schema,
+    right: Schema,
+}
+
+impl HashJoinSchemas {
+    /// Create a schema bundle for hash-join construction.
+    #[must_use]
+    pub fn new(output: Schema, left: Schema, right: Schema) -> Self {
+        Self {
+            output,
+            left,
+            right,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum BuildSide {
     Left,
@@ -198,20 +222,15 @@ impl HashJoin {
     /// - `right_key` — expression evaluated over right rows to produce the probe key.
     /// - `join_type` — must be `Inner`, `LeftOuter`, `Semi`, or `Anti`;
     ///   other variants return `ExecError::Unsupported` at runtime.
-    /// - `schema` — output schema (left columns followed by right columns).
-    /// - `left_schema` — schema of the left child's output.
-    /// - `right_schema` — schema of the right child's output.
+    /// - `schemas` — output and child schemas.
     #[must_use]
-    #[allow(clippy::too_many_arguments)] // all 8 parameters are distinct logical inputs
     pub fn new(
         left: Box<dyn Operator>,
         right: Box<dyn Operator>,
         left_key: ScalarExpr,
         right_key: ScalarExpr,
         join_type: LogicalJoinType,
-        schema: Schema,
-        left_schema: Schema,
-        right_schema: Schema,
+        schemas: HashJoinSchemas,
     ) -> Self {
         Self::new_multi(
             left,
@@ -219,9 +238,7 @@ impl HashJoin {
             vec![left_key],
             vec![right_key],
             join_type,
-            schema,
-            left_schema,
-            right_schema,
+            schemas,
         )
     }
 
@@ -232,34 +249,20 @@ impl HashJoin {
     /// `left_keys[i] = right_keys[i]`. Rows with NULL in any key component
     /// do not match, preserving SQL equality semantics.
     #[must_use]
-    #[allow(clippy::too_many_arguments)] // all 8 parameters are distinct logical inputs
     pub fn new_multi(
         left: Box<dyn Operator>,
         right: Box<dyn Operator>,
         left_keys: Vec<ScalarExpr>,
         right_keys: Vec<ScalarExpr>,
         join_type: LogicalJoinType,
-        schema: Schema,
-        left_schema: Schema,
-        right_schema: Schema,
+        schemas: HashJoinSchemas,
     ) -> Self {
-        Self::new_multi_with_residual(
-            left,
-            right,
-            left_keys,
-            right_keys,
-            None,
-            join_type,
-            schema,
-            left_schema,
-            right_schema,
-        )
+        Self::new_multi_with_residual(left, right, left_keys, right_keys, None, join_type, schemas)
     }
 
     /// Construct a hash join with equality keys plus an optional residual
     /// predicate evaluated over the joined `left ++ right` row.
     #[must_use]
-    #[allow(clippy::too_many_arguments)] // all 9 parameters are distinct logical inputs
     pub fn new_multi_with_residual(
         left: Box<dyn Operator>,
         right: Box<dyn Operator>,
@@ -267,9 +270,7 @@ impl HashJoin {
         right_keys: Vec<ScalarExpr>,
         residual: Option<ScalarExpr>,
         join_type: LogicalJoinType,
-        schema: Schema,
-        left_schema: Schema,
-        right_schema: Schema,
+        schemas: HashJoinSchemas,
     ) -> Self {
         debug_assert!(!left_keys.is_empty(), "hash join requires at least one key");
         debug_assert_eq!(
@@ -277,6 +278,11 @@ impl HashJoin {
             right_keys.len(),
             "hash join key vectors must align"
         );
+        let HashJoinSchemas {
+            output: schema,
+            left: left_schema,
+            right: right_schema,
+        } = schemas;
         Self {
             left,
             right,
@@ -310,7 +316,6 @@ impl HashJoin {
     /// Construct a semi/anti hash join that builds the right side and streams
     /// the left/output side as the probe.
     #[must_use]
-    #[allow(clippy::too_many_arguments)] // all 9 parameters are distinct logical inputs
     pub fn new_multi_with_residual_build_right(
         left: Box<dyn Operator>,
         right: Box<dyn Operator>,
@@ -318,24 +323,14 @@ impl HashJoin {
         right_keys: Vec<ScalarExpr>,
         residual: Option<ScalarExpr>,
         join_type: LogicalJoinType,
-        schema: Schema,
-        left_schema: Schema,
-        right_schema: Schema,
+        schemas: HashJoinSchemas,
     ) -> Self {
         debug_assert!(
             matches!(join_type, LogicalJoinType::Semi | LogicalJoinType::Anti),
             "right-build hash join is only valid for semi/anti joins"
         );
         let mut join = Self::new_multi_with_residual(
-            left,
-            right,
-            left_keys,
-            right_keys,
-            residual,
-            join_type,
-            schema,
-            left_schema,
-            right_schema,
+            left, right, left_keys, right_keys, residual, join_type, schemas,
         );
         join.build_side = BuildSide::RightForSemiAnti;
         join
@@ -1204,7 +1199,7 @@ mod tests {
     use ultrasql_vec::Batch;
     use ultrasql_vec::column::{Column, NumericColumn};
 
-    use super::HashJoin;
+    use super::{HashJoin, HashJoinSchemas};
     use crate::mem_table_scan::MemTableScan;
     use crate::{ExecError, Operator, WorkMemBudget};
 
@@ -1417,9 +1412,7 @@ mod tests {
             col_idx0_i32("id"),
             col_idx0_i32("val"),
             LogicalJoinType::Inner,
-            schema_id_val(),
-            schema_id(),
-            schema_val(),
+            HashJoinSchemas::new(schema_id_val(), schema_id(), schema_val()),
         );
         let mut rows = drain_rows(&mut op);
         rows.sort_unstable();
@@ -1438,9 +1431,7 @@ mod tests {
             col_decimal("id", 0, 1),
             col_decimal("val", 0, 0),
             LogicalJoinType::Inner,
-            schema_joined_decimals(1, 0),
-            left_schema,
-            right_schema,
+            HashJoinSchemas::new(schema_joined_decimals(1, 0), left_schema, right_schema),
         );
 
         assert_eq!(drain_decimal_pairs(&mut op), vec![((10, 1), (1, 0))]);
@@ -1456,9 +1447,7 @@ mod tests {
             divide_i32_by_zero("id"),
             col_idx0_i32("val"),
             LogicalJoinType::Inner,
-            schema_id_val(),
-            schema_id(),
-            schema_val(),
+            HashJoinSchemas::new(schema_id_val(), schema_id(), schema_val()),
         );
 
         let err = op.next_batch().expect_err("build key division must error");
@@ -1478,9 +1467,7 @@ mod tests {
             col_idx0_i32("id"),
             divide_i32_by_zero("val"),
             LogicalJoinType::Inner,
-            schema_id_val(),
-            schema_id(),
-            schema_val(),
+            HashJoinSchemas::new(schema_id_val(), schema_id(), schema_val()),
         );
 
         let err = op.next_batch().expect_err("probe key division must error");
@@ -1500,9 +1487,7 @@ mod tests {
             col_idx0_i32("id"),
             col_idx0_i32("val"),
             LogicalJoinType::Inner,
-            schema_id_val(),
-            schema_id(),
-            schema_val(),
+            HashJoinSchemas::new(schema_id_val(), schema_id(), schema_val()),
         )
         .with_work_mem_budget(std::sync::Arc::new(WorkMemBudget::new(1)));
 
@@ -1530,9 +1515,7 @@ mod tests {
             vec![col_i32("left_part", 0), col_i32("left_supp", 1)],
             vec![col_i32("right_part", 0), col_i32("right_supp", 1)],
             LogicalJoinType::Inner,
-            schema_joined_pair(),
-            left_schema,
-            right_schema,
+            HashJoinSchemas::new(schema_joined_pair(), left_schema, right_schema),
         );
 
         let schema = op.schema().clone();
@@ -1566,9 +1549,7 @@ mod tests {
             col_idx0_i32("id"),
             col_idx0_i32("val"),
             LogicalJoinType::Inner,
-            schema_id_val(),
-            schema_id(),
-            schema_val(),
+            HashJoinSchemas::new(schema_id_val(), schema_id(), schema_val()),
         );
 
         let rows = drain_rows(&mut op);
@@ -1591,9 +1572,7 @@ mod tests {
             col_idx0_i32("id"),
             col_idx0_i32("val"),
             LogicalJoinType::Inner,
-            schema_id_val(),
-            schema_id(),
-            schema_val(),
+            HashJoinSchemas::new(schema_id_val(), schema_id(), schema_val()),
         );
         assert!(drain_rows(&mut op).is_empty());
     }
@@ -1614,9 +1593,7 @@ mod tests {
             col_idx0_i32("id"),
             col_idx0_i32("val"),
             LogicalJoinType::LeftOuter,
-            schema_id_val(),
-            schema_id(),
-            schema_val(),
+            HashJoinSchemas::new(schema_id_val(), schema_id(), schema_val()),
         );
         let mut rows = drain_rows(&mut op);
         rows.sort_unstable();
@@ -1639,9 +1616,7 @@ mod tests {
             col_idx0_i32("id"),
             col_idx0_i32("val"),
             LogicalJoinType::Semi,
-            schema_id(),
-            schema_id(),
-            schema_val(),
+            HashJoinSchemas::new(schema_id(), schema_id(), schema_val()),
         );
         let mut rows = drain_single_i32(&mut op);
         rows.sort_unstable();
@@ -1658,9 +1633,7 @@ mod tests {
             col_idx0_i32("id"),
             col_idx0_i32("val"),
             LogicalJoinType::Anti,
-            schema_id(),
-            schema_id(),
-            schema_val(),
+            HashJoinSchemas::new(schema_id(), schema_id(), schema_val()),
         );
         let mut rows = drain_single_i32(&mut op);
         rows.sort_unstable();
@@ -1692,9 +1665,7 @@ mod tests {
             vec![col_i32("right_part", 0)],
             Some(residual),
             LogicalJoinType::Semi,
-            left_schema.clone(),
-            left_schema,
-            right_schema,
+            HashJoinSchemas::new(left_schema.clone(), left_schema, right_schema),
         );
 
         assert_eq!(drain_pair_i32(&mut op), vec![(1, 10)]);
@@ -1725,9 +1696,7 @@ mod tests {
             vec![col_i32("right_part", 0)],
             Some(residual),
             LogicalJoinType::Anti,
-            left_schema.clone(),
-            left_schema,
-            right_schema,
+            HashJoinSchemas::new(left_schema.clone(), left_schema, right_schema),
         );
 
         assert_eq!(drain_pair_i32(&mut op), vec![(2, 30)]);
@@ -1744,9 +1713,7 @@ mod tests {
             vec![col_idx0_i32("val")],
             None,
             LogicalJoinType::Semi,
-            schema_id(),
-            schema_id(),
-            schema_val(),
+            HashJoinSchemas::new(schema_id(), schema_id(), schema_val()),
         );
         let mut rows = drain_single_i32(&mut op);
         rows.sort_unstable();
@@ -1778,9 +1745,7 @@ mod tests {
             vec![col_i32("right_part", 0)],
             Some(residual),
             LogicalJoinType::Anti,
-            left_schema.clone(),
-            left_schema,
-            right_schema,
+            HashJoinSchemas::new(left_schema.clone(), left_schema, right_schema),
         );
 
         assert_eq!(drain_pair_i32(&mut op), vec![(2, 30)]);
@@ -1802,9 +1767,7 @@ mod tests {
             col_idx0_i32("id"),
             col_idx0_i32("val"),
             LogicalJoinType::Inner,
-            schema_id_val(),
-            schema_id(),
-            schema_val(),
+            HashJoinSchemas::new(schema_id_val(), schema_id(), schema_val()),
         );
         let mut rows = drain_rows(&mut op);
         rows.sort_unstable();
@@ -1828,9 +1791,7 @@ mod tests {
             col_idx0_i32("id"),
             col_idx0_i32("val"),
             LogicalJoinType::RightOuter,
-            schema_id_val(),
-            schema_id(),
-            schema_val(),
+            HashJoinSchemas::new(schema_id_val(), schema_id(), schema_val()),
         );
         let err = op.next_batch().expect_err("RightOuter must error");
         assert!(matches!(err, ExecError::Unsupported(_)), "got {err:?}");

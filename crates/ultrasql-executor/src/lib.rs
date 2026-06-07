@@ -126,7 +126,7 @@ pub use function_scan::FunctionScan;
 pub use fused_insert::FusedInsertInt32Pair;
 pub use gather::{Gather, GatherMerge};
 pub use hash_aggregate::HashAggregate;
-pub use hash_join::HashJoin;
+pub use hash_join::{HashJoin, HashJoinSchemas};
 pub use hybrid_search::{
     HybridSearch, HybridSearchConfig, HybridSearchWeights, HybridTextSpec, HybridVectorSpec,
 };
