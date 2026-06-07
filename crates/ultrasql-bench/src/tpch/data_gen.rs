@@ -227,7 +227,7 @@ fn write_customer(n: u32, out_dir: &Path) -> Result<()> {
     let mut rng = Xorshift64::new(0x5EED_0002);
     for i in 1..=n {
         let nation_key = rng.next_u64() % 25;
-        let seg = segments[(i as usize - 1) % segments.len()];
+        let seg = segments[one_based_index(i, segments.len())];
         let acctbal = format!("{:.2}", f64::from(i % 9999) - 999.99);
         let addr = fake_string(&mut rng, 10, 40);
         let phone = fake_phone(&mut rng, nation_key);
@@ -245,7 +245,7 @@ fn write_part(n: u32, out_dir: &Path) -> Result<()> {
     let mut buf = String::new();
     let mut rng = Xorshift64::new(0x5EED_0003);
     for i in 1..=n {
-        let size = (rng.next_u64() % 50 + 1) as u32;
+        let size = u64_to_u32(rng.next_u64() % 50 + 1);
         let price = format!("{:.2}", 900.0 + f64::from(i % 20086) * 0.01);
         let name = fake_part_name(&mut rng);
         let mfgr = rng.next_u64() % 5 + 1;
@@ -274,7 +274,7 @@ fn write_partsupp(n_parts: u32, n_suppliers: u32, out_dir: &Path) -> Result<()> 
             let availqty = rng.next_u64() % 9999 + 1;
             let supplycost = format!(
                 "{:.2}",
-                f64::from((rng.next_u64() % 100_000) as u32) / 100.0 + 1.0
+                f64::from(u64_to_u32(rng.next_u64() % 100_000)) / 100.0 + 1.0
             );
             let comment = fake_string(&mut rng, 30, 199);
             writeln!(buf, "{p}|{suppkey}|{availqty}|{supplycost}|{comment}")
@@ -293,13 +293,13 @@ fn write_orders(n: u32, n_customers: u32, out_dir: &Path) -> Result<()> {
         // Non-customer orderkeys: multiples-of-4 within customer range.
         let orderkey = i * 4;
         let custkey = (rng.next_u64() % u64::from(n_customers)) + 1;
-        let status = statuses[(i as usize - 1) % statuses.len()];
+        let status = statuses[one_based_index(i, statuses.len())];
         let price = format!(
             "{:.2}",
-            f64::from((rng.next_u64() % 50_000) as u32) + 1000.0
+            f64::from(u64_to_u32(rng.next_u64() % 50_000)) + 1000.0
         );
         let date = fake_date(&mut rng, 1992, 1998);
-        let priority = priorities[(i as usize - 1) % priorities.len()];
+        let priority = priorities[one_based_index(i, priorities.len())];
         let clerk = format!("Clerk#{:>000009}", rng.next_u64() % 1000 + 1);
         let comment = fake_string(&mut rng, 10, 79);
         writeln!(
@@ -323,24 +323,24 @@ fn write_lineitem(n_orders: u32, n_parts: u32, n_suppliers: u32, out_dir: &Path)
     let mut rng = Xorshift64::new(0x5EED_0006);
     for o in 1..=n_orders {
         let orderkey = o * 4;
-        let linecnt = (rng.next_u64() % 7 + 1) as u32;
+        let linecnt = u64_to_u32(rng.next_u64() % 7 + 1);
         for linenumber in 1..=linecnt {
             let partkey = (rng.next_u64() % u64::from(n_parts)) + 1;
             let suppkey = (rng.next_u64() % u64::from(n_suppliers)) + 1;
-            let quantity = format!("{:.2}", f64::from((rng.next_u64() % 50 + 1) as u32));
+            let quantity = format!("{:.2}", f64::from(u64_to_u32(rng.next_u64() % 50 + 1)));
             let ep = format!(
                 "{:.2}",
-                f64::from((rng.next_u64() % 100_000) as u32) / 100.0 + 100.0
+                f64::from(u64_to_u32(rng.next_u64() % 100_000)) / 100.0 + 100.0
             );
-            let discount = format!("{:.2}", f64::from((rng.next_u64() % 11) as u32) / 100.0);
-            let tax = format!("{:.2}", f64::from((rng.next_u64() % 9) as u32) / 100.0);
+            let discount = format!("{:.2}", f64::from(u64_to_u32(rng.next_u64() % 11)) / 100.0);
+            let tax = format!("{:.2}", f64::from(u64_to_u32(rng.next_u64() % 9)) / 100.0);
             let returnflag = if rng.next_u64() % 3 == 0 { 'R' } else { 'N' };
             let linestatus = if rng.next_u64() % 2 == 0 { 'O' } else { 'F' };
             let shipdate = fake_date(&mut rng, 1992, 1998);
             let commitdate = fake_date(&mut rng, 1992, 1998);
             let receiptdate = fake_date(&mut rng, 1992, 1999);
-            let shipmode = shipmodes[(rng.next_u64() as usize) % shipmodes.len()];
-            let shipinstruct = shipinstructs[(rng.next_u64() as usize) % shipinstructs.len()];
+            let shipmode = shipmodes[bounded_index(rng.next_u64(), shipmodes.len())];
+            let shipinstruct = shipinstructs[bounded_index(rng.next_u64(), shipinstructs.len())];
             let comment = fake_string(&mut rng, 5, 44);
             writeln!(
                 buf,
@@ -379,10 +379,31 @@ impl Xorshift64 {
     }
 }
 
+fn u64_to_u32(value: u64) -> u32 {
+    u32::try_from(value).unwrap_or_default()
+}
+
+fn u64_to_u8(value: u64) -> u8 {
+    u8::try_from(value).unwrap_or_default()
+}
+
+fn bounded_index(value: u64, len: usize) -> usize {
+    let len_u64 = u64::try_from(len).unwrap_or(1);
+    if len_u64 == 0 {
+        return 0;
+    }
+    usize::try_from(value % len_u64).unwrap_or_default()
+}
+
+fn one_based_index(value: u32, len: usize) -> usize {
+    bounded_index(u64::from(value.saturating_sub(1)), len)
+}
+
 fn fake_string(rng: &mut Xorshift64, min_len: usize, max_len: usize) -> String {
-    let len = min_len + (rng.next_u64() as usize % (max_len - min_len + 1));
+    let span = max_len.saturating_sub(min_len).saturating_add(1);
+    let len = min_len + bounded_index(rng.next_u64(), span);
     (0..len)
-        .map(|_| (b'a' + (rng.next_u64() % 26) as u8) as char)
+        .map(|_| char::from(b'a' + u64_to_u8(rng.next_u64() % 26)))
         .collect()
 }
 
@@ -397,9 +418,10 @@ fn fake_phone(rng: &mut Xorshift64, nation_key: u64) -> String {
 }
 
 fn fake_date(rng: &mut Xorshift64, year_min: u32, year_max: u32) -> String {
-    let year = year_min + (rng.next_u64() as u32 % (year_max - year_min + 1));
-    let month = 1 + rng.next_u64() as u32 % 12;
-    let day = 1 + rng.next_u64() as u32 % 28;
+    let year_span = year_max.saturating_sub(year_min).saturating_add(1);
+    let year = year_min + u64_to_u32(rng.next_u64() % u64::from(year_span));
+    let month = 1 + u64_to_u32(rng.next_u64() % 12);
+    let day = 1 + u64_to_u32(rng.next_u64() % 28);
     format!("{year:04}-{month:02}-{day:02}")
 }
 
@@ -458,7 +480,7 @@ fn fake_part_name(rng: &mut Xorshift64) -> String {
     ];
     const N: usize = 5;
     (0..N)
-        .map(|_| WORDS[(rng.next_u64() as usize) % WORDS.len()])
+        .map(|_| WORDS[bounded_index(rng.next_u64(), WORDS.len())])
         .collect::<Vec<_>>()
         .join(" ")
 }
@@ -469,9 +491,9 @@ fn fake_part_type(rng: &mut Xorshift64) -> String {
     const SUBSTANCES: &[&str] = &["TIN", "NICKEL", "BRASS", "STEEL", "COPPER"];
     format!(
         "{} {} {}",
-        SYLLABLES[(rng.next_u64() as usize) % SYLLABLES.len()],
-        MATERIALS[(rng.next_u64() as usize) % MATERIALS.len()],
-        SUBSTANCES[(rng.next_u64() as usize) % SUBSTANCES.len()],
+        SYLLABLES[bounded_index(rng.next_u64(), SYLLABLES.len())],
+        MATERIALS[bounded_index(rng.next_u64(), MATERIALS.len())],
+        SUBSTANCES[bounded_index(rng.next_u64(), SUBSTANCES.len())],
     )
 }
 
@@ -480,8 +502,8 @@ fn fake_container(rng: &mut Xorshift64) -> String {
     const KINDS: &[&str] = &["CASE", "BOX", "BAG", "JAR", "PKG", "PACK", "CAN", "DRUM"];
     format!(
         "{} {}",
-        SIZES[(rng.next_u64() as usize) % SIZES.len()],
-        KINDS[(rng.next_u64() as usize) % KINDS.len()],
+        SIZES[bounded_index(rng.next_u64(), SIZES.len())],
+        KINDS[bounded_index(rng.next_u64(), KINDS.len())],
     )
 }
 
