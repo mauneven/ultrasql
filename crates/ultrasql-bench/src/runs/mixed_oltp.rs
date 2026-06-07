@@ -79,6 +79,10 @@ fn rng_index(seed: u64, upper_bound: usize) -> usize {
     usize::try_from(reduced).unwrap_or(0)
 }
 
+fn op_kind(seed: u64) -> u8 {
+    u8::try_from(seed % 100).unwrap_or(0)
+}
+
 /// Runs the mixed-OLTP benchmark.
 pub fn run(ctx: &BenchContext) -> BenchResult {
     // Budget: initial rows + ops_per_iter inserts per iteration.
@@ -130,7 +134,7 @@ pub fn run(ctx: &BenchContext) -> BenchResult {
                 s = xorshift64(s);
                 // Determine operation by low 7 bits: 0..49 read, 50..79 update,
                 // 80..99 insert.
-                let kind = (s % 100) as u8;
+                let kind = op_kind(s);
                 if kind < 50 {
                     // Point read.
                     let idx = rng_index(s, n_tids);
@@ -250,7 +254,7 @@ mod tests {
         let (mut reads, mut updates, mut inserts) = (0usize, 0usize, 0usize);
         for _ in 0..OPS_PER_ITER {
             s = xorshift64(s);
-            let kind = (s % 100) as u8;
+            let kind = op_kind(s);
             if kind < 50 {
                 reads += 1;
             } else if kind < 80 {
@@ -344,7 +348,7 @@ mod tests {
             let mut s = seed;
             for op_idx in 0..OPS_PER_ITER {
                 s = xorshift64(s);
-                let kind = (s % 100) as u8;
+                let kind = op_kind(s);
                 if kind < 50 {
                     let idx = rng_index(s, n_tids);
                     let _ = heap.fetch(tids[idx]);
