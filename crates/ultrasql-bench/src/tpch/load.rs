@@ -3877,21 +3877,25 @@ fn direct_days_in_month(year: i32, month: u32) -> u32 {
 }
 
 #[cfg(feature = "sql-bench")]
-#[allow(
-    clippy::cast_possible_truncation,
-    clippy::cast_possible_wrap,
-    clippy::cast_sign_loss,
-    reason = "Howard Hinnant civil-date algorithm bounds yoe/doe before casts"
-)]
 fn direct_days_since_epoch(year: i32, month: u32, day: u32) -> i32 {
     let y = if month <= 2 { year - 1 } else { year };
     let era = y.div_euclid(400);
-    let yoe = (y - era * 400) as u32;
+    let yoe = direct_i32_to_u32(y - era * 400);
     let month_prime = if month > 2 { month - 3 } else { month + 9 };
     let doy = (153 * month_prime + 2) / 5 + day - 1;
     let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
-    let days_since_1970 = era * 146_097 + doe as i32 - 719_468;
+    let days_since_1970 = era * 146_097 + direct_u32_to_i32(doe) - 719_468;
     days_since_1970 - 10_957
+}
+
+#[cfg(feature = "sql-bench")]
+fn direct_i32_to_u32(value: i32) -> u32 {
+    u32::try_from(value).unwrap_or_default()
+}
+
+#[cfg(feature = "sql-bench")]
+fn direct_u32_to_i32(value: u32) -> i32 {
+    i32::try_from(value).unwrap_or_default()
 }
 
 #[cfg(feature = "sql-bench")]

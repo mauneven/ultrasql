@@ -18,10 +18,12 @@ SQL_BENCH_FILES = [
 TPCH_DATA_GEN_FILE = (
     REPO / "crates" / "ultrasql-bench" / "src" / "tpch" / "data_gen.rs"
 )
+TPCH_LOAD_FILE = REPO / "crates" / "ultrasql-bench" / "src" / "tpch" / "load.rs"
 NUMERIC_AS_CAST = re.compile(
     r"\bas\s+(?:usize|u8|u16|u32|u64|i8|i16|i32|i64|isize|f32|f64)\b"
 )
 TPCH_DATA_GEN_CAST = re.compile(r"\bas\s+(?:usize|u32|u8|char)\b")
+TPCH_LOAD_DATE_CAST = re.compile(r"\bas\s+(?:u32|i32)\b")
 NEAREST_RANK_INDEX_CAST = re.compile(r"rank\.max\(1\.0\)\s+as\s+usize")
 ANN_VECTOR_SEED_WIDTH_CAST = re.compile(r"\b(?:row_id|query_id|dim)\s+as\s+u64\b")
 ANN_VECTOR_COMPONENT_FLOAT_CAST = re.compile(r"\)\s+as\s+f32\s*/\s*(?:37|41)\.0")
@@ -143,6 +145,15 @@ class BenchStyleTests(unittest.TestCase):
                 offenders.append(
                     f"{TPCH_DATA_GEN_FILE.relative_to(REPO)}:{line_no}: {line.strip()}"
                 )
+
+        self.assertEqual([], offenders)
+
+    def test_tpch_load_date_math_uses_checked_conversions(self) -> None:
+        offenders: list[str] = []
+        for line_no, line in enumerate(TPCH_LOAD_FILE.read_text().splitlines(), start=1):
+            code = line.split("//", maxsplit=1)[0]
+            if TPCH_LOAD_DATE_CAST.search(code):
+                offenders.append(f"{TPCH_LOAD_FILE.relative_to(REPO)}:{line_no}: {line.strip()}")
 
         self.assertEqual([], offenders)
 
