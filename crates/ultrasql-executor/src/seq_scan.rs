@@ -1983,8 +1983,9 @@ mod tests {
         let oracle = Arc::new(MapOracle::new());
         oracle.set_committed(Xid::new(xid));
 
-        let total = 10_000_i32;
-        for i in 0..total {
+        let total = 10_000_usize;
+        let total_i32 = i32::try_from(total).expect("total fits i32");
+        for i in 0..total_i32 {
             let row = vec![Value::Int32(i)];
             let payload = codec.encode(&row).expect("encode");
             heap.insert(rel(), &payload, insert_opts(xid))
@@ -2002,7 +2003,7 @@ mod tests {
             codec,
         );
 
-        let mut streamed: Vec<i32> = Vec::with_capacity(total as usize);
+        let mut streamed: Vec<i32> = Vec::with_capacity(total);
         while let Some(batch) = scan.next_batch().expect("operator must not error") {
             match &batch.columns()[0] {
                 Column::Int32(c) => streamed.extend_from_slice(c.data()),
@@ -2010,7 +2011,7 @@ mod tests {
             }
         }
 
-        let expected: Vec<i32> = (0..total).collect();
+        let expected: Vec<i32> = (0..total_i32).collect();
         assert_eq!(
             streamed, expected,
             "streaming output diverges from insertion order"
@@ -2032,8 +2033,9 @@ mod tests {
         let oracle = Arc::new(MapOracle::new());
         oracle.set_committed(Xid::new(xid));
 
-        let total: i32 = 32;
-        for i in 0..total {
+        let total = 32_usize;
+        let total_i32 = i32::try_from(total).expect("total fits i32");
+        for i in 0..total_i32 {
             let row = if i % 2 == 0 {
                 vec![Value::Int32(i), Value::Null]
             } else {
@@ -2066,7 +2068,7 @@ mod tests {
         let nulls = score_col
             .nulls()
             .expect("null bitmap must be present after observing nulls");
-        for i in 0..(total as usize) {
+        for i in 0..total {
             let is_valid_expected = i % 2 == 1;
             assert_eq!(
                 nulls.get(i),

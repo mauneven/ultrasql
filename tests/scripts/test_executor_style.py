@@ -5,6 +5,7 @@ from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[2]
 WINDOW_AGG = REPO / "crates" / "ultrasql-executor" / "src" / "window_agg.rs"
+SEQ_SCAN = REPO / "crates" / "ultrasql-executor" / "src" / "seq_scan.rs"
 AGGREGATE_FILES = [
     REPO / "crates" / "ultrasql-executor" / "src" / "hash_aggregate.rs",
     REPO / "crates" / "ultrasql-executor" / "src" / "sort_aggregate.rs",
@@ -19,6 +20,15 @@ class ExecutorStyleTests(unittest.TestCase):
             code = line.split("//", maxsplit=1)[0]
             if INTEGER_AS_CAST.search(code):
                 offenders.append(f"{WINDOW_AGG.relative_to(REPO)}:{line_no}: {line.strip()}")
+
+        self.assertEqual([], offenders)
+
+    def test_seq_scan_tests_use_checked_integer_conversions(self) -> None:
+        offenders: list[str] = []
+        for line_no, line in enumerate(SEQ_SCAN.read_text().splitlines(), start=1):
+            code = line.split("//", maxsplit=1)[0]
+            if INTEGER_AS_CAST.search(code):
+                offenders.append(f"{SEQ_SCAN.relative_to(REPO)}:{line_no}: {line.strip()}")
 
         self.assertEqual([], offenders)
 
