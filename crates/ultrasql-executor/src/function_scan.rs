@@ -135,7 +135,6 @@ fn flatten_array_elements(elements: &[Value], out: &mut Vec<Value>) {
 }
 
 impl Operator for FunctionScan {
-    #[allow(clippy::similar_names)]
     fn next_batch(&mut self) -> Result<Option<Batch>, ExecError> {
         if let Some(flag) = self.cancel_flag.as_ref()
             && flag.is_set()
@@ -147,11 +146,15 @@ impl Operator for FunctionScan {
         }
 
         match &self.kind {
-            SrfKind::GenerateSeries { stop, step, .. } => {
-                let stop_val = *stop;
-                let step_val = *step;
+            SrfKind::GenerateSeries {
+                stop: series_bound,
+                step: increment,
+                ..
+            } => {
+                let series_bound = *series_bound;
+                let increment = *increment;
 
-                if step_val == 0 {
+                if increment == 0 {
                     return Err(ExecError::InvalidParameterValue(
                         "generate_series step size cannot equal zero".to_owned(),
                     ));
@@ -160,14 +163,14 @@ impl Operator for FunctionScan {
                 let mut data: Vec<i64> = Vec::with_capacity(BATCH_TARGET_ROWS);
                 for _ in 0..BATCH_TARGET_ROWS {
                     // Check bounds: ascending or descending.
-                    if (step_val > 0 && self.current > stop_val)
-                        || (step_val < 0 && self.current < stop_val)
+                    if (increment > 0 && self.current > series_bound)
+                        || (increment < 0 && self.current < series_bound)
                     {
                         self.eof = true;
                         break;
                     }
                     data.push(self.current);
-                    let Some(next) = self.current.checked_add(step_val) else {
+                    let Some(next) = self.current.checked_add(increment) else {
                         self.eof = true;
                         break;
                     };
