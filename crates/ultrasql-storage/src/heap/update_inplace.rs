@@ -35,6 +35,73 @@ struct UpdateInt32PairRange<'a, O: ?Sized, P: ?Sized> {
     vm: Option<&'a crate::vm::VisibilityMap>,
 }
 
+/// Page-major scan request for fused `(Int32, Int32)` UPDATE.
+///
+/// The predicate receives decoded `(id, value)` payload values after
+/// MVCC visibility checks pass for the supplied snapshot and oracle.
+pub struct UpdateInt32PairScan<'a, O: ?Sized, P> {
+    /// Relation to scan.
+    pub rel: RelationId,
+    /// Number of blocks to visit in `rel`.
+    pub block_count: u32,
+    /// MVCC snapshot used for tuple visibility.
+    pub snapshot: &'a Snapshot,
+    /// Commit-status oracle backing visibility checks.
+    pub oracle: &'a O,
+    /// Predicate over decoded `(Int32, Int32)` payload values.
+    pub predicate: P,
+}
+
+impl<O: ?Sized, P> std::fmt::Debug for UpdateInt32PairScan<'_, O, P> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("UpdateInt32PairScan")
+            .field("rel", &self.rel)
+            .field("block_count", &self.block_count)
+            .finish_non_exhaustive()
+    }
+}
+
+/// Point-update request for a candidate `(Int32, Int32)` tuple.
+///
+/// The heap rechecks visibility and the predicate before writing, so
+/// stale secondary-index candidates are skipped safely.
+pub struct UpdateInt32PairTid<'a, O: ?Sized, P> {
+    /// Candidate tuple id to recheck and update.
+    pub tid: TupleId,
+    /// MVCC snapshot used for tuple visibility.
+    pub snapshot: &'a Snapshot,
+    /// Commit-status oracle backing visibility checks.
+    pub oracle: &'a O,
+    /// Predicate over decoded `(Int32, Int32)` payload values.
+    pub predicate: P,
+}
+
+impl<O: ?Sized, P> std::fmt::Debug for UpdateInt32PairTid<'_, O, P> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("UpdateInt32PairTid")
+            .field("tid", &self.tid)
+            .finish_non_exhaustive()
+    }
+}
+
+/// Arithmetic edit applied by fused `(Int32, Int32)` UPDATE helpers.
+#[derive(Clone, Copy, Debug)]
+pub struct UpdateInt32PairEdit {
+    /// Target column: `0` for id, `1` for value.
+    pub target_col: u8,
+    /// Signed delta added to the target column.
+    pub delta: i32,
+}
+
+/// MVCC stamp written by fused in-place UPDATE helpers.
+#[derive(Clone, Copy, Debug)]
+pub struct UpdateInt32PairStamp {
+    /// XID stamped as `xmax` on updated tuple versions.
+    pub xid: Xid,
+    /// Command id stamped as `cmax` on updated tuple versions.
+    pub command_id: CommandId,
+}
+
 #[derive(Debug)]
 struct PageUndoSlots {
     first_slot: u16,
@@ -432,19 +499,12 @@ impl<L: PageLoader> HeapAccess<L> {
     /// The buffer pool decides which mode applies via its configured
     /// [`crate::wal_sink::WalSink`]; fused executor callers
     /// pull the sink from [`HeapAccess::wal_sink`].
-    #[allow(clippy::too_many_arguments)]
     #[inline]
     pub fn update_int32_pair_inplace_undo<O, P>(
         &self,
-        rel: RelationId,
-        block_count: u32,
-        snapshot: &Snapshot,
-        oracle: &O,
-        predicate: P,
-        target_col: u8,
-        delta: i32,
-        xid: Xid,
-        command_id: CommandId,
+        scan: UpdateInt32PairScan<'_, O, P>,
+        edit: UpdateInt32PairEdit,
+        stamp: UpdateInt32PairStamp,
         wal: Option<&dyn WalSink>,
         vm: Option<&crate::vm::VisibilityMap>,
     ) -> Result<usize, HeapError>
@@ -454,6 +514,15 @@ impl<L: PageLoader> HeapAccess<L> {
     {
         use crate::page::{ITEMID_SIZE, PAGE_HEADER_SIZE};
 
+        let UpdateInt32PairScan {
+            rel,
+            block_count,
+            snapshot,
+            oracle,
+            predicate,
+        } = scan;
+        let UpdateInt32PairEdit { target_col, delta } = edit;
+        let UpdateInt32PairStamp { xid, command_id } = stamp;
         let mut total_updated: usize = 0;
         let mut xmin_cache: Option<(Xid, u16, bool)> = None;
 
@@ -703,18 +772,11 @@ impl<L: PageLoader> HeapAccess<L> {
     /// disjoint block range, records compact undo locally, and the caller
     /// appends all undo batches under one relation-log lock after workers
     /// finish.
-    #[allow(clippy::too_many_arguments)]
     pub fn update_int32_pair_inplace_undo_parallel_no_wal<O, P>(
         &self,
-        rel: RelationId,
-        block_count: u32,
-        snapshot: &Snapshot,
-        oracle: &O,
-        predicate: P,
-        target_col: u8,
-        delta: i32,
-        xid: Xid,
-        command_id: CommandId,
+        scan: UpdateInt32PairScan<'_, O, P>,
+        edit: UpdateInt32PairEdit,
+        stamp: UpdateInt32PairStamp,
         vm: Option<&crate::vm::VisibilityMap>,
     ) -> Result<usize, HeapError>
     where
@@ -722,21 +784,30 @@ impl<L: PageLoader> HeapAccess<L> {
         P: Fn(i32, i32) -> bool + Sync,
     {
         let available_workers = std::thread::available_parallelism().map_or(1, |n| n.get());
+        let UpdateInt32PairScan {
+            rel,
+            block_count,
+            snapshot,
+            oracle,
+            predicate,
+        } = scan;
         if block_count < 2_048 || available_workers <= 1 {
             return self.update_int32_pair_inplace_undo(
-                rel,
-                block_count,
-                snapshot,
-                oracle,
-                predicate,
-                target_col,
-                delta,
-                xid,
-                command_id,
+                UpdateInt32PairScan {
+                    rel,
+                    block_count,
+                    snapshot,
+                    oracle,
+                    predicate,
+                },
+                edit,
+                stamp,
                 None,
                 vm,
             );
         }
+        let UpdateInt32PairEdit { target_col, delta } = edit;
+        let UpdateInt32PairStamp { xid, command_id } = stamp;
 
         let block_count_usize = usize_from_u32(block_count, "block count overflow")?;
         let workers = available_workers
@@ -748,15 +819,15 @@ impl<L: PageLoader> HeapAccess<L> {
             .clamp(1, 4);
         if workers <= 1 {
             return self.update_int32_pair_inplace_undo(
-                rel,
-                block_count,
-                snapshot,
-                oracle,
-                predicate,
-                target_col,
-                delta,
-                xid,
-                command_id,
+                UpdateInt32PairScan {
+                    rel,
+                    block_count,
+                    snapshot,
+                    oracle,
+                    predicate,
+                },
+                edit,
+                stamp,
                 None,
                 vm,
             );
@@ -998,17 +1069,11 @@ impl<L: PageLoader> HeapAccess<L> {
     /// index. This method rechecks MVCC visibility and the predicate
     /// against the heap slot before mutating, so stale or invisible
     /// index entries remain correctness-neutral.
-    #[allow(clippy::too_many_arguments)]
     pub fn update_int32_pair_tid_inplace_undo<O, P>(
         &self,
-        tid: TupleId,
-        snapshot: &Snapshot,
-        oracle: &O,
-        predicate: P,
-        target_col: u8,
-        delta: i32,
-        xid: Xid,
-        command_id: CommandId,
+        target: UpdateInt32PairTid<'_, O, P>,
+        edit: UpdateInt32PairEdit,
+        stamp: UpdateInt32PairStamp,
         wal: Option<&dyn WalSink>,
         vm: Option<&crate::vm::VisibilityMap>,
     ) -> Result<usize, HeapError>
@@ -1018,6 +1083,14 @@ impl<L: PageLoader> HeapAccess<L> {
     {
         use crate::page::{ITEMID_SIZE, PAGE_HEADER_SIZE};
 
+        let UpdateInt32PairTid {
+            tid,
+            snapshot,
+            oracle,
+            predicate,
+        } = target;
+        let UpdateInt32PairEdit { target_col, delta } = edit;
+        let UpdateInt32PairStamp { xid, command_id } = stamp;
         let rel = tid.page.relation;
         let xid_bytes = xid.raw().to_le_bytes();
         let cmd_bytes = command_id.raw().to_le_bytes();

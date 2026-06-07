@@ -28,7 +28,7 @@ use ultrasql_core::{BlockNumber, CommandId, PageId, RelationId, TupleId, Xid};
 use ultrasql_storage::buffer_pool::BufferPool;
 use ultrasql_storage::heap::{
     DeleteInt32PairScan, DeleteInt32PairStamp, DeleteOptions, HeapAccess, InsertOptions,
-    UpdateOptions,
+    UpdateInt32PairEdit, UpdateInt32PairScan, UpdateInt32PairStamp, UpdateOptions,
 };
 use ultrasql_wal::applier::dispatch_record;
 
@@ -398,15 +398,21 @@ fn crash_recovery_in_place_update_restores_post_image_and_undo_log() {
         let sink_ref: &dyn ultrasql_storage::wal_sink::WalSink = sink.as_ref();
         let updated = heap
             .update_int32_pair_inplace_undo(
-                rel(),
-                n_blocks,
-                &snap,
-                &oracle,
-                |_id, _val| true,
-                1,
-                DELTA,
-                Xid::new(2),
-                CommandId::FIRST,
+                UpdateInt32PairScan {
+                    rel: rel(),
+                    block_count: n_blocks,
+                    snapshot: &snap,
+                    oracle: &oracle,
+                    predicate: |_id, _val| true,
+                },
+                UpdateInt32PairEdit {
+                    target_col: 1,
+                    delta: DELTA,
+                },
+                UpdateInt32PairStamp {
+                    xid: Xid::new(2),
+                    command_id: CommandId::FIRST,
+                },
                 Some(sink_ref),
                 None,
             )

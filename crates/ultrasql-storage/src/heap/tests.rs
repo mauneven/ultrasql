@@ -94,6 +94,33 @@ fn del_opts(xmax: u64, cmax: u32) -> DeleteOptions<'static> {
     }
 }
 
+fn update_int32_scan<'a, O: ?Sized, P>(
+    rel: RelationId,
+    block_count: u32,
+    snapshot: &'a Snapshot,
+    oracle: &'a O,
+    predicate: P,
+) -> UpdateInt32PairScan<'a, O, P> {
+    UpdateInt32PairScan {
+        rel,
+        block_count,
+        snapshot,
+        oracle,
+        predicate,
+    }
+}
+
+fn update_int32_edit(target_col: u8, delta: i32) -> UpdateInt32PairEdit {
+    UpdateInt32PairEdit { target_col, delta }
+}
+
+fn update_int32_stamp(xid: u64) -> UpdateInt32PairStamp {
+    UpdateInt32PairStamp {
+        xid: Xid::new(xid),
+        command_id: CommandId::FIRST,
+    }
+}
+
 fn make_heap(capacity: usize) -> HeapAccess<MapLoader> {
     let pool = Arc::new(BufferPool::new(capacity, MapLoader::new()));
     HeapAccess::new(pool)
@@ -570,15 +597,15 @@ fn inplace_int32_update_conflicts_with_in_progress_writer() {
     );
     let updated = heap
         .update_int32_pair_inplace_undo(
-            rel(),
-            heap.block_count(rel()),
-            &writer_20,
-            &oracle,
-            |id, _val| id == 1,
-            1,
-            5,
-            Xid::new(20),
-            CommandId::FIRST,
+            update_int32_scan(
+                rel(),
+                heap.block_count(rel()),
+                &writer_20,
+                &oracle,
+                |id, _val| id == 1,
+            ),
+            update_int32_edit(1, 5),
+            update_int32_stamp(20),
             None,
             None,
         )
@@ -594,15 +621,15 @@ fn inplace_int32_update_conflicts_with_in_progress_writer() {
     );
     let err = heap
         .update_int32_pair_inplace_undo(
-            rel(),
-            heap.block_count(rel()),
-            &writer_30,
-            &oracle,
-            |id, _val| id == 1,
-            1,
-            7,
-            Xid::new(30),
-            CommandId::FIRST,
+            update_int32_scan(
+                rel(),
+                heap.block_count(rel()),
+                &writer_30,
+                &oracle,
+                |id, _val| id == 1,
+            ),
+            update_int32_edit(1, 7),
+            update_int32_stamp(30),
             None,
             None,
         )
@@ -636,15 +663,15 @@ fn inplace_int32_update_skips_unrelated_in_progress_writer() {
         std::iter::empty(),
     );
     heap.update_int32_pair_inplace_undo(
-        rel(),
-        heap.block_count(rel()),
-        &writer_20,
-        &oracle,
-        |id, _val| id == 1,
-        1,
-        5,
-        Xid::new(20),
-        CommandId::FIRST,
+        update_int32_scan(
+            rel(),
+            heap.block_count(rel()),
+            &writer_20,
+            &oracle,
+            |id, _val| id == 1,
+        ),
+        update_int32_edit(1, 5),
+        update_int32_stamp(20),
         None,
         None,
     )
@@ -659,15 +686,15 @@ fn inplace_int32_update_skips_unrelated_in_progress_writer() {
     );
     let updated = heap
         .update_int32_pair_inplace_undo(
-            rel(),
-            heap.block_count(rel()),
-            &writer_30,
-            &oracle,
-            |id, _val| id == 2,
-            1,
-            7,
-            Xid::new(30),
-            CommandId::FIRST,
+            update_int32_scan(
+                rel(),
+                heap.block_count(rel()),
+                &writer_30,
+                &oracle,
+                |id, _val| id == 2,
+            ),
+            update_int32_edit(1, 7),
+            update_int32_stamp(30),
             None,
             None,
         )
@@ -697,15 +724,15 @@ fn inplace_int32_update_records_compact_undo_batch() {
 
     let updated = heap
         .update_int32_pair_inplace_undo(
-            rel(),
-            heap.block_count(rel()),
-            &writer_20,
-            &oracle,
-            |_id, _val| true,
-            1,
-            5,
-            Xid::new(20),
-            CommandId::FIRST,
+            update_int32_scan(
+                rel(),
+                heap.block_count(rel()),
+                &writer_20,
+                &oracle,
+                |_id, _val| true,
+            ),
+            update_int32_edit(1, 5),
+            update_int32_stamp(20),
             None,
             None,
         )
@@ -746,15 +773,15 @@ fn invisible_inplace_int32_update_reads_compact_preimage() {
         std::iter::empty(),
     );
     heap.update_int32_pair_inplace_undo(
-        rel(),
-        heap.block_count(rel()),
-        &writer_20,
-        &oracle,
-        |id, _val| id == 1,
-        1,
-        5,
-        Xid::new(20),
-        CommandId::FIRST,
+        update_int32_scan(
+            rel(),
+            heap.block_count(rel()),
+            &writer_20,
+            &oracle,
+            |id, _val| id == 1,
+        ),
+        update_int32_edit(1, 5),
+        update_int32_stamp(20),
         None,
         None,
     )
@@ -794,15 +821,15 @@ fn rollback_inplace_int32_update_restores_compact_undo_batch() {
         std::iter::empty(),
     );
     heap.update_int32_pair_inplace_undo(
-        rel(),
-        heap.block_count(rel()),
-        &writer_20,
-        &oracle,
-        |id, _val| id == 1,
-        1,
-        5,
-        Xid::new(20),
-        CommandId::FIRST,
+        update_int32_scan(
+            rel(),
+            heap.block_count(rel()),
+            &writer_20,
+            &oracle,
+            |id, _val| id == 1,
+        ),
+        update_int32_edit(1, 5),
+        update_int32_stamp(20),
         None,
         None,
     )
@@ -836,15 +863,9 @@ fn parallel_no_wal_inplace_int32_update_records_undo_and_rolls_back() {
     );
     let updated = heap
         .update_int32_pair_inplace_undo_parallel_no_wal(
-            rel(),
-            2_048,
-            &writer_20,
-            &oracle,
-            |_id, _val| true,
-            1,
-            7,
-            Xid::new(20),
-            CommandId::FIRST,
+            update_int32_scan(rel(), 2_048, &writer_20, &oracle, |_id, _val| true),
+            update_int32_edit(1, 7),
+            update_int32_stamp(20),
             None,
         )
         .unwrap();
@@ -890,14 +911,14 @@ fn point_inplace_int32_update_rechecks_tid_predicate() {
 
     let updated = heap
         .update_int32_pair_tid_inplace_undo(
-            second,
-            &writer_20,
-            &oracle,
-            |id, _val| id == 2,
-            1,
-            7,
-            Xid::new(20),
-            CommandId::FIRST,
+            UpdateInt32PairTid {
+                tid: second,
+                snapshot: &writer_20,
+                oracle: &oracle,
+                predicate: |id, _val| id == 2,
+            },
+            update_int32_edit(1, 7),
+            update_int32_stamp(20),
             None,
             None,
         )
@@ -907,14 +928,14 @@ fn point_inplace_int32_update_rechecks_tid_predicate() {
 
     let skipped = heap
         .update_int32_pair_tid_inplace_undo(
-            first,
-            &writer_20,
-            &oracle,
-            |id, _val| id == 2,
-            1,
-            100,
-            Xid::new(20),
-            CommandId::FIRST,
+            UpdateInt32PairTid {
+                tid: first,
+                snapshot: &writer_20,
+                oracle: &oracle,
+                predicate: |id, _val| id == 2,
+            },
+            update_int32_edit(1, 100),
+            update_int32_stamp(20),
             None,
             None,
         )
@@ -1538,15 +1559,15 @@ mod wal_emission {
         );
         let updated = heap
             .update_int32_pair_inplace_undo(
-                rel(),
-                heap.block_count(rel()),
-                &snapshot,
-                &oracle,
-                |_id, _val| true,
-                1,
-                1,
-                Xid::new(20),
-                CommandId::FIRST,
+                update_int32_scan(
+                    rel(),
+                    heap.block_count(rel()),
+                    &snapshot,
+                    &oracle,
+                    |_id, _val| true,
+                ),
+                update_int32_edit(1, 1),
+                update_int32_stamp(20),
                 Some(sink.as_ref()),
                 None,
             )

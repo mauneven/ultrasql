@@ -23,7 +23,8 @@ use ultrasql_mvcc::Snapshot;
 use ultrasql_mvcc::status::test_support::MapOracle;
 use ultrasql_storage::buffer_pool::{BufferPool, PageLoader};
 use ultrasql_storage::heap::{
-    DeleteInt32PairScan, DeleteInt32PairStamp, HeapAccess, InsertOptions,
+    DeleteInt32PairScan, DeleteInt32PairStamp, HeapAccess, InsertOptions, UpdateInt32PairEdit,
+    UpdateInt32PairScan, UpdateInt32PairStamp,
 };
 use ultrasql_storage::page::Page;
 
@@ -76,6 +77,32 @@ fn pair_decode(bytes: &[u8]) -> (i32, i32) {
     let id = i32::from_le_bytes(bytes[1..5].try_into().expect("id slice"));
     let val = i32::from_le_bytes(bytes[5..9].try_into().expect("val slice"));
     (id, val)
+}
+
+fn update_int32_scan<'a, O: ?Sized, P>(
+    block_count: u32,
+    snapshot: &'a Snapshot,
+    oracle: &'a O,
+    predicate: P,
+) -> UpdateInt32PairScan<'a, O, P> {
+    UpdateInt32PairScan {
+        rel: rel(),
+        block_count,
+        snapshot,
+        oracle,
+        predicate,
+    }
+}
+
+fn update_int32_edit(target_col: u8, delta: i32) -> UpdateInt32PairEdit {
+    UpdateInt32PairEdit { target_col, delta }
+}
+
+fn update_int32_stamp(xid: u64) -> UpdateInt32PairStamp {
+    UpdateInt32PairStamp {
+        xid: Xid::new(xid),
+        command_id: CommandId::FIRST,
+    }
 }
 
 fn make_heap() -> HeapAccess<MapLoader> {
@@ -143,15 +170,9 @@ fn vacuum_undo_log_drops_only_below_threshold() {
             std::iter::empty(),
         );
         heap.update_int32_pair_inplace_undo(
-            rel(),
-            n_blocks,
-            &snap,
-            &oracle,
-            |_id, _val| true,
-            1,
-            1,
-            Xid::new(xid_raw),
-            CommandId::FIRST,
+            update_int32_scan(n_blocks, &snap, &oracle, |_id, _val| true),
+            update_int32_edit(1, 1),
+            update_int32_stamp(xid_raw),
             None,
             None,
         )
@@ -218,15 +239,9 @@ fn vacuum_undo_log_no_op_when_threshold_below_every_writer() {
         std::iter::empty(),
     );
     heap.update_int32_pair_inplace_undo(
-        rel(),
-        heap.block_count(rel()),
-        &snap,
-        &oracle,
-        |_, _| true,
-        0,
-        7,
-        Xid::new(20),
-        CommandId::FIRST,
+        update_int32_scan(heap.block_count(rel()), &snap, &oracle, |_, _| true),
+        update_int32_edit(0, 7),
+        update_int32_stamp(20),
         None,
         None,
     )
@@ -281,15 +296,9 @@ fn long_snapshot_survives_update_delete_and_vacuum() {
     );
     let updated = heap
         .update_int32_pair_inplace_undo(
-            rel(),
-            block_count,
-            &writer_update,
-            &oracle,
-            |id, _val| id % 2 == 0,
-            1,
-            1000,
-            Xid::new(2),
-            CommandId::FIRST,
+            update_int32_scan(block_count, &writer_update, &oracle, |id, _val| id % 2 == 0),
+            update_int32_edit(1, 1000),
+            update_int32_stamp(2),
             None,
             None,
         )

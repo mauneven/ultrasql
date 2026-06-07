@@ -491,6 +491,9 @@ mod wal_emit;
 mod walker;
 
 pub use delete::{DeleteInt32PairScan, DeleteInt32PairStamp};
+pub use update_inplace::{
+    UpdateInt32PairEdit, UpdateInt32PairScan, UpdateInt32PairStamp, UpdateInt32PairTid,
+};
 
 impl<L: PageLoader> HeapAccess<L> {
     /// Build a new heap access bound to `pool`.

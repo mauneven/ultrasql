@@ -39,7 +39,10 @@ use std::sync::Arc;
 use ultrasql_core::{CommandId, DataType, Field, RelationId, Schema, TupleId, Xid};
 use ultrasql_mvcc::Snapshot;
 use ultrasql_storage::PageLoader;
-use ultrasql_storage::heap::{HeapAccess, HeapError};
+use ultrasql_storage::heap::{
+    HeapAccess, HeapError, UpdateInt32PairEdit, UpdateInt32PairScan, UpdateInt32PairStamp,
+    UpdateInt32PairTid,
+};
 use ultrasql_storage::vm::VisibilityMap;
 use ultrasql_txn::TransactionManager;
 use ultrasql_vec::Batch;
@@ -299,14 +302,17 @@ impl<L: PageLoader + Send + Sync + std::fmt::Debug + 'static> Operator for Fused
                     }
                 }
                 let update_result = self.heap.update_int32_pair_tid_inplace_undo(
-                    *tid,
-                    &update_snapshot,
-                    &*self.oracle,
-                    predicate_fn,
-                    target_col,
-                    delta,
-                    self.xid,
-                    self.command_id,
+                    UpdateInt32PairTid {
+                        tid: *tid,
+                        snapshot: &update_snapshot,
+                        oracle: &*self.oracle,
+                        predicate: predicate_fn,
+                    },
+                    UpdateInt32PairEdit { target_col, delta },
+                    UpdateInt32PairStamp {
+                        xid: self.xid,
+                        command_id: self.command_id,
+                    },
                     wal_sink,
                     self.vm.as_deref(),
                 );
@@ -320,14 +326,17 @@ impl<L: PageLoader + Send + Sync + std::fmt::Debug + 'static> Operator for Fused
                         update_snapshot = self.oracle.statement_snapshot(self.xid, self.command_id);
                         self.heap
                             .update_int32_pair_tid_inplace_undo(
-                                *tid,
-                                &update_snapshot,
-                                &*self.oracle,
-                                predicate_fn,
-                                target_col,
-                                delta,
-                                self.xid,
-                                self.command_id,
+                                UpdateInt32PairTid {
+                                    tid: *tid,
+                                    snapshot: &update_snapshot,
+                                    oracle: &*self.oracle,
+                                    predicate: predicate_fn,
+                                },
+                                UpdateInt32PairEdit { target_col, delta },
+                                UpdateInt32PairStamp {
+                                    xid: self.xid,
+                                    command_id: self.command_id,
+                                },
                                 wal_sink,
                                 self.vm.as_deref(),
                             )
@@ -338,30 +347,30 @@ impl<L: PageLoader + Send + Sync + std::fmt::Debug + 'static> Operator for Fused
             }
             total
         } else {
+            let scan = UpdateInt32PairScan {
+                rel: self.relation,
+                block_count: self.block_count,
+                snapshot: &self.snapshot,
+                oracle: &*self.oracle,
+                predicate: predicate_fn,
+            };
+            let edit = UpdateInt32PairEdit { target_col, delta };
+            let stamp = UpdateInt32PairStamp {
+                xid: self.xid,
+                command_id: self.command_id,
+            };
             if wal_sink.is_none() {
                 self.heap.update_int32_pair_inplace_undo_parallel_no_wal(
-                    self.relation,
-                    self.block_count,
-                    &self.snapshot,
-                    &*self.oracle,
-                    predicate_fn,
-                    target_col,
-                    delta,
-                    self.xid,
-                    self.command_id,
+                    scan,
+                    edit,
+                    stamp,
                     self.vm.as_deref(),
                 )
             } else {
                 self.heap.update_int32_pair_inplace_undo(
-                    self.relation,
-                    self.block_count,
-                    &self.snapshot,
-                    &*self.oracle,
-                    predicate_fn,
-                    target_col,
-                    delta,
-                    self.xid,
-                    self.command_id,
+                    scan,
+                    edit,
+                    stamp,
                     wal_sink,
                     self.vm.as_deref(),
                 )
