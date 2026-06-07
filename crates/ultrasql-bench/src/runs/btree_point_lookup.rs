@@ -40,7 +40,10 @@ mod tests {
     fn run_produces_two_samples_with_positive_throughput() {
         let ctx = test_ctx();
         let result = run(&ctx);
-        assert_eq!(result.samples.len(), ctx.iterations as usize);
+        assert_eq!(
+            result.samples.len(),
+            usize::try_from(ctx.iterations).unwrap_or(0)
+        );
         assert!(result.throughput_per_sec > 0.0);
     }
 }
