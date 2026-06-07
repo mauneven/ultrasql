@@ -72,6 +72,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use clap::Parser;
+use num_traits::ToPrimitive;
 use serde::Deserialize;
 use serde_json::Value;
 
@@ -365,7 +366,11 @@ fn render_bar(value: f64, max: f64) -> String {
         return " ".repeat(WIDTH);
     }
     let ratio = (value / max).clamp(0.0, 1.0);
-    let cells = (ratio * WIDTH as f64).round() as usize;
+    let width = WIDTH.to_f64().expect("bar width fits f64");
+    let cells = (ratio * width)
+        .round()
+        .to_usize()
+        .expect("bar cell count fits usize");
     let cells = cells.clamp(1, WIDTH);
     let mut out = String::with_capacity(WIDTH);
     for _ in 0..cells {
