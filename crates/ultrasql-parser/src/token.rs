@@ -452,9 +452,66 @@ impl TokenKind {
     /// Whether this kind corresponds to a SQL keyword.
     #[must_use]
     pub const fn is_keyword(self) -> bool {
-        // Keyword variants begin at KwAbort. We exploit the structural
-        // ordering to make this a single integer comparison.
-        (self as u32) >= (Self::KwAbort as u32)
+        !matches!(
+            self,
+            Self::Eof
+                | Self::Integer
+                | Self::Float
+                | Self::String
+                | Self::EscapedString
+                | Self::DollarString
+                | Self::Identifier
+                | Self::QuotedIdentifier
+                | Self::Parameter
+                | Self::LParen
+                | Self::RParen
+                | Self::LBracket
+                | Self::RBracket
+                | Self::Comma
+                | Self::Semicolon
+                | Self::Dot
+                | Self::ColonColon
+                | Self::Colon
+                | Self::Star
+                | Self::QuestionMark
+                | Self::Plus
+                | Self::Minus
+                | Self::Slash
+                | Self::Percent
+                | Self::Caret
+                | Self::Eq
+                | Self::NotEq
+                | Self::Lt
+                | Self::LtEq
+                | Self::Gt
+                | Self::GtEq
+                | Self::VectorL2Distance
+                | Self::VectorNegativeInnerProduct
+                | Self::VectorCosineDistance
+                | Self::VectorL1Distance
+                | Self::Concat
+                | Self::Arrow
+                | Self::ArrowDouble
+                | Self::HashArrow
+                | Self::HashArrowDouble
+                | Self::AtArrow
+                | Self::AtAt
+                | Self::ArrowAt
+                | Self::Overlap
+                | Self::Tilde
+                | Self::NotTilde
+                | Self::TildeStar
+                | Self::NotTildeStar
+                | Self::Ampersand
+                | Self::Pipe
+                | Self::Hash
+                | Self::ShiftLeft
+                | Self::ShiftRight
+                | Self::ShiftLeftEq
+                | Self::ShiftRightEq
+                | Self::QuestionPipe
+                | Self::QuestionAmpersand
+        )
     }
 
     /// Whether this kind is a literal — string or number.

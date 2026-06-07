@@ -21,6 +21,10 @@ mod binary_ops;
 mod expr;
 mod postfix;
 
+fn max_parse_depth_usize() -> usize {
+    usize::try_from(MAX_PARSE_DEPTH).expect("MAX_PARSE_DEPTH fits usize")
+}
+
 /// Parse a full statement and return it, panicking on error.
 pub(super) fn parse(src: &str) -> Statement {
     Parser::new(src)
@@ -312,7 +316,7 @@ fn unsupported_statement_rejected() {
 /// that comfortably exceeds it.
 #[test]
 fn deeply_nested_parens_rejected_without_overflow() {
-    let depth = (MAX_PARSE_DEPTH as usize) + 64;
+    let depth = max_parse_depth_usize() + 64;
     let mut sql = String::with_capacity(depth * 2 + 16);
     sql.push_str("SELECT ");
     for _ in 0..depth {
@@ -334,7 +338,7 @@ fn deeply_nested_parens_rejected_without_overflow() {
 /// reasonable ones.
 #[test]
 fn parens_below_limit_succeed() {
-    let depth = (MAX_PARSE_DEPTH as usize) / 2;
+    let depth = max_parse_depth_usize() / 2;
     let mut sql = String::with_capacity(depth * 2 + 16);
     sql.push_str("SELECT ");
     for _ in 0..depth {
