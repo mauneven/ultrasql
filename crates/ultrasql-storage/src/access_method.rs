@@ -244,6 +244,18 @@ enum HashPageRef {
     Overflow(usize),
 }
 
+#[derive(Clone, Copy)]
+struct HashWalRequest<'a> {
+    op: HashOpKind,
+    index_rel: RelationId,
+    page_ref: HashPageRef,
+    key_hash: u64,
+    key: &'a [u8],
+    tid: TupleId,
+    xid: Xid,
+    wal: Option<&'a dyn WalSink>,
+}
+
 impl HashStorage {
     fn new(num_buckets: usize) -> Self {
         Self {
@@ -333,16 +345,16 @@ impl HashIndex {
             let next = {
                 let page = storage.page_mut(current);
                 if page.entries.len() < self.page_capacity {
-                    self.emit_hash_wal(
-                        HashOpKind::Insert,
+                    self.emit_hash_wal(HashWalRequest {
+                        op: HashOpKind::Insert,
                         index_rel,
-                        current,
+                        page_ref: current,
                         key_hash,
                         key,
                         tid,
                         xid,
                         wal,
-                    )?;
+                    })?;
                     page.entries.push((key.to_vec(), tid));
                     return Ok(());
                 }
@@ -354,26 +366,26 @@ impl HashIndex {
             }
             let overflow_idx = storage.overflow_pages.len();
             let overflow_ref = HashPageRef::Overflow(overflow_idx);
-            self.emit_hash_wal(
-                HashOpKind::OverflowLink,
+            self.emit_hash_wal(HashWalRequest {
+                op: HashOpKind::OverflowLink,
                 index_rel,
-                current,
+                page_ref: current,
                 key_hash,
                 key,
                 tid,
                 xid,
                 wal,
-            )?;
-            self.emit_hash_wal(
-                HashOpKind::Insert,
+            })?;
+            self.emit_hash_wal(HashWalRequest {
+                op: HashOpKind::Insert,
                 index_rel,
-                overflow_ref,
+                page_ref: overflow_ref,
                 key_hash,
                 key,
                 tid,
                 xid,
                 wal,
-            )?;
+            })?;
             storage.overflow_pages.push(HashPage::default());
             storage.page_mut(current).next_overflow = Some(overflow_idx);
             storage.overflow_pages[overflow_idx]
@@ -403,8 +415,8 @@ impl HashIndex {
                 .iter()
                 .position(|(k, t)| k.as_slice() == key && *t == tid)
             {
-                self.emit_hash_wal(
-                    HashOpKind::Delete,
+                self.emit_hash_wal(HashWalRequest {
+                    op: HashOpKind::Delete,
                     index_rel,
                     page_ref,
                     key_hash,
@@ -412,7 +424,7 @@ impl HashIndex {
                     tid,
                     xid,
                     wal,
-                )?;
+                })?;
                 page.entries.remove(pos);
                 return Ok(());
             }
@@ -421,37 +433,26 @@ impl HashIndex {
         Err(AccessMethodError::NotFound)
     }
 
-    #[allow(clippy::too_many_arguments)]
-    fn emit_hash_wal(
-        &self,
-        op: HashOpKind,
-        index_rel: RelationId,
-        page_ref: HashPageRef,
-        key_hash: u64,
-        key: &[u8],
-        tid: TupleId,
-        xid: Xid,
-        wal: Option<&dyn WalSink>,
-    ) -> Result<(), AccessMethodError> {
-        let Some(sink) = wal else {
+    fn emit_hash_wal(&self, request: HashWalRequest<'_>) -> Result<(), AccessMethodError> {
+        let Some(sink) = request.wal else {
             return Ok(());
         };
-        let page = self.hash_page_id(index_rel, page_ref)?;
+        let page = self.hash_page_id(request.index_rel, request.page_ref)?;
         let payload = HashOpPayload {
-            op,
-            index_rel,
-            bucket: u32::try_from(self.bucket_index(key)).map_err(|_| {
+            op: request.op,
+            index_rel: request.index_rel,
+            bucket: u32::try_from(self.bucket_index(request.key)).map_err(|_| {
                 AccessMethodError::Storage("hash bucket does not fit in u32".to_owned())
             })?,
             page,
-            key_hash,
-            key_bytes: key.to_vec(),
-            value_bytes: Self::tuple_id_bytes(tid),
+            key_hash: request.key_hash,
+            key_bytes: request.key.to_vec(),
+            value_bytes: Self::tuple_id_bytes(request.tid),
         }
         .encode()
         .map_err(|e| AccessMethodError::Storage(format!("hash WAL payload encode: {e}")))?;
-        let prev_lsn = sink.last_lsn_for(xid);
-        let record = WalRecord::new(RecordType::HashOp, xid, prev_lsn, 0, payload)
+        let prev_lsn = sink.last_lsn_for(request.xid);
+        let record = WalRecord::new(RecordType::HashOp, request.xid, prev_lsn, 0, payload)
             .map_err(|e| AccessMethodError::Storage(format!("hash WAL record encode: {e}")))?;
         sink.append(record)
             .map(|_| ())
