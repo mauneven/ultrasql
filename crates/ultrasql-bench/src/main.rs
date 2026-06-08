@@ -7,6 +7,7 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 use clap::{Args, Parser, Subcommand, ValueEnum};
+#[cfg(any(test, feature = "sql-bench"))]
 use num_traits::ToPrimitive;
 use serde::Serialize;
 use ultrasql_bench::ai_gauntlet::{

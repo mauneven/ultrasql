@@ -63,7 +63,7 @@ const CLOG_XIDS_PER_PAGE_USIZE: usize = CLOG_DATA_BYTES * CLOG_XIDS_PER_BYTE;
 /// Number of XID statuses that fit on a single CLOG page (2 bits each).
 ///
 /// The public type is `u64` because it divides [`Xid::raw`]. Keep this
-/// mirrored with [`CLOG_XIDS_PER_PAGE_USIZE`] until stable Rust permits
+/// mirrored with `CLOG_XIDS_PER_PAGE_USIZE` until stable Rust permits
 /// checked `usize` to `u64` conversion in constants.
 pub const CLOG_XIDS_PER_PAGE: u64 = 32_672;
 
