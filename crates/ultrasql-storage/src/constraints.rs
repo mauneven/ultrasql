@@ -363,13 +363,9 @@ impl ConstraintChecker {
         let mut inserted_keys: Vec<(usize, Vec<Value>)> = Vec::new();
         for (i, c) in self.constraints.iter().enumerate() {
             if let Constraint::Unique { columns } | Constraint::PrimaryKey { columns } = c {
-                let key: Vec<Value> = columns
-                    .iter()
-                    .map(|&col| row.get(col).cloned().unwrap_or(Value::Null))
-                    .collect();
-                if key.iter().any(|v| v == &Value::Null) {
-                    continue; // NULLs never participate in uniqueness
-                }
+                let Some(key) = Self::unique_key_for(columns, row) else {
+                    continue;
+                };
                 if let Some(set_lock) = &self.unique_sets[i] {
                     let inserted = set_lock.lock().insert(key.clone());
                     if !inserted {
@@ -391,9 +387,66 @@ impl ConstraintChecker {
         }
     }
 
+    fn restore_unique_keys(&self, removed_keys: Vec<(usize, Vec<Value>)>) {
+        for (i, key) in removed_keys.into_iter().rev() {
+            if let Some(set_lock) = &self.unique_sets[i] {
+                set_lock.lock().insert(key);
+            }
+        }
+    }
+
+    fn unique_key_for(columns: &[usize], row: &[Value]) -> Option<Vec<Value>> {
+        let key: Vec<Value> = columns
+            .iter()
+            .map(|&col| row.get(col).cloned().unwrap_or(Value::Null))
+            .collect();
+        if key.iter().any(|v| v == &Value::Null) {
+            None
+        } else {
+            Some(key)
+        }
+    }
+
     /// Check all constraints for an UPDATE (new row after-image).
-    pub fn check_update(&self, _old: &[Value], new: &[Value]) -> Result<(), ConstraintError> {
-        self.check_insert(new)
+    pub fn check_update(&self, old: &[Value], new: &[Value]) -> Result<(), ConstraintError> {
+        self.check_insert_non_unique_constraints(new)?;
+        self.update_unique_keys(old, new)
+    }
+
+    fn update_unique_keys(&self, old: &[Value], new: &[Value]) -> Result<(), ConstraintError> {
+        let mut removed_keys: Vec<(usize, Vec<Value>)> = Vec::new();
+        let mut inserted_keys: Vec<(usize, Vec<Value>)> = Vec::new();
+
+        for (i, c) in self.constraints.iter().enumerate() {
+            if let Constraint::Unique { columns } | Constraint::PrimaryKey { columns } = c {
+                let old_key = Self::unique_key_for(columns, old);
+                let new_key = Self::unique_key_for(columns, new);
+                if old_key == new_key {
+                    continue;
+                }
+
+                if let Some(old_key) = old_key
+                    && let Some(set_lock) = &self.unique_sets[i]
+                    && set_lock.lock().remove(&old_key)
+                {
+                    removed_keys.push((i, old_key));
+                }
+
+                if let Some(new_key) = new_key
+                    && let Some(set_lock) = &self.unique_sets[i]
+                {
+                    let inserted = set_lock.lock().insert(new_key.clone());
+                    if !inserted {
+                        self.rollback_unique_keys(inserted_keys);
+                        self.restore_unique_keys(removed_keys);
+                        return Err(ConstraintError::UniqueViolation);
+                    }
+                    inserted_keys.push((i, new_key));
+                }
+            }
+        }
+
+        Ok(())
     }
 
     /// Check deferred constraints for a newly inserted row.
@@ -686,6 +739,37 @@ mod tests {
             c.check_insert(&[Value::Int64(7), Value::Bool(true)])
                 .is_ok()
         );
+    }
+
+    #[test]
+    fn unique_update_allows_unchanged_key() {
+        let c = no_fk(vec![Constraint::Unique { columns: vec![0] }]);
+        c.check_insert(&[Value::Int64(7), Value::Text("old".to_owned())])
+            .unwrap();
+
+        assert!(
+            c.check_update(
+                &[Value::Int64(7), Value::Text("old".to_owned())],
+                &[Value::Int64(7), Value::Text("new".to_owned())],
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn unique_update_releases_old_key_and_reserves_new_key() {
+        let c = no_fk(vec![Constraint::Unique { columns: vec![0] }]);
+        c.check_insert(&[Value::Int64(7)]).unwrap();
+
+        assert!(
+            c.check_update(&[Value::Int64(7)], &[Value::Int64(8)])
+                .is_ok()
+        );
+        assert!(c.check_insert(&[Value::Int64(7)]).is_ok());
+        let err = c
+            .check_insert(&[Value::Int64(8)])
+            .expect_err("new key must be reserved");
+        assert!(matches!(err, ConstraintError::UniqueViolation));
     }
 
     // --- PrimaryKey ---
