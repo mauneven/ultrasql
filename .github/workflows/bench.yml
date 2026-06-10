@@ -140,7 +140,8 @@ jobs:
         shell: bash
         run: |
           brew update
-          brew install duckdb sqlite postgresql@14
+          brew install duckdb sqlite postgresql@14 clickhouse
+          python3 -m pip install clickhouse-driver
           echo "$(brew --prefix postgresql@14)/bin" >> "$GITHUB_PATH"
       - name: start PostgreSQL
         shell: bash
@@ -169,7 +170,7 @@ jobs:
           SCALE_SWEEP_ROWS: "10000 100000"
           ULTRASQL_RELEASE_VERSION: v${{ steps.package-version.outputs.version }}
         run: |
-          benchmarks/run_scale_sweep.sh quick
+          CH_BIN="$(command -v clickhouse)" benchmarks/run_scale_sweep.sh quick
       - name: upload scale sweep artifacts
         if: always()
         uses: actions/upload-artifact@v7

@@ -30,6 +30,7 @@ fn scale_sweep_script_uses_external_release_artifact() {
     assert!(script.contains("10k-row INSERT chunks"));
     assert!(script.contains("benchmarks/scripts/run_clickhouse_writes.sh"));
     assert!(script.contains("ClickHouse"));
+    assert!(script.contains("benchmarks/scripts/check_supremacy.py \"$RAW\""));
     assert!(script.contains("mixed-correctness"));
     assert!(script.contains("mixed_correctness_100k"));
     assert!(script.contains("run_competitor_script"));
@@ -54,6 +55,15 @@ fn release_sweep_workflow_pins_manifest_release_version() {
         !workflow.contains("run: benchmarks/run_scale_sweep.sh quick"),
         "release sweep must not install a mutable latest release"
     );
+}
+
+#[test]
+fn release_sweep_workflow_enables_clickhouse_comparison() {
+    let workflow = repo_file(".github/workflows/bench.yml");
+
+    assert!(workflow.contains("brew install duckdb sqlite postgresql@14 clickhouse"));
+    assert!(workflow.contains("python3 -m pip install clickhouse-driver"));
+    assert!(workflow.contains("CH_BIN=\"$(command -v clickhouse)\""));
 }
 
 #[test]
@@ -105,6 +115,7 @@ fn scale_sweep_renders_clickhouse_as_first_class_competitor() {
     assert!(readme.contains("ClickHouse"));
     assert!(benchmarks.contains("PostgreSQL, and ClickHouse clients"));
     assert!(benchmarks.contains("benchmarks/scripts/run_clickhouse_writes.sh"));
+    assert!(benchmarks.contains("benchmarks/scripts/check_supremacy.py"));
 }
 
 #[test]

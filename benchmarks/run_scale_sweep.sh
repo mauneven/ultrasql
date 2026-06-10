@@ -434,6 +434,8 @@ python3 benchmarks/scripts/render_scale_sweep.py \
     --output-md "$OUT/scale_sweep.md" \
     --output-json "$OUT/scale_sweep.json"
 
+python3 benchmarks/scripts/check_supremacy.py "$RAW"
+
 python3 - "$OUT/scale_sweep_manifest.json" "$mode" "$ITERS" "$WARMUP" "$ROWS" "$ULTRASQL_VERSION_TEXT" "$install_source" "${SCALE_SWEEP_APPEND:-0}" <<'PY'
 import json
 import sys
