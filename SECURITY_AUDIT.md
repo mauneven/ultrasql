@@ -252,9 +252,9 @@ test fixtures).
 
 ---
 
-## 3a. Side-finding — flaky heap concurrency test (Info, not security)
+## 3a. Side-finding — heap concurrency regression coverage (Info)
 
-**Affected:** `crates/ultrasql-storage/src/heap.rs:753` test
+**Affected coverage:** `crates/ultrasql-storage/src/heap/tests.rs` test
 `concurrent_inserts_from_two_threads_preserve_every_tuple`
 
 **Audit observation:** While running per-crate tests in isolation,
@@ -268,9 +268,16 @@ the heap's concurrent-insert path. The race is in `Heap::insert`
 assigning the same `TupleId` to two concurrent inserts under
 contention on the same page. Surfaced by accident.
 
-**Status:** Reproduces at HEAD on the v0.5 heap commit `4675f4b` even
+**Historical status:** Reproduced at HEAD on the v0.5 heap commit `4675f4b` even
 before any of this audit's changes. File against the heap subsystem as
 a follow-up; not in scope for this audit.
+
+**2026-06-10 refresh:** No longer reproduces at current `main`. Evidence:
+`cargo test -p ultrasql-storage concurrent_inserts_from_two_threads_preserve_every_tuple -- --nocapture`
+passes, and a 100-run isolated stress loop of the same test also passes.
+Keep the regression test active; reopen the heap finding only if the
+duplicate-`TupleId` failure reappears with a current commit hash and
+reproduction command.
 
 ---
 
