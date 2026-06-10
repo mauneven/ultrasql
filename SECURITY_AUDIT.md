@@ -1,7 +1,7 @@
 # SECURITY_AUDIT.md — UltraSQL v0.5 adversarial pass
 
 **Date:** 2026-05-12
-**Last dependency refresh:** 2026-05-24
+**Last dependency refresh:** 2026-06-10
 **Auditor:** automated adversarial sweep, owner-directed
 **Scope:** workspace at `crates/`, dependencies in `Cargo.toml`/`Cargo.lock`
 **Baseline:** 420 tests green pre-audit; 438 tests green post-audit (18 new
@@ -15,26 +15,35 @@ the durability path (WAL recovery, segment files) and the SQL frontend
 
 ---
 
-## 0. 2026-05-24 dependency-audit refresh
+## 0. 2026-06-10 dependency-audit refresh
 
 Scope: dependency advisory gate and CI/release enforcement only. This
 refresh did not re-run the full adversarial source review from
 2026-05-12.
 
+Dependency changes:
+
+- Apache Arrow and Parquet workspace dependencies moved from `58.3.0`
+  to `59.0.0`.
+- `thrift 0.17.0`, `integer-encoding 3.0.4`, and
+  `ordered-float 2.10.1` left the dependency graph through the Parquet
+  update.
+- `paste 1.0.15` remains in the dependency graph through
+  `parquet 59.0.0`.
+
 Commands run locally:
 
 - `cargo audit --deny yanked` — advisory DB fetched from
-  `https://github.com/RustSec/advisory-db.git`, 1098 advisories
-  loaded, 436 crate dependencies scanned, exit 0.
+  `https://github.com/RustSec/advisory-db.git`, 1124 advisories
+  loaded, 446 crate dependencies scanned, exit 0.
 - `cargo audit --deny warnings` — exit 1 because `paste 1.0.15` is
   flagged unmaintained by `RUSTSEC-2024-0436`; dependency path is
-  `paste -> parquet 58.3.0 -> ultrasql-*`.
+  `paste -> parquet 59.0.0 -> ultrasql-*`.
 - `cargo deny check advisories` — exit 0 (`advisories ok`).
 - `cargo tree -i paste --all-features` — confirms `paste` only enters
-  through `parquet 58.3.0`.
-- `cargo search parquet --limit 5` — crates.io reports `parquet =
-  "58.3.0"` as the current Apache Parquet crate, so there is no newer
-  upstream release to take for this warning.
+  through `parquet 59.0.0`.
+- `cargo tree -i thrift --all-features` — exit 101 because `thrift` is
+  no longer present in the workspace dependency graph.
 
 CI changes:
 
@@ -45,7 +54,7 @@ CI changes:
 
 Gate policy: fail on known vulnerabilities and yanked crates. Allow the
 current unmaintained warning for transitive `paste` while it is pulled
-by the latest `parquet` release; keep it visible in audit output and
+by the supported `parquet` release; keep it visible in audit output and
 re-check when Arrow/Parquet publishes an alternate path.
 
 ---
@@ -372,18 +381,19 @@ join chains in the current binder.
 
 ## 5. Dependency advisories
 
-`cargo audit --deny yanked` (advisory DB fetched 2026-05-24) reports:
+`cargo audit --deny yanked` (advisory DB fetched 2026-06-10) reports:
 
-- **Crates scanned:** 436
+- **Crates scanned:** 446
 - **Security vulnerabilities:** 0
 - **Yanked crates:** 0
 - **Allowed warnings:** 1 (`RUSTSEC-2024-0436`, unmaintained
-  `paste 1.0.15`, transitive through `parquet 58.3.0`)
+  `paste 1.0.15`, transitive through `parquet 59.0.0`)
 
 `cargo audit --deny warnings` intentionally is not the CI policy while
-the latest Apache Parquet crate still depends on `paste`; it exits 1 on
-the unmaintained warning but does not report a vulnerability. `cargo
-deny check advisories` reports `advisories ok`.
+the supported Apache Parquet crate still depends on `paste`; it exits 1
+on the unmaintained warning but does not report a vulnerability.
+`cargo deny check advisories` reports `advisories ok`. `thrift` is no
+longer present after the Arrow/Parquet 59.0.0 refresh.
 
 ---
 
