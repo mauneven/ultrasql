@@ -47,7 +47,6 @@ use anyhow::{Context, Result};
 use arrow_array::{Int64Array, RecordBatch, StringArray};
 use arrow_schema::{DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema};
 use clap::{Parser, ValueEnum};
-use num_traits::ToPrimitive;
 use parquet::arrow::{ArrowWriter, arrow_reader::ParquetRecordBatchReaderBuilder};
 use sha2::{Digest, Sha256};
 use tokio_postgres::NoTls;
@@ -947,25 +946,49 @@ fn required_csv_path(args: &Args) -> Result<&PathBuf> {
 }
 
 fn percentile_nearest_rank(sorted_values: &[f64], percentile: f64) -> f64 {
-    let sample_count = sorted_values.len().to_f64().unwrap_or(f64::INFINITY);
-    let rank = (sample_count * percentile)
-        .ceil()
-        .to_usize()
-        .unwrap_or(usize::MAX);
-    let idx = rank.saturating_sub(1).min(sorted_values.len() - 1);
+    let Some(last_idx) = sorted_values.len().checked_sub(1) else {
+        return f64::NAN;
+    };
+    let rank_cutoff = usize_to_f64_lossy(sorted_values.len()) * percentile.clamp(0.0, 1.0);
+    let mut rank = 1_usize;
+    while rank < sorted_values.len() && usize_to_f64_lossy(rank) < rank_cutoff {
+        rank += 1;
+    }
+    let idx = rank.saturating_sub(1).min(last_idx);
     sorted_values[idx]
 }
 
 fn usize_to_f64(value: usize, context: &str) -> Result<f64> {
-    value
-        .to_f64()
-        .with_context(|| format!("{context} does not fit f64"))
+    let converted = usize_to_f64_lossy(value);
+    anyhow::ensure!(converted.is_finite(), "{context} does not fit f64");
+    Ok(converted)
 }
 
 fn u64_to_f64(value: u64, context: &str) -> Result<f64> {
-    value
-        .to_f64()
-        .with_context(|| format!("{context} does not fit f64"))
+    let converted = u64_to_f64_lossy(value);
+    anyhow::ensure!(converted.is_finite(), "{context} does not fit f64");
+    Ok(converted)
+}
+
+fn usize_to_u64(value: usize) -> u64 {
+    let bytes = value.to_le_bytes();
+    let mut padded = [0_u8; 8];
+    padded[..bytes.len()].copy_from_slice(&bytes);
+    u64::from_le_bytes(padded)
+}
+
+fn usize_to_f64_lossy(value: usize) -> f64 {
+    u64_to_f64_lossy(usize_to_u64(value))
+}
+
+fn u64_to_f64_lossy(value: u64) -> f64 {
+    let high = u32_from_u64_saturating(value >> 32);
+    let low = u32_from_u64_saturating(value & u64::from(u32::MAX));
+    f64::from(high) * 4_294_967_296.0 + f64::from(low)
+}
+
+fn u32_from_u64_saturating(value: u64) -> u32 {
+    u32::try_from(value).unwrap_or(u32::MAX)
 }
 
 fn sql_string(path: &Path) -> String {
@@ -3050,15 +3073,22 @@ async fn run_shared_window_row_number(
 
 const VECTOR_PRELOAD_CHUNK_ROWS: usize = 1_000;
 
+fn usize_to_u128(value: usize) -> u128 {
+    let bytes = value.to_le_bytes();
+    let mut padded = [0_u8; 16];
+    padded[..bytes.len()].copy_from_slice(&bytes);
+    u128::from_le_bytes(padded)
+}
+
 fn vector_component(row_id: usize, dim: usize) -> i32 {
-    let row = u128::try_from(row_id).expect("vector row id fits u128");
-    let dim = u128::try_from(dim).expect("vector dimension fits u128");
+    let row = usize_to_u128(row_id);
+    let dim = usize_to_u128(dim);
     let value = ((row * 31) + (dim * 17) + ((row % 7) * 13)) % 101;
     i32::try_from(value).unwrap_or(0) - 50
 }
 
 fn vector_probe_component(dim: usize) -> i32 {
-    let dim = u128::try_from(dim).expect("vector dimension fits u128");
+    let dim = usize_to_u128(dim);
     let value = ((dim * 7) + 3) % 23;
     i32::try_from(value).unwrap_or(0) - 11
 }
@@ -3549,18 +3579,17 @@ impl SplitMix64 {
         // baselines' `random.random()` distribution closely enough that
         // the per-op mix matches across engines.
         let bits = self.next_u64() >> 11;
-        let scale_denominator = (1_u64 << 53)
-            .to_f64()
-            .expect("splitmix scale denominator fits f64 exactly");
-        let bits_f64 = bits.to_f64().expect("splitmix high bits fit f64 exactly");
-        let scale = 1.0_f64 / scale_denominator;
-        bits_f64 * scale
+        splitmix_high_bits_to_f64(bits) * (1.0_f64 / 9_007_199_254_740_992.0)
     }
 
     fn next_i32(&mut self) -> i32 {
         let bytes = self.next_u64().to_le_bytes();
         i32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]])
     }
+}
+
+fn splitmix_high_bits_to_f64(bits: u64) -> f64 {
+    u64_to_f64_lossy(bits)
 }
 
 #[cfg(test)]
@@ -3584,6 +3613,39 @@ mod tests {
             Workload::VectorTopK.registry_id_with_shape(10_000, 8, 10),
             "vector_topk_exact_10k_8d_k10"
         );
+    }
+
+    #[test]
+    fn vector_component_converts_usize_bounds_without_panics() {
+        assert_eq!(usize_to_u128(0), 0);
+        assert_eq!(usize_to_u128(1), 1);
+
+        #[cfg(target_pointer_width = "64")]
+        assert_eq!(usize_to_u128(usize::MAX), u128::from(u64::MAX));
+
+        #[cfg(target_pointer_width = "32")]
+        assert_eq!(usize_to_u128(usize::MAX), u128::from(u32::MAX));
+
+        let component = vector_component(usize::MAX, usize::MAX);
+        assert!((-50..=50).contains(&component));
+    }
+
+    #[test]
+    fn splitmix_high_bits_convert_exactly_with_no_panic_path() {
+        assert_eq!(splitmix_high_bits_to_f64(0), 0.0);
+        assert_eq!(splitmix_high_bits_to_f64(1), 1.0);
+        assert_eq!(splitmix_high_bits_to_f64(1_u64 << 32), 4_294_967_296.0);
+        assert_eq!(
+            splitmix_high_bits_to_f64((1_u64 << 53) - 1),
+            9_007_199_254_740_991.0
+        );
+
+        let mut rng = SplitMix64::new(0);
+        for _ in 0..1_000 {
+            let value = rng.next_unit_f64();
+            assert!(value.is_finite());
+            assert!((0.0..1.0).contains(&value));
+        }
     }
 
     #[test]

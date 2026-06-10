@@ -68,7 +68,6 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use clap::Parser;
-use num_traits::ToPrimitive;
 use serde::Deserialize;
 use serde_json::Value;
 
@@ -358,15 +357,18 @@ fn render_workload_md(workload: &str, results: &[EngineResult]) -> String {
 /// empty bar; the longest bar is 48 cells.
 fn render_bar(value: f64, max: f64) -> String {
     const WIDTH: usize = 48;
+    const WIDTH_F64: f64 = 48.0;
     if max <= 0.0 || !value.is_finite() {
         return " ".repeat(WIDTH);
     }
     let ratio = (value / max).clamp(0.0, 1.0);
-    let width = WIDTH.to_f64().expect("bar width fits f64");
-    let cells = (ratio * width)
-        .round()
-        .to_usize()
-        .expect("bar cell count fits usize");
+    let scaled = ratio * WIDTH_F64;
+    let mut cells = 0_usize;
+    let mut threshold = 0.5_f64;
+    while cells < WIDTH && scaled >= threshold {
+        cells += 1;
+        threshold += 1.0;
+    }
     let cells = cells.clamp(1, WIDTH);
     let mut out = String::with_capacity(WIDTH);
     for _ in 0..cells {
@@ -560,6 +562,23 @@ mod tests {
         assert_eq!(format_duration(999.99), "999.99 µs");
         assert_eq!(format_duration(1_000.0), "1.00 ms");
         assert_eq!(format_duration(1_500.0), "1.50 ms");
+    }
+
+    #[test]
+    fn render_bar_rounds_without_numeric_panics() {
+        assert_eq!(
+            render_bar(0.0, 10.0).chars().filter(|c| *c == '█').count(),
+            1
+        );
+        assert_eq!(
+            render_bar(0.11, 10.0).chars().filter(|c| *c == '█').count(),
+            1
+        );
+        assert_eq!(
+            render_bar(10.0, 10.0).chars().filter(|c| *c == '█').count(),
+            48
+        );
+        assert_eq!(render_bar(f64::INFINITY, 10.0), " ".repeat(48));
     }
 
     // -----------------------------------------------------------------------
