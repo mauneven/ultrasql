@@ -317,7 +317,12 @@ impl ConstraintChecker {
 
     /// Check all constraints that apply to a newly inserted row.
     pub fn check_insert(&self, row: &[Value]) -> Result<(), ConstraintError> {
-        for (i, c) in self.constraints.iter().enumerate() {
+        self.check_insert_non_unique_constraints(row)?;
+        self.reserve_unique_keys(row)
+    }
+
+    fn check_insert_non_unique_constraints(&self, row: &[Value]) -> Result<(), ConstraintError> {
+        for c in &self.constraints {
             match c {
                 Constraint::NotNull { column } => {
                     if matches!(row.get(*column), Some(Value::Null) | None) {
@@ -330,21 +335,7 @@ impl ConstraintChecker {
                     Some(Value::Bool(true)) => {}
                     _ => return Err(ConstraintError::CheckFailed { name: name.clone() }),
                 },
-                Constraint::Unique { columns } | Constraint::PrimaryKey { columns } => {
-                    let key: Vec<Value> = columns
-                        .iter()
-                        .map(|&col| row.get(col).cloned().unwrap_or(Value::Null))
-                        .collect();
-                    if key.iter().any(|v| v == &Value::Null) {
-                        continue; // NULLs never participate in uniqueness
-                    }
-                    if let Some(set_lock) = &self.unique_sets[i] {
-                        let inserted = set_lock.lock().insert(key);
-                        if !inserted {
-                            return Err(ConstraintError::UniqueViolation);
-                        }
-                    }
-                }
+                Constraint::Unique { .. } | Constraint::PrimaryKey { .. } => {}
                 Constraint::ForeignKey {
                     columns,
                     target_rel,
@@ -366,6 +357,38 @@ impl ConstraintChecker {
             }
         }
         Ok(())
+    }
+
+    fn reserve_unique_keys(&self, row: &[Value]) -> Result<(), ConstraintError> {
+        let mut inserted_keys: Vec<(usize, Vec<Value>)> = Vec::new();
+        for (i, c) in self.constraints.iter().enumerate() {
+            if let Constraint::Unique { columns } | Constraint::PrimaryKey { columns } = c {
+                let key: Vec<Value> = columns
+                    .iter()
+                    .map(|&col| row.get(col).cloned().unwrap_or(Value::Null))
+                    .collect();
+                if key.iter().any(|v| v == &Value::Null) {
+                    continue; // NULLs never participate in uniqueness
+                }
+                if let Some(set_lock) = &self.unique_sets[i] {
+                    let inserted = set_lock.lock().insert(key.clone());
+                    if !inserted {
+                        self.rollback_unique_keys(inserted_keys);
+                        return Err(ConstraintError::UniqueViolation);
+                    }
+                    inserted_keys.push((i, key));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn rollback_unique_keys(&self, inserted_keys: Vec<(usize, Vec<Value>)>) {
+        for (i, key) in inserted_keys.into_iter().rev() {
+            if let Some(set_lock) = &self.unique_sets[i] {
+                set_lock.lock().remove(&key);
+            }
+        }
     }
 
     /// Check all constraints for an UPDATE (new row after-image).
@@ -634,6 +657,33 @@ mod tests {
             .check_insert(&[Value::Int64(7)])
             .expect_err("dup must fail");
         assert!(matches!(err, ConstraintError::UniqueViolation));
+    }
+
+    #[test]
+    fn unique_key_is_not_reserved_when_later_constraint_fails() {
+        let c = no_fk(vec![
+            Constraint::Unique { columns: vec![0] },
+            Constraint::Check {
+                name: "flag_true".into(),
+                expr: ScalarExpr::new(
+                    |row| match row.get(1) {
+                        Some(Value::Bool(v)) => Some(Value::Bool(*v)),
+                        _ => Some(Value::Bool(false)),
+                    },
+                    "flag_true",
+                ),
+            },
+        ]);
+
+        let err = c
+            .check_insert(&[Value::Int64(7), Value::Bool(false)])
+            .expect_err("check must fail");
+        assert!(matches!(err, ConstraintError::CheckFailed { .. }));
+
+        assert!(
+            c.check_insert(&[Value::Int64(7), Value::Bool(true)])
+                .is_ok()
+        );
     }
 
     // --- PrimaryKey ---
