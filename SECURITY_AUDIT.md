@@ -416,9 +416,10 @@ None. Three new public symbols (`MAX_PARSE_DEPTH`,
 
 ## 9. Outstanding work for v0.6
 
-1. Add a `cargo fuzz` corpus for the wire-protocol codec, the WAL
-   record decoder, and the SQL parser (referenced in AGENTS.md §8 but
-   not yet bootstrapped).
+1. Maintain one clean week of nightly/manual `cargo fuzz` evidence for
+   `parser_fuzz`, `planner_fuzz`, `protocol_fuzz`, and
+   `wal_record_fuzz`; targets and committed seed corpora are now
+   bootstrapped under `fuzz/`.
 2. Add a public-IP slow-loris integration test now that the timeout
    work in D-1 has landed.
 3. Track upstream `parquet` releases for removal of transitive
