@@ -22,10 +22,12 @@
 //! # Deferred constraints
 //!
 //! `DEFERRABLE INITIALLY DEFERRED` FK constraints are not checked
-//! immediately; the checker skips them on DML. A separate deferred-
-//! check pass at COMMIT time calls the same methods.
-//! `TODO(constraints-deferred)`: wire the deferred pass to the
-//! transaction manager.
+//! immediately; the checker skips them on immediate DML checks. Callers
+//! that buffer deferred FK events must call
+//! [`ConstraintChecker::check_deferred_insert`],
+//! [`ConstraintChecker::check_deferred_update`], and
+//! [`ConstraintChecker::check_deferred_delete`] during their commit-time
+//! deferred pass.
 
 use std::collections::HashSet;
 use std::fmt;
@@ -262,6 +264,21 @@ pub struct ConstraintChecker {
     fk_child_lookup: FkChildLookup,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ConstraintCheckPhase {
+    Immediate,
+    Deferred,
+}
+
+impl ConstraintCheckPhase {
+    const fn should_check_fk(self, deferrable: bool, initially_deferred: bool) -> bool {
+        match self {
+            Self::Immediate => !(deferrable && initially_deferred),
+            Self::Deferred => deferrable && initially_deferred,
+        }
+    }
+}
+
 impl fmt::Debug for ConstraintChecker {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("ConstraintChecker")
@@ -335,18 +352,10 @@ impl ConstraintChecker {
                     initially_deferred,
                     ..
                 } => {
-                    if *deferrable && *initially_deferred {
-                        continue;
-                    }
-                    let key: Vec<Value> = columns
-                        .iter()
-                        .map(|&col| row.get(col).cloned().unwrap_or(Value::Null))
-                        .collect();
-                    if key.iter().all(|v| v == &Value::Null) {
-                        continue;
-                    }
-                    if !(self.fk_lookup)(*target_rel, &key) {
-                        return Err(ConstraintError::ForeignKeyViolation);
+                    if ConstraintCheckPhase::Immediate
+                        .should_check_fk(*deferrable, *initially_deferred)
+                    {
+                        self.check_insert_fk(columns, *target_rel, row)?;
                     }
                 }
                 Constraint::Default { .. }
@@ -362,6 +371,44 @@ impl ConstraintChecker {
     /// Check all constraints for an UPDATE (new row after-image).
     pub fn check_update(&self, _old: &[Value], new: &[Value]) -> Result<(), ConstraintError> {
         self.check_insert(new)
+    }
+
+    /// Check deferred constraints for a newly inserted row.
+    ///
+    /// Only `DEFERRABLE INITIALLY DEFERRED` foreign keys are evaluated
+    /// here. Immediate constraints and unique-key state are intentionally
+    /// not re-run because they have already been checked by
+    /// [`Self::check_insert`].
+    pub fn check_deferred_insert(&self, row: &[Value]) -> Result<(), ConstraintError> {
+        for c in &self.constraints {
+            if let Constraint::ForeignKey {
+                columns,
+                target_rel,
+                deferrable,
+                initially_deferred,
+                ..
+            } = c
+            {
+                if ConstraintCheckPhase::Deferred.should_check_fk(*deferrable, *initially_deferred)
+                {
+                    self.check_insert_fk(columns, *target_rel, row)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Check deferred constraints for an UPDATE after-image.
+    ///
+    /// The current representation stores deferred state only on foreign
+    /// keys, so UPDATE validation is equivalent to validating the new
+    /// row's referencing key at commit time.
+    pub fn check_deferred_update(
+        &self,
+        _old: &[Value],
+        new: &[Value],
+    ) -> Result<(), ConstraintError> {
+        self.check_deferred_insert(new)
     }
 
     /// Check referential integrity when a row is deleted.
@@ -380,25 +427,34 @@ impl ConstraintChecker {
                 ..
             } = c
             {
-                if *deferrable && *initially_deferred {
-                    continue;
+                if ConstraintCheckPhase::Immediate.should_check_fk(*deferrable, *initially_deferred)
+                {
+                    self.check_delete_fk(columns, *target_rel, on_delete, row)?;
                 }
-                let key: Vec<Value> = columns
-                    .iter()
-                    .map(|&col| row.get(col).cloned().unwrap_or(Value::Null))
-                    .collect();
-                let children = (self.fk_child_lookup)(*target_rel, &key);
-                if !children.is_empty() {
-                    match on_delete {
-                        ReferentialAction::Restrict | ReferentialAction::NoAction => {
-                            return Err(ConstraintError::ReferentialAction(format!(
-                                "ON DELETE {on_delete}: child rows still reference key {key:?}",
-                            )));
-                        }
-                        ReferentialAction::Cascade
-                        | ReferentialAction::SetNull
-                        | ReferentialAction::SetDefault => {}
-                    }
+            }
+        }
+        Ok(())
+    }
+
+    /// Check deferred referential integrity for a deleted row.
+    ///
+    /// Only `DEFERRABLE INITIALLY DEFERRED` foreign keys are evaluated.
+    /// Cascading actions are still left to executor-layer DML; this
+    /// method reports only deferred `RESTRICT` / `NO ACTION` failures.
+    pub fn check_deferred_delete(&self, row: &[Value]) -> Result<(), ConstraintError> {
+        for c in &self.constraints {
+            if let Constraint::ForeignKey {
+                columns,
+                target_rel,
+                on_delete,
+                deferrable,
+                initially_deferred,
+                ..
+            } = c
+            {
+                if ConstraintCheckPhase::Deferred.should_check_fk(*deferrable, *initially_deferred)
+                {
+                    self.check_delete_fk(columns, *target_rel, on_delete, row)?;
                 }
             }
         }
@@ -436,6 +492,52 @@ impl ConstraintChecker {
                 }
             }
         }
+    }
+
+    fn check_insert_fk(
+        &self,
+        columns: &[usize],
+        target_rel: Oid,
+        row: &[Value],
+    ) -> Result<(), ConstraintError> {
+        let key: Vec<Value> = columns
+            .iter()
+            .map(|&col| row.get(col).cloned().unwrap_or(Value::Null))
+            .collect();
+        if key.iter().all(|v| v == &Value::Null) {
+            return Ok(());
+        }
+        if !(self.fk_lookup)(target_rel, &key) {
+            return Err(ConstraintError::ForeignKeyViolation);
+        }
+        Ok(())
+    }
+
+    fn check_delete_fk(
+        &self,
+        columns: &[usize],
+        target_rel: Oid,
+        on_delete: &ReferentialAction,
+        row: &[Value],
+    ) -> Result<(), ConstraintError> {
+        let key: Vec<Value> = columns
+            .iter()
+            .map(|&col| row.get(col).cloned().unwrap_or(Value::Null))
+            .collect();
+        let children = (self.fk_child_lookup)(target_rel, &key);
+        if !children.is_empty() {
+            match on_delete {
+                ReferentialAction::Restrict | ReferentialAction::NoAction => {
+                    return Err(ConstraintError::ReferentialAction(format!(
+                        "ON DELETE {on_delete}: child rows still reference key {key:?}",
+                    )));
+                }
+                ReferentialAction::Cascade
+                | ReferentialAction::SetNull
+                | ReferentialAction::SetDefault => {}
+            }
+        }
+        Ok(())
     }
 }
 
@@ -597,6 +699,29 @@ mod tests {
         assert!(matches!(err, ConstraintError::ForeignKeyViolation));
     }
 
+    #[test]
+    fn deferred_fk_insert_skips_immediate_and_fails_deferred_pass() {
+        let c = ConstraintChecker::new(
+            vec![Constraint::ForeignKey {
+                columns: vec![0],
+                target_rel: Oid::new(100),
+                target_columns: vec![0],
+                on_delete: ReferentialAction::Restrict,
+                on_update: ReferentialAction::NoAction,
+                deferrable: true,
+                initially_deferred: true,
+            }],
+            |_, _| false,
+            |_, _| Vec::new(),
+        );
+
+        assert!(c.check_insert(&[Value::Int64(999)]).is_ok());
+        let err = c
+            .check_deferred_insert(&[Value::Int64(999)])
+            .expect_err("deferred pass must fail");
+        assert!(matches!(err, ConstraintError::ForeignKeyViolation));
+    }
+
     // --- ForeignKey DELETE (Restrict / Cascade / SetNull) ---
 
     #[test]
@@ -654,6 +779,29 @@ mod tests {
             |_, _| vec![vec![Value::Int64(5)]],
         );
         assert!(c.check_delete(&[Value::Int64(1)]).is_ok());
+    }
+
+    #[test]
+    fn deferred_fk_delete_skips_immediate_and_fails_deferred_pass() {
+        let c = ConstraintChecker::new(
+            vec![Constraint::ForeignKey {
+                columns: vec![0],
+                target_rel: Oid::new(200),
+                target_columns: vec![0],
+                on_delete: ReferentialAction::Restrict,
+                on_update: ReferentialAction::NoAction,
+                deferrable: true,
+                initially_deferred: true,
+            }],
+            |_, _| true,
+            |_, _| vec![vec![Value::Int64(7)]],
+        );
+
+        assert!(c.check_delete(&[Value::Int64(1)]).is_ok());
+        let err = c
+            .check_deferred_delete(&[Value::Int64(1)])
+            .expect_err("deferred pass must fail");
+        assert!(matches!(err, ConstraintError::ReferentialAction(_)));
     }
 
     // --- Defaults ---
