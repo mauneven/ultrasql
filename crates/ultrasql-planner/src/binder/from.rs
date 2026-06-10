@@ -29,6 +29,7 @@ use ultrasql_parser::ast::{
 const READ_CSV_HEADER_SAMPLE_BYTES: u64 = 64 * 1024;
 const JSON_STREAM_CHUNK_BYTES: u64 = 64 * 1024;
 const PLANNER_JSON_RECORD_LIMIT_BYTES: usize = 16 * 1024 * 1024;
+const MAX_JOIN_DEPTH: usize = 64;
 
 use super::ddl::resolve_type_name;
 use super::{
@@ -43,6 +44,13 @@ pub(super) fn bind_from(
     cte_catalog: &[(String, Schema)],
     outer_scope: &mut ScopeStack,
 ) -> Result<(LogicalPlan, Vec<ScopeEntry>), PlanError> {
+    let join_depth = from_clause_join_depth(from_items);
+    if join_depth > MAX_JOIN_DEPTH {
+        return Err(PlanError::not_supported(format!(
+            "join depth {join_depth} exceeds planner limit {MAX_JOIN_DEPTH}"
+        )));
+    }
+
     if from_items.is_empty() {
         return Ok((
             LogicalPlan::Empty {
@@ -79,6 +87,32 @@ pub(super) fn bind_from(
     }
 
     Ok((plan, from_scope))
+}
+
+fn from_clause_join_depth(from_items: &[TableRef]) -> usize {
+    let mut items = from_items.iter();
+    let Some(first) = items.next() else {
+        return 0;
+    };
+
+    let mut depth = table_ref_join_depth(first);
+    for item in items {
+        depth = depth.max(table_ref_join_depth(item)).saturating_add(1);
+    }
+    depth
+}
+
+fn table_ref_join_depth(table_ref: &TableRef) -> usize {
+    match table_ref {
+        TableRef::Join { left, right, .. } => table_ref_join_depth(left)
+            .max(table_ref_join_depth(right))
+            .saturating_add(1),
+        TableRef::Named { .. }
+        | TableRef::Subquery { .. }
+        | TableRef::Function { .. }
+        | TableRef::JsonTable { .. }
+        | TableRef::XmlTable { .. } => 0,
+    }
 }
 
 fn bind_table_ref(

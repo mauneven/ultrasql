@@ -334,18 +334,23 @@ the server's effective UID. Regression coverage:
 `server_init_stores_canonical_data_dir`, and
 `data_dir_owner_check_rejects_unexpected_uid`.
 
-### D-3. No `MAX_JOIN_DEPTH` in planner
+### D-3. Planner join-depth guard
 
-**Affected:** `crates/ultrasql-planner/` (no joins implemented in v0.5)
+**Affected:** `crates/ultrasql-planner/src/binder/from.rs`
 
-A future planner that accepts `T1 JOIN T2 JOIN T3 ... JOIN TN` with
-N very large might run an exponential-time optimiser. Not actionable
-at v0.5 because joins are not implemented.
+The planner accepts `T1 JOIN T2 JOIN T3 ... JOIN TN` chains. Without a
+depth guard, a malicious client can force the binder to construct a very
+wide left-deep logical plan and hand later optimizer/executor phases an
+unbounded join tree.
 
-**Proposed fix:** When joins land, introduce `MAX_JOIN_DEPTH = 64` and
-reject deeper queries as `PlanError::Unsupported`. Track as RFC.
+**2026-06-10 refresh:** Fixed by preflighting the FROM-clause join tree
+before table binding. `MAX_JOIN_DEPTH = 64`; deeper joins are rejected as
+`PlanError::NotSupportedOwned` with a join-depth message. Regression
+coverage: `accepts_explicit_join_chain_at_depth_limit` and
+`rejects_explicit_join_chain_above_depth_limit`.
 
-**Effort:** Track as a checklist item for the v0.6 planner work.
+**Status:** Closed for explicit and parser-canonicalized comma/CROSS
+join chains in the current binder.
 
 ---
 

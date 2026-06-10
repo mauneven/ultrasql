@@ -2355,6 +2355,44 @@ fn binds_cross_join_has_no_predicate() {
     );
 }
 
+fn join_chain_catalog(table_count: usize) -> InMemoryCatalog {
+    let mut cat = InMemoryCatalog::new();
+    let schema = Schema::new([Field::required("id", DataType::Int32)]).expect("schema ok");
+    for idx in 0..table_count {
+        cat.register(&format!("t{idx}"), TableMeta::new(schema.clone()));
+    }
+    cat
+}
+
+fn join_chain_sql(table_count: usize) -> String {
+    let mut sql = String::from("SELECT t0.id FROM t0");
+    for idx in 1..table_count {
+        sql.push_str(&format!(" JOIN t{idx} ON t0.id = t{idx}.id"));
+    }
+    sql
+}
+
+#[test]
+fn accepts_explicit_join_chain_at_depth_limit() {
+    let cat = join_chain_catalog(65);
+    let sql = join_chain_sql(65);
+
+    parse_and_bind(&sql, &cat).expect("join depth at planner limit should bind");
+}
+
+#[test]
+fn rejects_explicit_join_chain_above_depth_limit() {
+    let cat = join_chain_catalog(66);
+    let sql = join_chain_sql(66);
+
+    let err = parse_and_bind(&sql, &cat).expect_err("join chain should exceed planner limit");
+
+    assert!(
+        err.to_string().contains("join depth"),
+        "expected join-depth error, got {err:?}"
+    );
+}
+
 #[test]
 fn binds_using_join_folds_to_equality_and_collapses_columns() {
     // Build a catalog where both tables have a column named `id`.
