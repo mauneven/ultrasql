@@ -68,6 +68,22 @@ fn ci_bench_uses_pr_smoke_and_scheduled_full_certifications() {
 }
 
 #[test]
+fn legacy_benchmark_runners_allow_isolated_output_dirs() {
+    let kernel_runner = repo_file("benchmarks/run.sh");
+    let wire_runner = repo_file("benchmarks/run_wire.sh");
+
+    assert!(kernel_runner.contains("out=\"${BENCH_RUN_OUT_DIR:-benchmarks/results/latest}\""));
+    assert!(kernel_runner.contains("raw=\"$out/raw\""));
+    assert!(kernel_runner.contains("--output-md \"$out/results.md\""));
+    assert!(kernel_runner.contains("--output-json \"$out/results.json\""));
+
+    assert!(wire_runner.contains("out=\"${BENCH_WIRE_OUT_DIR:-benchmarks/results/latest}\""));
+    assert!(wire_runner.contains("raw=\"$out/raw\""));
+    assert!(wire_runner.contains("--output-md \"$out/results.md\""));
+    assert!(wire_runner.contains("--output-json \"$out/results.json\""));
+}
+
+#[test]
 fn tpcc_and_sysbench_certification_wrappers_write_artifacts() {
     let tpcb = repo_file("benchmarks/tpcb_certify.sh");
     let tpcc = repo_file("benchmarks/tpcc_certify.sh");

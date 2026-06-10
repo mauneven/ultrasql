@@ -26,6 +26,9 @@
 #   benchmarks/results/latest/results.md                    — rendered table
 #   benchmarks/results/latest/results.json                  — machine-readable
 #
+# Environment overrides:
+#   BENCH_RUN_OUT_DIR  output directory (default benchmarks/results/latest)
+#
 # The script is idempotent: re-running overwrites previous output.
 
 set -euo pipefail
@@ -40,7 +43,7 @@ engines="${2:-postgres17,duckdb,sqlite3,clickhouse,cockroachdb}"
 # "ultra writes" subcommand: write-side workloads × all available engines
 # ---------------------------------------------------------------------------
 if [[ "$tier" == "ultra" && "$engines" == "writes" ]]; then
-    out="benchmarks/results/latest"
+    out="${BENCH_RUN_OUT_DIR:-benchmarks/results/latest}"
     raw="$out/raw"
     mkdir -p "$raw"
 
@@ -122,7 +125,7 @@ if [[ "$tier" != "low" && "$tier" != "ultra" ]]; then
     exit 1
 fi
 
-out="benchmarks/results/latest"
+out="${BENCH_RUN_OUT_DIR:-benchmarks/results/latest}"
 raw="$out/raw"
 mkdir -p "$raw"
 

@@ -18,6 +18,7 @@
 # Environment overrides:
 #   CH_BIN     path to clickhouse binary (default /tmp/ultracmp/clickhouse)
 #   N_ITERS    sample count for competitor scripts (default 32 in full mode)
+#   BENCH_WIRE_OUT_DIR  output directory (default benchmarks/results/latest)
 
 set -euo pipefail
 
@@ -31,7 +32,7 @@ case "$mode" in
     *) echo "unknown mode '$mode' (full|quick)" >&2; exit 2 ;;
 esac
 
-out="benchmarks/results/latest"
+out="${BENCH_WIRE_OUT_DIR:-benchmarks/results/latest}"
 raw="$out/raw"
 mkdir -p "$raw"
 
