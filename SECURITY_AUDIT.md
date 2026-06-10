@@ -281,7 +281,12 @@ reproduction command.
 
 ---
 
-## 4. Deferred — `TODO(security)` markers
+## 4. Closed — historical `TODO(security)` markers
+
+No live `TODO(security)` markers remain in `crates/` at the 2026-06-10
+audit refresh. The entries below are retained as historical findings so
+future audits can trace the original risk, the remediation, and the
+regression coverage.
 
 ### D-1. No per-connection slow-loris timeout
 
@@ -308,6 +313,8 @@ work and the configurable post-startup idle-session timeout. Regression
 coverage: `statement_timeout_round_trip.rs`,
 `idle_session_timeout_round_trip.rs`, and
 `cancel_request_round_trip.rs`.
+
+**Status:** Closed.
 
 ### D-2. mmap-aliasing under hostile concurrent writers
 
@@ -340,6 +347,8 @@ the server's effective UID. Regression coverage:
 `server_init_refuses_symlinked_data_dir`,
 `server_init_stores_canonical_data_dir`, and
 `data_dir_owner_check_rejects_unexpected_uid`.
+
+**Status:** Closed.
 
 ### D-3. Planner join-depth guard
 
