@@ -100,6 +100,31 @@ const RAG_RETRIEVAL_REQUIRED_METRICS: &[&str] = &[
     "latency_us",
     "answer_citation_coverage",
 ];
+const LATE_MATERIALIZATION_REQUIRED_METRICS: &[&str] = &[
+    "median_us",
+    "p50_latency_us",
+    "p95_latency_us",
+    "p99_latency_us",
+    "explain_late_materialization",
+    "eager_scan_median_us",
+    "late_materialization_median_us",
+    "rows",
+];
+const LATE_MATERIALIZATION_ANSWER_METRICS: &[&str] = &[
+    "rows",
+    "tenant_id",
+    "wide_columns",
+    "projected_columns",
+    "query_shape",
+    "firebolt_style_shape",
+    "answer_order",
+    "explain_late_materialization",
+    "eager_scan_median_us",
+    "eager_scan_samples_us",
+    "late_materialization_median_us",
+    "late_materialization_samples_us",
+    "comparison_policy",
+];
 const COLD_START_INDEX_LOAD_REQUIRED_METRICS: &[&str] = &[
     "restart_time_us",
     "first_query_us",
@@ -798,6 +823,9 @@ async fn main() -> Result<()> {
     });
     if let Some(answer) = answer {
         let answer_hash = answer_sha256(&answer)?;
+        if matches!(args.workload, Workload::LateMaterialization) {
+            promote_answer_metrics(&mut report, &answer, LATE_MATERIALIZATION_ANSWER_METRICS);
+        }
         report["answer"] = answer;
         report["answer_sha256"] = serde_json::json!(answer_hash);
     }
@@ -806,16 +834,7 @@ async fn main() -> Result<()> {
         report["suite"] = serde_json::json!("late_materialization");
         report["profile"] = serde_json::json!("smoke");
         report["status"] = serde_json::json!("measured");
-        report["required_metrics"] = serde_json::json!([
-            "median_us",
-            "p50_latency_us",
-            "p95_latency_us",
-            "p99_latency_us",
-            "explain_late_materialization",
-            "eager_scan_median_us",
-            "late_materialization_median_us",
-            "rows"
-        ]);
+        report["required_metrics"] = serde_json::json!(LATE_MATERIALIZATION_REQUIRED_METRICS);
         report["p50_latency_us"] = serde_json::json!(p50_latency_us);
         report["p95_latency_us"] = serde_json::json!(p95_latency_us);
         report["p99_latency_us"] = serde_json::json!(p99_latency_us);
@@ -1033,6 +1052,21 @@ fn answer_sha256(answer: &serde_json::Value) -> Result<String> {
         .iter()
         .map(|byte| format!("{byte:02x}"))
         .collect::<String>())
+}
+
+fn promote_answer_metrics(
+    report: &mut serde_json::Value,
+    answer: &serde_json::Value,
+    metric_keys: &[&str],
+) {
+    let Some(answer_object) = answer.as_object() else {
+        return;
+    };
+    for key in metric_keys {
+        if let Some(value) = answer_object.get(*key) {
+            report[*key] = value.clone();
+        }
+    }
 }
 
 async fn start_persistent_bench_server(data_dir: &Path) -> Result<PersistentBenchServer> {
@@ -2175,6 +2209,7 @@ async fn run_insert_iter(server: SocketAddr, n_rows: usize, ix: usize) -> Result
 /// server's parser well past the workload under test; 50 000 rows per
 /// chunk keeps each statement under a megabyte of SQL text.
 const PRELOAD_CHUNK_ROWS: usize = 50_000;
+const LATE_MAT_PRELOAD_CHUNK_ROWS: usize = 5_000;
 
 /// Preload `n_rows` of `(id INT, x INT)` rows into `table` via a
 /// sequence of multi-row INSERTs, chunked at [`PRELOAD_CHUNK_ROWS`]
@@ -2596,7 +2631,7 @@ async fn preload_late_materialization_chunked(
 ) -> Result<()> {
     let mut start = 0;
     while start < n_rows {
-        let end = (start + PRELOAD_CHUNK_ROWS).min(n_rows);
+        let end = (start + LATE_MAT_PRELOAD_CHUNK_ROWS).min(n_rows);
         let mut sql = String::with_capacity((end - start) * 128 + 64);
         sql.push_str("INSERT INTO ");
         sql.push_str(table);
@@ -3764,6 +3799,47 @@ mod tests {
             Workload::LateMaterialization.registry_id(1_000),
             "late_materialization_1k"
         );
+    }
+
+    #[test]
+    fn late_materialization_preload_uses_wide_row_chunk_size() {
+        let late_chunk_rows = std::hint::black_box(LATE_MAT_PRELOAD_CHUNK_ROWS);
+        let generic_chunk_rows = std::hint::black_box(PRELOAD_CHUNK_ROWS);
+
+        assert!(
+            late_chunk_rows <= 5_000,
+            "wide 100-column INSERT chunks must stay small enough for full certification"
+        );
+        assert!(
+            late_chunk_rows < generic_chunk_rows,
+            "late-materialization should not reuse the generic narrow-row preload chunk"
+        );
+    }
+
+    #[test]
+    fn late_materialization_promotes_required_answer_metrics() {
+        let mut report = serde_json::json!({
+            "status": "measured",
+            "median_us": 10.0,
+            "p50_latency_us": 10.0,
+            "p95_latency_us": 10.0,
+            "p99_latency_us": 10.0,
+        });
+        let answer = serde_json::json!({
+            "rows": 3,
+            "explain_late_materialization": "Late Materialization: candidates=3 fetched=3 skipped=0",
+            "eager_scan_median_us": 40.0,
+            "late_materialization_median_us": 12.0,
+        });
+
+        promote_answer_metrics(&mut report, &answer, LATE_MATERIALIZATION_ANSWER_METRICS);
+
+        for metric in LATE_MATERIALIZATION_REQUIRED_METRICS {
+            assert!(
+                report.get(*metric).is_some_and(|value| !value.is_null()),
+                "late-materialization artifact must expose required metric {metric}"
+            );
+        }
     }
 
     #[test]

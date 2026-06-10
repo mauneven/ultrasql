@@ -102,6 +102,17 @@ with open(bad_path, "w", newline="", encoding="utf-8") as f:
     writer.writerow([4, "alpha", 50, "d4"])
 PY
 
+CSV_READ_LIMIT_BYTES="${CSV_GAUNTLET_CSV_READ_LIMIT_BYTES:-$(
+    python3 - "$CSV_PATH" "$BAD_CSV_PATH" <<'PY'
+import pathlib
+import sys
+
+margin = 16 * 1024 * 1024
+sizes = [pathlib.Path(path).stat().st_size for path in sys.argv[1:]]
+print(max(sizes) + margin)
+PY
+)}"
+
 record_artifact() {
     local engine="$1"
     local workload="$2"
@@ -146,7 +157,8 @@ run_ultrasql() {
             warmup=0
             iters=1
         fi
-        target/release/cross_compare_sql \
+        ULTRASQL_CSV_LOCAL_READ_LIMIT_BYTES="$CSV_READ_LIMIT_BYTES" \
+            target/release/cross_compare_sql \
             --workload "$cli_workload" \
             --rows "$ROWS" \
             --warmup "$warmup" \

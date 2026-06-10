@@ -43,6 +43,20 @@ fn csv_gauntlet_declares_required_workloads_and_engines() {
 }
 
 #[test]
+fn csv_gauntlet_sets_ultrasql_read_limit_for_generated_full_dataset() {
+    let script = repo_file("benchmarks/csv_benchmark_gauntlet.sh");
+
+    assert!(
+        script.contains("CSV_GAUNTLET_CSV_READ_LIMIT_BYTES"),
+        "CSV gauntlet must expose an override for the generated CSV read limit"
+    );
+    assert!(
+        script.contains("ULTRASQL_CSV_LOCAL_READ_LIMIT_BYTES"),
+        "UltraSQL CSV runs must set the local file read limit explicitly"
+    );
+}
+
+#[test]
 fn cross_compare_sql_exposes_csv_workloads() {
     let driver = repo_file("crates/ultrasql-bench/src/bin/cross_compare_sql.rs");
 
