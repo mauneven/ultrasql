@@ -14,6 +14,7 @@
 //! `benchmarks/results/host.yaml` alongside criterion output.
 
 use criterion::{Criterion, Throughput, black_box, criterion_group, criterion_main};
+use std::collections::HashSet;
 use ultrasql_core::{DataType, Field, Schema, Value};
 use ultrasql_optimizer::plan_cache::{PlanCache, PlanCacheConfig, PlanCacheKey};
 use ultrasql_optimizer::rules::RewriteRule;
@@ -71,29 +72,51 @@ fn neg(e: ScalarExpr) -> ScalarExpr {
     }
 }
 
+fn unique_join_field_name(base: &str, used_names: &mut HashSet<String>) -> String {
+    if used_names.insert(base.to_ascii_lowercase()) {
+        return base.to_owned();
+    }
+    for suffix in 1.. {
+        let candidate = format!("{base}_{suffix}");
+        if used_names.insert(candidate.to_ascii_lowercase()) {
+            return candidate;
+        }
+    }
+    unreachable!("unbounded suffix search returns before overflow")
+}
+
 /// Build a decorrelated `Filter(LeftOuter(outer, sub), IS NOT NULL(sub.id))`.
 ///
 /// Mimics the EXISTS-lowering output that `SubqueryDecorrelation` would
 /// produce, so the decorrelation benchmark can apply the rule on realistic
 /// (already-lowered) plan shapes without depending on a `#[cfg(test)]` helper.
 fn exists_lowered_plan(outer: LogicalPlan, sub: LogicalPlan) -> LogicalPlan {
-    // Concatenate the schemas by collecting all fields.
+    // Mirror binder join schemas: right-side duplicates are suffixed and
+    // become nullable under a left outer join.
     let outer_schema = outer.schema();
     let sub_schema = sub.schema();
-    let mut fields: Vec<Field> = outer_schema.fields().to_vec();
-    fields.extend_from_slice(sub_schema.fields());
+    let mut fields: Vec<Field> = Vec::with_capacity(outer_schema.len() + sub_schema.len());
+    let mut used_names = HashSet::new();
+    for field in outer_schema.fields() {
+        used_names.insert(field.name.to_ascii_lowercase());
+        fields.push(field.clone());
+    }
+    for field in sub_schema.fields() {
+        fields.push(Field {
+            name: unique_join_field_name(&field.name, &mut used_names),
+            data_type: field.data_type.clone(),
+            nullable: true,
+        });
+    }
     let join_schema = Schema::new(fields).expect("join schema ok");
 
     // Use the first column of the sub as the IS NOT NULL witness.
     let witness_idx = outer_schema.len(); // first sub column after outer
+    let witness_field = &join_schema.fields()[witness_idx];
     let witness_col = ScalarExpr::Column {
-        name: sub_schema
-            .fields()
-            .first()
-            .map_or("__wit__", |f| f.name.as_str())
-            .into(),
+        name: witness_field.name.clone(),
         index: witness_idx,
-        data_type: DataType::Int32,
+        data_type: witness_field.data_type.clone(),
     };
 
     let join = LogicalPlan::Join {
@@ -130,6 +153,32 @@ fn plan_with_cse_candidate() -> LogicalPlan {
             right: Box::new(lit_i32(0)),
             data_type: DataType::Bool,
         },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn exists_lowered_plan_renames_duplicate_join_fields() {
+        let plan =
+            super::exists_lowered_plan(super::two_col_scan("outer"), super::two_col_scan("sub"));
+        let super::LogicalPlan::Filter { input, predicate } = plan else {
+            panic!("expected filter");
+        };
+        let super::LogicalPlan::Join { schema, .. } = input.as_ref() else {
+            panic!("expected join");
+        };
+        let names: Vec<_> = schema
+            .fields()
+            .iter()
+            .map(|field| field.name.as_str())
+            .collect();
+        assert_eq!(names, ["id", "val", "id_1", "val_1"]);
+        assert!(schema.fields()[2].nullable);
+        assert!(matches!(
+            predicate,
+            super::ScalarExpr::IsNull { negated: true, .. }
+        ));
     }
 }
 
