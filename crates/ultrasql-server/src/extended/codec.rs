@@ -343,7 +343,7 @@ pub(super) fn encode_binary_value(
         Column::Float32(c) => Some(c.data()[row].to_be_bytes().to_vec()),
         Column::Float64(c) => Some(c.data()[row].to_be_bytes().to_vec()),
         Column::Utf8(c) => Some(c.value(row).as_bytes().to_vec()),
-        Column::DictionaryUtf8(c) => Some(c.decode_at(row).as_bytes().to_vec()),
+        Column::DictionaryUtf8(c) => c.try_decode_at(row).map(|value| value.as_bytes().to_vec()),
     }
 }
 
@@ -640,6 +640,7 @@ const fn pg_type_size(ty: &DataType) -> i16 {
 mod tests {
     use super::*;
     use ultrasql_vec::column::{Column, NumericColumn, StringColumn};
+    use ultrasql_vec::dict::DictionaryColumn;
 
     fn pg_numeric_12_340() -> Vec<u8> {
         vec![
@@ -731,6 +732,20 @@ mod tests {
         assert_eq!(
             encode_binary_value_typed(&column, 0, &DataType::Jsonb).unwrap(),
             [vec![1_u8], br#"{"a":1}"#.to_vec()].concat()
+        );
+    }
+
+    #[test]
+    fn binary_encoding_rejects_invalid_dictionary_code_without_panic() {
+        let column = Column::DictionaryUtf8(DictionaryColumn {
+            dict: vec!["ok".to_owned()],
+            codes: NumericColumn::from_data(vec![7]),
+        });
+
+        assert_eq!(encode_binary_value(&column, 0), None);
+        assert_eq!(
+            encode_binary_value_typed(&column, 0, &DataType::Text { max_len: None }),
+            None
         );
     }
 

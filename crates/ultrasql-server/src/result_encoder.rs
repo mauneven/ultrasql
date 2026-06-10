@@ -556,12 +556,12 @@ pub(crate) fn run_select_with_options(
         for row in 0..row_count {
             let mut columns = Vec::with_capacity(batch.width());
             for (idx, col) in batch.columns().iter().enumerate() {
-                columns.push(encode_text_value_typed_with_options(
+                columns.push(checked_encode_text_value_typed_with_options(
                     col,
                     row,
                     &schema.field_at(idx).data_type,
                     options,
-                ));
+                )?);
             }
             messages.push(BackendMessage::DataRow { columns });
         }
@@ -869,7 +869,7 @@ pub(crate) fn encode_text_value(col: &Column, row: usize) -> Option<Vec<u8>> {
             b"f".to_vec()
         }),
         Column::Utf8(c) => Some(c.value(row).as_bytes().to_vec()),
-        Column::DictionaryUtf8(c) => Some(c.decode_at(row).as_bytes().to_vec()),
+        Column::DictionaryUtf8(c) => c.try_decode_at(row).map(|value| value.as_bytes().to_vec()),
     }
 }
 
@@ -929,6 +929,21 @@ pub(crate) fn encode_text_value_typed_with_options(
             .map(|text| encode_vector_family_text_value(text, ty)),
         _ => encode_text_value(col, row),
     }
+}
+
+fn checked_encode_text_value_typed_with_options(
+    col: &Column,
+    row: usize,
+    logical_type: &DataType,
+    options: &TextEncodingOptions,
+) -> Result<Option<Vec<u8>>, ServerError> {
+    let encoded = encode_text_value_typed_with_options(col, row, logical_type, options);
+    if encoded.is_none() && !column_row_is_null(col, row) {
+        return Err(ServerError::Execute(
+            ultrasql_executor::ExecError::Internal("result text cell encoding failed"),
+        ));
+    }
+    Ok(encoded)
 }
 
 fn encode_vector_family_text_value(text: &str, expected_type: &DataType) -> Vec<u8> {
@@ -995,6 +1010,10 @@ const fn column_nulls(col: &Column) -> Option<&ultrasql_vec::Bitmap> {
         Column::Utf8(c) => c.nulls(),
         Column::DictionaryUtf8(c) => c.codes.nulls(),
     }
+}
+
+fn column_row_is_null(col: &Column, row: usize) -> bool {
+    column_nulls(col).is_some_and(|nulls| !nulls.get(row))
 }
 
 /// Text-format float emission. PostgreSQL uses a `%g`-style format
@@ -1146,6 +1165,7 @@ mod tests {
     use ultrasql_executor::MemTableScan;
     use ultrasql_vec::Batch;
     use ultrasql_vec::column::{Column, NumericColumn, StringColumn};
+    use ultrasql_vec::dict::DictionaryColumn;
 
     #[test]
     fn run_select_produces_row_description_then_data_rows() {
@@ -1445,6 +1465,34 @@ mod tests {
             encode_text_value_typed(&vectors, 2, &DataType::Vector { dims: Some(2) }),
             Some(b"not-a-vector".to_vec())
         );
+    }
+
+    #[test]
+    fn text_encoding_rejects_invalid_dictionary_code_without_panic() {
+        let column = Column::DictionaryUtf8(DictionaryColumn {
+            dict: vec!["ok".to_owned()],
+            codes: NumericColumn::from_data(vec![7]),
+        });
+
+        assert_eq!(encode_text_value(&column, 0), None);
+        assert_eq!(
+            encode_text_value_typed(&column, 0, &DataType::Text { max_len: None }),
+            None
+        );
+    }
+
+    #[test]
+    fn run_select_rejects_invalid_dictionary_code_without_null_substitution() {
+        let schema = Schema::new([Field::required("label", DataType::Text { max_len: None })])
+            .expect("schema");
+        let batch = Batch::new([Column::DictionaryUtf8(DictionaryColumn {
+            dict: vec!["ok".to_owned()],
+            codes: NumericColumn::from_data(vec![7]),
+        })])
+        .expect("batch");
+        let mut scan = MemTableScan::new(schema, vec![batch]);
+
+        assert!(run_select(&mut scan).is_err());
     }
 
     #[test]

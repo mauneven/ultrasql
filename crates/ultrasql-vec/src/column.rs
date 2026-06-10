@@ -120,14 +120,10 @@ impl Column {
             }
             Self::DictionaryUtf8(c) => {
                 if row >= c.len() || bitmap_row_is_null(c.codes.nulls(), row) {
-                    return None;
+                    None
+                } else {
+                    c.try_decode_at(row)
                 }
-                let code = *c.codes.data().get(row)?;
-                if code == u32::MAX {
-                    return None;
-                }
-                let dict_index = usize::try_from(code).ok()?;
-                c.dict.get(dict_index).map(String::as_str)
             }
             _ => None,
         }

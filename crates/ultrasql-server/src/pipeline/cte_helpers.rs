@@ -249,7 +249,11 @@ pub(super) fn batch_row_keys(batch: &Batch) -> Result<Vec<Vec<u8>>, ServerError>
                         key.push(0xFF);
                     } else {
                         key.push(0x00);
-                        let s = c.decode_at(row_idx);
+                        let Some(s) = c.try_decode_at(row_idx) else {
+                            return Err(ServerError::unsupported(
+                                "recursive CTE dictionary code out of range",
+                            ));
+                        };
                         key.extend_from_slice(&cte_key_text_len(s)?.to_le_bytes());
                         key.extend_from_slice(s.as_bytes());
                     }
@@ -514,6 +518,17 @@ mod tests {
                 .expect("all seen")
                 .is_none()
         );
+    }
+
+    #[test]
+    fn row_keys_reject_invalid_dictionary_code_without_panic() {
+        let batch = Batch::new([Column::DictionaryUtf8(DictionaryColumn {
+            dict: vec!["ok".to_owned()],
+            codes: NumericColumn::from_data(vec![5]),
+        })])
+        .expect("batch");
+
+        assert!(batch_row_keys(&batch).is_err());
     }
 
     #[test]

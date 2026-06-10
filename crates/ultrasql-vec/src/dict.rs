@@ -132,6 +132,23 @@ impl DictionaryColumn {
 
     /// Look up the string value for row `i`.
     ///
+    /// Returns `None` when `i` is out of bounds, the row is SQL NULL, or
+    /// the stored code does not point at a dictionary entry.
+    #[must_use]
+    pub fn try_decode_at(&self, i: usize) -> Option<&str> {
+        if self.codes.nulls().is_some_and(|nulls| !nulls.get(i)) {
+            return None;
+        }
+        let code = *self.codes.data().get(i)?;
+        if code == u32::MAX {
+            return None;
+        }
+        let idx = u32_to_usize(code);
+        self.dict.get(idx).map(String::as_str)
+    }
+
+    /// Look up the string value for row `i`.
+    ///
     /// # Panics
     ///
     /// Panics if `i >= self.len()` or if row `i` is null (code == `u32::MAX`).
@@ -505,6 +522,16 @@ mod tests {
         };
 
         let _ = col.decode_at(0);
+    }
+
+    #[test]
+    fn try_decode_at_rejects_invalid_code_without_panic() {
+        let col = DictionaryColumn {
+            dict: vec!["a".to_owned()],
+            codes: NumericColumn::from_data(vec![5]),
+        };
+
+        assert_eq!(col.try_decode_at(0), None);
     }
 
     #[test]

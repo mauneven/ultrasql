@@ -2,7 +2,7 @@
 //! a previously bound portal; [`resume_suspended_portal`] resumes a portal
 //! that was suspended by a prior `max_rows` cap.
 
-use ultrasql_executor::Operator;
+use ultrasql_executor::{ExecError, Operator};
 use ultrasql_planner::LogicalPlan;
 use ultrasql_protocol::BackendMessage;
 
@@ -183,7 +183,7 @@ pub fn execute_portal(
             for (col_idx, col) in batch.columns().iter().enumerate() {
                 let fmt = resolve_param_format(&portal.result_formats, col_idx);
                 let logical_type = &output_schema.field_at(col_idx).data_type;
-                let encoded = encode_result_value(col, row, logical_type, fmt, &text_options);
+                let encoded = encode_result_value(col, row, logical_type, fmt, &text_options)?;
                 columns.push(encoded);
             }
             messages.push(BackendMessage::DataRow { columns });
@@ -233,7 +233,7 @@ fn execute_modify_returning(
             for (col_idx, col) in batch.columns().iter().enumerate() {
                 let fmt = resolve_param_format(result_formats, col_idx);
                 let logical_type = &output_schema.field_at(col_idx).data_type;
-                let encoded = encode_result_value(col, row, logical_type, fmt, text_options);
+                let encoded = encode_result_value(col, row, logical_type, fmt, text_options)?;
                 columns.push(encoded);
             }
             messages.push(BackendMessage::DataRow { columns });
@@ -252,12 +252,32 @@ fn encode_result_value(
     logical_type: &ultrasql_core::DataType,
     format: i16,
     text_options: &TextEncodingOptions,
-) -> Option<Vec<u8>> {
-    if format == 1 {
+) -> Result<Option<Vec<u8>>, ServerError> {
+    let encoded = if format == 1 {
         encode_binary_value_typed(col, row, logical_type)
     } else {
         encode_text_value_typed_with_options(col, row, logical_type, text_options)
+    };
+    if encoded.is_none() && !result_column_row_is_null(col, row) {
+        return Err(ServerError::Execute(ExecError::Internal(
+            "extended result cell encoding failed",
+        )));
     }
+    Ok(encoded)
+}
+
+fn result_column_row_is_null(col: &ultrasql_vec::column::Column, row: usize) -> bool {
+    use ultrasql_vec::column::Column;
+    let nulls = match col {
+        Column::Int32(c) => c.nulls(),
+        Column::Int64(c) => c.nulls(),
+        Column::Float32(c) => c.nulls(),
+        Column::Float64(c) => c.nulls(),
+        Column::Bool(c) => c.nulls(),
+        Column::Utf8(c) => c.nulls(),
+        Column::DictionaryUtf8(c) => c.codes.nulls(),
+    };
+    nulls.is_some_and(|bitmap| !bitmap.get(row))
 }
 
 fn modify_command_tag(command: &str, affected: u64) -> String {
@@ -312,7 +332,7 @@ fn resume_suspended_portal(
             for (col_idx, col) in batch.columns().iter().enumerate() {
                 let fmt = resolve_param_format(&sus.result_formats, col_idx);
                 let logical_type = &output_schema.field_at(col_idx).data_type;
-                let encoded = encode_result_value(col, row, logical_type, fmt, &sus.text_options);
+                let encoded = encode_result_value(col, row, logical_type, fmt, &sus.text_options)?;
                 columns.push(encoded);
             }
             messages.push(BackendMessage::DataRow { columns });
@@ -362,6 +382,7 @@ mod tests {
     use ultrasql_executor::ExecError;
     use ultrasql_vec::Batch;
     use ultrasql_vec::column::{Column, NumericColumn};
+    use ultrasql_vec::dict::DictionaryColumn;
 
     #[derive(Debug)]
     struct TestOperator {
@@ -402,5 +423,24 @@ mod tests {
             "unexpected error: {err:?}"
         );
         assert!(!state.suspended.contains_key("p"));
+    }
+
+    #[test]
+    fn encode_result_value_rejects_invalid_dictionary_code() {
+        let column = Column::DictionaryUtf8(DictionaryColumn {
+            dict: vec!["ok".to_owned()],
+            codes: NumericColumn::from_data(vec![7]),
+        });
+
+        assert!(
+            encode_result_value(
+                &column,
+                0,
+                &DataType::Text { max_len: None },
+                0,
+                &TextEncodingOptions::default(),
+            )
+            .is_err()
+        );
     }
 }

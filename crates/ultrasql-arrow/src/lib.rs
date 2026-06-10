@@ -187,12 +187,17 @@ fn column_to_arrow_array(field: &Field, column: Column) -> Result<ArrayRef> {
             let rows = (0..column.len())
                 .map(|row| {
                     if column.codes.nulls().is_some_and(|nulls| !nulls.get(row)) {
-                        None
+                        Ok(None)
                     } else {
-                        Some(column.decode_at(row))
+                        column.try_decode_at(row).map(Some).ok_or_else(|| {
+                            ArrowBridgeError::Type(format!(
+                                "Arrow export column {} has dictionary code out of range at row {row}",
+                                field.name
+                            ))
+                        })
                     }
                 })
-                .collect::<Vec<_>>();
+                .collect::<Result<Vec<_>>>()?;
             Ok(Arc::new(StringArray::from(rows)))
         }
         (expected, got) => Err(ArrowBridgeError::Type(format!(
@@ -643,6 +648,19 @@ mod tests {
         assert!(labels.is_null(1));
         assert_eq!(labels.value(2), "red");
         assert_eq!(labels.value(3), "blue");
+    }
+
+    #[test]
+    fn export_invalid_dictionary_code_returns_error_without_panic() {
+        let dictionary = DictionaryColumn {
+            dict: vec!["ok".to_owned()],
+            codes: NumericColumn::from_data(vec![9]),
+        };
+        let batch = Batch::new([Column::DictionaryUtf8(dictionary)]).expect("batch");
+        let schema = Schema::new([Field::required("label", DataType::Text { max_len: None })])
+            .expect("schema");
+
+        assert!(batch_to_record_batch(&schema, batch).is_err());
     }
 
     #[test]
