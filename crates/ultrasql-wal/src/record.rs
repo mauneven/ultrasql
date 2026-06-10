@@ -303,9 +303,14 @@ fn total_length_to_usize(total_length: u32) -> Result<usize, WalRecordError> {
         .map_err(|_| WalRecordError::Malformed("total_length does not fit usize"))
 }
 
+#[cfg(not(any(target_pointer_width = "32", target_pointer_width = "64")))]
+compile_error!("ultrasql-wal requires a 32-bit or 64-bit target pointer width");
+
 fn trusted_total_length_to_usize(total_length: u32) -> usize {
-    total_length_to_usize(total_length)
-        .expect("WAL record total_length must fit usize on supported targets")
+    let bytes = total_length.to_le_bytes();
+    let lo = u16::from_le_bytes([bytes[0], bytes[1]]);
+    let hi = u16::from_le_bytes([bytes[2], bytes[3]]);
+    usize::from(lo) | (usize::from(hi) << 16)
 }
 
 fn encode_header_into(header: &WalRecordHeader, bytes: &mut [u8]) {

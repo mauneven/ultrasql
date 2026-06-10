@@ -431,6 +431,7 @@ mod tests {
 
     #[test]
     fn build_server_config_from_valid_files() {
+        let _env_guard = tls_env_test_guard(None);
         use std::io::Write;
         let (cert_pem, key_pem) = generate_self_signed();
 
@@ -450,12 +451,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn build_server_config_rejects_symlinked_pem_files() {
-        let _env_guard = tls_env_test_lock();
-        // SAFETY: tls_env_test_lock serializes process-env mutation in this
-        // module's tests.
-        unsafe {
-            std::env::remove_var("ULTRASQL_TLS_PEM_LIMIT_BYTES");
-        }
+        let _env_guard = tls_env_test_guard(None);
 
         use std::io::Write;
         use std::os::unix::fs::symlink;
@@ -500,43 +496,60 @@ mod tests {
 
     #[test]
     fn read_regular_pem_file_rejects_configured_oversized_file() {
-        let _env_guard = tls_env_test_lock();
-        // SAFETY: tls_env_test_lock serializes process-env mutation in this
-        // module's tests.
-        unsafe {
-            std::env::set_var("ULTRASQL_TLS_PEM_LIMIT_BYTES", "3");
-        }
+        let _env_guard = tls_env_test_guard(Some("3"));
         let pem = tempfile::NamedTempFile::new().expect("pem file");
         std::fs::write(pem.path(), b"abcd").expect("write pem");
 
         let err = read_regular_pem_file(pem.path()).expect_err("oversized PEM rejected");
 
         assert!(err.to_string().contains("TLS PEM file exceeds limit"));
-        // SAFETY: tls_env_test_lock serializes process-env mutation in this
-        // module's tests.
-        unsafe {
-            std::env::remove_var("ULTRASQL_TLS_PEM_LIMIT_BYTES");
-        }
     }
 
     #[test]
     fn read_regular_pem_file_rejects_unbounded_limit() {
-        let _env_guard = tls_env_test_lock();
-        // SAFETY: tls_env_test_lock serializes process-env mutation in this
-        // module's tests.
-        unsafe {
-            std::env::set_var("ULTRASQL_TLS_PEM_LIMIT_BYTES", u64::MAX.to_string());
-        }
+        let limit = u64::MAX.to_string();
+        let _env_guard = tls_env_test_guard(Some(&limit));
         let pem = tempfile::NamedTempFile::new().expect("pem file");
         std::fs::write(pem.path(), b"ok").expect("write pem");
 
         let err = read_regular_pem_file(pem.path()).expect_err("unbounded PEM limit rejected");
 
         assert!(err.to_string().contains("TLS PEM read limit is too large"));
+    }
+
+    struct TlsEnvTestGuard {
+        previous: Option<std::ffi::OsString>,
+        _lock: std::sync::MutexGuard<'static, ()>,
+    }
+
+    impl Drop for TlsEnvTestGuard {
+        fn drop(&mut self) {
+            // SAFETY: this guard holds the module-wide environment test lock,
+            // so TLS tests in this module cannot concurrently read or mutate
+            // ULTRASQL_TLS_PEM_LIMIT_BYTES while restoration runs.
+            unsafe {
+                match &self.previous {
+                    Some(value) => std::env::set_var("ULTRASQL_TLS_PEM_LIMIT_BYTES", value),
+                    None => std::env::remove_var("ULTRASQL_TLS_PEM_LIMIT_BYTES"),
+                }
+            }
+        }
+    }
+
+    fn tls_env_test_guard(value: Option<&str>) -> TlsEnvTestGuard {
+        let lock = tls_env_test_lock();
+        let previous = std::env::var_os("ULTRASQL_TLS_PEM_LIMIT_BYTES");
         // SAFETY: tls_env_test_lock serializes process-env mutation in this
         // module's tests.
         unsafe {
-            std::env::remove_var("ULTRASQL_TLS_PEM_LIMIT_BYTES");
+            match value {
+                Some(value) => std::env::set_var("ULTRASQL_TLS_PEM_LIMIT_BYTES", value),
+                None => std::env::remove_var("ULTRASQL_TLS_PEM_LIMIT_BYTES"),
+            }
+        }
+        TlsEnvTestGuard {
+            previous,
+            _lock: lock,
         }
     }
 

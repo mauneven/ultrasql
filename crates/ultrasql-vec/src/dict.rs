@@ -21,6 +21,7 @@ use std::collections::HashMap;
 
 use crate::bitmap::Bitmap;
 use crate::column::{ColumnError, NumericColumn, StringColumn};
+use crate::int_cast::u32_to_usize;
 
 /// Errors raised while building dictionary-encoded string columns.
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
@@ -138,8 +139,7 @@ impl DictionaryColumn {
     pub fn decode_at(&self, i: usize) -> &str {
         let code = self.codes.data()[i];
         assert_ne!(code, u32::MAX, "decode_at called on null row {i}");
-        let idx =
-            usize::try_from(code).expect("dictionary code must fit usize on supported targets");
+        let idx = u32_to_usize(code);
         match self.dict.get(idx) {
             Some(value) => value,
             None => panic!(

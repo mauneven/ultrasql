@@ -32,6 +32,7 @@ pub mod bitmap;
 pub mod column;
 pub mod dict;
 pub mod dict_i64;
+mod int_cast;
 pub mod jit;
 pub mod kernels;
 

@@ -158,7 +158,7 @@ impl<L: PageLoader> HeapAccess<L> {
                     // Both are benign (concurrent vacuum or shrinkage); ignore.
                     let _ = page.delete_tuple(*slot);
                 }
-                page.compact();
+                page.compact()?;
             }
 
             let reclaimed = u32::try_from(dead_slots.len())

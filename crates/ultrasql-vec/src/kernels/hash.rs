@@ -18,6 +18,7 @@
 
 use crate::bitmap::Bitmap;
 use crate::column::NumericColumn;
+use crate::int_cast::u32_to_usize;
 
 /// FNV-1a 64-bit offset basis.
 const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
@@ -25,7 +26,7 @@ const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
 const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
 
 fn offset_to_usize(offset: u32) -> usize {
-    usize::try_from(offset).expect("hash_text_bytes: offset must fit usize on supported targets")
+    u32_to_usize(offset)
 }
 
 // ============================================================================

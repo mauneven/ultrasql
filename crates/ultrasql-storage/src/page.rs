@@ -382,18 +382,6 @@ fn item_field_to_usize(field: u32, name: &'static str) -> Result<usize, PageErro
     usize::try_from(field).map_err(|_| PageError::Malformed(name))
 }
 
-fn invariant_item_field_to_usize(field: u32, name: &'static str) -> usize {
-    item_field_to_usize(field, name).expect("page invariant: item field fits usize")
-}
-
-fn invariant_item_offset(offset: usize) -> u32 {
-    item_offset_from_usize(offset).expect("page invariant: tuple offset fits itemid")
-}
-
-fn invariant_page_bound(value: usize) -> u16 {
-    page_u16_from_usize(value, "page bound").expect("page invariant: page bound fits u16")
-}
-
 impl Page {
     /// Allocate a freshly-initialized empty heap page.
     #[must_use]
@@ -630,7 +618,7 @@ impl Page {
     /// Reclaim dead-tuple space by compacting live tuples to the high
     /// end of the page and clearing dead-slot data. Slot indices for
     /// live tuples are preserved.
-    pub fn compact(&mut self) {
+    pub fn compact(&mut self) -> Result<(), PageError> {
         let mut header = self.header();
         let count = header.slot_count();
         // Gather (slot, length) for every live tuple, in descending
@@ -649,15 +637,23 @@ impl Page {
 
         let mut write_end = usize::from(header.special);
         for (slot, off, len) in live {
-            let src = invariant_item_field_to_usize(off, "tuple offset");
-            let length = invariant_item_field_to_usize(len, "tuple length");
-            let new_off = write_end - length;
+            let src = item_field_to_usize(off, "tuple offset")?;
+            let length = item_field_to_usize(len, "tuple length")?;
+            let src_end = src
+                .checked_add(length)
+                .ok_or(PageError::Malformed("tuple range overflow"))?;
+            if src_end > self.bytes.len() {
+                return Err(PageError::Malformed("tuple range out of bounds"));
+            }
+            let new_off = write_end
+                .checked_sub(length)
+                .ok_or(PageError::Malformed("tuple compact underflow"))?;
             if new_off != src {
                 // copy_within is safe for overlapping ranges; the
                 // ordering above guarantees `new_off >= src`.
-                self.bytes.copy_within(src..src + length, new_off);
+                self.bytes.copy_within(src..src_end, new_off);
             }
-            let new_id = ItemId::new(invariant_item_offset(new_off), len, ItemIdFlags::Normal);
+            let new_id = ItemId::new(item_offset_from_usize(new_off)?, len, ItemIdFlags::Normal);
             self.write_item_id(slot, new_id);
             write_end = new_off;
         }
@@ -670,8 +666,9 @@ impl Page {
             }
         }
 
-        header.upper = invariant_page_bound(write_end);
+        header.upper = page_u16_from_usize(write_end, "page upper")?;
         header.encode(&mut self.bytes);
+        Ok(())
     }
 
     // ----------------- internal helpers ----------------------------------
@@ -801,7 +798,7 @@ mod tests {
         let s2 = page.insert_tuple(b"cccccc").unwrap();
         let before = page.header().free_space();
         page.delete_tuple(s1).unwrap();
-        page.compact();
+        page.compact().unwrap();
         let after = page.header().free_space();
         assert!(after > before, "compact must reclaim deleted tuple space");
         // Live tuples remain readable at their original slots.
@@ -889,10 +886,29 @@ mod tests {
         let s0 = page.insert_tuple(b"first").unwrap();
         let _s1 = page.insert_tuple(b"second").unwrap();
         page.delete_tuple(s0).unwrap();
-        page.compact();
+        page.compact().unwrap();
         // The unused slot at index 0 should be reused on the next insert.
         let s_new = page.insert_tuple(b"new").unwrap();
         assert_eq!(s_new, 0);
         assert_eq!(page.read_tuple(s_new).unwrap(), b"new");
+    }
+
+    #[test]
+    fn compact_rejects_malformed_live_tuple_range() {
+        let mut page = Page::new_heap();
+        let slot = page.insert_tuple(b"ok").unwrap();
+        let item_off = Page::item_id_offset(slot);
+        let malformed = ItemId::new(8_000, 500, ItemIdFlags::Normal);
+        write_u32_le(
+            &mut page.as_bytes_mut()[item_off..item_off + ITEMID_SIZE],
+            malformed.into_raw(),
+        );
+
+        let err = page.compact().unwrap_err();
+
+        assert!(matches!(
+            err,
+            PageError::Malformed("tuple range out of bounds")
+        ));
     }
 }
