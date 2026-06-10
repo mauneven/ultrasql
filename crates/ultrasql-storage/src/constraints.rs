@@ -527,7 +527,9 @@ impl ConstraintChecker {
             .iter()
             .map(|&col| row.get(col).cloned().unwrap_or(Value::Null))
             .collect();
-        if key.iter().all(|v| v == &Value::Null) {
+        // SQL's default MATCH SIMPLE semantics skip the FK lookup when
+        // any referencing column is NULL.
+        if key.iter().any(|v| v == &Value::Null) {
             return Ok(());
         }
         if !(self.fk_lookup)(target_rel, &key) {
@@ -747,6 +749,27 @@ mod tests {
         );
         let err = c.check_insert(&[Value::Int64(999)]).expect_err("must fail");
         assert!(matches!(err, ConstraintError::ForeignKeyViolation));
+    }
+
+    #[test]
+    fn composite_fk_match_simple_skips_any_null_key_column() {
+        let c = ConstraintChecker::new(
+            vec![Constraint::ForeignKey {
+                columns: vec![0, 1],
+                target_rel: Oid::new(100),
+                target_columns: vec![0, 1],
+                on_delete: ReferentialAction::Restrict,
+                on_update: ReferentialAction::NoAction,
+                deferrable: false,
+                initially_deferred: false,
+            }],
+            |_, _| false,
+            |_, _| Vec::new(),
+        );
+
+        assert!(c.check_insert(&[Value::Null, Value::Int64(1)]).is_ok());
+        assert!(c.check_insert(&[Value::Int64(1), Value::Null]).is_ok());
+        assert!(c.check_insert(&[Value::Null, Value::Null]).is_ok());
     }
 
     #[test]
