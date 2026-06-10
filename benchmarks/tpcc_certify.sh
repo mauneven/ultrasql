@@ -26,7 +26,7 @@ POSTGRES_IMAGE="${TPCC_POSTGRES_IMAGE:-postgres:17}"
 POSTGRES_CONTAINER="${TPCC_POSTGRES_CONTAINER:-ultrasql-postgres-tpcc}"
 POSTGRES_PORT="${TPCC_POSTGRES_PORT:-55433}"
 POSTGRES_PASSWORD="${TPCC_POSTGRES_PASSWORD:-postgres}"
-OUT_DIR="benchmarks/results/latest"
+OUT_DIR="${TPCC_OUT_DIR:-benchmarks/results/latest}"
 RAW_DIR="$OUT_DIR/raw"
 SUMMARY_OUT="$OUT_DIR/tpcc_certification.json"
 

@@ -355,10 +355,10 @@ for suite in "${suites[@]}"; do
             run_suite "$suite" benchmarks/clickbench_certify.sh
             ;;
         tpcb)
-            run_suite "$suite" benchmarks/tpcb_certify.sh
+            run_suite "$suite" env TPCB_OUT_DIR="$OUT_DIR" benchmarks/tpcb_certify.sh
             ;;
         tpcc)
-            run_suite "$suite" benchmarks/tpcc_certify.sh
+            run_suite "$suite" env TPCC_OUT_DIR="$OUT_DIR" benchmarks/tpcc_certify.sh
             ;;
         *)
             echo "certify.sh: unknown suite '$suite'" >&2

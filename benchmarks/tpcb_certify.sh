@@ -25,7 +25,7 @@ POSTGRES_IMAGE="${TPCB_POSTGRES_IMAGE:-postgres:17}"
 POSTGRES_CONTAINER="${TPCB_POSTGRES_CONTAINER:-ultrasql-postgres-tpcb}"
 POSTGRES_PORT="${TPCB_POSTGRES_PORT:-55432}"
 POSTGRES_PASSWORD="${TPCB_POSTGRES_PASSWORD:-postgres}"
-OUT_DIR="benchmarks/results/latest"
+OUT_DIR="${TPCB_OUT_DIR:-benchmarks/results/latest}"
 RAW_DIR="$OUT_DIR/raw"
 SUMMARY_OUT="$OUT_DIR/tpcb_certification.json"
 
@@ -231,12 +231,12 @@ if [[ -z "$POSTGRES_RESULT" ]]; then
     fi
 fi
 
-python3 - "$SUMMARY_OUT" "$POSTGRES_RESULT" "$ULTRASQL_RESULT" <<'PY'
+python3 - "$SUMMARY_OUT" "$POSTGRES_RESULT" "$ULTRASQL_RESULT" "$KERNEL_SMOKE_RESULT" <<'PY'
 import json
 import pathlib
 import sys
 
-summary_path, pg_path, ultra_path = sys.argv[1:]
+summary_path, pg_path, ultra_path, kernel_smoke_result = sys.argv[1:]
 
 def load(path):
     if not path:
@@ -289,7 +289,7 @@ doc = {
     "ultrasql_throughput_per_sec": ul_tps,
     "throughput_ratio_ultrasql_vs_postgres": ratio,
     "ultrasql_p99_latency_us": ul_p99_us,
-    "kernel_smoke_result": "benchmarks/results/latest/raw/tpcb_32conn-ultrasql-kernel.json",
+    "kernel_smoke_result": kernel_smoke_result,
     "next_step": (
         "Set POSTGRES_DSN for PostgreSQL 17 or let TPCB_AUTO_POSTGRES=1 start "
         "local postgres:17, then rerun the same command on a quiet host if "

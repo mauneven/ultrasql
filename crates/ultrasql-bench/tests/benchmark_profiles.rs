@@ -25,7 +25,9 @@ fn certification_runner_splits_smoke_and_full_profiles() {
     assert!(script.contains("benchmarks/tpch_sf10_certify.sh"));
     assert!(script.contains("benchmarks/tpch_sf1_postgres_certify.sh"));
     assert!(script.contains("benchmarks/clickbench_certify.sh"));
+    assert!(script.contains("TPCB_OUT_DIR=\"$OUT_DIR\""));
     assert!(script.contains("benchmarks/tpcc_certify.sh"));
+    assert!(script.contains("TPCC_OUT_DIR=\"$OUT_DIR\""));
     assert!(script.contains("benchmarks/sysbench_certify.sh"));
     assert!(script.contains("chaos-recovery"));
     assert!(script.contains("benchmarks/chaos_recovery.sh"));
@@ -67,11 +69,20 @@ fn ci_bench_uses_pr_smoke_and_scheduled_full_certifications() {
 
 #[test]
 fn tpcc_and_sysbench_certification_wrappers_write_artifacts() {
+    let tpcb = repo_file("benchmarks/tpcb_certify.sh");
     let tpcc = repo_file("benchmarks/tpcc_certify.sh");
     let sysbench = repo_file("benchmarks/sysbench_certify.sh");
 
+    assert!(tpcb.contains("OUT_DIR=\"${TPCB_OUT_DIR:-benchmarks/results/latest}\""));
+    assert!(tpcb.contains("RAW_DIR=\"$OUT_DIR/raw\""));
+    assert!(tpcb.contains("SUMMARY_OUT=\"$OUT_DIR/tpcb_certification.json\""));
+    assert!(tpcb.contains("\"kernel_smoke_result\": kernel_smoke_result"));
+
     assert!(tpcc.contains("tpcc_5types"));
     assert!(tpcc.contains("tpcc_certification.json"));
+    assert!(tpcc.contains("OUT_DIR=\"${TPCC_OUT_DIR:-benchmarks/results/latest}\""));
+    assert!(tpcc.contains("RAW_DIR=\"$OUT_DIR/raw\""));
+    assert!(tpcc.contains("SUMMARY_OUT=\"$OUT_DIR/tpcc_certification.json\""));
     assert!(tpcc.contains("POSTGRES_DSN"));
     assert!(tpcc.contains("TPCC_CONNECTIONS"));
     assert!(tpcc.contains("TMP_ULTRASQL_RESULT"));
