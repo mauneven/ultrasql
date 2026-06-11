@@ -77,6 +77,18 @@ impl InfoMask {
     /// pre-update / pre-delete state.
     pub const UPDATED_IN_PLACE: u16 = 1 << 10;
 
+    const KNOWN_BITS: u16 = Self::HAS_NULL
+        | Self::HAS_VARWIDTH
+        | Self::XMIN_COMMITTED
+        | Self::XMIN_INVALID
+        | Self::XMAX_COMMITTED
+        | Self::XMAX_INVALID
+        | Self::UPDATED
+        | Self::HOT_UPDATED
+        | Self::FROZEN
+        | Self::SUBXACT
+        | Self::UPDATED_IN_PLACE;
+
     /// Wrap an existing 16-bit mask.
     #[must_use]
     pub const fn from_bits(bits: u16) -> Self {
@@ -208,7 +220,11 @@ impl TupleHeader {
         let xmax = Xid::new(read_u64_le(&bytes[8..16]).ok()?);
         let cmin = CommandId::new(read_u32_le(&bytes[16..20]).ok()?);
         let cmax = CommandId::new(read_u32_le(&bytes[20..24]).ok()?);
-        let infomask = InfoMask::from_bits(read_u16_le(&bytes[24..26]).ok()?);
+        let infomask_bits = read_u16_le(&bytes[24..26]).ok()?;
+        if infomask_bits & !InfoMask::KNOWN_BITS != 0 {
+            return None;
+        }
+        let infomask = InfoMask::from_bits(infomask_bits);
         let n_atts = read_u16_le(&bytes[26..28]).ok()?;
         let data_offset = read_u16_le(&bytes[28..30]).ok()?;
         // 2 bytes of padding at 30..32 reserved.
@@ -350,6 +366,15 @@ mod tests {
         let mut bytes = [0_u8; TUPLE_HEADER_SIZE];
         h.encode(&mut bytes);
         bytes[30] = 1;
+        assert!(TupleHeader::decode(&bytes).is_none());
+    }
+
+    #[test]
+    fn decode_rejects_reserved_infomask_bits() {
+        let h = TupleHeader::fresh(Xid::new(1), CommandId::new(0), sample_tid(), 1);
+        let mut bytes = [0_u8; TUPLE_HEADER_SIZE];
+        h.encode(&mut bytes);
+        bytes[25] = 0x80;
         assert!(TupleHeader::decode(&bytes).is_none());
     }
 
