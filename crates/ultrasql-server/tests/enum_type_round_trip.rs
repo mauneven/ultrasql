@@ -185,3 +185,40 @@ async fn enum_type_catalog_storage_and_wire_survive_restart() {
         .expect_err("invalid enum label rejected after restart");
     shutdown(running).await;
 }
+
+#[tokio::test]
+async fn enum_type_keys_distinguish_schema_dot_from_type_dot() {
+    let data_dir = tempfile::TempDir::new().unwrap();
+    let running = start_persistent_server(data_dir.path(), "enum_type_quoted_dot").await;
+
+    running
+        .client
+        .batch_execute(
+            "CREATE SCHEMA app; \
+             CREATE TYPE app.\"mood.type\" AS ENUM ('app'); \
+             CREATE SCHEMA \"app.mood\"; \
+             CREATE TYPE \"app.mood\".type AS ENUM ('schema'); \
+             CREATE TABLE app.enum_dot_probe (id INT, mood app.\"mood.type\"); \
+             CREATE TABLE \"app.mood\".enum_type_probe (id INT, mood \"app.mood\".type); \
+             INSERT INTO app.enum_dot_probe VALUES (1, 'app'); \
+             INSERT INTO \"app.mood\".enum_type_probe VALUES (1, 'schema')",
+        )
+        .await
+        .expect("dotted schema and dotted type names do not collide");
+
+    let app_values = running
+        .client
+        .simple_query("SELECT mood FROM app.enum_dot_probe")
+        .await
+        .expect("select dotted enum type value");
+    assert_eq!(first_col_strings(&app_values), vec!["app"]);
+
+    let schema_values = running
+        .client
+        .simple_query("SELECT mood FROM \"app.mood\".enum_type_probe")
+        .await
+        .expect("select dotted schema enum value");
+    assert_eq!(first_col_strings(&schema_values), vec!["schema"]);
+
+    shutdown(running).await;
+}

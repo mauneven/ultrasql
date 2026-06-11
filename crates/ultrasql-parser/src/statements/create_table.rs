@@ -723,12 +723,19 @@ impl Parser<'_> {
             parts.push(ident);
         }
         if parts.len() == 1 {
-            return Ok(first);
+            return Ok(if first.quoted {
+                Identifier {
+                    value: render_ddl_type_identifier_part(&first),
+                    ..first
+                }
+            } else {
+                first
+            });
         }
         Ok(Identifier {
             value: parts
                 .iter()
-                .map(|part| part.value.as_str())
+                .map(render_ddl_type_identifier_part)
                 .collect::<Vec<_>>()
                 .join("."),
             quoted: parts.iter().any(|part| part.quoted),
@@ -774,6 +781,14 @@ impl Parser<'_> {
             }
         }
         Ok(list)
+    }
+}
+
+fn render_ddl_type_identifier_part(part: &Identifier) -> String {
+    if part.quoted {
+        format!("\"{}\"", part.value.replace('"', "\"\""))
+    } else {
+        part.value.clone()
     }
 }
 
@@ -850,6 +865,12 @@ mod tests {
     fn create_table_parses_schema_qualified_type_name() {
         let stmt = parse_create_table("CREATE TABLE moods (value app.mood)");
         assert_eq!(stmt.columns[0].data_type.name.value, "app.mood");
+    }
+
+    #[test]
+    fn create_table_preserves_quoted_schema_qualified_type_name() {
+        let stmt = parse_create_table(r#"CREATE TABLE moods (value app."mood.type")"#);
+        assert_eq!(stmt.columns[0].data_type.name.value, r#"app."mood.type""#);
     }
 
     #[test]

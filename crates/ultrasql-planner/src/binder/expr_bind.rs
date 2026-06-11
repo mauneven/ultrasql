@@ -22,7 +22,8 @@ use ultrasql_parser::ast::{BinaryOp, Expr, Literal, ObjectName, UnaryOp};
 use super::expr_type::{binary_result_type, comparable, display_unary};
 use super::{
     Catalog, PlanError, ScalarExpr, Schema, ScopeFrame, ScopeStack, bind_select_with_ctes,
-    derive_agg_output_name, is_aggregate_name, is_scalar_min_max_call, plan_contains_outer_column,
+    derive_agg_output_name, is_aggregate_name, is_scalar_min_max_call, parse_pg_identifier_path,
+    plan_contains_outer_column,
 };
 
 const MICROS_PER_DAY: i64 = 86_400_000_000;
@@ -2832,49 +2833,6 @@ fn resolve_regtype_literal(text: &str, catalog: &dyn Catalog) -> Option<Oid> {
         [name] => catalog.lookup_type_oid(name),
         [schema_name, type_name] => catalog.lookup_type_oid_in_schema(schema_name, type_name),
         _ => None,
-    }
-}
-
-fn parse_pg_identifier_path(text: &str) -> Option<Vec<String>> {
-    let mut parts = Vec::new();
-    let mut chars = text.chars().peekable();
-    loop {
-        match chars.peek().copied()? {
-            '"' => {
-                chars.next();
-                let mut part = String::new();
-                loop {
-                    match chars.next()? {
-                        '"' if chars.peek() == Some(&'"') => {
-                            chars.next();
-                            part.push('"');
-                        }
-                        '"' => break,
-                        ch => part.push(ch),
-                    }
-                }
-                parts.push(part);
-            }
-            _ => {
-                let mut part = String::new();
-                while let Some(ch) = chars.peek().copied() {
-                    if ch == '.' {
-                        break;
-                    }
-                    part.push(ch);
-                    chars.next();
-                }
-                if part.is_empty() {
-                    return None;
-                }
-                parts.push(part);
-            }
-        }
-        match chars.next() {
-            Some('.') => continue,
-            None => return Some(parts),
-            Some(_) => return None,
-        }
     }
 }
 

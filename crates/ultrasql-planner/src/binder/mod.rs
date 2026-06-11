@@ -94,7 +94,8 @@ use self::privilege::{
 };
 use self::util::{
     bind_order_by, bind_returning, bind_unsigned_literal, build_returning_schema,
-    derive_output_name, lookup_table_reference, object_name_simple, plan_contains_outer_column,
+    derive_output_name, lookup_table_reference, object_name_simple, parse_pg_identifier_path,
+    plan_contains_outer_column,
 };
 
 #[cfg(test)]

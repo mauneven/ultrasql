@@ -77,6 +77,49 @@ pub(super) fn canonical_table_plan_name(meta: &TableMeta, table_name: &str) -> S
     ultrasql_catalog::table_lookup_key(&meta.schema_name, table_name)
 }
 
+pub(super) fn parse_pg_identifier_path(text: &str) -> Option<Vec<String>> {
+    let mut parts = Vec::new();
+    let mut chars = text.chars().peekable();
+    loop {
+        match chars.peek().copied()? {
+            '"' => {
+                chars.next();
+                let mut part = String::new();
+                loop {
+                    match chars.next()? {
+                        '"' if chars.peek() == Some(&'"') => {
+                            chars.next();
+                            part.push('"');
+                        }
+                        '"' => break,
+                        ch => part.push(ch),
+                    }
+                }
+                parts.push(part);
+            }
+            _ => {
+                let mut part = String::new();
+                while let Some(ch) = chars.peek().copied() {
+                    if ch == '.' {
+                        break;
+                    }
+                    part.push(ch);
+                    chars.next();
+                }
+                if part.is_empty() {
+                    return None;
+                }
+                parts.push(part);
+            }
+        }
+        match chars.next() {
+            Some('.') => continue,
+            None => return Some(parts),
+            Some(_) => return None,
+        }
+    }
+}
+
 pub(super) fn lookup_table_reference(
     catalog: &dyn Catalog,
     name: &ObjectName,

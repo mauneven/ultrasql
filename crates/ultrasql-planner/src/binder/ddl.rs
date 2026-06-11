@@ -24,7 +24,7 @@ use ultrasql_parser::ast::{
 use super::expr_bind::{coerce_literal_to_type, resolve_builtin_collation};
 use super::{
     Catalog, LogicalAlterTableAction, LogicalPlan, PlanError, ScalarExpr, ScopeStack, bind_expr,
-    bind_select, lookup_table_reference, object_name_simple,
+    bind_select, lookup_table_reference, object_name_simple, parse_pg_identifier_path,
 };
 use crate::catalog::TableMeta;
 use crate::plan::{
@@ -1325,9 +1325,10 @@ fn resolve_type_name_with_catalog(
 }
 
 fn lookup_custom_type_name(catalog: &dyn Catalog, t: &TypeName) -> Option<DataType> {
-    type_name_namespace_and_name(&t.name.value).map_or_else(
-        || catalog.lookup_type(&t.name.value),
-        |(schema_name, type_name)| {
+    let parts = parse_pg_identifier_path(&t.name.value)?;
+    match parts.as_slice() {
+        [type_name] => catalog.lookup_type(type_name),
+        [schema_name, type_name] => {
             if schema_name.eq_ignore_ascii_case("pg_catalog") {
                 let mut unqualified = t.clone();
                 unqualified.name.value = type_name.to_owned();
@@ -1336,13 +1337,9 @@ fn lookup_custom_type_name(catalog: &dyn Catalog, t: &TypeName) -> Option<DataTy
                 }
             }
             catalog.lookup_type_in_schema(schema_name, type_name)
-        },
-    )
-}
-
-fn type_name_namespace_and_name(name: &str) -> Option<(&str, &str)> {
-    let (schema_name, type_name) = name.rsplit_once('.')?;
-    (!schema_name.is_empty() && !type_name.is_empty()).then_some((schema_name, type_name))
+        }
+        _ => None,
+    }
 }
 
 fn resolve_bpchar_type(len: Option<u32>) -> Result<DataType, PlanError> {

@@ -44,11 +44,9 @@ pub fn table_lookup_key(schema_name: &str, table_name: &str) -> String {
 /// Return the canonical type lookup key for a schema-qualified type.
 #[must_use]
 pub fn type_lookup_key(schema_name: &str, type_name: &str) -> String {
-    format!(
-        "{}.{}",
-        fold_identifier(schema_name),
-        fold_identifier(type_name)
-    )
+    let schema = fold_identifier(schema_name);
+    let ty = fold_identifier(type_name);
+    format!("{}:{schema}{}:{ty}", schema.len(), ty.len())
 }
 
 /// Return the canonical lookup key for a schema-qualified index.
@@ -345,5 +343,17 @@ mod tests {
         assert!(entry.is_unique);
         assert_eq!(entry.columns, vec![0]);
         assert_eq!(entry.table_oid, Oid::new(16384));
+    }
+
+    #[test]
+    fn type_lookup_key_distinguishes_dots_in_schema_and_type_names() {
+        assert_ne!(
+            type_lookup_key("app", "mood.type"),
+            type_lookup_key("app.mood", "type")
+        );
+        assert_eq!(
+            type_lookup_key("App", "Mood.Type"),
+            type_lookup_key("app", "mood.type")
+        );
     }
 }
