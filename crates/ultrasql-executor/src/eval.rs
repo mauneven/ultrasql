@@ -4263,17 +4263,15 @@ fn eval_substring(args: &[Value]) -> Result<Value, EvalError> {
             return Err(EvalError::Type("substring: `from` must be integer".into()));
         }
     };
-    // SQL substring is 1-based and clamps to the string's character
-    // range. We operate on bytes for the v0.6 milestone; ASCII-only
-    // TPC-H comments / phone numbers / type strings make this safe.
-    let bytes = s.as_bytes();
-    let start_byte_signed = from.saturating_sub(1);
-    let start = if start_byte_signed < 0 {
+    // SQL substring is 1-based and counts text characters, not UTF-8 bytes.
+    let char_count = s.chars().count();
+    let start_char_signed = from.saturating_sub(1);
+    let start = if start_char_signed < 0 {
         0
     } else {
-        usize::try_from(start_byte_signed)
-            .unwrap_or(bytes.len())
-            .min(bytes.len())
+        usize::try_from(start_char_signed)
+            .unwrap_or(char_count)
+            .min(char_count)
     };
     let end = if args.len() == 3 {
         let len = match args[2].as_i64() {
@@ -4287,18 +4285,26 @@ fn eval_substring(args: &[Value]) -> Result<Value, EvalError> {
         };
         let len = len.max(0);
         let mut effective = usize::try_from(len).unwrap_or(0);
-        if start_byte_signed < 0 {
-            let abs_back = usize::try_from(start_byte_signed.unsigned_abs()).unwrap_or(usize::MAX);
+        if start_char_signed < 0 {
+            let abs_back = usize::try_from(start_char_signed.unsigned_abs()).unwrap_or(usize::MAX);
             effective = effective.saturating_sub(abs_back);
         }
-        (start + effective).min(bytes.len())
+        start.saturating_add(effective).min(char_count)
     } else {
-        bytes.len()
+        char_count
     };
-    let slice = &bytes[start..end];
-    let out = std::str::from_utf8(slice)
-        .map_err(|_| EvalError::Type("substring: utf-8 boundary mid-character".into()))?;
-    Ok(Value::Text(out.to_owned()))
+    let start_byte = byte_index_for_char(s, start);
+    let end_byte = byte_index_for_char(s, end);
+    Ok(Value::Text(s[start_byte..end_byte].to_owned()))
+}
+
+fn byte_index_for_char(text: &str, char_index: usize) -> usize {
+    if char_index == 0 {
+        return 0;
+    }
+    text.char_indices()
+        .nth(char_index)
+        .map_or(text.len(), |(byte_index, _)| byte_index)
 }
 
 // ---------------------------------------------------------------------------
@@ -8617,6 +8623,21 @@ mod tests {
         ));
 
         assert_eq!(ev.eval(&[]).unwrap(), Value::Text("13".to_owned()));
+    }
+
+    #[test]
+    fn substring_counts_unicode_characters() {
+        assert_eq!(
+            eval_fn(
+                "substring",
+                vec![
+                    Value::Text("a\u{00e9}bc".to_owned()),
+                    Value::Int32(2),
+                    Value::Int32(1),
+                ],
+            ),
+            Value::Text("\u{00e9}".to_owned())
+        );
     }
 
     #[test]
