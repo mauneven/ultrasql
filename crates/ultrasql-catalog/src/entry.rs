@@ -49,6 +49,30 @@ pub fn table_lookup_key(schema_name: &str, table_name: &str) -> String {
     }
 }
 
+/// Decode an encoded table lookup key into `(schema, relation)`.
+///
+/// Returns `None` for legacy unencoded keys such as public relations
+/// without dots. The returned string slices borrow from `key`.
+#[must_use]
+pub fn decode_table_lookup_key(key: &str) -> Option<(&str, &str)> {
+    let (schema_len_text, rest) = key.split_once(':')?;
+    if schema_len_text.is_empty() || !schema_len_text.chars().all(|ch| ch.is_ascii_digit()) {
+        return None;
+    }
+    let schema_len = schema_len_text.parse::<usize>().ok()?;
+    let (schema, after_schema) = split_at_byte(rest, schema_len)?;
+    let (relation_len_text, relation) = after_schema.split_once(':')?;
+    if relation_len_text.is_empty() || !relation_len_text.chars().all(|ch| ch.is_ascii_digit()) {
+        return None;
+    }
+    let relation_len = relation_len_text.parse::<usize>().ok()?;
+    (relation.len() == relation_len).then_some((schema, relation))
+}
+
+fn split_at_byte(text: &str, index: usize) -> Option<(&str, &str)> {
+    (index <= text.len() && text.is_char_boundary(index)).then(|| text.split_at(index))
+}
+
 /// Return the canonical type lookup key for a schema-qualified type.
 #[must_use]
 pub fn type_lookup_key(schema_name: &str, type_name: &str) -> String {
@@ -377,5 +401,23 @@ mod tests {
             table_lookup_key("App", "Events.Log"),
             table_lookup_key("app", "events.log")
         );
+    }
+
+    #[test]
+    fn decode_table_lookup_key_round_trips_encoded_relation_keys() {
+        let public_dotted = table_lookup_key("public", "events.log");
+        assert_eq!(
+            decode_table_lookup_key(&public_dotted),
+            Some(("public", "events.log"))
+        );
+
+        let schema_dotted = table_lookup_key("app.events", "log");
+        assert_eq!(
+            decode_table_lookup_key(&schema_dotted),
+            Some(("app.events", "log"))
+        );
+
+        assert_eq!(decode_table_lookup_key("orders"), None);
+        assert_eq!(decode_table_lookup_key("3:app4:logsx"), None);
     }
 }

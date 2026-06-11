@@ -2263,6 +2263,11 @@ fn rows_pg_sequences(ctx: &LowerCtx<'_>) -> Vec<Vec<Value>> {
 
 fn sequence_display_name(key: &str, namespace: &str) -> String {
     let namespace = namespace.to_ascii_lowercase();
+    if let Some((schema, relation)) = ultrasql_catalog::decode_table_lookup_key(key)
+        && schema.eq_ignore_ascii_case(&namespace)
+    {
+        return relation.to_owned();
+    }
     let prefix = format!("{namespace}.");
     let visible = key.strip_prefix(&prefix).unwrap_or(key);
     visible

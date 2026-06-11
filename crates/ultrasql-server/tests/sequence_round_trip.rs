@@ -64,6 +64,17 @@ async fn sequence_functions_preserve_quoted_dot_in_public_name() {
     assert_eq!(simple_i64(client, "SELECT nextval('\"seq.dot\"')").await, 3);
     assert_eq!(simple_i64(client, "SELECT currval('\"seq.dot\"')").await, 3);
 
+    let catalog_name = client
+        .query_one(
+            "SELECT sequencename FROM pg_catalog.pg_sequences \
+             WHERE schemaname = 'public' AND sequencename = 'seq.dot'",
+            &[],
+        )
+        .await
+        .expect("quoted dotted sequence appears in pg_sequences")
+        .get::<_, String>(0);
+    assert_eq!(catalog_name, "seq.dot");
+
     graceful_shutdown(running).await;
 }
 
