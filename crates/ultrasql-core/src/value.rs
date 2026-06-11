@@ -2180,26 +2180,25 @@ fn xml_direct_text(text: &str, element: &XmlElement) -> Option<String> {
     let mut out = String::new();
     let mut cursor = element.content_start;
     while cursor < element.close_start {
-        let Some(relative) = text[cursor..element.close_start].find('<') else {
-            out.push_str(&text[cursor..element.close_start]);
+        let body = text.get(cursor..element.close_start)?;
+        let Some(relative) = body.find('<') else {
+            out.push_str(body);
             break;
         };
-        let open = cursor + relative;
-        out.push_str(&text[cursor..open]);
-        let next = text.as_bytes().get(open + 1).copied()?;
+        let open = cursor.checked_add(relative)?;
+        out.push_str(text.get(cursor..open)?);
+        let next = text.as_bytes().get(open.checked_add(1)?).copied()?;
         match next {
             b'?' => {
-                let end = text[open + 2..element.close_start].find("?>")?;
-                cursor = open + 2 + end + 2;
+                cursor = xml_terminated_cursor_before(text, open, 2, "?>", element.close_start)?;
             }
             b'!' if text[open..].starts_with("<!--") => {
-                let end = text[open + 4..element.close_start].find("-->")?;
-                cursor = open + 4 + end + 3;
+                cursor = xml_terminated_cursor_before(text, open, 4, "-->", element.close_start)?;
             }
             b'!' if text[open..].starts_with("<![CDATA[") => {
-                let end = text[open + 9..element.close_start].find("]]>")?;
-                out.push_str(&text[open + 9..open + 9 + end]);
-                cursor = open + 9 + end + 3;
+                let (cdata, next_cursor) = xml_cdata_body_before(text, open, element.close_start)?;
+                out.push_str(cdata);
+                cursor = next_cursor;
             }
             b'/' => break,
             _ => {
@@ -2315,34 +2314,52 @@ fn xml_xpath_sum_value(matches: &[String]) -> f64 {
 fn xml_collect_string_value(text: &str, element: &XmlElement, out: &mut String) {
     let mut cursor = element.content_start;
     while cursor < element.close_start {
-        let Some(relative) = text[cursor..element.close_start].find('<') else {
-            out.push_str(&text[cursor..element.close_start]);
+        let Some(body) = text.get(cursor..element.close_start) else {
             break;
         };
-        let open = cursor + relative;
-        out.push_str(&text[cursor..open]);
-        let Some(next) = text.as_bytes().get(open + 1).copied() else {
+        let Some(relative) = body.find('<') else {
+            out.push_str(body);
+            break;
+        };
+        let Some(open) = cursor.checked_add(relative) else {
+            break;
+        };
+        let Some(prefix) = text.get(cursor..open) else {
+            break;
+        };
+        out.push_str(prefix);
+        let Some(next) = open
+            .checked_add(1)
+            .and_then(|idx| text.as_bytes().get(idx))
+            .copied()
+        else {
             break;
         };
         match next {
             b'?' => {
-                let Some(end) = text[open + 2..element.close_start].find("?>") else {
+                let Some(next_cursor) =
+                    xml_terminated_cursor_before(text, open, 2, "?>", element.close_start)
+                else {
                     break;
                 };
-                cursor = open + 2 + end + 2;
+                cursor = next_cursor;
             }
             b'!' if text[open..].starts_with("<!--") => {
-                let Some(end) = text[open + 4..element.close_start].find("-->") else {
+                let Some(next_cursor) =
+                    xml_terminated_cursor_before(text, open, 4, "-->", element.close_start)
+                else {
                     break;
                 };
-                cursor = open + 4 + end + 3;
+                cursor = next_cursor;
             }
             b'!' if text[open..].starts_with("<![CDATA[") => {
-                let Some(end) = text[open + 9..element.close_start].find("]]>") else {
+                let Some((cdata, next_cursor)) =
+                    xml_cdata_body_before(text, open, element.close_start)
+                else {
                     break;
                 };
-                out.push_str(&text[open + 9..open + 9 + end]);
-                cursor = open + 9 + end + 3;
+                out.push_str(cdata);
+                cursor = next_cursor;
             }
             b'/' => break,
             _ => {
@@ -2354,6 +2371,13 @@ fn xml_collect_string_value(text: &str, element: &XmlElement, out: &mut String) 
             }
         }
     }
+}
+
+fn xml_cdata_body_before(text: &str, open: usize, limit: usize) -> Option<(&str, usize)> {
+    let body_start = open.checked_add(9)?;
+    let cursor = xml_terminated_cursor_before(text, open, 9, "]]>", limit)?;
+    let body_end = cursor.checked_sub("]]>".len())?;
+    Some((text.get(body_start..body_end)?, cursor))
 }
 
 fn xml_xpath_name_value(fragment: &str) -> String {
