@@ -337,7 +337,10 @@ pub(super) fn bind_create_type(
 ) -> Result<LogicalPlan, PlanError> {
     let type_name = object_name_simple(&s.name);
     let namespace = object_name_namespace(&s.name);
-    if catalog.lookup_type(&type_name).is_some() {
+    if catalog
+        .lookup_type_in_schema(&namespace, &type_name)
+        .is_some()
+    {
         return Err(PlanError::TypeMismatch(format!(
             "type '{type_name}' already exists"
         )));
@@ -395,7 +398,10 @@ pub(super) fn bind_create_domain(
 ) -> Result<LogicalPlan, PlanError> {
     let domain_name = object_name_simple(&s.name);
     let namespace = object_name_namespace(&s.name);
-    if catalog.lookup_type(&domain_name).is_some() {
+    if catalog
+        .lookup_type_in_schema(&namespace, &domain_name)
+        .is_some()
+    {
         return Err(PlanError::TypeMismatch(format!(
             "type '{domain_name}' already exists"
         )));
@@ -1311,11 +1317,32 @@ fn resolve_type_name_with_catalog(
     }
     match resolve_type_name(t) {
         Ok(dtype) => Ok(dtype),
-        Err(PlanError::NotSupported(_)) => catalog.lookup_type(&t.name.value).ok_or({
+        Err(PlanError::NotSupported(_)) => lookup_custom_type_name(catalog, t).ok_or({
             PlanError::NotSupported("CREATE TABLE: column type not implemented in v0.5")
         }),
         Err(err) => Err(err),
     }
+}
+
+fn lookup_custom_type_name(catalog: &dyn Catalog, t: &TypeName) -> Option<DataType> {
+    type_name_namespace_and_name(&t.name.value).map_or_else(
+        || catalog.lookup_type(&t.name.value),
+        |(schema_name, type_name)| {
+            if schema_name.eq_ignore_ascii_case("pg_catalog") {
+                let mut unqualified = t.clone();
+                unqualified.name.value = type_name.to_owned();
+                if let Ok(dtype) = resolve_type_name(&unqualified) {
+                    return Some(dtype);
+                }
+            }
+            catalog.lookup_type_in_schema(schema_name, type_name)
+        },
+    )
+}
+
+fn type_name_namespace_and_name(name: &str) -> Option<(&str, &str)> {
+    let (schema_name, type_name) = name.rsplit_once('.')?;
+    (!schema_name.is_empty() && !type_name.is_empty()).then_some((schema_name, type_name))
 }
 
 fn resolve_bpchar_type(len: Option<u32>) -> Result<DataType, PlanError> {

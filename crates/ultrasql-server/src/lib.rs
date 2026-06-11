@@ -2541,7 +2541,27 @@ impl PlannerCatalog for CombinedCatalog<'_> {
     }
 
     fn lookup_type(&self, name: &str) -> Option<DataType> {
-        PlannerCatalog::lookup_type(self.snapshot, name).or_else(|| self.fallback.lookup_type(name))
+        if let Some((schema_name, type_name)) = type_name_namespace_and_name(name) {
+            return self.lookup_type_in_schema(schema_name, type_name);
+        }
+        for schema_name in search_path_schema_names(self.search_path) {
+            if let Some(data_type) =
+                PlannerCatalog::lookup_type_in_schema(self.snapshot, &schema_name, name)
+            {
+                return Some(data_type);
+            }
+            if let Some(data_type) =
+                PlannerCatalog::lookup_type_in_schema(self.fallback, &schema_name, name)
+            {
+                return Some(data_type);
+            }
+        }
+        None
+    }
+
+    fn lookup_type_in_schema(&self, schema_name: &str, name: &str) -> Option<DataType> {
+        PlannerCatalog::lookup_type_in_schema(self.snapshot, schema_name, name)
+            .or_else(|| PlannerCatalog::lookup_type_in_schema(self.fallback, schema_name, name))
     }
 
     fn lookup_index(&self, name: &str) -> bool {
@@ -2553,8 +2573,27 @@ impl PlannerCatalog for CombinedCatalog<'_> {
     }
 
     fn lookup_type_oid(&self, name: &str) -> Option<Oid> {
-        PlannerCatalog::lookup_type_oid(self.snapshot, name)
-            .or_else(|| self.fallback.lookup_type_oid(name))
+        if let Some((schema_name, type_name)) = type_name_namespace_and_name(name) {
+            return self.lookup_type_oid_in_schema(schema_name, type_name);
+        }
+        for schema_name in search_path_schema_names(self.search_path) {
+            if let Some(oid) =
+                PlannerCatalog::lookup_type_oid_in_schema(self.snapshot, &schema_name, name)
+            {
+                return Some(oid);
+            }
+            if let Some(oid) =
+                PlannerCatalog::lookup_type_oid_in_schema(self.fallback, &schema_name, name)
+            {
+                return Some(oid);
+            }
+        }
+        None
+    }
+
+    fn lookup_type_oid_in_schema(&self, schema_name: &str, name: &str) -> Option<Oid> {
+        PlannerCatalog::lookup_type_oid_in_schema(self.snapshot, schema_name, name)
+            .or_else(|| PlannerCatalog::lookup_type_oid_in_schema(self.fallback, schema_name, name))
     }
 
     fn table_schema_visible_without_qualification(&self, schema_name: &str) -> bool {
@@ -2575,6 +2614,11 @@ fn search_path_contains_schema(search_path: Option<&str>, schema_name: &str) -> 
             .as_deref()
             .is_some_and(|schema| schema == folded)
     })
+}
+
+fn type_name_namespace_and_name(name: &str) -> Option<(&str, &str)> {
+    let (schema_name, type_name) = name.rsplit_once('.')?;
+    (!schema_name.is_empty() && !type_name.is_empty()).then_some((schema_name, type_name))
 }
 
 fn search_path_schema_names(search_path: Option<&str>) -> Vec<String> {

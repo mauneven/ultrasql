@@ -41,6 +41,16 @@ pub fn table_lookup_key(schema_name: &str, table_name: &str) -> String {
     }
 }
 
+/// Return the canonical type lookup key for a schema-qualified type.
+#[must_use]
+pub fn type_lookup_key(schema_name: &str, type_name: &str) -> String {
+    format!(
+        "{}.{}",
+        fold_identifier(schema_name),
+        fold_identifier(type_name)
+    )
+}
+
 /// A table (relation) entry in the catalog.
 ///
 /// The owning catalog hands out cloned `TableEntry` values rather than

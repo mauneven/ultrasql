@@ -254,9 +254,12 @@ where
         };
         self.ensure_schema_exists(namespace)?;
         self.ensure_schema_create_privilege(namespace)?;
-        if snapshot.enum_types.contains_key(type_name)
-            || snapshot.composite_types.contains_key(type_name)
-            || snapshot.tables.contains_key(type_name)
+        let type_key = ultrasql_catalog::type_lookup_key(namespace, type_name);
+        let relation_key = ultrasql_catalog::table_lookup_key(namespace, type_name);
+        if snapshot.enum_types.contains_key(&type_key)
+            || snapshot.composite_types.contains_key(&type_key)
+            || snapshot.domain_types.contains_key(&type_key)
+            || snapshot.tables.contains_key(&relation_key)
         {
             return Err(ServerError::Catalog(
                 ultrasql_catalog::CatalogError::already_exists(type_name.clone()),
@@ -299,7 +302,7 @@ where
                     "abort of catalog-write txn failed after persist_enum_type_rows error",
                 );
             }
-            let _ = self.state.persistent_catalog.drop_enum_type(type_name);
+            let _ = self.state.persistent_catalog.drop_enum_type(&type_key);
             return Err(e.into());
         }
         self.state
@@ -327,9 +330,12 @@ where
         };
         self.ensure_schema_exists(namespace)?;
         self.ensure_schema_create_privilege(namespace)?;
-        if snapshot.enum_types.contains_key(type_name)
-            || snapshot.composite_types.contains_key(type_name)
-            || snapshot.tables.contains_key(type_name)
+        let type_key = ultrasql_catalog::type_lookup_key(namespace, type_name);
+        let relation_key = ultrasql_catalog::table_lookup_key(namespace, type_name);
+        if snapshot.enum_types.contains_key(&type_key)
+            || snapshot.composite_types.contains_key(&type_key)
+            || snapshot.domain_types.contains_key(&type_key)
+            || snapshot.tables.contains_key(&relation_key)
         {
             return Err(ServerError::Catalog(
                 ultrasql_catalog::CatalogError::already_exists(type_name.clone()),
@@ -361,7 +367,7 @@ where
                     "abort of catalog-write txn failed after persist_composite_type_rows error",
                 );
             }
-            let _ = self.state.persistent_catalog.drop_composite_type(type_name);
+            let _ = self.state.persistent_catalog.drop_composite_type(&type_key);
             return Err(e.into());
         }
         self.state
@@ -391,10 +397,12 @@ where
         };
         self.ensure_schema_exists(namespace)?;
         self.ensure_schema_create_privilege(namespace)?;
-        if snapshot.enum_types.contains_key(domain_name)
-            || snapshot.composite_types.contains_key(domain_name)
-            || snapshot.domain_types.contains_key(domain_name)
-            || snapshot.tables.contains_key(domain_name)
+        let type_key = ultrasql_catalog::type_lookup_key(namespace, domain_name);
+        let relation_key = ultrasql_catalog::table_lookup_key(namespace, domain_name);
+        if snapshot.enum_types.contains_key(&type_key)
+            || snapshot.composite_types.contains_key(&type_key)
+            || snapshot.domain_types.contains_key(&type_key)
+            || snapshot.tables.contains_key(&relation_key)
         {
             return Err(ServerError::Catalog(
                 ultrasql_catalog::CatalogError::already_exists(domain_name.clone()),
@@ -444,7 +452,7 @@ where
                     "abort of catalog-write txn failed after persist_domain_type_rows error",
                 );
             }
-            let _ = self.state.persistent_catalog.drop_domain_type(domain_name);
+            let _ = self.state.persistent_catalog.drop_domain_type(&type_key);
             self.state.domain_constraints.remove(&entry.oid);
             return Err(e.into());
         }
@@ -455,7 +463,7 @@ where
                     "abort of catalog-write txn failed after domain-runtime metadata error",
                 );
             }
-            let _ = self.state.persistent_catalog.drop_domain_type(domain_name);
+            let _ = self.state.persistent_catalog.drop_domain_type(&type_key);
             self.state.domain_constraints.remove(&entry.oid);
             return Err(e);
         }

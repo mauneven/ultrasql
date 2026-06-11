@@ -372,6 +372,107 @@ async fn same_relation_name_is_isolated_by_schema() {
 }
 
 #[tokio::test]
+async fn same_type_name_is_isolated_by_schema() {
+    let running = start_sample_server("schema_same_type_name").await;
+
+    running
+        .client
+        .batch_execute(
+            "CREATE SCHEMA app; \
+             CREATE TYPE mood AS ENUM ('ok'); \
+             CREATE TYPE app.mood AS ENUM ('warm'); \
+             CREATE DOMAIN positive_int AS INT CHECK (VALUE > 0); \
+             CREATE DOMAIN app.positive_int AS INT CHECK (VALUE > 10); \
+             CREATE TYPE address AS (zip INT); \
+             CREATE TYPE app.address AS (zip TEXT); \
+             CREATE TABLE public_mood (v public.mood); \
+             CREATE TABLE app.app_mood (v app.mood); \
+             CREATE TABLE public_domain (v public.positive_int); \
+             CREATE TABLE app.app_domain (v app.positive_int); \
+             CREATE TABLE public_address (v public.address); \
+             CREATE TABLE app.app_address (v app.address); \
+             INSERT INTO public_mood VALUES ('ok'); \
+             INSERT INTO app.app_mood VALUES ('warm'); \
+             INSERT INTO public_domain VALUES (5); \
+             INSERT INTO app.app_domain VALUES (11)",
+        )
+        .await
+        .expect("schemas may contain user-defined types with the same name");
+
+    running
+        .client
+        .batch_execute("INSERT INTO public_mood VALUES ('warm')")
+        .await
+        .expect_err("public enum must reject app-only label");
+    running
+        .client
+        .batch_execute("INSERT INTO app.app_mood VALUES ('ok')")
+        .await
+        .expect_err("app enum must reject public-only label");
+    running
+        .client
+        .batch_execute("INSERT INTO app.app_domain VALUES (5)")
+        .await
+        .expect_err("app domain must enforce app-only constraint");
+
+    running
+        .client
+        .batch_execute("SET search_path TO app, public")
+        .await
+        .expect("set app-first search path");
+    running
+        .client
+        .batch_execute(
+            "CREATE TABLE app.path_mood (v mood); \
+             CREATE TABLE app.path_domain (v positive_int); \
+             CREATE TABLE app.path_address (v address); \
+             INSERT INTO app.path_mood VALUES ('warm'); \
+             INSERT INTO app.path_domain VALUES (11)",
+        )
+        .await
+        .expect("search path resolves app user-defined types first");
+    running
+        .client
+        .batch_execute("INSERT INTO app.path_mood VALUES ('ok')")
+        .await
+        .expect_err("app enum must reject public-only label");
+    running
+        .client
+        .batch_execute("INSERT INTO app.path_domain VALUES (5)")
+        .await
+        .expect_err("app search-path domain must enforce app-only constraint");
+
+    running
+        .client
+        .batch_execute("RESET search_path")
+        .await
+        .expect("reset search path");
+    running
+        .client
+        .batch_execute(
+            "CREATE TABLE public_path_mood (v mood); \
+             CREATE TABLE public_path_domain (v positive_int); \
+             CREATE TABLE public_path_address (v address); \
+             INSERT INTO public_path_mood VALUES ('ok'); \
+             INSERT INTO public_path_domain VALUES (5)",
+        )
+        .await
+        .expect("default search path resolves public user-defined types");
+    running
+        .client
+        .batch_execute("INSERT INTO public_path_mood VALUES ('warm')")
+        .await
+        .expect_err("public enum must reject app-only label");
+    running
+        .client
+        .batch_execute("INSERT INTO public_path_domain VALUES (-1)")
+        .await
+        .expect_err("public search-path domain must enforce public constraint");
+
+    shutdown(running).await;
+}
+
+#[tokio::test]
 async fn select_respects_schema_qualifier() {
     let running = start_sample_server("schema_select_qualifier_guard").await;
 

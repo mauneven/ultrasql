@@ -106,6 +106,15 @@ pub trait Catalog: Send + Sync {
         None
     }
 
+    /// Resolve a user-defined type by schema and bare type name.
+    fn lookup_type_in_schema(&self, schema_name: &str, name: &str) -> Option<DataType> {
+        if schema_name.eq_ignore_ascii_case("public") {
+            self.lookup_type(name)
+        } else {
+            self.lookup_type(&ultrasql_catalog::type_lookup_key(schema_name, name))
+        }
+    }
+
     /// Return whether a case-insensitive index name exists.
     fn lookup_index(&self, name: &str) -> bool {
         let _ = name;
@@ -129,6 +138,17 @@ pub trait Catalog: Send + Sync {
     /// Resolve a type name to its `pg_type.oid`.
     fn lookup_type_oid(&self, name: &str) -> Option<Oid> {
         builtin_type_oid(name)
+    }
+
+    /// Resolve a type name in a specific schema to its `pg_type.oid`.
+    fn lookup_type_oid_in_schema(&self, schema_name: &str, name: &str) -> Option<Oid> {
+        if schema_name.eq_ignore_ascii_case("pg_catalog") {
+            builtin_type_oid(name).or_else(|| self.lookup_type_oid(name))
+        } else if schema_name.eq_ignore_ascii_case("public") {
+            self.lookup_type_oid(name)
+        } else {
+            self.lookup_type_oid(&ultrasql_catalog::type_lookup_key(schema_name, name))
+        }
     }
 }
 
@@ -189,6 +209,18 @@ impl Catalog for InMemoryCatalog {
         self.types.get(&name.to_ascii_lowercase()).cloned()
     }
 
+    fn lookup_type_in_schema(&self, schema_name: &str, name: &str) -> Option<DataType> {
+        self.types
+            .get(&ultrasql_catalog::type_lookup_key(schema_name, name))
+            .cloned()
+            .or_else(|| {
+                schema_name
+                    .eq_ignore_ascii_case("public")
+                    .then(|| self.lookup_type(name))
+                    .flatten()
+            })
+    }
+
     fn lookup_index(&self, name: &str) -> bool {
         self.indexes.contains(&name.to_ascii_lowercase())
     }
@@ -198,6 +230,18 @@ impl Catalog for InMemoryCatalog {
             .as_ref()
             .and_then(type_oid_for_data_type)
             .or_else(|| builtin_type_oid(name))
+    }
+
+    fn lookup_type_oid_in_schema(&self, schema_name: &str, name: &str) -> Option<Oid> {
+        self.lookup_type_in_schema(schema_name, name)
+            .as_ref()
+            .and_then(type_oid_for_data_type)
+            .or_else(|| {
+                schema_name
+                    .eq_ignore_ascii_case("pg_catalog")
+                    .then(|| builtin_type_oid(name))
+                    .flatten()
+            })
     }
 }
 
@@ -275,7 +319,7 @@ impl Catalog for ultrasql_catalog::CatalogSnapshot {
     }
 
     fn lookup_type(&self, name: &str) -> Option<DataType> {
-        let key = name.to_ascii_lowercase();
+        let key = ultrasql_catalog::type_lookup_key("public", name);
         self.enum_types
             .get(&key)
             .map(ultrasql_catalog::EnumTypeEntry::data_type)
@@ -288,6 +332,45 @@ impl Catalog for ultrasql_catalog::CatalogSnapshot {
                 self.domain_types
                     .get(&key)
                     .map(ultrasql_catalog::DomainTypeEntry::data_type)
+            })
+            .or_else(|| {
+                let key = name.to_ascii_lowercase();
+                self.enum_types
+                    .get(&key)
+                    .map(ultrasql_catalog::EnumTypeEntry::data_type)
+                    .or_else(|| {
+                        self.composite_types
+                            .get(&key)
+                            .map(ultrasql_catalog::CompositeTypeEntry::data_type)
+                    })
+                    .or_else(|| {
+                        self.domain_types
+                            .get(&key)
+                            .map(ultrasql_catalog::DomainTypeEntry::data_type)
+                    })
+            })
+    }
+
+    fn lookup_type_in_schema(&self, schema_name: &str, name: &str) -> Option<DataType> {
+        let key = ultrasql_catalog::type_lookup_key(schema_name, name);
+        self.enum_types
+            .get(&key)
+            .map(ultrasql_catalog::EnumTypeEntry::data_type)
+            .or_else(|| {
+                self.composite_types
+                    .get(&key)
+                    .map(ultrasql_catalog::CompositeTypeEntry::data_type)
+            })
+            .or_else(|| {
+                self.domain_types
+                    .get(&key)
+                    .map(ultrasql_catalog::DomainTypeEntry::data_type)
+            })
+            .or_else(|| {
+                schema_name
+                    .eq_ignore_ascii_case("public")
+                    .then(|| self.lookup_type(name))
+                    .flatten()
             })
     }
 
@@ -303,13 +386,39 @@ impl Catalog for ultrasql_catalog::CatalogSnapshot {
 
     fn lookup_type_oid(&self, name: &str) -> Option<Oid> {
         builtin_type_oid(name).or_else(|| {
-            let key = name.to_ascii_lowercase();
+            let key = ultrasql_catalog::type_lookup_key("public", name);
             self.enum_types
                 .get(&key)
                 .map(|entry| entry.oid)
                 .or_else(|| self.composite_types.get(&key).map(|entry| entry.oid))
                 .or_else(|| self.domain_types.get(&key).map(|entry| entry.oid))
+                .or_else(|| {
+                    let key = name.to_ascii_lowercase();
+                    self.enum_types
+                        .get(&key)
+                        .map(|entry| entry.oid)
+                        .or_else(|| self.composite_types.get(&key).map(|entry| entry.oid))
+                        .or_else(|| self.domain_types.get(&key).map(|entry| entry.oid))
+                })
         })
+    }
+
+    fn lookup_type_oid_in_schema(&self, schema_name: &str, name: &str) -> Option<Oid> {
+        if schema_name.eq_ignore_ascii_case("pg_catalog") {
+            return builtin_type_oid(name).or_else(|| self.lookup_type_oid(name));
+        }
+        let key = ultrasql_catalog::type_lookup_key(schema_name, name);
+        self.enum_types
+            .get(&key)
+            .map(|entry| entry.oid)
+            .or_else(|| self.composite_types.get(&key).map(|entry| entry.oid))
+            .or_else(|| self.domain_types.get(&key).map(|entry| entry.oid))
+            .or_else(|| {
+                schema_name
+                    .eq_ignore_ascii_case("public")
+                    .then(|| self.lookup_type_oid(name))
+                    .flatten()
+            })
     }
 }
 

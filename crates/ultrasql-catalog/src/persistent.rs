@@ -63,7 +63,7 @@ use crate::encoding::{
 };
 use crate::entry::{
     CompositeTypeEntry, DomainTypeEntry, EnumLabelEntry, EnumTypeEntry, IndexEntry, TableEntry,
-    table_lookup_key,
+    table_lookup_key, type_lookup_key,
 };
 use crate::error::CatalogError;
 use crate::traits::{Catalog, MutableCatalog};
@@ -615,8 +615,9 @@ impl PersistentCatalog {
         for (oid, entries) in &snap.indexes_by_table {
             self.indexes_by_table.insert(*oid, entries.clone());
         }
-        for (name, entry) in &snap.enum_types {
-            self.enum_types_by_name.insert(name.clone(), entry.clone());
+        for entry in snap.enum_types.values() {
+            self.enum_types_by_name
+                .insert(type_entry_key(entry), entry.clone());
             self.enum_types_by_oid.insert(entry.oid, entry.clone());
             self.pg_type.insert(entry.oid, type_row_from_enum(entry));
             for label in &entry.labels {
@@ -626,9 +627,9 @@ impl PersistentCatalog {
                 );
             }
         }
-        for (name, entry) in &snap.composite_types {
+        for entry in snap.composite_types.values() {
             self.composite_types_by_name
-                .insert(name.clone(), entry.clone());
+                .insert(type_entry_key(entry), entry.clone());
             self.composite_types_by_oid.insert(entry.oid, entry.clone());
             self.pg_type
                 .insert(entry.oid, type_row_from_composite(entry));
@@ -648,9 +649,9 @@ impl PersistentCatalog {
                 self.pg_attribute.insert((entry.oid, attnum), attr);
             }
         }
-        for (name, entry) in &snap.domain_types {
+        for entry in snap.domain_types.values() {
             self.domain_types_by_name
-                .insert(name.clone(), entry.clone());
+                .insert(type_entry_key(entry), entry.clone());
             self.domain_types_by_oid.insert(entry.oid, entry.clone());
             self.pg_type.insert(entry.oid, type_row_from_domain(entry));
         }
@@ -823,7 +824,7 @@ impl PersistentCatalog {
                 schema_name,
                 labels,
             };
-            enum_types.insert(fold_name(&entry.name), entry.clone());
+            enum_types.insert(type_entry_key(&entry), entry.clone());
             enum_types_by_oid.insert(entry.oid, entry);
         }
 
@@ -1019,7 +1020,7 @@ impl PersistentCatalog {
                         schema_name,
                         schema,
                     };
-                    composite_types.insert(fold_name(&entry.name), entry.clone());
+                    composite_types.insert(type_entry_key(&entry), entry.clone());
                     composite_types_by_oid.insert(entry.oid, entry);
                 }
                 _ => {}
@@ -1261,12 +1262,13 @@ impl PersistentCatalog {
                 )));
             }
         }
-        let key = fold_name(&entry.name);
+        let key = type_entry_key(&entry);
+        let relation_key = table_lookup_key(&entry.schema_name, &entry.name);
         let _guard = self.write_lock.lock();
         if self.enum_types_by_name.contains_key(&key)
             || self.composite_types_by_name.contains_key(&key)
             || self.domain_types_by_name.contains_key(&key)
-            || self.tables_by_name.contains_key(&key)
+            || self.tables_by_name.contains_key(&relation_key)
         {
             return Err(CatalogError::already_exists(entry.name));
         }
@@ -1387,12 +1389,13 @@ impl PersistentCatalog {
                 entry.name
             )));
         }
-        let key = fold_name(&entry.name);
+        let key = type_entry_key(&entry);
+        let relation_key = table_lookup_key(&entry.schema_name, &entry.name);
         let _guard = self.write_lock.lock();
         if self.composite_types_by_name.contains_key(&key)
             || self.enum_types_by_name.contains_key(&key)
             || self.domain_types_by_name.contains_key(&key)
-            || self.tables_by_name.contains_key(&key)
+            || self.tables_by_name.contains_key(&relation_key)
         {
             return Err(CatalogError::already_exists(entry.name));
         }
@@ -1552,12 +1555,13 @@ impl PersistentCatalog {
                 entry.name
             )));
         }
-        let key = fold_name(&entry.name);
+        let key = type_entry_key(&entry);
+        let relation_key = table_lookup_key(&entry.schema_name, &entry.name);
         let _guard = self.write_lock.lock();
         if self.domain_types_by_name.contains_key(&key)
             || self.enum_types_by_name.contains_key(&key)
             || self.composite_types_by_name.contains_key(&key)
-            || self.tables_by_name.contains_key(&key)
+            || self.tables_by_name.contains_key(&relation_key)
         {
             return Err(CatalogError::already_exists(entry.name));
         }
@@ -2322,7 +2326,10 @@ impl PersistentCatalog {
         let enum_types: std::collections::HashMap<String, EnumTypeEntry> = self
             .enum_types_by_name
             .iter()
-            .map(|r| (r.key().clone(), r.value().clone()))
+            .map(|r| {
+                let entry = r.value().clone();
+                (type_entry_key(&entry), entry)
+            })
             .collect();
         let enum_types_by_oid: std::collections::HashMap<Oid, EnumTypeEntry> = self
             .enum_types_by_oid
@@ -2332,7 +2339,10 @@ impl PersistentCatalog {
         let composite_types: std::collections::HashMap<String, CompositeTypeEntry> = self
             .composite_types_by_name
             .iter()
-            .map(|r| (r.key().clone(), r.value().clone()))
+            .map(|r| {
+                let entry = r.value().clone();
+                (type_entry_key(&entry), entry)
+            })
             .collect();
         let composite_types_by_oid: std::collections::HashMap<Oid, CompositeTypeEntry> = self
             .composite_types_by_oid
@@ -2342,7 +2352,10 @@ impl PersistentCatalog {
         let domain_types: std::collections::HashMap<String, DomainTypeEntry> = self
             .domain_types_by_name
             .iter()
-            .map(|r| (r.key().clone(), r.value().clone()))
+            .map(|r| {
+                let entry = r.value().clone();
+                (type_entry_key(&entry), entry)
+            })
             .collect();
         let domain_types_by_oid: std::collections::HashMap<Oid, DomainTypeEntry> = self
             .domain_types_by_oid
@@ -2549,21 +2562,7 @@ impl PersistentCatalog {
         for entry in table_entries {
             self.tables_by_name.insert(table_entry_key(&entry), entry);
         }
-        for mut item in self.enum_types_by_name.iter_mut() {
-            if let Some(type_row) = self.pg_type.get(&item.oid)
-                && let Some(schema_name) = namespace_names.get(&type_row.typnamespace)
-            {
-                item.schema_name = schema_name.clone();
-            }
-        }
         for mut item in self.enum_types_by_oid.iter_mut() {
-            if let Some(type_row) = self.pg_type.get(&item.oid)
-                && let Some(schema_name) = namespace_names.get(&type_row.typnamespace)
-            {
-                item.schema_name = schema_name.clone();
-            }
-        }
-        for mut item in self.composite_types_by_name.iter_mut() {
             if let Some(type_row) = self.pg_type.get(&item.oid)
                 && let Some(schema_name) = namespace_names.get(&type_row.typnamespace)
             {
@@ -2577,19 +2576,42 @@ impl PersistentCatalog {
                 item.schema_name = schema_name.clone();
             }
         }
-        for mut item in self.domain_types_by_name.iter_mut() {
-            if let Some(type_row) = self.pg_type.get(&item.oid)
-                && let Some(schema_name) = namespace_names.get(&type_row.typnamespace)
-            {
-                item.schema_name = schema_name.clone();
-            }
-        }
         for mut item in self.domain_types_by_oid.iter_mut() {
             if let Some(type_row) = self.pg_type.get(&item.oid)
                 && let Some(schema_name) = namespace_names.get(&type_row.typnamespace)
             {
                 item.schema_name = schema_name.clone();
             }
+        }
+        let enum_entries = self
+            .enum_types_by_oid
+            .iter()
+            .map(|item| item.value().clone())
+            .collect::<Vec<_>>();
+        self.enum_types_by_name.clear();
+        for entry in enum_entries {
+            self.enum_types_by_name
+                .insert(type_entry_key(&entry), entry);
+        }
+        let composite_entries = self
+            .composite_types_by_oid
+            .iter()
+            .map(|item| item.value().clone())
+            .collect::<Vec<_>>();
+        self.composite_types_by_name.clear();
+        for entry in composite_entries {
+            self.composite_types_by_name
+                .insert(type_entry_key(&entry), entry);
+        }
+        let domain_entries = self
+            .domain_types_by_oid
+            .iter()
+            .map(|item| item.value().clone())
+            .collect::<Vec<_>>();
+        self.domain_types_by_name.clear();
+        for entry in domain_entries {
+            self.domain_types_by_name
+                .insert(type_entry_key(&entry), entry);
         }
         self.rebuild_snapshot();
     }
@@ -2716,6 +2738,45 @@ fn fold_name(name: &str) -> String {
 
 fn table_entry_key(entry: &TableEntry) -> String {
     table_lookup_key(&entry.schema_name, &entry.name)
+}
+
+trait TypeEntryKey {
+    fn type_schema_name(&self) -> &str;
+    fn type_name(&self) -> &str;
+}
+
+impl TypeEntryKey for EnumTypeEntry {
+    fn type_schema_name(&self) -> &str {
+        &self.schema_name
+    }
+
+    fn type_name(&self) -> &str {
+        &self.name
+    }
+}
+
+impl TypeEntryKey for CompositeTypeEntry {
+    fn type_schema_name(&self) -> &str {
+        &self.schema_name
+    }
+
+    fn type_name(&self) -> &str {
+        &self.name
+    }
+}
+
+impl TypeEntryKey for DomainTypeEntry {
+    fn type_schema_name(&self) -> &str {
+        &self.schema_name
+    }
+
+    fn type_name(&self) -> &str {
+        &self.name
+    }
+}
+
+fn type_entry_key(entry: &impl TypeEntryKey) -> String {
+    type_lookup_key(entry.type_schema_name(), entry.type_name())
 }
 
 impl Catalog for PersistentCatalog {
@@ -3131,8 +3192,8 @@ mod tests {
             schema,
         };
         snap.composite_types
-            .insert("too_wide".to_owned(), entry.clone());
-        snap.composite_types_by_oid.insert(entry.oid, entry);
+            .insert(type_entry_key(&entry), entry.clone());
+        snap.composite_types_by_oid.insert(entry.oid, entry.clone());
 
         let err = cat
             .install_snapshot(snap)
@@ -3142,7 +3203,7 @@ mod tests {
         );
         let after = cat.snapshot();
         assert_eq!(after.tables.len(), before.tables.len());
-        assert!(!after.composite_types.contains_key("too_wide"));
+        assert!(!after.composite_types.contains_key(&type_entry_key(&entry)));
     }
 
     // -----------------------------------------------------------------------
