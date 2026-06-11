@@ -522,7 +522,7 @@ fn normalize_default_privilege_object_name(
     let folded = name.trim().to_ascii_lowercase();
     match kind {
         PrivilegeObjectKind::Table | PrivilegeObjectKind::Sequence => {
-            if is_encoded_relation_lookup_key(&folded) {
+            if ultrasql_catalog::decode_table_lookup_key(&folded).is_some() {
                 folded
             } else {
                 ultrasql_catalog::table_lookup_key(schema_name, &folded)
@@ -555,7 +555,7 @@ fn normalize_object_name(kind: PrivilegeObjectKind, name: &str) -> String {
 }
 
 fn normalize_relation_object_name(folded: &str) -> String {
-    if is_encoded_relation_lookup_key(folded) {
+    if ultrasql_catalog::decode_table_lookup_key(folded).is_some() {
         return folded.to_owned();
     }
     match crate::parse_pg_identifier_path(folded).as_deref() {
@@ -565,35 +565,6 @@ fn normalize_relation_object_name(folded: &str) -> String {
         }
         _ => folded.to_owned(),
     }
-}
-
-fn is_encoded_relation_lookup_key(key: &str) -> bool {
-    let Some((schema_len_text, rest)) = key.split_once(':') else {
-        return false;
-    };
-    if schema_len_text.is_empty() || !schema_len_text.chars().all(|ch| ch.is_ascii_digit()) {
-        return false;
-    }
-    let Ok(schema_len) = schema_len_text.parse::<usize>() else {
-        return false;
-    };
-    let Some((_, after_schema)) = split_at_byte(rest, schema_len) else {
-        return false;
-    };
-    let Some((relation_len_text, relation)) = after_schema.split_once(':') else {
-        return false;
-    };
-    if relation_len_text.is_empty() || !relation_len_text.chars().all(|ch| ch.is_ascii_digit()) {
-        return false;
-    }
-    let Ok(relation_len) = relation_len_text.parse::<usize>() else {
-        return false;
-    };
-    relation.len() == relation_len
-}
-
-fn split_at_byte(text: &str, index: usize) -> Option<(&str, &str)> {
-    (index <= text.len() && text.is_char_boundary(index)).then(|| text.split_at(index))
 }
 
 fn last_name_part(name: &str) -> &str {
