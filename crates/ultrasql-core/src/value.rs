@@ -36,6 +36,8 @@ const TIMETZ_OFFSET_MASK: i64 = (1_i64 << TIMETZ_OFFSET_BITS) - 1;
 const HEX_ALPHA_BASE: u8 = 10;
 const HEX_NIBBLES_PER_BYTE: usize = 2;
 const UUID_HEX_NIBBLES: usize = 32;
+const BITS_PER_BYTE: usize = 8;
+const HIGH_BIT_INDEX: usize = 7;
 
 #[must_use]
 fn i64_to_f64(value: i64) -> f64 {
@@ -933,14 +935,14 @@ impl Value {
         if dims == 0 || dims > MAX_VECTOR_DIMS {
             return None;
         }
-        let mut bytes = vec![0_u8; trimmed.len().div_ceil(8)];
+        let mut bytes = vec![0_u8; trimmed.len().div_ceil(BITS_PER_BYTE)];
         for (idx, byte) in trimmed.bytes().enumerate() {
             match byte {
                 b'0' => {}
                 b'1' => {
-                    let byte_idx = idx / 8;
-                    let bit_idx = idx % 8;
-                    bytes[byte_idx] |= 1_u8 << (7 - bit_idx);
+                    let (byte_idx, shift) = packed_bit_position(idx)?;
+                    let mask = 1_u8.checked_shl(shift)?;
+                    *bytes.get_mut(byte_idx)? |= mask;
                 }
                 _ => return None,
             }
@@ -2641,6 +2643,13 @@ fn pack_hex_byte(high: u8, low: u8) -> Option<u8> {
     high.checked_shl(4).map(|upper| upper | low)
 }
 
+fn packed_bit_position(idx: usize) -> Option<(usize, u32)> {
+    let byte_idx = idx.checked_div(BITS_PER_BYTE)?;
+    let bit_idx = idx.checked_rem(BITS_PER_BYTE)?;
+    let shift = HIGH_BIT_INDEX.checked_sub(bit_idx)?;
+    Some((byte_idx, u32::try_from(shift).ok()?))
+}
+
 fn write_decimal_text(f: &mut fmt::Formatter<'_>, value: i64, scale: i32) -> fmt::Result {
     let sign = if value < 0 { "-" } else { "" };
     let mag = value.unsigned_abs().to_string();
@@ -2733,14 +2742,14 @@ impl fmt::Display for Value {
             Self::Network(v) => write!(f, "{v}"),
             Self::BitVec { dims, bytes } => {
                 let dims_usize = usize::try_from(*dims).map_err(|_| fmt::Error)?;
-                let required_bytes = dims_usize.div_ceil(8);
+                let required_bytes = dims_usize.div_ceil(BITS_PER_BYTE);
                 if bytes.len() < required_bytes {
                     return Err(fmt::Error);
                 }
                 for idx in 0..dims_usize {
-                    let byte_idx = idx / 8;
-                    let bit_idx = idx % 8;
-                    let bit = (bytes[byte_idx] >> (7 - bit_idx)) & 1;
+                    let (byte_idx, shift) = packed_bit_position(idx).ok_or(fmt::Error)?;
+                    let byte = bytes.get(byte_idx).ok_or(fmt::Error)?;
+                    let bit = (byte >> shift) & 1;
                     f.write_str(if bit == 1 { "1" } else { "0" })?;
                 }
                 Ok(())
@@ -4360,6 +4369,13 @@ mod tests {
             Value::BitVec {
                 dims: 6,
                 bytes: vec![0b1010_0100]
+            }
+        );
+        assert_eq!(
+            Value::parse_bitvec("111111111").unwrap(),
+            Value::BitVec {
+                dims: 9,
+                bytes: vec![0xff, 0b1000_0000]
             }
         );
         assert_eq!(
