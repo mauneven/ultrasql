@@ -63,6 +63,14 @@ pub use vector::{
 use crate::bitmap::Bitmap;
 use crate::column::NumericColumn;
 
+#[inline]
+fn lanes8<'a, T>(lanes: &'a [T], invariant: &'static str) -> &'a [T; 8] {
+    match <&[T; 8]>::try_from(lanes) {
+        Ok(lanes) => lanes,
+        Err(_) => unreachable!("{invariant}"),
+    }
+}
+
 /// Element-wise `a == b` over two `i32` columns of equal length.
 ///
 /// The output is a `Bitmap` of length `n` where bit `i` is set iff
@@ -167,10 +175,8 @@ fn pack_eq_64(a: &[i32; 64], b: &[i32; 64]) -> u64 {
         .step_by(8)
         .zip(a.chunks_exact(8).zip(b.chunks_exact(8)))
     {
-        let a_lanes = <&[i32; 8]>::try_from(a_lanes)
-            .expect("chunks_exact(8) must yield eight left i32 lanes");
-        let b_lanes = <&[i32; 8]>::try_from(b_lanes)
-            .expect("chunks_exact(8) must yield eight right i32 lanes");
+        let a_lanes = lanes8(a_lanes, "chunks_exact(8) must yield eight left i32 lanes");
+        let b_lanes = lanes8(b_lanes, "chunks_exact(8) must yield eight right i32 lanes");
         let mut byte: u64 = 0;
         byte |= u64::from(a_lanes[0] == b_lanes[0]);
         byte |= u64::from(a_lanes[1] == b_lanes[1]) << 1;
@@ -388,9 +394,7 @@ fn min_f64_nullable(data: &[f64], nulls: &Bitmap) -> Option<f64> {
             if !v.is_nan() {
                 best = Some(best.map_or(v, |b| min_f64_value(b, v)));
             }
-            w &= w
-                .checked_sub(1)
-                .expect("nonzero bitmap word must have predecessor");
+            w &= w - 1;
         }
     }
     best
@@ -588,8 +592,7 @@ fn pack_cmp_gt_64(a: &[i64; 64], scalar: i64) -> u64 {
     let mut mask: u64 = 0;
     // 8 chunks × 8 lanes per chunk = 64 lanes per word.
     for (shift, lanes) in (0_u32..=56).step_by(8).zip(a.chunks_exact(8)) {
-        let lanes =
-            <&[i64; 8]>::try_from(lanes).expect("chunks_exact(8) must yield eight i64 lanes");
+        let lanes = lanes8(lanes, "chunks_exact(8) must yield eight i64 lanes");
         let mut byte: u64 = 0;
         byte |= u64::from(lanes[0] > scalar);
         byte |= u64::from(lanes[1] > scalar) << 1;
@@ -785,8 +788,7 @@ const fn cmp_i64_lane(op: CmpOp, a: i64, b: i64) -> bool {
 fn pack_cmp_i32_64(a: &[i32; 64], scalar: i32, op: CmpOp) -> u64 {
     let mut mask: u64 = 0;
     for (shift, lanes) in (0_u32..=56).step_by(8).zip(a.chunks_exact(8)) {
-        let lanes =
-            <&[i32; 8]>::try_from(lanes).expect("chunks_exact(8) must yield eight i32 lanes");
+        let lanes = lanes8(lanes, "chunks_exact(8) must yield eight i32 lanes");
         let mut byte: u64 = 0;
         byte |= u64::from(cmp_i32_lane(op, lanes[0], scalar));
         byte |= u64::from(cmp_i32_lane(op, lanes[1], scalar)) << 1;
@@ -825,8 +827,7 @@ fn cmp_i32_pack_into(a: &[i32], scalar: i32, op: CmpOp, words: &mut [u64]) {
 fn pack_cmp_i64_64(a: &[i64; 64], scalar: i64, op: CmpOp) -> u64 {
     let mut mask: u64 = 0;
     for (shift, lanes) in (0_u32..=56).step_by(8).zip(a.chunks_exact(8)) {
-        let lanes =
-            <&[i64; 8]>::try_from(lanes).expect("chunks_exact(8) must yield eight i64 lanes");
+        let lanes = lanes8(lanes, "chunks_exact(8) must yield eight i64 lanes");
         let mut byte: u64 = 0;
         byte |= u64::from(cmp_i64_lane(op, lanes[0], scalar));
         byte |= u64::from(cmp_i64_lane(op, lanes[1], scalar)) << 1;

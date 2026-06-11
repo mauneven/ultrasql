@@ -203,14 +203,21 @@ where
 
 /// Compare 64 `i32` lanes, pack to u64. LLVM autovectorizes to NEON/AVX2.
 #[inline]
+fn lanes8<'a, T>(lanes: &'a [T], invariant: &'static str) -> &'a [T; 8] {
+    match <&[T; 8]>::try_from(lanes) {
+        Ok(lanes) => lanes,
+        Err(_) => unreachable!("{invariant}"),
+    }
+}
+
+#[inline]
 fn pack_cmp_64_i32<F>(a: &[i32; 64], scalar: i32, cmp: &F) -> u64
 where
     F: Fn(i32, i32) -> bool,
 {
     let mut mask: u64 = 0;
     for (shift, lanes) in (0_u32..=56).step_by(8).zip(a.chunks_exact(8)) {
-        let lanes =
-            <&[i32; 8]>::try_from(lanes).expect("chunks_exact(8) must yield eight i32 lanes");
+        let lanes = lanes8(lanes, "chunks_exact(8) must yield eight i32 lanes");
         let mut byte: u64 = 0;
         byte |= u64::from(cmp(lanes[0], scalar));
         byte |= u64::from(cmp(lanes[1], scalar)) << 1;
@@ -233,8 +240,7 @@ where
 {
     let mut mask: u64 = 0;
     for (shift, lanes) in (0_u32..=56).step_by(8).zip(a.chunks_exact(8)) {
-        let lanes =
-            <&[i64; 8]>::try_from(lanes).expect("chunks_exact(8) must yield eight i64 lanes");
+        let lanes = lanes8(lanes, "chunks_exact(8) must yield eight i64 lanes");
         let mut byte: u64 = 0;
         byte |= u64::from(cmp(lanes[0], scalar));
         byte |= u64::from(cmp(lanes[1], scalar)) << 1;
@@ -254,8 +260,7 @@ where
 fn pack_eq_f64_64(a: &[f64; 64], sbits: u64) -> u64 {
     let mut mask: u64 = 0;
     for (shift, lanes) in (0_u32..=56).step_by(8).zip(a.chunks_exact(8)) {
-        let lanes =
-            <&[f64; 8]>::try_from(lanes).expect("chunks_exact(8) must yield eight f64 lanes");
+        let lanes = lanes8(lanes, "chunks_exact(8) must yield eight f64 lanes");
         let mut byte: u64 = 0;
         byte |= u64::from(lanes[0].to_bits() == sbits);
         byte |= u64::from(lanes[1].to_bits() == sbits) << 1;

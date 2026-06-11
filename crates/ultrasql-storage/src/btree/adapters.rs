@@ -15,6 +15,7 @@ use ultrasql_core::endian::{read_i64_le, write_i64_le};
 // ---------------------------------------------------------------------------
 
 const COMPOSITE_I64_WIDTH: usize = std::mem::size_of::<i64>();
+const MAX_COMPOSITE_I64_COMPONENTS: usize = 8;
 
 /// A composite key made of multiple fixed-width components.
 ///
@@ -36,21 +37,26 @@ impl<const N: usize> CompositeKey<N> {
     /// Construct a composite key from an array of `i64` values.
     #[must_use]
     pub const fn new(values: [i64; N]) -> Self {
+        Self::assert_component_count();
         Self { values }
     }
 
+    const fn assert_component_count() {
+        assert!(
+            N > 0 && N <= MAX_COMPOSITE_I64_COMPONENTS,
+            "composite key component count must be 1..=8"
+        );
+    }
+
     fn encoded_len() -> usize {
-        N.checked_mul(COMPOSITE_I64_WIDTH)
-            .expect("composite key byte length must fit usize")
+        Self::assert_component_count();
+        N * COMPOSITE_I64_WIDTH
     }
 
     fn component_range(component: usize) -> std::ops::Range<usize> {
-        let start = component
-            .checked_mul(COMPOSITE_I64_WIDTH)
-            .expect("composite key component offset must fit usize");
-        let end = start
-            .checked_add(COMPOSITE_I64_WIDTH)
-            .expect("composite key component end must fit usize");
+        Self::assert_component_count();
+        let start = component * COMPOSITE_I64_WIDTH;
+        let end = start + COMPOSITE_I64_WIDTH;
         start..end
     }
 

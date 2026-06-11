@@ -379,8 +379,10 @@ impl PageHeader {
     /// Bytes of free space available for additional tuples.
     #[must_use]
     pub fn free_space(&self) -> usize {
-        self.try_free_space()
-            .expect("page header free space invariant violated")
+        match self.try_free_space() {
+            Ok(free_space) => free_space,
+            Err(err) => panic!("page header free space invariant violated: {err}"),
+        }
     }
 
     /// Checked free-space width for callers that receive an untrusted
@@ -755,7 +757,10 @@ impl Page {
     /// [`Self::insert_tuple_appended`] performs.
     #[must_use]
     pub(crate) fn item_id_offset(slot: SlotIndex) -> usize {
-        Self::try_item_id_offset(slot).expect("page item id offset invariant violated")
+        match Self::try_item_id_offset(slot) {
+            Ok(offset) => offset,
+            Err(err) => panic!("page item id offset invariant violated: {err}"),
+        }
     }
 
     pub(crate) fn try_item_id_offset(slot: SlotIndex) -> Result<usize, PageError> {
@@ -776,15 +781,16 @@ impl Page {
 
     fn item_id_range(slot: SlotIndex) -> Range<usize> {
         let start = Self::item_id_offset(slot);
-        let end = start
-            .checked_add(ITEMID_SIZE)
-            .expect("page item id offset invariant violated");
+        let end = start + ITEMID_SIZE;
         start..end
     }
 
     fn read_item_id(&self, slot: SlotIndex) -> ItemId {
         let range = Self::item_id_range(slot);
-        let raw = read_u32_le(&self.bytes[range]).expect("page item id range invariant violated");
+        let raw = match read_u32_le(&self.bytes[range]) {
+            Ok(raw) => raw,
+            Err(err) => panic!("page item id range invariant violated: {err}"),
+        };
         ItemId::from_raw(raw)
     }
 

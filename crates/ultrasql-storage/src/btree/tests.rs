@@ -795,6 +795,18 @@ fn composite_key_ordering_is_lexicographic() {
 }
 
 #[test]
+#[should_panic(expected = "composite key component count must be 1..=8")]
+fn composite_key_rejects_zero_components() {
+    let _ = CompositeKey::<0>::new([]);
+}
+
+#[test]
+#[should_panic(expected = "composite key component count must be 1..=8")]
+fn composite_key_rejects_more_than_eight_components() {
+    let _ = CompositeKey::<9>::new([0; 9]);
+}
+
+#[test]
 fn expression_index_insert_and_lookup() {
     use crate::access_method::BTreeAccessMethod;
     use ultrasql_core::Value;

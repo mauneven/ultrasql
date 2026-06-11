@@ -319,7 +319,10 @@ fn entry_start(index: usize, entry_size: usize, label: &'static str) -> Result<u
 }
 
 fn entry_start_or_panic(index: usize, entry_size: usize, label: &'static str) -> usize {
-    entry_start(index, entry_size, label).expect("B-tree entry offset must fit page bounds")
+    match entry_start(index, entry_size, label) {
+        Ok(start) => start,
+        Err(err) => panic!("B-tree entry offset invariant violated: {err}"),
+    }
 }
 
 fn entry_field(
@@ -346,7 +349,10 @@ fn entry_field_or_panic(
     end: usize,
     label: &'static str,
 ) -> Range<usize> {
-    entry_field(base, start, end, label).expect("B-tree entry field must fit page bounds")
+    match entry_field(base, start, end, label) {
+        Ok(range) => range,
+        Err(err) => panic!("B-tree entry field invariant violated: {err}"),
+    }
 }
 
 pub(super) fn init_btree_page(page: &mut Page, meta: NodeMeta) -> Result<(), BTreeError> {

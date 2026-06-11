@@ -230,10 +230,7 @@ pub fn exact_top_k_f32_flat(
         dims,
         "exact_top_k_f32_flat: probe length mismatch"
     );
-    let remainder = values
-        .len()
-        .checked_rem(dims)
-        .expect("dims is asserted nonzero before row-major check");
+    let remainder = values.len() % dims;
     assert_eq!(
         remainder, 0,
         "exact_top_k_f32_flat: row-major values length mismatch"
@@ -241,10 +238,7 @@ pub fn exact_top_k_f32_flat(
     if k == 0 {
         return Vec::new();
     }
-    let row_count = values
-        .len()
-        .checked_div(dims)
-        .expect("dims is asserted nonzero before row count");
+    let row_count = values.len() / dims;
     let mut kept: Vec<VectorTopKHit> = Vec::with_capacity(k.min(row_count));
     for (row, vector) in values.chunks_exact(dims).enumerate() {
         let hit = VectorTopKHit {
