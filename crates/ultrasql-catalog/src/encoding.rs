@@ -209,15 +209,42 @@ impl<'a> Reader<'a> {
             Err(DecodeError::TrailingBytes { len })
         }
     }
+    fn ensure_remaining(&self, needed: usize) -> Result<(), DecodeError> {
+        let have = self.remaining();
+        if have < needed {
+            return Err(DecodeError::UnexpectedEnd { needed, have });
+        }
+        Ok(())
+    }
+    fn ensure_remaining_items(
+        &self,
+        count: usize,
+        min_item_width: usize,
+    ) -> Result<(), DecodeError> {
+        let needed =
+            count
+                .checked_mul(min_item_width)
+                .ok_or_else(|| DecodeError::UnexpectedEnd {
+                    needed: usize::MAX,
+                    have: self.remaining(),
+                })?;
+        self.ensure_remaining(needed)
+    }
     fn take(&mut self, n: usize) -> Result<&'a [u8], DecodeError> {
-        if self.pos + n > self.bytes.len() {
+        let Some(end) = self.pos.checked_add(n) else {
+            return Err(DecodeError::UnexpectedEnd {
+                needed: n,
+                have: self.remaining(),
+            });
+        };
+        if end > self.bytes.len() {
             return Err(DecodeError::UnexpectedEnd {
                 needed: n,
                 have: self.bytes.len().saturating_sub(self.pos),
             });
         }
-        let out = &self.bytes[self.pos..self.pos + n];
-        self.pos += n;
+        let out = &self.bytes[self.pos..end];
+        self.pos = end;
         Ok(out)
     }
     fn fixed<const N: usize>(&mut self) -> Result<[u8; N], DecodeError> {
@@ -489,6 +516,7 @@ fn decode_data_type(r: &mut Reader<'_>) -> Result<DataType, DecodeError> {
             let oid = Oid::new(r.u32()?);
             let name = r.str()?;
             let label_count = r.usize_len()?;
+            r.ensure_remaining_items(label_count, 4)?;
             let mut labels = Vec::with_capacity(label_count);
             for _ in 0..label_count {
                 labels.push(r.str()?);
@@ -503,6 +531,7 @@ fn decode_data_type(r: &mut Reader<'_>) -> Result<DataType, DecodeError> {
             let oid = Oid::new(r.u32()?);
             let name = r.str()?;
             let field_count = r.usize_len()?;
+            r.ensure_remaining_items(field_count, 5)?;
             let mut fields = Vec::with_capacity(field_count);
             for _ in 0..field_count {
                 let field_name = r.str()?;
@@ -706,8 +735,9 @@ impl ClassRow {
         let reltuples = r.f64()?;
         let relfilenode = r.u32()?;
         let relhasindex = r.bool()?;
-        let count = r.u32()?;
-        let mut reloptions = Vec::with_capacity(usize::try_from(count).unwrap_or(0));
+        let count = r.usize_len()?;
+        r.ensure_remaining_items(count, 8)?;
+        let mut reloptions = Vec::with_capacity(count);
         for _ in 0..count {
             let key = r.str()?;
             let value = r.str()?;
@@ -970,6 +1000,7 @@ pub fn decode_index_row(bytes: &[u8]) -> Result<IndexRow, DecodeError> {
     let indisprimary = r.bool()?;
     let indisvalid = r.bool()?;
     let key_len = r.usize_len()?;
+    r.ensure_remaining_items(key_len, 2)?;
     let mut indkey = Vec::with_capacity(key_len);
     for _ in 0..key_len {
         indkey.push(r.i16()?);
@@ -979,11 +1010,13 @@ pub fn decode_index_row(bytes: &[u8]) -> Result<IndexRow, DecodeError> {
     } else {
         let indmethod = r.str()?;
         let opclass_len = r.usize_len()?;
+        r.ensure_remaining_items(opclass_len, 1)?;
         let mut indopclasses = Vec::with_capacity(opclass_len);
         for _ in 0..opclass_len {
             indopclasses.push(if r.bool()? { Some(r.str()?) } else { None });
         }
         let option_len = r.usize_len()?;
+        r.ensure_remaining_items(option_len, 8)?;
         let mut indoptions = Vec::with_capacity(option_len);
         for _ in 0..option_len {
             indoptions.push((r.str()?, r.str()?));
@@ -1046,6 +1079,7 @@ fn write_i16_vec(
 
 fn read_i16_vec(r: &mut Reader<'_>) -> Result<Vec<i16>, DecodeError> {
     let len = r.usize_len()?;
+    r.ensure_remaining_items(len, 2)?;
     let mut values = Vec::with_capacity(len);
     for _ in 0..len {
         values.push(r.i16()?);
@@ -1232,6 +1266,7 @@ pub fn decode_statistic_ext_row(bytes: &[u8]) -> Result<StatisticExtRow, DecodeE
     let stxname = r.str()?;
     let stxrelid = Oid::new(r.u32()?);
     let key_len = r.usize_len()?;
+    r.ensure_remaining_items(key_len, 2)?;
     let mut stxkeys = Vec::with_capacity(key_len);
     for _ in 0..key_len {
         stxkeys.push(r.i16()?);
@@ -1288,6 +1323,28 @@ mod tests {
                 what: "test field",
                 len: got,
             } if got == len
+        ));
+    }
+
+    #[test]
+    fn index_row_decoder_rejects_impossible_key_count_before_items() {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&1_u32.to_le_bytes());
+        bytes.extend_from_slice(&2_u32.to_le_bytes());
+        bytes.extend_from_slice(&1_u32.to_le_bytes());
+        bytes.push(1);
+        bytes.push(0);
+        bytes.push(1);
+        bytes.extend_from_slice(&1000_u32.to_le_bytes());
+
+        let err = decode_index_row(&bytes).expect_err("missing key payload must fail");
+
+        assert!(matches!(
+            err,
+            DecodeError::UnexpectedEnd {
+                needed: 2000,
+                have: 0,
+            }
         ));
     }
 
