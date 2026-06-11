@@ -3880,6 +3880,23 @@ fn binds_drop_index_preserves_explicit_namespace() {
 }
 
 #[test]
+fn binds_drop_index_preserves_quoted_dotted_public_name() {
+    let mut cat = users_index_catalog();
+    cat.register_index("idx.dotted");
+    let plan = parse_and_bind("DROP INDEX \"idx.dotted\"", &cat).expect("drop index binds");
+    let LogicalPlan::DropIndex {
+        indexes,
+        index_namespaces,
+        ..
+    } = plan
+    else {
+        panic!("expected DropIndex plan");
+    };
+    assert_eq!(indexes, vec!["idx.dotted".to_string()]);
+    assert_eq!(index_namespaces, vec![None]);
+}
+
+#[test]
 fn drop_index_if_exists_silently_omits_missing_indexes() {
     let cat = users_index_catalog();
     let plan = parse_and_bind("DROP INDEX IF EXISTS users_id_idx, nope", &cat)

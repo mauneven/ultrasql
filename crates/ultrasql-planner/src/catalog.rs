@@ -225,7 +225,8 @@ impl InMemoryCatalog {
 
     /// Register an index name for DDL binding tests and lightweight tools.
     pub fn register_index(&mut self, name: &str) -> bool {
-        self.indexes.insert(name.to_ascii_lowercase())
+        self.indexes
+            .insert(ultrasql_catalog::index_lookup_key("public", name))
     }
 
     /// Register an index in a specific schema.
@@ -555,6 +556,17 @@ mod tests {
         );
         let previous = cat.register("users", replacement);
         assert_eq!(previous, Some(first));
+    }
+
+    #[test]
+    fn lookup_index_schema_treats_dotted_index_name_as_public_name() {
+        let mut cat = InMemoryCatalog::new();
+        assert!(cat.register_index("idx.dotted"));
+
+        assert_eq!(
+            cat.lookup_index_schema("idx.dotted").as_deref(),
+            Some("public")
+        );
     }
 
     #[test]
