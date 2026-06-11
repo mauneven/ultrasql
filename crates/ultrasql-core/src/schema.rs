@@ -177,11 +177,16 @@ impl Schema {
     /// Concatenate two schemas (used for join output). Errors on name
     /// collision; callers must alias before concatenating.
     pub fn concat(&self, other: &Self) -> Result<Self> {
-        let mut combined = Vec::with_capacity(self.len() + other.len());
+        let mut combined = Vec::with_capacity(combined_field_capacity(self.len(), other.len())?);
         combined.extend(self.fields.iter().cloned());
         combined.extend(other.fields.iter().cloned());
         Self::new(combined)
     }
+}
+
+fn combined_field_capacity(left: usize, right: usize) -> Result<usize> {
+    left.checked_add(right)
+        .ok_or_else(|| Error::invalid("schema width overflow"))
 }
 
 impl fmt::Display for Schema {
@@ -277,6 +282,11 @@ mod tests {
         let b = Schema::new([Field::required("y", DataType::Int32)]).unwrap();
         let c = a.concat(&b).unwrap();
         assert_eq!(c.len(), 2);
+    }
+
+    #[test]
+    fn concat_capacity_rejects_overflow() {
+        assert!(combined_field_capacity(usize::MAX, 1).is_err());
     }
 
     #[test]
