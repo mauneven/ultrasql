@@ -35,11 +35,15 @@ macro_rules! impl_reader {
 macro_rules! impl_writer {
     ($name:ident, $ty:ty) => {
         /// Write a little-endian integer to `buf`. The slice must be at
-        /// least `size_of::<$ty>()` bytes; otherwise the function panics.
+        /// least `size_of::<$ty>()` bytes; otherwise the function panics
+        /// with a named bounds invariant.
         #[inline]
         pub fn $name(buf: &mut [u8], value: $ty) {
             let bytes = value.to_le_bytes();
-            buf[..bytes.len()].copy_from_slice(&bytes);
+            let dst = buf
+                .get_mut(..bytes.len())
+                .expect("endian writer requires enough output bytes");
+            dst.copy_from_slice(&bytes);
         }
     };
 }
