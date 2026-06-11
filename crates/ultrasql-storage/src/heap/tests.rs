@@ -13,7 +13,7 @@ use ultrasql_mvcc::{Snapshot, Visibility, is_visible};
 
 use super::*;
 use crate::buffer_pool::{BufferPool, BufferPoolError};
-use crate::page::Page;
+use crate::page::{ITEMID_SIZE, ItemId, ItemIdFlags, Page};
 
 /// Test loader that materializes blank heap pages on first miss
 /// and persists them keyed by `PageId` so writes from one
@@ -171,6 +171,23 @@ fn heap_u64_count_add_rejects_overflow() {
     assert!(matches!(
         err,
         HeapError::MalformedHeader("bulk load count overflow")
+    ));
+}
+
+#[test]
+fn slot_window_rejects_itemid_range_outside_page() {
+    let mut page = Page::new_heap();
+    let slot = page.insert_tuple(b"ok").unwrap();
+    let item_off = Page::item_id_offset(slot);
+    let malformed = ItemId::new(8_000, 500, ItemIdFlags::Normal);
+    page.as_bytes_mut()[item_off..item_off + ITEMID_SIZE]
+        .copy_from_slice(&malformed.into_raw().to_le_bytes());
+
+    let err = HeapAccess::<MapLoader>::slot_window(page.as_bytes(), slot).unwrap_err();
+
+    assert!(matches!(
+        err,
+        HeapError::MalformedHeader("itemid tuple range outside page")
     ));
 }
 

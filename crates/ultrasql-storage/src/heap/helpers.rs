@@ -486,6 +486,14 @@ impl<L: PageLoader> HeapAccess<L> {
             .map_err(|_| HeapError::MalformedHeader("itemid offset overflow"))?;
         let length = usize::try_from(id.length())
             .map_err(|_| HeapError::MalformedHeader("itemid length overflow"))?;
+        let end = offset
+            .checked_add(length)
+            .ok_or(HeapError::MalformedHeader("itemid tuple range overflow"))?;
+        if end > page_bytes.len() {
+            return Err(HeapError::MalformedHeader(
+                "itemid tuple range outside page",
+            ));
+        }
         Ok((offset, length))
     }
 }
