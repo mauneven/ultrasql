@@ -36,6 +36,9 @@ pub enum ColumnError {
         /// Value-buffer length that did not fit in `u32`.
         len: usize,
     },
+    /// Row count exceeded the host's addressable capacity.
+    #[error("column row count exceeds usize capacity")]
+    RowCountTooLarge,
 }
 
 /// A column of one of UltraSQL's primitive types.
@@ -364,9 +367,15 @@ impl StringColumn {
         for window in offsets.windows(2) {
             let start = usize::try_from(window[0]).map_err(|_| ColumnError::InvalidUtf8Offsets)?;
             let end = usize::try_from(window[1]).map_err(|_| ColumnError::InvalidUtf8Offsets)?;
-            std::str::from_utf8(&values[start..end]).map_err(|_| ColumnError::InvalidUtf8)?;
+            let value = values
+                .get(start..end)
+                .ok_or(ColumnError::InvalidUtf8Offsets)?;
+            std::str::from_utf8(value).map_err(|_| ColumnError::InvalidUtf8)?;
         }
-        let row_count = offsets.len() - 1;
+        let row_count = offsets
+            .len()
+            .checked_sub(1)
+            .ok_or(ColumnError::InvalidUtf8Offsets)?;
         if let Some(nulls) = &nulls
             && nulls.len() != row_count
         {
@@ -429,11 +438,11 @@ impl StringColumn {
     #[must_use]
     pub fn try_value(&self, i: usize) -> Option<&str> {
         let start = usize::try_from(*self.offsets.get(i)?).ok()?;
-        let end = usize::try_from(*self.offsets.get(i + 1)?).ok()?;
+        let end = usize::try_from(*self.offsets.get(i.checked_add(1)?)?).ok()?;
         if start > end || end > self.values.len() {
             return None;
         }
-        std::str::from_utf8(&self.values[start..end]).ok()
+        std::str::from_utf8(self.values.get(start..end)?).ok()
     }
 
     /// Borrowed string at row `i`.
@@ -466,7 +475,9 @@ fn build_string_buffers<I: IntoIterator<Item = String>>(
         let offset = u32::try_from(values.len())
             .map_err(|_| ColumnError::Utf8ValuesTooLarge { len: values.len() })?;
         offsets.push(offset);
-        row_count += 1;
+        row_count = row_count
+            .checked_add(1)
+            .ok_or(ColumnError::RowCountTooLarge)?;
     }
     Ok((offsets, values, row_count))
 }
@@ -544,6 +555,12 @@ mod tests {
         let c = StringColumn::from_data(Vec::<String>::new());
         assert_eq!(c.len(), 0);
         assert!(c.is_empty());
+    }
+
+    #[test]
+    fn string_column_from_parts_rejects_out_of_bounds_offsets() {
+        let err = StringColumn::from_parts(vec![0, 8], b"abc".to_vec(), None).unwrap_err();
+        assert_eq!(err, ColumnError::InvalidUtf8Offsets);
     }
 
     #[test]
