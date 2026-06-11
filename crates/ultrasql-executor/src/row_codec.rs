@@ -3123,22 +3123,8 @@ fn decode_varlena_text(
     cursor: &mut usize,
     context: &'static str,
 ) -> Result<String, RowCodecError> {
-    let len_end = *cursor + 4;
-    if bytes.len() < len_end {
-        return Err(RowCodecError::Truncated {
-            needed: len_end,
-            have: bytes.len(),
-        });
-    }
-    let len_raw: [u8; 4] =
-        bytes[*cursor..*cursor + 4]
-            .try_into()
-            .map_err(|_| RowCodecError::Truncated {
-                needed: len_end,
-                have: bytes.len(),
-            })?;
+    let len_raw = read_fixed::<4>(bytes, cursor)?;
     let str_len = u32_payload_len_to_usize(u32::from_le_bytes(len_raw))?;
-    *cursor += 4;
     let str_end = checked_payload_end(*cursor, str_len, bytes.len())?;
     if bytes.len() < str_end {
         return Err(RowCodecError::Truncated {
@@ -3241,7 +3227,7 @@ mod tests {
 
     use super::{
         ColumnBuilder, RowCodec, RowCodecError, VECTOR_DIMS_WIDTH, VECTOR_ELEMENT_WIDTH,
-        checked_fixed_end,
+        checked_fixed_end, decode_varlena_text,
     };
     use ultrasql_vec::column::Column;
 
@@ -3283,6 +3269,20 @@ mod tests {
                 have: 0
             }
         ));
+    }
+
+    #[test]
+    fn decode_varlena_text_rejects_cursor_overflow() {
+        let mut cursor = usize::MAX;
+        let err = decode_varlena_text(&[], &mut cursor, "text column").unwrap_err();
+        assert!(matches!(
+            err,
+            RowCodecError::Truncated {
+                needed: usize::MAX,
+                have: 0
+            }
+        ));
+        assert_eq!(cursor, usize::MAX);
     }
 
     fn schema_decimal(scale: Option<i32>) -> Schema {
