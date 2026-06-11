@@ -3191,23 +3191,61 @@ pub fn parse_date_text(text: &str) -> Option<i32> {
 }
 
 fn days_from_civil(year: i32, month: u32, day: u32) -> Option<i32> {
-    if !(1..=12).contains(&month) || !(1..=31).contains(&day) {
+    if day == 0 || day > days_in_month(year, month)? {
         return None;
     }
-    let month = i32::try_from(month).ok()?;
-    let day = i32::try_from(day).ok()?;
-    let y = year - i32::from(month <= 2);
-    let era = if y >= 0 { y } else { y - 399 } / 400;
-    let yoe = y - era * 400;
-    let mp = if month > 2 { month - 3 } else { month + 9 };
-    let doy = (153 * mp + 2) / 5 + day - 1;
-    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
-    let days_since_0000 = era * 146_097 + doe - 719_468;
-    Some(days_since_0000 - 10_957)
+    let month = i64::from(month);
+    let day = i64::from(day);
+    let march_year_adjust = if month <= 2 { 1_i64 } else { 0 };
+    let y = i64::from(year).checked_sub(march_year_adjust)?;
+    let era = if y >= 0 {
+        y.div_euclid(400)
+    } else {
+        y.checked_sub(399)?.div_euclid(400)
+    };
+    let yoe = y.checked_sub(era.checked_mul(400)?)?;
+    let mp = if month > 2 {
+        month.checked_sub(3)?
+    } else {
+        month.checked_add(9)?
+    };
+    let doy = 153_i64
+        .checked_mul(mp)?
+        .checked_add(2)?
+        .div_euclid(5)
+        .checked_add(day)?
+        .checked_sub(1)?;
+    let leap_days = yoe.div_euclid(4).checked_sub(yoe.div_euclid(100))?;
+    let doe = yoe
+        .checked_mul(365)?
+        .checked_add(leap_days)?
+        .checked_add(doy)?;
+    let days_since_unix = era
+        .checked_mul(146_097)?
+        .checked_add(doe)?
+        .checked_sub(719_468)?;
+    let days_since_ultrasql = days_since_unix.checked_sub(10_957)?;
+    i32::try_from(days_since_ultrasql).ok()
+}
+
+fn days_in_month(year: i32, month: u32) -> Option<u32> {
+    match month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => Some(31),
+        4 | 6 | 9 | 11 => Some(30),
+        2 if is_leap_year(year) => Some(29),
+        2 => Some(28),
+        _ => None,
+    }
+}
+
+fn is_leap_year(year: i32) -> bool {
+    year.rem_euclid(4) == 0 && (year.rem_euclid(100) != 0 || year.rem_euclid(400) == 0)
 }
 
 fn format_date(days_since_2000_01_01: i32) -> String {
-    let (year, month, day) = civil_from_days(days_since_2000_01_01);
+    let Some((year, month, day)) = civil_from_days(days_since_2000_01_01) else {
+        return format!("{days_since_2000_01_01}d");
+    };
     format!("{year:04}-{month:02}-{day:02}")
 }
 
@@ -3220,8 +3258,7 @@ pub fn format_date_days(days_since_2000_01_01: i32) -> String {
 /// Return `(year, month, day)` for days since UltraSQL's date epoch.
 #[must_use]
 pub fn date_parts_from_days(days_since_2000_01_01: i32) -> Option<(i32, u32, u32)> {
-    let (year, month, day) = civil_from_days(days_since_2000_01_01);
-    Some((year, u32::try_from(month).ok()?, u32::try_from(day).ok()?))
+    civil_from_days(days_since_2000_01_01)
 }
 
 /// Format `TIME` in PostgreSQL's default ISO style.
@@ -3230,12 +3267,12 @@ pub fn format_time_micros(micros: i64) -> String {
     if !(0..=MICROS_PER_DAY).contains(&micros) {
         return format!("{micros}us");
     }
-    let hour = micros / MICROS_PER_HOUR;
-    let rem = micros % MICROS_PER_HOUR;
-    let minute = rem / MICROS_PER_MINUTE;
-    let rem = rem % MICROS_PER_MINUTE;
-    let second = rem / MICROS_PER_SECOND;
-    let frac = rem % MICROS_PER_SECOND;
+    let hour = micros.div_euclid(MICROS_PER_HOUR);
+    let rem = micros.rem_euclid(MICROS_PER_HOUR);
+    let minute = rem.div_euclid(MICROS_PER_MINUTE);
+    let rem = rem.rem_euclid(MICROS_PER_MINUTE);
+    let second = rem.div_euclid(MICROS_PER_SECOND);
+    let frac = rem.rem_euclid(MICROS_PER_SECOND);
     format_time_parts(hour, minute, second, frac)
 }
 
@@ -3363,9 +3400,9 @@ fn format_time_parts(hour: i64, minute: i64, second: i64, frac: i64) -> String {
 fn format_timezone_offset(offset_seconds: i32) -> String {
     let sign = if offset_seconds < 0 { '-' } else { '+' };
     let abs = offset_seconds.unsigned_abs();
-    let hours = abs / 3_600;
-    let minutes = (abs % 3_600) / 60;
-    let seconds = abs % 60;
+    let hours = abs.div_euclid(3_600);
+    let minutes = abs.rem_euclid(3_600).div_euclid(60);
+    let seconds = abs.rem_euclid(60);
     if seconds != 0 {
         format!("{sign}{hours:02}:{minutes:02}:{seconds:02}")
     } else if minutes != 0 {
@@ -3529,8 +3566,9 @@ fn parse_timezone_offset(token: &str) -> Option<i32> {
         }
         (hours, minutes, seconds)
     } else if body.len() > 2 {
-        let hours = body[..body.len() - 2].parse::<i32>().ok()?;
-        let minutes = body[body.len() - 2..].parse::<i32>().ok()?;
+        let minute_start = body.len().checked_sub(2)?;
+        let hours = body.get(..minute_start)?.parse::<i32>().ok()?;
+        let minutes = body.get(minute_start..)?.parse::<i32>().ok()?;
         (hours, minutes, 0)
     } else {
         (body.parse::<i32>().ok()?, 0, 0)
@@ -3546,7 +3584,7 @@ fn parse_timezone_offset(token: &str) -> Option<i32> {
 }
 
 fn parse_timezone_abbreviation(lower: &str) -> Option<i32> {
-    let hours = match lower {
+    let hours: i32 = match lower {
         "gmt" | "ut" | "wet" => 0,
         "west" | "cet" => 1,
         "cest" | "eet" => 2,
@@ -3558,7 +3596,7 @@ fn parse_timezone_abbreviation(lower: &str) -> Option<i32> {
         "pst" => -8,
         _ => return None,
     };
-    Some(hours * 3_600)
+    hours.checked_mul(3_600)
 }
 
 fn apply_timezone_offset(micros: i64, offset_seconds: i32) -> Option<i64> {
@@ -3581,14 +3619,9 @@ fn fixed_timezone_display_name(token: &str) -> Option<String> {
 fn naive_datetime_from_timestamp_micros(micros: i64) -> Option<chrono::NaiveDateTime> {
     let days = micros.div_euclid(MICROS_PER_DAY);
     let time_micros = micros.rem_euclid(MICROS_PER_DAY);
-    let (year, month, day) = civil_from_days(i32::try_from(days).ok()?);
-    let date = NaiveDate::from_ymd_opt(year, u32::try_from(month).ok()?, u32::try_from(day).ok()?)?;
-    let hour = u32::try_from(time_micros / MICROS_PER_HOUR).ok()?;
-    let rem = time_micros % MICROS_PER_HOUR;
-    let minute = u32::try_from(rem / MICROS_PER_MINUTE).ok()?;
-    let rem = rem % MICROS_PER_MINUTE;
-    let second = u32::try_from(rem / MICROS_PER_SECOND).ok()?;
-    let micros = u32::try_from(rem % MICROS_PER_SECOND).ok()?;
+    let (year, month, day) = civil_from_days(i32::try_from(days).ok()?)?;
+    let date = NaiveDate::from_ymd_opt(year, month, day)?;
+    let (hour, minute, second, micros) = split_micros_of_day(time_micros)?;
     let time = NaiveTime::from_hms_micro_opt(hour, minute, second, micros)?;
     Some(date.and_time(time))
 }
@@ -3602,12 +3635,7 @@ fn parse_named_timezone_offset(date_text: &str, micros: i64, zone: &str) -> Opti
         date = date.checked_add_days(Days::new(1))?;
         local_micros = 0;
     }
-    let hour = u32::try_from(local_micros / MICROS_PER_HOUR).ok()?;
-    let rem = local_micros % MICROS_PER_HOUR;
-    let minute = u32::try_from(rem / MICROS_PER_MINUTE).ok()?;
-    let rem = rem % MICROS_PER_MINUTE;
-    let second = u32::try_from(rem / MICROS_PER_SECOND).ok()?;
-    let micros = u32::try_from(rem % MICROS_PER_SECOND).ok()?;
+    let (hour, minute, second, micros) = split_micros_of_day(local_micros)?;
     let time = NaiveTime::from_hms_micro_opt(hour, minute, second, micros)?;
     let local = date.and_time(time);
     let resolved = match timezone.from_local_datetime(&local) {
@@ -3654,25 +3682,58 @@ pub fn timetz_utc_micros(micros: i64, offset_seconds: i32) -> i64 {
         .rem_euclid(MICROS_PER_DAY)
 }
 
+fn split_micros_of_day(micros: i64) -> Option<(u32, u32, u32, u32)> {
+    if !(0..MICROS_PER_DAY).contains(&micros) {
+        return None;
+    }
+    let hour = u32::try_from(micros.div_euclid(MICROS_PER_HOUR)).ok()?;
+    let rem = micros.rem_euclid(MICROS_PER_HOUR);
+    let minute = u32::try_from(rem.div_euclid(MICROS_PER_MINUTE)).ok()?;
+    let rem = rem.rem_euclid(MICROS_PER_MINUTE);
+    let second = u32::try_from(rem.div_euclid(MICROS_PER_SECOND)).ok()?;
+    let micros = u32::try_from(rem.rem_euclid(MICROS_PER_SECOND)).ok()?;
+    Some((hour, minute, second, micros))
+}
+
 /// Inverse of Howard Hinnant's `days_from_civil`, rebased on UltraSQL's
 /// 2000-01-01 date epoch.
-fn civil_from_days(days_since_2000_01_01: i32) -> (i32, i32, i32) {
-    let z = days_since_2000_01_01 + 10_957;
-    let z = z + 719_468;
+fn civil_from_days(days_since_2000_01_01: i32) -> Option<(i32, u32, u32)> {
+    let z = i64::from(days_since_2000_01_01)
+        .checked_add(10_957)?
+        .checked_add(719_468)?;
     let era = if z >= 0 {
-        z / 146_097
+        z.div_euclid(146_097)
     } else {
-        (z - 146_096) / 146_097
+        z.checked_sub(146_096)?.div_euclid(146_097)
     };
-    let doe = z - era * 146_097;
-    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
-    let y = yoe + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let day = doy - (153 * mp + 2) / 5 + 1;
-    let month = if mp < 10 { mp + 3 } else { mp - 9 };
-    let year = if month <= 2 { y + 1 } else { y };
-    (year, month, day)
+    let doe = z.checked_sub(era.checked_mul(146_097)?)?;
+    let yoe_numerator = doe
+        .checked_sub(doe.div_euclid(1_460))?
+        .checked_add(doe.div_euclid(36_524))?
+        .checked_sub(doe.div_euclid(146_096))?;
+    let yoe = yoe_numerator.div_euclid(365);
+    let y = yoe.checked_add(era.checked_mul(400)?)?;
+    let doy = doe.checked_sub(
+        365_i64
+            .checked_mul(yoe)?
+            .checked_add(yoe.div_euclid(4))?
+            .checked_sub(yoe.div_euclid(100))?,
+    )?;
+    let mp = 5_i64.checked_mul(doy)?.checked_add(2)?.div_euclid(153);
+    let day = doy
+        .checked_sub(153_i64.checked_mul(mp)?.checked_add(2)?.div_euclid(5))?
+        .checked_add(1)?;
+    let month = if mp < 10 {
+        mp.checked_add(3)?
+    } else {
+        mp.checked_sub(9)?
+    };
+    let year = if month <= 2 { y.checked_add(1)? } else { y };
+    Some((
+        i32::try_from(year).ok()?,
+        u32::try_from(month).ok()?,
+        u32::try_from(day).ok()?,
+    ))
 }
 
 impl From<bool> for Value {
@@ -3758,6 +3819,10 @@ mod tests {
     fn iso_date_and_timestamp_text_helpers_round_trip() {
         assert_eq!(parse_date_text(" 2000-01-02 "), Some(1));
         assert_eq!(format_date_days(1), "2000-01-02");
+        let leap_day = parse_date_text("2024-02-29").unwrap();
+        assert_eq!(format_date_days(leap_day), "2024-02-29");
+        assert_eq!(parse_date_text("2023-02-29"), None);
+        assert_eq!(parse_date_text("2023-04-31"), None);
         assert_eq!(
             parse_timestamp_text("2000-01-01T01:02:03.456789"),
             Some(3_723_456_789)
