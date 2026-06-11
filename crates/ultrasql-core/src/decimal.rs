@@ -77,16 +77,20 @@ pub fn parse_decimal_text(raw: &str, target_scale: Option<i32>) -> Result<Value,
 
     let mut value: i128 = 0;
     for digit in whole.bytes() {
+        let digit_value =
+            ascii_decimal_digit_i128(digit).ok_or_else(|| DecimalError::new("decimal overflow"))?;
         value = value
             .checked_mul(10)
-            .and_then(|v| v.checked_add(i128::from(digit - b'0')))
+            .and_then(|v| v.checked_add(digit_value))
             .ok_or_else(|| DecimalError::new("decimal overflow"))?;
     }
 
     for digit in frac.bytes().take(scale_usize) {
+        let digit_value =
+            ascii_decimal_digit_i128(digit).ok_or_else(|| DecimalError::new("decimal overflow"))?;
         value = value
             .checked_mul(10)
-            .and_then(|v| v.checked_add(i128::from(digit - b'0')))
+            .and_then(|v| v.checked_add(digit_value))
             .ok_or_else(|| DecimalError::new("decimal overflow"))?;
     }
     let copied_frac = frac.len().min(scale_usize);
@@ -255,16 +259,28 @@ fn decimal_to_numeric_parts(value: i64, scale: i32) -> Result<NumericBinaryParts
 
     if dscale_usize > 0 {
         if dscale_usize > digit_len {
-            for _ in 0..dscale_usize - digit_len {
+            let missing_frac_digits = dscale_usize
+                .checked_sub(digit_len)
+                .ok_or_else(|| DecimalError::new("numeric payload too large"))?;
+            for _ in 0..missing_frac_digits {
                 grouped.push('0');
             }
             grouped.push_str(&magnitude_digits);
         } else {
-            grouped.push_str(&magnitude_digits[digit_len - dscale_usize..]);
+            let frac_start = digit_len
+                .checked_sub(dscale_usize)
+                .ok_or_else(|| DecimalError::new("numeric payload too large"))?;
+            grouped.push_str(&magnitude_digits[frac_start..]);
         }
-        let rem = grouped.len() % NUMERIC_GROUP_WIDTH;
+        let rem = grouped
+            .len()
+            .checked_rem(NUMERIC_GROUP_WIDTH)
+            .ok_or_else(|| DecimalError::new("numeric payload too large"))?;
         if rem != 0 {
-            for _ in 0..NUMERIC_GROUP_WIDTH - rem {
+            let padding = NUMERIC_GROUP_WIDTH
+                .checked_sub(rem)
+                .ok_or_else(|| DecimalError::new("numeric payload too large"))?;
+            for _ in 0..padding {
                 grouped.push('0');
             }
         }
@@ -278,13 +294,18 @@ fn decimal_to_numeric_parts(value: i64, scale: i32) -> Result<NumericBinaryParts
         .ok_or_else(|| DecimalError::new("invalid numeric digit group"))?;
     let mut weight = i32::try_from(groups_before_decimal)
         .map_err(|_| DecimalError::new("numeric weight out of range"))?
-        - 1;
+        .checked_sub(1)
+        .ok_or_else(|| DecimalError::new("numeric weight out of range"))?;
 
     let leading_zeroes = digits.iter().take_while(|digit| **digit == 0).count();
     if leading_zeroes > 0 {
         digits.drain(..leading_zeroes);
-        weight -= i32::try_from(leading_zeroes)
-            .map_err(|_| DecimalError::new("numeric weight out of range"))?;
+        weight = weight
+            .checked_sub(
+                i32::try_from(leading_zeroes)
+                    .map_err(|_| DecimalError::new("numeric weight out of range"))?,
+            )
+            .ok_or_else(|| DecimalError::new("numeric weight out of range"))?;
     }
     while digits.last().is_some_and(|digit| *digit == 0) {
         digits.pop();
@@ -305,14 +326,24 @@ fn decimal_to_numeric_parts(value: i64, scale: i32) -> Result<NumericBinaryParts
 fn decimal_group_to_u16(group: &[u8]) -> Option<u16> {
     let mut value = 0_u16;
     for byte in group {
-        if !byte.is_ascii_digit() {
-            return None;
-        }
-        value = value
-            .checked_mul(10)?
-            .checked_add(u16::from(*byte - b'0'))?;
+        let digit = ascii_decimal_digit_u16(*byte)?;
+        value = value.checked_mul(10)?.checked_add(digit)?;
     }
     Some(value)
+}
+
+fn ascii_decimal_digit_i128(byte: u8) -> Option<i128> {
+    if !byte.is_ascii_digit() {
+        return None;
+    }
+    Some(i128::from(byte.checked_sub(b'0')?))
+}
+
+fn ascii_decimal_digit_u16(byte: u8) -> Option<u16> {
+    if !byte.is_ascii_digit() {
+        return None;
+    }
+    Some(u16::from(byte.checked_sub(b'0')?))
 }
 
 fn numeric_parts_to_value(
@@ -350,12 +381,18 @@ fn numeric_parts_to_value(
             )
             .ok_or_else(|| DecimalError::new("numeric exponent overflow"))?;
             let digit = i128::from(*digit);
-            if digit % divisor != 0 {
+            if digit
+                .checked_rem(divisor)
+                .ok_or_else(|| DecimalError::new("numeric exponent overflow"))?
+                != 0
+            {
                 return Err(DecimalError::new(
                     "numeric stores more fractional digits than display scale",
                 ));
             }
-            digit / divisor
+            digit
+                .checked_div(divisor)
+                .ok_or_else(|| DecimalError::new("numeric exponent overflow"))?
         } else {
             let pow = pow10_i128(
                 u32::try_from(decimal_exp)
@@ -422,6 +459,14 @@ mod tests {
             Value::Decimal {
                 value: 12_340,
                 scale: 3
+            }
+        );
+        let fractional = encode_pg_numeric_binary(12, 4).unwrap();
+        assert_eq!(
+            decode_pg_numeric_binary(&fractional).unwrap(),
+            Value::Decimal {
+                value: 12,
+                scale: 4
             }
         );
     }
