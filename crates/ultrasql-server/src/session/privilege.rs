@@ -291,10 +291,12 @@ where
         table: &str,
     ) -> Result<ultrasql_core::Oid, ServerError> {
         let snapshot = self.state.catalog_snapshot();
-        let table_name = privilege_object_simple_name(table);
-        let table_key = privilege_object_namespace(table).map_or_else(
-            || table_name.to_ascii_lowercase(),
-            |namespace| ultrasql_catalog::table_lookup_key(namespace, table_name),
+        let Some((namespace, table_name)) = privilege_relation_parts(table) else {
+            return Err(ServerError::ddl(format!("table '{table}' does not exist")));
+        };
+        let table_key = namespace.map_or_else(
+            || ultrasql_catalog::table_lookup_key("public", &table_name),
+            |namespace| ultrasql_catalog::table_lookup_key(&namespace, &table_name),
         );
         let Some(meta) = snapshot.tables.get(&table_key) else {
             return Err(ServerError::ddl(format!("table '{table}' does not exist")));
@@ -369,9 +371,13 @@ where
     }
 
     fn sequence_key_for_privilege_object(&self, sequence: &str) -> Result<String, ServerError> {
-        let sequence_name = privilege_object_simple_name(sequence).to_ascii_lowercase();
-        let sequence_key = if let Some(namespace) = privilege_object_namespace(sequence) {
-            crate::sequence_lookup_key(namespace, &sequence_name)
+        let Some((namespace, sequence_name)) = privilege_relation_parts(sequence) else {
+            return Err(ServerError::ddl(format!(
+                "sequence '{sequence}' does not exist"
+            )));
+        };
+        let sequence_key = if let Some(namespace) = namespace {
+            crate::sequence_lookup_key(&namespace, &sequence_name)
         } else if self.state.sequences.contains_key(&sequence_name) {
             sequence_name
         } else {
@@ -416,14 +422,16 @@ fn convert_object_kind(kind: LogicalPrivilegeObjectKind) -> PrivilegeObjectKind 
     }
 }
 
-fn privilege_object_simple_name(object: &str) -> &str {
-    object.rsplit('.').next().unwrap_or(object)
-}
-
-fn privilege_object_namespace(object: &str) -> Option<&str> {
-    let mut parts = object.rsplit('.');
-    parts.next()?;
-    parts.next()
+fn privilege_relation_parts(object: &str) -> Option<(Option<String>, String)> {
+    let parts = crate::parse_pg_identifier_path(object)?;
+    match parts.as_slice() {
+        [name] => Some((None, name.to_ascii_lowercase())),
+        [namespace, name] => Some((
+            Some(namespace.to_ascii_lowercase()),
+            name.to_ascii_lowercase(),
+        )),
+        _ => None,
+    }
 }
 
 fn privilege_function_simple_name(function: &str) -> String {

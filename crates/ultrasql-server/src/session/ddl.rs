@@ -947,12 +947,12 @@ where
             crate::auth::PrivilegeObjectKind::Table,
             table_name,
         );
-        for (_, seq_key, _) in &serial_sequences {
+        for (seq_name, _, _) in &serial_sequences {
             self.state.privilege_catalog.apply_default_privileges(
                 &self.current_user,
                 namespace,
                 crate::auth::PrivilegeObjectKind::Sequence,
-                seq_key,
+                seq_name,
             );
         }
         let grants_changed = before_grants != self.state.privilege_catalog.list_grants()

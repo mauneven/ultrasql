@@ -2661,6 +2661,49 @@ fn type_name_namespace_and_name(name: &str) -> Option<(&str, &str)> {
     (!schema_name.is_empty() && !type_name.is_empty()).then_some((schema_name, type_name))
 }
 
+pub(crate) fn parse_pg_identifier_path(text: &str) -> Option<Vec<String>> {
+    let mut parts = Vec::new();
+    let mut chars = text.chars().peekable();
+    loop {
+        match chars.peek().copied()? {
+            '"' => {
+                chars.next();
+                let mut part = String::new();
+                loop {
+                    match chars.next()? {
+                        '"' if chars.peek() == Some(&'"') => {
+                            chars.next();
+                            part.push('"');
+                        }
+                        '"' => break,
+                        ch => part.push(ch),
+                    }
+                }
+                parts.push(part);
+            }
+            _ => {
+                let mut part = String::new();
+                while let Some(ch) = chars.peek().copied() {
+                    if ch == '.' {
+                        break;
+                    }
+                    part.push(ch);
+                    chars.next();
+                }
+                if part.is_empty() {
+                    return None;
+                }
+                parts.push(part);
+            }
+        }
+        match chars.next() {
+            Some('.') => continue,
+            None => return Some(parts),
+            Some(_) => return None,
+        }
+    }
+}
+
 fn sequence_lookup_key(schema_name: &str, sequence_name: &str) -> String {
     ultrasql_catalog::table_lookup_key(schema_name, sequence_name)
 }

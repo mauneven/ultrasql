@@ -244,9 +244,22 @@ fn bind_object_names(objects: &[ObjectName]) -> Vec<String> {
 fn object_name_key(name: &ObjectName) -> String {
     name.parts
         .iter()
-        .map(|part| part.value.to_ascii_lowercase())
+        .map(object_name_part_key)
         .collect::<Vec<_>>()
         .join(".")
+}
+
+fn object_name_part_key(part: &Identifier) -> String {
+    let folded = part.value.to_ascii_lowercase();
+    if part.quoted {
+        quote_identifier(&folded)
+    } else {
+        folded
+    }
+}
+
+fn quote_identifier(value: &str) -> String {
+    format!("\"{}\"", value.replace('"', "\"\""))
 }
 
 fn bind_role_names(names: &[Identifier]) -> Vec<String> {
@@ -273,9 +286,24 @@ mod tests {
         }
     }
 
+    fn quoted_ident(name: &str) -> Identifier {
+        Identifier {
+            value: name.to_owned(),
+            quoted: true,
+            span: Span::default(),
+        }
+    }
+
     fn object(parts: &[&str]) -> ObjectName {
         ObjectName {
             parts: parts.iter().map(|part| ident(part)).collect(),
+            span: Span::default(),
+        }
+    }
+
+    fn quoted_object(parts: Vec<Identifier>) -> ObjectName {
+        ObjectName {
+            parts,
             span: Span::default(),
         }
     }
@@ -471,6 +499,14 @@ mod tests {
         assert_eq!(
             bind_object_names(&[object(&["App", "Users"])]),
             vec!["app.users"]
+        );
+        assert_eq!(
+            bind_object_names(&[quoted_object(vec![quoted_ident("Grant.Dot")])]),
+            vec!["\"grant.dot\""]
+        );
+        assert_eq!(
+            bind_object_names(&[quoted_object(vec![ident("App"), quoted_ident("Users.Dot")])]),
+            vec!["app.\"users.dot\""]
         );
         assert_eq!(
             bind_ident_names(&[ident("Owner"), ident("PUBLIC")]),

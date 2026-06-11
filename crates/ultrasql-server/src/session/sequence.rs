@@ -125,7 +125,7 @@ where
             &self.current_user,
             namespace,
             crate::auth::PrivilegeObjectKind::Sequence,
-            &sequence_key,
+            sequence_name,
         );
         let grants_changed = before_grants != self.state.privilege_catalog.list_grants()
             || before_default_grants != self.state.privilege_catalog.list_default_grants();
@@ -289,7 +289,7 @@ where
 
     fn sequence_key_for_reference(&self, sequence_name: &str) -> Option<String> {
         let folded = sequence_name.to_ascii_lowercase();
-        let parts = parse_sequence_identifier_path(&folded)?;
+        let parts = crate::parse_pg_identifier_path(&folded)?;
         match parts.as_slice() {
             [name] => {
                 if self.state.sequences.contains_key(name) {
@@ -597,49 +597,6 @@ fn expect_sequence_name(expr: &AstExpr) -> Result<String, ServerError> {
         ));
     };
     Ok(value.to_ascii_lowercase())
-}
-
-fn parse_sequence_identifier_path(text: &str) -> Option<Vec<String>> {
-    let mut parts = Vec::new();
-    let mut chars = text.chars().peekable();
-    loop {
-        match chars.peek().copied()? {
-            '"' => {
-                chars.next();
-                let mut part = String::new();
-                loop {
-                    match chars.next()? {
-                        '"' if chars.peek() == Some(&'"') => {
-                            chars.next();
-                            part.push('"');
-                        }
-                        '"' => break,
-                        ch => part.push(ch),
-                    }
-                }
-                parts.push(part);
-            }
-            _ => {
-                let mut part = String::new();
-                while let Some(ch) = chars.peek().copied() {
-                    if ch == '.' {
-                        break;
-                    }
-                    part.push(ch);
-                    chars.next();
-                }
-                if part.is_empty() {
-                    return None;
-                }
-                parts.push(part);
-            }
-        }
-        match chars.next() {
-            Some('.') => continue,
-            None => return Some(parts),
-            Some(_) => return None,
-        }
-    }
 }
 
 fn expect_i64(expr: &AstExpr) -> Result<i64, ServerError> {
