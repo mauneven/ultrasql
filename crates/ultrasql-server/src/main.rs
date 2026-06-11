@@ -28,6 +28,8 @@ use ultrasql_server::{
 const OPS_REQUEST_HEAD_LIMIT_BYTES: usize = 8 * 1024;
 const OPS_REQUEST_HEAD_HARD_LIMIT_BYTES: usize = 64 * 1024;
 const OPS_REQUEST_READ_TIMEOUT: Duration = Duration::from_secs(2);
+const DEFAULT_WAL_COMMAND_TIMEOUT: Duration = Duration::from_secs(60);
+const WAL_COMMAND_TIMEOUT_POLL_INTERVAL: Duration = Duration::from_millis(10);
 
 /// `ultrasqld` v0.5: SQL server with an
 /// in-memory sample database.
@@ -130,6 +132,22 @@ struct Cli {
     /// Background WAL archive scan interval in milliseconds.
     #[arg(long, default_value_t = 1000)]
     archive_interval_ms: u64,
+
+    /// Kill `archive_command` after this many milliseconds; 0 disables.
+    #[arg(
+        long,
+        env = "ULTRASQL_ARCHIVE_COMMAND_TIMEOUT_MS",
+        default_value_t = 60_000
+    )]
+    archive_command_timeout_ms: u64,
+
+    /// Kill `restore_command` after this many milliseconds; 0 disables.
+    #[arg(
+        long,
+        env = "ULTRASQL_RESTORE_COMMAND_TIMEOUT_MS",
+        default_value_t = 60_000
+    )]
+    restore_command_timeout_ms: u64,
 }
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
@@ -185,6 +203,8 @@ Production-oriented v0.9 flags:
   - --idle-session-timeout-ms N
   - --archive-command CMD  archive completed WAL files; %p=path, %f=name
   - --restore-command CMD  restore archived WAL before recovery; %p=path, %f=name
+  - --archive-command-timeout-ms N  kill hung archive commands; 0 disables
+  - --restore-command-timeout-ms N  kill hung restore commands; 0 disables
 ";
 
 fn main() -> std::process::ExitCode {
@@ -230,7 +250,13 @@ fn main() -> std::process::ExitCode {
                 .as_deref()
                 .filter(|command| !command.trim().is_empty())
             {
-                match restore_wal_once(path, command, cli.restore_max_segments) {
+                let timeout = command_timeout(cli.restore_command_timeout_ms);
+                match restore_wal_once_with_timeout(
+                    path,
+                    command,
+                    cli.restore_max_segments,
+                    timeout,
+                ) {
                     Ok(restored) if restored > 0 => {
                         info!(target: "ultrasqld", restored, data_dir = %path.display(), "restored archived WAL before startup recovery");
                     }
@@ -298,8 +324,9 @@ fn main() -> std::process::ExitCode {
                 .filter(|command| !command.trim().is_empty()),
         ) {
             let interval_ms = cli.archive_interval_ms;
+            let timeout = command_timeout(cli.archive_command_timeout_ms);
             tokio::spawn(async move {
-                run_wal_archiver_loop(data_dir, command, interval_ms).await;
+                run_wal_archiver_loop(data_dir, command, interval_ms, timeout).await;
             });
         }
         run_server(cli.listen, state).await
@@ -347,12 +374,17 @@ fn autovacuum_config_from_cli(cli: &Cli) -> Result<AutovacuumConfig, String> {
     })
 }
 
-async fn run_wal_archiver_loop(data_dir: PathBuf, archive_command: String, interval_ms: u64) {
+async fn run_wal_archiver_loop(
+    data_dir: PathBuf,
+    archive_command: String,
+    interval_ms: u64,
+    timeout: Option<Duration>,
+) {
     let interval_ms = interval_ms.max(1);
     let mut ticker = tokio::time::interval(std::time::Duration::from_millis(interval_ms));
     loop {
         ticker.tick().await;
-        match archive_wal_once(&data_dir, &archive_command) {
+        match archive_wal_once_with_timeout(&data_dir, &archive_command, timeout) {
             Ok(archived) if archived > 0 => {
                 info!(target: "ultrasqld", archived, "WAL archiver completed batch");
             }
@@ -364,7 +396,16 @@ async fn run_wal_archiver_loop(data_dir: PathBuf, archive_command: String, inter
     }
 }
 
+#[cfg(test)]
 fn archive_wal_once(data_dir: &Path, archive_command: &str) -> Result<usize, String> {
+    archive_wal_once_with_timeout(data_dir, archive_command, Some(DEFAULT_WAL_COMMAND_TIMEOUT))
+}
+
+fn archive_wal_once_with_timeout(
+    data_dir: &Path,
+    archive_command: &str,
+    timeout: Option<Duration>,
+) -> Result<usize, String> {
     let wal_dir = data_dir.join("pg_wal");
     let status_dir = wal_dir.join("archive_status");
     ensure_directory(&wal_dir, "WAL directory")?;
@@ -410,14 +451,24 @@ fn archive_wal_once(data_dir: &Path, archive_command: &str) -> Result<usize, Str
             continue;
         }
         let rendered = render_archive_command(archive_command, &path, name);
-        let status = run_archive_shell_command(&rendered)
-            .map_err(|e| format!("archive command spawn failed for {name}: {e}"))?;
-        if !status.success() {
-            let failed = status_dir.join(format!("{name}.failed"));
-            write_status_marker(&failed, rendered.as_bytes())?;
-            return Err(format!(
-                "archive command failed for {name} with status {status}"
-            ));
+        match run_archive_shell_command(&rendered, timeout) {
+            Ok(status) if status.success() => {}
+            Ok(status) => {
+                let failed = status_dir.join(format!("{name}.failed"));
+                write_status_marker(&failed, rendered.as_bytes())?;
+                return Err(format!(
+                    "archive command failed for {name} with status {status}"
+                ));
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::TimedOut => {
+                let failed = status_dir.join(format!("{name}.failed"));
+                write_status_marker(&failed, rendered.as_bytes())?;
+                return Err(format!(
+                    "archive command timed out for {name} after {} ms",
+                    timeout_label_ms(timeout)
+                ));
+            }
+            Err(err) => return Err(format!("archive command spawn failed for {name}: {err}")),
         }
         write_status_marker(&done, rendered.as_bytes())?;
         archived = archived.saturating_add(1);
@@ -425,10 +476,25 @@ fn archive_wal_once(data_dir: &Path, archive_command: &str) -> Result<usize, Str
     Ok(archived)
 }
 
+#[cfg(test)]
 fn restore_wal_once(
     data_dir: &Path,
     restore_command: &str,
     max_segments: u32,
+) -> Result<usize, String> {
+    restore_wal_once_with_timeout(
+        data_dir,
+        restore_command,
+        max_segments,
+        Some(DEFAULT_WAL_COMMAND_TIMEOUT),
+    )
+}
+
+fn restore_wal_once_with_timeout(
+    data_dir: &Path,
+    restore_command: &str,
+    max_segments: u32,
+    timeout: Option<Duration>,
 ) -> Result<usize, String> {
     if restore_command.trim().is_empty() || max_segments == 0 {
         return Ok(0);
@@ -448,12 +514,22 @@ fn restore_wal_once(
         }
 
         let rendered = render_restore_command(restore_command, &path, &name);
-        let status = run_restore_shell_command(&rendered)
-            .map_err(|e| format!("restore command spawn failed for {name}: {e}"))?;
-        if !status.success() {
-            let missing = status_dir.join(format!("{name}.missing"));
-            write_status_marker(&missing, rendered.as_bytes())?;
-            break;
+        match run_restore_shell_command(&rendered, timeout) {
+            Ok(status) if status.success() => {}
+            Ok(_) => {
+                let missing = status_dir.join(format!("{name}.missing"));
+                write_status_marker(&missing, rendered.as_bytes())?;
+                break;
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::TimedOut => {
+                let failed = status_dir.join(format!("{name}.failed"));
+                write_status_marker(&failed, rendered.as_bytes())?;
+                return Err(format!(
+                    "restore command timed out for {name} after {} ms",
+                    timeout_label_ms(timeout)
+                ));
+            }
+            Err(err) => return Err(format!("restore command spawn failed for {name}: {err}")),
         }
         if !wal_file_exists(&path, &name)? {
             let missing = status_dir.join(format!("{name}.missing"));
@@ -566,23 +642,72 @@ fn render_restore_command(template: &str, path: &Path, filename: &str) -> String
         .replace("%f", filename)
 }
 
-fn run_archive_shell_command(command: &str) -> std::io::Result<std::process::ExitStatus> {
-    run_shell_command(command)
+fn run_archive_shell_command(
+    command: &str,
+    timeout: Option<Duration>,
+) -> std::io::Result<std::process::ExitStatus> {
+    run_shell_command_with_timeout(command, timeout)
 }
 
-fn run_restore_shell_command(command: &str) -> std::io::Result<std::process::ExitStatus> {
-    run_shell_command(command)
+fn run_restore_shell_command(
+    command: &str,
+    timeout: Option<Duration>,
+) -> std::io::Result<std::process::ExitStatus> {
+    run_shell_command_with_timeout(command, timeout)
 }
 
-fn run_shell_command(command: &str) -> std::io::Result<std::process::ExitStatus> {
+fn run_shell_command_with_timeout(
+    command: &str,
+    timeout: Option<Duration>,
+) -> std::io::Result<std::process::ExitStatus> {
+    let Some(timeout) = timeout else {
+        return spawn_shell_command(command)?.wait();
+    };
+    let mut child = spawn_shell_command(command)?;
+    let started = std::time::Instant::now();
+    loop {
+        if let Some(status) = child.try_wait()? {
+            return Ok(status);
+        }
+        if started.elapsed() >= timeout {
+            if let Err(err) = child.kill()
+                && err.kind() != std::io::ErrorKind::InvalidInput
+            {
+                return Err(err);
+            }
+            let _status = child.wait()?;
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                format!("shell command timed out after {} ms", timeout.as_millis()),
+            ));
+        }
+        let remaining = timeout
+            .checked_sub(started.elapsed())
+            .unwrap_or(Duration::ZERO);
+        if remaining.is_zero() {
+            continue;
+        }
+        std::thread::sleep(remaining.min(WAL_COMMAND_TIMEOUT_POLL_INTERVAL));
+    }
+}
+
+fn spawn_shell_command(command: &str) -> std::io::Result<std::process::Child> {
     #[cfg(windows)]
     {
-        Command::new("cmd").args(["/C", command]).status()
+        Command::new("cmd").args(["/C", command]).spawn()
     }
     #[cfg(not(windows))]
     {
-        Command::new("sh").args(["-c", command]).status()
+        Command::new("sh").args(["-c", command]).spawn()
     }
+}
+
+fn command_timeout(timeout_ms: u64) -> Option<Duration> {
+    (timeout_ms > 0).then(|| Duration::from_millis(timeout_ms))
+}
+
+fn timeout_label_ms(timeout: Option<Duration>) -> u128 {
+    timeout.unwrap_or(DEFAULT_WAL_COMMAND_TIMEOUT).as_millis()
 }
 
 fn logging_config_from_cli(cli: &Cli) -> Result<LoggingConfig, String> {
@@ -1137,6 +1262,8 @@ mod tests {
             restore_command: None,
             restore_max_segments: 0,
             archive_interval_ms: 1000,
+            archive_command_timeout_ms: 60_000,
+            restore_command_timeout_ms: 60_000,
         };
 
         let config = autovacuum_config_from_cli(&cli).expect("valid autovacuum config");
@@ -1168,6 +1295,8 @@ mod tests {
             restore_command: None,
             restore_max_segments: 0,
             archive_interval_ms: 1000,
+            archive_command_timeout_ms: 60_000,
+            restore_command_timeout_ms: 60_000,
         };
 
         assert!(autovacuum_config_from_cli(&cli).is_err());
@@ -1194,6 +1323,8 @@ mod tests {
             restore_command: None,
             restore_max_segments: 0,
             archive_interval_ms: 1000,
+            archive_command_timeout_ms: 60_000,
+            restore_command_timeout_ms: 60_000,
         };
 
         assert!(logging_config_from_cli(&cli).is_err());
@@ -1220,6 +1351,8 @@ mod tests {
             restore_command: None,
             restore_max_segments: 0,
             archive_interval_ms: 1000,
+            archive_command_timeout_ms: 60_000,
+            restore_command_timeout_ms: 60_000,
         };
 
         let config = logging_config_from_cli(&cli).expect("valid logging config");
@@ -1430,6 +1563,75 @@ mod tests {
     #[cfg(not(windows))]
     fn failing_shell_command() -> &'static str {
         "exit 7"
+    }
+
+    #[test]
+    fn shell_command_timeout_stops_hung_commands() {
+        let started = std::time::Instant::now();
+        let err = run_shell_command_with_timeout(
+            hanging_shell_command(),
+            Some(Duration::from_millis(25)),
+        )
+        .expect_err("hung shell command should time out");
+
+        assert_eq!(err.kind(), std::io::ErrorKind::TimedOut);
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "timeout should stop command promptly"
+        );
+    }
+
+    #[test]
+    fn archive_wal_once_marks_timed_out_command_failed() {
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let wal_dir = dir.path().join("pg_wal");
+        std::fs::create_dir_all(&wal_dir).expect("pg_wal");
+        std::fs::write(wal_dir.join("000000010000000000000001"), b"wal-a").expect("wal a");
+        std::fs::write(wal_dir.join("000000010000000000000002"), b"wal-b").expect("wal b");
+
+        let err = archive_wal_once_with_timeout(
+            dir.path(),
+            hanging_shell_command(),
+            Some(Duration::from_millis(25)),
+        )
+        .expect_err("hung archive command should fail");
+
+        assert!(err.contains("archive command timed out"));
+        assert!(
+            wal_dir
+                .join("archive_status/000000010000000000000001.failed")
+                .exists()
+        );
+    }
+
+    #[test]
+    fn restore_wal_once_errors_on_timed_out_command() {
+        let dir = tempfile::TempDir::new().expect("temp dir");
+
+        let err = restore_wal_once_with_timeout(
+            dir.path(),
+            hanging_shell_command(),
+            1,
+            Some(Duration::from_millis(25)),
+        )
+        .expect_err("hung restore command should fail");
+
+        assert!(err.contains("restore command timed out"));
+        assert!(
+            dir.path()
+                .join("pg_wal/restore_status/segment_0000000000.failed")
+                .exists()
+        );
+    }
+
+    #[cfg(windows)]
+    fn hanging_shell_command() -> &'static str {
+        "powershell -NoProfile -NonInteractive -Command Start-Sleep -Seconds 5"
+    }
+
+    #[cfg(not(windows))]
+    fn hanging_shell_command() -> &'static str {
+        "sleep 5"
     }
 
     #[cfg(not(windows))]
