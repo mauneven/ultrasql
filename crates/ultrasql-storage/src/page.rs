@@ -298,6 +298,10 @@ impl PageHeader {
 
         let kind = PageKind::from_u16(kind_raw).ok_or(PageError::Malformed("unknown page kind"))?;
 
+        if bytes[23] != 0 {
+            return Err(PageError::Malformed("reserved header byte"));
+        }
+
         if version != PAGE_VERSION_CURRENT {
             return Err(PageError::UnsupportedVersion(version));
         }
@@ -878,6 +882,18 @@ mod tests {
         bytes[22] = 0xFF;
         let err = PageHeader::decode(&bytes).unwrap_err();
         assert!(matches!(err, PageError::UnsupportedVersion(0xFF)));
+    }
+
+    #[test]
+    fn reserved_header_byte_rejected() {
+        let mut bytes = [0_u8; PAGE_SIZE];
+        let h = PageHeader::fresh_heap();
+        h.encode(&mut bytes);
+        bytes[23] = 1;
+
+        let err = PageHeader::decode(&bytes).unwrap_err();
+
+        assert!(matches!(err, PageError::Malformed("reserved header byte")));
     }
 
     #[test]
