@@ -33,6 +33,9 @@ const MICROS_PER_SECOND: i64 = 1_000_000;
 const TIMETZ_OFFSET_BITS: u32 = 18;
 const TIMETZ_OFFSET_BIAS_SECONDS: i32 = 86_400;
 const TIMETZ_OFFSET_MASK: i64 = (1_i64 << TIMETZ_OFFSET_BITS) - 1;
+const HEX_ALPHA_BASE: u8 = 10;
+const HEX_NIBBLES_PER_BYTE: usize = 2;
+const UUID_HEX_NIBBLES: usize = 32;
 
 #[must_use]
 fn i64_to_f64(value: i64) -> f64 {
@@ -781,7 +784,7 @@ impl Value {
     /// Accepts canonical hyphenated text and compact 32-hex-digit text.
     #[must_use]
     pub fn parse_uuid(text: &str) -> Option<[u8; 16]> {
-        let mut nibbles = [0_u8; 32];
+        let mut nibbles = [0_u8; UUID_HEX_NIBBLES];
         let mut len = 0_usize;
         for byte in text.bytes() {
             if byte == b'-' {
@@ -790,20 +793,18 @@ impl Value {
             if len >= nibbles.len() {
                 return None;
             }
-            nibbles[len] = match byte {
-                b'0'..=b'9' => byte - b'0',
-                b'a'..=b'f' => byte - b'a' + 10,
-                b'A'..=b'F' => byte - b'A' + 10,
-                _ => return None,
-            };
-            len += 1;
+            nibbles[len] = hex_nibble(byte)?;
+            len = len.checked_add(1)?;
         }
         if len != nibbles.len() {
             return None;
         }
         let mut out = [0_u8; 16];
-        for idx in 0..out.len() {
-            out[idx] = (nibbles[idx * 2] << 4) | nibbles[idx * 2 + 1];
+        for (slot, pair) in out
+            .iter_mut()
+            .zip(nibbles.chunks_exact(HEX_NIBBLES_PER_BYTE))
+        {
+            *slot = pack_hex_byte(pair[0], pair[1])?;
         }
         Some(out)
     }
@@ -814,15 +815,13 @@ impl Value {
         let hex = text
             .strip_prefix("\\x")
             .or_else(|| text.strip_prefix("\\X"))?;
-        if hex.len() % 2 != 0 {
+        if hex.len().checked_rem(HEX_NIBBLES_PER_BYTE) != Some(0) {
             return None;
         }
-        let mut out = Vec::with_capacity(hex.len() / 2);
+        let mut out = Vec::with_capacity(hex.len().checked_div(HEX_NIBBLES_PER_BYTE).unwrap_or(0));
         let bytes = hex.as_bytes();
-        for idx in (0..bytes.len()).step_by(2) {
-            let hi = hex_nibble(bytes[idx])?;
-            let lo = hex_nibble(bytes[idx + 1])?;
-            out.push((hi << 4) | lo);
+        for pair in bytes.chunks_exact(HEX_NIBBLES_PER_BYTE) {
+            out.push(pack_hex_byte(hex_nibble(pair[0])?, hex_nibble(pair[1])?)?);
         }
         Some(out)
     }
@@ -2627,11 +2626,19 @@ fn xml_entity_ref_len(bytes: &[u8]) -> Option<usize> {
 
 fn hex_nibble(byte: u8) -> Option<u8> {
     match byte {
-        b'0'..=b'9' => Some(byte - b'0'),
-        b'a'..=b'f' => Some(byte - b'a' + 10),
-        b'A'..=b'F' => Some(byte - b'A' + 10),
+        b'0'..=b'9' => byte.checked_sub(b'0'),
+        b'a'..=b'f' => byte
+            .checked_sub(b'a')
+            .and_then(|digit| digit.checked_add(HEX_ALPHA_BASE)),
+        b'A'..=b'F' => byte
+            .checked_sub(b'A')
+            .and_then(|digit| digit.checked_add(HEX_ALPHA_BASE)),
         _ => None,
     }
+}
+
+fn pack_hex_byte(high: u8, low: u8) -> Option<u8> {
+    high.checked_shl(4).map(|upper| upper | low)
 }
 
 fn write_decimal_text(f: &mut fmt::Formatter<'_>, value: i64, scale: i32) -> fmt::Result {
@@ -4289,6 +4296,7 @@ mod tests {
         );
         assert_eq!(Value::parse_bytea("\\xabc"), None);
         assert_eq!(Value::parse_bytea("deadbeef"), None);
+        assert_eq!(Value::parse_bytea("\\xzz"), None);
     }
 
     #[test]
@@ -4385,6 +4393,14 @@ mod tests {
             Some(expected)
         );
         assert_eq!(Value::parse_uuid("not-a-uuid"), None);
+        assert_eq!(
+            Value::parse_uuid("12345678-9abc-def0-1234-56789abcdef"),
+            None
+        );
+        assert_eq!(
+            Value::parse_uuid("12345678-9abc-def0-1234-56789abcdeg0"),
+            None
+        );
     }
 
     #[test]
