@@ -1047,12 +1047,14 @@ fn resolve_relation_size_entry<'a>(
     ctx: &'a super::LowerCtx<'_>,
 ) -> Option<&'a ultrasql_catalog::TableEntry> {
     let folded = relation_name.to_ascii_lowercase();
-    if let Some(entry) = ctx.catalog_snapshot.tables.get(&folded) {
-        return Some(entry);
+    if let Some((namespace, relation)) = folded.rsplit_once('.') {
+        if namespace.is_empty() || relation.is_empty() {
+            return None;
+        }
+        let key = ultrasql_catalog::table_lookup_key(namespace, relation);
+        return ctx.catalog_snapshot.tables.get(&key);
     }
-    folded
-        .rsplit_once('.')
-        .and_then(|(_, unqualified)| ctx.catalog_snapshot.tables.get(unqualified))
+    ctx.catalog_snapshot.tables.get(&folded)
 }
 
 fn lower_window_func(func: &ultrasql_planner::LogicalWindowFunc) -> ultrasql_executor::WindowFunc {

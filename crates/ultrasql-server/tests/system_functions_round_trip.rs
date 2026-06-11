@@ -440,5 +440,19 @@ async fn pg_relation_size_reports_heap_pages() {
     assert_eq!(rows[0].get::<_, i64>(0), 8192);
     assert_eq!(rows[0].get::<_, String>(1), "8 kB");
 
+    client
+        .batch_execute("CREATE SCHEMA app")
+        .await
+        .expect("create app schema");
+    let err = client
+        .query("SELECT pg_relation_size('app.sized')", &[])
+        .await
+        .expect_err("qualified missing relation must not fall back to public table");
+    let message = err
+        .as_db_error()
+        .map(|db| db.message().to_owned())
+        .unwrap_or_else(|| err.to_string());
+    assert!(message.contains("app.sized"), "{message}");
+
     shutdown(running).await;
 }
