@@ -105,6 +105,22 @@ fn parse_bind_ok(sql: &str) -> LogicalPlan {
 }
 
 #[test]
+fn binds_explicit_public_dotted_table_name() {
+    let schema = Schema::new([Field::required("id", DataType::Int32)]).expect("schema ok");
+    let mut cat = InMemoryCatalog::new();
+    cat.register("events.log", TableMeta::new(schema));
+
+    let plan = parse_and_bind("SELECT id FROM public.\"events.log\"", &cat).expect("bind ok");
+    let LogicalPlan::Project { input, .. } = plan else {
+        panic!("expected Project");
+    };
+    let LogicalPlan::Scan { table, .. } = input.as_ref() else {
+        panic!("expected Scan");
+    };
+    assert_eq!(table, "6:public10:events.log");
+}
+
+#[test]
 fn binds_column_privilege_specs() {
     let plan = parse_bind_ok("GRANT SELECT(id), UPDATE(name) ON TABLE users TO analyst");
     let LogicalPlan::GrantPrivileges {

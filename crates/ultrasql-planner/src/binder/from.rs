@@ -2208,7 +2208,7 @@ mod tests {
         let mut catalog = InMemoryCatalog::new();
         catalog.register("users", TableMeta::new(users.clone()));
         catalog.register("orders", TableMeta::new(orders));
-        catalog.register("pg_catalog.pg_class", TableMeta::new(users));
+        catalog.register("pg_class", TableMeta::with_schema_name("pg_catalog", users));
         catalog
     }
 

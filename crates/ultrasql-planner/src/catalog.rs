@@ -206,14 +206,11 @@ impl InMemoryCatalog {
         }
     }
 
-    /// Register a table. If a table with the same case-folded name
-    /// already exists, the previous entry is returned.
+    /// Register a table using the schema recorded in its metadata. If a table
+    /// with the same case-folded schema/name key already exists, the previous
+    /// entry is returned.
     pub fn register(&mut self, name: &str, meta: TableMeta) -> Option<TableMeta> {
-        let key = if name.contains('.') {
-            name.to_ascii_lowercase()
-        } else {
-            ultrasql_catalog::table_lookup_key(&meta.schema_name, name)
-        };
+        let key = ultrasql_catalog::table_lookup_key(&meta.schema_name, name);
         self.tables.insert(key, meta)
     }
 
@@ -239,11 +236,18 @@ impl InMemoryCatalog {
 impl Catalog for InMemoryCatalog {
     fn lookup_table(&self, name: &str) -> Option<TableMeta> {
         let folded = name.to_ascii_lowercase();
+        let public_key = ultrasql_catalog::table_lookup_key("public", name);
+        if public_key != folded
+            && let Some(meta) = self.tables.get(&public_key).cloned()
+        {
+            return Some(meta);
+        }
         self.tables.get(&folded).cloned().or_else(|| {
-            let public_key = ultrasql_catalog::table_lookup_key("public", name);
-            (public_key != folded)
-                .then(|| self.tables.get(&public_key).cloned())
-                .flatten()
+            folded
+                .rsplit_once('.')
+                .and_then(|(schema_name, table_name)| {
+                    self.lookup_table_in_schema(schema_name, table_name)
+                })
         })
     }
 
@@ -567,6 +571,14 @@ mod tests {
             cat.lookup_index_schema("idx.dotted").as_deref(),
             Some("public")
         );
+    }
+
+    #[test]
+    fn lookup_table_in_schema_treats_dotted_table_name_as_public_name() {
+        let mut cat = InMemoryCatalog::new();
+        cat.register("events.log", TableMeta::new(users_schema()));
+
+        assert!(cat.lookup_table_in_schema("public", "events.log").is_some());
     }
 
     #[test]
