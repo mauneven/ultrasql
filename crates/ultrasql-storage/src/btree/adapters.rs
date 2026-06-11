@@ -14,6 +14,8 @@ use ultrasql_core::endian::{read_i64_le, write_i64_le};
 // Multi-column key support
 // ---------------------------------------------------------------------------
 
+const COMPOSITE_I64_WIDTH: usize = std::mem::size_of::<i64>();
+
 /// A composite key made of multiple fixed-width components.
 ///
 /// Each component is an `i64` value. The composite key encodes all
@@ -37,22 +39,45 @@ impl<const N: usize> CompositeKey<N> {
         Self { values }
     }
 
+    fn encoded_len() -> usize {
+        N.checked_mul(COMPOSITE_I64_WIDTH)
+            .expect("composite key byte length must fit usize")
+    }
+
+    fn component_range(component: usize) -> std::ops::Range<usize> {
+        let start = component
+            .checked_mul(COMPOSITE_I64_WIDTH)
+            .expect("composite key component offset must fit usize");
+        let end = start
+            .checked_add(COMPOSITE_I64_WIDTH)
+            .expect("composite key component end must fit usize");
+        start..end
+    }
+
     /// Encode the composite key into a byte buffer.
     ///
     /// The buffer must be exactly `N * 8` bytes long.
     pub fn encode_into(&self, out: &mut [u8]) {
-        assert_eq!(out.len(), N * 8, "buffer length must equal N*8");
+        assert_eq!(
+            out.len(),
+            Self::encoded_len(),
+            "buffer length must equal N*8"
+        );
         for (i, &v) in self.values.iter().enumerate() {
-            write_i64_le(&mut out[i * 8..i * 8 + 8], v);
+            write_i64_le(&mut out[Self::component_range(i)], v);
         }
     }
 
     /// Decode a composite key from a byte buffer.
     pub fn decode_from(bytes: &[u8]) -> Self {
-        assert_eq!(bytes.len(), N * 8, "buffer length must equal N*8");
+        assert_eq!(
+            bytes.len(),
+            Self::encoded_len(),
+            "buffer length must equal N*8"
+        );
         let mut values = [0_i64; N];
         for (i, v) in values.iter_mut().enumerate() {
-            *v = read_i64_le(&bytes[i * 8..i * 8 + 8]).unwrap_or(0);
+            *v = read_i64_le(&bytes[Self::component_range(i)]).unwrap_or(0);
         }
         Self { values }
     }
