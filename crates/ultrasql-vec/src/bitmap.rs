@@ -8,6 +8,8 @@ use std::fmt;
 
 use crate::int_cast::u32_to_usize;
 
+const BITS_PER_WORD: usize = 64;
+
 /// Packed bitmap with a logical length in bits.
 #[derive(Clone, PartialEq, Eq)]
 pub struct Bitmap {
@@ -19,14 +21,13 @@ impl Bitmap {
     /// Allocate a bitmap of `len` bits, all set to `value`.
     #[must_use]
     pub fn new(len: usize, value: bool) -> Self {
-        let words = len.div_ceil(64);
+        let words = len.div_ceil(BITS_PER_WORD);
         let pattern = if value { u64::MAX } else { 0 };
         let mut bits = vec![pattern; words];
-        if value && len % 64 != 0 {
+        if let (true, Some(mask)) = (value, trailing_word_mask(len)) {
             // Clear the trailing high bits in the last word so the
             // logical bit count is exactly `len` and popcount is
             // honest.
-            let mask = (1_u64 << (len % 64)) - 1;
             if let Some(last) = bits.last_mut() {
                 *last &= mask;
             }
@@ -51,7 +52,7 @@ impl Bitmap {
     /// Panics if `words.len() < len.div_ceil(64)`.
     #[must_use]
     pub fn from_words(mut words: Vec<u64>, len: usize) -> Self {
-        let required = len.div_ceil(64);
+        let required = len.div_ceil(BITS_PER_WORD);
         assert!(
             words.len() >= required,
             "Bitmap::from_words: words.len() = {} < required {} for {} bits",
@@ -60,8 +61,7 @@ impl Bitmap {
             len
         );
         words.truncate(required);
-        if len % 64 != 0 {
-            let mask = (1_u64 << (len % 64)) - 1;
+        if let Some(mask) = trailing_word_mask(len) {
             if let Some(last) = words.last_mut() {
                 *last &= mask;
             }
@@ -89,8 +89,9 @@ impl Bitmap {
     #[must_use]
     pub fn get(&self, i: usize) -> bool {
         assert!(i < self.len_bits, "bitmap index out of bounds");
-        let word = i / 64;
-        let bit = i % 64;
+        let Some((word, bit)) = word_and_bit(i) else {
+            return false;
+        };
         (self.bits[word] >> bit) & 1 == 1
     }
 
@@ -98,12 +99,16 @@ impl Bitmap {
     #[inline]
     pub fn set(&mut self, i: usize, value: bool) {
         assert!(i < self.len_bits, "bitmap index out of bounds");
-        let word = i / 64;
-        let bit = i % 64;
+        let Some((word, bit)) = word_and_bit(i) else {
+            return;
+        };
+        let Some(mask) = 1_u64.checked_shl(bit) else {
+            return;
+        };
         if value {
-            self.bits[word] |= 1_u64 << bit;
+            self.bits[word] |= mask;
         } else {
-            self.bits[word] &= !(1_u64 << bit);
+            self.bits[word] &= !mask;
         }
     }
 
@@ -172,20 +177,39 @@ impl Iterator for SetBitsIter<'_> {
         loop {
             if self.current != 0 {
                 let bit = u32_to_usize(self.current.trailing_zeros());
-                let i = self.word_idx * 64 + bit;
-                self.current &= self.current - 1;
+                let i = self
+                    .word_idx
+                    .checked_mul(BITS_PER_WORD)
+                    .and_then(|base| base.checked_add(bit))?;
+                self.current &= self.current.wrapping_sub(1);
                 if i < self.len_bits {
                     return Some(i);
                 }
                 return None;
             }
-            self.word_idx += 1;
+            self.word_idx = self.word_idx.checked_add(1)?;
             if self.word_idx >= self.bits.len() {
                 return None;
             }
             self.current = self.bits[self.word_idx];
         }
     }
+}
+
+fn trailing_word_mask(len: usize) -> Option<u64> {
+    let tail_bits = len.rem_euclid(BITS_PER_WORD);
+    if tail_bits == 0 {
+        return None;
+    }
+    let shift = u32::try_from(tail_bits).ok()?;
+    1_u64.checked_shl(shift)?.checked_sub(1)
+}
+
+fn word_and_bit(i: usize) -> Option<(usize, u32)> {
+    Some((
+        i.div_euclid(BITS_PER_WORD),
+        u32::try_from(i.rem_euclid(BITS_PER_WORD)).ok()?,
+    ))
 }
 
 #[cfg(test)]
@@ -227,6 +251,15 @@ mod tests {
         }
         let got: Vec<_> = bm.iter_ones().collect();
         assert_eq!(got, vec![5, 13, 42, 64, 79]);
+    }
+
+    #[test]
+    fn iter_ones_ignores_masked_padding_bits() {
+        let bm = Bitmap::from_words(vec![u64::MAX, u64::MAX], 65);
+        let got: Vec<_> = bm.iter_ones().collect();
+        assert_eq!(got.len(), 65);
+        assert_eq!(got.first(), Some(&0));
+        assert_eq!(got.last(), Some(&64));
     }
 
     #[test]
