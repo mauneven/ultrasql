@@ -68,6 +68,7 @@ async fn grant_revoke_privileges_update_catalog_checks() {
                 has_database_privilege('analyst', 'ultrasql', 'CONNECT'), \
                 has_database_privilege('analyst', 'ultrasql', 'TEMPORARY'), \
                 has_sequence_privilege('analyst', 'grant_seq', 'USAGE'), \
+                has_sequence_privilege('analyst', 'public.grant_seq', 'USAGE'), \
                 has_function_privilege('analyst', 'current_database()', 'EXECUTE')",
             &[],
         )
@@ -88,6 +89,10 @@ async fn grant_revoke_privileges_update_catalog_checks() {
     assert!(row.get::<_, bool>(5), "sequence USAGE grant should persist");
     assert!(
         row.get::<_, bool>(6),
+        "public-qualified sequence USAGE grant should persist"
+    );
+    assert!(
+        row.get::<_, bool>(7),
         "function EXECUTE grant should persist"
     );
 
@@ -634,29 +639,44 @@ async fn grant_table_respects_schema_qualifier() {
             "CREATE ROLE tester SUPERUSER LOGIN; \
              CREATE ROLE qualifier_reader LOGIN; \
              CREATE SCHEMA app; \
-             CREATE TABLE grant_qualifier_guard (id INT)",
+             CREATE TABLE grant_qualifier_guard (id INT); \
+             CREATE TABLE app.grant_qualifier_guard (id INT)",
         )
         .await
-        .expect("create public table and separate schema");
+        .expect("create same-name public and app tables");
 
     client
         .batch_execute("GRANT SELECT ON TABLE app.grant_qualifier_guard TO qualifier_reader")
         .await
-        .expect_err("qualified GRANT must not target public same-name table");
+        .expect("qualified GRANT targets app table");
 
-    let visible = client
+    let app_visible = client
         .query_one(
             "SELECT has_table_privilege('qualifier_reader', 'app.grant_qualifier_guard', 'SELECT')",
             &[],
         )
         .await
-        .expect("privilege check after rejected qualified grant")
+        .expect("qualified app privilege check")
         .get::<_, bool>(0);
-    assert!(!visible, "rejected qualified GRANT must not persist");
+    assert!(app_visible, "qualified GRANT must persist on app table");
+
+    let public_visible = client
+        .query_one(
+            "SELECT has_table_privilege('qualifier_reader', 'grant_qualifier_guard', 'SELECT')",
+            &[],
+        )
+        .await
+        .expect("public privilege check")
+        .get::<_, bool>(0);
+    assert!(
+        !public_visible,
+        "qualified GRANT must not leak to public same-name table"
+    );
 
     client
         .batch_execute(
-            "DROP TABLE grant_qualifier_guard; \
+            "DROP TABLE app.grant_qualifier_guard; \
+             DROP TABLE grant_qualifier_guard; \
              DROP SCHEMA app; \
              DROP ROLE tester; \
              DROP ROLE qualifier_reader",
@@ -1651,7 +1671,7 @@ async fn privilege_catalog_survives_restart() {
     let default_grant = running
         .client
         .query_one(
-            "SELECT has_table_privilege('analyst', 'priv_restart_future', 'SELECT')",
+            "SELECT has_table_privilege('analyst', 'tenant.priv_restart_future', 'SELECT')",
             &[],
         )
         .await

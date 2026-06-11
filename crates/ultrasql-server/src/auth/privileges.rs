@@ -321,7 +321,8 @@ impl InMemoryPrivilegeCatalog {
     ) {
         let owner_role = owner_role.to_ascii_lowercase();
         let schema_name = schema_name.to_ascii_lowercase();
-        let object_name = normalize_object_name(object_kind, object);
+        let object_name =
+            normalize_default_privilege_object_name(object_kind, &schema_name, object);
         let matching = {
             let default_grants = self.default_grants.read();
             default_grants
@@ -513,6 +514,24 @@ impl InMemoryPrivilegeCatalog {
     }
 }
 
+fn normalize_default_privilege_object_name(
+    kind: PrivilegeObjectKind,
+    schema_name: &str,
+    name: &str,
+) -> String {
+    let folded = name.trim().to_ascii_lowercase();
+    match kind {
+        PrivilegeObjectKind::Table | PrivilegeObjectKind::Sequence => {
+            if folded.contains('.') {
+                normalize_relation_object_name(&folded)
+            } else {
+                ultrasql_catalog::table_lookup_key(schema_name, &folded)
+            }
+        }
+        _ => normalize_object_name(kind, &folded),
+    }
+}
+
 fn normalize_object_name(kind: PrivilegeObjectKind, name: &str) -> String {
     let folded = name.trim().to_ascii_lowercase();
     match kind {
@@ -526,9 +545,24 @@ fn normalize_object_name(kind: PrivilegeObjectKind, name: &str) -> String {
                 .map_or(compact.as_str(), |(base, _)| base);
             last_name_part(base).to_owned()
         }
-        PrivilegeObjectKind::Sequence => folded,
+        PrivilegeObjectKind::Table | PrivilegeObjectKind::Sequence => {
+            normalize_relation_object_name(&folded)
+        }
         _ => last_name_part(&folded).to_owned(),
     }
+}
+
+fn normalize_relation_object_name(folded: &str) -> String {
+    folded.rsplit_once('.').map_or_else(
+        || folded.to_owned(),
+        |(schema_name, relation_name)| {
+            if schema_name.is_empty() || relation_name.is_empty() {
+                folded.to_owned()
+            } else {
+                ultrasql_catalog::table_lookup_key(schema_name, relation_name)
+            }
+        },
+    )
 }
 
 fn last_name_part(name: &str) -> &str {
@@ -748,7 +782,7 @@ mod tests {
         assert!(catalog.has_privilege(
             "analyst",
             PrivilegeObjectKind::Table,
-            "future",
+            "tenant.future",
             PrivilegeKind::Select
         ));
 
@@ -772,7 +806,7 @@ mod tests {
         assert!(catalog.has_privilege(
             "analyst",
             PrivilegeObjectKind::Table,
-            "future",
+            "tenant.future",
             PrivilegeKind::Select
         ));
     }
