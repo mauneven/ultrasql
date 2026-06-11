@@ -156,6 +156,53 @@ async fn materialized_view_snapshots_then_appends_from_source_inserts() {
     shutdown(running).await;
 }
 
+#[tokio::test]
+async fn same_materialized_view_name_is_isolated_by_schema() {
+    let running = start_server_and_connect().await;
+    let client = &running.client;
+
+    client
+        .batch_execute(
+            "CREATE SCHEMA app; \
+             CREATE TABLE same_mv_src (id INT NOT NULL, amount INT NOT NULL); \
+             CREATE TABLE app.same_mv_src (id INT NOT NULL, amount INT NOT NULL); \
+             INSERT INTO same_mv_src VALUES (1, 10); \
+             INSERT INTO app.same_mv_src VALUES (10, 100); \
+             CREATE MATERIALIZED VIEW same_mv_copy AS \
+                 SELECT id, amount FROM same_mv_src; \
+             CREATE MATERIALIZED VIEW app.same_mv_copy AS \
+                 SELECT id, amount FROM app.same_mv_src",
+        )
+        .await
+        .expect("create same materialized view names in different schemas");
+
+    client
+        .batch_execute(
+            "INSERT INTO same_mv_src VALUES (2, 20); \
+             INSERT INTO app.same_mv_src VALUES (20, 200)",
+        )
+        .await
+        .expect("append both schema sources");
+
+    let public_rows = client
+        .query("SELECT id, amount FROM same_mv_copy ORDER BY id", &[])
+        .await
+        .expect("public materialized view is maintained");
+    assert_eq!(public_rows.len(), 2);
+    assert_eq!(public_rows[1].get::<_, i32>(0), 2);
+    assert_eq!(public_rows[1].get::<_, i32>(1), 20);
+
+    let app_rows = client
+        .query("SELECT id, amount FROM app.same_mv_copy ORDER BY id", &[])
+        .await
+        .expect("app materialized view is maintained");
+    assert_eq!(app_rows.len(), 2);
+    assert_eq!(app_rows[1].get::<_, i32>(0), 20);
+    assert_eq!(app_rows[1].get::<_, i32>(1), 200);
+
+    shutdown(running).await;
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn appended_materialized_view_rows_survive_restart() {
     let data_dir = tempfile::TempDir::new().unwrap();

@@ -1033,7 +1033,7 @@ where
         let view_table = ultrasql_catalog::table_lookup_key(namespace, table_name);
 
         let runtime = Arc::new(crate::MaterializedViewRuntime {
-            view_table,
+            view_table: view_table.clone(),
             source_table: source_table.to_ascii_lowercase(),
             source: source.as_ref().clone(),
             materialized_rows: std::sync::atomic::AtomicU64::new(0),
@@ -1063,11 +1063,11 @@ where
             Err(e) => {
                 if let Err(abort_err) = self.state.txn_manager.abort(ddl_txn) {
                     tracing::warn!(
-                        error = %abort_err,
-                        "abort of materialized-view DDL txn failed",
+                            error = %abort_err,
+                            "abort of materialized-view DDL txn failed",
                     );
                 }
-                let _ = self.state.persistent_catalog.drop_table(table_name);
+                let _ = self.state.persistent_catalog.drop_table(&view_table);
                 return Err(e);
             }
         };
@@ -1081,7 +1081,7 @@ where
                     "abort of materialized-view metadata txn failed",
                 );
             }
-            let _ = self.state.persistent_catalog.drop_table(table_name);
+            let _ = self.state.persistent_catalog.drop_table(&view_table);
             return Err(e);
         }
         self.state.commit_transaction(
@@ -1120,10 +1120,10 @@ where
             .materialized_rows
             .store(materialized_rows, std::sync::atomic::Ordering::Release);
         self.state
-            .note_table_modifications(table_name, materialized_rows);
+            .note_table_modifications(&runtime.view_table, materialized_rows);
         self.state
             .materialized_views
-            .insert(table_name.clone(), runtime);
+            .insert(runtime.view_table.clone(), runtime);
         self.plan_cache_invalidate();
         Ok(run_ddl_command("CREATE MATERIALIZED VIEW"))
     }
