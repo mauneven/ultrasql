@@ -221,6 +221,12 @@ pub(super) fn read_leaf_entries(page: &Page, count: u16) -> Result<Vec<LeafEntry
             .map_err(|_| BTreeError::MalformedNode("block"))?;
         let slot = read_u16_le(&bytes[off + 16..off + 18])
             .map_err(|_| BTreeError::MalformedNode("slot"))?;
+        if bytes[off + 18..off + LEAF_ENTRY_SIZE]
+            .iter()
+            .any(|&b| b != 0)
+        {
+            return Err(BTreeError::MalformedNode("leaf entry reserved bytes"));
+        }
         let value = TupleId::new(
             PageId::new(RelationId::new(rel), BlockNumber::new(block)),
             slot,
@@ -260,6 +266,12 @@ pub(super) fn read_internal_entries(
             .map_err(|_| BTreeError::MalformedNode("internal key"))?;
         let child = read_u32_le(&bytes[off + 8..off + 12])
             .map_err(|_| BTreeError::MalformedNode("child"))?;
+        if bytes[off + 12..off + INTERNAL_ENTRY_SIZE]
+            .iter()
+            .any(|&b| b != 0)
+        {
+            return Err(BTreeError::MalformedNode("internal entry reserved bytes"));
+        }
         out.push(InternalEntry { key, child });
     }
     Ok(out)

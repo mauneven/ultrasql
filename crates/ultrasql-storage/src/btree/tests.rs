@@ -8,10 +8,13 @@ use ultrasql_core::endian::write_i64_le;
 use ultrasql_core::{BlockNumber, PageId, RelationId, TupleId, Xid};
 use ultrasql_wal::WalRecord;
 
-use super::node::{NodeMeta, init_btree_page};
+use super::node::{
+    InternalEntry, LeafEntry, NodeMeta, init_btree_page, read_internal_entries, read_leaf_entries,
+    write_internal_entries, write_leaf_entries,
+};
 use super::*;
 use crate::buffer_pool::{BufferPool, BufferPoolError, PageLoader};
-use crate::page::Page;
+use crate::page::{PAGE_HEADER_SIZE, Page};
 use crate::wal_sink::{WalSink, WalSinkError};
 
 /// In-memory loader for B-tree tests.
@@ -100,6 +103,58 @@ fn node_meta_write_clears_reserved_suffix_bytes() {
             .iter()
             .all(|&b| b == 0)
     );
+}
+
+#[test]
+fn leaf_entry_rejects_reserved_padding() {
+    let mut page = Page::new_heap();
+    let meta = NodeMeta {
+        n_keys: 1,
+        ..NodeMeta::fresh_leaf()
+    };
+    init_btree_page(&mut page, meta).unwrap();
+    write_leaf_entries(
+        &mut page,
+        &[LeafEntry {
+            key: 7,
+            value: tid(1, 0),
+        }],
+    );
+    meta.write_into(&mut page);
+    page.as_bytes_mut()[PAGE_HEADER_SIZE + 18] = 1;
+
+    let err = read_leaf_entries(&page, 1).unwrap_err();
+
+    assert!(matches!(
+        err,
+        BTreeError::MalformedNode("leaf entry reserved bytes")
+    ));
+}
+
+#[test]
+fn internal_entry_rejects_reserved_padding() {
+    let mut page = Page::new_heap();
+    let meta = NodeMeta {
+        n_keys: 1,
+        ..NodeMeta::fresh_internal(1)
+    };
+    init_btree_page(&mut page, meta).unwrap();
+    write_internal_entries(
+        &mut page,
+        &[InternalEntry {
+            key: i64::MIN,
+            child: 1,
+        }],
+    );
+    meta.write_into(&mut page);
+    page.as_bytes_mut()[PAGE_HEADER_SIZE + 12] = 1;
+
+    let err = read_internal_entries(&page, 1).unwrap_err();
+
+    assert!(matches!(
+        err,
+        BTreeError::MalformedNode("internal entry reserved bytes")
+    ));
 }
 
 #[test]
