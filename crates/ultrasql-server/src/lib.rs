@@ -2593,7 +2593,28 @@ impl PlannerCatalog for CombinedCatalog<'_> {
     }
 
     fn lookup_table_oid(&self, name: &str) -> Option<Oid> {
-        PlannerCatalog::lookup_table_oid(self.snapshot, name)
+        if let Some((schema_name, table_name)) = type_name_namespace_and_name(name) {
+            return self.lookup_table_oid_in_schema(schema_name, table_name);
+        }
+        for schema_name in search_path_schema_names(self.search_path) {
+            if let Some(oid) =
+                PlannerCatalog::lookup_table_oid_in_schema(self.snapshot, &schema_name, name)
+            {
+                return Some(oid);
+            }
+            if let Some(oid) =
+                PlannerCatalog::lookup_table_oid_in_schema(self.fallback, &schema_name, name)
+            {
+                return Some(oid);
+            }
+        }
+        None
+    }
+
+    fn lookup_table_oid_in_schema(&self, schema_name: &str, name: &str) -> Option<Oid> {
+        PlannerCatalog::lookup_table_oid_in_schema(self.snapshot, schema_name, name).or_else(|| {
+            PlannerCatalog::lookup_table_oid_in_schema(self.fallback, schema_name, name)
+        })
     }
 
     fn lookup_type_oid(&self, name: &str) -> Option<Oid> {

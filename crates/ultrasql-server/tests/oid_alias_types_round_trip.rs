@@ -105,6 +105,40 @@ async fn simple_query_type_oids(addr: std::net::SocketAddr, sql: &str) -> Vec<u3
     type_oids.expect("query produced RowDescription")
 }
 
+#[tokio::test]
+async fn regclass_literal_uses_search_path_schema() {
+    let data_dir = tempfile::TempDir::new().expect("temp data dir");
+    let running = start_persistent_server(data_dir.path(), "regclass_search_path").await;
+
+    running
+        .client
+        .batch_execute(
+            "CREATE SCHEMA app; \
+             CREATE TABLE app.regclass_path_probe (id INT); \
+             SET search_path TO app, public",
+        )
+        .await
+        .expect("create app regclass probe");
+
+    let table_oid = first_i64(
+        running
+            .client
+            .simple_query("SELECT oid FROM pg_class WHERE relname = 'regclass_path_probe'")
+            .await
+            .expect("pg_class app table oid"),
+    );
+    let regclass_oid = first_i64(
+        running
+            .client
+            .simple_query("SELECT 'regclass_path_probe'::regclass")
+            .await
+            .expect("regclass follows search_path"),
+    );
+    assert_eq!(regclass_oid, table_oid);
+
+    shutdown(running).await;
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn oid_regclass_regtype_pg_lsn_store_cast_wire_and_restart() {
     let data_dir = tempfile::TempDir::new().unwrap();
