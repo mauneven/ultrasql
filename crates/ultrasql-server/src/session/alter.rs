@@ -900,7 +900,8 @@ where
                 let Some(table) = snapshot.tables_by_oid.get(&table_oid) else {
                     continue;
                 };
-                let table_name = table.name.to_ascii_lowercase();
+                let table_name =
+                    ultrasql_catalog::table_lookup_key(&table.schema_name, &table.name);
                 if truncate_set.contains(&table_name) {
                     continue;
                 }

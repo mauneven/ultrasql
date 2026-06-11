@@ -304,6 +304,44 @@ async fn truncate_cascade_empties_runtime_foreign_key_children() {
     shutdown(client, server_handle).await;
 }
 
+#[tokio::test]
+async fn truncate_cascade_keeps_child_schema_qualification() {
+    let (client, _conn_handle, server_handle) = start_server_and_connect().await;
+
+    client
+        .batch_execute(
+            "CREATE SCHEMA app; \
+             CREATE TABLE trunc_parent_schema (id INT PRIMARY KEY); \
+             CREATE TABLE trunc_child_schema (
+                 parent_id INT REFERENCES trunc_parent_schema(id),
+                 v INT
+             ); \
+             CREATE TABLE app.trunc_parent_schema (id INT PRIMARY KEY); \
+             CREATE TABLE app.trunc_child_schema (
+                 parent_id INT REFERENCES app.trunc_parent_schema(id),
+                 v INT
+             ); \
+             INSERT INTO trunc_parent_schema VALUES (1); \
+             INSERT INTO trunc_child_schema VALUES (1, 10); \
+             INSERT INTO app.trunc_parent_schema VALUES (2); \
+             INSERT INTO app.trunc_child_schema VALUES (2, 20)",
+        )
+        .await
+        .expect("create colliding public and app FK pairs");
+
+    client
+        .batch_execute("TRUNCATE TABLE app.trunc_parent_schema CASCADE")
+        .await
+        .expect("qualified cascade truncate succeeds");
+
+    assert_eq!(select_count(&client, "app.trunc_parent_schema").await, 0);
+    assert_eq!(select_count(&client, "app.trunc_child_schema").await, 0);
+    assert_eq!(select_count(&client, "trunc_parent_schema").await, 1);
+    assert_eq!(select_count(&client, "trunc_child_schema").await, 1);
+
+    shutdown(client, server_handle).await;
+}
+
 /// Restart rebuilds FK runtime metadata, so `TRUNCATE ... CASCADE`
 /// still finds child tables after process restart.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
