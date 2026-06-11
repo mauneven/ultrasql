@@ -8,7 +8,7 @@
 //!     8       8   prev_lsn (u64) — previous record from the same transaction
 //!    16       8   xid (u64) — owning transaction
 //!    24       1   record_type (u8)
-//!    25       1   flags (u8)
+//!    25       1   flags (u8, reserved-zero)
 //!    26       2   reserved
 //!    28      ..   payload
 //! ```
@@ -205,7 +205,8 @@ pub struct WalRecordHeader {
     pub xid: Xid,
     /// Record type.
     pub record_type: RecordType,
-    /// Reserved flag bits; per-record-type semantics.
+    /// Reserved flag bits. Must be zero until per-record semantics
+    /// are defined.
     pub flags: u8,
 }
 
@@ -237,6 +238,9 @@ impl WalRecord {
                 payload_len: payload.len(),
                 max_payload_len: MAX_RECORD_BYTES - RECORD_HEADER_SIZE,
             });
+        }
+        if flags != 0 {
+            return Err(WalRecordError::Malformed("record flags reserved bits"));
         }
         let total = u32::try_from(total_len)
             .map_err(|_| WalRecordError::Malformed("total_length overflow"))?;
@@ -352,6 +356,9 @@ fn decode_header_from(bytes: &[u8]) -> Result<WalRecordHeader, WalRecordError> {
     );
     let record_type = RecordType::from_u8(bytes[RTYPE_OFFSET])?;
     let flags = bytes[FLAGS_OFFSET];
+    if flags != 0 {
+        return Err(WalRecordError::Malformed("record flags reserved bits"));
+    }
     if bytes[FLAGS_OFFSET + 1..RECORD_HEADER_SIZE]
         .iter()
         .any(|byte| *byte != 0)
@@ -451,6 +458,34 @@ mod tests {
         bytes[FLAGS_OFFSET + 1] = 1;
         let err = WalRecord::decode(&bytes).unwrap_err();
         assert!(matches!(err, WalRecordError::Malformed(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn constructor_rejects_reserved_flags() {
+        let err = WalRecord::new(
+            RecordType::HeapInsert,
+            Xid::new(1),
+            Lsn::ZERO,
+            1,
+            Vec::new(),
+        )
+        .unwrap_err();
+        assert!(matches!(
+            err,
+            WalRecordError::Malformed("record flags reserved bits")
+        ));
+    }
+
+    #[test]
+    fn header_reserved_flags_rejected() {
+        let record = rec(RecordType::HeapInsert, b"x");
+        let mut bytes = record.encode();
+        bytes[FLAGS_OFFSET] = 1;
+        let err = WalRecord::decode(&bytes).unwrap_err();
+        assert!(matches!(
+            err,
+            WalRecordError::Malformed("record flags reserved bits")
+        ));
     }
 
     #[test]
