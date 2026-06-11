@@ -451,6 +451,43 @@ async fn copy_respects_schema_qualifier() {
     shutdown(running).await;
 }
 
+#[tokio::test]
+async fn copy_from_records_modifications_under_qualified_table_key() {
+    let running = start_sample_server("copy_schema_runtime_key").await;
+    let client = &running.client;
+
+    client
+        .batch_execute(
+            "CREATE SCHEMA app; \
+             CREATE TABLE copy_mods (id INT, label TEXT); \
+             CREATE TABLE app.copy_mods (id INT, label TEXT)",
+        )
+        .await
+        .expect("create same-named COPY targets");
+
+    let rows_inserted =
+        copy_in_payload(client, "COPY app.copy_mods FROM STDIN", b"1\tapp\n2\tapp\n").await;
+    assert_eq!(rows_inserted, 2);
+    assert_eq!(select_count(client, "copy_mods").await, 0);
+    assert_eq!(select_count(client, "app.copy_mods").await, 2);
+
+    assert!(
+        !running.server.table_modifications.contains_key("copy_mods"),
+        "qualified COPY must not dirty public same-name table"
+    );
+    assert_eq!(
+        running
+            .server
+            .table_modifications
+            .get("app.copy_mods")
+            .map(|entry| *entry),
+        Some(2),
+        "qualified COPY must dirty app table key"
+    );
+
+    shutdown(running).await;
+}
+
 /// The exact bytes pushed through `COPY FROM STDIN` come back through
 /// `COPY TO STDOUT`. This is the integration "byte-equality of the
 /// round-tripped text payload" property the workplan asks for.

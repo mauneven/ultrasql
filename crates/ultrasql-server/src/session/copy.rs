@@ -36,7 +36,7 @@ use std::sync::Arc;
 use bytes::BytesMut;
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use tracing::warn;
-use ultrasql_catalog::{CatalogSnapshot, TableEntry};
+use ultrasql_catalog::{CatalogSnapshot, TableEntry, table_lookup_key};
 use ultrasql_core::csv::sniff_csv_text;
 use ultrasql_core::{
     BitString, DataType, NetworkValue, RelationId, Schema, Value, coerce_bpchar_text,
@@ -76,6 +76,10 @@ fn copy_row_count_overflow(context: &str) -> ServerError {
 
 fn copy_rows_from_usize(rows: usize, context: &str) -> Result<u64, ServerError> {
     u64::try_from(rows).map_err(|_| copy_row_count_overflow(context))
+}
+
+fn copy_table_key(entry: &TableEntry) -> String {
+    table_lookup_key(&entry.schema_name, &entry.name)
 }
 
 pub(super) fn add_copy_rows(rows: &mut u64, delta: u64, context: &str) -> Result<(), ServerError> {
@@ -701,7 +705,7 @@ where
         self.finalise_copy_from_commit(txn, rows_inserted, "COPY FROM autocommit")?;
         self.state.note_commit_for_gc();
         self.state
-            .note_table_modifications(&entry.name, rows_inserted);
+            .note_table_modifications(&copy_table_key(entry), rows_inserted);
         self.plan_cache_invalidate();
 
         let mut wire_buf = BytesMut::with_capacity(64);
@@ -754,7 +758,8 @@ where
         if opts.format == ServerCopyFormat::Parquet {
             let rows = self.copy_from_parquet_file(entry, columns, schema, path)?;
             self.state.note_commit_for_gc();
-            self.state.note_table_modifications(&entry.name, rows);
+            self.state
+                .note_table_modifications(&copy_table_key(entry), rows);
             self.plan_cache_invalidate();
             return self.send_copy_complete(rows, emit_ready_for_query).await;
         }
@@ -801,11 +806,14 @@ where
         let rows_changed = copy_add_row_counts(rows, reject_rows, "COPY FROM file")?;
         self.finalise_copy_from_commit(txn, rows_changed, "COPY FROM file")?;
         self.state.note_commit_for_gc();
-        self.state.note_table_modifications(&entry.name, rows);
+        self.state
+            .note_table_modifications(&copy_table_key(entry), rows);
         if let Some(reject_target) = reject_state.and_then(|state| state.target) {
             if reject_target.rows > 0 {
-                self.state
-                    .note_table_modifications(&reject_target.entry.name, reject_target.rows);
+                self.state.note_table_modifications(
+                    &copy_table_key(&reject_target.entry),
+                    reject_target.rows,
+                );
             }
         }
         self.send_copy_complete(rows, emit_ready_for_query).await
@@ -1105,7 +1113,8 @@ where
         self.flush_copy_insert_batch(entry, &payloads, &txn)?;
         self.finalise_copy_from_commit(txn, rows, "binary COPY FROM")?;
         self.state.note_commit_for_gc();
-        self.state.note_table_modifications(&entry.name, rows);
+        self.state
+            .note_table_modifications(&copy_table_key(entry), rows);
         self.send_copy_complete(rows, emit_ready_for_query).await
     }
 
