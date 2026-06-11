@@ -1750,10 +1750,10 @@ fn parse_xml_path(path: &str) -> Option<Vec<XmlPathStep>> {
     let mut cursor = 0_usize;
     while cursor < path.len() {
         let descendant = if path[cursor..].starts_with("//") {
-            cursor += 2;
+            cursor = cursor.checked_add(2)?;
             true
         } else if path[cursor..].starts_with('/') {
-            cursor += 1;
+            cursor = cursor.checked_add(1)?;
             false
         } else {
             return None;
@@ -1762,7 +1762,8 @@ fn parse_xml_path(path: &str) -> Option<Vec<XmlPathStep>> {
             return None;
         }
         let relative_end = path[cursor..].find('/');
-        let segment_end = relative_end.map_or(path.len(), |offset| cursor + offset);
+        let segment_end =
+            relative_end.map_or(Some(path.len()), |offset| cursor.checked_add(offset))?;
         let terminal = segment_end == path.len();
         let segment = path[cursor..segment_end].trim();
         if segment.is_empty() || segment == ".." {
@@ -1816,7 +1817,9 @@ fn parse_xml_path(path: &str) -> Option<Vec<XmlPathStep>> {
         };
         let (name, attr_filter, text_filter, child_text_filter, position_filter) =
             if let Some(open) = segment.find('[') {
-                let predicate = segment.get(open + 1..segment.len().checked_sub(1)?)?.trim();
+                let predicate = segment
+                    .get(open.checked_add(1)?..segment.len().checked_sub(1)?)?
+                    .trim();
                 if !segment.ends_with(']') {
                     return None;
                 }
