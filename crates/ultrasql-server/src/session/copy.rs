@@ -865,20 +865,24 @@ where
     fn copy_reject_table_entry(&self, table_name: &str) -> Result<TableEntry, ServerError> {
         let catalog_snapshot = self.state.catalog_snapshot();
         let folded = table_name.to_ascii_lowercase();
-        if let Some((namespace, relation_name)) = crate::type_name_namespace_and_name(&folded) {
-            let key = table_lookup_key(namespace, relation_name);
-            return catalog_snapshot.tables.get(&key).cloned().ok_or_else(|| {
-                ServerError::CopyFormat(format!("COPY reject_table not found: {table_name}"))
-            });
-        }
-
-        for namespace in crate::search_path_schema_names(
-            self.session_settings.get("search_path").map(String::as_str),
-        ) {
-            let key = table_lookup_key(&namespace, &folded);
-            if let Some(entry) = catalog_snapshot.tables.get(&key) {
-                return Ok(entry.clone());
+        match crate::parse_pg_identifier_path(&folded).as_deref() {
+            Some([relation_name]) => {
+                for namespace in crate::search_path_schema_names(
+                    self.session_settings.get("search_path").map(String::as_str),
+                ) {
+                    let key = table_lookup_key(&namespace, relation_name);
+                    if let Some(entry) = catalog_snapshot.tables.get(&key) {
+                        return Ok(entry.clone());
+                    }
+                }
             }
+            Some([namespace, relation_name]) => {
+                let key = table_lookup_key(namespace, relation_name);
+                if let Some(entry) = catalog_snapshot.tables.get(&key) {
+                    return Ok(entry.clone());
+                }
+            }
+            _ => {}
         }
 
         Err(ServerError::CopyFormat(format!(

@@ -724,6 +724,40 @@ async fn copy_reject_table_follows_search_path() {
 }
 
 #[tokio::test]
+async fn copy_reject_table_preserves_quoted_dot_name() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let csv_path = dir.path().join("quoted_dot_bad_rows.csv");
+    std::fs::write(&csv_path, "id,label\nbad,quoted\n1,ok\n").expect("write csv");
+
+    let running = start_sample_server("copy_reject_quoted_dot").await;
+    let client = &running.client;
+    client
+        .batch_execute(
+            "CREATE TABLE copy_quarantine_dot (id INT, label TEXT); \
+             CREATE TABLE \"csv.rejects\" (
+                 filename TEXT,
+                 line_number BIGINT,
+                 raw_row TEXT,
+                 error TEXT
+             )",
+        )
+        .await
+        .expect("create quoted dotted reject table");
+
+    let copy_sql = format!(
+        "COPY copy_quarantine_dot FROM {} WITH \
+         (FORMAT csv, HEADER true, IGNORE_ERRORS = true, MAX_ERRORS = 1000, REJECT_TABLE = '\"csv.rejects\"')",
+        sql_string(csv_path.to_str().expect("utf8 path"))
+    );
+    client.batch_execute(&copy_sql).await.expect("copy file");
+
+    assert_eq!(select_count(client, "copy_quarantine_dot").await, 1);
+    assert_eq!(select_count(client, "\"csv.rejects\"").await, 1);
+
+    shutdown(running).await;
+}
+
+#[tokio::test]
 async fn copy_from_file_csv_stops_after_max_errors() {
     let dir = tempfile::tempdir().expect("tempdir");
     let csv_path = dir.path().join("too_many_bad_rows.csv");
