@@ -2766,13 +2766,13 @@ fn write_decimal_text(f: &mut fmt::Formatter<'_>, value: i64, scale: i32) -> fmt
         usize::try_from(u32::try_from(scale).map_err(|_| fmt::Error)?).map_err(|_| fmt::Error)?;
     f.write_str(sign)?;
     if mag.len() > scale {
-        let split = mag.len() - scale;
-        f.write_str(&mag[..split])?;
+        let split = mag.len().checked_sub(scale).ok_or(fmt::Error)?;
+        f.write_str(mag.get(..split).ok_or(fmt::Error)?)?;
         f.write_str(".")?;
-        f.write_str(&mag[split..])
+        f.write_str(mag.get(split..).ok_or(fmt::Error)?)
     } else {
         f.write_str("0.")?;
-        write_zeros(f, scale - mag.len())?;
+        write_zeros(f, scale.checked_sub(mag.len()).ok_or(fmt::Error)?)?;
         f.write_str(&mag)
     }
 }
@@ -2960,7 +2960,7 @@ fn split_array_elements(text: &str) -> Option<Vec<&str>> {
             }
             ',' if !in_string && depth == 0 => {
                 out.push(&text[start..idx]);
-                start = idx + ch.len_utf8();
+                start = idx.checked_add(ch.len_utf8())?;
             }
             _ => {}
         }
@@ -3055,18 +3055,21 @@ fn write_array_text(f: &mut fmt::Formatter<'_>, text: &str) -> fmt::Result {
 }
 
 fn split_once_unquoted_comma(s: &str) -> Option<(&str, &str)> {
-    let idx = s.find(',')?;
-    Some((&s[..idx], &s[idx + 1..]))
+    split_once_byte(s, ',')
 }
 
 fn split_once_unquoted_slash(s: &str) -> Option<(&str, &str)> {
-    let idx = s.find('/')?;
-    Some((&s[..idx], &s[idx + 1..]))
+    split_once_byte(s, '/')
 }
 
 fn split_once_unquoted_colon(s: &str) -> Option<(&str, &str)> {
-    let idx = s.find(':')?;
-    Some((&s[..idx], &s[idx + 1..]))
+    split_once_byte(s, ':')
+}
+
+fn split_once_byte(s: &str, needle: char) -> Option<(&str, &str)> {
+    let idx = s.find(needle)?;
+    let right_start = idx.checked_add(needle.len_utf8())?;
+    Some((s.get(..idx)?, s.get(right_start..)?))
 }
 
 fn parse_range_bound(range_type: RangeType, text: &str) -> Option<Option<f64>> {
