@@ -194,17 +194,26 @@ impl<'src> Lexer<'src> {
 
     #[inline]
     fn peek_at(&self, n: usize) -> Option<u8> {
-        self.bytes.get(self.pos + n).copied()
+        self.pos
+            .checked_add(n)
+            .and_then(|idx| self.bytes.get(idx))
+            .copied()
     }
 
     #[inline]
-    const fn advance(&mut self) {
-        self.pos += 1;
+    fn advance(&mut self) {
+        self.pos = self
+            .pos
+            .checked_add(1)
+            .map_or(self.bytes.len(), |next| next.min(self.bytes.len()));
     }
 
     #[inline]
-    const fn advance_n(&mut self, n: usize) {
-        self.pos += n;
+    fn advance_n(&mut self, n: usize) {
+        self.pos = self
+            .pos
+            .checked_add(n)
+            .map_or(self.bytes.len(), |next| next.min(self.bytes.len()));
     }
 
     fn skip_trivia(&mut self) -> Result<(), LexerError> {
@@ -231,11 +240,15 @@ impl<'src> Lexer<'src> {
                         match self.peek() {
                             Some(b'/') if self.peek_at(1) == Some(b'*') => {
                                 self.advance_n(2);
-                                depth += 1;
+                                depth = depth.checked_add(1).ok_or(
+                                    LexerError::UnterminatedBlockComment { offset: start },
+                                )?;
                             }
                             Some(b'*') if self.peek_at(1) == Some(b'/') => {
                                 self.advance_n(2);
-                                depth -= 1;
+                                depth = depth.checked_sub(1).ok_or(
+                                    LexerError::UnterminatedBlockComment { offset: start },
+                                )?;
                             }
                             Some(_) => {
                                 self.advance();
@@ -563,14 +576,20 @@ impl<'src> Lexer<'src> {
                 None => return Err(LexerError::UnterminatedDollarString { offset: start }),
                 Some(b'$') => {
                     // Try to match the closing tag.
-                    let after_dollar = self.pos + 1;
-                    let closing_end = after_dollar + tag_bytes.len();
+                    let Some(after_dollar) = self.pos.checked_add(1) else {
+                        return Err(LexerError::UnterminatedDollarString { offset: start });
+                    };
+                    let Some(closing_end) = after_dollar.checked_add(tag_bytes.len()) else {
+                        return Err(LexerError::UnterminatedDollarString { offset: start });
+                    };
                     if closing_end < self.bytes.len()
                         && &self.bytes[after_dollar..closing_end] == tag_bytes
                         && self.bytes.get(closing_end) == Some(&b'$')
                     {
                         // Consume the full closing $tag$.
-                        self.pos = closing_end + 1;
+                        self.pos = closing_end
+                            .checked_add(1)
+                            .ok_or(LexerError::UnterminatedDollarString { offset: start })?;
                         return Ok(Token::new(
                             TokenKind::DollarString,
                             Span::from_usize(start, self.pos),
