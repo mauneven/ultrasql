@@ -36,7 +36,7 @@ impl BitString {
         for (idx, byte) in trimmed.bytes().enumerate() {
             match byte {
                 b'0' => {}
-                b'1' => set_raw_bit(&mut bytes, idx, true),
+                b'1' => set_raw_bit(&mut bytes, idx, true)?,
                 _ => return None,
             }
         }
@@ -58,7 +58,7 @@ impl BitString {
                 ((value >> shift) & 1) == 1
             };
             if bit {
-                set_raw_bit(&mut bytes, idx, true);
+                set_raw_bit(&mut bytes, idx, true)?;
             }
         }
         Self::new(width, bytes)
@@ -105,7 +105,7 @@ impl BitString {
         if idx >= usize::try_from(self.len).ok()? {
             return None;
         }
-        Some(raw_bit(&self.bytes, idx))
+        raw_bit(&self.bytes, idx)
     }
 
     /// Return new bit string with one bit changed.
@@ -115,7 +115,7 @@ impl BitString {
             return None;
         }
         let mut bytes = self.bytes.clone();
-        set_raw_bit(&mut bytes, idx, bit);
+        set_raw_bit(&mut bytes, idx, bit)?;
         Self::new(self.len, bytes)
     }
 
@@ -158,7 +158,7 @@ impl BitString {
                 && source < len
                 && self.bit(source)?
             {
-                set_raw_bit(&mut bytes, idx, true);
+                set_raw_bit(&mut bytes, idx, true)?;
             }
         }
         Self::new(self.len, bytes)
@@ -171,7 +171,7 @@ impl BitString {
         let mut bytes = vec![0_u8; byte_len(self.len)?];
         for idx in 0..len {
             if idx >= amount && self.bit(idx - amount)? {
-                set_raw_bit(&mut bytes, idx, true);
+                set_raw_bit(&mut bytes, idx, true)?;
             }
         }
         Self::new(self.len, bytes)
@@ -185,13 +185,13 @@ impl BitString {
         let left_len = usize::try_from(self.len).ok()?;
         for idx in 0..left_len {
             if self.bit(idx)? {
-                set_raw_bit(&mut bytes, idx, true);
+                set_raw_bit(&mut bytes, idx, true)?;
             }
         }
         let right_len = usize::try_from(other.len).ok()?;
         for idx in 0..right_len {
             if other.bit(idx)? {
-                set_raw_bit(&mut bytes, left_len.checked_add(idx)?, true);
+                set_raw_bit(&mut bytes, left_len.checked_add(idx)?, true)?;
             }
         }
         Self::new(new_len, bytes)
@@ -230,10 +230,7 @@ impl BitString {
     /// Decode PostgreSQL binary wire/COPY shape.
     #[must_use]
     pub fn from_pg_binary(bytes: &[u8]) -> Option<Self> {
-        if bytes.len() < 4 {
-            return None;
-        }
-        let len = i32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+        let len = i32::from_be_bytes(bytes.get(..4)?.try_into().ok()?);
         if len < 0 {
             return None;
         }
@@ -290,7 +287,7 @@ impl BitString {
         let copy_len = usize::try_from(copy_len).ok()?;
         for idx in 0..copy_len {
             if self.bit(idx)? {
-                set_raw_bit(&mut bytes, idx, true);
+                set_raw_bit(&mut bytes, idx, true)?;
             }
         }
         Self::new(target_len, bytes)
@@ -308,7 +305,7 @@ impl BitString {
         let mut bytes = vec![0_u8; byte_len(self.len)?];
         for idx in 0..len {
             if op(self.bit(idx)?, other.bit(idx)?) {
-                set_raw_bit(&mut bytes, idx, true);
+                set_raw_bit(&mut bytes, idx, true)?;
             }
         }
         Self::new(self.len, bytes)
@@ -325,21 +322,23 @@ fn byte_len(len: u32) -> Option<usize> {
     usize::try_from(len.div_ceil(8)).ok()
 }
 
-fn raw_bit(bytes: &[u8], idx: usize) -> bool {
+fn raw_bit(bytes: &[u8], idx: usize) -> Option<bool> {
     let byte_idx = idx / 8;
     let bit_idx = idx % 8;
-    ((bytes[byte_idx] >> (7 - bit_idx)) & 1) == 1
+    Some(((bytes.get(byte_idx)? >> (7 - bit_idx)) & 1) == 1)
 }
 
-fn set_raw_bit(bytes: &mut [u8], idx: usize, bit: bool) {
+fn set_raw_bit(bytes: &mut [u8], idx: usize, bit: bool) -> Option<()> {
     let byte_idx = idx / 8;
     let bit_idx = idx % 8;
     let mask = 1_u8 << (7 - bit_idx);
+    let byte = bytes.get_mut(byte_idx)?;
     if bit {
-        bytes[byte_idx] |= mask;
+        *byte |= mask;
     } else {
-        bytes[byte_idx] &= !mask;
+        *byte &= !mask;
     }
+    Some(())
 }
 
 fn mask_unused_bits(len: u32, bytes: &mut [u8]) {
