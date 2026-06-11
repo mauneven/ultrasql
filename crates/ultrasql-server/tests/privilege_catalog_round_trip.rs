@@ -630,6 +630,77 @@ async fn schema_usage_is_required_for_table_access() {
 }
 
 #[tokio::test]
+async fn schema_usage_is_required_for_quoted_dotted_schema_access() {
+    let running = start_sample_server("schema_usage_dotted_gate").await;
+    let client = &running.client;
+
+    client
+        .batch_execute(
+            "CREATE ROLE tester SUPERUSER LOGIN; \
+             CREATE ROLE dotted_usage_owner LOGIN; \
+             CREATE ROLE dotted_usage_reader LOGIN; \
+             SET ROLE dotted_usage_owner; \
+             CREATE SCHEMA \"usage.dot\"; \
+             CREATE TABLE \"usage.dot\".docs (id INT); \
+             INSERT INTO \"usage.dot\".docs VALUES (9); \
+             RESET ROLE; \
+             GRANT SELECT ON TABLE \"usage.dot\".docs TO dotted_usage_reader",
+        )
+        .await
+        .expect("create dotted schema usage test table");
+
+    let (reader, reader_conn) = connect_as(
+        running.bound,
+        "dotted_usage_reader",
+        "schema_usage_dotted_reader_blocked",
+    )
+    .await;
+    assert_insufficient_privilege(
+        reader
+            .query("SELECT id FROM \"usage.dot\".docs", &[])
+            .await
+            .expect_err("quoted dotted schema USAGE required despite table SELECT"),
+    );
+    drop(reader);
+    reader_conn
+        .await
+        .expect("blocked dotted schema usage reader joins");
+
+    client
+        .batch_execute("GRANT USAGE ON SCHEMA \"usage.dot\" TO dotted_usage_reader")
+        .await
+        .expect("grant dotted schema usage");
+
+    let (reader, reader_conn) = connect_as(
+        running.bound,
+        "dotted_usage_reader",
+        "schema_usage_dotted_reader_allowed",
+    )
+    .await;
+    let row = reader
+        .query_one("SELECT id FROM \"usage.dot\".docs", &[])
+        .await
+        .expect("quoted dotted schema USAGE plus table SELECT permits access");
+    assert_eq!(row.get::<_, i32>(0), 9);
+    drop(reader);
+    reader_conn
+        .await
+        .expect("allowed dotted schema usage reader joins");
+
+    client
+        .batch_execute(
+            "DROP TABLE \"usage.dot\".docs; \
+             DROP SCHEMA \"usage.dot\"; \
+             DROP ROLE dotted_usage_owner; \
+             DROP ROLE dotted_usage_reader",
+        )
+        .await
+        .expect("cleanup dotted schema usage test");
+
+    shutdown(running).await;
+}
+
+#[tokio::test]
 async fn grant_table_respects_schema_qualifier() {
     let running = start_sample_server("privilege_table_schema_qualifier_guard").await;
     let client = &running.client;
