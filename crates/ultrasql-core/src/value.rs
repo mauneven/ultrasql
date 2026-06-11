@@ -2585,7 +2585,7 @@ fn xml_tag_end(text: &str, start: usize) -> Option<usize> {
         match (quote, byte) {
             (Some(q), b) if b == q => quote = None,
             (None, b'\'' | b'"') => quote = Some(byte),
-            (None, b'>') => return Some(start + offset),
+            (None, b'>') => return start.checked_add(offset),
             _ => {}
         }
     }
@@ -2604,7 +2604,7 @@ fn xml_name_len(bytes: &[u8]) -> usize {
         if !xml_name_byte(*byte) {
             break;
         }
-        len += 1;
+        len = len.saturating_add(1);
     }
     len
 }
@@ -2630,7 +2630,7 @@ fn xml_parse_attributes(rest: &str) -> Option<Vec<(String, String)>> {
             .get(cursor)
             .is_some_and(|byte| byte.is_ascii_whitespace())
         {
-            cursor += 1;
+            cursor = cursor.checked_add(1)?;
         }
         if cursor == bytes.len() {
             return Some(attrs);
@@ -2639,43 +2639,45 @@ fn xml_parse_attributes(rest: &str) -> Option<Vec<(String, String)>> {
         if name_len == 0 {
             return None;
         }
-        let name = rest[cursor..cursor + name_len].to_owned();
-        cursor += name_len;
+        let name_end = cursor.checked_add(name_len)?;
+        let name = rest.get(cursor..name_end)?.to_owned();
+        cursor = name_end;
         while bytes
             .get(cursor)
             .is_some_and(|byte| byte.is_ascii_whitespace())
         {
-            cursor += 1;
+            cursor = cursor.checked_add(1)?;
         }
         if bytes.get(cursor) != Some(&b'=') {
             return None;
         }
-        cursor += 1;
+        cursor = cursor.checked_add(1)?;
         while bytes
             .get(cursor)
             .is_some_and(|byte| byte.is_ascii_whitespace())
         {
-            cursor += 1;
+            cursor = cursor.checked_add(1)?;
         }
         let Some(quote @ (b'\'' | b'"')) = bytes.get(cursor).copied() else {
             return None;
         };
-        cursor += 1;
+        cursor = cursor.checked_add(1)?;
         let value_start = cursor;
         while bytes.get(cursor).is_some_and(|byte| *byte != quote) {
             if bytes[cursor] == b'<' {
                 return None;
             }
-            cursor += 1;
+            cursor = cursor.checked_add(1)?;
         }
-        if !xml_text_segment_is_well_formed(&rest[value_start..cursor]) {
+        let value = rest.get(value_start..cursor)?;
+        if !xml_text_segment_is_well_formed(value) {
             return None;
         }
         if bytes.get(cursor) != Some(&quote) {
             return None;
         }
-        attrs.push((name, rest[value_start..cursor].to_owned()));
-        cursor += 1;
+        attrs.push((name, value.to_owned()));
+        cursor = cursor.checked_add(1)?;
     }
     Some(attrs)
 }
@@ -2683,12 +2685,20 @@ fn xml_parse_attributes(rest: &str) -> Option<Vec<(String, String)>> {
 fn xml_text_segment_is_well_formed(text: &str) -> bool {
     let bytes = text.as_bytes();
     let mut cursor = 0_usize;
-    while let Some(relative) = bytes[cursor..].iter().position(|byte| *byte == b'&') {
-        let amp = cursor + relative;
+    while let Some(relative) = bytes
+        .get(cursor..)
+        .and_then(|tail| tail.iter().position(|byte| *byte == b'&'))
+    {
+        let Some(amp) = cursor.checked_add(relative) else {
+            return false;
+        };
         let Some(entity_len) = xml_entity_ref_len(&bytes[amp..]) else {
             return false;
         };
-        cursor = amp + entity_len;
+        let Some(next_cursor) = amp.checked_add(entity_len) else {
+            return false;
+        };
+        cursor = next_cursor;
     }
     true
 }
@@ -2701,19 +2711,19 @@ fn xml_entity_ref_len(bytes: &[u8]) -> Option<usize> {
     if semi <= 1 {
         return None;
     }
-    let body = std::str::from_utf8(&bytes[1..semi]).ok()?;
+    let body = std::str::from_utf8(bytes.get(1..semi)?).ok()?;
     if matches!(body, "amp" | "lt" | "gt" | "apos" | "quot") {
-        return Some(semi + 1);
+        return semi.checked_add(1);
     }
     if let Some(hex) = body.strip_prefix("#x").or_else(|| body.strip_prefix("#X")) {
         if !hex.is_empty() && hex.bytes().all(|byte| byte.is_ascii_hexdigit()) {
-            return Some(semi + 1);
+            return semi.checked_add(1);
         }
     } else if let Some(dec) = body.strip_prefix('#')
         && !dec.is_empty()
         && dec.bytes().all(|byte| byte.is_ascii_digit())
     {
-        return Some(semi + 1);
+        return semi.checked_add(1);
     }
     None
 }
