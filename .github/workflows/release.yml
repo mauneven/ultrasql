@@ -28,6 +28,7 @@ jobs:
   verify:
     name: release gate
     runs-on: ubuntu-latest
+    timeout-minutes: 120
     steps:
       - uses: actions/checkout@v6
         with:
@@ -95,6 +96,7 @@ jobs:
     name: build (${{ matrix.target }})
     runs-on: ${{ matrix.os }}
     needs: verify
+    timeout-minutes: 120
     strategy:
       fail-fast: false
       matrix:
