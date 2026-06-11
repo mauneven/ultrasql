@@ -7,6 +7,7 @@ pub mod support;
 use support::{
     connect_as, shutdown as graceful_shutdown, start_persistent_server, start_sample_server,
 };
+use ultrasql_server::Server;
 
 async fn simple_i64(client: &tokio_postgres::Client, sql: &str) -> i64 {
     let rows = client.simple_query(sql).await.expect("simple query");
@@ -133,6 +134,35 @@ async fn sequence_owner_survives_restart_in_catalog_views() {
         .get::<_, String>(0);
     assert_eq!(owner, "persisted_sequence_owner");
     graceful_shutdown(running).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn sequence_owner_metadata_rejects_unknown_owner_on_rebuild() {
+    let data_dir = tempfile::TempDir::new().expect("temp data dir");
+
+    let running = start_persistent_server(data_dir.path(), "sequence_owner_orphan_setup").await;
+    running
+        .client
+        .batch_execute("CREATE SEQUENCE orphan_owner_sequence")
+        .await
+        .expect("create sequence");
+    graceful_shutdown(running).await;
+
+    std::fs::write(
+        data_dir.path().join("pg_sequence_owner.meta"),
+        concat!(
+            "# ultrasql sequence owners v2\n",
+            "sequence\torphan_owner_sequence\tmissing_owner\tpublic\n"
+        ),
+    )
+    .expect("write orphaned sequence owner metadata");
+
+    let err = Server::init(data_dir.path()).expect_err("orphaned sequence owner rejected");
+    assert!(
+        err.to_string()
+            .contains("unknown sequence owner metadata role 'missing_owner'"),
+        "expected unknown sequence owner rejection, got {err}"
+    );
 }
 
 #[tokio::test]

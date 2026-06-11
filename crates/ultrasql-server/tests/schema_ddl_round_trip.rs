@@ -3,6 +3,7 @@
 pub mod support;
 
 use support::{connect_as, shutdown, start_persistent_server, start_sample_server};
+use ultrasql_server::Server;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn create_drop_schema_survives_restart_and_blocks_owner_drop() {
@@ -74,6 +75,26 @@ async fn create_drop_schema_survives_restart_and_blocks_owner_drop() {
         .expect("query dropped schema count");
     assert!(rows.is_empty());
     shutdown(running).await;
+}
+
+#[test]
+fn schema_metadata_rejects_unknown_owner_on_rebuild() {
+    let data_dir = tempfile::TempDir::new().expect("temp data dir");
+    std::fs::write(
+        data_dir.path().join("pg_schema_runtime.meta"),
+        concat!(
+            "# ultrasql schemas v1\n",
+            "schema\torphaned_schema\tmissing_owner\n"
+        ),
+    )
+    .expect("write orphaned schema metadata");
+
+    let err = Server::init(data_dir.path()).expect_err("orphaned schema owner rejected");
+    assert!(
+        err.to_string()
+            .contains("unknown schema metadata owner 'missing_owner'"),
+        "expected unknown schema owner rejection, got {err}"
+    );
 }
 
 #[tokio::test]

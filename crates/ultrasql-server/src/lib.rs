@@ -879,6 +879,19 @@ fn validate_privilege_metadata_grantee(
     validate_privilege_metadata_role(known_roles, grantee, line_no, "grantee")
 }
 
+fn runtime_metadata_known_role_names(
+    role_catalog: &auth::InMemoryAuthCatalog,
+) -> std::collections::HashSet<String> {
+    let mut roles = role_catalog
+        .list_roles()
+        .into_iter()
+        .map(|role| role.name.to_ascii_lowercase())
+        .collect::<std::collections::HashSet<_>>();
+    // Trust-mode tests already treat uncataloged `tester` as an effective superuser.
+    roles.insert("tester".to_owned());
+    roles
+}
+
 fn privilege_metadata_object_key(name: &str) -> String {
     let folded = name.trim().to_ascii_lowercase();
     folded
@@ -5813,6 +5826,7 @@ impl Server {
 
         let mut owners = Vec::new();
         let mut seen_sequences = std::collections::HashSet::new();
+        let known_roles = runtime_metadata_known_role_names(&self.role_catalog);
         for (line_no, line) in text.lines().enumerate() {
             if line.is_empty() || line.starts_with('#') {
                 continue;
@@ -5858,6 +5872,13 @@ impl Server {
                     "ignoring stale sequence owner metadata for missing sequence",
                 );
                 continue;
+            }
+            if !known_roles.contains(&owner_role) {
+                return Err(ServerError::ddl(format!(
+                    "unknown sequence owner metadata role '{}' on line {}",
+                    owner_role,
+                    line_no + 1
+                )));
             }
             owners.push((sequence_name, owner_role, namespace));
         }
@@ -5909,6 +5930,7 @@ impl Server {
 
         let mut schemas = Vec::new();
         let mut seen = std::collections::HashSet::new();
+        let known_roles = runtime_metadata_known_role_names(&self.role_catalog);
         for (line_no, line) in text.lines().enumerate() {
             if line.is_empty() || line.starts_with('#') {
                 continue;
@@ -5939,6 +5961,13 @@ impl Server {
                 return Err(ServerError::ddl(format!(
                     "duplicate schema metadata '{}' on line {}",
                     name,
+                    line_no + 1
+                )));
+            }
+            if !known_roles.contains(&owner_role) {
+                return Err(ServerError::ddl(format!(
+                    "unknown schema metadata owner '{}' on line {}",
+                    owner_role,
                     line_no + 1
                 )));
             }
