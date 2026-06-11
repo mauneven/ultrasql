@@ -307,8 +307,7 @@ where
     fn ensure_schema_privilege_owner(&self, schemas: &[String]) -> Result<(), ServerError> {
         let current_user = self.current_user.to_ascii_lowercase();
         for schema in schemas {
-            self.ensure_schema_exists_for_privilege(schema)?;
-            let folded = schema.to_ascii_lowercase();
+            let folded = self.ensure_schema_exists_for_privilege(schema)?;
             let owns_schema = self
                 .state
                 .schemas
@@ -323,10 +322,10 @@ where
         Ok(())
     }
 
-    fn ensure_schema_exists_for_privilege(&self, schema: &str) -> Result<(), ServerError> {
-        let folded = schema.to_ascii_lowercase();
+    fn ensure_schema_exists_for_privilege(&self, schema: &str) -> Result<String, ServerError> {
+        let folded = privilege_schema_name(schema);
         if builtin_schema_name(&folded) || self.state.schemas.contains_key(&folded) {
-            return Ok(());
+            return Ok(folded);
         }
         Err(ServerError::ddl(format!(
             "schema '{schema}' does not exist"
@@ -432,6 +431,17 @@ fn privilege_relation_parts(object: &str) -> Option<(Option<String>, String)> {
         )),
         _ => None,
     }
+}
+
+fn privilege_schema_name(schema: &str) -> String {
+    let folded = schema.to_ascii_lowercase();
+    if folded.starts_with('"')
+        && let Some(parts) = crate::parse_pg_identifier_path(&folded)
+        && let [name] = parts.as_slice()
+    {
+        return name.to_ascii_lowercase();
+    }
+    folded
 }
 
 fn privilege_function_simple_name(function: &str) -> String {

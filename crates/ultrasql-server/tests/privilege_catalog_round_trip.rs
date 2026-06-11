@@ -725,6 +725,43 @@ async fn grant_table_preserves_quoted_dot_in_public_name() {
 }
 
 #[tokio::test]
+async fn grant_schema_preserves_quoted_dot_in_name() {
+    let running = start_sample_server("privilege_schema_quoted_dot_guard").await;
+    let client = &running.client;
+
+    client
+        .batch_execute(
+            "CREATE ROLE tester SUPERUSER LOGIN; \
+             CREATE ROLE dotted_schema_reader LOGIN; \
+             CREATE SCHEMA \"acl.dot\"; \
+             GRANT USAGE ON SCHEMA \"acl.dot\" TO dotted_schema_reader",
+        )
+        .await
+        .expect("grant quoted dotted schema");
+
+    let visible = client
+        .query_one(
+            "SELECT has_schema_privilege('dotted_schema_reader', '\"acl.dot\"', 'USAGE')",
+            &[],
+        )
+        .await
+        .expect("quoted dotted schema privilege check")
+        .get::<_, bool>(0);
+    assert!(visible, "quoted dotted schema grant must persist");
+
+    client
+        .batch_execute(
+            "DROP SCHEMA \"acl.dot\"; \
+             DROP ROLE tester; \
+             DROP ROLE dotted_schema_reader",
+        )
+        .await
+        .expect("cleanup quoted dotted schema privilege guard");
+
+    shutdown(running).await;
+}
+
+#[tokio::test]
 async fn non_superuser_cannot_alter_default_privileges_for_privileged_role() {
     let running = start_sample_server("privilege_catalog_test").await;
     let client = &running.client;

@@ -548,7 +548,9 @@ fn normalize_object_name(kind: PrivilegeObjectKind, name: &str) -> String {
         PrivilegeObjectKind::Table | PrivilegeObjectKind::Sequence => {
             normalize_relation_object_name(&folded)
         }
-        _ => last_name_part(&folded).to_owned(),
+        PrivilegeObjectKind::Schema | PrivilegeObjectKind::Database => {
+            normalize_single_object_name(&folded)
+        }
     }
 }
 
@@ -596,6 +598,16 @@ fn split_at_byte(text: &str, index: usize) -> Option<(&str, &str)> {
 
 fn last_name_part(name: &str) -> &str {
     name.rsplit_once('.').map_or(name, |(_, last)| last)
+}
+
+fn normalize_single_object_name(folded: &str) -> String {
+    if folded.starts_with('"')
+        && let Some(parts) = crate::parse_pg_identifier_path(folded)
+        && let [name] = parts.as_slice()
+    {
+        return name.to_ascii_lowercase();
+    }
+    folded.to_owned()
 }
 
 fn privilege_columns(request: &PrivilegeRequest) -> Vec<Option<String>> {
