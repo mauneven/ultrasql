@@ -143,6 +143,15 @@ pub trait Catalog: Send + Sync {
         None
     }
 
+    /// Resolve a relation name to its catalog OID inside one schema.
+    fn lookup_table_oid_in_schema(&self, schema_name: &str, name: &str) -> Option<Oid> {
+        if schema_name.eq_ignore_ascii_case("public") {
+            self.lookup_table_oid(name)
+        } else {
+            self.lookup_table_oid(&ultrasql_catalog::table_lookup_key(schema_name, name))
+        }
+    }
+
     /// Return whether an unqualified table reference can see this schema.
     fn table_schema_visible_without_qualification(&self, schema_name: &str) -> bool {
         matches!(

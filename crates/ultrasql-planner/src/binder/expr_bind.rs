@@ -2810,13 +2810,17 @@ fn coerce_literal_to_oid_alias_with_catalog(
 }
 
 fn resolve_regclass_literal(text: &str, catalog: &dyn Catalog) -> Option<Oid> {
-    Value::parse_oid_text(text)
-        .or_else(|| catalog.lookup_table_oid(text))
-        .or_else(|| {
-            parse_pg_identifier_path(text)
-                .and_then(|parts| parts.last().cloned())
-                .and_then(|name| catalog.lookup_table_oid(&name))
-        })
+    if let Some(oid) = Value::parse_oid_text(text) {
+        return Some(oid);
+    }
+    let parts = parse_pg_identifier_path(text)?;
+    match parts.as_slice() {
+        [name] => catalog.lookup_table_oid(name),
+        [schema_name, relation_name] => {
+            catalog.lookup_table_oid_in_schema(schema_name, relation_name)
+        }
+        _ => None,
+    }
 }
 
 fn parse_pg_identifier_path(text: &str) -> Option<Vec<String>> {

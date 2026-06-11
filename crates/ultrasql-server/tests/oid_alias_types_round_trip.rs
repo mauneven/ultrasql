@@ -192,6 +192,16 @@ async fn oid_regclass_regtype_pg_lsn_store_cast_wire_and_restart() {
         .expect_err("missing regclass rejected");
     running
         .client
+        .batch_execute("CREATE SCHEMA app")
+        .await
+        .expect("create app schema for regclass qualifier guard");
+    running
+        .client
+        .batch_execute("SELECT 'app.oid_alias_probe'::regclass")
+        .await
+        .expect_err("qualified missing regclass must not resolve public table");
+    running
+        .client
         .batch_execute("SELECT 'missing_type'::regtype")
         .await
         .expect_err("missing regtype rejected");
