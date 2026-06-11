@@ -111,6 +111,12 @@ fn checked_len_sum(parts: &[usize], context: &'static str) -> Result<usize, Payl
     })
 }
 
+fn checked_offset(start: usize, len: usize, context: &'static str) -> Result<usize, PayloadError> {
+    start
+        .checked_add(len)
+        .ok_or(PayloadError::Malformed(context))
+}
+
 // ---------------------------------------------------------------------------
 // TupleId helpers (private)
 // ---------------------------------------------------------------------------
@@ -604,7 +610,10 @@ impl HeapUpdateInPlaceBatchPayload {
         let entry_count = u32::try_from(self.entries.len()).map_err(|_| {
             PayloadError::Malformed("heap_update_in_place_batch entry_count overflow")
         })?;
-        let entry_size = Self::ENTRY_FIXED + Self::IMAGE_LEN * 2;
+        let entry_size = checked_len_sum(
+            &[Self::ENTRY_FIXED, Self::IMAGE_LEN, Self::IMAGE_LEN],
+            "heap_update_in_place_batch length overflow",
+        )?;
         let entries_len =
             self.entries
                 .len()
@@ -612,11 +621,10 @@ impl HeapUpdateInPlaceBatchPayload {
                 .ok_or(PayloadError::Malformed(
                     "heap_update_in_place_batch length overflow",
                 ))?;
-        let total = Self::FIXED
-            .checked_add(entries_len)
-            .ok_or(PayloadError::Malformed(
-                "heap_update_in_place_batch length overflow",
-            ))?;
+        let total = checked_len_sum(
+            &[Self::FIXED, entries_len],
+            "heap_update_in_place_batch length overflow",
+        )?;
         if total > MAX_VARIABLE_PAYLOAD_BYTES {
             return Err(PayloadError::Malformed(
                 "heap_update_in_place_batch length exceeds ceiling",
@@ -645,13 +653,26 @@ impl HeapUpdateInPlaceBatchPayload {
 
         let mut off = Self::FIXED;
         for entry in &self.entries {
-            write_u16_le(&mut out[off..off + 2], entry.slot);
-            write_u16_le(&mut out[off + 2..off + 4], 0);
-            off += Self::ENTRY_FIXED;
-            out[off..off + Self::IMAGE_LEN].copy_from_slice(&entry.pre_image);
-            off += Self::IMAGE_LEN;
-            out[off..off + Self::IMAGE_LEN].copy_from_slice(&entry.post_image);
-            off += Self::IMAGE_LEN;
+            let slot_end = checked_offset(off, 2, "heap_update_in_place_batch length overflow")?;
+            write_u16_le(&mut out[off..slot_end], entry.slot);
+            let reserved_end =
+                checked_offset(slot_end, 2, "heap_update_in_place_batch length overflow")?;
+            write_u16_le(&mut out[slot_end..reserved_end], 0);
+            off = reserved_end;
+            let pre_end = checked_offset(
+                off,
+                Self::IMAGE_LEN,
+                "heap_update_in_place_batch length overflow",
+            )?;
+            out[off..pre_end].copy_from_slice(&entry.pre_image);
+            off = pre_end;
+            let post_end = checked_offset(
+                off,
+                Self::IMAGE_LEN,
+                "heap_update_in_place_batch length overflow",
+            )?;
+            out[off..post_end].copy_from_slice(&entry.post_image);
+            off = post_end;
         }
         Ok(out)
     }
@@ -694,17 +715,19 @@ impl HeapUpdateInPlaceBatchPayload {
                 .map_err(|_| PayloadError::Malformed("heap_update_in_place_batch entry_count"))?,
         )
         .map_err(|_| PayloadError::Malformed("heap_update_in_place_batch entry_count usize"))?;
-        let entry_size = Self::ENTRY_FIXED + image_len * 2;
+        let entry_size = checked_len_sum(
+            &[Self::ENTRY_FIXED, image_len, image_len],
+            "heap_update_in_place_batch length overflow",
+        )?;
         let entries_len = entry_count
             .checked_mul(entry_size)
             .ok_or(PayloadError::Malformed(
                 "heap_update_in_place_batch length overflow",
             ))?;
-        let needed = Self::FIXED
-            .checked_add(entries_len)
-            .ok_or(PayloadError::Malformed(
-                "heap_update_in_place_batch length overflow",
-            ))?;
+        let needed = checked_len_sum(
+            &[Self::FIXED, entries_len],
+            "heap_update_in_place_batch length overflow",
+        )?;
         if bytes.len() < needed {
             return Err(PayloadError::Truncated {
                 needed,
@@ -716,9 +739,12 @@ impl HeapUpdateInPlaceBatchPayload {
         let mut entries = Vec::with_capacity(entry_count);
         let mut off = Self::FIXED;
         for _ in 0..entry_count {
-            let slot = read_u16_le(&bytes[off..off + 2])
+            let slot_end = checked_offset(off, 2, "heap_update_in_place_batch length overflow")?;
+            let slot = read_u16_le(&bytes[off..slot_end])
                 .map_err(|_| PayloadError::Malformed("heap_update_in_place_batch slot"))?;
-            let entry_reserved = read_u16_le(&bytes[off + 2..off + 4]).map_err(|_| {
+            let reserved_end =
+                checked_offset(slot_end, 2, "heap_update_in_place_batch length overflow")?;
+            let entry_reserved = read_u16_le(&bytes[slot_end..reserved_end]).map_err(|_| {
                 PayloadError::Malformed("heap_update_in_place_batch entry reserved")
             })?;
             if entry_reserved != 0 {
@@ -726,13 +752,23 @@ impl HeapUpdateInPlaceBatchPayload {
                     "heap_update_in_place_batch entry reserved bits set",
                 ));
             }
-            off += Self::ENTRY_FIXED;
+            off = reserved_end;
             let mut pre_image = [0_u8; Self::IMAGE_LEN];
-            pre_image.copy_from_slice(&bytes[off..off + Self::IMAGE_LEN]);
-            off += Self::IMAGE_LEN;
+            let pre_end = checked_offset(
+                off,
+                Self::IMAGE_LEN,
+                "heap_update_in_place_batch length overflow",
+            )?;
+            pre_image.copy_from_slice(&bytes[off..pre_end]);
+            off = pre_end;
             let mut post_image = [0_u8; Self::IMAGE_LEN];
-            post_image.copy_from_slice(&bytes[off..off + Self::IMAGE_LEN]);
-            off += Self::IMAGE_LEN;
+            let post_end = checked_offset(
+                off,
+                Self::IMAGE_LEN,
+                "heap_update_in_place_batch length overflow",
+            )?;
+            post_image.copy_from_slice(&bytes[off..post_end]);
+            off = post_end;
             entries.push(HeapUpdateInPlaceBatchEntry {
                 slot,
                 pre_image,
