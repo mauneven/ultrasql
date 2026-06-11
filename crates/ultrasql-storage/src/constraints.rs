@@ -335,7 +335,16 @@ impl ConstraintChecker {
                     Some(Value::Bool(true)) => {}
                     _ => return Err(ConstraintError::CheckFailed { name: name.clone() }),
                 },
-                Constraint::Unique { .. } | Constraint::PrimaryKey { .. } => {}
+                Constraint::Unique { .. } => {}
+                Constraint::PrimaryKey { columns } => {
+                    for &column in columns {
+                        if matches!(row.get(column), Some(Value::Null) | None) {
+                            return Err(ConstraintError::NotNull {
+                                column_index: column,
+                            });
+                        }
+                    }
+                }
                 Constraint::ForeignKey {
                     columns,
                     target_rel,
@@ -791,6 +800,21 @@ mod tests {
             .check_insert(&[Value::Null])
             .expect_err("null pk must fail");
         assert!(matches!(err, ConstraintError::NotNull { .. }));
+    }
+
+    #[test]
+    fn primary_key_rejects_null_without_separate_not_null() {
+        let c = no_fk(vec![Constraint::PrimaryKey { columns: vec![0] }]);
+
+        let null_err = c
+            .check_insert(&[Value::Null])
+            .expect_err("primary key must imply not null");
+        assert!(matches!(null_err, ConstraintError::NotNull { .. }));
+
+        let missing_err = c
+            .check_insert(&[])
+            .expect_err("missing primary key value must imply not null");
+        assert!(matches!(missing_err, ConstraintError::NotNull { .. }));
     }
 
     // --- ForeignKey INSERT ---
