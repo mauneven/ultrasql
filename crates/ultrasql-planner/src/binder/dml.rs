@@ -13,8 +13,7 @@ use crate::catalog::TableMeta;
 use super::expr_bind::coerce_literal_to_type;
 use super::{
     Catalog, ConflictTarget, LogicalOnConflict, LogicalPlan, PlanError, ScalarExpr, ScopeStack,
-    bind_expr, bind_returning, bind_select, build_returning_schema, object_name_simple,
-    validate_table_reference_namespace,
+    bind_expr, bind_returning, bind_select, build_returning_schema, lookup_table_reference,
 };
 
 pub(super) fn bind_insert(
@@ -449,10 +448,6 @@ fn lookup_target_table(
     catalog: &dyn Catalog,
     object_name: &ObjectName,
 ) -> Result<(String, TableMeta), PlanError> {
-    let table_name = object_name_simple(object_name);
-    let meta = catalog
-        .lookup_table(&table_name)
-        .ok_or_else(|| PlanError::TableNotFound(table_name.clone()))?;
-    validate_table_reference_namespace(catalog, object_name, &table_name, &meta)?;
-    Ok((table_name, meta))
+    let resolved = lookup_table_reference(catalog, object_name)?;
+    Ok((resolved.plan_name, resolved.meta))
 }

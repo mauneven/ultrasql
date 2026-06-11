@@ -12,6 +12,11 @@ use super::{
 };
 use crate::catalog::TableMeta;
 
+pub(super) struct ResolvedTableRef {
+    pub(super) plan_name: String,
+    pub(super) meta: TableMeta,
+}
+
 /// Build the `RETURNING` schema from the resolved `(expr, name)` pairs.
 pub(super) fn build_returning_schema(
     returning: &[(ScalarExpr, String)],
@@ -68,27 +73,31 @@ pub(super) fn object_name_explicit_namespace(name: &ObjectName) -> Option<String
     })
 }
 
-/// Validate that a catalog hit is visible through the requested SQL name.
-pub(super) fn validate_table_reference_namespace(
+pub(super) fn canonical_table_plan_name(meta: &TableMeta, table_name: &str) -> String {
+    ultrasql_catalog::table_lookup_key(&meta.schema_name, table_name)
+}
+
+pub(super) fn lookup_table_reference(
     catalog: &dyn Catalog,
     name: &ObjectName,
-    table_name: &str,
-    meta: &TableMeta,
-) -> Result<(), PlanError> {
+) -> Result<ResolvedTableRef, PlanError> {
+    let table_name = object_name_simple(name);
     if let Some(namespace) = object_name_explicit_namespace(name) {
-        if meta.schema_name.eq_ignore_ascii_case(&namespace) {
-            return Ok(());
-        }
-        return Err(PlanError::TableNotFound(format!(
-            "{namespace}.{table_name}"
-        )));
+        let meta = catalog
+            .lookup_table_in_schema(&namespace, &table_name)
+            .ok_or_else(|| PlanError::TableNotFound(format!("{namespace}.{table_name}")))?;
+        let plan_name = canonical_table_plan_name(&meta, &table_name);
+        return Ok(ResolvedTableRef { plan_name, meta });
     }
 
-    if catalog.table_schema_visible_without_qualification(&meta.schema_name) {
-        return Ok(());
+    let meta = catalog
+        .lookup_table(&table_name)
+        .ok_or_else(|| PlanError::TableNotFound(table_name.clone()))?;
+    if !catalog.table_schema_visible_without_qualification(&meta.schema_name) {
+        return Err(PlanError::TableNotFound(table_name));
     }
-
-    Err(PlanError::TableNotFound(table_name.to_owned()))
+    let plan_name = canonical_table_plan_name(&meta, &table_name);
+    Ok(ResolvedTableRef { plan_name, meta })
 }
 
 /// Derive an output column name from an expression.

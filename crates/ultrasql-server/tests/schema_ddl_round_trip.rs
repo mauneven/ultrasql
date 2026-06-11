@@ -306,6 +306,72 @@ async fn qualified_object_ddl_uses_created_schema_namespace() {
 }
 
 #[tokio::test]
+async fn same_relation_name_is_isolated_by_schema() {
+    let running = start_sample_server("schema_same_relation_name").await;
+
+    running
+        .client
+        .batch_execute(
+            "CREATE SCHEMA app; \
+             CREATE TABLE same_name (id INT); \
+             CREATE TABLE app.same_name (id INT); \
+             INSERT INTO same_name VALUES (1); \
+             INSERT INTO app.same_name VALUES (2)",
+        )
+        .await
+        .expect("schemas may contain tables with the same relation name");
+
+    let public_row = running
+        .client
+        .query_one("SELECT id FROM public.same_name", &[])
+        .await
+        .expect("public relation resolves by qualified name")
+        .get::<_, i32>(0);
+    let app_row = running
+        .client
+        .query_one("SELECT id FROM app.same_name", &[])
+        .await
+        .expect("app relation resolves by qualified name")
+        .get::<_, i32>(0);
+    assert_eq!(public_row, 1);
+    assert_eq!(app_row, 2);
+
+    running
+        .client
+        .batch_execute("SET search_path TO app, public")
+        .await
+        .expect("set app-first search path");
+    let app_first = running
+        .client
+        .query_one("SELECT id FROM same_name", &[])
+        .await
+        .expect("search path resolves app relation first")
+        .get::<_, i32>(0);
+    assert_eq!(app_first, 2);
+
+    running
+        .client
+        .batch_execute("RESET search_path")
+        .await
+        .expect("reset search path");
+    let public_default = running
+        .client
+        .query_one("SELECT id FROM same_name", &[])
+        .await
+        .expect("default search path resolves public relation")
+        .get::<_, i32>(0);
+    assert_eq!(public_default, 1);
+
+    running
+        .client
+        .batch_execute("DROP TABLE app.same_name; DROP TABLE same_name; DROP SCHEMA app")
+        .await
+        .expect("cleanup same-name schema isolation");
+
+    shutdown(running).await;
+}
+
+#[tokio::test]
 async fn select_respects_schema_qualifier() {
     let running = start_sample_server("schema_select_qualifier_guard").await;
 

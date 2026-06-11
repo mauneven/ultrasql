@@ -21,7 +21,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use dashmap::DashMap;
 use ultrasql_core::{Field, Oid, Schema};
 
-use crate::entry::{IndexEntry, TableEntry};
+use crate::entry::{IndexEntry, TableEntry, fold_identifier, table_lookup_key};
 use crate::error::CatalogError;
 use crate::traits::{Catalog, MutableCatalog};
 
@@ -35,7 +35,11 @@ pub const FIRST_USER_OID: u32 = 16_384;
 /// by lowercasing on the way in.
 #[inline]
 fn fold_name(name: &str) -> String {
-    name.to_ascii_lowercase()
+    fold_identifier(name)
+}
+
+fn table_entry_key(entry: &TableEntry) -> String {
+    table_lookup_key(&entry.schema_name, &entry.name)
 }
 
 /// In-memory catalog.
@@ -102,7 +106,7 @@ impl InMemoryCatalog {
     /// TODO(catalog-persistent): replace with a heap insert against
     /// `pg_class` plus a unique-key check on `(relname, relnamespace)`.
     fn install_table(&self, entry: TableEntry) -> Result<(), CatalogError> {
-        let key = fold_name(&entry.name);
+        let key = table_entry_key(&entry);
         if self.tables_by_name.contains_key(&key) {
             return Err(CatalogError::already_exists(entry.name));
         }
@@ -143,6 +147,12 @@ impl Catalog for InMemoryCatalog {
     fn lookup_table(&self, name: &str) -> Option<TableEntry> {
         self.tables_by_name
             .get(&fold_name(name))
+            .map(|r| r.value().clone())
+    }
+
+    fn lookup_table_in_schema(&self, schema_name: &str, name: &str) -> Option<TableEntry> {
+        self.tables_by_name
+            .get(&table_lookup_key(schema_name, name))
             .map(|r| r.value().clone())
     }
 
@@ -257,7 +267,7 @@ impl MutableCatalog for InMemoryCatalog {
                 .get_mut(&oid)
                 .ok_or_else(|| CatalogError::not_found(format!("oid {oid}")))?;
             entry.n_blocks = n_blocks;
-            fold_name(&entry.name)
+            table_entry_key(&entry)
         };
         // Drop the by-oid write-guard before reacquiring on the by-name
         // shard: holding both at once would risk a cross-shard wait
@@ -355,7 +365,13 @@ impl MutableCatalog for InMemoryCatalog {
         new_name: &str,
     ) -> Result<TableEntry, CatalogError> {
         let old_key = fold_name(old_name);
-        let new_key = fold_name(new_name);
+        let existing = self
+            .tables_by_name
+            .get(&old_key)
+            .ok_or_else(|| CatalogError::not_found(old_name.to_owned()))?
+            .value()
+            .clone();
+        let new_key = table_lookup_key(&existing.schema_name, new_name);
         if self.tables_by_name.contains_key(&new_key) {
             return Err(CatalogError::already_exists(new_name.to_owned()));
         }

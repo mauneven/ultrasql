@@ -32,6 +32,16 @@ pub trait Catalog: Send + Sync {
     /// registered. The name comparison ignores ASCII case.
     fn lookup_table(&self, name: &str) -> Option<TableEntry>;
 
+    /// Resolve a table by schema and bare relation name.
+    ///
+    /// Returns `None` when no table with that `(schema, name)` pair is
+    /// registered. Implementations that do not model schemas may fall back to
+    /// [`Self::lookup_table`] and filter by [`TableEntry::schema_name`].
+    fn lookup_table_in_schema(&self, schema_name: &str, name: &str) -> Option<TableEntry> {
+        self.lookup_table(name)
+            .filter(|entry| entry.schema_name.eq_ignore_ascii_case(schema_name))
+    }
+
     /// Resolve a table by its OID.
     ///
     /// Returns `None` when no live table holds that OID. Catalog

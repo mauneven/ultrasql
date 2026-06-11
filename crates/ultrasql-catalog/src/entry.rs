@@ -25,6 +25,22 @@
 
 use ultrasql_core::{BlockNumber, DataType, Lsn, Oid, Schema};
 
+/// Fold a SQL identifier the same way the catalog stores lookup keys.
+#[must_use]
+pub fn fold_identifier(name: &str) -> String {
+    name.to_ascii_lowercase()
+}
+
+/// Return the canonical table lookup key for a schema-qualified relation.
+#[must_use]
+pub fn table_lookup_key(schema_name: &str, table_name: &str) -> String {
+    let table = fold_identifier(table_name);
+    match fold_identifier(schema_name).as_str() {
+        "public" | "pg_catalog" | "information_schema" => table,
+        schema => format!("{schema}.{table}"),
+    }
+}
+
 /// A table (relation) entry in the catalog.
 ///
 /// The owning catalog hands out cloned `TableEntry` values rather than

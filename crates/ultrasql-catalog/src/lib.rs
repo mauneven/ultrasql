@@ -54,6 +54,7 @@ pub use encoding::{
 };
 pub use entry::{
     CompositeTypeEntry, DomainTypeEntry, EnumLabelEntry, EnumTypeEntry, IndexEntry, TableEntry,
+    fold_identifier, table_lookup_key,
 };
 pub use error::CatalogError;
 pub use memory::{FIRST_USER_OID, InMemoryCatalog};

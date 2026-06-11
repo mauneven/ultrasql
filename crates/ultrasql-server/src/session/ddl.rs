@@ -590,8 +590,14 @@ where
         };
         self.ensure_schema_exists(namespace)?;
         self.ensure_schema_create_privilege(namespace)?;
-        let exists_persistent = snapshot.tables.contains_key(table_name);
-        let exists_fallback = self.state.catalog.lookup_table(table_name).is_some();
+        let exists_persistent = snapshot
+            .tables
+            .contains_key(&ultrasql_catalog::table_lookup_key(namespace, table_name));
+        let exists_fallback = self
+            .state
+            .catalog
+            .lookup_table_in_schema(namespace, table_name)
+            .is_some();
         if exists_persistent || exists_fallback {
             if *if_not_exists {
                 return Ok(run_ddl_command("CREATE TABLE"));
@@ -975,8 +981,14 @@ where
         };
         self.ensure_schema_exists(namespace)?;
         self.ensure_schema_create_privilege(namespace)?;
-        let exists_persistent = snapshot.tables.contains_key(table_name);
-        let exists_fallback = self.state.catalog.lookup_table(table_name).is_some();
+        let exists_persistent = snapshot
+            .tables
+            .contains_key(&ultrasql_catalog::table_lookup_key(namespace, table_name));
+        let exists_fallback = self
+            .state
+            .catalog
+            .lookup_table_in_schema(namespace, table_name)
+            .is_some();
         if exists_persistent || exists_fallback {
             if *if_not_exists {
                 return Ok(run_ddl_command("CREATE MATERIALIZED VIEW"));
@@ -999,9 +1011,10 @@ where
             "materialized_view".to_owned(),
         ));
         self.state.persistent_catalog.create_table(entry.clone())?;
+        let view_table = ultrasql_catalog::table_lookup_key(namespace, table_name);
 
         let runtime = Arc::new(crate::MaterializedViewRuntime {
-            view_table: table_name.clone(),
+            view_table,
             source_table: source_table.to_ascii_lowercase(),
             source: source.as_ref().clone(),
             materialized_rows: std::sync::atomic::AtomicU64::new(0),

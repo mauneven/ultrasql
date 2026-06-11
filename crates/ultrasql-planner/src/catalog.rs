@@ -89,6 +89,12 @@ pub trait Catalog: Send + Sync {
     /// Returns `None` if no table by that name is registered.
     fn lookup_table(&self, name: &str) -> Option<TableMeta>;
 
+    /// Resolve a table by schema and bare relation name.
+    fn lookup_table_in_schema(&self, schema_name: &str, name: &str) -> Option<TableMeta> {
+        self.lookup_table(name)
+            .filter(|meta| meta.schema_name.eq_ignore_ascii_case(schema_name))
+    }
+
     /// Resolve a user-defined type by its case-folded SQL name.
     ///
     /// Built-in types are resolved directly by the binder; catalog
@@ -174,6 +180,11 @@ impl Catalog for InMemoryCatalog {
         self.tables.get(&name.to_ascii_lowercase()).cloned()
     }
 
+    fn lookup_table_in_schema(&self, schema_name: &str, name: &str) -> Option<TableMeta> {
+        self.lookup_table(name)
+            .filter(|meta| meta.schema_name.eq_ignore_ascii_case(schema_name))
+    }
+
     fn lookup_type(&self, name: &str) -> Option<DataType> {
         self.types.get(&name.to_ascii_lowercase()).cloned()
     }
@@ -254,6 +265,12 @@ impl Catalog for ultrasql_catalog::CatalogSnapshot {
     fn lookup_table(&self, name: &str) -> Option<TableMeta> {
         self.tables
             .get(&name.to_ascii_lowercase())
+            .map(|entry| TableMeta::with_schema_name(&entry.schema_name, entry.schema.clone()))
+    }
+
+    fn lookup_table_in_schema(&self, schema_name: &str, name: &str) -> Option<TableMeta> {
+        self.tables
+            .get(&ultrasql_catalog::table_lookup_key(schema_name, name))
             .map(|entry| TableMeta::with_schema_name(&entry.schema_name, entry.schema.clone()))
     }
 

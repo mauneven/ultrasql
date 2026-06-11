@@ -292,14 +292,13 @@ where
     ) -> Result<ultrasql_core::Oid, ServerError> {
         let snapshot = self.state.catalog_snapshot();
         let table_name = privilege_object_simple_name(table);
-        let Some(meta) = snapshot.tables.get(table_name) else {
+        let table_key = privilege_object_namespace(table).map_or_else(
+            || table_name.to_ascii_lowercase(),
+            |namespace| ultrasql_catalog::table_lookup_key(namespace, table_name),
+        );
+        let Some(meta) = snapshot.tables.get(&table_key) else {
             return Err(ServerError::ddl(format!("table '{table}' does not exist")));
         };
-        if let Some(namespace) = privilege_object_namespace(table)
-            && !meta.schema_name.eq_ignore_ascii_case(namespace)
-        {
-            return Err(ServerError::ddl(format!("table '{table}' does not exist")));
-        }
         Ok(meta.oid)
     }
 

@@ -63,6 +63,7 @@ use crate::encoding::{
 };
 use crate::entry::{
     CompositeTypeEntry, DomainTypeEntry, EnumLabelEntry, EnumTypeEntry, IndexEntry, TableEntry,
+    table_lookup_key,
 };
 use crate::error::CatalogError;
 use crate::traits::{Catalog, MutableCatalog};
@@ -603,8 +604,9 @@ impl PersistentCatalog {
         self.pg_statistic.clear();
         self.pg_statistic_ext.clear();
 
-        for (name, entry) in &snap.tables {
-            self.tables_by_name.insert(name.clone(), entry.clone());
+        for entry in snap.tables_by_oid.values() {
+            self.tables_by_name
+                .insert(table_entry_key(entry), entry.clone());
             self.tables_by_oid.insert(entry.oid, entry.clone());
         }
         for (name, entry) in &snap.indexes {
@@ -974,8 +976,7 @@ impl PersistentCatalog {
                         root_block: ultrasql_core::BlockNumber::new(class_row.relfilenode),
                         options: class_row.reloptions.clone(),
                     };
-                    let key = class_row.relname.to_ascii_lowercase();
-                    tables.insert(key, entry.clone());
+                    tables.insert(table_entry_key(&entry), entry.clone());
                     tables_by_oid.insert(entry.oid, entry);
                 }
                 RelKind::Index => {
@@ -2298,7 +2299,10 @@ impl PersistentCatalog {
         let tables: std::collections::HashMap<String, TableEntry> = self
             .tables_by_name
             .iter()
-            .map(|r| (r.key().clone(), r.value().clone()))
+            .map(|r| {
+                let entry = r.value().clone();
+                (table_entry_key(&entry), entry)
+            })
             .collect();
         let tables_by_oid: std::collections::HashMap<Oid, TableEntry> = self
             .tables_by_oid
@@ -2529,19 +2533,21 @@ impl PersistentCatalog {
             return;
         }
         let _guard = self.write_lock.lock();
-        for mut item in self.tables_by_name.iter_mut() {
-            if let Some(class_row) = self.pg_class.get(&item.oid)
-                && let Some(schema_name) = namespace_names.get(&class_row.relnamespace)
-            {
-                item.schema_name = schema_name.clone();
-            }
-        }
         for mut item in self.tables_by_oid.iter_mut() {
             if let Some(class_row) = self.pg_class.get(&item.oid)
                 && let Some(schema_name) = namespace_names.get(&class_row.relnamespace)
             {
                 item.schema_name = schema_name.clone();
             }
+        }
+        let table_entries: Vec<TableEntry> = self
+            .tables_by_oid
+            .iter()
+            .map(|item| item.value().clone())
+            .collect();
+        self.tables_by_name.clear();
+        for entry in table_entries {
+            self.tables_by_name.insert(table_entry_key(&entry), entry);
         }
         for mut item in self.enum_types_by_name.iter_mut() {
             if let Some(type_row) = self.pg_type.get(&item.oid)
@@ -2708,10 +2714,21 @@ fn fold_name(name: &str) -> String {
     name.to_ascii_lowercase()
 }
 
+fn table_entry_key(entry: &TableEntry) -> String {
+    table_lookup_key(&entry.schema_name, &entry.name)
+}
+
 impl Catalog for PersistentCatalog {
     fn lookup_table(&self, name: &str) -> Option<TableEntry> {
         let snap = self.snapshot.load();
         snap.tables.get(&fold_name(name)).cloned()
+    }
+
+    fn lookup_table_in_schema(&self, schema_name: &str, name: &str) -> Option<TableEntry> {
+        let snap = self.snapshot.load();
+        snap.tables
+            .get(&table_lookup_key(schema_name, name))
+            .cloned()
     }
 
     fn lookup_table_by_oid(&self, oid: Oid) -> Option<TableEntry> {
@@ -2745,7 +2762,7 @@ impl MutableCatalog for PersistentCatalog {
                 "cannot register table with INVALID oid",
             ));
         }
-        let key = fold_name(&entry.name);
+        let key = table_entry_key(&entry);
         let _guard = self.write_lock.lock();
         if self.tables_by_name.contains_key(&key) {
             return Err(CatalogError::already_exists(entry.name));
@@ -2831,7 +2848,7 @@ impl MutableCatalog for PersistentCatalog {
                 .get_mut(&oid)
                 .ok_or_else(|| CatalogError::not_found(format!("oid {}", oid.raw())))?;
             entry.n_blocks = n_blocks;
-            fold_name(&entry.name)
+            table_entry_key(&entry)
         };
         if let Some(mut by_name) = self.tables_by_name.get_mut(&folded) {
             by_name.n_blocks = n_blocks;
@@ -2928,8 +2945,14 @@ impl MutableCatalog for PersistentCatalog {
         new_name: &str,
     ) -> Result<TableEntry, CatalogError> {
         let old_key = fold_name(old_name);
-        let new_key = fold_name(new_name);
         let _guard = self.write_lock.lock();
+        let existing = self
+            .tables_by_name
+            .get(&old_key)
+            .ok_or_else(|| CatalogError::not_found(old_name.to_owned()))?
+            .value()
+            .clone();
+        let new_key = table_lookup_key(&existing.schema_name, new_name);
         if self.tables_by_name.contains_key(&new_key) {
             return Err(CatalogError::already_exists(new_name.to_owned()));
         }

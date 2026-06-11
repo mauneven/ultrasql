@@ -893,11 +893,7 @@ fn runtime_metadata_known_role_names(
 }
 
 fn privilege_metadata_object_key(name: &str) -> String {
-    let folded = name.trim().to_ascii_lowercase();
-    folded
-        .rsplit_once('.')
-        .map_or(folded.as_str(), |(_, last)| last)
-        .to_owned()
+    name.trim().to_ascii_lowercase()
 }
 
 fn privilege_metadata_table_has_column(
@@ -2520,10 +2516,28 @@ impl PlannerCatalog for CombinedCatalog<'_> {
         if let Some(schema) = pipeline::catalog_views::virtual_catalog_schema(name) {
             return Some(TableMeta::new(schema));
         }
-        if let Some(meta) = PlannerCatalog::lookup_table(self.snapshot, name) {
-            return Some(meta);
+        for schema_name in search_path_schema_names(self.search_path) {
+            if let Some(meta) =
+                PlannerCatalog::lookup_table_in_schema(self.snapshot, &schema_name, name)
+            {
+                return Some(meta);
+            }
+            if let Some(meta) =
+                PlannerCatalog::lookup_table_in_schema(self.fallback, &schema_name, name)
+            {
+                return Some(meta);
+            }
         }
-        self.fallback.lookup_table(name)
+        None
+    }
+
+    fn lookup_table_in_schema(&self, schema_name: &str, name: &str) -> Option<TableMeta> {
+        let table_key = ultrasql_catalog::table_lookup_key(schema_name, name);
+        if let Some(schema) = pipeline::catalog_views::virtual_catalog_schema(&table_key) {
+            return Some(TableMeta::with_schema_name(schema_name, schema));
+        }
+        PlannerCatalog::lookup_table_in_schema(self.snapshot, schema_name, name)
+            .or_else(|| PlannerCatalog::lookup_table_in_schema(self.fallback, schema_name, name))
     }
 
     fn lookup_type(&self, name: &str) -> Option<DataType> {
@@ -2561,6 +2575,16 @@ fn search_path_contains_schema(search_path: Option<&str>, schema_name: &str) -> 
             .as_deref()
             .is_some_and(|schema| schema == folded)
     })
+}
+
+fn search_path_schema_names(search_path: Option<&str>) -> Vec<String> {
+    let Some(search_path) = search_path else {
+        return vec!["public".to_owned()];
+    };
+    search_path
+        .split(',')
+        .filter_map(normalize_search_path_schema)
+        .collect()
 }
 
 fn normalize_search_path_schema(part: &str) -> Option<String> {
@@ -7102,9 +7126,10 @@ impl Server {
                     table.oid.raw()
                 ));
             }
-            if folded != &table.name.to_ascii_lowercase() {
+            let expected_key = ultrasql_catalog::table_lookup_key(&table.schema_name, &table.name);
+            if folded != &expected_key {
                 errors.push(format!(
-                    "table {} stored under non-folded key {}",
+                    "table {} stored under non-canonical key {}",
                     table.name, folded
                 ));
             }

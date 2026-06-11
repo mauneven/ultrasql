@@ -821,6 +821,7 @@ where
             }
             "search_path" => {
                 self.session_settings.remove("search_path");
+                self.plan_cache_invalidate();
                 Ok(result_encoder::run_ddl_command("RESET"))
             }
             "intervalstyle" => {
@@ -905,6 +906,7 @@ where
             "search_path" => {
                 self.session_settings
                     .insert("search_path".to_owned(), value.to_owned());
+                self.plan_cache_invalidate();
                 Ok(())
             }
             "intervalstyle" => match value.to_ascii_lowercase().as_str() {

@@ -24,7 +24,7 @@ use ultrasql_parser::ast::{
 use super::expr_bind::{coerce_literal_to_type, resolve_builtin_collation};
 use super::{
     Catalog, LogicalAlterTableAction, LogicalPlan, PlanError, ScalarExpr, ScopeStack, bind_expr,
-    bind_select, object_name_simple, validate_table_reference_namespace,
+    bind_select, lookup_table_reference, object_name_simple,
 };
 use crate::catalog::TableMeta;
 use crate::plan::{
@@ -54,7 +54,6 @@ struct RawForeignKeyConstraint {
     name: String,
     columns: Vec<String>,
     target_object: ObjectName,
-    target_table: String,
     target_columns: Vec<String>,
     on_delete: LogicalReferentialAction,
     on_update: LogicalReferentialAction,
@@ -79,7 +78,11 @@ pub(super) fn bind_create_table(
 ) -> Result<LogicalPlan, PlanError> {
     let table_name = object_name_simple(&s.name);
     let namespace = object_name_namespace(&s.name);
-    if !s.if_not_exists && catalog.lookup_table(&table_name).is_some() {
+    if !s.if_not_exists
+        && catalog
+            .lookup_table_in_schema(&namespace, &table_name)
+            .is_some()
+    {
         return Err(PlanError::DuplicateTable(table_name));
     }
     if s.columns.is_empty() {
@@ -574,8 +577,9 @@ pub(super) fn bind_create_policy(
     s: &CreatePolicyStmt,
     catalog: &dyn Catalog,
 ) -> Result<LogicalPlan, PlanError> {
-    let table_name = object_name_simple(&s.table);
-    let meta = lookup_table_object(catalog, &s.table, &table_name)?;
+    let resolved = lookup_table_reference(catalog, &s.table)?;
+    let table_name = resolved.plan_name;
+    let meta = resolved.meta;
     let using = s
         .using
         .as_ref()
@@ -701,7 +705,11 @@ pub(super) fn bind_create_materialized_view(
 ) -> Result<LogicalPlan, PlanError> {
     let table_name = object_name_simple(&s.name);
     let namespace = object_name_namespace(&s.name);
-    if !s.if_not_exists && catalog.lookup_table(&table_name).is_some() {
+    if !s.if_not_exists
+        && catalog
+            .lookup_table_in_schema(&namespace, &table_name)
+            .is_some()
+    {
         return Err(PlanError::DuplicateTable(table_name));
     }
 
@@ -800,7 +808,6 @@ fn collect_column_constraints<'a>(
                     name: named_or(name.as_ref(), || format!("{table}_{col}_fkey")),
                     columns: vec![col.clone()],
                     target_object: target_table.clone(),
-                    target_table: object_name_simple(target_table),
                     target_columns: target_columns
                         .iter()
                         .map(|c| c.value.to_ascii_lowercase())
@@ -892,7 +899,6 @@ fn collect_table_constraints<'a>(
                     name: named_or(name.as_ref(), || format!("{}_fkey", cols.join("_"))),
                     columns: cols,
                     target_object: target_table.clone(),
-                    target_table: object_name_simple(target_table),
                     target_columns: target_columns
                         .iter()
                         .map(|c| c.value.to_ascii_lowercase())
@@ -1052,7 +1058,9 @@ fn bind_foreign_key_constraints(
                 raw.target_columns.len()
             )));
         }
-        let target = lookup_table_object(catalog, &raw.target_object, &raw.target_table)?;
+        let resolved = lookup_table_reference(catalog, &raw.target_object)?;
+        let target_table = resolved.plan_name;
+        let target = resolved.meta;
         let mut columns = Vec::with_capacity(raw.columns.len());
         let mut target_columns = Vec::with_capacity(raw.target_columns.len());
         for (src, dst) in raw.columns.iter().zip(raw.target_columns.iter()) {
@@ -1075,7 +1083,7 @@ fn bind_foreign_key_constraints(
         out.push(LogicalForeignKeyConstraint {
             name: raw.name,
             columns,
-            target_table: raw.target_table,
+            target_table,
             target_columns,
             on_delete: raw.on_delete,
             on_update: raw.on_update,
@@ -1573,8 +1581,8 @@ pub(super) fn bind_comment(
 ) -> Result<LogicalPlan, PlanError> {
     let target = match &s.target {
         CommentTarget::Table(name) => {
-            let table = object_name_simple(name);
-            lookup_table_object(catalog, name, &table)?;
+            let resolved = lookup_table_reference(catalog, name)?;
+            let table = resolved.plan_name;
             LogicalCommentTarget::Table { table }
         }
         CommentTarget::Index(name) => LogicalCommentTarget::Index {
@@ -1607,8 +1615,9 @@ fn bind_comment_column_target(
         parts: name.parts[..name.parts.len() - 1].to_vec(),
         span: name.span,
     };
-    let table = object_name_simple(&table_obj);
-    let meta = lookup_table_object(catalog, &table_obj, &table)?;
+    let resolved = lookup_table_reference(catalog, &table_obj)?;
+    let table = resolved.plan_name;
+    let meta = resolved.meta;
     let Some(idx) = meta
         .schema
         .fields()
@@ -1735,8 +1744,9 @@ pub(super) fn bind_create_index(
     catalog: &dyn Catalog,
 ) -> Result<LogicalPlan, PlanError> {
     // Resolve the target table.
-    let table_name = object_name_simple(&s.table);
-    let meta = lookup_table_object(catalog, &s.table, &table_name)?;
+    let resolved = lookup_table_reference(catalog, &s.table)?;
+    let table_name = resolved.plan_name;
+    let meta = resolved.meta;
     let table_schema = &meta.schema;
 
     let method = if s.aggregating {
@@ -2218,8 +2228,8 @@ pub(super) fn bind_drop_table(
     let mut tables: Vec<String> = Vec::with_capacity(s.names.len());
     for obj in &s.names {
         let name = object_name_simple(obj);
-        if table_object_exists(catalog, obj, &name) {
-            tables.push(name);
+        if let Ok(resolved) = lookup_table_reference(catalog, obj) {
+            tables.push(resolved.plan_name);
         } else if !s.if_exists {
             return Err(PlanError::TableNotFound(name));
         }
@@ -2277,8 +2287,10 @@ pub(super) fn bind_alter_table(
     s: &AlterTableStmt,
     catalog: &dyn Catalog,
 ) -> Result<LogicalPlan, PlanError> {
-    let table_name = object_name_simple(&s.name);
-    let meta = lookup_table_object(catalog, &s.name, &table_name)?;
+    let raw_table_name = object_name_simple(&s.name);
+    let resolved = lookup_table_reference(catalog, &s.name)?;
+    let table_name = resolved.plan_name;
+    let meta = resolved.meta;
     let table_schema = &meta.schema;
 
     let action = match &s.action {
@@ -2328,7 +2340,10 @@ pub(super) fn bind_alter_table(
         }
         AlterTableAction::RenameTable { new_name, .. } => {
             let new = new_name.value.clone();
-            if catalog.lookup_table(&new.to_ascii_lowercase()).is_some() {
+            if catalog
+                .lookup_table_in_schema(&meta.schema_name, &new)
+                .is_some()
+            {
                 return Err(PlanError::DuplicateTable(new));
             }
             LogicalAlterTableAction::RenameTable { new_name: new }
@@ -2351,7 +2366,7 @@ pub(super) fn bind_alter_table(
         AlterTableAction::AddConstraint { constraint, .. } => {
             LogicalAlterTableAction::AddUniqueConstraint {
                 constraint: bind_alter_add_unique_constraint(
-                    &table_name,
+                    &raw_table_name,
                     table_schema,
                     constraint,
                 )?,
@@ -2465,10 +2480,9 @@ pub(super) fn bind_truncate(
     let mut table_names: Vec<String> = Vec::with_capacity(s.tables.len());
     for obj in &s.tables {
         let name = object_name_simple(obj);
-        if !table_object_exists(catalog, obj, &name) {
-            return Err(PlanError::TableNotFound(name));
-        }
-        table_names.push(name);
+        let resolved = lookup_table_reference(catalog, obj)
+            .map_err(|_| PlanError::TableNotFound(name.clone()))?;
+        table_names.push(resolved.plan_name);
     }
     Ok(LogicalPlan::Truncate {
         tables: table_names,
@@ -2476,22 +2490,6 @@ pub(super) fn bind_truncate(
         cascade: s.cascade,
         schema: Schema::empty(),
     })
-}
-
-fn table_object_exists(catalog: &dyn Catalog, obj: &ObjectName, name: &str) -> bool {
-    lookup_table_object(catalog, obj, name).is_ok()
-}
-
-fn lookup_table_object(
-    catalog: &dyn Catalog,
-    obj: &ObjectName,
-    name: &str,
-) -> Result<TableMeta, PlanError> {
-    let meta = catalog
-        .lookup_table(name)
-        .ok_or_else(|| PlanError::TableNotFound(name.to_owned()))?;
-    validate_table_reference_namespace(catalog, obj, name, &meta)?;
-    Ok(meta)
 }
 
 // ---------------------------------------------------------------------------
@@ -2584,8 +2582,8 @@ pub(super) fn bind_copy(s: &CopyStmt, catalog: &dyn Catalog) -> Result<LogicalPl
     let table_name = s.table.as_ref().ok_or(PlanError::NotSupported(
         "COPY requires table or query target",
     ))?;
-    let relation = object_name_simple(table_name);
-    let table_meta = lookup_table_object(catalog, table_name, &relation)?;
+    let relation = lookup_table_reference(catalog, table_name)?;
+    let table_meta = relation.meta;
 
     let columns: Vec<usize> = if s.columns.is_empty() {
         Vec::new()
@@ -2661,7 +2659,7 @@ pub(super) fn bind_copy(s: &CopyStmt, catalog: &dyn Catalog) -> Result<LogicalPl
     }
 
     Ok(LogicalPlan::Copy {
-        relation: Some(relation),
+        relation: Some(relation.plan_name),
         input: None,
         columns,
         direction,

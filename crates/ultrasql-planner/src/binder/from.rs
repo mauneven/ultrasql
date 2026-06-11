@@ -35,7 +35,7 @@ use super::ddl::resolve_type_name;
 use super::{
     Catalog, LogicalJoinCondition, LogicalJoinType, LogicalPlan, PlanError, ScalarExpr, ScopeEntry,
     ScopeStack, apply_column_aliases, bind_expr_with_ctes, bind_select_with_ctes,
-    schema_for_qualified_binding, validate_table_reference_namespace,
+    lookup_table_reference, schema_for_qualified_binding,
 };
 
 pub(super) fn bind_from(
@@ -128,7 +128,7 @@ fn bind_table_ref(
                 .last()
                 .map_or_else(String::new, |p| p.value.to_ascii_lowercase());
             let system_table_name = qualified_system_name(name);
-            let table_name = system_table_name
+            let mut table_name = system_table_name
                 .clone()
                 .unwrap_or_else(|| raw_table_name.clone());
             let qualifier = alias
@@ -141,13 +141,14 @@ fn bind_table_ref(
                 .find(|(n, _)| n.eq_ignore_ascii_case(&table_name))
             {
                 s.clone()
+            } else if system_table_name.is_none() {
+                let resolved = lookup_table_reference(catalog, name)?;
+                table_name = resolved.plan_name;
+                resolved.meta.schema
             } else {
                 let meta = catalog
                     .lookup_table(&table_name)
                     .ok_or_else(|| PlanError::TableNotFound(table_name.clone()))?;
-                if system_table_name.is_none() {
-                    validate_table_reference_namespace(catalog, name, &raw_table_name, &meta)?;
-                }
                 meta.schema
             };
 
