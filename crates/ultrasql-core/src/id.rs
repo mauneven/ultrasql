@@ -225,7 +225,20 @@ impl Lsn {
     #[inline]
     #[must_use]
     pub const fn advance(self, bytes: u64) -> Self {
-        Self(self.0 + bytes)
+        Self(self.0.saturating_add(bytes))
+    }
+
+    /// Checked advance by a number of bytes.
+    ///
+    /// Returns `None` when the requested byte range would exceed the
+    /// representable 64-bit WAL address space.
+    #[inline]
+    #[must_use]
+    pub const fn checked_advance(self, bytes: u64) -> Option<Self> {
+        match self.0.checked_add(bytes) {
+            Some(next) => Some(Self(next)),
+            None => None,
+        }
     }
 }
 
@@ -449,6 +462,14 @@ mod tests {
     fn lsn_advance() {
         let l = Lsn::new(1000);
         assert_eq!(l.advance(24).raw(), 1024);
+        assert_eq!(l.checked_advance(24), Some(Lsn::new(1024)));
+    }
+
+    #[test]
+    fn lsn_advance_saturates_and_checked_advance_rejects_overflow() {
+        let l = Lsn::new(u64::MAX);
+        assert_eq!(l.advance(1), Lsn::new(u64::MAX));
+        assert_eq!(l.checked_advance(1), None);
     }
 
     #[test]

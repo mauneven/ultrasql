@@ -4605,7 +4605,11 @@ impl Server {
         let recovered_lsn =
             ultrasql_wal::recover_with_target(&wal_dir, recovery_replay_target, |record| {
                 let current_lsn = record_lsn;
-                record_lsn = record_lsn.advance(u64::from(record.header.total_length));
+                record_lsn = record_lsn
+                    .checked_advance(u64::from(record.header.total_length))
+                    .ok_or(ultrasql_wal::RecoveryError::Record(
+                        ultrasql_wal::WalRecordError::Malformed("replay lsn overflow"),
+                    ))?;
                 ultrasql_wal::dispatch_record_at_lsn(&recovery_apply_target, record, current_lsn)
                     .map_err(|e| ultrasql_wal::RecoveryError::Applier(e.to_string()))
             })
