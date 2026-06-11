@@ -7,9 +7,9 @@
 //! the statistics layer:
 //!
 //! - **NULL** sorts *last* (consistent with PostgreSQL `NULLS LAST`).
-//! - **Numeric cross-type comparisons** widen to `f64`; integers widen
-//!   through checked conversions. Decimal values compare exactly against
-//!   other decimals.
+//! - **Numeric cross-type comparisons** compare integers exactly and
+//!   compare integer/float pairs without losing integer precision.
+//!   Decimal values compare exactly against other decimals.
 //! - **NaN** sorts last among floats.
 //! - **Mixed-type comparisons** (e.g., Int32 vs Text) fall back to a
 //!   stable discriminant ordering so the result is always a total
@@ -26,8 +26,9 @@ use ultrasql_core::{Value, bpchar_semantic_text, timetz_utc_micros};
 /// Compare two [`Value`]s under the statistics layer's total ordering.
 ///
 /// - `NULL` is greater than every non-NULL value (sorts last).
-/// - Numeric values are compared by widening to `f64`; decimal pairs compare
-///   with exact scale-aware ordering.
+/// - Numeric values compare with exact integer ordering and precision-aware
+///   integer/float ordering; decimal pairs compare with exact scale-aware
+///   ordering.
 /// - `Text` values are compared lexicographically.
 /// - `Bytea` values are compared lexicographically.
 /// - Mixed types fall back to discriminant ordering.
@@ -48,17 +49,7 @@ pub(super) fn compare_values(a: &Value, b: &Value) -> Ordering {
                 scale: right_scale,
             },
         ) => compare_decimals(*left_value, *left_scale, *right_value, *right_scale),
-        (lhs, rhs) if both_numeric(lhs, rhs) => {
-            let fa = to_f64(lhs);
-            let fb = to_f64(rhs);
-            // NaN sorts last.
-            match (fa.is_nan(), fb.is_nan()) {
-                (true, true) => Ordering::Equal,
-                (true, false) => Ordering::Greater,
-                (false, true) => Ordering::Less,
-                (false, false) => fa.partial_cmp(&fb).unwrap_or(Ordering::Equal),
-            }
-        }
+        (lhs, rhs) if both_numeric(lhs, rhs) => compare_numeric_values(lhs, rhs),
 
         (Value::Text(la), Value::Text(lb)) => la.cmp(lb),
         (Value::Char(la), Value::Char(lb)) => {
@@ -141,21 +132,11 @@ pub(super) fn value_key(v: &Value) -> Vec<u8> {
     match v {
         Value::Null => vec![0],
         Value::Bool(b) => vec![1, u8::from(*b)],
-        Value::Int16(i) => {
-            let mut out = vec![2];
-            out.extend_from_slice(&i.to_be_bytes());
-            out
-        }
-        Value::Int32(i) => {
-            let mut out = vec![3];
-            out.extend_from_slice(&i.to_be_bytes());
-            out
-        }
-        Value::Int64(i) => {
-            let mut out = vec![4];
-            out.extend_from_slice(&i.to_be_bytes());
-            out
-        }
+        Value::Int16(_)
+        | Value::Int32(_)
+        | Value::Int64(_)
+        | Value::Float32(_)
+        | Value::Float64(_) => numeric_key(v),
         Value::Oid(oid) => {
             let mut out = vec![30];
             out.extend_from_slice(&oid.raw().to_be_bytes());
@@ -174,28 +155,6 @@ pub(super) fn value_key(v: &Value) -> Vec<u8> {
         Value::PgLsn(lsn) => {
             let mut out = vec![33];
             out.extend_from_slice(&lsn.raw().to_be_bytes());
-            out
-        }
-        Value::Float32(f) => {
-            // Normalize: canonicalize NaN to a single bit pattern;
-            // use the bits directly for hashing.
-            let bits = if f.is_nan() {
-                f32::NAN.to_bits()
-            } else {
-                f.to_bits()
-            };
-            let mut out = vec![5];
-            out.extend_from_slice(&bits.to_be_bytes());
-            out
-        }
-        Value::Float64(f) => {
-            let bits = if f.is_nan() {
-                f64::NAN.to_bits()
-            } else {
-                f.to_bits()
-            };
-            let mut out = vec![6];
-            out.extend_from_slice(&bits.to_be_bytes());
             out
         }
         Value::Text(s) => {
@@ -370,6 +329,39 @@ const fn is_numeric(v: &Value) -> bool {
     )
 }
 
+fn compare_numeric_values(lhs: &Value, rhs: &Value) -> Ordering {
+    if let (Some(left), Some(right)) = (as_i64(lhs), as_i64(rhs)) {
+        return left.cmp(&right);
+    }
+
+    if let (Some(left), Some(right)) = (as_i64(lhs), as_f64(rhs)) {
+        return compare_i64_to_f64(left, right);
+    }
+
+    if let (Some(left), Some(right)) = (as_f64(lhs), as_i64(rhs)) {
+        return compare_i64_to_f64(right, left).reverse();
+    }
+
+    compare_f64_values(to_f64(lhs), to_f64(rhs))
+}
+
+fn as_i64(v: &Value) -> Option<i64> {
+    match v {
+        Value::Int16(i) => Some(i64::from(*i)),
+        Value::Int32(i) => Some(i64::from(*i)),
+        Value::Int64(i) => Some(*i),
+        _ => None,
+    }
+}
+
+fn as_f64(v: &Value) -> Option<f64> {
+    match v {
+        Value::Float32(f) => Some(f64::from(*f)),
+        Value::Float64(f) => Some(*f),
+        _ => None,
+    }
+}
+
 fn to_f64(v: &Value) -> f64 {
     match v {
         Value::Int16(i) => f64::from(*i),
@@ -389,6 +381,74 @@ fn i64_to_f64_saturating(value: i64) -> f64 {
             f64::MAX
         }
     })
+}
+
+fn compare_i64_to_f64(integer: i64, float: f64) -> Ordering {
+    if float.is_nan() {
+        return Ordering::Less;
+    }
+
+    let Some(truncated) = float.to_i64() else {
+        return if float.is_sign_negative() {
+            Ordering::Greater
+        } else {
+            Ordering::Less
+        };
+    };
+
+    match integer.cmp(&truncated) {
+        Ordering::Equal => match float.fract().partial_cmp(&0.0).unwrap_or(Ordering::Equal) {
+            Ordering::Greater => Ordering::Less,
+            Ordering::Less => Ordering::Greater,
+            Ordering::Equal => Ordering::Equal,
+        },
+        non_equal => non_equal,
+    }
+}
+
+fn compare_f64_values(left: f64, right: f64) -> Ordering {
+    match (left.is_nan(), right.is_nan()) {
+        (true, true) => Ordering::Equal,
+        (true, false) => Ordering::Greater,
+        (false, true) => Ordering::Less,
+        (false, false) => left.partial_cmp(&right).unwrap_or(Ordering::Equal),
+    }
+}
+
+fn numeric_key(v: &Value) -> Vec<u8> {
+    let mut out = vec![2];
+    if let Some(integer) = numeric_integral_i64(v) {
+        out.push(0);
+        out.extend_from_slice(&integer.to_be_bytes());
+        return out;
+    }
+
+    let float = to_f64(v);
+    if float.is_nan() {
+        out.push(2);
+        return out;
+    }
+
+    out.push(1);
+    let bits = if float == 0.0 {
+        0.0f64.to_bits()
+    } else {
+        float.to_bits()
+    };
+    out.extend_from_slice(&bits.to_be_bytes());
+    out
+}
+
+fn numeric_integral_i64(v: &Value) -> Option<i64> {
+    if let Some(integer) = as_i64(v) {
+        return Some(integer);
+    }
+
+    let float = as_f64(v)?;
+    if !float.is_finite() || float.fract() != 0.0 {
+        return None;
+    }
+    float.to_i64()
 }
 
 fn compare_decimals(l: i64, l_scale: i32, r: i64, r_scale: i32) -> Ordering {
@@ -567,6 +627,46 @@ mod tests {
         assert_eq!(
             compare_values(&Value::Int32(4), &Value::Float64(5.0)),
             Ordering::Less
+        );
+    }
+
+    #[test]
+    fn int64_values_compare_exactly_beyond_f64_precision() {
+        assert_eq!(
+            compare_values(&Value::Int64(i64::MAX - 1), &Value::Int64(i64::MAX)),
+            Ordering::Less
+        );
+        assert_eq!(
+            compare_values(&Value::Int64(i64::MAX), &Value::Int64(i64::MAX - 1)),
+            Ordering::Greater
+        );
+    }
+
+    #[test]
+    fn integer_float_comparison_preserves_i64_precision() {
+        const ABOVE_F64_EXACT_RANGE: i64 = 9_007_199_254_740_993;
+        let rounded_float = Value::Float64(9_007_199_254_740_992.0);
+        let exact_int = Value::Int64(ABOVE_F64_EXACT_RANGE);
+
+        assert_eq!(
+            compare_values(&exact_int, &rounded_float),
+            Ordering::Greater
+        );
+        assert_eq!(compare_values(&rounded_float, &exact_int), Ordering::Less);
+        assert_ne!(value_key(&exact_int), value_key(&rounded_float));
+    }
+
+    #[test]
+    fn value_key_matches_numeric_cross_type_equality() {
+        assert_eq!(
+            value_key(&Value::Int16(0)),
+            value_key(&Value::Float64(-0.0))
+        );
+        assert_eq!(value_key(&Value::Int32(5)), value_key(&Value::Float32(5.0)));
+        assert_eq!(value_key(&Value::Int64(5)), value_key(&Value::Float64(5.0)));
+        assert_eq!(
+            value_key(&Value::Float32(f32::NAN)),
+            value_key(&Value::Float64(f64::NAN))
         );
     }
 
