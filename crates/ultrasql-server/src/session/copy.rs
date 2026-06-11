@@ -1819,6 +1819,8 @@ fn append_i16_be(out: &mut Vec<u8>, v: i16) {
     out.extend_from_slice(&v.to_be_bytes());
 }
 
+const BINARY_COPY_CRITICAL_FLAGS_MASK: u32 = 0xFFFF_0000;
+
 fn decode_binary_copy_payload(
     bytes: &[u8],
     entry: &TableEntry,
@@ -1834,7 +1836,12 @@ fn decode_binary_copy_payload(
         ));
     }
     let mut pos = MAGIC.len();
-    let _flags = read_i32_be(bytes, &mut pos)?;
+    let flags = u32::from_be_bytes(read_i32_be(bytes, &mut pos)?.to_be_bytes());
+    if flags & BINARY_COPY_CRITICAL_FLAGS_MASK != 0 {
+        return Err(ServerError::CopyFormat(format!(
+            "unsupported binary COPY critical flags: {flags:#010x}"
+        )));
+    }
     let ext_len = read_i32_be(bytes, &mut pos)?;
     if ext_len < 0 {
         return Err(ServerError::CopyFormat(
@@ -2882,6 +2889,30 @@ b"#
         assert!(
             decode_binary_copy_payload(&bad_len, &entry, &[], &table_schema, &codec, &mut cache)
                 .is_err()
+        );
+    }
+
+    #[test]
+    fn binary_copy_rejects_unsupported_critical_header_flags() {
+        let table_schema = schema([Field::required("id", DataType::Int32)]);
+        let entry = entry_with_schema(table_schema.clone());
+        let codec = RowCodec::new(table_schema.clone());
+        let mut cache = JsonbShapeCache::default();
+
+        let mut encoded = Vec::new();
+        encoded.extend_from_slice(b"PGCOPY\n\xff\r\n\0");
+        encoded.extend_from_slice(&(1_i32 << 16).to_be_bytes());
+        encoded.extend_from_slice(&0_i32.to_be_bytes());
+        append_i16_be(&mut encoded, -1);
+
+        let err =
+            decode_binary_copy_payload(&encoded, &entry, &[], &table_schema, &codec, &mut cache)
+                .expect_err("unsupported critical binary COPY flags must fail closed");
+
+        assert!(
+            err.to_string()
+                .contains("unsupported binary COPY critical flags"),
+            "unexpected error: {err:?}"
         );
     }
 
