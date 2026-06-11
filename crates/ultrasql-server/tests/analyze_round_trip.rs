@@ -214,6 +214,84 @@ async fn analyze_statistics_hydrate_optimizer_after_restart() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn qualified_analyze_statistics_hydrate_under_schema_key_after_restart() {
+    let data_dir = tempfile::TempDir::new().expect("temp dir");
+
+    let running = start_persistent_server(data_dir.path(), "qualified_analyze_restart").await;
+    running
+        .client
+        .batch_execute(
+            "CREATE SCHEMA app; \
+             CREATE TABLE app.analyze_restart (id INT NOT NULL, label TEXT); \
+             INSERT INTO app.analyze_restart VALUES (1, 'alpha'), (2, 'bravo')",
+        )
+        .await
+        .expect("create and seed qualified analyze table");
+    running
+        .client
+        .batch_execute("ANALYZE app.analyze_restart")
+        .await
+        .expect("analyze qualified table");
+    let before = running
+        .server
+        .lookup_relation_stats("app.analyze_restart")
+        .expect("ANALYZE registers qualified optimizer stats before restart");
+    assert_eq!(before.row_count, 2);
+    graceful_shutdown(running).await;
+
+    let running = start_persistent_server(data_dir.path(), "qualified_analyze_restart").await;
+    let after = running
+        .server
+        .lookup_relation_stats("app.analyze_restart")
+        .expect("persistent pg_statistic rows hydrate qualified optimizer stats");
+    assert_eq!(after.table, "app.analyze_restart");
+    assert_eq!(after.row_count, 2);
+    assert!(
+        running
+            .server
+            .lookup_relation_stats("analyze_restart")
+            .is_none(),
+        "qualified stats must not hydrate under bare public key"
+    );
+
+    graceful_shutdown(running).await;
+}
+
+#[tokio::test]
+async fn autovacuum_consumes_qualified_table_modification_key() {
+    let (client, server, _conn, server_handle) = start_server_and_connect().await;
+    client
+        .batch_execute(
+            "CREATE SCHEMA app; \
+             CREATE TABLE app.auto_analyze_schema (id INT NOT NULL); \
+             INSERT INTO app.auto_analyze_schema VALUES (1), (2)",
+        )
+        .await
+        .expect("create and seed qualified autovacuum table");
+
+    server
+        .table_modifications
+        .insert("app.auto_analyze_schema".to_owned(), u64::MAX);
+    server.run_autovacuum_cycle();
+
+    assert_eq!(
+        server
+            .table_modifications
+            .get("app.auto_analyze_schema")
+            .map(|entry| *entry),
+        Some(0),
+        "autovacuum must reset qualified modification counter"
+    );
+    let stats = server
+        .lookup_relation_stats("app.auto_analyze_schema")
+        .expect("autovacuum analyze should publish qualified stats");
+    assert_eq!(stats.table, "app.auto_analyze_schema");
+    assert_eq!(stats.row_count, 2);
+
+    shutdown(client, server_handle).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn dropped_table_statistics_do_not_survive_restart() {
     let data_dir = tempfile::TempDir::new().expect("temp dir");
 

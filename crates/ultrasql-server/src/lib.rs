@@ -192,7 +192,7 @@ fn hydrate_optimizer_stats_from_catalog<L: PageLoader>(
 
         let row_count = restored_relation_row_count(table, &stat_rows, heap, txn_manager);
         catalog.register(RelationStats {
-            table: table.name.to_ascii_lowercase(),
+            table: table_entry_lookup_key(table),
             row_count,
             page_count: u64::from(table.n_blocks),
             columns,
@@ -2649,6 +2649,10 @@ fn sequence_lookup_key(schema_name: &str, sequence_name: &str) -> String {
     ultrasql_catalog::table_lookup_key(schema_name, sequence_name)
 }
 
+fn table_entry_lookup_key(entry: &TableEntry) -> String {
+    ultrasql_catalog::table_lookup_key(&entry.schema_name, &entry.name)
+}
+
 fn search_path_schema_names(search_path: Option<&str>) -> Vec<String> {
     let Some(search_path) = search_path else {
         return vec!["public".to_owned()];
@@ -4608,7 +4612,7 @@ impl Server {
         }
         let snapshot = self.catalog_snapshot();
         for entry in snapshot.tables.values() {
-            let table_name = entry.name.to_ascii_lowercase();
+            let table_name = table_entry_lookup_key(entry);
             let modified = self
                 .table_modifications
                 .get(&table_name)
@@ -4845,12 +4849,6 @@ impl Server {
             wal_writer: Some(wal_writer),
         };
         server.recover_commit_status_from_wal()?;
-        let stats_catalog = hydrate_optimizer_stats_from_catalog(
-            &server.catalog_snapshot(),
-            server.heap.as_ref(),
-            server.txn_manager.as_ref(),
-        );
-        *server.stats_catalog.write() = stats_catalog;
         server.rebuild_persistent_index_sidecars()?;
         server.rebuild_domain_runtime_constraint_sidecars()?;
         server.rebuild_table_runtime_constraint_sidecars()?;
@@ -4858,6 +4856,12 @@ impl Server {
         server.rebuild_privilege_metadata()?;
         server.rebuild_schema_metadata()?;
         server.refresh_persistent_catalog_schema_names();
+        let stats_catalog = hydrate_optimizer_stats_from_catalog(
+            &server.catalog_snapshot(),
+            server.heap.as_ref(),
+            server.txn_manager.as_ref(),
+        );
+        *server.stats_catalog.write() = stats_catalog;
         server.rebuild_sequence_owner_metadata()?;
         server.rebuild_operator_metadata()?;
         server.rebuild_row_security_sidecars()?;
