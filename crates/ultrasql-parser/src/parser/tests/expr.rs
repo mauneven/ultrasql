@@ -113,6 +113,29 @@ fn cast_expression_accepts_numeric_type_modifiers() {
 }
 
 #[test]
+fn cast_expression_preserves_qualified_and_quoted_type_name() {
+    let stmt = parse(r#"SELECT CAST('ok' AS app."mood.type") FROM t"#);
+    let Statement::Select(s) = stmt else { panic!() };
+    let SelectItem::Expr { expr, .. } = &s.projection[0] else {
+        panic!()
+    };
+    let Expr::Cast { target, .. } = expr else {
+        panic!("expected CAST expression");
+    };
+    assert_eq!(target.value, r#"app."mood.type""#);
+
+    let stmt = parse(r#"SELECT CAST('ok' AS "mood.type") FROM t"#);
+    let Statement::Select(s) = stmt else { panic!() };
+    let SelectItem::Expr { expr, .. } = &s.projection[0] else {
+        panic!()
+    };
+    let Expr::Cast { target, .. } = expr else {
+        panic!("expected CAST expression");
+    };
+    assert_eq!(target.value, r#""mood.type""#);
+}
+
+#[test]
 fn xml_parse_and_serialize_syntax_lower_to_builtin_calls() {
     let stmt = parse(
         "SELECT \

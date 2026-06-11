@@ -224,7 +224,7 @@ fn postfix_cast_accepts_schema_qualified_pg_catalog_type() {
     else {
         panic!()
     };
-    assert_eq!(outer_target.value, "text");
+    assert_eq!(outer_target.value, "pg_catalog.text");
     let Expr::PostfixCast {
         target: inner_target,
         ..
@@ -232,7 +232,7 @@ fn postfix_cast_accepts_schema_qualified_pg_catalog_type() {
     else {
         panic!()
     };
-    assert_eq!(inner_target.value, "regtype");
+    assert_eq!(inner_target.value, "pg_catalog.regtype");
 }
 
 #[test]

@@ -1126,13 +1126,29 @@ impl<'src> Parser<'src> {
     }
 
     fn parse_cast_type_name(&mut self) -> Result<Identifier, ParseError> {
-        let mut target = self.parse_type_name()?;
-        let qualified_start = target.span.start;
+        let first = self.parse_type_name()?;
+        let qualified_start = first.span.start;
+        let mut qualified_end = first.span.end;
+        let mut parts = vec![first.clone()];
         while self.peek()?.kind == TokenKind::Dot {
             self.advance()?; // .
-            target = self.parse_type_name()?;
-            target.span = Span::new(qualified_start, target.span.end);
+            let ident = self.parse_type_name()?;
+            qualified_end = ident.span.end;
+            parts.push(ident);
         }
+        let mut target = if parts.len() == 1 && !first.quoted {
+            first
+        } else {
+            Identifier {
+                value: parts
+                    .iter()
+                    .map(render_cast_type_identifier_part)
+                    .collect::<Vec<_>>()
+                    .join("."),
+                quoted: parts.iter().any(|part| part.quoted),
+                span: Span::new(qualified_start, qualified_end),
+            }
+        };
         if target.value == "double" && self.peek()?.kind == TokenKind::KwPrecision {
             let precision = self.advance()?;
             target.value = "double precision".to_owned();
@@ -1246,6 +1262,14 @@ fn single_modifier_cast_type_base(text: &str) -> Option<&'static str> {
         Some("bit varying")
     } else {
         None
+    }
+}
+
+fn render_cast_type_identifier_part(part: &Identifier) -> String {
+    if part.quoted {
+        format!("\"{}\"", part.value.replace('"', "\"\""))
+    } else {
+        part.value.clone()
     }
 }
 

@@ -3492,23 +3492,20 @@ fn parse_decimal_type_name(type_name: &str) -> Option<DataType> {
 
 fn resolve_cast_type_with_catalog(type_name: &str, catalog: &dyn Catalog) -> Option<DataType> {
     resolve_cast_type(type_name).or_else(|| {
-        type_name_namespace_and_name(type_name).map_or_else(
-            || catalog.lookup_type(type_name),
-            |(schema_name, type_name)| {
+        let parts = parse_pg_identifier_path(type_name)?;
+        match parts.as_slice() {
+            [name] => catalog.lookup_type(name),
+            [schema_name, type_name] => {
                 if schema_name.eq_ignore_ascii_case("pg_catalog")
                     && let Some(data_type) = resolve_cast_type(type_name)
                 {
                     return Some(data_type);
                 }
                 catalog.lookup_type_in_schema(schema_name, type_name)
-            },
-        )
+            }
+            _ => None,
+        }
     })
-}
-
-fn type_name_namespace_and_name(name: &str) -> Option<(&str, &str)> {
-    let (schema_name, type_name) = name.rsplit_once('.')?;
-    (!schema_name.is_empty() && !type_name.is_empty()).then_some((schema_name, type_name))
 }
 
 fn parse_network_type_name(type_name: &str) -> Option<DataType> {

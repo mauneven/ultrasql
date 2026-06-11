@@ -220,5 +220,19 @@ async fn enum_type_keys_distinguish_schema_dot_from_type_dot() {
         .expect("select dotted schema enum value");
     assert_eq!(first_col_strings(&schema_values), vec!["schema"]);
 
+    let app_cast_values = running
+        .client
+        .simple_query("SELECT CAST('app' AS app.\"mood.type\")")
+        .await
+        .expect("cast to dotted enum type name");
+    assert_eq!(first_col_strings(&app_cast_values), vec!["app"]);
+
+    let schema_cast_values = running
+        .client
+        .simple_query("SELECT CAST('schema' AS \"app.mood\".type)")
+        .await
+        .expect("cast to dotted schema enum type");
+    assert_eq!(first_col_strings(&schema_cast_values), vec!["schema"]);
+
     shutdown(running).await;
 }
