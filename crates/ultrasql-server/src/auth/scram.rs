@@ -187,6 +187,7 @@ enum ScramState {
     /// `server-first-message` sent; waiting for `client-final-message`.
     WaitingForClientFinal {
         server_nonce: String,
+        client_first_gs2_header: String,
         client_first_message_bare: String,
         server_first_message: String,
     },
@@ -261,12 +262,13 @@ impl ScramSha256Server {
         let text = std::str::from_utf8(client_first)
             .map_err(|_| AuthError::BadClientFirst("not valid UTF-8"))?;
 
-        // Strip GS2 header: everything up to and including the second comma.
-        // PostgreSQL sends "n,," as the GS2 header for no channel binding.
-        let bare = strip_gs2_header(text)?;
+        // Strip and validate the GS2 header. PostgreSQL sends "n,," for
+        // no channel binding; "y,," is also valid when a client supports
+        // channel binding but this mechanism is not SCRAM-*-PLUS.
+        let parsed_first = parse_client_first_message(text)?;
 
         // Extract the client nonce (r= attribute).
-        let client_nonce = extract_attribute(bare, "r=")
+        let client_nonce = extract_attribute(parsed_first.bare, "r=")
             .ok_or(AuthError::BadClientFirst("missing r= attribute"))?;
 
         // Build server nonce: client_nonce + random server suffix.
@@ -281,7 +283,8 @@ impl ScramSha256Server {
 
         self.state = ScramState::WaitingForClientFinal {
             server_nonce,
-            client_first_message_bare: bare.to_owned(),
+            client_first_gs2_header: parsed_first.gs2_header.to_owned(),
+            client_first_message_bare: parsed_first.bare.to_owned(),
             server_first_message: server_first.clone(),
         };
 
@@ -301,13 +304,20 @@ impl ScramSha256Server {
     /// verify. Returns [`AuthError::BadClientFinal`] or
     /// [`AuthError::NonceMismatch`] on malformed input.
     pub fn server_final(&mut self, client_final: &[u8]) -> Result<Vec<u8>, AuthError> {
-        let (server_nonce, client_first_message_bare, server_first_message) = match &self.state {
+        let (
+            server_nonce,
+            client_first_gs2_header,
+            client_first_message_bare,
+            server_first_message,
+        ) = match &self.state {
             ScramState::WaitingForClientFinal {
                 server_nonce,
+                client_first_gs2_header,
                 client_first_message_bare,
                 server_first_message,
             } => (
                 server_nonce.clone(),
+                client_first_gs2_header.clone(),
                 client_first_message_bare.clone(),
                 server_first_message.clone(),
             ),
@@ -330,6 +340,13 @@ impl ScramSha256Server {
             .ok_or(AuthError::BadClientFinal("missing p= attribute"))?;
         let client_final_without_proof = &text[..proof_pos];
         let proof_b64 = &text[proof_pos + 3..];
+
+        let channel_binding = extract_attribute(client_final_without_proof, "c=")
+            .ok_or(AuthError::BadClientFinal("missing c= attribute"))?;
+        let expected_channel_binding = B64.encode(client_first_gs2_header);
+        if channel_binding != expected_channel_binding {
+            return Err(AuthError::BadClientFinal("channel binding mismatch"));
+        }
 
         // Verify nonce.
         let nonce_in_final = extract_attribute(client_final_without_proof, "r=")
@@ -381,25 +398,46 @@ impl ScramSha256Server {
 
 // ── Parsing helpers ───────────────────────────────────────────────────────────
 
-/// Strip the GS2 header (everything up to and including the second
-/// comma) from a `client-first-message`, returning the bare portion.
-fn strip_gs2_header(msg: &str) -> Result<&str, AuthError> {
-    // GS2 header is "n,," or "y,," or "p=<cbname>,<authzid>," etc.
-    // We find the second comma.
+struct ClientFirstMessage<'a> {
+    gs2_header: &'a str,
+    bare: &'a str,
+}
+
+/// Validate the GS2 header and return the bare client-first message.
+fn parse_client_first_message(msg: &str) -> Result<ClientFirstMessage<'_>, AuthError> {
+    // Some test clients omit the GS2 header; treat that as the standard
+    // no-channel-binding header so client-final `c=` still verifies.
     let mut commas = 0usize;
     for (i, ch) in msg.char_indices() {
         if ch == ',' {
             commas += 1;
             if commas == 2 {
-                return Ok(&msg[i + 1..]);
+                let header = &msg[..=i];
+                validate_gs2_header(header)?;
+                return Ok(ClientFirstMessage {
+                    gs2_header: header,
+                    bare: &msg[i + 1..],
+                });
             }
         }
     }
-    // No GS2 header — treat as bare already (some test clients omit it).
     if commas == 0 {
-        return Ok(msg);
+        return Ok(ClientFirstMessage {
+            gs2_header: "n,,",
+            bare: msg,
+        });
     }
     Err(AuthError::BadClientFirst("malformed GS2 header"))
+}
+
+fn validate_gs2_header(header: &str) -> Result<(), AuthError> {
+    match header {
+        "n,," | "y,," => Ok(()),
+        _ if header.starts_with("p=") => {
+            Err(AuthError::BadClientFirst("unsupported channel binding"))
+        }
+        _ => Err(AuthError::BadClientFirst("unsupported GS2 header")),
+    }
 }
 
 /// Find the value of a `key=value` attribute within a SCRAM message
@@ -522,6 +560,22 @@ mod tests {
         client_first_bare: &str,
         server_first: &str,
     ) -> String {
+        client_final_with_channel_binding(
+            password,
+            client_nonce,
+            client_first_bare,
+            server_first,
+            "n,,",
+        )
+    }
+
+    fn client_final_with_channel_binding(
+        password: &str,
+        client_nonce: &str,
+        client_first_bare: &str,
+        server_first: &str,
+        gs2_header: &str,
+    ) -> String {
         // Parse server-first-message to get the full nonce, salt, and iter.
         let server_nonce = extract_attribute(server_first, "r=").expect("r=");
         let salt_b64 = extract_attribute(server_first, "s=").expect("s=");
@@ -558,7 +612,7 @@ mod tests {
         };
 
         // client-final-message-without-proof
-        let cbind_input = B64.encode("n,,"); // GS2 header base64-encoded
+        let cbind_input = B64.encode(gs2_header); // GS2 header base64-encoded
         let cfm_without_proof = format!("c={cbind_input},r={server_nonce}");
 
         // AuthMessage = client-first-message-bare + "," +
@@ -688,5 +742,49 @@ mod tests {
             matches!(err, AuthError::NonceMismatch | AuthError::BadClientFinal(_)),
             "unexpected error: {err}"
         );
+    }
+
+    #[test]
+    fn unsupported_channel_binding_gs2_header_returns_error() {
+        let ph = hash_password("pw", b"salt_16_bytes___", DEFAULT_ITERATIONS);
+        let mut server =
+            ScramSha256Server::new(ph.stored_key, ph.server_key, ph.salt.clone(), ph.iterations);
+
+        let err = server
+            .server_first(b"p=tls-server-end-point,,n=user,r=nonce")
+            .expect_err("unsupported channel binding header must fail");
+        assert_eq!(
+            err,
+            AuthError::BadClientFirst("unsupported channel binding")
+        );
+    }
+
+    #[test]
+    fn mismatched_channel_binding_returns_error_even_with_valid_proof() {
+        let password = "s3cr3t_pw";
+        let salt = b"random_salt_16by";
+        let ph = hash_password(password, salt, DEFAULT_ITERATIONS);
+        let mut server =
+            ScramSha256Server::new(ph.stored_key, ph.server_key, ph.salt.clone(), ph.iterations);
+
+        let client_nonce = "client_nonce_cb";
+        let c_first = client_first("alice", client_nonce);
+        let s_first_bytes = server
+            .server_first(c_first.as_bytes())
+            .expect("server_first ok");
+        let s_first = String::from_utf8(s_first_bytes).expect("utf8");
+
+        let c_final = client_final_with_channel_binding(
+            password,
+            client_nonce,
+            "n=alice,r=client_nonce_cb",
+            &s_first,
+            "p=tls-server-end-point,,",
+        );
+
+        let err = server
+            .server_final(c_final.as_bytes())
+            .expect_err("unsupported channel binding must fail");
+        assert_eq!(err, AuthError::BadClientFinal("channel binding mismatch"));
     }
 }
