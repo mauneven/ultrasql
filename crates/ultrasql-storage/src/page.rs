@@ -596,7 +596,13 @@ impl Page {
         }
         let off = item_field_to_usize(id.offset(), "tuple offset")?;
         let len = item_field_to_usize(id.length(), "tuple length")?;
-        Ok(&self.bytes[off..off + len])
+        let end = off
+            .checked_add(len)
+            .ok_or(PageError::Malformed("tuple range overflow"))?;
+        if off < usize::from(header.upper) || end > usize::from(header.special) {
+            return Err(PageError::Malformed("tuple range out of bounds"));
+        }
+        Ok(&self.bytes[off..end])
     }
 
     /// Mark a tuple dead. The slot remains allocated; the data is left
@@ -921,6 +927,25 @@ mod tests {
         );
 
         let err = page.compact().unwrap_err();
+
+        assert!(matches!(
+            err,
+            PageError::Malformed("tuple range out of bounds")
+        ));
+    }
+
+    #[test]
+    fn read_tuple_rejects_malformed_live_tuple_range() {
+        let mut page = Page::new_heap();
+        let slot = page.insert_tuple(b"ok").unwrap();
+        let item_off = Page::item_id_offset(slot);
+        let malformed = ItemId::new(8_000, 500, ItemIdFlags::Normal);
+        write_u32_le(
+            &mut page.as_bytes_mut()[item_off..item_off + ITEMID_SIZE],
+            malformed.into_raw(),
+        );
+
+        let err = page.read_tuple(slot).unwrap_err();
 
         assert!(matches!(
             err,
