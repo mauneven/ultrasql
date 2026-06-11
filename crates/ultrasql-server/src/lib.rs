@@ -5676,12 +5676,7 @@ impl Server {
         let mut default_grants = Vec::new();
         let mut seen_grant_keys = std::collections::HashSet::new();
         let mut seen_default_grant_keys = std::collections::HashSet::new();
-        let known_roles = self
-            .role_catalog
-            .list_roles()
-            .into_iter()
-            .map(|role| role.name)
-            .collect::<std::collections::HashSet<_>>();
+        let known_roles = runtime_metadata_known_role_names(&self.role_catalog);
         let snapshot = self.catalog_snapshot();
         for (line_no, line) in text.lines().enumerate() {
             if line.is_empty() || line.starts_with('#') {
@@ -6189,12 +6184,7 @@ impl Server {
             std::collections::HashMap::new();
         let mut seen_table_oids = std::collections::HashSet::new();
         let mut seen_policy_keys = std::collections::HashSet::new();
-        let known_roles = self
-            .role_catalog
-            .list_roles()
-            .into_iter()
-            .map(|role| role.name)
-            .collect::<std::collections::HashSet<_>>();
+        let known_roles = runtime_metadata_known_role_names(&self.role_catalog);
         for (line_no, line) in text.lines().enumerate() {
             if line.is_empty() || line.starts_with('#') {
                 continue;
@@ -6226,6 +6216,13 @@ impl Server {
                     } else {
                         String::new()
                     };
+                    if !owner_role.is_empty() && !known_roles.contains(&owner_role) {
+                        return Err(ServerError::Ddl(format!(
+                            "unknown RLS table metadata owner '{}' on line {}",
+                            owner_role,
+                            line_no + 1
+                        )));
+                    }
                     let entry = rows
                         .entry(oid)
                         .or_insert_with(|| (String::new(), TableRowSecurity::default()));

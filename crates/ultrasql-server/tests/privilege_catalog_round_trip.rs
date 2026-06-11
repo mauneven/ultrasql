@@ -1661,6 +1661,37 @@ async fn privilege_catalog_survives_restart() {
     shutdown(running).await;
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn privilege_metadata_accepts_uncataloged_trust_grantor_on_rebuild() {
+    let data_dir = tempfile::TempDir::new().expect("temp data dir");
+
+    let running = start_persistent_server(data_dir.path(), "trust_grantor_setup").await;
+    running
+        .client
+        .batch_execute(
+            "CREATE ROLE analyst LOGIN; \
+             CREATE TABLE trust_grantor_acl (id INT); \
+             GRANT SELECT ON TABLE trust_grantor_acl TO analyst",
+        )
+        .await
+        .expect("trust-mode grant persists grantor");
+    shutdown(running).await;
+
+    let running = start_persistent_server(data_dir.path(), "trust_grantor_verify").await;
+    let visible = running
+        .client
+        .query_one(
+            "SELECT has_table_privilege('analyst', 'trust_grantor_acl', 'SELECT')",
+            &[],
+        )
+        .await
+        .expect("grant survives restart with trust grantor")
+        .get::<_, bool>(0);
+    assert!(visible, "trust-mode grantor metadata should rebuild");
+
+    shutdown(running).await;
+}
+
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn privilege_catalog_rolls_back_when_metadata_slot_is_unsafe() {
