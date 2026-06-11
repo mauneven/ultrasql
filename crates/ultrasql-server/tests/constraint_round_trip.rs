@@ -981,6 +981,41 @@ async fn drop_table_restricts_and_cascade_drops_foreign_key_dependency() {
     graceful_shutdown(running).await;
 }
 
+#[tokio::test]
+async fn drop_table_allows_qualified_parent_and_child_together() {
+    let running = start_sample_server("constraint_drop_qualified_pair").await;
+    let client = &running.client;
+
+    client
+        .batch_execute(
+            "CREATE SCHEMA app; \
+             CREATE TABLE app.fk_drop_parent (id INT PRIMARY KEY); \
+             CREATE TABLE app.fk_drop_child (\
+                parent_id INT REFERENCES app.fk_drop_parent(id)\
+             )",
+        )
+        .await
+        .expect("create qualified parent and child");
+
+    client
+        .batch_execute("DROP TABLE app.fk_drop_parent, app.fk_drop_child")
+        .await
+        .expect("drop parent and child together");
+
+    let parent_err = client
+        .query("SELECT id FROM app.fk_drop_parent", &[])
+        .await
+        .expect_err("parent table dropped");
+    assert_eq!(parent_err.code().expect("SQLSTATE").code(), "42P01");
+    let child_err = client
+        .query("SELECT parent_id FROM app.fk_drop_child", &[])
+        .await
+        .expect_err("child table dropped");
+    assert_eq!(child_err.code().expect("SQLSTATE").code(), "42P01");
+
+    graceful_shutdown(running).await;
+}
+
 /// `ON DELETE CASCADE` removes referencing child rows and keeps child
 /// indexes in sync.
 #[tokio::test]

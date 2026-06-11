@@ -35,6 +35,10 @@ const COLUMN_COLLATION_OPTION_PREFIX: &str = "ultrasql.attcollation.";
 
 const PG_OID_INT8: u32 = 20;
 
+fn table_entry_lookup_key(entry: &TableEntry) -> String {
+    ultrasql_catalog::table_lookup_key(&entry.schema_name, &entry.name)
+}
+
 struct CreateIndexProgressGuard<'a> {
     recorder: &'a crate::workload::WorkloadRecorder,
     pid: u32,
@@ -2210,7 +2214,7 @@ where
             let Some(table) = snapshot.tables_by_oid.get(&table_oid) else {
                 continue;
             };
-            if drop_set.contains(&table.name.to_ascii_lowercase()) {
+            if drop_set.contains(&table_entry_lookup_key(table)) {
                 continue;
             }
             for fk in &item.value().foreign_keys {
@@ -2274,7 +2278,7 @@ where
             let Some(table) = snapshot.tables_by_oid.get(&table_oid) else {
                 continue;
             };
-            if drop_set.contains(&table.name.to_ascii_lowercase()) {
+            if drop_set.contains(&table_entry_lookup_key(table)) {
                 continue;
             }
             if item
