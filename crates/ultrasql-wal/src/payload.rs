@@ -72,12 +72,35 @@ pub enum PayloadError {
     #[error("payload malformed: {0}")]
     Malformed(&'static str),
 
+    /// The byte slice contains bytes beyond the payload's declared layout.
+    #[error("payload has trailing bytes: expected {expected}, have {have}")]
+    Trailing {
+        /// Exact byte length required by the payload layout.
+        expected: usize,
+        /// Bytes supplied by the caller.
+        have: usize,
+    },
+
     /// A [`HeapUpdatePayload`] record has reserved flag bits set.
     ///
     /// Bit 0 is the HOT flag; all higher bits are reserved and must be zero.
     /// If they are non-zero the record was written by an unknown encoder.
     #[error("payload flags reserved bits set: {0:#010b}")]
     FlagsReserved(u8),
+}
+
+fn require_exact_len(bytes: &[u8], expected: usize) -> Result<(), PayloadError> {
+    match bytes.len().cmp(&expected) {
+        std::cmp::Ordering::Less => Err(PayloadError::Truncated {
+            needed: expected,
+            have: bytes.len(),
+        }),
+        std::cmp::Ordering::Equal => Ok(()),
+        std::cmp::Ordering::Greater => Err(PayloadError::Trailing {
+            expected,
+            have: bytes.len(),
+        }),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -241,6 +264,7 @@ impl HeapInsertPayload {
                 have: bytes.len(),
             });
         }
+        require_exact_len(bytes, needed)?;
         Ok(Self {
             tid,
             tuple_bytes: bytes[FIXED..needed].to_vec(),
@@ -351,6 +375,7 @@ impl HeapUpdatePayload {
                 have: bytes.len(),
             });
         }
+        require_exact_len(bytes, needed)?;
         Ok(Self {
             old_tid,
             new_tid,
@@ -467,6 +492,7 @@ impl HeapUpdateInPlacePayload {
                 have: bytes.len(),
             });
         }
+        require_exact_len(bytes, needed)?;
         let pre_off = FIXED;
         let post_off = FIXED + pre_len;
         Ok(Self {
@@ -643,6 +669,7 @@ impl HeapUpdateInPlaceBatchPayload {
                 have: bytes.len(),
             });
         }
+        require_exact_len(bytes, needed)?;
 
         let mut entries = Vec::with_capacity(entry_count);
         let mut off = Self::FIXED;
@@ -789,6 +816,7 @@ impl HeapDeletePayload {
             read_u32_le(&bytes[TID_SIZE + 8..TID_SIZE + 12])
                 .map_err(|_| PayloadError::Malformed("heap_delete cmax"))?,
         );
+        require_exact_len(bytes, SIZE)?;
         Ok(Self { tid, xmax, cmax })
     }
 }
@@ -842,6 +870,7 @@ impl CommitPayload {
             Lsn::new(read_u64_le(&bytes[0..8]).map_err(|_| PayloadError::Malformed("commit lsn"))?);
         let commit_timestamp_micros =
             read_u64_le(&bytes[8..16]).map_err(|_| PayloadError::Malformed("commit timestamp"))?;
+        require_exact_len(bytes, 16)?;
         Ok(Self {
             commit_lsn,
             commit_timestamp_micros,
@@ -890,6 +919,7 @@ impl AbortPayload {
         }
         let abort_lsn =
             Lsn::new(read_u64_le(&bytes[0..8]).map_err(|_| PayloadError::Malformed("abort lsn"))?);
+        require_exact_len(bytes, 8)?;
         Ok(Self { abort_lsn })
     }
 }
@@ -955,6 +985,7 @@ impl CheckpointPayload {
         let next_xid = Xid::new(
             read_u64_le(&bytes[16..24]).map_err(|_| PayloadError::Malformed("ckpt next_xid"))?,
         );
+        require_exact_len(bytes, 24)?;
         Ok(Self {
             redo_from,
             oldest_in_progress,
@@ -1046,6 +1077,7 @@ impl FullPageWritePayload {
                 have: bytes.len(),
             });
         }
+        require_exact_len(bytes, needed)?;
         Ok(Self {
             page,
             page_bytes: bytes[FIXED..needed].to_vec(),
@@ -1224,6 +1256,7 @@ impl BTreeOpPayload {
                 have: bytes.len(),
             });
         }
+        require_exact_len(bytes, cv_end)?;
         let child_or_value = bytes[key_end + 4..cv_end].to_vec();
         Ok(Self {
             op,
@@ -1393,6 +1426,7 @@ impl HashOpPayload {
                 have: bytes.len(),
             });
         }
+        require_exact_len(bytes, value_end)?;
         Ok(Self {
             op,
             index_rel,
@@ -1575,6 +1609,7 @@ impl HnswOpPayload {
                 have: bytes.len(),
             });
         }
+        require_exact_len(bytes, needed)?;
         let mut vector = Vec::with_capacity(vector_len);
         for chunk in bytes[FIXED..needed].chunks_exact(std::mem::size_of::<f32>()) {
             let value = f32::from_le_bytes(
@@ -1775,6 +1810,7 @@ impl IvfFlatOpPayload {
                 have: bytes.len(),
             });
         }
+        require_exact_len(bytes, needed)?;
         let mut vector = Vec::with_capacity(vector_len);
         for chunk in bytes[FIXED..needed].chunks_exact(std::mem::size_of::<f32>()) {
             let value = f32::from_le_bytes(
@@ -1989,6 +2025,7 @@ impl SequenceOpPayload {
                 "sequence_op reserved suffix bytes must be zero",
             ));
         }
+        require_exact_len(bytes, needed)?;
         Ok(Self {
             op,
             seqrelid,
@@ -2045,6 +2082,207 @@ mod tests {
     fn finite_f32_vec(max_len: usize) -> impl Strategy<Value = Vec<f32>> {
         proptest::collection::vec(-10_000_i16..=10_000_i16, 0..max_len)
             .prop_map(|values| values.into_iter().map(f32::from).collect())
+    }
+
+    fn assert_trailing_rejected<T: std::fmt::Debug>(
+        mut bytes: Vec<u8>,
+        decode: impl FnOnce(&[u8]) -> Result<T, PayloadError>,
+    ) {
+        let expected = bytes.len();
+        bytes.push(0x5a);
+        let err = decode(&bytes).expect_err("trailing bytes must fail");
+        assert!(matches!(
+            err,
+            PayloadError::Trailing {
+                expected: got_expected,
+                have,
+            } if got_expected == expected && have == expected + 1
+        ));
+    }
+
+    #[test]
+    fn payload_decoders_reject_trailing_bytes() {
+        assert_trailing_rejected(
+            HeapInsertPayload {
+                tid: tid(1, 2, 3),
+                tuple_bytes: vec![1, 2, 3],
+            }
+            .encode()
+            .expect("encode"),
+            HeapInsertPayload::decode,
+        );
+
+        assert_trailing_rejected(
+            HeapUpdatePayload {
+                old_tid: tid(1, 2, 3),
+                new_tid: tid(1, 2, 4),
+                flags: HEAP_UPDATE_HOT,
+                new_tuple_bytes: vec![4, 5, 6],
+            }
+            .encode()
+            .expect("encode"),
+            HeapUpdatePayload::decode,
+        );
+
+        assert_trailing_rejected(
+            HeapUpdateInPlacePayload {
+                tid: tid(1, 2, 3),
+                writer_xid: Xid::new(11),
+                command_id: CommandId::new(2),
+                pre_image_bytes: vec![1, 2],
+                post_image_bytes: vec![3, 4],
+            }
+            .encode()
+            .expect("encode"),
+            HeapUpdateInPlacePayload::decode,
+        );
+
+        assert_trailing_rejected(
+            HeapUpdateInPlaceBatchPayload {
+                page: page_id(1, 2),
+                writer_xid: Xid::new(11),
+                command_id: CommandId::new(2),
+                entries: vec![HeapUpdateInPlaceBatchEntry {
+                    slot: 3,
+                    pre_image: [1; HeapUpdateInPlaceBatchPayload::IMAGE_LEN],
+                    post_image: [2; HeapUpdateInPlaceBatchPayload::IMAGE_LEN],
+                }],
+            }
+            .encode()
+            .expect("encode"),
+            HeapUpdateInPlaceBatchPayload::decode,
+        );
+
+        assert_trailing_rejected(
+            HeapDeletePayload {
+                tid: tid(1, 2, 3),
+                xmax: Xid::new(11),
+                cmax: CommandId::new(2),
+            }
+            .encode()
+            .expect("encode"),
+            HeapDeletePayload::decode,
+        );
+
+        assert_trailing_rejected(
+            HeapDeleteInPlacePayload {
+                tid: tid(1, 2, 3),
+                xmax: Xid::new(11),
+                cmax: CommandId::new(2),
+            }
+            .encode()
+            .expect("encode"),
+            HeapDeleteInPlacePayload::decode,
+        );
+
+        assert_trailing_rejected(
+            CommitPayload {
+                commit_lsn: Lsn::new(123),
+                commit_timestamp_micros: 456,
+            }
+            .encode(),
+            CommitPayload::decode,
+        );
+
+        assert_trailing_rejected(
+            AbortPayload {
+                abort_lsn: Lsn::new(123),
+            }
+            .encode(),
+            AbortPayload::decode,
+        );
+
+        assert_trailing_rejected(
+            CheckpointPayload {
+                redo_from: Lsn::new(100),
+                oldest_in_progress: Xid::new(10),
+                next_xid: Xid::new(20),
+            }
+            .encode(),
+            CheckpointPayload::decode,
+        );
+
+        assert_trailing_rejected(
+            FullPageWritePayload {
+                page: page_id(1, 2),
+                page_bytes: full_page(),
+            }
+            .encode()
+            .expect("encode"),
+            FullPageWritePayload::decode,
+        );
+
+        assert_trailing_rejected(
+            BTreeOpPayload {
+                op: BTreeOpKind::Insert,
+                index_rel: RelationId::new(7),
+                page: page_id(7, 2),
+                key_bytes: vec![1, 2],
+                child_or_value: vec![3, 4],
+            }
+            .encode()
+            .expect("encode"),
+            BTreeOpPayload::decode,
+        );
+
+        assert_trailing_rejected(
+            HashOpPayload {
+                op: HashOpKind::Insert,
+                index_rel: RelationId::new(7),
+                bucket: 3,
+                page: page_id(7, 2),
+                key_hash: 99,
+                key_bytes: vec![1, 2],
+                value_bytes: vec![3, 4],
+            }
+            .encode()
+            .expect("encode"),
+            HashOpPayload::decode,
+        );
+
+        assert_trailing_rejected(
+            HnswOpPayload {
+                op: HnswOpKind::Insert,
+                index_rel: RelationId::new(7),
+                tid: tid(1, 2, 3),
+                vector: vec![1.0, 2.0],
+            }
+            .encode()
+            .expect("encode"),
+            HnswOpPayload::decode,
+        );
+
+        assert_trailing_rejected(
+            IvfFlatOpPayload {
+                op: IvfFlatOpKind::Insert,
+                index_rel: RelationId::new(7),
+                tid: tid(1, 2, 3),
+                list_id: 4,
+                vector: vec![1.0, 2.0],
+            }
+            .encode()
+            .expect("encode"),
+            IvfFlatOpPayload::decode,
+        );
+
+        assert_trailing_rejected(
+            SequenceOpPayload {
+                op: SequenceOpKind::Advance,
+                seqrelid: RelationId::new(9),
+                name: "seq".to_owned(),
+                start_value: 1,
+                last_value: 2,
+                min_value: 1,
+                max_value: 10,
+                increment: 1,
+                cache_size: 1,
+                is_called: true,
+                cycle: false,
+            }
+            .encode()
+            .expect("encode"),
+            SequenceOpPayload::decode,
+        );
     }
 
     // ── HeapInsertPayload ─────────────────────────────────────────────────
