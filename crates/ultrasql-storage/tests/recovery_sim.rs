@@ -113,6 +113,7 @@ fn insert_opts(xid: Xid, sink: &dyn ultrasql_storage::wal_sink::WalSink) -> Inse
     InsertOptions {
         xmin: xid,
         command_id: CommandId::FIRST,
+        n_atts: 2,
         wal: Some(sink),
         fsm: None,
         vm: None,

@@ -29,6 +29,27 @@ use crate::persistent::{
     SequenceRow, StatisticExtRow, StatisticRow, TypeRow,
 };
 
+/// Physical field count emitted by [`ClassRow::encode`].
+pub const CLASS_ROW_N_ATTS: u16 = 9;
+/// Physical field count emitted by [`encode_attribute_row`].
+pub const ATTRIBUTE_ROW_N_ATTS: u16 = 9;
+/// Physical field count emitted by [`encode_type_row`].
+pub const TYPE_ROW_N_ATTS: u16 = 7;
+/// Physical field count emitted by [`encode_enum_row`].
+pub const ENUM_ROW_N_ATTS: u16 = 4;
+/// Physical field count emitted by [`encode_index_row`].
+pub const INDEX_ROW_N_ATTS: u16 = 10;
+/// Physical field count emitted by [`encode_constraint_row`].
+pub const CONSTRAINT_ROW_N_ATTS: u16 = 9;
+/// Physical field count emitted by [`encode_sequence_row`].
+pub const SEQUENCE_ROW_N_ATTS: u16 = 8;
+/// Physical field count emitted by [`encode_description_row`].
+pub const DESCRIPTION_ROW_N_ATTS: u16 = 5;
+/// Physical field count emitted by [`encode_statistic_row`].
+pub const STATISTIC_ROW_N_ATTS: u16 = 4;
+/// Physical field count emitted by [`encode_statistic_ext_row`].
+pub const STATISTIC_EXT_ROW_N_ATTS: u16 = 5;
+
 /// Errors raised while writing a row to bytes.
 #[derive(Debug, thiserror::Error)]
 pub enum EncodeError {

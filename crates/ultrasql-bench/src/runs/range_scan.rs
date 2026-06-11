@@ -63,6 +63,7 @@ fn build_heap(n: usize) -> (Arc<BufferPool<BlankLoader>>, HeapAccess<BlankLoader
     let opts = InsertOptions {
         xmin: Xid::FIRST_USER,
         command_id: CommandId::FIRST,
+        n_atts: 2,
         wal: None,
         fsm: None,
         vm: None,

@@ -89,11 +89,11 @@ impl<L: PageLoader> HeapAccess<L> {
         old_tid: TupleId,
         new_payload: &[u8],
         opts: UpdateOptions<'_>,
-        n_atts: u16,
         new_tuple_size: usize,
     ) -> Result<Option<TupleId>, HeapError> {
         let new_tid = {
             let mut page = guard.write();
+            let n_atts;
 
             // Verify the old tuple is alive before touching anything.
             {
@@ -106,6 +106,7 @@ impl<L: PageLoader> HeapAccess<L> {
                 if !hdr.is_alive() {
                     return Err(HeapError::MalformedHeader("update on deleted tuple"));
                 }
+                n_atts = hdr.n_atts;
             }
 
             // Check whether there is room for the new version on this page.
@@ -194,22 +195,15 @@ impl<L: PageLoader> HeapAccess<L> {
         old_tid: TupleId,
         new_payload: &[u8],
         opts: UpdateOptions<'_>,
-        n_atts: u16,
         new_tuple_size: usize,
         scratch: &mut Vec<u8>,
     ) -> Result<Option<TupleId>, HeapError> {
-        // Free-space precheck — avoid building the new tuple and
-        // entering `insert_tuple_appended` only to bounce back.
-        let free = page.header().free_space();
-        if free < new_tuple_size + crate::page::ITEMID_SIZE {
-            return Ok(None);
-        }
-
         // Verify old tuple alive by reading xmax (bytes 8..16) directly.
         let (old_off, old_len) = Self::slot_window(page.as_bytes_mut(), old_tid.slot)?;
         if old_len < TUPLE_HEADER_SIZE {
             return Err(HeapError::MalformedHeader("old slot shorter than header"));
         }
+        let n_atts;
         {
             let bytes = page.as_bytes_mut();
             let xmax_at = old_off + 8;
@@ -217,6 +211,14 @@ impl<L: PageLoader> HeapAccess<L> {
             if existing_xmax != 0 {
                 return Err(HeapError::MalformedHeader("update on deleted tuple"));
             }
+            n_atts = read_u16_le(bytes, old_off + 26)?;
+        }
+
+        // Free-space precheck — avoid building the new tuple and
+        // entering `insert_tuple_appended` only to bounce back.
+        let free = page.header().free_space();
+        if free < new_tuple_size + crate::page::ITEMID_SIZE {
+            return Ok(None);
         }
 
         // Build the new tuple bytes into the caller-provided scratch.
@@ -499,4 +501,15 @@ fn read_u64_le(bytes: &[u8], offset: usize) -> Result<u64, HeapError> {
     Ok(u64::from_le_bytes([
         window[0], window[1], window[2], window[3], window[4], window[5], window[6], window[7],
     ]))
+}
+
+#[inline]
+fn read_u16_le(bytes: &[u8], offset: usize) -> Result<u16, HeapError> {
+    let end = offset
+        .checked_add(2)
+        .ok_or(HeapError::MalformedHeader("u16 field offset overflow"))?;
+    let window = bytes
+        .get(offset..end)
+        .ok_or(HeapError::MalformedHeader("u16 field outside tuple"))?;
+    Ok(u16::from_le_bytes([window[0], window[1]]))
 }

@@ -423,6 +423,7 @@ pub(super) fn build_index_fixture(
         let opts = InsertOptions {
             xmin: txn.xid,
             command_id: CommandId::FIRST,
+            n_atts: 2,
             wal: None,
             fsm: None,
             vm: None,

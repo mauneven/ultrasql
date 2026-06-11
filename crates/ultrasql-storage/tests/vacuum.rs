@@ -145,6 +145,7 @@ fn vacuum_undo_log_drops_only_below_threshold() {
             InsertOptions {
                 xmin: Xid::new(1),
                 command_id: CommandId::FIRST,
+                n_atts: 2,
                 wal: None,
                 fsm: None,
                 vm: None,
@@ -221,6 +222,7 @@ fn vacuum_undo_log_no_op_when_threshold_below_every_writer() {
             InsertOptions {
                 xmin: Xid::new(10),
                 command_id: CommandId::FIRST,
+                n_atts: 2,
                 wal: None,
                 fsm: None,
                 vm: None,
@@ -272,6 +274,7 @@ fn long_snapshot_survives_update_delete_and_vacuum() {
             InsertOptions {
                 xmin: Xid::new(1),
                 command_id: CommandId::FIRST,
+                n_atts: 2,
                 wal: None,
                 fsm: None,
                 vm: None,

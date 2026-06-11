@@ -552,6 +552,7 @@ fn run_insert_thread(
     let insert_opts = InsertOptions {
         xmin: xid,
         command_id: cid,
+        n_atts: 2,
         wal: None,
         fsm: None,
         vm: None,

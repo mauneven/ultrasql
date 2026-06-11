@@ -1371,9 +1371,12 @@ where
         }
         let payload_refs: Vec<&[u8]> = payloads.iter().map(Vec::as_slice).collect();
         let wal = self.state.heap.wal_sink().map(Arc::as_ref);
+        let n_atts = u16::try_from(entry.schema.len())
+            .map_err(|_| ServerError::ddl("COPY FROM schema column count exceeds u16"))?;
         let insert_opts = InsertOptions {
             xmin: txn.current_xid(),
             command_id: txn.current_command,
+            n_atts,
             wal,
             fsm: None,
             vm: Some(self.state.vm.as_ref()),

@@ -253,6 +253,7 @@ impl<L: PageLoader> ToastTable<L> {
         let opts = InsertOptions {
             xmin: Xid::BOOTSTRAP,
             command_id: CommandId::FIRST,
+            n_atts: 3,
             wal: None,
             fsm: None,
             vm: None,

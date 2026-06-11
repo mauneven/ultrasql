@@ -70,6 +70,18 @@ fn opts(xid: u64) -> InsertOptions<'static> {
     InsertOptions {
         xmin: Xid::new(xid),
         command_id: CommandId::FIRST,
+        n_atts: 0,
+        wal: None,
+        fsm: None,
+        vm: None,
+    }
+}
+
+fn opts_with_n_atts(xid: u64, n_atts: u16) -> InsertOptions<'static> {
+    InsertOptions {
+        xmin: Xid::new(xid),
+        command_id: CommandId::FIRST,
+        n_atts,
         wal: None,
         fsm: None,
         vm: None,
@@ -348,6 +360,7 @@ fn visibility_predicate_filters_scanned_tuples() {
             InsertOptions {
                 xmin: bad_xid,
                 command_id: CommandId::FIRST,
+                n_atts: 0,
                 fsm: None,
                 vm: None,
                 wal: None,
@@ -452,6 +465,47 @@ fn empty_scan_returns_nothing() {
     let heap = make_heap(8);
     let mut it = heap.scan(rel(), 0);
     assert!(it.next().is_none());
+}
+
+#[test]
+fn insert_and_update_preserve_attribute_count() {
+    let heap = make_heap(16);
+
+    let tid = heap
+        .insert(rel(), b"two-column-row", opts_with_n_atts(100, 2))
+        .unwrap();
+    assert_eq!(heap.fetch(tid).unwrap().header.n_atts, 2);
+
+    let batch_tids = heap
+        .insert_batch(
+            rel(),
+            &[b"batch-a".as_slice(), b"batch-b".as_slice()],
+            opts_with_n_atts(101, 3),
+        )
+        .unwrap();
+    for tid in batch_tids {
+        assert_eq!(heap.fetch(tid).unwrap().header.n_atts, 3);
+    }
+
+    let hot = heap
+        .update(tid, b"hot-row", update_opts(200))
+        .expect("small update should be HOT");
+    assert!(hot.hot);
+    assert_eq!(heap.fetch(hot.new_tid).unwrap().header.n_atts, 2);
+
+    let full_heap = make_heap(16);
+    let big = [0xAB_u8; 7000];
+    let old_tid = full_heap
+        .insert(rel(), &big, opts_with_n_atts(300, 4))
+        .unwrap();
+    let _other = full_heap
+        .insert(rel(), &big, opts_with_n_atts(300, 4))
+        .unwrap();
+    let non_hot = full_heap
+        .update(old_tid, &big, update_opts(400))
+        .expect("full page should fall back to non-HOT");
+    assert!(!non_hot.hot);
+    assert_eq!(full_heap.fetch(non_hot.new_tid).unwrap().header.n_atts, 4);
 }
 
 // -----------------------------------------------------------------------
@@ -1028,6 +1082,7 @@ fn visibility_scan_includes_own_uncommitted_writes() {
             InsertOptions {
                 xmin: Xid::new(42),
                 command_id: CommandId::FIRST,
+                n_atts: 0,
                 fsm: None,
                 vm: None,
                 wal: None,
@@ -1170,6 +1225,7 @@ proptest! {
                 .insert(rel(), p, InsertOptions {
                     xmin: insert_xid,
                     command_id: CommandId::FIRST,
+                    n_atts: 0,
                     fsm: None,
                     vm: None,
                     wal: None,
@@ -1272,6 +1328,7 @@ mod wal_emission {
                 InsertOptions {
                     xmin: Xid::new(10),
                     command_id: CommandId::FIRST,
+                    n_atts: 0,
                     fsm: None,
                     vm: None,
                     wal: Some(sink.as_ref()),
@@ -1318,6 +1375,7 @@ mod wal_emission {
                 InsertOptions {
                     xmin: Xid::new(1),
                     command_id: CommandId::FIRST,
+                    n_atts: 0,
                     fsm: None,
                     vm: None,
                     wal: Some(sink.as_ref()),
@@ -1375,6 +1433,7 @@ mod wal_emission {
                 InsertOptions {
                     xmin: Xid::new(1),
                     command_id: CommandId::FIRST,
+                    n_atts: 0,
                     fsm: None,
                     vm: None,
                     wal: None,
@@ -1389,6 +1448,7 @@ mod wal_emission {
                 InsertOptions {
                     xmin: Xid::new(1),
                     command_id: CommandId::FIRST,
+                    n_atts: 0,
                     fsm: None,
                     vm: None,
                     wal: None,
@@ -1443,6 +1503,7 @@ mod wal_emission {
                 InsertOptions {
                     xmin: Xid::new(10),
                     command_id: CommandId::FIRST,
+                    n_atts: 0,
                     fsm: None,
                     vm: None,
                     wal: None,
@@ -1491,6 +1552,7 @@ mod wal_emission {
                 InsertOptions {
                     xmin: Xid::new(1),
                     command_id: CommandId::FIRST,
+                    n_atts: 0,
                     fsm: None,
                     vm: None,
                     wal: Some(&null),
@@ -1519,6 +1581,7 @@ mod wal_emission {
                 InsertOptions {
                     xmin: Xid::new(5),
                     command_id: CommandId::FIRST,
+                    n_atts: 0,
                     fsm: None,
                     vm: None,
                     wal: None,
@@ -1610,6 +1673,7 @@ mod wal_emission {
                 InsertOptions {
                     xmin: xid,
                     command_id: CommandId::FIRST,
+                    n_atts: 0,
                     fsm: None,
                     vm: None,
                     wal: Some(sink.as_ref()),
@@ -1633,6 +1697,7 @@ mod wal_emission {
                 InsertOptions {
                     xmin: xid,
                     command_id: CommandId::FIRST,
+                    n_atts: 0,
                     fsm: None,
                     vm: None,
                     wal: Some(sink.as_ref()),
@@ -1688,6 +1753,7 @@ mod wal_emission {
                 InsertOptions {
                     xmin: Xid::new(42),
                     command_id: CommandId::FIRST,
+                    n_atts: 0,
                     fsm: None,
                     vm: None,
                     wal: Some(&sink),
@@ -1725,6 +1791,7 @@ mod wal_emission {
                     InsertOptions {
                         xmin: xid,
                         command_id: CommandId::FIRST,
+                        n_atts: 0,
                         fsm: None,
                         vm: None,
                         wal: Some(sink.as_ref()),
@@ -1770,6 +1837,7 @@ mod wal_emission {
                 InsertOptions {
                     xmin: xid,
                     command_id: CommandId::FIRST,
+                    n_atts: 0,
                     fsm: None,
                     vm: None,
                     wal: Some(sink.as_ref()),
@@ -1811,6 +1879,7 @@ mod wal_emission {
                 InsertOptions {
                     xmin: Xid::new(1),
                     command_id: CommandId::FIRST,
+                    n_atts: 0,
                     fsm: None,
                     vm: None,
                     wal: None,
@@ -1825,6 +1894,7 @@ mod wal_emission {
                 InsertOptions {
                     xmin: Xid::new(1),
                     command_id: CommandId::FIRST,
+                    n_atts: 0,
                     fsm: None,
                     vm: None,
                     wal: None,
@@ -1886,6 +1956,7 @@ mod wal_emission {
                 InsertOptions {
                     xmin: Xid::new(10),
                     command_id: CommandId::FIRST,
+                    n_atts: 0,
                     fsm: None,
                     vm: None,
                     wal: None, // no WAL for insert; clean sink for delete

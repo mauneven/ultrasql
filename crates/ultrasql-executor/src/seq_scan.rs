@@ -1433,6 +1433,7 @@ mod tests {
         InsertOptions {
             xmin: Xid::new(xid),
             command_id: CommandId::FIRST,
+            n_atts: 0,
             wal: None,
             fsm: None,
             vm: None,

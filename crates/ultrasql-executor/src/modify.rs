@@ -1268,6 +1268,9 @@ impl<L: PageLoader + Send + Sync + std::fmt::Debug + 'static> Operator for Modif
                     let n = payloads.len();
                     let payload_refs: Vec<&[u8]> = payloads.iter().map(Vec::as_slice).collect();
                     let wal_ref: Option<&dyn WalSink> = self.wal.as_deref();
+                    let n_atts = u16::try_from(target_schema.len()).map_err(|_| {
+                        ExecError::Internal("target schema column count exceeds u16")
+                    })?;
                     let tids = self
                         .heap
                         .insert_batch(
@@ -1276,6 +1279,7 @@ impl<L: PageLoader + Send + Sync + std::fmt::Debug + 'static> Operator for Modif
                             ultrasql_storage::heap::InsertOptions {
                                 xmin: self.insert_xmin,
                                 command_id: self.insert_command_id,
+                                n_atts,
                                 wal: wal_ref,
                                 fsm: None,
                                 vm: self.vm.as_deref(),
@@ -2469,6 +2473,7 @@ mod tests {
                 InsertOptions {
                     xmin: Xid::new(1),
                     command_id: CommandId::FIRST,
+                    n_atts: u16::try_from(schema.len()).expect("test schema fits u16"),
                     wal: None,
                     fsm: None,
                     vm: None,

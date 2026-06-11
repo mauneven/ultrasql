@@ -368,6 +368,7 @@ impl Engine {
             InsertOptions {
                 xmin: xid,
                 command_id: CommandId::FIRST,
+                n_atts: 2,
                 wal: None,
                 fsm: None,
                 vm: None,

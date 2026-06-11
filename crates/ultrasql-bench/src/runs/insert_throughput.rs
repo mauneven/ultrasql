@@ -92,6 +92,7 @@ pub(crate) fn setup(n: usize) -> SetupState {
     let opts = InsertOptions {
         xmin: Xid::FIRST_USER,
         command_id: CommandId::FIRST,
+        n_atts: 2,
         wal: None,
         fsm: None,
         vm: None,
@@ -123,6 +124,7 @@ pub(crate) fn run_one_iter(state: &SetupState) -> Duration {
     let opts = InsertOptions {
         xmin: Xid::FIRST_USER,
         command_id: CommandId::FIRST,
+        n_atts: 2,
         wal: None,
         fsm: None,
         vm: None,

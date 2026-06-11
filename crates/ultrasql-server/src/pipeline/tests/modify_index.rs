@@ -478,6 +478,7 @@ fn lower_query_index_scan_honours_mvcc_visibility() {
     let opts = InsertOptions {
         xmin: invisible_txn.xid,
         command_id: CommandId::FIRST,
+        n_atts: 2,
         wal: None,
         fsm: None,
         vm: None,

@@ -969,6 +969,7 @@ mod tests {
             InsertOptions {
                 xmin: Xid::new(1),
                 command_id: CommandId::FIRST,
+                n_atts: 0,
                 wal: None,
                 fsm: None,
                 vm: None,
@@ -997,6 +998,7 @@ mod tests {
             InsertOptions {
                 xmin: Xid::new(1),
                 command_id: CommandId::FIRST,
+                n_atts: 0,
                 wal: None,
                 fsm: None,
                 vm: None,
@@ -1035,6 +1037,7 @@ mod tests {
             InsertOptions {
                 xmin: Xid::new(1),
                 command_id: CommandId::FIRST,
+                n_atts: 0,
                 wal: None,
                 fsm: None,
                 vm: None,
@@ -1071,6 +1074,7 @@ mod tests {
             InsertOptions {
                 xmin: Xid::new(1),
                 command_id: CommandId::FIRST,
+                n_atts: 0,
                 wal: None,
                 fsm: None,
                 vm: None,
@@ -1147,6 +1151,7 @@ mod tests {
             InsertOptions {
                 xmin: Xid::new(1),
                 command_id: CommandId::FIRST,
+                n_atts: 0,
                 wal: None,
                 fsm: None,
                 vm: None,

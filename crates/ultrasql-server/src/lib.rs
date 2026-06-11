@@ -4350,9 +4350,20 @@ impl Server {
         payloads: &[Vec<u8>],
         txn: &Transaction,
     ) -> Result<u64, ServerError> {
+        let table = self
+            .catalog_snapshot()
+            .tables_by_oid
+            .get(&relation.oid())
+            .cloned()
+            .ok_or_else(|| {
+                ServerError::ddl(format!("bulk load relation {} not found", relation.oid()))
+            })?;
+        let n_atts = u16::try_from(table.schema.len())
+            .map_err(|_| ServerError::ddl("bulk load schema column count exceeds u16"))?;
         let insert_opts = InsertOptions {
             xmin: txn.current_xid(),
             command_id: txn.current_command,
+            n_atts,
             wal: None,
             fsm: None,
             vm: Some(self.vm.as_ref()),

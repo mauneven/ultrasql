@@ -86,6 +86,7 @@ impl<L: PageLoader + Send + Sync + std::fmt::Debug + 'static> Operator for Fused
                 InsertOptions {
                     xmin: self.xid,
                     command_id: self.command_id,
+                    n_atts: 2,
                     wal: wal_ref,
                     fsm: None,
                     vm: self.vm.as_deref(),

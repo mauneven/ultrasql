@@ -204,6 +204,8 @@ impl Operator for TimePartitionInsert {
 
         for (start_us, rows) in by_chunk {
             let chunk = self.ensure_chunk(start_us)?;
+            let n_atts = u16::try_from(self.runtime.schema.len())
+                .map_err(|_| ExecError::Internal("partition schema column count exceeds u16"))?;
             let payloads = rows
                 .iter()
                 .map(|row| {
@@ -220,6 +222,7 @@ impl Operator for TimePartitionInsert {
                     InsertOptions {
                         xmin: self.xid,
                         command_id: self.command_id,
+                        n_atts,
                         wal: self.wal.as_deref(),
                         fsm: None,
                         vm: Some(self.vm.as_ref()),

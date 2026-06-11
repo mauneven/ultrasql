@@ -314,6 +314,7 @@ mod tests {
                 InsertOptions {
                     xmin: Xid::new(10),
                     command_id: CommandId::FIRST,
+                    n_atts: 2,
                     wal: None,
                     fsm: None,
                     vm: None,

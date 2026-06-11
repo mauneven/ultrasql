@@ -55,12 +55,6 @@ impl<L: PageLoader> HeapAccess<L> {
         let new_tuple_size = TUPLE_HEADER_SIZE
             .checked_add(new_payload.len())
             .ok_or(HeapError::MalformedHeader("tuple size overflow"))?;
-        // TODO(attr-count): heap does not yet know per-tuple attribute counts;
-        // planner-side encoding will populate this in v0.4. Until then, store 0
-        // explicitly so future readers cannot mistake a clipped byte-length for
-        // a real count.
-        let n_atts: u16 = 0;
-
         // --- HOT path: try the same page first --------------------------------
         if opts.hot_eligible {
             // Encode the WAL payload BEFORE the page mutation. An encode
@@ -82,14 +76,8 @@ impl<L: PageLoader> HeapAccess<L> {
             }
             let hot_tid: Option<TupleId> = {
                 let guard = self.pool.get_page(old_tid.page)?;
-                let result = Self::try_hot_update(
-                    &guard,
-                    old_tid,
-                    new_payload,
-                    opts,
-                    n_atts,
-                    new_tuple_size,
-                )?;
+                let result =
+                    Self::try_hot_update(&guard, old_tid, new_payload, opts, new_tuple_size)?;
                 // guard drops here — pin released before WAL I/O
                 result
             };
@@ -117,9 +105,11 @@ impl<L: PageLoader> HeapAccess<L> {
         // here because the outer update path emits its own HeapUpdate record
         // that covers both old and new positions; we do not want a
         // spurious HeapInsert record for the internal insert.
+        let n_atts = self.fetch(old_tid)?.header.n_atts;
         let insert_opts = InsertOptions {
             xmin: opts.xid,
             command_id: opts.command_id,
+            n_atts,
             wal: None,
             fsm: None,
             vm: None,
@@ -352,7 +342,6 @@ impl<L: PageLoader> HeapAccess<L> {
                             old_tid,
                             &edits_vec[k].1,
                             opts,
-                            0,
                             new_tuple_size,
                             &mut scratch,
                         )? {
@@ -450,6 +439,7 @@ impl<L: PageLoader> HeapAccess<L> {
             let insert_opts = InsertOptions {
                 xmin: opts.xid,
                 command_id: opts.command_id,
+                n_atts: self.fetch(fallback[0].0)?.header.n_atts,
                 wal: None,
                 fsm: None,
                 vm: None,

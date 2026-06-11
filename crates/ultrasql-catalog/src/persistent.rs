@@ -56,6 +56,11 @@ use ultrasql_storage::buffer_pool::PageLoader;
 use ultrasql_storage::heap::HeapAccess;
 
 use crate::bootstrap::{self, initial_snapshot};
+use crate::encoding::{
+    ATTRIBUTE_ROW_N_ATTS, CLASS_ROW_N_ATTS, CONSTRAINT_ROW_N_ATTS, DESCRIPTION_ROW_N_ATTS,
+    ENUM_ROW_N_ATTS, INDEX_ROW_N_ATTS, SEQUENCE_ROW_N_ATTS, STATISTIC_EXT_ROW_N_ATTS,
+    STATISTIC_ROW_N_ATTS, TYPE_ROW_N_ATTS,
+};
 use crate::entry::{
     CompositeTypeEntry, DomainTypeEntry, EnumLabelEntry, EnumTypeEntry, IndexEntry, TableEntry,
 };
@@ -1338,6 +1343,7 @@ impl PersistentCatalog {
             InsertOptions {
                 xmin,
                 command_id,
+                n_atts: TYPE_ROW_N_ATTS,
                 wal,
                 fsm: None,
                 vm: None,
@@ -1355,6 +1361,7 @@ impl PersistentCatalog {
                 InsertOptions {
                     xmin,
                     command_id,
+                    n_atts: ENUM_ROW_N_ATTS,
                     wal,
                     fsm: None,
                     vm: None,
@@ -1475,6 +1482,7 @@ impl PersistentCatalog {
             InsertOptions {
                 xmin,
                 command_id,
+                n_atts: TYPE_ROW_N_ATTS,
                 wal,
                 fsm: None,
                 vm: None,
@@ -1491,6 +1499,7 @@ impl PersistentCatalog {
             InsertOptions {
                 xmin,
                 command_id,
+                n_atts: CLASS_ROW_N_ATTS,
                 wal,
                 fsm: None,
                 vm: None,
@@ -1518,6 +1527,7 @@ impl PersistentCatalog {
                 InsertOptions {
                     xmin,
                     command_id,
+                    n_atts: ATTRIBUTE_ROW_N_ATTS,
                     wal,
                     fsm: None,
                     vm: None,
@@ -1603,6 +1613,7 @@ impl PersistentCatalog {
             InsertOptions {
                 xmin,
                 command_id,
+                n_atts: TYPE_ROW_N_ATTS,
                 wal,
                 fsm: None,
                 vm: None,
@@ -1652,6 +1663,7 @@ impl PersistentCatalog {
             InsertOptions {
                 xmin,
                 command_id,
+                n_atts: CLASS_ROW_N_ATTS,
                 wal,
                 fsm: None,
                 vm: None,
@@ -1693,6 +1705,7 @@ impl PersistentCatalog {
             InsertOptions {
                 xmin,
                 command_id,
+                n_atts: INDEX_ROW_N_ATTS,
                 wal,
                 fsm: None,
                 vm: None,
@@ -1738,6 +1751,7 @@ impl PersistentCatalog {
             InsertOptions {
                 xmin,
                 command_id,
+                n_atts: CLASS_ROW_N_ATTS,
                 wal,
                 fsm: None,
                 vm: None,
@@ -1770,6 +1784,7 @@ impl PersistentCatalog {
             InsertOptions {
                 xmin,
                 command_id,
+                n_atts: CONSTRAINT_ROW_N_ATTS,
                 wal,
                 fsm: None,
                 vm: None,
@@ -1866,6 +1881,7 @@ impl PersistentCatalog {
             InsertOptions {
                 xmin,
                 command_id,
+                n_atts: CLASS_ROW_N_ATTS,
                 wal,
                 fsm: None,
                 vm: None,
@@ -1880,6 +1896,7 @@ impl PersistentCatalog {
             InsertOptions {
                 xmin,
                 command_id,
+                n_atts: SEQUENCE_ROW_N_ATTS,
                 wal,
                 fsm: None,
                 vm: None,
@@ -1962,6 +1979,7 @@ impl PersistentCatalog {
             InsertOptions {
                 xmin,
                 command_id,
+                n_atts: CLASS_ROW_N_ATTS,
                 wal,
                 fsm: None,
                 vm: None,
@@ -1989,6 +2007,7 @@ impl PersistentCatalog {
                 InsertOptions {
                     xmin,
                     command_id,
+                    n_atts: ATTRIBUTE_ROW_N_ATTS,
                     wal,
                     fsm: None,
                     vm: None,
@@ -2017,6 +2036,7 @@ impl PersistentCatalog {
                 InsertOptions {
                     xmin,
                     command_id,
+                    n_atts: ATTRIBUTE_ROW_N_ATTS,
                     wal,
                     fsm: None,
                     vm: None,
@@ -2068,6 +2088,7 @@ impl PersistentCatalog {
             InsertOptions {
                 xmin,
                 command_id,
+                n_atts: CLASS_ROW_N_ATTS,
                 wal,
                 fsm: None,
                 vm: None,
@@ -2095,6 +2116,7 @@ impl PersistentCatalog {
                 InsertOptions {
                     xmin,
                     command_id,
+                    n_atts: ATTRIBUTE_ROW_N_ATTS,
                     wal,
                     fsm: None,
                     vm: None,
@@ -2168,6 +2190,7 @@ impl PersistentCatalog {
         let class_opts = InsertOptions {
             xmin,
             command_id,
+            n_atts: CLASS_ROW_N_ATTS,
             wal,
             fsm: None,
             vm: None,
@@ -2192,6 +2215,7 @@ impl PersistentCatalog {
             let attr_opts = InsertOptions {
                 xmin,
                 command_id,
+                n_atts: ATTRIBUTE_ROW_N_ATTS,
                 wal,
                 fsm: None,
                 vm: None,
@@ -2225,6 +2249,7 @@ impl PersistentCatalog {
             let opts = InsertOptions {
                 xmin,
                 command_id,
+                n_atts: STATISTIC_ROW_N_ATTS,
                 wal,
                 fsm: None,
                 vm: None,
@@ -2256,6 +2281,7 @@ impl PersistentCatalog {
             InsertOptions {
                 xmin,
                 command_id,
+                n_atts: STATISTIC_EXT_ROW_N_ATTS,
                 wal,
                 fsm: None,
                 vm: None,
@@ -2406,6 +2432,7 @@ impl PersistentCatalog {
             InsertOptions {
                 xmin,
                 command_id,
+                n_atts: DESCRIPTION_ROW_N_ATTS,
                 wal,
                 fsm: None,
                 vm: None,

@@ -113,6 +113,11 @@ pub enum HeapError {
 /// that transaction; the heap stamps both into the tuple header before
 /// writing the slot.
 ///
+/// `n_atts` is the physical attribute count encoded in the tuple body.
+/// Callers that already have a row/schema descriptor should pass that
+/// count so future tuple decoders can distinguish intentionally-missing
+/// trailing attributes from unknown metadata.
+///
 /// The optional `wal` sink, when present, receives a fully-formed
 /// `HeapInsert` WAL record after the tuple has been written to the page.
 /// Pass `None` to skip WAL emission (e.g. during recovery or in tests
@@ -131,6 +136,8 @@ pub struct InsertOptions<'a> {
     pub xmin: Xid,
     /// Command id within `xmin` that issued the insert.
     pub command_id: CommandId,
+    /// Number of attributes physically present in the tuple body.
+    pub n_atts: u16,
     /// Optional WAL sink. When `Some`, the heap appends a
     /// `RecordType::HeapInsert` record after a successful insert.
     pub wal: Option<&'a dyn WalSink>,
@@ -148,6 +155,7 @@ impl std::fmt::Debug for InsertOptions<'_> {
         f.debug_struct("InsertOptions")
             .field("xmin", &self.xmin)
             .field("command_id", &self.command_id)
+            .field("n_atts", &self.n_atts)
             .field("wal", &self.wal.is_some())
             .field("fsm", &self.fsm.is_some())
             .field("vm", &self.vm.is_some())

@@ -96,11 +96,7 @@ impl<L: PageLoader> HeapAccess<L> {
         let cursor = self.cursor_for(rel);
         let existing = counter.load(Ordering::Acquire);
 
-        // TODO(attr-count): heap does not yet know per-tuple attribute counts;
-        // planner-side encoding will populate this in v0.4. Until then, store 0
-        // explicitly so future readers cannot mistake a clipped byte-length for
-        // a real count.
-        let n_atts: u16 = 0;
+        let n_atts = opts.n_atts;
         let tuple_size = TUPLE_HEADER_SIZE
             .checked_add(payload.len())
             .ok_or(HeapError::MalformedHeader("tuple size overflow"))?;
@@ -273,11 +269,7 @@ impl<L: PageLoader> HeapAccess<L> {
             return Ok(out);
         }
 
-        // TODO(attr-count): heap does not yet know per-tuple attribute counts;
-        // planner-side encoding will populate this in v0.4. Until then, store 0
-        // explicitly so future readers cannot mistake a clipped byte-length for
-        // a real count.
-        let n_atts: u16 = 0;
+        let n_atts = opts.n_atts;
 
         let counter = self.counter_for(rel);
         let insert_cursor = self.cursor_for(rel);
@@ -372,7 +364,7 @@ impl<L: PageLoader> HeapAccess<L> {
 
         let counter = self.counter_for(rel);
         let insert_cursor = self.cursor_for(rel);
-        let n_atts: u16 = 0;
+        let n_atts = opts.n_atts;
         let mut row_idx = 0_usize;
         let mut inserted = 0_u64;
 
