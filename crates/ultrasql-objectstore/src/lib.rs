@@ -142,7 +142,12 @@ pub fn read_object_range_with_metadata(
             object_size: None,
         });
     }
-    let end = start.checked_add(len - 1).ok_or_else(|| {
+    let last_byte_offset = len.checked_sub(1).ok_or_else(|| {
+        ObjectStoreError::InvalidRange(format!(
+            "object range overflows u64: start={start} len={len}"
+        ))
+    })?;
+    let end = start.checked_add(last_byte_offset).ok_or_else(|| {
         ObjectStoreError::InvalidRange(format!(
             "object range overflows u64: start={start} len={len}"
         ))
@@ -831,7 +836,9 @@ fn literal_prefix(pattern: &str) -> String {
         .char_indices()
         .find_map(|(idx, ch)| matches!(ch, '*' | '?').then_some(idx))
         .unwrap_or(pattern.len());
-    pattern[..first_wildcard].to_owned()
+    pattern
+        .get(..first_wildcard)
+        .map_or_else(String::new, ToOwned::to_owned)
 }
 
 fn contains_wildcard(s: &str) -> bool {
@@ -850,31 +857,55 @@ fn wildcard_match(pattern: &str, text: &str) -> bool {
     while let Some(&text_ch) = text.get(text_idx) {
         match pattern.get(pattern_idx).copied() {
             Some('?') => {
-                pattern_idx += 1;
-                text_idx += 1;
+                let Some(next_pattern_idx) = pattern_idx.checked_add(1) else {
+                    return false;
+                };
+                let Some(next_text_idx) = text_idx.checked_add(1) else {
+                    return false;
+                };
+                pattern_idx = next_pattern_idx;
+                text_idx = next_text_idx;
             }
             Some('*') => {
                 last_star = Some(pattern_idx);
-                pattern_idx += 1;
+                let Some(next_pattern_idx) = pattern_idx.checked_add(1) else {
+                    return false;
+                };
+                pattern_idx = next_pattern_idx;
                 star_text_idx = text_idx;
             }
             Some(pattern_ch) if pattern_ch == text_ch => {
-                pattern_idx += 1;
-                text_idx += 1;
+                let Some(next_pattern_idx) = pattern_idx.checked_add(1) else {
+                    return false;
+                };
+                let Some(next_text_idx) = text_idx.checked_add(1) else {
+                    return false;
+                };
+                pattern_idx = next_pattern_idx;
+                text_idx = next_text_idx;
             }
             _ => {
                 let Some(star_idx) = last_star else {
                     return false;
                 };
-                pattern_idx = star_idx + 1;
-                star_text_idx += 1;
+                let Some(next_pattern_idx) = star_idx.checked_add(1) else {
+                    return false;
+                };
+                let Some(next_star_text_idx) = star_text_idx.checked_add(1) else {
+                    return false;
+                };
+                pattern_idx = next_pattern_idx;
+                star_text_idx = next_star_text_idx;
                 text_idx = star_text_idx;
             }
         }
     }
 
     while matches!(pattern.get(pattern_idx), Some('*')) {
-        pattern_idx += 1;
+        let Some(next_pattern_idx) = pattern_idx.checked_add(1) else {
+            return false;
+        };
+        pattern_idx = next_pattern_idx;
     }
     pattern_idx == pattern.len()
 }
@@ -915,12 +946,29 @@ fn parse_xml_tag_values(input: &str, tag: &str) -> Vec<String> {
     let mut rest = input;
     let mut values = Vec::new();
     while let Some(start) = rest.find(&open) {
-        let value_start = start + open.len();
-        let Some(end) = rest[value_start..].find(&close) else {
+        let Some(value_start) = start.checked_add(open.len()) else {
             break;
         };
-        values.push(xml_decode(&rest[value_start..value_start + end]));
-        rest = &rest[value_start + end + close.len()..];
+        let Some(value_tail) = rest.get(value_start..) else {
+            break;
+        };
+        let Some(end) = value_tail.find(&close) else {
+            break;
+        };
+        let Some(value_end) = value_start.checked_add(end) else {
+            break;
+        };
+        let Some(value) = rest.get(value_start..value_end) else {
+            break;
+        };
+        values.push(xml_decode(value));
+        let Some(next_start) = value_end.checked_add(close.len()) else {
+            break;
+        };
+        let Some(next_rest) = rest.get(next_start..) else {
+            break;
+        };
+        rest = next_rest;
     }
     values
 }
@@ -952,6 +1000,7 @@ mod tests {
     fn wildcard_match_supports_file_patterns() {
         assert!(wildcard_match("logs/*.csv", "logs/a.csv"));
         assert!(wildcard_match("logs/part-?.csv", "logs/part-a.csv"));
+        assert!(wildcard_match("logs/?.csv", "logs/é.csv"));
         assert!(!wildcard_match("logs/part-?.csv", "logs/part-ab.csv"));
     }
 
@@ -981,6 +1030,10 @@ mod tests {
         let xml =
             "<ListBucketResult><Contents><Key>a&amp;b.csv</Key></Contents></ListBucketResult>";
         assert_eq!(parse_xml_tag_values(xml, "Key"), vec!["a&b.csv"]);
+        assert_eq!(
+            parse_xml_tag_values("<Key>one</Key><Key>two</Key><Key>broken", "Key"),
+            vec!["one", "two"]
+        );
     }
 
     #[test]
