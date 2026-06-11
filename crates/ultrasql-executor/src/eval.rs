@@ -1598,11 +1598,60 @@ fn decimal_magnitude_digits(mut magnitude: i128) -> usize {
 
 fn resolve_regtype_text(text: &str) -> Option<Oid> {
     let trimmed = text.trim();
-    let unqualified = trimmed
-        .strip_prefix("pg_catalog.")
-        .or_else(|| trimmed.strip_prefix("PG_CATALOG."))
-        .unwrap_or(trimmed);
-    Value::parse_oid_text(unqualified).or_else(|| builtin_type_oid(unqualified))
+    if let Some(oid) = Value::parse_oid_text(trimmed) {
+        return Some(oid);
+    }
+    let parts = parse_pg_identifier_path(trimmed)?;
+    match parts.as_slice() {
+        [name] => builtin_type_oid(name),
+        [schema_name, name] if schema_name.eq_ignore_ascii_case("pg_catalog") => {
+            builtin_type_oid(name)
+        }
+        _ => None,
+    }
+}
+
+fn parse_pg_identifier_path(text: &str) -> Option<Vec<String>> {
+    let mut parts = Vec::new();
+    let mut chars = text.chars().peekable();
+    loop {
+        match chars.peek().copied()? {
+            '"' => {
+                chars.next();
+                let mut part = String::new();
+                loop {
+                    match chars.next()? {
+                        '"' if chars.peek() == Some(&'"') => {
+                            chars.next();
+                            part.push('"');
+                        }
+                        '"' => break,
+                        ch => part.push(ch),
+                    }
+                }
+                parts.push(part);
+            }
+            _ => {
+                let mut part = String::new();
+                while let Some(ch) = chars.peek().copied() {
+                    if ch == '.' {
+                        break;
+                    }
+                    part.push(ch);
+                    chars.next();
+                }
+                if part.is_empty() {
+                    return None;
+                }
+                parts.push(part);
+            }
+        }
+        match chars.next() {
+            Some('.') => continue,
+            None => return Some(parts),
+            Some(_) => return None,
+        }
+    }
 }
 
 fn eval_pg_size_pretty(args: &[Value]) -> Result<Value, EvalError> {
@@ -7408,6 +7457,13 @@ mod tests {
         );
         assert_eq!(
             eval_fn("to_regtype", vec![Value::Text("int4".into())]),
+            Value::RegType(Oid::new(23))
+        );
+        assert_eq!(
+            eval_fn(
+                "to_regtype",
+                vec![Value::Text(r#"pg_catalog."int4""#.into())]
+            ),
             Value::RegType(Oid::new(23))
         );
         assert!(eval_fn_err("to_regtype", vec![]).contains("expected 1 arg"));
