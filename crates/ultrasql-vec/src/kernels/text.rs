@@ -49,8 +49,9 @@ pub fn len_text(column: &StringColumn, validity: Option<&Bitmap>) -> NumericColu
     let n = column.len();
     let offsets = column.offsets();
     let mut data: Vec<i64> = Vec::with_capacity(n);
-    for i in 0..n {
-        data.push(i64::from(offsets[i + 1] - offsets[i]));
+    for pair in offsets.windows(2).take(n) {
+        let len = pair[1].checked_sub(pair[0]).map_or(0, i64::from);
+        data.push(len);
     }
     finalize_numeric_i64(data, column.nulls(), validity, n)
 }
@@ -86,7 +87,7 @@ pub fn lower_text(column: &StringColumn, validity: Option<&Bitmap>) -> StringCol
     let bytes = column.values();
     let mut out_values: Vec<u8> = Vec::with_capacity(bytes.len());
     for &b in bytes {
-        out_values.push(if b.is_ascii_uppercase() { b + 32 } else { b });
+        out_values.push(b.to_ascii_lowercase());
     }
     finalize_string_with(column, out_values, validity)
 }
@@ -128,7 +129,7 @@ pub fn upper_text(column: &StringColumn, validity: Option<&Bitmap>) -> StringCol
     let bytes = column.values();
     let mut out_values: Vec<u8> = Vec::with_capacity(bytes.len());
     for &b in bytes {
-        out_values.push(if b.is_ascii_lowercase() { b - 32 } else { b });
+        out_values.push(b.to_ascii_uppercase());
     }
     finalize_string_with(column, out_values, validity)
 }
@@ -223,16 +224,16 @@ fn finalize_string_with(
         // Rebuild offsets so null rows have a zero-length slice. This is
         // the cleanest way to ensure no garbage bytes ever leak through the
         // string accessor.
-        let mut new_offsets: Vec<u32> = Vec::with_capacity(n + 1);
+        let mut new_offsets: Vec<u32> = Vec::with_capacity(n.checked_add(1).unwrap_or(n));
         let mut new_values: Vec<u8> = Vec::with_capacity(values.len());
         new_offsets.push(0);
         let src_offsets = column.offsets();
-        for i in 0..n {
+        for (i, pair) in src_offsets.windows(2).enumerate().take(n) {
             if bm.get(i) {
-                let Ok(start) = usize::try_from(src_offsets[i]) else {
+                let Ok(start) = usize::try_from(pair[0]) else {
                     return all_null_strings(n);
                 };
-                let Ok(end) = usize::try_from(src_offsets[i + 1]) else {
+                let Ok(end) = usize::try_from(pair[1]) else {
                     return all_null_strings(n);
                 };
                 if end > values.len() || start > end {

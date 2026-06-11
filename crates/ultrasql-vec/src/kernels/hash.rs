@@ -90,11 +90,14 @@ pub fn hash_text_bytes(offsets: &[u32], values: &[u8], validity: Option<&Bitmap>
         );
         return Vec::new();
     }
-    let n = offsets.len() - 1;
+    let n = offsets
+        .len()
+        .checked_sub(1)
+        .expect("validated offsets length must include at least two entries");
     let mut out = Vec::with_capacity(n);
-    for i in 0..n {
-        let start = offset_to_usize(offsets[i]);
-        let end = offset_to_usize(offsets[i + 1]);
+    for (i, pair) in offsets.windows(2).enumerate() {
+        let start = offset_to_usize(pair[0]);
+        let end = offset_to_usize(pair[1]);
         assert!(
             start <= end,
             "hash_text_bytes: offsets must be nondecreasing"

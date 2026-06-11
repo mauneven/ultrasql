@@ -243,7 +243,9 @@ fn filter_sum_par_slice(xs: &[i64], ys: &[i64], n_threads: usize) -> i64 {
         smallvec::SmallVec::with_capacity(n_threads);
     let mut off = 0_usize;
     while off < n {
-        let end = (off + part).min(n);
+        let end = off
+            .checked_add(part)
+            .map_or(n, |candidate| candidate.min(n));
         slices.push((&xs[off..end], &ys[off..end]));
         off = end;
     }
@@ -380,16 +382,22 @@ fn filter_sum_with_validity_scalar(
     let mut s0: i64 = 0;
     let mut s1: i64 = 0;
 
-    let nwords = n / 64;
+    let nwords = n
+        .checked_div(64)
+        .expect("division by nonzero bitmap word width must succeed");
     for w in 0..nwords {
-        let base = w * 64;
+        let base = w
+            .checked_mul(64)
+            .expect("bitmap word base index must fit usize");
         let xv = x_valid.map_or(u64::MAX, |b| b.words()[w]);
         let yv = y_valid.map_or(u64::MAX, |b| b.words()[w]);
         let valid_word = xv & yv;
 
         // Process the 64 rows in halves to feed two accumulators.
         for j in 0..32_usize {
-            let i = base + j;
+            let i = base
+                .checked_add(j)
+                .expect("bitmap half-word row index must fit usize");
             let valid_bit = ((valid_word >> j) & 1) != 0;
             let valid_mask = i64::from(valid_bit).wrapping_neg();
             let gt_mask = (i64::from(ys[i] > 0)).wrapping_neg();
@@ -397,7 +405,9 @@ fn filter_sum_with_validity_scalar(
             s0 = s0.wrapping_add(xs[i] & m);
         }
         for j in 32..64_usize {
-            let i = base + j;
+            let i = base
+                .checked_add(j)
+                .expect("bitmap half-word row index must fit usize");
             let valid_bit = ((valid_word >> j) & 1) != 0;
             let valid_mask = i64::from(valid_bit).wrapping_neg();
             let gt_mask = (i64::from(ys[i] > 0)).wrapping_neg();
@@ -407,14 +417,20 @@ fn filter_sum_with_validity_scalar(
     }
 
     // Tail.
-    let tail_start = nwords * 64;
+    let tail_start = nwords
+        .checked_mul(64)
+        .expect("bitmap tail start index must fit usize");
     if tail_start < n {
-        let last_word = n - tail_start;
+        let last_word = n
+            .checked_sub(tail_start)
+            .expect("tail start is bounded by row count");
         let xv = x_valid.map_or(u64::MAX, |b| b.words()[nwords]);
         let yv = y_valid.map_or(u64::MAX, |b| b.words()[nwords]);
         let valid_word = xv & yv;
         for j in 0..last_word {
-            let i = tail_start + j;
+            let i = tail_start
+                .checked_add(j)
+                .expect("bitmap tail row index must fit usize");
             let valid_bit = ((valid_word >> j) & 1) != 0;
             let valid_mask = i64::from(valid_bit).wrapping_neg();
             let gt_mask = (i64::from(ys[i] > 0)).wrapping_neg();

@@ -653,7 +653,9 @@ fn par_dict_slice(xs: &[i64], codes: &[u8], mask: &[i64; 256], n_threads: usize)
         smallvec::SmallVec::with_capacity(n_threads);
     let mut off = 0_usize;
     while off < n {
-        let end = (off + part).min(n);
+        let end = off
+            .checked_add(part)
+            .map_or(n, |candidate| candidate.min(n));
         slices.push((&xs[off..end], &codes[off..end]));
         off = end;
     }

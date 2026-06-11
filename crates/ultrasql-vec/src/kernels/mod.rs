@@ -163,18 +163,24 @@ fn eq_i32_pack_into(a: &[i32], b: &[i32], words: &mut [u64]) {
 #[inline]
 fn pack_eq_64(a: &[i32; 64], b: &[i32; 64]) -> u64 {
     let mut mask: u64 = 0;
-    for chunk in 0..8_usize {
-        let off = chunk * 8;
+    for (shift, (a_lanes, b_lanes)) in (0_u32..=56)
+        .step_by(8)
+        .zip(a.chunks_exact(8).zip(b.chunks_exact(8)))
+    {
+        let a_lanes = <&[i32; 8]>::try_from(a_lanes)
+            .expect("chunks_exact(8) must yield eight left i32 lanes");
+        let b_lanes = <&[i32; 8]>::try_from(b_lanes)
+            .expect("chunks_exact(8) must yield eight right i32 lanes");
         let mut byte: u64 = 0;
-        byte |= u64::from(a[off] == b[off]);
-        byte |= u64::from(a[off + 1] == b[off + 1]) << 1;
-        byte |= u64::from(a[off + 2] == b[off + 2]) << 2;
-        byte |= u64::from(a[off + 3] == b[off + 3]) << 3;
-        byte |= u64::from(a[off + 4] == b[off + 4]) << 4;
-        byte |= u64::from(a[off + 5] == b[off + 5]) << 5;
-        byte |= u64::from(a[off + 6] == b[off + 6]) << 6;
-        byte |= u64::from(a[off + 7] == b[off + 7]) << 7;
-        mask |= byte << (chunk * 8);
+        byte |= u64::from(a_lanes[0] == b_lanes[0]);
+        byte |= u64::from(a_lanes[1] == b_lanes[1]) << 1;
+        byte |= u64::from(a_lanes[2] == b_lanes[2]) << 2;
+        byte |= u64::from(a_lanes[3] == b_lanes[3]) << 3;
+        byte |= u64::from(a_lanes[4] == b_lanes[4]) << 4;
+        byte |= u64::from(a_lanes[5] == b_lanes[5]) << 5;
+        byte |= u64::from(a_lanes[6] == b_lanes[6]) << 6;
+        byte |= u64::from(a_lanes[7] == b_lanes[7]) << 7;
+        mask |= byte << shift;
     }
     mask
 }
@@ -364,13 +370,17 @@ fn min_f64_nullable(data: &[f64], nulls: &Bitmap) -> Option<f64> {
         if word == 0 {
             continue;
         }
-        let base = word_idx * 64;
+        let Some(base) = word_idx.checked_mul(64) else {
+            break;
+        };
         // Iterate over set bits using a `word & word-1` clearing trick.
         let mut w = word;
         while w != 0 {
             let bit = usize::try_from(w.trailing_zeros())
                 .unwrap_or_else(|_| unreachable!("u64 trailing_zeros fits usize"));
-            let i = base + bit;
+            let Some(i) = base.checked_add(bit) else {
+                break;
+            };
             if i >= data.len() {
                 break;
             }
@@ -378,7 +388,9 @@ fn min_f64_nullable(data: &[f64], nulls: &Bitmap) -> Option<f64> {
             if !v.is_nan() {
                 best = Some(best.map_or(v, |b| min_f64_value(b, v)));
             }
-            w &= w - 1;
+            w &= w
+                .checked_sub(1)
+                .expect("nonzero bitmap word must have predecessor");
         }
     }
     best
@@ -575,18 +587,19 @@ fn cmp_gt_i64_pack_into(a: &[i64], scalar: i64, words: &mut [u64]) {
 fn pack_cmp_gt_64(a: &[i64; 64], scalar: i64) -> u64 {
     let mut mask: u64 = 0;
     // 8 chunks × 8 lanes per chunk = 64 lanes per word.
-    for chunk in 0..8_usize {
-        let off = chunk * 8;
+    for (shift, lanes) in (0_u32..=56).step_by(8).zip(a.chunks_exact(8)) {
+        let lanes =
+            <&[i64; 8]>::try_from(lanes).expect("chunks_exact(8) must yield eight i64 lanes");
         let mut byte: u64 = 0;
-        byte |= u64::from(a[off] > scalar);
-        byte |= u64::from(a[off + 1] > scalar) << 1;
-        byte |= u64::from(a[off + 2] > scalar) << 2;
-        byte |= u64::from(a[off + 3] > scalar) << 3;
-        byte |= u64::from(a[off + 4] > scalar) << 4;
-        byte |= u64::from(a[off + 5] > scalar) << 5;
-        byte |= u64::from(a[off + 6] > scalar) << 6;
-        byte |= u64::from(a[off + 7] > scalar) << 7;
-        mask |= byte << (chunk * 8);
+        byte |= u64::from(lanes[0] > scalar);
+        byte |= u64::from(lanes[1] > scalar) << 1;
+        byte |= u64::from(lanes[2] > scalar) << 2;
+        byte |= u64::from(lanes[3] > scalar) << 3;
+        byte |= u64::from(lanes[4] > scalar) << 4;
+        byte |= u64::from(lanes[5] > scalar) << 5;
+        byte |= u64::from(lanes[6] > scalar) << 6;
+        byte |= u64::from(lanes[7] > scalar) << 7;
+        mask |= byte << shift;
     }
     mask
 }
@@ -771,18 +784,19 @@ const fn cmp_i64_lane(op: CmpOp, a: i64, b: i64) -> bool {
 #[inline]
 fn pack_cmp_i32_64(a: &[i32; 64], scalar: i32, op: CmpOp) -> u64 {
     let mut mask: u64 = 0;
-    for chunk in 0..8_usize {
-        let off = chunk * 8;
+    for (shift, lanes) in (0_u32..=56).step_by(8).zip(a.chunks_exact(8)) {
+        let lanes =
+            <&[i32; 8]>::try_from(lanes).expect("chunks_exact(8) must yield eight i32 lanes");
         let mut byte: u64 = 0;
-        byte |= u64::from(cmp_i32_lane(op, a[off], scalar));
-        byte |= u64::from(cmp_i32_lane(op, a[off + 1], scalar)) << 1;
-        byte |= u64::from(cmp_i32_lane(op, a[off + 2], scalar)) << 2;
-        byte |= u64::from(cmp_i32_lane(op, a[off + 3], scalar)) << 3;
-        byte |= u64::from(cmp_i32_lane(op, a[off + 4], scalar)) << 4;
-        byte |= u64::from(cmp_i32_lane(op, a[off + 5], scalar)) << 5;
-        byte |= u64::from(cmp_i32_lane(op, a[off + 6], scalar)) << 6;
-        byte |= u64::from(cmp_i32_lane(op, a[off + 7], scalar)) << 7;
-        mask |= byte << (chunk * 8);
+        byte |= u64::from(cmp_i32_lane(op, lanes[0], scalar));
+        byte |= u64::from(cmp_i32_lane(op, lanes[1], scalar)) << 1;
+        byte |= u64::from(cmp_i32_lane(op, lanes[2], scalar)) << 2;
+        byte |= u64::from(cmp_i32_lane(op, lanes[3], scalar)) << 3;
+        byte |= u64::from(cmp_i32_lane(op, lanes[4], scalar)) << 4;
+        byte |= u64::from(cmp_i32_lane(op, lanes[5], scalar)) << 5;
+        byte |= u64::from(cmp_i32_lane(op, lanes[6], scalar)) << 6;
+        byte |= u64::from(cmp_i32_lane(op, lanes[7], scalar)) << 7;
+        mask |= byte << shift;
     }
     mask
 }
@@ -810,18 +824,19 @@ fn cmp_i32_pack_into(a: &[i32], scalar: i32, op: CmpOp, words: &mut [u64]) {
 #[inline]
 fn pack_cmp_i64_64(a: &[i64; 64], scalar: i64, op: CmpOp) -> u64 {
     let mut mask: u64 = 0;
-    for chunk in 0..8_usize {
-        let off = chunk * 8;
+    for (shift, lanes) in (0_u32..=56).step_by(8).zip(a.chunks_exact(8)) {
+        let lanes =
+            <&[i64; 8]>::try_from(lanes).expect("chunks_exact(8) must yield eight i64 lanes");
         let mut byte: u64 = 0;
-        byte |= u64::from(cmp_i64_lane(op, a[off], scalar));
-        byte |= u64::from(cmp_i64_lane(op, a[off + 1], scalar)) << 1;
-        byte |= u64::from(cmp_i64_lane(op, a[off + 2], scalar)) << 2;
-        byte |= u64::from(cmp_i64_lane(op, a[off + 3], scalar)) << 3;
-        byte |= u64::from(cmp_i64_lane(op, a[off + 4], scalar)) << 4;
-        byte |= u64::from(cmp_i64_lane(op, a[off + 5], scalar)) << 5;
-        byte |= u64::from(cmp_i64_lane(op, a[off + 6], scalar)) << 6;
-        byte |= u64::from(cmp_i64_lane(op, a[off + 7], scalar)) << 7;
-        mask |= byte << (chunk * 8);
+        byte |= u64::from(cmp_i64_lane(op, lanes[0], scalar));
+        byte |= u64::from(cmp_i64_lane(op, lanes[1], scalar)) << 1;
+        byte |= u64::from(cmp_i64_lane(op, lanes[2], scalar)) << 2;
+        byte |= u64::from(cmp_i64_lane(op, lanes[3], scalar)) << 3;
+        byte |= u64::from(cmp_i64_lane(op, lanes[4], scalar)) << 4;
+        byte |= u64::from(cmp_i64_lane(op, lanes[5], scalar)) << 5;
+        byte |= u64::from(cmp_i64_lane(op, lanes[6], scalar)) << 6;
+        byte |= u64::from(cmp_i64_lane(op, lanes[7], scalar)) << 7;
+        mask |= byte << shift;
     }
     mask
 }
