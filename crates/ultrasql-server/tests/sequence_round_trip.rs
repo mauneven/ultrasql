@@ -353,7 +353,7 @@ async fn sequence_functions_require_schema_usage_privilege() {
              CREATE SCHEMA seq_schema_acl; \
              CREATE SEQUENCE seq_schema_acl.seq_schema_private START WITH 21; \
              RESET ROLE; \
-             GRANT USAGE ON SEQUENCE seq_schema_private TO seq_schema_reader",
+             GRANT USAGE ON SEQUENCE seq_schema_acl.seq_schema_private TO seq_schema_reader",
         )
         .await
         .expect("create private sequence usage test");
@@ -365,7 +365,7 @@ async fn sequence_functions_require_schema_usage_privilege() {
     )
     .await;
     let err = reader
-        .simple_query("SELECT nextval('seq_schema_private')")
+        .simple_query("SELECT nextval('seq_schema_acl.seq_schema_private')")
         .await
         .expect_err("schema USAGE required despite sequence USAGE");
     assert_eq!(err.code().expect("SQLSTATE").code(), "42501");
@@ -387,7 +387,11 @@ async fn sequence_functions_require_schema_usage_privilege() {
     )
     .await;
     assert_eq!(
-        simple_i64(&reader, "SELECT nextval('seq_schema_private')").await,
+        simple_i64(
+            &reader,
+            "SELECT nextval('seq_schema_acl.seq_schema_private')"
+        )
+        .await,
         21
     );
     drop(reader);
@@ -398,7 +402,7 @@ async fn sequence_functions_require_schema_usage_privilege() {
     running
         .client
         .batch_execute(
-            "DROP SEQUENCE seq_schema_private; \
+            "DROP SEQUENCE seq_schema_acl.seq_schema_private; \
              DROP SCHEMA seq_schema_acl; \
              DROP ROLE seq_schema_owner; \
              DROP ROLE seq_schema_reader",

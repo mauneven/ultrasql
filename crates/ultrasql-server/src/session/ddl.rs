@@ -620,27 +620,39 @@ where
         for unique in unique_constraints {
             crate::index_key::IndexKeyEncoding::for_columns(&entry.schema, &unique.columns)?;
         }
-        let serial_sequences: Vec<(String, ultrasql_planner::LogicalSequenceOptions)> =
+        let sequence_namespace = namespace.to_ascii_lowercase();
+        let runtime_sequence_defaults = sequence_defaults
+            .iter()
+            .map(|name| {
+                name.as_ref()
+                    .map(|name| crate::sequence_lookup_key(&sequence_namespace, name))
+            })
+            .collect::<Vec<_>>();
+        let serial_sequences: Vec<(String, String, ultrasql_planner::LogicalSequenceOptions)> =
             sequence_defaults
                 .iter()
                 .zip(sequence_options)
                 .filter_map(|(name, options)| {
-                    name.as_ref()
-                        .map(|name| (name.clone(), options.unwrap_or_default()))
+                    name.as_ref().map(|name| {
+                        (
+                            name.clone(),
+                            crate::sequence_lookup_key(&sequence_namespace, name),
+                            options.unwrap_or_default(),
+                        )
+                    })
                 })
                 .collect();
-        for (seq_name, _) in &serial_sequences {
-            if self.state.sequences.contains_key(seq_name) {
+        for (_, seq_key, _) in &serial_sequences {
+            if self.state.sequences.contains_key(seq_key) {
                 return Err(ServerError::Catalog(
-                    ultrasql_catalog::CatalogError::already_exists(seq_name.clone()),
+                    ultrasql_catalog::CatalogError::already_exists(seq_key.clone()),
                 ));
             }
         }
         self.state.persistent_catalog.create_table(entry.clone())?;
         let mut serial_sequence_rows = Vec::with_capacity(serial_sequences.len());
         let sequence_owner = self.current_user.to_ascii_lowercase();
-        let sequence_namespace = namespace.to_ascii_lowercase();
-        for (seq_name, options) in &serial_sequences {
+        for (seq_name, seq_key, options) in &serial_sequences {
             let seq = ultrasql_storage::sequence::Sequence::new(
                 super::sequence::to_storage_options(*options),
             )
@@ -650,6 +662,7 @@ where
             let seq_opts = seq.options_snapshot();
             serial_sequence_rows.push((
                 seq_name.clone(),
+                seq_key.clone(),
                 ultrasql_catalog::persistent::SequenceRow {
                     seqrelid: seq_oid,
                     seqtypid: PG_OID_INT8,
@@ -663,20 +676,19 @@ where
             ));
             seq.emit_wal(
                 SequenceOpKind::Create,
-                seq_name,
+                seq_key,
                 seq_rel,
                 ultrasql_core::Xid::INVALID,
                 self.state.heap.wal_sink().map(|sink| sink.as_ref()),
             )
             .map_err(|e| ServerError::ddl(format!("CREATE TABLE serial sequence WAL: {e}")))?;
-            self.state.sequences.insert(seq_name.clone(), Arc::new(seq));
-            let sequence_key = seq_name.to_ascii_lowercase();
+            self.state.sequences.insert(seq_key.clone(), Arc::new(seq));
             self.state
                 .sequence_owners
-                .insert(sequence_key.clone(), sequence_owner.clone());
+                .insert(seq_key.clone(), sequence_owner.clone());
             self.state
                 .sequence_namespaces
-                .insert(sequence_key, sequence_namespace.clone());
+                .insert(seq_key.clone(), sequence_namespace.clone());
         }
         let runtime_foreign_keys = foreign_keys
             .iter()
@@ -801,7 +813,7 @@ where
                 oid,
                 Arc::new(crate::TableRuntimeConstraints {
                     defaults: defaults.clone(),
-                    sequence_defaults: sequence_defaults.clone(),
+                    sequence_defaults: runtime_sequence_defaults.clone(),
                     identity_always: identity_always.clone(),
                     generated_stored: generated_stored.clone(),
                     checks: runtime_checks.clone(),
@@ -817,11 +829,10 @@ where
                 Err(e) => {
                     let _ = self.state.persistent_catalog.drop_table(table_name);
                     self.state.table_constraints.remove(&oid);
-                    for (seq_name, _) in &serial_sequences {
-                        let sequence_key = seq_name.to_ascii_lowercase();
-                        self.state.sequences.remove(seq_name);
-                        self.state.sequence_owners.remove(&sequence_key);
-                        self.state.sequence_namespaces.remove(&sequence_key);
+                    for (_, seq_key, _) in &serial_sequences {
+                        self.state.sequences.remove(seq_key);
+                        self.state.sequence_owners.remove(seq_key);
+                        self.state.sequence_namespaces.remove(seq_key);
                     }
                     return Err(e);
                 }
@@ -872,9 +883,10 @@ where
                     ddl_command_id,
                 )?;
             }
-            for (seq_name, row) in &serial_sequence_rows {
+            for (seq_name, _seq_key, row) in &serial_sequence_rows {
                 self.state.persistent_catalog.persist_sequence_rows(
                     seq_name,
+                    &sequence_namespace,
                     row,
                     self.state.heap.as_ref(),
                     ddl_xid,
@@ -897,11 +909,10 @@ where
             }
             let _ = self.state.persistent_catalog.drop_table(table_name);
             self.state.table_constraints.remove(&oid);
-            for (seq_name, _) in &serial_sequences {
-                let sequence_key = seq_name.to_ascii_lowercase();
-                self.state.sequences.remove(seq_name);
-                self.state.sequence_owners.remove(&sequence_key);
-                self.state.sequence_namespaces.remove(&sequence_key);
+            for (_, seq_key, _) in &serial_sequences {
+                self.state.sequences.remove(seq_key);
+                self.state.sequence_owners.remove(seq_key);
+                self.state.sequence_namespaces.remove(seq_key);
             }
             return Err(e.into());
         }
@@ -933,12 +944,12 @@ where
             crate::auth::PrivilegeObjectKind::Table,
             table_name,
         );
-        for (seq_name, _) in &serial_sequences {
+        for (_, seq_key, _) in &serial_sequences {
             self.state.privilege_catalog.apply_default_privileges(
                 &self.current_user,
                 namespace,
                 crate::auth::PrivilegeObjectKind::Sequence,
-                seq_name,
+                seq_key,
             );
         }
         let grants_changed = before_grants != self.state.privilege_catalog.list_grants()

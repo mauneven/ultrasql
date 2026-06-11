@@ -1861,6 +1861,7 @@ impl PersistentCatalog {
     pub fn persist_sequence_rows<L: PageLoader>(
         &self,
         sequence_name: &str,
+        schema_name: &str,
         row: &SequenceRow,
         heap: &HeapAccess<L>,
         xmin: ultrasql_core::Xid,
@@ -1875,7 +1876,7 @@ impl PersistentCatalog {
         let class_row = ClassRow {
             oid: row.seqrelid,
             relname: sequence_name.to_owned(),
-            relnamespace: Oid::new(bootstrap::PUBLIC_OID),
+            relnamespace: namespace_oid_for_schema(schema_name),
             relkind: RelKind::Sequence,
             relpages: 0,
             reltuples: 0.0,

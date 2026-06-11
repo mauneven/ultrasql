@@ -369,23 +369,24 @@ where
     }
 
     fn sequence_key_for_privilege_object(&self, sequence: &str) -> Result<String, ServerError> {
-        let sequence_key = privilege_object_simple_name(sequence).to_ascii_lowercase();
+        let sequence_name = privilege_object_simple_name(sequence).to_ascii_lowercase();
+        let sequence_key = if let Some(namespace) = privilege_object_namespace(sequence) {
+            crate::sequence_lookup_key(namespace, &sequence_name)
+        } else if self.state.sequences.contains_key(&sequence_name) {
+            sequence_name
+        } else {
+            crate::search_path_schema_names(
+                self.session_settings.get("search_path").map(String::as_str),
+            )
+            .into_iter()
+            .map(|namespace| crate::sequence_lookup_key(&namespace, &sequence_name))
+            .find(|key| self.state.sequences.contains_key(key))
+            .unwrap_or(sequence_name)
+        };
         if !self.state.sequences.contains_key(&sequence_key) {
             return Err(ServerError::ddl(format!(
                 "sequence '{sequence}' does not exist"
             )));
-        }
-        if let Some(namespace) = privilege_object_namespace(sequence) {
-            let actual_namespace = self
-                .state
-                .sequence_namespaces
-                .get(&sequence_key)
-                .map_or_else(|| "public".to_owned(), |entry| entry.value().clone());
-            if !actual_namespace.eq_ignore_ascii_case(namespace) {
-                return Err(ServerError::ddl(format!(
-                    "sequence '{sequence}' does not exist"
-                )));
-            }
         }
         Ok(sequence_key)
     }

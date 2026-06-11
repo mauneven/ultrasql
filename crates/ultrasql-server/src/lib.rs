@@ -2645,6 +2645,10 @@ fn type_name_namespace_and_name(name: &str) -> Option<(&str, &str)> {
     (!schema_name.is_empty() && !type_name.is_empty()).then_some((schema_name, type_name))
 }
 
+fn sequence_lookup_key(schema_name: &str, sequence_name: &str) -> String {
+    ultrasql_catalog::table_lookup_key(schema_name, sequence_name)
+}
+
 fn search_path_schema_names(search_path: Option<&str>) -> Vec<String> {
     let Some(search_path) = search_path else {
         return vec!["public".to_owned()];

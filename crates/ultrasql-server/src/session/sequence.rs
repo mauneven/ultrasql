@@ -48,14 +48,15 @@ where
                 "execute_create_sequence called with non-CreateSequence plan",
             ));
         };
+        let sequence_key = crate::sequence_lookup_key(namespace, sequence_name);
         self.ensure_schema_exists(namespace)?;
         self.ensure_schema_create_privilege(namespace)?;
-        if self.state.sequences.contains_key(sequence_name) {
+        if self.state.sequences.contains_key(&sequence_key) {
             if *if_not_exists {
                 return Ok(result_encoder::run_ddl_command("CREATE SEQUENCE"));
             }
             return Err(ServerError::Catalog(
-                ultrasql_catalog::CatalogError::already_exists(sequence_name.clone()),
+                ultrasql_catalog::CatalogError::already_exists(sequence_key),
             ));
         }
         let seq = Sequence::new(to_storage_options(*options))
@@ -79,6 +80,7 @@ where
         };
         if let Err(e) = self.state.persistent_catalog.persist_sequence_rows(
             sequence_name,
+            namespace,
             &seq_row,
             self.state.heap.as_ref(),
             ddl_txn.xid,
@@ -96,7 +98,7 @@ where
             .commit_transaction(ddl_txn, true, "CREATE SEQUENCE catalog transaction")?;
         seq.emit_wal(
             SequenceOpKind::Create,
-            sequence_name,
+            &sequence_key,
             seq_rel,
             self.sequence_xid(),
             self.sequence_wal_sink(),
@@ -104,8 +106,7 @@ where
         .map_err(|e| ServerError::ddl(format!("CREATE SEQUENCE WAL: {e}")))?;
         self.state
             .sequences
-            .insert(sequence_name.clone(), Arc::new(seq));
-        let sequence_key = sequence_name.to_ascii_lowercase();
+            .insert(sequence_key.clone(), Arc::new(seq));
         self.state
             .sequence_owners
             .insert(sequence_key.clone(), self.current_user.to_ascii_lowercase());
@@ -115,6 +116,7 @@ where
         if let Err(err) = self.state.persist_sequence_owner_metadata() {
             self.state.sequence_owners.remove(&sequence_key);
             self.state.sequence_namespaces.remove(&sequence_key);
+            self.state.sequences.remove(&sequence_key);
             return Err(err);
         }
         let before_grants = self.state.privilege_catalog.list_grants();
@@ -123,7 +125,7 @@ where
             &self.current_user,
             namespace,
             crate::auth::PrivilegeObjectKind::Sequence,
-            sequence_name,
+            &sequence_key,
         );
         let grants_changed = before_grants != self.state.privilege_catalog.list_grants()
             || before_default_grants != self.state.privilege_catalog.list_default_grants();
@@ -152,23 +154,24 @@ where
                 "execute_alter_sequence called with non-AlterSequence plan",
             ));
         };
-        self.ensure_sequence_namespace_matches(sequence_name, namespace.as_deref())?;
+        let sequence_key =
+            self.ensure_sequence_namespace_matches(sequence_name, namespace.as_deref())?;
         let seq = self
             .state
             .sequences
-            .get(sequence_name)
+            .get(&sequence_key)
             .ok_or_else(|| {
                 ServerError::Catalog(ultrasql_catalog::CatalogError::not_found(
-                    sequence_name.clone(),
+                    sequence_key.clone(),
                 ))
             })?
             .clone();
-        self.ensure_sequence_owner_or_superuser(sequence_name)?;
+        self.ensure_sequence_owner_or_superuser(&sequence_key)?;
         let (storage, restart_value) = apply_sequence_change(seq.options_snapshot(), *options);
         seq.alter_options_logged(
             storage,
             restart_value,
-            sequence_name,
+            &sequence_key,
             RelationId::INVALID,
             self.sequence_xid(),
             self.sequence_wal_sink(),
@@ -199,8 +202,8 @@ where
             let namespace = sequence_namespaces
                 .get(idx)
                 .and_then(std::option::Option::as_deref);
-            if self.sequence_namespace_matches(name, namespace) {
-                drop_set.insert(name.to_ascii_lowercase());
+            if let Some(sequence_key) = self.sequence_key_for_ddl(name, namespace) {
+                drop_set.insert(sequence_key);
             } else if !*if_exists {
                 return Err(ServerError::Catalog(
                     ultrasql_catalog::CatalogError::not_found(display_sequence_target(
@@ -235,10 +238,7 @@ where
             }
         }
         let mut privilege_grants_removed = false;
-        for name in sequences {
-            if !drop_set.contains(&name.to_ascii_lowercase()) {
-                continue;
-            }
+        for name in &drop_set {
             if let Some(seq) = self.state.sequences.get(name).map(|seq| seq.clone()) {
                 seq.emit_wal(
                     SequenceOpKind::Drop,
@@ -250,12 +250,8 @@ where
                 .map_err(|e| ServerError::ddl(format!("DROP SEQUENCE WAL: {e}")))?;
             }
             self.state.sequences.remove(name);
-            self.state
-                .sequence_owners
-                .remove(&name.to_ascii_lowercase());
-            self.state
-                .sequence_namespaces
-                .remove(&name.to_ascii_lowercase());
+            self.state.sequence_owners.remove(name);
+            self.state.sequence_namespaces.remove(name);
             self.sequence_state.forget(name);
             privilege_grants_removed |= self
                 .state
@@ -274,32 +270,38 @@ where
         &self,
         sequence_name: &str,
         namespace: Option<&str>,
-    ) -> Result<(), ServerError> {
-        if self.sequence_namespace_matches(sequence_name, namespace) {
-            return Ok(());
-        }
-        Err(ServerError::Catalog(
-            ultrasql_catalog::CatalogError::not_found(display_sequence_target(
-                sequence_name,
-                namespace,
-            )),
-        ))
+    ) -> Result<String, ServerError> {
+        self.sequence_key_for_ddl(sequence_name, namespace)
+            .ok_or_else(|| {
+                ServerError::Catalog(ultrasql_catalog::CatalogError::not_found(
+                    display_sequence_target(sequence_name, namespace),
+                ))
+            })
     }
 
-    fn sequence_namespace_matches(&self, sequence_name: &str, namespace: Option<&str>) -> bool {
-        if !self.state.sequences.contains_key(sequence_name) {
-            return false;
+    fn sequence_key_for_ddl(&self, sequence_name: &str, namespace: Option<&str>) -> Option<String> {
+        if let Some(namespace) = namespace {
+            let key = crate::sequence_lookup_key(namespace, sequence_name);
+            return self.state.sequences.contains_key(&key).then_some(key);
         }
-        let Some(namespace) = namespace else {
-            return true;
-        };
-        self.state
-            .sequence_namespaces
-            .get(&sequence_name.to_ascii_lowercase())
-            .map_or_else(
-                || namespace.eq_ignore_ascii_case("public"),
-                |actual| actual.eq_ignore_ascii_case(namespace),
-            )
+        self.sequence_key_for_reference(sequence_name)
+    }
+
+    fn sequence_key_for_reference(&self, sequence_name: &str) -> Option<String> {
+        let folded = sequence_name.to_ascii_lowercase();
+        if let Some((namespace, name)) = crate::type_name_namespace_and_name(&folded) {
+            let key = crate::sequence_lookup_key(namespace, name);
+            return self.state.sequences.contains_key(&key).then_some(key);
+        }
+        if self.state.sequences.contains_key(&folded) {
+            return Some(folded);
+        }
+        crate::search_path_schema_names(
+            self.session_settings.get("search_path").map(String::as_str),
+        )
+        .into_iter()
+        .map(|namespace| crate::sequence_lookup_key(&namespace, &folded))
+        .find(|key| self.state.sequences.contains_key(key))
     }
 
     fn sequence_default_dependents(&self, sequence_name: &str) -> Vec<String> {
@@ -391,32 +393,38 @@ where
     fn sequence_nextval(&mut self, args: &[AstExpr]) -> Result<i64, ServerError> {
         expect_arity(args, 1)?;
         let seq_name = expect_sequence_name(&args[0])?;
-        let seq = self.sequence_by_name(&seq_name)?;
+        let seq_key = self.sequence_key_for_reference(&seq_name).ok_or_else(|| {
+            ServerError::Catalog(ultrasql_catalog::CatalogError::not_found(seq_name.clone()))
+        })?;
+        let seq = self.sequence_by_name(&seq_key)?;
         self.ensure_sequence_function_privilege(
-            &seq_name,
+            &seq_key,
             &[PrivilegeKind::Usage, PrivilegeKind::Update],
         )?;
         let value = seq
             .nextval_logged(
-                &seq_name,
+                &seq_key,
                 RelationId::INVALID,
                 self.sequence_xid(),
                 self.sequence_wal_sink(),
             )
             .map_err(|e| ServerError::ddl(format!("nextval: {e}")))?;
-        self.sequence_state.record_nextval(&seq_name, value);
+        self.sequence_state.record_nextval(&seq_key, value);
         Ok(value)
     }
 
     fn sequence_currval(&self, args: &[AstExpr]) -> Result<i64, ServerError> {
         expect_arity(args, 1)?;
         let seq_name = expect_sequence_name(&args[0])?;
-        self.sequence_by_name(&seq_name)?;
+        let seq_key = self.sequence_key_for_reference(&seq_name).ok_or_else(|| {
+            ServerError::Catalog(ultrasql_catalog::CatalogError::not_found(seq_name.clone()))
+        })?;
+        self.sequence_by_name(&seq_key)?;
         self.ensure_sequence_function_privilege(
-            &seq_name,
+            &seq_key,
             &[PrivilegeKind::Usage, PrivilegeKind::Select],
         )?;
-        self.sequence_state.currval(&seq_name).ok_or_else(|| {
+        self.sequence_state.currval(&seq_key).ok_or_else(|| {
             ServerError::ObjectNotInPrerequisiteState(
                 "currval of sequence called before nextval".to_owned(),
             )
@@ -451,19 +459,22 @@ where
         } else {
             true
         };
-        let seq = self.sequence_by_name(&seq_name)?;
-        self.ensure_sequence_function_privilege(&seq_name, &[PrivilegeKind::Update])?;
+        let seq_key = self.sequence_key_for_reference(&seq_name).ok_or_else(|| {
+            ServerError::Catalog(ultrasql_catalog::CatalogError::not_found(seq_name.clone()))
+        })?;
+        let seq = self.sequence_by_name(&seq_key)?;
+        self.ensure_sequence_function_privilege(&seq_key, &[PrivilegeKind::Update])?;
         seq.setval_logged(
             value,
             is_called,
-            &seq_name,
+            &seq_key,
             RelationId::INVALID,
             self.sequence_xid(),
             self.sequence_wal_sink(),
         )
         .map_err(|e| ServerError::ddl(format!("setval: {e}")))?;
         if is_called {
-            self.sequence_state.record_nextval(&seq_name, value);
+            self.sequence_state.record_nextval(&seq_key, value);
         }
         Ok(value)
     }

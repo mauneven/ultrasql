@@ -2243,9 +2243,10 @@ fn rows_pg_sequences(ctx: &LowerCtx<'_>) -> Vec<Vec<Value>> {
                 .sequence_namespaces
                 .get(&name)
                 .map_or_else(|| "public".to_owned(), |entry| entry.value().clone());
+            let display_name = sequence_display_name(&name, &namespace);
             vec![
                 v_text(namespace),
-                v_text(name),
+                v_text(display_name),
                 v_text(owner),
                 v_text("bigint"),
                 Value::Int64(opts.start),
@@ -2258,6 +2259,15 @@ fn rows_pg_sequences(ctx: &LowerCtx<'_>) -> Vec<Vec<Value>> {
             ]
         })
         .collect()
+}
+
+fn sequence_display_name(key: &str, namespace: &str) -> String {
+    let namespace = namespace.to_ascii_lowercase();
+    let prefix = format!("{namespace}.");
+    let visible = key.strip_prefix(&prefix).unwrap_or(key);
+    visible
+        .rsplit_once('.')
+        .map_or_else(|| visible.to_owned(), |(_, name)| name.to_owned())
 }
 
 fn schema_pg_roles() -> Schema {
@@ -4502,10 +4512,11 @@ fn rows_information_schema_sequences(ctx: &LowerCtx<'_>) -> Vec<Vec<Value>> {
                 .sequence_namespaces
                 .get(&name)
                 .map_or_else(|| "public".to_owned(), |entry| entry.value().clone());
+            let display_name = sequence_display_name(&name, &namespace);
             vec![
                 v_text("ultrasql"),
                 v_text(namespace),
-                v_text(name),
+                v_text(display_name),
                 v_text("bigint"),
                 Value::Null,
                 Value::Null,

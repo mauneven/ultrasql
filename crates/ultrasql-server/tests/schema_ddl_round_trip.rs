@@ -5,6 +5,16 @@ pub mod support;
 use support::{connect_as, shutdown, start_persistent_server, start_sample_server};
 use ultrasql_server::Server;
 
+async fn simple_i64(client: &tokio_postgres::Client, sql: &str) -> i64 {
+    let rows = client.simple_query(sql).await.expect("simple query");
+    rows.iter()
+        .find_map(|msg| match msg {
+            tokio_postgres::SimpleQueryMessage::Row(row) => row.get(0)?.parse::<i64>().ok(),
+            _ => None,
+        })
+        .expect("one int8 row")
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn create_drop_schema_survives_restart_and_blocks_owner_drop() {
     let data_dir = tempfile::TempDir::new().expect("temp data dir");
@@ -546,6 +556,96 @@ async fn same_index_name_is_isolated_by_schema() {
     shutdown(running).await;
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn same_sequence_name_is_isolated_by_schema() {
+    let data_dir = tempfile::TempDir::new().expect("temp data dir");
+    let running = start_persistent_server(data_dir.path(), "schema_same_sequence_name_setup").await;
+
+    running
+        .client
+        .batch_execute(
+            "CREATE SCHEMA app; \
+             CREATE SEQUENCE same_seq START WITH 10; \
+             CREATE SEQUENCE app.same_seq START WITH 50",
+        )
+        .await
+        .expect("schemas may contain sequences with the same name");
+    assert_eq!(
+        simple_i64(&running.client, "SELECT nextval('same_seq')").await,
+        10
+    );
+    assert_eq!(
+        simple_i64(&running.client, "SELECT nextval('app.same_seq')").await,
+        50
+    );
+    running
+        .client
+        .batch_execute(
+            "CREATE ROLE same_seq_reader LOGIN; \
+             GRANT USAGE ON SCHEMA app TO same_seq_reader; \
+             GRANT USAGE, UPDATE ON SEQUENCE app.same_seq TO same_seq_reader",
+        )
+        .await
+        .expect("grant schema-qualified sequence privileges");
+    let (reader, reader_conn) = connect_as(
+        running.bound,
+        "same_seq_reader",
+        "schema_same_sequence_reader",
+    )
+    .await;
+    assert_eq!(
+        simple_i64(&reader, "SELECT nextval('app.same_seq')").await,
+        51
+    );
+    reader
+        .simple_query("SELECT nextval('same_seq')")
+        .await
+        .expect_err("app sequence grant must not leak to public sequence");
+    drop(reader);
+    reader_conn
+        .await
+        .expect("same sequence reader connection joins");
+    shutdown(running).await;
+
+    let running =
+        start_persistent_server(data_dir.path(), "schema_same_sequence_name_verify").await;
+    let rows = running
+        .client
+        .query(
+            "SELECT schemaname, sequencename \
+             FROM pg_catalog.pg_sequences \
+             WHERE sequencename = 'same_seq' \
+             ORDER BY schemaname",
+            &[],
+        )
+        .await
+        .expect("query schema-isolated sequences after restart");
+    let names = rows
+        .iter()
+        .map(|row| (row.get::<_, String>(0), row.get::<_, String>(1)))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        names,
+        vec![
+            ("app".to_owned(), "same_seq".to_owned()),
+            ("public".to_owned(), "same_seq".to_owned()),
+        ],
+        "same sequence name must survive in both schemas"
+    );
+
+    running
+        .client
+        .batch_execute("DROP SEQUENCE app.same_seq")
+        .await
+        .expect("qualified DROP SEQUENCE drops only the app sequence");
+    assert_eq!(
+        simple_i64(&running.client, "SELECT nextval('same_seq')").await,
+        11
+    );
+
+    shutdown(running).await;
+}
+
 #[tokio::test]
 async fn select_respects_schema_qualifier() {
     let running = start_sample_server("schema_select_qualifier_guard").await;
@@ -988,6 +1088,11 @@ async fn qualified_sequence_schema_survives_restart() {
         .expect("query sequence schema before restart")
         .get::<_, String>(0);
     assert_eq!(before, "app");
+    running
+        .client
+        .simple_query("SELECT nextval('event_seq')")
+        .await
+        .expect_err("unqualified sequence lookup must not leak into non-public schema");
     shutdown(running).await;
 
     let running = start_persistent_server(data_dir.path(), "schema_sequence_verify").await;
@@ -1011,7 +1116,7 @@ async fn qualified_sequence_schema_survives_restart() {
 
     running
         .client
-        .batch_execute("DROP SEQUENCE event_seq; DROP SCHEMA app RESTRICT")
+        .batch_execute("DROP SEQUENCE app.event_seq; DROP SCHEMA app RESTRICT")
         .await
         .expect("drop sequence then schema");
 
@@ -1027,7 +1132,7 @@ async fn drop_schema_cascade_removes_qualified_sequences() {
         .batch_execute(
             "CREATE SCHEMA app; \
              CREATE SEQUENCE app.event_seq START WITH 4; \
-             GRANT USAGE ON SEQUENCE event_seq TO PUBLIC; \
+             GRANT USAGE ON SEQUENCE app.event_seq TO PUBLIC; \
              DROP SCHEMA app CASCADE",
         )
         .await

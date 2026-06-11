@@ -526,6 +526,7 @@ fn normalize_object_name(kind: PrivilegeObjectKind, name: &str) -> String {
                 .map_or(compact.as_str(), |(base, _)| base);
             last_name_part(base).to_owned()
         }
+        PrivilegeObjectKind::Sequence => folded,
         _ => last_name_part(&folded).to_owned(),
     }
 }
