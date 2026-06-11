@@ -139,6 +139,49 @@ async fn regclass_literal_uses_search_path_schema() {
     shutdown(running).await;
 }
 
+#[tokio::test]
+async fn regtype_literal_parses_quoted_identifier_path() {
+    let data_dir = tempfile::TempDir::new().expect("temp data dir");
+    let running = start_persistent_server(data_dir.path(), "regtype_quoted_path").await;
+
+    running
+        .client
+        .batch_execute(
+            "CREATE SCHEMA app; \
+             CREATE TYPE app.\"CamelMood\" AS ENUM ('ok'); \
+             SET search_path TO app, public",
+        )
+        .await
+        .expect("create app quoted regtype probe");
+
+    let type_oid = first_i64(
+        running
+            .client
+            .simple_query("SELECT oid FROM pg_type WHERE typname = 'camelmood'")
+            .await
+            .expect("pg_type app type oid"),
+    );
+    let qualified_regtype_oid = first_i64(
+        running
+            .client
+            .simple_query("SELECT 'app.\"CamelMood\"'::regtype")
+            .await
+            .expect("qualified quoted regtype resolves"),
+    );
+    assert_eq!(qualified_regtype_oid, type_oid);
+
+    let search_path_regtype_oid = first_i64(
+        running
+            .client
+            .simple_query("SELECT '\"CamelMood\"'::regtype")
+            .await
+            .expect("search_path quoted regtype resolves"),
+    );
+    assert_eq!(search_path_regtype_oid, type_oid);
+
+    shutdown(running).await;
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn oid_regclass_regtype_pg_lsn_store_cast_wire_and_restart() {
     let data_dir = tempfile::TempDir::new().unwrap();

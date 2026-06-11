@@ -2791,7 +2791,7 @@ fn coerce_literal_to_oid_alias_with_catalog(
                 resolve_regclass_literal(text, catalog)
             }
             (DataType::RegType, Value::Text(text) | Value::Char(text)) => {
-                Value::parse_oid_text(text).or_else(|| catalog.lookup_type_oid(text))
+                resolve_regtype_literal(text, catalog)
             }
             _ => oid_from_literal_value(value),
         };
@@ -2819,6 +2819,18 @@ fn resolve_regclass_literal(text: &str, catalog: &dyn Catalog) -> Option<Oid> {
         [schema_name, relation_name] => {
             catalog.lookup_table_oid_in_schema(schema_name, relation_name)
         }
+        _ => None,
+    }
+}
+
+fn resolve_regtype_literal(text: &str, catalog: &dyn Catalog) -> Option<Oid> {
+    if let Some(oid) = Value::parse_oid_text(text) {
+        return Some(oid);
+    }
+    let parts = parse_pg_identifier_path(text)?;
+    match parts.as_slice() {
+        [name] => catalog.lookup_type_oid(name),
+        [schema_name, type_name] => catalog.lookup_type_oid_in_schema(schema_name, type_name),
         _ => None,
     }
 }
