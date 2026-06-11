@@ -1956,22 +1956,20 @@ fn unquote_xml_path_literal(text: &str) -> Option<String> {
     if !matches!(quote, b'\'' | b'"') || text.as_bytes().last().copied() != Some(quote) {
         return None;
     }
-    Some(text[1..text.len().checked_sub(1)?].to_owned())
+    Some(text.get(1..text.len().checked_sub(1)?)?.to_owned())
 }
 
 fn xml_root_element(text: &str) -> Option<XmlElement> {
     let mut cursor = 0_usize;
     while let Some(relative) = text[cursor..].find('<') {
-        let open = cursor + relative;
-        let next = text.as_bytes().get(open + 1).copied()?;
+        let open = cursor.checked_add(relative)?;
+        let next = text.as_bytes().get(open.checked_add(1)?).copied()?;
         match next {
             b'?' => {
-                let end = text[open + 2..].find("?>")?;
-                cursor = open + 2 + end + 2;
+                cursor = xml_terminated_cursor(text, open, 2, "?>")?;
             }
             b'!' if text[open..].starts_with("<!--") => {
-                let end = text[open + 4..].find("-->")?;
-                cursor = open + 4 + end + 3;
+                cursor = xml_terminated_cursor(text, open, 4, "-->")?;
             }
             b'!' => return None,
             b'/' => return None,
@@ -1989,15 +1987,16 @@ fn read_xml_element_at(
     if text.as_bytes().get(open) != Some(&b'<') {
         return None;
     }
-    let next = text.as_bytes().get(open + 1).copied()?;
+    let tag_start = open.checked_add(1)?;
+    let next = text.as_bytes().get(tag_start).copied()?;
     if matches!(next, b'/' | b'!' | b'?') {
         return None;
     }
-    let tag_close = xml_tag_end(text, open + 1)?;
-    let mut content = text[open + 1..tag_close].trim();
+    let tag_close = xml_tag_end(text, tag_start)?;
+    let mut content = text.get(tag_start..tag_close)?.trim();
     let self_closing = content.ends_with('/');
-    if self_closing {
-        content = content[..content.len().checked_sub(1)?].trim_end();
+    if let Some(stripped) = content.strip_suffix('/') {
+        content = stripped.trim_end();
     }
     let name_len = xml_name_len(content.as_bytes());
     if name_len == 0 {
@@ -2006,7 +2005,7 @@ fn read_xml_element_at(
     let name = content[..name_len].to_owned();
     let attrs = xml_parse_attributes(&content[name_len..])?;
     let namespaces = xml_namespace_context(inherited_namespaces, &attrs);
-    let content_start = tag_close + 1;
+    let content_start = tag_close.checked_add(1)?;
     if self_closing {
         return Some(XmlElement {
             name,
@@ -2022,27 +2021,26 @@ fn read_xml_element_at(
     let mut cursor = content_start;
     let mut same_name_depth = 1_usize;
     while let Some(relative) = text[cursor..].find('<') {
-        let tag_open = cursor + relative;
-        let next = text.as_bytes().get(tag_open + 1).copied()?;
+        let tag_open = cursor.checked_add(relative)?;
+        let next = text.as_bytes().get(tag_open.checked_add(1)?).copied()?;
         match next {
             b'?' => {
-                let end = text[tag_open + 2..].find("?>")?;
-                cursor = tag_open + 2 + end + 2;
+                cursor = xml_terminated_cursor(text, tag_open, 2, "?>")?;
             }
             b'!' if text[tag_open..].starts_with("<!--") => {
-                let end = text[tag_open + 4..].find("-->")?;
-                cursor = tag_open + 4 + end + 3;
+                cursor = xml_terminated_cursor(text, tag_open, 4, "-->")?;
             }
             b'!' if text[tag_open..].starts_with("<![CDATA[") => {
-                let end = text[tag_open + 9..].find("]]>")?;
-                cursor = tag_open + 9 + end + 3;
+                cursor = xml_terminated_cursor(text, tag_open, 9, "]]>")?;
             }
             b'/' => {
-                let close = xml_tag_end(text, tag_open + 2)?;
-                let closing_name = text[tag_open + 2..close].trim();
+                let close_name_start = tag_open.checked_add(2)?;
+                let close = xml_tag_end(text, close_name_start)?;
+                let closing_name = text.get(close_name_start..close)?.trim();
                 if closing_name == name {
                     same_name_depth = same_name_depth.checked_sub(1)?;
                     if same_name_depth == 0 {
+                        let close_end = close.checked_add(1)?;
                         return Some(XmlElement {
                             name,
                             attrs,
@@ -2050,18 +2048,19 @@ fn read_xml_element_at(
                             open_start: open,
                             content_start,
                             close_start: tag_open,
-                            close_end: close + 1,
+                            close_end,
                         });
                     }
                 }
-                cursor = close + 1;
+                cursor = close.checked_add(1)?;
             }
             _ => {
-                let child_close = xml_tag_end(text, tag_open + 1)?;
-                let mut child_content = text[tag_open + 1..child_close].trim();
+                let child_start = tag_open.checked_add(1)?;
+                let child_close = xml_tag_end(text, child_start)?;
+                let mut child_content = text.get(child_start..child_close)?.trim();
                 let child_self_closing = child_content.ends_with('/');
-                if child_self_closing {
-                    child_content = child_content[..child_content.len().checked_sub(1)?].trim_end();
+                if let Some(stripped) = child_content.strip_suffix('/') {
+                    child_content = stripped.trim_end();
                 }
                 let child_name_len = xml_name_len(child_content.as_bytes());
                 if child_name_len == 0 {
@@ -2070,7 +2069,7 @@ fn read_xml_element_at(
                 if child_content[..child_name_len] == name && !child_self_closing {
                     same_name_depth = same_name_depth.checked_add(1)?;
                 }
-                cursor = child_close + 1;
+                cursor = child_close.checked_add(1)?;
             }
         }
     }
