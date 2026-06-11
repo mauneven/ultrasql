@@ -441,6 +441,20 @@ async fn pg_relation_size_reports_heap_pages() {
     assert_eq!(rows[0].get::<_, String>(1), "8 kB");
 
     client
+        .batch_execute("CREATE TABLE \"size.dot\" (id INT)")
+        .await
+        .expect("create quoted dotted sized table");
+    client
+        .batch_execute("INSERT INTO \"size.dot\" VALUES (1)")
+        .await
+        .expect("insert quoted dotted sized row");
+    let dotted = client
+        .query_one("SELECT pg_relation_size('\"size.dot\"')", &[])
+        .await
+        .expect("quoted dotted relation size");
+    assert_eq!(dotted.get::<_, i64>(0), 8192);
+
+    client
         .batch_execute("CREATE SCHEMA app")
         .await
         .expect("create app schema");
