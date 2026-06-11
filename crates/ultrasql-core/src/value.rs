@@ -1349,7 +1349,9 @@ pub fn xml_xpath_element_fragments_with_namespaces(
         } else {
             value
                 .find(&delimiter)
-                .map_or_else(String::new, |idx| value[idx + delimiter.len()..].to_owned())
+                .and_then(|idx| idx.checked_add(delimiter.len()))
+                .and_then(|start| value.get(start..))
+                .map_or_else(String::new, ToOwned::to_owned)
         };
         return Some(vec![after]);
     }
@@ -1462,7 +1464,7 @@ pub fn xml_xpath_element_fragments_with_namespaces(
         XmlPathStep::Attribute(_) | XmlPathStep::Text => return None,
     };
     for (idx, step) in steps[1..].iter().enumerate() {
-        let terminal = idx + 2 == steps.len();
+        let terminal = idx.checked_add(2) == Some(steps.len());
         match step {
             XmlPathStep::Element {
                 descendant,
@@ -1567,7 +1569,7 @@ fn xml_xpath_string_literal_function_arguments<'a>(
         .trim();
     let comma = xml_xpath_top_level_comma(inner)?;
     let left = inner[..comma].trim();
-    let right = inner[comma + 1..].trim();
+    let right = inner.get(comma.checked_add(1)?..)?.trim();
     let literal = unquote_xml_path_literal(right)?;
     left.starts_with('/').then_some((left, literal))
 }
@@ -1677,7 +1679,7 @@ fn xml_xpath_top_level_comma_split(text: &str) -> Option<Vec<&str>> {
                     return None;
                 }
                 parts.push(part);
-                start = idx + ch.len_utf8();
+                start = idx.checked_add(ch.len_utf8())?;
             }
             None => {}
         }
