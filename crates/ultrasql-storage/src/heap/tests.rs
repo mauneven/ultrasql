@@ -191,6 +191,27 @@ fn slot_window_rejects_itemid_range_outside_page() {
     ));
 }
 
+#[test]
+fn tuple_header_range_rejects_offset_overflow() {
+    let err = HeapAccess::<MapLoader>::tuple_header_range(usize::MAX).unwrap_err();
+
+    assert!(matches!(
+        err,
+        HeapError::MalformedHeader("tuple header range overflow")
+    ));
+}
+
+#[test]
+fn tuple_field_range_rejects_offset_overflow() {
+    let err = HeapAccess::<MapLoader>::tuple_field_range(usize::MAX, 8, 8, "tuple field overflow")
+        .unwrap_err();
+
+    assert!(matches!(
+        err,
+        HeapError::MalformedHeader("tuple field overflow")
+    ));
+}
+
 #[derive(Debug, Default)]
 struct CountingOracle {
     inner: MapOracle,

@@ -492,6 +492,7 @@ mod insert;
 mod scan;
 #[cfg(test)]
 mod tests;
+mod tuple_fields;
 mod update;
 mod update_inplace;
 mod vacuum;

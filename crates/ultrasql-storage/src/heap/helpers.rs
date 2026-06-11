@@ -15,7 +15,10 @@ use ultrasql_mvcc::tuple_header::{InfoMask, TUPLE_HEADER_SIZE};
 use crate::buffer_pool::{BufferPool, PageGuard, PageLoader, PageWrite};
 use crate::page::PageError;
 
-use super::{DeleteOptions, HeapAccess, HeapError, HeapTuple, InsertOptions, UpdateOptions};
+use super::{
+    DeleteOptions, HeapAccess, HeapError, HeapTuple, InsertOptions, UpdateOptions,
+    checked_tuple_space_needed,
+};
 
 impl<L: PageLoader> HeapAccess<L> {
     /// Mark a page as all-visible in the visibility map.
@@ -111,7 +114,7 @@ impl<L: PageLoader> HeapAccess<L> {
 
             // Check whether there is room for the new version on this page.
             let free = page.header().free_space();
-            if free < new_tuple_size + crate::page::ITEMID_SIZE {
+            if free < checked_tuple_space_needed(new_tuple_size)? {
                 // Not enough room — signal fallback to caller.
                 return Ok(None);
             }
@@ -148,7 +151,8 @@ impl<L: PageLoader> HeapAccess<L> {
             let new_hdr_bytes = Self::collect_header_bytes(&patched_new_hdr);
             let page_bytes = page.as_bytes_mut();
             let (new_off, _) = Self::slot_window(page_bytes, new_slot)?;
-            page_bytes[new_off..new_off + TUPLE_HEADER_SIZE].copy_from_slice(&new_hdr_bytes);
+            Self::tuple_header_bytes_mut(page_bytes, new_off, "new header outside page")?
+                .copy_from_slice(&new_hdr_bytes);
 
             // Patch the old tuple's header in place: set xmax/cmax,
             // HOT_UPDATED flag, and redirect ctid to the new version.
@@ -156,15 +160,17 @@ impl<L: PageLoader> HeapAccess<L> {
             if old_len < TUPLE_HEADER_SIZE {
                 return Err(HeapError::MalformedHeader("old slot shorter than header"));
             }
-            let (mut old_hdr, _) =
-                TupleHeader::decode(&page_bytes[old_off..old_off + TUPLE_HEADER_SIZE])
-                    .ok_or(HeapError::MalformedHeader("old header decode failed"))?;
+            let old_header =
+                Self::tuple_header_bytes(page_bytes, old_off, "old header outside page")?;
+            let (mut old_hdr, _) = TupleHeader::decode(old_header)
+                .ok_or(HeapError::MalformedHeader("old header decode failed"))?;
             old_hdr.xmax = opts.xid;
             old_hdr.cmax = opts.command_id;
             old_hdr.infomask.set(InfoMask::HOT_UPDATED);
             old_hdr.ctid = new_tid;
             let old_hdr_bytes = Self::collect_header_bytes(&old_hdr);
-            page_bytes[old_off..old_off + TUPLE_HEADER_SIZE].copy_from_slice(&old_hdr_bytes);
+            Self::tuple_header_bytes_mut(page_bytes, old_off, "old header outside page")?
+                .copy_from_slice(&old_hdr_bytes);
 
             new_tid
         };
@@ -206,18 +212,17 @@ impl<L: PageLoader> HeapAccess<L> {
         let n_atts;
         {
             let bytes = page.as_bytes_mut();
-            let xmax_at = old_off + 8;
-            let existing_xmax = read_u64_le(bytes, xmax_at)?;
+            let existing_xmax = Self::read_xmax(bytes, old_off)?;
             if existing_xmax != 0 {
                 return Err(HeapError::MalformedHeader("update on deleted tuple"));
             }
-            n_atts = read_u16_le(bytes, old_off + 26)?;
+            n_atts = Self::read_n_atts(bytes, old_off)?;
         }
 
         // Free-space precheck — avoid building the new tuple and
         // entering `insert_tuple_appended` only to bounce back.
         let free = page.header().free_space();
-        if free < new_tuple_size + crate::page::ITEMID_SIZE {
+        if free < checked_tuple_space_needed(new_tuple_size)? {
             return Ok(None);
         }
 
@@ -245,29 +250,15 @@ impl<L: PageLoader> HeapAccess<L> {
         let (new_off, _) = Self::slot_window(page_bytes, new_slot)?;
 
         // New tuple ctid (bytes 32..40 relative to slot).
-        let ctid_rel_at = new_off + 32;
-        page_bytes[ctid_rel_at..ctid_rel_at + 4]
-            .copy_from_slice(&new_tid.page.relation.0.raw().to_le_bytes());
-        let block_slot_packed =
-            (new_tid.page.block.raw() & 0x00FF_FFFF) | ((u32::from(new_tid.slot)) << 24);
-        page_bytes[ctid_rel_at + 4..ctid_rel_at + 8]
-            .copy_from_slice(&block_slot_packed.to_le_bytes());
+        Self::write_ctid(page_bytes, new_off, new_tid)?;
 
         // Old tuple stamps: xmax | cmax | infomask |= HOT_UPDATED | ctid.
-        let xmax_at = old_off + 8;
-        page_bytes[xmax_at..xmax_at + 8].copy_from_slice(&opts.xid.raw().to_le_bytes());
-        let cmax_at = old_off + 20;
-        page_bytes[cmax_at..cmax_at + 4].copy_from_slice(&opts.command_id.raw().to_le_bytes());
-        let infomask_at = old_off + 24;
-        let cur_infomask =
-            u16::from_le_bytes([page_bytes[infomask_at], page_bytes[infomask_at + 1]]);
+        Self::write_xmax(page_bytes, old_off, opts.xid)?;
+        Self::write_cmax(page_bytes, old_off, opts.command_id)?;
+        let cur_infomask = Self::read_infomask(page_bytes, old_off)?;
         let new_infomask = cur_infomask | InfoMask::HOT_UPDATED;
-        page_bytes[infomask_at..infomask_at + 2].copy_from_slice(&new_infomask.to_le_bytes());
-        let old_ctid_at = old_off + 32;
-        page_bytes[old_ctid_at..old_ctid_at + 4]
-            .copy_from_slice(&new_tid.page.relation.0.raw().to_le_bytes());
-        page_bytes[old_ctid_at + 4..old_ctid_at + 8]
-            .copy_from_slice(&block_slot_packed.to_le_bytes());
+        Self::write_infomask(page_bytes, old_off, new_infomask)?;
+        Self::write_ctid(page_bytes, old_off, new_tid)?;
 
         Ok(Some(new_tid))
     }
@@ -315,36 +306,24 @@ impl<L: PageLoader> HeapAccess<L> {
         // Check tuple is alive — `is_alive == xmax.is_invalid()`,
         // and `Xid::INVALID == 0`, so read the 8-byte xmax field
         // and compare to zero. Eight bytes — one cache-line touch.
-        let xmax_at = slot_offset + 8;
-        let existing_xmax = read_u64_le(page_bytes, xmax_at)?;
+        let existing_xmax = Self::read_xmax(page_bytes, slot_offset)?;
         if existing_xmax != 0 {
             return Err(HeapError::MalformedHeader("update on deleted tuple"));
         }
 
         // Stamp xmax (bytes 8..16).
-        page_bytes[xmax_at..xmax_at + 8].copy_from_slice(&xid.raw().to_le_bytes());
+        Self::write_xmax(page_bytes, slot_offset, xid)?;
 
         // Stamp cmax (bytes 20..24).
-        let cmax_at = slot_offset + 20;
-        page_bytes[cmax_at..cmax_at + 4].copy_from_slice(&command_id.raw().to_le_bytes());
+        Self::write_cmax(page_bytes, slot_offset, command_id)?;
 
         // OR `UPDATED` into infomask (bytes 24..26).
-        let infomask_at = slot_offset + 24;
-        let cur_infomask =
-            u16::from_le_bytes([page_bytes[infomask_at], page_bytes[infomask_at + 1]]);
+        let cur_infomask = Self::read_infomask(page_bytes, slot_offset)?;
         let new_infomask = cur_infomask | InfoMask::UPDATED;
-        page_bytes[infomask_at..infomask_at + 2].copy_from_slice(&new_infomask.to_le_bytes());
+        Self::write_infomask(page_bytes, slot_offset, new_infomask)?;
 
         // Stamp ctid relation (bytes 32..36).
-        let ctid_rel_at = slot_offset + 32;
-        page_bytes[ctid_rel_at..ctid_rel_at + 4]
-            .copy_from_slice(&new_tid.page.relation.0.raw().to_le_bytes());
-
-        // Stamp ctid block+slot packing (bytes 36..40).
-        let block_slot_packed =
-            (new_tid.page.block.raw() & 0x00FF_FFFF) | ((u32::from(new_tid.slot)) << 24);
-        page_bytes[ctid_rel_at + 4..ctid_rel_at + 8]
-            .copy_from_slice(&block_slot_packed.to_le_bytes());
+        Self::write_ctid(page_bytes, slot_offset, new_tid)?;
 
         Ok(())
     }
@@ -376,7 +355,8 @@ impl<L: PageLoader> HeapAccess<L> {
         if slot_length < TUPLE_HEADER_SIZE {
             return Err(HeapError::MalformedHeader("slot shorter than header"));
         }
-        page_bytes[slot_offset..slot_offset + TUPLE_HEADER_SIZE].copy_from_slice(&hdr_bytes);
+        Self::tuple_header_bytes_mut(page_bytes, slot_offset, "slot header outside page")?
+            .copy_from_slice(&hdr_bytes);
         Ok(())
     }
 
@@ -456,28 +436,34 @@ impl<L: PageLoader> HeapAccess<L> {
     }
 
     /// Extract `(offset, length)` of slot `slot` by reading its
-    /// `ItemId` bytes directly out of the page buffer. The page-module
-    /// helpers `read_item_id` / `item_id_offset` are private, so we
-    /// inline the same arithmetic here.
-    ///
-    /// If the page-module helpers become `pub(crate)` we should switch
-    /// to those.
+    /// `ItemId` bytes directly out of the page buffer. Bounds-sensitive
+    /// byte ranges go through the page module's checked slot-directory
+    /// offset helper.
     #[inline]
     pub(super) fn slot_window(
         page_bytes: &[u8; ultrasql_core::constants::PAGE_SIZE],
         slot: u16,
     ) -> Result<(usize, usize), HeapError> {
-        use crate::page::{ITEMID_SIZE, ItemId, PAGE_HEADER_SIZE};
+        use crate::page::{ITEMID_SIZE, ItemId, Page};
 
-        let off = PAGE_HEADER_SIZE + usize::from(slot) * ITEMID_SIZE;
-        if off + ITEMID_SIZE > page_bytes.len() {
-            return Err(HeapError::Page(PageError::InvalidSlot {
+        let off = Page::try_item_id_offset(slot).map_err(|_| {
+            HeapError::Page(PageError::InvalidSlot {
                 index: slot,
                 len: 0,
-            }));
-        }
+            })
+        })?;
+        let end = off
+            .checked_add(ITEMID_SIZE)
+            .ok_or(HeapError::MalformedHeader("itemid range overflow"))?;
+        let item_bytes =
+            page_bytes
+                .get(off..end)
+                .ok_or(HeapError::Page(PageError::InvalidSlot {
+                    index: slot,
+                    len: 0,
+                }))?;
         let raw = u32::from_le_bytes(
-            page_bytes[off..off + ITEMID_SIZE]
+            item_bytes
                 .try_into()
                 .map_err(|_| HeapError::MalformedHeader("itemid slice"))?,
         );
@@ -489,35 +475,11 @@ impl<L: PageLoader> HeapAccess<L> {
         let end = offset
             .checked_add(length)
             .ok_or(HeapError::MalformedHeader("itemid tuple range overflow"))?;
-        if end > page_bytes.len() {
+        if page_bytes.get(offset..end).is_none() {
             return Err(HeapError::MalformedHeader(
                 "itemid tuple range outside page",
             ));
         }
         Ok((offset, length))
     }
-}
-
-#[inline]
-fn read_u64_le(bytes: &[u8], offset: usize) -> Result<u64, HeapError> {
-    let end = offset
-        .checked_add(8)
-        .ok_or(HeapError::MalformedHeader("u64 field offset overflow"))?;
-    let window = bytes
-        .get(offset..end)
-        .ok_or(HeapError::MalformedHeader("u64 field outside tuple"))?;
-    Ok(u64::from_le_bytes([
-        window[0], window[1], window[2], window[3], window[4], window[5], window[6], window[7],
-    ]))
-}
-
-#[inline]
-fn read_u16_le(bytes: &[u8], offset: usize) -> Result<u16, HeapError> {
-    let end = offset
-        .checked_add(2)
-        .ok_or(HeapError::MalformedHeader("u16 field offset overflow"))?;
-    let window = bytes
-        .get(offset..end)
-        .ok_or(HeapError::MalformedHeader("u16 field outside tuple"))?;
-    Ok(u16::from_le_bytes([window[0], window[1]]))
 }
