@@ -15,6 +15,11 @@ pub struct BitString {
     bytes: Vec<u8>,
 }
 
+const BITS_PER_BYTE_SHIFT: usize = 3;
+const BYTE_BIT_MASK: usize = 0b111;
+const HIGH_BIT_INDEX: usize = 7;
+const PG_BIT_LENGTH_BYTES: usize = 4;
+
 impl BitString {
     /// Build a bit string from an already packed payload.
     #[must_use]
@@ -170,7 +175,9 @@ impl BitString {
         let len = usize::try_from(self.len).ok()?;
         let mut bytes = vec![0_u8; byte_len(self.len)?];
         for idx in 0..len {
-            if idx >= amount && self.bit(idx - amount)? {
+            if let Some(source) = idx.checked_sub(amount)
+                && self.bit(source)?
+            {
                 set_raw_bit(&mut bytes, idx, true)?;
             }
         }
@@ -220,7 +227,7 @@ impl BitString {
     /// followed by packed bytes.
     #[must_use]
     pub fn to_pg_binary(&self) -> Vec<u8> {
-        let mut out = Vec::with_capacity(4 + self.bytes.len());
+        let mut out = Vec::with_capacity(self.bytes.len().saturating_add(PG_BIT_LENGTH_BYTES));
         let len = i32::try_from(self.len).unwrap_or(i32::MAX);
         out.extend_from_slice(&len.to_be_bytes());
         out.extend_from_slice(&self.bytes);
@@ -323,15 +330,17 @@ fn byte_len(len: u32) -> Option<usize> {
 }
 
 fn raw_bit(bytes: &[u8], idx: usize) -> Option<bool> {
-    let byte_idx = idx / 8;
-    let bit_idx = idx % 8;
-    Some(((bytes.get(byte_idx)? >> (7 - bit_idx)) & 1) == 1)
+    let byte_idx = idx >> BITS_PER_BYTE_SHIFT;
+    let bit_idx = idx & BYTE_BIT_MASK;
+    let shift = HIGH_BIT_INDEX.checked_sub(bit_idx)?;
+    Some(((bytes.get(byte_idx)? >> shift) & 1) == 1)
 }
 
 fn set_raw_bit(bytes: &mut [u8], idx: usize, bit: bool) -> Option<()> {
-    let byte_idx = idx / 8;
-    let bit_idx = idx % 8;
-    let mask = 1_u8 << (7 - bit_idx);
+    let byte_idx = idx >> BITS_PER_BYTE_SHIFT;
+    let bit_idx = idx & BYTE_BIT_MASK;
+    let shift = HIGH_BIT_INDEX.checked_sub(bit_idx)?;
+    let mask = 1_u8 << shift;
     let byte = bytes.get_mut(byte_idx)?;
     if bit {
         *byte |= mask;
@@ -346,7 +355,10 @@ fn mask_unused_bits(len: u32, bytes: &mut [u8]) {
     if rem == 0 || bytes.is_empty() {
         return;
     }
-    let keep = u8::MAX << (8 - rem);
+    let Some(shift) = 8_u32.checked_sub(rem) else {
+        return;
+    };
+    let keep = u8::MAX << shift;
     if let Some(last) = bytes.last_mut() {
         *last &= keep;
     }
@@ -384,6 +396,8 @@ mod tests {
         assert_eq!(bits.bit_not().to_string(), "0101");
         assert_eq!(bits.shift_left(1).unwrap().to_string(), "0100");
         assert_eq!(bits.shift_right(2).unwrap().to_string(), "0010");
+        assert_eq!(bits.shift_left(usize::MAX).unwrap().to_string(), "0000");
+        assert_eq!(bits.shift_right(usize::MAX).unwrap().to_string(), "0000");
         assert_eq!(bits.set_bit(1, true).unwrap().to_string(), "1110");
     }
 
