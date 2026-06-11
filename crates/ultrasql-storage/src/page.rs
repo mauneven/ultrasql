@@ -42,6 +42,8 @@ use ultrasql_core::endian::{
     read_u16_le, read_u32_le, read_u64_le, write_u16_le, write_u32_le, write_u64_le,
 };
 
+use std::ops::Range;
+
 use crate::checksum::{CHECKSUM_OFFSET, compute_page_checksum};
 
 /// Size of a [`PageHeader`] in bytes.
@@ -313,7 +315,10 @@ impl PageHeader {
             || up < lo
             || sp < up
             || sp > PAGE_SIZE
-            || (lo - PAGE_HEADER_SIZE) % ITEMID_SIZE != 0
+            || lo
+                .checked_sub(PAGE_HEADER_SIZE)
+                .and_then(|slot_bytes| slot_bytes.checked_rem(ITEMID_SIZE))
+                .is_none_or(|rem| rem != 0)
         {
             return Err(PageError::Malformed("pointer ordering"));
         }
@@ -347,13 +352,43 @@ impl PageHeader {
     /// Number of slots currently allocated on the page.
     #[must_use]
     pub const fn slot_count(&self) -> u16 {
-        (self.lower - PAGE_HEADER_SIZE_U16) / ITEMID_SIZE_U16
+        match self.try_slot_count() {
+            Ok(count) => count,
+            Err(_) => panic!("page header slot count invariant violated"),
+        }
+    }
+
+    /// Checked slot count for callers that receive an untrusted public
+    /// [`PageHeader`] value.
+    pub const fn try_slot_count(&self) -> Result<u16, PageError> {
+        let Some(slot_bytes) = self.lower.checked_sub(PAGE_HEADER_SIZE_U16) else {
+            return Err(PageError::Malformed("slot directory lower before header"));
+        };
+        let Some(rem) = slot_bytes.checked_rem(ITEMID_SIZE_U16) else {
+            return Err(PageError::Malformed("slot directory item size"));
+        };
+        if rem != 0 {
+            return Err(PageError::Malformed("slot directory alignment"));
+        }
+        let Some(count) = slot_bytes.checked_div(ITEMID_SIZE_U16) else {
+            return Err(PageError::Malformed("slot directory item size"));
+        };
+        Ok(count)
     }
 
     /// Bytes of free space available for additional tuples.
     #[must_use]
     pub fn free_space(&self) -> usize {
-        usize::from(self.upper) - usize::from(self.lower)
+        self.try_free_space()
+            .expect("page header free space invariant violated")
+    }
+
+    /// Checked free-space width for callers that receive an untrusted
+    /// public [`PageHeader`] value.
+    pub fn try_free_space(&self) -> Result<usize, PageError> {
+        usize::from(self.upper)
+            .checked_sub(usize::from(self.lower))
+            .ok_or(PageError::Malformed("free space pointer ordering"))
     }
 }
 
@@ -498,8 +533,10 @@ impl Page {
         let reuse = self.find_reusable_slot(header.slot_count());
         let needed_data = tuple.len();
         let needed_slot = if reuse.is_some() { 0 } else { ITEMID_SIZE };
-        let needed = needed_data + needed_slot;
-        let free = header.free_space();
+        let needed = needed_data
+            .checked_add(needed_slot)
+            .ok_or(PageError::Malformed("tuple size overflow"))?;
+        let free = header.try_free_space()?;
         if free < needed {
             return Err(PageError::NoSpace {
                 needed,
@@ -507,8 +544,13 @@ impl Page {
             });
         }
 
-        let new_upper = usize::from(header.upper) - needed_data;
-        self.bytes[new_upper..new_upper + tuple.len()].copy_from_slice(tuple);
+        let new_upper = usize::from(header.upper)
+            .checked_sub(needed_data)
+            .ok_or(PageError::Malformed("tuple upper underflow"))?;
+        let tuple_end = new_upper
+            .checked_add(tuple.len())
+            .ok_or(PageError::Malformed("tuple range overflow"))?;
+        self.bytes[new_upper..tuple_end].copy_from_slice(tuple);
 
         let item = ItemId::new(
             item_offset_from_usize(new_upper)?,
@@ -521,8 +563,10 @@ impl Page {
         } else {
             let idx = header.slot_count();
             self.write_item_id(idx, item);
-            header.lower =
-                page_u16_from_usize(usize::from(header.lower) + ITEMID_SIZE, "page lower")?;
+            let new_lower = usize::from(header.lower)
+                .checked_add(ITEMID_SIZE)
+                .ok_or(PageError::Malformed("page lower overflow"))?;
+            header.lower = page_u16_from_usize(new_lower, "page lower")?;
             idx
         };
 
@@ -554,8 +598,11 @@ impl Page {
         }
 
         let mut header = self.header();
-        let needed = tuple.len() + ITEMID_SIZE;
-        let free = header.free_space();
+        let needed = tuple
+            .len()
+            .checked_add(ITEMID_SIZE)
+            .ok_or(PageError::Malformed("tuple size overflow"))?;
+        let free = header.try_free_space()?;
         if free < needed {
             return Err(PageError::NoSpace {
                 needed,
@@ -563,8 +610,13 @@ impl Page {
             });
         }
 
-        let new_upper = usize::from(header.upper) - tuple.len();
-        self.bytes[new_upper..new_upper + tuple.len()].copy_from_slice(tuple);
+        let new_upper = usize::from(header.upper)
+            .checked_sub(tuple.len())
+            .ok_or(PageError::Malformed("tuple upper underflow"))?;
+        let tuple_end = new_upper
+            .checked_add(tuple.len())
+            .ok_or(PageError::Malformed("tuple range overflow"))?;
+        self.bytes[new_upper..tuple_end].copy_from_slice(tuple);
 
         let item = ItemId::new(
             item_offset_from_usize(new_upper)?,
@@ -573,7 +625,10 @@ impl Page {
         );
         let idx = header.slot_count();
         self.write_item_id(idx, item);
-        header.lower = page_u16_from_usize(usize::from(header.lower) + ITEMID_SIZE, "page lower")?;
+        let new_lower = usize::from(header.lower)
+            .checked_add(ITEMID_SIZE)
+            .ok_or(PageError::Malformed("page lower overflow"))?;
+        header.lower = page_u16_from_usize(new_lower, "page lower")?;
         header.upper = page_u16_from_usize(new_upper, "page upper")?;
         header.encode(&mut self.bytes);
         Ok(idx)
@@ -700,23 +755,42 @@ impl Page {
     /// [`Self::insert_tuple_appended`] performs.
     #[must_use]
     pub(crate) fn item_id_offset(slot: SlotIndex) -> usize {
-        PAGE_HEADER_SIZE + usize::from(slot) * ITEMID_SIZE
+        Self::try_item_id_offset(slot).expect("page item id offset invariant violated")
+    }
+
+    pub(crate) fn try_item_id_offset(slot: SlotIndex) -> Result<usize, PageError> {
+        let slot_bytes = usize::from(slot)
+            .checked_mul(ITEMID_SIZE)
+            .ok_or(PageError::Malformed("slot directory offset overflow"))?;
+        let off = PAGE_HEADER_SIZE
+            .checked_add(slot_bytes)
+            .ok_or(PageError::Malformed("slot directory offset overflow"))?;
+        let end = off
+            .checked_add(ITEMID_SIZE)
+            .ok_or(PageError::Malformed("slot directory offset overflow"))?;
+        if end > PAGE_SIZE {
+            return Err(PageError::Malformed("slot directory out of bounds"));
+        }
+        Ok(off)
+    }
+
+    fn item_id_range(slot: SlotIndex) -> Range<usize> {
+        let start = Self::item_id_offset(slot);
+        let end = start
+            .checked_add(ITEMID_SIZE)
+            .expect("page item id offset invariant violated");
+        start..end
     }
 
     fn read_item_id(&self, slot: SlotIndex) -> ItemId {
-        let off = Self::item_id_offset(slot);
-        let raw = u32::from_le_bytes([
-            self.bytes[off],
-            self.bytes[off + 1],
-            self.bytes[off + 2],
-            self.bytes[off + 3],
-        ]);
+        let range = Self::item_id_range(slot);
+        let raw = read_u32_le(&self.bytes[range]).expect("page item id range invariant violated");
         ItemId::from_raw(raw)
     }
 
     fn write_item_id(&mut self, slot: SlotIndex, id: ItemId) {
-        let off = Self::item_id_offset(slot);
-        write_u32_le(&mut self.bytes[off..off + ITEMID_SIZE], id.into_raw());
+        let range = Self::item_id_range(slot);
+        write_u32_le(&mut self.bytes[range], id.into_raw());
     }
 }
 
@@ -950,6 +1024,40 @@ mod tests {
         assert!(matches!(
             err,
             PageError::Malformed("tuple range out of bounds")
+        ));
+    }
+
+    #[test]
+    fn checked_header_accessors_reject_malformed_public_header() {
+        let lower_before_header = PageHeader {
+            lower: PAGE_HEADER_SIZE_U16 - 1,
+            ..PageHeader::fresh_heap()
+        };
+        let slot_count_err = lower_before_header.try_slot_count().unwrap_err();
+        assert!(matches!(
+            slot_count_err,
+            PageError::Malformed("slot directory lower before header")
+        ));
+
+        let reversed_free_space = PageHeader {
+            lower: PAGE_SIZE_U16,
+            upper: PAGE_HEADER_SIZE_U16,
+            ..PageHeader::fresh_heap()
+        };
+        let free_space_err = reversed_free_space.try_free_space().unwrap_err();
+        assert!(matches!(
+            free_space_err,
+            PageError::Malformed("free space pointer ordering")
+        ));
+    }
+
+    #[test]
+    fn item_id_offset_rejects_out_of_page_slot() {
+        let err = Page::try_item_id_offset(u16::MAX).unwrap_err();
+
+        assert!(matches!(
+            err,
+            PageError::Malformed("slot directory out of bounds")
         ));
     }
 }
