@@ -1113,8 +1113,12 @@ pub fn xml_document_is_well_formed(text: &str) -> bool {
     let mut root_closed = false;
 
     while let Some(relative) = text[cursor..].find('<') {
-        let open = cursor + relative;
-        let text_segment = &text[cursor..open];
+        let Some(open) = cursor.checked_add(relative) else {
+            return false;
+        };
+        let Some(text_segment) = text.get(cursor..open) else {
+            return false;
+        };
         if !xml_text_segment_is_well_formed(text_segment) {
             return false;
         }
@@ -1124,37 +1128,45 @@ pub fn xml_document_is_well_formed(text: &str) -> bool {
         if stack.is_empty() && root_closed && !text_segment.trim().is_empty() {
             return false;
         }
-        let Some(next) = text.as_bytes().get(open + 1).copied() else {
+        let Some(next_start) = open.checked_add(1) else {
+            return false;
+        };
+        let Some(next) = text.as_bytes().get(next_start).copied() else {
             return false;
         };
         match next {
             b'?' => {
-                let Some(end) = text[open + 2..].find("?>") else {
+                let Some(next_cursor) = xml_terminated_cursor(text, open, 2, "?>") else {
                     return false;
                 };
-                cursor = open + 2 + end + 2;
+                cursor = next_cursor;
             }
             b'!' if text[open..].starts_with("<!--") => {
-                let Some(end) = text[open + 4..].find("-->") else {
+                let Some(next_cursor) = xml_terminated_cursor(text, open, 4, "-->") else {
                     return false;
                 };
-                cursor = open + 4 + end + 3;
+                cursor = next_cursor;
             }
             b'!' if text[open..].starts_with("<![CDATA[") => {
                 if stack.is_empty() {
                     return false;
                 }
-                let Some(end) = text[open + 9..].find("]]>") else {
+                let Some(next_cursor) = xml_terminated_cursor(text, open, 9, "]]>") else {
                     return false;
                 };
-                cursor = open + 9 + end + 3;
+                cursor = next_cursor;
             }
             b'!' => return false,
             b'/' => {
-                let Some(close) = xml_tag_end(text, open + 2) else {
+                let Some(name_start) = open.checked_add(2) else {
                     return false;
                 };
-                let name = text[open + 2..close].trim();
+                let Some(close) = xml_tag_end(text, name_start) else {
+                    return false;
+                };
+                let Some(name) = text.get(name_start..close).map(str::trim) else {
+                    return false;
+                };
                 if name.is_empty()
                     || name.bytes().any(|byte| byte.is_ascii_whitespace())
                     || xml_name_len(name.as_bytes()) != name.len()
@@ -1165,19 +1177,27 @@ pub fn xml_document_is_well_formed(text: &str) -> bool {
                 if stack.is_empty() {
                     root_closed = true;
                 }
-                cursor = close + 1;
+                let Some(next_cursor) = close.checked_add(1) else {
+                    return false;
+                };
+                cursor = next_cursor;
             }
             _ => {
                 if root_closed {
                     return false;
                 }
-                let Some(close) = xml_tag_end(text, open + 1) else {
+                let Some(content_start) = open.checked_add(1) else {
                     return false;
                 };
-                let mut content = text[open + 1..close].trim();
+                let Some(close) = xml_tag_end(text, content_start) else {
+                    return false;
+                };
+                let Some(mut content) = text.get(content_start..close).map(str::trim) else {
+                    return false;
+                };
                 let self_closing = content.ends_with('/');
-                if self_closing {
-                    content = content[..content.len() - 1].trim_end();
+                if let Some(stripped) = content.strip_suffix('/') {
+                    content = stripped.trim_end();
                 }
                 let name_len = xml_name_len(content.as_bytes());
                 if name_len == 0 {
@@ -1196,7 +1216,10 @@ pub fn xml_document_is_well_formed(text: &str) -> bool {
                 } else {
                     stack.push(name.to_owned());
                 }
-                cursor = close + 1;
+                let Some(next_cursor) = close.checked_add(1) else {
+                    return false;
+                };
+                cursor = next_cursor;
             }
         }
     }
@@ -1221,6 +1244,19 @@ pub fn xml_content_is_well_formed(text: &str) -> bool {
     }
     let wrapped = format!("<__ultrasql_xml_content>{trimmed}</__ultrasql_xml_content>");
     xml_document_is_well_formed(&wrapped)
+}
+
+fn xml_terminated_cursor(
+    text: &str,
+    open: usize,
+    body_offset: usize,
+    terminator: &str,
+) -> Option<usize> {
+    let body_start = open.checked_add(body_offset)?;
+    let relative_end = text.get(body_start..)?.find(terminator)?;
+    body_start
+        .checked_add(relative_end)?
+        .checked_add(terminator.len())
 }
 
 /// Return fragments selected by a small, deterministic XPath subset.
