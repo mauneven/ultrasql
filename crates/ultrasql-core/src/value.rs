@@ -38,6 +38,7 @@ const HEX_NIBBLES_PER_BYTE: usize = 2;
 const UUID_HEX_NIBBLES: usize = 32;
 const BITS_PER_BYTE: usize = 8;
 const HIGH_BIT_INDEX: usize = 7;
+const COORDINATES_PER_POINT: usize = 2;
 
 #[must_use]
 fn i64_to_f64(value: i64) -> f64 {
@@ -276,7 +277,8 @@ impl GeometryValue {
                 if nums.len() < 4 {
                     return None;
                 }
-                let mut points = Vec::with_capacity(nums.len() / 2);
+                let mut points =
+                    Vec::with_capacity(nums.len().checked_div(COORDINATES_PER_POINT).unwrap_or(0));
                 for pair in nums.chunks_exact(2) {
                     points.push((pair[0], pair[1]));
                 }
