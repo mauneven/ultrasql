@@ -15,6 +15,8 @@ const IPV4_BITS: u8 = 32;
 const IPV6_BITS: u8 = 128;
 const PGSQL_AF_INET: u8 = 2;
 const PGSQL_AF_INET6: u8 = 3;
+const NIBBLES_PER_BYTE: usize = 2;
+const HEX_ALPHA_BASE: u8 = 10;
 
 /// SQL `INET` / `CIDR` address plus prefix length.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -532,7 +534,9 @@ fn prefix_mask(width: u8, prefix: u8) -> u128 {
     if prefix == 0 {
         return 0;
     }
-    let host_width = width - prefix;
+    let Some(host_width) = width.checked_sub(prefix) else {
+        return 0;
+    };
     low_bits_mask(width) & !low_bits_mask(host_width)
 }
 
@@ -540,7 +544,10 @@ fn low_bits_mask(width: u8) -> u128 {
     match width {
         0 => 0,
         128 => u128::MAX,
-        other => (1_u128 << u32::from(other)) - 1,
+        other => 1_u128
+            .checked_shl(u32::from(other))
+            .and_then(|value| value.checked_sub(1))
+            .unwrap_or(u128::MAX),
     }
 }
 
@@ -552,21 +559,25 @@ fn parse_mac_bytes(text: &str) -> Option<Vec<u8>> {
             _ => nibbles.push(hex_nibble(byte)?),
         }
     }
-    if nibbles.len() % 2 != 0 {
+    if nibbles.len().checked_rem(NIBBLES_PER_BYTE) != Some(0) {
         return None;
     }
-    let mut bytes = Vec::with_capacity(nibbles.len() / 2);
+    let mut bytes = Vec::with_capacity(nibbles.len().checked_div(NIBBLES_PER_BYTE).unwrap_or(0));
     for pair in nibbles.chunks_exact(2) {
         bytes.push((pair[0] << 4) | pair[1]);
     }
     Some(bytes)
 }
 
-const fn hex_nibble(byte: u8) -> Option<u8> {
+fn hex_nibble(byte: u8) -> Option<u8> {
     match byte {
-        b'0'..=b'9' => Some(byte - b'0'),
-        b'a'..=b'f' => Some(byte - b'a' + 10),
-        b'A'..=b'F' => Some(byte - b'A' + 10),
+        b'0'..=b'9' => byte.checked_sub(b'0'),
+        b'a'..=b'f' => byte
+            .checked_sub(b'a')
+            .and_then(|digit| digit.checked_add(HEX_ALPHA_BASE)),
+        b'A'..=b'F' => byte
+            .checked_sub(b'A')
+            .and_then(|digit| digit.checked_add(HEX_ALPHA_BASE)),
         _ => None,
     }
 }
@@ -620,6 +631,9 @@ mod tests {
                 .to_string(),
             "08:00:2b:ff:fe:01:02:03"
         );
+        assert!(InetAddr::parse_inet("192.168.1.1/33").is_none());
+        assert!(NetworkValue::parse_for_type(&crate::DataType::MacAddr, "0").is_none());
+        assert!(NetworkValue::parse_for_type(&crate::DataType::MacAddr, "zz:00").is_none());
     }
 
     #[test]
