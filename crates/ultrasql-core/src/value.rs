@@ -1252,11 +1252,22 @@ fn xml_terminated_cursor(
     body_offset: usize,
     terminator: &str,
 ) -> Option<usize> {
+    xml_terminated_cursor_before(text, open, body_offset, terminator, text.len())
+}
+
+fn xml_terminated_cursor_before(
+    text: &str,
+    open: usize,
+    body_offset: usize,
+    terminator: &str,
+    limit: usize,
+) -> Option<usize> {
     let body_start = open.checked_add(body_offset)?;
-    let relative_end = text.get(body_start..)?.find(terminator)?;
-    body_start
+    let relative_end = text.get(body_start..limit)?.find(terminator)?;
+    let cursor = body_start
         .checked_add(relative_end)?
-        .checked_add(terminator.len())
+        .checked_add(terminator.len())?;
+    (cursor <= limit).then_some(cursor)
 }
 
 /// Return fragments selected by a small, deterministic XPath subset.
@@ -2080,31 +2091,46 @@ fn xml_direct_child_elements(text: &str, parent: &XmlElement) -> Vec<XmlElement>
     let mut out = Vec::new();
     let mut cursor = parent.content_start;
     while cursor < parent.close_start {
-        let Some(relative) = text[cursor..parent.close_start].find('<') else {
+        let Some(relative) = text
+            .get(cursor..parent.close_start)
+            .and_then(|body| body.find('<'))
+        else {
             break;
         };
-        let open = cursor + relative;
-        let Some(next) = text.as_bytes().get(open + 1).copied() else {
+        let Some(open) = cursor.checked_add(relative) else {
+            break;
+        };
+        let Some(next) = open
+            .checked_add(1)
+            .and_then(|idx| text.as_bytes().get(idx))
+            .copied()
+        else {
             break;
         };
         match next {
             b'?' => {
-                let Some(end) = text[open + 2..parent.close_start].find("?>") else {
+                let Some(next_cursor) =
+                    xml_terminated_cursor_before(text, open, 2, "?>", parent.close_start)
+                else {
                     break;
                 };
-                cursor = open + 2 + end + 2;
+                cursor = next_cursor;
             }
             b'!' if text[open..].starts_with("<!--") => {
-                let Some(end) = text[open + 4..parent.close_start].find("-->") else {
+                let Some(next_cursor) =
+                    xml_terminated_cursor_before(text, open, 4, "-->", parent.close_start)
+                else {
                     break;
                 };
-                cursor = open + 4 + end + 3;
+                cursor = next_cursor;
             }
             b'!' if text[open..].starts_with("<![CDATA[") => {
-                let Some(end) = text[open + 9..parent.close_start].find("]]>") else {
+                let Some(next_cursor) =
+                    xml_terminated_cursor_before(text, open, 9, "]]>", parent.close_start)
+                else {
                     break;
                 };
-                cursor = open + 9 + end + 3;
+                cursor = next_cursor;
             }
             b'/' => break,
             _ => {
