@@ -51,6 +51,12 @@ pub fn type_lookup_key(schema_name: &str, type_name: &str) -> String {
     )
 }
 
+/// Return the canonical lookup key for a schema-qualified index.
+#[must_use]
+pub fn index_lookup_key(schema_name: &str, index_name: &str) -> String {
+    table_lookup_key(schema_name, index_name)
+}
+
 /// A table (relation) entry in the catalog.
 ///
 /// The owning catalog hands out cloned `TableEntry` values rather than
@@ -125,6 +131,9 @@ pub struct IndexEntry {
     pub oid: Oid,
     /// Bare index name.
     pub name: String,
+    /// Schema (namespace) the index lives in. Indexes live in the same
+    /// namespace as their parent relation.
+    pub schema_name: String,
     /// OID of the underlying table.
     pub table_oid: Oid,
     /// Column attnums (0-based positions into the table's schema) the
@@ -161,6 +170,7 @@ impl IndexEntry {
         Self {
             oid,
             name: name.into(),
+            schema_name: "public".to_owned(),
             table_oid,
             columns,
             root_block: BlockNumber::INVALID,
@@ -169,6 +179,13 @@ impl IndexEntry {
             opclasses: Vec::new(),
             options: Vec::new(),
         }
+    }
+
+    /// Attach the index namespace.
+    #[must_use]
+    pub fn with_schema_name<S: Into<String>>(mut self, schema_name: S) -> Self {
+        self.schema_name = schema_name.into();
+        self
     }
 
     /// Attach an access method and per-column opclasses.

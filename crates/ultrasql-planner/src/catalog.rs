@@ -121,6 +121,22 @@ pub trait Catalog: Send + Sync {
         false
     }
 
+    /// Return whether an index exists in a specific schema.
+    fn lookup_index_in_schema(&self, schema_name: &str, name: &str) -> bool {
+        self.lookup_index(&ultrasql_catalog::index_lookup_key(schema_name, name))
+    }
+
+    /// Resolve the schema that owns an unqualified index name.
+    fn lookup_index_schema(&self, name: &str) -> Option<String> {
+        if let Some((schema_name, index_name)) = name.rsplit_once('.') {
+            return self
+                .lookup_index_in_schema(schema_name, index_name)
+                .then(|| schema_name.to_ascii_lowercase());
+        }
+        self.lookup_index_in_schema("public", name)
+            .then(|| "public".to_owned())
+    }
+
     /// Resolve a relation name to its catalog OID.
     fn lookup_table_oid(&self, name: &str) -> Option<Oid> {
         let _ = name;
@@ -180,7 +196,12 @@ impl InMemoryCatalog {
     /// Register a table. If a table with the same case-folded name
     /// already exists, the previous entry is returned.
     pub fn register(&mut self, name: &str, meta: TableMeta) -> Option<TableMeta> {
-        self.tables.insert(name.to_ascii_lowercase(), meta)
+        let key = if name.contains('.') {
+            name.to_ascii_lowercase()
+        } else {
+            ultrasql_catalog::table_lookup_key(&meta.schema_name, name)
+        };
+        self.tables.insert(key, meta)
     }
 
     /// Register a user-defined type. If a type with the same case-folded name
@@ -193,6 +214,12 @@ impl InMemoryCatalog {
     pub fn register_index(&mut self, name: &str) -> bool {
         self.indexes.insert(name.to_ascii_lowercase())
     }
+
+    /// Register an index in a specific schema.
+    pub fn register_index_in_schema(&mut self, schema_name: &str, name: &str) -> bool {
+        self.indexes
+            .insert(ultrasql_catalog::index_lookup_key(schema_name, name))
+    }
 }
 
 impl Catalog for InMemoryCatalog {
@@ -201,8 +228,9 @@ impl Catalog for InMemoryCatalog {
     }
 
     fn lookup_table_in_schema(&self, schema_name: &str, name: &str) -> Option<TableMeta> {
-        self.lookup_table(name)
-            .filter(|meta| meta.schema_name.eq_ignore_ascii_case(schema_name))
+        self.tables
+            .get(&ultrasql_catalog::table_lookup_key(schema_name, name))
+            .cloned()
     }
 
     fn lookup_type(&self, name: &str) -> Option<DataType> {
@@ -223,6 +251,11 @@ impl Catalog for InMemoryCatalog {
 
     fn lookup_index(&self, name: &str) -> bool {
         self.indexes.contains(&name.to_ascii_lowercase())
+    }
+
+    fn lookup_index_in_schema(&self, schema_name: &str, name: &str) -> bool {
+        self.indexes
+            .contains(&ultrasql_catalog::index_lookup_key(schema_name, name))
     }
 
     fn lookup_type_oid(&self, name: &str) -> Option<Oid> {
@@ -376,6 +409,22 @@ impl Catalog for ultrasql_catalog::CatalogSnapshot {
 
     fn lookup_index(&self, name: &str) -> bool {
         self.indexes.contains_key(&name.to_ascii_lowercase())
+    }
+
+    fn lookup_index_in_schema(&self, schema_name: &str, name: &str) -> bool {
+        self.indexes
+            .contains_key(&ultrasql_catalog::index_lookup_key(schema_name, name))
+    }
+
+    fn lookup_index_schema(&self, name: &str) -> Option<String> {
+        if let Some((schema_name, index_name)) = name.rsplit_once('.') {
+            return self
+                .lookup_index_in_schema(schema_name, index_name)
+                .then(|| schema_name.to_ascii_lowercase());
+        }
+        self.indexes
+            .get(&ultrasql_catalog::index_lookup_key("public", name))
+            .map(|entry| entry.schema_name.clone())
     }
 
     fn lookup_table_oid(&self, name: &str) -> Option<Oid> {

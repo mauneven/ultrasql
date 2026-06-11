@@ -23,6 +23,17 @@ fn users_catalog() -> InMemoryCatalog {
     cat
 }
 
+fn app_users_catalog() -> InMemoryCatalog {
+    let schema = Schema::new([
+        Field::required("id", DataType::Int32),
+        Field::nullable("name", DataType::Text { max_len: None }),
+    ])
+    .expect("schema ok");
+    let mut cat = InMemoryCatalog::new();
+    cat.register("users", TableMeta::with_schema_name("app", schema));
+    cat
+}
+
 fn users_index_catalog() -> InMemoryCatalog {
     let mut cat = users_catalog();
     cat.register_index("users_id_idx");
@@ -3548,6 +3559,25 @@ fn binds_create_index_resolves_column_index_and_synthesises_name() {
 }
 
 #[test]
+fn binds_create_index_namespace_from_target_table() {
+    let cat = app_users_catalog();
+    let plan = parse_and_bind("CREATE INDEX same_idx ON app.users (id)", &cat)
+        .expect("qualified app table binds");
+    let LogicalPlan::CreateIndex {
+        index_name,
+        index_namespace,
+        table_name,
+        ..
+    } = plan
+    else {
+        panic!("expected CreateIndex plan");
+    };
+    assert_eq!(index_name, "same_idx");
+    assert_eq!(index_namespace, "app");
+    assert_eq!(table_name, "app.users");
+}
+
+#[test]
 fn binds_create_unique_index_honours_unique_flag_and_explicit_name() {
     let plan = parse_bind_ok("CREATE UNIQUE INDEX IF NOT EXISTS users_pk ON users (id)");
     let LogicalPlan::CreateIndex {
@@ -3834,7 +3864,8 @@ fn binds_drop_index_with_known_index() {
 
 #[test]
 fn binds_drop_index_preserves_explicit_namespace() {
-    let cat = users_index_catalog();
+    let mut cat = users_index_catalog();
+    cat.register_index_in_schema("app", "users_id_idx");
     let plan = parse_and_bind("DROP INDEX app.users_id_idx", &cat).expect("drop index binds");
     let LogicalPlan::DropIndex {
         indexes,

@@ -21,7 +21,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use dashmap::DashMap;
 use ultrasql_core::{Field, Oid, Schema};
 
-use crate::entry::{IndexEntry, TableEntry, fold_identifier, table_lookup_key};
+use crate::entry::{IndexEntry, TableEntry, fold_identifier, index_lookup_key, table_lookup_key};
 use crate::error::CatalogError;
 use crate::traits::{Catalog, MutableCatalog};
 
@@ -40,6 +40,10 @@ fn fold_name(name: &str) -> String {
 
 fn table_entry_key(entry: &TableEntry) -> String {
     table_lookup_key(&entry.schema_name, &entry.name)
+}
+
+fn index_entry_key(entry: &IndexEntry) -> String {
+    index_lookup_key(&entry.schema_name, &entry.name)
 }
 
 /// In-memory catalog.
@@ -137,7 +141,7 @@ impl InMemoryCatalog {
     fn drop_indexes_for_table(&self, table_oid: Oid) {
         if let Some((_, indexes)) = self.indexes_by_table.remove(&table_oid) {
             for idx in indexes {
-                self.indexes_by_name.remove(&fold_name(&idx.name));
+                self.indexes_by_name.remove(&index_entry_key(&idx));
             }
         }
     }
@@ -170,6 +174,12 @@ impl Catalog for InMemoryCatalog {
     fn lookup_index(&self, name: &str) -> Option<IndexEntry> {
         self.indexes_by_name
             .get(&fold_name(name))
+            .map(|r| r.value().clone())
+    }
+
+    fn lookup_index_in_schema(&self, schema_name: &str, name: &str) -> Option<IndexEntry> {
+        self.indexes_by_name
+            .get(&index_lookup_key(schema_name, name))
             .map(|r| r.value().clone())
     }
 
@@ -223,6 +233,12 @@ impl MutableCatalog for InMemoryCatalog {
             .value()
             .clone();
         let width = parent.schema.len();
+        if !entry.schema_name.eq_ignore_ascii_case(&parent.schema_name) {
+            return Err(CatalogError::schema_conflict(format!(
+                "index '{}' schema '{}' does not match table '{}' schema '{}'",
+                entry.name, entry.schema_name, parent.name, parent.schema_name
+            )));
+        }
         for col in &entry.columns {
             if usize::from(*col) >= width {
                 return Err(CatalogError::schema_conflict(format!(
@@ -231,7 +247,7 @@ impl MutableCatalog for InMemoryCatalog {
                 )));
             }
         }
-        let key = fold_name(&entry.name);
+        let key = index_entry_key(&entry);
         // TODO(catalog-persistent): replace with a heap insert against
         // `pg_index` and a unique-key check on `(relname, relnamespace)`.
         match self.indexes_by_name.entry(key) {

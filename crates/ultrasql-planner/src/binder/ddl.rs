@@ -1772,8 +1772,10 @@ pub(super) fn bind_create_index(
 ) -> Result<LogicalPlan, PlanError> {
     // Resolve the target table.
     let resolved = lookup_table_reference(catalog, &s.table)?;
+    let table_bare_name = object_name_simple(&s.table);
     let table_name = resolved.plan_name;
     let meta = resolved.meta;
+    let index_namespace = meta.schema_name.clone();
     let table_schema = &meta.schema;
 
     let method = if s.aggregating {
@@ -1805,7 +1807,13 @@ pub(super) fn bind_create_index(
         return Err(PlanError::NotSupported("CREATE INDEX: zero key columns"));
     }
     if method == LogicalIndexMethod::Aggregating {
-        return bind_create_aggregating_index(s, table_name, table_schema);
+        return bind_create_aggregating_index(
+            s,
+            table_name,
+            table_bare_name,
+            index_namespace,
+            table_schema,
+        );
     }
     if method == LogicalIndexMethod::Hash && s.columns.len() != 1 {
         return Err(PlanError::NotSupported(
@@ -1977,12 +1985,13 @@ pub(super) fn bind_create_index(
     };
 
     let index_name = s.name.as_ref().map_or_else(
-        || synthesise_index_name(&table_name, &col_names),
+        || synthesise_index_name(&table_bare_name, &col_names),
         |ident| ident.value.to_ascii_lowercase(),
     );
 
     Ok(LogicalPlan::CreateIndex {
         index_name,
+        index_namespace,
         table_name,
         columns: col_indices,
         key_exprs,
@@ -2002,6 +2011,8 @@ pub(super) fn bind_create_index(
 fn bind_create_aggregating_index(
     s: &CreateIndexStmt,
     table_name: String,
+    table_bare_name: String,
+    index_namespace: String,
     table_schema: &Schema,
 ) -> Result<LogicalPlan, PlanError> {
     if s.unique {
@@ -2080,12 +2091,13 @@ fn bind_create_aggregating_index(
     }
 
     let index_name = s.name.as_ref().map_or_else(
-        || synthesise_index_name(&table_name, &col_names),
+        || synthesise_index_name(&table_bare_name, &col_names),
         |ident| ident.value.to_ascii_lowercase(),
     );
 
     Ok(LogicalPlan::CreateIndex {
         index_name,
+        index_namespace,
         table_name,
         columns: group_columns.clone(),
         key_exprs: group_exprs,
@@ -2278,11 +2290,22 @@ pub(super) fn bind_drop_index(
     let mut index_namespaces = Vec::with_capacity(s.names.len());
     for obj in &s.names {
         let name = object_name_simple(obj);
-        if catalog.lookup_index(&name) {
+        if let Some(namespace) = object_name_explicit_namespace(obj) {
+            if !catalog.lookup_index_in_schema(&namespace, &name) {
+                if !s.if_exists {
+                    return Err(PlanError::IndexNotFound(format!("{namespace}.{name}")));
+                }
+                continue;
+            }
             indexes.push(name);
-            index_namespaces.push(object_name_explicit_namespace(obj));
-        } else if !s.if_exists {
-            return Err(PlanError::IndexNotFound(name));
+            index_namespaces.push(Some(namespace));
+        } else if let Some(namespace) = catalog.lookup_index_schema(&name) {
+            indexes.push(name);
+            index_namespaces.push((namespace != "public").then_some(namespace));
+        } else {
+            if !s.if_exists {
+                return Err(PlanError::IndexNotFound(name));
+            }
         }
     }
     Ok(LogicalPlan::DropIndex {

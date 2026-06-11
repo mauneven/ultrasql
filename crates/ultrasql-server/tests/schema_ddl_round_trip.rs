@@ -472,6 +472,80 @@ async fn same_type_name_is_isolated_by_schema() {
     shutdown(running).await;
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn same_index_name_is_isolated_by_schema() {
+    let data_dir = tempfile::TempDir::new().expect("temp data dir");
+    let running = start_persistent_server(data_dir.path(), "schema_same_index_name_setup").await;
+
+    running
+        .client
+        .batch_execute(
+            "CREATE SCHEMA app; \
+             CREATE TABLE indexed_public (id INT); \
+             CREATE TABLE app.indexed_app (id INT); \
+             CREATE INDEX same_idx ON indexed_public(id); \
+             CREATE INDEX same_idx ON app.indexed_app(id)",
+        )
+        .await
+        .expect("schemas may contain indexes with the same name");
+    shutdown(running).await;
+
+    let running = start_persistent_server(data_dir.path(), "schema_same_index_name_verify").await;
+
+    let rows = running
+        .client
+        .query(
+            "SELECT schemaname, tablename \
+             FROM pg_catalog.pg_indexes \
+             WHERE indexname = 'same_idx' \
+             ORDER BY schemaname, tablename",
+            &[],
+        )
+        .await
+        .expect("query schema-isolated indexes");
+    let names = rows
+        .iter()
+        .map(|row| (row.get::<_, String>(0), row.get::<_, String>(1)))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        names,
+        vec![
+            ("app".to_owned(), "indexed_app".to_owned()),
+            ("public".to_owned(), "indexed_public".to_owned()),
+        ],
+        "same index name must be visible in both schemas"
+    );
+
+    running
+        .client
+        .batch_execute("DROP INDEX app.same_idx")
+        .await
+        .expect("qualified DROP INDEX drops only the app index");
+
+    let rows = running
+        .client
+        .query(
+            "SELECT schemaname, tablename \
+             FROM pg_catalog.pg_indexes \
+             WHERE indexname = 'same_idx' \
+             ORDER BY schemaname, tablename",
+            &[],
+        )
+        .await
+        .expect("query indexes after qualified drop");
+    let names = rows
+        .iter()
+        .map(|row| (row.get::<_, String>(0), row.get::<_, String>(1)))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        names,
+        vec![("public".to_owned(), "indexed_public".to_owned())],
+        "public index must survive qualified drop of app index"
+    );
+
+    shutdown(running).await;
+}
+
 #[tokio::test]
 async fn select_respects_schema_qualifier() {
     let running = start_sample_server("schema_select_qualifier_guard").await;

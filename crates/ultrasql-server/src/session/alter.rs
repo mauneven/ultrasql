@@ -137,6 +137,7 @@ where
         }
         let create_index = LogicalPlan::CreateIndex {
             index_name: constraint.name.clone(),
+            index_namespace: table.schema_name.clone(),
             table_name: table_name.to_owned(),
             columns: constraint.columns.clone(),
             key_exprs: Vec::new(),
@@ -183,7 +184,13 @@ where
                     "abort of catalog-write txn failed after ALTER TABLE ADD CONSTRAINT",
                 );
             }
-            let _ = self.state.persistent_catalog.drop_index(&constraint.name);
+            let _ = self
+                .state
+                .persistent_catalog
+                .drop_index(&ultrasql_catalog::index_lookup_key(
+                    &table.schema_name,
+                    &constraint.name,
+                ));
             return Err(e.into());
         }
         self.state.commit_transaction(

@@ -1142,7 +1142,8 @@ where
                 attnums.push(attnum);
             }
             let mut entry =
-                IndexEntry::new(index_oid, unique.name.clone(), table.oid, attnums, true);
+                IndexEntry::new(index_oid, unique.name.clone(), table.oid, attnums, true)
+                    .with_schema_name(table.schema_name.clone());
             entry.root_block = root_block;
             // Empty table, so there are no existing heap rows to populate.
             self.state.persistent_catalog.create_index(entry.clone())?;
@@ -1206,6 +1207,7 @@ where
     ) -> Result<SelectResult, ServerError> {
         let LogicalPlan::CreateIndex {
             index_name,
+            index_namespace,
             table_name,
             columns,
             key_exprs,
@@ -1226,12 +1228,13 @@ where
         };
 
         // 1a. IF NOT EXISTS short-circuit.
-        if snapshot.indexes.contains_key(index_name) {
+        let index_key = ultrasql_catalog::index_lookup_key(index_namespace, index_name);
+        if snapshot.indexes.contains_key(&index_key) {
             if *if_not_exists {
                 return Ok(run_ddl_command("CREATE INDEX"));
             }
             return Err(ServerError::Catalog(
-                ultrasql_catalog::CatalogError::already_exists(index_name.clone()),
+                ultrasql_catalog::CatalogError::already_exists(index_key),
             ));
         }
 
@@ -1291,6 +1294,7 @@ where
                 })
                 .collect::<Result<Vec<_>, _>>()?;
             let entry = IndexEntry::new(index_oid, index_name.clone(), table.oid, attnums, false)
+                .with_schema_name(index_namespace.clone())
                 .with_access_method("aggregating", vec![None; spec.group_columns.len()])
                 .with_options(
                     crate::aggregating_index::catalog_options_for_aggregating_index(
@@ -1314,7 +1318,7 @@ where
                         "abort of catalog-write txn failed after persist_index_rows error",
                     );
                 }
-                let _ = self.state.persistent_catalog.drop_index(index_name);
+                let _ = self.state.persistent_catalog.drop_index(&index_key);
                 return Err(e.into());
             }
             self.state.commit_transaction(
@@ -1459,6 +1463,7 @@ where
                 vec![attnum],
                 false,
             )
+            .with_schema_name(index_namespace.clone())
             .with_access_method("ivfflat", opclasses.clone())
             .with_options(index_options_as_pairs(index_options));
             self.state.persistent_catalog.create_index(entry.clone())?;
@@ -1478,7 +1483,7 @@ where
                         "abort of catalog-write txn failed after persist_index_rows error",
                     );
                 }
-                let _ = self.state.persistent_catalog.drop_index(index_name);
+                let _ = self.state.persistent_catalog.drop_index(&index_key);
                 return Err(e.into());
             }
             self.state.commit_transaction(
@@ -1621,6 +1626,7 @@ where
                 vec![attnum],
                 false,
             )
+            .with_schema_name(index_namespace.clone())
             .with_access_method("hnsw", opclasses.clone())
             .with_options(index_options_as_pairs(index_options));
             self.state.persistent_catalog.create_index(entry.clone())?;
@@ -1640,7 +1646,7 @@ where
                         "abort of catalog-write txn failed after persist_index_rows error",
                     );
                 }
-                let _ = self.state.persistent_catalog.drop_index(index_name);
+                let _ = self.state.persistent_catalog.drop_index(&index_key);
                 return Err(e.into());
             }
             self.state.commit_transaction(
@@ -1800,6 +1806,7 @@ where
         //    cast is direct. We override `root_block` to match the
         //    freshly built tree.
         let mut entry = IndexEntry::new(index_oid, index_name.clone(), table.oid, attnums, *unique)
+            .with_schema_name(index_namespace.clone())
             .with_access_method(logical_index_method_name(*method), opclasses.clone())
             .with_options(index_options_as_pairs(index_options));
         entry.root_block = root_block;
@@ -1820,7 +1827,7 @@ where
                     "abort of catalog-write txn failed after persist_index_rows error",
                 );
             }
-            let _ = self.state.persistent_catalog.drop_index(index_name);
+            let _ = self.state.persistent_catalog.drop_index(&index_key);
             return Err(e.into());
         }
         self.state
@@ -1880,23 +1887,23 @@ where
 
         let mut entries = Vec::with_capacity(indexes.len());
         for (idx, name) in indexes.iter().enumerate() {
-            if let Some(entry) = self.state.persistent_catalog.lookup_index(name) {
+            let namespace = index_namespaces.get(idx).and_then(Option::as_ref);
+            let lookup_name = namespace.map_or_else(
+                || name.clone(),
+                |namespace| ultrasql_catalog::index_lookup_key(namespace, name),
+            );
+            if let Some(entry) = self.state.persistent_catalog.lookup_index(&lookup_name) {
                 let table = self
                     .state
                     .persistent_catalog
                     .lookup_table_by_oid(entry.table_oid);
-                if let Some(namespace) = index_namespaces.get(idx).and_then(Option::as_ref) {
-                    if !table
-                        .as_ref()
-                        .is_some_and(|table| table.schema_name.eq_ignore_ascii_case(namespace))
-                    {
-                        if !*if_exists {
-                            return Err(
-                                ultrasql_catalog::CatalogError::not_found(name.clone()).into()
-                            );
-                        }
-                        continue;
+                if let Some(namespace) = namespace
+                    && !entry.schema_name.eq_ignore_ascii_case(namespace)
+                {
+                    if !*if_exists {
+                        return Err(ultrasql_catalog::CatalogError::not_found(lookup_name).into());
                     }
+                    continue;
                 }
                 let table_name = table.map_or_else(
                     || format!("oid {}", entry.table_oid.raw()),
@@ -1921,7 +1928,7 @@ where
                 }
                 entries.push(entry);
             } else if !*if_exists {
-                return Err(ultrasql_catalog::CatalogError::not_found(name.clone()).into());
+                return Err(ultrasql_catalog::CatalogError::not_found(lookup_name).into());
             }
         }
         if entries.is_empty() {
@@ -1971,7 +1978,12 @@ where
             self.state
                 .persistent_catalog
                 .clear_descriptions_for_object(entry.oid);
-            self.state.persistent_catalog.drop_index(&entry.name)?;
+            self.state
+                .persistent_catalog
+                .drop_index(&ultrasql_catalog::index_lookup_key(
+                    &entry.schema_name,
+                    &entry.name,
+                ))?;
         }
         if runtime_metadata_removed {
             self.state.persist_table_runtime_constraints_metadata()?;

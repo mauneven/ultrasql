@@ -63,7 +63,7 @@ use crate::encoding::{
 };
 use crate::entry::{
     CompositeTypeEntry, DomainTypeEntry, EnumLabelEntry, EnumTypeEntry, IndexEntry, TableEntry,
-    table_lookup_key, type_lookup_key,
+    index_lookup_key, table_lookup_key, type_lookup_key,
 };
 use crate::error::CatalogError;
 use crate::traits::{Catalog, MutableCatalog};
@@ -609,8 +609,9 @@ impl PersistentCatalog {
                 .insert(table_entry_key(entry), entry.clone());
             self.tables_by_oid.insert(entry.oid, entry.clone());
         }
-        for (name, entry) in &snap.indexes {
-            self.indexes_by_name.insert(name.clone(), entry.clone());
+        for entry in snap.indexes.values() {
+            self.indexes_by_name
+                .insert(index_entry_key(entry), entry.clone());
         }
         for (oid, entries) in &snap.indexes_by_table {
             self.indexes_by_table.insert(*oid, entries.clone());
@@ -1089,11 +1090,16 @@ impl PersistentCatalog {
                 columns,
                 index_row.indisunique,
             );
+            entry.schema_name = if class_row.relnamespace.raw() == bootstrap::PG_CATALOG_OID {
+                "pg_catalog".to_owned()
+            } else {
+                "public".to_owned()
+            };
             entry.root_block = ultrasql_core::BlockNumber::new(class_row.relfilenode);
             entry.access_method = index_row.indmethod.clone();
             entry.opclasses = index_row.indopclasses.clone();
             entry.options = index_row.indoptions.clone();
-            indexes.insert(class_row.relname.to_ascii_lowercase(), entry.clone());
+            indexes.insert(index_entry_key(&entry), entry.clone());
             indexes_by_table
                 .entry(index_row.indrelid)
                 .or_default()
@@ -1651,7 +1657,7 @@ impl PersistentCatalog {
         let class_row = ClassRow {
             oid: entry.oid,
             relname: entry.name.clone(),
-            relnamespace: Oid::new(bootstrap::PUBLIC_OID),
+            relnamespace: namespace_oid_for_schema(&entry.schema_name),
             relkind: RelKind::Index,
             relpages: 0,
             reltuples: 0.0,
@@ -1739,7 +1745,7 @@ impl PersistentCatalog {
         let class_row = ClassRow {
             oid: entry.oid,
             relname: entry.name.clone(),
-            relnamespace: Oid::new(bootstrap::PUBLIC_OID),
+            relnamespace: namespace_oid_for_schema(&entry.schema_name),
             relkind: RelKind::Dropped,
             relpages: 0,
             reltuples: 0.0,
@@ -2316,7 +2322,10 @@ impl PersistentCatalog {
         let indexes: std::collections::HashMap<String, IndexEntry> = self
             .indexes_by_name
             .iter()
-            .map(|r| (r.key().clone(), r.value().clone()))
+            .map(|r| {
+                let entry = r.value().clone();
+                (index_entry_key(&entry), entry)
+            })
             .collect();
         let indexes_by_table: std::collections::HashMap<Oid, Vec<IndexEntry>> = self
             .indexes_by_table
@@ -2562,6 +2571,28 @@ impl PersistentCatalog {
         for entry in table_entries {
             self.tables_by_name.insert(table_entry_key(&entry), entry);
         }
+        let mut index_entries = self
+            .indexes_by_table
+            .iter()
+            .flat_map(|item| item.value().clone())
+            .collect::<Vec<_>>();
+        for entry in &mut index_entries {
+            if let Some(class_row) = self.pg_class.get(&entry.oid)
+                && let Some(schema_name) = namespace_names.get(&class_row.relnamespace)
+            {
+                entry.schema_name = schema_name.clone();
+            }
+        }
+        self.indexes_by_name.clear();
+        self.indexes_by_table.clear();
+        for entry in index_entries {
+            self.indexes_by_name
+                .insert(index_entry_key(&entry), entry.clone());
+            self.indexes_by_table
+                .entry(entry.table_oid)
+                .or_default()
+                .push(entry);
+        }
         for mut item in self.enum_types_by_oid.iter_mut() {
             if let Some(type_row) = self.pg_type.get(&item.oid)
                 && let Some(schema_name) = namespace_names.get(&type_row.typnamespace)
@@ -2740,6 +2771,10 @@ fn table_entry_key(entry: &TableEntry) -> String {
     table_lookup_key(&entry.schema_name, &entry.name)
 }
 
+fn index_entry_key(entry: &IndexEntry) -> String {
+    index_lookup_key(&entry.schema_name, &entry.name)
+}
+
 trait TypeEntryKey {
     fn type_schema_name(&self) -> &str;
     fn type_name(&self) -> &str;
@@ -2807,6 +2842,13 @@ impl Catalog for PersistentCatalog {
         snap.indexes.get(&fold_name(name)).cloned()
     }
 
+    fn lookup_index_in_schema(&self, schema_name: &str, name: &str) -> Option<IndexEntry> {
+        let snap = self.snapshot.load();
+        snap.indexes
+            .get(&index_lookup_key(schema_name, name))
+            .cloned()
+    }
+
     fn list_indexes_for_table(&self, table_oid: Oid) -> Vec<IndexEntry> {
         let snap = self.snapshot.load();
         snap.indexes_by_table
@@ -2851,7 +2893,7 @@ impl MutableCatalog for PersistentCatalog {
         self.tables_by_oid.remove(&removed.oid);
         if let Some((_, indexes)) = self.indexes_by_table.remove(&removed.oid) {
             for idx in indexes {
-                self.indexes_by_name.remove(&fold_name(&idx.name));
+                self.indexes_by_name.remove(&index_entry_key(&idx));
             }
         }
         self.remove_constraints_for_table(removed.oid);
@@ -2866,14 +2908,25 @@ impl MutableCatalog for PersistentCatalog {
             ));
         }
         let _guard = self.write_lock.lock();
-        if !self.tables_by_oid.contains_key(&entry.table_oid) {
+        let parent = self
+            .tables_by_oid
+            .get(&entry.table_oid)
+            .ok_or_else(|| {
+                CatalogError::schema_conflict(format!(
+                    "index '{}' references unknown table oid {}",
+                    entry.name,
+                    entry.table_oid.raw()
+                ))
+            })?
+            .value()
+            .clone();
+        if !entry.schema_name.eq_ignore_ascii_case(&parent.schema_name) {
             return Err(CatalogError::schema_conflict(format!(
-                "index '{}' references unknown table oid {}",
-                entry.name,
-                entry.table_oid.raw()
+                "index '{}' schema '{}' does not match table '{}' schema '{}'",
+                entry.name, entry.schema_name, parent.name, parent.schema_name
             )));
         }
-        let key = fold_name(&entry.name);
+        let key = index_entry_key(&entry);
         if self.indexes_by_name.contains_key(&key) {
             return Err(CatalogError::already_exists(entry.name));
         }

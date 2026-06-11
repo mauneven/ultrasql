@@ -785,6 +785,9 @@ pub enum LogicalPlan {
         /// Index name (caller-supplied or binder-synthesised). Always
         /// lowercase.
         index_name: String,
+        /// Namespace that owns the index. Indexes live in the same
+        /// namespace as their parent table.
+        index_namespace: String,
         /// Target table (lowercase).
         table_name: String,
         /// 0-based column indices into the table schema, in index key
@@ -2530,6 +2533,7 @@ impl LogicalPlan {
             }
             Self::CreateIndex {
                 index_name,
+                index_namespace,
                 table_name,
                 columns,
                 key_exprs,
@@ -2556,7 +2560,9 @@ impl LogicalPlan {
                 let _ = fmt::write(
                     out,
                     format_args!(
-                        "Create{u}Index{c}{inx}: {index_name} ON {table_name} USING {method} (keys=[{keys}])\n",
+                        "Create{u}Index{c}{inx}: {qualified_index_name} ON {table_name} USING {method} (keys=[{keys}])\n",
+                        qualified_index_name =
+                            ultrasql_catalog::index_lookup_key(index_namespace, index_name),
                         keys = if columns.is_empty() {
                             key_exprs
                                 .iter()
@@ -3550,6 +3556,7 @@ mod tests {
             (
                 LogicalPlan::CreateIndex {
                     index_name: "users_expr_idx".to_owned(),
+                    index_namespace: "public".to_owned(),
                     table_name: "users".to_owned(),
                     columns: vec![],
                     key_exprs: vec![col("id", 0, DataType::Int32)],

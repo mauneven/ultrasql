@@ -2565,7 +2565,31 @@ impl PlannerCatalog for CombinedCatalog<'_> {
     }
 
     fn lookup_index(&self, name: &str) -> bool {
-        PlannerCatalog::lookup_index(self.snapshot, name)
+        if let Some((schema_name, index_name)) = type_name_namespace_and_name(name) {
+            return self.lookup_index_in_schema(schema_name, index_name);
+        }
+        search_path_schema_names(self.search_path)
+            .into_iter()
+            .any(|schema_name| {
+                PlannerCatalog::lookup_index_in_schema(self.snapshot, &schema_name, name)
+                    || PlannerCatalog::lookup_index_in_schema(self.fallback, &schema_name, name)
+            })
+    }
+
+    fn lookup_index_in_schema(&self, schema_name: &str, name: &str) -> bool {
+        PlannerCatalog::lookup_index_in_schema(self.snapshot, schema_name, name)
+            || PlannerCatalog::lookup_index_in_schema(self.fallback, schema_name, name)
+    }
+
+    fn lookup_index_schema(&self, name: &str) -> Option<String> {
+        if let Some((schema_name, index_name)) = type_name_namespace_and_name(name) {
+            return self
+                .lookup_index_in_schema(schema_name, index_name)
+                .then(|| schema_name.to_ascii_lowercase());
+        }
+        search_path_schema_names(self.search_path)
+            .into_iter()
+            .find(|schema_name| self.lookup_index_in_schema(schema_name, name))
     }
 
     fn lookup_table_oid(&self, name: &str) -> Option<Oid> {

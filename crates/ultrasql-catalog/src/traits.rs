@@ -14,7 +14,7 @@
 
 use ultrasql_core::{Field, Oid};
 
-use crate::entry::{IndexEntry, TableEntry};
+use crate::entry::{IndexEntry, TableEntry, index_lookup_key};
 use crate::error::CatalogError;
 
 /// Read-only catalog interface.
@@ -63,6 +63,15 @@ pub trait Catalog: Send + Sync {
     /// Returns `None` when no live index by that case-folded name is
     /// registered.
     fn lookup_index(&self, name: &str) -> Option<IndexEntry>;
+
+    /// Resolve an index by schema and bare index name.
+    ///
+    /// Returns `None` when no live index with that `(schema, name)` pair is
+    /// registered.
+    fn lookup_index_in_schema(&self, schema_name: &str, name: &str) -> Option<IndexEntry> {
+        self.lookup_index(&index_lookup_key(schema_name, name))
+            .filter(|entry| entry.schema_name.eq_ignore_ascii_case(schema_name))
+    }
 
     /// Enumerate every index whose `table_oid` matches the supplied
     /// argument. The returned list is empty if there are no indexes,

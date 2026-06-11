@@ -749,7 +749,7 @@ fn rows_pg_class(ctx: &LowerCtx<'_>) -> Vec<Vec<Value>> {
         rows.push(pg_class_row(VirtualClassRow {
             oid: index.oid.raw(),
             relname: index.name.clone(),
-            relnamespace: PUBLIC_OID,
+            relnamespace: namespace_oid(&index.schema_name),
             reltype: 0,
             relkind: "i",
             relpages: 0,
@@ -2152,11 +2152,11 @@ fn rows_pg_indexes(ctx: &LowerCtx<'_>) -> Vec<Vec<Value>> {
     indexes.sort_by(|a, b| a.name.cmp(&b.name));
     for idx in indexes {
         let table = ctx.catalog_snapshot.tables_by_oid.get(&idx.table_oid);
-        let (schema_name, table_name) = table
-            .map(|entry| (entry.schema_name.clone(), entry.name.clone()))
-            .unwrap_or_else(|| ("public".to_owned(), idx.table_oid.raw().to_string()));
+        let table_name = table
+            .map(|entry| entry.name.clone())
+            .unwrap_or_else(|| idx.table_oid.raw().to_string());
         rows.push(vec![
-            v_text(schema_name),
+            v_text(idx.schema_name.clone()),
             v_text(table_name),
             v_text(idx.name.clone()),
             Value::Null,
@@ -3058,7 +3058,7 @@ fn rows_pg_stat_user_indexes(ctx: &LowerCtx<'_>) -> Vec<Vec<Value>> {
             Some(vec![
                 v_i64(table.oid.raw()),
                 v_i64(idx.oid.raw()),
-                v_text(table.schema_name.clone()),
+                v_text(idx.schema_name.clone()),
                 v_text(table.name.clone()),
                 v_text(idx.name.clone()),
                 Value::Int64(u64_to_i64_saturating(usage.idx_scan)),
@@ -3139,7 +3139,7 @@ fn rows_pg_statio_user_indexes(ctx: &LowerCtx<'_>) -> Vec<Vec<Value>> {
             Some(vec![
                 v_i64(table.oid.raw()),
                 v_i64(idx.oid.raw()),
-                v_text(table.schema_name.clone()),
+                v_text(idx.schema_name.clone()),
                 v_text(table.name.clone()),
                 v_text(idx.name.clone()),
                 Value::Int64(u64_to_i64_saturating(index_io.reads)),
