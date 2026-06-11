@@ -96,7 +96,7 @@ pub fn parse_decimal_text(raw: &str, target_scale: Option<i32>) -> Result<Value,
             .ok_or_else(|| DecimalError::new("decimal overflow"))?;
     }
 
-    if frac.len() > scale_usize && frac.as_bytes()[scale_usize] >= b'5' {
+    if matches!(frac.as_bytes().get(scale_usize), Some(digit) if *digit >= b'5') {
         value = value
             .checked_add(1)
             .ok_or_else(|| DecimalError::new("decimal overflow"))?;
@@ -142,21 +142,23 @@ pub fn encode_pg_numeric_binary(value: i64, scale: i32) -> Result<Vec<u8>, Decim
 
 /// Decode PostgreSQL numeric binary payload into UltraSQL's decimal value.
 pub fn decode_pg_numeric_binary(payload: &[u8]) -> Result<Value, DecimalError> {
-    if payload.len() < NUMERIC_BINARY_HEADER_WIDTH {
-        return Err(DecimalError::new("truncated numeric header"));
-    }
-    let ndigits = i16::from_be_bytes([payload[0], payload[1]]);
+    let header = payload
+        .get(..NUMERIC_BINARY_HEADER_WIDTH)
+        .ok_or_else(|| DecimalError::new("truncated numeric header"))?;
+    let mut header_fields = header.chunks_exact(NUMERIC_DIGIT_WIDTH);
+
+    let ndigits = read_i16_be(header_fields.next(), "truncated numeric header")?;
     if ndigits < 0 {
         return Err(DecimalError::new("negative numeric digit count"));
     }
     let ndigits_usize =
         usize::try_from(ndigits).map_err(|_| DecimalError::new("invalid numeric digit count"))?;
-    let weight = i16::from_be_bytes([payload[2], payload[3]]);
-    let sign = u16::from_be_bytes([payload[4], payload[5]]);
+    let weight = read_i16_be(header_fields.next(), "truncated numeric header")?;
+    let sign = read_u16_be(header_fields.next(), "truncated numeric header")?;
     if !matches!(sign, NUMERIC_POS | NUMERIC_NEG) {
         return Err(DecimalError::new("unsupported numeric sign"));
     }
-    let dscale = i16::from_be_bytes([payload[6], payload[7]]);
+    let dscale = read_i16_be(header_fields.next(), "truncated numeric header")?;
     if dscale < 0 {
         return Err(DecimalError::new("negative numeric display scale"));
     }
@@ -172,14 +174,31 @@ pub fn decode_pg_numeric_binary(payload: &[u8]) -> Result<Value, DecimalError> {
     }
 
     let mut digits = Vec::with_capacity(ndigits_usize);
-    for raw in payload[NUMERIC_BINARY_HEADER_WIDTH..].chunks_exact(NUMERIC_DIGIT_WIDTH) {
-        let digit = u16::from_be_bytes([raw[0], raw[1]]);
+    let digit_payload = payload
+        .get(NUMERIC_BINARY_HEADER_WIDTH..)
+        .ok_or_else(|| DecimalError::new("numeric payload length mismatch"))?;
+    for raw in digit_payload.chunks_exact(NUMERIC_DIGIT_WIDTH) {
+        let digit = read_u16_be(Some(raw), "numeric payload length mismatch")?;
         if digit >= NUMERIC_NBASE {
             return Err(DecimalError::new("numeric digit outside base-10000"));
         }
         digits.push(digit);
     }
     numeric_parts_to_value(&digits, weight, sign, dscale)
+}
+
+fn read_i16_be(raw: Option<&[u8]>, message: &'static str) -> Result<i16, DecimalError> {
+    let raw = raw.ok_or_else(|| DecimalError::new(message))?;
+    let bytes: [u8; NUMERIC_DIGIT_WIDTH] =
+        raw.try_into().map_err(|_| DecimalError::new(message))?;
+    Ok(i16::from_be_bytes(bytes))
+}
+
+fn read_u16_be(raw: Option<&[u8]>, message: &'static str) -> Result<u16, DecimalError> {
+    let raw = raw.ok_or_else(|| DecimalError::new(message))?;
+    let bytes: [u8; NUMERIC_DIGIT_WIDTH] =
+        raw.try_into().map_err(|_| DecimalError::new(message))?;
+    Ok(u16::from_be_bytes(bytes))
 }
 
 fn decimal_to_numeric_parts(value: i64, scale: i32) -> Result<NumericBinaryParts, DecimalError> {
@@ -404,6 +423,45 @@ mod tests {
                 value: 12_340,
                 scale: 3
             }
+        );
+    }
+
+    #[test]
+    fn pg_numeric_binary_rejects_malformed_payloads() {
+        assert!(
+            decode_pg_numeric_binary(&[])
+                .unwrap_err()
+                .to_string()
+                .contains("truncated numeric header")
+        );
+
+        let mut truncated = encode_pg_numeric_binary(12_340, 3).unwrap();
+        truncated.pop();
+        assert!(
+            decode_pg_numeric_binary(&truncated)
+                .unwrap_err()
+                .to_string()
+                .contains("numeric payload length mismatch")
+        );
+
+        let mut bad_digit = encode_pg_numeric_binary(12_340, 3).unwrap();
+        bad_digit
+            .get_mut(NUMERIC_BINARY_HEADER_WIDTH..NUMERIC_BINARY_HEADER_WIDTH + 2)
+            .unwrap()
+            .copy_from_slice(&NUMERIC_NBASE.to_be_bytes());
+        assert!(
+            decode_pg_numeric_binary(&bad_digit)
+                .unwrap_err()
+                .to_string()
+                .contains("numeric digit outside base-10000")
+        );
+
+        let bad_sign = [0x00, 0x00, 0x00, 0x00, 0x20, 0x00, 0x00, 0x00];
+        assert!(
+            decode_pg_numeric_binary(&bad_sign)
+                .unwrap_err()
+                .to_string()
+                .contains("unsupported numeric sign")
         );
     }
 }
