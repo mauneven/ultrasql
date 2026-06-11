@@ -62,6 +62,20 @@ async fn core_scalar_types_round_trip_over_postgres_wire() {
     assert_eq!(row.get::<_, String>(6), "vartext");
     assert!(row.get::<_, bool>(7));
 
+    let quoted_builtin_cast_row = client
+        .query_one(
+            "SELECT
+                CAST('quoted text' AS \"text\"),
+                CAST(8 AS \"int4\"),
+                CAST('true' AS \"bool\")",
+            &[],
+        )
+        .await
+        .expect("quoted lowercase builtin casts resolve");
+    assert_eq!(quoted_builtin_cast_row.get::<_, String>(0), "quoted text");
+    assert_eq!(quoted_builtin_cast_row.get::<_, i32>(1), 8);
+    assert!(quoted_builtin_cast_row.get::<_, bool>(2));
+
     let payload_rows = client
         .simple_query("SELECT payload FROM core_type_surface")
         .await

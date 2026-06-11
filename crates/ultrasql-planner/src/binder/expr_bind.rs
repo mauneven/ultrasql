@@ -3494,7 +3494,7 @@ fn resolve_cast_type_with_catalog(type_name: &str, catalog: &dyn Catalog) -> Opt
     resolve_cast_type(type_name).or_else(|| {
         let parts = parse_pg_identifier_path(type_name)?;
         match parts.as_slice() {
-            [name] => catalog.lookup_type(name),
+            [name] => resolve_cast_type(name).or_else(|| catalog.lookup_type(name)),
             [schema_name, type_name] => {
                 if schema_name.eq_ignore_ascii_case("pg_catalog")
                     && let Some(data_type) = resolve_cast_type(type_name)
