@@ -10,6 +10,8 @@ use crate::{Value, parse_decimal_text};
 
 const MONEY_SCALE: i32 = 2;
 const MONEY_BINARY_WIDTH: usize = std::mem::size_of::<i64>();
+const CENTS_PER_UNIT: i128 = 100;
+const GROUP_WIDTH: usize = 3;
 
 /// Error raised while parsing or encoding a money value.
 #[derive(Clone, Debug, Eq, PartialEq, thiserror::Error)]
@@ -40,9 +42,12 @@ pub fn parse_money_text(raw: &str) -> Result<Value, MoneyError> {
     }
 
     let mut negative = false;
-    if text.starts_with('(') && text.ends_with(')') {
+    if let Some(parenthesized) = text
+        .strip_prefix('(')
+        .and_then(|rest| rest.strip_suffix(')'))
+    {
         negative = true;
-        text = text[1..text.len() - 1].trim();
+        text = parenthesized.trim();
     }
 
     text = consume_sign(text, &mut negative);
@@ -151,10 +156,13 @@ fn normalize_money_number(text: &str) -> Option<String> {
 
 fn comma_marks_fraction(text: &str, comma: usize) -> bool {
     let before_has_digit = text[..comma].chars().any(|ch| ch.is_ascii_digit());
-    let digits_after = text[comma + 1..]
-        .chars()
-        .filter(|ch| ch.is_ascii_digit())
-        .count();
+    let Some(after_start) = comma.checked_add(1) else {
+        return false;
+    };
+    let Some(after_comma) = text.get(after_start..) else {
+        return false;
+    };
+    let digits_after = after_comma.chars().filter(|ch| ch.is_ascii_digit()).count();
     before_has_digit && (1..=2).contains(&digits_after)
 }
 
@@ -173,8 +181,7 @@ fn consume_sign<'a>(text: &'a str, negative: &mut bool) -> &'a str {
 #[must_use]
 pub fn format_money_text(cents: i64) -> String {
     let magnitude = i128::from(cents).abs();
-    let dollars = magnitude / 100;
-    let cents_part = magnitude % 100;
+    let (dollars, cents_part) = split_money_parts(magnitude);
     let mut out = String::new();
     if cents < 0 {
         out.push('-');
@@ -225,8 +232,7 @@ fn format_money_with_template(
     decimal_sep: char,
 ) -> String {
     let magnitude = i128::from(cents).abs();
-    let dollars = magnitude / 100;
-    let cents_part = magnitude % 100;
+    let (dollars, cents_part) = split_money_parts(magnitude);
     let mut out = String::new();
     if cents < 0 {
         out.push('-');
@@ -245,11 +251,24 @@ fn push_grouped_digits(out: &mut String, digits: &str) {
 
 fn push_grouped_digits_with_separator(out: &mut String, digits: &str, separator: char) {
     for (idx, ch) in digits.chars().enumerate() {
-        if idx > 0 && (digits.len() - idx) % 3 == 0 {
+        if idx > 0
+            && digits
+                .len()
+                .checked_sub(idx)
+                .and_then(|remaining| remaining.checked_rem(GROUP_WIDTH))
+                == Some(0)
+        {
             out.push(separator);
         }
         out.push(ch);
     }
+}
+
+fn split_money_parts(magnitude: i128) -> (i128, i128) {
+    (
+        magnitude.checked_div(CENTS_PER_UNIT).unwrap_or(0),
+        magnitude.checked_rem(CENTS_PER_UNIT).unwrap_or(0),
+    )
 }
 
 /// Encode `MONEY` as PostgreSQL binary `cash` payload.
