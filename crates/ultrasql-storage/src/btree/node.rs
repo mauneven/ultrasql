@@ -2,6 +2,7 @@
 //! entries, page initialisation, and the descent / right-link helpers
 //! that route through the sibling chain on Lehman-Yao reads.
 
+use std::ops::Range;
 use ultrasql_core::endian::{
     read_i64_le, read_u16_le, read_u32_le, write_i64_le, write_u16_le, write_u32_le,
 };
@@ -209,19 +210,16 @@ pub(super) fn read_leaf_entries(page: &Page, count: u16) -> Result<Vec<LeafEntry
     let count = usize::from(count);
     let mut out = Vec::with_capacity(count);
     for i in 0..count {
-        let off = PAGE_HEADER_SIZE + i * LEAF_ENTRY_SIZE;
-        if off + LEAF_ENTRY_SIZE > NODE_SPECIAL_OFFSET {
-            return Err(BTreeError::MalformedNode("leaf entry out of range"));
-        }
-        let key =
-            read_i64_le(&bytes[off..off + 8]).map_err(|_| BTreeError::MalformedNode("leaf key"))?;
-        let rel =
-            read_u32_le(&bytes[off + 8..off + 12]).map_err(|_| BTreeError::MalformedNode("rel"))?;
-        let block = read_u32_le(&bytes[off + 12..off + 16])
+        let off = entry_start(i, LEAF_ENTRY_SIZE, "leaf entry out of range")?;
+        let key = read_i64_le(&bytes[entry_field(off, 0, 8, "leaf entry out of range")?])
+            .map_err(|_| BTreeError::MalformedNode("leaf key"))?;
+        let rel = read_u32_le(&bytes[entry_field(off, 8, 12, "leaf entry out of range")?])
+            .map_err(|_| BTreeError::MalformedNode("rel"))?;
+        let block = read_u32_le(&bytes[entry_field(off, 12, 16, "leaf entry out of range")?])
             .map_err(|_| BTreeError::MalformedNode("block"))?;
-        let slot = read_u16_le(&bytes[off + 16..off + 18])
+        let slot = read_u16_le(&bytes[entry_field(off, 16, 18, "leaf entry out of range")?])
             .map_err(|_| BTreeError::MalformedNode("slot"))?;
-        if bytes[off + 18..off + LEAF_ENTRY_SIZE]
+        if bytes[entry_field(off, 18, LEAF_ENTRY_SIZE, "leaf entry out of range")?]
             .iter()
             .any(|&b| b != 0)
         {
@@ -239,14 +237,25 @@ pub(super) fn read_leaf_entries(page: &Page, count: u16) -> Result<Vec<LeafEntry
 pub(super) fn write_leaf_entries(page: &mut Page, entries: &[LeafEntry]) {
     let bytes = page.as_bytes_mut();
     for (i, e) in entries.iter().enumerate() {
-        let off = PAGE_HEADER_SIZE + i * LEAF_ENTRY_SIZE;
-        write_i64_le(&mut bytes[off..off + 8], e.key);
-        write_u32_le(&mut bytes[off + 8..off + 12], e.value.page.relation.0.raw());
-        write_u32_le(&mut bytes[off + 12..off + 16], e.value.page.block.raw());
-        write_u16_le(&mut bytes[off + 16..off + 18], e.value.slot);
+        let off = entry_start_or_panic(i, LEAF_ENTRY_SIZE, "leaf entry out of range");
+        write_i64_le(
+            &mut bytes[entry_field_or_panic(off, 0, 8, "leaf entry out of range")],
+            e.key,
+        );
+        write_u32_le(
+            &mut bytes[entry_field_or_panic(off, 8, 12, "leaf entry out of range")],
+            e.value.page.relation.0.raw(),
+        );
+        write_u32_le(
+            &mut bytes[entry_field_or_panic(off, 12, 16, "leaf entry out of range")],
+            e.value.page.block.raw(),
+        );
+        write_u16_le(
+            &mut bytes[entry_field_or_panic(off, 16, 18, "leaf entry out of range")],
+            e.value.slot,
+        );
         // Pad bytes 18..20 set to zero; readers ignore.
-        bytes[off + 18] = 0;
-        bytes[off + 19] = 0;
+        bytes[entry_field_or_panic(off, 18, LEAF_ENTRY_SIZE, "leaf entry out of range")].fill(0);
     }
 }
 
@@ -258,15 +267,12 @@ pub(super) fn read_internal_entries(
     let count = usize::from(count);
     let mut out = Vec::with_capacity(count);
     for i in 0..count {
-        let off = PAGE_HEADER_SIZE + i * INTERNAL_ENTRY_SIZE;
-        if off + INTERNAL_ENTRY_SIZE > NODE_SPECIAL_OFFSET {
-            return Err(BTreeError::MalformedNode("internal entry out of range"));
-        }
-        let key = read_i64_le(&bytes[off..off + 8])
+        let off = entry_start(i, INTERNAL_ENTRY_SIZE, "internal entry out of range")?;
+        let key = read_i64_le(&bytes[entry_field(off, 0, 8, "internal entry out of range")?])
             .map_err(|_| BTreeError::MalformedNode("internal key"))?;
-        let child = read_u32_le(&bytes[off + 8..off + 12])
+        let child = read_u32_le(&bytes[entry_field(off, 8, 12, "internal entry out of range")?])
             .map_err(|_| BTreeError::MalformedNode("child"))?;
-        if bytes[off + 12..off + INTERNAL_ENTRY_SIZE]
+        if bytes[entry_field(off, 12, INTERNAL_ENTRY_SIZE, "internal entry out of range")?]
             .iter()
             .any(|&b| b != 0)
         {
@@ -280,14 +286,68 @@ pub(super) fn read_internal_entries(
 pub(super) fn write_internal_entries(page: &mut Page, entries: &[InternalEntry]) {
     let bytes = page.as_bytes_mut();
     for (i, e) in entries.iter().enumerate() {
-        let off = PAGE_HEADER_SIZE + i * INTERNAL_ENTRY_SIZE;
-        write_i64_le(&mut bytes[off..off + 8], e.key);
-        write_u32_le(&mut bytes[off + 8..off + 12], e.child);
-        bytes[off + 12..off + 16].fill(0);
+        let off = entry_start_or_panic(i, INTERNAL_ENTRY_SIZE, "internal entry out of range");
+        write_i64_le(
+            &mut bytes[entry_field_or_panic(off, 0, 8, "internal entry out of range")],
+            e.key,
+        );
+        write_u32_le(
+            &mut bytes[entry_field_or_panic(off, 8, 12, "internal entry out of range")],
+            e.child,
+        );
+        bytes[entry_field_or_panic(off, 12, INTERNAL_ENTRY_SIZE, "internal entry out of range")]
+            .fill(0);
     }
 }
 
 // --- helpers ---------------------------------------------------------------
+
+fn entry_start(index: usize, entry_size: usize, label: &'static str) -> Result<usize, BTreeError> {
+    let payload_offset = index
+        .checked_mul(entry_size)
+        .ok_or(BTreeError::MalformedNode(label))?;
+    let start = PAGE_HEADER_SIZE
+        .checked_add(payload_offset)
+        .ok_or(BTreeError::MalformedNode(label))?;
+    let end = start
+        .checked_add(entry_size)
+        .ok_or(BTreeError::MalformedNode(label))?;
+    if end > NODE_SPECIAL_OFFSET {
+        return Err(BTreeError::MalformedNode(label));
+    }
+    Ok(start)
+}
+
+fn entry_start_or_panic(index: usize, entry_size: usize, label: &'static str) -> usize {
+    entry_start(index, entry_size, label).expect("B-tree entry offset must fit page bounds")
+}
+
+fn entry_field(
+    base: usize,
+    start: usize,
+    end: usize,
+    label: &'static str,
+) -> Result<Range<usize>, BTreeError> {
+    let start = base
+        .checked_add(start)
+        .ok_or(BTreeError::MalformedNode(label))?;
+    let end = base
+        .checked_add(end)
+        .ok_or(BTreeError::MalformedNode(label))?;
+    if start > end || end > NODE_SPECIAL_OFFSET {
+        return Err(BTreeError::MalformedNode(label));
+    }
+    Ok(start..end)
+}
+
+fn entry_field_or_panic(
+    base: usize,
+    start: usize,
+    end: usize,
+    label: &'static str,
+) -> Range<usize> {
+    entry_field(base, start, end, label).expect("B-tree entry field must fit page bounds")
+}
 
 pub(super) fn init_btree_page(page: &mut Page, meta: NodeMeta) -> Result<(), BTreeError> {
     // Reinitialise the page header so it represents a B-tree page
