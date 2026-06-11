@@ -212,6 +212,9 @@ impl TupleHeader {
         let n_atts = read_u16_le(&bytes[26..28]).ok()?;
         let data_offset = read_u16_le(&bytes[28..30]).ok()?;
         // 2 bytes of padding at 30..32 reserved.
+        if read_u16_le(&bytes[30..32]).ok()? != 0 {
+            return None;
+        }
         let rel = RelationId::new(read_u32_le(&bytes[32..36]).ok()?);
         let block_and_slot = read_u32_le(&bytes[36..40]).ok()?;
         let block = BlockNumber::new(block_and_slot & 0x00FF_FFFF);
@@ -338,6 +341,15 @@ mod tests {
     #[test]
     fn decode_rejects_short_input() {
         let bytes = [0_u8; TUPLE_HEADER_SIZE - 1];
+        assert!(TupleHeader::decode(&bytes).is_none());
+    }
+
+    #[test]
+    fn decode_rejects_reserved_padding_bits() {
+        let h = TupleHeader::fresh(Xid::new(1), CommandId::new(0), sample_tid(), 1);
+        let mut bytes = [0_u8; TUPLE_HEADER_SIZE];
+        h.encode(&mut bytes);
+        bytes[30] = 1;
         assert!(TupleHeader::decode(&bytes).is_none());
     }
 
