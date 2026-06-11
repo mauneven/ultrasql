@@ -2541,9 +2541,6 @@ impl PlannerCatalog for CombinedCatalog<'_> {
     }
 
     fn lookup_type(&self, name: &str) -> Option<DataType> {
-        if let Some((schema_name, type_name)) = type_name_namespace_and_name(name) {
-            return self.lookup_type_in_schema(schema_name, type_name);
-        }
         for schema_name in search_path_schema_names(self.search_path) {
             if let Some(data_type) =
                 PlannerCatalog::lookup_type_in_schema(self.snapshot, &schema_name, name)
@@ -2556,7 +2553,8 @@ impl PlannerCatalog for CombinedCatalog<'_> {
                 return Some(data_type);
             }
         }
-        None
+        type_name_namespace_and_name(name)
+            .and_then(|(schema_name, type_name)| self.lookup_type_in_schema(schema_name, type_name))
     }
 
     fn lookup_type_in_schema(&self, schema_name: &str, name: &str) -> Option<DataType> {
@@ -2565,15 +2563,18 @@ impl PlannerCatalog for CombinedCatalog<'_> {
     }
 
     fn lookup_index(&self, name: &str) -> bool {
-        if let Some((schema_name, index_name)) = type_name_namespace_and_name(name) {
-            return self.lookup_index_in_schema(schema_name, index_name);
-        }
-        search_path_schema_names(self.search_path)
+        if search_path_schema_names(self.search_path)
             .into_iter()
             .any(|schema_name| {
                 PlannerCatalog::lookup_index_in_schema(self.snapshot, &schema_name, name)
                     || PlannerCatalog::lookup_index_in_schema(self.fallback, &schema_name, name)
             })
+        {
+            return true;
+        }
+        type_name_namespace_and_name(name).is_some_and(|(schema_name, index_name)| {
+            self.lookup_index_in_schema(schema_name, index_name)
+        })
     }
 
     fn lookup_index_in_schema(&self, schema_name: &str, name: &str) -> bool {
@@ -2588,9 +2589,6 @@ impl PlannerCatalog for CombinedCatalog<'_> {
     }
 
     fn lookup_table_oid(&self, name: &str) -> Option<Oid> {
-        if let Some((schema_name, table_name)) = type_name_namespace_and_name(name) {
-            return self.lookup_table_oid_in_schema(schema_name, table_name);
-        }
         for schema_name in search_path_schema_names(self.search_path) {
             if let Some(oid) =
                 PlannerCatalog::lookup_table_oid_in_schema(self.snapshot, &schema_name, name)
@@ -2603,7 +2601,9 @@ impl PlannerCatalog for CombinedCatalog<'_> {
                 return Some(oid);
             }
         }
-        None
+        type_name_namespace_and_name(name).and_then(|(schema_name, table_name)| {
+            self.lookup_table_oid_in_schema(schema_name, table_name)
+        })
     }
 
     fn lookup_table_oid_in_schema(&self, schema_name: &str, name: &str) -> Option<Oid> {
@@ -2613,9 +2613,6 @@ impl PlannerCatalog for CombinedCatalog<'_> {
     }
 
     fn lookup_type_oid(&self, name: &str) -> Option<Oid> {
-        if let Some((schema_name, type_name)) = type_name_namespace_and_name(name) {
-            return self.lookup_type_oid_in_schema(schema_name, type_name);
-        }
         for schema_name in search_path_schema_names(self.search_path) {
             if let Some(oid) =
                 PlannerCatalog::lookup_type_oid_in_schema(self.snapshot, &schema_name, name)
@@ -2628,7 +2625,9 @@ impl PlannerCatalog for CombinedCatalog<'_> {
                 return Some(oid);
             }
         }
-        None
+        type_name_namespace_and_name(name).and_then(|(schema_name, type_name)| {
+            self.lookup_type_oid_in_schema(schema_name, type_name)
+        })
     }
 
     fn lookup_type_oid_in_schema(&self, schema_name: &str, name: &str) -> Option<Oid> {

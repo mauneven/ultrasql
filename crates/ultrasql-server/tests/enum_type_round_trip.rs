@@ -198,6 +198,7 @@ async fn enum_type_keys_distinguish_schema_dot_from_type_dot() {
              CREATE TYPE app.\"mood.type\" AS ENUM ('app'); \
              CREATE SCHEMA \"app.mood\"; \
              CREATE TYPE \"app.mood\".type AS ENUM ('schema'); \
+             CREATE TYPE \"plain.mood\" AS ENUM ('plain'); \
              CREATE TABLE app.enum_dot_probe (id INT, mood app.\"mood.type\"); \
              CREATE TABLE \"app.mood\".enum_type_probe (id INT, mood \"app.mood\".type); \
              INSERT INTO app.enum_dot_probe VALUES (1, 'app'); \
@@ -233,6 +234,13 @@ async fn enum_type_keys_distinguish_schema_dot_from_type_dot() {
         .await
         .expect("cast to dotted schema enum type");
     assert_eq!(first_col_strings(&schema_cast_values), vec!["schema"]);
+
+    let public_cast_values = running
+        .client
+        .simple_query("SELECT CAST('plain' AS \"plain.mood\")")
+        .await
+        .expect("cast to unqualified dotted public enum type");
+    assert_eq!(first_col_strings(&public_cast_values), vec!["plain"]);
 
     shutdown(running).await;
 }
