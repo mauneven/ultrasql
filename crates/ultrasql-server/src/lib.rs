@@ -6342,7 +6342,7 @@ impl Server {
                     line_no + 1
                 ))
             })?;
-            let view_table = parts[0].to_owned();
+            let view_table = metadata_unescape(parts[0])?;
             if !seen_view_names.insert(view_table.to_ascii_lowercase())
                 || !seen_view_oids.insert(view_oid)
             {
@@ -6381,7 +6381,7 @@ impl Server {
             records.push(MaterializedViewMetadataRecord {
                 view_table,
                 view_oid: ultrasql_core::Oid::new(view_oid),
-                source_table: parts[2].to_owned(),
+                source_table: metadata_unescape(parts[2])?,
                 source_oid: ultrasql_core::Oid::new(source_oid),
                 materialized_rows,
                 projection,
@@ -6407,9 +6407,9 @@ impl Server {
                 .join(",");
             out.push_str(&format!(
                 "{}\t{}\t{}\t{}\t{}\t{}\n",
-                record.view_table,
+                metadata_escape(&record.view_table),
                 record.view_oid.raw(),
-                record.source_table,
+                metadata_escape(&record.source_table),
                 record.source_oid.raw(),
                 record.materialized_rows,
                 projection

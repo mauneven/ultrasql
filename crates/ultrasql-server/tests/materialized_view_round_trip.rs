@@ -211,6 +211,59 @@ async fn appended_materialized_view_rows_survive_restart() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn materialized_view_metadata_escapes_quoted_names_on_restart() {
+    let data_dir = tempfile::TempDir::new().unwrap();
+    let metadata_path = data_dir.path().join("pg_materialized_views.meta");
+
+    let running = start_persistent_server(data_dir.path(), "materialized_view_quoted_setup").await;
+    running
+        .client
+        .batch_execute("CREATE TABLE \"mv\tsrc\" (id INT NOT NULL, amount INT NOT NULL)")
+        .await
+        .expect("create quoted source");
+    running
+        .client
+        .batch_execute("INSERT INTO \"mv\tsrc\" VALUES (1, 10)")
+        .await
+        .expect("seed quoted source");
+    running
+        .client
+        .batch_execute("CREATE MATERIALIZED VIEW \"mv\tcopy\" AS SELECT id FROM \"mv\tsrc\"")
+        .await
+        .expect("create quoted materialized view");
+    shutdown_persistent(running).await;
+
+    let metadata = std::fs::read_to_string(&metadata_path).expect("metadata exists");
+    assert!(
+        metadata.contains(r"mv\tcopy") && metadata.contains(r"mv\tsrc"),
+        "materialized-view metadata must escape quoted table names: {metadata:?}"
+    );
+
+    let running = start_persistent_server(data_dir.path(), "materialized_view_quoted_verify").await;
+    let before: i64 = running
+        .client
+        .query_one("SELECT COUNT(*) FROM \"mv\tcopy\"", &[])
+        .await
+        .expect("query quoted materialized view after restart")
+        .get(0);
+    assert_eq!(before, 1);
+
+    running
+        .client
+        .batch_execute("INSERT INTO \"mv\tsrc\" VALUES (2, 20)")
+        .await
+        .expect("append quoted source");
+    let after: i64 = running
+        .client
+        .query_one("SELECT COUNT(*) FROM \"mv\tcopy\"", &[])
+        .await
+        .expect("query maintained quoted materialized view")
+        .get(0);
+    assert_eq!(after, 2);
+    shutdown_persistent(running).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn materialized_view_keeps_maintaining_source_after_restart() {
     let data_dir = tempfile::TempDir::new().unwrap();
 
