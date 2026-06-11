@@ -1724,6 +1724,9 @@ fn materialized_view_source_plan_from_metadata(
     for (out_idx, source_idx) in record.projection.iter().copied().enumerate() {
         let source_field = source_entry.schema.fields().get(source_idx)?;
         let output_field = view_entry.schema.fields().get(out_idx)?;
+        if source_field.data_type != output_field.data_type {
+            return None;
+        }
         exprs.push((
             ScalarExpr::Column {
                 name: output_field.name.clone(),
