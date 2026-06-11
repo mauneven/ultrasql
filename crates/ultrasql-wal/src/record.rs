@@ -352,6 +352,14 @@ fn decode_header_from(bytes: &[u8]) -> Result<WalRecordHeader, WalRecordError> {
     );
     let record_type = RecordType::from_u8(bytes[RTYPE_OFFSET])?;
     let flags = bytes[FLAGS_OFFSET];
+    if bytes[FLAGS_OFFSET + 1..RECORD_HEADER_SIZE]
+        .iter()
+        .any(|byte| *byte != 0)
+    {
+        return Err(WalRecordError::Malformed(
+            "header reserved bytes must be zero",
+        ));
+    }
     Ok(WalRecordHeader {
         total_length,
         crc,
@@ -434,6 +442,15 @@ mod tests {
         bytes[RTYPE_OFFSET] = 99;
         let err = WalRecord::decode(&bytes).unwrap_err();
         assert!(matches!(err, WalRecordError::UnknownType(99)));
+    }
+
+    #[test]
+    fn header_reserved_bytes_rejected() {
+        let record = rec(RecordType::HeapInsert, b"x");
+        let mut bytes = record.encode();
+        bytes[FLAGS_OFFSET + 1] = 1;
+        let err = WalRecord::decode(&bytes).unwrap_err();
+        assert!(matches!(err, WalRecordError::Malformed(_)), "got {err:?}");
     }
 
     #[test]
