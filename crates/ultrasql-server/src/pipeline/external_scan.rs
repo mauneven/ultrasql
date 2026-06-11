@@ -36,6 +36,7 @@ const DEFAULT_EXTERNAL_LOCAL_READ_LIMIT_BYTES: u64 = 128 * 1024 * 1024;
 const EXTERNAL_LOCAL_READ_LIMIT_ENV: &str = "ULTRASQL_EXTERNAL_LOCAL_READ_LIMIT_BYTES";
 const DEFAULT_JSON_RECORD_READ_LIMIT_BYTES: u64 = 16 * 1024 * 1024;
 const JSON_RECORD_READ_LIMIT_ENV: &str = "ULTRASQL_JSON_RECORD_LIMIT_BYTES";
+const MAX_LOCAL_WILDCARD_PATTERN_CHARS: usize = 4096;
 
 /// Return true for file-backed table functions lowered through
 /// [`ExternalTableScan`].
@@ -600,6 +601,7 @@ fn expand_file_paths(function_name: &str, pattern: &str) -> Result<Vec<PathBuf>,
     if !contains_wildcard(file_pattern) {
         return Ok(vec![path.to_path_buf()]);
     }
+    validate_wildcard_pattern_len(function_name, file_pattern)?;
 
     let parent = path
         .parent()
@@ -634,26 +636,77 @@ fn contains_wildcard(s: &str) -> bool {
     s.chars().any(|ch| matches!(ch, '*' | '?'))
 }
 
+fn validate_wildcard_pattern_len(
+    function_name: &str,
+    file_pattern: &str,
+) -> Result<(), ServerError> {
+    let pattern_chars = file_pattern.chars().count();
+    if pattern_chars > MAX_LOCAL_WILDCARD_PATTERN_CHARS {
+        return Err(ServerError::CopyFormat(format!(
+            "{function_name}: wildcard pattern too long: chars={pattern_chars} limit={MAX_LOCAL_WILDCARD_PATTERN_CHARS}"
+        )));
+    }
+    Ok(())
+}
+
+fn advance_index(index: &mut usize) -> bool {
+    let Some(next) = index.checked_add(1) else {
+        return false;
+    };
+    *index = next;
+    true
+}
+
 fn wildcard_match(pattern: &str, text: &str) -> bool {
     let pattern = pattern.chars().collect::<Vec<_>>();
     let text = text.chars().collect::<Vec<_>>();
-    let mut dp = vec![vec![false; text.len() + 1]; pattern.len() + 1];
-    dp[0][0] = true;
-    for (i, ch) in pattern.iter().enumerate() {
-        if *ch == '*' {
-            dp[i + 1][0] = dp[i][0];
+
+    let mut pattern_idx = 0;
+    let mut text_idx = 0;
+    let mut last_star = None;
+    let mut star_text_idx = 0;
+
+    while let Some(&text_ch) = text.get(text_idx) {
+        match pattern.get(pattern_idx).copied() {
+            Some('?') => {
+                if !advance_index(&mut pattern_idx) || !advance_index(&mut text_idx) {
+                    return false;
+                }
+            }
+            Some('*') => {
+                last_star = Some(pattern_idx);
+                if !advance_index(&mut pattern_idx) {
+                    return false;
+                }
+                star_text_idx = text_idx;
+            }
+            Some(pattern_ch) if pattern_ch == text_ch => {
+                if !advance_index(&mut pattern_idx) || !advance_index(&mut text_idx) {
+                    return false;
+                }
+            }
+            _ => {
+                let Some(star_idx) = last_star else {
+                    return false;
+                };
+                let Some(next_pattern_idx) = star_idx.checked_add(1) else {
+                    return false;
+                };
+                pattern_idx = next_pattern_idx;
+                if !advance_index(&mut star_text_idx) {
+                    return false;
+                }
+                text_idx = star_text_idx;
+            }
         }
     }
-    for (i, pattern_ch) in pattern.iter().enumerate() {
-        for (j, text_ch) in text.iter().enumerate() {
-            dp[i + 1][j + 1] = match pattern_ch {
-                '*' => dp[i][j + 1] || dp[i + 1][j],
-                '?' => dp[i][j],
-                ch => dp[i][j] && ch == text_ch,
-            };
+
+    while matches!(pattern.get(pattern_idx), Some('*')) {
+        if !advance_index(&mut pattern_idx) {
+            return false;
         }
     }
-    dp[pattern.len()][text.len()]
+    pattern_idx == pattern.len()
 }
 
 type JsonObject = JsonMap<String, JsonValue>;
@@ -1444,6 +1497,20 @@ mod tests {
         assert_eq!(batch.rows(), 2);
         assert_eq!(pulls.load(Ordering::SeqCst), 1);
         assert!(scan.next_batch().expect("stream eof").is_none());
+    }
+
+    #[test]
+    fn external_glob_rejects_oversized_wildcard_pattern() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let pattern = dir.path().join(format!("{}*.json", "x".repeat(4096)));
+
+        let err = super::expand_file_paths("read_json", &pattern.to_string_lossy())
+            .expect_err("oversized wildcard pattern must fail before directory scan");
+
+        assert!(
+            err.to_string().contains("wildcard pattern too long"),
+            "unexpected error: {err}"
+        );
     }
 
     fn text_lit(value: &str) -> ScalarExpr {

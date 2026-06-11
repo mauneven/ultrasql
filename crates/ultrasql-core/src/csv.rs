@@ -16,6 +16,7 @@ use std::path::{Path, PathBuf};
 
 const DEFAULT_CSV_LOCAL_READ_LIMIT_BYTES: u64 = 128 * 1024 * 1024;
 const CSV_LOCAL_READ_LIMIT_ENV: &str = "ULTRASQL_CSV_LOCAL_READ_LIMIT_BYTES";
+const MAX_LOCAL_WILDCARD_PATTERN_CHARS: usize = 4096;
 
 const DEFAULT_DELIMITER: char = ',';
 const DEFAULT_QUOTE: char = '"';
@@ -365,8 +366,8 @@ pub fn sniff_csv_text(path: &str, input: &str) -> Result<CsvSniff, CsvError> {
 ///
 /// # Errors
 ///
-/// Returns [`CsvError`] when the directory cannot be read or the pattern
-/// matches no files.
+/// Returns [`CsvError`] when the wildcard pattern is too large, the directory
+/// cannot be read, or the pattern matches no files.
 pub fn expand_csv_paths(pattern: &str) -> Result<Vec<PathBuf>, CsvError> {
     let path = Path::new(pattern);
     let file_pattern = path
@@ -380,6 +381,7 @@ pub fn expand_csv_paths(pattern: &str) -> Result<Vec<PathBuf>, CsvError> {
     if !contains_wildcard(file_pattern) {
         return Ok(vec![path.to_path_buf()]);
     }
+    validate_wildcard_pattern_len(file_pattern)?;
 
     let parent = path
         .parent()
@@ -856,6 +858,16 @@ fn contains_wildcard(s: &str) -> bool {
     s.chars().any(|ch| matches!(ch, '*' | '?'))
 }
 
+fn validate_wildcard_pattern_len(file_pattern: &str) -> Result<(), CsvError> {
+    let pattern_chars = file_pattern.chars().count();
+    if pattern_chars > MAX_LOCAL_WILDCARD_PATTERN_CHARS {
+        return Err(CsvError::new(format!(
+            "read_csv wildcard pattern too long: chars={pattern_chars} limit={MAX_LOCAL_WILDCARD_PATTERN_CHARS}"
+        )));
+    }
+    Ok(())
+}
+
 fn display_row_number(row_index: usize) -> usize {
     row_index.saturating_add(1)
 }
@@ -1023,6 +1035,30 @@ mod tests {
         assert!(super::wildcard_match("part-?.csv", "part-a.csv"));
         assert!(!super::wildcard_match("part-?.csv", "part-ab.csv"));
         assert!(super::wildcard_match("a*b?d.csv", "a-very-bad.csv"));
+    }
+
+    #[test]
+    fn expand_csv_paths_rejects_oversized_wildcard_pattern() {
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |duration| duration.as_nanos());
+        let dir = std::env::temp_dir().join(format!(
+            "ultrasql-csv-long-wildcard-{}-{nonce}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let pattern = dir.join(format!("{}*.csv", "x".repeat(4096)));
+
+        let err = super::expand_csv_paths(&pattern.to_string_lossy())
+            .expect_err("oversized wildcard pattern must fail before directory scan");
+
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(
+            err.to_string().contains("wildcard pattern too long"),
+            "unexpected error: {err}"
+        );
     }
 
     #[cfg(unix)]
