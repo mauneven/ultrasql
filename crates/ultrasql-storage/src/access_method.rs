@@ -2311,8 +2311,17 @@ impl PageBackedHnswStorage {
             }
             let block = image.page_id.block;
             let mut page = image.page;
+            if page.page_id() != image.page_id {
+                return Err(AccessMethodError::Storage(
+                    "hnsw page image id mismatch".to_owned(),
+                ));
+            }
             page.set_lsn(image.lsn);
-            pages.insert(block, page);
+            if pages.insert(block, page).is_some() {
+                return Err(AccessMethodError::Storage(
+                    "hnsw duplicate page image block".to_owned(),
+                ));
+            }
         }
 
         let meta = match pages.get(&BlockNumber::new(HNSW_META_BLOCK)) {
@@ -2344,8 +2353,31 @@ impl PageBackedHnswStorage {
         let mut tombstones = 0;
         for (block, page) in &pages {
             if let HnswPersistentPage::Node(node) = page {
-                tid_to_node.insert(node.tid, node.node_id);
-                node_to_block.insert(node.node_id, *block);
+                if node.vector_len != meta.dims {
+                    return Err(AccessMethodError::Storage(
+                        "hnsw node vector length mismatch".to_owned(),
+                    ));
+                }
+                if node.node_id >= meta.next_node_id {
+                    return Err(AccessMethodError::Storage(
+                        "hnsw node id exceeds metadata".to_owned(),
+                    ));
+                }
+                if node.neighbor_count > meta.m {
+                    return Err(AccessMethodError::Storage(
+                        "hnsw node neighbor count exceeds metadata".to_owned(),
+                    ));
+                }
+                if tid_to_node.insert(node.tid, node.node_id).is_some() {
+                    return Err(AccessMethodError::Storage(
+                        "hnsw duplicate tuple id in page images".to_owned(),
+                    ));
+                }
+                if node_to_block.insert(node.node_id, *block).is_some() {
+                    return Err(AccessMethodError::Storage(
+                        "hnsw duplicate node id in page images".to_owned(),
+                    ));
+                }
                 if node.deleted {
                     tombstones += 1;
                 } else {
@@ -4969,6 +5001,36 @@ mod tests {
         assert_eq!(restored.page_stats().live_nodes, 1);
         let hits = restored.search(&[0.1, 0.0, 0.0], 1).expect("search");
         assert_eq!(hits[0].tid, tid(1, 0));
+    }
+
+    #[test]
+    fn page_backed_hnsw_restore_rejects_duplicate_node_ids() {
+        let index_rel = RelationId::new(8813);
+        let source =
+            PageBackedHnswIndex::new(index_rel, 3, HnswMetric::L2, 4, 16).expect("hnsw config");
+        source
+            .insert_vector(&[0.0, 0.0, 0.0], tid(1, 0))
+            .expect("insert node");
+
+        let mut images = source.page_images();
+        let mut duplicate = images
+            .iter()
+            .find(|image| matches!(image.page, HnswPersistentPage::Node(_)))
+            .expect("node image exists")
+            .clone();
+        duplicate.page_id = PageId::new(index_rel, BlockNumber::new(99_999));
+        let HnswPersistentPage::Node(node) = &mut duplicate.page else {
+            unreachable!("selected node page");
+        };
+        node.page_id = duplicate.page_id;
+        node.tid = tid(1, 1);
+        images.push(duplicate);
+
+        let err =
+            PageBackedHnswIndex::from_page_images(index_rel, 3, HnswMetric::L2, 4, 16, images)
+                .expect_err("duplicate node ids must be refused");
+
+        assert!(format!("{err}").contains("duplicate node id"));
     }
 
     #[test]
