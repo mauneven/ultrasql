@@ -149,21 +149,12 @@ impl DictionaryColumn {
 
     /// Look up the string value for row `i`.
     ///
-    /// # Panics
-    ///
-    /// Panics if `i >= self.len()` or if row `i` is null (code == `u32::MAX`).
+    /// Prefer [`Self::try_decode_at`] for externally supplied row indexes.
+    /// This convenience accessor fails closed to the empty string for
+    /// out-of-bounds, NULL, or malformed dictionary codes.
     #[must_use]
     pub fn decode_at(&self, i: usize) -> &str {
-        let code = self.codes.data()[i];
-        assert_ne!(code, u32::MAX, "decode_at called on null row {i}");
-        let idx = u32_to_usize(code);
-        match self.dict.get(idx) {
-            Some(value) => value,
-            None => panic!(
-                "dictionary code {code} out of range for dict size {}",
-                self.dict.len()
-            ),
-        }
+        self.try_decode_at(i).unwrap_or("")
     }
 
     /// Look up the dict code for `value`, or `None` if not present.
@@ -514,14 +505,13 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "dictionary code 2 out of range")]
-    fn decode_at_reports_out_of_range_code() {
+    fn decode_at_fails_closed_for_out_of_range_code() {
         let col = DictionaryColumn {
             dict: vec!["a".to_owned(), "b".to_owned()],
             codes: NumericColumn::from_data(vec![2]),
         };
 
-        let _ = col.decode_at(0);
+        assert_eq!(col.decode_at(0), "");
     }
 
     #[test]
