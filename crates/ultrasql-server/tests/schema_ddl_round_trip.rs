@@ -1204,6 +1204,30 @@ async fn drop_schema_cascade_removes_qualified_sequences() {
     shutdown(running).await;
 }
 
+#[tokio::test]
+async fn unqualified_drop_index_preserves_quoted_dot_in_name() {
+    let running = start_sample_server("schema_dotted_index_drop").await;
+
+    running
+        .client
+        .batch_execute(
+            "CREATE TABLE dotted_index_table (id INT); \
+             CREATE INDEX \"idx.dotted\" ON dotted_index_table(id); \
+             DROP INDEX \"idx.dotted\"",
+        )
+        .await
+        .expect("quoted dotted index name drops as an unqualified public index");
+
+    let remaining = simple_i64(
+        &running.client,
+        "SELECT COUNT(*) FROM pg_catalog.pg_indexes WHERE indexname = 'idx.dotted'",
+    )
+    .await;
+    assert_eq!(remaining, 0);
+
+    shutdown(running).await;
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn qualified_relation_and_type_schemas_survive_restart() {
     let data_dir = tempfile::TempDir::new().expect("temp data dir");

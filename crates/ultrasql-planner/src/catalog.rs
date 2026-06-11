@@ -128,13 +128,15 @@ pub trait Catalog: Send + Sync {
 
     /// Resolve the schema that owns an unqualified index name.
     fn lookup_index_schema(&self, name: &str) -> Option<String> {
+        if self.lookup_index_in_schema("public", name) {
+            return Some("public".to_owned());
+        }
         if let Some((schema_name, index_name)) = name.rsplit_once('.') {
             return self
                 .lookup_index_in_schema(schema_name, index_name)
                 .then(|| schema_name.to_ascii_lowercase());
         }
-        self.lookup_index_in_schema("public", name)
-            .then(|| "public".to_owned())
+        None
     }
 
     /// Resolve a relation name to its catalog OID.
@@ -451,14 +453,18 @@ impl Catalog for ultrasql_catalog::CatalogSnapshot {
     }
 
     fn lookup_index_schema(&self, name: &str) -> Option<String> {
+        if let Some(entry) = self
+            .indexes
+            .get(&ultrasql_catalog::index_lookup_key("public", name))
+        {
+            return Some(entry.schema_name.clone());
+        }
         if let Some((schema_name, index_name)) = name.rsplit_once('.') {
             return self
                 .lookup_index_in_schema(schema_name, index_name)
                 .then(|| schema_name.to_ascii_lowercase());
         }
-        self.indexes
-            .get(&ultrasql_catalog::index_lookup_key("public", name))
-            .map(|entry| entry.schema_name.clone())
+        None
     }
 
     fn lookup_table_oid(&self, name: &str) -> Option<Oid> {
