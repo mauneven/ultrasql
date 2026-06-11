@@ -11,8 +11,8 @@ use crate::buffer_pool::{PageGuard, PageLoader};
 use crate::page::{PAGE_HEADER_SIZE, Page, PageHeader, PageKind};
 
 use super::{
-    BTreeError, FLAG_HAS_HIGH_KEY, FLAG_LEAF, INTERNAL_ENTRY_SIZE, LEAF_ENTRY_SIZE, NO_SIBLING,
-    NODE_SPECIAL_OFFSET,
+    BTreeError, FLAG_HAS_HIGH_KEY, FLAG_LEAF, INTERNAL_ENTRY_SIZE, LEAF_ENTRY_SIZE,
+    MAX_INTERNAL_ENTRIES, MAX_LEAF_ENTRIES, NO_SIBLING, NODE_SPECIAL_OFFSET,
 };
 
 // --- node metadata ---------------------------------------------------------
@@ -35,6 +35,8 @@ pub(super) struct NodeMeta {
 }
 
 impl NodeMeta {
+    const KNOWN_FLAGS: u16 = FLAG_LEAF | FLAG_HAS_HIGH_KEY;
+
     pub(super) const fn fresh_leaf() -> Self {
         Self {
             right_link: NO_SIBLING,
@@ -78,6 +80,20 @@ impl NodeMeta {
             .map_err(|_| BTreeError::MalformedNode("n_keys"))?;
         let flags = read_u16_le(&bytes[off + 16..off + 18])
             .map_err(|_| BTreeError::MalformedNode("flags"))?;
+        if flags & !Self::KNOWN_FLAGS != 0 {
+            return Err(BTreeError::MalformedNode("node flags reserved bits"));
+        }
+        if bytes[off + 18..off + 24].iter().any(|&b| b != 0) {
+            return Err(BTreeError::MalformedNode("node reserved bytes"));
+        }
+        let max_keys = if flags & FLAG_LEAF != 0 {
+            MAX_LEAF_ENTRIES
+        } else {
+            MAX_INTERNAL_ENTRIES
+        };
+        if usize::from(n_keys) > max_keys {
+            return Err(BTreeError::MalformedNode("node key count"));
+        }
         Ok(Self {
             right_link,
             high_key,
@@ -95,8 +111,10 @@ impl NodeMeta {
         write_u16_le(&mut bytes[off + 12..off + 14], self.level);
         write_u16_le(&mut bytes[off + 14..off + 16], self.n_keys);
         write_u16_le(&mut bytes[off + 16..off + 18], self.flags);
-        // Reserved bytes (6) at offsets 18..24 are deliberately left
-        // zero so future format extensions can repurpose them.
+        // Reserved bytes (6) at offsets 18..24 are zeroed so future
+        // format extensions can repurpose them without inheriting
+        // stale page contents.
+        bytes[off + 18..off + 24].fill(0);
     }
 }
 

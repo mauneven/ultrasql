@@ -8,6 +8,7 @@ use ultrasql_core::endian::write_i64_le;
 use ultrasql_core::{BlockNumber, PageId, RelationId, TupleId, Xid};
 use ultrasql_wal::WalRecord;
 
+use super::node::{NodeMeta, init_btree_page};
 use super::*;
 use crate::buffer_pool::{BufferPool, BufferPoolError, PageLoader};
 use crate::page::Page;
@@ -56,6 +57,49 @@ fn tid(block: u32, slot: u16) -> TupleId {
         PageId::new(RelationId::new(99), BlockNumber::new(block)),
         slot,
     )
+}
+
+#[test]
+fn node_meta_rejects_reserved_flag_bits() {
+    let mut page = Page::new_heap();
+    init_btree_page(&mut page, NodeMeta::fresh_leaf()).unwrap();
+    page.as_bytes_mut()[NODE_SPECIAL_OFFSET + 16] |= 1 << 2;
+
+    let err = NodeMeta::read_from(&page).unwrap_err();
+
+    assert!(matches!(
+        err,
+        BTreeError::MalformedNode("node flags reserved bits")
+    ));
+}
+
+#[test]
+fn node_meta_rejects_reserved_suffix_bytes() {
+    let mut page = Page::new_heap();
+    init_btree_page(&mut page, NodeMeta::fresh_leaf()).unwrap();
+    page.as_bytes_mut()[NODE_SPECIAL_OFFSET + 18] = 1;
+
+    let err = NodeMeta::read_from(&page).unwrap_err();
+
+    assert!(matches!(
+        err,
+        BTreeError::MalformedNode("node reserved bytes")
+    ));
+}
+
+#[test]
+fn node_meta_write_clears_reserved_suffix_bytes() {
+    let mut page = Page::new_heap();
+    init_btree_page(&mut page, NodeMeta::fresh_leaf()).unwrap();
+    page.as_bytes_mut()[NODE_SPECIAL_OFFSET + 18..NODE_SPECIAL_OFFSET + NODE_META_SIZE].fill(0xFF);
+
+    NodeMeta::fresh_leaf().write_into(&mut page);
+
+    assert!(
+        page.as_bytes()[NODE_SPECIAL_OFFSET + 18..NODE_SPECIAL_OFFSET + NODE_META_SIZE]
+            .iter()
+            .all(|&b| b == 0)
+    );
 }
 
 #[test]
