@@ -316,7 +316,7 @@ pub fn sniff_csv_text(path: &str, input: &str) -> Result<CsvSniff, CsvError> {
         if record.len() != width {
             return Err(CsvError::new(format!(
                 "sniff_csv row {} has {} columns, expected {}",
-                row_index + 1,
+                display_row_number(row_index),
                 record.len(),
                 width
             )));
@@ -544,7 +544,7 @@ pub fn read_csv_data_from_text(path: &str, text: &str) -> Result<CsvReadData, Cs
         if record.len() != width {
             return Err(CsvError::new(format!(
                 "read_csv row {} in {} has {} columns, expected {}",
-                row_index + 1,
+                display_row_number(row_index),
                 path,
                 record.len(),
                 width
@@ -856,6 +856,18 @@ fn contains_wildcard(s: &str) -> bool {
     s.chars().any(|ch| matches!(ch, '*' | '?'))
 }
 
+fn display_row_number(row_index: usize) -> usize {
+    row_index.saturating_add(1)
+}
+
+fn advance_index(index: &mut usize) -> bool {
+    let Some(next) = index.checked_add(1) else {
+        return false;
+    };
+    *index = next;
+    true
+}
+
 fn wildcard_match(pattern: &str, text: &str) -> bool {
     let pattern = pattern.chars().collect::<Vec<_>>();
     let text = text.chars().collect::<Vec<_>>();
@@ -868,31 +880,42 @@ fn wildcard_match(pattern: &str, text: &str) -> bool {
     while let Some(&text_ch) = text.get(text_idx) {
         match pattern.get(pattern_idx).copied() {
             Some('?') => {
-                pattern_idx += 1;
-                text_idx += 1;
+                if !advance_index(&mut pattern_idx) || !advance_index(&mut text_idx) {
+                    return false;
+                }
             }
             Some('*') => {
                 last_star = Some(pattern_idx);
-                pattern_idx += 1;
+                if !advance_index(&mut pattern_idx) {
+                    return false;
+                }
                 star_text_idx = text_idx;
             }
             Some(pattern_ch) if pattern_ch == text_ch => {
-                pattern_idx += 1;
-                text_idx += 1;
+                if !advance_index(&mut pattern_idx) || !advance_index(&mut text_idx) {
+                    return false;
+                }
             }
             _ => {
                 let Some(star_idx) = last_star else {
                     return false;
                 };
-                pattern_idx = star_idx + 1;
-                star_text_idx += 1;
+                let Some(next_pattern_idx) = star_idx.checked_add(1) else {
+                    return false;
+                };
+                pattern_idx = next_pattern_idx;
+                if !advance_index(&mut star_text_idx) {
+                    return false;
+                }
                 text_idx = star_text_idx;
             }
         }
     }
 
     while matches!(pattern.get(pattern_idx), Some('*')) {
-        pattern_idx += 1;
+        if !advance_index(&mut pattern_idx) {
+            return false;
+        }
     }
     pattern_idx == pattern.len()
 }
