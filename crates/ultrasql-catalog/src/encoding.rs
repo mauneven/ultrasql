@@ -111,6 +111,13 @@ pub enum DecodeError {
     /// `Field`s — duplicate column names typically.
     #[error("schema rebuild failed: {0}")]
     Schema(#[from] CoreError),
+
+    /// The row contained bytes after the expected layout.
+    #[error("trailing bytes after catalog row: {len}")]
+    TrailingBytes {
+        /// Number of unread bytes after decoding the row.
+        len: usize,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -193,6 +200,14 @@ impl<'a> Reader<'a> {
     }
     fn remaining(&self) -> usize {
         self.bytes.len().saturating_sub(self.pos)
+    }
+    fn finish(&self) -> Result<(), DecodeError> {
+        let len = self.remaining();
+        if len == 0 {
+            Ok(())
+        } else {
+            Err(DecodeError::TrailingBytes { len })
+        }
     }
     fn take(&mut self, n: usize) -> Result<&'a [u8], DecodeError> {
         if self.pos + n > self.bytes.len() {
@@ -698,6 +713,7 @@ impl ClassRow {
             let value = r.str()?;
             reloptions.push((key, value));
         }
+        r.finish()?;
         Ok(Self {
             oid,
             relname,
@@ -765,6 +781,7 @@ pub fn decode_attribute_row(bytes: &[u8]) -> Result<(AttributeRow, DataType, boo
     let attisdropped = r.bool()?;
     let data_type = decode_data_type(&mut r)?;
     let nullable = r.bool()?;
+    r.finish()?;
     Ok((
         AttributeRow {
             attrelid,
@@ -846,6 +863,7 @@ pub fn decode_type_row(bytes: &[u8]) -> Result<TypeRow, DecodeError> {
     let typcategory = decode_single_char(&r.str()?)?;
     let typlen = r.i16()?;
     let typelem = r.u32()?;
+    r.finish()?;
     Ok(TypeRow {
         oid,
         typname,
@@ -876,12 +894,14 @@ pub fn encode_enum_row(row: &EnumRow) -> Result<Vec<u8>, EncodeError> {
 /// Decode a `pg_enum` row from the catalog's internal binary format.
 pub fn decode_enum_row(bytes: &[u8]) -> Result<EnumRow, DecodeError> {
     let mut r = Reader::new(bytes);
-    Ok(EnumRow {
+    let row = EnumRow {
         oid: Oid::new(r.u32()?),
         enumtypid: Oid::new(r.u32()?),
         enumsortorder: r.u32()?,
         enumlabel: r.str()?,
-    })
+    };
+    r.finish()?;
+    Ok(row)
 }
 
 fn decode_single_char(text: &str) -> Result<char, DecodeError> {
@@ -970,6 +990,7 @@ pub fn decode_index_row(bytes: &[u8]) -> Result<IndexRow, DecodeError> {
         }
         (indmethod, indopclasses, indoptions)
     };
+    r.finish()?;
     Ok(IndexRow {
         indexrelid,
         indrelid,
@@ -1066,6 +1087,7 @@ pub fn decode_constraint_row(bytes: &[u8]) -> Result<ConstraintRow, DecodeError>
     let conkey = read_i16_vec(&mut r)?;
     let confrelid = Oid::new(r.u32()?);
     let confkey = read_i16_vec(&mut r)?;
+    r.finish()?;
     Ok(ConstraintRow {
         oid,
         conname,
@@ -1102,7 +1124,7 @@ pub fn encode_sequence_row(row: &SequenceRow) -> Vec<u8> {
 /// Decode a row produced by [`encode_sequence_row`].
 pub fn decode_sequence_row(bytes: &[u8]) -> Result<SequenceRow, DecodeError> {
     let mut r = Reader::new(bytes);
-    Ok(SequenceRow {
+    let row = SequenceRow {
         seqrelid: Oid::new(r.u32()?),
         seqtypid: r.u32()?,
         seqstart: r.i64()?,
@@ -1111,7 +1133,9 @@ pub fn decode_sequence_row(bytes: &[u8]) -> Result<SequenceRow, DecodeError> {
         seqmin: r.i64()?,
         seqcache: r.i64()?,
         seqcycle: r.bool()?,
-    })
+    };
+    r.finish()?;
+    Ok(row)
 }
 
 // ---------------------------------------------------------------------------
@@ -1147,6 +1171,7 @@ pub fn decode_description_row(bytes: &[u8]) -> Result<(DescriptionRow, bool), De
         description: r.str()?,
     };
     let deleted = r.bool()?;
+    r.finish()?;
     Ok((row, deleted))
 }
 
@@ -1169,12 +1194,14 @@ pub fn encode_statistic_row(row: &StatisticRow) -> Vec<u8> {
 /// Decode a row produced by [`encode_statistic_row`].
 pub fn decode_statistic_row(bytes: &[u8]) -> Result<StatisticRow, DecodeError> {
     let mut r = Reader::new(bytes);
-    Ok(StatisticRow {
+    let row = StatisticRow {
         starelid: Oid::new(r.u32()?),
         staattnum: r.i16()?,
         stanullfrac: r.f32()?,
         stadistinct: r.f32()?,
-    })
+    };
+    r.finish()?;
+    Ok(row)
 }
 
 /// Encode a `pg_statistic_ext` row into the catalog's internal binary format.
@@ -1210,6 +1237,7 @@ pub fn decode_statistic_ext_row(bytes: &[u8]) -> Result<StatisticExtRow, DecodeE
         stxkeys.push(r.i16()?);
     }
     let stxkind = r.str()?.chars().collect();
+    r.finish()?;
     Ok(StatisticExtRow {
         oid,
         stxname,
@@ -1469,6 +1497,131 @@ mod tests {
                 "decode should fail at cut={cut}"
             );
         }
+    }
+
+    fn assert_trailing_rejected<T: std::fmt::Debug>(
+        mut bytes: Vec<u8>,
+        decode: impl FnOnce(&[u8]) -> Result<T, DecodeError>,
+    ) {
+        bytes.push(0xff);
+        let err = decode(&bytes).expect_err("trailing bytes must fail");
+        assert!(matches!(err, DecodeError::TrailingBytes { len: 1 }));
+    }
+
+    #[test]
+    fn catalog_row_decoders_reject_trailing_bytes() {
+        let class_row = sample_class_row(42);
+        assert_trailing_rejected(class_row.encode().expect("encode"), ClassRow::decode);
+
+        let attr_row = AttributeRow {
+            attrelid: Oid::new(42),
+            attname: "name".to_owned(),
+            atttypid: 25,
+            attnum: 1,
+            attnotnull: false,
+            atthasdef: false,
+            attisdropped: false,
+        };
+        assert_trailing_rejected(
+            encode_attribute_row(&attr_row, &DataType::Text { max_len: None }, true)
+                .expect("encode"),
+            decode_attribute_row,
+        );
+
+        let type_row = TypeRow {
+            oid: Oid::new(43),
+            typname: "custom_type".to_owned(),
+            typnamespace: Oid::new(99),
+            typtype: 'b',
+            typcategory: 'U',
+            typlen: -1,
+            typelem: 0,
+        };
+        assert_trailing_rejected(encode_type_row(&type_row).expect("encode"), decode_type_row);
+
+        let enum_row = EnumRow {
+            oid: Oid::new(44),
+            enumtypid: Oid::new(43),
+            enumsortorder: 1,
+            enumlabel: "pending".to_owned(),
+        };
+        assert_trailing_rejected(encode_enum_row(&enum_row).expect("encode"), decode_enum_row);
+
+        let index_row = IndexRow {
+            indexrelid: Oid::new(45),
+            indrelid: Oid::new(42),
+            indnatts: 1,
+            indisunique: true,
+            indisprimary: true,
+            indisvalid: true,
+            indkey: vec![1],
+            indmethod: "btree".to_owned(),
+            indopclasses: vec![None],
+            indoptions: Vec::new(),
+        };
+        assert_trailing_rejected(
+            encode_index_row(&index_row).expect("encode"),
+            decode_index_row,
+        );
+
+        let constraint_row = ConstraintRow {
+            oid: Oid::new(46),
+            conname: "pk_t".to_owned(),
+            conrelid: Oid::new(42),
+            contype: ConType::PrimaryKey,
+            condeferrable: false,
+            condeferred: false,
+            conkey: vec![1],
+            confrelid: Oid::new(0),
+            confkey: Vec::new(),
+        };
+        assert_trailing_rejected(
+            encode_constraint_row(&constraint_row).expect("encode"),
+            decode_constraint_row,
+        );
+
+        let sequence_row = SequenceRow {
+            seqrelid: Oid::new(47),
+            seqtypid: 20,
+            seqstart: 1,
+            seqincrement: 1,
+            seqmax: i64::MAX,
+            seqmin: 1,
+            seqcache: 1,
+            seqcycle: false,
+        };
+        assert_trailing_rejected(encode_sequence_row(&sequence_row), decode_sequence_row);
+
+        let description_row = DescriptionRow {
+            objoid: Oid::new(42),
+            classoid: Oid::new(1259),
+            objsubid: 0,
+            description: "table comment".to_owned(),
+        };
+        assert_trailing_rejected(
+            encode_description_row(&description_row, false).expect("encode"),
+            decode_description_row,
+        );
+
+        let statistic_row = StatisticRow {
+            starelid: Oid::new(42),
+            staattnum: 1,
+            stanullfrac: 0.0,
+            stadistinct: 1.0,
+        };
+        assert_trailing_rejected(encode_statistic_row(&statistic_row), decode_statistic_row);
+
+        let statistic_ext_row = StatisticExtRow {
+            oid: Oid::new(48),
+            stxname: "s_name".to_owned(),
+            stxrelid: Oid::new(42),
+            stxkeys: vec![1],
+            stxkind: vec!['d'],
+        };
+        assert_trailing_rejected(
+            encode_statistic_ext_row(&statistic_ext_row).expect("encode"),
+            decode_statistic_ext_row,
+        );
     }
 
     #[test]
