@@ -681,6 +681,49 @@ async fn copy_from_file_csv_quarantines_bad_rows_under_error_limit() {
 }
 
 #[tokio::test]
+async fn copy_reject_table_follows_search_path() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let csv_path = dir.path().join("schema_bad_rows.csv");
+    std::fs::write(&csv_path, "id,label\nbad,app\n1,ok\n").expect("write csv");
+
+    let running = start_sample_server("copy_reject_schema").await;
+    let client = &running.client;
+    client
+        .batch_execute(
+            "CREATE SCHEMA app; \
+             CREATE TABLE app.copy_quarantine (id INT, label TEXT); \
+             CREATE TABLE app.csv_rejects (
+                 filename TEXT,
+                 line_number BIGINT,
+                 raw_row TEXT,
+                 error TEXT
+             ); \
+             CREATE TABLE csv_rejects (
+                 filename TEXT,
+                 line_number BIGINT,
+                 raw_row TEXT,
+                 error TEXT
+             ); \
+             SET search_path TO app, public",
+        )
+        .await
+        .expect("create schema-scoped copy tables");
+
+    let copy_sql = format!(
+        "COPY copy_quarantine FROM {} WITH \
+         (FORMAT csv, HEADER true, IGNORE_ERRORS = true, MAX_ERRORS = 1000, REJECT_TABLE = 'csv_rejects')",
+        sql_string(csv_path.to_str().expect("utf8 path"))
+    );
+    client.batch_execute(&copy_sql).await.expect("copy file");
+
+    assert_eq!(select_count(client, "app.copy_quarantine").await, 1);
+    assert_eq!(select_count(client, "app.csv_rejects").await, 1);
+    assert_eq!(select_count(client, "public.csv_rejects").await, 0);
+
+    shutdown(running).await;
+}
+
+#[tokio::test]
 async fn copy_from_file_csv_stops_after_max_errors() {
     let dir = tempfile::tempdir().expect("tempdir");
     let csv_path = dir.path().join("too_many_bad_rows.csv");

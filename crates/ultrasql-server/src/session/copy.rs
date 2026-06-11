@@ -844,14 +844,7 @@ where
             return Ok(None);
         }
         let target = if let Some(table_name) = &opts.reject_table {
-            let catalog_snapshot = self.state.catalog_snapshot();
-            let entry = catalog_snapshot
-                .tables
-                .get(&table_name.to_ascii_lowercase())
-                .ok_or_else(|| {
-                    ServerError::CopyFormat(format!("COPY reject_table not found: {table_name}"))
-                })?
-                .clone();
+            let entry = self.copy_reject_table_entry(table_name)?;
             validate_copy_reject_table(&entry)?;
             Some(CopyRejectTarget {
                 codec: RowCodec::new(entry.schema.clone()),
@@ -867,6 +860,30 @@ where
             bad_rows: 0,
             target,
         }))
+    }
+
+    fn copy_reject_table_entry(&self, table_name: &str) -> Result<TableEntry, ServerError> {
+        let catalog_snapshot = self.state.catalog_snapshot();
+        let folded = table_name.to_ascii_lowercase();
+        if let Some((namespace, relation_name)) = crate::type_name_namespace_and_name(&folded) {
+            let key = table_lookup_key(namespace, relation_name);
+            return catalog_snapshot.tables.get(&key).cloned().ok_or_else(|| {
+                ServerError::CopyFormat(format!("COPY reject_table not found: {table_name}"))
+            });
+        }
+
+        for namespace in crate::search_path_schema_names(
+            self.session_settings.get("search_path").map(String::as_str),
+        ) {
+            let key = table_lookup_key(&namespace, &folded);
+            if let Some(entry) = catalog_snapshot.tables.get(&key) {
+                return Ok(entry.clone());
+            }
+        }
+
+        Err(ServerError::CopyFormat(format!(
+            "COPY reject_table not found: {table_name}"
+        )))
     }
 
     fn record_copy_reject(
