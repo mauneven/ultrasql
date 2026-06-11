@@ -103,6 +103,14 @@ fn require_exact_len(bytes: &[u8], expected: usize) -> Result<(), PayloadError> 
     }
 }
 
+fn checked_len_sum(parts: &[usize], context: &'static str) -> Result<usize, PayloadError> {
+    parts.iter().try_fold(0_usize, |total, part| {
+        total
+            .checked_add(*part)
+            .ok_or(PayloadError::Malformed(context))
+    })
+}
+
 // ---------------------------------------------------------------------------
 // TupleId helpers (private)
 // ---------------------------------------------------------------------------
@@ -231,7 +239,11 @@ impl HeapInsertPayload {
     pub fn encode(&self) -> Result<Vec<u8>, PayloadError> {
         let tuple_len = u32::try_from(self.tuple_bytes.len())
             .map_err(|_| PayloadError::Malformed("heap_insert tuple_len overflow"))?;
-        let mut out = vec![0_u8; TID_SIZE + 4 + self.tuple_bytes.len()];
+        let total = checked_len_sum(
+            &[TID_SIZE, 4, self.tuple_bytes.len()],
+            "heap_insert length overflow",
+        )?;
+        let mut out = vec![0_u8; total];
         let mut tid_buf = [0_u8; TID_SIZE];
         encode_tid(&mut tid_buf, self.tid)?;
         out[..TID_SIZE].copy_from_slice(&tid_buf);
@@ -265,7 +277,7 @@ impl HeapInsertPayload {
                 "heap_insert tuple_len exceeds ceiling",
             ));
         }
-        let needed = FIXED + tuple_len;
+        let needed = checked_len_sum(&[FIXED, tuple_len], "heap_insert length overflow")?;
         if bytes.len() < needed {
             return Err(PayloadError::Truncated {
                 needed,
@@ -333,7 +345,11 @@ impl HeapUpdatePayload {
         const FIXED: usize = TID_SIZE + TID_SIZE + 1 + 3 + 4; // 32
         let new_len = u32::try_from(self.new_tuple_bytes.len())
             .map_err(|_| PayloadError::Malformed("heap_update new_len overflow"))?;
-        let mut out = vec![0_u8; FIXED + self.new_tuple_bytes.len()];
+        let total = checked_len_sum(
+            &[FIXED, self.new_tuple_bytes.len()],
+            "heap_update length overflow",
+        )?;
+        let mut out = vec![0_u8; total];
         let mut buf = [0_u8; TID_SIZE];
         encode_tid(&mut buf, self.old_tid)?;
         out[..TID_SIZE].copy_from_slice(&buf);
@@ -381,7 +397,7 @@ impl HeapUpdatePayload {
                 "heap_update new_len exceeds ceiling",
             ));
         }
-        let needed = FIXED + new_len;
+        let needed = checked_len_sum(&[FIXED, new_len], "heap_update length overflow")?;
         if bytes.len() < needed {
             return Err(PayloadError::Truncated {
                 needed,
@@ -449,7 +465,14 @@ impl HeapUpdateInPlacePayload {
             .map_err(|_| PayloadError::Malformed("heap_update_in_place pre_len overflow"))?;
         let post_len = u32::try_from(self.post_image_bytes.len())
             .map_err(|_| PayloadError::Malformed("heap_update_in_place post_len overflow"))?;
-        let total = FIXED + self.pre_image_bytes.len() + self.post_image_bytes.len();
+        let total = checked_len_sum(
+            &[
+                FIXED,
+                self.pre_image_bytes.len(),
+                self.post_image_bytes.len(),
+            ],
+            "heap_update_in_place length overflow",
+        )?;
         let mut out = vec![0_u8; total];
         let mut tid_buf = [0_u8; TID_SIZE];
         encode_tid(&mut tid_buf, self.tid)?;
@@ -459,7 +482,10 @@ impl HeapUpdateInPlacePayload {
         write_u32_le(&mut out[TID_SIZE + 12..TID_SIZE + 16], pre_len);
         write_u32_le(&mut out[TID_SIZE + 16..TID_SIZE + 20], post_len);
         let pre_off = FIXED;
-        let post_off = FIXED + self.pre_image_bytes.len();
+        let post_off = checked_len_sum(
+            &[FIXED, self.pre_image_bytes.len()],
+            "heap_update_in_place length overflow",
+        )?;
         out[pre_off..post_off].copy_from_slice(&self.pre_image_bytes);
         out[post_off..total].copy_from_slice(&self.post_image_bytes);
         Ok(out)
@@ -498,7 +524,10 @@ impl HeapUpdateInPlacePayload {
                 "heap_update_in_place image length exceeds ceiling",
             ));
         }
-        let needed = FIXED + pre_len + post_len;
+        let needed = checked_len_sum(
+            &[FIXED, pre_len, post_len],
+            "heap_update_in_place length overflow",
+        )?;
         if bytes.len() < needed {
             return Err(PayloadError::Truncated {
                 needed,
@@ -507,7 +536,7 @@ impl HeapUpdateInPlacePayload {
         }
         require_exact_len(bytes, needed)?;
         let pre_off = FIXED;
-        let post_off = FIXED + pre_len;
+        let post_off = checked_len_sum(&[FIXED, pre_len], "heap_update_in_place length overflow")?;
         Ok(Self {
             tid,
             writer_xid,
