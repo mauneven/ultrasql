@@ -859,23 +859,42 @@ fn contains_wildcard(s: &str) -> bool {
 fn wildcard_match(pattern: &str, text: &str) -> bool {
     let pattern = pattern.chars().collect::<Vec<_>>();
     let text = text.chars().collect::<Vec<_>>();
-    let mut dp = vec![vec![false; text.len() + 1]; pattern.len() + 1];
-    dp[0][0] = true;
-    for (i, ch) in pattern.iter().enumerate() {
-        if *ch == '*' {
-            dp[i + 1][0] = dp[i][0];
+
+    let mut pattern_idx = 0;
+    let mut text_idx = 0;
+    let mut last_star = None;
+    let mut star_text_idx = 0;
+
+    while let Some(&text_ch) = text.get(text_idx) {
+        match pattern.get(pattern_idx).copied() {
+            Some('?') => {
+                pattern_idx += 1;
+                text_idx += 1;
+            }
+            Some('*') => {
+                last_star = Some(pattern_idx);
+                pattern_idx += 1;
+                star_text_idx = text_idx;
+            }
+            Some(pattern_ch) if pattern_ch == text_ch => {
+                pattern_idx += 1;
+                text_idx += 1;
+            }
+            _ => {
+                let Some(star_idx) = last_star else {
+                    return false;
+                };
+                pattern_idx = star_idx + 1;
+                star_text_idx += 1;
+                text_idx = star_text_idx;
+            }
         }
     }
-    for (i, pattern_ch) in pattern.iter().enumerate() {
-        for (j, text_ch) in text.iter().enumerate() {
-            dp[i + 1][j + 1] = match pattern_ch {
-                '*' => dp[i][j + 1] || dp[i + 1][j],
-                '?' => dp[i][j],
-                ch => dp[i][j] && ch == text_ch,
-            };
-        }
+
+    while matches!(pattern.get(pattern_idx), Some('*')) {
+        pattern_idx += 1;
     }
-    dp[pattern.len()][text.len()]
+    pattern_idx == pattern.len()
 }
 
 #[cfg(test)]
@@ -980,6 +999,7 @@ mod tests {
         assert!(super::wildcard_match("*.csv", "a.csv"));
         assert!(super::wildcard_match("part-?.csv", "part-a.csv"));
         assert!(!super::wildcard_match("part-?.csv", "part-ab.csv"));
+        assert!(super::wildcard_match("a*b?d.csv", "a-very-bad.csv"));
     }
 
     #[cfg(unix)]
