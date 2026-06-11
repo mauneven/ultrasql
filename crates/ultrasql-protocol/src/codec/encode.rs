@@ -308,10 +308,8 @@ where
     let payload_start = buf.len();
     write_payload(buf);
     let payload_end = buf.len();
-    let payload_len = payload_end - payload_start;
-    // `length` on the wire includes the 4 length bytes themselves.
-    let length = i32_from_usize(payload_len + 4);
-    buf[length_index..length_index + 4].copy_from_slice(&length.to_be_bytes());
+    let length = frame_length_i32(payload_start, payload_end);
+    backfill_i32(buf, length_index, length);
 }
 
 fn encode_startup(
@@ -331,9 +329,25 @@ fn encode_startup(
     }
     buf.put_u8(0); // empty key terminates the parameter list
     let payload_end = buf.len();
-    // Total message length includes the 4 length bytes.
-    let total = i32_from_usize(payload_end - payload_start + 4);
-    buf[length_index..length_index + 4].copy_from_slice(&total.to_be_bytes());
+    let total = frame_length_i32(payload_start, payload_end);
+    backfill_i32(buf, length_index, total);
+}
+
+fn frame_length_i32(payload_start: usize, payload_end: usize) -> i32 {
+    payload_end
+        .checked_sub(payload_start)
+        .and_then(|payload_len| payload_len.checked_add(4))
+        .map_or(i32::MAX, i32_from_usize)
+}
+
+fn backfill_i32(buf: &mut BytesMut, index: usize, value: i32) {
+    let Some(end) = index.checked_add(4) else {
+        return;
+    };
+    let Some(slot) = buf.get_mut(index..end) else {
+        return;
+    };
+    slot.copy_from_slice(&value.to_be_bytes());
 }
 
 fn encode_cancel_request(process_id: i32, secret_key: i32, buf: &mut BytesMut) {

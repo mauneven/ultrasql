@@ -179,7 +179,11 @@ impl<'a> PayloadReader<'a> {
     }
 
     pub(super) fn advance(&mut self, n: usize) {
-        self.bytes = &self.bytes[n..];
+        if let Some(rest) = self.bytes.get(n..) {
+            self.bytes = rest;
+        } else {
+            self.bytes = &[];
+        }
     }
 
     pub(super) fn peek_u8(&self) -> Result<u8, ProtocolError> {
@@ -243,7 +247,10 @@ impl<'a> PayloadReader<'a> {
             .position(|&b| b == 0)
             .ok_or(ProtocolError::Truncated)?;
         let s = std::str::from_utf8(&self.bytes[..nul])?.to_owned();
-        self.advance(nul + 1);
+        let advance_by = nul
+            .checked_add(1)
+            .ok_or(ProtocolError::Malformed("cstring length overflow"))?;
+        self.advance(advance_by);
         Ok(s)
     }
 
