@@ -66,6 +66,67 @@ const fn page_size_u64() -> u64 {
     PAGE_SIZE_U64
 }
 
+fn page_aligned_len_to_pages(len: u64) -> Result<u32, SegmentError> {
+    let page_size = page_size_u64();
+    if len
+        .checked_rem(page_size)
+        .ok_or(SegmentError::Layout("PAGE_SIZE must be non-zero"))?
+        != 0
+    {
+        return Err(SegmentError::Layout(
+            "segment file length is not a multiple of PAGE_SIZE",
+        ));
+    }
+    let pages_u64 = len
+        .checked_div(page_size)
+        .ok_or(SegmentError::Layout("PAGE_SIZE must be non-zero"))?;
+    u32::try_from(pages_u64)
+        .map_err(|_| SegmentError::Layout("segment file holds more pages than u32"))
+}
+
+fn page_byte_offset(page_index: u32) -> Result<u64, SegmentError> {
+    u64::from(page_index)
+        .checked_mul(page_size_u64())
+        .ok_or(SegmentError::Layout("page byte offset overflow"))
+}
+
+fn segment_for_block(
+    block: BlockNumber,
+    segment_cap: u32,
+) -> Result<(SegmentId, u32), SegmentError> {
+    if segment_cap == 0 {
+        return Err(SegmentError::Layout("segment_size_pages must be non-zero"));
+    }
+    let raw = block.raw();
+    let seg = raw
+        .checked_div(segment_cap)
+        .ok_or(SegmentError::Layout("segment_size_pages must be non-zero"))?;
+    let within = raw
+        .checked_rem(segment_cap)
+        .ok_or(SegmentError::Layout("segment_size_pages must be non-zero"))?;
+    Ok((SegmentId::new(seg), within))
+}
+
+fn truncation_shape(n_blocks: u32, segment_cap: u32) -> Result<(usize, u32), SegmentError> {
+    if n_blocks == 0 {
+        return Ok((0, 0));
+    }
+    let last_block = n_blocks
+        .checked_sub(1)
+        .ok_or(SegmentError::Layout("truncate block underflow"))?;
+    let (last_seg_id_after, within) = segment_for_block(BlockNumber::new(last_block), segment_cap)?;
+    let segs_after_u32 = last_seg_id_after
+        .raw()
+        .checked_add(1)
+        .ok_or(SegmentError::Layout("segment count overflowed u32"))?;
+    let segs_after_count = usize::try_from(segs_after_u32)
+        .map_err(|_| SegmentError::Layout("segment count overflowed usize"))?;
+    let within_after = within
+        .checked_add(1)
+        .ok_or(SegmentError::Layout("segment page count overflow"))?;
+    Ok((segs_after_count, within_after))
+}
+
 /// Default number of pages per segment file (1 GiB at 8 KiB pages).
 pub const DEFAULT_SEGMENT_SIZE_PAGES: u32 = 131_072;
 
@@ -173,15 +234,7 @@ impl SegmentFile {
         let file = opts.open(&path)?;
         let meta = file.metadata()?;
         let len = meta.len();
-        let page_size = page_size_u64();
-        if len % page_size != 0 {
-            return Err(SegmentError::Layout(
-                "segment file length is not a multiple of PAGE_SIZE",
-            ));
-        }
-        let pages_u64 = len / page_size;
-        let pages = u32::try_from(pages_u64)
-            .map_err(|_| SegmentError::Layout("segment file holds more pages than u32"))?;
+        let pages = page_aligned_len_to_pages(len)?;
         if pages > cap {
             return Err(SegmentError::Layout("segment file exceeds configured cap"));
         }
@@ -203,7 +256,7 @@ impl SegmentFile {
         if new_pages > self.cap {
             return Err(SegmentError::Layout("grow past segment cap"));
         }
-        let new_len = u64::from(new_pages) * page_size_u64();
+        let new_len = page_byte_offset(new_pages)?;
         self.file.set_len(new_len)?;
         self.pages = new_pages;
         Ok(())
@@ -214,7 +267,7 @@ impl SegmentFile {
         if new_pages >= self.pages {
             return Ok(());
         }
-        let new_len = u64::from(new_pages) * page_size_u64();
+        let new_len = page_byte_offset(new_pages)?;
         self.file.set_len(new_len)?;
         self.pages = new_pages;
         Ok(())
@@ -228,7 +281,7 @@ impl SegmentFile {
         dst: &mut [u8; PAGE_SIZE],
     ) -> Result<(), SegmentError> {
         debug_assert!(block_in_segment < self.pages);
-        let offset = u64::from(block_in_segment) * page_size_u64();
+        let offset = page_byte_offset(block_in_segment)?;
         pread_exact(&self.file, dst, offset)?;
         Ok(())
     }
@@ -240,7 +293,7 @@ impl SegmentFile {
         src: &[u8; PAGE_SIZE],
     ) -> Result<(), SegmentError> {
         debug_assert!(block_in_segment < self.pages);
-        let offset = u64::from(block_in_segment) * page_size_u64();
+        let offset = page_byte_offset(block_in_segment)?;
         pwrite_all(&self.file, src, offset)?;
         Ok(())
     }
@@ -380,15 +433,17 @@ impl RelationFiles {
         let mut total_blocks: u64 = 0;
         for (_idx, path) in entries {
             let seg = SegmentFile::open(path, segment_cap, false)?;
-            total_blocks += u64::from(seg.pages);
+            total_blocks = total_blocks
+                .checked_add(u64::from(seg.pages))
+                .ok_or(SegmentError::Layout("relation block count overflow"))?;
             segments.push(Arc::new(RwLock::new(seg)));
         }
 
         // Enforce: every non-last segment is full to capacity. This
         // detects an interrupted truncate or an external tool that
         // edited the directory.
-        if segments.len() >= 2 {
-            for (i, seg_arc) in segments.iter().enumerate().take(segments.len() - 1) {
+        if let Some((_, non_last_segments)) = segments.split_last() {
+            for (i, seg_arc) in non_last_segments.iter().enumerate() {
                 let seg = seg_arc.read();
                 if seg.pages != segment_cap {
                     debug!(
@@ -423,11 +478,8 @@ impl RelationFiles {
         self.n_blocks.load(Ordering::Acquire)
     }
 
-    const fn segment_for(&self, block: BlockNumber) -> (SegmentId, u32) {
-        let raw = block.raw();
-        let seg = raw / self.segment_cap;
-        let within = raw % self.segment_cap;
-        (SegmentId::new(seg), within)
+    fn segment_for(&self, block: BlockNumber) -> Result<(SegmentId, u32), SegmentError> {
+        segment_for_block(block, self.segment_cap)
     }
 
     fn read_page(&self, block: BlockNumber) -> Result<Page, SegmentError> {
@@ -439,7 +491,7 @@ impl RelationFiles {
                 size,
             });
         }
-        let (seg_id, within) = self.segment_for(block);
+        let (seg_id, within) = self.segment_for(block)?;
         let seg_arc = {
             let guard = self.segments.read();
             let idx = usize::try_from(seg_id.raw())
@@ -478,7 +530,7 @@ impl RelationFiles {
                 size,
             });
         }
-        let (seg_id, within) = self.segment_for(block);
+        let (seg_id, within) = self.segment_for(block)?;
         page.refresh_checksum();
         let seg_arc = {
             let guard = self.segments.read();
@@ -512,7 +564,7 @@ impl RelationFiles {
             .checked_add(1)
             .ok_or(SegmentError::Layout("block count overflow"))?;
 
-        let (seg_id, within) = self.segment_for(BlockNumber::new(new_block));
+        let (seg_id, within) = self.segment_for(BlockNumber::new(new_block))?;
 
         // Three cases on `seg_idx` versus the current segment count:
         //   - Equal: a new segment is needed.
@@ -538,7 +590,10 @@ impl RelationFiles {
                 let mut seg = seg_arc.write();
                 // The next page index inside the segment is `within`;
                 // total page count becomes `within + 1`.
-                seg.grow_to(within + 1)?;
+                let new_pages = within
+                    .checked_add(1)
+                    .ok_or(SegmentError::Layout("segment page count overflow"))?;
+                seg.grow_to(new_pages)?;
             }
             std::cmp::Ordering::Greater => {
                 return Err(SegmentError::Layout(
@@ -579,20 +634,7 @@ impl RelationFiles {
             return Ok(());
         }
         // Compute target segments and within-segment counts.
-        let (last_seg_id_after, within_after) = if n_blocks == 0 {
-            (0_u32, 0_u32)
-        } else {
-            let last_block = n_blocks - 1;
-            let seg = last_block / self.segment_cap;
-            let within = last_block % self.segment_cap;
-            (seg, within + 1)
-        };
-        let segs_after_count = if n_blocks == 0 {
-            0_usize
-        } else {
-            usize::try_from(last_seg_id_after + 1)
-                .map_err(|_| SegmentError::Layout("segment count overflowed usize"))?
-        };
+        let (segs_after_count, within_after) = truncation_shape(n_blocks, self.segment_cap)?;
 
         // Drop the surplus segments. We need to actually unlink the
         // files so disk space comes back and subsequent re-open sees a
@@ -626,9 +668,12 @@ impl RelationFiles {
         // Truncate the new-last segment to `within_after` pages, if
         // it exists.
         if segs_after_count > 0 {
+            let last_idx = segs_after_count
+                .checked_sub(1)
+                .ok_or(SegmentError::Layout("segment index underflow"))?;
             let seg_arc = {
                 let guard = self.segments.read();
-                guard[segs_after_count - 1].clone()
+                guard[last_idx].clone()
             };
             let mut seg = seg_arc.write();
             seg.truncate_to(within_after)?;
@@ -983,6 +1028,41 @@ mod tests {
             prev = Some(blk.raw());
         }
         assert_eq!(mgr.relation_size_blocks(r).unwrap(), 10);
+    }
+
+    #[test]
+    fn segment_layout_helpers_reject_zero_cap() {
+        let err = segment_for_block(BlockNumber::new(7), 0).unwrap_err();
+
+        assert!(matches!(
+            err,
+            SegmentError::Layout("segment_size_pages must be non-zero")
+        ));
+    }
+
+    #[test]
+    fn segment_layout_helpers_compute_boundary_shapes() {
+        let (seg, within) = segment_for_block(BlockNumber::new(7), 4).unwrap();
+        assert_eq!(seg, SegmentId::new(1));
+        assert_eq!(within, 3);
+
+        assert_eq!(truncation_shape(0, 4).unwrap(), (0, 0));
+        assert_eq!(truncation_shape(1, 4).unwrap(), (1, 1));
+        assert_eq!(truncation_shape(4, 4).unwrap(), (1, 4));
+        assert_eq!(truncation_shape(5, 4).unwrap(), (2, 1));
+    }
+
+    #[test]
+    fn segment_page_byte_helpers_preserve_page_alignment() {
+        assert_eq!(page_aligned_len_to_pages(0).unwrap(), 0);
+        assert_eq!(page_aligned_len_to_pages(page_size_u64()).unwrap(), 1);
+        assert_eq!(page_byte_offset(3).unwrap(), page_size_u64() * 3);
+
+        let err = page_aligned_len_to_pages(page_size_u64() + 1).unwrap_err();
+        assert!(matches!(
+            err,
+            SegmentError::Layout("segment file length is not a multiple of PAGE_SIZE")
+        ));
     }
 
     #[test]
