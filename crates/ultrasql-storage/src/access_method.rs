@@ -30,7 +30,7 @@
 #![allow(clippy::option_if_let_else)]
 #![allow(clippy::type_complexity)]
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use num_traits::ToPrimitive;
 use parking_lot::Mutex;
@@ -3068,8 +3068,12 @@ impl IvfFlatIndex {
 
     /// Train centroids and bulk-load vectors into inverted lists.
     pub fn bulk_load(&self, rows: Vec<(Vec<f32>, TupleId)>) -> Result<(), AccessMethodError> {
-        for (vector, _) in &rows {
+        let mut seen_tids = BTreeSet::new();
+        for (vector, tid) in &rows {
             self.validate_vector(vector)?;
+            if !seen_tids.insert(*tid) {
+                return Err(AccessMethodError::DuplicateKey);
+            }
         }
         let mut storage = self.storage.lock();
         storage.entries.clear();
@@ -3634,8 +3638,12 @@ impl PageBackedIvfFlatIndex {
         xid: Xid,
         wal: Option<&dyn WalSink>,
     ) -> Result<(), AccessMethodError> {
-        for (vector, _) in &rows {
+        let mut seen_tids = BTreeSet::new();
+        for (vector, tid) in &rows {
             self.validate_vector(vector)?;
+            if !seen_tids.insert(*tid) {
+                return Err(AccessMethodError::DuplicateKey);
+            }
         }
         {
             let mut storage = self.storage.lock();
@@ -5151,6 +5159,47 @@ mod tests {
         assert_eq!(am.compact_deleted().expect("compact ivfflat"), 1);
         assert_eq!(am.tombstone_count(), 0);
         assert_eq!(am.live_len(), 2);
+    }
+
+    #[test]
+    fn ivfflat_rejects_duplicate_bulk_load_tids() {
+        let am = IvfFlatIndex::new(2, HnswMetric::L2, 2, 1).expect("ivfflat config");
+
+        let err = am
+            .bulk_load(vec![
+                (vec![0.0, 0.0], tid(1, 0)),
+                (vec![1.0, 0.0], tid(1, 0)),
+            ])
+            .expect_err("duplicate tuple IDs should be rejected");
+
+        assert!(matches!(err, AccessMethodError::DuplicateKey));
+        assert!(!am.is_available());
+        assert_eq!(am.live_len(), 0);
+    }
+
+    #[test]
+    fn page_backed_ivfflat_rejects_duplicate_bulk_load_tids_atomically() {
+        let index_rel = RelationId::new(9899);
+        let index = PageBackedIvfFlatIndex::new(index_rel, 2, HnswMetric::L2, 2, 1)
+            .expect("ivfflat config");
+
+        index
+            .bulk_load_logged(vec![(vec![0.0, 0.0], tid(1, 0))], Xid::new(29), None)
+            .expect("initial bulk load");
+
+        let err = index
+            .bulk_load_logged(
+                vec![(vec![10.0, 0.0], tid(2, 0)), (vec![11.0, 0.0], tid(2, 0))],
+                Xid::new(30),
+                None,
+            )
+            .expect_err("duplicate tuple IDs should be rejected before mutation");
+
+        assert!(matches!(err, AccessMethodError::DuplicateKey));
+        assert_eq!(index.page_stats().live_entries, 1);
+        let hits = index.search(&[0.0, 0.0], 1).expect("search old index");
+        let tids: Vec<TupleId> = hits.into_iter().map(|hit| hit.tid).collect();
+        assert_eq!(tids, vec![tid(1, 0)]);
     }
 
     #[test]
