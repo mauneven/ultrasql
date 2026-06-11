@@ -1,5 +1,5 @@
 {
-  "iters": 16,
+  "iters": 32,
   "methodology": "UltraSQL external release artifact over TCP; competitors installed local clients including ClickHouse when available; bulk INSERT uses a fresh UltraSQL server per measured sample and 10k-row INSERT chunks across engines.",
   "mode": "full",
   "rows": [
@@ -10,5 +10,5 @@
   "schema_version": 1,
   "ultrasql_install_source": "ULTRASQLD_BIN",
   "ultrasql_version": "ultrasqld 0.0.9",
-  "warmup": 2
+  "warmup": 8
 }

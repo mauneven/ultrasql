@@ -16,6 +16,7 @@
 #   SCALE_SWEEP_ROWS           row counts (default "10000 100000 1000000")
 #   SCALE_SWEEP_OUT            artifact dir (default benchmarks/results/latest/scale-sweep)
 #   N_ITERS                    measured samples override
+#   WARMUP                     warmup samples override
 #
 # Bulk INSERT uses fresh UltraSQL server processes per measured sample so
 # every engine times a fresh table load. INSERT chunks are 10k rows across
@@ -28,8 +29,8 @@ cd "$REPO_ROOT"
 
 mode="${1:-full}"
 case "$mode" in
-    full)  ITERS="${N_ITERS:-16}"; WARMUP=2 ;;
-    quick) ITERS="${N_ITERS:-4}";  WARMUP=1 ;;
+    full)  ITERS="${N_ITERS:-32}"; WARMUP="${WARMUP:-8}" ;;
+    quick) ITERS="${N_ITERS:-8}";  WARMUP="${WARMUP:-2}" ;;
     *) echo "unknown mode '$mode' (full|quick)" >&2; exit 2 ;;
 esac
 

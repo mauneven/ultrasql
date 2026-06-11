@@ -163,14 +163,17 @@ over TCP and runs the same SQL-surface workloads as installed DuckDB, SQLite,
 PostgreSQL, and ClickHouse clients. ClickHouse is driven through
 `benchmarks/scripts/run_clickhouse_writes.sh`, which uses the native TCP client
 when `clickhouse_driver` and a local ClickHouse binary/server are available.
-Failures are recorded as `status=not_available`; they are not ranked and are
-not claims. Bulk INSERT uses a fresh UltraSQL server per measured sample,
-matching the fresh in-memory table setup used by the embedded measured-engine
-runners, and all engines use 10k-row INSERT chunks. The mixed correctness row
-also emits `answer_sha256`; the renderer refuses to rank that workload unless
-every measured engine returns the same answer hash. After rendering, the sweep
-runs `benchmarks/scripts/check_supremacy.py` on the raw artifact directory and
-exits non-zero if UltraSQL is not fastest for every comparable measured row.
+The `full` mode defaults to 32 measured samples after 8 warmup samples; `quick`
+defaults to 8 measured samples after 2 warmup samples. `N_ITERS` and `WARMUP`
+override those counts for controlled reruns. Failures are recorded as
+`status=not_available`; they are not ranked and are not claims. Bulk INSERT uses
+a fresh UltraSQL server per measured sample, matching the fresh in-memory table
+setup used by the embedded measured-engine runners, and all engines use 10k-row
+INSERT chunks. The mixed correctness row also emits `answer_sha256`; the
+renderer refuses to rank that workload unless every measured engine returns the
+same answer hash. After rendering, the sweep runs
+`benchmarks/scripts/check_supremacy.py` on the raw artifact directory and exits
+non-zero if UltraSQL is not fastest for every comparable measured row.
 Unavailable engines remain documented as unavailable and are not counted as
 claims. Artifacts live under:
 
