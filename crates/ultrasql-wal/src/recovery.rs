@@ -212,7 +212,7 @@ pub fn recover_with_target(
                         RecoveryError::Applier(s) => RecoveryError::Applier(s),
                         other => RecoveryError::Applier(other.to_string()),
                     })?;
-                    offset += used;
+                    offset = checked_segment_offset(offset, used)?;
                     stream_pos = record_end;
                     last_good_pos = stream_pos;
                     record_count = checked_record_count(record_count)?;
@@ -270,6 +270,14 @@ fn checked_record_count(record_count: u64) -> Result<u64, RecoveryError> {
         .checked_add(1)
         .ok_or(RecoveryError::Record(WalRecordError::Malformed(
             "recovery record count overflow",
+        )))
+}
+
+fn checked_segment_offset(offset: usize, used: usize) -> Result<usize, RecoveryError> {
+    offset
+        .checked_add(used)
+        .ok_or(RecoveryError::Record(WalRecordError::Malformed(
+            "recovery segment offset overflow",
         )))
 }
 

@@ -378,7 +378,8 @@ fn decode_header_from(bytes: &[u8]) -> Result<WalRecordHeader, WalRecordError> {
 }
 
 fn compute_record_crc(header: &WalRecordHeader, payload: &[u8]) -> u32 {
-    let mut buf = vec![0_u8; RECORD_HEADER_SIZE + payload.len()];
+    let total = trusted_total_length_to_usize(header.total_length);
+    let mut buf = vec![0_u8; total];
     let header_zeroed_crc = WalRecordHeader { crc: 0, ..*header };
     encode_header_into(&header_zeroed_crc, &mut buf);
     buf[RECORD_HEADER_SIZE..].copy_from_slice(payload);

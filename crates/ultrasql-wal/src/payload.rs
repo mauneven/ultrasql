@@ -117,6 +117,54 @@ fn checked_offset(start: usize, len: usize, context: &'static str) -> Result<usi
         .ok_or(PayloadError::Malformed(context))
 }
 
+fn write_i64_advance(
+    out: &mut [u8],
+    offset: &mut usize,
+    value: i64,
+    context: &'static str,
+) -> Result<(), PayloadError> {
+    let end = checked_offset(*offset, 8, context)?;
+    write_i64_le(&mut out[*offset..end], value);
+    *offset = end;
+    Ok(())
+}
+
+fn write_u32_advance(
+    out: &mut [u8],
+    offset: &mut usize,
+    value: u32,
+    context: &'static str,
+) -> Result<(), PayloadError> {
+    let end = checked_offset(*offset, 4, context)?;
+    write_u32_le(&mut out[*offset..end], value);
+    *offset = end;
+    Ok(())
+}
+
+fn read_i64_advance(
+    bytes: &[u8],
+    offset: &mut usize,
+    field: &'static str,
+    context: &'static str,
+) -> Result<i64, PayloadError> {
+    let end = checked_offset(*offset, 8, context)?;
+    let value = read_i64_le(&bytes[*offset..end]).map_err(|_| PayloadError::Malformed(field))?;
+    *offset = end;
+    Ok(value)
+}
+
+fn read_u32_advance(
+    bytes: &[u8],
+    offset: &mut usize,
+    field: &'static str,
+    context: &'static str,
+) -> Result<u32, PayloadError> {
+    let end = checked_offset(*offset, 4, context)?;
+    let value = read_u32_le(&bytes[*offset..end]).map_err(|_| PayloadError::Malformed(field))?;
+    *offset = end;
+    Ok(value)
+}
+
 // ---------------------------------------------------------------------------
 // TupleId helpers (private)
 // ---------------------------------------------------------------------------
@@ -1153,7 +1201,7 @@ impl FullPageWritePayload {
                 "fpw page_bytes_len must equal PAGE_SIZE",
             ));
         }
-        let needed = FIXED + page_bytes_len;
+        let needed = checked_offset(FIXED, page_bytes_len, "fpw length overflow")?;
         if bytes.len() < needed {
             return Err(PayloadError::Truncated {
                 needed,
@@ -1275,7 +1323,14 @@ impl BTreeOpPayload {
         }
         // Fixed section: 1 (op) + 3 (reserved) + 4 (index_rel) + 8 (page) + 4 (key_len) = 20
         // Then key_bytes, then 4 (cv_len), then cv_bytes.
-        let total = 20 + self.key_bytes.len() + 4 + self.child_or_value.len();
+        const FIXED: usize = 20;
+        let key_end = checked_offset(FIXED, self.key_bytes.len(), "btree_op length overflow")?;
+        let cv_len_end = checked_offset(key_end, 4, "btree_op length overflow")?;
+        let total = checked_offset(
+            cv_len_end,
+            self.child_or_value.len(),
+            "btree_op length overflow",
+        )?;
         let mut out = vec![0_u8; total];
         out[0] = u8::from(self.op);
         // bytes 1-3: reserved zero (already zeroed)
@@ -1284,10 +1339,9 @@ impl BTreeOpPayload {
         encode_page_id(&mut pid_buf, self.page);
         out[8..16].copy_from_slice(&pid_buf);
         write_u32_le(&mut out[16..20], key_len);
-        out[20..20 + self.key_bytes.len()].copy_from_slice(&self.key_bytes);
-        let cv_off = 20 + self.key_bytes.len();
-        write_u32_le(&mut out[cv_off..cv_off + 4], cv_len);
-        out[cv_off + 4..].copy_from_slice(&self.child_or_value);
+        out[FIXED..key_end].copy_from_slice(&self.key_bytes);
+        write_u32_le(&mut out[key_end..cv_len_end], cv_len);
+        out[cv_len_end..].copy_from_slice(&self.child_or_value);
         Ok(out)
     }
 
@@ -1321,23 +1375,24 @@ impl BTreeOpPayload {
         if key_len > MAX_VARIABLE_PAYLOAD_BYTES {
             return Err(PayloadError::Malformed("btree_op key_len exceeds ceiling"));
         }
-        let key_end = FIXED + key_len;
-        if bytes.len() < key_end + 4 {
+        let key_end = checked_offset(FIXED, key_len, "btree_op length overflow")?;
+        let cv_len_end = checked_offset(key_end, 4, "btree_op length overflow")?;
+        if bytes.len() < cv_len_end {
             return Err(PayloadError::Truncated {
-                needed: key_end + 4,
+                needed: cv_len_end,
                 have: bytes.len(),
             });
         }
         let key_bytes = bytes[FIXED..key_end].to_vec();
         let cv_len = usize::try_from(
-            read_u32_le(&bytes[key_end..key_end + 4])
+            read_u32_le(&bytes[key_end..cv_len_end])
                 .map_err(|_| PayloadError::Malformed("btree_op cv_len"))?,
         )
         .map_err(|_| PayloadError::Malformed("btree_op cv_len usize overflow"))?;
         if cv_len > MAX_VARIABLE_PAYLOAD_BYTES {
             return Err(PayloadError::Malformed("btree_op cv_len exceeds ceiling"));
         }
-        let cv_end = key_end + 4 + cv_len;
+        let cv_end = checked_offset(cv_len_end, cv_len, "btree_op length overflow")?;
         if bytes.len() < cv_end {
             return Err(PayloadError::Truncated {
                 needed: cv_end,
@@ -1345,7 +1400,7 @@ impl BTreeOpPayload {
             });
         }
         require_exact_len(bytes, cv_end)?;
-        let child_or_value = bytes[key_end + 4..cv_end].to_vec();
+        let child_or_value = bytes[cv_len_end..cv_end].to_vec();
         Ok(Self {
             op,
             index_rel,
@@ -1449,7 +1504,14 @@ impl HashOpPayload {
         if self.value_bytes.len() > MAX_VARIABLE_PAYLOAD_BYTES {
             return Err(PayloadError::Malformed("hash_op value_len exceeds ceiling"));
         }
-        let total = 32 + self.key_bytes.len() + 4 + self.value_bytes.len();
+        const FIXED: usize = 32;
+        let key_end = checked_offset(FIXED, self.key_bytes.len(), "hash_op length overflow")?;
+        let value_len_end = checked_offset(key_end, 4, "hash_op length overflow")?;
+        let total = checked_offset(
+            value_len_end,
+            self.value_bytes.len(),
+            "hash_op length overflow",
+        )?;
         let mut out = vec![0_u8; total];
         out[0] = u8::from(self.op);
         write_u32_le(&mut out[4..8], self.index_rel.oid().raw());
@@ -1459,10 +1521,9 @@ impl HashOpPayload {
         out[12..20].copy_from_slice(&pid_buf);
         write_u64_le(&mut out[20..28], self.key_hash);
         write_u32_le(&mut out[28..32], key_len);
-        out[32..32 + self.key_bytes.len()].copy_from_slice(&self.key_bytes);
-        let value_off = 32 + self.key_bytes.len();
-        write_u32_le(&mut out[value_off..value_off + 4], value_len);
-        out[value_off + 4..].copy_from_slice(&self.value_bytes);
+        out[FIXED..key_end].copy_from_slice(&self.key_bytes);
+        write_u32_le(&mut out[key_end..value_len_end], value_len);
+        out[value_len_end..].copy_from_slice(&self.value_bytes);
         Ok(out)
     }
 
@@ -1496,23 +1557,24 @@ impl HashOpPayload {
         if key_len > MAX_VARIABLE_PAYLOAD_BYTES {
             return Err(PayloadError::Malformed("hash_op key_len exceeds ceiling"));
         }
-        let key_end = FIXED + key_len;
-        if bytes.len() < key_end + 4 {
+        let key_end = checked_offset(FIXED, key_len, "hash_op length overflow")?;
+        let value_len_end = checked_offset(key_end, 4, "hash_op length overflow")?;
+        if bytes.len() < value_len_end {
             return Err(PayloadError::Truncated {
-                needed: key_end + 4,
+                needed: value_len_end,
                 have: bytes.len(),
             });
         }
         let key_bytes = bytes[FIXED..key_end].to_vec();
         let value_len = usize::try_from(
-            read_u32_le(&bytes[key_end..key_end + 4])
+            read_u32_le(&bytes[key_end..value_len_end])
                 .map_err(|_| PayloadError::Malformed("hash_op value_len"))?,
         )
         .map_err(|_| PayloadError::Malformed("hash_op value_len usize overflow"))?;
         if value_len > MAX_VARIABLE_PAYLOAD_BYTES {
             return Err(PayloadError::Malformed("hash_op value_len exceeds ceiling"));
         }
-        let value_end = key_end + 4 + value_len;
+        let value_end = checked_offset(value_len_end, value_len, "hash_op length overflow")?;
         if bytes.len() < value_end {
             return Err(PayloadError::Truncated {
                 needed: value_end,
@@ -1527,7 +1589,7 @@ impl HashOpPayload {
             page,
             key_hash,
             key_bytes,
-            value_bytes: bytes[key_end + 4..value_end].to_vec(),
+            value_bytes: bytes[value_len_end..value_end].to_vec(),
         })
     }
 }
@@ -1617,7 +1679,8 @@ impl HnswOpPayload {
             .map_err(|_| PayloadError::Malformed("hnsw_op dims overflow"))?;
         let vector_len = u32::try_from(self.vector.len())
             .map_err(|_| PayloadError::Malformed("hnsw_op vector_len overflow"))?;
-        let total = 28 + vector_bytes_len;
+        const FIXED: usize = 28;
+        let total = checked_offset(FIXED, vector_bytes_len, "hnsw_op length overflow")?;
         let mut out = vec![0_u8; total];
         out[0] = u8::from(self.op);
         write_u32_le(&mut out[4..8], self.index_rel.oid().raw());
@@ -1634,8 +1697,9 @@ impl HnswOpPayload {
                     "hnsw_op vector elements must be finite",
                 ));
             }
-            out[off..off + 4].copy_from_slice(&value.to_le_bytes());
-            off += 4;
+            let next = checked_offset(off, 4, "hnsw_op length overflow")?;
+            out[off..next].copy_from_slice(&value.to_le_bytes());
+            off = next;
         }
         Ok(out)
     }
@@ -1695,7 +1759,7 @@ impl HnswOpPayload {
                 "hnsw_op vector length exceeds ceiling",
             ));
         }
-        let needed = FIXED + vector_bytes_len;
+        let needed = checked_offset(FIXED, vector_bytes_len, "hnsw_op length overflow")?;
         if bytes.len() < needed {
             return Err(PayloadError::Truncated {
                 needed,
@@ -1814,7 +1878,8 @@ impl IvfFlatOpPayload {
             .map_err(|_| PayloadError::Malformed("ivfflat_op dims overflow"))?;
         let vector_len = u32::try_from(self.vector.len())
             .map_err(|_| PayloadError::Malformed("ivfflat_op vector_len overflow"))?;
-        let total = 32 + vector_bytes_len;
+        const FIXED: usize = 32;
+        let total = checked_offset(FIXED, vector_bytes_len, "ivfflat_op length overflow")?;
         let mut out = vec![0_u8; total];
         out[0] = u8::from(self.op);
         write_u32_le(&mut out[4..8], self.index_rel.oid().raw());
@@ -1832,8 +1897,9 @@ impl IvfFlatOpPayload {
                     "ivfflat_op vector elements must be finite",
                 ));
             }
-            out[off..off + 4].copy_from_slice(&value.to_le_bytes());
-            off += 4;
+            let next = checked_offset(off, 4, "ivfflat_op length overflow")?;
+            out[off..next].copy_from_slice(&value.to_le_bytes());
+            off = next;
         }
         Ok(out)
     }
@@ -1896,7 +1962,7 @@ impl IvfFlatOpPayload {
                 "ivfflat_op vector length exceeds ceiling",
             ));
         }
-        let needed = FIXED + vector_bytes_len;
+        let needed = checked_offset(FIXED, vector_bytes_len, "ivfflat_op length overflow")?;
         if bytes.len() < needed {
             return Err(PayloadError::Truncated {
                 needed,
@@ -2022,6 +2088,8 @@ pub struct SequenceOpPayload {
 impl SequenceOpPayload {
     /// Encode this payload into a freshly allocated byte vector.
     pub fn encode(&self) -> Result<Vec<u8>, PayloadError> {
+        const FIXED_PREFIX: usize = 12;
+        const FIXED_SUFFIX: usize = 48;
         let name_bytes = self.name.as_bytes();
         let name_len = u32::try_from(name_bytes.len())
             .map_err(|_| PayloadError::Malformed("sequence_op name_len overflow"))?;
@@ -2030,27 +2098,57 @@ impl SequenceOpPayload {
                 "sequence_op name_len exceeds ceiling",
             ));
         }
-        let total = 12 + name_bytes.len() + 48;
+        let name_end = checked_offset(
+            FIXED_PREFIX,
+            name_bytes.len(),
+            "sequence_op length overflow",
+        )?;
+        let total = checked_offset(name_end, FIXED_SUFFIX, "sequence_op length overflow")?;
         let mut out = vec![0_u8; total];
         out[0] = u8::from(self.op);
         write_u32_le(&mut out[4..8], self.seqrelid.oid().raw());
         write_u32_le(&mut out[8..12], name_len);
-        out[12..12 + name_bytes.len()].copy_from_slice(name_bytes);
-        let mut off = 12 + name_bytes.len();
-        write_i64_le(&mut out[off..off + 8], self.start_value);
-        off += 8;
-        write_i64_le(&mut out[off..off + 8], self.last_value);
-        off += 8;
-        write_i64_le(&mut out[off..off + 8], self.min_value);
-        off += 8;
-        write_i64_le(&mut out[off..off + 8], self.max_value);
-        off += 8;
-        write_i64_le(&mut out[off..off + 8], self.increment);
-        off += 8;
-        write_u32_le(&mut out[off..off + 4], self.cache_size);
-        off += 4;
+        out[FIXED_PREFIX..name_end].copy_from_slice(name_bytes);
+        let mut off = name_end;
+        write_i64_advance(
+            &mut out,
+            &mut off,
+            self.start_value,
+            "sequence_op length overflow",
+        )?;
+        write_i64_advance(
+            &mut out,
+            &mut off,
+            self.last_value,
+            "sequence_op length overflow",
+        )?;
+        write_i64_advance(
+            &mut out,
+            &mut off,
+            self.min_value,
+            "sequence_op length overflow",
+        )?;
+        write_i64_advance(
+            &mut out,
+            &mut off,
+            self.max_value,
+            "sequence_op length overflow",
+        )?;
+        write_i64_advance(
+            &mut out,
+            &mut off,
+            self.increment,
+            "sequence_op length overflow",
+        )?;
+        write_u32_advance(
+            &mut out,
+            &mut off,
+            self.cache_size,
+            "sequence_op length overflow",
+        )?;
+        let cycle_off = checked_offset(off, 1, "sequence_op length overflow")?;
         out[off] = u8::from(self.is_called);
-        out[off + 1] = u8::from(self.cycle);
+        out[cycle_off] = u8::from(self.cycle);
         Ok(out)
     }
 
@@ -2082,38 +2180,63 @@ impl SequenceOpPayload {
                 "sequence_op name_len exceeds ceiling",
             ));
         }
-        let needed = FIXED_PREFIX + name_len + FIXED_SUFFIX;
+        let name_end = checked_offset(FIXED_PREFIX, name_len, "sequence_op length overflow")?;
+        let needed = checked_offset(name_end, FIXED_SUFFIX, "sequence_op length overflow")?;
         if bytes.len() < needed {
             return Err(PayloadError::Truncated {
                 needed,
                 have: bytes.len(),
             });
         }
-        let name = std::str::from_utf8(&bytes[12..12 + name_len])
+        let name = std::str::from_utf8(&bytes[FIXED_PREFIX..name_end])
             .map_err(|_| PayloadError::Malformed("sequence_op name utf8"))?
             .to_owned();
-        let mut off = 12 + name_len;
-        let start_value = read_i64_le(&bytes[off..off + 8])
-            .map_err(|_| PayloadError::Malformed("sequence_op start_value"))?;
-        off += 8;
-        let last_value = read_i64_le(&bytes[off..off + 8])
-            .map_err(|_| PayloadError::Malformed("sequence_op last_value"))?;
-        off += 8;
-        let min_value = read_i64_le(&bytes[off..off + 8])
-            .map_err(|_| PayloadError::Malformed("sequence_op min_value"))?;
-        off += 8;
-        let max_value = read_i64_le(&bytes[off..off + 8])
-            .map_err(|_| PayloadError::Malformed("sequence_op max_value"))?;
-        off += 8;
-        let increment = read_i64_le(&bytes[off..off + 8])
-            .map_err(|_| PayloadError::Malformed("sequence_op increment"))?;
-        off += 8;
-        let cache_size = read_u32_le(&bytes[off..off + 4])
-            .map_err(|_| PayloadError::Malformed("sequence_op cache_size"))?;
-        off += 4;
+        let mut off = name_end;
+        let start_value = read_i64_advance(
+            bytes,
+            &mut off,
+            "sequence_op start_value",
+            "sequence_op length overflow",
+        )?;
+        let last_value = read_i64_advance(
+            bytes,
+            &mut off,
+            "sequence_op last_value",
+            "sequence_op length overflow",
+        )?;
+        let min_value = read_i64_advance(
+            bytes,
+            &mut off,
+            "sequence_op min_value",
+            "sequence_op length overflow",
+        )?;
+        let max_value = read_i64_advance(
+            bytes,
+            &mut off,
+            "sequence_op max_value",
+            "sequence_op length overflow",
+        )?;
+        let increment = read_i64_advance(
+            bytes,
+            &mut off,
+            "sequence_op increment",
+            "sequence_op length overflow",
+        )?;
+        let cache_size = read_u32_advance(
+            bytes,
+            &mut off,
+            "sequence_op cache_size",
+            "sequence_op length overflow",
+        )?;
+        let cycle_off = checked_offset(off, 1, "sequence_op length overflow")?;
+        let reserved_start = checked_offset(off, 2, "sequence_op length overflow")?;
+        let reserved_end = checked_offset(off, 4, "sequence_op length overflow")?;
         let is_called = decode_bool_byte(bytes[off], "sequence_op is_called")?;
-        let cycle = decode_bool_byte(bytes[off + 1], "sequence_op cycle")?;
-        if bytes[off + 2] != 0 || bytes[off + 3] != 0 {
+        let cycle = decode_bool_byte(bytes[cycle_off], "sequence_op cycle")?;
+        if bytes[reserved_start..reserved_end]
+            .iter()
+            .any(|byte| *byte != 0)
+        {
             return Err(PayloadError::Malformed(
                 "sequence_op reserved suffix bytes must be zero",
             ));
