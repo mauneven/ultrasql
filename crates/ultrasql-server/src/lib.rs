@@ -4851,11 +4851,11 @@ impl Server {
         server.recover_commit_status_from_wal()?;
         server.rebuild_persistent_index_sidecars()?;
         server.rebuild_domain_runtime_constraint_sidecars()?;
-        server.rebuild_table_runtime_constraint_sidecars()?;
         server.rebuild_role_metadata()?;
         server.rebuild_privilege_metadata()?;
         server.rebuild_schema_metadata()?;
         server.refresh_persistent_catalog_schema_names();
+        server.rebuild_table_runtime_constraint_sidecars()?;
         let stats_catalog = hydrate_optimizer_stats_from_catalog(
             &server.catalog_snapshot(),
             server.heap.as_ref(),
@@ -5062,7 +5062,7 @@ impl Server {
                 let table = snapshot.tables_by_oid.get(entry.key())?;
                 Some((
                     *entry.key(),
-                    table.name.clone(),
+                    table_entry_lookup_key(table),
                     entry.value().as_ref().clone(),
                 ))
             })
@@ -5205,7 +5205,6 @@ impl Server {
         let mut exclusions: std::collections::HashMap<Oid, Vec<RuntimeExclusionConstraint>> =
             std::collections::HashMap::new();
         let mut seen_table_oids = std::collections::HashSet::new();
-        let mut seen_table_names = std::collections::HashSet::new();
         let mut seen_sequence_default_keys = std::collections::HashSet::new();
         let mut seen_default_keys = std::collections::HashSet::new();
         let mut seen_identity_keys = std::collections::HashSet::new();
@@ -5227,9 +5226,7 @@ impl Server {
                         ))
                     })?);
                     let table_name = metadata_unescape(parts[1])?;
-                    if !seen_table_oids.insert(oid)
-                        || !seen_table_names.insert(table_name.to_ascii_lowercase())
-                    {
+                    if !seen_table_oids.insert(oid) {
                         return Err(ServerError::Ddl(format!(
                             "duplicate table-runtime metadata on line {}",
                             line_no + 1
@@ -5457,10 +5454,11 @@ impl Server {
                     oid.raw()
                 )));
             };
-            if table.name != table_name {
+            let expected_key = table_entry_lookup_key(table);
+            if table_name != expected_key && table_name != table.name {
                 return Err(ServerError::Ddl(format!(
                     "table-runtime metadata table '{}' does not match catalog table '{}'",
-                    table_name, table.name
+                    table_name, expected_key
                 )));
             }
             let width = table.schema.fields().len();

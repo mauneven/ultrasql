@@ -587,6 +587,41 @@ async fn check_constraint_survives_restart() {
     graceful_shutdown(running).await;
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn same_table_name_constraints_survive_restart_across_schemas() {
+    let data_dir = tempfile::TempDir::new().unwrap();
+
+    let running = start_persistent_server(data_dir.path(), "schema_constraint_restart_setup").await;
+    let client = &running.client;
+    client
+        .batch_execute(
+            "CREATE SCHEMA app; \
+             CREATE TABLE same_runtime_constraint (id INT CHECK (id > 0)); \
+             CREATE TABLE app.same_runtime_constraint (id INT CHECK (id > 10))",
+        )
+        .await
+        .expect("create constrained same-name tables in two schemas");
+    graceful_shutdown(running).await;
+
+    let running =
+        start_persistent_server(data_dir.path(), "schema_constraint_restart_verify").await;
+    let client = &running.client;
+
+    let public_err = client
+        .batch_execute("INSERT INTO same_runtime_constraint VALUES (-1)")
+        .await
+        .expect_err("public CHECK rejects row after restart");
+    assert_eq!(public_err.code().expect("SQLSTATE").code(), "23514");
+
+    let app_err = client
+        .batch_execute("INSERT INTO app.same_runtime_constraint VALUES (5)")
+        .await
+        .expect_err("app CHECK rejects row after restart");
+    assert_eq!(app_err.code().expect("SQLSTATE").code(), "23514");
+
+    graceful_shutdown(running).await;
+}
+
 /// PRIMARY KEY creates a unique B-tree and implies NOT NULL.
 #[tokio::test]
 async fn primary_key_enforces_not_null_and_unique() {
