@@ -148,7 +148,9 @@ pub trait Catalog: Send + Sync {
     /// Resolve a relation name to its catalog OID inside one schema.
     fn lookup_table_oid_in_schema(&self, schema_name: &str, name: &str) -> Option<Oid> {
         if schema_name.eq_ignore_ascii_case("public") {
-            self.lookup_table_oid(name)
+            self.lookup_table_oid(name).or_else(|| {
+                self.lookup_table_oid(&ultrasql_catalog::table_lookup_key("public", name))
+            })
         } else {
             self.lookup_table_oid(&ultrasql_catalog::table_lookup_key(schema_name, name))
         }
@@ -468,9 +470,13 @@ impl Catalog for ultrasql_catalog::CatalogSnapshot {
     }
 
     fn lookup_table_oid(&self, name: &str) -> Option<Oid> {
-        self.tables
-            .get(&name.to_ascii_lowercase())
-            .map(|entry| entry.oid)
+        let folded = name.to_ascii_lowercase();
+        self.tables.get(&folded).map(|entry| entry.oid).or_else(|| {
+            let public_key = ultrasql_catalog::table_lookup_key("public", name);
+            (public_key != folded)
+                .then(|| self.tables.get(&public_key).map(|entry| entry.oid))
+                .flatten()
+        })
     }
 
     fn lookup_type_oid(&self, name: &str) -> Option<Oid> {

@@ -140,6 +140,36 @@ async fn regclass_literal_uses_search_path_schema() {
 }
 
 #[tokio::test]
+async fn regclass_literal_resolves_public_dotted_relation_name() {
+    let data_dir = tempfile::TempDir::new().expect("temp data dir");
+    let running = start_persistent_server(data_dir.path(), "regclass_public_dotted").await;
+
+    running
+        .client
+        .batch_execute("CREATE TABLE \"reg.class\" (id INT)")
+        .await
+        .expect("create public dotted relation");
+
+    let table_oid = first_i64(
+        running
+            .client
+            .simple_query("SELECT oid FROM pg_class WHERE relname = 'reg.class'")
+            .await
+            .expect("pg_class dotted table oid"),
+    );
+    let regclass_oid = first_i64(
+        running
+            .client
+            .simple_query("SELECT '\"reg.class\"'::regclass")
+            .await
+            .expect("quoted dotted public regclass resolves"),
+    );
+    assert_eq!(regclass_oid, table_oid);
+
+    shutdown(running).await;
+}
+
+#[tokio::test]
 async fn regtype_literal_parses_quoted_identifier_path() {
     let data_dir = tempfile::TempDir::new().expect("temp data dir");
     let running = start_persistent_server(data_dir.path(), "regtype_quoted_path").await;
