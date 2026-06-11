@@ -59,6 +59,7 @@ where
         let combined = CombinedCatalog {
             snapshot: &catalog_snapshot,
             fallback: &self.state.catalog,
+            search_path: self.session_settings.get("search_path").map(String::as_str),
         };
         let parse_sql = sql.clone();
         let parse_name = name.clone();
@@ -173,6 +174,7 @@ where
         let combined = CombinedCatalog {
             snapshot: &catalog_snapshot,
             fallback: &self.state.catalog,
+            search_path: self.session_settings.get("search_path").map(String::as_str),
         };
         match crate::extended::handle_bind(
             &mut self.extended,
@@ -208,6 +210,7 @@ where
         let combined = CombinedCatalog {
             snapshot: &catalog_snapshot,
             fallback: &self.state.catalog,
+            search_path: self.session_settings.get("search_path").map(String::as_str),
         };
         let result = match kind {
             ultrasql_protocol::DescribeKind::Statement => {

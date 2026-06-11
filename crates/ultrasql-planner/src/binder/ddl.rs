@@ -24,7 +24,7 @@ use ultrasql_parser::ast::{
 use super::expr_bind::{coerce_literal_to_type, resolve_builtin_collation};
 use super::{
     Catalog, LogicalAlterTableAction, LogicalPlan, PlanError, ScalarExpr, ScopeStack, bind_expr,
-    bind_select, object_name_simple,
+    bind_select, object_name_simple, validate_table_reference_namespace,
 };
 use crate::catalog::TableMeta;
 use crate::plan::{
@@ -2487,15 +2487,10 @@ fn lookup_table_object(
     obj: &ObjectName,
     name: &str,
 ) -> Result<TableMeta, PlanError> {
-    let requested_namespace = object_name_namespace(obj);
     let meta = catalog
         .lookup_table(name)
         .ok_or_else(|| PlanError::TableNotFound(name.to_owned()))?;
-    if obj.parts.len() >= 2 && !meta.schema_name.eq_ignore_ascii_case(&requested_namespace) {
-        return Err(PlanError::TableNotFound(format!(
-            "{requested_namespace}.{name}"
-        )));
-    }
+    validate_table_reference_namespace(catalog, obj, name, &meta)?;
     Ok(meta)
 }
 

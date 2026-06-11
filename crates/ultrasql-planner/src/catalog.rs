@@ -112,6 +112,14 @@ pub trait Catalog: Send + Sync {
         None
     }
 
+    /// Return whether an unqualified table reference can see this schema.
+    fn table_schema_visible_without_qualification(&self, schema_name: &str) -> bool {
+        matches!(
+            schema_name.to_ascii_lowercase().as_str(),
+            "public" | "pg_catalog" | "information_schema"
+        )
+    }
+
     /// Resolve a type name to its `pg_type.oid`.
     fn lookup_type_oid(&self, name: &str) -> Option<Oid> {
         builtin_type_oid(name)

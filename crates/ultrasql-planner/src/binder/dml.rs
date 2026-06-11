@@ -14,6 +14,7 @@ use super::expr_bind::coerce_literal_to_type;
 use super::{
     Catalog, ConflictTarget, LogicalOnConflict, LogicalPlan, PlanError, ScalarExpr, ScopeStack,
     bind_expr, bind_returning, bind_select, build_returning_schema, object_name_simple,
+    validate_table_reference_namespace,
 };
 
 pub(super) fn bind_insert(
@@ -452,16 +453,6 @@ fn lookup_target_table(
     let meta = catalog
         .lookup_table(&table_name)
         .ok_or_else(|| PlanError::TableNotFound(table_name.clone()))?;
-    if object_name.parts.len() >= 2 {
-        let namespace_index = object_name.parts.len() - 2;
-        let namespace = object_name.parts[namespace_index]
-            .value
-            .to_ascii_lowercase();
-        if !meta.schema_name.eq_ignore_ascii_case(&namespace) {
-            return Err(PlanError::TableNotFound(format!(
-                "{namespace}.{table_name}"
-            )));
-        }
-    }
+    validate_table_reference_namespace(catalog, object_name, &table_name, &meta)?;
     Ok((table_name, meta))
 }

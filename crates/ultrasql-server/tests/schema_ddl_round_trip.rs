@@ -343,6 +343,222 @@ async fn select_respects_schema_qualifier() {
 }
 
 #[tokio::test]
+async fn unqualified_select_does_not_resolve_non_public_table() {
+    let running = start_sample_server("schema_select_default_namespace_guard").await;
+
+    running
+        .client
+        .batch_execute(
+            "CREATE SCHEMA app; \
+             CREATE TABLE app.private_select (id INT); \
+             INSERT INTO app.private_select VALUES (11)",
+        )
+        .await
+        .expect("create non-public table");
+
+    running
+        .client
+        .query("SELECT id FROM private_select", &[])
+        .await
+        .expect_err("unqualified SELECT must not resolve non-public table");
+
+    let row = running
+        .client
+        .query_one("SELECT id FROM app.private_select", &[])
+        .await
+        .expect("qualified table remains readable")
+        .get::<_, i32>(0);
+    assert_eq!(row, 11);
+
+    running
+        .client
+        .batch_execute("DROP TABLE app.private_select; DROP SCHEMA app")
+        .await
+        .expect("cleanup default namespace guard");
+
+    shutdown(running).await;
+}
+
+#[tokio::test]
+async fn unqualified_dml_does_not_resolve_non_public_table() {
+    let running = start_sample_server("schema_dml_default_namespace_guard").await;
+
+    running
+        .client
+        .batch_execute(
+            "CREATE SCHEMA app; \
+             CREATE TABLE app.private_dml (id INT); \
+             INSERT INTO app.private_dml VALUES (1)",
+        )
+        .await
+        .expect("create non-public DML target");
+
+    for sql in [
+        "INSERT INTO private_dml VALUES (2)",
+        "UPDATE private_dml SET id = 3",
+        "DELETE FROM private_dml",
+    ] {
+        running
+            .client
+            .batch_execute(sql)
+            .await
+            .expect_err("unqualified DML must not resolve non-public table");
+    }
+
+    let row = running
+        .client
+        .query_one("SELECT id FROM app.private_dml", &[])
+        .await
+        .expect("qualified DML target remains readable")
+        .get::<_, i32>(0);
+    assert_eq!(row, 1);
+
+    running
+        .client
+        .batch_execute("DROP TABLE app.private_dml; DROP SCHEMA app")
+        .await
+        .expect("cleanup DML default namespace guard");
+
+    shutdown(running).await;
+}
+
+#[tokio::test]
+async fn unqualified_table_ddl_does_not_resolve_non_public_table() {
+    let running = start_sample_server("schema_table_ddl_default_namespace_guard").await;
+
+    running
+        .client
+        .batch_execute(
+            "CREATE SCHEMA app; \
+             CREATE TABLE app.private_truncate (id INT); \
+             CREATE TABLE app.private_alter (id INT); \
+             CREATE TABLE app.private_index (id INT); \
+             INSERT INTO app.private_truncate VALUES (1)",
+        )
+        .await
+        .expect("create non-public DDL targets");
+
+    running
+        .client
+        .batch_execute("TRUNCATE private_truncate")
+        .await
+        .expect_err("unqualified TRUNCATE must not resolve non-public table");
+    running
+        .client
+        .batch_execute("ALTER TABLE private_alter ADD COLUMN leaked INT")
+        .await
+        .expect_err("unqualified ALTER TABLE must not resolve non-public table");
+    running
+        .client
+        .batch_execute("CREATE INDEX private_index_id_idx ON private_index(id)")
+        .await
+        .expect_err("unqualified CREATE INDEX must not resolve non-public table");
+
+    let row = running
+        .client
+        .query_one("SELECT id FROM app.private_truncate", &[])
+        .await
+        .expect("qualified truncate target remains readable")
+        .get::<_, i32>(0);
+    assert_eq!(row, 1);
+    running
+        .client
+        .query("SELECT leaked FROM app.private_alter", &[])
+        .await
+        .expect_err("qualified alter target must not gain rejected column");
+    let rows = running
+        .client
+        .query(
+            "SELECT indexname \
+             FROM pg_catalog.pg_indexes \
+             WHERE schemaname = 'app' \
+             AND tablename = 'private_index' \
+             AND indexname = 'private_index_id_idx'",
+            &[],
+        )
+        .await
+        .expect("query rejected non-public index");
+    assert!(
+        rows.is_empty(),
+        "unqualified CREATE INDEX must not create a non-public index"
+    );
+
+    running
+        .client
+        .batch_execute(
+            "DROP TABLE app.private_truncate; \
+             DROP TABLE app.private_alter; \
+             DROP TABLE app.private_index; \
+             DROP SCHEMA app",
+        )
+        .await
+        .expect("cleanup table DDL default namespace guard");
+
+    shutdown(running).await;
+}
+
+#[tokio::test]
+async fn search_path_allows_unqualified_non_public_table_access() {
+    let running = start_sample_server("schema_search_path_namespace_guard").await;
+
+    running
+        .client
+        .batch_execute("CREATE SCHEMA app; CREATE TABLE app.path_target (id INT)")
+        .await
+        .expect("create search path target");
+
+    running
+        .client
+        .batch_execute("SET search_path TO app, public")
+        .await
+        .expect("set search path");
+    running
+        .client
+        .batch_execute("INSERT INTO path_target VALUES (1)")
+        .await
+        .expect("search path INSERT resolves app table");
+    running
+        .client
+        .batch_execute("UPDATE path_target SET id = 2")
+        .await
+        .expect("search path UPDATE resolves app table");
+    let row = running
+        .client
+        .query_one("SELECT id FROM path_target", &[])
+        .await
+        .expect("search path SELECT resolves app table")
+        .get::<_, i32>(0);
+    assert_eq!(row, 2);
+
+    running
+        .client
+        .batch_execute("RESET search_path")
+        .await
+        .expect("reset search path");
+    running
+        .client
+        .query("SELECT id FROM path_target", &[])
+        .await
+        .expect_err("reset search_path hides non-public table again");
+
+    let row = running
+        .client
+        .query_one("SELECT id FROM app.path_target", &[])
+        .await
+        .expect("qualified search path target remains readable")
+        .get::<_, i32>(0);
+    assert_eq!(row, 2);
+
+    running
+        .client
+        .batch_execute("DROP TABLE app.path_target; DROP SCHEMA app")
+        .await
+        .expect("cleanup search path guard");
+
+    shutdown(running).await;
+}
+
+#[tokio::test]
 async fn dml_respects_schema_qualifier() {
     let running = start_sample_server("schema_dml_qualifier_guard").await;
 

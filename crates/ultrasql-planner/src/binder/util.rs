@@ -10,6 +10,7 @@ use super::{
     Catalog, LogicalOnConflict, LogicalPlan, PlanError, ScalarExpr, ScopeStack, SortKey, bind_expr,
     bind_expr_with_ctes,
 };
+use crate::catalog::TableMeta;
 
 /// Build the `RETURNING` schema from the resolved `(expr, name)` pairs.
 pub(super) fn build_returning_schema(
@@ -56,6 +57,38 @@ pub(super) fn object_name_simple(name: &ObjectName) -> String {
     name.parts
         .last()
         .map_or_else(String::new, |p| p.value.to_ascii_lowercase())
+}
+
+/// Extract the explicit namespace in a table reference, if present.
+#[inline]
+pub(super) fn object_name_explicit_namespace(name: &ObjectName) -> Option<String> {
+    (name.parts.len() >= 2).then(|| {
+        let namespace_index = name.parts.len() - 2;
+        name.parts[namespace_index].value.to_ascii_lowercase()
+    })
+}
+
+/// Validate that a catalog hit is visible through the requested SQL name.
+pub(super) fn validate_table_reference_namespace(
+    catalog: &dyn Catalog,
+    name: &ObjectName,
+    table_name: &str,
+    meta: &TableMeta,
+) -> Result<(), PlanError> {
+    if let Some(namespace) = object_name_explicit_namespace(name) {
+        if meta.schema_name.eq_ignore_ascii_case(&namespace) {
+            return Ok(());
+        }
+        return Err(PlanError::TableNotFound(format!(
+            "{namespace}.{table_name}"
+        )));
+    }
+
+    if catalog.table_schema_visible_without_qualification(&meta.schema_name) {
+        return Ok(());
+    }
+
+    Err(PlanError::TableNotFound(table_name.to_owned()))
 }
 
 /// Derive an output column name from an expression.

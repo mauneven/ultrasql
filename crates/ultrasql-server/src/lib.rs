@@ -2512,6 +2512,7 @@ impl PageLoader for BlankPageLoader {
 struct CombinedCatalog<'a> {
     snapshot: &'a CatalogSnapshot,
     fallback: &'a InMemoryCatalog,
+    search_path: Option<&'a str>,
 }
 
 impl PlannerCatalog for CombinedCatalog<'_> {
@@ -2541,6 +2542,37 @@ impl PlannerCatalog for CombinedCatalog<'_> {
         PlannerCatalog::lookup_type_oid(self.snapshot, name)
             .or_else(|| self.fallback.lookup_type_oid(name))
     }
+
+    fn table_schema_visible_without_qualification(&self, schema_name: &str) -> bool {
+        search_path_contains_schema(self.search_path, schema_name)
+    }
+}
+
+fn search_path_contains_schema(search_path: Option<&str>, schema_name: &str) -> bool {
+    let folded = schema_name.to_ascii_lowercase();
+    if matches!(folded.as_str(), "pg_catalog" | "information_schema") {
+        return true;
+    }
+    let Some(search_path) = search_path else {
+        return folded == "public";
+    };
+    search_path.split(',').any(|part| {
+        normalize_search_path_schema(part)
+            .as_deref()
+            .is_some_and(|schema| schema == folded)
+    })
+}
+
+fn normalize_search_path_schema(part: &str) -> Option<String> {
+    let trimmed = part.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let unquoted = trimmed
+        .strip_prefix('"')
+        .and_then(|value| value.strip_suffix('"'))
+        .unwrap_or(trimmed);
+    (unquoted != "$user").then(|| unquoted.to_ascii_lowercase())
 }
 
 fn is_local_read_plan(plan: &LogicalPlan) -> bool {
@@ -4042,6 +4074,7 @@ impl Server {
         let combined = CombinedCatalog {
             snapshot: &catalog_snapshot,
             fallback: &self.catalog,
+            search_path: None,
         };
         let plan = bind(&stmt, &combined)?;
         if !is_local_read_plan(&plan) {

@@ -183,6 +183,7 @@ where
         let combined = CombinedCatalog {
             snapshot: &catalog_snapshot,
             fallback: &self.state.catalog,
+            search_path: self.session_settings.get("search_path").map(String::as_str),
         };
         let plan = match bind(&stmt, &combined) {
             Ok(p) => p,

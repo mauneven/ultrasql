@@ -1422,13 +1422,13 @@ async fn default_privileges_apply_to_future_objects_only() {
         .await
         .expect("create table after default grant");
     client
-        .batch_execute("INSERT INTO default_acl_future (id, secret) VALUES (1, 'visible')")
+        .batch_execute("INSERT INTO tenant.default_acl_future (id, secret) VALUES (1, 'visible')")
         .await
         .expect("seed future table");
 
     let granted = client
         .query_one(
-            "SELECT has_table_privilege('analyst', 'default_acl_future', 'SELECT')",
+            "SELECT has_table_privilege('analyst', 'tenant.default_acl_future', 'SELECT')",
             &[],
         )
         .await
@@ -1441,7 +1441,10 @@ async fn default_privileges_apply_to_future_objects_only() {
     let (analyst, analyst_conn) =
         connect_as(running.bound, "analyst", "default_privilege_analyst").await;
     let visible = analyst
-        .query_one("SELECT secret FROM default_acl_future WHERE id = 1", &[])
+        .query_one(
+            "SELECT secret FROM tenant.default_acl_future WHERE id = 1",
+            &[],
+        )
         .await
         .expect("default-granted SELECT succeeds");
     assert_eq!(visible.get::<_, String>(0), "visible");
@@ -1463,8 +1466,8 @@ async fn default_privileges_apply_to_future_objects_only() {
     let after_revoke = client
         .query_one(
             "SELECT \
-                has_table_privilege('analyst', 'default_acl_future', 'SELECT'), \
-                has_table_privilege('analyst', 'default_acl_later', 'SELECT')",
+                has_table_privilege('analyst', 'tenant.default_acl_future', 'SELECT'), \
+                has_table_privilege('analyst', 'tenant.default_acl_later', 'SELECT')",
             &[],
         )
         .await
@@ -1524,7 +1527,7 @@ async fn drop_schema_removes_schema_scoped_default_privileges() {
 
     let granted = client
         .query_one(
-            "SELECT has_table_privilege('analyst', 'after_schema_recreate', 'SELECT')",
+            "SELECT has_table_privilege('analyst', 'tenant.after_schema_recreate', 'SELECT')",
             &[],
         )
         .await

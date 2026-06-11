@@ -35,7 +35,7 @@ use super::ddl::resolve_type_name;
 use super::{
     Catalog, LogicalJoinCondition, LogicalJoinType, LogicalPlan, PlanError, ScalarExpr, ScopeEntry,
     ScopeStack, apply_column_aliases, bind_expr_with_ctes, bind_select_with_ctes,
-    schema_for_qualified_binding,
+    schema_for_qualified_binding, validate_table_reference_namespace,
 };
 
 pub(super) fn bind_from(
@@ -128,7 +128,6 @@ fn bind_table_ref(
                 .last()
                 .map_or_else(String::new, |p| p.value.to_ascii_lowercase());
             let system_table_name = qualified_system_name(name);
-            let requested_namespace = explicit_namespace(name);
             let table_name = system_table_name
                 .clone()
                 .unwrap_or_else(|| raw_table_name.clone());
@@ -146,13 +145,8 @@ fn bind_table_ref(
                 let meta = catalog
                     .lookup_table(&table_name)
                     .ok_or_else(|| PlanError::TableNotFound(table_name.clone()))?;
-                if system_table_name.is_none()
-                    && let Some(namespace) = &requested_namespace
-                    && !meta.schema_name.eq_ignore_ascii_case(namespace)
-                {
-                    return Err(PlanError::TableNotFound(format!(
-                        "{namespace}.{raw_table_name}"
-                    )));
+                if system_table_name.is_none() {
+                    validate_table_reference_namespace(catalog, name, &raw_table_name, &meta)?;
                 }
                 meta.schema
             };
@@ -254,14 +248,6 @@ fn qualified_system_name(name: &ultrasql_parser::ast::ObjectName) -> Option<Stri
     }
     let relation = name.parts[1].value.to_ascii_lowercase();
     Some(format!("{namespace}.{relation}"))
-}
-
-fn explicit_namespace(name: &ultrasql_parser::ast::ObjectName) -> Option<String> {
-    if name.parts.len() < 2 {
-        return None;
-    }
-    let idx = name.parts.len() - 2;
-    Some(name.parts[idx].value.to_ascii_lowercase())
 }
 
 fn bind_table_function(
