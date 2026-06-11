@@ -10,8 +10,8 @@
 //!
 //! # Wire conventions
 //!
-//! All integers are little-endian. Padding bytes are written as zero and
-//! ignored on decode (except where a reserved field's value is validated).
+//! All integers are little-endian. Padding and reserved bytes are written as
+//! zero and must decode as zero.
 //! Length fields are `u32` and represent the byte count of the variable-length
 //! data that follows immediately.
 //!
@@ -146,8 +146,16 @@ fn decode_tid(bytes: &[u8]) -> Result<TupleId, PayloadError> {
         });
     }
     let rel_raw = read_u32_le(&bytes[0..4]).map_err(|_| PayloadError::Malformed("tid relation"))?;
-    let block_raw =
-        read_u32_le(&bytes[4..8]).map_err(|_| PayloadError::Malformed("tid block"))? & 0x00FF_FFFF;
+    let block_word = read_u32_le(&bytes[4..8]).map_err(|_| PayloadError::Malformed("tid block"))?;
+    if block_word & 0xFF00_0000 != 0 {
+        return Err(PayloadError::Malformed("tid block reserved bits set"));
+    }
+    let reserved =
+        read_u16_le(&bytes[10..12]).map_err(|_| PayloadError::Malformed("tid reserved bytes"))?;
+    if reserved != 0 {
+        return Err(PayloadError::Malformed("tid reserved bytes must be zero"));
+    }
+    let block_raw = block_word & 0x00FF_FFFF;
     let slot = read_u16_le(&bytes[8..10]).map_err(|_| PayloadError::Malformed("tid slot"))?;
     Ok(TupleId::new(
         PageId::new(RelationId::new(rel_raw), BlockNumber::new(block_raw)),
@@ -357,6 +365,11 @@ impl HeapUpdatePayload {
         let flags = bytes[TID_SIZE * 2];
         if flags & HEAP_UPDATE_FLAGS_RESERVED != 0 {
             return Err(PayloadError::FlagsReserved(flags));
+        }
+        if bytes[25] != 0 || bytes[26] != 0 || bytes[27] != 0 {
+            return Err(PayloadError::Malformed(
+                "heap_update reserved bytes must be zero",
+            ));
         }
         let new_len = usize::try_from(
             read_u32_le(&bytes[28..32])
@@ -816,6 +829,11 @@ impl HeapDeletePayload {
             read_u32_le(&bytes[TID_SIZE + 8..TID_SIZE + 12])
                 .map_err(|_| PayloadError::Malformed("heap_delete cmax"))?,
         );
+        if bytes[TID_SIZE + 12..SIZE].iter().any(|byte| *byte != 0) {
+            return Err(PayloadError::Malformed(
+                "heap_delete reserved bytes must be zero",
+            ));
+        }
         require_exact_len(bytes, SIZE)?;
         Ok(Self { tid, xmax, cmax })
     }
@@ -1222,6 +1240,11 @@ impl BTreeOpPayload {
             });
         }
         let op = BTreeOpKind::from_u8(bytes[0])?;
+        if bytes[1] != 0 || bytes[2] != 0 || bytes[3] != 0 {
+            return Err(PayloadError::Malformed(
+                "btree_op reserved bytes must be zero",
+            ));
+        }
         let index_rel = RelationId::new(
             read_u32_le(&bytes[4..8]).map_err(|_| PayloadError::Malformed("btree_op index_rel"))?,
         );
@@ -1388,6 +1411,11 @@ impl HashOpPayload {
             });
         }
         let op = HashOpKind::from_u8(bytes[0])?;
+        if bytes[1] != 0 || bytes[2] != 0 || bytes[3] != 0 {
+            return Err(PayloadError::Malformed(
+                "hash_op reserved bytes must be zero",
+            ));
+        }
         let index_rel = RelationId::new(
             read_u32_le(&bytes[4..8]).map_err(|_| PayloadError::Malformed("hash_op index_rel"))?,
         );
@@ -2100,6 +2128,16 @@ mod tests {
         ));
     }
 
+    fn assert_reserved_rejected<T: std::fmt::Debug>(
+        mut bytes: Vec<u8>,
+        offset: usize,
+        decode: impl FnOnce(&[u8]) -> Result<T, PayloadError>,
+    ) {
+        bytes[offset] = 0x01;
+        let err = decode(&bytes).expect_err("reserved bytes must fail");
+        assert!(matches!(err, PayloadError::Malformed(_)));
+    }
+
     #[test]
     fn payload_decoders_reject_trailing_bytes() {
         assert_trailing_rejected(
@@ -2282,6 +2320,73 @@ mod tests {
             .encode()
             .expect("encode"),
             SequenceOpPayload::decode,
+        );
+    }
+
+    #[test]
+    fn payload_decoders_reject_reserved_bytes() {
+        let heap_insert = HeapInsertPayload {
+            tid: tid(1, 2, 3),
+            tuple_bytes: vec![1, 2, 3],
+        }
+        .encode()
+        .expect("encode");
+        assert_reserved_rejected(heap_insert.clone(), 7, HeapInsertPayload::decode);
+        assert_reserved_rejected(heap_insert, 10, HeapInsertPayload::decode);
+
+        assert_reserved_rejected(
+            HeapUpdatePayload {
+                old_tid: tid(1, 2, 3),
+                new_tid: tid(1, 2, 4),
+                flags: HEAP_UPDATE_HOT,
+                new_tuple_bytes: vec![4, 5, 6],
+            }
+            .encode()
+            .expect("encode"),
+            25,
+            HeapUpdatePayload::decode,
+        );
+
+        assert_reserved_rejected(
+            HeapDeletePayload {
+                tid: tid(1, 2, 3),
+                xmax: Xid::new(11),
+                cmax: CommandId::new(2),
+            }
+            .encode()
+            .expect("encode"),
+            TID_SIZE + 12,
+            HeapDeletePayload::decode,
+        );
+
+        assert_reserved_rejected(
+            BTreeOpPayload {
+                op: BTreeOpKind::Insert,
+                index_rel: RelationId::new(7),
+                page: page_id(7, 2),
+                key_bytes: vec![1, 2],
+                child_or_value: vec![3, 4],
+            }
+            .encode()
+            .expect("encode"),
+            1,
+            BTreeOpPayload::decode,
+        );
+
+        assert_reserved_rejected(
+            HashOpPayload {
+                op: HashOpKind::Insert,
+                index_rel: RelationId::new(7),
+                bucket: 3,
+                page: page_id(7, 2),
+                key_hash: 99,
+                key_bytes: vec![1, 2],
+                value_bytes: vec![3, 4],
+            }
+            .encode()
+            .expect("encode"),
+            1,
+            HashOpPayload::decode,
         );
     }
 
