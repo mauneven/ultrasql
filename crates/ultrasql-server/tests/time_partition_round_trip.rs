@@ -106,3 +106,58 @@ async fn range_partitioned_timestamp_table_auto_creates_and_prunes_chunks() {
 
     shutdown(client, server_handle).await;
 }
+
+#[tokio::test]
+async fn same_partitioned_table_name_is_isolated_by_schema() {
+    let (server, client, _conn, server_handle) = start_server_and_connect().await;
+
+    client
+        .batch_execute(
+            "CREATE SCHEMA app;\
+             CREATE TABLE metrics (\
+             ts TIMESTAMP NOT NULL, host TEXT NOT NULL, value INT NOT NULL\
+             ) PARTITION BY RANGE (ts);\
+             CREATE TABLE app.metrics (\
+             ts TIMESTAMP NOT NULL, host TEXT NOT NULL, value INT NOT NULL\
+             ) PARTITION BY RANGE (ts);",
+        )
+        .await
+        .expect("create partitioned tables with same relation name");
+
+    client
+        .batch_execute(
+            "INSERT INTO metrics VALUES \
+             (TIMESTAMP '2026-05-20 00:00:00', 'public', 10);\
+             INSERT INTO app.metrics VALUES \
+             (TIMESTAMP '2026-05-20 00:00:00', 'app', 20);",
+        )
+        .await
+        .expect("insert into schema-isolated partitioned tables");
+
+    assert!(
+        server.time_partitions.get("metrics").is_some(),
+        "public partition runtime registered"
+    );
+    assert!(
+        server.time_partitions.get("app.metrics").is_some(),
+        "qualified partition runtime registered"
+    );
+
+    let public_rows = client
+        .query("SELECT host, value FROM metrics ORDER BY value", &[])
+        .await
+        .expect("scan public partitioned parent");
+    assert_eq!(public_rows.len(), 1);
+    assert_eq!(public_rows[0].get::<_, String>(0), "public");
+    assert_eq!(public_rows[0].get::<_, i32>(1), 10);
+
+    let app_rows = client
+        .query("SELECT host, value FROM app.metrics ORDER BY value", &[])
+        .await
+        .expect("scan app partitioned parent");
+    assert_eq!(app_rows.len(), 1);
+    assert_eq!(app_rows[0].get::<_, String>(0), "app");
+    assert_eq!(app_rows[0].get::<_, i32>(1), 20);
+
+    shutdown(client, server_handle).await;
+}

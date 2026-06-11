@@ -7,7 +7,7 @@ use std::sync::atomic::AtomicUsize;
 use dashmap::DashMap;
 use parking_lot::Mutex;
 use ultrasql_catalog::persistent::PersistentCatalog;
-use ultrasql_catalog::{Catalog, MutableCatalog, TableEntry};
+use ultrasql_catalog::{Catalog, MutableCatalog, TableEntry, table_lookup_key};
 use ultrasql_core::{CommandId, DataType, Field, Oid, RelationId, Schema, Value, Xid};
 use ultrasql_executor::{ExecError, Operator, RowCodec, batch_to_rows, build_batch};
 use ultrasql_storage::heap::{HeapAccess, InsertOptions};
@@ -23,8 +23,12 @@ pub const DEFAULT_TIME_CHUNK_INTERVAL_US: i64 = 86_400_000_000;
 /// Runtime metadata for one time-range partitioned parent table.
 #[derive(Debug)]
 pub struct TimePartitionRuntime {
-    /// Parent table name.
+    /// Canonical parent table lookup key.
     pub parent_table: String,
+    /// Parent table relation name without a schema qualifier.
+    pub parent_relname: String,
+    /// Parent table schema name.
+    pub parent_schema_name: String,
     /// Parent table OID.
     pub parent_oid: Oid,
     /// Parent table schema.
@@ -48,14 +52,18 @@ impl TimePartitionRuntime {
     /// Build a one-day range partition runtime descriptor.
     #[must_use]
     pub fn daily(
-        parent_table: String,
+        parent_schema_name: String,
+        parent_relname: String,
         parent_oid: Oid,
         schema: Schema,
         partition_column: String,
         partition_column_index: usize,
     ) -> Self {
+        let parent_table = table_lookup_key(&parent_schema_name, &parent_relname);
         Self {
             parent_table,
+            parent_relname,
+            parent_schema_name,
             parent_oid,
             schema,
             partition_column,
@@ -155,15 +163,16 @@ impl TimePartitionInsert {
             return Ok(chunk.value().clone());
         }
 
-        let table_name = chunk_table_name(&self.runtime.parent_table, start_us);
+        let chunk_relname = chunk_table_name(&self.runtime.parent_relname, start_us);
+        let table_name = table_lookup_key(&self.runtime.parent_schema_name, &chunk_relname);
         let oid = if let Some(existing) = self.persistent_catalog.lookup_table(&table_name) {
             existing.oid
         } else {
             let oid = self.persistent_catalog.next_oid();
             let entry = TableEntry::new(
                 oid,
-                table_name.clone(),
-                "public".to_owned(),
+                chunk_relname,
+                self.runtime.parent_schema_name.clone(),
                 self.runtime.schema.clone(),
             );
             self.persistent_catalog

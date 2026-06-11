@@ -2902,7 +2902,7 @@ pub struct Server {
     pub materialized_views: Arc<dashmap::DashMap<String, Arc<MaterializedViewRuntime>>>,
     /// Same-process columnar secondary-storage registry.
     pub columnar_storage: Arc<columnar_storage::ColumnarSecondaryStore>,
-    /// Same-process time-range partition registry keyed by parent table name.
+    /// Same-process time-range partition registry keyed by canonical parent table key.
     pub time_partitions: Arc<dashmap::DashMap<String, Arc<time_partition::TimePartitionRuntime>>>,
     /// Same-process logical replication publication registry and CDC stream.
     pub logical_replication: Arc<replication::LogicalReplicationRuntime>,

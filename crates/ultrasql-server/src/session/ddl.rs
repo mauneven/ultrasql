@@ -598,9 +598,8 @@ where
         };
         self.ensure_schema_exists(namespace)?;
         self.ensure_schema_create_privilege(namespace)?;
-        let exists_persistent = snapshot
-            .tables
-            .contains_key(&ultrasql_catalog::table_lookup_key(namespace, table_name));
+        let table_key = ultrasql_catalog::table_lookup_key(namespace, table_name);
+        let exists_persistent = snapshot.tables.contains_key(&table_key);
         let exists_fallback = self
             .state
             .catalog
@@ -962,8 +961,9 @@ where
         }
         if let Some(partition) = partition {
             self.state.time_partitions.insert(
-                table_name.clone(),
+                table_key,
                 Arc::new(crate::time_partition::TimePartitionRuntime::daily(
+                    namespace.clone(),
                     table_name.clone(),
                     oid,
                     columns.clone(),
