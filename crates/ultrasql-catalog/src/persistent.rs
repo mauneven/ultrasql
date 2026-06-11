@@ -558,6 +558,32 @@ impl PersistentCatalog {
         self.snapshot.load_full()
     }
 
+    fn table_lookup_key_for_unqualified(&self, name: &str) -> String {
+        let folded = fold_name(name);
+        if self.tables_by_name.contains_key(&folded) {
+            return folded;
+        }
+        let public_key = table_lookup_key("public", name);
+        if public_key == folded {
+            folded
+        } else {
+            public_key
+        }
+    }
+
+    fn index_lookup_key_for_unqualified(&self, name: &str) -> String {
+        let folded = fold_name(name);
+        if self.indexes_by_name.contains_key(&folded) {
+            return folded;
+        }
+        let public_key = index_lookup_key("public", name);
+        if public_key == folded {
+            folded
+        } else {
+            public_key
+        }
+    }
+
     /// Atomically replace the in-memory snapshot with `snap`.
     ///
     /// The caller is responsible for also updating the `DashMap` backing
@@ -2818,7 +2844,13 @@ fn type_entry_key(entry: &impl TypeEntryKey) -> String {
 impl Catalog for PersistentCatalog {
     fn lookup_table(&self, name: &str) -> Option<TableEntry> {
         let snap = self.snapshot.load();
-        snap.tables.get(&fold_name(name)).cloned()
+        let folded = fold_name(name);
+        snap.tables.get(&folded).cloned().or_else(|| {
+            let public_key = table_lookup_key("public", name);
+            (public_key != folded)
+                .then(|| snap.tables.get(&public_key).cloned())
+                .flatten()
+        })
     }
 
     fn lookup_table_in_schema(&self, schema_name: &str, name: &str) -> Option<TableEntry> {
@@ -2840,7 +2872,13 @@ impl Catalog for PersistentCatalog {
 
     fn lookup_index(&self, name: &str) -> Option<IndexEntry> {
         let snap = self.snapshot.load();
-        snap.indexes.get(&fold_name(name)).cloned()
+        let folded = fold_name(name);
+        snap.indexes.get(&folded).cloned().or_else(|| {
+            let public_key = index_lookup_key("public", name);
+            (public_key != folded)
+                .then(|| snap.indexes.get(&public_key).cloned())
+                .flatten()
+        })
     }
 
     fn lookup_index_in_schema(&self, schema_name: &str, name: &str) -> Option<IndexEntry> {
@@ -2884,7 +2922,7 @@ impl MutableCatalog for PersistentCatalog {
     }
 
     fn drop_table(&self, name: &str) -> Result<(), CatalogError> {
-        let key = fold_name(name);
+        let key = self.table_lookup_key_for_unqualified(name);
         let _guard = self.write_lock.lock();
         let removed = self
             .tables_by_name
@@ -2941,7 +2979,7 @@ impl MutableCatalog for PersistentCatalog {
     }
 
     fn drop_index(&self, name: &str) -> Result<(), CatalogError> {
-        let key = fold_name(name);
+        let key = self.index_lookup_key_for_unqualified(name);
         let _guard = self.write_lock.lock();
         let removed = self
             .indexes_by_name
@@ -2977,7 +3015,7 @@ impl MutableCatalog for PersistentCatalog {
         name: &str,
         column: Field,
     ) -> Result<TableEntry, CatalogError> {
-        let key = fold_name(name);
+        let key = self.table_lookup_key_for_unqualified(name);
         let _guard = self.write_lock.lock();
         // Snapshot the existing entry under the write lock so the
         // schema rebuild observes a stable input even when concurrent
@@ -3009,7 +3047,7 @@ impl MutableCatalog for PersistentCatalog {
         name: &str,
         new_schema: Schema,
     ) -> Result<TableEntry, CatalogError> {
-        let key = fold_name(name);
+        let key = self.table_lookup_key_for_unqualified(name);
         let _guard = self.write_lock.lock();
         let existing = self
             .tables_by_name
@@ -3034,7 +3072,7 @@ impl MutableCatalog for PersistentCatalog {
         name: &str,
         options: Vec<(String, String)>,
     ) -> Result<TableEntry, CatalogError> {
-        let key = fold_name(name);
+        let key = self.table_lookup_key_for_unqualified(name);
         let _guard = self.write_lock.lock();
         let existing = self
             .tables_by_name
@@ -3059,7 +3097,7 @@ impl MutableCatalog for PersistentCatalog {
         old_name: &str,
         new_name: &str,
     ) -> Result<TableEntry, CatalogError> {
-        let old_key = fold_name(old_name);
+        let old_key = self.table_lookup_key_for_unqualified(old_name);
         let _guard = self.write_lock.lock();
         let existing = self
             .tables_by_name

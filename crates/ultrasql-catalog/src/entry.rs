@@ -34,10 +34,18 @@ pub fn fold_identifier(name: &str) -> String {
 /// Return the canonical table lookup key for a schema-qualified relation.
 #[must_use]
 pub fn table_lookup_key(schema_name: &str, table_name: &str) -> String {
+    fn encoded_key(schema: &str, relation: &str) -> String {
+        format!("{}:{schema}{}:{relation}", schema.len(), relation.len())
+    }
+
+    let schema = fold_identifier(schema_name);
     let table = fold_identifier(table_name);
-    match fold_identifier(schema_name).as_str() {
+    if schema.contains('.') || table.contains('.') {
+        return encoded_key(&schema, &table);
+    }
+    match schema.as_str() {
         "public" | "pg_catalog" | "information_schema" => table,
-        schema => format!("{schema}.{table}"),
+        _ => format!("{schema}.{table}"),
     }
 }
 
@@ -354,6 +362,20 @@ mod tests {
         assert_eq!(
             type_lookup_key("App", "Mood.Type"),
             type_lookup_key("app", "mood.type")
+        );
+    }
+
+    #[test]
+    fn table_lookup_key_distinguishes_dots_in_schema_and_relation_names() {
+        assert_eq!(table_lookup_key("public", "orders"), "orders");
+        assert_eq!(table_lookup_key("app", "orders"), "app.orders");
+        assert_ne!(
+            table_lookup_key("app", "events.log"),
+            table_lookup_key("app.events", "log")
+        );
+        assert_eq!(
+            table_lookup_key("App", "Events.Log"),
+            table_lookup_key("app", "events.log")
         );
     }
 }

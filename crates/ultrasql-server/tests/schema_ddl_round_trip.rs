@@ -382,6 +382,41 @@ async fn same_relation_name_is_isolated_by_schema() {
 }
 
 #[tokio::test]
+async fn relation_keys_distinguish_schema_dot_from_table_dot() {
+    let running = start_sample_server("schema_dotted_relation_key").await;
+
+    running
+        .client
+        .batch_execute(
+            "CREATE SCHEMA app; \
+             CREATE TABLE app.\"events.log\" (id INT); \
+             CREATE SCHEMA \"app.events\"; \
+             CREATE TABLE \"app.events\".log (id INT); \
+             INSERT INTO app.\"events.log\" VALUES (1); \
+             INSERT INTO \"app.events\".log VALUES (2)",
+        )
+        .await
+        .expect("dotted schema and dotted table names do not collide");
+
+    let dotted_table = running
+        .client
+        .query_one("SELECT id FROM app.\"events.log\"", &[])
+        .await
+        .expect("select dotted table name")
+        .get::<_, i32>(0);
+    let dotted_schema = running
+        .client
+        .query_one("SELECT id FROM \"app.events\".log", &[])
+        .await
+        .expect("select dotted schema name")
+        .get::<_, i32>(0);
+    assert_eq!(dotted_table, 1);
+    assert_eq!(dotted_schema, 2);
+
+    shutdown(running).await;
+}
+
+#[tokio::test]
 async fn same_type_name_is_isolated_by_schema() {
     let running = start_sample_server("schema_same_type_name").await;
 

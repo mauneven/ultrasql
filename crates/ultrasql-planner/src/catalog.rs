@@ -233,7 +233,13 @@ impl InMemoryCatalog {
 
 impl Catalog for InMemoryCatalog {
     fn lookup_table(&self, name: &str) -> Option<TableMeta> {
-        self.tables.get(&name.to_ascii_lowercase()).cloned()
+        let folded = name.to_ascii_lowercase();
+        self.tables.get(&folded).cloned().or_else(|| {
+            let public_key = ultrasql_catalog::table_lookup_key("public", name);
+            (public_key != folded)
+                .then(|| self.tables.get(&public_key).cloned())
+                .flatten()
+        })
     }
 
     fn lookup_table_in_schema(&self, schema_name: &str, name: &str) -> Option<TableMeta> {
@@ -259,7 +265,11 @@ impl Catalog for InMemoryCatalog {
     }
 
     fn lookup_index(&self, name: &str) -> bool {
-        self.indexes.contains(&name.to_ascii_lowercase())
+        let folded = name.to_ascii_lowercase();
+        self.indexes.contains(&folded) || {
+            let public_key = ultrasql_catalog::index_lookup_key("public", name);
+            public_key != folded && self.indexes.contains(&public_key)
+        }
     }
 
     fn lookup_index_in_schema(&self, schema_name: &str, name: &str) -> bool {
@@ -349,9 +359,20 @@ fn type_oid_for_data_type(data_type: &DataType) -> Option<Oid> {
 /// the query before lookup.
 impl Catalog for ultrasql_catalog::CatalogSnapshot {
     fn lookup_table(&self, name: &str) -> Option<TableMeta> {
+        let folded = name.to_ascii_lowercase();
         self.tables
-            .get(&name.to_ascii_lowercase())
+            .get(&folded)
             .map(|entry| TableMeta::with_schema_name(&entry.schema_name, entry.schema.clone()))
+            .or_else(|| {
+                let public_key = ultrasql_catalog::table_lookup_key("public", name);
+                (public_key != folded)
+                    .then(|| {
+                        self.tables.get(&public_key).map(|entry| {
+                            TableMeta::with_schema_name(&entry.schema_name, entry.schema.clone())
+                        })
+                    })
+                    .flatten()
+            })
     }
 
     fn lookup_table_in_schema(&self, schema_name: &str, name: &str) -> Option<TableMeta> {
@@ -417,7 +438,11 @@ impl Catalog for ultrasql_catalog::CatalogSnapshot {
     }
 
     fn lookup_index(&self, name: &str) -> bool {
-        self.indexes.contains_key(&name.to_ascii_lowercase())
+        let folded = name.to_ascii_lowercase();
+        self.indexes.contains_key(&folded) || {
+            let public_key = ultrasql_catalog::index_lookup_key("public", name);
+            public_key != folded && self.indexes.contains_key(&public_key)
+        }
     }
 
     fn lookup_index_in_schema(&self, schema_name: &str, name: &str) -> bool {

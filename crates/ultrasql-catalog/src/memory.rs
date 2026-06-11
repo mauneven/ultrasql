@@ -145,12 +145,46 @@ impl InMemoryCatalog {
             }
         }
     }
+
+    fn table_lookup_key_for_unqualified(&self, name: &str) -> String {
+        let folded = fold_name(name);
+        if self.tables_by_name.contains_key(&folded) {
+            return folded;
+        }
+        let public_key = table_lookup_key("public", name);
+        if public_key == folded {
+            folded
+        } else {
+            public_key
+        }
+    }
+
+    fn index_lookup_key_for_unqualified(&self, name: &str) -> String {
+        let folded = fold_name(name);
+        if self.indexes_by_name.contains_key(&folded) {
+            return folded;
+        }
+        let public_key = index_lookup_key("public", name);
+        if public_key == folded {
+            folded
+        } else {
+            public_key
+        }
+    }
 }
 
 impl Catalog for InMemoryCatalog {
     fn lookup_table(&self, name: &str) -> Option<TableEntry> {
+        let folded = fold_name(name);
+        if let Some(entry) = self.tables_by_name.get(&folded) {
+            return Some(entry.value().clone());
+        }
+        let public_key = table_lookup_key("public", name);
+        if public_key == folded {
+            return None;
+        }
         self.tables_by_name
-            .get(&fold_name(name))
+            .get(&public_key)
             .map(|r| r.value().clone())
     }
 
@@ -172,8 +206,16 @@ impl Catalog for InMemoryCatalog {
     }
 
     fn lookup_index(&self, name: &str) -> Option<IndexEntry> {
+        let folded = fold_name(name);
+        if let Some(entry) = self.indexes_by_name.get(&folded) {
+            return Some(entry.value().clone());
+        }
+        let public_key = index_lookup_key("public", name);
+        if public_key == folded {
+            return None;
+        }
         self.indexes_by_name
-            .get(&fold_name(name))
+            .get(&public_key)
             .map(|r| r.value().clone())
     }
 
@@ -201,7 +243,7 @@ impl MutableCatalog for InMemoryCatalog {
     }
 
     fn drop_table(&self, name: &str) -> Result<(), CatalogError> {
-        let key = fold_name(name);
+        let key = self.table_lookup_key_for_unqualified(name);
         // TODO(catalog-persistent): replace with a heap delete + index
         // cascade against `pg_class`, `pg_attribute`, `pg_index`.
         let removed = self
@@ -264,7 +306,7 @@ impl MutableCatalog for InMemoryCatalog {
     }
 
     fn drop_index(&self, name: &str) -> Result<(), CatalogError> {
-        let key = fold_name(name);
+        let key = self.index_lookup_key_for_unqualified(name);
         let removed = self
             .indexes_by_name
             .remove(&key)
@@ -299,7 +341,7 @@ impl MutableCatalog for InMemoryCatalog {
         name: &str,
         column: Field,
     ) -> Result<TableEntry, CatalogError> {
-        let key = fold_name(name);
+        let key = self.table_lookup_key_for_unqualified(name);
         // Capture the existing entry under the by-name shard lock so a
         // concurrent DDL cannot delete it under us between the read and
         // the write.
@@ -333,7 +375,7 @@ impl MutableCatalog for InMemoryCatalog {
         name: &str,
         new_schema: Schema,
     ) -> Result<TableEntry, CatalogError> {
-        let key = fold_name(name);
+        let key = self.table_lookup_key_for_unqualified(name);
         let existing = {
             let guard = self
                 .tables_by_name
@@ -357,7 +399,7 @@ impl MutableCatalog for InMemoryCatalog {
         name: &str,
         options: Vec<(String, String)>,
     ) -> Result<TableEntry, CatalogError> {
-        let key = fold_name(name);
+        let key = self.table_lookup_key_for_unqualified(name);
         let existing = self
             .tables_by_name
             .get(&key)
@@ -380,7 +422,7 @@ impl MutableCatalog for InMemoryCatalog {
         old_name: &str,
         new_name: &str,
     ) -> Result<TableEntry, CatalogError> {
-        let old_key = fold_name(old_name);
+        let old_key = self.table_lookup_key_for_unqualified(old_name);
         let existing = self
             .tables_by_name
             .get(&old_key)
