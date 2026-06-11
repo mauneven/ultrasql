@@ -51,6 +51,22 @@ async fn create_sequence_nextval_currval_setval_and_drop() {
     graceful_shutdown(running).await;
 }
 
+#[tokio::test]
+async fn sequence_functions_preserve_quoted_dot_in_public_name() {
+    let running = start_sample_server("sequence_dotted_public_name").await;
+    let client = &running.client;
+
+    client
+        .batch_execute("CREATE SEQUENCE \"seq.dot\" START WITH 3")
+        .await
+        .expect("create quoted dotted sequence");
+
+    assert_eq!(simple_i64(client, "SELECT nextval('\"seq.dot\"')").await, 3);
+    assert_eq!(simple_i64(client, "SELECT currval('\"seq.dot\"')").await, 3);
+
+    graceful_shutdown(running).await;
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn dropped_sequence_stays_dropped_after_restart() {
     let data_dir = tempfile::TempDir::new().expect("temp data dir");
