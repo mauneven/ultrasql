@@ -1026,15 +1026,16 @@ where
             "ultrasql.relkind".to_owned(),
             "materialized_view".to_owned(),
         ));
-        self.state.persistent_catalog.create_table(entry.clone())?;
         let view_table = ultrasql_catalog::table_lookup_key(namespace, table_name);
-
         let runtime = Arc::new(crate::MaterializedViewRuntime {
             view_table: view_table.clone(),
             source_table: source_table.to_ascii_lowercase(),
             source: source.as_ref().clone(),
             materialized_rows: std::sync::atomic::AtomicU64::new(0),
         });
+        self.state
+            .ensure_materialized_view_runtime_metadata_persistable(&runtime)?;
+        self.state.persistent_catalog.create_table(entry.clone())?;
         let attr_has_defaults = vec![false; columns.len()];
         let ddl_txn = self
             .state

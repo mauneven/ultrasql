@@ -258,6 +258,50 @@ async fn appended_materialized_view_rows_survive_restart() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn persistent_materialized_view_unmaintainable_shape_is_rejected_before_catalog_write() {
+    let data_dir = tempfile::TempDir::new().unwrap();
+
+    let running = start_persistent_server(data_dir.path(), "materialized_view_shape").await;
+    running
+        .client
+        .batch_execute("CREATE TABLE mv_shape_src (id INT NOT NULL)")
+        .await
+        .expect("create source");
+    let err = running
+        .client
+        .batch_execute(
+            "CREATE MATERIALIZED VIEW mv_shape_bad AS SELECT id + 1 AS id FROM mv_shape_src",
+        )
+        .await
+        .expect_err("persistent materialized view must reject unmaintainable source shape");
+    let msg = err
+        .as_db_error()
+        .expect("server-sent DB error")
+        .message()
+        .to_owned();
+    assert!(
+        msg.contains("materialized view") && msg.contains("restart-persistable metadata subset"),
+        "unexpected error: {err}"
+    );
+    let err = running
+        .client
+        .query("SELECT id FROM mv_shape_bad", &[])
+        .await
+        .expect_err("failed materialized view must not exist in current session");
+    assert_eq!(err.code().expect("SQLSTATE").code(), "42P01");
+    shutdown_persistent(running).await;
+
+    let running = start_persistent_server(data_dir.path(), "materialized_view_shape").await;
+    let err = running
+        .client
+        .query("SELECT id FROM mv_shape_bad", &[])
+        .await
+        .expect_err("failed materialized view must not exist after restart");
+    assert_eq!(err.code().expect("SQLSTATE").code(), "42P01");
+    shutdown_persistent(running).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn materialized_view_metadata_escapes_quoted_names_on_restart() {
     let data_dir = tempfile::TempDir::new().unwrap();
     support::make_data_dir_private(data_dir.path());

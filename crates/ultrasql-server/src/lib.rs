@@ -6756,18 +6756,30 @@ impl Server {
         write_runtime_metadata_file(&path, &out)
     }
 
+    pub(crate) fn ensure_materialized_view_runtime_metadata_persistable(
+        &self,
+        runtime: &MaterializedViewRuntime,
+    ) -> Result<Vec<usize>, ServerError> {
+        if self.materialized_view_metadata_path().is_none() {
+            return Ok(Vec::new());
+        }
+        materialized_view_projection_indices(&runtime.source).ok_or_else(|| {
+            ServerError::ddl(format!(
+                "materialized view '{}' source shape is outside restart-persistable metadata subset",
+                runtime.view_table
+            ))
+        })
+    }
+
     pub(crate) fn persist_materialized_view_runtime_metadata(
         &self,
         runtime: &MaterializedViewRuntime,
         materialized_rows: u64,
     ) -> Result<(), ServerError> {
-        let Some(projection) = materialized_view_projection_indices(&runtime.source) else {
-            tracing::warn!(
-                view = %runtime.view_table,
-                "materialized-view source shape is not restart-maintainable yet",
-            );
+        if self.materialized_view_metadata_path().is_none() {
             return Ok(());
-        };
+        }
+        let projection = self.ensure_materialized_view_runtime_metadata_persistable(runtime)?;
         let Some(view_entry) = self.persistent_catalog.lookup_table(&runtime.view_table) else {
             return Ok(());
         };
