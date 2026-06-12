@@ -35,7 +35,6 @@ use std::sync::Arc;
 
 use bytes::BytesMut;
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
-use tracing::warn;
 use ultrasql_catalog::{CatalogSnapshot, TableEntry, table_lookup_key};
 use ultrasql_core::csv::sniff_csv_text;
 use ultrasql_core::{
@@ -481,9 +480,7 @@ where
                 "COPY TO autocommit rollback after scan error",
             ));
         }
-        if let Err(e) = self.state.txn_manager.commit(txn) {
-            warn!(error = %e, "COPY TO autocommit commit failed to finalise");
-        }
+        self.finalise_read_transaction(txn, "COPY TO autocommit commit")?;
 
         encode_backend(&BackendMessage::CopyDone, &mut wire_buf);
         encode_backend(
@@ -1277,9 +1274,7 @@ where
                 ));
             }
         };
-        if let Err(e) = self.state.txn_manager.commit(txn) {
-            warn!(error = %e, "COPY query transaction commit failed");
-        }
+        self.finalise_read_transaction(txn, "COPY query transaction commit")?;
         let (payload, rows) = copy_rows_from_select_result(&result, schema, opts)?;
         match source {
             CopySource::Stdout => {
@@ -1371,9 +1366,7 @@ where
             }
             increment_copy_rows(&mut rows, "COPY TO file")?;
         }
-        if let Err(e) = self.state.txn_manager.commit(txn) {
-            warn!(error = %e, "COPY TO file scan commit failed");
-        }
+        self.finalise_read_transaction(txn, "COPY TO file scan commit")?;
         Ok((out, rows))
     }
 
@@ -1406,9 +1399,7 @@ where
             increment_copy_rows(&mut rows, "binary COPY TO")?;
         }
         append_i16_be(&mut out, -1);
-        if let Err(e) = self.state.txn_manager.commit(txn) {
-            warn!(error = %e, "binary COPY scan commit failed");
-        }
+        self.finalise_read_transaction(txn, "binary COPY scan commit")?;
         Ok((out, rows))
     }
 

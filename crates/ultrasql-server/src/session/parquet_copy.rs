@@ -12,7 +12,6 @@ use arrow_schema::{DataType as ArrowDataType, Field as ArrowField, Schema as Arr
 use parquet::arrow::ArrowWriter;
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use tokio::io::{AsyncRead, AsyncWrite};
-use tracing::warn;
 use ultrasql_catalog::TableEntry;
 use ultrasql_core::{DataType, RelationId, Schema, Value, coerce_bpchar_text};
 use ultrasql_executor::RowCodec;
@@ -96,9 +95,7 @@ where
                 "COPY TO parquet rollback after writer close error",
             ));
         }
-        if let Err(err) = self.state.txn_manager.commit(txn) {
-            warn!(error = %err, "COPY TO parquet scan commit failed");
-        }
+        self.finalise_read_transaction(txn, "COPY TO parquet scan commit")?;
         Ok(rows)
     }
 

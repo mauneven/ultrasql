@@ -2117,6 +2117,17 @@ where
         self.rollback_transaction_after_error(txn, original, context)
     }
 
+    pub(crate) fn finalise_read_transaction(
+        &self,
+        txn: Transaction,
+        context: &'static str,
+    ) -> Result<(), ServerError> {
+        self.state
+            .txn_manager
+            .commit(txn)
+            .map_err(|err| ServerError::Ddl(format!("{context}: {err}")))
+    }
+
     fn try_parse_analyze_target(&self, trimmed_sql: &str) -> Option<Option<String>> {
         if trimmed_sql.len() < "analyze".len() || !trimmed_sql[..7].eq_ignore_ascii_case("analyze")
         {
@@ -3754,6 +3765,27 @@ mod tests {
             msg.contains("transaction abort failed"),
             "abort failure hidden: {err}"
         );
+    }
+
+    #[test]
+    fn read_transaction_commit_reports_commit_failure_with_context() {
+        let session = test_session();
+        let txn = session
+            .state
+            .txn_manager
+            .begin(IsolationLevel::ReadCommitted);
+        let stale = txn.clone();
+        session.state.txn_manager.commit(txn).expect("pre-commit");
+
+        let err = session
+            .finalise_read_transaction(stale, "read cleanup commit")
+            .expect_err("stale read commit must fail");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("read cleanup commit"),
+            "context missing: {err}"
+        );
+        assert!(msg.contains("commit"), "commit failure hidden: {err}");
     }
 
     #[test]

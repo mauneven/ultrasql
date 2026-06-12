@@ -190,9 +190,7 @@ where
                 ));
             }
         };
-        if let Err(e) = self.state.txn_manager.commit(txn) {
-            tracing::warn!(error = %e, "EXPLAIN ANALYZE commit failed");
-        }
+        self.finalise_read_transaction(txn, "EXPLAIN ANALYZE commit")?;
         Ok(ExplainActuals {
             rows,
             batches: 0,
@@ -276,9 +274,7 @@ where
 
         match outcome {
             Ok(actuals) => {
-                if let Err(e) = self.state.txn_manager.commit(txn) {
-                    tracing::warn!(error = %e, "EXPLAIN ANALYZE commit failed");
-                }
+                self.finalise_read_transaction(txn, "EXPLAIN ANALYZE select commit")?;
                 Ok(actuals)
             }
             Err(e) => Err(self.rollback_explain_analyze_transaction_after_error(
@@ -496,10 +492,13 @@ where
         };
         match outcome {
             Ok(summary) => {
-                if let Err(e) = self.state.txn_manager.commit(txn) {
-                    tracing::warn!(error = %e, "EXPLAIN ANALYZE late materialization note commit failed");
+                match self.finalise_read_transaction(
+                    txn,
+                    "EXPLAIN ANALYZE late materialization note commit",
+                ) {
+                    Ok(()) => summary.note,
+                    Err(err) => format!("skipped: {err}"),
                 }
-                summary.note
             }
             Err(e) => {
                 let err = self.rollback_explain_analyze_transaction_after_error(
