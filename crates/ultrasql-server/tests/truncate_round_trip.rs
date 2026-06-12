@@ -400,6 +400,37 @@ async fn truncate_cascade_uses_foreign_key_runtime_after_restart() {
     persistent_shutdown(running).await;
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn truncate_delete_state_survives_restart() {
+    let data_dir = tempfile::TempDir::new().expect("temp dir");
+
+    let running = start_persistent_server(data_dir.path(), "truncate_durable_setup").await;
+    running
+        .client
+        .batch_execute(
+            "CREATE TABLE trunc_durable (id INT PRIMARY KEY, value INT);
+             INSERT INTO trunc_durable VALUES (1, 10), (2, 20)",
+        )
+        .await
+        .expect("create and seed durable truncate table");
+    assert_eq!(select_count(&running.client, "trunc_durable").await, 2);
+    persistent_shutdown(running).await;
+
+    let running = start_persistent_server(data_dir.path(), "truncate_durable_apply").await;
+    assert_eq!(select_count(&running.client, "trunc_durable").await, 2);
+    running
+        .client
+        .batch_execute("TRUNCATE TABLE trunc_durable")
+        .await
+        .expect("truncate durable table");
+    assert_eq!(select_count(&running.client, "trunc_durable").await, 0);
+    persistent_shutdown(running).await;
+
+    let running = start_persistent_server(data_dir.path(), "truncate_durable_verify").await;
+    assert_eq!(select_count(&running.client, "trunc_durable").await, 0);
+    persistent_shutdown(running).await;
+}
+
 /// `TRUNCATE` on an empty relation is a no-op and must succeed.
 #[tokio::test]
 async fn truncate_empty_relation_is_noop() {
