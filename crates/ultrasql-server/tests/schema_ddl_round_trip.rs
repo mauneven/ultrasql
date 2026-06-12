@@ -1251,6 +1251,72 @@ async fn drop_schema_cascade_removes_qualified_sequences() {
 }
 
 #[tokio::test]
+async fn drop_schema_cascade_removes_partitioned_tables() {
+    let running = start_sample_server("schema_partition_cascade").await;
+
+    running
+        .client
+        .batch_execute(
+            "CREATE SCHEMA app; \
+             CREATE TABLE app.metrics_schema_cascade (\
+                 ts TIMESTAMP NOT NULL, host TEXT NOT NULL, value INT NOT NULL\
+             ) PARTITION BY RANGE (ts); \
+             INSERT INTO app.metrics_schema_cascade VALUES \
+             (TIMESTAMP '2026-05-20 00:00:00', 'a', 10), \
+             (TIMESTAMP '2026-05-21 00:00:00', 'b', 20)",
+        )
+        .await
+        .expect("create and seed schema-qualified partitioned table");
+
+    assert!(
+        running
+            .server
+            .time_partitions
+            .get("app.metrics_schema_cascade")
+            .is_some(),
+        "qualified partition runtime registered before schema drop"
+    );
+
+    running
+        .client
+        .batch_execute("DROP SCHEMA app CASCADE")
+        .await
+        .expect("drop schema cascade removes partitioned table dependency");
+
+    assert!(
+        running
+            .server
+            .time_partitions
+            .get("app.metrics_schema_cascade")
+            .is_none(),
+        "schema cascade must remove partition runtime"
+    );
+    assert_eq!(
+        simple_i64(
+            &running.client,
+            "SELECT COUNT(*) FROM pg_catalog.pg_namespace WHERE nspname = 'app'",
+        )
+        .await,
+        0
+    );
+    assert_eq!(
+        simple_i64(
+            &running.client,
+            "SELECT COUNT(*) FROM information_schema.tables WHERE table_schema = 'app'",
+        )
+        .await,
+        0
+    );
+    running
+        .client
+        .simple_query("SELECT COUNT(*) FROM app.metrics_schema_cascade")
+        .await
+        .expect_err("schema cascade must remove partitioned table state");
+
+    shutdown(running).await;
+}
+
+#[tokio::test]
 async fn unqualified_drop_index_preserves_quoted_dot_in_name() {
     let running = start_sample_server("schema_dotted_index_drop").await;
 

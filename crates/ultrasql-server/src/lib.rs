@@ -5419,6 +5419,10 @@ impl Server {
         Ok(())
     }
 
+    pub(crate) fn ensure_schema_metadata_slots_persistable(&self) -> Result<(), ServerError> {
+        ensure_optional_runtime_metadata_write_slots(self.schema_metadata_path())
+    }
+
     pub(crate) fn ensure_table_runtime_constraints_metadata_persistable(
         &self,
         table_name: &str,
@@ -6242,6 +6246,10 @@ impl Server {
         self.data_dir
             .as_ref()
             .map(|dir| dir.join("pg_privileges.meta"))
+    }
+
+    pub(crate) fn ensure_privilege_metadata_slots_persistable(&self) -> Result<(), ServerError> {
+        ensure_optional_runtime_metadata_write_slots(self.privilege_metadata_path())
     }
 
     pub(crate) fn persist_privilege_metadata(&self) -> Result<(), ServerError> {

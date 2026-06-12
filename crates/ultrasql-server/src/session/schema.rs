@@ -3,7 +3,7 @@
 use std::sync::Arc;
 
 use tokio::io::{AsyncRead, AsyncWrite};
-use ultrasql_core::RelationId;
+use ultrasql_core::{RelationId, Schema};
 use ultrasql_planner::LogicalPlan;
 use ultrasql_storage::sequence::Sequence;
 use ultrasql_wal::payload::SequenceOpKind;
@@ -114,7 +114,9 @@ where
             let dependents = if *cascade {
                 dependents
                     .into_iter()
-                    .filter(|dependent| !dependent.starts_with("sequence "))
+                    .filter(|dependent| {
+                        !dependent.starts_with("sequence ") && !dependent.starts_with("table ")
+                    })
                     .collect::<Vec<_>>()
             } else {
                 dependents
@@ -128,12 +130,34 @@ where
             }
         }
         let mut cascade_sequence_names = Vec::new();
+        let mut cascade_table_names = Vec::new();
         if *cascade {
             for name in &drop_set {
+                cascade_table_names.extend(self.schema_table_names(name)?);
                 cascade_sequence_names.extend(self.schema_sequence_names(name));
             }
+            cascade_table_names.sort();
+            cascade_table_names.dedup();
             cascade_sequence_names.sort();
             cascade_sequence_names.dedup();
+            self.state.ensure_schema_metadata_slots_persistable()?;
+            if !cascade_sequence_names.is_empty() {
+                self.state
+                    .ensure_sequence_owner_metadata_slots_persistable()?;
+            }
+            if self.drop_schema_privilege_metadata_changes(&drop_set, &cascade_sequence_names) {
+                self.state.ensure_privilege_metadata_slots_persistable()?;
+            }
+            if !cascade_table_names.is_empty() {
+                self.state
+                    .ensure_drop_table_runtime_metadata_slots_persistable(&cascade_table_names)?;
+                self.execute_drop_table(&LogicalPlan::DropTable {
+                    tables: cascade_table_names.clone(),
+                    if_exists: true,
+                    cascade: true,
+                    schema: Schema::empty(),
+                })?;
+            }
         }
         let runtime_snapshot = DropSchemaRuntimeSnapshot {
             schemas: drop_set
@@ -304,6 +328,73 @@ where
         names.sort();
         names.dedup();
         names
+    }
+
+    fn schema_table_names(&self, schema_name: &str) -> Result<Vec<String>, ServerError> {
+        let snapshot = self.state.catalog_snapshot();
+        let mut names = Vec::new();
+        for table in snapshot.tables_by_oid.values() {
+            if !table.schema_name.eq_ignore_ascii_case(schema_name) {
+                continue;
+            }
+            if let Some(chunk) =
+                crate::time_partition::chunk_options_from_entry(table).map_err(ServerError::ddl)?
+            {
+                let managed_by_dropped_parent = snapshot
+                    .tables_by_oid
+                    .get(&chunk.parent_oid)
+                    .is_some_and(|parent| {
+                        parent.schema_name.eq_ignore_ascii_case(schema_name)
+                            && self.state.time_partitions.contains_key(
+                                &ultrasql_catalog::table_lookup_key(
+                                    &parent.schema_name,
+                                    &parent.name,
+                                ),
+                            )
+                    });
+                if managed_by_dropped_parent {
+                    continue;
+                }
+            }
+            names.push(ultrasql_catalog::table_lookup_key(
+                &table.schema_name,
+                &table.name,
+            ));
+        }
+        names.sort();
+        names.dedup();
+        Ok(names)
+    }
+
+    fn drop_schema_privilege_metadata_changes(
+        &self,
+        schemas: &[String],
+        sequence_names: &[String],
+    ) -> bool {
+        let grants = self.state.privilege_catalog.list_grants();
+        if grants.iter().any(|grant| {
+            (grant.object_kind == PrivilegeObjectKind::Schema
+                && schemas
+                    .iter()
+                    .any(|schema| grant.object_name.eq_ignore_ascii_case(schema)))
+                || (grant.object_kind == PrivilegeObjectKind::Sequence
+                    && sequence_names
+                        .iter()
+                        .any(|sequence| grant.object_name.eq_ignore_ascii_case(sequence)))
+        }) {
+            return true;
+        }
+        self.state
+            .privilege_catalog
+            .list_default_grants()
+            .iter()
+            .any(|grant| {
+                grant.schema_name.as_deref().is_some_and(|schema_name| {
+                    schemas
+                        .iter()
+                        .any(|schema| schema_name.eq_ignore_ascii_case(schema))
+                })
+            })
     }
 
     fn schema_dependents(&self, schema_name: &str) -> Vec<String> {
