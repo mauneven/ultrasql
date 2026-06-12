@@ -197,10 +197,9 @@ impl TwoPhaseCoordinator {
 
     /// Scan the state directory and repopulate `prepared` from disk.
     ///
-    /// Called during crash recovery / restart.  Any file that cannot be
-    /// parsed is skipped (logged as a warning in production; silently skipped
-    /// here since the tracing dependency is present but callers can layer it
-    /// on).
+    /// Called during crash recovery / restart. Any regular `.txn` file that
+    /// cannot be read or parsed fails recovery rather than silently losing an
+    /// in-doubt transaction.
     ///
     /// Returns the count of successfully restored prepared transactions.
     pub fn recover_from_disk(&self) -> Result<usize, TwoPhaseError> {
@@ -212,12 +211,14 @@ impl TwoPhaseCoordinator {
         let mut count: usize = 0;
 
         for dir_entry_result in entries {
-            let Ok(dir_entry) = dir_entry_result else {
-                continue; // skip unreadable entries
-            };
-            let Ok(file_type) = dir_entry.file_type() else {
-                continue;
-            };
+            let dir_entry = dir_entry_result.map_err(|e| TwoPhaseError::Io {
+                gid: "<state_dir>".to_owned(),
+                detail: e.to_string(),
+            })?;
+            let file_type = dir_entry.file_type().map_err(|e| TwoPhaseError::Io {
+                gid: dir_entry.file_name().to_string_lossy().into_owned(),
+                detail: e.to_string(),
+            })?;
             if !file_type.is_file() {
                 continue;
             }
@@ -227,14 +228,6 @@ impl TwoPhaseCoordinator {
                 continue;
             }
 
-            let Ok(content) = read_state_file_text(&path) else {
-                tracing::warn!(
-                    path = %path.display(),
-                    "skipping unreadable 2PC state file during recovery"
-                );
-                continue;
-            };
-
             // Derive a placeholder GID from the filename for error messages.
             let filename_gid = path
                 .file_stem()
@@ -242,20 +235,12 @@ impl TwoPhaseCoordinator {
                 .unwrap_or("<unknown>")
                 .to_owned();
 
-            let record = match parse_state_file(&content) {
-                Ok(r) => r,
-                Err(detail) => {
-                    // Skip corrupt files during recovery; they will be
-                    // investigated by the operator.
-                    tracing::warn!(
-                        path = %path.display(),
-                        %detail,
-                        "skipping corrupt 2PC state file during recovery"
-                    );
-                    let _ = filename_gid; // suppress lint
-                    continue;
-                }
-            };
+            let content = read_state_file_text(&path)
+                .map_err(|err| recovery_state_file_read_error(&filename_gid, err))?;
+            let record = parse_state_file(&content).map_err(|detail| TwoPhaseError::Corrupt {
+                gid: filename_gid.clone(),
+                detail,
+            })?;
 
             // Re-insert only if not already present (idempotent recovery).
             self.prepared
@@ -369,6 +354,20 @@ fn read_state_file_text(path: &Path) -> std::io::Result<String> {
         return Err(state_file_limit_error(path, bytes_read, limit));
     }
     Ok(content)
+}
+
+fn recovery_state_file_read_error(gid: &str, err: std::io::Error) -> TwoPhaseError {
+    if matches!(err.kind(), ErrorKind::InvalidData | ErrorKind::InvalidInput) {
+        TwoPhaseError::Corrupt {
+            gid: gid.to_owned(),
+            detail: err.to_string(),
+        }
+    } else {
+        TwoPhaseError::Io {
+            gid: gid.to_owned(),
+            detail: err.to_string(),
+        }
+    }
 }
 
 fn state_file_limit_bytes() -> u64 {
@@ -751,7 +750,20 @@ mod tests {
     }
 
     #[test]
-    fn recover_from_disk_skips_configured_oversized_state_files() {
+    fn recover_from_disk_rejects_corrupt_state_files() {
+        let dir = TempDir::new().expect("tempdir");
+        std::fs::write(dir.path().join("corrupt.txn"), "{\"gid\":\"corrupt\"").expect("state file");
+
+        let coord = TwoPhaseCoordinator::new(dir.path().to_path_buf());
+        let err = coord
+            .recover_from_disk()
+            .expect_err("corrupt state must fail recovery");
+        assert!(matches!(err, TwoPhaseError::Corrupt { gid, .. } if gid == "corrupt"));
+        assert!(coord.list_prepared().is_empty());
+    }
+
+    #[test]
+    fn recover_from_disk_rejects_configured_oversized_state_files() {
         let dir = TempDir::new().expect("tempdir");
         let mut state = String::from("{\"gid\":\"oversized\",\"xid\":702,\"prepared_at_secs\":0}");
         let padding = usize::try_from(DEFAULT_STATE_FILE_LIMIT_BYTES).unwrap() + 1;
@@ -759,7 +771,10 @@ mod tests {
         std::fs::write(dir.path().join("oversized.txn"), state).expect("state file");
 
         let coord = TwoPhaseCoordinator::new(dir.path().to_path_buf());
-        assert_eq!(coord.recover_from_disk().expect("recover"), 0);
+        let err = coord
+            .recover_from_disk()
+            .expect_err("oversized state must fail recovery");
+        assert!(matches!(err, TwoPhaseError::Corrupt { gid, .. } if gid == "oversized"));
         assert!(coord.list_prepared().is_empty());
     }
 }
