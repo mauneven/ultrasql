@@ -432,10 +432,16 @@ where
                     .clear_session_transaction_start(self.pid);
                 let xid = txn.xid;
                 if let Err(e) = self.state.heap.rollback_in_place_updates(xid) {
-                    tracing::warn!(error = %e, "in-place update rollback failed");
+                    self.txn_state = TxnState::Failed(txn);
+                    return Err(ServerError::Ddl(format!(
+                        "explicit COMMIT rollback in-place updates: {e}"
+                    )));
                 }
                 if let Err(e) = self.state.txn_manager.abort(txn) {
-                    tracing::warn!(error = %e, "explicit COMMIT (treated as rollback) failed");
+                    self.clear_pending_dml_effects();
+                    return Err(ServerError::Ddl(format!(
+                        "explicit COMMIT treated as ROLLBACK abort: {e}"
+                    )));
                 }
                 self.clear_pending_dml_effects();
                 // PostgreSQL emits the ROLLBACK tag here, not COMMIT.
@@ -470,10 +476,14 @@ where
                     .clear_session_transaction_start(self.pid);
                 let xid = txn.xid;
                 if let Err(e) = self.state.heap.rollback_in_place_updates(xid) {
-                    tracing::warn!(error = %e, "in-place update rollback failed");
+                    self.txn_state = TxnState::Failed(txn);
+                    return Err(ServerError::Ddl(format!(
+                        "explicit ROLLBACK in-place updates: {e}"
+                    )));
                 }
                 if let Err(e) = self.state.txn_manager.abort(txn) {
-                    tracing::warn!(error = %e, "explicit ROLLBACK failed");
+                    self.clear_pending_dml_effects();
+                    return Err(ServerError::Ddl(format!("explicit ROLLBACK abort: {e}")));
                 }
                 self.clear_pending_dml_effects();
                 Ok(SelectResult {
@@ -771,5 +781,45 @@ mod tests {
             "unexpected error: {err}"
         );
         assert_eq!(session.state.two_phase.list_prepared().len(), 1);
+    }
+
+    #[test]
+    fn rollback_reports_abort_failure_instead_of_success_tag() {
+        let mut session = test_session();
+        let txn = session
+            .state
+            .txn_manager
+            .begin(IsolationLevel::ReadCommitted);
+        let stale = txn.clone();
+        session.state.txn_manager.abort(txn).expect("pre-abort");
+        session.txn_state = TxnState::InTransaction(stale);
+
+        let err = session
+            .execute_rollback()
+            .expect_err("stale rollback must fail");
+        assert!(
+            err.to_string().contains("ROLLBACK"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn failed_commit_reports_abort_failure_instead_of_success_tag() {
+        let mut session = test_session();
+        let txn = session
+            .state
+            .txn_manager
+            .begin(IsolationLevel::ReadCommitted);
+        let stale = txn.clone();
+        session.state.txn_manager.abort(txn).expect("pre-abort");
+        session.txn_state = TxnState::Failed(stale);
+
+        let err = session
+            .execute_commit()
+            .expect_err("stale failed-block commit must fail");
+        assert!(
+            err.to_string().contains("COMMIT"),
+            "unexpected error: {err}"
+        );
     }
 }
