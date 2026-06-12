@@ -273,19 +273,31 @@ impl TwoPhaseCoordinator {
 
     /// Common resolution path for both commit and rollback.
     fn resolve(&self, gid: &str) -> Result<Xid, TwoPhaseError> {
-        let (_, txn) = self
+        let txn = self
             .prepared
-            .remove(gid)
+            .get(gid)
             .ok_or_else(|| TwoPhaseError::NotFound {
                 gid: gid.to_owned(),
-            })?;
+            })?
+            .clone();
 
-        // Best-effort file removal.  If the file is missing (e.g. after
-        // crash-recovery where we recovered from disk but the file was already
-        // cleaned up), that is not an error.
-        let _ = fs::remove_file(&txn.state_file);
+        match fs::remove_file(&txn.state_file) {
+            Ok(()) => {}
+            Err(err) if err.kind() == ErrorKind::NotFound => {}
+            Err(err) => {
+                return Err(TwoPhaseError::Io {
+                    gid: gid.to_owned(),
+                    detail: err.to_string(),
+                });
+            }
+        }
 
-        Ok(txn.xid)
+        self.prepared
+            .remove(gid)
+            .map(|(_, txn)| txn.xid)
+            .ok_or_else(|| TwoPhaseError::NotFound {
+                gid: gid.to_owned(),
+            })
     }
 
     /// Construct the canonical state file path for a GID.
@@ -595,6 +607,22 @@ mod tests {
         let rolled_xid = coord.rollback_prepared("txn-2").unwrap();
         assert_eq!(rolled_xid, xid(200));
         assert!(coord.list_prepared().is_empty());
+    }
+
+    #[test]
+    fn rollback_prepared_keeps_entry_when_state_file_removal_fails() {
+        let (coord, _dir) = make_coordinator();
+
+        coord.prepare("stuck", xid(201)).unwrap();
+        let state_file = coord.list_prepared()[0].state_file.clone();
+        std::fs::remove_file(&state_file).expect("remove state file");
+        std::fs::create_dir(&state_file).expect("replace state file with directory");
+
+        let err = coord
+            .rollback_prepared("stuck")
+            .expect_err("failed state removal must abort resolution");
+        assert!(matches!(err, TwoPhaseError::Io { gid, .. } if gid == "stuck"));
+        assert_eq!(coord.list_prepared().len(), 1);
     }
 
     // ── duplicate GID rejected ───────────────────────────────────────────────
