@@ -36,6 +36,7 @@ async fn dropped_table_stays_dropped_after_restart() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn dropped_table_is_removed_from_runtime_metadata() {
     let data_dir = tempfile::TempDir::new().unwrap();
+    support::make_data_dir_private(data_dir.path());
     let metadata_path = data_dir.path().join("pg_table_runtime.meta");
 
     let running = start_persistent_server(data_dir.path(), "drop_runtime_meta_test").await;
@@ -67,6 +68,7 @@ async fn dropped_table_is_removed_from_runtime_metadata() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn table_runtime_metadata_rejects_duplicate_table_rows_on_rebuild() {
     let data_dir = tempfile::TempDir::new().unwrap();
+    support::make_data_dir_private(data_dir.path());
     let metadata_path = data_dir.path().join("pg_table_runtime.meta");
 
     let running = start_persistent_server(data_dir.path(), "table_runtime_duplicate_meta").await;
@@ -98,6 +100,7 @@ async fn table_runtime_metadata_rejects_duplicate_table_rows_on_rebuild() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn table_runtime_metadata_rejects_unknown_table_rows_on_rebuild() {
     let data_dir = tempfile::TempDir::new().unwrap();
+    support::make_data_dir_private(data_dir.path());
     let metadata_path = data_dir.path().join("pg_table_runtime.meta");
 
     let running = start_persistent_server(data_dir.path(), "table_runtime_unknown_meta").await;
@@ -124,6 +127,7 @@ async fn table_runtime_metadata_rejects_unknown_table_rows_on_rebuild() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn table_runtime_metadata_rejects_orphan_constraint_rows_on_rebuild() {
     let data_dir = tempfile::TempDir::new().unwrap();
+    support::make_data_dir_private(data_dir.path());
     let metadata_path = data_dir.path().join("pg_table_runtime.meta");
 
     let running = start_persistent_server(data_dir.path(), "table_runtime_orphan_constraint").await;
@@ -157,6 +161,7 @@ async fn table_runtime_metadata_rejects_orphan_constraint_rows_on_rebuild() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn table_runtime_metadata_rejects_duplicate_default_rows_on_rebuild() {
     let data_dir = tempfile::TempDir::new().unwrap();
+    support::make_data_dir_private(data_dir.path());
     let metadata_path = data_dir.path().join("pg_table_runtime.meta");
 
     let running = start_persistent_server(data_dir.path(), "table_runtime_duplicate_default").await;
@@ -189,6 +194,7 @@ async fn table_runtime_metadata_rejects_duplicate_default_rows_on_rebuild() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn table_runtime_metadata_rejects_duplicate_sequence_default_rows_on_rebuild() {
     let data_dir = tempfile::TempDir::new().unwrap();
+    support::make_data_dir_private(data_dir.path());
     let metadata_path = data_dir.path().join("pg_table_runtime.meta");
 
     let running =
@@ -223,6 +229,7 @@ async fn table_runtime_metadata_rejects_duplicate_sequence_default_rows_on_rebui
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn table_runtime_metadata_rejects_duplicate_identity_rows_on_rebuild() {
     let data_dir = tempfile::TempDir::new().unwrap();
+    support::make_data_dir_private(data_dir.path());
     let metadata_path = data_dir.path().join("pg_table_runtime.meta");
 
     let running =
@@ -259,6 +266,7 @@ async fn table_runtime_metadata_rejects_duplicate_identity_rows_on_rebuild() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn table_runtime_metadata_rejects_duplicate_generated_rows_on_rebuild() {
     let data_dir = tempfile::TempDir::new().unwrap();
+    support::make_data_dir_private(data_dir.path());
     let metadata_path = data_dir.path().join("pg_table_runtime.meta");
 
     let running =
@@ -295,6 +303,7 @@ async fn table_runtime_metadata_rejects_duplicate_generated_rows_on_rebuild() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn table_runtime_metadata_rejects_duplicate_check_rows_on_rebuild() {
     let data_dir = tempfile::TempDir::new().unwrap();
+    support::make_data_dir_private(data_dir.path());
     let metadata_path = data_dir.path().join("pg_table_runtime.meta");
 
     let running = start_persistent_server(data_dir.path(), "table_runtime_duplicate_check").await;
@@ -330,6 +339,7 @@ async fn table_runtime_metadata_rejects_duplicate_check_rows_on_rebuild() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn table_runtime_metadata_rejects_duplicate_foreign_key_rows_on_rebuild() {
     let data_dir = tempfile::TempDir::new().unwrap();
+    support::make_data_dir_private(data_dir.path());
     let metadata_path = data_dir.path().join("pg_table_runtime.meta");
 
     let running =
@@ -368,6 +378,7 @@ async fn table_runtime_metadata_rejects_duplicate_foreign_key_rows_on_rebuild() 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn table_runtime_metadata_rejects_mismatched_foreign_key_target_on_rebuild() {
     let data_dir = tempfile::TempDir::new().unwrap();
+    support::make_data_dir_private(data_dir.path());
     let metadata_path = data_dir.path().join("pg_table_runtime.meta");
 
     let running =
@@ -408,6 +419,7 @@ async fn table_runtime_metadata_rejects_mismatched_foreign_key_target_on_rebuild
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn table_runtime_metadata_rejects_duplicate_exclusion_rows_on_rebuild() {
     let data_dir = tempfile::TempDir::new().unwrap();
+    support::make_data_dir_private(data_dir.path());
     let metadata_path = data_dir.path().join("pg_table_runtime.meta");
 
     let running =

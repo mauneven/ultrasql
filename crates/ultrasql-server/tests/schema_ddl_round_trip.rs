@@ -90,6 +90,7 @@ async fn create_drop_schema_survives_restart_and_blocks_owner_drop() {
 #[test]
 fn schema_metadata_rejects_unknown_owner_on_rebuild() {
     let data_dir = tempfile::TempDir::new().expect("temp data dir");
+    support::make_data_dir_private(data_dir.path());
     std::fs::write(
         data_dir.path().join("pg_schema_runtime.meta"),
         concat!(

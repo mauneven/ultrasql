@@ -260,6 +260,7 @@ async fn appended_materialized_view_rows_survive_restart() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn materialized_view_metadata_escapes_quoted_names_on_restart() {
     let data_dir = tempfile::TempDir::new().unwrap();
+    support::make_data_dir_private(data_dir.path());
     let metadata_path = data_dir.path().join("pg_materialized_views.meta");
 
     let running = start_persistent_server(data_dir.path(), "materialized_view_quoted_setup").await;
@@ -440,6 +441,7 @@ async fn drop_materialized_view_clears_runtime_dependency() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn drop_materialized_view_removes_restart_metadata() {
     let data_dir = tempfile::TempDir::new().unwrap();
+    support::make_data_dir_private(data_dir.path());
     let metadata_path = data_dir.path().join("pg_materialized_views.meta");
 
     let running = start_persistent_server(data_dir.path(), "materialized_view_drop_meta").await;
@@ -483,6 +485,7 @@ async fn drop_materialized_view_removes_restart_metadata() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn materialized_view_metadata_rejects_duplicate_views_on_rebuild() {
     let data_dir = tempfile::TempDir::new().unwrap();
+    support::make_data_dir_private(data_dir.path());
     let metadata_path = data_dir.path().join("pg_materialized_views.meta");
 
     let running =
@@ -528,6 +531,7 @@ async fn materialized_view_metadata_rejects_duplicate_views_on_rebuild() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn materialized_view_metadata_rejects_mismatched_source_on_rebuild() {
     let data_dir = tempfile::TempDir::new().unwrap();
+    support::make_data_dir_private(data_dir.path());
     let metadata_path = data_dir.path().join("pg_materialized_views.meta");
 
     let running =
@@ -575,6 +579,7 @@ async fn materialized_view_metadata_rejects_mismatched_source_on_rebuild() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn materialized_view_metadata_rejects_projection_type_mismatch_on_rebuild() {
     let data_dir = tempfile::TempDir::new().unwrap();
+    support::make_data_dir_private(data_dir.path());
     let metadata_path = data_dir.path().join("pg_materialized_views.meta");
 
     let running =

@@ -10,8 +10,10 @@ use ultrasql_storage::page::Page;
 use ultrasql_wal::payload::{SequenceOpKind, SequenceOpPayload};
 use ultrasql_wal::{HeapTarget, RecordType, WalRecord};
 
+#[cfg(unix)]
+use super::super::prepare_secure_data_dir;
 use super::super::{
-    BlankPageLoader, Server, ServerRecoveryTarget, capped_text_take_limit, prepare_secure_data_dir,
+    BlankPageLoader, Server, ServerRecoveryTarget, capped_text_take_limit,
     recovery_replay_target_from_data_dir,
 };
 

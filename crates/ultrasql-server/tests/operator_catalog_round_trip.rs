@@ -2,7 +2,7 @@ pub mod support;
 
 use ultrasql_server::Server;
 
-use support::{shutdown, start_persistent_server};
+use support::{make_data_dir_private, shutdown, start_persistent_server};
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn create_operator_catalog_survives_restart() {
@@ -48,6 +48,7 @@ async fn create_operator_catalog_survives_restart() {
 #[test]
 fn operator_catalog_rejects_unknown_runtime_procedure_on_rebuild() {
     let data_dir = tempfile::TempDir::new().expect("temp data dir");
+    make_data_dir_private(data_dir.path());
     std::fs::write(
         data_dir.path().join("pg_operator_runtime.meta"),
         "# ultrasql operator runtime v1\noperator\t90000\tpg_catalog\t===\tbool\tbool\tevil\tbool\n",
@@ -64,6 +65,7 @@ fn operator_catalog_rejects_unknown_runtime_procedure_on_rebuild() {
 #[test]
 fn operator_catalog_rejects_duplicate_runtime_signature_on_rebuild() {
     let data_dir = tempfile::TempDir::new().expect("temp data dir");
+    make_data_dir_private(data_dir.path());
     std::fs::write(
         data_dir.path().join("pg_operator_runtime.meta"),
         concat!(

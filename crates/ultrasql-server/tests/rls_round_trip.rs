@@ -497,6 +497,7 @@ async fn rls_tenant_policy_survives_restart() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn drop_table_removes_rls_restart_metadata() {
     let data_dir = tempfile::TempDir::new().unwrap();
+    support::make_data_dir_private(data_dir.path());
     let metadata_path = data_dir.path().join("pg_row_security.meta");
 
     let running = start_persistent_server(data_dir.path(), "rls_drop_metadata").await;
@@ -531,6 +532,7 @@ async fn drop_table_removes_rls_restart_metadata() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn rls_metadata_rejects_duplicate_policy_names_on_rebuild() {
     let data_dir = tempfile::TempDir::new().unwrap();
+    support::make_data_dir_private(data_dir.path());
     let metadata_path = data_dir.path().join("pg_row_security.meta");
 
     let running = start_persistent_server(data_dir.path(), "rls_duplicate_policy_setup").await;
@@ -564,6 +566,7 @@ async fn rls_metadata_rejects_duplicate_policy_names_on_rebuild() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn rls_metadata_rejects_duplicate_table_rows_on_rebuild() {
     let data_dir = tempfile::TempDir::new().unwrap();
+    support::make_data_dir_private(data_dir.path());
     let metadata_path = data_dir.path().join("pg_row_security.meta");
 
     let running = start_persistent_server(data_dir.path(), "rls_duplicate_table_setup").await;
@@ -595,6 +598,7 @@ async fn rls_metadata_rejects_duplicate_table_rows_on_rebuild() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn rls_metadata_rejects_unknown_table_rows_on_rebuild() {
     let data_dir = tempfile::TempDir::new().unwrap();
+    support::make_data_dir_private(data_dir.path());
     let metadata_path = data_dir.path().join("pg_row_security.meta");
 
     let running = start_persistent_server(data_dir.path(), "rls_unknown_table_setup").await;
@@ -620,6 +624,7 @@ async fn rls_metadata_rejects_unknown_table_rows_on_rebuild() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn rls_metadata_rejects_unknown_table_owner_on_rebuild() {
     let data_dir = tempfile::TempDir::new().unwrap();
+    support::make_data_dir_private(data_dir.path());
     let metadata_path = data_dir.path().join("pg_row_security.meta");
 
     let running = start_persistent_server(data_dir.path(), "rls_unknown_owner_setup").await;
@@ -659,6 +664,7 @@ async fn rls_metadata_rejects_unknown_table_owner_on_rebuild() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn rls_metadata_rejects_unknown_policy_roles_on_rebuild() {
     let data_dir = tempfile::TempDir::new().unwrap();
+    support::make_data_dir_private(data_dir.path());
     let metadata_path = data_dir.path().join("pg_row_security.meta");
 
     let running = start_persistent_server(data_dir.path(), "rls_unknown_role_setup").await;
@@ -699,6 +705,7 @@ async fn rls_metadata_rejects_unknown_policy_roles_on_rebuild() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn rls_metadata_rejects_invalid_policy_columns_on_rebuild() {
     let data_dir = tempfile::TempDir::new().unwrap();
+    support::make_data_dir_private(data_dir.path());
     let metadata_path = data_dir.path().join("pg_row_security.meta");
 
     let running = start_persistent_server(data_dir.path(), "rls_bad_column_setup").await;

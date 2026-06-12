@@ -58,6 +58,20 @@ pub async fn connect_as(
     (client, handle)
 }
 
+pub fn make_data_dir_private(path: &Path) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))
+            .expect("chmod temp data dir");
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+    }
+}
+
 async fn start_server(server: Arc<Server>, application_name: &str) -> RunningServer {
     let addr: SocketAddr = "127.0.0.1:0".parse().expect("addr parses");
     let (listener, bound) = bind_listener(addr).await.expect("bind");

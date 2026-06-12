@@ -189,6 +189,7 @@ async fn domain_catalog_constraints_coercions_and_wire_survive_restart() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn domain_metadata_rejects_duplicate_domain_rows_on_rebuild() {
     let data_dir = tempfile::TempDir::new().unwrap();
+    support::make_data_dir_private(data_dir.path());
     let metadata_path = data_dir.path().join("pg_domain_runtime.meta");
 
     let running = start_persistent_server(data_dir.path(), "domain_duplicate_meta").await;
@@ -220,6 +221,7 @@ async fn domain_metadata_rejects_duplicate_domain_rows_on_rebuild() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn domain_metadata_rejects_duplicate_check_rows_on_rebuild() {
     let data_dir = tempfile::TempDir::new().unwrap();
+    support::make_data_dir_private(data_dir.path());
     let metadata_path = data_dir.path().join("pg_domain_runtime.meta");
 
     let running = start_persistent_server(data_dir.path(), "domain_duplicate_check").await;
@@ -254,6 +256,7 @@ async fn domain_metadata_rejects_duplicate_check_rows_on_rebuild() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn domain_metadata_rejects_orphan_check_rows_on_rebuild() {
     let data_dir = tempfile::TempDir::new().unwrap();
+    support::make_data_dir_private(data_dir.path());
     let metadata_path = data_dir.path().join("pg_domain_runtime.meta");
 
     let running = start_persistent_server(data_dir.path(), "domain_orphan_check").await;

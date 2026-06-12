@@ -77,6 +77,14 @@ struct Cli {
     #[arg(long, env = "ULTRASQL_OPS_TOKEN")]
     ops_token: Option<String>,
 
+    /// PostgreSQL startup user that must authenticate with MD5.
+    #[arg(long, env = "ULTRASQL_AUTH_USER")]
+    auth_user: Option<String>,
+
+    /// File containing the MD5 authentication password for `--auth-user`.
+    #[arg(long, env = "ULTRASQL_AUTH_PASSWORD_FILE")]
+    auth_password_file: Option<PathBuf>,
+
     /// Tracing level filter, e.g. `info`, `debug`, `ultrasqld=trace`.
     #[arg(long, default_value = "info")]
     log_level: String,
@@ -205,6 +213,8 @@ Supported query shapes in v0.5:
 Production-oriented v0.9 flags:
   - --data-dir DIR      boot WAL-backed storage
   - --allow-insecure-listen  permit trust-auth listener outside loopback
+  - --auth-user USER    require MD5 password auth for this PostgreSQL user
+  - --auth-password-file PATH  read MD5 auth password from a local secret file
   - --ops-listen ADDR   serve /health, /ready, /metrics, and backup routes
   - --ops-token TOKEN   require bearer token for /backup/start and /backup/stop
   - --log-format json   emit structured logs
@@ -234,6 +244,13 @@ fn main() -> std::process::ExitCode {
         Ok(config) => config,
         Err(e) => {
             error!(target: "ultrasqld", error = %e, "invalid logging configuration");
+            return std::process::ExitCode::from(1);
+        }
+    };
+    let auth_config = match auth_config_from_cli(&cli) {
+        Ok(config) => config,
+        Err(e) => {
+            error!(target: "ultrasqld", error = %e, "invalid auth configuration");
             return std::process::ExitCode::from(1);
         }
     };
@@ -294,6 +311,7 @@ fn main() -> std::process::ExitCode {
                     server.set_logging_config(logging_config);
                     server.set_idle_session_timeout_ms(cli.idle_session_timeout_ms);
                     server.set_wal_archive_config(wal_archive_config.clone());
+                    server = apply_auth_config(server, &auth_config);
                     Arc::new(server)
                 }
                 Err(e) => {
@@ -308,6 +326,7 @@ fn main() -> std::process::ExitCode {
             server.set_logging_config(logging_config);
             server.set_idle_session_timeout_ms(cli.idle_session_timeout_ms);
             server.set_wal_archive_config(wal_archive_config);
+            server = apply_auth_config(server, &auth_config);
             Arc::new(server)
         }
     };
@@ -789,6 +808,56 @@ fn ops_token_from_cli(cli: &Cli) -> Result<Option<Arc<str>>, String> {
     Ok(Some(Arc::<str>::from(token)))
 }
 
+fn auth_config_from_cli(cli: &Cli) -> Result<Option<(String, String)>, String> {
+    match (cli.auth_user.as_deref(), cli.auth_password_file.as_deref()) {
+        (None, None) => Ok(None),
+        (Some(_), None) => Err("auth_password_file is required when auth_user is set".to_string()),
+        (None, Some(_)) => Err("auth_user is required when auth_password_file is set".to_string()),
+        (Some(user), Some(password_file)) => {
+            validate_auth_user(user)?;
+            let raw = fs::read_to_string(password_file).map_err(|err| {
+                format!("read auth_password_file {}: {err}", password_file.display())
+            })?;
+            let password = raw.strip_suffix('\n').unwrap_or(raw.as_str());
+            validate_auth_password(password)?;
+            Ok(Some((user.to_owned(), password.to_owned())))
+        }
+    }
+}
+
+fn validate_auth_user(user: &str) -> Result<(), String> {
+    if user.is_empty() {
+        return Err("auth_user must not be empty".to_string());
+    }
+    if user
+        .bytes()
+        .any(|b| b.is_ascii_control() || b.is_ascii_whitespace())
+    {
+        return Err("auth_user must not contain whitespace or control bytes".to_string());
+    }
+    Ok(())
+}
+
+fn validate_auth_password(password: &str) -> Result<(), String> {
+    if password.len() < 12 {
+        return Err("auth password must be at least 12 bytes".to_string());
+    }
+    if password
+        .bytes()
+        .any(|b| b.is_ascii_control() || b.is_ascii_whitespace())
+    {
+        return Err("auth password must not contain whitespace or control bytes".to_string());
+    }
+    Ok(())
+}
+
+fn apply_auth_config(mut server: Server, auth_config: &Option<(String, String)>) -> Server {
+    if let Some((username, password)) = auth_config {
+        server = server.require_md5_password(username.clone(), password.clone());
+    }
+    server
+}
+
 fn logging_config_from_cli(cli: &Cli) -> Result<LoggingConfig, String> {
     if cli.log_min_duration_statement_ms < -1 {
         return Err("log_min_duration_statement_ms must be -1 or greater".to_string());
@@ -801,13 +870,17 @@ fn logging_config_from_cli(cli: &Cli) -> Result<LoggingConfig, String> {
 }
 
 fn listen_security_from_cli(cli: &Cli) -> Result<(), String> {
-    if cli.listen.ip().is_loopback() || cli.allow_insecure_listen {
+    if cli.listen.ip().is_loopback() || cli.allow_insecure_listen || cli_has_password_auth(cli) {
         return Ok(());
     }
     Err(format!(
         "PostgreSQL listener {} uses trust authentication on a non-loopback address; bind to 127.0.0.1/::1 or pass --allow-insecure-listen for isolated test networks",
         cli.listen
     ))
+}
+
+fn cli_has_password_auth(cli: &Cli) -> bool {
+    cli.auth_user.is_some() && cli.auth_password_file.is_some()
 }
 
 fn apply_startup_signal_files(state: &Server, data_dir: &Path) -> bool {
@@ -1480,6 +1553,8 @@ mod tests {
             data_dir: None,
             ops_listen: None,
             ops_token: None,
+            auth_user: None,
+            auth_password_file: None,
             log_level: "info".to_owned(),
             log_format: LogFormat::Text,
             log_connections: false,
@@ -1515,6 +1590,8 @@ mod tests {
             data_dir: None,
             ops_listen: None,
             ops_token: None,
+            auth_user: None,
+            auth_password_file: None,
             log_level: "info".to_owned(),
             log_format: LogFormat::Text,
             log_connections: false,
@@ -1545,6 +1622,8 @@ mod tests {
             data_dir: None,
             ops_listen: None,
             ops_token: None,
+            auth_user: None,
+            auth_password_file: None,
             log_level: "info".to_owned(),
             log_format: LogFormat::Text,
             log_connections: false,
@@ -1575,6 +1654,8 @@ mod tests {
             data_dir: None,
             ops_listen: None,
             ops_token: None,
+            auth_user: None,
+            auth_password_file: None,
             log_level: "info".to_owned(),
             log_format: LogFormat::Json,
             log_connections: true,
@@ -1609,6 +1690,8 @@ mod tests {
             data_dir: None,
             ops_listen: None,
             ops_token: None,
+            auth_user: None,
+            auth_password_file: None,
             log_level: "info".to_owned(),
             log_format: LogFormat::Text,
             log_connections: false,
@@ -1643,6 +1726,118 @@ mod tests {
     }
 
     #[test]
+    fn md5_auth_from_cli_reads_password_file_and_secures_wildcard_listener() {
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let password_file = dir.path().join("password");
+        std::fs::write(&password_file, "very-secret-password\n").expect("write password");
+        let cli = Cli {
+            listen: "0.0.0.0:5433".parse().expect("listen addr"),
+            allow_insecure_listen: false,
+            data_dir: None,
+            ops_listen: None,
+            ops_token: None,
+            auth_user: Some("alice".to_owned()),
+            auth_password_file: Some(password_file),
+            log_level: "info".to_owned(),
+            log_format: LogFormat::Text,
+            log_connections: false,
+            log_min_duration_statement_ms: -1,
+            log_statement: CliLogStatementMode::None,
+            idle_session_timeout_ms: 0,
+            autovacuum_interval_ms: 1000,
+            autovacuum_vacuum_threshold: 50,
+            autovacuum_vacuum_scale_factor: 0.2,
+            autovacuum_analyze_threshold: 50,
+            autovacuum_analyze_scale_factor: 0.1,
+            archive_command: None,
+            restore_command: None,
+            restore_max_segments: 0,
+            archive_interval_ms: 1000,
+            archive_command_timeout_ms: 60_000,
+            restore_command_timeout_ms: 60_000,
+        };
+
+        let auth = auth_config_from_cli(&cli).expect("password file auth config");
+
+        assert_eq!(
+            auth,
+            Some(("alice".to_owned(), "very-secret-password".to_owned()))
+        );
+        assert!(listen_security_from_cli(&cli).is_ok());
+    }
+
+    #[test]
+    fn apply_auth_config_enables_md5_password_auth() {
+        let server = apply_auth_config(
+            Server::with_sample_database(),
+            &Some(("alice".to_owned(), "very-secret-password".to_owned())),
+        );
+
+        match &server.auth {
+            ultrasql_server::AuthConfig::Md5 { username, password } => {
+                assert_eq!(username, "alice");
+                assert_eq!(password, "very-secret-password");
+            }
+            other => panic!("expected MD5 auth, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn md5_auth_from_cli_rejects_partial_or_dirty_password_config() {
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let password_file = dir.path().join("password");
+        std::fs::write(&password_file, "short\n").expect("write short password");
+        let mut cli = Cli {
+            listen: "127.0.0.1:5433".parse().expect("listen addr"),
+            allow_insecure_listen: false,
+            data_dir: None,
+            ops_listen: None,
+            ops_token: None,
+            auth_user: Some("alice".to_owned()),
+            auth_password_file: None,
+            log_level: "info".to_owned(),
+            log_format: LogFormat::Text,
+            log_connections: false,
+            log_min_duration_statement_ms: -1,
+            log_statement: CliLogStatementMode::None,
+            idle_session_timeout_ms: 0,
+            autovacuum_interval_ms: 1000,
+            autovacuum_vacuum_threshold: 50,
+            autovacuum_vacuum_scale_factor: 0.2,
+            autovacuum_analyze_threshold: 50,
+            autovacuum_analyze_scale_factor: 0.1,
+            archive_command: None,
+            restore_command: None,
+            restore_max_segments: 0,
+            archive_interval_ms: 1000,
+            archive_command_timeout_ms: 60_000,
+            restore_command_timeout_ms: 60_000,
+        };
+
+        let err = auth_config_from_cli(&cli).expect_err("partial auth config rejected");
+        assert!(
+            err.contains("auth_password_file"),
+            "expected missing password-file rejection, got {err}"
+        );
+
+        cli.auth_password_file = Some(password_file);
+        let err = auth_config_from_cli(&cli).expect_err("weak password rejected");
+        assert!(
+            err.contains("at least 12 bytes"),
+            "expected weak password rejection, got {err}"
+        );
+
+        let dirty_file = dir.path().join("dirty-password");
+        std::fs::write(&dirty_file, "valid-password\r\n").expect("write dirty password");
+        cli.auth_password_file = Some(dirty_file);
+        let err = auth_config_from_cli(&cli).expect_err("dirty password rejected");
+        assert!(
+            err.contains("control bytes"),
+            "expected control-byte rejection, got {err}"
+        );
+    }
+
+    #[test]
     fn ops_token_from_cli_rejects_weak_tokens() {
         let mut cli = Cli {
             listen: "127.0.0.1:5433".parse().expect("listen addr"),
@@ -1650,6 +1845,8 @@ mod tests {
             data_dir: None,
             ops_listen: None,
             ops_token: None,
+            auth_user: None,
+            auth_password_file: None,
             log_level: "info".to_owned(),
             log_format: LogFormat::Text,
             log_connections: false,

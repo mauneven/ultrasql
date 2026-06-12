@@ -498,6 +498,7 @@ async fn connection_limit_rejects_second_live_session() {
 #[test]
 fn role_metadata_rejects_duplicate_role_names_on_rebuild() {
     let data_dir = tempfile::TempDir::new().expect("temp data dir");
+    support::make_data_dir_private(data_dir.path());
     std::fs::write(
         data_dir.path().join("pg_auth.meta"),
         concat!(
@@ -518,6 +519,7 @@ fn role_metadata_rejects_duplicate_role_names_on_rebuild() {
 #[test]
 fn role_metadata_rejects_empty_role_names_on_rebuild() {
     let data_dir = tempfile::TempDir::new().expect("temp data dir");
+    support::make_data_dir_private(data_dir.path());
     std::fs::write(
         data_dir.path().join("pg_auth.meta"),
         concat!(
@@ -540,6 +542,7 @@ fn role_metadata_rejects_empty_role_names_on_rebuild() {
 #[test]
 fn role_metadata_rejects_zero_role_oids_on_rebuild() {
     let data_dir = tempfile::TempDir::new().expect("temp data dir");
+    support::make_data_dir_private(data_dir.path());
     std::fs::write(
         data_dir.path().join("pg_auth.meta"),
         concat!(
@@ -562,6 +565,7 @@ fn role_metadata_rejects_zero_role_oids_on_rebuild() {
 #[test]
 fn role_metadata_rejects_missing_bootstrap_role_on_rebuild() {
     let data_dir = tempfile::TempDir::new().expect("temp data dir");
+    support::make_data_dir_private(data_dir.path());
     std::fs::write(
         data_dir.path().join("pg_auth.meta"),
         concat!(
@@ -584,6 +588,7 @@ fn role_metadata_rejects_missing_bootstrap_role_on_rebuild() {
 #[test]
 fn role_metadata_rejects_wrong_bootstrap_oid_on_rebuild() {
     let data_dir = tempfile::TempDir::new().expect("temp data dir");
+    support::make_data_dir_private(data_dir.path());
     std::fs::write(
         data_dir.path().join("pg_auth.meta"),
         concat!(
@@ -606,6 +611,7 @@ fn role_metadata_rejects_wrong_bootstrap_oid_on_rebuild() {
 #[test]
 fn role_metadata_rejects_demoted_bootstrap_role_on_rebuild() {
     let data_dir = tempfile::TempDir::new().expect("temp data dir");
+    support::make_data_dir_private(data_dir.path());
     std::fs::write(
         data_dir.path().join("pg_auth.meta"),
         concat!(
@@ -629,6 +635,7 @@ fn role_metadata_rejects_demoted_bootstrap_role_on_rebuild() {
 #[test]
 fn role_metadata_rejects_duplicate_memberships_on_rebuild() {
     let data_dir = tempfile::TempDir::new().expect("temp data dir");
+    support::make_data_dir_private(data_dir.path());
     std::fs::write(
         data_dir.path().join("pg_auth.meta"),
         concat!(
@@ -652,6 +659,7 @@ fn role_metadata_rejects_duplicate_memberships_on_rebuild() {
 #[test]
 fn role_metadata_rejects_memberships_with_unknown_roles_on_rebuild() {
     let data_dir = tempfile::TempDir::new().expect("temp data dir");
+    support::make_data_dir_private(data_dir.path());
     std::fs::write(
         data_dir.path().join("pg_auth.meta"),
         concat!(
@@ -1087,6 +1095,7 @@ async fn role_catalog_rolls_back_when_metadata_slot_is_unsafe() {
     use std::os::unix::fs::symlink;
 
     let data_dir = tempfile::TempDir::new().expect("temp data dir");
+    support::make_data_dir_private(data_dir.path());
     let outside = data_dir.path().join("outside-auth-meta");
     std::fs::write(&outside, b"keep").expect("outside metadata target");
 

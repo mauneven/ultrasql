@@ -2042,6 +2042,7 @@ async fn run_ctl(
 ) -> Result<()> {
     match cmd {
         CtlCommand::Initdb => {
+            prepare_initdb_data_dir(data_dir)?;
             fs::create_dir_all(data_dir.join("base"))?;
             fs::create_dir_all(data_dir.join("pg_wal"))?;
             fs::create_dir_all(data_dir.join("global"))?;
@@ -2117,6 +2118,36 @@ async fn run_ctl(
             println!("stop requested; send SIGTERM through service manager");
         }
     }
+    Ok(())
+}
+
+fn prepare_initdb_data_dir(data_dir: &Path) -> Result<()> {
+    match fs::symlink_metadata(data_dir) {
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            anyhow::bail!("data directory {} is a symlink", data_dir.display());
+        }
+        Ok(metadata) if metadata.file_type().is_dir() => {}
+        Ok(_) => anyhow::bail!("data directory {} is not a directory", data_dir.display()),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => fs::create_dir_all(data_dir)
+            .with_context(|| format!("create data directory {}", data_dir.display()))?,
+        Err(err) => {
+            return Err(err)
+                .with_context(|| format!("inspect data directory {}", data_dir.display()));
+        }
+    }
+    set_private_data_dir_permissions(data_dir)
+}
+
+#[cfg(unix)]
+fn set_private_data_dir_permissions(data_dir: &Path) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    fs::set_permissions(data_dir, fs::Permissions::from_mode(0o700))
+        .with_context(|| format!("chmod 700 data directory {}", data_dir.display()))
+}
+
+#[cfg(not(unix))]
+fn set_private_data_dir_permissions(_data_dir: &Path) -> Result<()> {
     Ok(())
 }
 

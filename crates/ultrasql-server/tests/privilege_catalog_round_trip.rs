@@ -896,6 +896,7 @@ async fn privilege_ddl_rejects_unknown_roles_with_undefined_object() {
 #[test]
 fn privilege_metadata_rejects_duplicate_grant_keys_on_rebuild() {
     let data_dir = tempfile::TempDir::new().expect("temp data dir");
+    support::make_data_dir_private(data_dir.path());
     std::fs::write(
         data_dir.path().join("pg_privileges.meta"),
         concat!(
@@ -916,6 +917,7 @@ fn privilege_metadata_rejects_duplicate_grant_keys_on_rebuild() {
 #[test]
 fn privilege_metadata_rejects_duplicate_default_grant_keys_on_rebuild() {
     let data_dir = tempfile::TempDir::new().expect("temp data dir");
+    support::make_data_dir_private(data_dir.path());
     std::fs::write(
         data_dir.path().join("pg_privileges.meta"),
         concat!(
@@ -967,6 +969,7 @@ fn privilege_metadata_rejects_unknown_role_refs_on_rebuild() {
 
     for (case, row, role) in cases {
         let data_dir = tempfile::TempDir::new().expect("temp data dir");
+        support::make_data_dir_private(data_dir.path());
         std::fs::write(
             data_dir.path().join("pg_privileges.meta"),
             format!("# ultrasql privilege runtime v1\n{row}"),
@@ -990,6 +993,7 @@ fn privilege_metadata_rejects_unknown_role_refs_on_rebuild() {
 #[test]
 fn privilege_metadata_rejects_unknown_column_refs_on_rebuild() {
     let data_dir = tempfile::TempDir::new().expect("temp data dir");
+    support::make_data_dir_private(data_dir.path());
     std::fs::write(
         data_dir.path().join("pg_privileges.meta"),
         concat!(
@@ -1015,6 +1019,7 @@ fn privilege_metadata_rejects_unknown_column_refs_on_rebuild() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn drop_table_removes_table_privilege_grants() {
     let data_dir = tempfile::TempDir::new().expect("temp data dir");
+    support::make_data_dir_private(data_dir.path());
     let metadata_path = data_dir.path().join("pg_privileges.meta");
 
     let running = start_persistent_server(data_dir.path(), "privilege_drop_table").await;
@@ -1105,6 +1110,7 @@ async fn drop_table_removes_table_privilege_grants() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn drop_sequence_removes_sequence_privilege_grants() {
     let data_dir = tempfile::TempDir::new().expect("temp data dir");
+    support::make_data_dir_private(data_dir.path());
     let metadata_path = data_dir.path().join("pg_privileges.meta");
 
     let running = start_persistent_server(data_dir.path(), "privilege_drop_sequence").await;
@@ -1192,6 +1198,7 @@ async fn drop_sequence_removes_sequence_privilege_grants() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn drop_table_removes_owned_sequence_privilege_grants() {
     let data_dir = tempfile::TempDir::new().expect("temp data dir");
+    support::make_data_dir_private(data_dir.path());
     let metadata_path = data_dir.path().join("pg_privileges.meta");
     let sequence_name = "privilege_owned_seq_id_seq";
 
@@ -1866,6 +1873,7 @@ async fn privilege_catalog_rolls_back_when_metadata_slot_is_unsafe() {
     use std::os::unix::fs::symlink;
 
     let data_dir = tempfile::TempDir::new().expect("temp data dir");
+    support::make_data_dir_private(data_dir.path());
     let outside = data_dir.path().join("outside-privilege-meta");
     std::fs::write(&outside, b"keep").expect("outside metadata target");
 
