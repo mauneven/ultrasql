@@ -4907,9 +4907,17 @@ impl Server {
         let plan_cache = Arc::new(PlanCache::new(PlanCacheConfig::default()));
         let two_phase_dir = data_dir.join("pg_twophase");
         std::fs::create_dir_all(&two_phase_dir).map_err(ServerError::Io)?;
-        let two_phase = Arc::new(ultrasql_txn::two_phase::TwoPhaseCoordinator::new(
-            two_phase_dir,
-        ));
+        let two_phase_coord = ultrasql_txn::two_phase::TwoPhaseCoordinator::new(two_phase_dir);
+        let recovered_prepared = two_phase_coord
+            .recover_from_disk()
+            .map_err(|e| ServerError::Ddl(format!("2PC recovery: {e}")))?;
+        for prepared in two_phase_coord.list_prepared() {
+            txn_manager
+                .recover_prepared(prepared.xid)
+                .map_err(|e| ServerError::Ddl(format!("2PC CLOG recovery: {e}")))?;
+        }
+        tracing::info!(count = recovered_prepared, "2PC state recovery complete");
+        let two_phase = Arc::new(two_phase_coord);
 
         let server = Self {
             catalog,

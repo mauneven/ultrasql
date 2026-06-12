@@ -687,6 +687,29 @@ impl TransactionManager {
         self.recover_observed_xid(xid);
     }
 
+    /// Restore an in-progress prepared XID observed in 2PC state.
+    ///
+    /// WAL recovery runs before 2PC state recovery. If WAL has already marked
+    /// the XID terminal, the state file is inconsistent and startup must fail
+    /// rather than re-open a resolved transaction.
+    pub fn recover_prepared(&self, xid: Xid) -> Result<(), TxnError> {
+        if xid == Xid::INVALID || xid == Xid::FROZEN || xid == Xid::BOOTSTRAP {
+            return Ok(());
+        }
+
+        if let Some(entry) = self.clog.get(&xid) {
+            match *entry.value() {
+                XidStatus::InProgress => {}
+                status => return Err(TxnError::AlreadyTerminated { xid, status }),
+            }
+        } else {
+            self.clog.insert(xid, XidStatus::InProgress);
+        }
+        self.in_progress.lock().insert(xid);
+        self.recover_observed_xid(xid);
+        Ok(())
+    }
+
     /// Advance the allocator past an XID observed during WAL recovery.
     pub fn recover_observed_xid(&self, xid: Xid) {
         if xid == Xid::INVALID || xid == Xid::FROZEN || xid == Xid::BOOTSTRAP {
