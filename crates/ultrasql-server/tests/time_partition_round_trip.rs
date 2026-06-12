@@ -108,6 +108,107 @@ async fn range_partitioned_timestamp_table_auto_creates_and_prunes_chunks() {
 }
 
 #[tokio::test]
+async fn renamed_partitioned_table_keeps_chunk_routing() {
+    let (server, client, _conn, server_handle) = start_server_and_connect().await;
+
+    client
+        .batch_execute(
+            "CREATE TABLE metrics_rename (\
+             ts TIMESTAMP NOT NULL, host TEXT NOT NULL, value INT NOT NULL\
+             ) PARTITION BY RANGE (ts);\
+             INSERT INTO metrics_rename VALUES \
+             (TIMESTAMP '2026-05-20 00:00:00', 'a', 10),\
+             (TIMESTAMP '2026-05-21 00:00:00', 'b', 20);\
+             ALTER TABLE metrics_rename RENAME TO metrics_renamed",
+        )
+        .await
+        .expect("create, seed, and rename partitioned table");
+
+    assert!(
+        server.time_partitions.get("metrics_renamed").is_some(),
+        "partition runtime must move to renamed parent"
+    );
+    assert!(
+        server.time_partitions.get("metrics_rename").is_none(),
+        "old parent name must not keep partition runtime"
+    );
+
+    let rows = client
+        .query(
+            "SELECT host, value FROM metrics_renamed ORDER BY value",
+            &[],
+        )
+        .await
+        .expect("renamed partition parent scans existing chunks");
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0].get::<_, String>(0), "a");
+    assert_eq!(rows[1].get::<_, i32>(1), 20);
+
+    client
+        .batch_execute(
+            "INSERT INTO metrics_renamed VALUES \
+             (TIMESTAMP '2026-05-22 00:00:00', 'c', 30)",
+        )
+        .await
+        .expect("insert after rename routes through partition runtime");
+    let rows = client
+        .query(
+            "SELECT host, value FROM metrics_renamed ORDER BY value",
+            &[],
+        )
+        .await
+        .expect("renamed partition parent scans new chunk");
+    assert_eq!(rows.len(), 3);
+    assert_eq!(rows[2].get::<_, String>(0), "c");
+    assert_eq!(rows[2].get::<_, i32>(1), 30);
+
+    shutdown(client, server_handle).await;
+}
+
+#[tokio::test]
+async fn partitioned_parent_count_reads_chunks() {
+    let (_server, client, _conn, server_handle) = start_server_and_connect().await;
+
+    client
+        .batch_execute(
+            "CREATE TABLE metrics_count (\
+             ts TIMESTAMP NOT NULL, host TEXT NOT NULL, value INT NOT NULL\
+             ) PARTITION BY RANGE (ts);\
+             INSERT INTO metrics_count VALUES \
+             (TIMESTAMP '2026-05-20 00:00:00', 'a', 10),\
+             (TIMESTAMP '2026-05-21 00:00:00', 'b', 20)",
+        )
+        .await
+        .expect("create and seed partitioned count table");
+
+    let count = client
+        .query_one("SELECT COUNT(*) FROM metrics_count", &[])
+        .await
+        .expect("count partitioned parent")
+        .get::<_, i64>(0);
+    assert_eq!(count, 2);
+
+    let sum = client
+        .query_one("SELECT SUM(value) FROM metrics_count", &[])
+        .await
+        .expect("sum partitioned parent")
+        .get::<_, i64>(0);
+    assert_eq!(sum, 30);
+
+    let filtered_sum = client
+        .query_one(
+            "SELECT SUM(value) FROM metrics_count WHERE value >= 20",
+            &[],
+        )
+        .await
+        .expect("filtered sum partitioned parent")
+        .get::<_, i64>(0);
+    assert_eq!(filtered_sum, 20);
+
+    shutdown(client, server_handle).await;
+}
+
+#[tokio::test]
 async fn same_partitioned_table_name_is_isolated_by_schema() {
     let (server, client, _conn, server_handle) = start_server_and_connect().await;
 

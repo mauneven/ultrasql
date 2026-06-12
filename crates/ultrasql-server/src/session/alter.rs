@@ -7,7 +7,9 @@
 use std::sync::Arc;
 
 use tokio::io::{AsyncRead, AsyncWrite};
-use ultrasql_catalog::{CatalogSnapshot, MutableCatalog, TableEntry};
+use ultrasql_catalog::{
+    Catalog, CatalogError, CatalogSnapshot, MutableCatalog, TableEntry, table_lookup_key,
+};
 use ultrasql_core::{BlockNumber, Field, RelationId, Value};
 use ultrasql_planner::{LogicalAlterTableAction, LogicalPlan, ScalarExpr};
 use ultrasql_storage::btree::BTree;
@@ -485,6 +487,12 @@ where
     ) -> Result<SelectResult, ServerError> {
         self.state
             .ensure_create_relation_metadata_slots_persistable()?;
+        let old_entry = self
+            .state
+            .persistent_catalog
+            .lookup_table(old_name)
+            .ok_or_else(|| ServerError::Catalog(CatalogError::not_found(old_name.to_owned())))?;
+        let old_table_key = table_lookup_key(&old_entry.schema_name, &old_entry.name);
         let before_grants = self.state.privilege_catalog.list_grants();
         let before_default_grants = self.state.privilege_catalog.list_default_grants();
         let updated_entry = self
@@ -497,6 +505,16 @@ where
             old_name,
             new_name,
         );
+        let new_table_key = table_lookup_key(&updated_entry.schema_name, &updated_entry.name);
+        if let Some((_, runtime)) = self.state.time_partitions.remove(&old_table_key) {
+            self.state.time_partitions.insert(
+                new_table_key,
+                Arc::new(runtime.as_ref().renamed(
+                    updated_entry.schema_name.clone(),
+                    updated_entry.name.clone(),
+                )),
+            );
+        }
         let attr_has_defaults =
             if let Some(runtime) = self.state.table_constraints.get(&updated_entry.oid) {
                 alter_attr_has_defaults(Some(runtime.value().as_ref()), updated_entry.schema.len())

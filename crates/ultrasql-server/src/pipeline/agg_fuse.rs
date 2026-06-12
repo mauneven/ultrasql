@@ -130,6 +130,9 @@ pub(super) fn try_lower_cached_scalar_aggregate_i32(
         return Ok(None);
     };
     let folded = table.to_ascii_lowercase();
+    if is_time_partitioned_parent(&folded, ctx) {
+        return Ok(None);
+    }
     let entry = match ctx.catalog_snapshot.tables.get(&folded) {
         Some(entry) => entry,
         None => return Ok(None),
@@ -227,6 +230,9 @@ pub(super) fn try_lower_direct_scalar_aggregate(
         return Ok(None);
     };
     let folded = table.to_ascii_lowercase();
+    if is_time_partitioned_parent(&folded, ctx) {
+        return Ok(None);
+    }
     let entry = match ctx.catalog_snapshot.tables.get(&folded) {
         Some(entry) => entry,
         None => return Ok(None),
@@ -362,6 +368,9 @@ pub(super) fn try_lower_fused_filter_sum_int(
     // would not provide the `Int32` columns the fused operator
     // requires anyway.
     let folded = table.to_ascii_lowercase();
+    if is_time_partitioned_parent(&folded, ctx) {
+        return Ok(None);
+    }
     let entry = match ctx.catalog_snapshot.tables.get(&folded) {
         Some(entry) => entry,
         None => return Ok(None),
@@ -460,6 +469,10 @@ pub(super) fn try_lower_fused_filter_sum_int(
         }
         _ => Ok(None),
     }
+}
+
+fn is_time_partitioned_parent(folded_table: &str, ctx: &LowerCtx<'_>) -> bool {
+    ctx.time_partitions.contains_key(folded_table)
 }
 
 /// Match a predicate of shape `Column { Int32 } op Literal(Int32)`

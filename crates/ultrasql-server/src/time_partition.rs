@@ -2,7 +2,7 @@
 
 use std::collections::{BTreeMap, VecDeque};
 use std::sync::Arc;
-use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use dashmap::DashMap;
 use parking_lot::Mutex;
@@ -74,6 +74,32 @@ impl TimePartitionRuntime {
             last_scan_selected_chunks: AtomicUsize::new(0),
             create_lock: Mutex::new(()),
         }
+    }
+
+    /// Build a copy of this runtime for a renamed parent table.
+    #[must_use]
+    pub fn renamed(&self, parent_schema_name: String, parent_relname: String) -> Self {
+        let mut renamed = Self::daily(
+            parent_schema_name,
+            parent_relname,
+            self.parent_oid,
+            self.schema.clone(),
+            self.partition_column.clone(),
+            self.partition_column_index,
+        );
+        for chunk in &self.chunks {
+            renamed.chunks.insert(*chunk.key(), chunk.value().clone());
+        }
+        renamed.chunk_interval_us = self.chunk_interval_us;
+        renamed.last_scan_total_chunks.store(
+            self.last_scan_total_chunks.load(Ordering::Acquire),
+            Ordering::Release,
+        );
+        renamed.last_scan_selected_chunks.store(
+            self.last_scan_selected_chunks.load(Ordering::Acquire),
+            Ordering::Release,
+        );
+        renamed
     }
 }
 
