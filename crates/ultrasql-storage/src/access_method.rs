@@ -14,11 +14,12 @@
 //! # Status
 //!
 //! - [`BTreeAccessMethod`]: wraps the existing [`crate::btree::BTree`];
-//!   the full Lehman-Yao implementation is production-ready.
+//!   this is the primary persistent B-tree backend and has restart,
+//!   concurrency, uniqueness, range-scan, and WAL-failure coverage.
 //! - [`HashIndex`]: static hashing with fixed primary bucket pages and
 //!   overflow-page chains.
 //! - [`HnswIndex`]: runtime ANN graph; [`PageBackedHnswIndex`] adds the
-//!   persistent page arena, WAL replay, and VACUUM reclamation seam.
+//!   persistent page arena, WAL replay, and VACUUM reclamation path.
 //! - [`IvfFlatIndex`]: runtime inverted-list ANN; [`PageBackedIvfFlatIndex`]
 //!   adds persistent centroid/list pages and logical WAL replay.
 //! - [`GinIndex`], [`GistIndex`], [`BrinIndex`]: provide the trait shape with
