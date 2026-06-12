@@ -4,8 +4,8 @@
 
 use super::*;
 use std::sync::atomic::Ordering;
-use ultrasql_core::{Field, Oid, Schema};
-use ultrasql_planner::LogicalAggregateExpr;
+use ultrasql_core::{DataType, Field, Oid, Schema, Value};
+use ultrasql_planner::{LogicalAggregateExpr, ScalarExpr};
 
 #[test]
 fn top_level_local_query_runs_sample_select_and_rejects_writes() {
@@ -237,6 +237,46 @@ fn wal_backed_catalog_bootstrap_errors_are_fatal() {
         err.to_string().contains("duplicate pg_class oid"),
         "original bootstrap error lost: {err}"
     );
+}
+
+#[test]
+fn table_runtime_metadata_preflight_rejects_unpersistable_expressions() {
+    let dir = tempfile::tempdir().expect("data dir");
+    let server = Server::init(dir.path()).expect("persistent server");
+    let function_expr = || ScalarExpr::FunctionCall {
+        name: "lower".to_owned(),
+        args: vec![ScalarExpr::Literal {
+            value: Value::Text("Ada".to_owned()),
+            data_type: DataType::Text { max_len: None },
+        }],
+        data_type: DataType::Text { max_len: None },
+    };
+
+    let mut constraints = TableRuntimeConstraints {
+        defaults: vec![Some(function_expr())],
+        ..TableRuntimeConstraints::default()
+    };
+    let err = server
+        .ensure_table_runtime_constraints_metadata_persistable("public.t", &constraints)
+        .expect_err("function DEFAULT cannot be silently skipped");
+    assert!(err.to_string().contains("DEFAULT expression"));
+
+    constraints.defaults.clear();
+    constraints.generated_stored = vec![Some(function_expr())];
+    let err = server
+        .ensure_table_runtime_constraints_metadata_persistable("public.t", &constraints)
+        .expect_err("function generated column cannot be silently skipped");
+    assert!(err.to_string().contains("generated stored expression"));
+
+    constraints.generated_stored.clear();
+    constraints.checks = vec![RuntimeCheckConstraint {
+        name: "ck_lower".to_owned(),
+        expr: function_expr(),
+    }];
+    let err = server
+        .ensure_table_runtime_constraints_metadata_persistable("public.t", &constraints)
+        .expect_err("function CHECK cannot be silently skipped");
+    assert!(err.to_string().contains("CHECK 'ck_lower' expression"));
 }
 
 #[test]

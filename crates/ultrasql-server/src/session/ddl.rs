@@ -644,47 +644,6 @@ where
                 ));
             }
         }
-        self.state.persistent_catalog.create_table(entry.clone())?;
-        let mut serial_sequence_rows = Vec::with_capacity(serial_sequences.len());
-        let sequence_owner = self.current_user.to_ascii_lowercase();
-        for (seq_name, seq_key, options) in &serial_sequences {
-            let seq = ultrasql_storage::sequence::Sequence::new(
-                super::sequence::to_storage_options(*options),
-            )
-            .map_err(|e| ServerError::ddl(format!("CREATE TABLE serial sequence: {e}")))?;
-            let seq_oid = self.state.persistent_catalog.next_oid();
-            let seq_rel = RelationId::new(seq_oid.raw());
-            let seq_opts = seq.options_snapshot();
-            serial_sequence_rows.push((
-                seq_name.clone(),
-                seq_key.clone(),
-                ultrasql_catalog::persistent::SequenceRow {
-                    seqrelid: seq_oid,
-                    seqtypid: PG_OID_INT8,
-                    seqstart: seq_opts.start,
-                    seqincrement: seq_opts.increment,
-                    seqmax: seq_opts.max.unwrap_or(i64::MAX),
-                    seqmin: seq_opts.min.unwrap_or(1),
-                    seqcache: i64::from(seq_opts.cache),
-                    seqcycle: seq_opts.cycle,
-                },
-            ));
-            seq.emit_wal(
-                SequenceOpKind::Create,
-                seq_key,
-                seq_rel,
-                ultrasql_core::Xid::INVALID,
-                self.state.heap.wal_sink().map(|sink| sink.as_ref()),
-            )
-            .map_err(|e| ServerError::ddl(format!("CREATE TABLE serial sequence WAL: {e}")))?;
-            self.state.sequences.insert(seq_key.clone(), Arc::new(seq));
-            self.state
-                .sequence_owners
-                .insert(seq_key.clone(), sequence_owner.clone());
-            self.state
-                .sequence_namespaces
-                .insert(seq_key.clone(), sequence_namespace.clone());
-        }
         let runtime_foreign_keys = foreign_keys
             .iter()
             .map(|fk| {
@@ -729,6 +688,74 @@ where
             })
             .collect::<Vec<_>>();
         runtime_checks.extend(self.domain_checks_for_columns(columns)?);
+        let runtime_constraints = if defaults.iter().any(Option::is_some)
+            || sequence_defaults.iter().any(Option::is_some)
+            || identity_always.iter().any(|v| *v)
+            || generated_stored.iter().any(Option::is_some)
+            || !runtime_checks.is_empty()
+            || !runtime_foreign_keys.is_empty()
+            || !runtime_exclusion_constraints.is_empty()
+        {
+            let runtime = Arc::new(crate::TableRuntimeConstraints {
+                defaults: defaults.clone(),
+                sequence_defaults: runtime_sequence_defaults.clone(),
+                identity_always: identity_always.clone(),
+                generated_stored: generated_stored.clone(),
+                checks: runtime_checks.clone(),
+                foreign_keys: runtime_foreign_keys.clone(),
+                exclusion_constraints: runtime_exclusion_constraints.clone(),
+                indexes: std::collections::HashMap::new(),
+            });
+            self.state
+                .ensure_table_runtime_constraints_metadata_persistable(
+                    &table_entry_lookup_key(&entry),
+                    runtime.as_ref(),
+                )?;
+            Some(runtime)
+        } else {
+            None
+        };
+        self.state.persistent_catalog.create_table(entry.clone())?;
+        let mut serial_sequence_rows = Vec::with_capacity(serial_sequences.len());
+        let sequence_owner = self.current_user.to_ascii_lowercase();
+        for (seq_name, seq_key, options) in &serial_sequences {
+            let seq = ultrasql_storage::sequence::Sequence::new(
+                super::sequence::to_storage_options(*options),
+            )
+            .map_err(|e| ServerError::ddl(format!("CREATE TABLE serial sequence: {e}")))?;
+            let seq_oid = self.state.persistent_catalog.next_oid();
+            let seq_rel = RelationId::new(seq_oid.raw());
+            let seq_opts = seq.options_snapshot();
+            serial_sequence_rows.push((
+                seq_name.clone(),
+                seq_key.clone(),
+                ultrasql_catalog::persistent::SequenceRow {
+                    seqrelid: seq_oid,
+                    seqtypid: PG_OID_INT8,
+                    seqstart: seq_opts.start,
+                    seqincrement: seq_opts.increment,
+                    seqmax: seq_opts.max.unwrap_or(i64::MAX),
+                    seqmin: seq_opts.min.unwrap_or(1),
+                    seqcache: i64::from(seq_opts.cache),
+                    seqcycle: seq_opts.cycle,
+                },
+            ));
+            seq.emit_wal(
+                SequenceOpKind::Create,
+                seq_key,
+                seq_rel,
+                ultrasql_core::Xid::INVALID,
+                self.state.heap.wal_sink().map(|sink| sink.as_ref()),
+            )
+            .map_err(|e| ServerError::ddl(format!("CREATE TABLE serial sequence WAL: {e}")))?;
+            self.state.sequences.insert(seq_key.clone(), Arc::new(seq));
+            self.state
+                .sequence_owners
+                .insert(seq_key.clone(), sequence_owner.clone());
+            self.state
+                .sequence_namespaces
+                .insert(seq_key.clone(), sequence_namespace.clone());
+        }
         let mut persistent_constraint_rows = Vec::with_capacity(
             unique_constraints.len()
                 + runtime_checks.len()
@@ -796,27 +823,8 @@ where
                 confkey: Vec::new(),
             });
         }
-        if defaults.iter().any(Option::is_some)
-            || sequence_defaults.iter().any(Option::is_some)
-            || identity_always.iter().any(|v| *v)
-            || generated_stored.iter().any(Option::is_some)
-            || !runtime_checks.is_empty()
-            || !runtime_foreign_keys.is_empty()
-            || !runtime_exclusion_constraints.is_empty()
-        {
-            self.state.table_constraints.insert(
-                oid,
-                Arc::new(crate::TableRuntimeConstraints {
-                    defaults: defaults.clone(),
-                    sequence_defaults: runtime_sequence_defaults.clone(),
-                    identity_always: identity_always.clone(),
-                    generated_stored: generated_stored.clone(),
-                    checks: runtime_checks.clone(),
-                    foreign_keys: runtime_foreign_keys.clone(),
-                    exclusion_constraints: runtime_exclusion_constraints.clone(),
-                    indexes: std::collections::HashMap::new(),
-                }),
-            );
+        if let Some(runtime) = runtime_constraints.clone() {
+            self.state.table_constraints.insert(oid, runtime);
         }
         let created_unique_indexes =
             match self.create_table_unique_indexes(&entry, unique_constraints) {

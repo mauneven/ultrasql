@@ -340,6 +340,42 @@ async fn default_expression_survives_restart() {
     graceful_shutdown(running).await;
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn persistent_default_outside_metadata_subset_is_rejected_before_catalog_write() {
+    let data_dir = tempfile::TempDir::new().unwrap();
+
+    let running = start_persistent_server(data_dir.path(), "constraint_default_subset").await;
+    let client = &running.client;
+    let err = client
+        .batch_execute("CREATE TABLE default_subset_fail (v TEXT DEFAULT lower('Ada'))")
+        .await
+        .expect_err("persistent CREATE TABLE must reject non-persistable DEFAULT");
+    let msg = err
+        .as_db_error()
+        .expect("server-sent DB error")
+        .message()
+        .to_owned();
+    assert!(
+        msg.contains("DEFAULT expression") && msg.contains("restart-persistable metadata subset"),
+        "unexpected error: {err}"
+    );
+    let err = client
+        .query("SELECT v FROM default_subset_fail", &[])
+        .await
+        .expect_err("failed CREATE TABLE must not create relation in current session");
+    assert_eq!(err.code().expect("SQLSTATE").code(), "42P01");
+    graceful_shutdown(running).await;
+
+    let running = start_persistent_server(data_dir.path(), "constraint_default_subset").await;
+    let err = running
+        .client
+        .query("SELECT v FROM default_subset_fail", &[])
+        .await
+        .expect_err("failed CREATE TABLE must not create relation after restart");
+    assert_eq!(err.code().expect("SQLSTATE").code(), "42P01");
+    graceful_shutdown(running).await;
+}
+
 /// Stored generated columns are computed on INSERT and recomputed on UPDATE.
 #[tokio::test]
 async fn generated_stored_column_is_computed_and_recomputed() {

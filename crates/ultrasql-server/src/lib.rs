@@ -1579,6 +1579,18 @@ fn encode_scalar_expr_field(expr: &ScalarExpr) -> Option<String> {
     Some(tokens.join("\u{1f}"))
 }
 
+fn encode_table_runtime_scalar_expr(
+    table_name: &str,
+    subject: String,
+    expr: &ScalarExpr,
+) -> Result<String, ServerError> {
+    encode_scalar_expr_field(expr).ok_or_else(|| {
+        ServerError::ddl(format!(
+            "table '{table_name}' {subject} is outside restart-persistable metadata subset"
+        ))
+    })
+}
+
 fn decode_scalar_expr(tokens: &[&str], pos: &mut usize) -> Result<ScalarExpr, ServerError> {
     let Some(kind) = tokens.get(*pos).copied() else {
         return Err(ServerError::Ddl(
@@ -5218,6 +5230,42 @@ impl Server {
             .map(|dir| dir.join("pg_table_runtime.meta"))
     }
 
+    pub(crate) fn ensure_table_runtime_constraints_metadata_persistable(
+        &self,
+        table_name: &str,
+        constraints: &TableRuntimeConstraints,
+    ) -> Result<(), ServerError> {
+        if self.table_runtime_metadata_path().is_none() {
+            return Ok(());
+        }
+        for (idx, default_expr) in constraints.defaults.iter().enumerate() {
+            if let Some(default_expr) = default_expr {
+                encode_table_runtime_scalar_expr(
+                    table_name,
+                    format!("DEFAULT expression on column {idx}"),
+                    default_expr,
+                )?;
+            }
+        }
+        for (idx, generated_expr) in constraints.generated_stored.iter().enumerate() {
+            if let Some(generated_expr) = generated_expr {
+                encode_table_runtime_scalar_expr(
+                    table_name,
+                    format!("generated stored expression on column {idx}"),
+                    generated_expr,
+                )?;
+            }
+        }
+        for check in &constraints.checks {
+            encode_table_runtime_scalar_expr(
+                table_name,
+                format!("CHECK '{}' expression", check.name),
+                &check.expr,
+            )?;
+        }
+        Ok(())
+    }
+
     pub(crate) fn persist_table_runtime_constraints_metadata(&self) -> Result<(), ServerError> {
         let Some(path) = self.table_runtime_metadata_path() else {
             return Ok(());
@@ -5259,14 +5307,11 @@ impl Server {
                 let Some(default_expr) = default_expr else {
                     continue;
                 };
-                let Some(expr) = encode_scalar_expr_field(default_expr) else {
-                    tracing::warn!(
-                        table = %table_name,
-                        column = idx,
-                        "DEFAULT expression is outside restart-persistable subset",
-                    );
-                    continue;
-                };
+                let expr = encode_table_runtime_scalar_expr(
+                    &table_name,
+                    format!("DEFAULT expression on column {idx}"),
+                    default_expr,
+                )?;
                 out.push_str(&format!(
                     "default\t{}\t{}\t{}\n",
                     oid.raw(),
@@ -5283,14 +5328,11 @@ impl Server {
                 let Some(generated_expr) = generated_expr else {
                     continue;
                 };
-                let Some(expr) = encode_scalar_expr_field(generated_expr) else {
-                    tracing::warn!(
-                        table = %table_name,
-                        column = idx,
-                        "generated stored expression is outside restart-persistable subset",
-                    );
-                    continue;
-                };
+                let expr = encode_table_runtime_scalar_expr(
+                    &table_name,
+                    format!("generated stored expression on column {idx}"),
+                    generated_expr,
+                )?;
                 out.push_str(&format!(
                     "generated_stored\t{}\t{}\t{}\n",
                     oid.raw(),
@@ -5299,14 +5341,11 @@ impl Server {
                 ));
             }
             for check in &constraints.checks {
-                let Some(expr) = encode_scalar_expr_field(&check.expr) else {
-                    tracing::warn!(
-                        table = %table_name,
-                        constraint = %check.name,
-                        "CHECK expression is outside restart-persistable subset",
-                    );
-                    continue;
-                };
+                let expr = encode_table_runtime_scalar_expr(
+                    &table_name,
+                    format!("CHECK '{}' expression", check.name),
+                    &check.expr,
+                )?;
                 out.push_str(&format!(
                     "check\t{}\t{}\t{}\n",
                     oid.raw(),
