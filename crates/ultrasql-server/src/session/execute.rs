@@ -1998,8 +1998,8 @@ where
     }
 
     /// Commit-on-success / abort-on-error for the autocommit path.
-    /// Logs (does not surface) txn manager errors so the original
-    /// outcome reaches the client.
+    /// Surfaces cleanup/finalization failures so the client never sees
+    /// success for a transaction the server could not close cleanly.
     pub(crate) fn finalise_autocommit(
         &mut self,
         plan: &LogicalPlan,
@@ -2031,10 +2031,7 @@ where
                     .state
                     .commit_transaction(txn, is_dml, "autocommit statement")
                 {
-                    if is_dml {
-                        return Err(e);
-                    }
-                    tracing::warn!(error = %e, "autocommit failed to finalise");
+                    return Err(e);
                 } else {
                     self.pending_post_commit_maintenance = true;
                     let rows = result.rows;
@@ -3708,6 +3705,36 @@ mod tests {
             msg.contains("transaction abort failed"),
             "abort failure hidden: {err}"
         );
+    }
+
+    #[test]
+    fn finalise_autocommit_reports_read_commit_failure() {
+        let mut session = test_session();
+        let txn = session
+            .state
+            .txn_manager
+            .begin(IsolationLevel::ReadCommitted);
+        let stale = txn.clone();
+        session.state.txn_manager.commit(txn).expect("pre-commit");
+
+        let err = session
+            .finalise_autocommit(
+                &scan_plan(),
+                stale,
+                Ok(SelectResult {
+                    messages: Vec::new(),
+                    streamed_body: None,
+                    shared_streamed_body: None,
+                    rows: 0,
+                }),
+            )
+            .expect_err("read autocommit commit failure must be visible");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("autocommit statement commit"),
+            "context missing: {err}"
+        );
+        assert!(msg.contains("commit"), "commit failure hidden: {err}");
     }
 
     #[test]

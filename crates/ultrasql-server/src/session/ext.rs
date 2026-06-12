@@ -582,10 +582,7 @@ where
                             is_dml,
                             "Extended Execute autocommit",
                         ) {
-                            if is_dml {
-                                return Err(e);
-                            }
-                            tracing::warn!(error = %e, "autocommit failed to finalise (Extended Execute)");
+                            return Err(e);
                         } else {
                             self.state.note_commit_for_gc();
                             if let Some(plan) = portal_plan.as_ref() {
