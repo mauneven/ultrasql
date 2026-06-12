@@ -314,6 +314,38 @@ async fn brin_index_summary_rebuilds_after_restart() {
     }
 }
 
+#[tokio::test]
+async fn expression_index_runtime_metadata_survives_restart() {
+    let data_dir = tempfile::TempDir::new().unwrap();
+
+    {
+        let running = start_persistent_server(data_dir.path(), "expr_index_restart_test").await;
+        running
+            .client
+            .batch_execute(
+                "CREATE TABLE t_expr_restart (name TEXT NOT NULL, payload INT NOT NULL); \
+                 INSERT INTO t_expr_restart VALUES ('Alice', 1); \
+                 CREATE UNIQUE INDEX ux_t_expr_restart_lower_name \
+                 ON t_expr_restart (lower(name))",
+            )
+            .await
+            .expect("create expression index before restart");
+        graceful_shutdown(running).await;
+    }
+
+    {
+        let running = start_persistent_server(data_dir.path(), "expr_index_restart_test").await;
+        let err = running
+            .client
+            .batch_execute("INSERT INTO t_expr_restart VALUES ('alice', 2)")
+            .await
+            .expect_err("expression index duplicate must remain rejected after restart");
+        let db_err = err.as_db_error().expect("server returns SQLSTATE");
+        assert_eq!(db_err.code().code(), "23505");
+        graceful_shutdown(running).await;
+    }
+}
+
 /// Plain non-unique indexes must retain every duplicate key/TID pair.
 /// Unique enforcement belongs only to UNIQUE / PRIMARY KEY indexes.
 #[tokio::test]

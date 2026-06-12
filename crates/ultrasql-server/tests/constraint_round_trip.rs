@@ -341,38 +341,42 @@ async fn default_expression_survives_restart() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn persistent_default_outside_metadata_subset_is_rejected_before_catalog_write() {
+async fn persistent_function_default_survives_restart() {
     let data_dir = tempfile::TempDir::new().unwrap();
 
-    let running = start_persistent_server(data_dir.path(), "constraint_default_subset").await;
+    let running = start_persistent_server(data_dir.path(), "constraint_function_default").await;
     let client = &running.client;
-    let err = client
-        .batch_execute("CREATE TABLE default_subset_fail (v TEXT DEFAULT lower('Ada'))")
+    client
+        .batch_execute(
+            "CREATE TABLE function_default_restart (id INT, v TEXT DEFAULT lower('Ada'))",
+        )
         .await
-        .expect_err("persistent CREATE TABLE must reject non-persistable DEFAULT");
-    let msg = err
-        .as_db_error()
-        .expect("server-sent DB error")
-        .message()
-        .to_owned();
-    assert!(
-        msg.contains("DEFAULT expression") && msg.contains("restart-persistable metadata subset"),
-        "unexpected error: {err}"
-    );
-    let err = client
-        .query("SELECT v FROM default_subset_fail", &[])
+        .expect("persistent CREATE TABLE stores function DEFAULT");
+    client
+        .batch_execute("INSERT INTO function_default_restart (id) VALUES (1)")
         .await
-        .expect_err("failed CREATE TABLE must not create relation in current session");
-    assert_eq!(err.code().expect("SQLSTATE").code(), "42P01");
+        .expect("function DEFAULT applies before restart");
     graceful_shutdown(running).await;
 
-    let running = start_persistent_server(data_dir.path(), "constraint_default_subset").await;
-    let err = running
+    let running = start_persistent_server(data_dir.path(), "constraint_function_default").await;
+    running
         .client
-        .query("SELECT v FROM default_subset_fail", &[])
+        .batch_execute("INSERT INTO function_default_restart (id) VALUES (2)")
         .await
-        .expect_err("failed CREATE TABLE must not create relation after restart");
-    assert_eq!(err.code().expect("SQLSTATE").code(), "42P01");
+        .expect("function DEFAULT applies after restart");
+    let rows = running
+        .client
+        .query(
+            "SELECT id, v FROM function_default_restart ORDER BY id",
+            &[],
+        )
+        .await
+        .expect("select default rows");
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0].get::<_, i32>(0), 1);
+    assert_eq!(rows[0].get::<_, String>(1), "ada");
+    assert_eq!(rows[1].get::<_, i32>(0), 2);
+    assert_eq!(rows[1].get::<_, String>(1), "ada");
     graceful_shutdown(running).await;
 }
 

@@ -1568,6 +1568,19 @@ fn encode_scalar_expr(expr: &ScalarExpr, out: &mut Vec<String>) -> Option<()> {
             out.push(negated.to_string());
             encode_scalar_expr(expr, out)?;
         }
+        ScalarExpr::FunctionCall {
+            name,
+            args,
+            data_type,
+        } => {
+            out.push("func".to_owned());
+            out.push(metadata_escape(name));
+            out.push(data_type_token(data_type)?);
+            out.push(args.len().to_string());
+            for arg in args {
+                encode_scalar_expr(arg, out)?;
+            }
+        }
         _ => return None,
     }
     Some(())
@@ -1589,6 +1602,25 @@ fn encode_table_runtime_scalar_expr(
             "table '{table_name}' {subject} is outside restart-persistable metadata subset"
         ))
     })
+}
+
+fn encode_table_runtime_scalar_expr_list(
+    table_name: &str,
+    subject: String,
+    exprs: &[ScalarExpr],
+) -> Result<String, ServerError> {
+    let encoded = exprs
+        .iter()
+        .enumerate()
+        .map(|(idx, expr)| {
+            encode_table_runtime_scalar_expr(
+                table_name,
+                format!("{subject} expression {idx}"),
+                expr,
+            )
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(metadata_encode_list(&encoded))
 }
 
 fn decode_scalar_expr(tokens: &[&str], pos: &mut usize) -> Result<ScalarExpr, ServerError> {
@@ -1698,6 +1730,36 @@ fn decode_scalar_expr(tokens: &[&str], pos: &mut usize) -> Result<ScalarExpr, Se
             let expr = Box::new(decode_scalar_expr(tokens, pos)?);
             Ok(ScalarExpr::IsNull { expr, negated })
         }
+        "func" => {
+            let name = metadata_unescape(
+                tokens
+                    .get(*pos)
+                    .ok_or_else(|| ServerError::Ddl("truncated function name".to_owned()))?,
+            )?;
+            *pos += 1;
+            let data_type = data_type_from_token(
+                tokens
+                    .get(*pos)
+                    .ok_or_else(|| ServerError::Ddl("truncated function type".to_owned()))?,
+            )
+            .ok_or_else(|| ServerError::Ddl("unknown function type".to_owned()))?;
+            *pos += 1;
+            let arg_count = tokens
+                .get(*pos)
+                .ok_or_else(|| ServerError::Ddl("truncated function arg count".to_owned()))?
+                .parse::<usize>()
+                .map_err(|err| ServerError::Ddl(format!("bad function arg count: {err}")))?;
+            *pos += 1;
+            let mut args = Vec::with_capacity(arg_count);
+            for _ in 0..arg_count {
+                args.push(decode_scalar_expr(tokens, pos)?);
+            }
+            Ok(ScalarExpr::FunctionCall {
+                name,
+                args,
+                data_type,
+            })
+        }
         other => Err(ServerError::Ddl(format!(
             "unknown scalar expression token {other}"
         ))),
@@ -1714,6 +1776,13 @@ fn decode_scalar_expr_field(raw: &str) -> Result<ScalarExpr, ServerError> {
         ));
     }
     Ok(expr)
+}
+
+fn decode_scalar_expr_list_field(raw: &str) -> Result<Vec<ScalarExpr>, ServerError> {
+    metadata_decode_list(raw)?
+        .into_iter()
+        .map(|expr| decode_scalar_expr_field(&expr))
+        .collect()
 }
 
 fn materialized_view_projection_indices(plan: &LogicalPlan) -> Option<Vec<usize>> {
@@ -5059,13 +5128,13 @@ impl Server {
             wal_writer: Some(wal_writer),
         };
         server.recover_commit_status_from_wal()?;
-        server.rebuild_persistent_index_sidecars()?;
         server.rebuild_domain_runtime_constraint_sidecars()?;
         server.rebuild_role_metadata()?;
         server.rebuild_privilege_metadata()?;
         server.rebuild_schema_metadata()?;
         server.refresh_persistent_catalog_schema_names();
         server.rebuild_table_runtime_constraint_sidecars()?;
+        server.rebuild_persistent_index_sidecars()?;
         let stats_catalog = hydrate_optimizer_stats_from_catalog(
             &server.catalog_snapshot(),
             server.heap.as_ref(),
@@ -5502,6 +5571,36 @@ impl Server {
                     elements
                 ));
             }
+            let mut indexes = constraints.indexes.iter().collect::<Vec<_>>();
+            indexes.sort_by_key(|(index_oid, _)| index_oid.raw());
+            for (index_oid, metadata) in indexes {
+                let key_exprs = encode_table_runtime_scalar_expr_list(
+                    &table_name,
+                    format!("index {} key", index_oid.raw()),
+                    &metadata.key_exprs,
+                )?;
+                let predicate = metadata
+                    .predicate
+                    .as_ref()
+                    .map(|predicate| {
+                        encode_table_runtime_scalar_expr(
+                            &table_name,
+                            format!("index {} predicate", index_oid.raw()),
+                            predicate,
+                        )
+                    })
+                    .transpose()?
+                    .unwrap_or_default();
+                out.push_str(&format!(
+                    "index\t{}\t{}\t{}\t{}\t{}\t{}\n",
+                    oid.raw(),
+                    index_oid.raw(),
+                    index_method_token(metadata.method),
+                    metadata_escape(&key_exprs),
+                    metadata_escape(&predicate),
+                    usize_list_token(&metadata.include_columns)
+                ));
+            }
         }
         write_runtime_metadata_file(&path, &out)
     }
@@ -5530,6 +5629,8 @@ impl Server {
             std::collections::HashMap::new();
         let mut exclusions: std::collections::HashMap<Oid, Vec<RuntimeExclusionConstraint>> =
             std::collections::HashMap::new();
+        let mut indexes: std::collections::HashMap<Oid, Vec<(Oid, RuntimeIndexMetadata)>> =
+            std::collections::HashMap::new();
         let mut seen_table_oids = std::collections::HashSet::new();
         let mut seen_sequence_default_keys = std::collections::HashSet::new();
         let mut seen_default_keys = std::collections::HashSet::new();
@@ -5538,6 +5639,8 @@ impl Server {
         let mut seen_check_keys = std::collections::HashSet::new();
         let mut seen_foreign_key_keys = std::collections::HashSet::new();
         let mut seen_exclusion_keys = std::collections::HashSet::new();
+        let mut seen_index_keys = std::collections::HashSet::new();
+        let mut skipped_stale_index_metadata = false;
         for (line_no, line) in text.lines().enumerate() {
             if line.is_empty() || line.starts_with('#') {
                 continue;
@@ -5764,6 +5867,49 @@ impl Server {
                             elements,
                         });
                 }
+                Some("index") if parts.len() == 7 => {
+                    let oid = Oid::new(parts[1].parse::<u32>().map_err(|err| {
+                        ServerError::Ddl(format!(
+                            "table-runtime metadata line {} bad oid: {err}",
+                            line_no + 1
+                        ))
+                    })?);
+                    let index_oid = Oid::new(parts[2].parse::<u32>().map_err(|err| {
+                        ServerError::Ddl(format!(
+                            "table-runtime metadata line {} bad index oid: {err}",
+                            line_no + 1
+                        ))
+                    })?);
+                    if !seen_index_keys.insert((oid, index_oid)) {
+                        return Err(ServerError::Ddl(format!(
+                            "duplicate table-runtime index metadata on line {}",
+                            line_no + 1
+                        )));
+                    }
+                    let method = parse_index_method(parts[3])?;
+                    let key_exprs = decode_scalar_expr_list_field(&metadata_unescape(parts[4])?)?;
+                    let predicate = {
+                        let raw = metadata_unescape(parts[5])?;
+                        if raw.is_empty() {
+                            None
+                        } else {
+                            Some(decode_scalar_expr_field(&raw)?)
+                        }
+                    };
+                    indexes.entry(oid).or_default().push((
+                        index_oid,
+                        RuntimeIndexMetadata {
+                            key_exprs,
+                            predicate,
+                            include_columns: parse_usize_list_token(parts[6])?,
+                            method,
+                            brin: None,
+                            hnsw: None,
+                            ivfflat: None,
+                            aggregating: None,
+                        },
+                    ));
+                }
                 _ => {
                     return Err(ServerError::Ddl(format!(
                         "malformed table-runtime metadata line {}",
@@ -5859,6 +6005,33 @@ impl Server {
             if let Some(exclusions) = exclusions.remove(&oid) {
                 runtime.exclusion_constraints = exclusions;
             }
+            if let Some(indexes) = indexes.remove(&oid) {
+                for (index_oid, metadata) in indexes {
+                    let index_belongs_to_table = snapshot
+                        .indexes_by_table
+                        .get(&oid)
+                        .is_some_and(|entries| entries.iter().any(|index| index.oid == index_oid));
+                    if !index_belongs_to_table {
+                        let index_exists = snapshot
+                            .indexes_by_table
+                            .values()
+                            .any(|entries| entries.iter().any(|index| index.oid == index_oid));
+                        // CREATE INDEX can crash after the runtime sidecar is written but before
+                        // the catalog index row is WAL-durable. That stale sidecar is ignored; a
+                        // committed index oid attached to the wrong table is still corrupt.
+                        if !index_exists {
+                            skipped_stale_index_metadata = true;
+                            continue;
+                        }
+                        return Err(ServerError::Ddl(format!(
+                            "invalid table-runtime index metadata on oid {} for table oid {}",
+                            index_oid.raw(),
+                            oid.raw()
+                        )));
+                    }
+                    runtime.indexes.insert(index_oid, metadata);
+                }
+            }
             self.table_constraints.insert(oid, Arc::new(runtime));
         }
         if let Some(oid) = sequence_defaults
@@ -5869,6 +6042,7 @@ impl Server {
             .chain(checks.keys())
             .chain(foreign_keys.keys())
             .chain(exclusions.keys())
+            .chain(indexes.keys())
             .copied()
             .next()
         {
@@ -5876,6 +6050,9 @@ impl Server {
                 "orphan table-runtime metadata rows on oid {}",
                 oid.raw()
             )));
+        }
+        if skipped_stale_index_metadata {
+            self.persist_table_runtime_constraints_metadata()?;
         }
         Ok(())
     }
@@ -7212,7 +7389,7 @@ impl Server {
         index: &IndexEntry,
         method: LogicalIndexMethod,
     ) -> Result<u64, ServerError> {
-        if index.root_block == BlockNumber::INVALID || index.columns.is_empty() {
+        if index.root_block == BlockNumber::INVALID {
             return Ok(0);
         }
         let columns: Vec<usize> = index
@@ -7220,8 +7397,23 @@ impl Server {
             .iter()
             .map(|attnum| usize::from(*attnum))
             .collect();
+        let runtime_metadata = self
+            .table_constraints
+            .get(&table.oid)
+            .and_then(|constraints| constraints.indexes.get(&index.oid).cloned());
+        let expression_key_exprs = runtime_metadata
+            .as_ref()
+            .map_or_else(Vec::new, |metadata| metadata.key_exprs.clone());
+        let predicate = runtime_metadata
+            .as_ref()
+            .and_then(|metadata| metadata.predicate.clone());
+        if columns.is_empty() && expression_key_exprs.is_empty() {
+            return Ok(0);
+        }
         let encoding = if method == LogicalIndexMethod::Hash {
             crate::index_key::IndexKeyEncoding::Int64
+        } else if columns.is_empty() && expression_key_exprs.len() == 1 {
+            crate::index_key::IndexKeyEncoding::for_data_type(&expression_key_exprs[0].data_type())?
         } else {
             crate::index_key::IndexKeyEncoding::for_columns(&table.schema, &columns)?
         };
@@ -7251,8 +7443,8 @@ impl Server {
                     &tuple.data,
                     &table.schema,
                     key_col_idx,
-                    &[],
-                    None,
+                    &expression_key_exprs,
+                    predicate.as_ref(),
                     method,
                     &encoding,
                 )?

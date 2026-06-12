@@ -1267,6 +1267,8 @@ where
                 ));
             };
             let index_oid = self.state.persistent_catalog.next_oid();
+            self.state
+                .ensure_table_runtime_constraints_metadata_slots_persistable()?;
             let block_count = self
                 .state
                 .heap
@@ -1355,6 +1357,7 @@ where
             self.state
                 .table_constraints
                 .insert(table.oid, Arc::new(constraints));
+            self.state.persist_table_runtime_constraints_metadata()?;
             self.plan_cache_invalidate();
 
             return Ok(run_ddl_command("CREATE INDEX"));
@@ -1388,6 +1391,8 @@ where
             let (lists, probes, payload) = ivfflat_options(index_options)?;
             let payload = payload.unwrap_or(default_payload);
             let index_oid = self.state.persistent_catalog.next_oid();
+            self.state
+                .ensure_table_runtime_constraints_metadata_slots_persistable()?;
             let ivfflat = Arc::new(
                 PageBackedIvfFlatIndex::new_with_payload_kind(
                     RelationId::new(index_oid.raw()),
@@ -1518,6 +1523,7 @@ where
             self.state
                 .table_constraints
                 .insert(table.oid, Arc::new(constraints));
+            self.state.persist_table_runtime_constraints_metadata()?;
             self.plan_cache_invalidate();
 
             return Ok(run_ddl_command("CREATE INDEX"));
@@ -1551,6 +1557,8 @@ where
             let metric = hnsw_metric_for_opclass(opclasses.first().and_then(Option::as_deref))?;
             let payload = hnsw_payload_option(index_options)?.unwrap_or(default_payload);
             let index_oid = self.state.persistent_catalog.next_oid();
+            self.state
+                .ensure_table_runtime_constraints_metadata_slots_persistable()?;
             let index_rel = RelationId::new(index_oid.raw());
             let hnsw = Arc::new(
                 PageBackedHnswIndex::new_with_payload_kind(
@@ -1679,6 +1687,7 @@ where
             self.state
                 .table_constraints
                 .insert(table.oid, Arc::new(constraints));
+            self.state.persist_table_runtime_constraints_metadata()?;
             self.plan_cache_invalidate();
 
             return Ok(run_ddl_command("CREATE INDEX"));
@@ -1721,6 +1730,14 @@ where
         } else {
             None
         };
+        let writes_runtime_index_metadata = !expression_key_exprs.is_empty()
+            || predicate.is_some()
+            || !include_columns.is_empty()
+            || *method != ultrasql_planner::LogicalIndexMethod::Btree;
+        if writes_runtime_index_metadata {
+            self.state
+                .ensure_table_runtime_constraints_metadata_slots_persistable()?;
+        }
 
         // 3. Scan the heap and populate the tree.
         let mut attnums: Vec<u16> = Vec::with_capacity(columns.len());
@@ -1833,11 +1850,7 @@ where
         }
         self.state
             .commit_transaction(ddl_txn, true, "CREATE INDEX catalog transaction")?;
-        if !expression_key_exprs.is_empty()
-            || predicate.is_some()
-            || !include_columns.is_empty()
-            || *method != ultrasql_planner::LogicalIndexMethod::Btree
-        {
+        if writes_runtime_index_metadata {
             let mut constraints = self
                 .state
                 .table_constraints
@@ -1860,6 +1873,7 @@ where
             self.state
                 .table_constraints
                 .insert(table.oid, Arc::new(constraints));
+            self.state.persist_table_runtime_constraints_metadata()?;
         }
         // A new index can flip an existing cached plan from
         // `Filter(SeqScan)` to `IndexScan`; clear the cache so the next

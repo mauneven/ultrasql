@@ -867,6 +867,15 @@ async fn hnsw_crash_during_index_build_uses_exact_scan_after_restart() {
 
         graceful_shutdown(running).await;
     }
+
+    let table_runtime_metadata =
+        fs::read_to_string(dir.path().join("pg_table_runtime.meta")).expect("runtime metadata");
+    assert!(
+        !table_runtime_metadata
+            .lines()
+            .any(|line| line.starts_with("index\t")),
+        "stale ANN runtime index metadata must be scrubbed after crash recovery: {table_runtime_metadata}"
+    );
 }
 
 #[tokio::test]

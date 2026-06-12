@@ -243,40 +243,36 @@ fn wal_backed_catalog_bootstrap_errors_are_fatal() {
 fn table_runtime_metadata_preflight_rejects_unpersistable_expressions() {
     let dir = tempfile::tempdir().expect("data dir");
     let server = Server::init(dir.path()).expect("persistent server");
-    let function_expr = || ScalarExpr::FunctionCall {
-        name: "lower".to_owned(),
-        args: vec![ScalarExpr::Literal {
-            value: Value::Text("Ada".to_owned()),
-            data_type: DataType::Text { max_len: None },
-        }],
+    let parameter_expr = || ScalarExpr::Parameter {
+        index: 1,
         data_type: DataType::Text { max_len: None },
     };
 
     let mut constraints = TableRuntimeConstraints {
-        defaults: vec![Some(function_expr())],
+        defaults: vec![Some(parameter_expr())],
         ..TableRuntimeConstraints::default()
     };
     let err = server
         .ensure_table_runtime_constraints_metadata_persistable("public.t", &constraints)
-        .expect_err("function DEFAULT cannot be silently skipped");
+        .expect_err("parameter DEFAULT cannot be silently skipped");
     assert!(err.to_string().contains("DEFAULT expression"));
 
     constraints.defaults.clear();
-    constraints.generated_stored = vec![Some(function_expr())];
+    constraints.generated_stored = vec![Some(parameter_expr())];
     let err = server
         .ensure_table_runtime_constraints_metadata_persistable("public.t", &constraints)
-        .expect_err("function generated column cannot be silently skipped");
+        .expect_err("parameter generated column cannot be silently skipped");
     assert!(err.to_string().contains("generated stored expression"));
 
     constraints.generated_stored.clear();
     constraints.checks = vec![RuntimeCheckConstraint {
-        name: "ck_lower".to_owned(),
-        expr: function_expr(),
+        name: "ck_param".to_owned(),
+        expr: parameter_expr(),
     }];
     let err = server
         .ensure_table_runtime_constraints_metadata_persistable("public.t", &constraints)
-        .expect_err("function CHECK cannot be silently skipped");
-    assert!(err.to_string().contains("CHECK 'ck_lower' expression"));
+        .expect_err("parameter CHECK cannot be silently skipped");
+    assert!(err.to_string().contains("CHECK 'ck_param' expression"));
 }
 
 #[test]
