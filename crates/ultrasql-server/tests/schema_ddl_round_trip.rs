@@ -108,6 +108,51 @@ fn schema_metadata_rejects_unknown_owner_on_rebuild() {
     );
 }
 
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn drop_schema_rolls_back_runtime_state_when_metadata_slot_is_unsafe() {
+    use std::os::unix::fs::symlink;
+
+    let data_dir = tempfile::TempDir::new().expect("temp data dir");
+    support::make_data_dir_private(data_dir.path());
+    let outside = data_dir.path().join("outside-schema-meta");
+    std::fs::write(&outside, b"keep").expect("outside metadata target");
+
+    let running = start_persistent_server(data_dir.path(), "schema_drop_rollback").await;
+    let client = &running.client;
+    client
+        .batch_execute("CREATE SCHEMA schema_drop_rollback")
+        .await
+        .expect("create schema before failed drop");
+    symlink(&outside, data_dir.path().join("pg_schema_runtime.meta.tmp"))
+        .expect("schema temp symlink");
+
+    let err = client
+        .batch_execute("DROP SCHEMA schema_drop_rollback")
+        .await
+        .expect_err("unsafe schema metadata slot rejects DROP SCHEMA");
+    assert!(
+        err.as_db_error()
+            .is_some_and(|db| db.message().contains("runtime metadata file")),
+        "unexpected error: {err}"
+    );
+    let count = client
+        .query_one(
+            "SELECT COUNT(*) FROM pg_catalog.pg_namespace \
+             WHERE nspname = 'schema_drop_rollback'",
+            &[],
+        )
+        .await
+        .expect("schema remains queryable after failed drop")
+        .get::<_, i64>(0);
+    assert_eq!(
+        count, 1,
+        "failed DROP SCHEMA must not remove runtime schema state"
+    );
+
+    shutdown(running).await;
+}
+
 #[tokio::test]
 async fn drop_schema_if_exists_tolerates_missing_schema() {
     let running = start_sample_server("schema_ddl_missing").await;

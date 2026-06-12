@@ -5,6 +5,7 @@ use std::sync::Arc;
 use tokio::io::{AsyncRead, AsyncWrite};
 use ultrasql_core::RelationId;
 use ultrasql_planner::LogicalPlan;
+use ultrasql_storage::sequence::Sequence;
 use ultrasql_wal::payload::SequenceOpKind;
 
 use super::Session;
@@ -12,6 +13,16 @@ use crate::auth::PrivilegeObjectKind;
 use crate::error::ServerError;
 use crate::result_encoder::{self, SelectResult};
 use crate::{RuntimeSchema, builtin_schema_name};
+
+struct DropSchemaRuntimeSnapshot {
+    schemas: Vec<(String, Arc<RuntimeSchema>)>,
+    sequences: Vec<(String, Arc<Sequence>)>,
+    sequence_owners: Vec<(String, String)>,
+    sequence_namespaces: Vec<(String, String)>,
+    sequence_session: crate::SequenceSessionSnapshot,
+    privilege_grants: Vec<crate::auth::PrivilegeGrant>,
+    default_privilege_grants: Vec<crate::auth::DefaultPrivilegeGrant>,
+}
 
 impl<RW> Session<RW>
 where
@@ -116,6 +127,55 @@ where
                 )));
             }
         }
+        let mut cascade_sequence_names = Vec::new();
+        if *cascade {
+            for name in &drop_set {
+                cascade_sequence_names.extend(self.schema_sequence_names(name));
+            }
+            cascade_sequence_names.sort();
+            cascade_sequence_names.dedup();
+        }
+        let runtime_snapshot = DropSchemaRuntimeSnapshot {
+            schemas: drop_set
+                .iter()
+                .filter_map(|name| {
+                    self.state
+                        .schemas
+                        .get(name)
+                        .map(|schema| (name.clone(), Arc::clone(schema.value())))
+                })
+                .collect(),
+            sequences: cascade_sequence_names
+                .iter()
+                .filter_map(|name| {
+                    self.state
+                        .sequences
+                        .get(name)
+                        .map(|seq| (name.clone(), Arc::clone(seq.value())))
+                })
+                .collect(),
+            sequence_owners: cascade_sequence_names
+                .iter()
+                .filter_map(|name| {
+                    self.state
+                        .sequence_owners
+                        .get(name)
+                        .map(|owner| (name.clone(), owner.value().clone()))
+                })
+                .collect(),
+            sequence_namespaces: cascade_sequence_names
+                .iter()
+                .filter_map(|name| {
+                    self.state
+                        .sequence_namespaces
+                        .get(name)
+                        .map(|namespace| (name.clone(), namespace.value().clone()))
+                })
+                .collect(),
+            sequence_session: self.sequence_state.snapshot(),
+            privilege_grants: self.state.privilege_catalog.list_grants(),
+            default_privilege_grants: self.state.privilege_catalog.list_default_grants(),
+        };
         let mut privilege_metadata_changed = false;
         let mut sequence_owner_metadata_changed = false;
         if *cascade {
@@ -137,14 +197,62 @@ where
                 .remove_default_grants_for_schema(name);
         }
         if sequence_owner_metadata_changed {
-            self.state.persist_sequence_owner_metadata()?;
+            if let Err(err) = self.state.persist_sequence_owner_metadata() {
+                self.restore_drop_schema_runtime_state(runtime_snapshot);
+                return Err(err);
+            }
         }
-        self.state.persist_schema_metadata()?;
+        if let Err(err) = self.state.persist_schema_metadata() {
+            self.restore_drop_schema_runtime_state(runtime_snapshot);
+            if sequence_owner_metadata_changed
+                && let Err(restore_err) = self.state.persist_sequence_owner_metadata()
+            {
+                return Err(ServerError::ddl(format!(
+                    "DROP SCHEMA schema metadata error: {err}; sequence owner metadata rollback failed: {restore_err}"
+                )));
+            }
+            return Err(err);
+        }
         if privilege_metadata_changed {
-            self.state.persist_privilege_metadata()?;
+            if let Err(err) = self.state.persist_privilege_metadata() {
+                self.restore_drop_schema_runtime_state(runtime_snapshot);
+                if sequence_owner_metadata_changed
+                    && let Err(restore_err) = self.state.persist_sequence_owner_metadata()
+                {
+                    return Err(ServerError::ddl(format!(
+                        "DROP SCHEMA privilege metadata error: {err}; sequence owner metadata rollback failed: {restore_err}"
+                    )));
+                }
+                if let Err(restore_err) = self.state.persist_schema_metadata() {
+                    return Err(ServerError::ddl(format!(
+                        "DROP SCHEMA privilege metadata error: {err}; schema metadata rollback failed: {restore_err}"
+                    )));
+                }
+                return Err(err);
+            }
         }
         self.plan_cache_invalidate();
         Ok(result_encoder::run_ddl_command("DROP SCHEMA"))
+    }
+
+    fn restore_drop_schema_runtime_state(&self, snapshot: DropSchemaRuntimeSnapshot) {
+        for (name, schema) in snapshot.schemas {
+            self.state.schemas.insert(name, schema);
+        }
+        for (name, sequence) in snapshot.sequences {
+            self.state.sequences.insert(name, sequence);
+        }
+        for (name, owner) in snapshot.sequence_owners {
+            self.state.sequence_owners.insert(name, owner);
+        }
+        for (name, namespace) in snapshot.sequence_namespaces {
+            self.state.sequence_namespaces.insert(name, namespace);
+        }
+        self.sequence_state
+            .restore_snapshot(snapshot.sequence_session);
+        self.state
+            .privilege_catalog
+            .install_snapshot(snapshot.privilege_grants, snapshot.default_privilege_grants);
     }
 
     fn drop_schema_sequences(&mut self, schema_name: &str) -> Result<(bool, bool), ServerError> {
