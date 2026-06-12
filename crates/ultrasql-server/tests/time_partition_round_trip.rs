@@ -335,6 +335,58 @@ async fn partitioned_table_truncate_clears_chunks() {
 }
 
 #[tokio::test]
+async fn qualified_partitioned_truncate_isolates_schema_chunks() {
+    let (_server, client, _conn, server_handle) = start_server_and_connect().await;
+
+    client
+        .batch_execute(
+            "CREATE SCHEMA app;\
+             CREATE TABLE metrics_schema_truncate (\
+             ts TIMESTAMP NOT NULL, host TEXT NOT NULL, value INT NOT NULL\
+             ) PARTITION BY RANGE (ts);\
+             CREATE TABLE app.metrics_schema_truncate (\
+             ts TIMESTAMP NOT NULL, host TEXT NOT NULL, value INT NOT NULL\
+             ) PARTITION BY RANGE (ts);\
+             INSERT INTO metrics_schema_truncate VALUES \
+             (TIMESTAMP '2026-05-20 00:00:00', 'public', 10);\
+             INSERT INTO app.metrics_schema_truncate VALUES \
+             (TIMESTAMP '2026-05-20 00:00:00', 'app', 20);\
+             TRUNCATE TABLE app.metrics_schema_truncate;",
+        )
+        .await
+        .expect("truncate only qualified partitioned table");
+
+    let public_count = client
+        .query_one("SELECT COUNT(*) FROM metrics_schema_truncate", &[])
+        .await
+        .expect("count public partitioned table")
+        .get::<_, i64>(0);
+    assert_eq!(public_count, 1);
+    let app_count = client
+        .query_one("SELECT COUNT(*) FROM app.metrics_schema_truncate", &[])
+        .await
+        .expect("count app partitioned table")
+        .get::<_, i64>(0);
+    assert_eq!(app_count, 0);
+
+    client
+        .batch_execute(
+            "INSERT INTO app.metrics_schema_truncate VALUES \
+             (TIMESTAMP '2026-05-21 00:00:00', 'app2', 30)",
+        )
+        .await
+        .expect("insert after qualified partitioned truncate");
+    let app_count = client
+        .query_one("SELECT COUNT(*) FROM app.metrics_schema_truncate", &[])
+        .await
+        .expect("count app partitioned table after insert")
+        .get::<_, i64>(0);
+    assert_eq!(app_count, 1);
+
+    shutdown(client, server_handle).await;
+}
+
+#[tokio::test]
 async fn partitioned_table_add_column_refreshes_runtime_schema() {
     let data_dir = tempfile::TempDir::new().expect("temp data dir");
 
