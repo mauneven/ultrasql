@@ -1837,6 +1837,80 @@ async fn privilege_catalog_survives_restart() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn table_rename_rewrites_privilege_metadata_across_restart() {
+    let data_dir = tempfile::TempDir::new().expect("temp data dir");
+
+    let running = start_persistent_server(data_dir.path(), "privilege_rename_setup").await;
+    let client = &running.client;
+    client
+        .batch_execute(
+            "CREATE ROLE tester SUPERUSER LOGIN; \
+             CREATE ROLE rename_acl_reader LOGIN; \
+             CREATE TABLE privilege_rename_old (id INT, secret TEXT); \
+             INSERT INTO privilege_rename_old VALUES (1, 'hidden'); \
+             GRANT SELECT(id), UPDATE(id) ON TABLE privilege_rename_old TO rename_acl_reader; \
+             GRANT DELETE ON TABLE privilege_rename_old TO rename_acl_reader; \
+             ALTER TABLE privilege_rename_old RENAME TO privilege_rename_new",
+        )
+        .await
+        .expect("create grants and rename table");
+    shutdown(running).await;
+
+    let running = start_persistent_server(data_dir.path(), "privilege_rename_verify").await;
+    let checks = running
+        .client
+        .query_one(
+            "SELECT \
+                has_column_privilege('rename_acl_reader', 'privilege_rename_new', 'id', 'SELECT'), \
+                has_column_privilege('rename_acl_reader', 'privilege_rename_old', 'id', 'SELECT'), \
+                has_table_privilege('rename_acl_reader', 'privilege_rename_new', 'DELETE'), \
+                has_table_privilege('rename_acl_reader', 'privilege_rename_old', 'DELETE'), \
+                has_column_privilege('rename_acl_reader', 'privilege_rename_new', 'secret', 'SELECT')",
+            &[],
+        )
+        .await
+        .expect("privilege checks after table rename restart");
+    assert!(
+        checks.get::<_, bool>(0),
+        "renamed table should keep column SELECT grant"
+    );
+    assert!(
+        !checks.get::<_, bool>(1),
+        "old table name must not keep stale column SELECT grant"
+    );
+    assert!(
+        checks.get::<_, bool>(2),
+        "renamed table should keep object DELETE grant"
+    );
+    assert!(
+        !checks.get::<_, bool>(3),
+        "old table name must not keep stale object DELETE grant"
+    );
+    assert!(
+        !checks.get::<_, bool>(4),
+        "ungranted column should stay denied after rename"
+    );
+
+    let (reader, reader_conn) =
+        connect_as(running.bound, "rename_acl_reader", "rename_acl_reader").await;
+    let row = reader
+        .query_one("SELECT id FROM privilege_rename_new WHERE id = 1", &[])
+        .await
+        .expect("renamed table column grant permits SELECT");
+    assert_eq!(row.get::<_, i32>(0), 1);
+    assert_insufficient_privilege(
+        reader
+            .query_one("SELECT secret FROM privilege_rename_new WHERE id = 1", &[])
+            .await
+            .expect_err("ungranted renamed table column SELECT fails"),
+    );
+    drop(reader);
+    reader_conn.await.expect("reader connection joins");
+
+    shutdown(running).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn privilege_metadata_accepts_uncataloged_trust_grantor_on_rebuild() {
     let data_dir = tempfile::TempDir::new().expect("temp data dir");
 

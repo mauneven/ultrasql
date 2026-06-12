@@ -15,6 +15,7 @@ use ultrasql_storage::heap::{DeleteOptions, UpdateOptions};
 use ultrasql_txn::IsolationLevel;
 
 use super::Session;
+use crate::auth::PrivilegeObjectKind;
 use crate::error::ServerError;
 use crate::result_encoder::{SelectResult, run_ddl_command};
 
@@ -484,11 +485,18 @@ where
     ) -> Result<SelectResult, ServerError> {
         self.state
             .ensure_create_relation_metadata_slots_persistable()?;
+        let before_grants = self.state.privilege_catalog.list_grants();
+        let before_default_grants = self.state.privilege_catalog.list_default_grants();
         let updated_entry = self
             .state
             .persistent_catalog
             .alter_table_rename(old_name, new_name)
             .map_err(ServerError::Catalog)?;
+        let privilege_metadata_changed = self.state.privilege_catalog.rename_object_grants(
+            PrivilegeObjectKind::Table,
+            old_name,
+            new_name,
+        );
         let attr_has_defaults =
             if let Some(runtime) = self.state.table_constraints.get(&updated_entry.oid) {
                 alter_attr_has_defaults(Some(runtime.value().as_ref()), updated_entry.schema.len())
@@ -516,6 +524,12 @@ where
         self.state
             .commit_transaction(txn, true, "ALTER TABLE RENAME")?;
         self.state.persist_row_security_metadata()?;
+        if privilege_metadata_changed && let Err(err) = self.state.persist_privilege_metadata() {
+            self.state
+                .privilege_catalog
+                .install_snapshot(before_grants, before_default_grants);
+            return Err(err);
+        }
         self.state.plan_cache.invalidate_all();
         Ok(run_ddl_command(&format!(
             "ALTER TABLE RENAME TO {new_name}"

@@ -230,6 +230,44 @@ impl InMemoryPrivilegeCatalog {
         grants.len() != before
     }
 
+    /// Rename all explicit grants attached to one object.
+    pub fn rename_object_grants(
+        &self,
+        object_kind: PrivilegeObjectKind,
+        old_object: &str,
+        new_object: &str,
+    ) -> bool {
+        let old_object_name = normalize_object_name(object_kind, old_object);
+        let new_object_name = normalize_object_name(object_kind, new_object);
+        if old_object_name == new_object_name {
+            return false;
+        }
+        let mut grants = self.grants.write();
+        let old_keys = grants
+            .keys()
+            .filter(|key| key.object_kind == object_kind && key.object_name == old_object_name)
+            .cloned()
+            .collect::<Vec<_>>();
+        let changed = !old_keys.is_empty();
+        for old_key in old_keys {
+            let Some(mut grant) = grants.remove(&old_key) else {
+                continue;
+            };
+            grant.object_name.clone_from(&new_object_name);
+            grants.insert(
+                PrivilegeKey {
+                    object_kind: old_key.object_kind,
+                    object_name: new_object_name.clone(),
+                    grantee: old_key.grantee,
+                    privilege: old_key.privilege,
+                    column_name: old_key.column_name,
+                },
+                grant,
+            );
+        }
+        changed
+    }
+
     /// Remove every default privilege template scoped to one schema.
     pub fn remove_default_grants_for_schema(&self, schema_name: &str) -> bool {
         let schema_name = schema_name.to_ascii_lowercase();
@@ -760,6 +798,56 @@ mod tests {
             PrivilegeKind::Usage
         ));
         assert!(!catalog.remove_object_grants(PrivilegeObjectKind::Table, "t"));
+    }
+
+    #[test]
+    fn rename_object_grants_rekeys_object_and_column_entries() {
+        let catalog = InMemoryPrivilegeCatalog::new();
+        catalog.grant_many(
+            "ultrasql",
+            PrivilegeObjectKind::Table,
+            &["public.old_t".to_owned()],
+            &["analyst".to_owned()],
+            &[
+                PrivilegeRequest {
+                    privilege: PrivilegeKind::Delete,
+                    columns: Vec::new(),
+                },
+                PrivilegeRequest {
+                    privilege: PrivilegeKind::Select,
+                    columns: vec!["id".to_owned()],
+                },
+            ],
+            false,
+        );
+
+        assert!(catalog.rename_object_grants(PrivilegeObjectKind::Table, "old_t", "new_t"));
+        assert!(catalog.has_privilege(
+            "analyst",
+            PrivilegeObjectKind::Table,
+            "new_t",
+            PrivilegeKind::Delete
+        ));
+        assert!(!catalog.has_privilege(
+            "analyst",
+            PrivilegeObjectKind::Table,
+            "old_t",
+            PrivilegeKind::Delete
+        ));
+        assert!(catalog.has_column_privilege(
+            "analyst",
+            PrivilegeObjectKind::Table,
+            "new_t",
+            "id",
+            PrivilegeKind::Select
+        ));
+        assert!(!catalog.has_column_privilege(
+            "analyst",
+            PrivilegeObjectKind::Table,
+            "old_t",
+            "id",
+            PrivilegeKind::Select
+        ));
     }
 
     #[test]
