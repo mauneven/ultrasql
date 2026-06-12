@@ -183,10 +183,11 @@ where
         let rows = match outcome {
             Ok(result) => result.rows,
             Err(e) => {
-                if let Err(abort_err) = self.state.txn_manager.abort(txn) {
-                    tracing::warn!(error = %abort_err, "EXPLAIN ANALYZE abort failed");
-                }
-                return Err(e);
+                return Err(self.rollback_explain_analyze_transaction_after_error(
+                    txn,
+                    e,
+                    "EXPLAIN ANALYZE rollback after execution error",
+                ));
             }
         };
         if let Err(e) = self.state.txn_manager.commit(txn) {
@@ -208,6 +209,15 @@ where
             parquet_columns_read: notes.parquet_columns_read,
             operator_profile: None,
         })
+    }
+
+    pub(crate) fn rollback_explain_analyze_transaction_after_error(
+        &self,
+        txn: ultrasql_txn::Transaction,
+        original: ServerError,
+        context: &'static str,
+    ) -> ServerError {
+        self.rollback_transaction_after_error(txn, original, context)
     }
 
     fn run_explain_select_analyze(
@@ -271,12 +281,11 @@ where
                 }
                 Ok(actuals)
             }
-            Err(e) => {
-                if let Err(abort_err) = self.state.txn_manager.abort(txn) {
-                    tracing::warn!(error = %abort_err, "EXPLAIN ANALYZE abort failed");
-                }
-                Err(e)
-            }
+            Err(e) => Err(self.rollback_explain_analyze_transaction_after_error(
+                txn,
+                e,
+                "EXPLAIN ANALYZE select rollback after execution error",
+            )),
         }
     }
 
@@ -493,10 +502,12 @@ where
                 summary.note
             }
             Err(e) => {
-                if let Err(abort_err) = self.state.txn_manager.abort(txn) {
-                    tracing::warn!(error = %abort_err, "EXPLAIN ANALYZE late materialization note abort failed");
-                }
-                format!("skipped: {e}")
+                let err = self.rollback_explain_analyze_transaction_after_error(
+                    txn,
+                    e,
+                    "EXPLAIN ANALYZE late materialization note rollback after summary error",
+                );
+                format!("skipped: {err}")
             }
         }
     }
@@ -1339,14 +1350,20 @@ fn json_escape(input: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use super::*;
+    use tokio::io::{DuplexStream, duplex};
     use ultrasql_core::{Field, Schema};
     use ultrasql_executor::MemTableScan;
     use ultrasql_planner::{
         AggregateFunc, LogicalAggregateExpr, LogicalJoinCondition, LogicalJoinType, LogicalSetOp,
         LogicalSetQuantifier,
     };
+    use ultrasql_txn::IsolationLevel;
     use ultrasql_vec::column::{Column, NumericColumn, StringColumn};
+
+    use crate::Server;
 
     fn schema() -> Schema {
         Schema::new([Field::required("id", DataType::Int32)]).expect("schema")
@@ -1373,6 +1390,38 @@ mod tests {
             value: Value::Int32(value),
             data_type: DataType::Int32,
         }
+    }
+
+    fn test_session() -> Session<DuplexStream> {
+        let (io, _peer) = duplex(64);
+        Session::new(io, Arc::new(Server::with_sample_database()))
+    }
+
+    #[test]
+    fn explain_analyze_cleanup_reports_abort_failure_with_original_error() {
+        let session = test_session();
+        let txn = session
+            .state
+            .txn_manager
+            .begin(IsolationLevel::ReadCommitted);
+        let stale = txn.clone();
+        session.state.txn_manager.abort(txn).expect("pre-abort");
+
+        let err = session.rollback_explain_analyze_transaction_after_error(
+            stale,
+            ServerError::Unsupported("analyze boom"),
+            "EXPLAIN ANALYZE rollback after execution error",
+        );
+        let msg = err.to_string();
+        assert!(
+            msg.contains("EXPLAIN ANALYZE rollback after execution error"),
+            "unexpected error: {err}"
+        );
+        assert!(msg.contains("analyze boom"), "original error lost: {err}");
+        assert!(
+            msg.contains("transaction abort failed"),
+            "abort failure hidden: {err}"
+        );
     }
 
     #[test]
