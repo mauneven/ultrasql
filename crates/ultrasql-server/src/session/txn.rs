@@ -137,10 +137,16 @@ where
                     .clear_session_transaction_start(self.pid);
                 let xid = txn.xid;
                 if let Err(e) = self.state.heap.rollback_in_place_updates(xid) {
-                    tracing::warn!(error = %e, "in-place update rollback failed");
+                    self.txn_state = TxnState::Failed(txn);
+                    return Err(ServerError::Ddl(format!(
+                        "PREPARE TRANSACTION rollback in-place updates: {e}"
+                    )));
                 }
                 if let Err(e) = self.state.txn_manager.abort(txn) {
-                    tracing::warn!(error = %e, "PREPARE TRANSACTION on failed block — abort failed");
+                    self.clear_pending_dml_effects();
+                    return Err(ServerError::Ddl(format!(
+                        "PREPARE TRANSACTION failed-block abort: {e}"
+                    )));
                 }
                 self.clear_pending_dml_effects();
                 Ok(SelectResult {
@@ -819,6 +825,26 @@ mod tests {
             .expect_err("stale failed-block commit must fail");
         assert!(
             err.to_string().contains("COMMIT"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn failed_prepare_reports_abort_failure_instead_of_success_tag() {
+        let mut session = test_session();
+        let txn = session
+            .state
+            .txn_manager
+            .begin(IsolationLevel::ReadCommitted);
+        let stale = txn.clone();
+        session.state.txn_manager.abort(txn).expect("pre-abort");
+        session.txn_state = TxnState::Failed(stale);
+
+        let err = session
+            .execute_prepare_transaction("stale-prepare")
+            .expect_err("stale failed-block prepare must fail");
+        assert!(
+            err.to_string().contains("PREPARE TRANSACTION"),
             "unexpected error: {err}"
         );
     }
