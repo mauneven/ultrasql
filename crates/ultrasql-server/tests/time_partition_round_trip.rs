@@ -272,6 +272,108 @@ async fn partitioned_table_add_column_refreshes_runtime_schema() {
     shutdown_persistent(running).await;
 }
 
+#[tokio::test]
+async fn partitioned_table_drop_column_refreshes_chunk_schema() {
+    let data_dir = tempfile::TempDir::new().expect("temp data dir");
+
+    let running =
+        start_persistent_server(data_dir.path(), "time_partition_drop_column_setup").await;
+    running
+        .client
+        .batch_execute(
+            "CREATE TABLE metrics_drop_column (\
+             ts TIMESTAMP NOT NULL, host TEXT NOT NULL, value INT NOT NULL, note TEXT\
+             ) PARTITION BY RANGE (ts);\
+             INSERT INTO metrics_drop_column VALUES \
+             (TIMESTAMP '2026-05-20 00:00:00', 'a', 10, 'before');\
+             ALTER TABLE metrics_drop_column DROP COLUMN note;\
+             INSERT INTO metrics_drop_column VALUES \
+             (TIMESTAMP '2026-05-21 00:00:00', 'b', 20)",
+        )
+        .await
+        .expect("drop partitioned table column and insert narrowed row");
+
+    let rows = running
+        .client
+        .query(
+            "SELECT host, value FROM metrics_drop_column ORDER BY value",
+            &[],
+        )
+        .await
+        .expect("scan narrowed partitioned parent");
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0].get::<_, String>(0), "a");
+    assert_eq!(rows[0].get::<_, i32>(1), 10);
+    assert_eq!(rows[1].get::<_, String>(0), "b");
+    assert_eq!(rows[1].get::<_, i32>(1), 20);
+    shutdown_persistent(running).await;
+
+    let running =
+        start_persistent_server(data_dir.path(), "time_partition_drop_column_verify").await;
+    let rows = running
+        .client
+        .query(
+            "SELECT host, value FROM metrics_drop_column ORDER BY value",
+            &[],
+        )
+        .await
+        .expect("scan narrowed partitioned parent after restart");
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0].get::<_, String>(0), "a");
+    assert_eq!(rows[0].get::<_, i32>(1), 10);
+    assert_eq!(rows[1].get::<_, String>(0), "b");
+    assert_eq!(rows[1].get::<_, i32>(1), 20);
+    shutdown_persistent(running).await;
+}
+
+#[tokio::test]
+async fn partitioned_table_rejects_dropping_partition_key() {
+    let (server, client, _conn, server_handle) = start_server_and_connect().await;
+
+    client
+        .batch_execute(
+            "CREATE TABLE metrics_drop_key (\
+             ts TIMESTAMP NOT NULL, host TEXT NOT NULL, value INT NOT NULL\
+             ) PARTITION BY RANGE (ts);\
+             INSERT INTO metrics_drop_key VALUES \
+             (TIMESTAMP '2026-05-20 00:00:00', 'a', 10)",
+        )
+        .await
+        .expect("create and seed partitioned table");
+
+    let err = client
+        .batch_execute("ALTER TABLE metrics_drop_key DROP COLUMN ts")
+        .await
+        .expect_err("partition key drop must be rejected");
+    let message = err
+        .as_db_error()
+        .map_or_else(|| err.to_string(), |db| db.message().to_owned());
+    assert!(
+        message.contains("partition"),
+        "error should name partition key constraint: {message}"
+    );
+
+    assert!(
+        server.time_partitions.get("metrics_drop_key").is_some(),
+        "failed partition key drop must preserve runtime"
+    );
+    client
+        .batch_execute(
+            "INSERT INTO metrics_drop_key VALUES \
+             (TIMESTAMP '2026-05-21 00:00:00', 'b', 20)",
+        )
+        .await
+        .expect("insert still routes after rejected partition key drop");
+    let count = client
+        .query_one("SELECT COUNT(*) FROM metrics_drop_key", &[])
+        .await
+        .expect("count after rejected partition key drop")
+        .get::<_, i64>(0);
+    assert_eq!(count, 2);
+
+    shutdown(client, server_handle).await;
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn partitioned_table_rebuilds_runtime_after_restart() {
     let data_dir = tempfile::TempDir::new().expect("temp data dir");

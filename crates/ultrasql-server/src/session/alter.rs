@@ -320,6 +320,21 @@ where
                 "ALTER TABLE DROP COLUMN: {e}"
             )))
         })?;
+        let table_key = ultrasql_catalog::table_lookup_key(&entry.schema_name, &entry.name);
+        let partition_chunks = if let Some(runtime) = self.state.time_partitions.get(&table_key) {
+            if runtime.partition_column_index == column_index {
+                return Err(ServerError::Unsupported(
+                    "ALTER TABLE DROP COLUMN cannot drop a time partition key",
+                ));
+            }
+            runtime
+                .chunks
+                .iter()
+                .filter_map(|chunk| snapshot.tables.get(&chunk.table_name).cloned())
+                .collect::<Vec<_>>()
+        } else {
+            Vec::new()
+        };
 
         let txn = self.state.txn_manager.begin(IsolationLevel::ReadCommitted);
         let rel = RelationId(entry.oid);
@@ -346,6 +361,39 @@ where
                     to_rewrite.push((tup.tid, row));
                 }
             }
+            let mut chunk_rewrites = Vec::with_capacity(partition_chunks.len());
+            for chunk_entry in &partition_chunks {
+                let chunk_rel = RelationId(chunk_entry.oid);
+                let chunk_block_count = self
+                    .state
+                    .heap
+                    .block_count(chunk_rel)
+                    .max(chunk_entry.n_blocks);
+                let chunk_codec = ultrasql_executor::RowCodec::new(chunk_entry.schema.clone());
+                let mut chunk_rows = Vec::new();
+                {
+                    let scan = self.state.heap.scan_visible(
+                        chunk_rel,
+                        chunk_block_count,
+                        &txn.snapshot,
+                        self.state.txn_manager.as_ref(),
+                    );
+                    for result in scan {
+                        let tup = result.map_err(|e| {
+                            ServerError::ddl(format!(
+                                "ALTER TABLE DROP COLUMN partition chunk scan: {e}"
+                            ))
+                        })?;
+                        let row = chunk_codec.decode(&tup.data).map_err(|e| {
+                            ServerError::ddl(format!(
+                                "ALTER TABLE DROP COLUMN partition chunk decode: {e}"
+                            ))
+                        })?;
+                        chunk_rows.push((tup.tid, row));
+                    }
+                }
+                chunk_rewrites.push(chunk_rows);
+            }
             for (tid, mut old_row) in to_rewrite {
                 old_row.remove(column_index);
                 let new_payload = new_codec.encode(&old_row).map_err(|e| {
@@ -368,6 +416,34 @@ where
                         ServerError::ddl(format!("ALTER TABLE DROP COLUMN heap update: {e}"))
                     })?;
             }
+            for rows in chunk_rewrites {
+                for (tid, mut old_row) in rows {
+                    old_row.remove(column_index);
+                    let new_payload = new_codec.encode(&old_row).map_err(|e| {
+                        ServerError::ddl(format!(
+                            "ALTER TABLE DROP COLUMN partition chunk encode: {e}"
+                        ))
+                    })?;
+                    self.state
+                        .heap
+                        .update(
+                            tid,
+                            &new_payload,
+                            UpdateOptions {
+                                xid: txn.xid,
+                                command_id: ultrasql_core::CommandId::FIRST,
+                                wal: self.state.heap.wal_sink().map(|sink| sink.as_ref()),
+                                vm: Some(self.state.vm.as_ref()),
+                                hot_eligible: true,
+                            },
+                        )
+                        .map_err(|e| {
+                            ServerError::ddl(format!(
+                                "ALTER TABLE DROP COLUMN partition chunk update: {e}"
+                            ))
+                        })?;
+                }
+            }
             Ok(())
         })();
 
@@ -376,7 +452,7 @@ where
                 let updated_entry = self
                     .state
                     .persistent_catalog
-                    .alter_table_replace_schema(table_name, new_schema)
+                    .alter_table_replace_schema(table_name, new_schema.clone())
                     .map_err(ServerError::Catalog)?;
                 if let Err(e) = self
                     .state
@@ -395,8 +471,54 @@ where
                         "ALTER TABLE DROP COLUMN catalog rollback after persist error",
                     ));
                 }
+                for chunk_entry in &partition_chunks {
+                    let chunk_key = ultrasql_catalog::table_lookup_key(
+                        &chunk_entry.schema_name,
+                        &chunk_entry.name,
+                    );
+                    let updated_chunk = self
+                        .state
+                        .persistent_catalog
+                        .alter_table_replace_schema(&chunk_key, new_schema.clone())
+                        .map_err(ServerError::Catalog)?;
+                    if let Err(e) = self
+                        .state
+                        .persistent_catalog
+                        .persist_table_schema_replacement(
+                            chunk_entry,
+                            &updated_chunk,
+                            self.state.heap.as_ref(),
+                            txn.xid,
+                            txn.current_command,
+                        )
+                    {
+                        return Err(self.rollback_catalog_transaction_after_error(
+                            txn,
+                            e.into(),
+                            "ALTER TABLE DROP COLUMN partition chunk catalog rollback after persist error",
+                        ));
+                    }
+                }
                 self.state
                     .commit_transaction(txn, true, "ALTER TABLE DROP COLUMN")?;
+                if let Some((_, partition)) = self.state.time_partitions.remove(&table_key) {
+                    let partition_column_index = if column_index < partition.partition_column_index
+                    {
+                        partition.partition_column_index.saturating_sub(1)
+                    } else {
+                        partition.partition_column_index
+                    };
+                    self.state.time_partitions.insert(
+                        table_key,
+                        Arc::new(partition.as_ref().with_parent_metadata(
+                            updated_entry.schema_name.clone(),
+                            updated_entry.name.clone(),
+                            updated_entry.schema.clone(),
+                            partition.partition_column.clone(),
+                            partition_column_index,
+                        )),
+                    );
+                }
                 self.state.plan_cache.invalidate_all();
                 Ok(run_ddl_command(&format!(
                     "ALTER TABLE DROP COLUMN {column_name}"
