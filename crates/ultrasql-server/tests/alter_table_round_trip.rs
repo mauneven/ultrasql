@@ -143,6 +143,32 @@ async fn alter_table_add_not_null_column_rejects_non_empty_table() {
     shutdown(client, server_handle).await;
 }
 
+/// Unsupported `ADD COLUMN` constraints must fail closed instead of
+/// being silently discarded by the binder.
+#[tokio::test]
+async fn alter_table_add_column_rejects_unsupported_constraints() {
+    let (client, _conn, server_handle) = start_server_and_connect().await;
+
+    client
+        .batch_execute("CREATE TABLE t (id INT NOT NULL)")
+        .await
+        .expect("create");
+
+    let err = client
+        .batch_execute("ALTER TABLE t ADD COLUMN c INT DEFAULT 7")
+        .await
+        .expect_err("unsupported ADD COLUMN DEFAULT must be rejected");
+    assert_eq!(err.code().expect("SQLSTATE").code(), "0A000");
+
+    let err = client
+        .query("SELECT c FROM t", &[])
+        .await
+        .expect_err("failed ALTER must not install column");
+    assert_eq!(err.code().expect("SQLSTATE").code(), "42703");
+
+    shutdown(client, server_handle).await;
+}
+
 /// Two `ALTER TABLE ADD COLUMN` statements stack: the schema grows by
 /// each addition and earlier columns are unaffected.
 #[tokio::test]

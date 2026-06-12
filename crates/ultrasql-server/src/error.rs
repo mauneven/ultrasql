@@ -238,6 +238,10 @@ impl ServerError {
             Self::Plan(ultrasql_planner::PlanError::DuplicateColumn(_)) => "42701", // duplicate_column
             Self::Plan(ultrasql_planner::PlanError::ColumnNotFound(_)) => "42703", // undefined_column
             Self::Plan(ultrasql_planner::PlanError::TypeMismatch(_)) => "42804", // datatype_mismatch
+            Self::Plan(
+                ultrasql_planner::PlanError::NotSupported(_)
+                | ultrasql_planner::PlanError::NotSupportedOwned(_),
+            ) => "0A000", // feature_not_supported
             // undefined_table — coarse planner fallback plus the catalog
             // NotFound that surfaces when DROP / ALTER fails to resolve a name
             Self::Plan(_) | Self::Catalog(ultrasql_catalog::CatalogError::NotFound(_)) => "42P01",

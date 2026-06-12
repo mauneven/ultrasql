@@ -544,6 +544,28 @@ fn column_default(constraints: &[ColumnConstraint]) -> Result<Option<&Expr>, Pla
     Ok(out)
 }
 
+fn reject_unsupported_alter_add_column_constraints(
+    constraints: &[ColumnConstraint],
+) -> Result<(), PlanError> {
+    for constraint in constraints {
+        match constraint {
+            ColumnConstraint::Null { .. } | ColumnConstraint::NotNull { .. } => {}
+            ColumnConstraint::Default { .. }
+            | ColumnConstraint::PrimaryKey { .. }
+            | ColumnConstraint::Unique { .. }
+            | ColumnConstraint::Check { .. }
+            | ColumnConstraint::References { .. }
+            | ColumnConstraint::GeneratedIdentity { .. }
+            | ColumnConstraint::GeneratedStored { .. } => {
+                return Err(PlanError::NotSupported(
+                    "ALTER TABLE ADD COLUMN currently supports only NULL and NOT NULL column constraints",
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
 fn column_identity(
     constraints: &[ColumnConstraint],
 ) -> Result<Option<(bool, LogicalSequenceOptions)>, PlanError> {
@@ -2327,8 +2349,8 @@ pub(super) fn bind_drop_index(
 /// contract stays honest.
 ///
 /// For `ADD COLUMN` the binder resolves the column's data type and
-/// nullability against the same v0.5 column-constraint matrix used by
-/// `CREATE TABLE` and rejects duplicate column names up front
+/// nullability, rejects unsupported constraints before they can be
+/// silently discarded, and rejects duplicate column names up front
 /// ([`PlanError::DuplicateColumn`]).
 pub(super) fn bind_alter_table(
     s: &AlterTableStmt,
@@ -2346,6 +2368,7 @@ pub(super) fn bind_alter_table(
             if table_schema.find(&new_name.to_ascii_lowercase()).is_some() {
                 return Err(PlanError::DuplicateColumn(new_name));
             }
+            reject_unsupported_alter_add_column_constraints(&column.constraints)?;
             let dtype = resolve_type_name_with_catalog(&column.data_type, catalog)?;
             let nullable = resolve_column_nullability(&column.constraints)?;
             let field = if nullable {
