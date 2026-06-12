@@ -192,14 +192,16 @@ impl LogicalReplicationRuntime {
     }
 
     /// Remove a publication, returning whether it existed.
-    #[must_use]
-    pub fn drop_publication(&self, name: &str) -> bool {
+    ///
+    /// Metadata-backed runtimes delete durable state before mutating in-memory
+    /// state so a failed drop cannot resurrect after restart.
+    pub fn drop_publication(&self, name: &str) -> Result<bool, ServerError> {
         let name = fold_identifier(name);
-        let removed = self.publications.remove(&name).is_some();
-        if removed {
-            let _ = self.remove_metadata_file("publications", &name);
+        if self.publications.get(&name).is_none() {
+            return Ok(false);
         }
-        removed
+        self.remove_metadata_file("publications", &name)?;
+        Ok(self.publications.remove(&name).is_some())
     }
 
     /// Look up a publication by name.
@@ -275,14 +277,16 @@ impl LogicalReplicationRuntime {
     }
 
     /// Remove a subscription, returning whether it existed.
-    #[must_use]
-    pub fn drop_subscription(&self, name: &str) -> bool {
+    ///
+    /// Metadata-backed runtimes delete durable state before mutating in-memory
+    /// state so a failed drop cannot resurrect after restart.
+    pub fn drop_subscription(&self, name: &str) -> Result<bool, ServerError> {
         let name = fold_identifier(name);
-        let removed = self.subscriptions.remove(&name).is_some();
-        if removed {
-            let _ = self.remove_metadata_file("subscriptions", &name);
+        if self.subscriptions.get(&name).is_none() {
+            return Ok(false);
         }
-        removed
+        self.remove_metadata_file("subscriptions", &name)?;
+        Ok(self.subscriptions.remove(&name).is_some())
     }
 
     /// Return subscriptions in deterministic name order.
@@ -1206,9 +1210,64 @@ mod tests {
         fs::write(&outside_file, "name=pub_events\ntables=secret\n").expect("outside metadata");
         symlink(outside.path(), dir.path().join("publications")).expect("publication dir symlink");
 
-        assert!(runtime.drop_publication("pub_events"));
+        let err = runtime
+            .drop_publication("pub_events")
+            .expect_err("metadata deletion failure should abort drop");
+        assert!(
+            err.to_string()
+                .contains("logical replication metadata directory")
+        );
 
         assert!(outside_file.exists());
+        assert!(runtime.publication("pub_events").is_some());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn logical_subscription_drop_does_not_follow_swapped_symlinked_kind_directory() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::TempDir::new().expect("metadata dir");
+        let outside = tempfile::TempDir::new().expect("outside dir");
+        let runtime = LogicalReplicationRuntime::open_metadata(dir.path()).expect("runtime");
+        runtime
+            .create_publication("pub_events", vec!["events".to_string()])
+            .expect("publication");
+        runtime
+            .create_subscription(
+                "sub_events",
+                "host=localhost dbname=ultrasql",
+                vec!["pub_events".to_string()],
+                None,
+            )
+            .expect("subscription");
+        fs::remove_file(metadata_path(
+            &dir.path().join("subscriptions"),
+            "sub_events",
+        ))
+        .expect("remove local metadata");
+        fs::remove_dir(dir.path().join("subscriptions")).expect("remove subscriptions dir");
+        let outside_file = metadata_path(outside.path(), "sub_events");
+        fs::write(&outside_file, "name=sub_events\npublications=secret\n")
+            .expect("outside metadata");
+        symlink(outside.path(), dir.path().join("subscriptions"))
+            .expect("subscription dir symlink");
+
+        let err = runtime
+            .drop_subscription("sub_events")
+            .expect_err("metadata deletion failure should abort drop");
+        assert!(
+            err.to_string()
+                .contains("logical replication metadata directory")
+        );
+
+        assert!(outside_file.exists());
+        assert!(
+            runtime
+                .subscriptions()
+                .iter()
+                .any(|subscription| subscription.name == "sub_events")
+        );
     }
 
     #[test]

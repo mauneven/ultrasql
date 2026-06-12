@@ -2933,7 +2933,8 @@ where
                 Ok(Some(run_ddl_command("CREATE PUBLICATION")))
             }
             LogicalReplicationDdl::DropPublication { name, if_exists } => {
-                if !self.state.logical_replication.drop_publication(&name) && !if_exists {
+                let dropped = self.state.logical_replication.drop_publication(&name)?;
+                if !dropped && !if_exists {
                     return Err(ServerError::ddl(format!(
                         "publication \"{}\" does not exist",
                         name.to_ascii_lowercase()
@@ -2956,7 +2957,8 @@ where
                 Ok(Some(run_ddl_command("CREATE SUBSCRIPTION")))
             }
             LogicalReplicationDdl::DropSubscription { name, if_exists } => {
-                if !self.state.logical_replication.drop_subscription(&name) && !if_exists {
+                let dropped = self.state.logical_replication.drop_subscription(&name)?;
+                if !dropped && !if_exists {
                     return Err(ServerError::ddl(format!(
                         "subscription \"{}\" does not exist",
                         name.to_ascii_lowercase()
