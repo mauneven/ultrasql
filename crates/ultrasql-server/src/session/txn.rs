@@ -166,23 +166,37 @@ where
         &mut self,
         gid: &str,
     ) -> Result<SelectResult, ServerError> {
-        let xid = self
+        let prepared = self
             .state
             .two_phase
-            .commit_prepared(gid)
+            .begin_resolution(gid)
             .map_err(|e| ServerError::Ddl(format!("commit_prepared({gid}): {e}")))?;
-        if let Err(e) = self
-            .state
-            .txn_manager
-            .finalise_prepared(xid, ultrasql_mvcc::XidStatus::Committed)
-        {
-            tracing::warn!(error = %e, "finalise_prepared (committed) failed");
-        } else {
+        let xid = prepared.xid;
+        let result = (|| -> Result<(), ServerError> {
+            self.state
+                .txn_manager
+                .validate_prepared(xid)
+                .map_err(|e| ServerError::Ddl(format!("validate_prepared({gid}): {e}")))?;
             if let Some(commit_lsn) = self.state.append_commit_record(xid)? {
                 self.state.wait_for_wal_durable(commit_lsn)?;
             }
+            self.state
+                .txn_manager
+                .finalise_prepared(xid, ultrasql_mvcc::XidStatus::Committed)
+                .map_err(|e| {
+                    ServerError::Ddl(format!("finalise_prepared({gid} committed): {e}"))
+                })?;
             self.state.note_commit_for_gc();
+            Ok(())
+        })();
+        if let Err(err) = result {
+            self.state.two_phase.abort_resolution(&prepared);
+            return Err(err);
         }
+        self.state
+            .two_phase
+            .finish_resolution(&prepared)
+            .map_err(|e| ServerError::Ddl(format!("commit_prepared({gid}): {e}")))?;
         Ok(SelectResult {
             messages: vec![BackendMessage::CommandComplete {
                 tag: "COMMIT PREPARED".to_string(),
@@ -203,21 +217,37 @@ where
         &mut self,
         gid: &str,
     ) -> Result<SelectResult, ServerError> {
-        let xid = self
+        let prepared = self
             .state
             .two_phase
-            .rollback_prepared(gid)
+            .begin_resolution(gid)
             .map_err(|e| ServerError::Ddl(format!("rollback_prepared({gid}): {e}")))?;
-        if let Err(e) = self.state.heap.rollback_in_place_updates(xid) {
-            tracing::warn!(error = %e, "in-place update rollback failed for prepared txn");
+        let xid = prepared.xid;
+        let result = (|| -> Result<(), ServerError> {
+            self.state
+                .txn_manager
+                .validate_prepared(xid)
+                .map_err(|e| ServerError::Ddl(format!("validate_prepared({gid}): {e}")))?;
+            self.state
+                .heap
+                .rollback_in_place_updates(xid)
+                .map_err(|e| {
+                    ServerError::Ddl(format!("rollback prepared in-place updates({gid}): {e}"))
+                })?;
+            self.state
+                .txn_manager
+                .finalise_prepared(xid, ultrasql_mvcc::XidStatus::Aborted)
+                .map_err(|e| ServerError::Ddl(format!("finalise_prepared({gid} aborted): {e}")))?;
+            Ok(())
+        })();
+        if let Err(err) = result {
+            self.state.two_phase.abort_resolution(&prepared);
+            return Err(err);
         }
-        if let Err(e) = self
-            .state
-            .txn_manager
-            .finalise_prepared(xid, ultrasql_mvcc::XidStatus::Aborted)
-        {
-            tracing::warn!(error = %e, "finalise_prepared (aborted) failed");
-        }
+        self.state
+            .two_phase
+            .finish_resolution(&prepared)
+            .map_err(|e| ServerError::Ddl(format!("rollback_prepared({gid}): {e}")))?;
         Ok(SelectResult {
             messages: vec![BackendMessage::CommandComplete {
                 tag: "ROLLBACK PREPARED".to_string(),
@@ -703,5 +733,43 @@ mod tests {
             .execute_rollback_prepared("rollback-gid")
             .expect("rollback prepared");
         assert_eq!(last_tag(&rolled_back), "ROLLBACK PREPARED");
+    }
+
+    #[test]
+    fn commit_prepared_keeps_state_when_finalise_fails() {
+        let mut session = test_session();
+        session
+            .state
+            .two_phase
+            .prepare("orphan-commit", ultrasql_core::Xid::new(99_001))
+            .expect("prepare orphan");
+
+        let err = session
+            .execute_commit_prepared("orphan-commit")
+            .expect_err("missing CLOG entry must fail");
+        assert!(
+            err.to_string().contains("validate_prepared"),
+            "unexpected error: {err}"
+        );
+        assert_eq!(session.state.two_phase.list_prepared().len(), 1);
+    }
+
+    #[test]
+    fn rollback_prepared_keeps_state_when_finalise_fails() {
+        let mut session = test_session();
+        session
+            .state
+            .two_phase
+            .prepare("orphan-rollback", ultrasql_core::Xid::new(99_002))
+            .expect("prepare orphan");
+
+        let err = session
+            .execute_rollback_prepared("orphan-rollback")
+            .expect_err("missing CLOG entry must fail");
+        assert!(
+            err.to_string().contains("validate_prepared"),
+            "unexpected error: {err}"
+        );
+        assert_eq!(session.state.two_phase.list_prepared().len(), 1);
     }
 }

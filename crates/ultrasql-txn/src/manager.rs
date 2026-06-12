@@ -677,6 +677,17 @@ impl TransactionManager {
         Ok(())
     }
 
+    /// Validate that a prepared XID is still open for phase-2 resolution.
+    pub fn validate_prepared(&self, xid: Xid) -> Result<(), TxnError> {
+        let Some(entry) = self.clog.get(&xid) else {
+            return Err(TxnError::Unknown { xid });
+        };
+        match *entry.value() {
+            XidStatus::InProgress => Ok(()),
+            status => Err(TxnError::AlreadyTerminated { xid, status }),
+        }
+    }
+
     /// Restore a committed XID observed during WAL recovery.
     pub fn recover_committed(&self, xid: Xid) {
         if xid == Xid::INVALID || xid == Xid::FROZEN || xid == Xid::BOOTSTRAP {

@@ -15,8 +15,9 @@
 //!
 //! 2. **Phase 2 — resolve:** The application calls `COMMIT PREPARED 'gid'` or
 //!    `ROLLBACK PREPARED 'gid'` after all resource managers have voted.  The
-//!    coordinator removes the state file and returns the XID so the caller can
-//!    update the CLOG.
+//!    caller reserves the GID, completes its CLOG/WAL/undo side effects, then
+//!    asks the coordinator to remove the state file.  Until that final removal
+//!    succeeds, restart recovery still treats the transaction as in doubt.
 //!
 //! # State file format
 //!
@@ -45,7 +46,7 @@ use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use dashmap::DashMap;
+use dashmap::{DashMap, mapref::entry::Entry};
 use ultrasql_core::Xid;
 
 const DEFAULT_STATE_FILE_LIMIT_BYTES: u64 = 1024 * 1024;
@@ -73,6 +74,12 @@ pub enum TwoPhaseError {
         gid: String,
         /// Human-readable I/O error description.
         detail: String,
+    },
+    /// A phase-2 resolver is already operating on this GID.
+    #[error("prepared transaction \"{gid}\" is already being resolved")]
+    ResolutionInProgress {
+        /// The GID being resolved by another caller.
+        gid: String,
     },
     /// The state file contained malformed data.
     #[error("state file for \"{gid}\" is corrupt: {detail}")]
@@ -114,6 +121,8 @@ pub struct PreparedTxn {
 pub struct TwoPhaseCoordinator {
     /// In-memory index of prepared transactions, keyed by GID.
     prepared: DashMap<String, PreparedTxn>,
+    /// GIDs currently inside phase-2 resolution.
+    resolving: DashMap<String, ()>,
     /// Directory in which state files are stored.
     state_dir: PathBuf,
 }
@@ -128,6 +137,7 @@ impl TwoPhaseCoordinator {
     pub fn new(state_dir: PathBuf) -> Self {
         Self {
             prepared: DashMap::new(),
+            resolving: DashMap::new(),
             state_dir,
         }
     }
@@ -193,6 +203,52 @@ impl TwoPhaseCoordinator {
     /// the caller can mark it aborted in the CLOG.
     pub fn rollback_prepared(&self, gid: &str) -> Result<Xid, TwoPhaseError> {
         self.resolve(gid)
+    }
+
+    /// Reserve a prepared transaction for phase-2 resolution.
+    ///
+    /// The state file and prepared entry remain intact until
+    /// [`Self::finish_resolution`] succeeds. Call [`Self::abort_resolution`] if
+    /// the caller cannot complete the commit/rollback side effects.
+    pub fn begin_resolution(&self, gid: &str) -> Result<PreparedTxn, TwoPhaseError> {
+        match self.resolving.entry(gid.to_owned()) {
+            Entry::Occupied(_) => {
+                return Err(TwoPhaseError::ResolutionInProgress {
+                    gid: gid.to_owned(),
+                });
+            }
+            Entry::Vacant(entry) => {
+                entry.insert(());
+            }
+        }
+
+        let Some(txn) = self.prepared.get(gid).map(|entry| entry.value().clone()) else {
+            self.resolving.remove(gid);
+            return Err(TwoPhaseError::NotFound {
+                gid: gid.to_owned(),
+            });
+        };
+
+        Ok(txn)
+    }
+
+    /// Release a phase-2 reservation without deleting prepared state.
+    pub fn abort_resolution(&self, txn: &PreparedTxn) {
+        self.resolving.remove(&txn.gid);
+    }
+
+    /// Delete durable prepared state after phase-2 side effects succeed.
+    pub fn finish_resolution(&self, txn: &PreparedTxn) -> Result<Xid, TwoPhaseError> {
+        let result = remove_state_file(txn);
+        self.resolving.remove(&txn.gid);
+        result?;
+
+        self.prepared
+            .remove(&txn.gid)
+            .map(|(_, removed)| removed.xid)
+            .ok_or_else(|| TwoPhaseError::NotFound {
+                gid: txn.gid.clone(),
+            })
     }
 
     /// Scan the state directory and repopulate `prepared` from disk.
@@ -273,37 +329,29 @@ impl TwoPhaseCoordinator {
 
     /// Common resolution path for both commit and rollback.
     fn resolve(&self, gid: &str) -> Result<Xid, TwoPhaseError> {
-        let txn = self
-            .prepared
-            .get(gid)
-            .ok_or_else(|| TwoPhaseError::NotFound {
-                gid: gid.to_owned(),
-            })?
-            .clone();
-
-        match fs::remove_file(&txn.state_file) {
-            Ok(()) => {}
-            Err(err) if err.kind() == ErrorKind::NotFound => {}
-            Err(err) => {
-                return Err(TwoPhaseError::Io {
-                    gid: gid.to_owned(),
-                    detail: err.to_string(),
-                });
-            }
+        let txn = self.begin_resolution(gid)?;
+        let resolved = self.finish_resolution(&txn);
+        if resolved.is_err() {
+            self.abort_resolution(&txn);
         }
-
-        self.prepared
-            .remove(gid)
-            .map(|(_, txn)| txn.xid)
-            .ok_or_else(|| TwoPhaseError::NotFound {
-                gid: gid.to_owned(),
-            })
+        resolved
     }
 
     /// Construct the canonical state file path for a GID.
     fn state_file_path(&self, gid: &str) -> PathBuf {
         let sanitized = sanitize_gid(gid);
         self.state_dir.join(format!("{sanitized}.txn"))
+    }
+}
+
+fn remove_state_file(txn: &PreparedTxn) -> Result<(), TwoPhaseError> {
+    match fs::remove_file(&txn.state_file) {
+        Ok(()) => sync_state_file_parent(&txn.state_file, &txn.gid),
+        Err(err) if err.kind() == ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(TwoPhaseError::Io {
+            gid: txn.gid.clone(),
+            detail: err.to_string(),
+        }),
     }
 }
 
@@ -631,6 +679,27 @@ mod tests {
             .rollback_prepared("stuck")
             .expect_err("failed state removal must abort resolution");
         assert!(matches!(err, TwoPhaseError::Io { gid, .. } if gid == "stuck"));
+        assert_eq!(coord.list_prepared().len(), 1);
+    }
+
+    #[test]
+    fn begin_resolution_blocks_second_resolver_until_abort() {
+        let (coord, _dir) = make_coordinator();
+
+        coord.prepare("resolving", xid(202)).unwrap();
+        let prepared = coord.begin_resolution("resolving").unwrap();
+        assert_eq!(prepared.xid, xid(202));
+
+        let err = coord.begin_resolution("resolving").unwrap_err();
+        assert!(matches!(
+            err,
+            TwoPhaseError::ResolutionInProgress { gid } if gid == "resolving"
+        ));
+        coord.abort_resolution(&prepared);
+
+        let prepared_again = coord.begin_resolution("resolving").unwrap();
+        assert_eq!(prepared_again.xid, xid(202));
+        coord.abort_resolution(&prepared_again);
         assert_eq!(coord.list_prepared().len(), 1);
     }
 

@@ -4908,15 +4908,32 @@ impl Server {
         let two_phase_dir = data_dir.join("pg_twophase");
         std::fs::create_dir_all(&two_phase_dir).map_err(ServerError::Io)?;
         let two_phase_coord = ultrasql_txn::two_phase::TwoPhaseCoordinator::new(two_phase_dir);
-        let recovered_prepared = two_phase_coord
+        let recovered_state_files = two_phase_coord
             .recover_from_disk()
             .map_err(|e| ServerError::Ddl(format!("2PC recovery: {e}")))?;
+        let mut recovered_prepared = 0usize;
+        let mut cleaned_resolved = 0usize;
         for prepared in two_phase_coord.list_prepared() {
-            txn_manager
-                .recover_prepared(prepared.xid)
-                .map_err(|e| ServerError::Ddl(format!("2PC CLOG recovery: {e}")))?;
+            match txn_manager.recover_prepared(prepared.xid) {
+                Ok(()) => recovered_prepared += 1,
+                Err(TxnError::AlreadyTerminated {
+                    status: ultrasql_mvcc::XidStatus::Committed | ultrasql_mvcc::XidStatus::Aborted,
+                    ..
+                }) => {
+                    two_phase_coord.finish_resolution(&prepared).map_err(|e| {
+                        ServerError::Ddl(format!("2PC resolved state cleanup: {e}"))
+                    })?;
+                    cleaned_resolved += 1;
+                }
+                Err(e) => return Err(ServerError::Ddl(format!("2PC CLOG recovery: {e}"))),
+            }
         }
-        tracing::info!(count = recovered_prepared, "2PC state recovery complete");
+        tracing::info!(
+            state_files = recovered_state_files,
+            prepared = recovered_prepared,
+            cleaned_resolved,
+            "2PC state recovery complete"
+        );
         let two_phase = Arc::new(two_phase_coord);
 
         let server = Self {
