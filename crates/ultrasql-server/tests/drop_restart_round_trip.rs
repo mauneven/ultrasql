@@ -65,6 +65,47 @@ async fn dropped_table_is_removed_from_runtime_metadata() {
     );
 }
 
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn drop_table_rejects_unsafe_runtime_metadata_slot_before_live_drop() {
+    use std::os::unix::fs::symlink;
+
+    let data_dir = tempfile::TempDir::new().expect("temp data dir");
+    support::make_data_dir_private(data_dir.path());
+    let outside = data_dir.path().join("outside-table-runtime-meta");
+    std::fs::write(&outside, b"keep").expect("outside metadata target");
+
+    let running = start_persistent_server(data_dir.path(), "drop_table_runtime_slot").await;
+    let client = &running.client;
+    client
+        .batch_execute(
+            "CREATE TABLE drop_table_slot_guard (id SERIAL, v INT DEFAULT 7); \
+             INSERT INTO drop_table_slot_guard (v) VALUES (11)",
+        )
+        .await
+        .expect("create table before failed drop");
+    symlink(&outside, data_dir.path().join("pg_table_runtime.meta.tmp"))
+        .expect("table-runtime temp symlink");
+
+    let err = client
+        .batch_execute("DROP TABLE drop_table_slot_guard")
+        .await
+        .expect_err("unsafe table runtime metadata slot rejects DROP TABLE");
+    assert!(
+        err.as_db_error()
+            .is_some_and(|db| db.message().contains("runtime metadata file")),
+        "unexpected error: {err}"
+    );
+    let rows = client
+        .query("SELECT id, v FROM drop_table_slot_guard", &[])
+        .await
+        .expect("table remains queryable after rejected drop");
+    assert_eq!(rows.len(), 1, "failed DROP TABLE must not remove table");
+    assert_eq!(rows[0].get::<_, i32>(1), 11);
+
+    shutdown(running).await;
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn table_runtime_metadata_rejects_duplicate_table_rows_on_rebuild() {
     let data_dir = tempfile::TempDir::new().unwrap();

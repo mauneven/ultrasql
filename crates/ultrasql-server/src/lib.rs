@@ -4252,9 +4252,8 @@ fn open_no_follow_read(path: &Path) -> Result<std::fs::File, ServerError> {
 }
 
 fn write_runtime_metadata_file(path: &Path, text: &str) -> Result<(), ServerError> {
-    ensure_runtime_metadata_file_slot(path)?;
+    ensure_runtime_metadata_write_slots(path)?;
     let tmp = path.with_extension("meta.tmp");
-    ensure_runtime_metadata_file_slot(&tmp)?;
     let mut file = std::fs::OpenOptions::new()
         .write(true)
         .create(true)
@@ -4263,6 +4262,19 @@ fn write_runtime_metadata_file(path: &Path, text: &str) -> Result<(), ServerErro
         .map_err(ServerError::Io)?;
     std::io::Write::write_all(&mut file, text.as_bytes()).map_err(ServerError::Io)?;
     std::fs::rename(tmp, path).map_err(ServerError::Io)
+}
+
+fn ensure_runtime_metadata_write_slots(path: &Path) -> Result<(), ServerError> {
+    ensure_runtime_metadata_file_slot(path)?;
+    let tmp = path.with_extension("meta.tmp");
+    ensure_runtime_metadata_file_slot(&tmp)
+}
+
+fn ensure_optional_runtime_metadata_write_slots(path: Option<PathBuf>) -> Result<(), ServerError> {
+    if let Some(path) = path {
+        ensure_runtime_metadata_write_slots(&path)?;
+    }
+    Ok(())
 }
 
 fn ensure_runtime_metadata_file_slot(path: &Path) -> Result<(), ServerError> {
@@ -5246,6 +5258,70 @@ impl Server {
         self.data_dir
             .as_ref()
             .map(|dir| dir.join("pg_table_runtime.meta"))
+    }
+
+    pub(crate) fn ensure_drop_table_runtime_metadata_slots_persistable(
+        &self,
+        dropped_tables: &[String],
+    ) -> Result<(), ServerError> {
+        ensure_optional_runtime_metadata_write_slots(self.table_runtime_metadata_path())?;
+        ensure_optional_runtime_metadata_write_slots(self.row_security_metadata_path())?;
+
+        let grant_objects = self
+            .privilege_catalog
+            .list_grants()
+            .into_iter()
+            .map(|grant| (grant.object_kind, grant.object_name))
+            .collect::<std::collections::HashSet<_>>();
+        let mut sequence_owner_metadata_changed = false;
+        let mut privilege_metadata_changed = false;
+        let mut materialized_view_metadata_changed = false;
+        for table_name in dropped_tables {
+            if self.materialized_views.contains_key(table_name) {
+                materialized_view_metadata_changed = true;
+            }
+            let Some(entry) = self.persistent_catalog.lookup_table(table_name) else {
+                continue;
+            };
+            let table_key = ultrasql_catalog::table_lookup_key(&entry.schema_name, &entry.name);
+            if grant_objects.contains(&(crate::auth::PrivilegeObjectKind::Table, table_key)) {
+                privilege_metadata_changed = true;
+            }
+            let Some(constraints) = self.table_constraints.get(&entry.oid) else {
+                continue;
+            };
+            for sequence_name in constraints.sequence_defaults.iter().flatten() {
+                sequence_owner_metadata_changed = true;
+                let sequence_key = sequence_name.to_ascii_lowercase();
+                let sequence_grant_key =
+                    if ultrasql_catalog::decode_table_lookup_key(&sequence_key).is_some() {
+                        sequence_key
+                    } else {
+                        let namespace = self
+                            .sequence_namespaces
+                            .get(&sequence_key)
+                            .map_or_else(|| "public".to_owned(), |entry| entry.value().clone());
+                        ultrasql_catalog::table_lookup_key(&namespace, &sequence_key)
+                    };
+                if grant_objects.contains(&(
+                    crate::auth::PrivilegeObjectKind::Sequence,
+                    sequence_grant_key,
+                )) {
+                    privilege_metadata_changed = true;
+                }
+            }
+        }
+
+        if sequence_owner_metadata_changed {
+            ensure_optional_runtime_metadata_write_slots(self.sequence_owner_metadata_path())?;
+        }
+        if privilege_metadata_changed {
+            ensure_optional_runtime_metadata_write_slots(self.privilege_metadata_path())?;
+        }
+        if materialized_view_metadata_changed {
+            ensure_optional_runtime_metadata_write_slots(self.materialized_view_metadata_path())?;
+        }
+        Ok(())
     }
 
     pub(crate) fn ensure_table_runtime_constraints_metadata_persistable(

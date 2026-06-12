@@ -2064,6 +2064,8 @@ where
                 }
             }
         }
+        self.state
+            .ensure_drop_table_runtime_metadata_slots_persistable(&drop_names)?;
         if !durable_drop_entries.is_empty() {
             let ddl_txn = self
                 .state
