@@ -1945,7 +1945,7 @@ mod tests {
         let dir = tempfile::TempDir::new().expect("temp dir");
         let oversized = dir.path().join("oversized-password");
         write_private_password_file(&oversized, &"a".repeat(2048));
-        let mut cli = cli_with_auth_password_file(oversized);
+        let cli = cli_with_auth_password_file(oversized);
 
         let err = auth_config_from_cli(&cli).expect_err("oversized password file rejected");
         assert!(
@@ -1957,6 +1957,7 @@ mod tests {
         {
             use std::os::unix::fs::PermissionsExt;
 
+            let mut cli = cli;
             let public_file = dir.path().join("public-password");
             write_private_password_file(&public_file, "very-secret-password\n");
             std::fs::set_permissions(&public_file, std::fs::Permissions::from_mode(0o644))
