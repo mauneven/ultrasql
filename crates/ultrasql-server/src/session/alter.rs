@@ -36,9 +36,10 @@ where
     /// `ADD COLUMN` we
     ///
     /// 1. take a per-statement MVCC snapshot,
-    /// 2. scan every visible tuple under the *old* schema and rewrite
-    ///    it back through `HeapAccess::update` with a payload encoded
-    ///    against the *new* schema (the appended column carries
+    /// 2. scan every visible tuple under the *old* schema and reject
+    ///    non-nullable appended columns for non-empty tables, otherwise
+    ///    rewrite each tuple through `HeapAccess::update` with a payload
+    ///    encoded against the *new* schema (the appended column carries
     ///    [`Value::Null`] for every pre-existing row),
     /// 3. swap the catalog entry to the new schema via
     ///    [`MutableCatalog::alter_table_add_column`].
@@ -519,6 +520,11 @@ where
                         .map_err(|e| ServerError::ddl(format!("ALTER TABLE row decode: {e}")))?;
                     to_rewrite.push((tup.tid, row));
                 }
+            }
+            if !column.nullable && !to_rewrite.is_empty() {
+                return Err(ServerError::Execute(
+                    ultrasql_executor::ExecError::NotNullViolation(column.name.clone()),
+                ));
             }
 
             // Now perform the updates.

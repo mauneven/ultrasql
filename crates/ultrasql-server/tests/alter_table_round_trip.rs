@@ -105,6 +105,44 @@ async fn alter_table_add_column_extends_schema_and_back_fills_null() {
     shutdown(client, server_handle).await;
 }
 
+/// `ALTER TABLE ADD COLUMN c TYPE NOT NULL` cannot backfill existing
+/// rows with NULL; reject before changing the schema.
+#[tokio::test]
+async fn alter_table_add_not_null_column_rejects_non_empty_table() {
+    let (client, _conn, server_handle) = start_server_and_connect().await;
+
+    client
+        .batch_execute("CREATE TABLE t (id INT NOT NULL, v INT NOT NULL)")
+        .await
+        .expect("create");
+    client
+        .batch_execute("INSERT INTO t VALUES (1, 10), (2, 20)")
+        .await
+        .expect("seed pre-alter rows");
+
+    let err = client
+        .batch_execute("ALTER TABLE t ADD COLUMN c INT NOT NULL")
+        .await
+        .expect_err("NOT NULL column without a backfill must be rejected");
+    assert_eq!(err.code().expect("SQLSTATE").code(), "23502");
+
+    let rows = client
+        .query("SELECT id, v FROM t ORDER BY id", &[])
+        .await
+        .expect("original table remains queryable");
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0].get::<_, i32>(0), 1);
+    assert_eq!(rows[1].get::<_, i32>(0), 2);
+
+    let err = client
+        .query("SELECT c FROM t", &[])
+        .await
+        .expect_err("failed ALTER must not install column");
+    assert_eq!(err.code().expect("SQLSTATE").code(), "42703");
+
+    shutdown(client, server_handle).await;
+}
+
 /// Two `ALTER TABLE ADD COLUMN` statements stack: the schema grows by
 /// each addition and earlier columns are unaffected.
 #[tokio::test]
