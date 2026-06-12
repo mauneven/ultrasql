@@ -3933,10 +3933,12 @@ fn recovery_replay_target_from_data_dir(
 
 fn prepare_secure_data_dir(data_dir: &Path) -> Result<PathBuf, ServerError> {
     reject_data_dir_symlink(data_dir)?;
+    let existed = data_dir.try_exists().map_err(ServerError::Io)?;
     std::fs::create_dir_all(data_dir).map_err(ServerError::Io)?;
     reject_data_dir_symlink(data_dir)?;
     let canonical = data_dir.canonicalize().map_err(ServerError::Io)?;
     validate_data_dir_ownership(&canonical)?;
+    validate_data_dir_permissions(&canonical, existed)?;
     Ok(canonical)
 }
 
@@ -3967,6 +3969,18 @@ fn validate_data_dir_ownership(data_dir: &Path) -> Result<(), ServerError> {
     }
 }
 
+fn validate_data_dir_permissions(data_dir: &Path, existed: bool) -> Result<(), ServerError> {
+    #[cfg(unix)]
+    {
+        validate_data_dir_mode(data_dir, existed)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (data_dir, existed);
+        Ok(())
+    }
+}
+
 #[cfg(unix)]
 fn validate_data_dir_owner(data_dir: &Path, expected_uid: u32) -> Result<(), ServerError> {
     use std::os::unix::fs::MetadataExt;
@@ -3986,6 +4000,43 @@ fn validate_data_dir_owner(data_dir: &Path, expected_uid: u32) -> Result<(), Ser
         )));
     }
     Ok(())
+}
+
+#[cfg(unix)]
+fn validate_data_dir_mode(data_dir: &Path, existed: bool) -> Result<(), ServerError> {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    const PRIVATE_DIR_MODE: u32 = 0o700;
+    const GROUP_OR_WORLD_BITS: u32 = 0o077;
+
+    let metadata = std::fs::metadata(data_dir).map_err(ServerError::Io)?;
+    let mode = metadata.mode() & 0o777;
+    if mode & GROUP_OR_WORLD_BITS == 0 {
+        return Ok(());
+    }
+    if !existed || data_dir_is_empty(data_dir)? {
+        std::fs::set_permissions(data_dir, std::fs::Permissions::from_mode(PRIVATE_DIR_MODE))
+            .map_err(ServerError::Io)?;
+        let tightened = std::fs::metadata(data_dir).map_err(ServerError::Io)?.mode() & 0o777;
+        if tightened & GROUP_OR_WORLD_BITS == 0 {
+            return Ok(());
+        }
+    }
+    Err(ServerError::ddl(format!(
+        "data directory {} has group/world permissions {:o}; chmod 700 before startup",
+        data_dir.display(),
+        mode
+    )))
+}
+
+#[cfg(unix)]
+fn data_dir_is_empty(data_dir: &Path) -> Result<bool, ServerError> {
+    let mut entries = std::fs::read_dir(data_dir).map_err(ServerError::Io)?;
+    entries
+        .next()
+        .transpose()
+        .map_err(ServerError::Io)
+        .map(|entry| entry.is_none())
 }
 
 #[cfg(unix)]

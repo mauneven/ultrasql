@@ -11,7 +11,7 @@ use ultrasql_wal::payload::{SequenceOpKind, SequenceOpPayload};
 use ultrasql_wal::{HeapTarget, RecordType, WalRecord};
 
 use super::super::{
-    BlankPageLoader, Server, ServerRecoveryTarget, capped_text_take_limit,
+    BlankPageLoader, Server, ServerRecoveryTarget, capped_text_take_limit, prepare_secure_data_dir,
     recovery_replay_target_from_data_dir,
 };
 
@@ -22,6 +22,13 @@ fn recovery_target() -> ServerRecoveryTarget {
         heap,
         sequences: Arc::new(dashmap::DashMap::new()),
     }
+}
+
+#[cfg(unix)]
+fn make_data_dir_private(path: &std::path::Path) {
+    use std::os::unix::fs::PermissionsExt;
+
+    fs::set_permissions(path, fs::Permissions::from_mode(0o700)).unwrap();
 }
 
 #[test]
@@ -110,6 +117,7 @@ fn server_init_refuses_symlinked_runtime_metadata_sidecar() {
     let outside = data_dir.path().join("outside.meta");
     fs::write(&outside, "# outside\n").unwrap();
     symlink(&outside, data_dir.path().join("pg_domain_runtime.meta")).unwrap();
+    make_data_dir_private(data_dir.path());
 
     let err = Server::init(data_dir.path()).expect_err("symlinked sidecar rejected");
 
@@ -178,6 +186,7 @@ fn server_init_refuses_symlinked_recovery_targets() {
     let outside = data_dir.path().join("outside.targets");
     fs::write(&outside, "recovery_target_xid = '42'\n").unwrap();
     symlink(&outside, data_dir.path().join("recovery.targets")).unwrap();
+    make_data_dir_private(data_dir.path());
 
     let err = Server::init(data_dir.path()).expect_err("symlinked recovery targets rejected");
 
@@ -208,11 +217,46 @@ fn data_dir_owner_check_rejects_unexpected_uid() {
     );
 }
 
+#[cfg(unix)]
+#[test]
+fn prepare_secure_data_dir_tightens_new_directory_permissions() {
+    use std::os::unix::fs::MetadataExt;
+
+    let parent = tempfile::TempDir::new().unwrap();
+    let data_dir = parent.path().join("data");
+
+    let canonical = prepare_secure_data_dir(&data_dir).expect("fresh data dir");
+    let mode = fs::metadata(canonical).expect("data dir metadata").mode() & 0o777;
+
+    assert_eq!(mode & 0o077, 0);
+}
+
+#[cfg(unix)]
+#[test]
+fn prepare_secure_data_dir_rejects_existing_group_world_permissions() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let parent = tempfile::TempDir::new().unwrap();
+    let data_dir = parent.path().join("data");
+    fs::create_dir(&data_dir).expect("data dir");
+    fs::write(data_dir.join("PG_VERSION"), b"0").expect("marker");
+    fs::set_permissions(&data_dir, fs::Permissions::from_mode(0o755)).expect("chmod data dir");
+
+    let err = prepare_secure_data_dir(&data_dir).expect_err("open mode must be rejected");
+
+    assert!(
+        err.to_string().contains("group/world permissions"),
+        "expected permissions rejection, got {err}"
+    );
+}
+
 #[test]
 fn server_init_stores_canonical_data_dir() {
     let root = tempfile::TempDir::new().unwrap();
     let child = root.path().join("child");
     fs::create_dir(&child).unwrap();
+    #[cfg(unix)]
+    make_data_dir_private(root.path());
     let aliased = child.join("..");
 
     let server = Server::init(&aliased).unwrap();
@@ -361,6 +405,8 @@ fn server_init_honors_recovery_target_lsn_before_installing_wal_writer() {
         format!("recovery_target_lsn = '{}'\n", target.raw()),
     )
     .unwrap();
+    #[cfg(unix)]
+    make_data_dir_private(data_dir.path());
 
     let server = Server::init(data_dir.path()).unwrap();
     let sink = server
