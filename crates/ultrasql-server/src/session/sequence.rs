@@ -59,6 +59,8 @@ where
                 ultrasql_catalog::CatalogError::already_exists(sequence_key),
             ));
         }
+        self.state
+            .ensure_sequence_owner_metadata_slots_persistable()?;
         let seq = Sequence::new(to_storage_options(*options))
             .map_err(|e| ServerError::ddl(format!("CREATE SEQUENCE: {e}")))?;
         let seq_oid = self.state.persistent_catalog.next_oid();

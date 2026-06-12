@@ -224,6 +224,74 @@ async fn sequence_owner_metadata_rejects_missing_sequence_on_rebuild() {
 
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn create_sequence_rejects_unsafe_owner_metadata_slot_before_durable_create() {
+    use std::os::unix::fs::symlink;
+
+    let data_dir = tempfile::TempDir::new().expect("temp data dir");
+    support::make_data_dir_private(data_dir.path());
+    let outside = data_dir.path().join("outside-sequence-create-meta");
+    std::fs::write(&outside, b"keep").expect("outside metadata target");
+
+    let running = start_persistent_server(data_dir.path(), "sequence_owner_create_guard").await;
+    let client = &running.client;
+    symlink(&outside, data_dir.path().join("pg_sequence_owner.meta.tmp"))
+        .expect("sequence-owner temp symlink");
+
+    let err = client
+        .batch_execute("CREATE SEQUENCE seq_owner_create_guard START WITH 5")
+        .await
+        .expect_err("unsafe sequence-owner metadata slot rejects CREATE SEQUENCE");
+    assert!(
+        err.as_db_error()
+            .is_some_and(|db| db.message().contains("runtime metadata file")),
+        "unexpected error: {err}"
+    );
+    client
+        .batch_execute("SELECT nextval('seq_owner_create_guard')")
+        .await
+        .expect_err("failed CREATE SEQUENCE must not leave live sequence");
+    let live_catalog_rows = client
+        .query_one(
+            "SELECT COUNT(*) FROM pg_catalog.pg_sequences \
+             WHERE sequencename = 'seq_owner_create_guard'",
+            &[],
+        )
+        .await
+        .expect("pg_sequences query after failed create")
+        .get::<_, i64>(0);
+    assert_eq!(
+        live_catalog_rows, 0,
+        "failed CREATE SEQUENCE must not leave live catalog row"
+    );
+    graceful_shutdown(running).await;
+
+    std::fs::remove_file(data_dir.path().join("pg_sequence_owner.meta.tmp"))
+        .expect("remove unsafe temp slot before restart");
+    let running = start_persistent_server(data_dir.path(), "sequence_owner_create_restart").await;
+    running
+        .client
+        .batch_execute("SELECT nextval('seq_owner_create_guard')")
+        .await
+        .expect_err("failed CREATE SEQUENCE must not survive restart");
+    let restart_catalog_rows = running
+        .client
+        .query_one(
+            "SELECT COUNT(*) FROM pg_catalog.pg_sequences \
+             WHERE sequencename = 'seq_owner_create_guard'",
+            &[],
+        )
+        .await
+        .expect("pg_sequences query after restart")
+        .get::<_, i64>(0);
+    assert_eq!(
+        restart_catalog_rows, 0,
+        "failed CREATE SEQUENCE must not leave restart catalog row"
+    );
+    graceful_shutdown(running).await;
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn drop_sequence_rolls_back_runtime_state_when_owner_metadata_slot_is_unsafe() {
     use std::os::unix::fs::symlink;
 

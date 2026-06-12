@@ -6223,6 +6223,12 @@ impl Server {
             .map(|dir| dir.join("pg_sequence_owner.meta"))
     }
 
+    pub(crate) fn ensure_sequence_owner_metadata_slots_persistable(
+        &self,
+    ) -> Result<(), ServerError> {
+        ensure_optional_runtime_metadata_write_slots(self.sequence_owner_metadata_path())
+    }
+
     pub(crate) fn persist_sequence_owner_metadata(&self) -> Result<(), ServerError> {
         let Some(path) = self.sequence_owner_metadata_path() else {
             return Ok(());
