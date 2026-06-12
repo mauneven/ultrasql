@@ -1862,11 +1862,11 @@ mod tests {
             .trim()
             .parse::<libc::pid_t>()
             .expect("pid");
-        let child_alive = process_alive(pid);
-        if child_alive {
+        let child_running = process_running_after_wait(pid, Duration::from_secs(1));
+        if child_running {
             kill_process(pid);
         }
-        assert!(!child_alive, "timed-out shell child should be killed");
+        assert!(!child_running, "timed-out shell child should be killed");
     }
 
     #[test]
@@ -1928,7 +1928,42 @@ mod tests {
     }
 
     #[cfg(not(windows))]
-    fn process_alive(pid: libc::pid_t) -> bool {
+    fn process_running_after_wait(pid: libc::pid_t, timeout: Duration) -> bool {
+        let started = std::time::Instant::now();
+        loop {
+            if !process_running(pid) {
+                return false;
+            }
+            if started.elapsed() >= timeout {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    #[cfg(all(not(windows), target_os = "linux"))]
+    fn process_running(pid: libc::pid_t) -> bool {
+        match std::fs::read_to_string(format!("/proc/{pid}/stat")) {
+            Ok(stat) => !linux_proc_state_is_dead(&stat),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => false,
+            Err(_) => process_exists(pid),
+        }
+    }
+
+    #[cfg(all(not(windows), target_os = "linux"))]
+    fn linux_proc_state_is_dead(stat: &str) -> bool {
+        stat.rsplit_once(") ")
+            .and_then(|(_, rest)| rest.as_bytes().first().copied())
+            .is_some_and(|state| matches!(state, b'Z' | b'X' | b'x'))
+    }
+
+    #[cfg(all(not(windows), not(target_os = "linux")))]
+    fn process_running(pid: libc::pid_t) -> bool {
+        process_exists(pid)
+    }
+
+    #[cfg(not(windows))]
+    fn process_exists(pid: libc::pid_t) -> bool {
         // SAFETY: `kill(pid, 0)` does not send a signal; it probes whether the
         // process exists and whether this process can signal it.
         unsafe { libc::kill(pid, 0) == 0 }
