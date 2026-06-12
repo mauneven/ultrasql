@@ -88,8 +88,8 @@ use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpListener;
 use tracing::{debug, error, info, warn};
 use ultrasql_catalog::{
-    Catalog, CatalogSnapshot, DomainTypeEntry, IndexEntry, MutableCatalog, PersistentCatalog,
-    StatisticRow, TableEntry,
+    Catalog, CatalogError, CatalogSnapshot, CatalogStats, DomainTypeEntry, IndexEntry,
+    MutableCatalog, PersistentCatalog, StatisticRow, TableEntry,
 };
 use ultrasql_core::constants::PAGE_SIZE;
 use ultrasql_core::{BlockNumber, DataType, Lsn, Oid, PageId, RelationId, Value, Xid};
@@ -288,6 +288,12 @@ fn finish_stats_hydration_row_count(
             None
         }
     }
+}
+
+fn require_wal_backed_catalog_bootstrap(
+    result: Result<CatalogStats, CatalogError>,
+) -> Result<CatalogStats, ServerError> {
+    result.map_err(ServerError::Catalog)
 }
 
 fn positive_f32_ceil_to_u64(value: f32) -> Option<u64> {
@@ -4923,14 +4929,10 @@ impl Server {
         ));
 
         let persistent_catalog = Arc::new(PersistentCatalog::new());
-        match persistent_catalog.bootstrap_from_heap(heap.as_ref()) {
-            Ok(stats) => {
-                tracing::info!(?stats, "persistent catalog bootstrapped (WAL-backed)");
-            }
-            Err(e) => {
-                tracing::warn!(error = %e, "persistent catalog bootstrap failed; using empty catalog");
-            }
-        }
+        let stats = require_wal_backed_catalog_bootstrap(
+            persistent_catalog.bootstrap_from_heap(heap.as_ref()),
+        )?;
+        tracing::info!(?stats, "persistent catalog bootstrapped (WAL-backed)");
 
         let mut catalog = InMemoryCatalog::new();
         let tables = build_sample_database(&mut catalog);

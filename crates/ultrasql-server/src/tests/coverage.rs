@@ -226,6 +226,20 @@ fn analyze_catalog_statistics_abort_failure_preserves_original_error() {
 }
 
 #[test]
+fn wal_backed_catalog_bootstrap_errors_are_fatal() {
+    let err = require_wal_backed_catalog_bootstrap(Err(
+        ultrasql_catalog::CatalogError::schema_conflict("duplicate pg_class oid"),
+    ))
+    .expect_err("WAL-backed startup must not continue after catalog bootstrap failure");
+
+    assert!(matches!(err, ServerError::Catalog(_)));
+    assert!(
+        err.to_string().contains("duplicate pg_class oid"),
+        "original bootstrap error lost: {err}"
+    );
+}
+
+#[test]
 fn metadata_codecs_cover_escapes_and_rls_tokens() {
     let raw = "tenant\\name\tline\nnext";
     let escaped = metadata_escape(raw);
