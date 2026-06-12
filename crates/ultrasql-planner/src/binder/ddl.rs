@@ -549,16 +549,17 @@ fn reject_unsupported_alter_add_column_constraints(
 ) -> Result<(), PlanError> {
     for constraint in constraints {
         match constraint {
-            ColumnConstraint::Null { .. } | ColumnConstraint::NotNull { .. } => {}
-            ColumnConstraint::Default { .. }
-            | ColumnConstraint::PrimaryKey { .. }
+            ColumnConstraint::Null { .. }
+            | ColumnConstraint::NotNull { .. }
+            | ColumnConstraint::Default { .. } => {}
+            ColumnConstraint::PrimaryKey { .. }
             | ColumnConstraint::Unique { .. }
             | ColumnConstraint::Check { .. }
             | ColumnConstraint::References { .. }
             | ColumnConstraint::GeneratedIdentity { .. }
             | ColumnConstraint::GeneratedStored { .. } => {
                 return Err(PlanError::NotSupported(
-                    "ALTER TABLE ADD COLUMN currently supports only NULL and NOT NULL column constraints",
+                    "ALTER TABLE ADD COLUMN currently supports only NULL, NOT NULL, and DEFAULT column constraints",
                 ));
             }
         }
@@ -2372,11 +2373,35 @@ pub(super) fn bind_alter_table(
             let dtype = resolve_type_name_with_catalog(&column.data_type, catalog)?;
             let nullable = resolve_column_nullability(&column.constraints)?;
             let field = if nullable {
-                Field::nullable(new_name, dtype)
+                Field::nullable(new_name, dtype.clone())
             } else {
-                Field::required(new_name, dtype)
+                Field::required(new_name, dtype.clone())
             };
-            LogicalAlterTableAction::AddColumn { column: field }
+            let default = column_default(&column.constraints)?;
+            let default = if let Some(expr) = default {
+                let mut scope = ScopeStack::new();
+                let mut bound = bind_expr(expr, &Schema::empty(), catalog, &mut scope)?;
+                if !is_default_safe(&bound) {
+                    return Err(PlanError::NotSupported(
+                        "ALTER TABLE ADD COLUMN: DEFAULT may not refer to rows, parameters, or subqueries",
+                    ));
+                }
+                coerce_default_expr_to_type(&mut bound, &dtype);
+                let actual = bound.data_type();
+                if actual != dtype.clone() && actual != DataType::Null {
+                    return Err(PlanError::TypeMismatch(format!(
+                        "DEFAULT for column '{}' has type {:?}, expected {:?}",
+                        field.name, actual, dtype,
+                    )));
+                }
+                Some(bound)
+            } else {
+                None
+            };
+            LogicalAlterTableAction::AddColumn {
+                column: field,
+                default,
+            }
         }
         AlterTableAction::DropColumn { name, .. } => {
             let raw = name.value.to_ascii_lowercase();

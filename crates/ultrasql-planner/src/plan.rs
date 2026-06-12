@@ -1699,9 +1699,9 @@ pub enum LogicalWindowFunc {
 }
 
 /// One action clause of an [`LogicalPlan::AlterTable`].
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum LogicalAlterTableAction {
-    /// `ALTER TABLE t ADD [COLUMN] c TYPE [NULL | NOT NULL]`.
+    /// `ALTER TABLE t ADD [COLUMN] c TYPE [DEFAULT expr] [NULL | NOT NULL]`.
     ///
     /// The new column is appended to the end of the table's schema.
     /// `column` carries the resolved [`Field`] (name, type,
@@ -1710,6 +1710,8 @@ pub enum LogicalAlterTableAction {
     AddColumn {
         /// The resolved column being added.
         column: Field,
+        /// Bound default expression for the new column, if any.
+        default: Option<ScalarExpr>,
     },
     /// `ALTER TABLE t DROP [COLUMN] c [CASCADE|RESTRICT]`.
     ///
@@ -2627,13 +2629,14 @@ impl LogicalPlan {
             } => {
                 out.push_str(&pad);
                 match action {
-                    LogicalAlterTableAction::AddColumn { column } => {
+                    LogicalAlterTableAction::AddColumn { column, default } => {
                         let _ = fmt::write(
                             out,
                             format_args!(
-                                "AlterTable: {table_name} ADD COLUMN {} {:?}{}\n",
+                                "AlterTable: {table_name} ADD COLUMN {} {:?}{}{}\n",
                                 column.name,
                                 column.data_type,
+                                if default.is_some() { " DEFAULT" } else { "" },
                                 if column.nullable { "" } else { " NOT NULL" }
                             ),
                         );

@@ -1989,6 +1989,30 @@ impl PersistentCatalog {
         xmin: ultrasql_core::Xid,
         command_id: ultrasql_core::CommandId,
     ) -> Result<(), CatalogError> {
+        self.persist_table_schema_replacement_with_defaults(
+            old_entry,
+            new_entry,
+            &[],
+            heap,
+            xmin,
+            command_id,
+        )
+    }
+
+    /// Append catalog rows for a table schema replacement with
+    /// caller-supplied `pg_attribute.atthasdef` metadata.
+    ///
+    /// `attr_has_defaults` is indexed by zero-based column position in
+    /// `new_entry.schema`. Missing entries default to `false`.
+    pub fn persist_table_schema_replacement_with_defaults<L: PageLoader>(
+        &self,
+        old_entry: &TableEntry,
+        new_entry: &TableEntry,
+        attr_has_defaults: &[bool],
+        heap: &HeapAccess<L>,
+        xmin: ultrasql_core::Xid,
+        command_id: ultrasql_core::CommandId,
+    ) -> Result<(), CatalogError> {
         use crate::encoding::encode_attribute_row;
         use crate::persistent::{AttributeRow, ClassRow};
         use ultrasql_storage::heap::InsertOptions;
@@ -2063,7 +2087,7 @@ impl PersistentCatalog {
                 atttypid: 0,
                 attnum,
                 attnotnull: !field.nullable,
-                atthasdef: false,
+                atthasdef: attr_has_defaults.get(i).copied().unwrap_or(false),
                 attisdropped: false,
             };
             let bytes = encode_attribute_row(&attr_row, &field.data_type, field.nullable)

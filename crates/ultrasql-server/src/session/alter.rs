@@ -8,8 +8,8 @@ use std::sync::Arc;
 
 use tokio::io::{AsyncRead, AsyncWrite};
 use ultrasql_catalog::{CatalogSnapshot, MutableCatalog, TableEntry};
-use ultrasql_core::{BlockNumber, RelationId, Value};
-use ultrasql_planner::{LogicalAlterTableAction, LogicalPlan};
+use ultrasql_core::{BlockNumber, Field, RelationId, Value};
+use ultrasql_planner::{LogicalAlterTableAction, LogicalPlan, ScalarExpr};
 use ultrasql_storage::btree::BTree;
 use ultrasql_storage::heap::{DeleteOptions, UpdateOptions};
 use ultrasql_txn::IsolationLevel;
@@ -37,10 +37,11 @@ where
     ///
     /// 1. take a per-statement MVCC snapshot,
     /// 2. scan every visible tuple under the *old* schema and reject
-    ///    non-nullable appended columns for non-empty tables, otherwise
-    ///    rewrite each tuple through `HeapAccess::update` with a payload
-    ///    encoded against the *new* schema (the appended column carries
-    ///    [`Value::Null`] for every pre-existing row),
+    ///    non-nullable appended columns without a default for non-empty
+    ///    tables, otherwise rewrite each tuple through
+    ///    `HeapAccess::update` with a payload encoded against the *new*
+    ///    schema (the appended column carries its bound DEFAULT, or
+    ///    [`Value::Null`] when no default exists),
     /// 3. swap the catalog entry to the new schema via
     ///    [`MutableCatalog::alter_table_add_column`].
     ///
@@ -84,8 +85,8 @@ where
         })?;
         self.ensure_table_owner_or_superuser(entry.oid, table_name)?;
         match action {
-            LogicalAlterTableAction::AddColumn { column } => {
-                self.execute_alter_add_column(table_name, column.clone(), snapshot)
+            LogicalAlterTableAction::AddColumn { column, default } => {
+                self.execute_alter_add_column(table_name, column.clone(), default.clone(), snapshot)
             }
             LogicalAlterTableAction::DropColumn {
                 column_index,
@@ -463,7 +464,8 @@ where
         )))
     }
 
-    /// Execute the `ALTER TABLE t ADD COLUMN c TYPE [NULL | NOT NULL]`
+    /// Execute the
+    /// `ALTER TABLE t ADD COLUMN c TYPE [DEFAULT expr] [NULL | NOT NULL]`
     /// path.
     ///
     /// Decoded from the dispatch arm so `execute_alter_table` stays
@@ -473,7 +475,8 @@ where
     pub(crate) fn execute_alter_add_column(
         &self,
         table_name: &str,
-        column: ultrasql_core::Field,
+        column: Field,
+        default: Option<ScalarExpr>,
         snapshot: &CatalogSnapshot,
     ) -> Result<SelectResult, ServerError> {
         // 1. Resolve the existing entry and build the new schema.
@@ -489,6 +492,16 @@ where
                 "ALTER TABLE ADD COLUMN: {e}"
             )))
         })?;
+        let new_width = new_schema.len();
+        let runtime_after =
+            self.runtime_column_metadata_after_add_column(entry.oid, new_width, default.clone());
+        let table_key = ultrasql_catalog::table_lookup_key(&entry.schema_name, &entry.name);
+        if let Some(runtime) = runtime_after.as_ref() {
+            self.state
+                .ensure_table_runtime_constraints_metadata_persistable(&table_key, runtime)?;
+            self.state
+                .ensure_table_runtime_constraints_metadata_slots_persistable()?;
+        }
 
         // 2. Rewrite existing tuples — outside the catalog swap so
         //    the snapshot scan still observes the old schema.
@@ -521,7 +534,7 @@ where
                     to_rewrite.push((tup.tid, row));
                 }
             }
-            if !column.nullable && !to_rewrite.is_empty() {
+            if default.is_none() && !column.nullable && !to_rewrite.is_empty() {
                 return Err(ServerError::Execute(
                     ultrasql_executor::ExecError::NotNullViolation(column.name.clone()),
                 ));
@@ -530,7 +543,7 @@ where
             // Now perform the updates.
             for (tid, old_row) in to_rewrite {
                 let mut new_row = old_row.clone();
-                new_row.push(Value::Null);
+                new_row.push(alter_add_column_default_value(default.as_ref(), &column)?);
                 let new_payload = new_codec
                     .encode(&new_row)
                     .map_err(|e| ServerError::ddl(format!("ALTER TABLE row encode: {e}")))?;
@@ -574,16 +587,15 @@ where
                     .state
                     .persistent_catalog
                     .alter_table_add_column(table_name, column)?;
-                self.resize_runtime_column_metadata_after_add_column(
-                    entry.oid,
-                    updated_entry.schema.len(),
-                );
+                let attr_has_defaults =
+                    alter_attr_has_defaults(runtime_after.as_ref(), updated_entry.schema.len());
                 if let Err(e) = self
                     .state
                     .persistent_catalog
-                    .persist_table_schema_replacement(
+                    .persist_table_schema_replacement_with_defaults(
                         entry,
                         &updated_entry,
+                        &attr_has_defaults,
                         self.state.heap.as_ref(),
                         txn.xid,
                         txn.current_command,
@@ -597,6 +609,12 @@ where
                 }
                 self.state
                     .commit_transaction(txn, true, "ALTER TABLE ADD COLUMN")?;
+                if let Some(runtime) = runtime_after {
+                    self.state
+                        .table_constraints
+                        .insert(entry.oid, Arc::new(runtime));
+                    self.state.persist_table_runtime_constraints_metadata()?;
+                }
                 // A schema change can invalidate any cached projection-
                 // pushdown / predicate-pushdown decision; clear all.
                 self.plan_cache_invalidate();
@@ -610,23 +628,30 @@ where
         }
     }
 
-    fn resize_runtime_column_metadata_after_add_column(
+    fn runtime_column_metadata_after_add_column(
         &self,
         table_oid: ultrasql_core::Oid,
         width: usize,
-    ) {
-        let Some(existing) = self.state.table_constraints.get(&table_oid) else {
-            return;
-        };
-        let mut constraints = existing.value().as_ref().clone();
+        default: Option<ScalarExpr>,
+    ) -> Option<crate::TableRuntimeConstraints> {
+        let (had_existing, mut constraints) =
+            if let Some(existing) = self.state.table_constraints.get(&table_oid) {
+                (true, existing.value().as_ref().clone())
+            } else {
+                (false, crate::TableRuntimeConstraints::default())
+            };
         constraints.defaults.resize(width, None);
         constraints.sequence_defaults.resize(width, None);
         constraints.identity_always.resize(width, false);
         constraints.generated_stored.resize(width, None);
-        drop(existing);
-        self.state
-            .table_constraints
-            .insert(table_oid, Arc::new(constraints));
+        if let Some(default) = default {
+            constraints.defaults[width - 1] = Some(default);
+        }
+        if had_existing || table_runtime_constraints_have_metadata(&constraints) {
+            Some(constraints)
+        } else {
+            None
+        }
     }
 
     fn maintain_indexes_for_alter_rewrite(
@@ -931,6 +956,60 @@ where
             }
         }
     }
+}
+
+fn alter_add_column_default_value(
+    default: Option<&ScalarExpr>,
+    column: &Field,
+) -> Result<Value, ServerError> {
+    let value = if let Some(expr) = default {
+        ultrasql_executor::Eval::new(expr.clone())
+            .eval(&[])
+            .map_err(ultrasql_executor::eval_error_to_exec_error)
+            .map_err(ServerError::Execute)?
+    } else {
+        Value::Null
+    };
+    if !column.nullable && matches!(value, Value::Null) {
+        return Err(ServerError::Execute(
+            ultrasql_executor::ExecError::NotNullViolation(column.name.clone()),
+        ));
+    }
+    Ok(value)
+}
+
+fn alter_attr_has_defaults(
+    runtime: Option<&crate::TableRuntimeConstraints>,
+    width: usize,
+) -> Vec<bool> {
+    let Some(runtime) = runtime else {
+        return vec![false; width];
+    };
+    (0..width)
+        .map(|idx| {
+            runtime.defaults.get(idx).is_some_and(Option::is_some)
+                || runtime
+                    .sequence_defaults
+                    .get(idx)
+                    .is_some_and(Option::is_some)
+                || runtime.identity_always.get(idx).copied().unwrap_or(false)
+                || runtime
+                    .generated_stored
+                    .get(idx)
+                    .is_some_and(Option::is_some)
+        })
+        .collect()
+}
+
+fn table_runtime_constraints_have_metadata(constraints: &crate::TableRuntimeConstraints) -> bool {
+    constraints.defaults.iter().any(Option::is_some)
+        || constraints.sequence_defaults.iter().any(Option::is_some)
+        || constraints.identity_always.iter().any(|flag| *flag)
+        || constraints.generated_stored.iter().any(Option::is_some)
+        || !constraints.checks.is_empty()
+        || !constraints.foreign_keys.is_empty()
+        || !constraints.exclusion_constraints.is_empty()
+        || !constraints.indexes.is_empty()
 }
 
 fn alter_constraint_attnums(columns: &[usize], name: &str) -> Result<Vec<i16>, ServerError> {

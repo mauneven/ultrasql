@@ -155,9 +155,9 @@ async fn alter_table_add_column_rejects_unsupported_constraints() {
         .expect("create");
 
     let err = client
-        .batch_execute("ALTER TABLE t ADD COLUMN c INT DEFAULT 7")
+        .batch_execute("ALTER TABLE t ADD COLUMN c INT CHECK (c > 0)")
         .await
-        .expect_err("unsupported ADD COLUMN DEFAULT must be rejected");
+        .expect_err("unsupported ADD COLUMN CHECK must be rejected");
     assert_eq!(err.code().expect("SQLSTATE").code(), "0A000");
 
     let err = client

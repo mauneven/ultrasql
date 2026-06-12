@@ -3944,12 +3944,13 @@ fn binds_alter_table_add_column_resolves_field() {
         panic!("expected AlterTable plan");
     };
     assert_eq!(table_name, "users");
-    let LogicalAlterTableAction::AddColumn { column } = action else {
+    let LogicalAlterTableAction::AddColumn { column, default } = action else {
         panic!("expected AddColumn action");
     };
     assert_eq!(column.name, "extra");
     assert_eq!(column.data_type, DataType::Int32);
     assert!(column.nullable, "ADD COLUMN defaults to nullable");
+    assert!(default.is_none());
 }
 
 #[test]
@@ -3958,11 +3959,32 @@ fn binds_alter_table_add_column_not_null() {
     let LogicalPlan::AlterTable { action, .. } = plan else {
         panic!("expected AlterTable plan");
     };
-    let LogicalAlterTableAction::AddColumn { column } = action else {
+    let LogicalAlterTableAction::AddColumn { column, default } = action else {
         panic!("expected AddColumn action");
     };
     assert_eq!(column.data_type, DataType::Bool);
     assert!(!column.nullable);
+    assert!(default.is_none());
+}
+
+#[test]
+fn binds_alter_table_add_column_default() {
+    let plan = parse_bind_ok("ALTER TABLE users ADD COLUMN extra INTEGER DEFAULT 7");
+    let LogicalPlan::AlterTable { action, .. } = plan else {
+        panic!("expected AlterTable plan");
+    };
+    let LogicalAlterTableAction::AddColumn { column, default } = action else {
+        panic!("expected AddColumn action");
+    };
+    assert_eq!(column.name, "extra");
+    assert_eq!(column.data_type, DataType::Int32);
+    let Some(ScalarExpr::Literal {
+        value: Value::Int32(7),
+        ..
+    }) = default
+    else {
+        panic!("expected integer literal default");
+    };
 }
 
 #[test]

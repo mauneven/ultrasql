@@ -341,6 +341,56 @@ async fn default_expression_survives_restart() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn alter_add_column_default_backfills_and_survives_restart() {
+    let data_dir = tempfile::TempDir::new().unwrap();
+
+    let running = start_persistent_server(data_dir.path(), "alter_default_restart").await;
+    let client = &running.client;
+    client
+        .batch_execute(
+            "CREATE TABLE alter_default_restart (id INT NOT NULL); \
+             INSERT INTO alter_default_restart VALUES (1), (2); \
+             ALTER TABLE alter_default_restart ADD COLUMN v INT DEFAULT 7 NOT NULL; \
+             INSERT INTO alter_default_restart (id) VALUES (3)",
+        )
+        .await
+        .expect("ALTER ADD COLUMN DEFAULT backfills and applies before restart");
+    graceful_shutdown(running).await;
+
+    let running = start_persistent_server(data_dir.path(), "alter_default_restart").await;
+    let client = &running.client;
+    client
+        .batch_execute("INSERT INTO alter_default_restart (id) VALUES (4)")
+        .await
+        .expect("ALTER ADD COLUMN DEFAULT survives restart");
+    let rows = client
+        .query("SELECT id, v FROM alter_default_restart ORDER BY id", &[])
+        .await
+        .expect("select default rows");
+    assert_eq!(rows.len(), 4);
+    for (idx, row) in rows.iter().enumerate() {
+        let id = i32::try_from(idx + 1).expect("small id");
+        assert_eq!(row.get::<_, i32>(0), id);
+        assert_eq!(row.get::<_, i32>(1), 7);
+    }
+    let attrdefs = client
+        .query(
+            "SELECT a.atthasdef, d.adbin \
+             FROM pg_catalog.pg_class c \
+             JOIN pg_catalog.pg_attribute a ON a.attrelid = c.oid \
+             JOIN pg_catalog.pg_attrdef d ON d.adrelid = a.attrelid AND d.adnum = a.attnum \
+             WHERE c.relname = 'alter_default_restart' AND a.attname = 'v'",
+            &[],
+        )
+        .await
+        .expect("pg_attrdef survives ALTER ADD COLUMN DEFAULT restart");
+    assert_eq!(attrdefs.len(), 1);
+    assert!(attrdefs[0].get::<_, bool>(0));
+    assert!(attrdefs[0].get::<_, String>(1).contains('7'));
+    graceful_shutdown(running).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn persistent_function_default_survives_restart() {
     let data_dir = tempfile::TempDir::new().unwrap();
 
