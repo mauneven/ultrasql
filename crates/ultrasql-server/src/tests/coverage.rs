@@ -88,6 +88,59 @@ fn local_query_finalisation_reports_abort_failure_with_original_error() {
 }
 
 #[test]
+fn restart_rebuild_finalisation_reports_commit_failure() {
+    let server = Server::with_sample_database();
+    let txn = server.txn_manager.begin(IsolationLevel::ReadCommitted);
+    let stale = txn.clone();
+    server.txn_manager.commit(txn).expect("pre-commit");
+
+    let err = server
+        .finalise_restart_rebuild_transaction(
+            stale,
+            Ok(1_u64),
+            "restart rebuild btree commit",
+            "restart rebuild btree rollback",
+        )
+        .expect_err("restart rebuild commit failure must be visible");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("restart rebuild btree commit"),
+        "context missing: {err}"
+    );
+    assert!(msg.contains("commit"), "commit failure hidden: {err}");
+}
+
+#[test]
+fn restart_rebuild_finalisation_reports_abort_failure_with_original_error() {
+    let server = Server::with_sample_database();
+    let txn = server.txn_manager.begin(IsolationLevel::ReadCommitted);
+    let stale = txn.clone();
+    server.txn_manager.abort(txn).expect("pre-abort");
+
+    let err = server
+        .finalise_restart_rebuild_transaction::<u64>(
+            stale,
+            Err(ServerError::ddl("restart rebuild boom")),
+            "restart rebuild btree commit",
+            "restart rebuild btree rollback",
+        )
+        .expect_err("restart rebuild rollback failure must be visible");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("restart rebuild btree rollback"),
+        "context missing: {err}"
+    );
+    assert!(
+        msg.contains("restart rebuild boom"),
+        "original error lost: {err}"
+    );
+    assert!(
+        msg.contains("transaction abort failed"),
+        "abort failure hidden: {err}"
+    );
+}
+
+#[test]
 fn metadata_codecs_cover_escapes_and_rls_tokens() {
     let raw = "tenant\\name\tline\nnext";
     let escaped = metadata_escape(raw);

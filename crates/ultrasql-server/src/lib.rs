@@ -7067,10 +7067,12 @@ impl Server {
             }
             Ok(inserted)
         })();
-        if let Err(e) = self.txn_manager.commit(txn) {
-            tracing::warn!(error = %e, "restart btree rebuild txn failed to finalise");
-        }
-        result
+        self.finalise_restart_rebuild_transaction(
+            txn,
+            result,
+            "restart btree rebuild transaction commit",
+            "restart btree rebuild transaction rollback",
+        )
     }
 
     fn rebuild_brin_summary(
@@ -7127,10 +7129,13 @@ impl Server {
             }
             Ok(inserted)
         })();
-        if let Err(e) = self.txn_manager.commit(txn) {
-            tracing::warn!(error = %e, "restart brin rebuild txn failed to finalise");
-        }
-        result.map(|rows| (brin, rows))
+        let rows = self.finalise_restart_rebuild_transaction(
+            txn,
+            result,
+            "restart brin rebuild transaction commit",
+            "restart brin rebuild transaction rollback",
+        )?;
+        Ok((brin, rows))
     }
 
     fn rebuild_aggregating_index_rows(
@@ -7146,10 +7151,34 @@ impl Server {
             &txn.snapshot,
             self.txn_manager.as_ref(),
         );
-        if let Err(e) = self.txn_manager.commit(txn) {
-            tracing::warn!(error = %e, "restart aggregating-index rebuild txn failed to finalise");
+        self.finalise_restart_rebuild_transaction(
+            txn,
+            rows,
+            "restart aggregating-index rebuild transaction commit",
+            "restart aggregating-index rebuild transaction rollback",
+        )
+    }
+
+    fn finalise_restart_rebuild_transaction<T>(
+        &self,
+        txn: Transaction,
+        outcome: Result<T, ServerError>,
+        commit_context: &'static str,
+        rollback_context: &'static str,
+    ) -> Result<T, ServerError> {
+        match outcome {
+            Ok(value) => self
+                .txn_manager
+                .commit(txn)
+                .map(|()| value)
+                .map_err(|err| ServerError::ddl(format!("{commit_context}: {err}"))),
+            Err(err) => match self.txn_manager.abort(txn) {
+                Ok(()) => Err(err),
+                Err(abort_err) => Err(ServerError::ddl(format!(
+                    "{rollback_context}: {err}; transaction abort failed: {abort_err}"
+                ))),
+            },
         }
-        rows
     }
 
     fn replay_vector_index_wal_into(
