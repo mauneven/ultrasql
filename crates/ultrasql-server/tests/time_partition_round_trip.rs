@@ -387,6 +387,85 @@ async fn qualified_partitioned_truncate_isolates_schema_chunks() {
 }
 
 #[tokio::test]
+async fn qualified_partitioned_add_column_isolates_schema_chunks() {
+    let (_server, client, _conn, server_handle) = start_server_and_connect().await;
+
+    client
+        .batch_execute(
+            "CREATE SCHEMA app;\
+             CREATE TABLE metrics_schema_alter (\
+             ts TIMESTAMP NOT NULL, host TEXT NOT NULL, value INT NOT NULL\
+             ) PARTITION BY RANGE (ts);\
+             CREATE TABLE app.metrics_schema_alter (\
+             ts TIMESTAMP NOT NULL, host TEXT NOT NULL, value INT NOT NULL\
+             ) PARTITION BY RANGE (ts);\
+             INSERT INTO metrics_schema_alter VALUES \
+             (TIMESTAMP '2026-05-20 00:00:00', 'public', 10);\
+             INSERT INTO app.metrics_schema_alter VALUES \
+             (TIMESTAMP '2026-05-20 00:00:00', 'app', 20);\
+             ALTER TABLE app.metrics_schema_alter ADD COLUMN note TEXT;\
+             INSERT INTO app.metrics_schema_alter VALUES \
+             (TIMESTAMP '2026-05-21 00:00:00', 'app2', 30, 'new');",
+        )
+        .await
+        .expect("alter only qualified partitioned table");
+
+    let public_columns = client
+        .query(
+            "SELECT column_name FROM information_schema.columns \
+             WHERE table_schema = 'public' AND table_name = 'metrics_schema_alter' \
+             ORDER BY ordinal_position",
+            &[],
+        )
+        .await
+        .expect("public columns");
+    let public_names = public_columns
+        .iter()
+        .map(|row| row.get::<_, String>(0))
+        .collect::<Vec<_>>();
+    assert_eq!(public_names, vec!["ts", "host", "value"]);
+
+    let app_columns = client
+        .query(
+            "SELECT column_name FROM information_schema.columns \
+             WHERE table_schema = 'app' AND table_name = 'metrics_schema_alter' \
+             ORDER BY ordinal_position",
+            &[],
+        )
+        .await
+        .expect("app columns");
+    let app_names = app_columns
+        .iter()
+        .map(|row| row.get::<_, String>(0))
+        .collect::<Vec<_>>();
+    assert_eq!(app_names, vec!["ts", "host", "value", "note"]);
+
+    let app_rows = client
+        .query(
+            "SELECT host, note FROM app.metrics_schema_alter ORDER BY value",
+            &[],
+        )
+        .await
+        .expect("scan altered app partitioned table");
+    assert_eq!(app_rows.len(), 2);
+    assert_eq!(app_rows[0].get::<_, String>(0), "app");
+    assert!(app_rows[0].get::<_, Option<String>>(1).is_none());
+    assert_eq!(
+        app_rows[1].get::<_, Option<String>>(1).as_deref(),
+        Some("new")
+    );
+
+    let public_count = client
+        .query_one("SELECT COUNT(*) FROM metrics_schema_alter", &[])
+        .await
+        .expect("count untouched public partitioned table")
+        .get::<_, i64>(0);
+    assert_eq!(public_count, 1);
+
+    shutdown(client, server_handle).await;
+}
+
+#[tokio::test]
 async fn partitioned_table_add_column_refreshes_runtime_schema() {
     let data_dir = tempfile::TempDir::new().expect("temp data dir");
 
