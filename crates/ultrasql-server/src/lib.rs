@@ -6202,12 +6202,11 @@ impl Server {
                 )));
             }
             if !self.sequences.contains_key(&sequence_name) {
-                tracing::warn!(
-                    sequence = %sequence_name,
-                    line = line_no + 1,
-                    "ignoring stale sequence owner metadata for missing sequence",
-                );
-                continue;
+                return Err(ServerError::ddl(format!(
+                    "sequence owner metadata line {} references missing sequence '{}'",
+                    line_no + 1,
+                    sequence_name
+                )));
             }
             if !known_roles.contains(&owner_role) {
                 return Err(ServerError::ddl(format!(

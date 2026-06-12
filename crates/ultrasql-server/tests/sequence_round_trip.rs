@@ -192,6 +192,36 @@ async fn sequence_owner_metadata_rejects_unknown_owner_on_rebuild() {
     );
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn sequence_owner_metadata_rejects_missing_sequence_on_rebuild() {
+    let data_dir = tempfile::TempDir::new().expect("temp data dir");
+
+    let running = start_persistent_server(data_dir.path(), "sequence_owner_missing_setup").await;
+    running
+        .client
+        .batch_execute("CREATE ROLE sequence_metadata_owner LOGIN")
+        .await
+        .expect("create owner role");
+    graceful_shutdown(running).await;
+
+    std::fs::write(
+        data_dir.path().join("pg_sequence_owner.meta"),
+        concat!(
+            "# ultrasql sequence owners v2\n",
+            "sequence\tmissing_sequence\tsequence_metadata_owner\tpublic\n"
+        ),
+    )
+    .expect("write missing sequence owner metadata");
+
+    let err = Server::init(data_dir.path()).expect_err("missing sequence owner rejected");
+    assert!(
+        err.to_string().contains(
+            "sequence owner metadata line 2 references missing sequence 'missing_sequence'"
+        ),
+        "expected missing sequence owner rejection, got {err}"
+    );
+}
+
 #[tokio::test]
 async fn non_owner_cannot_alter_or_drop_sequence() {
     let running = start_sample_server("sequence_owner_guard").await;
