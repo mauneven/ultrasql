@@ -475,10 +475,11 @@ where
         };
 
         if let Err(e) = scan_result {
-            if let Err(abort_err) = self.state.txn_manager.abort(txn) {
-                warn!(error = %abort_err, "COPY TO autocommit abort failed");
-            }
-            return Err(e);
+            return Err(self.rollback_copy_transaction_after_error(
+                txn,
+                e,
+                "COPY TO autocommit rollback after scan error",
+            ));
         }
         if let Err(e) = self.state.txn_manager.commit(txn) {
             warn!(error = %e, "COPY TO autocommit commit failed to finalise");
@@ -1269,10 +1270,11 @@ where
         }) {
             Ok(result) => result,
             Err(e) => {
-                if let Err(abort_err) = self.state.txn_manager.abort(txn) {
-                    warn!(error = %abort_err, "COPY query transaction abort failed");
-                }
-                return Err(e);
+                return Err(self.rollback_copy_transaction_after_error(
+                    txn,
+                    e,
+                    "COPY query rollback after execution error",
+                ));
             }
         };
         if let Err(e) = self.state.txn_manager.commit(txn) {

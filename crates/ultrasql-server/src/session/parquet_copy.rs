@@ -81,20 +81,20 @@ where
         let rows = match scan_result {
             Ok(rows) => rows,
             Err(err) => {
-                if let Err(abort_err) = self.state.txn_manager.abort(txn) {
-                    warn!(error = %abort_err, "COPY TO parquet abort failed");
-                }
-                return Err(err);
+                return Err(self.rollback_copy_transaction_after_error(
+                    txn,
+                    err,
+                    "COPY TO parquet rollback after scan error",
+                ));
             }
         };
 
         if let Err(err) = writer.close() {
-            if let Err(abort_err) = self.state.txn_manager.abort(txn) {
-                warn!(error = %abort_err, "COPY TO parquet abort failed");
-            }
-            return Err(ServerError::CopyFormat(format!(
-                "COPY TO parquet {path}: {err}"
-            )));
+            return Err(self.rollback_copy_transaction_after_error(
+                txn,
+                ServerError::CopyFormat(format!("COPY TO parquet {path}: {err}")),
+                "COPY TO parquet rollback after writer close error",
+            ));
         }
         if let Err(err) = self.state.txn_manager.commit(txn) {
             warn!(error = %err, "COPY TO parquet scan commit failed");
