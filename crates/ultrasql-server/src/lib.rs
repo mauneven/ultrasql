@@ -4338,19 +4338,28 @@ impl Server {
             let mut op = pipeline::lower_query(&plan, &ctx)?;
             local_output_from_select_result(run_select(op.as_mut())?)
         })();
+        self.finalise_local_query_transaction(txn, outcome)
+    }
+
+    fn finalise_local_query_transaction(
+        &self,
+        txn: Transaction,
+        outcome: Result<LocalQueryOutput, ServerError>,
+    ) -> Result<LocalQueryOutput, ServerError> {
         match outcome {
-            Ok(output) => {
-                if let Err(err) = self.txn_manager.commit(txn) {
-                    warn!(error = %err, "ultrasql-local read transaction commit failed");
-                }
-                Ok(output)
-            }
-            Err(err) => {
-                if let Err(abort_err) = self.txn_manager.abort(txn) {
-                    warn!(error = %abort_err, "ultrasql-local read transaction abort failed");
-                }
-                Err(err)
-            }
+            Ok(output) => self
+                .txn_manager
+                .commit(txn)
+                .map(|()| output)
+                .map_err(|err| {
+                    ServerError::ddl(format!("ultrasql-local read transaction commit: {err}"))
+                }),
+            Err(err) => match self.txn_manager.abort(txn) {
+                Ok(()) => Err(err),
+                Err(abort_err) => Err(ServerError::ddl(format!(
+                    "ultrasql-local read transaction rollback: {err}; transaction abort failed: {abort_err}"
+                ))),
+            },
         }
     }
 
