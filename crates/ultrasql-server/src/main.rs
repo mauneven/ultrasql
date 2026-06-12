@@ -670,11 +670,7 @@ fn run_shell_command_with_timeout(
             return Ok(status);
         }
         if started.elapsed() >= timeout {
-            if let Err(err) = child.kill()
-                && err.kind() != std::io::ErrorKind::InvalidInput
-            {
-                return Err(err);
-            }
+            terminate_shell_child(&mut child)?;
             let _status = child.wait()?;
             return Err(std::io::Error::new(
                 std::io::ErrorKind::TimedOut,
@@ -698,7 +694,52 @@ fn spawn_shell_command(command: &str) -> std::io::Result<std::process::Child> {
     }
     #[cfg(not(windows))]
     {
-        Command::new("sh").args(["-c", command]).spawn()
+        use std::os::unix::process::CommandExt;
+
+        let mut shell = Command::new("sh");
+        shell.args(["-c", command]);
+        // SAFETY: The closure only calls async-signal-safe `setpgid` in the
+        // child after fork and before exec. It does not touch shared Rust state.
+        unsafe {
+            shell.pre_exec(|| {
+                if libc::setpgid(0, 0) == -1 {
+                    Err(std::io::Error::last_os_error())
+                } else {
+                    Ok(())
+                }
+            });
+        }
+        shell.spawn()
+    }
+}
+
+fn terminate_shell_child(child: &mut std::process::Child) -> std::io::Result<()> {
+    #[cfg(windows)]
+    {
+        if let Err(err) = child.kill()
+            && err.kind() != std::io::ErrorKind::InvalidInput
+        {
+            return Err(err);
+        }
+        Ok(())
+    }
+    #[cfg(not(windows))]
+    {
+        let pid = libc::pid_t::try_from(child.id()).map_err(|_| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "child process id does not fit platform pid_t",
+            )
+        })?;
+        // SAFETY: `spawn_shell_command` puts the shell in a new process group
+        // whose pgid is the child pid. Negative pid targets that process group.
+        if unsafe { libc::kill(-pid, libc::SIGKILL) } == -1 {
+            let err = std::io::Error::last_os_error();
+            if err.raw_os_error() != Some(libc::ESRCH) {
+                return Err(err);
+            }
+        }
+        Ok(())
     }
 }
 
@@ -1581,6 +1622,32 @@ mod tests {
         );
     }
 
+    #[cfg(not(windows))]
+    #[test]
+    fn shell_command_timeout_kills_spawned_children() {
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let pid_file = dir.path().join("sleep.pid");
+        let command = format!(
+            "sleep 5 & echo $! > {}; wait",
+            sh_single_quoted_path(&pid_file)
+        );
+
+        let err = run_shell_command_with_timeout(&command, Some(Duration::from_millis(100)))
+            .expect_err("spawned child should time out");
+
+        assert_eq!(err.kind(), std::io::ErrorKind::TimedOut);
+        let pid = std::fs::read_to_string(&pid_file)
+            .expect("pid file")
+            .trim()
+            .parse::<libc::pid_t>()
+            .expect("pid");
+        let child_alive = process_alive(pid);
+        if child_alive {
+            kill_process(pid);
+        }
+        assert!(!child_alive, "timed-out shell child should be killed");
+    }
+
     #[test]
     fn archive_wal_once_marks_timed_out_command_failed() {
         let dir = tempfile::TempDir::new().expect("temp dir");
@@ -1637,6 +1704,21 @@ mod tests {
     #[cfg(not(windows))]
     fn sh_single_quoted_path(path: &Path) -> String {
         format!("'{}'", path.to_string_lossy().replace('\'', "'\\''"))
+    }
+
+    #[cfg(not(windows))]
+    fn process_alive(pid: libc::pid_t) -> bool {
+        // SAFETY: `kill(pid, 0)` does not send a signal; it probes whether the
+        // process exists and whether this process can signal it.
+        unsafe { libc::kill(pid, 0) == 0 }
+    }
+
+    #[cfg(not(windows))]
+    fn kill_process(pid: libc::pid_t) {
+        // SAFETY: Best-effort test cleanup for a PID created by this test.
+        unsafe {
+            libc::kill(pid, libc::SIGKILL);
+        }
     }
 
     #[test]
