@@ -2011,7 +2011,7 @@ where
                 let is_dml = Self::dml_target_table(plan).is_some();
                 if is_dml {
                     if let Err(e) = self.state.validate_deferred_foreign_keys(&txn) {
-                        return Err(self.rollback_autocommit_after_error(
+                        return Err(self.rollback_transaction_after_error(
                             txn,
                             e,
                             "autocommit rollback after deferred FK violation",
@@ -2020,7 +2020,7 @@ where
                     if let Err(e) =
                         self.flush_dirty_heap_pages_after_dml_if_needed(plan, result.rows)
                     {
-                        return Err(self.rollback_autocommit_after_error(
+                        return Err(self.rollback_transaction_after_error(
                             txn,
                             e,
                             "autocommit rollback after dirty-page flush error",
@@ -2052,7 +2052,7 @@ where
                 }
                 Ok(result)
             }
-            Err(e) => Err(self.rollback_autocommit_after_error(
+            Err(e) => Err(self.rollback_transaction_after_error(
                 txn,
                 e,
                 "autocommit rollback after statement error",
@@ -2060,7 +2060,7 @@ where
         }
     }
 
-    pub(crate) fn rollback_autocommit_after_error(
+    pub(crate) fn rollback_transaction_after_error(
         &self,
         txn: Transaction,
         original: ServerError,

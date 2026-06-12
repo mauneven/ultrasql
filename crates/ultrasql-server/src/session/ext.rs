@@ -571,7 +571,7 @@ where
                             .and_then(Self::dml_target_table)
                             .is_some();
                         if is_dml && let Err(e) = self.state.validate_deferred_foreign_keys(&txn) {
-                            return Err(self.rollback_autocommit_after_error(
+                            return Err(self.rollback_transaction_after_error(
                                 txn,
                                 e,
                                 "Extended Execute autocommit rollback after deferred FK violation",
@@ -602,7 +602,7 @@ where
                         }
                         Ok(outcome)
                     }
-                    Err(e) => Err(self.rollback_autocommit_after_error(
+                    Err(e) => Err(self.rollback_transaction_after_error(
                         txn,
                         e,
                         "Extended Execute autocommit rollback after statement error",

@@ -95,21 +95,12 @@ where
                 if !self.pending_table_modifications.is_empty()
                     && let Err(e) = self.state.validate_deferred_foreign_keys(&txn)
                 {
-                    let xid = txn.xid;
-                    if let Err(rollback_err) = self.state.heap.rollback_in_place_updates(xid) {
-                        tracing::warn!(
-                            error = %rollback_err,
-                            "in-place update rollback failed after deferred FK violation",
-                        );
-                    }
-                    if let Err(abort_err) = self.state.txn_manager.abort(txn) {
-                        tracing::warn!(
-                            error = %abort_err,
-                            "PREPARE TRANSACTION rollback failed after deferred FK violation",
-                        );
-                    }
                     self.clear_pending_dml_effects();
-                    return Err(e);
+                    return Err(self.rollback_transaction_after_error(
+                        txn,
+                        e,
+                        "PREPARE TRANSACTION rollback after deferred FK violation",
+                    ));
                 }
                 if let Err(e) = self.state.txn_manager.prepare_transaction(
                     gid,
@@ -378,21 +369,12 @@ where
                     .collect::<Vec<_>>();
                 if !self.pending_table_modifications.is_empty() {
                     if let Err(e) = self.state.validate_deferred_foreign_keys(&txn) {
-                        let xid = txn.xid;
-                        if let Err(rollback_err) = self.state.heap.rollback_in_place_updates(xid) {
-                            tracing::warn!(
-                                error = %rollback_err,
-                                "in-place update rollback failed after deferred FK violation",
-                            );
-                        }
-                        if let Err(abort_err) = self.state.txn_manager.abort(txn) {
-                            tracing::warn!(
-                                error = %abort_err,
-                                "COMMIT rollback failed after deferred FK violation",
-                            );
-                        }
                         self.clear_pending_dml_effects();
-                        return Err(e);
+                        return Err(self.rollback_transaction_after_error(
+                            txn,
+                            e,
+                            "COMMIT rollback after deferred FK violation",
+                        ));
                     }
                 }
                 if let Err(e) = self.state.commit_transaction(
