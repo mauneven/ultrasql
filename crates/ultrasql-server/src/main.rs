@@ -954,7 +954,7 @@ fn ops_control_auth_response(
             "{\"error\":\"unauthorized\"}\n".to_string(),
         ));
     };
-    if constant_time_eq(actual.as_bytes(), expected.as_bytes()) {
+    if constant_time_eq(expected.as_bytes(), actual.as_bytes()) {
         None
     } else {
         Some((
@@ -980,14 +980,13 @@ fn ops_authorization_bearer(request: &str) -> Option<&str> {
     None
 }
 
-fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
-    if left.len() != right.len() {
-        return false;
+fn constant_time_eq(expected: &[u8], supplied: &[u8]) -> bool {
+    let mut diff = expected.len() ^ supplied.len();
+    for (idx, expected_byte) in expected.iter().copied().enumerate() {
+        let supplied_byte = supplied.get(idx).copied().unwrap_or(0);
+        diff |= usize::from(expected_byte ^ supplied_byte);
     }
-    left.iter()
-        .zip(right)
-        .fold(0_u8, |diff, (a, b)| diff | (a ^ b))
-        == 0
+    diff == 0
 }
 
 enum OpsRequestHead {
@@ -1622,6 +1621,16 @@ mod tests {
             ops_token_from_cli(&cli).expect("valid token").as_deref(),
             Some("0123456789abcdef")
         );
+    }
+
+    #[test]
+    fn ops_constant_time_eq_rejects_wrong_length_tokens() {
+        let expected = b"0123456789abcdef";
+
+        assert!(constant_time_eq(expected, b"0123456789abcdef"));
+        assert!(!constant_time_eq(expected, b"fedcba9876543210"));
+        assert!(!constant_time_eq(expected, b"0123456789abcde"));
+        assert!(!constant_time_eq(expected, b"0123456789abcdef0"));
     }
 
     #[test]
