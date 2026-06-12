@@ -222,6 +222,43 @@ async fn sequence_owner_metadata_rejects_missing_sequence_on_rebuild() {
     );
 }
 
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn drop_sequence_rolls_back_runtime_state_when_owner_metadata_slot_is_unsafe() {
+    use std::os::unix::fs::symlink;
+
+    let data_dir = tempfile::TempDir::new().expect("temp data dir");
+    support::make_data_dir_private(data_dir.path());
+    let outside = data_dir.path().join("outside-sequence-owner-meta");
+    std::fs::write(&outside, b"keep").expect("outside metadata target");
+
+    let running = start_persistent_server(data_dir.path(), "sequence_owner_drop_rollback").await;
+    let client = &running.client;
+    client
+        .batch_execute("CREATE SEQUENCE seq_owner_drop_rollback START WITH 41")
+        .await
+        .expect("create sequence before failed drop");
+    symlink(&outside, data_dir.path().join("pg_sequence_owner.meta.tmp"))
+        .expect("sequence-owner temp symlink");
+
+    let err = client
+        .batch_execute("DROP SEQUENCE seq_owner_drop_rollback")
+        .await
+        .expect_err("unsafe sequence-owner metadata slot rejects DROP SEQUENCE");
+    assert!(
+        err.as_db_error()
+            .is_some_and(|db| db.message().contains("runtime metadata file")),
+        "unexpected error: {err}"
+    );
+    assert_eq!(
+        simple_i64(client, "SELECT nextval('seq_owner_drop_rollback')").await,
+        41,
+        "failed DROP SEQUENCE must not remove runtime sequence state"
+    );
+
+    graceful_shutdown(running).await;
+}
+
 #[tokio::test]
 async fn non_owner_cannot_alter_or_drop_sequence() {
     let running = start_sample_server("sequence_owner_guard").await;

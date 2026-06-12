@@ -2033,6 +2033,12 @@ pub struct SequenceSessionState {
     last_sequence: Arc<parking_lot::Mutex<Option<String>>>,
 }
 
+#[derive(Clone, Debug)]
+pub(crate) struct SequenceSessionSnapshot {
+    currvals: std::collections::HashMap<String, i64>,
+    last_sequence: Option<String>,
+}
+
 impl SequenceSessionState {
     /// Record a generated value for `currval` / `lastval`.
     pub fn record_nextval(&self, name: &str, value: i64) {
@@ -2048,6 +2054,18 @@ impl SequenceSessionState {
         if self.last_sequence.lock().as_deref() == Some(folded.as_str()) {
             *self.last_sequence.lock() = None;
         }
+    }
+
+    pub(crate) fn snapshot(&self) -> SequenceSessionSnapshot {
+        SequenceSessionSnapshot {
+            currvals: self.currvals.lock().clone(),
+            last_sequence: self.last_sequence.lock().clone(),
+        }
+    }
+
+    pub(crate) fn restore_snapshot(&self, snapshot: SequenceSessionSnapshot) {
+        *self.currvals.lock() = snapshot.currvals;
+        *self.last_sequence.lock() = snapshot.last_sequence;
     }
 
     /// Return the session-local value for a named sequence.

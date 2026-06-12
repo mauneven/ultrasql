@@ -216,6 +216,8 @@ where
         for name in &drop_set {
             self.ensure_sequence_owner_or_superuser(name)?;
         }
+        let mut cascade_constraints_snapshot = None;
+        let mut cascade_constraints_changed = false;
         if *cascade {
             let before_constraints = self.table_runtime_constraint_snapshot();
             if self.detach_sequence_default_dependencies(&drop_set)
@@ -224,6 +226,8 @@ where
                 self.restore_table_runtime_constraints(before_constraints);
                 return Err(err);
             }
+            cascade_constraints_changed = true;
+            cascade_constraints_snapshot = Some(before_constraints);
         } else {
             for name in &drop_set {
                 let dependents = self.sequence_default_dependents(name);
@@ -235,6 +239,36 @@ where
                 }
             }
         }
+        let removed_sequences = drop_set
+            .iter()
+            .filter_map(|name| {
+                self.state
+                    .sequences
+                    .get(name)
+                    .map(|seq| (name.clone(), Arc::clone(seq.value())))
+            })
+            .collect::<Vec<_>>();
+        let removed_owners = drop_set
+            .iter()
+            .filter_map(|name| {
+                self.state
+                    .sequence_owners
+                    .get(name)
+                    .map(|owner| (name.clone(), owner.value().clone()))
+            })
+            .collect::<Vec<_>>();
+        let removed_namespaces = drop_set
+            .iter()
+            .filter_map(|name| {
+                self.state
+                    .sequence_namespaces
+                    .get(name)
+                    .map(|namespace| (name.clone(), namespace.value().clone()))
+            })
+            .collect::<Vec<_>>();
+        let sequence_session_snapshot = self.sequence_state.snapshot();
+        let before_grants = self.state.privilege_catalog.list_grants();
+        let before_default_grants = self.state.privilege_catalog.list_default_grants();
         let mut privilege_grants_removed = false;
         for name in &drop_set {
             if let Some(seq) = self.state.sequences.get(name).map(|seq| seq.clone()) {
@@ -256,10 +290,64 @@ where
                 .privilege_catalog
                 .remove_object_grants(crate::auth::PrivilegeObjectKind::Sequence, name);
         }
-        if privilege_grants_removed {
-            self.state.persist_privilege_metadata()?;
+        if let Err(err) = self.state.persist_sequence_owner_metadata() {
+            for (name, seq) in removed_sequences {
+                self.state.sequences.insert(name, seq);
+            }
+            for (name, owner) in removed_owners {
+                self.state.sequence_owners.insert(name, owner);
+            }
+            for (name, namespace) in removed_namespaces {
+                self.state.sequence_namespaces.insert(name, namespace);
+            }
+            self.sequence_state
+                .restore_snapshot(sequence_session_snapshot);
+            self.state
+                .privilege_catalog
+                .install_snapshot(before_grants, before_default_grants);
+            if let Some(snapshot) = cascade_constraints_snapshot {
+                self.restore_table_runtime_constraints(snapshot);
+            }
+            return Err(err);
         }
-        self.state.persist_sequence_owner_metadata()?;
+        if privilege_grants_removed {
+            if let Err(err) = self.state.persist_privilege_metadata() {
+                for (name, seq) in removed_sequences {
+                    self.state.sequences.insert(name, seq);
+                }
+                for (name, owner) in removed_owners {
+                    self.state.sequence_owners.insert(name, owner);
+                }
+                for (name, namespace) in removed_namespaces {
+                    self.state.sequence_namespaces.insert(name, namespace);
+                }
+                self.sequence_state
+                    .restore_snapshot(sequence_session_snapshot);
+                self.state
+                    .privilege_catalog
+                    .install_snapshot(before_grants, before_default_grants);
+                let sequence_owner_restore = self.state.persist_sequence_owner_metadata();
+                let table_runtime_restore = if cascade_constraints_changed {
+                    if let Some(snapshot) = cascade_constraints_snapshot {
+                        self.restore_table_runtime_constraints(snapshot);
+                    }
+                    self.state.persist_table_runtime_constraints_metadata()
+                } else {
+                    Ok(())
+                };
+                if let Err(restore_err) = sequence_owner_restore {
+                    return Err(ServerError::ddl(format!(
+                        "DROP SEQUENCE privilege metadata error: {err}; sequence owner metadata rollback failed: {restore_err}"
+                    )));
+                }
+                if let Err(restore_err) = table_runtime_restore {
+                    return Err(ServerError::ddl(format!(
+                        "DROP SEQUENCE privilege metadata error: {err}; table runtime metadata rollback failed: {restore_err}"
+                    )));
+                }
+                return Err(err);
+            }
+        }
         self.plan_cache_invalidate();
         Ok(result_encoder::run_ddl_command("DROP SEQUENCE"))
     }
