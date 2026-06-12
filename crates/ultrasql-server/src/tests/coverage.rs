@@ -203,6 +203,29 @@ fn stats_hydration_row_count_ignores_unclean_scan_transaction() {
 }
 
 #[test]
+fn analyze_catalog_statistics_abort_failure_preserves_original_error() {
+    let server = Server::with_sample_database();
+    let txn = server.txn_manager.begin(IsolationLevel::ReadCommitted);
+    let stale = txn.clone();
+    server.txn_manager.abort(txn).expect("pre-abort");
+
+    let err = server.abort_analyze_catalog_statistics_transaction(
+        stale,
+        ultrasql_catalog::CatalogError::schema_conflict("stats boom"),
+    );
+    let msg = err.to_string();
+    assert!(
+        msg.contains("ANALYZE catalog statistics transaction abort"),
+        "context missing: {err}"
+    );
+    assert!(msg.contains("stats boom"), "original error lost: {err}");
+    assert!(
+        msg.contains("transaction abort failed"),
+        "abort failure hidden: {err}"
+    );
+}
+
+#[test]
 fn metadata_codecs_cover_escapes_and_rls_tokens() {
     let raw = "tenant\\name\tline\nnext";
     let escaped = metadata_escape(raw);

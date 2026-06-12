@@ -7937,13 +7937,7 @@ impl Server {
                 catalog_txn.xid,
                 catalog_txn.current_command,
             ) {
-                if let Err(abort_err) = self.txn_manager.abort(catalog_txn) {
-                    tracing::warn!(
-                        error = %abort_err,
-                        "ANALYZE catalog statistics transaction abort failed",
-                    );
-                }
-                return Err(ServerError::Catalog(e));
+                return Err(self.abort_analyze_catalog_statistics_transaction(catalog_txn, e));
             }
             self.commit_transaction(catalog_txn, true, "ANALYZE catalog statistics transaction")?;
             self.stats_catalog.write().register(stats);
@@ -7962,6 +7956,20 @@ impl Server {
             }
         }
         result
+    }
+
+    fn abort_analyze_catalog_statistics_transaction(
+        &self,
+        txn: Transaction,
+        err: ultrasql_catalog::CatalogError,
+    ) -> ServerError {
+        match self.txn_manager.abort(txn) {
+            Ok(()) => ServerError::Catalog(err),
+            Err(abort_err) => ServerError::ddl(format!(
+                "ANALYZE catalog statistics transaction abort: {err}; \
+                 transaction abort failed: {abort_err}"
+            )),
+        }
     }
 
     fn finalise_scan_transaction<T>(
