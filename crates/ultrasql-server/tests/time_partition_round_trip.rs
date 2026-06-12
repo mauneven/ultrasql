@@ -46,6 +46,18 @@ async fn shutdown(
     server_handle.abort();
 }
 
+async fn public_table_count(client: &tokio_postgres::Client, table_name: &str) -> i64 {
+    client
+        .query_one(
+            "SELECT COUNT(*) FROM information_schema.tables \
+             WHERE table_schema = 'public' AND table_name = $1",
+            &[&table_name],
+        )
+        .await
+        .expect("count information_schema table rows")
+        .get::<_, i64>(0)
+}
+
 #[tokio::test]
 async fn range_partitioned_timestamp_table_auto_creates_and_prunes_chunks() {
     let (server, client, _conn, server_handle) = start_server_and_connect().await;
@@ -166,6 +178,76 @@ async fn renamed_partitioned_table_keeps_chunk_routing() {
     assert_eq!(rows[2].get::<_, i32>(1), 30);
 
     shutdown(client, server_handle).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn dropped_partitioned_table_removes_chunks_after_restart() {
+    let data_dir = tempfile::TempDir::new().expect("temp data dir");
+
+    let running = start_persistent_server(data_dir.path(), "time_partition_drop_setup").await;
+    running
+        .client
+        .batch_execute(
+            "CREATE TABLE metrics_drop_parent (\
+             ts TIMESTAMP NOT NULL, host TEXT NOT NULL, value INT NOT NULL\
+             ) PARTITION BY RANGE (ts);\
+             INSERT INTO metrics_drop_parent VALUES \
+             (TIMESTAMP '2026-05-20 00:00:00', 'a', 10),\
+             (TIMESTAMP '2026-05-21 00:00:00', 'b', 20)",
+        )
+        .await
+        .expect("create and seed partitioned table before drop");
+    let chunk_names = running
+        .server
+        .time_partitions
+        .get("metrics_drop_parent")
+        .expect("partition runtime before drop")
+        .chunks
+        .iter()
+        .map(|chunk| chunk.value().table_name.clone())
+        .collect::<Vec<_>>();
+    assert_eq!(chunk_names.len(), 2);
+
+    running
+        .client
+        .batch_execute("DROP TABLE metrics_drop_parent")
+        .await
+        .expect("drop partitioned table");
+    assert!(
+        running
+            .server
+            .time_partitions
+            .get("metrics_drop_parent")
+            .is_none(),
+        "partition runtime must be removed immediately after drop"
+    );
+    assert_eq!(
+        public_table_count(&running.client, "metrics_drop_parent").await,
+        0
+    );
+    for chunk_name in &chunk_names {
+        assert_eq!(public_table_count(&running.client, chunk_name).await, 0);
+    }
+    shutdown_persistent(running).await;
+
+    let running = start_persistent_server(data_dir.path(), "time_partition_drop_verify").await;
+    assert!(
+        running
+            .server
+            .time_partitions
+            .get("metrics_drop_parent")
+            .is_none(),
+        "partition runtime must stay removed after restart"
+    );
+    assert_eq!(
+        public_table_count(&running.client, "metrics_drop_parent").await,
+        0
+    );
+    for chunk_name in &chunk_names {
+        assert_eq!(public_table_count(&running.client, chunk_name).await, 0);
+    }
+
+    shutdown_persistent(running).await;
 }
 
 #[tokio::test]
