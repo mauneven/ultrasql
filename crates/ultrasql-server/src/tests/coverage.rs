@@ -141,6 +141,56 @@ fn restart_rebuild_finalisation_reports_abort_failure_with_original_error() {
 }
 
 #[test]
+fn scan_transaction_finalisation_reports_abort_failure_on_success() {
+    let server = Server::with_sample_database();
+    let txn = server.txn_manager.begin(IsolationLevel::ReadCommitted);
+    let stale = txn.clone();
+    server.txn_manager.abort(txn).expect("pre-abort");
+
+    let err = server
+        .finalise_scan_transaction(
+            stale,
+            Ok(()),
+            "columnarization scan transaction abort",
+            "columnarization scan rollback after scan error",
+        )
+        .expect_err("scan abort failure must be visible");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("columnarization scan transaction abort"),
+        "context missing: {err}"
+    );
+    assert!(msg.contains("abort"), "abort failure hidden: {err}");
+}
+
+#[test]
+fn scan_transaction_finalisation_reports_abort_failure_with_original_error() {
+    let server = Server::with_sample_database();
+    let txn = server.txn_manager.begin(IsolationLevel::ReadCommitted);
+    let stale = txn.clone();
+    server.txn_manager.abort(txn).expect("pre-abort");
+
+    let err = server
+        .finalise_scan_transaction::<()>(
+            stale,
+            Err(ServerError::ddl("scan boom")),
+            "ANALYZE scan transaction abort",
+            "ANALYZE scan rollback after scan error",
+        )
+        .expect_err("scan rollback failure must be visible");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("ANALYZE scan rollback after scan error"),
+        "context missing: {err}"
+    );
+    assert!(msg.contains("scan boom"), "original error lost: {err}");
+    assert!(
+        msg.contains("transaction abort failed"),
+        "abort failure hidden: {err}"
+    );
+}
+
+#[test]
 fn metadata_codecs_cover_escapes_and_rls_tokens() {
     let raw = "tenant\\name\tline\nnext";
     let escaped = metadata_escape(raw);

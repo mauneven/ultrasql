@@ -7781,23 +7781,29 @@ impl Server {
         }
 
         let scan_txn = self.txn_manager.begin(IsolationLevel::ReadCommitted);
-        let mut scan = SeqScan::new_with_vm(
-            Arc::clone(&self.heap),
-            rel,
-            block_count,
-            scan_txn.snapshot.clone(),
-            Arc::clone(&self.txn_manager),
-            Arc::clone(&self.vm),
-            RowCodec::new(entry.schema.clone()),
-        );
-        while scan
-            .next_batch()
-            .map_err(|e| ServerError::Ddl(format!("columnarization scan failed: {e}")))?
-            .is_some()
-        {}
-        if let Err(e) = self.txn_manager.abort(scan_txn) {
-            tracing::warn!(error = %e, "columnarization scan transaction abort failed");
-        }
+        let scan_result = (|| -> Result<(), ServerError> {
+            let mut scan = SeqScan::new_with_vm(
+                Arc::clone(&self.heap),
+                rel,
+                block_count,
+                scan_txn.snapshot.clone(),
+                Arc::clone(&self.txn_manager),
+                Arc::clone(&self.vm),
+                RowCodec::new(entry.schema.clone()),
+            );
+            while scan
+                .next_batch()
+                .map_err(|e| ServerError::Ddl(format!("columnarization scan failed: {e}")))?
+                .is_some()
+            {}
+            Ok(())
+        })();
+        self.finalise_scan_transaction(
+            scan_txn,
+            scan_result,
+            "columnarization scan transaction abort",
+            "columnarization scan rollback after scan error",
+        )?;
 
         let Some(cached) = self.heap.column_cache.get(rel) else {
             return Ok(false);
@@ -7844,7 +7850,8 @@ impl Server {
             let scan_txn = self.txn_manager.begin(IsolationLevel::ReadCommitted);
             let scan_snapshot = scan_txn.snapshot.clone();
             let mut payloads: Vec<Vec<u8>> = Vec::new();
-            self.heap
+            let scan_result = self
+                .heap
                 .for_each_visible(
                     rel,
                     block_count,
@@ -7855,10 +7862,13 @@ impl Server {
                         Ok(())
                     },
                 )
-                .map_err(|e| ServerError::Ddl(format!("ANALYZE scan failed: {e}")))?;
-            if let Err(e) = self.txn_manager.abort(scan_txn) {
-                tracing::warn!(error = %e, "ANALYZE scan transaction abort failed");
-            }
+                .map_err(|e| ServerError::Ddl(format!("ANALYZE scan failed: {e}")));
+            self.finalise_scan_transaction(
+                scan_txn,
+                scan_result,
+                "ANALYZE scan transaction abort",
+                "ANALYZE scan rollback after scan error",
+            )?;
 
             self.workload_recorder
                 .update_analyze(pid, "computing statistics", block_count);
@@ -7929,6 +7939,24 @@ impl Server {
             }
         }
         result
+    }
+
+    fn finalise_scan_transaction<T>(
+        &self,
+        txn: Transaction,
+        outcome: Result<T, ServerError>,
+        success_context: &'static str,
+        rollback_context: &'static str,
+    ) -> Result<T, ServerError> {
+        match self.txn_manager.abort(txn) {
+            Ok(()) => outcome,
+            Err(abort_err) => match outcome {
+                Ok(_) => Err(ServerError::ddl(format!("{success_context}: {abort_err}"))),
+                Err(err) => Err(ServerError::ddl(format!(
+                    "{rollback_context}: {err}; transaction abort failed: {abort_err}"
+                ))),
+            },
+        }
     }
 
     fn auto_analyze_threshold(&self, table: &str) -> u64 {
