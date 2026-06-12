@@ -2008,40 +2008,23 @@ where
     ) -> Result<SelectResult, ServerError> {
         match outcome {
             Ok(result) => {
-                let xid = txn.xid;
                 let is_dml = Self::dml_target_table(plan).is_some();
                 if is_dml {
                     if let Err(e) = self.state.validate_deferred_foreign_keys(&txn) {
-                        if let Err(rollback_err) = self.state.heap.rollback_in_place_updates(xid) {
-                            tracing::warn!(
-                                error = %rollback_err,
-                                "in-place update rollback failed after deferred FK violation",
-                            );
-                        }
-                        if let Err(abort_err) = self.state.txn_manager.abort(txn) {
-                            tracing::warn!(
-                                error = %abort_err,
-                                "autocommit rollback failed after deferred FK violation",
-                            );
-                        }
-                        return Err(e);
+                        return Err(self.rollback_autocommit_after_error(
+                            txn,
+                            e,
+                            "autocommit rollback after deferred FK violation",
+                        ));
                     }
                     if let Err(e) =
                         self.flush_dirty_heap_pages_after_dml_if_needed(plan, result.rows)
                     {
-                        if let Err(rollback_err) = self.state.heap.rollback_in_place_updates(xid) {
-                            tracing::warn!(
-                                error = %rollback_err,
-                                "in-place update rollback failed after dirty-page flush error",
-                            );
-                        }
-                        if let Err(abort_err) = self.state.txn_manager.abort(txn) {
-                            tracing::warn!(
-                                error = %abort_err,
-                                "autocommit rollback failed after dirty-page flush error",
-                            );
-                        }
-                        return Err(e);
+                        return Err(self.rollback_autocommit_after_error(
+                            txn,
+                            e,
+                            "autocommit rollback after dirty-page flush error",
+                        ));
                     }
                 }
                 if let Err(e) = self
@@ -2069,19 +2052,50 @@ where
                 }
                 Ok(result)
             }
-            Err(e) => {
-                // Roll back any in-place UPDATE writes by this txn
-                // *before* terminating the CLOG entry, so the undo
-                // log walker still sees the writer's XID.
-                let xid = txn.xid;
-                if let Err(e) = self.state.heap.rollback_in_place_updates(xid) {
-                    tracing::warn!(error = %e, "in-place update rollback failed");
-                }
-                if let Err(abort_err) = self.state.txn_manager.abort(txn) {
-                    tracing::warn!(error = %abort_err, "autocommit rollback failed");
-                }
-                Err(e)
-            }
+            Err(e) => Err(self.rollback_autocommit_after_error(
+                txn,
+                e,
+                "autocommit rollback after statement error",
+            )),
+        }
+    }
+
+    fn rollback_autocommit_after_error(
+        &self,
+        txn: Transaction,
+        original: ServerError,
+        context: &'static str,
+    ) -> ServerError {
+        // Roll back any in-place UPDATE writes by this txn before
+        // terminating the CLOG entry, so the undo walker still sees
+        // the writer's XID. Surface cleanup failure to the client;
+        // otherwise callers could miss that autocommit rollback did
+        // not actually finish.
+        let original_text = original.to_string();
+        let xid = txn.xid;
+        let rollback_err = self
+            .state
+            .heap
+            .rollback_in_place_updates(xid)
+            .err()
+            .map(|err| err.to_string());
+        let abort_err = self
+            .state
+            .txn_manager
+            .abort(txn)
+            .err()
+            .map(|err| err.to_string());
+        match (rollback_err, abort_err) {
+            (None, None) => original,
+            (Some(rollback), None) => ServerError::Ddl(format!(
+                "{context}: {original_text}; in-place update rollback failed: {rollback}"
+            )),
+            (None, Some(abort)) => ServerError::Ddl(format!(
+                "{context}: {original_text}; transaction abort failed: {abort}"
+            )),
+            (Some(rollback), Some(abort)) => ServerError::Ddl(format!(
+                "{context}: {original_text}; in-place update rollback failed: {rollback}; transaction abort failed: {abort}"
+            )),
         }
     }
 
@@ -3641,6 +3655,35 @@ mod tests {
                 .materialized_rows
                 .load(std::sync::atomic::Ordering::Acquire),
             u64::MAX
+        );
+    }
+
+    #[test]
+    fn finalise_autocommit_reports_abort_failure_with_original_error() {
+        let mut session = test_session();
+        let txn = session
+            .state
+            .txn_manager
+            .begin(IsolationLevel::ReadCommitted);
+        let stale = txn.clone();
+        session.state.txn_manager.abort(txn).expect("pre-abort");
+
+        let err = session
+            .finalise_autocommit(
+                &scan_plan(),
+                stale,
+                Err(ServerError::Unsupported("executor boom")),
+            )
+            .expect_err("autocommit cleanup failure must be visible");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("autocommit rollback after statement error"),
+            "unexpected error: {err}"
+        );
+        assert!(msg.contains("executor boom"), "original error lost: {err}");
+        assert!(
+            msg.contains("transaction abort failed"),
+            "abort failure hidden: {err}"
         );
     }
 
