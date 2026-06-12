@@ -562,6 +562,20 @@ where
                 "ALTER TABLE RENAME COLUMN: {e}"
             )))
         })?;
+        let table_key = ultrasql_catalog::table_lookup_key(&entry.schema_name, &entry.name);
+        let partition_update = self.state.time_partitions.get(&table_key).map(|runtime| {
+            let partition_column = if runtime.partition_column_index == column_index {
+                new_name.to_string()
+            } else {
+                runtime.partition_column.clone()
+            };
+            let chunks = runtime
+                .chunks
+                .iter()
+                .filter_map(|chunk| snapshot.tables.get(&chunk.table_name).cloned())
+                .collect::<Vec<_>>();
+            (partition_column, runtime.partition_column_index, chunks)
+        });
         let attr_has_defaults = if let Some(runtime) = self.state.table_constraints.get(&entry.oid)
         {
             alter_attr_has_defaults(Some(runtime.value().as_ref()), new_schema.len())
@@ -569,11 +583,22 @@ where
             alter_attr_has_defaults(None, new_schema.len())
         };
         let txn = self.state.txn_manager.begin(IsolationLevel::ReadCommitted);
-        let updated_entry = self
+        let mut updated_entry = self
             .state
             .persistent_catalog
             .alter_table_replace_schema(table_name, new_schema)
             .map_err(ServerError::Catalog)?;
+        if let Some((partition_column, _, _)) = partition_update.as_ref() {
+            let options = crate::time_partition::parent_catalog_options_with_column(
+                &updated_entry.options,
+                partition_column,
+            );
+            updated_entry = self
+                .state
+                .persistent_catalog
+                .alter_table_options(table_name, options)
+                .map_err(ServerError::Catalog)?;
+        }
         if let Err(e) = self
             .state
             .persistent_catalog
@@ -592,8 +617,70 @@ where
                 "ALTER TABLE RENAME COLUMN catalog rollback after persist error",
             ));
         }
+        if let Some((_, _, chunks)) = partition_update.as_ref() {
+            for chunk_entry in chunks {
+                let mut chunk_fields: Vec<ultrasql_core::Field> =
+                    chunk_entry.schema.fields().to_vec();
+                if column_index >= chunk_fields.len() {
+                    return Err(self.rollback_catalog_transaction_after_error(
+                        txn,
+                        ServerError::ddl(format!(
+                            "ALTER TABLE RENAME COLUMN partition chunk index {column_index} out of bounds"
+                        )),
+                        "ALTER TABLE RENAME COLUMN partition chunk catalog rollback after schema error",
+                    ));
+                }
+                chunk_fields[column_index] = ultrasql_core::Field {
+                    name: new_name.to_string(),
+                    ..chunk_fields[column_index].clone()
+                };
+                let chunk_schema = ultrasql_core::Schema::new(chunk_fields).map_err(|e| {
+                    ServerError::Catalog(ultrasql_catalog::CatalogError::schema_conflict(format!(
+                        "ALTER TABLE RENAME COLUMN partition chunk: {e}"
+                    )))
+                })?;
+                let chunk_key =
+                    ultrasql_catalog::table_lookup_key(&chunk_entry.schema_name, &chunk_entry.name);
+                let updated_chunk = self
+                    .state
+                    .persistent_catalog
+                    .alter_table_replace_schema(&chunk_key, chunk_schema)
+                    .map_err(ServerError::Catalog)?;
+                if let Err(e) = self
+                    .state
+                    .persistent_catalog
+                    .persist_table_schema_replacement(
+                        chunk_entry,
+                        &updated_chunk,
+                        self.state.heap.as_ref(),
+                        txn.xid,
+                        txn.current_command,
+                    )
+                {
+                    return Err(self.rollback_catalog_transaction_after_error(
+                        txn,
+                        e.into(),
+                        "ALTER TABLE RENAME COLUMN partition chunk catalog rollback after persist error",
+                    ));
+                }
+            }
+        }
         self.state
             .commit_transaction(txn, true, "ALTER TABLE RENAME COLUMN")?;
+        if let Some((partition_column, partition_column_index, _)) = partition_update
+            && let Some((_, partition)) = self.state.time_partitions.remove(&table_key)
+        {
+            self.state.time_partitions.insert(
+                table_key,
+                Arc::new(partition.as_ref().with_parent_metadata(
+                    updated_entry.schema_name.clone(),
+                    updated_entry.name.clone(),
+                    updated_entry.schema.clone(),
+                    partition_column,
+                    partition_column_index,
+                )),
+            );
+        }
         self.state.plan_cache.invalidate_all();
         Ok(run_ddl_command(&format!(
             "ALTER TABLE RENAME COLUMN TO {new_name}"

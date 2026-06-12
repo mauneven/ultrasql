@@ -374,6 +374,115 @@ async fn partitioned_table_rejects_dropping_partition_key() {
     shutdown(client, server_handle).await;
 }
 
+#[tokio::test]
+async fn partitioned_table_rename_column_updates_chunk_catalog() {
+    let (server, client, _conn, server_handle) = start_server_and_connect().await;
+
+    client
+        .batch_execute(
+            "CREATE TABLE metrics_rename_column (\
+             ts TIMESTAMP NOT NULL, host TEXT NOT NULL, value INT NOT NULL\
+             ) PARTITION BY RANGE (ts);\
+             INSERT INTO metrics_rename_column VALUES \
+             (TIMESTAMP '2026-05-20 00:00:00', 'a', 10);\
+             ALTER TABLE metrics_rename_column RENAME COLUMN value TO reading;\
+             INSERT INTO metrics_rename_column VALUES \
+             (TIMESTAMP '2026-05-21 00:00:00', 'b', 20)",
+        )
+        .await
+        .expect("rename partitioned table column and insert rows");
+
+    let rows = client
+        .query(
+            "SELECT host, reading FROM metrics_rename_column ORDER BY reading",
+            &[],
+        )
+        .await
+        .expect("scan renamed partitioned parent");
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0].get::<_, String>(0), "a");
+    assert_eq!(rows[1].get::<_, i32>(1), 20);
+
+    let runtime = server
+        .time_partitions
+        .get("metrics_rename_column")
+        .expect("partition runtime exists");
+    for chunk in &runtime.chunks {
+        let chunk_name = chunk.value().table_name.clone();
+        let chunk_columns = client
+            .query(
+                "SELECT column_name FROM information_schema.columns \
+                 WHERE table_name = $1 ORDER BY ordinal_position",
+                &[&chunk_name],
+            )
+            .await
+            .expect("chunk columns from information_schema");
+        let names = chunk_columns
+            .iter()
+            .map(|row| row.get::<_, String>(0))
+            .collect::<Vec<_>>();
+        assert_eq!(names, ["ts", "host", "reading"]);
+    }
+
+    shutdown(client, server_handle).await;
+}
+
+#[tokio::test]
+async fn partitioned_table_rename_partition_key_survives_restart() {
+    let data_dir = tempfile::TempDir::new().expect("temp data dir");
+
+    let running = start_persistent_server(data_dir.path(), "time_partition_rename_key_setup").await;
+    running
+        .client
+        .batch_execute(
+            "CREATE TABLE metrics_rename_key (\
+             ts TIMESTAMP NOT NULL, host TEXT NOT NULL, value INT NOT NULL\
+             ) PARTITION BY RANGE (ts);\
+             INSERT INTO metrics_rename_key VALUES \
+             (TIMESTAMP '2026-05-20 00:00:00', 'a', 10);\
+             ALTER TABLE metrics_rename_key RENAME COLUMN ts TO event_ts;\
+             INSERT INTO metrics_rename_key VALUES \
+             (TIMESTAMP '2026-05-21 00:00:00', 'b', 20)",
+        )
+        .await
+        .expect("rename partition key and insert rows");
+    let rows = running
+        .client
+        .query(
+            "SELECT host, value FROM metrics_rename_key \
+             WHERE event_ts >= TIMESTAMP '2026-05-21 00:00:00'",
+            &[],
+        )
+        .await
+        .expect("scan renamed partition key before restart");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].get::<_, String>(0), "b");
+    shutdown_persistent(running).await;
+
+    let running =
+        start_persistent_server(data_dir.path(), "time_partition_rename_key_verify").await;
+    let partition_column = running
+        .server
+        .time_partitions
+        .get("metrics_rename_key")
+        .expect("partition runtime rebuilt after key rename")
+        .partition_column
+        .clone();
+    assert_eq!(partition_column, "event_ts");
+    let rows = running
+        .client
+        .query(
+            "SELECT host, value FROM metrics_rename_key \
+             WHERE event_ts >= TIMESTAMP '2026-05-21 00:00:00'",
+            &[],
+        )
+        .await
+        .expect("scan renamed partition key after restart");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].get::<_, String>(0), "b");
+    shutdown_persistent(running).await;
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn partitioned_table_rebuilds_runtime_after_restart() {
     let data_dir = tempfile::TempDir::new().expect("temp data dir");

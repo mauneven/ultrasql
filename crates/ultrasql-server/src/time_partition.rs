@@ -70,6 +70,24 @@ pub(crate) fn parent_catalog_options(
     ]
 }
 
+/// Return relation options with the parent partition key column renamed.
+#[must_use]
+pub(crate) fn parent_catalog_options_with_column(
+    options: &[(String, String)],
+    partition_column: &str,
+) -> Vec<(String, String)> {
+    options
+        .iter()
+        .map(|(name, value)| {
+            if name == TIME_PARTITION_COLUMN_OPTION {
+                (name.clone(), partition_column.to_owned())
+            } else {
+                (name.clone(), value.clone())
+            }
+        })
+        .collect()
+}
+
 /// Return catalog options for an auto-created time-partition chunk relation.
 #[must_use]
 pub(crate) fn chunk_catalog_options(
