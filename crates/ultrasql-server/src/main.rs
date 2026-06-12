@@ -60,6 +60,10 @@ struct Cli {
     #[arg(long, default_value = "127.0.0.1:5433")]
     listen: SocketAddr,
 
+    /// Permit trust-auth PostgreSQL-wire listener on non-loopback addresses.
+    #[arg(long, default_value_t = false)]
+    allow_insecure_listen: bool,
+
     /// Optional data directory. When set, server boots WAL-backed storage.
     #[arg(long, env = "ULTRASQL_DATA_DIR")]
     data_dir: Option<PathBuf>,
@@ -200,6 +204,7 @@ Supported query shapes in v0.5:
 
 Production-oriented v0.9 flags:
   - --data-dir DIR      boot WAL-backed storage
+  - --allow-insecure-listen  permit trust-auth listener outside loopback
   - --ops-listen ADDR   serve /health, /ready, /metrics, and backup routes
   - --ops-token TOKEN   require bearer token for /backup/start and /backup/stop
   - --log-format json   emit structured logs
@@ -232,6 +237,10 @@ fn main() -> std::process::ExitCode {
             return std::process::ExitCode::from(1);
         }
     };
+    if let Err(e) = listen_security_from_cli(&cli) {
+        error!(target: "ultrasqld", error = %e, "invalid listener security configuration");
+        return std::process::ExitCode::from(1);
+    }
     let ops_token = match ops_token_from_cli(&cli) {
         Ok(token) => token,
         Err(e) => {
@@ -789,6 +798,16 @@ fn logging_config_from_cli(cli: &Cli) -> Result<LoggingConfig, String> {
         log_min_duration_statement_ms: cli.log_min_duration_statement_ms,
         log_statement: cli.log_statement.into(),
     })
+}
+
+fn listen_security_from_cli(cli: &Cli) -> Result<(), String> {
+    if cli.listen.ip().is_loopback() || cli.allow_insecure_listen {
+        return Ok(());
+    }
+    Err(format!(
+        "PostgreSQL listener {} uses trust authentication on a non-loopback address; bind to 127.0.0.1/::1 or pass --allow-insecure-listen for isolated test networks",
+        cli.listen
+    ))
 }
 
 fn apply_startup_signal_files(state: &Server, data_dir: &Path) -> bool {
@@ -1457,6 +1476,7 @@ mod tests {
     fn autovacuum_config_from_cli_converts_scale_factors() {
         let cli = Cli {
             listen: "127.0.0.1:5433".parse().expect("listen addr"),
+            allow_insecure_listen: false,
             data_dir: None,
             ops_listen: None,
             ops_token: None,
@@ -1491,6 +1511,7 @@ mod tests {
     fn autovacuum_config_from_cli_rejects_invalid_scale_factor() {
         let cli = Cli {
             listen: "127.0.0.1:5433".parse().expect("listen addr"),
+            allow_insecure_listen: false,
             data_dir: None,
             ops_listen: None,
             ops_token: None,
@@ -1520,6 +1541,7 @@ mod tests {
     fn logging_config_from_cli_rejects_invalid_duration() {
         let cli = Cli {
             listen: "127.0.0.1:5433".parse().expect("listen addr"),
+            allow_insecure_listen: false,
             data_dir: None,
             ops_listen: None,
             ops_token: None,
@@ -1549,6 +1571,7 @@ mod tests {
     fn logging_config_from_cli_accepts_duration_and_statement_mode() {
         let cli = Cli {
             listen: "127.0.0.1:5433".parse().expect("listen addr"),
+            allow_insecure_listen: false,
             data_dir: None,
             ops_listen: None,
             ops_token: None,
@@ -1579,9 +1602,51 @@ mod tests {
     }
 
     #[test]
+    fn listen_security_from_cli_rejects_wildcard_without_override() {
+        let mut cli = Cli {
+            listen: "0.0.0.0:5433".parse().expect("listen addr"),
+            allow_insecure_listen: false,
+            data_dir: None,
+            ops_listen: None,
+            ops_token: None,
+            log_level: "info".to_owned(),
+            log_format: LogFormat::Text,
+            log_connections: false,
+            log_min_duration_statement_ms: -1,
+            log_statement: CliLogStatementMode::None,
+            idle_session_timeout_ms: 0,
+            autovacuum_interval_ms: 1000,
+            autovacuum_vacuum_threshold: 50,
+            autovacuum_vacuum_scale_factor: 0.2,
+            autovacuum_analyze_threshold: 50,
+            autovacuum_analyze_scale_factor: 0.1,
+            archive_command: None,
+            restore_command: None,
+            restore_max_segments: 0,
+            archive_interval_ms: 1000,
+            archive_command_timeout_ms: 60_000,
+            restore_command_timeout_ms: 60_000,
+        };
+
+        let err = listen_security_from_cli(&cli).expect_err("wildcard trust must be rejected");
+        assert!(
+            err.contains("non-loopback"),
+            "expected non-loopback rejection, got {err}"
+        );
+
+        cli.listen = "127.0.0.1:5433".parse().expect("loopback listen");
+        assert!(listen_security_from_cli(&cli).is_ok());
+
+        cli.listen = "0.0.0.0:5433".parse().expect("wildcard listen");
+        cli.allow_insecure_listen = true;
+        assert!(listen_security_from_cli(&cli).is_ok());
+    }
+
+    #[test]
     fn ops_token_from_cli_rejects_weak_tokens() {
         let mut cli = Cli {
             listen: "127.0.0.1:5433".parse().expect("listen addr"),
+            allow_insecure_listen: false,
             data_dir: None,
             ops_listen: None,
             ops_token: None,
