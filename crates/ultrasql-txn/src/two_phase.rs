@@ -476,6 +476,15 @@ fn parse_state_file(content: &str) -> Result<ParsedRecord, String> {
     let prepared_at = UNIX_EPOCH
         .checked_add(Duration::from_secs(secs))
         .ok_or_else(|| "prepared_at_secs overflows SystemTime".to_owned())?;
+    let expected = format!(
+        "{{\"gid\":\"{}\",\"xid\":{},\"prepared_at_secs\":{}}}",
+        escape_json_string(&gid),
+        xid_raw,
+        secs
+    );
+    if content != expected {
+        return Err("state file does not match canonical 2PC format".to_owned());
+    }
 
     Ok(ParsedRecord {
         gid,
@@ -842,6 +851,23 @@ mod tests {
             .recover_from_disk()
             .expect_err("corrupt state must fail recovery");
         assert!(matches!(err, TwoPhaseError::Corrupt { gid, .. } if gid == "corrupt"));
+        assert!(coord.list_prepared().is_empty());
+    }
+
+    #[test]
+    fn recover_from_disk_rejects_trailing_garbage_state_files() {
+        let dir = TempDir::new().expect("tempdir");
+        std::fs::write(
+            dir.path().join("garbage.txn"),
+            "{\"gid\":\"garbage\",\"xid\":703,\"prepared_at_secs\":0} trailing",
+        )
+        .expect("state file");
+
+        let coord = TwoPhaseCoordinator::new(dir.path().to_path_buf());
+        let err = coord
+            .recover_from_disk()
+            .expect_err("trailing garbage must fail recovery");
+        assert!(matches!(err, TwoPhaseError::Corrupt { gid, .. } if gid == "garbage"));
         assert!(coord.list_prepared().is_empty());
     }
 
