@@ -84,6 +84,9 @@ still track role-qualified policies and wider write-path checks. See
 
 - `ULTRASQL_OPS_LISTEN` or `ultrasqld --ops-listen ADDR` exposes `/health`,
   `/ready`, and `/metrics`.
+- `ULTRASQL_OPS_TOKEN` or `ultrasqld --ops-token TOKEN` enables
+  `/backup/start` and `/backup/stop`; callers must send
+  `Authorization: Bearer TOKEN`.
 - `ultrasql --ops-endpoint ADDR --isready` checks readiness through the ops
   endpoint.
 - `ultrasql --data-dir DIR validate` checks catalog, indexes, WAL, heap

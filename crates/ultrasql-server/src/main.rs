@@ -65,9 +65,13 @@ struct Cli {
     data_dir: Option<PathBuf>,
 
     /// Optional HTTP operations endpoint for `/health`, `/ready`, `/metrics`,
-    /// and backup fencing.
+    /// and token-protected backup fencing.
     #[arg(long, env = "ULTRASQL_OPS_LISTEN")]
     ops_listen: Option<SocketAddr>,
+
+    /// Bearer token required for mutating ops routes such as backup fencing.
+    #[arg(long, env = "ULTRASQL_OPS_TOKEN")]
+    ops_token: Option<String>,
 
     /// Tracing level filter, e.g. `info`, `debug`, `ultrasqld=trace`.
     #[arg(long, default_value = "info")]
@@ -196,7 +200,8 @@ Supported query shapes in v0.5:
 
 Production-oriented v0.9 flags:
   - --data-dir DIR      boot WAL-backed storage
-  - --ops-listen ADDR   serve /health, /ready, /metrics, /backup/start, /backup/stop
+  - --ops-listen ADDR   serve /health, /ready, /metrics, and backup routes
+  - --ops-token TOKEN   require bearer token for /backup/start and /backup/stop
   - --log-format json   emit structured logs
   - --log-min-duration-statement-ms N
   - --log-statement none|ddl|mod|all
@@ -224,6 +229,13 @@ fn main() -> std::process::ExitCode {
         Ok(config) => config,
         Err(e) => {
             error!(target: "ultrasqld", error = %e, "invalid logging configuration");
+            return std::process::ExitCode::from(1);
+        }
+    };
+    let ops_token = match ops_token_from_cli(&cli) {
+        Ok(token) => token,
+        Err(e) => {
+            error!(target: "ultrasqld", error = %e, "invalid ops token configuration");
             return std::process::ExitCode::from(1);
         }
     };
@@ -299,8 +311,9 @@ fn main() -> std::process::ExitCode {
         if let Some(ops_addr) = cli.ops_listen {
             let pg_addr = cli.listen;
             let ops_state = Arc::clone(&state);
+            let ops_token = ops_token.clone();
             tokio::spawn(async move {
-                if let Err(e) = run_ops_endpoint(ops_addr, pg_addr, ops_state).await {
+                if let Err(e) = run_ops_endpoint(ops_addr, pg_addr, ops_state, ops_token).await {
                     error!(target: "ultrasqld", error = %e, "ops endpoint terminated");
                 }
             });
@@ -751,6 +764,22 @@ fn timeout_label_ms(timeout: Option<Duration>) -> u128 {
     timeout.unwrap_or(DEFAULT_WAL_COMMAND_TIMEOUT).as_millis()
 }
 
+fn ops_token_from_cli(cli: &Cli) -> Result<Option<Arc<str>>, String> {
+    let Some(token) = cli.ops_token.as_deref() else {
+        return Ok(None);
+    };
+    if token.len() < 16 {
+        return Err("ops_token must be at least 16 bytes".to_string());
+    }
+    if token
+        .bytes()
+        .any(|b| b.is_ascii_control() || b.is_ascii_whitespace())
+    {
+        return Err("ops_token must not contain whitespace or control bytes".to_string());
+    }
+    Ok(Some(Arc::<str>::from(token)))
+}
+
 fn logging_config_from_cli(cli: &Cli) -> Result<LoggingConfig, String> {
     if cli.log_min_duration_statement_ms < -1 {
         return Err("log_min_duration_statement_ms must be -1 or greater".to_string());
@@ -805,15 +834,26 @@ async fn run_ops_endpoint(
     addr: SocketAddr,
     pg_addr: SocketAddr,
     state: Arc<Server>,
+    ops_token: Option<Arc<str>>,
 ) -> std::io::Result<()> {
     let listener = TcpListener::bind(addr).await?;
     loop {
         let (stream, _) = listener.accept().await?;
-        tokio::spawn(handle_ops_request(stream, pg_addr, Arc::clone(&state)));
+        tokio::spawn(handle_ops_request(
+            stream,
+            pg_addr,
+            Arc::clone(&state),
+            ops_token.clone(),
+        ));
     }
 }
 
-async fn handle_ops_request(mut stream: TcpStream, pg_addr: SocketAddr, state: Arc<Server>) {
+async fn handle_ops_request(
+    mut stream: TcpStream,
+    pg_addr: SocketAddr,
+    state: Arc<Server>,
+    ops_token: Option<Arc<str>>,
+) {
     let buf = match read_ops_request_head(&mut stream).await {
         OpsRequestHead::Complete(buf) => buf,
         OpsRequestHead::TooLarge => {
@@ -866,12 +906,20 @@ async fn handle_ops_request(mut stream: TcpStream, pg_addr: SocketAddr, state: A
             }
         }
         "/metrics" => ("200 OK", "text/plain; version=0.0.4", metrics_body(&state)),
-        "/backup/start" if method == "POST" => match start_backup_fence(&state) {
-            Ok(body) => ("200 OK", "application/json", body),
-            Err(body) => ("500 Internal Server Error", "application/json", body),
-        },
+        "/backup/start" if method == "POST" => {
+            match ops_control_auth_response(&req, ops_token.as_deref()) {
+                Some(auth_response) => auth_response,
+                None => match start_backup_fence(&state) {
+                    Ok(body) => ("200 OK", "application/json", body),
+                    Err(body) => ("500 Internal Server Error", "application/json", body),
+                },
+            }
+        }
         "/backup/stop" if method == "POST" => {
-            ("200 OK", "application/json", stop_backup_fence(&state))
+            match ops_control_auth_response(&req, ops_token.as_deref()) {
+                Some(auth_response) => auth_response,
+                None => ("200 OK", "application/json", stop_backup_fence(&state)),
+            }
         }
         "/backup/start" | "/backup/stop" => (
             "405 Method Not Allowed",
@@ -886,6 +934,60 @@ async fn handle_ops_request(mut stream: TcpStream, pg_addr: SocketAddr, state: A
     };
 
     write_ops_response(&mut stream, status, content_type, &body).await;
+}
+
+fn ops_control_auth_response(
+    request: &str,
+    ops_token: Option<&str>,
+) -> Option<(&'static str, &'static str, String)> {
+    let Some(expected) = ops_token else {
+        return Some((
+            "403 Forbidden",
+            "application/json",
+            "{\"error\":\"ops token required\"}\n".to_string(),
+        ));
+    };
+    let Some(actual) = ops_authorization_bearer(request) else {
+        return Some((
+            "401 Unauthorized",
+            "application/json",
+            "{\"error\":\"unauthorized\"}\n".to_string(),
+        ));
+    };
+    if constant_time_eq(actual.as_bytes(), expected.as_bytes()) {
+        None
+    } else {
+        Some((
+            "401 Unauthorized",
+            "application/json",
+            "{\"error\":\"unauthorized\"}\n".to_string(),
+        ))
+    }
+}
+
+fn ops_authorization_bearer(request: &str) -> Option<&str> {
+    for line in request.lines().skip(1) {
+        if line.is_empty() {
+            break;
+        }
+        let Some((name, value)) = line.split_once(':') else {
+            continue;
+        };
+        if name.eq_ignore_ascii_case("authorization") {
+            return value.trim().strip_prefix("Bearer ");
+        }
+    }
+    None
+}
+
+fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
+    if left.len() != right.len() {
+        return false;
+    }
+    left.iter()
+        .zip(right)
+        .fold(0_u8, |diff, (a, b)| diff | (a ^ b))
+        == 0
 }
 
 enum OpsRequestHead {
@@ -1160,18 +1262,6 @@ mod tests {
         assert!(metrics.contains("content-type: text/plain; version=0.0.4"));
         assert!(metrics.contains("ultrasql_up 1"));
 
-        let backup_start =
-            request_ops_method("POST", "/backup/start", missing_pg, Arc::clone(&state)).await;
-        assert!(backup_start.starts_with("HTTP/1.1 200 OK"));
-        assert!(backup_start.contains("\"backup_started\""));
-        assert!(state.is_standby_mode());
-
-        let backup_stop =
-            request_ops_method("POST", "/backup/stop", missing_pg, Arc::clone(&state)).await;
-        assert!(backup_stop.starts_with("HTTP/1.1 200 OK"));
-        assert!(backup_stop.contains("\"backup_stopped\""));
-        assert!(!state.is_standby_mode());
-
         let not_found = request_ops_path("/nope", missing_pg, state).await;
         assert!(not_found.starts_with("HTTP/1.1 404 Not Found"));
         assert!(not_found.contains("\"error\":\"not found\""));
@@ -1190,6 +1280,70 @@ mod tests {
         let backup_stop = request_ops_path("/backup/stop", missing_pg, Arc::clone(&state)).await;
         assert!(backup_stop.starts_with("HTTP/1.1 405 Method Not Allowed"));
         assert!(state.is_standby_mode());
+    }
+
+    #[tokio::test]
+    async fn ops_endpoint_backup_routes_require_bearer_token() {
+        let state = Arc::new(Server::with_sample_database());
+        let missing_pg: SocketAddr = "127.0.0.1:0".parse().expect("missing pg addr");
+
+        let backup_start =
+            request_ops_method("POST", "/backup/start", missing_pg, Arc::clone(&state)).await;
+
+        assert!(backup_start.starts_with("HTTP/1.1 403 Forbidden"));
+        assert!(backup_start.contains("\"error\":\"ops token required\""));
+        assert!(!state.is_standby_mode());
+
+        let token = Arc::<str>::from("0123456789abcdef");
+        let missing_auth = request_ops_method_with_auth(
+            "POST",
+            "/backup/start",
+            missing_pg,
+            Arc::clone(&state),
+            Some(Arc::clone(&token)),
+            None,
+        )
+        .await;
+        assert!(missing_auth.starts_with("HTTP/1.1 401 Unauthorized"));
+        assert!(!state.is_standby_mode());
+
+        let wrong_auth = request_ops_method_with_auth(
+            "POST",
+            "/backup/start",
+            missing_pg,
+            Arc::clone(&state),
+            Some(Arc::clone(&token)),
+            Some("Bearer fedcba9876543210"),
+        )
+        .await;
+        assert!(wrong_auth.starts_with("HTTP/1.1 401 Unauthorized"));
+        assert!(!state.is_standby_mode());
+
+        let backup_start = request_ops_method_with_auth(
+            "POST",
+            "/backup/start",
+            missing_pg,
+            Arc::clone(&state),
+            Some(Arc::clone(&token)),
+            Some("Bearer 0123456789abcdef"),
+        )
+        .await;
+        assert!(backup_start.starts_with("HTTP/1.1 200 OK"));
+        assert!(backup_start.contains("\"backup_started\""));
+        assert!(state.is_standby_mode());
+
+        let backup_stop = request_ops_method_with_auth(
+            "POST",
+            "/backup/stop",
+            missing_pg,
+            Arc::clone(&state),
+            Some(token),
+            Some("Bearer 0123456789abcdef"),
+        )
+        .await;
+        assert!(backup_stop.starts_with("HTTP/1.1 200 OK"));
+        assert!(backup_stop.contains("\"backup_stopped\""));
+        assert!(!state.is_standby_mode());
     }
 
     #[tokio::test]
@@ -1216,18 +1370,36 @@ mod tests {
         pg_addr: SocketAddr,
         state: Arc<Server>,
     ) -> String {
+        request_ops_method_with_auth(method, path, pg_addr, state, None, None).await
+    }
+
+    async fn request_ops_method_with_auth(
+        method: &str,
+        path: &str,
+        pg_addr: SocketAddr,
+        state: Arc<Server>,
+        ops_token: Option<Arc<str>>,
+        authorization: Option<&str>,
+    ) -> String {
         let listener = TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind ops probe");
         let addr = listener.local_addr().expect("ops addr");
         let server = tokio::spawn(async move {
             let (stream, _) = listener.accept().await.expect("accept ops probe");
-            handle_ops_request(stream, pg_addr, state).await;
+            handle_ops_request(stream, pg_addr, state, ops_token).await;
         });
 
         let mut client = TcpStream::connect(addr).await.expect("connect ops probe");
+        let mut request = format!("{method} {path} HTTP/1.1\r\nhost: localhost\r\n");
+        if let Some(authorization) = authorization {
+            request.push_str("authorization: ");
+            request.push_str(authorization);
+            request.push_str("\r\n");
+        }
+        request.push_str("\r\n");
         client
-            .write_all(format!("{method} {path} HTTP/1.1\r\nhost: localhost\r\n\r\n").as_bytes())
+            .write_all(request.as_bytes())
             .await
             .expect("write request");
         let response = read_ops_test_response(&mut client).await;
@@ -1288,6 +1460,7 @@ mod tests {
             listen: "127.0.0.1:5433".parse().expect("listen addr"),
             data_dir: None,
             ops_listen: None,
+            ops_token: None,
             log_level: "info".to_owned(),
             log_format: LogFormat::Text,
             log_connections: false,
@@ -1321,6 +1494,7 @@ mod tests {
             listen: "127.0.0.1:5433".parse().expect("listen addr"),
             data_dir: None,
             ops_listen: None,
+            ops_token: None,
             log_level: "info".to_owned(),
             log_format: LogFormat::Text,
             log_connections: false,
@@ -1349,6 +1523,7 @@ mod tests {
             listen: "127.0.0.1:5433".parse().expect("listen addr"),
             data_dir: None,
             ops_listen: None,
+            ops_token: None,
             log_level: "info".to_owned(),
             log_format: LogFormat::Text,
             log_connections: false,
@@ -1377,6 +1552,7 @@ mod tests {
             listen: "127.0.0.1:5433".parse().expect("listen addr"),
             data_dir: None,
             ops_listen: None,
+            ops_token: None,
             log_level: "info".to_owned(),
             log_format: LogFormat::Json,
             log_connections: true,
@@ -1401,6 +1577,51 @@ mod tests {
         assert!(config.log_connections);
         assert_eq!(config.log_min_duration_statement_ms, 25);
         assert_eq!(config.log_statement, LogStatementMode::All);
+    }
+
+    #[test]
+    fn ops_token_from_cli_rejects_weak_tokens() {
+        let mut cli = Cli {
+            listen: "127.0.0.1:5433".parse().expect("listen addr"),
+            data_dir: None,
+            ops_listen: None,
+            ops_token: None,
+            log_level: "info".to_owned(),
+            log_format: LogFormat::Text,
+            log_connections: false,
+            log_min_duration_statement_ms: -1,
+            log_statement: CliLogStatementMode::None,
+            idle_session_timeout_ms: 0,
+            autovacuum_interval_ms: 1000,
+            autovacuum_vacuum_threshold: 50,
+            autovacuum_vacuum_scale_factor: 0.2,
+            autovacuum_analyze_threshold: 50,
+            autovacuum_analyze_scale_factor: 0.1,
+            archive_command: None,
+            restore_command: None,
+            restore_max_segments: 0,
+            archive_interval_ms: 1000,
+            archive_command_timeout_ms: 60_000,
+            restore_command_timeout_ms: 60_000,
+        };
+
+        assert!(
+            ops_token_from_cli(&cli)
+                .expect("missing token ok")
+                .is_none()
+        );
+
+        cli.ops_token = Some("short".to_owned());
+        assert!(ops_token_from_cli(&cli).is_err());
+
+        cli.ops_token = Some("0123456789abcde ".to_owned());
+        assert!(ops_token_from_cli(&cli).is_err());
+
+        cli.ops_token = Some("0123456789abcdef".to_owned());
+        assert_eq!(
+            ops_token_from_cli(&cli).expect("valid token").as_deref(),
+            Some("0123456789abcdef")
+        );
     }
 
     #[test]
