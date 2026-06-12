@@ -610,8 +610,15 @@ where
             ));
         }
         let oid = self.state.persistent_catalog.next_oid();
+        let mut table_options = column_collation_options(column_collations);
+        if let Some(partition) = partition {
+            table_options.extend(crate::time_partition::parent_catalog_options(
+                &partition.column,
+                crate::time_partition::DEFAULT_TIME_CHUNK_INTERVAL_US,
+            ));
+        }
         let entry = TableEntry::new(oid, table_name.clone(), namespace.clone(), columns.clone())
-            .with_options(column_collation_options(column_collations));
+            .with_options(table_options);
         for unique in unique_constraints {
             crate::index_key::IndexKeyEncoding::for_columns(&entry.schema, &unique.columns)?;
         }

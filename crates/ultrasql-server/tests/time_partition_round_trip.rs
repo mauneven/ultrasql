@@ -1,10 +1,13 @@
 //! End-to-end time-series range partitioning tests.
 
+pub mod support;
+
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 
+use support::{shutdown as shutdown_persistent, start_persistent_server};
 use tokio_postgres::NoTls;
 use ultrasql_server::{Server, bind_listener, serve_listener};
 
@@ -206,6 +209,72 @@ async fn partitioned_parent_count_reads_chunks() {
     assert_eq!(filtered_sum, 20);
 
     shutdown(client, server_handle).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn partitioned_table_rebuilds_runtime_after_restart() {
+    let data_dir = tempfile::TempDir::new().expect("temp data dir");
+
+    let running = start_persistent_server(data_dir.path(), "time_partition_restart_setup").await;
+    running
+        .client
+        .batch_execute(
+            "CREATE TABLE metrics_restart (\
+             ts TIMESTAMP NOT NULL, host TEXT NOT NULL, value INT NOT NULL\
+             ) PARTITION BY RANGE (ts);\
+             INSERT INTO metrics_restart VALUES \
+             (TIMESTAMP '2026-05-20 00:00:00', 'a', 10),\
+             (TIMESTAMP '2026-05-21 00:00:00', 'b', 20)",
+        )
+        .await
+        .expect("create and seed partitioned table before restart");
+    assert!(
+        running
+            .server
+            .time_partitions
+            .get("metrics_restart")
+            .is_some(),
+        "partition runtime must exist before restart"
+    );
+    shutdown_persistent(running).await;
+
+    let running = start_persistent_server(data_dir.path(), "time_partition_restart_verify").await;
+    assert!(
+        running
+            .server
+            .time_partitions
+            .get("metrics_restart")
+            .is_some(),
+        "partition runtime must be rebuilt after restart"
+    );
+    let rows = running
+        .client
+        .query(
+            "SELECT host, value FROM metrics_restart ORDER BY value",
+            &[],
+        )
+        .await
+        .expect("scan restarted partitioned parent");
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0].get::<_, String>(0), "a");
+    assert_eq!(rows[1].get::<_, i32>(1), 20);
+
+    running
+        .client
+        .batch_execute(
+            "INSERT INTO metrics_restart VALUES \
+             (TIMESTAMP '2026-05-22 00:00:00', 'c', 30)",
+        )
+        .await
+        .expect("insert after restart routes to time chunk");
+    let count = running
+        .client
+        .query_one("SELECT COUNT(*) FROM metrics_restart", &[])
+        .await
+        .expect("count restarted partitioned parent")
+        .get::<_, i64>(0);
+    assert_eq!(count, 3);
+    shutdown_persistent(running).await;
 }
 
 #[tokio::test]

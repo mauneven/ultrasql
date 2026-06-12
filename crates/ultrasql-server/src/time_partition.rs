@@ -19,6 +19,179 @@ use crate::BlankPageLoader;
 
 /// Default chunk width for `PARTITION BY RANGE(timestamp)`: one day.
 pub const DEFAULT_TIME_CHUNK_INTERVAL_US: i64 = 86_400_000_000;
+const TIME_PARTITION_KIND_OPTION: &str = "ultrasql.time_partition.kind";
+const TIME_PARTITION_PARENT_KIND: &str = "parent";
+const TIME_PARTITION_CHUNK_KIND: &str = "chunk";
+const TIME_PARTITION_COLUMN_OPTION: &str = "ultrasql.time_partition.column";
+const TIME_PARTITION_INTERVAL_US_OPTION: &str = "ultrasql.time_partition.interval_us";
+const TIME_PARTITION_PARENT_OID_OPTION: &str = "ultrasql.time_partition.parent_oid";
+const TIME_PARTITION_START_US_OPTION: &str = "ultrasql.time_partition.start_us";
+const TIME_PARTITION_END_US_OPTION: &str = "ultrasql.time_partition.end_us";
+
+/// Durable parent-table time partition metadata decoded from catalog options.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct TimePartitionParentOptions {
+    /// Partition key column name.
+    pub column: String,
+    /// Chunk interval in microseconds.
+    pub interval_us: i64,
+}
+
+/// Durable chunk-table time partition metadata decoded from catalog options.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct TimePartitionChunkOptions {
+    /// Parent table OID.
+    pub parent_oid: Oid,
+    /// Inclusive lower bound in microseconds since 2000-01-01.
+    pub start_us: i64,
+    /// Exclusive upper bound in microseconds since 2000-01-01.
+    pub end_us: i64,
+}
+
+/// Return catalog options for a time-partitioned parent relation.
+#[must_use]
+pub(crate) fn parent_catalog_options(
+    partition_column: &str,
+    interval_us: i64,
+) -> Vec<(String, String)> {
+    vec![
+        (
+            TIME_PARTITION_KIND_OPTION.to_owned(),
+            TIME_PARTITION_PARENT_KIND.to_owned(),
+        ),
+        (
+            TIME_PARTITION_COLUMN_OPTION.to_owned(),
+            partition_column.to_owned(),
+        ),
+        (
+            TIME_PARTITION_INTERVAL_US_OPTION.to_owned(),
+            interval_us.to_string(),
+        ),
+    ]
+}
+
+/// Return catalog options for an auto-created time-partition chunk relation.
+#[must_use]
+pub(crate) fn chunk_catalog_options(
+    parent_oid: Oid,
+    start_us: i64,
+    end_us: i64,
+) -> Vec<(String, String)> {
+    vec![
+        (
+            TIME_PARTITION_KIND_OPTION.to_owned(),
+            TIME_PARTITION_CHUNK_KIND.to_owned(),
+        ),
+        (
+            TIME_PARTITION_PARENT_OID_OPTION.to_owned(),
+            parent_oid.raw().to_string(),
+        ),
+        (
+            TIME_PARTITION_START_US_OPTION.to_owned(),
+            start_us.to_string(),
+        ),
+        (TIME_PARTITION_END_US_OPTION.to_owned(), end_us.to_string()),
+    ]
+}
+
+/// Decode parent time-partition metadata from a table entry.
+pub(crate) fn parent_options_from_entry(
+    entry: &TableEntry,
+) -> Result<Option<TimePartitionParentOptions>, String> {
+    match option_value(entry, TIME_PARTITION_KIND_OPTION) {
+        None | Some(TIME_PARTITION_CHUNK_KIND) => Ok(None),
+        Some(TIME_PARTITION_PARENT_KIND) => {
+            let column = option_value(entry, TIME_PARTITION_COLUMN_OPTION)
+                .ok_or_else(|| format!("table '{}' missing time partition column", entry.name))?
+                .to_owned();
+            let interval_us = parse_i64_option(entry, TIME_PARTITION_INTERVAL_US_OPTION)?;
+            if interval_us <= 0 {
+                return Err(format!(
+                    "table '{}' has non-positive time partition interval {interval_us}",
+                    entry.name
+                ));
+            }
+            Ok(Some(TimePartitionParentOptions {
+                column,
+                interval_us,
+            }))
+        }
+        Some(kind) => Err(format!(
+            "table '{}' has unknown time partition kind '{}'",
+            entry.name, kind
+        )),
+    }
+}
+
+/// Decode chunk time-partition metadata from a table entry.
+pub(crate) fn chunk_options_from_entry(
+    entry: &TableEntry,
+) -> Result<Option<TimePartitionChunkOptions>, String> {
+    match option_value(entry, TIME_PARTITION_KIND_OPTION) {
+        None | Some(TIME_PARTITION_PARENT_KIND) => Ok(None),
+        Some(TIME_PARTITION_CHUNK_KIND) => {
+            let parent_oid_raw = parse_u32_option(entry, TIME_PARTITION_PARENT_OID_OPTION)?;
+            let start_us = parse_i64_option(entry, TIME_PARTITION_START_US_OPTION)?;
+            let end_us = parse_i64_option(entry, TIME_PARTITION_END_US_OPTION)?;
+            if end_us <= start_us {
+                return Err(format!(
+                    "table '{}' has invalid time partition chunk bounds {start_us}..{end_us}",
+                    entry.name
+                ));
+            }
+            Ok(Some(TimePartitionChunkOptions {
+                parent_oid: Oid::new(parent_oid_raw),
+                start_us,
+                end_us,
+            }))
+        }
+        Some(kind) => Err(format!(
+            "table '{}' has unknown time partition kind '{}'",
+            entry.name, kind
+        )),
+    }
+}
+
+fn option_value<'a>(entry: &'a TableEntry, name: &str) -> Option<&'a str> {
+    entry
+        .options
+        .iter()
+        .find_map(|(key, value)| (key == name).then_some(value.as_str()))
+}
+
+fn parse_i64_option(entry: &TableEntry, name: &str) -> Result<i64, String> {
+    option_value(entry, name)
+        .ok_or_else(|| {
+            format!(
+                "table '{}' missing time partition option {name}",
+                entry.name
+            )
+        })?
+        .parse::<i64>()
+        .map_err(|_| {
+            format!(
+                "table '{}' has invalid time partition option {name}",
+                entry.name
+            )
+        })
+}
+
+fn parse_u32_option(entry: &TableEntry, name: &str) -> Result<u32, String> {
+    option_value(entry, name)
+        .ok_or_else(|| {
+            format!(
+                "table '{}' missing time partition option {name}",
+                entry.name
+            )
+        })?
+        .parse::<u32>()
+        .map_err(|_| {
+            format!(
+                "table '{}' has invalid time partition option {name}",
+                entry.name
+            )
+        })
+}
 
 /// Runtime metadata for one time-range partitioned parent table.
 #[derive(Debug)]
@@ -191,6 +364,7 @@ impl TimePartitionInsert {
 
         let chunk_relname = chunk_table_name(&self.runtime.parent_relname, start_us);
         let table_name = table_lookup_key(&self.runtime.parent_schema_name, &chunk_relname);
+        let end_us = start_us.saturating_add(self.runtime.chunk_interval_us);
         let oid = if let Some(existing) = self.persistent_catalog.lookup_table(&table_name) {
             existing.oid
         } else {
@@ -200,15 +374,31 @@ impl TimePartitionInsert {
                 chunk_relname,
                 self.runtime.parent_schema_name.clone(),
                 self.runtime.schema.clone(),
-            );
+            )
+            .with_options(chunk_catalog_options(
+                self.runtime.parent_oid,
+                start_us,
+                end_us,
+            ));
             self.persistent_catalog
-                .create_table(entry)
+                .create_table(entry.clone())
                 .map_err(|e| ExecError::TypeMismatch(format!("create time chunk: {e}")))?;
+            if let Err(err) = self.persistent_catalog.persist_table_rows(
+                &entry,
+                self.heap.as_ref(),
+                self.xid,
+                self.command_id,
+            ) {
+                let _ = self.persistent_catalog.drop_table(&table_name);
+                return Err(ExecError::TypeMismatch(format!(
+                    "persist time chunk catalog rows: {err}"
+                )));
+            }
             oid
         };
         let chunk = TimeChunkRuntime {
             start_us,
-            end_us: start_us.saturating_add(self.runtime.chunk_interval_us),
+            end_us,
             table_name,
             oid,
         };

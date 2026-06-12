@@ -5145,6 +5145,7 @@ impl Server {
         server.rebuild_operator_metadata()?;
         server.rebuild_row_security_sidecars()?;
         server.rebuild_materialized_view_runtime_sidecars()?;
+        server.rebuild_time_partition_runtime_sidecars()?;
         Ok(server)
     }
 
@@ -7172,6 +7173,92 @@ impl Server {
                     materialized_rows: std::sync::atomic::AtomicU64::new(record.materialized_rows),
                 }),
             );
+        }
+        Ok(())
+    }
+
+    fn rebuild_time_partition_runtime_sidecars(&self) -> Result<(), ServerError> {
+        self.time_partitions.clear();
+        let snapshot = self.catalog_snapshot();
+        let mut parents = Vec::new();
+        let mut chunks = Vec::new();
+        for (key, entry) in &snapshot.tables {
+            if let Some(options) =
+                time_partition::parent_options_from_entry(entry).map_err(ServerError::Ddl)?
+            {
+                parents.push((entry.clone(), options));
+            }
+            if let Some(options) =
+                time_partition::chunk_options_from_entry(entry).map_err(ServerError::Ddl)?
+            {
+                chunks.push((key.clone(), entry.clone(), options));
+            }
+        }
+        parents.sort_by_key(|(entry, _)| entry.oid.raw());
+        chunks.sort_by_key(|(_, entry, _)| entry.oid.raw());
+
+        for (entry, options) in parents {
+            let partition_column_index = entry
+                .schema
+                .fields()
+                .iter()
+                .position(|field| field.name.eq_ignore_ascii_case(&options.column))
+                .ok_or_else(|| {
+                    ServerError::Ddl(format!(
+                        "time partition table '{}' references missing column '{}'",
+                        entry.name, options.column
+                    ))
+                })?;
+            let partition_column = entry.schema.field(partition_column_index).ok_or_else(|| {
+                ServerError::Ddl(format!(
+                    "time partition table '{}' column index is invalid",
+                    entry.name
+                ))
+            })?;
+            match &partition_column.data_type {
+                DataType::Timestamp | DataType::TimestampTz => {}
+                other => {
+                    return Err(ServerError::Ddl(format!(
+                        "time partition table '{}' column '{}' has unsupported type {other}",
+                        entry.name, partition_column.name
+                    )));
+                }
+            }
+
+            let mut runtime = time_partition::TimePartitionRuntime::daily(
+                entry.schema_name.clone(),
+                entry.name.clone(),
+                entry.oid,
+                entry.schema.clone(),
+                partition_column.name.clone(),
+                partition_column_index,
+            );
+            runtime.chunk_interval_us = options.interval_us;
+            for (chunk_key, chunk_entry, chunk_options) in &chunks {
+                if chunk_options.parent_oid != entry.oid {
+                    continue;
+                }
+                if chunk_entry.schema.len() != entry.schema.len() {
+                    return Err(ServerError::Ddl(format!(
+                        "time partition chunk '{}' has schema width {} but parent '{}' has width {}",
+                        chunk_entry.name,
+                        chunk_entry.schema.len(),
+                        entry.name,
+                        entry.schema.len()
+                    )));
+                }
+                runtime.chunks.insert(
+                    chunk_options.start_us,
+                    time_partition::TimeChunkRuntime {
+                        start_us: chunk_options.start_us,
+                        end_us: chunk_options.end_us,
+                        table_name: chunk_key.clone(),
+                        oid: chunk_entry.oid,
+                    },
+                );
+            }
+            self.time_partitions
+                .insert(table_entry_lookup_key(&entry), Arc::new(runtime));
         }
         Ok(())
     }
