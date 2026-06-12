@@ -178,12 +178,6 @@ where
             ddl_txn.xid,
             ddl_txn.current_command,
         ) {
-            if let Err(abort_err) = self.state.txn_manager.abort(ddl_txn) {
-                tracing::warn!(
-                    error = %abort_err,
-                    "abort of catalog-write txn failed after ALTER TABLE ADD CONSTRAINT",
-                );
-            }
             let _ = self
                 .state
                 .persistent_catalog
@@ -191,7 +185,11 @@ where
                     &table.schema_name,
                     &constraint.name,
                 ));
-            return Err(e.into());
+            return Err(self.rollback_catalog_transaction_after_error(
+                ddl_txn,
+                e.into(),
+                "ALTER TABLE ADD CONSTRAINT catalog rollback after persist error",
+            ));
         }
         self.state.commit_transaction(
             ddl_txn,
@@ -243,13 +241,11 @@ where
             txn.xid,
             txn.current_command,
         ) {
-            if let Err(abort_err) = self.state.txn_manager.abort(txn) {
-                tracing::warn!(
-                    error = %abort_err,
-                    "ALTER TABLE SET catalog transaction abort failed",
-                );
-            }
-            return Err(e.into());
+            return Err(self.rollback_catalog_transaction_after_error(
+                txn,
+                e.into(),
+                "ALTER TABLE SET catalog rollback after persist error",
+            ));
         }
         self.state
             .commit_transaction(txn, true, "ALTER TABLE SET catalog transaction")?;
@@ -388,13 +384,11 @@ where
                         txn.current_command,
                     )
                 {
-                    if let Err(abort_err) = self.state.txn_manager.abort(txn) {
-                        tracing::warn!(
-                            error = %abort_err,
-                            "ALTER TABLE DROP COLUMN catalog transaction abort failed",
-                        );
-                    }
-                    return Err(e.into());
+                    return Err(self.rollback_catalog_transaction_after_error(
+                        txn,
+                        e.into(),
+                        "ALTER TABLE DROP COLUMN catalog rollback after persist error",
+                    ));
                 }
                 self.state
                     .commit_transaction(txn, true, "ALTER TABLE DROP COLUMN")?;
@@ -403,10 +397,11 @@ where
                     "ALTER TABLE DROP COLUMN {column_name}"
                 )))
             }
-            Err(e) => {
-                let _ = self.state.txn_manager.abort(txn);
-                Err(e)
-            }
+            Err(e) => Err(self.rollback_transaction_after_error(
+                txn,
+                e,
+                "ALTER TABLE DROP COLUMN rollback after rewrite error",
+            )),
         }
     }
 
@@ -588,13 +583,11 @@ where
                         txn.current_command,
                     )
                 {
-                    if let Err(abort_err) = self.state.txn_manager.abort(txn) {
-                        tracing::warn!(
-                            error = %abort_err,
-                            "ALTER TABLE ADD COLUMN catalog transaction abort failed",
-                        );
-                    }
-                    return Err(e.into());
+                    return Err(self.rollback_catalog_transaction_after_error(
+                        txn,
+                        e.into(),
+                        "ALTER TABLE ADD COLUMN catalog rollback after persist error",
+                    ));
                 }
                 self.state
                     .commit_transaction(txn, true, "ALTER TABLE ADD COLUMN")?;
@@ -603,15 +596,11 @@ where
                 self.plan_cache_invalidate();
                 Ok(run_ddl_command("ALTER TABLE"))
             }
-            Err(e) => {
-                if let Err(abort_err) = self.state.txn_manager.abort(txn) {
-                    tracing::warn!(
-                        error = %abort_err,
-                        "autocommit (ALTER TABLE rollback) failed to abort"
-                    );
-                }
-                Err(e)
-            }
+            Err(e) => Err(self.rollback_transaction_after_error(
+                txn,
+                e,
+                "ALTER TABLE ADD COLUMN rollback after rewrite error",
+            )),
         }
     }
 
@@ -865,15 +854,11 @@ where
                 self.plan_cache_invalidate();
                 Ok(run_ddl_command("TRUNCATE TABLE"))
             }
-            Err(e) => {
-                if let Err(abort_err) = self.state.txn_manager.abort(txn) {
-                    tracing::warn!(
-                        error = %abort_err,
-                        "autocommit (TRUNCATE rollback) failed to abort"
-                    );
-                }
-                Err(e)
-            }
+            Err(e) => Err(self.rollback_transaction_after_error(
+                txn,
+                e,
+                "TRUNCATE rollback after execution error",
+            )),
         }
     }
 

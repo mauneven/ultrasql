@@ -86,13 +86,11 @@ where
             ddl_txn.xid,
             ddl_txn.current_command,
         ) {
-            if let Err(abort_err) = self.state.txn_manager.abort(ddl_txn) {
-                tracing::warn!(
-                    error = %abort_err,
-                    "abort of catalog-write txn failed after persist_sequence_rows error",
-                );
-            }
-            return Err(e.into());
+            return Err(self.rollback_catalog_transaction_after_error(
+                ddl_txn,
+                e.into(),
+                "CREATE SEQUENCE catalog rollback after persist_sequence_rows error",
+            ));
         }
         self.state
             .commit_transaction(ddl_txn, true, "CREATE SEQUENCE catalog transaction")?;

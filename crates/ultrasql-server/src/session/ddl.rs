@@ -300,14 +300,12 @@ where
             ddl_txn.current_command,
         );
         if let Err(e) = persist_result {
-            if let Err(abort_err) = self.state.txn_manager.abort(ddl_txn) {
-                tracing::warn!(
-                    error = %abort_err,
-                    "abort of catalog-write txn failed after persist_enum_type_rows error",
-                );
-            }
             let _ = self.state.persistent_catalog.drop_enum_type(&type_key);
-            return Err(e.into());
+            return Err(self.rollback_catalog_transaction_after_error(
+                ddl_txn,
+                e.into(),
+                "CREATE TYPE enum catalog rollback after persist error",
+            ));
         }
         self.state
             .commit_transaction(ddl_txn, true, "CREATE TYPE catalog-write transaction")?;
@@ -365,14 +363,12 @@ where
             ddl_txn.current_command,
         );
         if let Err(e) = persist_result {
-            if let Err(abort_err) = self.state.txn_manager.abort(ddl_txn) {
-                tracing::warn!(
-                    error = %abort_err,
-                    "abort of catalog-write txn failed after persist_composite_type_rows error",
-                );
-            }
             let _ = self.state.persistent_catalog.drop_composite_type(&type_key);
-            return Err(e.into());
+            return Err(self.rollback_catalog_transaction_after_error(
+                ddl_txn,
+                e.into(),
+                "CREATE TYPE composite catalog rollback after persist error",
+            ));
         }
         self.state
             .commit_transaction(ddl_txn, true, "CREATE TYPE catalog-write transaction")?;
@@ -450,26 +446,22 @@ where
             ddl_txn.current_command,
         );
         if let Err(e) = persist_result {
-            if let Err(abort_err) = self.state.txn_manager.abort(ddl_txn) {
-                tracing::warn!(
-                    error = %abort_err,
-                    "abort of catalog-write txn failed after persist_domain_type_rows error",
-                );
-            }
             let _ = self.state.persistent_catalog.drop_domain_type(&type_key);
             self.state.domain_constraints.remove(&entry.oid);
-            return Err(e.into());
+            return Err(self.rollback_catalog_transaction_after_error(
+                ddl_txn,
+                e.into(),
+                "CREATE DOMAIN catalog rollback after persist error",
+            ));
         }
         if let Err(e) = self.state.persist_domain_runtime_constraints_metadata() {
-            if let Err(abort_err) = self.state.txn_manager.abort(ddl_txn) {
-                tracing::warn!(
-                    error = %abort_err,
-                    "abort of catalog-write txn failed after domain-runtime metadata error",
-                );
-            }
             let _ = self.state.persistent_catalog.drop_domain_type(&type_key);
             self.state.domain_constraints.remove(&entry.oid);
-            return Err(e);
+            return Err(self.rollback_catalog_transaction_after_error(
+                ddl_txn,
+                e,
+                "CREATE DOMAIN catalog rollback after runtime metadata error",
+            ));
         }
         self.state
             .commit_transaction(ddl_txn, true, "CREATE DOMAIN catalog-write transaction")?;
@@ -899,17 +891,6 @@ where
             Ok(())
         })();
         if let Err(e) = persist_result {
-            // Abort the catalog-write txn before surfacing the error so
-            // the CLOG entry is closed and the rollback path cleans
-            // any partial in-place undo entries (there are none for
-            // pg_class inserts, but symmetry matters for future
-            // expansion).
-            if let Err(abort_err) = self.state.txn_manager.abort(ddl_txn) {
-                tracing::warn!(
-                    error = %abort_err,
-                    "abort of catalog-write txn failed after persist_table_rows error",
-                );
-            }
             let _ = self.state.persistent_catalog.drop_table(table_name);
             self.state.table_constraints.remove(&oid);
             for (_, seq_key, _) in &serial_sequences {
@@ -917,7 +898,11 @@ where
                 self.state.sequence_owners.remove(seq_key);
                 self.state.sequence_namespaces.remove(seq_key);
             }
-            return Err(e.into());
+            return Err(self.rollback_catalog_transaction_after_error(
+                ddl_txn,
+                e.into(),
+                "CREATE TABLE catalog rollback after persist error",
+            ));
         }
         self.state
             .commit_transaction(ddl_txn, true, "CREATE TABLE catalog-write transaction")?;
@@ -1065,28 +1050,24 @@ where
         let materialized_rows = match materialized_rows {
             Ok(rows) => rows,
             Err(e) => {
-                if let Err(abort_err) = self.state.txn_manager.abort(ddl_txn) {
-                    tracing::warn!(
-                            error = %abort_err,
-                            "abort of materialized-view DDL txn failed",
-                    );
-                }
                 let _ = self.state.persistent_catalog.drop_table(&view_table);
-                return Err(e);
+                return Err(self.rollback_catalog_transaction_after_error(
+                    ddl_txn,
+                    e,
+                    "CREATE MATERIALIZED VIEW rollback after materialization error",
+                ));
             }
         };
         if let Err(e) = self
             .state
             .persist_materialized_view_runtime_metadata(&runtime, materialized_rows)
         {
-            if let Err(abort_err) = self.state.txn_manager.abort(ddl_txn) {
-                tracing::warn!(
-                    error = %abort_err,
-                    "abort of materialized-view metadata txn failed",
-                );
-            }
             let _ = self.state.persistent_catalog.drop_table(&view_table);
-            return Err(e);
+            return Err(self.rollback_catalog_transaction_after_error(
+                ddl_txn,
+                e,
+                "CREATE MATERIALIZED VIEW rollback after runtime metadata error",
+            ));
         }
         self.state.commit_transaction(
             ddl_txn,
@@ -1327,14 +1308,12 @@ where
                 ddl_txn.xid,
                 ddl_txn.current_command,
             ) {
-                if let Err(abort_err) = self.state.txn_manager.abort(ddl_txn) {
-                    tracing::warn!(
-                        error = %abort_err,
-                        "abort of catalog-write txn failed after persist_index_rows error",
-                    );
-                }
                 let _ = self.state.persistent_catalog.drop_index(&index_key);
-                return Err(e.into());
+                return Err(self.rollback_catalog_transaction_after_error(
+                    ddl_txn,
+                    e.into(),
+                    "CREATE AGGREGATING INDEX catalog rollback after persist error",
+                ));
             }
             self.state.commit_transaction(
                 ddl_txn,
@@ -1492,14 +1471,12 @@ where
                 ddl_txn.xid,
                 ddl_txn.current_command,
             ) {
-                if let Err(abort_err) = self.state.txn_manager.abort(ddl_txn) {
-                    tracing::warn!(
-                        error = %abort_err,
-                        "abort of catalog-write txn failed after persist_index_rows error",
-                    );
-                }
                 let _ = self.state.persistent_catalog.drop_index(&index_key);
-                return Err(e.into());
+                return Err(self.rollback_catalog_transaction_after_error(
+                    ddl_txn,
+                    e.into(),
+                    "CREATE IVFFLAT INDEX catalog rollback after persist error",
+                ));
             }
             self.state.commit_transaction(
                 ddl_txn,
@@ -1655,14 +1632,12 @@ where
                 ddl_txn.xid,
                 ddl_txn.current_command,
             ) {
-                if let Err(abort_err) = self.state.txn_manager.abort(ddl_txn) {
-                    tracing::warn!(
-                        error = %abort_err,
-                        "abort of catalog-write txn failed after persist_index_rows error",
-                    );
-                }
                 let _ = self.state.persistent_catalog.drop_index(&index_key);
-                return Err(e.into());
+                return Err(self.rollback_catalog_transaction_after_error(
+                    ddl_txn,
+                    e.into(),
+                    "CREATE HNSW INDEX catalog rollback after persist error",
+                ));
             }
             self.state.commit_transaction(
                 ddl_txn,
@@ -1836,14 +1811,12 @@ where
             ddl_txn.xid,
             ddl_txn.current_command,
         ) {
-            if let Err(abort_err) = self.state.txn_manager.abort(ddl_txn) {
-                tracing::warn!(
-                    error = %abort_err,
-                    "abort of catalog-write txn failed after persist_index_rows error",
-                );
-            }
             let _ = self.state.persistent_catalog.drop_index(&index_key);
-            return Err(e.into());
+            return Err(self.rollback_catalog_transaction_after_error(
+                ddl_txn,
+                e.into(),
+                "CREATE INDEX catalog rollback after persist error",
+            ));
         }
         self.state
             .commit_transaction(ddl_txn, true, "CREATE INDEX catalog transaction")?;
@@ -1965,13 +1938,11 @@ where
             )
         });
         if let Err(e) = persist_result {
-            if let Err(abort_err) = self.state.txn_manager.abort(ddl_txn) {
-                tracing::warn!(
-                    error = %abort_err,
-                    "abort of DROP INDEX catalog txn failed",
-                );
-            }
-            return Err(e.into());
+            return Err(self.rollback_catalog_transaction_after_error(
+                ddl_txn,
+                e.into(),
+                "DROP INDEX catalog rollback after tombstone persist error",
+            ));
         }
         self.state
             .commit_transaction(ddl_txn, true, "DROP INDEX catalog transaction")?;
@@ -2100,13 +2071,11 @@ where
                 )
             });
             if let Err(e) = persist_result {
-                if let Err(abort_err) = self.state.txn_manager.abort(ddl_txn) {
-                    tracing::warn!(
-                        error = %abort_err,
-                        "abort of DROP TABLE catalog txn failed",
-                    );
-                }
-                return Err(e.into());
+                return Err(self.rollback_catalog_transaction_after_error(
+                    ddl_txn,
+                    e.into(),
+                    "DROP TABLE catalog rollback after tombstone persist error",
+                ));
             }
             self.state
                 .commit_transaction(ddl_txn, true, "DROP TABLE catalog transaction")?;
@@ -2366,13 +2335,11 @@ where
             ddl_txn.xid,
             ddl_txn.current_command,
         ) {
-            if let Err(abort_err) = self.state.txn_manager.abort(ddl_txn) {
-                tracing::warn!(
-                    error = %abort_err,
-                    "abort of COMMENT catalog txn failed",
-                );
-            }
-            return Err(e.into());
+            return Err(self.rollback_catalog_transaction_after_error(
+                ddl_txn,
+                e.into(),
+                "COMMENT catalog rollback after persist error",
+            ));
         }
         self.state
             .commit_transaction(ddl_txn, true, "COMMENT catalog transaction")?;

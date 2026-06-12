@@ -2099,6 +2099,15 @@ where
         }
     }
 
+    pub(crate) fn rollback_catalog_transaction_after_error(
+        &self,
+        txn: Transaction,
+        original: ServerError,
+        context: &'static str,
+    ) -> ServerError {
+        self.rollback_transaction_after_error(txn, original, context)
+    }
+
     fn try_parse_analyze_target(&self, trimmed_sql: &str) -> Option<Option<String>> {
         if trimmed_sql.len() < "analyze".len() || !trimmed_sql[..7].eq_ignore_ascii_case("analyze")
         {
@@ -2228,13 +2237,11 @@ where
             catalog_txn.xid,
             catalog_txn.current_command,
         ) {
-            if let Err(abort_err) = self.state.txn_manager.abort(catalog_txn) {
-                tracing::warn!(
-                    error = %abort_err,
-                    "CREATE STATISTICS catalog transaction abort failed",
-                );
-            }
-            return Err(ServerError::Catalog(e));
+            return Err(self.rollback_catalog_transaction_after_error(
+                catalog_txn,
+                ServerError::Catalog(e),
+                "CREATE STATISTICS catalog rollback after persist error",
+            ));
         }
         self.state.commit_transaction(
             catalog_txn,
@@ -3681,6 +3688,33 @@ mod tests {
             "unexpected error: {err}"
         );
         assert!(msg.contains("executor boom"), "original error lost: {err}");
+        assert!(
+            msg.contains("transaction abort failed"),
+            "abort failure hidden: {err}"
+        );
+    }
+
+    #[test]
+    fn catalog_rollback_reports_abort_failure_with_original_error() {
+        let session = test_session();
+        let txn = session
+            .state
+            .txn_manager
+            .begin(IsolationLevel::ReadCommitted);
+        let stale = txn.clone();
+        session.state.txn_manager.abort(txn).expect("pre-abort");
+
+        let err = session.rollback_catalog_transaction_after_error(
+            stale,
+            ServerError::ddl("catalog boom"),
+            "CREATE TABLE catalog rollback after persist error",
+        );
+        let msg = err.to_string();
+        assert!(
+            msg.contains("CREATE TABLE catalog rollback after persist error"),
+            "unexpected error: {err}"
+        );
+        assert!(msg.contains("catalog boom"), "original error lost: {err}");
         assert!(
             msg.contains("transaction abort failed"),
             "abort failure hidden: {err}"
