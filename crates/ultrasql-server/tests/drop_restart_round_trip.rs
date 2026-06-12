@@ -67,6 +67,40 @@ async fn dropped_table_is_removed_from_runtime_metadata() {
 
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn create_table_rejects_unsafe_row_security_metadata_slot_before_durable_create() {
+    use std::os::unix::fs::symlink;
+
+    let data_dir = tempfile::TempDir::new().expect("temp data dir");
+    support::make_data_dir_private(data_dir.path());
+    let outside = data_dir.path().join("outside-row-security-meta");
+    std::fs::write(&outside, b"keep").expect("outside metadata target");
+
+    let running = start_persistent_server(data_dir.path(), "create_table_rowsec_slot").await;
+    let client = &running.client;
+    symlink(&outside, data_dir.path().join("pg_row_security.meta.tmp"))
+        .expect("row-security temp symlink");
+
+    let err = client
+        .batch_execute("CREATE TABLE create_table_slot_guard (id INT)")
+        .await
+        .expect_err("unsafe row-security metadata slot rejects CREATE TABLE");
+    assert!(
+        err.as_db_error()
+            .is_some_and(|db| db.message().contains("runtime metadata file")),
+        "unexpected error: {err}"
+    );
+    assert_undefined_table(client, "SELECT id FROM create_table_slot_guard").await;
+    shutdown(running).await;
+
+    std::fs::remove_file(data_dir.path().join("pg_row_security.meta.tmp"))
+        .expect("remove unsafe temp slot before restart");
+    let running = start_persistent_server(data_dir.path(), "create_table_rowsec_restart").await;
+    assert_undefined_table(&running.client, "SELECT id FROM create_table_slot_guard").await;
+    shutdown(running).await;
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn drop_table_rejects_unsafe_runtime_metadata_slot_before_live_drop() {
     use std::os::unix::fs::symlink;
 

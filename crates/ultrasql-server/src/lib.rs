@@ -5266,6 +5266,25 @@ impl Server {
         ensure_optional_runtime_metadata_write_slots(self.table_runtime_metadata_path())
     }
 
+    pub(crate) fn ensure_create_table_runtime_metadata_slots_persistable(
+        &self,
+        writes_sequence_owner_metadata: bool,
+    ) -> Result<(), ServerError> {
+        self.ensure_table_runtime_constraints_metadata_slots_persistable()?;
+        self.ensure_create_relation_metadata_slots_persistable()?;
+        if writes_sequence_owner_metadata {
+            ensure_optional_runtime_metadata_write_slots(self.sequence_owner_metadata_path())?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn ensure_create_relation_metadata_slots_persistable(
+        &self,
+    ) -> Result<(), ServerError> {
+        ensure_optional_runtime_metadata_write_slots(self.row_security_metadata_path())?;
+        ensure_optional_runtime_metadata_write_slots(self.privilege_metadata_path())
+    }
+
     pub(crate) fn ensure_drop_table_runtime_metadata_slots_persistable(
         &self,
         dropped_tables: &[String],
@@ -6227,6 +6246,13 @@ impl Server {
         &self,
     ) -> Result<(), ServerError> {
         ensure_optional_runtime_metadata_write_slots(self.sequence_owner_metadata_path())
+    }
+
+    pub(crate) fn ensure_create_sequence_metadata_slots_persistable(
+        &self,
+    ) -> Result<(), ServerError> {
+        self.ensure_sequence_owner_metadata_slots_persistable()?;
+        ensure_optional_runtime_metadata_write_slots(self.privilege_metadata_path())
     }
 
     pub(crate) fn persist_sequence_owner_metadata(&self) -> Result<(), ServerError> {

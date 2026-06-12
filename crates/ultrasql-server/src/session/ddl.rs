@@ -715,6 +715,8 @@ where
         } else {
             None
         };
+        self.state
+            .ensure_create_table_runtime_metadata_slots_persistable(!serial_sequences.is_empty())?;
         self.state.persistent_catalog.create_table(entry.clone())?;
         let mut serial_sequence_rows = Vec::with_capacity(serial_sequences.len());
         let sequence_owner = self.current_user.to_ascii_lowercase();
@@ -1035,6 +1037,8 @@ where
         });
         self.state
             .ensure_materialized_view_runtime_metadata_persistable(&runtime)?;
+        self.state
+            .ensure_create_relation_metadata_slots_persistable()?;
         self.state.persistent_catalog.create_table(entry.clone())?;
         let attr_has_defaults = vec![false; columns.len()];
         let ddl_txn = self
