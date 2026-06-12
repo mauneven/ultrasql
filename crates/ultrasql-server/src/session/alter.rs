@@ -437,10 +437,38 @@ where
                 "ALTER TABLE RENAME COLUMN: {e}"
             )))
         })?;
-        self.state
+        let attr_has_defaults = if let Some(runtime) = self.state.table_constraints.get(&entry.oid)
+        {
+            alter_attr_has_defaults(Some(runtime.value().as_ref()), new_schema.len())
+        } else {
+            alter_attr_has_defaults(None, new_schema.len())
+        };
+        let txn = self.state.txn_manager.begin(IsolationLevel::ReadCommitted);
+        let updated_entry = self
+            .state
             .persistent_catalog
             .alter_table_replace_schema(table_name, new_schema)
             .map_err(ServerError::Catalog)?;
+        if let Err(e) = self
+            .state
+            .persistent_catalog
+            .persist_table_schema_replacement_with_defaults(
+                entry,
+                &updated_entry,
+                &attr_has_defaults,
+                self.state.heap.as_ref(),
+                txn.xid,
+                txn.current_command,
+            )
+        {
+            return Err(self.rollback_catalog_transaction_after_error(
+                txn,
+                e.into(),
+                "ALTER TABLE RENAME COLUMN catalog rollback after persist error",
+            ));
+        }
+        self.state
+            .commit_transaction(txn, true, "ALTER TABLE RENAME COLUMN")?;
         self.state.plan_cache.invalidate_all();
         Ok(run_ddl_command(&format!(
             "ALTER TABLE RENAME COLUMN TO {new_name}"
