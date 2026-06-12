@@ -252,13 +252,32 @@ impl TimePartitionRuntime {
     /// Build a copy of this runtime for a renamed parent table.
     #[must_use]
     pub fn renamed(&self, parent_schema_name: String, parent_relname: String) -> Self {
+        self.with_parent_metadata(
+            parent_schema_name,
+            parent_relname,
+            self.schema.clone(),
+            self.partition_column.clone(),
+            self.partition_column_index,
+        )
+    }
+
+    /// Build a copy of this runtime with updated parent metadata.
+    #[must_use]
+    pub fn with_parent_metadata(
+        &self,
+        parent_schema_name: String,
+        parent_relname: String,
+        schema: Schema,
+        partition_column: String,
+        partition_column_index: usize,
+    ) -> Self {
         let mut renamed = Self::daily(
             parent_schema_name,
             parent_relname,
             self.parent_oid,
-            self.schema.clone(),
-            self.partition_column.clone(),
-            self.partition_column_index,
+            schema,
+            partition_column,
+            partition_column_index,
         );
         for chunk in &self.chunks {
             renamed.chunks.insert(*chunk.key(), chunk.value().clone());

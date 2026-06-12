@@ -211,6 +211,67 @@ async fn partitioned_parent_count_reads_chunks() {
     shutdown(client, server_handle).await;
 }
 
+#[tokio::test]
+async fn partitioned_table_add_column_refreshes_runtime_schema() {
+    let data_dir = tempfile::TempDir::new().expect("temp data dir");
+
+    let running = start_persistent_server(data_dir.path(), "time_partition_add_column_setup").await;
+    running
+        .client
+        .batch_execute(
+            "CREATE TABLE metrics_add_column (\
+             ts TIMESTAMP NOT NULL, host TEXT NOT NULL, value INT NOT NULL\
+             ) PARTITION BY RANGE (ts);\
+             INSERT INTO metrics_add_column VALUES \
+             (TIMESTAMP '2026-05-20 00:00:00', 'a', 10);\
+             ALTER TABLE metrics_add_column ADD COLUMN note TEXT;\
+             INSERT INTO metrics_add_column VALUES \
+             (TIMESTAMP '2026-05-21 00:00:00', 'b', 20, 'after')",
+        )
+        .await
+        .expect("alter partitioned table and insert widened row");
+
+    let rows = running
+        .client
+        .query(
+            "SELECT host, value, note FROM metrics_add_column ORDER BY value",
+            &[],
+        )
+        .await
+        .expect("scan widened partitioned parent");
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0].get::<_, String>(0), "a");
+    assert!(rows[0].get::<_, Option<String>>(2).is_none());
+    assert_eq!(rows[1].get::<_, String>(0), "b");
+    assert_eq!(rows[1].get::<_, i32>(1), 20);
+    assert_eq!(
+        rows[1].get::<_, Option<String>>(2).as_deref(),
+        Some("after")
+    );
+    shutdown_persistent(running).await;
+
+    let running =
+        start_persistent_server(data_dir.path(), "time_partition_add_column_verify").await;
+    let rows = running
+        .client
+        .query(
+            "SELECT host, value, note FROM metrics_add_column ORDER BY value",
+            &[],
+        )
+        .await
+        .expect("scan widened partitioned parent after restart");
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0].get::<_, String>(0), "a");
+    assert!(rows[0].get::<_, Option<String>>(2).is_none());
+    assert_eq!(rows[1].get::<_, String>(0), "b");
+    assert_eq!(rows[1].get::<_, i32>(1), 20);
+    assert_eq!(
+        rows[1].get::<_, Option<String>>(2).as_deref(),
+        Some("after")
+    );
+    shutdown_persistent(running).await;
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn partitioned_table_rebuilds_runtime_after_restart() {
     let data_dir = tempfile::TempDir::new().expect("temp data dir");

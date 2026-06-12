@@ -592,6 +592,18 @@ where
             self.state
                 .ensure_table_runtime_constraints_metadata_slots_persistable()?;
         }
+        let partition_chunks = self
+            .state
+            .time_partitions
+            .get(&table_key)
+            .map(|runtime| {
+                runtime
+                    .chunks
+                    .iter()
+                    .filter_map(|chunk| snapshot.tables.get(&chunk.table_name).cloned())
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
 
         // 2. Rewrite existing tuples — outside the catalog swap so
         //    the snapshot scan still observes the old schema.
@@ -624,7 +636,41 @@ where
                     to_rewrite.push((tup.tid, row));
                 }
             }
-            if default.is_none() && !column.nullable && !to_rewrite.is_empty() {
+            let mut chunk_rewrites = Vec::with_capacity(partition_chunks.len());
+            for chunk_entry in &partition_chunks {
+                let chunk_rel = RelationId(chunk_entry.oid);
+                let chunk_block_count = self
+                    .state
+                    .heap
+                    .block_count(chunk_rel)
+                    .max(chunk_entry.n_blocks);
+                let chunk_codec = ultrasql_executor::RowCodec::new(chunk_entry.schema.clone());
+                let mut chunk_rows = Vec::new();
+                {
+                    let scan = self.state.heap.scan_visible(
+                        chunk_rel,
+                        chunk_block_count,
+                        &txn.snapshot,
+                        self.state.txn_manager.as_ref(),
+                    );
+                    for result in scan {
+                        let tup = result.map_err(|e| {
+                            ServerError::ddl(format!("ALTER TABLE partition chunk scan: {e}"))
+                        })?;
+                        let row = chunk_codec.decode(&tup.data).map_err(|e| {
+                            ServerError::ddl(format!("ALTER TABLE partition chunk decode: {e}"))
+                        })?;
+                        chunk_rows.push((tup.tid, row));
+                    }
+                }
+                chunk_rewrites.push((chunk_entry.clone(), chunk_rows));
+            }
+
+            if default.is_none()
+                && !column.nullable
+                && (!to_rewrite.is_empty()
+                    || chunk_rewrites.iter().any(|(_, rows)| !rows.is_empty()))
+            {
                 return Err(ServerError::Execute(
                     ultrasql_executor::ExecError::NotNullViolation(column.name.clone()),
                 ));
@@ -664,6 +710,32 @@ where
                     },
                 )?;
             }
+            for (chunk_entry, rows) in chunk_rewrites {
+                for (tid, old_row) in rows {
+                    let mut new_row = old_row;
+                    new_row.push(alter_add_column_default_value(default.as_ref(), &column)?);
+                    let new_payload = new_codec.encode(&new_row).map_err(|e| {
+                        ServerError::ddl(format!("ALTER TABLE partition chunk encode: {e}"))
+                    })?;
+                    self.state
+                        .heap
+                        .update(
+                            tid,
+                            &new_payload,
+                            UpdateOptions {
+                                xid: txn.xid,
+                                command_id: ultrasql_core::CommandId::FIRST,
+                                wal: self.state.heap.wal_sink().map(|sink| sink.as_ref()),
+                                vm: Some(self.state.vm.as_ref()),
+                                hot_eligible: true,
+                            },
+                        )
+                        .map_err(|e| {
+                            ServerError::ddl(format!("ALTER TABLE partition chunk update: {e}"))
+                        })?;
+                }
+                let _ = chunk_entry;
+            }
             Ok(())
         })();
 
@@ -676,7 +748,7 @@ where
                 let updated_entry = self
                     .state
                     .persistent_catalog
-                    .alter_table_add_column(table_name, column)?;
+                    .alter_table_add_column(table_name, column.clone())?;
                 let attr_has_defaults =
                     alter_attr_has_defaults(runtime_after.as_ref(), updated_entry.schema.len());
                 if let Err(e) = self
@@ -697,6 +769,34 @@ where
                         "ALTER TABLE ADD COLUMN catalog rollback after persist error",
                     ));
                 }
+                for chunk_entry in &partition_chunks {
+                    let chunk_key = ultrasql_catalog::table_lookup_key(
+                        &chunk_entry.schema_name,
+                        &chunk_entry.name,
+                    );
+                    let updated_chunk = self
+                        .state
+                        .persistent_catalog
+                        .alter_table_add_column(&chunk_key, column.clone())
+                        .map_err(ServerError::Catalog)?;
+                    if let Err(e) = self
+                        .state
+                        .persistent_catalog
+                        .persist_table_schema_replacement(
+                            chunk_entry,
+                            &updated_chunk,
+                            self.state.heap.as_ref(),
+                            txn.xid,
+                            txn.current_command,
+                        )
+                    {
+                        return Err(self.rollback_catalog_transaction_after_error(
+                            txn,
+                            e.into(),
+                            "ALTER TABLE ADD COLUMN partition chunk catalog rollback after persist error",
+                        ));
+                    }
+                }
                 self.state
                     .commit_transaction(txn, true, "ALTER TABLE ADD COLUMN")?;
                 if let Some(runtime) = runtime_after {
@@ -704,6 +804,18 @@ where
                         .table_constraints
                         .insert(entry.oid, Arc::new(runtime));
                     self.state.persist_table_runtime_constraints_metadata()?;
+                }
+                if let Some((_, partition)) = self.state.time_partitions.remove(&table_key) {
+                    self.state.time_partitions.insert(
+                        table_key,
+                        Arc::new(partition.as_ref().with_parent_metadata(
+                            updated_entry.schema_name.clone(),
+                            updated_entry.name.clone(),
+                            updated_entry.schema.clone(),
+                            partition.partition_column.clone(),
+                            partition.partition_column_index,
+                        )),
+                    );
                 }
                 // A schema change can invalidate any cached projection-
                 // pushdown / predicate-pushdown decision; clear all.
