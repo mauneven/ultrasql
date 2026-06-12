@@ -1317,6 +1317,53 @@ async fn drop_schema_cascade_removes_partitioned_tables() {
 }
 
 #[tokio::test]
+async fn drop_schema_cascade_removes_materialized_view_runtime() {
+    let running = start_sample_server("schema_matview_cascade").await;
+
+    running
+        .client
+        .batch_execute(
+            "CREATE SCHEMA app; \
+             CREATE MATERIALIZED VIEW app.user_names AS SELECT id, name FROM users; \
+             DROP SCHEMA app CASCADE",
+        )
+        .await
+        .expect("drop schema cascade removes materialized view dependency");
+
+    assert!(
+        running
+            .server
+            .materialized_views
+            .get("app.user_names")
+            .is_none(),
+        "schema cascade must remove materialized view runtime"
+    );
+    assert_eq!(
+        simple_i64(
+            &running.client,
+            "SELECT COUNT(*) FROM pg_catalog.pg_namespace WHERE nspname = 'app'",
+        )
+        .await,
+        0
+    );
+    assert_eq!(
+        simple_i64(
+            &running.client,
+            "SELECT COUNT(*) FROM pg_catalog.pg_matviews WHERE schemaname = 'app'",
+        )
+        .await,
+        0
+    );
+    running
+        .client
+        .simple_query("SELECT COUNT(*) FROM app.user_names")
+        .await
+        .expect_err("schema cascade must remove materialized view table state");
+
+    shutdown(running).await;
+}
+
+#[tokio::test]
 async fn unqualified_drop_index_preserves_quoted_dot_in_name() {
     let running = start_sample_server("schema_dotted_index_drop").await;
 
