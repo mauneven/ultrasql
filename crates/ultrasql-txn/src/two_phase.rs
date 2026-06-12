@@ -317,19 +317,55 @@ fn write_state_file(
         secs
     );
 
-    let mut file = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(path)
-        .map_err(|e| TwoPhaseError::Io {
-            gid: gid.to_owned(),
-            detail: e.to_string(),
-        })?;
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
+    }
+
+    let mut file = options.open(path).map_err(|e| TwoPhaseError::Io {
+        gid: gid.to_owned(),
+        detail: e.to_string(),
+    })?;
     file.write_all(content.as_bytes())
         .map_err(|e| TwoPhaseError::Io {
             gid: gid.to_owned(),
             detail: e.to_string(),
-        })
+        })?;
+    file.sync_all().map_err(|e| TwoPhaseError::Io {
+        gid: gid.to_owned(),
+        detail: e.to_string(),
+    })?;
+    sync_state_file_parent(path, gid)
+}
+
+fn sync_state_file_parent(path: &Path, gid: &str) -> Result<(), TwoPhaseError> {
+    let Some(parent) = path.parent() else {
+        return Ok(());
+    };
+    sync_state_directory(parent, gid)
+}
+
+#[cfg(unix)]
+fn sync_state_directory(path: &Path, gid: &str) -> Result<(), TwoPhaseError> {
+    let dir = File::open(path).map_err(|e| TwoPhaseError::Io {
+        gid: gid.to_owned(),
+        detail: e.to_string(),
+    })?;
+    match dir.sync_all() {
+        Ok(()) => Ok(()),
+        Err(err) if err.kind() == ErrorKind::InvalidInput => Ok(()),
+        Err(err) => Err(TwoPhaseError::Io {
+            gid: gid.to_owned(),
+            detail: err.to_string(),
+        }),
+    }
+}
+
+#[cfg(not(unix))]
+fn sync_state_directory(_path: &Path, _gid: &str) -> Result<(), TwoPhaseError> {
+    Ok(())
 }
 
 fn read_state_file_text(path: &Path) -> std::io::Result<String> {
@@ -727,6 +763,25 @@ mod tests {
         assert!(coord.prepare("evil", xid(700)).is_err());
         assert_eq!(std::fs::read(&target).expect("target unchanged"), b"keep");
         assert!(coord.list_prepared().is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn prepare_writes_private_state_file_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = TempDir::new().expect("tempdir");
+        let coord = TwoPhaseCoordinator::new(dir.path().to_path_buf());
+
+        coord.prepare("private", xid(701)).expect("prepare");
+        let state_file = coord.list_prepared()[0].state_file.clone();
+        let mode = std::fs::metadata(state_file)
+            .expect("state metadata")
+            .permissions()
+            .mode()
+            & 0o777;
+
+        assert_eq!(mode, 0o600);
     }
 
     #[cfg(unix)]
