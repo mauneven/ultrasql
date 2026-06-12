@@ -10,6 +10,7 @@
 //! socket.
 
 use std::fs;
+use std::io::Read;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -30,6 +31,7 @@ const OPS_REQUEST_HEAD_HARD_LIMIT_BYTES: usize = 64 * 1024;
 const OPS_REQUEST_READ_TIMEOUT: Duration = Duration::from_secs(2);
 const DEFAULT_WAL_COMMAND_TIMEOUT: Duration = Duration::from_secs(60);
 const WAL_COMMAND_TIMEOUT_POLL_INTERVAL: Duration = Duration::from_millis(10);
+const AUTH_PASSWORD_FILE_MAX_BYTES: u64 = 1024;
 
 /// `ultrasqld` v0.5: SQL server with an
 /// in-memory sample database.
@@ -214,7 +216,7 @@ Production-oriented v0.9 flags:
   - --data-dir DIR      boot WAL-backed storage
   - --allow-insecure-listen  permit trust-auth listener outside loopback
   - --auth-user USER    require MD5 password auth for this PostgreSQL user
-  - --auth-password-file PATH  read MD5 auth password from a local secret file
+  - --auth-password-file PATH  read MD5 auth password from a private local secret file
   - --ops-listen ADDR   serve /health, /ready, /metrics, and backup routes
   - --ops-token TOKEN   require bearer token for /backup/start and /backup/stop
   - --log-format json   emit structured logs
@@ -815,14 +817,115 @@ fn auth_config_from_cli(cli: &Cli) -> Result<Option<(String, String)>, String> {
         (None, Some(_)) => Err("auth_user is required when auth_password_file is set".to_string()),
         (Some(user), Some(password_file)) => {
             validate_auth_user(user)?;
-            let raw = fs::read_to_string(password_file).map_err(|err| {
-                format!("read auth_password_file {}: {err}", password_file.display())
-            })?;
+            let raw = read_auth_password_file(password_file)?;
             let password = raw.strip_suffix('\n').unwrap_or(raw.as_str());
             validate_auth_password(password)?;
             Ok(Some((user.to_owned(), password.to_owned())))
         }
     }
+}
+
+fn read_auth_password_file(password_file: &Path) -> Result<String, String> {
+    reject_auth_password_file_symlink(password_file)?;
+    let file = open_auth_password_file(password_file)?;
+    let metadata = file.metadata().map_err(|err| {
+        format!(
+            "inspect auth_password_file {}: {err}",
+            password_file.display()
+        )
+    })?;
+    let file_type = metadata.file_type();
+    if !file_type.is_file() {
+        return Err(format!(
+            "auth_password_file {} must be a regular file",
+            password_file.display()
+        ));
+    }
+    validate_auth_password_file_permissions(password_file, &metadata)?;
+    if metadata.len() > AUTH_PASSWORD_FILE_MAX_BYTES {
+        return Err(format!(
+            "auth_password_file {} must be at most {AUTH_PASSWORD_FILE_MAX_BYTES} bytes",
+            password_file.display()
+        ));
+    }
+    let mut raw = String::new();
+    let mut limited = file.take(AUTH_PASSWORD_FILE_MAX_BYTES.saturating_add(1));
+    limited
+        .read_to_string(&mut raw)
+        .map_err(|err| format!("read auth_password_file {}: {err}", password_file.display()))?;
+    if u64::try_from(raw.len()).unwrap_or(u64::MAX) > AUTH_PASSWORD_FILE_MAX_BYTES {
+        return Err(format!(
+            "auth_password_file {} must be at most {AUTH_PASSWORD_FILE_MAX_BYTES} bytes",
+            password_file.display()
+        ));
+    }
+    Ok(raw)
+}
+
+fn reject_auth_password_file_symlink(password_file: &Path) -> Result<(), String> {
+    let metadata = fs::symlink_metadata(password_file).map_err(|err| {
+        format!(
+            "inspect auth_password_file {}: {err}",
+            password_file.display()
+        )
+    })?;
+    if metadata.file_type().is_symlink() {
+        return Err(format!(
+            "auth_password_file {} must not be a symlink",
+            password_file.display()
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn open_auth_password_file(password_file: &Path) -> Result<fs::File, String> {
+    use std::os::unix::fs::OpenOptionsExt;
+
+    fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(password_file)
+        .map_err(|err| {
+            if err.raw_os_error() == Some(libc::ELOOP) {
+                format!(
+                    "auth_password_file {} must not be a symlink",
+                    password_file.display()
+                )
+            } else {
+                format!("open auth_password_file {}: {err}", password_file.display())
+            }
+        })
+}
+
+#[cfg(not(unix))]
+fn open_auth_password_file(password_file: &Path) -> Result<fs::File, String> {
+    fs::File::open(password_file)
+        .map_err(|err| format!("open auth_password_file {}: {err}", password_file.display()))
+}
+
+#[cfg(unix)]
+fn validate_auth_password_file_permissions(
+    password_file: &Path,
+    metadata: &fs::Metadata,
+) -> Result<(), String> {
+    use std::os::unix::fs::PermissionsExt;
+
+    if metadata.permissions().mode() & 0o077 != 0 {
+        return Err(format!(
+            "auth_password_file {} must not be group- or world-accessible",
+            password_file.display()
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn validate_auth_password_file_permissions(
+    _password_file: &Path,
+    _metadata: &fs::Metadata,
+) -> Result<(), String> {
+    Ok(())
 }
 
 fn validate_auth_user(user: &str) -> Result<(), String> {
@@ -1729,7 +1832,7 @@ mod tests {
     fn md5_auth_from_cli_reads_password_file_and_secures_wildcard_listener() {
         let dir = tempfile::TempDir::new().expect("temp dir");
         let password_file = dir.path().join("password");
-        std::fs::write(&password_file, "very-secret-password\n").expect("write password");
+        write_private_password_file(&password_file, "very-secret-password\n");
         let cli = Cli {
             listen: "0.0.0.0:5433".parse().expect("listen addr"),
             allow_insecure_listen: false,
@@ -1786,7 +1889,7 @@ mod tests {
     fn md5_auth_from_cli_rejects_partial_or_dirty_password_config() {
         let dir = tempfile::TempDir::new().expect("temp dir");
         let password_file = dir.path().join("password");
-        std::fs::write(&password_file, "short\n").expect("write short password");
+        write_private_password_file(&password_file, "short\n");
         let mut cli = Cli {
             listen: "127.0.0.1:5433".parse().expect("listen addr"),
             allow_insecure_listen: false,
@@ -1828,13 +1931,95 @@ mod tests {
         );
 
         let dirty_file = dir.path().join("dirty-password");
-        std::fs::write(&dirty_file, "valid-password\r\n").expect("write dirty password");
+        write_private_password_file(&dirty_file, "valid-password\r\n");
         cli.auth_password_file = Some(dirty_file);
         let err = auth_config_from_cli(&cli).expect_err("dirty password rejected");
         assert!(
             err.contains("control bytes"),
             "expected control-byte rejection, got {err}"
         );
+    }
+
+    #[test]
+    fn md5_auth_from_cli_rejects_unsafe_password_files() {
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let oversized = dir.path().join("oversized-password");
+        write_private_password_file(&oversized, &"a".repeat(2048));
+        let mut cli = cli_with_auth_password_file(oversized);
+
+        let err = auth_config_from_cli(&cli).expect_err("oversized password file rejected");
+        assert!(
+            err.contains("at most"),
+            "expected oversized password-file rejection, got {err}"
+        );
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            let public_file = dir.path().join("public-password");
+            write_private_password_file(&public_file, "very-secret-password\n");
+            std::fs::set_permissions(&public_file, std::fs::Permissions::from_mode(0o644))
+                .expect("make password file public");
+            cli.auth_password_file = Some(public_file);
+            let err = auth_config_from_cli(&cli).expect_err("public password file rejected");
+            assert!(
+                err.contains("group- or world-accessible"),
+                "expected password-file mode rejection, got {err}"
+            );
+
+            let target_file = dir.path().join("target-password");
+            write_private_password_file(&target_file, "very-secret-password\n");
+            let symlink_file = dir.path().join("symlink-password");
+            std::os::unix::fs::symlink(&target_file, &symlink_file)
+                .expect("create password symlink");
+            cli.auth_password_file = Some(symlink_file);
+            let err = auth_config_from_cli(&cli).expect_err("password symlink rejected");
+            assert!(
+                err.contains("symlink"),
+                "expected password-file symlink rejection, got {err}"
+            );
+        }
+    }
+
+    fn write_private_password_file(path: &Path, contents: &str) {
+        std::fs::write(path, contents).expect("write password");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+                .expect("chmod private password file");
+        }
+    }
+
+    fn cli_with_auth_password_file(password_file: PathBuf) -> Cli {
+        Cli {
+            listen: "127.0.0.1:5433".parse().expect("listen addr"),
+            allow_insecure_listen: false,
+            data_dir: None,
+            ops_listen: None,
+            ops_token: None,
+            auth_user: Some("alice".to_owned()),
+            auth_password_file: Some(password_file),
+            log_level: "info".to_owned(),
+            log_format: LogFormat::Text,
+            log_connections: false,
+            log_min_duration_statement_ms: -1,
+            log_statement: CliLogStatementMode::None,
+            idle_session_timeout_ms: 0,
+            autovacuum_interval_ms: 1000,
+            autovacuum_vacuum_threshold: 50,
+            autovacuum_vacuum_scale_factor: 0.2,
+            autovacuum_analyze_threshold: 50,
+            autovacuum_analyze_scale_factor: 0.1,
+            archive_command: None,
+            restore_command: None,
+            restore_max_segments: 0,
+            archive_interval_ms: 1000,
+            archive_command_timeout_ms: 60_000,
+            restore_command_timeout_ms: 60_000,
+        }
     }
 
     #[test]
