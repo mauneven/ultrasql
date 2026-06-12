@@ -80,6 +80,50 @@ async fn drop_index_removes_catalog_metadata_and_survives_restart() {
     }
 }
 
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn drop_index_rejects_unsafe_runtime_metadata_slot_before_live_drop() {
+    use std::os::unix::fs::symlink;
+
+    let data_dir = tempfile::TempDir::new().expect("temp data dir");
+    support::make_data_dir_private(data_dir.path());
+    let outside = data_dir.path().join("outside-index-runtime-meta");
+    std::fs::write(&outside, b"keep").expect("outside metadata target");
+
+    let running = start_persistent_server(data_dir.path(), "drop_index_runtime_slot").await;
+    let client = &running.client;
+    client
+        .batch_execute(
+            "CREATE TABLE drop_index_slot_guard (id INT NOT NULL, active BOOLEAN NOT NULL); \
+             CREATE INDEX drop_index_slot_guard_idx ON drop_index_slot_guard (id) WHERE active = TRUE",
+        )
+        .await
+        .expect("create partial index before failed drop");
+    symlink(&outside, data_dir.path().join("pg_table_runtime.meta.tmp"))
+        .expect("table-runtime temp symlink");
+
+    let err = client
+        .batch_execute("DROP INDEX drop_index_slot_guard_idx")
+        .await
+        .expect_err("unsafe table runtime metadata slot rejects DROP INDEX");
+    assert!(
+        err.as_db_error()
+            .is_some_and(|db| db.message().contains("runtime metadata file")),
+        "unexpected error: {err}"
+    );
+    let rows = client
+        .query(
+            "SELECT indexname FROM pg_catalog.pg_indexes \
+             WHERE indexname = 'drop_index_slot_guard_idx'",
+            &[],
+        )
+        .await
+        .expect("index remains queryable after rejected drop");
+    assert_eq!(rows.len(), 1, "failed DROP INDEX must not remove index");
+
+    shutdown(running).await;
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn drop_index_rejects_constraint_backed_primary_key_index() {
     let data_dir = tempfile::TempDir::new().expect("temp data dir");

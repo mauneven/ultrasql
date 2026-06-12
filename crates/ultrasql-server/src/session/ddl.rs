@@ -1932,6 +1932,17 @@ where
             return Ok(run_ddl_command("DROP INDEX"));
         }
 
+        let runtime_metadata_will_be_removed = entries.iter().any(|entry| {
+            self.state
+                .table_constraints
+                .get(&entry.table_oid)
+                .is_some_and(|constraints| constraints.indexes.contains_key(&entry.oid))
+        });
+        if runtime_metadata_will_be_removed {
+            self.state
+                .ensure_table_runtime_constraints_metadata_slots_persistable()?;
+        }
+
         let ddl_txn = self
             .state
             .txn_manager

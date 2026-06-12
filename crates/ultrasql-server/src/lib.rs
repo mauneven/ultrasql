@@ -5260,11 +5260,17 @@ impl Server {
             .map(|dir| dir.join("pg_table_runtime.meta"))
     }
 
+    pub(crate) fn ensure_table_runtime_constraints_metadata_slots_persistable(
+        &self,
+    ) -> Result<(), ServerError> {
+        ensure_optional_runtime_metadata_write_slots(self.table_runtime_metadata_path())
+    }
+
     pub(crate) fn ensure_drop_table_runtime_metadata_slots_persistable(
         &self,
         dropped_tables: &[String],
     ) -> Result<(), ServerError> {
-        ensure_optional_runtime_metadata_write_slots(self.table_runtime_metadata_path())?;
+        self.ensure_table_runtime_constraints_metadata_slots_persistable()?;
         ensure_optional_runtime_metadata_write_slots(self.row_security_metadata_path())?;
 
         let grant_objects = self
