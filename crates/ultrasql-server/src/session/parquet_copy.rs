@@ -160,10 +160,11 @@ where
         let rows = match import_result {
             Ok(rows) => rows,
             Err(err) => {
-                if let Err(abort_err) = self.state.txn_manager.abort(txn) {
-                    warn!(error = %abort_err, "COPY FROM parquet abort failed");
-                }
-                return Err(err);
+                return Err(self.rollback_copy_transaction_after_error(
+                    txn,
+                    err,
+                    "COPY FROM parquet rollback after import error",
+                ));
             }
         };
         self.finalise_copy_from_commit(txn, rows, "COPY FROM parquet")?;

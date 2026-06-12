@@ -155,6 +155,15 @@ where
             .commit_transaction(txn, rows_changed > 0, context)
     }
 
+    pub(super) fn rollback_copy_transaction_after_error(
+        &self,
+        txn: Transaction,
+        original: ServerError,
+        context: &'static str,
+    ) -> ServerError {
+        self.rollback_transaction_after_error(txn, original, context)
+    }
+
     /// Best-effort parse + bind that returns `Some(plan)` only when `sql`
     /// is a single `COPY` statement.
     ///
@@ -561,11 +570,13 @@ where
                         match decoded {
                             Ok(payload) => payload_batch.push(payload),
                             Err(e) => {
-                                if let Err(abort_err) = self.state.txn_manager.abort(txn) {
-                                    warn!(error = %abort_err, "COPY FROM autocommit abort failed");
-                                }
+                                let err = self.rollback_copy_transaction_after_error(
+                                    txn,
+                                    e,
+                                    "COPY FROM autocommit rollback after row decode error",
+                                );
                                 self.drain_copy_remainder().await?;
-                                return Err(e);
+                                return Err(err);
                             }
                         }
                         if payload_batch.len() == COPY_INSERT_BATCH_ROWS {
@@ -574,20 +585,24 @@ where
                                 payload_batch.len(),
                                 "COPY FROM STDIN",
                             ) {
-                                if let Err(abort_err) = self.state.txn_manager.abort(txn) {
-                                    warn!(error = %abort_err, "COPY FROM autocommit abort failed");
-                                }
+                                let err = self.rollback_copy_transaction_after_error(
+                                    txn,
+                                    e,
+                                    "COPY FROM autocommit rollback after row count overflow",
+                                );
                                 self.drain_copy_remainder().await?;
-                                return Err(e);
+                                return Err(err);
                             }
                             if let Err(e) =
                                 self.flush_copy_insert_batch(entry, &payload_batch, &txn)
                             {
-                                if let Err(abort_err) = self.state.txn_manager.abort(txn) {
-                                    warn!(error = %abort_err, "COPY FROM autocommit abort failed");
-                                }
+                                let err = self.rollback_copy_transaction_after_error(
+                                    txn,
+                                    e,
+                                    "COPY FROM autocommit rollback after insert batch error",
+                                );
                                 self.drain_copy_remainder().await?;
-                                return Err(e);
+                                return Err(err);
                             }
                             payload_batch.clear();
                         }
@@ -613,18 +628,20 @@ where
                 // semantics intact.
                 FrontendMessage::Sync | FrontendMessage::Flush => continue,
                 FrontendMessage::Terminate => {
-                    if let Err(abort_err) = self.state.txn_manager.abort(txn) {
-                        warn!(error = %abort_err, "COPY FROM abort on terminate failed");
-                    }
-                    return Err(ServerError::UnexpectedEof);
+                    return Err(self.rollback_copy_transaction_after_error(
+                        txn,
+                        ServerError::UnexpectedEof,
+                        "COPY FROM rollback after terminate",
+                    ));
                 }
                 other => {
-                    if let Err(abort_err) = self.state.txn_manager.abort(txn) {
-                        warn!(error = %abort_err, "COPY FROM abort on protocol error failed");
-                    }
-                    return Err(ServerError::CopyFormat(format!(
-                        "unexpected frontend message during COPY FROM: {other:?}"
-                    )));
+                    return Err(self.rollback_copy_transaction_after_error(
+                        txn,
+                        ServerError::CopyFormat(format!(
+                            "unexpected frontend message during COPY FROM: {other:?}"
+                        )),
+                        "COPY FROM rollback after protocol error",
+                    ));
                 }
             }
         }
@@ -649,10 +666,11 @@ where
                 match decoded {
                     Ok(payload) => payload_batch.push(payload),
                     Err(e) => {
-                        if let Err(abort_err) = self.state.txn_manager.abort(txn) {
-                            warn!(error = %abort_err, "COPY FROM autocommit abort failed");
-                        }
-                        return Err(e);
+                        return Err(self.rollback_copy_transaction_after_error(
+                            txn,
+                            e,
+                            "COPY FROM autocommit rollback after final row decode error",
+                        ));
                     }
                 }
             } else {
@@ -661,45 +679,39 @@ where
         }
 
         if let Some(reason) = client_fail_message {
-            if let Err(abort_err) = self.state.txn_manager.abort(txn) {
-                warn!(error = %abort_err, "COPY FROM abort on CopyFail failed");
-            }
-            return Err(ServerError::CopyAborted(reason));
+            return Err(self.rollback_copy_transaction_after_error(
+                txn,
+                ServerError::CopyAborted(reason),
+                "COPY FROM rollback after CopyFail",
+            ));
         }
 
         if !payload_batch.is_empty() {
             if let Err(e) =
                 add_copy_batch_rows(&mut rows_inserted, payload_batch.len(), "COPY FROM STDIN")
             {
-                if let Err(abort_err) = self.state.txn_manager.abort(txn) {
-                    warn!(error = %abort_err, "COPY FROM autocommit abort failed");
-                }
-                return Err(e);
+                return Err(self.rollback_copy_transaction_after_error(
+                    txn,
+                    e,
+                    "COPY FROM autocommit rollback after row count overflow",
+                ));
             }
             if let Err(e) = self.flush_copy_insert_batch(entry, &payload_batch, &txn) {
-                if let Err(abort_err) = self.state.txn_manager.abort(txn) {
-                    warn!(error = %abort_err, "COPY FROM autocommit abort failed");
-                }
-                return Err(e);
+                return Err(self.rollback_copy_transaction_after_error(
+                    txn,
+                    e,
+                    "COPY FROM autocommit rollback after insert batch error",
+                ));
             }
         }
 
         if rows_inserted > 0 {
             if let Err(e) = self.state.validate_deferred_foreign_keys(&txn) {
-                let xid = txn.xid;
-                if let Err(rollback_err) = self.state.heap.rollback_in_place_updates(xid) {
-                    warn!(
-                        error = %rollback_err,
-                        "COPY FROM rollback of in-place updates failed after deferred FK violation",
-                    );
-                }
-                if let Err(abort_err) = self.state.txn_manager.abort(txn) {
-                    warn!(
-                        error = %abort_err,
-                        "COPY FROM abort failed after deferred FK violation",
-                    );
-                }
-                return Err(e);
+                return Err(self.rollback_copy_transaction_after_error(
+                    txn,
+                    e,
+                    "COPY FROM autocommit rollback after deferred FK violation",
+                ));
             }
         }
         self.finalise_copy_from_commit(txn, rows_inserted, "COPY FROM autocommit")?;
@@ -793,10 +805,11 @@ where
         let rows = match stream_result {
             Ok(rows) => rows,
             Err(err) => {
-                if let Err(abort_err) = self.state.txn_manager.abort(txn) {
-                    warn!(error = %abort_err, "COPY FROM file abort failed");
-                }
-                return Err(err);
+                return Err(self.rollback_copy_transaction_after_error(
+                    txn,
+                    err,
+                    "COPY FROM file rollback after import error",
+                ));
             }
         };
         let reject_rows = reject_state
@@ -1131,7 +1144,13 @@ where
         };
         let rows = copy_rows_from_usize(payloads.len(), "binary COPY FROM")?;
         let txn = self.state.txn_manager.begin(IsolationLevel::ReadCommitted);
-        self.flush_copy_insert_batch(entry, &payloads, &txn)?;
+        if let Err(e) = self.flush_copy_insert_batch(entry, &payloads, &txn) {
+            return Err(self.rollback_copy_transaction_after_error(
+                txn,
+                e,
+                "binary COPY FROM rollback after insert batch error",
+            ));
+        }
         self.finalise_copy_from_commit(txn, rows, "binary COPY FROM")?;
         self.state.note_commit_for_gc();
         self.state
@@ -2604,7 +2623,9 @@ fn format_float_f64(v: f64) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::Server;
     use crate::result_encoder::SelectResult;
+    use tokio::io::{DuplexStream, duplex};
     use ultrasql_core::{Field, GeometryType, Oid, RangeType};
 
     fn copy_opts(format: ServerCopyFormat) -> CopyOptions {
@@ -2626,6 +2647,11 @@ mod tests {
 
     fn entry_with_schema(schema: Schema) -> TableEntry {
         TableEntry::new(Oid::new(42), "copy_t", "public", schema)
+    }
+
+    fn test_session() -> Session<DuplexStream> {
+        let (io, _peer) = duplex(64);
+        Session::new(io, Arc::new(Server::with_sample_database()))
     }
 
     #[test]
@@ -3305,6 +3331,33 @@ b"#
         let mut rows = 1;
         add_copy_batch_rows(&mut rows, 2, "COPY test").expect("small batch count");
         assert_eq!(rows, 3);
+    }
+
+    #[test]
+    fn copy_cleanup_reports_abort_failure_with_original_error() {
+        let session = test_session();
+        let txn = session
+            .state
+            .txn_manager
+            .begin(IsolationLevel::ReadCommitted);
+        let stale = txn.clone();
+        session.state.txn_manager.abort(txn).expect("pre-abort");
+
+        let err = session.rollback_copy_transaction_after_error(
+            stale,
+            ServerError::CopyFormat("row boom".to_owned()),
+            "COPY FROM autocommit rollback after row error",
+        );
+        let msg = err.to_string();
+        assert!(
+            msg.contains("COPY FROM autocommit rollback after row error"),
+            "unexpected error: {err}"
+        );
+        assert!(msg.contains("row boom"), "original error lost: {err}");
+        assert!(
+            msg.contains("transaction abort failed"),
+            "abort failure hidden: {err}"
+        );
     }
 
     #[test]
