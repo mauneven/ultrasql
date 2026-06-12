@@ -941,15 +941,40 @@ Input
 /// Build the `tokio-postgres` connection string from resolved parameters.
 fn build_conn_string(p: &ConnParams) -> String {
     let mut parts = vec![
-        format!("host={}", p.host),
+        format_conn_param("host", &p.host),
         format!("port={}", p.port),
-        format!("dbname={}", p.dbname),
-        format!("user={}", p.user),
+        format_conn_param("dbname", &p.dbname),
+        format_conn_param("user", &p.user),
     ];
     if let Some(pw) = &p.password {
-        parts.push(format!("password={pw}"));
+        parts.push(format_conn_param("password", pw));
     }
     parts.join(" ")
+}
+
+fn format_conn_param(key: &str, value: &str) -> String {
+    format!("{key}={}", quote_conn_value(value))
+}
+
+fn quote_conn_value(value: &str) -> String {
+    if !value.is_empty()
+        && !value
+            .bytes()
+            .any(|b| b.is_ascii_whitespace() || b == b'\'' || b == b'\\')
+    {
+        return value.to_owned();
+    }
+
+    let mut quoted = String::with_capacity(value.len() + 2);
+    quoted.push('\'');
+    for ch in value.chars() {
+        if ch == '\'' || ch == '\\' {
+            quoted.push('\\');
+        }
+        quoted.push(ch);
+    }
+    quoted.push('\'');
+    quoted
 }
 
 /// Collect all connection parameters from the various sources.
@@ -2421,6 +2446,30 @@ mod tests {
         let p = ConnParams::from_url("postgresql://carol@/db").expect("empty host accepted");
         assert_eq!(p.user, "carol");
         assert_eq!(p.dbname, "db");
+    }
+
+    #[test]
+    fn connection_string_quotes_keyword_values() {
+        let params = ConnParams {
+            host: "db internal".to_owned(),
+            port: 25432,
+            dbname: "prod db".to_owned(),
+            user: "alice admin".to_owned(),
+            password: Some("p a's\\word".to_owned()),
+        };
+
+        let rendered = build_conn_string(&params);
+        let parsed = rendered
+            .parse::<tokio_postgres::Config>()
+            .expect("rendered connection string must parse");
+
+        match parsed.get_hosts() {
+            [tokio_postgres::config::Host::Tcp(host)] => assert_eq!(host, "db internal"),
+            other => panic!("expected one TCP host, got {other:?}"),
+        }
+        assert_eq!(parsed.get_dbname(), Some("prod db"));
+        assert_eq!(parsed.get_user(), Some("alice admin"));
+        assert_eq!(parsed.get_password(), Some("p a's\\word".as_bytes()));
     }
 
     #[test]
