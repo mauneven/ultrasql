@@ -1193,6 +1193,7 @@ where
                 "truncate",
             )?;
         }
+        let truncate_tables = self.expand_time_partition_truncate_tables(&tables);
 
         // Single autocommit txn so the multi-table case is atomic. A
         // partial failure aborts the txn and every delete it stamped
@@ -1202,7 +1203,7 @@ where
         let truncate_result: Result<(), ServerError> = (|| {
             let mut owned_sequences_to_restart = Vec::new();
             let mut seen_owned_sequences = std::collections::HashSet::new();
-            for name in &tables {
+            for name in &truncate_tables {
                 let entry = snapshot.tables.get(name).ok_or_else(|| {
                     ServerError::Plan(ultrasql_planner::PlanError::TableNotFound(name.clone()))
                 })?;
@@ -1288,7 +1289,7 @@ where
         match truncate_result {
             Ok(()) => {
                 self.state.commit_transaction(txn, true, "TRUNCATE")?;
-                for name in &tables {
+                for name in &truncate_tables {
                     self.state.columnar_storage.mark_dirty(name);
                 }
                 // Row counts changed beyond recognition; clear the cache
@@ -1302,6 +1303,26 @@ where
                 "TRUNCATE rollback after execution error",
             )),
         }
+    }
+
+    fn expand_time_partition_truncate_tables(&self, tables: &[String]) -> Vec<String> {
+        let mut expanded = tables.to_vec();
+        let mut seen = tables
+            .iter()
+            .map(|name| name.to_ascii_lowercase())
+            .collect::<std::collections::HashSet<_>>();
+        for name in tables {
+            let Some(runtime) = self.state.time_partitions.get(name) else {
+                continue;
+            };
+            for chunk in runtime.chunks.iter() {
+                let chunk_name = chunk.value().table_name.clone();
+                if seen.insert(chunk_name.to_ascii_lowercase()) {
+                    expanded.push(chunk_name);
+                }
+            }
+        }
+        expanded
     }
 
     fn collect_truncate_tables(

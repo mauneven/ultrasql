@@ -212,6 +212,47 @@ async fn partitioned_parent_count_reads_chunks() {
 }
 
 #[tokio::test]
+async fn partitioned_table_truncate_clears_chunks() {
+    let (_server, client, _conn, server_handle) = start_server_and_connect().await;
+
+    client
+        .batch_execute(
+            "CREATE TABLE metrics_truncate (\
+             ts TIMESTAMP NOT NULL, host TEXT NOT NULL, value INT NOT NULL\
+             ) PARTITION BY RANGE (ts);\
+             INSERT INTO metrics_truncate VALUES \
+             (TIMESTAMP '2026-05-20 00:00:00', 'a', 10),\
+             (TIMESTAMP '2026-05-21 00:00:00', 'b', 20);\
+             TRUNCATE TABLE metrics_truncate",
+        )
+        .await
+        .expect("truncate partitioned table");
+
+    let count = client
+        .query_one("SELECT COUNT(*) FROM metrics_truncate", &[])
+        .await
+        .expect("count truncated partitioned table")
+        .get::<_, i64>(0);
+    assert_eq!(count, 0);
+
+    client
+        .batch_execute(
+            "INSERT INTO metrics_truncate VALUES \
+             (TIMESTAMP '2026-05-22 00:00:00', 'c', 30)",
+        )
+        .await
+        .expect("insert after partitioned truncate");
+    let count = client
+        .query_one("SELECT COUNT(*) FROM metrics_truncate", &[])
+        .await
+        .expect("count after partitioned truncate insert")
+        .get::<_, i64>(0);
+    assert_eq!(count, 1);
+
+    shutdown(client, server_handle).await;
+}
+
+#[tokio::test]
 async fn partitioned_table_add_column_refreshes_runtime_schema() {
     let data_dir = tempfile::TempDir::new().expect("temp data dir");
 
