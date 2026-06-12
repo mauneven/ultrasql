@@ -483,9 +483,39 @@ where
         new_name: &str,
     ) -> Result<SelectResult, ServerError> {
         self.state
+            .ensure_create_relation_metadata_slots_persistable()?;
+        let updated_entry = self
+            .state
             .persistent_catalog
             .alter_table_rename(old_name, new_name)
             .map_err(ServerError::Catalog)?;
+        let attr_has_defaults =
+            if let Some(runtime) = self.state.table_constraints.get(&updated_entry.oid) {
+                alter_attr_has_defaults(Some(runtime.value().as_ref()), updated_entry.schema.len())
+            } else {
+                alter_attr_has_defaults(None, updated_entry.schema.len())
+            };
+        let txn = self.state.txn_manager.begin(IsolationLevel::ReadCommitted);
+        if let Err(e) = self
+            .state
+            .persistent_catalog
+            .persist_table_rows_with_defaults(
+                &updated_entry,
+                &attr_has_defaults,
+                self.state.heap.as_ref(),
+                txn.xid,
+                txn.current_command,
+            )
+        {
+            return Err(self.rollback_catalog_transaction_after_error(
+                txn,
+                e.into(),
+                "ALTER TABLE RENAME catalog rollback after persist error",
+            ));
+        }
+        self.state
+            .commit_transaction(txn, true, "ALTER TABLE RENAME")?;
+        self.state.persist_row_security_metadata()?;
         self.state.plan_cache.invalidate_all();
         Ok(run_ddl_command(&format!(
             "ALTER TABLE RENAME TO {new_name}"

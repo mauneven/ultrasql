@@ -82,3 +82,42 @@ async fn alter_table_rename_column_survives_restart() {
     assert_eq!(err.code().expect("SQLSTATE").code(), "42703");
     shutdown(running).await;
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn alter_table_rename_table_survives_restart() {
+    let data_dir = tempfile::TempDir::new().unwrap();
+
+    let running = start_persistent_server(data_dir.path(), "alter_rename_table_restart_test").await;
+    running
+        .client
+        .batch_execute("CREATE TABLE alter_rename_old (id INT, label TEXT)")
+        .await
+        .expect("create");
+    running
+        .client
+        .batch_execute("INSERT INTO alter_rename_old VALUES (1, 'alpha')")
+        .await
+        .expect("seed");
+    running
+        .client
+        .batch_execute("ALTER TABLE alter_rename_old RENAME TO alter_rename_new")
+        .await
+        .expect("rename table");
+    shutdown(running).await;
+
+    let running = start_persistent_server(data_dir.path(), "alter_rename_table_restart_test").await;
+    let rows = running
+        .client
+        .query("SELECT label FROM alter_rename_new WHERE id = 1", &[])
+        .await
+        .expect("renamed table resolves after restart");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].get::<_, String>(0), "alpha");
+    let err = running
+        .client
+        .query("SELECT label FROM alter_rename_old", &[])
+        .await
+        .expect_err("old table name stays gone after restart");
+    assert_eq!(err.code().expect("SQLSTATE").code(), "42P01");
+    shutdown(running).await;
+}
