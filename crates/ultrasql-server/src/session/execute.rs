@@ -2046,6 +2046,7 @@ where
                         )?;
                     }
                     self.maintain_append_only_materialized_views_after_commit(plan)?;
+                    self.flush_pending_dml_effects()?;
                 }
                 Ok(result)
             }
@@ -2850,33 +2851,49 @@ where
             .unwrap_or(0)
     }
 
-    pub(crate) fn note_committed_dml_effect(&self, plan: &LogicalPlan, rows: u64) {
+    pub(crate) fn note_committed_dml_effect(
+        &self,
+        plan: &LogicalPlan,
+        rows: u64,
+    ) -> Result<(), ServerError> {
         if rows == 0 {
-            return;
+            return Ok(());
         }
         let Some(table) = Self::dml_target_table(plan) else {
-            return;
+            return Ok(());
         };
-        if let Some(kind) = Self::dml_change_kind(plan) {
+        let logical_result = if let Some(kind) = Self::dml_change_kind(plan) {
             self.state
                 .logical_replication
-                .record_committed_dml(table, kind, rows);
-        }
+                .record_committed_dml(table, kind, rows)
+        } else {
+            Ok(())
+        };
         self.state.note_table_modifications(table, rows);
+        logical_result
     }
 
-    pub(crate) fn flush_pending_dml_effects(&mut self) {
+    pub(crate) fn flush_pending_dml_effects(&mut self) -> Result<(), ServerError> {
         let logical = std::mem::take(&mut self.pending_logical_changes);
+        let mut first_error = None;
         for change in logical {
-            self.state.logical_replication.record_committed_dml(
+            if let Err(err) = self.state.logical_replication.record_committed_dml(
                 &change.table,
                 change.kind,
                 change.rows_affected,
-            );
+            ) && first_error.is_none()
+            {
+                first_error = Some(err);
+            }
         }
         let drained = std::mem::take(&mut self.pending_table_modifications);
         for (table, rows) in drained {
             self.state.note_table_modifications(&table, rows);
+        }
+        if let Some(err) = first_error {
+            Err(err)
+        } else {
+            Ok(())
         }
     }
 
@@ -2915,7 +2932,12 @@ where
             self.pending_post_commit_maintenance = false;
             self.state.note_commit_for_gc();
         }
-        self.flush_pending_dml_effects();
+        if let Err(err) = self.flush_pending_dml_effects() {
+            tracing::warn!(
+                error = %err,
+                "post-response DML effect finalization failed",
+            );
+        }
     }
 
     pub(crate) fn clear_pending_dml_effects(&mut self) {
@@ -3749,6 +3771,60 @@ mod tests {
             "context missing: {err}"
         );
         assert!(msg.contains("commit"), "commit failure hidden: {err}");
+    }
+
+    #[test]
+    fn finalise_autocommit_reports_logical_replication_lsn_exhaustion() {
+        let mut session = test_session();
+        session
+            .state
+            .logical_replication
+            .create_publication("pub_t", vec!["t".to_owned()])
+            .expect("publication");
+        session
+            .state
+            .logical_replication
+            .set_next_lsn_for_test(u64::MAX);
+        let txn = session
+            .state
+            .txn_manager
+            .begin(IsolationLevel::ReadCommitted);
+        let insert = LogicalPlan::Insert {
+            table: "t".to_owned(),
+            columns: Vec::new(),
+            source: Box::new(LogicalPlan::Values {
+                rows: vec![vec![ScalarExpr::Literal {
+                    value: Value::Int32(1),
+                    data_type: DataType::Int32,
+                }]],
+                schema: Schema::new([Field::required("id", DataType::Int32)])
+                    .expect("values schema"),
+            }),
+            on_conflict: None,
+            returning: Vec::new(),
+            schema: Schema::empty(),
+        };
+
+        let err = session
+            .finalise_autocommit(
+                &insert,
+                txn,
+                Ok(SelectResult {
+                    messages: Vec::new(),
+                    streamed_body: None,
+                    shared_streamed_body: None,
+                    rows: 1,
+                }),
+            )
+            .expect_err("CDC finalization failure must be visible before success response");
+
+        assert!(
+            err.to_string()
+                .contains("logical replication LSN space exhausted"),
+            "unexpected error: {err}"
+        );
+        assert!(session.pending_logical_changes.is_empty());
+        assert_eq!(session.state.logical_replication.changes_since(0).len(), 0);
     }
 
     #[test]

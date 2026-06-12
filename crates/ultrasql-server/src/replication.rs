@@ -359,14 +359,24 @@ impl LogicalReplicationRuntime {
             .collect()
     }
 
+    #[cfg(test)]
+    pub(crate) fn set_next_lsn_for_test(&self, lsn: u64) {
+        self.next_lsn.store(lsn, Ordering::Release);
+    }
+
     /// Emit a committed statement-level DML change for matching publications.
-    pub fn record_committed_dml(&self, table: &str, kind: LogicalChangeKind, rows_affected: u64) {
+    pub fn record_committed_dml(
+        &self,
+        table: &str,
+        kind: LogicalChangeKind,
+        rows_affected: u64,
+    ) -> Result<(), ServerError> {
         if rows_affected == 0 {
-            return;
+            return Ok(());
         }
         let table = fold_identifier(table);
         if table.is_empty() {
-            return;
+            return Ok(());
         }
         let mut publications = self
             .publications
@@ -375,7 +385,7 @@ impl LogicalReplicationRuntime {
             .map(|publication| publication.key().clone())
             .collect::<Vec<_>>();
         if publications.is_empty() {
-            return;
+            return Ok(());
         }
         publications.sort();
         let mut changes = self.changes.lock();
@@ -386,8 +396,9 @@ impl LogicalReplicationRuntime {
                         current.checked_add(1)
                     })
             else {
-                tracing::error!("logical replication LSN space exhausted; skipping CDC record");
-                return;
+                return Err(ServerError::ddl(
+                    "logical replication LSN space exhausted while recording committed DML",
+                ));
             };
             changes.push(LogicalChange {
                 lsn,
@@ -397,6 +408,7 @@ impl LogicalReplicationRuntime {
                 rows_affected,
             });
         }
+        Ok(())
     }
 
     fn load_metadata(&self) -> Result<(), ServerError> {
@@ -1309,7 +1321,9 @@ mod tests {
                 .create_publication("pub_events", vec!["events".to_string()])
                 .expect("publication");
             runtime.create_logical_slot("slot_events").expect("slot");
-            runtime.record_committed_dml("events", LogicalChangeKind::Insert, 2);
+            runtime
+                .record_committed_dml("events", LogicalChangeKind::Insert, 2)
+                .expect("record insert");
             let changes = runtime.decode_slot("slot_events").expect("decode");
             assert_eq!(changes.len(), 1);
             assert_eq!(changes[0].lsn, 1);
@@ -1330,7 +1344,9 @@ mod tests {
                 .confirmed_lsn,
             1
         );
-        runtime.record_committed_dml("events", LogicalChangeKind::Update, 1);
+        runtime
+            .record_committed_dml("events", LogicalChangeKind::Update, 1)
+            .expect("record update");
         let changes = runtime
             .decode_slot("slot_events")
             .expect("decode after reopen");
@@ -1367,8 +1383,15 @@ mod tests {
             .expect("publication");
         runtime.next_lsn.store(u64::MAX, Ordering::Release);
 
-        runtime.record_committed_dml("events", LogicalChangeKind::Insert, 1);
+        let err = runtime
+            .record_committed_dml("events", LogicalChangeKind::Insert, 1)
+            .expect_err("exhausted logical LSN must be visible to caller");
 
+        assert!(
+            err.to_string()
+                .contains("logical replication LSN space exhausted"),
+            "unexpected error: {err}"
+        );
         assert!(runtime.changes_since(0).is_empty());
         assert_eq!(runtime.next_lsn.load(Ordering::Acquire), u64::MAX);
     }

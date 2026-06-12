@@ -587,7 +587,7 @@ where
                             self.state.note_commit_for_gc();
                             if let Some(plan) = portal_plan.as_ref() {
                                 let rows = Self::parse_affected_rows_tag(&outcome.messages);
-                                self.note_committed_dml_effect(plan, rows);
+                                self.note_committed_dml_effect(plan, rows)?;
                                 if rows > 0
                                     && let Some(table) = Self::dml_target_table(plan)
                                 {
