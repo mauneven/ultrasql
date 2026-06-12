@@ -191,6 +191,18 @@ fn scan_transaction_finalisation_reports_abort_failure_with_original_error() {
 }
 
 #[test]
+fn stats_hydration_row_count_ignores_unclean_scan_transaction() {
+    let result = finish_stats_hydration_row_count(
+        "users",
+        42,
+        Ok(()),
+        Err(TxnError::Unknown { xid: Xid::new(99) }),
+    );
+
+    assert_eq!(result, None);
+}
+
+#[test]
 fn metadata_codecs_cover_escapes_and_rls_tokens() {
     let raw = "tenant\\name\tline\nnext";
     let escaped = metadata_escape(raw);

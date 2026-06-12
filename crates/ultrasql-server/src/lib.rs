@@ -111,7 +111,7 @@ use ultrasql_storage::access_method::{
 };
 use ultrasql_storage::btree::BTree;
 use ultrasql_storage::buffer_pool::{BufferPool, PageLoader};
-use ultrasql_storage::heap::{HeapAccess, InsertOptions};
+use ultrasql_storage::heap::{HeapAccess, HeapError, InsertOptions};
 use ultrasql_storage::page::Page;
 use ultrasql_storage::segment::{SegmentConfig, SegmentError, SegmentFileManager};
 use ultrasql_storage::sequence::{Sequence, SequenceSnapshot};
@@ -255,13 +255,36 @@ fn count_visible_relation_rows<L: PageLoader>(
             Ok(())
         },
     );
-    if let Err(e) = txn_manager.abort(scan_txn) {
-        warn!(table = %table.name, error = %e, "stats hydration scan transaction abort failed");
-    }
-    match scan_result {
-        Ok(()) => Some(row_count),
+    finish_stats_hydration_row_count(
+        &table.name,
+        row_count,
+        scan_result,
+        txn_manager.abort(scan_txn),
+    )
+}
+
+fn finish_stats_hydration_row_count(
+    table_name: &str,
+    row_count: u64,
+    scan_result: Result<(), HeapError>,
+    abort_result: Result<(), TxnError>,
+) -> Option<u64> {
+    let scan_aborted_cleanly = match abort_result {
+        Ok(()) => true,
         Err(e) => {
-            warn!(table = %table.name, error = %e, "stats hydration row count scan failed");
+            warn!(
+                table = %table_name,
+                error = %e,
+                "stats hydration scan transaction abort failed"
+            );
+            false
+        }
+    };
+    match scan_result {
+        Ok(()) if scan_aborted_cleanly => Some(row_count),
+        Ok(()) => None,
+        Err(e) => {
+            warn!(table = %table_name, error = %e, "stats hydration row count scan failed");
             None
         }
     }
