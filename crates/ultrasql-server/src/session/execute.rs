@@ -2125,6 +2125,19 @@ where
             .map_err(|err| ServerError::Ddl(format!("{context}: {err}")))
     }
 
+    pub(crate) fn finalise_read_maintenance_transaction(
+        &self,
+        txn: Transaction,
+        outcome: Result<(), ServerError>,
+        commit_context: &'static str,
+        rollback_context: &'static str,
+    ) -> Result<(), ServerError> {
+        match outcome {
+            Ok(()) => self.finalise_read_transaction(txn, commit_context),
+            Err(err) => Err(self.rollback_transaction_after_error(txn, err, rollback_context)),
+        }
+    }
+
     fn try_parse_analyze_target(&self, trimmed_sql: &str) -> Option<Option<String>> {
         if trimmed_sql.len() < "analyze".len() || !trimmed_sql[..7].eq_ignore_ascii_case("analyze")
         {
@@ -2485,10 +2498,12 @@ where
             }
             Ok(())
         })();
-        if let Err(e) = self.state.txn_manager.commit(txn) {
-            tracing::warn!(error = %e, "autocommit (VACUUM BRIN summarize) failed to finalise");
-        }
-        result
+        self.finalise_read_maintenance_transaction(
+            txn,
+            result,
+            "VACUUM BRIN summarize commit",
+            "VACUUM BRIN summarize rollback after rebuild error",
+        )
     }
 
     fn execute_analyze(&mut self, table: Option<&str>) -> Result<SelectResult, ServerError> {
@@ -2684,13 +2699,12 @@ where
             }
             Ok(())
         })();
-        if let Err(commit_err) = self.state.txn_manager.commit(txn) {
-            tracing::warn!(
-                error = %commit_err,
-                "aggregating-index maintenance commit failed",
-            );
-        }
-        result
+        self.finalise_read_maintenance_transaction(
+            txn,
+            result,
+            "aggregating-index maintenance commit",
+            "aggregating-index maintenance rollback after refresh error",
+        )
     }
 
     pub(crate) fn materialize_view_delta(
@@ -3813,6 +3827,62 @@ mod tests {
             "context missing: {err}"
         );
         assert!(msg.contains("commit"), "commit failure hidden: {err}");
+    }
+
+    #[test]
+    fn read_maintenance_transaction_reports_commit_failure() {
+        let session = test_session();
+        let txn = session
+            .state
+            .txn_manager
+            .begin(IsolationLevel::ReadCommitted);
+        let stale = txn.clone();
+        session.state.txn_manager.commit(txn).expect("pre-commit");
+
+        let err = session
+            .finalise_read_maintenance_transaction(
+                stale,
+                Ok(()),
+                "maintenance commit",
+                "maintenance rollback",
+            )
+            .expect_err("maintenance commit failure must be visible");
+        let msg = err.to_string();
+        assert!(msg.contains("maintenance commit"), "context missing: {err}");
+        assert!(msg.contains("commit"), "commit failure hidden: {err}");
+    }
+
+    #[test]
+    fn read_maintenance_transaction_reports_abort_failure_with_original_error() {
+        let session = test_session();
+        let txn = session
+            .state
+            .txn_manager
+            .begin(IsolationLevel::ReadCommitted);
+        let stale = txn.clone();
+        session.state.txn_manager.abort(txn).expect("pre-abort");
+
+        let err = session
+            .finalise_read_maintenance_transaction(
+                stale,
+                Err(ServerError::ddl("maintenance boom")),
+                "maintenance commit",
+                "maintenance rollback",
+            )
+            .expect_err("maintenance rollback failure must be visible");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("maintenance rollback"),
+            "context missing: {err}"
+        );
+        assert!(
+            msg.contains("maintenance boom"),
+            "original error lost: {err}"
+        );
+        assert!(
+            msg.contains("transaction abort failed"),
+            "abort failure hidden: {err}"
+        );
     }
 
     #[test]
