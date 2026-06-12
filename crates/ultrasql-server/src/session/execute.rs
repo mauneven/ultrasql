@@ -2060,7 +2060,7 @@ where
         }
     }
 
-    fn rollback_autocommit_after_error(
+    pub(crate) fn rollback_autocommit_after_error(
         &self,
         txn: Transaction,
         original: ServerError,

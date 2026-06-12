@@ -564,65 +564,50 @@ where
                 }
                 let res =
                     crate::extended::execute_portal(&mut self.extended, portal, max_rows, &ctx);
-                if res.is_ok() {
-                    if portal_plan
-                        .as_ref()
-                        .and_then(|plan| Self::dml_target_table(plan))
-                        .is_some()
-                    {
-                        if let Err(e) = self.state.validate_deferred_foreign_keys(&txn) {
-                            let xid = txn.xid;
-                            if let Err(rollback_err) =
-                                self.state.heap.rollback_in_place_updates(xid)
-                            {
-                                tracing::warn!(
-                                    error = %rollback_err,
-                                    "in-place update rollback failed after deferred FK violation",
-                                );
-                            }
-                            if let Err(abort_err) = self.state.txn_manager.abort(txn) {
-                                tracing::warn!(
-                                    error = %abort_err,
-                                    "autocommit rollback failed after deferred FK violation (Extended Execute)",
-                                );
-                            }
-                            return Err(e);
+                match res {
+                    Ok(outcome) => {
+                        let is_dml = portal_plan
+                            .as_ref()
+                            .and_then(Self::dml_target_table)
+                            .is_some();
+                        if is_dml && let Err(e) = self.state.validate_deferred_foreign_keys(&txn) {
+                            return Err(self.rollback_autocommit_after_error(
+                                txn,
+                                e,
+                                "Extended Execute autocommit rollback after deferred FK violation",
+                            ));
                         }
+                        if let Err(e) = self.state.commit_transaction(
+                            txn,
+                            is_dml,
+                            "Extended Execute autocommit",
+                        ) {
+                            if is_dml {
+                                return Err(e);
+                            }
+                            tracing::warn!(error = %e, "autocommit failed to finalise (Extended Execute)");
+                        } else {
+                            self.state.note_commit_for_gc();
+                            if let Some(plan) = portal_plan.as_ref() {
+                                let rows = Self::parse_affected_rows_tag(&outcome.messages);
+                                self.note_committed_dml_effect(plan, rows);
+                                if rows > 0
+                                    && let Some(table) = Self::dml_target_table(plan)
+                                {
+                                    self.maintain_aggregating_indexes_for_tables_after_commit(&[
+                                        table.to_ascii_lowercase(),
+                                    ])?;
+                                }
+                            }
+                        }
+                        Ok(outcome)
                     }
-                    let is_dml = portal_plan
-                        .as_ref()
-                        .and_then(Self::dml_target_table)
-                        .is_some();
-                    if let Err(e) =
-                        self.state
-                            .commit_transaction(txn, is_dml, "Extended Execute autocommit")
-                    {
-                        if is_dml {
-                            return Err(e);
-                        }
-                        tracing::warn!(error = %e, "autocommit failed to finalise (Extended Execute)");
-                    } else {
-                        self.state.note_commit_for_gc();
-                        if let (Some(plan), Ok(outcome)) = (portal_plan.as_ref(), res.as_ref()) {
-                            let rows = Self::parse_affected_rows_tag(&outcome.messages);
-                            self.note_committed_dml_effect(plan, rows);
-                            if rows > 0
-                                && let Some(table) = Self::dml_target_table(plan)
-                            {
-                                self.maintain_aggregating_indexes_for_tables_after_commit(&[
-                                    table.to_ascii_lowercase(),
-                                ])?;
-                            }
-                        }
-                    }
-                } else if let Err(e) = self.state.txn_manager.abort(txn) {
-                    tracing::warn!(
-                        error = %e,
-                        "autocommit rollback failed (Extended Execute)",
-                    );
+                    Err(e) => Err(self.rollback_autocommit_after_error(
+                        txn,
+                        e,
+                        "Extended Execute autocommit rollback after statement error",
+                    )),
                 }
-                // txn_state stays Idle.
-                res
             }
             TxnState::InTransaction(mut txn) => {
                 self.state.txn_manager.refresh_snapshot(&mut txn);
