@@ -54,41 +54,41 @@ Raw benchmark data lives under
 
 ## Release-Artifact DB-vs-DB Benchmark
 
-Fresh run (2026-06-10):
+Fresh run (2026-06-12):
 `CH_BIN="$(command -v clickhouse)" SCALE_SWEEP_ROWS="10000 100000 1000000" ULTRASQLD_BIN=target/release-ship/ultrasqld benchmarks/run_scale_sweep.sh full`.
 UltraSQL v0.0.9 was launched as an external `ultrasqld` over TCP on the same
 Apple M4 host as installed DuckDB v1.5.2, ClickHouse 26.5.2.39, SQLite 3.51.0,
-and PostgreSQL 17. Each row uses 32 measured samples after 8 warmup samples;
+and PostgreSQL 14.22 (Homebrew). Each row uses 32 measured samples after 8 warmup samples;
 lower is better; bold marks the fastest measured engine. Bulk INSERT uses fresh
 UltraSQL server processes per measured sample and 10k-row INSERT chunks across
 engines.
 
 | Workload | Rows | UltraSQL | DuckDB | ClickHouse | SQLite | PostgreSQL | Fastest |
 |---|---:|---:|---:|---:|---:|---:|---|
-| INSERT throughput | 10 000 | **5.64 ms** | 67.93 ms (1104.1% slower) | 61.35 ms (987.6% slower) | 21.55 ms (282.1% slower) | 54.43 ms (864.8% slower) | UltraSQL |
-| INSERT throughput | 100 000 | **48.50 ms** | 425.40 ms (777% slower) | 652.23 ms (1244.7% slower) | 66.68 ms (37.5% slower) | 205.65 ms (324% slower) | UltraSQL |
-| INSERT throughput | 1 000 000 | **516.29 ms** | 4068.99 ms (688.1% slower) | 6472.41 ms (1153.6% slower) | 717.06 ms (38.9% slower) | 2196.20 ms (325.4% slower) | UltraSQL |
-| SELECT scan | 10 000 | **613.88 µs** | 880.15 µs (43.4% slower) | 1.10 ms (78.7% slower) | 1.95 ms (217.4% slower) | 30.90 ms (4933.7% slower) | UltraSQL |
-| SELECT scan | 100 000 | **6.39 ms** | 9.85 ms (54.1% slower) | 7.36 ms (15.2% slower) | 20.26 ms (217.1% slower) | 61.14 ms (857% slower) | UltraSQL |
-| SELECT scan | 1 000 000 | **62.05 ms** | 99.28 ms (60% slower) | 68.48 ms (10.4% slower) | 210.37 ms (239% slower) | 220.79 ms (255.8% slower) | UltraSQL |
-| SELECT SUM(x) | 10 000 | **59.88 µs** | 76.02 µs (27% slower) | 457.98 µs (664.9% slower) | 138.17 µs (130.8% slower) | 27.35 ms (45586.2% slower) | UltraSQL |
-| SELECT SUM(x) | 100 000 | **34.83 µs** | 85.02 µs (144.1% slower) | 796.98 µs (2187.9% slower) | 1.46 ms (4094.4% slower) | 39.64 ms (113706.5% slower) | UltraSQL |
-| SELECT SUM(x) | 1 000 000 | **43.71 µs** | 172.96 µs (295.7% slower) | 1.87 ms (4184% slower) | 14.66 ms (33438.3% slower) | 47.90 ms (109481.1% slower) | UltraSQL |
-| SELECT AVG(x) | 10 000 | **36.46 µs** | 82.71 µs (126.9% slower) | 461.73 µs (1166.5% slower) | 135.56 µs (271.8% slower) | 27.70 ms (75880.8% slower) | UltraSQL |
-| SELECT AVG(x) | 100 000 | **42.21 µs** | 113.75 µs (169.5% slower) | 733.98 µs (1638.9% slower) | 1.47 ms (3376.8% slower) | 40.10 ms (94915.1% slower) | UltraSQL |
-| SELECT AVG(x) | 1 000 000 | **60.17 µs** | 246.94 µs (310.4% slower) | 1.83 ms (2943.4% slower) | 14.28 ms (23637.2% slower) | 47.55 ms (78930.8% slower) | UltraSQL |
-| Filter + SUM | 10 000 | **48.00 µs** | 110.31 µs (129.8% slower) | 557.48 µs (1061.4% slower) | 154.83 µs (222.6% slower) | 27.89 ms (58008.4% slower) | UltraSQL |
-| Filter + SUM | 100 000 | **57.08 µs** | 136.29 µs (138.8% slower) | 822.33 µs (1340.6% slower) | 1.62 ms (2742.8% slower) | 40.02 ms (70001.4% slower) | UltraSQL |
-| Filter + SUM | 1 000 000 | **39.38 µs** | 184.48 µs (368.5% slower) | 1.56 ms (3868.7% slower) | 16.32 ms (41338.8% slower) | 48.48 ms (123018.4% slower) | UltraSQL |
-| UPDATE throughput | 10 000 | **94.75 µs** | 160.94 µs (69.9% slower) | 4.31 ms (4450.4% slower) | 425.52 µs (349.1% slower) | 48.41 ms (50989.3% slower) | UltraSQL |
-| UPDATE throughput | 100 000 | **563.00 µs** | 797.10 µs (41.6% slower) | 12.29 ms (2082.3% slower) | 4.32 ms (666.9% slower) | 172.95 ms (30619.3% slower) | UltraSQL |
-| UPDATE throughput | 1 000 000 | **1.96 ms** | 2.30 ms (17.3% slower) | 35.54 ms (1713.3% slower) | 44.50 ms (2170.3% slower) | 2101.20 ms (107108.8% slower) | UltraSQL |
-| DELETE throughput | 10 000 | **181.75 µs** | 2.19 ms (1104.8% slower) | 4.59 ms (2427.8% slower) | 539.10 µs (196.6% slower) | 24.56 ms (13415.8% slower) | UltraSQL |
-| DELETE throughput | 100 000 | **709.21 µs** | 20.39 ms (2774.9% slower) | 3.68 ms (419.4% slower) | 5.87 ms (727.2% slower) | 39.43 ms (5460.1% slower) | UltraSQL |
-| DELETE throughput | 1 000 000 | **2.73 ms** | 231.06 ms (8375.4% slower) | 3.14 ms (15.1% slower) | 60.85 ms (2132.2% slower) | 173.38 ms (6259.7% slower) | UltraSQL |
-| Mixed OLTP | 10 000 | **211.15 µs/op** | 1.32 ms/op (523.5% slower) | 27.48 ms/op (12915.3% slower) | 386.16 µs/op (82.9% slower) | 12.35 ms/op (5746.9% slower) | UltraSQL |
-| Mixed correctness | 100 000 | **159.00 µs** | 284.50 µs (78.9% slower) | 78.83 ms (49476.8% slower) | 2.29 ms (1340.1% slower) | 3.65 ms (2195.5% slower) | UltraSQL |
-| Window row_number() | 65 536 | **4.31 ms** | 7.49 ms (73.9% slower) | 6.36 ms (47.5% slower) | 30.18 ms (600.7% slower) | 59.77 ms (1287.6% slower) | UltraSQL |
+| INSERT throughput | 10 000 | **5.66 ms** | 68.14 ms (1103.2% slower) | 60.73 ms (972.3% slower) | 21.13 ms (273.1% slower) | 54.37 ms (860% slower) | UltraSQL |
+| INSERT throughput | 100 000 | **47.88 ms** | 425.07 ms (787.8% slower) | 648.81 ms (1255.1% slower) | 66.59 ms (39.1% slower) | 203.99 ms (326.1% slower) | UltraSQL |
+| INSERT throughput | 1 000 000 | **518.82 ms** | 4073.24 ms (685.1% slower) | 6454.41 ms (1144.1% slower) | 721.66 ms (39.1% slower) | 2193.44 ms (322.8% slower) | UltraSQL |
+| SELECT scan | 10 000 | **560.62 µs** | 875.15 µs (56.1% slower) | 1.05 ms (87.1% slower) | 1.93 ms (244.8% slower) | 30.71 ms (5378% slower) | UltraSQL |
+| SELECT scan | 100 000 | **6.29 ms** | 9.93 ms (57.9% slower) | 7.43 ms (18% slower) | 20.26 ms (221.9% slower) | 60.71 ms (864.7% slower) | UltraSQL |
+| SELECT scan | 1 000 000 | **60.76 ms** | 99.41 ms (63.6% slower) | 66.80 ms (9.9% slower) | 209.42 ms (244.6% slower) | 220.72 ms (263.2% slower) | UltraSQL |
+| SELECT SUM(x) | 10 000 | **59.33 µs** | 90.90 µs (53.2% slower) | 502.81 µs (747.4% slower) | 139.98 µs (135.9% slower) | 27.34 ms (45979.6% slower) | UltraSQL |
+| SELECT SUM(x) | 100 000 | **46.38 µs** | 107.02 µs (130.8% slower) | 712.88 µs (1437.2% slower) | 1.49 ms (3116.7% slower) | 38.73 ms (83414.9% slower) | UltraSQL |
+| SELECT SUM(x) | 1 000 000 | **45.71 µs** | 158.42 µs (246.6% slower) | 1.76 ms (3750.9% slower) | 14.59 ms (31824.2% slower) | 47.38 ms (103548.8% slower) | UltraSQL |
+| SELECT AVG(x) | 10 000 | **57.79 µs** | 92.08 µs (59.3% slower) | 531.29 µs (819.3% slower) | 140.21 µs (142.6% slower) | 27.52 ms (47511% slower) | UltraSQL |
+| SELECT AVG(x) | 100 000 | **64.29 µs** | 127.02 µs (97.6% slower) | 752.86 µs (1071% slower) | 1.49 ms (2224.7% slower) | 39.82 ms (61842.7% slower) | UltraSQL |
+| SELECT AVG(x) | 1 000 000 | **65.08 µs** | 250.31 µs (284.6% slower) | 1.78 ms (2630.7% slower) | 14.55 ms (22259.4% slower) | 46.66 ms (71598.6% slower) | UltraSQL |
+| Filter + SUM | 10 000 | **46.42 µs** | 105.25 µs (126.8% slower) | 578.81 µs (1147% slower) | 152.00 µs (227.5% slower) | 27.47 ms (59082.9% slower) | UltraSQL |
+| Filter + SUM | 100 000 | **44.38 µs** | 133.90 µs (201.7% slower) | 805.38 µs (1714.9% slower) | 1.68 ms (3686.7% slower) | 39.45 ms (88798.1% slower) | UltraSQL |
+| Filter + SUM | 1 000 000 | **61.75 µs** | 183.56 µs (197.3% slower) | 1.72 ms (2679.6% slower) | 16.28 ms (26272.1% slower) | 48.73 ms (78818.2% slower) | UltraSQL |
+| UPDATE throughput | 10 000 | **115.92 µs** | 171.75 µs (48.2% slower) | 3.80 ms (3177.9% slower) | 422.02 µs (264.1% slower) | 48.22 ms (41496.7% slower) | UltraSQL |
+| UPDATE throughput | 100 000 | **543.83 µs** | 822.44 µs (51.2% slower) | 12.41 ms (2181.6% slower) | 4.25 ms (682% slower) | 172.81 ms (31675.7% slower) | UltraSQL |
+| UPDATE throughput | 1 000 000 | **2.03 ms** | 2.29 ms (13% slower) | 36.44 ms (1697.7% slower) | 44.63 ms (2101.8% slower) | 2103.99 ms (103704.6% slower) | UltraSQL |
+| DELETE throughput | 10 000 | **161.12 µs** | 2.09 ms (1198.7% slower) | 3.75 ms (2229% slower) | 528.85 µs (228.2% slower) | 23.73 ms (14626.1% slower) | UltraSQL |
+| DELETE throughput | 100 000 | **599.54 µs** | 20.36 ms (3296.5% slower) | 3.74 ms (524.6% slower) | 5.91 ms (886.3% slower) | 38.75 ms (6363.8% slower) | UltraSQL |
+| DELETE throughput | 1 000 000 | **2.68 ms** | 230.93 ms (8524.4% slower) | 3.26 ms (21.6% slower) | 60.58 ms (2162.3% slower) | 176.08 ms (6476% slower) | UltraSQL |
+| Mixed OLTP | 10 000 | **211.96 µs/op** | 1.32 ms/op (521.1% slower) | 22.87 ms/op (10691% slower) | 385.31 µs/op (81.8% slower) | 12.35 ms/op (5724.5% slower) | UltraSQL |
+| Mixed correctness | 100 000 | **148.38 µs** | 275.90 µs (85.9% slower) | 78.63 ms (52896.1% slower) | 2.25 ms (1418.3% slower) | 3.69 ms (2386.8% slower) | UltraSQL |
+| Window row_number() | 65 536 | **4.27 ms** | 7.61 ms (78.4% slower) | 6.29 ms (47.5% slower) | 31.61 ms (641% slower) | 60.23 ms (1311.7% slower) | UltraSQL |
 
 ## Quick Start
 

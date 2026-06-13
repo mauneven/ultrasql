@@ -390,8 +390,9 @@ fn render_md(by_workload: &HashMap<String, Vec<EngineResult>>) -> String {
          SQL pipeline. Measured rows come from each engine's native client \
          (`sqlite3` Python driver, `duckdb` Python driver, ClickHouse native \
          TCP via `clickhouse_driver`, `psql`/libpq subprocess for PostgreSQL); \
-         UltraSQL rows are measured via `tokio-postgres` against an \
-         in-process `ultrasqld` (see `cross_compare_sql`). Every benchmark \
+         UltraSQL rows are measured via `tokio-postgres` against \
+         `ultrasqld` (in-process for generic runs, or an external release \
+         artifact when raw rows record `server_mode=external`). Every benchmark \
          shape — INSERT, SELECT scan, SUM / AVG / Filter+SUM, UPDATE, \
          DELETE, mixed OLTP — now travels the wire path end-to-end through \
          `ultrasqld`. See [`../../BENCHMARKS.md`](../../BENCHMARKS.md) for \
@@ -409,11 +410,10 @@ fn render_md(by_workload: &HashMap<String, Vec<EngineResult>>) -> String {
          performance claim. The wider operator surface — ORDER BY, \
          JOIN, IndexScan, EXPLAIN, PREPARE/EXECUTE, COPY — is not yet \
          reachable from `lower_query`.\n\n\
-         > **⚠️ Durability gap**: the in-place UPDATE / DELETE fast \
-         paths emit **no WAL**. Bench numbers describe a non-durable \
-         contract; the classical `update_many` / `delete_many` paths \
-         do emit WAL and are the durable route. Adding WAL to the \
-         in-place path is a tracked P0 item.\n\n",
+         > **Durability note**: the in-place UPDATE / DELETE fast paths \
+         used by this matrix emit WAL batch records and are wired through \
+         storage recovery. This is still a narrow shape benchmark, not a \
+         claim that every SQL shape has the same hot path or crash profile.\n\n",
     );
     out.push_str(
         "Tables are ordered fastest → slowest. The `Relative` column shows \

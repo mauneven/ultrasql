@@ -25,11 +25,16 @@ fn scale_sweep_script_uses_external_release_artifact() {
     assert!(script.contains("cargo build --profile \"$PROFILE\""));
     assert!(script.contains("\"status\": \"not_available\""));
     assert!(script.contains("SCALE_SWEEP_APPEND"));
+    assert!(script.contains("\"host\""));
+    assert!(script.contains("\"engine_versions\""));
     assert!(script.contains("benchmarks/scripts/render_scale_sweep.py"));
     assert!(script.contains("run_ultrasql_fresh_insert_samples"));
     assert!(script.contains("10k-row INSERT chunks"));
     assert!(script.contains("benchmarks/scripts/run_clickhouse_writes.sh"));
     assert!(script.contains("ClickHouse"));
+    assert!(
+        script.contains("run_competitor_script postgres benchmarks/scripts/run_postgres_writes.sh")
+    );
     assert!(script.contains("benchmarks/scripts/check_supremacy.py \"$RAW\""));
     assert!(script.contains("mixed-correctness"));
     assert!(script.contains("mixed_correctness_100k"));

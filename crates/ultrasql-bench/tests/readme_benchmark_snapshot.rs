@@ -21,7 +21,7 @@ fn readme_db_snapshot_matches_latest_raw_artifacts() {
 
     assert!(readme.contains("## Release-Artifact DB-vs-DB Benchmark"));
     assert!(readme.contains("benchmarks/run_scale_sweep.sh full"));
-    assert!(readme.contains("PostgreSQL 17"));
+    assert!(readme.contains("PostgreSQL 14.22"));
     assert!(!readme.contains("## Current DB-vs-DB Snapshot"));
 
     for line in scale_md.lines().filter(|line| line.starts_with('|')) {

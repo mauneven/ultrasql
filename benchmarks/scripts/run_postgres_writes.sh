@@ -19,7 +19,7 @@
 #                             bench_analytical WHERE x > 5000000`
 #
 # Output: one JSON file per workload in $RAW_DIR:
-#   <workload>-postgres17.json
+#   <workload>-postgres.json
 #
 # An optional positional argument selects a single workload (e.g.
 # `select_scan_10k`); with no argument all workloads run.
@@ -34,7 +34,7 @@
 
 set -euo pipefail
 
-ENGINE="postgres17"
+ENGINE="postgres"
 RAW_DIR="${RAW_DIR:-benchmarks/results/latest/raw}"
 N_ITERS="${N_ITERS:-8}"
 N_ROWS="${N_ROWS:-10000}"
@@ -61,7 +61,7 @@ row_suffix() {
 # ---------------------------------------------------------------------------
 
 if ! command -v psql >/dev/null 2>&1; then
-    echo "run_postgres_writes.sh: WARNING: psql not found — skipping postgres17 benchmarks" >&2
+    echo "run_postgres_writes.sh: WARNING: psql not found — skipping postgres benchmarks" >&2
     for wl in insert_throughput_10k update_throughput_10k delete_throughput_10k mixed_oltp_pgbench_like "mixed_correctness_$(row_suffix "$N_ROWS")" select_scan_10k select_sum_65k_i64 select_avg_1m_i64 filter_sum_1m_i64 window_row_number_65k_i64; do
         echo "{\"engine\":\"${ENGINE}\",\"status\":\"not_available\",\"workload\":\"${wl}\"}" \
             > "${RAW_DIR}/${wl}-${ENGINE}.json"
@@ -116,8 +116,10 @@ SQL
 ensure_database
 
 PSQL="psql -U $PGUSER -d $PGDATABASE -q --no-align -t"
+PG_SERVER_VERSION="$($PSQL -c "SHOW server_version;" | xargs)"
+PG_ENGINE_VERSION="PostgreSQL ${PG_SERVER_VERSION:-unknown}"
 
-echo "run_postgres_writes.sh: PostgreSQL ${ENGINE} — N_ROWS=${N_ROWS} N_ITERS=${N_ITERS}"
+echo "run_postgres_writes.sh: ${PG_ENGINE_VERSION} — N_ROWS=${N_ROWS} N_ITERS=${N_ITERS}"
 
 # ---------------------------------------------------------------------------
 # Helper: compute median of space-separated microsecond values
@@ -151,10 +153,39 @@ PYEOF
 )
     local n_samples
     n_samples="$#"
-    printf '{"engine":"%s","workload":"%s","n_rows":%d,"samples":%d,"median_us":%.3f,"min_us":%.3f,"iterations_us":%s}\n' \
-        "$ENGINE" "$workload" "$n_rows" "$n_samples" "$median_us" \
-        "$(python3 -c "import sys; vals=[float(x) for x in sys.argv[1:]]; print(min(vals) if vals else 0)" "$@")" \
-        "$samples_json"
+    local min_us
+    min_us="$(python3 -c "import sys; vals=[float(x) for x in sys.argv[1:]]; print(min(vals) if vals else 0)" "$@")"
+    python3 - "$ENGINE" "$PG_ENGINE_VERSION" "$workload" "$n_rows" "$n_samples" "$median_us" "$min_us" "$samples_json" <<'PYEOF'
+import json
+import sys
+
+engine, version, workload, n_rows, samples, median_us, min_us, samples_json = sys.argv[1:]
+doc = {
+    "engine": engine,
+    "engine_version": version,
+    "workload": workload,
+    "n_rows": int(n_rows),
+    "samples": int(samples),
+    "median_us": float(median_us),
+    "min_us": float(min_us),
+    "iterations_us": json.loads(samples_json),
+}
+print(json.dumps(doc, sort_keys=True))
+PYEOF
+}
+
+annotate_json() {
+    local path="$1"
+    python3 - "$path" "$PG_ENGINE_VERSION" <<'PYEOF'
+import json
+import sys
+from pathlib import Path
+
+path = Path(sys.argv[1])
+doc = json.loads(path.read_text())
+doc["engine_version"] = sys.argv[2]
+path.write_text(json.dumps(doc, sort_keys=True) + "\n")
+PYEOF
 }
 
 # ---------------------------------------------------------------------------
@@ -172,7 +203,7 @@ SQL
 
     # Pre-generate values as a Python CSV to avoid shell loops.
     local values_file
-    values_file="$(mktemp /tmp/pg_bench_insert_XXXX.sql)"
+    values_file="$(mktemp /tmp/pg_bench_insert_XXXXXXXX.sql)"
     python3 - "$N_ROWS" "$INSERT_CHUNK_ROWS" "$values_file" <<'PYEOF'
 import sys, random
 n = int(sys.argv[1])
@@ -270,7 +301,7 @@ run_delete() {
 
     # Generate insert SQL once.
     local insert_file
-    insert_file="$(mktemp /tmp/pg_bench_delete_XXXX.sql)"
+    insert_file="$(mktemp /tmp/pg_bench_delete_XXXXXXXX.sql)"
     python3 - "$N_ROWS" "$insert_file" <<'PYEOF'
 import sys, random
 n = int(sys.argv[1])
@@ -407,6 +438,7 @@ run_mixed_correctness() {
         --pg-user "$PGUSER" \
         --pg-database "$PGDATABASE" \
         --out "${RAW_DIR}/${wl}-${ENGINE}.json"
+    annotate_json "${RAW_DIR}/${wl}-${ENGINE}.json"
 }
 
 # ---------------------------------------------------------------------------

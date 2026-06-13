@@ -375,13 +375,13 @@ run_competitors() {
         insert_throughput_*|select_scan_*|update_throughput_*|delete_throughput_*|mixed_oltp_pgbench_like|mixed_correctness_*)
             run_competitor_script duckdb benchmarks/scripts/run_duckdb_writes.sh "$selector" "$rows" row
             run_competitor_script sqlite3 benchmarks/scripts/run_sqlite3_writes.sh "$selector" "$rows" row
-            run_competitor_script postgres17 benchmarks/scripts/run_postgres_writes.sh "$selector" "$rows" row
+            run_competitor_script postgres benchmarks/scripts/run_postgres_writes.sh "$selector" "$rows" row
             run_competitor_script clickhouse benchmarks/scripts/run_clickhouse_writes.sh "$selector" "$rows" row
             ;;
         select_sum_*_i64|select_avg_*_i64|filter_sum_*_i64|window_row_number_*_i64)
             run_competitor_script duckdb benchmarks/scripts/run_duckdb_writes.sh "$selector" "$rows" analytical
             run_competitor_script sqlite3 benchmarks/scripts/run_sqlite3_writes.sh "$selector" "$rows" analytical
-            run_competitor_script postgres17 benchmarks/scripts/run_postgres_writes.sh "$selector" "$rows" analytical
+            run_competitor_script postgres benchmarks/scripts/run_postgres_writes.sh "$selector" "$rows" analytical
             run_competitor_script clickhouse benchmarks/scripts/run_clickhouse_writes.sh "$selector" "$rows" analytical
             ;;
         *) echo "run_scale_sweep.sh: unknown competitor selector $selector" >&2; exit 2 ;;
@@ -439,10 +439,52 @@ python3 benchmarks/scripts/check_supremacy.py "$RAW"
 
 python3 - "$OUT/scale_sweep_manifest.json" "$mode" "$ITERS" "$WARMUP" "$ROWS" "$ULTRASQL_VERSION_TEXT" "$install_source" "${SCALE_SWEEP_APPEND:-0}" <<'PY'
 import json
+import os
+import platform
+import socket
+import subprocess
 import sys
 from pathlib import Path
 
 path, mode, iters, warmup, rows, version, install_source, append = sys.argv[1:]
+
+def cmd_output(*cmd: str) -> str | None:
+    try:
+        return subprocess.check_output(cmd, text=True, stderr=subprocess.DEVNULL).strip()
+    except (OSError, subprocess.CalledProcessError):
+        return None
+
+def cpu_model() -> str | None:
+    if platform.system() == "Darwin":
+        return cmd_output("sysctl", "-n", "machdep.cpu.brand_string")
+    if Path("/proc/cpuinfo").exists():
+        for line in Path("/proc/cpuinfo").read_text(errors="replace").splitlines():
+            if line.lower().startswith("model name"):
+                return line.split(":", 1)[1].strip()
+    return platform.processor() or None
+
+def memory_bytes() -> int | None:
+    if platform.system() == "Darwin":
+        value = cmd_output("sysctl", "-n", "hw.memsize")
+        return int(value) if value and value.isdigit() else None
+    if Path("/proc/meminfo").exists():
+        for line in Path("/proc/meminfo").read_text(errors="replace").splitlines():
+            if line.startswith("MemTotal:"):
+                return int(line.split()[1]) * 1024
+    return None
+
+def postgres_server_version() -> str | None:
+    user = os.environ.get("PGUSER") or cmd_output("id", "-un") or ""
+    database = os.environ.get("PGDATABASE", "ultrasql_bench")
+    try:
+        return subprocess.check_output(
+            ["psql", "-U", user, "-d", database, "-q", "--no-align", "-t", "-c", "SHOW server_version;"],
+            text=True,
+            stderr=subprocess.DEVNULL,
+        ).strip()
+    except (OSError, subprocess.CalledProcessError):
+        return None
+
 path_obj = Path(path)
 existing_rows = []
 if append == "1" and path_obj.exists():
@@ -460,6 +502,23 @@ doc = {
     "ultrasql_version": version,
     "ultrasql_install_source": install_source,
     "methodology": "UltraSQL external release artifact over TCP; competitors installed local clients including ClickHouse when available; bulk INSERT uses a fresh UltraSQL server per measured sample and 10k-row INSERT chunks across engines.",
+    "host": {
+        "hostname": socket.gethostname(),
+        "os": platform.platform(),
+        "machine": platform.machine(),
+        "cpu_model": cpu_model(),
+        "logical_cpus": os.cpu_count(),
+        "memory_bytes": memory_bytes(),
+        "rustc": cmd_output("rustc", "--version"),
+        "git_commit": cmd_output("git", "rev-parse", "HEAD"),
+    },
+    "engine_versions": {
+        "ultrasql": version,
+        "duckdb": cmd_output("duckdb", "--version"),
+        "clickhouse": cmd_output(os.environ.get("CH_BIN", "clickhouse"), "--version"),
+        "sqlite": cmd_output("sqlite3", "--version"),
+        "postgres": postgres_server_version(),
+    },
 }
 with open(path_obj, "w", encoding="utf-8") as fh:
     json.dump(doc, fh, indent=2, sort_keys=True)

@@ -13,12 +13,12 @@ import json
 from pathlib import Path
 
 
-ENGINE_ORDER = ["ultrasql", "duckdb", "clickhouse", "sqlite3", "postgres17"]
+ENGINE_ORDER = ["ultrasql", "duckdb", "clickhouse", "sqlite3", "postgres"]
 ENGINE_LABELS = {
     "ultrasql": "UltraSQL",
     "duckdb": "DuckDB",
     "sqlite3": "SQLite",
-    "postgres17": "PostgreSQL",
+    "postgres": "PostgreSQL",
     "clickhouse": "ClickHouse",
 }
 WORKLOAD_ORDER = [
@@ -75,6 +75,12 @@ def workload_family(workload: str) -> str | None:
     return None
 
 
+def canonical_engine(engine: str) -> str:
+    if engine == "postgres17":
+        return "postgres"
+    return engine
+
+
 def format_rows(rows: int) -> str:
     return f"{rows:,}".replace(",", " ")
 
@@ -112,7 +118,7 @@ def load_raw(raw_dir: Path) -> list[dict]:
             continue
         records.append(
             {
-                "engine": str(doc["engine"]),
+                "engine": canonical_engine(str(doc["engine"])),
                 "workload": str(doc["workload"]),
                 "family": family,
                 "n_rows": int(doc.get("n_rows", 0)),

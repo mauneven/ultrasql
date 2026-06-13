@@ -292,9 +292,9 @@ def main() -> None:
         samples, answer = run_duckdb(args.rows, args.iters)
     elif args.engine == "sqlite3":
         samples, answer = run_sqlite(args.rows, args.iters)
-    elif args.engine == "postgres17":
+    elif args.engine in {"postgres", "postgres17"}:
         if not args.pg_user or not args.pg_database:
-            raise SystemExit("--pg-user and --pg-database are required for postgres17")
+            raise SystemExit("--pg-user and --pg-database are required for postgres")
         samples, answer = run_postgres(args.rows, args.iters, args.pg_user, args.pg_database)
     elif args.engine == "clickhouse":
         samples, answer = run_clickhouse(args.rows, args.iters, args.ch_port)

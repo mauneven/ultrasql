@@ -1,4 +1,21 @@
 {
+  "engine_versions": {
+    "clickhouse": "ClickHouse local version 26.5.2.39 (official build).",
+    "duckdb": "v1.5.2 (Variegata) 8a5851971f",
+    "postgres": "14.22 (Homebrew)",
+    "sqlite": "3.51.0 2025-06-12 13:14:41 f0ca7bba1c5e232e5d279fad6338121ab55af0c8c68c84cdfb18ba5114dcaapl (64-bit)",
+    "ultrasql": "ultrasqld 0.0.9"
+  },
+  "host": {
+    "cpu_model": "Apple M4",
+    "git_commit": "a9b54182147218962b6b60c1d2a92f962daff988",
+    "hostname": "maunevens-Mac-mini.local",
+    "logical_cpus": 10,
+    "machine": "arm64",
+    "memory_bytes": 17179869184,
+    "os": "macOS-26.5.1-arm64-arm-64bit-Mach-O",
+    "rustc": "rustc 1.95.0 (59807616e 2026-04-14)"
+  },
   "iters": 32,
   "methodology": "UltraSQL external release artifact over TCP; competitors installed local clients including ClickHouse when available; bulk INSERT uses a fresh UltraSQL server per measured sample and 10k-row INSERT chunks across engines.",
   "mode": "full",
