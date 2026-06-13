@@ -698,6 +698,16 @@ impl TransactionManager {
         self.recover_observed_xid(xid);
     }
 
+    /// Restore an aborted XID observed during WAL recovery.
+    pub fn recover_aborted(&self, xid: Xid) {
+        if xid == Xid::INVALID || xid == Xid::FROZEN || xid == Xid::BOOTSTRAP {
+            return;
+        }
+        self.clog.insert(xid, XidStatus::Aborted);
+        self.in_progress.lock().remove(&xid);
+        self.recover_observed_xid(xid);
+    }
+
     /// Restore an in-progress prepared XID observed in 2PC state.
     ///
     /// WAL recovery runs before 2PC state recovery. If WAL has already marked
@@ -861,6 +871,19 @@ mod tests {
         assert_eq!(mgr.status(t2_xid), XidStatus::Aborted);
         assert!(mgr.is_aborted(t2_xid));
         assert!(!mgr.is_committed(t2_xid));
+    }
+
+    #[test]
+    fn recover_aborted_restores_terminal_status_and_advances_allocator() {
+        let mgr = TransactionManager::new();
+        let xid = Xid::new(10);
+
+        mgr.recover_aborted(xid);
+        let next = mgr.begin(IsolationLevel::ReadCommitted);
+
+        assert_eq!(mgr.status(xid), XidStatus::Aborted);
+        assert_eq!(next.xid, Xid::new(11));
+        assert!(!next.snapshot.xip.contains(&xid));
     }
 
     #[test]

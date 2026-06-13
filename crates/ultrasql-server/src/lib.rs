@@ -7293,8 +7293,10 @@ impl Server {
         let wal_dir = data_dir.join("pg_wal");
         ultrasql_wal::recover(&wal_dir, |record| {
             self.txn_manager.recover_observed_xid(record.header.xid);
-            if record.header.record_type == RecordType::Commit {
-                self.txn_manager.recover_committed(record.header.xid);
+            match record.header.record_type {
+                RecordType::Commit => self.txn_manager.recover_committed(record.header.xid),
+                RecordType::Abort => self.txn_manager.recover_aborted(record.header.xid),
+                _ => {}
             }
             Ok(())
         })

@@ -4,10 +4,11 @@ use std::fs;
 use std::sync::Arc;
 
 use ultrasql_core::{BlockNumber, Lsn, PageId, RelationId, Xid};
+use ultrasql_mvcc::{XidStatus, XidStatusOracle};
 use ultrasql_storage::buffer_pool::{BufferPool, PageLoader};
 use ultrasql_storage::heap::HeapAccess;
 use ultrasql_storage::page::Page;
-use ultrasql_wal::payload::{SequenceOpKind, SequenceOpPayload};
+use ultrasql_wal::payload::{AbortPayload, SequenceOpKind, SequenceOpPayload};
 use ultrasql_wal::{HeapTarget, RecordType, WalRecord};
 
 #[cfg(unix)]
@@ -281,6 +282,26 @@ fn persistent_server_can_force_commit_marker_durable() {
         .runtime_wal_flushed_lsn()
         .expect("persistent server must own a WAL writer");
     assert!(flushed_lsn.raw() >= commit_lsn.raw());
+}
+
+#[test]
+fn server_init_restores_aborted_xids_from_wal() {
+    let data_dir = tempfile::TempDir::new().unwrap();
+    let wal_dir = data_dir.path().join("pg_wal");
+    fs::create_dir_all(&wal_dir).unwrap();
+    let xid = Xid::new(42);
+    let payload = AbortPayload {
+        abort_lsn: Lsn::new(100),
+    };
+    let record = WalRecord::new(RecordType::Abort, xid, Lsn::ZERO, 0, payload.encode())
+        .expect("test WAL abort record should fit size limits");
+    fs::write(wal_dir.join("segment_0000000000"), record.encode()).unwrap();
+    #[cfg(unix)]
+    make_data_dir_private(data_dir.path());
+
+    let server = Server::init(data_dir.path()).unwrap();
+
+    assert_eq!(server.txn_manager.status(xid), XidStatus::Aborted);
 }
 
 #[test]
