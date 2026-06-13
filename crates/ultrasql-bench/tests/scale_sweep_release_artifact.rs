@@ -47,18 +47,20 @@ fn scale_sweep_script_uses_external_release_artifact() {
 }
 
 #[test]
-fn release_sweep_workflow_pins_manifest_release_version() {
+fn scale_sweep_workflow_benchmarks_current_commit_binary() {
     let workflow = repo_file(".github/workflows/bench.yml");
 
-    assert!(workflow.contains("id: package-version"));
-    assert!(workflow.contains("cargo metadata --no-deps --format-version 1"));
+    assert!(workflow.contains("name: build current ultrasqld"));
     assert!(
-        workflow
-            .contains(r#"ULTRASQL_RELEASE_VERSION: v${{ steps.package-version.outputs.version }}"#)
+        workflow.contains(
+            "cargo build --profile release-ship --package ultrasql-server --bin ultrasqld"
+        )
     );
+    assert!(workflow.contains(r#"ULTRASQLD_BIN="target/release-ship/ultrasqld""#));
     assert!(
-        !workflow.contains("run: benchmarks/run_scale_sweep.sh quick"),
-        "release sweep must not install a mutable latest release"
+        !workflow
+            .contains(r#"ULTRASQL_RELEASE_VERSION: v${{ steps.package-version.outputs.version }}"#),
+        "bench workflow must not gate current source on a stale published release"
     );
 }
 
@@ -69,7 +71,7 @@ fn release_sweep_workflow_enables_clickhouse_comparison() {
     assert!(workflow.contains("brew install duckdb sqlite postgresql@14 clickhouse"));
     assert!(workflow.contains(r#"python3 -m venv "$RUNNER_TEMP/clickhouse-driver-venv""#));
     assert!(workflow.contains(
-        r#""$RUNNER_TEMP/clickhouse-driver-venv/bin/python" -m pip install --disable-pip-version-check clickhouse-driver"#
+        r#""$RUNNER_TEMP/clickhouse-driver-venv/bin/python" -m pip install --disable-pip-version-check clickhouse-driver duckdb"#
     ));
     assert!(
         workflow.contains(r#"echo "$RUNNER_TEMP/clickhouse-driver-venv/bin" >> "$GITHUB_PATH""#)

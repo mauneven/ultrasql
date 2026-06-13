@@ -62,9 +62,9 @@ fn ci_bench_uses_pr_smoke_and_scheduled_full_certifications() {
         "if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'"
     ));
     assert!(workflow.contains("benchmarks/certify.sh full"));
-    assert!(workflow.contains("name: release artifact scale sweep"));
+    assert!(workflow.contains("name: current commit scale sweep"));
     assert!(workflow.contains("benchmarks/run_scale_sweep.sh quick"));
-    assert!(workflow.contains("release-artifact-scale-sweep"));
+    assert!(workflow.contains("current-commit-scale-sweep"));
 }
 
 #[test]

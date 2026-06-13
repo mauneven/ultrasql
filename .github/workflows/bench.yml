@@ -122,13 +122,13 @@ jobs:
             benchmarks/results/latest/raw/
 
   # -------------------------------------------------------------------
-  # Release-artifact scale sweep. This proves the published archive can be
-  # installed, launched as ultrasqld, and benchmarked over TCP against local
-  # installed engines. It is not a PR gate because it depends on the latest
-  # GitHub Release and package-manager setup.
+  # Current-commit scale sweep. This proves the checked-out ultrasqld can be
+  # launched over TCP and benchmarked against local installed engines. It is
+  # not a PR gate because package-manager setup and full DB-vs-DB sweeps are
+  # noisy on shared runners.
   # -------------------------------------------------------------------
-  release-artifact-sweep:
-    name: release artifact scale sweep
+  current-commit-sweep:
+    name: current commit scale sweep
     runs-on: macos-14
     if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
     timeout-minutes: 90
@@ -142,9 +142,12 @@ jobs:
           brew update
           brew install duckdb sqlite postgresql@14 clickhouse
           python3 -m venv "$RUNNER_TEMP/clickhouse-driver-venv"
-          "$RUNNER_TEMP/clickhouse-driver-venv/bin/python" -m pip install --disable-pip-version-check clickhouse-driver
+          "$RUNNER_TEMP/clickhouse-driver-venv/bin/python" -m pip install --disable-pip-version-check clickhouse-driver duckdb
           echo "$RUNNER_TEMP/clickhouse-driver-venv/bin" >> "$GITHUB_PATH"
           echo "$(brew --prefix postgresql@14)/bin" >> "$GITHUB_PATH"
+      - name: build current ultrasqld
+        shell: bash
+        run: cargo build --profile release-ship --package ultrasql-server --bin ultrasqld
       - name: start PostgreSQL
         shell: bash
         run: |
@@ -153,16 +156,7 @@ jobs:
           "$pg_bin/initdb" -D "$data" --username runner >/dev/null
           "$pg_bin/pg_ctl" -D "$data" -o "-h 127.0.0.1 -p 55432" -w start
           createdb -h 127.0.0.1 -p 55432 -U runner ultrasql_bench
-      - name: resolve package version
-        id: package-version
-        shell: bash
-        run: |
-          version="$(
-            cargo metadata --no-deps --format-version 1 \
-              | python3 -c 'import json, sys; data = json.load(sys.stdin); print(next(p["version"] for p in data["packages"] if p["name"] == "ultrasql-server"))'
-          )"
-          echo "version=${version}" >> "$GITHUB_OUTPUT"
-      - name: run release artifact scale sweep
+      - name: run current commit scale sweep
         shell: bash
         env:
           PGHOST: 127.0.0.1
@@ -170,12 +164,11 @@ jobs:
           PGUSER: runner
           PGDATABASE: ultrasql_bench
           SCALE_SWEEP_ROWS: "10000 100000"
-          ULTRASQL_RELEASE_VERSION: v${{ steps.package-version.outputs.version }}
         run: |
-          CH_BIN="$(command -v clickhouse)" benchmarks/run_scale_sweep.sh quick
+          ULTRASQLD_BIN="target/release-ship/ultrasqld" CH_BIN="$(command -v clickhouse)" benchmarks/run_scale_sweep.sh quick
       - name: upload scale sweep artifacts
         if: always()
         uses: actions/upload-artifact@v7
         with:
-          name: release-artifact-scale-sweep
+          name: current-commit-scale-sweep
           path: benchmarks/results/latest/scale-sweep/
