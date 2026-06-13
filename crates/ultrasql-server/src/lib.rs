@@ -130,8 +130,9 @@ use ultrasql_vec::kernels::{
 use ultrasql_wal::applier::{ApplyError, HeapTarget};
 use ultrasql_wal::payload::{
     AbortPayload, BTreeOpPayload, CheckpointPayload, CommitPayload, FullPageWritePayload,
-    HeapDeleteInPlacePayload, HeapDeletePayload, HeapInsertPayload, HeapUpdateInPlacePayload,
-    HeapUpdatePayload, SequenceOpKind, SequenceOpPayload,
+    HeapDeleteInPlaceBatchPayload, HeapDeleteInPlacePayload, HeapDeletePayload, HeapInsertPayload,
+    HeapUpdateInPlaceBatchPayload, HeapUpdateInPlacePayload, HeapUpdatePayload, SequenceOpKind,
+    SequenceOpPayload,
 };
 use ultrasql_wal::{RecordType, WalRecord};
 
@@ -2423,8 +2424,22 @@ impl HeapTarget for ServerRecoveryTarget {
         HeapTarget::apply_update_in_place(self.heap.as_ref(), payload)
     }
 
+    fn apply_update_in_place_batch(
+        &self,
+        payload: &HeapUpdateInPlaceBatchPayload,
+    ) -> Result<(), ApplyError> {
+        HeapTarget::apply_update_in_place_batch(self.heap.as_ref(), payload)
+    }
+
     fn apply_delete_in_place(&self, payload: &HeapDeleteInPlacePayload) -> Result<(), ApplyError> {
         HeapTarget::apply_delete_in_place(self.heap.as_ref(), payload)
+    }
+
+    fn apply_delete_in_place_batch(
+        &self,
+        payload: &HeapDeleteInPlaceBatchPayload,
+    ) -> Result<(), ApplyError> {
+        HeapTarget::apply_delete_in_place_batch(self.heap.as_ref(), payload)
     }
 
     fn apply_full_page_write(&self, payload: &FullPageWritePayload) -> Result<(), ApplyError> {

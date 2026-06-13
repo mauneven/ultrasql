@@ -877,6 +877,172 @@ impl HeapDeleteInPlacePayload {
 }
 
 // ---------------------------------------------------------------------------
+// HeapDeleteInPlaceBatchPayload
+// ---------------------------------------------------------------------------
+
+/// One slot stamp inside a page-batched in-place DELETE WAL record.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HeapDeleteInPlaceBatchEntry {
+    /// Slot number within [`HeapDeleteInPlaceBatchPayload::page`].
+    pub slot: u16,
+}
+
+/// Payload for a `RecordType::HeapDeleteInPlaceBatch` WAL record.
+///
+/// Groups all in-place delete stamps that touch the same heap page into a
+/// single WAL record. The durability contract matches
+/// [`HeapUpdateInPlaceBatchPayload`]: the page LSN is stamped with this
+/// record's LSN after append, so recovery either replays every slot stamp in
+/// the batch or skips an already-flushed page image.
+///
+/// Wire layout (little-endian):
+/// ```text
+///  0   8   page (PageId)
+///  8   8   xmax (u64)
+/// 16   4   cmax (u32)
+/// 20   4   reserved (zero)
+/// 24   4   entry_count (u32)
+/// 28  ..   repeated entries: slot (u16), reserved (u16)
+/// ```
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HeapDeleteInPlaceBatchPayload {
+    /// Heap page containing every slot in [`Self::entries`].
+    pub page: PageId,
+    /// Transaction that performed the delete.
+    pub xmax: Xid,
+    /// Command within `xmax` that performed the delete.
+    pub cmax: CommandId,
+    /// Slots stamped on `page`, in ascending slot order.
+    pub entries: Vec<HeapDeleteInPlaceBatchEntry>,
+}
+
+impl HeapDeleteInPlaceBatchPayload {
+    const FIXED: usize = PAGE_ID_SIZE + 8 + 4 + 4 + 4;
+    const ENTRY_SIZE: usize = 4;
+
+    /// Encode this payload into a freshly-allocated byte vector.
+    pub fn encode(&self) -> Result<Vec<u8>, PayloadError> {
+        let entry_count = u32::try_from(self.entries.len()).map_err(|_| {
+            PayloadError::Malformed("heap_delete_in_place_batch entry_count overflow")
+        })?;
+        let entries_len =
+            self.entries
+                .len()
+                .checked_mul(Self::ENTRY_SIZE)
+                .ok_or(PayloadError::Malformed(
+                    "heap_delete_in_place_batch length overflow",
+                ))?;
+        let total = checked_len_sum(
+            &[Self::FIXED, entries_len],
+            "heap_delete_in_place_batch length overflow",
+        )?;
+        if total > MAX_VARIABLE_PAYLOAD_BYTES {
+            return Err(PayloadError::Malformed(
+                "heap_delete_in_place_batch length exceeds ceiling",
+            ));
+        }
+
+        let mut out = vec![0_u8; total];
+        let mut page_buf = [0_u8; PAGE_ID_SIZE];
+        encode_page_id(&mut page_buf, self.page);
+        out[..PAGE_ID_SIZE].copy_from_slice(&page_buf);
+        write_u64_le(&mut out[PAGE_ID_SIZE..PAGE_ID_SIZE + 8], self.xmax.raw());
+        write_u32_le(
+            &mut out[PAGE_ID_SIZE + 8..PAGE_ID_SIZE + 12],
+            self.cmax.raw(),
+        );
+        write_u32_le(&mut out[PAGE_ID_SIZE + 12..PAGE_ID_SIZE + 16], 0);
+        write_u32_le(&mut out[PAGE_ID_SIZE + 16..Self::FIXED], entry_count);
+
+        let mut off = Self::FIXED;
+        for entry in &self.entries {
+            let slot_end = checked_offset(off, 2, "heap_delete_in_place_batch length overflow")?;
+            write_u16_le(&mut out[off..slot_end], entry.slot);
+            let reserved_end =
+                checked_offset(slot_end, 2, "heap_delete_in_place_batch length overflow")?;
+            write_u16_le(&mut out[slot_end..reserved_end], 0);
+            off = reserved_end;
+        }
+        Ok(out)
+    }
+
+    /// Decode a `HeapDeleteInPlaceBatchPayload` from a byte slice.
+    pub fn decode(bytes: &[u8]) -> Result<Self, PayloadError> {
+        if bytes.len() < Self::FIXED {
+            return Err(PayloadError::Truncated {
+                needed: Self::FIXED,
+                have: bytes.len(),
+            });
+        }
+        let page = decode_page_id(bytes)?;
+        let xmax = Xid::new(
+            read_u64_le(&bytes[PAGE_ID_SIZE..PAGE_ID_SIZE + 8])
+                .map_err(|_| PayloadError::Malformed("heap_delete_in_place_batch xmax"))?,
+        );
+        let cmax = CommandId::new(
+            read_u32_le(&bytes[PAGE_ID_SIZE + 8..PAGE_ID_SIZE + 12])
+                .map_err(|_| PayloadError::Malformed("heap_delete_in_place_batch cmax"))?,
+        );
+        let reserved = read_u32_le(&bytes[PAGE_ID_SIZE + 12..PAGE_ID_SIZE + 16])
+            .map_err(|_| PayloadError::Malformed("heap_delete_in_place_batch reserved"))?;
+        if reserved != 0 {
+            return Err(PayloadError::Malformed(
+                "heap_delete_in_place_batch reserved bits set",
+            ));
+        }
+        let entry_count = usize::try_from(
+            read_u32_le(&bytes[PAGE_ID_SIZE + 16..Self::FIXED])
+                .map_err(|_| PayloadError::Malformed("heap_delete_in_place_batch entry_count"))?,
+        )
+        .map_err(|_| PayloadError::Malformed("heap_delete_in_place_batch entry_count usize"))?;
+        let entries_len =
+            entry_count
+                .checked_mul(Self::ENTRY_SIZE)
+                .ok_or(PayloadError::Malformed(
+                    "heap_delete_in_place_batch length overflow",
+                ))?;
+        let needed = checked_len_sum(
+            &[Self::FIXED, entries_len],
+            "heap_delete_in_place_batch length overflow",
+        )?;
+        if bytes.len() < needed {
+            return Err(PayloadError::Truncated {
+                needed,
+                have: bytes.len(),
+            });
+        }
+        require_exact_len(bytes, needed)?;
+
+        let mut entries = Vec::with_capacity(entry_count);
+        let mut off = Self::FIXED;
+        for _ in 0..entry_count {
+            let slot_end = checked_offset(off, 2, "heap_delete_in_place_batch length overflow")?;
+            let slot = read_u16_le(&bytes[off..slot_end])
+                .map_err(|_| PayloadError::Malformed("heap_delete_in_place_batch slot"))?;
+            let reserved_end =
+                checked_offset(slot_end, 2, "heap_delete_in_place_batch length overflow")?;
+            let entry_reserved = read_u16_le(&bytes[slot_end..reserved_end]).map_err(|_| {
+                PayloadError::Malformed("heap_delete_in_place_batch entry reserved")
+            })?;
+            if entry_reserved != 0 {
+                return Err(PayloadError::Malformed(
+                    "heap_delete_in_place_batch entry reserved bits set",
+                ));
+            }
+            entries.push(HeapDeleteInPlaceBatchEntry { slot });
+            off = reserved_end;
+        }
+
+        Ok(Self {
+            page,
+            xmax,
+            cmax,
+            entries,
+        })
+    }
+}
+
+// ---------------------------------------------------------------------------
 // HeapDeletePayload
 // ---------------------------------------------------------------------------
 
@@ -2402,6 +2568,18 @@ mod tests {
         );
 
         assert_trailing_rejected(
+            HeapDeleteInPlaceBatchPayload {
+                page: page_id(1, 2),
+                xmax: Xid::new(11),
+                cmax: CommandId::new(2),
+                entries: vec![HeapDeleteInPlaceBatchEntry { slot: 3 }],
+            }
+            .encode()
+            .expect("encode"),
+            HeapDeleteInPlaceBatchPayload::decode,
+        );
+
+        assert_trailing_rejected(
             CommitPayload {
                 commit_lsn: Lsn::new(123),
                 commit_timestamp_micros: 456,
@@ -2643,6 +2821,23 @@ mod tests {
         };
         assert_eq!(
             HeapUpdateInPlaceBatchPayload::decode(&p.encode().unwrap()).unwrap(),
+            p
+        );
+    }
+
+    #[test]
+    fn heap_delete_in_place_batch_round_trip_two_slots() {
+        let p = HeapDeleteInPlaceBatchPayload {
+            page: page_id(9, 3),
+            xmax: Xid::new(77),
+            cmax: CommandId::new(4),
+            entries: vec![
+                HeapDeleteInPlaceBatchEntry { slot: 1 },
+                HeapDeleteInPlaceBatchEntry { slot: 2 },
+            ],
+        };
+        assert_eq!(
+            HeapDeleteInPlaceBatchPayload::decode(&p.encode().unwrap()).unwrap(),
             p
         );
     }

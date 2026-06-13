@@ -420,11 +420,12 @@ impl<L: PageLoader> HeapAccess<L> {
     ///
     /// # Durability
     ///
-    /// When `wal` is `Some`, per-row [`RecordType::HeapDeleteInPlace`]
-    /// records are appended after the page guard is dropped and the
-    /// page LSN is stamped with the last assigned LSN, mirroring the
-    /// FPW + per-row + page-LSN pattern in
-    /// [`Self::update_int32_pair_inplace_undo`]. A `None` value
+    /// When `wal` is `Some`, one
+    /// [`RecordType::HeapDeleteInPlaceBatch`] record is appended per
+    /// mutated page after the page guard is dropped and the page LSN is
+    /// stamped with that batch LSN, mirroring the FPW + page-batch +
+    /// page-LSN pattern in [`Self::update_int32_pair_inplace_undo`].
+    /// A `None` value
     /// retains the non-durable benchmark path for the executor's
     /// fused operator (the pipeline lowerer threads the live sink in
     /// when present).
@@ -456,10 +457,10 @@ impl<L: PageLoader> HeapAccess<L> {
         let xid_bytes = xid.raw().to_le_bytes();
         let cmd_bytes = command_id.raw().to_le_bytes();
 
-        // Per-page TID scratch: collect under the write guard, emit
+        // Per-page slot scratch: collect under the write guard, emit
         // WAL once the guard is dropped, same shape as the update
         // path. Reused across pages.
-        let mut wal_scratch: Vec<TupleId> = if wal.is_some() {
+        let mut wal_scratch: Vec<u16> = if wal.is_some() {
             Vec::with_capacity(256)
         } else {
             Vec::new()
@@ -571,7 +572,7 @@ impl<L: PageLoader> HeapAccess<L> {
                 src_bytes[offset + 24..offset + 26].copy_from_slice(&new_infomask.to_le_bytes());
 
                 if wal.is_some() {
-                    wal_scratch.push(TupleId::new(src_page_id, src_slot));
+                    wal_scratch.push(src_slot);
                 }
 
                 total_deleted += 1;
@@ -581,19 +582,21 @@ impl<L: PageLoader> HeapAccess<L> {
             drop(src_page);
             drop(src_guard);
 
-            // Emit one WAL record per stamped slot with the page guard
-            // dropped. Stamp the page LSN with the last assigned LSN
-            // so recovery's redo-skip check covers every record on
-            // this page.
+            // Emit one WAL record for every stamped slot on this page
+            // with the page guard dropped. Stamp the page LSN with the
+            // batch LSN so recovery's redo-skip check covers the whole
+            // page-local mutation.
             if let Some(sink) = wal {
-                let mut last_lsn = ultrasql_core::Lsn::ZERO;
-                for tid in wal_scratch.iter().copied() {
-                    let lsn =
-                        Self::emit_delete_in_place_wal(&self.pool, sink, tid, xid, command_id)?;
-                    last_lsn = lsn;
-                }
                 if !wal_scratch.is_empty() {
-                    Self::stamp_page_lsn(&self.pool, src_page_id, last_lsn)?;
+                    let lsn = Self::emit_delete_in_place_batch_wal(
+                        &self.pool,
+                        sink,
+                        src_page_id,
+                        xid,
+                        command_id,
+                        &wal_scratch,
+                    )?;
+                    Self::stamp_page_lsn(&self.pool, src_page_id, lsn)?;
                 }
                 wal_scratch.clear();
             }

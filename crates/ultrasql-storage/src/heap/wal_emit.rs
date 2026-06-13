@@ -12,8 +12,9 @@ use ultrasql_core::{CommandId, Lsn, PageId, TupleId, Xid};
 use ultrasql_mvcc::tuple_header::TUPLE_HEADER_SIZE;
 use ultrasql_wal::WalRecord;
 use ultrasql_wal::payload::{
-    FullPageWritePayload, HeapDeleteInPlacePayload, HeapInsertPayload, HeapUpdateInPlaceBatchEntry,
-    HeapUpdateInPlaceBatchPayload, HeapUpdateInPlacePayload, HeapUpdatePayload,
+    FullPageWritePayload, HeapDeleteInPlaceBatchEntry, HeapDeleteInPlaceBatchPayload,
+    HeapInsertPayload, HeapUpdateInPlaceBatchEntry, HeapUpdateInPlaceBatchPayload,
+    HeapUpdateInPlacePayload, HeapUpdatePayload,
 };
 use ultrasql_wal::record::RecordType;
 
@@ -341,23 +342,36 @@ impl<L: PageLoader> HeapAccess<L> {
         Ok(lsn)
     }
 
-    /// Emit a `RecordType::HeapDeleteInPlace` WAL record covering one
-    /// row stamped dead by the single-pass `delete_int32_pair_inplace`
-    /// path. Same semantics as the classical
-    /// `RecordType::HeapDelete` record (xmax / cmax stamp) but kept
-    /// as a distinct type so VACUUM / recovery telemetry can branch
-    /// on path origin.
-    pub(super) fn emit_delete_in_place_wal(
+    /// Emit one page-level in-place DELETE record covering every slot
+    /// stamped on `page_id`.
+    ///
+    /// The caller mutates one source page under one write guard, drops
+    /// the guard, appends this WAL record, then stamps the page with
+    /// the returned LSN. This preserves the same FPW + redo-skip
+    /// contract as the per-row record while avoiding one WAL append
+    /// per tuple on bulk deletes.
+    pub(super) fn emit_delete_in_place_batch_wal(
         pool: &Arc<BufferPool<L>>,
         sink: &dyn WalSink,
-        tid: TupleId,
+        page_id: PageId,
         xmax: Xid,
         cmax: CommandId,
+        slots: &[u16],
     ) -> Result<Lsn, HeapError> {
         let prev_lsn = sink.last_lsn_for(xmax);
-        let payload_bytes = HeapDeleteInPlacePayload { tid, xmax, cmax }.encode()?;
+        let entries = slots
+            .iter()
+            .map(|slot| HeapDeleteInPlaceBatchEntry { slot: *slot })
+            .collect();
+        let payload_bytes = HeapDeleteInPlaceBatchPayload {
+            page: page_id,
+            xmax,
+            cmax,
+            entries,
+        }
+        .encode()?;
         let record = WalRecord::new(
-            RecordType::HeapDeleteInPlace,
+            RecordType::HeapDeleteInPlaceBatch,
             xmax,
             prev_lsn,
             0,

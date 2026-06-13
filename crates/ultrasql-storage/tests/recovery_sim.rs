@@ -562,9 +562,9 @@ fn crash_recovery_in_place_delete_stamps_xmax() {
     assert!(
         records.iter().any(|(_, r)| matches!(
             r.header.record_type,
-            ultrasql_wal::record::RecordType::HeapDeleteInPlace
+            ultrasql_wal::record::RecordType::HeapDeleteInPlaceBatch
         )),
-        "WAL must contain at least one HeapDeleteInPlace record"
+        "WAL must contain at least one HeapDeleteInPlaceBatch record"
     );
 
     let recovery_heap = make_persistent_heap(loader::MapLoader::new());

@@ -34,8 +34,9 @@ use ultrasql_mvcc::TupleHeader;
 use ultrasql_mvcc::tuple_header::{InfoMask, TUPLE_HEADER_SIZE};
 use ultrasql_wal::applier::{ApplyError, HeapTarget};
 use ultrasql_wal::payload::{
-    BTreeOpKind, BTreeOpPayload, FullPageWritePayload, HeapDeleteInPlacePayload, HeapDeletePayload,
-    HeapInsertPayload, HeapUpdateInPlaceBatchPayload, HeapUpdateInPlacePayload, HeapUpdatePayload,
+    BTreeOpKind, BTreeOpPayload, FullPageWritePayload, HeapDeleteInPlaceBatchPayload,
+    HeapDeleteInPlacePayload, HeapDeletePayload, HeapInsertPayload, HeapUpdateInPlaceBatchPayload,
+    HeapUpdateInPlacePayload, HeapUpdatePayload,
 };
 
 use crate::btree::{BTree, BTreeError};
@@ -631,6 +632,79 @@ impl<L: PageLoader + 'static> HeapTarget for HeapAccess<L> {
         }
 
         self.column_cache.bump_version(page_id.relation);
+        Ok(())
+    }
+
+    fn apply_delete_in_place_batch(
+        &self,
+        payload: &HeapDeleteInPlaceBatchPayload,
+    ) -> Result<(), ApplyError> {
+        self.apply_delete_in_place_batch_at_lsn(payload, Lsn::ZERO)
+    }
+
+    fn apply_delete_in_place_batch_at_lsn(
+        &self,
+        payload: &HeapDeleteInPlaceBatchPayload,
+        record_lsn: Lsn,
+    ) -> Result<(), ApplyError> {
+        let page_id = payload.page;
+        self.advance_counter(page_id.relation, page_id.block)?;
+        let mut applied = false;
+
+        {
+            let guard = self
+                .pool
+                .get_page(page_id)
+                .map_err(|e| ApplyError::Refused {
+                    operation: "heap_delete_in_place_batch",
+                    detail: format!("buffer pool: {e}"),
+                })?;
+            let mut page = guard.write();
+            if should_skip_redo(&page, record_lsn) {
+                return Ok(());
+            }
+
+            for entry in &payload.entries {
+                let existing = page
+                    .read_tuple(entry.slot)
+                    .map_err(|e| ApplyError::Refused {
+                        operation: "heap_delete_in_place_batch",
+                        detail: format!("read slot: {e}"),
+                    })?;
+                if existing.len() < TUPLE_HEADER_SIZE {
+                    return Err(ApplyError::Refused {
+                        operation: "heap_delete_in_place_batch",
+                        detail: String::from("slot shorter than tuple header"),
+                    });
+                }
+                let (mut hdr, _) =
+                    TupleHeader::decode(&existing[..TUPLE_HEADER_SIZE]).ok_or_else(|| {
+                        ApplyError::Refused {
+                            operation: "heap_delete_in_place_batch",
+                            detail: String::from("header decode failed"),
+                        }
+                    })?;
+                if hdr.xmax == payload.xmax {
+                    continue;
+                }
+
+                hdr.mark_deleted(payload.xmax, payload.cmax);
+                let mut hdr_bytes = [0_u8; TUPLE_HEADER_SIZE];
+                hdr.encode(&mut hdr_bytes);
+
+                let page_bytes = page.as_bytes_mut();
+                let item =
+                    item_id_from_page_bytes(page_bytes, entry.slot, "heap_delete_in_place_batch")?;
+                let slot_off = item_offset_usize(item, "heap_delete_in_place_batch")?;
+                page_bytes[slot_off..slot_off + TUPLE_HEADER_SIZE].copy_from_slice(&hdr_bytes);
+                applied = true;
+            }
+            stamp_replayed_lsn(&mut page, record_lsn);
+        }
+
+        if applied {
+            self.column_cache.bump_version(page_id.relation);
+        }
         Ok(())
     }
 

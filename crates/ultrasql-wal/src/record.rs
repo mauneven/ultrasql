@@ -136,6 +136,8 @@ pub enum RecordType {
     IvfFlatOp = 14,
     /// Multiple in-place tuple payload rewrites on one heap page.
     HeapUpdateInPlaceBatch = 15,
+    /// Multiple in-place tuple delete stamps on one heap page.
+    HeapDeleteInPlaceBatch = 16,
     /// A no-op marker (used to round records up to alignment
     /// boundaries; ignored on replay).
     Nop = 255,
@@ -160,6 +162,7 @@ impl RecordType {
             13 => Self::HnswOp,
             14 => Self::IvfFlatOp,
             15 => Self::HeapUpdateInPlaceBatch,
+            16 => Self::HeapDeleteInPlaceBatch,
             255 => Self::Nop,
             other => return Err(WalRecordError::UnknownType(other)),
         })
@@ -184,6 +187,7 @@ impl From<RecordType> for u8 {
             RecordType::HnswOp => 13,
             RecordType::IvfFlatOp => 14,
             RecordType::HeapUpdateInPlaceBatch => 15,
+            RecordType::HeapDeleteInPlaceBatch => 16,
             RecordType::Nop => 255,
         }
     }
@@ -507,6 +511,7 @@ mod tests {
             RecordType::HnswOp,
             RecordType::IvfFlatOp,
             RecordType::HeapUpdateInPlaceBatch,
+            RecordType::HeapDeleteInPlaceBatch,
             RecordType::Nop,
         ] {
             let raw = u8::from(rt);

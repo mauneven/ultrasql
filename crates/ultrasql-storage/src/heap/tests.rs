@@ -1331,8 +1331,8 @@ mod wal_emission {
     use ultrasql_core::{CommandId, Lsn, Xid};
     use ultrasql_wal::WalRecord;
     use ultrasql_wal::payload::{
-        HEAP_UPDATE_HOT, HeapDeletePayload, HeapInsertPayload, HeapUpdateInPlaceBatchPayload,
-        HeapUpdatePayload,
+        HEAP_UPDATE_HOT, HeapDeleteInPlaceBatchPayload, HeapDeletePayload, HeapInsertPayload,
+        HeapUpdateInPlaceBatchPayload, HeapUpdatePayload,
     };
     use ultrasql_wal::record::RecordType;
 
@@ -1691,6 +1691,56 @@ mod wal_emission {
         assert_eq!(payload.page, PageId::new(rel(), BlockNumber::new(0)));
         assert_eq!(payload.writer_xid, Xid::new(20));
         assert_eq!(payload.command_id, CommandId::FIRST);
+        assert_eq!(payload.entries.len(), 3);
+    }
+
+    #[test]
+    fn inplace_int32_delete_emits_one_batch_record_per_page() {
+        let (heap, sink) = make_heap_with_sink(8);
+        for id in 0_i32..3 {
+            heap.insert(rel(), &int32_pair_payload(id, id * 10), opts(10))
+                .unwrap();
+        }
+
+        let oracle = MapOracle::new();
+        oracle.set_committed(Xid::new(10));
+        let snapshot = Snapshot::new(
+            Xid::new(10),
+            Xid::new(100),
+            Xid::new(20),
+            CommandId::FIRST,
+            std::iter::empty(),
+        );
+        let deleted = heap
+            .delete_int32_pair_inplace(
+                DeleteInt32PairScan {
+                    rel: rel(),
+                    block_count: heap.block_count(rel()),
+                    snapshot: &snapshot,
+                    oracle: &oracle,
+                    predicate: |_id, _val| true,
+                },
+                DeleteInt32PairStamp {
+                    xid: Xid::new(20),
+                    command_id: CommandId::FIRST,
+                },
+                Some(sink.as_ref()),
+                None,
+            )
+            .unwrap();
+
+        assert_eq!(deleted, 3);
+        assert_eq!(sink.len(), 1, "one page should emit one batch record");
+        let records = sink.records();
+        let (_lsn, record) = &records[0];
+        assert_eq!(
+            record.header.record_type,
+            RecordType::HeapDeleteInPlaceBatch
+        );
+        let payload = HeapDeleteInPlaceBatchPayload::decode(&record.payload).unwrap();
+        assert_eq!(payload.page, PageId::new(rel(), BlockNumber::new(0)));
+        assert_eq!(payload.xmax, Xid::new(20));
+        assert_eq!(payload.cmax, CommandId::FIRST);
         assert_eq!(payload.entries.len(), 3);
     }
 

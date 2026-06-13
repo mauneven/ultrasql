@@ -14,9 +14,9 @@
 
 use crate::payload::{
     AbortPayload, BTreeOpPayload, CheckpointPayload, CommitPayload, FullPageWritePayload,
-    HashOpPayload, HeapDeleteInPlacePayload, HeapDeletePayload, HeapInsertPayload,
-    HeapUpdateInPlaceBatchPayload, HeapUpdateInPlacePayload, HeapUpdatePayload, HnswOpPayload,
-    IvfFlatOpPayload, PayloadError, SequenceOpPayload,
+    HashOpPayload, HeapDeleteInPlaceBatchPayload, HeapDeleteInPlacePayload, HeapDeletePayload,
+    HeapInsertPayload, HeapUpdateInPlaceBatchPayload, HeapUpdateInPlacePayload, HeapUpdatePayload,
+    HnswOpPayload, IvfFlatOpPayload, PayloadError, SequenceOpPayload,
 };
 use crate::record::{RecordType, WalRecord};
 use crate::recovery::RecoveryError;
@@ -193,6 +193,28 @@ pub trait HeapTarget: Send + Sync {
         self.apply_delete_in_place(payload)
     }
 
+    /// Apply a page-batched in-place delete record.
+    fn apply_delete_in_place_batch(
+        &self,
+        payload: &HeapDeleteInPlaceBatchPayload,
+    ) -> Result<(), ApplyError> {
+        let _ = payload;
+        Err(ApplyError::Refused {
+            operation: "heap_delete_in_place_batch",
+            detail: String::from("not implemented"),
+        })
+    }
+
+    /// Apply a page-batched in-place delete record at its WAL stream LSN.
+    fn apply_delete_in_place_batch_at_lsn(
+        &self,
+        payload: &HeapDeleteInPlaceBatchPayload,
+        record_lsn: Lsn,
+    ) -> Result<(), ApplyError> {
+        let _ = record_lsn;
+        self.apply_delete_in_place_batch(payload)
+    }
+
     /// Apply a full-page-write record by restoring the page image verbatim.
     fn apply_full_page_write(&self, payload: &FullPageWritePayload) -> Result<(), ApplyError> {
         let _ = payload;
@@ -346,6 +368,10 @@ pub fn dispatch_record_at_lsn(
             &HeapUpdateInPlaceBatchPayload::decode(bytes)?,
             record_lsn,
         ),
+        RecordType::HeapDeleteInPlaceBatch => target.apply_delete_in_place_batch_at_lsn(
+            &HeapDeleteInPlaceBatchPayload::decode(bytes)?,
+            record_lsn,
+        ),
         RecordType::HeapDeleteInPlace => target
             .apply_delete_in_place_at_lsn(&HeapDeleteInPlacePayload::decode(bytes)?, record_lsn),
         RecordType::FullPageWrite => {
@@ -432,8 +458,9 @@ mod tests {
     use crate::buffer::WalBuffer;
     use crate::payload::{
         AbortPayload, BTreeOpKind, BTreeOpPayload, CheckpointPayload, CommitPayload, HashOpKind,
-        HashOpPayload, HeapUpdateInPlaceBatchEntry, HeapUpdateInPlaceBatchPayload,
-        HeapUpdatePayload, SequenceOpKind, SequenceOpPayload,
+        HashOpPayload, HeapDeleteInPlaceBatchEntry, HeapDeleteInPlaceBatchPayload,
+        HeapUpdateInPlaceBatchEntry, HeapUpdateInPlaceBatchPayload, HeapUpdatePayload,
+        SequenceOpKind, SequenceOpPayload,
     };
     use crate::record::{RecordType, WalRecord, WalRecordError};
     use crate::writer::{WalWriter, WalWriterConfig};
@@ -448,6 +475,7 @@ mod tests {
         insert_lsns: Mutex<Vec<Lsn>>,
         updates: Mutex<Vec<HeapUpdatePayload>>,
         update_in_place_batches: Mutex<Vec<HeapUpdateInPlaceBatchPayload>>,
+        delete_in_place_batches: Mutex<Vec<HeapDeleteInPlaceBatchPayload>>,
         deletes: Mutex<Vec<HeapDeletePayload>>,
         btree_ops: Mutex<Vec<BTreeOpPayload>>,
         hash_ops: Mutex<Vec<HashOpPayload>>,
@@ -484,6 +512,14 @@ mod tests {
             p: &HeapUpdateInPlaceBatchPayload,
         ) -> Result<(), ApplyError> {
             self.update_in_place_batches.lock().push(p.clone());
+            Ok(())
+        }
+
+        fn apply_delete_in_place_batch(
+            &self,
+            p: &HeapDeleteInPlaceBatchPayload,
+        ) -> Result<(), ApplyError> {
+            self.delete_in_place_batches.lock().push(p.clone());
             Ok(())
         }
 
@@ -612,6 +648,19 @@ mod tests {
         );
         dispatch_record(&mock, &rec).unwrap();
 
+        // HeapDeleteInPlaceBatch
+        let delete_batch_payload = HeapDeleteInPlaceBatchPayload {
+            page: page_id(1, 0),
+            xmax: Xid::new(89),
+            cmax: CommandId::new(3),
+            entries: vec![HeapDeleteInPlaceBatchEntry { slot: 4 }],
+        };
+        let rec = make_record(
+            RecordType::HeapDeleteInPlaceBatch,
+            delete_batch_payload.encode().unwrap(),
+        );
+        dispatch_record(&mock, &rec).unwrap();
+
         // HeapDelete
         let delete_payload = HeapDeletePayload {
             tid: tid(2, 3, 7),
@@ -701,6 +750,7 @@ mod tests {
         assert_eq!(mock.inserts.lock().len(), 1);
         assert_eq!(mock.updates.lock().len(), 1);
         assert_eq!(mock.update_in_place_batches.lock().len(), 1);
+        assert_eq!(mock.delete_in_place_batches.lock().len(), 1);
         assert_eq!(mock.deletes.lock().len(), 1);
         assert_eq!(mock.btree_ops.lock().len(), 1);
         assert_eq!(mock.hash_ops.lock().len(), 1);
