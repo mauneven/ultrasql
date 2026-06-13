@@ -541,6 +541,23 @@ impl LogicalReplicationRuntime {
 }
 
 fn write_regular_text_file(path: &Path, body: &str) -> Result<(), ServerError> {
+    ensure_regular_metadata_write_slot(path)?;
+    let tmp = path.with_extension("meta.tmp");
+    ensure_regular_metadata_write_slot(&tmp)?;
+
+    let mut options = OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
+    let mut file = options.open(&tmp).map_err(ServerError::Io)?;
+    file.write_all(body.as_bytes()).map_err(ServerError::Io)?;
+    file.sync_all().map_err(ServerError::Io)?;
+    drop(file);
+    fs::rename(&tmp, path).map_err(ServerError::Io)?;
+    sync_metadata_parent(path)
+}
+
+fn ensure_regular_metadata_write_slot(path: &Path) -> Result<(), ServerError> {
     match fs::symlink_metadata(path) {
         Ok(metadata) if !metadata.file_type().is_file() => {
             return Err(ServerError::ddl(format!(
@@ -552,12 +569,29 @@ fn write_regular_text_file(path: &Path, body: &str) -> Result<(), ServerError> {
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
         Err(err) => return Err(ServerError::Io(err)),
     }
-    let mut options = OpenOptions::new();
-    options.write(true).create(true).truncate(true);
-    #[cfg(unix)]
-    options.custom_flags(libc::O_NOFOLLOW);
-    let mut file = options.open(path).map_err(ServerError::Io)?;
-    file.write_all(body.as_bytes()).map_err(ServerError::Io)
+    Ok(())
+}
+
+fn sync_metadata_parent(path: &Path) -> Result<(), ServerError> {
+    let Some(parent) = path.parent() else {
+        return Ok(());
+    };
+    sync_metadata_dir(parent)
+}
+
+#[cfg(unix)]
+fn sync_metadata_dir(path: &Path) -> Result<(), ServerError> {
+    let dir = File::open(path).map_err(ServerError::Io)?;
+    match dir.sync_all() {
+        Ok(()) => Ok(()),
+        Err(err) if err.kind() == ErrorKind::InvalidInput => Ok(()),
+        Err(err) => Err(ServerError::Io(err)),
+    }
+}
+
+#[cfg(not(unix))]
+fn sync_metadata_dir(_path: &Path) -> Result<(), ServerError> {
+    Ok(())
 }
 
 fn read_regular_text_file(path: &Path, context: &str) -> Result<String, ServerError> {
@@ -1429,6 +1463,37 @@ mod tests {
 
         assert!(outside_file.exists());
         assert!(runtime.publication("pub_events").is_some());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn logical_metadata_persist_rejects_symlinked_temp_file_without_truncating_target() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::TempDir::new().expect("metadata dir");
+        let publications = dir.path().join("publications");
+        fs::create_dir_all(&publications).expect("publications dir");
+        let metadata = metadata_path(&publications, "pub_events");
+        let outside = dir.path().join("outside.tmp");
+        fs::write(&metadata, "name=pub_events\ntables=events\n").expect("metadata");
+        fs::write(&outside, "keep").expect("outside");
+        symlink(&outside, metadata.with_extension("meta.tmp")).expect("temp symlink");
+
+        let err = write_regular_text_file(&metadata, "name=pub_events\ntables=audit\n")
+            .expect_err("symlinked temp metadata rejected");
+
+        assert!(
+            err.to_string().contains("non-regular metadata file"),
+            "unexpected error: {err}"
+        );
+        assert_eq!(
+            fs::read_to_string(&metadata).expect("metadata unchanged"),
+            "name=pub_events\ntables=events\n"
+        );
+        assert_eq!(
+            fs::read_to_string(&outside).expect("outside unchanged"),
+            "keep"
+        );
     }
 
     #[cfg(unix)]
