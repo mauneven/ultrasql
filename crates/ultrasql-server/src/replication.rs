@@ -433,8 +433,16 @@ impl LogicalReplicationRuntime {
             let path = entry.path();
             let text = read_regular_text_file(&path, "logical publication metadata file")?;
             let publication = parse_publication_metadata(&text)?;
-            self.publications
-                .insert(publication.name.clone(), publication);
+            let name = publication.name.clone();
+            if self
+                .publications
+                .insert(name.clone(), publication)
+                .is_some()
+            {
+                return Err(ServerError::ddl(format!(
+                    "duplicate logical publication metadata: {name}"
+                )));
+            }
         }
         for entry in fs::read_dir(&subscriptions_dir).map_err(ServerError::Io)? {
             let entry = entry.map_err(ServerError::Io)?;
@@ -444,8 +452,16 @@ impl LogicalReplicationRuntime {
             let path = entry.path();
             let text = read_regular_text_file(&path, "logical subscription metadata file")?;
             let subscription = parse_subscription_metadata(&text)?;
-            self.subscriptions
-                .insert(subscription.name.clone(), subscription);
+            let name = subscription.name.clone();
+            if self
+                .subscriptions
+                .insert(name.clone(), subscription)
+                .is_some()
+            {
+                return Err(ServerError::ddl(format!(
+                    "duplicate logical subscription metadata: {name}"
+                )));
+            }
         }
         let mut max_confirmed = 0_u64;
         for entry in fs::read_dir(&logical_slots_dir).map_err(ServerError::Io)? {
@@ -457,7 +473,12 @@ impl LogicalReplicationRuntime {
             let text = read_regular_text_file(&path, "logical slot metadata file")?;
             let slot = parse_logical_slot_metadata(&text)?;
             max_confirmed = max_confirmed.max(slot.confirmed_lsn);
-            self.logical_slots.insert(slot.name.clone(), slot);
+            let name = slot.name.clone();
+            if self.logical_slots.insert(name.clone(), slot).is_some() {
+                return Err(ServerError::ddl(format!(
+                    "duplicate logical slot metadata: {name}"
+                )));
+            }
         }
         let next_lsn = max_confirmed
             .checked_add(1)
@@ -1264,6 +1285,83 @@ mod tests {
 
         assert!(
             err.to_string().contains("malformed logical slot metadata"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn logical_metadata_rejects_duplicate_publication_files() {
+        let dir = tempfile::TempDir::new().expect("metadata dir");
+        let publications = dir.path().join("publications");
+        fs::create_dir_all(&publications).expect("publications dir");
+        fs::write(
+            metadata_path(&publications, "pub_events"),
+            "name=pub_events\ntables=events\n",
+        )
+        .expect("metadata");
+        fs::write(
+            publications.join("duplicate.meta"),
+            "name=pub_events\ntables=audit\n",
+        )
+        .expect("duplicate metadata");
+
+        let err = LogicalReplicationRuntime::open_metadata(dir.path())
+            .expect_err("duplicate publication metadata rejected");
+
+        assert!(
+            err.to_string()
+                .contains("duplicate logical publication metadata"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn logical_metadata_rejects_duplicate_subscription_files() {
+        let dir = tempfile::TempDir::new().expect("metadata dir");
+        let subscriptions = dir.path().join("subscriptions");
+        fs::create_dir_all(&subscriptions).expect("subscriptions dir");
+        fs::write(
+            metadata_path(&subscriptions, "sub_events"),
+            "name=sub_events\nconninfo=host=localhost\nslot_name=s1\npublications=pub_events\n",
+        )
+        .expect("metadata");
+        fs::write(
+            subscriptions.join("duplicate.meta"),
+            "name=sub_events\nconninfo=host=localhost\nslot_name=s2\npublications=pub_events\n",
+        )
+        .expect("duplicate metadata");
+
+        let err = LogicalReplicationRuntime::open_metadata(dir.path())
+            .expect_err("duplicate subscription metadata rejected");
+
+        assert!(
+            err.to_string()
+                .contains("duplicate logical subscription metadata"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn logical_metadata_rejects_duplicate_slot_files() {
+        let dir = tempfile::TempDir::new().expect("metadata dir");
+        let slots = dir.path().join("logical_slots");
+        fs::create_dir_all(&slots).expect("slots dir");
+        fs::write(
+            metadata_path(&slots, "slot_events"),
+            "name=slot_events\nconfirmed_lsn=1\n",
+        )
+        .expect("metadata");
+        fs::write(
+            slots.join("duplicate.meta"),
+            "name=slot_events\nconfirmed_lsn=2\n",
+        )
+        .expect("duplicate metadata");
+
+        let err = LogicalReplicationRuntime::open_metadata(dir.path())
+            .expect_err("duplicate slot metadata rejected");
+
+        assert!(
+            err.to_string().contains("duplicate logical slot metadata"),
             "unexpected error: {err}"
         );
     }
