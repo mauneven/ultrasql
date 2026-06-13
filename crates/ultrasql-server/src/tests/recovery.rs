@@ -8,7 +8,7 @@ use ultrasql_mvcc::{XidStatus, XidStatusOracle};
 use ultrasql_storage::buffer_pool::{BufferPool, PageLoader};
 use ultrasql_storage::heap::HeapAccess;
 use ultrasql_storage::page::Page;
-use ultrasql_wal::payload::{AbortPayload, SequenceOpKind, SequenceOpPayload};
+use ultrasql_wal::payload::{AbortPayload, CommitPayload, SequenceOpKind, SequenceOpPayload};
 use ultrasql_wal::{HeapTarget, RecordType, WalRecord};
 
 #[cfg(unix)]
@@ -445,4 +445,46 @@ fn server_init_honors_recovery_target_lsn_before_installing_wal_writer() {
         .unwrap();
 
     assert_eq!(appended, target);
+}
+
+#[test]
+fn server_init_does_not_restore_commit_status_after_recovery_target_lsn() {
+    let data_dir = tempfile::TempDir::new().unwrap();
+    let wal_dir = data_dir.path().join("pg_wal");
+    fs::create_dir_all(&wal_dir).unwrap();
+
+    let first = WalRecord::new(RecordType::Nop, Xid::new(10), Lsn::ZERO, 0, Vec::new())
+        .expect("test WAL record should fit size limits");
+    let first_bytes = first.encode();
+    let target = Lsn::new(u64::try_from(first_bytes.len()).unwrap());
+    let xid_after_target = Xid::new(42);
+    let commit = CommitPayload {
+        commit_lsn: Lsn::new(200),
+        commit_timestamp_micros: 1_700_000_000_000_000,
+    };
+    let second = WalRecord::new(
+        RecordType::Commit,
+        xid_after_target,
+        Lsn::ZERO,
+        0,
+        commit.encode(),
+    )
+    .expect("test WAL commit record should fit size limits");
+    let mut segment = first_bytes;
+    segment.extend_from_slice(&second.encode());
+    fs::write(wal_dir.join("segment_0000000000"), segment).unwrap();
+    fs::write(
+        data_dir.path().join("recovery.targets"),
+        format!("recovery_target_lsn = '{}'\n", target.raw()),
+    )
+    .unwrap();
+    #[cfg(unix)]
+    make_data_dir_private(data_dir.path());
+
+    let server = Server::init(data_dir.path()).unwrap();
+
+    assert_eq!(
+        server.txn_manager.status(xid_after_target),
+        XidStatus::InProgress
+    );
 }

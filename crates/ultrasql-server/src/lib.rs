@@ -7324,7 +7324,8 @@ impl Server {
             return Ok(());
         };
         let wal_dir = data_dir.join("pg_wal");
-        ultrasql_wal::recover(&wal_dir, |record| {
+        let recovery_replay_target = recovery_replay_target_from_data_dir(data_dir)?;
+        ultrasql_wal::recover_with_target(&wal_dir, recovery_replay_target, |record| {
             self.txn_manager.recover_observed_xid(record.header.xid);
             match record.header.record_type {
                 RecordType::Commit => self.txn_manager.recover_committed(record.header.xid),
