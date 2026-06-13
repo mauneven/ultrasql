@@ -4662,6 +4662,21 @@ impl Server {
             .map_err(|e| ServerError::ddl(format!("commit WAL append: {e}")))
     }
 
+    /// Append an abort marker for WAL-backed SQL recovery.
+    pub(crate) fn append_abort_record(&self, xid: Xid) -> Result<Option<Lsn>, ServerError> {
+        let Some(wal) = self.heap.wal_sink() else {
+            return Ok(None);
+        };
+        let payload = AbortPayload {
+            abort_lsn: Lsn::ZERO,
+        };
+        let record = WalRecord::new(RecordType::Abort, xid, Lsn::ZERO, 0, payload.encode())
+            .map_err(|e| ServerError::ddl(format!("abort WAL record encode: {e}")))?;
+        wal.append(record)
+            .map(Some)
+            .map_err(|e| ServerError::ddl(format!("abort WAL append: {e}")))
+    }
+
     /// Wait until the runtime WAL writer has fsynced at least `lsn`.
     pub(crate) fn wait_for_wal_durable(&self, lsn: Lsn) -> Result<(), ServerError> {
         let Some(writer) = &self.wal_writer else {
@@ -4712,6 +4727,24 @@ impl Server {
         })?;
         if durable_commit_marker && let Some(commit_lsn) = self.append_commit_record(xid)? {
             self.wait_for_wal_durable(commit_lsn)?;
+        }
+        Ok(())
+    }
+
+    /// Abort a transaction and, when it changed persistent heap/index state,
+    /// force its abort marker durable before reporting rollback success.
+    pub(crate) fn abort_transaction(
+        &self,
+        txn: ultrasql_txn::Transaction,
+        durable_abort_marker: bool,
+        context: &str,
+    ) -> Result<(), ServerError> {
+        let xid = txn.xid;
+        self.txn_manager
+            .abort(txn)
+            .map_err(|e| ServerError::ddl(format!("{context} abort: {e}")))?;
+        if durable_abort_marker && let Some(abort_lsn) = self.append_abort_record(xid)? {
+            self.wait_for_wal_durable(abort_lsn)?;
         }
         Ok(())
     }

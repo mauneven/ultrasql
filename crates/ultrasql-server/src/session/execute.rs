@@ -2006,24 +2006,26 @@ where
         txn: Transaction,
         outcome: Result<SelectResult, ServerError>,
     ) -> Result<SelectResult, ServerError> {
+        let is_dml = Self::dml_target_table(plan).is_some();
         match outcome {
             Ok(result) => {
-                let is_dml = Self::dml_target_table(plan).is_some();
                 if is_dml {
                     if let Err(e) = self.state.validate_deferred_foreign_keys(&txn) {
-                        return Err(self.rollback_transaction_after_error(
+                        return Err(self.rollback_transaction_after_error_with_abort_marker(
                             txn,
                             e,
                             "autocommit rollback after deferred FK violation",
+                            true,
                         ));
                     }
                     if let Err(e) =
                         self.flush_dirty_heap_pages_after_dml_if_needed(plan, result.rows)
                     {
-                        return Err(self.rollback_transaction_after_error(
+                        return Err(self.rollback_transaction_after_error_with_abort_marker(
                             txn,
                             e,
                             "autocommit rollback after dirty-page flush error",
+                            true,
                         ));
                     }
                 }
@@ -2050,10 +2052,11 @@ where
                 }
                 Ok(result)
             }
-            Err(e) => Err(self.rollback_transaction_after_error(
+            Err(e) => Err(self.rollback_transaction_after_error_with_abort_marker(
                 txn,
                 e,
                 "autocommit rollback after statement error",
+                is_dml,
             )),
         }
     }
@@ -2063,6 +2066,22 @@ where
         txn: Transaction,
         original: ServerError,
         context: &'static str,
+    ) -> ServerError {
+        let durable_abort_marker = !self.pending_table_modifications.is_empty();
+        self.rollback_transaction_after_error_with_abort_marker(
+            txn,
+            original,
+            context,
+            durable_abort_marker,
+        )
+    }
+
+    pub(crate) fn rollback_transaction_after_error_with_abort_marker(
+        &self,
+        txn: Transaction,
+        original: ServerError,
+        context: &'static str,
+        durable_abort_marker: bool,
     ) -> ServerError {
         // Roll back any in-place UPDATE writes by this txn before
         // terminating the CLOG entry, so the undo walker still sees
@@ -2079,8 +2098,7 @@ where
             .map(|err| err.to_string());
         let abort_err = self
             .state
-            .txn_manager
-            .abort(txn)
+            .abort_transaction(txn, durable_abort_marker, context)
             .err()
             .map(|err| err.to_string());
         match (rollback_err, abort_err) {

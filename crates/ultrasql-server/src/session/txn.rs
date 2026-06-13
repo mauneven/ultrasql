@@ -95,12 +95,14 @@ where
                 if !self.pending_table_modifications.is_empty()
                     && let Err(e) = self.state.validate_deferred_foreign_keys(&txn)
                 {
-                    self.clear_pending_dml_effects();
-                    return Err(self.rollback_transaction_after_error(
+                    let err = self.rollback_transaction_after_error_with_abort_marker(
                         txn,
                         e,
                         "PREPARE TRANSACTION rollback after deferred FK violation",
-                    ));
+                        true,
+                    );
+                    self.clear_pending_dml_effects();
+                    return Err(err);
                 }
                 if let Err(e) = self.state.txn_manager.prepare_transaction(
                     gid,
@@ -133,11 +135,14 @@ where
                         "PREPARE TRANSACTION rollback in-place updates: {e}"
                     )));
                 }
-                if let Err(e) = self.state.txn_manager.abort(txn) {
+                let durable_abort_marker = !self.pending_table_modifications.is_empty();
+                if let Err(e) = self.state.abort_transaction(
+                    txn,
+                    durable_abort_marker,
+                    "PREPARE TRANSACTION failed-block",
+                ) {
                     self.clear_pending_dml_effects();
-                    return Err(ServerError::Ddl(format!(
-                        "PREPARE TRANSACTION failed-block abort: {e}"
-                    )));
+                    return Err(e);
                 }
                 self.clear_pending_dml_effects();
                 Ok(SelectResult {
@@ -231,6 +236,9 @@ where
                 .map_err(|e| {
                     ServerError::Ddl(format!("rollback prepared in-place updates({gid}): {e}"))
                 })?;
+            if let Some(abort_lsn) = self.state.append_abort_record(xid)? {
+                self.state.wait_for_wal_durable(abort_lsn)?;
+            }
             self.state
                 .txn_manager
                 .finalise_prepared(xid, ultrasql_mvcc::XidStatus::Aborted)
@@ -369,12 +377,14 @@ where
                     .collect::<Vec<_>>();
                 if !self.pending_table_modifications.is_empty() {
                     if let Err(e) = self.state.validate_deferred_foreign_keys(&txn) {
-                        self.clear_pending_dml_effects();
-                        return Err(self.rollback_transaction_after_error(
+                        let err = self.rollback_transaction_after_error_with_abort_marker(
                             txn,
                             e,
                             "COMMIT rollback after deferred FK violation",
-                        ));
+                            true,
+                        );
+                        self.clear_pending_dml_effects();
+                        return Err(err);
                     }
                 }
                 if let Err(e) = self.state.commit_transaction(
@@ -425,11 +435,14 @@ where
                         "explicit COMMIT rollback in-place updates: {e}"
                     )));
                 }
-                if let Err(e) = self.state.txn_manager.abort(txn) {
+                let durable_abort_marker = !self.pending_table_modifications.is_empty();
+                if let Err(e) = self.state.abort_transaction(
+                    txn,
+                    durable_abort_marker,
+                    "explicit COMMIT rollback",
+                ) {
                     self.clear_pending_dml_effects();
-                    return Err(ServerError::Ddl(format!(
-                        "explicit COMMIT treated as ROLLBACK abort: {e}"
-                    )));
+                    return Err(e);
                 }
                 self.clear_pending_dml_effects();
                 // PostgreSQL emits the ROLLBACK tag here, not COMMIT.
@@ -469,9 +482,13 @@ where
                         "explicit ROLLBACK in-place updates: {e}"
                     )));
                 }
-                if let Err(e) = self.state.txn_manager.abort(txn) {
+                let durable_abort_marker = !self.pending_table_modifications.is_empty();
+                if let Err(e) =
+                    self.state
+                        .abort_transaction(txn, durable_abort_marker, "explicit ROLLBACK")
+                {
                     self.clear_pending_dml_effects();
-                    return Err(ServerError::Ddl(format!("explicit ROLLBACK abort: {e}")));
+                    return Err(e);
                 }
                 self.clear_pending_dml_effects();
                 Ok(SelectResult {
