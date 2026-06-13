@@ -79,6 +79,59 @@ def run_validator(reports_dir: Path, *extra: str) -> dict:
 
 
 class OperatorSoakValidatorTests(unittest.TestCase):
+    def test_soak_normalizes_operator_id_before_independence_count(self) -> None:
+        with tempfile_dir() as tmp_path:
+            write_report(tmp_path / "a.json", operator_id="op-a")
+            write_report(tmp_path / "b.json", operator_id=" op-a ")
+            write_report(tmp_path / "c.json", operator_id="op-a\t")
+
+            status = run_validator(tmp_path, "--commit", COMMIT)
+
+            self.assertFalse(status["ready"])
+            self.assertEqual(status["independent_operator_count"], 1)
+            self.assertTrue(
+                any("independent operator" in reason for reason in status["reasons"])
+            )
+
+    def test_soak_rejects_non_string_operator_ids(self) -> None:
+        with tempfile_dir() as tmp_path:
+            write_report(tmp_path / "a.json", operator_id=1)
+            write_report(tmp_path / "b.json", operator_id=2)
+            write_report(tmp_path / "c.json", operator_id=3)
+
+            status = run_validator(tmp_path, "--commit", COMMIT)
+
+            self.assertFalse(status["ready"])
+            for report in status["reports"]:
+                self.assertTrue(
+                    any(
+                        "operator_id must be a non-empty string" in error
+                        for error in report["errors"]
+                    )
+                )
+
+    def test_soak_requires_positive_client_count(self) -> None:
+        with tempfile_dir() as tmp_path:
+            write_report(tmp_path / "a.json", operator_id="op-a")
+            write_report(tmp_path / "b.json", operator_id="op-b")
+            write_report(tmp_path / "c.json", operator_id="op-c")
+            report = json.loads((tmp_path / "c.json").read_text())
+            report["client_count"] = 0
+            (tmp_path / "c.json").write_text(json.dumps(report) + "\n")
+
+            status = run_validator(tmp_path, "--commit", COMMIT)
+
+            self.assertFalse(status["ready"])
+            bad_report = next(
+                report for report in status["reports"] if report["operator_id"] == "op-c"
+            )
+            self.assertTrue(
+                any(
+                    "client_count must be a positive integer" in error
+                    for error in bad_report["errors"]
+                )
+            )
+
     def test_soak_requires_same_release_commit(self) -> None:
         with self.subTest("mixed commit"):
             with tempfile_dir() as tmp_path:

@@ -50,9 +50,11 @@ when possible.
 The release gate is ready only when:
 
 - at least three valid reports exist,
-- each report is from a distinct `operator_id`,
+- each report is from a distinct normalized `operator_id` after surrounding
+  whitespace is trimmed,
 - every report covers the tagged release commit,
 - every report covers at least 30 continuous days,
+- `client_count` is a positive integer,
 - `end_time_utc` is not in the future,
 - `failure_count` is zero,
 - `correctness_issue_count`, `critical_issue_count`, and

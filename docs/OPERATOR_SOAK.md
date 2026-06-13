@@ -65,8 +65,10 @@ curl -fsS http://127.0.0.1:8080/metrics
 The roadmap checkbox may be closed only after three independent operator
 records show the same release commit, at least 30 continuous days each, zero
 availability failures, zero correctness issues, and zero critical or
-high-severity issues. Reports whose end time is in the future are rejected. The
-release workflow runs `scripts/validate-operator-soak.py --strict --commit
-$GITHUB_SHA`; if
+high-severity issues. Operator identifiers are compared after trimming
+surrounding whitespace, and reports with non-positive `client_count` are
+rejected. Reports whose end time is in the future are rejected. The release
+workflow runs `scripts/validate-operator-soak.py --strict --commit $GITHUB_SHA`;
+if
 `benchmarks/results/latest/operator_soak_status.json` reports `not_ready`, the
 tagged release must not publish.

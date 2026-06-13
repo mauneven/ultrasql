@@ -34,6 +34,20 @@ REQUIRED_FIELDS = [
     "log_bundle_path",
     "signed_off_by",
 ]
+TEXT_FIELDS = [
+    "operator_id",
+    "host_cpu",
+    "host_memory",
+    "host_storage",
+    "os",
+    "ultrasqld_command",
+    "workload",
+    "data_dir",
+    "ops_endpoint",
+    "health_check_interval",
+    "log_bundle_path",
+    "signed_off_by",
+]
 GIT_COMMIT_RE = re.compile(r"^[0-9a-fA-F]{40}$")
 
 
@@ -79,6 +93,21 @@ def parse_count(value: Any, field: str) -> int:
     return value
 
 
+def parse_positive_count(value: Any, field: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        raise ValueError(f"{field} must be a positive integer")
+    return value
+
+
+def parse_text(value: Any, field: str) -> str:
+    if not isinstance(value, str):
+        raise ValueError(f"{field} must be a non-empty string")
+    normalized = value.strip()
+    if not normalized:
+        raise ValueError(f"{field} must be a non-empty string")
+    return normalized
+
+
 def parse_commit(value: Any) -> str:
     if not isinstance(value, str) or not GIT_COMMIT_RE.fullmatch(value.strip()):
         raise ValueError("must be a full 40-character hex git commit")
@@ -112,11 +141,17 @@ def validate_report(
             "errors": ["report must be a JSON object"],
         }
 
+    normalized_text: dict[str, str] = {}
     for field in REQUIRED_FIELDS:
         if field not in report:
             errors.append(f"missing {field}")
-        elif isinstance(report[field], str) and not report[field].strip():
-            errors.append(f"{field} must be non-empty")
+
+    for field in TEXT_FIELDS:
+        if field in report:
+            try:
+                normalized_text[field] = parse_text(report[field], field)
+            except ValueError as err:
+                errors.append(str(err))
 
     commit = None
     try:
@@ -157,6 +192,11 @@ def validate_report(
         except ValueError as err:
             errors.append(str(err))
 
+    try:
+        parse_positive_count(report.get("client_count"), "client_count")
+    except ValueError as err:
+        errors.append(str(err))
+
     if isinstance(report.get("failure_count"), int) and report["failure_count"] != 0:
         errors.append("failure_count must be zero for a continuous soak")
 
@@ -166,7 +206,7 @@ def validate_report(
 
     return {
         "path": str(path),
-        "operator_id": report.get("operator_id"),
+        "operator_id": normalized_text.get("operator_id", report.get("operator_id")),
         "commit": commit if commit is not None else report.get("commit"),
         "valid": not errors,
         "duration_days": round(duration_days, 6),
