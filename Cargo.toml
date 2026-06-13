@@ -142,7 +142,7 @@ hex = "0.4"
 
 # CLI
 rustyline      = { version = "14", default-features = false, features = ["derive"] }
-tokio-postgres = "0.7"
+tokio-postgres = "0.7.18"
 
 # Compression
 lz4_flex = "0.11"
