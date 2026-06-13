@@ -432,10 +432,9 @@ impl LogicalReplicationRuntime {
             }
             let path = entry.path();
             let text = read_regular_text_file(&path, "logical publication metadata file")?;
-            if let Some(publication) = parse_publication_metadata(&text) {
-                self.publications
-                    .insert(publication.name.clone(), publication);
-            }
+            let publication = parse_publication_metadata(&text)?;
+            self.publications
+                .insert(publication.name.clone(), publication);
         }
         for entry in fs::read_dir(&subscriptions_dir).map_err(ServerError::Io)? {
             let entry = entry.map_err(ServerError::Io)?;
@@ -444,10 +443,9 @@ impl LogicalReplicationRuntime {
             }
             let path = entry.path();
             let text = read_regular_text_file(&path, "logical subscription metadata file")?;
-            if let Some(subscription) = parse_subscription_metadata(&text) {
-                self.subscriptions
-                    .insert(subscription.name.clone(), subscription);
-            }
+            let subscription = parse_subscription_metadata(&text)?;
+            self.subscriptions
+                .insert(subscription.name.clone(), subscription);
         }
         let mut max_confirmed = 0_u64;
         for entry in fs::read_dir(&logical_slots_dir).map_err(ServerError::Io)? {
@@ -457,10 +455,9 @@ impl LogicalReplicationRuntime {
             }
             let path = entry.path();
             let text = read_regular_text_file(&path, "logical slot metadata file")?;
-            if let Some(slot) = parse_logical_slot_metadata(&text) {
-                max_confirmed = max_confirmed.max(slot.confirmed_lsn);
-                self.logical_slots.insert(slot.name.clone(), slot);
-            }
+            let slot = parse_logical_slot_metadata(&text)?;
+            max_confirmed = max_confirmed.max(slot.confirmed_lsn);
+            self.logical_slots.insert(slot.name.clone(), slot);
         }
         let next_lsn = max_confirmed
             .checked_add(1)
@@ -646,33 +643,67 @@ fn metadata_field<'a>(text: &'a str, field: &str) -> Option<&'a str> {
         .find_map(|line| line.strip_prefix(prefix.as_str()))
 }
 
-fn parse_publication_metadata(text: &str) -> Option<Publication> {
-    let name = fold_identifier(metadata_field(text, "name")?);
-    let tables = metadata_field(text, "tables")?
+fn metadata_required_field<'a>(
+    text: &'a str,
+    field: &str,
+    kind: &str,
+) -> Result<&'a str, ServerError> {
+    metadata_field(text, field).ok_or_else(|| {
+        ServerError::ddl(format!("malformed {kind} metadata: missing {field} field"))
+    })
+}
+
+fn parse_publication_metadata(text: &str) -> Result<Publication, ServerError> {
+    let name = fold_identifier(metadata_required_field(
+        text,
+        "name",
+        "logical publication",
+    )?);
+    let tables = metadata_required_field(text, "tables", "logical publication")?
         .split(',')
         .map(fold_identifier)
         .filter(|table| !table.is_empty())
         .collect::<BTreeSet<_>>();
     if name.is_empty() || tables.is_empty() {
-        return None;
+        return Err(ServerError::ddl(
+            "malformed logical publication metadata: empty name or tables",
+        ));
     }
-    Some(Publication { name, tables })
+    Ok(Publication { name, tables })
 }
 
-fn parse_subscription_metadata(text: &str) -> Option<Subscription> {
-    let name = fold_identifier(metadata_field(text, "name")?);
-    let conninfo = metadata_field(text, "conninfo")?.to_string();
-    let slot_name = fold_identifier(metadata_field(text, "slot_name")?);
-    let publications = metadata_field(text, "publications")?
+fn parse_subscription_metadata(text: &str) -> Result<Subscription, ServerError> {
+    let name = fold_identifier(metadata_required_field(
+        text,
+        "name",
+        "logical subscription",
+    )?);
+    let conninfo = metadata_required_field(text, "conninfo", "logical subscription")?.to_string();
+    let slot_name = fold_identifier(metadata_required_field(
+        text,
+        "slot_name",
+        "logical subscription",
+    )?);
+    let publications = metadata_required_field(text, "publications", "logical subscription")?
         .split(',')
         .map(fold_identifier)
         .filter(|publication| !publication.is_empty())
         .collect::<Vec<_>>();
     if name.is_empty() || slot_name.is_empty() || publications.is_empty() {
-        return None;
+        return Err(ServerError::ddl(
+            "malformed logical subscription metadata: empty name, slot, or publications",
+        ));
     }
-    let enabled = metadata_field(text, "enabled") != Some("false");
-    Some(Subscription {
+    let enabled = match metadata_field(text, "enabled") {
+        Some("true") | None => true,
+        Some("false") => false,
+        Some(_) => {
+            return Err(ServerError::ddl(
+                "malformed logical subscription metadata: enabled must be true or false",
+            ));
+        }
+    };
+    Ok(Subscription {
         name,
         conninfo,
         slot_name,
@@ -681,13 +712,19 @@ fn parse_subscription_metadata(text: &str) -> Option<Subscription> {
     })
 }
 
-fn parse_logical_slot_metadata(text: &str) -> Option<LogicalReplicationSlot> {
-    let name = fold_identifier(metadata_field(text, "name")?);
-    let confirmed_lsn = metadata_field(text, "confirmed_lsn")?.parse::<u64>().ok()?;
+fn parse_logical_slot_metadata(text: &str) -> Result<LogicalReplicationSlot, ServerError> {
+    let name = fold_identifier(metadata_required_field(text, "name", "logical slot")?);
+    let confirmed_lsn = metadata_required_field(text, "confirmed_lsn", "logical slot")?
+        .parse::<u64>()
+        .map_err(|_| {
+            ServerError::ddl("malformed logical slot metadata: confirmed_lsn must be a u64")
+        })?;
     if name.is_empty() {
-        return None;
+        return Err(ServerError::ddl(
+            "malformed logical slot metadata: empty name",
+        ));
     }
-    Some(LogicalReplicationSlot {
+    Ok(LogicalReplicationSlot {
         name,
         confirmed_lsn,
     })
@@ -1167,6 +1204,68 @@ mod tests {
             .expect_err("oversized metadata rejected");
 
         assert!(err.to_string().contains("exceeds read limit"));
+    }
+
+    #[test]
+    fn logical_metadata_rejects_malformed_publication_files() {
+        let dir = tempfile::TempDir::new().expect("metadata dir");
+        let publications = dir.path().join("publications");
+        fs::create_dir_all(&publications).expect("publications dir");
+        fs::write(
+            metadata_path(&publications, "pub_events"),
+            "name=pub_events\n",
+        )
+        .expect("metadata");
+
+        let err = LogicalReplicationRuntime::open_metadata(dir.path())
+            .expect_err("malformed publication metadata rejected");
+
+        assert!(
+            err.to_string()
+                .contains("malformed logical publication metadata"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn logical_metadata_rejects_malformed_subscription_files() {
+        let dir = tempfile::TempDir::new().expect("metadata dir");
+        let subscriptions = dir.path().join("subscriptions");
+        fs::create_dir_all(&subscriptions).expect("subscriptions dir");
+        fs::write(
+            metadata_path(&subscriptions, "sub_events"),
+            "name=sub_events\nslot_name=sub_events\npublications=pub_events\nenabled=maybe\n",
+        )
+        .expect("metadata");
+
+        let err = LogicalReplicationRuntime::open_metadata(dir.path())
+            .expect_err("malformed subscription metadata rejected");
+
+        assert!(
+            err.to_string()
+                .contains("malformed logical subscription metadata"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn logical_metadata_rejects_malformed_slot_files() {
+        let dir = tempfile::TempDir::new().expect("metadata dir");
+        let slots = dir.path().join("logical_slots");
+        fs::create_dir_all(&slots).expect("slots dir");
+        fs::write(
+            metadata_path(&slots, "slot_events"),
+            "name=slot_events\nconfirmed_lsn=not-a-number\n",
+        )
+        .expect("metadata");
+
+        let err = LogicalReplicationRuntime::open_metadata(dir.path())
+            .expect_err("malformed slot metadata rejected");
+
+        assert!(
+            err.to_string().contains("malformed logical slot metadata"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]
