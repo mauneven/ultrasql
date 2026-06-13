@@ -192,6 +192,10 @@ impl Operator for WindowAgg {
     fn profile_children(&self) -> Vec<&dyn Operator> {
         vec![self.child.as_ref()]
     }
+
+    fn estimated_row_count(&self) -> Option<usize> {
+        self.child.estimated_row_count()
+    }
 }
 
 impl WindowAgg {
@@ -835,9 +839,9 @@ mod tests {
     use ultrasql_vec::column::{Column, NumericColumn};
 
     use super::{WindowAgg, WindowFunc};
-    use crate::Operator;
     use crate::filter_op::batch_to_rows;
     use crate::mem_table_scan::MemTableScan;
+    use crate::{ExecError, Operator};
 
     fn schema_id_val() -> Schema {
         Schema::new([
@@ -970,6 +974,44 @@ mod tests {
             out.extend(rows.into_iter().map(|row| row[2].clone()));
         }
         out
+    }
+
+    #[derive(Debug)]
+    struct EstimatedScan {
+        schema: Schema,
+        batches: std::vec::IntoIter<Batch>,
+        rows: Option<usize>,
+    }
+
+    impl Operator for EstimatedScan {
+        fn next_batch(&mut self) -> Result<Option<Batch>, ExecError> {
+            Ok(self.batches.next())
+        }
+
+        fn schema(&self) -> &Schema {
+            &self.schema
+        }
+
+        fn estimated_row_count(&self) -> Option<usize> {
+            self.rows
+        }
+    }
+
+    #[test]
+    fn window_agg_preserves_child_estimated_row_count() {
+        let scan = EstimatedScan {
+            schema: schema_id_val(),
+            batches: vec![make_batch(&[(1, 10), (2, 20)])].into_iter(),
+            rows: Some(65_536),
+        };
+        let op = WindowAgg::new(
+            Box::new(scan),
+            vec![],
+            vec![col_val()],
+            WindowFunc::RowNumber,
+            schema_with_window(),
+        );
+        assert_eq!(op.estimated_row_count(), Some(65_536));
     }
 
     #[test]
