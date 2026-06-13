@@ -7738,7 +7738,8 @@ impl Server {
             return Ok(());
         };
         let wal_dir = data_dir.join("pg_wal");
-        ultrasql_wal::recover(&wal_dir, |record| {
+        let recovery_replay_target = recovery_replay_target_from_data_dir(data_dir)?;
+        ultrasql_wal::recover_with_target(&wal_dir, recovery_replay_target, |record| {
             if record.header.record_type == RecordType::HnswOp {
                 for hnsw in hnsw_indexes {
                     if !hnsw.is_valid() {

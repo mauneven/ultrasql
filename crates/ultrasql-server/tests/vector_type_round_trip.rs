@@ -131,6 +131,47 @@ fn truncate_wal_before_first(data_dir: &Path, record_type: RecordType) {
     panic!("WAL record type {record_type:?} not found");
 }
 
+fn lsn_before_first_wal_record(data_dir: &Path, record_type: RecordType) -> u64 {
+    let segments = sorted_wal_segments(data_dir);
+    let mut stream_pos = 0_u64;
+    for segment in &segments {
+        let bytes =
+            fs::read(segment).unwrap_or_else(|e| panic!("read WAL segment {segment:?}: {e}"));
+        let mut offset = 0;
+        while offset < bytes.len() {
+            let (record, used) = WalRecord::decode(&bytes[offset..])
+                .unwrap_or_else(|e| panic!("decode WAL segment {segment:?} at {offset}: {e}"));
+            if record.header.record_type == record_type {
+                return stream_pos + u64::try_from(offset).expect("WAL offset fits u64");
+            }
+            offset += used;
+        }
+        stream_pos = stream_pos
+            .checked_add(u64::try_from(bytes.len()).expect("WAL segment length fits u64"))
+            .expect("WAL stream position fits u64");
+    }
+    panic!("WAL record type {record_type:?} not found");
+}
+
+fn wal_end_lsn(data_dir: &Path) -> u64 {
+    let segments = sorted_wal_segments(data_dir);
+    let mut stream_pos = 0_u64;
+    for segment in &segments {
+        let bytes =
+            fs::read(segment).unwrap_or_else(|e| panic!("read WAL segment {segment:?}: {e}"));
+        let mut offset = 0;
+        while offset < bytes.len() {
+            let (_record, used) = WalRecord::decode(&bytes[offset..])
+                .unwrap_or_else(|e| panic!("decode WAL segment {segment:?} at {offset}: {e}"));
+            offset += used;
+        }
+        stream_pos = stream_pos
+            .checked_add(u64::try_from(offset).expect("WAL segment offset fits u64"))
+            .expect("WAL stream position fits u64");
+    }
+    stream_pos
+}
+
 fn truncate_inside_first_wal_record(data_dir: &Path, record_type: RecordType) {
     let segments = sorted_wal_segments(data_dir);
     for (segment_idx, segment) in segments.iter().enumerate() {
@@ -160,6 +201,54 @@ fn truncate_inside_first_wal_record(data_dir: &Path, record_type: RecordType) {
         }
     }
     panic!("WAL record type {record_type:?} not found");
+}
+
+fn corrupt_first_vector_wal_payload_after(
+    data_dir: &Path,
+    record_type: RecordType,
+    min_record_start_lsn: u64,
+) {
+    let segments = sorted_wal_segments(data_dir);
+    let mut stream_pos = 0_u64;
+    for segment in &segments {
+        let mut bytes =
+            fs::read(segment).unwrap_or_else(|e| panic!("read WAL segment {segment:?}: {e}"));
+        let mut offset = 0;
+        while offset < bytes.len() {
+            let record_start_lsn = stream_pos + u64::try_from(offset).expect("WAL offset fits u64");
+            let (record, used) = WalRecord::decode(&bytes[offset..])
+                .unwrap_or_else(|e| panic!("decode WAL segment {segment:?} at {offset}: {e}"));
+            if record_start_lsn >= min_record_start_lsn && record.header.record_type == record_type
+            {
+                let mut payload = record.payload;
+                assert!(
+                    payload.len() > 1,
+                    "vector WAL payload should include reserved prefix bytes"
+                );
+                payload[1] = 1;
+                let rewritten = WalRecord::new(
+                    record_type,
+                    record.header.xid,
+                    record.header.prev_lsn,
+                    record.header.flags,
+                    payload,
+                )
+                .expect("test WAL record should fit original size limits");
+                assert_eq!(rewritten.header.total_length, record.header.total_length);
+                let encoded = rewritten.encode();
+                assert_eq!(encoded.len(), used);
+                bytes[offset..offset + used].copy_from_slice(&encoded);
+                fs::write(segment, bytes)
+                    .unwrap_or_else(|e| panic!("rewrite WAL segment {segment:?}: {e}"));
+                return;
+            }
+            offset += used;
+        }
+        stream_pos = stream_pos
+            .checked_add(u64::try_from(bytes.len()).expect("WAL segment length fits u64"))
+            .expect("WAL stream position fits u64");
+    }
+    panic!("WAL record type {record_type:?} not found after LSN {min_record_start_lsn}");
 }
 
 fn corrupt_first_vector_wal_payload(data_dir: &Path, record_type: RecordType) {
@@ -876,6 +965,148 @@ async fn hnsw_crash_during_index_build_uses_exact_scan_after_restart() {
             .any(|line| line.starts_with("index\t")),
         "stale ANN runtime index metadata must be scrubbed after crash recovery: {table_runtime_metadata}"
     );
+}
+
+#[tokio::test]
+async fn hnsw_recovery_target_before_index_wal_uses_exact_scan_after_restart() {
+    let dir = tempfile::tempdir().expect("tempdir");
+
+    {
+        let running = start_persistent_server(dir.path(), "vector_type_test").await;
+        let client = &running.client;
+        client
+            .batch_execute("CREATE TABLE ann_hnsw_pitr (id INT NOT NULL, embedding VECTOR(3))")
+            .await
+            .expect("create vector table");
+        client
+            .batch_execute(
+                "INSERT INTO ann_hnsw_pitr VALUES \
+                 (1, '[9,0,0]'), \
+                 (2, '[1,0,0]'), \
+                 (3, '[2,0,0]'), \
+                 (4, '[0,0,0]')",
+            )
+            .await
+            .expect("insert vectors");
+        graceful_shutdown(running).await;
+    }
+
+    {
+        let (client, _conn, server_handle) =
+            start_crash_persistent_server_and_connect(dir.path()).await;
+        client
+            .batch_execute(
+                "CREATE INDEX ann_hnsw_pitr_embedding_idx \
+                 ON ann_hnsw_pitr USING hnsw (embedding vector_l2_ops)",
+            )
+            .await
+            .expect("create hnsw index");
+        shutdown(client, server_handle).await;
+    }
+
+    let target = lsn_before_first_wal_record(dir.path(), RecordType::HnswOp);
+    fs::write(
+        dir.path().join("recovery.targets"),
+        format!("recovery_target_lsn = '{target}'\n"),
+    )
+    .expect("write recovery target");
+
+    {
+        let running = start_persistent_server(dir.path(), "vector_type_test").await;
+        let client = &running.client;
+        let messages = client
+            .simple_query(
+                "EXPLAIN ANALYZE SELECT id FROM ann_hnsw_pitr \
+                 ORDER BY embedding <-> VECTOR '[0,0,0]' LIMIT 3",
+            )
+            .await
+            .expect("explain after PITR before hnsw WAL");
+        let text = simple_rows(&messages)
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            !text.contains("selected ann_hnsw_pitr_embedding_idx"),
+            "PITR before HNSW WAL must not replay post-target index sidecar, got: {text}"
+        );
+
+        graceful_shutdown(running).await;
+    }
+}
+
+#[tokio::test]
+async fn hnsw_recovery_target_ignores_corrupt_post_target_index_wal() {
+    let dir = tempfile::tempdir().expect("tempdir");
+
+    {
+        let running = start_persistent_server(dir.path(), "vector_type_test").await;
+        let client = &running.client;
+        client
+            .batch_execute("CREATE TABLE ann_hnsw_pitr_post (id INT NOT NULL, embedding VECTOR(3))")
+            .await
+            .expect("create vector table");
+        client
+            .batch_execute(
+                "INSERT INTO ann_hnsw_pitr_post VALUES \
+                 (1, '[9,0,0]'), \
+                 (2, '[1,0,0]'), \
+                 (3, '[2,0,0]'), \
+                 (4, '[0,0,0]')",
+            )
+            .await
+            .expect("insert vectors");
+        client
+            .batch_execute(
+                "CREATE INDEX ann_hnsw_pitr_post_embedding_idx \
+                 ON ann_hnsw_pitr_post USING hnsw (embedding vector_l2_ops)",
+            )
+            .await
+            .expect("create hnsw index");
+        graceful_shutdown(running).await;
+    }
+
+    let target = wal_end_lsn(dir.path());
+
+    {
+        let (client, _conn, server_handle) =
+            start_crash_persistent_server_and_connect(dir.path()).await;
+        client
+            .batch_execute("INSERT INTO ann_hnsw_pitr_post VALUES (5, '[0.5,0,0]')")
+            .await
+            .expect("insert post-target vector");
+        shutdown(client, server_handle).await;
+    }
+
+    corrupt_first_vector_wal_payload_after(dir.path(), RecordType::HnswOp, target);
+    fs::write(
+        dir.path().join("recovery.targets"),
+        format!("recovery_target_lsn = '{target}'\n"),
+    )
+    .expect("write recovery target");
+
+    {
+        let running = start_persistent_server(dir.path(), "vector_type_test").await;
+        let client = &running.client;
+        let messages = client
+            .simple_query(
+                "EXPLAIN ANALYZE SELECT id FROM ann_hnsw_pitr_post \
+                 ORDER BY embedding <-> VECTOR '[0,0,0]' LIMIT 3",
+            )
+            .await
+            .expect("explain after PITR before corrupt post-target hnsw WAL");
+        let text = simple_rows(&messages)
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            text.contains("Vector Index: selected ann_hnsw_pitr_post_embedding_idx"),
+            "PITR must ignore corrupt post-target HNSW WAL and keep target index valid, got: {text}"
+        );
+
+        graceful_shutdown(running).await;
+    }
 }
 
 #[tokio::test]
