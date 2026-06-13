@@ -67,7 +67,14 @@ fn release_sweep_workflow_enables_clickhouse_comparison() {
     let workflow = repo_file(".github/workflows/bench.yml");
 
     assert!(workflow.contains("brew install duckdb sqlite postgresql@14 clickhouse"));
-    assert!(workflow.contains("python3 -m pip install clickhouse-driver"));
+    assert!(workflow.contains(r#"python3 -m venv "$RUNNER_TEMP/clickhouse-driver-venv""#));
+    assert!(workflow.contains(
+        r#""$RUNNER_TEMP/clickhouse-driver-venv/bin/python" -m pip install --disable-pip-version-check clickhouse-driver"#
+    ));
+    assert!(
+        workflow.contains(r#"echo "$RUNNER_TEMP/clickhouse-driver-venv/bin" >> "$GITHUB_PATH""#)
+    );
+    assert!(!workflow.contains("python3 -m pip install clickhouse-driver"));
     assert!(workflow.contains("CH_BIN=\"$(command -v clickhouse)\""));
 }
 

@@ -141,7 +141,9 @@ jobs:
         run: |
           brew update
           brew install duckdb sqlite postgresql@14 clickhouse
-          python3 -m pip install clickhouse-driver
+          python3 -m venv "$RUNNER_TEMP/clickhouse-driver-venv"
+          "$RUNNER_TEMP/clickhouse-driver-venv/bin/python" -m pip install --disable-pip-version-check clickhouse-driver
+          echo "$RUNNER_TEMP/clickhouse-driver-venv/bin" >> "$GITHUB_PATH"
           echo "$(brew --prefix postgresql@14)/bin" >> "$GITHUB_PATH"
       - name: start PostgreSQL
         shell: bash
