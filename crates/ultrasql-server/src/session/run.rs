@@ -19,7 +19,7 @@ use super::timeout::StatementTimeoutGuard;
 use crate::TxnState;
 use crate::error::ServerError;
 use crate::result_encoder::SelectResult;
-use crate::workload::{self, WorkloadQueryRecord};
+use crate::workload::WorkloadQueryRecordRef;
 
 const SHARED_STREAM_COPY_LIMIT_BYTES: usize = 16 * 1024 * 1024;
 
@@ -196,7 +196,8 @@ where
             return Ok(());
         }
 
-        if let Ok(statement_slices) = Parser::new(trimmed).parse_statement_slices()
+        if simple_query_needs_batch_parse(trimmed)
+            && let Ok(statement_slices) = Parser::new(trimmed).parse_statement_slices()
             && statement_slices.len() > 1
         {
             return self.handle_query_batch(&statement_slices).await;
@@ -229,15 +230,17 @@ where
         let rows = outcome.as_ref().map_or(0, |result| result.rows);
         let error = outcome.as_ref().err().map(ToString::to_string);
         self.log_completed_statement(trimmed, elapsed, rows, error.as_deref());
-        self.state.workload_recorder.record(WorkloadQueryRecord {
-            query: trimmed.to_string(),
-            plan_hash: workload::plan_hash_for_sql(trimmed),
-            elapsed,
-            rows,
-            error,
-            bind_param_count: 0,
-            bind_params_redacted: false,
-        });
+        self.state
+            .workload_recorder
+            .record_ref(WorkloadQueryRecordRef {
+                query: trimmed,
+                plan_hash: 0,
+                elapsed,
+                rows,
+                error: error.as_deref(),
+                bind_param_count: 0,
+                bind_params_redacted: false,
+            });
 
         match outcome {
             Ok(result) => {
@@ -308,15 +311,17 @@ where
             let rows = outcome.as_ref().map_or(0, |result| result.rows);
             let error = outcome.as_ref().err().map(ToString::to_string);
             self.log_completed_statement(trimmed, elapsed, rows, error.as_deref());
-            self.state.workload_recorder.record(WorkloadQueryRecord {
-                query: trimmed.to_string(),
-                plan_hash: workload::plan_hash_for_sql(trimmed),
-                elapsed,
-                rows,
-                error,
-                bind_param_count: 0,
-                bind_params_redacted: false,
-            });
+            self.state
+                .workload_recorder
+                .record_ref(WorkloadQueryRecordRef {
+                    query: trimmed,
+                    plan_hash: 0,
+                    elapsed,
+                    rows,
+                    error: error.as_deref(),
+                    bind_param_count: 0,
+                    bind_params_redacted: false,
+                });
 
             match outcome {
                 Ok(result) => Self::encode_query_result_body(&mut scratch, result),
@@ -591,6 +596,10 @@ fn simple_query_is_empty(sql: &str) -> bool {
     true
 }
 
+fn simple_query_needs_batch_parse(sql: &str) -> bool {
+    sql.as_bytes().contains(&b';')
+}
+
 fn statement_log_class(sql: &str) -> &'static str {
     let head = sql.split_whitespace().next().unwrap_or_default();
     if head.eq_ignore_ascii_case("create")
@@ -611,5 +620,27 @@ fn statement_log_class(sql: &str) -> &'static str {
         "mod"
     } else {
         "other"
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::simple_query_needs_batch_parse;
+
+    #[test]
+    fn batch_parse_gate_skips_plain_single_statement_without_semicolon() {
+        assert!(!simple_query_needs_batch_parse(
+            "SELECT SUM(x) FROM bench_sum_shared"
+        ));
+        assert!(!simple_query_needs_batch_parse(
+            "  SELECT AVG(x) FROM bench_avg_shared"
+        ));
+    }
+
+    #[test]
+    fn batch_parse_gate_keeps_any_semicolon_on_parser_path() {
+        assert!(simple_query_needs_batch_parse("SELECT 1; SELECT 2"));
+        assert!(simple_query_needs_batch_parse("SELECT 1;"));
+        assert!(simple_query_needs_batch_parse("SELECT ';'"));
     }
 }

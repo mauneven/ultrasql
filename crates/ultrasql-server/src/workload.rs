@@ -85,6 +85,25 @@ pub struct WorkloadQueryRecord {
     pub bind_params_redacted: bool,
 }
 
+/// Borrowed completed query execution submitted to the recorder.
+#[derive(Debug)]
+pub struct WorkloadQueryRecordRef<'a> {
+    /// SQL text as seen by the execution path.
+    pub query: &'a str,
+    /// Stable hash of the bound logical plan shape when available.
+    pub plan_hash: u64,
+    /// Statement duration.
+    pub elapsed: Duration,
+    /// Rows reported by command tags.
+    pub rows: u64,
+    /// Query-scoped error text, if the statement failed.
+    pub error: Option<&'a str>,
+    /// Number of bind parameters supplied by the client.
+    pub bind_param_count: u32,
+    /// Whether concrete bind values were redacted from this record.
+    pub bind_params_redacted: bool,
+}
+
 /// One cumulative latency histogram bucket.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct WorkloadLatencyBucket {
@@ -328,7 +347,20 @@ impl WorkloadRecorder {
 
     /// Record one completed statement.
     pub fn record(&self, record: WorkloadQueryRecord) {
-        let query = normalize_query(&record.query);
+        self.record_ref(WorkloadQueryRecordRef {
+            query: &record.query,
+            plan_hash: record.plan_hash,
+            elapsed: record.elapsed,
+            rows: record.rows,
+            error: record.error.as_deref(),
+            bind_param_count: record.bind_param_count,
+            bind_params_redacted: record.bind_params_redacted,
+        });
+    }
+
+    /// Record one completed statement without taking ownership of SQL text.
+    pub fn record_ref(&self, record: WorkloadQueryRecordRef<'_>) {
+        let query = normalize_query(record.query);
         if query.is_empty() {
             return;
         }
@@ -339,7 +371,7 @@ impl WorkloadRecorder {
         } else {
             record.plan_hash
         };
-        let error = record.error.map(|err| truncate_error(&err));
+        let error = record.error.map(truncate_error);
         let mut stats = self.stats.lock();
         stats
             .entry(query_id)
@@ -820,6 +852,25 @@ mod tests {
                 .iter()
                 .any(|bucket| bucket.le_us == u64::MAX && bucket.count == 2)
         );
+    }
+
+    #[test]
+    fn workload_recorder_records_borrowed_query() {
+        let recorder = WorkloadRecorder::new();
+        recorder.record_ref(WorkloadQueryRecordRef {
+            query: "SELECT   1",
+            plan_hash: 0,
+            elapsed: Duration::from_micros(50),
+            rows: 1,
+            error: None,
+            bind_param_count: 0,
+            bind_params_redacted: false,
+        });
+
+        let stats = recorder.snapshot();
+        assert_eq!(stats.len(), 1);
+        assert_eq!(stats[0].query, "SELECT 1");
+        assert_eq!(stats[0].plan_hash, plan_hash_for_sql("SELECT 1"));
     }
 
     #[test]
