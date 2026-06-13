@@ -5031,6 +5031,7 @@ impl Server {
         // 2. Sink adapter bridges WalBuffer ↔ storage's WalSink trait.
         let sink: Arc<dyn ultrasql_storage::WalSink> =
             Arc::new(WalBufferSink::new(Arc::clone(&wal_buffer)));
+        let last_checkpoint_lsn = Arc::new(std::sync::atomic::AtomicU64::new(0));
 
         // 3. Buffer pool with WAL.
         let page_loader = BlankPageLoader::persistent(data_dir.join("base")).map_err(|e| {
@@ -5039,9 +5040,12 @@ impl Server {
         let pool = Arc::new(BufferPool::with_wal(
             IN_MEMORY_POOL_FRAMES,
             page_loader.clone(),
-            sink,
+            Arc::clone(&sink),
         ));
-        let heap = Arc::new(HeapAccess::new(Arc::clone(&pool)));
+        let heap = Arc::new(HeapAccess::with_checkpoint_lsn(
+            Arc::clone(&pool),
+            Arc::clone(&last_checkpoint_lsn),
+        ));
         let vm = Arc::new(VisibilityMap::new());
         let sequences = Arc::new(dashmap::DashMap::new());
         let sequence_owners = Arc::new(dashmap::DashMap::new());
@@ -5082,7 +5086,8 @@ impl Server {
         let checkpointer_loader = page_loader.clone();
         let checkpointer = Some(ultrasql_storage::Checkpointer::spawn(
             &pool,
-            None,
+            Some(Arc::clone(&sink)),
+            Some(Arc::clone(&last_checkpoint_lsn)),
             move |page_id, page| checkpointer_loader.store(page_id, page),
             ultrasql_storage::CheckpointerConfig::default(),
         ));

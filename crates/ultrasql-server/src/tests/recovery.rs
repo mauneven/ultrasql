@@ -94,6 +94,17 @@ fn server_init_retains_wal_writer_and_flushes_on_drop() {
     assert!(recovered_lsn.raw() > appended_lsn.raw());
 }
 
+#[test]
+fn server_init_shares_checkpoint_lsn_with_checkpointer() {
+    let data_dir = tempfile::TempDir::new().unwrap();
+    let server = Server::init(data_dir.path()).unwrap();
+
+    assert!(
+        Arc::strong_count(&server.heap.last_checkpoint_lsn) >= 2,
+        "persistent heap checkpoint LSN must be shared with checkpointer"
+    );
+}
+
 #[cfg(unix)]
 #[test]
 fn server_init_refuses_symlinked_data_dir() {

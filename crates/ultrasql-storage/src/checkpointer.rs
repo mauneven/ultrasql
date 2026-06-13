@@ -19,9 +19,9 @@
 //! 3. Log the result with [`tracing::debug`] on success or [`tracing::warn`]
 //!    on writer error. The thread **continues** on writer errors; it does not
 //!    bring down the system.
-//! 4. Optionally append a `RecordType::Checkpoint` WAL record via the sink —
-//!    **TODO(v0.4)**: the checkpointer does not yet know which redo-from LSN
-//!    to record, so this step is deferred.
+//! 4. Publish the WAL's durable LSN to the shared checkpoint-LSN atomic, when
+//!    supplied, so the heap can emit full-page-write records on first page
+//!    mutations after the checkpoint.
 //!
 //! # Shutdown
 //!
@@ -39,6 +39,7 @@
 
 use std::io;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
@@ -95,6 +96,9 @@ impl Checkpointer {
     /// When a WAL `sink` is supplied, only pages whose page-LSN is ≤
     /// `sink.durable_lsn()` are flushed; this preserves the WAL-ahead-of-data
     /// invariant. Pass `None` to flush all dirty pages regardless of LSN.
+    /// When `last_checkpoint_lsn` is supplied with a `sink`, each successful
+    /// flush cycle publishes the sink's durable LSN into that atomic. The heap
+    /// uses the value to decide when a full-page-write record is required.
     ///
     /// # Arguments
     ///
@@ -107,7 +111,8 @@ impl Checkpointer {
     /// - `config`: tuning knobs, most importantly the flush interval.
     pub fn spawn<L, F>(
         pool: &Arc<BufferPool<L>>,
-        _sink: Option<Arc<dyn WalSink>>,
+        sink: Option<Arc<dyn WalSink>>,
+        last_checkpoint_lsn: Option<Arc<AtomicU64>>,
         writer: F,
         config: CheckpointerConfig,
     ) -> Self
@@ -121,7 +126,16 @@ impl Checkpointer {
 
         let handle = thread::Builder::new()
             .name(String::from("ultrasql-checkpointer"))
-            .spawn(move || Self::run(&pool_clone, writer, config, &thread_shared))
+            .spawn(move || {
+                Self::run(
+                    &pool_clone,
+                    sink,
+                    last_checkpoint_lsn,
+                    writer,
+                    config,
+                    &thread_shared,
+                )
+            })
             .ok();
 
         Self { shared, handle }
@@ -158,6 +172,8 @@ impl Checkpointer {
     /// thread immediately rather than waiting for the next interval.
     fn run<L, F>(
         pool: &Arc<BufferPool<L>>,
+        sink: Option<Arc<dyn WalSink>>,
+        last_checkpoint_lsn: Option<Arc<AtomicU64>>,
         mut writer: F,
         config: CheckpointerConfig,
         shared: &Arc<Shared>,
@@ -190,9 +206,15 @@ impl Checkpointer {
                     total_flushed = checked_checkpoint_flush_count_add(total_flushed, n)?;
                     if n > 0 {
                         debug!(pages = n, "checkpointer: flushed dirty pages");
+                        if let (Some(sink), Some(last_checkpoint_lsn)) =
+                            (sink.as_ref(), last_checkpoint_lsn.as_ref())
+                        {
+                            let durable = sink.durable_lsn().raw();
+                            if durable > 0 {
+                                last_checkpoint_lsn.fetch_max(durable, Ordering::AcqRel);
+                            }
+                        }
                     }
-                    // TODO(v0.4): append a RecordType::Checkpoint WAL record
-                    // here once the checkpointer knows the redo-from LSN.
                 }
                 Err(e) => {
                     // Writer errors are non-fatal for the checkpointer; the
@@ -276,7 +298,7 @@ mod tests {
         let config = CheckpointerConfig {
             interval: Duration::from_millis(50),
         };
-        let ckpt = Checkpointer::spawn(&pool, None, |_pid, _page| Ok(()), config);
+        let ckpt = Checkpointer::spawn(&pool, None, None, |_pid, _page| Ok(()), config);
         std::thread::sleep(Duration::from_millis(50));
         let count = ckpt.shutdown().expect("checkpointer should not panic");
         // No dirty pages, so no flushes expected.
@@ -328,6 +350,7 @@ mod tests {
         let ckpt = Checkpointer::spawn(
             &pool,
             Some(sink),
+            None,
             move |_pid, _page| {
                 flush_count_clone.fetch_add(1, Ordering::SeqCst);
                 Ok(())
@@ -347,6 +370,63 @@ mod tests {
         assert!(
             total >= 1,
             "shutdown must return flush count > 0; got {total}"
+        );
+    }
+
+    #[test]
+    fn checkpointer_advances_checkpoint_lsn_after_durable_flush() {
+        use std::sync::atomic::AtomicU64;
+
+        use crate::wal_sink::WalSink;
+        use crate::wal_sink::WalSinkError;
+        use ultrasql_core::Lsn;
+        use ultrasql_core::Xid;
+        use ultrasql_wal::WalRecord;
+
+        struct DurableSink;
+        impl WalSink for DurableSink {
+            fn append(&self, _record: WalRecord) -> Result<Lsn, WalSinkError> {
+                Ok(Lsn::ZERO)
+            }
+            fn durable_lsn(&self) -> Lsn {
+                Lsn::new(100)
+            }
+            fn last_lsn_for(&self, _xid: Xid) -> Lsn {
+                Lsn::ZERO
+            }
+        }
+
+        let sink: Arc<dyn WalSink> = Arc::new(DurableSink);
+        let checkpoint_lsn = Arc::new(AtomicU64::new(0));
+        let pool = Arc::new(BufferPool::with_wal(4, BlankLoader, Arc::clone(&sink)));
+        {
+            let g = pool.get_page(pid(0)).unwrap();
+            let mut w = g.write();
+            w.set_lsn(50);
+        }
+
+        let ckpt = Checkpointer::spawn(
+            &pool,
+            Some(sink),
+            Some(Arc::clone(&checkpoint_lsn)),
+            |_pid, _page| Ok(()),
+            CheckpointerConfig {
+                interval: Duration::from_millis(1),
+            },
+        );
+
+        for _ in 0..100 {
+            if checkpoint_lsn.load(Ordering::SeqCst) == 100 {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        ckpt.shutdown().expect("checkpointer should not panic");
+
+        assert_eq!(
+            checkpoint_lsn.load(Ordering::SeqCst),
+            100,
+            "checkpointer must publish durable LSN after flushing checkpointed pages"
         );
     }
 }
