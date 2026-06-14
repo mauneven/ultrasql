@@ -27,7 +27,7 @@ use ultrasql_core::{Lsn, Xid};
 
 use crate::RecordType;
 use crate::payload::CommitPayload;
-use crate::record::{WalRecord, WalRecordError};
+use crate::record::{RECORD_HEADER_SIZE, WalRecord, WalRecordError};
 use crate::segment::list_segments;
 
 const DEFAULT_RECOVERY_SEGMENT_READ_LIMIT_BYTES: u64 = 128 * 1024 * 1024;
@@ -233,6 +233,12 @@ pub fn recover_with_target(
                     return Ok(Lsn::new(last_good_pos));
                 }
                 Err(WalRecordError::CrcMismatch { expected, actual }) => {
+                    if !crc_mismatch_is_at_segment_tail(&buf, offset)? {
+                        return Err(RecoveryError::Record(WalRecordError::CrcMismatch {
+                            expected,
+                            actual,
+                        }));
+                    }
                     warn!(
                         ?path,
                         expected = format!("{expected:08x}"),
@@ -279,6 +285,34 @@ fn checked_segment_offset(offset: usize, used: usize) -> Result<usize, RecoveryE
         .ok_or(RecoveryError::Record(WalRecordError::Malformed(
             "recovery segment offset overflow",
         )))
+}
+
+fn crc_mismatch_is_at_segment_tail(buf: &[u8], offset: usize) -> Result<bool, RecoveryError> {
+    let remaining = buf
+        .get(offset..)
+        .ok_or(RecoveryError::Record(WalRecordError::Malformed(
+            "recovery segment offset out of bounds",
+        )))?;
+    if remaining.len() < RECORD_HEADER_SIZE {
+        return Ok(true);
+    }
+
+    let total = usize::try_from(u32::from_le_bytes([
+        remaining[0],
+        remaining[1],
+        remaining[2],
+        remaining[3],
+    ]))
+    .map_err(|_| {
+        RecoveryError::Record(WalRecordError::Malformed("total_length does not fit usize"))
+    })?;
+    if total < RECORD_HEADER_SIZE {
+        return Err(RecoveryError::Record(WalRecordError::Malformed(
+            "total_length too small",
+        )));
+    }
+    let record_end = checked_segment_offset(offset, total)?;
+    Ok(record_end == buf.len())
 }
 
 fn read_segment_bytes(path: &Path) -> Result<Vec<u8>, RecoveryError> {
@@ -453,6 +487,41 @@ mod tests {
     }
 
     #[test]
+    fn crc_mismatch_before_later_bytes_is_corruption_not_torn_tail() {
+        let dir = TempDir::new().unwrap();
+        let first = WalRecord::new(RecordType::Nop, Xid::new(10), Lsn::ZERO, 0, Vec::new())
+            .expect("test WAL record should fit size limits");
+        let mut corrupt_middle =
+            WalRecord::new(RecordType::Nop, Xid::new(11), Lsn::ZERO, 0, Vec::new())
+                .expect("test WAL record should fit size limits")
+                .encode();
+        corrupt_middle[RECORD_HEADER_CRC_BYTE_OFFSET_FOR_TEST] ^= 0x01;
+        let third = WalRecord::new(RecordType::Nop, Xid::new(12), Lsn::ZERO, 0, Vec::new())
+            .expect("test WAL record should fit size limits");
+
+        let mut segment = first.encode();
+        segment.extend_from_slice(&corrupt_middle);
+        segment.extend_from_slice(&third.encode());
+        std::fs::write(dir.path().join("segment_0000000000"), segment).unwrap();
+
+        let mut seen = Vec::new();
+        let err = recover(dir.path(), |record| {
+            seen.push(record.header.xid.raw());
+            Ok(())
+        })
+        .expect_err("middle-of-segment CRC mismatch must be fatal corruption");
+
+        assert_eq!(seen, vec![10]);
+        assert!(
+            matches!(
+                err,
+                RecoveryError::Record(WalRecordError::CrcMismatch { .. })
+            ),
+            "{err:?}"
+        );
+    }
+
+    #[test]
     fn recovery_record_end_rejects_stream_position_overflow() {
         let err = super::checked_record_end(u64::MAX, 1)
             .expect_err("record end overflow must not saturate");
@@ -486,4 +555,6 @@ mod tests {
         WalRecord::new(RecordType::Commit, xid, Lsn::ZERO, 0, payload.encode())
             .expect("test WAL record should fit size limits")
     }
+
+    const RECORD_HEADER_CRC_BYTE_OFFSET_FOR_TEST: usize = 4;
 }
