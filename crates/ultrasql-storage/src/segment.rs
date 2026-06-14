@@ -36,7 +36,8 @@
 //! Durability:
 //!
 //! - [`SegmentFileManager::fsync_relation`] syncs every segment file
-//!   owned by the relation via safe [`File::sync_all`].
+//!   owned by the relation via safe [`File::sync_all`], then syncs the
+//!   relation and base directories so segment entries are durable.
 
 use std::fs::{self, File, OpenOptions};
 use std::io;
@@ -694,6 +695,7 @@ impl RelationFiles {
         for seg in segs {
             seg.read().fsync()?;
         }
+        sync_storage_dir(&self.dir)?;
         Ok(())
     }
 }
@@ -784,7 +786,9 @@ impl SegmentFileManager {
     /// Flush all segments owned by `rel` to disk durably.
     pub fn fsync_relation(&self, rel: RelationId) -> Result<(), SegmentError> {
         let r = self.relation(rel)?;
-        r.fsync()
+        r.fsync()?;
+        sync_storage_dir(&self.base_dir)?;
+        Ok(())
     }
 
     /// Truncate `rel` to `n_blocks` blocks. Surplus blocks (and their
@@ -814,6 +818,21 @@ impl SegmentFileManager {
         })?;
         Ok(entry.value().clone())
     }
+}
+
+#[cfg(unix)]
+fn sync_storage_dir(path: &Path) -> io::Result<()> {
+    let dir = File::open(path)?;
+    match dir.sync_all() {
+        Ok(()) => Ok(()),
+        Err(err) if err.kind() == io::ErrorKind::InvalidInput => Ok(()),
+        Err(err) => Err(err),
+    }
+}
+
+#[cfg(not(unix))]
+fn sync_storage_dir(_path: &Path) -> io::Result<()> {
+    Ok(())
 }
 
 fn ensure_storage_dir(
@@ -889,6 +908,14 @@ mod tests {
 
     fn pid(r: u32, b: u32) -> PageId {
         PageId::new(RelationId::new(r), BlockNumber::new(b))
+    }
+
+    #[cfg(unix)]
+    fn assert_permission_denied(err: SegmentError) {
+        match err {
+            SegmentError::Io(err) => assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied),
+            other => panic!("expected PermissionDenied io error, got {other:?}"),
+        }
     }
 
     fn make_payload(tag: u8) -> Vec<u8> {
@@ -1196,6 +1223,43 @@ mod tests {
         mgr.fsync_relation(r).unwrap();
         // Second fsync must also succeed.
         mgr.fsync_relation(r).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn fsync_relation_fails_if_relation_directory_cannot_be_synced() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = TempDir::new().unwrap();
+        let mgr = SegmentFileManager::open(tmp.path(), config_mmap(false)).unwrap();
+        let r = rel(59);
+        mgr.allocate_block(r).unwrap();
+        let rel_dir = tmp.path().join("59");
+        std::fs::set_permissions(&rel_dir, std::fs::Permissions::from_mode(0o300)).unwrap();
+
+        let result = mgr.fsync_relation(r);
+
+        std::fs::set_permissions(&rel_dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let err = result.expect_err("relation fsync must fail if relation dir cannot be synced");
+        assert_permission_denied(err);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn fsync_relation_fails_if_base_directory_cannot_be_synced() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = TempDir::new().unwrap();
+        let mgr = SegmentFileManager::open(tmp.path(), config_mmap(false)).unwrap();
+        let r = rel(61);
+        mgr.allocate_block(r).unwrap();
+        std::fs::set_permissions(tmp.path(), std::fs::Permissions::from_mode(0o300)).unwrap();
+
+        let result = mgr.fsync_relation(r);
+
+        std::fs::set_permissions(tmp.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let err = result.expect_err("relation fsync must fail if base dir cannot be synced");
+        assert_permission_denied(err);
     }
 
     #[test]
