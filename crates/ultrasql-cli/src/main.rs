@@ -1076,7 +1076,13 @@ async fn run(cli: Cli) -> Result<()> {
     }
 
     if let Some(dest) = &cli.pg_dump {
-        run_pg_dump(&cli.data_dir, dest, cli.dump_format)?;
+        run_pg_dump_fenced(
+            &cli.data_dir,
+            dest,
+            cli.dump_format,
+            cli.ops_endpoint.as_deref(),
+        )
+        .await?;
         return Ok(());
     }
 
@@ -1559,13 +1565,68 @@ fn basebackup_manifest_text(
 }
 
 fn json_escape(value: &str) -> String {
-    value
-        .replace('\\', "\\\\")
-        .replace('"', "\\\"")
-        .replace('\n', "\\n")
+    let mut escaped = String::with_capacity(value.len());
+    for ch in value.chars() {
+        match ch {
+            '\\' => escaped.push_str("\\\\"),
+            '"' => escaped.push_str("\\\""),
+            '\n' => escaped.push_str("\\n"),
+            '\r' => escaped.push_str("\\r"),
+            '\t' => escaped.push_str("\\t"),
+            '\u{08}' => escaped.push_str("\\b"),
+            '\u{0c}' => escaped.push_str("\\f"),
+            ch if ch.is_control() => {
+                write!(&mut escaped, "\\u{:04x}", u32::from(ch))
+                    .expect("writing to String cannot fail");
+            }
+            ch => escaped.push(ch),
+        }
+    }
+    escaped
 }
 
+#[cfg(test)]
 fn run_pg_dump(data_dir: &Path, dest: &Path, format: DumpFormat) -> Result<()> {
+    run_pg_dump_with_fence(data_dir, dest, format, None)
+}
+
+async fn run_pg_dump_fenced(
+    data_dir: &Path,
+    dest: &Path,
+    format: DumpFormat,
+    ops_endpoint: Option<&str>,
+) -> Result<()> {
+    let checkpoint_fence = if let Some(endpoint) = ops_endpoint {
+        let response = http_post_ops_endpoint(endpoint, "/backup/start").await?;
+        if !response.ok {
+            anyhow::bail!("dump fence start failed: {}", response.body.trim());
+        }
+        Some(response.body)
+    } else {
+        None
+    };
+
+    let dump_result = run_pg_dump_with_fence(data_dir, dest, format, checkpoint_fence.as_deref());
+    if let Some(endpoint) = ops_endpoint {
+        let stop_result = http_post_ops_endpoint(endpoint, "/backup/stop").await;
+        if dump_result.is_ok() {
+            let response = stop_result?;
+            if !response.ok {
+                anyhow::bail!("dump fence stop failed: {}", response.body.trim());
+            }
+        } else {
+            let _ = stop_result;
+        }
+    }
+    dump_result
+}
+
+fn run_pg_dump_with_fence(
+    data_dir: &Path,
+    dest: &Path,
+    format: DumpFormat,
+    checkpoint_fence: Option<&str>,
+) -> Result<()> {
     match format {
         DumpFormat::Directory => {
             if path_exists_or_symlink(dest)? {
@@ -1582,7 +1643,7 @@ fn run_pg_dump(data_dir: &Path, dest: &Path, format: DumpFormat) -> Result<()> {
             manifest.sort_by(|a, b| a.0.cmp(&b.0));
             write_regular_file(
                 &dest.join("ultrasql_dump.manifest"),
-                dump_manifest_text(&manifest).as_bytes(),
+                dump_manifest_text_with_fence(&manifest, checkpoint_fence).as_bytes(),
                 "dump manifest",
             )?;
             println!(
@@ -1600,6 +1661,14 @@ fn run_pg_dump(data_dir: &Path, dest: &Path, format: DumpFormat) -> Result<()> {
             entries.sort_by(|a, b| a.0.cmp(&b.0));
             let mut out = String::new();
             writeln!(&mut out, "ULTRASQL_DUMP_V1 format={format:?}")?;
+            if let Some(fence) = checkpoint_fence {
+                writeln!(
+                    &mut out,
+                    "CHECKPOINT_FENCE_HEX {} {}",
+                    hex_bytes(fence.as_bytes()),
+                    json_escape(fence)
+                )?;
+            }
             for (path, bytes) in &entries {
                 if path.contains('\n') {
                     anyhow::bail!("cannot dump path containing newline: {path}");
@@ -1640,6 +1709,9 @@ fn run_pg_restore(source: &Path, data_dir: &Path) -> Result<()> {
     }
     while let Some(line) = lines.next() {
         if line.trim().is_empty() {
+            continue;
+        }
+        if line.starts_with("CHECKPOINT_FENCE_HEX ") {
             continue;
         }
         let Some(rest) = line.strip_prefix("FILE ") else {
@@ -1729,7 +1801,15 @@ fn checksum_hex(bytes: &[u8]) -> String {
     format!("{:016x}", hasher.finish())
 }
 
+#[cfg(test)]
 fn dump_manifest_text(manifest: &[(String, u64, String)]) -> String {
+    dump_manifest_text_with_fence(manifest, None)
+}
+
+fn dump_manifest_text_with_fence(
+    manifest: &[(String, u64, String)],
+    checkpoint_fence: Option<&str>,
+) -> String {
     let mut text = String::from("{\n  \"files\": [\n");
     for (idx, (path, bytes, checksum)) in manifest.iter().enumerate() {
         let comma = if idx + 1 == manifest.len() { "" } else { "," };
@@ -1738,7 +1818,14 @@ fn dump_manifest_text(manifest: &[(String, u64, String)]) -> String {
             "    {{\"path\":\"{escaped}\",\"bytes\":{bytes},\"checksum\":\"{checksum}\"}}{comma}\n"
         ));
     }
-    text.push_str("  ]\n}\n");
+    text.push_str("  ]");
+    if let Some(fence) = checkpoint_fence {
+        text.push_str(&format!(
+            ",\n  \"checkpoint_fence\":\"{}\"",
+            json_escape(fence)
+        ));
+    }
+    text.push_str("\n}\n");
     text
 }
 
@@ -2721,6 +2808,45 @@ mod tests {
         assert!(stop.starts_with("POST /backup/stop HTTP/1.1"), "{stop}");
     }
 
+    #[tokio::test]
+    async fn pg_dump_fence_uses_post_requests_and_records_metadata() {
+        let data_dir = tempfile::tempdir().expect("data dir");
+        fs::create_dir_all(data_dir.path().join("base/1")).expect("data tree");
+        fs::write(data_dir.path().join("base/1/heap"), b"rows").expect("data file");
+        let dump_parent = tempfile::tempdir().expect("dump parent");
+        let archive = dump_parent.path().join("dump.ultra");
+        let (endpoint, mut requests) = spawn_recording_http(vec![
+            "HTTP/1.1 200 OK\r\ncontent-length: 44\r\n\r\n{\"status\":\"backup_started\",\"flushed_lsn\":7}"
+                .to_owned(),
+            "HTTP/1.1 200 OK\r\ncontent-length: 19\r\n\r\n{\"status\":\"stop\"}".to_owned(),
+        ])
+        .await;
+
+        run_pg_dump_fenced(
+            data_dir.path(),
+            &archive,
+            DumpFormat::Custom,
+            Some(&endpoint.to_string()),
+        )
+        .await
+        .expect("fenced pg dump");
+
+        let start = requests.recv().await.expect("start request");
+        let stop = requests.recv().await.expect("stop request");
+        assert!(start.starts_with("POST /backup/start HTTP/1.1"), "{start}");
+        assert!(stop.starts_with("POST /backup/stop HTTP/1.1"), "{stop}");
+        let text = fs::read_to_string(&archive).expect("dump archive");
+        assert!(text.contains("CHECKPOINT_FENCE_HEX"));
+        assert!(text.contains("backup_started"));
+
+        let restored = dump_parent.path().join("restored");
+        run_pg_restore(&archive, &restored).expect("restore fenced archive");
+        assert_eq!(
+            fs::read(restored.join("base/1/heap")).expect("restored heap"),
+            b"rows"
+        );
+    }
+
     async fn spawn_one_shot_http(response: &'static str) -> std::net::SocketAddr {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -3018,6 +3144,7 @@ mod tests {
 
         assert!(dump_manifest_text(&[("a\"b".to_owned(), 3, "abc".to_owned())]).contains("a\\\"b"));
         assert_eq!(json_escape("\"\\\n"), "\\\"\\\\\\n");
+        assert_eq!(json_escape("\r\t\u{0001}"), "\\r\\t\\u0001");
         assert_eq!(checksum_hex(b"same"), checksum_hex(b"same"));
         assert!(run_pg_restore(&dir.path().join("missing.dump"), &dir.path().join("bad")).is_err());
     }

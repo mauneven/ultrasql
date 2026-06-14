@@ -20,6 +20,11 @@ ultrasql --data-dir target/restored-data validate
 UltraSQL archive in custom, directory, and tar modes. `--pg-restore` rehydrates
 that archive into a target data directory.
 
+When `--ops-endpoint` is supplied, `--basebackup` and `--pg-dump` call the
+server backup fence before and after copying. The dump records the returned
+checkpoint fence in the archive or directory manifest so reviewers can tell
+whether an online copy used the fence path.
+
 ## Smoke Runner
 
 Run the committed smoke:
@@ -54,7 +59,7 @@ actually exercised. Missing local prerequisites such as `psql` are recorded as
 ## Clean-Copy Rule
 
 For release evidence, copy a data directory only after writers are stopped or
-after a future checkpoint-fenced online-backup path is documented. The current
-runner uses a small local server and stops it before the physical copy. Do not
-publish backup/restore evidence from a live directory copy without an explicit
-checkpoint-fencing note.
+through the checkpoint-fenced `--ops-endpoint` path. The current runner uses a
+small local server and stops it before the physical copy. Do not publish
+backup/restore evidence from a live directory copy without the recorded
+checkpoint-fencing metadata.
