@@ -486,6 +486,7 @@ pub(crate) fn row_description_for_plan_with_formats(
             | LogicalPlan::CommitPrepared { .. }
             | LogicalPlan::RollbackPrepared { .. }
             | LogicalPlan::SetTransaction { .. }
+            | LogicalPlan::Checkpoint { .. }
             | LogicalPlan::Listen { .. }
             | LogicalPlan::Notify { .. }
             | LogicalPlan::Unlisten { .. }

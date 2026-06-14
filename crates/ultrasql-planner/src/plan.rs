@@ -1104,6 +1104,15 @@ pub enum LogicalPlan {
         schema: Schema,
     },
 
+    /// `CHECKPOINT` — force a WAL durability barrier, flush eligible dirty
+    /// pages, and append a checkpoint WAL record.
+    ///
+    /// `schema` is always [`Schema::empty`].
+    Checkpoint {
+        /// Always [`Schema::empty`].
+        schema: Schema,
+    },
+
     /// `BEGIN [TRANSACTION]` — open an explicit transaction block.
     ///
     /// The planner produces this variant unconditionally; the server
@@ -1900,6 +1909,7 @@ impl LogicalPlan {
                 | Self::AlterSequence { .. }
                 | Self::DropSequence { .. }
                 | Self::Comment { .. }
+                | Self::Checkpoint { .. }
                 | Self::Begin { .. }
                 | Self::Commit { .. }
                 | Self::Rollback { .. }
@@ -1971,6 +1981,7 @@ impl LogicalPlan {
             | Self::AlterSequence { .. }
             | Self::DropSequence { .. }
             | Self::Comment { .. }
+            | Self::Checkpoint { .. }
             | Self::Begin { .. }
             | Self::Commit { .. }
             | Self::Rollback { .. }
@@ -2033,6 +2044,7 @@ impl LogicalPlan {
             | Self::AlterSequence { schema, .. }
             | Self::DropSequence { schema, .. }
             | Self::Comment { schema, .. }
+            | Self::Checkpoint { schema }
             | Self::Begin { schema, .. }
             | Self::Commit { schema }
             | Self::Rollback { schema }
@@ -3069,6 +3081,10 @@ impl LogicalPlan {
                         out.push_str("Describe: Query\n");
                     }
                 }
+            }
+            Self::Checkpoint { .. } => {
+                out.push_str(&pad);
+                out.push_str("Checkpoint\n");
             }
             Self::SetRole { role_name, .. } => {
                 out.push_str(&pad);

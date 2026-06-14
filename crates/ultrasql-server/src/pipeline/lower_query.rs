@@ -349,6 +349,7 @@ fn lower_query_inner(
         | LogicalPlan::SetTransaction { .. }
         | LogicalPlan::SetVariable { .. }
         | LogicalPlan::Describe { .. }
+        | LogicalPlan::Checkpoint { .. }
         | LogicalPlan::SetRole { .. } => Err(ServerError::Unsupported(
             "session control reached operator lowerer; expected direct dispatch path",
         )),
@@ -709,6 +710,7 @@ fn profile_operator_name(plan: &LogicalPlan) -> &'static str {
         LogicalPlan::SetTransaction { .. } => "SetTransaction",
         LogicalPlan::SetVariable { .. } => "SetVariable",
         LogicalPlan::Describe { .. } => "Describe",
+        LogicalPlan::Checkpoint { .. } => "Checkpoint",
         LogicalPlan::SetRole { .. } => "SetRole",
         LogicalPlan::Explain { .. } => "Explain",
         LogicalPlan::Listen { .. } => "Listen",

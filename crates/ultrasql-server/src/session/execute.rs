@@ -508,6 +508,9 @@ where
             return Err(ServerError::TransactionAborted);
         }
 
+        if matches!(&plan, LogicalPlan::Checkpoint { .. }) {
+            return self.execute_checkpoint(&plan);
+        }
         if matches!(&plan, LogicalPlan::SetVariable { .. }) {
             return self.execute_set_variable(&plan, true);
         }
@@ -551,6 +554,7 @@ where
                 | LogicalPlan::AlterSequence { .. }
                 | LogicalPlan::DropSequence { .. }
                 | LogicalPlan::Comment { .. }
+                | LogicalPlan::Checkpoint { .. }
                 | LogicalPlan::DropTable { .. }
                 | LogicalPlan::AlterTable { .. }
                 | LogicalPlan::Truncate { .. }
@@ -629,6 +633,9 @@ where
             }
             LogicalPlan::Comment { .. } => {
                 return self.execute_comment(&plan, &catalog_snapshot);
+            }
+            LogicalPlan::Checkpoint { .. } => {
+                return self.execute_checkpoint(&plan);
             }
             LogicalPlan::DropTable { .. } => {
                 return self.execute_drop_table(&plan);
@@ -715,6 +722,7 @@ where
                 | LogicalPlan::AlterSequence { .. }
                 | LogicalPlan::DropSequence { .. }
                 | LogicalPlan::Comment { .. }
+                | LogicalPlan::Checkpoint { .. }
                 | LogicalPlan::DropTable { .. }
                 | LogicalPlan::AlterTable { .. }
                 | LogicalPlan::Truncate { .. }
@@ -758,10 +766,30 @@ where
             LogicalPlan::AlterSequence { .. } => self.execute_alter_sequence(plan),
             LogicalPlan::DropSequence { .. } => self.execute_drop_sequence(plan),
             LogicalPlan::Comment { .. } => self.execute_comment(plan, catalog_snapshot),
+            LogicalPlan::Checkpoint { .. } => self.execute_checkpoint(plan),
             LogicalPlan::DropTable { .. } => self.execute_drop_table(plan),
             LogicalPlan::AlterTable { .. } => self.execute_alter_table(plan, catalog_snapshot),
             LogicalPlan::Truncate { .. } => self.execute_truncate(plan, catalog_snapshot),
             _ => Err(ServerError::Unsupported("execute_ddl_plan: wrong plan")),
+        }
+    }
+
+    pub(crate) fn execute_checkpoint(
+        &mut self,
+        plan: &LogicalPlan,
+    ) -> Result<SelectResult, ServerError> {
+        let LogicalPlan::Checkpoint { .. } = plan else {
+            return Err(ServerError::Unsupported("execute_checkpoint: wrong plan"));
+        };
+        match self.txn_state {
+            TxnState::Idle => {
+                self.state.perform_checkpoint()?;
+                Ok(run_ddl_command("CHECKPOINT"))
+            }
+            TxnState::InTransaction(_) => Err(self.fail_if_in_transaction(
+                ServerError::Unsupported("CHECKPOINT inside an explicit transaction block"),
+            )),
+            TxnState::Failed(_) => Err(ServerError::TransactionAborted),
         }
     }
 

@@ -41,6 +41,11 @@ pub enum Statement {
     Truncate(TruncateStmt),
     /// `DESCRIBE [TABLE|VIEW] object` or `DESCRIBE SELECT ...`.
     Describe(DescribeStmt),
+    /// `CHECKPOINT`.
+    Checkpoint {
+        /// Source span.
+        span: Span,
+    },
     /// `BEGIN [TRANSACTION] [ISOLATION LEVEL …]`.
     Begin {
         /// Optional isolation level requested by the client.
@@ -202,6 +207,7 @@ impl Statement {
             Self::Delete(s) => s.span,
             Self::Truncate(s) => s.span,
             Self::Describe(s) => s.span,
+            Self::Checkpoint { span } => *span,
             Self::Begin { span, .. } | Self::Commit { span } | Self::Rollback { span } => *span,
             Self::CreateTable(s) => s.span,
             Self::CreateTableAs(s) => s.span,

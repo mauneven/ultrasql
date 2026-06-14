@@ -356,11 +356,27 @@ impl<'src> Parser<'src> {
             {
                 self.parse_describe().map(Statement::Describe)
             }
+            TokenKind::Identifier
+                if head
+                    .text(self.source)
+                    .is_some_and(|text| text.eq_ignore_ascii_case("checkpoint")) =>
+            {
+                let tok = self.advance()?;
+                let next = *self.peek()?;
+                if !matches!(next.kind, TokenKind::Semicolon | TokenKind::Eof) {
+                    return Err(ParseError::Expected {
+                        expected: "';' or end of input after CHECKPOINT",
+                        found: next.kind,
+                        offset: next.span.start_usize(),
+                    });
+                }
+                Ok(Statement::Checkpoint { span: tok.span })
+            }
             other => Err(ParseError::Expected {
                 expected: "SELECT, INSERT, UPDATE, DELETE, TRUNCATE, CREATE, DROP, ALTER, \
                            COMMENT, REINDEX, SET, SHOW, RESET, BEGIN, COMMIT, ROLLBACK, SAVEPOINT, \
                            RELEASE, EXPLAIN, PREPARE, EXECUTE, GRANT, REVOKE, DEALLOCATE, \
-                           LISTEN, NOTIFY, UNLISTEN, or COPY",
+                           LISTEN, NOTIFY, UNLISTEN, COPY, DESCRIBE, or CHECKPOINT",
                 found: other,
                 offset: head.span.start_usize(),
             }),

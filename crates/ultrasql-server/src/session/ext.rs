@@ -432,6 +432,26 @@ where
         }
 
         if let Some(ref plan) = plan_clone
+            && matches!(plan, LogicalPlan::Checkpoint { .. })
+        {
+            match self.execute_checkpoint(plan) {
+                Ok(result) => {
+                    for m in &result.messages {
+                        self.send(m).await?;
+                    }
+                    return Ok(());
+                }
+                Err(e) => {
+                    if !e.is_query_scoped() {
+                        return Err(e);
+                    }
+                    self.extended.mark_failed();
+                    return self.send_error(&e.to_string(), e.sqlstate()).await;
+                }
+            }
+        }
+
+        if let Some(ref plan) = plan_clone
             && Self::is_ddl_plan(plan)
         {
             let catalog_snapshot = self.state.catalog_snapshot();

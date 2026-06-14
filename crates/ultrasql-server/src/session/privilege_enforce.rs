@@ -418,6 +418,7 @@ where
             | LogicalPlan::SetTransaction { .. }
             | LogicalPlan::SetVariable { .. }
             | LogicalPlan::Describe { .. }
+            | LogicalPlan::Checkpoint { .. }
             | LogicalPlan::SetRole { .. }
             | LogicalPlan::Listen { .. }
             | LogicalPlan::Notify { .. }

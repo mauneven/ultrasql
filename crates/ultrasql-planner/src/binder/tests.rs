@@ -159,6 +159,13 @@ fn describe_view_reports_unsupported_until_view_catalog_metadata_exists() {
 }
 
 #[test]
+fn binds_checkpoint_as_empty_session_control_plan() {
+    let plan = parse_bind_ok("CHECKPOINT");
+    assert!(matches!(plan, LogicalPlan::Checkpoint { .. }));
+    assert!(plan.schema().is_empty());
+}
+
+#[test]
 fn binds_explicit_public_dotted_table_name() {
     let schema = Schema::new([Field::required("id", DataType::Int32)]).expect("schema ok");
     let mut cat = InMemoryCatalog::new();
@@ -4154,6 +4161,7 @@ fn collect_window_funcs<'a>(plan: &'a LogicalPlan, out: &mut Vec<&'a LogicalWind
         | LogicalPlan::SetTransaction { .. }
         | LogicalPlan::SetVariable { .. }
         | LogicalPlan::Describe { .. }
+        | LogicalPlan::Checkpoint { .. }
         | LogicalPlan::SetRole { .. }
         | LogicalPlan::Listen { .. }
         | LogicalPlan::Notify { .. }

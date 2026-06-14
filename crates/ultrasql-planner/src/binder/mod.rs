@@ -121,6 +121,9 @@ pub fn bind(stmt: &Statement, catalog: &dyn Catalog) -> Result<LogicalPlan, Plan
         Statement::Delete(s) => bind_delete(s, catalog, &mut scope),
         Statement::Truncate(s) => bind_truncate(s, catalog),
         Statement::Describe(s) => bind_describe(s, catalog, &mut scope),
+        Statement::Checkpoint { .. } => Ok(LogicalPlan::Checkpoint {
+            schema: Schema::empty(),
+        }),
         Statement::CreateTable(s) => bind_create_table(s, catalog),
         Statement::CreateMaterializedView(s) => bind_create_materialized_view(s, catalog),
         Statement::CreateType(s) => bind_create_type(s, catalog),

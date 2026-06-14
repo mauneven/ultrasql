@@ -593,6 +593,34 @@ impl<L: PageLoader> BufferPool<L> {
         }
     }
 
+    /// Return the oldest page-LSN among dirty resident frames.
+    ///
+    /// This is a checkpoint helper: after a WAL durability barrier and a
+    /// dirty-page flush, any remaining dirty page older than the barrier
+    /// becomes the conservative redo start for the checkpoint record.
+    #[must_use]
+    pub fn oldest_dirty_lsn(&self) -> Option<ultrasql_core::Lsn> {
+        let mut oldest: Option<u64> = None;
+        for frame in &self.frames {
+            if !frame.dirty.load(Ordering::Acquire) {
+                continue;
+            }
+            if frame.page_id.lock().is_none() {
+                continue;
+            }
+            let page_guard = frame.page.read();
+            let Some(page) = page_guard.as_ref() else {
+                continue;
+            };
+            let page_lsn = page.header().lsn;
+            oldest = Some(match oldest {
+                Some(current) if current <= page_lsn => current,
+                _ => page_lsn,
+            });
+        }
+        oldest.map(ultrasql_core::Lsn::new)
+    }
+
     /// Return cumulative counters for one relation.
     #[must_use]
     pub fn relation_stats(&self, relation: RelationId) -> BufferPoolRelationStats {
@@ -1037,6 +1065,27 @@ mod tests {
             0,
             "dirty bit must be cleared after flush"
         );
+    }
+
+    #[test]
+    fn oldest_dirty_lsn_reports_minimum_dirty_page_lsn() {
+        let pool = Arc::new(BufferPool::new(4, BlankLoader));
+
+        {
+            let g = pool.get_page(pid(0)).unwrap();
+            let mut w = g.write();
+            w.set_lsn(75);
+        }
+        {
+            let g = pool.get_page(pid(1)).unwrap();
+            let mut w = g.write();
+            w.set_lsn(25);
+        }
+        {
+            let _clean = pool.get_page(pid(2)).unwrap();
+        }
+
+        assert_eq!(pool.oldest_dirty_lsn(), Some(Lsn::new(25)));
     }
 
     /// Pool with sink at `durable_lsn=10`, page `lsn=100`. The page's LSN is

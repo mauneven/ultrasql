@@ -112,10 +112,10 @@ Docs commits happen only after passing implementation tests for that family.
 - Add checkpoint helper on `Server` near `flush_dirty_heap_pages`.
 - Add tests in `crates/ultrasql-server/tests/checkpoint_round_trip.rs` and storage/WAL unit tests if new helpers are added.
 
-- [ ] Parse bare `CHECKPOINT`; reject options until supported.
-- [ ] Bind to empty-schema `LogicalPlan::Checkpoint`.
-- [ ] Execute by notifying WAL writer, waiting for durable LSN, flushing dirty pages whose page LSN is durable, appending checkpoint WAL record, waiting for it durable, and publishing `last_checkpoint_lsn`.
-- [ ] For in-memory server without WAL writer, return successful no-op after dirty-page flush.
+- [x] Parse bare `CHECKPOINT`; reject options until supported.
+- [x] Bind to empty-schema `LogicalPlan::Checkpoint`.
+- [x] Execute by notifying WAL writer, waiting for durable LSN, flushing dirty pages whose page LSN is durable, appending checkpoint WAL record, waiting for it durable, and publishing `last_checkpoint_lsn`.
+- [x] For in-memory server without WAL writer, return successful no-op after dirty-page flush.
 - [ ] Add concurrent read/write safety tests using existing server test harness.
 
 ## Phase 5: EXPORT DATABASE / IMPORT DATABASE

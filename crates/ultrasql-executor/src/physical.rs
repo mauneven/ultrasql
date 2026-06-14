@@ -210,6 +210,7 @@ pub fn build_operator(
         | LogicalPlan::RollbackPrepared { .. }
         | LogicalPlan::SetTransaction { .. }
         | LogicalPlan::SetVariable { .. }
+        | LogicalPlan::Checkpoint { .. }
         | LogicalPlan::SetRole { .. } => Err(BuildError::Unsupported(
             "session-control statements are dispatched outside the operator pipeline",
         )),

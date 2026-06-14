@@ -123,6 +123,7 @@ pub fn lower_plan(
         | LogicalPlan::SetTransaction { .. }
         | LogicalPlan::SetVariable { .. }
         | LogicalPlan::Describe { .. }
+        | LogicalPlan::Checkpoint { .. }
         | LogicalPlan::SetRole { .. } => Err(ServerError::Unsupported(
             "session control reached operator lowerer; expected direct dispatch path",
         )),

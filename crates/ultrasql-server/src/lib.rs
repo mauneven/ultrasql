@@ -4714,6 +4714,52 @@ impl Server {
             .map_err(|e| ServerError::ddl(format!("abort WAL append: {e}")))
     }
 
+    /// Force a WAL durability barrier, flush eligible heap pages, then append
+    /// and fsync a checkpoint record.
+    pub(crate) fn perform_checkpoint(&self) -> Result<(), ServerError> {
+        let Some(wal) = self.heap.wal_sink() else {
+            self.flush_dirty_heap_pages()?;
+            return Ok(());
+        };
+
+        let barrier = WalRecord::new(RecordType::Nop, Xid::INVALID, Lsn::ZERO, 0, Vec::new())
+            .map_err(|e| ServerError::ddl(format!("checkpoint barrier WAL record encode: {e}")))?;
+        let barrier_lsn = wal
+            .append(barrier)
+            .map_err(|e| ServerError::ddl(format!("checkpoint barrier WAL append: {e}")))?;
+        self.wait_for_wal_durable(barrier_lsn)?;
+
+        self.flush_dirty_heap_pages()?;
+
+        let redo_from = self
+            .heap
+            .buffer_pool()
+            .oldest_dirty_lsn()
+            .filter(|oldest| oldest.raw() < barrier_lsn.raw())
+            .unwrap_or(barrier_lsn);
+        let payload = CheckpointPayload {
+            redo_from,
+            oldest_in_progress: self.txn_manager.oldest_in_progress(),
+            next_xid: self.txn_manager.next_xid(),
+        };
+        let checkpoint = WalRecord::new(
+            RecordType::Checkpoint,
+            Xid::INVALID,
+            Lsn::ZERO,
+            0,
+            payload.encode(),
+        )
+        .map_err(|e| ServerError::ddl(format!("checkpoint WAL record encode: {e}")))?;
+        let checkpoint_lsn = wal
+            .append(checkpoint)
+            .map_err(|e| ServerError::ddl(format!("checkpoint WAL append: {e}")))?;
+        self.wait_for_wal_durable(checkpoint_lsn)?;
+        self.heap
+            .last_checkpoint_lsn
+            .fetch_max(checkpoint_lsn.raw(), std::sync::atomic::Ordering::AcqRel);
+        Ok(())
+    }
+
     /// Wait until the runtime WAL writer has fsynced at least `lsn`.
     pub(crate) fn wait_for_wal_durable(&self, lsn: Lsn) -> Result<(), ServerError> {
         let Some(writer) = &self.wal_writer else {

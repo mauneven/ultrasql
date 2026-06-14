@@ -452,6 +452,13 @@ impl TransactionManager {
         oldest.unwrap_or_else(|| Xid::new(self.next_xid.load(Ordering::Acquire)))
     }
 
+    /// XID that the next top-level transaction or savepoint allocation will
+    /// hand out.
+    #[must_use]
+    pub fn next_xid(&self) -> Xid {
+        Xid::new(self.next_xid.load(Ordering::Acquire))
+    }
+
     // ---- internal helpers -------------------------------------------------
 
     /// Build a snapshot at this instant for `current_xid` and
@@ -989,6 +996,18 @@ mod tests {
         // assigned so far.
         let oldest = mgr.oldest_in_progress();
         assert_eq!(oldest.raw(), t_xid.raw() + 1);
+    }
+
+    #[test]
+    fn next_xid_reports_allocator_high_water() {
+        let mgr = TransactionManager::new();
+        assert_eq!(mgr.next_xid(), Xid::FIRST_USER);
+
+        let t1 = mgr.begin(IsolationLevel::ReadCommitted);
+        assert_eq!(mgr.next_xid().raw(), t1.xid.raw() + 1);
+
+        let t2 = mgr.begin(IsolationLevel::ReadCommitted);
+        assert_eq!(mgr.next_xid().raw(), t2.xid.raw() + 1);
     }
 
     #[test]

@@ -310,6 +310,23 @@ fn describe_query_statement_is_accepted() {
 }
 
 #[test]
+fn checkpoint_statement_is_accepted() {
+    let stmt = Parser::new("CHECKPOINT")
+        .parse_statement()
+        .expect("CHECKPOINT must parse");
+    assert!(matches!(stmt, Statement::Checkpoint { .. }));
+    assert_eq!(stmt.span().start_usize(), 0);
+}
+
+#[test]
+fn checkpoint_statement_rejects_options() {
+    let err = Parser::new("CHECKPOINT FAST")
+        .parse_statement()
+        .expect_err("CHECKPOINT options are not supported");
+    assert!(matches!(err, ParseError::Expected { .. }));
+}
+
+#[test]
 fn missing_from_returns_select_without_from() {
     let stmt = parse("SELECT 1 + 1");
     let Statement::Select(s) = stmt else { panic!() };
