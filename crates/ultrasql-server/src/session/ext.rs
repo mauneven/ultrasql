@@ -277,6 +277,12 @@ where
                 p.bind_params_redacted,
             )
         });
+        let result_formats = self
+            .extended
+            .portals
+            .get(portal)
+            .map(|p| p.result_formats.clone())
+            .unwrap_or_default();
 
         // Transaction-control plans take the dedicated TxnState dispatch.
         if let Some(ref plan) = plan_clone {
@@ -351,6 +357,23 @@ where
             }
             if matches!(plan, LogicalPlan::SetRole { .. }) {
                 match self.execute_set_role(plan) {
+                    Ok(result) => {
+                        for m in &result.messages {
+                            self.send(m).await?;
+                        }
+                        return Ok(());
+                    }
+                    Err(e) => {
+                        if !e.is_query_scoped() {
+                            return Err(e);
+                        }
+                        self.extended.mark_failed();
+                        return self.send_error(&e.to_string(), e.sqlstate()).await;
+                    }
+                }
+            }
+            if matches!(plan, LogicalPlan::Describe { .. }) {
+                match self.execute_describe(plan, false, &result_formats) {
                     Ok(result) => {
                         for m in &result.messages {
                             self.send(m).await?;

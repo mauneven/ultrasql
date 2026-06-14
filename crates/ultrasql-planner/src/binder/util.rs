@@ -241,6 +241,7 @@ pub(super) fn plan_contains_outer_column(plan: &LogicalPlan) -> bool {
         | LogicalPlan::RollbackPrepared { .. }
         | LogicalPlan::SetTransaction { .. }
         | LogicalPlan::SetVariable { .. }
+        | LogicalPlan::Describe { .. }
         | LogicalPlan::SetRole { .. }
         | LogicalPlan::Listen { .. }
         | LogicalPlan::Notify { .. }

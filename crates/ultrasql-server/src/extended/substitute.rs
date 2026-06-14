@@ -294,6 +294,7 @@ where
         | LogicalPlan::RollbackPrepared { .. }
         | LogicalPlan::SetTransaction { .. }
         | LogicalPlan::SetVariable { .. }
+        | LogicalPlan::Describe { .. }
         | LogicalPlan::SetRole { .. }
         | LogicalPlan::Listen { .. }
         | LogicalPlan::Notify { .. }

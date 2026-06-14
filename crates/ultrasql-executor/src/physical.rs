@@ -221,6 +221,9 @@ pub fn build_operator(
         LogicalPlan::Explain { .. } => Err(BuildError::Unsupported(
             "EXPLAIN is dispatched by the server, not lowered to an executor operator",
         )),
+        LogicalPlan::Describe { .. } => Err(BuildError::Unsupported(
+            "DESCRIBE is dispatched by the server, not lowered to an executor operator",
+        )),
         LogicalPlan::Copy { .. } => Err(BuildError::Unsupported(
             "COPY is dispatched by the server, not lowered to an executor operator",
         )),

@@ -286,6 +286,30 @@ fn parse_statement_slices_preserve_source_text() {
 }
 
 #[test]
+fn describe_table_statement_is_accepted() {
+    let stmt = Parser::new("DESCRIBE TABLE users")
+        .parse_statement()
+        .expect("DESCRIBE TABLE must parse");
+    assert_eq!(stmt.span().start_usize(), 0);
+}
+
+#[test]
+fn describe_object_statement_is_accepted() {
+    let stmt = Parser::new("DESCRIBE users")
+        .parse_statement()
+        .expect("DESCRIBE object must parse");
+    assert_eq!(stmt.span().start_usize(), 0);
+}
+
+#[test]
+fn describe_query_statement_is_accepted() {
+    let stmt = Parser::new("DESCRIBE SELECT 1 AS answer")
+        .parse_statement()
+        .expect("DESCRIBE query must parse");
+    assert_eq!(stmt.span().start_usize(), 0);
+}
+
+#[test]
 fn missing_from_returns_select_without_from() {
     let stmt = parse("SELECT 1 + 1");
     let Statement::Select(s) = stmt else { panic!() };

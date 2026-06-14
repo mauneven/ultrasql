@@ -105,6 +105,60 @@ fn parse_bind_ok(sql: &str) -> LogicalPlan {
 }
 
 #[test]
+fn binds_describe_table_output_schema() {
+    let plan = parse_bind_ok("DESCRIBE TABLE users");
+    let fields = plan.schema().fields();
+    assert_eq!(
+        fields
+            .iter()
+            .map(|field| field.name.as_str())
+            .collect::<Vec<_>>(),
+        vec![
+            "column_name",
+            "data_type",
+            "nullable",
+            "source_schema",
+            "source_object",
+            "source_kind",
+        ]
+    );
+}
+
+#[test]
+fn binds_describe_query_output_schema() {
+    let plan = parse_bind_ok("DESCRIBE SELECT id, name FROM users");
+    let fields = plan.schema().fields();
+    assert_eq!(fields.len(), 6);
+    assert_eq!(fields[0].name, "column_name");
+    let LogicalPlan::Describe {
+        target: LogicalDescribeTarget::Query { query_schema },
+        ..
+    } = plan
+    else {
+        panic!("expected Describe query plan");
+    };
+    assert!(!query_schema.field_at(0).nullable);
+    assert!(query_schema.field_at(1).nullable);
+}
+
+#[test]
+fn describe_missing_object_is_table_not_found() {
+    let cat = users_catalog();
+    let err = parse_and_bind("DESCRIBE missing_users", &cat).expect_err("missing object");
+    assert_eq!(err, PlanError::TableNotFound("missing_users".to_owned()));
+}
+
+#[test]
+fn describe_view_reports_unsupported_until_view_catalog_metadata_exists() {
+    let cat = users_catalog();
+    let err = parse_and_bind("DESCRIBE VIEW users", &cat).expect_err("view describe unsupported");
+    assert_eq!(
+        err,
+        PlanError::NotSupported("DESCRIBE VIEW requires view catalog metadata")
+    );
+}
+
+#[test]
 fn binds_explicit_public_dotted_table_name() {
     let schema = Schema::new([Field::required("id", DataType::Int32)]).expect("schema ok");
     let mut cat = InMemoryCatalog::new();
@@ -4099,6 +4153,7 @@ fn collect_window_funcs<'a>(plan: &'a LogicalPlan, out: &mut Vec<&'a LogicalWind
         | LogicalPlan::RollbackPrepared { .. }
         | LogicalPlan::SetTransaction { .. }
         | LogicalPlan::SetVariable { .. }
+        | LogicalPlan::Describe { .. }
         | LogicalPlan::SetRole { .. }
         | LogicalPlan::Listen { .. }
         | LogicalPlan::Notify { .. }

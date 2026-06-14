@@ -310,6 +310,36 @@ pub enum LogicalSetVariableAction {
     Reset,
 }
 
+/// Catalog object kind carried by [`LogicalDescribeTarget::Object`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LogicalDescribeObjectKind {
+    /// Ordinary table or table-like relation.
+    Table,
+    /// View relation. Full user-view support depends on catalog metadata.
+    View,
+}
+
+/// Bound target metadata for `DESCRIBE`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum LogicalDescribeTarget {
+    /// A catalog object whose stored schema should be returned.
+    Object {
+        /// Case-folded bare object name.
+        name: String,
+        /// Case-folded schema name.
+        namespace: String,
+        /// Object kind as validated by the binder.
+        kind: LogicalDescribeObjectKind,
+        /// Stored object schema.
+        object_schema: Schema,
+    },
+    /// A query expression whose projected schema should be returned.
+    Query {
+        /// Bound query output schema.
+        query_schema: Schema,
+    },
+}
+
 // ============================================================================
 // Locking
 // ============================================================================
@@ -1211,6 +1241,14 @@ pub enum LogicalPlan {
         schema: Schema,
     },
 
+    /// `DESCRIBE [TABLE|VIEW] object` or `DESCRIBE SELECT ...`.
+    Describe {
+        /// Bound target whose field metadata should be returned.
+        target: LogicalDescribeTarget,
+        /// Fixed six-column DESCRIBE output schema.
+        schema: Schema,
+    },
+
     /// `SET ROLE role` / `SET ROLE NONE` / `RESET ROLE`.
     SetRole {
         /// Folded target role. `None` resets to session user.
@@ -1873,6 +1911,7 @@ impl LogicalPlan {
                 | Self::RollbackPrepared { .. }
                 | Self::SetTransaction { .. }
                 | Self::SetVariable { .. }
+                | Self::Describe { .. }
                 | Self::SetRole { .. }
                 | Self::Listen { .. }
                 | Self::Notify { .. }
@@ -1943,6 +1982,7 @@ impl LogicalPlan {
             | Self::RollbackPrepared { .. }
             | Self::SetTransaction { .. }
             | Self::SetVariable { .. }
+            | Self::Describe { .. }
             | Self::SetRole { .. }
             | Self::Listen { .. }
             | Self::Notify { .. }
@@ -2004,6 +2044,7 @@ impl LogicalPlan {
             | Self::RollbackPrepared { schema, .. }
             | Self::SetTransaction { schema, .. }
             | Self::SetVariable { schema, .. }
+            | Self::Describe { schema, .. }
             | Self::SetRole { schema, .. }
             | Self::Listen { schema, .. }
             | Self::Notify { schema, .. }
@@ -3007,6 +3048,25 @@ impl LogicalPlan {
                     }
                     None => {
                         let _ = fmt::write(out, format_args!("SetVariable: {action:?} {name}\n"));
+                    }
+                }
+            }
+            Self::Describe { target, .. } => {
+                out.push_str(&pad);
+                match target {
+                    LogicalDescribeTarget::Object {
+                        name,
+                        namespace,
+                        kind,
+                        ..
+                    } => {
+                        let _ = fmt::write(
+                            out,
+                            format_args!("Describe: {kind:?} {namespace}.{name}\n"),
+                        );
+                    }
+                    LogicalDescribeTarget::Query { .. } => {
+                        out.push_str("Describe: Query\n");
                     }
                 }
             }

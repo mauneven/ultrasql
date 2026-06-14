@@ -778,6 +778,7 @@ fn plan_node_type(plan: &LogicalPlan) -> &'static str {
         LogicalPlan::RollbackPrepared { .. } => "RollbackPrepared",
         LogicalPlan::SetTransaction { .. } => "SetTransaction",
         LogicalPlan::SetVariable { .. } => "SetVariable",
+        LogicalPlan::Describe { .. } => "Describe",
         LogicalPlan::SetRole { .. } => "SetRole",
         LogicalPlan::Explain { .. } => "Explain",
         LogicalPlan::Listen { .. } => "Listen",

@@ -222,7 +222,7 @@ impl<'src> Parser<'src> {
     // ---------------- statement-level ------------------------------------
 
     pub(crate) fn parse_one(&mut self) -> Result<Statement, ParseError> {
-        let head = self.peek()?;
+        let head = *self.peek()?;
         match head.kind {
             // SELECT or WITH … SELECT
             TokenKind::KwSelect | TokenKind::KwWith => {
@@ -349,6 +349,13 @@ impl<'src> Parser<'src> {
                 self.parse_unlisten(tok.span.start)
             }
             TokenKind::KwCopy => self.parse_copy().map(|s| Statement::Copy(Box::new(s))),
+            TokenKind::Identifier
+                if head
+                    .text(self.source)
+                    .is_some_and(|text| text.eq_ignore_ascii_case("describe")) =>
+            {
+                self.parse_describe().map(Statement::Describe)
+            }
             other => Err(ParseError::Expected {
                 expected: "SELECT, INSERT, UPDATE, DELETE, TRUNCATE, CREATE, DROP, ALTER, \
                            COMMENT, REINDEX, SET, SHOW, RESET, BEGIN, COMMIT, ROLLBACK, SAVEPOINT, \

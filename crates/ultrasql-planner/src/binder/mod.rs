@@ -45,8 +45,9 @@
 //! wave. Until then a recursive CTE binding resolves the CTE's definition
 //! non-recursively.
 
-use ultrasql_core::{DataType, Field, Schema};
+use ultrasql_core::{DataType, Field, Schema, Value};
 use ultrasql_parser::ast::{
+    DescribeObjectKind as AstDescribeObjectKind, DescribeStmt, DescribeTarget as AstDescribeTarget,
     Distinct, ExplainFormat as AstExplainFormat, ExplainStmt, Expr as AstExpr, Literal,
     LockStrength as AstLockStrength, LockWaitPolicy as AstLockWaitPolicy, SelectStmt, SetOp,
     SetQuantifier, SetRoleStmt, SetScope, SetValue, SetVarStmt, Statement,
@@ -57,9 +58,9 @@ use crate::error::PlanError;
 use crate::expr::ScalarExpr;
 use crate::plan::{
     AggregateFunc, ConflictTarget, ExplainFormat, LockStrength, LockWaitPolicy,
-    LogicalAggregateExpr, LogicalAlterTableAction, LogicalJoinCondition, LogicalJoinType,
-    LogicalOnConflict, LogicalPlan, LogicalSetOp, LogicalSetQuantifier, LogicalSetVariableAction,
-    SortKey, TxnIsolationLevel,
+    LogicalAggregateExpr, LogicalAlterTableAction, LogicalDescribeObjectKind,
+    LogicalDescribeTarget, LogicalJoinCondition, LogicalJoinType, LogicalOnConflict, LogicalPlan,
+    LogicalSetOp, LogicalSetQuantifier, LogicalSetVariableAction, SortKey, TxnIsolationLevel,
 };
 use crate::scope::{ScopeFrame, ScopeStack};
 
@@ -119,6 +120,7 @@ pub fn bind(stmt: &Statement, catalog: &dyn Catalog) -> Result<LogicalPlan, Plan
         Statement::Update(s) => bind_update(s, catalog, &mut scope),
         Statement::Delete(s) => bind_delete(s, catalog, &mut scope),
         Statement::Truncate(s) => bind_truncate(s, catalog),
+        Statement::Describe(s) => bind_describe(s, catalog, &mut scope),
         Statement::CreateTable(s) => bind_create_table(s, catalog),
         Statement::CreateMaterializedView(s) => bind_create_materialized_view(s, catalog),
         Statement::CreateType(s) => bind_create_type(s, catalog),
@@ -230,6 +232,53 @@ pub fn bind(stmt: &Statement, catalog: &dyn Catalog) -> Result<LogicalPlan, Plan
         }),
         _ => Err(PlanError::NotSupported("statement variant")),
     }
+}
+
+fn bind_describe(
+    stmt: &DescribeStmt,
+    catalog: &dyn Catalog,
+    scope: &mut ScopeStack,
+) -> Result<LogicalPlan, PlanError> {
+    let target = match &stmt.target {
+        AstDescribeTarget::Query(query) => {
+            let plan = bind_select(query, catalog, scope)?;
+            LogicalDescribeTarget::Query {
+                query_schema: plan.schema().clone(),
+            }
+        }
+        AstDescribeTarget::Object { kind, name } => {
+            if *kind == AstDescribeObjectKind::View {
+                return Err(PlanError::NotSupported(
+                    "DESCRIBE VIEW requires view catalog metadata",
+                ));
+            }
+            let table_name = object_name_simple(name);
+            let resolved = lookup_table_reference(catalog, name)?;
+            LogicalDescribeTarget::Object {
+                name: table_name,
+                namespace: resolved.meta.schema_name,
+                kind: LogicalDescribeObjectKind::Table,
+                object_schema: resolved.meta.schema,
+            }
+        }
+    };
+
+    Ok(LogicalPlan::Describe {
+        target,
+        schema: describe_output_schema()?,
+    })
+}
+
+fn describe_output_schema() -> Result<Schema, PlanError> {
+    Schema::new([
+        Field::required("column_name", DataType::Text { max_len: None }),
+        Field::required("data_type", DataType::Text { max_len: None }),
+        Field::required("nullable", DataType::Bool),
+        Field::required("source_schema", DataType::Text { max_len: None }),
+        Field::required("source_object", DataType::Text { max_len: None }),
+        Field::required("source_kind", DataType::Text { max_len: None }),
+    ])
+    .map_err(|err| PlanError::TypeMismatch(format!("DESCRIBE schema: {err}")))
 }
 
 fn bind_set_var(stmt: &SetVarStmt) -> Result<LogicalPlan, PlanError> {
@@ -859,9 +908,10 @@ fn bind_select_body(
             cte_catalog,
             scope,
         )?;
+        let projection_input_schema = plan.schema().clone();
         let proj_fields: Vec<Field> = projected
             .iter()
-            .map(|(e, name)| Field::nullable(name, e.data_type()))
+            .map(|(e, name)| projection_field(e, name, &projection_input_schema))
             .collect();
         let proj_schema = Schema::new_with_duplicate_names(proj_fields);
 
@@ -874,9 +924,10 @@ fn bind_select_body(
         plan =
             bind_order_by_around_projection(plan, &select.order_by, catalog, cte_catalog, scope)?;
     } else {
+        let projection_input_schema = plan.schema().clone();
         let projected = bind_projection_with_scope(
             &select.projection,
-            plan.schema(),
+            &projection_input_schema,
             &from_scope,
             catalog,
             cte_catalog,
@@ -884,7 +935,7 @@ fn bind_select_body(
         )?;
         let proj_fields: Vec<Field> = projected
             .iter()
-            .map(|(e, name)| Field::nullable(name, e.data_type()))
+            .map(|(e, name)| projection_field(e, name, &projection_input_schema))
             .collect();
         let proj_schema = Schema::new_with_duplicate_names(proj_fields);
 
@@ -954,6 +1005,23 @@ fn bind_select_body(
     }
 
     Ok(plan)
+}
+
+fn projection_field(expr: &ScalarExpr, name: &str, input: &Schema) -> Field {
+    let nullable = match expr {
+        ScalarExpr::Column { index, .. } => input
+            .fields()
+            .get(*index)
+            .is_none_or(|field| field.nullable),
+        ScalarExpr::Literal { value, .. } => matches!(value, Value::Null),
+        ScalarExpr::IsNull { .. } => false,
+        _ => true,
+    };
+    Field {
+        name: name.to_owned(),
+        data_type: expr.data_type(),
+        nullable,
+    }
 }
 
 fn bind_order_by_around_projection(

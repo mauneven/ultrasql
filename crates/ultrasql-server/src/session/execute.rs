@@ -9,12 +9,15 @@ use std::sync::Arc;
 use tokio::io::{AsyncRead, AsyncWrite};
 use ultrasql_catalog::{CatalogSnapshot, StatisticExtRow, TableEntry};
 use ultrasql_core::{
-    BlockNumber, DataType, RelationId, Value, Xid, timestamptz_display_in_timezone,
+    BlockNumber, DataType, RelationId, Schema, Value, Xid, timestamptz_display_in_timezone,
 };
 use ultrasql_mvcc::XidStatusOracle;
 use ultrasql_optimizer::{InMemoryStatsCatalog, PlanCacheKey, StatsCatalog, StatsSource};
 use ultrasql_parser::Parser;
-use ultrasql_planner::{BinaryOp, LogicalPlan, LogicalSetVariableAction, ScalarExpr, bind};
+use ultrasql_planner::{
+    BinaryOp, LogicalDescribeObjectKind, LogicalDescribeTarget, LogicalPlan,
+    LogicalSetVariableAction, ScalarExpr, bind,
+};
 use ultrasql_protocol::{BackendMessage, FieldDescription};
 use ultrasql_storage::access_method::{AccessMethod, BrinIndex};
 use ultrasql_storage::btree::BTree;
@@ -29,6 +32,10 @@ use crate::{
     CombinedCatalog, RunPlanInTxnArgs, TxnState, run_plan_in_txn, try_run_cached_int32_pair_select,
     try_run_cached_scalar_aggregate_select,
 };
+
+const PG_OID_BOOL: u32 = 16;
+const PG_OID_TEXT: u32 = 25;
+const FORMAT_TEXT: i16 = 0;
 
 #[derive(Debug)]
 struct CreateStatisticsSpec {
@@ -507,6 +514,9 @@ where
         if matches!(&plan, LogicalPlan::SetRole { .. }) {
             return self.execute_set_role(&plan);
         }
+        if matches!(&plan, LogicalPlan::Describe { .. }) {
+            return self.execute_describe(&plan, true, &[]);
+        }
 
         // DDL is dispatched ahead of operator lowering: it never produces
         // rows, so the lowerer would only round-trip it through an
@@ -781,6 +791,121 @@ where
             LogicalSetVariableAction::Show => {
                 Ok(self.show_session_variable(name, include_row_description)?)
             }
+        }
+    }
+
+    pub(crate) fn execute_describe(
+        &self,
+        plan: &LogicalPlan,
+        include_row_description: bool,
+        result_formats: &[i16],
+    ) -> Result<SelectResult, ServerError> {
+        let LogicalPlan::Describe { target, schema } = plan else {
+            return Err(ServerError::Unsupported("execute_describe: wrong plan"));
+        };
+
+        let (fields, source_schema, source_object, source_kind) = match target {
+            LogicalDescribeTarget::Object {
+                name,
+                namespace,
+                kind,
+                object_schema,
+            } => {
+                let source_kind = match kind {
+                    LogicalDescribeObjectKind::Table => "table",
+                    LogicalDescribeObjectKind::View => "view",
+                };
+                (
+                    object_schema.fields(),
+                    namespace.as_str(),
+                    name.as_str(),
+                    source_kind,
+                )
+            }
+            LogicalDescribeTarget::Query { query_schema } => {
+                (query_schema.fields(), "", "", "query")
+            }
+        };
+
+        let mut messages = Vec::with_capacity(fields.len().saturating_add(2));
+        if include_row_description {
+            messages.push(Self::describe_row_description(schema, result_formats));
+        }
+        for field in fields {
+            let nullable_format = Self::describe_result_format(&DataType::Bool, result_formats, 2);
+            messages.push(BackendMessage::DataRow {
+                columns: vec![
+                    Some(field.name.clone().into_bytes()),
+                    Some(field.data_type.to_string().into_bytes()),
+                    Some(Self::describe_bool_cell(field.nullable, nullable_format)),
+                    Some(source_schema.as_bytes().to_vec()),
+                    Some(source_object.as_bytes().to_vec()),
+                    Some(source_kind.as_bytes().to_vec()),
+                ],
+            });
+        }
+        let rows = u64::try_from(fields.len()).map_err(|_| {
+            ServerError::Execute(ultrasql_executor::ExecError::NumericFieldOverflow(
+                "DESCRIBE row count overflow".to_owned(),
+            ))
+        })?;
+        messages.push(BackendMessage::CommandComplete {
+            tag: format!("SELECT {rows}"),
+        });
+        Ok(SelectResult {
+            messages,
+            streamed_body: None,
+            shared_streamed_body: None,
+            rows,
+        })
+    }
+
+    fn describe_row_description(schema: &Schema, result_formats: &[i16]) -> BackendMessage {
+        let fields = schema
+            .fields()
+            .iter()
+            .enumerate()
+            .map(|(idx, field)| {
+                let (type_oid, type_size) = match field.data_type {
+                    DataType::Bool => (PG_OID_BOOL, 1),
+                    _ => (PG_OID_TEXT, -1),
+                };
+                FieldDescription {
+                    name: field.name.clone(),
+                    table_oid: 0,
+                    col_attnum: 0,
+                    type_oid,
+                    type_size,
+                    type_modifier: -1,
+                    format_code: Self::describe_result_format(
+                        &field.data_type,
+                        result_formats,
+                        idx,
+                    ),
+                }
+            })
+            .collect();
+        BackendMessage::RowDescription { fields }
+    }
+
+    fn describe_result_format(data_type: &DataType, result_formats: &[i16], idx: usize) -> i16 {
+        match result_formats.len() {
+            0 => match data_type {
+                DataType::Float32 | DataType::Float64 => 1,
+                _ => FORMAT_TEXT,
+            },
+            1 => result_formats[0],
+            _ => result_formats.get(idx).copied().unwrap_or(FORMAT_TEXT),
+        }
+    }
+
+    fn describe_bool_cell(value: bool, format: i16) -> Vec<u8> {
+        if format == 1 {
+            vec![u8::from(value)]
+        } else if value {
+            b"t".to_vec()
+        } else {
+            b"f".to_vec()
         }
     }
 

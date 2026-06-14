@@ -39,6 +39,8 @@ pub enum Statement {
     Delete(Box<DeleteStmt>),
     /// `TRUNCATE TABLE ...`.
     Truncate(TruncateStmt),
+    /// `DESCRIBE [TABLE|VIEW] object` or `DESCRIBE SELECT ...`.
+    Describe(DescribeStmt),
     /// `BEGIN [TRANSACTION] [ISOLATION LEVEL …]`.
     Begin {
         /// Optional isolation level requested by the client.
@@ -199,6 +201,7 @@ impl Statement {
             Self::Update(s) => s.span,
             Self::Delete(s) => s.span,
             Self::Truncate(s) => s.span,
+            Self::Describe(s) => s.span,
             Self::Begin { span, .. } | Self::Commit { span } | Self::Rollback { span } => *span,
             Self::CreateTable(s) => s.span,
             Self::CreateTableAs(s) => s.span,
@@ -395,6 +398,40 @@ pub struct CreateMaterializedViewStmt {
     pub source: Box<SelectStmt>,
     /// Source span of the entire statement.
     pub span: Span,
+}
+
+/// `DESCRIBE [TABLE|VIEW] object` or `DESCRIBE SELECT ...`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DescribeStmt {
+    /// Object or query expression whose output metadata is requested.
+    pub target: DescribeTarget,
+    /// Source span of the entire statement.
+    pub span: Span,
+}
+
+/// Target form for a `DESCRIBE` statement.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum DescribeTarget {
+    /// Catalog object lookup, optionally constrained to table or view.
+    Object {
+        /// Requested object kind.
+        kind: DescribeObjectKind,
+        /// Object name, possibly schema-qualified.
+        name: ObjectName,
+    },
+    /// Query expression whose projected schema should be described.
+    Query(Box<SelectStmt>),
+}
+
+/// Catalog object kind requested by `DESCRIBE`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DescribeObjectKind {
+    /// No explicit object-kind qualifier.
+    Any,
+    /// `DESCRIBE TABLE name`.
+    Table,
+    /// `DESCRIBE VIEW name`.
+    View,
 }
 
 /// `CREATE TYPE name AS ...`.
