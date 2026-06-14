@@ -16,9 +16,11 @@ ultrasql --data-dir target/restored-data validate
 ```
 
 `--basebackup` copies the data-directory tree and writes
-`backup_manifest.json` with file sizes and checksums. `--pg-dump` writes an
-UltraSQL archive in custom, directory, and tar modes. `--pg-restore` rehydrates
-that archive into a target data directory.
+`backup_manifest.json` with file sizes and SHA-256 checksums. `--pg-dump`
+writes an UltraSQL archive in custom, directory, and tar modes. Current dumps
+record SHA-256 payload checksums; `--pg-restore` validates directory dump
+manifests and archive checksums before restoring files into the target data
+directory.
 
 When `--ops-endpoint` is supplied, `--basebackup` and `--pg-dump` call the
 server backup fence before and after copying. The dump records the returned

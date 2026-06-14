@@ -1673,7 +1673,13 @@ fn run_pg_dump_with_fence(
                 if path.contains('\n') {
                     anyhow::bail!("cannot dump path containing newline: {path}");
                 }
-                writeln!(&mut out, "FILE {} {}", bytes.len(), path)?;
+                writeln!(
+                    &mut out,
+                    "FILE {} sha256:{} {}",
+                    bytes.len(),
+                    checksum_hex(bytes),
+                    path
+                )?;
                 writeln!(&mut out, "{}", hex_bytes(bytes))?;
                 writeln!(&mut out, "END")?;
             }
@@ -1694,6 +1700,7 @@ fn run_pg_restore(source: &Path, data_dir: &Path) -> Result<()> {
         .with_context(|| format!("cannot inspect dump source: {}", source.display()))?
         .file_type();
     if source_type.is_dir() {
+        verify_dump_directory_manifest(source)?;
         restore_dump_directory(source, source, data_dir)?;
         println!("restored directory dump into {}", data_dir.display());
         return Ok(());
@@ -1720,6 +1727,19 @@ fn run_pg_restore(source: &Path, data_dir: &Path) -> Result<()> {
         let (len_text, rel_path) = rest
             .split_once(' ')
             .context("malformed FILE header in dump archive")?;
+        let (expected_checksum, rel_path) =
+            if let Some((maybe_checksum, path)) = rel_path.split_once(' ') {
+                if let Some(checksum) = maybe_checksum.strip_prefix("sha256:") {
+                    if !is_checksum_hex(checksum) {
+                        anyhow::bail!("malformed dump archive checksum: {maybe_checksum}");
+                    }
+                    (Some(checksum), path)
+                } else {
+                    (None, rel_path)
+                }
+            } else {
+                (None, rel_path)
+            };
         let expected_len = len_text.parse::<usize>()?;
         let hex = lines.next().context("missing FILE payload")?;
         let bytes = decode_hex(hex)?;
@@ -1728,6 +1748,14 @@ fn run_pg_restore(source: &Path, data_dir: &Path) -> Result<()> {
                 "dump payload length mismatch for {rel_path}: expected {expected_len}, got {}",
                 bytes.len()
             );
+        }
+        if let Some(expected_checksum) = expected_checksum {
+            let actual_checksum = checksum_hex(&bytes);
+            if actual_checksum != expected_checksum {
+                anyhow::bail!(
+                    "dump archive checksum mismatch for {rel_path}: expected {expected_checksum}, got {actual_checksum}"
+                );
+            }
         }
         let end = lines.next().context("missing FILE terminator")?;
         if end != "END" {
@@ -1741,6 +1769,10 @@ fn run_pg_restore(source: &Path, data_dir: &Path) -> Result<()> {
     }
     println!("restored archive dump into {}", data_dir.display());
     Ok(())
+}
+
+fn is_checksum_hex(value: &str) -> bool {
+    value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
 fn validate_restore_manifest_path(rel_path: &str) -> Result<PathBuf> {
@@ -1793,12 +1825,10 @@ fn copy_tree_with_manifest(
 }
 
 fn checksum_hex(bytes: &[u8]) -> String {
-    use std::collections::hash_map::DefaultHasher;
-    use std::hash::{Hash, Hasher};
+    use sha2::{Digest, Sha256};
 
-    let mut hasher = DefaultHasher::new();
-    bytes.hash(&mut hasher);
-    format!("{:016x}", hasher.finish())
+    let digest = Sha256::digest(bytes);
+    hex_bytes(&digest)
 }
 
 #[cfg(test)]
@@ -1813,7 +1843,7 @@ fn dump_manifest_text_with_fence(
     let mut text = String::from("{\n  \"files\": [\n");
     for (idx, (path, bytes, checksum)) in manifest.iter().enumerate() {
         let comma = if idx + 1 == manifest.len() { "" } else { "," };
-        let escaped = path.replace('\\', "\\\\").replace('"', "\\\"");
+        let escaped = json_escape(path);
         text.push_str(&format!(
             "    {{\"path\":\"{escaped}\",\"bytes\":{bytes},\"checksum\":\"{checksum}\"}}{comma}\n"
         ));
@@ -1843,6 +1873,109 @@ fn collect_dump_entries(
         } else if file_type.is_file() {
             let rel = path.strip_prefix(root)?.display().to_string();
             entries.push((rel, read_regular_file(&path, "dump source")?));
+        } else {
+            anyhow::bail!("dump source is not a regular file: {}", path.display());
+        }
+    }
+    Ok(())
+}
+
+#[derive(Debug)]
+struct DumpManifestEntry {
+    bytes: u64,
+    checksum: String,
+}
+
+fn verify_dump_directory_manifest(root: &Path) -> Result<()> {
+    let manifest_path = root.join("ultrasql_dump.manifest");
+    let mut expected = read_dump_manifest_entries(&manifest_path)?;
+    verify_dump_directory_tree(root, root, &mut expected)?;
+    if !expected.is_empty() {
+        let missing = expected.keys().next().cloned().unwrap_or_default();
+        anyhow::bail!("dump manifest entry missing from directory: {missing}");
+    }
+    Ok(())
+}
+
+fn read_dump_manifest_entries(
+    manifest_path: &Path,
+) -> Result<std::collections::HashMap<String, DumpManifestEntry>> {
+    let text = read_regular_text_file(manifest_path, "dump manifest")?;
+    let manifest: serde_json::Value = serde_json::from_str(&text)
+        .with_context(|| format!("cannot parse dump manifest: {}", manifest_path.display()))?;
+    let files = manifest
+        .get("files")
+        .and_then(serde_json::Value::as_array)
+        .context("dump manifest missing files array")?;
+    let mut entries = std::collections::HashMap::with_capacity(files.len());
+    for file in files {
+        let entry = file
+            .as_object()
+            .context("dump manifest file entry is not an object")?;
+        let path = entry
+            .get("path")
+            .and_then(serde_json::Value::as_str)
+            .context("dump manifest file entry missing path")?
+            .to_owned();
+        if path == "ultrasql_dump.manifest" {
+            anyhow::bail!("dump manifest cannot list itself");
+        }
+        validate_restore_manifest_path(&path)?;
+        let bytes = entry
+            .get("bytes")
+            .and_then(serde_json::Value::as_u64)
+            .context("dump manifest file entry missing bytes")?;
+        let checksum = entry
+            .get("checksum")
+            .and_then(serde_json::Value::as_str)
+            .context("dump manifest file entry missing checksum")?
+            .to_owned();
+        if entries
+            .insert(path.clone(), DumpManifestEntry { bytes, checksum })
+            .is_some()
+        {
+            anyhow::bail!("dump manifest lists duplicate path: {path}");
+        }
+    }
+    Ok(entries)
+}
+
+fn verify_dump_directory_tree(
+    root: &Path,
+    current: &Path,
+    expected: &mut std::collections::HashMap<String, DumpManifestEntry>,
+) -> Result<()> {
+    for entry in fs::read_dir(current)? {
+        let entry = entry?;
+        let file_type = entry.file_type()?;
+        let path = entry.path();
+        let rel = path.strip_prefix(root)?;
+        if rel == Path::new("ultrasql_dump.manifest") {
+            continue;
+        }
+        if file_type.is_dir() {
+            verify_dump_directory_tree(root, &path, expected)?;
+        } else if file_type.is_file() {
+            let rel_text = rel.display().to_string();
+            let expected_entry = expected.remove(&rel_text).with_context(|| {
+                format!("dump directory contains unmanifested file: {rel_text}")
+            })?;
+            let bytes = read_regular_file(&path, "directory dump file")?;
+            let actual_len =
+                u64::try_from(bytes.len()).context("dump file length does not fit u64")?;
+            if actual_len != expected_entry.bytes {
+                anyhow::bail!(
+                    "dump directory length mismatch for {rel_text}: expected {}, got {actual_len}",
+                    expected_entry.bytes
+                );
+            }
+            let actual_checksum = checksum_hex(&bytes);
+            if actual_checksum != expected_entry.checksum {
+                anyhow::bail!(
+                    "dump directory checksum mismatch for {rel_text}: expected {}, got {actual_checksum}",
+                    expected_entry.checksum
+                );
+            }
         } else {
             anyhow::bail!("dump source is not a regular file: {}", path.display());
         }
@@ -3146,7 +3279,59 @@ mod tests {
         assert_eq!(json_escape("\"\\\n"), "\\\"\\\\\\n");
         assert_eq!(json_escape("\r\t\u{0001}"), "\\r\\t\\u0001");
         assert_eq!(checksum_hex(b"same"), checksum_hex(b"same"));
+        assert_eq!(checksum_hex(b"same").len(), 64);
         assert!(run_pg_restore(&dir.path().join("missing.dump"), &dir.path().join("bad")).is_err());
+    }
+
+    #[test]
+    fn pg_restore_rejects_corrupt_dump_payloads() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let data = dir.path().join("data");
+        fs::create_dir_all(data.join("base/1")).expect("create data dir");
+        fs::write(data.join("base/1/heap"), b"rows").expect("write heap");
+
+        let directory_dump = dir.path().join("dumpdir");
+        run_pg_dump(&data, &directory_dump, DumpFormat::Directory).expect("directory dump");
+        fs::write(directory_dump.join("base/1/heap"), b"rowt").expect("corrupt directory dump");
+        let restored_dir = dir.path().join("restore-dir-corrupt");
+        let err = run_pg_restore(&directory_dump, &restored_dir).expect_err("directory checksum");
+        assert!(err.to_string().contains("checksum"), "{err:?}");
+        assert!(!restored_dir.join("base/1/heap").exists());
+
+        let archive = dir.path().join("dump.ultra");
+        run_pg_dump(&data, &archive, DumpFormat::Plain).expect("archive dump");
+        let text = fs::read_to_string(&archive).expect("archive text");
+        assert!(text.contains("FILE 4 sha256:"));
+        let corrupted = text.replacen("726f7773", "726f7774", 1);
+        assert_ne!(text, corrupted);
+        fs::write(&archive, corrupted).expect("corrupt archive");
+        let restored_archive = dir.path().join("restore-archive-corrupt");
+        let err = run_pg_restore(&archive, &restored_archive).expect_err("archive checksum");
+        assert!(err.to_string().contains("checksum"), "{err:?}");
+        assert!(!restored_archive.join("base/1/heap").exists());
+    }
+
+    #[test]
+    fn pg_restore_legacy_archive_keeps_checksum_like_path_token() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let checksum_like_name = "a".repeat(64);
+        let rel_path = format!("{checksum_like_name} file");
+        let archive = dir.path().join("legacy.dump");
+        fs::write(
+            &archive,
+            format!(
+                "ULTRASQL_DUMP_V1 format=Plain\nFILE 4 {rel_path}\n{}\nEND\n",
+                hex_bytes(b"rows")
+            ),
+        )
+        .expect("legacy archive");
+
+        let restored = dir.path().join("restore-legacy");
+        run_pg_restore(&archive, &restored).expect("legacy restore");
+        assert_eq!(
+            fs::read(restored.join(rel_path)).expect("restored legacy file"),
+            b"rows"
+        );
     }
 
     #[test]
