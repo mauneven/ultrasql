@@ -3,6 +3,14 @@
 This page records the v1.0 configuration surfaces that are wired today and the
 release modes that must be named in artifacts.
 
+## Session settings
+
+Session-local runtime parameters use PostgreSQL-style `SET`, `SHOW`, and
+`RESET`, plus the compatibility spelling documented in
+[`SET VARIABLE`](sql/set-variable.md). Supported built-in settings keep their
+existing validation, and dotted custom settings such as `ultrasql.tenant` are
+stored per connection.
+
 ## Memory
 
 - `work_mem` appears through `pg_catalog.pg_settings` for client tooling.

@@ -3,6 +3,8 @@
 //! Handles:
 //! - `SET var = expr [, expr …]`
 //! - `SET var TO expr [, expr …]`
+//! - `SET VARIABLE var = expr`
+//! - `SET VARIABLE var TO expr`
 //! - `SET SESSION var = expr`
 //! - `SET LOCAL var = expr`
 //! - `SHOW var`
@@ -46,8 +48,14 @@ impl Parser<'_> {
             _ => {}
         }
 
+        // SET VARIABLE var [= | TO] value. `VARIABLE` is a compatibility
+        // marker, not part of the stored runtime parameter name.
+        let set_variable = self.consume_set_variable_marker()?;
+
         // SET [SESSION | LOCAL] var [= | TO] value
-        let scope = if self.peek()?.kind == TokenKind::KwSession {
+        let scope = if set_variable {
+            SetScope::Session
+        } else if self.peek()?.kind == TokenKind::KwSession {
             self.advance()?;
             SetScope::Session
         } else if self.peek()?.kind == TokenKind::KwLocal {
@@ -56,6 +64,15 @@ impl Parser<'_> {
         } else {
             SetScope::Session
         };
+
+        if !set_variable && self.peek_is_set_variable_marker()? {
+            let found = self.peek()?.kind;
+            return Err(ParseError::Expected {
+                expected: "SET VARIABLE name = value; scoped SET VARIABLE is not supported",
+                found,
+                offset: self.peek()?.span.start_usize(),
+            });
+        }
 
         let name = self.parse_set_name()?;
 
@@ -159,6 +176,23 @@ impl Parser<'_> {
         })
     }
 
+    fn consume_set_variable_marker(&mut self) -> Result<bool, ParseError> {
+        if self.peek_is_set_variable_marker()? {
+            self.advance()?;
+            Ok(true)
+        } else {
+            Ok(false)
+        }
+    }
+
+    fn peek_is_set_variable_marker(&mut self) -> Result<bool, ParseError> {
+        let tok = *self.peek()?;
+        Ok(tok.kind == TokenKind::Identifier
+            && tok
+                .text(self.source)
+                .is_some_and(|text| text.eq_ignore_ascii_case("variable")))
+    }
+
     fn parse_set_name(&mut self) -> Result<Identifier, ParseError> {
         if self.peek()?.kind == TokenKind::KwTime {
             let first = self.advance()?;
@@ -260,6 +294,36 @@ mod tests {
     }
 
     #[test]
+    fn set_variable_eq() {
+        let stmt = parse_set("SET VARIABLE ultrasql.tenant = 'acme'");
+        assert_eq!(stmt.scope, SetScope::Session);
+        assert_eq!(stmt.name.value, "ultrasql.tenant");
+        let SetValue::Values(vals) = &stmt.value else {
+            panic!("expected Values")
+        };
+        assert_eq!(vals.len(), 1);
+    }
+
+    #[test]
+    fn set_variable_to() {
+        let stmt = parse_set("SET VARIABLE application_name TO 'worker'");
+        assert_eq!(stmt.scope, SetScope::Session);
+        assert_eq!(stmt.name.value, "application_name");
+        let SetValue::Values(vals) = &stmt.value else {
+            panic!("expected Values")
+        };
+        assert_eq!(vals.len(), 1);
+    }
+
+    #[test]
+    fn set_variable_default() {
+        let stmt = parse_set("SET VARIABLE statement_timeout = DEFAULT");
+        assert_eq!(stmt.scope, SetScope::Session);
+        assert_eq!(stmt.name.value, "statement_timeout");
+        assert!(matches!(stmt.value, SetValue::Default));
+    }
+
+    #[test]
     fn set_local() {
         let stmt = parse_set("SET LOCAL work_mem = '64MB'");
         assert_eq!(stmt.scope, SetScope::Local);
@@ -342,5 +406,16 @@ mod tests {
             err,
             ParseError::Expected { .. } | ParseError::UnexpectedEof { .. }
         ));
+    }
+
+    #[test]
+    fn set_local_variable_errors() {
+        let err = Parser::new("SET LOCAL VARIABLE ultrasql.tenant = 'acme'")
+            .parse_statement()
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("SET VARIABLE"),
+            "unexpected error: {err}"
+        );
     }
 }

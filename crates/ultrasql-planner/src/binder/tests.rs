@@ -262,6 +262,23 @@ fn binds_datestyle_list_set() {
 }
 
 #[test]
+fn binds_set_variable_as_session_setting() {
+    let plan = parse_bind_ok("SET VARIABLE ultrasql.tenant TO 'acme'");
+    let LogicalPlan::SetVariable {
+        name,
+        action,
+        value,
+        ..
+    } = plan
+    else {
+        panic!("expected SetVariable");
+    };
+    assert_eq!(name, "ultrasql.tenant");
+    assert_eq!(action, LogicalSetVariableAction::Set);
+    assert_eq!(value.as_deref(), Some("acme"));
+}
+
+#[test]
 fn rejects_invalid_column_privilege_specs() {
     let cat = users_catalog();
     let err = parse_and_bind("GRANT SELECT(id) ON DATABASE ultrasql TO analyst", &cat)

@@ -101,7 +101,7 @@ pub enum Statement {
     CreateSchema(CreateSchemaStmt),
     /// `DROP SCHEMA …`.
     DropSchema(DropSchemaStmt),
-    /// `SET [SESSION|LOCAL] var = val` / `SHOW var` / `RESET var`.
+    /// `SET [VARIABLE|SESSION|LOCAL] var = val` / `SHOW var` / `RESET var`.
     SetVar(SetVarStmt),
     /// `SET ROLE role` / `SET ROLE NONE` / `RESET ROLE`.
     SetRole(SetRoleStmt),
@@ -1146,7 +1146,7 @@ pub struct DropSchemaStmt {
     pub span: Span,
 }
 
-/// `SET [SESSION|LOCAL] var = val` / `SHOW var` / `RESET var`.
+/// `SET [VARIABLE|SESSION|LOCAL] var = val` / `SHOW var` / `RESET var`.
 ///
 /// A single statement covering all GUC (Grand Unified Configuration)
 /// manipulation forms supported by PostgreSQL.

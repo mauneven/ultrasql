@@ -141,11 +141,11 @@ Docs commits happen only after passing implementation tests for that family.
 - Add parser/planner/server tests for exact spelling.
 - Update configuration docs after passing tests.
 
-- [ ] Parse `SET VARIABLE name = value` and `SET VARIABLE name TO value` as the same AST as existing session `SET`.
-- [ ] Keep scope session-local.
-- [ ] Preserve existing type validation in `apply_session_variable`.
-- [ ] Reject `SET LOCAL VARIABLE` unless deliberately supported with tests.
-- [ ] Add tests for invalid names, invalid types, session visibility, transaction behavior, and prepared usage.
+- [x] Parse `SET VARIABLE name = value` and `SET VARIABLE name TO value` as the same AST as existing session `SET`.
+- [x] Keep scope session-local.
+- [x] Preserve existing type validation in `apply_session_variable`.
+- [x] Reject `SET LOCAL VARIABLE` unless deliberately supported with tests.
+- [x] Add tests for invalid names, invalid types, session visibility, transaction behavior, and prepared usage.
 
 ## Phase 7: PIVOT / UNPIVOT
 
