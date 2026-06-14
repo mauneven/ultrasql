@@ -43,6 +43,8 @@ pub enum Statement {
     Truncate(TruncateStmt),
     /// `DESCRIBE [TABLE|VIEW] object` or `DESCRIBE SELECT ...`.
     Describe(DescribeStmt),
+    /// `SUMMARIZE table_name`.
+    Summarize(SummarizeStmt),
     /// `CHECKPOINT`.
     Checkpoint {
         /// Source span.
@@ -210,6 +212,7 @@ impl Statement {
             Self::Merge(s) => s.span,
             Self::Truncate(s) => s.span,
             Self::Describe(s) => s.span,
+            Self::Summarize(s) => s.span,
             Self::Checkpoint { span } => *span,
             Self::Begin { span, .. } | Self::Commit { span } | Self::Rollback { span } => *span,
             Self::CreateTable(s) => s.span,
@@ -441,6 +444,15 @@ pub enum DescribeObjectKind {
     Table,
     /// `DESCRIBE VIEW name`.
     View,
+}
+
+/// `SUMMARIZE table_name`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SummarizeStmt {
+    /// Table whose columns should be summarized.
+    pub name: ObjectName,
+    /// Source span of the entire statement.
+    pub span: Span,
 }
 
 /// `CREATE TYPE name AS ...`.

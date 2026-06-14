@@ -379,11 +379,19 @@ impl<'src> Parser<'src> {
                 }
                 Ok(Statement::Checkpoint { span: tok.span })
             }
+            TokenKind::Identifier
+                if head
+                    .text(self.source)
+                    .is_some_and(|text| text.eq_ignore_ascii_case("summarize")) =>
+            {
+                self.parse_summarize().map(Statement::Summarize)
+            }
             other => Err(ParseError::Expected {
                 expected: "SELECT, INSERT, UPDATE, DELETE, TRUNCATE, CREATE, DROP, ALTER, \
                            COMMENT, REINDEX, SET, SHOW, RESET, BEGIN, COMMIT, ROLLBACK, SAVEPOINT, \
                            RELEASE, EXPLAIN, PREPARE, EXECUTE, GRANT, REVOKE, DEALLOCATE, \
-                           LISTEN, NOTIFY, UNLISTEN, COPY, DESCRIBE, MERGE, or CHECKPOINT",
+                           LISTEN, NOTIFY, UNLISTEN, COPY, DESCRIBE, MERGE, CHECKPOINT, \
+                           or SUMMARIZE",
                 found: other,
                 offset: head.span.start_usize(),
             }),

@@ -28,5 +28,6 @@ pub(crate) mod prepare;
 pub(crate) mod savepoint;
 pub(crate) mod select;
 pub(crate) mod set_stmt;
+pub(crate) mod summarize;
 pub(crate) mod truncate;
 pub(crate) mod update;

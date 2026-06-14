@@ -147,6 +147,29 @@ fn select_eq_any_array_function_parses() {
 }
 
 #[test]
+fn summarize_table_statement_parses() {
+    let stmt = parse("SUMMARIZE public.users");
+    let Statement::Summarize(s) = stmt else {
+        panic!("expected Summarize statement");
+    };
+    assert_eq!(s.name.to_string(), "public.users");
+}
+
+#[test]
+fn summarize_rejects_missing_target() {
+    Parser::new("SUMMARIZE")
+        .parse_statement()
+        .expect_err("SUMMARIZE requires a table name");
+}
+
+#[test]
+fn summarize_rejects_query_expression_until_supported() {
+    Parser::new("SUMMARIZE (SELECT 1)")
+        .parse_statement()
+        .expect_err("SUMMARIZE query targets are not supported yet");
+}
+
+#[test]
 fn select_with_where_clause() {
     let stmt = parse("SELECT id FROM users WHERE age >= 18 AND active = TRUE");
     let Statement::Select(s) = stmt else { panic!() };
