@@ -110,6 +110,7 @@ pub(super) fn plan_sources(plan: &LogicalPlan) -> Vec<Option<ColumnSource>> {
         | LogicalPlan::SetTransaction { schema, .. }
         | LogicalPlan::SetVariable { schema, .. }
         | LogicalPlan::Describe { schema, .. }
+        | LogicalPlan::Summarize { schema, .. }
         | LogicalPlan::Checkpoint { schema }
         | LogicalPlan::SetRole { schema, .. }
         | LogicalPlan::Listen { schema, .. }

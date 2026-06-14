@@ -110,6 +110,7 @@ fn infer_into(
         | LogicalPlan::SetTransaction { .. }
         | LogicalPlan::SetVariable { .. }
         | LogicalPlan::Describe { .. }
+        | LogicalPlan::Summarize { .. }
         | LogicalPlan::Checkpoint { .. }
         | LogicalPlan::SetRole { .. }
         | LogicalPlan::Listen { .. }
@@ -517,6 +518,7 @@ pub(super) fn walk_plan_exprs<F: FnMut(&ScalarExpr)>(plan: &LogicalPlan, f: &mut
         | LogicalPlan::SetTransaction { .. }
         | LogicalPlan::SetVariable { .. }
         | LogicalPlan::Describe { .. }
+        | LogicalPlan::Summarize { .. }
         | LogicalPlan::Checkpoint { .. }
         | LogicalPlan::SetRole { .. }
         | LogicalPlan::Listen { .. }

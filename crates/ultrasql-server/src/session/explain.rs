@@ -780,6 +780,7 @@ fn plan_node_type(plan: &LogicalPlan) -> &'static str {
         LogicalPlan::SetTransaction { .. } => "SetTransaction",
         LogicalPlan::SetVariable { .. } => "SetVariable",
         LogicalPlan::Describe { .. } => "Describe",
+        LogicalPlan::Summarize { .. } => "Summarize",
         LogicalPlan::Checkpoint { .. } => "Checkpoint",
         LogicalPlan::SetRole { .. } => "SetRole",
         LogicalPlan::Explain { .. } => "Explain",

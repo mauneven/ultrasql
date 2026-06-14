@@ -1321,6 +1321,18 @@ pub enum LogicalPlan {
         schema: Schema,
     },
 
+    /// `SUMMARIZE table_name`.
+    Summarize {
+        /// Case-folded bare table name.
+        table: String,
+        /// Case-folded schema name.
+        namespace: String,
+        /// Stored table schema to summarize.
+        target_schema: Schema,
+        /// Fixed summary output schema.
+        schema: Schema,
+    },
+
     /// `SET ROLE role` / `SET ROLE NONE` / `RESET ROLE`.
     SetRole {
         /// Folded target role. `None` resets to session user.
@@ -1986,6 +1998,7 @@ impl LogicalPlan {
                 | Self::SetTransaction { .. }
                 | Self::SetVariable { .. }
                 | Self::Describe { .. }
+                | Self::Summarize { .. }
                 | Self::SetRole { .. }
                 | Self::Listen { .. }
                 | Self::Notify { .. }
@@ -2059,6 +2072,7 @@ impl LogicalPlan {
             | Self::SetTransaction { .. }
             | Self::SetVariable { .. }
             | Self::Describe { .. }
+            | Self::Summarize { .. }
             | Self::SetRole { .. }
             | Self::Listen { .. }
             | Self::Notify { .. }
@@ -2123,6 +2137,7 @@ impl LogicalPlan {
             | Self::SetTransaction { schema, .. }
             | Self::SetVariable { schema, .. }
             | Self::Describe { schema, .. }
+            | Self::Summarize { schema, .. }
             | Self::SetRole { schema, .. }
             | Self::Listen { schema, .. }
             | Self::Notify { schema, .. }
@@ -3166,6 +3181,12 @@ impl LogicalPlan {
                         out.push_str("Describe: Query\n");
                     }
                 }
+            }
+            Self::Summarize {
+                table, namespace, ..
+            } => {
+                out.push_str(&pad);
+                let _ = fmt::write(out, format_args!("Summarize: {namespace}.{table}\n"));
             }
             Self::Checkpoint { .. } => {
                 out.push_str(&pad);

@@ -295,6 +295,7 @@ where
         | LogicalPlan::SetTransaction { .. }
         | LogicalPlan::SetVariable { .. }
         | LogicalPlan::Describe { .. }
+        | LogicalPlan::Summarize { .. }
         | LogicalPlan::Checkpoint { .. }
         | LogicalPlan::SetRole { .. }
         | LogicalPlan::Listen { .. }

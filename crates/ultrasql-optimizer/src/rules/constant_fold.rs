@@ -573,6 +573,7 @@ fn fold_plan(plan: &LogicalPlan) -> Result<Option<LogicalPlan>, OptimizeError> {
         | LogicalPlan::SetTransaction { .. }
         | LogicalPlan::SetVariable { .. }
         | LogicalPlan::Describe { .. }
+        | LogicalPlan::Summarize { .. }
         | LogicalPlan::Checkpoint { .. }
         | LogicalPlan::SetRole { .. }
         | LogicalPlan::Listen { .. }

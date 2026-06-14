@@ -159,6 +159,49 @@ fn describe_view_reports_unsupported_until_view_catalog_metadata_exists() {
 }
 
 #[test]
+fn binds_summarize_table_output_schema() {
+    let plan = parse_bind_ok("SUMMARIZE users");
+    let fields = plan.schema().fields();
+    assert_eq!(
+        fields
+            .iter()
+            .map(|field| field.name.as_str())
+            .collect::<Vec<_>>(),
+        vec![
+            "column_name",
+            "data_type",
+            "row_count",
+            "null_count",
+            "min",
+            "max",
+            "unique_count",
+            "avg",
+            "stddev",
+        ]
+    );
+
+    let LogicalPlan::Summarize {
+        table,
+        namespace,
+        target_schema,
+        ..
+    } = plan
+    else {
+        panic!("expected Summarize plan");
+    };
+    assert_eq!(table, "users");
+    assert_eq!(namespace, "public");
+    assert_eq!(target_schema.len(), 3);
+}
+
+#[test]
+fn summarize_missing_table_errors() {
+    let cat = users_catalog();
+    let err = parse_and_bind("SUMMARIZE missing_users", &cat).expect_err("missing summarize table");
+    assert_eq!(err, PlanError::TableNotFound("missing_users".to_owned()));
+}
+
+#[test]
 fn binds_checkpoint_as_empty_session_control_plan() {
     let plan = parse_bind_ok("CHECKPOINT");
     assert!(matches!(plan, LogicalPlan::Checkpoint { .. }));
@@ -4271,6 +4314,7 @@ fn collect_window_funcs<'a>(plan: &'a LogicalPlan, out: &mut Vec<&'a LogicalWind
         | LogicalPlan::SetTransaction { .. }
         | LogicalPlan::SetVariable { .. }
         | LogicalPlan::Describe { .. }
+        | LogicalPlan::Summarize { .. }
         | LogicalPlan::Checkpoint { .. }
         | LogicalPlan::SetRole { .. }
         | LogicalPlan::Listen { .. }

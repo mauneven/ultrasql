@@ -559,6 +559,9 @@ fn lower_query_inner(
                 schema.clone(),
             )))
         }
+        LogicalPlan::Summarize { .. } => Err(ServerError::Unsupported(
+            "SUMMARIZE reached operator lowerer; expected session dispatch path",
+        )),
     }
 }
 
@@ -719,6 +722,7 @@ fn profile_operator_name(plan: &LogicalPlan) -> &'static str {
         LogicalPlan::SetTransaction { .. } => "SetTransaction",
         LogicalPlan::SetVariable { .. } => "SetVariable",
         LogicalPlan::Describe { .. } => "Describe",
+        LogicalPlan::Summarize { .. } => "Summarize",
         LogicalPlan::Checkpoint { .. } => "Checkpoint",
         LogicalPlan::SetRole { .. } => "SetRole",
         LogicalPlan::Explain { .. } => "Explain",

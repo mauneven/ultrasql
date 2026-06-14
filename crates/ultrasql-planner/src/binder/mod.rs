@@ -50,7 +50,7 @@ use ultrasql_parser::ast::{
     DescribeObjectKind as AstDescribeObjectKind, DescribeStmt, DescribeTarget as AstDescribeTarget,
     Distinct, ExplainFormat as AstExplainFormat, ExplainStmt, Expr as AstExpr, Literal,
     LockStrength as AstLockStrength, LockWaitPolicy as AstLockWaitPolicy, SelectStmt, SetOp,
-    SetQuantifier, SetRoleStmt, SetScope, SetValue, SetVarStmt, Statement,
+    SetQuantifier, SetRoleStmt, SetScope, SetValue, SetVarStmt, Statement, SummarizeStmt,
 };
 
 use crate::catalog::Catalog;
@@ -123,6 +123,7 @@ pub fn bind(stmt: &Statement, catalog: &dyn Catalog) -> Result<LogicalPlan, Plan
         Statement::Merge(s) => bind_merge(s, catalog, &mut scope),
         Statement::Truncate(s) => bind_truncate(s, catalog),
         Statement::Describe(s) => bind_describe(s, catalog, &mut scope),
+        Statement::Summarize(s) => bind_summarize(s, catalog),
         Statement::Checkpoint { .. } => Ok(LogicalPlan::Checkpoint {
             schema: Schema::empty(),
         }),
@@ -284,6 +285,32 @@ fn describe_output_schema() -> Result<Schema, PlanError> {
         Field::required("source_kind", DataType::Text { max_len: None }),
     ])
     .map_err(|err| PlanError::TypeMismatch(format!("DESCRIBE schema: {err}")))
+}
+
+fn bind_summarize(stmt: &SummarizeStmt, catalog: &dyn Catalog) -> Result<LogicalPlan, PlanError> {
+    let table = object_name_simple(&stmt.name);
+    let resolved = lookup_table_reference(catalog, &stmt.name)?;
+    Ok(LogicalPlan::Summarize {
+        table,
+        namespace: resolved.meta.schema_name,
+        target_schema: resolved.meta.schema,
+        schema: summarize_output_schema()?,
+    })
+}
+
+fn summarize_output_schema() -> Result<Schema, PlanError> {
+    Schema::new([
+        Field::required("column_name", DataType::Text { max_len: None }),
+        Field::required("data_type", DataType::Text { max_len: None }),
+        Field::required("row_count", DataType::Int64),
+        Field::required("null_count", DataType::Int64),
+        Field::nullable("min", DataType::Text { max_len: None }),
+        Field::nullable("max", DataType::Text { max_len: None }),
+        Field::required("unique_count", DataType::Int64),
+        Field::nullable("avg", DataType::Float64),
+        Field::nullable("stddev", DataType::Float64),
+    ])
+    .map_err(|err| PlanError::TypeMismatch(format!("SUMMARIZE schema: {err}")))
 }
 
 fn bind_set_var(stmt: &SetVarStmt) -> Result<LogicalPlan, PlanError> {

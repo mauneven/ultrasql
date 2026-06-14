@@ -393,6 +393,15 @@ where
                 }
                 self.collect_plan(source, false);
             }
+            LogicalPlan::Summarize {
+                table,
+                target_schema,
+                ..
+            } => {
+                for index in 0..target_schema.len() {
+                    self.require_table_column(table, target_schema, index, PrivilegeKind::Select);
+                }
+            }
             LogicalPlan::CreateMaterializedView { source, .. }
             | LogicalPlan::Explain { input: source, .. } => {
                 self.collect_plan(source, true);
