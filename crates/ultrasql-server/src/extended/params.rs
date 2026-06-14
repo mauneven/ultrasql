@@ -7,7 +7,7 @@
 
 use ultrasql_core::DataType;
 use ultrasql_planner::{
-    BinaryOp, LogicalJoinCondition, LogicalOnConflict, LogicalPlan, ScalarExpr,
+    BinaryOp, LogicalJoinCondition, LogicalMergeAction, LogicalOnConflict, LogicalPlan, ScalarExpr,
 };
 
 // ---------------------------------------------------------------------------
@@ -220,6 +220,42 @@ fn infer_into(
             infer_into(input, catalog, out);
             for (e, _) in returning {
                 infer_in_expr(e, None, out);
+            }
+        }
+        LogicalPlan::Merge {
+            target_schema,
+            source,
+            on,
+            clauses,
+            ..
+        } => {
+            infer_into(source, catalog, out);
+            infer_expr_types_from_predicate(on, out);
+            for clause in clauses {
+                if let Some(condition) = &clause.condition {
+                    infer_expr_types_from_predicate(condition, out);
+                }
+                match &clause.action {
+                    LogicalMergeAction::Update { assignments } => {
+                        for (col_idx, e) in assignments {
+                            let target = target_schema
+                                .fields()
+                                .get(*col_idx)
+                                .map(|field| field.data_type.clone());
+                            infer_in_expr(e, target, out);
+                        }
+                    }
+                    LogicalMergeAction::Delete => {}
+                    LogicalMergeAction::Insert { columns, values } => {
+                        for (idx, e) in columns.iter().zip(values.iter()) {
+                            let target = target_schema
+                                .fields()
+                                .get(*idx)
+                                .map(|field| field.data_type.clone());
+                            infer_in_expr(e, target, out);
+                        }
+                    }
+                }
             }
         }
         LogicalPlan::Join {
@@ -548,6 +584,33 @@ pub(super) fn walk_plan_exprs<F: FnMut(&ScalarExpr)>(plan: &LogicalPlan, f: &mut
             walk_plan_exprs(input, f);
             for (e, _) in returning {
                 walk_expr(e, f);
+            }
+        }
+        LogicalPlan::Merge {
+            source,
+            on,
+            clauses,
+            ..
+        } => {
+            walk_plan_exprs(source, f);
+            walk_expr(on, f);
+            for clause in clauses {
+                if let Some(condition) = &clause.condition {
+                    walk_expr(condition, f);
+                }
+                match &clause.action {
+                    LogicalMergeAction::Update { assignments } => {
+                        for (_, e) in assignments {
+                            walk_expr(e, f);
+                        }
+                    }
+                    LogicalMergeAction::Delete => {}
+                    LogicalMergeAction::Insert { values, .. } => {
+                        for e in values {
+                            walk_expr(e, f);
+                        }
+                    }
+                }
             }
         }
         LogicalPlan::Join {

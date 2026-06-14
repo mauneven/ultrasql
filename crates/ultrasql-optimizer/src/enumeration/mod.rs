@@ -163,7 +163,7 @@ pub fn outer_join_subtree_is_barrier(plan: &LogicalPlan) -> bool {
         // these embed a join subtree the enumerator can see, so they are
         // never barriers on their own. (DML statements that build on a
         // `Scan(Filter(...))` source have their input handled by the
-        // dedicated `Insert`/`Update`/`Delete` arms below.)
+        // dedicated DML arms below.)
         LogicalPlan::Scan { .. }
         | LogicalPlan::Empty { .. }
         | LogicalPlan::Values { .. }
@@ -218,6 +218,7 @@ pub fn outer_join_subtree_is_barrier(plan: &LogicalPlan) -> bool {
         LogicalPlan::Update { input, .. } | LogicalPlan::Delete { input, .. } => {
             outer_join_subtree_is_barrier(input)
         }
+        LogicalPlan::Merge { source, .. } => outer_join_subtree_is_barrier(source),
     }
 }
 
@@ -441,6 +442,23 @@ pub fn reorder_inner_joins_with_stats(plan: &LogicalPlan, stats: &dyn StatsSourc
             table: table.clone(),
             input: Box::new(reorder_inner_joins_with_stats(input, stats)),
             returning: returning.clone(),
+            schema: schema.clone(),
+        },
+        LogicalPlan::Merge {
+            target,
+            target_alias,
+            target_schema,
+            source,
+            on,
+            clauses,
+            schema,
+        } => LogicalPlan::Merge {
+            target: target.clone(),
+            target_alias: target_alias.clone(),
+            target_schema: target_schema.clone(),
+            source: Box::new(reorder_inner_joins_with_stats(source, stats)),
+            on: on.clone(),
+            clauses: clauses.clone(),
             schema: schema.clone(),
         },
 

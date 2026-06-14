@@ -39,12 +39,13 @@ pub use plan::{
     LogicalAlterTableAction, LogicalCheckConstraint, LogicalCommentTarget,
     LogicalDefaultPrivilegeOperation, LogicalDescribeObjectKind, LogicalDescribeTarget,
     LogicalForeignKeyConstraint, LogicalIndexMethod, LogicalIndexOption, LogicalJoinCondition,
-    LogicalJoinType, LogicalOnConflict, LogicalPlan, LogicalPrivilegeKind,
-    LogicalPrivilegeObjectKind, LogicalPrivilegeSpec, LogicalReferentialAction, LogicalRlsCommand,
-    LogicalRlsPermissiveness, LogicalRlsPolicy, LogicalRoleKind, LogicalRoleOptions,
-    LogicalSequenceChange, LogicalSequenceOptions, LogicalSetOp, LogicalSetQuantifier,
-    LogicalSetVariableAction, LogicalTableOption, LogicalTenantPolicyExpr, LogicalUniqueConstraint,
-    LogicalWindowFunc, SortKey, TxnIsolationLevel,
+    LogicalJoinType, LogicalMergeAction, LogicalMergeClause, LogicalMergeMatchKind,
+    LogicalOnConflict, LogicalPlan, LogicalPrivilegeKind, LogicalPrivilegeObjectKind,
+    LogicalPrivilegeSpec, LogicalReferentialAction, LogicalRlsCommand, LogicalRlsPermissiveness,
+    LogicalRlsPolicy, LogicalRoleKind, LogicalRoleOptions, LogicalSequenceChange,
+    LogicalSequenceOptions, LogicalSetOp, LogicalSetQuantifier, LogicalSetVariableAction,
+    LogicalTableOption, LogicalTenantPolicyExpr, LogicalUniqueConstraint, LogicalWindowFunc,
+    SortKey, TxnIsolationLevel,
 };
 
 #[cfg(test)]

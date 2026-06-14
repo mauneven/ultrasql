@@ -7,8 +7,8 @@ use ultrasql_parser::ast::{
 };
 
 use super::{
-    Catalog, LogicalOnConflict, LogicalPlan, PlanError, ScalarExpr, ScopeStack, SortKey, bind_expr,
-    bind_expr_with_ctes,
+    Catalog, LogicalMergeAction, LogicalOnConflict, LogicalPlan, PlanError, ScalarExpr, ScopeStack,
+    SortKey, bind_expr, bind_expr_with_ctes,
 };
 use crate::catalog::TableMeta;
 
@@ -320,6 +320,27 @@ pub(super) fn plan_contains_outer_column(plan: &LogicalPlan) -> bool {
         } => {
             plan_contains_outer_column(input)
                 || returning.iter().any(|(e, _)| expr_contains_outer(e))
+        }
+        LogicalPlan::Merge {
+            source,
+            on,
+            clauses,
+            ..
+        } => {
+            plan_contains_outer_column(source)
+                || expr_contains_outer(on)
+                || clauses.iter().any(|clause| {
+                    clause.condition.as_ref().is_some_and(expr_contains_outer)
+                        || match &clause.action {
+                            LogicalMergeAction::Update { assignments } => {
+                                assignments.iter().any(|(_, e)| expr_contains_outer(e))
+                            }
+                            LogicalMergeAction::Delete => false,
+                            LogicalMergeAction::Insert { values, .. } => {
+                                values.iter().any(expr_contains_outer)
+                            }
+                        }
+                })
         }
         LogicalPlan::Explain { input, .. } => plan_contains_outer_column(input),
         LogicalPlan::Copy { .. } => false,

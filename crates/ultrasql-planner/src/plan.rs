@@ -279,6 +279,47 @@ pub enum LogicalOnConflict {
     },
 }
 
+/// Match class for a bound `MERGE INTO` branch.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LogicalMergeMatchKind {
+    /// `WHEN MATCHED`.
+    Matched,
+    /// `WHEN NOT MATCHED`.
+    NotMatched,
+}
+
+/// Runtime action attached to a bound `MERGE INTO` branch.
+#[derive(Clone, Debug, PartialEq)]
+pub enum LogicalMergeAction {
+    /// `THEN UPDATE SET ...`.
+    Update {
+        /// `(column-index, new-value-expression)` pairs against the full
+        /// target table schema. Expressions bind against
+        /// `[target alias columns..., source alias columns...]`.
+        assignments: Vec<(usize, ScalarExpr)>,
+    },
+    /// `THEN DELETE`.
+    Delete,
+    /// `THEN INSERT [(columns)] VALUES (...)`.
+    Insert {
+        /// 0-based target column indices supplied by the branch.
+        columns: Vec<usize>,
+        /// Values bound against `[target alias columns..., source alias columns...]`.
+        values: Vec<ScalarExpr>,
+    },
+}
+
+/// One ordered `WHEN ... THEN ...` branch in a bound `MERGE INTO`.
+#[derive(Clone, Debug, PartialEq)]
+pub struct LogicalMergeClause {
+    /// Whether this branch handles matched or not-matched source rows.
+    pub kind: LogicalMergeMatchKind,
+    /// Optional `AND` predicate, bound against the combined target/source row.
+    pub condition: Option<ScalarExpr>,
+    /// Mutation action to execute for this branch.
+    pub action: LogicalMergeAction,
+}
+
 // ============================================================================
 // Transaction control
 // ============================================================================
@@ -535,6 +576,28 @@ pub enum LogicalPlan {
         returning: Vec<(ScalarExpr, String)>,
         /// Schema of the rows returned by `RETURNING`. Empty when there
         /// is no `RETURNING` clause.
+        schema: Schema,
+    },
+
+    /// Merge rows from a source relation into a target table.
+    ///
+    /// The source child supplies candidate rows. The executor evaluates `on`
+    /// over the concatenated row `[target..., source...]`, checks ordered
+    /// `clauses`, and applies at most one mutation per source row.
+    Merge {
+        /// Case-folded target table name.
+        target: String,
+        /// Optional target alias from `MERGE INTO target [AS alias]`.
+        target_alias: Option<String>,
+        /// Full target table schema.
+        target_schema: Schema,
+        /// Source plan from the `USING` relation.
+        source: Box<Self>,
+        /// Boolean-valued `ON` predicate over `[target..., source...]`.
+        on: ScalarExpr,
+        /// Ordered `WHEN` clauses.
+        clauses: Vec<LogicalMergeClause>,
+        /// Always empty in this wave; `MERGE RETURNING` is not supported.
         schema: Schema,
     },
 
@@ -1883,6 +1946,7 @@ impl LogicalPlan {
             Self::Insert { .. }
                 | Self::Update { .. }
                 | Self::Delete { .. }
+                | Self::Merge { .. }
                 | Self::Truncate { .. }
                 | Self::CreateTable { .. }
                 | Self::CreateMaterializedView { .. }
@@ -1948,6 +2012,7 @@ impl LogicalPlan {
             } => definition.has_batch_pipeline() || body.has_batch_pipeline(),
             Self::Insert { source, .. } => source.has_batch_pipeline(),
             Self::Update { input, .. } | Self::Delete { input, .. } => input.has_batch_pipeline(),
+            Self::Merge { source, .. } => source.has_batch_pipeline(),
             Self::Explain { input: plan, .. }
             | Self::Copy {
                 input: Some(plan), ..
@@ -2013,6 +2078,7 @@ impl LogicalPlan {
             | Self::Insert { schema, .. }
             | Self::Update { schema, .. }
             | Self::Delete { schema, .. }
+            | Self::Merge { schema, .. }
             | Self::Truncate { schema, .. }
             | Self::CreateTable { schema, .. }
             | Self::CreateMaterializedView { schema, .. }
@@ -2259,6 +2325,25 @@ impl LogicalPlan {
                 }
                 out.push('\n');
                 input.display_into(indent + 2, out);
+            }
+            Self::Merge {
+                target,
+                target_alias,
+                source,
+                on,
+                clauses,
+                ..
+            } => {
+                out.push_str(&pad);
+                out.push_str("Merge: target=");
+                out.push_str(target);
+                if let Some(alias) = target_alias {
+                    out.push_str(" alias=");
+                    out.push_str(alias);
+                }
+                let _ = fmt::write(out, format_args!(" on={on} clauses={}", clauses.len()));
+                out.push('\n');
+                source.display_into(indent + 2, out);
             }
             Self::Truncate {
                 tables,

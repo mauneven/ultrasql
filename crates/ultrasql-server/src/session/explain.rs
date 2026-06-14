@@ -740,6 +740,7 @@ fn plan_node_type(plan: &LogicalPlan) -> &'static str {
         LogicalPlan::Insert { .. } => "Insert",
         LogicalPlan::Update { .. } => "Update",
         LogicalPlan::Delete { .. } => "Delete",
+        LogicalPlan::Merge { .. } => "Merge",
         LogicalPlan::Empty { .. } => "Empty",
         LogicalPlan::Truncate { .. } => "Truncate",
         LogicalPlan::CreateTable { .. } => "CreateTable",
@@ -804,6 +805,7 @@ fn plan_children(plan: &LogicalPlan) -> Vec<&LogicalPlan> {
         | LogicalPlan::Update { input, .. }
         | LogicalPlan::Window { input, .. }
         | LogicalPlan::Delete { input, .. } => vec![input],
+        LogicalPlan::Merge { source, .. } => vec![source],
         LogicalPlan::Join { left, right, .. } | LogicalPlan::SetOp { left, right, .. } => {
             vec![left, right]
         }

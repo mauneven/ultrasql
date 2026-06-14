@@ -5,15 +5,17 @@
 use ultrasql_core::{DataType, Field, Schema};
 use ultrasql_parser::ast::{
     Assignment, ConflictTarget as AstConflictTarget, DeleteStmt, Expr, InsertSource, InsertStmt,
-    ObjectName, OnConflict, UpdateStmt,
+    MergeAction, MergeMatchKind, MergeStmt, ObjectName, OnConflict, UpdateStmt,
 };
 
 use crate::catalog::TableMeta;
 
 use super::expr_bind::coerce_literal_to_type;
 use super::{
-    Catalog, ConflictTarget, LogicalOnConflict, LogicalPlan, PlanError, ScalarExpr, ScopeStack,
-    bind_expr, bind_returning, bind_select, build_returning_schema, lookup_table_reference,
+    Catalog, ConflictTarget, LogicalMergeAction, LogicalMergeClause, LogicalMergeMatchKind,
+    LogicalOnConflict, LogicalPlan, PlanError, ScalarExpr, ScopeEntry, ScopeStack, bind_expr,
+    bind_from, bind_returning, bind_select, build_returning_schema, lookup_table_reference,
+    schema_for_qualified_binding,
 };
 
 pub(super) fn bind_insert(
@@ -442,6 +444,181 @@ pub(super) fn bind_delete(
         returning,
         schema: returning_schema,
     })
+}
+
+// ---------------------------------------------------------------------------
+// MERGE
+// ---------------------------------------------------------------------------
+
+/// Bind a `MERGE INTO` statement.
+///
+/// Produces a source child plan plus ordered branch metadata. Expressions bind
+/// against a combined schema containing target columns first and source columns
+/// second, both qualified by their SQL alias/table name so bare references are
+/// rejected when ambiguous.
+pub(super) fn bind_merge(
+    s: &MergeStmt,
+    catalog: &dyn Catalog,
+    scope: &mut ScopeStack,
+) -> Result<LogicalPlan, PlanError> {
+    let (target, meta) = lookup_target_table(catalog, &s.target)?;
+    let target_schema = meta.schema;
+    let target_qualifier = s
+        .target_alias
+        .as_ref()
+        .map_or_else(|| object_name_leaf(&s.target), |alias| alias.value.clone());
+    let target_binding_schema = qualified_table_schema(&target_schema, &target_qualifier)?;
+
+    let (source, source_scope) = bind_from(std::slice::from_ref(&s.source), catalog, &[], scope)?;
+    let source_binding_schema = schema_for_qualified_binding(source.schema(), &source_scope)?;
+    let combined_schema = concat_binding_schemas(&target_binding_schema, &source_binding_schema)?;
+
+    let on = bind_bool_expr(&s.on, &combined_schema, catalog, scope, "MERGE ON")?;
+
+    let mut clauses = Vec::with_capacity(s.clauses.len());
+    for clause in &s.clauses {
+        let kind = match clause.kind {
+            MergeMatchKind::Matched => LogicalMergeMatchKind::Matched,
+            MergeMatchKind::NotMatched => LogicalMergeMatchKind::NotMatched,
+        };
+        let condition = clause
+            .condition
+            .as_ref()
+            .map(|expr| bind_bool_expr(expr, &combined_schema, catalog, scope, "MERGE WHEN"))
+            .transpose()?;
+        let action = match (&clause.kind, &clause.action) {
+            (MergeMatchKind::Matched, MergeAction::Update { set }) => LogicalMergeAction::Update {
+                assignments: bind_assignments(
+                    set,
+                    &target_schema,
+                    &combined_schema,
+                    catalog,
+                    scope,
+                )?,
+            },
+            (MergeMatchKind::Matched, MergeAction::Delete) => LogicalMergeAction::Delete,
+            (MergeMatchKind::NotMatched, MergeAction::Insert { columns, values }) => {
+                let columns = bind_insert_columns(columns, &target_schema)?;
+                if values.len() != columns.len() {
+                    return Err(PlanError::TypeMismatch(format!(
+                        "MERGE INSERT column count ({}) does not match VALUES arity ({})",
+                        columns.len(),
+                        values.len()
+                    )));
+                }
+                let mut bound_values = Vec::with_capacity(values.len());
+                for (idx, value) in values.iter().enumerate() {
+                    let mut expr = bind_expr(value, &combined_schema, catalog, scope)?;
+                    let target = &target_schema.field_at(columns[idx]).data_type;
+                    coerce_assignment_expr_to_type(&mut expr, target);
+                    bound_values.push(expr);
+                }
+                LogicalMergeAction::Insert {
+                    columns,
+                    values: bound_values,
+                }
+            }
+            (MergeMatchKind::Matched, MergeAction::Insert { .. }) => {
+                return Err(PlanError::NotSupported(
+                    "MERGE WHEN MATCHED THEN INSERT has no source-only target row",
+                ));
+            }
+            (MergeMatchKind::NotMatched, MergeAction::Update { .. }) => {
+                return Err(PlanError::NotSupported(
+                    "MERGE WHEN NOT MATCHED THEN UPDATE has no target row",
+                ));
+            }
+            (MergeMatchKind::NotMatched, MergeAction::Delete) => {
+                return Err(PlanError::NotSupported(
+                    "MERGE WHEN NOT MATCHED THEN DELETE has no target row",
+                ));
+            }
+        };
+        clauses.push(LogicalMergeClause {
+            kind,
+            condition,
+            action,
+        });
+    }
+
+    Ok(LogicalPlan::Merge {
+        target,
+        target_alias: s.target_alias.as_ref().map(|alias| alias.value.clone()),
+        target_schema,
+        source: Box::new(source),
+        on,
+        clauses,
+        schema: Schema::empty(),
+    })
+}
+
+fn bind_bool_expr(
+    expr: &Expr,
+    input: &Schema,
+    catalog: &dyn Catalog,
+    scope: &mut ScopeStack,
+    label: &'static str,
+) -> Result<ScalarExpr, PlanError> {
+    let bound = bind_expr(expr, input, catalog, scope)?;
+    let ty = bound.data_type();
+    if ty != DataType::Bool && ty != DataType::Null {
+        return Err(PlanError::TypeMismatch(format!(
+            "{label} predicate must be boolean, got {ty}"
+        )));
+    }
+    Ok(bound)
+}
+
+fn bind_insert_columns(
+    columns: &[ultrasql_parser::ast::Identifier],
+    target_schema: &Schema,
+) -> Result<Vec<usize>, PlanError> {
+    if columns.is_empty() {
+        return Ok((0..target_schema.len()).collect());
+    }
+
+    let mut out = Vec::with_capacity(columns.len());
+    let mut seen: std::collections::HashSet<String> =
+        std::collections::HashSet::with_capacity(columns.len());
+    for ident in columns {
+        let col_name = ident.value.clone();
+        if !seen.insert(col_name.to_ascii_lowercase()) {
+            return Err(PlanError::DuplicateColumn(col_name));
+        }
+        let idx = target_schema
+            .find(&col_name)
+            .ok_or_else(|| PlanError::ColumnNotFound(col_name.clone()))?
+            .0;
+        out.push(idx);
+    }
+    Ok(out)
+}
+
+fn qualified_table_schema(schema: &Schema, qualifier: &str) -> Result<Schema, PlanError> {
+    let from_scope: Vec<ScopeEntry> = schema
+        .fields()
+        .iter()
+        .enumerate()
+        .map(|(i, field)| ScopeEntry {
+            qualifier: qualifier.to_owned(),
+            field_index: i,
+            field: field.clone(),
+        })
+        .collect();
+    schema_for_qualified_binding(schema, &from_scope)
+}
+
+fn concat_binding_schemas(left: &Schema, right: &Schema) -> Result<Schema, PlanError> {
+    let mut fields = Vec::with_capacity(left.len() + right.len());
+    fields.extend(left.fields().iter().cloned());
+    fields.extend(right.fields().iter().cloned());
+    Schema::new(fields).map_err(|e| PlanError::TypeMismatch(format!("MERGE binding schema: {e}")))
+}
+
+fn object_name_leaf(name: &ObjectName) -> String {
+    name.parts
+        .last()
+        .map_or_else(String::new, |part| part.value.to_ascii_lowercase())
 }
 
 fn lookup_target_table(

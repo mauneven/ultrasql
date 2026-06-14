@@ -309,6 +309,7 @@ fn lower_query_inner(
             }
             lower_real_delete(table, input, returning, schema, ctx)
         }
+        LogicalPlan::Merge { .. } => Err(ServerError::Unsupported("MERGE")),
         LogicalPlan::Truncate { .. }
         | LogicalPlan::CreateTable { .. }
         | LogicalPlan::CreateMaterializedView { .. }
@@ -671,6 +672,7 @@ fn profile_operator_name(plan: &LogicalPlan) -> &'static str {
         LogicalPlan::Insert { .. } => "Insert",
         LogicalPlan::Update { .. } => "Update",
         LogicalPlan::Delete { .. } => "Delete",
+        LogicalPlan::Merge { .. } => "Merge",
         LogicalPlan::Empty { .. } => "Empty",
         LogicalPlan::Truncate { .. } => "Truncate",
         LogicalPlan::CreateTable { .. } => "CreateTable",

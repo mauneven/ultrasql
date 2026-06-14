@@ -79,6 +79,7 @@ pub fn lower_plan(
         LogicalPlan::Insert { .. } => Err(ServerError::Unsupported("INSERT")),
         LogicalPlan::Update { .. } => Err(ServerError::Unsupported("UPDATE")),
         LogicalPlan::Delete { .. } => Err(ServerError::Unsupported("DELETE")),
+        LogicalPlan::Merge { .. } => Err(ServerError::Unsupported("MERGE")),
         LogicalPlan::Truncate { .. } => Err(ServerError::Unsupported("TRUNCATE")),
         // DDL is dispatched ahead of the lowerer in
         // `lib.rs::execute_query`. Reaching here means the dispatcher

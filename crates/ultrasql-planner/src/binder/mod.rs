@@ -59,8 +59,9 @@ use crate::expr::ScalarExpr;
 use crate::plan::{
     AggregateFunc, ConflictTarget, ExplainFormat, LockStrength, LockWaitPolicy,
     LogicalAggregateExpr, LogicalAlterTableAction, LogicalDescribeObjectKind,
-    LogicalDescribeTarget, LogicalJoinCondition, LogicalJoinType, LogicalOnConflict, LogicalPlan,
-    LogicalSetOp, LogicalSetQuantifier, LogicalSetVariableAction, SortKey, TxnIsolationLevel,
+    LogicalDescribeTarget, LogicalJoinCondition, LogicalJoinType, LogicalMergeAction,
+    LogicalMergeClause, LogicalMergeMatchKind, LogicalOnConflict, LogicalPlan, LogicalSetOp,
+    LogicalSetQuantifier, LogicalSetVariableAction, SortKey, TxnIsolationLevel,
 };
 use crate::scope::{ScopeFrame, ScopeStack};
 
@@ -86,7 +87,7 @@ use self::ddl::{
     bind_create_table, bind_create_type, bind_drop_index, bind_drop_role, bind_drop_schema,
     bind_drop_sequence, bind_drop_table, bind_truncate,
 };
-use self::dml::{bind_delete, bind_insert, bind_update};
+use self::dml::{bind_delete, bind_insert, bind_merge, bind_update};
 use self::expr_bind::{bind_expr, bind_expr_with_ctes};
 use self::from::bind_from;
 use self::privilege::{
@@ -119,9 +120,7 @@ pub fn bind(stmt: &Statement, catalog: &dyn Catalog) -> Result<LogicalPlan, Plan
         Statement::Insert(s) => bind_insert(s, catalog, &mut scope),
         Statement::Update(s) => bind_update(s, catalog, &mut scope),
         Statement::Delete(s) => bind_delete(s, catalog, &mut scope),
-        Statement::Merge(_) => Err(PlanError::NotSupported(
-            "MERGE INTO binding is not implemented yet",
-        )),
+        Statement::Merge(s) => bind_merge(s, catalog, &mut scope),
         Statement::Truncate(s) => bind_truncate(s, catalog),
         Statement::Describe(s) => bind_describe(s, catalog, &mut scope),
         Statement::Checkpoint { .. } => Ok(LogicalPlan::Checkpoint {

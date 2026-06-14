@@ -5,7 +5,7 @@ use ultrasql_parser::ast::BinaryOp;
 
 use super::*;
 use crate::catalog::{InMemoryCatalog, TableMeta};
-use crate::plan::PipelineMode;
+use crate::plan::{LogicalMergeAction, LogicalMergeMatchKind, PipelineMode};
 use crate::{
     LogicalIndexMethod, LogicalPrivilegeKind, LogicalPrivilegeObjectKind, LogicalWindowFunc,
 };
@@ -279,20 +279,95 @@ fn binds_set_variable_as_session_setting() {
 }
 
 #[test]
-fn merge_fails_closed_until_semantic_binding_lands() {
+fn binds_merge_update_delete_insert_clauses() {
+    let plan = parse_bind_ok(
+        "MERGE INTO users AS u \
+         USING users AS s \
+         ON u.id = s.id \
+         WHEN MATCHED AND s.score IS NULL THEN DELETE \
+         WHEN MATCHED THEN UPDATE SET name = s.name, score = s.score \
+         WHEN NOT MATCHED THEN INSERT (id, name, score) VALUES (s.id, s.name, s.score)",
+    );
+    let LogicalPlan::Merge {
+        target,
+        source,
+        on,
+        clauses,
+        schema,
+        ..
+    } = plan
+    else {
+        panic!("expected Merge");
+    };
+
+    assert_eq!(target, "users");
+    assert!(matches!(source.as_ref(), LogicalPlan::Scan { table, .. } if table == "users"));
+    assert_eq!(on.data_type(), DataType::Bool);
+    assert!(schema.is_empty());
+    assert_eq!(clauses.len(), 3);
+    assert_eq!(clauses[0].kind, LogicalMergeMatchKind::Matched);
+    assert!(matches!(clauses[0].action, LogicalMergeAction::Delete));
+    assert!(clauses[0].condition.is_some());
+    assert_eq!(clauses[1].kind, LogicalMergeMatchKind::Matched);
+    let LogicalMergeAction::Update { ref assignments } = clauses[1].action else {
+        panic!("expected update action");
+    };
+    assert_eq!(
+        assignments.iter().map(|(idx, _)| *idx).collect::<Vec<_>>(),
+        vec![1, 2]
+    );
+    assert_eq!(clauses[2].kind, LogicalMergeMatchKind::NotMatched);
+    let LogicalMergeAction::Insert {
+        ref columns,
+        ref values,
+    } = clauses[2].action
+    else {
+        panic!("expected insert action");
+    };
+    assert_eq!(columns, &[0, 1, 2]);
+    assert_eq!(values.len(), 3);
+}
+
+#[test]
+fn merge_rejects_ambiguous_unqualified_column_references() {
+    let cat = users_catalog();
+    let err = parse_and_bind(
+        "MERGE INTO users AS u \
+         USING users AS s \
+         ON id = s.id \
+         WHEN MATCHED THEN UPDATE SET name = s.name",
+        &cat,
+    )
+    .expect_err("unqualified id is ambiguous between target and source");
+    assert!(matches!(err, PlanError::Ambiguous(ref c) if c == "id"));
+}
+
+#[test]
+fn merge_rejects_non_boolean_on_condition() {
+    let cat = users_catalog();
+    let err = parse_and_bind(
+        "MERGE INTO users AS u \
+         USING users AS s \
+         ON s.score \
+         WHEN MATCHED THEN DELETE",
+        &cat,
+    )
+    .expect_err("ON must be boolean");
+    assert!(matches!(err, PlanError::TypeMismatch(msg) if msg.contains("MERGE ON")));
+}
+
+#[test]
+fn merge_rejects_duplicate_update_target() {
     let cat = users_catalog();
     let err = parse_and_bind(
         "MERGE INTO users AS u \
          USING users AS s \
          ON u.id = s.id \
-         WHEN MATCHED THEN UPDATE SET name = s.name",
+         WHEN MATCHED THEN UPDATE SET name = s.name, name = 'x'",
         &cat,
     )
-    .expect_err("MERGE must fail closed before binder support");
-    assert!(
-        matches!(err, PlanError::NotSupported(msg) if msg.contains("MERGE INTO")),
-        "unexpected error: {err:?}"
-    );
+    .expect_err("duplicate update target is rejected");
+    assert!(matches!(err, PlanError::DuplicateColumn(ref c) if c == "name"));
 }
 
 #[test]
@@ -4138,6 +4213,7 @@ fn collect_window_funcs<'a>(plan: &'a LogicalPlan, out: &mut Vec<&'a LogicalWind
         | LogicalPlan::Update { input, .. }
         | LogicalPlan::Delete { input, .. } => collect_window_funcs(input, out),
         LogicalPlan::Insert { source, .. } => collect_window_funcs(source, out),
+        LogicalPlan::Merge { source, .. } => collect_window_funcs(source, out),
         LogicalPlan::Join { left, right, .. } | LogicalPlan::SetOp { left, right, .. } => {
             collect_window_funcs(left, out);
             collect_window_funcs(right, out);

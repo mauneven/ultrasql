@@ -169,6 +169,7 @@ pub fn build_operator(
         LogicalPlan::Insert { .. } => Err(BuildError::Unsupported("INSERT not supported in v0.5")),
         LogicalPlan::Update { .. } => Err(BuildError::Unsupported("UPDATE not supported in v0.5")),
         LogicalPlan::Delete { .. } => Err(BuildError::Unsupported("DELETE not supported in v0.5")),
+        LogicalPlan::Merge { .. } => Err(BuildError::Unsupported("MERGE not supported in v0.5")),
         LogicalPlan::Truncate { .. } => {
             Err(BuildError::Unsupported("TRUNCATE not supported in v0.5"))
         }

@@ -7,7 +7,7 @@ use ultrasql_catalog::{CatalogSnapshot, TableEntry};
 use ultrasql_core::Schema;
 use ultrasql_planner::{
     Catalog as PlannerCatalog, CopyDirection, LogicalAggregateExpr, LogicalJoinCondition,
-    LogicalOnConflict, LogicalPlan, LogicalWindowFunc, ScalarExpr, SortKey,
+    LogicalMergeAction, LogicalOnConflict, LogicalPlan, LogicalWindowFunc, ScalarExpr, SortKey,
 };
 
 use super::Session;
@@ -345,6 +345,53 @@ where
                     self.collect_target_exprs(table, &schema, returning);
                 }
                 self.collect_plan(input, false);
+            }
+            LogicalPlan::Merge {
+                target,
+                target_schema,
+                source,
+                on,
+                clauses,
+                ..
+            } => {
+                let mut sources = table_sources(target, target_schema);
+                sources.extend(plan_sources(source));
+                self.collect_expr(on, &sources, PrivilegeKind::Select);
+                for clause in clauses {
+                    if let Some(condition) = &clause.condition {
+                        self.collect_expr(condition, &sources, PrivilegeKind::Select);
+                    }
+                    match &clause.action {
+                        LogicalMergeAction::Update { assignments } => {
+                            for (index, expr) in assignments {
+                                self.require_table_column(
+                                    target,
+                                    target_schema,
+                                    *index,
+                                    PrivilegeKind::Update,
+                                );
+                                self.collect_expr(expr, &sources, PrivilegeKind::Select);
+                            }
+                        }
+                        LogicalMergeAction::Delete => {
+                            self.require_table(target, PrivilegeKind::Delete);
+                        }
+                        LogicalMergeAction::Insert { columns, values } => {
+                            for index in columns {
+                                self.require_table_column(
+                                    target,
+                                    target_schema,
+                                    *index,
+                                    PrivilegeKind::Insert,
+                                );
+                            }
+                            for expr in values {
+                                self.collect_expr(expr, &sources, PrivilegeKind::Select);
+                            }
+                        }
+                    }
+                }
+                self.collect_plan(source, false);
             }
             LogicalPlan::CreateMaterializedView { source, .. }
             | LogicalPlan::Explain { input: source, .. } => {

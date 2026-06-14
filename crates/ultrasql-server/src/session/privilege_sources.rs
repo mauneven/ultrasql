@@ -71,6 +71,7 @@ pub(super) fn plan_sources(plan: &LogicalPlan) -> Vec<Option<ColumnSource>> {
         | LogicalPlan::Insert { schema, .. }
         | LogicalPlan::Update { schema, .. }
         | LogicalPlan::Delete { schema, .. }
+        | LogicalPlan::Merge { schema, .. }
         | LogicalPlan::Truncate { schema, .. }
         | LogicalPlan::CreateTable { schema, .. }
         | LogicalPlan::CreateMaterializedView { schema, .. }

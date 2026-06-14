@@ -15,7 +15,9 @@
 //! to detect a fixed point without re-hashing the plan tree.
 
 use ultrasql_core::{DataType, Value};
-use ultrasql_planner::{BinaryOp, LogicalPlan, ScalarExpr, SortKey, UnaryOp};
+use ultrasql_planner::{
+    BinaryOp, LogicalMergeAction, LogicalMergeClause, LogicalPlan, ScalarExpr, SortKey, UnaryOp,
+};
 
 use crate::error::OptimizeError;
 use crate::rules::RewriteRule;
@@ -411,6 +413,62 @@ fn fold_plan(plan: &LogicalPlan) -> Result<Option<LogicalPlan>, OptimizeError> {
                 table: table.clone(),
                 input: Box::new(new_input.unwrap_or_else(|| *input.clone())),
                 returning: new_ret,
+                schema: schema.clone(),
+            }))
+        }
+
+        LogicalPlan::Merge {
+            target,
+            target_alias,
+            target_schema,
+            source,
+            on,
+            clauses,
+            schema,
+        } => {
+            let new_source = fold_plan(source)?;
+            let new_on = fold_expr(on);
+            let mut clauses_changed = false;
+            let new_clauses = clauses
+                .iter()
+                .map(|clause| {
+                    let new_condition = clause.condition.as_ref().and_then(fold_expr);
+                    if new_condition.is_some() {
+                        clauses_changed = true;
+                    }
+                    let action = match &clause.action {
+                        LogicalMergeAction::Update { assignments } => {
+                            let (assignments, changed) = fold_idx_expr_pairs(assignments);
+                            clauses_changed |= changed;
+                            LogicalMergeAction::Update { assignments }
+                        }
+                        LogicalMergeAction::Delete => LogicalMergeAction::Delete,
+                        LogicalMergeAction::Insert { columns, values } => {
+                            let (values, changed) = fold_expr_list(values);
+                            clauses_changed |= changed;
+                            LogicalMergeAction::Insert {
+                                columns: columns.clone(),
+                                values,
+                            }
+                        }
+                    };
+                    LogicalMergeClause {
+                        kind: clause.kind,
+                        condition: new_condition.or_else(|| clause.condition.clone()),
+                        action,
+                    }
+                })
+                .collect();
+            if new_source.is_none() && new_on.is_none() && !clauses_changed {
+                return Ok(None);
+            }
+            Ok(Some(LogicalPlan::Merge {
+                target: target.clone(),
+                target_alias: target_alias.clone(),
+                target_schema: target_schema.clone(),
+                source: Box::new(new_source.unwrap_or_else(|| *source.clone())),
+                on: new_on.unwrap_or_else(|| on.clone()),
+                clauses: new_clauses,
                 schema: schema.clone(),
             }))
         }

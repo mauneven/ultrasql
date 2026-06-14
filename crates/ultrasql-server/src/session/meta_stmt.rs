@@ -32,7 +32,7 @@ use std::sync::Arc;
 use ultrasql_catalog::CatalogSnapshot;
 use ultrasql_core::Value;
 use ultrasql_parser::ast::{DeallocateStmt, ExecuteStmt, Expr, Literal, PrepareStmt, Statement};
-use ultrasql_planner::{LogicalPlan, ScalarExpr, bind};
+use ultrasql_planner::{LogicalMergeAction, LogicalPlan, ScalarExpr, bind};
 use ultrasql_protocol::BackendMessage;
 
 use crate::CombinedCatalog;
@@ -369,6 +369,33 @@ fn walk_plan_for_max_param(plan: &LogicalPlan, max_idx: &mut u32) {
             }
         }
         LogicalPlan::Delete { input, .. } => walk_plan_for_max_param(input, max_idx),
+        LogicalPlan::Merge {
+            source,
+            on,
+            clauses,
+            ..
+        } => {
+            walk_plan_for_max_param(source, max_idx);
+            walk_expr_for_max_param(on, max_idx);
+            for clause in clauses {
+                if let Some(condition) = &clause.condition {
+                    walk_expr_for_max_param(condition, max_idx);
+                }
+                match &clause.action {
+                    LogicalMergeAction::Update { assignments } => {
+                        for (_idx, expr) in assignments {
+                            walk_expr_for_max_param(expr, max_idx);
+                        }
+                    }
+                    LogicalMergeAction::Delete => {}
+                    LogicalMergeAction::Insert { values, .. } => {
+                        for expr in values {
+                            walk_expr_for_max_param(expr, max_idx);
+                        }
+                    }
+                }
+            }
+        }
         LogicalPlan::Window {
             input,
             partition_by,

@@ -8,8 +8,8 @@
 use num_traits::ToPrimitive;
 use ultrasql_core::{DataType, Value};
 use ultrasql_planner::{
-    BinaryOp, LogicalAggregateExpr, LogicalJoinCondition, LogicalOnConflict, LogicalPlan,
-    LogicalSetOp, LogicalSetQuantifier, ScalarExpr, SortKey,
+    BinaryOp, LogicalAggregateExpr, LogicalJoinCondition, LogicalMergeAction, LogicalMergeClause,
+    LogicalOnConflict, LogicalPlan, LogicalSetOp, LogicalSetQuantifier, ScalarExpr, SortKey,
 };
 
 // Parameter substitution: ScalarExpr::Parameter → ScalarExpr::Literal.
@@ -392,6 +392,41 @@ where
             table: table.clone(),
             input: Box::new(map_plan_exprs(input, f)),
             returning: returning.iter().map(|(e, n)| (f(e), n.clone())).collect(),
+            schema: schema.clone(),
+        },
+        LogicalPlan::Merge {
+            target,
+            target_alias,
+            target_schema,
+            source,
+            on,
+            clauses,
+            schema,
+        } => LogicalPlan::Merge {
+            target: target.clone(),
+            target_alias: target_alias.clone(),
+            target_schema: target_schema.clone(),
+            source: Box::new(map_plan_exprs(source, f)),
+            on: f(on),
+            clauses: clauses
+                .iter()
+                .map(|clause| LogicalMergeClause {
+                    kind: clause.kind,
+                    condition: clause.condition.as_ref().map(f),
+                    action: match &clause.action {
+                        LogicalMergeAction::Update { assignments } => LogicalMergeAction::Update {
+                            assignments: assignments.iter().map(|(i, e)| (*i, f(e))).collect(),
+                        },
+                        LogicalMergeAction::Delete => LogicalMergeAction::Delete,
+                        LogicalMergeAction::Insert { columns, values } => {
+                            LogicalMergeAction::Insert {
+                                columns: columns.clone(),
+                                values: values.iter().map(f).collect(),
+                            }
+                        }
+                    },
+                })
+                .collect(),
             schema: schema.clone(),
         },
         LogicalPlan::Join {
