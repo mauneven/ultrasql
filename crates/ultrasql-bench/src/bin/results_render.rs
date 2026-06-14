@@ -491,26 +491,38 @@ fn render_json(by_workload: &HashMap<String, Vec<EngineResult>>) -> Result<Strin
 ///
 /// Falls back to a static placeholder when the system time is unavailable.
 fn rendered_at() -> String {
-    // Use std::time to get Unix timestamp, then format manually.
     let secs = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
+    format_unix_timestamp_utc(secs)
+}
 
-    // Simple ISO-8601 UTC approximation without a date crate.
-    // Accurate for years 2001–2038 within the UTC offset.
-    let s = secs;
-    let sec = s % 60;
-    let min = (s / 60) % 60;
-    let hour = (s / 3600) % 24;
-    // Days since epoch → rough date (good enough for a metadata field).
-    let days = s / 86400;
-    // 400-year cycle; close enough for our purposes.
-    let year = 1970 + days / 365;
-    let doy = days % 365;
-    let month = (doy / 30).clamp(0, 11) + 1;
-    let day = (doy % 30) + 1;
+fn format_unix_timestamp_utc(secs: u64) -> String {
+    let sec = secs % 60;
+    let min = (secs / 60) % 60;
+    let hour = (secs / 3600) % 24;
+    let days = i64::try_from(secs / 86_400).unwrap_or(i64::MAX);
+    let (year, month, day) = civil_from_days(days);
     format!("{year:04}-{month:02}-{day:02}T{hour:02}:{min:02}:{sec:02}Z")
+}
+
+fn civil_from_days(days_since_unix_epoch: i64) -> (i64, u32, u32) {
+    let z = days_since_unix_epoch + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = mp + if mp < 10 { 3 } else { -9 };
+    let year = y + i64::from(month <= 2);
+    (
+        year,
+        u32::try_from(month).unwrap_or(0),
+        u32::try_from(day).unwrap_or(0),
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -579,6 +591,19 @@ mod tests {
             48
         );
         assert_eq!(render_bar(f64::INFINITY, 10.0), " ".repeat(48));
+    }
+
+    #[test]
+    fn unix_timestamp_format_is_real_utc_calendar_date() {
+        assert_eq!(format_unix_timestamp_utc(0), "1970-01-01T00:00:00Z");
+        assert_eq!(
+            format_unix_timestamp_utc(1_704_067_200),
+            "2024-01-01T00:00:00Z"
+        );
+        assert_eq!(
+            format_unix_timestamp_utc(1_709_164_800),
+            "2024-02-29T00:00:00Z"
+        );
     }
 
     // -----------------------------------------------------------------------
