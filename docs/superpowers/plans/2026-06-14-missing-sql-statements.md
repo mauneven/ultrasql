@@ -70,7 +70,7 @@ Docs commits happen only after passing implementation tests for that family.
 - [x] Execute table describes from catalog snapshot and query describes from the bound plan schema.
 - [x] Add integration tests for table, query, missing object, and view-kind unsupported error until normal views exist.
 - [x] Add docs after tests pass with syntax, examples, limitations, and links to test/source paths.
-- [ ] Commit parser/planner/executor/tests/docs separately.
+- [x] Commit parser/planner/executor/tests/docs separately.
 
 ## Phase 2: ALTER VIEW
 
