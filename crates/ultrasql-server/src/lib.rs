@@ -9018,6 +9018,10 @@ fn run_plan_in_txn(args: RunPlanInTxnArgs<'_>) -> Result<SelectResult, ServerErr
                 )
             }
         }
+        LogicalPlan::Merge { .. } => {
+            let mut op = pipeline::lower_query(plan, &ctx)?;
+            run_modify_command(op.as_mut(), "MERGE")
+        }
         _ => {
             let mut op = pipeline::lower_query(plan, &ctx)?;
             // Streaming wire-encode hot path: bypass the

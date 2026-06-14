@@ -2742,13 +2742,14 @@ where
     ) -> Result<(), ServerError> {
         let table = match plan {
             LogicalPlan::Update { table, .. } | LogicalPlan::Delete { table, .. } => table,
+            LogicalPlan::Merge { target, .. } => target,
             _ => return Ok(()),
         };
         if self.materialized_views_for_source(table).is_empty() {
             return Ok(());
         }
         Err(ServerError::Unsupported(
-            "UPDATE/DELETE on append-only materialized view source is not supported",
+            "UPDATE/DELETE/MERGE on append-only materialized view source is not supported",
         ))
     }
 
@@ -3000,10 +3001,10 @@ where
         let Some(cmd) = parts.next() else {
             return 0;
         };
-        if !matches!(cmd, "INSERT" | "UPDATE" | "DELETE") {
+        if !matches!(cmd, "INSERT" | "UPDATE" | "DELETE" | "MERGE") {
             return 0;
         }
-        // INSERT tag shape is `INSERT 0 <rows>`, UPDATE/DELETE is
+        // INSERT tag shape is `INSERT 0 <rows>`, UPDATE/DELETE/MERGE is
         // `<CMD> <rows>`.
         let last = parts.next_back().unwrap_or_default();
         last.parse::<u64>().unwrap_or(0)
@@ -3121,7 +3122,8 @@ where
         match plan {
             LogicalPlan::Insert { table, .. }
             | LogicalPlan::Update { table, .. }
-            | LogicalPlan::Delete { table, .. } => Some(table.as_str()),
+            | LogicalPlan::Delete { table, .. }
+            | LogicalPlan::Merge { target: table, .. } => Some(table.as_str()),
             _ => None,
         }
     }
