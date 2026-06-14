@@ -17,7 +17,9 @@
 //! Segment rollover is handled inline: when the active segment's size
 //! reaches `segment_size_bytes`, the writer fsyncs the segment, closes
 //! it, and opens the next one. Drains happen in whole-record granularity
-//! so rollover always happens on a record boundary.
+//! so rollover always happens on a record boundary. Segment creation
+//! fsyncs the parent directory before the new file handle is returned,
+//! so crash recovery does not depend on an unsynced directory entry.
 //!
 //! Platform fsync semantics
 //! ------------------------
@@ -590,7 +592,35 @@ fn open_segment_file(path: &Path) -> std::io::Result<File> {
     opts.create_new(true).write(true).read(false);
     #[cfg(unix)]
     opts.custom_flags(libc::O_NOFOLLOW);
-    opts.open(path)
+    let file = opts.open(path)?;
+    if let Err(err) = sync_segment_parent_dir(path) {
+        drop(file);
+        let _ = std::fs::remove_file(path);
+        return Err(err);
+    }
+    Ok(file)
+}
+
+fn sync_segment_parent_dir(path: &Path) -> std::io::Result<()> {
+    let Some(parent) = path.parent() else {
+        return Ok(());
+    };
+    sync_segment_dir(parent)
+}
+
+#[cfg(unix)]
+fn sync_segment_dir(path: &Path) -> std::io::Result<()> {
+    let dir = File::open(path)?;
+    match dir.sync_all() {
+        Ok(()) => Ok(()),
+        Err(err) if err.kind() == std::io::ErrorKind::InvalidInput => Ok(()),
+        Err(err) => Err(err),
+    }
+}
+
+#[cfg(not(unix))]
+fn sync_segment_dir(_path: &Path) -> std::io::Result<()> {
+    Ok(())
 }
 
 /// Determine the index to use for the next segment to be written to a
@@ -663,6 +693,28 @@ mod tests {
         let err = open_segment_file(&path).expect_err("closed WAL segment must stay immutable");
         assert_eq!(err.kind(), std::io::ErrorKind::AlreadyExists);
         assert_eq!(std::fs::read(&path).unwrap(), b"closed-segment");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn segment_open_fails_if_parent_directory_cannot_be_synced() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = TempDir::new().unwrap();
+        let wal_dir = dir.path().join("wal");
+        std::fs::create_dir(&wal_dir).unwrap();
+        std::fs::set_permissions(&wal_dir, std::fs::Permissions::from_mode(0o300)).unwrap();
+
+        let path = segment_path(&wal_dir, 0);
+        let result = open_segment_file(&path);
+        std::fs::set_permissions(&wal_dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+        let err = result.expect_err("segment create must fail if parent dir cannot be synced");
+        assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied);
+        assert!(
+            !path.exists(),
+            "failed durable segment create must not leave an empty segment behind"
+        );
     }
 
     #[test]
