@@ -361,6 +361,18 @@ struct VectorDeleteIndexChange {
     keys: Vec<Option<Vec<f32>>>,
 }
 
+struct ComputedDelete {
+    tid: TupleId,
+    index_change: Option<DeleteIndexChange>,
+    vector_index_change: Option<VectorDeleteIndexChange>,
+}
+
+struct PreparedInsert {
+    payload: Vec<u8>,
+    index_keys: Vec<Option<i64>>,
+    vector_index_keys: Vec<Option<Vec<f32>>>,
+}
+
 type DeleteExtraction = (
     Vec<TupleId>,
     Vec<DeleteIndexChange>,
@@ -456,6 +468,45 @@ pub enum ModifyKind {
     /// The child operator must emit rows in the shape
     /// `[tid_block: Int32, tid_slot: Int32, ...rest]`.
     Delete,
+
+    /// Apply tagged `MERGE INTO` rows.
+    ///
+    /// The child operator emits rows in the shape
+    /// `[merge_clause: Int32, tid_block: Int32, tid_slot: Int32,
+    /// target_col0, ..., source_col0, ...]`. `merge_clause` indexes
+    /// `clauses`; update/delete actions use the target TID, while insert
+    /// actions ignore the fake TID and evaluate values against
+    /// `[target..., source...]`.
+    Merge {
+        /// Ordered runtime branch actions.
+        clauses: Vec<MergeClause>,
+    },
+}
+
+/// Runtime action for a selected `MERGE INTO` branch.
+#[derive(Clone, Debug)]
+pub enum MergeAction {
+    /// `WHEN MATCHED THEN UPDATE SET ...`.
+    Update {
+        /// Assignment evaluators applied against `[target..., source...]`.
+        assignments: Vec<(usize, Eval)>,
+    },
+    /// `WHEN MATCHED THEN DELETE`.
+    Delete,
+    /// `WHEN NOT MATCHED THEN INSERT ...`.
+    Insert {
+        /// Target column map for the insert row.
+        columns: Vec<usize>,
+        /// Value evaluators applied against `[target..., source...]`.
+        values: Vec<Eval>,
+    },
+}
+
+/// Runtime metadata for one selected `MERGE INTO` branch.
+#[derive(Clone, Debug)]
+pub struct MergeClause {
+    /// Branch action.
+    pub action: MergeAction,
 }
 
 /// Runtime action for `INSERT ... ON CONFLICT`.
@@ -552,6 +603,12 @@ pub struct ModifyTable<L: PageLoader> {
     ///
     /// Empty for INSERT and DELETE.
     update_evaluators: Vec<(usize, Eval)>,
+    /// When true, UPDATE child rows may carry extra columns after the
+    /// target row image. The first `relation_schema.len()` values remain
+    /// the old target row; assignment expressions evaluate against the
+    /// full row. Used by MERGE, whose update expressions bind against
+    /// `[target..., source...]`.
+    update_extra_eval_columns: bool,
     /// Cached descriptor for the columnar UPDATE fast path. `Some`
     /// when (a) the kind is UPDATE, (b) the relation schema is
     /// exactly `(Int32, Int32)`, (c) there is one assignment whose
@@ -653,13 +710,13 @@ impl<L: PageLoader> ModifyTable<L> {
                 .iter()
                 .map(|(col, expr)| (*col, Eval::new(expr.clone())))
                 .collect(),
-            ModifyKind::Insert | ModifyKind::Delete => Vec::new(),
+            ModifyKind::Insert | ModifyKind::Delete | ModifyKind::Merge { .. } => Vec::new(),
         };
         let update_fast_path = match &kind {
             ModifyKind::Update { assignments } => {
                 detect_update_int32_pair_fast_path(assignments, &target_schema)
             }
-            _ => None,
+            ModifyKind::Insert | ModifyKind::Delete | ModifyKind::Merge { .. } => None,
         };
         Self {
             heap,
@@ -668,6 +725,7 @@ impl<L: PageLoader> ModifyTable<L> {
             codec: RowCodec::new(target_schema),
             kind,
             update_evaluators,
+            update_extra_eval_columns: false,
             update_fast_path,
             insert_xmin: stamps.insert_xmin,
             insert_command_id: stamps.insert_command_id,
@@ -723,6 +781,17 @@ impl<L: PageLoader> ModifyTable<L> {
     #[must_use]
     pub fn with_update_indexes(mut self, indexes: Vec<InsertIndexMaintainer<L>>) -> Self {
         self.update_indexes = indexes;
+        self
+    }
+
+    /// Allow UPDATE child rows to append expression-only columns after
+    /// the target row image.
+    ///
+    /// The heap update still writes only the target-width prefix. The
+    /// full post-TID row is visible to assignment evaluators.
+    #[must_use]
+    pub fn with_update_extra_eval_columns(mut self) -> Self {
+        self.update_extra_eval_columns = true;
         self
     }
 
@@ -1006,6 +1075,19 @@ impl<L: PageLoader + Send + Sync + std::fmt::Debug + 'static> Operator for Modif
         let mut all_update_edits: Vec<(TupleId, UpdatePayload)> = Vec::new();
         let mut all_update_index_changes: Vec<UpdateIndexChange> = Vec::new();
         let mut all_update_vector_index_changes: Vec<VectorUpdateIndexChange> = Vec::new();
+        let mut all_delete_tids: Vec<TupleId> = Vec::new();
+        let mut all_delete_index_changes: Vec<DeleteIndexChange> = Vec::new();
+        let mut all_delete_vector_index_changes: Vec<VectorDeleteIndexChange> = Vec::new();
+        let mut all_insert_payloads: Vec<Vec<u8>> = Vec::new();
+        let mut all_insert_index_keys: Vec<Vec<Option<i64>>> =
+            self.insert_indexes.iter().map(|_| Vec::new()).collect();
+        let mut all_insert_vector_index_keys: Vec<Vec<Option<Vec<f32>>>> = self
+            .insert_vector_indexes
+            .iter()
+            .map(|_| Vec::new())
+            .collect();
+        let mut merge_seen_insert_keys: Vec<HashSet<i64>> =
+            self.insert_indexes.iter().map(|_| HashSet::new()).collect();
         let mut returning_rows: Vec<Vec<Value>> = Vec::new();
         let returning_active = !self.returning_evaluators.is_empty();
 
@@ -1109,6 +1191,69 @@ impl<L: PageLoader + Send + Sync + std::fmt::Debug + 'static> Operator for Modif
                         all_update_edits = edits;
                     } else {
                         all_update_edits.extend(edits);
+                    }
+                }
+                ModifyKind::Merge { clauses } => {
+                    let child_schema = self.child.schema().clone();
+                    let rows = batch_to_rows(&batch, &child_schema)
+                        .map_err(|e| ExecError::TypeMismatch(e.to_string()))?;
+                    for row in &rows {
+                        let clause_idx = merge_clause_index(row, clauses.len())?;
+                        let clause = &clauses[clause_idx];
+                        match &clause.action {
+                            MergeAction::Update { assignments } => {
+                                let computed = self.compute_update_edit_with_evaluators(
+                                    merge_tid_row(row)?,
+                                    assignments,
+                                    false,
+                                )?;
+                                if let Some(index_change) = computed.index_change {
+                                    all_update_index_changes.push(index_change);
+                                }
+                                if let Some(index_change) = computed.vector_index_change {
+                                    all_update_vector_index_changes.push(index_change);
+                                }
+                                all_update_edits.push((computed.tid, computed.payload));
+                            }
+                            MergeAction::Delete => {
+                                let deleted =
+                                    self.compute_delete_change_from_row(merge_tid_row(row)?)?;
+                                all_delete_tids.push(deleted.tid);
+                                if let Some(index_change) = deleted.index_change {
+                                    all_delete_index_changes.push(index_change);
+                                }
+                                if let Some(index_change) = deleted.vector_index_change {
+                                    all_delete_vector_index_changes.push(index_change);
+                                }
+                            }
+                            MergeAction::Insert { columns, values } => {
+                                let prepared = self.prepare_merge_insert_row(
+                                    row,
+                                    columns,
+                                    values,
+                                    &mut merge_seen_insert_keys,
+                                )?;
+                                for (idx, key) in prepared.index_keys.into_iter().enumerate() {
+                                    let Some(keys) = all_insert_index_keys.get_mut(idx) else {
+                                        return Err(ExecError::Internal(
+                                            "merge insert index key vector width mismatch",
+                                        ));
+                                    };
+                                    keys.push(key);
+                                }
+                                for (idx, key) in prepared.vector_index_keys.into_iter().enumerate()
+                                {
+                                    let Some(keys) = all_insert_vector_index_keys.get_mut(idx)
+                                    else {
+                                        return Err(ExecError::Internal(
+                                            "merge insert vector index key vector width mismatch",
+                                        ));
+                                    };
+                                    keys.push(key);
+                                }
+                                all_insert_payloads.push(prepared.payload);
+                            }
+                        }
                     }
                 }
                 ModifyKind::Insert => {
@@ -1356,6 +1501,75 @@ impl<L: PageLoader + Send + Sync + std::fmt::Debug + 'static> Operator for Modif
             self.add_affected_rows(n)?;
         }
 
+        if !all_delete_tids.is_empty() {
+            let n = all_delete_tids.len();
+            let wal_ref: Option<&dyn WalSink> = self.wal.as_deref();
+            self.heap
+                .delete_many(
+                    all_delete_tids,
+                    DeleteOptions {
+                        xmax: self.delete_xmax,
+                        cmax: self.delete_cmax,
+                        wal: wal_ref,
+                        fsm: None,
+                        vm: self.vm.as_deref(),
+                    },
+                )
+                .map_err(|e| ExecError::TypeMismatch(e.to_string()))?;
+            self.apply_delete_index_changes(&all_delete_index_changes)?;
+            self.apply_delete_vector_index_changes(&all_delete_vector_index_changes)?;
+            self.add_affected_rows(n)?;
+        }
+
+        if !all_insert_payloads.is_empty() {
+            let n = all_insert_payloads.len();
+            let payload_refs: Vec<&[u8]> = all_insert_payloads.iter().map(Vec::as_slice).collect();
+            let wal_ref: Option<&dyn WalSink> = self.wal.as_deref();
+            let n_atts = u16::try_from(self.codec.schema().len())
+                .map_err(|_| ExecError::Internal("target schema column count exceeds u16"))?;
+            let tids = self
+                .heap
+                .insert_batch(
+                    self.relation,
+                    &payload_refs,
+                    ultrasql_storage::heap::InsertOptions {
+                        xmin: self.insert_xmin,
+                        command_id: self.insert_command_id,
+                        n_atts,
+                        wal: wal_ref,
+                        fsm: None,
+                        vm: self.vm.as_deref(),
+                    },
+                )
+                .map_err(|e| ExecError::TypeMismatch(e.to_string()))?;
+            debug_assert_eq!(tids.len(), all_insert_payloads.len());
+            for (idx, index) in self.insert_indexes.iter_mut().enumerate() {
+                for (row_idx, key) in all_insert_index_keys[idx].iter().enumerate() {
+                    if let Some(k) = key {
+                        let Some(tid) = tids.get(row_idx).copied() else {
+                            return Err(ExecError::Internal(
+                                "heap insert_batch returned fewer TIDs than payloads",
+                            ));
+                        };
+                        index.insert_key(*k, tid, self.insert_xmin, wal_ref)?;
+                    }
+                }
+            }
+            for (idx, index) in self.insert_vector_indexes.iter().enumerate() {
+                for (row_idx, key) in all_insert_vector_index_keys[idx].iter().enumerate() {
+                    if let Some(vector) = key {
+                        let Some(tid) = tids.get(row_idx).copied() else {
+                            return Err(ExecError::Internal(
+                                "heap insert_batch returned fewer TIDs than payloads",
+                            ));
+                        };
+                        index.insert_vector(vector, tid)?;
+                    }
+                }
+            }
+            self.add_affected_rows(n)?;
+        }
+
         if returning_active {
             return build_batch(&returning_rows, &self.schema).map(Some);
         }
@@ -1428,22 +1642,38 @@ impl<L: PageLoader + Send + Sync + std::fmt::Debug + 'static> ModifyTable<L> {
         row: &[Value],
         capture_returning_row: bool,
     ) -> Result<ComputedUpdate, ExecError> {
-        let (tid, orig_row) = extract_tid_and_row(row, self.relation)?;
+        self.compute_update_edit_with_evaluators(
+            row,
+            &self.update_evaluators,
+            capture_returning_row,
+        )
+    }
+
+    fn compute_update_edit_with_evaluators(
+        &self,
+        row: &[Value],
+        assignments: &[(usize, Eval)],
+        capture_returning_row: bool,
+    ) -> Result<ComputedUpdate, ExecError> {
+        let (tid, eval_row) = extract_tid_and_row(row, self.relation)?;
 
         // Build the new row from the original, applying assignments.
         let relation_cols = self.codec.schema().len();
-        let mut new_row: Vec<Value> = orig_row.to_vec();
-        if new_row.len() != relation_cols {
+        if eval_row.len() < relation_cols
+            || (!self.update_extra_eval_columns && eval_row.len() != relation_cols)
+        {
             return Err(ExecError::TypeMismatch(format!(
                 "UPDATE row has {} columns after TID, expected {}",
-                new_row.len(),
+                eval_row.len(),
                 relation_cols,
             )));
         }
+        let orig_row = &eval_row[..relation_cols];
+        let mut new_row: Vec<Value> = orig_row.to_vec();
         let old_keys = self.encode_update_index_keys(orig_row)?;
         let old_vector_keys = self.encode_update_vector_index_keys(orig_row)?;
 
-        for (col_idx, evaluator) in &self.update_evaluators {
+        for (col_idx, evaluator) in assignments {
             if self
                 .generated_stored
                 .get(*col_idx)
@@ -1453,7 +1683,7 @@ impl<L: PageLoader + Send + Sync + std::fmt::Debug + 'static> ModifyTable<L> {
                     self.codec.schema().field_at(*col_idx).name.clone(),
                 ));
             }
-            let val = evaluator.eval(orig_row).map_err(eval_error_to_exec_error)?;
+            let val = evaluator.eval(eval_row).map_err(eval_error_to_exec_error)?;
             if *col_idx >= relation_cols {
                 return Err(ExecError::TypeMismatch(format!(
                     "UPDATE assignment column index {col_idx} out of range (relation has {relation_cols} columns)"
@@ -2007,16 +2237,25 @@ impl<L: PageLoader + Send + Sync + std::fmt::Debug + 'static> ModifyTable<L> {
         };
         for row in &rows {
             let (tid, orig_row) = extract_tid_and_row(row, self.relation)?;
-            self.check_referenced_by_delete(orig_row)?;
+            let relation_cols = self.codec.schema().len();
+            if orig_row.len() < relation_cols {
+                return Err(ExecError::TypeMismatch(format!(
+                    "DELETE row has {} columns after TID, expected at least {}",
+                    orig_row.len(),
+                    relation_cols,
+                )));
+            }
+            let target_row = &orig_row[..relation_cols];
+            self.check_referenced_by_delete(target_row)?;
             let keys = self
                 .delete_indexes
                 .iter()
-                .map(|index| index.encode_key(orig_row))
+                .map(|index| index.encode_key(target_row))
                 .collect::<Result<Vec<_>, _>>()?;
             let vector_keys = self
                 .delete_vector_indexes
                 .iter()
-                .map(|index| index.encode_key(orig_row))
+                .map(|index| index.encode_key(target_row))
                 .collect::<Result<Vec<_>, _>>()?;
             tids.push(tid);
             changes.push(DeleteIndexChange { tid, keys });
@@ -2025,10 +2264,97 @@ impl<L: PageLoader + Send + Sync + std::fmt::Debug + 'static> ModifyTable<L> {
                 keys: vector_keys,
             });
             if capture_deleted_rows {
-                deleted_rows.push(orig_row.to_vec());
+                deleted_rows.push(target_row.to_vec());
             }
         }
         Ok((tids, changes, vector_changes, deleted_rows))
+    }
+
+    fn compute_delete_change_from_row(&self, row: &[Value]) -> Result<ComputedDelete, ExecError> {
+        let (tid, orig_row) = extract_tid_and_row(row, self.relation)?;
+        let relation_cols = self.codec.schema().len();
+        if orig_row.len() < relation_cols {
+            return Err(ExecError::TypeMismatch(format!(
+                "MERGE DELETE row has {} columns after TID, expected at least {}",
+                orig_row.len(),
+                relation_cols,
+            )));
+        }
+        let target_row = &orig_row[..relation_cols];
+        self.check_referenced_by_delete(target_row)?;
+        let keys = self
+            .delete_indexes
+            .iter()
+            .map(|index| index.encode_key(target_row))
+            .collect::<Result<Vec<_>, _>>()?;
+        let vector_keys = self
+            .delete_vector_indexes
+            .iter()
+            .map(|index| index.encode_key(target_row))
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(ComputedDelete {
+            tid,
+            index_change: (!self.delete_indexes.is_empty())
+                .then_some(DeleteIndexChange { tid, keys }),
+            vector_index_change: (!self.delete_vector_indexes.is_empty()).then_some(
+                VectorDeleteIndexChange {
+                    tid,
+                    keys: vector_keys,
+                },
+            ),
+        })
+    }
+
+    fn prepare_merge_insert_row(
+        &self,
+        row: &[Value],
+        columns: &[usize],
+        values: &[Eval],
+        seen_keys: &mut [HashSet<i64>],
+    ) -> Result<PreparedInsert, ExecError> {
+        let relation_cols = self.codec.schema().len();
+        if row.len() < 3 + relation_cols {
+            return Err(ExecError::TypeMismatch(format!(
+                "MERGE INSERT row has {} columns, expected at least {}",
+                row.len(),
+                3 + relation_cols,
+            )));
+        }
+        let eval_row = &row[3..];
+        let source_values = values
+            .iter()
+            .map(|eval| eval.eval(eval_row).map_err(eval_error_to_exec_error))
+            .collect::<Result<Vec<_>, _>>()?;
+        let expanded = expand_insert_row(&source_values, relation_cols, columns)?;
+        let mut target_row = expanded.values;
+        self.check_identity_explicit_values(&expanded.omitted)?;
+        self.apply_insert_defaults(&mut target_row, &expanded.omitted)?;
+        self.check_generated_stored_explicit_values(&expanded.omitted)?;
+        self.apply_generated_stored(&mut target_row)?;
+        self.check_row_constraints(&target_row)?;
+        self.check_foreign_keys(&target_row)?;
+        self.check_exclusions(&target_row)?;
+        check_not_null_violations(&target_row, self.codec.schema())?;
+        let index_keys = self
+            .insert_indexes
+            .iter()
+            .map(|index| index.encode_key(&target_row))
+            .collect::<Result<Vec<_>, _>>()?;
+        self.reject_duplicate_insert_keys(&index_keys, seen_keys)?;
+        let vector_index_keys = self
+            .insert_vector_indexes
+            .iter()
+            .map(|index| index.encode_key(&target_row))
+            .collect::<Result<Vec<_>, _>>()?;
+        let payload = self
+            .codec
+            .encode(&target_row)
+            .map_err(row_codec_error_to_exec)?;
+        Ok(PreparedInsert {
+            payload,
+            index_keys,
+            vector_index_keys,
+        })
     }
 
     fn apply_delete_index_changes(
@@ -2281,6 +2607,37 @@ fn extract_tid_and_row(
     let page_id = ultrasql_core::PageId::new(relation, ultrasql_core::BlockNumber::new(block_u32));
     let tid = TupleId::new(page_id, slot_u16);
     Ok((tid, &row[2..]))
+}
+
+fn merge_clause_index(row: &[Value], clause_count: usize) -> Result<usize, ExecError> {
+    let Some(first) = row.first() else {
+        return Err(ExecError::TypeMismatch(
+            "MERGE input row must include a clause index".to_owned(),
+        ));
+    };
+    let Value::Int32(raw) = first else {
+        return Err(ExecError::TypeMismatch(format!(
+            "MERGE clause index must be Int32, got {first:?}"
+        )));
+    };
+    let idx = usize::try_from(*raw).map_err(|_| {
+        ExecError::TypeMismatch(format!("MERGE clause index {raw} out of usize range"))
+    })?;
+    if idx >= clause_count {
+        return Err(ExecError::TypeMismatch(format!(
+            "MERGE clause index {idx} out of range for {clause_count} clause(s)"
+        )));
+    }
+    Ok(idx)
+}
+
+fn merge_tid_row(row: &[Value]) -> Result<&[Value], ExecError> {
+    if row.len() < 3 {
+        return Err(ExecError::TypeMismatch(
+            "MERGE input row must include clause index and TID columns".to_owned(),
+        ));
+    }
+    Ok(&row[1..])
 }
 
 // ---------------------------------------------------------------------------

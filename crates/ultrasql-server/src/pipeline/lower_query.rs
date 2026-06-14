@@ -26,7 +26,8 @@ use super::index_scan::{
 };
 use super::join::{LowerJoinArgs, lower_join};
 use super::modify::{
-    lower_project_columns, lower_real_delete, lower_real_insert, lower_real_update,
+    lower_project_columns, lower_real_delete, lower_real_insert, lower_real_merge,
+    lower_real_update,
 };
 use super::saturate_row_count;
 use super::scan::{
@@ -309,7 +310,13 @@ fn lower_query_inner(
             }
             lower_real_delete(table, input, returning, schema, ctx)
         }
-        LogicalPlan::Merge { .. } => Err(ServerError::Unsupported("MERGE")),
+        LogicalPlan::Merge {
+            target,
+            source,
+            on,
+            clauses,
+            ..
+        } => lower_real_merge(target, source, on, clauses, ctx),
         LogicalPlan::Truncate { .. }
         | LogicalPlan::CreateTable { .. }
         | LogicalPlan::CreateMaterializedView { .. }
