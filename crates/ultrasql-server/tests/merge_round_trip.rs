@@ -3,6 +3,40 @@
 pub mod support;
 
 use support::{shutdown, start_sample_server};
+use tokio_postgres::SimpleQueryMessage;
+
+#[tokio::test]
+async fn merge_reports_affected_rows_command_complete() {
+    let running = start_sample_server("merge_command_tag").await;
+    let client = &running.client;
+
+    client
+        .batch_execute(
+            "CREATE TABLE target (id INT PRIMARY KEY, v INT NOT NULL);
+             CREATE TABLE source (id INT NOT NULL, v INT NOT NULL);
+             INSERT INTO target VALUES (1, 10);
+             INSERT INTO source VALUES (1, 100)",
+        )
+        .await
+        .expect("setup");
+
+    let messages = client
+        .simple_query(
+            "MERGE INTO target AS t
+             USING source AS s
+             ON t.id = s.id
+             WHEN MATCHED THEN UPDATE SET v = s.v",
+        )
+        .await
+        .expect("merge command complete");
+    let affected = messages.iter().find_map(|message| match message {
+        SimpleQueryMessage::CommandComplete(rows) => Some(*rows),
+        _ => None,
+    });
+    assert_eq!(affected, Some(1));
+
+    shutdown(running).await;
+}
 
 #[tokio::test]
 async fn merge_applies_update_delete_and_insert_branches() {
