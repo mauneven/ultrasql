@@ -185,9 +185,9 @@ tunable.
 
 - A record is durable when its LSN is ≤ `flushed_lsn` and
   `flushed_lsn` has been observed under acquire ordering.
-- Recovery replays records in LSN order. A CRC mismatch terminates
-  replay at that record; subsequent bytes are treated as torn-write
-  residue.
+- Recovery replays records in LSN order. Truncation or CRC mismatch is
+  treated as torn-write residue only at the final segment tail; corruption
+  before later bytes or later segments is fatal.
 - WAL segments are 16 MiB and recycle after archiving / the configured
   retention window.
 

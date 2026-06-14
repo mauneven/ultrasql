@@ -11,10 +11,11 @@
 //!
 //! WAL records can be truncated by a crash mid-write. When the decoder
 //! encounters a CRC mismatch or a "needs more bytes than available"
-//! error past the start of a record, recovery treats the rest of the
-//! file as torn-write residue: it logs a warning, stops scanning, and
-//! returns the LSN of the last record that decoded cleanly. Earlier
-//! segments are guaranteed durable because we fsync before rotating.
+//! error at the tail of the final segment, recovery treats the rest
+//! of the file as torn-write residue: it logs a warning, stops
+//! scanning, and returns the LSN of the last record that decoded
+//! cleanly. Corruption in earlier segments is fatal because the writer
+//! fsyncs before rotating.
 
 use std::fs::{File, OpenOptions};
 use std::io::{ErrorKind, Read};
@@ -145,9 +146,10 @@ pub enum RecoveryError {
 /// measured from the start of the WAL stream). An empty WAL directory
 /// returns [`Lsn::ZERO`].
 ///
-/// Stops scanning at the first torn-write or CRC failure, treating it
-/// as the tail of the log. The applier is not called for any record
-/// past that point.
+/// Stops scanning at the first torn write at the final segment tail.
+/// CRC failures before later bytes or before later segments are fatal
+/// corruption. The applier is not called for any record past that
+/// point.
 pub fn recover(
     wal_dir: impl AsRef<Path>,
     mut apply: impl FnMut(&WalRecord) -> Result<(), RecoveryError>,
@@ -175,7 +177,9 @@ pub fn recover_with_target(
     let mut record_count: u64 = 0;
     let mut last_good_pos: u64 = 0;
 
-    for (index, path) in segments {
+    let segment_count = segments.len();
+    for (segment_ordinal, (index, path)) in segments.into_iter().enumerate() {
+        let is_final_segment = segment_ordinal + 1 == segment_count;
         let buf = read_segment_bytes(&path)?;
         debug!(
             ?path,
@@ -226,6 +230,12 @@ pub fn recover_with_target(
                     }
                 }
                 Err(WalRecordError::Truncated { needed, have }) => {
+                    if !is_final_segment {
+                        return Err(RecoveryError::Record(WalRecordError::Truncated {
+                            needed,
+                            have,
+                        }));
+                    }
                     warn!(
                         ?path,
                         needed, have, "wal recovery: torn record at tail; stopping cleanly"
@@ -233,7 +243,7 @@ pub fn recover_with_target(
                     return Ok(Lsn::new(last_good_pos));
                 }
                 Err(WalRecordError::CrcMismatch { expected, actual }) => {
-                    if !crc_mismatch_is_at_segment_tail(&buf, offset)? {
+                    if !is_final_segment || !crc_mismatch_is_at_segment_tail(&buf, offset)? {
                         return Err(RecoveryError::Record(WalRecordError::CrcMismatch {
                             expected,
                             actual,
@@ -517,6 +527,78 @@ mod tests {
                 err,
                 RecoveryError::Record(WalRecordError::CrcMismatch { .. })
             ),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn crc_mismatch_at_non_final_segment_tail_is_corruption() {
+        let dir = TempDir::new().unwrap();
+        let first = WalRecord::new(RecordType::Nop, Xid::new(10), Lsn::ZERO, 0, Vec::new())
+            .expect("test WAL record should fit size limits");
+        let mut corrupt_tail =
+            WalRecord::new(RecordType::Nop, Xid::new(11), Lsn::ZERO, 0, Vec::new())
+                .expect("test WAL record should fit size limits")
+                .encode();
+        corrupt_tail[RECORD_HEADER_CRC_BYTE_OFFSET_FOR_TEST] ^= 0x01;
+        let third = WalRecord::new(RecordType::Nop, Xid::new(12), Lsn::ZERO, 0, Vec::new())
+            .expect("test WAL record should fit size limits");
+
+        let mut first_segment = first.encode();
+        first_segment.extend_from_slice(&corrupt_tail);
+        std::fs::write(dir.path().join("segment_0000000000"), first_segment).unwrap();
+        std::fs::write(dir.path().join("segment_0000000001"), third.encode()).unwrap();
+
+        let mut seen = Vec::new();
+        let err = recover(dir.path(), |record| {
+            seen.push(record.header.xid.raw());
+            Ok(())
+        })
+        .expect_err("CRC mismatch before a later segment must be fatal corruption");
+
+        assert_eq!(seen, vec![10]);
+        assert!(
+            matches!(
+                err,
+                RecoveryError::Record(WalRecordError::CrcMismatch { .. })
+            ),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn truncated_non_final_segment_tail_is_corruption() {
+        let dir = TempDir::new().unwrap();
+        let first = WalRecord::new(RecordType::Nop, Xid::new(10), Lsn::ZERO, 0, Vec::new())
+            .expect("test WAL record should fit size limits");
+        let mut truncated_tail = WalRecord::new(
+            RecordType::Nop,
+            Xid::new(11),
+            Lsn::ZERO,
+            0,
+            vec![1, 2, 3, 4],
+        )
+        .expect("test WAL record should fit size limits")
+        .encode();
+        truncated_tail.truncate(RECORD_HEADER_SIZE + 1);
+        let third = WalRecord::new(RecordType::Nop, Xid::new(12), Lsn::ZERO, 0, Vec::new())
+            .expect("test WAL record should fit size limits");
+
+        let mut first_segment = first.encode();
+        first_segment.extend_from_slice(&truncated_tail);
+        std::fs::write(dir.path().join("segment_0000000000"), first_segment).unwrap();
+        std::fs::write(dir.path().join("segment_0000000001"), third.encode()).unwrap();
+
+        let mut seen = Vec::new();
+        let err = recover(dir.path(), |record| {
+            seen.push(record.header.xid.raw());
+            Ok(())
+        })
+        .expect_err("truncation before a later segment must be fatal corruption");
+
+        assert_eq!(seen, vec![10]);
+        assert!(
+            matches!(err, RecoveryError::Record(WalRecordError::Truncated { .. })),
             "{err:?}"
         );
     }
