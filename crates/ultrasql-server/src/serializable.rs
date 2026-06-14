@@ -281,16 +281,18 @@ fn column_range_tags_for_predicate_expr(
             right,
             ..
         } => {
-            let mut left_tags = column_range_tags_for_predicate_expr(entry, left)?;
-            if left_tags.is_empty() {
-                return Some(Vec::new());
+            let left_tags = column_range_tags_for_predicate_expr(entry, left);
+            let right_tags = column_range_tags_for_predicate_expr(entry, right);
+            match (left_tags, right_tags) {
+                (Some(tags), _) if tags.is_empty() => Some(Vec::new()),
+                (_, Some(tags)) if tags.is_empty() => Some(Vec::new()),
+                (Some(mut left_tags), Some(right_tags)) => {
+                    left_tags.extend(right_tags);
+                    Some(left_tags)
+                }
+                (Some(tags), None) | (None, Some(tags)) => Some(tags),
+                (None, None) => None,
             }
-            let right_tags = column_range_tags_for_predicate_expr(entry, right)?;
-            if right_tags.is_empty() {
-                return Some(Vec::new());
-            }
-            left_tags.extend(right_tags);
-            Some(left_tags)
         }
         ScalarExpr::Binary {
             op: BinaryOp::Or,
@@ -716,6 +718,35 @@ mod tests {
 
     #[test]
     fn serializable_read_locks_keep_relation_fallback_for_unsupported_conjunctions() {
+        let unsupported_lhs = binary(
+            BinaryOp::Eq,
+            binary(BinaryOp::Add, col(0, "a"), lit_i32(1)),
+            lit_i32(7),
+        );
+        let unsupported_rhs = binary(
+            BinaryOp::Eq,
+            binary(BinaryOp::Add, col(1, "b"), lit_i32(1)),
+            lit_i32(9),
+        );
+        let predicate = binary(BinaryOp::And, unsupported_lhs, unsupported_rhs);
+        let plan = LogicalPlan::Filter {
+            input: Box::new(scan()),
+            predicate,
+        };
+        let snapshot = test_snapshot();
+        let mut tags = Vec::new();
+
+        collect_serializable_read_locks(&plan, &snapshot, &mut tags);
+        dedup_predicate_tags(&mut tags);
+
+        assert_eq!(
+            tags,
+            vec![PredicateLockTag::Relation(RelationId(Oid::new(42)))]
+        );
+    }
+
+    #[test]
+    fn serializable_read_locks_keep_supported_conjunct_with_unsupported_peer() {
         let unsupported_rhs = binary(
             BinaryOp::Eq,
             binary(BinaryOp::Add, col(1, "b"), lit_i32(1)),
@@ -738,7 +769,12 @@ mod tests {
 
         assert_eq!(
             tags,
-            vec![PredicateLockTag::Relation(RelationId(Oid::new(42)))]
+            vec![PredicateLockTag::ColumnRange {
+                relation: RelationId(Oid::new(42)),
+                column: 0,
+                low: Some(7),
+                high: Some(7),
+            }]
         );
     }
 }

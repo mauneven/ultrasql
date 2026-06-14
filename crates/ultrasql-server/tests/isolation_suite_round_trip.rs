@@ -399,6 +399,78 @@ async fn serializable_disjoint_in_list_ranges_both_commit_wire() {
 }
 
 #[tokio::test]
+async fn serializable_disjoint_supported_and_unsupported_conjuncts_both_commit_wire() {
+    let running = start_sample_server("serializable_partial_and_ranges").await;
+    let (peer, peer_handle) =
+        connect_peer(running.bound, "serializable_partial_and_ranges_peer").await;
+
+    running
+        .client
+        .batch_execute(
+            "CREATE TABLE serializable_partial_and (id INT NOT NULL, value INT NOT NULL);\
+             INSERT INTO serializable_partial_and VALUES (1, 10), (2, 20);\
+             CREATE INDEX serializable_partial_and_id_idx ON serializable_partial_and (id)",
+        )
+        .await
+        .expect("seed partial AND serializable table");
+
+    running
+        .client
+        .batch_execute("BEGIN ISOLATION LEVEL SERIALIZABLE")
+        .await
+        .expect("begin a");
+    peer.batch_execute("BEGIN ISOLATION LEVEL SERIALIZABLE")
+        .await
+        .expect("begin b");
+
+    assert_eq!(
+        scalar_i32(
+            &running.client,
+            "SELECT value FROM serializable_partial_and WHERE id = 1 AND value + 0 = 10",
+        )
+        .await,
+        10
+    );
+    assert_eq!(
+        scalar_i32(
+            &peer,
+            "SELECT value FROM serializable_partial_and WHERE id = 2 AND value + 0 = 20",
+        )
+        .await,
+        20
+    );
+
+    running
+        .client
+        .batch_execute("UPDATE serializable_partial_and SET value = value + 1 WHERE id = 1")
+        .await
+        .expect("update a");
+    peer.batch_execute("UPDATE serializable_partial_and SET value = value + 1 WHERE id = 2")
+        .await
+        .expect("update b");
+
+    let a_commit = running.client.batch_execute("COMMIT").await;
+    let b_commit = peer.batch_execute("COMMIT").await;
+
+    assert!(
+        a_commit.is_ok() && b_commit.is_ok(),
+        "disjoint serializable AND predicates should both commit: a={a_commit:?}, b={b_commit:?}"
+    );
+
+    assert_eq!(
+        scalar_i64(
+            &running.client,
+            "SELECT SUM(value) FROM serializable_partial_and",
+        )
+        .await,
+        32
+    );
+
+    close_peer(peer, peer_handle).await;
+    shutdown(running).await;
+}
+
+#[tokio::test]
 async fn serializable_empty_strict_range_does_not_false_abort_wire() {
     let running = start_sample_server("serializable_empty_strict_range").await;
     let (peer, peer_handle) =

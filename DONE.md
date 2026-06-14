@@ -242,6 +242,15 @@ as a concise evidence ledger; roadmap stays for open gates only.
   conflict targeting, while unsupported conjunction terms still force the
   conservative relation fallback. Evidence:
   `cargo test -p ultrasql-server serializable::tests:: --lib -- --nocapture`.
+- Serializable `AND` predicate locks now keep safe supported conjunct bounds
+  when another conjunct is unsupported, instead of falling back to a relation
+  lock for the whole read. This prevents false serializable aborts for disjoint
+  `id = const AND unsupported_expr` reads while preserving relation fallback
+  when every conjunct is unsupported. Evidence:
+  `cargo test -p ultrasql-server serializable_read_locks_keep_supported_conjunct_with_unsupported_peer --lib -- --nocapture`,
+  `cargo test -p ultrasql-server serializable_read_locks_keep_relation_fallback_for_unsupported_conjunctions --lib -- --nocapture`,
+  and
+  `cargo test -p ultrasql-server --test isolation_suite_round_trip serializable_disjoint_supported_and_unsupported_conjuncts_both_commit_wire -- --nocapture`.
 - Serializable predicate locks now split fully supported `OR` predicate trees,
   including binder-lowered `IN (...)` lists, into bounded column-range tags.
   Disjoint serializable `IN` ranges can now commit without a relation-wide
