@@ -458,8 +458,10 @@ impl Page {
     /// Construct a `Page` from an existing buffer, validating header
     /// invariants.
     pub fn from_bytes(bytes: Box<[u8; PAGE_SIZE]>) -> Result<Self, PageError> {
-        let _hdr = PageHeader::decode(&bytes)?;
-        Ok(Self { bytes })
+        let header = PageHeader::decode(&bytes)?;
+        let page = Self { bytes };
+        page.validate_slot_directory(header)?;
+        Ok(page)
     }
 
     /// Decode the current header. Note that this re-parses on every
@@ -740,6 +742,25 @@ impl Page {
 
     // ----------------- internal helpers ----------------------------------
 
+    fn validate_slot_directory(&self, header: PageHeader) -> Result<(), PageError> {
+        for slot in 0..header.try_slot_count()? {
+            let id = self.read_item_id(slot);
+            if !id.is_normal() {
+                continue;
+            }
+
+            let off = item_field_to_usize(id.offset(), "tuple offset")?;
+            let len = item_field_to_usize(id.length(), "tuple length")?;
+            let end = off
+                .checked_add(len)
+                .ok_or(PageError::Malformed("tuple range overflow"))?;
+            if off < usize::from(header.upper) || end > usize::from(header.special) {
+                return Err(PageError::Malformed("tuple range out of bounds"));
+            }
+        }
+        Ok(())
+    }
+
     fn find_reusable_slot(&self, count: SlotIndex) -> Option<SlotIndex> {
         for i in 0..count {
             let id = self.read_item_id(i);
@@ -924,6 +945,26 @@ mod tests {
         let page2 = Page::from_bytes(bytes).unwrap();
         page2.verify_checksum().unwrap();
         assert_eq!(page2.read_tuple(s).unwrap(), b"persistent");
+    }
+
+    #[test]
+    fn from_bytes_rejects_live_slot_pointing_outside_tuple_area() {
+        let mut page = Page::new_heap();
+        let slot = page.insert_tuple(b"persistent").unwrap();
+        let item_off = Page::item_id_offset(slot);
+        let malformed = ItemId::new(8_000, 500, ItemIdFlags::Normal);
+        write_u32_le(
+            &mut page.as_bytes_mut()[item_off..item_off + ITEMID_SIZE],
+            malformed.into_raw(),
+        );
+        page.refresh_checksum();
+
+        let err = Page::from_bytes(page.into_inner()).unwrap_err();
+
+        assert!(matches!(
+            err,
+            PageError::Malformed("tuple range out of bounds")
+        ));
     }
 
     #[test]
