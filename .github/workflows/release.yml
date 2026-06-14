@@ -29,6 +29,9 @@ jobs:
     name: release gate
     runs-on: ubuntu-latest
     timeout-minutes: 120
+    env:
+      DOTNET_CLI_TELEMETRY_OPTOUT: "1"
+      DOTNET_NOLOGO: "1"
     steps:
       - uses: actions/checkout@v6
         with:
@@ -77,6 +80,63 @@ jobs:
       - run: cargo audit --deny yanked
       - run: cargo clippy --workspace --all-targets --all-features -- -D warnings
       - run: cargo test --workspace --all-features -- --nocapture
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.13"
+      - uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: "3.4"
+          bundler-cache: false
+      - uses: actions/setup-node@v5
+        with:
+          node-version: "22"
+      - uses: pnpm/action-setup@v6
+        with:
+          version: "11.1.2"
+          run_install: false
+      - uses: actions/setup-go@v6
+        with:
+          go-version: "1.26.x"
+          cache-dependency-path: tests/driver_certification/go/go.sum
+      - uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: "21"
+      - uses: actions/setup-dotnet@v5
+        with:
+          dotnet-version: "8.0.x"
+      - name: install libpq development files
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libpq-dev postgresql-client
+      - name: install driver dependencies
+        run: |
+          python -m venv .venv-driver-cert
+          .venv-driver-cert/bin/python -m pip install --disable-pip-version-check \
+            -r tests/driver_certification/requirements.txt
+          bundle install --gemfile tests/driver_certification/rails/Gemfile --jobs 4 --retry 3
+          pnpm --dir tests/driver_certification/node install --frozen-lockfile
+          go -C tests/driver_certification/go mod download
+          cargo fetch --manifest-path tests/driver_certification/diesel/Cargo.toml
+          dotnet restore --locked-mode tests/driver_certification/dotnet/Ultrasql.DriverCertification.csproj
+      - run: cargo build -p ultrasql-server --bin ultrasqld
+      - name: run driver certification
+        run: |
+          .venv-driver-cert/bin/python tests/driver_certification/driver_certification.py \
+            --ultrasqld target/debug/ultrasqld \
+            --json-output target/driver-certification.json
+      - name: validate driver compatibility
+        shell: bash
+        run: |
+          args=(
+            --report target/driver-certification.json
+            --commit "$GITHUB_SHA"
+            --out target/driver_compatibility_status.json
+          )
+          if [[ "$RELEASE_TAG" != v0.* ]]; then
+            args+=(--strict)
+          fi
+          python3 scripts/validate-driver-compatibility.py "${args[@]}"
       - name: validate operator soak reports
         shell: bash
         run: |
@@ -118,6 +178,18 @@ jobs:
             args+=(--strict)
           fi
           python3 scripts/validate-incident-drills.py "${args[@]}"
+      - name: collect release evidence
+        run: |
+          mkdir -p target/release-evidence
+          cp target/driver-certification.json target/release-evidence/driver-certification.json
+          cp target/driver_compatibility_status.json target/release-evidence/driver_compatibility_status.json
+          cp target/operator_soak_status.json target/release-evidence/operator_soak_status.json
+          cp target/external_audit_status.json target/release-evidence/external_audit_status.json
+          cp target/incident_drill_status.json target/release-evidence/incident_drill_status.json
+      - uses: actions/upload-artifact@v7
+        with:
+          name: release-evidence-${{ env.RELEASE_TAG }}
+          path: target/release-evidence/*
 
   build:
     name: build (${{ matrix.target }})
@@ -385,6 +457,10 @@ jobs:
         with:
           pattern: ultrasql-${{ env.RELEASE_TAG }}-*
           path: dist
+      - uses: actions/download-artifact@v8
+        with:
+          name: release-evidence-${{ env.RELEASE_TAG }}
+          path: release-evidence
       - name: flatten assets and generate checksum manifest
         shell: bash
         run: |
@@ -410,43 +486,17 @@ jobs:
               shasum -a 256 "$asset" > "$asset.sha256"
             done
           )
-          args=(
-            --reports-dir operator-reports
-            --min-reports 3
-            --min-days 30
-            --commit "$GITHUB_SHA"
-            --out release/operator_soak_status.json
-          )
-          if [[ "$RELEASE_TAG" != v0.* ]]; then
-            args+=(--strict)
-          fi
-          python3 scripts/validate-operator-soak.py "${args[@]}"
-          args=(
-            --reports-dir external-audits
-            --min-reports 2
-            --required-audit-types security,correctness
-            --commit "$GITHUB_SHA"
-            --out release/external_audit_status.json
-          )
-          if [[ "$RELEASE_TAG" != v0.* ]]; then
-            args+=(--strict)
-          fi
-          python3 scripts/validate-external-audits.py "${args[@]}"
-          args=(
-            --reports-dir incident-drills
-            --required-drill-types backup_restore,wal_recovery,disk_full
-            --commit "$GITHUB_SHA"
-            --out release/incident_drill_status.json
-          )
-          if [[ "$RELEASE_TAG" != v0.* ]]; then
-            args+=(--strict)
-          fi
-          python3 scripts/validate-incident-drills.py "${args[@]}"
+          cp release-evidence/driver-certification.json release/driver-certification.json
+          cp release-evidence/driver_compatibility_status.json release/driver_compatibility_status.json
+          cp release-evidence/operator_soak_status.json release/operator_soak_status.json
+          cp release-evidence/external_audit_status.json release/external_audit_status.json
+          cp release-evidence/incident_drill_status.json release/incident_drill_status.json
           scripts/render-release-notes.sh \
             "$RELEASE_TAG" \
             release/operator_soak_status.json \
             release/external_audit_status.json \
             release/incident_drill_status.json \
+            release/driver_compatibility_status.json \
             release/RELEASE_NOTES.md
           ls -la release
       - name: publish github release

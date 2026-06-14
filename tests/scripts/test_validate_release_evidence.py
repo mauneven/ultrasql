@@ -8,6 +8,7 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parents[2]
 AUDIT_SCRIPT = REPO / "scripts" / "validate-external-audits.py"
 DRILL_SCRIPT = REPO / "scripts" / "validate-incident-drills.py"
+DRIVER_SCRIPT = REPO / "scripts" / "validate-driver-compatibility.py"
 COMMIT = "0123456789abcdef0123456789abcdef01234567"
 
 
@@ -83,6 +84,60 @@ def write_drill_report(
     )
 
 
+REQUIRED_DRIVERS = [
+    "libpq",
+    "psql meta-commands",
+    "psycopg2",
+    "psycopg3",
+    "SQLAlchemy",
+    "Django ORM",
+    "Rails ActiveRecord",
+    "node-postgres",
+    "lib/pq",
+    "pgx",
+    "GORM",
+    "JDBC PostgreSQL driver",
+    "Hibernate ORM",
+    "Npgsql",
+    "Prisma",
+    "Diesel",
+    "GUI introspection probes",
+    "Flyway",
+    "Liquibase",
+    "Alembic",
+]
+
+
+def write_driver_report(
+    path: Path,
+    *,
+    drivers: list[str] | None = None,
+    failed_driver: str | None = None,
+    commit: str = COMMIT,
+) -> None:
+    selected_drivers = drivers if drivers is not None else REQUIRED_DRIVERS
+    path.write_text(
+        json.dumps(
+            {
+                "ultrasqld": "target/debug/ultrasqld",
+                "host": "127.0.0.1",
+                "port": 5432,
+                "commit": commit,
+                "drivers": [
+                    {
+                        "driver": driver,
+                        "version": "1.0.0-test",
+                        "checks": ["connect", "parameterized_select"],
+                        "status": "fail" if driver == failed_driver else "pass",
+                    }
+                    for driver in selected_drivers
+                ],
+            }
+        )
+        + "\n"
+    )
+
+
 def run_script(script: Path, reports_dir: Path, *extra: str) -> dict:
     out = reports_dir / "status.json"
     proc = subprocess.run(
@@ -93,6 +148,28 @@ def run_script(script: Path, reports_dir: Path, *extra: str) -> dict:
             str(reports_dir),
             "--now",
             "2026-02-02T00:00:00Z",
+            "--commit",
+            COMMIT,
+            "--out",
+            str(out),
+            *extra,
+        ],
+        check=False,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    assert proc.returncode == 0, proc.stderr
+    return json.loads(out.read_text())
+
+
+def run_driver_script(report: Path, out: Path, *extra: str) -> dict:
+    proc = subprocess.run(
+        [
+            sys.executable,
+            str(DRIVER_SCRIPT),
+            "--report",
+            str(report),
             "--commit",
             COMMIT,
             "--out",
@@ -236,6 +313,42 @@ class ReleaseEvidenceValidatorTests(unittest.TestCase):
             self.assertIn("rpo_actual_seconds exceeds rpo_target_seconds", errors)
             self.assertIn("data_loss_confirmed must be false", errors)
             self.assertIn("unresolved_sev1_count must be zero", errors)
+
+    def test_driver_compatibility_requires_full_passing_required_matrix(self) -> None:
+        with tempfile_dir() as tmp_path:
+            report = tmp_path / "driver-certification.json"
+            out = tmp_path / "driver_compatibility_status.json"
+            write_driver_report(report)
+
+            status = run_driver_script(report, out)
+
+            self.assertTrue(status["ready"])
+            self.assertEqual(status["status"], "ready")
+            self.assertEqual(status["required_driver_count"], len(REQUIRED_DRIVERS))
+            self.assertEqual(status["passing_required_driver_count"], len(REQUIRED_DRIVERS))
+            self.assertEqual(status["missing_required_drivers"], [])
+
+    def test_driver_compatibility_rejects_missing_or_failed_required_driver(self) -> None:
+        with tempfile_dir() as tmp_path:
+            report = tmp_path / "driver-certification.json"
+            out = tmp_path / "driver_compatibility_status.json"
+            write_driver_report(
+                report,
+                drivers=[driver for driver in REQUIRED_DRIVERS if driver != "Prisma"],
+                failed_driver="psycopg3",
+            )
+
+            status = run_driver_script(report, out)
+
+            self.assertFalse(status["ready"])
+            self.assertEqual(status["status"], "not_ready")
+            self.assertEqual(status["missing_required_drivers"], ["Prisma"])
+            self.assertEqual(status["failed_required_drivers"], ["psycopg3"])
+            psycopg3 = next(
+                driver for driver in status["drivers"] if driver["driver"] == "psycopg3"
+            )
+            self.assertFalse(psycopg3["valid"])
+            self.assertIn("status must be pass", psycopg3["errors"])
 
 
 class tempfile_dir:

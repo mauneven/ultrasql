@@ -1030,6 +1030,65 @@ fn final_release_requires_external_audits_and_incident_drills() {
 }
 
 #[test]
+fn final_release_requires_driver_compatibility_status() {
+    let driver_docs = repo_file("docs/driver-certification.md");
+    let validator = repo_file("scripts/validate-driver-compatibility.py");
+    let status = repo_file("benchmarks/results/latest/driver_compatibility_status.json");
+    let release = repo_file(".github/workflows/release.yml");
+    let notes_template = repo_file("docs/release-notes-template.md");
+    let notes_renderer = repo_file("scripts/render-release-notes.sh");
+    let release_checklist = repo_file("docs/release-checklist.md");
+    let roadmap = repo_file("ROADMAP.md");
+
+    for needle in [
+        "scripts/validate-driver-compatibility.py --strict",
+        "driver_compatibility_status.json",
+        "required_driver_count",
+        "passing_required_driver_count",
+        "missing_required_drivers",
+    ] {
+        assert!(driver_docs.contains(needle), "driver docs missing {needle}");
+        assert!(
+            validator.contains(needle),
+            "driver compatibility validator missing {needle}"
+        );
+        assert!(
+            release_checklist.contains(needle),
+            "release checklist missing {needle}"
+        );
+        assert!(roadmap.contains(needle), "ROADMAP missing {needle}");
+    }
+
+    for needle in [
+        "\"status\": \"not_ready\"",
+        "\"ready\": false",
+        "\"required_drivers\"",
+        "\"Prisma\"",
+        "\"JDBC PostgreSQL driver\"",
+    ] {
+        assert!(status.contains(needle), "driver status missing {needle}");
+    }
+
+    for needle in [
+        "scripts/validate-driver-compatibility.py",
+        "driver_compatibility_status.json",
+    ] {
+        assert!(
+            release.contains(needle),
+            "release workflow missing {needle}"
+        );
+        assert!(
+            notes_template.contains(needle),
+            "release notes template missing {needle}"
+        );
+        assert!(
+            notes_renderer.contains(needle),
+            "release notes renderer missing {needle}"
+        );
+    }
+}
+
+#[test]
 fn release_user_docs_exist_and_state_current_limits() {
     let changelog = repo_file("CHANGELOG.md");
     let getting_started = repo_file("docs/getting-started.md");

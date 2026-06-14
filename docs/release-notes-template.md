@@ -9,6 +9,7 @@ production claim unless every gate below is linked to evidence.
 - Operator soak status: @OPERATOR_SOAK_STATUS@
 - External audit status: @EXTERNAL_AUDIT_STATUS@
 - Incident drill status: @INCIDENT_DRILL_STATUS@
+- Driver compatibility status: @DRIVER_COMPATIBILITY_STATUS@
 - GitHub release notes: this body plus attached assets and checksums.
 
 ## Green workflow evidence
@@ -41,6 +42,15 @@ The release workflow validates `incident-drills/*.json` with
 The required drill types are `backup_restore`, `wal_recovery`, and
 `disk_full`. The rendered status artifact is `incident_drill_status.json`.
 
+## Driver compatibility
+
+The release workflow validates `target/driver-certification.json` with
+`scripts/validate-driver-compatibility.py --strict` for v1.0 and later
+releases. Required clients include stock libpq, psql meta-commands, Python,
+Node.js, Go, Java/JDBC, Hibernate, .NET/Npgsql, Prisma, Diesel, GUI
+introspection probes, Flyway, Liquibase, and Alembic coverage. The rendered
+status artifact is `driver_compatibility_status.json`.
+
 ## Assets
 
 Release assets include:
@@ -51,7 +61,8 @@ Release assets include:
 - Linux `.deb` and `.rpm` packages,
 - `operator_soak_status.json`,
 - `external_audit_status.json`,
-- `incident_drill_status.json`.
+- `incident_drill_status.json`,
+- `driver_compatibility_status.json`.
 
 ## Known Gaps
 

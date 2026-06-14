@@ -9,7 +9,8 @@ claims that cannot be reproduced.
 - No closed-source code.
 - No fake benchmark claims.
 - No production-ready claim without `operator_soak_status.json`,
-  `external_audit_status.json`, and `incident_drill_status.json` showing ready.
+  `external_audit_status.json`, `incident_drill_status.json`, and
+  `driver_compatibility_status.json` showing ready.
 
 ## Verification commands
 

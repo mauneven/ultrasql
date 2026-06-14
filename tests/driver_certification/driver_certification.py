@@ -17,6 +17,7 @@ import argparse
 import hashlib
 import json
 import os
+import re
 import shutil
 import socket
 import ssl
@@ -57,6 +58,7 @@ DIESEL_VERSION = "2.3.9"
 FLYWAY_VERSION = "12.6.2"
 LIQUIBASE_VERSION = "5.0.3"
 ALEMBIC_VERSION = "1.18.4"
+GIT_COMMIT_RE = re.compile(r"^[0-9a-fA-F]{40}$")
 
 
 class CertificationFailure(AssertionError):
@@ -194,6 +196,27 @@ def repo_root() -> Path:
     """Return repository root from this script location."""
 
     return Path(__file__).resolve().parents[2]
+
+
+def current_commit() -> str | None:
+    """Return the commit covered by this certification run, when available."""
+
+    github_sha = os.environ.get("GITHUB_SHA", "").strip()
+    if GIT_COMMIT_RE.fullmatch(github_sha):
+        return github_sha.lower()
+
+    completed = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=repo_root(),
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+    commit = completed.stdout.strip()
+    if completed.returncode == 0 and GIT_COMMIT_RE.fullmatch(commit):
+        return commit.lower()
+    return None
 
 
 def free_port() -> int:
@@ -1551,6 +1574,7 @@ def write_report(path: Path, binary: Path, port: int, results: list[DriverResult
         "ultrasqld": str(binary),
         "host": HOST,
         "port": port,
+        "commit": current_commit(),
         "drivers": [
             {
                 "driver": result.driver,

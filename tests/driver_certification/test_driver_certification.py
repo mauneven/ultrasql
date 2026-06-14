@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import importlib.util
 import hashlib
+import json
 import ssl
 import subprocess
 import sys
@@ -205,6 +206,36 @@ class DriverRoleBootstrapTests(unittest.TestCase):
         self.assertIn("CREATE ROLE IF NOT EXISTS driver_cert SUPERUSER LOGIN", script)
         self.assertTrue(calls[0]["text"])
         self.assertFalse(calls[0]["check"])
+
+
+class DriverReportTests(unittest.TestCase):
+    """Machine-readable certification report behavior."""
+
+    def test_write_report_records_git_commit_for_release_evidence(self) -> None:
+        """Release gates must be able to prove compatibility for the exact commit."""
+
+        with tempfile.TemporaryDirectory() as tmp:
+            report = Path(tmp) / "driver-certification.json"
+            binary = Path(tmp) / "ultrasqld"
+            result = driver_certification.DriverResult(
+                driver="psycopg3",
+                version="3.3.2",
+                checks=["connect", "parameterized_select"],
+            )
+
+            with mock.patch.dict(
+                driver_certification.os.environ,
+                {"GITHUB_SHA": "abcdef0123456789abcdef0123456789abcdef01"},
+            ):
+                driver_certification.write_report(report, binary, 6543, [result])
+
+            payload = json.loads(report.read_text())
+            self.assertEqual(
+                payload["commit"],
+                "abcdef0123456789abcdef0123456789abcdef01",
+            )
+            self.assertEqual(payload["drivers"][0]["driver"], "psycopg3")
+            self.assertEqual(payload["drivers"][0]["status"], "pass")
 
 
 if __name__ == "__main__":

@@ -12,8 +12,9 @@ file focused on what still blocks production.
   tests, docs, cargo-audit, cargo-deny, driver certification, release build.
 - Final release needs `operator soak reports`, `latest green CI workflow run id`,
   `release workflow run id`, `GitHub release notes`, and
-  `operator_soak_status.json`, `external_audit_status.json`, and
-  `incident_drill_status.json` recorded in the release checklist.
+  `operator_soak_status.json`, `external_audit_status.json`,
+  `incident_drill_status.json`, and `driver_compatibility_status.json`
+  recorded in the release checklist.
 - Release candidate must rerun benchmark, fuzz, sanitizer, Miri, package, and
   smoke-install gates on the tagged commit.
 
@@ -27,6 +28,10 @@ file focused on what still blocks production.
 - Required `incident-drills/*.json` files must pass strict validation through
   `scripts/validate-incident-drills.py --strict`; required drill types are
   `backup_restore`, `wal_recovery`, and `disk_full`.
+- Driver compatibility must pass strict validation through
+  `scripts/validate-driver-compatibility.py --strict`; the status artifact
+  records `required_driver_count`, `passing_required_driver_count`, and
+  `missing_required_drivers` for the release commit.
 - Zero open critical or high-severity correctness bugs.
 - Fuzz testing: one clean week for parser, protocol, WAL decoder, and planner.
 - Re-run chaos recovery on release candidates; completed random-kill,

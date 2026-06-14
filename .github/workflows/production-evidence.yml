@@ -7,10 +7,13 @@ on:
     paths:
       - 'external-audits/**'
       - 'incident-drills/**'
+      - 'tests/driver_certification/**'
       - 'scripts/validate-external-audits.py'
       - 'scripts/validate-incident-drills.py'
+      - 'scripts/validate-driver-compatibility.py'
       - 'docs/external-audits.md'
       - 'docs/incident-drills.md'
+      - 'docs/driver-certification.md'
       - '.github/workflows/production-evidence.yml'
   workflow_dispatch:
 
@@ -45,6 +48,12 @@ jobs:
             --required-drill-types backup_restore,wal_recovery,disk_full \
             --commit "$GITHUB_SHA" \
             --out benchmarks/results/latest/incident_drill_status.json
+      - name: validate driver compatibility report
+        run: |
+          python3 scripts/validate-driver-compatibility.py \
+            --report target/driver-certification.json \
+            --commit "$GITHUB_SHA" \
+            --out benchmarks/results/latest/driver_compatibility_status.json
       - name: summarize status
         run: |
           {
@@ -55,6 +64,10 @@ jobs:
             echo '## Incident drill status'
             echo
             sed 's/^/    /' benchmarks/results/latest/incident_drill_status.json
+            echo
+            echo '## Driver compatibility status'
+            echo
+            sed 's/^/    /' benchmarks/results/latest/driver_compatibility_status.json
           } >> "$GITHUB_STEP_SUMMARY"
       - uses: actions/upload-artifact@v7
         with:
@@ -62,3 +75,4 @@ jobs:
           path: |
             benchmarks/results/latest/external_audit_status.json
             benchmarks/results/latest/incident_drill_status.json
+            benchmarks/results/latest/driver_compatibility_status.json

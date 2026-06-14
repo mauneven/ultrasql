@@ -71,6 +71,30 @@ migration version tables, explicit transaction rollback, and failed-transaction
 recovery. It writes a machine-readable report to
 `target/driver-certification.json`.
 
+## Release Gate
+
+v1.0 and later releases require strict validation of that report:
+
+```bash
+scripts/validate-driver-compatibility.py --strict \
+  --report target/driver-certification.json \
+  --commit "$(git rev-parse HEAD)" \
+  --out benchmarks/results/latest/driver_compatibility_status.json
+```
+
+The validator records `required_driver_count`,
+`passing_required_driver_count`, `missing_required_drivers`, every driver
+entry, and the exact commit covered by the report. The gate is ready only when:
+
+- the certification report covers the release commit,
+- every required stock driver/tool entry is present,
+- every required entry has `status: "pass"`,
+- every required entry records a non-empty version and check list.
+
+The committed status file may say `not_ready`. That is honest evidence, not a
+failure to be hidden; production readiness requires a fresh passing report for
+the tagged commit.
+
 Current scope is intentionally narrow: it proves the named drivers can connect
 and run core SQL/ORM/migration traffic through public APIs. It does not
 certify every ORM edge, desktop GUI launch/click path, admin-tool mutation

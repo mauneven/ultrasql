@@ -76,6 +76,11 @@ Pushing a `vX.Y.Z` tag runs `.github/workflows/release.yml`. The workflow:
 - validates `incident-drills/*.json`; `v1+` releases require
   `scripts/validate-incident-drills.py --strict`, while `v0.*` prereleases
   record `incident_drill_status.json` without blocking publication,
+- validates `target/driver-certification.json`; `v1+` releases require
+  `scripts/validate-driver-compatibility.py --strict`, while `v0.*`
+  prereleases record `driver_compatibility_status.json` without blocking
+  publication. The status records `required_driver_count`,
+  `passing_required_driver_count`, and `missing_required_drivers`,
 - renders `RELEASE_NOTES.md` from `docs/release-notes-template.md`,
 - marks `v0.*` releases as pre-releases.
 
@@ -111,7 +116,7 @@ section is the same run miri smoke on memory-safety-sensitive crates block used
 by CI. TPC-H, ClickBench, Firebolt Core, AI gauntlet, fuzz, and Miri evidence
 belongs here, not in the PR-critical path.
 
-## 69-83 Evidence Map
+## 69-86 Evidence Map
 
 | item | code | test | benchmark or reason | docs | artifact |
 | --- | --- | --- | --- | --- | --- |
@@ -135,6 +140,7 @@ belongs here, not in the PR-critical path.
 | 83 GitHub release notes | `docs/release-notes-template.md`, `scripts/render-release-notes.sh`, `.github/release.yml` | `crates/ultrasql-bench/tests/release_hardening.rs` | no benchmark; release communication gate | `CHANGELOG.md`, this file | rendered `RELEASE_NOTES.md` and GitHub release notes URL |
 | 84 External audit reports | `scripts/validate-external-audits.py`, `external-audits/*.json` | `tests/scripts/test_validate_release_evidence.py`, `crates/ultrasql-bench/tests/release_hardening.rs` | no benchmark; independent security and correctness review gate | `docs/external-audits.md` | `benchmarks/results/latest/external_audit_status.json` |
 | 85 Incident drill reports | `scripts/validate-incident-drills.py`, `incident-drills/*.json` | `tests/scripts/test_validate_release_evidence.py`, `crates/ultrasql-bench/tests/release_hardening.rs` | no benchmark; recovery and incident-response gate | `docs/incident-drills.md` | `benchmarks/results/latest/incident_drill_status.json` |
+| 86 Driver compatibility status | `tests/driver_certification/driver_certification.py`, `scripts/validate-driver-compatibility.py`, `target/driver-certification.json` | `tests/scripts/test_validate_release_evidence.py`, `tests/driver_certification/test_driver_certification.py`, `crates/ultrasql-bench/tests/release_hardening.rs` | no benchmark; client ecosystem compatibility gate | `docs/driver-certification.md` | `benchmarks/results/latest/driver_compatibility_status.json` |
 
 ## Sign-off rule
 
@@ -161,6 +167,7 @@ Before tagging v1.0, attach:
 - two independent external audit reports and `external_audit_status.json`,
 - backup_restore, wal_recovery, disk_full incident drills and
   `incident_drill_status.json`,
+- driver certification report and `driver_compatibility_status.json`,
 - GitHub release notes URL,
 - security/ethics audit notes,
 - config docs hash or commit id.
