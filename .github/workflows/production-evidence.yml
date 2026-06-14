@@ -1,0 +1,64 @@
+name: production evidence
+
+on:
+  schedule:
+    - cron: '41 8 * * *'
+  pull_request:
+    paths:
+      - 'external-audits/**'
+      - 'incident-drills/**'
+      - 'scripts/validate-external-audits.py'
+      - 'scripts/validate-incident-drills.py'
+      - 'docs/external-audits.md'
+      - 'docs/incident-drills.md'
+      - '.github/workflows/production-evidence.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: production-evidence-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  validate:
+    name: validate production evidence
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.13'
+      - name: validate external audit reports
+        run: |
+          python3 scripts/validate-external-audits.py \
+            --reports-dir external-audits \
+            --min-reports 2 \
+            --required-audit-types security,correctness \
+            --commit "$GITHUB_SHA" \
+            --out benchmarks/results/latest/external_audit_status.json
+      - name: validate incident drill reports
+        run: |
+          python3 scripts/validate-incident-drills.py \
+            --reports-dir incident-drills \
+            --required-drill-types backup_restore,wal_recovery,disk_full \
+            --commit "$GITHUB_SHA" \
+            --out benchmarks/results/latest/incident_drill_status.json
+      - name: summarize status
+        run: |
+          {
+            echo '## External audit status'
+            echo
+            sed 's/^/    /' benchmarks/results/latest/external_audit_status.json
+            echo
+            echo '## Incident drill status'
+            echo
+            sed 's/^/    /' benchmarks/results/latest/incident_drill_status.json
+          } >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: production-evidence-status
+          path: |
+            benchmarks/results/latest/external_audit_status.json
+            benchmarks/results/latest/incident_drill_status.json

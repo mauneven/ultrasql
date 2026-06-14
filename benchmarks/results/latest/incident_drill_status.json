@@ -1,0 +1,23 @@
+{
+  "covered_drill_types": [],
+  "ready": false,
+  "reasons": [
+    "0 valid drill report(s), need 3",
+    "missing required drill type(s): backup_restore, disk_full, wal_recovery",
+    "Cannot be closed by code changes alone; requires production incident drill evidence."
+  ],
+  "release_commit": null,
+  "report_count": 0,
+  "reports": [],
+  "reports_dir": "incident-drills",
+  "required_drill_types": [
+    "backup_restore",
+    "disk_full",
+    "wal_recovery"
+  ],
+  "schema_version": 1,
+  "status": "not_ready",
+  "valid_release_commits": [],
+  "valid_report_count": 0,
+  "validated_at_utc": "2026-06-14T00:00:00Z"
+}

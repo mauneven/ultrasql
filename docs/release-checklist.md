@@ -70,6 +70,12 @@ Pushing a `vX.Y.Z` tag runs `.github/workflows/release.yml`. The workflow:
 - validates `operator-reports/*.json`; `v1+` releases require
   `scripts/validate-operator-soak.py --strict`, while `v0.*` prereleases record
   the current soak status without blocking publication,
+- validates `external-audits/*.json`; `v1+` releases require
+  `scripts/validate-external-audits.py --strict`, while `v0.*` prereleases
+  record `external_audit_status.json` without blocking publication,
+- validates `incident-drills/*.json`; `v1+` releases require
+  `scripts/validate-incident-drills.py --strict`, while `v0.*` prereleases
+  record `incident_drill_status.json` without blocking publication,
 - renders `RELEASE_NOTES.md` from `docs/release-notes-template.md`,
 - marks `v0.*` releases as pre-releases.
 
@@ -127,6 +133,8 @@ belongs here, not in the PR-critical path.
 | 81 Operator soak reports | `scripts/validate-operator-soak.py`, `.github/workflows/operator-soak.yml` | `crates/ultrasql-bench/tests/release_hardening.rs` | no benchmark; 30-day external operation gate | `docs/OPERATOR_SOAK.md`, `docs/operator-reports.md` | `benchmarks/results/latest/operator_soak_status.json` |
 | 82 Green CI/release workflows | `.github/workflows/ci.yml`, `.github/workflows/release.yml` | `crates/ultrasql-bench/tests/release_hardening.rs`, actionlint | no benchmark; release governance gate | this file | latest green CI workflow run id and release workflow run id |
 | 83 GitHub release notes | `docs/release-notes-template.md`, `scripts/render-release-notes.sh`, `.github/release.yml` | `crates/ultrasql-bench/tests/release_hardening.rs` | no benchmark; release communication gate | `CHANGELOG.md`, this file | rendered `RELEASE_NOTES.md` and GitHub release notes URL |
+| 84 External audit reports | `scripts/validate-external-audits.py`, `external-audits/*.json` | `tests/scripts/test_validate_release_evidence.py`, `crates/ultrasql-bench/tests/release_hardening.rs` | no benchmark; independent security and correctness review gate | `docs/external-audits.md` | `benchmarks/results/latest/external_audit_status.json` |
+| 85 Incident drill reports | `scripts/validate-incident-drills.py`, `incident-drills/*.json` | `tests/scripts/test_validate_release_evidence.py`, `crates/ultrasql-bench/tests/release_hardening.rs` | no benchmark; recovery and incident-response gate | `docs/incident-drills.md` | `benchmarks/results/latest/incident_drill_status.json` |
 
 ## Sign-off rule
 
@@ -150,6 +158,9 @@ Before tagging v1.0, attach:
 - Homebrew formula asset,
 - Debian and RPM package assets,
 - operator soak reports and `operator_soak_status.json`,
+- two independent external audit reports and `external_audit_status.json`,
+- backup_restore, wal_recovery, disk_full incident drills and
+  `incident_drill_status.json`,
 - GitHub release notes URL,
 - security/ethics audit notes,
 - config docs hash or commit id.

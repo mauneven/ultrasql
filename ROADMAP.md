@@ -12,7 +12,8 @@ file focused on what still blocks production.
   tests, docs, cargo-audit, cargo-deny, driver certification, release build.
 - Final release needs `operator soak reports`, `latest green CI workflow run id`,
   `release workflow run id`, `GitHub release notes`, and
-  `operator_soak_status.json` recorded in the release checklist.
+  `operator_soak_status.json`, `external_audit_status.json`, and
+  `incident_drill_status.json` recorded in the release checklist.
 - Release candidate must rerun benchmark, fuzz, sanitizer, Miri, package, and
   smoke-install gates on the tagged commit.
 
@@ -20,6 +21,12 @@ file focused on what still blocks production.
 
 - Three independent `operator-reports/*.json` files must pass strict validation
   for 30 continuous days through `.github/workflows/operator-soak.yml`.
+- Two independent `external-audits/*.json` files must pass strict validation
+  through `scripts/validate-external-audits.py --strict`; required audit types
+  are `security` and `correctness`.
+- Required `incident-drills/*.json` files must pass strict validation through
+  `scripts/validate-incident-drills.py --strict`; required drill types are
+  `backup_restore`, `wal_recovery`, and `disk_full`.
 - Zero open critical or high-severity correctness bugs.
 - Fuzz testing: one clean week for parser, protocol, WAL decoder, and planner.
 - Re-run chaos recovery on release candidates; completed random-kill,

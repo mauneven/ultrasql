@@ -91,6 +91,33 @@ jobs:
             args+=(--strict)
           fi
           python3 scripts/validate-operator-soak.py "${args[@]}"
+      - name: validate external audit reports
+        shell: bash
+        run: |
+          args=(
+            --reports-dir external-audits
+            --min-reports 2
+            --required-audit-types security,correctness
+            --commit "$GITHUB_SHA"
+            --out target/external_audit_status.json
+          )
+          if [[ "$RELEASE_TAG" != v0.* ]]; then
+            args+=(--strict)
+          fi
+          python3 scripts/validate-external-audits.py "${args[@]}"
+      - name: validate incident drill reports
+        shell: bash
+        run: |
+          args=(
+            --reports-dir incident-drills
+            --required-drill-types backup_restore,wal_recovery,disk_full
+            --commit "$GITHUB_SHA"
+            --out target/incident_drill_status.json
+          )
+          if [[ "$RELEASE_TAG" != v0.* ]]; then
+            args+=(--strict)
+          fi
+          python3 scripts/validate-incident-drills.py "${args[@]}"
 
   build:
     name: build (${{ matrix.target }})
@@ -394,7 +421,33 @@ jobs:
             args+=(--strict)
           fi
           python3 scripts/validate-operator-soak.py "${args[@]}"
-          scripts/render-release-notes.sh "$RELEASE_TAG" release/operator_soak_status.json release/RELEASE_NOTES.md
+          args=(
+            --reports-dir external-audits
+            --min-reports 2
+            --required-audit-types security,correctness
+            --commit "$GITHUB_SHA"
+            --out release/external_audit_status.json
+          )
+          if [[ "$RELEASE_TAG" != v0.* ]]; then
+            args+=(--strict)
+          fi
+          python3 scripts/validate-external-audits.py "${args[@]}"
+          args=(
+            --reports-dir incident-drills
+            --required-drill-types backup_restore,wal_recovery,disk_full
+            --commit "$GITHUB_SHA"
+            --out release/incident_drill_status.json
+          )
+          if [[ "$RELEASE_TAG" != v0.* ]]; then
+            args+=(--strict)
+          fi
+          python3 scripts/validate-incident-drills.py "${args[@]}"
+          scripts/render-release-notes.sh \
+            "$RELEASE_TAG" \
+            release/operator_soak_status.json \
+            release/external_audit_status.json \
+            release/incident_drill_status.json \
+            release/RELEASE_NOTES.md
           ls -la release
       - name: publish github release
         uses: softprops/action-gh-release@v3

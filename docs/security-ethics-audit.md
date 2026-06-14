@@ -8,6 +8,8 @@ claims that cannot be reproduced.
 - No proprietary tests.
 - No closed-source code.
 - No fake benchmark claims.
+- No production-ready claim without `operator_soak_status.json`,
+  `external_audit_status.json`, and `incident_drill_status.json` showing ready.
 
 ## Verification commands
 

@@ -913,6 +913,123 @@ fn final_release_requires_operator_reports_green_workflows_and_notes() {
 }
 
 #[test]
+fn final_release_requires_external_audits_and_incident_drills() {
+    let audit_docs = repo_file("docs/external-audits.md");
+    let drill_docs = repo_file("docs/incident-drills.md");
+    let audit_validator = repo_file("scripts/validate-external-audits.py");
+    let drill_validator = repo_file("scripts/validate-incident-drills.py");
+    let audit_status = repo_file("benchmarks/results/latest/external_audit_status.json");
+    let drill_status = repo_file("benchmarks/results/latest/incident_drill_status.json");
+    let release = repo_file(".github/workflows/release.yml");
+    let notes_template = repo_file("docs/release-notes-template.md");
+    let release_checklist = repo_file("docs/release-checklist.md");
+    let roadmap = repo_file("ROADMAP.md");
+
+    for needle in [
+        "two independent external audit reports",
+        "security",
+        "correctness",
+        "critical_findings_open",
+        "high_findings_open",
+        "report_uri",
+        "signed_off_by",
+        "scripts/validate-external-audits.py --strict",
+    ] {
+        assert!(audit_docs.contains(needle), "audit docs missing {needle}");
+    }
+
+    for needle in [
+        "backup_restore",
+        "wal_recovery",
+        "disk_full",
+        "rto_actual_seconds",
+        "rpo_actual_seconds",
+        "data_loss_confirmed",
+        "postmortem_uri",
+        "scripts/validate-incident-drills.py --strict",
+    ] {
+        assert!(drill_docs.contains(needle), "drill docs missing {needle}");
+    }
+
+    for needle in [
+        "required_audit_types",
+        "independent_auditor_count",
+        "critical_findings_open",
+        "high_findings_open",
+        "ready",
+        "not_ready",
+    ] {
+        assert!(
+            audit_validator.contains(needle),
+            "audit validator missing {needle}"
+        );
+    }
+
+    for needle in [
+        "required_drill_types",
+        "covered_drill_types",
+        "rto_actual_seconds",
+        "rpo_actual_seconds",
+        "data_loss_confirmed",
+        "ready",
+        "not_ready",
+    ] {
+        assert!(
+            drill_validator.contains(needle),
+            "incident drill validator missing {needle}"
+        );
+    }
+
+    for needle in [
+        "\"status\": \"not_ready\"",
+        "\"ready\": false",
+        "\"required_audit_types\"",
+        "\"security\"",
+        "\"correctness\"",
+    ] {
+        assert!(
+            audit_status.contains(needle),
+            "audit status missing {needle}"
+        );
+    }
+
+    for needle in [
+        "\"status\": \"not_ready\"",
+        "\"ready\": false",
+        "\"required_drill_types\"",
+        "\"backup_restore\"",
+        "\"wal_recovery\"",
+        "\"disk_full\"",
+    ] {
+        assert!(
+            drill_status.contains(needle),
+            "drill status missing {needle}"
+        );
+    }
+
+    for needle in [
+        "scripts/validate-external-audits.py",
+        "scripts/validate-incident-drills.py",
+        "external_audit_status.json",
+        "incident_drill_status.json",
+    ] {
+        assert!(
+            release.contains(needle),
+            "release workflow missing {needle}"
+        );
+        assert!(
+            notes_template.contains(needle),
+            "release notes template missing {needle}"
+        );
+        assert!(
+            release_checklist.contains(needle),
+            "release checklist missing {needle}"
+        );
+        assert!(roadmap.contains(needle), "ROADMAP missing {needle}");
+    }
+}
+
+#[test]
 fn release_user_docs_exist_and_state_current_limits() {
     let changelog = repo_file("CHANGELOG.md");
     let getting_started = repo_file("docs/getting-started.md");

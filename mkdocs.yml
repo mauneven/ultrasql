@@ -33,6 +33,8 @@ nav:
   - Backup and Restore: backup-restore.md
   - Chaos Recovery: chaos-recovery.md
   - Operator Reports: operator-reports.md
+  - External Audits: external-audits.md
+  - Incident Drills: incident-drills.md
   - Release Notes Template: release-notes-template.md
   - Driver Certification: driver-certification.md
   - Migration Guide: migration-guide.md

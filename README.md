@@ -12,8 +12,8 @@ release-grade benchmark tooling.
 
 The project is pre-alpha. It is already fast on the tracked SQL-surface
 benchmarks, but release readiness is evidence-based: correctness, driver
-certification, security, coverage, packaging, and operator soak gates must all
-close before v1.0.
+certification, security, coverage, packaging, external audits, incident drills,
+and operator soak gates must all close before v1.0.
 
 ## Current Shape
 

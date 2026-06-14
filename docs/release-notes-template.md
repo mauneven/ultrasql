@@ -7,6 +7,8 @@ production claim unless every gate below is linked to evidence.
 
 - Release workflow: @RELEASE_RUN_URL@
 - Operator soak status: @OPERATOR_SOAK_STATUS@
+- External audit status: @EXTERNAL_AUDIT_STATUS@
+- Incident drill status: @INCIDENT_DRILL_STATUS@
 - GitHub release notes: this body plus attached assets and checksums.
 
 ## Green workflow evidence
@@ -25,6 +27,20 @@ The release workflow validates `operator-reports/*.json` with
 reports are required. The rendered status artifact is
 `operator_soak_status.json`.
 
+## External audit reports
+
+The release workflow validates `external-audits/*.json` with
+`scripts/validate-external-audits.py --strict` for v1.0 and later releases.
+Two independent external audit reports covering `security` and `correctness`
+are required. The rendered status artifact is `external_audit_status.json`.
+
+## Incident drills
+
+The release workflow validates `incident-drills/*.json` with
+`scripts/validate-incident-drills.py --strict` for v1.0 and later releases.
+The required drill types are `backup_restore`, `wal_recovery`, and
+`disk_full`. The rendered status artifact is `incident_drill_status.json`.
+
 ## Assets
 
 Release assets include:
@@ -33,7 +49,9 @@ Release assets include:
 - `SHASUMS256.txt`,
 - `ultrasql.rb` Homebrew formula,
 - Linux `.deb` and `.rpm` packages,
-- `operator_soak_status.json`.
+- `operator_soak_status.json`,
+- `external_audit_status.json`,
+- `incident_drill_status.json`.
 
 ## Known Gaps
 
