@@ -571,20 +571,23 @@ fn peek_record_length(bytes: &[u8]) -> Result<u64, WalWriterError> {
     Ok(u64::from(total))
 }
 
-/// Open (or create) a WAL segment file for append.
+/// Create a new WAL segment file for writing.
+///
+/// The path must not already exist. `WalWriter::open` chooses
+/// `max(existing_segment) + 1`; if that path appears before open, a
+/// second writer or hostile filesystem actor has raced us. Refusing
+/// the open keeps closed segments immutable.
 ///
 /// On Unix the file is opened with `O_NOFOLLOW` so that a hostile actor
 /// who plants `wal_dir/segment_*` as a symlink to a sensitive file
 /// (`/etc/passwd`, another database's data file, etc.) cannot trick the
 /// writer into appending WAL records into the symlinked target. The
-/// `open(2)` call fails with `ELOOP` in that case and the writer
-/// surfaces the error to its caller, who tears the writer thread down
-/// rather than silently overwriting unrelated files.
+/// open call fails without following the link.
 ///
 /// On non-Unix targets the flag is unavailable and the open is plain.
 fn open_segment_file(path: &Path) -> std::io::Result<File> {
     let mut opts = OpenOptions::new();
-    opts.create(true).append(true).read(false);
+    opts.create_new(true).write(true).read(false);
     #[cfg(unix)]
     opts.custom_flags(libc::O_NOFOLLOW);
     opts.open(path)
@@ -652,6 +655,17 @@ mod tests {
     }
 
     #[test]
+    fn segment_open_refuses_existing_segment_file() {
+        let dir = TempDir::new().unwrap();
+        let path = segment_path(dir.path(), 0);
+        std::fs::write(&path, b"closed-segment").unwrap();
+
+        let err = open_segment_file(&path).expect_err("closed WAL segment must stay immutable");
+        assert_eq!(err.kind(), std::io::ErrorKind::AlreadyExists);
+        assert_eq!(std::fs::read(&path).unwrap(), b"closed-segment");
+    }
+
+    #[test]
     fn writer_counter_add_rejects_overflow() {
         let err = checked_writer_u64_add(u64::MAX, 1, "segment size").unwrap_err();
         assert!(matches!(err, WalWriterError::CounterOverflow { .. }));
@@ -681,8 +695,7 @@ mod tests {
     /// Hostile-fs scenario: an attacker has staged a symlink at
     /// `wal_dir/segment_0000000000` pointing at a sensitive file. The
     /// writer must refuse to follow the link rather than appending WAL
-    /// bytes into the linked target. We assert the open returns an
-    /// `ELOOP`-class error.
+    /// bytes into the linked target.
     #[cfg(unix)]
     #[test]
     fn segment_open_refuses_to_follow_symlink() {
@@ -695,13 +708,14 @@ mod tests {
         symlink(&target, &link).unwrap();
 
         let err = open_segment_file(&link).expect_err("open must refuse symlink");
-        // POSIX returns ELOOP; some platforms surface it as
-        // `FilesystemLoop`, others as `Other`. Either way it must NOT
-        // be Ok.
+        // POSIX may return ELOOP for O_NOFOLLOW or AlreadyExists for
+        // create_new. Either way it must NOT be Ok.
         let raw = err.raw_os_error();
         assert!(
-            raw == Some(libc::ELOOP) || err.kind() == std::io::ErrorKind::Other,
-            "expected ELOOP, got {err:?}"
+            raw == Some(libc::ELOOP)
+                || err.kind() == std::io::ErrorKind::AlreadyExists
+                || err.kind() == std::io::ErrorKind::Other,
+            "expected symlink refusal, got {err:?}"
         );
 
         // The target file's contents must be unchanged.
