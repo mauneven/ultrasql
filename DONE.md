@@ -2343,3 +2343,11 @@ as a concise evidence ledger; roadmap stays for open gates only.
   `cargo clippy -p ultrasql-server --all-targets --all-features -- -D warnings`,
   `cargo test -p ultrasql-server --lib session:: -- --nocapture`,
   `cargo test -p ultrasql-bench --test release_hardening -- --nocapture`.
+- The current release-artifact DB-vs-DB scale sweep was re-run against commit
+  `687d101d798a9dee712d62afe0a15d3c93765e5b` with DuckDB, ClickHouse, SQLite,
+  and PostgreSQL on the same Apple M4 host. UltraSQL is fastest in all 24
+  published rows, and benchmark rendering now emits real UTC calendar dates
+  instead of approximate future dates. Evidence:
+  `CH_BIN="$(command -v clickhouse)" ULTRASQLD_BIN=target/release-ship/ultrasqld SCALE_SWEEP_OUT=/tmp/ultrasql-scale-sweep-full-20260614-687d101d SCALE_SWEEP_ROWS="10000 100000 1000000" benchmarks/run_scale_sweep.sh full`,
+  `python3 benchmarks/scripts/check_supremacy.py benchmarks/results/latest/scale-sweep/raw`,
+  `cargo test -p ultrasql-bench --bin results-render unix_timestamp_format_is_real_utc_calendar_date -- --nocapture`.
