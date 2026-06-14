@@ -779,6 +779,25 @@ fn principal_files_keep_hygiene_guards() {
 }
 
 #[test]
+fn runtime_metadata_writes_are_nofollow_and_fsynced() {
+    let source = repo_file("crates/ultrasql-server/src/lib.rs");
+
+    for needle in [
+        "fn write_runtime_metadata_file",
+        "libc::O_NOFOLLOW",
+        "file.sync_all().map_err(ServerError::Io)?",
+        "std::fs::rename(&tmp, path).map_err(ServerError::Io)?",
+        "sync_runtime_metadata_parent(path)",
+        "fn sync_runtime_metadata_dir",
+    ] {
+        assert!(
+            source.contains(needle),
+            "runtime metadata write path missing {needle}"
+        );
+    }
+}
+
+#[test]
 fn final_release_requires_operator_reports_green_workflows_and_notes() {
     let operator_docs = repo_file("docs/OPERATOR_SOAK.md");
     let operator_report_docs = repo_file("docs/operator-reports.md");

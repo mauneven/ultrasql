@@ -4338,14 +4338,29 @@ fn open_no_follow_read(path: &Path) -> Result<std::fs::File, ServerError> {
 fn write_runtime_metadata_file(path: &Path, text: &str) -> Result<(), ServerError> {
     ensure_runtime_metadata_write_slots(path)?;
     let tmp = path.with_extension("meta.tmp");
-    let mut file = std::fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .open(&tmp)
-        .map_err(ServerError::Io)?;
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+
+        options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
+    }
+    let mut file = options.open(&tmp).map_err(|err| {
+        #[cfg(unix)]
+        if err.raw_os_error() == Some(libc::ELOOP) {
+            return ServerError::ddl(format!(
+                "runtime metadata file {} is not a regular file",
+                tmp.display()
+            ));
+        }
+        ServerError::Io(err)
+    })?;
     std::io::Write::write_all(&mut file, text.as_bytes()).map_err(ServerError::Io)?;
-    std::fs::rename(tmp, path).map_err(ServerError::Io)
+    file.sync_all().map_err(ServerError::Io)?;
+    drop(file);
+    std::fs::rename(&tmp, path).map_err(ServerError::Io)?;
+    sync_runtime_metadata_parent(path)
 }
 
 fn ensure_runtime_metadata_write_slots(path: &Path) -> Result<(), ServerError> {
@@ -4371,6 +4386,28 @@ fn ensure_runtime_metadata_file_slot(path: &Path) -> Result<(), ServerError> {
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(err) => Err(ServerError::Io(err)),
     }
+}
+
+fn sync_runtime_metadata_parent(path: &Path) -> Result<(), ServerError> {
+    let Some(parent) = path.parent() else {
+        return Ok(());
+    };
+    sync_runtime_metadata_dir(parent)
+}
+
+#[cfg(unix)]
+fn sync_runtime_metadata_dir(path: &Path) -> Result<(), ServerError> {
+    let dir = std::fs::File::open(path).map_err(ServerError::Io)?;
+    match dir.sync_all() {
+        Ok(()) => Ok(()),
+        Err(err) if err.kind() == std::io::ErrorKind::InvalidInput => Ok(()),
+        Err(err) => Err(ServerError::Io(err)),
+    }
+}
+
+#[cfg(not(unix))]
+fn sync_runtime_metadata_dir(_path: &Path) -> Result<(), ServerError> {
+    Ok(())
 }
 
 fn write_backup_marker_file(path: &Path, payload: &str) -> Result<(), ServerError> {

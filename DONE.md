@@ -2247,6 +2247,16 @@ as a concise evidence ledger; roadmap stays for open gates only.
 - Runtime metadata sidecar reads now check sentinel read limits and byte-count
   conversion instead of saturating data-dir metadata reads. Evidence:
   `cargo test -p ultrasql-server tests::recovery::runtime_metadata_read_limit_rejects_overflow --lib -- --nocapture`.
+- Runtime metadata sidecar writes now open temp files with `O_NOFOLLOW` on Unix,
+  fsync the temp file before atomic rename, and fsync the parent directory after
+  rename. This hardens the remaining sidecar path against symlink races and
+  crash-lost metadata updates while the roadmap moves those rows into typed
+  catalog storage. Evidence:
+  `cargo test -p ultrasql-bench --test release_hardening runtime_metadata_writes_are_nofollow_and_fsynced -- --nocapture`,
+  `cargo test -p ultrasql-server tests::recovery::runtime_metadata_persist_refuses_symlinked_temp_file --lib -- --nocapture`,
+  `cargo test -p ultrasql-server tests::recovery::server_init_refuses_symlinked_runtime_metadata_sidecar --lib -- --nocapture`,
+  and
+  `cargo test -p ultrasql-server tests::recovery::runtime_metadata_read_limit_rejects_overflow --lib -- --nocapture`.
 - Object-store range readers now check cursor advancement and byte-count
   conversion instead of saturating remote object stream positions. Evidence:
   `cargo test -p ultrasql-server pipeline::object_stream::tests::object_stream_pos_add_rejects_overflow --lib -- --nocapture`.
