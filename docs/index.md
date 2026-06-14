@@ -14,6 +14,8 @@ candidate path until the v1.0 release checklist is closed.
 - [DESCRIBE](sql/describe.md) documents table and query metadata introspection.
 - [CHECKPOINT](sql/checkpoint.md) documents the WAL checkpoint command.
 - [SET VARIABLE](sql/set-variable.md) documents session-local runtime settings.
+- [MERGE INTO](sql/merge.md) documents conditional table upserts, updates, and
+  deletes.
 - [AI Database Strategy](ai-database-strategy.md) maps UltraSQL's AI memory
   engine plan.
 - [Known Limitations](known-limitations.md) records open SQL and operations

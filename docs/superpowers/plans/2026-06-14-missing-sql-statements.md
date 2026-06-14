@@ -96,13 +96,13 @@ Docs commits happen only after passing implementation tests for that family.
 - Extend `crates/ultrasql-server/src/pipeline/modify.rs` or session DML dispatch.
 - Add `crates/ultrasql-server/tests/merge_round_trip.rs`.
 
-- [ ] Support `MERGE INTO target USING source ON condition`.
-- [ ] Support `WHEN MATCHED THEN UPDATE SET ...`.
-- [ ] Support `WHEN MATCHED THEN DELETE`.
-- [ ] Support `WHEN NOT MATCHED THEN INSERT [(cols)] VALUES (...)`.
-- [ ] Reject multiple source rows matching one target row with deterministic SQLSTATE/error text before mutating target.
-- [ ] Use one transaction boundary for all branches; rollback all branch effects on error.
-- [ ] Test update, delete, insert, no-op, duplicate match, `NULL` match semantics, rollback, indexes, and constraints.
+- [x] Support `MERGE INTO target USING source ON condition`.
+- [x] Support `WHEN MATCHED THEN UPDATE SET ...`.
+- [x] Support `WHEN MATCHED THEN DELETE`.
+- [x] Support `WHEN NOT MATCHED THEN INSERT [(cols)] VALUES (...)`.
+- [x] Reject multiple source rows matching one target row with deterministic SQLSTATE/error text before mutating target.
+- [x] Use one transaction boundary for all branches; rollback all branch effects on error.
+- [x] Test update, delete, insert, no-op, duplicate match, `NULL` match semantics, rollback, indexes, and constraints.
 
 ## Phase 4: CHECKPOINT
 
