@@ -23,6 +23,7 @@ pub(crate) mod explain;
 pub(crate) mod grant;
 pub(crate) mod insert;
 pub(crate) mod listen;
+pub(crate) mod merge;
 pub(crate) mod prepare;
 pub(crate) mod savepoint;
 pub(crate) mod select;

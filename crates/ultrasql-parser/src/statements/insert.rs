@@ -81,7 +81,7 @@ impl Parser<'_> {
 
     /// Parse the parenthesised column list `(col1, col2, ...)` in an
     /// `INSERT` statement.
-    fn parse_insert_column_list(&mut self) -> Result<Vec<Identifier>, ParseError> {
+    pub(crate) fn parse_insert_column_list(&mut self) -> Result<Vec<Identifier>, ParseError> {
         self.expect(TokenKind::LParen, "(")?;
         let mut cols = Vec::new();
         loop {
@@ -130,7 +130,7 @@ impl Parser<'_> {
     }
 
     /// Parse a single parenthesised values row `(expr, expr, ...)`.
-    fn parse_values_row(&mut self) -> Result<Vec<crate::ast::Expr>, ParseError> {
+    pub(crate) fn parse_values_row(&mut self) -> Result<Vec<crate::ast::Expr>, ParseError> {
         self.expect(TokenKind::LParen, "(")?;
         let mut exprs = Vec::new();
         loop {

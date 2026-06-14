@@ -359,6 +359,13 @@ impl<'src> Parser<'src> {
             TokenKind::Identifier
                 if head
                     .text(self.source)
+                    .is_some_and(|text| text.eq_ignore_ascii_case("merge")) =>
+            {
+                self.parse_merge().map(|s| Statement::Merge(Box::new(s)))
+            }
+            TokenKind::Identifier
+                if head
+                    .text(self.source)
                     .is_some_and(|text| text.eq_ignore_ascii_case("checkpoint")) =>
             {
                 let tok = self.advance()?;
@@ -376,7 +383,7 @@ impl<'src> Parser<'src> {
                 expected: "SELECT, INSERT, UPDATE, DELETE, TRUNCATE, CREATE, DROP, ALTER, \
                            COMMENT, REINDEX, SET, SHOW, RESET, BEGIN, COMMIT, ROLLBACK, SAVEPOINT, \
                            RELEASE, EXPLAIN, PREPARE, EXECUTE, GRANT, REVOKE, DEALLOCATE, \
-                           LISTEN, NOTIFY, UNLISTEN, COPY, DESCRIBE, or CHECKPOINT",
+                           LISTEN, NOTIFY, UNLISTEN, COPY, DESCRIBE, MERGE, or CHECKPOINT",
                 found: other,
                 offset: head.span.start_usize(),
             }),

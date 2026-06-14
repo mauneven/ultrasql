@@ -279,6 +279,23 @@ fn binds_set_variable_as_session_setting() {
 }
 
 #[test]
+fn merge_fails_closed_until_semantic_binding_lands() {
+    let cat = users_catalog();
+    let err = parse_and_bind(
+        "MERGE INTO users AS u \
+         USING users AS s \
+         ON u.id = s.id \
+         WHEN MATCHED THEN UPDATE SET name = s.name",
+        &cat,
+    )
+    .expect_err("MERGE must fail closed before binder support");
+    assert!(
+        matches!(err, PlanError::NotSupported(msg) if msg.contains("MERGE INTO")),
+        "unexpected error: {err:?}"
+    );
+}
+
+#[test]
 fn rejects_invalid_column_privilege_specs() {
     let cat = users_catalog();
     let err = parse_and_bind("GRANT SELECT(id) ON DATABASE ultrasql TO analyst", &cat)

@@ -37,6 +37,8 @@ pub enum Statement {
     Update(Box<UpdateStmt>),
     /// `DELETE FROM ...`.
     Delete(Box<DeleteStmt>),
+    /// `MERGE INTO ...`.
+    Merge(Box<MergeStmt>),
     /// `TRUNCATE TABLE ...`.
     Truncate(TruncateStmt),
     /// `DESCRIBE [TABLE|VIEW] object` or `DESCRIBE SELECT ...`.
@@ -205,6 +207,7 @@ impl Statement {
             Self::Insert(s) => s.span,
             Self::Update(s) => s.span,
             Self::Delete(s) => s.span,
+            Self::Merge(s) => s.span,
             Self::Truncate(s) => s.span,
             Self::Describe(s) => s.span,
             Self::Checkpoint { span } => *span,
@@ -1465,6 +1468,64 @@ pub struct DeleteStmt {
     pub returning: Vec<SelectItem>,
     /// Source span of the entire statement.
     pub span: Span,
+}
+
+/// A `MERGE INTO` statement.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MergeStmt {
+    /// Target table.
+    pub target: ObjectName,
+    /// Optional alias for the target table.
+    pub target_alias: Option<Identifier>,
+    /// Source relation from `USING`.
+    pub source: TableRef,
+    /// Match predicate after `ON`.
+    pub on: Expr,
+    /// Ordered `WHEN ... THEN ...` clauses.
+    pub clauses: Vec<MergeClause>,
+    /// Source span of the entire statement.
+    pub span: Span,
+}
+
+/// One `WHEN ... THEN ...` clause in a `MERGE INTO` statement.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MergeClause {
+    /// Whether this branch handles matched or unmatched source rows.
+    pub kind: MergeMatchKind,
+    /// Optional branch predicate after `AND`.
+    pub condition: Option<Expr>,
+    /// Action to run when this branch fires.
+    pub action: MergeAction,
+    /// Source span of this clause.
+    pub span: Span,
+}
+
+/// Match class for a `MERGE INTO` branch.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MergeMatchKind {
+    /// `WHEN MATCHED`.
+    Matched,
+    /// `WHEN NOT MATCHED`.
+    NotMatched,
+}
+
+/// Action attached to a `MERGE INTO` branch.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum MergeAction {
+    /// `THEN UPDATE SET ...`.
+    Update {
+        /// Target assignments.
+        set: Vec<Assignment>,
+    },
+    /// `THEN DELETE`.
+    Delete,
+    /// `THEN INSERT [(columns)] VALUES (...)`.
+    Insert {
+        /// Optional target column list.
+        columns: Vec<Identifier>,
+        /// Values to insert.
+        values: Vec<Expr>,
+    },
 }
 
 /// A `TRUNCATE TABLE` statement.

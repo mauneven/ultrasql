@@ -361,7 +361,7 @@ impl Parser<'_> {
     ///   | '(' SELECT … ')' AS alias [ '(' col_alias, … ')' ]
     ///   | '(' joined_table ')'
     /// ```
-    fn parse_table_factor(&mut self) -> Result<TableRef, ParseError> {
+    pub(crate) fn parse_table_factor(&mut self) -> Result<TableRef, ParseError> {
         if matches!(
             self.peek()?.kind,
             TokenKind::String | TokenKind::EscapedString | TokenKind::DollarString

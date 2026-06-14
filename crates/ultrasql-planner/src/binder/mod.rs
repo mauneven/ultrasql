@@ -119,6 +119,9 @@ pub fn bind(stmt: &Statement, catalog: &dyn Catalog) -> Result<LogicalPlan, Plan
         Statement::Insert(s) => bind_insert(s, catalog, &mut scope),
         Statement::Update(s) => bind_update(s, catalog, &mut scope),
         Statement::Delete(s) => bind_delete(s, catalog, &mut scope),
+        Statement::Merge(_) => Err(PlanError::NotSupported(
+            "MERGE INTO binding is not implemented yet",
+        )),
         Statement::Truncate(s) => bind_truncate(s, catalog),
         Statement::Describe(s) => bind_describe(s, catalog, &mut scope),
         Statement::Checkpoint { .. } => Ok(LogicalPlan::Checkpoint {
