@@ -48,9 +48,10 @@
 use ultrasql_core::{DataType, Field, Schema, Value};
 use ultrasql_parser::ast::{
     DescribeObjectKind as AstDescribeObjectKind, DescribeStmt, DescribeTarget as AstDescribeTarget,
-    Distinct, ExplainFormat as AstExplainFormat, ExplainStmt, Expr as AstExpr, Literal,
-    LockStrength as AstLockStrength, LockWaitPolicy as AstLockWaitPolicy, SelectStmt, SetOp,
-    SetQuantifier, SetRoleStmt, SetScope, SetValue, SetVarStmt, Statement, SummarizeStmt,
+    Distinct, ExplainFormat as AstExplainFormat, ExplainStmt, ExportDatabaseStmt, Expr as AstExpr,
+    ImportDatabaseStmt, Literal, LockStrength as AstLockStrength,
+    LockWaitPolicy as AstLockWaitPolicy, SelectStmt, SetOp, SetQuantifier, SetRoleStmt, SetScope,
+    SetValue, SetVarStmt, Statement, SummarizeStmt,
 };
 
 use crate::catalog::Catalog;
@@ -125,6 +126,8 @@ pub fn bind(stmt: &Statement, catalog: &dyn Catalog) -> Result<LogicalPlan, Plan
         Statement::Truncate(s) => bind_truncate(s, catalog),
         Statement::Describe(s) => bind_describe(s, catalog, &mut scope),
         Statement::Summarize(s) => bind_summarize(s, catalog),
+        Statement::ExportDatabase(s) => bind_export_database(s),
+        Statement::ImportDatabase(s) => bind_import_database(s),
         Statement::Checkpoint { .. } => Ok(LogicalPlan::Checkpoint {
             schema: Schema::empty(),
         }),
@@ -296,6 +299,30 @@ fn bind_summarize(stmt: &SummarizeStmt, catalog: &dyn Catalog) -> Result<Logical
         namespace: resolved.meta.schema_name,
         target_schema: resolved.meta.schema,
         schema: summarize_output_schema()?,
+    })
+}
+
+fn bind_export_database(stmt: &ExportDatabaseStmt) -> Result<LogicalPlan, PlanError> {
+    if stmt.path.trim().is_empty() {
+        return Err(PlanError::TypeMismatch(
+            "EXPORT DATABASE path cannot be empty".to_owned(),
+        ));
+    }
+    Ok(LogicalPlan::ExportDatabase {
+        path: stmt.path.clone(),
+        schema: Schema::empty(),
+    })
+}
+
+fn bind_import_database(stmt: &ImportDatabaseStmt) -> Result<LogicalPlan, PlanError> {
+    if stmt.path.trim().is_empty() {
+        return Err(PlanError::TypeMismatch(
+            "IMPORT DATABASE path cannot be empty".to_owned(),
+        ));
+    }
+    Ok(LogicalPlan::ImportDatabase {
+        path: stmt.path.clone(),
+        schema: Schema::empty(),
     })
 }
 

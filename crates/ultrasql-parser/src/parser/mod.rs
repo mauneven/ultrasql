@@ -386,12 +386,26 @@ impl<'src> Parser<'src> {
             {
                 self.parse_summarize().map(Statement::Summarize)
             }
+            TokenKind::Identifier
+                if head
+                    .text(self.source)
+                    .is_some_and(|text| text.eq_ignore_ascii_case("export")) =>
+            {
+                self.parse_export_database().map(Statement::ExportDatabase)
+            }
+            TokenKind::Identifier
+                if head
+                    .text(self.source)
+                    .is_some_and(|text| text.eq_ignore_ascii_case("import")) =>
+            {
+                self.parse_import_database().map(Statement::ImportDatabase)
+            }
             other => Err(ParseError::Expected {
                 expected: "SELECT, INSERT, UPDATE, DELETE, TRUNCATE, CREATE, DROP, ALTER, \
                            COMMENT, REINDEX, SET, SHOW, RESET, BEGIN, COMMIT, ROLLBACK, SAVEPOINT, \
                            RELEASE, EXPLAIN, PREPARE, EXECUTE, GRANT, REVOKE, DEALLOCATE, \
                            LISTEN, NOTIFY, UNLISTEN, COPY, DESCRIBE, MERGE, CHECKPOINT, \
-                           or SUMMARIZE",
+                           SUMMARIZE, EXPORT, or IMPORT",
                 found: other,
                 offset: head.span.start_usize(),
             }),

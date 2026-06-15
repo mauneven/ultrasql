@@ -487,6 +487,8 @@ where
             | LogicalPlan::SetVariable { .. }
             | LogicalPlan::Describe { .. }
             | LogicalPlan::Checkpoint { .. }
+            | LogicalPlan::ExportDatabase { .. }
+            | LogicalPlan::ImportDatabase { .. }
             | LogicalPlan::SetRole { .. }
             | LogicalPlan::Listen { .. }
             | LogicalPlan::Notify { .. }

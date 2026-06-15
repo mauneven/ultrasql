@@ -112,6 +112,8 @@ fn infer_into(
         | LogicalPlan::Describe { .. }
         | LogicalPlan::Summarize { .. }
         | LogicalPlan::Checkpoint { .. }
+        | LogicalPlan::ExportDatabase { .. }
+        | LogicalPlan::ImportDatabase { .. }
         | LogicalPlan::SetRole { .. }
         | LogicalPlan::Listen { .. }
         | LogicalPlan::Notify { .. }
@@ -531,6 +533,8 @@ pub(super) fn walk_plan_exprs<F: FnMut(&ScalarExpr)>(plan: &LogicalPlan, f: &mut
         | LogicalPlan::Describe { .. }
         | LogicalPlan::Summarize { .. }
         | LogicalPlan::Checkpoint { .. }
+        | LogicalPlan::ExportDatabase { .. }
+        | LogicalPlan::ImportDatabase { .. }
         | LogicalPlan::SetRole { .. }
         | LogicalPlan::Listen { .. }
         | LogicalPlan::Notify { .. }

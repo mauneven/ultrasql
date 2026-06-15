@@ -487,6 +487,8 @@ pub(crate) fn row_description_for_plan_with_formats(
             | LogicalPlan::RollbackPrepared { .. }
             | LogicalPlan::SetTransaction { .. }
             | LogicalPlan::Checkpoint { .. }
+            | LogicalPlan::ExportDatabase { .. }
+            | LogicalPlan::ImportDatabase { .. }
             | LogicalPlan::Listen { .. }
             | LogicalPlan::Notify { .. }
             | LogicalPlan::Unlisten { .. }

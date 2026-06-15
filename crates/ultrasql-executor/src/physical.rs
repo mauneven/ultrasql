@@ -212,6 +212,8 @@ pub fn build_operator(
         | LogicalPlan::SetTransaction { .. }
         | LogicalPlan::SetVariable { .. }
         | LogicalPlan::Checkpoint { .. }
+        | LogicalPlan::ExportDatabase { .. }
+        | LogicalPlan::ImportDatabase { .. }
         | LogicalPlan::SetRole { .. } => Err(BuildError::Unsupported(
             "session-control statements are dispatched outside the operator pipeline",
         )),

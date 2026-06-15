@@ -289,6 +289,8 @@ fn walk_plan_for_max_param(plan: &LogicalPlan, max_idx: &mut u32) {
         | LogicalPlan::Describe { .. }
         | LogicalPlan::Summarize { .. }
         | LogicalPlan::Checkpoint { .. }
+        | LogicalPlan::ExportDatabase { .. }
+        | LogicalPlan::ImportDatabase { .. }
         | LogicalPlan::SetRole { .. }
         | LogicalPlan::Listen { .. }
         | LogicalPlan::Notify { .. }

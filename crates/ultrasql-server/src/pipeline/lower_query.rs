@@ -358,6 +358,8 @@ fn lower_query_inner(
         | LogicalPlan::SetVariable { .. }
         | LogicalPlan::Describe { .. }
         | LogicalPlan::Checkpoint { .. }
+        | LogicalPlan::ExportDatabase { .. }
+        | LogicalPlan::ImportDatabase { .. }
         | LogicalPlan::SetRole { .. } => Err(ServerError::Unsupported(
             "session control reached operator lowerer; expected direct dispatch path",
         )),
@@ -764,6 +766,8 @@ fn profile_operator_name(plan: &LogicalPlan) -> &'static str {
         LogicalPlan::Describe { .. } => "Describe",
         LogicalPlan::Summarize { .. } => "Summarize",
         LogicalPlan::Checkpoint { .. } => "Checkpoint",
+        LogicalPlan::ExportDatabase { .. } => "ExportDatabase",
+        LogicalPlan::ImportDatabase { .. } => "ImportDatabase",
         LogicalPlan::SetRole { .. } => "SetRole",
         LogicalPlan::Explain { .. } => "Explain",
         LogicalPlan::Listen { .. } => "Listen",

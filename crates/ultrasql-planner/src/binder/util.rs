@@ -244,6 +244,8 @@ pub(super) fn plan_contains_outer_column(plan: &LogicalPlan) -> bool {
         | LogicalPlan::Describe { .. }
         | LogicalPlan::Summarize { .. }
         | LogicalPlan::Checkpoint { .. }
+        | LogicalPlan::ExportDatabase { .. }
+        | LogicalPlan::ImportDatabase { .. }
         | LogicalPlan::SetRole { .. }
         | LogicalPlan::Listen { .. }
         | LogicalPlan::Notify { .. }

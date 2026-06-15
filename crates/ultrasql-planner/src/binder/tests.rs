@@ -233,6 +233,26 @@ fn binds_checkpoint_as_empty_session_control_plan() {
 }
 
 #[test]
+fn binds_export_database_as_empty_admin_plan() {
+    let plan = parse_bind_ok("EXPORT DATABASE TO '/tmp/ultra-dump'");
+    let LogicalPlan::ExportDatabase { path, schema } = plan else {
+        panic!("expected ExportDatabase plan");
+    };
+    assert_eq!(path, "/tmp/ultra-dump");
+    assert!(schema.is_empty());
+}
+
+#[test]
+fn binds_import_database_as_empty_admin_plan() {
+    let plan = parse_bind_ok("IMPORT DATABASE FROM '/tmp/ultra-dump'");
+    let LogicalPlan::ImportDatabase { path, schema } = plan else {
+        panic!("expected ImportDatabase plan");
+    };
+    assert_eq!(path, "/tmp/ultra-dump");
+    assert!(schema.is_empty());
+}
+
+#[test]
 fn binds_explicit_public_dotted_table_name() {
     let schema = Schema::new([Field::required("id", DataType::Int32)]).expect("schema ok");
     let mut cat = InMemoryCatalog::new();
@@ -4531,6 +4551,8 @@ fn collect_window_funcs<'a>(plan: &'a LogicalPlan, out: &mut Vec<&'a LogicalWind
         | LogicalPlan::Describe { .. }
         | LogicalPlan::Summarize { .. }
         | LogicalPlan::Checkpoint { .. }
+        | LogicalPlan::ExportDatabase { .. }
+        | LogicalPlan::ImportDatabase { .. }
         | LogicalPlan::SetRole { .. }
         | LogicalPlan::Listen { .. }
         | LogicalPlan::Notify { .. }

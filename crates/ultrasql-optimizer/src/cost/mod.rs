@@ -355,6 +355,8 @@ impl<'s> CostModel<'s> {
             | LogicalPlan::Describe { .. }
             | LogicalPlan::Summarize { .. }
             | LogicalPlan::Checkpoint { .. }
+            | LogicalPlan::ExportDatabase { .. }
+            | LogicalPlan::ImportDatabase { .. }
             | LogicalPlan::SetRole { .. }
             | LogicalPlan::Listen { .. }
             | LogicalPlan::Notify { .. }

@@ -520,7 +520,12 @@ where
         if matches!(&plan, LogicalPlan::Describe { .. }) {
             return self.execute_describe(&plan, true, &[]);
         }
-
+        if matches!(&plan, LogicalPlan::ExportDatabase { .. }) {
+            return self.execute_export_database(&plan);
+        }
+        if matches!(&plan, LogicalPlan::ImportDatabase { .. }) {
+            return self.execute_import_database(&plan);
+        }
         // DDL is dispatched ahead of operator lowering: it never produces
         // rows, so the lowerer would only round-trip it through an
         // unreachable arm. DDL inside an explicit transaction is
@@ -555,6 +560,8 @@ where
                 | LogicalPlan::DropSequence { .. }
                 | LogicalPlan::Comment { .. }
                 | LogicalPlan::Checkpoint { .. }
+                | LogicalPlan::ExportDatabase { .. }
+                | LogicalPlan::ImportDatabase { .. }
                 | LogicalPlan::DropTable { .. }
                 | LogicalPlan::AlterTable { .. }
                 | LogicalPlan::Truncate { .. }
@@ -636,6 +643,12 @@ where
             }
             LogicalPlan::Checkpoint { .. } => {
                 return self.execute_checkpoint(&plan);
+            }
+            LogicalPlan::ExportDatabase { .. } => {
+                return self.execute_export_database(&plan);
+            }
+            LogicalPlan::ImportDatabase { .. } => {
+                return self.execute_import_database(&plan);
             }
             LogicalPlan::DropTable { .. } => {
                 return self.execute_drop_table(&plan);
@@ -723,6 +736,8 @@ where
                 | LogicalPlan::DropSequence { .. }
                 | LogicalPlan::Comment { .. }
                 | LogicalPlan::Checkpoint { .. }
+                | LogicalPlan::ExportDatabase { .. }
+                | LogicalPlan::ImportDatabase { .. }
                 | LogicalPlan::DropTable { .. }
                 | LogicalPlan::AlterTable { .. }
                 | LogicalPlan::Truncate { .. }
@@ -767,6 +782,8 @@ where
             LogicalPlan::DropSequence { .. } => self.execute_drop_sequence(plan),
             LogicalPlan::Comment { .. } => self.execute_comment(plan, catalog_snapshot),
             LogicalPlan::Checkpoint { .. } => self.execute_checkpoint(plan),
+            LogicalPlan::ExportDatabase { .. } => self.execute_export_database(plan),
+            LogicalPlan::ImportDatabase { .. } => self.execute_import_database(plan),
             LogicalPlan::DropTable { .. } => self.execute_drop_table(plan),
             LogicalPlan::AlterTable { .. } => self.execute_alter_table(plan, catalog_snapshot),
             LogicalPlan::Truncate { .. } => self.execute_truncate(plan, catalog_snapshot),

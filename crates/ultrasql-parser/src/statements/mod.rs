@@ -4,6 +4,7 @@
 //! one SQL statement family. The top-level dispatch in `parser.rs` routes
 //! to these methods based on the leading keyword.
 
+pub(crate) mod admin;
 pub(crate) mod alter_table;
 pub(crate) mod comment;
 pub(crate) mod copy;

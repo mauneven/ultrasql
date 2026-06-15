@@ -1247,6 +1247,26 @@ pub enum LogicalPlan {
         schema: Schema,
     },
 
+    /// `EXPORT DATABASE TO 'path'` — write a deterministic logical dump.
+    ///
+    /// `schema` is always [`Schema::empty`].
+    ExportDatabase {
+        /// Destination directory path.
+        path: String,
+        /// Always [`Schema::empty`].
+        schema: Schema,
+    },
+
+    /// `IMPORT DATABASE FROM 'path'` — restore a deterministic logical dump.
+    ///
+    /// `schema` is always [`Schema::empty`].
+    ImportDatabase {
+        /// Source directory path.
+        path: String,
+        /// Always [`Schema::empty`].
+        schema: Schema,
+    },
+
     /// `BEGIN [TRANSACTION]` — open an explicit transaction block.
     ///
     /// The planner produces this variant unconditionally; the server
@@ -2057,6 +2077,8 @@ impl LogicalPlan {
                 | Self::DropSequence { .. }
                 | Self::Comment { .. }
                 | Self::Checkpoint { .. }
+                | Self::ExportDatabase { .. }
+                | Self::ImportDatabase { .. }
                 | Self::Begin { .. }
                 | Self::Commit { .. }
                 | Self::Rollback { .. }
@@ -2133,6 +2155,8 @@ impl LogicalPlan {
             | Self::DropSequence { .. }
             | Self::Comment { .. }
             | Self::Checkpoint { .. }
+            | Self::ExportDatabase { .. }
+            | Self::ImportDatabase { .. }
             | Self::Begin { .. }
             | Self::Commit { .. }
             | Self::Rollback { .. }
@@ -2200,6 +2224,8 @@ impl LogicalPlan {
             | Self::DropSequence { schema, .. }
             | Self::Comment { schema, .. }
             | Self::Checkpoint { schema }
+            | Self::ExportDatabase { schema, .. }
+            | Self::ImportDatabase { schema, .. }
             | Self::Begin { schema, .. }
             | Self::Commit { schema }
             | Self::Rollback { schema }
@@ -3312,6 +3338,14 @@ impl LogicalPlan {
             Self::Checkpoint { .. } => {
                 out.push_str(&pad);
                 out.push_str("Checkpoint\n");
+            }
+            Self::ExportDatabase { path, .. } => {
+                out.push_str(&pad);
+                let _ = fmt::write(out, format_args!("ExportDatabase: {path}\n"));
+            }
+            Self::ImportDatabase { path, .. } => {
+                out.push_str(&pad);
+                let _ = fmt::write(out, format_args!("ImportDatabase: {path}\n"));
             }
             Self::SetRole { role_name, .. } => {
                 out.push_str(&pad);

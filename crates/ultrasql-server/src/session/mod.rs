@@ -24,6 +24,7 @@ mod ddl;
 mod embedded;
 mod execute;
 mod explain;
+mod export_import;
 mod ext;
 mod io;
 mod jsonb_ingest;

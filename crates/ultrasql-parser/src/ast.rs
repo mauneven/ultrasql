@@ -45,6 +45,10 @@ pub enum Statement {
     Describe(DescribeStmt),
     /// `SUMMARIZE table_name`.
     Summarize(SummarizeStmt),
+    /// `EXPORT DATABASE TO 'path'`.
+    ExportDatabase(ExportDatabaseStmt),
+    /// `IMPORT DATABASE FROM 'path'`.
+    ImportDatabase(ImportDatabaseStmt),
     /// `CHECKPOINT`.
     Checkpoint {
         /// Source span.
@@ -213,6 +217,8 @@ impl Statement {
             Self::Truncate(s) => s.span,
             Self::Describe(s) => s.span,
             Self::Summarize(s) => s.span,
+            Self::ExportDatabase(s) => s.span,
+            Self::ImportDatabase(s) => s.span,
             Self::Checkpoint { span } => *span,
             Self::Begin { span, .. } | Self::Commit { span } | Self::Rollback { span } => *span,
             Self::CreateTable(s) => s.span,
@@ -451,6 +457,24 @@ pub enum DescribeObjectKind {
 pub struct SummarizeStmt {
     /// Table whose columns should be summarized.
     pub name: ObjectName,
+    /// Source span of the entire statement.
+    pub span: Span,
+}
+
+/// `EXPORT DATABASE TO 'path'`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ExportDatabaseStmt {
+    /// Destination directory path literal.
+    pub path: String,
+    /// Source span of the entire statement.
+    pub span: Span,
+}
+
+/// `IMPORT DATABASE FROM 'path'`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ImportDatabaseStmt {
+    /// Source directory path literal.
+    pub path: String,
     /// Source span of the entire statement.
     pub span: Span,
 }

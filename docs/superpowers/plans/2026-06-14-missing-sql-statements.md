@@ -123,16 +123,16 @@ Docs commits happen only after passing implementation tests for that family.
 **Files:**
 - Add parser/admin statement module.
 - Add logical plans for export/import.
-- Add deterministic dump format module under `crates/ultrasql-server/src/export_import.rs`.
+- Add deterministic dump format module under `crates/ultrasql-server/src/session/export_import.rs`.
 - Add `crates/ultrasql-server/tests/export_import_round_trip.rs`.
 - Add docs page for dump format.
 
-- [ ] Format: directory with `manifest.json`, `schema.sql`, one data file per table in deterministic order, and `checksums.json`.
-- [ ] Export only after a checkpoint or equivalent read-consistent snapshot fence.
-- [ ] Include tables, indexes, materialized views, sequences, schemas, comments, and supported metadata.
-- [ ] Import into empty database only in first implementation; reject non-empty targets.
-- [ ] Validate manifest version and checksums.
-- [ ] Round-trip schema/data/query results.
+- [x] Format: directory with `manifest.json`, `schema.sql`, one data file per table in deterministic order, and `checksums.json`.
+- [x] Export from a repeatable-read heap snapshot.
+- [x] Include ordinary tables, plain btree indexes, standalone sequences, schemas, and supported metadata; reject unsupported metadata explicitly.
+- [x] Import into empty database only in first implementation; reject non-empty targets.
+- [x] Validate manifest version and checksums.
+- [x] Round-trip schema/data/query results.
 
 ## Phase 6: SET VARIABLE
 
