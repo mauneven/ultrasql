@@ -42,6 +42,14 @@ fn collect_serializable_read_locks(
                 out.push(relation_predicate_tag(entry));
             }
         }
+        LogicalPlan::Summarize {
+            table, namespace, ..
+        } => {
+            let key = ultrasql_catalog::table_lookup_key(namespace, table);
+            if let Some(entry) = catalog_snapshot.tables.get(&key) {
+                out.push(relation_predicate_tag(entry));
+            }
+        }
         LogicalPlan::Filter { input, predicate } => {
             if let Some(tags) = column_range_tags_for_filter(input, predicate, catalog_snapshot) {
                 out.extend(tags);

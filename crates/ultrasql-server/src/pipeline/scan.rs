@@ -1,7 +1,10 @@
 //! Scan-lowering helpers and table-function scan.
 
+use std::cmp::Ordering;
+use std::collections::HashSet;
 use std::sync::Arc;
 
+use num_traits::ToPrimitive;
 use serde_json::Value as JsonValue;
 use ultrasql_catalog::TableEntry;
 use ultrasql_core::{DataType, Field, RelationId, Schema, Value};
@@ -24,6 +27,237 @@ use super::external_scan::{
 use super::json_table_scan::lower_json_table_scan;
 use super::parquet_scan::ParquetPredicate;
 use super::xml_table_scan::lower_xml_table_scan;
+
+#[derive(Clone, Debug, Default)]
+struct SummaryColumnStats {
+    null_count: u64,
+    unique_values: HashSet<Value>,
+    min: Option<Value>,
+    max: Option<Value>,
+    numeric_count: u64,
+    numeric_mean: f64,
+    numeric_m2: f64,
+}
+
+impl SummaryColumnStats {
+    fn observe(&mut self, value: &Value) -> Result<(), ServerError> {
+        if matches!(value, Value::Null) {
+            self.null_count = checked_summary_count_add(self.null_count, 1, "SUMMARIZE null")?;
+            return Ok(());
+        }
+        self.unique_values.insert(value.clone());
+        if self
+            .min
+            .as_ref()
+            .is_some_and(|current| summary_value_cmp(value, current) == Some(Ordering::Less))
+            || (self.min.is_none() && summary_value_cmp(value, value).is_some())
+        {
+            self.min = Some(value.clone());
+        }
+        if self
+            .max
+            .as_ref()
+            .is_some_and(|current| summary_value_cmp(value, current) == Some(Ordering::Greater))
+            || (self.max.is_none() && summary_value_cmp(value, value).is_some())
+        {
+            self.max = Some(value.clone());
+        }
+        if let Some(numeric) = summary_numeric_value(value) {
+            self.observe_numeric(numeric)?;
+        }
+        Ok(())
+    }
+
+    fn observe_numeric(&mut self, value: f64) -> Result<(), ServerError> {
+        self.numeric_count = checked_summary_count_add(self.numeric_count, 1, "SUMMARIZE numeric")?;
+        let count = self
+            .numeric_count
+            .to_f64()
+            .ok_or_else(|| summary_count_overflow("SUMMARIZE numeric"))?;
+        let delta = value - self.numeric_mean;
+        self.numeric_mean += delta / count;
+        let delta2 = value - self.numeric_mean;
+        self.numeric_m2 += delta * delta2;
+        Ok(())
+    }
+
+    fn avg(&self) -> Value {
+        if self.numeric_count == 0 {
+            Value::Null
+        } else {
+            Value::Float64(self.numeric_mean)
+        }
+    }
+
+    fn stddev(&self) -> Result<Value, ServerError> {
+        if self.numeric_count < 2 {
+            return Ok(Value::Null);
+        }
+        let divisor = self
+            .numeric_count
+            .checked_sub(1)
+            .and_then(|count| count.to_f64())
+            .ok_or_else(|| summary_count_overflow("SUMMARIZE stddev"))?;
+        Ok(Value::Float64((self.numeric_m2 / divisor).sqrt()))
+    }
+}
+
+pub(super) fn lower_summarize(
+    table: &str,
+    namespace: &str,
+    target_schema: &Schema,
+    schema: &Schema,
+    ctx: &LowerCtx<'_>,
+) -> Result<Box<dyn Operator>, ServerError> {
+    let table_key = ultrasql_catalog::table_lookup_key(namespace, table);
+    let entry = ctx.catalog_snapshot.tables.get(&table_key).ok_or_else(|| {
+        ServerError::Plan(ultrasql_planner::PlanError::TableNotFound(table.to_owned()))
+    })?;
+    if ctx
+        .row_security
+        .get(&entry.oid)
+        .is_some_and(|runtime| runtime.enabled)
+    {
+        return Err(ServerError::UnsupportedOwned(format!(
+            "SUMMARIZE on row-level security table {namespace}.{table}"
+        )));
+    }
+
+    let relation = RelationId(entry.oid);
+    let block_count = ctx.heap.block_count(relation).max(entry.n_blocks);
+    let codec = RowCodec::new(entry.schema.clone());
+    let mut row_count = 0_u64;
+    let mut stats = vec![SummaryColumnStats::default(); target_schema.len()];
+    for tuple in ctx
+        .heap
+        .scan_visible(relation, block_count, &ctx.snapshot, ctx.oracle.as_ref())
+    {
+        let tuple = tuple.map_err(|err| {
+            ServerError::Ddl(format!(
+                "SUMMARIZE heap scan {}.{}: {err}",
+                namespace, table
+            ))
+        })?;
+        let row = codec.decode(&tuple.data).map_err(|err| {
+            ServerError::Ddl(format!(
+                "SUMMARIZE row decode {}.{}: {err}",
+                namespace, table
+            ))
+        })?;
+        row_count = checked_summary_count_add(row_count, 1, "SUMMARIZE row")?;
+        if row.len() != stats.len() {
+            return Err(ServerError::Ddl(format!(
+                "SUMMARIZE row width {} does not match schema width {}",
+                row.len(),
+                stats.len()
+            )));
+        }
+        for (idx, value) in row.iter().enumerate() {
+            stats[idx].observe(value)?;
+        }
+    }
+
+    let row_count_i64 = summary_u64_to_i64(row_count, "SUMMARIZE row")?;
+    let mut rows = Vec::with_capacity(target_schema.len());
+    for (field, column_stats) in target_schema.fields().iter().zip(&stats) {
+        rows.push(vec![
+            Value::Text(field.name.clone()),
+            Value::Text(field.data_type.to_string()),
+            Value::Int64(row_count_i64),
+            Value::Int64(summary_u64_to_i64(
+                column_stats.null_count,
+                "SUMMARIZE null",
+            )?),
+            column_stats
+                .min
+                .as_ref()
+                .map_or(Value::Null, summary_value_text),
+            column_stats
+                .max
+                .as_ref()
+                .map_or(Value::Null, summary_value_text),
+            Value::Int64(summary_usize_to_i64(
+                column_stats.unique_values.len(),
+                "SUMMARIZE unique",
+            )?),
+            column_stats.avg(),
+            column_stats.stddev()?,
+        ]);
+    }
+    let batch = build_batch(&rows, schema)?;
+    Ok(Box::new(MemTableScan::new(schema.clone(), vec![batch])))
+}
+
+fn summary_count_overflow(context: &str) -> ServerError {
+    ServerError::Execute(ultrasql_executor::ExecError::NumericFieldOverflow(format!(
+        "{context} count overflow"
+    )))
+}
+
+fn checked_summary_count_add(left: u64, right: u64, context: &str) -> Result<u64, ServerError> {
+    left.checked_add(right)
+        .ok_or_else(|| summary_count_overflow(context))
+}
+
+fn summary_u64_to_i64(value: u64, context: &str) -> Result<i64, ServerError> {
+    i64::try_from(value).map_err(|_| summary_count_overflow(context))
+}
+
+fn summary_usize_to_i64(value: usize, context: &str) -> Result<i64, ServerError> {
+    i64::try_from(value).map_err(|_| summary_count_overflow(context))
+}
+
+fn summary_value_text(value: &Value) -> Value {
+    Value::Text(value.to_string())
+}
+
+fn summary_numeric_value(value: &Value) -> Option<f64> {
+    match value {
+        Value::Int16(value) => Some(f64::from(*value)),
+        Value::Int32(value) => Some(f64::from(*value)),
+        Value::Int64(value) => value.to_f64(),
+        Value::Float32(value) => Some(f64::from(*value)),
+        Value::Float64(value) => Some(*value),
+        Value::Decimal { value, scale } => Some(value.to_f64()? / 10_f64.powi(*scale)),
+        Value::Money(value) => value.to_f64().map(|cents| cents / 100.0),
+        _ => None,
+    }
+}
+
+#[allow(clippy::match_same_arms)]
+fn summary_value_cmp(left: &Value, right: &Value) -> Option<Ordering> {
+    match (left, right) {
+        (Value::Bool(left), Value::Bool(right)) => Some(left.cmp(right)),
+        (Value::Int16(left), Value::Int16(right)) => Some(left.cmp(right)),
+        (Value::Int32(left), Value::Int32(right)) => Some(left.cmp(right)),
+        (Value::Int64(left), Value::Int64(right)) => Some(left.cmp(right)),
+        (Value::Oid(left), Value::Oid(right))
+        | (Value::RegClass(left), Value::RegClass(right))
+        | (Value::RegType(left), Value::RegType(right)) => left.raw().partial_cmp(&right.raw()),
+        (Value::PgLsn(left), Value::PgLsn(right)) => left.raw().partial_cmp(&right.raw()),
+        (Value::Float32(left), Value::Float32(right)) => left.partial_cmp(right),
+        (Value::Float64(left), Value::Float64(right)) => left.partial_cmp(right),
+        (Value::Text(left), Value::Text(right))
+        | (Value::Char(left), Value::Char(right))
+        | (Value::Json(left), Value::Json(right))
+        | (Value::Jsonb(left), Value::Jsonb(right))
+        | (Value::Xml(left), Value::Xml(right)) => Some(left.cmp(right)),
+        (Value::Bytea(left), Value::Bytea(right)) => Some(left.cmp(right)),
+        (Value::Timestamp(left), Value::Timestamp(right))
+        | (Value::TimestampTz(left), Value::TimestampTz(right))
+        | (Value::Time(left), Value::Time(right)) => Some(left.cmp(right)),
+        (Value::TimeTz { .. }, Value::TimeTz { .. }) => {
+            left.to_string().partial_cmp(&right.to_string())
+        }
+        (Value::Date(left), Value::Date(right)) => Some(left.cmp(right)),
+        (Value::Uuid(left), Value::Uuid(right)) => Some(left.cmp(right)),
+        (Value::Decimal { .. }, Value::Decimal { .. }) => {
+            summary_numeric_value(left)?.partial_cmp(&summary_numeric_value(right)?)
+        }
+        (Value::Money(left), Value::Money(right)) => Some(left.cmp(right)),
+        _ => None,
+    }
+}
 
 pub(super) fn lower_catalog_or_sample_scan(
     table: &str,

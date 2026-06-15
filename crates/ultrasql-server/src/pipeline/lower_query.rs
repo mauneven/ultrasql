@@ -31,7 +31,7 @@ use super::modify::{
 };
 use super::saturate_row_count;
 use super::scan::{
-    lower_catalog_or_sample_scan, lower_function_scan, try_lower_read_csv_filter,
+    lower_catalog_or_sample_scan, lower_function_scan, lower_summarize, try_lower_read_csv_filter,
     try_lower_read_csv_project, try_lower_read_parquet_filter, try_lower_read_parquet_project,
 };
 use super::time_partition::try_lower_time_partition_filter_scan;
@@ -559,9 +559,12 @@ fn lower_query_inner(
                 schema.clone(),
             )))
         }
-        LogicalPlan::Summarize { .. } => Err(ServerError::Unsupported(
-            "SUMMARIZE reached operator lowerer; expected session dispatch path",
-        )),
+        LogicalPlan::Summarize {
+            table,
+            namespace,
+            target_schema,
+            schema,
+        } => lower_summarize(table, namespace, target_schema, schema, ctx),
     }
 }
 
