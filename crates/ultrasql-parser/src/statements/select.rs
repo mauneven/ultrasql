@@ -23,8 +23,8 @@
 use crate::ast::{
     Cte, Distinct, Expr, Identifier, JoinCondition, JoinOp, JsonTableColumn, JsonTableColumnKind,
     Literal, LockStrength, LockWaitPolicy, LockingClause, NullsOrder, ObjectName, OrderItem,
-    SelectItem, SelectStmt, SetOp, SetOpTail, SetQuantifier, SortDirection, TableRef,
-    XmlTableColumn, XmlTableColumnKind,
+    PivotAggregate, PivotValue, SelectItem, SelectStmt, SetOp, SetOpTail, SetQuantifier,
+    SortDirection, TableRef, UnpivotColumn, XmlTableColumn, XmlTableColumnKind,
 };
 use crate::parser::{ParseError, Parser};
 use crate::span::Span;
@@ -366,7 +366,8 @@ impl Parser<'_> {
             self.peek()?.kind,
             TokenKind::String | TokenKind::EscapedString | TokenKind::DollarString
         ) {
-            return self.parse_file_table_factor();
+            let factor = self.parse_file_table_factor()?;
+            return self.parse_table_transform_suffix(factor);
         }
 
         if self.peek()?.kind == TokenKind::LParen {
@@ -395,12 +396,13 @@ impl Parser<'_> {
                 };
 
                 let end = column_aliases.last().map_or(alias.span.end, |a| a.span.end);
-                return Ok(TableRef::Subquery {
+                let result = TableRef::Subquery {
                     select: Box::new(select),
                     alias,
                     column_aliases,
                     span: Span::new(lp.span.start, end),
-                });
+                };
+                return self.parse_table_transform_suffix(result);
             }
 
             // Parenthesised table reference / joined table.
@@ -431,11 +433,149 @@ impl Parser<'_> {
                 }
             }
 
-            return Ok(result);
+            return self.parse_table_transform_suffix(result);
         }
 
         // Named table reference.
-        self.parse_table_ref()
+        let factor = self.parse_table_ref()?;
+        self.parse_table_transform_suffix(factor)
+    }
+
+    fn parse_table_transform_suffix(
+        &mut self,
+        mut input: TableRef,
+    ) -> Result<TableRef, ParseError> {
+        loop {
+            match self.peek()?.kind {
+                TokenKind::KwPivot => {
+                    input = self.parse_pivot_suffix(input)?;
+                }
+                TokenKind::KwUnpivot => {
+                    input = self.parse_unpivot_suffix(input)?;
+                }
+                _ => return Ok(input),
+            }
+        }
+    }
+
+    fn parse_pivot_suffix(&mut self, input: TableRef) -> Result<TableRef, ParseError> {
+        let start = input.ref_span().start;
+        self.expect(TokenKind::KwPivot, "PIVOT")?;
+        self.expect(TokenKind::LParen, "(")?;
+        let aggregate = self.parse_pivot_aggregate()?;
+        self.expect(TokenKind::KwFor, "FOR")?;
+        let value_column = self.parse_identifier()?;
+        self.expect(TokenKind::KwIn, "IN")?;
+        self.expect(TokenKind::LParen, "(")?;
+        let mut pivot_values = Vec::new();
+        loop {
+            pivot_values.push(self.parse_pivot_value()?);
+            if self.peek()?.kind == TokenKind::Comma {
+                self.advance()?;
+            } else {
+                break;
+            }
+        }
+        self.expect(TokenKind::RParen, ")")?;
+        let rp = self.expect(TokenKind::RParen, ")")?;
+        Ok(TableRef::Pivot {
+            input: Box::new(input),
+            aggregate,
+            value_column,
+            pivot_values,
+            span: Span::new(start, rp.span.end),
+        })
+    }
+
+    fn parse_pivot_aggregate(&mut self) -> Result<PivotAggregate, ParseError> {
+        let function = self.parse_identifier()?;
+        let start = function.span.start;
+        self.expect(TokenKind::LParen, "(")?;
+        let arg = if self.peek()?.kind == TokenKind::Star {
+            self.advance()?;
+            None
+        } else {
+            Some(self.parse_expr()?)
+        };
+        let rp = self.expect(TokenKind::RParen, ")")?;
+        Ok(PivotAggregate {
+            function,
+            arg,
+            span: Span::new(start, rp.span.end),
+        })
+    }
+
+    fn parse_pivot_value(&mut self) -> Result<PivotValue, ParseError> {
+        let value = self.parse_expr()?;
+        let start = value.span().start;
+        let alias = if self.match_kw(TokenKind::KwAs) {
+            Some(self.parse_alias_identifier()?)
+        } else {
+            None
+        };
+        let end = alias.as_ref().map_or(value.span().end, |a| a.span.end);
+        Ok(PivotValue {
+            value,
+            alias,
+            span: Span::new(start, end),
+        })
+    }
+
+    fn parse_unpivot_suffix(&mut self, input: TableRef) -> Result<TableRef, ParseError> {
+        let start = input.ref_span().start;
+        self.expect(TokenKind::KwUnpivot, "UNPIVOT")?;
+        let include_nulls = if self.match_kw(TokenKind::KwInclude) {
+            self.expect(TokenKind::KwNulls, "NULLS")?;
+            true
+        } else if self.match_kw(TokenKind::KwExclude) {
+            self.expect(TokenKind::KwNulls, "NULLS")?;
+            false
+        } else {
+            false
+        };
+        self.expect(TokenKind::LParen, "(")?;
+        let value_column = self.parse_identifier()?;
+        self.expect(TokenKind::KwFor, "FOR")?;
+        let name_column = self.parse_identifier()?;
+        self.expect(TokenKind::KwIn, "IN")?;
+        self.expect(TokenKind::LParen, "(")?;
+        let mut columns = Vec::new();
+        loop {
+            columns.push(self.parse_unpivot_column()?);
+            if self.peek()?.kind == TokenKind::Comma {
+                self.advance()?;
+            } else {
+                break;
+            }
+        }
+        self.expect(TokenKind::RParen, ")")?;
+        let rp = self.expect(TokenKind::RParen, ")")?;
+        Ok(TableRef::Unpivot {
+            input: Box::new(input),
+            value_column,
+            name_column,
+            columns,
+            include_nulls,
+            span: Span::new(start, rp.span.end),
+        })
+    }
+
+    fn parse_unpivot_column(&mut self) -> Result<UnpivotColumn, ParseError> {
+        let column = self.parse_identifier()?;
+        let start = column.span.start;
+        let label = if self.match_kw(TokenKind::KwAs) {
+            Some(self.parse_expr()?)
+        } else {
+            None
+        };
+        let end = label
+            .as_ref()
+            .map_or(column.span.end, |expr| expr.span().end);
+        Ok(UnpivotColumn {
+            column,
+            label,
+            span: Span::new(start, end),
+        })
     }
 
     fn parse_file_table_factor(&mut self) -> Result<TableRef, ParseError> {
@@ -1190,6 +1330,8 @@ impl TableRefSpan for TableRef {
             | Self::Subquery { span, .. }
             | Self::Function { span, .. }
             | Self::JsonTable { span, .. }
+            | Self::Pivot { span, .. }
+            | Self::Unpivot { span, .. }
             | Self::XmlTable { span, .. } => *span,
         }
     }
@@ -1411,6 +1553,69 @@ mod tests {
         let Statement::Select(s) = stmt else { panic!() };
         assert_eq!(s.from.len(), 1);
         assert!(matches!(s.from[0], TableRef::Named { .. }));
+    }
+
+    #[test]
+    fn select_pivot_table_factor_parses_aggregate_and_values() {
+        let stmt = parse(
+            "SELECT * FROM sales \
+             PIVOT (SUM(amount) FOR quarter IN ('Q1' AS q1, 'Q2' AS q2))",
+        );
+        let Statement::Select(s) = stmt else { panic!() };
+        let TableRef::Pivot {
+            aggregate,
+            value_column,
+            pivot_values,
+            ..
+        } = &s.from[0]
+        else {
+            panic!("expected PIVOT table ref");
+        };
+        assert_eq!(aggregate.function.value, "sum");
+        assert!(aggregate.arg.is_some());
+        assert_eq!(value_column.value, "quarter");
+        assert_eq!(pivot_values.len(), 2);
+        assert_eq!(pivot_values[0].alias.as_ref().expect("alias").value, "q1");
+    }
+
+    #[test]
+    fn select_unpivot_table_factor_parses_columns_and_labels() {
+        let stmt = parse(
+            "SELECT * FROM quarterly \
+             UNPIVOT INCLUDE NULLS (amount FOR quarter IN (q1 AS 'Q1', q2 AS 'Q2'))",
+        );
+        let Statement::Select(s) = stmt else { panic!() };
+        let TableRef::Unpivot {
+            value_column,
+            name_column,
+            columns,
+            include_nulls,
+            ..
+        } = &s.from[0]
+        else {
+            panic!("expected UNPIVOT table ref");
+        };
+        assert_eq!(value_column.value, "amount");
+        assert_eq!(name_column.value, "quarter");
+        assert!(*include_nulls);
+        assert_eq!(columns.len(), 2);
+        assert_eq!(columns[0].column.value, "q1");
+        assert!(columns[0].label.is_some());
+    }
+
+    #[test]
+    fn select_pivot_rejects_multiple_aggregate_arguments() {
+        let err = parse_err(
+            "SELECT * FROM sales \
+             PIVOT (SUM(amount, tax) FOR quarter IN ('Q1' AS q1))",
+        );
+        assert!(err.to_string().contains("expected )"));
+    }
+
+    #[test]
+    fn select_unpivot_rejects_empty_column_list() {
+        let err = parse_err("SELECT * FROM quarterly UNPIVOT (amount FOR quarter IN ())");
+        assert!(err.to_string().contains("expected identifier"));
     }
 
     #[test]
@@ -1860,6 +2065,7 @@ mod tests {
             | TableRef::Function { .. }
             | TableRef::JsonTable { .. }
             | TableRef::XmlTable { .. } => true,
+            TableRef::Pivot { input, .. } | TableRef::Unpivot { input, .. } => is_left_deep(input),
             TableRef::Join { left, right, .. } => {
                 // Right must be a leaf.
                 matches!(
@@ -1868,6 +2074,8 @@ mod tests {
                         | TableRef::Subquery { .. }
                         | TableRef::Function { .. }
                         | TableRef::JsonTable { .. }
+                        | TableRef::Pivot { .. }
+                        | TableRef::Unpivot { .. }
                         | TableRef::XmlTable { .. }
                 ) && is_left_deep(left)
             }

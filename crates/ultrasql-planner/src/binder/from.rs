@@ -111,6 +111,8 @@ fn table_ref_join_depth(table_ref: &TableRef) -> usize {
         | TableRef::Subquery { .. }
         | TableRef::Function { .. }
         | TableRef::JsonTable { .. }
+        | TableRef::Pivot { .. }
+        | TableRef::Unpivot { .. }
         | TableRef::XmlTable { .. } => 0,
     }
 }
@@ -221,6 +223,8 @@ fn bind_table_ref(
             cte_catalog,
             scope,
         ),
+        TableRef::Pivot { .. } => Err(PlanError::NotSupported("PIVOT table factor")),
+        TableRef::Unpivot { .. } => Err(PlanError::NotSupported("UNPIVOT table factor")),
         TableRef::XmlTable {
             context,
             row_path,

@@ -274,6 +274,8 @@ pub enum TokenKind {
     KwOuter,
     KwOver,
     KwPartition,
+    /// `PIVOT` — table-factor transform.
+    KwPivot,
     KwPlacing,
     KwPrecision,
     KwPrimary,
@@ -311,6 +313,8 @@ pub enum TokenKind {
     KwUnion,
     KwUnique,
     KwUnknown,
+    /// `UNPIVOT` — table-factor transform.
+    KwUnpivot,
     KwUpdate,
     KwUsing,
     KwValues,

@@ -1782,6 +1782,34 @@ pub enum TableRef {
         /// Source span.
         span: Span,
     },
+    /// `table PIVOT (agg(expr) FOR col IN (...))`.
+    Pivot {
+        /// Input table reference.
+        input: Box<Self>,
+        /// Aggregate applied to each pivot value.
+        aggregate: PivotAggregate,
+        /// Column whose values select the pivot bucket.
+        value_column: Identifier,
+        /// Literal pivot values and optional output aliases.
+        pivot_values: Vec<PivotValue>,
+        /// Source span.
+        span: Span,
+    },
+    /// `table UNPIVOT ([INCLUDE|EXCLUDE NULLS] value FOR name IN (...))`.
+    Unpivot {
+        /// Input table reference.
+        input: Box<Self>,
+        /// Output value column.
+        value_column: Identifier,
+        /// Output name column holding each unpivoted label.
+        name_column: Identifier,
+        /// Input columns to unpivot.
+        columns: Vec<UnpivotColumn>,
+        /// Whether NULL source values are retained.
+        include_nulls: bool,
+        /// Source span.
+        span: Span,
+    },
     /// SQL/XML `XMLTABLE(...)` table function.
     XmlTable {
         /// Input XML expression.
@@ -1795,6 +1823,39 @@ pub enum TableRef {
         /// Source span.
         span: Span,
     },
+}
+
+/// Aggregate call inside a `PIVOT` table-factor transform.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PivotAggregate {
+    /// Aggregate function name.
+    pub function: Identifier,
+    /// Aggregate argument, or `None` for `COUNT(*)`.
+    pub arg: Option<Expr>,
+    /// Source span.
+    pub span: Span,
+}
+
+/// One value inside a `PIVOT ... IN (...)` list.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PivotValue {
+    /// Pivot-key value expression.
+    pub value: Expr,
+    /// Optional output column alias.
+    pub alias: Option<Identifier>,
+    /// Source span.
+    pub span: Span,
+}
+
+/// One input column inside an `UNPIVOT ... IN (...)` list.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct UnpivotColumn {
+    /// Source column to unpivot.
+    pub column: Identifier,
+    /// Optional emitted label. Defaults to the column name.
+    pub label: Option<Expr>,
+    /// Source span.
+    pub span: Span,
 }
 
 /// One column declared inside a `JSON_TABLE ... COLUMNS (...)` clause.
