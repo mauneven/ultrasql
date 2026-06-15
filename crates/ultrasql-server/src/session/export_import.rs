@@ -3,7 +3,11 @@
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::fmt::Write as _;
 use std::fs::File;
-use std::io::{Read, Write as _};
+#[cfg(windows)]
+use std::fs::OpenOptions;
+use std::io::{self, Read, Write as _};
+#[cfg(windows)]
+use std::os::windows::fs::OpenOptionsExt;
 use std::path::{Component, Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -565,9 +569,38 @@ fn sync_parent_dir(path: &Path) -> Result<(), ServerError> {
 }
 
 fn sync_dir(path: &Path) -> Result<(), ServerError> {
-    File::open(path)
-        .and_then(|file| file.sync_all())
+    sync_dir_inner(path)
         .map_err(|err| ServerError::ddl(format!("sync directory {}: {err}", path.display())))
+}
+
+#[cfg(unix)]
+fn sync_dir_inner(path: &Path) -> io::Result<()> {
+    let dir = File::open(path)?;
+    match dir.sync_all() {
+        Ok(()) => Ok(()),
+        Err(err) if err.kind() == io::ErrorKind::InvalidInput => Ok(()),
+        Err(err) => Err(err),
+    }
+}
+
+#[cfg(windows)]
+fn sync_dir_inner(path: &Path) -> io::Result<()> {
+    const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+
+    let dir = OpenOptions::new()
+        .read(true)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+        .open(path)?;
+    match dir.sync_all() {
+        Ok(()) => Ok(()),
+        Err(err) if err.kind() == io::ErrorKind::InvalidInput => Ok(()),
+        Err(err) => Err(err),
+    }
+}
+
+#[cfg(all(not(unix), not(windows)))]
+fn sync_dir_inner(_path: &Path) -> io::Result<()> {
+    Ok(())
 }
 
 fn read_and_verify_dump(root: &Path) -> Result<(DumpManifest, HashSet<String>), ServerError> {
@@ -1036,4 +1069,16 @@ fn sanitize_file_component(value: &str) -> String {
 
 fn is_system_schema(schema: &str) -> bool {
     matches!(schema, "pg_catalog" | "information_schema")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sync_dir_accepts_existing_directory() {
+        let temp = tempfile::TempDir::new().expect("temp dir");
+
+        sync_dir(temp.path()).expect("sync temp dir");
+    }
 }
