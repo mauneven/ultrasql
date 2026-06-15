@@ -3,11 +3,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::fmt::Write as _;
 use std::fs::File;
-#[cfg(windows)]
-use std::fs::OpenOptions;
 use std::io::{self, Read, Write as _};
-#[cfg(windows)]
-use std::os::windows::fs::OpenOptionsExt;
 use std::path::{Component, Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -583,22 +579,7 @@ fn sync_dir_inner(path: &Path) -> io::Result<()> {
     }
 }
 
-#[cfg(windows)]
-fn sync_dir_inner(path: &Path) -> io::Result<()> {
-    const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
-
-    let dir = OpenOptions::new()
-        .read(true)
-        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
-        .open(path)?;
-    match dir.sync_all() {
-        Ok(()) => Ok(()),
-        Err(err) if err.kind() == io::ErrorKind::InvalidInput => Ok(()),
-        Err(err) => Err(err),
-    }
-}
-
-#[cfg(all(not(unix), not(windows)))]
+#[cfg(not(unix))]
 fn sync_dir_inner(_path: &Path) -> io::Result<()> {
     Ok(())
 }
