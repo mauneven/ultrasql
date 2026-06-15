@@ -170,11 +170,11 @@ Docs commits happen only after passing implementation tests for that family.
 - Execute through an internally generated aggregate plan or direct table scan summary operator.
 - Add `crates/ultrasql-server/tests/summarize_round_trip.rs`.
 
-- [ ] Support `SUMMARIZE table_name`.
-- [ ] Return per-column rows with `column_name`, `data_type`, `count`, `null_count`, `min`, `max`, `approx_unique`, `avg`, and `stddev` where meaningful.
-- [ ] Use exact `COUNT(DISTINCT)` if available for small test correctness; document cost.
-- [ ] Return `NULL` for unsupported stats by type instead of fake values.
-- [ ] Test numeric, text, bool, date/time, null-heavy, and empty tables.
+- [x] Support `SUMMARIZE table_name`.
+- [x] Return per-column rows with `column_name`, `data_type`, `row_count`, `null_count`, `min`, `max`, `unique_count`, `avg`, and `stddev` where meaningful.
+- [x] Use exact distinct counts for correctness; document cost.
+- [x] Return `NULL` for unsupported stats by type instead of fake values.
+- [x] Test numeric, text, bool, date/time, null-heavy, and empty tables.
 
 ## Final Verification
 
