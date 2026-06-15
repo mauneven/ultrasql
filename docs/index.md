@@ -16,6 +16,8 @@ candidate path until the v1.0 release checklist is closed.
 - [SET VARIABLE](sql/set-variable.md) documents session-local runtime settings.
 - [MERGE INTO](sql/merge.md) documents conditional table upserts, updates, and
   deletes.
+- [PIVOT](sql/pivot.md) documents row-to-column aggregate transforms.
+- [UNPIVOT](sql/unpivot.md) documents column-to-row transforms.
 - [SUMMARIZE](sql/summarize.md) documents per-column table statistics.
 - [AI Database Strategy](ai-database-strategy.md) maps UltraSQL's AI memory
   engine plan.

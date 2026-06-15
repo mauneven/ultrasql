@@ -156,11 +156,11 @@ Docs commits happen only after passing implementation tests for that family.
 - Reuse aggregate/project/filter/values plans; add executor code only if rewrite cannot express behavior.
 - Add `crates/ultrasql-server/tests/pivot_unpivot_round_trip.rs`.
 
-- [ ] Use explicit documented syntax, not silent DuckDB/Oracle superset parsing.
-- [ ] Lower `PIVOT` to grouped aggregates with conditional expressions.
-- [ ] Lower `UNPIVOT` to a union/values rewrite preserving types and null policy.
-- [ ] Reject duplicate pivot values and mixed incompatible output types.
-- [ ] Test grouping, nulls, aliases, empty input, duplicates, and mixed types.
+- [x] Use explicit documented syntax, not silent DuckDB/Oracle superset parsing.
+- [x] Bind `PIVOT` as a dedicated logical plan and execute with a grouped pivot operator.
+- [x] Bind `UNPIVOT` as a dedicated logical plan and execute with explicit null-policy handling.
+- [x] Reject duplicate pivot values and mixed incompatible output types.
+- [x] Test grouping, nulls, aliases, empty input, duplicates, and mixed types.
 
 ## Phase 8: SUMMARIZE
 
