@@ -9,22 +9,24 @@
 
 use ultrasql_core::{DataType, Field, GeometryType, MAX_VECTOR_DIMS, RangeType, Schema};
 use ultrasql_parser::ast::{
-    AlterRoleStmt, AlterSequenceStmt, AlterTableAction, AlterTableStmt, BinaryOp, ColumnConstraint,
-    CommentStmt, CommentTarget, CopyDirection as AstCopyDirection, CopyFormat as AstCopyFormat,
-    CopyOption, CopySource as AstCopySource, CopyStmt, CreateDomainStmt, CreateIndexStmt,
+    AlterRoleStmt, AlterSequenceStmt, AlterTableAction, AlterTableStmt, AlterViewAction,
+    AlterViewStmt, BinaryOp, ColumnConstraint, CommentStmt, CommentTarget,
+    CopyDirection as AstCopyDirection, CopyFormat as AstCopyFormat, CopyOption,
+    CopySource as AstCopySource, CopyStmt, CreateDomainStmt, CreateIndexStmt,
     CreateMaterializedViewStmt, CreateOperatorStmt, CreatePolicyStmt, CreateRoleStmt,
     CreateSchemaStmt, CreateSequenceStmt, CreateTableStmt, CreateTypeKind, CreateTypeStmt,
-    DomainConstraint, DropIndexStmt, DropRoleStmt, DropSchemaStmt, DropSequenceStmt, DropTableStmt,
-    Expr, Identifier, Literal, ObjectName, PolicyCommand as AstPolicyCommand,
-    PolicyPermissiveness as AstPolicyPermissiveness, ReferentialAction as AstReferentialAction,
-    RoleOption as AstRoleOption, RoleStmtKind as AstRoleStmtKind, SequenceOption, TableConstraint,
-    TruncateStmt, TypeName,
+    CreateViewStmt, DomainConstraint, DropIndexStmt, DropRoleStmt, DropSchemaStmt,
+    DropSequenceStmt, DropTableStmt, Expr, Identifier, Literal, ObjectName,
+    PolicyCommand as AstPolicyCommand, PolicyPermissiveness as AstPolicyPermissiveness,
+    ReferentialAction as AstReferentialAction, RoleOption as AstRoleOption,
+    RoleStmtKind as AstRoleStmtKind, SequenceOption, TableConstraint, TruncateStmt, TypeName,
 };
 
 use super::expr_bind::{coerce_literal_to_type, resolve_builtin_collation};
 use super::{
-    Catalog, LogicalAlterTableAction, LogicalPlan, PlanError, ScalarExpr, ScopeStack, bind_expr,
-    bind_select, lookup_table_reference, object_name_simple, parse_pg_identifier_path,
+    Catalog, LogicalAlterTableAction, LogicalAlterViewAction, LogicalPlan, PlanError, ScalarExpr,
+    ScopeStack, bind_expr, bind_select, lookup_table_reference, object_name_simple,
+    parse_pg_identifier_path,
 };
 use crate::catalog::TableMeta;
 use crate::plan::{
@@ -757,6 +759,63 @@ pub(super) fn bind_create_materialized_view(
         columns,
         source: Box::new(source),
         if_not_exists: s.if_not_exists,
+        schema: Schema::empty(),
+    })
+}
+
+pub(super) fn bind_create_view(
+    s: &CreateViewStmt,
+    catalog: &dyn Catalog,
+) -> Result<LogicalPlan, PlanError> {
+    let table_name = object_name_simple(&s.name);
+    let namespace = object_name_namespace(&s.name);
+    if !s.or_replace
+        && catalog
+            .lookup_table_in_schema(&namespace, &table_name)
+            .is_some()
+    {
+        return Err(PlanError::DuplicateTable(table_name));
+    }
+
+    let mut scope = ScopeStack::new();
+    let source = bind_select(&s.source, catalog, &mut scope)?;
+    let columns = materialized_view_schema(source.schema(), &s.columns)?;
+    if columns.is_empty() {
+        return Err(PlanError::NotSupported("CREATE VIEW: zero columns"));
+    }
+
+    Ok(LogicalPlan::CreateView {
+        table_name,
+        namespace,
+        columns,
+        source: Box::new(source),
+        source_sql: s.source_sql.clone(),
+        or_replace: s.or_replace,
+        schema: Schema::empty(),
+    })
+}
+
+pub(super) fn bind_alter_view(
+    s: &AlterViewStmt,
+    catalog: &dyn Catalog,
+) -> Result<LogicalPlan, PlanError> {
+    let resolved = lookup_table_reference(catalog, &s.name)?;
+    let action = match &s.action {
+        AlterViewAction::RenameView { new_name, .. } => LogicalAlterViewAction::RenameView {
+            new_name: new_name.value.to_ascii_lowercase(),
+        },
+        AlterViewAction::SetSchema { schema_name, .. } => LogicalAlterViewAction::SetSchema {
+            new_schema: schema_name.value.to_ascii_lowercase(),
+        },
+        AlterViewAction::ReplaceDefinition { .. } => {
+            return Err(PlanError::NotSupported(
+                "ALTER VIEW ... AS SELECT is not supported until dependency-safe view replacement lands",
+            ));
+        }
+    };
+    Ok(LogicalPlan::AlterView {
+        view_name: resolved.plan_name,
+        action,
         schema: Schema::empty(),
     })
 }

@@ -68,7 +68,7 @@ Docs commits happen only after passing implementation tests for that family.
   - `source_object text`
   - `source_kind text`
 - [x] Execute table describes from catalog snapshot and query describes from the bound plan schema.
-- [x] Add integration tests for table, query, missing object, and view-kind unsupported error until normal views exist.
+- [x] Add integration tests for table, query, missing object, and regular-view metadata.
 - [x] Add docs after tests pass with syntax, examples, limitations, and links to test/source paths.
 - [x] Commit parser/planner/executor/tests/docs separately.
 
@@ -76,16 +76,18 @@ Docs commits happen only after passing implementation tests for that family.
 
 **Files:**
 - Modify parser AST and `parser/mod.rs` alter dispatch.
-- Add `crates/ultrasql-parser/src/statements/alter_view.rs`.
+- Extend `crates/ultrasql-parser/src/statements/create_view.rs` with
+  regular-view and `ALTER VIEW` grammar.
 - Modify planner DDL binding and `LogicalPlan`.
 - Extend catalog mutation APIs for view rename and schema move only after view entries are real relations.
-- Add `crates/ultrasql-server/tests/alter_view_round_trip.rs`.
+- Add `crates/ultrasql-server/tests/view_round_trip.rs`.
 
-- [ ] First add normal `CREATE VIEW` if catalog cannot create user views yet; without that, `ALTER VIEW` cannot be production-complete.
-- [ ] Implement `ALTER VIEW name RENAME TO new_name`.
-- [ ] Implement `ALTER VIEW name SET SCHEMA schema_name` only against real schema catalog support.
-- [ ] Implement `ALTER VIEW name AS SELECT ...` only if stored view definitions and dependency validation exist; otherwise parse and reject with structured `NotSupported`.
-- [ ] Add rollback tests if DDL transactions become supported; current server rejects DDL in explicit transactions, so test the existing rejection path if unchanged.
+- [x] First add normal `CREATE VIEW` if catalog cannot create user views yet; without that, `ALTER VIEW` cannot be production-complete.
+- [x] Implement `ALTER VIEW name RENAME TO new_name`.
+- [x] Implement `ALTER VIEW name SET SCHEMA schema_name` only against real schema catalog support.
+- [x] Parse and reject `ALTER VIEW name AS SELECT ...` with structured `NotSupported`; dependency-safe replacement remains future work.
+- [x] Add explicit-transaction rejection coverage; full rollback tests remain
+  blocked until transactional DDL is supported.
 
 ## Phase 3: MERGE INTO
 

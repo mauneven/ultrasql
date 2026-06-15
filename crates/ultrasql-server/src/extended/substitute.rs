@@ -261,6 +261,7 @@ where
         | LogicalPlan::Truncate { .. }
         | LogicalPlan::CreateTable { .. }
         | LogicalPlan::CreateMaterializedView { .. }
+        | LogicalPlan::CreateView { .. }
         | LogicalPlan::CreateTypeEnum { .. }
         | LogicalPlan::CreateTypeComposite { .. }
         | LogicalPlan::CreateDomain { .. }
@@ -279,6 +280,7 @@ where
         | LogicalPlan::DropSchema { .. }
         | LogicalPlan::DropTable { .. }
         | LogicalPlan::AlterTable { .. }
+        | LogicalPlan::AlterView { .. }
         | LogicalPlan::CreateSequence { .. }
         | LogicalPlan::AlterSequence { .. }
         | LogicalPlan::DropSequence { .. }

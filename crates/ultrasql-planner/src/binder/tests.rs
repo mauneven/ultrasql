@@ -173,13 +173,33 @@ fn describe_missing_object_is_table_not_found() {
 }
 
 #[test]
-fn describe_view_reports_unsupported_until_view_catalog_metadata_exists() {
-    let cat = users_catalog();
-    let err = parse_and_bind("DESCRIBE VIEW users", &cat).expect_err("view describe unsupported");
-    assert_eq!(
-        err,
-        PlanError::NotSupported("DESCRIBE VIEW requires view catalog metadata")
-    );
+fn describe_unqualified_object_preserves_any_kind() {
+    let plan = parse_bind_ok("DESCRIBE users");
+    let LogicalPlan::Describe { target, .. } = plan else {
+        panic!("expected Describe plan");
+    };
+    let LogicalDescribeTarget::Object { kind, .. } = target else {
+        panic!("expected Describe object target");
+    };
+    assert_eq!(kind, LogicalDescribeObjectKind::Any);
+}
+
+#[test]
+fn describe_view_binds_view_target_metadata() {
+    let plan = parse_bind_ok("DESCRIBE VIEW users");
+    let LogicalPlan::Describe { target, .. } = plan else {
+        panic!("expected Describe plan");
+    };
+    let LogicalDescribeTarget::Object {
+        kind,
+        object_schema,
+        ..
+    } = target
+    else {
+        panic!("expected Describe object target");
+    };
+    assert_eq!(kind, LogicalDescribeObjectKind::View);
+    assert_eq!(object_schema.len(), 3);
 }
 
 #[test]
@@ -1420,6 +1440,37 @@ fn binds_create_materialized_view_derives_and_aliases_columns() {
         columns.fields()[1].data_type,
         DataType::Text { max_len: None }
     );
+    assert!(matches!(*source, LogicalPlan::Project { .. }));
+}
+
+#[test]
+fn binds_create_view_derives_aliases_and_preserves_source_sql() {
+    let cat = users_catalog();
+    let plan = parse_and_bind(
+        "CREATE VIEW user_v (user_id, username) AS SELECT id, name FROM users",
+        &cat,
+    )
+    .expect("bind ok");
+    let LogicalPlan::CreateView {
+        table_name,
+        namespace,
+        columns,
+        source,
+        source_sql,
+        or_replace,
+        schema,
+    } = plan
+    else {
+        panic!("expected CreateView");
+    };
+    assert_eq!(table_name, "user_v");
+    assert_eq!(namespace, "public");
+    assert!(!or_replace);
+    assert_eq!(schema, Schema::empty());
+    assert_eq!(source_sql, "SELECT id, name FROM users");
+    assert_eq!(columns.fields()[0].name, "user_id");
+    assert_eq!(columns.fields()[0].data_type, DataType::Int32);
+    assert_eq!(columns.fields()[1].name, "username");
     assert!(matches!(*source, LogicalPlan::Project { .. }));
 }
 
@@ -4474,6 +4525,55 @@ fn binds_alter_table_rename_to_new_name() {
     assert_eq!(new_name, "subscribers");
 }
 
+#[test]
+fn binds_alter_view_rename_and_set_schema() {
+    let mut cat = users_catalog();
+    cat.register(
+        "user_v",
+        TableMeta::new(
+            Schema::new([
+                Field::required("id", DataType::Int32),
+                Field::nullable("name", DataType::Text { max_len: None }),
+            ])
+            .expect("schema ok"),
+        ),
+    );
+    let plan = parse_and_bind("ALTER VIEW user_v RENAME TO user_v2", &cat).unwrap();
+    let LogicalPlan::AlterView { action, .. } = plan else {
+        panic!("expected AlterView plan");
+    };
+    let LogicalAlterViewAction::RenameView { new_name } = action else {
+        panic!("expected RenameView action");
+    };
+    assert_eq!(new_name, "user_v2");
+
+    let plan = parse_and_bind("ALTER VIEW user_v SET SCHEMA app", &cat).unwrap();
+    let LogicalPlan::AlterView { action, .. } = plan else {
+        panic!("expected AlterView plan");
+    };
+    let LogicalAlterViewAction::SetSchema { new_schema } = action else {
+        panic!("expected SetSchema action");
+    };
+    assert_eq!(new_schema, "app");
+}
+
+#[test]
+fn alter_view_replace_definition_is_explicitly_unsupported() {
+    let mut cat = users_catalog();
+    cat.register(
+        "user_v",
+        TableMeta::new(Schema::new([Field::required("id", DataType::Int32)]).expect("schema ok")),
+    );
+    let err = parse_and_bind("ALTER VIEW user_v AS SELECT id FROM users", &cat)
+        .expect_err("replacement unsupported");
+    assert_eq!(
+        err,
+        PlanError::NotSupported(
+            "ALTER VIEW ... AS SELECT is not supported until dependency-safe view replacement lands"
+        )
+    );
+}
+
 fn collect_window_funcs<'a>(plan: &'a LogicalPlan, out: &mut Vec<&'a LogicalWindowFunc>) {
     match plan {
         LogicalPlan::Window { input, func, .. } => {
@@ -4503,6 +4603,7 @@ fn collect_window_funcs<'a>(plan: &'a LogicalPlan, out: &mut Vec<&'a LogicalWind
             collect_window_funcs(body, out);
         }
         LogicalPlan::CreateMaterializedView { source, .. }
+        | LogicalPlan::CreateView { source, .. }
         | LogicalPlan::Explain { input: source, .. }
         | LogicalPlan::Copy {
             input: Some(source),
@@ -4533,6 +4634,7 @@ fn collect_window_funcs<'a>(plan: &'a LogicalPlan, out: &mut Vec<&'a LogicalWind
         | LogicalPlan::RevokeRole { .. }
         | LogicalPlan::DropTable { .. }
         | LogicalPlan::AlterTable { .. }
+        | LogicalPlan::AlterView { .. }
         | LogicalPlan::CreateSequence { .. }
         | LogicalPlan::AlterSequence { .. }
         | LogicalPlan::DropSequence { .. }

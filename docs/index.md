@@ -11,7 +11,11 @@ candidate path until the v1.0 release checklist is closed.
 - [Getting Started](getting-started.md) builds and runs a local server.
 - [Install](install.md) covers archives, npm, Docker, Homebrew, Debian, and RPM.
 - [Configuration](configuration.md) lists release-relevant server knobs.
-- [DESCRIBE](sql/describe.md) documents table and query metadata introspection.
+- [DESCRIBE](sql/describe.md) documents table, view, and query metadata introspection.
+- [CREATE VIEW](sql/create-view.md) documents regular view creation and query
+  expansion.
+- [ALTER VIEW](sql/alter-view.md) documents regular view rename and schema
+  moves.
 - [CHECKPOINT](sql/checkpoint.md) documents the WAL checkpoint command.
 - [SET VARIABLE](sql/set-variable.md) documents session-local runtime settings.
 - [MERGE INTO](sql/merge.md) documents conditional table upserts, updates, and

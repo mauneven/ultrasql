@@ -77,6 +77,8 @@ pub enum Statement {
     CreateTableAs(Box<CreateTableAsStmt>),
     /// `CREATE MATERIALIZED VIEW … AS SELECT …`.
     CreateMaterializedView(Box<CreateMaterializedViewStmt>),
+    /// `CREATE [OR REPLACE] VIEW … AS SELECT …`.
+    CreateView(Box<CreateViewStmt>),
     /// `CREATE TYPE name AS ENUM (...)`.
     CreateType(Box<CreateTypeStmt>),
     /// `CREATE DOMAIN name AS base_type [constraints...]`.
@@ -101,6 +103,8 @@ pub enum Statement {
     DropRole(DropRoleStmt),
     /// `ALTER TABLE …`.
     AlterTable(Box<AlterTableStmt>),
+    /// `ALTER VIEW …`.
+    AlterView(Box<AlterViewStmt>),
     /// `ALTER ROLE name ...` / `ALTER USER name ...`.
     AlterRole(Box<AlterRoleStmt>),
     /// `ALTER DEFAULT PRIVILEGES ...`.
@@ -224,6 +228,7 @@ impl Statement {
             Self::CreateTable(s) => s.span,
             Self::CreateTableAs(s) => s.span,
             Self::CreateMaterializedView(s) => s.span,
+            Self::CreateView(s) => s.span,
             Self::CreateType(s) => s.span,
             Self::CreateDomain(s) => s.span,
             Self::CreateOperator(s) => s.span,
@@ -236,6 +241,7 @@ impl Statement {
             Self::DropTable(s) => s.span,
             Self::DropRole(s) => s.span,
             Self::AlterTable(s) => s.span,
+            Self::AlterView(s) => s.span,
             Self::AlterRole(s) => s.span,
             Self::AlterDefaultPrivileges(s) => s.span,
             Self::CreateSchema(s) => s.span,
@@ -414,6 +420,23 @@ pub struct CreateMaterializedViewStmt {
     pub columns: Vec<Identifier>,
     /// The SELECT statement that provides rows.
     pub source: Box<SelectStmt>,
+    /// Source span of the entire statement.
+    pub span: Span,
+}
+
+/// `CREATE [OR REPLACE] VIEW name [(cols...)] AS SELECT …`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CreateViewStmt {
+    /// Whether `OR REPLACE` was specified.
+    pub or_replace: bool,
+    /// View name (possibly schema-qualified).
+    pub name: ObjectName,
+    /// Optional explicit column-name list `(col1, col2, …)`.
+    pub columns: Vec<Identifier>,
+    /// The SELECT statement that provides rows.
+    pub source: Box<SelectStmt>,
+    /// Source SQL text for the SELECT definition, trimmed.
+    pub source_sql: String,
     /// Source span of the entire statement.
     pub span: Span,
 }
@@ -1094,6 +1117,45 @@ pub struct AlterTableStmt {
     pub action: AlterTableAction,
     /// Source span.
     pub span: Span,
+}
+
+/// `ALTER VIEW name action`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AlterViewStmt {
+    /// View to alter.
+    pub name: ObjectName,
+    /// The single action to perform.
+    pub action: AlterViewAction,
+    /// Source span.
+    pub span: Span,
+}
+
+/// One action clause of an `ALTER VIEW` statement.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum AlterViewAction {
+    /// `RENAME TO new_name`.
+    RenameView {
+        /// New view name.
+        new_name: Identifier,
+        /// Source span.
+        span: Span,
+    },
+    /// `SET SCHEMA schema_name`.
+    SetSchema {
+        /// Target schema name.
+        schema_name: Identifier,
+        /// Source span.
+        span: Span,
+    },
+    /// `AS SELECT ...`.
+    ReplaceDefinition {
+        /// Replacement SELECT query.
+        source: Box<SelectStmt>,
+        /// Source SQL text for the SELECT definition, trimmed.
+        source_sql: String,
+        /// Source span.
+        span: Span,
+    },
 }
 
 /// One action clause of an `ALTER TABLE` statement.

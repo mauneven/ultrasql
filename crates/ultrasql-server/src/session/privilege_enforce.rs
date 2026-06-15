@@ -415,6 +415,7 @@ where
                 }
             }
             LogicalPlan::CreateMaterializedView { source, .. }
+            | LogicalPlan::CreateView { source, .. }
             | LogicalPlan::Explain { input: source, .. } => {
                 self.collect_plan(source, true);
             }
@@ -470,6 +471,7 @@ where
             | LogicalPlan::DropSchema { .. }
             | LogicalPlan::DropTable { .. }
             | LogicalPlan::AlterTable { .. }
+            | LogicalPlan::AlterView { .. }
             | LogicalPlan::CreateSequence { .. }
             | LogicalPlan::AlterSequence { .. }
             | LogicalPlan::DropSequence { .. }

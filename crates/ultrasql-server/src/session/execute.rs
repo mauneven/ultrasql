@@ -7,7 +7,7 @@
 use std::sync::Arc;
 
 use tokio::io::{AsyncRead, AsyncWrite};
-use ultrasql_catalog::{CatalogSnapshot, StatisticExtRow, TableEntry};
+use ultrasql_catalog::{Catalog, CatalogSnapshot, StatisticExtRow, TableEntry};
 use ultrasql_core::{
     BlockNumber, DataType, RelationId, Schema, Value, Xid, timestamptz_display_in_timezone,
 };
@@ -399,6 +399,16 @@ where
                 || Self::is_fused_update_shape(&plan_arc)
                 || Self::is_scalar_aggregate_shape(&plan_arc)
             {
+                if !self.state.regular_views.is_empty() {
+                    let prepared = self.prepare_regular_view_plan(&plan_arc, &catalog_snapshot)?;
+                    if Self::is_trivial_insert_values(&prepared)
+                        || Self::is_fused_update_shape(&prepared)
+                        || Self::is_scalar_aggregate_shape(&prepared)
+                    {
+                        return self.run_dml_or_select(&prepared, &catalog_snapshot);
+                    }
+                    return self.execute_bound_plan(prepared, sql, catalog_snapshot);
+                }
                 return self.run_dml_or_select(&plan_arc, &catalog_snapshot);
             }
             let plan = Arc::unwrap_or_clone(plan_arc);
@@ -438,6 +448,10 @@ where
         let plan = match bind(&stmt, &combined) {
             Ok(p) => p,
             Err(e) => return Err(self.fail_if_in_transaction(e.into())),
+        };
+        let plan = match self.prepare_regular_view_plan(&plan, &catalog_snapshot) {
+            Ok(p) => p,
+            Err(e) => return Err(self.fail_if_in_transaction(e)),
         };
 
         // Cache the bound plan for repeated identical SQL. Only true
@@ -538,6 +552,7 @@ where
             &plan,
             LogicalPlan::CreateTable { .. }
                 | LogicalPlan::CreateMaterializedView { .. }
+                | LogicalPlan::CreateView { .. }
                 | LogicalPlan::CreateTypeEnum { .. }
                 | LogicalPlan::CreateTypeComposite { .. }
                 | LogicalPlan::CreateDomain { .. }
@@ -564,6 +579,7 @@ where
                 | LogicalPlan::ImportDatabase { .. }
                 | LogicalPlan::DropTable { .. }
                 | LogicalPlan::AlterTable { .. }
+                | LogicalPlan::AlterView { .. }
                 | LogicalPlan::Truncate { .. }
         );
         if is_ddl && matches!(self.txn_state, TxnState::InTransaction(_)) {
@@ -577,6 +593,9 @@ where
             }
             LogicalPlan::CreateMaterializedView { .. } => {
                 return self.execute_create_materialized_view(&plan, &catalog_snapshot);
+            }
+            LogicalPlan::CreateView { .. } => {
+                return self.execute_create_view(&plan, &catalog_snapshot);
             }
             LogicalPlan::CreateTypeEnum { .. } => {
                 return self.execute_create_type_enum(&plan, &catalog_snapshot);
@@ -656,6 +675,9 @@ where
             LogicalPlan::AlterTable { .. } => {
                 return self.execute_alter_table(&plan, &catalog_snapshot);
             }
+            LogicalPlan::AlterView { .. } => {
+                return self.execute_alter_view(&plan, &catalog_snapshot);
+            }
             LogicalPlan::Truncate { .. } => {
                 return self.execute_truncate(&plan, &catalog_snapshot);
             }
@@ -695,13 +717,17 @@ where
         // the optimizer drops the DashMap lookup + `LogicalPlan::clone`
         // pair from every iteration of `cross_compare_sql --workload
         // sum-scalar/avg-scalar/filter-sum`.
-        let optimised_plan = if Self::is_trivial_insert_values(&plan)
-            || Self::is_fused_update_shape(&plan)
-            || Self::is_scalar_aggregate_shape(&plan)
+        let executable_plan = match self.prepare_regular_view_plan(&plan, &catalog_snapshot) {
+            Ok(plan) => plan,
+            Err(e) => return Err(self.fail_if_in_transaction(e)),
+        };
+        let optimised_plan = if Self::is_trivial_insert_values(&executable_plan)
+            || Self::is_fused_update_shape(&executable_plan)
+            || Self::is_scalar_aggregate_shape(&executable_plan)
         {
-            plan
+            executable_plan
         } else {
-            match self.optimize_dml_plan(sql, plan, &catalog_snapshot) {
+            match self.optimize_dml_plan(sql, executable_plan, &catalog_snapshot) {
                 Ok(p) => p,
                 Err(e) => return Err(self.fail_if_in_transaction(e)),
             }
@@ -714,6 +740,7 @@ where
             plan,
             LogicalPlan::CreateTable { .. }
                 | LogicalPlan::CreateMaterializedView { .. }
+                | LogicalPlan::CreateView { .. }
                 | LogicalPlan::CreateTypeEnum { .. }
                 | LogicalPlan::CreateTypeComposite { .. }
                 | LogicalPlan::CreateDomain { .. }
@@ -740,6 +767,7 @@ where
                 | LogicalPlan::ImportDatabase { .. }
                 | LogicalPlan::DropTable { .. }
                 | LogicalPlan::AlterTable { .. }
+                | LogicalPlan::AlterView { .. }
                 | LogicalPlan::Truncate { .. }
         )
     }
@@ -754,6 +782,7 @@ where
             LogicalPlan::CreateMaterializedView { .. } => {
                 self.execute_create_materialized_view(plan, catalog_snapshot)
             }
+            LogicalPlan::CreateView { .. } => self.execute_create_view(plan, catalog_snapshot),
             LogicalPlan::CreateTypeEnum { .. } => {
                 self.execute_create_type_enum(plan, catalog_snapshot)
             }
@@ -786,6 +815,7 @@ where
             LogicalPlan::ImportDatabase { .. } => self.execute_import_database(plan),
             LogicalPlan::DropTable { .. } => self.execute_drop_table(plan),
             LogicalPlan::AlterTable { .. } => self.execute_alter_table(plan, catalog_snapshot),
+            LogicalPlan::AlterView { .. } => self.execute_alter_view(plan, catalog_snapshot),
             LogicalPlan::Truncate { .. } => self.execute_truncate(plan, catalog_snapshot),
             _ => Err(ServerError::Unsupported("execute_ddl_plan: wrong plan")),
         }
@@ -849,6 +879,22 @@ where
             return Err(ServerError::Unsupported("execute_describe: wrong plan"));
         };
 
+        if let LogicalDescribeTarget::Object {
+            name,
+            namespace,
+            kind: LogicalDescribeObjectKind::View,
+            ..
+        } = target
+        {
+            let key = ultrasql_catalog::table_lookup_key(namespace, name);
+            let Some(entry) = self.state.persistent_catalog.lookup_table(&key) else {
+                return Err(ServerError::ddl(format!("{key} is not a view")));
+            };
+            if !crate::is_regular_view_entry(&entry) {
+                return Err(ServerError::ddl(format!("{key} is not a view")));
+            }
+        }
+
         let (fields, source_schema, source_object, source_kind) = match target {
             LogicalDescribeTarget::Object {
                 name,
@@ -856,9 +902,36 @@ where
                 kind,
                 object_schema,
             } => {
+                let key = ultrasql_catalog::table_lookup_key(namespace, name);
+                let is_view = self.state.regular_views.contains_key(&key)
+                    || self
+                        .state
+                        .catalog_snapshot()
+                        .tables
+                        .get(&key)
+                        .is_some_and(crate::is_regular_view_entry);
                 let source_kind = match kind {
-                    LogicalDescribeObjectKind::Table => "table",
-                    LogicalDescribeObjectKind::View => "view",
+                    LogicalDescribeObjectKind::Any => {
+                        if is_view {
+                            "view"
+                        } else {
+                            "table"
+                        }
+                    }
+                    LogicalDescribeObjectKind::Table => {
+                        if is_view {
+                            return Err(ServerError::ddl(format!(
+                                "{key} is a view; use DESCRIBE VIEW"
+                            )));
+                        }
+                        "table"
+                    }
+                    LogicalDescribeObjectKind::View => {
+                        if !is_view {
+                            return Err(ServerError::ddl(format!("{key} is not a view")));
+                        }
+                        "view"
+                    }
                 };
                 (
                     object_schema.fields(),
@@ -1234,13 +1307,17 @@ where
         if matches!(self.txn_state, TxnState::Failed(_)) {
             return Err(ServerError::TransactionAborted);
         }
-        let optimised_plan = if Self::is_trivial_insert_values(&plan)
-            || Self::is_fused_update_shape(&plan)
-            || Self::is_scalar_aggregate_shape(&plan)
+        let executable_plan = match self.prepare_regular_view_plan(&plan, &catalog_snapshot) {
+            Ok(plan) => plan,
+            Err(e) => return Err(self.fail_if_in_transaction(e)),
+        };
+        let optimised_plan = if Self::is_trivial_insert_values(&executable_plan)
+            || Self::is_fused_update_shape(&executable_plan)
+            || Self::is_scalar_aggregate_shape(&executable_plan)
         {
-            plan
+            executable_plan
         } else {
-            match self.optimize_dml_plan(sql, plan, &catalog_snapshot) {
+            match self.optimize_dml_plan(sql, executable_plan, &catalog_snapshot) {
                 Ok(p) => p,
                 Err(e) => return Err(self.fail_if_in_transaction(e)),
             }
@@ -1473,6 +1550,380 @@ where
                     "optimizer failed: {e}"
                 )))
             })
+    }
+
+    pub(crate) fn prepare_regular_view_plan(
+        &self,
+        plan: &LogicalPlan,
+        catalog_snapshot: &Arc<CatalogSnapshot>,
+    ) -> Result<LogicalPlan, ServerError> {
+        if let Some(table) = Self::dml_target_table(plan) {
+            let key = table.to_ascii_lowercase();
+            if self.state.regular_views.contains_key(&key)
+                || catalog_snapshot
+                    .tables
+                    .get(&key)
+                    .is_some_and(crate::is_regular_view_entry)
+            {
+                return Err(ServerError::UnsupportedOwned(format!(
+                    "cannot modify view {table}"
+                )));
+            }
+        }
+        self.expand_regular_views_in_plan(plan, catalog_snapshot, &mut Vec::new())
+    }
+
+    fn expand_regular_views_in_plan(
+        &self,
+        plan: &LogicalPlan,
+        catalog_snapshot: &CatalogSnapshot,
+        stack: &mut Vec<String>,
+    ) -> Result<LogicalPlan, ServerError> {
+        match plan {
+            LogicalPlan::Scan {
+                table,
+                schema,
+                projection,
+            } => self.expand_regular_view_scan(table, schema, projection, catalog_snapshot, stack),
+            LogicalPlan::Filter { input, predicate } => Ok(LogicalPlan::Filter {
+                input: Box::new(self.expand_regular_views_in_plan(
+                    input,
+                    catalog_snapshot,
+                    stack,
+                )?),
+                predicate: predicate.clone(),
+            }),
+            LogicalPlan::Project {
+                input,
+                exprs,
+                schema,
+            } => Ok(LogicalPlan::Project {
+                input: Box::new(self.expand_regular_views_in_plan(
+                    input,
+                    catalog_snapshot,
+                    stack,
+                )?),
+                exprs: exprs.clone(),
+                schema: schema.clone(),
+            }),
+            LogicalPlan::Limit { input, n, offset } => Ok(LogicalPlan::Limit {
+                input: Box::new(self.expand_regular_views_in_plan(
+                    input,
+                    catalog_snapshot,
+                    stack,
+                )?),
+                n: *n,
+                offset: *offset,
+            }),
+            LogicalPlan::Sort { input, keys } => Ok(LogicalPlan::Sort {
+                input: Box::new(self.expand_regular_views_in_plan(
+                    input,
+                    catalog_snapshot,
+                    stack,
+                )?),
+                keys: keys.clone(),
+            }),
+            LogicalPlan::Window {
+                input,
+                partition_by,
+                order_by,
+                func,
+                output_name,
+                schema,
+            } => Ok(LogicalPlan::Window {
+                input: Box::new(self.expand_regular_views_in_plan(
+                    input,
+                    catalog_snapshot,
+                    stack,
+                )?),
+                partition_by: partition_by.clone(),
+                order_by: order_by.clone(),
+                func: func.clone(),
+                output_name: output_name.clone(),
+                schema: schema.clone(),
+            }),
+            LogicalPlan::Aggregate {
+                input,
+                group_by,
+                aggregates,
+                schema,
+            } => Ok(LogicalPlan::Aggregate {
+                input: Box::new(self.expand_regular_views_in_plan(
+                    input,
+                    catalog_snapshot,
+                    stack,
+                )?),
+                group_by: group_by.clone(),
+                aggregates: aggregates.clone(),
+                schema: schema.clone(),
+            }),
+            LogicalPlan::Pivot {
+                input,
+                group_columns,
+                pivot_column,
+                aggregate,
+                pivot_values,
+                schema,
+            } => Ok(LogicalPlan::Pivot {
+                input: Box::new(self.expand_regular_views_in_plan(
+                    input,
+                    catalog_snapshot,
+                    stack,
+                )?),
+                group_columns: group_columns.clone(),
+                pivot_column: *pivot_column,
+                aggregate: aggregate.clone(),
+                pivot_values: pivot_values.clone(),
+                schema: schema.clone(),
+            }),
+            LogicalPlan::Unpivot {
+                input,
+                passthrough_columns,
+                columns,
+                name_column,
+                value_column,
+                include_nulls,
+                schema,
+            } => Ok(LogicalPlan::Unpivot {
+                input: Box::new(self.expand_regular_views_in_plan(
+                    input,
+                    catalog_snapshot,
+                    stack,
+                )?),
+                passthrough_columns: passthrough_columns.clone(),
+                columns: columns.clone(),
+                name_column: name_column.clone(),
+                value_column: value_column.clone(),
+                include_nulls: *include_nulls,
+                schema: schema.clone(),
+            }),
+            LogicalPlan::Join {
+                left,
+                right,
+                join_type,
+                condition,
+                schema,
+            } => Ok(LogicalPlan::Join {
+                left: Box::new(self.expand_regular_views_in_plan(left, catalog_snapshot, stack)?),
+                right: Box::new(self.expand_regular_views_in_plan(
+                    right,
+                    catalog_snapshot,
+                    stack,
+                )?),
+                join_type: *join_type,
+                condition: condition.clone(),
+                schema: schema.clone(),
+            }),
+            LogicalPlan::SetOp {
+                op,
+                quantifier,
+                left,
+                right,
+                schema,
+            } => Ok(LogicalPlan::SetOp {
+                op: *op,
+                quantifier: *quantifier,
+                left: Box::new(self.expand_regular_views_in_plan(left, catalog_snapshot, stack)?),
+                right: Box::new(self.expand_regular_views_in_plan(
+                    right,
+                    catalog_snapshot,
+                    stack,
+                )?),
+                schema: schema.clone(),
+            }),
+            LogicalPlan::Cte {
+                name,
+                recursive,
+                definition,
+                body,
+                schema,
+            } => Ok(LogicalPlan::Cte {
+                name: name.clone(),
+                recursive: *recursive,
+                definition: Box::new(self.expand_regular_views_in_plan(
+                    definition,
+                    catalog_snapshot,
+                    stack,
+                )?),
+                body: Box::new(self.expand_regular_views_in_plan(body, catalog_snapshot, stack)?),
+                schema: schema.clone(),
+            }),
+            LogicalPlan::LockRows {
+                input,
+                strength,
+                wait_policy,
+                schema,
+            } => Ok(LogicalPlan::LockRows {
+                input: Box::new(self.expand_regular_views_in_plan(
+                    input,
+                    catalog_snapshot,
+                    stack,
+                )?),
+                strength: *strength,
+                wait_policy: *wait_policy,
+                schema: schema.clone(),
+            }),
+            LogicalPlan::Insert {
+                table,
+                columns,
+                source,
+                on_conflict,
+                returning,
+                schema,
+            } => Ok(LogicalPlan::Insert {
+                table: table.clone(),
+                columns: columns.clone(),
+                source: Box::new(self.expand_regular_views_in_plan(
+                    source,
+                    catalog_snapshot,
+                    stack,
+                )?),
+                on_conflict: on_conflict.clone(),
+                returning: returning.clone(),
+                schema: schema.clone(),
+            }),
+            LogicalPlan::Update {
+                table,
+                assignments,
+                input,
+                returning,
+                schema,
+            } => Ok(LogicalPlan::Update {
+                table: table.clone(),
+                assignments: assignments.clone(),
+                input: Box::new(self.expand_regular_views_in_plan(
+                    input,
+                    catalog_snapshot,
+                    stack,
+                )?),
+                returning: returning.clone(),
+                schema: schema.clone(),
+            }),
+            LogicalPlan::Delete {
+                table,
+                input,
+                returning,
+                schema,
+            } => Ok(LogicalPlan::Delete {
+                table: table.clone(),
+                input: Box::new(self.expand_regular_views_in_plan(
+                    input,
+                    catalog_snapshot,
+                    stack,
+                )?),
+                returning: returning.clone(),
+                schema: schema.clone(),
+            }),
+            LogicalPlan::Merge {
+                target,
+                target_alias,
+                target_schema,
+                source,
+                on,
+                clauses,
+                schema,
+            } => Ok(LogicalPlan::Merge {
+                target: target.clone(),
+                target_alias: target_alias.clone(),
+                target_schema: target_schema.clone(),
+                source: Box::new(self.expand_regular_views_in_plan(
+                    source,
+                    catalog_snapshot,
+                    stack,
+                )?),
+                on: on.clone(),
+                clauses: clauses.clone(),
+                schema: schema.clone(),
+            }),
+            LogicalPlan::Explain {
+                input,
+                analyze,
+                format,
+                schema,
+            } => Ok(LogicalPlan::Explain {
+                analyze: *analyze,
+                format: *format,
+                input: Box::new(self.expand_regular_views_in_plan(
+                    input,
+                    catalog_snapshot,
+                    stack,
+                )?),
+                schema: schema.clone(),
+            }),
+            other => Ok(other.clone()),
+        }
+    }
+
+    fn expand_regular_view_scan(
+        &self,
+        table: &str,
+        schema: &Schema,
+        projection: &Option<Vec<usize>>,
+        catalog_snapshot: &CatalogSnapshot,
+        stack: &mut Vec<String>,
+    ) -> Result<LogicalPlan, ServerError> {
+        let key = table.to_ascii_lowercase();
+        let Some(runtime) = self
+            .state
+            .regular_views
+            .get(&key)
+            .map(|guard| Arc::clone(guard.value()))
+        else {
+            if catalog_snapshot
+                .tables
+                .get(&key)
+                .is_some_and(crate::is_regular_view_entry)
+            {
+                return Err(ServerError::ddl(format!(
+                    "missing runtime metadata for view {table}"
+                )));
+            }
+            return Ok(LogicalPlan::Scan {
+                table: table.to_owned(),
+                schema: schema.clone(),
+                projection: projection.clone(),
+            });
+        };
+        if stack.iter().any(|seen| seen == &key) {
+            return Err(ServerError::ddl(format!(
+                "recursive view expansion for {table}"
+            )));
+        }
+        if projection.is_some() {
+            return Err(ServerError::Unsupported(
+                "projected regular-view scans are not supported before view expansion",
+            ));
+        }
+        stack.push(key);
+        let source = self.expand_regular_views_in_plan(&runtime.source, catalog_snapshot, stack)?;
+        stack.pop();
+        if !crate::view_source_shape_matches(source.schema(), &runtime.columns) {
+            return Err(ServerError::ddl(format!(
+                "view {} source schema no longer matches stored view schema",
+                runtime.view_table
+            )));
+        }
+        let exprs = runtime
+            .columns
+            .fields()
+            .iter()
+            .enumerate()
+            .map(|(index, field)| {
+                (
+                    ScalarExpr::Column {
+                        name: field.name.clone(),
+                        index,
+                        data_type: field.data_type.clone(),
+                    },
+                    field.name.clone(),
+                )
+            })
+            .collect();
+        Ok(LogicalPlan::Project {
+            input: Box::new(source),
+            exprs,
+            schema: runtime.columns.clone(),
+        })
     }
 
     /// Clear the shared plan cache.

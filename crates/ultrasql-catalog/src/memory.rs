@@ -446,6 +446,37 @@ impl MutableCatalog for InMemoryCatalog {
         }
         Ok(updated)
     }
+
+    fn alter_table_set_schema(
+        &self,
+        name: &str,
+        new_schema: &str,
+    ) -> Result<TableEntry, CatalogError> {
+        let new_schema = new_schema.to_ascii_lowercase();
+        let old_key = self.table_lookup_key_for_unqualified(name);
+        let existing = self
+            .tables_by_name
+            .get(&old_key)
+            .ok_or_else(|| CatalogError::not_found(name.to_owned()))?
+            .value()
+            .clone();
+        let new_key = table_lookup_key(&new_schema, &existing.name);
+        if new_key != old_key && self.tables_by_name.contains_key(&new_key) {
+            return Err(CatalogError::already_exists(new_key));
+        }
+        let existing = self
+            .tables_by_name
+            .remove(&old_key)
+            .ok_or_else(|| CatalogError::not_found(name.to_owned()))?
+            .1;
+        let mut updated = existing.clone();
+        updated.schema_name = new_schema;
+        self.tables_by_name.insert(new_key, updated.clone());
+        if let Some(mut entry) = self.tables_by_oid.get_mut(&existing.oid) {
+            *entry = updated.clone();
+        }
+        Ok(updated)
+    }
 }
 
 #[cfg(test)]
@@ -477,6 +508,12 @@ mod tests {
             root_block: BlockNumber::INVALID,
             options: Vec::new(),
         }
+    }
+
+    fn make_table_in_schema(cat: &InMemoryCatalog, schema_name: &str, name: &str) -> TableEntry {
+        let mut entry = make_table(cat, name);
+        entry.schema_name = schema_name.to_owned();
+        entry
     }
 
     #[test]
@@ -789,6 +826,60 @@ mod tests {
         assert!(
             matches!(err, CatalogError::SchemaConflict(_)),
             "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn alter_table_set_schema_folds_target_and_preserves_oid() {
+        let cat = InMemoryCatalog::new();
+        let entry = make_table(&cat, "users");
+        let oid = entry.oid;
+        cat.create_table(entry).expect("create");
+
+        let updated = cat
+            .alter_table_set_schema("USERS", "App")
+            .expect("schema move succeeds");
+        assert_eq!(updated.oid, oid);
+        assert_eq!(updated.schema_name, "app");
+        assert!(cat.lookup_table("users").is_none());
+        assert_eq!(
+            cat.lookup_table_in_schema("APP", "users")
+                .expect("moved table reachable by schema")
+                .oid,
+            oid
+        );
+        assert_eq!(
+            cat.lookup_table_by_oid(oid)
+                .expect("moved table reachable by oid")
+                .schema_name,
+            "app"
+        );
+
+        let same_schema = cat
+            .alter_table_set_schema("app.users", "APP")
+            .expect("same-schema move is idempotent");
+        assert_eq!(same_schema.oid, oid);
+        assert_eq!(same_schema.schema_name, "app");
+    }
+
+    #[test]
+    fn alter_table_set_schema_rejects_target_collision_without_mutating_source() {
+        let cat = InMemoryCatalog::new();
+        let source = make_table(&cat, "users");
+        let source_oid = source.oid;
+        cat.create_table(source).expect("create public source");
+        cat.create_table(make_table_in_schema(&cat, "app", "users"))
+            .expect("create app collision target");
+
+        let err = cat
+            .alter_table_set_schema("users", "app")
+            .expect_err("schema collision must fail");
+        assert!(matches!(err, CatalogError::AlreadyExists(_)));
+        assert_eq!(
+            cat.lookup_table("users")
+                .expect("source remains in public")
+                .oid,
+            source_oid
         );
     }
 }

@@ -320,6 +320,7 @@ fn lower_query_inner(
         LogicalPlan::Truncate { .. }
         | LogicalPlan::CreateTable { .. }
         | LogicalPlan::CreateMaterializedView { .. }
+        | LogicalPlan::CreateView { .. }
         | LogicalPlan::CreateTypeEnum { .. }
         | LogicalPlan::CreateTypeComposite { .. }
         | LogicalPlan::CreateDomain { .. }
@@ -339,6 +340,7 @@ fn lower_query_inner(
         | LogicalPlan::DropSchema { .. }
         | LogicalPlan::DropTable { .. }
         | LogicalPlan::AlterTable { .. }
+        | LogicalPlan::AlterView { .. }
         | LogicalPlan::CreateSequence { .. }
         | LogicalPlan::AlterSequence { .. }
         | LogicalPlan::DropSequence { .. }
@@ -729,6 +731,7 @@ fn profile_operator_name(plan: &LogicalPlan) -> &'static str {
         LogicalPlan::Truncate { .. } => "Truncate",
         LogicalPlan::CreateTable { .. } => "CreateTable",
         LogicalPlan::CreateMaterializedView { .. } => "CreateMaterializedView",
+        LogicalPlan::CreateView { .. } => "CreateView",
         LogicalPlan::CreateTypeEnum { .. } => "CreateTypeEnum",
         LogicalPlan::CreateTypeComposite { .. } => "CreateTypeComposite",
         LogicalPlan::CreateDomain { .. } => "CreateDomain",
@@ -748,6 +751,7 @@ fn profile_operator_name(plan: &LogicalPlan) -> &'static str {
         LogicalPlan::DropSchema { .. } => "DropSchema",
         LogicalPlan::DropTable { .. } => "DropTable",
         LogicalPlan::AlterTable { .. } => "AlterTable",
+        LogicalPlan::AlterView { .. } => "AlterView",
         LogicalPlan::CreateSequence { .. } => "CreateSequence",
         LogicalPlan::AlterSequence { .. } => "AlterSequence",
         LogicalPlan::DropSequence { .. } => "DropSequence",

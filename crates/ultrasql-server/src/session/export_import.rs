@@ -277,6 +277,11 @@ where
                 "EXPORT DATABASE does not yet support materialized views",
             ));
         }
+        if !self.state.regular_views.is_empty() {
+            return Err(ServerError::unsupported(
+                "EXPORT DATABASE does not yet support regular views",
+            ));
+        }
         for table in export_tables(snapshot) {
             if !table.options.is_empty() {
                 return Err(ServerError::unsupported(format!(

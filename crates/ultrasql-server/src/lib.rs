@@ -92,7 +92,7 @@ use ultrasql_catalog::{
     MutableCatalog, PersistentCatalog, StatisticRow, TableEntry,
 };
 use ultrasql_core::constants::PAGE_SIZE;
-use ultrasql_core::{BlockNumber, DataType, Lsn, Oid, PageId, RelationId, Value, Xid};
+use ultrasql_core::{BlockNumber, DataType, Lsn, Oid, PageId, RelationId, Schema, Value, Xid};
 use ultrasql_executor::{Eval, ExecError, MemTableScan, Operator, RowCodec, SeqScan};
 use ultrasql_optimizer::{
     AnalyzeOptions, AnalyzeRunner, ColumnStats, InMemoryStatsCatalog, PgStatisticRow, PlanCache,
@@ -605,6 +605,26 @@ pub struct MaterializedViewRuntime {
     pub materialized_rows: std::sync::atomic::AtomicU64,
 }
 
+/// Runtime metadata for one regular SQL view.
+///
+/// The persistent catalog stores the view's exposed schema as a
+/// `RelKind::View` relation. This sidecar keeps the stored query text and
+/// the current bound source plan used to expand `Scan(view)` at execution
+/// time.
+#[derive(Debug)]
+pub struct RegularViewRuntime {
+    /// Canonical folded view lookup key.
+    pub view_table: String,
+    /// Trimmed `SELECT` text from the `CREATE VIEW` statement.
+    pub source_sql: String,
+    /// Session search path captured at creation for restart rebinding.
+    pub search_path: Option<String>,
+    /// Bound query used as the view source.
+    pub source: LogicalPlan,
+    /// Exposed view schema, including explicit column aliases.
+    pub columns: Schema,
+}
+
 pub(crate) fn append_only_materialized_source_table(plan: &LogicalPlan) -> Option<&str> {
     match plan {
         LogicalPlan::Scan { table, .. } => Some(table.as_str()),
@@ -613,6 +633,37 @@ pub(crate) fn append_only_materialized_source_table(plan: &LogicalPlan) -> Optio
         }
         _ => None,
     }
+}
+
+pub(crate) fn is_regular_view_entry(entry: &TableEntry) -> bool {
+    entry
+        .options
+        .iter()
+        .any(|(key, value)| key == "ultrasql.relkind" && value == "view")
+}
+
+pub(crate) fn view_source_shape_matches(source_schema: &Schema, view_schema: &Schema) -> bool {
+    source_schema.len() == view_schema.len()
+        && source_schema
+            .fields()
+            .iter()
+            .zip(view_schema.fields())
+            .all(|(source, view)| {
+                source.data_type == view.data_type && source.nullable == view.nullable
+            })
+}
+
+fn bind_regular_view_source_sql(
+    source_sql: &str,
+    catalog: &dyn PlannerCatalog,
+) -> Result<LogicalPlan, ServerError> {
+    let stmt = Parser::new(source_sql).parse_statement()?;
+    if !matches!(stmt, ultrasql_parser::ast::Statement::Select(_)) {
+        return Err(ServerError::Ddl(
+            "view metadata source SQL is not a SELECT".to_owned(),
+        ));
+    }
+    bind(&stmt, catalog).map_err(ServerError::Plan)
 }
 
 fn metadata_escape(raw: &str) -> String {
@@ -1860,6 +1911,14 @@ struct MaterializedViewMetadataRecord {
     projection: Vec<usize>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct RegularViewMetadataRecord {
+    view_table: String,
+    view_oid: ultrasql_core::Oid,
+    source_sql: String,
+    search_path: Option<String>,
+}
+
 /// Runtime metadata for one index beyond plain attnum keys.
 #[derive(Clone, Debug, Default)]
 pub struct RuntimeIndexMetadata {
@@ -3105,6 +3164,8 @@ pub struct Server {
     pub operators: Arc<dashmap::DashMap<String, Arc<RuntimeOperator>>>,
     /// Same-process append-only materialized-view registry keyed by view name.
     pub materialized_views: Arc<dashmap::DashMap<String, Arc<MaterializedViewRuntime>>>,
+    /// Same-process regular-view registry keyed by canonical view name.
+    pub regular_views: Arc<dashmap::DashMap<String, Arc<RegularViewRuntime>>>,
     /// Same-process columnar secondary-storage registry.
     pub columnar_storage: Arc<columnar_storage::ColumnarSecondaryStore>,
     /// Same-process time-range partition registry keyed by canonical parent table key.
@@ -4635,6 +4696,7 @@ impl Server {
             schemas: Arc::new(dashmap::DashMap::new()),
             operators: Arc::new(dashmap::DashMap::new()),
             materialized_views: Arc::new(dashmap::DashMap::new()),
+            regular_views: Arc::new(dashmap::DashMap::new()),
             columnar_storage: Arc::new(columnar_storage::ColumnarSecondaryStore::new()),
             time_partitions: Arc::new(dashmap::DashMap::new()),
             logical_replication: Arc::new(replication::LogicalReplicationRuntime::new()),
@@ -5238,6 +5300,7 @@ impl Server {
             schemas,
             operators: Arc::new(dashmap::DashMap::new()),
             materialized_views: Arc::new(dashmap::DashMap::new()),
+            regular_views: Arc::new(dashmap::DashMap::new()),
             columnar_storage: Arc::new(columnar_storage::ColumnarSecondaryStore::new()),
             time_partitions: Arc::new(dashmap::DashMap::new()),
             logical_replication: Arc::new(replication::LogicalReplicationRuntime::open_metadata(
@@ -5281,6 +5344,7 @@ impl Server {
         server.rebuild_operator_metadata()?;
         server.rebuild_row_security_sidecars()?;
         server.rebuild_materialized_view_runtime_sidecars()?;
+        server.rebuild_regular_view_runtime_sidecars()?;
         server.rebuild_time_partition_runtime_sidecars()?;
         Ok(server)
     }
@@ -5507,9 +5571,13 @@ impl Server {
         let mut sequence_owner_metadata_changed = false;
         let mut privilege_metadata_changed = false;
         let mut materialized_view_metadata_changed = false;
+        let mut regular_view_metadata_changed = false;
         for table_name in dropped_tables {
             if self.materialized_views.contains_key(table_name) {
                 materialized_view_metadata_changed = true;
+            }
+            if self.regular_views.contains_key(table_name) {
+                regular_view_metadata_changed = true;
             }
             let Some(entry) = self.persistent_catalog.lookup_table(table_name) else {
                 continue;
@@ -5551,6 +5619,9 @@ impl Server {
         }
         if materialized_view_metadata_changed {
             ensure_optional_runtime_metadata_write_slots(self.materialized_view_metadata_path())?;
+        }
+        if regular_view_metadata_changed {
+            ensure_optional_runtime_metadata_write_slots(self.regular_view_metadata_path())?;
         }
         Ok(())
     }
@@ -7315,6 +7386,182 @@ impl Server {
                     source_table: record.source_table.clone(),
                     source,
                     materialized_rows: std::sync::atomic::AtomicU64::new(record.materialized_rows),
+                }),
+            );
+        }
+        Ok(())
+    }
+
+    fn regular_view_metadata_path(&self) -> Option<std::path::PathBuf> {
+        self.data_dir.as_ref().map(|dir| dir.join("pg_views.meta"))
+    }
+
+    fn load_regular_view_metadata(&self) -> Result<Vec<RegularViewMetadataRecord>, ServerError> {
+        let Some(path) = self.regular_view_metadata_path() else {
+            return Ok(Vec::new());
+        };
+        let Some(text) = read_runtime_metadata_file(&path)? else {
+            return Ok(Vec::new());
+        };
+        let mut records = Vec::new();
+        let mut seen_view_names = std::collections::HashSet::new();
+        let mut seen_view_oids = std::collections::HashSet::new();
+        for (line_no, line) in text.lines().enumerate() {
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            let parts = line.split('\t').collect::<Vec<_>>();
+            if parts.len() != 4 {
+                return Err(ServerError::Ddl(format!(
+                    "view metadata line {} has {} fields",
+                    line_no + 1,
+                    parts.len()
+                )));
+            }
+            let view_table = metadata_unescape(parts[0])?;
+            let view_oid = parts[1].parse::<u32>().map_err(|err| {
+                ServerError::Ddl(format!(
+                    "view metadata line {} bad view oid: {err}",
+                    line_no + 1
+                ))
+            })?;
+            if !seen_view_names.insert(view_table.to_ascii_lowercase())
+                || !seen_view_oids.insert(view_oid)
+            {
+                return Err(ServerError::Ddl(format!(
+                    "duplicate view metadata on line {}",
+                    line_no + 1
+                )));
+            }
+            let source_sql = metadata_unescape(parts[2])?;
+            if source_sql.is_empty() {
+                return Err(ServerError::Ddl(format!(
+                    "view metadata line {} has empty source SQL",
+                    line_no + 1
+                )));
+            }
+            let search_path = (!parts[3].is_empty())
+                .then(|| metadata_unescape(parts[3]))
+                .transpose()?;
+            records.push(RegularViewMetadataRecord {
+                view_table,
+                view_oid: ultrasql_core::Oid::new(view_oid),
+                source_sql,
+                search_path,
+            });
+        }
+        Ok(records)
+    }
+
+    fn write_regular_view_metadata(
+        &self,
+        records: &[RegularViewMetadataRecord],
+    ) -> Result<(), ServerError> {
+        let Some(path) = self.regular_view_metadata_path() else {
+            return Ok(());
+        };
+        let mut out = String::from("# ultrasql views v1\n");
+        for record in records {
+            out.push_str(&format!(
+                "{}\t{}\t{}\t{}\n",
+                metadata_escape(&record.view_table),
+                record.view_oid.raw(),
+                metadata_escape(&record.source_sql),
+                record
+                    .search_path
+                    .as_deref()
+                    .map(metadata_escape)
+                    .unwrap_or_default()
+            ));
+        }
+        write_runtime_metadata_file(&path, &out)
+    }
+
+    pub(crate) fn persist_regular_view_runtime_metadata(
+        &self,
+        runtime: &RegularViewRuntime,
+    ) -> Result<(), ServerError> {
+        if self.regular_view_metadata_path().is_none() {
+            return Ok(());
+        }
+        let Some(view_entry) = self.persistent_catalog.lookup_table(&runtime.view_table) else {
+            return Ok(());
+        };
+        let mut records = self.load_regular_view_metadata()?;
+        records.retain(|record| {
+            record.view_table != runtime.view_table && record.view_oid != view_entry.oid
+        });
+        records.push(RegularViewMetadataRecord {
+            view_table: runtime.view_table.clone(),
+            view_oid: view_entry.oid,
+            source_sql: runtime.source_sql.clone(),
+            search_path: runtime.search_path.clone(),
+        });
+        self.write_regular_view_metadata(&records)
+    }
+
+    pub(crate) fn ensure_regular_view_runtime_metadata_slots_persistable(
+        &self,
+    ) -> Result<(), ServerError> {
+        ensure_optional_runtime_metadata_write_slots(self.regular_view_metadata_path())
+    }
+
+    pub(crate) fn remove_regular_view_runtime_metadata(
+        &self,
+        dropped_tables: &[String],
+    ) -> Result<(), ServerError> {
+        if dropped_tables.is_empty() {
+            return Ok(());
+        }
+        let mut records = self.load_regular_view_metadata()?;
+        let before = records.len();
+        records.retain(|record| {
+            !dropped_tables
+                .iter()
+                .any(|table| record.view_table.eq_ignore_ascii_case(table))
+        });
+        if records.len() != before {
+            self.write_regular_view_metadata(&records)?;
+        }
+        Ok(())
+    }
+
+    fn rebuild_regular_view_runtime_sidecars(&self) -> Result<(), ServerError> {
+        self.regular_views.clear();
+        let catalog_snapshot = self.catalog_snapshot();
+        for record in self.load_regular_view_metadata()? {
+            let view_entry = self
+                .persistent_catalog
+                .lookup_table(&record.view_table)
+                .ok_or_else(|| {
+                    ServerError::Ddl(format!("invalid view metadata for '{}'", record.view_table))
+                })?;
+            if view_entry.oid != record.view_oid || !is_regular_view_entry(&view_entry) {
+                return Err(ServerError::Ddl(format!(
+                    "invalid view metadata for '{}'",
+                    record.view_table
+                )));
+            }
+            let combined = CombinedCatalog {
+                snapshot: &catalog_snapshot,
+                fallback: &self.catalog,
+                search_path: record.search_path.as_deref(),
+            };
+            let source = bind_regular_view_source_sql(&record.source_sql, &combined)?;
+            if !view_source_shape_matches(source.schema(), &view_entry.schema) {
+                return Err(ServerError::Ddl(format!(
+                    "view metadata for '{}' no longer matches catalog schema",
+                    record.view_table
+                )));
+            }
+            self.regular_views.insert(
+                record.view_table.clone(),
+                Arc::new(RegularViewRuntime {
+                    view_table: record.view_table,
+                    source_sql: record.source_sql,
+                    search_path: record.search_path,
+                    source,
+                    columns: view_entry.schema,
                 }),
             );
         }

@@ -119,6 +119,11 @@ where
             },
             None => return Ok(()),
         };
+        let bound_plan = self.prepare_regular_view_plan(&bound_plan, catalog_snapshot)?;
+        if let Some(stmt) = self.extended.statements.get_mut(name) {
+            stmt.plan_hash = plan_hash_for_plan(&bound_plan);
+            stmt.plan = Some(bound_plan.clone());
+        }
         if self
             .extended
             .statements
@@ -150,7 +155,8 @@ where
             // the operator pipeline.
             return Ok(());
         }
-        let optimised = self.optimize_dml_plan(sql, bound_plan, catalog_snapshot)?;
+        let executable = self.prepare_regular_view_plan(&bound_plan, catalog_snapshot)?;
+        let optimised = self.optimize_dml_plan(sql, executable, catalog_snapshot)?;
         if let Some(stmt) = self.extended.statements.get_mut(name) {
             stmt.plan_hash = plan_hash_for_plan(&optimised);
             stmt.plan = Some(optimised);

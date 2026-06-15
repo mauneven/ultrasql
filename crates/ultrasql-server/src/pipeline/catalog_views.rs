@@ -231,7 +231,7 @@ fn virtual_rows(name: &str, ctx: &LowerCtx<'_>) -> Option<(Schema, Vec<Vec<Value
         }
         "pg_catalog.pg_tables" => Some((schema_pg_tables(), rows_pg_tables(ctx))),
         "pg_catalog.pg_indexes" => Some((schema_pg_indexes(), rows_pg_indexes(ctx))),
-        "pg_catalog.pg_views" => Some((schema_pg_views(), Vec::new())),
+        "pg_catalog.pg_views" => Some((schema_pg_views(), rows_pg_views(ctx))),
         "pg_catalog.pg_matviews" => Some((schema_pg_matviews(), rows_pg_matviews(ctx))),
         "pg_catalog.pg_sequences" => Some((schema_pg_sequences(), rows_pg_sequences(ctx))),
         "pg_catalog.pg_roles" => Some((schema_pg_roles(), rows_pg_roles(ctx))),
@@ -646,6 +646,13 @@ fn is_materialized_view_entry(entry: &ultrasql_catalog::TableEntry) -> bool {
         .any(|(key, value)| key == "ultrasql.relkind" && value == "materialized_view")
 }
 
+fn is_regular_view_entry(entry: &ultrasql_catalog::TableEntry) -> bool {
+    entry
+        .options
+        .iter()
+        .any(|(key, value)| key == "ultrasql.relkind" && value == "view")
+}
+
 fn schema_pg_namespace() -> Schema {
     schema([
         Field::required("oid", DataType::Int64),
@@ -726,6 +733,8 @@ fn rows_pg_class(ctx: &LowerCtx<'_>) -> Vec<Vec<Value>> {
     for entry in table_entries(ctx) {
         let relkind = if is_materialized_view_entry(&entry) {
             "m"
+        } else if is_regular_view_entry(&entry) {
+            "v"
         } else {
             "r"
         };
@@ -2116,6 +2125,7 @@ fn rows_pg_tables(ctx: &LowerCtx<'_>) -> Vec<Vec<Value>> {
             entry.schema_name != "pg_catalog"
                 && entry.schema_name != "information_schema"
                 && !is_materialized_view_entry(entry)
+                && !is_regular_view_entry(entry)
         })
         .map(|entry| {
             vec![
@@ -2173,6 +2183,21 @@ fn schema_pg_views() -> Schema {
         Field::required("viewowner", text()),
         Field::nullable("definition", text()),
     ])
+}
+
+fn rows_pg_views(ctx: &LowerCtx<'_>) -> Vec<Vec<Value>> {
+    table_entries(ctx)
+        .into_iter()
+        .filter(is_regular_view_entry)
+        .map(|entry| {
+            vec![
+                v_text(entry.schema_name.clone()),
+                v_text(entry.name.clone()),
+                v_text("ultrasql"),
+                Value::Null,
+            ]
+        })
+        .collect()
 }
 
 fn schema_pg_matviews() -> Schema {
@@ -4173,17 +4198,18 @@ fn rows_information_schema_tables(ctx: &LowerCtx<'_>) -> Vec<Vec<Value>> {
                 && !is_materialized_view_entry(entry)
         })
         .map(|entry| {
+            let is_view = is_regular_view_entry(&entry);
             vec![
                 v_text("ultrasql"),
                 v_text(entry.schema_name.clone()),
                 v_text(entry.name.clone()),
-                v_text("BASE TABLE"),
+                v_text(if is_view { "VIEW" } else { "BASE TABLE" }),
                 Value::Null,
                 Value::Null,
                 Value::Null,
                 Value::Null,
                 Value::Null,
-                v_text("YES"),
+                v_text(if is_view { "NO" } else { "YES" }),
                 v_text("NO"),
                 Value::Null,
             ]

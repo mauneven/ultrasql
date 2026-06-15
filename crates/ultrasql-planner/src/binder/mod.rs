@@ -59,11 +59,11 @@ use crate::error::PlanError;
 use crate::expr::ScalarExpr;
 use crate::plan::{
     AggregateFunc, ConflictTarget, ExplainFormat, LockStrength, LockWaitPolicy,
-    LogicalAggregateExpr, LogicalAlterTableAction, LogicalDescribeObjectKind,
-    LogicalDescribeTarget, LogicalJoinCondition, LogicalJoinType, LogicalMergeAction,
-    LogicalMergeClause, LogicalMergeMatchKind, LogicalOnConflict, LogicalPivotAggregate,
-    LogicalPivotValue, LogicalPlan, LogicalSetOp, LogicalSetQuantifier, LogicalSetVariableAction,
-    LogicalUnpivotColumn, SortKey, TxnIsolationLevel,
+    LogicalAggregateExpr, LogicalAlterTableAction, LogicalAlterViewAction,
+    LogicalDescribeObjectKind, LogicalDescribeTarget, LogicalJoinCondition, LogicalJoinType,
+    LogicalMergeAction, LogicalMergeClause, LogicalMergeMatchKind, LogicalOnConflict,
+    LogicalPivotAggregate, LogicalPivotValue, LogicalPlan, LogicalSetOp, LogicalSetQuantifier,
+    LogicalSetVariableAction, LogicalUnpivotColumn, SortKey, TxnIsolationLevel,
 };
 use crate::scope::{ScopeFrame, ScopeStack};
 
@@ -83,11 +83,11 @@ use self::aggregate::{
     expr_has_aggregate, is_aggregate_name, is_scalar_min_max_call, projection_item_has_aggregate,
 };
 use self::ddl::{
-    bind_alter_role, bind_alter_sequence, bind_alter_table, bind_comment, bind_copy,
-    bind_create_domain, bind_create_index, bind_create_materialized_view, bind_create_operator,
-    bind_create_policy, bind_create_role, bind_create_schema, bind_create_sequence,
-    bind_create_table, bind_create_type, bind_drop_index, bind_drop_role, bind_drop_schema,
-    bind_drop_sequence, bind_drop_table, bind_truncate,
+    bind_alter_role, bind_alter_sequence, bind_alter_table, bind_alter_view, bind_comment,
+    bind_copy, bind_create_domain, bind_create_index, bind_create_materialized_view,
+    bind_create_operator, bind_create_policy, bind_create_role, bind_create_schema,
+    bind_create_sequence, bind_create_table, bind_create_type, bind_create_view, bind_drop_index,
+    bind_drop_role, bind_drop_schema, bind_drop_sequence, bind_drop_table, bind_truncate,
 };
 use self::dml::{bind_delete, bind_insert, bind_merge, bind_update};
 use self::expr_bind::{bind_expr, bind_expr_with_ctes};
@@ -133,6 +133,7 @@ pub fn bind(stmt: &Statement, catalog: &dyn Catalog) -> Result<LogicalPlan, Plan
         }),
         Statement::CreateTable(s) => bind_create_table(s, catalog),
         Statement::CreateMaterializedView(s) => bind_create_materialized_view(s, catalog),
+        Statement::CreateView(s) => bind_create_view(s, catalog),
         Statement::CreateType(s) => bind_create_type(s, catalog),
         Statement::CreateDomain(s) => bind_create_domain(s, catalog),
         Statement::CreateOperator(s) => bind_create_operator(s, catalog),
@@ -155,6 +156,7 @@ pub fn bind(stmt: &Statement, catalog: &dyn Catalog) -> Result<LogicalPlan, Plan
         Statement::Comment(s) => bind_comment(s, catalog),
         Statement::DropTable(s) => bind_drop_table(s, catalog),
         Statement::AlterTable(s) => bind_alter_table(s, catalog),
+        Statement::AlterView(s) => bind_alter_view(s, catalog),
         Statement::Copy(s) => bind_copy(s, catalog),
         Statement::Explain(s) => bind_explain(s, catalog, &mut scope),
         // Transaction-control statements have no catalog dependency: the
@@ -257,17 +259,17 @@ fn bind_describe(
             }
         }
         AstDescribeTarget::Object { kind, name } => {
-            if *kind == AstDescribeObjectKind::View {
-                return Err(PlanError::NotSupported(
-                    "DESCRIBE VIEW requires view catalog metadata",
-                ));
-            }
             let table_name = object_name_simple(name);
             let resolved = lookup_table_reference(catalog, name)?;
+            let kind = match kind {
+                AstDescribeObjectKind::Any => LogicalDescribeObjectKind::Any,
+                AstDescribeObjectKind::Table => LogicalDescribeObjectKind::Table,
+                AstDescribeObjectKind::View => LogicalDescribeObjectKind::View,
+            };
             LogicalDescribeTarget::Object {
                 name: table_name,
                 namespace: resolved.meta.schema_name,
-                kind: LogicalDescribeObjectKind::Table,
+                kind,
                 object_schema: resolved.meta.schema,
             }
         }

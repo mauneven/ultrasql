@@ -385,9 +385,11 @@ pub enum LogicalSetVariableAction {
 /// Catalog object kind carried by [`LogicalDescribeTarget::Object`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LogicalDescribeObjectKind {
+    /// No explicit object-kind qualifier.
+    Any,
     /// Ordinary table or table-like relation.
     Table,
-    /// View relation. Full user-view support depends on catalog metadata.
+    /// View relation.
     View,
 }
 
@@ -723,6 +725,24 @@ pub enum LogicalPlan {
         schema: Schema,
     },
 
+    /// Create a regular view over a stored SELECT definition.
+    CreateView {
+        /// Case-folded bare view name.
+        table_name: String,
+        /// SQL namespace, usually `"public"`.
+        namespace: String,
+        /// Row shape exposed by the view.
+        columns: Schema,
+        /// Bound SELECT source.
+        source: Box<Self>,
+        /// Trimmed SELECT SQL text persisted as the view definition.
+        source_sql: String,
+        /// Whether `OR REPLACE` was specified.
+        or_replace: bool,
+        /// Always [`Schema::empty`]; DDL emits no rows.
+        schema: Schema,
+    },
+
     /// Create a user-defined enum type.
     CreateTypeEnum {
         /// Case-folded bare type name.
@@ -1029,6 +1049,16 @@ pub enum LogicalPlan {
         table_name: String,
         /// Resolved, type-checked action.
         action: LogicalAlterTableAction,
+        /// Always [`Schema::empty`].
+        schema: Schema,
+    },
+
+    /// Alter an existing regular view.
+    AlterView {
+        /// Lowercase target view name.
+        view_name: String,
+        /// Resolved action.
+        action: LogicalAlterViewAction,
         /// Always [`Schema::empty`].
         schema: Schema,
     },
@@ -1976,6 +2006,21 @@ pub enum LogicalAlterTableAction {
     },
 }
 
+/// One action clause of an [`LogicalPlan::AlterView`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum LogicalAlterViewAction {
+    /// `ALTER VIEW v RENAME TO new_name`.
+    RenameView {
+        /// New bare view name.
+        new_name: String,
+    },
+    /// `ALTER VIEW v SET SCHEMA schema_name`.
+    SetSchema {
+        /// Target schema name.
+        new_schema: String,
+    },
+}
+
 /// Tenant row-security predicate supported by the v1 RLS path.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LogicalTenantPolicyExpr {
@@ -2053,6 +2098,7 @@ impl LogicalPlan {
                 | Self::Truncate { .. }
                 | Self::CreateTable { .. }
                 | Self::CreateMaterializedView { .. }
+                | Self::CreateView { .. }
                 | Self::CreateTypeEnum { .. }
                 | Self::CreateTypeComposite { .. }
                 | Self::CreateDomain { .. }
@@ -2072,6 +2118,7 @@ impl LogicalPlan {
                 | Self::DropSchema { .. }
                 | Self::DropTable { .. }
                 | Self::AlterTable { .. }
+                | Self::AlterView { .. }
                 | Self::CreateSequence { .. }
                 | Self::AlterSequence { .. }
                 | Self::DropSequence { .. }
@@ -2131,6 +2178,7 @@ impl LogicalPlan {
             | Self::Truncate { .. }
             | Self::CreateTable { .. }
             | Self::CreateMaterializedView { .. }
+            | Self::CreateView { .. }
             | Self::CreateTypeEnum { .. }
             | Self::CreateTypeComposite { .. }
             | Self::CreateDomain { .. }
@@ -2150,6 +2198,7 @@ impl LogicalPlan {
             | Self::DropSchema { .. }
             | Self::DropTable { .. }
             | Self::AlterTable { .. }
+            | Self::AlterView { .. }
             | Self::CreateSequence { .. }
             | Self::AlterSequence { .. }
             | Self::DropSequence { .. }
@@ -2193,6 +2242,7 @@ impl LogicalPlan {
             | Self::Truncate { schema, .. }
             | Self::CreateTable { schema, .. }
             | Self::CreateMaterializedView { schema, .. }
+            | Self::CreateView { schema, .. }
             | Self::CreateTypeEnum { schema, .. }
             | Self::CreateTypeComposite { schema, .. }
             | Self::CreateDomain { schema, .. }
@@ -2219,6 +2269,7 @@ impl LogicalPlan {
             | Self::DropSchema { schema, .. }
             | Self::DropTable { schema, .. }
             | Self::AlterTable { schema, .. }
+            | Self::AlterView { schema, .. }
             | Self::CreateSequence { schema, .. }
             | Self::AlterSequence { schema, .. }
             | Self::DropSequence { schema, .. }
@@ -2550,6 +2601,35 @@ impl LogicalPlan {
                 out.push_str(table_name);
                 if *if_not_exists {
                     out.push_str(" IF NOT EXISTS");
+                }
+                out.push_str(" (");
+                for (i, f) in columns.fields().iter().enumerate() {
+                    if i > 0 {
+                        out.push_str(", ");
+                    }
+                    let _ = fmt::write(out, format_args!("{} {:?}", f.name, f.data_type));
+                    if !f.nullable {
+                        out.push_str(" NOT NULL");
+                    }
+                }
+                out.push_str(")\n");
+                source.display_into(indent + 2, out);
+            }
+            Self::CreateView {
+                table_name,
+                namespace,
+                columns,
+                source,
+                or_replace,
+                ..
+            } => {
+                out.push_str(&pad);
+                out.push_str("CreateView: ");
+                out.push_str(namespace);
+                out.push('.');
+                out.push_str(table_name);
+                if *or_replace {
+                    out.push_str(" OR REPLACE");
                 }
                 out.push_str(" (");
                 for (i, f) in columns.fields().iter().enumerate() {
@@ -2992,6 +3072,25 @@ impl LogicalPlan {
                                 "AlterTable: {table_name} ADD CONSTRAINT {} {kind} {:?}\n",
                                 constraint.name, constraint.columns
                             ),
+                        );
+                    }
+                }
+            }
+            Self::AlterView {
+                view_name, action, ..
+            } => {
+                out.push_str(&pad);
+                match action {
+                    LogicalAlterViewAction::RenameView { new_name } => {
+                        let _ = fmt::write(
+                            out,
+                            format_args!("AlterView: {view_name} RENAME TO {new_name}\n"),
+                        );
+                    }
+                    LogicalAlterViewAction::SetSchema { new_schema } => {
+                        let _ = fmt::write(
+                            out,
+                            format_args!("AlterView: {view_name} SET SCHEMA {new_schema}\n"),
                         );
                     }
                 }

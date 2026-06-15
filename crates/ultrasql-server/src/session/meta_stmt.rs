@@ -137,7 +137,8 @@ where
 
         let substituted = substitute_parameters_in_plan(&plan, &values);
         let catalog_snapshot: Arc<CatalogSnapshot> = self.state.catalog_snapshot();
-        self.run_dml_or_select(&substituted, &catalog_snapshot)
+        let executable = self.prepare_regular_view_plan(&substituted, &catalog_snapshot)?;
+        self.run_dml_or_select(&executable, &catalog_snapshot)
     }
 
     fn execute_deallocate_statement(&mut self, stmt: &DeallocateStmt) -> SelectResult {
@@ -252,6 +253,7 @@ fn walk_plan_for_max_param(plan: &LogicalPlan, max_idx: &mut u32) {
         | LogicalPlan::Empty { .. }
         | LogicalPlan::CreateTable { .. }
         | LogicalPlan::CreateMaterializedView { .. }
+        | LogicalPlan::CreateView { .. }
         | LogicalPlan::CreateTypeEnum { .. }
         | LogicalPlan::CreateTypeComposite { .. }
         | LogicalPlan::CreateDomain { .. }
@@ -270,6 +272,7 @@ fn walk_plan_for_max_param(plan: &LogicalPlan, max_idx: &mut u32) {
         | LogicalPlan::DropSchema { .. }
         | LogicalPlan::DropTable { .. }
         | LogicalPlan::AlterTable { .. }
+        | LogicalPlan::AlterView { .. }
         | LogicalPlan::CreateSequence { .. }
         | LogicalPlan::AlterSequence { .. }
         | LogicalPlan::DropSequence { .. }

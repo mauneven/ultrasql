@@ -36,7 +36,7 @@ pub use expr::{BinaryOp, ScalarExpr, UnaryOp};
 pub use plan::{
     AggregateFunc, ConflictTarget, CopyDirection, CopyFormat, CopySource, ExplainFormat,
     LogicalAggregateExpr, LogicalAggregatingIndex, LogicalAggregatingIndexExpr,
-    LogicalAlterTableAction, LogicalCheckConstraint, LogicalCommentTarget,
+    LogicalAlterTableAction, LogicalAlterViewAction, LogicalCheckConstraint, LogicalCommentTarget,
     LogicalDefaultPrivilegeOperation, LogicalDescribeObjectKind, LogicalDescribeTarget,
     LogicalForeignKeyConstraint, LogicalIndexMethod, LogicalIndexOption, LogicalJoinCondition,
     LogicalJoinType, LogicalMergeAction, LogicalMergeClause, LogicalMergeMatchKind,

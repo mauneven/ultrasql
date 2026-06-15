@@ -420,6 +420,12 @@ impl<'src> Parser<'src> {
 
         let tok = *self.peek()?;
         match tok.kind {
+            TokenKind::KwOr => {
+                self.advance()?; // OR
+                self.expect_identifier_keyword("replace", "REPLACE after CREATE OR")?;
+                self.parse_create_view(start, true)
+                    .map(|s| Statement::CreateView(Box::new(s)))
+            }
             TokenKind::KwTable => self.parse_create_table(start),
             TokenKind::KwSchema => self.parse_create_schema(start).map(Statement::CreateSchema),
             TokenKind::Identifier
@@ -445,6 +451,14 @@ impl<'src> Parser<'src> {
             {
                 self.parse_create_operator(start)
                     .map(|s| Statement::CreateOperator(Box::new(s)))
+            }
+            TokenKind::Identifier
+                if tok
+                    .text(self.source)
+                    .is_some_and(|text| text.eq_ignore_ascii_case("view")) =>
+            {
+                self.parse_create_view(start, false)
+                    .map(|s| Statement::CreateView(Box::new(s)))
             }
             TokenKind::Identifier
                 if tok
@@ -500,7 +514,7 @@ impl<'src> Parser<'src> {
                 .parse_create_sequence(start)
                 .map(|s| Statement::CreateSequence(Box::new(s))),
             other => Err(ParseError::Expected {
-                expected: "TABLE, TYPE, DOMAIN, OPERATOR, MATERIALIZED VIEW, SCHEMA, INDEX, UNIQUE, AGGREGATING, POLICY, ROLE, USER, or SEQUENCE after CREATE",
+                expected: "TABLE, VIEW, OR REPLACE VIEW, TYPE, DOMAIN, OPERATOR, MATERIALIZED VIEW, SCHEMA, INDEX, UNIQUE, AGGREGATING, POLICY, ROLE, USER, or SEQUENCE after CREATE",
                 found: other,
                 offset: tok.span.start_usize(),
             }),
@@ -678,6 +692,14 @@ impl<'src> Parser<'src> {
             TokenKind::KwTable => self
                 .parse_alter_table(start)
                 .map(|s| Statement::AlterTable(Box::new(s))),
+            TokenKind::Identifier
+                if tok
+                    .text(self.source)
+                    .is_some_and(|text| text.eq_ignore_ascii_case("view")) =>
+            {
+                self.parse_alter_view(start)
+                    .map(|s| Statement::AlterView(Box::new(s)))
+            }
             TokenKind::KwSequence => self
                 .parse_alter_sequence(start)
                 .map(|s| Statement::AlterSequence(Box::new(s))),
@@ -698,7 +720,7 @@ impl<'src> Parser<'src> {
                     .map(|s| Statement::AlterRole(Box::new(s)))
             }
             other => Err(ParseError::Expected {
-                expected: "DEFAULT PRIVILEGES, TABLE, SEQUENCE, ROLE, or USER after ALTER",
+                expected: "DEFAULT PRIVILEGES, TABLE, VIEW, SEQUENCE, ROLE, or USER after ALTER",
                 found: other,
                 offset: tok.span.start_usize(),
             }),

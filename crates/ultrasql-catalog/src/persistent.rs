@@ -980,7 +980,7 @@ impl PersistentCatalog {
         let mut user_index_classes: Vec<ClassRow> = Vec::new();
         for (_, class_row) in latest_class_by_oid {
             match class_row.relkind {
-                RelKind::Table | RelKind::MaterializedView => {
+                RelKind::Table | RelKind::View | RelKind::MaterializedView => {
                     user_relations = user_relations.saturating_add(1);
                     let attrs = attrs_by_relation.remove(&class_row.oid).unwrap_or_default();
                     let schema = schema_from_attributes(attrs).map_err(|e| {
@@ -2865,6 +2865,52 @@ fn type_entry_key(entry: &impl TypeEntryKey) -> String {
     type_lookup_key(entry.type_schema_name(), entry.type_name())
 }
 
+impl PersistentCatalog {
+    /// Move a relation without indexes to another schema, preserving its OID.
+    ///
+    /// This is currently used by `ALTER VIEW ... SET SCHEMA`. Ordinary
+    /// table moves need additional index namespace handling and should use a
+    /// broader catalog API when that SQL surface lands.
+    pub fn alter_relation_set_schema(
+        &self,
+        name: &str,
+        new_schema: &str,
+    ) -> Result<TableEntry, CatalogError> {
+        let old_key = self.table_lookup_key_for_unqualified(name);
+        let new_schema = fold_name(new_schema);
+        let _guard = self.write_lock.lock();
+        let existing = self
+            .tables_by_name
+            .get(&old_key)
+            .ok_or_else(|| CatalogError::not_found(name.to_owned()))?
+            .value()
+            .clone();
+        if self.indexes_by_table.contains_key(&existing.oid) {
+            return Err(CatalogError::schema_conflict(format!(
+                "relation '{}' has indexes and cannot be moved by alter_relation_set_schema",
+                existing.name
+            )));
+        }
+        let new_key = table_lookup_key(&new_schema, &existing.name);
+        if new_key != old_key && self.tables_by_name.contains_key(&new_key) {
+            return Err(CatalogError::already_exists(existing.name.clone()));
+        }
+        let existing = self
+            .tables_by_name
+            .remove(&old_key)
+            .ok_or_else(|| CatalogError::not_found(name.to_owned()))?
+            .1;
+        let mut updated = existing.clone();
+        updated.schema_name = new_schema;
+        self.tables_by_name.insert(new_key, updated.clone());
+        if let Some(mut entry) = self.tables_by_oid.get_mut(&existing.oid) {
+            *entry = updated.clone();
+        }
+        self.rebuild_snapshot();
+        Ok(updated)
+    }
+}
+
 impl Catalog for PersistentCatalog {
     fn lookup_table(&self, name: &str) -> Option<TableEntry> {
         let snap = self.snapshot.load();
@@ -3147,6 +3193,39 @@ impl MutableCatalog for PersistentCatalog {
         self.rebuild_snapshot();
         Ok(updated)
     }
+
+    fn alter_table_set_schema(
+        &self,
+        name: &str,
+        new_schema: &str,
+    ) -> Result<TableEntry, CatalogError> {
+        let new_schema = new_schema.to_ascii_lowercase();
+        let old_key = self.table_lookup_key_for_unqualified(name);
+        let _guard = self.write_lock.lock();
+        let existing = self
+            .tables_by_name
+            .get(&old_key)
+            .ok_or_else(|| CatalogError::not_found(name.to_owned()))?
+            .value()
+            .clone();
+        let new_key = table_lookup_key(&new_schema, &existing.name);
+        if new_key != old_key && self.tables_by_name.contains_key(&new_key) {
+            return Err(CatalogError::already_exists(new_key));
+        }
+        let existing = self
+            .tables_by_name
+            .remove(&old_key)
+            .ok_or_else(|| CatalogError::not_found(name.to_owned()))?
+            .1;
+        let mut updated = existing.clone();
+        updated.schema_name = new_schema;
+        self.tables_by_name.insert(new_key, updated.clone());
+        if let Some(mut entry) = self.tables_by_oid.get_mut(&existing.oid) {
+            *entry = updated.clone();
+        }
+        self.rebuild_snapshot();
+        Ok(updated)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -3180,6 +3259,12 @@ mod tests {
             root_block: BlockNumber::INVALID,
             options: Vec::new(),
         }
+    }
+
+    fn make_table_in_schema(cat: &PersistentCatalog, schema_name: &str, name: &str) -> TableEntry {
+        let mut entry = make_table(cat, name);
+        entry.schema_name = schema_name.to_owned();
+        entry
     }
 
     // --- Create / lookup round-trip via snapshot ---
@@ -3223,6 +3308,62 @@ mod tests {
         cat.create_table(make_table(&cat, "a")).expect("a");
         cat.create_table(make_table(&cat, "b")).expect("b");
         assert_eq!(cat.list_tables().len(), 2);
+    }
+
+    #[test]
+    fn alter_table_set_schema_folds_target_and_rebuilds_snapshot() {
+        let cat = PersistentCatalog::new();
+        let entry = make_table(&cat, "users");
+        let oid = entry.oid;
+        cat.create_table(entry).expect("create");
+
+        let updated = cat
+            .alter_table_set_schema("USERS", "App")
+            .expect("schema move succeeds");
+        assert_eq!(updated.oid, oid);
+        assert_eq!(updated.schema_name, "app");
+        assert!(cat.lookup_table("users").is_none());
+        assert_eq!(
+            cat.lookup_table_in_schema("APP", "users")
+                .expect("moved table reachable by schema")
+                .oid,
+            oid
+        );
+        assert_eq!(
+            cat.snapshot()
+                .tables_by_oid
+                .get(&oid)
+                .expect("snapshot rebuilt")
+                .schema_name,
+            "app"
+        );
+
+        let same_schema = cat
+            .alter_table_set_schema("app.users", "APP")
+            .expect("same-schema move is idempotent");
+        assert_eq!(same_schema.oid, oid);
+        assert_eq!(same_schema.schema_name, "app");
+    }
+
+    #[test]
+    fn alter_table_set_schema_rejects_target_collision_without_rebuilding_source() {
+        let cat = PersistentCatalog::new();
+        let source = make_table(&cat, "users");
+        let source_oid = source.oid;
+        cat.create_table(source).expect("create public source");
+        cat.create_table(make_table_in_schema(&cat, "app", "users"))
+            .expect("create app collision target");
+
+        let err = cat
+            .alter_table_set_schema("users", "app")
+            .expect_err("schema collision must fail");
+        assert!(matches!(err, CatalogError::AlreadyExists(_)));
+        assert_eq!(
+            cat.lookup_table("users")
+                .expect("source remains in public")
+                .oid,
+            source_oid
+        );
     }
 
     // --- Index management ---

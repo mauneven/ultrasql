@@ -196,8 +196,8 @@ file focused on what still blocks production.
 
 ## P4 - Later SQL Surface
 
-- Views and materialized views: expansion, updatable views, `WITH CHECK OPTION`,
-  refresh, and materialized-view indexes.
+- Views and materialized views: updatable views, `WITH CHECK OPTION`,
+  dependency-safe view replacement, refresh, and materialized-view indexes.
 - PL/pgSQL and procedures: variables, control flow, dynamic SQL, exceptions,
   cursors, `%TYPE`, `%ROWTYPE`, `SETOF`, OUT/INOUT, and `CALL`.
 - Triggers: row/statement triggers, `INSTEAD OF`, `NEW`/`OLD`, `WHEN`,

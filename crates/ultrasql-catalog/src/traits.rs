@@ -191,4 +191,19 @@ pub trait MutableCatalog: Catalog {
         old_name: &str,
         new_name: &str,
     ) -> Result<TableEntry, CatalogError>;
+
+    /// Move a table-like relation into another schema.
+    ///
+    /// The [`Oid`] and bare relation name are preserved. Only the
+    /// namespace component of the by-name key changes.
+    ///
+    /// # Errors
+    /// - [`CatalogError::NotFound`] when no relation by `name` exists.
+    /// - [`CatalogError::AlreadyExists`] when `new_schema.name` collides
+    ///   with another live relation.
+    fn alter_table_set_schema(
+        &self,
+        name: &str,
+        new_schema: &str,
+    ) -> Result<TableEntry, CatalogError>;
 }

@@ -31,9 +31,10 @@ completed evidence.
   functions.
 - PL/pgSQL, stored procedures, trigger semantics, event triggers, and
   extension loading are not complete.
-- Plain view expansion, updatable views, `WITH CHECK OPTION`, materialized-view
-  refresh/index parity, and general `RANGE`/`LIST`/`HASH` partitioning remain
-  roadmap items.
+- Regular views support stored `SELECT` expansion, rename, schema moves, and
+  restart metadata. Updatable views, `WITH CHECK OPTION`, dependency-safe
+  `CREATE OR REPLACE VIEW`, materialized-view refresh/index parity, and general
+  `RANGE`/`LIST`/`HASH` partitioning remain roadmap items.
 
 ## Security and administration
 
