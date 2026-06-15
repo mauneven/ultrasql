@@ -12,10 +12,18 @@
 
 ## Starting Evidence
 
+This section records the state at plan start on 2026-06-14. Current
+implementation status is reflected by checked tasks below and by the SQL pages
+under `docs/sql/`.
+
 - `SET` / `SHOW` / `RESET` already parse as `Statement::SetVar`, bind to `LogicalPlan::SetVariable`, and execute in `crates/ultrasql-server/src/session/execute.rs`.
 - PostgreSQL protocol `Describe` exists, but SQL `DESCRIBE` does not.
 - `CHECKPOINT` WAL/storage pieces exist: `CheckpointPayload`, `RecordType::Checkpoint`, storage `Checkpointer`, server `flush_dirty_heap_pages`, and WAL writer durability wait. SQL dispatch does not exist.
-- Normal `CREATE VIEW` is not user-facing yet; parser only has `CREATE MATERIALIZED VIEW`. `ALTER VIEW` needs normal view catalog semantics or explicit scope limited to materialized/catalog views.
+- At plan start, regular `CREATE VIEW` had not shipped and the parser only had
+  `CREATE MATERIALIZED VIEW`. Current status: regular `CREATE VIEW` and
+  `ALTER VIEW` metadata operations are implemented and documented; remaining
+  gaps live in `docs/sql/create-view.md`, `docs/sql/alter-view.md`, and
+  `docs/known-limitations.md`.
 - `MERGE INTO`, `EXPORT DATABASE`, `IMPORT DATABASE`, `PIVOT`, `UNPIVOT`, and `SUMMARIZE` have no parser/planner/executor statement surface.
 
 ## Commit Policy

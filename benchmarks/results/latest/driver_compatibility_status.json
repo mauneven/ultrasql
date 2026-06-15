@@ -4,7 +4,7 @@
   "errors": [
     "report missing: target/driver-certification.json"
   ],
-  "expected_commit": null,
+  "expected_commit": "f9fc5c6f9960ad17d72e049ced436a1f0402cc7f",
   "failed_required_drivers": [],
   "missing_required_drivers": [
     "Alembic",

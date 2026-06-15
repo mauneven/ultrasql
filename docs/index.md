@@ -27,6 +27,8 @@ candidate path until the v1.0 release checklist is closed.
 - [SUMMARIZE](sql/summarize.md) documents per-column table statistics.
 - [AI Database Strategy](ai-database-strategy.md) maps UltraSQL's AI memory
   engine plan.
+- [Production Readiness Audit](production-readiness.md) records the current
+  evidence-backed readiness verdict.
 - [Known Limitations](known-limitations.md) records open SQL and operations
   gaps.
 - [Release Checklist](release-checklist.md) is the production readiness gate.

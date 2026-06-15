@@ -32,6 +32,7 @@ nav:
   - AI Database Strategy: ai-database-strategy.md
   - Backup and Restore: backup-restore.md
   - Chaos Recovery: chaos-recovery.md
+  - Production Readiness Audit: production-readiness.md
   - Operator Reports: operator-reports.md
   - External Audits: external-audits.md
   - Incident Drills: incident-drills.md

@@ -8,6 +8,8 @@ completed evidence.
 
 - v1.0 is not released until correctness, benchmark, security, and operator
   soak gates are green.
+- The current evidence-backed readiness verdict lives in
+  [Production Readiness Audit](production-readiness.md).
 - Three independent 30-day operator soaks are still required.
 - Chaos, disk-full, long fuzz, and full benchmark certification remain release
   gates, not README claims.

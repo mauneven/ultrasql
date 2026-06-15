@@ -1,11 +1,21 @@
 {
-  "milestone": "v0.9",
-  "item": "Three independent operators run UltraSQL for 7 days and report",
-  "status": "pending_external_validation",
-  "created_date": "2026-05-19",
-  "earliest_close_date_if_started_today": "2026-05-26",
-  "required_independent_operator_reports": 3,
-  "received_independent_operator_reports": 0,
-  "runbook": "docs/OPERATOR_SOAK.md",
-  "notes": "Cannot be closed by code changes alone; requires wall-clock operator evidence."
+  "independent_operator_count": 0,
+  "min_days": 30.0,
+  "min_reports": 3,
+  "ready": false,
+  "reasons": [
+    "0 valid report(s), need 3",
+    "0 independent operator(s), need 3",
+    "0 valid release commit(s), need exactly 1",
+    "valid reports must cover expected commit f9fc5c6f9960ad17d72e049ced436a1f0402cc7f"
+  ],
+  "release_commit": "f9fc5c6f9960ad17d72e049ced436a1f0402cc7f",
+  "report_count": 0,
+  "reports": [],
+  "reports_dir": "operator-reports",
+  "schema_version": 1,
+  "status": "not_ready",
+  "valid_release_commits": [],
+  "valid_report_count": 0,
+  "validated_at_utc": "2026-06-15T12:00:00Z"
 }

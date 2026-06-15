@@ -160,6 +160,7 @@ fuzz/         parser, wire, WAL, and planner fuzz targets
 
 ## Read Next
 
+- [docs/production-readiness.md](docs/production-readiness.md) - current audited readiness verdict.
 - [ROADMAP.md](ROADMAP.md) - production plan and open gates.
 - [DONE.md](DONE.md) - completed milestones and evidence ledger.
 - [docs/getting-started.md](docs/getting-started.md) - local first steps.
