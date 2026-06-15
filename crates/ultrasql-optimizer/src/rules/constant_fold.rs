@@ -353,6 +353,53 @@ fn fold_plan(plan: &LogicalPlan) -> Result<Option<LogicalPlan>, OptimizeError> {
             }))
         }
 
+        LogicalPlan::Pivot {
+            input,
+            group_columns,
+            pivot_column,
+            aggregate,
+            pivot_values,
+            schema,
+        } => {
+            let new_input = fold_plan(input)?;
+            let new_arg = aggregate.arg.as_ref().and_then(fold_expr);
+            if new_input.is_none() && new_arg.is_none() {
+                return Ok(None);
+            }
+            let mut aggregate = aggregate.clone();
+            if let Some(arg) = new_arg {
+                aggregate.arg = Some(arg);
+            }
+            Ok(Some(LogicalPlan::Pivot {
+                input: Box::new(new_input.unwrap_or_else(|| *input.clone())),
+                group_columns: group_columns.clone(),
+                pivot_column: *pivot_column,
+                aggregate,
+                pivot_values: pivot_values.clone(),
+                schema: schema.clone(),
+            }))
+        }
+
+        LogicalPlan::Unpivot {
+            input,
+            passthrough_columns,
+            columns,
+            name_column,
+            value_column,
+            include_nulls,
+            schema,
+        } => fold_plan(input)?
+            .map(|new_input| LogicalPlan::Unpivot {
+                input: Box::new(new_input),
+                passthrough_columns: passthrough_columns.clone(),
+                columns: columns.clone(),
+                name_column: name_column.clone(),
+                value_column: value_column.clone(),
+                include_nulls: *include_nulls,
+                schema: schema.clone(),
+            })
+            .map_or(Ok(None), |plan| Ok(Some(plan))),
+
         LogicalPlan::Insert {
             table,
             columns,

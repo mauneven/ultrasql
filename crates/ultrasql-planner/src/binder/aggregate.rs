@@ -103,7 +103,7 @@ pub(super) fn is_aggregate_name(name: &str) -> bool {
     )
 }
 
-fn classify_aggregate(name: &str, args_empty: bool) -> Option<AggregateFunc> {
+pub(super) fn classify_aggregate(name: &str, args_empty: bool) -> Option<AggregateFunc> {
     match name.to_ascii_lowercase().as_str() {
         "count" if args_empty => Some(AggregateFunc::CountStar),
         "count" => Some(AggregateFunc::Count),
@@ -129,7 +129,7 @@ fn classify_aggregate(name: &str, args_empty: bool) -> Option<AggregateFunc> {
     }
 }
 
-fn aggregate_return_type(func: AggregateFunc, arg_type: DataType) -> DataType {
+pub(super) fn aggregate_return_type(func: AggregateFunc, arg_type: DataType) -> DataType {
     match func {
         AggregateFunc::CountStar | AggregateFunc::Count => DataType::Int64,
         AggregateFunc::Sum => match arg_type {

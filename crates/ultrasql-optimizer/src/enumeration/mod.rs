@@ -147,6 +147,8 @@ pub fn outer_join_subtree_is_barrier(plan: &LogicalPlan) -> bool {
         | LogicalPlan::Limit { input, .. }
         | LogicalPlan::Sort { input, .. }
         | LogicalPlan::Aggregate { input, .. }
+        | LogicalPlan::Pivot { input, .. }
+        | LogicalPlan::Unpivot { input, .. }
         | LogicalPlan::LockRows { input, .. }
         | LogicalPlan::Window { input, .. }
         | LogicalPlan::Explain { input, .. } => outer_join_subtree_is_barrier(input),
@@ -348,6 +350,38 @@ pub fn reorder_inner_joins_with_stats(plan: &LogicalPlan, stats: &dyn StatsSourc
             input: Box::new(reorder_inner_joins_with_stats(input, stats)),
             group_by: group_by.clone(),
             aggregates: aggregates.clone(),
+            schema: schema.clone(),
+        },
+        LogicalPlan::Pivot {
+            input,
+            group_columns,
+            pivot_column,
+            aggregate,
+            pivot_values,
+            schema,
+        } => LogicalPlan::Pivot {
+            input: Box::new(reorder_inner_joins_with_stats(input, stats)),
+            group_columns: group_columns.clone(),
+            pivot_column: *pivot_column,
+            aggregate: aggregate.clone(),
+            pivot_values: pivot_values.clone(),
+            schema: schema.clone(),
+        },
+        LogicalPlan::Unpivot {
+            input,
+            passthrough_columns,
+            columns,
+            name_column,
+            value_column,
+            include_nulls,
+            schema,
+        } => LogicalPlan::Unpivot {
+            input: Box::new(reorder_inner_joins_with_stats(input, stats)),
+            passthrough_columns: passthrough_columns.clone(),
+            columns: columns.clone(),
+            name_column: name_column.clone(),
+            value_column: value_column.clone(),
+            include_nulls: *include_nulls,
             schema: schema.clone(),
         },
         LogicalPlan::SetOp {

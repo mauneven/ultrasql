@@ -92,6 +92,7 @@ pub mod modify;
 mod nested_loop_join;
 pub mod parallel_seq_scan;
 pub mod physical;
+mod pivot;
 mod profile;
 mod project;
 pub mod project_expr;
@@ -145,6 +146,7 @@ pub use nested_loop_join::{NestedLoopJoin, RightFactory};
 pub use parallel_seq_scan::{
     ParallelSeqScan, ParallelSeqScanConfig, choose_parallel_seq_scan_workers,
 };
+pub use pivot::{Pivot, Unpivot};
 pub use profile::{OperatorRuntimeProfile, OperatorSpillProfile, ProfiledOperator};
 pub use project::Project;
 pub use project_expr::ProjectExprs;

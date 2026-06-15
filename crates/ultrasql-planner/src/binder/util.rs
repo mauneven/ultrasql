@@ -261,6 +261,13 @@ pub(super) fn plan_contains_outer_column(plan: &LogicalPlan) -> bool {
         LogicalPlan::Limit { input, .. } | LogicalPlan::LockRows { input, .. } => {
             plan_contains_outer_column(input)
         }
+        LogicalPlan::Pivot {
+            input, aggregate, ..
+        } => {
+            aggregate.arg.as_ref().is_some_and(expr_contains_outer)
+                || plan_contains_outer_column(input)
+        }
+        LogicalPlan::Unpivot { input, .. } => plan_contains_outer_column(input),
         LogicalPlan::Aggregate {
             input,
             group_by,

@@ -6,8 +6,8 @@ use std::sync::Arc;
 use ultrasql_core::{DataType, RelationId, Schema, Value, constants::PAGE_SIZE};
 use ultrasql_executor::unique::UniqueMode;
 use ultrasql_executor::{
-    Filter, HashAggregate, Limit, Operator, ProfiledOperator, ResultOp, Sort, TopK, Unique,
-    ValuesScan,
+    Filter, HashAggregate, Limit, Operator, Pivot, ProfiledOperator, ResultOp, Sort, TopK, Unique,
+    Unpivot, ValuesScan,
 };
 use ultrasql_planner::{BinaryOp, LogicalPlan, ScalarExpr, SortKey};
 use ultrasql_vec::Batch;
@@ -565,6 +565,41 @@ fn lower_query_inner(
             target_schema,
             schema,
         } => lower_summarize(table, namespace, target_schema, schema, ctx),
+        LogicalPlan::Pivot {
+            input,
+            group_columns,
+            pivot_column,
+            aggregate,
+            pivot_values,
+            schema,
+        } => {
+            let child = lower_query(input, ctx)?;
+            Ok(Box::new(Pivot::try_new(
+                child,
+                group_columns.clone(),
+                *pivot_column,
+                aggregate.clone(),
+                pivot_values.clone(),
+                schema.clone(),
+            )?))
+        }
+        LogicalPlan::Unpivot {
+            input,
+            passthrough_columns,
+            columns,
+            include_nulls,
+            schema,
+            ..
+        } => {
+            let child = lower_query(input, ctx)?;
+            Ok(Box::new(Unpivot::new(
+                child,
+                passthrough_columns.clone(),
+                columns.clone(),
+                *include_nulls,
+                schema.clone(),
+            )))
+        }
     }
 }
 
@@ -676,6 +711,8 @@ fn profile_operator_name(plan: &LogicalPlan) -> &'static str {
         LogicalPlan::Sort { .. } => "Sort",
         LogicalPlan::Join { .. } => "Hash Join",
         LogicalPlan::Aggregate { .. } => "Aggregate",
+        LogicalPlan::Pivot { .. } => "Pivot",
+        LogicalPlan::Unpivot { .. } => "Unpivot",
         LogicalPlan::Values { .. } => "Values Scan",
         LogicalPlan::SetOp { .. } => "Set Op",
         LogicalPlan::Cte { .. } => "CTE",

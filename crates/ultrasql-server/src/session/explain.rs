@@ -733,6 +733,8 @@ fn plan_node_type(plan: &LogicalPlan) -> &'static str {
         LogicalPlan::Sort { .. } => "Sort",
         LogicalPlan::Join { .. } => "Hash Join",
         LogicalPlan::Aggregate { .. } => "Aggregate",
+        LogicalPlan::Pivot { .. } => "Pivot",
+        LogicalPlan::Unpivot { .. } => "Unpivot",
         LogicalPlan::Values { .. } => "Values Scan",
         LogicalPlan::SetOp { .. } => "Set Op",
         LogicalPlan::Cte { .. } => "CTE",
@@ -801,6 +803,8 @@ fn plan_children(plan: &LogicalPlan) -> Vec<&LogicalPlan> {
         | LogicalPlan::Limit { input, .. }
         | LogicalPlan::Sort { input, .. }
         | LogicalPlan::Aggregate { input, .. }
+        | LogicalPlan::Pivot { input, .. }
+        | LogicalPlan::Unpivot { input, .. }
         | LogicalPlan::LockRows { input, .. }
         | LogicalPlan::Explain { input, .. }
         | LogicalPlan::Update { input, .. }

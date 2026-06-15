@@ -293,6 +293,17 @@ fn infer_into(
                 }
             }
         }
+        LogicalPlan::Pivot {
+            input, aggregate, ..
+        } => {
+            infer_into(input, catalog, out);
+            if let Some(arg) = &aggregate.arg {
+                infer_in_expr(arg, None, out);
+            }
+        }
+        LogicalPlan::Unpivot { input, .. } => {
+            infer_into(input, catalog, out);
+        }
         LogicalPlan::SetOp { left, right, .. } => {
             infer_into(left, catalog, out);
             infer_into(right, catalog, out);
@@ -648,6 +659,17 @@ pub(super) fn walk_plan_exprs<F: FnMut(&ScalarExpr)>(plan: &LogicalPlan, f: &mut
                     walk_expr(&key.expr, f);
                 }
             }
+        }
+        LogicalPlan::Pivot {
+            input, aggregate, ..
+        } => {
+            walk_plan_exprs(input, f);
+            if let Some(arg) = &aggregate.arg {
+                walk_expr(arg, f);
+            }
+        }
+        LogicalPlan::Unpivot { input, .. } => {
+            walk_plan_exprs(input, f);
         }
         LogicalPlan::SetOp { left, right, .. } => {
             walk_plan_exprs(left, f);

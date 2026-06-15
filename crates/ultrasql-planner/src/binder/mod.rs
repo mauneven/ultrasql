@@ -60,8 +60,9 @@ use crate::plan::{
     AggregateFunc, ConflictTarget, ExplainFormat, LockStrength, LockWaitPolicy,
     LogicalAggregateExpr, LogicalAlterTableAction, LogicalDescribeObjectKind,
     LogicalDescribeTarget, LogicalJoinCondition, LogicalJoinType, LogicalMergeAction,
-    LogicalMergeClause, LogicalMergeMatchKind, LogicalOnConflict, LogicalPlan, LogicalSetOp,
-    LogicalSetQuantifier, LogicalSetVariableAction, SortKey, TxnIsolationLevel,
+    LogicalMergeClause, LogicalMergeMatchKind, LogicalOnConflict, LogicalPivotAggregate,
+    LogicalPivotValue, LogicalPlan, LogicalSetOp, LogicalSetQuantifier, LogicalSetVariableAction,
+    LogicalUnpivotColumn, SortKey, TxnIsolationLevel,
 };
 use crate::scope::{ScopeFrame, ScopeStack};
 

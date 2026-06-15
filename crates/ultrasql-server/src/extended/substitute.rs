@@ -472,6 +472,42 @@ where
                 .collect(),
             schema: schema.clone(),
         },
+        LogicalPlan::Pivot {
+            input,
+            group_columns,
+            pivot_column,
+            aggregate,
+            pivot_values,
+            schema,
+        } => {
+            let mut aggregate = aggregate.clone();
+            aggregate.arg = aggregate.arg.as_ref().map(f);
+            LogicalPlan::Pivot {
+                input: Box::new(map_plan_exprs(input, f)),
+                group_columns: group_columns.clone(),
+                pivot_column: *pivot_column,
+                aggregate,
+                pivot_values: pivot_values.clone(),
+                schema: schema.clone(),
+            }
+        }
+        LogicalPlan::Unpivot {
+            input,
+            passthrough_columns,
+            columns,
+            name_column,
+            value_column,
+            include_nulls,
+            schema,
+        } => LogicalPlan::Unpivot {
+            input: Box::new(map_plan_exprs(input, f)),
+            passthrough_columns: passthrough_columns.clone(),
+            columns: columns.clone(),
+            name_column: name_column.clone(),
+            value_column: value_column.clone(),
+            include_nulls: *include_nulls,
+            schema: schema.clone(),
+        },
         LogicalPlan::SetOp {
             op,
             quantifier,

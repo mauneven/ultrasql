@@ -45,7 +45,7 @@ use crate::set_op::SetOp;
 use crate::sort::Sort;
 use crate::top_k::TopK;
 use crate::values_scan::ValuesScan;
-use crate::{Limit, MemTableScan, Operator, Project};
+use crate::{Limit, MemTableScan, Operator, Pivot, Project, Unpivot};
 
 /// Pluggable backing store for [`build_operator`].
 ///
@@ -265,6 +265,45 @@ pub fn build_operator(
                 child,
                 group_by.clone(),
                 aggregates.clone(),
+                schema.clone(),
+            )))
+        }
+
+        LogicalPlan::Pivot {
+            input,
+            group_columns,
+            pivot_column,
+            aggregate,
+            pivot_values,
+            schema,
+        } => {
+            let child = build_operator(input, data_source)?;
+            let op = Pivot::try_new(
+                child,
+                group_columns.clone(),
+                *pivot_column,
+                aggregate.clone(),
+                pivot_values.clone(),
+                schema.clone(),
+            )
+            .map_err(map_exec_error)?;
+            Ok(Box::new(op))
+        }
+
+        LogicalPlan::Unpivot {
+            input,
+            passthrough_columns,
+            columns,
+            include_nulls,
+            schema,
+            ..
+        } => {
+            let child = build_operator(input, data_source)?;
+            Ok(Box::new(Unpivot::new(
+                child,
+                passthrough_columns.clone(),
+                columns.clone(),
+                *include_nulls,
                 schema.clone(),
             )))
         }

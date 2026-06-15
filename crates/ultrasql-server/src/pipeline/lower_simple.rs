@@ -2,7 +2,9 @@
 //! dispatcher, plus the sample-database loader.
 
 use ultrasql_core::{DataType, Field, Schema};
-use ultrasql_executor::{Filter, Limit, MemTableScan, Operator, Project, ResultOp, SetOp, Sort};
+use ultrasql_executor::{
+    Filter, Limit, MemTableScan, Operator, Pivot, Project, ResultOp, SetOp, Sort, Unpivot,
+};
 use ultrasql_planner::{InMemoryCatalog, LogicalPlan, ScalarExpr};
 use ultrasql_vec::Batch;
 use ultrasql_vec::column::{Column, NumericColumn, StringColumn};
@@ -141,6 +143,41 @@ pub fn lower_plan(
         LogicalPlan::Copy { .. } => Err(ServerError::Unsupported(
             "COPY reached operator lowerer; expected session dispatch path",
         )),
+        LogicalPlan::Pivot {
+            input,
+            group_columns,
+            pivot_column,
+            aggregate,
+            pivot_values,
+            schema,
+        } => {
+            let child = lower_plan(input, tables)?;
+            Ok(Box::new(Pivot::try_new(
+                child,
+                group_columns.clone(),
+                *pivot_column,
+                aggregate.clone(),
+                pivot_values.clone(),
+                schema.clone(),
+            )?))
+        }
+        LogicalPlan::Unpivot {
+            input,
+            passthrough_columns,
+            columns,
+            include_nulls,
+            schema,
+            ..
+        } => {
+            let child = lower_plan(input, tables)?;
+            Ok(Box::new(Unpivot::new(
+                child,
+                passthrough_columns.clone(),
+                columns.clone(),
+                *include_nulls,
+                schema.clone(),
+            )))
+        }
         LogicalPlan::Aggregate { .. } => Err(ServerError::Unsupported("GROUP BY / aggregate")),
         LogicalPlan::SetOp {
             op,

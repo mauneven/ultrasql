@@ -229,6 +229,37 @@ pub struct LogicalAggregateExpr {
     pub data_type: DataType,
 }
 
+/// Aggregate specification inside a logical `PIVOT`.
+#[derive(Clone, Debug, PartialEq)]
+pub struct LogicalPivotAggregate {
+    /// Aggregate function to compute for each pivot bucket.
+    pub func: AggregateFunc,
+    /// Bound aggregate argument, or `None` for `COUNT(*)`.
+    pub arg: Option<ScalarExpr>,
+    /// Result data type for each pivot output column.
+    pub data_type: DataType,
+}
+
+/// One value/output-column pair inside a logical `PIVOT`.
+#[derive(Clone, Debug, PartialEq)]
+pub struct LogicalPivotValue {
+    /// Constant pivot-key value.
+    pub value: Value,
+    /// Static type of `value`.
+    pub data_type: DataType,
+    /// Output column name for this pivot bucket.
+    pub output_name: String,
+}
+
+/// One input column/label pair inside a logical `UNPIVOT`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LogicalUnpivotColumn {
+    /// 0-based input source column index.
+    pub source_column: usize,
+    /// Text label emitted into the unpivot name column.
+    pub label: String,
+}
+
 // ============================================================================
 // SortKey and conflict types (pre-existing)
 // ============================================================================
@@ -788,6 +819,46 @@ pub enum LogicalPlan {
         /// Aggregate function calls.
         aggregates: Vec<LogicalAggregateExpr>,
         /// Output schema: group-by columns then aggregate columns.
+        schema: Schema,
+    },
+
+    /// Table-factor `PIVOT` transform.
+    ///
+    /// The output schema is `[group columns..., pivot value columns...]`.
+    /// Group columns are inferred as input columns not consumed by the
+    /// pivot key or aggregate argument.
+    Pivot {
+        /// Input plan to pivot.
+        input: Box<Self>,
+        /// Input columns carried through as grouping keys.
+        group_columns: Vec<usize>,
+        /// Input column whose values select the pivot bucket.
+        pivot_column: usize,
+        /// Aggregate computed per group and pivot value.
+        aggregate: LogicalPivotAggregate,
+        /// Constant pivot values and output names.
+        pivot_values: Vec<LogicalPivotValue>,
+        /// Output schema.
+        schema: Schema,
+    },
+
+    /// Table-factor `UNPIVOT` transform.
+    ///
+    /// The output schema is `[passthrough columns..., name column, value column]`.
+    Unpivot {
+        /// Input plan to unpivot.
+        input: Box<Self>,
+        /// Input columns carried through unchanged.
+        passthrough_columns: Vec<usize>,
+        /// Input columns expanded into rows.
+        columns: Vec<LogicalUnpivotColumn>,
+        /// Output name column.
+        name_column: String,
+        /// Output value column.
+        value_column: String,
+        /// Whether rows with NULL unpivoted values are retained.
+        include_nulls: bool,
+        /// Output schema.
         schema: Schema,
     },
 
@@ -2014,6 +2085,8 @@ impl LogicalPlan {
             | Self::Sort { .. }
             | Self::Window { .. }
             | Self::Aggregate { .. }
+            | Self::Pivot { .. }
+            | Self::Unpivot { .. }
             | Self::Join { .. }
             | Self::SetOp { .. }
             | Self::LockRows { .. } => true,
@@ -2102,6 +2175,8 @@ impl LogicalPlan {
             | Self::CreateOperator { schema, .. }
             | Self::Join { schema, .. }
             | Self::Aggregate { schema, .. }
+            | Self::Pivot { schema, .. }
+            | Self::Unpivot { schema, .. }
             | Self::SetOp { schema, .. }
             | Self::Cte { schema, .. }
             | Self::LockRows { schema, .. }
@@ -2629,6 +2704,52 @@ impl LogicalPlan {
                     }
                 }
                 out.push_str("]\n");
+                input.display_into(indent + 2, out);
+            }
+            Self::Pivot {
+                input,
+                group_columns,
+                pivot_column,
+                aggregate,
+                pivot_values,
+                ..
+            } => {
+                out.push_str(&pad);
+                let _ = fmt::write(
+                    out,
+                    format_args!(
+                        "Pivot: groups={group_columns:?} pivot_column={pivot_column} func={:?} values=[{}]\n",
+                        aggregate.func,
+                        pivot_values
+                            .iter()
+                            .map(|value| value.output_name.as_str())
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    ),
+                );
+                input.display_into(indent + 2, out);
+            }
+            Self::Unpivot {
+                input,
+                passthrough_columns,
+                columns,
+                name_column,
+                value_column,
+                include_nulls,
+                ..
+            } => {
+                out.push_str(&pad);
+                let _ = fmt::write(
+                    out,
+                    format_args!(
+                        "Unpivot: passthrough={passthrough_columns:?} name={name_column} value={value_column} include_nulls={include_nulls} columns=[{}]\n",
+                        columns
+                            .iter()
+                            .map(|column| column.label.as_str())
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    ),
+                );
                 input.display_into(indent + 2, out);
             }
             Self::SetOp {

@@ -50,6 +50,34 @@ pub(super) fn plan_sources(plan: &LogicalPlan) -> Vec<Option<ColumnSource>> {
             sources.extend((0..aggregates.len()).map(|_| None));
             sources
         }
+        LogicalPlan::Pivot {
+            input,
+            group_columns,
+            pivot_values,
+            ..
+        } => {
+            let input_sources = plan_sources(input);
+            let mut sources = group_columns
+                .iter()
+                .map(|idx| input_sources.get(*idx).cloned().flatten())
+                .collect::<Vec<_>>();
+            sources.extend((0..pivot_values.len()).map(|_| None));
+            sources
+        }
+        LogicalPlan::Unpivot {
+            input,
+            passthrough_columns,
+            ..
+        } => {
+            let input_sources = plan_sources(input);
+            let mut sources = passthrough_columns
+                .iter()
+                .map(|idx| input_sources.get(*idx).cloned().flatten())
+                .collect::<Vec<_>>();
+            sources.push(None);
+            sources.push(None);
+            sources
+        }
         LogicalPlan::Join {
             left,
             right,

@@ -263,6 +263,18 @@ where
                 }
                 self.collect_plan(input, false);
             }
+            LogicalPlan::Pivot {
+                input, aggregate, ..
+            } => {
+                let sources = plan_sources(input);
+                if let Some(arg) = &aggregate.arg {
+                    self.collect_expr(arg, &sources, PrivilegeKind::Select);
+                }
+                self.collect_plan(input, true);
+            }
+            LogicalPlan::Unpivot { input, .. } => {
+                self.collect_plan(input, true);
+            }
             LogicalPlan::Join {
                 left,
                 right,

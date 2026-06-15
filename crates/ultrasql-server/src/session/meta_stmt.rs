@@ -331,6 +331,17 @@ fn walk_plan_for_max_param(plan: &LogicalPlan, max_idx: &mut u32) {
                 }
             }
         }
+        LogicalPlan::Pivot {
+            input, aggregate, ..
+        } => {
+            walk_plan_for_max_param(input, max_idx);
+            if let Some(arg) = &aggregate.arg {
+                walk_expr_for_max_param(arg, max_idx);
+            }
+        }
+        LogicalPlan::Unpivot { input, .. } => {
+            walk_plan_for_max_param(input, max_idx);
+        }
         LogicalPlan::Join {
             left,
             right,

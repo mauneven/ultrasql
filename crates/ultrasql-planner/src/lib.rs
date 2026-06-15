@@ -40,12 +40,12 @@ pub use plan::{
     LogicalDefaultPrivilegeOperation, LogicalDescribeObjectKind, LogicalDescribeTarget,
     LogicalForeignKeyConstraint, LogicalIndexMethod, LogicalIndexOption, LogicalJoinCondition,
     LogicalJoinType, LogicalMergeAction, LogicalMergeClause, LogicalMergeMatchKind,
-    LogicalOnConflict, LogicalPlan, LogicalPrivilegeKind, LogicalPrivilegeObjectKind,
-    LogicalPrivilegeSpec, LogicalReferentialAction, LogicalRlsCommand, LogicalRlsPermissiveness,
-    LogicalRlsPolicy, LogicalRoleKind, LogicalRoleOptions, LogicalSequenceChange,
-    LogicalSequenceOptions, LogicalSetOp, LogicalSetQuantifier, LogicalSetVariableAction,
-    LogicalTableOption, LogicalTenantPolicyExpr, LogicalUniqueConstraint, LogicalWindowFunc,
-    SortKey, TxnIsolationLevel,
+    LogicalOnConflict, LogicalPivotAggregate, LogicalPivotValue, LogicalPlan, LogicalPrivilegeKind,
+    LogicalPrivilegeObjectKind, LogicalPrivilegeSpec, LogicalReferentialAction, LogicalRlsCommand,
+    LogicalRlsPermissiveness, LogicalRlsPolicy, LogicalRoleKind, LogicalRoleOptions,
+    LogicalSequenceChange, LogicalSequenceOptions, LogicalSetOp, LogicalSetQuantifier,
+    LogicalSetVariableAction, LogicalTableOption, LogicalTenantPolicyExpr, LogicalUniqueConstraint,
+    LogicalUnpivotColumn, LogicalWindowFunc, SortKey, TxnIsolationLevel,
 };
 
 #[cfg(test)]

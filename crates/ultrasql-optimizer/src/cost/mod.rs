@@ -279,6 +279,18 @@ impl<'s> CostModel<'s> {
                 cost_aggregate(input_est, n_groups, &self.gucs)
             }
 
+            LogicalPlan::Pivot { input, .. } => {
+                let input_est = self.estimate(input);
+                let n_groups = input_est.rows.max(1.0).sqrt();
+                cost_aggregate(input_est, n_groups, &self.gucs)
+            }
+
+            LogicalPlan::Unpivot { input, columns, .. } => {
+                let mut est = self.estimate(input);
+                est.rows *= columns.len().to_f64().unwrap_or(1.0);
+                est
+            }
+
             LogicalPlan::SetOp { left, right, .. } => {
                 // Model as nested-loop-style: left cost + right cost + output rows.
                 let left_est = self.estimate(left);

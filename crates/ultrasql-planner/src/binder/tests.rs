@@ -81,6 +81,30 @@ fn fact_events_catalog() -> InMemoryCatalog {
     cat
 }
 
+fn sales_pivot_catalog() -> InMemoryCatalog {
+    let schema = Schema::new([
+        Field::required("region", DataType::Text { max_len: None }),
+        Field::required("quarter", DataType::Text { max_len: None }),
+        Field::nullable("amount", DataType::Int32),
+    ])
+    .expect("schema ok");
+    let mut cat = InMemoryCatalog::new();
+    cat.register("sales", TableMeta::new(schema));
+    cat
+}
+
+fn quarterly_unpivot_catalog() -> InMemoryCatalog {
+    let schema = Schema::new([
+        Field::required("id", DataType::Int32),
+        Field::nullable("q1", DataType::Int32),
+        Field::nullable("q2", DataType::Int32),
+    ])
+    .expect("schema ok");
+    let mut cat = InMemoryCatalog::new();
+    cat.register("quarterly", TableMeta::new(schema));
+    cat
+}
+
 fn timestamp_catalog() -> InMemoryCatalog {
     let schema = Schema::new([
         Field::required("id", DataType::Int32),
@@ -2726,6 +2750,195 @@ fn binds_natural_join_collapses_shared_columns_without_ambiguous_select() {
     assert_eq!(schema.field_at(2).name, "right_name");
 }
 
+#[test]
+fn binds_pivot_table_factor_schema_and_keys() {
+    let cat = sales_pivot_catalog();
+    let plan = parse_and_bind(
+        "SELECT * FROM sales \
+         PIVOT (SUM(amount) FOR quarter IN ('Q1' AS q1, 'Q2' AS q2))",
+        &cat,
+    )
+    .expect("bind ok");
+
+    assert_eq!(
+        plan.schema()
+            .fields()
+            .iter()
+            .map(|field| field.name.as_str())
+            .collect::<Vec<_>>(),
+        vec!["region", "q1", "q2"]
+    );
+    assert_eq!(plan.schema().field_at(1).data_type, DataType::Int64);
+
+    fn find_pivot(plan: &LogicalPlan) -> Option<&LogicalPlan> {
+        match plan {
+            LogicalPlan::Pivot { .. } => Some(plan),
+            LogicalPlan::Project { input, .. }
+            | LogicalPlan::Filter { input, .. }
+            | LogicalPlan::Sort { input, .. }
+            | LogicalPlan::Limit { input, .. } => find_pivot(input),
+            _ => None,
+        }
+    }
+    let pivot = find_pivot(&plan).expect("should contain Pivot");
+    let LogicalPlan::Pivot {
+        group_columns,
+        pivot_column,
+        aggregate,
+        pivot_values,
+        ..
+    } = pivot
+    else {
+        panic!("expected Pivot");
+    };
+    assert_eq!(group_columns, &[0]);
+    assert_eq!(*pivot_column, 1);
+    assert_eq!(aggregate.func, AggregateFunc::Sum);
+    assert!(aggregate.arg.is_some());
+    assert_eq!(pivot_values.len(), 2);
+    assert_eq!(pivot_values[0].output_name, "q1");
+}
+
+#[test]
+fn pivot_values_coerce_to_pivot_column_type() {
+    let cat = users_catalog();
+    let plan = parse_and_bind(
+        "SELECT * FROM users PIVOT (COUNT(*) FOR score IN (1 AS one))",
+        &cat,
+    )
+    .expect("bind ok");
+
+    fn find_pivot(plan: &LogicalPlan) -> Option<&LogicalPlan> {
+        match plan {
+            LogicalPlan::Pivot { .. } => Some(plan),
+            LogicalPlan::Project { input, .. }
+            | LogicalPlan::Filter { input, .. }
+            | LogicalPlan::Sort { input, .. }
+            | LogicalPlan::Limit { input, .. } => find_pivot(input),
+            _ => None,
+        }
+    }
+    let pivot = find_pivot(&plan).expect("should contain Pivot");
+    let LogicalPlan::Pivot { pivot_values, .. } = pivot else {
+        panic!("expected Pivot");
+    };
+    assert_eq!(pivot_values[0].value, Value::Float64(1.0));
+    assert_eq!(pivot_values[0].data_type, DataType::Float64);
+}
+
+#[test]
+fn pivot_values_that_cannot_be_coerced_fail_fast() {
+    let cat = users_catalog();
+    let err = parse_and_bind(
+        "SELECT * FROM users PIVOT (COUNT(*) FOR id IN (1.5 AS bad))",
+        &cat,
+    )
+    .expect_err("fractional pivot value should not match integer column");
+    assert!(matches!(err, PlanError::TypeMismatch(_)), "got {err:?}");
+    assert!(err.to_string().contains("cannot be coerced"));
+}
+
+#[test]
+fn binds_unpivot_table_factor_schema_and_columns() {
+    let cat = quarterly_unpivot_catalog();
+    let plan = parse_and_bind(
+        "SELECT * FROM quarterly \
+         UNPIVOT INCLUDE NULLS (amount FOR quarter IN (q1 AS 'Q1', q2 AS 'Q2'))",
+        &cat,
+    )
+    .expect("bind ok");
+
+    assert_eq!(
+        plan.schema()
+            .fields()
+            .iter()
+            .map(|field| field.name.as_str())
+            .collect::<Vec<_>>(),
+        vec!["id", "quarter", "amount"]
+    );
+    assert_eq!(
+        plan.schema().field_at(1).data_type,
+        DataType::Text { max_len: None }
+    );
+    assert_eq!(plan.schema().field_at(2).data_type, DataType::Int32);
+
+    fn find_unpivot(plan: &LogicalPlan) -> Option<&LogicalPlan> {
+        match plan {
+            LogicalPlan::Unpivot { .. } => Some(plan),
+            LogicalPlan::Project { input, .. }
+            | LogicalPlan::Filter { input, .. }
+            | LogicalPlan::Sort { input, .. }
+            | LogicalPlan::Limit { input, .. } => find_unpivot(input),
+            _ => None,
+        }
+    }
+    let unpivot = find_unpivot(&plan).expect("should contain Unpivot");
+    let LogicalPlan::Unpivot {
+        passthrough_columns,
+        columns,
+        include_nulls,
+        ..
+    } = unpivot
+    else {
+        panic!("expected Unpivot");
+    };
+    assert_eq!(passthrough_columns, &[0]);
+    assert_eq!(columns.len(), 2);
+    assert_eq!(columns[0].source_column, 1);
+    assert_eq!(columns[0].label, "Q1");
+    assert!(*include_nulls);
+}
+
+#[test]
+fn pivot_duplicate_output_names_are_rejected() {
+    let cat = sales_pivot_catalog();
+    let err = parse_and_bind(
+        "SELECT * FROM sales \
+         PIVOT (SUM(amount) FOR quarter IN ('Q1' AS q, 'Q2' AS q))",
+        &cat,
+    )
+    .expect_err("duplicate pivot outputs");
+    assert!(matches!(err, PlanError::TypeMismatch(_)), "got {err:?}");
+    assert!(err.to_string().contains("duplicate PIVOT output column"));
+}
+
+#[test]
+fn pivot_duplicate_values_are_rejected() {
+    let cat = sales_pivot_catalog();
+    let err = parse_and_bind(
+        "SELECT * FROM sales \
+         PIVOT (SUM(amount) FOR quarter IN ('Q1' AS q1, 'Q1' AS q1_again))",
+        &cat,
+    )
+    .expect_err("duplicate pivot values");
+    assert!(matches!(err, PlanError::TypeMismatch(_)), "got {err:?}");
+    assert!(err.to_string().contains("duplicate PIVOT value Q1"));
+}
+
+#[test]
+fn pivot_sum_requires_supported_numeric_argument() {
+    let cat = sales_pivot_catalog();
+    let err = parse_and_bind(
+        "SELECT * FROM sales \
+         PIVOT (SUM(region) FOR quarter IN ('Q1' AS q1))",
+        &cat,
+    )
+    .expect_err("text pivot SUM should be rejected");
+    assert!(matches!(err, PlanError::TypeMismatch(_)), "got {err:?}");
+    assert!(err.to_string().contains("PIVOT Sum argument must be"));
+}
+
+#[test]
+fn unpivot_missing_source_column_is_rejected() {
+    let cat = quarterly_unpivot_catalog();
+    let err = parse_and_bind(
+        "SELECT * FROM quarterly UNPIVOT (amount FOR quarter IN (q1, q3))",
+        &cat,
+    )
+    .expect_err("missing unpivot column");
+    assert_eq!(err, PlanError::ColumnNotFound("q3".to_owned()));
+}
+
 // -----------------------------------------------------------------------
 // GROUP BY / aggregate tests
 // -----------------------------------------------------------------------
@@ -4252,6 +4465,8 @@ fn collect_window_funcs<'a>(plan: &'a LogicalPlan, out: &mut Vec<&'a LogicalWind
         | LogicalPlan::Limit { input, .. }
         | LogicalPlan::Sort { input, .. }
         | LogicalPlan::Aggregate { input, .. }
+        | LogicalPlan::Pivot { input, .. }
+        | LogicalPlan::Unpivot { input, .. }
         | LogicalPlan::LockRows { input, .. }
         | LogicalPlan::Update { input, .. }
         | LogicalPlan::Delete { input, .. } => collect_window_funcs(input, out),
