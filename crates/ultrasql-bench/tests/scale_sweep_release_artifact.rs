@@ -61,6 +61,7 @@ fn scale_sweep_workflow_benchmarks_current_commit_binary() {
         )
     );
     assert!(workflow.contains("scripts/run-benchmark-certification.py"));
+    assert!(workflow.contains("--mode full"));
     assert!(workflow.contains("--skip-build"));
     assert!(workflow.contains("--min-comparable-rows 17"));
     assert!(
@@ -153,6 +154,47 @@ fn scale_sweep_writes_manifest_before_fastest_gate() {
         manifest_write < lead_check,
         "scale sweep must write manifest before the lead check so failed sweeps upload fresh status evidence"
     );
+}
+
+#[test]
+fn ultrasql_delete_benchmark_uses_rollback_methodology() {
+    let driver = repo_file("crates/ultrasql-bench/src/bin/cross_compare_sql.rs");
+    let start = driver
+        .find("async fn run_delete_iter")
+        .expect("run_delete_iter");
+    let tail = &driver[start..];
+    let end = tail
+        .find("/// Shared-table SELECT-scan workload")
+        .expect("next workload marker");
+    let body = &tail[..end];
+
+    let begin = body.find(".batch_execute(\"BEGIN\")").expect("BEGIN");
+    let started = body
+        .find("let started = Instant::now()")
+        .expect("timed region start");
+    let rollback = body.find(".batch_execute(\"ROLLBACK\")").expect("ROLLBACK");
+
+    assert!(
+        begin < started && started < rollback,
+        "DELETE sweep must time only the DELETE statement inside BEGIN/ROLLBACK"
+    );
+}
+
+#[test]
+fn ultrasql_mixed_oltp_batches_wire_roundtrips() {
+    let driver = repo_file("crates/ultrasql-bench/src/bin/cross_compare_sql.rs");
+    let start = driver
+        .find("async fn run_mixed_oltp_iter")
+        .expect("run_mixed_oltp_iter");
+    let tail = &driver[start..];
+    let end = tail.find("struct SplitMix64").expect("next marker");
+    let body = &tail[..end];
+
+    assert!(body.contains("const MIXED_BATCH_OPS"));
+    assert!(body.contains("for _ in 0..MIXED_BATCH_OPS"));
+    assert!(body.contains(".batch_execute(&sql)"));
+    assert!(body.contains("CREATE INDEX"));
+    assert!(body.contains("bench_mixed_id_idx"));
 }
 
 #[test]

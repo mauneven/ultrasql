@@ -167,7 +167,7 @@ jobs:
         run: |
           CH_BIN="$(command -v clickhouse)" \
             python3 scripts/run-benchmark-certification.py \
-              --mode quick \
+              --mode full \
               --skip-build \
               --python "$RUNNER_TEMP/clickhouse-driver-venv/bin/python" \
               --min-comparable-rows 17

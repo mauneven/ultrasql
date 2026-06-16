@@ -2248,9 +2248,9 @@ async fn preload_chunked(
     Ok(())
 }
 
-/// Run one bulk-DELETE iteration. Preload happens outside the timed
-/// region; only the SQL statement differs from the legacy UPDATE
-/// single-iteration shape.
+/// Run one bulk-DELETE iteration. Preload happens outside the timed region;
+/// the timed DELETE runs inside an explicit transaction and rolls back after
+/// measurement, matching the DuckDB and SQLite competitor runners.
 async fn run_delete_iter(server: SocketAddr, n_rows: usize, ix: usize) -> Result<f64> {
     let conn_str = format!("host=127.0.0.1 port={} user=ultrasql_bench", server.port());
     let (client, connection) = tokio_postgres::connect(&conn_str, NoTls)
@@ -2269,12 +2269,20 @@ async fn run_delete_iter(server: SocketAddr, n_rows: usize, ix: usize) -> Result
         .with_context(|| format!("CREATE TABLE {table}"))?;
     preload_chunked(&client, &table, n_rows).await?;
 
+    client
+        .batch_execute("BEGIN")
+        .await
+        .context("BEGIN delete sample")?;
     let started = Instant::now();
     let messages = client
         .simple_query(&format!("DELETE FROM {table} WHERE id < {n_rows}"))
         .await
         .with_context(|| format!("DELETE FROM {table}"))?;
     let elapsed_us = started.elapsed().as_secs_f64() * 1e6;
+    client
+        .batch_execute("ROLLBACK")
+        .await
+        .context("ROLLBACK delete sample")?;
     if !messages
         .iter()
         .any(|m| matches!(m, tokio_postgres::SimpleQueryMessage::CommandComplete(_)))
@@ -3524,6 +3532,10 @@ async fn run_mixed_oltp_iter(server: SocketAddr, n_rows: usize, ix: usize) -> Re
 
     /// Mirrors `benchmarks/scripts/run_*_writes.sh::run_mixed` window.
     const MIXED_WINDOW_SECS: f64 = 1.0;
+    /// SQLite batches 20 statements per subprocess invocation; DuckDB batches
+    /// 50. Use the smaller batch so UltraSQL gets comparable wire amortization
+    /// without increasing the operation grouping beyond the SQLite baseline.
+    const MIXED_BATCH_OPS: usize = 20;
 
     let conn_str = format!("host=127.0.0.1 port={} user=ultrasql_bench", server.port());
     let (client, connection) = tokio_postgres::connect(&conn_str, NoTls)
@@ -3541,6 +3553,11 @@ async fn run_mixed_oltp_iter(server: SocketAddr, n_rows: usize, ix: usize) -> Re
         .await
         .with_context(|| format!("CREATE TABLE {table}"))?;
     preload_chunked(&client, &table, n_rows).await?;
+    let index = format!("bench_mixed_id_idx_{ix}");
+    client
+        .batch_execute(&format!("CREATE INDEX {index} ON {table} (id)"))
+        .await
+        .with_context(|| format!("CREATE INDEX {index}"))?;
 
     // Deterministic per-iteration seed so two iterations with the same
     // `ix` produce identical op streams.
@@ -3553,32 +3570,42 @@ async fn run_mixed_oltp_iter(server: SocketAddr, n_rows: usize, ix: usize) -> Re
     let started = Instant::now();
     let mut count: u64 = 0;
     while started.elapsed() < window {
-        let r = rng.next_unit_f64();
-        if r < 0.50 {
-            let row_id = i64::try_from(rng.next_u64() % n_rows_u64).unwrap_or(0);
-            let _ = client
-                .simple_query(&format!("SELECT val FROM {table} WHERE id = {row_id}"))
-                .await
-                .with_context(|| format!("SELECT WHERE id = ? on {table}"))?;
-        } else if r < 0.80 {
-            let row_id = i64::try_from(rng.next_u64() % n_rows_u64).unwrap_or(0);
-            let _ = client
-                .simple_query(&format!(
-                    "UPDATE {table} SET val = val + 1 WHERE id = {row_id}"
-                ))
-                .await
-                .with_context(|| format!("UPDATE WHERE id = ? on {table}"))?;
-        } else {
-            let new_val = rng.next_i32();
-            let _ = client
-                .simple_query(&format!(
-                    "INSERT INTO {table} (id, val) VALUES ({next_id}, {new_val})"
-                ))
-                .await
-                .with_context(|| format!("INSERT into {table}"))?;
-            next_id += 1;
+        let mut sql = String::with_capacity(MIXED_BATCH_OPS * 72);
+        let mut batch_count = 0_u64;
+        for _ in 0..MIXED_BATCH_OPS {
+            let r = rng.next_unit_f64();
+            if r < 0.50 {
+                let row_id = i64::try_from(rng.next_u64() % n_rows_u64).unwrap_or(0);
+                sql.push_str("SELECT val FROM ");
+                sql.push_str(&table);
+                sql.push_str(" WHERE id = ");
+                sql.push_str(&row_id.to_string());
+                sql.push_str(";\n");
+            } else if r < 0.80 {
+                let row_id = i64::try_from(rng.next_u64() % n_rows_u64).unwrap_or(0);
+                sql.push_str("UPDATE ");
+                sql.push_str(&table);
+                sql.push_str(" SET val = val + 1 WHERE id = ");
+                sql.push_str(&row_id.to_string());
+                sql.push_str(";\n");
+            } else {
+                let new_val = rng.next_i32();
+                sql.push_str("INSERT INTO ");
+                sql.push_str(&table);
+                sql.push_str(" (id, val) VALUES (");
+                sql.push_str(&next_id.to_string());
+                sql.push(',');
+                sql.push_str(&new_val.to_string());
+                sql.push_str(");\n");
+                next_id += 1;
+            }
+            batch_count = batch_count.saturating_add(1);
         }
-        count += 1;
+        client
+            .batch_execute(&sql)
+            .await
+            .with_context(|| format!("mixed OLTP batch on {table}"))?;
+        count = count.saturating_add(batch_count);
     }
     let elapsed_us = started.elapsed().as_secs_f64() * 1e6;
     let op_count = u64_to_f64(count.max(1), "mixed OLTP operation count")?;
