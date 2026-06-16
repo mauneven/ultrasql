@@ -3,7 +3,7 @@
 Last audited: 2026-06-16.
 
 Evidence baseline observed before this docs-only audit update:
-`cc1d5b2c9ff08d41dbbc25a5095ee5a79c3e80ee`.
+`7449f11d8c9ee130c228298f2a57407ec01b9580`.
 
 This page records evidence that was current at audit time. Every docs-only
 commit creates a newer CI run, so do not treat these run IDs as a permanent
@@ -28,11 +28,11 @@ The ethical claim today is narrower:
 
 - UltraSQL leads the committed 2026-06-14 release-artifact DB-vs-DB scale sweep
   on 24 of 24 comparable measured rows on the recorded Apple M4 host.
-- UltraSQL had green `main` CI for commit `8f771ace`. CI for the evidence
-  baseline commit was still in progress when this audit was updated.
+- UltraSQL had green `main` CI for commit `8f771ace`. CI for the current
+  evidence baseline was not rechecked in this docs pass.
 - UltraSQL still lacks required independent production evidence: operator soak
-  reports, external audits, incident drills, and a release-commit driver status
-  artifact.
+  reports, external audits, incident drills, release-commit driver status, and
+  fresh strict benchmark certification.
 
 ## Evidence Checked
 
@@ -48,7 +48,8 @@ The ethical claim today is narrower:
 | Sanitizers workflow | GitHub run `27526490428` for commit `f9fc5c6f` | success |
 | Bench workflow | GitHub run `27532810814` for commit `f9fc5c6f` | cancelled; latest committed scale-sweep artifact remains 2026-06-14 |
 | Release-artifact scale sweep | `benchmarks/results/latest/scale-sweep/scale_sweep.json` | UltraSQL fastest on 24 of 24 comparable measured rows |
-| Benchmark certification profile | `benchmarks/results/latest/benchmark_certification_manifest.json` | smoke profile passed; this is not full release benchmark certification |
+| Benchmark certification status | `benchmarks/results/latest/benchmark_certification_status.json` | `not_ready`; committed scale sweep is stale, lacks data-dir mode evidence, and predates strict raw-artifact schema |
+| Aggregate release gate | `benchmarks/results/latest/release_gate_status.json` | `not_ready`; blockers remain across driver, operator soak, external audit, incident drill, and benchmark gates |
 | Operator soak status | `benchmarks/results/latest/operator_soak_status.json` | `not_ready`; 0 valid release reports, need 3 independent 30-day reports |
 | External audit status | `benchmarks/results/latest/external_audit_status.json` | `not_ready`; 0 valid reports, need 2 independent reports covering security and correctness for commit `043093e8` |
 | Incident drill status | `benchmarks/results/latest/incident_drill_status.json` | `not_ready`; 0 valid release drills, need backup restore, WAL recovery, and disk-full drills |
@@ -83,11 +84,12 @@ The ethical claim today is narrower:
   commit has a fresh `target/driver-certification.json` and strict validation.
 - The latest scheduled benchmark workflow for the audited commit was cancelled,
   so the current README benchmark table is the 2026-06-14 release-artifact run,
-  not a new 2026-06-15 full benchmark run.
+  not a fresh current-commit full benchmark run.
+- `scripts/validate-release-evidence.py` reports the aggregate release gate as
+  `not_ready`; missing or stale evidence fails closed.
 - Broader production claims still need longer fuzz windows, Miri breadth,
-  larger benchmark scales, WAL-backed data-dir benchmark modes, full benchmark
-  certification profile evidence, broader SQL regression coverage, and real
-  incident-response practice.
+  larger benchmark scales, strict WAL-backed data-dir benchmark certification,
+  broader SQL regression coverage, and real incident-response practice.
 
 ## Claim Policy
 
@@ -116,7 +118,9 @@ Those stronger claims require every release gate in
 2. Run and validate three independent 30-day operator soaks.
 3. Complete independent security and correctness audits.
 4. Complete backup-restore, WAL-recovery, and disk-full incident drills.
-5. Rerun benchmark certification on the release host, including the
-   release-artifact DB-vs-DB scale sweep with ClickHouse enabled.
-6. Keep expanding correctness coverage, SQL compatibility, fuzzing, Miri,
+5. Rerun benchmark certification on the release host with:
+   `python3 scripts/run-benchmark-certification.py --mode full`.
+6. Close the aggregate release gate with:
+   `python3 scripts/validate-release-evidence.py --commit <release-commit> --strict`.
+7. Keep expanding correctness coverage, SQL compatibility, fuzzing, Miri,
    sanitizer, crash-recovery, replication, backup, and observability evidence.

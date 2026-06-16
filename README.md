@@ -47,6 +47,7 @@ Useful commands:
 cargo run --package ultrasql-bench --features sql-bench --bin cross_compare_sql -- --help
 cargo run --package ultrasql-bench --bin readme-render
 benchmarks/certify.sh smoke
+python3 scripts/run-benchmark-certification.py --mode full
 ```
 
 Raw benchmark data lives under
@@ -57,6 +58,9 @@ Raw benchmark data lives under
 
 Fresh run (2026-06-14):
 `CH_BIN="$(command -v clickhouse)" SCALE_SWEEP_ROWS="10000 100000 1000000" ULTRASQLD_BIN=target/release-ship/ultrasqld benchmarks/run_scale_sweep.sh full`.
+Strict release reruns use `python3 scripts/run-benchmark-certification.py --mode full`.
+The committed `benchmark_certification_status.json` is currently `not_ready`
+until a fresh current-commit data-dir sweep passes strict validation.
 UltraSQL v0.0.9 was launched as an external `ultrasqld` over TCP on the same
 Apple M4 host as installed DuckDB v1.5.2, ClickHouse 26.5.2.39, SQLite 3.51.0,
 and PostgreSQL 14.22 (Homebrew). Each row uses 32 measured samples after 8 warmup samples;

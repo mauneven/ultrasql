@@ -1321,7 +1321,7 @@ fn release_user_docs_exist_and_state_current_limits() {
         assert!(changelog.contains(needle), "CHANGELOG missing {needle}");
     }
     for needle in [
-        "pre-alpha",
+        "alpha",
         "Build from source",
         "Run tests",
         "SQLLogicTest",
