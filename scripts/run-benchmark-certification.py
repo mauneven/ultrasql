@@ -122,6 +122,27 @@ def run_checked(cmd: list[str], *, cwd: Path, env: dict[str, str] | None = None)
     subprocess.run(cmd, cwd=cwd, env=env, check=True)
 
 
+def run_scale_sweep(
+    cmd: list[str],
+    *,
+    cwd: Path,
+    env: dict[str, str],
+    continue_on_failure: bool,
+) -> None:
+    print("+ " + " ".join(cmd), flush=True)
+    completed = subprocess.run(cmd, cwd=cwd, env=env, check=False)
+    if completed.returncode == 0:
+        return
+    if continue_on_failure:
+        print(
+            "benchmark sweep exited "
+            f"{completed.returncode}; continuing to write not_ready status",
+            file=sys.stderr,
+        )
+        return
+    raise subprocess.CalledProcessError(completed.returncode, cmd)
+
+
 def require_clickhouse(python: str) -> None:
     missing: list[str] = []
     if shutil.which("clickhouse") is None:
@@ -199,7 +220,12 @@ def main() -> int:
             env["ULTRASQLD_BIN"] = str(ultrasqld)
             env["SCALE_SWEEP_OUT"] = str(out_dir)
             env["SCALE_SWEEP_STORAGE"] = args.storage
-            run_checked([str(scale_script), args.mode], cwd=repo_root, env=env)
+            run_scale_sweep(
+                [str(scale_script), args.mode],
+                cwd=repo_root,
+                env=env,
+                continue_on_failure=args.no_strict,
+            )
 
         validate_cmd = [
             args.python,
