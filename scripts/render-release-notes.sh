@@ -14,8 +14,9 @@ driver_status_json="$5"
 out="$6"
 template="docs/release-notes-template.md"
 RELEASE_RUN_URL="${GITHUB_SERVER_URL:-https://github.com}/${GITHUB_REPOSITORY:-mauneven/ultrasql}/actions/runs/${GITHUB_RUN_ID:-local}"
-# Driver compatibility input is produced by scripts/validate-driver-compatibility.py
-# as driver_compatibility_status.json.
+# Driver compatibility input is produced by scripts/run-driver-release-evidence.py,
+# which invokes scripts/validate-driver-compatibility.py and writes
+# driver_compatibility_status.json.
 
 summarize_status() {
     python3 - "$1" <<'PY'

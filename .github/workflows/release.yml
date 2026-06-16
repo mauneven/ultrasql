@@ -119,24 +119,21 @@ jobs:
           go -C tests/driver_certification/go mod download
           cargo fetch --manifest-path tests/driver_certification/diesel/Cargo.toml
           dotnet restore --locked-mode tests/driver_certification/dotnet/Ultrasql.DriverCertification.csproj
-      - run: cargo build -p ultrasql-server --bin ultrasqld
-      - name: run driver certification
-        run: |
-          .venv-driver-cert/bin/python tests/driver_certification/driver_certification.py \
-            --ultrasqld target/debug/ultrasqld \
-            --json-output target/driver-certification.json
-      - name: validate driver compatibility
+      - name: run and validate driver release evidence
         shell: bash
         run: |
+          # run-driver-release-evidence.py builds ultrasqld, writes
+          # target/driver-certification.json, and invokes
+          # scripts/validate-driver-compatibility.py.
           args=(
-            --report target/driver-certification.json
             --commit "$GITHUB_SHA"
             --out target/driver_compatibility_status.json
+            --python .venv-driver-cert/bin/python
           )
-          if [[ "$RELEASE_TAG" != v0.* ]]; then
-            args+=(--strict)
+          if [[ "$RELEASE_TAG" == v0.* ]]; then
+            args+=(--no-strict)
           fi
-          python3 scripts/validate-driver-compatibility.py "${args[@]}"
+          python3 scripts/run-driver-release-evidence.py "${args[@]}"
       - name: validate operator soak reports
         shell: bash
         run: |

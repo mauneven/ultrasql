@@ -65,6 +65,22 @@ dotnet restore --locked-mode tests/driver_certification/dotnet/Ultrasql.DriverCe
   --ultrasqld target/debug/ultrasqld
 ```
 
+Release evidence can be generated through one command after dependencies are
+installed:
+
+```bash
+python3 scripts/run-driver-release-evidence.py \
+  --commit "$(git rev-parse HEAD)" \
+  --out benchmarks/results/latest/driver_compatibility_status.json
+```
+
+That command builds `ultrasqld`, runs
+`tests/driver_certification/driver_certification.py`, writes
+`target/driver-certification.json`, validates it with
+`scripts/validate-driver-compatibility.py --strict`, and writes the status
+artifact. It exits non-zero if the report is stale, malformed, missing a
+required driver, or contains any failed required driver.
+
 The harness starts a real `ultrasqld` process on an ephemeral localhost port
 and verifies startup, simple query, extended query parameter binding, DDL/DML,
 migration version tables, explicit transaction rollback, and failed-transaction
@@ -74,6 +90,14 @@ recovery. It writes a machine-readable report to
 ## Release Gate
 
 v1.0 and later releases require strict validation of that report:
+
+```bash
+python3 scripts/run-driver-release-evidence.py \
+  --commit "$(git rev-parse HEAD)" \
+  --out benchmarks/results/latest/driver_compatibility_status.json
+```
+
+The lower-level validation command is:
 
 ```bash
 scripts/validate-driver-compatibility.py --strict \

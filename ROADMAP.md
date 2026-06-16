@@ -29,6 +29,7 @@ file focused on what still blocks production.
   `scripts/validate-incident-drills.py --strict`; required drill types are
   `backup_restore`, `wal_recovery`, and `disk_full`.
 - Driver compatibility must pass strict validation through
+  `scripts/run-driver-release-evidence.py` and
   `scripts/validate-driver-compatibility.py --strict`; the status artifact
   records `required_driver_count`, `passing_required_driver_count`, and
   `missing_required_drivers` for the release commit.

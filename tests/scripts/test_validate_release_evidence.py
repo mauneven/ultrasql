@@ -350,6 +350,24 @@ class ReleaseEvidenceValidatorTests(unittest.TestCase):
             self.assertFalse(psycopg3["valid"])
             self.assertIn("status must be pass", psycopg3["errors"])
 
+    def test_driver_compatibility_rejects_stale_release_commit(self) -> None:
+        with tempfile_dir() as tmp_path:
+            report = tmp_path / "driver-certification.json"
+            out = tmp_path / "driver_compatibility_status.json"
+            write_driver_report(
+                report,
+                commit="fedcba9876543210fedcba9876543210fedcba98",
+            )
+
+            status = run_driver_script(report, out)
+
+            self.assertFalse(status["ready"])
+            self.assertEqual(status["status"], "not_ready")
+            self.assertIn(
+                f"commit expected commit {COMMIT}, got fedcba9876543210fedcba9876543210fedcba98",
+                status["errors"],
+            )
+
 
 class tempfile_dir:
     def __enter__(self) -> Path:

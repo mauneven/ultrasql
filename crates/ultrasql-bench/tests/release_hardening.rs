@@ -1032,6 +1032,7 @@ fn final_release_requires_external_audits_and_incident_drills() {
 #[test]
 fn final_release_requires_driver_compatibility_status() {
     let driver_docs = repo_file("docs/driver-certification.md");
+    let runner = repo_file("scripts/run-driver-release-evidence.py");
     let validator = repo_file("scripts/validate-driver-compatibility.py");
     let status = repo_file("benchmarks/results/latest/driver_compatibility_status.json");
     let release = repo_file(".github/workflows/release.yml");
@@ -1059,6 +1060,27 @@ fn final_release_requires_driver_compatibility_status() {
         assert!(roadmap.contains(needle), "ROADMAP missing {needle}");
     }
 
+    for needle in ["scripts/run-driver-release-evidence.py"] {
+        assert!(driver_docs.contains(needle), "driver docs missing {needle}");
+        assert!(
+            release_checklist.contains(needle),
+            "release checklist missing {needle}"
+        );
+        assert!(roadmap.contains(needle), "ROADMAP missing {needle}");
+    }
+
+    for needle in [
+        "cargo",
+        "build",
+        "driver_certification.py",
+        "target/driver-certification.json",
+        "validate-driver-compatibility.py",
+        "--strict",
+        "GITHUB_SHA",
+    ] {
+        assert!(runner.contains(needle), "driver runner missing {needle}");
+    }
+
     for needle in [
         "\"status\": \"not_ready\"",
         "\"ready\": false",
@@ -1070,6 +1092,7 @@ fn final_release_requires_driver_compatibility_status() {
     }
 
     for needle in [
+        "scripts/run-driver-release-evidence.py",
         "scripts/validate-driver-compatibility.py",
         "driver_compatibility_status.json",
     ] {

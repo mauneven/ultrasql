@@ -44,10 +44,11 @@ The required drill types are `backup_restore`, `wal_recovery`, and
 
 ## Driver compatibility
 
-The release workflow validates `target/driver-certification.json` with
-`scripts/validate-driver-compatibility.py --strict` for v1.0 and later
-releases. Required clients include stock libpq, psql meta-commands, Python,
-Node.js, Go, Java/JDBC, Hibernate, .NET/Npgsql, Prisma, Diesel, GUI
+The release workflow runs `scripts/run-driver-release-evidence.py`, which
+builds `ultrasqld`, writes `target/driver-certification.json`, and validates
+the result with `scripts/validate-driver-compatibility.py --strict` for v1.0
+and later releases. Required clients include stock libpq, psql meta-commands,
+Python, Node.js, Go, Java/JDBC, Hibernate, .NET/Npgsql, Prisma, Diesel, GUI
 introspection probes, Flyway, Liquibase, and Alembic coverage. The rendered
 status artifact is `driver_compatibility_status.json`.
 
