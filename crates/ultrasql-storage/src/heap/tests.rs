@@ -2153,6 +2153,47 @@ mod wal_emission {
     }
 
     #[test]
+    fn vacuum_heap_keeps_committed_in_place_update_slot() {
+        let heap = make_heap(16);
+        let r = rel();
+        let tid = heap
+            .insert(r, &int32_pair_payload(1, 10), opts(10))
+            .unwrap();
+
+        let oracle = MapOracle::new();
+        oracle.set_committed(Xid::new(10));
+        let writer_20 = Snapshot::new(
+            Xid::new(10),
+            Xid::new(100),
+            Xid::new(20),
+            CommandId::FIRST,
+            std::iter::empty(),
+        );
+        let updated = heap
+            .update_int32_pair_tid_inplace_undo(
+                UpdateInt32PairTid {
+                    tid,
+                    snapshot: &writer_20,
+                    oracle: &oracle,
+                    predicate: |id, _val| id == 1,
+                },
+                update_int32_edit(1, 5),
+                update_int32_stamp(20),
+                None,
+                None,
+            )
+            .unwrap();
+        assert_eq!(updated, 1);
+        assert_eq!(heap.fetch(tid).unwrap().data, int32_pair_payload(1, 15));
+
+        oracle.set_committed(Xid::new(20));
+        let stats = heap.vacuum_heap(r, Xid::new(100), &oracle).unwrap();
+        assert_eq!(stats.tuples_reclaimed, 0);
+        assert_eq!(stats.pages_compacted, 0);
+        assert_eq!(heap.fetch(tid).unwrap().data, int32_pair_payload(1, 15));
+    }
+
+    #[test]
     fn vacuum_heap_skips_in_progress_deleters() {
         let heap = make_heap(16);
         let r = rel();

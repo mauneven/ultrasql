@@ -5,7 +5,7 @@
 //! block here adds methods to the type defined in `heap/mod.rs`.
 
 use ultrasql_core::{BlockNumber, PageId, RelationId, Xid};
-use ultrasql_mvcc::tuple_header::TUPLE_HEADER_SIZE;
+use ultrasql_mvcc::tuple_header::{InfoMask, TUPLE_HEADER_SIZE};
 use ultrasql_mvcc::{TupleHeader, XidStatusOracle};
 
 use crate::buffer_pool::PageLoader;
@@ -139,6 +139,12 @@ impl<L: PageLoader> HeapAccess<L> {
                         // Malformed header — skip conservatively.
                         continue;
                     };
+                    if hdr.infomask.contains(InfoMask::UPDATED_IN_PLACE) {
+                        // In-place UPDATE stores the current version in this slot.
+                        // `xmax` is the writer stamp for conflict/undo, not proof
+                        // that the slot is a dead predecessor.
+                        continue;
+                    }
                     if !hdr.is_alive() {
                         dead.push(slot);
                     }
