@@ -179,6 +179,7 @@ if [[ ! -x "$CH_BIN" ]]; then
 fi
 
 mkdir -p "$RAW_DIR"
+CH_ENGINE_VERSION="$("$CH_BIN" --version 2>&1 | head -1)"
 
 # ---------------------------------------------------------------------------
 # Bring up an isolated clickhouse-server if one is not already listening.
@@ -270,10 +271,28 @@ emit_json() {
 import json,sys
 print(json.dumps([float(x) for x in sys.argv[1:]]))
 " "$@")"
-    printf '{"engine":"%s","workload":"%s","n_rows":%s,"samples":%s,"median_us":%s,"min_us":%s,"iterations_us":%s}\n' \
-        "$ENGINE" "$workload" "$n_rows" "$n_samples" "$median_us" \
-        "$(python3 -c "import sys; vals=[float(x) for x in sys.argv[1:]]; print(min(vals) if vals else 0)" "$@")" \
-        "$samples_json"
+    local min_us
+    min_us="$(python3 -c "import sys; vals=[float(x) for x in sys.argv[1:]]; print(min(vals) if vals else 0)" "$@")"
+    python3 - "$ENGINE" "$CH_ENGINE_VERSION" "$workload" "$n_rows" "$n_samples" "$median_us" "$min_us" "$samples_json" <<'PYEOF'
+import json
+import sys
+
+engine, version, workload, n_rows, samples, median_us, min_us, samples_json = sys.argv[1:]
+doc = {
+    "schema_version": 1,
+    "engine": engine,
+    "engine_version": version,
+    "workload": workload,
+    "status": "measured",
+    "n_rows": int(n_rows),
+    "samples": int(samples),
+    "median_us": float(median_us),
+    "min_us": float(min_us),
+    "iterations_us": json.loads(samples_json),
+    "policy": "Raw measured samples only; no ranking or winner claim.",
+}
+print(json.dumps(doc, sort_keys=True))
+PYEOF
 }
 
 # ---------------------------------------------------------------------------

@@ -15,6 +15,8 @@
 #   ULTRASQL_RELEASE_VERSION   release tag for scripts/install.sh (default latest)
 #   SCALE_SWEEP_ROWS           row counts (default "10000 100000 1000000")
 #   SCALE_SWEEP_OUT            artifact dir (default benchmarks/results/latest/scale-sweep)
+#   SCALE_SWEEP_STORAGE        memory|data-dir (default memory)
+#   SCALE_SWEEP_DATA_ROOT      data-dir benchmark root (default $SCALE_SWEEP_OUT/data-dirs)
 #   N_ITERS                    measured samples override
 #   WARMUP                     warmup samples override
 #
@@ -38,9 +40,16 @@ OUT="${SCALE_SWEEP_OUT:-benchmarks/results/latest/scale-sweep}"
 RAW="$OUT/raw"
 ROWS="${SCALE_SWEEP_ROWS:-10000 100000 1000000}"
 INSERT_CHUNK_ROWS="${INSERT_CHUNK_ROWS:-10000}"
+STORAGE_MODE="${SCALE_SWEEP_STORAGE:-memory}"
+case "$STORAGE_MODE" in
+    memory|data-dir) ;;
+    *) echo "unknown SCALE_SWEEP_STORAGE '$STORAGE_MODE' (memory|data-dir)" >&2; exit 2 ;;
+esac
+DATA_ROOT="${SCALE_SWEEP_DATA_ROOT:-$OUT/data-dirs}"
 mkdir -p "$RAW"
 if [[ "${SCALE_SWEEP_APPEND:-0}" != "1" ]]; then
     rm -f "$RAW"/*.json
+    rm -rf "$DATA_ROOT"
 fi
 
 tmp_dir="$(mktemp -d)"
@@ -117,7 +126,7 @@ sys.exit(1)
 PY
 }
 
-echo "=== scale sweep mode=$mode iters=$ITERS warmup=$WARMUP rows=[$ROWS] ==="
+echo "=== scale sweep mode=$mode storage=$STORAGE_MODE iters=$ITERS warmup=$WARMUP rows=[$ROWS] ==="
 
 PROFILE="${SCALE_SWEEP_PROFILE:-release-ship}"
 echo "--- Building benchmark driver (profile=$PROFILE) ---"
@@ -162,10 +171,15 @@ run_ultrasql_workload() {
     log="$OUT/ultrasqld-${wid}.log"
     tmp_json="$RAW/${wid}-ultrasql.json.tmp"
     err_log="$OUT/cross_compare-${wid}.err"
-    "$ULTRASQLD_BIN" \
-        --listen "127.0.0.1:${port}" \
-        --log-level warn \
-        >"$log" 2>&1 &
+    local data_dir args
+    data_dir="$DATA_ROOT/${wid}"
+    args=("$ULTRASQLD_BIN" --listen "127.0.0.1:${port}" --log-level warn)
+    if [[ "$STORAGE_MODE" == "data-dir" ]]; then
+        rm -rf "$data_dir"
+        mkdir -p "$(dirname "$data_dir")"
+        args+=(--data-dir "$data_dir")
+    fi
+    "${args[@]}" >"$log" 2>&1 &
     server_pid="$!"
     wait_for_port "$port"
     if "$BIN/cross_compare_sql" \
@@ -225,10 +239,15 @@ run_ultrasql_fresh_insert_samples() {
         log="$OUT/ultrasqld-${wid}-sample-${sample}.log"
         tmp_json="$sample_dir/sample-${sample}.json"
         err_log="$OUT/cross_compare-${wid}-sample-${sample}.err"
-        "$ULTRASQLD_BIN" \
-            --listen "127.0.0.1:${port}" \
-            --log-level warn \
-            >"$log" 2>&1 &
+        local data_dir args
+        data_dir="$DATA_ROOT/${wid}-sample-${sample}"
+        args=("$ULTRASQLD_BIN" --listen "127.0.0.1:${port}" --log-level warn)
+        if [[ "$STORAGE_MODE" == "data-dir" ]]; then
+            rm -rf "$data_dir"
+            mkdir -p "$(dirname "$data_dir")"
+            args+=(--data-dir "$data_dir")
+        fi
+        "${args[@]}" >"$log" 2>&1 &
         server_pid="$!"
         wait_for_port "$port"
         if ! "$BIN/cross_compare_sql" \
@@ -437,7 +456,7 @@ python3 benchmarks/scripts/render_scale_sweep.py \
 
 python3 benchmarks/scripts/check_supremacy.py "$RAW"
 
-python3 - "$OUT/scale_sweep_manifest.json" "$mode" "$ITERS" "$WARMUP" "$ROWS" "$ULTRASQL_VERSION_TEXT" "$install_source" "${SCALE_SWEEP_APPEND:-0}" <<'PY'
+python3 - "$OUT/scale_sweep_manifest.json" "$mode" "$ITERS" "$WARMUP" "$ROWS" "$ULTRASQL_VERSION_TEXT" "$install_source" "${SCALE_SWEEP_APPEND:-0}" "$STORAGE_MODE" <<'PY'
 import json
 import os
 import platform
@@ -446,7 +465,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-path, mode, iters, warmup, rows, version, install_source, append = sys.argv[1:]
+path, mode, iters, warmup, rows, version, install_source, append, storage_mode = sys.argv[1:]
 
 def cmd_output(*cmd: str) -> str | None:
     try:
@@ -501,6 +520,7 @@ doc = {
     "rows": merged_rows,
     "ultrasql_version": version,
     "ultrasql_install_source": install_source,
+    "ultrasql_storage_mode": storage_mode,
     "methodology": "UltraSQL external release artifact over TCP; competitors installed local clients including ClickHouse when available; bulk INSERT uses a fresh UltraSQL server per measured sample and 10k-row INSERT chunks across engines.",
     "host": {
         "hostname": socket.gethostname(),

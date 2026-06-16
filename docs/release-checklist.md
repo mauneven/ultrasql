@@ -99,6 +99,7 @@ Run on schedule or by `workflow_dispatch`:
 
 ```bash
 benchmarks/certify.sh full
+python3 scripts/run-benchmark-certification.py --mode full
 benchmarks/chaos_recovery.sh full
 cargo bench --workspace
 for target in parser_fuzz planner_fuzz protocol_fuzz wal_record_fuzz; do
@@ -119,7 +120,7 @@ section is the same run miri smoke on memory-safety-sensitive crates block used
 by CI. TPC-H, ClickBench, Firebolt Core, AI gauntlet, fuzz, and Miri evidence
 belongs here, not in the PR-critical path.
 
-## 69-86 Evidence Map
+## 69-87 Evidence Map
 
 | item | code | test | benchmark or reason | docs | artifact |
 | --- | --- | --- | --- | --- | --- |
@@ -144,6 +145,7 @@ belongs here, not in the PR-critical path.
 | 84 External audit reports | `scripts/validate-external-audits.py`, `external-audits/*.json` | `tests/scripts/test_validate_release_evidence.py`, `crates/ultrasql-bench/tests/release_hardening.rs` | no benchmark; independent security and correctness review gate | `docs/external-audits.md` | `benchmarks/results/latest/external_audit_status.json` |
 | 85 Incident drill reports | `scripts/run-incident-drills.py`, `scripts/validate-incident-drills.py`, `incident-drills/*.json` | `tests/scripts/test_run_incident_drills.py`, `tests/scripts/test_validate_release_evidence.py`, `crates/ultrasql-bench/tests/release_hardening.rs` | no benchmark; recovery and incident-response gate | `docs/incident-drills.md` | `benchmarks/results/latest/incident_drill_status.json` |
 | 86 Driver compatibility status | `tests/driver_certification/driver_certification.py`, `scripts/run-driver-release-evidence.py`, `scripts/validate-driver-compatibility.py`, `target/driver-certification.json` | `tests/scripts/test_run_driver_release_evidence.py`, `tests/scripts/test_validate_release_evidence.py`, `tests/driver_certification/test_driver_certification.py`, `crates/ultrasql-bench/tests/release_hardening.rs` | no benchmark; client ecosystem compatibility gate | `docs/driver-certification.md` | `benchmarks/results/latest/driver_compatibility_status.json` |
+| 87 Benchmark certification status | `scripts/run-benchmark-certification.py`, `scripts/validate-benchmark-certification.py`, `benchmarks/run_scale_sweep.sh` | `tests/scripts/test_run_benchmark_certification.py`, `tests/scripts/test_validate_benchmark_certification.py`, `crates/ultrasql-bench/tests/scale_sweep_release_artifact.rs` | release-artifact DB-vs-DB scale sweep with ClickHouse and data-dir mode | `BENCHMARKS.md` | `benchmarks/results/latest/benchmark_certification_status.json` |
 
 ## Sign-off rule
 
@@ -152,7 +154,8 @@ Before tagging v1.0, attach:
 - latest `ci-passed` run id,
 - latest green CI workflow run id,
 - release workflow run id,
-- latest full benchmark certification manifest,
+- latest full benchmark certification manifest and
+  `benchmark_certification_status.json`,
 - RLS tenant certification artifact,
 - TPC-H SF10 and ClickBench artifacts or explicit setup-missing reasons,
 - Firebolt Core local artifacts or explicit Docker/setup-missing reasons,

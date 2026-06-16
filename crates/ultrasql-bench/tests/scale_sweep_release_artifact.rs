@@ -25,6 +25,10 @@ fn scale_sweep_script_uses_external_release_artifact() {
     assert!(script.contains("cargo build --profile \"$PROFILE\""));
     assert!(script.contains("\"status\": \"not_available\""));
     assert!(script.contains("SCALE_SWEEP_APPEND"));
+    assert!(script.contains("SCALE_SWEEP_STORAGE"));
+    assert!(script.contains("SCALE_SWEEP_DATA_ROOT"));
+    assert!(script.contains("--data-dir \"$data_dir\""));
+    assert!(script.contains("\"ultrasql_storage_mode\""));
     assert!(script.contains("\"host\""));
     assert!(script.contains("\"engine_versions\""));
     assert!(script.contains("benchmarks/scripts/render_scale_sweep.py"));
@@ -56,7 +60,9 @@ fn scale_sweep_workflow_benchmarks_current_commit_binary() {
             "cargo build --profile release-ship --package ultrasql-server --bin ultrasqld"
         )
     );
-    assert!(workflow.contains(r#"ULTRASQLD_BIN="target/release-ship/ultrasqld""#));
+    assert!(workflow.contains("scripts/run-benchmark-certification.py"));
+    assert!(workflow.contains("--skip-build"));
+    assert!(workflow.contains("--min-comparable-rows 17"));
     assert!(
         !workflow
             .contains(r#"ULTRASQL_RELEASE_VERSION: v${{ steps.package-version.outputs.version }}"#),
@@ -112,6 +118,28 @@ fn clickhouse_runner_requires_tcp_readiness_before_measurement() {
 }
 
 #[test]
+fn scale_sweep_competitor_raw_artifacts_use_strict_schema() {
+    for path in [
+        "benchmarks/scripts/run_duckdb_writes.sh",
+        "benchmarks/scripts/run_sqlite3_writes.sh",
+        "benchmarks/scripts/run_postgres_writes.sh",
+        "benchmarks/scripts/run_clickhouse_writes.sh",
+    ] {
+        let script = repo_file(path);
+
+        for needle in [
+            "\"schema_version\": 1",
+            "\"status\": \"measured\"",
+            "\"status\": \"not_available\"",
+            "\"policy\"",
+            "\"reason\"",
+        ] {
+            assert!(script.contains(needle), "{path} missing {needle}");
+        }
+    }
+}
+
+#[test]
 fn scale_sweep_renders_clickhouse_as_first_class_competitor() {
     let renderer = repo_file("benchmarks/scripts/render_scale_sweep.py");
     let scale_md = repo_file("benchmarks/results/latest/scale-sweep/scale_sweep.md");
@@ -127,7 +155,8 @@ fn scale_sweep_renders_clickhouse_as_first_class_competitor() {
     assert!(scale_md.contains("% slower"));
     assert!(scale_json.contains("\"clickhouse\""));
     assert!(readme.contains("ClickHouse"));
-    assert!(benchmarks.contains("PostgreSQL, and ClickHouse clients"));
+    assert!(benchmarks.contains("PostgreSQL, and ClickHouse"));
+    assert!(benchmarks.contains("clients"));
     assert!(benchmarks.contains("benchmarks/scripts/run_clickhouse_writes.sh"));
     assert!(benchmarks.contains("benchmarks/scripts/check_supremacy.py"));
 }

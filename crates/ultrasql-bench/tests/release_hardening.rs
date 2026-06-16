@@ -1168,6 +1168,88 @@ fn final_release_requires_driver_compatibility_status() {
 }
 
 #[test]
+fn final_release_requires_benchmark_certification_status() {
+    let runner = repo_file("scripts/run-benchmark-certification.py");
+    let validator = repo_file("scripts/validate-benchmark-certification.py");
+    let status = repo_file("benchmarks/results/latest/benchmark_certification_status.json");
+    let bench_workflow = repo_file(".github/workflows/bench.yml");
+    let benchmarks = repo_file("BENCHMARKS.md");
+    let release_checklist = repo_file("docs/release-checklist.md");
+
+    for needle in [
+        "cargo",
+        "build",
+        "--profile",
+        "release-ship",
+        "run_scale_sweep.sh",
+        "SCALE_SWEEP_STORAGE",
+        "data-dir",
+        "validate-benchmark-certification.py",
+        "--required-storage-mode",
+        "clickhouse_driver",
+    ] {
+        assert!(runner.contains(needle), "benchmark runner missing {needle}");
+    }
+
+    for needle in [
+        "required_storage_mode",
+        "min_comparable_rows",
+        "missing_required_engine_rows",
+        "ultrasql_fastest_comparable_row_count",
+        "manifest host.git_commit expected commit",
+        "rendered fastest_engine must match raw medians",
+        "mixed_correctness",
+        "answer_sha256",
+        "ready",
+        "not_ready",
+    ] {
+        assert!(
+            validator.contains(needle),
+            "benchmark validator missing {needle}"
+        );
+    }
+
+    for needle in [
+        "\"status\": \"not_ready\"",
+        "\"ready\": false",
+        "\"required_storage_mode\": \"data-dir\"",
+        "\"comparable_row_count\"",
+        "\"ultrasql_fastest_comparable_row_count\"",
+        "\"missing_required_engine_rows\"",
+    ] {
+        assert!(status.contains(needle), "benchmark status missing {needle}");
+    }
+
+    for needle in [
+        "scripts/run-benchmark-certification.py",
+        "--min-comparable-rows 17",
+        "benchmark_certification_status.json",
+    ] {
+        assert!(
+            bench_workflow.contains(needle),
+            "bench workflow missing {needle}"
+        );
+    }
+
+    for needle in [
+        "scripts/run-benchmark-certification.py --mode full",
+        "scripts/validate-benchmark-certification.py",
+        "SCALE_SWEEP_STORAGE=data-dir",
+        "ClickHouse",
+        "benchmark_certification_status.json",
+    ] {
+        assert!(
+            benchmarks.contains(needle),
+            "benchmark docs missing {needle}"
+        );
+        assert!(
+            release_checklist.contains("benchmark_certification_status.json"),
+            "release checklist missing benchmark status artifact"
+        );
+    }
+}
+
+#[test]
 fn release_user_docs_exist_and_state_current_limits() {
     let changelog = repo_file("CHANGELOG.md");
     let getting_started = repo_file("docs/getting-started.md");

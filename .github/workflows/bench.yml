@@ -165,10 +165,17 @@ jobs:
           PGDATABASE: ultrasql_bench
           SCALE_SWEEP_ROWS: "10000 100000"
         run: |
-          ULTRASQLD_BIN="target/release-ship/ultrasqld" CH_BIN="$(command -v clickhouse)" benchmarks/run_scale_sweep.sh quick
+          CH_BIN="$(command -v clickhouse)" \
+            python3 scripts/run-benchmark-certification.py \
+              --mode quick \
+              --skip-build \
+              --python "$RUNNER_TEMP/clickhouse-driver-venv/bin/python" \
+              --min-comparable-rows 17
       - name: upload scale sweep artifacts
         if: always()
         uses: actions/upload-artifact@v7
         with:
           name: current-commit-scale-sweep
-          path: benchmarks/results/latest/scale-sweep/
+          path: |
+            benchmarks/results/latest/scale-sweep/
+            benchmarks/results/latest/benchmark_certification_status.json

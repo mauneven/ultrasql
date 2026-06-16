@@ -155,12 +155,27 @@ claim:
 
 ```text
 SCALE_SWEEP_ROWS="10000 100000 1000000" benchmarks/run_scale_sweep.sh full
+python3 scripts/run-benchmark-certification.py --mode full
 ```
 
-UltraSQL is installed through `scripts/install.sh` unless `ULTRASQLD_BIN` points
-at an existing release binary. The harness launches that external `ultrasqld`
-over TCP and runs the same SQL-surface workloads as installed DuckDB, SQLite,
-PostgreSQL, and ClickHouse clients. ClickHouse is driven through
+`scripts/run-benchmark-certification.py` is the release command. It builds the
+current `ultrasqld` with `--profile release-ship`, runs the scale sweep with
+`SCALE_SWEEP_STORAGE=data-dir` by default, renders `scale_sweep.md` and
+`scale_sweep.json`, and writes
+`benchmarks/results/latest/benchmark_certification_status.json` through
+`scripts/validate-benchmark-certification.py`. The validator rejects missing
+ClickHouse measurements, stale `host.git_commit`, malformed raw artifacts,
+rendered fastest rows that disagree with raw medians, and memory-only release
+runs unless `--required-storage-mode memory` or `any` is explicitly used for a
+non-release check.
+
+`benchmarks/run_scale_sweep.sh` is the lower-level runner. UltraSQL is installed
+through `scripts/install.sh` unless `ULTRASQLD_BIN` points at an existing binary.
+The harness launches that external `ultrasqld` over TCP and runs the same
+SQL-surface workloads as installed DuckDB, SQLite, PostgreSQL, and ClickHouse
+clients. Set `SCALE_SWEEP_STORAGE=data-dir` to run UltraSQL against WAL-backed
+storage; `memory` remains available for local iteration only. ClickHouse is
+driven through
 `benchmarks/scripts/run_clickhouse_writes.sh`, which uses the native TCP client
 when `clickhouse_driver` and a local ClickHouse binary/server are available.
 The `full` mode defaults to 32 measured samples after 8 warmup samples; `quick`
@@ -179,6 +194,7 @@ claims. Artifacts live under:
 
 ```text
 benchmarks/results/latest/scale-sweep/
+benchmarks/results/latest/benchmark_certification_status.json
 ```
 
 ### SQLLogicTest Replay Timing

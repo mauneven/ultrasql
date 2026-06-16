@@ -51,22 +51,68 @@ row_suffix() {
     fi
 }
 
+target_stub_workloads() {
+    echo "insert_throughput_$(row_suffix "$N_ROWS")"
+    echo "update_throughput_$(row_suffix "$N_ROWS")"
+    echo "delete_throughput_$(row_suffix "$N_ROWS")"
+    echo "mixed_oltp_pgbench_like"
+    echo "mixed_correctness_$(row_suffix "$N_ROWS")"
+    echo "select_scan_$(row_suffix "$N_ROWS")"
+    echo "select_sum_65k_i64"
+    echo "select_avg_1m_i64"
+    echo "filter_sum_1m_i64"
+    echo "window_row_number_65k_i64"
+}
+
+workload_rows() {
+    local wl="$1"
+    case "$wl" in
+        select_sum_*_i64|window_row_number_*_i64) echo 65536 ;;
+        select_avg_*_i64|filter_sum_*_i64) echo 1000000 ;;
+        *) echo "$N_ROWS" ;;
+    esac
+}
+
+emit_unavailable_all() {
+    local reason="$1"
+    echo "run_duckdb_writes.sh: WARNING: ${reason} — skipping duckdb benchmarks" >&2
+    mkdir -p "$RAW_DIR"
+    target_stub_workloads | while IFS= read -r wl; do
+        local rows
+        rows="$(workload_rows "$wl")"
+        python3 - "$RAW_DIR/${wl}-${ENGINE}.json" "$ENGINE" "$wl" "$rows" "$reason" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+out, engine, workload, rows, reason = sys.argv[1:]
+doc = {
+    "schema_version": 1,
+    "engine": engine,
+    "status": "not_available",
+    "workload": workload,
+    "n_rows": int(rows),
+    "reason": reason,
+    "policy": "No DuckDB benchmark claim exists until this artifact records measured samples from the same scale-sweep run.",
+}
+Path(out).write_text(json.dumps(doc, sort_keys=True) + "\n")
+PY
+    done
+}
+
 # ---------------------------------------------------------------------------
 # Prerequisites
 # ---------------------------------------------------------------------------
 
 if ! command -v duckdb >/dev/null 2>&1; then
-    echo "run_duckdb_writes.sh: WARNING: duckdb not found — skipping duckdb benchmarks" >&2
-    for wl in insert_throughput_10k update_throughput_10k delete_throughput_10k mixed_oltp_pgbench_like "mixed_correctness_$(row_suffix "$N_ROWS")" select_scan_10k select_sum_65k_i64 select_avg_1m_i64 filter_sum_1m_i64 window_row_number_65k_i64; do
-        echo "{\"engine\":\"${ENGINE}\",\"status\":\"not_available\",\"workload\":\"${wl}\"}" \
-            > "${RAW_DIR}/${wl}-${ENGINE}.json"
-    done
+    emit_unavailable_all "duckdb not found"
     exit 0
 fi
 
 mkdir -p "$RAW_DIR"
 
-echo "run_duckdb_writes.sh: DuckDB $(duckdb --version 2>&1 | head -1) — N_ROWS=${N_ROWS} N_ITERS=${N_ITERS}"
+DUCKDB_ENGINE_VERSION="$(duckdb --version 2>&1 | head -1)"
+echo "run_duckdb_writes.sh: DuckDB ${DUCKDB_ENGINE_VERSION} — N_ROWS=${N_ROWS} N_ITERS=${N_ITERS}"
 
 # ---------------------------------------------------------------------------
 # Helper: compute median
@@ -98,10 +144,28 @@ print(json.dumps(vals))
 PYEOF
 )
     local n_samples="$#"
-    printf '{"engine":"%s","workload":"%s","n_rows":%d,"samples":%d,"median_us":%.3f,"min_us":%.3f,"iterations_us":%s}\n' \
-        "$ENGINE" "$workload" "$n_rows" "$n_samples" "$median_us" \
-        "$(python3 -c "import sys; vals=[float(x) for x in sys.argv[1:]]; print(min(vals) if vals else 0)" "$@")" \
-        "$samples_json"
+    local min_us
+    min_us="$(python3 -c "import sys; vals=[float(x) for x in sys.argv[1:]]; print(min(vals) if vals else 0)" "$@")"
+    python3 - "$ENGINE" "$DUCKDB_ENGINE_VERSION" "$workload" "$n_rows" "$n_samples" "$median_us" "$min_us" "$samples_json" <<'PYEOF'
+import json
+import sys
+
+engine, version, workload, n_rows, samples, median_us, min_us, samples_json = sys.argv[1:]
+doc = {
+    "schema_version": 1,
+    "engine": engine,
+    "engine_version": version,
+    "workload": workload,
+    "status": "measured",
+    "n_rows": int(n_rows),
+    "samples": int(samples),
+    "median_us": float(median_us),
+    "min_us": float(min_us),
+    "iterations_us": json.loads(samples_json),
+    "policy": "Raw measured samples only; no ranking or winner claim.",
+}
+print(json.dumps(doc, sort_keys=True))
+PYEOF
 }
 
 # ---------------------------------------------------------------------------
