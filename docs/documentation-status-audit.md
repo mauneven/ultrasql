@@ -44,6 +44,10 @@ unless quoting a prohibited claim in the claim-policy section.
 - Current benchmark claim remains narrow: UltraSQL was fastest on all 24
   comparable rows in the committed 2026-06-14 release-artifact DB-vs-DB scale
   sweep on the recorded Apple M4 host.
+- That claim does not mean the full release benchmark-certification gate is
+  closed. The committed benchmark certification manifest is smoke-profile
+  evidence, while release sign-off still needs full-profile and WAL-backed
+  data-dir benchmark evidence.
 - Current certification artifacts are mixed: TPC-H SF1/SF10 and AI vector
   pgvector certification pass; TPC-B, TPC-C, Sysbench, ClickBench, and Firebolt
   sparse pruning are not passing release-certification targets.

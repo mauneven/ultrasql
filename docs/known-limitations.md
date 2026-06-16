@@ -64,6 +64,9 @@ completed evidence.
 - Current TPC-H SF1/SF10 certification artifacts pass their recorded
   PostgreSQL/DuckDB targets. TPC-B, TPC-C, Sysbench, and ClickBench release
   gates remain open in the latest committed artifacts.
+- The README release-artifact scale sweep is a same-host fastest-table result,
+  not full benchmark release certification. Full sign-off still needs the
+  full benchmark profile and WAL-backed data-dir scale-sweep evidence.
 - Firebolt comparisons use local Firebolt Core only, not hosted Firebolt URLs.
 
 ## Client ecosystem

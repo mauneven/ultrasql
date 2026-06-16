@@ -48,6 +48,7 @@ The ethical claim today is narrower:
 | Sanitizers workflow | GitHub run `27526490428` for commit `f9fc5c6f` | success |
 | Bench workflow | GitHub run `27532810814` for commit `f9fc5c6f` | cancelled; latest committed scale-sweep artifact remains 2026-06-14 |
 | Release-artifact scale sweep | `benchmarks/results/latest/scale-sweep/scale_sweep.json` | UltraSQL fastest on 24 of 24 comparable measured rows |
+| Benchmark certification profile | `benchmarks/results/latest/benchmark_certification_manifest.json` | smoke profile passed; this is not full release benchmark certification |
 | Operator soak status | `benchmarks/results/latest/operator_soak_status.json` | `not_ready`; 0 valid release reports, need 3 independent 30-day reports |
 | External audit status | `benchmarks/results/latest/external_audit_status.json` | `not_ready`; 0 valid reports, need 2 independent reports covering security and correctness for commit `043093e8` |
 | Incident drill status | `benchmarks/results/latest/incident_drill_status.json` | `not_ready`; 0 valid release drills, need backup restore, WAL recovery, and disk-full drills |
@@ -84,8 +85,9 @@ The ethical claim today is narrower:
   so the current README benchmark table is the 2026-06-14 release-artifact run,
   not a new 2026-06-15 full benchmark run.
 - Broader production claims still need longer fuzz windows, Miri breadth,
-  larger benchmark scales, WAL-backed data-dir benchmark modes, broader SQL
-  regression coverage, and real incident-response practice.
+  larger benchmark scales, WAL-backed data-dir benchmark modes, full benchmark
+  certification profile evidence, broader SQL regression coverage, and real
+  incident-response practice.
 
 ## Claim Policy
 
