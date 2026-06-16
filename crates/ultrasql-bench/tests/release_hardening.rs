@@ -1284,7 +1284,10 @@ fn final_release_aggregates_evidence_statuses() {
         "\"incident_drill\"",
         "\"benchmark\"",
     ] {
-        assert!(status.contains(needle), "release gate status missing {needle}");
+        assert!(
+            status.contains(needle),
+            "release gate status missing {needle}"
+        );
     }
 
     for needle in [
@@ -1304,7 +1307,9 @@ fn final_release_aggregates_evidence_statuses() {
             "release checklist missing {needle}"
         );
     }
-    assert!(release_workflow.contains("--benchmark-status benchmarks/results/latest/benchmark_certification_status.json"));
+    assert!(release_workflow.contains(
+        "--benchmark-status benchmarks/results/latest/benchmark_certification_status.json"
+    ));
     assert!(release_workflow.contains("cp target/release_gate_status.json"));
     assert!(release_workflow.contains("cp release-evidence/release_gate_status.json"));
     assert!(notes_template.contains("release_gate_status.json"));
@@ -1320,12 +1325,7 @@ fn release_user_docs_exist_and_state_current_limits() {
     for needle in ["Unreleased", "Known gaps", "pre-1.0 releases"] {
         assert!(changelog.contains(needle), "CHANGELOG missing {needle}");
     }
-    for needle in [
-        "alpha",
-        "Build from source",
-        "Run tests",
-        "SQLLogicTest",
-    ] {
+    for needle in ["alpha", "Build from source", "Run tests", "SQLLogicTest"] {
         assert!(
             getting_started.contains(needle),
             "getting started missing {needle}"
