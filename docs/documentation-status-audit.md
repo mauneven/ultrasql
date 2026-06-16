@@ -51,97 +51,99 @@ unless quoting a prohibited claim in the claim-policy section.
   external audits, incident drills, and final release evidence still need to
   close.
 
-## First-Party Markdown Inventory
+## First-Party Markdown Audit Ledger
 
-The audit covers these 85 files:
+The audit covers these 85 files. "Checked" means the file was inspected for
+stale maturity language, unsupported production-readiness claims, and broad
+benchmark claims that are not backed by committed artifacts.
 
-```text
-.github/ISSUE_TEMPLATE/bug_report.md
-.github/ISSUE_TEMPLATE/feature_request.md
-.github/pull_request_template.md
-AGENTS.md
-ARCHITECTURE.md
-BENCHMARKS.md
-CHANGELOG.md
-CODE_OF_CONDUCT.md
-CONTRIBUTING.md
-DONE.md
-GOVERNANCE.md
-OPERATIONS.md
-PERFORMANCE.md
-README.md
-RFC_PROCESS.md
-ROADMAP.md
-SECURITY.md
-SECURITY_AUDIT.md
-benchmarks/results/latest/benchmark_arena_artifacts.md
-benchmarks/results/latest/methodology.md
-benchmarks/results/latest/results.md
-benchmarks/results/latest/scale-sweep/results.md
-benchmarks/results/latest/scale-sweep/scale_sweep.md
-benchmarks/results/latest/slt_authored_speed_comparison.md
-benchmarks/results/latest/slt_hydromatic_smoke_comparison.md
-benchmarks/results/latest/slt_speed_comparison.md
-docs/OPERATOR_SOAK.md
-docs/ai-database-strategy.md
-docs/backup-restore.md
-docs/catalog-upgrades.md
-docs/chaos-recovery.md
-docs/configuration.md
-docs/driver-certification.md
-docs/documentation-status-audit.md
-docs/external-audits.md
-docs/external-validation-outreach.md
-docs/getting-started.md
-docs/hnsw-index-design.md
-docs/incident-drills.md
-docs/index.md
-docs/install.md
-docs/known-limitations.md
-docs/migration-guide.md
-docs/operator-reports.md
-docs/packaging.md
-docs/private-preview-runbook.md
-docs/production-readiness.md
-docs/rag-tenant-security.md
-docs/release-checklist.md
-docs/release-notes-template.md
-docs/security-ethics-audit.md
-docs/sql/alter-view.md
-docs/sql/checkpoint.md
-docs/sql/create-view.md
-docs/sql/describe.md
-docs/sql/export-import.md
-docs/sql/merge.md
-docs/sql/pivot.md
-docs/sql/set-variable.md
-docs/sql/summarize.md
-docs/sql/unpivot.md
-docs/superpowers/plans/2026-06-14-missing-sql-statements.md
-docs/testing/coverage-evidence-2026-05-24.md
-docs/testing/coverage-evidence-2026-05-28.md
-docs/testing/coverage-evidence-2026-05-29-cli.md
-docs/testing/coverage-evidence-2026-05-29-core.md
-docs/testing/coverage-evidence-2026-05-29-executor.md
-docs/testing/coverage-evidence-2026-05-29-planner.md
-docs/testing/coverage-evidence-2026-05-29-server.md
-docs/testing/coverage-evidence-2026-05-29-sqllogictest-runner.md
-docs/testing/coverage-evidence-2026-05-29-workspace.md
-docs/testing/external-sql-test-reuse.md
-docs/testing/isolation-suite.md
-external-audits/README.md
-fuzz/README.md
-incident-drills/README.md
-operator-reports/README.md
-packages/npm/README.md
-tests/isolation/NOTICE.hermitage.md
-tests/isolation/README.md
-tests/slt/README.md
-tests/slt/portable/imported/hydromatic/README.md
-tests/slt/sql_regression/README.md
-tests/slt/sql_regression/regression_subset/README.md
-third_party/sqllogictest/README.md
-```
+| File | Audit result |
+| --- | --- |
+| `.github/ISSUE_TEMPLATE/bug_report.md` | GitHub template; no project maturity claim |
+| `.github/ISSUE_TEMPLATE/feature_request.md` | GitHub template; no project maturity claim |
+| `.github/pull_request_template.md` | GitHub template; no project maturity claim |
+| `AGENTS.md` | benchmark/performance policy; checked for claim scoping |
+| `ARCHITECTURE.md` | project documentation; checked for stale maturity/overclaim terms |
+| `BENCHMARKS.md` | benchmark/performance policy; checked for claim scoping |
+| `CHANGELOG.md` | historical evidence ledger; keep dated entries, avoid rewriting old evidence |
+| `CODE_OF_CONDUCT.md` | project documentation; checked for stale maturity/overclaim terms |
+| `CONTRIBUTING.md` | project documentation; checked for stale maturity/overclaim terms |
+| `DONE.md` | historical evidence ledger; keep dated entries, avoid rewriting old evidence |
+| `GOVERNANCE.md` | project documentation; checked for stale maturity/overclaim terms |
+| `OPERATIONS.md` | project documentation; checked for stale maturity/overclaim terms |
+| `PERFORMANCE.md` | benchmark/performance policy; checked for claim scoping |
+| `README.md` | status/claim surface; updated or checked against current evidence |
+| `RFC_PROCESS.md` | project documentation; checked for stale maturity/overclaim terms |
+| `ROADMAP.md` | status/claim surface; updated or checked against current evidence |
+| `SECURITY.md` | project documentation; checked for stale maturity/overclaim terms |
+| `SECURITY_AUDIT.md` | project documentation; checked for stale maturity/overclaim terms |
+| `benchmarks/results/latest/benchmark_arena_artifacts.md` | benchmark artifact; checked for scoped result wording |
+| `benchmarks/results/latest/methodology.md` | benchmark artifact; checked for scoped result wording |
+| `benchmarks/results/latest/results.md` | benchmark artifact; checked for scoped result wording |
+| `benchmarks/results/latest/scale-sweep/results.md` | benchmark artifact; checked for scoped result wording |
+| `benchmarks/results/latest/scale-sweep/scale_sweep.md` | benchmark artifact; checked for scoped result wording |
+| `benchmarks/results/latest/slt_authored_speed_comparison.md` | benchmark artifact; checked for scoped result wording |
+| `benchmarks/results/latest/slt_hydromatic_smoke_comparison.md` | benchmark artifact; checked for scoped result wording |
+| `benchmarks/results/latest/slt_speed_comparison.md` | benchmark artifact; checked for scoped result wording |
+| `docs/OPERATOR_SOAK.md` | release evidence gate; not-ready wording checked |
+| `docs/ai-database-strategy.md` | project documentation; checked for stale maturity/overclaim terms |
+| `docs/backup-restore.md` | project documentation; checked for stale maturity/overclaim terms |
+| `docs/catalog-upgrades.md` | project documentation; checked for stale maturity/overclaim terms |
+| `docs/chaos-recovery.md` | project documentation; checked for stale maturity/overclaim terms |
+| `docs/configuration.md` | project documentation; checked for stale maturity/overclaim terms |
+| `docs/documentation-status-audit.md` | project documentation; checked for stale maturity/overclaim terms |
+| `docs/driver-certification.md` | project documentation; checked for stale maturity/overclaim terms |
+| `docs/external-audits.md` | release evidence gate; not-ready wording checked |
+| `docs/external-validation-outreach.md` | status/claim surface; updated or checked against current evidence |
+| `docs/getting-started.md` | status/claim surface; updated or checked against current evidence |
+| `docs/hnsw-index-design.md` | project documentation; checked for stale maturity/overclaim terms |
+| `docs/incident-drills.md` | release evidence gate; not-ready wording checked |
+| `docs/index.md` | status/claim surface; updated or checked against current evidence |
+| `docs/install.md` | status/claim surface; updated or checked against current evidence |
+| `docs/known-limitations.md` | status/claim surface; updated or checked against current evidence |
+| `docs/migration-guide.md` | project documentation; checked for stale maturity/overclaim terms |
+| `docs/operator-reports.md` | release evidence gate; not-ready wording checked |
+| `docs/packaging.md` | status/claim surface; updated or checked against current evidence |
+| `docs/private-preview-runbook.md` | status/claim surface; updated or checked against current evidence |
+| `docs/production-readiness.md` | status/claim surface; updated or checked against current evidence |
+| `docs/rag-tenant-security.md` | project documentation; checked for stale maturity/overclaim terms |
+| `docs/release-checklist.md` | release evidence gate; not-ready wording checked |
+| `docs/release-notes-template.md` | release evidence gate; not-ready wording checked |
+| `docs/security-ethics-audit.md` | project documentation; checked for stale maturity/overclaim terms |
+| `docs/sql/alter-view.md` | SQL reference; no project maturity claim |
+| `docs/sql/checkpoint.md` | SQL reference; no project maturity claim |
+| `docs/sql/create-view.md` | SQL reference; no project maturity claim |
+| `docs/sql/describe.md` | SQL reference; no project maturity claim |
+| `docs/sql/export-import.md` | SQL reference; no project maturity claim |
+| `docs/sql/merge.md` | SQL reference; no project maturity claim |
+| `docs/sql/pivot.md` | SQL reference; no project maturity claim |
+| `docs/sql/set-variable.md` | SQL reference; no project maturity claim |
+| `docs/sql/summarize.md` | SQL reference; no project maturity claim |
+| `docs/sql/unpivot.md` | SQL reference; no project maturity claim |
+| `docs/superpowers/plans/2026-06-14-missing-sql-statements.md` | implementation plan archive; no public maturity claim |
+| `docs/testing/coverage-evidence-2026-05-24.md` | historical evidence ledger; keep dated entries, avoid rewriting old evidence |
+| `docs/testing/coverage-evidence-2026-05-28.md` | historical evidence ledger; keep dated entries, avoid rewriting old evidence |
+| `docs/testing/coverage-evidence-2026-05-29-cli.md` | historical evidence ledger; keep dated entries, avoid rewriting old evidence |
+| `docs/testing/coverage-evidence-2026-05-29-core.md` | historical evidence ledger; keep dated entries, avoid rewriting old evidence |
+| `docs/testing/coverage-evidence-2026-05-29-executor.md` | historical evidence ledger; keep dated entries, avoid rewriting old evidence |
+| `docs/testing/coverage-evidence-2026-05-29-planner.md` | historical evidence ledger; keep dated entries, avoid rewriting old evidence |
+| `docs/testing/coverage-evidence-2026-05-29-server.md` | historical evidence ledger; keep dated entries, avoid rewriting old evidence |
+| `docs/testing/coverage-evidence-2026-05-29-sqllogictest-runner.md` | historical evidence ledger; keep dated entries, avoid rewriting old evidence |
+| `docs/testing/coverage-evidence-2026-05-29-workspace.md` | historical evidence ledger; keep dated entries, avoid rewriting old evidence |
+| `docs/testing/external-sql-test-reuse.md` | historical evidence ledger; keep dated entries, avoid rewriting old evidence |
+| `docs/testing/isolation-suite.md` | historical evidence ledger; keep dated entries, avoid rewriting old evidence |
+| `external-audits/README.md` | release evidence gate; not-ready wording checked |
+| `fuzz/README.md` | fuzz docs; no public maturity claim |
+| `incident-drills/README.md` | release evidence gate; not-ready wording checked |
+| `operator-reports/README.md` | release evidence gate; not-ready wording checked |
+| `packages/npm/README.md` | status/claim surface; updated or checked against current evidence |
+| `tests/isolation/NOTICE.hermitage.md` | test/imported fixture docs; no public maturity claim |
+| `tests/isolation/README.md` | test/imported fixture docs; no public maturity claim |
+| `tests/slt/README.md` | test/imported fixture docs; no public maturity claim |
+| `tests/slt/portable/imported/hydromatic/README.md` | test/imported fixture docs; no public maturity claim |
+| `tests/slt/sql_regression/README.md` | test/imported fixture docs; no public maturity claim |
+| `tests/slt/sql_regression/regression_subset/README.md` | test/imported fixture docs; no public maturity claim |
+| `third_party/sqllogictest/README.md` | test/imported fixture docs; no public maturity claim |
 
 ## Audit Result
 
