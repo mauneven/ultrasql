@@ -15,8 +15,9 @@
 use crate::payload::{
     AbortPayload, BTreeOpPayload, CheckpointPayload, CommitPayload, FullPageWritePayload,
     HashOpPayload, HeapDeleteInPlaceBatchPayload, HeapDeleteInPlacePayload, HeapDeletePayload,
-    HeapInsertPayload, HeapUpdateInPlaceBatchPayload, HeapUpdateInPlacePayload, HeapUpdatePayload,
-    HnswOpPayload, IvfFlatOpPayload, PayloadError, SequenceOpPayload,
+    HeapInsertBatchPayload, HeapInsertPayload, HeapUpdateInPlaceBatchPayload,
+    HeapUpdateInPlacePayload, HeapUpdatePayload, HnswOpPayload, IvfFlatOpPayload, PayloadError,
+    SequenceOpPayload,
 };
 use crate::record::{RecordType, WalRecord};
 use crate::recovery::RecoveryError;
@@ -83,6 +84,25 @@ pub trait HeapTarget: Send + Sync {
     ) -> Result<(), ApplyError> {
         let _ = record_lsn;
         self.apply_insert(payload)
+    }
+
+    /// Apply a page-batched heap-insert record.
+    fn apply_insert_batch(&self, payload: &HeapInsertBatchPayload) -> Result<(), ApplyError> {
+        let _ = payload;
+        Err(ApplyError::Refused {
+            operation: "heap_insert_batch",
+            detail: String::from("not implemented"),
+        })
+    }
+
+    /// Apply a page-batched heap-insert record at its WAL stream LSN.
+    fn apply_insert_batch_at_lsn(
+        &self,
+        payload: &HeapInsertBatchPayload,
+        record_lsn: Lsn,
+    ) -> Result<(), ApplyError> {
+        let _ = record_lsn;
+        self.apply_insert_batch(payload)
     }
 
     /// Apply a heap-update record by superseding the old slot with the new tuple.
@@ -356,6 +376,9 @@ pub fn dispatch_record_at_lsn(
         RecordType::HeapInsert => {
             target.apply_insert_at_lsn(&HeapInsertPayload::decode(bytes)?, record_lsn)
         }
+        RecordType::HeapInsertBatch => {
+            target.apply_insert_batch_at_lsn(&HeapInsertBatchPayload::decode(bytes)?, record_lsn)
+        }
         RecordType::HeapUpdate => {
             target.apply_update_at_lsn(&HeapUpdatePayload::decode(bytes)?, record_lsn)
         }
@@ -459,8 +482,8 @@ mod tests {
     use crate::payload::{
         AbortPayload, BTreeOpKind, BTreeOpPayload, CheckpointPayload, CommitPayload, HashOpKind,
         HashOpPayload, HeapDeleteInPlaceBatchEntry, HeapDeleteInPlaceBatchPayload,
-        HeapUpdateInPlaceBatchEntry, HeapUpdateInPlaceBatchPayload, HeapUpdatePayload,
-        SequenceOpKind, SequenceOpPayload,
+        HeapInsertBatchEntry, HeapInsertBatchPayload, HeapUpdateInPlaceBatchEntry,
+        HeapUpdateInPlaceBatchPayload, HeapUpdatePayload, SequenceOpKind, SequenceOpPayload,
     };
     use crate::record::{RecordType, WalRecord, WalRecordError};
     use crate::writer::{WalWriter, WalWriterConfig};
@@ -473,6 +496,7 @@ mod tests {
     struct MockHeap {
         inserts: Mutex<Vec<HeapInsertPayload>>,
         insert_lsns: Mutex<Vec<Lsn>>,
+        insert_batches: Mutex<Vec<HeapInsertBatchPayload>>,
         updates: Mutex<Vec<HeapUpdatePayload>>,
         update_in_place_batches: Mutex<Vec<HeapUpdateInPlaceBatchPayload>>,
         delete_in_place_batches: Mutex<Vec<HeapDeleteInPlaceBatchPayload>>,
@@ -499,6 +523,11 @@ mod tests {
         ) -> Result<(), ApplyError> {
             self.inserts.lock().push(p.clone());
             self.insert_lsns.lock().push(record_lsn);
+            Ok(())
+        }
+
+        fn apply_insert_batch(&self, p: &HeapInsertBatchPayload) -> Result<(), ApplyError> {
+            self.insert_batches.lock().push(p.clone());
             Ok(())
         }
 
@@ -619,6 +648,20 @@ mod tests {
             tuple_bytes: b"row".to_vec(),
         };
         let rec = make_record(RecordType::HeapInsert, insert_payload.encode().unwrap());
+        dispatch_record(&mock, &rec).unwrap();
+
+        // HeapInsertBatch
+        let insert_batch_payload = HeapInsertBatchPayload {
+            page: page_id(1, 0),
+            entries: vec![HeapInsertBatchEntry {
+                slot: 1,
+                tuple_bytes: b"row-b".to_vec(),
+            }],
+        };
+        let rec = make_record(
+            RecordType::HeapInsertBatch,
+            insert_batch_payload.encode().unwrap(),
+        );
         dispatch_record(&mock, &rec).unwrap();
 
         // HeapUpdate
@@ -748,6 +791,7 @@ mod tests {
         dispatch_record(&mock, &rec).unwrap();
 
         assert_eq!(mock.inserts.lock().len(), 1);
+        assert_eq!(mock.insert_batches.lock().len(), 1);
         assert_eq!(mock.updates.lock().len(), 1);
         assert_eq!(mock.update_in_place_batches.lock().len(), 1);
         assert_eq!(mock.delete_in_place_batches.lock().len(), 1);

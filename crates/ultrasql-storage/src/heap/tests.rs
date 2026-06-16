@@ -1331,8 +1331,8 @@ mod wal_emission {
     use ultrasql_core::{CommandId, Lsn, Xid};
     use ultrasql_wal::WalRecord;
     use ultrasql_wal::payload::{
-        HEAP_UPDATE_HOT, HeapDeleteInPlaceBatchPayload, HeapDeletePayload, HeapInsertPayload,
-        HeapUpdateInPlaceBatchPayload, HeapUpdatePayload,
+        HEAP_UPDATE_HOT, HeapDeleteInPlaceBatchPayload, HeapDeletePayload, HeapInsertBatchPayload,
+        HeapInsertPayload, HeapUpdateInPlaceBatchPayload, HeapUpdatePayload,
     };
     use ultrasql_wal::record::RecordType;
 
@@ -1396,6 +1396,47 @@ mod wal_emission {
             payload.tuple_bytes, expected_bytes,
             "WAL tuple_bytes must match on-page canonical bytes"
         );
+    }
+
+    #[test]
+    fn insert_batch_emits_one_batch_record_per_page() {
+        let (heap, sink) = make_heap_with_sink(8);
+        let rows = [b"a".as_slice(), b"bb".as_slice(), b"ccc".as_slice()];
+        let tids = heap
+            .insert_batch(
+                rel(),
+                &rows,
+                InsertOptions {
+                    xmin: Xid::new(10),
+                    command_id: CommandId::FIRST,
+                    n_atts: 0,
+                    fsm: None,
+                    vm: None,
+                    wal: Some(sink.as_ref()),
+                },
+            )
+            .unwrap();
+
+        assert_eq!(tids.len(), rows.len());
+        assert_eq!(sink.len(), 1, "one heap page should emit one batch record");
+        let records = sink.records();
+        let (_lsn, record) = &records[0];
+        assert_eq!(record.header.record_type, RecordType::HeapInsertBatch);
+        assert_eq!(record.header.xid, Xid::new(10));
+
+        let payload = HeapInsertBatchPayload::decode(&record.payload).unwrap();
+        assert_eq!(payload.page, PageId::new(rel(), BlockNumber::new(0)));
+        assert_eq!(payload.entries.len(), rows.len());
+        for (entry, tid) in payload.entries.iter().zip(&tids) {
+            assert_eq!(entry.slot, tid.slot);
+            let fetched = heap.fetch(*tid).unwrap();
+            let mut expected_bytes = vec![0_u8; TUPLE_HEADER_SIZE + fetched.data.len()];
+            fetched
+                .header
+                .encode(&mut expected_bytes[..TUPLE_HEADER_SIZE]);
+            expected_bytes[TUPLE_HEADER_SIZE..].copy_from_slice(&fetched.data);
+            assert_eq!(entry.tuple_bytes, expected_bytes);
+        }
     }
 
     // -------------------------------------------------------------------

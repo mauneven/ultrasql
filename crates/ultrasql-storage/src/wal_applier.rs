@@ -35,8 +35,8 @@ use ultrasql_mvcc::tuple_header::{InfoMask, TUPLE_HEADER_SIZE};
 use ultrasql_wal::applier::{ApplyError, HeapTarget};
 use ultrasql_wal::payload::{
     BTreeOpKind, BTreeOpPayload, FullPageWritePayload, HeapDeleteInPlaceBatchPayload,
-    HeapDeleteInPlacePayload, HeapDeletePayload, HeapInsertPayload, HeapUpdateInPlaceBatchPayload,
-    HeapUpdateInPlacePayload, HeapUpdatePayload,
+    HeapDeleteInPlacePayload, HeapDeletePayload, HeapInsertBatchPayload, HeapInsertPayload,
+    HeapUpdateInPlaceBatchPayload, HeapUpdateInPlacePayload, HeapUpdatePayload,
 };
 
 use crate::btree::{BTree, BTreeError};
@@ -152,6 +152,60 @@ impl<L: PageLoader + 'static> HeapTarget for HeapAccess<L> {
                 })?;
             stamp_replayed_lsn(&mut page, record_lsn);
         }
+        Ok(())
+    }
+
+    fn apply_insert_batch(&self, payload: &HeapInsertBatchPayload) -> Result<(), ApplyError> {
+        self.apply_insert_batch_at_lsn(payload, Lsn::ZERO)
+    }
+
+    fn apply_insert_batch_at_lsn(
+        &self,
+        payload: &HeapInsertBatchPayload,
+        record_lsn: Lsn,
+    ) -> Result<(), ApplyError> {
+        let page_id = payload.page;
+        self.advance_counter(page_id.relation, page_id.block)?;
+
+        let guard = self
+            .pool
+            .get_page(page_id)
+            .map_err(|e| ApplyError::Refused {
+                operation: "heap_insert_batch",
+                detail: format!("buffer pool: {e}"),
+            })?;
+        let mut page = guard.write();
+        if should_skip_redo(&page, record_lsn) {
+            return Ok(());
+        }
+
+        for entry in &payload.entries {
+            let slot_count = page.header().slot_count();
+            if entry.slot < slot_count
+                && page
+                    .read_tuple(entry.slot)
+                    .map_or(false, |existing| !existing.is_empty())
+            {
+                continue;
+            }
+
+            let actual_slot =
+                page.insert_tuple(&entry.tuple_bytes)
+                    .map_err(|e| ApplyError::Refused {
+                        operation: "heap_insert_batch",
+                        detail: format!("insert_tuple: {e}"),
+                    })?;
+            if actual_slot != entry.slot {
+                return Err(ApplyError::Refused {
+                    operation: "heap_insert_batch",
+                    detail: format!(
+                        "slot mismatch: expected {}, inserted {actual_slot}",
+                        entry.slot
+                    ),
+                });
+            }
+        }
+        stamp_replayed_lsn(&mut page, record_lsn);
         Ok(())
     }
 
@@ -910,7 +964,8 @@ mod tests {
     use ultrasql_mvcc::tuple_header::TUPLE_HEADER_SIZE;
     use ultrasql_wal::applier::{ApplyError, HeapTarget};
     use ultrasql_wal::payload::{
-        BTreeOpKind, BTreeOpPayload, FullPageWritePayload, HeapDeletePayload, HeapInsertPayload,
+        BTreeOpKind, BTreeOpPayload, FullPageWritePayload, HeapDeletePayload, HeapInsertBatchEntry,
+        HeapInsertBatchPayload, HeapInsertPayload,
     };
 
     use crate::btree::BTree;
@@ -1028,6 +1083,33 @@ mod tests {
         // Second application of the same record must not fail.
         heap.apply_insert(&payload).unwrap();
         // Only one slot should exist.
+        assert_eq!(heap.block_count(rel()), 1);
+    }
+
+    #[test]
+    fn apply_insert_batch_writes_tuples_to_page() {
+        let heap = make_heap();
+        let tid0 = tuple_id(0, 0);
+        let tid1 = tuple_id(0, 1);
+        let payload = HeapInsertBatchPayload {
+            page: page_id(0),
+            entries: vec![
+                HeapInsertBatchEntry {
+                    slot: 0,
+                    tuple_bytes: minimal_tuple(1, tid0),
+                },
+                HeapInsertBatchEntry {
+                    slot: 1,
+                    tuple_bytes: minimal_tuple(1, tid1),
+                },
+            ],
+        };
+
+        heap.apply_insert_batch(&payload).unwrap();
+        heap.apply_insert_batch(&payload).unwrap();
+
+        assert_eq!(heap.fetch(tid0).unwrap().tid, tid0);
+        assert_eq!(heap.fetch(tid1).unwrap().tid, tid1);
         assert_eq!(heap.block_count(rel()), 1);
     }
 

@@ -13,8 +13,8 @@ use ultrasql_mvcc::tuple_header::TUPLE_HEADER_SIZE;
 use ultrasql_wal::WalRecord;
 use ultrasql_wal::payload::{
     FullPageWritePayload, HeapDeleteInPlaceBatchEntry, HeapDeleteInPlaceBatchPayload,
-    HeapInsertPayload, HeapUpdateInPlaceBatchEntry, HeapUpdateInPlaceBatchPayload,
-    HeapUpdateInPlacePayload, HeapUpdatePayload,
+    HeapInsertBatchEntry, HeapInsertBatchPayload, HeapInsertPayload, HeapUpdateInPlaceBatchEntry,
+    HeapUpdateInPlaceBatchPayload, HeapUpdateInPlacePayload, HeapUpdatePayload,
 };
 use ultrasql_wal::record::RecordType;
 
@@ -185,6 +185,61 @@ impl<L: PageLoader> HeapAccess<L> {
             // Stamp the page LSN now that the WAL record is durable.
             // WAL append happened before stamp so page LSN is never ahead of WAL.
             Self::stamp_page_lsn(pool, tid.page, lsn)?;
+        }
+        Ok(())
+    }
+
+    /// Emit one `HeapInsertBatch` WAL record for rows inserted on one page.
+    ///
+    /// `insert_batch` calls this once per touched heap page after the page
+    /// mutation has landed and the page guard has been dropped. Recovery
+    /// replays each entry to its explicit slot, while the page LSN lets redo
+    /// skip a page already flushed at or past this record.
+    pub(super) fn emit_insert_batch_wal(
+        pool: &Arc<BufferPool<L>>,
+        page_id: PageId,
+        tids: &[TupleId],
+        opts: &InsertOptions<'_>,
+        mut fetch_tuple: impl FnMut(TupleId) -> Result<HeapTuple, HeapError>,
+    ) -> Result<(), HeapError> {
+        if let Some(sink) = opts.wal {
+            let mut entries = Vec::with_capacity(tids.len());
+            for &tid in tids {
+                if tid.page != page_id {
+                    return Err(HeapError::MalformedHeader(
+                        "heap insert batch spans multiple pages",
+                    ));
+                }
+                let tup = fetch_tuple(tid)?;
+                let mut tuple_bytes = Vec::with_capacity(TUPLE_HEADER_SIZE + tup.data.len());
+                tuple_bytes.resize(TUPLE_HEADER_SIZE, 0);
+                tup.header.encode(&mut tuple_bytes[..TUPLE_HEADER_SIZE]);
+                tuple_bytes.extend_from_slice(&tup.data);
+                entries.push(HeapInsertBatchEntry {
+                    slot: tid.slot,
+                    tuple_bytes,
+                });
+            }
+
+            if entries.is_empty() {
+                return Ok(());
+            }
+
+            let prev_lsn = sink.last_lsn_for(opts.xmin);
+            let payload_bytes = HeapInsertBatchPayload {
+                page: page_id,
+                entries,
+            }
+            .encode()?;
+            let record = WalRecord::new(
+                RecordType::HeapInsertBatch,
+                opts.xmin,
+                prev_lsn,
+                0,
+                payload_bytes,
+            )?;
+            let lsn: Lsn = Self::append_after_page_mutation(pool, sink, record)?;
+            Self::stamp_page_lsn(pool, page_id, lsn)?;
         }
         Ok(())
     }

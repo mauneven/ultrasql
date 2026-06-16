@@ -138,6 +138,8 @@ pub enum RecordType {
     HeapUpdateInPlaceBatch = 15,
     /// Multiple in-place tuple delete stamps on one heap page.
     HeapDeleteInPlaceBatch = 16,
+    /// Multiple heap inserts packed into one heap page.
+    HeapInsertBatch = 17,
     /// A no-op marker (used to round records up to alignment
     /// boundaries; ignored on replay).
     Nop = 255,
@@ -163,6 +165,7 @@ impl RecordType {
             14 => Self::IvfFlatOp,
             15 => Self::HeapUpdateInPlaceBatch,
             16 => Self::HeapDeleteInPlaceBatch,
+            17 => Self::HeapInsertBatch,
             255 => Self::Nop,
             other => return Err(WalRecordError::UnknownType(other)),
         })
@@ -188,6 +191,7 @@ impl From<RecordType> for u8 {
             RecordType::IvfFlatOp => 14,
             RecordType::HeapUpdateInPlaceBatch => 15,
             RecordType::HeapDeleteInPlaceBatch => 16,
+            RecordType::HeapInsertBatch => 17,
             RecordType::Nop => 255,
         }
     }

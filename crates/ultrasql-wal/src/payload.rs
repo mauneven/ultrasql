@@ -347,6 +347,170 @@ impl HeapInsertPayload {
 }
 
 // ---------------------------------------------------------------------------
+// HeapInsertBatchPayload
+// ---------------------------------------------------------------------------
+
+/// One tuple inserted into a page-level heap-insert batch.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HeapInsertBatchEntry {
+    /// Slot assigned on [`HeapInsertBatchPayload::page`].
+    pub slot: u16,
+    /// Full on-page tuple bytes: tuple header followed by user-data attributes.
+    pub tuple_bytes: Vec<u8>,
+}
+
+/// Payload for a `RecordType::HeapInsertBatch` WAL record.
+///
+/// Groups inserts that landed on the same heap page into one WAL record while
+/// preserving each page-local slot assignment for exact redo.
+///
+/// Wire layout (little-endian):
+/// ```text
+///  0   8   page (PageId)
+///  8   4   entry_count (u32)
+/// 12  ..   repeated entries:
+///            slot (u16), reserved (u16), tuple_len (u32), tuple_bytes
+/// ```
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HeapInsertBatchPayload {
+    /// Heap page containing every slot in [`Self::entries`].
+    pub page: PageId,
+    /// Slot payloads inserted on `page`, in slot order.
+    pub entries: Vec<HeapInsertBatchEntry>,
+}
+
+impl HeapInsertBatchPayload {
+    const FIXED: usize = PAGE_ID_SIZE + 4;
+    const ENTRY_FIXED: usize = 2 + 2 + 4;
+
+    /// Encode this payload into a freshly-allocated byte vector.
+    pub fn encode(&self) -> Result<Vec<u8>, PayloadError> {
+        let entry_count = u32::try_from(self.entries.len())
+            .map_err(|_| PayloadError::Malformed("heap_insert_batch entry_count overflow"))?;
+        let mut total = Self::FIXED;
+        for entry in &self.entries {
+            if entry.tuple_bytes.len() > MAX_VARIABLE_PAYLOAD_BYTES {
+                return Err(PayloadError::Malformed(
+                    "heap_insert_batch tuple_len exceeds ceiling",
+                ));
+            }
+            total = checked_len_sum(
+                &[total, Self::ENTRY_FIXED, entry.tuple_bytes.len()],
+                "heap_insert_batch length overflow",
+            )?;
+        }
+        if total > MAX_VARIABLE_PAYLOAD_BYTES {
+            return Err(PayloadError::Malformed(
+                "heap_insert_batch length exceeds ceiling",
+            ));
+        }
+
+        let mut out = vec![0_u8; total];
+        let mut page_buf = [0_u8; PAGE_ID_SIZE];
+        encode_page_id(&mut page_buf, self.page);
+        out[..PAGE_ID_SIZE].copy_from_slice(&page_buf);
+        write_u32_le(&mut out[PAGE_ID_SIZE..Self::FIXED], entry_count);
+
+        let mut off = Self::FIXED;
+        for entry in &self.entries {
+            let slot_end = checked_offset(off, 2, "heap_insert_batch length overflow")?;
+            write_u16_le(&mut out[off..slot_end], entry.slot);
+            let reserved_end = checked_offset(slot_end, 2, "heap_insert_batch length overflow")?;
+            write_u16_le(&mut out[slot_end..reserved_end], 0);
+            let len_end = checked_offset(reserved_end, 4, "heap_insert_batch length overflow")?;
+            let tuple_len = u32::try_from(entry.tuple_bytes.len())
+                .map_err(|_| PayloadError::Malformed("heap_insert_batch tuple_len overflow"))?;
+            write_u32_le(&mut out[reserved_end..len_end], tuple_len);
+            off = len_end;
+            let tuple_end = checked_offset(
+                off,
+                entry.tuple_bytes.len(),
+                "heap_insert_batch length overflow",
+            )?;
+            out[off..tuple_end].copy_from_slice(&entry.tuple_bytes);
+            off = tuple_end;
+        }
+        Ok(out)
+    }
+
+    /// Decode a `HeapInsertBatchPayload` from a byte slice.
+    pub fn decode(bytes: &[u8]) -> Result<Self, PayloadError> {
+        if bytes.len() < Self::FIXED {
+            return Err(PayloadError::Truncated {
+                needed: Self::FIXED,
+                have: bytes.len(),
+            });
+        }
+        let page = decode_page_id(bytes)?;
+        let entry_count = usize::try_from(
+            read_u32_le(&bytes[PAGE_ID_SIZE..Self::FIXED])
+                .map_err(|_| PayloadError::Malformed("heap_insert_batch entry_count"))?,
+        )
+        .map_err(|_| PayloadError::Malformed("heap_insert_batch entry_count usize"))?;
+
+        let mut entries = Vec::with_capacity(entry_count);
+        let mut off = Self::FIXED;
+        for _ in 0..entry_count {
+            let slot_end = checked_offset(off, 2, "heap_insert_batch length overflow")?;
+            if bytes.len() < slot_end {
+                return Err(PayloadError::Truncated {
+                    needed: slot_end,
+                    have: bytes.len(),
+                });
+            }
+            let slot = read_u16_le(&bytes[off..slot_end])
+                .map_err(|_| PayloadError::Malformed("heap_insert_batch slot"))?;
+            let reserved_end = checked_offset(slot_end, 2, "heap_insert_batch length overflow")?;
+            if bytes.len() < reserved_end {
+                return Err(PayloadError::Truncated {
+                    needed: reserved_end,
+                    have: bytes.len(),
+                });
+            }
+            let reserved = read_u16_le(&bytes[slot_end..reserved_end])
+                .map_err(|_| PayloadError::Malformed("heap_insert_batch entry reserved"))?;
+            if reserved != 0 {
+                return Err(PayloadError::Malformed(
+                    "heap_insert_batch entry reserved bits set",
+                ));
+            }
+            let len_end = checked_offset(reserved_end, 4, "heap_insert_batch length overflow")?;
+            if bytes.len() < len_end {
+                return Err(PayloadError::Truncated {
+                    needed: len_end,
+                    have: bytes.len(),
+                });
+            }
+            let tuple_len = usize::try_from(
+                read_u32_le(&bytes[reserved_end..len_end])
+                    .map_err(|_| PayloadError::Malformed("heap_insert_batch tuple_len"))?,
+            )
+            .map_err(|_| PayloadError::Malformed("heap_insert_batch tuple_len usize"))?;
+            if tuple_len > MAX_VARIABLE_PAYLOAD_BYTES {
+                return Err(PayloadError::Malformed(
+                    "heap_insert_batch tuple_len exceeds ceiling",
+                ));
+            }
+            off = len_end;
+            let tuple_end = checked_offset(off, tuple_len, "heap_insert_batch length overflow")?;
+            if bytes.len() < tuple_end {
+                return Err(PayloadError::Truncated {
+                    needed: tuple_end,
+                    have: bytes.len(),
+                });
+            }
+            entries.push(HeapInsertBatchEntry {
+                slot,
+                tuple_bytes: bytes[off..tuple_end].to_vec(),
+            });
+            off = tuple_end;
+        }
+        require_exact_len(bytes, off)?;
+        Ok(Self { page, entries })
+    }
+}
+
+// ---------------------------------------------------------------------------
 // HeapUpdatePayload
 // ---------------------------------------------------------------------------
 
@@ -2505,6 +2669,19 @@ mod tests {
         );
 
         assert_trailing_rejected(
+            HeapInsertBatchPayload {
+                page: page_id(1, 2),
+                entries: vec![HeapInsertBatchEntry {
+                    slot: 3,
+                    tuple_bytes: vec![1, 2, 3],
+                }],
+            }
+            .encode()
+            .expect("encode"),
+            HeapInsertBatchPayload::decode,
+        );
+
+        assert_trailing_rejected(
             HeapUpdatePayload {
                 old_tid: tid(1, 2, 3),
                 new_tid: tid(1, 2, 4),
@@ -2774,6 +2951,27 @@ mod tests {
             tuple_bytes: (0_u8..64).collect(),
         };
         assert_eq!(HeapInsertPayload::decode(&p.encode().unwrap()).unwrap(), p);
+    }
+
+    #[test]
+    fn heap_insert_batch_round_trip_realistic() {
+        let p = HeapInsertBatchPayload {
+            page: page_id(7, 42),
+            entries: vec![
+                HeapInsertBatchEntry {
+                    slot: 13,
+                    tuple_bytes: (0_u8..64).collect(),
+                },
+                HeapInsertBatchEntry {
+                    slot: 14,
+                    tuple_bytes: (64_u8..96).collect(),
+                },
+            ],
+        };
+        assert_eq!(
+            HeapInsertBatchPayload::decode(&p.encode().unwrap()).unwrap(),
+            p
+        );
     }
 
     // ── HeapUpdatePayload ─────────────────────────────────────────────────

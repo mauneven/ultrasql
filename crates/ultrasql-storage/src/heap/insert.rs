@@ -216,10 +216,9 @@ impl<L: PageLoader> HeapAccess<L> {
     ///   `opts.command_id`, identical to `insert`.
     /// - Each tuple's `ctid` is patched to its assigned [`TupleId`]
     ///   after slot allocation, identical to `insert`.
-    /// - WAL emission, if `opts.wal` is `Some`, runs exactly once per
-    ///   tuple (just like `insert`); the batch path is meaningful only
-    ///   when `opts.wal` is `None` (the WAL emission path serializes on
-    ///   the sink and dominates the per-row cost).
+    /// - WAL emission, if `opts.wal` is `Some`, runs once per page touched.
+    ///   Each `HeapInsertBatch` record carries every slot and tuple byte image
+    ///   inserted on that page.
     /// - FSM hints and VM clears, when `opts.fsm` / `opts.vm` are
     ///   `Some`, run once per *page touched*, not per row. This is a
     ///   strict improvement over `insert`'s per-row hooks because the
@@ -295,11 +294,21 @@ impl<L: PageLoader> HeapAccess<L> {
             }
 
             let page_id = PageId::new(rel, BlockNumber::new(cursor));
+            let page_out_start = out.len();
             let drained =
                 Self::batch_fill_page(&self.pool, page_id, rows, &mut out, row_idx, opts, n_atts)?;
             row_idx += drained;
             // After this page, the post hooks fire once for the affected page.
             Self::post_insert_fsm_vm(&self.pool, page_id, opts);
+            if opts.wal.is_some() && out.len() > page_out_start {
+                Self::emit_insert_batch_wal(
+                    &self.pool,
+                    page_id,
+                    &out[page_out_start..],
+                    &opts,
+                    |tid| self.fetch(tid),
+                )?;
+            }
 
             if row_idx == rows.len() {
                 // Cache the last block we wrote into so the next batch
@@ -319,14 +328,6 @@ impl<L: PageLoader> HeapAccess<L> {
                 }
                 block_count = new_block.checked_add(1).ok_or(HeapError::OutOfBlocks)?;
                 cursor = new_block;
-            }
-        }
-
-        // WAL emission, if configured. Runs in the same per-row pattern
-        // as `insert`, after every page mutation and outside any pin.
-        if opts.wal.is_some() {
-            for &tid in &out {
-                Self::emit_insert_wal(&self.pool, tid, &opts, || self.fetch(tid))?;
             }
         }
 
