@@ -166,7 +166,8 @@ def workload_sql(cycle: int) -> list[tuple[str, str]]:
         ("ddl", "CREATE INDEX IF NOT EXISTS soak_accounts_id_idx ON soak_accounts (id)"),
         (
             "ddl",
-            "CREATE VIEW IF NOT EXISTS soak_positive_balances AS "
+            "DROP TABLE IF EXISTS soak_positive_balances; "
+            "CREATE VIEW soak_positive_balances AS "
             "SELECT id, balance FROM soak_accounts WHERE balance >= 0",
         ),
         (
@@ -188,7 +189,7 @@ def workload_sql(cycle: int) -> list[tuple[str, str]]:
             "WHERE to_tsvector(note) @@ plainto_tsquery('searchable')",
         ),
         ("read", "SELECT id FROM soak_accounts ORDER BY embedding <-> '[1,2,3]' LIMIT 1"),
-        ("copy", "COPY soak_accounts TO STDOUT WITH CSV"),
+        ("copy", "COPY soak_accounts TO STDOUT WITH (FORMAT CSV)"),
         ("transaction", "COMMIT"),
     ]
 

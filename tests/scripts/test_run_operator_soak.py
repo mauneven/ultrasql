@@ -122,6 +122,10 @@ class OperatorSoakRunnerTests(unittest.TestCase):
             sql = sql_log.read_text()
             for needle in ["JSONB", "CREATE VIEW", "BEGIN", "COMMIT", "COPY"]:
                 self.assertIn(needle, sql)
+            self.assertIn("DROP TABLE IF EXISTS soak_positive_balances", sql)
+            self.assertIn("COPY soak_accounts TO STDOUT WITH (FORMAT CSV)", sql)
+            self.assertNotIn("CREATE VIEW IF NOT EXISTS", sql)
+            self.assertNotIn("COPY soak_accounts TO STDOUT WITH CSV", sql)
 
 
 class tempfile_dir:
