@@ -61,8 +61,9 @@ completed evidence.
 
 - README performance notes must come from SQL-surface scripts and recorded
   artifacts.
-- TPC-H/TPC-C/Sysbench/ClickBench gates are open until same-host artifacts prove
-  the target thresholds.
+- Current TPC-H SF1/SF10 certification artifacts pass their recorded
+  PostgreSQL/DuckDB targets. TPC-B, TPC-C, Sysbench, and ClickBench release
+  gates remain open in the latest committed artifacts.
 - Firebolt comparisons use local Firebolt Core only, not hosted Firebolt URLs.
 
 ## Client ecosystem

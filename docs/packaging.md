@@ -116,10 +116,11 @@ brew install ultrasql
 requires acceptance into `homebrew/core`. That is a separate upstream Homebrew
 review path, not something the release workflow can force. The formula is now
 source-built so it is shaped for that path, but the project should submit to
-`homebrew/core` only after UltraSQL has a stable tagged release that is not
-advertised as pre-alpha/beta, builds and passes tests on Homebrew-supported
-macOS and Linux targets, and satisfies Homebrew's notability and maintainability
-checks. Until then, the tap is the correct distribution channel.
+`homebrew/core` only after UltraSQL has a stable tagged release that is no
+longer advertised as alpha or beta, builds and passes tests on
+Homebrew-supported macOS and Linux targets, and satisfies Homebrew's notability
+and maintainability checks. Until then, the tap is the correct distribution
+channel.
 
 ## AUR
 

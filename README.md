@@ -3,17 +3,18 @@
 Fast SQL database in Rust.
 
 [![License: Apache 2.0 OR MIT](https://img.shields.io/badge/license-Apache_2.0_OR_MIT-blue.svg)](#license)
-[![Status: pre-alpha](https://img.shields.io/badge/status-pre--alpha-orange.svg)](ROADMAP.md)
+[![Status: alpha](https://img.shields.io/badge/status-alpha-orange.svg)](ROADMAP.md)
 [![MSRV](https://img.shields.io/badge/MSRV-1.85-blue.svg)](rust-toolchain.toml)
 
 UltraSQL is a native Rust SQL database with durable storage, MVCC, WAL, query
 execution, indexes, vector search, embedded Node/Bun support, and
 release-grade benchmark tooling.
 
-The project is pre-alpha. It is already fast on the tracked SQL-surface
-benchmarks, but release readiness is evidence-based: correctness, driver
-certification, security, coverage, packaging, external audits, incident drills,
-and operator soak gates must all close before v1.0.
+The project is alpha: the engine is broad enough for serious evaluation,
+compatibility testing, and reproducible benchmarking, but release readiness is
+evidence-based. Correctness, driver certification, security, coverage,
+packaging, external audits, incident drills, and operator soak gates must all
+close before v1.0 or production use.
 
 ## Current Shape
 
@@ -161,6 +162,7 @@ fuzz/         parser, wire, WAL, and planner fuzz targets
 ## Read Next
 
 - [docs/production-readiness.md](docs/production-readiness.md) - current audited readiness verdict.
+- [docs/documentation-status-audit.md](docs/documentation-status-audit.md) - current docs truth audit.
 - [ROADMAP.md](ROADMAP.md) - production plan and open gates.
 - [DONE.md](DONE.md) - completed milestones and evidence ledger.
 - [docs/getting-started.md](docs/getting-started.md) - local first steps.

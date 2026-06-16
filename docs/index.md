@@ -3,7 +3,7 @@
 UltraSQL is a fast SQL database in Rust. These docs cover local evaluation,
 release artifacts, operational gates, and known limits.
 
-UltraSQL is pre-alpha. Treat every install path as an evaluation or release
+UltraSQL is alpha. Treat every install path as an evaluation or release
 candidate path until the v1.0 release checklist is closed.
 
 ## Start here
@@ -29,6 +29,8 @@ candidate path until the v1.0 release checklist is closed.
   engine plan.
 - [Production Readiness Audit](production-readiness.md) records the current
   evidence-backed readiness verdict.
+- [Documentation Status Audit](documentation-status-audit.md) records the
+  current alpha wording and first-party Markdown audit scope.
 - [Private Preview Runbook](private-preview-runbook.md) defines the controlled
   pre-production preview packet.
 - [External Validation Outreach](external-validation-outreach.md) gives audit,

@@ -25,7 +25,7 @@ If any item is missing, do not start a broad preview. Fix the packet first.
 Allowed:
 
 ```text
-UltraSQL is a pre-alpha database seeking independent production-readiness
+UltraSQL is an alpha database seeking independent production-readiness
 evidence.
 ```
 

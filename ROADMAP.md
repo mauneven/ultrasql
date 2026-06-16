@@ -54,12 +54,15 @@ file focused on what still blocks production.
 
 ### Performance Certification
 
-- TPC-B: correctness verified, throughput leads PostgreSQL 17, p99 < 5 ms at
-  32 connections.
-- TPC-C: all five transaction types correct and throughput leads PostgreSQL 17.
-- Sysbench OLTP read/write: full same-host PostgreSQL 17 certification remains
-  open. Latest UltraSQL-only smoke passes, but is non-certifying until a
-  `POSTGRES_DSN` artifact refreshes the comparison.
+- TPC-B: latest committed certification artifact is `target_not_met`; keep the
+  correctness work, but do not claim throughput leadership or p99 < 5 ms until
+  `benchmarks/results/latest/tpcb_certification.json` passes.
+- TPC-C: latest committed certification artifact is `target_not_met`; all five
+  transaction paths need a passing same-host PostgreSQL 17 comparison before a
+  throughput-leadership claim.
+- Sysbench OLTP read/write: latest committed certification artifact is
+  `target_not_met`; keep the UltraSQL smoke path, but do not claim same-host
+  PostgreSQL 17 leadership until `sysbench_certification.json` passes.
 - ClickBench: dataset-backed same-host PostgreSQL 17 comparison, plus
   ClickHouse and Firebolt legs when available.
 - Firebolt sparse primary-index pruning: pass

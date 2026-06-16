@@ -8,7 +8,7 @@ independent operators, external auditors, and incident-drill reviewers.
 
 ## Current Position
 
-UltraSQL can be presented as a pre-alpha database seeking independent review.
+UltraSQL can be presented as an alpha database seeking independent review.
 The only benchmark claim that can be made today is the committed same-host
 release-artifact DB-vs-DB scale-sweep result recorded in the benchmark
 artifacts. Do not claim production readiness, universal database leadership, or

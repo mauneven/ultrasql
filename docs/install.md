@@ -150,7 +150,7 @@ brew install ultrasql
 Plain `brew install ultrasql` on a fresh machine requires a formula accepted
 into `homebrew/core`. The formula is now source-built, which is the right shape
 for that future review. UltraSQL should submit it once releases are stable and
-no longer advertised as pre-alpha.
+no longer advertised as alpha.
 
 ## Arch Linux / AUR
 
