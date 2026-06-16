@@ -38,7 +38,10 @@ use ultrasql_storage::btree::BTree;
 
 pub mod support;
 
-use support::{shutdown as graceful_shutdown, start_persistent_server, start_sample_server};
+use support::{
+    make_data_dir_private, shutdown as graceful_shutdown, start_persistent_server,
+    start_sample_server,
+};
 
 /// Insert `n_rows` of `(id INT, val INT)` rows into `table_name` via a
 /// single multi-row VALUES statement.
@@ -98,6 +101,35 @@ fn rows_first_col(rows: &[tokio_postgres::SimpleQueryMessage]) -> Vec<String> {
         .collect()
 }
 
+struct SplitMix64(u64);
+
+impl SplitMix64 {
+    const fn new(seed: u64) -> Self {
+        Self(seed)
+    }
+
+    fn next_u64(&mut self) -> u64 {
+        self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let mut z = self.0;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^ (z >> 31)
+    }
+
+    fn next_unit_f64(&mut self) -> f64 {
+        let bits = self.next_u64() >> 11;
+        let high = bits
+            .to_f64()
+            .expect("53-bit SplitMix mantissa converts to f64 exactly");
+        high * (1.0_f64 / 9_007_199_254_740_992.0)
+    }
+
+    fn next_i32(&mut self) -> i32 {
+        let bytes = self.next_u64().to_le_bytes();
+        i32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]])
+    }
+}
+
 /// `SELECT * FROM t WHERE id = 42` returns exactly the row with `id =
 /// 42` when an index covers the column.
 #[tokio::test]
@@ -148,6 +180,64 @@ async fn create_index_concurrently_then_point_lookup_round_trip() {
         .await
         .expect("query through concurrent index");
     assert_eq!(rows_first_col(&rows), vec!["420".to_string()]);
+
+    graceful_shutdown(running).await;
+}
+
+#[tokio::test]
+async fn mixed_indexed_updates_and_inserts_keep_point_reads_live() {
+    const N_ROWS: i32 = 10_000;
+    const BATCHES: usize = 200;
+    const BATCH_OPS: usize = 20;
+
+    let data_dir = tempfile::tempdir().expect("tempdir");
+    make_data_dir_private(data_dir.path());
+    let running = start_persistent_server(data_dir.path(), "index_scan_mixed_test").await;
+    let client = &running.client;
+    preload(client, "t_mixed_idx", N_ROWS).await;
+    client
+        .batch_execute("CREATE INDEX ix_t_mixed_idx_id ON t_mixed_idx(id)")
+        .await
+        .expect("create index");
+
+    let mut expected: Vec<i32> = (0..N_ROWS).map(|id| id * 10).collect();
+    let mut next_id = N_ROWS;
+    let mut rng = SplitMix64::new(0xBEEF);
+    let n_rows_u64 = u64::try_from(N_ROWS).expect("positive row count");
+    for batch in 0..BATCHES {
+        let mut sql = String::new();
+        for _ in 0..BATCH_OPS {
+            let r = rng.next_unit_f64();
+            if r < 0.50 {
+                let row_id = i32::try_from(rng.next_u64() % n_rows_u64).expect("row id fits");
+                sql.push_str(&format!("SELECT val FROM t_mixed_idx WHERE id = {row_id};\n"));
+            } else if r < 0.80 {
+                let row_id = i32::try_from(rng.next_u64() % n_rows_u64).expect("row id fits");
+                let idx = usize::try_from(row_id).expect("non-negative row id");
+                expected[idx] = expected[idx].checked_add(1).expect("fixture value fits");
+                sql.push_str(&format!(
+                    "UPDATE t_mixed_idx SET val = val + 1 WHERE id = {row_id};\n"
+                ));
+            } else {
+                let new_val = rng.next_i32();
+                sql.push_str(&format!(
+                    "INSERT INTO t_mixed_idx (id, val) VALUES ({next_id}, {new_val});\n"
+                ));
+                next_id += 1;
+            }
+        }
+        client
+            .batch_execute(&sql)
+            .await
+            .unwrap_or_else(|err| panic!("mixed batch {batch} must not corrupt index scan: {err}"));
+    }
+
+    let rows = client
+        .simple_query("SELECT val FROM t_mixed_idx WHERE id = 9613")
+        .await
+        .expect("indexed point read after mixed workload");
+    let expected_val = expected[9613].to_string();
+    assert_eq!(rows_first_col(&rows), vec![expected_val]);
 
     graceful_shutdown(running).await;
 }
