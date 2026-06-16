@@ -802,6 +802,7 @@ fn final_release_requires_operator_reports_green_workflows_and_notes() {
     let operator_docs = repo_file("docs/OPERATOR_SOAK.md");
     let operator_report_docs = repo_file("docs/operator-reports.md");
     let operator_workflow = repo_file(".github/workflows/operator-soak.yml");
+    let runner = repo_file("scripts/run-operator-soak.py");
     let validator = repo_file("scripts/validate-operator-soak.py");
     let release = repo_file(".github/workflows/release.yml");
     let notes_template = repo_file("docs/release-notes-template.md");
@@ -814,9 +815,16 @@ fn final_release_requires_operator_reports_green_workflows_and_notes() {
         "30 continuous days",
         "Three independent operators",
         "operator-reports/*.json",
+        "scripts/run-operator-soak.py",
+        "schema_version",
+        "operator.id_hash",
+        "workload.id_hash",
+        "db_binary.sha256",
         "benchmarks/results/latest/operator_soak_status.json",
-        "critical_issue_count",
-        "high_issue_count",
+        "errors.critical",
+        "errors.high",
+        "wal_replay_checks",
+        "smoke_valid_report_count",
     ] {
         assert!(operator_docs.contains(needle), "soak docs missing {needle}");
         assert!(
@@ -842,11 +850,14 @@ fn final_release_requires_operator_reports_green_workflows_and_notes() {
     for needle in [
         "min_reports",
         "min_days",
-        "operator_id",
-        "start_time_utc",
-        "end_time_utc",
-        "critical_issue_count",
-        "high_issue_count",
+        "operator.id_hash",
+        "started_at",
+        "ended_at",
+        "errors.total",
+        "errors.critical",
+        "errors.high",
+        "wal_replay_checks",
+        "smoke_valid_report_count",
         "status",
         "ready",
         "not_ready",
@@ -855,6 +866,21 @@ fn final_release_requires_operator_reports_green_workflows_and_notes() {
             validator.contains(needle),
             "operator validator missing {needle}"
         );
+    }
+
+    for needle in [
+        "mode",
+        "smoke",
+        "30d",
+        "ultrasqld",
+        "CREATE VIEW",
+        "JSONB",
+        "COPY",
+        "wal_replay_checks",
+        "operator",
+        "id_hash",
+    ] {
+        assert!(runner.contains(needle), "operator runner missing {needle}");
     }
 
     for needle in [

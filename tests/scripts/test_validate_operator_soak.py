@@ -18,31 +18,81 @@ def write_report(
     *,
     operator_id: str,
     commit: str = COMMIT,
-    failure_count: int = 0,
+    mode: str = "30d",
+    final_verdict: str = "pass",
+    error_total: int = 0,
+    consistency_passed: bool = True,
+    wal_passed: bool = True,
     start: str = "2026-01-01T00:00:00Z",
     end: str = "2026-02-01T00:00:00Z",
 ) -> None:
     path.write_text(
         json.dumps(
             {
-                "operator_id": operator_id,
+                "schema_version": 2,
+                "mode": mode,
                 "commit": commit,
-                "start_time_utc": start,
-                "end_time_utc": end,
-                "host_cpu": "test cpu",
-                "host_memory": "64 GiB",
-                "host_storage": "nvme ext4",
-                "os": "linux",
-                "ultrasqld_command": "ultrasqld --data-dir /redacted",
-                "workload": "mixed sql smoke",
-                "client_count": 8,
-                "data_dir": "/redacted",
-                "ops_endpoint": "127.0.0.1:8080",
-                "health_check_interval": "30s",
-                "failure_count": failure_count,
-                "correctness_issue_count": 0,
-                "critical_issue_count": 0,
-                "high_issue_count": 0,
+                "started_at": start,
+                "ended_at": end,
+                "duration_days": 31.0 if mode == "30d" else 0.0001,
+                "host": {
+                    "id_hash": "host-a",
+                    "cpu": "test cpu",
+                    "memory_bytes": 68719476736,
+                    "storage": "nvme ext4",
+                    "os": "linux",
+                },
+                "operator": {"id_hash": operator_id},
+                "workload": {
+                    "id": "mixed-sql-soak-v1",
+                    "id_hash": "workload-a",
+                    "sql_surface": ["ddl", "crud", "transactions", "jsonb"],
+                },
+                "db_binary": {
+                    "path": "target/debug/ultrasqld",
+                    "sha256": "a" * 64,
+                },
+                "config": {
+                    "ultrasqld_command": "ultrasqld --data-dir /redacted",
+                    "data_dir": "/redacted",
+                    "ops_endpoint": "127.0.0.1:8080",
+                    "health_check_interval": "30s",
+                },
+                "dataset_scale": {"rows": 1000},
+                "concurrency": 8,
+                "operations": {
+                    "total": 100,
+                    "ddl": 4,
+                    "read": 30,
+                    "write": 30,
+                    "transactions": 20,
+                    "copy": 1,
+                    "export_import": 1,
+                },
+                "latency_ms": {"p50": 1.0, "p95": 2.0, "p99": 3.0},
+                "throughput_ops_per_sec": 10.0,
+                "errors": {
+                    "total": error_total,
+                    "availability": 0,
+                    "sql": error_total,
+                    "correctness": 0,
+                    "corruption": 0,
+                    "critical": 0,
+                    "high": 0,
+                },
+                "restart_count": 1,
+                "crash_recovery_count": 0,
+                "consistency_checks": [
+                    {
+                        "name": "row_count",
+                        "passed": consistency_passed,
+                        "checksum": "b" * 64,
+                    }
+                ],
+                "wal_replay_checks": [
+                    {"name": "clean_restart", "passed": wal_passed}
+                ],
+                "final_verdict": final_verdict,
                 "log_bundle_path": "artifact://logs",
                 "signed_off_by": "reviewer",
             }
@@ -79,7 +129,7 @@ def run_validator(reports_dir: Path, *extra: str) -> dict:
 
 
 class OperatorSoakValidatorTests(unittest.TestCase):
-    def test_soak_normalizes_operator_id_before_independence_count(self) -> None:
+    def test_soak_normalizes_operator_hash_before_independence_count(self) -> None:
         with tempfile_dir() as tmp_path:
             write_report(tmp_path / "a.json", operator_id="op-a")
             write_report(tmp_path / "b.json", operator_id=" op-a ")
@@ -93,7 +143,7 @@ class OperatorSoakValidatorTests(unittest.TestCase):
                 any("independent operator" in reason for reason in status["reasons"])
             )
 
-    def test_soak_rejects_non_string_operator_ids(self) -> None:
+    def test_soak_rejects_non_string_operator_hashes(self) -> None:
         with tempfile_dir() as tmp_path:
             write_report(tmp_path / "a.json", operator_id=1)
             write_report(tmp_path / "b.json", operator_id=2)
@@ -105,18 +155,18 @@ class OperatorSoakValidatorTests(unittest.TestCase):
             for report in status["reports"]:
                 self.assertTrue(
                     any(
-                        "operator_id must be a non-empty string" in error
+                        "operator.id_hash must be a non-empty string" in error
                         for error in report["errors"]
                     )
                 )
 
-    def test_soak_requires_positive_client_count(self) -> None:
+    def test_soak_requires_positive_concurrency(self) -> None:
         with tempfile_dir() as tmp_path:
             write_report(tmp_path / "a.json", operator_id="op-a")
             write_report(tmp_path / "b.json", operator_id="op-b")
             write_report(tmp_path / "c.json", operator_id="op-c")
             report = json.loads((tmp_path / "c.json").read_text())
-            report["client_count"] = 0
+            report["concurrency"] = 0
             (tmp_path / "c.json").write_text(json.dumps(report) + "\n")
 
             status = run_validator(tmp_path, "--commit", COMMIT)
@@ -127,7 +177,7 @@ class OperatorSoakValidatorTests(unittest.TestCase):
             )
             self.assertTrue(
                 any(
-                    "client_count must be a positive integer" in error
+                    "concurrency must be a positive integer" in error
                     for error in bad_report["errors"]
                 )
             )
@@ -175,14 +225,20 @@ class OperatorSoakValidatorTests(unittest.TestCase):
                 report for report in status["reports"] if report["operator_id"] == "op-c"
             )
             self.assertTrue(
-                any("end_time_utc is in the future" in error for error in bad_report["errors"])
+                any("ended_at is in the future" in error for error in bad_report["errors"])
             )
 
-    def test_soak_rejects_availability_failures(self) -> None:
+    def test_soak_rejects_errors_and_failed_integrity_checks(self) -> None:
         with tempfile_dir() as tmp_path:
             write_report(tmp_path / "a.json", operator_id="op-a")
             write_report(tmp_path / "b.json", operator_id="op-b")
-            write_report(tmp_path / "c.json", operator_id="op-c", failure_count=1)
+            write_report(
+                tmp_path / "c.json",
+                operator_id="op-c",
+                error_total=1,
+                consistency_passed=False,
+                wal_passed=False,
+            )
 
             status = run_validator(tmp_path, "--commit", COMMIT)
 
@@ -190,9 +246,41 @@ class OperatorSoakValidatorTests(unittest.TestCase):
             bad_report = next(
                 report for report in status["reports"] if report["operator_id"] == "op-c"
             )
-            self.assertTrue(
-                any("failure_count must be zero" in error for error in bad_report["errors"])
+            errors = "\n".join(bad_report["errors"])
+            self.assertIn("errors.total must be zero", errors)
+            self.assertIn("consistency_checks[0].passed must be true", errors)
+            self.assertIn("wal_replay_checks[0].passed must be true", errors)
+
+    def test_soak_accepts_smoke_mode_only_as_non_ready_dev_check(self) -> None:
+        with tempfile_dir() as tmp_path:
+            write_report(
+                tmp_path / "smoke.json",
+                operator_id="op-smoke",
+                mode="smoke",
+                final_verdict="smoke_pass",
+                start="2026-02-01T00:00:00Z",
+                end="2026-02-01T00:10:00Z",
             )
+
+            status = run_validator(tmp_path, "--commit", COMMIT)
+
+            self.assertFalse(status["ready"])
+            self.assertEqual(status["smoke_valid_report_count"], 1)
+            self.assertTrue(any("smoke" in reason for reason in status["reasons"]))
+
+    def test_soak_release_schema_v2_reports_can_close_gate(self) -> None:
+        with tempfile_dir() as tmp_path:
+            write_report(tmp_path / "a.json", operator_id="op-a")
+            write_report(tmp_path / "b.json", operator_id="op-b")
+            write_report(tmp_path / "c.json", operator_id="op-c")
+
+            status = run_validator(tmp_path, "--commit", COMMIT)
+
+            self.assertTrue(status["ready"])
+            self.assertEqual(status["status"], "ready")
+            self.assertEqual(status["valid_report_count"], 3)
+            self.assertEqual(status["smoke_valid_report_count"], 0)
+            self.assertEqual(status["valid_release_commits"], [COMMIT])
 
 
 class InstallScriptHardeningTests(unittest.TestCase):

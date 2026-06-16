@@ -22,6 +22,7 @@ file focused on what still blocks production.
 
 - Three independent `operator-reports/*.json` files must pass strict validation
   for 30 continuous days through `.github/workflows/operator-soak.yml`.
+  Operators can generate schema v2 reports with `scripts/run-operator-soak.py`.
 - Two independent `external-audits/*.json` files must pass strict validation
   through `scripts/validate-external-audits.py --strict`; required audit types
   are `security` and `correctness`.

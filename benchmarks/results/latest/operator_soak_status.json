@@ -4,18 +4,18 @@
   "min_reports": 3,
   "ready": false,
   "reasons": [
-    "0 valid report(s), need 3",
+    "0 valid release report(s), need 3",
     "0 independent operator(s), need 3",
-    "0 valid release commit(s), need exactly 1",
-    "valid reports must cover expected commit 043093e87299cc84e46ef37344f98eea50fa0472"
+    "0 valid release commit(s), need exactly 1"
   ],
-  "release_commit": "043093e87299cc84e46ef37344f98eea50fa0472",
+  "release_commit": null,
   "report_count": 0,
   "reports": [],
   "reports_dir": "operator-reports",
-  "schema_version": 1,
+  "schema_version": 2,
+  "smoke_valid_report_count": 0,
   "status": "not_ready",
   "valid_release_commits": [],
   "valid_report_count": 0,
-  "validated_at_utc": "2026-06-16T04:10:00.110923Z"
+  "validated_at_utc": "2026-06-16T00:00:00Z"
 }
