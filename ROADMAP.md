@@ -28,7 +28,9 @@ file focused on what still blocks production.
   are `security` and `correctness`.
 - Required `incident-drills/*.json` files must pass strict validation through
   `scripts/validate-incident-drills.py --strict`; required drill types are
-  `backup_restore`, `wal_recovery`, and `disk_full`.
+  `backup_restore`, `wal_recovery`, and `disk_full`. Local smoke reports can
+  be generated with `scripts/run-incident-drills.py`, but production sign-off
+  requires `mode: "production"` reports.
 - Driver compatibility must pass strict validation through
   `scripts/run-driver-release-evidence.py` and
   `scripts/validate-driver-compatibility.py --strict`; the status artifact

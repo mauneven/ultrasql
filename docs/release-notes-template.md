@@ -39,6 +39,9 @@ are required. The rendered status artifact is `external_audit_status.json`.
 
 The release workflow validates `incident-drills/*.json` with
 `scripts/validate-incident-drills.py --strict` for v1.0 and later releases.
+Local smoke drill reports can be generated with
+`scripts/run-incident-drills.py`, but production sign-off requires submitted
+production-mode drill evidence.
 The required drill types are `backup_restore`, `wal_recovery`, and
 `disk_full`. The rendered status artifact is `incident_drill_status.json`.
 

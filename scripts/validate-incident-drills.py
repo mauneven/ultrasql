@@ -13,6 +13,8 @@ from typing import Any
 
 
 REQUIRED_FIELDS = [
+    "schema_version",
+    "mode",
     "drill_id",
     "commit",
     "drill_type",
@@ -30,6 +32,8 @@ REQUIRED_FIELDS = [
     "postmortem_uri",
     "unresolved_sev0_count",
     "unresolved_sev1_count",
+    "artifacts",
+    "checks",
     "signed_off_by",
 ]
 TEXT_FIELDS = [
@@ -115,6 +119,12 @@ def parse_bool(value: Any, field: str) -> bool:
     return value
 
 
+def parse_object(value: Any, field: str) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        raise ValueError(f"{field} must be a JSON object")
+    return value
+
+
 def parse_commit(value: Any) -> str:
     if not isinstance(value, str) or not GIT_COMMIT_RE.fullmatch(value.strip()):
         raise ValueError("must be a full 40-character hex git commit")
@@ -152,6 +162,13 @@ def validate_report(
     for field in REQUIRED_FIELDS:
         if field not in report:
             errors.append(f"missing {field}")
+
+    if report.get("schema_version") != 2:
+        errors.append("schema_version must be 2")
+    mode = report.get("mode")
+    if mode not in {"production", "smoke"}:
+        errors.append("mode must be production or smoke")
+
     for field in TEXT_FIELDS:
         if field in report:
             try:
@@ -221,12 +238,42 @@ def validate_report(
         if isinstance(report.get(field), int) and report[field] != 0:
             errors.append(f"{field} must be zero for release sign-off")
 
+    try:
+        artifacts = parse_object(report.get("artifacts"), "artifacts")
+        parse_text(artifacts.get("manifest_path"), "artifacts.manifest_path")
+        parse_text(artifacts.get("log_bundle_path"), "artifacts.log_bundle_path")
+    except ValueError as err:
+        errors.append(str(err))
+
+    checks = report.get("checks")
+    if not isinstance(checks, list) or not checks:
+        errors.append("checks must be a non-empty list")
+    else:
+        for index, check in enumerate(checks):
+            if not isinstance(check, dict):
+                errors.append(f"checks[{index}] must be a JSON object")
+                continue
+            try:
+                parse_text(check.get("name"), f"checks[{index}].name")
+            except ValueError as err:
+                errors.append(str(err))
+            if check.get("passed") is not True:
+                errors.append(f"checks[{index}].passed must be true")
+
+    release_errors = list(errors)
+    if mode == "smoke":
+        release_errors.append("smoke mode is a non-ready development check")
+    smoke_valid = mode == "smoke" and not errors
+    release_valid = mode == "production" and not errors
+
     return {
         "path": str(path),
         "drill_id": normalized_text.get("drill_id", report.get("drill_id")),
         "drill_type": drill_type,
         "commit": commit if commit is not None else report.get("commit"),
-        "valid": not errors,
+        "mode": mode,
+        "valid": release_valid,
+        "smoke_valid": smoke_valid,
         "rto_target_seconds": counts.get(
             "rto_target_seconds", report.get("rto_target_seconds")
         ),
@@ -248,7 +295,7 @@ def validate_report(
         "unresolved_sev1_count": counts.get(
             "unresolved_sev1_count", report.get("unresolved_sev1_count")
         ),
-        "errors": errors,
+        "errors": [] if release_valid else release_errors,
     }
 
 
@@ -278,6 +325,7 @@ def main() -> int:
         for path in paths
     ]
     valid_reports = [report for report in reports if report["valid"]]
+    smoke_valid_reports = [report for report in reports if report.get("smoke_valid")]
     covered_drill_types = sorted({report["drill_type"] for report in valid_reports})
     valid_commits = sorted({report["commit"] for report in valid_reports})
     missing_drill_types = [
@@ -310,9 +358,13 @@ def main() -> int:
         report.get("commit") != expected_commit for report in reports
     ):
         reasons.append(f"one or more reports did not cover expected commit {expected_commit}")
+    if smoke_valid_reports:
+        reasons.append(
+            f"{len(smoke_valid_reports)} smoke drill report(s) accepted as non-ready dev checks"
+        )
 
     doc = {
-        "schema_version": 1,
+        "schema_version": 2,
         "status": status,
         "ready": ready,
         "release_commit": expected_commit,
@@ -321,6 +373,7 @@ def main() -> int:
         "reports_dir": str(reports_dir),
         "report_count": len(reports),
         "valid_report_count": len(valid_reports),
+        "smoke_valid_report_count": len(smoke_valid_reports),
         "covered_drill_types": covered_drill_types,
         "valid_release_commits": valid_commits,
         "reasons": reasons,

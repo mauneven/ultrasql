@@ -16,12 +16,31 @@ The release gate requires one valid report for each drill type:
 These drills complement `benchmarks/chaos_recovery.sh`; they add operator
 runbook, monitoring, RTO/RPO, and postmortem evidence.
 
+Local smoke reports can be generated with:
+
+```bash
+scripts/run-incident-drills.py \
+  --mode smoke \
+  --commit "$(git rev-parse HEAD)" \
+  --reports-dir target/incident-drills
+scripts/validate-incident-drills.py \
+  --reports-dir target/incident-drills \
+  --required-drill-types backup_restore,wal_recovery,disk_full \
+  --commit "$(git rev-parse HEAD)"
+```
+
+Smoke reports are recorded as `smoke_valid_report_count`, but do not close the
+release gate. Production sign-off requires `mode: "production"` reports from a
+real incident-drill environment.
+
 ## Report schema
 
 Each report is a JSON file under `incident-drills/*.json`:
 
 ```json
 {
+  "schema_version": 2,
+  "mode": "production",
   "drill_id": "rc1-backup-restore",
   "commit": "0123456789abcdef0123456789abcdef01234567",
   "drill_type": "backup_restore",
@@ -39,6 +58,14 @@ Each report is a JSON file under `incident-drills/*.json`:
   "postmortem_uri": "https://example.invalid/rc1-backup-restore.md",
   "unresolved_sev0_count": 0,
   "unresolved_sev1_count": 0,
+  "artifacts": {
+    "manifest_path": "artifact://backup_restore_smoke_manifest.json",
+    "log_bundle_path": "artifact://incident-drill-logs"
+  },
+  "checks": [
+    {"name": "row_count_verified", "passed": true},
+    {"name": "recovery_verified", "passed": true}
+  ],
   "signed_off_by": "incident commander"
 }
 ```
@@ -64,6 +91,7 @@ scripts/validate-incident-drills.py --strict
 The gate is ready only when:
 
 - `backup_restore`, `wal_recovery`, and `disk_full` are covered,
+- every counted report has `schema_version: 2` and `mode: "production"`,
 - every valid report covers the release commit,
 - `rto_actual_seconds <= rto_target_seconds`,
 - `rpo_actual_seconds <= rpo_target_seconds`,
@@ -71,6 +99,8 @@ The gate is ready only when:
 - `correctness_verified` is `true`,
 - `monitoring_alerted` is `true`,
 - `unresolved_sev0_count` and `unresolved_sev1_count` are `0`,
+- every report has non-empty `artifacts.manifest_path`,
+- every `checks` entry has `passed: true`,
 - every report has `postmortem_uri` and `signed_off_by`.
 
 The committed status file may say `not_ready`. That is honest evidence, not a

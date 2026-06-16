@@ -165,6 +165,9 @@ jobs:
       - name: validate incident drill reports
         shell: bash
         run: |
+          # Local smoke drill reports can be generated with
+          # scripts/run-incident-drills.py; release validates submitted
+          # incident-drills/*.json evidence.
           args=(
             --reports-dir incident-drills
             --required-drill-types backup_restore,wal_recovery,disk_full

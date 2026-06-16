@@ -50,6 +50,7 @@ def write_drill_report(
     *,
     drill_id: str,
     drill_type: str,
+    mode: str = "production",
     rto_actual_seconds: int = 20,
     rpo_actual_seconds: int = 0,
     data_loss_confirmed: bool = False,
@@ -60,6 +61,8 @@ def write_drill_report(
     path.write_text(
         json.dumps(
             {
+                "schema_version": 2,
+                "mode": mode,
                 "drill_id": drill_id,
                 "commit": commit,
                 "drill_type": drill_type,
@@ -77,6 +80,14 @@ def write_drill_report(
                 "postmortem_uri": f"https://example.invalid/{drill_id}.md",
                 "unresolved_sev0_count": unresolved_sev0_count,
                 "unresolved_sev1_count": unresolved_sev1_count,
+                "artifacts": {
+                    "manifest_path": f"artifact://{drill_id}.json",
+                    "log_bundle_path": f"artifact://{drill_id}-logs",
+                },
+                "checks": [
+                    {"name": "consistency", "passed": True},
+                    {"name": "recovery", "passed": True},
+                ],
                 "signed_off_by": "incident commander",
             }
         )
@@ -313,6 +324,28 @@ class ReleaseEvidenceValidatorTests(unittest.TestCase):
             self.assertIn("rpo_actual_seconds exceeds rpo_target_seconds", errors)
             self.assertIn("data_loss_confirmed must be false", errors)
             self.assertIn("unresolved_sev1_count must be zero", errors)
+
+    def test_incident_drills_accept_smoke_reports_only_as_non_ready_dev_checks(self) -> None:
+        with tempfile_dir() as tmp_path:
+            for drill_type in ["backup_restore", "wal_recovery", "disk_full"]:
+                write_drill_report(
+                    tmp_path / f"{drill_type}.json",
+                    drill_id=f"smoke-{drill_type}",
+                    drill_type=drill_type,
+                    mode="smoke",
+                )
+
+            status = run_script(
+                DRILL_SCRIPT,
+                tmp_path,
+                "--required-drill-types",
+                "backup_restore,wal_recovery,disk_full",
+            )
+
+            self.assertFalse(status["ready"])
+            self.assertEqual(status["smoke_valid_report_count"], 3)
+            self.assertEqual(status["covered_drill_types"], [])
+            self.assertTrue(any("smoke" in reason for reason in status["reasons"]))
 
     def test_driver_compatibility_requires_full_passing_required_matrix(self) -> None:
         with tempfile_dir() as tmp_path:

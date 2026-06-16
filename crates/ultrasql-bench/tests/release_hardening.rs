@@ -942,6 +942,7 @@ fn final_release_requires_operator_reports_green_workflows_and_notes() {
 fn final_release_requires_external_audits_and_incident_drills() {
     let audit_docs = repo_file("docs/external-audits.md");
     let drill_docs = repo_file("docs/incident-drills.md");
+    let drill_runner = repo_file("scripts/run-incident-drills.py");
     let audit_validator = repo_file("scripts/validate-external-audits.py");
     let drill_validator = repo_file("scripts/validate-incident-drills.py");
     let audit_status = repo_file("benchmarks/results/latest/external_audit_status.json");
@@ -968,6 +969,13 @@ fn final_release_requires_external_audits_and_incident_drills() {
         "backup_restore",
         "wal_recovery",
         "disk_full",
+        "scripts/run-incident-drills.py",
+        "schema_version",
+        "mode",
+        "production",
+        "smoke_valid_report_count",
+        "artifacts.manifest_path",
+        "checks",
         "rto_actual_seconds",
         "rpo_actual_seconds",
         "data_loss_confirmed",
@@ -994,6 +1002,10 @@ fn final_release_requires_external_audits_and_incident_drills() {
     for needle in [
         "required_drill_types",
         "covered_drill_types",
+        "smoke_valid_report_count",
+        "schema_version",
+        "artifacts.manifest_path",
+        "checks",
         "rto_actual_seconds",
         "rpo_actual_seconds",
         "data_loss_confirmed",
@@ -1003,6 +1015,22 @@ fn final_release_requires_external_audits_and_incident_drills() {
         assert!(
             drill_validator.contains(needle),
             "incident drill validator missing {needle}"
+        );
+    }
+
+    for needle in [
+        "backup_restore_smoke_manifest.json",
+        "chaos_recovery_manifest.json",
+        "backup_restore",
+        "wal_recovery",
+        "disk_full",
+        "mode",
+        "smoke",
+        "production",
+    ] {
+        assert!(
+            drill_runner.contains(needle),
+            "incident drill runner missing {needle}"
         );
     }
 
@@ -1026,6 +1054,7 @@ fn final_release_requires_external_audits_and_incident_drills() {
         "\"backup_restore\"",
         "\"wal_recovery\"",
         "\"disk_full\"",
+        "\"smoke_valid_report_count\"",
     ] {
         assert!(
             drill_status.contains(needle),
@@ -1035,6 +1064,7 @@ fn final_release_requires_external_audits_and_incident_drills() {
 
     for needle in [
         "scripts/validate-external-audits.py",
+        "scripts/run-incident-drills.py",
         "scripts/validate-incident-drills.py",
         "external_audit_status.json",
         "incident_drill_status.json",
