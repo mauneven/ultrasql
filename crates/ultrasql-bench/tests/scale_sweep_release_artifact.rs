@@ -140,6 +140,22 @@ fn scale_sweep_competitor_raw_artifacts_use_strict_schema() {
 }
 
 #[test]
+fn scale_sweep_writes_manifest_before_fastest_gate() {
+    let script = repo_file("benchmarks/run_scale_sweep.sh");
+    let manifest_write = script
+        .find("\"$OUT/scale_sweep_manifest.json\"")
+        .expect("scale sweep manifest writer");
+    let lead_check = script
+        .find("benchmarks/scripts/check_supremacy.py \"$RAW\"")
+        .expect("scale sweep lead check");
+
+    assert!(
+        manifest_write < lead_check,
+        "scale sweep must write manifest before the lead check so failed sweeps upload fresh status evidence"
+    );
+}
+
+#[test]
 fn scale_sweep_renders_clickhouse_as_first_class_competitor() {
     let renderer = repo_file("benchmarks/scripts/render_scale_sweep.py");
     let scale_md = repo_file("benchmarks/results/latest/scale-sweep/scale_sweep.md");

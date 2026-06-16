@@ -171,6 +171,80 @@ out.write_text(json.dumps({
             self.assertFalse(payload["ready"])
             self.assertEqual(payload["status"], "not_ready")
 
+    def test_strict_writes_not_ready_status_after_sweep_failure(self) -> None:
+        with tempfile_dir() as repo:
+            status = repo / "status" / "benchmark_certification_status.json"
+            out_dir = repo / "artifacts" / "scale-sweep"
+            ultrasqld = repo / "target" / "release-ship" / "ultrasqld"
+            write_executable(ultrasqld, "#!/usr/bin/env bash\nexit 0\n")
+            write_executable(
+                repo / "benchmarks" / "run_scale_sweep.sh",
+                """#!/usr/bin/env bash
+set -euo pipefail
+mkdir -p "$SCALE_SWEEP_OUT"
+echo "partial artifact" > "$SCALE_SWEEP_OUT/partial.txt"
+exit 7
+""",
+            )
+            write_executable(
+                repo / "scripts" / "validate-benchmark-certification.py",
+                """#!/usr/bin/env python3
+import json
+import sys
+from pathlib import Path
+out = Path(sys.argv[sys.argv.index("--out") + 1])
+out.parent.mkdir(parents=True, exist_ok=True)
+out.write_text(json.dumps({
+    "ready": False,
+    "status": "not_ready",
+    "blockers": ["sweep_failed"],
+    "argv": sys.argv[1:],
+}, indent=2, sort_keys=True) + "\\n")
+sys.exit(1 if "--strict" in sys.argv else 0)
+""",
+            )
+
+            proc = subprocess.run(
+                [
+                    sys.executable,
+                    str(SCRIPT),
+                    "--repo-root",
+                    str(repo),
+                    "--commit",
+                    COMMIT,
+                    "--mode",
+                    "quick",
+                    "--out-dir",
+                    str(out_dir),
+                    "--status-out",
+                    str(status),
+                    "--ultrasqld",
+                    str(ultrasqld),
+                    "--storage",
+                    "data-dir",
+                    "--required-engines",
+                    "ultrasql",
+                    "--min-comparable-rows",
+                    "1",
+                    "--skip-build",
+                    "--skip-clickhouse-check",
+                    "--python",
+                    sys.executable,
+                ],
+                check=False,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+
+            self.assertNotEqual(proc.returncode, 0)
+            self.assertIn("continuing to write not_ready status", proc.stderr)
+            self.assertTrue((out_dir / "partial.txt").exists())
+            payload = json.loads(status.read_text())
+            self.assertFalse(payload["ready"])
+            self.assertEqual(payload["status"], "not_ready")
+            self.assertIn("--strict", payload["argv"])
+
 
 class tempfile_dir:
     def __enter__(self) -> Path:

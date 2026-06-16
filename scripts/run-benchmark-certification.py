@@ -128,19 +128,19 @@ def run_scale_sweep(
     cwd: Path,
     env: dict[str, str],
     continue_on_failure: bool,
-) -> None:
+) -> int:
     print("+ " + " ".join(cmd), flush=True)
     completed = subprocess.run(cmd, cwd=cwd, env=env, check=False)
     if completed.returncode == 0:
-        return
+        return 0
+    print(
+        "benchmark sweep exited "
+        f"{completed.returncode}; continuing to write not_ready status",
+        file=sys.stderr,
+    )
     if continue_on_failure:
-        print(
-            "benchmark sweep exited "
-            f"{completed.returncode}; continuing to write not_ready status",
-            file=sys.stderr,
-        )
-        return
-    raise subprocess.CalledProcessError(completed.returncode, cmd)
+        return completed.returncode
+    return completed.returncode
 
 
 def require_clickhouse(python: str) -> None:
@@ -196,6 +196,7 @@ def main() -> int:
     validator = repo_root / "scripts" / "validate-benchmark-certification.py"
 
     try:
+        sweep_returncode = 0
         if not args.skip_run:
             if "clickhouse" in {engine.strip() for engine in args.required_engines.split(",")}:
                 if not args.skip_clickhouse_check:
@@ -220,7 +221,7 @@ def main() -> int:
             env["ULTRASQLD_BIN"] = str(ultrasqld)
             env["SCALE_SWEEP_OUT"] = str(out_dir)
             env["SCALE_SWEEP_STORAGE"] = args.storage
-            run_scale_sweep(
+            sweep_returncode = run_scale_sweep(
                 [str(scale_script), args.mode],
                 cwd=repo_root,
                 env=env,
@@ -247,6 +248,8 @@ def main() -> int:
             validate_cmd.append("--strict")
         run_checked(validate_cmd, cwd=repo_root)
         status = load_status(status_out)
+        if sweep_returncode != 0 and not args.no_strict:
+            return sweep_returncode
     except subprocess.CalledProcessError as err:
         return int(err.returncode)
     except RuntimeError as err:

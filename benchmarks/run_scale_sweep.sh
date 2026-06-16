@@ -454,8 +454,6 @@ python3 benchmarks/scripts/render_scale_sweep.py \
     --output-md "$OUT/scale_sweep.md" \
     --output-json "$OUT/scale_sweep.json"
 
-python3 benchmarks/scripts/check_supremacy.py "$RAW"
-
 python3 - "$OUT/scale_sweep_manifest.json" "$mode" "$ITERS" "$WARMUP" "$ROWS" "$ULTRASQL_VERSION_TEXT" "$install_source" "${SCALE_SWEEP_APPEND:-0}" "$STORAGE_MODE" <<'PY'
 import json
 import os
@@ -544,5 +542,7 @@ with open(path_obj, "w", encoding="utf-8") as fh:
     json.dump(doc, fh, indent=2, sort_keys=True)
     fh.write("\n")
 PY
+
+python3 benchmarks/scripts/check_supremacy.py "$RAW"
 
 echo "=== Done. Scale sweep in $OUT ==="
