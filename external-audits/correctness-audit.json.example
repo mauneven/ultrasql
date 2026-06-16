@@ -1,0 +1,17 @@
+{
+  "auditor_id": "correctness-lab-a",
+  "auditor_org": "Correctness Lab A",
+  "auditor_contact": "correctness-lab-a@example.invalid",
+  "commit": "0123456789abcdef0123456789abcdef01234567",
+  "audit_type": "correctness",
+  "report_date_utc": "2026-06-16T00:00:00Z",
+  "scope": "SQL execution, storage, MVCC, WAL, crash recovery, indexes, transaction isolation",
+  "methodology": "manual review, invariant review, differential tests, crash-recovery tests",
+  "report_uri": "https://example.invalid/ultrasql-correctness-audit.pdf",
+  "critical_findings_open": 0,
+  "high_findings_open": 0,
+  "medium_findings_open": 0,
+  "low_findings_open": 0,
+  "signed_off_by": "external reviewer",
+  "signature": "detached-signature-or-verifiable-attestation"
+}

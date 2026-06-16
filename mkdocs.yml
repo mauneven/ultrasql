@@ -33,6 +33,8 @@ nav:
   - Backup and Restore: backup-restore.md
   - Chaos Recovery: chaos-recovery.md
   - Production Readiness Audit: production-readiness.md
+  - Private Preview Runbook: private-preview-runbook.md
+  - External Validation Outreach: external-validation-outreach.md
   - Operator Reports: operator-reports.md
   - External Audits: external-audits.md
   - Incident Drills: incident-drills.md

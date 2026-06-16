@@ -8,9 +8,9 @@
     "0 independent auditor(s), need 2",
     "missing required audit type(s): correctness, security",
     "0 valid release commit(s), need exactly 1",
-    "valid reports must cover expected commit f9fc5c6f9960ad17d72e049ced436a1f0402cc7f"
+    "valid reports must cover expected commit 043093e87299cc84e46ef37344f98eea50fa0472"
   ],
-  "release_commit": "f9fc5c6f9960ad17d72e049ced436a1f0402cc7f",
+  "release_commit": "043093e87299cc84e46ef37344f98eea50fa0472",
   "report_count": 0,
   "reports": [],
   "reports_dir": "external-audits",
@@ -22,5 +22,5 @@
   "status": "not_ready",
   "valid_release_commits": [],
   "valid_report_count": 0,
-  "validated_at_utc": "2026-06-15T12:00:00Z"
+  "validated_at_utc": "2026-06-16T04:10:00.110921Z"
 }

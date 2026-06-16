@@ -1,7 +1,9 @@
 # Production Readiness Audit
 
-Last audited: 2026-06-15 on commit
-`f9fc5c6f9960ad17d72e049ced436a1f0402cc7f`.
+Last audited: 2026-06-16.
+
+Latest committed release-evidence commit checked:
+`043093e87299cc84e46ef37344f98eea50fa0472`.
 
 ## Verdict
 
@@ -16,7 +18,9 @@ The ethical claim today is narrower:
 
 - UltraSQL leads the committed 2026-06-14 release-artifact DB-vs-DB scale sweep
   on 24 of 24 comparable measured rows on the recorded Apple M4 host.
-- UltraSQL has green latest `main` CI for the audited commit.
+- UltraSQL had green `main` CI for the previous evidence/docs commit
+  `8f771ace`; `043093e8` CI was still in progress when this non-code outreach
+  packet was prepared.
 - UltraSQL still lacks required independent production evidence: operator soak
   reports, external audits, incident drills, and a release-commit driver status
   artifact.
@@ -25,7 +29,9 @@ The ethical claim today is narrower:
 
 | Area | Evidence | Current result |
 | --- | --- | --- |
-| CI | GitHub `ci` run `27522790812` for commit `f9fc5c6f` | success |
+| CI | GitHub `ci` run `27593531225` for commit `043093e8` | in progress during this audit refresh; do not sign off until success |
+| Previous CI | GitHub `ci` run `27572340131` for commit `8f771ace` | success |
+| Docs CI | GitHub `docs` run `27593531220` for commit `043093e8` | success |
 | Production evidence workflow | GitHub run `27540874758` for commit `f9fc5c6f` | success, with not-ready release gates recorded |
 | Operator soak workflow | GitHub run `27539947931` for commit `f9fc5c6f` | success, status is `not_ready` |
 | Coverage workflow | GitHub run `27535619220` for commit `f9fc5c6f` | success |
@@ -33,9 +39,9 @@ The ethical claim today is narrower:
 | Sanitizers workflow | GitHub run `27526490428` for commit `f9fc5c6f` | success |
 | Bench workflow | GitHub run `27532810814` for commit `f9fc5c6f` | cancelled; latest committed scale-sweep artifact remains 2026-06-14 |
 | Release-artifact scale sweep | `benchmarks/results/latest/scale-sweep/scale_sweep.json` | UltraSQL fastest on 24 of 24 comparable measured rows |
-| Operator soak status | `benchmarks/results/latest/operator_soak_status.json` | `not_ready`; 0 valid reports, need 3 independent 30-day reports |
-| External audit status | `benchmarks/results/latest/external_audit_status.json` | `not_ready`; 0 valid reports, need 2 independent reports covering security and correctness |
-| Incident drill status | `benchmarks/results/latest/incident_drill_status.json` | `not_ready`; 0 valid drills, need backup restore, WAL recovery, and disk-full drills |
+| Operator soak status | `benchmarks/results/latest/operator_soak_status.json` | `not_ready`; 0 valid reports, need 3 independent 30-day reports for commit `043093e8` |
+| External audit status | `benchmarks/results/latest/external_audit_status.json` | `not_ready`; 0 valid reports, need 2 independent reports covering security and correctness for commit `043093e8` |
+| Incident drill status | `benchmarks/results/latest/incident_drill_status.json` | `not_ready`; 0 valid drills, need backup restore, WAL recovery, and disk-full drills for commit `043093e8` |
 | Driver compatibility status | `benchmarks/results/latest/driver_compatibility_status.json` | `not_ready`; committed status lacks `target/driver-certification.json` for the audited commit |
 
 ## What UltraSQL Can Do Now

@@ -29,6 +29,10 @@ candidate path until the v1.0 release checklist is closed.
   engine plan.
 - [Production Readiness Audit](production-readiness.md) records the current
   evidence-backed readiness verdict.
+- [Private Preview Runbook](private-preview-runbook.md) defines the controlled
+  pre-production preview packet.
+- [External Validation Outreach](external-validation-outreach.md) gives audit,
+  operator-soak, and incident-drill outreach templates.
 - [Known Limitations](known-limitations.md) records open SQL and operations
   gaps.
 - [Release Checklist](release-checklist.md) is the production readiness gate.

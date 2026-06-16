@@ -1,0 +1,17 @@
+{
+  "auditor_id": "security-lab-a",
+  "auditor_org": "Security Lab A",
+  "auditor_contact": "security-lab-a@example.invalid",
+  "commit": "0123456789abcdef0123456789abcdef01234567",
+  "audit_type": "security",
+  "report_date_utc": "2026-06-16T00:00:00Z",
+  "scope": "threat model, auth, authorization, filesystem handling, WAL/recovery security, release packaging, dependency risk",
+  "methodology": "manual review, automated analysis, threat modeling, dependency review",
+  "report_uri": "https://example.invalid/ultrasql-security-audit.pdf",
+  "critical_findings_open": 0,
+  "high_findings_open": 0,
+  "medium_findings_open": 0,
+  "low_findings_open": 0,
+  "signed_off_by": "external reviewer",
+  "signature": "detached-signature-or-verifiable-attestation"
+}

@@ -1,0 +1,20 @@
+{
+  "drill_id": "rc1-disk-full",
+  "commit": "0123456789abcdef0123456789abcdef01234567",
+  "drill_type": "disk_full",
+  "run_time_utc": "2026-06-16T00:00:00Z",
+  "environment": "release-candidate staging",
+  "scenario": "fill data volume, verify failed writes do not corrupt durable state",
+  "operator": "ops-a",
+  "rto_target_seconds": 300,
+  "rto_actual_seconds": 180,
+  "rpo_target_seconds": 0,
+  "rpo_actual_seconds": 0,
+  "data_loss_confirmed": false,
+  "correctness_verified": true,
+  "monitoring_alerted": true,
+  "postmortem_uri": "https://example.invalid/rc1-disk-full.md",
+  "unresolved_sev0_count": 0,
+  "unresolved_sev1_count": 0,
+  "signed_off_by": "incident commander"
+}
