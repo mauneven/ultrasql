@@ -1,0 +1,141 @@
+{
+  "blockers": [
+    {
+      "gate": "driver_compatibility",
+      "reason": "report missing: target/driver-certification.json"
+    },
+    {
+      "gate": "driver_compatibility",
+      "reason": "missing_required_drivers: [\"Alembic\", \"Diesel\", \"Django ORM\", \"Flyway\", \"GORM\", \"GUI introspection probes\", \"Hibernate ORM\", \"JDBC PostgreSQL driver\", \"Liquibase\", \"Npgsql\", \"Prisma\", \"Rails ActiveRecord\", \"SQLAlchemy\", \"lib/pq\", \"libpq\", \"node-postgres\", \"pgx\", \"psql meta-commands\", \"psycopg2\", \"psycopg3\"]"
+    },
+    {
+      "gate": "operator_soak",
+      "reason": "0 valid release report(s), need 3"
+    },
+    {
+      "gate": "operator_soak",
+      "reason": "0 independent operator(s), need 3"
+    },
+    {
+      "gate": "operator_soak",
+      "reason": "0 valid release commit(s), need exactly 1"
+    },
+    {
+      "gate": "external_audit",
+      "reason": "0 valid report(s), need 2"
+    },
+    {
+      "gate": "external_audit",
+      "reason": "0 independent auditor(s), need 2"
+    },
+    {
+      "gate": "external_audit",
+      "reason": "missing required audit type(s): correctness, security"
+    },
+    {
+      "gate": "external_audit",
+      "reason": "0 valid release commit(s), need exactly 1"
+    },
+    {
+      "gate": "external_audit",
+      "reason": "valid reports must cover expected commit 043093e87299cc84e46ef37344f98eea50fa0472"
+    },
+    {
+      "gate": "incident_drill",
+      "reason": "0 valid drill report(s), need 3"
+    },
+    {
+      "gate": "incident_drill",
+      "reason": "missing required drill type(s): backup_restore, disk_full, wal_recovery"
+    },
+    {
+      "gate": "incident_drill",
+      "reason": "0 valid release commit(s), need exactly 1"
+    },
+    {
+      "gate": "benchmark",
+      "reason": "expected release commit is required"
+    },
+    {
+      "gate": "benchmark",
+      "reason": "ultrasql_storage_mode expected data-dir, got None"
+    },
+    {
+      "gate": "benchmark",
+      "reason": "benchmarks/results/latest/scale-sweep/raw/insert_throughput_10k-clickhouse.json: schema_version must be 1"
+    },
+    {
+      "gate": "benchmark",
+      "reason": "benchmarks/results/latest/scale-sweep/raw/insert_throughput_10k-clickhouse.json: status must be measured or not_available"
+    },
+    {
+      "gate": "benchmark",
+      "reason": "benchmarks/results/latest/scale-sweep/raw/insert_throughput_10k-duckdb.json: schema_version must be 1"
+    },
+    {
+      "gate": "benchmark",
+      "reason": "benchmarks/results/latest/scale-sweep/raw/insert_throughput_10k-duckdb.json: status must be measured or not_available"
+    },
+    {
+      "gate": "benchmark",
+      "reason": "benchmarks/results/latest/scale-sweep/raw/insert_throughput_10k-postgres.json: schema_version must be 1"
+    },
+    {
+      "gate": "benchmark",
+      "reason": "benchmarks/results/latest/scale-sweep/raw/insert_throughput_10k-postgres.json: status must be measured or not_available"
+    },
+    {
+      "gate": "benchmark",
+      "reason": "364 more issue(s) omitted"
+    }
+  ],
+  "expected_commit": null,
+  "gates": [
+    {
+      "blocker_count": 2,
+      "name": "driver_compatibility",
+      "path": "benchmarks/results/latest/driver_compatibility_status.json",
+      "ready": false,
+      "release_commit": null,
+      "status": "not_ready"
+    },
+    {
+      "blocker_count": 3,
+      "name": "operator_soak",
+      "path": "benchmarks/results/latest/operator_soak_status.json",
+      "ready": false,
+      "release_commit": null,
+      "status": "not_ready"
+    },
+    {
+      "blocker_count": 5,
+      "name": "external_audit",
+      "path": "benchmarks/results/latest/external_audit_status.json",
+      "ready": false,
+      "release_commit": "043093e87299cc84e46ef37344f98eea50fa0472",
+      "status": "not_ready"
+    },
+    {
+      "blocker_count": 3,
+      "name": "incident_drill",
+      "path": "benchmarks/results/latest/incident_drill_status.json",
+      "ready": false,
+      "release_commit": null,
+      "status": "not_ready"
+    },
+    {
+      "blocker_count": 9,
+      "name": "benchmark",
+      "path": "benchmarks/results/latest/benchmark_certification_status.json",
+      "ready": false,
+      "release_commit": "687d101d798a9dee712d62afe0a15d3c93765e5b",
+      "status": "not_ready"
+    }
+  ],
+  "policy": "Missing, malformed, not_ready, or stale release evidence fails closed.",
+  "ready": false,
+  "schema_version": 1,
+  "status": "not_ready",
+  "summary": "not_ready: 22 blocker(s) across 5 gate(s)",
+  "validated_at_utc": "2026-06-16T00:00:00Z"
+}

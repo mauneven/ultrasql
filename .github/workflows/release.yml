@@ -178,6 +178,22 @@ jobs:
             args+=(--strict)
           fi
           python3 scripts/validate-incident-drills.py "${args[@]}"
+      - name: validate aggregate release gate
+        shell: bash
+        run: |
+          args=(
+            --driver-status target/driver_compatibility_status.json
+            --operator-soak-status target/operator_soak_status.json
+            --external-audit-status target/external_audit_status.json
+            --incident-drill-status target/incident_drill_status.json
+            --benchmark-status benchmarks/results/latest/benchmark_certification_status.json
+            --commit "$GITHUB_SHA"
+            --out target/release_gate_status.json
+          )
+          if [[ "$RELEASE_TAG" != v0.* ]]; then
+            args+=(--strict)
+          fi
+          python3 scripts/validate-release-evidence.py "${args[@]}"
       - name: collect release evidence
         run: |
           mkdir -p target/release-evidence
@@ -186,6 +202,7 @@ jobs:
           cp target/operator_soak_status.json target/release-evidence/operator_soak_status.json
           cp target/external_audit_status.json target/release-evidence/external_audit_status.json
           cp target/incident_drill_status.json target/release-evidence/incident_drill_status.json
+          cp target/release_gate_status.json target/release-evidence/release_gate_status.json
       - uses: actions/upload-artifact@v7
         with:
           name: release-evidence-${{ env.RELEASE_TAG }}
@@ -491,6 +508,7 @@ jobs:
           cp release-evidence/operator_soak_status.json release/operator_soak_status.json
           cp release-evidence/external_audit_status.json release/external_audit_status.json
           cp release-evidence/incident_drill_status.json release/incident_drill_status.json
+          cp release-evidence/release_gate_status.json release/release_gate_status.json
           scripts/render-release-notes.sh \
             "$RELEASE_TAG" \
             release/operator_soak_status.json \

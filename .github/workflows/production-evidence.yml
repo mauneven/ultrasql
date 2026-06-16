@@ -11,6 +11,9 @@ on:
       - 'scripts/validate-external-audits.py'
       - 'scripts/validate-incident-drills.py'
       - 'scripts/validate-driver-compatibility.py'
+      - 'scripts/validate-benchmark-certification.py'
+      - 'scripts/validate-release-evidence.py'
+      - 'benchmarks/results/latest/benchmark_certification_status.json'
       - 'docs/external-audits.md'
       - 'docs/incident-drills.md'
       - 'docs/driver-certification.md'
@@ -54,9 +57,18 @@ jobs:
             --report target/driver-certification.json \
             --commit "$GITHUB_SHA" \
             --out benchmarks/results/latest/driver_compatibility_status.json
+      - name: validate aggregate release gate
+        run: |
+          python3 scripts/validate-release-evidence.py \
+            --commit "$GITHUB_SHA" \
+            --out benchmarks/results/latest/release_gate_status.json
       - name: summarize status
         run: |
           {
+            echo '## Release gate status'
+            echo
+            sed 's/^/    /' benchmarks/results/latest/release_gate_status.json
+            echo
             echo '## External audit status'
             echo
             sed 's/^/    /' benchmarks/results/latest/external_audit_status.json
@@ -76,3 +88,4 @@ jobs:
             benchmarks/results/latest/external_audit_status.json
             benchmarks/results/latest/incident_drill_status.json
             benchmarks/results/latest/driver_compatibility_status.json
+            benchmarks/results/latest/release_gate_status.json

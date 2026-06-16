@@ -1250,6 +1250,67 @@ fn final_release_requires_benchmark_certification_status() {
 }
 
 #[test]
+fn final_release_aggregates_evidence_statuses() {
+    let aggregator = repo_file("scripts/validate-release-evidence.py");
+    let status = repo_file("benchmarks/results/latest/release_gate_status.json");
+    let production_workflow = repo_file(".github/workflows/production-evidence.yml");
+    let release_workflow = repo_file(".github/workflows/release.yml");
+    let notes_template = repo_file("docs/release-notes-template.md");
+    let release_checklist = repo_file("docs/release-checklist.md");
+
+    for needle in [
+        "driver_compatibility",
+        "operator_soak",
+        "external_audit",
+        "incident_drill",
+        "benchmark",
+        "blockers",
+        "Missing, malformed, not_ready, or stale release evidence fails closed.",
+        "--strict",
+    ] {
+        assert!(
+            aggregator.contains(needle),
+            "release evidence aggregator missing {needle}"
+        );
+    }
+
+    for needle in [
+        "\"status\": \"not_ready\"",
+        "\"ready\": false",
+        "\"blockers\"",
+        "\"driver_compatibility\"",
+        "\"operator_soak\"",
+        "\"external_audit\"",
+        "\"incident_drill\"",
+        "\"benchmark\"",
+    ] {
+        assert!(status.contains(needle), "release gate status missing {needle}");
+    }
+
+    for needle in [
+        "scripts/validate-release-evidence.py",
+        "release_gate_status.json",
+    ] {
+        assert!(
+            production_workflow.contains(needle),
+            "production evidence workflow missing {needle}"
+        );
+        assert!(
+            release_workflow.contains(needle),
+            "release workflow missing {needle}"
+        );
+        assert!(
+            release_checklist.contains(needle),
+            "release checklist missing {needle}"
+        );
+    }
+    assert!(release_workflow.contains("--benchmark-status benchmarks/results/latest/benchmark_certification_status.json"));
+    assert!(release_workflow.contains("cp target/release_gate_status.json"));
+    assert!(release_workflow.contains("cp release-evidence/release_gate_status.json"));
+    assert!(notes_template.contains("release_gate_status.json"));
+}
+
+#[test]
 fn release_user_docs_exist_and_state_current_limits() {
     let changelog = repo_file("CHANGELOG.md");
     let getting_started = repo_file("docs/getting-started.md");

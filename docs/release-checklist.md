@@ -100,6 +100,7 @@ Run on schedule or by `workflow_dispatch`:
 ```bash
 benchmarks/certify.sh full
 python3 scripts/run-benchmark-certification.py --mode full
+python3 scripts/validate-release-evidence.py --commit "$(git rev-parse HEAD)" --strict
 benchmarks/chaos_recovery.sh full
 cargo bench --workspace
 for target in parser_fuzz planner_fuzz protocol_fuzz wal_record_fuzz; do
@@ -120,7 +121,7 @@ section is the same run miri smoke on memory-safety-sensitive crates block used
 by CI. TPC-H, ClickBench, Firebolt Core, AI gauntlet, fuzz, and Miri evidence
 belongs here, not in the PR-critical path.
 
-## 69-87 Evidence Map
+## 69-88 Evidence Map
 
 | item | code | test | benchmark or reason | docs | artifact |
 | --- | --- | --- | --- | --- | --- |
@@ -146,6 +147,7 @@ belongs here, not in the PR-critical path.
 | 85 Incident drill reports | `scripts/run-incident-drills.py`, `scripts/validate-incident-drills.py`, `incident-drills/*.json` | `tests/scripts/test_run_incident_drills.py`, `tests/scripts/test_validate_release_evidence.py`, `crates/ultrasql-bench/tests/release_hardening.rs` | no benchmark; recovery and incident-response gate | `docs/incident-drills.md` | `benchmarks/results/latest/incident_drill_status.json` |
 | 86 Driver compatibility status | `tests/driver_certification/driver_certification.py`, `scripts/run-driver-release-evidence.py`, `scripts/validate-driver-compatibility.py`, `target/driver-certification.json` | `tests/scripts/test_run_driver_release_evidence.py`, `tests/scripts/test_validate_release_evidence.py`, `tests/driver_certification/test_driver_certification.py`, `crates/ultrasql-bench/tests/release_hardening.rs` | no benchmark; client ecosystem compatibility gate | `docs/driver-certification.md` | `benchmarks/results/latest/driver_compatibility_status.json` |
 | 87 Benchmark certification status | `scripts/run-benchmark-certification.py`, `scripts/validate-benchmark-certification.py`, `benchmarks/run_scale_sweep.sh` | `tests/scripts/test_run_benchmark_certification.py`, `tests/scripts/test_validate_benchmark_certification.py`, `crates/ultrasql-bench/tests/scale_sweep_release_artifact.rs` | release-artifact DB-vs-DB scale sweep with ClickHouse and data-dir mode | `BENCHMARKS.md` | `benchmarks/results/latest/benchmark_certification_status.json` |
+| 88 Aggregate release gate | `scripts/validate-release-evidence.py` | `tests/scripts/test_validate_release_gate.py`, `crates/ultrasql-bench/tests/release_hardening.rs` | no benchmark; fail-closed aggregate of release evidence statuses | this file | `benchmarks/results/latest/release_gate_status.json` |
 
 ## Sign-off rule
 
@@ -174,6 +176,7 @@ Before tagging v1.0, attach:
 - backup_restore, wal_recovery, disk_full incident drills and
   `incident_drill_status.json`,
 - driver certification report and `driver_compatibility_status.json`,
+- aggregate release gate status `release_gate_status.json`,
 - GitHub release notes URL,
 - security/ethics audit notes,
 - config docs hash or commit id.

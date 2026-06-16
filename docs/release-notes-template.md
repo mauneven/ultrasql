@@ -66,6 +66,7 @@ Release assets include:
 - `operator_soak_status.json`,
 - `external_audit_status.json`,
 - `incident_drill_status.json`,
+- `release_gate_status.json`,
 - `driver_compatibility_status.json`.
 
 ## Known Gaps
