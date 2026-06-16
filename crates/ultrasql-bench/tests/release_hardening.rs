@@ -46,6 +46,7 @@ fn backup_restore_smoke_runner_documents_real_verification() {
     assert!(script.contains("for format in"));
     assert!(script.contains("--dump-format \"$format\""));
     assert!(script.contains("verify_restored_dump"));
+    assert!(script.contains("chmod 700 \"$restore_data_dir\""));
     assert!(script.contains("SELECT COUNT(*) FROM backup_restore_smoke"));
     assert!(script.contains("SELECT payload FROM backup_restore_smoke WHERE id = 2"));
     assert!(script.contains("\"row_count_verified\""));

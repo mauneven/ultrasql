@@ -253,6 +253,8 @@ verify_restored_dump() {
         || fail "pg_dump_${format}_failed"
     "$ULTRASQL_BIN" --data-dir "$restore_data_dir" --pg-restore "$dump_path" \
         || fail "pg_restore_${format}_failed"
+    chmod 700 "$restore_data_dir" \
+        || fail "restore_chmod_${format}_failed"
     "$ULTRASQL_BIN" --data-dir "$restore_data_dir" validate \
         || fail "restore_validate_${format}_failed"
 
