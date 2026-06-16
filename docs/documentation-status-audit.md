@@ -166,6 +166,17 @@ benchmark claims that are not backed by committed artifacts.
 Run this before release notes or website publication:
 
 ```bash
+python3 scripts/validate-documentation-status.py
+```
+
+The validator checks that this ledger covers every first-party Markdown file,
+that stale maturity labels do not return, that unsupported universal claims stay
+inside forbidden-claim examples, and that benchmark wording remains backed by
+the committed benchmark artifacts.
+
+For a quick text scan, run:
+
+```bash
 rg -n -i "pre[- ]alpha|production ready|best database in all aspects|beats every database" \
   README.md docs packages/npm external-audits incident-drills operator-reports \
   -g '*.md'
