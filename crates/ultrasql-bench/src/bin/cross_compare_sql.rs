@@ -3570,7 +3570,8 @@ async fn run_mixed_oltp_iter(server: SocketAddr, n_rows: usize, ix: usize) -> Re
     let started = Instant::now();
     let mut count: u64 = 0;
     while started.elapsed() < window {
-        let mut sql = String::with_capacity(MIXED_BATCH_OPS * 72);
+        let mut sql = String::with_capacity(MIXED_BATCH_OPS * 72 + 16);
+        sql.push_str("BEGIN;\n");
         let mut batch_count = 0_u64;
         for _ in 0..MIXED_BATCH_OPS {
             let r = rng.next_unit_f64();
@@ -3601,6 +3602,7 @@ async fn run_mixed_oltp_iter(server: SocketAddr, n_rows: usize, ix: usize) -> Re
             }
             batch_count = batch_count.saturating_add(1);
         }
+        sql.push_str("COMMIT;\n");
         client
             .batch_execute(&sql)
             .await

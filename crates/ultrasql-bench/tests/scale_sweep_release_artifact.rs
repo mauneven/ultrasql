@@ -192,6 +192,8 @@ fn ultrasql_mixed_oltp_batches_wire_roundtrips() {
 
     assert!(body.contains("const MIXED_BATCH_OPS"));
     assert!(body.contains("for _ in 0..MIXED_BATCH_OPS"));
+    assert!(body.contains("sql.push_str(\"BEGIN;\\n\")"));
+    assert!(body.contains("sql.push_str(\"COMMIT;\\n\")"));
     assert!(body.contains(".batch_execute(&sql)"));
     assert!(body.contains("CREATE INDEX"));
     assert!(body.contains("bench_mixed_id_idx"));
