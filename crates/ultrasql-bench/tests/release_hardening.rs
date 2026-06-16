@@ -1116,14 +1116,13 @@ fn final_release_requires_driver_compatibility_status() {
         assert!(roadmap.contains(needle), "ROADMAP missing {needle}");
     }
 
-    for needle in ["scripts/run-driver-release-evidence.py"] {
-        assert!(driver_docs.contains(needle), "driver docs missing {needle}");
-        assert!(
-            release_checklist.contains(needle),
-            "release checklist missing {needle}"
-        );
-        assert!(roadmap.contains(needle), "ROADMAP missing {needle}");
-    }
+    let needle = "scripts/run-driver-release-evidence.py";
+    assert!(driver_docs.contains(needle), "driver docs missing {needle}");
+    assert!(
+        release_checklist.contains(needle),
+        "release checklist missing {needle}"
+    );
+    assert!(roadmap.contains(needle), "ROADMAP missing {needle}");
 
     for needle in [
         "cargo",
