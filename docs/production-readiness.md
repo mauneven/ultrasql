@@ -2,11 +2,18 @@
 
 Last audited: 2026-06-16.
 
-Latest pushed documentation/evidence commit observed:
+Evidence baseline observed before this docs-only audit update:
 `cc1d5b2c9ff08d41dbbc25a5095ee5a79c3e80ee`.
 
-Latest release-evidence code commit observed:
-`cc1d5b2c9ff08d41dbbc25a5095ee5a79c3e80ee`.
+This page records evidence that was current at audit time. Every docs-only
+commit creates a newer CI run, so do not treat these run IDs as a permanent
+"latest CI" claim. Re-check the current head with:
+
+```bash
+git rev-parse HEAD
+gh run list --branch main --limit 6 \
+  --json databaseId,workflowName,headSha,status,conclusion,url
+```
 
 ## Verdict
 
@@ -21,8 +28,8 @@ The ethical claim today is narrower:
 
 - UltraSQL leads the committed 2026-06-14 release-artifact DB-vs-DB scale sweep
   on 24 of 24 comparable measured rows on the recorded Apple M4 host.
-- UltraSQL had green `main` CI for commit `8f771ace`. The latest observed
-  `main` CI for `cc1d5b2c` was still in progress when this audit was updated.
+- UltraSQL had green `main` CI for commit `8f771ace`. CI for the evidence
+  baseline commit was still in progress when this audit was updated.
 - UltraSQL still lacks required independent production evidence: operator soak
   reports, external audits, incident drills, and a release-commit driver status
   artifact.
@@ -31,7 +38,7 @@ The ethical claim today is narrower:
 
 | Area | Evidence | Current result |
 | --- | --- | --- |
-| CI | GitHub `ci` run `27593967602` for commit `cc1d5b2c` | in progress during this audit update; do not sign off until success |
+| CI | GitHub `ci` run `27593967602` for evidence baseline commit `cc1d5b2c` | in progress during this audit update; do not sign off until a current-head CI run succeeds |
 | Previous CI | GitHub `ci` run `27572340131` for commit `8f771ace` | success |
 | Docs CI | GitHub `docs` run `27593967575` for commit `cc1d5b2c` | success |
 | Production evidence workflow | GitHub run `27540874758` for commit `f9fc5c6f` | success, with not-ready release gates recorded |
