@@ -546,7 +546,10 @@ mod tests {
                 Ok(rt),
                 "type-byte round-trip failed for {rt:?}"
             );
-            assert!(seen.insert(byte), "duplicate variant in RecordType::ALL: {rt:?}");
+            assert!(
+                seen.insert(byte),
+                "duplicate variant in RecordType::ALL: {rt:?}"
+            );
         }
         for v in 0..=u8::MAX {
             if let Ok(rt) = RecordType::from_u8(v) {
@@ -569,7 +572,10 @@ mod tests {
             let (decoded, used) =
                 WalRecord::decode(&bytes).unwrap_or_else(|e| panic!("decode {rt:?}: {e}"));
             assert_eq!(used, bytes.len(), "consumed length mismatch for {rt:?}");
-            assert_eq!(decoded.header.record_type, rt, "record type changed for {rt:?}");
+            assert_eq!(
+                decoded.header.record_type, rt,
+                "record type changed for {rt:?}"
+            );
             assert_eq!(decoded.payload, payload, "payload changed for {rt:?}");
         }
     }
