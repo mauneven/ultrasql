@@ -103,18 +103,42 @@ def parse_commit(value: str) -> str:
     return commit
 
 
-def current_commit(repo_root: Path) -> str:
+def read_manifest_commit(out_dir: Path) -> str:
+    """Return the release commit recorded in the scale-sweep manifest.
+
+    The manifest's ``host.git_commit`` is the HEAD the sweep ran against, so it
+    is the commit the artifacts certify. Pinning to it (rather than to a moving
+    HEAD) keeps re-verification of committed artifacts stable across later
+    commits.
+    """
+    manifest_path = out_dir / "scale_sweep_manifest.json"
+    try:
+        doc = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except Exception as err:  # noqa: BLE001 - reported to the operator.
+        raise RuntimeError(f"cannot read release commit from {manifest_path}: {err}") from err
+    host = doc.get("host") if isinstance(doc, dict) else None
+    commit = host.get("git_commit") if isinstance(host, dict) else None
+    try:
+        return parse_commit(commit if isinstance(commit, str) else "")
+    except ValueError as err:
+        raise RuntimeError(f"manifest {manifest_path} host.git_commit {err}") from err
+
+
+def commit_is_ancestor(repo_root: Path, commit: str) -> bool:
+    """True when ``commit`` is an ancestor of (or equal to) HEAD.
+
+    The honesty guard for self-pinning: the certified commit must exist in this
+    repository's history, so a fabricated or unrelated SHA cannot self-certify.
+    """
     completed = subprocess.run(
-        ["git", "rev-parse", "HEAD"],
+        ["git", "merge-base", "--is-ancestor", commit, "HEAD"],
         cwd=repo_root,
         check=False,
-        text=True,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
+        text=True,
     )
-    if completed.returncode != 0:
-        raise RuntimeError(completed.stderr.strip() or "git rev-parse HEAD failed")
-    return parse_commit(completed.stdout)
+    return completed.returncode == 0
 
 
 def run_checked(cmd: list[str], *, cwd: Path, env: dict[str, str] | None = None) -> None:
@@ -178,12 +202,9 @@ def main() -> int:
     args = parse_args()
     repo_root = args.repo_root.resolve()
     try:
-        release_commit = parse_commit(args.commit) if args.commit else current_commit(repo_root)
+        explicit_commit = parse_commit(args.commit) if args.commit else None
     except ValueError as err:
         print(f"--commit {err}", file=sys.stderr)
-        return 2
-    except RuntimeError as err:
-        print(str(err), file=sys.stderr)
         return 2
     if args.min_comparable_rows <= 0:
         print("--min-comparable-rows must be positive", file=sys.stderr)
@@ -227,6 +248,23 @@ def main() -> int:
                 env=env,
                 continue_on_failure=args.no_strict,
             )
+
+        # Pin the release commit to the commit the artifacts were generated at:
+        # the manifest's recorded HEAD. Re-verifying committed artifacts in a
+        # fresh checkout then validates against the commit that contains the
+        # run, not a moving HEAD, so certification is stable rather than
+        # perpetually one commit behind. An explicit --commit overrides and is
+        # trusted to the operator; the validator still requires it to match the
+        # manifest.
+        if explicit_commit is not None:
+            release_commit = explicit_commit
+        else:
+            release_commit = read_manifest_commit(out_dir)
+            if not commit_is_ancestor(repo_root, release_commit):
+                raise RuntimeError(
+                    f"release commit {release_commit} is not an ancestor of HEAD; "
+                    "the certified commit must exist in this repository's history"
+                )
 
         validate_cmd = [
             args.python,

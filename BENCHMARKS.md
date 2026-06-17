@@ -196,8 +196,12 @@ The release-artifact sweep verifies package reality before publishing a scale
 claim:
 
 ```text
+# Generate certification (builds release-ship ultrasqld, runs the data-dir sweep):
 SCALE_SWEEP_ROWS="10000 100000 1000000" benchmarks/run_scale_sweep.sh full
 python3 scripts/run-benchmark-certification.py --mode full
+
+# Re-verify the committed certification in a fresh checkout (no sweep, no build):
+python3 scripts/run-benchmark-certification.py --skip-run --storage data-dir
 ```
 
 `scripts/run-benchmark-certification.py` is the release command. It builds the
@@ -205,11 +209,26 @@ current `ultrasqld` with `--profile release-ship`, runs the scale sweep with
 `SCALE_SWEEP_STORAGE=data-dir` by default, renders `scale_sweep.md` and
 `scale_sweep.json`, and writes
 `benchmarks/results/latest/benchmark_certification_status.json` through
-`scripts/validate-benchmark-certification.py`. The validator rejects missing
-ClickHouse measurements, stale `host.git_commit`, malformed raw artifacts,
-rendered fastest rows that disagree with raw medians, and memory-only release
-runs unless `--required-storage-mode memory` or `any` is explicitly used for a
-non-release check.
+`scripts/validate-benchmark-certification.py`.
+
+Release-commit linkage (stable, not one-commit-behind): the runner pins the
+release commit to the manifest's recorded `host.git_commit` — the HEAD the
+sweep ran against — rather than the current HEAD, and verifies that commit is an
+ancestor of HEAD (`git merge-base --is-ancestor`). So `--skip-run` re-validates
+committed artifacts against the commit that contains the run even after later
+commits move HEAD; a fabricated or unrelated SHA fails the ancestor check. An
+explicit `--commit` overrides and is then required to match the manifest.
+
+`ready` means fair, symmetric methodology, schema-valid artifacts, every
+required engine measured or explicitly `not_available` with a reason, data-dir
+storage, the pinned-and-ancestor release commit, and a complete host descriptor.
+It does **not** require UltraSQL to win every row. The validator still rejects
+missing ClickHouse measurements, malformed raw artifacts, rendered fastest rows
+that disagree with raw medians, and memory-only release runs unless
+`--required-storage-mode memory` or `any` is explicitly used for a non-release
+check. Per-row wins and losses are reported in the status `scoreboard`
+(fastest engine, win/loss/not_available counts, and each loss's winner and gap),
+not gated.
 
 `benchmarks/run_scale_sweep.sh` is the lower-level runner. UltraSQL is installed
 through `scripts/install.sh` unless `ULTRASQLD_BIN` points at an existing binary.
@@ -229,10 +248,12 @@ setup used by the embedded measured-engine runners, and all engines use 10k-row
 INSERT chunks. The mixed correctness row also emits `answer_sha256`; the
 renderer refuses to rank that workload unless every measured engine returns the
 same answer hash. After rendering, the sweep runs
-`benchmarks/scripts/check_supremacy.py` on the raw artifact directory and exits
-non-zero if UltraSQL is not fastest for every comparable measured row.
-Unavailable engines remain documented as unavailable and are not counted as
-claims. Artifacts live under:
+`benchmarks/scripts/check_supremacy.py` on the raw artifact directory as a
+non-blocking scoreboard reporter: it prints the per-workload fastest engine and
+whether UltraSQL led, lost, or was `not_available`, and exits 0. Per-row losses
+are reported data, not a certification failure; the release gate is the
+validator. Unavailable engines remain documented as unavailable and are not
+counted as claims. Artifacts live under:
 
 ```text
 benchmarks/results/latest/scale-sweep/

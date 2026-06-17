@@ -1,18 +1,18 @@
 {
-  "artifact_dir": "benchmarks/results/latest/scale-sweep",
+  "artifact_dir": "/Users/mauneven/Code/ultraSQL/benchmarks/results/latest/scale-sweep",
   "comparable_row_count": 23,
   "complete_row_count": 24,
   "errors": [],
   "expected_commit": "77a92d7c711cdc4d709d6291ab6a07781649693d",
-  "manifest": "benchmarks/results/latest/scale-sweep/scale_sweep_manifest.json",
+  "manifest": "/Users/mauneven/Code/ultraSQL/benchmarks/results/latest/scale-sweep/scale_sweep_manifest.json",
   "min_comparable_rows": 24,
   "missing_required_engine_rows": [],
   "policy": "ready means fair symmetric methodology, schema-valid artifacts, all required engines measured or explicitly not_available with a reason, data-dir storage, a pinned release commit, and a host descriptor. Per-row wins and losses are reported in the scoreboard, not gated.",
-  "raw_dir": "benchmarks/results/latest/scale-sweep/raw",
+  "raw_dir": "/Users/mauneven/Code/ultraSQL/benchmarks/results/latest/scale-sweep/raw",
   "ready": true,
   "reasons": [],
   "release_commit": "77a92d7c711cdc4d709d6291ab6a07781649693d",
-  "rendered_json": "benchmarks/results/latest/scale-sweep/scale_sweep.json",
+  "rendered_json": "/Users/mauneven/Code/ultraSQL/benchmarks/results/latest/scale-sweep/scale_sweep.json",
   "required_engines": [
     "clickhouse",
     "duckdb",
@@ -566,5 +566,5 @@
   "ultrasql_fastest_comparable_row_count": 17,
   "ultrasql_fastest_row_count": 17,
   "ultrasql_storage_mode": "data-dir",
-  "validated_at_utc": "2026-06-17T05:37:39.920693Z"
+  "validated_at_utc": "2026-06-17T12:43:33.058907Z"
 }
