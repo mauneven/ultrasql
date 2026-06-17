@@ -250,6 +250,125 @@ class BenchmarkCertificationValidatorTests(unittest.TestCase):
                 )
             )
 
+    def write_single_row(
+        self,
+        root: Path,
+        medians: dict[str, float],
+        *,
+        fastest_engine: str,
+        not_available_engines: dict[str, str] | None = None,
+    ) -> None:
+        """Render one select_scan_10k row from explicit per-engine medians.
+
+        Engines in `medians` are measured; engines in `not_available_engines`
+        get an explicit not_available raw artifact and are absent from the
+        rendered row, exactly as the renderer produces them.
+        """
+        raw_dir = root / "raw"
+        workload = "select_scan_10k"
+        engines = {}
+        for engine, median in medians.items():
+            path = raw_dir / f"{workload}-{engine}.json"
+            write_json(path, raw_record(workload, engine, median))
+            engines[engine] = {
+                "engine": engine,
+                "workload": workload,
+                "family": "select_scan",
+                "n_rows": 10000,
+                "median_us": median,
+                "samples": 32,
+                "server_mode": "external" if engine == "ultrasql" else None,
+                "path": str(path),
+            }
+        for engine, reason in (not_available_engines or {}).items():
+            write_json(
+                raw_dir / f"{workload}-{engine}.json",
+                {
+                    "schema_version": 1,
+                    "status": "not_available",
+                    "engine": engine,
+                    "workload": workload,
+                    "n_rows": 10000,
+                    "storage_mode": "data-dir",
+                    "durability_mode": "durable",
+                    "reason": reason,
+                },
+            )
+        write_json(root / "scale_sweep_manifest.json", manifest())
+        write_json(
+            root / "scale_sweep.json",
+            {
+                "schema_version": 1,
+                "raw_dir": str(raw_dir),
+                "engine_order": ENGINES,
+                "rows": [
+                    {
+                        "workload": "select_scan",
+                        "workload_label": "SELECT scan",
+                        "n_rows": 10000,
+                        "engines": engines,
+                        "fastest_engine": fastest_engine,
+                        "fastest_median_us": medians[fastest_engine],
+                        "correctness_status": None,
+                        "answer_sha256": None,
+                    }
+                ],
+                "policy": "Only measured raw artifacts are rendered.",
+            },
+        )
+
+    def test_ready_when_ultrasql_loses_a_row(self) -> None:
+        # Honest semantics: a fair, complete, schema-valid sweep is ready even
+        # when a competitor is faster. The loss is reported, not gated.
+        with tempfile_dir() as tmp_path:
+            self.write_single_row(
+                tmp_path,
+                {
+                    "ultrasql": 20.0,
+                    "duckdb": 10.0,
+                    "clickhouse": 30.0,
+                    "sqlite3": 40.0,
+                    "postgres": 50.0,
+                },
+                fastest_engine="duckdb",
+            )
+
+            status = run_validator(tmp_path)
+
+            self.assertTrue(status["ready"], status["reasons"])
+            self.assertEqual(status["ultrasql_fastest_row_count"], 0)
+            board = status["scoreboard"]
+            self.assertEqual(board["ultrasql_win_count"], 0)
+            self.assertEqual(board["ultrasql_loss_count"], 1)
+            self.assertEqual(len(board["losses"]), 1)
+            loss = board["losses"][0]
+            self.assertEqual(loss["winner"], "duckdb")
+            self.assertAlmostEqual(loss["gap_pct"], 100.0)
+
+    def test_ready_when_ultrasql_not_available_with_reason(self) -> None:
+        # An engine that explicitly records not_available with a reason is
+        # accounted for; the row stays complete and certification is ready.
+        with tempfile_dir() as tmp_path:
+            self.write_single_row(
+                tmp_path,
+                {
+                    "duckdb": 10.0,
+                    "clickhouse": 11.0,
+                    "sqlite3": 12.0,
+                    "postgres": 13.0,
+                },
+                fastest_engine="duckdb",
+                not_available_engines={"ultrasql": "wal buffer full at 1M rows"},
+            )
+
+            status = run_validator(tmp_path)
+
+            self.assertTrue(status["ready"], status["reasons"])
+            self.assertEqual(status["missing_required_engine_rows"], [])
+            board = status["scoreboard"]
+            self.assertEqual(board["ultrasql_not_available_count"], 1)
+            self.assertEqual(board["rows"][0]["ultrasql_result"], "not_available")
+
     def test_rejects_missing_raw_storage_profile_for_data_dir_release(self) -> None:
         with tempfile_dir() as tmp_path:
             write_artifact(tmp_path)

@@ -134,6 +134,61 @@ def canonical_engine(engine: str) -> str:
     return engine
 
 
+# Workload families, longest-prefix first, used to map a full raw workload id
+# (e.g. "insert_throughput_1m") back to its rendered family + scale so an
+# explicit not_available artifact can be matched to the row it belongs to.
+WORKLOAD_FAMILIES = [
+    "insert_throughput",
+    "select_scan",
+    "select_sum",
+    "select_avg",
+    "filter_sum",
+    "update_throughput",
+    "delete_throughput",
+    "mixed_oltp_pgbench_like",
+    "mixed_correctness",
+    "window_row_number",
+]
+
+
+def workload_family(workload: str) -> str | None:
+    for family in WORKLOAD_FAMILIES:
+        if workload == family or workload.startswith(f"{family}_"):
+            return family
+    return None
+
+
+def scan_not_available(raw_dir: Path) -> dict[tuple[str, str, int], str]:
+    """Map (engine, family, n_rows) -> reason for every not_available raw file.
+
+    An engine that explicitly records `status="not_available"` with a reason is
+    accounted for: the workload was attempted and the gap is documented, so it
+    must not be treated as a silently missing measurement.
+    """
+    statuses: dict[tuple[str, str, int], str] = {}
+    if not raw_dir.is_dir():
+        return statuses
+    for path in sorted(raw_dir.glob("*.json")):
+        doc, _ = load_json(path)
+        if not isinstance(doc, dict) or doc.get("status") != "not_available":
+            continue
+        engine = doc.get("engine")
+        workload = doc.get("workload")
+        n_rows = doc.get("n_rows")
+        if not isinstance(engine, str) or not isinstance(workload, str):
+            continue
+        if isinstance(n_rows, bool) or not isinstance(n_rows, int):
+            continue
+        family = workload_family(workload)
+        if family is None:
+            continue
+        reason = doc.get("reason")
+        statuses[(canonical_engine(engine), family, n_rows)] = (
+            reason if isinstance(reason, str) and reason.strip() else "not_available"
+        )
+    return statuses
+
+
 def resolve_artifact_path(artifact_dir: Path, raw_dir: Path, text: Any) -> Path | None:
     if not isinstance(text, str) or not text.strip():
         return None
@@ -275,20 +330,27 @@ def validate_rendered_rows(
     required_engines: list[str],
     required_storage_mode: str,
     min_comparable_rows: int,
-) -> tuple[list[dict[str, Any]], int, int, int, list[dict[str, Any]], list[str]]:
+    not_available: dict[tuple[str, str, int], str],
+) -> dict[str, Any]:
     errors: list[str] = []
     if not isinstance(rendered, dict):
-        return [], 0, 0, 0, [], ["scale_sweep.json must be a JSON object"]
+        return {"errors": ["scale_sweep.json must be a JSON object"]}
     if rendered.get("schema_version") != 1:
         errors.append("scale_sweep.json schema_version must be 1")
     rows = rendered.get("rows")
     if not isinstance(rows, list) or not rows:
-        return [], 0, 0, 0, [], errors + ["scale_sweep.json rows must be a non-empty list"]
+        errors.append("scale_sweep.json rows must be a non-empty list")
+        return {"errors": errors}
 
     row_summaries: list[dict[str, Any]] = []
+    scoreboard_rows: list[dict[str, Any]] = []
+    losses: list[dict[str, Any]] = []
     missing_required_rows: list[dict[str, Any]] = []
     comparable_count = 0
+    complete_count = 0
     ultrasql_fastest_count = 0
+    ultrasql_loss_count = 0
+    ultrasql_not_available_count = 0
     total_rendered = 0
 
     for index, row in enumerate(rows):
@@ -343,7 +405,18 @@ def validate_rendered_rows(
                         f"{workload} rows={n_rows} {engine}: raw median_us mismatch"
                     )
 
-        missing = [engine for engine in required_engines if engine not in measured]
+        # An engine is genuinely missing only when it is neither measured nor
+        # explicitly recorded as not_available with a reason.
+        not_available_here = [
+            engine
+            for engine in required_engines
+            if engine not in measured and (engine, workload, n_rows) in not_available
+        ]
+        missing = [
+            engine
+            for engine in required_engines
+            if engine not in measured and engine not in not_available_here
+        ]
         if missing:
             missing_required_rows.append(
                 {
@@ -353,19 +426,67 @@ def validate_rendered_rows(
                 }
             )
         else:
+            complete_count += 1
+        if not missing and not not_available_here:
             comparable_count += 1
+
+        # Per-row scoreboard over the measured engines. Losses are first-class
+        # reported data, never a certification failure.
+        fastest_engine = None
+        fastest_median = None
+        ultrasql_result = "missing"
+        if measured:
             fastest_median = min(measured.values())
-            fastest_engines = sorted(
+            fastest_candidates = sorted(
                 engine for engine, median in measured.items() if median == fastest_median
             )
+            fastest_engine = fastest_candidates[0]
             rendered_fastest = canonical_engine(str(row.get("fastest_engine")))
             rendered_fastest_median = measured_median({"median_us": row.get("fastest_median_us")})
-            if rendered_fastest not in fastest_engines or rendered_fastest_median != fastest_median:
+            if (
+                rendered_fastest not in fastest_candidates
+                or rendered_fastest_median != fastest_median
+            ):
                 errors.append(
                     f"{workload} rows={n_rows}: rendered fastest_engine must match raw medians"
                 )
-            if "ultrasql" in fastest_engines:
-                ultrasql_fastest_count += 1
+            ultrasql_median = measured.get("ultrasql")
+            if ultrasql_median is not None:
+                if "ultrasql" in fastest_candidates:
+                    ultrasql_fastest_count += 1
+                    ultrasql_result = "win"
+                else:
+                    ultrasql_result = "loss"
+                    ultrasql_loss_count += 1
+                    gap_pct = (
+                        (ultrasql_median / fastest_median - 1.0) * 100.0
+                        if fastest_median > 0.0
+                        else None
+                    )
+                    losses.append(
+                        {
+                            "workload": workload,
+                            "n_rows": n_rows,
+                            "winner": fastest_engine,
+                            "winner_median_us": fastest_median,
+                            "ultrasql_median_us": ultrasql_median,
+                            "gap_pct": gap_pct,
+                        }
+                    )
+            elif "ultrasql" in not_available_here:
+                ultrasql_result = "not_available"
+                ultrasql_not_available_count += 1
+
+        scoreboard_rows.append(
+            {
+                "workload": workload,
+                "n_rows": n_rows,
+                "fastest_engine": fastest_engine,
+                "fastest_median_us": fastest_median,
+                "ultrasql_median_us": measured.get("ultrasql"),
+                "ultrasql_result": ultrasql_result,
+            }
+        )
 
         if workload == "mixed_correctness":
             answer_hash = row.get("answer_sha256")
@@ -383,23 +504,32 @@ def validate_rendered_rows(
             }
         )
 
-    if comparable_count < min_comparable_rows:
+    # "ready" requires complete coverage (every required engine measured or
+    # explicitly not_available), NOT that UltraSQL wins every row.
+    if complete_count < min_comparable_rows:
         errors.append(
-            f"comparable_row_count {comparable_count} below minimum {min_comparable_rows}"
-        )
-    if ultrasql_fastest_count != comparable_count:
-        errors.append(
-            "UltraSQL must be fastest for every comparable row in this release artifact"
+            f"complete_row_count {complete_count} below minimum {min_comparable_rows}"
         )
 
-    return (
-        row_summaries,
-        total_rendered,
-        comparable_count,
-        ultrasql_fastest_count,
-        missing_required_rows,
-        errors,
-    )
+    scoreboard = {
+        "rows": scoreboard_rows,
+        "ultrasql_win_count": ultrasql_fastest_count,
+        "ultrasql_loss_count": ultrasql_loss_count,
+        "ultrasql_not_available_count": ultrasql_not_available_count,
+        "rows_not_led_by_ultrasql": ultrasql_loss_count + ultrasql_not_available_count,
+        "losses": losses,
+    }
+
+    return {
+        "row_summaries": row_summaries,
+        "total_rendered": total_rendered,
+        "comparable_count": comparable_count,
+        "complete_count": complete_count,
+        "ultrasql_fastest_count": ultrasql_fastest_count,
+        "missing_required_rows": missing_required_rows,
+        "scoreboard": scoreboard,
+        "errors": errors,
+    }
 
 
 def build_status(
@@ -434,23 +564,30 @@ def build_status(
     )
     errors.extend(manifest_errors)
 
-    (
-        rows,
-        total_rendered,
-        comparable_count,
-        ultrasql_fastest_count,
-        missing_required_rows,
-        rendered_errors,
-    ) = validate_rendered_rows(
+    not_available = scan_not_available(raw_dir)
+    rendered_result = validate_rendered_rows(
         rendered,
         artifact_dir=artifact_dir,
         raw_dir=raw_dir,
         required_engines=required_engines,
         required_storage_mode=required_storage_mode,
         min_comparable_rows=min_comparable_rows,
+        not_available=not_available,
     )
-    errors.extend(rendered_errors)
+    rows = rendered_result.get("row_summaries", [])
+    total_rendered = rendered_result.get("total_rendered", 0)
+    comparable_count = rendered_result.get("comparable_count", 0)
+    complete_count = rendered_result.get("complete_count", 0)
+    ultrasql_fastest_count = rendered_result.get("ultrasql_fastest_count", 0)
+    missing_required_rows = rendered_result.get("missing_required_rows", [])
+    scoreboard = rendered_result.get("scoreboard", {})
+    errors.extend(rendered_result.get("errors", []))
 
+    # "ready" rewards honest, fair methodology: valid artifacts, all required
+    # engines measured or explicitly not_available, data-dir storage, a pinned
+    # release commit, and a host descriptor. It does NOT require UltraSQL to be
+    # fastest on every row; per-row wins and losses are reported in the
+    # scoreboard.
     ready = not errors and not missing_required_rows
     reasons = []
     if not ready:
@@ -482,14 +619,20 @@ def build_status(
         "min_comparable_rows": min_comparable_rows,
         "total_rendered_row_count": total_rendered,
         "comparable_row_count": comparable_count,
+        "complete_row_count": complete_count,
+        # Informational only: not a gate. UltraSQL is not required to win rows.
         "ultrasql_fastest_comparable_row_count": ultrasql_fastest_count,
+        "ultrasql_fastest_row_count": ultrasql_fastest_count,
+        "scoreboard": scoreboard,
         "missing_required_engine_rows": missing_required_rows,
         "rows": rows,
         "errors": errors,
         "reasons": reasons,
         "policy": (
-            "Validation checks only raw measured artifacts and rendered rows; "
-            "missing engines and stale commits are not release-ready evidence."
+            "ready means fair symmetric methodology, schema-valid artifacts, all "
+            "required engines measured or explicitly not_available with a reason, "
+            "data-dir storage, a pinned release commit, and a host descriptor. "
+            "Per-row wins and losses are reported in the scoreboard, not gated."
         ),
     }
 
