@@ -53,6 +53,33 @@ as a concise evidence ledger; roadmap stays for open gates only.
   `ultrasql-objectstore`) serves explicit object-store reads only. Docs:
   `docs/transactional-embeddings.md`.
 
+## HNSW Recall Quality + Honest Vector Benchmarks
+
+- HNSW diversity heuristic: the persistent and in-process graphs connected each
+  node to its `m` exact-nearest neighbors with no diversity pruning — a plain
+  k-NN graph that navigates poorly. The HNSW select-neighbors heuristic
+  (Malkov & Yashunin Algorithm 4, applied to build over a bounded
+  `ef_construction` pool and to neighbor-list trim) lifts SIFT recall@10 from
+  0.66 to 0.997 at ef=64. Evidence: `crates/ultrasql-storage/src/access_method.rs`
+  (`select_neighbors_heuristic`), test
+  `page_backed_hnsw_diversity_heuristic_keeps_high_recall_in_high_dim`.
+- Per-session `hnsw.ef_search` knob (pgvector-compatible `SET`/`SHOW`) lets users
+  trade query latency for recall; the vector lowering reads it from
+  session_settings. Evidence: `crates/ultrasql-server/src/session/execute.rs`,
+  `crates/ultrasql-server/src/pipeline/index_scan.rs`, test
+  `hnsw_ef_search_session_knob_is_accepted_and_applied`.
+- Honest ANN benchmark suite vs pgvector (PG17), Qdrant, and LanceDB on the same
+  host: same base/query/k/L2 metric, exact ground truth computed in-harness over
+  the loaded base (independent of the dataset's full-corpus file), recall@k
+  always paired with p50/p95/p99 latency, each competitor swept in its
+  recommended config. On SIFT 50k×128d (Apple M4): UltraSQL recall@10 0.986 at
+  ef=64 / 1.000 at ef=200, p50 697 µs at the matched point — faster than Qdrant
+  (1403 µs) and LanceDB (1154 µs), slower than pgvector (319 µs). Build time
+  (~400 s O(N²)) is the open gap, tracked in ROADMAP. Evidence:
+  `benchmarks/vector_ann_sift.sh`, `benchmarks/scripts/vector_ann_bench.py`,
+  `docs/vector-benchmarks.md`, artifacts under
+  `benchmarks/results/latest/raw/vector_ann_sift_50k_k10*`.
+
 ## Release And Packaging Automation
 
 - Release workflow builds and attaches release archives for Linux, macOS, and

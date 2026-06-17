@@ -1,0 +1,75 @@
+{
+  "config": {
+    "ef_construction": 200,
+    "m": 16
+  },
+  "dataset": "siftsmall",
+  "dims": 128,
+  "engine": "postgres17_pgvector",
+  "host": {
+    "cpu_model": "Apple M4",
+    "git_commit": "16cb3c27401462132b4d924c36738b7358b861f2",
+    "hostname": "maunevens-Mac-mini.local",
+    "logical_cpus": 10,
+    "machine": "arm64",
+    "os": "macOS-26.5.1-arm64-arm-64bit-Mach-O"
+  },
+  "index": "hnsw",
+  "index_build_us": 1377822.7919247001,
+  "ingest_us": 178704.24990542233,
+  "k": 10,
+  "metric": "l2",
+  "n_base": 10000,
+  "n_queries": 100,
+  "pgvector_version": "0.8.0",
+  "points": [
+    {
+      "ef_search": 10,
+      "p50_latency_us": 111.41598224639893,
+      "p95_latency_us": 172.58385196328163,
+      "p99_latency_us": 232.91702382266521,
+      "queries": 100,
+      "recall_at_k_mean": 0.966,
+      "recall_at_k_min": 0.6
+    },
+    {
+      "ef_search": 40,
+      "p50_latency_us": 148.08308333158493,
+      "p95_latency_us": 222.00006060302258,
+      "p99_latency_us": 237.50006221234798,
+      "queries": 100,
+      "recall_at_k_mean": 1.0,
+      "recall_at_k_min": 1.0
+    },
+    {
+      "ef_search": 64,
+      "p50_latency_us": 142.5000373274088,
+      "p95_latency_us": 203.33402790129185,
+      "p99_latency_us": 279.58396822214127,
+      "queries": 100,
+      "recall_at_k_mean": 1.0,
+      "recall_at_k_min": 1.0
+    },
+    {
+      "ef_search": 100,
+      "p50_latency_us": 177.58295871317387,
+      "p95_latency_us": 339.54204991459846,
+      "p99_latency_us": 432.37488716840744,
+      "queries": 100,
+      "recall_at_k_mean": 1.0,
+      "recall_at_k_min": 1.0
+    },
+    {
+      "ef_search": 200,
+      "p50_latency_us": 265.7088916748762,
+      "p95_latency_us": 669.7908975183964,
+      "p99_latency_us": 729.2910013347864,
+      "queries": 100,
+      "recall_at_k_mean": 1.0,
+      "recall_at_k_min": 1.0
+    }
+  ],
+  "server_version": "PostgreSQL 17.10 (Homebrew) on aarch64-apple-darwin25.4.0, compiled by Apple clang version 21.0.0 (clang-2100.0.123.102), 64-bit",
+  "status": "measured",
+  "wall_seconds": 1.68
+}

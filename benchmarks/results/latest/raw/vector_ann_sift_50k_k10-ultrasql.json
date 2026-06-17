@@ -1,0 +1,74 @@
+{
+  "config": {
+    "ef_construction": "internal_default (exact top-200 + heuristic)",
+    "m": 16
+  },
+  "dataset": "sift",
+  "dims": 128,
+  "engine": "ultrasql",
+  "host": {
+    "cpu_model": "Apple M4",
+    "git_commit": "16cb3c27401462132b4d924c36738b7358b861f2",
+    "hostname": "maunevens-Mac-mini.local",
+    "logical_cpus": 10,
+    "machine": "arm64",
+    "os": "macOS-26.5.1-arm64-arm-64bit-Mach-O"
+  },
+  "index": "hnsw",
+  "index_build_us": 400166598.3751882,
+  "ingest_us": 2131862.2920662165,
+  "k": 10,
+  "metric": "l2",
+  "n_base": 50000,
+  "n_queries": 100,
+  "points": [
+    {
+      "ef_search": 10,
+      "p50_latency_us": 264.7079527378082,
+      "p95_latency_us": 359.08306017518044,
+      "p99_latency_us": 2146.707847714424,
+      "queries": 100,
+      "recall_at_k_mean": 0.53,
+      "recall_at_k_min": 0.0
+    },
+    {
+      "ef_search": 40,
+      "p50_latency_us": 507.20805302262306,
+      "p95_latency_us": 694.1668689250946,
+      "p99_latency_us": 763.1669286638498,
+      "queries": 100,
+      "recall_at_k_mean": 0.978,
+      "recall_at_k_min": 0.7
+    },
+    {
+      "ef_search": 64,
+      "p50_latency_us": 696.5422071516514,
+      "p95_latency_us": 1009.5001198351383,
+      "p99_latency_us": 4313.874989748001,
+      "queries": 100,
+      "recall_at_k_mean": 0.986,
+      "recall_at_k_min": 0.7
+    },
+    {
+      "ef_search": 100,
+      "p50_latency_us": 1012.9169095307589,
+      "p95_latency_us": 1428.8329984992743,
+      "p99_latency_us": 3869.415959343314,
+      "queries": 100,
+      "recall_at_k_mean": 0.998,
+      "recall_at_k_min": 0.9
+    },
+    {
+      "ef_search": 200,
+      "p50_latency_us": 1728.4159548580647,
+      "p95_latency_us": 2390.541136264801,
+      "p99_latency_us": 2652.290975674987,
+      "queries": 100,
+      "recall_at_k_mean": 1.0,
+      "recall_at_k_min": 1.0
+    }
+  ],
+  "server_version": "PostgreSQL 14.0 (UltraSQL 0.0.9)",
+  "status": "measured",
+  "wall_seconds": 403.43
+}

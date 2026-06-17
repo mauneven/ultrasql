@@ -1,0 +1,86 @@
+{
+  "config": {
+    "ef_construction": 200,
+    "m": 16,
+    "nprobes": 20
+  },
+  "dataset": "siftsmall",
+  "dims": 128,
+  "engine": "lancedb",
+  "host": {
+    "cpu_model": "Apple M4",
+    "git_commit": "16cb3c27401462132b4d924c36738b7358b861f2",
+    "hostname": "maunevens-Mac-mini.local",
+    "logical_cpus": 10,
+    "machine": "arm64",
+    "os": "macOS-26.5.1-arm64-arm-64bit-Mach-O"
+  },
+  "index": "IVF_HNSW_SQ",
+  "index_build_us": 195979.45804707706,
+  "ingest_us": 73607.41682350636,
+  "k": 10,
+  "metric": "l2",
+  "n_base": 10000,
+  "n_queries": 100,
+  "points": [
+    {
+      "ef_search": null,
+      "nprobes": 20,
+      "p50_latency_us": 869.5409633219242,
+      "p95_latency_us": 1110.8340695500374,
+      "p99_latency_us": 1149.4590435177088,
+      "queries": 100,
+      "recall_at_k_mean": 0.909,
+      "recall_at_k_min": 0.6,
+      "refine_factor": 1
+    },
+    {
+      "ef_search": null,
+      "nprobes": 20,
+      "p50_latency_us": 1053.7081398069859,
+      "p95_latency_us": 1240.7498434185982,
+      "p99_latency_us": 1354.7088019549847,
+      "queries": 100,
+      "recall_at_k_mean": 1.0,
+      "recall_at_k_min": 1.0,
+      "refine_factor": 5
+    },
+    {
+      "ef_search": null,
+      "nprobes": 20,
+      "p50_latency_us": 1267.3339806497097,
+      "p95_latency_us": 1498.2919674366713,
+      "p99_latency_us": 1621.791860088706,
+      "queries": 100,
+      "recall_at_k_mean": 1.0,
+      "recall_at_k_min": 1.0,
+      "refine_factor": 10
+    },
+    {
+      "ef_search": null,
+      "nprobes": 20,
+      "p50_latency_us": 1585.2078795433044,
+      "p95_latency_us": 1900.0419415533543,
+      "p99_latency_us": 1946.2909549474716,
+      "queries": 100,
+      "recall_at_k_mean": 1.0,
+      "recall_at_k_min": 1.0,
+      "refine_factor": 20
+    },
+    {
+      "ef_search": null,
+      "nprobes": 20,
+      "p50_latency_us": 2289.0002001076937,
+      "p95_latency_us": 2723.8340117037296,
+      "p99_latency_us": 2876.87499076128,
+      "queries": 100,
+      "recall_at_k_mean": 1.0,
+      "recall_at_k_min": 1.0,
+      "refine_factor": 50
+    }
+  ],
+  "server_version": "0.33.0",
+  "status": "measured",
+  "tuning_knob": "refine_factor (IVF+SQ; ef_search not applicable)",
+  "wall_seconds": 1.99
+}

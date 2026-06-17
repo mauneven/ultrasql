@@ -1,0 +1,75 @@
+{
+  "config": {
+    "ef_construction": 200,
+    "m": 16
+  },
+  "dataset": "sift",
+  "dims": 128,
+  "engine": "postgres17_pgvector",
+  "host": {
+    "cpu_model": "Apple M4",
+    "git_commit": "16cb3c27401462132b4d924c36738b7358b861f2",
+    "hostname": "maunevens-Mac-mini.local",
+    "logical_cpus": 10,
+    "machine": "arm64",
+    "os": "macOS-26.5.1-arm64-arm-64bit-Mach-O"
+  },
+  "index": "hnsw",
+  "index_build_us": 4215065.791038796,
+  "ingest_us": 897684.4158023596,
+  "k": 10,
+  "metric": "l2",
+  "n_base": 50000,
+  "n_queries": 100,
+  "pgvector_version": "0.8.0",
+  "points": [
+    {
+      "ef_search": 10,
+      "p50_latency_us": 161.37491911649704,
+      "p95_latency_us": 209.8330296576023,
+      "p99_latency_us": 217.70899184048176,
+      "queries": 100,
+      "recall_at_k_mean": 0.909,
+      "recall_at_k_min": 0.4
+    },
+    {
+      "ef_search": 40,
+      "p50_latency_us": 258.20801965892315,
+      "p95_latency_us": 389.91705514490604,
+      "p99_latency_us": 503.5409703850746,
+      "queries": 100,
+      "recall_at_k_mean": 0.993,
+      "recall_at_k_min": 0.7
+    },
+    {
+      "ef_search": 64,
+      "p50_latency_us": 319.2909061908722,
+      "p95_latency_us": 454.20811511576176,
+      "p99_latency_us": 539.249973371625,
+      "queries": 100,
+      "recall_at_k_mean": 0.995,
+      "recall_at_k_min": 0.7
+    },
+    {
+      "ef_search": 100,
+      "p50_latency_us": 431.0421645641327,
+      "p95_latency_us": 618.9581472426653,
+      "p99_latency_us": 668.833963572979,
+      "queries": 100,
+      "recall_at_k_mean": 1.0,
+      "recall_at_k_min": 1.0
+    },
+    {
+      "ef_search": 200,
+      "p50_latency_us": 641.6249088943005,
+      "p95_latency_us": 964.9579878896475,
+      "p99_latency_us": 1110.2089192718267,
+      "queries": 100,
+      "recall_at_k_mean": 1.0,
+      "recall_at_k_min": 1.0
+    }
+  ],
+  "server_version": "PostgreSQL 17.10 (Homebrew) on aarch64-apple-darwin25.4.0, compiled by Apple clang version 21.0.0 (clang-2100.0.123.102), 64-bit",
+  "status": "measured",
+  "wall_seconds": 5.34
+}

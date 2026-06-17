@@ -1,0 +1,68 @@
+{
+  "dataset": "siftsmall",
+  "dims": 128,
+  "engines": {
+    "lancedb": "measured",
+    "postgres17_pgvector": "measured",
+    "qdrant": "measured",
+    "ultrasql": "measured"
+  },
+  "hnsw_config": {
+    "ef_construction": 200,
+    "m": 16
+  },
+  "host": {
+    "cpu_model": "Apple M4",
+    "git_commit": "16cb3c27401462132b4d924c36738b7358b861f2",
+    "hostname": "maunevens-Mac-mini.local",
+    "logical_cpus": 10,
+    "machine": "arm64",
+    "os": "macOS-26.5.1-arm64-arm-64bit-Mach-O"
+  },
+  "k": 10,
+  "matched_operating_point_ef_search": 64,
+  "matched_point": {
+    "lancedb": {
+      "ef_search": null,
+      "p50_latency_us": 1053.7081398069859,
+      "p95_latency_us": 1240.7498434185982,
+      "p99_latency_us": 1354.7088019549847,
+      "qps_p50": 949.0293964922546,
+      "recall_at_k_mean": 1.0,
+      "refine_factor": 5
+    },
+    "postgres17_pgvector": {
+      "ef_search": 64,
+      "p50_latency_us": 142.5000373274088,
+      "p95_latency_us": 203.33402790129185,
+      "p99_latency_us": 279.58396822214127,
+      "qps_p50": 7017.542021426949,
+      "recall_at_k_mean": 1.0,
+      "refine_factor": null
+    },
+    "qdrant": {
+      "ef_search": 64,
+      "p50_latency_us": 1271.8748766928911,
+      "p95_latency_us": 1849.2909148335457,
+      "p99_latency_us": 1991.166966035962,
+      "qps_p50": 786.2408624661131,
+      "recall_at_k_mean": 1.0,
+      "refine_factor": null
+    },
+    "ultrasql": {
+      "ef_search": 64,
+      "p50_latency_us": 391.45792834460735,
+      "p95_latency_us": 565.2918480336666,
+      "p99_latency_us": 736.0000163316727,
+      "qps_p50": 2554.552935557566,
+      "recall_at_k_mean": 0.997,
+      "refine_factor": null
+    }
+  },
+  "metric": "l2",
+  "n_base": 10000,
+  "n_queries": 100,
+  "policy": "Same base/query/ground-truth/k/metric (L2) for every engine. Recall@k is always paired with p50/p95/p99 latency. Competitors swept across ef_search; the matched point is ef_search = UltraSQL's effective value. Unavailable engines are recorded, never faked.",
+  "schema_version": 1,
+  "suite": "vector_ann_recall_latency_same_host"
+}

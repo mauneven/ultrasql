@@ -201,8 +201,23 @@ p50 ≈ 257 µs on 2k×16d via `benchmarks/vector_ann_hnsw.sh`):
   cheaply — exit condition: a metadata-index pre-filter path so selective
   filtered-ANN p50 is sub-millisecond at 1M rows, recall 1.0; (b) IVFFlat-indexed
   vector columns still use the exact filter+sort path — exit condition: a
-  probes-based IVFFlat over-fetch with a committed recall artifact; (c) larger
-  recall/latency artifacts (SIFT1M scale) from the server wire path.
+  probes-based IVFFlat over-fetch with a committed recall artifact.
+- HNSW index build scales O(N²) (PART 3): every inserted vector scans all live
+  nodes to pick neighbors, so build time grows quadratically — measured ~424 s
+  for 50k×128d on Apple M4 vs pgvector's ~5 s in the same SIFT comparison
+  (`benchmarks/vector_ann_sift.sh`), which makes SIFT1M-scale builds impractical.
+  Query recall and latency are already competitive (recall@10 0.986 at ef=64,
+  1.000 at ef=200; see `docs/vector-benchmarks.md`); the gap is build, not search.
+  Exit condition: graph-search-based candidate selection at insert (find the
+  `ef_construction` nearest via the partially-built graph instead of a full scan)
+  so a 1M×128d build completes in minutes with recall@10 ≥ 0.95 at ef ≤ 128, plus
+  a committed SIFT1M artifact from the server wire path.
+- Hierarchical HNSW layers (PART 3): the persistent graph is a single navigable
+  layer. Recall holds through 50k with the diversity heuristic, but a multi-layer
+  graph would lower the ef needed for a given recall at large N. Exit condition:
+  per-node levels with per-level neighbor lists, crash/WAL-replay recovery tests,
+  and a recall/latency artifact showing lower ef-for-recall at ≥ 100k vs the
+  single-layer baseline.
 - Agent memory primitives (PART 4): exit condition: tenant/namespace isolation
   enforced and tested under concurrency (no cross-tenant leakage), deterministic
   time-decay ranking (`relevance × decay(age)`), and TTL/decay eviction as
@@ -211,11 +226,13 @@ p50 ≈ 257 µs on 2k×16d via `benchmarks/vector_ann_hnsw.sh`):
   hybrid query reports index choice, candidates examined/pruned, filter
   selectivity, per-component scores, and a recall estimate, with tests asserting
   the explain reflects the executed path.
-- Killer demo + competitive benchmarks (PART 6): exit condition: a
-  `crates/ultrasql-node` demo that ingests embeddings + text + metadata and runs
-  a hybrid RAG query surviving restart, plus fair `recall@k`-with-latency
+- Killer demo + competitive benchmarks (PART 6): fair `recall@k`-with-latency
   benchmarks versus PostgreSQL 17 + pgvector, LanceDB, and Qdrant in their
-  recommended configs, reporting wins and losses.
+  recommended configs are shipped — same-host SIFT, computed exact ground truth,
+  recall always paired with latency (`benchmarks/vector_ann_sift.sh`,
+  `docs/vector-benchmarks.md`, DONE.md "Honest vector benchmark suite").
+  Remaining exit condition: a `crates/ultrasql-node` demo that ingests embeddings
+  + text + metadata and runs a hybrid RAG query surviving restart.
 
 ### ANN And pgvector
 

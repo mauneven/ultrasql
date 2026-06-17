@@ -74,3 +74,7 @@ benchmarks/results/latest/scale-sweep/*.log
 
 # Scratch per-engine data dirs created by benchmarks/run_scale_sweep.sh
 benchmarks/results/latest/scale-sweep/data-dirs/
+
+# Large ANN benchmark datasets (SIFT/TEXMEX, hundreds of MB); downloaded on
+# demand by benchmarks/vector_ann_sift.sh, never committed.
+benchmarks/datasets/

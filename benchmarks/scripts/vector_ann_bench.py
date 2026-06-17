@@ -47,6 +47,16 @@ def read_fvecs(path: Path, limit: int | None = None) -> np.ndarray:
     return rows[:, 1:].view(np.float32).astype(np.float32, copy=True)
 
 
+def count_fvecs(path: Path) -> int:
+    with open(path, "rb") as handle:
+        head = handle.read(4)
+        if len(head) < 4:
+            return 0
+        dim = int(np.frombuffer(head, dtype=np.int32)[0])
+    row_bytes = (dim + 1) * 4
+    return path.stat().st_size // row_bytes if row_bytes else 0
+
+
 def read_ivecs(path: Path, limit: int | None = None) -> np.ndarray:
     raw = np.fromfile(path, dtype=np.int32)
     if raw.size == 0:
@@ -87,6 +97,23 @@ def percentile(values: list[float], pct: float) -> float:
     ordered = sorted(values)
     rank = max(0, min(len(ordered) - 1, round(pct / 100.0 * (len(ordered) - 1))))
     return ordered[rank]
+
+
+def compute_groundtruth(base: np.ndarray, queries: np.ndarray, k: int) -> np.ndarray:
+    """Exact k-NN (L2) of each query over the *loaded* base, as an independent
+    NumPy baseline. Computed here rather than read from the dataset's own
+    ground-truth file because that file's neighbor ids index the full corpus —
+    using it against a loaded subset would be wrong. Computing it ourselves is
+    both correct at any base size and an independent check on every engine.
+    """
+    n = base.shape[0]
+    kk = min(k, n)
+    truth = np.empty((queries.shape[0], kk), dtype=np.int64)
+    for qi in range(queries.shape[0]):
+        dist = np.linalg.norm(base - queries[qi], axis=1)
+        top = np.argpartition(dist, kk - 1)[:kk]
+        truth[qi] = top[np.argsort(dist[top], kind="stable")]
+    return truth
 
 
 def recall_at_k(got_ids: list[int], truth_ids: np.ndarray, k: int) -> float:
@@ -287,12 +314,15 @@ def bench_qdrant(base, queries, truth, cfg) -> dict:
                 wait=True,
             )
         ingest_us = (time.perf_counter() - ingest_start) * 1e6
-        # Wait for the HNSW graph to finish indexing (Qdrant builds async).
+        # Wait for Qdrant to finish optimizing (it builds HNSW async). A GREEN
+        # status means optimization is complete; indexed_vectors_count stays 0
+        # for small collections that Qdrant keeps in a plain (still searchable)
+        # segment, so it is not a reliable readiness signal.
         build_start = time.perf_counter()
-        deadline = build_start + 600
+        deadline = build_start + 300
         while time.perf_counter() < deadline:
             info = client.get_collection(coll)
-            if info.status == qmodels.CollectionStatus.GREEN and (info.indexed_vectors_count or 0) >= n:
+            if info.status == qmodels.CollectionStatus.GREEN:
                 break
             time.sleep(0.5)
         build_us = (time.perf_counter() - build_start) * 1e6
@@ -365,15 +395,19 @@ def bench_lancedb(base, queries, truth, cfg) -> dict:
         build_us = (time.perf_counter() - build_start) * 1e6
     except Exception as exc:  # noqa: BLE001
         return {**engine, "status": "not_available", "reason": f"load/build failed: {exc}"}
+    # LanceDB's IVF_HNSW_SQ scalar-quantizes vectors, so recall is recovered by
+    # `refine_factor` (re-rank the over-fetched candidates against exact vectors)
+    # — the documented high-recall knob — not by ef/nprobes. Sweep refine_factor
+    # to trace its recall/latency curve, the LanceDB analogue of ef_search.
     points = []
-    for ef in cfg["ef_search_list"]:
+    for refine in cfg["lancedb_refine_list"]:
         def run_query(q):
             return (
                 table.search(q.tolist())
                 .metric("l2")
                 .limit(k)
                 .nprobes(cfg["lancedb_nprobes"])
-                .refine_factor(1)
+                .refine_factor(refine)
                 .to_list()
             )
         try:
@@ -386,15 +420,17 @@ def bench_lancedb(base, queries, truth, cfg) -> dict:
                 got = [int(r["id"]) for r in res]
                 latencies.append((time.perf_counter() - t0) * 1e6)
                 recalls.append(recall_at_k(got, truth[qi], k))
-            pt = summarize_point(recalls, latencies, ef)
-            pt["ef_search_note"] = "lancedb ef passed via index ef; nprobes fixed"
+            pt = summarize_point(recalls, latencies, None)
+            pt["refine_factor"] = refine
+            pt["nprobes"] = cfg["lancedb_nprobes"]
             points.append(pt)
         except Exception as exc:  # noqa: BLE001
-            points.append({"ef_search": ef, "status": "query_failed", "reason": str(exc)})
+            points.append({"refine_factor": refine, "status": "query_failed", "reason": str(exc)})
     return {
         **engine,
         "status": "measured",
         "index": index_kind,
+        "tuning_knob": "refine_factor (IVF+SQ; ef_search not applicable)",
         "server_version": getattr(lancedb, "__version__", "unknown"),
         "config": {"m": cfg["m"], "ef_construction": cfg["ef_construction"], "nprobes": cfg["lancedb_nprobes"]},
         "ingest_us": ingest_us,
@@ -416,6 +452,7 @@ def main() -> int:
     parser.add_argument("--base", type=Path, required=True)
     parser.add_argument("--query", type=Path, required=True)
     parser.add_argument("--groundtruth", type=Path, required=True)
+    parser.add_argument("--groundtruth-mode", choices=["compute", "file"], default="compute")
     parser.add_argument("--n-base", type=int, default=None)
     parser.add_argument("--n-queries", type=int, default=100)
     parser.add_argument("--k", type=int, default=10)
@@ -424,6 +461,7 @@ def main() -> int:
     parser.add_argument("--ef-search-list", default="10,40,64,100,200")
     parser.add_argument("--ultrasql-effective-ef", type=int, default=64)
     parser.add_argument("--lancedb-nprobes", type=int, default=20)
+    parser.add_argument("--lancedb-refine-list", default="1,5,10,20,50")
     parser.add_argument("--engines", default="ultrasql,pgvector,qdrant,lancedb")
     parser.add_argument("--ultrasql-dsn", default=os.environ.get("ULTRASQL_DSN", ""))
     parser.add_argument("--pg-dsn", default=os.environ.get("PG_DSN", ""))
@@ -435,9 +473,18 @@ def main() -> int:
 
     base = read_fvecs(args.base, args.n_base)
     queries = read_fvecs(args.query, args.n_queries)
-    truth = read_ivecs(args.groundtruth, args.n_queries)
     n, dim = base.shape
     print(f"dataset={args.dataset_name} base={n}x{dim} queries={len(queries)} k={args.k}")
+    # Exact ground truth over the loaded base (independent NumPy baseline). The
+    # dataset's own .ivecs file indexes the full 1M corpus and is only valid at
+    # full scale, so computing it here keeps recall correct at every base size.
+    if args.groundtruth_mode == "file" and n == count_fvecs(args.base):
+        truth = read_ivecs(args.groundtruth, args.n_queries)
+        print("ground truth: dataset file (full base loaded)")
+    else:
+        gt_start = time.perf_counter()
+        truth = compute_groundtruth(base, queries, args.k)
+        print(f"ground truth: computed exact k-NN in {time.perf_counter() - gt_start:.1f}s")
 
     cfg = {
         "k": args.k,
@@ -450,6 +497,7 @@ def main() -> int:
         "qdrant_url": args.qdrant_url,
         "lancedb_dir": args.lancedb_dir,
         "lancedb_nprobes": args.lancedb_nprobes,
+        "lancedb_refine_list": [int(x) for x in args.lancedb_refine_list.split(",") if x],
     }
 
     host = host_descriptor()
@@ -492,18 +540,27 @@ def main() -> int:
         if res.get("status") != "measured":
             matched[engine] = {"status": res.get("status"), "reason": res.get("reason")}
             continue
+        candidates = [p for p in res["points"] if "recall_at_k_mean" in p]
         chosen = None
-        for p in res["points"]:
-            if p.get("ef_search") == target_ef and "recall_at_k_mean" in p:
+        # Engines with an ef_search knob: compare at the same ef as UltraSQL.
+        for p in candidates:
+            if p.get("ef_search") == target_ef:
                 chosen = p
                 break
-        if chosen is None:
-            # nearest ef >= target, else the last measured point
-            candidates = [p for p in res["points"] if "recall_at_k_mean" in p]
-            chosen = min(candidates, key=lambda p: abs((p.get("ef_search") or 0) - target_ef)) if candidates else None
+        if chosen is None and candidates:
+            # No matching ef (e.g. LanceDB tunes via refine_factor): pick the
+            # lowest-latency point that still reaches high recall (>= 0.95), so
+            # the engine is represented at a fair high-recall operating point
+            # rather than its weakest one; fall back to its best recall.
+            high_recall = [p for p in candidates if p["recall_at_k_mean"] >= 0.95]
+            if high_recall:
+                chosen = min(high_recall, key=lambda p: p["p50_latency_us"])
+            else:
+                chosen = max(candidates, key=lambda p: p["recall_at_k_mean"])
         if chosen:
             matched[engine] = {
                 "ef_search": chosen.get("ef_search"),
+                "refine_factor": chosen.get("refine_factor"),
                 "recall_at_k_mean": chosen["recall_at_k_mean"],
                 "p50_latency_us": chosen["p50_latency_us"],
                 "p95_latency_us": chosen["p95_latency_us"],

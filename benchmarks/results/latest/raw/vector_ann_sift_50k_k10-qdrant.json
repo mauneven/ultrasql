@@ -1,0 +1,74 @@
+{
+  "config": {
+    "ef_construction": 200,
+    "m": 16
+  },
+  "dataset": "sift",
+  "dims": 128,
+  "engine": "qdrant",
+  "host": {
+    "cpu_model": "Apple M4",
+    "git_commit": "16cb3c27401462132b4d924c36738b7358b861f2",
+    "hostname": "maunevens-Mac-mini.local",
+    "logical_cpus": 10,
+    "machine": "arm64",
+    "os": "macOS-26.5.1-arm64-arm-64bit-Mach-O"
+  },
+  "index": "hnsw",
+  "index_build_us": 2032898.8328110427,
+  "ingest_us": 1095068.4999115765,
+  "k": 10,
+  "metric": "l2",
+  "n_base": 50000,
+  "n_queries": 100,
+  "points": [
+    {
+      "ef_search": 10,
+      "p50_latency_us": 1448.7088192254305,
+      "p95_latency_us": 1936.167012900114,
+      "p99_latency_us": 2410.5000775307417,
+      "queries": 100,
+      "recall_at_k_mean": 0.907,
+      "recall_at_k_min": 0.6
+    },
+    {
+      "ef_search": 40,
+      "p50_latency_us": 1391.8331824243069,
+      "p95_latency_us": 1736.3750375807285,
+      "p99_latency_us": 1816.1670304834843,
+      "queries": 100,
+      "recall_at_k_mean": 0.998,
+      "recall_at_k_min": 0.9
+    },
+    {
+      "ef_search": 64,
+      "p50_latency_us": 1402.6248827576637,
+      "p95_latency_us": 1668.333075940609,
+      "p99_latency_us": 1798.6251041293144,
+      "queries": 100,
+      "recall_at_k_mean": 1.0,
+      "recall_at_k_min": 1.0
+    },
+    {
+      "ef_search": 100,
+      "p50_latency_us": 1403.624890372157,
+      "p95_latency_us": 1719.874795526266,
+      "p99_latency_us": 1819.792203605175,
+      "queries": 100,
+      "recall_at_k_mean": 1.0,
+      "recall_at_k_min": 1.0
+    },
+    {
+      "ef_search": 200,
+      "p50_latency_us": 1511.7500443011522,
+      "p95_latency_us": 1840.708078816533,
+      "p99_latency_us": 1983.8749431073666,
+      "queries": 100,
+      "recall_at_k_mean": 1.0,
+      "recall_at_k_min": 1.0
+    }
+  ],
+  "server_version": "1.18.2",
+  "status": "measured",
+  "wall_seconds": 4.35
+}
