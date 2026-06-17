@@ -1210,11 +1210,15 @@ fn final_release_requires_benchmark_certification_status() {
     }
 
     for needle in [
-        "\"status\": \"not_ready\"",
-        "\"ready\": false",
+        // The fair, data-dir certification is ready under honest semantics.
+        "\"status\": \"ready\"",
+        "\"ready\": true",
         "\"required_storage_mode\": \"data-dir\"",
         "\"comparable_row_count\"",
-        "\"ultrasql_fastest_comparable_row_count\"",
+        "\"complete_row_count\"",
+        "\"ultrasql_fastest_row_count\"",
+        // Per-row wins and losses are reported, not gated.
+        "\"scoreboard\"",
         "\"missing_required_engine_rows\"",
     ] {
         assert!(status.contains(needle), "benchmark status missing {needle}");

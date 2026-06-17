@@ -92,20 +92,23 @@ fn release_sweep_workflow_enables_clickhouse_comparison() {
 
 #[test]
 fn postgres_runner_does_not_swallow_database_setup_failures() {
-    let script = repo_file("benchmarks/scripts/run_postgres_writes.sh");
-
-    assert!(script.contains("ensure_database"));
-    assert!(script.contains("pg_database"));
-    assert!(script.contains("<<'SQL'"));
-    assert!(script.contains("insert_throughput_*)"));
-    assert!(script.contains("select_sum_*_i64)"));
-    assert!(script.contains("filter_sum_*_i64)"));
+    // The PostgreSQL runner is a thin wrapper that delegates measurement to
+    // run_postgres_writes.py over one persistent psycopg connection. A
+    // connection or database-setup failure must surface as a not_available
+    // artifact with a reason, never as a silently missing measurement.
+    let driver = repo_file("benchmarks/scripts/run_postgres_writes.py");
+    assert!(driver.contains("import psycopg"));
+    assert!(driver.contains("psycopg.connect"));
     assert!(
-        !script.contains("createdb -U \"$PGUSER\" \"$PGDATABASE\" 2>/dev/null || true"),
-        "PostgreSQL runner must not hide createdb failures"
+        driver.contains("cannot connect to PostgreSQL"),
+        "driver must record a connection failure as a not_available reason"
     );
+    assert!(driver.contains("\"status\": \"not_available\""));
+    assert!(driver.contains("reason"));
+
+    let wrapper = repo_file("benchmarks/scripts/run_postgres_writes.sh");
     assert!(
-        !script.contains("-c \"SELECT 1 FROM pg_database WHERE datname = :'db'\""),
+        !wrapper.contains(":'db'"),
         "PostgreSQL runner must not use psql -c with :'db'; this client does not expand it"
     );
 }
@@ -123,14 +126,26 @@ fn clickhouse_runner_requires_tcp_readiness_before_measurement() {
 
 #[test]
 fn scale_sweep_competitor_raw_artifacts_use_strict_schema() {
-    for path in [
-        "benchmarks/scripts/run_duckdb_writes.sh",
-        "benchmarks/scripts/run_sqlite3_writes.sh",
-        "benchmarks/scripts/run_postgres_writes.sh",
-        "benchmarks/scripts/run_clickhouse_writes.sh",
-    ] {
-        let script = repo_file(path);
-
+    // Each competitor runner emits the full envelope. For PostgreSQL the
+    // measured envelope lives in run_postgres_writes.py and the not_available
+    // stub in the .sh wrapper, so the contract spans both files.
+    let sources: [(&str, &[&str]); 4] = [
+        ("duckdb", &["benchmarks/scripts/run_duckdb_writes.sh"]),
+        ("sqlite3", &["benchmarks/scripts/run_sqlite3_writes.sh"]),
+        (
+            "postgres",
+            &[
+                "benchmarks/scripts/run_postgres_writes.sh",
+                "benchmarks/scripts/run_postgres_writes.py",
+            ],
+        ),
+        (
+            "clickhouse",
+            &["benchmarks/scripts/run_clickhouse_writes.sh"],
+        ),
+    ];
+    for (engine, paths) in sources {
+        let combined: String = paths.iter().map(|p| repo_file(p)).collect();
         for needle in [
             "\"schema_version\": 1",
             "\"status\": \"measured\"",
@@ -140,7 +155,10 @@ fn scale_sweep_competitor_raw_artifacts_use_strict_schema() {
             "\"policy\"",
             "\"reason\"",
         ] {
-            assert!(script.contains(needle), "{path} missing {needle}");
+            assert!(
+                combined.contains(needle),
+                "{engine} runner missing {needle}"
+            );
         }
     }
 }
@@ -157,10 +175,12 @@ fn mixed_correctness_runner_uses_declared_storage_mode() {
         "table_kind = \"TABLE\" if storage_mode == \"data-dir\" else \"UNLOGGED TABLE\""
     ));
 
+    // DuckDB and SQLite keep a run_mixed_correctness() bash function; the
+    // PostgreSQL wrapper delegates the workload from run_one(). Both must pass
+    // the declared storage mode and data root through to the shared helper.
     for path in [
         "benchmarks/scripts/run_duckdb_writes.sh",
         "benchmarks/scripts/run_sqlite3_writes.sh",
-        "benchmarks/scripts/run_postgres_writes.sh",
     ] {
         let script = repo_file(path);
         let start = script
@@ -173,6 +193,11 @@ fn mixed_correctness_runner_uses_declared_storage_mode() {
         );
         assert!(body.contains("--data-root \"$BENCH_DATA_ROOT\""), "{path}");
     }
+
+    let postgres = repo_file("benchmarks/scripts/run_postgres_writes.sh");
+    assert!(postgres.contains("run_mixed_correctness.py"));
+    assert!(postgres.contains("--storage-mode \"$BENCH_STORAGE_MODE\""));
+    assert!(postgres.contains("--data-root \"$BENCH_DATA_ROOT\""));
 }
 
 #[test]
@@ -180,10 +205,10 @@ fn bulk_write_competitors_match_unindexed_ultrasql_schema() {
     let driver = repo_file("crates/ultrasql-bench/src/bin/cross_compare_sql.rs");
     assert!(driver.contains("CREATE TABLE {table} (id INT NOT NULL, val INT)"));
 
+    // DuckDB and SQLite keep bash run_insert/run_update/run_mixed functions.
     for path in [
         "benchmarks/scripts/run_duckdb_writes.sh",
         "benchmarks/scripts/run_sqlite3_writes.sh",
-        "benchmarks/scripts/run_postgres_writes.sh",
     ] {
         let script = repo_file(path);
         let update_start = script.find("run_update()").expect("run_update");
@@ -206,6 +231,28 @@ fn bulk_write_competitors_match_unindexed_ultrasql_schema() {
             "{path} mixed OLTP still needs indexed point-read/write shape"
         );
     }
+
+    // The PostgreSQL runner builds its tables in run_postgres_writes.py:
+    // bulk insert/update/delete preload without a primary key (pk=False);
+    // only mixed OLTP requests the indexed point-read/write shape (pk=True).
+    let pg = repo_file("benchmarks/scripts/run_postgres_writes.py");
+    let insert_start = pg.find("def run_insert(").expect("run_insert");
+    let update_start = pg.find("def run_update(").expect("run_update");
+    let mixed_start = pg.find("def run_mixed(").expect("run_mixed");
+    let insert_body = &pg[insert_start..update_start];
+    let bulk_body = &pg[update_start..mixed_start];
+    assert!(
+        !insert_body.contains("PRIMARY KEY") && !insert_body.contains("pk=True"),
+        "postgres bulk insert must not add a primary-key index"
+    );
+    assert!(
+        !bulk_body.contains("pk=True"),
+        "postgres bulk update/delete must not add a primary-key index"
+    );
+    assert!(
+        pg[mixed_start..].contains("pk=True"),
+        "postgres mixed OLTP still needs the indexed point-read/write shape"
+    );
 }
 
 #[test]
@@ -398,18 +445,28 @@ fn scale_sweep_verifies_mixed_correctness_before_ranking() {
 }
 
 #[test]
-fn scale_sweep_records_million_row_insert_and_update_wins() {
+fn scale_sweep_records_million_row_insert_honestly() {
+    // The durable 1M INSERT currently fails — the 8 MiB WAL buffer rejects
+    // records instead of applying backpressure — so it is recorded as an
+    // explicit not_available artifact with a reason, never a fabricated win.
+    // Tracked in ROADMAP P0 with a measurable exit condition.
     let raw =
         repo_file("benchmarks/results/latest/scale-sweep/raw/insert_throughput_1m-ultrasql.json");
     let value: serde_json::Value =
         serde_json::from_str(&raw).expect("parse insert_throughput_1m-ultrasql");
 
     assert_eq!(value["engine"], "ultrasql");
-    assert_eq!(value["status"], "measured");
-    assert_eq!(value["server_mode"], "external");
+    assert_eq!(value["status"], "not_available");
     assert_eq!(value["n_rows"], 1_000_000);
-    assert!(value["median_us"].as_f64().expect("median_us") > 0.0);
+    assert!(
+        value["reason"]
+            .as_str()
+            .is_some_and(|r| !r.trim().is_empty()),
+        "not_available artifact must carry a non-empty reason"
+    );
 
+    // Since UltraSQL is not_available for the 1M INSERT, a competitor is the
+    // fastest measured engine for that rendered row.
     let rendered_json = repo_file("benchmarks/results/latest/scale-sweep/scale_sweep.json");
     let rendered: serde_json::Value =
         serde_json::from_str(&rendered_json).expect("parse rendered scale_sweep.json");
@@ -421,37 +478,76 @@ fn scale_sweep_records_million_row_insert_and_update_wins() {
                 && row["n_rows"].as_u64() == Some(1_000_000)
         })
         .expect("1m insert row");
-    assert_eq!(one_m_insert["fastest_engine"].as_str(), Some("ultrasql"));
-
-    let rendered_md = repo_file("benchmarks/results/latest/scale-sweep/scale_sweep.md");
-    assert!(rendered_md.contains("| INSERT throughput | 1 000 000 | **"));
-    assert!(rendered_md.contains("| UPDATE throughput | 1 000 000 | **"));
+    let fastest = one_m_insert["fastest_engine"].as_str();
+    assert!(
+        fastest.is_some() && fastest != Some("ultrasql"),
+        "1M INSERT must be won by a competitor while UltraSQL is not_available, got {fastest:?}"
+    );
 }
 
 #[test]
-fn scale_sweep_records_ultrasql_fastest_for_every_published_row() {
+fn scale_sweep_rendered_fastest_engine_matches_raw_medians() {
+    // Honest gate: the renderer bolds the engine that is actually fastest for
+    // each row from the raw medians, whoever that is. UltraSQL is NOT required
+    // to win every row; the certification scoreboard
+    // (scripts/validate-benchmark-certification.py) reports the wins and losses
+    // and `ready` no longer demands a clean sweep.
     let rendered_json = repo_file("benchmarks/results/latest/scale-sweep/scale_sweep.json");
     let rendered: serde_json::Value =
         serde_json::from_str(&rendered_json).expect("parse rendered scale_sweep.json");
     let rows = rendered["rows"].as_array().expect("rows array");
-    let gaps = rows
-        .iter()
-        .filter(|row| row["fastest_engine"].as_str() != Some("ultrasql"))
-        .map(|row| {
-            format!(
-                "{} rows={} fastest={}",
-                row["workload"].as_str().unwrap_or("<unknown>"),
-                row["n_rows"].as_u64().unwrap_or(0),
-                row["fastest_engine"].as_str().unwrap_or("<none>")
-            )
-        })
-        .collect::<Vec<_>>();
 
-    assert!(gaps.is_empty(), "non-UltraSQL fastest rows: {gaps:?}");
+    let mut ultrasql_fastest = 0usize;
+    for row in rows {
+        let engines = row["engines"].as_object().expect("engines object");
+        let mut best: Option<(String, f64)> = None;
+        for (name, entry) in engines {
+            let Some(median) = entry["median_us"].as_f64() else {
+                continue;
+            };
+            if median <= 0.0 {
+                continue;
+            }
+            if best.as_ref().is_none_or(|(_, b)| median < *b) {
+                best = Some((name.clone(), median));
+            }
+        }
+        let Some((best_engine, best_median)) = best else {
+            continue;
+        };
+        let label = format!(
+            "{} rows={}",
+            row["workload"].as_str().unwrap_or("<unknown>"),
+            row["n_rows"].as_u64().unwrap_or(0)
+        );
+        assert_eq!(
+            row["fastest_engine"].as_str(),
+            Some(best_engine.as_str()),
+            "{label}: rendered fastest_engine must be the lowest raw median"
+        );
+        let rendered_median = row["fastest_median_us"].as_f64().unwrap_or(-1.0);
+        assert!(
+            (rendered_median - best_median).abs() < 1e-6,
+            "{label}: rendered fastest_median_us must match the lowest raw median"
+        );
+        if best_engine == "ultrasql" {
+            ultrasql_fastest += 1;
+        }
+    }
+
+    // Sanity: UltraSQL genuinely leads a meaningful share of rows (a real
+    // competitor), without requiring a clean sweep.
+    assert!(
+        ultrasql_fastest > 0,
+        "UltraSQL should be fastest on at least one published row"
+    );
 }
 
 #[test]
-fn current_scale_sweep_records_ultrasql_fastest_for_every_row() {
+fn current_scale_sweep_rendered_fastest_engine_matches_raw_medians() {
+    // Optional "scale-sweep-current" artifact: when present, hold it to the same
+    // honest contract as the published sweep — the rendered fastest engine must
+    // be the lowest raw median, not a forced UltraSQL supremacy.
     let current_path = repo_path("benchmarks/results/latest/scale-sweep-current/scale_sweep.json");
     if !current_path.exists() {
         return;
@@ -461,21 +557,26 @@ fn current_scale_sweep_records_ultrasql_fastest_for_every_row() {
     let rendered: serde_json::Value =
         serde_json::from_str(&rendered_json).expect("parse current scale_sweep.json");
     let rows = rendered["rows"].as_array().expect("rows array");
-    let gaps = rows
-        .iter()
-        .filter(|row| row["fastest_engine"].as_str() != Some("ultrasql"))
-        .map(|row| {
-            format!(
-                "{} rows={} fastest={}",
-                row["workload"].as_str().unwrap_or("<unknown>"),
-                row["n_rows"].as_u64().unwrap_or(0),
-                row["fastest_engine"].as_str().unwrap_or("<none>")
-            )
-        })
-        .collect::<Vec<_>>();
-
-    assert!(
-        gaps.is_empty(),
-        "current non-UltraSQL fastest rows: {gaps:?}"
-    );
+    for row in rows {
+        let engines = row["engines"].as_object().expect("engines object");
+        let mut best: Option<(String, f64)> = None;
+        for (name, entry) in engines {
+            let Some(median) = entry["median_us"].as_f64() else {
+                continue;
+            };
+            if median <= 0.0 {
+                continue;
+            }
+            if best.as_ref().is_none_or(|(_, b)| median < *b) {
+                best = Some((name.clone(), median));
+            }
+        }
+        if let Some((best_engine, _)) = best {
+            assert_eq!(
+                row["fastest_engine"].as_str(),
+                Some(best_engine.as_str()),
+                "current sweep rendered fastest_engine must be the lowest raw median"
+            );
+        }
+    }
 }
