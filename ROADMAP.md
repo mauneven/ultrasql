@@ -191,14 +191,29 @@ checked tests, and `docs/hybrid-search.md`. Open items below carry the
 measured baseline taken on 2026-06-16 (unfiltered HNSW recall@10 = 0.998 at
 p50 ≈ 257 µs on 2k×16d via `benchmarks/vector_ann_hnsw.sh`):
 
+- **Persistent HNSW search is exact, not approximate** (foundational): the
+  server's `PageBackedHnswIndex::search`
+  (`crates/ultrasql-storage/src/access_method.rs`) iterates every live node and
+  computes the distance — an exact brute-force scan — even though the page-backed
+  arena persists the navigable graph (`entry_node`, per-node neighbor lists). The
+  approximate graph traversal exists only in the in-process runtime `HnswIndex`,
+  which is what `benchmarks/vector_ann_hnsw.sh` measures (recall@10≈0.998); the
+  server does not use it. So persistent `ORDER BY vector_distance LIMIT k` is
+  exact (recall 1.0) but O(N) per query — no ANN speedup at scale. `HnswIndex`
+  now has a per-query `search_with_ef` knob. Exit condition: a page-backed
+  approximate graph search (read-only traversal of the persisted neighbors with a
+  per-query `ef_search`) with a committed `recall@k`-vs-latency artifact from the
+  server wire path (not the in-process index), all recovery tests green.
 - Filtered ANN (PART 2): `WHERE … ORDER BY vector_distance LIMIT k` currently
   lowers as `Sort(Filter(Scan))`, which the ANN matcher does not recognize, so
   filtered vector queries fall back to exact brute force (recall 1.0, no ANN
-  speedup). Exit condition: a selectivity-aware crossover (pre-filter exact for
-  selective predicates, ANN over-fetch + post-filter for loose ones, with a
-  documented threshold) plus a committed `recall@10`-vs-exact artifact across
-  0.1 %/1 %/10 %/100 % selectivities where recall stays within a documented
-  bound at every selectivity, and planner tests for the crossover.
+  speedup). This is also blocked by the exact-persistent-search item above: a
+  selectivity-aware over-fetch crossover only delivers value once persistent
+  search is approximate. Exit condition: a selectivity-aware crossover
+  (pre-filter exact for selective predicates, ANN over-fetch + post-filter for
+  loose ones, with a documented threshold) plus a committed `recall@10`-vs-exact
+  artifact across 0.1 %/1 %/10 %/100 % selectivities where recall stays within a
+  documented bound at every selectivity, and planner tests for the crossover.
 - Online vector-index MVCC + recovery (PART 3): the HNSW/IVFFlat index is
   invalidated and rebuilt on DML rather than reflecting committed MVCC state
   online. Exit condition: a recovery test proving the index matches the heap
