@@ -1,0 +1,68 @@
+{
+  "dims": 16,
+  "engine": "ultrasql",
+  "host": {
+    "cpu_model": "Apple M4",
+    "git_commit": "64b3977e1381f1eb61e6734da6d2000171187417",
+    "hostname": "maunevens-Mac-mini.local",
+    "logical_cpus": 10,
+    "machine": "arm64",
+    "os": "macOS-26.5.1-arm64-arm-64bit-Mach-O",
+    "rustc": "rustc 1.95.0 (59807616e 2026-04-14)"
+  },
+  "index": "hnsw",
+  "index_build_us": 32604568.250011653,
+  "ingest_us": 278344.20814178884,
+  "k": 10,
+  "metric": "l2",
+  "n_rows": 20000,
+  "per_selectivity": [
+    {
+      "bucket_threshold": 1,
+      "matching_rows": 16,
+      "p50_latency_us": 23963.20807747543,
+      "p95_latency_us": 24495.541118085384,
+      "p99_latency_us": 76447.16696813703,
+      "recall_at_k_mean": 1.0,
+      "recall_at_k_min": 1.0,
+      "selectivity": "0.1%"
+    },
+    {
+      "bucket_threshold": 10,
+      "matching_rows": 215,
+      "p50_latency_us": 24134.00006480515,
+      "p95_latency_us": 25002.70796008408,
+      "p99_latency_us": 47481.41602613032,
+      "recall_at_k_mean": 1.0,
+      "recall_at_k_min": 1.0,
+      "selectivity": "1%"
+    },
+    {
+      "bucket_threshold": 100,
+      "matching_rows": 2073,
+      "p50_latency_us": 855.8749686926603,
+      "p95_latency_us": 25324.083166196942,
+      "p99_latency_us": 25664.54210318625,
+      "recall_at_k_mean": 0.9620000000000001,
+      "recall_at_k_min": 0.7,
+      "selectivity": "10%"
+    },
+    {
+      "bucket_threshold": 1000,
+      "matching_rows": 20000,
+      "p50_latency_us": 828.790944069624,
+      "p95_latency_us": 1148.6250441521406,
+      "p99_latency_us": 1270.7500718533993,
+      "recall_at_k_mean": 0.972,
+      "recall_at_k_min": 0.7,
+      "selectivity": "100%"
+    }
+  ],
+  "policy": "Recall@k is reported with p50/p95/p99 latency at every selectivity; the exact baseline is an independent NumPy brute-force over the same filtered set. A recall floor holding across selectivities is the no-cliff property.",
+  "queries": 50,
+  "recall_at_k_floor": 0.9620000000000001,
+  "schema_version": 1,
+  "server_version": "PostgreSQL 14.0 (UltraSQL 0.0.9)",
+  "status": "measured",
+  "workload": "filtered_ann_recall_20000_16d_k10"
+}
