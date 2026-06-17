@@ -662,6 +662,70 @@ async fn hnsw_index_after_insert_keeps_top_k_correct() {
 }
 
 #[tokio::test]
+async fn hnsw_filtered_top_k_returns_correct_filtered_neighbors() {
+    // WHERE <predicate> ORDER BY embedding <-> probe LIMIT k must return the
+    // true filtered nearest neighbors through the selectivity-aware filtered-ANN
+    // path. 200 rows on a line with ef_search default 64 means the over-fetch
+    // path traverses the graph (approximate) rather than scanning exhaustively;
+    // the post-filter + fallback keep the result exact.
+    let (client, _conn, server_handle) = start_server_and_connect().await;
+
+    client
+        .batch_execute("CREATE TABLE fdocs (id INT NOT NULL, kind INT, embedding VECTOR(2))")
+        .await
+        .expect("create vector table");
+    let mut values = String::new();
+    for i in 0..200 {
+        if i > 0 {
+            values.push(',');
+        }
+        values.push_str(&format!("({i}, {}, '[{i},0]')", i % 4));
+    }
+    client
+        .batch_execute(&format!("INSERT INTO fdocs VALUES {values}"))
+        .await
+        .expect("insert rows");
+    client
+        .batch_execute("CREATE INDEX fdocs_emb_hnsw ON fdocs USING hnsw (embedding)")
+        .await
+        .expect("create hnsw index");
+
+    // Loose filter (kind = 0, ~25%): nearest kind-0 ids to x=61 are 60 (d1),
+    // 64 (d3), 56 (d5). The over-fetch ANN path must surface exactly those.
+    let loose = client
+        .simple_query(
+            "SELECT id FROM fdocs WHERE kind = 0 \
+             ORDER BY embedding <-> VECTOR '[61,0]' LIMIT 3",
+        )
+        .await
+        .expect("loose filtered query");
+    assert_eq!(
+        simple_rows(&loose),
+        vec![
+            vec!["60".to_owned()],
+            vec!["64".to_owned()],
+            vec!["56".to_owned()],
+        ],
+    );
+
+    // Selective conjunctive filter (id in [30,32]): nearest to x=40 are 32 (d8),
+    // 31 (d9). The crossover still returns the exact filtered top-k.
+    let selective = client
+        .simple_query(
+            "SELECT id FROM fdocs WHERE id >= 30 AND id <= 32 \
+             ORDER BY embedding <-> VECTOR '[40,0]' LIMIT 2",
+        )
+        .await
+        .expect("selective filtered query");
+    assert_eq!(
+        simple_rows(&selective),
+        vec![vec!["32".to_owned()], vec!["31".to_owned()]],
+    );
+
+    shutdown(client, server_handle).await;
+}
+
+#[tokio::test]
 async fn ann_quantized_payload_options_work_through_sql_indexes() {
     let (client, _conn, server_handle) = start_server_and_connect().await;
 

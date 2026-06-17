@@ -5,7 +5,9 @@ use std::sync::Arc;
 
 use ultrasql_catalog::{CatalogSnapshot, IndexEntry, TableEntry};
 use ultrasql_core::{BlockNumber, DataType, Field, RelationId, Schema, TupleId, Value};
-use ultrasql_executor::{Filter, IndexOnlyScan, IndexScan, Limit, Operator, RowCodec, TopK};
+use ultrasql_executor::{
+    Eval, Filter, IndexOnlyScan, IndexScan, Limit, Operator, RowCodec, TopK,
+};
 use ultrasql_mvcc::{InfoMask, TupleHeader, Visibility, is_visible};
 use ultrasql_planner::{BinaryOp, LogicalIndexMethod, LogicalPlan, ScalarExpr, SortKey};
 use ultrasql_storage::access_method::{
@@ -348,6 +350,230 @@ fn hnsw_column_probe(
         return None;
     };
     Some((*index, metric, values.clone()))
+}
+
+// Filtered-ANN crossover tuning. The over-fetch budget is sized to the filter:
+// to surface `k` survivors when a fraction `s` of rows pass, explore roughly
+// `k / s` candidates with a safety multiplier. Below the floor the search is
+// effectively exact (small ef); above the ceiling a very selective filter is
+// better served by the exact filter+sort path.
+const FILTERED_ANN_OVERFETCH: usize = 4;
+const FILTERED_ANN_MIN_EF: usize = 64;
+const FILTERED_ANN_MAX_EF: usize = 8192;
+
+/// Try to lower `WHERE <predicate> ORDER BY vector_distance LIMIT k`
+/// (`Sort(Filter(Scan))`, optionally under a `Project`) through an HNSW index
+/// with a selectivity-aware crossover.
+///
+/// Loose filters use ANN over-fetch + post-filter (fast, no full scan); very
+/// selective filters, or cases where too few ANN candidates survive the filter,
+/// return `Ok(None)` so the caller uses the exact filter+sort path (recall 1.0).
+/// The fallback is what keeps recall from collapsing at any selectivity.
+pub(super) fn try_hnsw_filtered_top_k_limit(
+    input: &LogicalPlan,
+    limit: u64,
+    offset: u64,
+    ctx: &LowerCtx<'_>,
+) -> Result<Option<Box<dyn Operator>>, ServerError> {
+    if offset != 0 || limit == 0 || limit == u64::MAX {
+        return Ok(None);
+    }
+    let limit = usize::try_from(limit).unwrap_or(usize::MAX);
+    match input {
+        LogicalPlan::Sort {
+            input: sort_input,
+            keys,
+        } => try_hnsw_filtered_sorted(sort_input, keys, limit, ctx),
+        LogicalPlan::Project {
+            input: project_input,
+            exprs,
+            ..
+        } => {
+            let LogicalPlan::Sort {
+                input: sort_input,
+                keys,
+            } = project_input.as_ref()
+            else {
+                return Ok(None);
+            };
+            let Some(scan) = try_hnsw_filtered_sorted(sort_input, keys, limit, ctx)? else {
+                return Ok(None);
+            };
+            lower_project_columns(scan, exprs).map(Some)
+        }
+        _ => Ok(None),
+    }
+}
+
+fn try_hnsw_filtered_sorted(
+    sort_input: &LogicalPlan,
+    keys: &[SortKey],
+    limit: usize,
+    ctx: &LowerCtx<'_>,
+) -> Result<Option<Box<dyn Operator>>, ServerError> {
+    let [key] = keys else {
+        return Ok(None);
+    };
+    if !key.asc {
+        return Ok(None);
+    }
+    let LogicalPlan::Filter {
+        input: filter_input,
+        predicate,
+    } = sort_input
+    else {
+        return Ok(None);
+    };
+    let LogicalPlan::Scan {
+        table, projection, ..
+    } = filter_input.as_ref()
+    else {
+        return Ok(None);
+    };
+    if projection.is_some() {
+        return Ok(None);
+    }
+    let Some(table_entry) = ctx.catalog_snapshot.tables.get(&table.to_ascii_lowercase()) else {
+        return Ok(None);
+    };
+    let Some((col_idx, metric, probe)) = match_hnsw_sort_key(&key.expr) else {
+        return Ok(None);
+    };
+    // Only the HNSW index exposes the per-query ef over-fetch knob; other index
+    // kinds fall back to the exact filter+sort path.
+    let Some(hnsw) = find_hnsw_index(ctx, table_entry, col_idx, metric) else {
+        return Ok(None);
+    };
+
+    // Size the exploration budget to the estimated filter selectivity.
+    let selectivity = estimate_filter_selectivity(predicate).clamp(0.0001, 1.0);
+    let want = (limit.saturating_mul(FILTERED_ANN_OVERFETCH)) as f64 / selectivity;
+    // Very selective filter: ANN would have to explore beyond the ceiling to
+    // surface k survivors, so exact filter+sort is both correct and faster.
+    if want > FILTERED_ANN_MAX_EF as f64 {
+        return Ok(None);
+    }
+    let clamped = want.clamp(FILTERED_ANN_MIN_EF as f64, FILTERED_ANN_MAX_EF as f64).ceil();
+    // INVARIANT: `clamped` is finite and within [MIN_EF, MAX_EF], both small
+    // positive usizes, so the cast cannot truncate or lose sign.
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    let ef = clamped as usize;
+
+    let hits = hnsw
+        .search_with_ef(&probe, ef, ef)
+        .map_err(|e| ServerError::ddl(format!("HNSW filtered search: {e}")))?
+        .into_iter()
+        .map(|hit| VectorSearchHit { tid: hit.tid })
+        .collect::<Vec<_>>();
+    if hits.is_empty() {
+        return Ok(None);
+    }
+    let predicate_eval = Eval::new(predicate.clone());
+    let payloads = fetch_vector_visible_filtered_payloads(
+        &hits,
+        table_entry,
+        col_idx,
+        metric,
+        &probe,
+        &predicate_eval,
+        limit,
+        ctx,
+    )?;
+    // Too few survived the filter (the estimate was optimistic): fall back to
+    // exact so recall cannot collapse.
+    if payloads.len() < limit {
+        return Ok(None);
+    }
+    let codec = RowCodec::new(table_entry.schema.clone());
+    Ok(Some(Box::new(IndexScan::new(payloads, codec))))
+}
+
+/// Self-contained predicate selectivity heuristic for the filtered-ANN
+/// crossover, mirroring the optimizer's stats-free formulas. The estimate only
+/// sizes the over-fetch budget; correctness is guaranteed by the exact
+/// fallback when too few candidates survive.
+fn estimate_filter_selectivity(pred: &ScalarExpr) -> f64 {
+    const EQ_SEL: f64 = 0.1;
+    const RANGE_SEL: f64 = 0.33;
+    const DEFAULT_SEL: f64 = 0.5;
+    match pred {
+        ScalarExpr::Binary { op, left, right, .. } => match op {
+            BinaryOp::Eq => EQ_SEL,
+            BinaryOp::NotEq => 1.0 - EQ_SEL,
+            BinaryOp::Lt | BinaryOp::LtEq | BinaryOp::Gt | BinaryOp::GtEq => RANGE_SEL,
+            BinaryOp::And => estimate_filter_selectivity(left) * estimate_filter_selectivity(right),
+            BinaryOp::Or => {
+                let l = estimate_filter_selectivity(left);
+                let r = estimate_filter_selectivity(right);
+                1.0 - (1.0 - l) * (1.0 - r)
+            }
+            BinaryOp::JsonContains
+            | BinaryOp::JsonContained
+            | BinaryOp::JsonHasKey
+            | BinaryOp::JsonHasAnyKey
+            | BinaryOp::JsonHasAllKeys => EQ_SEL,
+            _ => DEFAULT_SEL,
+        },
+        _ => DEFAULT_SEL,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn fetch_vector_visible_filtered_payloads(
+    hits: &[VectorSearchHit],
+    table_entry: &TableEntry,
+    col_idx: usize,
+    metric: HnswMetric,
+    probe: &[f32],
+    predicate: &Eval,
+    limit: usize,
+    ctx: &LowerCtx<'_>,
+) -> Result<Vec<Vec<u8>>, ServerError> {
+    let codec = RowCodec::new(table_entry.schema.clone());
+    let mut rows: Vec<(f32, TupleId, Vec<u8>)> = Vec::new();
+    for hit in hits {
+        let tuple = ctx
+            .heap
+            .fetch(hit.tid)
+            .map_err(|e| ServerError::ddl(format!("filtered ANN heap fetch: {e}")))?;
+        if !matches!(
+            is_visible(&tuple.header, &ctx.snapshot, ctx.oracle.as_ref()),
+            Visibility::Visible
+        ) {
+            continue;
+        }
+        let row = codec
+            .decode(&tuple.data)
+            .map_err(|e| ServerError::ddl(format!("filtered ANN heap decode: {e}")))?;
+        match predicate.eval(&row) {
+            Ok(Value::Bool(true)) => {}
+            Ok(Value::Bool(false) | Value::Null) => continue,
+            Ok(other) => {
+                return Err(ServerError::ddl(format!(
+                    "filtered ANN predicate must be boolean, got {:?}",
+                    other.data_type()
+                )));
+            }
+            Err(e) => {
+                return Err(ServerError::ddl(format!("filtered ANN predicate eval: {e}")));
+            }
+        }
+        let Some(Value::Vector(vector) | Value::HalfVec(vector)) = row.get(col_idx) else {
+            return Err(ServerError::ddl(
+                "filtered ANN recheck: key column did not decode as vector or halfvec",
+            ));
+        };
+        if vector.len() != probe.len() {
+            return Err(ServerError::ddl(
+                "filtered ANN recheck: vector dimension mismatch",
+            ));
+        }
+        let distance = metric_distance(metric, vector, probe);
+        rows.push((distance, hit.tid, tuple.data));
+    }
+    rows.sort_by(|left, right| left.0.total_cmp(&right.0).then_with(|| left.1.cmp(&right.1)));
+    rows.truncate(limit);
+    Ok(rows.into_iter().map(|(_, _, payload)| payload).collect())
 }
 
 fn find_hnsw_index(
