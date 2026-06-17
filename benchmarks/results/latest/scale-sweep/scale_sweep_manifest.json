@@ -8,7 +8,7 @@
   },
   "host": {
     "cpu_model": "Apple M4",
-    "git_commit": "1e65211d5ae7dd5710a05502e5ef5fbad7d995e8",
+    "git_commit": "77a92d7c711cdc4d709d6291ab6a07781649693d",
     "hostname": "maunevens-Mac-mini.local",
     "logical_cpus": 10,
     "machine": "arm64",

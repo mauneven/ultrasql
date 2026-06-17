@@ -3,7 +3,7 @@
   "engine": "ultrasql",
   "n_rows": 1000000,
   "policy": "Failure is recorded as not_available; no benchmark claim is made for this row.",
-  "reason": "Error: INSERT chunk INTO bench_insert_0\n\nCaused by:\n    0: db error\n    1: ERROR: execution error: type mismatch: wal sink: wal sink rejected record: WalBuffer rejected record: wal buffer full: have 8383400 bytes used of 8388608",
+  "reason": "Error: INSERT chunk INTO bench_insert_0\n\nCaused by:\n    0: db error\n    1: ERROR: execution error: type mismatch: wal sink: wal sink rejected record: WalBuffer rejected record: wal buffer full: have 8386518 bytes used of 8388608",
   "schema_version": 1,
   "server_mode": "external",
   "status": "not_available",
