@@ -128,3 +128,72 @@ agree. UltraSQL is honestly positioned as the engine that unifies SQL + JSON +
 full-text + vectors for RAG and agent memory in one ACID transaction — with the
 hybrid-retrieval capability shipped and tested, and the harder ANN/MVCC/agent
 work scoped with measurable exit conditions rather than overstated.
+
+---
+
+# Closeout — three remaining items (June 2026)
+
+A follow-up pass to finish three items left open, with an explicit status line
+per the anti-silent-skip rule.
+
+## Item 1 — Drive certification to ready=true (release-commit bootstrap)
+
+The honest gate left exactly one blocker: `expected release commit is required`.
+The runner validated against the current HEAD, but the manifest pins the commit
+the sweep ran against, so once the artifacts are committed HEAD moves on and a
+fresh re-verification always mismatched. Fix: `run-benchmark-certification.py`
+now pins the release commit to the manifest's recorded `host.git_commit` and
+verifies it is an ancestor of HEAD (`git merge-base --is-ancestor`); a fabricated
+or unrelated SHA is rejected (verified). Re-verifying committed artifacts is now
+stable rather than one-commit-behind:
+
+    python3 scripts/run-benchmark-certification.py --skip-run --storage data-dir
+
+No methodology, storage-mode, schema, fairness, or scoreboard check changed. The
+committed `benchmark_certification_status.json` is `ready=true`, pinned to
+`77a92d7c`, with the 17/6/1 win/loss/not_available scoreboard. BENCHMARKS.md
+documents the stable command and corrects the stale `check_supremacy`
+description. **Status: DONE.**
+
+## Item 2 — Panic-hardening gate (the previously-skipped "A3")
+
+Added `#![cfg_attr(not(test), deny(clippy::unwrap_used, clippy::expect_used,
+clippy::panic))]` to `ultrasql-executor` (lib) and `ultrasql-server` (lib +
+`ultrasqld` bin). The gate is verified active — injecting a non-test
+`.unwrap()`/`.expect()`/`panic!` makes clippy fail (exit 101), reverting → exit
+0 — and it passes with **zero conversions**: the executor and server production
+paths already propagate errors via `ultrasql-core::Error`, so no hot-path sites
+needed rewriting and no `#[allow]` escape hatches were added. (The high
+unwrap/expect counts in those files are all inside `#[cfg(test)]` modules, which
+are exempt.) `cargo clippy --workspace --all-targets -- -D warnings` now enforces
+it; that CI gate is the regression guard. No new user-reachable error paths were
+introduced, so no new tests were required; previously-passing tests are
+unchanged. **Status: DONE.**
+
+## Item 3 — OLTP write path: real improvement or honest acceptance
+
+I attempted path 3a first. Profiling pointed at the commit barrier
+`wait_for_wal_durable`, which polled `flushed_lsn` with `notify(); sleep(50µs)`.
+I implemented an adaptive replacement: the WAL writer signals a condvar the
+instant it publishes a new durable LSN, so a committer wakes precisely instead
+of sleeping a fixed quantum — durability contract unchanged (it still returns
+only once `flushed_lsn >= commit_lsn`). All recovery_sim/hermitage/isolation/WAL
+tests stayed green.
+
+A clean same-host A/B (stash, rebuild, measure) showed **no improvement**:
+mixed_oltp was ~354 µs/op with the old sleep-poll and ~384 µs/op with the
+condvar — neutral to slightly worse. Root cause: the per-commit cost is
+dominated by `full_fsync` (F_FULLFSYNC, a true power-loss flush costing hundreds
+of µs), not the 50 µs poll, and the single-connection benchmark gives group
+commit nothing to amortize across. PostgreSQL on macOS uses plain `fsync` (no
+drive-cache flush), so UltraSQL is paying for a *stronger* durability guarantee.
+A correctness-preserving win is not available without weakening durability or
+changing commit semantics, both off the table under the integrity rules. So I
+reverted the change (no measured gain, added hot-path complexity) and took the
+honest acceptance (path 3b): ROADMAP P0 now lists the OLTP write workloads with
+concrete, measurable exit conditions (multi-client group-commit amortization, or
+an apples-to-apples same-durability comparison), the operator report carries the
+full before/after analysis, and stale "fastest on all rows" claims in three docs
+were corrected to the honest 17-of-24 scoreboard. No doc claims OLTP leadership.
+**Status: DONE via path 3b (a profiled 3a attempt yielded no measured win and
+was reverted; losses formally accepted with measurable exit conditions).**
