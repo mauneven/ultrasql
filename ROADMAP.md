@@ -187,7 +187,11 @@ Shipped: single-query hybrid retrieval fusing vector similarity, BM25 lexical
 relevance, and SQL/JSON metadata filters via
 `ORDER BY hybrid_search(text, query, vector, probe[, fusion]) DESC LIMIT k`,
 with Reciprocal Rank Fusion (`'rrf'`) and weighted-linear fusion, reference-
-checked tests, and `docs/hybrid-search.md`. Open items below carry the
+checked tests, and `docs/hybrid-search.md`. Also shipped: transactional
+embedding consistency — text+vector+metadata in one transaction, online
+vector-index MVCC with crash + WAL-replay recovery, embedding versioning, and
+bring-your-own-vectors (see DONE.md "Transactional Embedding Consistency" and
+`docs/transactional-embeddings.md`). Open items below carry the
 measured baseline taken on 2026-06-16 (unfiltered HNSW recall@10 = 0.998 at
 p50 ≈ 257 µs on 2k×16d via `benchmarks/vector_ann_hnsw.sh`):
 
@@ -199,12 +203,6 @@ p50 ≈ 257 µs on 2k×16d via `benchmarks/vector_ann_hnsw.sh`):
   vector columns still use the exact filter+sort path — exit condition: a
   probes-based IVFFlat over-fetch with a committed recall artifact; (c) larger
   recall/latency artifacts (SIFT1M scale) from the server wire path.
-- Online vector-index MVCC + recovery (PART 3): the HNSW/IVFFlat index is
-  invalidated and rebuilt on DML rather than reflecting committed MVCC state
-  online. Exit condition: a recovery test proving the index matches the heap
-  after `update text+embedding+metadata in one txn → crash → restart → WAL
-  replay`, plus an embedding-generation/versioning migration test proving
-  readers stay consistent during re-embedding.
 - Agent memory primitives (PART 4): exit condition: tenant/namespace isolation
   enforced and tested under concurrency (no cross-tenant leakage), deterministic
   time-decay ranking (`relevance × decay(age)`), and TTL/decay eviction as

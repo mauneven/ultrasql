@@ -27,6 +27,32 @@ as a concise evidence ledger; roadmap stays for open gates only.
   floor 0.962 across 0.1 %/1 %/10 %/100 % selectivities, 20k×16d on Apple M4,
   reproduce with `benchmarks/filtered_ann_recall.sh`).
 
+## Transactional Embedding Consistency
+
+- Text + vector + metadata commit (or roll back) in **one transaction**, and the
+  vector index reflects committed MVCC state only. The unfiltered top-k path now
+  over-fetches candidates and rechecks heap visibility (then exact-sort fallback
+  when too few survive), so an aborted or update-superseded tuple near the probe
+  can no longer occupy a result slot and starve the answer below `k` live rows.
+  Evidence: `crates/ultrasql-server/src/pipeline/index_scan.rs`
+  (`try_hnsw_sorted_scan` over-fetch + `PageBackedHnswIndex::ef_search()` floor),
+  test `rolled_back_embedding_update_does_not_affect_vector_search`.
+- Crash recovery: the page-backed, WAL-logged HNSW index agrees with the heap
+  after crash + WAL replay. A committed one-transaction text+vector+metadata
+  update is reflected in nearest-neighbor order, body, and JSON metadata after a
+  process abort and restart. Evidence: test
+  `vector_index_and_heap_agree_after_transactional_update_and_crash`.
+- Re-embedding / embedding versioning: a `model_version` column lets old and new
+  embedding generations coexist during a re-embed migration, each pinned through
+  the filtered-ANN metadata path so readers stay consistent. Evidence: test
+  `embedding_generations_coexist_during_re_embedding_migration`.
+- Bring-your-own-vectors: no embedding model is bundled (no ONNX/Candle/
+  tokenizer/Torch dependency in the workspace) and no hidden network call
+  produces a vector — vectors only enter as caller-supplied literals via
+  `Value::parse_vector`. The single network client (`ureq` in
+  `ultrasql-objectstore`) serves explicit object-store reads only. Docs:
+  `docs/transactional-embeddings.md`.
+
 ## Release And Packaging Automation
 
 - Release workflow builds and attaches release archives for Linux, macOS, and
