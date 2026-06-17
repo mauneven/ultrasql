@@ -10,7 +10,7 @@ set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$REPO_ROOT"
 
-TPCH_DATA_DIR="${TPCH_DATA_DIR:-target/tpch-scale1-real}"
+TPCH_DATA_DIR="${TPCH_DATA_DIR:-${ULTRASQL_BENCH_SCRATCH:-${TMPDIR:-/tmp}/ultrasql-bench}/tpch-scale1-real}"
 POSTGRES_DSN="${POSTGRES_DSN:-}"
 PSQL_BIN="${TPCH_PSQL:-$(command -v psql || true)}"
 RUNS="${TPCH_RUNS:-3}"

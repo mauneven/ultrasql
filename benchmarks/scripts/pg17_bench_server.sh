@@ -18,7 +18,8 @@
 # Environment overrides:
 #   PG17_PREFIX   PostgreSQL 17 install prefix
 #                 (default: /opt/homebrew/opt/postgresql@17, else pg_config)
-#   PG17_DATA     data directory (default: target/pg17-bench-data)
+#   PG17_DATA     data directory
+#                 (default: $ULTRASQL_BENCH_SCRATCH/pg17-bench-data, outside the repo)
 #   PG17_PORT     TCP port (default: 55417)
 #   PG17_DB       benchmark database (default: ultrasql_bench)
 #   PG17_SHARED_BUFFERS / PG17_WORK_MEM / PG17_EFFECTIVE_CACHE_SIZE ...
@@ -35,7 +36,7 @@ if [[ ! -x "$PG17_PREFIX/bin/initdb" ]]; then
     fi
 fi
 PG_BIN="$PG17_PREFIX/bin"
-PG17_DATA="${PG17_DATA:-$REPO_ROOT/target/pg17-bench-data}"
+PG17_DATA="${PG17_DATA:-${ULTRASQL_BENCH_SCRATCH:-${TMPDIR:-/tmp}/ultrasql-bench}/pg17-bench-data}"
 PG17_PORT="${PG17_PORT:-55417}"
 PG17_DB="${PG17_DB:-ultrasql_bench}"
 PG17_USER="${PG17_USER:-$(id -un)}"

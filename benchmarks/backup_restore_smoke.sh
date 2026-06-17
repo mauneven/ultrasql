@@ -10,7 +10,7 @@ set -euo pipefail
 
 PROFILE="${BACKUP_RESTORE_PROFILE:-${1:-smoke}}"
 OUT_DIR="${BACKUP_RESTORE_OUT_DIR:-benchmarks/results/latest}"
-WORK_DIR="${BACKUP_RESTORE_WORK_DIR:-target/backup-restore-smoke}"
+WORK_DIR="${BACKUP_RESTORE_WORK_DIR:-${ULTRASQL_BENCH_SCRATCH:-${TMPDIR:-/tmp}/ultrasql-bench}/backup-restore-smoke}"
 MANIFEST="$OUT_DIR/backup_restore_smoke_manifest.json"
 ULTRASQL_BIN="${ULTRASQL_BIN:-target/release/ultrasql}"
 ULTRASQLD_BIN="${ULTRASQLD_BIN:-target/release/ultrasqld}"

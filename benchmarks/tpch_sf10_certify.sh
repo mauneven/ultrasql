@@ -9,7 +9,7 @@ set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$REPO_ROOT"
 
-TPCH_DATA_DIR="${TPCH_DATA_DIR:-target/tpch-scale10-real}"
+TPCH_DATA_DIR="${TPCH_DATA_DIR:-${ULTRASQL_BENCH_SCRATCH:-${TMPDIR:-/tmp}/ultrasql-bench}/tpch-scale10-real}"
 DUCKDB_BIN="${TPCH_DUCKDB:-$(command -v duckdb || true)}"
 RUNS="${TPCH_RUNS:-5}"
 WARMUP="${TPCH_WARMUP:-1}"

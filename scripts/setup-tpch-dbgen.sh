@@ -15,6 +15,10 @@ git -C "${tool_dir}" fetch --tags --quiet origin
 git -C "${tool_dir}" checkout --quiet "${repo_rev}"
 make -C "${tool_dir}" >/dev/null
 
+# Generate TPC-H data outside the repo (see benchmarks/scratch.sh), so it never
+# bloats target/. Reclaim it with `make clean-scratch`.
+tpch_data_hint="${ULTRASQL_BENCH_SCRATCH:-${TMPDIR:-/tmp}/ultrasql-bench}/tpch-scale1-real"
+
 cat <<EOF
 TPC-H dbgen ready:
   ${tool_dir}/dbgen
@@ -22,5 +26,5 @@ TPC-H dbgen ready:
 Use:
   ULTRASQL_TPCH_DBGEN=${tool_dir}/dbgen \\
   cargo run --release -p ultrasql-bench --features sql-bench --bin tpch -- \\
-    gen-data 1 target/tpch-scale1-real
+    gen-data 1 ${tpch_data_hint}
 EOF

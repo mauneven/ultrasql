@@ -10,7 +10,7 @@ set -euo pipefail
 
 PROFILE="${CHAOS_PROFILE:-${1:-smoke}}"
 OUT_DIR="${CHAOS_OUT_DIR:-benchmarks/results/latest}"
-WORK_DIR="${CHAOS_WORK_DIR:-target/chaos-recovery}"
+WORK_DIR="${CHAOS_WORK_DIR:-${ULTRASQL_BENCH_SCRATCH:-${TMPDIR:-/tmp}/ultrasql-bench}/chaos-recovery}"
 MANIFEST="$OUT_DIR/chaos_recovery_manifest.json"
 ULTRASQL_BIN="${ULTRASQL_BIN:-target/release/ultrasql}"
 ULTRASQLD_BIN="${ULTRASQLD_BIN:-target/release/ultrasqld}"

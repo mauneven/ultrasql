@@ -11,7 +11,7 @@ cd "$REPO_ROOT"
 
 PROFILE="${RLS_TENANT_PROFILE:-${1:-smoke}}"
 OUT_DIR="${RLS_TENANT_OUT_DIR:-benchmarks/results/latest}"
-LOG_DIR="${RLS_TENANT_LOG_DIR:-target/rls-tenant-cert}"
+LOG_DIR="${RLS_TENANT_LOG_DIR:-${ULTRASQL_BENCH_SCRATCH:-${TMPDIR:-/tmp}/ultrasql-bench}/rls-tenant-cert}"
 MANIFEST="$OUT_DIR/rls_tenant_certification.json"
 LOG_FILE="$LOG_DIR/rls_round_trip.log"
 TEST_PACKAGE="${RLS_TENANT_TEST_PACKAGE:-ultrasql-server}"

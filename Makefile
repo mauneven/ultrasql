@@ -13,12 +13,15 @@
 CARGO        ?= cargo
 STAGE        ?= current
 BENCH_JOBS   ?= $(shell sysctl -n hw.ncpu 2>/dev/null || nproc 2>/dev/null || echo 4)
-TPCH_DATA_DIR    ?= target/tpch-scale1-real
+# Transient benchmark data dirs and cached inputs live OUTSIDE the repo so runs
+# never bloat the working tree or target/. See benchmarks/scratch.sh.
+ULTRASQL_BENCH_SCRATCH ?= $(shell echo "$${TMPDIR:-/tmp}")/ultrasql-bench
+TPCH_DATA_DIR    ?= $(ULTRASQL_BENCH_SCRATCH)/tpch-scale1-real
 TPCH_DUCKDB      ?= duckdb
 TPCH_QUERIES     ?= all
 TPCH_POOL_FRAMES ?= 262144
 
-.PHONY: bench-smoke bench-full bench-record tpch-validate help
+.PHONY: bench-smoke bench-full bench-record tpch-validate clean-scratch help
 
 help:
 	@echo "UltraSQL benchmark targets:"
@@ -26,8 +29,10 @@ help:
 	@echo "  make bench-full     full sweep — run before promoting a perf commit"
 	@echo "  make bench-record   full sweep + write baselines/<stage>.json"
 	@echo "  make tpch-validate  TPC-H correctness; override TPCH_QUERIES=4,11,16"
+	@echo "  make clean-scratch  reclaim build/benchmark scratch disk (safe)"
 
 bench-smoke:
+	CARGO_INCREMENTAL=0 \
 	$(CARGO) run --release \
 	    --jobs $(BENCH_JOBS) \
 	    --package ultrasql-bench \
@@ -37,6 +42,7 @@ bench-smoke:
 	    --smoke
 
 bench-full:
+	CARGO_INCREMENTAL=0 \
 	$(CARGO) run --release \
 	    --jobs $(BENCH_JOBS) \
 	    --package ultrasql-bench \
@@ -47,6 +53,7 @@ bench-full:
 	    --warmup 2
 
 bench-record:
+	CARGO_INCREMENTAL=0 \
 	$(CARGO) run --release \
 	    --jobs $(BENCH_JOBS) \
 	    --package ultrasql-bench \
@@ -71,3 +78,6 @@ tpch-validate:
 	    --queries $(TPCH_QUERIES) \
 	    --data-dir $(TPCH_DATA_DIR) \
 	    --duckdb $(TPCH_DUCKDB)
+
+clean-scratch:
+	ULTRASQL_BENCH_SCRATCH="$(ULTRASQL_BENCH_SCRATCH)" scripts/clean-scratch.sh

@@ -157,6 +157,9 @@ echo "=== scale sweep mode=$mode storage=$STORAGE_MODE iters=$ITERS warmup=$WARM
 
 PROFILE="${SCALE_SWEEP_PROFILE:-release-ship}"
 echo "--- Building benchmark driver (profile=$PROFILE) ---"
+# Release/bench builds disable incremental compilation: it adds gigabytes of
+# cache under target/ with no benefit for a one-shot measured build.
+CARGO_INCREMENTAL="${CARGO_INCREMENTAL:-0}" \
 cargo build --profile "$PROFILE" \
     --package ultrasql-bench \
     --features sql-bench \
