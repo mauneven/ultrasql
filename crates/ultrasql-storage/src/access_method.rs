@@ -2677,13 +2677,7 @@ impl PageBackedHnswStorage {
         ef_search: usize,
     ) -> Result<Vec<HnswSearchResult>, AccessMethodError> {
         let entry = match self.meta.entry_node {
-            Some(id)
-                if self
-                    .node_page(id)?
-                    .is_some_and(|node| !node.deleted) =>
-            {
-                Some(id)
-            }
+            Some(id) if self.node_page(id)?.is_some_and(|node| !node.deleted) => Some(id),
             _ => self.first_live_node_id()?,
         };
         let Some(mut current) = entry else {
@@ -2710,8 +2704,7 @@ impl PageBackedHnswStorage {
         }
 
         // Best-first expansion bounded by ef_search.
-        let mut visited: std::collections::BTreeSet<HnswNodeId> =
-            std::collections::BTreeSet::new();
+        let mut visited: std::collections::BTreeSet<HnswNodeId> = std::collections::BTreeSet::new();
         visited.insert(current);
         let mut frontier: Vec<(f32, HnswNodeId)> = vec![(current_distance, current)];
         let mut explored: Vec<(f32, TupleId)> =
