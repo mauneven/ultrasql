@@ -197,3 +197,19 @@ full before/after analysis, and stale "fastest on all rows" claims in three docs
 were corrected to the honest 17-of-24 scoreboard. No doc claims OLTP leadership.
 **Status: DONE via path 3b (a profiled 3a attempt yielded no measured win and
 was reverted; losses formally accepted with measurable exit conditions).**
+
+## Test-suite rigor (found and fixed during closeout)
+
+Running the full `cargo test --workspace` (not just targeted tests + clippy,
+which compiles but does not *run* tests) surfaced **eight stale tests** that had
+been red since earlier work and were never caught: the README PostgreSQL-version
+guard (still asserting 14.22), and seven `ultrasql-bench` release-artifact tests
+encoding superseded assumptions — UltraSQL "fastest on every row", the 1M INSERT
+as a measured win, the certification as `not_ready`, and the pre-psycopg
+PostgreSQL-runner script structure. Each was corrected to the new honest
+contract (renderer bolds the true lowest median; the 1M INSERT is
+not_available-with-reason; the cert is `ready` with a scoreboard; the postgres
+runner is the psycopg `.py` + thin `.sh` wrapper) — strengthening the renderer
+and runner checks rather than weakening them. `cargo build/test/clippy
+(-D warnings, panic gate)/fmt` are all green, and the lesson — run the full test
+suite, not just clippy — is noted here so the gap is not repeated silently.
