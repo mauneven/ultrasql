@@ -3,6 +3,30 @@
 Completed/addressed work moved out of [ROADMAP.md](ROADMAP.md). Keep this file
 as a concise evidence ledger; roadmap stays for open gates only.
 
+## Persistent Approximate HNSW + Filtered ANN
+
+- The server's persistent `PageBackedHnswIndex::search` now traverses the
+  persisted navigable graph (greedy descent + best-first expansion bounded by
+  `ef_search`, reading nodes/neighbor lists from the page arena) instead of an
+  exact O(N) scan over every live node, so persistent `ORDER BY vector_distance
+  LIMIT k` gets real ANN speedup. It stays exact when the live set is no larger
+  than `ef_search`; a per-query `ef_search` (`search_with_ef`) overrides the
+  default. Read-only traversal; all storage, `recovery_sim`, and server vector
+  tests pass. Evidence: `crates/ultrasql-storage/src/access_method.rs`
+  (`graph_search`, `search_with_ef`), test
+  `page_backed_hnsw_graph_search_is_approximate_and_exact_with_high_ef`.
+- Selectivity-aware filtered ANN: `WHERE … ORDER BY vector_distance LIMIT k`
+  (lowered as `Sort(Filter(Scan))`) routes through `try_hnsw_filtered_top_k_limit`
+  — loose filters use HNSW over-fetch + post-filter sized to the estimated
+  selectivity, very selective or low-survivor cases fall back to exact (recall
+  1.0), so recall does not cliff. Evidence:
+  `crates/ultrasql-server/src/pipeline/index_scan.rs`, integration test
+  `hnsw_filtered_top_k_returns_correct_filtered_neighbors`,
+  `docs/filtered-ann.md`, and the committed recall artifact
+  `benchmarks/results/latest/raw/filtered_ann_recall-ultrasql.json` (recall@10
+  floor 0.962 across 0.1 %/1 %/10 %/100 % selectivities, 20k×16d on Apple M4,
+  reproduce with `benchmarks/filtered_ann_recall.sh`).
+
 ## Release And Packaging Automation
 
 - Release workflow builds and attaches release archives for Linux, macOS, and
