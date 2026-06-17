@@ -1302,10 +1302,28 @@ impl HnswIndex {
         probe: &[f32],
         k: usize,
     ) -> Result<Vec<HnswSearchResult>, AccessMethodError> {
+        self.search_with_ef(probe, k, self.ef_search)
+    }
+
+    /// Search for the nearest `k` tuple IDs with a caller-supplied
+    /// `ef_search` exploration budget, overriding the index default.
+    ///
+    /// A larger `ef_search` explores more graph nodes, trading latency for
+    /// recall — the per-query knob that filtered ANN uses to over-fetch
+    /// candidates before applying a metadata predicate, and that recall/latency
+    /// sweeps use to trace the curve. When `ef_search >= live_count` the search
+    /// is exact.
+    pub fn search_with_ef(
+        &self,
+        probe: &[f32],
+        k: usize,
+        ef_search: usize,
+    ) -> Result<Vec<HnswSearchResult>, AccessMethodError> {
         self.validate_vector(probe)?;
         if k == 0 {
             return Ok(Vec::new());
         }
+        let ef_search = ef_search.max(1);
         let storage = self.storage.lock();
         if !storage.available {
             return Ok(Vec::new());
@@ -1318,7 +1336,7 @@ impl HnswIndex {
         if live_count == 0 {
             return Ok(Vec::new());
         }
-        if live_count <= self.ef_search {
+        if live_count <= ef_search {
             return Ok(self.exact_search_locked(&storage, probe, k));
         }
 
@@ -1360,9 +1378,9 @@ impl HnswIndex {
         let mut visited = vec![false; storage.entries.len()];
         let mut frontier = vec![entry_idx];
         visited[entry_idx] = true;
-        let mut explored = Vec::with_capacity(self.ef_search.min(live_count));
+        let mut explored = Vec::with_capacity(ef_search.min(live_count));
 
-        while !frontier.is_empty() && explored.len() < self.ef_search {
+        while !frontier.is_empty() && explored.len() < ef_search {
             let best_pos = best_frontier_position(&frontier, &storage, probe, self.metric);
             let idx = frontier.swap_remove(best_pos);
             let entry = &storage.entries[idx];
@@ -4809,6 +4827,26 @@ mod tests {
         let hits = am.search(&[0.2, 0.0, 0.0], 2).expect("search");
         let tids: Vec<TupleId> = hits.into_iter().map(|hit| hit.tid).collect();
         assert_eq!(tids, vec![tid(1, 0), tid(1, 1)]);
+    }
+
+    #[test]
+    fn hnsw_search_with_ef_overrides_exploration_budget() {
+        // A small index default ef_search keeps the graph search narrow; a
+        // per-query ef that covers the whole live set makes the search exact.
+        let am = HnswIndex::new(2, HnswMetric::L2, 4, 2).expect("hnsw config");
+        for i in 0u16..20 {
+            am.insert_vector(&[f32::from(i) * 2.0, 0.0], tid(1, i))
+                .expect("insert");
+        }
+        let probe = [0.1, 0.0];
+        // Default ef_search=2 explores at most two nodes, so it returns 2 hits.
+        let narrow = am.search(&probe, 3).expect("default search");
+        assert_eq!(narrow.len(), 2);
+        // A per-query ef >= live count makes the search exact: the true 3
+        // nearest to 0.1 are ids 0 (d=0.1), 1 (d=1.9), 2 (d=3.9).
+        let exact = am.search_with_ef(&probe, 3, 100).expect("boosted search");
+        let tids: Vec<TupleId> = exact.into_iter().map(|hit| hit.tid).collect();
+        assert_eq!(tids, vec![tid(1, 0), tid(1, 1), tid(1, 2)]);
     }
 
     #[test]
