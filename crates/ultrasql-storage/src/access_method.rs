@@ -1987,31 +1987,36 @@ impl PageBackedHnswIndex {
         probe: &[f32],
         k: usize,
     ) -> Result<Vec<HnswSearchResult>, AccessMethodError> {
+        self.search_with_ef(probe, k, self.ef_search)
+    }
+
+    /// Search the persistent index with a caller-supplied `ef_search`.
+    ///
+    /// The page-backed arena persists the navigable graph, so this traverses it
+    /// (greedy descent + best-first expansion) for real ANN speedup on large
+    /// indexes. When the live set is no larger than `ef_search` the search is an
+    /// exact exhaustive scan (cheap and exact at small scale), so a per-query
+    /// `ef_search >= live count` is exact — the knob filtered ANN uses to
+    /// over-fetch candidates and recall/latency sweeps use to trace the curve.
+    pub fn search_with_ef(
+        &self,
+        probe: &[f32],
+        k: usize,
+        ef_search: usize,
+    ) -> Result<Vec<HnswSearchResult>, AccessMethodError> {
         self.validate_vector(probe)?;
         if k == 0 {
             return Ok(Vec::new());
         }
+        let ef_search = ef_search.max(1);
         let storage = self.storage.lock();
-        if !storage.valid {
+        if !storage.valid || storage.meta.live_nodes == 0 {
             return Ok(Vec::new());
         }
-        let mut hits = Vec::with_capacity(storage.meta.live_nodes.min(k.max(self.ef_search)));
-        for node_id in storage.node_to_block.keys() {
-            let Some(node) = storage.node_page(*node_id)? else {
-                continue;
-            };
-            if node.deleted {
-                continue;
-            }
-            let vector = storage.vector_for_node(node)?;
-            hits.push(HnswSearchResult {
-                tid: node.tid,
-                distance: self.metric.distance(probe, &vector),
-            });
+        if storage.meta.live_nodes <= ef_search {
+            return storage.exact_scan(probe, k);
         }
-        hits.sort_by(compare_hnsw_hits);
-        hits.truncate(k);
-        Ok(hits)
+        storage.graph_search(probe, k, ef_search)
     }
 
     /// Mark a node tombstoned. VACUUM reclaims its pages later.
@@ -2622,6 +2627,122 @@ impl PageBackedHnswStorage {
         }
         neighbors.truncate(node.neighbor_count);
         Ok(neighbors)
+    }
+
+    /// Distance from `probe` to a live node, or `None` when the node is missing
+    /// or tombstoned.
+    fn node_probe_distance(
+        &self,
+        probe: &[f32],
+        node_id: HnswNodeId,
+    ) -> Result<Option<(f32, TupleId)>, AccessMethodError> {
+        let Some(node) = self.node_page(node_id)? else {
+            return Ok(None);
+        };
+        if node.deleted {
+            return Ok(None);
+        }
+        let vector = self.vector_for_node(node)?;
+        Ok(Some((self.meta.metric.distance(probe, &vector), node.tid)))
+    }
+
+    /// Exact brute-force scan over every live node. Used when the live set is
+    /// small enough that exhaustive search is both cheap and exact.
+    fn exact_scan(
+        &self,
+        probe: &[f32],
+        k: usize,
+    ) -> Result<Vec<HnswSearchResult>, AccessMethodError> {
+        let mut hits = Vec::with_capacity(self.meta.live_nodes.min(k.max(1)));
+        for node_id in self.node_to_block.keys() {
+            if let Some((distance, tid)) = self.node_probe_distance(probe, *node_id)? {
+                hits.push(HnswSearchResult { tid, distance });
+            }
+        }
+        hits.sort_by(compare_hnsw_hits);
+        hits.truncate(k);
+        Ok(hits)
+    }
+
+    /// Approximate nearest-neighbor search over the persisted navigable graph:
+    /// greedy descent to a local minimum, then best-first expansion bounded by
+    /// `ef_search`. This is the same traversal the in-process runtime index
+    /// uses, but reading nodes and neighbor lists from the page-backed arena,
+    /// so the persistent server path gets real ANN speedup instead of an O(N)
+    /// exhaustive scan. The search is read-only.
+    fn graph_search(
+        &self,
+        probe: &[f32],
+        k: usize,
+        ef_search: usize,
+    ) -> Result<Vec<HnswSearchResult>, AccessMethodError> {
+        let entry = match self.meta.entry_node {
+            Some(id)
+                if self
+                    .node_page(id)?
+                    .is_some_and(|node| !node.deleted) =>
+            {
+                Some(id)
+            }
+            _ => self.first_live_node_id()?,
+        };
+        let Some(mut current) = entry else {
+            return Ok(Vec::new());
+        };
+        let Some((mut current_distance, _)) = self.node_probe_distance(probe, current)? else {
+            return Ok(Vec::new());
+        };
+
+        // Greedy descent: hop to the closer neighbor until none improves.
+        let mut improved = true;
+        while improved {
+            improved = false;
+            for neighbor in self.neighbors_for_node(current)? {
+                if let Some((distance, _)) = self.node_probe_distance(probe, neighbor)? {
+                    if distance < current_distance {
+                        current = neighbor;
+                        current_distance = distance;
+                        improved = true;
+                        break;
+                    }
+                }
+            }
+        }
+
+        // Best-first expansion bounded by ef_search.
+        let mut visited: std::collections::BTreeSet<HnswNodeId> =
+            std::collections::BTreeSet::new();
+        visited.insert(current);
+        let mut frontier: Vec<(f32, HnswNodeId)> = vec![(current_distance, current)];
+        let mut explored: Vec<(f32, TupleId)> =
+            Vec::with_capacity(ef_search.min(self.meta.live_nodes));
+        while !frontier.is_empty() && explored.len() < ef_search {
+            let best_pos = frontier
+                .iter()
+                .enumerate()
+                .min_by(|left, right| left.1.0.total_cmp(&right.1.0))
+                .map_or(0, |(idx, _)| idx);
+            let (_, node_id) = frontier.swap_remove(best_pos);
+            if let Some((distance, tid)) = self.node_probe_distance(probe, node_id)? {
+                explored.push((distance, tid));
+            }
+            for neighbor in self.neighbors_for_node(node_id)? {
+                if !visited.insert(neighbor) {
+                    continue;
+                }
+                if let Some((distance, _)) = self.node_probe_distance(probe, neighbor)? {
+                    frontier.push((distance, neighbor));
+                }
+            }
+        }
+
+        let mut hits: Vec<HnswSearchResult> = explored
+            .into_iter()
+            .map(|(distance, tid)| HnswSearchResult { tid, distance })
+            .collect();
+        hits.sort_by(compare_hnsw_hits);
+        hits.truncate(k);
+        Ok(hits)
     }
 
     fn write_neighbors(
@@ -4952,6 +5073,47 @@ mod tests {
         let hits = am.search(&[0.2, 0.0, 0.0], 2).expect("search");
         let tids: Vec<TupleId> = hits.into_iter().map(|hit| hit.tid).collect();
         assert_eq!(tids, vec![tid(1, 0), tid(1, 1)]);
+    }
+
+    #[test]
+    fn page_backed_hnsw_graph_search_is_approximate_and_exact_with_high_ef() {
+        // 200 live nodes with ef_search=8: the persistent search must traverse
+        // the graph (not exhaustively scan), and a per-query ef >= live count
+        // must be exact.
+        let am = PageBackedHnswIndex::new(RelationId::new(8810), 2, HnswMetric::L2, 16, 8)
+            .expect("page-backed hnsw config");
+        for i in 0u16..200 {
+            am.insert_vector(&[f32::from(i), 0.0], tid(1, i))
+                .expect("insert");
+        }
+        let probe = [50.3_f32, 0.0];
+        let k = 5;
+
+        // Boosted ef (>= live=200) is exact: the true 5 nearest to 50.3.
+        let exact: Vec<TupleId> = am
+            .search_with_ef(&probe, k, 1000)
+            .expect("exact search")
+            .into_iter()
+            .map(|hit| hit.tid)
+            .collect();
+        assert_eq!(
+            exact,
+            vec![tid(1, 50), tid(1, 51), tid(1, 49), tid(1, 52), tid(1, 48)]
+        );
+
+        // Default ef=8 traverses the graph and recovers the true neighbors with
+        // high recall (the line graph navigates cleanly).
+        let approx: std::collections::BTreeSet<TupleId> = am
+            .search(&probe, k)
+            .expect("graph search")
+            .into_iter()
+            .map(|hit| hit.tid)
+            .collect();
+        assert_eq!(approx.len(), k, "graph search must return k results");
+        let overlap = exact.iter().filter(|t| approx.contains(t)).count();
+        let recall =
+            f64::from(u16::try_from(overlap).unwrap()) / f64::from(u16::try_from(k).unwrap());
+        assert!(recall >= 0.8, "graph recall@{k} too low: {recall}");
     }
 
     #[test]
