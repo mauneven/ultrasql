@@ -459,6 +459,12 @@ PYEOF
 # ---------------------------------------------------------------------------
 # Workload: mixed_oltp_pgbench_like
 # ---------------------------------------------------------------------------
+# Persistent in-process connection via the Python sqlite3 driver: preload
+# N_ROWS once outside the timed window, then run single point ops (50% read,
+# 30% update, 20% insert) on that warm connection until the 1-second deadline
+# and report µs/op. The older path spawned a fresh `sqlite3` process per 20-op
+# batch AND re-ran the full preload every batch, so it timed process startup,
+# parse, and a full table reload instead of SQLite's per-op cost.
 run_mixed() {
     local wl="mixed_oltp_pgbench_like"
     echo "  workload: ${wl}"
@@ -468,7 +474,9 @@ run_mixed() {
     for (( i=0; i<N_ITERS; i++ )); do
         local us_per_op
         us_per_op="$(python3 - "$N_ROWS" "$window_secs" "$i" "$BENCH_STORAGE_MODE" "$BENCH_DATA_ROOT" "$wl" <<'PYEOF'
-import subprocess, time, random, sys
+import os
+import sys, time, random
+import sqlite3
 from pathlib import Path
 
 n = int(sys.argv[1])
@@ -480,58 +488,52 @@ workload = sys.argv[6]
 rng = random.Random(0xBEEF + seed)
 
 if storage_mode == "data-dir":
-    preamble = "PRAGMA journal_mode=WAL;\nPRAGMA synchronous=FULL;\nPRAGMA temp_store=DEFAULT;\n"
-else:
-    preamble = "PRAGMA journal_mode=MEMORY;\nPRAGMA synchronous=OFF;\nPRAGMA temp_store=MEMORY;\n"
-
-# Build initial preload SQL.
-ids = list(range(n))
-rng2 = random.Random(0xC0FFEE)
-rng2.shuffle(ids)
-vals = [rng2.randint(-2**31, 2**31-1) for _ in range(n)]
-preload_parts = ["CREATE TABLE bench_write(id INTEGER PRIMARY KEY, val INTEGER);"]
-chunks = [ids[i:i+1000] for i in range(0, n, 1000)]
-vchunks = [vals[i:i+1000] for i in range(0, n, 1000)]
-for ch, vc in zip(chunks, vchunks):
-    rows = ",".join(f"({i},{v})" for i, v in zip(ch, vc))
-    preload_parts.append(f"INSERT INTO bench_write(id,val) VALUES {rows};")
-preload_sql = "\n".join(preload_parts)
-
-def sqlite_target(batch: int) -> str:
-    if storage_mode != "data-dir":
-        return ":memory:"
-    db_path = data_root / "sqlite3" / f"{workload}-{seed}-{batch}.sqlite3"
+    db_path = data_root / "sqlite3" / f"{workload}-{seed}-{os.getpid()}.sqlite3"
     db_path.parent.mkdir(parents=True, exist_ok=True)
     for suffix in ("", "-wal", "-shm"):
         candidate = Path(f"{db_path}{suffix}")
         if candidate.exists():
             candidate.unlink()
-    return str(db_path)
+else:
+    db_path = Path(":memory:")
 
-def run_sqlite(extra_sql: str, batch: int) -> None:
-    sql = preamble + preload_sql + "\n" + extra_sql
-    subprocess.run(["sqlite3", sqlite_target(batch)], input=sql, capture_output=True, text=True)
+con = sqlite3.connect(str(db_path), isolation_level=None)
+if storage_mode == "data-dir":
+    con.execute("PRAGMA journal_mode=WAL;")
+    con.execute("PRAGMA synchronous=FULL;")
+    con.execute("PRAGMA temp_store=DEFAULT;")
+else:
+    con.execute("PRAGMA journal_mode=MEMORY;")
+    con.execute("PRAGMA synchronous=OFF;")
+    con.execute("PRAGMA temp_store=MEMORY;")
+
+# Preload once, outside the timed window.
+ids = list(range(n))
+rng2 = random.Random(0xC0FFEE)
+rng2.shuffle(ids)
+vals = [rng2.randint(-2**31, 2**31-1) for _ in range(n)]
+con.execute("CREATE TABLE bench_write(id INTEGER PRIMARY KEY, val INTEGER);")
+con.execute("BEGIN;")
+con.executemany("INSERT INTO bench_write(id,val) VALUES (?, ?);", list(zip(ids, vals)))
+con.execute("COMMIT;")
 
 deadline = time.perf_counter() + window
 count = 0
 next_id = n
 
 while time.perf_counter() < deadline:
-    ops_batch = []
-    for _ in range(20):
-        r = rng.random()
-        if r < 0.50:
-            row_id = rng.randint(0, n - 1)
-            ops_batch.append(f"SELECT val FROM bench_write WHERE id = {row_id};")
-        elif r < 0.80:
-            row_id = rng.randint(0, n - 1)
-            ops_batch.append(f"UPDATE bench_write SET val = val + 1 WHERE id = {row_id};")
-        else:
-            new_val = rng.randint(-2**31, 2**31 - 1)
-            ops_batch.append(f"INSERT INTO bench_write(id, val) VALUES ({next_id}, {new_val});")
-            next_id += 1
-    run_sqlite("\n".join(ops_batch), count)
-    count += 20
+    r = rng.random()
+    if r < 0.50:
+        row_id = rng.randint(0, n - 1)
+        con.execute(f"SELECT val FROM bench_write WHERE id = {row_id};").fetchall()
+    elif r < 0.80:
+        row_id = rng.randint(0, n - 1)
+        con.execute(f"UPDATE bench_write SET val = val + 1 WHERE id = {row_id};")
+    else:
+        new_val = rng.randint(-2**31, 2**31 - 1)
+        con.execute(f"INSERT OR IGNORE INTO bench_write(id, val) VALUES ({next_id}, {new_val});")
+        next_id += 1
+    count += 1
 
 elapsed = time.perf_counter() - (deadline - window)
 us_per_op = elapsed * 1e6 / max(count, 1)

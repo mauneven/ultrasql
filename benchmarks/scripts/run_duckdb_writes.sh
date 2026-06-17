@@ -427,6 +427,12 @@ PYEOF
 # ---------------------------------------------------------------------------
 # Workload: mixed_oltp_pgbench_like
 # ---------------------------------------------------------------------------
+# Persistent in-process connection via the duckdb Python driver: preload
+# N_ROWS once outside the timed window, then run single point ops (50% read,
+# 30% update, 20% insert) on that warm connection until the 1-second deadline
+# and report µs/op. The older path spawned a fresh `duckdb` process per 50-op
+# batch AND re-ran the full preload every batch, so it timed process startup,
+# parse, temp-DB init, and a 10k-row reload instead of DuckDB's per-op cost.
 run_mixed() {
     local wl="mixed_oltp_pgbench_like"
     echo "  workload: ${wl}"
@@ -436,7 +442,9 @@ run_mixed() {
     for (( i=0; i<N_ITERS; i++ )); do
         local us_per_op
         us_per_op="$(python3 - "$N_ROWS" "$window_secs" "$i" "$BENCH_STORAGE_MODE" "$BENCH_DATA_ROOT" "$wl" <<'PYEOF'
-import subprocess, time, random, sys, os
+import os
+import sys, time, random
+import duckdb
 from pathlib import Path
 
 n = int(sys.argv[1])
@@ -447,62 +455,47 @@ data_root = Path(sys.argv[5])
 workload = sys.argv[6]
 rng = random.Random(0xBEEF + seed)
 
-def duckdb_target(batch: int) -> str:
-    if storage_mode != "data-dir":
-        return ":memory:"
-    db_path = data_root / "duckdb" / f"{workload}-{seed}-{batch}.duckdb"
+if storage_mode == "data-dir":
+    db_path = data_root / "duckdb" / f"{workload}-{seed}-{os.getpid()}.duckdb"
     db_path.parent.mkdir(parents=True, exist_ok=True)
     for suffix in ("", ".wal"):
         candidate = Path(f"{db_path}{suffix}")
         if candidate.exists():
             candidate.unlink()
-    return str(db_path)
+else:
+    db_path = Path(":memory:")
 
-def run_duckdb(sql: str, batch: int) -> str:
-    r = subprocess.run(
-        ["duckdb", duckdb_target(batch)],
-        input=sql,
-        capture_output=True,
-        text=True,
-    )
-    return r.stdout
-
-# Pre-populate table via a temp file that we can reuse as a preload.
+# Preload once, outside the timed window.
 ids = list(range(n))
 rng2 = random.Random(0xC0FFEE)
 rng2.shuffle(ids)
 vals = [rng2.randint(-2**31, 2**31-1) for _ in range(n)]
-preload_parts = ["CREATE OR REPLACE TABLE bench_write(id BIGINT PRIMARY KEY, val BIGINT);"]
-chunks = [ids[i:i+1000] for i in range(0, n, 1000)]
-vchunks = [vals[i:i+1000] for i in range(0, n, 1000)]
-for ch, vc in zip(chunks, vchunks):
-    rows = ",".join(f"({i},{v})" for i, v in zip(ch, vc))
-    preload_parts.append(f"INSERT INTO bench_write(id,val) VALUES {rows};")
-preload_sql = "\n".join(preload_parts)
+con = duckdb.connect(str(db_path))
+con.execute("CREATE OR REPLACE TABLE bench_write(id BIGINT PRIMARY KEY, val BIGINT);")
+for chunk_start in range(0, n, 1000):
+    rows = ",".join(
+        f"({ids[i]},{vals[i]})"
+        for i in range(chunk_start, min(chunk_start + 1000, n))
+    )
+    con.execute(f"INSERT INTO bench_write(id,val) VALUES {rows};")
 
-# DuckDB :memory: is stateless per-invocation, so we batch ops per call
-# to amortize startup cost. Run 50-op batches for the window.
 deadline = time.perf_counter() + window
 count = 0
 next_id = n
 
 while time.perf_counter() < deadline:
-    batch_ops = []
-    for _ in range(50):
-        r = rng.random()
-        if r < 0.50:
-            row_id = rng.randint(0, n - 1)
-            batch_ops.append(f"SELECT val FROM bench_write WHERE id = {row_id};")
-        elif r < 0.80:
-            row_id = rng.randint(0, n - 1)
-            batch_ops.append(f"UPDATE bench_write SET val = val + 1 WHERE id = {row_id};")
-        else:
-            new_val = rng.randint(-2**31, 2**31 - 1)
-            batch_ops.append(f"INSERT INTO bench_write(id, val) VALUES ({next_id}, {new_val}) ON CONFLICT DO NOTHING;")
-            next_id += 1
-    sql = preload_sql + "\n" + "\n".join(batch_ops)
-    run_duckdb(sql, count)
-    count += 50
+    r = rng.random()
+    if r < 0.50:
+        row_id = rng.randint(0, n - 1)
+        con.execute(f"SELECT val FROM bench_write WHERE id = {row_id};").fetchall()
+    elif r < 0.80:
+        row_id = rng.randint(0, n - 1)
+        con.execute(f"UPDATE bench_write SET val = val + 1 WHERE id = {row_id};")
+    else:
+        new_val = rng.randint(-2**31, 2**31 - 1)
+        con.execute(f"INSERT INTO bench_write(id, val) VALUES ({next_id}, {new_val}) ON CONFLICT DO NOTHING;")
+        next_id += 1
+    count += 1
 
 elapsed = time.perf_counter() - (deadline - window)
 us_per_op = elapsed * 1e6 / max(count, 1)
