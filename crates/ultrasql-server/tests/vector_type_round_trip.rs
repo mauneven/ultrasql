@@ -2333,6 +2333,77 @@ async fn hybrid_search_function_orders_candidates_through_executor() {
 }
 
 #[tokio::test]
+async fn hybrid_search_rrf_fusion_reranks_versus_weighted() {
+    // Data where the lexical and vector rankings disagree:
+    //   doc 1: very strong text match, farthest vector
+    //   doc 2: weak text match,        closest vector
+    //   doc 3: no text match,          middle vector
+    // Weighted-linear lets doc 1's large BM25 magnitude dominate, so it wins.
+    // RRF only counts ranks, so the rank-balanced doc 2 (text #2, vector #1)
+    // beats doc 1 (text #1, vector #3). The two fusion methods therefore
+    // return different orders, proving the 'rrf' selector is engaged.
+    let (client, _conn, server_handle) = start_server_and_connect().await;
+
+    client
+        .batch_execute(
+            "CREATE TABLE rrf_docs (\
+                id INT NOT NULL, \
+                content TEXT, \
+                embedding VECTOR(2)\
+             )",
+        )
+        .await
+        .expect("create rrf docs");
+    client
+        .batch_execute(
+            "INSERT INTO rrf_docs VALUES \
+             (1, 'alpha beta beta beta alpha', '[0.5,0]'), \
+             (2, 'alpha', '[0.01,0]'), \
+             (3, 'gamma delta', '[0.2,0]')",
+        )
+        .await
+        .expect("insert rrf docs");
+
+    let weighted = client
+        .simple_query(
+            "SELECT id FROM rrf_docs \
+             ORDER BY hybrid_search(content, 'alpha beta', embedding, VECTOR '[0,0]') DESC \
+             LIMIT 3",
+        )
+        .await
+        .expect("weighted hybrid query");
+    assert_eq!(
+        simple_rows(&weighted),
+        vec![
+            vec!["1".to_owned()],
+            vec!["2".to_owned()],
+            vec!["3".to_owned()],
+        ],
+        "weighted-linear fusion is dominated by doc 1's BM25 magnitude"
+    );
+
+    let rrf = client
+        .simple_query(
+            "SELECT id FROM rrf_docs \
+             ORDER BY hybrid_search(content, 'alpha beta', embedding, VECTOR '[0,0]', 'rrf') DESC \
+             LIMIT 3",
+        )
+        .await
+        .expect("rrf hybrid query");
+    assert_eq!(
+        simple_rows(&rrf),
+        vec![
+            vec!["2".to_owned()],
+            vec!["1".to_owned()],
+            vec!["3".to_owned()],
+        ],
+        "RRF balances rank contributions, so the rank-balanced doc 2 wins"
+    );
+
+    shutdown(client, server_handle).await;
+}
+
+#[tokio::test]
 async fn insert_rejects_vector_dimension_mismatch() {
     let (client, _conn, server_handle) = start_server_and_connect().await;
 

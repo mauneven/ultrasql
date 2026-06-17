@@ -2,8 +2,8 @@
 
 use ultrasql_core::{DataType, Value};
 use ultrasql_executor::{
-    HybridSearch, HybridSearchConfig, HybridSearchWeights, HybridTextSpec, HybridVectorSpec,
-    Operator,
+    FusionMethod, HybridSearch, HybridSearchConfig, HybridSearchWeights, HybridTextSpec,
+    HybridVectorSpec, Operator,
 };
 use ultrasql_planner::{LogicalPlan, ScalarExpr, SortKey};
 use ultrasql_vec::kernels::vector::VectorMetric;
@@ -90,6 +90,7 @@ fn lower_hybrid_sorted_input(
         version_column: None,
         limit,
         weights: HybridSearchWeights::DEFAULT,
+        fusion: spec.fusion,
     };
     Ok(Some(Box::new(HybridSearch::new(child, schema, config))))
 }
@@ -100,6 +101,30 @@ struct HybridSearchKey {
     query: String,
     vector_column: usize,
     probe: Vec<f32>,
+    fusion: FusionMethod,
+}
+
+/// Parse the optional 5th `hybrid_search` argument, a fusion selector.
+///
+/// `'rrf'` (Reciprocal Rank Fusion, the recommended default) or `'weighted'`
+/// (weighted linear sum). Absent → weighted linear, preserving the original
+/// four-argument behaviour.
+fn parse_fusion(arg: Option<&ScalarExpr>) -> Result<FusionMethod, ServerError> {
+    match arg {
+        None => Ok(FusionMethod::WeightedLinear),
+        Some(expr) => match match_text_literal(expr).as_deref() {
+            Some(text) => match text.trim().to_ascii_lowercase().as_str() {
+                "rrf" => Ok(FusionMethod::rrf()),
+                "weighted" | "linear" | "weighted_linear" => Ok(FusionMethod::WeightedLinear),
+                _ => Err(ServerError::Unsupported(
+                    "hybrid_search fusion must be 'rrf' or 'weighted'",
+                )),
+            },
+            None => Err(ServerError::Unsupported(
+                "hybrid_search fusion selector must be a text literal",
+            )),
+        },
+    }
 }
 
 fn match_hybrid_search_key(expr: &ScalarExpr) -> Result<Option<HybridSearchKey>, ServerError> {
@@ -109,9 +134,9 @@ fn match_hybrid_search_key(expr: &ScalarExpr) -> Result<Option<HybridSearchKey>,
     if name != "hybrid_search" {
         return Ok(None);
     }
-    if args.len() != 4 {
+    if args.len() != 4 && args.len() != 5 {
         return Err(ServerError::Unsupported(
-            "hybrid_search expects four arguments",
+            "hybrid_search expects four or five arguments",
         ));
     }
     let Some(text_column) = match_hybrid_text_column(&args[0]) else {
@@ -126,11 +151,13 @@ fn match_hybrid_search_key(expr: &ScalarExpr) -> Result<Option<HybridSearchKey>,
     let Some(probe) = match_dense_vector_literal(&args[3]) else {
         return Ok(None);
     };
+    let fusion = parse_fusion(args.get(4))?;
     Ok(Some(HybridSearchKey {
         text_column,
         query,
         vector_column,
         probe,
+        fusion,
     }))
 }
 

@@ -2474,11 +2474,21 @@ fn validate_vector_dims_args(args: &[ScalarExpr]) -> Result<(), PlanError> {
 }
 
 fn validate_hybrid_search_args(args: &mut [ScalarExpr]) -> Result<(), PlanError> {
-    if args.len() != 4 {
+    if args.len() != 4 && args.len() != 5 {
         return Err(PlanError::TypeMismatch(format!(
-            "hybrid_search: expected 4 arguments, got {}",
+            "hybrid_search: expected 4 or 5 arguments, got {}",
             args.len()
         )));
+    }
+
+    // Optional 5th argument selects the fusion method ('rrf' | 'weighted').
+    if let Some(fusion_arg) = args.get(4) {
+        let fusion_type = fusion_arg.data_type();
+        if !matches!(fusion_type, DataType::Text { .. }) {
+            return Err(PlanError::TypeMismatch(format!(
+                "hybrid_search: fifth argument (fusion method) must be text, got {fusion_type}"
+            )));
+        }
     }
 
     let text_type = args[0].data_type();
