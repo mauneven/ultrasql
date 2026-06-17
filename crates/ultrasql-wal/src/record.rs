@@ -580,6 +580,7 @@ mod tests {
             RecordType::HeapInsertBatch,
             RecordType::HeapUpdateInt32PairDeltaBatch,
             RecordType::HeapDeleteInPlaceRangeBatch,
+            RecordType::HeapUpdateInt32PairDeltaRangeBatch,
             RecordType::Nop,
         ] {
             let raw = u8::from(rt);

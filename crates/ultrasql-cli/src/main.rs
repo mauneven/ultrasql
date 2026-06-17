@@ -1445,6 +1445,9 @@ fn decode_wal_payload(record: &ultrasql_wal::WalRecord) -> String {
         RecordType::HeapUpdateInt32PairDeltaBatch => format_decoded(
             ultrasql_wal::HeapUpdateInt32PairDeltaBatchPayload::decode(&record.payload),
         ),
+        RecordType::HeapUpdateInt32PairDeltaRangeBatch => format_decoded(
+            ultrasql_wal::HeapUpdateInt32PairDeltaRangeBatchPayload::decode(&record.payload),
+        ),
         RecordType::HeapDeleteInPlace => format_decoded(
             ultrasql_wal::HeapDeleteInPlacePayload::decode(&record.payload),
         ),
