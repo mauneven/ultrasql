@@ -293,10 +293,16 @@ fn try_hnsw_sorted_scan(
     // `limit` live rows. A wider candidate set absorbs that mortality; the exact
     // fallback below covers the rest.
     let hits = if let Some(hnsw) = find_hnsw_index(ctx, table_entry, col_idx, metric) {
-        let want = limit
-            .saturating_mul(ANN_TOPK_OVERFETCH)
-            .max(ANN_TOPK_MIN_EF)
-            .max(hnsw.ef_search());
+        // A per-session `hnsw.ef_search` (pgvector-compatible) overrides the
+        // auto-sized budget so users can trade latency for recall; it must still
+        // be at least `limit` to return k results.
+        let want = match session_ef_search(ctx) {
+            Some(ef) => ef.max(limit),
+            None => limit
+                .saturating_mul(ANN_TOPK_OVERFETCH)
+                .max(ANN_TOPK_MIN_EF)
+                .max(hnsw.ef_search()),
+        };
         hnsw.search_with_ef(&probe, want, want)
             .map_err(|e| ServerError::ddl(format!("HNSW search: {e}")))?
             .into_iter()
@@ -387,6 +393,16 @@ const FILTERED_ANN_MAX_EF: usize = 8192;
 // but it is sized for tuple mortality rather than filter selectivity.
 const ANN_TOPK_OVERFETCH: usize = 4;
 const ANN_TOPK_MIN_EF: usize = 64;
+
+/// Read a per-session `hnsw.ef_search` override (pgvector-compatible). Returns
+/// `None` when unset or non-positive, in which case the lowering auto-sizes the
+/// exploration budget.
+fn session_ef_search(ctx: &LowerCtx<'_>) -> Option<usize> {
+    ctx.session_settings
+        .get("hnsw.ef_search")
+        .and_then(|raw| raw.parse::<usize>().ok())
+        .filter(|&ef| ef > 0)
+}
 
 /// Try to lower `WHERE <predicate> ORDER BY vector_distance LIMIT k`
 /// (`Sort(Filter(Scan))`, optionally under a `Project`) through an HNSW index
@@ -486,7 +502,10 @@ fn try_hnsw_filtered_sorted(
     // INVARIANT: `clamped` is finite and within [MIN_EF, MAX_EF], both small
     // positive usizes, so the cast cannot truncate or lose sign.
     #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-    let ef = clamped as usize;
+    let selectivity_ef = clamped as usize;
+    // A per-session `hnsw.ef_search` raises the floor so users can boost recall
+    // on filtered queries too, but never below what selectivity demands.
+    let ef = selectivity_ef.max(session_ef_search(ctx).unwrap_or(0));
 
     let hits = hnsw
         .search_with_ef(&probe, ef, ef)

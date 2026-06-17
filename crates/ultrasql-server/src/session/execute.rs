@@ -1215,6 +1215,21 @@ where
                     .insert("statement_timeout".to_owned(), parsed.to_string());
                 Ok(())
             }
+            // pgvector-compatible per-session HNSW exploration budget. Higher
+            // ef_search trades latency for recall; the vector lowering reads it
+            // from session_settings, so plans must be re-lowered after a change.
+            "hnsw.ef_search" => {
+                let parsed = value
+                    .parse::<usize>()
+                    .map_err(|_| ServerError::Unsupported("invalid hnsw.ef_search"))?;
+                if parsed == 0 {
+                    return Err(ServerError::Unsupported("hnsw.ef_search must be positive"));
+                }
+                self.session_settings
+                    .insert("hnsw.ef_search".to_owned(), parsed.to_string());
+                self.plan_cache_invalidate();
+                Ok(())
+            }
             "extra_float_digits" => {
                 let parsed = value
                     .parse::<i32>()
@@ -1316,6 +1331,11 @@ where
             }
             "jit_above_cost" => self.jit_above_rows.to_string(),
             "statement_timeout" => self.statement_timeout_ms.to_string(),
+            "hnsw.ef_search" => self
+                .session_settings
+                .get("hnsw.ef_search")
+                .cloned()
+                .unwrap_or_else(|| "auto".to_owned()),
             "extra_float_digits" => self
                 .session_settings
                 .get("extra_float_digits")

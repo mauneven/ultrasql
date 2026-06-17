@@ -802,6 +802,66 @@ async fn vector_index_and_heap_agree_after_transactional_update_and_crash() {
 }
 
 #[tokio::test]
+async fn hnsw_ef_search_session_knob_is_accepted_and_applied() {
+    // pgvector-compatible per-session ef_search knob: SET is accepted, SHOW
+    // reflects it, and a query under the override returns correct neighbors.
+    let (client, _conn, server_handle) = start_server_and_connect().await;
+    client
+        .batch_execute("CREATE TABLE knob (id INT NOT NULL, embedding VECTOR(2))")
+        .await
+        .expect("create table");
+    let values: String = (0..200)
+        .map(|i| format!("({i}, '[{i},0]')"))
+        .collect::<Vec<_>>()
+        .join(",");
+    client
+        .batch_execute(&format!("INSERT INTO knob (id, embedding) VALUES {values}"))
+        .await
+        .expect("insert rows");
+    client
+        .batch_execute("CREATE INDEX knob_emb ON knob USING hnsw (embedding vector_l2_ops)")
+        .await
+        .expect("create index");
+
+    // Unset → SHOW reports the auto-sized default.
+    let shown = client
+        .simple_query("SHOW hnsw.ef_search")
+        .await
+        .expect("show default");
+    assert_eq!(simple_rows(&shown), vec![vec!["auto".to_owned()]]);
+
+    // A large override is accepted and SHOW echoes it.
+    client
+        .batch_execute("SET hnsw.ef_search = 500")
+        .await
+        .expect("set ef_search");
+    let shown = client
+        .simple_query("SHOW hnsw.ef_search")
+        .await
+        .expect("show override");
+    assert_eq!(simple_rows(&shown), vec![vec!["500".to_owned()]]);
+
+    // Under the override the nearest-neighbor answer is still correct.
+    let near = client
+        .simple_query("SELECT id FROM knob ORDER BY embedding <-> VECTOR '[30,0]' LIMIT 3")
+        .await
+        .expect("knn under override");
+    assert_eq!(
+        simple_rows(&near),
+        vec![
+            vec!["30".to_owned()],
+            vec!["29".to_owned()],
+            vec!["31".to_owned()]
+        ]
+    );
+
+    // Zero is rejected (must be positive).
+    let bad = client.batch_execute("SET hnsw.ef_search = 0").await;
+    assert!(bad.is_err(), "ef_search = 0 must be rejected");
+    shutdown(client, server_handle).await;
+}
+
+#[tokio::test]
 async fn rolled_back_embedding_update_does_not_affect_vector_search() {
     // MVCC visibility: an aborted embedding update must leave no trace in vector
     // search — the index reflects committed state only and never drifts to an
