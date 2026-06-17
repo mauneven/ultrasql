@@ -131,8 +131,10 @@ use ultrasql_wal::applier::{ApplyError, HeapTarget};
 use ultrasql_wal::payload::{
     AbortPayload, BTreeOpPayload, CheckpointPayload, CommitPayload, FullPageWritePayload,
     HeapDeleteInPlaceBatchPayload, HeapDeleteInPlacePayload, HeapDeleteInPlaceRangeBatchPayload,
-    HeapDeletePayload, HeapInsertPayload, HeapUpdateInPlaceBatchPayload, HeapUpdateInPlacePayload,
-    HeapUpdateInt32PairDeltaBatchPayload, HeapUpdatePayload, SequenceOpKind, SequenceOpPayload,
+    HeapDeletePayload, HeapInsertBatchPayload, HeapInsertPayload, HeapUpdateInPlaceBatchPayload,
+    HeapUpdateInPlacePayload, HeapUpdateInt32PairDeltaBatchPayload,
+    HeapUpdateInt32PairDeltaRangeBatchPayload, HeapUpdatePayload, SequenceOpKind,
+    SequenceOpPayload,
 };
 use ultrasql_wal::{RecordType, WalRecord};
 
@@ -2471,6 +2473,18 @@ impl HeapTarget for ServerRecoveryTarget {
         HeapTarget::apply_insert(self.heap.as_ref(), payload)
     }
 
+    fn apply_insert_batch(&self, payload: &HeapInsertBatchPayload) -> Result<(), ApplyError> {
+        HeapTarget::apply_insert_batch(self.heap.as_ref(), payload)
+    }
+
+    fn apply_insert_batch_at_lsn(
+        &self,
+        payload: &HeapInsertBatchPayload,
+        record_lsn: Lsn,
+    ) -> Result<(), ApplyError> {
+        HeapTarget::apply_insert_batch_at_lsn(self.heap.as_ref(), payload, record_lsn)
+    }
+
     fn apply_update(&self, payload: &HeapUpdatePayload) -> Result<(), ApplyError> {
         HeapTarget::apply_update(self.heap.as_ref(), payload)
     }
@@ -2507,6 +2521,29 @@ impl HeapTarget for ServerRecoveryTarget {
         record_lsn: Lsn,
     ) -> Result<(), ApplyError> {
         HeapTarget::apply_update_int32_pair_delta_batch_at_lsn(
+            self.heap.as_ref(),
+            payload,
+            record_lsn,
+        )
+    }
+
+    fn apply_update_int32_pair_delta_range_batch(
+        &self,
+        payload: &HeapUpdateInt32PairDeltaRangeBatchPayload,
+    ) -> Result<(), ApplyError> {
+        HeapTarget::apply_update_int32_pair_delta_range_batch_at_lsn(
+            self.heap.as_ref(),
+            payload,
+            Lsn::ZERO,
+        )
+    }
+
+    fn apply_update_int32_pair_delta_range_batch_at_lsn(
+        &self,
+        payload: &HeapUpdateInt32PairDeltaRangeBatchPayload,
+        record_lsn: Lsn,
+    ) -> Result<(), ApplyError> {
+        HeapTarget::apply_update_int32_pair_delta_range_batch_at_lsn(
             self.heap.as_ref(),
             payload,
             record_lsn,

@@ -35,7 +35,7 @@ async fn pg_stat_wal_reports_live_append_counters() {
 }
 
 #[tokio::test]
-async fn explicit_rollback_of_persistent_dml_writes_abort_record() {
+async fn explicit_rollback_of_persistent_dml_uses_recovery_abort_inference() {
     let data_dir = tempfile::TempDir::new().expect("tempdir");
     support::make_data_dir_private(data_dir.path());
     let running = support::start_persistent_server(data_dir.path(), "wal_abort_marker_test").await;
@@ -62,5 +62,18 @@ async fn explicit_rollback_of_persistent_dml_writes_abort_record() {
     })
     .expect("recover WAL");
 
-    assert!(abort_records > 0, "rollback wrote no abort WAL record");
+    assert_eq!(
+        abort_records, 0,
+        "unprepared explicit ROLLBACK must not force an abort WAL marker"
+    );
+
+    let restarted =
+        support::start_persistent_server(data_dir.path(), "wal_abort_inference_restart").await;
+    let rows = restarted
+        .client
+        .query("SELECT COUNT(*) FROM wal_abort_t", &[])
+        .await
+        .expect("query rolled-back table after restart");
+    assert_eq!(rows[0].get::<_, i64>(0), 0);
+    support::shutdown(restarted).await;
 }
