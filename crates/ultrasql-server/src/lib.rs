@@ -42,6 +42,14 @@
     clippy::cast_lossless,
     clippy::cast_possible_wrap
 )]
+// Panic hardening: production (non-test) server code must not `.unwrap()`,
+// `.expect()`, or `panic!`. Fallible sites propagate errors; proven invariants
+// carry a per-site `#[allow]` with an `// INVARIANT:` justification.
+// `#[cfg(test)]` modules are exempt.
+#![cfg_attr(
+    not(test),
+    deny(clippy::unwrap_used, clippy::expect_used, clippy::panic)
+)]
 
 mod aggregating_index;
 pub mod auth;

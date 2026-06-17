@@ -9,6 +9,15 @@
 //! duplex stream as well as by integration tests over a real TCP
 //! socket.
 
+// Panic hardening: production (non-test) server-binary code must not
+// `.unwrap()`, `.expect()`, or `panic!`. Fallible sites propagate errors;
+// proven invariants carry a per-site `#[allow]` with an `// INVARIANT:`
+// justification.
+#![cfg_attr(
+    not(test),
+    deny(clippy::unwrap_used, clippy::expect_used, clippy::panic)
+)]
+
 use std::fs;
 use std::io::Read;
 use std::net::SocketAddr;
