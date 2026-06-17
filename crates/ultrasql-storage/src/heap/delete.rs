@@ -606,7 +606,7 @@ pub struct DeleteInt32PairStamp {
 
 impl<L: PageLoader> HeapAccess<L> {
     const PARALLEL_WAL_DELETE_MIN_BLOCKS: u32 = 128;
-    const PARALLEL_WAL_DELETE_BLOCKS_PER_WORKER: u32 = 128;
+    const PARALLEL_WAL_DELETE_BLOCKS_PER_WORKER: u32 = 256;
 
     /// Clear `xmax` stamps for an aborted transaction.
     ///
