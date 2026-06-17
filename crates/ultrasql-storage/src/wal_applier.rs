@@ -186,7 +186,7 @@ impl<L: PageLoader + 'static> HeapTarget for HeapAccess<L> {
             if entry.slot < slot_count
                 && page
                     .read_tuple(entry.slot)
-                    .map_or(false, |existing| !existing.is_empty())
+                    .is_ok_and(|existing| !existing.is_empty())
             {
                 continue;
             }

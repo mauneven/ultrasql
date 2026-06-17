@@ -448,6 +448,10 @@ impl<L: PageLoader> HeapAccess<L> {
     /// The fused update path already knows every changed row applied the same
     /// `target_col += delta` edit, so recovery can reconstruct both the
     /// post-image and undo pre-image from the page bytes plus slot list.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "WAL emit helper mirrors fixed wire fields and reuses caller scratch"
+    )]
     pub(super) fn emit_update_int32_pair_delta_batch_wal_reuse(
         pool: &Arc<BufferPool<L>>,
         sink: &dyn WalSink,
@@ -461,16 +465,16 @@ impl<L: PageLoader> HeapAccess<L> {
     ) -> Result<Lsn, HeapError> {
         let prev_lsn = sink.last_lsn_for(writer_xid);
         let record_type = if let Some((first_slot, slot_count)) = contiguous_slot_range(slots) {
-            HeapUpdateInt32PairDeltaRangeBatchPayload::encode_range_into(
-                page_id,
+            HeapUpdateInt32PairDeltaRangeBatchPayload {
+                page: page_id,
                 writer_xid,
                 command_id,
                 target_col,
                 delta,
                 first_slot,
                 slot_count,
-                payload_buf,
-            )?;
+            }
+            .encode_into(payload_buf)?;
             RecordType::HeapUpdateInt32PairDeltaRangeBatch
         } else {
             HeapUpdateInt32PairDeltaBatchPayload::encode_slots_into(
@@ -500,6 +504,10 @@ impl<L: PageLoader> HeapAccess<L> {
     /// Buffered WAL sinks can accept this while the caller still owns the page
     /// write guard. If append fails, the page has not been mutated, so the
     /// buffer pool must not be poisoned.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "WAL emit helper mirrors fixed wire fields and reuses caller scratch"
+    )]
     pub(super) fn emit_update_int32_pair_delta_batch_wal_before_reuse(
         sink: &dyn WalSink,
         page_id: PageId,
@@ -512,16 +520,16 @@ impl<L: PageLoader> HeapAccess<L> {
         payload_buf: &mut Vec<u8>,
     ) -> Result<Lsn, HeapError> {
         let record_type = if let Some((first_slot, slot_count)) = contiguous_slot_range(slots) {
-            HeapUpdateInt32PairDeltaRangeBatchPayload::encode_range_into(
-                page_id,
+            HeapUpdateInt32PairDeltaRangeBatchPayload {
+                page: page_id,
                 writer_xid,
                 command_id,
                 target_col,
                 delta,
                 first_slot,
                 slot_count,
-                payload_buf,
-            )?;
+            }
+            .encode_into(payload_buf)?;
             RecordType::HeapUpdateInt32PairDeltaRangeBatch
         } else {
             HeapUpdateInt32PairDeltaBatchPayload::encode_slots_into(
@@ -548,6 +556,10 @@ impl<L: PageLoader> HeapAccess<L> {
     /// contract as the per-row record while avoiding one WAL append
     /// per tuple on bulk deletes.
     /// Emit one page-level in-place DELETE record, reusing `payload_buf`.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "WAL emit helper mirrors fixed wire fields and reuses caller scratch"
+    )]
     pub(super) fn emit_delete_in_place_batch_wal_reuse_after(
         pool: &Arc<BufferPool<L>>,
         sink: &dyn WalSink,
@@ -570,6 +582,10 @@ impl<L: PageLoader> HeapAccess<L> {
         )
     }
 
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "WAL emit helper mirrors fixed wire fields and reuses caller scratch"
+    )]
     pub(super) fn emit_delete_in_place_range_batch_wal_reuse_after(
         pool: &Arc<BufferPool<L>>,
         sink: &dyn WalSink,
@@ -610,6 +626,10 @@ impl<L: PageLoader> HeapAccess<L> {
     /// Buffered WAL sinks can accept this while the caller still owns the page
     /// write guard. If append fails, the page has not been mutated, so the
     /// buffer pool must not be poisoned.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "WAL emit helper mirrors fixed wire fields and reuses caller scratch"
+    )]
     pub(super) fn emit_delete_in_place_batch_wal_before_reuse(
         sink: &dyn WalSink,
         page_id: PageId,
@@ -643,6 +663,10 @@ impl<L: PageLoader> HeapAccess<L> {
             .map_err(HeapError::Wal)
     }
 
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "WAL emit helper mirrors fixed wire fields and reuses caller scratch"
+    )]
     pub(super) fn emit_delete_in_place_range_batch_wal_before_reuse(
         sink: &dyn WalSink,
         page_id: PageId,
@@ -671,6 +695,10 @@ impl<L: PageLoader> HeapAccess<L> {
         .map_err(HeapError::Wal)
     }
 
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "WAL emit helper mirrors fixed wire fields and reuses caller scratch"
+    )]
     fn emit_delete_in_place_batch_wal_reuse_after_inner(
         pool: &Arc<BufferPool<L>>,
         sink: &dyn WalSink,

@@ -1360,36 +1360,34 @@ impl HeapUpdateInt32PairDeltaRangeBatchPayload {
         slot_count: u16,
     ) -> Result<Vec<u8>, PayloadError> {
         let mut out = Vec::new();
-        Self::encode_range_into(
-            page, writer_xid, command_id, target_col, delta, first_slot, slot_count, &mut out,
-        )?;
+        Self {
+            page,
+            writer_xid,
+            command_id,
+            target_col,
+            delta,
+            first_slot,
+            slot_count,
+        }
+        .encode_into(&mut out)?;
         Ok(out)
     }
 
     /// Encode a contiguous page-local update slot range into `out`.
     ///
     /// `out` is cleared before bytes are written.
-    pub fn encode_range_into(
-        page: PageId,
-        writer_xid: Xid,
-        command_id: CommandId,
-        target_col: u8,
-        delta: i32,
-        first_slot: u16,
-        slot_count: u16,
-        out: &mut Vec<u8>,
-    ) -> Result<(), PayloadError> {
-        if target_col > 1 {
+    pub fn encode_into(&self, out: &mut Vec<u8>) -> Result<(), PayloadError> {
+        if self.target_col > 1 {
             return Err(PayloadError::Malformed(
                 "heap_update_int32_pair_delta_range_batch target_col out of range",
             ));
         }
-        if slot_count == 0 {
+        if self.slot_count == 0 {
             return Err(PayloadError::Malformed(
                 "heap_update_int32_pair_delta_range_batch slot_count must be nonzero",
             ));
         }
-        let last_slot = u32::from(first_slot) + u32::from(slot_count) - 1;
+        let last_slot = u32::from(self.first_slot) + u32::from(self.slot_count) - 1;
         if last_slot > u32::from(u16::MAX) {
             return Err(PayloadError::Malformed(
                 "heap_update_int32_pair_delta_range_batch slot range overflow",
@@ -1399,32 +1397,35 @@ impl HeapUpdateInt32PairDeltaRangeBatchPayload {
         out.clear();
         out.resize(Self::FIXED, 0);
         let mut page_buf = [0_u8; PAGE_ID_SIZE];
-        encode_page_id(&mut page_buf, page);
+        encode_page_id(&mut page_buf, self.page);
         out[..PAGE_ID_SIZE].copy_from_slice(&page_buf);
-        write_u64_le(&mut out[PAGE_ID_SIZE..PAGE_ID_SIZE + 8], writer_xid.raw());
+        write_u64_le(
+            &mut out[PAGE_ID_SIZE..PAGE_ID_SIZE + 8],
+            self.writer_xid.raw(),
+        );
         write_u32_le(
             &mut out[PAGE_ID_SIZE + 8..PAGE_ID_SIZE + 12],
-            command_id.raw(),
+            self.command_id.raw(),
         );
-        out[PAGE_ID_SIZE + 12] = target_col;
-        write_i32_le(&mut out[PAGE_ID_SIZE + 16..PAGE_ID_SIZE + 20], delta);
-        write_u16_le(&mut out[PAGE_ID_SIZE + 20..PAGE_ID_SIZE + 22], first_slot);
-        write_u16_le(&mut out[PAGE_ID_SIZE + 22..PAGE_ID_SIZE + 24], slot_count);
+        out[PAGE_ID_SIZE + 12] = self.target_col;
+        write_i32_le(&mut out[PAGE_ID_SIZE + 16..PAGE_ID_SIZE + 20], self.delta);
+        write_u16_le(
+            &mut out[PAGE_ID_SIZE + 20..PAGE_ID_SIZE + 22],
+            self.first_slot,
+        );
+        write_u16_le(
+            &mut out[PAGE_ID_SIZE + 22..PAGE_ID_SIZE + 24],
+            self.slot_count,
+        );
         write_u32_le(&mut out[PAGE_ID_SIZE + 24..Self::FIXED], 0);
         Ok(())
     }
 
     /// Encode this payload into a byte vector.
     pub fn encode(&self) -> Result<Vec<u8>, PayloadError> {
-        Self::encode_range(
-            self.page,
-            self.writer_xid,
-            self.command_id,
-            self.target_col,
-            self.delta,
-            self.first_slot,
-            self.slot_count,
-        )
+        let mut out = Vec::new();
+        self.encode_into(&mut out)?;
+        Ok(out)
     }
 
     /// Decode a `HeapUpdateInt32PairDeltaRangeBatchPayload` from bytes.
