@@ -1,14 +1,48 @@
 # UltraSQL
 
-Fast SQL database in Rust.
+An embeddable, PostgreSQL-compatible, ACID SQL database in Rust that keeps your
+relational data, JSON metadata, full-text, and vector embeddings in one engine —
+and ranks them together in one query.
 
 [![License: Apache 2.0 OR MIT](https://img.shields.io/badge/license-Apache_2.0_OR_MIT-blue.svg)](#license)
 [![Status: alpha](https://img.shields.io/badge/status-alpha-orange.svg)](ROADMAP.md)
 [![MSRV](https://img.shields.io/badge/MSRV-1.85-blue.svg)](rust-toolchain.toml)
 
-UltraSQL is a native Rust SQL database with durable storage, MVCC, WAL, query
-execution, indexes, vector search, embedded Node/Bun support, and
-release-grade benchmark tooling.
+UltraSQL is a native Rust SQL database with durable storage, MVCC, WAL,
+vectorized query execution, B-tree/hash/HNSW/IVFFlat indexes, JSON/JSONB,
+full-text search, the `vector` type with `<->`/`<=>`/`<#>` operators, embedded
+Node/Bun support, and release-grade benchmark tooling.
+
+## Why UltraSQL for RAG and agent memory
+
+RAG and agent applications usually stitch together Postgres + a vector DB +
+a search index + a cache, then reconcile them in application code. UltraSQL
+collapses that stack: source text, its embedding, and its JSON metadata are
+columns of **one ACID table**, so a single SQL statement fuses vector
+similarity, BM25 lexical relevance, and SQL/JSON metadata filters into one
+ranked top-k — inside one transaction, over one consistent MVCC snapshot.
+
+```sql
+SELECT id, body
+FROM memories
+WHERE metadata @> '{"tenant":"acme"}'
+ORDER BY hybrid_search(body, 'failed invoice payment', embedding,
+                       VECTOR '[...]', 'rrf') DESC
+LIMIT 10;
+```
+
+The moat is transactional consistency: updating a row's text, embedding, and
+metadata is one transaction, so the retrieval surfaces can never drift the way
+a separate vector store, search index, and SQL database can. See
+[docs/hybrid-search.md](docs/hybrid-search.md) for the worked example, and
+[ROADMAP.md](ROADMAP.md) P2 for what is shipped versus open (online vector-index
+MVCC, selectivity-aware filtered ANN, and competitive recall benchmarks are
+tracked there with measurable exit conditions).
+
+This is not a "fastest at everything" claim. UltraSQL's measured strengths are
+reads, scans, aggregations, and unified retrieval; heavy single-row OLTP write
+throughput is a documented weak spot. The same-host scoreboard below reports
+wins and losses honestly.
 
 The project is alpha: the engine is broad enough for serious evaluation,
 compatibility testing, and reproducible benchmarking, but release readiness is

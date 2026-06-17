@@ -148,6 +148,44 @@ file focused on what still blocks production.
 
 ## P2 - Vector, Analytics, Lakehouse
 
+### AI-Native Retrieval (hybrid search, filtered ANN, embedding MVCC)
+
+Shipped: single-query hybrid retrieval fusing vector similarity, BM25 lexical
+relevance, and SQL/JSON metadata filters via
+`ORDER BY hybrid_search(text, query, vector, probe[, fusion]) DESC LIMIT k`,
+with Reciprocal Rank Fusion (`'rrf'`) and weighted-linear fusion, reference-
+checked tests, and `docs/hybrid-search.md`. Open items below carry the
+measured baseline taken on 2026-06-16 (unfiltered HNSW recall@10 = 0.998 at
+p50 ≈ 257 µs on 2k×16d via `benchmarks/vector_ann_hnsw.sh`):
+
+- Filtered ANN (PART 2): `WHERE … ORDER BY vector_distance LIMIT k` currently
+  lowers as `Sort(Filter(Scan))`, which the ANN matcher does not recognize, so
+  filtered vector queries fall back to exact brute force (recall 1.0, no ANN
+  speedup). Exit condition: a selectivity-aware crossover (pre-filter exact for
+  selective predicates, ANN over-fetch + post-filter for loose ones, with a
+  documented threshold) plus a committed `recall@10`-vs-exact artifact across
+  0.1 %/1 %/10 %/100 % selectivities where recall stays within a documented
+  bound at every selectivity, and planner tests for the crossover.
+- Online vector-index MVCC + recovery (PART 3): the HNSW/IVFFlat index is
+  invalidated and rebuilt on DML rather than reflecting committed MVCC state
+  online. Exit condition: a recovery test proving the index matches the heap
+  after `update text+embedding+metadata in one txn → crash → restart → WAL
+  replay`, plus an embedding-generation/versioning migration test proving
+  readers stay consistent during re-embedding.
+- Agent memory primitives (PART 4): exit condition: tenant/namespace isolation
+  enforced and tested under concurrency (no cross-tenant leakage), deterministic
+  time-decay ranking (`relevance × decay(age)`), and TTL/decay eviction as
+  tested SQL, with a documented agent-memory example.
+- Retrieval observability (PART 5): exit condition: `EXPLAIN ANALYZE` on a
+  hybrid query reports index choice, candidates examined/pruned, filter
+  selectivity, per-component scores, and a recall estimate, with tests asserting
+  the explain reflects the executed path.
+- Killer demo + competitive benchmarks (PART 6): exit condition: a
+  `crates/ultrasql-node` demo that ingests embeddings + text + metadata and runs
+  a hybrid RAG query surviving restart, plus fair `recall@k`-with-latency
+  benchmarks versus PostgreSQL 17 + pgvector, LanceDB, and Qdrant in their
+  recommended configs, reporting wins and losses.
+
 ### ANN And pgvector
 
 - Production ANN certification: `Page-backed HNSW` and `Page-backed IVFFlat`
