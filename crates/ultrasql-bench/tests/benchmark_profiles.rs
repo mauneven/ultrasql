@@ -64,7 +64,7 @@ fn ci_bench_uses_pr_smoke_and_scheduled_full_certifications() {
     assert!(workflow.contains("benchmarks/certify.sh full"));
     assert!(workflow.contains("name: current commit scale sweep"));
     assert!(workflow.contains("scripts/run-benchmark-certification.py"));
-    assert!(workflow.contains("--mode quick"));
+    assert!(workflow.contains("--mode full"));
     assert!(workflow.contains("--skip-build"));
     assert!(workflow.contains("benchmark_certification_status.json"));
     assert!(workflow.contains("current-commit-scale-sweep"));
