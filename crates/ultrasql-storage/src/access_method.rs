@@ -1246,16 +1246,26 @@ impl HnswIndex {
         self.validate_vector(vector)?;
         let mut storage = self.storage.lock();
         let new_idx = storage.entries.len();
-        let mut neighbors: Vec<(usize, f32, TupleId)> = storage
+        let mut candidates: Vec<(usize, f32, Vec<f32>)> = storage
             .entries
             .iter()
             .enumerate()
             .filter(|(_, entry)| !entry.deleted)
-            .map(|(idx, entry)| (idx, self.metric.distance(vector, &entry.vector), entry.tid))
+            .map(|(idx, entry)| {
+                (
+                    idx,
+                    self.metric.distance(vector, &entry.vector),
+                    entry.vector.clone(),
+                )
+            })
             .collect();
-        neighbors.sort_by(compare_hnsw_candidates);
-        neighbors.truncate(self.m);
-        let neighbor_ids: Vec<usize> = neighbors.iter().map(|(idx, _, _)| *idx).collect();
+        candidates.sort_by(|left, right| {
+            left.1
+                .total_cmp(&right.1)
+                .then_with(|| left.0.cmp(&right.0))
+        });
+        candidates.truncate(HNSW_DEFAULT_EF_CONSTRUCTION.max(self.m));
+        let neighbor_ids = select_neighbors_heuristic(&candidates, self.m, self.metric);
 
         storage.entries.push(HnswEntry {
             vector: vector.to_vec(),
@@ -1596,24 +1606,28 @@ impl HnswIndex {
         }
         let origin = storage.entries[idx].vector.clone();
         let mut neighbors = std::mem::take(&mut storage.entries[idx].neighbors);
-        neighbors.retain(|neighbor| {
-            storage
-                .entries
-                .get(*neighbor)
-                .is_some_and(|entry| !entry.deleted)
-        });
-        neighbors.sort_by(|left, right| {
-            let left_entry = &storage.entries[*left];
-            let right_entry = &storage.entries[*right];
-            let left_distance = self.metric.distance(&origin, &left_entry.vector);
-            let right_distance = self.metric.distance(&origin, &right_entry.vector);
-            left_distance
-                .total_cmp(&right_distance)
-                .then_with(|| left_entry.tid.cmp(&right_entry.tid))
-        });
+        neighbors.sort_unstable();
         neighbors.dedup();
-        neighbors.truncate(self.m);
-        storage.entries[idx].neighbors = neighbors;
+        let mut candidates: Vec<(usize, f32, Vec<f32>)> = Vec::with_capacity(neighbors.len());
+        for neighbor in neighbors {
+            let Some(entry) = storage.entries.get(neighbor) else {
+                continue;
+            };
+            if entry.deleted {
+                continue;
+            }
+            let distance = self.metric.distance(&origin, &entry.vector);
+            candidates.push((neighbor, distance, entry.vector.clone()));
+        }
+        candidates.sort_by(|left, right| {
+            left.1
+                .total_cmp(&right.1)
+                .then_with(|| left.0.cmp(&right.0))
+        });
+        // Diversity heuristic keeps the navigable bridge edges on trim, matching
+        // the persistent index so both layers stay searchable.
+        storage.entries[idx].neighbors =
+            select_neighbors_heuristic(&candidates, self.m, self.metric);
     }
 }
 
@@ -2143,21 +2157,25 @@ impl PageBackedHnswIndex {
             return Err(AccessMethodError::DuplicateKey);
         }
 
-        let mut neighbors: Vec<(HnswNodeId, f32, TupleId)> = storage
+        // Gather every live node with its exact distance to the new vector, keep
+        // the nearest `ef_construction` as the candidate pool, then select a
+        // diverse subset with the HNSW heuristic so the navigable layer stays
+        // searchable instead of collapsing into a poorly-connected k-NN graph.
+        let mut candidates: Vec<(HnswNodeId, f32, Vec<f32>)> = storage
             .live_node_snapshot()?
             .into_iter()
-            .map(|(node_id, node_tid, node_vector)| {
-                (
-                    node_id,
-                    self.metric.distance(vector, &node_vector),
-                    node_tid,
-                )
+            .map(|(node_id, _node_tid, node_vector)| {
+                let distance = self.metric.distance(vector, &node_vector);
+                (node_id, distance, node_vector)
             })
             .collect();
-        neighbors.sort_by(compare_persistent_hnsw_candidates);
-        neighbors.truncate(self.m);
-        let neighbor_ids: Vec<HnswNodeId> =
-            neighbors.iter().map(|(node_id, _, _)| *node_id).collect();
+        candidates.sort_by(|left, right| {
+            left.1
+                .total_cmp(&right.1)
+                .then_with(|| left.0.cmp(&right.0))
+        });
+        candidates.truncate(HNSW_DEFAULT_EF_CONSTRUCTION.max(self.m));
+        let neighbor_ids = select_neighbors_heuristic(&candidates, self.m, self.metric);
 
         let node_id = storage.meta.next_node_id;
         storage.meta.next_node_id = storage
@@ -2780,7 +2798,7 @@ impl PageBackedHnswStorage {
             return Ok(Vec::new());
         };
         let origin = self.vector_for_node(origin_node)?;
-        let mut candidates = Vec::with_capacity(neighbors.len());
+        let mut candidates: Vec<(HnswNodeId, f32, Vec<f32>)> = Vec::with_capacity(neighbors.len());
         for neighbor in neighbors {
             let Some(neighbor_node) = self.node_page(neighbor)? else {
                 continue;
@@ -2789,18 +2807,21 @@ impl PageBackedHnswStorage {
                 continue;
             }
             let vector = self.vector_for_node(neighbor_node)?;
-            candidates.push((
-                neighbor,
-                metric.distance(&origin, &vector),
-                neighbor_node.tid,
-            ));
+            let distance = metric.distance(&origin, &vector);
+            candidates.push((neighbor, distance, vector));
         }
-        candidates.sort_by(compare_persistent_hnsw_candidates);
-        candidates.truncate(max_neighbors);
-        Ok(candidates
-            .into_iter()
-            .map(|(neighbor, _, _)| neighbor)
-            .collect())
+        candidates.sort_by(|left, right| {
+            left.1
+                .total_cmp(&right.1)
+                .then_with(|| left.0.cmp(&right.0))
+        });
+        // Apply the same diversity heuristic on trim so re-linking keeps the
+        // navigable bridge edges rather than greedily collapsing to the nearest.
+        Ok(select_neighbors_heuristic(
+            &candidates,
+            max_neighbors,
+            metric,
+        ))
     }
 
     fn mark_deleted(
@@ -2968,14 +2989,51 @@ impl PageBackedHnswStorage {
     }
 }
 
-fn compare_persistent_hnsw_candidates(
-    left: &(HnswNodeId, f32, TupleId),
-    right: &(HnswNodeId, f32, TupleId),
-) -> std::cmp::Ordering {
-    left.1
-        .total_cmp(&right.1)
-        .then_with(|| left.2.cmp(&right.2))
-        .then_with(|| left.0.cmp(&right.0))
+/// Maximum candidate pool examined when selecting a node's neighbors at build
+/// time — the standard HNSW `ef_construction`. The pool is the exact nearest
+/// live nodes, so this bounds the diversity heuristic's pairwise-distance cost
+/// while keeping graph quality high. Larger trades build time for recall.
+const HNSW_DEFAULT_EF_CONSTRUCTION: usize = 200;
+
+/// HNSW select-neighbors heuristic (Malkov & Yashunin 2018, Algorithm 4).
+///
+/// From `candidates` — each paired with its exact distance to the node being
+/// connected (`dist_to_q`) and the candidate's own vector, sorted by
+/// `dist_to_q` ascending — keep up to `m` that are mutually *diverse*: a
+/// candidate is pruned when it lies closer to an already-kept neighbor than to
+/// the node itself. Dropping such redundant same-cluster edges is what
+/// preserves the long-range "bridge" links that keep a single navigable layer
+/// searchable; a plain "m nearest" graph traps greedy descent in local clusters
+/// and caps recall. Pruned candidates backfill nearest-first so a node never
+/// loses degree — and thus connectivity — when few survive the diversity test.
+fn select_neighbors_heuristic<Id: Copy>(
+    candidates: &[(Id, f32, Vec<f32>)],
+    m: usize,
+    metric: HnswMetric,
+) -> Vec<Id> {
+    let mut kept: Vec<(Id, &[f32])> = Vec::with_capacity(m);
+    let mut pruned: Vec<Id> = Vec::new();
+    for (id, dist_to_q, vector) in candidates {
+        if kept.len() >= m {
+            break;
+        }
+        let diverse = kept
+            .iter()
+            .all(|(_, kept_vec)| metric.distance(vector, kept_vec) >= *dist_to_q);
+        if diverse {
+            kept.push((*id, vector.as_slice()));
+        } else {
+            pruned.push(*id);
+        }
+    }
+    let mut result: Vec<Id> = kept.iter().map(|(id, _)| *id).collect();
+    for id in pruned {
+        if result.len() >= m {
+            break;
+        }
+        result.push(id);
+    }
+    result
 }
 
 impl AccessMethod for HnswIndex {
@@ -3031,16 +3089,6 @@ fn decode_vector_key(
         vector.push(value);
     }
     Ok(vector)
-}
-
-fn compare_hnsw_candidates(
-    left: &(usize, f32, TupleId),
-    right: &(usize, f32, TupleId),
-) -> std::cmp::Ordering {
-    left.1
-        .total_cmp(&right.1)
-        .then_with(|| left.2.cmp(&right.2))
-        .then_with(|| left.0.cmp(&right.0))
 }
 
 fn compare_hnsw_hits(left: &HnswSearchResult, right: &HnswSearchResult) -> std::cmp::Ordering {
@@ -5117,6 +5165,62 @@ mod tests {
         let recall =
             f64::from(u16::try_from(overlap).unwrap()) / f64::from(u16::try_from(k).unwrap());
         assert!(recall >= 0.8, "graph recall@{k} too low: {recall}");
+    }
+
+    #[test]
+    fn page_backed_hnsw_diversity_heuristic_keeps_high_recall_in_high_dim() {
+        // 16-dimensional pseudo-random vectors: a plain "connect to the m
+        // nearest" graph navigates this poorly (greedy descent gets trapped in
+        // local clusters, recall@10 ~0.66), while the HNSW diversity heuristic
+        // preserves the long-range bridge edges that keep recall high. This test
+        // would fail on the pre-heuristic build.
+        const DIMS: usize = 16;
+        const N: u16 = 600;
+        let dims_u32 = u32::try_from(DIMS).expect("dims fit u32");
+        let am = PageBackedHnswIndex::new(RelationId::new(8811), dims_u32, HnswMetric::L2, 16, 64)
+            .expect("page-backed hnsw config");
+        let mut rng = 0x1234_5678_9abc_def0_u64;
+        let mut next_unit = || {
+            rng = rng
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            let bits = u16::try_from((rng >> 48) & 0xFFFF).expect("16 bits fit u16");
+            f32::from(bits) / f32::from(u16::MAX)
+        };
+        let mut vectors: Vec<(TupleId, Vec<f32>)> = Vec::new();
+        for i in 0..N {
+            let v: Vec<f32> = (0..DIMS).map(|_| next_unit()).collect();
+            am.insert_vector(&v, tid(1, i)).expect("insert");
+            vectors.push((tid(1, i), v));
+        }
+
+        let k = 10;
+        let mut recall_sum = 0.0_f64;
+        let trials = 30;
+        for _ in 0..trials {
+            let probe: Vec<f32> = (0..DIMS).map(|_| next_unit()).collect();
+            let mut exact: Vec<(f32, TupleId)> = vectors
+                .iter()
+                .map(|(t, v)| (HnswMetric::L2.distance(&probe, v), *t))
+                .collect();
+            exact.sort_by(|a, b| a.0.total_cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+            let want: std::collections::BTreeSet<TupleId> =
+                exact.iter().take(k).map(|(_, t)| *t).collect();
+            let got: std::collections::BTreeSet<TupleId> = am
+                .search_with_ef(&probe, k, 64)
+                .expect("graph search")
+                .into_iter()
+                .map(|hit| hit.tid)
+                .collect();
+            let overlap = want.iter().filter(|t| got.contains(t)).count();
+            recall_sum += f64::from(u16::try_from(overlap).expect("overlap fits u16"))
+                / f64::from(u16::try_from(k).expect("k fits u16"));
+        }
+        let mean = recall_sum / f64::from(trials);
+        assert!(
+            mean >= 0.9,
+            "diversity-heuristic recall@{k} too low: {mean} (pre-heuristic was ~0.66)"
+        );
     }
 
     #[test]
