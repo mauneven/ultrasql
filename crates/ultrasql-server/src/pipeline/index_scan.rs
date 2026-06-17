@@ -5,9 +5,7 @@ use std::sync::Arc;
 
 use ultrasql_catalog::{CatalogSnapshot, IndexEntry, TableEntry};
 use ultrasql_core::{BlockNumber, DataType, Field, RelationId, Schema, TupleId, Value};
-use ultrasql_executor::{
-    Eval, Filter, IndexOnlyScan, IndexScan, Limit, Operator, RowCodec, TopK,
-};
+use ultrasql_executor::{Eval, Filter, IndexOnlyScan, IndexScan, Limit, Operator, RowCodec, TopK};
 use ultrasql_mvcc::{InfoMask, TupleHeader, Visibility, is_visible};
 use ultrasql_planner::{BinaryOp, LogicalIndexMethod, LogicalPlan, ScalarExpr, SortKey};
 use ultrasql_storage::access_method::{
@@ -453,7 +451,9 @@ fn try_hnsw_filtered_sorted(
     if want > FILTERED_ANN_MAX_EF as f64 {
         return Ok(None);
     }
-    let clamped = want.clamp(FILTERED_ANN_MIN_EF as f64, FILTERED_ANN_MAX_EF as f64).ceil();
+    let clamped = want
+        .clamp(FILTERED_ANN_MIN_EF as f64, FILTERED_ANN_MAX_EF as f64)
+        .ceil();
     // INVARIANT: `clamped` is finite and within [MIN_EF, MAX_EF], both small
     // positive usizes, so the cast cannot truncate or lose sign.
     #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
@@ -497,7 +497,9 @@ fn estimate_filter_selectivity(pred: &ScalarExpr) -> f64 {
     const RANGE_SEL: f64 = 0.33;
     const DEFAULT_SEL: f64 = 0.5;
     match pred {
-        ScalarExpr::Binary { op, left, right, .. } => match op {
+        ScalarExpr::Binary {
+            op, left, right, ..
+        } => match op {
             BinaryOp::Eq => EQ_SEL,
             BinaryOp::NotEq => 1.0 - EQ_SEL,
             BinaryOp::Lt | BinaryOp::LtEq | BinaryOp::Gt | BinaryOp::GtEq => RANGE_SEL,
@@ -555,7 +557,9 @@ fn fetch_vector_visible_filtered_payloads(
                 )));
             }
             Err(e) => {
-                return Err(ServerError::ddl(format!("filtered ANN predicate eval: {e}")));
+                return Err(ServerError::ddl(format!(
+                    "filtered ANN predicate eval: {e}"
+                )));
             }
         }
         let Some(Value::Vector(vector) | Value::HalfVec(vector)) = row.get(col_idx) else {
@@ -571,7 +575,11 @@ fn fetch_vector_visible_filtered_payloads(
         let distance = metric_distance(metric, vector, probe);
         rows.push((distance, hit.tid, tuple.data));
     }
-    rows.sort_by(|left, right| left.0.total_cmp(&right.0).then_with(|| left.1.cmp(&right.1)));
+    rows.sort_by(|left, right| {
+        left.0
+            .total_cmp(&right.0)
+            .then_with(|| left.1.cmp(&right.1))
+    });
     rows.truncate(limit);
     Ok(rows.into_iter().map(|(_, _, payload)| payload).collect())
 }
