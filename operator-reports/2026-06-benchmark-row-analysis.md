@@ -62,18 +62,40 @@ via WAL backpressure (writer-driven drain wait, callers release latches first),
 all `recovery_sim`/`hermitage`/`isolation` tests green, and the sweep records a
 measured `insert_throughput_1m-ultrasql` artifact.
 
-## insert_throughput 10k & mixed_oltp 10k → PostgreSQL (OLTP write/commit path)
+## insert_throughput 10k & mixed_oltp 10k → PostgreSQL / SQLite (OLTP commit path)
 
-These are the genuine transactional-write weakness. PostgreSQL 17 wins
-single-shot INSERT-10k (7.6 ms vs 9.6 ms) and point-mixed OLTP (31 µs/op vs
-~472 µs/op). The mixed-OLTP gap is large and is the per-commit cost: every op is
-its own transaction, so the WAL commit + fsync cadence dominates. This is the
-group-commit / fsync-amplification / lock-manager surface. A genuine
-improvement here (e.g. a tuned group-commit batching window) is real future
-work; it was not landed in this pass. **Exit condition:** a committed
-before/after from the harness showing reduced per-commit latency on the
-sysbench/mixed-OLTP path with all isolation/recovery tests green; documented in
-ROADMAP P0 Performance Certification.
+These are the genuine transactional-write weakness. On the certified sweep
+PostgreSQL 17 wins single-shot INSERT-10k and PostgreSQL/SQLite win point-mixed
+OLTP (SQLite 28 µs/op, PostgreSQL 29 µs/op vs UltraSQL ~417 µs/op). Every op is
+its own transaction, so the per-commit WAL durability cost dominates.
+
+**Profiled, attempted, no win (durable-wait micro-optimization).** The commit
+barrier `wait_for_wal_durable` polled `flushed_lsn` with `notify(); sleep(50µs)`,
+so each commit appeared to pay a ~50 µs poll-quantum floor. I implemented an
+adaptive replacement: the WAL writer signals a condvar the instant it publishes
+a new durable LSN, so the committer wakes precisely instead of sleeping
+(durability contract unchanged — it still returns only once
+`flushed_lsn >= commit_lsn`). All `recovery_sim`/`hermitage`/`isolation`/WAL
+tests stayed green. But a clean same-host A/B showed **no improvement**:
+mixed_oltp was ~354 µs/op (old sleep-poll) vs ~384 µs/op (condvar) — neutral to
+slightly worse. The change was reverted.
+
+**Real root cause.** The per-commit cost is dominated by `full_fsync`
+(F_FULLFSYNC, `crates/ultrasql-wal/src/writer.rs::flush_current`), which forces a
+true power-loss flush of the drive cache and costs hundreds of µs on this host —
+far more than the 50 µs poll, so removing the poll cannot help. PostgreSQL on
+macOS uses plain `fsync` by default, which does **not** force a drive-cache
+flush, so UltraSQL is providing a *stronger* durability guarantee at a higher
+per-commit cost. The single-connection benchmark also gives group commit nothing
+to amortize across (commits are serial). A correctness-preserving win is
+therefore not available without either (a) weakening durability to PG's macOS
+`fsync` level (dishonest vs the current guarantee) or (b) async/deferred commit
+(changes durability semantics). Both are off the table under the integrity
+rules, so these rows are formally accepted as honest losses. **Exit conditions
+(ROADMAP P0):** either a multi-client OLTP benchmark where group commit amortizes
+F_FULLFSYNC across concurrent committers and UltraSQL's tx/s meets or beats the
+winner, or an apples-to-apples same-durability comparison (both engines at
+F_FULLFSYNC, or both at `fsync`) where UltraSQL's per-commit latency is no higher.
 
 ## update_throughput 1M → DuckDB, delete_throughput 100k → DuckDB, delete_throughput 1M → ClickHouse
 

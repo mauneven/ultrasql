@@ -93,6 +93,23 @@ file focused on what still blocks production.
   1M-row durable INSERT completes and the data-dir scale sweep records a
   measured `insert_throughput_1m-ultrasql` artifact (currently
   `not_available`), lifting the certification to 24 comparable rows.
+- OLTP commit-path losses (`insert_throughput_10k` → PostgreSQL,
+  `mixed_oltp_pgbench_like` → SQLite/PostgreSQL): the per-commit cost is
+  dominated by `full_fsync` (F_FULLFSYNC, true power-loss durability) in
+  `crates/ultrasql-wal/src/writer.rs::flush_current`, which is a *stronger*
+  guarantee than PostgreSQL's default macOS `fsync`. A durable-wait
+  micro-optimization (condvar wakeup instead of a 50 µs sleep-poll) was
+  profiled, implemented, and reverted after a same-host A/B showed no
+  improvement (~354 µs/op old vs ~384 µs/op new), because the fsync, not the
+  poll, dominates; see
+  [`operator-reports/2026-06-benchmark-row-analysis.md`](operator-reports/2026-06-benchmark-row-analysis.md).
+  No correctness-preserving win is available without weakening durability or
+  changing commit semantics, so these are formally accepted as honest losses.
+  Exit condition: either a committed multi-client OLTP artifact where group
+  commit amortizes F_FULLFSYNC across concurrent committers and UltraSQL's tx/s
+  is ≥ the winner's, or a same-durability-level comparison (both engines at
+  F_FULLFSYNC, or both at `fsync`) where UltraSQL's per-commit p50 is ≤ the
+  winner's. No OLTP leadership is claimed until then.
 - Fair-measurement scoreboard honesty: on the same-host data-dir sweep with a
   tuned PostgreSQL 17, UltraSQL is fastest on 17 of 24 workloads. The
   certification gate (`scripts/validate-benchmark-certification.py`) now treats

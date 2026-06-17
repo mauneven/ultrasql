@@ -96,8 +96,10 @@ The ethical claim today is narrower:
 Allowed:
 
 ```text
-UltraSQL was fastest on all 24 comparable rows in the committed 2026-06-14
-release-artifact DB-vs-DB scale sweep on the recorded Apple M4 host.
+UltraSQL was the fastest measured engine on 17 of 24 workloads in the committed
+release-artifact DB-vs-DB scale sweep (pinned commit 77a92d7c) on the recorded
+Apple M4 host; PostgreSQL 17, DuckDB, ClickHouse, and SQLite each win one or more
+of the other workloads, and the durable 1M INSERT is recorded not_available.
 ```
 
 Not allowed:
@@ -106,6 +108,8 @@ Not allowed:
 UltraSQL is production ready.
 UltraSQL is the best database in every aspect.
 UltraSQL beats every database on every workload.
+UltraSQL was fastest on all comparable scale-sweep rows.
+UltraSQL leads OLTP / has the fastest writes.
 ```
 
 Those stronger claims require every release gate in

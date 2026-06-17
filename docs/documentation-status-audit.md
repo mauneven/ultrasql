@@ -41,9 +41,14 @@ unless quoting a prohibited claim in the claim-policy section.
   indexes, JSON/JSONB, text search, vector types, HNSW/IVFFlat, COPY, external
   scans, regular views, export/import, pivot/unpivot, packaging, fuzz,
   sanitizer, release, benchmark, and driver-certification work.
-- Current benchmark claim remains narrow: UltraSQL was fastest on all 24
-  comparable rows in the committed 2026-06-14 release-artifact DB-vs-DB scale
-  sweep on the recorded Apple M4 host.
+- Current benchmark claim remains narrow and honest: UltraSQL was the fastest
+  measured engine on 17 of 24 workloads in the committed release-artifact
+  DB-vs-DB scale sweep (pinned commit 77a92d7c) on the recorded Apple M4 host.
+  PostgreSQL 17, DuckDB, ClickHouse, and SQLite each win one or more of the
+  other workloads (point-mixed OLTP, single-shot INSERT, bulk update/delete),
+  and the durable 1M INSERT is recorded not_available. The certification gate
+  certifies fair methodology and reports this win/loss scoreboard rather than
+  requiring a clean sweep.
 - That claim does not mean the full release benchmark-certification gate is
   closed. The committed benchmark certification manifest is smoke-profile
   evidence, while release sign-off still needs full-profile and WAL-backed

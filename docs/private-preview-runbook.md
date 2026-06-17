@@ -32,8 +32,9 @@ evidence.
 Allowed when linking the exact artifact:
 
 ```text
-UltraSQL was fastest on the committed release-artifact DB-vs-DB scale sweep for
-the measured comparable rows on the recorded host.
+UltraSQL was the fastest measured engine on 17 of 24 workloads of the committed
+release-artifact DB-vs-DB scale sweep on the recorded host; the scoreboard in
+benchmark_certification_status.json lists the rows each competitor wins.
 ```
 
 Not allowed:
