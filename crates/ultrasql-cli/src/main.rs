@@ -3079,6 +3079,34 @@ mod tests {
     }
 
     #[test]
+    fn every_record_type_has_a_waldump_decode_arm() {
+        // Regression guard for the build-break class where a new
+        // ultrasql-wal RecordType variant is added without a matching arm in
+        // the CLI's WAL-decode dispatch. Iterating RecordType::ALL (kept
+        // exhaustive by a compile-time guard in ultrasql-wal) ensures every
+        // current and future variant routes through a typed payload decoder.
+        //
+        // decode_wal_payload returns "decoded=<Payload>" on a successful parse
+        // and "payload_error=<err>" when a typed decoder rejects the (here,
+        // empty) payload. Both prove the variant reached a real decode arm. A
+        // future wildcard `_ =>` fallback for an unhandled variant would emit
+        // neither prefix, failing this test instead of shipping a CLI that
+        // cannot describe that record.
+        use ultrasql_core::{Lsn, Xid};
+        use ultrasql_wal::{RecordType, WalRecord};
+
+        for &rt in RecordType::ALL {
+            let record = WalRecord::new(rt, Xid::new(7), Lsn::ZERO, 0, Vec::new())
+                .expect("test WAL record should fit size limits");
+            let decoded = decode_wal_payload(&record);
+            assert!(
+                decoded.starts_with("decoded=") || decoded.starts_with("payload_error="),
+                "RecordType::{rt:?} has no typed waldump decode arm: {decoded:?}"
+            );
+        }
+    }
+
+    #[test]
     fn wal_dump_archive_restore_and_hex_helpers_cover_success_and_errors() {
         use ultrasql_core::{Lsn, Xid};
         use ultrasql_wal::{RecordType, WalRecord};

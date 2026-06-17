@@ -181,7 +181,75 @@ impl RecordType {
             other => return Err(WalRecordError::UnknownType(other)),
         })
     }
+
+    /// Every `RecordType` variant.
+    ///
+    /// Kept exhaustive by [`RecordType::ENSURE_EXHAUSTIVE`], whose match has no
+    /// wildcard arm: adding a variant to the enum fails to compile until it is
+    /// also handled there, and the `record_type_all_is_complete` test rejects
+    /// any drift between this slice and [`RecordType::from_u8`]. Round-trip and
+    /// downstream dispatch tests (including the CLI `waldump` decoder) iterate
+    /// `ALL`, so a new variant cannot silently escape encode/decode or
+    /// decode-arm coverage.
+    pub const ALL: &'static [RecordType] = &[
+        Self::HeapInsert,
+        Self::HeapUpdate,
+        Self::HeapDelete,
+        Self::FullPageWrite,
+        Self::Commit,
+        Self::Abort,
+        Self::Checkpoint,
+        Self::BTreeOp,
+        Self::HeapUpdateInPlace,
+        Self::HeapDeleteInPlace,
+        Self::SequenceOp,
+        Self::HashOp,
+        Self::HnswOp,
+        Self::IvfFlatOp,
+        Self::HeapUpdateInPlaceBatch,
+        Self::HeapDeleteInPlaceBatch,
+        Self::HeapInsertBatch,
+        Self::HeapUpdateInt32PairDeltaBatch,
+        Self::HeapDeleteInPlaceRangeBatch,
+        Self::HeapUpdateInt32PairDeltaRangeBatch,
+        Self::Nop,
+    ];
+
+    /// Compile-time exhaustiveness guard. The match deliberately has no
+    /// wildcard arm, so a newly added variant fails to compile here until it
+    /// is handled. Evaluated as a `const` so it costs nothing at runtime.
+    const ENSURE_EXHAUSTIVE: () = {
+        const fn ensure(rt: RecordType) {
+            match rt {
+                RecordType::HeapInsert
+                | RecordType::HeapUpdate
+                | RecordType::HeapDelete
+                | RecordType::FullPageWrite
+                | RecordType::Commit
+                | RecordType::Abort
+                | RecordType::Checkpoint
+                | RecordType::BTreeOp
+                | RecordType::HeapUpdateInPlace
+                | RecordType::HeapDeleteInPlace
+                | RecordType::SequenceOp
+                | RecordType::HashOp
+                | RecordType::HnswOp
+                | RecordType::IvfFlatOp
+                | RecordType::HeapUpdateInPlaceBatch
+                | RecordType::HeapDeleteInPlaceBatch
+                | RecordType::HeapInsertBatch
+                | RecordType::HeapUpdateInt32PairDeltaBatch
+                | RecordType::HeapDeleteInPlaceRangeBatch
+                | RecordType::HeapUpdateInt32PairDeltaRangeBatch
+                | RecordType::Nop => (),
+            }
+        }
+        ensure(RecordType::Nop);
+    };
 }
+
+// Force evaluation of the exhaustiveness guard.
+const _: () = RecordType::ENSURE_EXHAUSTIVE;
 
 impl From<RecordType> for u8 {
     fn from(record_type: RecordType) -> Self {
@@ -463,6 +531,47 @@ mod tests {
         let (decoded, n) = WalRecord::decode(&bytes).unwrap();
         assert_eq!(n, bytes.len());
         assert_eq!(decoded, record);
+    }
+
+    #[test]
+    fn record_type_all_is_complete() {
+        // `ALL` must list exactly the variants `from_u8` decodes, with no
+        // duplicates and no drift. A new variant added to the enum (and its
+        // `from_u8` arm) fails this test until it is appended to `ALL`.
+        let mut seen = std::collections::BTreeSet::new();
+        for &rt in RecordType::ALL {
+            let byte = u8::from(rt);
+            assert_eq!(
+                RecordType::from_u8(byte),
+                Ok(rt),
+                "type-byte round-trip failed for {rt:?}"
+            );
+            assert!(seen.insert(byte), "duplicate variant in RecordType::ALL: {rt:?}");
+        }
+        for v in 0..=u8::MAX {
+            if let Ok(rt) = RecordType::from_u8(v) {
+                assert!(
+                    seen.contains(&v),
+                    "from_u8 decodes byte {v} -> {rt:?} but RecordType::ALL omits it"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn every_record_type_encodes_and_decodes() {
+        // Each variant must survive a full WalRecord encode -> decode cycle,
+        // preserving its record-type byte and payload.
+        for &rt in RecordType::ALL {
+            let payload = [0xA5_u8, 0x5A, 0x12, 0x34];
+            let record = rec(rt, &payload);
+            let bytes = record.encode();
+            let (decoded, used) =
+                WalRecord::decode(&bytes).unwrap_or_else(|e| panic!("decode {rt:?}: {e}"));
+            assert_eq!(used, bytes.len(), "consumed length mismatch for {rt:?}");
+            assert_eq!(decoded.header.record_type, rt, "record type changed for {rt:?}");
+            assert_eq!(decoded.payload, payload, "payload changed for {rt:?}");
+        }
     }
 
     #[test]
