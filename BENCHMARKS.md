@@ -132,6 +132,48 @@ The comparison must:
 
 A comparison that violates any of these is invalid.
 
+### Methodology & Fairness (release-artifact scale sweep)
+
+The release-artifact scale sweep (`benchmarks/run_scale_sweep.sh`,
+`benchmarks/scripts/run_<engine>_writes.sh`) follows one symmetric measurement
+contract for every engine:
+
+- **Persistent connection / session.** Each engine is measured over a single
+  long-lived connection or in-process session that is opened once and reused
+  across every warmup and measured sample. No timed region spawns a client
+  process or opens a fresh connection per query:
+  - UltraSQL — one `tokio-postgres` wire connection to an external `ultrasqld`.
+  - PostgreSQL — one `psycopg` (v3) connection with server-side prepared
+    statements (`benchmarks/scripts/run_postgres_writes.py`).
+  - DuckDB / SQLite — one in-process driver connection
+    (`duckdb` / `sqlite3` Python modules).
+  - ClickHouse — one `clickhouse_driver` native-TCP session.
+  - The earlier `psql -c` / `duckdb -c` per-query process-spawn paths are gone;
+    they timed process startup, parse, and plan rather than execution.
+- **Warmup uses the measured path.** Warmup samples run the identical preloaded
+  query against the identical persistent connection. Preloads (table creation +
+  row load) happen once, outside the timed region.
+- **Fair, tuned competitors.** PostgreSQL is a dedicated, same-host
+  **PostgreSQL 17** cluster brought up by
+  `benchmarks/scripts/pg17_bench_server.sh` with documented OLTP/analytics
+  tuning (`shared_buffers`, `effective_cache_size`, `work_mem`,
+  `maintenance_work_mem`, `max_wal_size`, durable `synchronous_commit`/`fsync`).
+  Point at it with the standard `PG*` env. The default Homebrew `psql`/`postgres`
+  on PATH may be older; the recorded `engine_version` always reflects the live
+  server, not the client.
+- **Durability is matched.** A `data-dir` sweep records `storage_mode=data-dir`
+  and `durability_mode=durable` for every engine: UltraSQL runs WAL-backed,
+  PostgreSQL uses logged tables with `synchronous_commit=on`, SQLite uses
+  `journal_mode=WAL, synchronous=FULL`, DuckDB/ClickHouse use on-disk files.
+- **Host descriptor.** Every run embeds the host block (CPU, cores, RAM, OS,
+  rustc, git commit) and per-engine versions in
+  `scale_sweep_manifest.json`. Incomplete descriptors are not publishable.
+- **No unfair wins.** If an engine cannot be measured under this contract it is
+  recorded `status=not_available` with a reason, never as a loss or a win. The
+  published table bolds the engine that is actually fastest for each row from
+  the raw medians; UltraSQL is not assumed to win, and rows where a competitor
+  is faster are reported as such.
+
 ### Public Benchmark Arena
 
 The public arena publishes raw artifacts only:

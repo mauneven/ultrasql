@@ -73,8 +73,24 @@ file focused on what still blocks production.
 - Rerun TPC-H SF1/SF10 on the release host before publishing release
   performance claims; completed local evidence lives in `DONE.md`.
 - Broaden release-artifact scale-sweep coverage beyond the current same-host
-  table: larger row counts, WAL-backed `--data-dir` mode, repeatable
-  ClickHouse artifacts, and Firebolt legs when local services are available.
+  table: larger row counts, repeatable ClickHouse artifacts, and Firebolt legs
+  when local services are available.
+- Durable bulk INSERT: a 1,000,000-row INSERT fails in `--data-dir` mode with
+  `wal buffer full` because the server WAL sink rejects records instead of
+  applying backpressure when the 8 MiB `WalBuffer` is full
+  (`crates/ultrasql-server/src/lib.rs` `WAL_BUFFER_BYTES`,
+  `crates/ultrasql-wal/src/buffer.rs` `WalBuffer::append`). Exit condition: a
+  1M-row durable INSERT completes and the data-dir scale sweep records a
+  measured `insert_throughput_1m-ultrasql` artifact (currently
+  `not_available`), lifting the certification to 24 comparable rows.
+- Fair-measurement scoreboard honesty: on the 2026-06-16 same-host data-dir
+  sweep with a tuned PostgreSQL 17, UltraSQL is fastest on 17 of 23 comparable
+  rows. It is not fastest on point-mixed OLTP and single-shot INSERT-10k
+  (PostgreSQL 17 wins), UPDATE-1m and DELETE-100k (DuckDB wins), or SELECT
+  scan-100k and DELETE-1m (ClickHouse wins). `benchmark_certification_status.json`
+  is therefore `not_ready`; the supremacy gate stays as-is. Exit condition for a
+  leadership claim on any of these rows: a committed sweep where UltraSQL's
+  measured median for that row is the lowest, with no harness regression.
 - AI/vector competitor claims require same-host DuckDB, ClickHouse, and
   PostgreSQL+pgvector artifacts for exact top-k, ANN recall/latency, hybrid
   search, JSON-filtered retrieval, and RAG quality, with answer or recall gates

@@ -2,13 +2,13 @@
   "engine_versions": {
     "clickhouse": "ClickHouse local version 26.5.2.39 (official build).",
     "duckdb": "v1.5.2 (Variegata) 8a5851971f",
-    "postgres": "14.22 (Homebrew)",
+    "postgres": "17.10 (Homebrew)",
     "sqlite": "3.51.0 2025-06-12 13:14:41 f0ca7bba1c5e232e5d279fad6338121ab55af0c8c68c84cdfb18ba5114dcaapl (64-bit)",
     "ultrasql": "ultrasqld 0.0.9"
   },
   "host": {
     "cpu_model": "Apple M4",
-    "git_commit": "687d101d798a9dee712d62afe0a15d3c93765e5b",
+    "git_commit": "1e65211d5ae7dd5710a05502e5ef5fbad7d995e8",
     "hostname": "maunevens-Mac-mini.local",
     "logical_cpus": 10,
     "machine": "arm64",
@@ -26,6 +26,7 @@
   ],
   "schema_version": 1,
   "ultrasql_install_source": "ULTRASQLD_BIN",
+  "ultrasql_storage_mode": "data-dir",
   "ultrasql_version": "ultrasqld 0.0.9",
   "warmup": 8
 }

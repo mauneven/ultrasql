@@ -1,1 +1,12 @@
-{"engine": "ultrasql", "host": {"cores": 10, "cpu": "Apple M4", "os": "macos unknown", "ram_gb": 16}, "iterations_us": [336338.0, 374872.917, 347192.667, 341005.375, 340018.875, 349580.083, 397366.709, 360414.291, 335520.25, 338725.625, 335724.91599999997, 333966.91699999996, 339728.375, 334501.875, 339343.33300000004, 336769.667, 335759.04099999997, 334810.5, 336055.25, 331413.667, 334356.20900000003, 332094.167, 340131.917, 341683.667, 337494.125, 337368.25, 335428.584, 338769.41599999997, 338418.208, 332160.375, 335083.666, 336755.70900000003], "median_us": 337068.9585, "min_us": 331413.667, "n_rows": 1000000, "policy": "Raw measured samples only; no ranking or winner claim.", "samples": 32, "schema_version": 1, "server_addr": "127.0.0.1:49937", "server_mode": "external", "status": "measured", "workload": "insert_throughput_1m"}
+{
+  "durability_mode": "durable",
+  "engine": "ultrasql",
+  "n_rows": 1000000,
+  "policy": "Failure is recorded as not_available; no benchmark claim is made for this row.",
+  "reason": "Error: INSERT chunk INTO bench_insert_0\n\nCaused by:\n    0: db error\n    1: ERROR: execution error: type mismatch: wal sink: wal sink rejected record: WalBuffer rejected record: wal buffer full: have 8383400 bytes used of 8388608",
+  "schema_version": 1,
+  "server_mode": "external",
+  "status": "not_available",
+  "storage_mode": "data-dir",
+  "workload": "insert_throughput_1m"
+}

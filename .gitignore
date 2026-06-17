@@ -71,3 +71,6 @@ benchmarks/results/latest/scale-sweep/*.log
 /tpch-dbgen/
 /dists.dss
 /tpch-data/
+
+# Scratch per-engine data dirs created by benchmarks/run_scale_sweep.sh
+benchmarks/results/latest/scale-sweep/data-dirs/
