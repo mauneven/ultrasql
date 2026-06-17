@@ -17,9 +17,9 @@
 #![allow(clippy::print_stdout, clippy::print_stderr)]
 
 use std::collections::BTreeMap;
-use std::io::{Read, Seek, SeekFrom};
+use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand, ValueEnum};
@@ -510,21 +510,31 @@ fn run_queries_duckdb(
     let tmp = tempfile::tempdir().context("create temporary DuckDB directory")?;
     let db_path = tmp.path().join("tpch.duckdb");
     let setup_sql = duckdb_setup_sql(data_dir)?;
-    run_duckdb_sql(duckdb_bin, &db_path, &setup_sql).context("initialize DuckDB timing DB")?;
+    // Attach and load the TPC-H database once in a single long-lived DuckDB
+    // session. Per-query timing then measures DuckDB's execution cost over a
+    // warm buffer cache, not a fresh process startup + catalog attach on every
+    // query — matching the persistent-connection methodology used to time
+    // UltraSQL and PostgreSQL.
+    let mut session = DuckDbSession::start(duckdb_bin, &db_path)?;
+    session
+        .exec(&setup_sql)
+        .context("initialize DuckDB timing DB")?;
 
     let mut timings = Vec::with_capacity(queries.len());
     for &n in queries {
         let label = format!("q{n}");
         let sql = runner::query_sql(n)?;
         for _ in 0..warmup {
-            run_duckdb_query(duckdb_bin, &db_path, sql.as_ref())
+            session
+                .query(sql.as_ref())
                 .with_context(|| format!("warmup {label}"))?;
         }
 
         let mut elapsed_ms = Vec::with_capacity(runs);
         for _ in 0..runs {
             let t0 = Instant::now();
-            run_duckdb_query(duckdb_bin, &db_path, sql.as_ref())
+            session
+                .query(sql.as_ref())
                 .with_context(|| format!("run {label}"))?;
             elapsed_ms.push(t0.elapsed().as_secs_f64() * 1_000.0);
         }
@@ -797,14 +807,16 @@ fn run_duckdb_results(
     let tmp = tempfile::tempdir().context("create temporary DuckDB directory")?;
     let db_path = tmp.path().join("tpch.duckdb");
     let setup_sql = duckdb_setup_sql(data_dir)?;
-    run_duckdb_sql(duckdb_bin, &db_path, &setup_sql).context("initialize DuckDB reference")?;
+    let mut session = DuckDbSession::start(duckdb_bin, &db_path)?;
+    session
+        .exec(&setup_sql)
+        .context("initialize DuckDB reference")?;
 
     let mut results = Vec::new();
     for &n in queries {
         let label = format!("q{n}");
         let sql = runner::query_sql(n)?;
-        let stdout =
-            run_duckdb_query(duckdb_bin, &db_path, sql.as_ref()).with_context(|| label.clone())?;
+        let stdout = session.query(sql.as_ref()).with_context(|| label.clone())?;
         let rows = parse_csv_rows(&stdout).with_context(|| format!("parse {label} CSV"))?;
         if progress_enabled() {
             eprintln!(
@@ -840,40 +852,91 @@ fn sql_path_literal(path: &Path) -> Result<String> {
     Ok(format!("'{escaped}'"))
 }
 
-fn run_duckdb_sql(duckdb_bin: &Path, db_path: &Path, sql: &str) -> Result<()> {
-    let output = Command::new(duckdb_bin)
-        .arg(db_path)
-        .arg("-c")
-        .arg(sql)
-        .output()
-        .with_context(|| format!("spawn {}", duckdb_bin.display()))?;
-    if !output.status.success() {
-        bail!(
-            "DuckDB failed: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        );
-    }
-    Ok(())
+/// A single long-lived `duckdb` CLI process used to time TPC-H queries.
+///
+/// The TPC-H database is attached and loaded once at session start, so each
+/// `query` measures DuckDB's execution cost over a warm buffer cache rather
+/// than paying process startup, catalog attach, and a cold cache on every
+/// query. This makes the DuckDB timing symmetric with the persistent
+/// UltraSQL/PostgreSQL connections.
+///
+/// DuckDB's CLI flushes stdout after each statement when stdout is a pipe, so
+/// each command is followed by a unique sentinel `SELECT` whose single-row
+/// output delimits the command's rows in the shared stdout stream.
+struct DuckDbSession {
+    child: Child,
+    stdin: ChildStdin,
+    stdout: BufReader<ChildStdout>,
+    counter: u64,
 }
 
-fn run_duckdb_query(duckdb_bin: &Path, db_path: &Path, sql: &str) -> Result<String> {
-    let output = Command::new(duckdb_bin)
-        .arg(db_path)
-        .arg("-csv")
-        .arg("-noheader")
-        .arg("-nullvalue")
-        .arg("\\N")
-        .arg("-c")
-        .arg(sql)
-        .output()
-        .with_context(|| format!("spawn {}", duckdb_bin.display()))?;
-    if !output.status.success() {
-        bail!(
-            "DuckDB query failed: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        );
+impl DuckDbSession {
+    fn start(duckdb_bin: &Path, db_path: &Path) -> Result<Self> {
+        let mut child = Command::new(duckdb_bin)
+            .arg(db_path)
+            .arg("-csv")
+            .arg("-noheader")
+            .arg("-nullvalue")
+            .arg("\\N")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .with_context(|| format!("spawn {}", duckdb_bin.display()))?;
+        let stdin = child.stdin.take().context("capture DuckDB stdin")?;
+        let stdout = BufReader::new(child.stdout.take().context("capture DuckDB stdout")?);
+        Ok(Self {
+            child,
+            stdin,
+            stdout,
+            counter: 0,
+        })
     }
-    String::from_utf8(output.stdout).context("DuckDB emitted non-UTF8 CSV")
+
+    /// Runs one or more SQL statements and returns the CSV rows printed before
+    /// this command's sentinel.
+    fn query(&mut self, sql: &str) -> Result<String> {
+        self.counter += 1;
+        let sentinel = format!("__ULTRASQL_TPCH_SENTINEL_{}__", self.counter);
+        let body = sql.trim().trim_end_matches(';');
+        writeln!(self.stdin, "{body};").context("write DuckDB query")?;
+        writeln!(self.stdin, "SELECT '{sentinel}';").context("write DuckDB sentinel")?;
+        self.stdin.flush().context("flush DuckDB stdin")?;
+
+        let mut out = String::new();
+        let mut line = String::new();
+        loop {
+            line.clear();
+            let read = self
+                .stdout
+                .read_line(&mut line)
+                .context("read DuckDB output")?;
+            if read == 0 {
+                let mut err = String::new();
+                if let Some(mut stderr) = self.child.stderr.take() {
+                    let _ = stderr.read_to_string(&mut err);
+                }
+                bail!("DuckDB session closed unexpectedly: {}", err.trim());
+            }
+            if line.trim_end_matches(['\r', '\n']) == sentinel {
+                break;
+            }
+            out.push_str(&line);
+        }
+        Ok(out)
+    }
+
+    /// Runs statements whose output is discarded (DDL, COPY, setup).
+    fn exec(&mut self, sql: &str) -> Result<()> {
+        self.query(sql).map(|_| ())
+    }
+}
+
+impl Drop for DuckDbSession {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
 }
 
 fn parse_csv_rows(csv: &str) -> Result<Vec<Vec<String>>> {
