@@ -129,7 +129,8 @@ pub use gather::{Gather, GatherMerge};
 pub use hash_aggregate::HashAggregate;
 pub use hash_join::{HashJoin, HashJoinSchemas};
 pub use hybrid_search::{
-    HybridSearch, HybridSearchConfig, HybridSearchWeights, HybridTextSpec, HybridVectorSpec,
+    FusionMethod, HybridSearch, HybridSearchConfig, HybridSearchWeights, HybridTextSpec,
+    HybridVectorSpec,
 };
 pub use index_scan::IndexScan;
 pub use limit::Limit;

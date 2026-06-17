@@ -44,6 +44,40 @@ pub struct HybridSearch {
     eof: bool,
 }
 
+/// Score-fusion method used by [`HybridSearch`] to combine its component
+/// signals into one ranking.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum FusionMethod {
+    /// Weighted linear sum of normalized component scores:
+    /// `Σ weightₘ · scoreₘ`. BM25 is used as-is; vector similarity, recency,
+    /// and version are min/max normalized across the candidate set.
+    WeightedLinear,
+    /// Reciprocal Rank Fusion. Each component independently ranks the
+    /// candidates (best = rank 1); the fused score is
+    /// `Σ weightₘ / (k + rankₘ)`. A candidate absent from a component's
+    /// ranking (e.g. no lexical match) contributes nothing for that
+    /// component. RRF is robust to incomparable score scales, which is why
+    /// it is the documented default for the SQL `ai_search` surface.
+    Rrf {
+        /// Rank-damping constant (Cormack et al. use 60). Larger `k`
+        /// flattens the contribution of top ranks.
+        k: f64,
+    },
+}
+
+impl FusionMethod {
+    /// The conventional RRF damping constant from the original paper.
+    pub const RRF_DEFAULT_K: f64 = 60.0;
+
+    /// RRF with the conventional damping constant.
+    #[must_use]
+    pub const fn rrf() -> Self {
+        Self::Rrf {
+            k: Self::RRF_DEFAULT_K,
+        }
+    }
+}
+
 /// Configuration for [`HybridSearch`].
 #[derive(Clone, Debug)]
 pub struct HybridSearchConfig {
@@ -64,6 +98,8 @@ pub struct HybridSearchConfig {
     pub limit: usize,
     /// Component weights used for the final score.
     pub weights: HybridSearchWeights,
+    /// How component scores are fused into the final ranking.
+    pub fusion: FusionMethod,
 }
 
 impl HybridSearchConfig {
@@ -79,6 +115,7 @@ impl HybridSearchConfig {
             version_column: None,
             limit,
             weights: HybridSearchWeights::DEFAULT,
+            fusion: FusionMethod::WeightedLinear,
         }
     }
 }
@@ -261,40 +298,14 @@ impl HybridSearch {
     }
 
     fn rank_candidates(&self, candidates: Vec<Candidate>) -> Vec<Vec<Value>> {
-        let query_terms = self
-            .config
-            .text
-            .as_ref()
-            .map(|spec| unique_terms(tokenize(&spec.query)))
-            .unwrap_or_default();
-        let doc_freq = document_frequencies(&candidates, &query_terms);
-        let avg_doc_len = average_document_len(&candidates);
-        let corpus_docs = candidates.len().to_f64().unwrap_or(0.0);
-        let recency_range = finite_range(candidates.iter().filter_map(|c| c.recency));
-        let version_range = finite_range(candidates.iter().filter_map(|c| c.version));
-
+        let scores = self.component_scores(&candidates);
         let mut scored: Vec<ScoredRow> = candidates
             .into_iter()
-            .map(|candidate| {
-                let bm25 = bm25_score(
-                    &candidate,
-                    &query_terms,
-                    &doc_freq,
-                    avg_doc_len,
-                    corpus_docs,
-                );
-                let vector = candidate.vector_similarity.unwrap_or(0.0);
-                let recency = normalized(candidate.recency, recency_range);
-                let version = normalized(candidate.version, version_range);
-                let score = (self.config.weights.bm25 * bm25)
-                    + (self.config.weights.vector * vector)
-                    + (self.config.weights.recency * recency)
-                    + (self.config.weights.version * version);
-                ScoredRow {
-                    row: candidate.row,
-                    ordinal: candidate.ordinal,
-                    score,
-                }
+            .zip(scores)
+            .map(|(candidate, score)| ScoredRow {
+                row: candidate.row,
+                ordinal: candidate.ordinal,
+                score,
             })
             .collect();
 
@@ -304,6 +315,95 @@ impl HybridSearch {
             .take(self.config.limit)
             .map(|scored| scored.row)
             .collect()
+    }
+
+    /// Compute the fused score for each candidate, in candidate order.
+    ///
+    /// The lexical (BM25), vector, recency, and version signals are derived
+    /// once, then combined per [`FusionMethod`]. Splitting derivation from
+    /// fusion keeps the two fusion strategies — and the explainability hook
+    /// in PART 5 — reading from one set of component values.
+    fn component_scores(&self, candidates: &[Candidate]) -> Vec<f64> {
+        let query_terms = self
+            .config
+            .text
+            .as_ref()
+            .map(|spec| unique_terms(tokenize(&spec.query)))
+            .unwrap_or_default();
+        let doc_freq = document_frequencies(candidates, &query_terms);
+        let avg_doc_len = average_document_len(candidates);
+        let corpus_docs = candidates.len().to_f64().unwrap_or(0.0);
+
+        let bm25: Vec<f64> = candidates
+            .iter()
+            .map(|c| bm25_score(c, &query_terms, &doc_freq, avg_doc_len, corpus_docs))
+            .collect();
+        let vector: Vec<Option<f64>> = candidates.iter().map(|c| c.vector_similarity).collect();
+        let recency: Vec<Option<f64>> = candidates.iter().map(|c| c.recency).collect();
+        let version: Vec<Option<f64>> = candidates.iter().map(|c| c.version).collect();
+        let weights = self.config.weights;
+
+        match self.config.fusion {
+            FusionMethod::WeightedLinear => {
+                let recency_range = finite_range(recency.iter().copied().flatten());
+                let version_range = finite_range(version.iter().copied().flatten());
+                (0..candidates.len())
+                    .map(|i| {
+                        (weights.bm25 * bm25[i])
+                            + (weights.vector * vector[i].unwrap_or(0.0))
+                            + (weights.recency * normalized(recency[i], recency_range))
+                            + (weights.version * normalized(version[i], version_range))
+                    })
+                    .collect()
+            }
+            FusionMethod::Rrf { k } => {
+                // BM25 only contributes a lexical rank when a query term
+                // actually matched (score > 0); a zero score means the row
+                // is absent from the lexical result list.
+                let bm25_opt: Vec<Option<f64>> =
+                    bm25.iter().map(|&s| (s > 0.0).then_some(s)).collect();
+                let bm25_rank = rrf_ranks(&bm25_opt);
+                let vector_rank = rrf_ranks(&vector);
+                let recency_rank = rrf_ranks(&recency);
+                let version_rank = rrf_ranks(&version);
+                (0..candidates.len())
+                    .map(|i| {
+                        rrf_term(weights.bm25, bm25_rank[i], k)
+                            + rrf_term(weights.vector, vector_rank[i], k)
+                            + rrf_term(weights.recency, recency_rank[i], k)
+                            + rrf_term(weights.version, version_rank[i], k)
+                    })
+                    .collect()
+            }
+        }
+    }
+}
+
+/// Assign 1-based ranks to each index by descending value (best = rank 1).
+///
+/// Indices whose value is `None` are absent from this component's ranking
+/// and receive `None`. Ties are broken by original index so the ranking is
+/// deterministic.
+fn rrf_ranks(values: &[Option<f64>]) -> Vec<Option<usize>> {
+    let mut order: Vec<usize> = (0..values.len()).filter(|&i| values[i].is_some()).collect();
+    order.sort_by(|&a, &b| {
+        let va = values[a].unwrap_or(f64::NEG_INFINITY);
+        let vb = values[b].unwrap_or(f64::NEG_INFINITY);
+        vb.total_cmp(&va).then_with(|| a.cmp(&b))
+    });
+    let mut ranks = vec![None; values.len()];
+    for (rank, &idx) in order.iter().enumerate() {
+        ranks[idx] = Some(rank + 1);
+    }
+    ranks
+}
+
+/// One Reciprocal Rank Fusion term: `weight / (k + rank)`, or `0` when the
+/// candidate is absent from this component's ranking.
+fn rrf_term(weight: f64, rank: Option<usize>, k: f64) -> f64 {
+    match rank {
+        Some(rank) => weight / (k + rank.to_f64().unwrap_or(f64::INFINITY)),
+        None => 0.0,
     }
 }
 
@@ -692,6 +792,7 @@ mod tests {
                 recency: 0.75,
                 version: 0.25,
             },
+            fusion: FusionMethod::WeightedLinear,
         };
 
         let mut op = HybridSearch::new(Box::new(scan), schema.clone(), config);
@@ -712,6 +813,103 @@ mod tests {
         assert!(op.next_batch().expect("eof check").is_none());
     }
 
+    /// 1-based rank by descending value, ties broken by index — the same
+    /// contract as the operator's `rrf_ranks`, reimplemented independently
+    /// so the test is a true reference check rather than a tautology.
+    fn reference_rank_desc(values: &[f64]) -> Vec<usize> {
+        let mut order: Vec<usize> = (0..values.len()).collect();
+        order.sort_by(|&a, &b| values[b].total_cmp(&values[a]).then_with(|| a.cmp(&b)));
+        let mut ranks = vec![0usize; values.len()];
+        for (rank, &idx) in order.iter().enumerate() {
+            ranks[idx] = rank + 1;
+        }
+        ranks
+    }
+
+    fn drain_ids(op: &mut HybridSearch, schema: &Schema) -> Vec<i32> {
+        let mut ids = Vec::new();
+        while let Some(batch) = op.next_batch().expect("hybrid search batch") {
+            for row in batch_to_rows(&batch, schema).expect("decode") {
+                match row.first() {
+                    Some(Value::Int32(id)) => ids.push(*id),
+                    other => panic!("expected Int32 id, got {other:?}"),
+                }
+            }
+        }
+        ids
+    }
+
+    #[test]
+    fn hybrid_search_rrf_matches_reference_fusion() {
+        // Two components (vector closeness, version) whose rankings disagree,
+        // so the fused order is non-trivial and exercises real RRF math.
+        let schema = schema();
+        let spec = [(1, 0.1_f32, 1_i64), (2, 0.2, 4), (3, 0.3, 3), (4, 0.4, 2)];
+        let rows: Vec<Vec<Value>> = spec
+            .iter()
+            .map(|&(id, dist, version)| {
+                vec![
+                    Value::Int32(id),
+                    Value::Text(String::new()),
+                    Value::Vector(vec![dist, 0.0]),
+                    Value::Jsonb("{}".to_owned()),
+                    Value::Int64(0),
+                    Value::Int64(version),
+                    Value::Bool(true),
+                ]
+            })
+            .collect();
+        let batch = build_batch(&rows, &schema).expect("rows encode");
+        let scan = MemTableScan::new(schema.clone(), vec![batch]);
+        let config = HybridSearchConfig {
+            text: None,
+            vector: Some(HybridVectorSpec {
+                column: 2,
+                probe: vec![0.0, 0.0],
+                metric: VectorMetric::L2,
+            }),
+            metadata_filter: None,
+            where_predicate: None,
+            recency_column: None,
+            version_column: Some(5),
+            limit: 4,
+            weights: HybridSearchWeights {
+                bm25: 0.0,
+                vector: 1.0,
+                recency: 0.0,
+                version: 1.0,
+            },
+            fusion: FusionMethod::rrf(),
+        };
+        let mut op = HybridSearch::new(Box::new(scan), schema.clone(), config);
+        let got = drain_ids(&mut op, &schema);
+
+        // Independent reference RRF over the same component signals.
+        let k = FusionMethod::RRF_DEFAULT_K;
+        let vector_sim: Vec<f64> = spec
+            .iter()
+            .map(|&(_, dist, _)| 1.0 / (1.0 + f64::from(dist)))
+            .collect();
+        let version: Vec<f64> = spec.iter().map(|&(_, _, v)| v as f64).collect();
+        let vrank = reference_rank_desc(&vector_sim);
+        let verrank = reference_rank_desc(&version);
+        let mut expected: Vec<(i32, f64)> = spec
+            .iter()
+            .enumerate()
+            .map(|(i, &(id, _, _))| {
+                let score = 1.0 / (k + vrank[i] as f64) + 1.0 / (k + verrank[i] as f64);
+                (id, score)
+            })
+            .collect();
+        expected.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+        let expected_ids: Vec<i32> = expected.into_iter().map(|(id, _)| id).collect();
+
+        assert_eq!(got, expected_ids);
+        // Sanity: the disagreeing components make the fused winner id=2, not
+        // the vector-closest id=1.
+        assert_eq!(got.first(), Some(&2));
+    }
+
     #[test]
     fn hybrid_search_limit_zero_returns_eof_without_draining_child() {
         let schema = schema();
@@ -729,6 +927,7 @@ mod tests {
             version_column: None,
             limit: 0,
             weights: HybridSearchWeights::default(),
+            fusion: FusionMethod::WeightedLinear,
         };
 
         let mut op = HybridSearch::new(Box::new(scan), schema, config);
@@ -756,6 +955,7 @@ mod tests {
             version_column: None,
             limit: 1,
             weights: HybridSearchWeights::default(),
+            fusion: FusionMethod::WeightedLinear,
         };
 
         let mut op = HybridSearch::new(Box::new(scan), schema, config);
