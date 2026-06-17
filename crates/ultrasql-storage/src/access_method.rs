@@ -1866,6 +1866,16 @@ impl PageBackedHnswIndex {
         })
     }
 
+    /// The index's configured default exploration budget (`ef_search`).
+    ///
+    /// Callers that override `ef_search` per query (filtered ANN over-fetch,
+    /// recall/latency sweeps) use this as a floor so a query never explores less
+    /// than the index was built to.
+    #[must_use]
+    pub const fn ef_search(&self) -> usize {
+        self.ef_search
+    }
+
     /// Export buffer-pool-style page images in block-number order.
     #[must_use]
     pub fn page_images(&self) -> Vec<PageBackedHnswPageImage> {

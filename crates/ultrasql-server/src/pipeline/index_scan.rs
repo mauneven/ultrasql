@@ -286,15 +286,28 @@ fn try_hnsw_sorted_scan(
     let Some((col_idx, metric, probe)) = match_hnsw_sort_key(&key.expr) else {
         return Ok(None);
     };
+    // Over-fetch candidates beyond `limit`: an MVCC-dead tuple (aborted, or
+    // superseded by an UPDATE) can sit nearer the probe than a live row and,
+    // taking exactly `limit` candidates, would push a real answer out of the
+    // result only to be dropped by the visibility recheck — leaving fewer than
+    // `limit` live rows. A wider candidate set absorbs that mortality; the exact
+    // fallback below covers the rest.
     let hits = if let Some(hnsw) = find_hnsw_index(ctx, table_entry, col_idx, metric) {
-        hnsw.search(&probe, limit)
+        let want = limit
+            .saturating_mul(ANN_TOPK_OVERFETCH)
+            .max(ANN_TOPK_MIN_EF)
+            .max(hnsw.ef_search());
+        hnsw.search_with_ef(&probe, want, want)
             .map_err(|e| ServerError::ddl(format!("HNSW search: {e}")))?
             .into_iter()
             .map(|hit| VectorSearchHit { tid: hit.tid })
             .collect::<Vec<_>>()
     } else if let Some(ivfflat) = find_ivfflat_index(ctx, table_entry, col_idx, metric) {
+        let want = limit
+            .saturating_mul(ANN_TOPK_OVERFETCH)
+            .max(ANN_TOPK_MIN_EF);
         ivfflat
-            .search(&probe, limit)
+            .search(&probe, want)
             .map_err(|e| ServerError::ddl(format!("IVFFlat search: {e}")))?
             .into_iter()
             .map(|hit| VectorSearchHit { tid: hit.tid })
@@ -305,7 +318,15 @@ fn try_hnsw_sorted_scan(
     if hits.is_empty() {
         return Ok(None);
     }
-    let payloads = fetch_vector_visible_payloads(&hits, table_entry, col_idx, metric, &probe, ctx)?;
+    let mut payloads =
+        fetch_vector_visible_payloads(&hits, table_entry, col_idx, metric, &probe, ctx)?;
+    // If even the over-fetch cannot deliver `limit` live rows, the ANN answer is
+    // not trustworthy at this `k` — decline to lower and let the exact sort path
+    // (recall 1.0) handle it.
+    if payloads.len() < limit {
+        return Ok(None);
+    }
+    payloads.truncate(limit);
     let codec = RowCodec::new(table_entry.schema.clone());
     Ok(Some(Box::new(IndexScan::new(payloads, codec))))
 }
@@ -358,6 +379,14 @@ fn hnsw_column_probe(
 const FILTERED_ANN_OVERFETCH: usize = 4;
 const FILTERED_ANN_MIN_EF: usize = 64;
 const FILTERED_ANN_MAX_EF: usize = 8192;
+
+// Unfiltered top-k ANN over-fetches candidates beyond `k` so MVCC-dead tuples
+// (aborted, or superseded by an UPDATE) sitting near the probe cannot occupy a
+// result slot only to be dropped by the visibility recheck — which would starve
+// the answer below `k` live rows. This mirrors the filtered path's over-fetch,
+// but it is sized for tuple mortality rather than filter selectivity.
+const ANN_TOPK_OVERFETCH: usize = 4;
+const ANN_TOPK_MIN_EF: usize = 64;
 
 /// Try to lower `WHERE <predicate> ORDER BY vector_distance LIMIT k`
 /// (`Sort(Filter(Scan))`, optionally under a `Project`) through an HNSW index

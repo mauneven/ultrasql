@@ -726,6 +726,176 @@ async fn hnsw_filtered_top_k_returns_correct_filtered_neighbors() {
 }
 
 #[tokio::test]
+async fn vector_index_and_heap_agree_after_transactional_update_and_crash() {
+    // The moat: text, embedding, and metadata are columns of one ACID table, so
+    // updating all three in one transaction and then crashing must recover to a
+    // state where the vector index agrees with the heap — the updated row is
+    // found at its new vector position, never the stale one.
+    let dir = tempfile::tempdir().expect("tempdir");
+    {
+        let (client, _conn, server_handle) =
+            start_crash_persistent_server_and_connect(dir.path()).await;
+        client
+            .batch_execute(
+                "CREATE TABLE memories \
+                 (id INT NOT NULL, body TEXT, embedding VECTOR(3), metadata JSONB)",
+            )
+            .await
+            .expect("create table");
+        client
+            .batch_execute(
+                "INSERT INTO memories VALUES \
+                 (1, 'alpha', '[0,0,0]', '{\"v\":1}'), \
+                 (2, 'beta',  '[5,0,0]', '{\"v\":1}'), \
+                 (3, 'gamma', '[9,0,0]', '{\"v\":1}')",
+            )
+            .await
+            .expect("insert rows");
+        client
+            .batch_execute(
+                "CREATE INDEX memories_emb ON memories USING hnsw (embedding vector_l2_ops)",
+            )
+            .await
+            .expect("create index");
+        // One transaction updates text + embedding + metadata together: move id=3
+        // from far ([9,0,0]) to near ([0.1,0,0]).
+        client
+            .batch_execute(
+                "BEGIN; \
+                 UPDATE memories \
+                 SET body='gamma-v2', embedding='[0.1,0,0]', metadata='{\"v\":2}' \
+                 WHERE id=3; \
+                 COMMIT;",
+            )
+            .await
+            .expect("transactional update");
+        // Crash: abort the server without a graceful shutdown.
+        shutdown(client, server_handle).await;
+    }
+    {
+        let (client, _conn, server_handle) =
+            start_crash_persistent_server_and_connect(dir.path()).await;
+        // Vector search reflects the committed embedding update after recovery:
+        // id=3 (now [0.1,0,0]) is the second-nearest to the origin, ahead of id=2.
+        let messages = client
+            .simple_query("SELECT id FROM memories ORDER BY embedding <-> VECTOR '[0,0,0]' LIMIT 2")
+            .await
+            .expect("vector search after recovery");
+        assert_eq!(
+            simple_rows(&messages),
+            vec![vec!["1".to_owned()], vec!["3".to_owned()]],
+            "vector index must reflect the committed embedding update after crash recovery"
+        );
+        // Heap reflects the committed text + metadata from the same transaction.
+        let body = client
+            .simple_query("SELECT body FROM memories WHERE id=3")
+            .await
+            .expect("body after recovery");
+        assert_eq!(simple_rows(&body), vec![vec!["gamma-v2".to_owned()]]);
+        let meta = client
+            .simple_query("SELECT metadata->>'v' FROM memories WHERE id=3")
+            .await
+            .expect("metadata after recovery");
+        assert_eq!(simple_rows(&meta), vec![vec!["2".to_owned()]]);
+        shutdown(client, server_handle).await;
+    }
+}
+
+#[tokio::test]
+async fn rolled_back_embedding_update_does_not_affect_vector_search() {
+    // MVCC visibility: an aborted embedding update must leave no trace in vector
+    // search — the index reflects committed state only and never drifts to an
+    // uncommitted vector.
+    let (client, _conn, server_handle) = start_server_and_connect().await;
+    client
+        .batch_execute("CREATE TABLE m2 (id INT NOT NULL, embedding VECTOR(3))")
+        .await
+        .expect("create table");
+    client
+        .batch_execute("INSERT INTO m2 VALUES (1,'[0,0,0]'),(2,'[5,0,0]'),(3,'[9,0,0]')")
+        .await
+        .expect("insert rows");
+    client
+        .batch_execute("CREATE INDEX m2_emb ON m2 USING hnsw (embedding vector_l2_ops)")
+        .await
+        .expect("create index");
+    // Move id=3 near the origin, then roll back.
+    client
+        .batch_execute("BEGIN; UPDATE m2 SET embedding='[0.1,0,0]' WHERE id=3; ROLLBACK;")
+        .await
+        .expect("rolled-back update");
+    // Search reflects committed state only: id=3 stays far, so the top-2 nearest
+    // to the origin are id=1 and id=2 — not the rolled-back id=3.
+    let messages = client
+        .simple_query("SELECT id FROM m2 ORDER BY embedding <-> VECTOR '[0,0,0]' LIMIT 2")
+        .await
+        .expect("vector search after rollback");
+    assert_eq!(
+        simple_rows(&messages),
+        vec![vec!["1".to_owned()], vec!["2".to_owned()]],
+        "rolled-back embedding update must not appear in vector search"
+    );
+    shutdown(client, server_handle).await;
+}
+
+#[tokio::test]
+async fn embedding_generations_coexist_during_re_embedding_migration() {
+    // Re-embedding a corpus when the model changes: a model_version column tracks
+    // which generation produced each vector. During the migration both
+    // generations coexist and are queryable independently (each pins its own
+    // vectors via the metadata filter), so readers stay consistent.
+    let (client, _conn, server_handle) = start_server_and_connect().await;
+    client
+        .batch_execute(
+            "CREATE TABLE corpus \
+             (doc_id INT NOT NULL, model_version INT NOT NULL, embedding VECTOR(2), body TEXT)",
+        )
+        .await
+        .expect("create table");
+    // Generation 1.
+    client
+        .batch_execute(
+            "INSERT INTO corpus VALUES \
+             (1,1,'[0,0]','a'), (2,1,'[5,0]','b'), (3,1,'[9,0]','c')",
+        )
+        .await
+        .expect("generation 1");
+    client
+        .batch_execute("CREATE INDEX corpus_emb ON corpus USING hnsw (embedding vector_l2_ops)")
+        .await
+        .expect("create index");
+    // Re-embed with a new model in one transaction: generation 2 with different
+    // vectors (doc 3 is now nearest the origin instead of doc 1).
+    client
+        .batch_execute(
+            "BEGIN; \
+             INSERT INTO corpus VALUES (1,2,'[9,0]','a'), (2,2,'[5,0]','b'), (3,2,'[0,0]','c'); \
+             COMMIT;",
+        )
+        .await
+        .expect("generation 2 migration");
+    // Old generation still queryable, pinned to its own vectors.
+    let gen1 = client
+        .simple_query(
+            "SELECT doc_id FROM corpus WHERE model_version=1 \
+             ORDER BY embedding <-> VECTOR '[0,0]' LIMIT 1",
+        )
+        .await
+        .expect("generation 1 search");
+    assert_eq!(simple_rows(&gen1), vec![vec!["1".to_owned()]]);
+    // New generation queryable, with its own nearest neighbor.
+    let gen2 = client
+        .simple_query(
+            "SELECT doc_id FROM corpus WHERE model_version=2 \
+             ORDER BY embedding <-> VECTOR '[0,0]' LIMIT 1",
+        )
+        .await
+        .expect("generation 2 search");
+    assert_eq!(simple_rows(&gen2), vec![vec!["3".to_owned()]]);
+    shutdown(client, server_handle).await;
+}
+
+#[tokio::test]
 async fn ann_quantized_payload_options_work_through_sql_indexes() {
     let (client, _conn, server_handle) = start_server_and_connect().await;
 
