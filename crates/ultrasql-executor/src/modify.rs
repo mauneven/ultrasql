@@ -2929,11 +2929,11 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Test 2: insert emits a WAL record per inserted row
+    // Test 2: insert emits one page-batched WAL record
     // -----------------------------------------------------------------------
 
     #[test]
-    fn insert_emits_wal_record_per_inserted_row() {
+    fn insert_emits_page_batched_wal_record() {
         let heap = make_heap();
         let schema = schema_i32_text();
         let wal = Arc::new(InMemoryWalSink::new());
@@ -2956,8 +2956,12 @@ mod tests {
 
         op.next_batch().unwrap();
 
-        // Each insert should emit exactly one WAL record.
-        assert_eq!(wal.len(), 2, "expected 2 WAL records");
+        let records = wal.records();
+        assert_eq!(records.len(), 1, "expected one page-batched WAL record");
+        assert_eq!(
+            format!("{:?}", records[0].1.header.record_type),
+            "HeapInsertBatch"
+        );
     }
 
     // -----------------------------------------------------------------------
