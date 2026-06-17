@@ -394,4 +394,9 @@ pathlib.Path(manifest_path).write_text(json.dumps(doc, indent=2) + "\n")
 print(json.dumps(doc, indent=2))
 PY
 
+# Advisory backstop: surface any benchmark data dir that leaked into target/.
+# Transient data dirs must live under $ULTRASQL_BENCH_SCRATCH (benchmarks/scratch.sh).
+"$(dirname "$0")/check_no_scratch_in_repo.sh" || \
+    echo "warning: benchmark scratch leaked into target/ — run 'make clean-scratch'" >&2
+
 exit "$failed"

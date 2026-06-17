@@ -289,14 +289,42 @@ Use this artifact to catch obvious query-path regressions and to see whether
 UltraSQL is faster or slower than SQLite/DuckDB/PostgreSQL on the current
 portable suite. Do not publish it as a TPC-H, ClickBench, or OLTP result.
 
+### Local Disk And Scratch Directories
+
+Benchmark and certification runners must never bloat the working tree or
+`target/`. Transient database data dirs (heap/WAL/segment files) and cached
+inputs live under an external scratch root, resolved by `benchmarks/scratch.sh`:
+
+```text
+ULTRASQL_BENCH_SCRATCH   default: ${TMPDIR:-/tmp}/ultrasql-bench   (outside the repo)
+```
+
+Every runner defaults its work dir to a subdirectory of that root. Point it at a
+larger disk when needed, e.g. `ULTRASQL_BENCH_SCRATCH=/mnt/big/scratch
+benchmarks/tpch_sf1_postgres_certify.sh`. Release/benchmark builds also set
+`CARGO_INCREMENTAL=0` so a one-shot measured build does not accumulate gigabytes
+of incremental cache.
+
+Reclaim everything (incremental caches + the scratch root + any stray non-cargo
+directory under `target/`) with:
+
+```bash
+make clean-scratch          # or: scripts/clean-scratch.sh [--dry-run]
+```
+
+`benchmarks/check_no_scratch_in_repo.sh` is the backstop: it fails if a runner
+leaks a data dir into `target/`. `certify.sh` calls it as an advisory at the end
+of a run, and `tests/scripts/test_check_no_scratch_in_repo.py` enforces the
+guard's behavior in CI.
+
 ### TPC-H Data Generation
 
 TPC-H data must come from an external `dbgen` / `qgen` checkout, not a
 vendored source tree in the UltraSQL repository root. Use
 `scripts/setup-tpch-dbgen.sh` to install the pinned checkout under
 `target/tools/tpch-dbgen`, or point `ULTRASQL_TPCH_DBGEN` at another
-local binary. Generated `.tbl` files belong under `target/` or another
-ignored local directory.
+local binary. Generated `.tbl` files and database data dirs belong under the
+external scratch root (see "Local Disk And Scratch Directories"), never the repo.
 
 The synthetic fallback in `ultrasql-bench tpch gen-data` exists only for
 CI and smoke tests. Results produced from synthetic data are not TPC-H
