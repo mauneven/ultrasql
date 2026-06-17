@@ -162,12 +162,15 @@ struct EngineResult {
 /// Returns `(workload_name, engine_name, result)` on success.  The workload
 /// name comes from the `"workload"` field in the file; the engine name is
 /// derived from the file stem by stripping the workload prefix.
-fn load_raw_file(path: &Path) -> Result<(String, String, EngineResult)> {
+fn load_raw_file(path: &Path) -> Result<Option<(String, String, EngineResult)>> {
     let raw = std::fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
 
     // Parse the whole file as a generic JSON map so we can extract extras.
     let full: HashMap<String, Value> = serde_json::from_str(&raw)
         .with_context(|| format!("parse JSON from {}", path.display()))?;
+    if full.get("status").and_then(Value::as_str) == Some("not_available") {
+        return Ok(None);
+    }
 
     // Deserialize the typed fields.
     let record: RawRecord = serde_json::from_str(&raw)
@@ -214,7 +217,7 @@ fn load_raw_file(path: &Path) -> Result<(String, String, EngineResult)> {
         extras,
     };
 
-    Ok((record.workload, engine, result))
+    Ok(Some((record.workload, engine, result)))
 }
 
 /// Load all `*.json` files from `dir`, grouping results by workload.
@@ -233,9 +236,10 @@ fn load_raw_dir(dir: &Path) -> Result<HashMap<String, Vec<EngineResult>>> {
             continue;
         }
         match load_raw_file(&path) {
-            Ok((workload, _engine, result)) => {
+            Ok(Some((workload, _engine, result))) => {
                 by_workload.entry(workload).or_default().push(result);
             }
+            Ok(None) => {}
             Err(e) => {
                 eprintln!("results-render: skipping {}: {e}", path.display());
             }
@@ -720,8 +724,13 @@ mod tests {
         std::fs::write(dir.path().join("insert_throughput_10k-postgres17.json"), na)
             .expect("write not_available record");
 
-        // load_raw_dir should fail to deserialize the not_available record
-        // (it lacks `median_us`) and skip it with a warning.
+        let skipped = load_raw_file(&dir.path().join("insert_throughput_10k-postgres17.json"))
+            .expect("load not_available record");
+        assert!(
+            skipped.is_none(),
+            "not_available records should skip cleanly before timing deserialization"
+        );
+
         let mut by_workload = load_raw_dir(dir.path()).expect("load_raw_dir");
         for results in by_workload.values_mut() {
             rank_engines(results);

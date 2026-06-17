@@ -28,6 +28,7 @@ fn scale_sweep_script_uses_external_release_artifact() {
     assert!(script.contains("SCALE_SWEEP_STORAGE"));
     assert!(script.contains("SCALE_SWEEP_DATA_ROOT"));
     assert!(script.contains("--data-dir \"$data_dir\""));
+    assert!(script.contains("--storage-mode \"$STORAGE_MODE\""));
     assert!(script.contains("\"ultrasql_storage_mode\""));
     assert!(script.contains("\"host\""));
     assert!(script.contains("\"engine_versions\""));
@@ -44,6 +45,8 @@ fn scale_sweep_script_uses_external_release_artifact() {
     assert!(script.contains("mixed_correctness_100k"));
     assert!(script.contains("run_competitor_script"));
     assert!(script.contains("record_competitor_failure"));
+    assert!(script.contains("BENCH_STORAGE_MODE=\"$STORAGE_MODE\""));
+    assert!(script.contains("BENCH_DATA_ROOT=\"$DATA_ROOT/competitors\""));
     assert!(!script.contains("run_duckdb_writes.sh \"$selector\" || true"));
     assert!(!script.contains("run_sqlite3_writes.sh \"$selector\" || true"));
     assert!(!script.contains("run_postgres_writes.sh \"$selector\" || true"));
@@ -132,11 +135,76 @@ fn scale_sweep_competitor_raw_artifacts_use_strict_schema() {
             "\"schema_version\": 1",
             "\"status\": \"measured\"",
             "\"status\": \"not_available\"",
+            "\"storage_mode\"",
+            "\"durability_mode\"",
             "\"policy\"",
             "\"reason\"",
         ] {
             assert!(script.contains(needle), "{path} missing {needle}");
         }
+    }
+}
+
+#[test]
+fn mixed_correctness_runner_uses_declared_storage_mode() {
+    let helper = repo_file("benchmarks/scripts/run_mixed_correctness.py");
+    assert!(helper.contains("--storage-mode"));
+    assert!(helper.contains("--data-root"));
+    assert!(helper.contains("def db_path_for("));
+    assert!(helper.contains("duckdb.connect(str(db_path))"));
+    assert!(helper.contains("sqlite3.connect(str(db_path), isolation_level=None)"));
+    assert!(helper.contains(
+        "table_kind = \"TABLE\" if storage_mode == \"data-dir\" else \"UNLOGGED TABLE\""
+    ));
+
+    for path in [
+        "benchmarks/scripts/run_duckdb_writes.sh",
+        "benchmarks/scripts/run_sqlite3_writes.sh",
+        "benchmarks/scripts/run_postgres_writes.sh",
+    ] {
+        let script = repo_file(path);
+        let start = script
+            .find("run_mixed_correctness()")
+            .expect("run_mixed_correctness");
+        let body = &script[start..];
+        assert!(
+            body.contains("--storage-mode \"$BENCH_STORAGE_MODE\""),
+            "{path}"
+        );
+        assert!(body.contains("--data-root \"$BENCH_DATA_ROOT\""), "{path}");
+    }
+}
+
+#[test]
+fn bulk_write_competitors_match_unindexed_ultrasql_schema() {
+    let driver = repo_file("crates/ultrasql-bench/src/bin/cross_compare_sql.rs");
+    assert!(driver.contains("CREATE TABLE {table} (id INT NOT NULL, val INT)"));
+
+    for path in [
+        "benchmarks/scripts/run_duckdb_writes.sh",
+        "benchmarks/scripts/run_sqlite3_writes.sh",
+        "benchmarks/scripts/run_postgres_writes.sh",
+    ] {
+        let script = repo_file(path);
+        let update_start = script.find("run_update()").expect("run_update");
+        let mixed_start = script.find("run_mixed()").expect("run_mixed");
+        let bulk_body = &script[update_start..mixed_start];
+        let insert_start = script.find("run_insert()").expect("run_insert");
+        let insert_body = &script[insert_start..update_start];
+
+        assert!(
+            !bulk_body.contains("PRIMARY KEY"),
+            "{path} bulk update/delete schema must not add a primary-key index"
+        );
+        assert!(
+            !insert_body.contains("PRIMARY KEY"),
+            "{path} bulk insert schema must not add a primary-key index"
+        );
+        assert!(
+            script[mixed_start..].contains("PRIMARY KEY")
+                || script[mixed_start..].contains("CREATE INDEX"),
+            "{path} mixed OLTP still needs indexed point-read/write shape"
+        );
     }
 }
 
@@ -160,13 +228,19 @@ fn scale_sweep_writes_manifest_before_fastest_gate() {
 fn ultrasql_delete_benchmark_uses_rollback_methodology() {
     let driver = repo_file("crates/ultrasql-bench/src/bin/cross_compare_sql.rs");
     let start = driver
-        .find("async fn run_delete_iter")
-        .expect("run_delete_iter");
+        .find("async fn run_shared_delete")
+        .expect("run_shared_delete");
     let tail = &driver[start..];
     let end = tail
         .find("/// Shared-table SELECT-scan workload")
         .expect("next workload marker");
     let body = &tail[..end];
+
+    assert!(body.contains("let table = \"bench_delete_shared\""));
+    assert!(body.contains("preload_chunked(&client, table, n_rows).await?"));
+    assert!(body.contains("for i in 0..total_iters"));
+    assert!(body.contains("if i >= warmup"));
+    assert!(!body.contains("bench_delete_{ix}"));
 
     let begin = body.find(".batch_execute(\"BEGIN\")").expect("BEGIN");
     let started = body
@@ -178,6 +252,44 @@ fn ultrasql_delete_benchmark_uses_rollback_methodology() {
         begin < started && started < rollback,
         "DELETE sweep must time only the DELETE statement inside BEGIN/ROLLBACK"
     );
+}
+
+#[test]
+fn ultrasql_bulk_write_benchmarks_use_execute_style_wire_path() {
+    let driver = repo_file("crates/ultrasql-bench/src/bin/cross_compare_sql.rs");
+    for (fn_name, next_marker) in [
+        (
+            "async fn run_shared_delete",
+            "/// Shared-table SELECT-scan workload",
+        ),
+        (
+            "async fn run_shared_update",
+            "fn push_mixed_correctness_row",
+        ),
+    ] {
+        let start = driver.find(fn_name).expect(fn_name);
+        let tail = &driver[start..];
+        let end = tail.find(next_marker).expect(next_marker);
+        let body = &tail[..end];
+
+        assert!(
+            body.contains(".batch_execute(&query)"),
+            "{fn_name} should use execute-style protocol path for non-returning writes"
+        );
+        assert!(
+            !body.contains(".simple_query(&query)"),
+            "{fn_name} should not allocate SimpleQueryMessage rows for non-returning writes"
+        );
+    }
+}
+
+#[test]
+fn ultrasql_raw_driver_records_storage_profile() {
+    let driver = repo_file("crates/ultrasql-bench/src/bin/cross_compare_sql.rs");
+    assert!(driver.contains("enum StorageMode"));
+    assert!(driver.contains("#[arg(long, value_enum, default_value_t = StorageMode::Memory)]"));
+    assert!(driver.contains("\"storage_mode\": args.storage_mode.as_str()"));
+    assert!(driver.contains("\"durability_mode\": args.storage_mode.durability_mode()"));
 }
 
 #[test]

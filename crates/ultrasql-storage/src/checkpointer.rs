@@ -62,7 +62,11 @@ pub struct CheckpointerConfig {
 impl Default for CheckpointerConfig {
     fn default() -> Self {
         Self {
-            interval: Duration::from_secs(5),
+            // Match common WAL database posture: checkpoint on a minute-scale
+            // cadence so foreground OLTP work is not repeatedly forced through
+            // full-page-write bursts, while crash recovery remains bounded by
+            // recent WAL.
+            interval: Duration::from_secs(300),
         }
     }
 }

@@ -19,6 +19,8 @@ use super::{
     HeapAccess, HeapError, InsertOptions, checked_heap_u64_count_add, checked_tuple_space_needed,
 };
 
+const EMPTY_HEAP_PAGE_FREE_SPACE: usize = ultrasql_core::constants::PAGE_SIZE - PAGE_HEADER_SIZE;
+
 fn appended_slot_count(cur_lower: usize) -> Result<u16, HeapError> {
     let slot_bytes = cur_lower
         .checked_sub(PAGE_HEADER_SIZE)
@@ -82,6 +84,7 @@ impl<L: PageLoader> HeapAccess<L> {
         // Invalidate the columnar projection cache for this
         // relation — a new row makes any cached `Vec<Column>`
         // stale until the next `SeqScan` re-builds it.
+        self.invalidate_int32_pair_payload_stats_relation(rel);
         self.column_cache.bump_version(rel);
         Ok(tid)
     }
@@ -280,6 +283,11 @@ impl<L: PageLoader> HeapAccess<L> {
         let cached = insert_cursor.load(Ordering::Acquire);
         let mut cursor: u32 = cached.min(block_count.saturating_sub(1));
         let mut row_idx: usize = 0;
+        let mut wal_payload_buf: Vec<u8> = if opts.wal.is_some() {
+            Vec::with_capacity(8 * 1024)
+        } else {
+            Vec::new()
+        };
 
         while row_idx < rows.len() {
             // (1) If no block has ever been allocated, grow first.
@@ -295,19 +303,35 @@ impl<L: PageLoader> HeapAccess<L> {
 
             let page_id = PageId::new(rel, BlockNumber::new(cursor));
             let page_out_start = out.len();
+            let page_row_start = row_idx;
             let drained =
                 Self::batch_fill_page(&self.pool, page_id, rows, &mut out, row_idx, opts, n_atts)?;
             row_idx += drained;
-            // After this page, the post hooks fire once for the affected page.
-            Self::post_insert_fsm_vm(&self.pool, page_id, opts);
-            if opts.wal.is_some() && out.len() > page_out_start {
-                Self::emit_insert_batch_wal(
-                    &self.pool,
-                    page_id,
-                    &out[page_out_start..],
-                    &opts,
-                    |tid| self.fetch(tid),
-                )?;
+            if drained == 0 {
+                let tuple_size = TUPLE_HEADER_SIZE
+                    .checked_add(rows[row_idx].len())
+                    .ok_or(HeapError::MalformedHeader("tuple size overflow"))?;
+                let needed = checked_tuple_space_needed(tuple_size)?;
+                if needed > EMPTY_HEAP_PAGE_FREE_SPACE {
+                    return Err(HeapError::Page(PageError::NoSpace {
+                        needed,
+                        available: EMPTY_HEAP_PAGE_FREE_SPACE,
+                    }));
+                }
+            } else {
+                // After this page, the post hooks fire once for the affected page.
+                Self::post_insert_fsm_vm(&self.pool, page_id, opts);
+                if opts.wal.is_some() && out.len() > page_out_start {
+                    Self::emit_insert_batch_wal_from_payloads(
+                        &self.pool,
+                        page_id,
+                        &out[page_out_start..],
+                        &rows[page_row_start..row_idx],
+                        &opts,
+                        n_atts,
+                        &mut wal_payload_buf,
+                    )?;
+                }
             }
 
             if row_idx == rows.len() {
@@ -332,6 +356,7 @@ impl<L: PageLoader> HeapAccess<L> {
         }
 
         // Invalidate columnar projection cache.
+        self.invalidate_int32_pair_payload_stats_relation(rel);
         self.column_cache.bump_version(rel);
         Ok(out)
     }
@@ -397,6 +422,7 @@ impl<L: PageLoader> HeapAccess<L> {
             insert_cursor.store(block, Ordering::Release);
         }
 
+        self.invalidate_int32_pair_payload_stats_relation(rel);
         self.column_cache.bump_version(rel);
         Ok(inserted)
     }

@@ -482,10 +482,12 @@ where
                         "explicit ROLLBACK in-place updates: {e}"
                     )));
                 }
-                let durable_abort_marker = !self.pending_table_modifications.is_empty();
-                if let Err(e) =
-                    self.state
-                        .abort_transaction(txn, durable_abort_marker, "explicit ROLLBACK")
+                // Recovery treats WAL-observed, non-prepared XIDs with no
+                // commit record as aborted, so ordinary explicit rollback does
+                // not need a synchronous abort marker.
+                if let Err(e) = self
+                    .state
+                    .abort_transaction(txn, false, "explicit ROLLBACK")
                 {
                     self.clear_pending_dml_effects();
                     return Err(e);
@@ -806,6 +808,32 @@ mod tests {
             err.to_string().contains("ROLLBACK"),
             "unexpected error: {err}"
         );
+    }
+
+    #[test]
+    fn explicit_rollback_does_not_append_abort_marker_for_unprepared_transaction() {
+        let data_dir = tempfile::TempDir::new().expect("temp data dir");
+        let server = Arc::new(Server::init(data_dir.path()).expect("persistent server"));
+        let (io, _peer) = duplex(64);
+        let mut session = Session::new(io, Arc::clone(&server));
+        session.execute_begin(None).expect("begin");
+        session
+            .pending_table_modifications
+            .insert("t".to_owned(), 1);
+
+        session.execute_rollback().expect("rollback");
+        drop(session);
+        drop(server);
+
+        let mut abort_records = 0usize;
+        ultrasql_wal::recover(data_dir.path().join("pg_wal"), |record| {
+            if record.header.record_type == ultrasql_wal::RecordType::Abort {
+                abort_records += 1;
+            }
+            Ok(())
+        })
+        .expect("recover WAL");
+        assert_eq!(abort_records, 0);
     }
 
     #[test]

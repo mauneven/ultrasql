@@ -242,15 +242,13 @@ enum Workload {
     /// event_day, tenant_id, bucket`. This mirrors Firebolt primary-index
     /// sparse granule pruning without claiming UltraSQL has that index.
     SparsePruning,
-    /// Bulk UPDATE: preload `--rows` (id INT, val INT) tuples, then
-    /// time one `UPDATE bench_update_{ix} SET val = val + 1 WHERE
-    /// id < <rows>`. Matches the shape of
-    /// `benchmarks/scripts/run_postgres_writes.sh::run_update`.
+    /// Bulk UPDATE: preload `--rows` (id INT, val INT) tuples once,
+    /// then time `UPDATE bench_update_shared SET val = val + 1 WHERE
+    /// id < <rows>` inside BEGIN/ROLLBACK for every sample.
     UpdateBulk,
-    /// Bulk DELETE: preload `--rows` (id INT, val INT) tuples, then
-    /// time one `DELETE FROM bench_delete_{ix} WHERE id < <rows>`.
-    /// Matches the shape of
-    /// `benchmarks/scripts/run_postgres_writes.sh::run_delete`.
+    /// Bulk DELETE: preload `--rows` (id INT, val INT) tuples once,
+    /// then time `DELETE FROM bench_delete_shared WHERE id < <rows>`
+    /// inside BEGIN/ROLLBACK for every sample.
     DeleteBulk,
     /// Mixed OLTP pgbench-like — preload `--rows` (id INT, val INT)
     /// tuples, then run a 1-second window of 50% point reads (SELECT
@@ -320,6 +318,28 @@ enum Workload {
     /// persistent tables with and without a pre-created ANN index, measuring
     /// throughput, WAL growth, index-maintenance delta, and commit latency.
     IngestionThroughput,
+}
+
+#[derive(Copy, Clone, Eq, PartialEq, Debug, ValueEnum)]
+enum StorageMode {
+    Memory,
+    DataDir,
+}
+
+impl StorageMode {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Memory => "memory",
+            Self::DataDir => "data-dir",
+        }
+    }
+
+    const fn durability_mode(self) -> &'static str {
+        match self {
+            Self::Memory => "volatile",
+            Self::DataDir => "durable",
+        }
+    }
 }
 
 impl Workload {
@@ -439,6 +459,9 @@ struct Args {
     /// in-process harness server. Used by release-artifact certification.
     #[arg(long)]
     server: Option<SocketAddr>,
+    /// Storage profile of the UltraSQL server being measured.
+    #[arg(long, value_enum, default_value_t = StorageMode::Memory)]
+    storage_mode: StorageMode,
 }
 
 #[tokio::main(flavor = "multi_thread", worker_threads = 4)]
@@ -591,6 +614,9 @@ async fn main() -> Result<()> {
         }
         Workload::UpdateBulk => {
             run_shared_update(bound, args.rows, args.warmup, total_iters, &mut iters_us).await?;
+        }
+        Workload::DeleteBulk => {
+            run_shared_delete(bound, args.rows, args.warmup, total_iters, &mut iters_us).await?;
         }
         Workload::MixedCorrectness => {
             answer = Some(
@@ -764,7 +790,6 @@ async fn main() -> Result<()> {
             for i in 0..total_iters {
                 let micros = match args.workload {
                     Workload::InsertBulk => run_insert_iter(bound, args.rows, i).await?,
-                    Workload::DeleteBulk => run_delete_iter(bound, args.rows, i).await?,
                     Workload::MixedOltp => run_mixed_oltp_iter(bound, args.rows, i).await?,
                     Workload::SelectScan
                     | Workload::SumScalar
@@ -775,6 +800,7 @@ async fn main() -> Result<()> {
                     | Workload::SparsePruning
                     | Workload::WindowRowNumber
                     | Workload::UpdateBulk
+                    | Workload::DeleteBulk
                     | Workload::MixedCorrectness
                     | Workload::VectorTopK
                     | Workload::CsvColdRead
@@ -800,7 +826,7 @@ async fn main() -> Result<()> {
 
     // Compute median + min.
     ultrasql_bench::sort_f64_nan_last(&mut iters_us);
-    let median_us = iters_us[iters_us.len() / 2];
+    let median_us = median_sorted(&iters_us);
     let min_us = iters_us[0];
     let p50_latency_us = percentile_nearest_rank(&iters_us, 0.50);
     let p95_latency_us = percentile_nearest_rank(&iters_us, 0.95);
@@ -819,6 +845,8 @@ async fn main() -> Result<()> {
         "host": HostInfo::from_env(),
         "server_addr": bound.to_string(),
         "server_mode": if args.server.is_some() { "external" } else { "in_process" },
+        "storage_mode": args.storage_mode.as_str(),
+        "durability_mode": args.storage_mode.durability_mode(),
         "policy": "Raw measured samples only; no ranking or winner claim.",
     });
     if let Some(answer) = answer {
@@ -1424,7 +1452,12 @@ fn sorted_f64(mut values: Vec<f64>) -> Vec<f64> {
 }
 
 fn median_sorted(values: &[f64]) -> f64 {
-    values[values.len() / 2]
+    let mid = values.len() / 2;
+    if values.len() % 2 == 0 {
+        (values[mid - 1] + values[mid]) / 2.0
+    } else {
+        values[mid]
+    }
 }
 
 async fn run_parquet_smoke(
@@ -2248,10 +2281,20 @@ async fn preload_chunked(
     Ok(())
 }
 
-/// Run one bulk-DELETE iteration. Preload happens outside the timed region;
-/// the timed DELETE runs inside an explicit transaction and rolls back after
-/// measurement, matching the DuckDB and SQLite competitor runners.
-async fn run_delete_iter(server: SocketAddr, n_rows: usize, ix: usize) -> Result<f64> {
+/// Shared-table bulk DELETE workload: preload `n_rows` once, then
+/// time only `DELETE FROM t WHERE id < n_rows` inside a transaction
+/// and roll it back after the timed statement.
+///
+/// This matches the DuckDB and SQLite competitor runners: one
+/// persistent driver connection, stable SQL text, identical starting
+/// row image for every sample, and rollback outside the timed region.
+async fn run_shared_delete(
+    server: SocketAddr,
+    n_rows: usize,
+    warmup: usize,
+    total_iters: usize,
+    iters_us: &mut Vec<f64>,
+) -> Result<()> {
     let conn_str = format!("host=127.0.0.1 port={} user=ultrasql_bench", server.port());
     let (client, connection) = tokio_postgres::connect(&conn_str, NoTls)
         .await
@@ -2262,37 +2305,37 @@ async fn run_delete_iter(server: SocketAddr, n_rows: usize, ix: usize) -> Result
         }
     });
 
-    let table = format!("bench_delete_{ix}");
+    let table = "bench_delete_shared";
     client
         .batch_execute(&format!("CREATE TABLE {table} (id INT NOT NULL, val INT)"))
         .await
         .with_context(|| format!("CREATE TABLE {table}"))?;
-    preload_chunked(&client, &table, n_rows).await?;
+    preload_chunked(&client, table, n_rows).await?;
 
-    client
-        .batch_execute("BEGIN")
-        .await
-        .context("BEGIN delete sample")?;
-    let started = Instant::now();
-    let messages = client
-        .simple_query(&format!("DELETE FROM {table} WHERE id < {n_rows}"))
-        .await
-        .with_context(|| format!("DELETE FROM {table}"))?;
-    let elapsed_us = started.elapsed().as_secs_f64() * 1e6;
-    client
-        .batch_execute("ROLLBACK")
-        .await
-        .context("ROLLBACK delete sample")?;
-    if !messages
-        .iter()
-        .any(|m| matches!(m, tokio_postgres::SimpleQueryMessage::CommandComplete(_)))
-    {
-        anyhow::bail!("DELETE returned no CommandComplete message");
+    let query = format!("DELETE FROM {table} WHERE id < {n_rows}");
+    for i in 0..total_iters {
+        client
+            .batch_execute("BEGIN")
+            .await
+            .context("BEGIN delete sample")?;
+        let started = Instant::now();
+        client
+            .batch_execute(&query)
+            .await
+            .with_context(|| format!("DELETE FROM {table}"))?;
+        let elapsed_us = started.elapsed().as_secs_f64() * 1e6;
+        client
+            .batch_execute("ROLLBACK")
+            .await
+            .context("ROLLBACK delete sample")?;
+        if i >= warmup {
+            iters_us.push(elapsed_us);
+        }
     }
 
     drop(client);
     conn_handle.abort();
-    Ok(elapsed_us)
+    Ok(())
 }
 
 /// Shared-table SELECT-scan workload: preload `n_rows` once, then
@@ -2393,8 +2436,8 @@ async fn run_shared_update(
             .await
             .context("BEGIN update sample")?;
         let started = Instant::now();
-        let messages = client
-            .simple_query(&query)
+        client
+            .batch_execute(&query)
             .await
             .with_context(|| format!("UPDATE {table}"))?;
         let elapsed_us = started.elapsed().as_secs_f64() * 1e6;
@@ -2402,12 +2445,6 @@ async fn run_shared_update(
             .batch_execute("ROLLBACK")
             .await
             .context("ROLLBACK update sample")?;
-        if !messages
-            .iter()
-            .any(|m| matches!(m, tokio_postgres::SimpleQueryMessage::CommandComplete(_)))
-        {
-            anyhow::bail!("UPDATE returned no CommandComplete message");
-        }
         if i >= warmup {
             iters_us.push(elapsed_us);
         }
@@ -3710,6 +3747,13 @@ mod tests {
             assert!(value.is_finite());
             assert!((0.0..1.0).contains(&value));
         }
+    }
+
+    #[test]
+    fn median_sorted_averages_even_sample_count() {
+        assert_eq!(median_sorted(&[1.0, 3.0]), 2.0);
+        assert_eq!(median_sorted(&[1.0, 2.0, 10.0, 20.0]), 6.0);
+        assert_eq!(median_sorted(&[1.0, 2.0, 3.0]), 2.0);
     }
 
     #[test]

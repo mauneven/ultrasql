@@ -130,9 +130,9 @@ use ultrasql_vec::kernels::{
 use ultrasql_wal::applier::{ApplyError, HeapTarget};
 use ultrasql_wal::payload::{
     AbortPayload, BTreeOpPayload, CheckpointPayload, CommitPayload, FullPageWritePayload,
-    HeapDeleteInPlaceBatchPayload, HeapDeleteInPlacePayload, HeapDeletePayload, HeapInsertPayload,
-    HeapUpdateInPlaceBatchPayload, HeapUpdateInPlacePayload, HeapUpdatePayload, SequenceOpKind,
-    SequenceOpPayload,
+    HeapDeleteInPlaceBatchPayload, HeapDeleteInPlacePayload, HeapDeleteInPlaceRangeBatchPayload,
+    HeapDeletePayload, HeapInsertPayload, HeapUpdateInPlaceBatchPayload, HeapUpdateInPlacePayload,
+    HeapUpdateInt32PairDeltaBatchPayload, HeapUpdatePayload, SequenceOpKind, SequenceOpPayload,
 };
 use ultrasql_wal::{RecordType, WalRecord};
 
@@ -2490,6 +2490,29 @@ impl HeapTarget for ServerRecoveryTarget {
         HeapTarget::apply_update_in_place_batch(self.heap.as_ref(), payload)
     }
 
+    fn apply_update_int32_pair_delta_batch(
+        &self,
+        payload: &HeapUpdateInt32PairDeltaBatchPayload,
+    ) -> Result<(), ApplyError> {
+        HeapTarget::apply_update_int32_pair_delta_batch_at_lsn(
+            self.heap.as_ref(),
+            payload,
+            Lsn::ZERO,
+        )
+    }
+
+    fn apply_update_int32_pair_delta_batch_at_lsn(
+        &self,
+        payload: &HeapUpdateInt32PairDeltaBatchPayload,
+        record_lsn: Lsn,
+    ) -> Result<(), ApplyError> {
+        HeapTarget::apply_update_int32_pair_delta_batch_at_lsn(
+            self.heap.as_ref(),
+            payload,
+            record_lsn,
+        )
+    }
+
     fn apply_delete_in_place(&self, payload: &HeapDeleteInPlacePayload) -> Result<(), ApplyError> {
         HeapTarget::apply_delete_in_place(self.heap.as_ref(), payload)
     }
@@ -2499,6 +2522,25 @@ impl HeapTarget for ServerRecoveryTarget {
         payload: &HeapDeleteInPlaceBatchPayload,
     ) -> Result<(), ApplyError> {
         HeapTarget::apply_delete_in_place_batch(self.heap.as_ref(), payload)
+    }
+
+    fn apply_delete_in_place_range_batch(
+        &self,
+        payload: &HeapDeleteInPlaceRangeBatchPayload,
+    ) -> Result<(), ApplyError> {
+        HeapTarget::apply_delete_in_place_range_batch_at_lsn(self.heap.as_ref(), payload, Lsn::ZERO)
+    }
+
+    fn apply_delete_in_place_range_batch_at_lsn(
+        &self,
+        payload: &HeapDeleteInPlaceRangeBatchPayload,
+        record_lsn: Lsn,
+    ) -> Result<(), ApplyError> {
+        HeapTarget::apply_delete_in_place_range_batch_at_lsn(
+            self.heap.as_ref(),
+            payload,
+            record_lsn,
+        )
     }
 
     fn apply_full_page_write(&self, payload: &FullPageWritePayload) -> Result<(), ApplyError> {
@@ -7660,7 +7702,9 @@ impl Server {
         };
         let wal_dir = data_dir.join("pg_wal");
         let recovery_replay_target = recovery_replay_target_from_data_dir(data_dir)?;
+        let mut observed_xids = std::collections::BTreeSet::new();
         ultrasql_wal::recover_with_target(&wal_dir, recovery_replay_target, |record| {
+            observed_xids.insert(record.header.xid);
             self.txn_manager.recover_observed_xid(record.header.xid);
             match record.header.record_type {
                 RecordType::Commit => self.txn_manager.recover_committed(record.header.xid),
@@ -7669,8 +7713,11 @@ impl Server {
             }
             Ok(())
         })
-        .map(|_| ())
-        .map_err(|e| ServerError::ddl(format!("recover commit status: {e}")))
+        .map_err(|e| ServerError::ddl(format!("recover commit status: {e}")))?;
+        for xid in observed_xids {
+            self.txn_manager.recover_uncommitted_as_aborted(xid);
+        }
+        Ok(())
     }
 
     fn rebuild_persistent_index_sidecars(&self) -> Result<(), ServerError> {

@@ -14,10 +14,11 @@
 
 use crate::payload::{
     AbortPayload, BTreeOpPayload, CheckpointPayload, CommitPayload, FullPageWritePayload,
-    HashOpPayload, HeapDeleteInPlaceBatchPayload, HeapDeleteInPlacePayload, HeapDeletePayload,
-    HeapInsertBatchPayload, HeapInsertPayload, HeapUpdateInPlaceBatchPayload,
-    HeapUpdateInPlacePayload, HeapUpdatePayload, HnswOpPayload, IvfFlatOpPayload, PayloadError,
-    SequenceOpPayload,
+    HashOpPayload, HeapDeleteInPlaceBatchPayload, HeapDeleteInPlacePayload,
+    HeapDeleteInPlaceRangeBatchPayload, HeapDeletePayload, HeapInsertBatchPayload,
+    HeapInsertPayload, HeapUpdateInPlaceBatchPayload, HeapUpdateInPlacePayload,
+    HeapUpdateInt32PairDeltaBatchPayload, HeapUpdateInt32PairDeltaRangeBatchPayload,
+    HeapUpdatePayload, HnswOpPayload, IvfFlatOpPayload, PayloadError, SequenceOpPayload,
 };
 use crate::record::{RecordType, WalRecord};
 use crate::recovery::RecoveryError;
@@ -190,6 +191,52 @@ pub trait HeapTarget: Send + Sync {
         self.apply_update_in_place_batch(payload)
     }
 
+    /// Apply a compact page-batched `(Int32, Int32)` delta update record.
+    fn apply_update_int32_pair_delta_batch(
+        &self,
+        payload: &HeapUpdateInt32PairDeltaBatchPayload,
+    ) -> Result<(), ApplyError> {
+        let _ = payload;
+        Err(ApplyError::Refused {
+            operation: "heap_update_int32_pair_delta_batch",
+            detail: String::from("not implemented"),
+        })
+    }
+
+    /// Apply a compact page-batched `(Int32, Int32)` delta update record at
+    /// its WAL stream LSN.
+    fn apply_update_int32_pair_delta_batch_at_lsn(
+        &self,
+        payload: &HeapUpdateInt32PairDeltaBatchPayload,
+        record_lsn: Lsn,
+    ) -> Result<(), ApplyError> {
+        let _ = record_lsn;
+        self.apply_update_int32_pair_delta_batch(payload)
+    }
+
+    /// Apply a compact page-batched `(Int32, Int32)` delta update range record.
+    fn apply_update_int32_pair_delta_range_batch(
+        &self,
+        payload: &HeapUpdateInt32PairDeltaRangeBatchPayload,
+    ) -> Result<(), ApplyError> {
+        let _ = payload;
+        Err(ApplyError::Refused {
+            operation: "heap_update_int32_pair_delta_range_batch",
+            detail: String::from("not implemented"),
+        })
+    }
+
+    /// Apply a compact page-batched `(Int32, Int32)` delta update range record
+    /// at its WAL stream LSN.
+    fn apply_update_int32_pair_delta_range_batch_at_lsn(
+        &self,
+        payload: &HeapUpdateInt32PairDeltaRangeBatchPayload,
+        record_lsn: Lsn,
+    ) -> Result<(), ApplyError> {
+        let _ = record_lsn;
+        self.apply_update_int32_pair_delta_range_batch(payload)
+    }
+
     /// Apply an in-place delete record: stamp `xmax`/`cmax` on the
     /// tuple header. Same semantic shape as `apply_delete`; kept as
     /// a distinct method so a future implementor can branch on
@@ -233,6 +280,29 @@ pub trait HeapTarget: Send + Sync {
     ) -> Result<(), ApplyError> {
         let _ = record_lsn;
         self.apply_delete_in_place_batch(payload)
+    }
+
+    /// Apply a compact page-batched in-place delete slot range record.
+    fn apply_delete_in_place_range_batch(
+        &self,
+        payload: &HeapDeleteInPlaceRangeBatchPayload,
+    ) -> Result<(), ApplyError> {
+        let _ = payload;
+        Err(ApplyError::Refused {
+            operation: "heap_delete_in_place_range_batch",
+            detail: String::from("not implemented"),
+        })
+    }
+
+    /// Apply a compact page-batched in-place delete slot range record at its
+    /// WAL stream LSN.
+    fn apply_delete_in_place_range_batch_at_lsn(
+        &self,
+        payload: &HeapDeleteInPlaceRangeBatchPayload,
+        record_lsn: Lsn,
+    ) -> Result<(), ApplyError> {
+        let _ = record_lsn;
+        self.apply_delete_in_place_range_batch(payload)
     }
 
     /// Apply a full-page-write record by restoring the page image verbatim.
@@ -391,8 +461,22 @@ pub fn dispatch_record_at_lsn(
             &HeapUpdateInPlaceBatchPayload::decode(bytes)?,
             record_lsn,
         ),
+        RecordType::HeapUpdateInt32PairDeltaBatch => target
+            .apply_update_int32_pair_delta_batch_at_lsn(
+                &HeapUpdateInt32PairDeltaBatchPayload::decode(bytes)?,
+                record_lsn,
+            ),
+        RecordType::HeapUpdateInt32PairDeltaRangeBatch => target
+            .apply_update_int32_pair_delta_range_batch_at_lsn(
+                &HeapUpdateInt32PairDeltaRangeBatchPayload::decode(bytes)?,
+                record_lsn,
+            ),
         RecordType::HeapDeleteInPlaceBatch => target.apply_delete_in_place_batch_at_lsn(
             &HeapDeleteInPlaceBatchPayload::decode(bytes)?,
+            record_lsn,
+        ),
+        RecordType::HeapDeleteInPlaceRangeBatch => target.apply_delete_in_place_range_batch_at_lsn(
+            &HeapDeleteInPlaceRangeBatchPayload::decode(bytes)?,
             record_lsn,
         ),
         RecordType::HeapDeleteInPlace => target
@@ -482,8 +566,10 @@ mod tests {
     use crate::payload::{
         AbortPayload, BTreeOpKind, BTreeOpPayload, CheckpointPayload, CommitPayload, HashOpKind,
         HashOpPayload, HeapDeleteInPlaceBatchEntry, HeapDeleteInPlaceBatchPayload,
-        HeapInsertBatchEntry, HeapInsertBatchPayload, HeapUpdateInPlaceBatchEntry,
-        HeapUpdateInPlaceBatchPayload, HeapUpdatePayload, SequenceOpKind, SequenceOpPayload,
+        HeapDeleteInPlaceRangeBatchPayload, HeapInsertBatchEntry, HeapInsertBatchPayload,
+        HeapUpdateInPlaceBatchEntry, HeapUpdateInPlaceBatchPayload,
+        HeapUpdateInt32PairDeltaBatchPayload, HeapUpdateInt32PairDeltaRangeBatchPayload,
+        HeapUpdatePayload, SequenceOpKind, SequenceOpPayload,
     };
     use crate::record::{RecordType, WalRecord, WalRecordError};
     use crate::writer::{WalWriter, WalWriterConfig};
@@ -499,7 +585,11 @@ mod tests {
         insert_batches: Mutex<Vec<HeapInsertBatchPayload>>,
         updates: Mutex<Vec<HeapUpdatePayload>>,
         update_in_place_batches: Mutex<Vec<HeapUpdateInPlaceBatchPayload>>,
+        update_int32_pair_delta_batches: Mutex<Vec<HeapUpdateInt32PairDeltaBatchPayload>>,
+        update_int32_pair_delta_range_batches:
+            Mutex<Vec<HeapUpdateInt32PairDeltaRangeBatchPayload>>,
         delete_in_place_batches: Mutex<Vec<HeapDeleteInPlaceBatchPayload>>,
+        delete_in_place_range_batches: Mutex<Vec<HeapDeleteInPlaceRangeBatchPayload>>,
         deletes: Mutex<Vec<HeapDeletePayload>>,
         btree_ops: Mutex<Vec<BTreeOpPayload>>,
         hash_ops: Mutex<Vec<HashOpPayload>>,
@@ -544,11 +634,37 @@ mod tests {
             Ok(())
         }
 
+        fn apply_update_int32_pair_delta_batch(
+            &self,
+            p: &HeapUpdateInt32PairDeltaBatchPayload,
+        ) -> Result<(), ApplyError> {
+            self.update_int32_pair_delta_batches.lock().push(p.clone());
+            Ok(())
+        }
+
+        fn apply_update_int32_pair_delta_range_batch(
+            &self,
+            p: &HeapUpdateInt32PairDeltaRangeBatchPayload,
+        ) -> Result<(), ApplyError> {
+            self.update_int32_pair_delta_range_batches
+                .lock()
+                .push(p.clone());
+            Ok(())
+        }
+
         fn apply_delete_in_place_batch(
             &self,
             p: &HeapDeleteInPlaceBatchPayload,
         ) -> Result<(), ApplyError> {
             self.delete_in_place_batches.lock().push(p.clone());
+            Ok(())
+        }
+
+        fn apply_delete_in_place_range_batch(
+            &self,
+            p: &HeapDeleteInPlaceRangeBatchPayload,
+        ) -> Result<(), ApplyError> {
+            self.delete_in_place_range_batches.lock().push(p.clone());
             Ok(())
         }
 
@@ -691,6 +807,37 @@ mod tests {
         );
         dispatch_record(&mock, &rec).unwrap();
 
+        // HeapUpdateInt32PairDeltaBatch
+        let update_delta_payload = HeapUpdateInt32PairDeltaBatchPayload {
+            page: page_id(1, 0),
+            writer_xid: Xid::new(90),
+            command_id: CommandId::new(4),
+            target_col: 1,
+            delta: 7,
+            slots: vec![4, 5],
+        };
+        let rec = make_record(
+            RecordType::HeapUpdateInt32PairDeltaBatch,
+            update_delta_payload.encode().unwrap(),
+        );
+        dispatch_record(&mock, &rec).unwrap();
+
+        // HeapUpdateInt32PairDeltaRangeBatch
+        let update_delta_range_payload = HeapUpdateInt32PairDeltaRangeBatchPayload {
+            page: page_id(1, 0),
+            writer_xid: Xid::new(92),
+            command_id: CommandId::new(6),
+            target_col: 1,
+            delta: 7,
+            first_slot: 4,
+            slot_count: 2,
+        };
+        let rec = make_record(
+            RecordType::HeapUpdateInt32PairDeltaRangeBatch,
+            update_delta_range_payload.encode().unwrap(),
+        );
+        dispatch_record(&mock, &rec).unwrap();
+
         // HeapDeleteInPlaceBatch
         let delete_batch_payload = HeapDeleteInPlaceBatchPayload {
             page: page_id(1, 0),
@@ -701,6 +848,20 @@ mod tests {
         let rec = make_record(
             RecordType::HeapDeleteInPlaceBatch,
             delete_batch_payload.encode().unwrap(),
+        );
+        dispatch_record(&mock, &rec).unwrap();
+
+        // HeapDeleteInPlaceRangeBatch
+        let delete_range_payload = HeapDeleteInPlaceRangeBatchPayload {
+            page: page_id(1, 0),
+            xmax: Xid::new(91),
+            cmax: CommandId::new(5),
+            first_slot: 4,
+            slot_count: 2,
+        };
+        let rec = make_record(
+            RecordType::HeapDeleteInPlaceRangeBatch,
+            delete_range_payload.encode().unwrap(),
         );
         dispatch_record(&mock, &rec).unwrap();
 
@@ -794,7 +955,10 @@ mod tests {
         assert_eq!(mock.insert_batches.lock().len(), 1);
         assert_eq!(mock.updates.lock().len(), 1);
         assert_eq!(mock.update_in_place_batches.lock().len(), 1);
+        assert_eq!(mock.update_int32_pair_delta_batches.lock().len(), 1);
+        assert_eq!(mock.update_int32_pair_delta_range_batches.lock().len(), 1);
         assert_eq!(mock.delete_in_place_batches.lock().len(), 1);
+        assert_eq!(mock.delete_in_place_range_batches.lock().len(), 1);
         assert_eq!(mock.deletes.lock().len(), 1);
         assert_eq!(mock.btree_ops.lock().len(), 1);
         assert_eq!(mock.hash_ops.lock().len(), 1);

@@ -359,6 +359,36 @@ pub struct HeapAccess<L: PageLoader> {
     /// is older than every live snapshot's `xmin` (no live reader
     /// could need that pre-image any more); v0.7+ work.
     pub undo_log: Arc<DashMap<RelationId, parking_lot::RwLock<UndoRelationLog>>>,
+    /// Pages whose tuple headers were stamped with `xmax` by a transaction.
+    ///
+    /// Rollback uses this to clear aborted DELETE/classic-UPDATE stamps without
+    /// scanning every block of every relation. In-place UPDATE rollback uses
+    /// `undo_log` instead because it must restore payload bytes too.
+    rollback_stamp_pages: Arc<DashMap<u64, parking_lot::Mutex<Vec<PageId>>>>,
+    /// Payload-only min/max cache for page-local `(Int32, Int32)` rows.
+    ///
+    /// Header-only DELETE stamps do not invalidate this cache because tuple
+    /// payload bytes and slot layout stay stable. INSERT and UPDATE paths must
+    /// invalidate entries for their relation before cached stats can be used to
+    /// prove a page-level predicate match.
+    pub(crate) int32_pair_payload_stats: Arc<DashMap<PageId, Int32PairPagePayloadStats>>,
+}
+
+/// Payload min/max stats for one heap page containing fixed `(Int32, Int32)` rows.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct Int32PairPagePayloadStats {
+    /// Page header slot count when the stats were built.
+    pub slot_count: u16,
+    /// Number of normal item slots included in the min/max range.
+    pub normal_slots: u16,
+    /// Minimum value observed for payload column 0.
+    pub min0: i32,
+    /// Maximum value observed for payload column 0.
+    pub max0: i32,
+    /// Minimum value observed for payload column 1.
+    pub min1: i32,
+    /// Maximum value observed for payload column 1.
+    pub max1: i32,
 }
 
 /// Per-relation undo log entries, sorted by `tid` (ascending).
@@ -499,7 +529,10 @@ mod vacuum;
 mod wal_emit;
 mod walker;
 
-pub use delete::{DeleteInt32PairScan, DeleteInt32PairStamp};
+pub use delete::{
+    DeleteInt32PairScan, DeleteInt32PairStamp, Int32PairCmp, Int32PairPredicate,
+    Int32PairPredicateEval,
+};
 pub use update_inplace::{
     UpdateInt32PairEdit, UpdateInt32PairScan, UpdateInt32PairStamp, UpdateInt32PairTid,
 };
@@ -521,6 +554,8 @@ impl<L: PageLoader> HeapAccess<L> {
             last_checkpoint_lsn: Arc::new(AtomicU64::new(0)),
             column_cache: Arc::new(crate::column_cache::ColumnCache::new()),
             undo_log: Arc::new(DashMap::new()),
+            rollback_stamp_pages: Arc::new(DashMap::new()),
+            int32_pair_payload_stats: Arc::new(DashMap::new()),
         }
     }
 
@@ -541,7 +576,35 @@ impl<L: PageLoader> HeapAccess<L> {
             last_checkpoint_lsn,
             column_cache: Arc::new(crate::column_cache::ColumnCache::new()),
             undo_log: Arc::new(DashMap::new()),
+            rollback_stamp_pages: Arc::new(DashMap::new()),
+            int32_pair_payload_stats: Arc::new(DashMap::new()),
         }
+    }
+
+    pub(crate) fn invalidate_int32_pair_payload_stats_relation(&self, rel: RelationId) {
+        self.int32_pair_payload_stats
+            .retain(|page_id, _| page_id.relation != rel);
+    }
+
+    pub(crate) fn remember_rollback_stamp_page(&self, xid: Xid, page_id: PageId) {
+        let xid_raw = xid.raw();
+        if xid_raw == 0 {
+            return;
+        }
+        let entry = self
+            .rollback_stamp_pages
+            .entry(xid_raw)
+            .or_insert_with(|| parking_lot::Mutex::new(Vec::new()));
+        let mut pages = entry.lock();
+        if !pages.contains(&page_id) {
+            pages.push(page_id);
+        }
+    }
+
+    pub(crate) fn take_rollback_stamp_pages(&self, xid: Xid) -> Vec<PageId> {
+        self.rollback_stamp_pages
+            .remove(&xid.raw())
+            .map_or_else(Vec::new, |(_, pages)| pages.into_inner())
     }
 
     /// Borrow the buffer pool's WAL sink, if any.

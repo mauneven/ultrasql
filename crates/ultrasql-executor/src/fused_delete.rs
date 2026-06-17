@@ -25,13 +25,15 @@ use std::sync::Arc;
 use ultrasql_core::{CommandId, DataType, Field, RelationId, Schema, Xid};
 use ultrasql_mvcc::Snapshot;
 use ultrasql_storage::PageLoader;
-use ultrasql_storage::heap::{DeleteInt32PairScan, DeleteInt32PairStamp, HeapAccess};
+use ultrasql_storage::heap::{
+    DeleteInt32PairScan, DeleteInt32PairStamp, HeapAccess, Int32PairCmp, Int32PairPredicate,
+};
 use ultrasql_storage::vm::VisibilityMap;
 use ultrasql_txn::TransactionManager;
 use ultrasql_vec::Batch;
 
 use crate::affected_rows::affected_rows_batch;
-use crate::fused_update::FusedPredicate;
+use crate::fused_update::{FusedCmp, FusedPredicate};
 use crate::{ExecError, Operator};
 
 pub struct FusedDeleteInt32Pair<L: PageLoader> {
@@ -137,19 +139,29 @@ impl<L: PageLoader + Send + Sync + std::fmt::Debug + 'static> Operator for Fused
         }
         self.done = true;
 
-        let predicate = self.predicate;
-
-        // Build a closure that the heap path can invoke per tuple to
-        // decide eligibility. None means "delete every visible tuple".
-        let predicate_fn = |id: i32, val: i32| -> bool {
-            match predicate {
-                None => true,
-                Some(pred) => {
-                    let key = if pred.col_index == 0 { id } else { val };
-                    pred.op.check(key, pred.literal)
+        let predicate = match self.predicate {
+            None => Int32PairPredicate::All,
+            Some(pred) => {
+                let op = match pred.op {
+                    FusedCmp::Eq => Int32PairCmp::Eq,
+                    FusedCmp::Ne => Int32PairCmp::Ne,
+                    FusedCmp::Lt => Int32PairCmp::Lt,
+                    FusedCmp::Le => Int32PairCmp::Le,
+                    FusedCmp::Gt => Int32PairCmp::Gt,
+                    FusedCmp::Ge => Int32PairCmp::Ge,
+                };
+                Int32PairPredicate::ColumnCmp {
+                    col_index: pred.col_index,
+                    op,
+                    literal: pred.literal,
                 }
             }
         };
+
+        // The heap can evaluate this typed predicate from one decoded
+        // payload column, avoiding the generic closure path's full pair
+        // decode on simple `WHERE col cmp literal` deletes.
+        let predicate_fn = predicate;
         let wal_sink_arc = self.heap.wal_sink().cloned();
         let wal_sink: Option<&dyn ultrasql_storage::WalSink> = wal_sink_arc.as_deref();
         let scan = DeleteInt32PairScan {
@@ -163,9 +175,13 @@ impl<L: PageLoader + Send + Sync + std::fmt::Debug + 'static> Operator for Fused
             xid: self.xid,
             command_id: self.command_id,
         };
-        let n = if wal_sink.is_some() {
-            self.heap
-                .delete_int32_pair_inplace(scan, stamp, wal_sink, self.vm.as_deref())
+        let n = if let Some(wal_sink) = wal_sink {
+            self.heap.delete_int32_pair_inplace_parallel_wal(
+                scan,
+                stamp,
+                wal_sink,
+                self.vm.as_deref(),
+            )
         } else {
             self.heap
                 .delete_int32_pair_inplace_parallel_no_wal(scan, stamp, self.vm.as_deref())

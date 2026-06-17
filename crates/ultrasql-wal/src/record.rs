@@ -140,6 +140,14 @@ pub enum RecordType {
     HeapDeleteInPlaceBatch = 16,
     /// Multiple heap inserts packed into one heap page.
     HeapInsertBatch = 17,
+    /// Fixed-width `(Int32, Int32)` in-place UPDATE batch represented
+    /// as `target_col += delta` over page-local slots.
+    HeapUpdateInt32PairDeltaBatch = 18,
+    /// Multiple contiguous in-place tuple delete stamps on one heap page.
+    HeapDeleteInPlaceRangeBatch = 19,
+    /// Fixed-width `(Int32, Int32)` in-place UPDATE over one contiguous
+    /// page-local slot range.
+    HeapUpdateInt32PairDeltaRangeBatch = 20,
     /// A no-op marker (used to round records up to alignment
     /// boundaries; ignored on replay).
     Nop = 255,
@@ -166,6 +174,9 @@ impl RecordType {
             15 => Self::HeapUpdateInPlaceBatch,
             16 => Self::HeapDeleteInPlaceBatch,
             17 => Self::HeapInsertBatch,
+            18 => Self::HeapUpdateInt32PairDeltaBatch,
+            19 => Self::HeapDeleteInPlaceRangeBatch,
+            20 => Self::HeapUpdateInt32PairDeltaRangeBatch,
             255 => Self::Nop,
             other => return Err(WalRecordError::UnknownType(other)),
         })
@@ -192,6 +203,9 @@ impl From<RecordType> for u8 {
             RecordType::HeapUpdateInPlaceBatch => 15,
             RecordType::HeapDeleteInPlaceBatch => 16,
             RecordType::HeapInsertBatch => 17,
+            RecordType::HeapUpdateInt32PairDeltaBatch => 18,
+            RecordType::HeapDeleteInPlaceRangeBatch => 19,
+            RecordType::HeapUpdateInt32PairDeltaRangeBatch => 20,
             RecordType::Nop => 255,
         }
     }
@@ -238,30 +252,22 @@ impl WalRecord {
         flags: u8,
         payload: Vec<u8>,
     ) -> Result<Self, WalRecordError> {
-        let total_len = RECORD_HEADER_SIZE
-            .checked_add(payload.len())
-            .ok_or(WalRecordError::Malformed("total_length overflow"))?;
-        if total_len > MAX_RECORD_BYTES {
-            return Err(WalRecordError::TooLarge {
-                payload_len: payload.len(),
-                max_payload_len: MAX_RECORD_BYTES - RECORD_HEADER_SIZE,
-            });
-        }
-        if flags != 0 {
-            return Err(WalRecordError::Malformed("record flags reserved bits"));
-        }
-        let total = u32::try_from(total_len)
-            .map_err(|_| WalRecordError::Malformed("total_length overflow"))?;
-        let mut header = WalRecordHeader {
-            total_length: total,
-            crc: 0,
-            prev_lsn,
-            xid,
-            record_type,
-            flags,
-        };
-        header.crc = compute_record_crc(&header, &payload);
+        let header = build_header(record_type, xid, prev_lsn, flags, &payload)?;
         Ok(Self { header, payload })
+    }
+
+    /// Build a WAL header for a borrowed payload.
+    ///
+    /// Used by append buffers that can serialize header + payload directly
+    /// without allocating an owned [`WalRecord`].
+    pub(crate) fn header_for_borrowed_payload(
+        record_type: RecordType,
+        xid: Xid,
+        prev_lsn: Lsn,
+        flags: u8,
+        payload: &[u8],
+    ) -> Result<WalRecordHeader, WalRecordError> {
+        build_header(record_type, xid, prev_lsn, flags, payload)
     }
 
     /// Encode the record into a freshly-allocated `Vec<u8>`.
@@ -272,6 +278,12 @@ impl WalRecord {
         encode_header_into(&self.header, &mut out);
         out[RECORD_HEADER_SIZE..].copy_from_slice(&self.payload);
         out
+    }
+
+    /// Append the encoded record to `out` without allocating a temporary
+    /// record buffer.
+    pub fn append_encoded_to(&self, out: &mut Vec<u8>) {
+        append_encoded_parts_to(&self.header, &self.payload, out);
     }
 
     /// Decode a record from a byte slice that begins at the record's
@@ -308,6 +320,46 @@ impl WalRecord {
         }
         Ok((Self { header, payload }, total))
     }
+}
+
+fn build_header(
+    record_type: RecordType,
+    xid: Xid,
+    prev_lsn: Lsn,
+    flags: u8,
+    payload: &[u8],
+) -> Result<WalRecordHeader, WalRecordError> {
+    let total_len = RECORD_HEADER_SIZE
+        .checked_add(payload.len())
+        .ok_or(WalRecordError::Malformed("total_length overflow"))?;
+    if total_len > MAX_RECORD_BYTES {
+        return Err(WalRecordError::TooLarge {
+            payload_len: payload.len(),
+            max_payload_len: MAX_RECORD_BYTES - RECORD_HEADER_SIZE,
+        });
+    }
+    if flags != 0 {
+        return Err(WalRecordError::Malformed("record flags reserved bits"));
+    }
+    let total =
+        u32::try_from(total_len).map_err(|_| WalRecordError::Malformed("total_length overflow"))?;
+    let mut header = WalRecordHeader {
+        total_length: total,
+        crc: 0,
+        prev_lsn,
+        xid,
+        record_type,
+        flags,
+    };
+    header.crc = compute_record_crc(&header, payload);
+    Ok(header)
+}
+
+pub(crate) fn append_encoded_parts_to(header: &WalRecordHeader, payload: &[u8], out: &mut Vec<u8>) {
+    let mut header_bytes = [0_u8; RECORD_HEADER_SIZE];
+    encode_header_into(header, &mut header_bytes);
+    out.extend_from_slice(&header_bytes);
+    out.extend_from_slice(payload);
 }
 
 fn total_length_to_usize(total_length: u32) -> Result<usize, WalRecordError> {
@@ -386,12 +438,11 @@ fn decode_header_from(bytes: &[u8]) -> Result<WalRecordHeader, WalRecordError> {
 }
 
 fn compute_record_crc(header: &WalRecordHeader, payload: &[u8]) -> u32 {
-    let total = trusted_total_length_to_usize(header.total_length);
-    let mut buf = vec![0_u8; total];
     let header_zeroed_crc = WalRecordHeader { crc: 0, ..*header };
-    encode_header_into(&header_zeroed_crc, &mut buf);
-    buf[RECORD_HEADER_SIZE..].copy_from_slice(payload);
-    crc32c::crc32c(&buf)
+    let mut header_bytes = [0_u8; RECORD_HEADER_SIZE];
+    encode_header_into(&header_zeroed_crc, &mut header_bytes);
+    let crc = crc32c::crc32c_append(0, &header_bytes);
+    crc32c::crc32c_append(crc, payload)
 }
 
 #[cfg(test)]
@@ -412,6 +463,16 @@ mod tests {
         let (decoded, n) = WalRecord::decode(&bytes).unwrap();
         assert_eq!(n, bytes.len());
         assert_eq!(decoded, record);
+    }
+
+    #[test]
+    fn append_encoded_to_matches_encode() {
+        let record = rec(RecordType::HeapUpdateInPlaceBatch, b"payload bytes");
+        let mut out = vec![0xAA, 0xBB];
+        record.append_encoded_to(&mut out);
+
+        assert_eq!(&out[..2], &[0xAA, 0xBB]);
+        assert_eq!(&out[2..], record.encode());
     }
 
     #[test]
@@ -516,6 +577,9 @@ mod tests {
             RecordType::IvfFlatOp,
             RecordType::HeapUpdateInPlaceBatch,
             RecordType::HeapDeleteInPlaceBatch,
+            RecordType::HeapInsertBatch,
+            RecordType::HeapUpdateInt32PairDeltaBatch,
+            RecordType::HeapDeleteInPlaceRangeBatch,
             RecordType::Nop,
         ] {
             let raw = u8::from(rt);

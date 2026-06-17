@@ -26,11 +26,12 @@ pub use buffer::{WalBuffer, WalBufferError};
 pub use payload::{
     AbortPayload, BTreeOpKind, BTreeOpPayload, CheckpointPayload, CommitPayload,
     FullPageWritePayload, HashOpKind, HashOpPayload, HeapDeleteInPlaceBatchEntry,
-    HeapDeleteInPlaceBatchPayload, HeapDeleteInPlacePayload, HeapDeletePayload,
-    HeapInsertBatchEntry, HeapInsertBatchPayload, HeapInsertPayload, HeapUpdateInPlaceBatchEntry,
-    HeapUpdateInPlaceBatchPayload, HeapUpdateInPlacePayload, HeapUpdatePayload, HnswOpKind,
-    HnswOpPayload, IvfFlatOpKind, IvfFlatOpPayload, PayloadError, SequenceOpKind,
-    SequenceOpPayload,
+    HeapDeleteInPlaceBatchPayload, HeapDeleteInPlacePayload, HeapDeleteInPlaceRangeBatchPayload,
+    HeapDeletePayload, HeapInsertBatchEntry, HeapInsertBatchPayload, HeapInsertPayload,
+    HeapUpdateInPlaceBatchEntry, HeapUpdateInPlaceBatchPayload, HeapUpdateInPlacePayload,
+    HeapUpdateInt32PairDeltaBatchPayload, HeapUpdateInt32PairDeltaRangeBatchPayload,
+    HeapUpdatePayload, HnswOpKind, HnswOpPayload, IvfFlatOpKind, IvfFlatOpPayload, PayloadError,
+    SequenceOpKind, SequenceOpPayload,
 };
 pub use record::{RECORD_HEADER_SIZE, RecordType, WalRecord, WalRecordError, WalRecordHeader};
 pub use recovery::{RecoveryError, RecoveryTarget, recover, recover_with_target};

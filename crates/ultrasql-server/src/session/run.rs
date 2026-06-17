@@ -5,6 +5,7 @@
 //! changing semantics.
 
 use std::io::{Error as IoError, ErrorKind, IoSlice};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use bytes::BytesMut;
@@ -196,11 +197,28 @@ where
             return Ok(());
         }
 
-        if simple_query_needs_batch_parse(trimmed)
-            && let Ok(statement_slices) = Parser::new(trimmed).parse_statement_slices()
-            && statement_slices.len() > 1
-        {
-            return self.handle_query_batch(&statement_slices).await;
+        if simple_query_needs_batch_parse(trimmed) {
+            let cached_batch = self.simple_batch_cache.borrow().get(trimmed).cloned();
+            if let Some(statements) = cached_batch {
+                return self.handle_query_batch_strings(&statements).await;
+            }
+            if let Ok(statement_slices) = Parser::new(trimmed).parse_statement_slices()
+                && statement_slices.len() > 1
+            {
+                let statements = Arc::new(
+                    statement_slices
+                        .iter()
+                        .map(|statement| statement.trim().to_owned())
+                        .filter(|statement| !simple_query_is_empty(statement))
+                        .collect::<Vec<_>>(),
+                );
+                if statements.len() > 1 {
+                    self.simple_batch_cache
+                        .borrow_mut()
+                        .insert(trimmed.to_owned(), Arc::clone(&statements));
+                    return self.handle_query_batch_strings(&statements).await;
+                }
+            }
         }
 
         // COPY needs the async wire flow.
@@ -353,6 +371,14 @@ where
             self.run_post_response_maintenance();
         }
         Ok(())
+    }
+
+    async fn handle_query_batch_strings(
+        &mut self,
+        statements: &[String],
+    ) -> Result<(), ServerError> {
+        let statement_refs = statements.iter().map(String::as_str).collect::<Vec<_>>();
+        self.handle_query_batch(&statement_refs).await
     }
 
     fn encode_query_result_body(scratch: &mut BytesMut, mut result: SelectResult) {

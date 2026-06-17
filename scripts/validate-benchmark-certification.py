@@ -206,7 +206,9 @@ def validate_manifest(
     return release_commit, storage_mode if isinstance(storage_mode, str) else None, errors
 
 
-def validate_raw_file(path: Path) -> tuple[dict[str, Any] | None, list[str]]:
+def validate_raw_file(
+    path: Path, *, required_storage_mode: str
+) -> tuple[dict[str, Any] | None, list[str]]:
     raw, errors = load_json(path)
     if errors:
         return None, errors
@@ -221,12 +223,34 @@ def validate_raw_file(path: Path) -> tuple[dict[str, Any] | None, list[str]]:
     require_text(raw, "engine", local_errors)
     require_text(raw, "workload", local_errors)
     require_positive_int(raw, "n_rows", local_errors)
+    engine = canonical_engine(str(raw.get("engine"))) if isinstance(raw.get("engine"), str) else None
     if status == "measured":
         require_positive_number(raw, "median_us", local_errors)
         require_positive_int(raw, "samples", local_errors)
         iterations = raw.get("iterations_us")
         if not isinstance(iterations, list) or not iterations:
             local_errors.append(f"{path}: iterations_us must be a non-empty list")
+        storage_mode = require_text(
+            raw,
+            "storage_mode",
+            local_errors,
+            label=f"{engine}: raw storage_mode" if engine else "raw storage_mode",
+        )
+        durability_mode = require_text(
+            raw,
+            "durability_mode",
+            local_errors,
+            label=f"{engine}: raw durability_mode" if engine else "raw durability_mode",
+        )
+        if required_storage_mode == "data-dir":
+            if storage_mode is not None and storage_mode != "data-dir":
+                local_errors.append(
+                    f"{engine}: raw storage_mode expected data-dir, got {storage_mode}"
+                )
+            if durability_mode is not None and durability_mode != "durable":
+                local_errors.append(
+                    f"{engine}: raw durability_mode expected durable, got {durability_mode}"
+                )
     if status == "not_available":
         require_text(raw, "reason", local_errors)
     if local_errors:
@@ -249,6 +273,7 @@ def validate_rendered_rows(
     artifact_dir: Path,
     raw_dir: Path,
     required_engines: list[str],
+    required_storage_mode: str,
     min_comparable_rows: int,
 ) -> tuple[list[dict[str, Any]], int, int, int, list[dict[str, Any]], list[str]]:
     errors: list[str] = []
@@ -296,7 +321,9 @@ def validate_rendered_rows(
                 if raw_path is None:
                     errors.append(f"{workload} rows={n_rows} {engine}: missing raw path")
                     continue
-                raw, raw_errors = validate_raw_file(raw_path)
+                raw, raw_errors = validate_raw_file(
+                    raw_path, required_storage_mode=required_storage_mode
+                )
                 errors.extend(raw_errors)
                 if raw is None:
                     continue
@@ -419,6 +446,7 @@ def build_status(
         artifact_dir=artifact_dir,
         raw_dir=raw_dir,
         required_engines=required_engines,
+        required_storage_mode=required_storage_mode,
         min_comparable_rows=min_comparable_rows,
     )
     errors.extend(rendered_errors)

@@ -5,10 +5,12 @@
 //! are written eagerly; the expensive `fsync` is deferred and amortized
 //! across one of three triggers:
 //!
-//! 1. The group-commit window (`fsync_window_us`) has elapsed since the
+//! 1. A committer/checkpointer calls [`WalWriter::notify`] to force a
+//!    durability boundary for already-appended records.
+//! 2. The group-commit window (`fsync_window_us`) has elapsed since the
 //!    last fsync.
-//! 2. The number of unflushed bytes has reached `fsync_batch_bytes`.
-//! 3. A shutdown signal arrived.
+//! 3. The number of unflushed bytes has reached `fsync_batch_bytes`.
+//! 4. A shutdown signal arrived.
 //!
 //! Upon a successful fsync the writer publishes the new durable LSN
 //! through [`WalBuffer::publish_durable_lsn`], unblocking committers
@@ -86,7 +88,8 @@ pub struct WalWriterConfig {
     pub segment_size_bytes: u64,
     /// Group-commit window in microseconds. The writer fsyncs at
     /// least once per window even if no batch threshold is reached.
-    /// Default: 200 microseconds.
+    /// `WalWriter::notify` bypasses this window for commit/checkpoint
+    /// waiters. Default: 5 milliseconds.
     pub fsync_window_us: u64,
     /// Number of unflushed bytes that triggers an immediate fsync,
     /// regardless of the time window. Default: 256 KiB.
@@ -110,7 +113,7 @@ impl Default for WalWriterConfig {
     fn default() -> Self {
         Self {
             segment_size_bytes: 16 * 1024 * 1024,
-            fsync_window_us: 200,
+            fsync_window_us: 5_000,
             fsync_batch_bytes: 256 * 1024,
         }
     }
@@ -123,6 +126,9 @@ struct WakeState {
     /// `true` once shutdown has been requested. The writer thread
     /// observes this, drains, fsyncs, and exits.
     stopping: bool,
+    /// `true` when a durability waiter asked the writer to fsync the
+    /// current drained prefix without waiting for the group window.
+    force_fsync: bool,
     /// Bumped on every appender notification. The condvar wait keys
     /// off the value, not the boolean, so a notification that arrives
     /// between the lock release and the wait does not get lost.
@@ -237,11 +243,15 @@ impl WalWriter {
         })
     }
 
-    /// Wake the writer thread immediately. Optional; the writer also
-    /// polls on its `fsync_window_us` cadence.
+    /// Wake the writer thread and force pending WAL durable.
+    ///
+    /// Commit and checkpoint waiters call this before polling
+    /// [`Self::flushed_lsn`], so notify must bypass the background
+    /// group-commit window for bytes that are already in the buffer.
     pub fn notify(&self) {
         {
             let mut state = self.shared.wake_mutex.lock();
+            state.force_fsync = true;
             state.epoch = state.epoch.wrapping_add(1);
         }
         self.shared.wake_cv.notify_one();
@@ -339,6 +349,8 @@ struct WriterDriver {
     /// The largest LSN that has been fsynced. Initialized from the
     /// buffer's `durable_lsn` on entry.
     durable_lsn: Lsn,
+    /// Reused destination for [`WalBuffer`] drains.
+    drain_buf: Vec<u8>,
 }
 
 impl WriterDriver {
@@ -350,6 +362,7 @@ impl WriterDriver {
         first_index: u32,
     ) -> Self {
         let initial = buffer.durable_lsn();
+        let buffer_capacity = buffer.capacity();
         Self {
             dir,
             buffer,
@@ -361,6 +374,7 @@ impl WriterDriver {
             unflushed_bytes: 0,
             pending_lsn: initial,
             durable_lsn: initial,
+            drain_buf: Vec::with_capacity(buffer_capacity),
         }
     }
 
@@ -371,19 +385,24 @@ impl WriterDriver {
 
         loop {
             // Drain whatever is pending in the buffer first.
-            let drained = self.buffer.drain()?;
-            if !drained.bytes.is_empty() {
-                self.write_drained(&drained.bytes, drained.end_lsn)?;
+            let drained = self.buffer.drain_into(&mut self.drain_buf)?;
+            if !self.drain_buf.is_empty() {
+                let drained_bytes = std::mem::take(&mut self.drain_buf);
+                self.write_drained(&drained_bytes, drained.end_lsn)?;
+                self.drain_buf = drained_bytes;
             }
 
             // Decide whether to fsync this iteration.
             let elapsed = last_fsync.elapsed();
-            let stopping = {
-                let state = self.shared.wake_mutex.lock();
-                state.stopping
+            let (stopping, force_fsync) = {
+                let mut state = self.shared.wake_mutex.lock();
+                let force_fsync = state.force_fsync;
+                state.force_fsync = false;
+                (state.stopping, force_fsync)
             };
             let need_fsync = self.unflushed_bytes > 0
-                && (stopping
+                && (force_fsync
+                    || stopping
                     || self.unflushed_bytes >= self.config.fsync_batch_bytes
                     || elapsed >= window);
 
@@ -395,9 +414,11 @@ impl WriterDriver {
             if stopping {
                 // Drain one last time in case appenders snuck in
                 // between the drain above and observing `stopping`.
-                let trailing = self.buffer.drain()?;
-                if !trailing.bytes.is_empty() {
-                    self.write_drained(&trailing.bytes, trailing.end_lsn)?;
+                let trailing = self.buffer.drain_into(&mut self.drain_buf)?;
+                if !self.drain_buf.is_empty() {
+                    let trailing_bytes = std::mem::take(&mut self.drain_buf);
+                    self.write_drained(&trailing_bytes, trailing.end_lsn)?;
+                    self.drain_buf = trailing_bytes;
                 }
                 if self.unflushed_bytes > 0 {
                     self.flush_current()?;
@@ -742,6 +763,33 @@ mod tests {
         let next_lsn = buffer.next_lsn();
         writer.shutdown().unwrap();
         assert!(buffer.durable_lsn() >= next_lsn);
+    }
+
+    #[test]
+    fn notify_forces_pending_wal_durable_before_window_elapsed() {
+        let dir = TempDir::new().unwrap();
+        let buffer = Arc::new(WalBuffer::new(64 * 1024, Lsn::ZERO));
+        let writer = WalWriter::open(
+            dir.path(),
+            Arc::clone(&buffer),
+            WalWriterConfig {
+                segment_size_bytes: 1024 * 1024,
+                fsync_window_us: 60_000_000,
+                fsync_batch_bytes: 1024 * 1024,
+            },
+        )
+        .unwrap();
+
+        buffer.append(&rec(b"notify")).unwrap();
+        let next_lsn = buffer.next_lsn();
+        writer.notify();
+
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while buffer.durable_lsn() < next_lsn && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert!(buffer.durable_lsn() >= next_lsn);
+        writer.shutdown().unwrap();
     }
 
     /// Hostile-fs scenario: an attacker has staged a symlink at

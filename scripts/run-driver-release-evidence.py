@@ -29,7 +29,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--ultrasqld",
-        default=Path("target/debug/ultrasqld"),
+        default=Path("target/release-ship/ultrasqld"),
         type=Path,
         help="ultrasqld path relative to repo root, or absolute path",
     )
@@ -120,7 +120,16 @@ def main() -> int:
     env["GITHUB_SHA"] = release_commit
     try:
         run_checked(
-            ["cargo", "build", "-p", "ultrasql-server", "--bin", "ultrasqld"],
+            [
+                "cargo",
+                "build",
+                "--profile",
+                "release-ship",
+                "-p",
+                "ultrasql-server",
+                "--bin",
+                "ultrasqld",
+            ],
             cwd=repo_root,
         )
         run_checked(

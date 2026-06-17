@@ -35,8 +35,10 @@ use ultrasql_mvcc::tuple_header::{InfoMask, TUPLE_HEADER_SIZE};
 use ultrasql_wal::applier::{ApplyError, HeapTarget};
 use ultrasql_wal::payload::{
     BTreeOpKind, BTreeOpPayload, FullPageWritePayload, HeapDeleteInPlaceBatchPayload,
-    HeapDeleteInPlacePayload, HeapDeletePayload, HeapInsertBatchPayload, HeapInsertPayload,
-    HeapUpdateInPlaceBatchPayload, HeapUpdateInPlacePayload, HeapUpdatePayload,
+    HeapDeleteInPlacePayload, HeapDeleteInPlaceRangeBatchPayload, HeapDeletePayload,
+    HeapInsertBatchPayload, HeapInsertPayload, HeapUpdateInPlaceBatchPayload,
+    HeapUpdateInPlacePayload, HeapUpdateInt32PairDeltaBatchPayload,
+    HeapUpdateInt32PairDeltaRangeBatchPayload, HeapUpdatePayload,
 };
 
 use crate::btree::{BTree, BTreeError};
@@ -622,6 +624,176 @@ impl<L: PageLoader + 'static> HeapTarget for HeapAccess<L> {
         Ok(())
     }
 
+    fn apply_update_int32_pair_delta_batch(
+        &self,
+        payload: &HeapUpdateInt32PairDeltaBatchPayload,
+    ) -> Result<(), ApplyError> {
+        self.apply_update_int32_pair_delta_batch_at_lsn(payload, Lsn::ZERO)
+    }
+
+    fn apply_update_int32_pair_delta_batch_at_lsn(
+        &self,
+        payload: &HeapUpdateInt32PairDeltaBatchPayload,
+        record_lsn: Lsn,
+    ) -> Result<(), ApplyError> {
+        let page_id = payload.page;
+        let rel = page_id.relation;
+        self.advance_counter(rel, page_id.block)?;
+
+        let mut undo_entries: Vec<(u16, [u8; 9])> = Vec::with_capacity(payload.slots.len());
+        {
+            let guard = self
+                .pool
+                .get_page(page_id)
+                .map_err(|e| ApplyError::Refused {
+                    operation: "heap_update_int32_pair_delta_batch",
+                    detail: format!("buffer pool: {e}"),
+                })?;
+            let mut page = guard.write();
+            if should_skip_redo(&page, record_lsn) {
+                return Ok(());
+            }
+            let page_bytes = page.as_bytes_mut();
+            for &slot in &payload.slots {
+                let item = item_id_from_page_bytes(
+                    page_bytes,
+                    slot,
+                    "heap_update_int32_pair_delta_batch",
+                )?;
+                let slot_off = item_offset_usize(item, "heap_update_int32_pair_delta_batch")?;
+                let slot_len = item_length_usize(item, "heap_update_int32_pair_delta_batch")?;
+                if slot_len < TUPLE_HEADER_SIZE + 9 {
+                    return Err(ApplyError::Refused {
+                        operation: "heap_update_int32_pair_delta_batch",
+                        detail: format!("slot length {slot_len} too small for int32 pair update"),
+                    });
+                }
+
+                let (mut hdr, _) =
+                    TupleHeader::decode(&page_bytes[slot_off..slot_off + TUPLE_HEADER_SIZE])
+                        .ok_or_else(|| ApplyError::Refused {
+                            operation: "heap_update_int32_pair_delta_batch",
+                            detail: String::from("header decode failed"),
+                        })?;
+                let payload_off = slot_off + TUPLE_HEADER_SIZE;
+                let mut pre_image = [0_u8; 9];
+                pre_image.copy_from_slice(&page_bytes[payload_off..payload_off + 9]);
+                let target_off = payload_off
+                    + match payload.target_col {
+                        0 => 1,
+                        1 => 5,
+                        _ => {
+                            return Err(ApplyError::Refused {
+                                operation: "heap_update_int32_pair_delta_batch",
+                                detail: format!("target_col {} out of range", payload.target_col),
+                            });
+                        }
+                    };
+                let current = i32::from_le_bytes([
+                    page_bytes[target_off],
+                    page_bytes[target_off + 1],
+                    page_bytes[target_off + 2],
+                    page_bytes[target_off + 3],
+                ]);
+                let already_applied = hdr.xmax == payload.writer_xid
+                    && hdr.infomask.contains(InfoMask::UPDATED_IN_PLACE);
+                if already_applied {
+                    let restored =
+                        current
+                            .checked_sub(payload.delta)
+                            .ok_or_else(|| ApplyError::Refused {
+                                operation: "heap_update_int32_pair_delta_batch",
+                                detail: String::from("pre-image delta subtraction overflow"),
+                            })?;
+                    pre_image[target_off - payload_off..target_off - payload_off + 4]
+                        .copy_from_slice(&restored.to_le_bytes());
+                } else {
+                    let updated =
+                        current
+                            .checked_add(payload.delta)
+                            .ok_or_else(|| ApplyError::Refused {
+                                operation: "heap_update_int32_pair_delta_batch",
+                                detail: String::from("post-image delta addition overflow"),
+                            })?;
+                    page_bytes[target_off..target_off + 4].copy_from_slice(&updated.to_le_bytes());
+                    hdr.xmax = payload.writer_xid;
+                    hdr.cmax = payload.command_id;
+                    hdr.infomask.set(InfoMask::UPDATED);
+                    hdr.infomask.set(InfoMask::UPDATED_IN_PLACE);
+                    let mut hdr_bytes = [0_u8; TUPLE_HEADER_SIZE];
+                    hdr.encode(&mut hdr_bytes);
+                    page_bytes[slot_off..slot_off + TUPLE_HEADER_SIZE].copy_from_slice(&hdr_bytes);
+                }
+                undo_entries.push((slot, pre_image));
+            }
+            stamp_replayed_lsn(&mut page, record_lsn);
+        }
+
+        if !undo_entries.is_empty() {
+            let log_handle = self
+                .undo_log
+                .entry(rel)
+                .or_insert_with(|| parking_lot::RwLock::new(UndoRelationLog::default()));
+            let mut log = log_handle.write();
+            for (slot, pre_image) in undo_entries {
+                let tid = TupleId::new(page_id, slot);
+                let already = log.entries.iter().rev().any(|existing| {
+                    existing.tid == tid
+                        && existing.writer_xid == payload.writer_xid
+                        && existing.old_payload == pre_image
+                });
+                if !already {
+                    log.entries.push(UndoEntry {
+                        tid,
+                        writer_xid: payload.writer_xid,
+                        old_payload: pre_image,
+                    });
+                }
+            }
+            self.column_cache.bump_version(rel);
+        }
+        Ok(())
+    }
+
+    fn apply_update_int32_pair_delta_range_batch(
+        &self,
+        payload: &HeapUpdateInt32PairDeltaRangeBatchPayload,
+    ) -> Result<(), ApplyError> {
+        self.apply_update_int32_pair_delta_range_batch_at_lsn(payload, Lsn::ZERO)
+    }
+
+    fn apply_update_int32_pair_delta_range_batch_at_lsn(
+        &self,
+        payload: &HeapUpdateInt32PairDeltaRangeBatchPayload,
+        record_lsn: Lsn,
+    ) -> Result<(), ApplyError> {
+        if payload.slot_count == 0 {
+            return Err(refused(
+                "heap_update_int32_pair_delta_range_batch",
+                "slot_count must be nonzero",
+            ));
+        }
+        let mut slots = Vec::with_capacity(usize::from(payload.slot_count));
+        for delta in 0..payload.slot_count {
+            let slot = payload.first_slot.checked_add(delta).ok_or_else(|| {
+                refused(
+                    "heap_update_int32_pair_delta_range_batch",
+                    "slot range overflow",
+                )
+            })?;
+            slots.push(slot);
+        }
+        let expanded = HeapUpdateInt32PairDeltaBatchPayload {
+            page: payload.page,
+            writer_xid: payload.writer_xid,
+            command_id: payload.command_id,
+            target_col: payload.target_col,
+            delta: payload.delta,
+            slots,
+        };
+        self.apply_update_int32_pair_delta_batch_at_lsn(&expanded, record_lsn)
+    }
+
     /// Apply an in-place DELETE record. Stamps `xmax`/`cmax`/
     /// `infomask | UPDATED` on the tuple header. Idempotent: an
     /// already-stamped slot with the same `xmax` is a no-op.
@@ -750,6 +922,86 @@ impl<L: PageLoader + 'static> HeapTarget for HeapAccess<L> {
                 let item =
                     item_id_from_page_bytes(page_bytes, entry.slot, "heap_delete_in_place_batch")?;
                 let slot_off = item_offset_usize(item, "heap_delete_in_place_batch")?;
+                page_bytes[slot_off..slot_off + TUPLE_HEADER_SIZE].copy_from_slice(&hdr_bytes);
+                applied = true;
+            }
+            stamp_replayed_lsn(&mut page, record_lsn);
+        }
+
+        if applied {
+            self.column_cache.bump_version(page_id.relation);
+        }
+        Ok(())
+    }
+
+    fn apply_delete_in_place_range_batch(
+        &self,
+        payload: &HeapDeleteInPlaceRangeBatchPayload,
+    ) -> Result<(), ApplyError> {
+        self.apply_delete_in_place_range_batch_at_lsn(payload, Lsn::ZERO)
+    }
+
+    fn apply_delete_in_place_range_batch_at_lsn(
+        &self,
+        payload: &HeapDeleteInPlaceRangeBatchPayload,
+        record_lsn: Lsn,
+    ) -> Result<(), ApplyError> {
+        let page_id = payload.page;
+        if payload.slot_count == 0 {
+            return Err(ApplyError::Refused {
+                operation: "heap_delete_in_place_range_batch",
+                detail: String::from("slot_count must be nonzero"),
+            });
+        }
+        self.advance_counter(page_id.relation, page_id.block)?;
+        let mut applied = false;
+
+        {
+            let guard = self
+                .pool
+                .get_page(page_id)
+                .map_err(|e| ApplyError::Refused {
+                    operation: "heap_delete_in_place_range_batch",
+                    detail: format!("buffer pool: {e}"),
+                })?;
+            let mut page = guard.write();
+            if should_skip_redo(&page, record_lsn) {
+                return Ok(());
+            }
+
+            let page_bytes = page.as_bytes_mut();
+            for delta in 0..payload.slot_count {
+                let slot =
+                    payload
+                        .first_slot
+                        .checked_add(delta)
+                        .ok_or_else(|| ApplyError::Refused {
+                            operation: "heap_delete_in_place_range_batch",
+                            detail: String::from("slot range overflow"),
+                        })?;
+                let item =
+                    item_id_from_page_bytes(page_bytes, slot, "heap_delete_in_place_range_batch")?;
+                let slot_off = item_offset_usize(item, "heap_delete_in_place_range_batch")?;
+                let slot_len = item_length_usize(item, "heap_delete_in_place_range_batch")?;
+                if slot_len < TUPLE_HEADER_SIZE {
+                    return Err(ApplyError::Refused {
+                        operation: "heap_delete_in_place_range_batch",
+                        detail: String::from("slot shorter than tuple header"),
+                    });
+                }
+                let (mut hdr, _) =
+                    TupleHeader::decode(&page_bytes[slot_off..slot_off + TUPLE_HEADER_SIZE])
+                        .ok_or_else(|| ApplyError::Refused {
+                            operation: "heap_delete_in_place_range_batch",
+                            detail: String::from("header decode failed"),
+                        })?;
+                if hdr.xmax == payload.xmax {
+                    continue;
+                }
+
+                hdr.mark_deleted(payload.xmax, payload.cmax);
+                let mut hdr_bytes = [0_u8; TUPLE_HEADER_SIZE];
+                hdr.encode(&mut hdr_bytes);
                 page_bytes[slot_off..slot_off + TUPLE_HEADER_SIZE].copy_from_slice(&hdr_bytes);
                 applied = true;
             }

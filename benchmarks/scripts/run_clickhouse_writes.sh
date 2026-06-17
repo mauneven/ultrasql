@@ -64,6 +64,9 @@ CH_HTTP_PORT="${CH_HTTP_PORT:-18123}"
 CH_DATA_DIR="${CH_DATA_DIR:-/tmp/ch_bench_$$}"
 INSERT_CHUNK_ROWS="${INSERT_CHUNK_ROWS:-10000}"
 WORKLOAD="${1:-all}"
+BENCH_STORAGE_MODE="${BENCH_STORAGE_MODE:-data-dir}"
+CH_STORAGE_MODE="data-dir"
+CH_DURABILITY_MODE="durable"
 
 row_suffix() {
     local rows="$1"
@@ -146,18 +149,21 @@ mark_unavailable() {
     target_workloads | while IFS= read -r wl; do
         local rows
         rows="$(workload_rows "$wl")"
-        python3 - "$RAW_DIR/${wl}-${ENGINE}.json" "$ENGINE" "$wl" "$rows" "$reason" <<'PY'
+        python3 - "$RAW_DIR/${wl}-${ENGINE}.json" "$ENGINE" "$wl" "$rows" "$reason" \
+            "$CH_STORAGE_MODE" "$CH_DURABILITY_MODE" <<'PY'
 import json
 import sys
 from pathlib import Path
 
-out, engine, workload, rows, reason = sys.argv[1:]
+out, engine, workload, rows, reason, storage_mode, durability_mode = sys.argv[1:]
 doc = {
     "schema_version": 1,
     "engine": engine,
     "status": "not_available",
     "workload": workload,
     "n_rows": int(rows),
+    "storage_mode": storage_mode,
+    "durability_mode": durability_mode,
     "reason": reason,
     "policy": "No ClickHouse benchmark claim exists until this artifact records measured samples from the same scale-sweep run.",
 }
@@ -273,11 +279,12 @@ print(json.dumps([float(x) for x in sys.argv[1:]]))
 " "$@")"
     local min_us
     min_us="$(python3 -c "import sys; vals=[float(x) for x in sys.argv[1:]]; print(min(vals) if vals else 0)" "$@")"
-    python3 - "$ENGINE" "$CH_ENGINE_VERSION" "$workload" "$n_rows" "$n_samples" "$median_us" "$min_us" "$samples_json" <<'PYEOF'
+    python3 - "$ENGINE" "$CH_ENGINE_VERSION" "$workload" "$n_rows" "$n_samples" \
+        "$median_us" "$min_us" "$samples_json" "$CH_STORAGE_MODE" "$CH_DURABILITY_MODE" <<'PYEOF'
 import json
 import sys
 
-engine, version, workload, n_rows, samples, median_us, min_us, samples_json = sys.argv[1:]
+engine, version, workload, n_rows, samples, median_us, min_us, samples_json, storage_mode, durability_mode = sys.argv[1:]
 doc = {
     "schema_version": 1,
     "engine": engine,
@@ -285,6 +292,8 @@ doc = {
     "workload": workload,
     "status": "measured",
     "n_rows": int(n_rows),
+    "storage_mode": storage_mode,
+    "durability_mode": durability_mode,
     "samples": int(samples),
     "median_us": float(median_us),
     "min_us": float(min_us),
@@ -292,6 +301,21 @@ doc = {
     "policy": "Raw measured samples only; no ranking or winner claim.",
 }
 print(json.dumps(doc, sort_keys=True))
+PYEOF
+}
+
+annotate_profile_json() {
+    local path="$1"
+    python3 - "$path" "$CH_STORAGE_MODE" "$CH_DURABILITY_MODE" <<'PYEOF'
+import json
+import sys
+from pathlib import Path
+
+path = Path(sys.argv[1])
+doc = json.loads(path.read_text())
+doc["storage_mode"] = sys.argv[2]
+doc["durability_mode"] = sys.argv[3]
+path.write_text(json.dumps(doc, sort_keys=True) + "\n")
 PYEOF
 }
 
@@ -514,8 +538,11 @@ run_mixed_correctness() {
         --workload "$wl" \
         --rows "$N_ROWS" \
         --iters "$N_ITERS" \
+        --storage-mode "$BENCH_STORAGE_MODE" \
+        --data-root "$BENCH_DATA_ROOT" \
         --ch-port "$CH_TCP_PORT" \
         --out "${RAW_DIR}/${wl}-${ENGINE}.json"
+    annotate_profile_json "${RAW_DIR}/${wl}-${ENGINE}.json"
 }
 
 # ---------------------------------------------------------------------------

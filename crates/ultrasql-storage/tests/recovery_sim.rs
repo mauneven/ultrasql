@@ -435,17 +435,21 @@ fn crash_recovery_in_place_update_restores_post_image_and_undo_log() {
     let records = sink.records();
     let batch_rows: usize = records
         .iter()
-        .filter(|(_, r)| {
-            matches!(
-                r.header.record_type,
-                ultrasql_wal::record::RecordType::HeapUpdateInPlaceBatch
-            )
-        })
-        .map(|(_, r)| {
-            ultrasql_wal::HeapUpdateInPlaceBatchPayload::decode(&r.payload)
-                .expect("batch payload decodes")
-                .entries
-                .len()
+        .filter_map(|(_, r)| match r.header.record_type {
+            ultrasql_wal::record::RecordType::HeapUpdateInt32PairDeltaBatch => Some(
+                ultrasql_wal::HeapUpdateInt32PairDeltaBatchPayload::decode(&r.payload)
+                    .expect("batch payload decodes")
+                    .slots
+                    .len(),
+            ),
+            ultrasql_wal::record::RecordType::HeapUpdateInt32PairDeltaRangeBatch => {
+                Some(usize::from(
+                    ultrasql_wal::HeapUpdateInt32PairDeltaRangeBatchPayload::decode(&r.payload)
+                        .expect("range batch payload decodes")
+                        .slot_count,
+                ))
+            }
+            _ => None,
         })
         .sum();
     assert_eq!(batch_rows, ROWS, "WAL must batch every in-place UPDATE row");
@@ -562,9 +566,9 @@ fn crash_recovery_in_place_delete_stamps_xmax() {
     assert!(
         records.iter().any(|(_, r)| matches!(
             r.header.record_type,
-            ultrasql_wal::record::RecordType::HeapDeleteInPlaceBatch
+            ultrasql_wal::record::RecordType::HeapDeleteInPlaceRangeBatch
         )),
-        "WAL must contain at least one HeapDeleteInPlaceBatch record"
+        "WAL must contain at least one HeapDeleteInPlaceRangeBatch record"
     );
 
     let recovery_heap = make_persistent_heap(loader::MapLoader::new());

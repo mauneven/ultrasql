@@ -18,22 +18,41 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use dashmap::DashMap;
+use parking_lot::Mutex;
 use ultrasql_core::{Lsn, Xid};
 use ultrasql_storage::{WalSink, WalSinkError, WalSinkStats};
-use ultrasql_wal::{RecordType, WalBuffer, WalRecord};
+use ultrasql_wal::{RECORD_HEADER_SIZE, RecordType, WalBuffer, WalRecord};
 
 /// Wraps an [`Arc<WalBuffer>`] and adds per-XID LSN tracking so the
 /// storage layer can chain WAL records into a per-transaction log.
 pub struct WalBufferSink {
     buffer: Arc<WalBuffer>,
     /// Last LSN assigned to each XID, updated on every successful append.
-    last_lsn: DashMap<u64, Lsn>,
+    last_lsn: DashMap<u64, AtomicU64>,
+    /// Single-XID hot cache for page-local WAL bursts from one transaction.
+    last_lsn_cache: LastLsnCache,
+    /// Serializes rare hot-cache XID switches.
+    last_lsn_switch: Mutex<()>,
     /// Cumulative records accepted by this sink.
     wal_records: AtomicU64,
     /// Cumulative full-page-write records accepted by this sink.
     wal_fpi: AtomicU64,
     /// Cumulative serialized bytes accepted by this sink.
     wal_bytes: AtomicU64,
+}
+
+struct LastLsnCache {
+    xid_raw: AtomicU64,
+    lsn_raw: AtomicU64,
+}
+
+impl LastLsnCache {
+    fn new() -> Self {
+        Self {
+            xid_raw: AtomicU64::new(0),
+            lsn_raw: AtomicU64::new(0),
+        }
+    }
 }
 
 impl std::fmt::Debug for WalBufferSink {
@@ -55,23 +74,68 @@ impl WalBufferSink {
         Self {
             buffer,
             last_lsn: DashMap::new(),
+            last_lsn_cache: LastLsnCache::new(),
+            last_lsn_switch: Mutex::new(()),
             wal_records: AtomicU64::new(0),
             wal_fpi: AtomicU64::new(0),
             wal_bytes: AtomicU64::new(0),
         }
     }
+
+    fn publish_last_lsn(&self, xid: Xid, lsn: Lsn) {
+        let xid_raw = xid.raw();
+        let lsn_raw = lsn.raw();
+        if self.last_lsn_cache.xid_raw.load(Ordering::Acquire) == xid_raw {
+            self.last_lsn_cache
+                .lsn_raw
+                .fetch_max(lsn_raw, Ordering::AcqRel);
+            return;
+        }
+
+        let _switch = self.last_lsn_switch.lock();
+        let current_xid = self.last_lsn_cache.xid_raw.load(Ordering::Acquire);
+        if current_xid == xid_raw {
+            self.last_lsn_cache
+                .lsn_raw
+                .fetch_max(lsn_raw, Ordering::AcqRel);
+            return;
+        }
+
+        if current_xid != 0 {
+            let current_lsn = self.last_lsn_cache.lsn_raw.load(Ordering::Acquire);
+            self.last_lsn
+                .entry(current_xid)
+                .or_insert_with(|| AtomicU64::new(0))
+                .fetch_max(current_lsn, Ordering::AcqRel);
+        }
+        let prior_lsn = self
+            .last_lsn
+            .get(&xid_raw)
+            .map(|stored| stored.load(Ordering::Acquire))
+            .unwrap_or(0);
+        self.last_lsn_cache
+            .lsn_raw
+            .store(prior_lsn.max(lsn_raw), Ordering::Release);
+        self.last_lsn_cache
+            .xid_raw
+            .store(xid_raw, Ordering::Release);
+    }
 }
 
 impl WalSink for WalBufferSink {
     fn append(&self, record: WalRecord) -> Result<Lsn, WalSinkError> {
+        self.append_ref(&record)
+    }
+
+    fn append_ref(&self, record: &WalRecord) -> Result<Lsn, WalSinkError> {
         let xid = record.header.xid;
         let total_length = u64::from(record.header.total_length);
         let is_fpi = record.header.record_type == RecordType::FullPageWrite;
         let lsn = self
             .buffer
-            .append(&record)
+            .append(record)
             .map_err(|e| WalSinkError::Rejected(format!("WalBuffer rejected record: {e}")))?;
-        self.last_lsn.insert(xid.raw(), lsn);
+        self.publish_last_lsn(xid, lsn);
         self.wal_records.fetch_add(1, Ordering::Relaxed);
         self.wal_bytes.fetch_add(total_length, Ordering::Relaxed);
         if is_fpi {
@@ -80,14 +144,51 @@ impl WalSink for WalBufferSink {
         Ok(lsn)
     }
 
+    fn append_borrowed(
+        &self,
+        record_type: RecordType,
+        xid: Xid,
+        prev_lsn: Lsn,
+        flags: u8,
+        payload: &[u8],
+    ) -> Result<Lsn, WalSinkError> {
+        let payload_len = u64::try_from(payload.len()).map_err(|_| {
+            WalSinkError::Rejected("borrowed WAL payload length overflow".to_owned())
+        })?;
+        let header_len = u64::try_from(RECORD_HEADER_SIZE)
+            .map_err(|_| WalSinkError::Rejected("WAL header length overflow".to_owned()))?;
+        let total_length = header_len
+            .checked_add(payload_len)
+            .ok_or_else(|| WalSinkError::Rejected("borrowed WAL length overflow".to_owned()))?;
+        let is_fpi = record_type == RecordType::FullPageWrite;
+        let lsn = self
+            .buffer
+            .append_borrowed(record_type, xid, prev_lsn, flags, payload)
+            .map_err(|e| WalSinkError::Rejected(format!("WalBuffer rejected record: {e}")))?;
+        self.publish_last_lsn(xid, lsn);
+        self.wal_records.fetch_add(1, Ordering::Relaxed);
+        self.wal_bytes.fetch_add(total_length, Ordering::Relaxed);
+        if is_fpi {
+            self.wal_fpi.fetch_add(1, Ordering::Relaxed);
+        }
+        Ok(lsn)
+    }
+
+    fn appends_without_blocking_io(&self) -> bool {
+        true
+    }
+
     fn durable_lsn(&self) -> Lsn {
         self.buffer.durable_lsn()
     }
 
     fn last_lsn_for(&self, xid: Xid) -> Lsn {
+        if self.last_lsn_cache.xid_raw.load(Ordering::Acquire) == xid.raw() {
+            return Lsn::new(self.last_lsn_cache.lsn_raw.load(Ordering::Acquire));
+        }
         self.last_lsn
             .get(&xid.raw())
-            .map(|r| *r.value())
+            .map(|r| Lsn::new(r.load(Ordering::Acquire)))
             .unwrap_or(Lsn::ZERO)
     }
 
@@ -142,5 +243,31 @@ mod tests {
                 wal_write: 2,
             }
         );
+    }
+
+    #[test]
+    fn wal_buffer_sink_last_lsn_cache_survives_xid_switches() {
+        let buffer = Arc::new(WalBuffer::new(4096, Lsn::ZERO));
+        let sink = WalBufferSink::new(buffer);
+        let xid7 = Xid::new(7);
+        let xid8 = Xid::new(8);
+
+        let first = sink.append(nop_record_for(xid7)).expect("append xid7");
+        assert_eq!(sink.last_lsn_for(xid7), first);
+
+        let second = sink.append(nop_record_for(xid8)).expect("append xid8");
+        assert_eq!(sink.last_lsn_for(xid7), first);
+        assert_eq!(sink.last_lsn_for(xid8), second);
+
+        let third = sink
+            .append(nop_record_for(xid7))
+            .expect("append xid7 again");
+        assert_eq!(sink.last_lsn_for(xid7), third);
+        assert_eq!(sink.last_lsn_for(xid8), second);
+    }
+
+    fn nop_record_for(xid: Xid) -> WalRecord {
+        WalRecord::new(RecordType::Nop, xid, Lsn::ZERO, 0, Vec::new())
+            .expect("test WAL record should fit size limits")
     }
 }

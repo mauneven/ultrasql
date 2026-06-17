@@ -10,7 +10,7 @@ use std::io::{ErrorKind, Read, Write};
 #[cfg(unix)]
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use crate::error::ServerError;
 
@@ -120,6 +120,7 @@ pub struct LogicalReplicationSlot {
 #[derive(Debug)]
 pub struct LogicalReplicationRuntime {
     publications: dashmap::DashMap<String, Publication>,
+    has_publications: AtomicBool,
     subscriptions: dashmap::DashMap<String, Subscription>,
     logical_slots: dashmap::DashMap<String, LogicalReplicationSlot>,
     changes: parking_lot::Mutex<Vec<LogicalChange>>,
@@ -139,6 +140,7 @@ impl LogicalReplicationRuntime {
     pub fn new() -> Self {
         Self {
             publications: dashmap::DashMap::new(),
+            has_publications: AtomicBool::new(false),
             subscriptions: dashmap::DashMap::new(),
             logical_slots: dashmap::DashMap::new(),
             changes: parking_lot::Mutex::new(Vec::new()),
@@ -188,6 +190,7 @@ impl LogicalReplicationRuntime {
         };
         self.persist_publication(&publication)?;
         self.publications.insert(name, publication.clone());
+        self.has_publications.store(true, Ordering::Release);
         Ok(publication)
     }
 
@@ -201,7 +204,11 @@ impl LogicalReplicationRuntime {
             return Ok(false);
         }
         self.remove_metadata_file("publications", &name)?;
-        Ok(self.publications.remove(&name).is_some())
+        let removed = self.publications.remove(&name).is_some();
+        if removed && self.publications.is_empty() {
+            self.has_publications.store(false, Ordering::Release);
+        }
+        Ok(removed)
     }
 
     /// Look up a publication by name.
@@ -210,6 +217,12 @@ impl LogicalReplicationRuntime {
         self.publications
             .get(&fold_identifier(name))
             .map(|entry| entry.value().clone())
+    }
+
+    /// Return `true` if any publication exists.
+    #[must_use]
+    pub fn has_publications(&self) -> bool {
+        self.has_publications.load(Ordering::Acquire)
     }
 
     /// Return publications in deterministic name order.
@@ -443,6 +456,7 @@ impl LogicalReplicationRuntime {
                     "duplicate logical publication metadata: {name}"
                 )));
             }
+            self.has_publications.store(true, Ordering::Release);
         }
         for entry in fs::read_dir(&subscriptions_dir).map_err(ServerError::Io)? {
             let entry = entry.map_err(ServerError::Io)?;

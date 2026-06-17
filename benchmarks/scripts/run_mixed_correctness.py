@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
 import statistics
 import subprocess
 import sys
@@ -26,6 +27,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--pg-user")
     parser.add_argument("--pg-database")
     parser.add_argument("--ch-port", type=int, default=19000)
+    parser.add_argument(
+        "--storage-mode",
+        choices=["memory", "data-dir"],
+        default="memory",
+        help="storage profile to measure honestly",
+    )
+    parser.add_argument(
+        "--data-root",
+        type=Path,
+        default=Path("benchmarks/results/latest/scale-sweep/data-dirs/competitors"),
+        help="root directory for data-dir mode engine files",
+    )
     return parser.parse_args()
 
 
@@ -65,12 +78,33 @@ def answer_sha256(answer: list[list[str]]) -> str:
     return hashlib.sha256(data).hexdigest()
 
 
-def run_duckdb(n_rows: int, n_iters: int) -> tuple[list[float], list[list[str]]]:
+def db_path_for(engine: str, storage_mode: str, data_root: Path, workload: str) -> Path:
+    if storage_mode == "memory":
+        return Path(":memory:")
+    suffix = ".duckdb" if engine == "duckdb" else ".sqlite3"
+    db_path = data_root / engine / f"{workload}-{os.getpid()}{suffix}"
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    stale_suffixes = ("", ".wal") if engine == "duckdb" else ("", "-wal", "-shm")
+    for suffix in stale_suffixes:
+        candidate = Path(f"{db_path}{suffix}")
+        if candidate.exists():
+            candidate.unlink()
+    return db_path
+
+
+def run_duckdb(
+    n_rows: int,
+    n_iters: int,
+    storage_mode: str,
+    data_root: Path,
+    workload: str,
+) -> tuple[list[float], list[list[str]]]:
     import duckdb
 
     fact_table = "bench_mixed_correctness_fact"
     state_table = "bench_mixed_correctness_state"
-    con = duckdb.connect(":memory:")
+    db_path = db_path_for("duckdb", storage_mode, data_root, workload)
+    con = duckdb.connect(str(db_path))
     con.execute(
         f"CREATE TABLE {fact_table} ("
         "id BIGINT NOT NULL, val BIGINT NOT NULL)"
@@ -98,15 +132,27 @@ def run_duckdb(n_rows: int, n_iters: int) -> tuple[list[float], list[list[str]]]
     return samples, answer
 
 
-def run_sqlite(n_rows: int, n_iters: int) -> tuple[list[float], list[list[str]]]:
+def run_sqlite(
+    n_rows: int,
+    n_iters: int,
+    storage_mode: str,
+    data_root: Path,
+    workload: str,
+) -> tuple[list[float], list[list[str]]]:
     import sqlite3
 
     fact_table = "bench_mixed_correctness_fact"
     state_table = "bench_mixed_correctness_state"
-    con = sqlite3.connect(":memory:", isolation_level=None)
-    con.execute("PRAGMA journal_mode=MEMORY")
-    con.execute("PRAGMA synchronous=OFF")
-    con.execute("PRAGMA temp_store=MEMORY")
+    db_path = db_path_for("sqlite3", storage_mode, data_root, workload)
+    con = sqlite3.connect(str(db_path), isolation_level=None)
+    if storage_mode == "data-dir":
+        con.execute("PRAGMA journal_mode=WAL")
+        con.execute("PRAGMA synchronous=FULL")
+        con.execute("PRAGMA temp_store=DEFAULT")
+    else:
+        con.execute("PRAGMA journal_mode=MEMORY")
+        con.execute("PRAGMA synchronous=OFF")
+        con.execute("PRAGMA temp_store=MEMORY")
     con.execute(
         f"CREATE TABLE {fact_table} ("
         "id INTEGER NOT NULL, val INTEGER NOT NULL)"
@@ -141,20 +187,22 @@ def run_postgres(
     n_iters: int,
     pg_user: str,
     pg_database: str,
+    storage_mode: str,
 ) -> tuple[list[float], list[list[str]]]:
     try:
         import psycopg
     except ImportError:
-        return run_postgres_psql(n_rows, n_iters, pg_user, pg_database)
+        return run_postgres_psql(n_rows, n_iters, pg_user, pg_database, storage_mode)
 
     fact_table = "bench_mixed_correctness_fact"
     state_table = "bench_mixed_correctness_state"
+    table_kind = "TABLE" if storage_mode == "data-dir" else "UNLOGGED TABLE"
     setup_sql = (
         f"DROP TABLE IF EXISTS {fact_table}; "
         f"DROP TABLE IF EXISTS {state_table}; "
-        f"CREATE UNLOGGED TABLE {fact_table} ("
+        f"CREATE {table_kind} {fact_table} ("
         "id BIGINT NOT NULL, val BIGINT NOT NULL); "
-        f"CREATE UNLOGGED TABLE {state_table} ("
+        f"CREATE {table_kind} {state_table} ("
         "id BIGINT NOT NULL, val BIGINT NOT NULL); "
         f"INSERT INTO {fact_table} VALUES {values_sql(base_rows(n_rows))}; "
         f"INSERT INTO {state_table} VALUES {values_sql(base_rows(16))};"
@@ -183,6 +231,7 @@ def run_postgres_psql(
     n_iters: int,
     pg_user: str,
     pg_database: str,
+    storage_mode: str,
 ) -> tuple[list[float], list[list[str]]]:
     fact_table = "bench_mixed_correctness_fact"
     state_table = "bench_mixed_correctness_state"
@@ -200,12 +249,13 @@ def run_postgres_psql(
         "-v",
         "ON_ERROR_STOP=1",
     ]
+    table_kind = "TABLE" if storage_mode == "data-dir" else "UNLOGGED TABLE"
     setup_sql = (
         f"DROP TABLE IF EXISTS {fact_table}; "
         f"DROP TABLE IF EXISTS {state_table}; "
-        f"CREATE UNLOGGED TABLE {fact_table} ("
+        f"CREATE {table_kind} {fact_table} ("
         "id BIGINT NOT NULL, val BIGINT NOT NULL); "
-        f"CREATE UNLOGGED TABLE {state_table} ("
+        f"CREATE {table_kind} {state_table} ("
         "id BIGINT NOT NULL, val BIGINT NOT NULL); "
         f"INSERT INTO {fact_table} VALUES {values_sql(base_rows(n_rows))}; "
         f"INSERT INTO {state_table} VALUES {values_sql(base_rows(16))};"
@@ -289,13 +339,31 @@ def emit(args: argparse.Namespace, samples: list[float], answer: list[list[str]]
 def main() -> None:
     args = parse_args()
     if args.engine == "duckdb":
-        samples, answer = run_duckdb(args.rows, args.iters)
+        samples, answer = run_duckdb(
+            args.rows,
+            args.iters,
+            args.storage_mode,
+            args.data_root,
+            args.workload,
+        )
     elif args.engine == "sqlite3":
-        samples, answer = run_sqlite(args.rows, args.iters)
+        samples, answer = run_sqlite(
+            args.rows,
+            args.iters,
+            args.storage_mode,
+            args.data_root,
+            args.workload,
+        )
     elif args.engine in {"postgres", "postgres17"}:
         if not args.pg_user or not args.pg_database:
             raise SystemExit("--pg-user and --pg-database are required for postgres")
-        samples, answer = run_postgres(args.rows, args.iters, args.pg_user, args.pg_database)
+        samples, answer = run_postgres(
+            args.rows,
+            args.iters,
+            args.pg_user,
+            args.pg_database,
+            args.storage_mode,
+        )
     elif args.engine == "clickhouse":
         samples, answer = run_clickhouse(args.rows, args.iters, args.ch_port)
     else:

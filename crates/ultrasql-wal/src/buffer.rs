@@ -28,11 +28,14 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use parking_lot::Mutex;
 use ultrasql_core::Lsn;
 
-use crate::record::WalRecord;
+use crate::record::{RecordType, WalRecord, WalRecordError, append_encoded_parts_to};
 
 /// Errors from the WAL append path.
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum WalBufferError {
+    /// The borrowed append path could not construct a valid WAL record.
+    #[error("wal record rejected: {0}")]
+    Record(#[from] WalRecordError),
     /// The buffer is full and the caller did not provide a wait
     /// strategy.
     #[error("wal buffer full: have {used} bytes used of {capacity}")]
@@ -134,10 +137,12 @@ impl WalBuffer {
     /// The LSN is assigned monotonically inside the lock; callers
     /// observe a global ordering.
     pub fn append(&self, record: &WalRecord) -> Result<Lsn, WalBufferError> {
-        let bytes = record.encode();
-        let byte_len = u64::try_from(bytes.len()).map_err(|_| WalBufferError::LsnOverflow {
-            current: u64::MAX,
-            bytes: u64::MAX,
+        let byte_len = u64::from(record.header.total_length);
+        let record_len = usize::try_from(record.header.total_length).map_err(|_| {
+            WalBufferError::LsnOverflow {
+                current: u64::MAX,
+                bytes: byte_len,
+            }
         })?;
         let lsn = {
             let mut inner = self.inner.lock();
@@ -145,7 +150,7 @@ impl WalBuffer {
                 inner
                     .bytes
                     .len()
-                    .checked_add(bytes.len())
+                    .checked_add(record_len)
                     .ok_or(WalBufferError::Full {
                         used: inner.bytes.len(),
                         capacity: self.capacity,
@@ -165,7 +170,59 @@ impl WalBuffer {
                         current: inner.next_lsn,
                         bytes: byte_len,
                     })?;
-            inner.bytes.extend_from_slice(&bytes);
+            record.append_encoded_to(&mut inner.bytes);
+            lsn
+        };
+        Ok(Lsn::new(lsn))
+    }
+
+    /// Append a record from a borrowed payload.
+    ///
+    /// This produces the same bytes as [`WalRecord::new`] followed by
+    /// [`Self::append`], but skips allocating an owned payload vector.
+    pub fn append_borrowed(
+        &self,
+        record_type: RecordType,
+        xid: ultrasql_core::Xid,
+        prev_lsn: Lsn,
+        flags: u8,
+        payload: &[u8],
+    ) -> Result<Lsn, WalBufferError> {
+        let header =
+            WalRecord::header_for_borrowed_payload(record_type, xid, prev_lsn, flags, payload)?;
+        let byte_len = u64::from(header.total_length);
+        let record_len =
+            usize::try_from(header.total_length).map_err(|_| WalBufferError::LsnOverflow {
+                current: u64::MAX,
+                bytes: byte_len,
+            })?;
+        let lsn = {
+            let mut inner = self.inner.lock();
+            let used_after =
+                inner
+                    .bytes
+                    .len()
+                    .checked_add(record_len)
+                    .ok_or(WalBufferError::Full {
+                        used: inner.bytes.len(),
+                        capacity: self.capacity,
+                    })?;
+            if used_after > self.capacity {
+                return Err(WalBufferError::Full {
+                    used: inner.bytes.len(),
+                    capacity: self.capacity,
+                });
+            }
+            let lsn = inner.next_lsn;
+            inner.next_lsn =
+                inner
+                    .next_lsn
+                    .checked_add(byte_len)
+                    .ok_or(WalBufferError::LsnOverflow {
+                        current: inner.next_lsn,
+                        bytes: byte_len,
+                    })?;
+            append_encoded_parts_to(&header, payload, &mut inner.bytes);
             lsn
         };
         Ok(Lsn::new(lsn))
@@ -178,9 +235,27 @@ impl WalBuffer {
     /// In production this is called by the flusher thread on every
     /// fsync window. The buffer reuses its allocation across drains.
     pub fn drain(&self) -> Result<DrainedBatch, WalBufferError> {
+        let mut bytes = Vec::new();
+        let range = self.drain_into(&mut bytes)?;
+        Ok(DrainedBatch {
+            bytes,
+            start_lsn: range.start_lsn,
+            end_lsn: range.end_lsn,
+        })
+    }
+
+    /// Drain the buffer into `bytes`, swapping the caller's empty allocation
+    /// back into the append path.
+    ///
+    /// The WAL writer owns a reusable drain buffer and calls this method on
+    /// every loop. Swapping avoids leaving the foreground append vector at
+    /// zero capacity after a drain, which would otherwise make the next burst
+    /// of WAL appends pay allocator growth under the append mutex.
+    pub fn drain_into(&self, bytes: &mut Vec<u8>) -> Result<DrainedRange, WalBufferError> {
+        bytes.clear();
         let mut inner = self.inner.lock();
         let end_lsn = inner.next_lsn;
-        let bytes = std::mem::take(&mut inner.bytes);
+        std::mem::swap(&mut inner.bytes, bytes);
         drop(inner);
 
         let byte_len = u64::try_from(bytes.len())
@@ -191,8 +266,7 @@ impl WalBuffer {
                 end: end_lsn,
                 bytes: byte_len,
             })?;
-        Ok(DrainedBatch {
-            bytes,
+        Ok(DrainedRange {
             start_lsn: Lsn::new(start_lsn),
             end_lsn: Lsn::new(end_lsn),
         })
@@ -239,6 +313,15 @@ pub struct DrainedBatch {
     pub end_lsn: Lsn,
 }
 
+/// LSN span of bytes drained into a caller-owned buffer.
+#[derive(Debug, Clone, Copy)]
+pub struct DrainedRange {
+    /// LSN of the first byte of the drained byte buffer.
+    pub start_lsn: Lsn,
+    /// LSN of the first byte after the drained byte buffer.
+    pub end_lsn: Lsn,
+}
+
 #[cfg(test)]
 mod tests {
     use ultrasql_core::Xid;
@@ -262,6 +345,31 @@ mod tests {
         assert_eq!(a, Lsn::new(1000));
         assert!(b > a);
         assert!(c > b);
+    }
+
+    #[test]
+    fn append_borrowed_payload_matches_record_append() {
+        let payload = b"payload bytes";
+        let record = rec(
+            RecordType::HeapDeleteInPlaceRangeBatch,
+            payload,
+            Lsn::new(7),
+        );
+        let expected = record.encode();
+
+        let buf = WalBuffer::new(64 * 1024, Lsn::new(1000));
+        let lsn = buf
+            .append_borrowed(
+                RecordType::HeapDeleteInPlaceRangeBatch,
+                Xid::new(1),
+                Lsn::new(7),
+                0,
+                payload,
+            )
+            .unwrap();
+
+        assert_eq!(lsn, Lsn::new(1000));
+        assert_eq!(buf.drain().unwrap().bytes, expected);
     }
 
     #[test]
@@ -373,6 +481,26 @@ mod tests {
         assert!(buf.buffered_bytes() > 0);
         let _ = buf.drain().expect("drain succeeds");
         assert_eq!(buf.buffered_bytes(), 0);
+    }
+
+    #[test]
+    fn drain_into_uses_caller_buffer_and_leaves_append_path_usable() {
+        let buf = WalBuffer::new(1024, Lsn::new(0));
+        let first = rec(RecordType::HeapInsert, b"x", Lsn::ZERO);
+        let first_len = u64::try_from(first.encode().len()).expect("record length fits");
+        buf.append(&first).unwrap();
+
+        let mut drained = Vec::with_capacity(1024);
+        let range = buf.drain_into(&mut drained).expect("drain succeeds");
+        assert_eq!(range.start_lsn, Lsn::ZERO);
+        assert_eq!(range.end_lsn, Lsn::new(first_len));
+        assert!(!drained.is_empty());
+        assert_eq!(buf.buffered_bytes(), 0);
+
+        drained.clear();
+        buf.append(&rec(RecordType::HeapInsert, b"y", Lsn::ZERO))
+            .unwrap();
+        assert!(buf.buffered_bytes() > 0);
     }
 
     #[test]

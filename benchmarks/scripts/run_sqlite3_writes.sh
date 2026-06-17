@@ -40,6 +40,17 @@ N_ITERS="${N_ITERS:-8}"
 N_ROWS="${N_ROWS:-10000}"
 ANALYTICAL_ROWS="${ANALYTICAL_ROWS:-}"
 INSERT_CHUNK_ROWS="${INSERT_CHUNK_ROWS:-10000}"
+BENCH_STORAGE_MODE="${BENCH_STORAGE_MODE:-memory}"
+case "$BENCH_STORAGE_MODE" in
+    memory|data-dir) ;;
+    *) echo "run_sqlite3_writes.sh: unknown BENCH_STORAGE_MODE '$BENCH_STORAGE_MODE' (memory|data-dir)" >&2; exit 2 ;;
+esac
+BENCH_DATA_ROOT="${BENCH_DATA_ROOT:-$(dirname "$RAW_DIR")/data-dirs/competitors}"
+if [[ "$BENCH_STORAGE_MODE" == "data-dir" ]]; then
+    SQLITE_DURABILITY_MODE="durable"
+else
+    SQLITE_DURABILITY_MODE="volatile"
+fi
 
 row_suffix() {
     local rows="$1"
@@ -83,18 +94,21 @@ emit_unavailable_all() {
     target_stub_workloads | while IFS= read -r wl; do
         local rows
         rows="$(workload_rows "$wl")"
-        python3 - "$RAW_DIR/${wl}-${ENGINE}.json" "$ENGINE" "$wl" "$rows" "$reason" <<'PY'
+        python3 - "$RAW_DIR/${wl}-${ENGINE}.json" "$ENGINE" "$wl" "$rows" "$reason" \
+            "$BENCH_STORAGE_MODE" "$SQLITE_DURABILITY_MODE" <<'PY'
 import json
 import sys
 from pathlib import Path
 
-out, engine, workload, rows, reason = sys.argv[1:]
+out, engine, workload, rows, reason, storage_mode, durability_mode = sys.argv[1:]
 doc = {
     "schema_version": 1,
     "engine": engine,
     "status": "not_available",
     "workload": workload,
     "n_rows": int(rows),
+    "storage_mode": storage_mode,
+    "durability_mode": durability_mode,
     "reason": reason,
     "policy": "No SQLite benchmark claim exists until this artifact records measured samples from the same scale-sweep run.",
 }
@@ -149,11 +163,12 @@ PYEOF
     local n_samples="$#"
     local min_us
     min_us="$(python3 -c "import sys; vals=[float(x) for x in sys.argv[1:]]; print(min(vals) if vals else 0)" "$@")"
-    python3 - "$ENGINE" "$SQLITE_ENGINE_VERSION" "$workload" "$n_rows" "$n_samples" "$median_us" "$min_us" "$samples_json" <<'PYEOF'
+    python3 - "$ENGINE" "$SQLITE_ENGINE_VERSION" "$workload" "$n_rows" "$n_samples" \
+        "$median_us" "$min_us" "$samples_json" "$BENCH_STORAGE_MODE" "$SQLITE_DURABILITY_MODE" <<'PYEOF'
 import json
 import sys
 
-engine, version, workload, n_rows, samples, median_us, min_us, samples_json = sys.argv[1:]
+engine, version, workload, n_rows, samples, median_us, min_us, samples_json, storage_mode, durability_mode = sys.argv[1:]
 doc = {
     "schema_version": 1,
     "engine": engine,
@@ -161,6 +176,8 @@ doc = {
     "workload": workload,
     "status": "measured",
     "n_rows": int(n_rows),
+    "storage_mode": storage_mode,
+    "durability_mode": durability_mode,
     "samples": int(samples),
     "median_us": float(median_us),
     "min_us": float(min_us),
@@ -171,12 +188,52 @@ print(json.dumps(doc, sort_keys=True))
 PYEOF
 }
 
+annotate_profile_json() {
+    local path="$1"
+    python3 - "$path" "$BENCH_STORAGE_MODE" "$SQLITE_DURABILITY_MODE" <<'PYEOF'
+import json
+import sys
+from pathlib import Path
+
+path = Path(sys.argv[1])
+doc = json.loads(path.read_text())
+doc["storage_mode"] = sys.argv[2]
+doc["durability_mode"] = sys.argv[3]
+path.write_text(json.dumps(doc, sort_keys=True) + "\n")
+PYEOF
+}
+
 # ---------------------------------------------------------------------------
-# Common SQLite preamble (in-memory hot mode)
+# Common SQLite preamble.
 # ---------------------------------------------------------------------------
-SQLITE_PREAMBLE="PRAGMA journal_mode=MEMORY;
+if [[ "$BENCH_STORAGE_MODE" == "data-dir" ]]; then
+    SQLITE_PREAMBLE="PRAGMA journal_mode=WAL;
+PRAGMA synchronous=FULL;
+PRAGMA temp_store=DEFAULT;"
+else
+    SQLITE_PREAMBLE="PRAGMA journal_mode=MEMORY;
 PRAGMA synchronous=OFF;
 PRAGMA temp_store=MEMORY;"
+fi
+
+sqlite_db_path() {
+    local workload="$1"
+    local sample="$2"
+    if [[ "$BENCH_STORAGE_MODE" == "memory" ]]; then
+        echo ":memory:"
+        return
+    fi
+    local dir="$BENCH_DATA_ROOT/sqlite3"
+    mkdir -p "$dir"
+    echo "$dir/${workload}-${sample}.sqlite3"
+}
+
+reset_sqlite_db() {
+    local db_path="$1"
+    if [[ "$db_path" != ":memory:" ]]; then
+        rm -f "$db_path" "$db_path-wal" "$db_path-shm"
+    fi
+}
 
 # ---------------------------------------------------------------------------
 # Workload: insert_throughput_10k
@@ -197,7 +254,7 @@ ids = list(range(n))
 rng.shuffle(ids)
 vals = [rng.randint(-2**31, 2**31-1) for _ in range(n)]
 with open(out, "w") as f:
-    f.write("CREATE TABLE bench_write(id INTEGER PRIMARY KEY, val INTEGER);\n")
+    f.write("CREATE TABLE bench_write(id INTEGER NOT NULL, val INTEGER);\n")
     f.write("BEGIN;\n")
     chunks = [ids[i:i+chunk_rows] for i in range(0, n, chunk_rows)]
     vchunks = [vals[i:i+chunk_rows] for i in range(0, n, chunk_rows)]
@@ -209,9 +266,11 @@ PYEOF
 
     local samples=()
     for (( i=0; i<N_ITERS; i++ )); do
-        local t0 t1 dt
+        local t0 t1 dt db_path
+        db_path="$(sqlite_db_path "$wl" "$i")"
+        reset_sqlite_db "$db_path"
         t0="$(python3 -c 'import time; print(time.perf_counter())')"
-        printf '%s\n' "$SQLITE_PREAMBLE" | cat - "$values_sql" | sqlite3 :memory: >/dev/null
+        printf '%s\n' "$SQLITE_PREAMBLE" | cat - "$values_sql" | sqlite3 "$db_path" >/dev/null
         t1="$(python3 -c 'import time; print(time.perf_counter())')"
         dt="$(python3 -c "print(($t1 - $t0) * 1e6)")"
         samples+=("$dt")
@@ -240,23 +299,43 @@ run_update() {
     # subtract-two-process methodology that clamped against
     # `max(v, 1.0)` and blew variance on sub-millisecond queries.
     local samples_raw
-    samples_raw="$(python3 - "$N_ROWS" "$N_ITERS" <<'PYEOF'
+    samples_raw="$(python3 - "$N_ROWS" "$N_ITERS" "$BENCH_STORAGE_MODE" "$BENCH_DATA_ROOT" "$wl" <<'PYEOF'
+import os
 import sys, time, random
 import sqlite3
+from pathlib import Path
 
 n = int(sys.argv[1])
 n_iters = int(sys.argv[2])
+storage_mode = sys.argv[3]
+data_root = Path(sys.argv[4])
+workload = sys.argv[5]
 
 rng = random.Random(0xC0FFEE)
 ids = list(range(n))
 rng.shuffle(ids)
 vals = [rng.randint(-(2**31), 2**31 - 1) for _ in range(n)]
 
-con = sqlite3.connect(":memory:", isolation_level=None)
-con.execute("PRAGMA journal_mode=MEMORY;")
-con.execute("PRAGMA synchronous=OFF;")
-con.execute("PRAGMA temp_store=MEMORY;")
-con.execute("CREATE TABLE bench_write(id INTEGER PRIMARY KEY, val INTEGER);")
+if storage_mode == "data-dir":
+    db_path = data_root / "sqlite3" / f"{workload}-{os.getpid()}.sqlite3"
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    for suffix in ("", "-wal", "-shm"):
+        candidate = Path(f"{db_path}{suffix}")
+        if candidate.exists():
+            candidate.unlink()
+else:
+    db_path = Path(":memory:")
+
+con = sqlite3.connect(str(db_path), isolation_level=None)
+if storage_mode == "data-dir":
+    con.execute("PRAGMA journal_mode=WAL;")
+    con.execute("PRAGMA synchronous=FULL;")
+    con.execute("PRAGMA temp_store=DEFAULT;")
+else:
+    con.execute("PRAGMA journal_mode=MEMORY;")
+    con.execute("PRAGMA synchronous=OFF;")
+    con.execute("PRAGMA temp_store=MEMORY;")
+con.execute("CREATE TABLE bench_write(id INTEGER NOT NULL, val INTEGER);")
 con.execute("BEGIN;")
 con.executemany(
     "INSERT INTO bench_write(id,val) VALUES (?, ?);",
@@ -305,23 +384,43 @@ run_delete() {
     # the same DELETE against the same row image. Avoids the
     # subtract-two-process methodology and its `max(v, 1.0)` clamp.
     local samples_raw
-    samples_raw="$(python3 - "$N_ROWS" "$N_ITERS" <<'PYEOF'
+    samples_raw="$(python3 - "$N_ROWS" "$N_ITERS" "$BENCH_STORAGE_MODE" "$BENCH_DATA_ROOT" "$wl" <<'PYEOF'
+import os
 import sys, time, random
 import sqlite3
+from pathlib import Path
 
 n = int(sys.argv[1])
 n_iters = int(sys.argv[2])
+storage_mode = sys.argv[3]
+data_root = Path(sys.argv[4])
+workload = sys.argv[5]
 
 rng = random.Random(0xC0FFEE)
 ids = list(range(n))
 rng.shuffle(ids)
 vals = [rng.randint(-(2**31), 2**31 - 1) for _ in range(n)]
 
-con = sqlite3.connect(":memory:", isolation_level=None)
-con.execute("PRAGMA journal_mode=MEMORY;")
-con.execute("PRAGMA synchronous=OFF;")
-con.execute("PRAGMA temp_store=MEMORY;")
-con.execute("CREATE TABLE bench_write(id INTEGER PRIMARY KEY, val INTEGER);")
+if storage_mode == "data-dir":
+    db_path = data_root / "sqlite3" / f"{workload}-{os.getpid()}.sqlite3"
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    for suffix in ("", "-wal", "-shm"):
+        candidate = Path(f"{db_path}{suffix}")
+        if candidate.exists():
+            candidate.unlink()
+else:
+    db_path = Path(":memory:")
+
+con = sqlite3.connect(str(db_path), isolation_level=None)
+if storage_mode == "data-dir":
+    con.execute("PRAGMA journal_mode=WAL;")
+    con.execute("PRAGMA synchronous=FULL;")
+    con.execute("PRAGMA temp_store=DEFAULT;")
+else:
+    con.execute("PRAGMA journal_mode=MEMORY;")
+    con.execute("PRAGMA synchronous=OFF;")
+    con.execute("PRAGMA temp_store=MEMORY;")
+con.execute("CREATE TABLE bench_write(id INTEGER NOT NULL, val INTEGER);")
 con.execute("BEGIN;")
 con.executemany(
     "INSERT INTO bench_write(id,val) VALUES (?, ?);",
@@ -368,15 +467,22 @@ run_mixed() {
     local window_secs=1
     for (( i=0; i<N_ITERS; i++ )); do
         local us_per_op
-        us_per_op="$(python3 - "$N_ROWS" "$window_secs" "$i" <<'PYEOF'
+        us_per_op="$(python3 - "$N_ROWS" "$window_secs" "$i" "$BENCH_STORAGE_MODE" "$BENCH_DATA_ROOT" "$wl" <<'PYEOF'
 import subprocess, time, random, sys
+from pathlib import Path
 
 n = int(sys.argv[1])
 window = float(sys.argv[2])
 seed = int(sys.argv[3])
+storage_mode = sys.argv[4]
+data_root = Path(sys.argv[5])
+workload = sys.argv[6]
 rng = random.Random(0xBEEF + seed)
 
-preamble = "PRAGMA journal_mode=MEMORY;\nPRAGMA synchronous=OFF;\nPRAGMA temp_store=MEMORY;\n"
+if storage_mode == "data-dir":
+    preamble = "PRAGMA journal_mode=WAL;\nPRAGMA synchronous=FULL;\nPRAGMA temp_store=DEFAULT;\n"
+else:
+    preamble = "PRAGMA journal_mode=MEMORY;\nPRAGMA synchronous=OFF;\nPRAGMA temp_store=MEMORY;\n"
 
 # Build initial preload SQL.
 ids = list(range(n))
@@ -391,9 +497,20 @@ for ch, vc in zip(chunks, vchunks):
     preload_parts.append(f"INSERT INTO bench_write(id,val) VALUES {rows};")
 preload_sql = "\n".join(preload_parts)
 
-def run_sqlite(extra_sql: str) -> None:
+def sqlite_target(batch: int) -> str:
+    if storage_mode != "data-dir":
+        return ":memory:"
+    db_path = data_root / "sqlite3" / f"{workload}-{seed}-{batch}.sqlite3"
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    for suffix in ("", "-wal", "-shm"):
+        candidate = Path(f"{db_path}{suffix}")
+        if candidate.exists():
+            candidate.unlink()
+    return str(db_path)
+
+def run_sqlite(extra_sql: str, batch: int) -> None:
     sql = preamble + preload_sql + "\n" + extra_sql
-    subprocess.run(["sqlite3", ":memory:"], input=sql, capture_output=True, text=True)
+    subprocess.run(["sqlite3", sqlite_target(batch)], input=sql, capture_output=True, text=True)
 
 deadline = time.perf_counter() + window
 count = 0
@@ -413,7 +530,7 @@ while time.perf_counter() < deadline:
             new_val = rng.randint(-2**31, 2**31 - 1)
             ops_batch.append(f"INSERT INTO bench_write(id, val) VALUES ({next_id}, {new_val});")
             next_id += 1
-    run_sqlite("\n".join(ops_batch))
+    run_sqlite("\n".join(ops_batch), count)
     count += 20
 
 elapsed = time.perf_counter() - (deadline - window)
@@ -442,7 +559,10 @@ run_mixed_correctness() {
         --workload "$wl" \
         --rows "$N_ROWS" \
         --iters "$N_ITERS" \
+        --storage-mode "$BENCH_STORAGE_MODE" \
+        --data-root "$BENCH_DATA_ROOT" \
         --out "${RAW_DIR}/${wl}-${ENGINE}.json"
+    annotate_profile_json "${RAW_DIR}/${wl}-${ENGINE}.json"
 }
 
 # ---------------------------------------------------------------------------
@@ -458,17 +578,37 @@ run_select_scan() {
     # `fetchall()`. Avoids the subtract-two-process methodology that
     # clamped fast scans against `max(v, 1.0)`.
     local samples_raw
-    samples_raw="$(python3 - "$N_ROWS" "$N_ITERS" <<'PYEOF'
+    samples_raw="$(python3 - "$N_ROWS" "$N_ITERS" "$BENCH_STORAGE_MODE" "$BENCH_DATA_ROOT" "$wl" <<'PYEOF'
+import os
 import sys, time
 import sqlite3
+from pathlib import Path
 
 n = int(sys.argv[1])
 n_iters = int(sys.argv[2])
+storage_mode = sys.argv[3]
+data_root = Path(sys.argv[4])
+workload = sys.argv[5]
 
-con = sqlite3.connect(":memory:", isolation_level=None)
-con.execute("PRAGMA journal_mode=MEMORY;")
-con.execute("PRAGMA synchronous=OFF;")
-con.execute("PRAGMA temp_store=MEMORY;")
+if storage_mode == "data-dir":
+    db_path = data_root / "sqlite3" / f"{workload}-{os.getpid()}.sqlite3"
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    for suffix in ("", "-wal", "-shm"):
+        candidate = Path(f"{db_path}{suffix}")
+        if candidate.exists():
+            candidate.unlink()
+else:
+    db_path = Path(":memory:")
+
+con = sqlite3.connect(str(db_path), isolation_level=None)
+if storage_mode == "data-dir":
+    con.execute("PRAGMA journal_mode=WAL;")
+    con.execute("PRAGMA synchronous=FULL;")
+    con.execute("PRAGMA temp_store=DEFAULT;")
+else:
+    con.execute("PRAGMA journal_mode=MEMORY;")
+    con.execute("PRAGMA synchronous=OFF;")
+    con.execute("PRAGMA temp_store=MEMORY;")
 con.execute("CREATE TABLE bench_select_scan(id INTEGER NOT NULL, val INTEGER);")
 con.execute("BEGIN;")
 con.executemany(
@@ -519,18 +659,38 @@ run_analytical() {
     echo "  workload: ${wl} (n_rows=${n_rows})"
 
     local samples_raw
-    samples_raw="$(python3 - "$n_rows" "$query" "$N_ITERS" <<'PYEOF'
+    samples_raw="$(python3 - "$n_rows" "$query" "$N_ITERS" "$BENCH_STORAGE_MODE" "$BENCH_DATA_ROOT" "$wl" <<'PYEOF'
+import os
 import sys, time
 import sqlite3
+from pathlib import Path
 
 n = int(sys.argv[1])
 query = sys.argv[2]
 n_iters = int(sys.argv[3])
+storage_mode = sys.argv[4]
+data_root = Path(sys.argv[5])
+workload = sys.argv[6]
 
-con = sqlite3.connect(":memory:", isolation_level=None)
-con.execute("PRAGMA journal_mode=MEMORY;")
-con.execute("PRAGMA synchronous=OFF;")
-con.execute("PRAGMA temp_store=MEMORY;")
+if storage_mode == "data-dir":
+    db_path = data_root / "sqlite3" / f"{workload}-{os.getpid()}.sqlite3"
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    for suffix in ("", "-wal", "-shm"):
+        candidate = Path(f"{db_path}{suffix}")
+        if candidate.exists():
+            candidate.unlink()
+else:
+    db_path = Path(":memory:")
+
+con = sqlite3.connect(str(db_path), isolation_level=None)
+if storage_mode == "data-dir":
+    con.execute("PRAGMA journal_mode=WAL;")
+    con.execute("PRAGMA synchronous=FULL;")
+    con.execute("PRAGMA temp_store=DEFAULT;")
+else:
+    con.execute("PRAGMA journal_mode=MEMORY;")
+    con.execute("PRAGMA synchronous=OFF;")
+    con.execute("PRAGMA temp_store=MEMORY;")
 con.execute("CREATE TABLE bench_analytical(id INTEGER NOT NULL, x INTEGER);")
 con.execute("BEGIN;")
 con.executemany(

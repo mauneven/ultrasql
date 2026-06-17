@@ -72,6 +72,15 @@ impl VisibilityMap {
         self.get_bits(rel, block) & BIT_FROZEN != 0
     }
 
+    /// Return `true` if this relation has any visibility-map storage.
+    ///
+    /// Heap hot paths use this to avoid repeated no-op clears for relations
+    /// that vacuum has never marked all-visible or all-frozen.
+    #[must_use]
+    pub fn contains_relation(&self, rel: RelationId) -> bool {
+        self.inner.contains_key(&rel)
+    }
+
     /// Mark a page as all-visible.
     ///
     /// Called by vacuum after verifying that all live tuples on the page

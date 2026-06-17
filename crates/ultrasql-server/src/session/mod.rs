@@ -73,6 +73,22 @@ pub(crate) struct Session<RW> {
     /// cache without rippling `&mut self` across the session API.
     pub(super) stmt_cache:
         std::cell::RefCell<std::collections::HashMap<String, Arc<ultrasql_planner::LogicalPlan>>>,
+    /// Logical-plan pointers whose static DML safety checks already passed.
+    ///
+    /// This is intentionally narrower than `stmt_cache`: entries are added
+    /// only for simple fused DML shapes with no row-security rewrite and no
+    /// materialized-view source guard. `plan_cache_invalidate` clears it
+    /// alongside `stmt_cache`, so role, privilege, RLS, or DDL changes force
+    /// the next execution back through the full checks.
+    pub(super) prechecked_fast_dml: std::cell::RefCell<std::collections::HashSet<usize>>,
+    /// Per-session split cache for repeated multi-statement Simple Query text.
+    ///
+    /// The hot mixed benchmark sends the same `INSERT; UPDATE; SELECT` batch
+    /// many times. Caching the parser's statement boundaries lets each child
+    /// statement still flow through the normal parse/bind/plan caches without
+    /// reparsing the outer batch envelope first.
+    pub(super) simple_batch_cache:
+        std::cell::RefCell<std::collections::HashMap<String, Arc<Vec<String>>>>,
     /// Session-local JSONB shape cache used by COPY ingest.
     ///
     /// Repeated AI/event rows tend to share object keys and structural
@@ -170,6 +186,8 @@ where
             session_settings: std::collections::HashMap::new(),
             notify_rx,
             stmt_cache: std::cell::RefCell::new(std::collections::HashMap::new()),
+            prechecked_fast_dml: std::cell::RefCell::new(std::collections::HashSet::new()),
+            simple_batch_cache: std::cell::RefCell::new(std::collections::HashMap::new()),
             jsonb_shape_cache: std::cell::RefCell::new(jsonb_ingest::JsonbShapeCache::default()),
             pending_table_modifications: std::collections::HashMap::new(),
             pending_logical_changes: Vec::new(),

@@ -920,6 +920,20 @@ fn build_referenced_by_delete_checks(
     Ok(out)
 }
 
+fn has_referenced_by_delete_checks(
+    parent_oid: ultrasql_core::Oid,
+    constraints: &dashmap::DashMap<ultrasql_core::Oid, Arc<crate::TableRuntimeConstraints>>,
+) -> bool {
+    constraints.iter().any(|item| {
+        item.value().foreign_keys.iter().any(|fk| {
+            fk.target_oid == parent_oid
+                && !(fk.deferrable
+                    && fk.initially_deferred
+                    && fk.on_delete == LogicalReferentialAction::NoAction)
+        })
+    })
+}
+
 fn relation_has_exclusion_conflict(
     heap: &ultrasql_storage::heap::HeapAccess<crate::BlankPageLoader>,
     table: &TableEntry,
@@ -2384,7 +2398,7 @@ pub(super) fn lower_real_delete(
     // single-pass `FusedDeleteInt32Pair` operator.
     if returning.is_empty()
         && !has_indexes
-        && build_referenced_by_delete_checks(entry.oid, ctx)?.is_empty()
+        && !has_referenced_by_delete_checks(entry.oid, &ctx.table_constraints)
     {
         if let Some(fused) = try_build_fused_delete(table, entry, input, ctx)? {
             return Ok(fused);
@@ -2694,4 +2708,83 @@ pub(super) fn lower_project_columns(
         indices,
         output_schema,
     )?))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use dashmap::DashMap;
+    use ultrasql_core::Oid;
+
+    use super::*;
+
+    fn fk_to_parent(
+        target_oid: Oid,
+        on_delete: LogicalReferentialAction,
+        deferrable: bool,
+        initially_deferred: bool,
+    ) -> crate::RuntimeForeignKeyConstraint {
+        crate::RuntimeForeignKeyConstraint {
+            name: "fk_child_parent".to_owned(),
+            columns: vec![0],
+            target_table: "parent".to_owned(),
+            target_oid,
+            target_columns: vec![0],
+            on_delete,
+            on_update: LogicalReferentialAction::NoAction,
+            deferrable,
+            initially_deferred,
+        }
+    }
+
+    #[test]
+    fn referenced_by_delete_metadata_detects_only_eager_delete_actions() {
+        let parent = Oid::new(10);
+        let other_parent = Oid::new(11);
+        let child = Oid::new(20);
+        let constraints = DashMap::new();
+        constraints.insert(
+            child,
+            Arc::new(crate::TableRuntimeConstraints {
+                foreign_keys: vec![fk_to_parent(
+                    parent,
+                    LogicalReferentialAction::NoAction,
+                    true,
+                    true,
+                )],
+                ..crate::TableRuntimeConstraints::default()
+            }),
+        );
+
+        assert!(!has_referenced_by_delete_checks(parent, &constraints));
+
+        constraints.insert(
+            child,
+            Arc::new(crate::TableRuntimeConstraints {
+                foreign_keys: vec![fk_to_parent(
+                    parent,
+                    LogicalReferentialAction::Restrict,
+                    false,
+                    false,
+                )],
+                ..crate::TableRuntimeConstraints::default()
+            }),
+        );
+        assert!(has_referenced_by_delete_checks(parent, &constraints));
+
+        constraints.insert(
+            child,
+            Arc::new(crate::TableRuntimeConstraints {
+                foreign_keys: vec![fk_to_parent(
+                    other_parent,
+                    LogicalReferentialAction::Restrict,
+                    false,
+                    false,
+                )],
+                ..crate::TableRuntimeConstraints::default()
+            }),
+        );
+        assert!(!has_referenced_by_delete_checks(parent, &constraints));
+    }
 }

@@ -210,7 +210,9 @@ async fn mixed_indexed_updates_and_inserts_keep_point_reads_live() {
             let r = rng.next_unit_f64();
             if r < 0.50 {
                 let row_id = i32::try_from(rng.next_u64() % n_rows_u64).expect("row id fits");
-                sql.push_str(&format!("SELECT val FROM t_mixed_idx WHERE id = {row_id};\n"));
+                sql.push_str(&format!(
+                    "SELECT val FROM t_mixed_idx WHERE id = {row_id};\n"
+                ));
             } else if r < 0.80 {
                 let row_id = i32::try_from(rng.next_u64() % n_rows_u64).expect("row id fits");
                 let idx = usize::try_from(row_id).expect("non-negative row id");

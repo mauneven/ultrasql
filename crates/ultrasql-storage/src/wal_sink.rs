@@ -15,7 +15,7 @@
 //! `InMemoryWalSink` in the test module for the reference implementation.
 
 use ultrasql_core::{Lsn, Xid};
-use ultrasql_wal::WalRecord;
+use ultrasql_wal::{RecordType, WalRecord};
 
 /// Live WAL counters exposed by storage sinks.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -70,6 +70,47 @@ pub trait WalSink: Send + Sync {
     /// Append `record` to the WAL and return the assigned LSN.
     fn append(&self, record: WalRecord) -> Result<Lsn, WalSinkError>;
 
+    /// Append a borrowed WAL record and return its assigned LSN.
+    ///
+    /// The default clones and delegates to [`Self::append`]. Buffered sinks
+    /// should override this when they can serialize from `&WalRecord`
+    /// directly; hot paths can then reuse payload allocations across many
+    /// page-local records.
+    fn append_ref(&self, record: &WalRecord) -> Result<Lsn, WalSinkError> {
+        self.append(record.clone())
+    }
+
+    /// Append a WAL record from a borrowed payload and return its assigned LSN.
+    ///
+    /// The default constructs an owned [`WalRecord`] and delegates to
+    /// [`Self::append`]. Buffered sinks should override this when they can
+    /// serialize directly from `payload`; hot page-local paths can then reuse
+    /// one payload allocation across many records.
+    fn append_borrowed(
+        &self,
+        record_type: RecordType,
+        xid: Xid,
+        prev_lsn: Lsn,
+        flags: u8,
+        payload: &[u8],
+    ) -> Result<Lsn, WalSinkError> {
+        let record = WalRecord::new(record_type, xid, prev_lsn, flags, payload.to_vec())
+            .map_err(|err| WalSinkError::Rejected(format!("WAL record rejected: {err}")))?;
+        self.append(record)
+    }
+
+    /// Return `true` when [`Self::append_ref`] only appends to memory and
+    /// cannot perform blocking filesystem I/O or fsync.
+    ///
+    /// Heap paths use this to decide whether they can append a page-local WAL
+    /// record while holding that page's write guard. This lets the page-local
+    /// DELETE path preserve WAL-before-data ordering without a second buffer
+    /// pool pin. Sinks that may touch storage during `append_ref` must keep the
+    /// default `false` so heap callers release page guards before appending.
+    fn appends_without_blocking_io(&self) -> bool {
+        false
+    }
+
     /// Return the highest LSN that has been made durable (flushed). Heap
     /// callers use this to decide whether they need to flush before evicting
     /// a dirty page. A value of [`Lsn::ZERO`] means nothing has been flushed
@@ -108,6 +149,21 @@ pub struct NullWalSink;
 impl WalSink for NullWalSink {
     fn append(&self, _record: WalRecord) -> Result<Lsn, WalSinkError> {
         Ok(Lsn::ZERO)
+    }
+
+    fn append_borrowed(
+        &self,
+        _record_type: RecordType,
+        _xid: Xid,
+        _prev_lsn: Lsn,
+        _flags: u8,
+        _payload: &[u8],
+    ) -> Result<Lsn, WalSinkError> {
+        Ok(Lsn::ZERO)
+    }
+
+    fn appends_without_blocking_io(&self) -> bool {
+        true
     }
 
     fn durable_lsn(&self) -> Lsn {
@@ -219,6 +275,10 @@ pub mod test_support {
             Ok(lsn)
         }
 
+        fn appends_without_blocking_io(&self) -> bool {
+            true
+        }
+
         fn durable_lsn(&self) -> Lsn {
             // All records in this mock are immediately "durable".
             let next_lsn = self.inner.lock().next_lsn;
@@ -269,6 +329,12 @@ pub mod test_support {
                 sink.records().is_empty(),
                 "failed append must not record duplicate LSN"
             );
+        }
+
+        #[test]
+        fn in_memory_sink_declares_buffered_append() {
+            let sink = InMemoryWalSink::new();
+            assert!(sink.appends_without_blocking_io());
         }
     }
 }

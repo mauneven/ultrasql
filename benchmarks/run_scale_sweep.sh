@@ -46,6 +46,7 @@ case "$STORAGE_MODE" in
     *) echo "unknown SCALE_SWEEP_STORAGE '$STORAGE_MODE' (memory|data-dir)" >&2; exit 2 ;;
 esac
 DATA_ROOT="${SCALE_SWEEP_DATA_ROOT:-$OUT/data-dirs}"
+BENCH_COMPETITOR_DATA_ROOT="$DATA_ROOT/competitors"
 mkdir -p "$RAW"
 if [[ "${SCALE_SWEEP_APPEND:-0}" != "1" ]]; then
     rm -f "$RAW"/*.json
@@ -126,6 +127,32 @@ sys.exit(1)
 PY
 }
 
+durability_mode() {
+    if [[ "$1" == "data-dir" ]]; then
+        echo "durable"
+    else
+        echo "volatile"
+    fi
+}
+
+annotate_raw_profile() {
+    local path="$1"
+    local storage_mode="$2"
+    local durability
+    durability="$(durability_mode "$storage_mode")"
+    python3 - "$path" "$storage_mode" "$durability" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+path = Path(sys.argv[1])
+doc = json.loads(path.read_text())
+doc["storage_mode"] = sys.argv[2]
+doc["durability_mode"] = sys.argv[3]
+path.write_text(json.dumps(doc, sort_keys=True) + "\n")
+PY
+}
+
 echo "=== scale sweep mode=$mode storage=$STORAGE_MODE iters=$ITERS warmup=$WARMUP rows=[$ROWS] ==="
 
 PROFILE="${SCALE_SWEEP_PROFILE:-release-ship}"
@@ -186,19 +213,22 @@ run_ultrasql_workload() {
         --server "127.0.0.1:${port}" \
         --workload "$workload" \
         --rows "$rows" \
+        --storage-mode "$STORAGE_MODE" \
         --warmup "$WARMUP" \
         --iters "$ITERS" \
         > "$tmp_json" 2>"$err_log"; then
         mv "$tmp_json" "$RAW/${wid}-ultrasql.json"
+        annotate_raw_profile "$RAW/${wid}-ultrasql.json" "$STORAGE_MODE"
     else
         cat "$err_log" >&2 || true
         rm -f "$tmp_json"
-        python3 - "$RAW/${wid}-ultrasql.json" "$wid" "$rows" "$err_log" "$log" <<'PY'
+        python3 - "$RAW/${wid}-ultrasql.json" "$wid" "$rows" "$err_log" "$log" \
+            "$STORAGE_MODE" "$(durability_mode "$STORAGE_MODE")" <<'PY'
 import json
 import sys
 from pathlib import Path
 
-out, workload, rows, err_log, server_log = sys.argv[1:]
+out, workload, rows, err_log, server_log, storage_mode, durability_mode = sys.argv[1:]
 reason_parts = []
 for path in [Path(err_log), Path(server_log)]:
     if path.exists():
@@ -212,6 +242,8 @@ doc = {
     "status": "not_available",
     "n_rows": int(rows),
     "server_mode": "external",
+    "storage_mode": storage_mode,
+    "durability_mode": durability_mode,
     "reason": "\n".join(reason_parts) or "benchmark command failed",
     "policy": "Failure is recorded as not_available; no benchmark claim is made for this row.",
 }
@@ -254,6 +286,7 @@ run_ultrasql_fresh_insert_samples() {
             --server "127.0.0.1:${port}" \
             --workload "$workload" \
             --rows "$rows" \
+            --storage-mode "$STORAGE_MODE" \
             --warmup 0 \
             --iters 1 \
             > "$tmp_json" 2>"$err_log"; then
@@ -261,12 +294,13 @@ run_ultrasql_fresh_insert_samples() {
             kill "$server_pid" >/dev/null 2>&1 || true
             wait "$server_pid" >/dev/null 2>&1 || true
             server_pid=""
-            python3 - "$RAW/${wid}-ultrasql.json" "$wid" "$rows" "$err_log" "$log" <<'PY'
+            python3 - "$RAW/${wid}-ultrasql.json" "$wid" "$rows" "$err_log" "$log" \
+                "$STORAGE_MODE" "$(durability_mode "$STORAGE_MODE")" <<'PY'
 import json
 import sys
 from pathlib import Path
 
-out, workload, rows, err_log, server_log = sys.argv[1:]
+out, workload, rows, err_log, server_log, storage_mode, durability_mode = sys.argv[1:]
 reason_parts = []
 for path in [Path(err_log), Path(server_log)]:
     if path.exists():
@@ -280,6 +314,8 @@ doc = {
     "status": "not_available",
     "n_rows": int(rows),
     "server_mode": "external",
+    "storage_mode": storage_mode,
+    "durability_mode": durability_mode,
     "reason": "\n".join(reason_parts) or "benchmark command failed",
     "policy": "Failure is recorded as not_available; no benchmark claim is made for this row.",
 }
@@ -293,13 +329,14 @@ PY
         server_pid=""
     done
 
-    python3 - "$RAW/${wid}-ultrasql.json" "$wid" "$rows" "$WARMUP" "$sample_dir"/*.json <<'PY'
+    python3 - "$RAW/${wid}-ultrasql.json" "$wid" "$rows" "$WARMUP" \
+        "$STORAGE_MODE" "$(durability_mode "$STORAGE_MODE")" "$sample_dir"/*.json <<'PY'
 import json
 import statistics
 import sys
 from pathlib import Path
 
-out, workload, rows, warmup, *sample_paths = sys.argv[1:]
+out, workload, rows, warmup, storage_mode, durability_mode, *sample_paths = sys.argv[1:]
 warmup = int(warmup)
 def sample_index(path: str) -> int:
     stem = Path(path).stem
@@ -317,6 +354,8 @@ base.update(
         "status": "measured",
         "n_rows": int(rows),
         "server_mode": "external",
+        "storage_mode": storage_mode,
+        "durability_mode": durability_mode,
         "samples": len(iters),
         "iterations_us": iters,
         "median_us": statistics.median(iters),
@@ -334,12 +373,13 @@ record_competitor_failure() {
     local selector="$2"
     local rows="$3"
     local err_log="$4"
-    python3 - "$RAW/${selector}-${engine}.json" "$engine" "$selector" "$rows" "$err_log" <<'PY'
+    python3 - "$RAW/${selector}-${engine}.json" "$engine" "$selector" "$rows" "$err_log" \
+        "$STORAGE_MODE" "$(durability_mode "$STORAGE_MODE")" <<'PY'
 import json
 import sys
 from pathlib import Path
 
-out, engine, workload, rows, err_log = sys.argv[1:]
+out, engine, workload, rows, err_log, storage_mode, durability_mode = sys.argv[1:]
 reason = "competitor benchmark command failed"
 path = Path(err_log)
 if path.exists():
@@ -352,6 +392,8 @@ doc = {
     "workload": workload,
     "status": "not_available",
     "n_rows": int(rows),
+    "storage_mode": storage_mode,
+    "durability_mode": durability_mode,
     "reason": reason,
     "policy": "Failure is recorded as not_available; no benchmark claim is made for this row.",
 }
@@ -371,11 +413,13 @@ run_competitor_script() {
     rm -f "$err_log"
     if [[ "$row_mode" == "analytical" ]]; then
         if RAW_DIR="$RAW" N_ITERS="$ITERS" ANALYTICAL_ROWS="$rows" \
+            BENCH_STORAGE_MODE="$STORAGE_MODE" BENCH_DATA_ROOT="$DATA_ROOT/competitors" \
             bash "$script" "$selector" 2>"$err_log"; then
             return
         fi
     else
         if RAW_DIR="$RAW" N_ITERS="$ITERS" N_ROWS="$rows" INSERT_CHUNK_ROWS="$INSERT_CHUNK_ROWS" \
+            BENCH_STORAGE_MODE="$STORAGE_MODE" BENCH_DATA_ROOT="$DATA_ROOT/competitors" \
             bash "$script" "$selector" 2>"$err_log"; then
             return
         fi

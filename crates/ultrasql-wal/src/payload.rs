@@ -28,8 +28,8 @@
 
 use ultrasql_core::constants::PAGE_SIZE;
 use ultrasql_core::endian::{
-    read_i64_le, read_u16_le, read_u32_le, read_u64_le, write_i64_le, write_u16_le, write_u32_le,
-    write_u64_le,
+    read_i64_le, read_u16_le, read_u32_le, read_u64_le, write_i32_le, write_i64_le, write_u16_le,
+    write_u32_le, write_u64_le,
 };
 use ultrasql_core::{BlockNumber, CommandId, Lsn, PageId, RelationId, TupleId, Xid};
 
@@ -817,6 +817,85 @@ impl HeapUpdateInPlaceBatchPayload {
     const IMAGE_LEN: usize = 9;
     const ENTRY_FIXED: usize = 4;
 
+    /// Encode page-local `(slot, pre_image, post_image)` entries
+    /// without first materializing [`HeapUpdateInPlaceBatchEntry`] values.
+    ///
+    /// This emits the same wire layout as [`Self::encode`]. Storage uses this
+    /// on the fused in-place UPDATE path, where it already has fixed-size
+    /// scratch tuples and would otherwise copy them into a second Vec before
+    /// serializing.
+    pub fn encode_entries(
+        page: PageId,
+        writer_xid: Xid,
+        command_id: CommandId,
+        entries: &[(u16, [u8; 9], [u8; 9])],
+    ) -> Result<Vec<u8>, PayloadError> {
+        let entry_count = u32::try_from(entries.len()).map_err(|_| {
+            PayloadError::Malformed("heap_update_in_place_batch entry_count overflow")
+        })?;
+        let entry_size = checked_len_sum(
+            &[Self::ENTRY_FIXED, Self::IMAGE_LEN, Self::IMAGE_LEN],
+            "heap_update_in_place_batch length overflow",
+        )?;
+        let entries_len = entries
+            .len()
+            .checked_mul(entry_size)
+            .ok_or(PayloadError::Malformed(
+                "heap_update_in_place_batch length overflow",
+            ))?;
+        let total = checked_len_sum(
+            &[Self::FIXED, entries_len],
+            "heap_update_in_place_batch length overflow",
+        )?;
+        if total > MAX_VARIABLE_PAYLOAD_BYTES {
+            return Err(PayloadError::Malformed(
+                "heap_update_in_place_batch length exceeds ceiling",
+            ));
+        }
+
+        let mut out = vec![0_u8; total];
+        let mut page_buf = [0_u8; PAGE_ID_SIZE];
+        encode_page_id(&mut page_buf, page);
+        out[..PAGE_ID_SIZE].copy_from_slice(&page_buf);
+        write_u64_le(&mut out[PAGE_ID_SIZE..PAGE_ID_SIZE + 8], writer_xid.raw());
+        write_u32_le(
+            &mut out[PAGE_ID_SIZE + 8..PAGE_ID_SIZE + 12],
+            command_id.raw(),
+        );
+        write_u16_le(
+            &mut out[PAGE_ID_SIZE + 12..PAGE_ID_SIZE + 14],
+            u16::try_from(Self::IMAGE_LEN)
+                .map_err(|_| PayloadError::Malformed("heap_update_in_place_batch image_len"))?,
+        );
+        write_u16_le(&mut out[PAGE_ID_SIZE + 14..PAGE_ID_SIZE + 16], 0);
+        write_u32_le(&mut out[PAGE_ID_SIZE + 16..Self::FIXED], entry_count);
+
+        let mut off = Self::FIXED;
+        for (slot, pre_image, post_image) in entries {
+            let slot_end = checked_offset(off, 2, "heap_update_in_place_batch length overflow")?;
+            write_u16_le(&mut out[off..slot_end], *slot);
+            let reserved_end =
+                checked_offset(slot_end, 2, "heap_update_in_place_batch length overflow")?;
+            write_u16_le(&mut out[slot_end..reserved_end], 0);
+            off = reserved_end;
+            let pre_end = checked_offset(
+                off,
+                Self::IMAGE_LEN,
+                "heap_update_in_place_batch length overflow",
+            )?;
+            out[off..pre_end].copy_from_slice(pre_image);
+            off = pre_end;
+            let post_end = checked_offset(
+                off,
+                Self::IMAGE_LEN,
+                "heap_update_in_place_batch length overflow",
+            )?;
+            out[off..post_end].copy_from_slice(post_image);
+            off = post_end;
+        }
+        Ok(out)
+    }
+
     /// Encode this payload into a freshly-allocated byte vector.
     pub fn encode(&self) -> Result<Vec<u8>, PayloadError> {
         let entry_count = u32::try_from(self.entries.len()).map_err(|_| {
@@ -998,6 +1077,425 @@ impl HeapUpdateInPlaceBatchPayload {
 }
 
 // ---------------------------------------------------------------------------
+// HeapUpdateInt32PairDeltaBatchPayload
+// ---------------------------------------------------------------------------
+
+/// Compact page-batched WAL payload for fixed `(Int32, Int32)` delta updates.
+///
+/// This represents the fused `UPDATE t SET col = col + delta` shape over one
+/// heap page. Recovery reads each slot's current payload, records that
+/// pre-image in the in-memory undo log, applies `delta` to `target_col`, and
+/// stamps the tuple header with `writer_xid`/`command_id`.
+///
+/// Wire layout (little-endian):
+/// ```text
+///  0   8   page (PageId)
+///  8   8   writer_xid (u64)
+/// 16   4   command_id (u32)
+/// 20   1   target_col (u8; 0 or 1)
+/// 21   3   reserved (zero)
+/// 24   4   delta (i32)
+/// 28   4   entry_count (u32)
+/// 32  ..   repeated entries: slot (u16), reserved (u16)
+/// ```
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HeapUpdateInt32PairDeltaBatchPayload {
+    /// Heap page containing every slot in [`Self::slots`].
+    pub page: PageId,
+    /// Transaction that performed the in-place UPDATE.
+    pub writer_xid: Xid,
+    /// Command within `writer_xid` that performed the UPDATE.
+    pub command_id: CommandId,
+    /// Target payload column: `0` for id, `1` for value.
+    pub target_col: u8,
+    /// Signed delta applied to `target_col`.
+    pub delta: i32,
+    /// Slots updated on `page`, in ascending slot order.
+    pub slots: Vec<u16>,
+}
+
+impl HeapUpdateInt32PairDeltaBatchPayload {
+    const FIXED: usize = PAGE_ID_SIZE + 8 + 4 + 1 + 3 + 4 + 4;
+    const ENTRY_SIZE: usize = 4;
+
+    /// Encode page-local updated slots without materializing per-row images.
+    pub fn encode_slots(
+        page: PageId,
+        writer_xid: Xid,
+        command_id: CommandId,
+        target_col: u8,
+        delta: i32,
+        slots: &[u16],
+    ) -> Result<Vec<u8>, PayloadError> {
+        let mut out = Vec::new();
+        Self::encode_slots_into(
+            page, writer_xid, command_id, target_col, delta, slots, &mut out,
+        )?;
+        Ok(out)
+    }
+
+    /// Encode page-local updated slots into `out`, reusing its allocation.
+    ///
+    /// `out` is cleared before bytes are written. The resulting byte layout is
+    /// identical to [`Self::encode_slots`].
+    pub fn encode_slots_into(
+        page: PageId,
+        writer_xid: Xid,
+        command_id: CommandId,
+        target_col: u8,
+        delta: i32,
+        slots: &[u16],
+        out: &mut Vec<u8>,
+    ) -> Result<(), PayloadError> {
+        if target_col > 1 {
+            return Err(PayloadError::Malformed(
+                "heap_update_int32_pair_delta_batch target_col out of range",
+            ));
+        }
+        let entry_count = u32::try_from(slots.len()).map_err(|_| {
+            PayloadError::Malformed("heap_update_int32_pair_delta_batch entry_count overflow")
+        })?;
+        let entries_len =
+            slots
+                .len()
+                .checked_mul(Self::ENTRY_SIZE)
+                .ok_or(PayloadError::Malformed(
+                    "heap_update_int32_pair_delta_batch length overflow",
+                ))?;
+        let total = checked_len_sum(
+            &[Self::FIXED, entries_len],
+            "heap_update_int32_pair_delta_batch length overflow",
+        )?;
+        if total > MAX_VARIABLE_PAYLOAD_BYTES {
+            return Err(PayloadError::Malformed(
+                "heap_update_int32_pair_delta_batch length exceeds ceiling",
+            ));
+        }
+
+        out.clear();
+        out.resize(total, 0);
+        let mut page_buf = [0_u8; PAGE_ID_SIZE];
+        encode_page_id(&mut page_buf, page);
+        out[..PAGE_ID_SIZE].copy_from_slice(&page_buf);
+        write_u64_le(&mut out[PAGE_ID_SIZE..PAGE_ID_SIZE + 8], writer_xid.raw());
+        write_u32_le(
+            &mut out[PAGE_ID_SIZE + 8..PAGE_ID_SIZE + 12],
+            command_id.raw(),
+        );
+        out[PAGE_ID_SIZE + 12] = target_col;
+        write_i32_le(&mut out[PAGE_ID_SIZE + 16..PAGE_ID_SIZE + 20], delta);
+        write_u32_le(&mut out[PAGE_ID_SIZE + 20..Self::FIXED], entry_count);
+
+        let mut off = Self::FIXED;
+        for slot in slots {
+            let slot_end =
+                checked_offset(off, 2, "heap_update_int32_pair_delta_batch length overflow")?;
+            write_u16_le(&mut out[off..slot_end], *slot);
+            let reserved_end = checked_offset(
+                slot_end,
+                2,
+                "heap_update_int32_pair_delta_batch length overflow",
+            )?;
+            write_u16_le(&mut out[slot_end..reserved_end], 0);
+            off = reserved_end;
+        }
+        Ok(())
+    }
+
+    /// Encode this payload into a freshly-allocated byte vector.
+    pub fn encode(&self) -> Result<Vec<u8>, PayloadError> {
+        Self::encode_slots(
+            self.page,
+            self.writer_xid,
+            self.command_id,
+            self.target_col,
+            self.delta,
+            &self.slots,
+        )
+    }
+
+    /// Decode a `HeapUpdateInt32PairDeltaBatchPayload` from bytes.
+    pub fn decode(bytes: &[u8]) -> Result<Self, PayloadError> {
+        if bytes.len() < Self::FIXED {
+            return Err(PayloadError::Truncated {
+                needed: Self::FIXED,
+                have: bytes.len(),
+            });
+        }
+        let page = decode_page_id(bytes)?;
+        let writer_xid = Xid::new(read_u64_le(&bytes[PAGE_ID_SIZE..PAGE_ID_SIZE + 8]).map_err(
+            |_| PayloadError::Malformed("heap_update_int32_pair_delta_batch writer_xid"),
+        )?);
+        let command_id = CommandId::new(
+            read_u32_le(&bytes[PAGE_ID_SIZE + 8..PAGE_ID_SIZE + 12]).map_err(|_| {
+                PayloadError::Malformed("heap_update_int32_pair_delta_batch command_id")
+            })?,
+        );
+        let target_col = bytes[PAGE_ID_SIZE + 12];
+        if target_col > 1 {
+            return Err(PayloadError::Malformed(
+                "heap_update_int32_pair_delta_batch target_col out of range",
+            ));
+        }
+        if bytes[PAGE_ID_SIZE + 13..PAGE_ID_SIZE + 16] != [0, 0, 0] {
+            return Err(PayloadError::Malformed(
+                "heap_update_int32_pair_delta_batch reserved bits set",
+            ));
+        }
+        let delta_word = read_u32_le(&bytes[PAGE_ID_SIZE + 16..PAGE_ID_SIZE + 20])
+            .map_err(|_| PayloadError::Malformed("heap_update_int32_pair_delta_batch delta"))?;
+        let delta = i32::from_le_bytes(delta_word.to_le_bytes());
+        let entry_count = usize::try_from(
+            read_u32_le(&bytes[PAGE_ID_SIZE + 20..Self::FIXED]).map_err(|_| {
+                PayloadError::Malformed("heap_update_int32_pair_delta_batch entry_count")
+            })?,
+        )
+        .map_err(|_| {
+            PayloadError::Malformed("heap_update_int32_pair_delta_batch entry_count usize")
+        })?;
+        let entries_len =
+            entry_count
+                .checked_mul(Self::ENTRY_SIZE)
+                .ok_or(PayloadError::Malformed(
+                    "heap_update_int32_pair_delta_batch length overflow",
+                ))?;
+        let needed = checked_len_sum(
+            &[Self::FIXED, entries_len],
+            "heap_update_int32_pair_delta_batch length overflow",
+        )?;
+        if bytes.len() < needed {
+            return Err(PayloadError::Truncated {
+                needed,
+                have: bytes.len(),
+            });
+        }
+        require_exact_len(bytes, needed)?;
+
+        let mut slots = Vec::with_capacity(entry_count);
+        let mut off = Self::FIXED;
+        for _ in 0..entry_count {
+            let slot_end =
+                checked_offset(off, 2, "heap_update_int32_pair_delta_batch length overflow")?;
+            let slot = read_u16_le(&bytes[off..slot_end])
+                .map_err(|_| PayloadError::Malformed("heap_update_int32_pair_delta_batch slot"))?;
+            let reserved_end = checked_offset(
+                slot_end,
+                2,
+                "heap_update_int32_pair_delta_batch length overflow",
+            )?;
+            let reserved = read_u16_le(&bytes[slot_end..reserved_end]).map_err(|_| {
+                PayloadError::Malformed("heap_update_int32_pair_delta_batch entry reserved")
+            })?;
+            if reserved != 0 {
+                return Err(PayloadError::Malformed(
+                    "heap_update_int32_pair_delta_batch entry reserved bits set",
+                ));
+            }
+            slots.push(slot);
+            off = reserved_end;
+        }
+
+        Ok(Self {
+            page,
+            writer_xid,
+            command_id,
+            target_col,
+            delta,
+            slots,
+        })
+    }
+}
+
+// ---------------------------------------------------------------------------
+// HeapUpdateInt32PairDeltaRangeBatchPayload
+// ---------------------------------------------------------------------------
+
+/// Compact page-batched WAL payload for contiguous fixed `(Int32, Int32)` updates.
+///
+/// This is equivalent to [`HeapUpdateInt32PairDeltaBatchPayload`] whose
+/// `slots` are `first_slot..first_slot + slot_count`, but avoids writing one
+/// slot entry per tuple for dense page updates.
+///
+/// Wire layout (little-endian):
+/// ```text
+///  0   8   page (PageId)
+///  8   8   writer_xid (u64)
+/// 16   4   command_id (u32)
+/// 20   1   target_col (u8; 0 or 1)
+/// 21   3   reserved (zero)
+/// 24   4   delta (i32)
+/// 28   2   first_slot (u16)
+/// 30   2   slot_count (u16)
+/// 32   4   reserved (zero)
+/// ```
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HeapUpdateInt32PairDeltaRangeBatchPayload {
+    /// Heap page containing the contiguous slot range.
+    pub page: PageId,
+    /// Transaction that performed the in-place UPDATE.
+    pub writer_xid: Xid,
+    /// Command within `writer_xid` that performed the UPDATE.
+    pub command_id: CommandId,
+    /// Target payload column: `0` for id, `1` for value.
+    pub target_col: u8,
+    /// Signed delta applied to `target_col`.
+    pub delta: i32,
+    /// First slot updated on `page`.
+    pub first_slot: u16,
+    /// Number of contiguous slots updated on `page`.
+    pub slot_count: u16,
+}
+
+impl HeapUpdateInt32PairDeltaRangeBatchPayload {
+    const FIXED: usize = PAGE_ID_SIZE + 8 + 4 + 1 + 3 + 4 + 2 + 2 + 4;
+
+    /// Encode a contiguous page-local update slot range.
+    pub fn encode_range(
+        page: PageId,
+        writer_xid: Xid,
+        command_id: CommandId,
+        target_col: u8,
+        delta: i32,
+        first_slot: u16,
+        slot_count: u16,
+    ) -> Result<Vec<u8>, PayloadError> {
+        let mut out = Vec::new();
+        Self::encode_range_into(
+            page, writer_xid, command_id, target_col, delta, first_slot, slot_count, &mut out,
+        )?;
+        Ok(out)
+    }
+
+    /// Encode a contiguous page-local update slot range into `out`.
+    ///
+    /// `out` is cleared before bytes are written.
+    pub fn encode_range_into(
+        page: PageId,
+        writer_xid: Xid,
+        command_id: CommandId,
+        target_col: u8,
+        delta: i32,
+        first_slot: u16,
+        slot_count: u16,
+        out: &mut Vec<u8>,
+    ) -> Result<(), PayloadError> {
+        if target_col > 1 {
+            return Err(PayloadError::Malformed(
+                "heap_update_int32_pair_delta_range_batch target_col out of range",
+            ));
+        }
+        if slot_count == 0 {
+            return Err(PayloadError::Malformed(
+                "heap_update_int32_pair_delta_range_batch slot_count must be nonzero",
+            ));
+        }
+        let last_slot = u32::from(first_slot) + u32::from(slot_count) - 1;
+        if last_slot > u32::from(u16::MAX) {
+            return Err(PayloadError::Malformed(
+                "heap_update_int32_pair_delta_range_batch slot range overflow",
+            ));
+        }
+
+        out.clear();
+        out.resize(Self::FIXED, 0);
+        let mut page_buf = [0_u8; PAGE_ID_SIZE];
+        encode_page_id(&mut page_buf, page);
+        out[..PAGE_ID_SIZE].copy_from_slice(&page_buf);
+        write_u64_le(&mut out[PAGE_ID_SIZE..PAGE_ID_SIZE + 8], writer_xid.raw());
+        write_u32_le(
+            &mut out[PAGE_ID_SIZE + 8..PAGE_ID_SIZE + 12],
+            command_id.raw(),
+        );
+        out[PAGE_ID_SIZE + 12] = target_col;
+        write_i32_le(&mut out[PAGE_ID_SIZE + 16..PAGE_ID_SIZE + 20], delta);
+        write_u16_le(&mut out[PAGE_ID_SIZE + 20..PAGE_ID_SIZE + 22], first_slot);
+        write_u16_le(&mut out[PAGE_ID_SIZE + 22..PAGE_ID_SIZE + 24], slot_count);
+        write_u32_le(&mut out[PAGE_ID_SIZE + 24..Self::FIXED], 0);
+        Ok(())
+    }
+
+    /// Encode this payload into a byte vector.
+    pub fn encode(&self) -> Result<Vec<u8>, PayloadError> {
+        Self::encode_range(
+            self.page,
+            self.writer_xid,
+            self.command_id,
+            self.target_col,
+            self.delta,
+            self.first_slot,
+            self.slot_count,
+        )
+    }
+
+    /// Decode a `HeapUpdateInt32PairDeltaRangeBatchPayload` from bytes.
+    pub fn decode(bytes: &[u8]) -> Result<Self, PayloadError> {
+        require_exact_len(bytes, Self::FIXED)?;
+        let page = decode_page_id(bytes)?;
+        let writer_xid = Xid::new(read_u64_le(&bytes[PAGE_ID_SIZE..PAGE_ID_SIZE + 8]).map_err(
+            |_| PayloadError::Malformed("heap_update_int32_pair_delta_range_batch writer_xid"),
+        )?);
+        let command_id = CommandId::new(
+            read_u32_le(&bytes[PAGE_ID_SIZE + 8..PAGE_ID_SIZE + 12]).map_err(|_| {
+                PayloadError::Malformed("heap_update_int32_pair_delta_range_batch command_id")
+            })?,
+        );
+        let target_col = bytes[PAGE_ID_SIZE + 12];
+        if target_col > 1 {
+            return Err(PayloadError::Malformed(
+                "heap_update_int32_pair_delta_range_batch target_col out of range",
+            ));
+        }
+        if bytes[PAGE_ID_SIZE + 13..PAGE_ID_SIZE + 16] != [0, 0, 0] {
+            return Err(PayloadError::Malformed(
+                "heap_update_int32_pair_delta_range_batch reserved bits set",
+            ));
+        }
+        let delta_word =
+            read_u32_le(&bytes[PAGE_ID_SIZE + 16..PAGE_ID_SIZE + 20]).map_err(|_| {
+                PayloadError::Malformed("heap_update_int32_pair_delta_range_batch delta")
+            })?;
+        let delta = i32::from_le_bytes(delta_word.to_le_bytes());
+        let first_slot =
+            read_u16_le(&bytes[PAGE_ID_SIZE + 20..PAGE_ID_SIZE + 22]).map_err(|_| {
+                PayloadError::Malformed("heap_update_int32_pair_delta_range_batch first_slot")
+            })?;
+        let slot_count =
+            read_u16_le(&bytes[PAGE_ID_SIZE + 22..PAGE_ID_SIZE + 24]).map_err(|_| {
+                PayloadError::Malformed("heap_update_int32_pair_delta_range_batch slot_count")
+            })?;
+        if slot_count == 0 {
+            return Err(PayloadError::Malformed(
+                "heap_update_int32_pair_delta_range_batch slot_count must be nonzero",
+            ));
+        }
+        let last_slot = u32::from(first_slot) + u32::from(slot_count) - 1;
+        if last_slot > u32::from(u16::MAX) {
+            return Err(PayloadError::Malformed(
+                "heap_update_int32_pair_delta_range_batch slot range overflow",
+            ));
+        }
+        let reserved = read_u32_le(&bytes[PAGE_ID_SIZE + 24..Self::FIXED]).map_err(|_| {
+            PayloadError::Malformed("heap_update_int32_pair_delta_range_batch reserved")
+        })?;
+        if reserved != 0 {
+            return Err(PayloadError::Malformed(
+                "heap_update_int32_pair_delta_range_batch reserved bits set",
+            ));
+        }
+
+        Ok(Self {
+            page,
+            writer_xid,
+            command_id,
+            target_col,
+            delta,
+            first_slot,
+            slot_count,
+        })
+    }
+}
+
+// ---------------------------------------------------------------------------
 // HeapDeleteInPlacePayload
 // ---------------------------------------------------------------------------
 
@@ -1083,6 +1581,76 @@ pub struct HeapDeleteInPlaceBatchPayload {
 impl HeapDeleteInPlaceBatchPayload {
     const FIXED: usize = PAGE_ID_SIZE + 8 + 4 + 4 + 4;
     const ENTRY_SIZE: usize = 4;
+
+    /// Encode page-local deleted slots without first materializing
+    /// [`HeapDeleteInPlaceBatchEntry`] values.
+    ///
+    /// This emits the same wire layout as [`Self::encode`]. Storage uses this
+    /// on the fused in-place DELETE path, where it already has a page-local
+    /// slot scratch buffer.
+    pub fn encode_slots(
+        page: PageId,
+        xmax: Xid,
+        cmax: CommandId,
+        slots: &[u16],
+    ) -> Result<Vec<u8>, PayloadError> {
+        let mut out = Vec::new();
+        Self::encode_slots_into(page, xmax, cmax, slots, &mut out)?;
+        Ok(out)
+    }
+
+    /// Encode page-local deleted slots into `out`, reusing its allocation.
+    ///
+    /// `out` is cleared before bytes are written. The resulting byte layout is
+    /// identical to [`Self::encode_slots`].
+    pub fn encode_slots_into(
+        page: PageId,
+        xmax: Xid,
+        cmax: CommandId,
+        slots: &[u16],
+        out: &mut Vec<u8>,
+    ) -> Result<(), PayloadError> {
+        let entry_count = u32::try_from(slots.len()).map_err(|_| {
+            PayloadError::Malformed("heap_delete_in_place_batch entry_count overflow")
+        })?;
+        let entries_len =
+            slots
+                .len()
+                .checked_mul(Self::ENTRY_SIZE)
+                .ok_or(PayloadError::Malformed(
+                    "heap_delete_in_place_batch length overflow",
+                ))?;
+        let total = checked_len_sum(
+            &[Self::FIXED, entries_len],
+            "heap_delete_in_place_batch length overflow",
+        )?;
+        if total > MAX_VARIABLE_PAYLOAD_BYTES {
+            return Err(PayloadError::Malformed(
+                "heap_delete_in_place_batch length exceeds ceiling",
+            ));
+        }
+
+        out.clear();
+        out.resize(total, 0);
+        let mut page_buf = [0_u8; PAGE_ID_SIZE];
+        encode_page_id(&mut page_buf, page);
+        out[..PAGE_ID_SIZE].copy_from_slice(&page_buf);
+        write_u64_le(&mut out[PAGE_ID_SIZE..PAGE_ID_SIZE + 8], xmax.raw());
+        write_u32_le(&mut out[PAGE_ID_SIZE + 8..PAGE_ID_SIZE + 12], cmax.raw());
+        write_u32_le(&mut out[PAGE_ID_SIZE + 12..PAGE_ID_SIZE + 16], 0);
+        write_u32_le(&mut out[PAGE_ID_SIZE + 16..Self::FIXED], entry_count);
+
+        let mut off = Self::FIXED;
+        for slot in slots {
+            let slot_end = checked_offset(off, 2, "heap_delete_in_place_batch length overflow")?;
+            write_u16_le(&mut out[off..slot_end], *slot);
+            let reserved_end =
+                checked_offset(slot_end, 2, "heap_delete_in_place_batch length overflow")?;
+            write_u16_le(&mut out[slot_end..reserved_end], 0);
+            off = reserved_end;
+        }
+        Ok(())
+    }
 
     /// Encode this payload into a freshly-allocated byte vector.
     pub fn encode(&self) -> Result<Vec<u8>, PayloadError> {
@@ -1737,6 +2305,147 @@ impl BTreeOpPayload {
             page,
             key_bytes,
             child_or_value,
+        })
+    }
+}
+
+// ---------------------------------------------------------------------------
+// HeapDeleteInPlaceRangeBatchPayload
+// ---------------------------------------------------------------------------
+
+/// Payload for a `RecordType::HeapDeleteInPlaceRangeBatch` WAL record.
+///
+/// Encodes a contiguous page-local slot range. This is equivalent to a
+/// [`HeapDeleteInPlaceBatchPayload`] whose entries are
+/// `first_slot..first_slot + slot_count`, but avoids writing one slot entry per
+/// tuple for dense page deletes.
+///
+/// Wire layout (little-endian):
+/// ```text
+///  0   8   page (PageId)
+///  8   8   xmax (u64)
+/// 16   4   cmax (u32)
+/// 20   2   first_slot (u16)
+/// 22   2   slot_count (u16)
+/// 24   4   reserved (zero)
+/// ```
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HeapDeleteInPlaceRangeBatchPayload {
+    /// Heap page containing the contiguous slot range.
+    pub page: PageId,
+    /// Transaction that performed the delete.
+    pub xmax: Xid,
+    /// Command within `xmax` that performed the delete.
+    pub cmax: CommandId,
+    /// First slot stamped on `page`.
+    pub first_slot: u16,
+    /// Number of contiguous slots stamped on `page`.
+    pub slot_count: u16,
+}
+
+impl HeapDeleteInPlaceRangeBatchPayload {
+    const FIXED: usize = PAGE_ID_SIZE + 8 + 4 + 2 + 2 + 4;
+
+    /// Encode a contiguous page-local delete slot range.
+    pub fn encode_range(
+        page: PageId,
+        xmax: Xid,
+        cmax: CommandId,
+        first_slot: u16,
+        slot_count: u16,
+    ) -> Result<Vec<u8>, PayloadError> {
+        let mut out = Vec::new();
+        Self::encode_range_into(page, xmax, cmax, first_slot, slot_count, &mut out)?;
+        Ok(out)
+    }
+
+    /// Encode a contiguous page-local delete slot range into `out`.
+    ///
+    /// `out` is cleared before bytes are written.
+    pub fn encode_range_into(
+        page: PageId,
+        xmax: Xid,
+        cmax: CommandId,
+        first_slot: u16,
+        slot_count: u16,
+        out: &mut Vec<u8>,
+    ) -> Result<(), PayloadError> {
+        if slot_count == 0 {
+            return Err(PayloadError::Malformed(
+                "heap_delete_in_place_range_batch slot_count must be nonzero",
+            ));
+        }
+        let last_slot = u32::from(first_slot) + u32::from(slot_count) - 1;
+        if last_slot > u32::from(u16::MAX) {
+            return Err(PayloadError::Malformed(
+                "heap_delete_in_place_range_batch slot range overflow",
+            ));
+        }
+
+        out.clear();
+        out.resize(Self::FIXED, 0);
+        let mut page_buf = [0_u8; PAGE_ID_SIZE];
+        encode_page_id(&mut page_buf, page);
+        out[..PAGE_ID_SIZE].copy_from_slice(&page_buf);
+        write_u64_le(&mut out[PAGE_ID_SIZE..PAGE_ID_SIZE + 8], xmax.raw());
+        write_u32_le(&mut out[PAGE_ID_SIZE + 8..PAGE_ID_SIZE + 12], cmax.raw());
+        write_u16_le(&mut out[PAGE_ID_SIZE + 12..PAGE_ID_SIZE + 14], first_slot);
+        write_u16_le(&mut out[PAGE_ID_SIZE + 14..PAGE_ID_SIZE + 16], slot_count);
+        write_u32_le(&mut out[PAGE_ID_SIZE + 16..Self::FIXED], 0);
+        Ok(())
+    }
+
+    /// Encode this payload into a byte vector.
+    pub fn encode(&self) -> Result<Vec<u8>, PayloadError> {
+        Self::encode_range(
+            self.page,
+            self.xmax,
+            self.cmax,
+            self.first_slot,
+            self.slot_count,
+        )
+    }
+
+    /// Decode a `HeapDeleteInPlaceRangeBatchPayload` from bytes.
+    pub fn decode(bytes: &[u8]) -> Result<Self, PayloadError> {
+        require_exact_len(bytes, Self::FIXED)?;
+        let page = decode_page_id(bytes)?;
+        let xmax = Xid::new(
+            read_u64_le(&bytes[PAGE_ID_SIZE..PAGE_ID_SIZE + 8])
+                .map_err(|_| PayloadError::Malformed("heap_delete_in_place_range_batch xmax"))?,
+        );
+        let cmax = CommandId::new(
+            read_u32_le(&bytes[PAGE_ID_SIZE + 8..PAGE_ID_SIZE + 12])
+                .map_err(|_| PayloadError::Malformed("heap_delete_in_place_range_batch cmax"))?,
+        );
+        let first_slot = read_u16_le(&bytes[PAGE_ID_SIZE + 12..PAGE_ID_SIZE + 14])
+            .map_err(|_| PayloadError::Malformed("heap_delete_in_place_range_batch first_slot"))?;
+        let slot_count = read_u16_le(&bytes[PAGE_ID_SIZE + 14..PAGE_ID_SIZE + 16])
+            .map_err(|_| PayloadError::Malformed("heap_delete_in_place_range_batch slot_count"))?;
+        if slot_count == 0 {
+            return Err(PayloadError::Malformed(
+                "heap_delete_in_place_range_batch slot_count must be nonzero",
+            ));
+        }
+        let last_slot = u32::from(first_slot) + u32::from(slot_count) - 1;
+        if last_slot > u32::from(u16::MAX) {
+            return Err(PayloadError::Malformed(
+                "heap_delete_in_place_range_batch slot range overflow",
+            ));
+        }
+        let reserved = read_u32_le(&bytes[PAGE_ID_SIZE + 16..Self::FIXED])
+            .map_err(|_| PayloadError::Malformed("heap_delete_in_place_range_batch reserved"))?;
+        if reserved != 0 {
+            return Err(PayloadError::Malformed(
+                "heap_delete_in_place_range_batch reserved bits set",
+            ));
+        }
+        Ok(Self {
+            page,
+            xmax,
+            cmax,
+            first_slot,
+            slot_count,
         })
     }
 }
@@ -2757,6 +3466,19 @@ mod tests {
         );
 
         assert_trailing_rejected(
+            HeapDeleteInPlaceRangeBatchPayload {
+                page: page_id(1, 2),
+                xmax: Xid::new(11),
+                cmax: CommandId::new(2),
+                first_slot: 3,
+                slot_count: 2,
+            }
+            .encode()
+            .expect("encode"),
+            HeapDeleteInPlaceRangeBatchPayload::decode,
+        );
+
+        assert_trailing_rejected(
             CommitPayload {
                 commit_lsn: Lsn::new(123),
                 commit_timestamp_micros: 456,
@@ -3024,6 +3746,107 @@ mod tests {
     }
 
     #[test]
+    fn heap_update_in_place_batch_encode_entries_matches_typed_encoder() {
+        let page = page_id(9, 3);
+        let writer_xid = Xid::new(77);
+        let command_id = CommandId::new(4);
+        let entries = [
+            (
+                1,
+                [0, 1, 0, 0, 0, 10, 0, 0, 0],
+                [0, 1, 0, 0, 0, 11, 0, 0, 0],
+            ),
+            (
+                2,
+                [0, 2, 0, 0, 0, 20, 0, 0, 0],
+                [0, 2, 0, 0, 0, 21, 0, 0, 0],
+            ),
+        ];
+        let typed = HeapUpdateInPlaceBatchPayload {
+            page,
+            writer_xid,
+            command_id,
+            entries: entries
+                .iter()
+                .map(
+                    |(slot, pre_image, post_image)| HeapUpdateInPlaceBatchEntry {
+                        slot: *slot,
+                        pre_image: *pre_image,
+                        post_image: *post_image,
+                    },
+                )
+                .collect(),
+        };
+
+        assert_eq!(
+            HeapUpdateInPlaceBatchPayload::encode_entries(page, writer_xid, command_id, &entries,)
+                .unwrap(),
+            typed.encode().unwrap()
+        );
+    }
+
+    #[test]
+    fn heap_update_int32_pair_delta_batch_round_trip_two_slots() {
+        let p = HeapUpdateInt32PairDeltaBatchPayload {
+            page: page_id(9, 3),
+            writer_xid: Xid::new(77),
+            command_id: CommandId::new(4),
+            target_col: 1,
+            delta: -3,
+            slots: vec![1, 2],
+        };
+        assert_eq!(
+            HeapUpdateInt32PairDeltaBatchPayload::decode(&p.encode().unwrap()).unwrap(),
+            p
+        );
+    }
+
+    #[test]
+    fn heap_update_int32_pair_delta_batch_encode_slots_into_matches_vec_encoder() {
+        let mut out = Vec::with_capacity(4);
+        HeapUpdateInt32PairDeltaBatchPayload::encode_slots_into(
+            page_id(9, 3),
+            Xid::new(77),
+            CommandId::new(4),
+            1,
+            -3,
+            &[1, 2, 3],
+            &mut out,
+        )
+        .unwrap();
+
+        assert_eq!(
+            out,
+            HeapUpdateInt32PairDeltaBatchPayload::encode_slots(
+                page_id(9, 3),
+                Xid::new(77),
+                CommandId::new(4),
+                1,
+                -3,
+                &[1, 2, 3],
+            )
+            .unwrap()
+        );
+    }
+
+    #[test]
+    fn heap_update_int32_pair_delta_range_batch_round_trip() {
+        let p = HeapUpdateInt32PairDeltaRangeBatchPayload {
+            page: page_id(9, 3),
+            writer_xid: Xid::new(77),
+            command_id: CommandId::new(4),
+            target_col: 1,
+            delta: -3,
+            first_slot: 1,
+            slot_count: 3,
+        };
+        assert_eq!(
+            HeapUpdateInt32PairDeltaRangeBatchPayload::decode(&p.encode().unwrap()).unwrap(),
+            p
+        );
+    }
+
+    #[test]
     fn heap_delete_in_place_batch_round_trip_two_slots() {
         let p = HeapDeleteInPlaceBatchPayload {
             page: page_id(9, 3),
@@ -3036,6 +3859,43 @@ mod tests {
         };
         assert_eq!(
             HeapDeleteInPlaceBatchPayload::decode(&p.encode().unwrap()).unwrap(),
+            p
+        );
+    }
+
+    #[test]
+    fn heap_delete_in_place_batch_encode_slots_matches_typed_encoder() {
+        let page = page_id(9, 3);
+        let xmax = Xid::new(77);
+        let cmax = CommandId::new(4);
+        let slots = [1, 2];
+        let typed = HeapDeleteInPlaceBatchPayload {
+            page,
+            xmax,
+            cmax,
+            entries: slots
+                .iter()
+                .map(|slot| HeapDeleteInPlaceBatchEntry { slot: *slot })
+                .collect(),
+        };
+
+        assert_eq!(
+            HeapDeleteInPlaceBatchPayload::encode_slots(page, xmax, cmax, &slots).unwrap(),
+            typed.encode().unwrap()
+        );
+    }
+
+    #[test]
+    fn heap_delete_in_place_range_batch_round_trip() {
+        let p = HeapDeleteInPlaceRangeBatchPayload {
+            page: page_id(9, 3),
+            xmax: Xid::new(77),
+            cmax: CommandId::new(4),
+            first_slot: 1,
+            slot_count: 2,
+        };
+        assert_eq!(
+            HeapDeleteInPlaceRangeBatchPayload::decode(&p.encode().unwrap()).unwrap(),
             p
         );
     }

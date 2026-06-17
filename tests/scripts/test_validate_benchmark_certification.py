@@ -48,13 +48,23 @@ def manifest(commit: str = COMMIT, storage_mode: str = "data-dir") -> dict:
     }
 
 
-def raw_record(workload: str, engine: str, median_us: float, *, rows: int = 10000) -> dict:
+def raw_record(
+    workload: str,
+    engine: str,
+    median_us: float,
+    *,
+    rows: int = 10000,
+    storage_mode: str = "data-dir",
+    durability_mode: str = "durable",
+) -> dict:
     return {
         "schema_version": 1,
         "status": "measured",
         "workload": workload,
         "engine": engine,
         "n_rows": rows,
+        "storage_mode": storage_mode,
+        "durability_mode": durability_mode,
         "median_us": median_us,
         "samples": 32,
         "iterations_us": [median_us],
@@ -213,6 +223,53 @@ class BenchmarkCertificationValidatorTests(unittest.TestCase):
             self.assertIn(
                 "ultrasql_storage_mode expected data-dir, got memory",
                 status["errors"],
+            )
+
+    def test_rejects_raw_storage_profile_mismatch_for_data_dir_release(self) -> None:
+        with tempfile_dir() as tmp_path:
+            write_artifact(tmp_path)
+            raw_path = tmp_path / "raw" / "select_scan_10k-duckdb.json"
+            raw = json.loads(raw_path.read_text())
+            raw["storage_mode"] = "memory"
+            raw["durability_mode"] = "volatile"
+            write_json(raw_path, raw)
+
+            status = run_validator(tmp_path)
+
+            self.assertFalse(status["ready"])
+            self.assertTrue(
+                any(
+                    "duckdb: raw storage_mode expected data-dir, got memory" in error
+                    for error in status["errors"]
+                )
+            )
+            self.assertTrue(
+                any(
+                    "duckdb: raw durability_mode expected durable, got volatile" in error
+                    for error in status["errors"]
+                )
+            )
+
+    def test_rejects_missing_raw_storage_profile_for_data_dir_release(self) -> None:
+        with tempfile_dir() as tmp_path:
+            write_artifact(tmp_path)
+            raw_path = tmp_path / "raw" / "select_scan_10k-sqlite3.json"
+            raw = json.loads(raw_path.read_text())
+            raw.pop("storage_mode")
+            raw.pop("durability_mode")
+            write_json(raw_path, raw)
+
+            status = run_validator(tmp_path)
+
+            self.assertFalse(status["ready"])
+            self.assertTrue(
+                any("sqlite3: raw storage_mode must be a non-empty string" in error for error in status["errors"])
+            )
+            self.assertTrue(
+                any(
+                    "sqlite3: raw durability_mode must be a non-empty string" in error
+                    for error in status["errors"]
+                )
             )
 
 

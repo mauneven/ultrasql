@@ -13,6 +13,7 @@ STORAGE_BTREE_TESTS = REPO / "crates" / "ultrasql-storage" / "src" / "btree" / "
 STORAGE_HEAP_TESTS = REPO / "crates" / "ultrasql-storage" / "src" / "heap" / "tests.rs"
 STORAGE_VACUUM_TESTS = REPO / "crates" / "ultrasql-storage" / "tests" / "vacuum.rs"
 STORAGE_RECOVERY_SIM_TESTS = REPO / "crates" / "ultrasql-storage" / "tests" / "recovery_sim.rs"
+STORAGE_HEAP_WAL_EMIT = REPO / "crates" / "ultrasql-storage" / "src" / "heap" / "wal_emit.rs"
 STORAGE_PAGE_THROUGHPUT_CAST = re.compile(
     r"\b(?:tuple_size|slots\.len\(\))\s+as\s+u64\b"
 )
@@ -100,6 +101,16 @@ class StorageStyleTests(unittest.TestCase):
                 )
 
         self.assertEqual([], offenders)
+
+    def test_fpw_lsn_skip_happens_before_page_image_copy(self) -> None:
+        text = STORAGE_HEAP_WAL_EMIT.read_text()
+        start = text.index("pub(super) fn maybe_emit_fpw")
+        body = text[start : text.index("/// Emit a `HeapInsert`", start)]
+
+        skip = body.index("if page_lsn >= checkpoint_lsn")
+        copy = body.index("to_vec()")
+
+        self.assertLess(skip, copy)
 
 
 if __name__ == "__main__":

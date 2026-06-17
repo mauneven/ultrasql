@@ -1416,6 +1416,9 @@ fn decode_wal_payload(record: &ultrasql_wal::WalRecord) -> String {
         RecordType::HeapInsert => {
             format_decoded(ultrasql_wal::HeapInsertPayload::decode(&record.payload))
         }
+        RecordType::HeapInsertBatch => format_decoded(
+            ultrasql_wal::HeapInsertBatchPayload::decode(&record.payload),
+        ),
         RecordType::HeapUpdate => {
             format_decoded(ultrasql_wal::HeapUpdatePayload::decode(&record.payload))
         }
@@ -1439,11 +1442,17 @@ fn decode_wal_payload(record: &ultrasql_wal::WalRecord) -> String {
         RecordType::HeapUpdateInPlaceBatch => format_decoded(
             ultrasql_wal::HeapUpdateInPlaceBatchPayload::decode(&record.payload),
         ),
+        RecordType::HeapUpdateInt32PairDeltaBatch => format_decoded(
+            ultrasql_wal::HeapUpdateInt32PairDeltaBatchPayload::decode(&record.payload),
+        ),
         RecordType::HeapDeleteInPlace => format_decoded(
             ultrasql_wal::HeapDeleteInPlacePayload::decode(&record.payload),
         ),
         RecordType::HeapDeleteInPlaceBatch => format_decoded(
             ultrasql_wal::HeapDeleteInPlaceBatchPayload::decode(&record.payload),
+        ),
+        RecordType::HeapDeleteInPlaceRangeBatch => format_decoded(
+            ultrasql_wal::HeapDeleteInPlaceRangeBatchPayload::decode(&record.payload),
         ),
         RecordType::SequenceOp => {
             format_decoded(ultrasql_wal::SequenceOpPayload::decode(&record.payload))

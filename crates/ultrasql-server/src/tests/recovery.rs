@@ -316,6 +316,23 @@ fn server_init_restores_aborted_xids_from_wal() {
 }
 
 #[test]
+fn server_init_treats_observed_xids_without_terminal_record_as_aborted() {
+    let data_dir = tempfile::TempDir::new().unwrap();
+    let wal_dir = data_dir.path().join("pg_wal");
+    fs::create_dir_all(&wal_dir).unwrap();
+    let xid = Xid::new(43);
+    let record = WalRecord::new(RecordType::Nop, xid, Lsn::ZERO, 0, Vec::new())
+        .expect("test WAL nop record should fit size limits");
+    fs::write(wal_dir.join("segment_0000000000"), record.encode()).unwrap();
+    #[cfg(unix)]
+    make_data_dir_private(data_dir.path());
+
+    let server = Server::init(data_dir.path()).unwrap();
+
+    assert_eq!(server.txn_manager.status(xid), XidStatus::Aborted);
+}
+
+#[test]
 fn server_init_reopens_base_heap_pages_from_data_dir() {
     let data_dir = tempfile::TempDir::new().unwrap();
     let page_id = PageId::new(RelationId::new(4242), BlockNumber::new(0));

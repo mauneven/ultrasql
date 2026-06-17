@@ -42,6 +42,18 @@ PGDATABASE="${PGDATABASE:-ultrasql_bench}"
 PGUSER="${PGUSER:-$(id -un)}"
 ANALYTICAL_ROWS="${ANALYTICAL_ROWS:-}"
 INSERT_CHUNK_ROWS="${INSERT_CHUNK_ROWS:-10000}"
+BENCH_STORAGE_MODE="${BENCH_STORAGE_MODE:-memory}"
+case "$BENCH_STORAGE_MODE" in
+    memory|data-dir) ;;
+    *) echo "run_postgres_writes.sh: unknown BENCH_STORAGE_MODE '$BENCH_STORAGE_MODE' (memory|data-dir)" >&2; exit 2 ;;
+esac
+if [[ "$BENCH_STORAGE_MODE" == "data-dir" ]]; then
+    PG_DURABILITY_MODE="durable"
+    PG_TABLE_KIND=""
+else
+    PG_DURABILITY_MODE="volatile"
+    PG_TABLE_KIND="UNLOGGED "
+fi
 
 row_suffix() {
     local rows="$1"
@@ -85,18 +97,21 @@ emit_unavailable_all() {
     target_stub_workloads | while IFS= read -r wl; do
         local rows
         rows="$(workload_rows "$wl")"
-        python3 - "$RAW_DIR/${wl}-${ENGINE}.json" "$ENGINE" "$wl" "$rows" "$reason" <<'PY'
+        python3 - "$RAW_DIR/${wl}-${ENGINE}.json" "$ENGINE" "$wl" "$rows" "$reason" \
+            "$BENCH_STORAGE_MODE" "$PG_DURABILITY_MODE" <<'PY'
 import json
 import sys
 from pathlib import Path
 
-out, engine, workload, rows, reason = sys.argv[1:]
+out, engine, workload, rows, reason, storage_mode, durability_mode = sys.argv[1:]
 doc = {
     "schema_version": 1,
     "engine": engine,
     "status": "not_available",
     "workload": workload,
     "n_rows": int(rows),
+    "storage_mode": storage_mode,
+    "durability_mode": durability_mode,
     "reason": reason,
     "policy": "No PostgreSQL benchmark claim exists until this artifact records measured samples from the same scale-sweep run.",
 }
@@ -192,11 +207,12 @@ PYEOF
     n_samples="$#"
     local min_us
     min_us="$(python3 -c "import sys; vals=[float(x) for x in sys.argv[1:]]; print(min(vals) if vals else 0)" "$@")"
-    python3 - "$ENGINE" "$PG_ENGINE_VERSION" "$workload" "$n_rows" "$n_samples" "$median_us" "$min_us" "$samples_json" <<'PYEOF'
+    python3 - "$ENGINE" "$PG_ENGINE_VERSION" "$workload" "$n_rows" "$n_samples" \
+        "$median_us" "$min_us" "$samples_json" "$BENCH_STORAGE_MODE" "$PG_DURABILITY_MODE" <<'PYEOF'
 import json
 import sys
 
-engine, version, workload, n_rows, samples, median_us, min_us, samples_json = sys.argv[1:]
+engine, version, workload, n_rows, samples, median_us, min_us, samples_json, storage_mode, durability_mode = sys.argv[1:]
 doc = {
     "schema_version": 1,
     "engine": engine,
@@ -204,6 +220,8 @@ doc = {
     "workload": workload,
     "status": "measured",
     "n_rows": int(n_rows),
+    "storage_mode": storage_mode,
+    "durability_mode": durability_mode,
     "samples": int(samples),
     "median_us": float(median_us),
     "min_us": float(min_us),
@@ -216,7 +234,7 @@ PYEOF
 
 annotate_json() {
     local path="$1"
-    python3 - "$path" "$PG_ENGINE_VERSION" <<'PYEOF'
+    python3 - "$path" "$PG_ENGINE_VERSION" "$BENCH_STORAGE_MODE" "$PG_DURABILITY_MODE" <<'PYEOF'
 import json
 import sys
 from pathlib import Path
@@ -224,6 +242,8 @@ from pathlib import Path
 path = Path(sys.argv[1])
 doc = json.loads(path.read_text())
 doc["engine_version"] = sys.argv[2]
+doc["storage_mode"] = sys.argv[3]
+doc["durability_mode"] = sys.argv[4]
 path.write_text(json.dumps(doc, sort_keys=True) + "\n")
 PYEOF
 }
@@ -238,7 +258,7 @@ run_insert() {
     # Setup: ensure empty table.
     $PSQL <<SQL
 DROP TABLE IF EXISTS bench_write;
-CREATE UNLOGGED TABLE bench_write (id BIGINT PRIMARY KEY, val BIGINT);
+CREATE ${PG_TABLE_KIND}TABLE bench_write (id BIGINT NOT NULL, val BIGINT);
 SQL
 
     # Pre-generate values as a Python CSV to avoid shell loops.
@@ -296,7 +316,7 @@ run_update() {
     # Preload N_ROWS rows once.
     $PSQL <<SQL
 DROP TABLE IF EXISTS bench_write;
-CREATE UNLOGGED TABLE bench_write (id BIGINT PRIMARY KEY, val BIGINT);
+CREATE ${PG_TABLE_KIND}TABLE bench_write (id BIGINT NOT NULL, val BIGINT);
 SQL
     python3 - "$N_ROWS" <<'PYEOF' | $PSQL >/dev/null
 import sys
@@ -363,7 +383,7 @@ PYEOF
     local samples=()
     for (( i=0; i<N_ITERS; i++ )); do
         # Reload the table before each delete iteration.
-        $PSQL -c "DROP TABLE IF EXISTS bench_write; CREATE UNLOGGED TABLE bench_write (id BIGINT PRIMARY KEY, val BIGINT);" >/dev/null
+        $PSQL -c "DROP TABLE IF EXISTS bench_write; CREATE ${PG_TABLE_KIND}TABLE bench_write (id BIGINT NOT NULL, val BIGINT);" >/dev/null
         $PSQL -f "$insert_file" >/dev/null
 
         local t0 t1 dt
@@ -393,7 +413,7 @@ run_mixed() {
     # Pre-populate a table with N_ROWS rows for reads/updates.
     $PSQL <<SQL
 DROP TABLE IF EXISTS bench_write;
-CREATE UNLOGGED TABLE bench_write (id BIGINT PRIMARY KEY, val BIGINT);
+CREATE ${PG_TABLE_KIND}TABLE bench_write (id BIGINT PRIMARY KEY, val BIGINT);
 SQL
     python3 - "$N_ROWS" <<'PYEOF' | $PSQL >/dev/null
 import sys
@@ -475,6 +495,8 @@ run_mixed_correctness() {
         --workload "$wl" \
         --rows "$N_ROWS" \
         --iters "$N_ITERS" \
+        --storage-mode "$BENCH_STORAGE_MODE" \
+        --data-root "$BENCH_DATA_ROOT" \
         --pg-user "$PGUSER" \
         --pg-database "$PGDATABASE" \
         --out "${RAW_DIR}/${wl}-${ENGINE}.json"
@@ -492,7 +514,7 @@ run_select_scan() {
     # UltraSQL select-scan blueprint in cross_compare_sql.rs: (id INT, val INT).
     $PSQL <<SQL
 DROP TABLE IF EXISTS bench_select_scan;
-CREATE UNLOGGED TABLE bench_select_scan (id INT NOT NULL, val INT);
+CREATE ${PG_TABLE_KIND}TABLE bench_select_scan (id INT NOT NULL, val INT);
 SQL
     python3 - "$N_ROWS" <<'PYEOF' | $PSQL >/dev/null
 import sys
@@ -541,7 +563,7 @@ run_analytical() {
     # blueprint in cross_compare_sql.rs: (id INT, x INT) with x = j * 10.
     $PSQL <<SQL
 DROP TABLE IF EXISTS bench_analytical;
-CREATE UNLOGGED TABLE bench_analytical (id INT NOT NULL, x INT);
+CREATE ${PG_TABLE_KIND}TABLE bench_analytical (id INT NOT NULL, x INT);
 SQL
     python3 - "$n_rows" <<'PYEOF' | $PSQL >/dev/null
 import sys

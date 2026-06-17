@@ -87,12 +87,14 @@ impl<L: PageLoader> HeapAccess<L> {
                     new_tid,
                     hot: true,
                 };
+                self.remember_rollback_stamp_page(opts.xid, old_tid.page);
                 // WAL append is outside any pin scope.
                 Self::emit_update_wal(&self.pool, outcome, &opts, || self.fetch(new_tid))?;
                 // HOT update: both versions on the same page; clear VM once.
                 if let Some(vm) = opts.vm {
                     vm.clear(new_tid.page.relation, new_tid.page.block);
                 }
+                self.invalidate_int32_pair_payload_stats_relation(old_tid.page.relation);
                 self.column_cache.bump_version(old_tid.page.relation);
                 return Ok(outcome);
             }
@@ -136,6 +138,7 @@ impl<L: PageLoader> HeapAccess<L> {
         {
             let old_guard = self.pool.get_page(old_tid.page)?;
             Self::stamp_updated_old(&old_guard, old_tid, new_tid, opts)?;
+            self.remember_rollback_stamp_page(opts.xid, old_tid.page);
             // old_guard drops here — pin released before WAL append
         }
 
@@ -153,6 +156,7 @@ impl<L: PageLoader> HeapAccess<L> {
                 vm.clear(new_tid.page.relation, new_tid.page.block);
             }
         }
+        self.invalidate_int32_pair_payload_stats_relation(old_tid.page.relation);
         self.column_cache.bump_version(old_tid.page.relation);
         Ok(outcome)
     }
@@ -385,6 +389,7 @@ impl<L: PageLoader> HeapAccess<L> {
                     had_hot_outcome = true;
                 }
                 if had_hot_outcome {
+                    self.remember_rollback_stamp_page(opts.xid, page_id);
                     hot_touched_relation = Some(page_id.relation);
                 }
             } else {
@@ -406,6 +411,7 @@ impl<L: PageLoader> HeapAccess<L> {
         // One column-cache bump per relation, covering every HOT
         // outcome across every page-run.
         if let Some(rel) = hot_touched_relation {
+            self.invalidate_int32_pair_payload_stats_relation(rel);
             self.column_cache.bump_version(rel);
         }
 
@@ -478,6 +484,7 @@ impl<L: PageLoader> HeapAccess<L> {
                 }
                 drop(page);
                 drop(guard);
+                self.remember_rollback_stamp_page(opts.xid, page_id);
                 if let Some(vm) = opts.vm {
                     vm.clear(page_id.relation, page_id.block);
                 }
@@ -493,6 +500,7 @@ impl<L: PageLoader> HeapAccess<L> {
                 ));
             }
             total = checked_heap_count_add(total, fallback.len(), "updated tuple count overflow")?;
+            self.invalidate_int32_pair_payload_stats_relation(rel);
             self.column_cache.bump_version(rel);
         }
 

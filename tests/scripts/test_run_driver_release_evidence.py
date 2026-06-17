@@ -21,7 +21,7 @@ def write_executable(path: Path, text: str) -> None:
 def make_fake_repo(root: Path) -> None:
     (root / "scripts").mkdir(parents=True)
     (root / "tests" / "driver_certification").mkdir(parents=True)
-    (root / "target" / "debug").mkdir(parents=True)
+    (root / "target" / "release-ship").mkdir(parents=True)
 
     write_executable(
         root / "scripts" / "validate-driver-compatibility.py",
@@ -94,7 +94,7 @@ class DriverReleaseEvidenceRunnerTests(unittest.TestCase):
                 import sys
 
                 Path({str(cargo_log)!r}).write_text(" ".join(sys.argv[1:]) + "\\n")
-                binary = Path.cwd() / "target" / "debug" / "ultrasqld"
+                binary = Path.cwd() / "target" / "release-ship" / "ultrasqld"
                 binary.parent.mkdir(parents=True, exist_ok=True)
                 binary.write_text("#!/bin/sh\\nexit 0\\n")
                 binary.chmod(0o755)
@@ -123,7 +123,10 @@ class DriverReleaseEvidenceRunnerTests(unittest.TestCase):
             )
 
             self.assertEqual(proc.returncode, 0, proc.stderr + proc.stdout)
-            self.assertIn("build -p ultrasql-server --bin ultrasqld", cargo_log.read_text())
+            self.assertIn(
+                "build --profile release-ship -p ultrasql-server --bin ultrasqld",
+                cargo_log.read_text(),
+            )
             report = json.loads((repo / "target" / "driver-certification.json").read_text())
             self.assertEqual(report["commit"], COMMIT)
             doc = json.loads(status.read_text())

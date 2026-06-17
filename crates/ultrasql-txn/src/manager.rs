@@ -715,6 +715,22 @@ impl TransactionManager {
         self.recover_observed_xid(xid);
     }
 
+    /// Mark a WAL-observed XID without a terminal record as aborted.
+    ///
+    /// Crash recovery reaches this after replaying the WAL and restoring any
+    /// prepared transaction state. An XID that already has a CLOG entry may be
+    /// committed, aborted, or prepared-in-progress and is left unchanged.
+    pub fn recover_uncommitted_as_aborted(&self, xid: Xid) {
+        if xid == Xid::INVALID || xid == Xid::FROZEN || xid == Xid::BOOTSTRAP {
+            return;
+        }
+        if self.clog.get(&xid).is_none() {
+            self.clog.insert(xid, XidStatus::Aborted);
+            self.in_progress.lock().remove(&xid);
+        }
+        self.recover_observed_xid(xid);
+    }
+
     /// Restore an in-progress prepared XID observed in 2PC state.
     ///
     /// WAL recovery runs before 2PC state recovery. If WAL has already marked
