@@ -4,7 +4,7 @@
 //! across files keeps every unit under the 600-line ceiling without
 //! changing semantics.
 
-use tokio::io::{AsyncRead, AsyncWrite};
+use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use tracing::{debug, info};
 use ultrasql_protocol::{BackendMessage, FrontendMessage};
 
@@ -18,37 +18,56 @@ where
 {
     /// Read the startup message and emit the canonical handshake.
     pub(crate) async fn startup(&mut self) -> Result<(), ServerError> {
-        let msg = self.read_frontend().await?;
-        let (major, minor, params) = match msg {
-            FrontendMessage::StartupMessage {
-                protocol_major,
-                protocol_minor,
-                params,
-            } => (protocol_major, protocol_minor, params),
-            // A `CancelRequest` rides on the startup-packet framing and
-            // is the only legitimate non-`StartupMessage` first message.
-            // Look up `(pid, secret)` in the server's registry, flip the
-            // target session's `CancelFlag` on match, and close this
-            // connection without further dialogue (PostgreSQL behaviour:
-            // never reply, never error — a mismatched secret silently
-            // fails so a probe cannot distinguish "unknown pid" from
-            // "wrong secret").
-            FrontendMessage::CancelRequest {
-                process_id,
-                secret_key,
-            } => {
-                let pid = u32::from_le_bytes(process_id.to_le_bytes());
-                let secret = u32::from_le_bytes(secret_key.to_le_bytes());
-                let _ = self.state.cancel_registry.request_cancel(pid, secret);
-                return Ok(());
-            }
-            // The spec allows an SSLRequest as the very first message
-            // (which decodes to a startup-shaped payload); v0.5 does
-            // not negotiate TLS yet. We treat anything else as a
-            // protocol violation.
-            other => {
-                debug!(target: "ultrasqld", ?other, "expected startup, got other");
-                return Err(ServerError::UnexpectedEof);
+        // Loop so an SSLRequest / GSSENCRequest (which precede the real
+        // StartupMessage) can be declined and the handshake continued.
+        // PostgreSQL clients send at most one of each (GSS then SSL), so the
+        // attempt count is capped to refuse an abusive pre-startup flood.
+        let mut negotiation_attempts: u8 = 0;
+        let (major, minor, params) = loop {
+            let msg = self.read_frontend().await?;
+            match msg {
+                FrontendMessage::StartupMessage {
+                    protocol_major,
+                    protocol_minor,
+                    params,
+                } => break (protocol_major, protocol_minor, params),
+                // A `CancelRequest` rides on the startup-packet framing and
+                // is a legitimate non-`StartupMessage` first message. Look up
+                // `(pid, secret)` in the server's registry, flip the target
+                // session's `CancelFlag` on match, and close this connection
+                // without further dialogue (PostgreSQL behaviour: never reply,
+                // never error — a mismatched secret silently fails so a probe
+                // cannot distinguish "unknown pid" from "wrong secret").
+                FrontendMessage::CancelRequest {
+                    process_id,
+                    secret_key,
+                } => {
+                    let pid = u32::from_le_bytes(process_id.to_le_bytes());
+                    let secret = u32::from_le_bytes(secret_key.to_le_bytes());
+                    let _ = self.state.cancel_registry.request_cancel(pid, secret);
+                    return Ok(());
+                }
+                // SSLRequest / GSSENCRequest: `libpq`/`psql` send these as the
+                // very first message (default `sslmode=prefer` sends
+                // SSLRequest). PostgreSQL must answer with a single byte: `'S'`
+                // to upgrade or `'N'` to decline. We do not negotiate TLS/GSS
+                // yet, so we decline with `'N'`; a `prefer` client then
+                // continues in plaintext (previously the server dropped the
+                // socket with no reply, so stock clients failed to connect).
+                FrontendMessage::SslRequest | FrontendMessage::GssEncRequest => {
+                    negotiation_attempts += 1;
+                    if negotiation_attempts > 2 {
+                        debug!(target: "ultrasqld", "too many pre-startup negotiation requests");
+                        return Err(ServerError::UnexpectedEof);
+                    }
+                    self.io.write_all(b"N").await?;
+                    self.io.flush().await?;
+                    continue;
+                }
+                other => {
+                    debug!(target: "ultrasqld", ?other, "expected startup, got other");
+                    return Err(ServerError::UnexpectedEof);
+                }
             }
         };
         if major != 3 {

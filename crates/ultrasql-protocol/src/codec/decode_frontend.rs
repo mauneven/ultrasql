@@ -251,6 +251,20 @@ fn decode_startup_payload(payload: &[u8]) -> Result<FrontendMessage, ProtocolErr
         });
     }
 
+    // SSLRequest (80877103 = (1234, 5679)) and GSSENCRequest
+    // (80877104 = (1234, 5680)) also ride on the startup framing with no
+    // payload. Recognize them so the connection handler can send the
+    // mandatory single-byte reply instead of treating them as a malformed
+    // startup packet and dropping the socket.
+    if protocol_major == 1234 && protocol_minor == 5679 {
+        p.ensure_drained()?;
+        return Ok(FrontendMessage::SslRequest);
+    }
+    if protocol_major == 1234 && protocol_minor == 5680 {
+        p.ensure_drained()?;
+        return Ok(FrontendMessage::GssEncRequest);
+    }
+
     let mut params = Vec::new();
     loop {
         if p.is_empty() {

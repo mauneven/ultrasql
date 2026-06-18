@@ -179,6 +179,23 @@ pub enum FrontendMessage {
         secret_key: i32,
     },
 
+    /// SSL negotiation request. Like [`Self::CancelRequest`] it rides on the
+    /// startup framing with no type tag; the magic code is `80877103`
+    /// (`(1234 << 16) | 5679`) and there is no payload. `libpq`/`psql` send
+    /// this as the *very first* message under the default `sslmode=prefer`
+    /// (and under `require`/`verify-*`). The server must answer with a single
+    /// byte — `'S'` to start a TLS handshake or `'N'` to decline — after which
+    /// a `prefer` client continues in plaintext. Decoding it as a distinct
+    /// message (instead of a malformed startup packet) lets the server send
+    /// that mandatory reply instead of dropping the socket, which is why
+    /// stock clients previously could not connect cleanly.
+    SslRequest,
+
+    /// GSSAPI encryption request: the GSS analogue of [`Self::SslRequest`],
+    /// magic code `80877104` (`(1234 << 16) | 5680`), no payload. Declined
+    /// the same way (single `'N'` byte).
+    GssEncRequest,
+
     /// Sync (`'S'`): close the current pipeline, causing the server to
     /// flush any pending [`BackendMessage::ReadyForQuery`].
     Sync,

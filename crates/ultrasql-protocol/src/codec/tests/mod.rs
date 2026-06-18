@@ -94,6 +94,32 @@ fn startup_missing_terminator_rejected() {
     assert!(matches!(err, ProtocolError::Malformed(_)));
 }
 
+#[test]
+fn ssl_request_decodes_to_ssl_request_message() {
+    // SSLRequest: 8-byte packet, magic 80877103 = (1234, 5679). It must
+    // decode to a distinct message so the connection handler can answer with
+    // the mandatory single 'N' byte instead of treating it as a malformed
+    // startup packet and dropping the socket (which broke stock libpq/psql
+    // clients connecting under the default sslmode=prefer).
+    let mut bytes = BytesMut::new();
+    bytes.put_i32(8);
+    bytes.put_u16(1234);
+    bytes.put_u16(5679);
+    let decoded = decode_frontend(&mut bytes).expect("decode").expect("some");
+    assert!(matches!(decoded, FrontendMessage::SslRequest));
+}
+
+#[test]
+fn gssenc_request_decodes_to_gssenc_request_message() {
+    // GSSENCRequest: magic 80877104 = (1234, 5680).
+    let mut bytes = BytesMut::new();
+    bytes.put_i32(8);
+    bytes.put_u16(1234);
+    bytes.put_u16(5680);
+    let decoded = decode_frontend(&mut bytes).expect("decode").expect("some");
+    assert!(matches!(decoded, FrontendMessage::GssEncRequest));
+}
+
 // -------------------------------------------------------------------
 // Frontend round-trips
 // -------------------------------------------------------------------

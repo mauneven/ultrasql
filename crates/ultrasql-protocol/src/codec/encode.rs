@@ -34,6 +34,8 @@ pub fn encode_frontend(msg: &FrontendMessage, buf: &mut BytesMut) {
             process_id,
             secret_key,
         } => encode_cancel_request(*process_id, *secret_key, buf),
+        FrontendMessage::SslRequest => encode_request_code(5679, buf),
+        FrontendMessage::GssEncRequest => encode_request_code(5680, buf),
         FrontendMessage::Query { sql } => {
             write_tagged(buf, b'Q', |payload| {
                 write_cstring(payload, sql);
@@ -358,6 +360,15 @@ fn encode_cancel_request(process_id: i32, secret_key: i32, buf: &mut BytesMut) {
     buf.put_u16(5678);
     buf.put_i32(process_id);
     buf.put_i32(secret_key);
+}
+
+/// Encode a payload-less startup-framed request code (`(1234, minor)`): an
+/// i32 length of 8 followed by the magic. SSLRequest is `minor == 5679`,
+/// GSSENCRequest is `minor == 5680`.
+fn encode_request_code(minor: u16, buf: &mut BytesMut) {
+    buf.put_i32(8);
+    buf.put_u16(1234);
+    buf.put_u16(minor);
 }
 
 fn write_cstring(buf: &mut BytesMut, s: &str) {
