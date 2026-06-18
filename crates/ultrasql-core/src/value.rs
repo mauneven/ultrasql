@@ -277,6 +277,12 @@ impl GeometryValue {
                 if nums.len() < 4 {
                     return None;
                 }
+                // Coordinates arrive as (x, y) pairs; an odd count is a trailing
+                // coordinate with no mate. Reject it rather than letting the
+                // `chunks_exact(2)` below silently drop the dangling value.
+                if nums.len() % COORDINATES_PER_POINT != 0 {
+                    return None;
+                }
                 let mut points =
                     Vec::with_capacity(nums.len().checked_div(COORDINATES_PER_POINT).unwrap_or(0));
                 for pair in nums.chunks_exact(2) {

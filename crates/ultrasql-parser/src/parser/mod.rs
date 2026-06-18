@@ -199,7 +199,11 @@ impl<'src> Parser<'src> {
             }
             let _ = self.parse_one()?;
             let end = self.peek()?.span.start_usize();
-            let slice = self.source[start..end].trim();
+            // `start`/`end` are token-span byte offsets into `self.source`, so
+            // the range is always valid; use the checked accessor anyway to
+            // keep parsing of untrusted SQL panic-free even if a future span
+            // bug produced an out-of-range pair.
+            let slice = self.source.get(start..end).unwrap_or("").trim();
             if !slice.is_empty() {
                 out.push(slice);
             }
@@ -775,7 +779,7 @@ impl<'src> Parser<'src> {
         // Ensure we have a buffered peeked token; this fixes the
         // lexer offset to "just past that token's end".
         let _ = self.peek()?;
-        let remainder = &self.source[self.lexer.offset()..];
+        let remainder = self.source.get(self.lexer.offset()..).unwrap_or("");
         let mut tmp = Lexer::new(remainder);
         let mut tok = tmp.next_token()?;
         for _ in 1..distance {
@@ -791,7 +795,7 @@ impl<'src> Parser<'src> {
     ) -> Result<bool, ParseError> {
         debug_assert!(distance >= 1);
         let _ = self.peek()?;
-        let remainder = &self.source[self.lexer.offset()..];
+        let remainder = self.source.get(self.lexer.offset()..).unwrap_or("");
         let mut tmp = Lexer::new(remainder);
         let mut tok = tmp.next_token()?;
         for _ in 1..distance {

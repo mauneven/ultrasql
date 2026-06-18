@@ -129,12 +129,14 @@ pub(super) fn read_error_fields(
 // panic on bad input.
 // ---------------------------------------------------------------------------
 
-pub(super) fn usize_from_i32(value: i32, _what: &'static str) -> Result<usize, ProtocolError> {
-    usize::try_from(value).map_err(|_| ProtocolError::Malformed("negative length"))
+pub(super) fn usize_from_i32(value: i32, what: &'static str) -> Result<usize, ProtocolError> {
+    // `what` names the specific field (e.g. "startup length") so a malformed
+    // client surfaces *which* count/length was negative, not a generic message.
+    usize::try_from(value).map_err(|_| ProtocolError::Malformed(what))
 }
 
-pub(super) fn nonneg_usize(value: i16, _what: &'static str) -> Result<usize, ProtocolError> {
-    usize::try_from(value).map_err(|_| ProtocolError::Malformed("negative count"))
+pub(super) fn nonneg_usize(value: i16, what: &'static str) -> Result<usize, ProtocolError> {
+    usize::try_from(value).map_err(|_| ProtocolError::Malformed(what))
 }
 
 /// Encoder helper. The wire length is encoded as a signed 32-bit

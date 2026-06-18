@@ -748,6 +748,16 @@ fn choose_costed_order_dp(
 ) -> Vec<usize> {
     use std::collections::HashMap;
 
+    // Subset masks are `u64` bitsets (`1_u64 << idx`, `1_u64 << leaves.len()`),
+    // so the DP is only sound for fewer than 64 leaves. The sole caller gates
+    // entry on `leaves.len() <= 10` (greedy handles anything larger), making
+    // this unreachable; assert it so a future routing change fails loudly in
+    // debug builds rather than silently overflowing a shift.
+    debug_assert!(
+        leaves.len() < 64,
+        "DP join enumeration requires < 64 leaves; caller must gate larger inputs to the greedy path"
+    );
+
     let model = CostModel::new(stats);
     let mut states = HashMap::<u64, JoinSearchState>::new();
     for (idx, leaf) in leaves.iter().enumerate() {
