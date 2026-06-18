@@ -184,7 +184,8 @@ impl RecordType {
 
     /// Every `RecordType` variant.
     ///
-    /// Kept exhaustive by [`RecordType::ENSURE_EXHAUSTIVE`], whose match has no
+    /// Kept exhaustive by the private `RecordType::ENSURE_EXHAUSTIVE` check,
+    /// whose match has no
     /// wildcard arm: adding a variant to the enum fails to compile until it is
     /// also handled there, and the `record_type_all_is_complete` test rejects
     /// any drift between this slice and [`RecordType::from_u8`]. Round-trip and
