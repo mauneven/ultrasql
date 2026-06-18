@@ -5,6 +5,15 @@
 //! planning uses the same helpers as execution so schema inference and row
 //! production agree on listing order and error messages.
 
+// Panic hardening: production (non-test) objectstore code must not `.unwrap()`,
+// `.expect()`, or `panic!`. Fallible sites propagate errors; proven invariants
+// carry a per-site `#[allow]` with an `// INVARIANT:` justification.
+// `#[cfg(test)]` modules are exempt.
+#![cfg_attr(
+    not(test),
+    deny(clippy::unwrap_used, clippy::expect_used, clippy::panic)
+)]
+
 use std::collections::{HashMap, VecDeque};
 use std::env;
 use std::sync::atomic::{AtomicU64, Ordering};

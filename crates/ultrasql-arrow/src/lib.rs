@@ -3,6 +3,15 @@
 //! This crate is the public Rust boundary for moving columnar data between
 //! UltraSQL batches and Arrow `RecordBatch` values.
 
+// Panic hardening: production (non-test) arrow-bridge code must not `.unwrap()`,
+// `.expect()`, or `panic!`. Fallible sites propagate errors; proven invariants
+// carry a per-site `#[allow]` with an `// INVARIANT:` justification.
+// `#[cfg(test)]` modules are exempt.
+#![cfg_attr(
+    not(test),
+    deny(clippy::unwrap_used, clippy::expect_used, clippy::panic)
+)]
+
 use std::sync::Arc;
 
 use arrow_array::{

@@ -1,5 +1,14 @@
 //! Node-API bindings for UltraSQL embedded mode.
 
+// Panic hardening: production (non-test) node-binding code must not `.unwrap()`,
+// `.expect()`, or `panic!`. Fallible sites propagate errors; proven invariants
+// carry a per-site `#[allow]` with an `// INVARIANT:` justification.
+// `#[cfg(test)]` modules are exempt.
+#![cfg_attr(
+    not(test),
+    deny(clippy::unwrap_used, clippy::expect_used, clippy::panic)
+)]
+
 use std::sync::Mutex;
 
 use napi::bindgen_prelude::*;
