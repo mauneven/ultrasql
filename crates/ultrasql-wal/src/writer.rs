@@ -840,6 +840,42 @@ mod tests {
     }
 
     #[test]
+    fn a_single_record_larger_than_the_buffer_is_admitted_not_rejected() {
+        // A record wider than the whole WAL buffer (here a 128 KiB payload
+        // through a 64 KiB buffer) used to be rejected with
+        // `WalBufferError::Full`, because no amount of draining can make room
+        // for a record larger than the buffer. That is what failed a durable
+        // bulk write whose largest record (a wide row or full page) exceeded the
+        // 8 MiB production buffer. With a drainer registered, the empty buffer
+        // now admits the record over-capacity and the writer drains it durably.
+        let dir = TempDir::new().unwrap();
+        let buffer = Arc::new(WalBuffer::new(64 * 1024, Lsn::ZERO));
+        let writer = WalWriter::open(
+            dir.path(),
+            Arc::clone(&buffer),
+            WalWriterConfig {
+                segment_size_bytes: 4 * 1024 * 1024,
+                fsync_window_us: 2_000,
+                fsync_batch_bytes: 256 * 1024,
+            },
+        )
+        .unwrap();
+
+        let payload = vec![b'x'; 128 * 1024];
+        buffer
+            .append(&rec(&payload))
+            .expect("a record larger than the buffer must be admitted, not rejected");
+
+        let final_lsn = buffer.next_lsn();
+        writer.notify();
+        writer.shutdown().unwrap();
+        assert!(
+            buffer.durable_lsn() >= final_lsn,
+            "the oversized record must be durable after shutdown"
+        );
+    }
+
+    #[test]
     fn notify_forces_pending_wal_durable_before_window_elapsed() {
         let dir = TempDir::new().unwrap();
         let buffer = Arc::new(WalBuffer::new(64 * 1024, Lsn::ZERO));

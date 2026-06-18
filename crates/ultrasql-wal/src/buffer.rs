@@ -180,12 +180,16 @@ impl WalBuffer {
     /// Returns the held [`Inner`] guard ready for the caller to assign an LSN
     /// and encode into. Behaviour when the record does not currently fit:
     ///
-    /// - A record wider than the whole buffer can never be admitted and is
-    ///   rejected immediately with [`WalBufferError::Full`] — never an infinite
-    ///   wait.
+    /// - With a drainer registered, a record larger than the whole buffer is
+    ///   admitted once the buffer is empty — written over-capacity (bounded by
+    ///   the 64 MiB [`MAX_RECORD_BYTES`](crate::record::MAX_RECORD_BYTES)
+    ///   record ceiling) — so a wide row or page flows through as backpressure
+    ///   instead of failing with [`WalBufferError::Full`].
     /// - A *transiently* full buffer parks the caller until a drain frees space
-    ///   when a drainer is registered, or is rejected with
-    ///   [`WalBufferError::Full`] when none is.
+    ///   when a drainer is registered.
+    /// - With NO drainer registered, a full buffer (transient or oversized) is
+    ///   rejected with [`WalBufferError::Full`]: there is nothing to drain it,
+    ///   so parking would hang. This preserves the bare-buffer contract.
     /// - A buffer whose writer has stopped returns [`WalBufferError::Closed`].
     ///
     /// Backpressure performs no filesystem I/O and acquires no buffer-pool page
@@ -206,28 +210,31 @@ impl WalBuffer {
             {
                 return Ok(inner);
             }
-            // A record wider than the entire buffer can never be admitted, no
-            // matter how much the writer drains — reject rather than hang.
-            if record_len > self.capacity {
+            // The record does not fit in the remaining space. Only the WAL
+            // writer (the registered drainer) can free space; without one,
+            // preserve the historical reject-on-full contract for bare buffers.
+            let drainer = self.drainer.lock().clone();
+            let Some(drainer) = drainer else {
                 return Err(WalBufferError::Full {
                     used,
                     capacity: self.capacity,
                 });
+            };
+            // An empty buffer can always make progress on a single record — even
+            // one wider than the whole buffer (a legal record up to
+            // `MAX_RECORD_BYTES`). Admit it over-capacity rather than rejecting,
+            // so a wide row or page flows through as backpressure instead of
+            // failing with `Full`; the drainer writes and fsyncs it next and
+            // reclaims the allocation. This is what lets a durable bulk write
+            // whose largest record exceeds the buffer succeed instead of erroring.
+            if used == 0 {
+                return Ok(inner);
             }
-            // Transiently full. Apply backpressure only when a drainer can free
-            // space; otherwise preserve the historical reject-on-full contract.
-            let drainer = self.drainer.lock().clone();
-            match drainer {
-                Some(drainer) => drainer.request_drain(),
-                None => {
-                    return Err(WalBufferError::Full {
-                        used,
-                        capacity: self.capacity,
-                    });
-                }
-            }
-            // Park until the writer drains (`space_available`) or stops
-            // (`closed`). The bounded wait re-pokes/re-checks defensively.
+            // Non-empty and the record does not fit: ask the writer to drain and
+            // park until space frees. For a record wider than the buffer this
+            // waits until the buffer fully empties, then the `used == 0` branch
+            // above admits it. The bounded wait re-pokes/re-checks defensively.
+            drainer.request_drain();
             self.space_available
                 .wait_for(&mut inner, Self::BACKPRESSURE_RECHECK);
         }
