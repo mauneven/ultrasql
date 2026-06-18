@@ -80,9 +80,13 @@ completed evidence.
   not full benchmark release certification. Full sign-off still needs the
   full benchmark profile and WAL-backed data-dir scale-sweep evidence.
 - Firebolt comparisons use local Firebolt Core only, not hosted Firebolt URLs.
-- Durable bulk `INSERT` at 1M rows is recorded `not_available`: the fixed 8 MiB
-  WAL buffer rejects when full instead of applying backpressure. A correct fix
-  requires backpressure / flow control, not just a larger buffer.
+- Durable bulk `INSERT` at 1M rows is still recorded `not_available` in the
+  committed scoreboard, but the underlying `wal buffer full` failure is fixed in
+  code: per-record backpressure is wired and a single record larger than the
+  8 MiB WAL buffer is now admitted over-capacity. The artifact needs a re-run to
+  record a measurement. Separately, the WAL is never truncated — segments grow
+  unbounded and restart replays all history — which remains an open durability
+  gate (see `ROADMAP.md`, "WAL retention / segment recycling").
 
 ## Client ecosystem
 

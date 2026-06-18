@@ -75,14 +75,34 @@ file focused on what still blocks production.
 - Broaden release-artifact scale-sweep coverage beyond the current same-host
   table: larger row counts, repeatable ClickHouse artifacts, and Firebolt legs
   when local services are available.
-- Durable bulk INSERT: a 1,000,000-row INSERT fails in `--data-dir` mode with
-  `wal buffer full` because the server WAL sink rejects records instead of
-  applying backpressure when the 8 MiB `WalBuffer` is full
-  (`crates/ultrasql-server/src/lib.rs` `WAL_BUFFER_BYTES`,
-  `crates/ultrasql-wal/src/buffer.rs` `WalBuffer::append`). Exit condition: a
-  1M-row durable INSERT completes and the data-dir scale sweep records a
-  measured `insert_throughput_1m-ultrasql` artifact (currently
-  `not_available`), lifting the certification to 24 comparable rows.
+- Durable bulk INSERT: the `wal buffer full` failure on a 1,000,000-row INSERT
+  in `--data-dir` mode is now fixed in code. Per-record backpressure is wired —
+  the WAL sink parks an appender on a transiently-full `WalBuffer` instead of
+  rejecting (`crates/ultrasql-wal/src/buffer.rs` `WalBuffer::reserve`,
+  `WalWriter::open` `set_drainer`) — and a single record larger than the 8 MiB
+  buffer is now admitted over-capacity (bounded by `MAX_RECORD_BYTES`) instead
+  of rejected. Exit condition: re-run the `--data-dir` scale sweep and record a
+  measured `insert_throughput_1m-ultrasql` artifact (currently `not_available`,
+  predating the fix), lifting the certification to 24 comparable measured rows.
+- WAL retention / segment recycling: the WAL is never truncated — segments
+  accumulate for the life of the database, so disk usage grows unbounded and
+  every restart replays all history (the vector index rebuilds from `Lsn::ZERO`
+  on each start). Checkpoint-driven truncation is blocked by four coupled
+  prerequisites, each a silent-data-loss risk if done wrong: (1) the WAL LSN is
+  an absolute byte offset from the start of history and recovery hardcodes
+  `stream_pos = 0` at the first segment, so removing head segments shifts every
+  reconstructed LSN — a per-segment start-LSN manifest is needed plus seeding
+  every recovery scanner from it; (2) commit/abort status is rebuilt by scanning
+  all `Commit`/`Abort` records on every startup (no persistent CLOG), so
+  truncation must first fold commit status into the checkpoint record or persist
+  a CLOG; (3) the checkpoint flush is a buffered `write_page` with no fsync, so
+  a checkpoint must be made durable before its LSN can bound truncation; (4)
+  vector indexes have no durable on-disk state and are pure WAL-replay artifacts,
+  so the arena must be snapshotted at checkpoint (`page_images` /
+  `from_page_images` are half-built) before its records can be removed. Exit
+  condition: a long-running instance recycles WAL segments below a durable
+  checkpoint, restart time is bounded by un-checkpointed work (not total
+  history), and a disk-full + crash-recovery drill passes after truncation.
 - OLTP commit-path losses (`insert_throughput_10k` → PostgreSQL,
   `mixed_oltp_pgbench_like` → SQLite/PostgreSQL): the per-commit cost is
   dominated by `full_fsync` (F_FULLFSYNC, true power-loss durability) in

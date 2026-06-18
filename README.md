@@ -113,11 +113,14 @@ all three sequential scans, the windowed scan, mixed correctness, and small-batc
 updates/deletes — by real ~2x margins over DuckDB, not the inflated numbers an
 earlier, unfair `psql -c`-per-query harness produced. It is **not** fastest on
 the single-shot INSERT-10k (PostgreSQL), point-mixed OLTP (SQLite), the 100k/1M
-update and 100k delete (DuckDB), or the 1M delete (ClickHouse). It currently
-**fails the 1M-row INSERT in durable mode** (the 8 MiB WAL buffer rejects instead
-of applying backpressure — tracked in [ROADMAP.md](ROADMAP.md) and
+update and 100k delete (DuckDB), or the 1M delete (ClickHouse). The committed scoreboard predates a durable-write fix: the 1M-row INSERT in
+durable mode was recorded `not_available` because the 8 MiB WAL buffer rejected
+records instead of applying backpressure. That failure is now fixed in code
+(per-record backpressure plus over-capacity admission of a single record larger
+than the buffer — see [ROADMAP.md](ROADMAP.md) and
 [operator-reports/2026-06-benchmark-row-analysis.md](operator-reports/2026-06-benchmark-row-analysis.md)),
-so that row has no UltraSQL measurement and is shown as `not_available`. The
+so that row needs a re-run to record a measurement; it is still shown as
+`not_available` in the pinned artifact below. The
 certification gate now certifies *fair methodology* and reports per-row wins and
 losses as a scoreboard rather than demanding an impossible clean sweep, so
 `benchmark_certification_status.json` is `ready`.
