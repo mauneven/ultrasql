@@ -132,9 +132,17 @@ file focused on what still blocks production.
   (`--checkpoint-interval-ms`, default 300s, persistent mode only) runs a full
   checkpoint — flush, fsync, snapshots, and WAL recycling — off the async reactor
   via `spawn_blocking`, so the WAL and restart time stay bounded without an
-  explicit `CHECKPOINT`. Remaining: a kill-9 + disk-full crash-recovery drill
-  after truncation. Restart time is now bounded by un-checkpointed work rather
-  than total history for any database that checkpoints.
+  explicit `CHECKPOINT`. The kill-9 + disk-full crash-recovery drill is DONE
+  (`benchmarks/chaos_recovery.sh` segment-recycling leg recycles the head
+  segment, hard-`kill -9`s a real `ultrasqld`, and recovers every committed row;
+  plus deterministic in-process drills for recycle-then-crash and a disk-full
+  manifest write). That drill caught and fixed a critical bug: relation block
+  counts were rebuilt only from WAL replay, so after recycling a restart
+  under-counted blocks and heap scans dropped rows and whole catalog tables —
+  recovery now seeds block counts from the durable on-disk segment sizes when the
+  stream no longer starts at the origin. Restart time is now bounded by
+  un-checkpointed work rather than total history for any database that
+  checkpoints.
 - OLTP commit-path losses (`insert_throughput_10k` → PostgreSQL,
   `mixed_oltp_pgbench_like` → SQLite/PostgreSQL): the per-commit cost is
   dominated by `full_fsync` (F_FULLFSYNC, true power-loss durability) in

@@ -3,6 +3,43 @@
 Completed/addressed work moved out of [ROADMAP.md](ROADMAP.md). Keep this file
 as a concise evidence ledger; roadmap stays for open gates only.
 
+## 2026-06-18 durable WAL retention: segment recycling + crash drills
+
+Landed on `main` (`b272ba8e`..`955e1c77`). Checkpoint-driven WAL segment
+recycling now keeps the WAL and restart time bounded by un-checkpointed work
+instead of total history, for both HNSW and IVFFlat databases.
+
+- **Segment recycling mechanic:** `ultrasql_wal::truncate_below` removes whole
+  segments below a crash-safe floor — the `wal.manifest` floor is written and
+  fsynced *before* any unlink, so an interrupted/disk-full truncation only leaves
+  harmless below-floor stragglers. `perform_checkpoint` computes the floor as
+  `min(redo_from, oldest in-progress txn's first LSN, min HNSW snapshot LSN, min
+  IVFFlat snapshot LSN)`.
+- **IVFFlat durable snapshot (prerequisite 4):** `encode_snapshot`/
+  `from_snapshot_bytes` over the authoritative logical state + a `meta_lsn`
+  high-water mark and `redo_covered` replay gate, mirroring HNSW. An adversarial
+  review caught and fixed a crash-on-search: an empty interior centroid slot in a
+  crafted snapshot hit a distance-kernel length assert (`nearest_vectors` now
+  skips empty slots).
+- **Automatic checkpoints:** `--checkpoint-interval-ms` (default 300s) runs a
+  full checkpoint off the async reactor via `spawn_blocking`, so recycling fires
+  without an explicit `CHECKPOINT`. `--wal-segment-size-bytes` tunes retention
+  granularity.
+- **Critical fix the drill caught:** relation block counts were rebuilt solely
+  from WAL replay, so after recycling a restart under-counted blocks and heap
+  scans dropped rows — and whole catalog tables — silently. Recovery now seeds
+  block counts from the durable on-disk segment sizes when the stream starts
+  above the origin (`SegmentFileManager::discover_relation_block_counts` +
+  `HeapAccess::seed_block_count`).
+- **Crash drills:** `benchmarks/chaos_recovery.sh` gains a real-process
+  segment-recycling + `kill -9` leg (head segment recycled, process hard-killed,
+  all committed rows recovered — smoke run: all four chaos cases measured/passed).
+  Plus deterministic in-process drills: recycle-then-crash recovers every row,
+  and a disk-full manifest-write failure removes nothing. Evidence:
+  `cargo test -p ultrasql-server --test vector_type_round_trip wal_recycling_then_crash`,
+  `cargo test -p ultrasql-wal truncate`, and
+  `CHAOS_BUILD=0 ULTRASQLD_BIN=target/debug/ultrasqld ULTRASQL_BIN=target/debug/ultrasql bash benchmarks/chaos_recovery.sh smoke`.
+
 ## 2026-06-17/18 correctness & security fix batch
 
 Landed on `main` (`b3a3470`..`1884832f`); full workspace test (4271 tests / 179
