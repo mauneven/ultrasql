@@ -31,7 +31,11 @@ Fixes (each a small committed slice):
   gone and `ultrasql_storage_mode = data-dir`.
 
 Honest result (2026-06-16 same-host data-dir sweep): **UltraSQL is fastest on
-17 of 23 comparable rows** — every aggregate (SUM/AVG/Filter+SUM, ~2× over
+17 of 24 comparable rows** (the certified scoreboard records 17 win / 6 loss /
+1 not_available; per-row winners live in
+`benchmarks/results/latest/benchmark_certification_status.json`, which
+supersedes the interim numbers in the tables below) — every aggregate
+(SUM/AVG/Filter+SUM, ~2× over
 DuckDB, not 40,000 %), the windowed scan, large sequential scans, and
 small-batch updates/deletes. It is **not** fastest on:
 
@@ -70,8 +74,10 @@ compile-time exhaustiveness guard) plus tests that round-trip every variant
 through `encode→decode` and assert the CLI `decode_wal_payload` routes each
 variant to a typed decoder. A new variant now fails compilation or the tests.
 
-(Integrity-mission Part 3, executor/server panic-hardening, was not undertaken
-and is noted in the task ledger; it remains available as scoped future work.)
+(Integrity-mission Part 3, executor/server panic-hardening, has since been
+completed: the crate-level `deny(clippy::unwrap_used, clippy::expect_used,
+clippy::panic)` gate is now active in `ultrasql-executor` and `ultrasql-server`
+with no escape hatches.)
 
 ## Mission B — AI-native operational database
 

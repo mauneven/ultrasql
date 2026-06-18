@@ -49,9 +49,13 @@ operator.
   `Σ weight / (k + rank)` with `k = 60`. RRF is robust to incomparable score
   scales (BM25 magnitude vs cosine similarity), so a strong single-modality
   outlier cannot dominate the ranking.
-- **`'weighted'`** — weighted linear sum of normalized component scores. This
-  is the default when the fifth argument is omitted, for backward
-  compatibility.
+- **`'weighted'`** — weighted linear sum of component scores. BM25 and vector
+  similarity are used on their **native scales** (not normalized); only recency
+  and version are min/max-normalized across the candidate set. This is the
+  default when the fifth argument is omitted, for backward compatibility. (It
+  is therefore pulled toward whichever component has the larger raw magnitude —
+  usually BM25 — which is why RRF is generally preferred for fusing unlike
+  scales.)
 
 The two methods can disagree. Given a document with a very strong lexical match
 but a distant vector, and another with a weaker lexical match but the closest

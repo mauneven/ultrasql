@@ -1,6 +1,6 @@
 # UltraSQL Operations Runbook
 
-This runbook covers the v0.9 operational surface that exists today and the
+This runbook covers the v0.0.9 operational surface that exists today and the
 evidence required before a production claim is valid.
 
 ## Start
@@ -34,7 +34,7 @@ curl -fsS http://127.0.0.1:8080/metrics
 
 The endpoint emits Prometheus text format. Current counters are process/build
 level only; query, WAL, and buffer counters must be backed by live engine
-instrumentation before v0.9 can be called production-complete.
+instrumentation before v0.0.9 can be called production-complete.
 
 ## Catalog diagnostics
 

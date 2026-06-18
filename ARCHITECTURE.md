@@ -15,7 +15,7 @@ not by reaching into private modules.
 
 ```text
 ┌──────────────────────────────────────────────────────────────────────┐
-│                       Wire Protocol (v3 / SCRAM)                     │
+│                          Wire Protocol (v3)                          │
 │                            ultrasql-protocol                          │
 └──────────────────────────────────────────────────────────────────────┘
                                   │
@@ -188,8 +188,10 @@ tunable.
 - Recovery replays records in LSN order. Truncation or CRC mismatch is
   treated as torn-write residue only at the final segment tail; corruption
   before later bytes or later segments is fatal.
-- WAL segments are 16 MiB and recycle after archiving / the configured
-  retention window.
+- WAL segments are 16 MiB and roll over inline when full. Segment recycling,
+  archiving, and retention-based reclamation are not yet implemented, so old
+  segments are retained (unbounded WAL growth and restart-replay time scaling
+  with total history are open items — see ROADMAP).
 
 **Rationale.** Group commit is the single largest OLTP throughput
 multiplier on rotational storage and on NVMe under bursty write
@@ -338,14 +340,16 @@ the logical plan keeps the optimizer free of name-resolution concerns.
 - Outer-join elimination where predicates allow.
 - Limit pushdown into sort and scan.
 
-**Stage B: cost-based search.**
+**Stage B: cost-based join reordering.**
 
-- Cascades-style top-down enumeration with memoization.
-- Join enumeration: DPsize for small queries (≤ 10 relations),
-  greedy heuristic above that.
-- Physical operator selection: NLJ / Hash / Merge for joins,
-  IndexScan / SeqScan for accesses, HashAggregate / SortAggregate /
-  StreamAggregate for aggregates.
+- Cost-based inner-join reordering (DPsize for ≤ 10 relations, greedy
+  heuristic above that) is the only cost-driven choice currently wired into
+  the production plan path.
+- A Cascades-style memo and per-operator cost formulas exist as scaffolding
+  for a future search driver but are not yet wired.
+- Physical operator selection (NLJ / Hash / Merge join, IndexScan / SeqScan,
+  HashAggregate / SortAggregate / StreamAggregate) is currently made by
+  structural rules during executor/server lowering, not by a cost search.
 
 **Statistics.** Per-column histograms (equi-depth + most-common
 values), per-relation row count, per-relation page count, per-index
@@ -431,9 +435,13 @@ parses incoming messages into typed enums (`StartupMessage`,
 ...) and serializes outgoing ones (`ReadyForQuery`, `RowDescription`,
 `DataRow`, `CommandComplete`, `ErrorResponse`, ...).
 
-**Authentication.** SCRAM-SHA-256 is the only supported auth method
-out of the box. Cleartext and md5 are accepted only for migration
-scenarios and are gated behind a config flag.
+**Authentication.** Authentication wired on a live connection is `Trust`
+(accept all — the default) or a single global MD5 credential. A
+SCRAM-SHA-256 server state machine, a rustls TLS loader, and a `pg_hba`
+parser exist as tested library code but are **not yet negotiated** on a
+connection. An `SSLRequest`/`GSSENCRequest` is answered with an `N` decline,
+so connections are plaintext only. Real TLS upgrade (`S`), per-role SCRAM
+auth, and `pg_hba` enforcement are open items.
 
 ---
 

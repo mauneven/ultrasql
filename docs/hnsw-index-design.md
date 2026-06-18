@@ -1,6 +1,14 @@
 # HNSW Index Design
 
-Status: design only. No HNSW code is implemented by this document.
+Status: **partially implemented.** A single-layer HNSW access method ships
+today — a runtime `HnswIndex` plus a `PageBackedHnswIndex`, `CREATE INDEX …
+USING hnsw`, executor ANN and filtered-ANN scans, and WAL-replay rebuild on
+restart. This document remains the **target** design for the full page-backed,
+buffer-pool-resident, multi-level, MVCC-correct vacuum/rebuild access method;
+sections describing multi-level graphs and on-disk page arenas describe that
+target, not the current single-layer implementation (insert is an exact O(N)
+scan and the page arena is rebuilt from WAL on restart rather than read from
+disk). See [known-limitations.md](known-limitations.md).
 
 ## Scope
 

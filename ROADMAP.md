@@ -51,16 +51,6 @@ file focused on what still blocks production.
   catalog-sanity beyond the active shard, and isolation schedules. The curated
   regression subset is active without local skip debt; evidence lives in
   `DONE.md`.
-- Panic hardening on the query path: a crate-level clippy gate denying
-  `clippy::unwrap_used` and `clippy::expect_used` (and `panic` in non-test code)
-  is not yet in place for `ultrasql-executor` and `ultrasql-server`. The hot
-  files carry many sites (e.g. `eval.rs`, `row_codec.rs`, `segment.rs`,
-  `session/execute.rs`), most in `#[cfg(test)]` modules but with real production
-  sites remaining. Exit condition: `#![cfg_attr(not(test), deny(clippy::unwrap_used,
-  clippy::expect_used))]` (or equivalent) compiles clean for both crates with
-  fallible sites converted to `Result` propagation via `ultrasql-core::Error`
-  and proven invariants justified by an `INVARIANT:` comment, with tests for any
-  newly user-reachable error paths.
 
 ### Performance Certification
 

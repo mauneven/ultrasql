@@ -67,10 +67,11 @@ an honest loss.
 
 ## Part 4 — panic hardening
 
-Status recorded in ROADMAP with a measurable exit condition (crate-level
-`clippy::unwrap_used`/`expect_used` deny for `ultrasql-executor` and
-`ultrasql-server` non-test code), scoped honestly against the size of the
-conversion.
+**Completed.** The crate-level
+`deny(clippy::unwrap_used, clippy::expect_used, clippy::panic)` gate (under
+`cfg(not(test))`) is now active in `ultrasql-executor` (`lib.rs:72`) and
+`ultrasql-server` (`lib.rs:51`) — and in every other library crate — with no
+`#[allow]` escape hatches. This is no longer a pending ROADMAP exit condition.
 
 ## Part 5 — commit, certify, scoreboard
 

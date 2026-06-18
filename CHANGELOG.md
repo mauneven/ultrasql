@@ -78,13 +78,58 @@ and must document the break here.
 - Roadmap now tracks only open production gates; completed milestones moved to
   `DONE.md`.
 
+### Security
+
+- Parser statement-level recursion (nested `FROM (SELECT …)` subqueries and
+  parenthesised joins) is now bounded by `MAX_PARSE_DEPTH`. Previously a
+  multi-KB query of a few hundred nesting levels overflowed the worker stack
+  and aborted the process — an uncatchable, pre-auth remote DoS under the
+  default `Trust` policy. It now returns a recoverable `DepthExceeded` error.
+- `COPY … FROM STDIN WITH (FORMAT binary)` now caps the cumulative stream at
+  128 MiB (env-tunable via `ULTRASQL_COPY_BINARY_FILE_LIMIT_BYTES`), closing an
+  unbounded-buffer OOM DoS where a client could stream `CopyData` frames until
+  the process was killed.
+- The fast-DML precheck cache now keys on `Arc` pointer identity instead of a
+  bare heap address, closing an ABA-style false positive that could skip
+  row-level-security / column-privilege checks for the wrong plan.
+
 ### Fixed
 
+- B-tree deletion of a non-unique key whose duplicate group spans a same-key
+  leaf split no longer silently fails for entries on the left side of the
+  split. Previously `DELETE`/`UPDATE` index maintenance on a low-cardinality
+  column (>32 rows sharing a key) could leave a dangling index entry —
+  index/heap disagreement (phantom rows, false unique violations).
+- Window functions now honor `ORDER BY … DESC` and `NULLS FIRST/LAST`.
+  Previously `RANK()`/`ROW_NUMBER()`/`LAG`/`LEAD`/etc. `OVER (ORDER BY x DESC)`
+  silently computed ascending results.
+- Equality selectivity now decodes PostgreSQL's negative `n_distinct`
+  convention, so high-cardinality columns are no longer costed as if `col = X`
+  returned the whole table (which was poisoning join-order selection).
+- SSI now garbage-collects committed conflict-graph entries
+  (`commit_horizon` + `collect_garbage`), bounding memory and removing a source
+  of spurious `40001` serialization aborts.
+- `pg_index.indisprimary` now comes from an authoritative index-creation flag
+  instead of the `*_pkey` name heuristic, so a user index named `*_pkey` is no
+  longer mislabeled primary.
+- Default `psql`/`libpq` clients (`sslmode=prefer`) now connect: the server
+  answers an `SSLRequest`/`GSSENCRequest` with the mandatory `N` decline
+  (plaintext fallback) instead of dropping the socket.
 - B-tree root splits keep the persisted root block stable and reopened B-tree
   handles seed allocation above resident pages, preserving indexed point
   lookups after sysbench-style indexed DML churn.
 - `ultrasql validate` no longer mis-decodes internal `pg_catalog` heap rows as
   SQL user rows during heap-visibility checks.
+
+### Changed
+
+- `^` (exponentiation) is now left-associative and boolean `NOT` binds looser
+  than the comparison band, matching PostgreSQL (`2 ^ 3 ^ 2` = 64;
+  `NOT a = b` parses as `NOT (a = b)`).
+- The crate-level clippy gate
+  `deny(clippy::unwrap_used, clippy::expect_used, clippy::panic)` (under
+  `cfg(not(test))`) is now enforced in every library crate, including
+  `ultrasql-executor` and `ultrasql-server`, with no escape hatches.
 
 ### Known gaps
 

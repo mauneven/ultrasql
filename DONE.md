@@ -3,6 +3,41 @@
 Completed/addressed work moved out of [ROADMAP.md](ROADMAP.md). Keep this file
 as a concise evidence ledger; roadmap stays for open gates only.
 
+## 2026-06-17/18 correctness & security fix batch
+
+Landed on `main` (`b3a3470`..`1884832f`); full workspace test (4271 tests / 179
+binaries), workspace clippy (`--all-targets --all-features -D warnings`), and
+the per-crate ≥80% coverage gate are all green.
+
+- **Storage / index correctness:** B-tree deletion of a non-unique key whose
+  duplicate group spans a same-key leaf split no longer silently fails for
+  left-side entries (was index/heap disagreement on any >32-duplicate key).
+  Evidence: `crates/ultrasql-storage/src/btree/lookup.rs`
+  (`descend_to_leftmost_leaf_for_key` + search-before-chase), test
+  `delete_removes_left_resident_duplicate_across_same_key_split`. Commit `0396b32`.
+- **Parser DoS:** statement-level recursion (`parse_table_factor`) now bounded
+  by `MAX_PARSE_DEPTH`; nested `FROM`-subqueries / parenthesised joins return
+  `DepthExceeded` instead of overflowing the stack. Commit `87a3dda`. Also `^`
+  is now left-associative and boolean `NOT` binds looser than comparison
+  (PostgreSQL). Commit `5495d81`.
+- **Executor:** window functions honor `ORDER BY … DESC` and `NULLS FIRST/LAST`
+  (`WindowAgg::with_order_directions`). Commit `9c76cf7`.
+- **Optimizer:** equality selectivity decodes PostgreSQL's negative `n_distinct`
+  convention. Commit `f88baf3`.
+- **Server / protocol security:** `COPY FROM STDIN` binary cap (128 MiB,
+  `ULTRASQL_COPY_BINARY_FILE_LIMIT_BYTES`); `SSLRequest`/`GSSENCRequest`
+  answered with `'N'` decline so stock clients connect in plaintext;
+  `prechecked_fast_dml` keyed on `Arc::ptr_eq` (closed an RLS/privilege-skip
+  ABA). Commits `0fec4e9`, `e613c09`, `b3a3470`.
+- **SSI / catalog:** SSI garbage-collects committed conflict entries
+  (`commit_horizon` + `collect_garbage`); `pg_index.indisprimary` from an
+  authoritative flag, not the `*_pkey` name heuristic. Commit `b3a3470`.
+- The crate-level `deny(clippy::unwrap_used, clippy::expect_used, clippy::panic)`
+  gate (`cfg(not(test))`) is enforced in **every** library crate, including
+  `ultrasql-executor` (`lib.rs:72`) and `ultrasql-server` (`lib.rs:51`), with no
+  escape hatches. This closes the former ROADMAP "panic hardening" exit
+  condition.
+
 ## Persistent Approximate HNSW + Filtered ANN
 
 - The server's persistent `PageBackedHnswIndex::search` now traverses the

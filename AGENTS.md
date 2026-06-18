@@ -85,10 +85,14 @@ ordered priorities. When two conflict, the earlier one wins.
 
 ### 3.3 Style
 
-- No `unwrap()` or `expect()` in non-test code unless the panic
-  represents a true unrecoverable invariant violation; in that case use
-  `expect("describe-the-invariant")` so the panic message names the
-  invariant.
+- No `unwrap()`, `expect()`, or `panic!` in non-test code. This is enforced:
+  every library crate's `lib.rs` carries
+  `#![cfg_attr(not(test), deny(clippy::unwrap_used, clippy::expect_used,
+  clippy::panic))]` with no crate-level escape hatches. Fallible sites must
+  propagate errors. When a call is infallible by a proven invariant, suppress
+  the lint at that single site (`#[expect(clippy::unwrap_used, reason = "…")]`
+  or a local `#[allow]` with an `// INVARIANT:` justification) rather than
+  weakening the gate.
 - No `as` casts between integer widths. Use `try_into()` and propagate
   the conversion error, or use the explicit `i64::from(u32_value)`
   idiom when widening losslessly.
@@ -359,9 +363,14 @@ ultrasql/
 │   ├── ultrasql-executor/         physical execution
 │   ├── ultrasql-vec/              vectorized kernels
 │   ├── ultrasql-catalog/          system catalog
+│   ├── ultrasql-arrow/            Arrow interop
+│   ├── ultrasql-objectstore/      object-store backend
+│   ├── ultrasql-iceberg/          Iceberg table format
 │   ├── ultrasql-protocol/         wire protocol v3
 │   ├── ultrasql-server/           ultrasqld binary
 │   ├── ultrasql-cli/              ultrasql interactive client
+│   ├── ultrasql-node/             Node/Bun embedded binding
+│   ├── ultrasql-sqllogictest-runner/  sqllogictest harness
 │   └── ultrasql-bench/            benchmark harness binary
 ├── benchmarks/                    reproducible benchmark assets and results
 ├── docs/                          user-facing documentation

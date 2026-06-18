@@ -48,6 +48,16 @@ Set `OBJECT_PARQUET_RANGE_PROFILE=smoke|full` and
 runner. Object-store paths must stay explicit; do not hide a whole-object read
 behind a range artifact.
 
+## COPY
+
+Binary `COPY` — both `COPY … FROM <file> WITH (FORMAT binary)` and
+`COPY … FROM STDIN WITH (FORMAT binary)` — is bounded to **128 MiB per stream**
+by default to prevent an unbounded-buffer OOM. Override the ceiling with the
+`ULTRASQL_COPY_BINARY_FILE_LIMIT_BYTES` environment variable (a positive byte
+count; a zero or invalid value falls back to the 128 MiB default). The STDIN
+path rejects the transfer once the cumulative `CopyData` size would exceed the
+limit; the file path rejects oversized files before reading.
+
 ## ANN
 
 HNSW and IVFFlat indexes are created with SQL syntax:

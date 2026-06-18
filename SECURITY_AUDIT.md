@@ -59,6 +59,53 @@ re-check when Arrow/Parquet publishes an alternate path.
 
 ---
 
+## 0b. 2026-06-17 post-fix pass (workspace at v0.0.9)
+
+Two pre-auth denial-of-service findings discovered after the 2026-05-12 pass
+were fixed on `main`. Both are reachable under the default `Trust` policy (no
+authentication), so they were pre-auth.
+
+### F-9. Parser statement-level recursion DoS (High, fixed)
+
+**Affected:** `crates/ultrasql-parser/src/statements/select.rs`
+(`parse_table_factor` → `parse_select` / `parse_from_clause`).
+
+**Exploitation:** F-1 bounded only the Pratt *expression* parser. A separate,
+unguarded *statement*-level recursion remained: nested `FROM` subqueries
+(`FROM (SELECT … FROM (SELECT …))`) and parenthesised joins (`(((t)))`) recursed
+with no depth guard, so a few-KB query overflowed the worker stack and aborted
+the process (`SIGABRT` under `panic = "abort"`) — an uncatchable, pre-auth
+remote DoS.
+
+**Remediation:** `parse_table_factor` now charges each level against the shared
+`MAX_PARSE_DEPTH` budget via `enter_depth`/`leave_depth`, returning a
+recoverable `DepthExceeded` error. Commit `87a3dda`. Regression tests:
+`deeply_nested_from_subqueries_rejected_without_overflow`,
+`deeply_nested_parenthesised_joins_rejected_without_overflow`.
+
+### F-10. COPY FROM STDIN binary unbounded-buffer OOM DoS (High, fixed)
+
+**Affected:** `crates/ultrasql-server/src/session/copy.rs`
+(`collect_copy_stdin_bytes`).
+
+**Exploitation:** `COPY t FROM STDIN WITH (FORMAT binary)` accumulated every
+`CopyData` frame into one `Vec` with no cumulative bound. A client could stream
+frames indefinitely, growing a single session's heap until the process was
+OOM-killed, taking down every other session. The binary *file* path was already
+capped; STDIN was not.
+
+**Remediation:** the STDIN path now enforces the same 128 MiB ceiling
+(`copy_binary_file_limit_bytes()`, env-tunable via
+`ULTRASQL_COPY_BINARY_FILE_LIMIT_BYTES`). Commit `0fec4e9`. Regression test:
+`copy_stdin_cumulative_limit_is_enforced`.
+
+Also in this batch: `SSLRequest`/`GSSENCRequest` are now answered with the
+mandatory `'N'` decline (commit `e613c09`) so stock clients connect in plaintext
+instead of seeing a dropped socket — connections remain cleartext (no TLS
+upgrade), which is tracked as an open limitation.
+
+---
+
 ## 1. Summary
 
 | Severity | Found | Fixed in this pass | Deferred |
@@ -88,10 +135,13 @@ tokio worker thread blows its 2 MiB stack. Result: panic, the server
 process aborts under default `panic = "abort"` release profile. Pre-auth
 because the parser runs before any authentication check.
 
-**Remediation:** Bound recursion at `MAX_PARSE_DEPTH = 1024`. Each entry
-into `parse_expr_with_precedence` increments a counter; on overflow the
-parser returns `ParseError::DepthExceeded`, which surfaces as a
-query-scoped `ErrorResponse` with SQLSTATE 42601.
+**Remediation:** Bound recursion at `MAX_PARSE_DEPTH` (currently `128`,
+tightened from an earlier `1024` so the guard fires before sanitizer-
+instrumented threads exhaust the stack). Each entry into
+`parse_expr_with_precedence` increments a counter; on overflow the parser
+returns `ParseError::DepthExceeded`, which surfaces as a query-scoped
+`ErrorResponse` with SQLSTATE 42601. (Statement-level recursion is bounded
+separately — see F-9 in the 2026-06-17 pass.)
 
 **Regression test:** `parser::tests::deeply_nested_parens_rejected_without_overflow`,
 `parser::tests::parens_below_limit_succeed`.

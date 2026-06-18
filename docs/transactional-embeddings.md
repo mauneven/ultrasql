@@ -40,11 +40,14 @@ Tested in `crates/ultrasql-server/tests/vector_type_round_trip.rs`:
 
 ## Crash recovery: index and heap agree after WAL replay
 
-The HNSW index is page-backed and WAL-logged like the heap. After a crash, WAL
-replay restores both, and the index agrees with the heap it indexes — a
-committed `UPDATE` of text + vector + metadata is reflected in the vector
-search, the body, and the JSON metadata after restart; an uncommitted one is
-not.
+The HNSW index is WAL-logged: every node insert/delete/compaction is written to
+the same WAL as the heap. After a crash, the heap is restored from its pages and
+the index graph is reconstructed by replaying the HNSW WAL records, so the index
+agrees with the heap it indexes — a committed `UPDATE` of text + vector +
+metadata is reflected in the vector search, the body, and the JSON metadata
+after restart; an uncommitted one is not. (The on-disk page arena is not yet
+read back on restart; the graph is rebuilt from WAL, so startup cost grows with
+total insert history — see [known-limitations.md](known-limitations.md).)
 
 Tested in the same file:
 `vector_index_and_heap_agree_after_transactional_update_and_crash` — it commits a

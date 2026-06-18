@@ -50,9 +50,11 @@ unless quoting a prohibited claim in the claim-policy section.
   certifies fair methodology and reports this win/loss scoreboard rather than
   requiring a clean sweep.
 - That claim does not mean the full release benchmark-certification gate is
-  closed. The committed benchmark certification manifest is smoke-profile
-  evidence, while release sign-off still needs full-profile and WAL-backed
-  data-dir benchmark evidence.
+  closed. The committed benchmark certification is now a full-profile,
+  WAL-backed data-dir sweep (`ready=true`, pinned to commit `77a92d7c`, 32
+  measured samples / 8 warmup); release sign-off still needs the broader suite
+  (TPC-B/C, Sysbench, ClickBench, Firebolt) and the independent operator soaks
+  to close.
 - Current certification artifacts are mixed: TPC-H SF1/SF10 and AI vector
   pgvector certification pass; TPC-B, TPC-C, Sysbench, ClickBench, and Firebolt
   sparse pruning are not passing release-certification targets.
