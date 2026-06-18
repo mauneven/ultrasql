@@ -105,19 +105,34 @@ as a concise evidence ledger; roadmap stays for open gates only.
   part). Documented in `docs/getting-started.md`.
 - `benchmarks/vector_soak.sh` (+ `benchmarks/scripts/vector_soak.py`): sustained
   concurrent ANN reads with a live recall check vs an independent NumPy baseline,
-  alongside concurrent far-region writers, then a CHECKPOINT, a SIGKILL, and a
-  restart. The full profile (20k base, 8 threads, 30 s) sustained ~37k queries
-  with 0 query/write errors and recall_mean 0.997, and all 20,769 committed rows
-  + the HNSW index + recall (verify recall 1.0) survived the abrupt restart.
-  Chaos-style manifest at
+  alongside concurrent far-region writers, then a SIGKILL with **no preceding
+  CHECKPOINT** and a restart — so recovery must replay the un-checkpointed
+  concurrent writes from the WAL. The full profile (20k base, 8 threads, 30 s)
+  sustained ~51k queries with 0 query/write errors and recall_mean 0.997, and
+  all 20,905 committed rows + the HNSW index + recall (verify recall 1.0)
+  survived the abrupt no-checkpoint restart. Chaos-style manifest at
   `benchmarks/results/latest/vector_soak_manifest.json`, `not_available` when
   prerequisites are missing.
-- The soak surfaced two real durability bugs (flagged + tracked in ROADMAP): a
-  crash without a CHECKPOINT after CONCURRENT writes fails to recover
-  (`heap_insert_batch slot mismatch` in `wal_applier.rs`), and connecting as a
-  reserved `ultrasql_`-prefixed user yields tables whose owner is rejected on
-  recovery. The soak verifies durability of checkpointed state across a SIGKILL;
-  the no-checkpoint concurrent WAL-replay path is the ROADMAP exit condition.
+- The soak surfaced — and these fixes close — two real durability bugs:
+  - Concurrent-write crash recovery: after sustained CONCURRENT writes, a crash
+    without a CHECKPOINT failed to recover with `heap_insert_batch: slot
+    mismatch` in `crates/ultrasql-storage/src/wal_applier.rs`. Slots are
+    allocated under the page lock but each insert appends its WAL record *after*
+    releasing it, so two inserters on a page can log their rows in the opposite
+    order to the slots they took; append-based redo then mis-ordered the slots
+    and aborted recovery. Fixed by replaying each insert at the **exact recorded
+    slot** (`Page::insert_tuple_at_slot`, backfilling `Unused` placeholders for
+    not-yet-replayed holes) in the heap insert / insert-batch / non-HOT update
+    redo paths. Regressions: `wal_applier::tests::apply_insert*_replays_slot_
+    reversed_records` (deterministic) and `recovery_sim::crash_recovery_
+    concurrent_inserts_replay_in_wal_order` (concurrent).
+  - Reserved-role login: connecting as a `ultrasql_`-prefixed user (e.g.
+    `ultrasql_bench`) was accepted by the Trust policy but never persisted, so a
+    table it owned failed recovery with `unknown RLS table metadata owner`. The
+    `ultrasql_` namespace is now reserved (PostgreSQL-style, like `pg_`): such a
+    login is rejected at connect (SQLSTATE 42939) unless it is a persisted role.
+    The bootstrap `ultrasql` role is unaffected. Regression:
+    `reserved_role_connect_round_trip`.
 
 ## Release And Packaging Automation
 

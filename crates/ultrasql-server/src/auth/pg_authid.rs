@@ -27,6 +27,29 @@ pub const BOOTSTRAP_ROLE_OID: u32 = 10;
 
 const FIRST_USER_ROLE_OID: u32 = 16_384;
 
+/// Role-name prefix reserved for system roles, analogous to PostgreSQL's
+/// `pg_` reservation. The bootstrap role is `ultrasql` (no trailing
+/// underscore), so it is *not* covered by this prefix.
+pub const RESERVED_ROLE_PREFIX: &str = "ultrasql_";
+
+/// Whether `name` falls inside the reserved system-role namespace.
+///
+/// Names are compared case-insensitively because the connection handler
+/// and DDL both lower-case role names before use. A name in this namespace
+/// that is not a persisted role must never be allowed to authenticate or
+/// own objects: it would be waved through by the `Trust` policy yet never
+/// recorded in the role catalog, and once it owns a table/schema/sequence
+/// the catalog and RLS sidecar replay on the next restart rejects the
+/// unknown owner and the database refuses to start — total data loss.
+#[must_use]
+pub fn is_reserved_role_name(name: &str) -> bool {
+    // Compare bytes (not `&str` slices) so a multi-byte UTF-8 name cannot
+    // panic on a fixed-index slice; the prefix is pure ASCII.
+    let prefix = RESERVED_ROLE_PREFIX.as_bytes();
+    let bytes = name.as_bytes();
+    bytes.len() >= prefix.len() && bytes[..prefix.len()].eq_ignore_ascii_case(prefix)
+}
+
 /// A single role's authentication data.
 ///
 /// Corresponds to a row in PostgreSQL's `pg_authid` table.
@@ -490,6 +513,20 @@ mod tests {
             connection_limit: -1,
             valid_until: None,
         }
+    }
+
+    #[test]
+    fn reserved_role_name_covers_prefix_only() {
+        assert!(super::is_reserved_role_name("ultrasql_bench"));
+        assert!(super::is_reserved_role_name("ultrasql_"));
+        // Case-insensitive.
+        assert!(super::is_reserved_role_name("ULTRASQL_Bench"));
+        // The bootstrap role itself has no trailing underscore.
+        assert!(!super::is_reserved_role_name("ultrasql"));
+        assert!(!super::is_reserved_role_name("tester"));
+        assert!(!super::is_reserved_role_name(""));
+        // A multi-byte name must not panic on the fixed-length prefix check.
+        assert!(!super::is_reserved_role_name("ültrasql_x"));
     }
 
     #[test]

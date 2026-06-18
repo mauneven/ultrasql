@@ -282,6 +282,104 @@ fn crash_recovery_visible_tuples_match_committed_only() {
     );
 }
 
+/// Crash-recovery under CONCURRENT inserts with no intervening checkpoint.
+///
+/// This is the regression for the durability bug the vector soak test
+/// surfaced: many connections inserting into the same relation contend on
+/// the same heap pages. Slot allocation happens under the page write lock,
+/// but each insert appends its WAL record *after* releasing that lock, so
+/// two inserters on a page can append in the opposite order to the slots
+/// they took. The recovery applier replays records in WAL (LSN) order; the
+/// pre-fix append-based redo then hit "slot mismatch: expected N, inserted
+/// N-1" and aborted recovery, losing every committed row on the page.
+///
+/// Phase 1 spawns several threads inserting concurrently (each as its own
+/// xid). Phase 2 drops the heap (simulated `kill -9` — only the WAL, kept
+/// in the sink, survives) and replays every record into a fresh heap, as
+/// crash recovery would. Phase 3 asserts every committed row is recoverable
+/// at its recorded TID with its original bytes, and no row leaked or
+/// duplicated.
+#[test]
+fn crash_recovery_concurrent_inserts_replay_in_wal_order() {
+    use std::thread;
+    use ultrasql_storage::test_support::InMemoryWalSink;
+
+    const THREADS: usize = 8;
+    const ROWS_PER_THREAD: usize = 300;
+
+    let sink = Arc::new(InMemoryWalSink::new());
+
+    // --- Phase 1: concurrent inserts into one relation --------------------
+    let inserted: Vec<(TupleId, String)> = {
+        let heap = make_persistent_heap(loader::MapLoader::new());
+        let sink_ref = sink.as_ref();
+        let per_thread: Vec<Vec<(TupleId, String)>> = thread::scope(|scope| {
+            let handles: Vec<_> = (0..THREADS)
+                .map(|t| {
+                    let heap = &heap;
+                    scope.spawn(move || {
+                        let xid = Xid::new(usize_to_u64(t) + 1);
+                        let mut mine = Vec::with_capacity(ROWS_PER_THREAD);
+                        for i in 0..ROWS_PER_THREAD {
+                            // Small payloads pack many rows per page, so
+                            // multiple threads collide on the same page and
+                            // the WAL/slot order divergence shows up.
+                            let payload = format!("t{t:02}-r{i:04}");
+                            let tid = heap
+                                .insert(rel(), payload.as_bytes(), insert_opts(xid, sink_ref))
+                                .expect("concurrent insert must succeed");
+                            mine.push((tid, payload));
+                        }
+                        mine
+                    })
+                })
+                .collect();
+            handles
+                .into_iter()
+                .map(|handle| handle.join().expect("insert thread joins"))
+                .collect()
+        });
+        per_thread.into_iter().flatten().collect()
+        // heap drops here — simulated crash; the WAL lives on in `sink`.
+    };
+
+    assert_eq!(
+        inserted.len(),
+        THREADS * ROWS_PER_THREAD,
+        "every insert must return a tid"
+    );
+
+    // --- Phase 2: replay the WAL (append order == LSN order) --------------
+    let records = sink.records();
+    let recovery_heap = make_persistent_heap(loader::MapLoader::new());
+    for (_lsn, record) in &records {
+        dispatch_record(&recovery_heap, record)
+            .expect("WAL replay of concurrent inserts must succeed");
+    }
+
+    // --- Phase 3: every committed row is recoverable ----------------------
+    for (tid, payload) in &inserted {
+        let tuple = recovery_heap
+            .fetch(*tid)
+            .unwrap_or_else(|e| panic!("row {payload} at {tid:?} lost in recovery: {e}"));
+        assert_eq!(
+            tuple.data,
+            payload.as_bytes(),
+            "row {payload} recovered with the wrong bytes"
+        );
+    }
+
+    let recovered = recovery_heap
+        .scan(rel(), recovery_heap.block_count(rel()))
+        .flatten()
+        .count();
+    assert_eq!(
+        recovered,
+        inserted.len(),
+        "recovered tuple count must equal the committed inserts (no loss, no duplication)"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Property tests: page tuple round-trips
 // ---------------------------------------------------------------------------

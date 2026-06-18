@@ -162,6 +162,40 @@ where
                 }
             }
         }
+        // Reserve the `ultrasql_` role namespace for the system (mirrors
+        // PostgreSQL's `pg_` reservation). A login under this prefix that is
+        // not a persisted role would be accepted by the `Trust` policy yet
+        // never recorded in the role catalog; once it owns objects, the
+        // catalog/RLS/sequence/schema sidecar replay on the next restart
+        // rejects the unknown owner and the database refuses to start —
+        // total data loss. Refuse the login instead. The bootstrap role
+        // `ultrasql` has no trailing underscore, so it is unaffected, and a
+        // role that was explicitly created (hence persisted) still logs in.
+        if crate::auth::is_reserved_role_name(&self.auth_user)
+            && self
+                .state
+                .role_catalog
+                .lookup_role(&self.auth_user)
+                .is_none()
+        {
+            let _ = self
+                .send(&BackendMessage::ErrorResponse {
+                    fields: vec![
+                        (b'S', "FATAL".to_string()),
+                        (b'C', "42939".to_string()),
+                        (
+                            b'M',
+                            format!(
+                                "role name \"{}\" is reserved; the \"{}\" prefix is for system roles",
+                                self.auth_user,
+                                crate::auth::RESERVED_ROLE_PREFIX
+                            ),
+                        ),
+                    ],
+                })
+                .await;
+            return Err(ServerError::AuthFailed);
+        }
         if let Some(role) = self.state.role_catalog.lookup_role(&self.auth_user) {
             if !role.can_login {
                 let _ = self

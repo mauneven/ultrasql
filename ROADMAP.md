@@ -246,18 +246,6 @@ p50 ≈ 257 µs on 2k×16d via `benchmarks/vector_ann_hnsw.sh`):
   fallback policy, and `larger recall/latency artifacts`.
 - Keep ANN WAL coverage expanding: crash/restart DML rebuild, corrupt-WAL
   unavailable fallback, and `WAL replay fuzz/property tests`.
-- Concurrent-write crash recovery (found by `benchmarks/vector_soak.sh`): after
-  sustained CONCURRENT writes, a crash without a preceding CHECKPOINT fails to
-  recover with `heap_insert_batch: slot mismatch` from
-  `crates/ultrasql-storage/src/wal_applier.rs` — the emit-time slot in the WAL
-  record diverges from what serial replay allocates under concurrency (a
-  CHECKPOINT before the crash recovers cleanly; sequential load always does).
-  Exit condition: a regression test that drives concurrent inserts, crashes with
-  no checkpoint, and recovers every committed row; plus the soak's durability
-  phase dropped back to a no-checkpoint SIGKILL. Related: connecting as a
-  reserved `ultrasql_`-prefixed user (e.g. `ultrasql_bench`) is accepted but its
-  table owner is not persisted, so recovery fails with `unknown RLS table
-  metadata owner` — reject or auto-register such owners.
 - pgvector parity: larger exact top-k profiles, filtered exact search,
   SQL-level HNSW/restart correctness, IVFFlat recall/latency, vector
   arithmetic beyond dense `sum`/`avg`, and broader cast/function cert.

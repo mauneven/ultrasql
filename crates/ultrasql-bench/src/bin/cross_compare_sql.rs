@@ -1045,7 +1045,7 @@ fn sql_string(path: &Path) -> String {
 async fn connect_sql_server(
     server: SocketAddr,
 ) -> Result<(tokio_postgres::Client, tokio::task::JoinHandle<()>)> {
-    let conn_str = format!("host=127.0.0.1 port={} user=ultrasql_bench", server.port());
+    let conn_str = format!("host=127.0.0.1 port={} user=bench_runner", server.port());
     let (client, connection) = tokio_postgres::connect(&conn_str, NoTls)
         .await
         .context("tokio-postgres connect to ultrasqld")?;
@@ -2176,7 +2176,7 @@ const INSERT_BENCH_CHUNK_ROWS: usize = 10_000;
 /// transaction. The CREATE and SQL string construction are outside the timed
 /// region.
 async fn run_insert_iter(server: SocketAddr, n_rows: usize, ix: usize) -> Result<f64> {
-    let conn_str = format!("host=127.0.0.1 port={} user=ultrasql_bench", server.port());
+    let conn_str = format!("host=127.0.0.1 port={} user=bench_runner", server.port());
     let (client, connection) = tokio_postgres::connect(&conn_str, NoTls)
         .await
         .context("tokio-postgres connect to ultrasqld")?;
@@ -2295,7 +2295,7 @@ async fn run_shared_delete(
     total_iters: usize,
     iters_us: &mut Vec<f64>,
 ) -> Result<()> {
-    let conn_str = format!("host=127.0.0.1 port={} user=ultrasql_bench", server.port());
+    let conn_str = format!("host=127.0.0.1 port={} user=bench_runner", server.port());
     let (client, connection) = tokio_postgres::connect(&conn_str, NoTls)
         .await
         .context("tokio-postgres connect to ultrasqld")?;
@@ -2354,7 +2354,7 @@ async fn run_shared_select_scan(
     total_iters: usize,
     iters_us: &mut Vec<f64>,
 ) -> Result<()> {
-    let conn_str = format!("host=127.0.0.1 port={} user=ultrasql_bench", server.port());
+    let conn_str = format!("host=127.0.0.1 port={} user=bench_runner", server.port());
     let (client, connection) = tokio_postgres::connect(&conn_str, NoTls)
         .await
         .context("tokio-postgres connect to ultrasqld")?;
@@ -2412,7 +2412,7 @@ async fn run_shared_update(
     total_iters: usize,
     iters_us: &mut Vec<f64>,
 ) -> Result<()> {
-    let conn_str = format!("host=127.0.0.1 port={} user=ultrasql_bench", server.port());
+    let conn_str = format!("host=127.0.0.1 port={} user=bench_runner", server.port());
     let (client, connection) = tokio_postgres::connect(&conn_str, NoTls)
         .await
         .context("tokio-postgres connect to ultrasqld")?;
@@ -2593,7 +2593,7 @@ async fn run_shared_olap_aggregate<F>(
 where
     F: Fn(&str) -> String,
 {
-    let conn_str = format!("host=127.0.0.1 port={} user=ultrasql_bench", server.port());
+    let conn_str = format!("host=127.0.0.1 port={} user=bench_runner", server.port());
     let (client, connection) = tokio_postgres::connect(&conn_str, NoTls)
         .await
         .context("tokio-postgres connect to ultrasqld")?;
@@ -2722,7 +2722,7 @@ async fn run_shared_late_materialization(
     total_iters: usize,
     iters_us: &mut Vec<f64>,
 ) -> Result<serde_json::Value> {
-    let conn_str = format!("host=127.0.0.1 port={} user=ultrasql_bench", server.port());
+    let conn_str = format!("host=127.0.0.1 port={} user=bench_runner", server.port());
     let (client, connection) = tokio_postgres::connect(&conn_str, NoTls)
         .await
         .context("tokio-postgres connect to ultrasqld")?;
@@ -2875,7 +2875,7 @@ async fn run_shared_dashboard_aggregate(
     total_iters: usize,
     iters_us: &mut Vec<f64>,
 ) -> Result<serde_json::Value> {
-    let conn_str = format!("host=127.0.0.1 port={} user=ultrasql_bench", server.port());
+    let conn_str = format!("host=127.0.0.1 port={} user=bench_runner", server.port());
     let (client, connection) = tokio_postgres::connect(&conn_str, NoTls)
         .await
         .context("tokio-postgres connect to ultrasqld")?;
@@ -3024,7 +3024,7 @@ async fn run_shared_sparse_pruning(
     total_iters: usize,
     iters_us: &mut Vec<f64>,
 ) -> Result<serde_json::Value> {
-    let conn_str = format!("host=127.0.0.1 port={} user=ultrasql_bench", server.port());
+    let conn_str = format!("host=127.0.0.1 port={} user=bench_runner", server.port());
     let (client, connection) = tokio_postgres::connect(&conn_str, NoTls)
         .await
         .context("tokio-postgres connect to ultrasqld")?;
@@ -3107,7 +3107,7 @@ async fn run_shared_window_row_number(
     total_iters: usize,
     iters_us: &mut Vec<f64>,
 ) -> Result<()> {
-    let conn_str = format!("host=127.0.0.1 port={} user=ultrasql_bench", server.port());
+    let conn_str = format!("host=127.0.0.1 port={} user=bench_runner", server.port());
     let (client, connection) = tokio_postgres::connect(&conn_str, NoTls)
         .await
         .context("tokio-postgres connect to ultrasqld")?;
@@ -3262,7 +3262,7 @@ async fn run_shared_vector_topk(
     total_iters: usize,
     iters_us: &mut Vec<f64>,
 ) -> Result<VectorTopKCertification> {
-    let conn_str = format!("host=127.0.0.1 port={} user=ultrasql_bench", server.port());
+    let conn_str = format!("host=127.0.0.1 port={} user=bench_runner", server.port());
     let (client, connection) = tokio_postgres::connect(&conn_str, NoTls)
         .await
         .context("tokio-postgres connect to ultrasqld")?;
@@ -3574,7 +3574,7 @@ async fn run_mixed_oltp_iter(server: SocketAddr, n_rows: usize, ix: usize) -> Re
     /// without increasing the operation grouping beyond the SQLite baseline.
     const MIXED_BATCH_OPS: usize = 20;
 
-    let conn_str = format!("host=127.0.0.1 port={} user=ultrasql_bench", server.port());
+    let conn_str = format!("host=127.0.0.1 port={} user=bench_runner", server.port());
     let (client, connection) = tokio_postgres::connect(&conn_str, NoTls)
         .await
         .context("tokio-postgres connect to ultrasqld")?;

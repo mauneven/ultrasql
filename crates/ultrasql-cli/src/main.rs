@@ -2791,7 +2791,7 @@ mod tests {
         let server = std::sync::Arc::new(Server::with_sample_database());
         let handle = tokio::spawn(ultrasql_server::serve_listener(listener, server));
         let conn = format!(
-            "host={} port={} user=ultrasql_cli application_name=ultrasql_cli_test",
+            "host={} port={} user=cli_tester application_name=ultrasql_cli_test",
             bound.ip(),
             bound.port()
         );
@@ -2806,7 +2806,7 @@ mod tests {
             host: bound.ip().to_string(),
             port: bound.port(),
             dbname: "ultrasql".to_owned(),
-            user: "ultrasql_cli".to_owned(),
+            user: "cli_tester".to_owned(),
             password: None,
         };
         let mut session = Session::new(client, params);

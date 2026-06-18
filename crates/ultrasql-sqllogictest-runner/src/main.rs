@@ -399,7 +399,7 @@ async fn connect_ultrasql_target(cli: &Cli) -> Result<(Client, Option<InProcessS
             let server = Arc::new(ultrasql_server::Server::with_sample_database());
             let handle = tokio::spawn(ultrasql_server::serve_listener(listener, server));
             let conn_str = format!(
-                "host={host} port={port} user=ultrasql_slt application_name=ultrasql_slt",
+                "host={host} port={port} user=slt_runner application_name=ultrasql_slt",
                 host = bound.ip(),
                 port = bound.port()
             );

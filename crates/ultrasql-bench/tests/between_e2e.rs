@@ -47,7 +47,7 @@ async fn spawn_server() -> Result<SocketAddr> {
 /// task whose lifetime ends when the test drops the client.
 async fn connect(addr: SocketAddr) -> Result<Client> {
     let conn_str = format!(
-        "host=127.0.0.1 port={} user=ultrasql_between_test",
+        "host=127.0.0.1 port={} user=between_test",
         addr.port()
     );
     let (client, connection) = tokio_postgres::connect(&conn_str, NoTls)

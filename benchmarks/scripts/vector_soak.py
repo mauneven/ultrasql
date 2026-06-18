@@ -154,14 +154,12 @@ def load_phase(args) -> int:
     for t in threads:
         t.join()
 
-    # Flush committed state to disk before the wrapper hard-crashes the server.
-    # Recovery of *un-checkpointed* writes produced under concurrency currently
-    # has a heap WAL-replay bug (tracked in ROADMAP / flagged separately), so the
-    # soak verifies durability of checkpointed state across a SIGKILL.
-    ckpt = psycopg.connect(args.dsn, autocommit=True)
-    ckpt.cursor().execute("CHECKPOINT")
-    ckpt.close()
-
+    # Intentionally NO checkpoint here: the wrapper hard-crashes the server
+    # next, so recovery must replay the *un-checkpointed* concurrent writes
+    # from the WAL. This is the durability the soak is here to prove. (A prior
+    # heap WAL-replay bug mis-ordered concurrent insert slots on recovery and
+    # forced a CHECKPOINT workaround here; that bug is fixed — see the
+    # crash-recovery regression tests in crates/ultrasql-storage.)
     expected_count = args.base + state["inserts"]
     probes = []
     for i in range(0, args.base, max(1, args.base // args.probe_samples)):

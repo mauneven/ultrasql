@@ -104,6 +104,12 @@ pub enum PageError {
     #[error("slot {0} is not live")]
     DeadSlot(u16),
 
+    /// An absolute-slot placement targeted a slot that already holds a
+    /// live tuple. Recovery redo is expected to check for this case and
+    /// treat it as an idempotent no-op.
+    #[error("slot {0} already holds a live tuple")]
+    SlotOccupied(u16),
+
     /// The on-disk page version is not understood by this build.
     #[error("unsupported page version {0}")]
     UnsupportedVersion(u8),
@@ -646,6 +652,107 @@ impl Page {
         Ok(idx)
     }
 
+    /// Write `tuple` into the page at the **exact** slot index `slot`,
+    /// growing the slot directory with `Unused` placeholders as needed.
+    ///
+    /// Unlike [`Self::insert_tuple`] / [`Self::insert_tuple_appended`],
+    /// which append to the next free slot, this honours an absolute slot.
+    /// It is the WAL-recovery redo primitive for heap inserts: under
+    /// concurrent writers the LSN order of a page's insert records can
+    /// diverge from the slot order those inserts took (slot allocation
+    /// happens under the page lock, but the WAL append happens after the
+    /// lock is released, so two inserters can append in the opposite
+    /// order). Append-based redo would then mis-place a tuple — or refuse
+    /// the record outright with a slot-mismatch error — and abort
+    /// recovery, losing every committed row on the page. Placing each
+    /// tuple at the slot its record recorded is order-independent and so
+    /// always reconstructs the page the emit side produced.
+    ///
+    /// Behaviour by slot state:
+    /// - `slot >= slot_count`: the directory grows to `slot + 1` entries;
+    ///   any gap entries in `[slot_count, slot)` are written `Unused` so a
+    ///   later record can fill them (or so they remain harmless reusable
+    ///   holes if that record never arrives — e.g. a torn WAL tail).
+    /// - `slot < slot_count` and the slot is `Unused`: the placeholder is
+    ///   filled in place.
+    /// - `slot < slot_count` and the slot already points to a live tuple:
+    ///   returns [`PageError::SlotOccupied`] so the caller can detect a
+    ///   non-idempotent re-application.
+    pub fn insert_tuple_at_slot(&mut self, slot: SlotIndex, tuple: &[u8]) -> Result<(), PageError> {
+        let tuple_len = u32::try_from(tuple.len())
+            .map_err(|_| PageError::Malformed("tuple too large for page"))?;
+        if tuple_len > ItemId::MAX_LENGTH {
+            return Err(PageError::Malformed("tuple length exceeds itemid"));
+        }
+
+        let mut header = self.header();
+        let slot_count = header.slot_count();
+
+        // Determine how many new directory entries we must allocate to
+        // reach `slot` (including `slot` itself). When `slot` already
+        // exists it must be an `Unused` placeholder to be fillable.
+        let new_slots = if slot >= slot_count {
+            usize::from(slot)
+                .checked_add(1)
+                .and_then(|end| end.checked_sub(usize::from(slot_count)))
+                .ok_or(PageError::Malformed("slot directory growth overflow"))?
+        } else {
+            if self.read_item_id(slot).is_normal() {
+                return Err(PageError::SlotOccupied(slot));
+            }
+            0
+        };
+
+        let needed_data = tuple.len();
+        let needed_slot = new_slots
+            .checked_mul(ITEMID_SIZE)
+            .ok_or(PageError::Malformed("slot directory growth overflow"))?;
+        let needed = needed_data
+            .checked_add(needed_slot)
+            .ok_or(PageError::Malformed("tuple size overflow"))?;
+        let free = header.try_free_space()?;
+        if free < needed {
+            return Err(PageError::NoSpace {
+                needed,
+                available: free,
+            });
+        }
+
+        let new_upper = usize::from(header.upper)
+            .checked_sub(needed_data)
+            .ok_or(PageError::Malformed("tuple upper underflow"))?;
+        let tuple_end = new_upper
+            .checked_add(tuple.len())
+            .ok_or(PageError::Malformed("tuple range overflow"))?;
+        self.bytes[new_upper..tuple_end].copy_from_slice(tuple);
+
+        let item = ItemId::new(
+            item_offset_from_usize(new_upper)?,
+            tuple_len,
+            ItemIdFlags::Normal,
+        );
+
+        if new_slots > 0 {
+            // Backfill any gap slots in `[slot_count, slot)` with `Unused`
+            // placeholders before writing the target slot, then grow
+            // `lower` to cover the whole extended directory at once.
+            for gap in slot_count..slot {
+                self.write_item_id(gap, ItemId::new(0, 0, ItemIdFlags::Unused));
+            }
+            self.write_item_id(slot, item);
+            let new_lower = usize::from(header.lower)
+                .checked_add(needed_slot)
+                .ok_or(PageError::Malformed("page lower overflow"))?;
+            header.lower = page_u16_from_usize(new_lower, "page lower")?;
+        } else {
+            self.write_item_id(slot, item);
+        }
+
+        header.upper = page_u16_from_usize(new_upper, "page upper")?;
+        header.encode(&mut self.bytes);
+        Ok(())
+    }
+
     /// Read a tuple by slot index. Returns a slice into the page's
     /// data area.
     pub fn read_tuple(&self, slot: SlotIndex) -> Result<&[u8], PageError> {
@@ -1122,5 +1229,51 @@ mod tests {
             err,
             PageError::Malformed("slot directory out of bounds")
         ));
+    }
+
+    #[test]
+    fn insert_tuple_at_slot_fills_gap_out_of_order() {
+        // Simulates WAL redo arriving in slot-reversed order: write the
+        // higher slot first (leaving a hole) and then backfill the hole.
+        let mut page = Page::new_heap();
+
+        // Slot 2 arrives before slots 0 and 1 exist.
+        page.insert_tuple_at_slot(2, b"row-2").unwrap();
+        assert_eq!(
+            page.header().slot_count(),
+            3,
+            "directory grew to cover slot 2"
+        );
+        assert_eq!(page.read_tuple(2).unwrap(), b"row-2");
+        // The gap slots 0 and 1 are Unused placeholders, not readable yet.
+        assert!(matches!(page.read_tuple(0), Err(PageError::DeadSlot(0))));
+        assert!(matches!(page.read_tuple(1), Err(PageError::DeadSlot(1))));
+
+        // Backfill the holes in any order.
+        page.insert_tuple_at_slot(0, b"row-0").unwrap();
+        page.insert_tuple_at_slot(1, b"row-1").unwrap();
+
+        assert_eq!(page.header().slot_count(), 3, "no new slots added");
+        assert_eq!(page.read_tuple(0).unwrap(), b"row-0");
+        assert_eq!(page.read_tuple(1).unwrap(), b"row-1");
+        assert_eq!(page.read_tuple(2).unwrap(), b"row-2");
+    }
+
+    #[test]
+    fn insert_tuple_at_slot_appends_when_slot_is_next() {
+        let mut page = Page::new_heap();
+        page.insert_tuple_at_slot(0, b"a").unwrap();
+        page.insert_tuple_at_slot(1, b"b").unwrap();
+        assert_eq!(page.header().slot_count(), 2);
+        assert_eq!(page.read_tuple(0).unwrap(), b"a");
+        assert_eq!(page.read_tuple(1).unwrap(), b"b");
+    }
+
+    #[test]
+    fn insert_tuple_at_slot_rejects_occupied_live_slot() {
+        let mut page = Page::new_heap();
+        page.insert_tuple_at_slot(0, b"a").unwrap();
+        let err = page.insert_tuple_at_slot(0, b"again").unwrap_err();
+        assert!(matches!(err, PageError::SlotOccupied(0)));
     }
 }

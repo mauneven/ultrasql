@@ -110,10 +110,9 @@ LOAD_STATUS=$?
 set -e
 
 # Phase 2 — hard crash (SIGKILL) and restart on the same data dir. The load
-# phase issues a CHECKPOINT first; recovery of un-checkpointed writes produced
-# under concurrency is a known heap WAL-replay gap (see ROADMAP), so the soak
-# asserts durability of checkpointed state across an abrupt kill.
-echo "--- checkpointed; crashing server (SIGKILL) and restarting ---"
+# phase does NOT checkpoint, so recovery must replay the un-checkpointed
+# concurrent writes from the WAL — the durability this soak exists to prove.
+echo "--- crashing server (SIGKILL, no checkpoint) and restarting ---"
 kill -9 "$SRV" >/dev/null 2>&1 || true
 wait "$SRV" >/dev/null 2>&1 || true
 SRV=""
@@ -146,9 +145,11 @@ doc = {
     "load_ok": load_status == 0,
     "crash": "SIGKILL",
     "recovery_note": (
-        "Durability is verified across a SIGKILL after a CHECKPOINT. Recovery of "
-        "un-checkpointed writes produced under concurrency is a known heap "
-        "WAL-replay gap, tracked in ROADMAP.md (P2 vector/storage)."
+        "Durability is verified across a SIGKILL with NO preceding CHECKPOINT: "
+        "recovery replays the un-checkpointed concurrent writes from the WAL. "
+        "The earlier heap WAL-replay gap (concurrent insert slots mis-ordered on "
+        "redo) is fixed; see the crash-recovery regression tests in "
+        "crates/ultrasql-storage (wal_applier + recovery_sim)."
     ),
     "durable_after_restart": result.get("durable"),
     "count_after_restart": result.get("count_after_restart"),
@@ -159,10 +160,10 @@ doc = {
     "generated_at_unix": int(time.time()),
     "host": {"os": platform.platform(), "machine": platform.machine()},
     "policy": (
-        "Sustained concurrent ANN reads + far-region writes, then a CHECKPOINT "
-        "and a SIGKILL + restart. Pass requires error-free load, recall above the "
-        "floor both during load and after recovery, and every committed row "
-        "durable after the abrupt restart."
+        "Sustained concurrent ANN reads + far-region writes, then a SIGKILL + "
+        "restart with no intervening CHECKPOINT. Pass requires error-free load, "
+        "recall above the floor both during load and after recovery, and every "
+        "committed row durable after the abrupt restart via WAL replay."
     ),
 }
 with open(manifest, "w", encoding="utf-8") as f:

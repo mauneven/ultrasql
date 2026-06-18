@@ -58,7 +58,9 @@ while time.time() < deadline:
 sys.exit("ultrasqld did not become ready")
 PY
 
-ULTRASQL_DSN="host=127.0.0.1 port=${PORT} user=ultrasql_bench dbname=ultrasql_bench sslmode=disable gssencmode=disable" \
+# The `ultrasql_` role-name prefix is reserved for system roles; connect as
+# the bootstrap `ultrasql` superuser instead of a phantom `ultrasql_bench`.
+ULTRASQL_DSN="host=127.0.0.1 port=${PORT} user=ultrasql dbname=ultrasql_bench sslmode=disable gssencmode=disable" \
     python3 benchmarks/scripts/filtered_ann_recall.py \
     --rows "$FANN_ROWS" --dims "$FANN_DIMS" --queries "$FANN_QUERIES" \
     --out "$FANN_OUT"

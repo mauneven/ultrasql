@@ -77,7 +77,10 @@ while time.time() < deadline:
         time.sleep(0.05)
 sys.exit("ultrasqld did not become ready")
 PY
-ULTRASQL_DSN="host=127.0.0.1 port=${PORT} user=ultrasql_bench dbname=ultrasql_bench sslmode=disable gssencmode=disable"
+# The `ultrasql_` role-name prefix is reserved for system roles, so connect
+# as the bootstrap `ultrasql` superuser (a phantom `ultrasql_bench` login is
+# rejected and would also break crash recovery if it owned objects).
+ULTRASQL_DSN="host=127.0.0.1 port=${PORT} user=ultrasql dbname=ultrasql_bench sslmode=disable gssencmode=disable"
 
 # --- pgvector: ensure the same-host PG17 cluster is up ---
 PG_DSN=""

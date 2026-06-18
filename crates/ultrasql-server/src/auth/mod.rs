@@ -30,7 +30,8 @@ pub mod scram;
 pub use connection_limit::{ConnectionLimitError, RoleConnectionLimiter};
 pub use hba::{HbaConfig, HbaConnectionKind, HbaDatabaseMatch, HbaMethod, HbaRule, HbaUserMatch};
 pub use pg_authid::{
-    AuthCatalog, InMemoryAuthCatalog, PasswordHash, RoleEntry, RoleEntryChanges, RoleMembership,
+    AuthCatalog, InMemoryAuthCatalog, PasswordHash, RESERVED_ROLE_PREFIX, RoleEntry,
+    RoleEntryChanges, RoleMembership, is_reserved_role_name,
 };
 pub use privileges::{
     DefaultPrivilegeGrant, DefaultPrivilegeUpdate, InMemoryPrivilegeCatalog, PrivilegeGrant,

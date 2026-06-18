@@ -146,11 +146,16 @@ impl<L: PageLoader + 'static> HeapTarget for HeapAccess<L> {
                 }
             }
 
-            // Write the tuple bytes into the page.
-            page.insert_tuple(&payload.tuple_bytes)
+            // Write the tuple at the EXACT recorded slot rather than
+            // appending. Under concurrency the WAL order of inserts on a
+            // page can diverge from the slot order they took, so an
+            // append would land the tuple in the wrong slot; placing it
+            // at `tid.slot` is order-independent. See
+            // `Page::insert_tuple_at_slot`.
+            page.insert_tuple_at_slot(payload.tid.slot, &payload.tuple_bytes)
                 .map_err(|e| ApplyError::Refused {
                     operation: "heap_insert",
-                    detail: format!("insert_tuple: {e}"),
+                    detail: format!("insert_tuple_at_slot: {e}"),
                 })?;
             stamp_replayed_lsn(&mut page, record_lsn);
         }
@@ -191,21 +196,20 @@ impl<L: PageLoader + 'static> HeapTarget for HeapAccess<L> {
                 continue;
             }
 
-            let actual_slot =
-                page.insert_tuple(&entry.tuple_bytes)
-                    .map_err(|e| ApplyError::Refused {
-                        operation: "heap_insert_batch",
-                        detail: format!("insert_tuple: {e}"),
-                    })?;
-            if actual_slot != entry.slot {
-                return Err(ApplyError::Refused {
+            // Place each row at its EXACT recorded slot. Appending here is
+            // unsound: concurrent writers allocate slots under the page
+            // lock but append their WAL records after releasing it, so the
+            // records for one page can reach the log in a different order
+            // than the slots they took. An append-based redo of such a
+            // stream mis-orders the slots and the old code aborted recovery
+            // with "slot mismatch: expected N, inserted N-1", losing every
+            // committed row. `insert_tuple_at_slot` reconstructs the exact
+            // slot layout regardless of record order.
+            page.insert_tuple_at_slot(entry.slot, &entry.tuple_bytes)
+                .map_err(|e| ApplyError::Refused {
                     operation: "heap_insert_batch",
-                    detail: format!(
-                        "slot mismatch: expected {}, inserted {actual_slot}",
-                        entry.slot
-                    ),
-                });
-            }
+                    detail: format!("insert_tuple_at_slot: {e}"),
+                })?;
         }
         stamp_replayed_lsn(&mut page, record_lsn);
         Ok(())
@@ -247,17 +251,21 @@ impl<L: PageLoader + 'static> HeapTarget for HeapAccess<L> {
             let mut page = guard.write();
             if !should_skip_redo(&page, record_lsn) {
                 let slot_count = page.header().slot_count();
-                if payload.new_tid.slot >= slot_count
-                    || page
+                let already_filled = payload.new_tid.slot < slot_count
+                    && page
                         .read_tuple(payload.new_tid.slot)
-                        .map_or(true, <[u8]>::is_empty)
-                {
-                    page.insert_tuple(&payload.new_tuple_bytes).map_err(|e| {
-                        ApplyError::Refused {
+                        .is_ok_and(|existing| !existing.is_empty());
+                if !already_filled {
+                    // Place the new version at its EXACT recorded slot. A
+                    // non-HOT update allocates a fresh slot, which under
+                    // concurrency can be WAL-ordered out of slot order on
+                    // the page (same hazard as inserts); appending would
+                    // mis-place it. See `Page::insert_tuple_at_slot`.
+                    page.insert_tuple_at_slot(payload.new_tid.slot, &payload.new_tuple_bytes)
+                        .map_err(|e| ApplyError::Refused {
                             operation: "heap_update_new",
-                            detail: format!("insert_tuple: {e}"),
-                        }
-                    })?;
+                            detail: format!("insert_tuple_at_slot: {e}"),
+                        })?;
                 }
                 stamp_replayed_lsn(&mut page, record_lsn);
             }
@@ -1363,6 +1371,74 @@ mod tests {
         assert_eq!(heap.fetch(tid0).unwrap().tid, tid0);
         assert_eq!(heap.fetch(tid1).unwrap().tid, tid1);
         assert_eq!(heap.block_count(rel()), 1);
+    }
+
+    /// Regression: under concurrent writers the WAL order of a page's
+    /// insert-batch records can diverge from the slot order those inserts
+    /// took, so a later-allocated slot can be logged (and thus replayed)
+    /// before an earlier one. The applier must reconstruct the recorded
+    /// slots regardless of arrival order. The previous append-based redo
+    /// aborted recovery here with "slot mismatch: expected 1, inserted 0",
+    /// which on a real server means every committed row on the page is
+    /// lost on the next restart.
+    #[test]
+    fn apply_insert_batch_replays_slot_reversed_records() {
+        let heap = make_heap();
+        let tid0 = tuple_id(0, 0);
+        let tid1 = tuple_id(0, 1);
+
+        // Record for the higher slot (1) arrives first — exactly the
+        // ordering a concurrent second inserter produces when it appends
+        // its WAL record before the first inserter does.
+        let record_slot1 = HeapInsertBatchPayload {
+            page: page_id(0),
+            entries: vec![HeapInsertBatchEntry {
+                slot: 1,
+                tuple_bytes: minimal_tuple(11, tid1),
+            }],
+        };
+        let record_slot0 = HeapInsertBatchPayload {
+            page: page_id(0),
+            entries: vec![HeapInsertBatchEntry {
+                slot: 0,
+                tuple_bytes: minimal_tuple(10, tid0),
+            }],
+        };
+
+        heap.apply_insert_batch(&record_slot1).unwrap();
+        heap.apply_insert_batch(&record_slot0).unwrap();
+
+        // Both rows land in their recorded slots with the right contents.
+        assert_eq!(heap.fetch(tid0).unwrap().header.xmin, Xid::new(10));
+        assert_eq!(heap.fetch(tid1).unwrap().header.xmin, Xid::new(11));
+
+        // Re-applying the same stream is idempotent (recovery may run twice).
+        heap.apply_insert_batch(&record_slot1).unwrap();
+        heap.apply_insert_batch(&record_slot0).unwrap();
+        assert_eq!(heap.fetch(tid0).unwrap().header.xmin, Xid::new(10));
+        assert_eq!(heap.fetch(tid1).unwrap().header.xmin, Xid::new(11));
+    }
+
+    /// Same divergence hazard for the single-row `HeapInsert` redo path.
+    #[test]
+    fn apply_insert_replays_slot_reversed_records() {
+        let heap = make_heap();
+        let tid0 = tuple_id(0, 0);
+        let tid1 = tuple_id(0, 1);
+
+        heap.apply_insert(&HeapInsertPayload {
+            tid: tid1,
+            tuple_bytes: minimal_tuple(21, tid1),
+        })
+        .unwrap();
+        heap.apply_insert(&HeapInsertPayload {
+            tid: tid0,
+            tuple_bytes: minimal_tuple(20, tid0),
+        })
+        .unwrap();
+
+        assert_eq!(heap.fetch(tid0).unwrap().header.xmin, Xid::new(20));
+        assert_eq!(heap.fetch(tid1).unwrap().header.xmin, Xid::new(21));
     }
 
     #[test]

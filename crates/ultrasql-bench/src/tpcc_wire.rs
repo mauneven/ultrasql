@@ -129,7 +129,7 @@ impl Target {
                     })
                     .context("spawn ultrasql server thread")?;
                 Ok(Self {
-                    dsn: format!("host=127.0.0.1 port={} user=ultrasql_bench", bound.port()),
+                    dsn: format!("host=127.0.0.1 port={} user=bench_runner", bound.port()),
                 })
             }
         }

@@ -228,7 +228,7 @@ pub fn run_ultrasql(
             }
         });
 
-        let conn_str = format!("host=127.0.0.1 port={} user=ultrasql_bench", bound.port());
+        let conn_str = format!("host=127.0.0.1 port={} user=bench_runner", bound.port());
         let (client, connection) = tokio_postgres::connect(&conn_str, NoTls)
             .await
             .context("tokio-postgres connect to ultrasqld")?;
@@ -420,7 +420,7 @@ pub fn run_ultrasql_result_outcomes(
             }
         });
 
-        let conn_str = format!("host=127.0.0.1 port={} user=ultrasql_bench", bound.port());
+        let conn_str = format!("host=127.0.0.1 port={} user=bench_runner", bound.port());
         let (client, connection) = tokio_postgres::connect(&conn_str, NoTls)
             .await
             .context("tokio-postgres connect to ultrasqld")?;
