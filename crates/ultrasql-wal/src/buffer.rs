@@ -23,12 +23,28 @@
 //!   via an `AtomicU64` so observers (waiting committers) can poll it
 //!   without blocking the append path.
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::time::Duration;
 
-use parking_lot::Mutex;
+use parking_lot::{Condvar, Mutex, MutexGuard};
 use ultrasql_core::Lsn;
 
 use crate::record::{RecordType, WalRecord, WalRecordError, append_encoded_parts_to};
+
+/// Wakes the buffer's drainer (the WAL writer) so it frees capacity promptly
+/// when an appender is blocked applying backpressure.
+///
+/// The WAL writer registers itself through [`WalBuffer::set_drainer`]. When an
+/// append finds the buffer transiently full it calls [`Self::request_drain`]
+/// before parking, so the writer drains on its next loop instead of waiting out
+/// its group-commit window. The signal is best-effort: a buffer with no drainer
+/// registered falls back to rejecting a full append (see [`WalBuffer::append`]),
+/// which preserves the historical behaviour for bare buffers in tests.
+pub trait WalDrainSignal: Send + Sync {
+    /// Ask the drainer to drain the buffer without waiting out its window.
+    fn request_drain(&self);
+}
 
 /// Errors from the WAL append path.
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
@@ -45,6 +61,10 @@ pub enum WalBufferError {
         /// Configured capacity.
         capacity: usize,
     },
+    /// The buffer was closed (the WAL writer stopped) while an append was
+    /// waiting for capacity. No further records can be accepted.
+    #[error("wal buffer closed: writer stopped")]
+    Closed,
     /// The append would advance the WAL byte-position beyond `u64::MAX`.
     #[error("wal lsn overflow: current {current}, append {bytes} bytes")]
     LsnOverflow {
@@ -70,11 +90,31 @@ pub enum WalBufferError {
 }
 
 /// In-memory WAL append buffer.
-#[derive(Debug)]
 pub struct WalBuffer {
     inner: Mutex<Inner>,
+    /// Signalled whenever a drain frees capacity, so appenders parked on
+    /// backpressure can retry.
+    space_available: Condvar,
+    /// Registered drainer (the WAL writer) used to request a prompt drain when
+    /// an appender is parked. `None` until a writer wires itself up; while it is
+    /// `None` a full append is rejected instead of waiting.
+    drainer: Mutex<Option<Arc<dyn WalDrainSignal>>>,
+    /// Set once the writer has stopped; unblocks any parked appenders so they
+    /// fail fast instead of waiting forever for a drain that will never come.
+    closed: AtomicBool,
     durable_lsn: AtomicU64,
     capacity: usize,
+}
+
+impl std::fmt::Debug for WalBuffer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WalBuffer")
+            .field("inner", &self.inner)
+            .field("closed", &self.closed.load(Ordering::Relaxed))
+            .field("durable_lsn", &self.durable_lsn())
+            .field("capacity", &self.capacity)
+            .finish_non_exhaustive()
+    }
 }
 
 #[derive(Debug)]
@@ -93,6 +133,9 @@ impl WalBuffer {
                 bytes: Vec::with_capacity(capacity),
                 next_lsn: initial_lsn.raw(),
             }),
+            space_available: Condvar::new(),
+            drainer: Mutex::new(None),
+            closed: AtomicBool::new(false),
             durable_lsn: AtomicU64::new(initial_lsn.raw()),
             capacity,
         }
@@ -102,6 +145,92 @@ impl WalBuffer {
     #[must_use]
     pub const fn capacity(&self) -> usize {
         self.capacity
+    }
+
+    /// Register the drainer (the WAL writer) that frees buffer capacity.
+    ///
+    /// Once a drainer is set, an append that finds the buffer transiently full
+    /// applies backpressure — it parks until the drainer frees space — instead
+    /// of returning [`WalBufferError::Full`]. Without a drainer (e.g. a bare
+    /// buffer in a unit test) a full append is rejected as before.
+    pub fn set_drainer(&self, drainer: Arc<dyn WalDrainSignal>) {
+        *self.drainer.lock() = Some(drainer);
+    }
+
+    /// Mark the buffer closed and wake every parked appender.
+    ///
+    /// The WAL writer calls this when it stops — clean shutdown, fatal error, or
+    /// panic — so appenders parked on backpressure observe
+    /// [`WalBufferError::Closed`] rather than waiting forever for a drain that
+    /// will never arrive. Idempotent.
+    pub fn close_appends(&self) {
+        self.closed.store(true, Ordering::Release);
+        self.space_available.notify_all();
+    }
+
+    /// Defensive re-check interval for a parked appender. Backpressure wakeups
+    /// are signalled precisely on every drain, so this bounded wait is only a
+    /// backstop: it lets a parked appender re-poke the drainer and re-observe
+    /// `closed` even in the (not-expected) event that a wakeup is missed.
+    const BACKPRESSURE_RECHECK: Duration = Duration::from_millis(100);
+
+    /// Acquire the append lock with at least `record_len` bytes of free
+    /// capacity, applying backpressure if necessary.
+    ///
+    /// Returns the held [`Inner`] guard ready for the caller to assign an LSN
+    /// and encode into. Behaviour when the record does not currently fit:
+    ///
+    /// - A record wider than the whole buffer can never be admitted and is
+    ///   rejected immediately with [`WalBufferError::Full`] — never an infinite
+    ///   wait.
+    /// - A *transiently* full buffer parks the caller until a drain frees space
+    ///   when a drainer is registered, or is rejected with
+    ///   [`WalBufferError::Full`] when none is.
+    /// - A buffer whose writer has stopped returns [`WalBufferError::Closed`].
+    ///
+    /// Backpressure performs no filesystem I/O and acquires no buffer-pool page
+    /// latch or storage lock — it only waits on the WAL writer, which is
+    /// independent of the page-latch world. Holding a page guard across this
+    /// wait is therefore deadlock-free, which is what lets heap callers keep
+    /// appending page-local records under their page guard.
+    fn reserve(&self, record_len: usize) -> Result<MutexGuard<'_, Inner>, WalBufferError> {
+        let mut inner = self.inner.lock();
+        loop {
+            if self.closed.load(Ordering::Acquire) {
+                return Err(WalBufferError::Closed);
+            }
+            let used = inner.bytes.len();
+            if used
+                .checked_add(record_len)
+                .is_some_and(|needed| needed <= self.capacity)
+            {
+                return Ok(inner);
+            }
+            // A record wider than the entire buffer can never be admitted, no
+            // matter how much the writer drains — reject rather than hang.
+            if record_len > self.capacity {
+                return Err(WalBufferError::Full {
+                    used,
+                    capacity: self.capacity,
+                });
+            }
+            // Transiently full. Apply backpressure only when a drainer can free
+            // space; otherwise preserve the historical reject-on-full contract.
+            let drainer = self.drainer.lock().clone();
+            match drainer {
+                Some(drainer) => drainer.request_drain(),
+                None => {
+                    return Err(WalBufferError::Full {
+                        used,
+                        capacity: self.capacity,
+                    });
+                }
+            }
+            // Park until the writer drains (`space_available`) or stops
+            // (`closed`). The bounded wait re-pokes/re-checks defensively.
+            self.space_available
+                .wait_for(&mut inner, Self::BACKPRESSURE_RECHECK);
+        }
     }
 
     /// LSN that the flusher has committed durably. Visible to every
@@ -145,22 +274,7 @@ impl WalBuffer {
             }
         })?;
         let lsn = {
-            let mut inner = self.inner.lock();
-            let used_after =
-                inner
-                    .bytes
-                    .len()
-                    .checked_add(record_len)
-                    .ok_or(WalBufferError::Full {
-                        used: inner.bytes.len(),
-                        capacity: self.capacity,
-                    })?;
-            if used_after > self.capacity {
-                return Err(WalBufferError::Full {
-                    used: inner.bytes.len(),
-                    capacity: self.capacity,
-                });
-            }
+            let mut inner = self.reserve(record_len)?;
             let lsn = inner.next_lsn;
             inner.next_lsn =
                 inner
@@ -197,22 +311,7 @@ impl WalBuffer {
                 bytes: byte_len,
             })?;
         let lsn = {
-            let mut inner = self.inner.lock();
-            let used_after =
-                inner
-                    .bytes
-                    .len()
-                    .checked_add(record_len)
-                    .ok_or(WalBufferError::Full {
-                        used: inner.bytes.len(),
-                        capacity: self.capacity,
-                    })?;
-            if used_after > self.capacity {
-                return Err(WalBufferError::Full {
-                    used: inner.bytes.len(),
-                    capacity: self.capacity,
-                });
-            }
+            let mut inner = self.reserve(record_len)?;
             let lsn = inner.next_lsn;
             inner.next_lsn =
                 inner
@@ -257,6 +356,13 @@ impl WalBuffer {
         let end_lsn = inner.next_lsn;
         std::mem::swap(&mut inner.bytes, bytes);
         drop(inner);
+
+        // Freeing capacity unblocks appenders parked on backpressure. Only
+        // signal when this drain actually moved bytes out; an empty drain
+        // changes nothing, and no appender can be parked on an empty buffer.
+        if !bytes.is_empty() {
+            self.space_available.notify_all();
+        }
 
         let byte_len = u64::try_from(bytes.len())
             .map_err(|_| WalBufferError::BufferedBytesOverflow { bytes: bytes.len() })?;
@@ -519,5 +625,123 @@ mod tests {
             .append(&rec(RecordType::HeapInsert, b"x", Lsn::ZERO))
             .unwrap();
         assert!(buf.next_lsn() > Lsn::new(100));
+    }
+
+    /// A drainer that only counts pokes; the test thread performs the drain
+    /// that actually frees space.
+    struct CountingDrainer(std::sync::Arc<std::sync::atomic::AtomicUsize>);
+
+    impl WalDrainSignal for CountingDrainer {
+        fn request_drain(&self) {
+            self.0.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    #[test]
+    fn backpressure_parks_append_until_a_drain_frees_space() {
+        use std::sync::atomic::AtomicUsize;
+        use std::thread;
+
+        // 64 bytes fits one ~45-byte record but not two, so the second append
+        // cannot proceed until a drain frees space.
+        let buf = Arc::new(WalBuffer::new(64, Lsn::ZERO));
+        let pokes = Arc::new(AtomicUsize::new(0));
+        buf.set_drainer(Arc::new(CountingDrainer(Arc::clone(&pokes))));
+
+        buf.append(&rec(
+            RecordType::HeapInsert,
+            b"first-record-payload",
+            Lsn::ZERO,
+        ))
+        .expect("first append fits");
+        assert!(buf.buffered_bytes() > 0);
+
+        let appender_buf = Arc::clone(&buf);
+        let appender = thread::spawn(move || {
+            appender_buf
+                .append(&rec(
+                    RecordType::HeapInsert,
+                    b"second-record-payload",
+                    Lsn::ZERO,
+                ))
+                .map(|_| ())
+        });
+
+        // The test thread deliberately does NOT drain until the appender has
+        // parked (it pokes the drainer immediately before parking), which makes
+        // the park deterministic rather than timing-dependent.
+        while pokes.load(Ordering::Relaxed) == 0 {
+            thread::yield_now();
+        }
+        // Free space; loop only to be robust against a park/notify race.
+        while !appender.is_finished() {
+            let _ = buf.drain().expect("drain succeeds");
+            thread::sleep(Duration::from_millis(1));
+        }
+        appender
+            .join()
+            .expect("appender thread joins")
+            .expect("second append succeeds via backpressure rather than erroring");
+    }
+
+    #[test]
+    fn close_appends_releases_parked_appender_with_closed_error() {
+        use std::sync::atomic::AtomicUsize;
+        use std::thread;
+
+        let buf = Arc::new(WalBuffer::new(64, Lsn::ZERO));
+        let pokes = Arc::new(AtomicUsize::new(0));
+        buf.set_drainer(Arc::new(CountingDrainer(Arc::clone(&pokes))));
+        buf.append(&rec(
+            RecordType::HeapInsert,
+            b"first-record-payload",
+            Lsn::ZERO,
+        ))
+        .expect("first append fits");
+
+        let appender_buf = Arc::clone(&buf);
+        let appender = thread::spawn(move || {
+            appender_buf.append(&rec(
+                RecordType::HeapInsert,
+                b"second-record-payload",
+                Lsn::ZERO,
+            ))
+        });
+
+        // Wait until the appender parks, then close the buffer (never drain).
+        while pokes.load(Ordering::Relaxed) == 0 {
+            thread::yield_now();
+        }
+        while !appender.is_finished() {
+            buf.close_appends();
+            thread::sleep(Duration::from_millis(1));
+        }
+
+        let err = appender
+            .join()
+            .expect("appender thread joins")
+            .expect_err("append on a closed buffer must fail rather than hang");
+        assert!(matches!(err, WalBufferError::Closed), "{err:?}");
+    }
+
+    #[test]
+    fn transient_full_without_drainer_still_rejects() {
+        // No drainer registered → preserve the historical reject-on-full
+        // contract for bare buffers so nothing parks forever.
+        let buf = WalBuffer::new(64, Lsn::ZERO);
+        buf.append(&rec(
+            RecordType::HeapInsert,
+            b"first-record-payload",
+            Lsn::ZERO,
+        ))
+        .expect("first append fits");
+        let err = buf
+            .append(&rec(
+                RecordType::HeapInsert,
+                b"second-record-payload",
+                Lsn::ZERO,
+            ))
+            .expect_err("a transiently full buffer with no drainer rejects");
+        assert!(matches!(err, WalBufferError::Full { .. }), "{err:?}");
     }
 }

@@ -44,7 +44,7 @@ use parking_lot::{Condvar, Mutex};
 use tracing::{debug, error, info, warn};
 use ultrasql_core::Lsn;
 
-use crate::buffer::{WalBuffer, WalBufferError};
+use crate::buffer::{WalBuffer, WalBufferError, WalDrainSignal};
 use crate::record::WalRecordError;
 use crate::segment::{list_segments, segment_path};
 
@@ -184,6 +184,30 @@ impl Shared {
     }
 }
 
+impl WalDrainSignal for Shared {
+    /// Wake the writer to drain the buffer promptly when an appender is parked
+    /// on backpressure. This bumps the wake epoch (so a writer about to sleep
+    /// re-loops and drains instead) without forcing an fsync — freeing buffer
+    /// capacity only requires a drain, not a durability boundary.
+    fn request_drain(&self) {
+        {
+            let mut state = self.wake_mutex.lock();
+            state.epoch = state.epoch.wrapping_add(1);
+        }
+        self.wake_cv.notify_one();
+    }
+}
+
+/// Drop guard that releases appenders parked on backpressure when the writer
+/// thread exits for any reason — clean return, fatal error, or panic unwind.
+struct DrainCloser(Arc<WalBuffer>);
+
+impl Drop for DrainCloser {
+    fn drop(&mut self) {
+        self.0.close_appends();
+    }
+}
+
 /// Owning handle to the background WAL writer thread.
 #[derive(Debug)]
 pub struct WalWriter {
@@ -227,6 +251,9 @@ impl WalWriter {
         let handle = thread::Builder::new()
             .name(String::from("ultrasql-wal-writer"))
             .spawn(move || {
+                // Release any backpressured appenders if this thread ever exits
+                // (clean return, error, or panic) so they cannot wait forever.
+                let _closer = DrainCloser(Arc::clone(&thread_buffer));
                 let mut driver =
                     WriterDriver::new(thread_dir, thread_buffer, thread_shared, config, next_index);
                 let result = driver.run();
@@ -235,6 +262,12 @@ impl WalWriter {
                 }
                 result
             })?;
+
+        // Arm backpressure: a full append now waits for this writer to drain
+        // instead of returning `WalBufferError::Full`.
+        let drainer_shared = Arc::clone(&shared);
+        let drainer: Arc<dyn WalDrainSignal> = drainer_shared;
+        buffer.set_drainer(drainer);
 
         info!(?dir, next_segment = next_index, "wal writer started");
         Ok(Self {
@@ -412,6 +445,12 @@ impl WriterDriver {
             }
 
             if stopping {
+                // Stop accepting new appends before the final drain. This wakes
+                // anything parked on backpressure (it observes `Closed`) and
+                // guarantees the trailing drain below captures every record
+                // that was already admitted — nothing can slip in after the
+                // writer stops draining.
+                self.buffer.close_appends();
                 // Drain one last time in case appenders snuck in
                 // between the drain above and observing `stopping`.
                 let trailing = self.buffer.drain_into(&mut self.drain_buf)?;
@@ -763,6 +802,41 @@ mod tests {
         let next_lsn = buffer.next_lsn();
         writer.shutdown().unwrap();
         assert!(buffer.durable_lsn() >= next_lsn);
+    }
+
+    #[test]
+    fn backpressure_lets_a_burst_far_exceed_buffer_capacity() {
+        // A 64 KiB buffer with ~1 MiB of records pushed through it in one
+        // burst. Before backpressure this returned `WalBufferError::Full`; now
+        // the appender waits for the writer to drain and every record lands.
+        let dir = TempDir::new().unwrap();
+        let buffer = Arc::new(WalBuffer::new(64 * 1024, Lsn::ZERO));
+        let writer = WalWriter::open(
+            dir.path(),
+            Arc::clone(&buffer),
+            WalWriterConfig {
+                segment_size_bytes: 1024 * 1024,
+                fsync_window_us: 2_000,
+                fsync_batch_bytes: 256 * 1024,
+            },
+        )
+        .unwrap();
+
+        let payload = [b'x'; 200];
+        const RECORDS: usize = 5_000;
+        for _ in 0..RECORDS {
+            buffer
+                .append(&rec(&payload))
+                .expect("append must apply backpressure, never reject when full");
+        }
+
+        let final_lsn = buffer.next_lsn();
+        writer.notify();
+        writer.shutdown().unwrap();
+        assert!(
+            buffer.durable_lsn() >= final_lsn,
+            "every backpressured record must be durable after shutdown"
+        );
     }
 
     #[test]

@@ -351,6 +351,10 @@ impl PageHeader {
 
     /// Number of slots currently allocated on the page.
     #[must_use]
+    #[allow(
+        clippy::panic,
+        reason = "INVARIANT: internal callers read this header from a validated `Page` (via `Page::header()`), whose slot directory was checked by `from_bytes`/`validate_slot_directory` or initialized by `new_heap`; untrusted public headers must use `try_slot_count`"
+    )]
     pub const fn slot_count(&self) -> u16 {
         match self.try_slot_count() {
             Ok(count) => count,
@@ -378,6 +382,10 @@ impl PageHeader {
 
     /// Bytes of free space available for additional tuples.
     #[must_use]
+    #[allow(
+        clippy::panic,
+        reason = "INVARIANT: internal callers read this header from a validated `Page` (via `Page::header()`), so `upper >= lower` holds and `try_free_space` cannot fail; untrusted public headers must use `try_free_space`"
+    )]
     pub fn free_space(&self) -> usize {
         match self.try_free_space() {
             Ok(free_space) => free_space,
@@ -777,6 +785,10 @@ impl Page {
     /// the per-tuple `page.header()` round trip that
     /// [`Self::insert_tuple_appended`] performs.
     #[must_use]
+    #[allow(
+        clippy::panic,
+        reason = "INVARIANT: callers pass a `slot` already bounded by the validated page's `slot_count`, so the computed item-id offset stays within `PAGE_SIZE` and `try_item_id_offset` cannot fail"
+    )]
     pub(crate) fn item_id_offset(slot: SlotIndex) -> usize {
         match Self::try_item_id_offset(slot) {
             Ok(offset) => offset,
@@ -806,6 +818,10 @@ impl Page {
         start..end
     }
 
+    #[allow(
+        clippy::panic,
+        reason = "INVARIANT: `item_id_range` yields exactly `ITEMID_SIZE` (4) bytes within a validated page, so `read_u32_le` over that range cannot fail"
+    )]
     fn read_item_id(&self, slot: SlotIndex) -> ItemId {
         let range = Self::item_id_range(slot);
         let raw = match read_u32_le(&self.bytes[range]) {

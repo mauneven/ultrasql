@@ -318,6 +318,10 @@ fn entry_start(index: usize, entry_size: usize, label: &'static str) -> Result<u
     Ok(start)
 }
 
+#[allow(
+    clippy::panic,
+    reason = "INVARIANT: callers iterate `index` over a node's key count, which `NodeHeader::decode` bounds to `MAX_LEAF_ENTRIES`/`MAX_INTERNAL_ENTRIES` (chosen so all entries fit before `NODE_SPECIAL_OFFSET`), so `entry_start` cannot fail"
+)]
 fn entry_start_or_panic(index: usize, entry_size: usize, label: &'static str) -> usize {
     match entry_start(index, entry_size, label) {
         Ok(start) => start,
@@ -343,6 +347,10 @@ fn entry_field(
     Ok(start..end)
 }
 
+#[allow(
+    clippy::panic,
+    reason = "INVARIANT: callers pass a `base` from `entry_start_or_panic` plus compile-time-constant field offsets within the entry size, so the field range stays inside the entry and `entry_field` cannot fail"
+)]
 fn entry_field_or_panic(
     base: usize,
     start: usize,

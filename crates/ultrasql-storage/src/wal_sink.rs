@@ -99,14 +99,21 @@ pub trait WalSink: Send + Sync {
         self.append(record)
     }
 
-    /// Return `true` when [`Self::append_ref`] only appends to memory and
-    /// cannot perform blocking filesystem I/O or fsync.
+    /// Return `true` when [`Self::append_ref`] performs no blocking filesystem
+    /// I/O or fsync and acquires no buffer-pool page latch or storage lock — so
+    /// it is safe to call while holding a page's write guard.
     ///
     /// Heap paths use this to decide whether they can append a page-local WAL
     /// record while holding that page's write guard. This lets the page-local
     /// DELETE path preserve WAL-before-data ordering without a second buffer
     /// pool pin. Sinks that may touch storage during `append_ref` must keep the
     /// default `false` so heap callers release page guards before appending.
+    ///
+    /// A buffered sink may still *briefly park* an append for WAL backpressure
+    /// when the in-memory buffer is full, waiting on the WAL writer to drain. It
+    /// may return `true` regardless, because the WAL writer is independent of
+    /// the page-latch world (it only writes its own segment files), so parking
+    /// an append while holding a page guard cannot deadlock.
     fn appends_without_blocking_io(&self) -> bool {
         false
     }
