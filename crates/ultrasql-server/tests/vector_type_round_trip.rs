@@ -888,6 +888,104 @@ async fn hnsw_snapshot_at_checkpoint_bounds_restart_replay_and_stays_correct() {
 }
 
 #[tokio::test]
+async fn ivfflat_snapshot_at_checkpoint_bounds_restart_replay_and_stays_correct() {
+    // A CHECKPOINT writes a durable per-index IVFFlat snapshot; a restart loads it
+    // and replays only the WAL appended AFTER the checkpoint. Correctness must
+    // match a full replay: vectors inserted both before and after the checkpoint
+    // are found, and EXPLAIN confirms the page-backed IVFFlat index (not a heap
+    // scan) actually served the query, so the result genuinely exercises the
+    // snapshot-reconstructed index.
+    let dir = tempfile::tempdir().expect("tempdir");
+    {
+        let (client, _conn, server_handle) =
+            start_crash_persistent_server_and_connect(dir.path()).await;
+        client
+            .batch_execute("CREATE TABLE ivf_pts (id INT NOT NULL, embedding VECTOR(2))")
+            .await
+            .expect("create table");
+        // Pre-checkpoint: 40 vectors along the x axis at [i,0], i=1..=40.
+        let pre: String = (1..=40)
+            .map(|i| format!("({i}, '[{i},0]')"))
+            .collect::<Vec<_>>()
+            .join(",");
+        client
+            .batch_execute(&format!("INSERT INTO ivf_pts VALUES {pre}"))
+            .await
+            .expect("insert pre-checkpoint rows");
+        client
+            .batch_execute(
+                "CREATE INDEX ivf_pts_emb ON ivf_pts \
+                 USING ivfflat (embedding vector_l2_ops) WITH (lists = 4, probes = 4)",
+            )
+            .await
+            .expect("create ivfflat index");
+        // Checkpoint: persists a snapshot reflecting ids 1..=40.
+        client
+            .batch_execute("CHECKPOINT")
+            .await
+            .expect("checkpoint");
+        // Post-checkpoint: recorded ONLY in the WAL above the snapshot LSN.
+        // id 200 sits at the origin (the new nearest), id 201 just past it.
+        client
+            .batch_execute("INSERT INTO ivf_pts VALUES (200, '[0,0]'), (201, '[0.5,0]')")
+            .await
+            .expect("insert post-checkpoint rows");
+        shutdown(client, server_handle).await;
+    }
+    // The checkpoint must have written a snapshot file.
+    let snap_count = std::fs::read_dir(dir.path().join("vecsnap"))
+        .map(|rd| {
+            rd.filter_map(Result::ok)
+                .filter(|e| e.path().extension().is_some_and(|x| x == "snap"))
+                .count()
+        })
+        .unwrap_or(0);
+    assert!(
+        snap_count >= 1,
+        "CHECKPOINT must write at least one vector-index snapshot"
+    );
+    {
+        let (client, _conn, server_handle) =
+            start_crash_persistent_server_and_connect(dir.path()).await;
+        // Nearest to the origin must be the POST-checkpoint id=200, then id=201,
+        // then the pre-checkpoint id=1. Seeing 200/201 proves the bounded replay
+        // applied the WAL above the snapshot; seeing 1 proves the snapshot loaded.
+        let near = client
+            .simple_query("SELECT id FROM ivf_pts ORDER BY embedding <-> VECTOR '[0,0]' LIMIT 3")
+            .await
+            .expect("nearest search after restart");
+        assert_eq!(
+            simple_rows(&near),
+            vec![
+                vec!["200".to_owned()],
+                vec!["201".to_owned()],
+                vec!["1".to_owned()],
+            ],
+            "post-checkpoint vectors must survive a snapshot-bounded restart"
+        );
+        // EXPLAIN confirms the reconstructed IVFFlat index actually served the
+        // query — otherwise a heap fallback would mask a broken snapshot.
+        let explain = client
+            .simple_query(
+                "EXPLAIN ANALYZE SELECT id FROM ivf_pts \
+                 ORDER BY embedding <-> VECTOR '[0,0]' LIMIT 3",
+            )
+            .await
+            .expect("explain after restart");
+        let text = simple_rows(&explain)
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            text.contains("Vector Index: selected ivf_pts_emb (page-backed ivfflat)"),
+            "EXPLAIN must report the page-backed IVFFlat index after restart, got: {text}"
+        );
+        shutdown(client, server_handle).await;
+    }
+}
+
+#[tokio::test]
 async fn hnsw_ef_search_session_knob_is_accepted_and_applied() {
     // pgvector-compatible per-session ef_search knob: SET is accepted, SHOW
     // reflects it, and a query under the override returns correct neighbors.

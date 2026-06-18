@@ -4214,6 +4214,27 @@ fn vector_snapshot_dir(data_dir: &Path) -> std::path::PathBuf {
     data_dir.join("vecsnap")
 }
 
+/// Fold one index's snapshot LSN into a running minimum, ignoring `Lsn::ZERO`.
+///
+/// The minimum over a vector-index family bounds the WAL recycling floor: the
+/// floor must stay at or below every index's snapshot LSN so the WAL above it
+/// (which the index replays on restart) survives. A `ZERO` snapshot LSN means
+/// the index has had no logged mutation — and therefore has no WAL records of
+/// its own — so it imposes no floor and must be excluded, otherwise an empty or
+/// never-written index would pin the floor at 0 and block all recycling.
+fn fold_min_nonzero_lsn(acc: Option<Lsn>, candidate: Lsn) -> Option<Lsn> {
+    if candidate == Lsn::ZERO {
+        return acc;
+    }
+    Some(acc.map_or(candidate, |current| {
+        if current.raw() <= candidate.raw() {
+            current
+        } else {
+            candidate
+        }
+    }))
+}
+
 /// Read a vector-index snapshot if one exists. Returns `None` on absence or any
 /// IO error — the caller then falls back to full WAL replay, so a missing or
 /// unreadable snapshot only costs a slower restart, never correctness.
@@ -5133,31 +5154,39 @@ impl Server {
         // load), so a write failure is logged and the checkpoint still succeeds.
         if let Some(data_dir) = &self.data_dir {
             let mut all_snapshots_ok = true;
-            // Any IVFFlat index has no snapshot and rebuilds purely by replaying
-            // the full WAL, so its presence forbids recycling any WAL below it.
-            let mut any_ivfflat = false;
-            // The lowest HNSW snapshot LSN, captured *before* each encode. meta.lsn
-            // is monotone, so the value a snapshot actually embeds is >= this; the
-            // truncation floor stays at or below every snapshot's real coverage.
+            // The lowest snapshot LSN per vector-index family, captured *before*
+            // each encode. meta.lsn is monotone, so the value a snapshot actually
+            // embeds is >= this; the truncation floor stays at or below every
+            // snapshot's real coverage. `ZERO` (no logged mutation) is excluded.
             let mut min_hnsw_snapshot_lsn: Option<Lsn> = None;
+            let mut min_ivfflat_snapshot_lsn: Option<Lsn> = None;
             for table in self.table_constraints.iter() {
                 for (oid, index_meta) in &table.value().indexes {
-                    if index_meta.ivfflat.is_some() {
-                        any_ivfflat = true;
-                    }
                     if let Some(hnsw) = &index_meta.hnsw {
                         let snap_lsn = hnsw.snapshot_lsn();
                         let bytes = hnsw.encode_snapshot();
                         match write_vector_snapshot(data_dir, *oid, &bytes) {
                             Ok(()) => {
                                 min_hnsw_snapshot_lsn =
-                                    Some(min_hnsw_snapshot_lsn.map_or(snap_lsn, |cur: Lsn| {
-                                        if cur.raw() <= snap_lsn.raw() {
-                                            cur
-                                        } else {
-                                            snap_lsn
-                                        }
-                                    }));
+                                    fold_min_nonzero_lsn(min_hnsw_snapshot_lsn, snap_lsn);
+                            }
+                            Err(e) => {
+                                all_snapshots_ok = false;
+                                tracing::warn!(
+                                    error = %e,
+                                    oid = oid.raw(),
+                                    "vector index snapshot write failed; full replay on next restart"
+                                );
+                            }
+                        }
+                    }
+                    if let Some(ivfflat) = &index_meta.ivfflat {
+                        let snap_lsn = ivfflat.snapshot_lsn();
+                        let bytes = ivfflat.encode_snapshot();
+                        match write_vector_snapshot(data_dir, *oid, &bytes) {
+                            Ok(()) => {
+                                min_ivfflat_snapshot_lsn =
+                                    fold_min_nonzero_lsn(min_ivfflat_snapshot_lsn, snap_lsn);
                             }
                             Err(e) => {
                                 all_snapshots_ok = false;
@@ -5196,7 +5225,7 @@ impl Server {
             self.maybe_recycle_wal(
                 redo_from,
                 min_hnsw_snapshot_lsn,
-                any_ivfflat,
+                min_ivfflat_snapshot_lsn,
                 all_snapshots_ok && clog_ok,
             );
         }
@@ -5211,16 +5240,18 @@ impl Server {
     /// * the oldest in-progress transaction's first written LSN — its records
     ///   must survive or recovery cannot mark it aborted, and an unknown XID
     ///   defaults to `InProgress` forever (wrong visibility, spurious conflicts).
-    /// * every HNSW index's snapshot LSN — each rebuilds from its snapshot plus
-    ///   the retained WAL above that LSN.
+    /// * every HNSW and IVFFlat index's snapshot LSN — each rebuilds from its
+    ///   snapshot plus the retained WAL above that LSN.
     ///
-    /// Recycling is skipped entirely when an IVFFlat index exists (no snapshot,
-    /// full-WAL replay) or any required snapshot failed to become durable.
+    /// Recycling is skipped entirely when any required snapshot failed to become
+    /// durable. An index with no logged mutation (snapshot LSN `ZERO`) has no WAL
+    /// records of its own and imposes no floor — `fold_min_nonzero_lsn` excludes
+    /// it, so its `None` bound here simply does not constrain the floor.
     fn maybe_recycle_wal(
         &self,
         redo_from: Lsn,
         min_hnsw_snapshot_lsn: Option<Lsn>,
-        any_ivfflat: bool,
+        min_ivfflat_snapshot_lsn: Option<Lsn>,
         snapshots_ok: bool,
     ) {
         let (Some(sink), Some(wal_dir)) = (&self.wal_buffer_sink, &self.wal_dir) else {
@@ -5230,7 +5261,7 @@ impl Server {
         // even when we cannot truncate) and learn the oldest still-active one.
         let oldest_active = sink
             .prune_terminal_and_oldest_active_first_lsn(|xid| self.txn_manager.is_in_progress(xid));
-        if any_ivfflat || !snapshots_ok {
+        if !snapshots_ok {
             return;
         }
         let mut floor = redo_from.raw();
@@ -5239,6 +5270,9 @@ impl Server {
         }
         if let Some(hnsw_lsn) = min_hnsw_snapshot_lsn {
             floor = floor.min(hnsw_lsn.raw());
+        }
+        if let Some(ivfflat_lsn) = min_ivfflat_snapshot_lsn {
+            floor = floor.min(ivfflat_lsn.raw());
         }
         match ultrasql_wal::truncate_below(wal_dir, Lsn::new(floor)) {
             Ok(outcome) if !outcome.is_noop() => tracing::info!(
@@ -8303,14 +8337,30 @@ impl Server {
                         let (lists, probes, payload) =
                             ivfflat_options_from_catalog(&index.options)?;
                         let payload = payload.unwrap_or(default_payload);
-                        let ivfflat = Arc::new(
-                            PageBackedIvfFlatIndex::new_with_payload_kind(
-                                RelationId::new(index.oid.raw()),
-                                dims,
-                                metric,
-                                lists,
-                                probes,
-                                payload,
+                        let rel = RelationId::new(index.oid.raw());
+                        // Prefer a durable snapshot, replaying only the WAL above
+                        // its meta.lsn high-water mark instead of rebuilding the
+                        // lists from a full from-zero replay. Trusted ONLY if
+                        // from_snapshot_bytes accepts it (crc32c + format +
+                        // relation), its dims and metric match this catalog index,
+                        // AND its meta.lsn does not exceed the durable WAL end —
+                        // identical contract to the HNSW path above.
+                        let snapshot_loaded = self
+                            .data_dir
+                            .as_ref()
+                            .and_then(|dd| read_vector_snapshot(dd, index.oid))
+                            .and_then(|bytes| {
+                                PageBackedIvfFlatIndex::from_snapshot_bytes(rel, &bytes).ok()
+                            })
+                            .filter(|idx| {
+                                usize::try_from(dims).is_ok_and(|d| idx.dims() == d)
+                                    && idx.metric() == metric
+                                    && idx.snapshot_lsn() <= recovered_lsn
+                            });
+                        let ivfflat = Arc::new(match snapshot_loaded {
+                            Some(idx) => idx,
+                            None => PageBackedIvfFlatIndex::new_with_payload_kind(
+                                rel, dims, metric, lists, probes, payload,
                             )
                             .map_err(|e| {
                                 ServerError::ddl(format!(
@@ -8318,7 +8368,7 @@ impl Server {
                                     index.name
                                 ))
                             })?,
-                        );
+                        });
                         ivfflat_indexes.push(Arc::clone(&ivfflat));
                         constraints.indexes.insert(
                             index.oid,
@@ -8620,7 +8670,9 @@ impl Server {
                     if !ivfflat.is_valid() {
                         continue;
                     }
-                    if let Err(e) = ivfflat.apply_wal_record(record) {
+                    // Pass the record's LSN so a loaded snapshot's redo gate skips
+                    // records it already covers (mirrors the HNSW path above).
+                    if let Err(e) = ivfflat.apply_wal_record_at(current_lsn, record) {
                         ivfflat.invalidate();
                         tracing::warn!(
                             error = %e,

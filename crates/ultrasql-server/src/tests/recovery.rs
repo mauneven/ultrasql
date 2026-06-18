@@ -594,6 +594,32 @@ fn append_resolved_records(server: &Server, count: usize) {
 }
 
 #[test]
+fn fold_min_nonzero_lsn_skips_zero_and_keeps_minimum() {
+    use super::super::fold_min_nonzero_lsn;
+    // ZERO never constrains the floor: an index with no logged ops has no WAL
+    // records of its own, so it must not pin the floor (which would block all
+    // recycling for an empty or never-written vector index).
+    assert_eq!(fold_min_nonzero_lsn(None, Lsn::ZERO), None);
+    assert_eq!(
+        fold_min_nonzero_lsn(Some(Lsn::new(500)), Lsn::ZERO),
+        Some(Lsn::new(500))
+    );
+    // The first non-zero seeds the accumulator; later folds keep the minimum.
+    assert_eq!(
+        fold_min_nonzero_lsn(None, Lsn::new(500)),
+        Some(Lsn::new(500))
+    );
+    assert_eq!(
+        fold_min_nonzero_lsn(Some(Lsn::new(500)), Lsn::new(300)),
+        Some(Lsn::new(300))
+    );
+    assert_eq!(
+        fold_min_nonzero_lsn(Some(Lsn::new(300)), Lsn::new(900)),
+        Some(Lsn::new(300))
+    );
+}
+
+#[test]
 fn checkpoint_recycles_wal_segments_below_the_floor() {
     let data_dir = tempfile::TempDir::new().unwrap();
     let wal_dir = data_dir.path().join("pg_wal");
