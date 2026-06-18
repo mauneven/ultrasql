@@ -3169,10 +3169,7 @@ pub fn load_ultrasql(data_dir: &Path) -> Result<Vec<LoadStats>> {
             }
         });
 
-        let conn_str = format!(
-            "host=127.0.0.1 port={} user=tpch_load",
-            bound.port()
-        );
+        let conn_str = format!("host=127.0.0.1 port={} user=tpch_load", bound.port());
         let (client, connection) = tokio_postgres::connect(&conn_str, NoTls)
             .await
             .context("connect to ultrasqld")?;
