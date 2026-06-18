@@ -350,8 +350,7 @@ impl SsiManager {
     pub fn collect_garbage(&self, horizon: Xid) -> usize {
         let mut removed = 0;
         self.rw_conflicts.retain(|_xid, state| {
-            let retire =
-                state.committed && state.commit_horizon.is_some_and(|h| horizon >= h);
+            let retire = state.committed && state.commit_horizon.is_some_and(|h| horizon >= h);
             if retire {
                 removed += 1;
             }
@@ -788,7 +787,9 @@ mod tests {
         mgr.commit(t3, far_horizon()).unwrap();
 
         // Now t2 tries to commit — it is the pivot and t3 is committed.
-        let err = mgr.commit(t2, far_horizon()).expect_err("pivot commit should fail");
+        let err = mgr
+            .commit(t2, far_horizon())
+            .expect_err("pivot commit should fail");
         let SsiError::Serialization { victim, .. } = err;
         assert_eq!(victim, t2);
     }
@@ -811,7 +812,11 @@ mod tests {
         // A concurrent transaction (XID 15 < 20) is still running, so the
         // horizon cannot have advanced past 20. Sweeping at 15 retires nothing.
         assert_eq!(mgr.collect_garbage(xid(15)), 0);
-        assert_eq!(mgr.tracked_len(), 1, "entry must survive while concurrent txn runs");
+        assert_eq!(
+            mgr.tracked_len(),
+            1,
+            "entry must survive while concurrent txn runs"
+        );
 
         // Once the oldest in-progress XID reaches the commit horizon, no
         // concurrent transaction can survive and the entry is retired.
@@ -849,7 +854,10 @@ mod tests {
             mgr.register_xid(t);
             // Each transaction reads a distinct range, leaving a predicate lock
             // and (potentially) conflict-set memory behind on commit.
-            mgr.add_predicate_lock(t, column_range_tag(1, 0, Some(i64::try_from(i).unwrap()), None));
+            mgr.add_predicate_lock(
+                t,
+                column_range_tag(1, 0, Some(i64::try_from(i).unwrap()), None),
+            );
             // No concurrent transactions: the high-water mark at commit is the
             // next XID (`i + 1`).
             mgr.commit(t, xid(i + 1)).unwrap();
@@ -870,7 +878,11 @@ mod tests {
             max_len <= usize::try_from(SWEEP_INTERVAL).unwrap(),
             "rw_conflicts grew beyond the sweep window: max_len={max_len}"
         );
-        assert_eq!(mgr.tracked_len(), 0, "all committed entries must be retired");
+        assert_eq!(
+            mgr.tracked_len(),
+            0,
+            "all committed entries must be retired"
+        );
     }
 
     /// Regression: an ancient committed serializable transaction that has been

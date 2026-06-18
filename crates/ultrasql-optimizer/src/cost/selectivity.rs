@@ -83,10 +83,11 @@ fn sel_inner(pred: &ScalarExpr, stats: &dyn StatsSource, table: &str, input_rows
             left,
             right,
             ..
-        } => column_index(left).or_else(|| column_index(right)).map_or(
-            DEFAULT_UNKNOWN_SEL,
-            |col_idx| eq_selectivity(stats.n_distinct(table, col_idx), input_rows),
-        ),
+        } => column_index(left)
+            .or_else(|| column_index(right))
+            .map_or(DEFAULT_UNKNOWN_SEL, |col_idx| {
+                eq_selectivity(stats.n_distinct(table, col_idx), input_rows)
+            }),
 
         // Column <> Literal  →  1 - eq_selectivity
         ScalarExpr::Binary {
@@ -95,10 +96,11 @@ fn sel_inner(pred: &ScalarExpr, stats: &dyn StatsSource, table: &str, input_rows
             right,
             ..
         } => {
-            let eq_sel = column_index(left).or_else(|| column_index(right)).map_or(
-                DEFAULT_UNKNOWN_SEL,
-                |col_idx| eq_selectivity(stats.n_distinct(table, col_idx), input_rows),
-            );
+            let eq_sel = column_index(left)
+                .or_else(|| column_index(right))
+                .map_or(DEFAULT_UNKNOWN_SEL, |col_idx| {
+                    eq_selectivity(stats.n_distinct(table, col_idx), input_rows)
+                });
             1.0 - eq_sel
         }
 
@@ -126,9 +128,7 @@ fn sel_inner(pred: &ScalarExpr, stats: &dyn StatsSource, table: &str, input_rows
             left,
             right,
             ..
-        } => {
-            sel_inner(left, stats, table, input_rows) * sel_inner(right, stats, table, input_rows)
-        }
+        } => sel_inner(left, stats, table, input_rows) * sel_inner(right, stats, table, input_rows),
 
         // OR  →  1 - (1 - sel(l)) * (1 - sel(r))
         ScalarExpr::Binary {

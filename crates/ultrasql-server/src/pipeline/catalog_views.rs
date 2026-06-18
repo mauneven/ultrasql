@@ -1688,11 +1688,7 @@ fn unique_index_constraint_kind(
         .find(|row| row.conrelid == index.table_oid && row.conname == index.name)
         .map_or_else(
             || {
-                if index.is_primary {
-                    "p"
-                } else {
-                    "u"
-                }
+                if index.is_primary { "p" } else { "u" }
             },
             constraint_kind,
         )

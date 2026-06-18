@@ -120,6 +120,23 @@ fn gssenc_request_decodes_to_gssenc_request_message() {
     assert!(matches!(decoded, FrontendMessage::GssEncRequest));
 }
 
+#[test]
+fn ssl_request_round_trip() {
+    // Exercises the encoder arm + encode_request_code, then the decoder.
+    assert_eq!(
+        round_trip_frontend(&FrontendMessage::SslRequest),
+        FrontendMessage::SslRequest
+    );
+}
+
+#[test]
+fn gssenc_request_round_trip() {
+    assert_eq!(
+        round_trip_frontend(&FrontendMessage::GssEncRequest),
+        FrontendMessage::GssEncRequest
+    );
+}
+
 // -------------------------------------------------------------------
 // Frontend round-trips
 // -------------------------------------------------------------------

@@ -445,7 +445,13 @@ fn not_binds_tighter_than_and() {
         panic!("expected a top-level AND, got {expr:?}");
     };
     assert!(
-        matches!(*left, Expr::Unary { op: UnaryOp::Not, .. }),
+        matches!(
+            *left,
+            Expr::Unary {
+                op: UnaryOp::Not,
+                ..
+            }
+        ),
         "left operand of AND must be `NOT a`, got {left:?}",
     );
 }
