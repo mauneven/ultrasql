@@ -33,6 +33,7 @@ ultrasql-iceberg   = { workspace = true }
 ultrasql-arrow     = { workspace = true }
 thiserror          = { workspace = true }
 anyhow             = { workspace = true }
+crc32c             = { workspace = true }
 tokio              = { workspace = true }
 tracing            = { workspace = true }
 tracing-subscriber = { workspace = true }

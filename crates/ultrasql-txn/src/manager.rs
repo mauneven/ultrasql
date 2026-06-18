@@ -795,6 +795,63 @@ impl TransactionManager {
             });
     }
 
+    /// Export the commit log for a durable checkpoint snapshot.
+    ///
+    /// Returns the allocator's `next_xid` and every **terminal**
+    /// `(xid, status)` entry (`Committed` / `Aborted` / `Frozen`). In-progress
+    /// (including prepared 2PC) transactions are intentionally excluded: their
+    /// status is restored from their WAL and 2PC state, whose records are
+    /// retained until the transaction resolves. Persisting this snapshot lets
+    /// the `Commit`/`Abort` WAL records below a checkpoint be recycled without
+    /// losing the status of transactions that resolved before it.
+    #[must_use]
+    pub fn export_clog(&self) -> (u64, Vec<(Xid, XidStatus)>) {
+        let next_xid = self.next_xid.load(Ordering::Acquire);
+        let entries: Vec<(Xid, XidStatus)> = self
+            .clog
+            .iter()
+            .filter_map(|entry| match *entry.value() {
+                status @ (XidStatus::Committed | XidStatus::Aborted | XidStatus::Frozen) => {
+                    Some((*entry.key(), status))
+                }
+                XidStatus::InProgress => None,
+            })
+            .collect();
+        (next_xid, entries)
+    }
+
+    /// Seed the commit log from a snapshot produced by [`Self::export_clog`].
+    ///
+    /// Used at restart to restore the status of transactions whose `Commit` /
+    /// `Abort` WAL records were recycled. An XID that already has a CLOG entry
+    /// (e.g. re-derived from retained WAL) is left unchanged, mirroring the
+    /// `recover_*` idempotency; the allocator is advanced past `next_xid` and
+    /// every imported XID.
+    pub fn import_clog(&self, next_xid: u64, entries: &[(Xid, XidStatus)]) {
+        for (xid, status) in entries {
+            if *xid == Xid::INVALID || *xid == Xid::FROZEN || *xid == Xid::BOOTSTRAP {
+                continue;
+            }
+            // Seed only terminal statuses, and only when the XID is not already
+            // resolved (retained WAL is authoritative — `import_clog` runs before
+            // the WAL commit-status scan, so this seeds the truncated tail only).
+            if matches!(
+                status,
+                XidStatus::Committed | XidStatus::Aborted | XidStatus::Frozen
+            ) && self.clog.get(xid).is_none()
+            {
+                self.clog.insert(*xid, *status);
+                self.in_progress.lock().remove(xid);
+            }
+            self.recover_observed_xid(*xid);
+        }
+        let _ = self
+            .next_xid
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+                (current < next_xid).then_some(next_xid)
+            });
+    }
+
     // ── SSI pass-through methods ─────────────────────────────────────────────
 
     /// Record a predicate lock for a serializable transaction.
@@ -935,6 +992,46 @@ mod tests {
         assert_eq!(mgr.status(xid), XidStatus::Aborted);
         assert_eq!(next.xid, Xid::new(11));
         assert!(!next.snapshot.xip.contains(&xid));
+    }
+
+    #[test]
+    fn clog_export_import_round_trips_terminal_status() {
+        let src = TransactionManager::new();
+        src.recover_committed(Xid::new(10));
+        src.recover_committed(Xid::new(11));
+        src.recover_aborted(Xid::new(12));
+        // An in-progress transaction must not be exported.
+        let live = src.begin(IsolationLevel::ReadCommitted);
+        let live_xid = live.xid;
+
+        let (next_xid, entries) = src.export_clog();
+        assert_eq!(entries.len(), 3, "only terminal entries are exported");
+        assert!(
+            !entries.iter().any(|(x, _)| *x == live_xid),
+            "in-progress xid must not be exported"
+        );
+
+        // Import into a fresh manager restores statuses and the allocator.
+        let dst = TransactionManager::new();
+        dst.import_clog(next_xid, &entries);
+        assert_eq!(dst.status(Xid::new(10)), XidStatus::Committed);
+        assert_eq!(dst.status(Xid::new(11)), XidStatus::Committed);
+        assert_eq!(dst.status(Xid::new(12)), XidStatus::Aborted);
+        assert!(
+            dst.begin(IsolationLevel::ReadCommitted).xid.raw() >= next_xid,
+            "allocator must never reissue an imported xid"
+        );
+
+        // Retained WAL is authoritative: an entry already resolved before import
+        // is not overwritten by the snapshot.
+        let dst2 = TransactionManager::new();
+        dst2.recover_aborted(Xid::new(10));
+        dst2.import_clog(next_xid, &entries);
+        assert_eq!(
+            dst2.status(Xid::new(10)),
+            XidStatus::Aborted,
+            "import must not override a status already re-derived from WAL"
+        );
     }
 
     #[test]

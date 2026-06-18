@@ -4242,6 +4242,152 @@ fn write_vector_snapshot(
     Ok(())
 }
 
+const CLOG_SNAPSHOT_MAGIC: &[u8; 8] = b"USQLCLG1";
+const CLOG_SNAPSHOT_VERSION: u32 = 1;
+/// magic(8) + version(4) + snapshot_lsn(8) + next_xid(8) + count(4).
+const CLOG_SNAPSHOT_HEADER_LEN: usize = 32;
+/// xid(8) + status(1) per entry.
+const CLOG_SNAPSHOT_ENTRY_LEN: usize = 9;
+
+/// A decoded commit-log snapshot: its WAL LSN, the allocator next-XID, and the
+/// terminal `(xid, status)` entries.
+type DecodedClogSnapshot = (Lsn, u64, Vec<(Xid, ultrasql_mvcc::XidStatus)>);
+
+fn clog_status_to_u8(status: ultrasql_mvcc::XidStatus) -> u8 {
+    match status {
+        ultrasql_mvcc::XidStatus::InProgress => 0,
+        ultrasql_mvcc::XidStatus::Committed => 1,
+        ultrasql_mvcc::XidStatus::Aborted => 2,
+        ultrasql_mvcc::XidStatus::Frozen => 3,
+    }
+}
+
+fn clog_status_from_u8(byte: u8) -> Result<ultrasql_mvcc::XidStatus, ServerError> {
+    match byte {
+        0 => Ok(ultrasql_mvcc::XidStatus::InProgress),
+        1 => Ok(ultrasql_mvcc::XidStatus::Committed),
+        2 => Ok(ultrasql_mvcc::XidStatus::Aborted),
+        3 => Ok(ultrasql_mvcc::XidStatus::Frozen),
+        other => Err(ServerError::ddl(format!(
+            "clog snapshot invalid status tag {other}"
+        ))),
+    }
+}
+
+/// Serialize the commit log to a versioned, crc32c-checksummed byte buffer.
+fn encode_clog_snapshot(
+    snapshot_lsn: Lsn,
+    next_xid: u64,
+    entries: &[(Xid, ultrasql_mvcc::XidStatus)],
+) -> Vec<u8> {
+    let count = u32::try_from(entries.len()).unwrap_or(u32::MAX);
+    let mut out =
+        Vec::with_capacity(CLOG_SNAPSHOT_HEADER_LEN + entries.len() * CLOG_SNAPSHOT_ENTRY_LEN + 4);
+    out.extend_from_slice(CLOG_SNAPSHOT_MAGIC);
+    out.extend_from_slice(&CLOG_SNAPSHOT_VERSION.to_le_bytes());
+    out.extend_from_slice(&snapshot_lsn.raw().to_le_bytes());
+    out.extend_from_slice(&next_xid.to_le_bytes());
+    out.extend_from_slice(&count.to_le_bytes());
+    for (xid, status) in entries {
+        out.extend_from_slice(&xid.raw().to_le_bytes());
+        out.push(clog_status_to_u8(*status));
+    }
+    let crc = crc32c::crc32c(&out);
+    out.extend_from_slice(&crc.to_le_bytes());
+    out
+}
+
+/// Strictly decode a commit-log snapshot, rejecting any corruption (so a caller
+/// falls back to full WAL commit-status rebuild). Returns the snapshot LSN, the
+/// allocator next-XID, and the terminal `(xid, status)` entries.
+fn decode_clog_snapshot(bytes: &[u8]) -> Result<DecodedClogSnapshot, ServerError> {
+    let body_len = bytes
+        .len()
+        .checked_sub(4)
+        .ok_or_else(|| ServerError::ddl("clog snapshot too short".to_owned()))?;
+    let (body, crc_bytes) = bytes.split_at(body_len);
+    let stored = u32::from_le_bytes(
+        crc_bytes
+            .try_into()
+            .map_err(|_| ServerError::ddl("clog snapshot crc read".to_owned()))?,
+    );
+    if crc32c::crc32c(body) != stored {
+        return Err(ServerError::ddl(
+            "clog snapshot checksum mismatch".to_owned(),
+        ));
+    }
+    if body.len() < CLOG_SNAPSHOT_HEADER_LEN || &body[0..8] != CLOG_SNAPSHOT_MAGIC {
+        return Err(ServerError::ddl("clog snapshot header invalid".to_owned()));
+    }
+    let read_u32 = |o: usize| -> Result<u32, ServerError> {
+        body.get(o..o + 4)
+            .and_then(|s| s.try_into().ok())
+            .map(u32::from_le_bytes)
+            .ok_or_else(|| ServerError::ddl("clog snapshot truncated".to_owned()))
+    };
+    let read_u64 = |o: usize| -> Result<u64, ServerError> {
+        body.get(o..o + 8)
+            .and_then(|s| s.try_into().ok())
+            .map(u64::from_le_bytes)
+            .ok_or_else(|| ServerError::ddl("clog snapshot truncated".to_owned()))
+    };
+    let version = read_u32(8)?;
+    if version != CLOG_SNAPSHOT_VERSION {
+        return Err(ServerError::ddl(format!(
+            "clog snapshot version {version} unsupported"
+        )));
+    }
+    let snapshot_lsn = Lsn::new(read_u64(12)?);
+    let next_xid = read_u64(20)?;
+    let count = usize::try_from(read_u32(28)?)
+        .map_err(|_| ServerError::ddl("clog snapshot count overflow".to_owned()))?;
+    let entries_len = count
+        .checked_mul(CLOG_SNAPSHOT_ENTRY_LEN)
+        .and_then(|n| n.checked_add(CLOG_SNAPSHOT_HEADER_LEN))
+        .ok_or_else(|| ServerError::ddl("clog snapshot size overflow".to_owned()))?;
+    if body.len() != entries_len {
+        return Err(ServerError::ddl("clog snapshot length mismatch".to_owned()));
+    }
+    let mut entries = Vec::with_capacity(count.min(1 << 20));
+    let mut off = CLOG_SNAPSHOT_HEADER_LEN;
+    for _ in 0..count {
+        let xid = Xid::new(read_u64(off)?);
+        let status = clog_status_from_u8(
+            *body
+                .get(off + 8)
+                .ok_or_else(|| ServerError::ddl("clog snapshot truncated".to_owned()))?,
+        )?;
+        entries.push((xid, status));
+        off += CLOG_SNAPSHOT_ENTRY_LEN;
+    }
+    Ok((snapshot_lsn, next_xid, entries))
+}
+
+fn clog_snapshot_path(data_dir: &Path) -> std::path::PathBuf {
+    data_dir.join("clog.snapshot")
+}
+
+fn read_clog_snapshot(data_dir: &Path) -> Option<Vec<u8>> {
+    std::fs::read(clog_snapshot_path(data_dir)).ok()
+}
+
+/// Durably write the commit-log snapshot via temp-file + atomic rename + fsync.
+fn write_clog_snapshot(data_dir: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write as _;
+    let final_path = clog_snapshot_path(data_dir);
+    let tmp_path = data_dir.join("clog.snapshot.tmp");
+    {
+        let mut file = std::fs::File::create(&tmp_path)?;
+        file.write_all(bytes)?;
+        file.sync_all()?;
+    }
+    std::fs::rename(&tmp_path, &final_path)?;
+    if let Ok(dir) = std::fs::File::open(data_dir) {
+        let _ = dir.sync_all();
+    }
+    Ok(())
+}
+
 fn recovery_replay_target_from_data_dir(
     data_dir: &Path,
 ) -> Result<ultrasql_wal::RecoveryTarget, ServerError> {
@@ -4991,6 +5137,21 @@ impl Server {
                     }
                 }
             }
+
+            // Write a durable commit-log snapshot stamped with the checkpoint
+            // LSN so the WAL Commit/Abort records below the checkpoint can later
+            // be recycled without losing the status of transactions that
+            // resolved before it. Best-effort, same contract as above: a missing
+            // or corrupt snapshot is rejected on load and recovery falls back to
+            // a full WAL commit-status rebuild.
+            let (next_xid, clog_entries) = self.txn_manager.export_clog();
+            let clog_bytes = encode_clog_snapshot(checkpoint_lsn, next_xid, &clog_entries);
+            if let Err(e) = write_clog_snapshot(data_dir, &clog_bytes) {
+                tracing::warn!(
+                    error = %e,
+                    "commit-log snapshot write failed; full WAL rebuild on next restart"
+                );
+            }
         }
         Ok(())
     }
@@ -5516,6 +5677,31 @@ impl Server {
             checkpointer,
             wal_writer: Some(wal_writer),
         };
+        // Restore the commit log from a durable snapshot before scanning the
+        // WAL, so transactions whose Commit/Abort records were recycled keep
+        // their status. Used only if it decodes cleanly AND its snapshot LSN is
+        // within the durable WAL end (a snapshot ahead of the recovered WAL
+        // would assert statuses for records that did not survive). The
+        // commit-status WAL scan below then runs idempotently on top (retained
+        // WAL is authoritative; import seeds only the truncated tail).
+        if let Some(data_dir) = &server.data_dir
+            && let Some(bytes) = read_clog_snapshot(data_dir)
+        {
+            match decode_clog_snapshot(&bytes) {
+                Ok((snapshot_lsn, next_xid, entries)) if snapshot_lsn <= recovered_lsn => {
+                    server.txn_manager.import_clog(next_xid, &entries);
+                }
+                Ok((snapshot_lsn, _, _)) => tracing::warn!(
+                    snapshot_lsn = snapshot_lsn.raw(),
+                    recovered_lsn = recovered_lsn.raw(),
+                    "commit-log snapshot ahead of recovered WAL; ignoring"
+                ),
+                Err(e) => tracing::warn!(
+                    error = %e,
+                    "commit-log snapshot unreadable; full WAL commit-status rebuild"
+                ),
+            }
+        }
         server.recover_commit_status_from_wal()?;
         server.rebuild_domain_runtime_constraint_sidecars()?;
         server.rebuild_role_metadata()?;

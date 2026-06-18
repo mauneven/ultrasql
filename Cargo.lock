@@ -3630,6 +3630,7 @@ dependencies = [
  "chrono",
  "clap",
  "config",
+ "crc32c",
  "dashmap",
  "futures",
  "hex",

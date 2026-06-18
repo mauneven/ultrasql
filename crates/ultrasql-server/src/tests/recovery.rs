@@ -14,9 +14,45 @@ use ultrasql_wal::{HeapTarget, RecordType, WalRecord};
 #[cfg(unix)]
 use super::super::prepare_secure_data_dir;
 use super::super::{
-    BlankPageLoader, Server, ServerRecoveryTarget, capped_text_take_limit,
-    recovery_replay_target_from_data_dir,
+    BlankPageLoader, Server, ServerRecoveryTarget, capped_text_take_limit, decode_clog_snapshot,
+    encode_clog_snapshot, recovery_replay_target_from_data_dir,
 };
+
+#[test]
+fn clog_snapshot_round_trips_and_rejects_corruption() {
+    let lsn = Lsn::new(12_345);
+    let next_xid = 99;
+    let entries = vec![
+        (Xid::new(10), XidStatus::Committed),
+        (Xid::new(11), XidStatus::Aborted),
+        (Xid::new(12), XidStatus::Committed),
+        (Xid::new(13), XidStatus::Frozen),
+    ];
+    let bytes = encode_clog_snapshot(lsn, next_xid, &entries);
+    let (got_lsn, got_next, got_entries) = decode_clog_snapshot(&bytes).expect("decode");
+    assert_eq!(got_lsn, lsn);
+    assert_eq!(got_next, next_xid);
+    assert_eq!(got_entries, entries);
+
+    // An empty commit log round-trips.
+    let empty = encode_clog_snapshot(Lsn::ZERO, 3, &[]);
+    let (_, n, e) = decode_clog_snapshot(&empty).expect("decode empty");
+    assert_eq!(n, 3);
+    assert!(e.is_empty());
+
+    // Corruption is rejected with an error, never a panic.
+    let mut flipped = bytes.clone();
+    let mid = flipped.len() / 2;
+    flipped[mid] ^= 0xFF;
+    assert!(decode_clog_snapshot(&flipped).is_err(), "flipped byte");
+    assert!(
+        decode_clog_snapshot(&bytes[..bytes.len() - 3]).is_err(),
+        "truncated"
+    );
+    let mut bad_magic = bytes.clone();
+    bad_magic[0] = b'X';
+    assert!(decode_clog_snapshot(&bad_magic).is_err(), "bad magic");
+}
 
 fn recovery_target() -> ServerRecoveryTarget {
     let pool = Arc::new(BufferPool::new(16, BlankPageLoader::new()));
