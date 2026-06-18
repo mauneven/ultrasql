@@ -4202,6 +4202,46 @@ fn pages_to_bytes_saturated(pages: usize) -> u64 {
     usize_to_u64_saturated(pages).saturating_mul(usize_to_u64_saturated(PAGE_SIZE))
 }
 
+/// Directory holding per-index vector-index snapshots under a data dir.
+fn vector_snapshot_dir(data_dir: &Path) -> std::path::PathBuf {
+    data_dir.join("vecsnap")
+}
+
+/// Read a vector-index snapshot if one exists. Returns `None` on absence or any
+/// IO error — the caller then falls back to full WAL replay, so a missing or
+/// unreadable snapshot only costs a slower restart, never correctness.
+fn read_vector_snapshot(data_dir: &Path, oid: ultrasql_core::Oid) -> Option<Vec<u8>> {
+    std::fs::read(vector_snapshot_dir(data_dir).join(format!("{}.snap", oid.raw()))).ok()
+}
+
+/// Durably write a vector-index snapshot via temp-file + atomic rename so a
+/// crash mid-write never leaves a torn `<oid>.snap` (the previous snapshot, or
+/// none, survives and a corrupt one is rejected by `from_snapshot_bytes`).
+/// Best-effort by contract: the WAL remains the source of truth, so a failed
+/// snapshot only slows the next restart.
+fn write_vector_snapshot(
+    data_dir: &Path,
+    oid: ultrasql_core::Oid,
+    bytes: &[u8],
+) -> std::io::Result<()> {
+    use std::io::Write as _;
+    let dir = vector_snapshot_dir(data_dir);
+    std::fs::create_dir_all(&dir)?;
+    let final_path = dir.join(format!("{}.snap", oid.raw()));
+    let tmp_path = dir.join(format!("{}.snap.tmp", oid.raw()));
+    {
+        let mut file = std::fs::File::create(&tmp_path)?;
+        file.write_all(bytes)?;
+        file.sync_all()?;
+    }
+    std::fs::rename(&tmp_path, &final_path)?;
+    // fsync the directory so the rename entry itself is durable.
+    if let Ok(dir_file) = std::fs::File::open(&dir) {
+        let _ = dir_file.sync_all();
+    }
+    Ok(())
+}
+
 fn recovery_replay_target_from_data_dir(
     data_dir: &Path,
 ) -> Result<ultrasql_wal::RecoveryTarget, ServerError> {
@@ -4930,6 +4970,28 @@ impl Server {
         self.heap
             .last_checkpoint_lsn
             .fetch_max(checkpoint_lsn.raw(), std::sync::atomic::Ordering::AcqRel);
+
+        // Write a durable per-index vector snapshot so the next restart can load
+        // it and replay only the WAL above its meta.lsn instead of rebuilding
+        // the whole HNSW graph. Best-effort: a snapshot is an optimization (the
+        // WAL is the source of truth and a stale/corrupt snapshot is rejected on
+        // load), so a write failure is logged and the checkpoint still succeeds.
+        if let Some(data_dir) = &self.data_dir {
+            for table in self.table_constraints.iter() {
+                for (oid, index_meta) in &table.value().indexes {
+                    if let Some(hnsw) = &index_meta.hnsw {
+                        let bytes = hnsw.encode_snapshot();
+                        if let Err(e) = write_vector_snapshot(data_dir, *oid, &bytes) {
+                            tracing::warn!(
+                                error = %e,
+                                oid = oid.raw(),
+                                "vector index snapshot write failed; full replay on next restart"
+                            );
+                        }
+                    }
+                }
+            }
+        }
         Ok(())
     }
 
@@ -5455,7 +5517,7 @@ impl Server {
         server.rebuild_schema_metadata()?;
         server.refresh_persistent_catalog_schema_names();
         server.rebuild_table_runtime_constraint_sidecars()?;
-        server.rebuild_persistent_index_sidecars()?;
+        server.rebuild_persistent_index_sidecars(recovered_lsn)?;
         let stats_catalog = hydrate_optimizer_stats_from_catalog(
             &server.catalog_snapshot(),
             server.heap.as_ref(),
@@ -7800,7 +7862,7 @@ impl Server {
         Ok(())
     }
 
-    fn rebuild_persistent_index_sidecars(&self) -> Result<(), ServerError> {
+    fn rebuild_persistent_index_sidecars(&self, recovered_lsn: Lsn) -> Result<(), ServerError> {
         let snapshot = self.catalog_snapshot();
         let mut hnsw_indexes = Vec::new();
         let mut ivfflat_indexes = Vec::new();
@@ -7869,14 +7931,34 @@ impl Server {
                         )?;
                         let payload = ann_payload_option_from_catalog(&index.options)?
                             .unwrap_or(default_payload);
-                        let hnsw = Arc::new(
-                            PageBackedHnswIndex::new_with_payload_kind(
-                                RelationId::new(index.oid.raw()),
-                                dims,
-                                metric,
-                                16,
-                                64,
-                                payload,
+                        let rel = RelationId::new(index.oid.raw());
+                        // Prefer a durable snapshot, replaying only the WAL
+                        // records above its meta.lsn high-water mark instead of
+                        // rebuilding the whole graph (an O(N^2) insert sweep).
+                        // The snapshot is trusted ONLY if from_snapshot_bytes
+                        // accepts it (crc32c + format + relation), its dims and
+                        // metric match this catalog index, AND its meta.lsn does
+                        // not exceed the durable WAL end (recovered_lsn): a
+                        // snapshot carrying ops beyond the durable WAL would
+                        // diverge from the heap on restart, so it is rejected and
+                        // we fall back to a full replay. Every failure is safe —
+                        // the WAL remains the source of truth.
+                        let snapshot_loaded = self
+                            .data_dir
+                            .as_ref()
+                            .and_then(|dd| read_vector_snapshot(dd, index.oid))
+                            .and_then(|bytes| {
+                                PageBackedHnswIndex::from_snapshot_bytes(rel, &bytes).ok()
+                            })
+                            .filter(|idx| {
+                                usize::try_from(dims).is_ok_and(|d| idx.dims() == d)
+                                    && idx.metric() == metric
+                                    && idx.snapshot_lsn() <= recovered_lsn
+                            });
+                        let hnsw = Arc::new(match snapshot_loaded {
+                            Some(idx) => idx,
+                            None => PageBackedHnswIndex::new_with_payload_kind(
+                                rel, dims, metric, 16, 64, payload,
                             )
                             .map_err(|e| {
                                 ServerError::ddl(format!(
@@ -7884,7 +7966,7 @@ impl Server {
                                     index.name
                                 ))
                             })?,
-                        );
+                        });
                         hnsw_indexes.push(Arc::clone(&hnsw));
                         constraints.indexes.insert(
                             index.oid,
@@ -8201,13 +8283,25 @@ impl Server {
         };
         let wal_dir = data_dir.join("pg_wal");
         let recovery_replay_target = recovery_replay_target_from_data_dir(data_dir)?;
+        // Track each record's WAL LSN (cumulative byte offset, exactly as the
+        // heap recovery pass does) so HNSW replay can be LSN-bounded: a record
+        // whose LSN is already covered by a loaded snapshot's meta.lsn
+        // high-water mark is skipped by `redo_covered`. Without a snapshot the
+        // arena starts at meta.lsn == 0 and every record applies (full rebuild).
+        let mut record_lsn = Lsn::ZERO;
         ultrasql_wal::recover_with_target(&wal_dir, recovery_replay_target, |record| {
+            let current_lsn = record_lsn;
+            record_lsn = record_lsn
+                .checked_advance(u64::from(record.header.total_length))
+                .ok_or(ultrasql_wal::RecoveryError::Record(
+                    ultrasql_wal::WalRecordError::Malformed("vector replay lsn overflow"),
+                ))?;
             if record.header.record_type == RecordType::HnswOp {
                 for hnsw in hnsw_indexes {
                     if !hnsw.is_valid() {
                         continue;
                     }
-                    if let Err(e) = hnsw.apply_wal_record(record) {
+                    if let Err(e) = hnsw.apply_wal_record_at(current_lsn, record) {
                         hnsw.invalidate();
                         tracing::warn!(
                             error = %e,

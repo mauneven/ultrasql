@@ -802,6 +802,92 @@ async fn vector_index_and_heap_agree_after_transactional_update_and_crash() {
 }
 
 #[tokio::test]
+async fn hnsw_snapshot_at_checkpoint_bounds_restart_replay_and_stays_correct() {
+    // A CHECKPOINT writes a durable per-index HNSW snapshot; a restart loads it
+    // and replays only the WAL records appended AFTER the checkpoint instead of
+    // rebuilding the whole graph. Correctness must match a full replay: vectors
+    // inserted both before and after the checkpoint are found. The post-
+    // checkpoint vectors live only in the WAL above the snapshot's meta.lsn, so
+    // if the LSN-bounded replay wrongly skipped them they would be missing here.
+    let dir = tempfile::tempdir().expect("tempdir");
+    {
+        let (client, _conn, server_handle) =
+            start_crash_persistent_server_and_connect(dir.path()).await;
+        client
+            .batch_execute("CREATE TABLE pts (id INT NOT NULL, embedding VECTOR(3))")
+            .await
+            .expect("create table");
+        client
+            .batch_execute("CREATE INDEX pts_emb ON pts USING hnsw (embedding vector_l2_ops)")
+            .await
+            .expect("create index");
+        // Pre-checkpoint: 100 vectors along the x axis at [i,0,0], i=1..=100.
+        // 100 > the default ef_search (64), so searches traverse the graph
+        // rather than exact-scanning — this actually exercises the index.
+        let pre: String = (1..=100)
+            .map(|i| format!("({i}, '[{i},0,0]')"))
+            .collect::<Vec<_>>()
+            .join(",");
+        client
+            .batch_execute(&format!("INSERT INTO pts VALUES {pre}"))
+            .await
+            .expect("insert pre-checkpoint rows");
+        // Checkpoint: persists a snapshot reflecting ids 1..=100.
+        client
+            .batch_execute("CHECKPOINT")
+            .await
+            .expect("checkpoint");
+        // Post-checkpoint: recorded ONLY in the WAL above the snapshot LSN.
+        // id 200 sits at the origin (the new nearest), id 201 just past it.
+        client
+            .batch_execute("INSERT INTO pts VALUES (200, '[0,0,0]'), (201, '[0.5,0,0]')")
+            .await
+            .expect("insert post-checkpoint rows");
+        shutdown(client, server_handle).await;
+    }
+    // The checkpoint must have written a snapshot file.
+    let snap_count = std::fs::read_dir(dir.path().join("vecsnap"))
+        .map(|rd| {
+            rd.filter_map(Result::ok)
+                .filter(|e| e.path().extension().is_some_and(|x| x == "snap"))
+                .count()
+        })
+        .unwrap_or(0);
+    assert!(
+        snap_count >= 1,
+        "CHECKPOINT must write at least one vector-index snapshot"
+    );
+    {
+        let (client, _conn, server_handle) =
+            start_crash_persistent_server_and_connect(dir.path()).await;
+        // Nearest to the origin must be the POST-checkpoint id=200, then id=201,
+        // then the pre-checkpoint id=1. Seeing 200/201 proves the bounded replay
+        // applied the WAL records above the snapshot; seeing 1 proves the
+        // snapshot itself loaded.
+        let near = client
+            .simple_query("SELECT id FROM pts ORDER BY embedding <-> VECTOR '[0,0,0]' LIMIT 3")
+            .await
+            .expect("nearest search after restart");
+        assert_eq!(
+            simple_rows(&near),
+            vec![
+                vec!["200".to_owned()],
+                vec!["201".to_owned()],
+                vec!["1".to_owned()],
+            ],
+            "post-checkpoint vectors must survive a snapshot-bounded restart"
+        );
+        // A pre-checkpoint vector at the far end is also intact.
+        let far = client
+            .simple_query("SELECT id FROM pts ORDER BY embedding <-> VECTOR '[100,0,0]' LIMIT 1")
+            .await
+            .expect("far search after restart");
+        assert_eq!(simple_rows(&far), vec![vec!["100".to_owned()]]);
+        shutdown(client, server_handle).await;
+    }
+}
+
+#[tokio::test]
 async fn hnsw_ef_search_session_knob_is_accepted_and_applied() {
     // pgvector-compatible per-session ef_search knob: SET is accepted, SHOW
     // reflects it, and a query under the override returns correct neighbors.

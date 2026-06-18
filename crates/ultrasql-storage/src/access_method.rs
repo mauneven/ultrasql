@@ -2094,6 +2094,12 @@ impl PageBackedHnswIndex {
         self.metric
     }
 
+    /// Vector dimensionality this graph indexes.
+    #[must_use]
+    pub const fn dims(&self) -> usize {
+        self.dims
+    }
+
     /// Whether the graph has at least one live node available for search.
     #[must_use]
     pub fn is_available(&self) -> bool {
