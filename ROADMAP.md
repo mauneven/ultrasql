@@ -112,23 +112,27 @@ file focused on what still blocks production.
   checkpoint and loaded at restart, with LSN-bounded replay
   (`apply_wal_record_at` + `redo_covered`) applying only the WAL above the
   snapshot's `meta.lsn`; a snapshot is trusted only if its `meta.lsn` is within
-  the durable WAL end, else it falls back to full replay. IVFFlat still rebuilds
-  from full WAL replay — its snapshot is the remaining piece of (4)). The
-  mechanic is DONE: `ultrasql_wal::truncate_below` recycles whole segments below
-  a crash-safe floor (the `wal.manifest` floor is written and fsynced *before*
-  any segment is unlinked, so an interrupted truncation only leaves harmless
-  below-floor stragglers that the next pass sweeps), and `perform_checkpoint`
-  computes that floor as `min(redo_from, oldest in-progress transaction's first
-  written LSN, min HNSW snapshot LSN)` — never recycling a live transaction's
-  records (an unknown XID defaults to `InProgress` forever) nor WAL an index
-  still needs. Recycling is disabled outright when any IVFFlat index is present
-  or a required snapshot did not become durable. Remaining: (a) a durable
-  IVFFlat snapshot so IVFFlat databases also recycle (currently they never do);
-  (b) auto-trigger recycling from the background checkpointer — today the floor
-  only advances on an explicit `CHECKPOINT`; (c) a kill-9 + disk-full
-  crash-recovery drill after truncation. Restart time is now bounded by
-  un-checkpointed work rather than total history for non-IVFFlat databases that
-  checkpoint.
+  the durable WAL end, else it falls back to full replay. DONE for IVFFlat too:
+  `PageBackedIvfFlatIndex` now has the symmetric `encode_snapshot`/
+  `from_snapshot_bytes` (serializing the authoritative logical state — config,
+  centroid slots, and entries — and re-deriving pages on load) plus a `meta_lsn`
+  high-water mark and the same `redo_covered` replay gate, written and loaded
+  with the identical LSN/dims/metric trust check). The mechanic is DONE:
+  `ultrasql_wal::truncate_below` recycles whole segments below a crash-safe floor
+  (the `wal.manifest` floor is written and fsynced *before* any segment is
+  unlinked, so an interrupted truncation only leaves harmless below-floor
+  stragglers that the next pass sweeps), and `perform_checkpoint` computes that
+  floor as `min(redo_from, oldest in-progress transaction's first written LSN,
+  min HNSW snapshot LSN, min IVFFlat snapshot LSN)` — never recycling a live
+  transaction's records (an unknown XID defaults to `InProgress` forever) nor WAL
+  an index still needs; an index with no logged mutation (snapshot LSN 0, hence
+  no WAL of its own) is excluded from the floor so it does not block recycling.
+  Recycling is disabled outright only when a required snapshot did not become
+  durable. Remaining: (a) auto-trigger recycling from the background checkpointer
+  — today the floor only advances on an explicit `CHECKPOINT`; (b) a kill-9 +
+  disk-full crash-recovery drill after truncation. Restart time is now bounded by
+  un-checkpointed work rather than total history for any database that
+  checkpoints.
 - OLTP commit-path losses (`insert_throughput_10k` → PostgreSQL,
   `mixed_oltp_pgbench_like` → SQLite/PostgreSQL): the per-commit cost is
   dominated by `full_fsync` (F_FULLFSYNC, true power-loss durability) in
