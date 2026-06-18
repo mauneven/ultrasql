@@ -62,6 +62,19 @@ fn push_proj(plan: &LogicalPlan) -> Result<Option<LogicalPlan>, OptimizeError> {
                 return Ok(None);
             }
 
+            // A scalar subquery / EXISTS / IN-subquery references outer (scan)
+            // columns through `OuterColumn` nodes that `collect_refs` treats as
+            // opaque leaves, so `column_indices_referenced` cannot see them.
+            // Narrowing the scan would drop columns the subquery still needs and
+            // leave its `OuterColumn` indices dangling, so refuse to prune when
+            // any projection expression carries a subquery or outer-column ref.
+            if exprs
+                .iter()
+                .any(|(e, _)| expr_contains_subquery_or_outer(e))
+            {
+                return Ok(None);
+            }
+
             // Collect all column indices referenced in the project expressions.
             let used: HashSet<usize> = exprs
                 .iter()
@@ -197,6 +210,28 @@ fn push_proj(plan: &LogicalPlan) -> Result<Option<LogicalPlan>, OptimizeError> {
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+/// Returns `true` if `expr` contains a scalar subquery, `EXISTS`, `IN`-subquery,
+/// or an `OuterColumn` reference. Such expressions reference outer columns
+/// opaquely, so scan-column pruning underneath them is unsafe.
+fn expr_contains_subquery_or_outer(expr: &ScalarExpr) -> bool {
+    match expr {
+        ScalarExpr::OuterColumn { .. }
+        | ScalarExpr::ScalarSubquery { .. }
+        | ScalarExpr::Exists { .. }
+        | ScalarExpr::InSubquery { .. } => true,
+        ScalarExpr::Binary { left, right, .. } => {
+            expr_contains_subquery_or_outer(left) || expr_contains_subquery_or_outer(right)
+        }
+        ScalarExpr::Unary { expr, .. } | ScalarExpr::IsNull { expr, .. } => {
+            expr_contains_subquery_or_outer(expr)
+        }
+        ScalarExpr::FunctionCall { args, .. } => args.iter().any(expr_contains_subquery_or_outer),
+        ScalarExpr::Column { .. } | ScalarExpr::Literal { .. } | ScalarExpr::Parameter { .. } => {
+            false
+        }
+    }
+}
 
 /// Collect all column indices referenced by `expr`.
 pub(crate) fn column_indices_referenced(expr: &ScalarExpr) -> HashSet<usize> {
@@ -380,6 +415,46 @@ mod tests {
         };
         let rule = ProjectionPushdown;
         assert!(rule.apply(&plan).expect("no error").is_none());
+    }
+
+    // --- Edge-case: projection carries a subquery (opaque outer refs) ---
+
+    #[test]
+    fn does_not_prune_scan_when_projection_contains_subquery() {
+        let scan = LogicalPlan::Scan {
+            table: "t".into(),
+            schema: three_col_schema(),
+            projection: None,
+        };
+        // A correlated scalar subquery references an outer (scan) column through
+        // `OuterColumn` nodes that `collect_refs` cannot see. `col[0]` is the
+        // only visibly-referenced column, so without the guard the rule would
+        // narrow the scan to [0] and leave the subquery's outer indices
+        // dangling. It must bail instead.
+        let subquery = ScalarExpr::ScalarSubquery {
+            subplan: Box::new(LogicalPlan::Scan {
+                table: "s".into(),
+                schema: Schema::new([Field::required("v", DataType::Int32)]).expect("schema ok"),
+                projection: None,
+            }),
+            correlated: true,
+            data_type: DataType::Int32,
+        };
+        let proj_schema = Schema::new([
+            Field::required("a", DataType::Int32),
+            Field::nullable("sub", DataType::Int32),
+        ])
+        .expect("schema ok");
+        let plan = LogicalPlan::Project {
+            input: Box::new(scan),
+            exprs: vec![(col("a", 0), "a".into()), (subquery, "sub".into())],
+            schema: proj_schema,
+        };
+        let rule = ProjectionPushdown;
+        assert!(
+            rule.apply(&plan).expect("no error").is_none(),
+            "must not prune a scan beneath a projection containing a subquery"
+        );
     }
 
     // --- No-op: all columns used ---

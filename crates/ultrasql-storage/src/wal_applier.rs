@@ -1053,9 +1053,16 @@ impl<L: PageLoader + 'static> HeapTarget for HeapAccess<L> {
                 })?;
 
             let mut page = guard.write();
-            if should_skip_redo(&page, record_lsn) {
-                return Ok(());
-            }
+            // A full-page-write carries the authoritative page image and exists
+            // precisely to repair a torn on-disk page, so it must be restored
+            // UNCONDITIONALLY. The usual `should_skip_redo` LSN gate is invalid
+            // here: a torn page's 8-byte LSN field may read >= the FPW record
+            // LSN while the rest of the page is inconsistent, which would skip
+            // the very repair the FPW provides and leave silent corruption.
+            // (Subsequent *incremental* redo records remain LSN-gated and
+            // re-apply on top of this restored image, so recovery stays
+            // idempotent.) This mirrors PostgreSQL, which restores a backup
+            // block image without consulting the page LSN.
             if payload.page_bytes.len() != PAGE_SIZE {
                 return Err(ApplyError::Refused {
                     operation: "fpw",
@@ -1627,7 +1634,13 @@ mod tests {
     }
 
     #[test]
-    fn apply_fpw_at_lsn_skips_when_page_lsn_is_newer() {
+    fn apply_fpw_at_lsn_restores_even_when_page_lsn_is_newer() {
+        // A torn on-disk page can carry a stale-but-high LSN while its body is
+        // inconsistent, so a full-page-write must be restored even when the
+        // current page LSN looks newer than the FPW record LSN. Gating the FPW
+        // on the page LSN (the previous behavior) would skip the torn-page
+        // repair and leave silent corruption. Incremental redo records that
+        // follow remain LSN-gated.
         let heap = make_heap();
         heap.insert(
             rel(),
@@ -1643,12 +1656,11 @@ mod tests {
         )
         .unwrap();
         let pid = page_id(0);
-        let original = {
+        {
             let guard = heap.pool.get_page(pid).unwrap();
             let mut page = guard.write();
             page.set_lsn(200);
-            page.as_bytes().to_vec()
-        };
+        }
         let zeroed = crate::page::Page::new_heap();
         let payload = FullPageWritePayload {
             page: pid,
@@ -1658,11 +1670,15 @@ mod tests {
         heap.apply_full_page_write_at_lsn(&payload, Lsn::new(100))
             .unwrap();
 
+        // The page must now be the restored FPW image, stamped with the FPW's
+        // record LSN (100), not the pre-existing LSN-200 page.
+        let mut expected = crate::page::Page::new_heap();
+        expected.set_lsn(100);
         let guard = heap.pool.get_page(pid).unwrap();
         assert_eq!(
             guard.read().as_bytes(),
-            original.as_slice(),
-            "old FPW redo must not replace newer page image"
+            expected.as_bytes(),
+            "FPW must restore its authoritative image even over a newer page LSN (torn-page repair)"
         );
     }
 

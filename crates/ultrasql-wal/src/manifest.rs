@@ -133,8 +133,12 @@ pub fn write_floor(wal_dir: &Path, floor: WalFloor) -> Result<(), RecoveryError>
         file.sync_all()?;
     }
     std::fs::rename(&tmp_path, &final_path)?;
+    // Make the manifest rename durable. Opening a directory as a file is not
+    // portable (fails on Windows), so tolerate a failed open; but a failed
+    // fsync on a handle that did open means the new floor may not survive a
+    // crash, so propagate it rather than silently dropping it.
     if let Ok(dir) = std::fs::File::open(wal_dir) {
-        let _ = dir.sync_all();
+        dir.sync_all()?;
     }
     Ok(())
 }

@@ -39,6 +39,20 @@ fn table_entry_lookup_key(entry: &TableEntry) -> String {
     ultrasql_catalog::table_lookup_key(&entry.schema_name, &entry.name)
 }
 
+/// Report a best-effort DDL rollback-cleanup failure. These persistent-catalog
+/// drops run on the error-recovery path after a half-created object; a failure
+/// here cannot lose committed user data but can leave an orphaned catalog
+/// entry, so surface it at `warn` rather than silently discarding the result.
+fn log_failed_ddl_rollback<T, E: std::fmt::Display>(result: Result<T, E>, what: &str) {
+    if let Err(e) = result {
+        tracing::warn!(
+            error = %e,
+            operation = what,
+            "best-effort DDL rollback cleanup failed; catalog may retain an orphaned entry"
+        );
+    }
+}
+
 struct CreateIndexProgressGuard<'a> {
     recorder: &'a crate::workload::WorkloadRecorder,
     pid: u32,
@@ -300,7 +314,10 @@ where
             ddl_txn.current_command,
         );
         if let Err(e) = persist_result {
-            let _ = self.state.persistent_catalog.drop_enum_type(&type_key);
+            log_failed_ddl_rollback(
+                self.state.persistent_catalog.drop_enum_type(&type_key),
+                "drop enum type",
+            );
             return Err(self.rollback_catalog_transaction_after_error(
                 ddl_txn,
                 e.into(),
@@ -363,7 +380,10 @@ where
             ddl_txn.current_command,
         );
         if let Err(e) = persist_result {
-            let _ = self.state.persistent_catalog.drop_composite_type(&type_key);
+            log_failed_ddl_rollback(
+                self.state.persistent_catalog.drop_composite_type(&type_key),
+                "drop composite type",
+            );
             return Err(self.rollback_catalog_transaction_after_error(
                 ddl_txn,
                 e.into(),
@@ -446,7 +466,10 @@ where
             ddl_txn.current_command,
         );
         if let Err(e) = persist_result {
-            let _ = self.state.persistent_catalog.drop_domain_type(&type_key);
+            log_failed_ddl_rollback(
+                self.state.persistent_catalog.drop_domain_type(&type_key),
+                "drop domain type",
+            );
             self.state.domain_constraints.remove(&entry.oid);
             return Err(self.rollback_catalog_transaction_after_error(
                 ddl_txn,
@@ -455,7 +478,10 @@ where
             ));
         }
         if let Err(e) = self.state.persist_domain_runtime_constraints_metadata() {
-            let _ = self.state.persistent_catalog.drop_domain_type(&type_key);
+            log_failed_ddl_rollback(
+                self.state.persistent_catalog.drop_domain_type(&type_key),
+                "drop domain type",
+            );
             self.state.domain_constraints.remove(&entry.oid);
             return Err(self.rollback_catalog_transaction_after_error(
                 ddl_txn,
@@ -839,7 +865,10 @@ where
             match self.create_table_unique_indexes(&entry, unique_constraints) {
                 Ok(indexes) => indexes,
                 Err(e) => {
-                    let _ = self.state.persistent_catalog.drop_table(table_name);
+                    log_failed_ddl_rollback(
+                        self.state.persistent_catalog.drop_table(table_name),
+                        "drop table",
+                    );
                     self.state.table_constraints.remove(&oid);
                     for (_, seq_key, _) in &serial_sequences {
                         self.state.sequences.remove(seq_key);
@@ -908,7 +937,10 @@ where
             Ok(())
         })();
         if let Err(e) = persist_result {
-            let _ = self.state.persistent_catalog.drop_table(table_name);
+            log_failed_ddl_rollback(
+                self.state.persistent_catalog.drop_table(table_name),
+                "drop table",
+            );
             self.state.table_constraints.remove(&oid);
             for (_, seq_key, _) in &serial_sequences {
                 self.state.sequences.remove(seq_key);
@@ -1070,7 +1102,10 @@ where
         let materialized_rows = match materialized_rows {
             Ok(rows) => rows,
             Err(e) => {
-                let _ = self.state.persistent_catalog.drop_table(&view_table);
+                log_failed_ddl_rollback(
+                    self.state.persistent_catalog.drop_table(&view_table),
+                    "drop table",
+                );
                 return Err(self.rollback_catalog_transaction_after_error(
                     ddl_txn,
                     e,
@@ -1082,7 +1117,10 @@ where
             .state
             .persist_materialized_view_runtime_metadata(&runtime, materialized_rows)
         {
-            let _ = self.state.persistent_catalog.drop_table(&view_table);
+            log_failed_ddl_rollback(
+                self.state.persistent_catalog.drop_table(&view_table),
+                "drop table",
+            );
             return Err(self.rollback_catalog_transaction_after_error(
                 ddl_txn,
                 e,
@@ -1213,7 +1251,10 @@ where
                 ddl_txn.current_command,
             );
         if let Err(e) = persist_result {
-            let _ = self.state.persistent_catalog.drop_table(&view_key);
+            log_failed_ddl_rollback(
+                self.state.persistent_catalog.drop_table(&view_key),
+                "drop table",
+            );
             return Err(self.rollback_catalog_transaction_after_error(
                 ddl_txn,
                 e.into(),
@@ -1221,7 +1262,10 @@ where
             ));
         }
         if let Err(e) = self.state.persist_regular_view_runtime_metadata(&runtime) {
-            let _ = self.state.persistent_catalog.drop_table(&view_key);
+            log_failed_ddl_rollback(
+                self.state.persistent_catalog.drop_table(&view_key),
+                "drop table",
+            );
             return Err(self.rollback_catalog_transaction_after_error(
                 ddl_txn,
                 e,
@@ -1675,7 +1719,10 @@ where
                 ddl_txn.xid,
                 ddl_txn.current_command,
             ) {
-                let _ = self.state.persistent_catalog.drop_index(&index_key);
+                log_failed_ddl_rollback(
+                    self.state.persistent_catalog.drop_index(&index_key),
+                    "drop index",
+                );
                 return Err(self.rollback_catalog_transaction_after_error(
                     ddl_txn,
                     e.into(),
@@ -1841,7 +1888,10 @@ where
                 ddl_txn.xid,
                 ddl_txn.current_command,
             ) {
-                let _ = self.state.persistent_catalog.drop_index(&index_key);
+                log_failed_ddl_rollback(
+                    self.state.persistent_catalog.drop_index(&index_key),
+                    "drop index",
+                );
                 return Err(self.rollback_catalog_transaction_after_error(
                     ddl_txn,
                     e.into(),
@@ -2005,7 +2055,10 @@ where
                 ddl_txn.xid,
                 ddl_txn.current_command,
             ) {
-                let _ = self.state.persistent_catalog.drop_index(&index_key);
+                log_failed_ddl_rollback(
+                    self.state.persistent_catalog.drop_index(&index_key),
+                    "drop index",
+                );
                 return Err(self.rollback_catalog_transaction_after_error(
                     ddl_txn,
                     e.into(),
@@ -2194,7 +2247,10 @@ where
             ddl_txn.xid,
             ddl_txn.current_command,
         ) {
-            let _ = self.state.persistent_catalog.drop_index(&index_key);
+            log_failed_ddl_rollback(
+                self.state.persistent_catalog.drop_index(&index_key),
+                "drop index",
+            );
             return Err(self.rollback_catalog_transaction_after_error(
                 ddl_txn,
                 e.into(),
@@ -2498,7 +2554,10 @@ where
                     .collect::<Vec<_>>();
                 if let Some((_, runtime)) = self.state.time_partitions.remove(name) {
                     for chunk in runtime.chunks.iter() {
-                        let _ = self.state.persistent_catalog.drop_table(&chunk.table_name);
+                        log_failed_ddl_rollback(
+                            self.state.persistent_catalog.drop_table(&chunk.table_name),
+                            "drop table",
+                        );
                     }
                 }
                 self.state.columnar_storage.remove(name);

@@ -861,8 +861,18 @@ fn bind_set_op(
                         lf.data_type, rf.data_type
                     ))
                 })?
-            } else {
+            } else if (lf.data_type.is_textlike() && rf.data_type.is_textlike())
+                || expr_type::comparable(&lf.data_type, &rf.data_type)
+            {
                 lf.data_type.clone()
+            } else {
+                // Reject corresponding columns whose types are not unifiable
+                // (e.g. INT vs TEXT) rather than silently coercing the right
+                // side into the left column's type and returning wrong data.
+                return Err(PlanError::TypeMismatch(format!(
+                    "set operation column type mismatch: {} vs {}",
+                    lf.data_type, rf.data_type
+                )));
             };
             Ok(Field::nullable(lf.name.clone(), out_ty))
         })

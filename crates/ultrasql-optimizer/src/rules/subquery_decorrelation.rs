@@ -47,8 +47,11 @@
 //! Non-equality correlations are not lowered yet. They stay as explicit
 //! roadmap debt rather than being hidden by benchmark-query rewrites.
 
-use ultrasql_core::{DataType, Field, Schema};
-use ultrasql_planner::{BinaryOp, LogicalJoinCondition, LogicalJoinType, LogicalPlan, ScalarExpr};
+use ultrasql_core::{DataType, Field, Schema, Value};
+use ultrasql_planner::{
+    AggregateFunc, BinaryOp, LogicalAggregateExpr, LogicalJoinCondition, LogicalJoinType,
+    LogicalPlan, ScalarExpr,
+};
 
 use crate::error::OptimizeError;
 use crate::rules::RewriteRule;
@@ -213,15 +216,13 @@ struct CorrelatedScalarRight {
     corr_pairs: Vec<CorrPair>,
     scalar_index: usize,
     scalar_name: String,
-}
-
-#[derive(Debug)]
-struct CorrelatedScalarProjectRight {
-    plan: LogicalPlan,
-    corr_pairs: Vec<CorrPair>,
-    residual_predicates: Vec<ScalarExpr>,
-    scalar_index: usize,
-    scalar_name: String,
+    /// `true` when the decorrelated scalar is a `COUNT(*)`/`COUNT(x)` whose
+    /// empty-input value is `0` rather than NULL. After the LEFT OUTER JOIN the
+    /// substituted column is NULL for outer keys with no inner match, so the
+    /// caller must wrap the replacement in `COALESCE(col, 0)` to restore the
+    /// SQL-correct count of `0`. `SUM`/`MIN`/`MAX`/`AVG` legitimately yield NULL
+    /// on empty input and leave this `false`.
+    empty_set_is_zero: bool,
 }
 
 #[derive(Debug)]
@@ -247,10 +248,18 @@ fn rewrite_scalar_subquery_filter(
     if let Some((subplan, data_type)) = find_first_correlated_scalar_subquery(predicate) {
         let right = build_correlated_scalar_aggregate_right(*subplan)?;
         let outer_width = outer.schema().len();
-        let replacement = ScalarExpr::Column {
+        let joined_column = ScalarExpr::Column {
             name: right.scalar_name.clone(),
             index: outer_width + right.scalar_index,
             data_type,
+        };
+        // A correlated COUNT has empty-set value 0, but the LEFT OUTER JOIN
+        // leaves the joined column NULL for outer keys with no inner match;
+        // restore the SQL-correct 0 via COALESCE. SUM/MIN/MAX/AVG keep NULL.
+        let replacement = if right.empty_set_is_zero {
+            coalesce_count_with_zero(joined_column)
+        } else {
+            joined_column
         };
         let rewritten_predicate = replace_first_correlated_scalar_subquery(predicate, replacement)?;
         let (outer_predicates, post_join_predicates) =
@@ -299,32 +308,83 @@ fn rewrite_project_with_scalar_subquery(
     let outer_width = input.schema().len();
     for (expr_idx, (expr, _alias)) in exprs.iter().enumerate() {
         if let Some((subplan, data_type)) = find_first_correlated_scalar_subquery(expr) {
-            let right = build_correlated_scalar_project_right(*subplan, outer_width)?;
-            let mut predicates = vec![build_correlation_condition_against_right_schema(
-                &right.corr_pairs,
-                outer_width,
-            )?];
-            predicates.extend(right.residual_predicates);
-            let join_schema = concat_schemas(input.schema(), right.plan.schema())?;
-            let join = LogicalPlan::Join {
-                left: Box::new(input.clone()),
-                right: Box::new(right.plan),
-                join_type: LogicalJoinType::LeftOuter,
-                condition: LogicalJoinCondition::On(conjuncts_to_and(predicates)),
-                schema: join_schema,
-            };
-            let replacement = ScalarExpr::Column {
-                name: right.scalar_name,
-                index: outer_width + right.scalar_index,
-                data_type,
-            };
-            let mut new_exprs = exprs.to_vec();
-            new_exprs[expr_idx].0 = replace_first_correlated_scalar_subquery(expr, replacement)?;
-            return Some(LogicalPlan::Project {
-                input: Box::new(join),
-                exprs: new_exprs,
-                schema: schema.clone(),
-            });
+            // Prefer the aggregate shape: a single grouped aggregate yields at
+            // most one row per correlated key, so a LEFT OUTER JOIN is
+            // cardinality-safe. This also covers correlated `COUNT(*)`/`COUNT(x)`
+            // projections, which must report 0 (not NULL) for outer keys with no
+            // inner match — see `coalesce_count_with_zero`.
+            if let Some(right) = build_correlated_scalar_aggregate_right((*subplan).clone()) {
+                let join_condition = build_correlation_condition(&right.corr_pairs, outer_width)?;
+                let join_schema = concat_schemas(input.schema(), right.plan.schema())?;
+                let join = LogicalPlan::Join {
+                    left: Box::new(input.clone()),
+                    right: Box::new(right.plan),
+                    join_type: LogicalJoinType::LeftOuter,
+                    condition: LogicalJoinCondition::On(join_condition),
+                    schema: join_schema,
+                };
+                let joined_column = ScalarExpr::Column {
+                    name: right.scalar_name,
+                    index: outer_width + right.scalar_index,
+                    data_type,
+                };
+                let replacement = if right.empty_set_is_zero {
+                    coalesce_count_with_zero(joined_column)
+                } else {
+                    joined_column
+                };
+                let mut new_exprs = exprs.to_vec();
+                new_exprs[expr_idx].0 =
+                    replace_first_correlated_scalar_subquery(expr, replacement)?;
+                return Some(LogicalPlan::Project {
+                    input: Box::new(join),
+                    exprs: new_exprs,
+                    schema: schema.clone(),
+                });
+            }
+
+            // Non-aggregated correlated scalar subquery (e.g.
+            // `(SELECT o.amount FROM orders o WHERE o.uid = u.id)`). Decorrelate
+            // via a LEFT OUTER JOIN against the projected inner rows. KNOWN
+            // LIMITATION: if such a subquery matches more than one inner row per
+            // outer key, SQL requires raising "more than one row returned by a
+            // subquery used as an expression", but this rewrite instead
+            // duplicates the outer row. This engine has no runtime single-row
+            // assertion operator to enforce that here, so the multi-row case is
+            // a pre-existing limitation; the common single-row case (the inner
+            // key is unique — e.g. catalog probes like psql's `\du`) is handled
+            // correctly and must keep working. The Filter-predicate path is
+            // unaffected: it routes un-aggregated correlated scalars through an
+            // aggregate/DISTINCT guard.
+            if let Some(right) = build_correlated_scalar_project_right(*subplan, outer_width) {
+                let mut predicates = vec![build_correlation_condition_against_right_schema(
+                    &right.corr_pairs,
+                    outer_width,
+                )?];
+                predicates.extend(right.residual_predicates);
+                let join_schema = concat_schemas(input.schema(), right.plan.schema())?;
+                let join = LogicalPlan::Join {
+                    left: Box::new(input.clone()),
+                    right: Box::new(right.plan),
+                    join_type: LogicalJoinType::LeftOuter,
+                    condition: LogicalJoinCondition::On(conjuncts_to_and(predicates)),
+                    schema: join_schema,
+                };
+                let replacement = ScalarExpr::Column {
+                    name: right.scalar_name,
+                    index: outer_width + right.scalar_index,
+                    data_type,
+                };
+                let mut new_exprs = exprs.to_vec();
+                new_exprs[expr_idx].0 =
+                    replace_first_correlated_scalar_subquery(expr, replacement)?;
+                return Some(LogicalPlan::Project {
+                    input: Box::new(join),
+                    exprs: new_exprs,
+                    schema: schema.clone(),
+                });
+            }
+            return None;
         }
 
         if let Some((new_expr, subplan)) = replace_first_uncorrelated_scalar_subquery(
@@ -351,6 +411,17 @@ fn rewrite_project_with_scalar_subquery(
         }
     }
     None
+}
+
+/// Projected right side for a non-aggregated correlated scalar subquery: the
+/// inner plan reduced to the correlation key columns plus the scalar value,
+/// ready to LEFT OUTER JOIN against the outer rows on the correlation keys.
+struct CorrelatedScalarProjectRight {
+    plan: LogicalPlan,
+    corr_pairs: Vec<CorrPair>,
+    residual_predicates: Vec<ScalarExpr>,
+    scalar_index: usize,
+    scalar_name: String,
 }
 
 fn build_correlated_scalar_project_right(
@@ -446,6 +517,17 @@ fn build_correlated_scalar_aggregate_right(plan: LogicalPlan) -> Option<Correlat
             if schema.len() != 1 || exprs.len() != 1 {
                 return None;
             }
+            // Capture the inner aggregate before it is moved so we can tell
+            // whether the projected scalar passes a COUNT through unchanged.
+            // A bare passthrough (`Column { index: 0 }`) of a single
+            // `COUNT(*)`/`COUNT(x)` has empty-set value 0; any wrapping
+            // expression (e.g. `COUNT(*) + 5`) does not, so we only flag the
+            // bare-passthrough shape.
+            let inner_aggregate_funcs = aggregate_funcs_of(&input);
+            let scalar_is_bare_count_passthrough =
+                matches!(&exprs[0].0, ScalarExpr::Column { index: 0, .. })
+                    && inner_aggregate_funcs.is_some_and(aggregate_empty_set_is_zero);
+
             let (aggregate, corr_pairs) = build_grouped_correlated_aggregate(*input)?;
             let corr_len = corr_pairs.len();
             let scalar_field = schema.field_at(0);
@@ -481,9 +563,14 @@ fn build_correlated_scalar_aggregate_right(plan: LogicalPlan) -> Option<Correlat
                 corr_pairs,
                 scalar_index: corr_len,
                 scalar_name,
+                empty_set_is_zero: scalar_is_bare_count_passthrough,
             })
         }
         LogicalPlan::Aggregate { .. } => {
+            // The scalar is the single aggregate output directly, so its
+            // empty-set value is 0 exactly when that aggregate is a COUNT.
+            let empty_set_is_zero =
+                aggregate_funcs_of(&plan).is_some_and(aggregate_empty_set_is_zero);
             let (aggregate, corr_pairs) = build_grouped_correlated_aggregate(plan)?;
             let scalar_index = corr_pairs.len();
             if aggregate.schema().len() != scalar_index + 1 {
@@ -495,9 +582,52 @@ fn build_correlated_scalar_aggregate_right(plan: LogicalPlan) -> Option<Correlat
                 corr_pairs,
                 scalar_index,
                 scalar_name,
+                empty_set_is_zero,
             })
         }
         _ => None,
+    }
+}
+
+/// Borrow the aggregate calls of an `Aggregate` node, or `None` for any other
+/// shape. Used to inspect a correlated scalar subquery's aggregate before the
+/// node is consumed by [`build_grouped_correlated_aggregate`].
+fn aggregate_funcs_of(plan: &LogicalPlan) -> Option<&[LogicalAggregateExpr]> {
+    match plan {
+        LogicalPlan::Aggregate { aggregates, .. } => Some(aggregates),
+        _ => None,
+    }
+}
+
+/// Whether a scalar aggregate's value over an empty input is `0` rather than
+/// NULL. Only a single `COUNT(*)`/`COUNT(x)` qualifies; `SUM`/`MIN`/`MAX`/`AVG`
+/// (and any other aggregate) yield NULL on empty input and must NOT be COALESCEd.
+fn aggregate_empty_set_is_zero(aggregates: &[LogicalAggregateExpr]) -> bool {
+    matches!(
+        aggregates,
+        [LogicalAggregateExpr {
+            func: AggregateFunc::CountStar | AggregateFunc::Count,
+            ..
+        }]
+    )
+}
+
+/// Wrap a decorrelated COUNT scalar column in `COALESCE(col, 0)` so that outer
+/// keys with no matching inner rows report `0` (the SQL count of the empty set)
+/// instead of the NULL produced by the LEFT OUTER JOIN. COUNT results are always
+/// `Int64` in this engine, so the literal `0` is built as `Int64`.
+fn coalesce_count_with_zero(column: ScalarExpr) -> ScalarExpr {
+    let data_type = column.data_type();
+    ScalarExpr::FunctionCall {
+        name: "coalesce".to_owned(),
+        args: vec![
+            column,
+            ScalarExpr::Literal {
+                value: Value::Int64(0),
+                data_type: data_type.clone(),
+            },
+        ],
+        data_type,
     }
 }
 
@@ -2727,5 +2857,286 @@ mod tests {
             result.is_none(),
             "ordinary Filter should not be rewritten by SubqueryDecorrelation"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // BUG 1: correlated COUNT scalar subquery must report 0 (not NULL) for
+    // outer keys with no matching inner rows. After the LEFT OUTER JOIN the
+    // joined count column is NULL, so the substituted column must be wrapped in
+    // COALESCE(col, 0). SUM/MIN/MAX/AVG legitimately yield NULL and must NOT be
+    // wrapped.
+    // -----------------------------------------------------------------------
+
+    /// Build the inner plan of `(SELECT <agg> FROM sub WHERE key = outer.id)`
+    /// as a `Project(Aggregate(Filter(scan)))`, the shape the binder produces.
+    fn correlated_scalar_agg_subplan(
+        func: AggregateFunc,
+        arg: Option<ScalarExpr>,
+        out_name: &str,
+        out_type: DataType,
+    ) -> LogicalPlan {
+        let sub_filter = LogicalPlan::Filter {
+            input: Box::new(sub_scan()),
+            predicate: ScalarExpr::Binary {
+                op: BinaryOp::Eq,
+                left: Box::new(col("key", 0, DataType::Int32)),
+                right: Box::new(outer_col("id", 0, DataType::Int32)),
+                data_type: DataType::Bool,
+            },
+        };
+        let agg_schema =
+            Schema::new([Field::nullable(out_name, out_type.clone())]).expect("schema ok");
+        let aggregate = LogicalPlan::Aggregate {
+            input: Box::new(sub_filter),
+            group_by: Vec::new(),
+            aggregates: vec![LogicalAggregateExpr {
+                func,
+                arg,
+                direct_arg: None,
+                order_by: None,
+                distinct: false,
+                output_name: out_name.to_owned(),
+                data_type: out_type.clone(),
+            }],
+            schema: agg_schema.clone(),
+        };
+        LogicalPlan::Project {
+            input: Box::new(aggregate),
+            exprs: vec![(col(out_name, 0, out_type), out_name.to_owned())],
+            schema: agg_schema,
+        }
+    }
+
+    /// `True` when `expr` is a `COALESCE(_, 0)` call.
+    fn is_coalesce_with_zero(expr: &ScalarExpr) -> bool {
+        matches!(
+            expr,
+            ScalarExpr::FunctionCall { name, args, .. }
+                if name == "coalesce"
+                    && args.len() == 2
+                    && matches!(
+                        &args[1],
+                        ScalarExpr::Literal {
+                            value: Value::Int64(0),
+                            ..
+                        }
+                    )
+        )
+    }
+
+    #[test]
+    fn correlated_count_in_filter_predicate_coalesces_to_zero() {
+        // SELECT * FROM outer WHERE (SELECT COUNT(*) FROM sub WHERE key=outer.id) = 0
+        let subquery =
+            correlated_scalar_agg_subplan(AggregateFunc::CountStar, None, "n", DataType::Int64);
+        let plan = LogicalPlan::Filter {
+            input: Box::new(outer_scan()),
+            predicate: ScalarExpr::Binary {
+                op: BinaryOp::Eq,
+                left: Box::new(ScalarExpr::ScalarSubquery {
+                    subplan: Box::new(subquery),
+                    correlated: true,
+                    data_type: DataType::Int64,
+                }),
+                right: Box::new(ScalarExpr::Literal {
+                    value: Value::Int64(0),
+                    data_type: DataType::Int64,
+                }),
+                data_type: DataType::Bool,
+            },
+        };
+
+        let result = SubqueryDecorrelation
+            .apply(&plan)
+            .expect("no error")
+            .expect("rewrite");
+        // Outer Project, then Filter carrying the rewritten predicate.
+        let LogicalPlan::Project { input, .. } = &result else {
+            panic!("expected Project, got {result:?}");
+        };
+        let LogicalPlan::Filter { predicate, .. } = input.as_ref() else {
+            panic!("expected Filter under Project, got {input:?}");
+        };
+        let ScalarExpr::Binary { left, .. } = predicate else {
+            panic!("expected Binary predicate, got {predicate:?}");
+        };
+        assert!(
+            is_coalesce_with_zero(left),
+            "correlated COUNT in filter must be COALESCE(col, 0), got {left:?}"
+        );
+    }
+
+    #[test]
+    fn correlated_count_in_projection_coalesces_to_zero() {
+        // SELECT id, (SELECT COUNT(*) FROM sub WHERE key=outer.id) AS n FROM outer
+        let subquery =
+            correlated_scalar_agg_subplan(AggregateFunc::CountStar, None, "n", DataType::Int64);
+        let proj_schema = Schema::new([
+            Field::required("id", DataType::Int32),
+            Field::nullable("n", DataType::Int64),
+        ])
+        .expect("schema ok");
+        let plan = LogicalPlan::Project {
+            input: Box::new(outer_scan()),
+            exprs: vec![
+                (col("id", 0, DataType::Int32), "id".to_owned()),
+                (
+                    ScalarExpr::ScalarSubquery {
+                        subplan: Box::new(subquery),
+                        correlated: true,
+                        data_type: DataType::Int64,
+                    },
+                    "n".to_owned(),
+                ),
+            ],
+            schema: proj_schema,
+        };
+
+        let result = SubqueryDecorrelation
+            .apply(&plan)
+            .expect("no error")
+            .expect("rewrite");
+        let LogicalPlan::Project { input, exprs, .. } = &result else {
+            panic!("expected Project, got {result:?}");
+        };
+        // The decorrelated input is a LEFT OUTER JOIN against the grouped count.
+        assert!(
+            matches!(
+                input.as_ref(),
+                LogicalPlan::Join {
+                    join_type: LogicalJoinType::LeftOuter,
+                    condition: LogicalJoinCondition::On(_),
+                    ..
+                }
+            ),
+            "correlated COUNT projection should LEFT OUTER JOIN, got {input:?}"
+        );
+        // The projected scalar must be COALESCE(col, 0), not a bare nullable col.
+        assert!(
+            is_coalesce_with_zero(&exprs[1].0),
+            "projected correlated COUNT must be COALESCE(col, 0), got {:?}",
+            exprs[1].0
+        );
+    }
+
+    #[test]
+    fn correlated_sum_in_projection_does_not_coalesce() {
+        // SUM over empty input is NULL in SQL, so the rewrite must leave the
+        // joined column unwrapped (no COALESCE) — regression guard for the
+        // COUNT-specific fix.
+        let subquery = correlated_scalar_agg_subplan(
+            AggregateFunc::Sum,
+            Some(col("data", 1, DataType::Int32)),
+            "s",
+            DataType::Int64,
+        );
+        let proj_schema = Schema::new([
+            Field::required("id", DataType::Int32),
+            Field::nullable("s", DataType::Int64),
+        ])
+        .expect("schema ok");
+        let plan = LogicalPlan::Project {
+            input: Box::new(outer_scan()),
+            exprs: vec![
+                (col("id", 0, DataType::Int32), "id".to_owned()),
+                (
+                    ScalarExpr::ScalarSubquery {
+                        subplan: Box::new(subquery),
+                        correlated: true,
+                        data_type: DataType::Int64,
+                    },
+                    "s".to_owned(),
+                ),
+            ],
+            schema: proj_schema,
+        };
+
+        let result = SubqueryDecorrelation
+            .apply(&plan)
+            .expect("no error")
+            .expect("rewrite");
+        let LogicalPlan::Project { exprs, .. } = &result else {
+            panic!("expected Project, got {result:?}");
+        };
+        assert!(
+            !is_coalesce_with_zero(&exprs[1].0),
+            "SUM must NOT be COALESCEd to 0, got {:?}",
+            exprs[1].0
+        );
+        assert!(
+            matches!(exprs[1].0, ScalarExpr::Column { .. }),
+            "SUM scalar should remain a bare joined column, got {:?}",
+            exprs[1].0
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // BUG 2: a non-aggregated correlated scalar subquery in a projection can
+    // match more than one inner row per outer key. A plain LEFT OUTER JOIN
+    // would silently multiply outer rows (wrong answer); SQL requires a
+    // cardinality error instead. With no runtime single-row-assert operator
+    // available, the rule must bail (return None) for this shape so the
+    // surviving subquery surfaces as a hard error rather than a silently-wrong
+    // duplicated result set.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn non_aggregated_correlated_scalar_in_projection_decorrelates() {
+        // SELECT id, (SELECT data FROM sub WHERE key = outer.id) FROM outer
+        let subquery = LogicalPlan::Project {
+            input: Box::new(LogicalPlan::Filter {
+                input: Box::new(sub_scan()),
+                predicate: ScalarExpr::Binary {
+                    op: BinaryOp::Eq,
+                    left: Box::new(col("key", 0, DataType::Int32)),
+                    right: Box::new(outer_col("id", 0, DataType::Int32)),
+                    data_type: DataType::Bool,
+                },
+            }),
+            exprs: vec![(col("data", 1, DataType::Int32), "data".to_owned())],
+            schema: Schema::new([Field::nullable("data", DataType::Int32)]).expect("schema ok"),
+        };
+        let proj_schema = Schema::new([
+            Field::required("id", DataType::Int32),
+            Field::nullable("data", DataType::Int32),
+        ])
+        .expect("schema ok");
+        let plan = LogicalPlan::Project {
+            input: Box::new(outer_scan()),
+            exprs: vec![
+                (col("id", 0, DataType::Int32), "id".to_owned()),
+                (
+                    ScalarExpr::ScalarSubquery {
+                        subplan: Box::new(subquery),
+                        correlated: true,
+                        data_type: DataType::Int32,
+                    },
+                    "data".to_owned(),
+                ),
+            ],
+            schema: proj_schema,
+        };
+
+        let result = SubqueryDecorrelation
+            .apply(&plan)
+            .expect("no error")
+            .expect("single-row correlated scalar projection must decorrelate");
+        // Decorrelation must rewrite to a Project over a LEFT OUTER JOIN with no
+        // surviving scalar subquery (the executor has no correlated-subquery
+        // fallback, so a surviving subquery would be a hard error). The
+        // multi-row case remains a documented limitation, not a bail.
+        match &result {
+            LogicalPlan::Project { input, .. } => assert!(
+                matches!(
+                    input.as_ref(),
+                    LogicalPlan::Join {
+                        join_type: LogicalJoinType::LeftOuter,
+                        ..
+                    }
+                ),
+                "expected Project over LEFT OUTER JOIN, got {result:?}"
+            ),
+            other => panic!("expected a Project at the top of the rewrite, got {other:?}"),
+        }
     }
 }

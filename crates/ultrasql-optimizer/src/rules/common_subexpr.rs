@@ -232,10 +232,16 @@ fn maybe_hoist(
         collect_subtrees(e, &mut freq);
     }
 
-    // Step 2: filter to candidates.
+    // Step 2: filter to candidates. Volatile sub-trees (those containing
+    // `random()`, UUID generators, etc.) must never be hoisted: collapsing two
+    // textually-identical volatile expressions into a single shared evaluation
+    // changes results (e.g. two independent `random()` calls must be free to
+    // differ). Opaque subquery/outer-column leaves are likewise excluded.
     let mut candidates: Vec<(usize, ScalarExpr)> = freq
         .into_values()
-        .filter(|(count, expr)| *count >= 2 && expr_size(expr) >= MIN_TREE_SIZE)
+        .filter(|(count, expr)| {
+            *count >= 2 && expr_size(expr) >= MIN_TREE_SIZE && !contains_volatile(expr)
+        })
         .collect();
 
     if candidates.is_empty() {
@@ -301,6 +307,54 @@ fn maybe_hoist(
             schema,
         },
     )))
+}
+
+// ============================================================================
+// Volatility
+// ============================================================================
+
+/// Returns `true` for builtin functions whose value may differ between two
+/// evaluations within the same statement (non-deterministic / volatile).
+/// Stable-within-statement functions such as `now()`/`current_timestamp` are
+/// deliberately excluded — collapsing those is value-preserving.
+fn is_volatile_fn(name: &str) -> bool {
+    matches!(
+        name,
+        "random"
+            | "random_normal"
+            | "gen_random_uuid"
+            | "uuid_generate_v4"
+            | "gen_random_bytes"
+            | "clock_timestamp"
+            | "nextval"
+            | "setseed"
+    )
+}
+
+/// Returns `true` if `expr` contains any volatile function call, or any opaque
+/// subquery / outer-column leaf. Such expressions are never CSE candidates: a
+/// shared `Project` would force two independent evaluations to collapse into
+/// one, which is only sound for pure (deterministic) expressions.
+fn contains_volatile(expr: &ScalarExpr) -> bool {
+    match expr {
+        ScalarExpr::Column { .. } | ScalarExpr::Literal { .. } | ScalarExpr::Parameter { .. } => {
+            false
+        }
+        ScalarExpr::Unary { expr: inner, .. } | ScalarExpr::IsNull { expr: inner, .. } => {
+            contains_volatile(inner)
+        }
+        ScalarExpr::Binary { left, right, .. } => {
+            contains_volatile(left) || contains_volatile(right)
+        }
+        ScalarExpr::FunctionCall { name, args, .. } => {
+            is_volatile_fn(name) || args.iter().any(contains_volatile)
+        }
+        // Conservatively treat subquery leaves as non-hoistable.
+        ScalarExpr::OuterColumn { .. }
+        | ScalarExpr::ScalarSubquery { .. }
+        | ScalarExpr::Exists { .. }
+        | ScalarExpr::InSubquery { .. } => true,
+    }
 }
 
 // ============================================================================
@@ -568,6 +622,48 @@ mod tests {
         let plan = two_col_scan();
         let result = CommonSubExprElimination.apply(&plan).expect("no error");
         assert!(result.is_none(), "plain Scan should not be rewritten");
+    }
+
+    #[test]
+    fn does_not_hoist_volatile_subexpr() {
+        fn project_dup(expr: ScalarExpr) -> LogicalPlan {
+            LogicalPlan::Project {
+                input: Box::new(two_col_scan()),
+                exprs: vec![(expr.clone(), "x".to_owned()), (expr, "y".to_owned())],
+                schema: Schema::new([
+                    Field::nullable("x", DataType::Int32),
+                    Field::nullable("y", DataType::Int32),
+                ])
+                .expect("schema ok"),
+            }
+        }
+
+        // Control: a pure 4-node sub-tree duplicated twice IS hoisted.
+        let pure_plan = project_dup(neg(add(col("a", 0), col("b", 1))));
+        assert!(
+            CommonSubExprElimination
+                .apply(&pure_plan)
+                .expect("no error")
+                .is_some(),
+            "a duplicated pure sub-expression should be hoisted (control)"
+        );
+
+        // A structurally-identical sub-tree containing a volatile `random()`
+        // must NOT be hoisted: collapsing two evaluations into one would force
+        // the two `random()` results to be equal.
+        let rand_call = ScalarExpr::FunctionCall {
+            name: "random".to_owned(),
+            args: vec![],
+            data_type: DataType::Float64,
+        };
+        let volatile_plan = project_dup(neg(add(rand_call, col("b", 1))));
+        assert!(
+            CommonSubExprElimination
+                .apply(&volatile_plan)
+                .expect("no error")
+                .is_none(),
+            "a duplicated volatile (random) sub-expression must not be hoisted"
+        );
     }
 
     #[test]

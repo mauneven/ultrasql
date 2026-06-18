@@ -2721,9 +2721,14 @@ impl BlankPageLoader {
 
     /// Create a loader backed by stable segment files under `base_dir`.
     pub fn persistent(base_dir: impl AsRef<std::path::Path>) -> Result<Self, SegmentError> {
+        // Durable user data: verify page checksums on every read so silent
+        // bit-rot or a torn write on a page that escaped full-page-write
+        // protection surfaces as a hard error instead of wrong query results.
+        // The write path refreshes the checksum before each page hits storage,
+        // so verification is consistent for data written by this build.
         let config = SegmentConfig {
             use_mmap: false,
-            verify_checksums: false,
+            verify_checksums: true,
             ..SegmentConfig::default()
         };
         let manager = SegmentFileManager::open(base_dir.as_ref().to_path_buf(), config)?;
@@ -4280,9 +4285,12 @@ fn write_vector_snapshot(
         file.sync_all()?;
     }
     std::fs::rename(&tmp_path, &final_path)?;
-    // fsync the directory so the rename entry itself is durable.
+    // fsync the directory so the rename entry itself is durable. Opening a
+    // directory as a file is not portable (it fails on Windows), so tolerate a
+    // failed open; but if the handle opens, a failed fsync means the rename may
+    // not be durable, so surface it instead of silently dropping it.
     if let Ok(dir_file) = std::fs::File::open(&dir) {
-        let _ = dir_file.sync_all();
+        dir_file.sync_all()?;
     }
     Ok(())
 }
@@ -4427,8 +4435,11 @@ fn write_clog_snapshot(data_dir: &Path, bytes: &[u8]) -> std::io::Result<()> {
         file.sync_all()?;
     }
     std::fs::rename(&tmp_path, &final_path)?;
+    // Make the rename durable. Tolerate a non-portable directory-open failure
+    // (Windows), but propagate a real fsync failure on platforms where the
+    // directory handle opens.
     if let Ok(dir) = std::fs::File::open(data_dir) {
-        let _ = dir.sync_all();
+        dir.sync_all()?;
     }
     Ok(())
 }
@@ -9572,10 +9583,28 @@ impl Server {
 /// returns when the listener fails irrecoverably (e.g. the port is
 /// closed by an external signal); per-connection errors are logged
 /// and the loop continues.
+/// Global cap on concurrently-served client sessions. Each accepted connection
+/// holds one permit for its entire lifetime, bounding total resident session
+/// state and the pre-auth memory a connection flood can pin (without a cap, N
+/// connections can each buffer up to a full message before auth). Excess
+/// connection attempts are rejected immediately (the socket is closed) rather
+/// than queued, keeping the accept loop responsive. Tunable via
+/// `ULTRASQL_MAX_CONNECTIONS` (default 256).
+fn connection_limit_semaphore() -> Arc<tokio::sync::Semaphore> {
+    const DEFAULT_MAX_CONNECTIONS: usize = 256;
+    let limit = std::env::var("ULTRASQL_MAX_CONNECTIONS")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(DEFAULT_MAX_CONNECTIONS);
+    Arc::new(tokio::sync::Semaphore::new(limit))
+}
+
 pub async fn run_server(addr: SocketAddr, state: Arc<Server>) -> Result<(), ServerError> {
     let listener = TcpListener::bind(addr).await?;
     let bound = listener.local_addr()?;
     info!(target: "ultrasqld", listen = %bound, "ultrasqld is ready");
+    let conn_limiter = connection_limit_semaphore();
     loop {
         let (stream, peer) = match listener.accept().await {
             Ok(v) => v,
@@ -9584,9 +9613,20 @@ pub async fn run_server(addr: SocketAddr, state: Arc<Server>) -> Result<(), Serv
                 continue;
             }
         };
+        // Enforce the global connection cap. At capacity we drop the new socket
+        // rather than block the accept loop or grow session state without bound.
+        let permit = match Arc::clone(&conn_limiter).try_acquire_owned() {
+            Ok(p) => p,
+            Err(_) => {
+                warn!(target: "ultrasqld", %peer, "connection limit reached; rejecting connection");
+                drop(stream);
+                continue;
+            }
+        };
         debug!(target: "ultrasqld", %peer, "connection accepted");
         let state = Arc::clone(&state);
         tokio::spawn(async move {
+            let _permit = permit;
             if let Err(e) = handle_connection(stream, state).await {
                 if matches!(e, ServerError::UnexpectedEof) {
                     debug!(target: "ultrasqld", %peer, "connection closed by peer");
@@ -9634,6 +9674,7 @@ where
 {
     tokio::pin!(shutdown);
     let mut sessions = tokio::task::JoinSet::new();
+    let conn_limiter = connection_limit_semaphore();
     loop {
         let (stream, peer) = tokio::select! {
             biased;
@@ -9678,9 +9719,20 @@ where
         if let Err(e) = stream.set_nodelay(true) {
             warn!(target: "ultrasqld", %peer, error = %e, "TCP_NODELAY failed");
         }
+        // Enforce the global connection cap. At capacity we drop the new socket
+        // rather than grow session state without bound.
+        let permit = match Arc::clone(&conn_limiter).try_acquire_owned() {
+            Ok(p) => p,
+            Err(_) => {
+                warn!(target: "ultrasqld", %peer, "connection limit reached; rejecting connection");
+                drop(stream);
+                continue;
+            }
+        };
         debug!(target: "ultrasqld", %peer, "connection accepted");
         let state = Arc::clone(&state);
         sessions.spawn(async move {
+            let _permit = permit;
             if let Err(e) = handle_connection(stream, state).await {
                 if matches!(e, ServerError::UnexpectedEof) {
                     debug!(target: "ultrasqld", %peer, "connection closed by peer");

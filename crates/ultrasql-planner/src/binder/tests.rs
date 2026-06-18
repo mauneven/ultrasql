@@ -129,6 +129,46 @@ fn parse_bind_ok(sql: &str) -> LogicalPlan {
 }
 
 #[test]
+fn case_branches_with_incompatible_types_are_rejected() {
+    let err = parse_and_bind(
+        "SELECT CASE WHEN id > 0 THEN id ELSE name END AS c FROM users",
+        &users_catalog(),
+    )
+    .expect_err("INT vs TEXT CASE branches must not bind");
+    assert!(
+        matches!(err, PlanError::TypeMismatch(_)),
+        "expected TypeMismatch, got {err:?}"
+    );
+}
+
+#[test]
+fn case_branches_reconcile_to_common_numeric_type() {
+    // THEN is INT (id), ELSE is FLOAT8 (score): the CASE output must reconcile
+    // to the common type FLOAT8, not silently adopt the first branch's INT.
+    let plan = parse_bind_ok("SELECT CASE WHEN id > 0 THEN id ELSE score END AS c FROM users");
+    assert_eq!(plan.schema().field_at(0).data_type, DataType::Float64);
+}
+
+#[test]
+fn set_op_with_incompatible_column_types_is_rejected() {
+    let err = parse_and_bind(
+        "SELECT id FROM users UNION SELECT name FROM users",
+        &users_catalog(),
+    )
+    .expect_err("INT vs TEXT set-op columns must not bind");
+    assert!(
+        matches!(err, PlanError::TypeMismatch(_)),
+        "expected TypeMismatch, got {err:?}"
+    );
+}
+
+#[test]
+fn set_op_with_compatible_column_types_binds() {
+    // Sanity: a well-typed UNION must still bind.
+    let _ = parse_bind_ok("SELECT id FROM users UNION SELECT id FROM users");
+}
+
+#[test]
 fn binds_describe_table_output_schema() {
     let plan = parse_bind_ok("DESCRIBE TABLE users");
     let fields = plan.schema().fields();

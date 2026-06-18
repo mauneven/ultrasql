@@ -410,7 +410,7 @@ where
         }
     }
 
-    fn current_role_is_superuser(&self) -> bool {
+    pub(super) fn current_role_is_superuser(&self) -> bool {
         match self.state.role_catalog.lookup_role(&self.current_user) {
             Some(role) => role.is_superuser,
             None => self.current_user.eq_ignore_ascii_case("tester"),

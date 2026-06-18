@@ -436,6 +436,11 @@ pub(super) fn bind_expr_with_ctes(
             ..
         } => {
             let mut bound_args: Vec<ScalarExpr> = Vec::with_capacity(branches.len() * 2 + 2);
+            // Indices into `bound_args` of the *result* branches (each THEN value
+            // plus the ELSE). The output type of a CASE is the common type of
+            // these branches — exactly like COALESCE — so they (and only they,
+            // not the boolean WHEN conditions) drive type reconciliation.
+            let mut result_indices: Vec<usize> = Vec::with_capacity(branches.len() + 1);
             let case_kind = if let Some(op_expr) = operand {
                 bound_args.push(bind_expr_with_ctes(
                     op_expr,
@@ -448,7 +453,6 @@ pub(super) fn bind_expr_with_ctes(
             } else {
                 "case_searched"
             };
-            let mut result_type = DataType::Null;
             for (when_e, then_e) in branches {
                 bound_args.push(bind_expr_with_ctes(
                     when_e,
@@ -458,22 +462,30 @@ pub(super) fn bind_expr_with_ctes(
                     scope,
                 )?);
                 let then_bound = bind_expr_with_ctes(then_e, input, catalog, cte_catalog, scope)?;
-                if matches!(result_type, DataType::Null) {
-                    result_type = then_bound.data_type();
-                }
+                result_indices.push(bound_args.len());
                 bound_args.push(then_bound);
             }
             if let Some(else_e) = else_expr {
                 let bound = bind_expr_with_ctes(else_e, input, catalog, cte_catalog, scope)?;
-                if matches!(result_type, DataType::Null) {
-                    result_type = bound.data_type();
-                }
+                result_indices.push(bound_args.len());
                 bound_args.push(bound);
             } else {
+                result_indices.push(bound_args.len());
                 bound_args.push(ScalarExpr::Literal {
                     value: Value::Null,
                     data_type: DataType::Null,
                 });
+            }
+            // Reconcile the result branches into one output type, rejecting
+            // incompatible branches (e.g. INT vs TEXT) with a TypeMismatch
+            // instead of silently adopting the first branch's type.
+            let result_args: Vec<ScalarExpr> = result_indices
+                .iter()
+                .map(|&i| bound_args[i].clone())
+                .collect();
+            let result_type = common_scalar_return_type("case", &result_args)?;
+            for &i in &result_indices {
+                coerce_literal_to_type(&mut bound_args[i], &result_type);
             }
             Ok(ScalarExpr::FunctionCall {
                 name: case_kind.to_owned(),

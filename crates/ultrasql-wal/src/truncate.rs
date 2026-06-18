@@ -207,8 +207,15 @@ pub fn truncate_below(
 
 #[cfg(unix)]
 fn sync_dir(path: &Path) {
+    // Best-effort by design: the new floor manifest is already durable (written
+    // and fsync'd before any unlink), and recovery filters below-floor segments
+    // that linger after a crash, so a failed directory fsync here cannot lose
+    // committed data. Log it rather than fail an already-durable truncation —
+    // but do not silently swallow it.
     if let Ok(dir) = std::fs::File::open(path) {
-        let _ = dir.sync_all();
+        if let Err(e) = dir.sync_all() {
+            warn!(error = %e, dir = ?path, "failed to fsync WAL directory after segment truncation");
+        }
     }
 }
 

@@ -321,6 +321,7 @@ where
                         .await
                 }
                 CopySource::File(path) => {
+                    self.ensure_copy_server_file_access()?;
                     let rows = self.copy_to_file(&entry, columns, schema, &opts, path)?;
                     self.send_copy_complete(rows, emit_ready_for_query).await
                 }
@@ -332,11 +333,33 @@ where
                         .await
                 }
                 CopySource::File(path) => {
+                    self.ensure_copy_server_file_access()?;
                     self.copy_from_file(&entry, columns, schema, &opts, path, emit_ready_for_query)
                         .await
                 }
                 CopySource::Stdout => Err(ServerError::Unsupported("COPY FROM STDOUT is invalid")),
             },
+        }
+    }
+
+    /// Gate for server-side file COPY (`COPY ... TO/FROM '<path>'`). These
+    /// variants read or write files on the database host using the server
+    /// process's own filesystem privileges, so — like PostgreSQL — they are
+    /// restricted to superusers. Without this gate any role able to run COPY on
+    /// a table could read arbitrary server-readable files (e.g. `COPY t FROM
+    /// '/etc/passwd'`) or write attacker-controlled bytes into new files on the
+    /// host. The STDIN/STDOUT variants stream over the client connection and are
+    /// unaffected — they need only the table-level privileges enforced by the
+    /// planner.
+    fn ensure_copy_server_file_access(&self) -> Result<(), ServerError> {
+        if self.current_role_is_superuser() {
+            Ok(())
+        } else {
+            Err(ServerError::InsufficientPrivilege(
+                "permission denied for server-side file COPY: must be superuser \
+                 (use COPY ... FROM/TO STDIN/STDOUT for client-side transfer)"
+                    .to_owned(),
+            ))
         }
     }
 
@@ -1314,6 +1337,7 @@ where
                 Ok(())
             }
             CopySource::File(path) => {
+                self.ensure_copy_server_file_access()?;
                 write_copy_output_file(path, &payload)?;
                 self.send_copy_complete(rows, emit_ready_for_query).await
             }
