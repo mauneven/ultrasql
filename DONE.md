@@ -96,6 +96,29 @@ as a concise evidence ledger; roadmap stays for open gates only.
   three-lens review (honesty / correctness / repo-fit). Linked from the top-level
   README.
 
+## Vector Quickstart + Soak
+
+- `scripts/quickstart-vector.sh`: from a built `ultrasqld`, boots a server,
+  creates a table of text + embedding + JSON metadata, ingests in one
+  transaction, and runs one fused vector + BM25 + metadata query — zero to first
+  hybrid result in ~0.2 s on an Apple M4 (the one-time build is the only slow
+  part). Documented in `docs/getting-started.md`.
+- `benchmarks/vector_soak.sh` (+ `benchmarks/scripts/vector_soak.py`): sustained
+  concurrent ANN reads with a live recall check vs an independent NumPy baseline,
+  alongside concurrent far-region writers, then a CHECKPOINT, a SIGKILL, and a
+  restart. The full profile (20k base, 8 threads, 30 s) sustained ~37k queries
+  with 0 query/write errors and recall_mean 0.997, and all 20,769 committed rows
+  + the HNSW index + recall (verify recall 1.0) survived the abrupt restart.
+  Chaos-style manifest at
+  `benchmarks/results/latest/vector_soak_manifest.json`, `not_available` when
+  prerequisites are missing.
+- The soak surfaced two real durability bugs (flagged + tracked in ROADMAP): a
+  crash without a CHECKPOINT after CONCURRENT writes fails to recover
+  (`heap_insert_batch slot mismatch` in `wal_applier.rs`), and connecting as a
+  reserved `ultrasql_`-prefixed user yields tables whose owner is rejected on
+  recovery. The soak verifies durability of checkpointed state across a SIGKILL;
+  the no-checkpoint concurrent WAL-replay path is the ROADMAP exit condition.
+
 ## Release And Packaging Automation
 
 - Release workflow builds and attaches release archives for Linux, macOS, and

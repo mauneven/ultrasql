@@ -1,0 +1,33 @@
+{
+  "schema_version": 1,
+  "suite": "vector_soak",
+  "profile": "full",
+  "status": "passed",
+  "passed": true,
+  "recall_floor": 0.9,
+  "load_ok": true,
+  "crash": "SIGKILL",
+  "recovery_note": "Durability is verified across a SIGKILL after a CHECKPOINT. Recovery of un-checkpointed writes produced under concurrency is a known heap WAL-replay gap, tracked in ROADMAP.md (P2 vector/storage).",
+  "durable_after_restart": true,
+  "count_after_restart": 20769,
+  "expected_count": 20769,
+  "verify_recall_mean": 1.0,
+  "verify_query_errors": 0,
+  "load_stats": {
+    "queries": 37368,
+    "query_errors": 0,
+    "inserts": 769,
+    "updates": 769,
+    "write_errors": 0,
+    "recall_mean": 0.997449689573967,
+    "recall_min": 0.8,
+    "duration_s": 30.0,
+    "reader_threads": 8
+  },
+  "generated_at_unix": 1781743445,
+  "host": {
+    "os": "macOS-26.5.1-arm64-arm-64bit-Mach-O",
+    "machine": "arm64"
+  },
+  "policy": "Sustained concurrent ANN reads + far-region writes, then a CHECKPOINT and a SIGKILL + restart. Pass requires error-free load, recall above the floor both during load and after recovery, and every committed row durable after the abrupt restart."
+}
