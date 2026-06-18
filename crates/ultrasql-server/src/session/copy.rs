@@ -739,10 +739,20 @@ where
     }
 
     async fn collect_copy_stdin_bytes(&mut self) -> Result<Vec<u8>, ServerError> {
+        // Bound the cumulative stream size. Without this an authenticated
+        // client (and under the default Trust policy, any client) can stream
+        // `CopyData` frames indefinitely via `COPY t FROM STDIN WITH (FORMAT
+        // binary)`, growing this Vec until the process is OOM-killed and every
+        // session dies — a classic unbounded-buffer DoS. The binary *file*
+        // path already enforces this 128 MiB ceiling; mirror it for STDIN.
+        let limit = copy_binary_file_limit_bytes();
         let mut bytes = Vec::new();
         loop {
             match self.read_frontend().await? {
-                FrontendMessage::CopyData(chunk) => bytes.extend_from_slice(&chunk),
+                FrontendMessage::CopyData(chunk) => {
+                    check_copy_stdin_within_limit(bytes.len(), chunk.len(), limit)?;
+                    bytes.extend_from_slice(&chunk);
+                }
                 FrontendMessage::CopyDone => return Ok(bytes),
                 FrontendMessage::CopyFail(reason) => return Err(ServerError::CopyAborted(reason)),
                 FrontendMessage::Sync | FrontendMessage::Flush => continue,
@@ -1578,6 +1588,23 @@ fn copy_binary_bytes_read_len(len: usize) -> Result<u64, ServerError> {
             "COPY binary file byte count exceeds u64: bytes={len}"
         ))
     })
+}
+
+/// Reject a binary `COPY FROM STDIN` chunk that would push the cumulative
+/// stream past `limit`. Pulled out of the streaming loop so the cumulative
+/// bound is unit-testable without driving the wire protocol.
+fn check_copy_stdin_within_limit(
+    current_len: usize,
+    chunk_len: usize,
+    limit: u64,
+) -> Result<(), ServerError> {
+    let projected = current_len.saturating_add(chunk_len);
+    if copy_binary_bytes_read_len(projected)? > limit {
+        return Err(ServerError::CopyFormat(format!(
+            "COPY FROM STDIN binary stream exceeds limit: size>={projected} limit={limit}"
+        )));
+    }
+    Ok(())
 }
 
 fn ensure_regular_copy_input(path: &str) -> Result<(), ServerError> {
@@ -2620,6 +2647,22 @@ mod tests {
     use crate::result_encoder::SelectResult;
     use tokio::io::{DuplexStream, duplex};
     use ultrasql_core::{Field, GeometryType, Oid, RangeType};
+
+    #[test]
+    fn copy_stdin_cumulative_limit_is_enforced() {
+        // Under the limit: OK.
+        assert!(check_copy_stdin_within_limit(0, 100, 1000).is_ok());
+        assert!(check_copy_stdin_within_limit(900, 100, 1000).is_ok());
+        // Exactly at the limit: OK (limit is inclusive).
+        assert!(check_copy_stdin_within_limit(500, 500, 1000).is_ok());
+        // One byte over: rejected. This is the DoS guard — a stream of frames
+        // can no longer grow the buffer without bound.
+        assert!(check_copy_stdin_within_limit(900, 101, 1000).is_err());
+        assert!(check_copy_stdin_within_limit(1000, 1, 1000).is_err());
+        // Saturating add means a pathological length cannot wrap to a small
+        // projected size and sneak past the check.
+        assert!(check_copy_stdin_within_limit(usize::MAX, 1, 1000).is_err());
+    }
 
     fn copy_opts(format: ServerCopyFormat) -> CopyOptions {
         CopyOptions {
