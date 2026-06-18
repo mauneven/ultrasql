@@ -95,10 +95,15 @@ file focused on what still blocks production.
   floor and ignores below-floor segments, and the server's redo and vector
   replay scanners seed from the same floor — so removing head segments no longer
   shifts reconstructed LSNs (behavior-neutral until truncation writes a
-  non-origin floor); (2) commit/abort status is rebuilt by scanning
-  all `Commit`/`Abort` records on every startup (no persistent CLOG), so
-  truncation must first fold commit status into the checkpoint record or persist
-  a CLOG; (3) the checkpoint flush is a buffered `write_page` with no fsync, so
+  non-origin floor); (2) DONE — commit/abort status was rebuilt by scanning all
+  `Commit`/`Abort` records on every startup (no persistent CLOG). A durable,
+  crc32c-checksummed `clog.snapshot` of every terminal `(xid, status)` is now
+  written at checkpoint (`TransactionManager::export_clog`) and loaded at restart
+  before the WAL scan (`import_clog`), used only when it decodes cleanly and its
+  LSN is within the durable WAL end, so the `Commit`/`Abort` records below a
+  checkpoint can be recycled without losing a committed transaction's status
+  (behavior-neutral until truncation drops those records); (3) the checkpoint
+  flush is a buffered `write_page` with no fsync, so
   a checkpoint must be made durable before its LSN can bound truncation
   (DONE: `perform_checkpoint` now fsyncs the data segments via
   `SegmentFileManager::fsync_all` before recording `last_checkpoint_lsn`); (4)
