@@ -96,10 +96,19 @@ file focused on what still blocks production.
   all `Commit`/`Abort` records on every startup (no persistent CLOG), so
   truncation must first fold commit status into the checkpoint record or persist
   a CLOG; (3) the checkpoint flush is a buffered `write_page` with no fsync, so
-  a checkpoint must be made durable before its LSN can bound truncation; (4)
-  vector indexes have no durable on-disk state and are pure WAL-replay artifacts,
-  so the arena must be snapshotted at checkpoint (`page_images` /
-  `from_page_images` are half-built) before its records can be removed. Exit
+  a checkpoint must be made durable before its LSN can bound truncation
+  (DONE: `perform_checkpoint` now fsyncs the data segments via
+  `SegmentFileManager::fsync_all` before recording `last_checkpoint_lsn`); (4)
+  vector indexes have no durable on-disk state and are pure WAL-replay artifacts.
+  The `HnswPersistentPage` arena is an in-memory `BTreeMap` with no byte
+  serialization at all (`page_images`/`from_page_images` round-trip in-memory
+  structs and even rebuild the `tid_to_node`/`node_to_block` maps), so a durable
+  snapshot requires building a from-scratch on-disk page format for the Meta /
+  Node / Overflow / FreeList pages and their vector/neighbor overflow chains,
+  plus LSN-bounded replay (`apply_wal_record_at` + `redo_covered`, currently dead
+  because production replay passes `Lsn::ZERO`). This is a standalone feature,
+  safe to build incrementally because while the WAL is retained a missing or
+  corrupt snapshot simply falls back to full replay. Exit
   condition: a long-running instance recycles WAL segments below a durable
   checkpoint, restart time is bounded by un-checkpointed work (not total
   history), and a disk-full + crash-recovery drill passes after truncation.
