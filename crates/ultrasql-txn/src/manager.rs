@@ -460,6 +460,17 @@ impl TransactionManager {
         oldest.unwrap_or_else(|| Xid::new(self.next_xid.load(Ordering::Acquire)))
     }
 
+    /// Whether `xid` is currently recorded as in progress.
+    ///
+    /// A meaningful answer requires `xid` to be a real, allocated transaction
+    /// (the CLOG default for an unknown XID is `InProgress`). The WAL-truncation
+    /// checkpoint only calls this for XIDs that have actually written WAL
+    /// records, which are by definition allocated, so the result is accurate.
+    #[must_use]
+    pub fn is_in_progress(&self, xid: Xid) -> bool {
+        matches!(self.status(xid), XidStatus::InProgress)
+    }
+
     /// Retire committed SSI entries that no longer overlap any running
     /// transaction.
     ///
@@ -1124,6 +1135,22 @@ mod tests {
         assert_eq!(mgr.oldest_in_progress(), t1.xid);
         // Sanity: t2 itself is now committed in the oracle.
         assert_eq!(mgr.status(t2_xid), XidStatus::Committed);
+    }
+
+    #[test]
+    fn is_in_progress_tracks_begin_and_commit() {
+        let mgr = TransactionManager::new();
+        let t = mgr.begin(IsolationLevel::ReadCommitted);
+        let xid = t.xid;
+        assert!(
+            mgr.is_in_progress(xid),
+            "a freshly begun xid is in progress"
+        );
+        mgr.commit(t).unwrap();
+        assert!(
+            !mgr.is_in_progress(xid),
+            "a committed xid is no longer in progress"
+        );
     }
 
     #[test]

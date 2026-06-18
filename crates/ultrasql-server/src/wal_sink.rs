@@ -29,6 +29,13 @@ pub struct WalBufferSink {
     buffer: Arc<WalBuffer>,
     /// Last LSN assigned to each XID, updated on every successful append.
     last_lsn: DashMap<u64, AtomicU64>,
+    /// First LSN ever assigned to each *normal* (user) XID. Used at checkpoint
+    /// to bound WAL truncation: a still-in-progress transaction's earliest
+    /// record must never be recycled, or recovery would lose the records that
+    /// let it resolve the transaction's status (an unknown XID defaults to
+    /// `InProgress` forever). Entries for resolved transactions are pruned by
+    /// [`Self::prune_terminal_and_oldest_active_first_lsn`] at each checkpoint.
+    first_lsn: DashMap<u64, AtomicU64>,
     /// Single-XID hot cache for page-local WAL bursts from one transaction.
     last_lsn_cache: LastLsnCache,
     /// Serializes rare hot-cache XID switches.
@@ -74,12 +81,55 @@ impl WalBufferSink {
         Self {
             buffer,
             last_lsn: DashMap::new(),
+            first_lsn: DashMap::new(),
             last_lsn_cache: LastLsnCache::new(),
             last_lsn_switch: Mutex::new(()),
             wal_records: AtomicU64::new(0),
             wal_fpi: AtomicU64::new(0),
             wal_bytes: AtomicU64::new(0),
         }
+    }
+
+    /// Record the earliest LSN seen for a normal (user) transaction. `fetch_min`
+    /// keeps the true minimum even if a transaction's records are appended out of
+    /// order across threads (the stored value is always a lower bound on the
+    /// transaction's WAL footprint). Bootstrap/frozen/INVALID XIDs are skipped:
+    /// they never sit in-progress across a checkpoint and must not pin the floor
+    /// (the checkpoint barrier/Nop records carry `Xid::INVALID`).
+    fn record_first_lsn(&self, xid: Xid, lsn: Lsn) {
+        if !xid.is_normal() {
+            return;
+        }
+        self.first_lsn
+            .entry(xid.raw())
+            .or_insert_with(|| AtomicU64::new(lsn.raw()))
+            .fetch_min(lsn.raw(), Ordering::AcqRel);
+    }
+
+    /// Prune `first_lsn` entries for transactions that are no longer in progress
+    /// and return the oldest first-LSN among those still active.
+    ///
+    /// `is_active` is the in-progress predicate (the checkpoint passes a CLOG
+    /// status check). Pruning here makes correctness independent of any explicit
+    /// per-commit cleanup: a resolved transaction's stale entry can never pin the
+    /// truncation floor because it is dropped the next time this runs. Returns
+    /// `None` when no in-progress transaction has written anything — then only the
+    /// redo point bounds the floor.
+    pub fn prune_terminal_and_oldest_active_first_lsn(
+        &self,
+        is_active: impl Fn(Xid) -> bool,
+    ) -> Option<Lsn> {
+        let mut oldest: Option<u64> = None;
+        self.first_lsn.retain(|&xid_raw, lsn| {
+            if is_active(Xid::new(xid_raw)) {
+                let value = lsn.load(Ordering::Acquire);
+                oldest = Some(oldest.map_or(value, |current| current.min(value)));
+                true
+            } else {
+                false
+            }
+        });
+        oldest.map(Lsn::new)
     }
 
     fn publish_last_lsn(&self, xid: Xid, lsn: Lsn) {
@@ -136,6 +186,7 @@ impl WalSink for WalBufferSink {
             .append(record)
             .map_err(|e| WalSinkError::Rejected(format!("WalBuffer rejected record: {e}")))?;
         self.publish_last_lsn(xid, lsn);
+        self.record_first_lsn(xid, lsn);
         self.wal_records.fetch_add(1, Ordering::Relaxed);
         self.wal_bytes.fetch_add(total_length, Ordering::Relaxed);
         if is_fpi {
@@ -166,6 +217,7 @@ impl WalSink for WalBufferSink {
             .append_borrowed(record_type, xid, prev_lsn, flags, payload)
             .map_err(|e| WalSinkError::Rejected(format!("WalBuffer rejected record: {e}")))?;
         self.publish_last_lsn(xid, lsn);
+        self.record_first_lsn(xid, lsn);
         self.wal_records.fetch_add(1, Ordering::Relaxed);
         self.wal_bytes.fetch_add(total_length, Ordering::Relaxed);
         if is_fpi {
@@ -269,5 +321,54 @@ mod tests {
     fn nop_record_for(xid: Xid) -> WalRecord {
         WalRecord::new(RecordType::Nop, xid, Lsn::ZERO, 0, Vec::new())
             .expect("test WAL record should fit size limits")
+    }
+
+    #[test]
+    fn first_lsn_keeps_the_earliest_per_normal_xid() {
+        let buffer = Arc::new(WalBuffer::new(4096, Lsn::ZERO));
+        let sink = WalBufferSink::new(buffer);
+        let xid = Xid::new(7);
+
+        let first = sink.append(nop_record_for(xid)).expect("first append");
+        let _second = sink.append(nop_record_for(xid)).expect("second append");
+
+        // Everything is active → the oldest first-LSN is this xid's first record.
+        let oldest = sink.prune_terminal_and_oldest_active_first_lsn(|_| true);
+        assert_eq!(oldest, Some(first));
+    }
+
+    #[test]
+    fn first_lsn_ignores_non_normal_xids() {
+        let buffer = Arc::new(WalBuffer::new(4096, Lsn::ZERO));
+        let sink = WalBufferSink::new(buffer);
+        // INVALID (checkpoint barrier) and BOOTSTRAP must never pin the floor.
+        sink.append(nop_record_for(Xid::INVALID)).expect("invalid");
+        sink.append(nop_record_for(Xid::BOOTSTRAP))
+            .expect("bootstrap");
+        assert_eq!(
+            sink.prune_terminal_and_oldest_active_first_lsn(|_| true),
+            None
+        );
+    }
+
+    #[test]
+    fn pruning_drops_resolved_transactions_and_returns_oldest_active() {
+        let buffer = Arc::new(WalBuffer::new(4096, Lsn::ZERO));
+        let sink = WalBufferSink::new(buffer);
+        let resolved = Xid::new(7);
+        let active = Xid::new(8);
+
+        let resolved_first = sink.append(nop_record_for(resolved)).expect("resolved");
+        let active_first = sink.append(nop_record_for(active)).expect("active");
+        assert!(resolved_first < active_first);
+
+        // Only xid 8 is still in progress: the resolved (older) xid is pruned and
+        // must not pin the floor; the oldest active is xid 8's first record.
+        let oldest = sink.prune_terminal_and_oldest_active_first_lsn(|xid| xid == active);
+        assert_eq!(oldest, Some(active_first));
+
+        // The resolved entry is gone, so a later pass sees only the active one.
+        let oldest_again = sink.prune_terminal_and_oldest_active_first_lsn(|_| true);
+        assert_eq!(oldest_again, Some(active_first));
     }
 }

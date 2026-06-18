@@ -3343,6 +3343,13 @@ pub struct Server {
     /// installed a [`wal_sink::WalBufferSink`] into the buffer pool and this
     /// handle keeps the drain/fsync thread alive until the server drops.
     wal_writer: Option<ultrasql_wal::WalWriter>,
+    /// Typed handle to the WAL sink, kept so the checkpoint can bound WAL
+    /// segment recycling by the oldest in-progress transaction's first written
+    /// LSN. `None` in in-memory sample mode.
+    wal_buffer_sink: Option<Arc<wal_sink::WalBufferSink>>,
+    /// WAL segment directory, needed to recycle segments at checkpoint. `None`
+    /// in in-memory sample mode.
+    wal_dir: Option<std::path::PathBuf>,
 }
 
 impl Drop for Server {
@@ -5006,6 +5013,8 @@ impl Server {
             standby_mode: std::sync::atomic::AtomicBool::new(false),
             checkpointer: None,
             wal_writer: None,
+            wal_buffer_sink: None,
+            wal_dir: None,
         }
     }
 
@@ -5123,16 +5132,41 @@ impl Server {
         // WAL is the source of truth and a stale/corrupt snapshot is rejected on
         // load), so a write failure is logged and the checkpoint still succeeds.
         if let Some(data_dir) = &self.data_dir {
+            let mut all_snapshots_ok = true;
+            // Any IVFFlat index has no snapshot and rebuilds purely by replaying
+            // the full WAL, so its presence forbids recycling any WAL below it.
+            let mut any_ivfflat = false;
+            // The lowest HNSW snapshot LSN, captured *before* each encode. meta.lsn
+            // is monotone, so the value a snapshot actually embeds is >= this; the
+            // truncation floor stays at or below every snapshot's real coverage.
+            let mut min_hnsw_snapshot_lsn: Option<Lsn> = None;
             for table in self.table_constraints.iter() {
                 for (oid, index_meta) in &table.value().indexes {
+                    if index_meta.ivfflat.is_some() {
+                        any_ivfflat = true;
+                    }
                     if let Some(hnsw) = &index_meta.hnsw {
+                        let snap_lsn = hnsw.snapshot_lsn();
                         let bytes = hnsw.encode_snapshot();
-                        if let Err(e) = write_vector_snapshot(data_dir, *oid, &bytes) {
-                            tracing::warn!(
-                                error = %e,
-                                oid = oid.raw(),
-                                "vector index snapshot write failed; full replay on next restart"
-                            );
+                        match write_vector_snapshot(data_dir, *oid, &bytes) {
+                            Ok(()) => {
+                                min_hnsw_snapshot_lsn =
+                                    Some(min_hnsw_snapshot_lsn.map_or(snap_lsn, |cur: Lsn| {
+                                        if cur.raw() <= snap_lsn.raw() {
+                                            cur
+                                        } else {
+                                            snap_lsn
+                                        }
+                                    }));
+                            }
+                            Err(e) => {
+                                all_snapshots_ok = false;
+                                tracing::warn!(
+                                    error = %e,
+                                    oid = oid.raw(),
+                                    "vector index snapshot write failed; full replay on next restart"
+                                );
+                            }
                         }
                     }
                 }
@@ -5146,14 +5180,79 @@ impl Server {
             // a full WAL commit-status rebuild.
             let (next_xid, clog_entries) = self.txn_manager.export_clog();
             let clog_bytes = encode_clog_snapshot(checkpoint_lsn, next_xid, &clog_entries);
-            if let Err(e) = write_clog_snapshot(data_dir, &clog_bytes) {
-                tracing::warn!(
-                    error = %e,
-                    "commit-log snapshot write failed; full WAL rebuild on next restart"
-                );
-            }
+            let clog_ok = match write_clog_snapshot(data_dir, &clog_bytes) {
+                Ok(()) => true,
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        "commit-log snapshot write failed; full WAL rebuild on next restart"
+                    );
+                    false
+                }
+            };
+
+            // With every secondary structure durably snapshotted, recycle the WAL
+            // segments below the safe floor.
+            self.maybe_recycle_wal(
+                redo_from,
+                min_hnsw_snapshot_lsn,
+                any_ivfflat,
+                all_snapshots_ok && clog_ok,
+            );
         }
         Ok(())
+    }
+
+    /// Recycle WAL segments that lie entirely below the safe recovery floor.
+    ///
+    /// The floor is the most conservative of three bounds, so recovery can still
+    /// reconstruct every committed byte and resolve every transaction:
+    /// * `redo_from` — the checkpoint redo point; the heap is durable up to it.
+    /// * the oldest in-progress transaction's first written LSN — its records
+    ///   must survive or recovery cannot mark it aborted, and an unknown XID
+    ///   defaults to `InProgress` forever (wrong visibility, spurious conflicts).
+    /// * every HNSW index's snapshot LSN — each rebuilds from its snapshot plus
+    ///   the retained WAL above that LSN.
+    ///
+    /// Recycling is skipped entirely when an IVFFlat index exists (no snapshot,
+    /// full-WAL replay) or any required snapshot failed to become durable.
+    fn maybe_recycle_wal(
+        &self,
+        redo_from: Lsn,
+        min_hnsw_snapshot_lsn: Option<Lsn>,
+        any_ivfflat: bool,
+        snapshots_ok: bool,
+    ) {
+        let (Some(sink), Some(wal_dir)) = (&self.wal_buffer_sink, &self.wal_dir) else {
+            return;
+        };
+        // Prune resolved transactions from the first-LSN map (bounding its growth
+        // even when we cannot truncate) and learn the oldest still-active one.
+        let oldest_active = sink
+            .prune_terminal_and_oldest_active_first_lsn(|xid| self.txn_manager.is_in_progress(xid));
+        if any_ivfflat || !snapshots_ok {
+            return;
+        }
+        let mut floor = redo_from.raw();
+        if let Some(active) = oldest_active {
+            floor = floor.min(active.raw());
+        }
+        if let Some(hnsw_lsn) = min_hnsw_snapshot_lsn {
+            floor = floor.min(hnsw_lsn.raw());
+        }
+        match ultrasql_wal::truncate_below(wal_dir, Lsn::new(floor)) {
+            Ok(outcome) if !outcome.is_noop() => tracing::info!(
+                removed = outcome.removed_segments.len(),
+                reclaimed_bytes = outcome.reclaimed_bytes,
+                floor_segment = outcome.floor.segment_index,
+                floor_lsn = outcome.floor.floor_lsn.raw(),
+                "recycled WAL segments below checkpoint floor"
+            ),
+            Ok(_) => {}
+            Err(e) => {
+                tracing::warn!(error = %e, "WAL segment recycling failed; segments retained")
+            }
+        }
     }
 
     /// Wait until the runtime WAL writer has fsynced at least `lsn`.
@@ -5500,8 +5599,18 @@ impl Server {
     /// [`ServerError::Ddl`] when the data directory itself is a symlink or
     /// is not owned by the effective user on Unix.
     pub fn init(data_dir: &Path) -> Result<Self, ServerError> {
+        Self::init_with_wal_writer_config(data_dir, ultrasql_wal::WalWriterConfig::default())
+    }
+
+    /// [`Self::init`] with an explicit WAL writer configuration. Used by tests
+    /// that need a small segment size to exercise multi-segment recycling
+    /// without writing tens of MiB.
+    pub(crate) fn init_with_wal_writer_config(
+        data_dir: &Path,
+        wal_writer_config: ultrasql_wal::WalWriterConfig,
+    ) -> Result<Self, ServerError> {
         use std::sync::Arc;
-        use ultrasql_wal::{WalBuffer, WalWriter, WalWriterConfig};
+        use ultrasql_wal::{WalBuffer, WalWriter};
         use wal_sink::WalBufferSink;
 
         let data_dir = prepare_secure_data_dir(data_dir)?;
@@ -5518,9 +5627,11 @@ impl Server {
         let wal_buffer = Arc::new(WalBuffer::new(WAL_BUFFER_BYTES, ultrasql_core::Lsn::ZERO));
         let wal_dir = data_dir.join("pg_wal");
 
-        // 2. Sink adapter bridges WalBuffer ↔ storage's WalSink trait.
-        let sink: Arc<dyn ultrasql_storage::WalSink> =
-            Arc::new(WalBufferSink::new(Arc::clone(&wal_buffer)));
+        // 2. Sink adapter bridges WalBuffer ↔ storage's WalSink trait. Keep a
+        // typed clone so the checkpoint can read per-transaction first-LSNs that
+        // the narrow `WalSink` trait does not expose.
+        let buffer_sink = Arc::new(WalBufferSink::new(Arc::clone(&wal_buffer)));
+        let sink: Arc<dyn ultrasql_storage::WalSink> = buffer_sink.clone();
         let last_checkpoint_lsn = Arc::new(std::sync::atomic::AtomicU64::new(0));
 
         // 3. Buffer pool with WAL.
@@ -5573,12 +5684,8 @@ impl Server {
         tracing::info!(lsn = recovered_lsn.raw(), "WAL recovery complete");
 
         // 5. Background writer thread draining the buffer to disk.
-        let wal_writer = WalWriter::open(
-            &wal_dir,
-            Arc::clone(&wal_buffer),
-            WalWriterConfig::default(),
-        )
-        .map_err(|e| ServerError::Io(std::io::Error::other(format!("WAL writer: {e}"))))?;
+        let wal_writer = WalWriter::open(&wal_dir, Arc::clone(&wal_buffer), wal_writer_config)
+            .map_err(|e| ServerError::Io(std::io::Error::other(format!("WAL writer: {e}"))))?;
         let checkpointer_loader = page_loader.clone();
         let checkpointer = Some(ultrasql_storage::Checkpointer::spawn(
             &pool,
@@ -5676,6 +5783,8 @@ impl Server {
             standby_mode: std::sync::atomic::AtomicBool::new(false),
             checkpointer,
             wal_writer: Some(wal_writer),
+            wal_buffer_sink: Some(buffer_sink),
+            wal_dir: Some(wal_dir.clone()),
         };
         // Restore the commit log from a durable snapshot before scanning the
         // WAL, so transactions whose Commit/Abort records were recycled keep

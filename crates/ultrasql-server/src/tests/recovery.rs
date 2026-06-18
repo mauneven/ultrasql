@@ -552,3 +552,133 @@ fn server_init_does_not_restore_commit_status_after_recovery_target_lsn() {
         XidStatus::InProgress
     );
 }
+
+/// Count `segment_*` files currently present in a WAL directory.
+fn count_wal_segments(wal_dir: &std::path::Path) -> usize {
+    fs::read_dir(wal_dir)
+        .map(|rd| {
+            rd.filter_map(Result::ok)
+                .filter(|e| {
+                    e.file_name()
+                        .to_str()
+                        .is_some_and(|n| n.starts_with("segment_"))
+                })
+                .count()
+        })
+        .unwrap_or(0)
+}
+
+/// A tiny segment size so a few hundred small records span many segments,
+/// exercising multi-segment recycling without writing tens of MiB.
+fn small_wal_config() -> ultrasql_wal::WalWriterConfig {
+    ultrasql_wal::WalWriterConfig {
+        segment_size_bytes: 4096,
+        fsync_window_us: 1000,
+        fsync_batch_bytes: 4096,
+    }
+}
+
+/// Append `count` records, each under its own freshly-committed transaction, so
+/// none of them stays in progress to pin the truncation floor.
+fn append_resolved_records(server: &Server, count: usize) {
+    use ultrasql_txn::IsolationLevel;
+    let pool = server.heap.buffer_pool();
+    let sink = pool.wal_sink().expect("WAL-backed server installs a sink");
+    for _ in 0..count {
+        let txn = server.txn_manager.begin(IsolationLevel::ReadCommitted);
+        let record = WalRecord::new(RecordType::Nop, txn.xid, Lsn::ZERO, 0, vec![0u8; 64])
+            .expect("nop record fits size limits");
+        sink.append(record).unwrap();
+        server.txn_manager.commit(txn).unwrap();
+    }
+}
+
+#[test]
+fn checkpoint_recycles_wal_segments_below_the_floor() {
+    let data_dir = tempfile::TempDir::new().unwrap();
+    let wal_dir = data_dir.path().join("pg_wal");
+    let cfg = small_wal_config();
+
+    {
+        let server = Server::init_with_wal_writer_config(data_dir.path(), cfg).unwrap();
+        append_resolved_records(&server, 600);
+
+        // The checkpoint forces every record durable (writing the segments) and
+        // then recycles those below the floor — so the post-checkpoint state is
+        // deterministic, unlike a pre-checkpoint count that races the writer.
+        server.perform_checkpoint().unwrap();
+
+        // A floor at segment N>0 is itself proof that segments 0..N existed and
+        // were recycled (the floor only advances over whole removed segments).
+        let floor = ultrasql_wal::read_floor(&wal_dir).unwrap();
+        assert!(
+            floor.segment_index > 0,
+            "checkpoint must recycle low WAL segments (floor still at segment {})",
+            floor.segment_index
+        );
+        assert!(
+            !wal_dir.join("segment_0000000000").exists(),
+            "the original head segment must be recycled"
+        );
+        // The active segment (and any kept tail) always survives.
+        assert!(
+            count_wal_segments(&wal_dir) >= 1,
+            "the active segment must never be recycled"
+        );
+    }
+
+    // Reopen: recovery seeds from the advanced floor and succeeds. An absent or
+    // mis-seeded floor would make recovery fail or reconstruct shifted LSNs.
+    let reopened = Server::init_with_wal_writer_config(data_dir.path(), cfg).unwrap();
+    assert!(
+        reopened.runtime_wal_flushed_lsn().is_some(),
+        "reopened WAL-backed server must report a flushed LSN"
+    );
+}
+
+#[test]
+fn checkpoint_keeps_an_in_progress_transactions_segment() {
+    use ultrasql_txn::IsolationLevel;
+
+    let data_dir = tempfile::TempDir::new().unwrap();
+    let wal_dir = data_dir.path().join("pg_wal");
+    let cfg = small_wal_config();
+    let server = Server::init_with_wal_writer_config(data_dir.path(), cfg).unwrap();
+
+    // A long-running transaction writes an EARLY record and stays in progress.
+    let long = server.txn_manager.begin(IsolationLevel::ReadCommitted);
+    let long_first_lsn = {
+        let pool = server.heap.buffer_pool();
+        let sink = pool.wal_sink().expect("sink");
+        sink.append(WalRecord::new(RecordType::Nop, long.xid, Lsn::ZERO, 0, vec![0u8; 64]).unwrap())
+            .unwrap()
+    };
+
+    // Many resolved transactions then span many later segments.
+    append_resolved_records(&server, 600);
+
+    server.perform_checkpoint().unwrap();
+
+    // The floor must not pass the in-progress transaction's first record: its
+    // records must survive so a crash recovery can still mark it aborted (an
+    // unknown XID would otherwise default to InProgress forever).
+    let pinned = ultrasql_wal::read_floor(&wal_dir).unwrap();
+    assert!(
+        pinned.floor_lsn.raw() <= long_first_lsn.raw(),
+        "floor {} must not pass the in-progress txn's first LSN {}",
+        pinned.floor_lsn.raw(),
+        long_first_lsn.raw()
+    );
+
+    // Once it resolves, the next checkpoint advances past it.
+    server.txn_manager.commit(long).unwrap();
+    server.perform_checkpoint().unwrap();
+    let advanced = ultrasql_wal::read_floor(&wal_dir).unwrap();
+    assert!(
+        advanced.floor_lsn.raw() > long_first_lsn.raw(),
+        "once the transaction resolved, the floor ({}) should advance past its \
+         former first LSN ({})",
+        advanced.floor_lsn.raw(),
+        long_first_lsn.raw()
+    );
+}
