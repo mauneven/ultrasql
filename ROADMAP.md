@@ -226,13 +226,15 @@ p50 ≈ 257 µs on 2k×16d via `benchmarks/vector_ann_hnsw.sh`):
   hybrid query reports index choice, candidates examined/pruned, filter
   selectivity, per-component scores, and a recall estimate, with tests asserting
   the explain reflects the executed path.
-- Killer demo + competitive benchmarks (PART 6): fair `recall@k`-with-latency
-  benchmarks versus PostgreSQL 17 + pgvector, LanceDB, and Qdrant in their
-  recommended configs are shipped — same-host SIFT, computed exact ground truth,
-  recall always paired with latency (`benchmarks/vector_ann_sift.sh`,
-  `docs/vector-benchmarks.md`, DONE.md "Honest vector benchmark suite").
-  Remaining exit condition: a `crates/ultrasql-node` demo that ingests embeddings
-  + text + metadata and runs a hybrid RAG query surviving restart.
+- Killer demo + competitive benchmarks (PART 6): shipped. Fair
+  `recall@k`-with-latency benchmarks versus PostgreSQL 17 + pgvector, LanceDB,
+  and Qdrant in their recommended configs — same-host SIFT, computed exact ground
+  truth, recall always paired with latency (`benchmarks/vector_ann_sift.sh`,
+  `docs/vector-benchmarks.md`). And a runnable Node RAG demo (`examples/node-rag`)
+  that ingests text + embedding + metadata in one transaction, retrieves with one
+  fused vector + BM25 + metadata query, and returns the identical answer from a
+  fresh, WAL-recovered process. See DONE.md "Honest vector benchmark suite" and
+  "Embedded Node RAG demo".
 
 ### ANN And pgvector
 

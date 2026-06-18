@@ -80,6 +80,22 @@ as a concise evidence ledger; roadmap stays for open gates only.
   `docs/vector-benchmarks.md`, artifacts under
   `benchmarks/results/latest/raw/vector_ann_sift_50k_k10*`.
 
+## Embedded Node RAG Demo
+
+- `examples/node-rag`: a compact, zero-dependency Node script using the
+  `ultrasql-node` napi binding (`Database.execute`) that demonstrates the whole
+  embeddable-RAG story end-to-end — open a WAL-backed database, ingest
+  text+vector+JSON metadata in one transaction, retrieve with one SQL statement
+  fusing vector + BM25 + tenant metadata (`hybrid_search(... 'rrf')`), then reopen
+  in a fresh OS process and get the identical answer from the WAL-recovered store.
+  It makes the integration value concrete: vector similarity alone returns the
+  nearest embedding, which belongs to another tenant; the single integrated query
+  excludes it via the in-table metadata filter, so the cross-tenant leak never
+  happens. `build.sh` compiles the addon and copies it next to the demo (no npm
+  install; the binary is gitignored). Verified by a real run and an adversarial
+  three-lens review (honesty / correctness / repo-fit). Linked from the top-level
+  README.
+
 ## Release And Packaging Automation
 
 - Release workflow builds and attaches release archives for Linux, macOS, and
