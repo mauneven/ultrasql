@@ -28,6 +28,7 @@ pub mod payload;
 pub mod record;
 pub mod recovery;
 pub(crate) mod segment;
+pub mod truncate;
 pub mod writer;
 
 pub use applier::{ApplyError, HeapTarget, dispatch_record, dispatch_record_at_lsn, replay_into};
@@ -45,4 +46,5 @@ pub use payload::{
 };
 pub use record::{RECORD_HEADER_SIZE, RecordType, WalRecord, WalRecordError, WalRecordHeader};
 pub use recovery::{RecoveryError, RecoveryTarget, recover, recover_with_target};
+pub use truncate::{TruncationOutcome, truncate_below};
 pub use writer::{WalWriter, WalWriterConfig, WalWriterError, WalWriterStats};
