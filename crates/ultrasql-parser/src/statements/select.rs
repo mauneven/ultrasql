@@ -361,7 +361,25 @@ impl Parser<'_> {
     ///   | '(' SELECT … ')' AS alias [ '(' col_alias, … ')' ]
     ///   | '(' joined_table ')'
     /// ```
+    /// Parse a single table factor, bounding statement-level recursion.
+    ///
+    /// `parse_table_factor` is the recursion hub for the FROM clause: a
+    /// derived table recurses into [`Self::parse_select`] and a parenthesised
+    /// joined table recurses into [`Self::parse_from_clause`] (which calls
+    /// back here). The expression-depth guard does not cover this path, so
+    /// nested `FROM (SELECT ...)` or `(((t)))` joins could overflow the stack
+    /// and abort the process on untrusted input. Charging each level against
+    /// the shared [`MAX_PARSE_DEPTH`](crate::parser::MAX_PARSE_DEPTH) budget
+    /// turns that crash into a recoverable `DepthExceeded` error. The
+    /// `enter_depth`/`leave_depth` pair is balanced on every exit path.
     pub(crate) fn parse_table_factor(&mut self) -> Result<TableRef, ParseError> {
+        self.enter_depth()?;
+        let result = self.parse_table_factor_inner();
+        self.leave_depth();
+        result
+    }
+
+    fn parse_table_factor_inner(&mut self) -> Result<TableRef, ParseError> {
         if matches!(
             self.peek()?.kind,
             TokenKind::String | TokenKind::EscapedString | TokenKind::DollarString

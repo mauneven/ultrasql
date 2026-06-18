@@ -397,6 +397,51 @@ fn deeply_nested_parens_rejected_without_overflow() {
     );
 }
 
+/// Adversarial input: deeply-nested FROM-subqueries must be rejected with a
+/// `DepthExceeded` error, not overflow the call stack. The expression-depth
+/// guard does not cover statement-level recursion, so a few hundred nested
+/// `FROM (SELECT ...)` used to SIGABRT the parsing thread (an uncatchable
+/// stack-overflow abort) — a remote DoS since the server parses untrusted
+/// client SQL.
+#[test]
+fn deeply_nested_from_subqueries_rejected_without_overflow() {
+    let depth = max_parse_depth_usize() + 64;
+    let mut sql = String::with_capacity(depth * 24 + 16);
+    for _ in 0..depth {
+        sql.push_str("SELECT * FROM (");
+    }
+    sql.push_str("SELECT 1");
+    for i in 0..depth {
+        // Each derived table needs an alias; PostgreSQL requires it.
+        sql.push_str(&format!(") a{i}"));
+    }
+    let err = Parser::new(&sql).parse_statement().unwrap_err();
+    assert!(
+        matches!(err, ParseError::DepthExceeded { .. }),
+        "expected DepthExceeded, got {err:?}"
+    );
+}
+
+/// Adversarial input: deeply-nested parenthesised joins must also be bounded.
+#[test]
+fn deeply_nested_parenthesised_joins_rejected_without_overflow() {
+    let depth = max_parse_depth_usize() + 64;
+    let mut sql = String::with_capacity(depth * 2 + 32);
+    sql.push_str("SELECT * FROM ");
+    for _ in 0..depth {
+        sql.push('(');
+    }
+    sql.push('t');
+    for _ in 0..depth {
+        sql.push(')');
+    }
+    let err = Parser::new(&sql).parse_statement().unwrap_err();
+    assert!(
+        matches!(err, ParseError::DepthExceeded { .. }),
+        "expected DepthExceeded, got {err:?}"
+    );
+}
+
 /// A query at a depth comfortably below the limit must still
 /// succeed; the bound exists to refuse pathological inputs, not
 /// reasonable ones.
