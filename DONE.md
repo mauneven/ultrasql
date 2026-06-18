@@ -1027,8 +1027,17 @@ as a concise evidence ledger; roadmap stays for open gates only.
 - Key-stable indexed UPDATE paths keep indexes anchored through HOT/classic
   `ctid` chains. Point probes, range scans, late materialization, and
   `ON CONFLICT DO UPDATE` now resolve the live tuple behind old indexed TIDs.
-- SCRAM-SHA-256, optional MD5 auth, TLS, CancelRequest, COPY text/CSV, and
-  LISTEN/NOTIFY base surfaces exist.
+- CancelRequest, COPY text/CSV, and LISTEN/NOTIFY base surfaces exist and are
+  wired into the live connection path. Auth/transport scope, stated honestly:
+  the SCRAM-SHA-256 implementation, the rustls TLS loader, and the pg_hba
+  parser exist as tested library code but are **not yet negotiated on a live
+  connection** — the connection path authenticates only via `Trust` (the
+  default, no authentication) or a single global MD5 credential, and does not
+  yet upgrade to TLS. SSLRequest/GSSENCRequest are now answered with the
+  mandatory `'N'` decline so stock libpq/psql clients (default
+  `sslmode=prefer`) connect in plaintext instead of being dropped; replying
+  `'S'` with a real TLS handshake, per-role SCRAM auth, and pg_hba enforcement
+  remain open (tracked in ROADMAP).
 - Parser, binder, optimizer, executor, storage, MVCC, WAL, catalog, protocol,
   server, CLI, and benchmark crates have working public surfaces and regression
   tests.

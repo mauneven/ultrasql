@@ -3,6 +3,19 @@
 //! This module implements the second phase of the UltraSQL optimizer:
 //! choosing join order and physical operators for a logical plan tree.
 //!
+//! ## What is actually wired (be honest about scope)
+//!
+//! Only **cost-based inner-join reordering** ([`reorder_inner_joins`] /
+//! [`reorder_inner_joins_with_stats`]) runs in the production query path.
+//! The Cascades-style [`memo`] table, the [`physical_selection`] cost rules,
+//! and the per-operator cost formulas are **not** yet driven by a search
+//! loop: physical operator choice (hash vs nested-loop vs merge join, seq vs
+//! index scan) is currently made downstream by structural rules in the
+//! executor/server lowering, not here. Those pieces are kept as the
+//! foundation for the v0.7 Cascades search driver and are exercised by their
+//! own unit tests; treat them as in-progress scaffolding, not the live plan
+//! chooser, until the search driver lands.
+//!
 //! ## Sub-modules
 //!
 //! | Sub-module | Contents |
