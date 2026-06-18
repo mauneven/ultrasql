@@ -119,6 +119,13 @@ pub struct WindowAgg {
     partition_keys: Vec<ScalarExpr>,
     /// Raw order-by expressions (kept for fast-path shape detection).
     order_keys: Vec<ScalarExpr>,
+    /// Per-`ORDER BY`-key direction as `(ascending, nulls_first)`, parallel to
+    /// `order_keys`. Defaults to `(true, false)` (ASC, NULLS LAST) for every
+    /// key; the lowering layer overrides it via
+    /// [`WindowAgg::with_order_directions`] so `ORDER BY x DESC` /
+    /// `NULLS FIRST` produce the correct ordering instead of being silently
+    /// ignored.
+    order_directions: Vec<(bool, bool)>,
     /// Expressions for the PARTITION BY keys.
     partition_key_evals: Vec<Eval>,
     /// Expressions for the ORDER BY keys.
@@ -152,10 +159,14 @@ impl WindowAgg {
         let partition_key_evals: Vec<Eval> =
             partition_keys.iter().cloned().map(Eval::new).collect();
         let order_key_evals: Vec<Eval> = order_keys.iter().cloned().map(Eval::new).collect();
+        // Default every key to ASC / NULLS LAST; callers override via
+        // `with_order_directions`.
+        let order_directions = vec![(true, false); order_keys.len()];
         Self {
             child,
             partition_keys,
             order_keys,
+            order_directions,
             partition_key_evals,
             order_key_evals,
             func,
@@ -165,6 +176,21 @@ impl WindowAgg {
             primed: false,
             eof: false,
         }
+    }
+
+    /// Override the per-`ORDER BY`-key sort direction.
+    ///
+    /// `directions` is `(ascending, nulls_first)` per key, parallel to the
+    /// `order_keys` passed to [`Self::new`]. Lengths shorter than `order_keys`
+    /// leave the remaining keys at the default ASC / NULLS LAST; extra entries
+    /// are ignored. Without this call the operator sorts every key ascending
+    /// with NULLs last, which is why `ORDER BY x DESC` used to be ignored.
+    #[must_use]
+    pub fn with_order_directions(mut self, directions: Vec<(bool, bool)>) -> Self {
+        for (slot, dir) in self.order_directions.iter_mut().zip(directions) {
+            *slot = dir;
+        }
+        self
     }
 }
 
@@ -234,6 +260,13 @@ impl WindowAgg {
             return Ok(None);
         }
         if self.order_keys.len() != 1 {
+            return Ok(None);
+        }
+        // The fast path bakes in ASC / NULLS LAST (NULLs map to an i64::MAX
+        // sentinel and the rank is assigned over an ascending sort). For any
+        // other direction, fall back to the slow path, which honours
+        // `order_directions`.
+        if self.order_directions.first().copied() != Some((true, false)) {
             return Ok(None);
         }
         let ScalarExpr::Column { index, .. } = &self.order_keys[0] else {
@@ -429,16 +462,26 @@ impl WindowAgg {
         // assembly walks `all_rows` once and consumes it.
         let mut window_values: Vec<Value> = vec![Value::Null; n_total];
 
+        // Per-key (ascending, nulls_first) direction; default ASC/NULLS LAST
+        // for any key the caller did not specify.
+        let order_directions = self.order_directions.clone();
+
         for partition_indices in &partitions {
             // Sort using the cached order-key buffer. Comparator reads
-            // a pre-computed slice instead of calling the interpreter.
+            // a pre-computed slice instead of calling the interpreter, and
+            // applies each key's direction (ASC/DESC, NULLS FIRST/LAST).
             let mut sorted_indices = partition_indices.clone();
             if order_key_count != 0 {
                 sorted_indices.sort_by(|&a, &b| {
                     let ka = row_order_key(a);
                     let kb = row_order_key(b);
                     for i in 0..order_key_count {
-                        let ord = compare_values_nullable(&ka[i], &kb[i], false);
+                        let (asc, nulls_first) =
+                            order_directions.get(i).copied().unwrap_or((true, false));
+                        let mut ord = compare_values_nullable(&ka[i], &kb[i], nulls_first);
+                        if !asc {
+                            ord = ord.reverse();
+                        }
                         if ord != std::cmp::Ordering::Equal {
                             return ord;
                         }
@@ -1029,6 +1072,57 @@ mod tests {
         );
         let rns = drain_window_col(&mut op);
         assert_eq!(rns, vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn window_row_number_descending_honors_direction() {
+        // Regression: `ORDER BY val DESC` used to be silently ignored, so
+        // results came out ascending. Rows (id,val): (1,10),(2,30),(3,20);
+        // DESC order is 30,20,10, so the window column in the ORIGINAL row
+        // order is row0(10)->3, row1(30)->1, row2(20)->2.
+        let scan = MemTableScan::new(
+            schema_id_val(),
+            vec![make_batch(&[(1, 10), (2, 30), (3, 20)])],
+        );
+        let mut op = WindowAgg::new(
+            Box::new(scan),
+            vec![],
+            vec![col_val()],
+            WindowFunc::RowNumber,
+            schema_with_window(),
+        )
+        .with_order_directions(vec![(false, false)]); // val DESC, NULLS LAST
+        let rns = drain_window_col(&mut op);
+        assert_eq!(
+            rns,
+            vec![3, 1, 2],
+            "DESC must number the highest value as row 1",
+        );
+    }
+
+    #[test]
+    fn window_rank_descending_honors_direction_with_ties() {
+        // Rows (id,val): (1,10),(2,30),(3,20),(4,30). DESC: 30,30,20,10.
+        // RANK ties: the two 30s share rank 1, 20->3, 10->4. In original row
+        // order: row0(10)->4, row1(30)->1, row2(20)->3, row3(30)->1.
+        let scan = MemTableScan::new(
+            schema_id_val(),
+            vec![make_batch(&[(1, 10), (2, 30), (3, 20), (4, 30)])],
+        );
+        let mut op = WindowAgg::new(
+            Box::new(scan),
+            vec![],
+            vec![col_val()],
+            WindowFunc::Rank,
+            schema_with_window(),
+        )
+        .with_order_directions(vec![(false, false)]);
+        let ranks = drain_window_col(&mut op);
+        assert_eq!(
+            ranks,
+            vec![4, 1, 3, 1],
+            "DESC RANK must give the highest value rank 1",
+        );
     }
 
     #[test]

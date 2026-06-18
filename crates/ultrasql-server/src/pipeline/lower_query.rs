@@ -557,14 +557,19 @@ fn lower_query_inner(
         } => {
             let child = lower_query(input, ctx)?;
             let order_exprs: Vec<ScalarExpr> = order_by.iter().map(|k| k.expr.clone()).collect();
+            let order_dirs: Vec<(bool, bool)> =
+                order_by.iter().map(|k| (k.asc, k.nulls_first)).collect();
             let kernel_func = lower_window_func(func);
-            Ok(Box::new(ultrasql_executor::WindowAgg::new(
-                child,
-                partition_by.clone(),
-                order_exprs,
-                kernel_func,
-                schema.clone(),
-            )))
+            Ok(Box::new(
+                ultrasql_executor::WindowAgg::new(
+                    child,
+                    partition_by.clone(),
+                    order_exprs,
+                    kernel_func,
+                    schema.clone(),
+                )
+                .with_order_directions(order_dirs),
+            ))
         }
         LogicalPlan::Summarize {
             table,

@@ -375,6 +375,8 @@ pub fn build_operator(
         } => {
             let child = build_operator(input, data_source)?;
             let order_exprs: Vec<ScalarExpr> = order_by.iter().map(|k| k.expr.clone()).collect();
+            let order_dirs: Vec<(bool, bool)> =
+                order_by.iter().map(|k| (k.asc, k.nulls_first)).collect();
             let kernel_func = match func {
                 ultrasql_planner::LogicalWindowFunc::RowNumber => crate::WindowFunc::RowNumber,
                 ultrasql_planner::LogicalWindowFunc::Rank => crate::WindowFunc::Rank,
@@ -411,13 +413,16 @@ pub fn build_operator(
                 }
                 ultrasql_planner::LogicalWindowFunc::Ntile(n) => crate::WindowFunc::Ntile(*n),
             };
-            Ok(Box::new(crate::WindowAgg::new(
-                child,
-                partition_by.clone(),
-                order_exprs,
-                kernel_func,
-                schema.clone(),
-            )))
+            Ok(Box::new(
+                crate::WindowAgg::new(
+                    child,
+                    partition_by.clone(),
+                    order_exprs,
+                    kernel_func,
+                    schema.clone(),
+                )
+                .with_order_directions(order_dirs),
+            ))
         }
     }
 }
