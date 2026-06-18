@@ -1905,6 +1905,147 @@ impl PageBackedHnswIndex {
             .collect()
     }
 
+    /// Return the high-water WAL LSN reflected in this index's meta page.
+    ///
+    /// This is the LSN a durable snapshot is consistent as of; callers compare
+    /// it against the replayed WAL tail to decide whether the snapshot can be
+    /// trusted or a full replay is required.
+    #[must_use]
+    pub fn snapshot_lsn(&self) -> Lsn {
+        self.storage.lock().meta.lsn
+    }
+
+    /// Serialize the page-backed graph to a self-describing, checksummed byte
+    /// buffer that can later be reloaded with [`Self::from_snapshot_bytes`].
+    ///
+    /// The buffer is versioned, length-explicit, little-endian, and ends with a
+    /// `crc32c` checksum over all preceding bytes. It captures every page image
+    /// plus the index parameters under a single storage lock so the snapshot is
+    /// internally consistent. This is purely additive: it never mutates the
+    /// index and adds no production call sites, so runtime behavior is
+    /// unchanged.
+    #[must_use]
+    pub fn encode_snapshot(&self) -> Vec<u8> {
+        // Capture everything under one lock for a consistent snapshot.
+        let (images, snapshot_lsn) = {
+            let storage = self.storage.lock();
+            let images: Vec<PageBackedHnswPageImage> = storage
+                .pages
+                .values()
+                .map(|page| PageBackedHnswPageImage {
+                    page_id: page.page_id(),
+                    lsn: page.lsn(),
+                    page: page.clone(),
+                })
+                .collect();
+            (images, storage.meta.lsn)
+        };
+
+        let mut out = Vec::new();
+        out.extend_from_slice(HNSW_SNAPSHOT_MAGIC);
+        out.extend_from_slice(&HNSW_SNAPSHOT_VERSION.to_le_bytes());
+        out.extend_from_slice(&self.index_rel.oid().raw().to_le_bytes());
+        // `dims` is validated to fit u32 on construction; encode losslessly.
+        let dims_u32 = u32::try_from(self.dims).unwrap_or(u32::MAX);
+        out.extend_from_slice(&dims_u32.to_le_bytes());
+        out.push(encode_hnsw_metric(self.metric));
+        let m_u32 = u32::try_from(self.m).unwrap_or(u32::MAX);
+        out.extend_from_slice(&m_u32.to_le_bytes());
+        let ef_u32 = u32::try_from(self.ef_search).unwrap_or(u32::MAX);
+        out.extend_from_slice(&ef_u32.to_le_bytes());
+        out.push(encode_ann_payload_kind(self.payload_kind));
+        out.extend_from_slice(&snapshot_lsn.raw().to_le_bytes());
+        let page_count = u32::try_from(images.len()).unwrap_or(u32::MAX);
+        out.extend_from_slice(&page_count.to_le_bytes());
+
+        for image in &images {
+            encode_hnsw_page_record(&mut out, image);
+        }
+
+        let checksum = crc32c::crc32c(&out);
+        out.extend_from_slice(&checksum.to_le_bytes());
+        out
+    }
+
+    /// Reconstruct a page-backed graph from a buffer produced by
+    /// [`Self::encode_snapshot`].
+    ///
+    /// Validation is strict: the magic, version, trailing `crc32c`, the encoded
+    /// index relation oid (which must equal `index_rel`), every embedded length
+    /// and tag, and every bounds check must pass. Any mismatch or short read
+    /// returns [`AccessMethodError`] rather than panicking, so a corrupt
+    /// snapshot can never silently yield a wrong index — callers fall back to a
+    /// full WAL replay.
+    pub fn from_snapshot_bytes(
+        index_rel: RelationId,
+        bytes: &[u8],
+    ) -> Result<Self, AccessMethodError> {
+        let body_len = bytes.len().checked_sub(4).ok_or_else(|| {
+            AccessMethodError::Storage("hnsw snapshot too short for checksum".to_owned())
+        })?;
+        let (body, checksum_bytes) = bytes.split_at(body_len);
+        let stored_checksum =
+            u32::from_le_bytes(checksum_bytes.try_into().map_err(|_| {
+                AccessMethodError::Storage("hnsw snapshot checksum read".to_owned())
+            })?);
+        if crc32c::crc32c(body) != stored_checksum {
+            return Err(AccessMethodError::Storage(
+                "hnsw snapshot checksum mismatch".to_owned(),
+            ));
+        }
+
+        let mut cursor = SnapshotCursor::new(body);
+        let magic = cursor.take(HNSW_SNAPSHOT_MAGIC.len())?;
+        if magic != HNSW_SNAPSHOT_MAGIC {
+            return Err(AccessMethodError::Storage(
+                "hnsw snapshot magic mismatch".to_owned(),
+            ));
+        }
+        let version = cursor.take_u32()?;
+        if version != HNSW_SNAPSHOT_VERSION {
+            return Err(AccessMethodError::Storage(format!(
+                "hnsw snapshot version {version} unsupported"
+            )));
+        }
+        let rel_oid = cursor.take_u32()?;
+        if rel_oid != index_rel.oid().raw() {
+            return Err(AccessMethodError::Storage(
+                "hnsw snapshot relation mismatch".to_owned(),
+            ));
+        }
+        let dims = cursor.take_u32()?;
+        let metric = decode_hnsw_metric(cursor.take_u8()?)?;
+        let m = cursor.take_usize_len_u32()?;
+        let ef_search = cursor.take_usize_len_u32()?;
+        let payload_kind = decode_ann_payload_kind(cursor.take_u8()?)?;
+        let snapshot_lsn = Lsn::new(cursor.take_u64()?);
+        let page_count = cursor.take_u32()?;
+        let page_count_usize = usize::try_from(page_count).map_err(|_| {
+            AccessMethodError::Storage("hnsw snapshot page count overflow".to_owned())
+        })?;
+
+        let mut images = Vec::with_capacity(page_count_usize.min(1 << 16));
+        for _ in 0..page_count_usize {
+            images.push(decode_hnsw_page_record(
+                &mut cursor,
+                index_rel,
+                payload_kind,
+            )?);
+        }
+        if !cursor.is_empty() {
+            return Err(AccessMethodError::Storage(
+                "hnsw snapshot has trailing bytes".to_owned(),
+            ));
+        }
+
+        // The meta page (rebuilt inside `from_page_images`) is the source of
+        // truth for `payload_kind`; the header copy above is only used to drive
+        // per-page vector decoding, and `from_page_images` cross-checks the rest.
+        let index = Self::from_page_images(index_rel, dims, metric, m, ef_search, images)?;
+        let _ = snapshot_lsn;
+        Ok(index)
+    }
+
     /// Return page and tuple counts for this page-backed graph.
     #[must_use]
     pub fn page_stats(&self) -> PageBackedHnswStats {
@@ -2295,6 +2436,501 @@ impl HnswPersistentPage {
             Self::FreeList(page) => page.lsn = lsn,
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Durable byte serialization for `PageBackedHnswIndex`.
+//
+// `encode_snapshot` walks `page_images()` and writes a versioned,
+// length-explicit, little-endian buffer terminated by a `crc32c` checksum;
+// `from_snapshot_bytes` reverses it with strict bounds/tag validation and
+// rebuilds via `from_page_images`. The two paths are deliberately symmetric:
+// each `encode_*` helper has a matching `decode_*` helper below it.
+// ---------------------------------------------------------------------------
+
+/// Snapshot container magic. Distinguishes this format from WAL/page bytes.
+const HNSW_SNAPSHOT_MAGIC: &[u8; 8] = b"USQLHNS1";
+/// Snapshot format version. Bump on any incompatible layout change.
+const HNSW_SNAPSHOT_VERSION: u32 = 1;
+
+const HNSW_PAGE_KIND_META: u8 = 0;
+const HNSW_PAGE_KIND_NODE: u8 = 1;
+const HNSW_PAGE_KIND_OVERFLOW: u8 = 2;
+const HNSW_PAGE_KIND_FREE_LIST: u8 = 3;
+
+const HNSW_OVERFLOW_KIND_VECTOR: u8 = 0;
+const HNSW_OVERFLOW_KIND_NEIGHBORS: u8 = 1;
+
+const ANN_QUANTIZED_KIND_F32: u8 = 0;
+const ANN_QUANTIZED_KIND_BF16: u8 = 1;
+const ANN_QUANTIZED_KIND_INT8: u8 = 2;
+
+const fn encode_hnsw_metric(metric: HnswMetric) -> u8 {
+    match metric {
+        HnswMetric::L2 => 0,
+        HnswMetric::Cosine => 1,
+        HnswMetric::NegativeInnerProduct => 2,
+        HnswMetric::L1 => 3,
+    }
+}
+
+fn decode_hnsw_metric(tag: u8) -> Result<HnswMetric, AccessMethodError> {
+    match tag {
+        0 => Ok(HnswMetric::L2),
+        1 => Ok(HnswMetric::Cosine),
+        2 => Ok(HnswMetric::NegativeInnerProduct),
+        3 => Ok(HnswMetric::L1),
+        other => Err(AccessMethodError::Storage(format!(
+            "hnsw snapshot invalid metric tag {other}"
+        ))),
+    }
+}
+
+const fn encode_ann_payload_kind(kind: AnnPayloadKind) -> u8 {
+    match kind {
+        AnnPayloadKind::F32 => 0,
+        AnnPayloadKind::Bf16 => 1,
+        AnnPayloadKind::Int8 => 2,
+    }
+}
+
+fn decode_ann_payload_kind(tag: u8) -> Result<AnnPayloadKind, AccessMethodError> {
+    match tag {
+        0 => Ok(AnnPayloadKind::F32),
+        1 => Ok(AnnPayloadKind::Bf16),
+        2 => Ok(AnnPayloadKind::Int8),
+        other => Err(AccessMethodError::Storage(format!(
+            "hnsw snapshot invalid payload kind tag {other}"
+        ))),
+    }
+}
+
+/// Append a `usize` as a `u64` length prefix (lossless on 16/32/64-bit).
+fn push_len(out: &mut Vec<u8>, len: usize) {
+    let len_u64 = u64::try_from(len).unwrap_or(u64::MAX);
+    out.extend_from_slice(&len_u64.to_le_bytes());
+}
+
+/// Append an `Option<BlockNumber>` as a one-byte present flag plus the raw u32.
+fn push_opt_block(out: &mut Vec<u8>, block: Option<BlockNumber>) {
+    match block {
+        Some(block) => {
+            out.push(1);
+            out.extend_from_slice(&block.raw().to_le_bytes());
+        }
+        None => {
+            out.push(0);
+            out.extend_from_slice(&0_u32.to_le_bytes());
+        }
+    }
+}
+
+/// Append an `Option<HnswNodeId>` as a one-byte present flag plus the raw u64.
+fn push_opt_node_id(out: &mut Vec<u8>, node: Option<HnswNodeId>) {
+    match node {
+        Some(node) => {
+            out.push(1);
+            out.extend_from_slice(&node.to_le_bytes());
+        }
+        None => {
+            out.push(0);
+            out.extend_from_slice(&0_u64.to_le_bytes());
+        }
+    }
+}
+
+/// Append a `TupleId` (heap pointer, so its relation is encoded in full).
+fn push_tuple_id(out: &mut Vec<u8>, tid: TupleId) {
+    out.extend_from_slice(&tid.page.relation.oid().raw().to_le_bytes());
+    out.extend_from_slice(&tid.page.block.raw().to_le_bytes());
+    out.extend_from_slice(&tid.slot.to_le_bytes());
+}
+
+/// Append an ANN vector payload: kind tag, exact f32 values, and the quantized
+/// body. The exact f32 values and the quantized values are written separately
+/// so decode can rebuild the payload by struct literal without re-quantizing.
+fn encode_ann_vector_payload(out: &mut Vec<u8>, payload: &AnnVectorPayload) {
+    out.push(encode_ann_payload_kind(payload.kind));
+    let exact = &payload.exact_f32;
+    push_len(out, exact.len());
+    for value in exact {
+        out.extend_from_slice(&value.to_le_bytes());
+    }
+    match &payload.quantized {
+        AnnQuantizedPayload::F32(values) => {
+            out.push(ANN_QUANTIZED_KIND_F32);
+            push_len(out, values.len());
+            for value in values {
+                out.extend_from_slice(&value.to_le_bytes());
+            }
+        }
+        AnnQuantizedPayload::Bf16(values) => {
+            out.push(ANN_QUANTIZED_KIND_BF16);
+            push_len(out, values.len());
+            for value in values {
+                out.extend_from_slice(&value.to_le_bytes());
+            }
+        }
+        AnnQuantizedPayload::Int8 { scale, values } => {
+            out.push(ANN_QUANTIZED_KIND_INT8);
+            out.extend_from_slice(&scale.to_le_bytes());
+            push_len(out, values.len());
+            for value in values {
+                out.extend_from_slice(&value.to_le_bytes());
+            }
+        }
+    }
+}
+
+/// Append one page record: `u32 block`, `u64 lsn`, `u8 page_kind`, body.
+fn encode_hnsw_page_record(out: &mut Vec<u8>, image: &PageBackedHnswPageImage) {
+    out.extend_from_slice(&image.page_id.block.raw().to_le_bytes());
+    out.extend_from_slice(&image.lsn.raw().to_le_bytes());
+    match &image.page {
+        HnswPersistentPage::Meta(meta) => {
+            out.push(HNSW_PAGE_KIND_META);
+            let dims = u32::try_from(meta.dims).unwrap_or(u32::MAX);
+            out.extend_from_slice(&dims.to_le_bytes());
+            out.push(encode_hnsw_metric(meta.metric));
+            let m = u32::try_from(meta.m).unwrap_or(u32::MAX);
+            out.extend_from_slice(&m.to_le_bytes());
+            let ef = u32::try_from(meta.ef_search).unwrap_or(u32::MAX);
+            out.extend_from_slice(&ef.to_le_bytes());
+            out.push(encode_ann_payload_kind(meta.payload_kind));
+            push_opt_node_id(out, meta.entry_node);
+            out.extend_from_slice(&meta.next_node_id.to_le_bytes());
+            push_len(out, meta.live_nodes);
+            push_len(out, meta.tombstones);
+            out.extend_from_slice(&meta.next_block_number.to_le_bytes());
+            out.extend_from_slice(&meta.free_list_page.raw().to_le_bytes());
+        }
+        HnswPersistentPage::Node(node) => {
+            out.push(HNSW_PAGE_KIND_NODE);
+            out.extend_from_slice(&node.node_id.to_le_bytes());
+            push_tuple_id(out, node.tid);
+            push_len(out, node.vector_len);
+            out.extend_from_slice(&node.vector_head.raw().to_le_bytes());
+            push_len(out, node.neighbor_count);
+            push_opt_block(out, node.neighbor_head);
+            out.push(u8::from(node.deleted));
+        }
+        HnswPersistentPage::Overflow(overflow) => {
+            out.push(HNSW_PAGE_KIND_OVERFLOW);
+            out.extend_from_slice(&overflow.owner_node.to_le_bytes());
+            push_opt_block(out, overflow.next);
+            match &overflow.payload {
+                HnswOverflowPayload::Vector(payload) => {
+                    out.push(HNSW_OVERFLOW_KIND_VECTOR);
+                    encode_ann_vector_payload(out, payload);
+                }
+                HnswOverflowPayload::Neighbors(neighbors) => {
+                    out.push(HNSW_OVERFLOW_KIND_NEIGHBORS);
+                    push_len(out, neighbors.len());
+                    for node in neighbors {
+                        out.extend_from_slice(&node.to_le_bytes());
+                    }
+                }
+            }
+        }
+        HnswPersistentPage::FreeList(free_list) => {
+            out.push(HNSW_PAGE_KIND_FREE_LIST);
+            push_len(out, free_list.blocks.len());
+            for block in &free_list.blocks {
+                out.extend_from_slice(&block.raw().to_le_bytes());
+            }
+        }
+    }
+}
+
+/// Forward-only reader over snapshot bytes. Every accessor is bounds-checked
+/// and returns `Err` (never panics) on a short read.
+struct SnapshotCursor<'a> {
+    bytes: &'a [u8],
+    pos: usize,
+}
+
+impl<'a> SnapshotCursor<'a> {
+    const fn new(bytes: &'a [u8]) -> Self {
+        Self { bytes, pos: 0 }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.pos >= self.bytes.len()
+    }
+
+    fn take(&mut self, len: usize) -> Result<&'a [u8], AccessMethodError> {
+        let end = self.pos.checked_add(len).ok_or_else(|| {
+            AccessMethodError::Storage("hnsw snapshot length overflow".to_owned())
+        })?;
+        let slice = self.bytes.get(self.pos..end).ok_or_else(|| {
+            AccessMethodError::Storage("hnsw snapshot unexpected end of buffer".to_owned())
+        })?;
+        self.pos = end;
+        Ok(slice)
+    }
+
+    fn take_u8(&mut self) -> Result<u8, AccessMethodError> {
+        let slice = self.take(1)?;
+        slice
+            .first()
+            .copied()
+            .ok_or_else(|| AccessMethodError::Storage("hnsw snapshot u8 read".to_owned()))
+    }
+
+    fn take_u16(&mut self) -> Result<u16, AccessMethodError> {
+        let slice = self.take(2)?;
+        let array: [u8; 2] = slice
+            .try_into()
+            .map_err(|_| AccessMethodError::Storage("hnsw snapshot u16 read".to_owned()))?;
+        Ok(u16::from_le_bytes(array))
+    }
+
+    fn take_u32(&mut self) -> Result<u32, AccessMethodError> {
+        let slice = self.take(4)?;
+        let array: [u8; 4] = slice
+            .try_into()
+            .map_err(|_| AccessMethodError::Storage("hnsw snapshot u32 read".to_owned()))?;
+        Ok(u32::from_le_bytes(array))
+    }
+
+    fn take_u64(&mut self) -> Result<u64, AccessMethodError> {
+        let slice = self.take(8)?;
+        let array: [u8; 8] = slice
+            .try_into()
+            .map_err(|_| AccessMethodError::Storage("hnsw snapshot u64 read".to_owned()))?;
+        Ok(u64::from_le_bytes(array))
+    }
+
+    fn take_i8(&mut self) -> Result<i8, AccessMethodError> {
+        let slice = self.take(1)?;
+        let array: [u8; 1] = slice
+            .try_into()
+            .map_err(|_| AccessMethodError::Storage("hnsw snapshot i8 read".to_owned()))?;
+        Ok(i8::from_le_bytes(array))
+    }
+
+    fn take_f32(&mut self) -> Result<f32, AccessMethodError> {
+        let slice = self.take(4)?;
+        let array: [u8; 4] = slice
+            .try_into()
+            .map_err(|_| AccessMethodError::Storage("hnsw snapshot f32 read".to_owned()))?;
+        Ok(f32::from_le_bytes(array))
+    }
+
+    fn take_usize_len(&mut self) -> Result<usize, AccessMethodError> {
+        let len = self.take_u64()?;
+        usize::try_from(len).map_err(|_| {
+            AccessMethodError::Storage("hnsw snapshot length overflows usize".to_owned())
+        })
+    }
+
+    /// Read a `u32` field and widen it to `usize` (used for `dims`/`m`/`ef`).
+    fn take_usize_len_u32(&mut self) -> Result<usize, AccessMethodError> {
+        let value = self.take_u32()?;
+        usize::try_from(value).map_err(|_| {
+            AccessMethodError::Storage("hnsw snapshot u32 length overflows usize".to_owned())
+        })
+    }
+
+    fn take_bool(&mut self) -> Result<bool, AccessMethodError> {
+        match self.take_u8()? {
+            0 => Ok(false),
+            1 => Ok(true),
+            other => Err(AccessMethodError::Storage(format!(
+                "hnsw snapshot invalid bool byte {other}"
+            ))),
+        }
+    }
+}
+
+fn decode_opt_block(
+    cursor: &mut SnapshotCursor<'_>,
+) -> Result<Option<BlockNumber>, AccessMethodError> {
+    let present = cursor.take_bool()?;
+    let raw = cursor.take_u32()?;
+    if present {
+        Ok(Some(BlockNumber::new(raw)))
+    } else {
+        Ok(None)
+    }
+}
+
+fn decode_opt_node_id(
+    cursor: &mut SnapshotCursor<'_>,
+) -> Result<Option<HnswNodeId>, AccessMethodError> {
+    let present = cursor.take_bool()?;
+    let raw = cursor.take_u64()?;
+    if present { Ok(Some(raw)) } else { Ok(None) }
+}
+
+fn decode_tuple_id(cursor: &mut SnapshotCursor<'_>) -> Result<TupleId, AccessMethodError> {
+    let relation = RelationId::new(cursor.take_u32()?);
+    let block = BlockNumber::new(cursor.take_u32()?);
+    let slot = cursor.take_u16()?;
+    Ok(TupleId::new(PageId::new(relation, block), slot))
+}
+
+fn decode_ann_vector_payload(
+    cursor: &mut SnapshotCursor<'_>,
+) -> Result<AnnVectorPayload, AccessMethodError> {
+    let kind = decode_ann_payload_kind(cursor.take_u8()?)?;
+    let exact_len = cursor.take_usize_len()?;
+    let mut exact_f32 = Vec::with_capacity(exact_len.min(1 << 20));
+    for _ in 0..exact_len {
+        exact_f32.push(cursor.take_f32()?);
+    }
+    let quantized = match cursor.take_u8()? {
+        ANN_QUANTIZED_KIND_F32 => {
+            let len = cursor.take_usize_len()?;
+            let mut values = Vec::with_capacity(len.min(1 << 20));
+            for _ in 0..len {
+                values.push(cursor.take_f32()?);
+            }
+            AnnQuantizedPayload::F32(values)
+        }
+        ANN_QUANTIZED_KIND_BF16 => {
+            let len = cursor.take_usize_len()?;
+            let mut values = Vec::with_capacity(len.min(1 << 20));
+            for _ in 0..len {
+                values.push(cursor.take_u16()?);
+            }
+            AnnQuantizedPayload::Bf16(values)
+        }
+        ANN_QUANTIZED_KIND_INT8 => {
+            let scale = cursor.take_f32()?;
+            let len = cursor.take_usize_len()?;
+            let mut values = Vec::with_capacity(len.min(1 << 20));
+            for _ in 0..len {
+                values.push(cursor.take_i8()?);
+            }
+            AnnQuantizedPayload::Int8 { scale, values }
+        }
+        other => {
+            return Err(AccessMethodError::Storage(format!(
+                "hnsw snapshot invalid quantized kind tag {other}"
+            )));
+        }
+    };
+    // Build by struct literal to preserve the exact stored values; using
+    // `AnnVectorPayload::new` here would re-quantize and lose round-trip parity.
+    Ok(AnnVectorPayload {
+        kind,
+        exact_f32,
+        quantized,
+    })
+}
+
+/// Decode one page record into a [`PageBackedHnswPageImage`]. `index_rel` is the
+/// owning relation for the page id; `payload_kind` is unused here but kept in
+/// the signature so vector overflow records can be validated against it without
+/// a wider rework (the meta page remains the source of truth on rebuild).
+fn decode_hnsw_page_record(
+    cursor: &mut SnapshotCursor<'_>,
+    index_rel: RelationId,
+    payload_kind: AnnPayloadKind,
+) -> Result<PageBackedHnswPageImage, AccessMethodError> {
+    let _ = payload_kind;
+    let block = BlockNumber::new(cursor.take_u32()?);
+    let page_id = PageId::new(index_rel, block);
+    let lsn = Lsn::new(cursor.take_u64()?);
+    let page_kind = cursor.take_u8()?;
+    let page = match page_kind {
+        HNSW_PAGE_KIND_META => {
+            let dims = cursor.take_usize_len_u32()?;
+            let metric = decode_hnsw_metric(cursor.take_u8()?)?;
+            let m = cursor.take_usize_len_u32()?;
+            let ef_search = cursor.take_usize_len_u32()?;
+            let meta_payload_kind = decode_ann_payload_kind(cursor.take_u8()?)?;
+            let entry_node = decode_opt_node_id(cursor)?;
+            let next_node_id = cursor.take_u64()?;
+            let live_nodes = cursor.take_usize_len()?;
+            let tombstones = cursor.take_usize_len()?;
+            let next_block_number = cursor.take_u32()?;
+            let free_list_page = BlockNumber::new(cursor.take_u32()?);
+            HnswPersistentPage::Meta(HnswMetaPage {
+                page_id,
+                lsn,
+                dims,
+                metric,
+                m,
+                ef_search,
+                payload_kind: meta_payload_kind,
+                entry_node,
+                next_node_id,
+                live_nodes,
+                tombstones,
+                next_block_number,
+                free_list_page,
+            })
+        }
+        HNSW_PAGE_KIND_NODE => {
+            let node_id = cursor.take_u64()?;
+            let tid = decode_tuple_id(cursor)?;
+            let vector_len = cursor.take_usize_len()?;
+            let vector_head = BlockNumber::new(cursor.take_u32()?);
+            let neighbor_count = cursor.take_usize_len()?;
+            let neighbor_head = decode_opt_block(cursor)?;
+            let deleted = cursor.take_bool()?;
+            HnswPersistentPage::Node(HnswNodePage {
+                page_id,
+                lsn,
+                node_id,
+                tid,
+                vector_len,
+                vector_head,
+                neighbor_count,
+                neighbor_head,
+                deleted,
+            })
+        }
+        HNSW_PAGE_KIND_OVERFLOW => {
+            let owner_node = cursor.take_u64()?;
+            let next = decode_opt_block(cursor)?;
+            let payload = match cursor.take_u8()? {
+                HNSW_OVERFLOW_KIND_VECTOR => {
+                    HnswOverflowPayload::Vector(decode_ann_vector_payload(cursor)?)
+                }
+                HNSW_OVERFLOW_KIND_NEIGHBORS => {
+                    let len = cursor.take_usize_len()?;
+                    let mut neighbors = Vec::with_capacity(len.min(1 << 20));
+                    for _ in 0..len {
+                        neighbors.push(cursor.take_u64()?);
+                    }
+                    HnswOverflowPayload::Neighbors(neighbors)
+                }
+                other => {
+                    return Err(AccessMethodError::Storage(format!(
+                        "hnsw snapshot invalid overflow kind tag {other}"
+                    )));
+                }
+            };
+            HnswPersistentPage::Overflow(HnswOverflowPage {
+                page_id,
+                lsn,
+                owner_node,
+                next,
+                payload,
+            })
+        }
+        HNSW_PAGE_KIND_FREE_LIST => {
+            let len = cursor.take_usize_len()?;
+            let mut blocks = Vec::with_capacity(len.min(1 << 20));
+            for _ in 0..len {
+                blocks.push(BlockNumber::new(cursor.take_u32()?));
+            }
+            HnswPersistentPage::FreeList(HnswFreeListPage {
+                page_id,
+                lsn,
+                blocks,
+            })
+        }
+        other => {
+            return Err(AccessMethodError::Storage(format!(
+                "hnsw snapshot invalid page kind tag {other}"
+            )));
+        }
+    };
+    Ok(PageBackedHnswPageImage { page_id, lsn, page })
 }
 
 impl PageBackedHnswStorage {
@@ -5617,5 +6253,122 @@ mod tests {
         .expect("ivfflat int8 config");
         assert_eq!(ivfflat.payload_kind(), AnnPayloadKind::Int8);
         assert_eq!(ivfflat.rerank_policy(), AnnRerankPolicy::ExactF32);
+    }
+
+    /// Build a 4-dim page-backed HNSW index with the given payload kind and
+    /// ~30 distinct vectors. `m = 2` with 30 inserts forces neighbor overflow
+    /// chains, so Node/Overflow(Vector)/Overflow(Neighbors)/FreeList page kinds
+    /// all appear in the snapshot.
+    fn build_snapshot_index(
+        index_rel: RelationId,
+        payload_kind: AnnPayloadKind,
+    ) -> PageBackedHnswIndex {
+        let am = PageBackedHnswIndex::new_with_payload_kind(
+            index_rel,
+            4,
+            HnswMetric::L2,
+            2,
+            32,
+            payload_kind,
+        )
+        .expect("snapshot index config");
+        for i in 0..30_u32 {
+            let f = i as f32;
+            let vector = [f, f * 0.5 + 1.0, 10.0 - f, (i % 7) as f32];
+            am.insert_vector(&vector, tid(7, u16::try_from(i).expect("slot fits u16")))
+                .expect("insert snapshot vector");
+        }
+        am
+    }
+
+    #[test]
+    fn hnsw_snapshot_round_trips_search_results() {
+        let query = [3.0_f32, 2.0, 7.0, 1.0];
+        for (rel, kind) in [
+            (9_910_u32, AnnPayloadKind::F32),
+            (9_911, AnnPayloadKind::Bf16),
+            (9_912, AnnPayloadKind::Int8),
+        ] {
+            let index_rel = RelationId::new(rel);
+            let am = build_snapshot_index(index_rel, kind);
+
+            // A node with more than `m` neighbors guarantees a neighbor overflow
+            // chain; confirm overflow pages exist so the encoding is exercised.
+            let stats = am.page_stats();
+            assert!(
+                stats.overflow_pages > 0,
+                "expected overflow pages for kind {kind:?}"
+            );
+
+            let expected = am.search(&query, 5).expect("source search");
+            let expected_tids: Vec<TupleId> = expected.iter().map(|hit| hit.tid).collect();
+            assert!(!expected_tids.is_empty());
+            let expected_pages = am.page_images().len();
+            let expected_lsn = am.snapshot_lsn();
+
+            let bytes = am.encode_snapshot();
+            let restored = PageBackedHnswIndex::from_snapshot_bytes(index_rel, &bytes)
+                .expect("snapshot decodes");
+
+            assert_eq!(restored.payload_kind(), kind, "payload kind preserved");
+            assert_eq!(
+                restored.page_images().len(),
+                expected_pages,
+                "page count preserved for kind {kind:?}"
+            );
+            assert_eq!(
+                restored.snapshot_lsn(),
+                expected_lsn,
+                "snapshot lsn preserved for kind {kind:?}"
+            );
+
+            let restored_hits = restored.search(&query, 5).expect("restored search");
+            let restored_tids: Vec<TupleId> = restored_hits.iter().map(|hit| hit.tid).collect();
+            assert_eq!(
+                restored_tids, expected_tids,
+                "top-k tids preserved for kind {kind:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn hnsw_snapshot_rejects_corruption() {
+        let index_rel = RelationId::new(9_913);
+        let am = build_snapshot_index(index_rel, AnnPayloadKind::Int8);
+        let bytes = am.encode_snapshot();
+
+        // Sanity: the pristine snapshot decodes.
+        PageBackedHnswIndex::from_snapshot_bytes(index_rel, &bytes)
+            .expect("pristine snapshot decodes");
+
+        // (a) Flip one byte in the middle of the buffer.
+        let mut flipped = bytes.clone();
+        let mid = flipped.len() / 2;
+        flipped[mid] ^= 0xFF;
+        assert!(
+            PageBackedHnswIndex::from_snapshot_bytes(index_rel, &flipped).is_err(),
+            "flipped byte must be rejected"
+        );
+
+        // (b) Truncate the buffer.
+        let truncated = &bytes[..bytes.len() - 5];
+        assert!(
+            PageBackedHnswIndex::from_snapshot_bytes(index_rel, truncated).is_err(),
+            "truncated buffer must be rejected"
+        );
+
+        // (c) Corrupt the magic header.
+        let mut bad_magic = bytes.clone();
+        bad_magic[0] ^= 0xFF;
+        assert!(
+            PageBackedHnswIndex::from_snapshot_bytes(index_rel, &bad_magic).is_err(),
+            "corrupt magic must be rejected"
+        );
+
+        // A relation mismatch is also refused (defense in depth).
+        assert!(
+            PageBackedHnswIndex::from_snapshot_bytes(RelationId::new(1), &bytes).is_err(),
+            "relation mismatch must be rejected"
+        );
     }
 }
