@@ -10,6 +10,7 @@
 //! This module is deliberately `pub(crate)` within the cost subsystem.
 //! Callers outside `cost/` should go through [`super::CostModel::estimate`].
 
+use num_traits::ToPrimitive;
 use ultrasql_planner::{BinaryOp, ScalarExpr, UnaryOp};
 
 use crate::cost::StatsSource;
@@ -39,15 +40,44 @@ pub fn selectivity(
     pred: &ScalarExpr,
     stats: &dyn StatsSource,
     table: &str,
-    _input_rows: u64,
+    input_rows: u64,
 ) -> f64 {
-    clamp(sel_inner(pred, stats, table))
+    clamp(sel_inner(pred, stats, table, input_rows))
+}
+
+/// Equality selectivity from a raw `n_distinct`, decoding PostgreSQL's
+/// negative-encoding convention.
+///
+/// `n_distinct` follows `pg_statistic`'s convention: a **positive** value is
+/// the absolute number of distinct values; a **negative** value is the
+/// negation of the *fraction* of rows that are distinct (so `-0.1` means 10 %
+/// of rows are distinct, `-1.0` means every row is distinct). The absolute
+/// distinct count in the negative case is therefore `-n_distinct * row_count`.
+/// Zero means "no statistics", which keeps the conservative pre-stats fallback
+/// of one distinct value (selectivity 1.0).
+///
+/// The previous code applied `1.0 / n_distinct.max(1.0)` to the raw value, so
+/// every negative `n_distinct` collapsed to `1.0 / 1.0 = 1.0` — i.e. a
+/// high-cardinality column (`-1.0`) was costed as if `col = X` returned the
+/// whole table, exactly inverting reality and poisoning join-order costing.
+fn eq_selectivity(n_distinct: f64, input_rows: u64) -> f64 {
+    let distinct = if n_distinct > 0.0 {
+        n_distinct
+    } else if n_distinct < 0.0 {
+        // Fraction-of-rows encoding: absolute distinct = -n_distinct * rows.
+        let rows = u64_to_f64_saturating(input_rows.max(1));
+        (-n_distinct) * rows
+    } else {
+        // n_distinct == 0 → no statistics; treat as a single distinct value.
+        1.0
+    };
+    1.0 / distinct.max(1.0)
 }
 
 /// Internal recursive selectivity computation (unclamped).
-fn sel_inner(pred: &ScalarExpr, stats: &dyn StatsSource, table: &str) -> f64 {
+fn sel_inner(pred: &ScalarExpr, stats: &dyn StatsSource, table: &str, input_rows: u64) -> f64 {
     match pred {
-        // Column = Literal  →  1.0 / max(n_distinct, 1)
+        // Column = Literal  →  1.0 / distinct_count
         ScalarExpr::Binary {
             op: BinaryOp::Eq,
             left,
@@ -55,11 +85,7 @@ fn sel_inner(pred: &ScalarExpr, stats: &dyn StatsSource, table: &str) -> f64 {
             ..
         } => column_index(left).or_else(|| column_index(right)).map_or(
             DEFAULT_UNKNOWN_SEL,
-            |col_idx| {
-                let nd = stats.n_distinct(table, col_idx);
-                // n_distinct = 0 means "no stats"; treat as 1 distinct value.
-                1.0 / nd.max(1.0)
-            },
+            |col_idx| eq_selectivity(stats.n_distinct(table, col_idx), input_rows),
         ),
 
         // Column <> Literal  →  1 - eq_selectivity
@@ -69,13 +95,9 @@ fn sel_inner(pred: &ScalarExpr, stats: &dyn StatsSource, table: &str) -> f64 {
             right,
             ..
         } => {
-            // Reuse the Eq formula: for a column reference compute 1/n_distinct.
             let eq_sel = column_index(left).or_else(|| column_index(right)).map_or(
                 DEFAULT_UNKNOWN_SEL,
-                |col_idx| {
-                    let nd = stats.n_distinct(table, col_idx);
-                    1.0 / nd.max(1.0)
-                },
+                |col_idx| eq_selectivity(stats.n_distinct(table, col_idx), input_rows),
             );
             1.0 - eq_sel
         }
@@ -104,7 +126,9 @@ fn sel_inner(pred: &ScalarExpr, stats: &dyn StatsSource, table: &str) -> f64 {
             left,
             right,
             ..
-        } => sel_inner(left, stats, table) * sel_inner(right, stats, table),
+        } => {
+            sel_inner(left, stats, table, input_rows) * sel_inner(right, stats, table, input_rows)
+        }
 
         // OR  →  1 - (1 - sel(l)) * (1 - sel(r))
         ScalarExpr::Binary {
@@ -113,8 +137,8 @@ fn sel_inner(pred: &ScalarExpr, stats: &dyn StatsSource, table: &str) -> f64 {
             right,
             ..
         } => {
-            let l = sel_inner(left, stats, table);
-            let r = sel_inner(right, stats, table);
+            let l = sel_inner(left, stats, table, input_rows);
+            let r = sel_inner(right, stats, table, input_rows);
             (1.0 - l).mul_add(-(1.0 - r), 1.0)
         }
 
@@ -123,7 +147,7 @@ fn sel_inner(pred: &ScalarExpr, stats: &dyn StatsSource, table: &str) -> f64 {
             op: UnaryOp::Not,
             expr,
             ..
-        } => 1.0 - sel_inner(expr, stats, table),
+        } => 1.0 - sel_inner(expr, stats, table, input_rows),
 
         // IS NULL  →  null_frac(column)
         ScalarExpr::IsNull {
@@ -163,6 +187,10 @@ const fn column_index(expr: &ScalarExpr) -> Option<usize> {
     } else {
         None
     }
+}
+
+fn u64_to_f64_saturating(value: u64) -> f64 {
+    value.to_f64().unwrap_or(f64::MAX)
 }
 
 /// Clamp a selectivity value to `[0.0, 1.0]`.
@@ -223,6 +251,64 @@ mod tests {
         let expr = bin(BinaryOp::Eq, col(0), lit_int(42));
         let sel = selectivity(&expr, &NoStats, "t", 1000);
         assert!((sel - 1.0).abs() < 1e-9, "expected 1.0, got {sel}");
+    }
+
+    /// Equality selectivity with a POSITIVE n_distinct is `1 / n_distinct`.
+    #[test]
+    fn eq_sel_with_positive_n_distinct() {
+        struct PosStats;
+        impl StatsSource for PosStats {
+            fn row_count(&self, _: &str) -> u64 {
+                1000
+            }
+            fn page_count(&self, _: &str) -> u64 {
+                10
+            }
+            fn null_frac(&self, _: &str, _: usize) -> f64 {
+                0.0
+            }
+            fn n_distinct(&self, _: &str, _: usize) -> f64 {
+                50.0
+            }
+        }
+        let expr = bin(BinaryOp::Eq, col(0), lit_int(42));
+        let sel = selectivity(&expr, &PosStats, "t", 1000);
+        assert!((sel - 0.02).abs() < 1e-9, "expected 1/50 = 0.02, got {sel}");
+    }
+
+    /// Equality selectivity with a NEGATIVE n_distinct (PostgreSQL's
+    /// fraction-of-rows encoding) must decode to `1 / (-n_distinct * rows)`,
+    /// not collapse to 1.0. Regression for the high-cardinality cost bug.
+    #[test]
+    fn eq_sel_decodes_negative_n_distinct() {
+        struct NegStats(f64);
+        impl StatsSource for NegStats {
+            fn row_count(&self, _: &str) -> u64 {
+                1000
+            }
+            fn page_count(&self, _: &str) -> u64 {
+                10
+            }
+            fn null_frac(&self, _: &str, _: usize) -> f64 {
+                0.0
+            }
+            fn n_distinct(&self, _: &str, _: usize) -> f64 {
+                self.0
+            }
+        }
+        // -1.0 = every row distinct over 1000 rows → 1000 distinct → 1/1000.
+        let expr = bin(BinaryOp::Eq, col(0), lit_int(42));
+        let sel = selectivity(&expr, &NegStats(-1.0), "t", 1000);
+        assert!((sel - 0.001).abs() < 1e-9, "expected 1/1000, got {sel}");
+
+        // -0.1 = 10 % distinct over 1000 rows → 100 distinct → 1/100.
+        let sel = selectivity(&expr, &NegStats(-0.1), "t", 1000);
+        assert!((sel - 0.01).abs() < 1e-9, "expected 1/100, got {sel}");
+
+        // <> is the complement.
+        let neq = bin(BinaryOp::NotEq, col(0), lit_int(42));
+        let sel = selectivity(&neq, &NegStats(-1.0), "t", 1000);
+        assert!((sel - 0.999).abs() < 1e-9, "expected 1 - 1/1000, got {sel}");
     }
 
     /// Range selectivity is always `DEFAULT_RANGE_SEL` (0.333).
