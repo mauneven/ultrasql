@@ -84,11 +84,9 @@ file focused on what still blocks production.
   of rejected. Exit condition: re-run the `--data-dir` scale sweep and record a
   measured `insert_throughput_1m-ultrasql` artifact (currently `not_available`,
   predating the fix), lifting the certification to 24 comparable measured rows.
-- WAL retention / segment recycling: the WAL is never truncated — segments
-  accumulate for the life of the database, so disk usage grows unbounded and
-  every restart replays all history (the vector index rebuilds from `Lsn::ZERO`
-  on each start). Checkpoint-driven truncation is blocked by four coupled
-  prerequisites, each a silent-data-loss risk if done wrong: (1) DONE — the WAL
+- WAL retention / segment recycling: checkpoint-driven WAL recycling now lands
+  the four coupled prerequisites (each a silent-data-loss risk if done wrong)
+  and the truncation mechanic itself: (1) DONE — the WAL
   LSN is an absolute byte offset from the start of history; a crc32c-checksummed
   `wal.manifest` now records the recovery floor (first surviving segment index +
   its absolute start LSN), `recover_with_target` seeds its byte cursor from the
@@ -115,10 +113,22 @@ file focused on what still blocks production.
   (`apply_wal_record_at` + `redo_covered`) applying only the WAL above the
   snapshot's `meta.lsn`; a snapshot is trusted only if its `meta.lsn` is within
   the durable WAL end, else it falls back to full replay. IVFFlat still rebuilds
-  from full WAL replay — its snapshot is the remaining piece of (4)). Exit
-  condition: a long-running instance recycles WAL segments below a durable
-  checkpoint, restart time is bounded by un-checkpointed work (not total
-  history), and a disk-full + crash-recovery drill passes after truncation.
+  from full WAL replay — its snapshot is the remaining piece of (4)). The
+  mechanic is DONE: `ultrasql_wal::truncate_below` recycles whole segments below
+  a crash-safe floor (the `wal.manifest` floor is written and fsynced *before*
+  any segment is unlinked, so an interrupted truncation only leaves harmless
+  below-floor stragglers that the next pass sweeps), and `perform_checkpoint`
+  computes that floor as `min(redo_from, oldest in-progress transaction's first
+  written LSN, min HNSW snapshot LSN)` — never recycling a live transaction's
+  records (an unknown XID defaults to `InProgress` forever) nor WAL an index
+  still needs. Recycling is disabled outright when any IVFFlat index is present
+  or a required snapshot did not become durable. Remaining: (a) a durable
+  IVFFlat snapshot so IVFFlat databases also recycle (currently they never do);
+  (b) auto-trigger recycling from the background checkpointer — today the floor
+  only advances on an explicit `CHECKPOINT`; (c) a kill-9 + disk-full
+  crash-recovery drill after truncation. Restart time is now bounded by
+  un-checkpointed work rather than total history for non-IVFFlat databases that
+  checkpoint.
 - OLTP commit-path losses (`insert_throughput_10k` → PostgreSQL,
   `mixed_oltp_pgbench_like` → SQLite/PostgreSQL): the per-commit cost is
   dominated by `full_fsync` (F_FULLFSYNC, true power-loss durability) in
