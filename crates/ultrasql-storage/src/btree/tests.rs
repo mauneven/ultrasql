@@ -294,6 +294,41 @@ fn non_unique_insert_allows_duplicate_keys_and_lookup_all_returns_every_tid() {
 }
 
 #[test]
+fn delete_removes_left_resident_duplicate_across_same_key_split() {
+    // Regression: a non-unique key whose duplicate group spans a leaf split
+    // (>MAX_LEAF_ENTRIES entries sharing one key) sets the left leaf's
+    // high_key to the duplicate key K. `delete` used to chase right past that
+    // left leaf for key==K, so a (K, tid) pair physically resident on the left
+    // side of the split could never be removed — `delete` returned Ok(false)
+    // and the dangling index entry survived, corrupting index/heap agreement.
+    let mut tree = make_tree();
+    for block in 1_u32..=40 {
+        tree.insert_non_unique::<i64>(7, tid(block, 0), Xid::new(1), None)
+            .unwrap();
+    }
+
+    // tid(1,0) lands on the left side of the same-key split; tid(40,0) on the
+    // right. Both must be deletable, and both must vanish from lookup_all.
+    assert!(
+        tree.delete::<i64>(7, tid(1, 0)).unwrap(),
+        "left-resident duplicate must be deletable",
+    );
+    assert!(
+        tree.delete::<i64>(7, tid(40, 0)).unwrap(),
+        "right-resident duplicate must be deletable",
+    );
+    // A genuinely-absent pair still reports false.
+    assert!(!tree.delete::<i64>(7, tid(1, 0)).unwrap());
+
+    let remaining = tree.lookup_all::<i64>(7).unwrap();
+    let expected: Vec<_> = (2_u32..=39).map(|block| tid(block, 0)).collect();
+    assert_eq!(
+        remaining, expected,
+        "deleted duplicates must be gone and the rest intact and ordered",
+    );
+}
+
+#[test]
 fn delete_removes_key_and_allows_reinsert() {
     let mut tree = make_tree();
     tree.insert::<i64>(7, tid(1, 0), Xid::new(1), None).unwrap();

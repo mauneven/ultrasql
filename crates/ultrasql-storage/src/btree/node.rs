@@ -420,3 +420,36 @@ pub(super) fn find_child_internal(
         .saturating_sub(1);
     Ok(BlockNumber::new(entries[idx].child))
 }
+
+/// Like [`find_child_internal`] but biased to the leftmost child that could
+/// begin `key`'s equal-key run.
+///
+/// For a non-unique index a run of equal keys can span several leaves; each
+/// same-key leaf split installs a duplicate separator equal to that key, and
+/// the child *to the left* of the first such separator still holds the start
+/// of the run (the separator invariant `child < next_sep` does not hold for
+/// duplicates). [`find_child_internal`] routes to the rightmost
+/// `key <= search` child, skipping the left of the run. Here we route to the
+/// child immediately left of the first separator `>= key`; the caller scans
+/// forward across the (global) leaf right-link chain, which self-corrects to
+/// the right, so it covers the whole run. At most one extra leaf left of the
+/// run is visited, and only when `key` equals an internal separator. For a
+/// key that is not a separator this lands on exactly the same child as
+/// [`find_child_internal`].
+pub(super) fn find_leftmost_child_internal(
+    page: &Page,
+    meta: NodeMeta,
+    key: i64,
+) -> Result<BlockNumber, BTreeError> {
+    let entries = read_internal_entries(page, meta.n_keys)?;
+    if entries.is_empty() {
+        return Err(BTreeError::MalformedNode("empty internal node"));
+    }
+    // Child just left of the first separator `>= key`. Entry 0 always has
+    // key == i64::MIN, so `partition_point` is >= 1 whenever `key > i64::MIN`
+    // and the saturating_sub keeps us in range for `key == i64::MIN`.
+    let idx = entries
+        .partition_point(|entry| entry.key < key)
+        .saturating_sub(1);
+    Ok(BlockNumber::new(entries[idx].child))
+}

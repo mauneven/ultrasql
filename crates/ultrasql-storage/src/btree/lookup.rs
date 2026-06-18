@@ -119,6 +119,41 @@ impl<L: PageLoader> BTree<L> {
         }
     }
 
+    /// Descend to the *leftmost* leaf whose subtree can contain `key`.
+    ///
+    /// [`Self::descend_to_leaf_readonly`] routes to the last child of a
+    /// duplicate-separator run, so for a non-unique key whose equal-key group
+    /// spans a leaf split it can land to the right of the first matching
+    /// entry. This routes left at every internal level (and never chases
+    /// right), so the returned leaf is at or before the start of the run; the
+    /// caller then scans forward across right-links to cover the whole run.
+    /// Used by delete, where a `(key, value)` pair can live on the left side
+    /// of a same-key split.
+    pub(super) fn descend_to_leftmost_leaf_for_key(
+        &self,
+        root: BlockNumber,
+        key: i64,
+    ) -> Result<BlockNumber, BTreeError> {
+        let mut current = root;
+        loop {
+            let guard = self.pool.get_page(self.page_id(current))?;
+            let child = {
+                let r = guard.read();
+                let meta = NodeMeta::read_from(&r)?;
+                if meta.is_leaf() {
+                    None
+                } else {
+                    Some(super::node::find_leftmost_child_internal(&r, meta, key)?)
+                }
+            };
+            drop(guard);
+            match child {
+                None => return Ok(current),
+                Some(child) => current = child,
+            }
+        }
+    }
+
     fn lookup_in_leaf(&self, leaf: BlockNumber, key: i64) -> Result<Option<TupleId>, BTreeError> {
         let mut current = leaf;
         loop {
@@ -175,7 +210,10 @@ impl<L: PageLoader> BTree<L> {
         let raw_key = read_i64_le(&buf).map_err(|_| BTreeError::MalformedNode("key encode"))?;
 
         let root = *self.root_block.lock();
-        let leaf = self.descend_to_leaf_readonly(root, raw_key)?;
+        // Enter at the leftmost leaf that can hold `raw_key` so a duplicate
+        // resident on the left side of a same-key split is reachable; the
+        // forward scan in `delete_from_leaf` then walks the rest of the run.
+        let leaf = self.descend_to_leftmost_leaf_for_key(root, raw_key)?;
         let Some(deleted_leaf) = self.delete_from_leaf(leaf, raw_key, value)? else {
             return Ok(false);
         };
@@ -212,29 +250,38 @@ impl<L: PageLoader> BTree<L> {
             let mut w = guard.write();
             let meta = super::node::NodeMeta::read_from(&w)?;
             debug_assert!(meta.is_leaf(), "descended to non-leaf in delete");
+
+            // Search this leaf BEFORE deciding to chase right. For a duplicate
+            // group spanning a same-key split, the left leaves carry
+            // high_key == key, so `should_chase_right` is true for them even
+            // though the target entry may live on this very leaf. Searching
+            // first means a left-resident `(key, value)` is found here;
+            // chasing only happens when it is genuinely absent locally.
+            let mut entries = super::node::read_leaf_entries(&w, meta.n_keys)?;
+            if let Some(pos) = entries
+                .iter()
+                .position(|entry| entry.key == key && entry.value == value)
+            {
+                entries.remove(pos);
+                super::node::write_leaf_entries(&mut w, &entries);
+                let new_meta = super::node::NodeMeta {
+                    n_keys: u16::try_from(entries.len())
+                        .map_err(|_| BTreeError::MalformedNode("leaf underflow"))?,
+                    ..meta
+                };
+                new_meta.write_into(&mut w);
+                return Ok(Some(current));
+            }
+
+            // Not on this leaf — the equal-key run may continue on the right
+            // sibling (Lehman-Yao right-link chase).
             if let Some(next) = super::node::should_chase_right(meta, key) {
                 drop(w);
                 drop(guard);
                 current = BlockNumber::new(next);
                 continue;
             }
-
-            let mut entries = super::node::read_leaf_entries(&w, meta.n_keys)?;
-            let Some(pos) = entries
-                .iter()
-                .position(|entry| entry.key == key && entry.value == value)
-            else {
-                return Ok(None);
-            };
-            entries.remove(pos);
-            super::node::write_leaf_entries(&mut w, &entries);
-            let new_meta = super::node::NodeMeta {
-                n_keys: u16::try_from(entries.len())
-                    .map_err(|_| BTreeError::MalformedNode("leaf underflow"))?,
-                ..meta
-            };
-            new_meta.write_into(&mut w);
-            return Ok(Some(current));
+            return Ok(None);
         }
     }
 }
