@@ -5395,6 +5395,15 @@ fn nearest_vectors(
     let mut scored: Vec<(usize, f32)> = centroids
         .iter()
         .enumerate()
+        // Skip unpopulated centroid slots. They carry no vector, so they have no
+        // distance to the probe; computing one would hit the distance kernels'
+        // length-equality assert (the probe is `dims`-long, the slot is empty) and
+        // panic. Empty slots only ever pair with empty inverted lists (the decode
+        // path rejects a populated list without a centroid, and the live op order
+        // installs a centroid before any insert), so skipping them drops no
+        // searchable entry — it just hardens search against a crafted/corrupt
+        // snapshot or a degenerate replay state that planted an empty slot.
+        .filter(|(_, centroid)| !centroid.is_empty())
         .map(|(idx, centroid)| (idx, metric.distance(probe, centroid)))
         .collect();
     scored.sort_by(|left, right| {
@@ -6882,5 +6891,69 @@ mod tests {
                 .any(|hit| hit.tid == tid(3, 0)),
             "the post-snapshot insert is searchable"
         );
+    }
+
+    #[test]
+    fn nearest_vectors_skips_empty_centroid_slots_without_panicking() {
+        // An empty interior centroid slot carries no vector. It must be skipped,
+        // never fed to a distance kernel whose length-equality assert would panic.
+        let centroids = vec![vec![1.0, 0.0], Vec::new(), vec![9.0, 0.0]];
+        let got = nearest_vectors(&centroids, &[8.0, 0.0], HnswMetric::L2, 3);
+        // The empty slot (index 1) is excluded; the populated slots rank by
+        // distance to [8,0]: slot 2 ([9,0]) nearest, then slot 0 ([1,0]).
+        assert_eq!(got, vec![2, 0]);
+        assert_eq!(
+            nearest_vector(&centroids, &[8.0, 0.0], HnswMetric::L2),
+            Some(2)
+        );
+        // All-empty centroids yield nothing to probe — and still no panic.
+        assert!(
+            nearest_vectors(&[Vec::new(), Vec::new()], &[8.0, 0.0], HnswMetric::L2, 2).is_empty()
+        );
+    }
+
+    #[test]
+    fn ivfflat_snapshot_with_empty_centroid_slot_decodes_and_search_is_safe() {
+        // Adversarial: a CRC-valid snapshot can carry an empty interior centroid
+        // slot (unreachable via the public API, reachable via corruption). Decoding
+        // it must never yield an index whose first search panics — the decode
+        // contract forbids a corrupt-but-decodable buffer from crashing a query.
+        let index_rel = RelationId::new(9_925);
+        let mut body = Vec::new();
+        body.extend_from_slice(b"USQLIFF1"); // magic
+        body.extend_from_slice(&1u32.to_le_bytes()); // version
+        body.extend_from_slice(&index_rel.oid().raw().to_le_bytes());
+        body.extend_from_slice(&2u32.to_le_bytes()); // dims
+        body.push(0); // metric = L2
+        body.extend_from_slice(&2u32.to_le_bytes()); // lists
+        body.extend_from_slice(&1u32.to_le_bytes()); // probes
+        body.push(0); // payload_kind = F32
+        body.extend_from_slice(&100u64.to_le_bytes()); // snapshot_lsn
+        // Two centroid slots: slot 0 EMPTY (len 0), slot 1 = [10, 0].
+        body.extend_from_slice(&2u32.to_le_bytes());
+        body.extend_from_slice(&0u32.to_le_bytes());
+        body.extend_from_slice(&2u32.to_le_bytes());
+        body.extend_from_slice(&10.0f32.to_le_bytes());
+        body.extend_from_slice(&0.0f32.to_le_bytes());
+        // One entry [9, 0] assigned to the populated list 1.
+        body.extend_from_slice(&1u32.to_le_bytes()); // entry_count
+        body.extend_from_slice(&2u32.to_le_bytes()); // vector len
+        body.extend_from_slice(&9.0f32.to_le_bytes());
+        body.extend_from_slice(&0.0f32.to_le_bytes());
+        body.extend_from_slice(&7u32.to_le_bytes()); // tid relation oid
+        body.extend_from_slice(&1u32.to_le_bytes()); // tid block
+        body.extend_from_slice(&0u16.to_le_bytes()); // tid slot
+        body.extend_from_slice(&1u32.to_le_bytes()); // list_id = 1
+        body.push(0); // not deleted
+        let crc = crc32c::crc32c(&body);
+        body.extend_from_slice(&crc.to_le_bytes());
+
+        let restored = PageBackedIvfFlatIndex::from_snapshot_bytes(index_rel, &body)
+            .expect("snapshot with an empty interior centroid slot must decode");
+        // The empty slot must not crash the first search; the one entry is found.
+        let hits = restored
+            .search(&[9.4, 0.0], 1)
+            .expect("search must not panic");
+        assert_eq!(hits.len(), 1);
     }
 }
