@@ -1502,7 +1502,8 @@ where
             }
             let mut entry =
                 IndexEntry::new(index_oid, unique.name.clone(), table.oid, attnums, true)
-                    .with_schema_name(table.schema_name.clone());
+                    .with_schema_name(table.schema_name.clone())
+                    .with_primary(unique.primary_key);
             entry.root_block = root_block;
             // Empty table, so there are no existing heap rows to populate.
             self.state.persistent_catalog.create_index(entry.clone())?;
@@ -1577,6 +1578,7 @@ where
             method,
             aggregating,
             unique,
+            primary_key,
             if_not_exists,
             ..
         } = plan
@@ -2177,6 +2179,7 @@ where
         //    freshly built tree.
         let mut entry = IndexEntry::new(index_oid, index_name.clone(), table.oid, attnums, *unique)
             .with_schema_name(index_namespace.clone())
+            .with_primary(*primary_key)
             .with_access_method(logical_index_method_name(*method), opclasses.clone())
             .with_options(index_options_as_pairs(index_options));
         entry.root_block = root_block;
@@ -2275,7 +2278,7 @@ where
                     |table| table.name,
                 );
                 self.ensure_table_owner_or_superuser(entry.table_oid, &table_name)?;
-                if entry.is_unique && entry.name.ends_with("_pkey") {
+                if entry.is_primary {
                     return Err(ServerError::DependentObjectsStillExist(format!(
                         "cannot drop index {} because primary key constraint depends on it",
                         entry.name

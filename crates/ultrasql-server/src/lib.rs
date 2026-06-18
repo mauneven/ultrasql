@@ -5138,6 +5138,17 @@ impl Server {
             Err(e) => tracing::warn!(error = %e, "undo-log GC failed"),
         }
         self.vacuum_mark_visible_pages(oldest);
+        // Retire committed SSI entries whose concurrent transactions have all
+        // finished. Bounds the rw-conflict map and prevents long-committed
+        // serializable transactions from fabricating spurious 40001 failures.
+        let ssi_retired = self.txn_manager.collect_ssi_garbage(oldest);
+        if ssi_retired > 0 {
+            tracing::debug!(
+                retired = ssi_retired,
+                oldest_xid = oldest.raw(),
+                "SSI committed-entry GC retired entries"
+            );
+        }
         self.run_one_pending_analyze();
     }
 

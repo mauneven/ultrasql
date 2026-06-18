@@ -1532,7 +1532,7 @@ fn rows_pg_index(ctx: &LowerCtx<'_>) -> Vec<Vec<Value>> {
                 v_i64(idx.table_oid.raw()),
                 Value::Int16(i16::try_from(idx.columns.len()).unwrap_or(i16::MAX)),
                 Value::Bool(idx.is_unique),
-                Value::Bool(idx.name.ends_with("_pkey")),
+                Value::Bool(idx.is_primary),
                 Value::Bool(false),
                 Value::Bool(true),
                 Value::Bool(false),
@@ -1688,7 +1688,7 @@ fn unique_index_constraint_kind(
         .find(|row| row.conrelid == index.table_oid && row.conname == index.name)
         .map_or_else(
             || {
-                if index.name.ends_with("_pkey") {
+                if index.is_primary {
                     "p"
                 } else {
                     "u"
@@ -4369,7 +4369,7 @@ fn referenced_constraint_name(ctx: &LowerCtx<'_>, table_oid: Oid) -> String {
         .and_then(|indexes| {
             indexes
                 .iter()
-                .find(|idx| idx.is_unique && idx.name.ends_with("_pkey"))
+                .find(|idx| idx.is_primary)
                 .or_else(|| indexes.iter().find(|idx| idx.is_unique))
         })
         .map(|idx| idx.name.clone())

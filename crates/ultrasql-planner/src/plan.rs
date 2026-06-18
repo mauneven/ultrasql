@@ -996,6 +996,10 @@ pub enum LogicalPlan {
         aggregating: Option<LogicalAggregatingIndex>,
         /// Whether `UNIQUE` was specified.
         unique: bool,
+        /// Whether this index backs a `PRIMARY KEY` constraint. Only set
+        /// for the synthesised plan that `ALTER TABLE ... ADD PRIMARY KEY`
+        /// lowers into; a plain `CREATE INDEX` is never primary.
+        primary_key: bool,
         /// Whether `CONCURRENTLY` was specified.
         concurrently: bool,
         /// Whether `IF NOT EXISTS` was specified.
@@ -4009,6 +4013,7 @@ mod tests {
                     method: LogicalIndexMethod::IvfFlat,
                     aggregating: None,
                     unique: true,
+                    primary_key: false,
                     concurrently: true,
                     if_not_exists: true,
                     schema: empty(),

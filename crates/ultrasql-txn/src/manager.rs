@@ -390,7 +390,15 @@ impl TransactionManager {
         // SSI check: only for serializable transactions with an installed manager.
         if isolation == IsolationLevel::Serializable {
             if let Some(ssi) = &self.ssi {
-                if let Err(SsiError::Serialization { victim, detail }) = ssi.commit(xid) {
+                // Capture the current XID high-water mark as this commit's
+                // GC horizon: every transaction able to be concurrent with us
+                // has, by definition, already begun and so carries a smaller
+                // XID. `terminate` above already removed `xid` from the active
+                // set, so a later `oldest_in_progress()` reaching this value
+                // proves no concurrent transaction survives.
+                if let Err(SsiError::Serialization { victim, detail }) =
+                    ssi.commit(xid, self.next_xid())
+                {
                     // The SSI manager marked us committed before detecting the
                     // cycle; we must immediately abort to restore consistency.
                     // Flip the CLOG entry back to Aborted using the force path
@@ -450,6 +458,26 @@ impl TransactionManager {
             }
         }
         oldest.unwrap_or_else(|| Xid::new(self.next_xid.load(Ordering::Acquire)))
+    }
+
+    /// Retire committed SSI entries that no longer overlap any running
+    /// transaction.
+    ///
+    /// `horizon` is the oldest in-progress XID (callers pass
+    /// [`Self::oldest_in_progress`]); a committed serializable transaction
+    /// whose commit horizon has been reached cannot be concurrent with any
+    /// live transaction, so its conflict-graph entry and predicate locks are
+    /// dropped. Without this sweep every serializable `COMMIT` would leak an
+    /// [`SsiManager`] entry for the life of the process and ancient committed
+    /// transactions could fabricate spurious serialization failures against
+    /// much later, non-overlapping transactions.
+    ///
+    /// No-op (returns `0`) when no [`SsiManager`] is installed. Returns the
+    /// number of entries retired.
+    pub fn collect_ssi_garbage(&self, horizon: Xid) -> usize {
+        self.ssi
+            .as_ref()
+            .map_or(0, |ssi| ssi.collect_garbage(horizon))
     }
 
     /// XID that the next top-level transaction or savepoint allocation will

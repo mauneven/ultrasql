@@ -153,6 +153,7 @@ where
             method: ultrasql_planner::LogicalIndexMethod::Btree,
             aggregating: None,
             unique: true,
+            primary_key: constraint.primary_key,
             concurrently: false,
             if_not_exists: false,
             schema: ultrasql_core::Schema::empty(),

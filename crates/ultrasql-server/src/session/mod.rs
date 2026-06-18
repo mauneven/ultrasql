@@ -73,14 +73,26 @@ pub(crate) struct Session<RW> {
     /// cache without rippling `&mut self` across the session API.
     pub(super) stmt_cache:
         std::cell::RefCell<std::collections::HashMap<String, Arc<ultrasql_planner::LogicalPlan>>>,
-    /// Logical-plan pointers whose static DML safety checks already passed.
+    /// Logical plans whose static DML safety checks already passed.
+    ///
+    /// Identity is the cached [`Arc<LogicalPlan>`](ultrasql_planner::LogicalPlan)
+    /// allocation, not a bare heap address: the map is keyed by the Arc's
+    /// pointer for O(1) lookup but the stored `Arc` is the source of truth,
+    /// so membership is confirmed with [`Arc::ptr_eq`]. Because the entry
+    /// keeps a strong reference, the allocation can never be freed and its
+    /// address reused by an unrelated plan while it is cached — closing the
+    /// ABA hazard that a raw-address `HashSet` would have. The only plans
+    /// looked up here are the pointer-stable `stmt_cache` `Arc`s, so a
+    /// freshly-allocated short-lived plan can never produce a false hit.
     ///
     /// This is intentionally narrower than `stmt_cache`: entries are added
     /// only for simple fused DML shapes with no row-security rewrite and no
     /// materialized-view source guard. `plan_cache_invalidate` clears it
     /// alongside `stmt_cache`, so role, privilege, RLS, or DDL changes force
     /// the next execution back through the full checks.
-    pub(super) prechecked_fast_dml: std::cell::RefCell<std::collections::HashSet<usize>>,
+    pub(super) prechecked_fast_dml: std::cell::RefCell<
+        std::collections::HashMap<usize, Arc<ultrasql_planner::LogicalPlan>>,
+    >,
     /// Per-session split cache for repeated multi-statement Simple Query text.
     ///
     /// The hot mixed benchmark sends the same `INSERT; UPDATE; SELECT` batch
@@ -186,7 +198,7 @@ where
             session_settings: std::collections::HashMap::new(),
             notify_rx,
             stmt_cache: std::cell::RefCell::new(std::collections::HashMap::new()),
-            prechecked_fast_dml: std::cell::RefCell::new(std::collections::HashSet::new()),
+            prechecked_fast_dml: std::cell::RefCell::new(std::collections::HashMap::new()),
             simple_batch_cache: std::cell::RefCell::new(std::collections::HashMap::new()),
             jsonb_shape_cache: std::cell::RefCell::new(jsonb_ingest::JsonbShapeCache::default()),
             pending_table_modifications: std::collections::HashMap::new(),

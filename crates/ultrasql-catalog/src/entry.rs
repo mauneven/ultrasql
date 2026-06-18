@@ -174,6 +174,14 @@ pub struct IndexEntry {
     pub root_block: BlockNumber,
     /// Whether this index enforces uniqueness.
     pub is_unique: bool,
+    /// Whether this index backs a `PRIMARY KEY` constraint.
+    ///
+    /// Set authoritatively at index-creation time from the bound
+    /// constraint metadata (mirrors `pg_index.indisprimary`). Never
+    /// inferred from the index name — a user index that happens to be
+    /// named `*_pkey` is not primary, and a primary-key index named by
+    /// the user need not follow the `_pkey` convention.
+    pub is_primary: bool,
     /// Access method requested by `CREATE INDEX ... USING`.
     pub access_method: String,
     /// Opclass names supplied per key column.
@@ -205,10 +213,21 @@ impl IndexEntry {
             columns,
             root_block: BlockNumber::INVALID,
             is_unique,
+            is_primary: false,
             access_method: "btree".to_owned(),
             opclasses: Vec::new(),
             options: Vec::new(),
         }
+    }
+
+    /// Mark whether this index backs a `PRIMARY KEY` constraint.
+    ///
+    /// Callers that build a primary-key index pass `true`; the default
+    /// from [`IndexEntry::new`] is `false`.
+    #[must_use]
+    pub fn with_primary(mut self, is_primary: bool) -> Self {
+        self.is_primary = is_primary;
+        self
     }
 
     /// Attach the index namespace.

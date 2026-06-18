@@ -138,7 +138,9 @@ where
         let substituted = substitute_parameters_in_plan(&plan, &values);
         let catalog_snapshot: Arc<CatalogSnapshot> = self.state.catalog_snapshot();
         let executable = self.prepare_regular_view_plan(&substituted, &catalog_snapshot)?;
-        self.run_dml_or_select(&executable, &catalog_snapshot)
+        // `executable` is a per-EXECUTE plan with substituted parameters and
+        // no stable identity, so it is not eligible for the precheck cache.
+        self.run_dml_or_select(&executable, &catalog_snapshot, None)
     }
 
     fn execute_deallocate_statement(&mut self, stmt: &DeallocateStmt) -> SelectResult {

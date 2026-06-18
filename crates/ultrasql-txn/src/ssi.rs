@@ -92,11 +92,20 @@ struct SsiState {
     /// Predicate locks held by this transaction.
     predicate_locks: Vec<PredicateLock>,
     /// Whether this transaction has committed (as opposed to still active or
-    /// aborted).  An aborted transaction's entry is removed entirely;
-    /// committed entries are retained until the SSI manager can safely GC them
-    /// (currently: until all concurrent transactions that overlap with this
-    /// one have terminated).
+    /// aborted).  An aborted transaction's entry is removed immediately by
+    /// [`SsiManager::abort`]; a committed entry is retained until
+    /// [`SsiManager::collect_garbage`] can prove no still-running transaction
+    /// could have been concurrent with it (see `commit_horizon`).
     committed: bool,
+    /// The XID high-water mark (`xmax`) captured at the instant this
+    /// transaction committed, or `None` while it is still active.
+    ///
+    /// Any transaction with an XID strictly less than this value was already
+    /// assigned — i.e. had begun — before this transaction committed, so it is
+    /// potentially concurrent with it. Conversely, once the oldest in-progress
+    /// XID has advanced to or past this horizon, no running transaction can be
+    /// concurrent with this one and its entry is safe to retire.
+    commit_horizon: Option<Xid>,
 }
 
 impl SsiState {
@@ -106,6 +115,7 @@ impl SsiState {
             in_conflict_out: HashSet::new(),
             predicate_locks: Vec::new(),
             committed: false,
+            commit_horizon: None,
         }
     }
 }
@@ -294,19 +304,69 @@ impl SsiManager {
 
     /// Commit `xid`.
     ///
-    /// Marks the transaction as committed, then performs a final
-    /// dangerous-structure check.  Returns [`SsiError::Serialization`] if
-    /// a dangerous structure is found after the commit mark is set (the
-    /// committed flag is required for the "one leg has committed" condition).
+    /// Marks the transaction as committed, records the `commit_horizon`
+    /// (the caller's current XID high-water mark, `xmax`) so the entry can
+    /// later be garbage-collected, then performs a final dangerous-structure
+    /// check.  Returns [`SsiError::Serialization`] if a dangerous structure is
+    /// found after the commit mark is set (the committed flag is required for
+    /// the "one leg has committed" condition).
+    ///
+    /// `commit_horizon` must be greater than every XID that has begun so far
+    /// (callers pass the transaction manager's `next_xid`). Any in-progress
+    /// transaction with a smaller XID is potentially concurrent with this one;
+    /// [`Self::collect_garbage`] uses this to decide when retirement is safe.
     ///
     /// On error the transaction must abort; callers are responsible for
     /// invoking [`Self::abort`] afterwards.
-    pub fn commit(&self, xid: Xid) -> Result<(), SsiError> {
+    pub fn commit(&self, xid: Xid, commit_horizon: Xid) -> Result<(), SsiError> {
         // Mark committed first so the dangerous-structure check can see it.
         if let Some(mut entry) = self.rw_conflicts.get_mut(&xid) {
             entry.committed = true;
+            entry.commit_horizon = Some(commit_horizon);
         }
         self.check_for_dangerous_structure(xid)
+    }
+
+    /// Retire committed entries that can no longer be concurrent with any
+    /// running transaction.
+    ///
+    /// `horizon` is the oldest in-progress XID across the whole instance
+    /// (callers pass [`crate::TransactionManager::oldest_in_progress`]). A committed
+    /// entry whose `commit_horizon` is `<= horizon` had all of its potentially
+    /// concurrent transactions begin before it committed *and* every one of
+    /// them has since terminated, so it can no longer participate in a new
+    /// dangerous structure with a live transaction. Dropping it reclaims its
+    /// predicate-lock and conflict-set memory and — crucially — stops it from
+    /// matching a much later writer's range and fabricating a spurious
+    /// rw-edge / committed leg (a false `40001`).
+    ///
+    /// Dangling edges left in other entries' `in_conflict_in` /
+    /// `in_conflict_out` sets that referenced a retired XID are harmless:
+    /// [`Self::check_for_dangerous_structure`] re-reads each neighbour and
+    /// skips any that is no longer present.
+    ///
+    /// Returns the number of entries removed. Active and aborted entries are
+    /// never touched here (aborts are reclaimed eagerly by [`Self::abort`]).
+    pub fn collect_garbage(&self, horizon: Xid) -> usize {
+        let mut removed = 0;
+        self.rw_conflicts.retain(|_xid, state| {
+            let retire =
+                state.committed && state.commit_horizon.is_some_and(|h| horizon >= h);
+            if retire {
+                removed += 1;
+            }
+            !retire
+        });
+        removed
+    }
+
+    /// Number of transactions currently tracked in the conflict graph.
+    ///
+    /// Exposed for metrics and regression tests asserting that committed
+    /// entries are retired (the map stays bounded) rather than leaked.
+    #[must_use]
+    pub fn tracked_len(&self) -> usize {
+        self.rw_conflicts.len()
     }
 
     /// Abort (or clean up) `xid`.
@@ -448,6 +508,13 @@ mod tests {
         Xid::new(n)
     }
 
+    /// A commit horizon larger than any XID used by the lifecycle tests, so
+    /// [`SsiManager::collect_garbage`] is never the behaviour under test there.
+    /// GC is exercised by its own dedicated tests with explicit horizons.
+    fn far_horizon() -> Xid {
+        xid(1_000_000)
+    }
+
     fn rel_tag(n: u32) -> PredicateLockTag {
         PredicateLockTag::Relation(RelationId::new(n))
     }
@@ -482,7 +549,7 @@ mod tests {
     fn register_and_commit_without_conflicts_is_ok() {
         let mgr = SsiManager::new();
         mgr.register_xid(xid(1));
-        mgr.commit(xid(1)).unwrap();
+        mgr.commit(xid(1), far_horizon()).unwrap();
     }
 
     #[test]
@@ -531,7 +598,7 @@ mod tests {
 
         // Commit T1 — now one of the legs is committed, making the structure
         // dangerous for T2 (the pivot).
-        mgr.commit(t1).unwrap(); // T1 commits cleanly
+        mgr.commit(t1, far_horizon()).unwrap(); // T1 commits cleanly
 
         // T2 is the pivot: in-conflict-in = {T1}, in-conflict-out = {T3}.
         // T1 is committed → dangerous structure → T2 must abort.
@@ -552,7 +619,7 @@ mod tests {
 
         // No record_rw_conflict calls.
 
-        mgr.commit(xid(1)).unwrap();
+        mgr.commit(xid(1), far_horizon()).unwrap();
         mgr.check_for_dangerous_structure(xid(2)).unwrap();
     }
 
@@ -565,7 +632,7 @@ mod tests {
         mgr.register_xid(xid(3));
 
         mgr.record_rw_conflict(xid(1), xid(2));
-        mgr.commit(xid(1)).unwrap();
+        mgr.commit(xid(1), far_horizon()).unwrap();
 
         // T2 has in-conflict-in = {T1} but in-conflict-out = {} → no pivot.
         mgr.check_for_dangerous_structure(xid(2)).unwrap();
@@ -581,11 +648,11 @@ mod tests {
         let mgr = SsiManager::new();
         // T1 commits first with no edges.
         mgr.register_xid(xid(1));
-        mgr.commit(xid(1)).unwrap();
+        mgr.commit(xid(1), far_horizon()).unwrap();
 
         // T2 starts after T1 committed; no rw-conflict edges exist for T2.
         mgr.register_xid(xid(2));
-        mgr.commit(xid(2)).unwrap();
+        mgr.commit(xid(2), far_horizon()).unwrap();
     }
 
     // ── predicate lock granularity ───────────────────────────────────────────
@@ -718,11 +785,145 @@ mod tests {
         mgr.record_rw_conflict(t2, t3);
 
         // Commit t3 first (the right-side committed leg).
-        mgr.commit(t3).unwrap();
+        mgr.commit(t3, far_horizon()).unwrap();
 
         // Now t2 tries to commit — it is the pivot and t3 is committed.
-        let err = mgr.commit(t2).expect_err("pivot commit should fail");
+        let err = mgr.commit(t2, far_horizon()).expect_err("pivot commit should fail");
         let SsiError::Serialization { victim, .. } = err;
         assert_eq!(victim, t2);
+    }
+
+    // ── committed-entry garbage collection ────────────────────────────────────
+
+    /// A committed entry is only retired once the horizon has reached its
+    /// commit point; a still-running concurrent transaction (smaller XID) keeps
+    /// it alive so it can still serve as a committed leg of a real dangerous
+    /// structure.
+    #[test]
+    fn collect_garbage_retires_only_safely_retired_commits() {
+        let mgr = SsiManager::new();
+        let committed = xid(10);
+        mgr.register_xid(committed);
+        // Commit horizon 20: any txn with XID < 20 may be concurrent.
+        mgr.commit(committed, xid(20)).unwrap();
+        assert_eq!(mgr.tracked_len(), 1);
+
+        // A concurrent transaction (XID 15 < 20) is still running, so the
+        // horizon cannot have advanced past 20. Sweeping at 15 retires nothing.
+        assert_eq!(mgr.collect_garbage(xid(15)), 0);
+        assert_eq!(mgr.tracked_len(), 1, "entry must survive while concurrent txn runs");
+
+        // Once the oldest in-progress XID reaches the commit horizon, no
+        // concurrent transaction can survive and the entry is retired.
+        assert_eq!(mgr.collect_garbage(xid(20)), 1);
+        assert_eq!(mgr.tracked_len(), 0);
+    }
+
+    /// GC must never touch a still-active (uncommitted) transaction, even if
+    /// the horizon is far ahead — it has no commit horizon yet.
+    #[test]
+    fn collect_garbage_never_retires_active_transactions() {
+        let mgr = SsiManager::new();
+        let active = xid(5);
+        mgr.register_xid(active);
+        mgr.add_predicate_lock(active, rel_tag(1));
+
+        assert_eq!(mgr.collect_garbage(xid(1_000)), 0);
+        assert_eq!(mgr.tracked_len(), 1, "active txn must not be GC'd");
+    }
+
+    /// Regression: a long sequence of serializable transactions that each
+    /// commit before the next begins must NOT leak entries. With periodic GC
+    /// (as the server drives it from `note_commit_for_gc`) the conflict map
+    /// stays bounded by the sweep interval rather than growing without limit.
+    #[test]
+    fn sequential_serializable_commits_stay_bounded() {
+        const SWEEP_INTERVAL: u64 = 64;
+        const N: u64 = 5_000;
+
+        let mgr = SsiManager::new();
+        let mut max_len = 0;
+
+        for i in 1..=N {
+            let t = xid(i);
+            mgr.register_xid(t);
+            // Each transaction reads a distinct range, leaving a predicate lock
+            // and (potentially) conflict-set memory behind on commit.
+            mgr.add_predicate_lock(t, column_range_tag(1, 0, Some(i64::try_from(i).unwrap()), None));
+            // No concurrent transactions: the high-water mark at commit is the
+            // next XID (`i + 1`).
+            mgr.commit(t, xid(i + 1)).unwrap();
+
+            // The server sweeps periodically, not on every commit. Nothing is
+            // in progress, so the oldest in-progress XID is the next XID.
+            if i % SWEEP_INTERVAL == 0 {
+                mgr.collect_garbage(xid(i + 1));
+            }
+            max_len = max_len.max(mgr.tracked_len());
+        }
+
+        // Drain whatever accumulated since the last sweep.
+        mgr.collect_garbage(xid(N + 1));
+
+        // Without GC this would be N (5000). Bounded by one sweep window.
+        assert!(
+            max_len <= usize::try_from(SWEEP_INTERVAL).unwrap(),
+            "rw_conflicts grew beyond the sweep window: max_len={max_len}"
+        );
+        assert_eq!(mgr.tracked_len(), 0, "all committed entries must be retired");
+    }
+
+    /// Regression: an ancient committed serializable transaction that has been
+    /// retired must not fabricate a spurious `40001` for a much later,
+    /// non-overlapping transaction.
+    ///
+    /// Before GC existed, the ancient reader's predicate lock lingered forever;
+    /// a later writer overwriting that range recorded `ancient --rw--> writer`,
+    /// and because `ancient.committed` was `true` it could serve as the
+    /// committed leg of a dangerous structure, aborting the innocent pivot.
+    #[test]
+    fn retired_ancient_commit_does_not_cause_false_serialization_failure() {
+        let mgr = SsiManager::new();
+
+        // An ancient serializable reader locks column range [0, 100] on rel 1
+        // and commits long ago (commit horizon 2).
+        let ancient = xid(1);
+        mgr.register_xid(ancient);
+        mgr.add_predicate_lock(ancient, column_range_tag(1, 0, Some(0), Some(100)));
+        mgr.commit(ancient, xid(2)).unwrap();
+
+        // Time passes; the global horizon advances far past the ancient commit
+        // and the sweep retires it.
+        assert_eq!(mgr.collect_garbage(xid(1_000)), 1);
+        assert_eq!(mgr.tracked_len(), 0);
+
+        // Much later, two fresh, non-overlapping transactions appear.
+        let pivot = xid(1_000);
+        let t3 = xid(1_001);
+        mgr.register_xid(pivot);
+        mgr.register_xid(t3);
+
+        // `pivot` writes into the range the ancient reader had locked. The
+        // retired ancient entry must NOT be recorded as a conflicting reader.
+        let in_readers =
+            mgr.record_write_conflicts(pivot, &column_range_tag(1, 0, Some(10), Some(10)));
+        assert!(
+            !in_readers.contains(&ancient),
+            "retired ancient txn must not appear as a conflicting reader"
+        );
+        assert!(
+            in_readers.is_empty(),
+            "no live reader locked the range, so there is no in-edge"
+        );
+
+        // `pivot` reads range [0, 50] on rel 2; `t3` writes into it, creating a
+        // genuine pivot --rw--> t3 out-edge.
+        mgr.add_predicate_lock(pivot, column_range_tag(2, 0, Some(0), Some(50)));
+        mgr.record_write_conflicts(t3, &column_range_tag(2, 0, Some(20), Some(20)));
+
+        // With the ancient entry retired, `pivot` has no committed in-edge, so
+        // its commit must succeed instead of raising a spurious 40001.
+        mgr.commit(pivot, xid(1_002))
+            .expect("pivot must commit cleanly; the retired ancient txn cannot be a committed leg");
     }
 }

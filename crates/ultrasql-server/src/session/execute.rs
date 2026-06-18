@@ -511,11 +511,16 @@ where
                         || Self::is_fused_delete_shape(&prepared)
                         || Self::is_scalar_aggregate_shape(&prepared)
                     {
-                        return self.run_dml_or_select(&prepared, &catalog_snapshot);
+                        // The view-rewrite produces a fresh `prepared` plan
+                        // every call, so it has no stable identity to cache
+                        // against — pass `None` and run the full checks.
+                        return self.run_dml_or_select(&prepared, &catalog_snapshot, None);
                     }
                     return self.execute_bound_plan(prepared, sql, catalog_snapshot);
                 }
-                return self.run_dml_or_select(&plan_arc, &catalog_snapshot);
+                // Stable path: `plan_arc` is the pointer-stable `stmt_cache`
+                // entry, so it can key the precheck cache by Arc identity.
+                return self.run_dml_or_select(&plan_arc, &catalog_snapshot, Some(&plan_arc));
             }
             let plan = Arc::unwrap_or_clone(plan_arc);
             return self.execute_bound_plan(plan, sql, catalog_snapshot);
@@ -839,7 +844,9 @@ where
                 Err(e) => return Err(self.fail_if_in_transaction(e)),
             }
         };
-        self.run_dml_or_select(&optimised_plan, &catalog_snapshot)
+        // Cold path: `optimised_plan` is a freshly-allocated local with no
+        // stable identity to cache against.
+        self.run_dml_or_select(&optimised_plan, &catalog_snapshot, None)
     }
 
     pub(crate) fn is_ddl_plan(plan: &LogicalPlan) -> bool {
@@ -1450,7 +1457,9 @@ where
                 Err(e) => return Err(self.fail_if_in_transaction(e)),
             }
         };
-        self.run_dml_or_select(&optimised_plan, &catalog_snapshot)
+        // `optimised_plan` is rebuilt from the bound plan each call, so it
+        // carries no stable identity for the precheck cache.
+        self.run_dml_or_select(&optimised_plan, &catalog_snapshot, None)
     }
 
     /// `true` iff `plan` is an `Update` whose source is a bare `Scan` or
@@ -2893,10 +2902,18 @@ where
         &mut self,
         plan: &LogicalPlan,
         catalog_snapshot: &Arc<CatalogSnapshot>,
+        owner: Option<&Arc<LogicalPlan>>,
     ) -> Result<SelectResult, ServerError> {
-        let precheck_key = Self::prechecked_fast_dml_key(plan);
-        let prechecked =
-            precheck_key.is_some_and(|key| self.prechecked_fast_dml.borrow().contains(&key));
+        // `owner`, when present, must be the `Arc` that `plan` derefs from:
+        // the precheck cache pins it by identity, so a mismatch would let a
+        // skipped check apply to the wrong plan. Only the pointer-stable
+        // `stmt_cache` path passes `Some`; cold / view-rewrite plans pass
+        // `None` and always run the full checks.
+        debug_assert!(
+            owner.is_none_or(|arc| std::ptr::eq(&**arc, plan)),
+            "run_dml_or_select owner Arc must point to the plan passed by value",
+        );
+        let prechecked = self.fast_dml_prechecked(owner);
         let rls_plan = if prechecked {
             None
         } else {
@@ -2959,10 +2976,17 @@ where
         if !prechecked {
             self.reject_non_append_materialized_view_source_write(plan)?;
             if rls_plan.is_none()
-                && let Some(key) = precheck_key
+                && let Some(arc) = owner
+                && let Some(key) = Self::prechecked_fast_dml_key(arc)
                 && self.fast_dml_checks_cacheable(plan)
             {
-                self.prechecked_fast_dml.borrow_mut().insert(key);
+                // Store the `Arc`, not just `key`: the strong reference pins
+                // the allocation so its address can't be recycled, and the
+                // value is what `fast_dml_prechecked` verifies with
+                // `Arc::ptr_eq`.
+                self.prechecked_fast_dml
+                    .borrow_mut()
+                    .insert(key, Arc::clone(arc));
             }
         }
 
@@ -3693,12 +3717,37 @@ where
         ))
     }
 
-    fn prechecked_fast_dml_key(plan: &LogicalPlan) -> Option<usize> {
-        if matches!(plan, LogicalPlan::Delete { .. }) {
-            Some(std::ptr::from_ref(plan).cast::<()>() as usize)
+    /// Hash-bucket key for `plan` in [`Self::prechecked_fast_dml`], or
+    /// `None` when the shape is not eligible for the precheck cache.
+    ///
+    /// The key is the `Arc`'s allocation address, used only to index the
+    /// map; identity is settled by [`Arc::ptr_eq`] against the stored
+    /// `Arc` (see [`Self::fast_dml_prechecked`]), so the address is never
+    /// trusted on its own.
+    fn prechecked_fast_dml_key(plan: &Arc<LogicalPlan>) -> Option<usize> {
+        if matches!(**plan, LogicalPlan::Delete { .. }) {
+            Some(Arc::as_ptr(plan).cast::<()>() as usize)
         } else {
             None
         }
+    }
+
+    /// `true` iff `owner`'s static DML checks were already cached.
+    ///
+    /// `owner` is the pointer-stable `stmt_cache` `Arc` driving this
+    /// execution (or `None` for the cold / view-rewrite paths, which never
+    /// cache). A hit requires both an address match *and* [`Arc::ptr_eq`]
+    /// against the stored `Arc`, so a recycled heap address belonging to a
+    /// different plan can never be mistaken for a cached one.
+    fn fast_dml_prechecked(&self, owner: Option<&Arc<LogicalPlan>>) -> bool {
+        owner.is_some_and(|arc| {
+            Self::prechecked_fast_dml_key(arc).is_some_and(|key| {
+                self.prechecked_fast_dml
+                    .borrow()
+                    .get(&key)
+                    .is_some_and(|cached| Arc::ptr_eq(cached, arc))
+            })
+        })
     }
 
     fn fast_dml_checks_cacheable(&self, plan: &LogicalPlan) -> bool {
@@ -4555,6 +4604,18 @@ mod tests {
         }
     }
 
+    /// A `DELETE FROM t` plan in the exact fused-int32-pair shape that
+    /// [`Session::fast_dml_checks_cacheable`] accepts, so it is eligible
+    /// for the precheck cache.
+    fn cacheable_delete_plan() -> LogicalPlan {
+        LogicalPlan::Delete {
+            table: "t".to_owned(),
+            input: Box::new(scan_plan()),
+            returning: Vec::new(),
+            schema: Schema::empty(),
+        }
+    }
+
     fn test_session() -> Session<tokio::io::DuplexStream> {
         let (io, _peer) = duplex(64);
         Session::new(io, Arc::new(Server::with_sample_database()))
@@ -4569,6 +4630,62 @@ mod tests {
             panic!("missing data row");
         };
         String::from_utf8(columns[0].clone().expect("value")).expect("utf8")
+    }
+
+    #[test]
+    fn fast_dml_precheck_cache_keys_on_arc_identity_not_heap_address() {
+        type S = Session<tokio::io::DuplexStream>;
+        let session = test_session();
+
+        // Two distinct, independently-allocated DELETE plans of the
+        // cacheable shape. In production these are the pointer-stable
+        // `stmt_cache` `Arc`s driving repeat executions.
+        let cached = Arc::new(cacheable_delete_plan());
+        let other = Arc::new(cacheable_delete_plan());
+
+        // Nothing cached yet: neither plan is prechecked, and the cold /
+        // view-rewrite `None` path is never prechecked.
+        assert!(!session.fast_dml_prechecked(Some(&cached)));
+        assert!(!session.fast_dml_prechecked(Some(&other)));
+        assert!(!session.fast_dml_prechecked(None));
+
+        // Simulate `cached` having passed its static DML checks, exactly as
+        // `run_dml_or_select` does on the stable path (pin the `Arc`).
+        let key = S::prechecked_fast_dml_key(&cached).expect("delete plan is cache-eligible");
+        session
+            .prechecked_fast_dml
+            .borrow_mut()
+            .insert(key, Arc::clone(&cached));
+
+        // The genuinely-cached `Arc` hits; the distinct sibling does not.
+        assert!(session.fast_dml_prechecked(Some(&cached)));
+        assert!(!session.fast_dml_prechecked(Some(&other)));
+
+        // Forge the ABA worst case directly: an entry stored under `other`'s
+        // current heap address but holding a *different* plan's `Arc`
+        // (`cached`). Under the old address-only `HashSet<usize>` this is
+        // exactly the false positive that would skip RLS / column-privilege
+        // / MV-source checks for `other`; `Arc::ptr_eq` must reject it.
+        let collision_key =
+            S::prechecked_fast_dml_key(&other).expect("delete plan is cache-eligible");
+        assert_ne!(
+            key, collision_key,
+            "distinct live Arcs must occupy distinct addresses",
+        );
+        session
+            .prechecked_fast_dml
+            .borrow_mut()
+            .insert(collision_key, Arc::clone(&cached));
+        assert!(
+            !session.fast_dml_prechecked(Some(&other)),
+            "address collision with a distinct plan must not be a false cache hit",
+        );
+
+        // Invalidation drops the pinned `Arc`s, forcing the next execution
+        // back through the full checks.
+        session.plan_cache_invalidate();
+        assert!(session.prechecked_fast_dml.borrow().is_empty());
+        assert!(!session.fast_dml_prechecked(Some(&cached)));
     }
 
     #[test]

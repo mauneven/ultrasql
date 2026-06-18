@@ -63,7 +63,9 @@ fn bench_ssi_commit_throughput(c: &mut Criterion) {
 
             for i in 0..N {
                 // Serialization errors are expected in ~some cases; ignore them.
-                let _ = mgr.commit(Xid::new(i + 1));
+                // All N XIDs were handed out up front, so the commit horizon is
+                // one past the largest (`N + 1`).
+                let _ = mgr.commit(Xid::new(i + 1), Xid::new(N + 1));
             }
 
             std::hint::black_box(&mgr);

@@ -1122,6 +1122,7 @@ impl PersistentCatalog {
                 "public".to_owned()
             };
             entry.root_block = ultrasql_core::BlockNumber::new(class_row.relfilenode);
+            entry.is_primary = index_row.indisprimary;
             entry.access_method = index_row.indmethod.clone();
             entry.opclasses = index_row.indopclasses.clone();
             entry.options = index_row.indoptions.clone();
@@ -1727,7 +1728,7 @@ impl PersistentCatalog {
                 ))
             })?,
             indisunique: entry.is_unique,
-            indisprimary: entry.name.ends_with("_pkey"),
+            indisprimary: entry.is_primary,
             indisvalid: true,
             indkey,
             indmethod: entry.access_method.clone(),
@@ -3915,6 +3916,67 @@ mod tests {
         assert_eq!(restored.root_block, BlockNumber::new(7));
         assert!(!restored.is_unique);
         assert_eq!(snap.indexes_by_table[&table_oid], vec![restored.clone()]);
+    }
+
+    #[test]
+    fn indisprimary_follows_is_primary_not_the_pkey_name_heuristic() {
+        use std::sync::Arc;
+        use ultrasql_core::{CommandId, DataType, Field, PageId, Schema, Xid};
+        use ultrasql_storage::buffer_pool::BufferPool;
+        use ultrasql_storage::heap::HeapAccess;
+        use ultrasql_storage::page::Page;
+
+        let pool = Arc::new(BufferPool::new(64, |_: PageId| Ok(Page::new_heap())));
+        let heap = HeapAccess::new(pool);
+
+        let cat = PersistentCatalog::new();
+        let table_oid = cat.next_oid();
+        let table = TableEntry::new(
+            table_oid,
+            "orders".to_owned(),
+            "public".to_owned(),
+            Schema::new(vec![Field::required("id", DataType::Int64)]).expect("schema"),
+        );
+        cat.persist_table_rows(&table, &heap, Xid::new(1), CommandId::new(0))
+            .expect("persist table");
+
+        // A primary-key index whose name does NOT follow the `_pkey`
+        // convention must still persist `indisprimary = true`.
+        let primary = IndexEntry::new(cat.next_oid(), "orders_primary", table_oid, vec![0], true)
+            .with_primary(true);
+        cat.persist_index_rows(&primary, &heap, Xid::new(2), CommandId::new(0))
+            .expect("persist primary index");
+
+        // A user index that merely happens to be named `*_pkey` is not
+        // primary and must persist `indisprimary = false`.
+        let decoy = IndexEntry::new(cat.next_oid(), "orders_pkey", table_oid, vec![0], false);
+        cat.persist_index_rows(&decoy, &heap, Xid::new(3), CommandId::new(0))
+            .expect("persist decoy index");
+
+        // Reload from the heap so the assertions read back the persisted
+        // `pg_index.indisprimary` value (bootstrap copies it into
+        // `IndexEntry::is_primary`), exercising the full round trip.
+        let cat2 = PersistentCatalog::new();
+        cat2.bootstrap_from_heap(&heap).expect("bootstrap");
+        let snap = cat2.snapshot();
+
+        let restored_primary = snap
+            .indexes
+            .get("orders_primary")
+            .expect("primary index restored");
+        assert!(
+            restored_primary.is_primary,
+            "non-_pkey-named primary index must report indisprimary = true"
+        );
+
+        let restored_decoy = snap
+            .indexes
+            .get("orders_pkey")
+            .expect("decoy index restored");
+        assert!(
+            !restored_decoy.is_primary,
+            "user index named *_pkey must report indisprimary = false"
+        );
     }
 
     #[test]
