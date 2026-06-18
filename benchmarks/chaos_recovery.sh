@@ -1,10 +1,11 @@
 #!/usr/bin/env bash
 # Chaos recovery smoke/full harness.
 #
-# Exercises three production failure classes against a real ultrasqld process:
-# random kill, WAL truncation, and safe disk-full simulation. The disk-full
-# leg uses a child-process file-size cap (`ulimit -f`) so it never fills the
-# host filesystem. Missing prerequisites emit `"status": "not_available"`.
+# Exercises four production failure classes against a real ultrasqld process:
+# random kill, WAL torn-tail truncation, WAL segment recycling + hard kill, and
+# safe disk-full simulation. The disk-full leg uses a child-process file-size
+# cap (`ulimit -f`) so it never fills the host filesystem. Missing prerequisites
+# emit `"status": "not_available"`.
 
 set -euo pipefail
 
@@ -26,6 +27,7 @@ case "$PROFILE" in
         DISK_FULL_MAX_INSERTS="${CHAOS_DISK_FULL_MAX_INSERTS:-80}"
         DISK_FULL_PAYLOAD_BYTES="${CHAOS_DISK_FULL_PAYLOAD_BYTES:-2048}"
         DISK_FULL_MARGIN_BYTES="${CHAOS_DISK_FULL_MARGIN_BYTES:-8192}"
+        RECYCLE_ROWS="${CHAOS_RECYCLE_ROWS:-40}"
         ;;
     full)
         RANDOM_ROWS="${CHAOS_RANDOM_ROWS:-96}"
@@ -33,6 +35,7 @@ case "$PROFILE" in
         DISK_FULL_MAX_INSERTS="${CHAOS_DISK_FULL_MAX_INSERTS:-512}"
         DISK_FULL_PAYLOAD_BYTES="${CHAOS_DISK_FULL_PAYLOAD_BYTES:-8192}"
         DISK_FULL_MARGIN_BYTES="${CHAOS_DISK_FULL_MARGIN_BYTES:-16384}"
+        RECYCLE_ROWS="${CHAOS_RECYCLE_ROWS:-200}"
         ;;
     *)
         echo "chaos_recovery.sh: profile must be smoke or full, got '$PROFILE'" >&2
@@ -87,7 +90,7 @@ record_case() {
 
 finish() {
     mkdir -p "$OUT_DIR"
-    python3 - "$PROFILE" "$MANIFEST" "$STATUS_FILE" "$CHAOS_SEED" "$RANDOM_ROWS" "$WAL_TRUNC_ROWS" "$DISK_FULL_MAX_INSERTS" <<'PY'
+    python3 - "$PROFILE" "$MANIFEST" "$STATUS_FILE" "$CHAOS_SEED" "$RANDOM_ROWS" "$WAL_TRUNC_ROWS" "$DISK_FULL_MAX_INSERTS" "$RECYCLE_ROWS" <<'PY'
 import json
 import os
 import pathlib
@@ -103,6 +106,7 @@ import time
     random_rows,
     wal_trunc_rows,
     disk_full_max_inserts,
+    recycle_rows,
 ) = sys.argv[1:]
 
 def bool_text(value):
@@ -154,6 +158,7 @@ doc = {
     "random_kill_rows": int(random_rows),
     "wal_truncation_rows": int(wal_trunc_rows),
     "disk_full_max_inserts": int(disk_full_max_inserts),
+    "segment_recycling_rows": int(recycle_rows),
     "cases": cases,
     "host": {
         "cpu": platform.processor() or platform.machine(),
@@ -218,6 +223,38 @@ start_server() {
     local pid="$!"
     remember_pid "$pid"
     echo "$pid"
+}
+
+start_server_small_segments() {
+    local data_dir="$1"
+    local port="$2"
+    local log_path="$3"
+    "$ULTRASQLD_BIN" \
+        --data-dir "$data_dir" \
+        --listen "127.0.0.1:$port" \
+        --log-level warn \
+        --autovacuum-interval-ms 0 \
+        --checkpoint-interval-ms 0 \
+        --wal-segment-size-bytes 16384 \
+        >"$log_path" 2>&1 &
+    local pid="$!"
+    remember_pid "$pid"
+    echo "$pid"
+}
+
+# Print 1 when the original head WAL segment has been recycled (the recovery
+# floor advanced past it), 0 otherwise.
+head_wal_segment_recycled() {
+    local data_dir="$1"
+    python3 - "$data_dir/pg_wal" <<'PY'
+import pathlib
+import sys
+
+wal_dir = pathlib.Path(sys.argv[1])
+head = wal_dir / "segment_0000000000"
+manifest = wal_dir / "wal.manifest"
+print(1 if (manifest.exists() and not head.exists()) else 0)
+PY
 }
 
 start_server_with_fsize_limit() {
@@ -546,6 +583,97 @@ run_disk_full_case() {
     fi
 }
 
+# WAL segment recycling + hard kill. Small WAL segments make a few hundred rows
+# span several segments; an explicit CHECKPOINT recycles the low ones (unlinking
+# the files and advancing the recovery floor). After more rows and a `kill -9`,
+# a restart must seed recovery from the advanced floor — not LSN 0 — and recover
+# every committed row, including those whose WAL segments were recycled (they
+# survive on the durable heap) and the post-checkpoint ones replayed from the
+# retained WAL tail.
+run_segment_recycling_case() {
+    local data_dir="$WORK_DIR/segment-recycling-data"
+    local log1="$WORK_DIR/segment-recycling-1.log"
+    local log2="$WORK_DIR/segment-recycling-2.log"
+    local port
+    port="$(pick_port)"
+    local dsn="postgresql://ultrasql@127.0.0.1:$port/ultrasql?sslmode=disable"
+    local pid
+    pid="$(start_server_small_segments "$data_dir" "$port" "$log1")"
+    if ! wait_psql_ready "$dsn"; then
+        record_case "segment_recycling" "failed" "server_not_ready_before_recycle" "0" "0" "0" "0" "" "" "$log1"
+        return
+    fi
+    if ! run_psql "$dsn" "CREATE TABLE chaos_segment_recycling (id INT, payload TEXT)" >/dev/null; then
+        record_case "segment_recycling" "failed" "create_table_failed" "0" "0" "0" "0" "" "" "$log1"
+        stop_pid "$pid"
+        return
+    fi
+    # ~1 KiB rows over 16 KiB segments: roughly a dozen rows per segment, so a
+    # few hundred rows span many segments and a checkpoint has plenty to recycle.
+    local payload
+    payload="$(printf 'r%.0s' $(seq 1 1000))"
+    local i
+    for i in $(seq 1 "$RECYCLE_ROWS"); do
+        if ! run_psql "$dsn" "INSERT INTO chaos_segment_recycling VALUES ($i, '$payload')" >/dev/null; then
+            record_case "segment_recycling" "failed" "insert_before_recycle_failed" "0" "0" "0" "0" "$RECYCLE_ROWS" "$i" "$log1"
+            stop_pid "$pid"
+            return
+        fi
+    done
+    if ! run_psql "$dsn" "CHECKPOINT" >/dev/null; then
+        record_case "segment_recycling" "failed" "checkpoint_failed" "0" "0" "0" "0" "$RECYCLE_ROWS" "" "$log1"
+        stop_pid "$pid"
+        return
+    fi
+    local recycled
+    recycled="$(head_wal_segment_recycled "$data_dir")"
+    if [ "$recycled" != "1" ]; then
+        # Not enough WAL to span past one segment on this host; the drill cannot
+        # exercise floor-seeded recovery, so report it as unavailable, not failed.
+        record_case "segment_recycling" "not_available" "recycling_not_triggered" "0" "0" "0" "0" "$RECYCLE_ROWS" "" "$log1"
+        stop_pid "$pid"
+        return
+    fi
+    # Post-checkpoint rows: ids 1000001+ live only in the WAL above the floor.
+    local post
+    for post in 1 2 3 4 5; do
+        if ! run_psql "$dsn" "INSERT INTO chaos_segment_recycling VALUES ($((1000000 + post)), 'post-$post')" >/dev/null; then
+            record_case "segment_recycling" "failed" "insert_after_recycle_failed" "0" "1" "0" "0" "$RECYCLE_ROWS" "" "$log1"
+            stop_pid "$pid"
+            return
+        fi
+    done
+    local expected
+    if ! expected="$(query_scalar "$dsn" "SELECT COUNT(*) FROM chaos_segment_recycling")"; then
+        record_case "segment_recycling" "failed" "count_before_kill_failed" "0" "1" "0" "0" "$RECYCLE_ROWS" "" "$log1"
+        stop_pid "$pid"
+        return
+    fi
+
+    # Hard crash: no graceful shutdown, no final flush.
+    kill_pid_hard "$pid"
+
+    port="$(pick_port)"
+    dsn="postgresql://ultrasql@127.0.0.1:$port/ultrasql?sslmode=disable"
+    pid="$(start_server_small_segments "$data_dir" "$port" "$log2")"
+    if ! wait_psql_ready "$dsn"; then
+        record_case "segment_recycling" "failed" "server_not_ready_after_kill" "1" "1" "0" "0" "$expected" "" "$log2"
+        return
+    fi
+    local recovered
+    if ! recovered="$(query_scalar "$dsn" "SELECT COUNT(*) FROM chaos_segment_recycling")"; then
+        record_case "segment_recycling" "failed" "count_after_kill_failed" "1" "1" "0" "0" "$expected" "" "$log2"
+        stop_pid "$pid"
+        return
+    fi
+    stop_pid "$pid"
+    if [ "$recovered" = "$expected" ] && validate_data_dir "$data_dir"; then
+        record_case "segment_recycling" "passed" "ok" "1" "1" "0" "1" "$expected" "$recovered" "recycled_head_segment=1"
+    else
+        record_case "segment_recycling" "failed" "row_count_mismatch_after_kill" "1" "1" "0" "0" "$expected" "$recovered" "recycled_head_segment=$recycled"
+    fi
+}
+
 need_cmd python3
 need_cmd cargo
 need_cmd "$PSQL"
@@ -567,5 +695,6 @@ mkdir -p "$WORK_DIR" "$OUT_DIR"
 
 run_random_kill_case
 run_wal_truncation_case
+run_segment_recycling_case
 run_disk_full_case
 finish
