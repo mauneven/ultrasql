@@ -88,11 +88,14 @@ file focused on what still blocks production.
   accumulate for the life of the database, so disk usage grows unbounded and
   every restart replays all history (the vector index rebuilds from `Lsn::ZERO`
   on each start). Checkpoint-driven truncation is blocked by four coupled
-  prerequisites, each a silent-data-loss risk if done wrong: (1) the WAL LSN is
-  an absolute byte offset from the start of history and recovery hardcodes
-  `stream_pos = 0` at the first segment, so removing head segments shifts every
-  reconstructed LSN — a per-segment start-LSN manifest is needed plus seeding
-  every recovery scanner from it; (2) commit/abort status is rebuilt by scanning
+  prerequisites, each a silent-data-loss risk if done wrong: (1) DONE — the WAL
+  LSN is an absolute byte offset from the start of history; a crc32c-checksummed
+  `wal.manifest` now records the recovery floor (first surviving segment index +
+  its absolute start LSN), `recover_with_target` seeds its byte cursor from the
+  floor and ignores below-floor segments, and the server's redo and vector
+  replay scanners seed from the same floor — so removing head segments no longer
+  shifts reconstructed LSNs (behavior-neutral until truncation writes a
+  non-origin floor); (2) commit/abort status is rebuilt by scanning
   all `Commit`/`Abort` records on every startup (no persistent CLOG), so
   truncation must first fold commit status into the checkpoint record or persist
   a CLOG; (3) the checkpoint flush is a buffered `write_page` with no fsync, so
