@@ -140,6 +140,15 @@ struct Cli {
     #[arg(long, default_value_t = 0.1)]
     autovacuum_analyze_scale_factor: f64,
 
+    /// Automatic checkpoint interval in milliseconds. Each cycle flushes dirty
+    /// pages, fsyncs the data segments, writes per-index/commit-log snapshots,
+    /// and recycles WAL segments below the safe floor (so the WAL and restart
+    /// time stay bounded instead of growing with total history). 0 disables;
+    /// then the floor only advances on an explicit `CHECKPOINT`. Persistent
+    /// (data-dir) mode only.
+    #[arg(long, default_value_t = 300_000)]
+    checkpoint_interval_ms: u64,
+
     /// Shell command used to archive completed WAL files. `%p` expands to the
     /// source path and `%f` expands to the WAL filename.
     #[arg(long, env = "ULTRASQL_ARCHIVE_COMMAND")]
@@ -366,6 +375,25 @@ fn main() -> std::process::ExitCode {
                 loop {
                     ticker.tick().await;
                     autovacuum_state.run_autovacuum_cycle();
+                }
+            });
+        }
+        if cli.checkpoint_interval_ms > 0 && cli.data_dir.is_some() {
+            let checkpoint_state = Arc::clone(&state);
+            let interval = std::time::Duration::from_millis(cli.checkpoint_interval_ms);
+            tokio::spawn(async move {
+                // Space cycles by `interval` AFTER each completes (not between
+                // starts), so a slow checkpoint never queues a back-to-back run.
+                loop {
+                    tokio::time::sleep(interval).await;
+                    let server = Arc::clone(&checkpoint_state);
+                    // A full checkpoint does blocking fsync/file IO; run it off
+                    // the async reactor so it never stalls connection handling.
+                    if let Err(e) =
+                        tokio::task::spawn_blocking(move || server.run_checkpoint_cycle()).await
+                    {
+                        error!(target: "ultrasqld", error = %e, "automatic checkpoint task panicked");
+                    }
                 }
             });
         }
@@ -1674,6 +1702,7 @@ mod tests {
             log_statement: CliLogStatementMode::None,
             idle_session_timeout_ms: 0,
             autovacuum_interval_ms: 1000,
+            checkpoint_interval_ms: 0,
             autovacuum_vacuum_threshold: 7,
             autovacuum_vacuum_scale_factor: 0.25,
             autovacuum_analyze_threshold: 11,
@@ -1711,6 +1740,7 @@ mod tests {
             log_statement: CliLogStatementMode::None,
             idle_session_timeout_ms: 0,
             autovacuum_interval_ms: 1000,
+            checkpoint_interval_ms: 0,
             autovacuum_vacuum_threshold: 50,
             autovacuum_vacuum_scale_factor: f64::NAN,
             autovacuum_analyze_threshold: 50,
@@ -1743,6 +1773,7 @@ mod tests {
             log_statement: CliLogStatementMode::Mod,
             idle_session_timeout_ms: 0,
             autovacuum_interval_ms: 1000,
+            checkpoint_interval_ms: 0,
             autovacuum_vacuum_threshold: 50,
             autovacuum_vacuum_scale_factor: 0.2,
             autovacuum_analyze_threshold: 50,
@@ -1775,6 +1806,7 @@ mod tests {
             log_statement: CliLogStatementMode::All,
             idle_session_timeout_ms: 0,
             autovacuum_interval_ms: 1000,
+            checkpoint_interval_ms: 0,
             autovacuum_vacuum_threshold: 50,
             autovacuum_vacuum_scale_factor: 0.2,
             autovacuum_analyze_threshold: 50,
@@ -1811,6 +1843,7 @@ mod tests {
             log_statement: CliLogStatementMode::None,
             idle_session_timeout_ms: 0,
             autovacuum_interval_ms: 1000,
+            checkpoint_interval_ms: 0,
             autovacuum_vacuum_threshold: 50,
             autovacuum_vacuum_scale_factor: 0.2,
             autovacuum_analyze_threshold: 50,
@@ -1857,6 +1890,7 @@ mod tests {
             log_statement: CliLogStatementMode::None,
             idle_session_timeout_ms: 0,
             autovacuum_interval_ms: 1000,
+            checkpoint_interval_ms: 0,
             autovacuum_vacuum_threshold: 50,
             autovacuum_vacuum_scale_factor: 0.2,
             autovacuum_analyze_threshold: 50,
@@ -1914,6 +1948,7 @@ mod tests {
             log_statement: CliLogStatementMode::None,
             idle_session_timeout_ms: 0,
             autovacuum_interval_ms: 1000,
+            checkpoint_interval_ms: 0,
             autovacuum_vacuum_threshold: 50,
             autovacuum_vacuum_scale_factor: 0.2,
             autovacuum_analyze_threshold: 50,
@@ -2019,6 +2054,7 @@ mod tests {
             log_statement: CliLogStatementMode::None,
             idle_session_timeout_ms: 0,
             autovacuum_interval_ms: 1000,
+            checkpoint_interval_ms: 0,
             autovacuum_vacuum_threshold: 50,
             autovacuum_vacuum_scale_factor: 0.2,
             autovacuum_analyze_threshold: 50,
@@ -2049,6 +2085,7 @@ mod tests {
             log_statement: CliLogStatementMode::None,
             idle_session_timeout_ms: 0,
             autovacuum_interval_ms: 1000,
+            checkpoint_interval_ms: 0,
             autovacuum_vacuum_threshold: 50,
             autovacuum_vacuum_scale_factor: 0.2,
             autovacuum_analyze_threshold: 50,

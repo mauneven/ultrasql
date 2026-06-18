@@ -5232,6 +5232,19 @@ impl Server {
         Ok(())
     }
 
+    /// Run one full checkpoint cycle for a background timer, logging and
+    /// swallowing any error so a transient failure never tears down the loop.
+    ///
+    /// A full checkpoint flushes dirty pages, fsyncs the data segments, writes
+    /// the per-index and commit-log snapshots, and recycles WAL segments below
+    /// the safe floor. In in-memory (no-WAL) mode this is a cheap no-op, since
+    /// `perform_checkpoint` returns early without a WAL sink.
+    pub fn run_checkpoint_cycle(&self) {
+        if let Err(e) = self.perform_checkpoint() {
+            warn!(error = %e, "automatic checkpoint cycle failed; will retry next interval");
+        }
+    }
+
     /// Recycle WAL segments that lie entirely below the safe recovery floor.
     ///
     /// The floor is the most conservative of three bounds, so recovery can still

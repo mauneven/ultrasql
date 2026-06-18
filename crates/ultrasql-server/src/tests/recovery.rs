@@ -620,6 +620,38 @@ fn fold_min_nonzero_lsn_skips_zero_and_keeps_minimum() {
 }
 
 #[test]
+fn run_checkpoint_cycle_recycles_wal_like_an_explicit_checkpoint() {
+    // The background-timer entry point must do a full checkpoint — including WAL
+    // recycling — exactly like an explicit CHECKPOINT.
+    let data_dir = tempfile::TempDir::new().unwrap();
+    let wal_dir = data_dir.path().join("pg_wal");
+    let cfg = small_wal_config();
+    {
+        let server = Server::init_with_wal_writer_config(data_dir.path(), cfg).unwrap();
+        append_resolved_records(&server, 600);
+        server.run_checkpoint_cycle();
+
+        let floor = ultrasql_wal::read_floor(&wal_dir).unwrap();
+        assert!(
+            floor.segment_index > 0,
+            "the automatic checkpoint cycle must recycle low WAL segments"
+        );
+        assert!(!wal_dir.join("segment_0000000000").exists());
+    }
+    // The advanced floor is durable: a reopen recovers cleanly from it.
+    let reopened = Server::init_with_wal_writer_config(data_dir.path(), cfg).unwrap();
+    assert!(reopened.runtime_wal_flushed_lsn().is_some());
+}
+
+#[test]
+fn run_checkpoint_cycle_is_a_safe_noop_without_a_wal() {
+    // In-memory (sample) mode installs no WAL sink; the cycle must be a quiet
+    // no-op rather than erroring or panicking.
+    let server = Server::with_sample_database();
+    server.run_checkpoint_cycle();
+}
+
+#[test]
 fn checkpoint_recycles_wal_segments_below_the_floor() {
     let data_dir = tempfile::TempDir::new().unwrap();
     let wal_dir = data_dir.path().join("pg_wal");
