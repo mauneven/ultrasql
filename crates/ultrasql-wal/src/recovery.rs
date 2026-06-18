@@ -167,15 +167,25 @@ pub fn recover_with_target(
     mut apply: impl FnMut(&WalRecord) -> Result<(), RecoveryError>,
 ) -> Result<Lsn, RecoveryError> {
     let dir = wal_dir.as_ref();
-    let segments = list_segments(dir)?;
+    // The recovery floor: after low segments are recycled, the on-disk stream no
+    // longer starts at LSN 0. Seed the byte cursor from the first surviving
+    // segment's absolute start LSN and ignore any segment below the floor index
+    // (a partial truncation can leave below-floor segments on disk; they are
+    // superseded and must not be replayed). An absent manifest is the origin
+    // (segment 0 / LSN 0) — the historical, unchanged behaviour.
+    let floor = crate::manifest::read_floor(dir)?;
+    let segments: Vec<_> = list_segments(dir)?
+        .into_iter()
+        .filter(|(index, _)| *index >= floor.segment_index)
+        .collect();
     if segments.is_empty() {
         debug!(?dir, "wal recovery: no segments found");
-        return Ok(Lsn::ZERO);
+        return Ok(floor.floor_lsn);
     }
 
-    let mut stream_pos: u64 = 0;
+    let mut stream_pos: u64 = floor.floor_lsn.raw();
     let mut record_count: u64 = 0;
-    let mut last_good_pos: u64 = 0;
+    let mut last_good_pos: u64 = stream_pos;
 
     let segment_count = segments.len();
     for (segment_ordinal, (index, path)) in segments.into_iter().enumerate() {
@@ -424,6 +434,63 @@ mod tests {
 
         assert_eq!(seen, vec![10]);
         assert_eq!(recovered, target);
+    }
+
+    #[test]
+    fn recover_seeds_the_byte_cursor_from_the_manifest_floor() {
+        use crate::manifest::{WalFloor, write_floor};
+
+        let dir = TempDir::new().unwrap();
+        let nop = |xid: u64| {
+            WalRecord::new(RecordType::Nop, Xid::new(xid), Lsn::ZERO, 0, Vec::new())
+                .expect("nop record")
+                .encode()
+        };
+
+        // segment_0 holds records 10,11; segment_1 holds 20,21. Segment_1's
+        // first record therefore begins at the absolute LSN `s0`.
+        let mut seg0 = nop(10);
+        seg0.extend_from_slice(&nop(11));
+        let mut seg1 = nop(20);
+        seg1.extend_from_slice(&nop(21));
+        let s0 = u64::try_from(seg0.len()).unwrap();
+        let s1 = u64::try_from(seg1.len()).unwrap();
+        std::fs::write(dir.path().join("segment_0000000000"), &seg0).unwrap();
+        std::fs::write(dir.path().join("segment_0000000001"), &seg1).unwrap();
+
+        // Full recovery (no manifest): every record, absolute end LSN s0 + s1.
+        let mut full = Vec::new();
+        let full_end = recover(dir.path(), |r| {
+            full.push(r.header.xid.raw());
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(full, vec![10, 11, 20, 21]);
+        assert_eq!(full_end, Lsn::new(s0 + s1));
+
+        // Set a floor at segment 1 (start LSN s0), as a truncation of segment 0
+        // would. Recovery ignores the below-floor segment_0, seeds its byte
+        // cursor from s0, and reconstructs the SAME absolute end LSN — proving
+        // that removing the head segment does not shift reconstructed LSNs.
+        write_floor(
+            dir.path(),
+            WalFloor {
+                segment_index: 1,
+                floor_lsn: Lsn::new(s0),
+            },
+        )
+        .unwrap();
+        let mut floored = Vec::new();
+        let floored_end = recover(dir.path(), |r| {
+            floored.push(r.header.xid.raw());
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(floored, vec![20, 21], "below-floor segment must be ignored");
+        assert_eq!(
+            floored_end, full_end,
+            "floored recovery must reconstruct the same absolute end LSN as a full run"
+        );
     }
 
     #[test]

@@ -23,6 +23,7 @@
 
 pub mod applier;
 pub mod buffer;
+pub mod manifest;
 pub mod payload;
 pub mod record;
 pub mod recovery;
@@ -31,6 +32,7 @@ pub mod writer;
 
 pub use applier::{ApplyError, HeapTarget, dispatch_record, dispatch_record_at_lsn, replay_into};
 pub use buffer::{WalBuffer, WalBufferError};
+pub use manifest::{WalFloor, read_floor, write_floor};
 pub use payload::{
     AbortPayload, BTreeOpKind, BTreeOpPayload, CheckpointPayload, CommitPayload,
     FullPageWritePayload, HashOpKind, HashOpPayload, HeapDeleteInPlaceBatchEntry,

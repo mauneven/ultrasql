@@ -5389,7 +5389,13 @@ impl Server {
             sequences: Arc::clone(&sequences),
         };
         let recovery_replay_target = recovery_replay_target_from_data_dir(data_dir)?;
-        let mut record_lsn = Lsn::ZERO;
+        // Seed the byte cursor from the WAL recovery floor (the start LSN of the
+        // first surviving segment after any truncation). recover_with_target
+        // seeds its own cursor from the same floor; both read the manifest, so
+        // the LSNs they reconstruct agree. An absent manifest is LSN 0.
+        let mut record_lsn = ultrasql_wal::read_floor(&wal_dir)
+            .map_err(|e| ServerError::Ddl(format!("read WAL recovery floor: {e}")))?
+            .floor_lsn;
         let recovered_lsn =
             ultrasql_wal::recover_with_target(&wal_dir, recovery_replay_target, |record| {
                 let current_lsn = record_lsn;
@@ -8288,7 +8294,11 @@ impl Server {
         // whose LSN is already covered by a loaded snapshot's meta.lsn
         // high-water mark is skipped by `redo_covered`. Without a snapshot the
         // arena starts at meta.lsn == 0 and every record applies (full rebuild).
-        let mut record_lsn = Lsn::ZERO;
+        // Seed from the WAL recovery floor so LSNs stay absolute after any
+        // truncation (matches recover_with_target's own cursor; absent = 0).
+        let mut record_lsn = ultrasql_wal::read_floor(&wal_dir)
+            .map_err(|e| ServerError::ddl(format!("read WAL recovery floor: {e}")))?
+            .floor_lsn;
         ultrasql_wal::recover_with_target(&wal_dir, recovery_replay_target, |record| {
             let current_lsn = record_lsn;
             record_lsn = record_lsn
