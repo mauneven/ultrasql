@@ -149,6 +149,12 @@ struct Cli {
     #[arg(long, default_value_t = 300_000)]
     checkpoint_interval_ms: u64,
 
+    /// WAL segment size in bytes; 0 uses the built-in default (16 MiB). Smaller
+    /// segments give finer WAL-retention granularity (segments are recycled
+    /// whole at checkpoints). Persistent (data-dir) mode only.
+    #[arg(long, default_value_t = 0)]
+    wal_segment_size_bytes: u64,
+
     /// Shell command used to archive completed WAL files. `%p` expands to the
     /// source path and `%f` expands to the WAL filename.
     #[arg(long, env = "ULTRASQL_ARCHIVE_COMMAND")]
@@ -325,7 +331,12 @@ fn main() -> std::process::ExitCode {
                     }
                 }
             }
-            match Server::init(path) {
+            let init_result = if cli.wal_segment_size_bytes > 0 {
+                Server::init_with_wal_segment_size(path, cli.wal_segment_size_bytes)
+            } else {
+                Server::init(path)
+            };
+            match init_result {
                 Ok(mut server) => {
                     server.set_autovacuum_config(autovacuum_config);
                     server.set_logging_config(logging_config);
@@ -1703,6 +1714,7 @@ mod tests {
             idle_session_timeout_ms: 0,
             autovacuum_interval_ms: 1000,
             checkpoint_interval_ms: 0,
+            wal_segment_size_bytes: 0,
             autovacuum_vacuum_threshold: 7,
             autovacuum_vacuum_scale_factor: 0.25,
             autovacuum_analyze_threshold: 11,
@@ -1741,6 +1753,7 @@ mod tests {
             idle_session_timeout_ms: 0,
             autovacuum_interval_ms: 1000,
             checkpoint_interval_ms: 0,
+            wal_segment_size_bytes: 0,
             autovacuum_vacuum_threshold: 50,
             autovacuum_vacuum_scale_factor: f64::NAN,
             autovacuum_analyze_threshold: 50,
@@ -1774,6 +1787,7 @@ mod tests {
             idle_session_timeout_ms: 0,
             autovacuum_interval_ms: 1000,
             checkpoint_interval_ms: 0,
+            wal_segment_size_bytes: 0,
             autovacuum_vacuum_threshold: 50,
             autovacuum_vacuum_scale_factor: 0.2,
             autovacuum_analyze_threshold: 50,
@@ -1807,6 +1821,7 @@ mod tests {
             idle_session_timeout_ms: 0,
             autovacuum_interval_ms: 1000,
             checkpoint_interval_ms: 0,
+            wal_segment_size_bytes: 0,
             autovacuum_vacuum_threshold: 50,
             autovacuum_vacuum_scale_factor: 0.2,
             autovacuum_analyze_threshold: 50,
@@ -1844,6 +1859,7 @@ mod tests {
             idle_session_timeout_ms: 0,
             autovacuum_interval_ms: 1000,
             checkpoint_interval_ms: 0,
+            wal_segment_size_bytes: 0,
             autovacuum_vacuum_threshold: 50,
             autovacuum_vacuum_scale_factor: 0.2,
             autovacuum_analyze_threshold: 50,
@@ -1891,6 +1907,7 @@ mod tests {
             idle_session_timeout_ms: 0,
             autovacuum_interval_ms: 1000,
             checkpoint_interval_ms: 0,
+            wal_segment_size_bytes: 0,
             autovacuum_vacuum_threshold: 50,
             autovacuum_vacuum_scale_factor: 0.2,
             autovacuum_analyze_threshold: 50,
@@ -1949,6 +1966,7 @@ mod tests {
             idle_session_timeout_ms: 0,
             autovacuum_interval_ms: 1000,
             checkpoint_interval_ms: 0,
+            wal_segment_size_bytes: 0,
             autovacuum_vacuum_threshold: 50,
             autovacuum_vacuum_scale_factor: 0.2,
             autovacuum_analyze_threshold: 50,
@@ -2055,6 +2073,7 @@ mod tests {
             idle_session_timeout_ms: 0,
             autovacuum_interval_ms: 1000,
             checkpoint_interval_ms: 0,
+            wal_segment_size_bytes: 0,
             autovacuum_vacuum_threshold: 50,
             autovacuum_vacuum_scale_factor: 0.2,
             autovacuum_analyze_threshold: 50,
@@ -2086,6 +2105,7 @@ mod tests {
             idle_session_timeout_ms: 0,
             autovacuum_interval_ms: 1000,
             checkpoint_interval_ms: 0,
+            wal_segment_size_bytes: 0,
             autovacuum_vacuum_threshold: 50,
             autovacuum_vacuum_scale_factor: 0.2,
             autovacuum_analyze_threshold: 50,
