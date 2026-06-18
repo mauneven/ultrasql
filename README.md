@@ -33,11 +33,15 @@ LIMIT 10;
 
 The moat is transactional consistency: updating a row's text, embedding, and
 metadata is one transaction, so the retrieval surfaces can never drift the way
-a separate vector store, search index, and SQL database can. See
-[docs/hybrid-search.md](docs/hybrid-search.md) for the worked example, and
-[ROADMAP.md](ROADMAP.md) P2 for what is shipped versus open (online vector-index
-MVCC, selectivity-aware filtered ANN, and competitive recall benchmarks are
-tracked there with measurable exit conditions).
+a separate vector store, search index, and SQL database can. Run the whole story
+end-to-end — ingest, hybrid retrieval, and survival across a process restart —
+as a zero-dependency Node script in [examples/node-rag/](examples/node-rag/).
+See [docs/hybrid-search.md](docs/hybrid-search.md) for the worked example,
+[docs/vector-benchmarks.md](docs/vector-benchmarks.md) for honest
+recall-vs-latency versus pgvector / Qdrant / LanceDB, and
+[ROADMAP.md](ROADMAP.md) P2 for what is shipped versus open (selectivity-aware
+filtered ANN and competitive recall benchmarks are tracked there with measurable
+exit conditions).
 
 This is not a "fastest at everything" claim. UltraSQL's measured strengths are
 reads, scans, aggregations, and unified retrieval; heavy single-row OLTP write
@@ -208,6 +212,7 @@ cargo run --release --bin ultrasqld
 crates/       core engine, storage, WAL, MVCC, SQL, protocol, server, CLI, bench
 benchmarks/   reproducible scripts, raw artifacts, baselines, certification
 docs/         install, operations, limitations, packaging, release notes
+examples/     runnable demos (e.g. examples/node-rag, the embedded RAG walkthrough)
 tests/        workspace integration and driver certification
 fuzz/         parser, wire, WAL, and planner fuzz targets
 .github/      CI, docs, coverage, fuzz, sanitizer, operator, release workflows

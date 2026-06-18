@@ -1,0 +1,2 @@
+# Compiled native addon — platform-specific, produced by ./build.sh
+*.node
