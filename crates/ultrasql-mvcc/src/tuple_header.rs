@@ -253,6 +253,12 @@ impl TupleHeader {
 
     /// Encode this header into the first [`TUPLE_HEADER_SIZE`] bytes
     /// of `bytes`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `bytes.len() < TUPLE_HEADER_SIZE` (40). Every caller writes
+    /// into a page slot or scratch buffer already sized to hold the header, so
+    /// the slice is always wide enough.
     pub fn encode(&self, bytes: &mut [u8]) {
         write_u64_le(&mut bytes[0..8], self.xmin.raw());
         write_u64_le(&mut bytes[8..16], self.xmax.raw());

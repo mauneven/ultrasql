@@ -300,6 +300,13 @@ pub struct StringColumn {
 
 impl StringColumn {
     /// Build a non-nullable UTF-8 string column.
+    ///
+    /// Infallible convenience wrapper over [`Self::try_from_data`]. If the
+    /// combined values overflow the 32-bit offset budget
+    /// ([`ColumnError::Utf8ValuesTooLarge`]) this returns an **empty** column
+    /// rather than surfacing the error. Callers that ingest inputs which may
+    /// exceed `u32::MAX` total bytes and need to distinguish that case must use
+    /// [`Self::try_from_data`] instead.
     #[must_use]
     pub fn from_data<I: IntoIterator<Item = String>>(rows: I) -> Self {
         match Self::try_from_data(rows) {

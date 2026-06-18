@@ -103,6 +103,11 @@ pub(super) const MAX_PAYLOAD: usize = MAX_MESSAGE_BYTES;
 /// This function does not perform any I/O. It is the caller's
 /// responsibility to feed bytes into `buf` as they arrive from the
 /// network.
+///
+/// Allocation: a decoded message owns its data. Every string field is
+/// copied into an owned `String` and every byte payload into an owned
+/// `Vec<u8>`, so the returned message is independent of `buf` and the
+/// caller may reuse or drop the buffer immediately.
 pub fn decode_frontend(buf: &mut BytesMut) -> Result<Option<FrontendMessage>, ProtocolError> {
     decode_with(buf, decode_frontend::decode_frontend_inner)
 }
@@ -113,6 +118,9 @@ pub fn decode_frontend(buf: &mut BytesMut) -> Result<Option<FrontendMessage>, Pr
 /// `Ok(Some(msg))` once a full message is parsed, or an error on a
 /// definitive protocol violation. All backend messages carry a type
 /// tag; there is no equivalent to the unframed startup message.
+///
+/// Allocation: like [`decode_frontend`], the returned message owns its
+/// strings (`String`) and payloads (`Vec<u8>`) independently of `buf`.
 pub fn decode_backend(buf: &mut BytesMut) -> Result<Option<BackendMessage>, ProtocolError> {
     decode_with(buf, decode_backend::decode_backend_inner)
 }
