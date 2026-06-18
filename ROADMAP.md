@@ -99,16 +99,15 @@ file focused on what still blocks production.
   a checkpoint must be made durable before its LSN can bound truncation
   (DONE: `perform_checkpoint` now fsyncs the data segments via
   `SegmentFileManager::fsync_all` before recording `last_checkpoint_lsn`); (4)
-  vector indexes have no durable on-disk state and are pure WAL-replay artifacts.
-  The `HnswPersistentPage` arena is an in-memory `BTreeMap` with no byte
-  serialization at all (`page_images`/`from_page_images` round-trip in-memory
-  structs and even rebuild the `tid_to_node`/`node_to_block` maps), so a durable
-  snapshot requires building a from-scratch on-disk page format for the Meta /
-  Node / Overflow / FreeList pages and their vector/neighbor overflow chains,
-  plus LSN-bounded replay (`apply_wal_record_at` + `redo_covered`, currently dead
-  because production replay passes `Lsn::ZERO`). This is a standalone feature,
-  safe to build incrementally because while the WAL is retained a missing or
-  corrupt snapshot simply falls back to full replay. Exit
+  vector indexes need a durable snapshot so their records can be removed without
+  losing the only copy of historical index entries (DONE for HNSW: the
+  `HnswPersistentPage` arena now has a versioned, crc32c-checksummed on-disk page
+  format — `encode_snapshot`/`from_snapshot_bytes` — written per index at
+  checkpoint and loaded at restart, with LSN-bounded replay
+  (`apply_wal_record_at` + `redo_covered`) applying only the WAL above the
+  snapshot's `meta.lsn`; a snapshot is trusted only if its `meta.lsn` is within
+  the durable WAL end, else it falls back to full replay. IVFFlat still rebuilds
+  from full WAL replay — its snapshot is the remaining piece of (4)). Exit
   condition: a long-running instance recycles WAL segments below a durable
   checkpoint, restart time is bounded by un-checkpointed work (not total
   history), and a disk-full + crash-recovery drill passes after truncation.
