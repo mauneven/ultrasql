@@ -2772,6 +2772,23 @@ impl BlankPageLoader {
             BlankPageBacking::Memory(_) => Ok(()),
         }
     }
+
+    /// Durable per-relation block counts discovered from the on-disk heap.
+    ///
+    /// Recovery seeds the heap's block counters from these so relation sizes are
+    /// recovered from the durable storage rather than purely from WAL replay —
+    /// the only thing that keeps scans correct once low WAL segments have been
+    /// recycled. Empty for a memory-backed loader (nothing durable to discover).
+    pub fn durable_relation_block_counts(
+        &self,
+    ) -> ultrasql_core::Result<Vec<(ultrasql_core::RelationId, u32)>> {
+        match self.backing.as_ref() {
+            BlankPageBacking::Segment { manager, .. } => manager
+                .discover_relation_block_counts()
+                .map_err(ultrasql_core::Error::from),
+            BlankPageBacking::Memory(_) => Ok(Vec::new()),
+        }
+    }
 }
 
 impl PageLoader for BlankPageLoader {
@@ -5649,6 +5666,28 @@ impl Server {
         Self::init_with_wal_writer_config(data_dir, ultrasql_wal::WalWriterConfig::default())
     }
 
+    /// [`Self::init`] with a custom WAL segment size in bytes.
+    ///
+    /// Smaller segments make checkpoint-driven segment recycling observable
+    /// without writing tens of MiB — used by the crash-recovery drill — and are
+    /// a legitimate operational knob for finer WAL-retention granularity. A
+    /// `segment_size_bytes` of `0` falls back to the built-in default.
+    pub fn init_with_wal_segment_size(
+        data_dir: &Path,
+        segment_size_bytes: u64,
+    ) -> Result<Self, ServerError> {
+        let default = ultrasql_wal::WalWriterConfig::default();
+        let config = ultrasql_wal::WalWriterConfig {
+            segment_size_bytes: if segment_size_bytes == 0 {
+                default.segment_size_bytes
+            } else {
+                segment_size_bytes
+            },
+            ..default
+        };
+        Self::init_with_wal_writer_config(data_dir, config)
+    }
+
     /// [`Self::init`] with an explicit WAL writer configuration. Used by tests
     /// that need a small segment size to exercise multi-segment recycling
     /// without writing tens of MiB.
@@ -5712,9 +5751,16 @@ impl Server {
         // first surviving segment after any truncation). recover_with_target
         // seeds its own cursor from the same floor; both read the manifest, so
         // the LSNs they reconstruct agree. An absent manifest is LSN 0.
-        let mut record_lsn = ultrasql_wal::read_floor(&wal_dir)
-            .map_err(|e| ServerError::Ddl(format!("read WAL recovery floor: {e}")))?
-            .floor_lsn;
+        let recovery_floor = ultrasql_wal::read_floor(&wal_dir)
+            .map_err(|e| ServerError::Ddl(format!("read WAL recovery floor: {e}")))?;
+        // WAL has been recycled iff the surviving stream no longer starts at the
+        // origin. Only then is replay-from-floor missing early relation-extend
+        // records and block counts must be re-seeded from the durable heap; with
+        // a complete origin stream, WAL replay already reconstructs them exactly,
+        // so seeding would be redundant (and would wrongly resurface a torn,
+        // never-committed DDL row that the truncated WAL leaves uncommitted).
+        let wal_was_recycled = recovery_floor.floor_lsn != ultrasql_core::Lsn::ZERO;
+        let mut record_lsn = recovery_floor.floor_lsn;
         let recovered_lsn =
             ultrasql_wal::recover_with_target(&wal_dir, recovery_replay_target, |record| {
                 let current_lsn = record_lsn;
@@ -5729,6 +5775,35 @@ impl Server {
             .map_err(|e| ServerError::Ddl(format!("WAL recovery: {e}")))?;
         wal_buffer.advance_to_lsn(recovered_lsn);
         tracing::info!(lsn = recovered_lsn.raw(), "WAL recovery complete");
+
+        // Seed relation block counts from the durable on-disk heap. WAL replay
+        // alone rebuilds these counters, but once low WAL segments are recycled
+        // the replayed stream no longer starts at LSN 0, so the early
+        // relation-extend records are gone even though the blocks they created
+        // are durably present. Without this seeding a post-recycle restart would
+        // under-count blocks and heap scans would stop short of durable pages —
+        // silently dropping rows and even whole catalog tables. Seeding is
+        // monotonic, so it never undoes a larger count WAL replay just set.
+        //
+        // Only HEAP-scanned relations are seeded: the system/catalog relations
+        // here (so the catalog bootstrap below sees every user table), and the
+        // user *tables* later once the catalog identifies them. Index relations
+        // are rebuilt from the table scan, not their own block count, and seeding
+        // a torn/partial index's durable pages would make it wrongly look present.
+        let durable_block_counts = if wal_was_recycled {
+            page_loader.durable_relation_block_counts().map_err(|e| {
+                ServerError::Io(std::io::Error::other(format!(
+                    "discover durable relation block counts: {e}"
+                )))
+            })?
+        } else {
+            Vec::new()
+        };
+        for (rel, blocks) in &durable_block_counts {
+            if rel.oid().raw() < ultrasql_catalog::FIRST_USER_OID {
+                heap.seed_block_count(*rel, *blocks);
+            }
+        }
 
         // 5. Background writer thread draining the buffer to disk.
         let wal_writer = WalWriter::open(&wal_dir, Arc::clone(&wal_buffer), wal_writer_config)
@@ -5859,6 +5934,21 @@ impl Server {
             }
         }
         server.recover_commit_status_from_wal()?;
+        // Phase two of durable block-count seeding (see WAL-recovery comment
+        // above): now that the catalog knows which relations are user *tables*,
+        // seed their durable block counts so post-recycle scans — and the index
+        // rebuilds below, which scan the table heap — see every durable page.
+        // User indexes are deliberately excluded.
+        {
+            let snapshot = server.catalog_snapshot();
+            for (rel, blocks) in &durable_block_counts {
+                if rel.oid().raw() >= ultrasql_catalog::FIRST_USER_OID
+                    && snapshot.tables_by_oid.contains_key(&rel.oid())
+                {
+                    server.heap.seed_block_count(*rel, *blocks);
+                }
+            }
+        }
         server.rebuild_domain_runtime_constraint_sidecars()?;
         server.rebuild_role_metadata()?;
         server.rebuild_privilege_metadata()?;

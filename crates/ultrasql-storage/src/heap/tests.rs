@@ -139,6 +139,30 @@ fn usize_to_u8(value: usize) -> u8 {
 }
 
 #[test]
+fn seed_block_count_advances_monotonically() {
+    let heap = make_heap(8);
+    let rel = ultrasql_core::RelationId::new(42);
+    assert_eq!(heap.block_count(rel), 0);
+
+    // Seeding raises the counter to the durable on-disk size...
+    heap.seed_block_count(rel, 5);
+    assert_eq!(heap.block_count(rel), 5);
+
+    // ...but never lowers it (a smaller durable figure must not undo a larger
+    // count that WAL replay already advanced past).
+    heap.seed_block_count(rel, 3);
+    assert_eq!(heap.block_count(rel), 5);
+
+    // A larger durable figure does advance it.
+    heap.seed_block_count(rel, 9);
+    assert_eq!(heap.block_count(rel), 9);
+
+    // Zero is a no-op (no durable blocks discovered for the relation).
+    heap.seed_block_count(rel, 0);
+    assert_eq!(heap.block_count(rel), 9);
+}
+
+#[test]
 fn heap_count_add_rejects_overflow() {
     let err = checked_heap_count_add(usize::MAX, 1, "updated tuple count overflow").unwrap_err();
     assert!(matches!(

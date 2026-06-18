@@ -783,6 +783,41 @@ impl SegmentFileManager {
         Ok(r.size_blocks())
     }
 
+    /// Discover every relation that already has segment files on disk and report
+    /// its durable block count.
+    ///
+    /// Recovery uses this to seed the heap's in-memory block counters from the
+    /// durable on-disk size. Those counters are otherwise rebuilt solely by
+    /// replaying relation-extend WAL records; once low WAL segments are recycled
+    /// the stream no longer starts at LSN 0, so the early extends are gone even
+    /// though the blocks they created are durably present here. Seeding from the
+    /// directory layout (`base/<oid>/`) restores the correct sizes regardless of
+    /// how much WAL has been recycled.
+    pub fn discover_relation_block_counts(&self) -> Result<Vec<(RelationId, u32)>, SegmentError> {
+        let mut out = Vec::new();
+        let read = match fs::read_dir(&self.base_dir) {
+            Ok(read) => read,
+            Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(out),
+            Err(err) => return Err(SegmentError::Io(err)),
+        };
+        for entry in read {
+            let entry = entry?;
+            if !entry.file_type()?.is_dir() {
+                continue;
+            }
+            let name = entry.file_name();
+            let Some(oid) = name.to_str().and_then(|name| name.parse::<u32>().ok()) else {
+                continue;
+            };
+            let rel = RelationId::new(oid);
+            let blocks = self.relation_size_blocks(rel)?;
+            if blocks > 0 {
+                out.push((rel, blocks));
+            }
+        }
+        Ok(out)
+    }
+
     /// Flush all segments owned by `rel` to disk durably.
     pub fn fsync_relation(&self, rel: RelationId) -> Result<(), SegmentError> {
         let r = self.relation(rel)?;
@@ -953,6 +988,27 @@ mod tests {
         let slot = p.insert_tuple(&make_payload(tag)).unwrap();
         debug_assert_eq!(slot, 0);
         p
+    }
+
+    #[test]
+    fn discover_relation_block_counts_reports_durable_sizes_after_reopen() {
+        let tmp = TempDir::new().unwrap();
+        {
+            let mgr = SegmentFileManager::open(tmp.path(), config_mmap(false)).unwrap();
+            for _ in 0..3 {
+                mgr.allocate_block(rel(42)).unwrap();
+            }
+            mgr.allocate_block(rel(99)).unwrap();
+            mgr.fsync_all().unwrap();
+        }
+        // A FRESH manager starts with an empty in-memory relation map, exactly as
+        // recovery does. It must still discover the durable relations and their
+        // block counts from the on-disk `base/<oid>/` layout — this is what lets
+        // recovery seed correct relation sizes after WAL recycling.
+        let reopened = SegmentFileManager::open(tmp.path(), config_mmap(false)).unwrap();
+        let mut counts = reopened.discover_relation_block_counts().unwrap();
+        counts.sort();
+        assert_eq!(counts, vec![(rel(42), 3), (rel(99), 1)]);
     }
 
     #[test]

@@ -631,6 +631,33 @@ impl<L: PageLoader> HeapAccess<L> {
             .map_or(0, |c| c.load(Ordering::Acquire))
     }
 
+    /// Seed `rel`'s in-memory block counter to at least `blocks`.
+    ///
+    /// Monotonic (fetch-max): never lowers a counter WAL replay has already
+    /// advanced further. Recovery calls this from the durable on-disk segment
+    /// sizes so relation sizes survive even when low WAL segments — including the
+    /// relation-extend records — have been recycled and the replayed stream no
+    /// longer starts at LSN 0. Without it, a scan would stop short of pages that
+    /// are durably present, silently dropping rows (and whole catalog tables).
+    pub fn seed_block_count(&self, rel: RelationId, blocks: u32) {
+        if blocks == 0 {
+            return;
+        }
+        let counter = self.counter_for(rel);
+        let mut current = counter.load(Ordering::Acquire);
+        while current < blocks {
+            match counter.compare_exchange_weak(
+                current,
+                blocks,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => break,
+                Err(actual) => current = actual,
+            }
+        }
+    }
+
     /// Borrow the underlying buffer pool.
     ///
     /// Exposed so subsystems that need raw page access against the
