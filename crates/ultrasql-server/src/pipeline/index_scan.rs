@@ -3,6 +3,8 @@
 
 use std::sync::Arc;
 
+use num_traits::ToPrimitive;
+
 use ultrasql_catalog::{CatalogSnapshot, IndexEntry, TableEntry};
 use ultrasql_core::{BlockNumber, DataType, Field, RelationId, Schema, TupleId, Value};
 use ultrasql_executor::{Eval, Filter, IndexOnlyScan, IndexScan, Limit, Operator, RowCodec, TopK};
@@ -490,19 +492,22 @@ fn try_hnsw_filtered_sorted(
 
     // Size the exploration budget to the estimated filter selectivity.
     let selectivity = estimate_filter_selectivity(predicate).clamp(0.0001, 1.0);
-    let want = (limit.saturating_mul(FILTERED_ANN_OVERFETCH)) as f64 / selectivity;
+    let overfetch = limit.saturating_mul(FILTERED_ANN_OVERFETCH);
+    let want = overfetch.to_f64().unwrap_or(f64::MAX) / selectivity;
+    let max_ef = FILTERED_ANN_MAX_EF.to_f64().unwrap_or(f64::MAX);
     // Very selective filter: ANN would have to explore beyond the ceiling to
     // surface k survivors, so exact filter+sort is both correct and faster.
-    if want > FILTERED_ANN_MAX_EF as f64 {
+    if want > max_ef {
         return Ok(None);
     }
-    let clamped = want
-        .clamp(FILTERED_ANN_MIN_EF as f64, FILTERED_ANN_MAX_EF as f64)
-        .ceil();
-    // INVARIANT: `clamped` is finite and within [MIN_EF, MAX_EF], both small
-    // positive usizes, so the cast cannot truncate or lose sign.
-    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-    let selectivity_ef = clamped as usize;
+    let min_ef = FILTERED_ANN_MIN_EF.to_f64().unwrap_or(0.0);
+    // `clamped` is finite within [MIN_EF, MAX_EF] (small positive usizes), so the
+    // checked `to_usize` cannot fail; fall back to the ceiling if it ever does.
+    let selectivity_ef = want
+        .clamp(min_ef, max_ef)
+        .ceil()
+        .to_usize()
+        .unwrap_or(FILTERED_ANN_MAX_EF);
     // A per-session `hnsw.ef_search` raises the floor so users can boost recall
     // on filtered queries too, but never below what selectivity demands.
     let ef = selectivity_ef.max(session_ef_search(ctx).unwrap_or(0));

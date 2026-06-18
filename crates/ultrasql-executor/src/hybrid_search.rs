@@ -813,15 +813,15 @@ mod tests {
         assert!(op.next_batch().expect("eof check").is_none());
     }
 
-    /// 1-based rank by descending value, ties broken by index — the same
-    /// contract as the operator's `rrf_ranks`, reimplemented independently
+    /// 1-based rank by descending value (as `f64`), ties broken by index — the
+    /// same contract as the operator's `rrf_ranks`, reimplemented independently
     /// so the test is a true reference check rather than a tautology.
-    fn reference_rank_desc(values: &[f64]) -> Vec<usize> {
+    fn reference_rank_desc(values: &[f64]) -> Vec<f64> {
         let mut order: Vec<usize> = (0..values.len()).collect();
         order.sort_by(|&a, &b| values[b].total_cmp(&values[a]).then_with(|| a.cmp(&b)));
-        let mut ranks = vec![0usize; values.len()];
+        let mut ranks = vec![0.0_f64; values.len()];
         for (rank, &idx) in order.iter().enumerate() {
-            ranks[idx] = rank + 1;
+            ranks[idx] = f64::from(u32::try_from(rank + 1).expect("rank fits u32"));
         }
         ranks
     }
@@ -890,14 +890,17 @@ mod tests {
             .iter()
             .map(|&(_, dist, _)| 1.0 / (1.0 + f64::from(dist)))
             .collect();
-        let version: Vec<f64> = spec.iter().map(|&(_, _, v)| v as f64).collect();
+        let version: Vec<f64> = spec
+            .iter()
+            .map(|&(_, _, v)| f64::from(i32::try_from(v).expect("test version fits i32")))
+            .collect();
         let vrank = reference_rank_desc(&vector_sim);
         let verrank = reference_rank_desc(&version);
         let mut expected: Vec<(i32, f64)> = spec
             .iter()
             .enumerate()
             .map(|(i, &(id, _, _))| {
-                let score = 1.0 / (k + vrank[i] as f64) + 1.0 / (k + verrank[i] as f64);
+                let score = 1.0 / (k + vrank[i]) + 1.0 / (k + verrank[i]);
                 (id, score)
             })
             .collect();
