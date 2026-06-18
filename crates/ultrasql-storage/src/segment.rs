@@ -791,6 +791,27 @@ impl SegmentFileManager {
         Ok(())
     }
 
+    /// Flush every currently-open relation's segments to disk durably.
+    ///
+    /// The checkpoint path calls this after flushing dirty pages so that every
+    /// heap mutation up to the checkpoint LSN is on disk (not merely in the OS
+    /// page cache) before the checkpoint LSN is recorded — making the
+    /// checkpoint a true durability barrier. That is a prerequisite for
+    /// recycling WAL segments below the checkpoint: removing those WAL records
+    /// is only safe once the pages they would replay are themselves durable.
+    ///
+    /// Relations opened concurrently after this call began carry no
+    /// already-flushed pages for the in-progress checkpoint (their mutations
+    /// are still in the buffer pool / WAL), so iterating the currently-open set
+    /// is a correct superset of what the checkpoint flushed.
+    pub fn fsync_all(&self) -> Result<(), SegmentError> {
+        for entry in &self.relations {
+            entry.value().fsync()?;
+        }
+        sync_storage_dir(&self.base_dir)?;
+        Ok(())
+    }
+
     /// Truncate `rel` to `n_blocks` blocks. Surplus blocks (and their
     /// surplus segments) are dropped and the disk files unlinked. If
     /// `n_blocks` is greater than or equal to the current size, this
@@ -1022,6 +1043,47 @@ mod tests {
         let read = mgr.read_page(PageId::new(r, blk)).unwrap();
         let tuple = read.read_tuple(0).unwrap();
         assert_eq!(tuple, make_payload(0x42).as_slice());
+    }
+
+    #[test]
+    fn fsync_all_syncs_every_open_relation_and_keeps_data() {
+        let tmp = TempDir::new().unwrap();
+        let mgr = SegmentFileManager::open(tmp.path(), config_mmap(false)).unwrap();
+
+        // Two distinct relations, so both are open in the manager.
+        let (r1, r2) = (rel(1), rel(2));
+        let b1 = mgr.allocate_block(r1).unwrap();
+        let b2 = mgr.allocate_block(r2).unwrap();
+        mgr.write_page(PageId::new(r1, b1), &page_with_tag(0x11))
+            .unwrap();
+        mgr.write_page(PageId::new(r2, b2), &page_with_tag(0x22))
+            .unwrap();
+
+        // fsync_all must durably sync every open relation without error.
+        mgr.fsync_all().unwrap();
+
+        // Data is intact after the sync.
+        assert_eq!(
+            mgr.read_page(PageId::new(r1, b1))
+                .unwrap()
+                .read_tuple(0)
+                .unwrap(),
+            make_payload(0x11).as_slice()
+        );
+        assert_eq!(
+            mgr.read_page(PageId::new(r2, b2))
+                .unwrap()
+                .read_tuple(0)
+                .unwrap(),
+            make_payload(0x22).as_slice()
+        );
+
+        // fsync_all with no open relations is a no-op (syncs only the base dir).
+        let empty_tmp = TempDir::new().unwrap();
+        SegmentFileManager::open(empty_tmp.path(), config_mmap(false))
+            .unwrap()
+            .fsync_all()
+            .unwrap();
     }
 
     #[test]

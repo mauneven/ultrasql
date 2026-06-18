@@ -2758,6 +2758,20 @@ impl BlankPageLoader {
             }
         }
     }
+
+    /// Make every previously-stored page durable on disk.
+    ///
+    /// The checkpoint path calls this after flushing dirty heap pages so the
+    /// checkpoint LSN reflects a durable on-disk state. A memory-backed loader
+    /// has nothing to fsync.
+    pub fn fsync_all(&self) -> ultrasql_core::Result<()> {
+        match self.backing.as_ref() {
+            BlankPageBacking::Segment { manager, .. } => {
+                manager.fsync_all().map_err(ultrasql_core::Error::from)
+            }
+            BlankPageBacking::Memory(_) => Ok(()),
+        }
+    }
 }
 
 impl PageLoader for BlankPageLoader {
@@ -4879,6 +4893,16 @@ impl Server {
         self.wait_for_wal_durable(barrier_lsn)?;
 
         self.flush_dirty_heap_pages()?;
+
+        // Make the flushed pages durable on disk BEFORE recording the
+        // checkpoint LSN, so the checkpoint is a true durability barrier: every
+        // heap mutation up to checkpoint_lsn is on disk, not merely in the OS
+        // page cache. This is a prerequisite for recycling WAL segments below
+        // the checkpoint — removing those WAL records is only safe once the
+        // pages they would otherwise replay are themselves durable.
+        self.page_loader
+            .fsync_all()
+            .map_err(|e| ServerError::ddl(format!("checkpoint fsync data segments: {e}")))?;
 
         let redo_from = self
             .heap
