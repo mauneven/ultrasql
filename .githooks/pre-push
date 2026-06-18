@@ -12,19 +12,35 @@
 #   4. cargo doc (strict)                  (~20 s)
 #   5. cargo deny check advisories         (skip bans/licenses/sources — CI handles them)
 #   6. regression-gate --smoke             (~5 s, "did it crash?" only)
+#   7. parser fuzz smoke                   (~15 s, nightly only)
+#   8. tests + per-crate coverage gate     (full suite under llvm-cov; the
+#                                           heavy gate, runs last so cheap
+#                                           checks fail first — several minutes)
 #
-# Full suite (integration tests + full deny + full bench) is run by CI on merge.
+# Gate 8 runs the ENTIRE test suite (lib + integration) under instrumentation,
+# so a single failing test refuses the push, and then enforces a per-crate
+# line-coverage floor. Full deny + full bench still run in CI on merge.
 # Before promoting a perf-sensitive commit run `make bench-full` locally.
+#
+# Coverage floor — ratchet toward 90%:
+#   The per-crate floor starts at the workspace's current passing level (80%,
+#   matching CI) and is RAISED toward the 90% target as coverage improves.
+#   Never lower it. Override the enforced floor for a single run with
+#   ULTRASQL_COVERAGE_MIN=<pct>. Edit COVERAGE_MIN_LINES below to ratchet the
+#   committed default upward.
 #
 # Pre-push escape hatches:
 #   ULTRASQL_SKIP_BENCH=1 git push
 #     Skips the regression gate.  Allowed ONLY for documentation-only commits.
+#   ULTRASQL_SKIP_COV=1 git push
+#     Skips the tests+coverage gate (gate 8).  Allowed ONLY for tooling/docs
+#     pushes; CI still enforces coverage on the remote.
 #   --no-verify
 #     Bypasses ALL gates.  Use only when you know what you are doing.
 #
 # Auto-skip conditions (no escape hatch needed):
-#   - Only .md / docs/** files changed  → regression gate skipped.
-#   - Only benches/** or benchmarks/results/latest/** changed  → regression gate skipped.
+#   - Only .md / docs/** files changed  → regression + coverage gates skipped.
+#   - Only benches/** or benchmarks/results/latest/** changed  → both skipped.
 
 set -e -o pipefail
 
@@ -154,6 +170,61 @@ if rustup toolchain list 2>/dev/null | grep -q '^nightly'; then
     fi
 else
     printf "\n\033[1;33m== fuzz smoke skipped (no nightly toolchain) ==\033[0m\n"
+fi
+
+# ── 8. Tests + per-crate coverage gate ───────────────────────────────────────
+#
+# Runs the ENTIRE test suite (lib + integration) under llvm-cov instrumentation
+# and refuses the push when:
+#   a) any test fails (cargo llvm-cov exits non-zero), or
+#   b) any shipping crate is below the per-crate line-coverage floor.
+#
+# The floor ratchets toward 90% (see header). It defaults to 80% — the
+# workspace's current passing floor, matching .github/workflows/coverage.yml —
+# and is raised over time. ultrasql-bench is excluded (non-published harness),
+# exactly as CI does.
+#
+# Honours ULTRASQL_SKIP_COV=1 and the same docs/bench-only auto-skip as the
+# regression gate. If cargo-llvm-cov is not installed the gate warns and skips
+# (the CI llvm-cov job still enforces coverage on the remote), matching the
+# cargo-deny fallback above.
+
+COVERAGE_MIN_LINES="${ULTRASQL_COVERAGE_MIN:-80}"  # ratchet toward 90; never lower
+COVERAGE_TARGET=90
+
+step "tests + per-crate coverage gate (floor ${COVERAGE_MIN_LINES}%, target ${COVERAGE_TARGET}%)"
+
+_run_coverage_gate() {
+    if ! command -v cargo-llvm-cov >/dev/null 2>&1; then
+        printf "\n\033[1;33m== cargo-llvm-cov not installed — coverage gate skipped ==\033[0m\n"
+        printf "   Install: cargo install cargo-llvm-cov   (CI enforces coverage on the remote)\n"
+        return 0
+    fi
+    mkdir -p target/llvm-cov
+    # `clean` discards stale profraw so the numbers reflect this exact tree.
+    cargo llvm-cov clean --workspace
+    # Runs the full test suite under instrumentation; a failing test aborts here
+    # (set -e), which is the "tests must all be green" half of the gate.
+    cargo llvm-cov --workspace --all-features \
+        --json --output-path target/llvm-cov/coverage.json
+    # The per-crate line-coverage floor is the second half of the gate.
+    python3 scripts/coverage_gate.py \
+        target/llvm-cov/coverage.json \
+        --root . \
+        --min-lines "$COVERAGE_MIN_LINES" \
+        --exclude-crate ultrasql-bench \
+        --summary-json target/llvm-cov/per-crate-coverage.json \
+        --summary-md target/llvm-cov/per-crate-coverage.md
+}
+
+if [ -n "${ULTRASQL_SKIP_COV:-}" ]; then
+    printf "\n\033[1;33m== coverage gate skipped (ULTRASQL_SKIP_COV set) ==\033[0m\n"
+    printf "   NOTE: allowed only for tooling/docs pushes.\n"
+    printf "   The CI llvm-cov job will enforce coverage on the remote.\n"
+elif _is_gate_skip_only; then
+    printf "\n\033[1;33m== coverage gate skipped (docs/bench-only diff detected) ==\033[0m\n"
+else
+    _run_coverage_gate
 fi
 
 printf "\n\033[1;32m== all gates green; push allowed ==\033[0m\n"
