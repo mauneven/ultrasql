@@ -90,9 +90,8 @@ pub(crate) struct Session<RW> {
     /// materialized-view source guard. `plan_cache_invalidate` clears it
     /// alongside `stmt_cache`, so role, privilege, RLS, or DDL changes force
     /// the next execution back through the full checks.
-    pub(super) prechecked_fast_dml: std::cell::RefCell<
-        std::collections::HashMap<usize, Arc<ultrasql_planner::LogicalPlan>>,
-    >,
+    pub(super) prechecked_fast_dml:
+        std::cell::RefCell<std::collections::HashMap<usize, Arc<ultrasql_planner::LogicalPlan>>>,
     /// Per-session split cache for repeated multi-statement Simple Query text.
     ///
     /// The hot mixed benchmark sends the same `INSERT; UPDATE; SELECT` batch

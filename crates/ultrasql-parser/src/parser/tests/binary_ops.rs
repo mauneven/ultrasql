@@ -406,20 +406,66 @@ fn binary_op_precedence_pairs() {
     }
 }
 
-/// Right-associativity of `^`: `a ^ b ^ c` must parse as `a ^ (b ^ c)`.
+/// PostgreSQL gives boolean `NOT` lower precedence than the comparison band,
+/// so `NOT a = b` parses as `NOT (a = b)`, not the (wrong) `(NOT a) = b`.
 #[test]
-fn pow_is_right_associative() {
+fn not_binds_looser_than_comparison() {
+    let expr = parse_expr("NOT a = b");
+    let Expr::Unary {
+        op: UnaryOp::Not,
+        expr: inner,
+        ..
+    } = expr
+    else {
+        panic!("expected a top-level NOT, got {expr:?}");
+    };
+    assert!(
+        matches!(
+            *inner,
+            Expr::Binary {
+                op: BinaryOp::Eq,
+                ..
+            }
+        ),
+        "NOT operand must be the whole comparison `a = b`, got {inner:?}",
+    );
+}
+
+/// ...but `NOT` still binds tighter than `AND`: `NOT a AND b` is
+/// `(NOT a) AND b`.
+#[test]
+fn not_binds_tighter_than_and() {
+    let expr = parse_expr("NOT a AND b");
+    let Expr::Binary {
+        op: BinaryOp::And,
+        left,
+        ..
+    } = expr
+    else {
+        panic!("expected a top-level AND, got {expr:?}");
+    };
+    assert!(
+        matches!(*left, Expr::Unary { op: UnaryOp::Not, .. }),
+        "left operand of AND must be `NOT a`, got {left:?}",
+    );
+}
+
+/// Left-associativity of `^` (matches PostgreSQL): `a ^ b ^ c` parses as
+/// `(a ^ b) ^ c`, so the tighter (nested) Pow sits on the LEFT operand —
+/// `2 ^ 3 ^ 2` = `(2^3)^2` = 64, not 512.
+#[test]
+fn pow_is_left_associative() {
     let expr = parse_expr("a ^ b ^ c");
     let Expr::Binary {
         op: BinaryOp::Pow,
-        right,
+        left,
         ..
     } = expr
     else {
         panic!()
     };
     assert!(matches!(
-        *right,
+        *left,
         Expr::Binary {
             op: BinaryOp::Pow,
             ..

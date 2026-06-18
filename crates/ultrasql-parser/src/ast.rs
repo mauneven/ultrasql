@@ -2710,7 +2710,7 @@ impl BinaryOp {
     /// Level 5 — bitwise shift << >>
     /// Level 6 — addition/subtraction + -
     /// Level 7 — multiplication/division/modulo * / %
-    /// Level 8 — exponentiation ^ (right-associative)
+    /// Level 8 — exponentiation ^ (left-associative, as in PostgreSQL)
     /// ```
     ///
     /// JSON operators and bitwise operators sit between the comparison band
@@ -2767,9 +2767,15 @@ impl BinaryOp {
     }
 
     /// `true` iff this operator is right-associative.
+    ///
+    /// PostgreSQL has no right-associative binary operators. In particular
+    /// `^` (exponentiation) is **left**-associative there: `2 ^ 3 ^ 2`
+    /// parses as `(2 ^ 3) ^ 2` = 64, not the maths-convention `2 ^ (3 ^ 2)`
+    /// = 512. Matching that keeps chained-`^` results identical to Postgres.
     #[must_use]
     pub const fn is_right_associative(self) -> bool {
-        matches!(self, Self::Pow)
+        // No PostgreSQL binary operator is right-associative.
+        false
     }
 
     /// `true` iff this operator is a comparison operator valid for

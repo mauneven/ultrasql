@@ -9,7 +9,7 @@
 //! operators in [`super::binary_ops`].
 
 use super::{ParseError, Parser, is_type_name_keyword};
-use crate::ast::{Expr, Identifier, Literal, ObjectName, UnaryOp};
+use crate::ast::{BinaryOp, Expr, Identifier, Literal, ObjectName, UnaryOp};
 use crate::span::Span;
 use crate::token::TokenKind;
 
@@ -164,8 +164,20 @@ impl<'src> Parser<'src> {
                 if op == UnaryOp::Not && self.peek()?.kind == TokenKind::KwExists {
                     return self.parse_exists_expr(true);
                 }
-                // Unary operators bind tighter than any binary operator.
-                let rhs = self.parse_expr_with_precedence(9)?;
+                let rhs_min_prec = if op == UnaryOp::Not {
+                    // Boolean NOT has LOWER precedence than the comparison
+                    // band in PostgreSQL, so `NOT a = b` parses as
+                    // `NOT (a = b)` and `NOT a IS NULL` as `NOT (a IS NULL)`.
+                    // Parsing its operand at the comparison level captures the
+                    // whole comparison while still stopping before AND/OR, so
+                    // `NOT a AND b` stays `(NOT a) AND b`.
+                    BinaryOp::Eq.precedence()
+                } else {
+                    // Arithmetic / bitwise unary (+ - ~) bind tighter than any
+                    // binary operator, as in PostgreSQL.
+                    9
+                };
+                let rhs = self.parse_expr_with_precedence(rhs_min_prec)?;
                 let span = Span::new(op_tok.span.start, rhs.span().end);
                 Ok(Expr::Unary {
                     op,
