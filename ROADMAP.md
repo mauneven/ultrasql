@@ -128,11 +128,13 @@ file focused on what still blocks production.
   an index still needs; an index with no logged mutation (snapshot LSN 0, hence
   no WAL of its own) is excluded from the floor so it does not block recycling.
   Recycling is disabled outright only when a required snapshot did not become
-  durable. Remaining: (a) auto-trigger recycling from the background checkpointer
-  — today the floor only advances on an explicit `CHECKPOINT`; (b) a kill-9 +
-  disk-full crash-recovery drill after truncation. Restart time is now bounded by
-  un-checkpointed work rather than total history for any database that
-  checkpoints.
+  durable. Recycling is also automatic: a background timer
+  (`--checkpoint-interval-ms`, default 300s, persistent mode only) runs a full
+  checkpoint — flush, fsync, snapshots, and WAL recycling — off the async reactor
+  via `spawn_blocking`, so the WAL and restart time stay bounded without an
+  explicit `CHECKPOINT`. Remaining: a kill-9 + disk-full crash-recovery drill
+  after truncation. Restart time is now bounded by un-checkpointed work rather
+  than total history for any database that checkpoints.
 - OLTP commit-path losses (`insert_throughput_10k` → PostgreSQL,
   `mixed_oltp_pgbench_like` → SQLite/PostgreSQL): the per-commit cost is
   dominated by `full_fsync` (F_FULLFSYNC, true power-loss durability) in
