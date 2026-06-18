@@ -401,4 +401,42 @@ mod tests {
         }
         assert!(segment_path(dir.path(), 4).exists());
     }
+
+    #[cfg(unix)]
+    #[test]
+    fn truncate_below_loses_nothing_when_the_manifest_write_fails() {
+        // Disk-full / unwritable-WAL-dir drill: the floor manifest must become
+        // durable BEFORE any segment is unlinked, so a write failure here
+        // (ENOSPC, read-only filesystem, ...) leaves the whole stream intact and
+        // the floor unmoved — never a half-recycled, unrecoverable WAL.
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = TempDir::new().unwrap();
+        for index in 0..4u32 {
+            std::fs::write(segment_path(dir.path(), index), vec![b'x'; 100]).unwrap();
+        }
+        // Make the WAL directory unwritable: the temp manifest file cannot be
+        // created, which is exactly how an out-of-space manifest write fails.
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o555)).unwrap();
+
+        // A target that would otherwise recycle segments 0 and 1.
+        let result = truncate_below(dir.path(), Lsn::new(250));
+
+        // Restore write permission so the assertions and TempDir cleanup can run.
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        assert!(
+            result.is_err(),
+            "a failed manifest write must surface, not silently half-truncate"
+        );
+        // Nothing was unlinked and the floor never moved: recovery still sees the
+        // full origin stream.
+        for index in 0..4u32 {
+            assert!(
+                segment_path(dir.path(), index).exists(),
+                "segment {index} must survive a failed truncation"
+            );
+        }
+        assert_eq!(read_floor(dir.path()).unwrap(), WalFloor::ORIGIN);
+    }
 }

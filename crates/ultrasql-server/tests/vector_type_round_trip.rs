@@ -35,6 +35,21 @@ async fn start_crash_persistent_server_and_connect(
     .await
 }
 
+async fn start_small_segment_crash_server_and_connect(
+    data_dir: &Path,
+    segment_size_bytes: u64,
+) -> (
+    tokio_postgres::Client,
+    tokio::task::JoinHandle<()>,
+    tokio::task::JoinHandle<Result<(), ultrasql_server::ServerError>>,
+) {
+    start_server_and_connect_to(Arc::new(
+        Server::init_with_wal_segment_size(data_dir, segment_size_bytes)
+            .expect("persistent server init"),
+    ))
+    .await
+}
+
 async fn start_server_and_connect_to(
     server: Arc<Server>,
 ) -> (
@@ -797,6 +812,84 @@ async fn vector_index_and_heap_agree_after_transactional_update_and_crash() {
             .await
             .expect("metadata after recovery");
         assert_eq!(simple_rows(&meta), vec![vec!["2".to_owned()]]);
+        shutdown(client, server_handle).await;
+    }
+}
+
+#[tokio::test]
+async fn wal_recycling_then_crash_recovers_every_committed_row() {
+    // Crash-recovery drill for WAL segment recycling. With small WAL segments a
+    // few hundred rows span several segments; a CHECKPOINT then recycles the low
+    // ones (removing the files and advancing the recovery floor). After more
+    // rows and a crash (no graceful shutdown), restart must seed recovery from
+    // the advanced floor — NOT from LSN 0 — and reconstruct every committed row.
+    // If recovery ignored the floor it would choke on the missing head segments.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let segment_size = 16 * 1024; // 16 KiB: a few hundred rows span many segments
+    let payload = "x".repeat(100);
+    {
+        let (client, _conn, server_handle) =
+            start_small_segment_crash_server_and_connect(dir.path(), segment_size).await;
+        client
+            .batch_execute("CREATE TABLE recycled (id INT NOT NULL, payload TEXT)")
+            .await
+            .expect("create table");
+        // 1000 rows of ~100-byte payload — well over a dozen 16 KiB segments.
+        let pre: String = (1..=1000)
+            .map(|i| format!("({i}, '{payload}')"))
+            .collect::<Vec<_>>()
+            .join(",");
+        client
+            .batch_execute(&format!("INSERT INTO recycled VALUES {pre}"))
+            .await
+            .expect("insert pre-checkpoint rows");
+        // Checkpoint: flush + fsync make the rows durable on the heap, then the
+        // low WAL segments are recycled.
+        client
+            .batch_execute("CHECKPOINT")
+            .await
+            .expect("checkpoint");
+        // Post-checkpoint rows live in the WAL retained above the floor.
+        client
+            .batch_execute("INSERT INTO recycled VALUES (1001, 'post-a'), (1002, 'post-b')")
+            .await
+            .expect("insert post-checkpoint rows");
+        // Crash: abort the server task without a graceful shutdown.
+        shutdown(client, server_handle).await;
+    }
+    // The checkpoint must have actually recycled the original head segment —
+    // otherwise this drill would not exercise floor-seeded recovery at all.
+    assert!(
+        !dir.path()
+            .join("pg_wal")
+            .join("segment_0000000000")
+            .exists(),
+        "CHECKPOINT must have recycled the original head WAL segment"
+    );
+    {
+        let (client, _conn, server_handle) =
+            start_small_segment_crash_server_and_connect(dir.path(), segment_size).await;
+        let count = client
+            .simple_query("SELECT COUNT(*) FROM recycled")
+            .await
+            .expect("count after recovery");
+        assert_eq!(
+            simple_rows(&count),
+            vec![vec!["1002".to_owned()]],
+            "every committed row must survive recycling + crash recovery"
+        );
+        // A pre-checkpoint row (its WAL segment was recycled; it survives on the
+        // durable heap) and a post-checkpoint row (replayed from the WAL tail).
+        let pre_row = client
+            .simple_query("SELECT id FROM recycled WHERE id = 1")
+            .await
+            .expect("pre-checkpoint row");
+        assert_eq!(simple_rows(&pre_row), vec![vec!["1".to_owned()]]);
+        let post_row = client
+            .simple_query("SELECT payload FROM recycled WHERE id = 1002")
+            .await
+            .expect("post-checkpoint row");
+        assert_eq!(simple_rows(&post_row), vec![vec!["post-b".to_owned()]]);
         shutdown(client, server_handle).await;
     }
 }
