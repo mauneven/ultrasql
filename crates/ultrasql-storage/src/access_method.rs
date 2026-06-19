@@ -1777,9 +1777,26 @@ struct HnswNodePage {
     tid: TupleId,
     vector_len: usize,
     vector_head: BlockNumber,
+    /// Level-0 (base layer) neighbor chain. The base layer is mandatory and is
+    /// where every node lives, so it keeps the original fields and on-disk
+    /// layout — a v1 snapshot is exactly a v2 snapshot with `level == 0`.
     neighbor_count: usize,
     neighbor_head: Option<BlockNumber>,
+    /// Top layer this node participates in (0 = base only). Hierarchical HNSW
+    /// gives upper layers progressively fewer nodes for O(log N) descent.
+    level: usize,
+    /// Neighbor chains for layers `1..=level` (index `k-1` is layer `k`); empty
+    /// for a base-only node. Persisted after the base fields, so older readers
+    /// that stop at `level == 0` stay correct.
+    upper_levels: Vec<HnswLevelNeighbors>,
     deleted: bool,
+}
+
+/// One layer's neighbor chain head and length, for layers above the base.
+#[derive(Debug, Clone)]
+struct HnswLevelNeighbors {
+    head: Option<BlockNumber>,
+    count: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -2035,7 +2052,9 @@ impl PageBackedHnswIndex {
             ));
         }
         let version = cursor.take_u32()?;
-        if version != HNSW_SNAPSHOT_VERSION {
+        // v1 snapshots predate hierarchical layers: every node is base-only
+        // (`level == 0`) and has no upper-layer trailer. v2 adds the trailer.
+        if version == 0 || version > HNSW_SNAPSHOT_VERSION {
             return Err(AccessMethodError::Storage(format!(
                 "hnsw snapshot version {version} unsupported"
             )));
@@ -2063,6 +2082,7 @@ impl PageBackedHnswIndex {
                 &mut cursor,
                 index_rel,
                 payload_kind,
+                version,
             )?);
         }
         if !cursor.is_empty() {
@@ -2411,6 +2431,8 @@ impl PageBackedHnswIndex {
             vector_head,
             neighbor_count: 0,
             neighbor_head: None,
+            level: 0,
+            upper_levels: Vec::new(),
             deleted: false,
         };
         storage
@@ -2537,7 +2559,7 @@ impl HnswPersistentPage {
 /// Snapshot container magic. Distinguishes this format from WAL/page bytes.
 const HNSW_SNAPSHOT_MAGIC: &[u8; 8] = b"USQLHNS1";
 /// Snapshot format version. Bump on any incompatible layout change.
-const HNSW_SNAPSHOT_VERSION: u32 = 1;
+const HNSW_SNAPSHOT_VERSION: u32 = 2;
 
 const HNSW_PAGE_KIND_META: u8 = 0;
 const HNSW_PAGE_KIND_NODE: u8 = 1;
@@ -2744,6 +2766,16 @@ fn encode_hnsw_page_record(out: &mut Vec<u8>, image: &PageBackedHnswPageImage) {
             push_len(out, node.neighbor_count);
             push_opt_block(out, node.neighbor_head);
             out.push(u8::from(node.deleted));
+            // v2 extension: upper-layer neighbor chains. Appended after the v1
+            // fields so a `level == 0` node encodes identically to v1 below this
+            // point (the trailing `level` byte aside) and decoders that know v2
+            // read exactly `level` upper-layer entries.
+            push_len(out, node.level);
+            debug_assert_eq!(node.upper_levels.len(), node.level);
+            for upper in &node.upper_levels {
+                push_opt_block(out, upper.head);
+                push_len(out, upper.count);
+            }
         }
         HnswPersistentPage::Overflow(overflow) => {
             out.push(HNSW_PAGE_KIND_OVERFLOW);
@@ -2959,6 +2991,7 @@ fn decode_hnsw_page_record(
     cursor: &mut SnapshotCursor<'_>,
     index_rel: RelationId,
     payload_kind: AnnPayloadKind,
+    version: u32,
 ) -> Result<PageBackedHnswPageImage, AccessMethodError> {
     let _ = payload_kind;
     let block = BlockNumber::new(cursor.take_u32()?);
@@ -3002,6 +3035,19 @@ fn decode_hnsw_page_record(
             let neighbor_count = cursor.take_usize_len()?;
             let neighbor_head = decode_opt_block(cursor)?;
             let deleted = cursor.take_bool()?;
+            // v2 trailer: upper-layer neighbor chains. v1 nodes are base-only.
+            let (level, upper_levels) = if version >= 2 {
+                let level = cursor.take_usize_len()?;
+                let mut upper_levels = Vec::with_capacity(level.min(1 << 16));
+                for _ in 0..level {
+                    let head = decode_opt_block(cursor)?;
+                    let count = cursor.take_usize_len()?;
+                    upper_levels.push(HnswLevelNeighbors { head, count });
+                }
+                (level, upper_levels)
+            } else {
+                (0, Vec::new())
+            };
             HnswPersistentPage::Node(HnswNodePage {
                 page_id,
                 lsn,
@@ -3011,6 +3057,8 @@ fn decode_hnsw_page_record(
                 vector_head,
                 neighbor_count,
                 neighbor_head,
+                level,
+                upper_levels,
                 deleted,
             })
         }
@@ -6720,6 +6768,92 @@ mod tests {
             .map(|hit| hit.tid)
             .collect();
         assert_eq!(before, after, "search results must survive snapshot reload");
+    }
+
+    #[test]
+    fn hnsw_node_page_round_trips_upper_layers() {
+        // The v2 node format must round-trip a multi-layer node (per-layer
+        // neighbor chains) exactly, even though the build does not yet produce
+        // levels > 0 — this exercises the durable format in isolation.
+        let rel = RelationId::new(9001);
+        let block = BlockNumber::new(7);
+        let node = HnswNodePage {
+            page_id: PageId::new(rel, block),
+            lsn: Lsn::new(42),
+            node_id: 5,
+            tid: tid(1, 9),
+            vector_len: 4,
+            vector_head: BlockNumber::new(8),
+            neighbor_count: 3,
+            neighbor_head: Some(BlockNumber::new(10)),
+            level: 2,
+            upper_levels: vec![
+                HnswLevelNeighbors {
+                    head: Some(BlockNumber::new(11)),
+                    count: 2,
+                },
+                HnswLevelNeighbors {
+                    head: None,
+                    count: 0,
+                },
+            ],
+            deleted: false,
+        };
+        let image = PageBackedHnswPageImage {
+            page_id: PageId::new(rel, block),
+            lsn: Lsn::new(42),
+            page: HnswPersistentPage::Node(node),
+        };
+        let mut bytes = Vec::new();
+        encode_hnsw_page_record(&mut bytes, &image);
+        let mut cursor = SnapshotCursor::new(&bytes);
+        let decoded =
+            decode_hnsw_page_record(&mut cursor, rel, AnnPayloadKind::F32, HNSW_SNAPSHOT_VERSION)
+                .expect("decode v2 node");
+        assert!(cursor.is_empty(), "no trailing bytes after a node record");
+        let HnswPersistentPage::Node(got) = decoded.page else {
+            panic!("expected a node page");
+        };
+        assert_eq!(got.level, 2);
+        assert_eq!(got.neighbor_head, Some(BlockNumber::new(10)));
+        assert_eq!(got.neighbor_count, 3);
+        assert_eq!(got.upper_levels.len(), 2);
+        assert_eq!(got.upper_levels[0].head, Some(BlockNumber::new(11)));
+        assert_eq!(got.upper_levels[0].count, 2);
+        assert_eq!(got.upper_levels[1].head, None);
+        assert_eq!(got.upper_levels[1].count, 0);
+    }
+
+    #[test]
+    fn hnsw_node_page_v1_decodes_as_base_only() {
+        // A v1 node record has no upper-layer trailer. Decoding it under the
+        // legacy version must yield a base-only (level 0) node and consume the
+        // record exactly — proving backward compatibility with pre-hierarchical
+        // on-disk snapshots.
+        let rel = RelationId::new(9002);
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&BlockNumber::new(3).raw().to_le_bytes());
+        bytes.extend_from_slice(&Lsn::new(7).raw().to_le_bytes());
+        bytes.push(HNSW_PAGE_KIND_NODE);
+        bytes.extend_from_slice(&12_u64.to_le_bytes());
+        push_tuple_id(&mut bytes, tid(2, 4));
+        push_len(&mut bytes, 4);
+        bytes.extend_from_slice(&BlockNumber::new(5).raw().to_le_bytes());
+        push_len(&mut bytes, 2);
+        push_opt_block(&mut bytes, Some(BlockNumber::new(6)));
+        bytes.push(0_u8); // not deleted; no v2 trailer follows
+        let mut cursor = SnapshotCursor::new(&bytes);
+        let decoded = decode_hnsw_page_record(&mut cursor, rel, AnnPayloadKind::F32, 1)
+            .expect("decode v1 node");
+        assert!(cursor.is_empty(), "v1 record consumed with no trailer");
+        let HnswPersistentPage::Node(got) = decoded.page else {
+            panic!("expected a node page");
+        };
+        assert_eq!(got.level, 0);
+        assert!(got.upper_levels.is_empty());
+        assert_eq!(got.node_id, 12);
+        assert_eq!(got.neighbor_count, 2);
+        assert_eq!(got.neighbor_head, Some(BlockNumber::new(6)));
     }
 
     #[test]
