@@ -1724,6 +1724,24 @@ struct PageBackedHnswStorage {
     free_list: HnswFreeListPage,
     tid_to_node: BTreeMap<TupleId, HnswNodeId>,
     node_to_block: BTreeMap<HnswNodeId, BlockNumber>,
+    /// In-memory, `node_id`-indexed mirror of every node's vector, adjacency,
+    /// tid, and tombstone flag. A pure read accelerator derived from `pages`:
+    /// the durable page chains stay authoritative (and are what snapshots
+    /// serialize), but graph traversal and search read the mirror so per-node
+    /// access is O(1) array indexing instead of `BTreeMap` block lookups plus
+    /// overflow-chain walks. Rebuilt wholesale from `pages` on load
+    /// (`rebuild_mirror`) and maintained in lockstep with `pages` on insert,
+    /// neighbor rewrite, delete, and vacuum. Never serialized.
+    mirror: Vec<Option<MirrorNode>>,
+}
+
+/// One node's in-memory mirror entry. See [`PageBackedHnswStorage::mirror`].
+#[derive(Debug, Clone)]
+struct MirrorNode {
+    vector: Vec<f32>,
+    neighbors: Vec<HnswNodeId>,
+    tid: TupleId,
+    deleted: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -2111,12 +2129,20 @@ impl PageBackedHnswIndex {
         let storage = self.storage.lock();
         let mut out = Vec::with_capacity(storage.node_to_block.len());
         for node_id in storage.node_to_block.keys() {
+            // Read the durable adjacency (not the mirror) so this asserts the
+            // on-disk graph, which is what WAL replay reconstructs.
             let neighbors = storage
-                .neighbors_for_node(*node_id)
+                .neighbors_from_pages(*node_id)
                 .expect("read neighbor list");
             out.push((*node_id, neighbors));
         }
         out
+    }
+
+    /// Assert the in-memory mirror matches the durable page state.
+    #[cfg(test)]
+    fn assert_mirror_consistent(&self) {
+        self.storage.lock().assert_mirror_consistent();
     }
 
     /// Distance metric attached to this graph.
@@ -2396,6 +2422,16 @@ impl PageBackedHnswIndex {
         if storage.meta.entry_node.is_none() {
             storage.meta.entry_node = Some(node_id);
         }
+        // Mirror the new node before linking; `write_neighbors` fills adjacency.
+        storage.mirror_put(
+            node_id,
+            MirrorNode {
+                vector: vector.to_vec(),
+                neighbors: Vec::new(),
+                tid,
+                deleted: false,
+            },
+        );
         storage.write_neighbors(node_id, &neighbor_ids)?;
 
         for neighbor_id in neighbor_ids {
@@ -3069,7 +3105,136 @@ impl PageBackedHnswStorage {
             free_list,
             tid_to_node: BTreeMap::new(),
             node_to_block: BTreeMap::new(),
+            mirror: Vec::new(),
         }
+    }
+
+    /// Rebuild the in-memory mirror from the authoritative page state. Called
+    /// once after construction from page images (load / snapshot restore /
+    /// WAL replay seed) so the mirror exactly reflects what is on disk.
+    fn rebuild_mirror(&mut self) -> Result<(), AccessMethodError> {
+        let len = usize::try_from(self.meta.next_node_id).map_err(|_| {
+            AccessMethodError::Storage("hnsw next_node_id does not fit usize".to_owned())
+        })?;
+        let mut mirror: Vec<Option<MirrorNode>> = Vec::new();
+        mirror.resize_with(len, || None);
+        let node_ids: Vec<HnswNodeId> = self.node_to_block.keys().copied().collect();
+        for node_id in node_ids {
+            let (tid, deleted, vector) = {
+                let Some(node) = self.node_page(node_id)? else {
+                    continue;
+                };
+                (node.tid, node.deleted, self.vector_for_node(node)?)
+            };
+            let neighbors = self.neighbors_from_pages(node_id)?;
+            let idx = usize::try_from(node_id).map_err(|_| {
+                AccessMethodError::Storage("hnsw node id does not fit usize".to_owned())
+            })?;
+            if idx >= mirror.len() {
+                mirror.resize_with(idx + 1, || None);
+            }
+            mirror[idx] = Some(MirrorNode {
+                vector,
+                neighbors,
+                tid,
+                deleted,
+            });
+        }
+        self.mirror = mirror;
+        Ok(())
+    }
+
+    /// O(1) shared view of a node's mirror entry, or `None` if the id is unused.
+    fn mirror_node(&self, node_id: HnswNodeId) -> Option<&MirrorNode> {
+        usize::try_from(node_id)
+            .ok()
+            .and_then(|idx| self.mirror.get(idx))
+            .and_then(Option::as_ref)
+    }
+
+    /// Insert or replace a node's mirror entry, growing the backing vec as the
+    /// monotonic `node_id` space advances.
+    fn mirror_put(&mut self, node_id: HnswNodeId, node: MirrorNode) {
+        let Ok(idx) = usize::try_from(node_id) else {
+            return;
+        };
+        if idx >= self.mirror.len() {
+            self.mirror.resize_with(idx + 1, || None);
+        }
+        self.mirror[idx] = Some(node);
+    }
+
+    /// Drop a node's mirror entry (vacuum reclaim). The slot stays as `None`.
+    fn mirror_remove(&mut self, node_id: HnswNodeId) {
+        if let Ok(idx) = usize::try_from(node_id)
+            && idx < self.mirror.len()
+        {
+            self.mirror[idx] = None;
+        }
+    }
+
+    /// Replace a node's mirrored adjacency list, keeping it in lockstep with the
+    /// durable neighbor chain written by `write_neighbors`.
+    fn mirror_set_neighbors(&mut self, node_id: HnswNodeId, neighbors: &[HnswNodeId]) {
+        if let Ok(idx) = usize::try_from(node_id)
+            && let Some(Some(node)) = self.mirror.get_mut(idx)
+        {
+            node.neighbors.clear();
+            node.neighbors.extend_from_slice(neighbors);
+        }
+    }
+
+    /// Mark a node's mirror entry tombstoned, matching the durable page flag.
+    fn mirror_mark_deleted(&mut self, node_id: HnswNodeId) {
+        if let Ok(idx) = usize::try_from(node_id)
+            && let Some(Some(node)) = self.mirror.get_mut(idx)
+        {
+            node.deleted = true;
+        }
+    }
+
+    /// Assert the mirror is byte-for-byte consistent with the durable page state:
+    /// every node in `node_to_block` has a mirror entry whose vector, adjacency,
+    /// tid, and tombstone flag match the pages, and there are no stray entries.
+    #[cfg(test)]
+    fn assert_mirror_consistent(&self) {
+        let mut durable = 0usize;
+        for node_id in self.node_to_block.keys().copied() {
+            let page_neighbors = self.neighbors_from_pages(node_id).expect("page neighbors");
+            let (page_tid, page_deleted, page_vector) = {
+                let node = self
+                    .node_page(node_id)
+                    .expect("node page")
+                    .expect("node present");
+                (
+                    node.tid,
+                    node.deleted,
+                    self.vector_for_node(node).expect("vec"),
+                )
+            };
+            let mirror = self
+                .mirror_node(node_id)
+                .unwrap_or_else(|| panic!("missing mirror entry for node {node_id}"));
+            assert_eq!(
+                mirror.vector, page_vector,
+                "mirror vector mismatch {node_id}"
+            );
+            assert_eq!(
+                mirror.neighbors, page_neighbors,
+                "mirror neighbors mismatch {node_id}"
+            );
+            assert_eq!(mirror.tid, page_tid, "mirror tid mismatch {node_id}");
+            assert_eq!(
+                mirror.deleted, page_deleted,
+                "mirror deleted mismatch {node_id}"
+            );
+            durable += 1;
+        }
+        let present = self.mirror.iter().filter(|slot| slot.is_some()).count();
+        assert_eq!(
+            present, durable,
+            "mirror has stray entries not in node_to_block"
+        );
     }
 
     fn from_page_images(
@@ -3176,11 +3341,13 @@ impl PageBackedHnswStorage {
             free_list,
             tid_to_node,
             node_to_block,
+            mirror: Vec::new(),
         };
         storage.meta.live_nodes = live_nodes;
         storage.meta.tombstones = tombstones;
         storage.meta.entry_node = storage.first_live_node_id()?;
         storage.sync_control_pages();
+        storage.rebuild_mirror()?;
         Ok(storage)
     }
 
@@ -3319,15 +3486,21 @@ impl PageBackedHnswStorage {
     fn live_node_snapshot(
         &self,
     ) -> Result<Vec<(HnswNodeId, TupleId, Vec<f32>)>, AccessMethodError> {
+        // Mirror order is ascending `node_id`, the same order
+        // `node_to_block.keys()` yields, so the candidate pool (and thus the
+        // built graph) is identical to the page-based scan it replaces.
         let mut out = Vec::with_capacity(self.meta.live_nodes);
-        for node_id in self.node_to_block.keys() {
-            let Some(node) = self.node_page(*node_id)? else {
+        for (idx, slot) in self.mirror.iter().enumerate() {
+            let Some(node) = slot else {
                 continue;
             };
             if node.deleted {
                 continue;
             }
-            out.push((*node_id, node.tid, self.vector_for_node(node)?));
+            let node_id = HnswNodeId::try_from(idx).map_err(|_| {
+                AccessMethodError::Storage("hnsw mirror index does not fit node id".to_owned())
+            })?;
+            out.push((node_id, node.tid, node.vector.clone()));
         }
         Ok(out)
     }
@@ -3361,30 +3534,9 @@ impl PageBackedHnswStorage {
 
     /// Zero-copy view of a node's vector when it lives in a single overflow page
     /// — the common case, since `HNSW_VECTOR_VALUES_PER_OVERFLOW_PAGE` is ~2k so
-    /// every vector up to that many dims is single-page. Returns `None` for the
-    /// rare multi-page vector, where the caller falls back to `vector_for_node`.
-    ///
-    /// This avoids the per-probe `Vec<f32>` allocation that otherwise dominates
-    /// build and search: a graph traversal probes thousands of nodes, and
-    /// materializing a fresh vector for each made the page-backed index's
-    /// per-access cost swamp the algorithmic win of touching fewer nodes.
-    fn node_vector_view(&self, node: &HnswNodePage) -> Option<&[f32]> {
-        let Some(HnswPersistentPage::Overflow(page)) = self.pages.get(&node.vector_head) else {
-            return None;
-        };
-        if page.next.is_some() {
-            return None;
-        }
-        match &page.payload {
-            HnswOverflowPayload::Vector(payload) => {
-                let view = payload.exact_f32();
-                (view.len() == node.vector_len).then_some(view)
-            }
-            HnswOverflowPayload::Neighbors(_) => None,
-        }
-    }
-
-    fn neighbors_for_node(
+    /// Adjacency from the durable neighbor chain. Used only to (re)build the
+    /// mirror; the hot read path is `neighbors_for_node`, which reads the mirror.
+    fn neighbors_from_pages(
         &self,
         node_id: HnswNodeId,
     ) -> Result<Vec<HnswNodeId>, AccessMethodError> {
@@ -3413,28 +3565,37 @@ impl PageBackedHnswStorage {
         Ok(neighbors)
     }
 
+    /// A node's adjacency list, read from the in-memory mirror (O(1)). The
+    /// mirror is kept in lockstep with the durable neighbor chain, so this is
+    /// identical to `neighbors_from_pages` but without the chain walk.
+    fn neighbors_for_node(
+        &self,
+        node_id: HnswNodeId,
+    ) -> Result<Vec<HnswNodeId>, AccessMethodError> {
+        Ok(self
+            .mirror_node(node_id)
+            .map(|node| node.neighbors.clone())
+            .unwrap_or_default())
+    }
+
     /// Distance from `probe` to a live node, or `None` when the node is missing
-    /// or tombstoned.
+    /// or tombstoned. Reads the node's vector from the mirror (O(1), no
+    /// per-probe allocation or page-chain walk).
     fn node_probe_distance(
         &self,
         probe: &[f32],
         node_id: HnswNodeId,
     ) -> Result<Option<(f32, TupleId)>, AccessMethodError> {
-        let Some(node) = self.node_page(node_id)? else {
+        let Some(node) = self.mirror_node(node_id) else {
             return Ok(None);
         };
         if node.deleted {
             return Ok(None);
         }
-        let tid = node.tid;
-        let distance = match self.node_vector_view(node) {
-            Some(view) => self.meta.metric.distance(probe, view),
-            None => self
-                .meta
-                .metric
-                .distance(probe, &self.vector_for_node(node)?),
-        };
-        Ok(Some((distance, tid)))
+        Ok(Some((
+            self.meta.metric.distance(probe, &node.vector),
+            node.tid,
+        )))
     }
 
     /// Exact brute-force scan over every live node. Used when the live set is
@@ -3616,9 +3777,8 @@ impl PageBackedHnswStorage {
         explored.truncate(ef_construction);
         let mut candidates = Vec::with_capacity(explored.len());
         for (node_id, distance) in explored {
-            if let Some(node) = self.node_page(node_id)? {
-                let vector = self.vector_for_node(node)?;
-                candidates.push((node_id, distance, vector));
+            if let Some(node) = self.mirror_node(node_id) {
+                candidates.push((node_id, distance, node.vector.clone()));
             }
         }
         Ok(candidates)
@@ -3639,6 +3799,7 @@ impl PageBackedHnswStorage {
         };
         node.neighbor_head = new_head;
         node.neighbor_count = neighbors.len();
+        self.mirror_set_neighbors(node_id, neighbors);
         Ok(())
     }
 
@@ -3652,21 +3813,20 @@ impl PageBackedHnswStorage {
         neighbors.sort_unstable();
         neighbors.dedup();
         neighbors.retain(|neighbor| *neighbor != node_id);
-        let Some(origin_node) = self.node_page(node_id)? else {
+        let Some(origin_node) = self.mirror_node(node_id) else {
             return Ok(Vec::new());
         };
-        let origin = self.vector_for_node(origin_node)?;
+        let origin = origin_node.vector.clone();
         let mut candidates: Vec<(HnswNodeId, f32, Vec<f32>)> = Vec::with_capacity(neighbors.len());
         for neighbor in neighbors {
-            let Some(neighbor_node) = self.node_page(neighbor)? else {
+            let Some(neighbor_node) = self.mirror_node(neighbor) else {
                 continue;
             };
             if neighbor_node.deleted {
                 continue;
             }
-            let vector = self.vector_for_node(neighbor_node)?;
-            let distance = metric.distance(&origin, &vector);
-            candidates.push((neighbor, distance, vector));
+            let distance = metric.distance(&origin, &neighbor_node.vector);
+            candidates.push((neighbor, distance, neighbor_node.vector.clone()));
         }
         candidates.sort_by(|left, right| {
             left.1
@@ -3710,6 +3870,7 @@ impl PageBackedHnswStorage {
             };
         }
         node.deleted = true;
+        self.mirror_mark_deleted(node_id);
         self.meta.live_nodes = self.meta.live_nodes.saturating_sub(1);
         self.meta.tombstones += 1;
         if self.meta.entry_node == Some(node_id) {
@@ -3768,6 +3929,7 @@ impl PageBackedHnswStorage {
             self.release_overflow_chain(Some(node.vector_head))?;
             self.release_overflow_chain(node.neighbor_head)?;
             self.free_page(block)?;
+            self.mirror_remove(*node_id);
         }
         self.meta.tombstones = 0;
         self.meta.live_nodes = self
@@ -6457,6 +6619,107 @@ mod tests {
             second.debug_neighbor_lists(),
             "traversal build must be deterministic for WAL replay"
         );
+    }
+
+    #[test]
+    fn page_backed_hnsw_mirror_stays_consistent_through_dml_and_reload() {
+        // The in-memory mirror (the O(1) read accelerator behind traversal and
+        // search) must stay byte-for-byte consistent with the durable pages
+        // across insert, delete, vacuum, and snapshot reload — otherwise search
+        // would silently diverge from the on-disk graph.
+        const DIMS: usize = 12;
+        const N: u16 = 400;
+        let dims_u32 = u32::try_from(DIMS).expect("dims fit u32");
+        let index_rel = RelationId::new(8824);
+        let am = PageBackedHnswIndex::new(index_rel, dims_u32, HnswMetric::L2, 12, 32)
+            .expect("page-backed hnsw config")
+            .with_build_traversal_work_threshold(0);
+        let mut rng = 0x0bad_c0de_1234_5678_u64;
+        let mut next_unit = || {
+            rng = rng
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            let bits = u16::try_from((rng >> 48) & 0xFFFF).expect("16 bits fit u16");
+            f32::from(bits) / f32::from(u16::MAX)
+        };
+        let mut vectors: Vec<(TupleId, Vec<f32>)> = Vec::new();
+        for i in 0..N {
+            let v: Vec<f32> = (0..DIMS).map(|_| next_unit()).collect();
+            am.insert_vector(&v, tid(1, i)).expect("insert");
+            vectors.push((tid(1, i), v));
+        }
+        am.assert_mirror_consistent();
+
+        // Tombstone every fifth vector, then vacuum it out.
+        for i in (0..N).step_by(5) {
+            am.mark_deleted(tid(1, i)).expect("delete");
+        }
+        am.assert_mirror_consistent();
+        am.vacuum_deleted().expect("vacuum");
+        am.assert_mirror_consistent();
+
+        // Search after DML must find the true nearest among the live set (the
+        // mirror is what search reads).
+        let live: Vec<(TupleId, &Vec<f32>)> = vectors
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| i % 5 != 0)
+            .map(|(_, (t, v))| (*t, v))
+            .collect();
+        let k = 10;
+        let mut recall_sum = 0.0_f64;
+        let trials = 20;
+        for _ in 0..trials {
+            let probe: Vec<f32> = (0..DIMS).map(|_| next_unit()).collect();
+            let mut exact: Vec<(f32, TupleId)> = live
+                .iter()
+                .map(|(t, v)| (HnswMetric::L2.distance(&probe, v), *t))
+                .collect();
+            exact.sort_by(|a, b| a.0.total_cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+            let want: std::collections::BTreeSet<TupleId> =
+                exact.iter().take(k).map(|(_, t)| *t).collect();
+            let got: std::collections::BTreeSet<TupleId> = am
+                .search_with_ef(&probe, k, 64)
+                .expect("search")
+                .into_iter()
+                .map(|hit| hit.tid)
+                .collect();
+            // Every returned tid must be a live one (no tombstoned/vacuumed leak).
+            for t in &got {
+                assert!(
+                    live.iter().any(|(lt, _)| lt == t),
+                    "search returned a non-live tid after vacuum"
+                );
+            }
+            let overlap = want.iter().filter(|t| got.contains(t)).count();
+            recall_sum += f64::from(u16::try_from(overlap).expect("overlap fits u16"))
+                / f64::from(u16::try_from(k).expect("k fits u16"));
+        }
+        assert!(
+            recall_sum / f64::from(trials) >= 0.9,
+            "post-vacuum recall@{k} too low"
+        );
+
+        // A snapshot reload rebuilds the mirror from pages alone; it must be
+        // consistent and return identical search results.
+        let probe: Vec<f32> = (0..DIMS).map(|_| next_unit()).collect();
+        let before: Vec<TupleId> = am
+            .search(&probe, k)
+            .expect("search before reload")
+            .into_iter()
+            .map(|hit| hit.tid)
+            .collect();
+        let bytes = am.encode_snapshot();
+        let restored =
+            PageBackedHnswIndex::from_snapshot_bytes(index_rel, &bytes).expect("snapshot decodes");
+        restored.assert_mirror_consistent();
+        let after: Vec<TupleId> = restored
+            .search(&probe, k)
+            .expect("search after reload")
+            .into_iter()
+            .map(|hit| hit.tid)
+            .collect();
+        assert_eq!(before, after, "search results must survive snapshot reload");
     }
 
     #[test]
