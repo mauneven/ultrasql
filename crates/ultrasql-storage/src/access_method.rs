@@ -1710,6 +1710,10 @@ pub struct PageBackedHnswIndex {
     m: usize,
     ef_search: usize,
     payload_kind: AnnPayloadKind,
+    /// `live_nodes × dims` work budget above which build switches from an
+    /// exhaustive candidate scan to graph-traversal candidate selection. See
+    /// [`HNSW_BUILD_TRAVERSAL_WORK_THRESHOLD`].
+    build_traversal_work_threshold: usize,
 }
 
 #[derive(Debug)]
@@ -1836,6 +1840,7 @@ impl PageBackedHnswIndex {
             m,
             ef_search,
             payload_kind,
+            build_traversal_work_threshold: HNSW_BUILD_TRAVERSAL_WORK_THRESHOLD,
         })
     }
 
@@ -1877,7 +1882,17 @@ impl PageBackedHnswIndex {
             m,
             ef_search,
             payload_kind,
+            build_traversal_work_threshold: HNSW_BUILD_TRAVERSAL_WORK_THRESHOLD,
         })
+    }
+
+    /// Override the build-time exhaustive-scan vs graph-traversal work threshold.
+    /// Test-only: lets a small fixture exercise the traversal build path without
+    /// inserting the ~8k vectors the production threshold would otherwise need.
+    #[cfg(test)]
+    fn with_build_traversal_work_threshold(mut self, threshold: usize) -> Self {
+        self.build_traversal_work_threshold = threshold;
+        self
     }
 
     /// The index's configured default exploration budget (`ef_search`).
@@ -2086,6 +2101,22 @@ impl PageBackedHnswIndex {
             }
         }
         stats
+    }
+
+    /// Deterministic snapshot of every node's neighbor list, ordered by node id.
+    /// Used by tests to assert that two builds of the same insert sequence
+    /// produce an identical graph (the property WAL replay relies on).
+    #[cfg(test)]
+    fn debug_neighbor_lists(&self) -> Vec<(HnswNodeId, Vec<HnswNodeId>)> {
+        let storage = self.storage.lock();
+        let mut out = Vec::with_capacity(storage.node_to_block.len());
+        for node_id in storage.node_to_block.keys() {
+            let neighbors = storage
+                .neighbors_for_node(*node_id)
+                .expect("read neighbor list");
+            out.push((*node_id, neighbors));
+        }
+        out
     }
 
     /// Distance metric attached to this graph.
@@ -2304,24 +2335,37 @@ impl PageBackedHnswIndex {
             return Err(AccessMethodError::DuplicateKey);
         }
 
-        // Gather every live node with its exact distance to the new vector, keep
-        // the nearest `ef_construction` as the candidate pool, then select a
-        // diverse subset with the HNSW heuristic so the navigable layer stays
-        // searchable instead of collapsing into a poorly-connected k-NN graph.
-        let mut candidates: Vec<(HnswNodeId, f32, Vec<f32>)> = storage
-            .live_node_snapshot()?
-            .into_iter()
-            .map(|(node_id, _node_tid, node_vector)| {
-                let distance = self.metric.distance(vector, &node_vector);
-                (node_id, distance, node_vector)
-            })
-            .collect();
+        // Build a candidate pool, then select a diverse subset with the HNSW
+        // heuristic so the navigable layer stays searchable instead of
+        // collapsing into a poorly-connected k-NN graph. Pick the gathering
+        // strategy by estimated cost: while the live set is small an exhaustive
+        // scan is both exact and faster, but once `live_nodes × dims` exceeds
+        // `build_traversal_work_threshold` a graph traversal of the
+        // partially-built graph for the nearest `ef_construction`
+        // (`collect_construction_candidates`) wins, turning the O(N²) build into
+        // a sub-quadratic one. The traversal is deterministic, so WAL replay
+        // reconstructs an identical graph.
+        let ef_construction = HNSW_DEFAULT_EF_CONSTRUCTION.max(self.m);
+        let scan_work = storage.meta.live_nodes.saturating_mul(self.dims);
+        let mut candidates: Vec<(HnswNodeId, f32, Vec<f32>)> =
+            if scan_work <= self.build_traversal_work_threshold {
+                storage
+                    .live_node_snapshot()?
+                    .into_iter()
+                    .map(|(node_id, _node_tid, node_vector)| {
+                        let distance = self.metric.distance(vector, &node_vector);
+                        (node_id, distance, node_vector)
+                    })
+                    .collect()
+            } else {
+                storage.collect_construction_candidates(vector, ef_construction)?
+            };
         candidates.sort_by(|left, right| {
             left.1
                 .total_cmp(&right.1)
                 .then_with(|| left.0.cmp(&right.0))
         });
-        candidates.truncate(HNSW_DEFAULT_EF_CONSTRUCTION.max(self.m));
+        candidates.truncate(ef_construction);
         let neighbor_ids = select_neighbors_heuristic(&candidates, self.m, self.metric);
 
         let node_id = storage.meta.next_node_id;
@@ -3315,6 +3359,31 @@ impl PageBackedHnswStorage {
         Ok(vector)
     }
 
+    /// Zero-copy view of a node's vector when it lives in a single overflow page
+    /// — the common case, since `HNSW_VECTOR_VALUES_PER_OVERFLOW_PAGE` is ~2k so
+    /// every vector up to that many dims is single-page. Returns `None` for the
+    /// rare multi-page vector, where the caller falls back to `vector_for_node`.
+    ///
+    /// This avoids the per-probe `Vec<f32>` allocation that otherwise dominates
+    /// build and search: a graph traversal probes thousands of nodes, and
+    /// materializing a fresh vector for each made the page-backed index's
+    /// per-access cost swamp the algorithmic win of touching fewer nodes.
+    fn node_vector_view(&self, node: &HnswNodePage) -> Option<&[f32]> {
+        let Some(HnswPersistentPage::Overflow(page)) = self.pages.get(&node.vector_head) else {
+            return None;
+        };
+        if page.next.is_some() {
+            return None;
+        }
+        match &page.payload {
+            HnswOverflowPayload::Vector(payload) => {
+                let view = payload.exact_f32();
+                (view.len() == node.vector_len).then_some(view)
+            }
+            HnswOverflowPayload::Neighbors(_) => None,
+        }
+    }
+
     fn neighbors_for_node(
         &self,
         node_id: HnswNodeId,
@@ -3357,8 +3426,15 @@ impl PageBackedHnswStorage {
         if node.deleted {
             return Ok(None);
         }
-        let vector = self.vector_for_node(node)?;
-        Ok(Some((self.meta.metric.distance(probe, &vector), node.tid)))
+        let tid = node.tid;
+        let distance = match self.node_vector_view(node) {
+            Some(view) => self.meta.metric.distance(probe, view),
+            None => self
+                .meta
+                .metric
+                .distance(probe, &self.vector_for_node(node)?),
+        };
+        Ok(Some((distance, tid)))
     }
 
     /// Exact brute-force scan over every live node. Used when the live set is
@@ -3451,6 +3527,101 @@ impl PageBackedHnswStorage {
         hits.sort_by(compare_hnsw_hits);
         hits.truncate(k);
         Ok(hits)
+    }
+
+    /// Gather up to `ef_construction` build-time candidates for a new vector by
+    /// traversing the partially-built navigable graph — greedy descent to a
+    /// local minimum, then best-first expansion bounded by `ef_construction`
+    /// popped nodes — instead of an exhaustive scan of every live node. This is
+    /// the standard HNSW construction search: it caps per-insert work at the
+    /// nodes the traversal touches rather than the whole live set, turning an
+    /// O(N²) build into ~O(N · ef_construction). The traversal is deterministic
+    /// given the graph state (BTreeMap node iteration plus total-order
+    /// distance/id tie-breaks), so WAL replay and snapshot-resumed replay
+    /// reconstruct an identical graph.
+    ///
+    /// Returns `(node_id, distance_to_query, vector)` for the nearest explored
+    /// nodes so the caller can run the diversity heuristic over the pool.
+    fn collect_construction_candidates(
+        &self,
+        query: &[f32],
+        ef_construction: usize,
+    ) -> Result<Vec<(HnswNodeId, f32, Vec<f32>)>, AccessMethodError> {
+        let entry = match self.meta.entry_node {
+            Some(id) if self.node_page(id)?.is_some_and(|node| !node.deleted) => Some(id),
+            _ => self.first_live_node_id()?,
+        };
+        let Some(mut current) = entry else {
+            return Ok(Vec::new());
+        };
+        let Some(mut current_distance) = self
+            .node_probe_distance(query, current)?
+            .map(|(distance, _)| distance)
+        else {
+            return Ok(Vec::new());
+        };
+
+        // Greedy descent: hop to the closer neighbor until none improves.
+        let mut improved = true;
+        while improved {
+            improved = false;
+            for neighbor in self.neighbors_for_node(current)? {
+                if let Some((distance, _)) = self.node_probe_distance(query, neighbor)? {
+                    if distance < current_distance {
+                        current = neighbor;
+                        current_distance = distance;
+                        improved = true;
+                        break;
+                    }
+                }
+            }
+        }
+
+        // Best-first expansion bounded by `ef_construction` popped nodes.
+        let mut visited: std::collections::BTreeSet<HnswNodeId> = std::collections::BTreeSet::new();
+        visited.insert(current);
+        let mut frontier: Vec<(f32, HnswNodeId)> = vec![(current_distance, current)];
+        let mut explored: Vec<(HnswNodeId, f32)> =
+            Vec::with_capacity(ef_construction.min(self.meta.live_nodes));
+        while !frontier.is_empty() && explored.len() < ef_construction {
+            let best_pos = frontier
+                .iter()
+                .enumerate()
+                .min_by(|left, right| {
+                    left.1
+                        .0
+                        .total_cmp(&right.1.0)
+                        .then_with(|| left.1.1.cmp(&right.1.1))
+                })
+                .map_or(0, |(idx, _)| idx);
+            let (distance, node_id) = frontier.swap_remove(best_pos);
+            explored.push((node_id, distance));
+            for neighbor in self.neighbors_for_node(node_id)? {
+                if !visited.insert(neighbor) {
+                    continue;
+                }
+                if let Some((distance, _)) = self.node_probe_distance(query, neighbor)? {
+                    frontier.push((distance, neighbor));
+                }
+            }
+        }
+
+        // Keep the `ef_construction` nearest explored nodes and attach their
+        // vectors so the diversity heuristic can run over the pool.
+        explored.sort_by(|left, right| {
+            left.1
+                .total_cmp(&right.1)
+                .then_with(|| left.0.cmp(&right.0))
+        });
+        explored.truncate(ef_construction);
+        let mut candidates = Vec::with_capacity(explored.len());
+        for (node_id, distance) in explored {
+            if let Some(node) = self.node_page(node_id)? {
+                let vector = self.vector_for_node(node)?;
+                candidates.push((node_id, distance, vector));
+            }
+        }
+        Ok(candidates)
     }
 
     fn write_neighbors(
@@ -3681,6 +3852,20 @@ impl PageBackedHnswStorage {
 /// live nodes, so this bounds the diversity heuristic's pairwise-distance cost
 /// while keeping graph quality high. Larger trades build time for recall.
 const HNSW_DEFAULT_EF_CONSTRUCTION: usize = 200;
+
+/// Build-time work budget — in vector-element comparisons (`live_nodes × dims`)
+/// — above which gathering a new node's neighbor candidates by traversing the
+/// partially-built graph beats an exhaustive scan of every live node.
+///
+/// An exhaustive scan costs ~`live_nodes × dims` element comparisons but is
+/// sequential and allocation-light, so it stays the faster *and* exact choice
+/// while the live set is small. A graph traversal touches far fewer nodes once
+/// the set is large, but pays a fixed per-node page-lookup cost (the page-backed
+/// arena chases `BTreeMap` blocks per probe) that only amortizes past this
+/// budget. Calibrated from the page-backed build sweep: the crossover is ~8k
+/// live nodes at 128 dims (≈ this value), where the exhaustive build first
+/// exceeds the traversal build. Below it, full-scan candidate selection is kept.
+const HNSW_BUILD_TRAVERSAL_WORK_THRESHOLD: usize = 1_000_000;
 
 /// HNSW select-neighbors heuristic (Malkov & Yashunin 2018, Algorithm 4).
 ///
@@ -6176,6 +6361,101 @@ mod tests {
         assert!(
             mean >= 0.9,
             "diversity-heuristic recall@{k} too low: {mean} (pre-heuristic was ~0.66)"
+        );
+    }
+
+    #[test]
+    fn page_backed_hnsw_graph_traversal_build_keeps_high_recall() {
+        // Force the graph-traversal build path (`collect_construction_candidates`)
+        // at small N via a zero work threshold — production crosses it at ~8k
+        // vectors. The navigable graph the traversal produces must still answer
+        // queries with high recall: the recall side of the O(N²)→sub-quadratic
+        // build fix.
+        const DIMS: usize = 16;
+        const N: u16 = 1200;
+        let dims_u32 = u32::try_from(DIMS).expect("dims fit u32");
+        let am = PageBackedHnswIndex::new(RelationId::new(8821), dims_u32, HnswMetric::L2, 16, 64)
+            .expect("page-backed hnsw config")
+            .with_build_traversal_work_threshold(0);
+        let mut rng = 0x0f1e_2d3c_4b5a_6978_u64;
+        let mut next_unit = || {
+            rng = rng
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            let bits = u16::try_from((rng >> 48) & 0xFFFF).expect("16 bits fit u16");
+            f32::from(bits) / f32::from(u16::MAX)
+        };
+        let mut vectors: Vec<(TupleId, Vec<f32>)> = Vec::new();
+        for i in 0..N {
+            let v: Vec<f32> = (0..DIMS).map(|_| next_unit()).collect();
+            am.insert_vector(&v, tid(1, i)).expect("insert");
+            vectors.push((tid(1, i), v));
+        }
+
+        let k = 10;
+        let mut recall_sum = 0.0_f64;
+        let trials = 30;
+        for _ in 0..trials {
+            let probe: Vec<f32> = (0..DIMS).map(|_| next_unit()).collect();
+            let mut exact: Vec<(f32, TupleId)> = vectors
+                .iter()
+                .map(|(t, v)| (HnswMetric::L2.distance(&probe, v), *t))
+                .collect();
+            exact.sort_by(|a, b| a.0.total_cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+            let want: std::collections::BTreeSet<TupleId> =
+                exact.iter().take(k).map(|(_, t)| *t).collect();
+            let got: std::collections::BTreeSet<TupleId> = am
+                .search_with_ef(&probe, k, 128)
+                .expect("graph search")
+                .into_iter()
+                .map(|hit| hit.tid)
+                .collect();
+            let overlap = want.iter().filter(|t| got.contains(t)).count();
+            recall_sum += f64::from(u16::try_from(overlap).expect("overlap fits u16"))
+                / f64::from(u16::try_from(k).expect("k fits u16"));
+        }
+        let mean = recall_sum / f64::from(trials);
+        assert!(
+            mean >= 0.95,
+            "graph-traversal-build recall@{k} too low: {mean} (target >= 0.95 at ef<=128)"
+        );
+    }
+
+    #[test]
+    fn page_backed_hnsw_traversal_build_is_deterministic_for_replay() {
+        // The traversal build must be deterministic: replaying the same insert
+        // sequence (e.g. during WAL recovery) has to reconstruct an identical
+        // graph, or recovery would diverge from the durable index. Build two
+        // indexes from the same vectors past the ef_construction threshold and
+        // assert every node's neighbor list matches byte-for-byte.
+        const DIMS: usize = 12;
+        const N: u16 = 500;
+        let dims_u32 = u32::try_from(DIMS).expect("dims fit u32");
+        let build = || {
+            let am =
+                PageBackedHnswIndex::new(RelationId::new(8822), dims_u32, HnswMetric::L2, 12, 32)
+                    .expect("page-backed hnsw config")
+                    .with_build_traversal_work_threshold(0);
+            let mut rng = 0xdead_beef_cafe_f00d_u64;
+            let mut next_unit = move || {
+                rng = rng
+                    .wrapping_mul(6_364_136_223_846_793_005)
+                    .wrapping_add(1_442_695_040_888_963_407);
+                let bits = u16::try_from((rng >> 48) & 0xFFFF).expect("16 bits fit u16");
+                f32::from(bits) / f32::from(u16::MAX)
+            };
+            for i in 0..N {
+                let v: Vec<f32> = (0..DIMS).map(|_| next_unit()).collect();
+                am.insert_vector(&v, tid(1, i)).expect("insert");
+            }
+            am
+        };
+        let first = build();
+        let second = build();
+        assert_eq!(
+            first.debug_neighbor_lists(),
+            second.debug_neighbor_lists(),
+            "traversal build must be deterministic for WAL replay"
         );
     }
 
