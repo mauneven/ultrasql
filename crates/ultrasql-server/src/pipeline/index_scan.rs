@@ -484,12 +484,6 @@ fn try_hnsw_filtered_sorted(
     let Some((col_idx, metric, probe)) = match_hnsw_sort_key(&key.expr) else {
         return Ok(None);
     };
-    // Only the HNSW index exposes the per-query ef over-fetch knob; other index
-    // kinds fall back to the exact filter+sort path.
-    let Some(hnsw) = find_hnsw_index(ctx, table_entry, col_idx, metric) else {
-        return Ok(None);
-    };
-
     // Size the exploration budget to the estimated filter selectivity.
     let selectivity = estimate_filter_selectivity(predicate).clamp(0.0001, 1.0);
     let overfetch = limit.saturating_mul(FILTERED_ANN_OVERFETCH);
@@ -508,16 +502,43 @@ fn try_hnsw_filtered_sorted(
         .ceil()
         .to_usize()
         .unwrap_or(FILTERED_ANN_MAX_EF);
-    // A per-session `hnsw.ef_search` raises the floor so users can boost recall
-    // on filtered queries too, but never below what selectivity demands.
+    // A per-session `ef_search` raises the floor so users can boost recall on
+    // filtered queries too, but never below what selectivity demands.
     let ef = selectivity_ef.max(session_ef_search(ctx).unwrap_or(0));
 
-    let hits = hnsw
-        .search_with_ef(&probe, ef, ef)
-        .map_err(|e| ServerError::ddl(format!("HNSW filtered search: {e}")))?
-        .into_iter()
-        .map(|hit| VectorSearchHit { tid: hit.tid })
-        .collect::<Vec<_>>();
+    // HNSW scales its `ef` exploration budget; IVFFlat scales the number of
+    // inverted lists it probes (both inversely with selectivity). Other index
+    // kinds fall back to the exact filter+sort path.
+    let hits = if let Some(hnsw) = find_hnsw_index(ctx, table_entry, col_idx, metric) {
+        hnsw.search_with_ef(&probe, ef, ef)
+            .map_err(|e| ServerError::ddl(format!("HNSW filtered search: {e}")))?
+            .into_iter()
+            .map(|hit| VectorSearchHit { tid: hit.tid })
+            .collect::<Vec<_>>()
+    } else if let Some(ivfflat) = find_ivfflat_index(ctx, table_entry, col_idx, metric) {
+        // Probe more lists for a more selective filter, capped at the
+        // materialized list count (probing every list is exact); `ef`
+        // over-fetches the result count. The cap is the only bound that matters,
+        // so clamp with `min(lists)` — never `clamp(configured, lists)`, which
+        // would panic when the configured probes exceed the materialized lists
+        // (e.g. `WITH (lists = 4, probes = 8)`, or fewer rows than lists).
+        let configured = ivfflat.probes().max(1);
+        let lists = ivfflat.list_count().max(1);
+        let probes = (configured.to_f64().unwrap_or(f64::MAX) / selectivity)
+            .ceil()
+            .to_usize()
+            .unwrap_or(lists)
+            .min(lists)
+            .max(1);
+        ivfflat
+            .search_with_probes(&probe, ef, probes)
+            .map_err(|e| ServerError::ddl(format!("IVFFlat filtered search: {e}")))?
+            .into_iter()
+            .map(|hit| VectorSearchHit { tid: hit.tid })
+            .collect::<Vec<_>>()
+    } else {
+        return Ok(None);
+    };
     if hits.is_empty() {
         return Ok(None);
     }

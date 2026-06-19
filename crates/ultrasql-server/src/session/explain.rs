@@ -406,9 +406,14 @@ where
                     return format!("skipped {}: page-backed hnsw unavailable", index.name);
                 }
                 if has_filter {
+                    // Filtered top-k uses the ANN index to over-fetch candidates
+                    // (ef scaled by filter selectivity), then rechecks the
+                    // predicate exactly; a runtime exact-scan fallback covers the
+                    // case where too few candidates survive the filter.
+                    let stats = hnsw.page_stats();
                     return format!(
-                        "method=exact index={} fallback_used=true fallback_reason=filtered vector top-k requires exact recheck recall_mode=n/a",
-                        index.name
+                        "selected {} (page-backed hnsw); method=hnsw filter=exact-recheck candidates_scanned={} recall_mode=n/a fallback_used=runtime-dependent",
+                        index.name, stats.live_nodes
                     );
                 }
                 let stats = hnsw.page_stats();
@@ -425,9 +430,14 @@ where
                     return format!("skipped {}: page-backed ivfflat unavailable", index.name);
                 }
                 if has_filter {
+                    // Filtered top-k uses the ANN index to over-fetch candidates
+                    // (probes scaled by filter selectivity), then rechecks the
+                    // predicate exactly; a runtime exact-scan fallback covers the
+                    // case where too few candidates survive the filter.
+                    let stats = ivfflat.page_stats();
                     return format!(
-                        "method=exact index={} fallback_used=true fallback_reason=filtered vector top-k requires exact recheck recall_mode=n/a",
-                        index.name
+                        "selected {} (page-backed ivfflat); method=ivfflat filter=exact-recheck candidates_scanned={} recall_mode=n/a fallback_used=runtime-dependent",
+                        index.name, stats.live_entries
                     );
                 }
                 let stats = ivfflat.page_stats();
