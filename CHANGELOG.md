@@ -53,6 +53,13 @@ and must document the break here.
 
 ### Changed
 
+- Page-backed HNSW index build is now sub-quadratic: large indexes gather a new
+  node's neighbors by traversing the partially-built graph instead of scanning
+  every live node, with a single-page zero-copy vector view removing the
+  per-probe allocation. Small/medium indexes keep the exhaustive scan (no
+  regression). Measured 2.3×–3.7× faster at 10k–20k×128d; the SIFT1M-scale gap
+  stays open (see ROADMAP). Build stays deterministic and recall holds
+  (recall@10 ≥ 0.95 at ef ≤ 128).
 - README benchmark tables are restricted to SQL-surface measurements. Kernel
   microbenchmarks stay internal and are not published as DB-vs-DB claims.
 - Roadmap items now distinguish implemented runtime surfaces from certification

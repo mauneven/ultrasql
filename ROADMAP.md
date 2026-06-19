@@ -252,18 +252,29 @@ p50 ≈ 257 µs on 2k×16d via `benchmarks/vector_ann_hnsw.sh`):
   filtered-ANN p50 is sub-millisecond at 1M rows, recall 1.0; (b) IVFFlat-indexed
   vector columns still use the exact filter+sort path — exit condition: a
   probes-based IVFFlat over-fetch with a committed recall artifact.
-- HNSW index build scales O(N²) (PART 3): every inserted vector scans all live
-  nodes to pick neighbors, so build time grows quadratically — measured ~424 s
-  for 50k×128d on Apple M4 vs pgvector's ~5 s in the same SIFT comparison
-  (`benchmarks/vector_ann_sift.sh`), which makes SIFT1M-scale builds impractical.
-  Query recall and latency are already competitive (recall@10 0.986 at ef=64,
-  1.000 at ef=200; see `docs/vector-benchmarks.md`); the gap is build, not search.
-  Exit condition: graph-search-based candidate selection at insert (find the
-  `ef_construction` nearest via the partially-built graph instead of a full scan)
-  so a 1M×128d build completes in minutes with recall@10 ≥ 0.95 at ef ≤ 128, plus
-  a committed SIFT1M artifact from the server wire path. The same O(N²) cost is
-  paid again on crash recovery, which replays the inserts — `vector_soak.sh full`
-  measured ~40 s to recover a 20k-node graph; the same insert-time fix bounds it.
+- HNSW index build (PART 3): graph-search candidate selection at insert is DONE
+  and the build is now sub-quadratic — the page-backed insert gathers a new
+  node's neighbor pool by traversing the partially-built graph
+  (`collect_construction_candidates`, gated on a measured `live_nodes × dims`
+  work budget so small/medium indexes keep the faster exhaustive scan and never
+  regress), plus a zero-copy single-page vector view that drops the per-probe
+  `Vec` allocation from build and search. Measured (128d, m=16, Apple M4): 10k
+  18.7 s→8.1 s, 20k ~80 s→21.9 s, with no regression below the ~8k crossover; the
+  build is deterministic (WAL-replay reconstructs an identical graph) and recall
+  holds (recall@10 ≥ 0.95 at ef ≤ 128, unit-tested). Evidence:
+  `benchmarks/vector_hnsw_build_scaling.sh`,
+  `operator-reports/2026-06-hnsw-build-scaling.md`. Query recall/latency were
+  already competitive (recall@10 0.986 at ef=64, 1.000 at ef=200;
+  `docs/vector-benchmarks.md`). REMAINING (the SIFT1M gap is not closed): the
+  page-backed arena's `BTreeMap` block lookups are a dims-independent per-probe
+  constant factor the zero-copy view reduced but did not remove, so the build is
+  not yet pgvector-competitive at 1M. Exit condition: a densely-indexed
+  in-memory mirror of the graph (vectors + adjacency in flat, `node_id`-indexed
+  arrays) feeding both the build traversal and search so per-node access is O(1),
+  giving a 1M×128d build in minutes with recall@10 ≥ 0.95 at ef ≤ 128 and a
+  committed SIFT1M artifact from the server wire path. The same per-node access
+  cost is paid on crash recovery, which replays the inserts — `vector_soak.sh
+  full` measured ~40 s to recover a 20k-node graph; the same mirror bounds it.
 - Hierarchical HNSW layers (PART 3): the persistent graph is a single navigable
   layer. Recall holds through 50k with the diversity heuristic, but a multi-layer
   graph would lower the ef needed for a given recall at large N. Exit condition:

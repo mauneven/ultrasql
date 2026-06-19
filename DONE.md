@@ -3,6 +3,35 @@
 Completed/addressed work moved out of [ROADMAP.md](ROADMAP.md). Keep this file
 as a concise evidence ledger; roadmap stays for open gates only.
 
+## 2026-06-19 sub-quadratic page-backed HNSW build (graph-traversal construction)
+
+The page-backed (server) HNSW build is no longer O(N²). Graph-search candidate
+selection at insert — the PART 3 roadmap item — landed; the SIFT1M-scale gap
+stays open (constant-factor work, see ROADMAP).
+
+- **Graph-traversal candidate selection:** `collect_construction_candidates`
+  gathers a new node's neighbor pool by traversing the partially-built navigable
+  graph (greedy descent + best-first expansion bounded by `ef_construction`)
+  instead of scanning every live node. Gated on a measured work budget
+  (`live_nodes × dims > 1_000_000`, crossover ≈ 8k nodes at 128d) so small/medium
+  indexes keep the exhaustive scan and never regress.
+- **Zero-copy vector access:** `node_vector_view` reads a node's vector as a
+  borrowed `&[f32]` when it fits in one overflow page (≤ ~2k dims), dropping the
+  per-probe `Vec<f32>` allocation from both the build traversal and the
+  read-only search path.
+- **Determinism preserved:** the traversal is deterministic (BTreeMap iteration
+  + total-order tie-breaks), so WAL replay and snapshot-resumed replay
+  reconstruct an identical graph. New test
+  `page_backed_hnsw_traversal_build_is_deterministic_for_replay`.
+- **Recall preserved:** `page_backed_hnsw_graph_traversal_build_keeps_high_recall`
+  asserts recall@10 ≥ 0.95 at ef ≤ 128 over a fully traversal-built graph; the
+  41-test server vector recovery suite (`vector_type_round_trip`) stays green.
+- **Measured (Apple M4, 128d, m=16):** 10k 18.7 s→8.1 s (2.3×), 20k ~80 s→21.9 s
+  (~3.7×), 2k/5k unchanged. Evidence:
+  `benchmarks/vector_hnsw_build_scaling.sh`,
+  `operator-reports/2026-06-hnsw-build-scaling.md`. The in-memory `HnswIndex`
+  (benchmark-only) keeps its cache-friendly exhaustive-scan build.
+
 ## 2026-06-18 durable WAL retention: segment recycling + crash drills
 
 Landed on `main` (`b272ba8e`..`955e1c77`). Checkpoint-driven WAL segment
