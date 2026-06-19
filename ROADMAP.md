@@ -249,9 +249,16 @@ p50 ≈ 257 µs on 2k×16d via `benchmarks/vector_ann_hnsw.sh`):
   approximate HNSW + filtered ANN"): (a) selective metadata filters fall back to
   an exact O(N) scan because there is no persistent metadata index to pre-filter
   cheaply — exit condition: a metadata-index pre-filter path so selective
-  filtered-ANN p50 is sub-millisecond at 1M rows, recall 1.0; (b) IVFFlat-indexed
-  vector columns still use the exact filter+sort path — exit condition: a
-  probes-based IVFFlat over-fetch with a committed recall artifact.
+  filtered-ANN p50 is sub-millisecond at 1M rows, recall 1.0. (b) DONE: IVFFlat
+  now has a probes-based over-fetch (`search_with_probes`, the analog of HNSW's
+  `search_with_ef`) and IVFFlat-indexed `WHERE … ORDER BY <vector> LIMIT k`
+  routes through the ANN filtered path (probes scaled inversely with filter
+  selectivity, exact predicate recheck, exact fallback if too few survive)
+  instead of an exact scan. Committed recall artifact (50k×64d, lists=256):
+  recall@10 climbs 0.06→1.00 as probes go 1→256, reaching 1.0 at probes==lists.
+  Evidence: `crates/ultrasql-bench/src/bin/vector_recall_sweep.rs`,
+  `operator-reports/2026-06-ivfflat-filtered-ann.md`. (Same-host pgvector IVFFlat
+  comparison at scale remains release-host evidence.)
 - HNSW index build (PART 3): graph-search candidate selection at insert is DONE
   and the build is sub-quadratic. The page-backed insert gathers a new node's
   neighbor pool by traversing the partially-built graph

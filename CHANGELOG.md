@@ -51,6 +51,13 @@ and must document the break here.
 - Release workflow emits a source tarball for Homebrew and renders a
   source-built formula.
 
+- IVFFlat-indexed filtered vector queries (`WHERE … ORDER BY <vector> LIMIT k`)
+  now use a probes-based ANN over-fetch (probes scaled by filter selectivity,
+  exact predicate recheck) instead of falling back to an exact scan, and
+  `search_with_probes` exposes a per-query probes override (the IVFFlat analog of
+  HNSW `ef_search`). `EXPLAIN ANALYZE` now accurately reports the ANN index that
+  serves a filtered top-k. Committed recall artifact: recall@10 climbs to 1.0 as
+  probes reach the list count.
 - Page-backed HNSW is now hierarchical (multi-layer), the standard HNSW
   structure: per-node deterministic levels + per-layer neighbor chains (v2 page
   format; v1 snapshots load as base-only), greedy top-down descent, and a

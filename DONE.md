@@ -3,6 +3,31 @@
 Completed/addressed work moved out of [ROADMAP.md](ROADMAP.md). Keep this file
 as a concise evidence ledger; roadmap stays for open gates only.
 
+## 2026-06-19 IVFFlat probes-based filtered ANN + recall artifact
+
+IVFFlat-indexed filtered vector queries now use a probes-based ANN over-fetch
+instead of an exact scan, closing filtered-ANN item (b).
+
+- **Per-query probes** (`PageBackedIvfFlatIndex::search_with_probes`): override
+  the index default probes per query — the IVFFlat analog of HNSW
+  `search_with_ef`. Probing every list is exact.
+- **Filtered routing**: `WHERE <metadata> ORDER BY <vector> LIMIT k` on an
+  IVFFlat column routes through `try_hnsw_filtered_sorted`, scaling probes
+  inversely with estimated filter selectivity (capped at list count), exact
+  predicate recheck on the candidates, exact-scan fallback if too few survive.
+- **EXPLAIN accuracy**: the filtered-top-k vector-index note now reports the ANN
+  index that actually serves the query (`selected … filter=exact-recheck`)
+  instead of the stale `method=exact fallback_used=true` — which had been wrong
+  for HNSW filtered queries too.
+- **Recall artifact (50k×64d, lists=256, 200 queries):** recall@10 0.059→1.000
+  as probes 1→256, reaching 1.0 at probes==lists. Tool:
+  `crates/ultrasql-bench/src/bin/vector_recall_sweep.rs` (now covers both HNSW
+  ef and IVFFlat probes); report
+  `operator-reports/2026-06-ivfflat-filtered-ann.md`.
+- **Tests:** `ivfflat_filtered_ann_uses_index_and_returns_correct_top_k`
+  (correctness + EXPLAIN names the index); 42-test server vector suite + 10
+  storage IVFFlat unit tests green.
+
 ## 2026-06-19 hierarchical (multi-layer) HNSW
 
 The page-backed HNSW is now multi-layer, the standard hierarchical structure. At
