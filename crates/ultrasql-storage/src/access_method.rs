@@ -1739,9 +1739,25 @@ struct PageBackedHnswStorage {
 #[derive(Debug, Clone)]
 struct MirrorNode {
     vector: Vec<f32>,
-    neighbors: Vec<HnswNodeId>,
+    /// Per-layer adjacency, `levels[k]` = layer-`k` neighbors. `levels.len()` is
+    /// this node's level + 1 (every node has a base layer 0). Unified in memory
+    /// even though the durable page keeps layer 0 separate from upper layers.
+    levels: Vec<Vec<HnswNodeId>>,
     tid: TupleId,
     deleted: bool,
+}
+
+impl MirrorNode {
+    /// This node's top layer (0 = base only).
+    fn level(&self) -> usize {
+        self.levels.len().saturating_sub(1)
+    }
+
+    /// Layer-`level` neighbors, or an empty slice when the node is not in that
+    /// layer.
+    fn neighbors_at(&self, level: usize) -> &[HnswNodeId] {
+        self.levels.get(level).map_or(&[], Vec::as_slice)
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -2141,20 +2157,29 @@ impl PageBackedHnswIndex {
         stats
     }
 
-    /// Deterministic snapshot of every node's neighbor list, ordered by node id.
-    /// Used by tests to assert that two builds of the same insert sequence
-    /// produce an identical graph (the property WAL replay relies on).
+    /// Deterministic snapshot of every node's level and per-layer neighbor lists,
+    /// ordered by node id. Used by tests to assert that two builds of the same
+    /// insert sequence produce an identical graph (the property WAL replay relies
+    /// on). Reads the durable pages (not the mirror) so it asserts the on-disk
+    /// graph that recovery reconstructs.
     #[cfg(test)]
-    fn debug_neighbor_lists(&self) -> Vec<(HnswNodeId, Vec<HnswNodeId>)> {
+    fn debug_neighbor_lists(&self) -> Vec<(HnswNodeId, usize, Vec<Vec<HnswNodeId>>)> {
         let storage = self.storage.lock();
         let mut out = Vec::with_capacity(storage.node_to_block.len());
         for node_id in storage.node_to_block.keys() {
-            // Read the durable adjacency (not the mirror) so this asserts the
-            // on-disk graph, which is what WAL replay reconstructs.
-            let neighbors = storage
-                .neighbors_from_pages(*node_id)
-                .expect("read neighbor list");
-            out.push((*node_id, neighbors));
+            let level = storage
+                .node_page(*node_id)
+                .expect("node page")
+                .map_or(0, |node| node.level);
+            let mut levels = Vec::with_capacity(level + 1);
+            for lvl in 0..=level {
+                levels.push(
+                    storage
+                        .neighbors_from_pages_at_level(*node_id, lvl)
+                        .expect("read neighbor list"),
+                );
+            }
+            out.push((*node_id, level, levels));
         }
         out
     }
@@ -2381,45 +2406,17 @@ impl PageBackedHnswIndex {
             return Err(AccessMethodError::DuplicateKey);
         }
 
-        // Build a candidate pool, then select a diverse subset with the HNSW
-        // heuristic so the navigable layer stays searchable instead of
-        // collapsing into a poorly-connected k-NN graph. Pick the gathering
-        // strategy by estimated cost: while the live set is small an exhaustive
-        // scan is both exact and faster, but once `live_nodes × dims` exceeds
-        // `build_traversal_work_threshold` a graph traversal of the
-        // partially-built graph for the nearest `ef_construction`
-        // (`collect_construction_candidates`) wins, turning the O(N²) build into
-        // a sub-quadratic one. The traversal is deterministic, so WAL replay
-        // reconstructs an identical graph.
         let ef_construction = HNSW_DEFAULT_EF_CONSTRUCTION.max(self.m);
-        let scan_work = storage.meta.live_nodes.saturating_mul(self.dims);
-        let mut candidates: Vec<(HnswNodeId, f32, Vec<f32>)> =
-            if scan_work <= self.build_traversal_work_threshold {
-                storage
-                    .live_node_snapshot()?
-                    .into_iter()
-                    .map(|(node_id, _node_tid, node_vector)| {
-                        let distance = self.metric.distance(vector, &node_vector);
-                        (node_id, distance, node_vector)
-                    })
-                    .collect()
-            } else {
-                storage.collect_construction_candidates(vector, ef_construction)?
-            };
-        candidates.sort_by(|left, right| {
-            left.1
-                .total_cmp(&right.1)
-                .then_with(|| left.0.cmp(&right.0))
-        });
-        candidates.truncate(ef_construction);
-        let neighbor_ids = select_neighbors_heuristic(&candidates, self.m, self.metric);
 
+        // Assign id and a deterministic hierarchical level, then materialize the
+        // node (page + vector chain + mirror entry) before linking.
         let node_id = storage.meta.next_node_id;
         storage.meta.next_node_id = storage
             .meta
             .next_node_id
             .checked_add(1)
             .ok_or_else(|| AccessMethodError::Storage("hnsw node id overflow".to_owned()))?;
+        let node_level = hnsw_assign_level(node_id, self.m);
         let vector_head = storage.allocate_vector_chain(node_id, vector, self.payload_kind)?;
         let node_block = storage.allocate_block()?;
         let node_page = HnswNodePage {
@@ -2431,8 +2428,14 @@ impl PageBackedHnswIndex {
             vector_head,
             neighbor_count: 0,
             neighbor_head: None,
-            level: 0,
-            upper_levels: Vec::new(),
+            level: node_level,
+            upper_levels: vec![
+                HnswLevelNeighbors {
+                    head: None,
+                    count: 0,
+                };
+                node_level
+            ],
             deleted: false,
         };
         storage
@@ -2441,29 +2444,103 @@ impl PageBackedHnswIndex {
         storage.node_to_block.insert(node_id, node_block);
         storage.tid_to_node.insert(tid, node_id);
         storage.meta.live_nodes += 1;
-        if storage.meta.entry_node.is_none() {
-            storage.meta.entry_node = Some(node_id);
-        }
-        // Mirror the new node before linking; `write_neighbors` fills adjacency.
         storage.mirror_put(
             node_id,
             MirrorNode {
                 vector: vector.to_vec(),
-                neighbors: Vec::new(),
+                levels: vec![Vec::new(); node_level + 1],
                 tid,
                 deleted: false,
             },
         );
-        storage.write_neighbors(node_id, &neighbor_ids)?;
 
-        for neighbor_id in neighbor_ids {
-            let mut neighbor_list = storage.neighbors_for_node(neighbor_id)?;
-            if !neighbor_list.contains(&node_id) {
-                neighbor_list.push(node_id);
+        // First live node: it becomes the entry point with no neighbors.
+        let Some(entry) = storage
+            .meta
+            .entry_node
+            .filter(|id| storage.mirror_node(*id).is_some_and(|node| !node.deleted))
+        else {
+            storage.meta.entry_node = Some(node_id);
+            storage.sync_control_pages();
+            storage.stamp_all_pages(page_lsn);
+            return Ok(());
+        };
+        let entry_level = storage.mirror_level(entry);
+        let Some((entry_distance, _)) = storage.node_probe_distance(vector, entry)? else {
+            storage.meta.entry_node = Some(node_id);
+            storage.sync_control_pages();
+            storage.stamp_all_pages(page_lsn);
+            return Ok(());
+        };
+
+        // Greedy descent (ef=1) through the layers above this node's top level.
+        let mut ep = vec![(entry_distance, entry)];
+        for level in ((node_level + 1)..=entry_level).rev() {
+            let nearest = storage.search_layer(vector, &ep, 1, level)?;
+            if let Some(&best) = nearest.first() {
+                ep = vec![best];
             }
-            let trimmed =
-                storage.trim_neighbor_list(neighbor_id, neighbor_list, self.m, self.metric)?;
-            storage.write_neighbors(neighbor_id, &trimmed)?;
+        }
+
+        // Connect at each layer from min(node_level, entry_level) down to 0,
+        // selecting a diverse neighbor subset so the navigable graph stays
+        // searchable. The base layer keeps the small-graph exhaustive scan
+        // (exact + faster) below the work threshold; otherwise it traverses.
+        let top_connect = node_level.min(entry_level);
+        for level in (0..=top_connect).rev() {
+            let m_max = hnsw_level_max_neighbors(level, self.m);
+            let scan_work = storage.meta.live_nodes.saturating_mul(self.dims);
+            let mut candidates: Vec<(HnswNodeId, f32, Vec<f32>)> =
+                if level == 0 && scan_work <= self.build_traversal_work_threshold {
+                    storage
+                        .live_node_snapshot()?
+                        .into_iter()
+                        .filter(|(id, _, _)| *id != node_id)
+                        .map(|(id, _tid, node_vector)| {
+                            let distance = self.metric.distance(vector, &node_vector);
+                            (id, distance, node_vector)
+                        })
+                        .collect()
+                } else {
+                    storage
+                        .search_layer(vector, &ep, ef_construction, level)?
+                        .into_iter()
+                        .filter(|(_, id)| *id != node_id)
+                        .filter_map(|(distance, id)| {
+                            storage
+                                .mirror_node(id)
+                                .map(|node| (id, distance, node.vector.clone()))
+                        })
+                        .collect()
+                };
+            candidates.sort_by(|left, right| {
+                left.1
+                    .total_cmp(&right.1)
+                    .then_with(|| left.0.cmp(&right.0))
+            });
+            candidates.truncate(ef_construction);
+            // Entry points for the next lower layer = this layer's candidate set.
+            ep = candidates
+                .iter()
+                .map(|(id, dist, _)| (*dist, *id))
+                .collect();
+
+            let selected = select_neighbors_heuristic(&candidates, m_max, self.metric);
+            storage.write_neighbors_at_level(node_id, level, &selected)?;
+            for neighbor_id in selected {
+                let mut neighbor_list = storage.neighbors_at_level(neighbor_id, level);
+                if !neighbor_list.contains(&node_id) {
+                    neighbor_list.push(node_id);
+                }
+                let trimmed =
+                    storage.trim_neighbor_list(neighbor_id, neighbor_list, m_max, self.metric)?;
+                storage.write_neighbors_at_level(neighbor_id, level, &trimmed)?;
+            }
+        }
+
+        // A taller node than the current entry becomes the new entry point.
+        if node_level > entry_level {
+            storage.meta.entry_node = Some(node_id);
         }
         storage.sync_control_pages();
         storage.stamp_all_pages(page_lsn);
@@ -3168,13 +3245,21 @@ impl PageBackedHnswStorage {
         mirror.resize_with(len, || None);
         let node_ids: Vec<HnswNodeId> = self.node_to_block.keys().copied().collect();
         for node_id in node_ids {
-            let (tid, deleted, vector) = {
+            let (tid, deleted, vector, node_level) = {
                 let Some(node) = self.node_page(node_id)? else {
                     continue;
                 };
-                (node.tid, node.deleted, self.vector_for_node(node)?)
+                (
+                    node.tid,
+                    node.deleted,
+                    self.vector_for_node(node)?,
+                    node.level,
+                )
             };
-            let neighbors = self.neighbors_from_pages(node_id)?;
+            let mut levels = Vec::with_capacity(node_level + 1);
+            for level in 0..=node_level {
+                levels.push(self.neighbors_from_pages_at_level(node_id, level)?);
+            }
             let idx = usize::try_from(node_id).map_err(|_| {
                 AccessMethodError::Storage("hnsw node id does not fit usize".to_owned())
             })?;
@@ -3183,7 +3268,7 @@ impl PageBackedHnswStorage {
             }
             mirror[idx] = Some(MirrorNode {
                 vector,
-                neighbors,
+                levels,
                 tid,
                 deleted,
             });
@@ -3221,15 +3306,34 @@ impl PageBackedHnswStorage {
         }
     }
 
-    /// Replace a node's mirrored adjacency list, keeping it in lockstep with the
-    /// durable neighbor chain written by `write_neighbors`.
-    fn mirror_set_neighbors(&mut self, node_id: HnswNodeId, neighbors: &[HnswNodeId]) {
+    /// Replace a node's mirrored layer-`level` adjacency, keeping it in lockstep
+    /// with the durable neighbor chain written by `write_neighbors_at_level`.
+    fn mirror_set_neighbors_at_level(
+        &mut self,
+        node_id: HnswNodeId,
+        level: usize,
+        neighbors: &[HnswNodeId],
+    ) {
         if let Ok(idx) = usize::try_from(node_id)
             && let Some(Some(node)) = self.mirror.get_mut(idx)
+            && let Some(slot) = node.levels.get_mut(level)
         {
-            node.neighbors.clear();
-            node.neighbors.extend_from_slice(neighbors);
+            slot.clear();
+            slot.extend_from_slice(neighbors);
         }
+    }
+
+    /// Layer-`level` neighbors of a node from the mirror (O(1)). Empty when the
+    /// node is absent or not present in that layer.
+    fn mirror_neighbors_at_level(&self, node_id: HnswNodeId, level: usize) -> Vec<HnswNodeId> {
+        self.mirror_node(node_id)
+            .map(|node| node.neighbors_at(level).to_vec())
+            .unwrap_or_default()
+    }
+
+    /// A node's top layer from the mirror (0 if absent).
+    fn mirror_level(&self, node_id: HnswNodeId) -> usize {
+        self.mirror_node(node_id).map_or(0, MirrorNode::level)
     }
 
     /// Mark a node's mirror entry tombstoned, matching the durable page flag.
@@ -3248,8 +3352,7 @@ impl PageBackedHnswStorage {
     fn assert_mirror_consistent(&self) {
         let mut durable = 0usize;
         for node_id in self.node_to_block.keys().copied() {
-            let page_neighbors = self.neighbors_from_pages(node_id).expect("page neighbors");
-            let (page_tid, page_deleted, page_vector) = {
+            let (page_tid, page_deleted, page_vector, page_level) = {
                 let node = self
                     .node_page(node_id)
                     .expect("node page")
@@ -3258,6 +3361,7 @@ impl PageBackedHnswStorage {
                     node.tid,
                     node.deleted,
                     self.vector_for_node(node).expect("vec"),
+                    node.level,
                 )
             };
             let mirror = self
@@ -3268,9 +3372,20 @@ impl PageBackedHnswStorage {
                 "mirror vector mismatch {node_id}"
             );
             assert_eq!(
-                mirror.neighbors, page_neighbors,
-                "mirror neighbors mismatch {node_id}"
+                mirror.level(),
+                page_level,
+                "mirror level mismatch {node_id}"
             );
+            for level in 0..=page_level {
+                let page_neighbors = self
+                    .neighbors_from_pages_at_level(node_id, level)
+                    .expect("page neighbors");
+                assert_eq!(
+                    mirror.neighbors_at(level),
+                    page_neighbors.as_slice(),
+                    "mirror neighbors mismatch node {node_id} level {level}"
+                );
+            }
             assert_eq!(mirror.tid, page_tid, "mirror tid mismatch {node_id}");
             assert_eq!(
                 mirror.deleted, page_deleted,
@@ -3359,9 +3474,20 @@ impl PageBackedHnswStorage {
                         "hnsw node id exceeds metadata".to_owned(),
                     ));
                 }
-                if node.neighbor_count > meta.m {
+                // Base layer keeps up to 2*m neighbors (M_max0); upper layers m.
+                if node.neighbor_count > meta.m.saturating_mul(2) {
                     return Err(AccessMethodError::Storage(
-                        "hnsw node neighbor count exceeds metadata".to_owned(),
+                        "hnsw node base-layer neighbor count exceeds metadata".to_owned(),
+                    ));
+                }
+                if node.level > HNSW_MAX_LEVEL || node.upper_levels.len() != node.level {
+                    return Err(AccessMethodError::Storage(
+                        "hnsw node level/upper-layer count inconsistent".to_owned(),
+                    ));
+                }
+                if node.upper_levels.iter().any(|upper| upper.count > meta.m) {
+                    return Err(AccessMethodError::Storage(
+                        "hnsw node upper-layer neighbor count exceeds metadata".to_owned(),
                     ));
                 }
                 if tid_to_node.insert(node.tid, node.node_id).is_some() {
@@ -3393,9 +3519,11 @@ impl PageBackedHnswStorage {
         };
         storage.meta.live_nodes = live_nodes;
         storage.meta.tombstones = tombstones;
-        storage.meta.entry_node = storage.first_live_node_id()?;
-        storage.sync_control_pages();
+        // Build the mirror first, then pick the entry point by level (the entry
+        // selection reads node levels from the mirror).
         storage.rebuild_mirror()?;
+        storage.meta.entry_node = storage.highest_level_live_node()?;
+        storage.sync_control_pages();
         Ok(storage)
     }
 
@@ -3584,15 +3712,24 @@ impl PageBackedHnswStorage {
     /// — the common case, since `HNSW_VECTOR_VALUES_PER_OVERFLOW_PAGE` is ~2k so
     /// Adjacency from the durable neighbor chain. Used only to (re)build the
     /// mirror; the hot read path is `neighbors_for_node`, which reads the mirror.
-    fn neighbors_from_pages(
+    fn neighbors_from_pages_at_level(
         &self,
         node_id: HnswNodeId,
+        level: usize,
     ) -> Result<Vec<HnswNodeId>, AccessMethodError> {
         let Some(node) = self.node_page(node_id)? else {
             return Ok(Vec::new());
         };
-        let mut neighbors = Vec::with_capacity(node.neighbor_count);
-        let mut current = node.neighbor_head;
+        let (head, count) = if level == 0 {
+            (node.neighbor_head, node.neighbor_count)
+        } else {
+            match node.upper_levels.get(level - 1) {
+                Some(upper) => (upper.head, upper.count),
+                None => return Ok(Vec::new()),
+            }
+        };
+        let mut neighbors = Vec::with_capacity(count);
+        let mut current = head;
         while let Some(block) = current {
             let Some(HnswPersistentPage::Overflow(page)) = self.pages.get(&block) else {
                 return Err(AccessMethodError::Storage(
@@ -3609,21 +3746,15 @@ impl PageBackedHnswStorage {
             }
             current = page.next;
         }
-        neighbors.truncate(node.neighbor_count);
+        neighbors.truncate(count);
         Ok(neighbors)
     }
 
-    /// A node's adjacency list, read from the in-memory mirror (O(1)). The
-    /// mirror is kept in lockstep with the durable neighbor chain, so this is
-    /// identical to `neighbors_from_pages` but without the chain walk.
-    fn neighbors_for_node(
-        &self,
-        node_id: HnswNodeId,
-    ) -> Result<Vec<HnswNodeId>, AccessMethodError> {
-        Ok(self
-            .mirror_node(node_id)
-            .map(|node| node.neighbors.clone())
-            .unwrap_or_default())
+    /// Layer-`level` adjacency of a node, read from the in-memory mirror (O(1)).
+    /// The mirror is kept in lockstep with the durable chains, so this matches
+    /// `neighbors_from_pages_at_level` without the chain walk.
+    fn neighbors_at_level(&self, node_id: HnswNodeId, level: usize) -> Vec<HnswNodeId> {
+        self.mirror_neighbors_at_level(node_id, level)
     }
 
     /// Distance from `probe` to a live node, or `None` when the node is missing
@@ -3664,12 +3795,71 @@ impl PageBackedHnswStorage {
         Ok(hits)
     }
 
-    /// Approximate nearest-neighbor search over the persisted navigable graph:
-    /// greedy descent to a local minimum, then best-first expansion bounded by
-    /// `ef_search`. This is the same traversal the in-process runtime index
-    /// uses, but reading nodes and neighbor lists from the page-backed arena,
-    /// so the persistent server path gets real ANN speedup instead of an O(N)
-    /// exhaustive scan. The search is read-only.
+    /// Canonical HNSW SEARCH-LAYER: best-first expansion of one layer from the
+    /// given entry points, keeping the `ef` nearest results. Used everywhere —
+    /// `ef = 1` for the greedy descent through upper layers, `ef = ef_construction`
+    /// to gather build candidates, and `ef = ef_search` for the base-layer query.
+    /// Reads vectors and adjacency from the mirror (O(1)), so the cost is bounded
+    /// by the nodes the beam touches, not the live-set size. Deterministic via
+    /// the total order on `DistNode`. Returns results sorted ascending by
+    /// distance.
+    fn search_layer(
+        &self,
+        query: &[f32],
+        entry_points: &[(f32, HnswNodeId)],
+        ef: usize,
+        level: usize,
+    ) -> Result<Vec<(f32, HnswNodeId)>, AccessMethodError> {
+        let ef = ef.max(1);
+        let mut visited: std::collections::BTreeSet<HnswNodeId> =
+            entry_points.iter().map(|(_, id)| *id).collect();
+        // candidates: min-heap on distance (expand the nearest first).
+        let mut candidates: std::collections::BinaryHeap<std::cmp::Reverse<DistNode>> =
+            std::collections::BinaryHeap::new();
+        // result: max-heap on distance (peek = current worst, capped at `ef`).
+        let mut result: std::collections::BinaryHeap<DistNode> =
+            std::collections::BinaryHeap::new();
+        for &(dist, id) in entry_points {
+            candidates.push(std::cmp::Reverse(DistNode { dist, id }));
+            result.push(DistNode { dist, id });
+        }
+        while result.len() > ef {
+            result.pop();
+        }
+        while let Some(std::cmp::Reverse(nearest)) = candidates.pop() {
+            let worst = result.peek().map_or(f32::INFINITY, |node| node.dist);
+            if result.len() >= ef && nearest.dist > worst {
+                break;
+            }
+            for neighbor in self.mirror_neighbors_at_level(nearest.id, level) {
+                if !visited.insert(neighbor) {
+                    continue;
+                }
+                let Some((dist, _)) = self.node_probe_distance(query, neighbor)? else {
+                    continue;
+                };
+                let worst = result.peek().map_or(f32::INFINITY, |node| node.dist);
+                if result.len() < ef || dist < worst {
+                    candidates.push(std::cmp::Reverse(DistNode { dist, id: neighbor }));
+                    result.push(DistNode { dist, id: neighbor });
+                    if result.len() > ef {
+                        result.pop();
+                    }
+                }
+            }
+        }
+        Ok(result
+            .into_sorted_vec()
+            .into_iter()
+            .map(|node| (node.dist, node.id))
+            .collect())
+    }
+
+    /// Multi-layer approximate nearest-neighbor search: greedy `ef=1` descent
+    /// from the top-layer entry point down to layer 1, then an `ef_search` beam
+    /// at the base layer. A single-layer graph (every node level 0, e.g. one
+    /// loaded from a v1 snapshot) simply skips the descent, so behavior is
+    /// unchanged there. Read-only.
     fn graph_search(
         &self,
         probe: &[f32],
@@ -3677,167 +3867,52 @@ impl PageBackedHnswStorage {
         ef_search: usize,
     ) -> Result<Vec<HnswSearchResult>, AccessMethodError> {
         let entry = match self.meta.entry_node {
-            Some(id) if self.node_page(id)?.is_some_and(|node| !node.deleted) => Some(id),
-            _ => self.first_live_node_id()?,
+            Some(id) if self.mirror_node(id).is_some_and(|node| !node.deleted) => Some(id),
+            _ => self.highest_level_live_node()?,
         };
-        let Some(mut current) = entry else {
+        let Some(entry) = entry else {
             return Ok(Vec::new());
         };
-        let Some((mut current_distance, _)) = self.node_probe_distance(probe, current)? else {
+        let Some((entry_distance, _)) = self.node_probe_distance(probe, entry)? else {
             return Ok(Vec::new());
         };
-
-        // Greedy descent: hop to the closer neighbor until none improves.
-        let mut improved = true;
-        while improved {
-            improved = false;
-            for neighbor in self.neighbors_for_node(current)? {
-                if let Some((distance, _)) = self.node_probe_distance(probe, neighbor)? {
-                    if distance < current_distance {
-                        current = neighbor;
-                        current_distance = distance;
-                        improved = true;
-                        break;
-                    }
-                }
+        let mut ep = vec![(entry_distance, entry)];
+        for level in (1..=self.mirror_level(entry)).rev() {
+            let nearest = self.search_layer(probe, &ep, 1, level)?;
+            if let Some(&best) = nearest.first() {
+                ep = vec![best];
             }
         }
-
-        // Best-first expansion bounded by ef_search.
-        let mut visited: std::collections::BTreeSet<HnswNodeId> = std::collections::BTreeSet::new();
-        visited.insert(current);
-        let mut frontier: Vec<(f32, HnswNodeId)> = vec![(current_distance, current)];
-        let mut explored: Vec<(f32, TupleId)> =
-            Vec::with_capacity(ef_search.min(self.meta.live_nodes));
-        while !frontier.is_empty() && explored.len() < ef_search {
-            let best_pos = frontier
-                .iter()
-                .enumerate()
-                .min_by(|left, right| left.1.0.total_cmp(&right.1.0))
-                .map_or(0, |(idx, _)| idx);
-            let (_, node_id) = frontier.swap_remove(best_pos);
-            if let Some((distance, tid)) = self.node_probe_distance(probe, node_id)? {
-                explored.push((distance, tid));
-            }
-            for neighbor in self.neighbors_for_node(node_id)? {
-                if !visited.insert(neighbor) {
-                    continue;
-                }
-                if let Some((distance, _)) = self.node_probe_distance(probe, neighbor)? {
-                    frontier.push((distance, neighbor));
-                }
-            }
-        }
-
-        let mut hits: Vec<HnswSearchResult> = explored
+        let found = self.search_layer(probe, &ep, ef_search, 0)?;
+        let mut hits: Vec<HnswSearchResult> = found
             .into_iter()
-            .map(|(distance, tid)| HnswSearchResult { tid, distance })
+            .filter_map(|(distance, node_id)| {
+                self.mirror_node(node_id)
+                    .filter(|node| !node.deleted)
+                    .map(|node| HnswSearchResult {
+                        tid: node.tid,
+                        distance,
+                    })
+            })
             .collect();
         hits.sort_by(compare_hnsw_hits);
         hits.truncate(k);
         Ok(hits)
     }
 
-    /// Gather up to `ef_construction` build-time candidates for a new vector by
-    /// traversing the partially-built navigable graph — greedy descent to a
-    /// local minimum, then best-first expansion bounded by `ef_construction`
-    /// popped nodes — instead of an exhaustive scan of every live node. This is
-    /// the standard HNSW construction search: it caps per-insert work at the
-    /// nodes the traversal touches rather than the whole live set, turning an
-    /// O(N²) build into ~O(N · ef_construction). The traversal is deterministic
-    /// given the graph state (BTreeMap node iteration plus total-order
-    /// distance/id tie-breaks), so WAL replay and snapshot-resumed replay
-    /// reconstruct an identical graph.
-    ///
-    /// Returns `(node_id, distance_to_query, vector)` for the nearest explored
-    /// nodes so the caller can run the diversity heuristic over the pool.
-    fn collect_construction_candidates(
-        &self,
-        query: &[f32],
-        ef_construction: usize,
-    ) -> Result<Vec<(HnswNodeId, f32, Vec<f32>)>, AccessMethodError> {
-        let entry = match self.meta.entry_node {
-            Some(id) if self.node_page(id)?.is_some_and(|node| !node.deleted) => Some(id),
-            _ => self.first_live_node_id()?,
-        };
-        let Some(mut current) = entry else {
-            return Ok(Vec::new());
-        };
-        let Some(mut current_distance) = self
-            .node_probe_distance(query, current)?
-            .map(|(distance, _)| distance)
-        else {
-            return Ok(Vec::new());
-        };
-
-        // Greedy descent: hop to the closer neighbor until none improves.
-        let mut improved = true;
-        while improved {
-            improved = false;
-            for neighbor in self.neighbors_for_node(current)? {
-                if let Some((distance, _)) = self.node_probe_distance(query, neighbor)? {
-                    if distance < current_distance {
-                        current = neighbor;
-                        current_distance = distance;
-                        improved = true;
-                        break;
-                    }
-                }
-            }
-        }
-
-        // Best-first expansion bounded by `ef_construction` popped nodes.
-        let mut visited: std::collections::BTreeSet<HnswNodeId> = std::collections::BTreeSet::new();
-        visited.insert(current);
-        let mut frontier: Vec<(f32, HnswNodeId)> = vec![(current_distance, current)];
-        let mut explored: Vec<(HnswNodeId, f32)> =
-            Vec::with_capacity(ef_construction.min(self.meta.live_nodes));
-        while !frontier.is_empty() && explored.len() < ef_construction {
-            let best_pos = frontier
-                .iter()
-                .enumerate()
-                .min_by(|left, right| {
-                    left.1
-                        .0
-                        .total_cmp(&right.1.0)
-                        .then_with(|| left.1.1.cmp(&right.1.1))
-                })
-                .map_or(0, |(idx, _)| idx);
-            let (distance, node_id) = frontier.swap_remove(best_pos);
-            explored.push((node_id, distance));
-            for neighbor in self.neighbors_for_node(node_id)? {
-                if !visited.insert(neighbor) {
-                    continue;
-                }
-                if let Some((distance, _)) = self.node_probe_distance(query, neighbor)? {
-                    frontier.push((distance, neighbor));
-                }
-            }
-        }
-
-        // Keep the `ef_construction` nearest explored nodes and attach their
-        // vectors so the diversity heuristic can run over the pool.
-        explored.sort_by(|left, right| {
-            left.1
-                .total_cmp(&right.1)
-                .then_with(|| left.0.cmp(&right.0))
-        });
-        explored.truncate(ef_construction);
-        let mut candidates = Vec::with_capacity(explored.len());
-        for (node_id, distance) in explored {
-            if let Some(node) = self.mirror_node(node_id) {
-                candidates.push((node_id, distance, node.vector.clone()));
-            }
-        }
-        Ok(candidates)
-    }
-
-    fn write_neighbors(
+    fn write_neighbors_at_level(
         &mut self,
         node_id: HnswNodeId,
+        level: usize,
         neighbors: &[HnswNodeId],
     ) -> Result<(), AccessMethodError> {
-        let old_head = self.node_page(node_id)?.and_then(|node| node.neighbor_head);
+        let old_head = if level == 0 {
+            self.node_page(node_id)?.and_then(|node| node.neighbor_head)
+        } else {
+            self.node_page(node_id)?
+                .and_then(|node| node.upper_levels.get(level - 1))
+                .and_then(|upper| upper.head)
+        };
         self.release_overflow_chain(old_head)?;
         let new_head = self.allocate_neighbor_chain(node_id, neighbors)?;
         let Some(node) = self.node_page_mut(node_id)? else {
@@ -3845,9 +3920,19 @@ impl PageBackedHnswStorage {
                 "hnsw write neighbors missing node".to_owned(),
             ));
         };
-        node.neighbor_head = new_head;
-        node.neighbor_count = neighbors.len();
-        self.mirror_set_neighbors(node_id, neighbors);
+        if level == 0 {
+            node.neighbor_head = new_head;
+            node.neighbor_count = neighbors.len();
+        } else {
+            let Some(upper) = node.upper_levels.get_mut(level - 1) else {
+                return Err(AccessMethodError::Storage(
+                    "hnsw write neighbors above node level".to_owned(),
+                ));
+            };
+            upper.head = new_head;
+            upper.count = neighbors.len();
+        }
+        self.mirror_set_neighbors_at_level(node_id, level, neighbors);
         Ok(())
     }
 
@@ -3922,7 +4007,7 @@ impl PageBackedHnswStorage {
         self.meta.live_nodes = self.meta.live_nodes.saturating_sub(1);
         self.meta.tombstones += 1;
         if self.meta.entry_node == Some(node_id) {
-            self.meta.entry_node = self.first_live_node_id()?;
+            self.meta.entry_node = self.highest_level_live_node()?;
         }
         self.sync_meta_page();
         self.stamp_all_pages(page_lsn);
@@ -3950,6 +4035,8 @@ impl PageBackedHnswStorage {
             return Ok(0);
         }
 
+        // Re-link every live node at every layer it participates in, dropping
+        // edges to vacuumed nodes and re-applying the diversity heuristic.
         let live_nodes: Vec<HnswNodeId> = self
             .node_to_block
             .keys()
@@ -3957,13 +4044,16 @@ impl PageBackedHnswStorage {
             .filter(|node_id| !deleted_nodes.contains(node_id))
             .collect();
         for node_id in live_nodes {
-            let neighbors = self
-                .neighbors_for_node(node_id)?
-                .into_iter()
-                .filter(|neighbor| !deleted_nodes.contains(neighbor))
-                .collect::<Vec<_>>();
-            let trimmed = self.trim_neighbor_list(node_id, neighbors, max_neighbors, metric)?;
-            self.write_neighbors(node_id, &trimmed)?;
+            for level in 0..=self.mirror_level(node_id) {
+                let neighbors = self
+                    .neighbors_at_level(node_id, level)
+                    .into_iter()
+                    .filter(|neighbor| !deleted_nodes.contains(neighbor))
+                    .collect::<Vec<_>>();
+                let m_max = hnsw_level_max_neighbors(level, max_neighbors);
+                let trimmed = self.trim_neighbor_list(node_id, neighbors, m_max, metric)?;
+                self.write_neighbors_at_level(node_id, level, &trimmed)?;
+            }
         }
 
         for node_id in &deleted_nodes {
@@ -3976,6 +4066,9 @@ impl PageBackedHnswStorage {
             self.tid_to_node.remove(&node.tid);
             self.release_overflow_chain(Some(node.vector_head))?;
             self.release_overflow_chain(node.neighbor_head)?;
+            for upper in &node.upper_levels {
+                self.release_overflow_chain(upper.head)?;
+            }
             self.free_page(block)?;
             self.mirror_remove(*node_id);
         }
@@ -3990,19 +4083,32 @@ impl PageBackedHnswStorage {
                     .is_some_and(|node| !node.deleted)
             })
             .count();
-        self.meta.entry_node = self.first_live_node_id()?;
+        self.meta.entry_node = self.highest_level_live_node()?;
         self.sync_control_pages();
         self.stamp_all_pages(page_lsn);
         Ok(deleted_nodes.len())
     }
 
-    fn first_live_node_id(&self) -> Result<Option<HnswNodeId>, AccessMethodError> {
-        for node_id in self.node_to_block.keys() {
-            if self.node_page(*node_id)?.is_some_and(|node| !node.deleted) {
-                return Ok(Some(*node_id));
+    /// The live node with the highest hierarchical level — the HNSW entry point.
+    /// Ties break to the lowest node id (mirror iterates ids ascending), so the
+    /// entry is deterministic and WAL replay reconstructs the same one.
+    fn highest_level_live_node(&self) -> Result<Option<HnswNodeId>, AccessMethodError> {
+        let mut best: Option<(usize, HnswNodeId)> = None;
+        for (idx, slot) in self.mirror.iter().enumerate() {
+            let Some(node) = slot else {
+                continue;
+            };
+            if node.deleted {
+                continue;
+            }
+            let id = HnswNodeId::try_from(idx).map_err(|_| {
+                AccessMethodError::Storage("hnsw mirror index does not fit node id".to_owned())
+            })?;
+            if best.is_none_or(|(best_level, _)| node.level() > best_level) {
+                best = Some((node.level(), id));
             }
         }
-        Ok(None)
+        Ok(best.map(|(_, id)| id))
     }
 
     fn release_overflow_chain(
@@ -4063,6 +4169,14 @@ impl PageBackedHnswStorage {
 /// while keeping graph quality high. Larger trades build time for recall.
 const HNSW_DEFAULT_EF_CONSTRUCTION: usize = 200;
 
+/// Hard cap on a node's hierarchical level. `P(level >= 1) = 1/max(m, 2)`
+/// (see `hnsw_assign_level`), so for the usual `m` (8..=64) the natural maximum
+/// stays well under this cap and it is just headroom that bounds the per-node
+/// upper-layer vector. For a pathologically small `m` (1 or 2) the decay is only
+/// `p = 1/2`, the cap is genuinely reached, and the top layer flattens — those
+/// `m` values give a poor hierarchy regardless and are not a realistic config.
+const HNSW_MAX_LEVEL: usize = 16;
+
 /// Build-time work budget — in vector-element comparisons (`live_nodes × dims`)
 /// — above which gathering a new node's neighbor candidates by traversing the
 /// partially-built graph beats an exhaustive scan of every live node.
@@ -4076,6 +4190,76 @@ const HNSW_DEFAULT_EF_CONSTRUCTION: usize = 200;
 /// live nodes at 128 dims (≈ this value), where the exhaustive build first
 /// exceeds the traversal build. Below it, full-scan candidate selection is kept.
 const HNSW_BUILD_TRAVERSAL_WORK_THRESHOLD: usize = 1_000_000;
+
+/// Deterministically assign a node's hierarchical level from its id.
+///
+/// Standard HNSW draws the level from a geometric distribution
+/// `floor(-ln(U) / ln(m))`. Drawing it from a hash of the (monotonic) node id
+/// instead of an RNG keeps it reproducible: WAL replay and snapshot-resumed
+/// replay recompute the identical level for every node, so the reconstructed
+/// multi-layer graph is byte-identical to the original. The level is also
+/// persisted, so loaded nodes never need recomputation — only fresh inserts do,
+/// under the same binary.
+fn hnsw_assign_level(node_id: HnswNodeId, m: usize) -> usize {
+    // splitmix64: a good integer hash so consecutive ids get well-spread levels.
+    let mut z = node_id.wrapping_add(0x9E37_79B9_7F4A_7C15);
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    z ^= z >> 31;
+    // Uniform in (0, 1): top 53 bits as a mantissa, shifted off zero.
+    #[expect(clippy::cast_precision_loss, reason = "53-bit mantissa fits f64")]
+    let mantissa = (z >> 11) as f64;
+    let unit = (mantissa + 1.0) / 9_007_199_254_740_993.0;
+    let scale = 1.0 / (m.max(2) as f64).ln();
+    let level = (-(unit.ln()) * scale).floor();
+    if level.is_finite() && level >= 0.0 {
+        #[expect(
+            clippy::cast_possible_truncation,
+            clippy::cast_sign_loss,
+            reason = "bounded by HNSW_MAX_LEVEL"
+        )]
+        let level = level as usize;
+        level.min(HNSW_MAX_LEVEL)
+    } else {
+        0
+    }
+}
+
+/// Per-layer neighbor cap: the base layer keeps `2*m` for connectivity, upper
+/// layers keep `m`, matching the canonical HNSW `M_max0` / `M_max`.
+fn hnsw_level_max_neighbors(level: usize, m: usize) -> usize {
+    if level == 0 {
+        m.saturating_mul(2).max(1)
+    } else {
+        m.max(1)
+    }
+}
+
+/// A `(distance, node_id)` heap element with a total order — distance via
+/// `total_cmp`, then `node_id` — so no two distinct nodes compare equal and the
+/// binary-heap pop order is fully deterministic (required for WAL-replay graph
+/// reproducibility).
+#[derive(Clone, Copy, PartialEq)]
+struct DistNode {
+    dist: f32,
+    id: HnswNodeId,
+}
+
+impl Eq for DistNode {}
+
+impl Ord for DistNode {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.dist
+            .total_cmp(&other.dist)
+            .then_with(|| self.id.cmp(&other.id))
+    }
+}
+
+impl PartialOrd for DistNode {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
 
 /// HNSW select-neighbors heuristic (Malkov & Yashunin 2018, Algorithm 4).
 ///
@@ -6854,6 +7038,74 @@ mod tests {
         assert_eq!(got.node_id, 12);
         assert_eq!(got.neighbor_count, 2);
         assert_eq!(got.neighbor_head, Some(BlockNumber::new(6)));
+    }
+
+    #[test]
+    fn page_backed_hnsw_build_is_multi_layer_and_recalls_well() {
+        // The hierarchical build must actually create upper layers (m=16 gives
+        // ~1/16 of nodes a level >= 1) and the layered navigation must answer
+        // queries with high recall.
+        const DIMS: usize = 16;
+        const N: u16 = 3000;
+        let dims_u32 = u32::try_from(DIMS).expect("dims fit u32");
+        let am = PageBackedHnswIndex::new(RelationId::new(8830), dims_u32, HnswMetric::L2, 16, 64)
+            .expect("page-backed hnsw config");
+        let mut rng = 0xa5a5_5a5a_1234_9e37_u64;
+        let mut next_unit = || {
+            rng = rng
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            let bits = u16::try_from((rng >> 48) & 0xFFFF).expect("16 bits fit u16");
+            f32::from(bits) / f32::from(u16::MAX)
+        };
+        let mut vectors: Vec<(TupleId, Vec<f32>)> = Vec::new();
+        for i in 0..N {
+            let v: Vec<f32> = (0..DIMS).map(|_| next_unit()).collect();
+            am.insert_vector(&v, tid(1, i)).expect("insert");
+            vectors.push((tid(1, i), v));
+        }
+
+        // The graph must be genuinely hierarchical.
+        let levels: Vec<usize> = am
+            .debug_neighbor_lists()
+            .iter()
+            .map(|(_, level, _)| *level)
+            .collect();
+        let max_level = levels.iter().copied().max().unwrap_or(0);
+        let upper = levels.iter().filter(|level| **level >= 1).count();
+        assert!(
+            max_level >= 1,
+            "hierarchical build should produce upper layers, got max level {max_level}"
+        );
+        assert!(
+            upper >= 1,
+            "expected some nodes promoted above the base layer, got {upper}"
+        );
+
+        let k = 10;
+        let mut recall_sum = 0.0_f64;
+        let trials = 30;
+        for _ in 0..trials {
+            let probe: Vec<f32> = (0..DIMS).map(|_| next_unit()).collect();
+            let mut exact: Vec<(f32, TupleId)> = vectors
+                .iter()
+                .map(|(t, v)| (HnswMetric::L2.distance(&probe, v), *t))
+                .collect();
+            exact.sort_by(|a, b| a.0.total_cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+            let want: std::collections::BTreeSet<TupleId> =
+                exact.iter().take(k).map(|(_, t)| *t).collect();
+            let got: std::collections::BTreeSet<TupleId> = am
+                .search_with_ef(&probe, k, 64)
+                .expect("graph search")
+                .into_iter()
+                .map(|hit| hit.tid)
+                .collect();
+            let overlap = want.iter().filter(|t| got.contains(t)).count();
+            recall_sum += f64::from(u16::try_from(overlap).expect("overlap fits u16"))
+                / f64::from(u16::try_from(k).expect("k fits u16"));
+        }
+        let mean = recall_sum / f64::from(trials);
+        assert!(mean >= 0.9, "multi-layer recall@{k} too low: {mean}");
     }
 
     #[test]
