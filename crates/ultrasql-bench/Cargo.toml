@@ -43,6 +43,10 @@ name = "ultrasql-bench"
 path = "src/main.rs"
 
 [[bin]]
+name = "hnsw_recall_sweep"
+path = "src/bin/hnsw_recall_sweep.rs"
+
+[[bin]]
 name = "cross_compare"
 path = "src/bin/cross_compare.rs"
 
