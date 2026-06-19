@@ -204,6 +204,27 @@ where
                     return Err(ServerError::AuthFailed);
                 }
             }
+            crate::AuthConfig::Hba(hba) => {
+                // PostgreSQL defaults the target database to the role name.
+                let database = params
+                    .iter()
+                    .find(|(k, _)| k == "database")
+                    .map(|(_, v)| v.as_str())
+                    .unwrap_or(self.auth_user.as_str())
+                    .to_owned();
+                if !self.authenticate_hba(hba, &database).await? {
+                    let _ = self
+                        .send(&BackendMessage::ErrorResponse {
+                            fields: vec![
+                                (b'S', "FATAL".to_string()),
+                                (b'C', "28P01".to_string()),
+                                (b'M', "authentication failed".to_string()),
+                            ],
+                        })
+                        .await;
+                    return Err(ServerError::AuthFailed);
+                }
+            }
         }
         // Reserve the `ultrasql_` role namespace for the system (mirrors
         // PostgreSQL's `pg_` reservation). A login under this prefix that is
@@ -413,5 +434,66 @@ where
         self.send(&BackendMessage::AuthenticationSASLFinal { data: server_final })
             .await?;
         Ok(true)
+    }
+
+    /// Resolve the authentication outcome for this connection from the `pg_hba`
+    /// rules.
+    ///
+    /// Matches `(connection kind, database, role, client IP)` against the rules
+    /// and applies the first match's method. Returns `Ok(true)` to admit,
+    /// `Ok(false)` to deny (caller emits the error), or `Err` on IO. `trust`
+    /// admits unconditionally; `reject` and no-matching-rule deny;
+    /// `scram-sha-256` runs SCRAM against the role's own stored verifier;
+    /// `md5`/`password` are rejected because role credentials are stored only as
+    /// SCRAM verifiers.
+    async fn authenticate_hba(
+        &mut self,
+        hba: &crate::auth::HbaConfig,
+        database: &str,
+    ) -> Result<bool, ServerError> {
+        use crate::auth::{HbaConnectionKind, HbaMethod};
+
+        // No client IP means an in-process / Unix-socket connection, which
+        // matches `local` rules; a TCP peer matches non-SSL `host` rules (TLS
+        // is not yet negotiated, so `hostssl` rules never match).
+        let conn_kind = if self.peer_ip.is_some() {
+            HbaConnectionKind::HostNoSsl
+        } else {
+            HbaConnectionKind::Local
+        };
+        // Canonicalize an IPv4-mapped IPv6 peer (e.g. `::ffff:127.0.0.1`, which
+        // a dual-stack listener reports for an IPv4 client) to its IPv4 form so
+        // it matches IPv4 CIDR rules like `127.0.0.1/32` as the operator
+        // intends, rather than silently failing the address check.
+        let peer = self.peer_ip.map(|ip| ip.to_canonical());
+        let Some(rule) = hba.match_rule(conn_kind, database, &self.auth_user, peer) else {
+            // No matching pg_hba entry → deny (PostgreSQL default).
+            return Ok(false);
+        };
+        match rule.method {
+            HbaMethod::Trust => Ok(true),
+            HbaMethod::Reject => Ok(false),
+            HbaMethod::ScramSha256 => {
+                let Some(verifier) = self
+                    .state
+                    .role_catalog
+                    .lookup_role(&self.auth_user)
+                    .and_then(|role| role.password)
+                else {
+                    // Unknown role, or a role with no password set.
+                    return Ok(false);
+                };
+                self.authenticate_scram(&verifier).await
+            }
+            HbaMethod::Md5 | HbaMethod::Password => {
+                tracing::warn!(
+                    target: "ultrasqld",
+                    method = ?rule.method,
+                    role = %self.auth_user,
+                    "pg_hba method is unsupported with SCRAM-only role verifiers; rejecting",
+                );
+                Ok(false)
+            }
+        }
     }
 }

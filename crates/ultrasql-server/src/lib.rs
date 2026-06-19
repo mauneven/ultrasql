@@ -3418,6 +3418,13 @@ pub enum AuthConfig {
         /// Pre-derived SCRAM verifier for the role's password.
         verifier: crate::auth::PasswordHash,
     },
+    /// `pg_hba`-style per-connection authentication. Each connection is matched
+    /// against the rules by `(connection kind, database, role, client IP)`; the
+    /// first matching rule's method decides the outcome: `trust` admits,
+    /// `reject` denies, and `scram-sha-256` runs a SCRAM exchange against the
+    /// role's own stored verifier in the role catalog. A connection with no
+    /// matching rule is rejected (PostgreSQL semantics).
+    Hba(crate::auth::HbaConfig),
 }
 
 /// Run undo-log GC every `UNDO_GC_INTERVAL_COMMITS` successful
@@ -9649,7 +9656,7 @@ pub async fn run_server(addr: SocketAddr, state: Arc<Server>) -> Result<(), Serv
         let state = Arc::clone(&state);
         tokio::spawn(async move {
             let _permit = permit;
-            if let Err(e) = handle_connection(stream, state).await {
+            if let Err(e) = handle_connection_with_peer(stream, state, Some(peer.ip())).await {
                 if matches!(e, ServerError::UnexpectedEof) {
                     debug!(target: "ultrasqld", %peer, "connection closed by peer");
                 } else {
@@ -9755,7 +9762,7 @@ where
         let state = Arc::clone(&state);
         sessions.spawn(async move {
             let _permit = permit;
-            if let Err(e) = handle_connection(stream, state).await {
+            if let Err(e) = handle_connection_with_peer(stream, state, Some(peer.ip())).await {
                 if matches!(e, ServerError::UnexpectedEof) {
                     debug!(target: "ultrasqld", %peer, "connection closed by peer");
                 } else {
@@ -9776,7 +9783,24 @@ pub async fn handle_connection<RW>(io: RW, state: Arc<Server>) -> Result<(), Ser
 where
     RW: AsyncRead + AsyncWrite + Unpin,
 {
-    let mut session = Session::new(io, state);
+    handle_connection_with_peer(io, state, None).await
+}
+
+/// Drive a single PostgreSQL session, recording the client IP for `pg_hba`
+/// host-rule matching.
+///
+/// [`handle_connection`] is the `peer = None` form used by in-process / test
+/// connections (which match `local` rules); the TCP accept loops call this with
+/// the accepted socket's address so `host` rules can match on source IP.
+pub async fn handle_connection_with_peer<RW>(
+    io: RW,
+    state: Arc<Server>,
+    peer: Option<std::net::IpAddr>,
+) -> Result<(), ServerError>
+where
+    RW: AsyncRead + AsyncWrite + Unpin,
+{
+    let mut session = Session::new(io, state, peer);
     // Slow-loris guard. A peer that opens the TCP connection and then
     // sits silently must not keep the session task alive forever — the
     // accept loop also stops accepting new connections beyond the

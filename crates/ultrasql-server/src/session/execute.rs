@@ -4618,7 +4618,7 @@ mod tests {
 
     fn test_session() -> Session<tokio::io::DuplexStream> {
         let (io, _peer) = duplex(64);
-        Session::new(io, Arc::new(Server::with_sample_database()))
+        Session::new(io, Arc::new(Server::with_sample_database()), None)
     }
 
     fn first_data_row_text(result: &SelectResult) -> String {

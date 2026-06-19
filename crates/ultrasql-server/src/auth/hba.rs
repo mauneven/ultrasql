@@ -185,7 +185,7 @@ pub struct HbaRule {
 ///
 /// Rules are evaluated in source order; the first matching rule is
 /// returned by [`HbaConfig::match_rule`].
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct HbaConfig {
     rules: Vec<HbaRule>,
 }

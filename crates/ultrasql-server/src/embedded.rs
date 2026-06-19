@@ -57,7 +57,9 @@ impl EmbeddedDatabase {
     fn from_server(server: Server) -> Self {
         let (io, _peer) = duplex(1);
         Self {
-            session: Session::new(io, Arc::new(server)),
+            // In-process connection: no client IP, so it matches `local`
+            // pg_hba rules rather than `host` rules.
+            session: Session::new(io, Arc::new(server), None),
         }
     }
 }

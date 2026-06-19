@@ -637,7 +637,7 @@ mod tests {
 
     fn test_session() -> Session<DuplexStream> {
         let (io, _peer) = duplex(64);
-        Session::new(io, Arc::new(Server::with_sample_database()))
+        Session::new(io, Arc::new(Server::with_sample_database()), None)
     }
 
     fn empty_plan() -> LogicalPlan {
@@ -815,7 +815,7 @@ mod tests {
         let data_dir = tempfile::TempDir::new().expect("temp data dir");
         let server = Arc::new(Server::init(data_dir.path()).expect("persistent server"));
         let (io, _peer) = duplex(64);
-        let mut session = Session::new(io, Arc::clone(&server));
+        let mut session = Session::new(io, Arc::clone(&server), None);
         session.execute_begin(None).expect("begin");
         session
             .pending_table_modifications

@@ -125,6 +125,10 @@ pub(crate) struct Session<RW> {
     /// `None` means startup failed before admission, or the peer used a
     /// legacy uncatalogued trust user. `Drop` releases the slot when present.
     pub(super) connection_limit_role: Option<String>,
+    /// Client IP address, for `pg_hba` host-rule matching. `None` for
+    /// in-process / Unix-socket connections (tests, embedded), which match
+    /// `local` rules rather than `host` rules.
+    pub(super) peer_ip: Option<std::net::IpAddr>,
     /// Session-local JIT enable flag, controlled by `SET jit`.
     pub(super) jit_enabled: bool,
     /// Session-local row threshold, controlled by `SET jit_above_cost`.
@@ -164,7 +168,7 @@ impl<RW> Session<RW>
 where
     RW: AsyncRead + AsyncWrite + Unpin,
 {
-    pub(crate) fn new(io: RW, state: Arc<Server>) -> Self {
+    pub(crate) fn new(io: RW, state: Arc<Server>, peer_ip: Option<std::net::IpAddr>) -> Self {
         // Register with the cancel registry first: it owns the canonical
         // per-session (pid, secret) tuple. Using the registry's pid for
         // the NotifyHub keeps a single u32 space for both subsystems,
@@ -191,6 +195,7 @@ where
             secret,
             cancel_flag,
             connection_limit_role: None,
+            peer_ip,
             jit_enabled: false,
             jit_above_rows: ultrasql_vec::jit::DEFAULT_JIT_ABOVE_ROWS,
             statement_timeout_ms: 0,

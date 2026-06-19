@@ -2711,7 +2711,7 @@ mod tests {
 
     fn test_session() -> Session<DuplexStream> {
         let (io, _peer) = duplex(64);
-        Session::new(io, Arc::new(Server::with_sample_database()))
+        Session::new(io, Arc::new(Server::with_sample_database()), None)
     }
 
     #[test]

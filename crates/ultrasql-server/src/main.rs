@@ -108,6 +108,13 @@ struct Cli {
     )]
     auth_method: String,
 
+    /// Path to a `pg_hba.conf`-style rules file. When set, each connection is
+    /// authenticated per its matching rule (`trust` / `reject` /
+    /// `scram-sha-256`, the last verified against the role's own catalog
+    /// password). Mutually exclusive with `--auth-user`.
+    #[arg(long, env = "ULTRASQL_HBA_FILE")]
+    hba_file: Option<PathBuf>,
+
     /// Tracing level filter, e.g. `info`, `debug`, `ultrasqld=trace`.
     #[arg(long, default_value = "info")]
     log_level: String,
@@ -254,6 +261,7 @@ Production-oriented v0.9 flags:
   - --auth-user USER    require password auth for this PostgreSQL user
   - --auth-password-file PATH  read the auth password from a private local secret file
   - --auth-method METHOD  scram (SCRAM-SHA-256, default) or md5 (legacy)
+  - --hba-file PATH     pg_hba.conf-style per-role rules (trust/reject/scram-sha-256)
   - --ops-listen ADDR   serve /health, /ready, /metrics, and backup routes
   - --ops-token TOKEN   require bearer token for /backup/start and /backup/stop
   - --log-format json   emit structured logs
@@ -871,7 +879,33 @@ fn ops_token_from_cli(cli: &Cli) -> Result<Option<Arc<str>>, String> {
     Ok(Some(Arc::<str>::from(token)))
 }
 
+const HBA_FILE_MAX_BYTES: u64 = 256 * 1024;
+
+fn read_hba_file(path: &Path) -> Result<String, String> {
+    let metadata = std::fs::metadata(path)
+        .map_err(|err| format!("inspect hba_file {}: {err}", path.display()))?;
+    if metadata.len() > HBA_FILE_MAX_BYTES {
+        return Err(format!(
+            "hba_file {} must be at most {HBA_FILE_MAX_BYTES} bytes",
+            path.display()
+        ));
+    }
+    std::fs::read_to_string(path).map_err(|err| format!("read hba_file {}: {err}", path.display()))
+}
+
 fn auth_config_from_cli(cli: &Cli) -> Result<Option<AuthConfig>, String> {
+    if let Some(hba_file) = cli.hba_file.as_deref() {
+        if cli.auth_user.is_some() || cli.auth_password_file.is_some() {
+            return Err(
+                "--hba-file is mutually exclusive with --auth-user / --auth-password-file"
+                    .to_string(),
+            );
+        }
+        let text = read_hba_file(hba_file)?;
+        let config = ultrasql_server::auth::HbaConfig::parse(&text)
+            .map_err(|e| format!("parse hba_file {}: {e}", hba_file.display()))?;
+        return Ok(Some(AuthConfig::Hba(config)));
+    }
     match (cli.auth_user.as_deref(), cli.auth_password_file.as_deref()) {
         (None, None) => Ok(None),
         (Some(_), None) => Err("auth_password_file is required when auth_user is set".to_string()),
@@ -1746,6 +1780,7 @@ mod tests {
             auth_user: None,
             auth_password_file: None,
             auth_method: "scram".to_owned(),
+            hba_file: None,
             log_level: "info".to_owned(),
             log_format: LogFormat::Text,
             log_connections: false,
@@ -1786,6 +1821,7 @@ mod tests {
             auth_user: None,
             auth_password_file: None,
             auth_method: "scram".to_owned(),
+            hba_file: None,
             log_level: "info".to_owned(),
             log_format: LogFormat::Text,
             log_connections: false,
@@ -1821,6 +1857,7 @@ mod tests {
             auth_user: None,
             auth_password_file: None,
             auth_method: "scram".to_owned(),
+            hba_file: None,
             log_level: "info".to_owned(),
             log_format: LogFormat::Text,
             log_connections: false,
@@ -1856,6 +1893,7 @@ mod tests {
             auth_user: None,
             auth_password_file: None,
             auth_method: "scram".to_owned(),
+            hba_file: None,
             log_level: "info".to_owned(),
             log_format: LogFormat::Json,
             log_connections: true,
@@ -1895,6 +1933,7 @@ mod tests {
             auth_user: None,
             auth_password_file: None,
             auth_method: "scram".to_owned(),
+            hba_file: None,
             log_level: "info".to_owned(),
             log_format: LogFormat::Text,
             log_connections: false,
@@ -1944,6 +1983,7 @@ mod tests {
             auth_user: Some("alice".to_owned()),
             auth_password_file: Some(password_file),
             auth_method: "scram".to_owned(),
+            hba_file: None,
             log_level: "info".to_owned(),
             log_format: LogFormat::Text,
             log_connections: false,
@@ -1996,6 +2036,34 @@ mod tests {
     }
 
     #[test]
+    fn auth_config_from_cli_hba_file_selects_hba() {
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let hba_path = dir.path().join("pg_hba.conf");
+        std::fs::write(&hba_path, "host all all 127.0.0.1/32 scram-sha-256\n").expect("write hba");
+        let mut cli = cli_with_auth_password_file(dir.path().join("password"));
+        cli.auth_user = None;
+        cli.auth_password_file = None;
+        cli.hba_file = Some(hba_path);
+
+        match auth_config_from_cli(&cli).expect("hba auth config") {
+            Some(ultrasql_server::AuthConfig::Hba(_)) => {}
+            other => panic!("expected Hba auth, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn auth_config_from_cli_rejects_hba_with_auth_user() {
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let hba_path = dir.path().join("pg_hba.conf");
+        std::fs::write(&hba_path, "host all all 127.0.0.1/32 trust\n").expect("write hba");
+        // The helper sets auth_user + auth_password_file; adding --hba-file is
+        // mutually exclusive and must error.
+        let mut cli = cli_with_auth_password_file(dir.path().join("password"));
+        cli.hba_file = Some(hba_path);
+        auth_config_from_cli(&cli).expect_err("--hba-file and --auth-user are mutually exclusive");
+    }
+
+    #[test]
     fn apply_auth_config_enables_md5_password_auth() {
         let server = apply_auth_config(
             Server::with_sample_database(),
@@ -2028,6 +2096,7 @@ mod tests {
             auth_user: Some("alice".to_owned()),
             auth_password_file: None,
             auth_method: "scram".to_owned(),
+            hba_file: None,
             log_level: "info".to_owned(),
             log_format: LogFormat::Text,
             log_connections: false,
@@ -2136,6 +2205,7 @@ mod tests {
             auth_user: Some("alice".to_owned()),
             auth_password_file: Some(password_file),
             auth_method: "scram".to_owned(),
+            hba_file: None,
             log_level: "info".to_owned(),
             log_format: LogFormat::Text,
             log_connections: false,
@@ -2169,6 +2239,7 @@ mod tests {
             auth_user: None,
             auth_password_file: None,
             auth_method: "scram".to_owned(),
+            hba_file: None,
             log_level: "info".to_owned(),
             log_format: LogFormat::Text,
             log_connections: false,

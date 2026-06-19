@@ -769,7 +769,7 @@ mod tests {
     fn missing_role_does_not_bypass_column_privileges() {
         let server = Arc::new(crate::Server::with_sample_database());
         let (io, _peer) = duplex(64);
-        let session = Session::new(io, server);
+        let session = Session::new(io, server, None);
 
         assert!(!session.privilege_bypass());
     }
@@ -795,7 +795,7 @@ mod tests {
         let server = Arc::new(crate::Server::with_sample_database());
         let snapshot = server.catalog_snapshot();
         let (io, _peer) = duplex(64);
-        let session = Session::new(io, server);
+        let session = Session::new(io, server, None);
 
         assert!(session.public_catalog_table("pg_catalog.pg_class", &snapshot));
         assert!(session.public_catalog_table("pg_collation", &snapshot));
@@ -807,7 +807,7 @@ mod tests {
         let server = Arc::new(crate::Server::with_sample_database());
         let snapshot = server.catalog_snapshot();
         let (io, _peer) = duplex(64);
-        let mut session = Session::new(io, Arc::clone(&server));
+        let mut session = Session::new(io, Arc::clone(&server), None);
         session.current_user = "ultrasql".to_owned();
         let mut collector = collector(&session, &snapshot);
 
@@ -964,7 +964,7 @@ mod tests {
         let server = Arc::new(crate::Server::with_sample_database());
         let snapshot = server.catalog_snapshot();
         let (io, _peer) = duplex(64);
-        let mut session = Session::new(io, Arc::clone(&server));
+        let mut session = Session::new(io, Arc::clone(&server), None);
         session.current_user = "ultrasql".to_owned();
         let mut collector = collector(&session, &snapshot);
 
