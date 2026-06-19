@@ -42,6 +42,25 @@ pub struct HybridSearch {
     where_predicate: Option<Eval>,
     sorted: Option<std::vec::IntoIter<Vec<Value>>>,
     eof: bool,
+    stats: HybridSearchStats,
+}
+
+/// Per-execution retrieval stats surfaced through `EXPLAIN ANALYZE` so an
+/// operator can show how the hybrid query actually ran: how many candidates it
+/// examined, how the metadata and `WHERE` filters pruned them, the per-component
+/// score spread, and a recall estimate. The fusion ranks every examined
+/// candidate exactly, so recall over the examined set is 1.0 — any recall loss
+/// is upstream (an ANN over-fetch feeding this operator).
+#[derive(Clone, Debug, Default)]
+struct HybridSearchStats {
+    computed: bool,
+    examined: usize,
+    metadata_pruned: usize,
+    where_pruned: usize,
+    ranked: usize,
+    emitted: usize,
+    bm25_range: Option<(f64, f64)>,
+    vector_range: Option<(f64, f64)>,
 }
 
 /// Score-fusion method used by [`HybridSearch`] to combine its component
@@ -204,6 +223,7 @@ impl HybridSearch {
             where_predicate,
             sorted: None,
             eof: false,
+            stats: HybridSearchStats::default(),
         }
     }
 
@@ -215,9 +235,11 @@ impl HybridSearch {
                 let row_ordinal = ordinal;
                 ordinal = ordinal.saturating_add(1);
                 if !passes_filter(&self.metadata_filter, &row, "metadata filter")? {
+                    self.stats.metadata_pruned = self.stats.metadata_pruned.saturating_add(1);
                     continue;
                 }
                 if !passes_filter(&self.where_predicate, &row, "WHERE predicate")? {
+                    self.stats.where_pruned = self.stats.where_pruned.saturating_add(1);
                     continue;
                 }
                 let text_terms = self.text_terms(&row)?;
@@ -234,6 +256,8 @@ impl HybridSearch {
                 });
             }
         }
+        self.stats.examined = ordinal;
+        self.stats.ranked = candidates.len();
         Ok(candidates)
     }
 
@@ -297,7 +321,7 @@ impl HybridSearch {
         })
     }
 
-    fn rank_candidates(&self, candidates: Vec<Candidate>) -> Vec<Vec<Value>> {
+    fn rank_candidates(&mut self, candidates: Vec<Candidate>) -> Vec<Vec<Value>> {
         let scores = self.component_scores(&candidates);
         let mut scored: Vec<ScoredRow> = candidates
             .into_iter()
@@ -310,11 +334,13 @@ impl HybridSearch {
             .collect();
 
         scored.sort_by(compare_scored_rows);
-        scored
+        let rows: Vec<Vec<Value>> = scored
             .into_iter()
             .take(self.config.limit)
             .map(|scored| scored.row)
-            .collect()
+            .collect();
+        self.stats.emitted = rows.len();
+        rows
     }
 
     /// Compute the fused score for each candidate, in candidate order.
@@ -323,7 +349,7 @@ impl HybridSearch {
     /// once, then combined per [`FusionMethod`]. Splitting derivation from
     /// fusion keeps the two fusion strategies — and the explainability hook
     /// in PART 5 — reading from one set of component values.
-    fn component_scores(&self, candidates: &[Candidate]) -> Vec<f64> {
+    fn component_scores(&mut self, candidates: &[Candidate]) -> Vec<f64> {
         let query_terms = self
             .config
             .text
@@ -341,6 +367,10 @@ impl HybridSearch {
         let vector: Vec<Option<f64>> = candidates.iter().map(|c| c.vector_similarity).collect();
         let recency: Vec<Option<f64>> = candidates.iter().map(|c| c.recency).collect();
         let version: Vec<Option<f64>> = candidates.iter().map(|c| c.version).collect();
+
+        // Record the per-component score spread for retrieval observability.
+        self.stats.bm25_range = finite_range(bm25.iter().copied());
+        self.stats.vector_range = finite_range(vector.iter().copied().flatten());
         let weights = self.config.weights;
 
         match self.config.fusion {
@@ -420,6 +450,7 @@ impl Operator for HybridSearch {
         if self.sorted.is_none() {
             let candidates = self.collect_candidates()?;
             let rows = self.rank_candidates(candidates);
+            self.stats.computed = true;
             self.sorted = Some(rows.into_iter());
         }
 
@@ -444,6 +475,48 @@ impl Operator for HybridSearch {
                 .estimated_row_count()
                 .map_or(self.config.limit, |rows| rows.min(self.config.limit)),
         )
+    }
+
+    fn profile_children(&self) -> Vec<&dyn Operator> {
+        vec![self.child.as_ref()]
+    }
+
+    /// Retrieval observability for `EXPLAIN ANALYZE`: candidates examined, how
+    /// the metadata and `WHERE` filters pruned them, filter selectivity, the
+    /// per-component score spread, top-k emitted, and a recall estimate (1.0 —
+    /// the fusion ranks every examined candidate exactly).
+    fn pruning_stats(&self) -> Vec<String> {
+        if !self.stats.computed {
+            return Vec::new();
+        }
+        let s = &self.stats;
+        let mut out = vec![
+            format!("hybrid_candidates_examined={}", s.examined),
+            format!("candidates_ranked={}", s.ranked),
+            format!("top_k_emitted={}", s.emitted),
+            "recall_estimate=1.000(exact-over-examined)".to_owned(),
+        ];
+        // Only report in-operator filter pruning when this operator actually
+        // applies a metadata/WHERE predicate. In the SQL path those filters run
+        // in a separate child operator (visible via its rows_in/rows_out), so
+        // emitting a constant `…_pruned=0` here would be misleading.
+        if s.metadata_pruned > 0 || s.where_pruned > 0 {
+            let selectivity = if s.examined > 0 {
+                s.ranked.to_f64().unwrap_or(0.0) / s.examined.to_f64().unwrap_or(1.0)
+            } else {
+                0.0
+            };
+            out.push(format!("metadata_filter_pruned={}", s.metadata_pruned));
+            out.push(format!("where_filter_pruned={}", s.where_pruned));
+            out.push(format!("filter_selectivity={selectivity:.3}"));
+        }
+        if let Some((lo, hi)) = s.bm25_range {
+            out.push(format!("bm25_score_range=[{lo:.3},{hi:.3}]"));
+        }
+        if let Some((lo, hi)) = s.vector_range {
+            out.push(format!("vector_similarity_range=[{lo:.3},{hi:.3}]"));
+        }
+        out
     }
 }
 

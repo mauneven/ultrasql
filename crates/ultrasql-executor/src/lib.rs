@@ -460,6 +460,13 @@ pub trait Operator: Send + Debug {
     fn pruning_stats(&self) -> Vec<String> {
         Vec::new()
     }
+
+    /// Whether this operator is already a profiling wrapper. Lowering checks this
+    /// to avoid nesting one `ProfiledOperator` inside another — a nested wrapper
+    /// would hide the inner node's stats and children from `EXPLAIN ANALYZE`.
+    fn is_profiled(&self) -> bool {
+        false
+    }
 }
 
 #[cfg(test)]

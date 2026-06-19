@@ -3,7 +3,7 @@
 use ultrasql_core::{DataType, Value};
 use ultrasql_executor::{
     FusionMethod, HybridSearch, HybridSearchConfig, HybridSearchWeights, HybridTextSpec,
-    HybridVectorSpec, Operator,
+    HybridVectorSpec, Operator, ProfiledOperator,
 };
 use ultrasql_planner::{LogicalPlan, ScalarExpr, SortKey};
 use ultrasql_vec::kernels::vector::VectorMetric;
@@ -92,7 +92,19 @@ fn lower_hybrid_sorted_input(
         weights: HybridSearchWeights::DEFAULT,
         fusion: spec.fusion,
     };
-    Ok(Some(Box::new(HybridSearch::new(child, schema, config))))
+    let search = Box::new(HybridSearch::new(child, schema, config));
+    // Wrap as a distinct profiling node so EXPLAIN ANALYZE surfaces the hybrid
+    // retrieval stats and recurses into the child scan/filter. `lower_query`
+    // skips re-wrapping an already-profiled op (via `Operator::is_profiled`), so
+    // this stays a single wrapper even when an identity projection is elided.
+    if ctx.profile_operators {
+        Ok(Some(Box::new(ProfiledOperator::new(
+            "HybridSearch",
+            search,
+        ))))
+    } else {
+        Ok(Some(search))
+    }
 }
 
 #[derive(Debug)]

@@ -100,6 +100,10 @@ impl Operator for ProfiledOperator {
         self.inner.estimated_row_count()
     }
 
+    fn is_profiled(&self) -> bool {
+        true
+    }
+
     fn runtime_profile(&self) -> Option<OperatorRuntimeProfile> {
         let children: Vec<OperatorRuntimeProfile> = self
             .inner

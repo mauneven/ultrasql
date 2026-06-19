@@ -63,7 +63,10 @@ pub fn lower_query(
     ctx: &LowerCtx<'_>,
 ) -> Result<Box<dyn Operator>, ServerError> {
     let op = lower_query_inner(plan, ctx)?;
-    if ctx.profile_operators {
+    // Skip wrapping when a specialized lowering already returned a profiling
+    // wrapper (e.g. a hybrid-search top-k whose projection was elided) — nesting
+    // `ProfiledOperator`s would hide the inner node from `EXPLAIN ANALYZE`.
+    if ctx.profile_operators && !op.is_profiled() {
         Ok(Box::new(ProfiledOperator::new(
             profile_operator_name(plan),
             op,
