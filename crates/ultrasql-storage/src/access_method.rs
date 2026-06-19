@@ -5407,15 +5407,33 @@ impl PageBackedIvfFlatIndex {
         probe: &[f32],
         k: usize,
     ) -> Result<Vec<IvfFlatSearchResult>, AccessMethodError> {
+        self.search_with_probes(probe, k, self.probes)
+    }
+
+    /// Search probing a caller-supplied number of nearest lists, overriding the
+    /// index default `probes`.
+    ///
+    /// A larger `probes` scans more inverted lists — trading latency for recall
+    /// — the per-query knob filtered ANN uses to over-fetch candidates before a
+    /// metadata predicate prunes them. Probing every list
+    /// (`probes >= list_count`) is exact. This is the IVFFlat analog of HNSW's
+    /// `search_with_ef`.
+    pub fn search_with_probes(
+        &self,
+        probe: &[f32],
+        k: usize,
+        probes: usize,
+    ) -> Result<Vec<IvfFlatSearchResult>, AccessMethodError> {
         self.validate_vector(probe)?;
         if k == 0 {
             return Ok(Vec::new());
         }
+        let probes = probes.max(1);
         let storage = self.storage.lock();
         if !storage.valid || storage.centroids.is_empty() {
             return Ok(Vec::new());
         }
-        let list_ids = nearest_vectors(&storage.centroids, probe, self.metric, self.probes);
+        let list_ids = nearest_vectors(&storage.centroids, probe, self.metric, probes);
         let mut candidate_indices = Vec::new();
         for list_id in list_ids {
             let Some(list) = storage.lists.get(list_id) else {
