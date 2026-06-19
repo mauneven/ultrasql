@@ -5047,3 +5047,179 @@ fn statement_family_display_schema_and_pipeline_modes_are_stable() {
         assert_eq!(format!("{plan}"), display);
     }
 }
+
+// -----------------------------------------------------------------------
+// Positional ORDER BY / GROUP BY ordinals
+//
+// A bare integer in ORDER BY / GROUP BY is a 1-based reference to the Nth
+// SELECT output column (PostgreSQL semantics), NOT an integer constant.
+// Regression for the bug where `GROUP BY 1` bound to a constant literal
+// (collapsing every row into one group) and `ORDER BY 1` became a no-op
+// sort on a constant.
+// -----------------------------------------------------------------------
+
+fn positional_find_aggregate(plan: &LogicalPlan) -> Option<&LogicalPlan> {
+    match plan {
+        LogicalPlan::Aggregate { .. } => Some(plan),
+        LogicalPlan::Project { input, .. }
+        | LogicalPlan::Filter { input, .. }
+        | LogicalPlan::Sort { input, .. }
+        | LogicalPlan::Limit { input, .. } => positional_find_aggregate(input),
+        _ => None,
+    }
+}
+
+fn positional_find_sort(plan: &LogicalPlan) -> Option<&LogicalPlan> {
+    match plan {
+        LogicalPlan::Sort { .. } => Some(plan),
+        LogicalPlan::Project { input, .. }
+        | LogicalPlan::Filter { input, .. }
+        | LogicalPlan::Aggregate { input, .. }
+        | LogicalPlan::Limit { input, .. } => positional_find_sort(input),
+        _ => None,
+    }
+}
+
+#[test]
+fn group_by_positional_ordinal_resolves_to_output_column() {
+    let plan = parse_bind_ok("SELECT name, count(*) FROM users GROUP BY 1");
+    let agg = positional_find_aggregate(&plan).expect("Aggregate node");
+    let LogicalPlan::Aggregate { group_by, .. } = agg else {
+        panic!("expected Aggregate, got {agg:?}");
+    };
+    assert_eq!(group_by.len(), 1, "GROUP BY 1 must produce exactly one key");
+    assert!(
+        matches!(&group_by[0], ScalarExpr::Column { name, .. } if name == "name"),
+        "GROUP BY 1 must resolve to the first output column `name`, got {:?}",
+        group_by[0]
+    );
+}
+
+#[test]
+fn group_by_positional_matches_named_column() {
+    // `GROUP BY 1` must bind to exactly the same key as `GROUP BY name`.
+    let by_pos = parse_bind_ok("SELECT name, count(*) FROM users GROUP BY 1");
+    let by_name = parse_bind_ok("SELECT name, count(*) FROM users GROUP BY name");
+    let key = |plan: &LogicalPlan| {
+        let LogicalPlan::Aggregate { group_by, .. } =
+            positional_find_aggregate(plan).expect("Aggregate")
+        else {
+            panic!("expected Aggregate");
+        };
+        group_by.clone()
+    };
+    assert_eq!(
+        key(&by_pos),
+        key(&by_name),
+        "GROUP BY 1 and GROUP BY name must produce identical group keys"
+    );
+}
+
+#[test]
+fn order_by_positional_ordinal_resolves_to_output_column() {
+    let plan = parse_bind_ok("SELECT id, name FROM users ORDER BY 2 DESC");
+    let sort = positional_find_sort(&plan).expect("Sort node");
+    let LogicalPlan::Sort { keys, .. } = sort else {
+        panic!("expected Sort, got {sort:?}");
+    };
+    assert_eq!(keys.len(), 1, "one sort key");
+    assert!(!keys[0].asc, "ORDER BY 2 DESC must sort descending");
+    assert!(
+        matches!(&keys[0].expr, ScalarExpr::Column { name, .. } if name == "name"),
+        "ORDER BY 2 must resolve to the second output column `name`, got {:?}",
+        keys[0].expr
+    );
+}
+
+#[test]
+fn order_by_positional_is_not_a_constant_literal() {
+    // The core of the original bug: `ORDER BY 1` must NOT bind to a constant.
+    let plan = parse_bind_ok("SELECT name, id FROM users ORDER BY 1");
+    let sort = positional_find_sort(&plan).expect("Sort node");
+    let LogicalPlan::Sort { keys, .. } = sort else {
+        panic!("expected Sort, got {sort:?}");
+    };
+    assert!(
+        !matches!(keys[0].expr, ScalarExpr::Literal { .. }),
+        "ORDER BY 1 must not be a constant literal sort key, got {:?}",
+        keys[0].expr
+    );
+    assert!(
+        matches!(&keys[0].expr, ScalarExpr::Column { name, .. } if name == "name"),
+        "ORDER BY 1 must resolve to the first output column `name`, got {:?}",
+        keys[0].expr
+    );
+}
+
+#[test]
+fn group_by_and_order_by_positional_combined() {
+    let plan = parse_bind_ok("SELECT name, count(*) AS c FROM users GROUP BY 1 ORDER BY 2 DESC");
+    let LogicalPlan::Aggregate { group_by, .. } =
+        positional_find_aggregate(&plan).expect("Aggregate")
+    else {
+        panic!("expected Aggregate");
+    };
+    assert!(
+        matches!(&group_by[0], ScalarExpr::Column { name, .. } if name == "name"),
+        "GROUP BY 1 must resolve to `name`, got {:?}",
+        group_by[0]
+    );
+    let LogicalPlan::Sort { keys, .. } = positional_find_sort(&plan).expect("Sort") else {
+        panic!("expected Sort");
+    };
+    // ORDER BY 2 -> the count aggregate output column, descending.
+    assert!(!keys[0].asc, "ORDER BY 2 DESC");
+    assert!(
+        !matches!(keys[0].expr, ScalarExpr::Literal { .. }),
+        "ORDER BY 2 must not be a constant literal, got {:?}",
+        keys[0].expr
+    );
+}
+
+#[test]
+fn order_by_positional_in_set_operation() {
+    // Set-operation ORDER BY also resolves ordinals against the output list.
+    let plan = parse_bind_ok("SELECT id FROM users UNION SELECT id FROM users ORDER BY 1");
+    let LogicalPlan::Sort { keys, .. } = positional_find_sort(&plan).expect("Sort") else {
+        panic!("expected Sort");
+    };
+    assert!(
+        matches!(&keys[0].expr, ScalarExpr::Column { .. }),
+        "ORDER BY 1 over a UNION must resolve to a column reference, got {:?}",
+        keys[0].expr
+    );
+}
+
+#[test]
+fn positional_ordinal_out_of_range_is_rejected() {
+    let order_err = parse_and_bind("SELECT id, name FROM users ORDER BY 5", &users_catalog())
+        .expect_err("ORDER BY position out of range must error");
+    assert!(
+        matches!(order_err, PlanError::TypeMismatch(_)),
+        "expected TypeMismatch for out-of-range ORDER BY, got {order_err:?}"
+    );
+    let group_err = parse_and_bind(
+        "SELECT name, count(*) FROM users GROUP BY 9",
+        &users_catalog(),
+    )
+    .expect_err("GROUP BY position out of range must error");
+    assert!(
+        matches!(group_err, PlanError::TypeMismatch(_)),
+        "expected TypeMismatch for out-of-range GROUP BY, got {group_err:?}"
+    );
+}
+
+#[test]
+fn group_by_positional_referencing_aggregate_is_rejected() {
+    // `GROUP BY 2` where output column 2 is an aggregate is an error,
+    // matching PostgreSQL.
+    let err = parse_and_bind(
+        "SELECT name, count(*) FROM users GROUP BY 2",
+        &users_catalog(),
+    )
+    .expect_err("GROUP BY referencing an aggregate must error");
+    assert!(
+        matches!(err, PlanError::TypeMismatch(_)),
+        "expected TypeMismatch for GROUP BY of an aggregate, got {err:?}"
+    );
+}

@@ -10,6 +10,7 @@ use super::expr_bind::{
     is_supported_builtin, validate_builtin_args,
 };
 use super::expr_type::{binary_result_type, comparable};
+use super::util::{ordinal_index, plain_select_exprs, positional_ordinal};
 use super::{
     AggregateFunc, Catalog, LogicalAggregateExpr, LogicalPlan, PlanError, ScalarExpr, ScopeEntry,
     ScopeStack, SortKey, bind_expr_with_ctes, derive_output_name, schema_for_qualified_binding,
@@ -177,8 +178,27 @@ pub(super) fn bind_aggregate(
 
     let mut group_by: Vec<ScalarExpr> = Vec::with_capacity(select.group_by.len());
     for e in &select.group_by {
+        // A bare integer in GROUP BY is a 1-based positional reference to the
+        // SELECT list (`GROUP BY 1` groups by the first output expression),
+        // not a constant — binding it as a literal would collapse every row
+        // into a single group.
+        let group_expr = if let Some(n) = positional_ordinal(e) {
+            let outputs = plain_select_exprs(&select.projection).ok_or(PlanError::NotSupported(
+                "positional GROUP BY with a wildcard in the SELECT list",
+            ))?;
+            let target = outputs[ordinal_index(n, outputs.len(), "GROUP BY")?];
+            if expr_has_aggregate(target) {
+                return Err(PlanError::TypeMismatch(format!(
+                    "GROUP BY position {n} refers to an aggregate expression, \
+                     which is not allowed"
+                )));
+            }
+            target
+        } else {
+            e
+        };
         group_by.push(bind_expr_with_ctes(
-            e,
+            group_expr,
             &binding_schema,
             catalog,
             cte_catalog,
@@ -362,6 +382,8 @@ fn collect_aggregates(
                         order_by: None,
                         arg_type: DataType::Null,
                     }
+                } else if func == AggregateFunc::StringAgg {
+                    bind_string_agg(args, input_schema, catalog, cte_catalog, scope)?
                 } else if func == AggregateFunc::Corr {
                     if args.len() != 2 {
                         return Err(PlanError::TypeMismatch(format!(
@@ -473,6 +495,42 @@ fn collect_non_aggregate_function_args(
         collect_aggregates(arg, None, input_schema, out, catalog, cte_catalog, scope)?;
     }
     Ok(())
+}
+
+/// Bind `STRING_AGG(value, delimiter)`.
+///
+/// PostgreSQL requires the delimiter argument; we bind it as a constant
+/// text expression and stash it in `direct_arg` so the executor can join
+/// the accumulated parts with it. The delimiter must be text-like (or a
+/// NULL literal, which PostgreSQL treats as no separator).
+fn bind_string_agg(
+    args: &[Expr],
+    input_schema: &Schema,
+    catalog: &dyn Catalog,
+    cte_catalog: &[(String, Schema)],
+    scope: &mut ScopeStack,
+) -> Result<BoundAggregateInput, PlanError> {
+    if args.len() != 2 {
+        return Err(PlanError::TypeMismatch(format!(
+            "string_agg: expected 2 arguments (value, delimiter), got {}",
+            args.len()
+        )));
+    }
+    let value = bind_expr_with_ctes(&args[0], input_schema, catalog, cte_catalog, scope)?;
+    let delimiter = bind_expr_with_ctes(&args[1], input_schema, catalog, cte_catalog, scope)?;
+    let delim_type = delimiter.data_type();
+    if !delim_type.is_textlike() && !matches!(delim_type, DataType::Null) {
+        return Err(PlanError::TypeMismatch(format!(
+            "string_agg: delimiter must be text, got {delim_type}"
+        )));
+    }
+    let arg_type = value.data_type();
+    Ok(BoundAggregateInput {
+        arg: Some(value),
+        direct_arg: Some(delimiter),
+        order_by: None,
+        arg_type,
+    })
 }
 
 fn bind_ordered_set_percentile(

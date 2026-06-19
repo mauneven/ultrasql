@@ -62,11 +62,21 @@ pub(crate) enum AggState {
     StringAgg(Vec<String>, String),
     ArrayAgg(Vec<Value>),
     JsonAgg(Vec<Value>),
-    /// Running sum and count for STDDEV / VARIANCE.
-    /// Fields: (`sum_x`, `sum_x2`, count).
-    Variance(f64, f64, i64),
-    /// Same accumulator for STDDEV (standard deviation).
-    Stddev(f64, f64, i64),
+    /// Welford running aggregate for STDDEV / VARIANCE: `(count, mean, m2)`
+    /// where `m2` is the running sum of squared differences from the mean.
+    /// Mirrors the [`HashAggregate`] path exactly: `sample` selects the
+    /// `n - 1` (sample) vs `n` (population) denominator and `sqrt` selects
+    /// standard deviation vs variance. Shared between `VAR_SAMP`, `VAR_POP`,
+    /// `STDDEV_SAMP`, and `STDDEV_POP`.
+    ///
+    /// [`HashAggregate`]: crate::HashAggregate
+    Welford {
+        count: i64,
+        mean: f64,
+        m2: f64,
+        sample: bool,
+        sqrt: bool,
+    },
     /// For CORR(y, x): (`sum_x`, `sum_y`, `sum_xy`, `sum_x2`, `sum_y2`, count).
     Corr(f64, f64, f64, f64, f64, i64),
     /// `PERCENTILE_CONT`: accumulates numeric values for interpolation.
@@ -94,12 +104,38 @@ fn init_state(agg: &LogicalAggregateExpr) -> AggState {
         AggregateFunc::Max => AggState::Max(None),
         AggregateFunc::BoolAnd => AggState::BoolAnd(None),
         AggregateFunc::BoolOr => AggState::BoolOr(None),
-        AggregateFunc::StringAgg => AggState::StringAgg(Vec::new(), String::new()),
+        AggregateFunc::StringAgg => AggState::StringAgg(Vec::new(), string_agg_separator(agg)),
         AggregateFunc::ArrayAgg => AggState::ArrayAgg(Vec::new()),
         AggregateFunc::JsonAgg => AggState::JsonAgg(Vec::new()),
         AggregateFunc::Corr => AggState::Corr(0.0, 0.0, 0.0, 0.0, 0.0, 0),
-        AggregateFunc::StddevSamp | AggregateFunc::StddevPop => AggState::Stddev(0.0, 0.0, 0),
-        AggregateFunc::VarSamp | AggregateFunc::VarPop => AggState::Variance(0.0, 0.0, 0),
+        AggregateFunc::StddevSamp => AggState::Welford {
+            count: 0,
+            mean: 0.0,
+            m2: 0.0,
+            sample: true,
+            sqrt: true,
+        },
+        AggregateFunc::StddevPop => AggState::Welford {
+            count: 0,
+            mean: 0.0,
+            m2: 0.0,
+            sample: false,
+            sqrt: true,
+        },
+        AggregateFunc::VarSamp => AggState::Welford {
+            count: 0,
+            mean: 0.0,
+            m2: 0.0,
+            sample: true,
+            sqrt: false,
+        },
+        AggregateFunc::VarPop => AggState::Welford {
+            count: 0,
+            mean: 0.0,
+            m2: 0.0,
+            sample: false,
+            sqrt: false,
+        },
         AggregateFunc::PercentileCont => {
             let asc = agg.order_by.as_ref().is_none_or(|key| key.asc);
             AggState::PercentileCont {
@@ -125,6 +161,23 @@ fn init_state(agg: &LogicalAggregateExpr) -> AggState {
 
 fn init_states(aggs: &[LogicalAggregateExpr]) -> Vec<AggState> {
     aggs.iter().map(init_state).collect()
+}
+
+/// Resolve the constant delimiter for `STRING_AGG(value, delimiter)`.
+///
+/// Mirrors the hash-aggregate path: the binder stores the bound delimiter
+/// in `direct_arg`, a constant text expression, which we evaluate once
+/// against an empty row. A NULL or absent delimiter (and any non-text
+/// result) collapses to the empty separator, matching PostgreSQL's
+/// treatment of a NULL delimiter as no separator.
+fn string_agg_separator(agg: &LogicalAggregateExpr) -> String {
+    let Some(expr) = agg.direct_arg.as_ref() else {
+        return String::new();
+    };
+    match Eval::new(expr.clone()).eval(&[]) {
+        Ok(Value::Text(s) | Value::Char(s)) => s,
+        _ => String::new(),
+    }
 }
 
 #[allow(clippy::too_many_lines)]
@@ -237,12 +290,20 @@ fn accumulate(
                 items.push(v);
             }
         }
-        AggState::Variance(sum_x, sum_x2, cnt) | AggState::Stddev(sum_x, sum_x2, cnt) => {
+        AggState::Welford {
+            count, mean, m2, ..
+        } => {
             if let Some(v) = arg {
                 if let Some(x) = to_f64(&v) {
-                    *sum_x += x;
-                    *sum_x2 += x * x;
-                    increment_count(cnt, "SortAggregate statistical count")?;
+                    // Welford's online algorithm, identical to the
+                    // HashAggregate path: numerically stable and avoids the
+                    // catastrophic cancellation of the naive sum-of-squares
+                    // minus square-of-sum recipe.
+                    increment_count(count, "SortAggregate statistical count")?;
+                    let delta = x - *mean;
+                    *mean += delta / i64_to_f64_saturating(*count);
+                    let delta2 = x - *mean;
+                    *m2 += delta * delta2;
                 }
             }
         }
@@ -331,21 +392,24 @@ fn finalise(state: &AggState) -> Value {
                 Value::Jsonb(json_agg_text(items))
             }
         }
-        AggState::Variance(sum_x, sum_x2, cnt) => {
-            if *cnt < 2 {
+        AggState::Welford {
+            count,
+            m2,
+            sample,
+            sqrt,
+            ..
+        } => {
+            // Sample variance/stddev needs `n - 1` in the denominator and is
+            // undefined for fewer than two non-NULL inputs. Population
+            // variance/stddev divides by `n` and is defined for any non-zero
+            // count (a single row yields 0). Matches the HashAggregate path.
+            let n = *count;
+            let denom = if *sample { n - 1 } else { n };
+            if denom <= 0 {
                 return Value::Null;
             }
-            let n = i64_to_f64_saturating(*cnt);
-            let variance = (*sum_x2 - (*sum_x * *sum_x) / n) / (n - 1.0);
-            Value::Float64(variance)
-        }
-        AggState::Stddev(sum_x, sum_x2, cnt) => {
-            if *cnt < 2 {
-                return Value::Null;
-            }
-            let n = i64_to_f64_saturating(*cnt);
-            let variance = (*sum_x2 - (*sum_x * *sum_x) / n) / (n - 1.0);
-            Value::Float64(variance.sqrt())
+            let variance = m2 / i64_to_f64_saturating(denom);
+            Value::Float64(if *sqrt { variance.sqrt() } else { variance })
         }
         AggState::Corr(sx, sy, sxy, sx2, sy2, cnt) => {
             if *cnt < 2 {
@@ -844,8 +908,20 @@ pub(crate) enum StatAggFunc {
 #[cfg(test)]
 pub(crate) const fn init_stat_state(func: &StatAggFunc) -> AggState {
     match func {
-        StatAggFunc::Stddev => AggState::Stddev(0.0, 0.0, 0),
-        StatAggFunc::Variance => AggState::Variance(0.0, 0.0, 0),
+        StatAggFunc::Stddev => AggState::Welford {
+            count: 0,
+            mean: 0.0,
+            m2: 0.0,
+            sample: true,
+            sqrt: true,
+        },
+        StatAggFunc::Variance => AggState::Welford {
+            count: 0,
+            mean: 0.0,
+            m2: 0.0,
+            sample: true,
+            sqrt: false,
+        },
         StatAggFunc::Corr => AggState::Corr(0.0, 0.0, 0.0, 0.0, 0.0, 0),
         StatAggFunc::PercentileCont(f) => AggState::PercentileCont {
             values: Vec::new(),
@@ -865,10 +941,14 @@ pub(crate) const fn init_stat_state(func: &StatAggFunc) -> AggState {
 #[cfg(test)]
 pub(crate) fn accumulate_stat(state: &mut AggState, x: f64) -> Result<(), ExecError> {
     match state {
-        AggState::Variance(sx, sx2, cnt) | AggState::Stddev(sx, sx2, cnt) => {
-            *sx += x;
-            *sx2 += x * x;
-            increment_count(cnt, "SortAggregate statistical count")?;
+        AggState::Welford {
+            count, mean, m2, ..
+        } => {
+            increment_count(count, "SortAggregate statistical count")?;
+            let delta = x - *mean;
+            *mean += delta / i64_to_f64_saturating(*count);
+            let delta2 = x - *mean;
+            *m2 += delta * delta2;
         }
         AggState::PercentileCont { values, .. } => {
             values.push(x);
@@ -1358,6 +1438,60 @@ mod tests {
         assert_eq!(rows[0][9], Value::Jsonb(r#"["a","b"]"#.to_owned()));
     }
 
+    /// `STRING_AGG(label, ',')` must join parts with the bound delimiter,
+    /// skip NULL inputs, and emit a single value without a trailing
+    /// delimiter for single-row groups. Regression for the bug where the
+    /// delimiter was dropped and parts were concatenated with `""`.
+    #[test]
+    fn sort_agg_string_agg_joins_with_delimiter() {
+        // Sorted by group. Group 1: a,b,c; group 2: single row; group 3:
+        // a NULL preceding a single non-null value.
+        let input_schema = Schema::new([
+            Field::required("group", DataType::Int32),
+            Field::nullable("label", DataType::Text { max_len: None }),
+        ])
+        .expect("schema");
+        let mut valid = ultrasql_vec::bitmap::Bitmap::new(6, true);
+        valid.set(4, false);
+        let batch = Batch::new([
+            Column::Int32(NumericColumn::from_data(vec![1, 1, 1, 2, 3, 3])),
+            Column::Utf8(
+                StringColumn::with_nulls(["a", "b", "c", "x", "", "y"].map(str::to_owned), valid)
+                    .expect("string column ok"),
+            ),
+        ])
+        .expect("batch");
+        let scan = MemTableScan::new(input_schema, vec![batch]);
+        let out_schema = Schema::new([
+            Field::required("group", DataType::Int32),
+            Field::nullable("joined", DataType::Text { max_len: None }),
+        ])
+        .expect("schema");
+        let aggs = vec![LogicalAggregateExpr {
+            func: AggregateFunc::StringAgg,
+            arg: Some(col("label", 1, DataType::Text { max_len: None })),
+            direct_arg: Some(lit(
+                Value::Text(",".to_owned()),
+                DataType::Text { max_len: None },
+            )),
+            order_by: None,
+            distinct: false,
+            output_name: "joined".to_owned(),
+            data_type: DataType::Text { max_len: None },
+        }];
+        let mut op = SortAggregate::new(Box::new(scan), vec![col_group()], aggs, out_schema);
+        let mut rows = drain_all(&mut op);
+        rows.sort_by_key(|r| match &r[0] {
+            Value::Int32(v) => *v,
+            _ => i32::MAX,
+        });
+
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[0][1], Value::Text("a,b,c".to_owned())); // multi-row join
+        assert_eq!(rows[1][1], Value::Text("x".to_owned())); // single row, no delimiter
+        assert_eq!(rows[2][1], Value::Text("y".to_owned())); // NULL skipped
+    }
+
     #[test]
     fn sort_agg_avg_vector_skips_nulls_and_returns_dense_vector() {
         let vector_type = DataType::Vector { dims: Some(3) };
@@ -1503,5 +1637,114 @@ mod tests {
             accumulate_stat(&mut disc, x).expect("percentile disc step");
         }
         assert_eq!(finalise_stat(&disc), Value::Float64(3.0));
+    }
+
+    // ---- Population vs sample variance/stddev, cross-validated against the
+    // ---- HashAggregate (Welford) path. ----
+
+    fn pop_sample_out_schema() -> Schema {
+        Schema::new([
+            Field::required("var_pop", DataType::Float64),
+            Field::required("var_samp", DataType::Float64),
+            Field::required("stddev_pop", DataType::Float64),
+            Field::required("stddev_samp", DataType::Float64),
+        ])
+        .expect("schema")
+    }
+
+    fn pop_sample_aggs() -> Vec<LogicalAggregateExpr> {
+        let val = || col("val", 0, DataType::Int64);
+        vec![
+            agg(
+                AggregateFunc::VarPop,
+                Some(val()),
+                "var_pop",
+                DataType::Float64,
+            ),
+            agg(
+                AggregateFunc::VarSamp,
+                Some(val()),
+                "var_samp",
+                DataType::Float64,
+            ),
+            agg(
+                AggregateFunc::StddevPop,
+                Some(val()),
+                "stddev_pop",
+                DataType::Float64,
+            ),
+            agg(
+                AggregateFunc::StddevSamp,
+                Some(val()),
+                "stddev_samp",
+                DataType::Float64,
+            ),
+        ]
+    }
+
+    fn single_col_scan(values: Vec<i64>) -> MemTableScan {
+        let schema = Schema::new([Field::required("val", DataType::Int64)]).expect("schema");
+        MemTableScan::new(
+            schema,
+            vec![Batch::new([Column::Int64(NumericColumn::from_data(values))]).expect("batch")],
+        )
+    }
+
+    /// Run the four pop/sample aggregates over `values` through both the sort
+    /// and hash aggregate paths and assert the paths agree, returning the
+    /// (identical) output row.
+    fn pop_sample_both_paths(values: Vec<i64>) -> Vec<Value> {
+        let mut sort_op = SortAggregate::new(
+            Box::new(single_col_scan(values.clone())),
+            vec![],
+            pop_sample_aggs(),
+            pop_sample_out_schema(),
+        );
+        let sort_rows = drain_all(&mut sort_op);
+
+        let mut hash_op = crate::HashAggregate::new(
+            Box::new(single_col_scan(values)),
+            vec![],
+            pop_sample_aggs(),
+            pop_sample_out_schema(),
+        );
+        let hash_rows = drain_all(&mut hash_op);
+
+        assert_eq!(sort_rows.len(), 1, "sort path emits one whole-relation row");
+        assert_eq!(hash_rows.len(), 1, "hash path emits one whole-relation row");
+        assert_eq!(
+            sort_rows, hash_rows,
+            "sort and hash aggregate paths must produce identical statistics"
+        );
+        sort_rows.into_iter().next().expect("one row")
+    }
+
+    #[test]
+    fn pop_and_sample_variance_match_across_hash_and_sort_paths() {
+        // Dataset [2, 4, 6]: mean 4, sum of squared deviations 8.
+        //   VAR_POP     = 8 / 3      STDDEV_POP  = sqrt(8 / 3)
+        //   VAR_SAMP    = 8 / 2 = 4  STDDEV_SAMP = sqrt(4) = 2
+        let row = pop_sample_both_paths(vec![2, 4, 6]);
+        let expected = [8.0 / 3.0, 4.0, (8.0_f64 / 3.0).sqrt(), 2.0];
+        for (i, want) in expected.iter().enumerate() {
+            let Value::Float64(got) = row[i] else {
+                panic!("expected Float64 at column {i}, got {:?}", row[i]);
+            };
+            assert!(
+                (got - want).abs() < 1e-12,
+                "column {i}: got {got}, want {want}"
+            );
+        }
+    }
+
+    #[test]
+    fn single_row_population_is_zero_sample_is_null_across_paths() {
+        // A single non-NULL input: population variance/stddev are defined and
+        // equal 0; sample variance/stddev are undefined (NULL).
+        let row = pop_sample_both_paths(vec![5]);
+        assert_eq!(row[0], Value::Float64(0.0), "VAR_POP of one row is 0");
+        assert_eq!(row[1], Value::Null, "VAR_SAMP of one row is NULL");
+        assert_eq!(row[2], Value::Float64(0.0), "STDDEV_POP of one row is 0");
+        assert_eq!(row[3], Value::Null, "STDDEV_SAMP of one row is NULL");
     }
 }

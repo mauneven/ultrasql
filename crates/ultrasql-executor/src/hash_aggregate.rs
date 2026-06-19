@@ -1538,13 +1538,24 @@ enum AggState {
 
 /// Initialise one [`AggState`] for the given aggregate descriptor.
 fn init_state_for(agg: &LogicalAggregateExpr) -> AggState {
+    let base = init_base_state(agg);
     if agg.distinct {
-        return AggState::Distinct {
-            inner: Box::new(init_state_for_func(agg.func)),
+        AggState::Distinct {
+            inner: Box::new(base),
             seen: HashSet::new(),
-        };
+        }
+    } else {
+        base
     }
+}
+
+/// Build the un-wrapped accumulator state for `agg`, reading any
+/// per-aggregate configuration (the `STRING_AGG` delimiter, percentile
+/// sort direction) off the descriptor. The `DISTINCT` wrapper, when
+/// present, boxes the result of this function.
+fn init_base_state(agg: &LogicalAggregateExpr) -> AggState {
     match agg.func {
+        AggregateFunc::StringAgg => AggState::StringAgg(Vec::new(), string_agg_separator(agg)),
         AggregateFunc::PercentileCont => {
             let asc = agg.order_by.as_ref().is_none_or(|key| key.asc);
             AggState::PercentileCont {
@@ -1566,6 +1577,23 @@ fn init_state_for(agg: &LogicalAggregateExpr) -> AggState {
             }
         }
         _ => init_state_for_func(agg.func),
+    }
+}
+
+/// Resolve the constant delimiter for `STRING_AGG(value, delimiter)`.
+///
+/// The binder stores the bound delimiter in `direct_arg`; it is a
+/// constant text expression, so we evaluate it once against an empty row
+/// when initialising the group. A NULL or absent delimiter (and any
+/// non-text result) collapses to the empty separator, matching
+/// PostgreSQL's treatment of a NULL delimiter as no separator.
+fn string_agg_separator(agg: &LogicalAggregateExpr) -> String {
+    let Some(expr) = agg.direct_arg.as_ref() else {
+        return String::new();
+    };
+    match Eval::new(expr.clone()).eval(&[]) {
+        Ok(Value::Text(s) | Value::Char(s)) => s,
+        _ => String::new(),
     }
 }
 
@@ -2868,6 +2896,109 @@ mod tests {
             err.to_string().contains("division by zero"),
             "unexpected error: {err}"
         );
+    }
+
+    /// `STRING_AGG(label, ',')` over the hash-aggregate path must join
+    /// parts with the bound delimiter, skip NULLs, and not emit a
+    /// trailing delimiter for single-row groups. Regression for the bug
+    /// where the delimiter was dropped and parts joined with `""`.
+    #[test]
+    fn hash_agg_string_agg_joins_with_delimiter() {
+        let input_schema = Schema::new([
+            Field::required("group", DataType::Int32),
+            Field::nullable("label", DataType::Text { max_len: None }),
+        ])
+        .expect("schema ok");
+        let mut valid = Bitmap::new(6, true);
+        valid.set(4, false);
+        let batch = Batch::new([
+            Column::Int32(NumericColumn::from_data(vec![1, 1, 1, 2, 3, 3])),
+            Column::Utf8(
+                StringColumn::with_nulls(["a", "b", "c", "x", "", "y"].map(str::to_owned), valid)
+                    .expect("utf8"),
+            ),
+        ])
+        .expect("batch ok");
+        let scan = MemTableScan::new(input_schema, vec![batch]);
+        let out_schema = Schema::new([
+            Field::required("group", DataType::Int32),
+            Field::nullable("joined", DataType::Text { max_len: None }),
+        ])
+        .expect("schema ok");
+        let aggs = vec![LogicalAggregateExpr {
+            func: AggregateFunc::StringAgg,
+            arg: Some(col("label", 1, DataType::Text { max_len: None })),
+            direct_arg: Some(ScalarExpr::Literal {
+                value: Value::Text(",".to_owned()),
+                data_type: DataType::Text { max_len: None },
+            }),
+            order_by: None,
+            distinct: false,
+            output_name: "joined".into(),
+            data_type: DataType::Text { max_len: None },
+        }];
+        let mut op = HashAggregate::new(
+            Box::new(scan),
+            vec![col("group", 0, DataType::Int32)],
+            aggs,
+            out_schema,
+        );
+        let mut rows = drain_all(&mut op);
+        rows.sort_by_key(|r| match &r[0] {
+            Value::Int32(v) => *v,
+            _ => i32::MAX,
+        });
+
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[0][1], Value::Text("a,b,c".to_owned())); // multi-row join
+        assert_eq!(rows[1][1], Value::Text("x".to_owned())); // single row, no delimiter
+        assert_eq!(rows[2][1], Value::Text("y".to_owned())); // NULL skipped
+    }
+
+    /// `STRING_AGG(DISTINCT label, '-')` must dedupe inputs yet still join
+    /// the surviving parts with the delimiter — exercising the `Distinct`
+    /// wrapper around the separator-carrying state.
+    #[test]
+    fn hash_agg_string_agg_distinct_uses_delimiter() {
+        let input_schema = Schema::new([
+            Field::required("group", DataType::Int32),
+            Field::required("label", DataType::Text { max_len: None }),
+        ])
+        .expect("schema ok");
+        let batch = Batch::new([
+            Column::Int32(NumericColumn::from_data(vec![1, 1, 1, 1])),
+            Column::Utf8(StringColumn::from_data(
+                ["a", "b", "a", "b"].map(str::to_owned),
+            )),
+        ])
+        .expect("batch ok");
+        let scan = MemTableScan::new(input_schema, vec![batch]);
+        let out_schema = Schema::new([
+            Field::required("group", DataType::Int32),
+            Field::nullable("joined", DataType::Text { max_len: None }),
+        ])
+        .expect("schema ok");
+        let aggs = vec![LogicalAggregateExpr {
+            func: AggregateFunc::StringAgg,
+            arg: Some(col("label", 1, DataType::Text { max_len: None })),
+            direct_arg: Some(ScalarExpr::Literal {
+                value: Value::Text("-".to_owned()),
+                data_type: DataType::Text { max_len: None },
+            }),
+            order_by: None,
+            distinct: true,
+            output_name: "joined".into(),
+            data_type: DataType::Text { max_len: None },
+        }];
+        let mut op = HashAggregate::new(
+            Box::new(scan),
+            vec![col("group", 0, DataType::Int32)],
+            aggs,
+            out_schema,
+        );
+        let rows = drain_all(&mut op);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0][1], Value::Text("a-b".to_owned()));
     }
 
     #[test]

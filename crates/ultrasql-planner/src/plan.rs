@@ -217,7 +217,8 @@ pub struct LogicalAggregateExpr {
     pub func: AggregateFunc,
     /// The argument expression; `None` for `COUNT(*)`.
     pub arg: Option<ScalarExpr>,
-    /// Direct argument for ordered-set aggregates, such as percentile fraction.
+    /// Direct (non-aggregated) argument: the percentile fraction for
+    /// ordered-set aggregates, or the delimiter for `STRING_AGG`.
     pub direct_arg: Option<ScalarExpr>,
     /// Ordered-set aggregate sort key from `WITHIN GROUP`.
     pub order_by: Option<SortKey>,

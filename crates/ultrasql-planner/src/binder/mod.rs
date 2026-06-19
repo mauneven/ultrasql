@@ -777,7 +777,7 @@ fn bind_set_result_modifiers(
     scope: &mut ScopeStack,
 ) -> Result<LogicalPlan, PlanError> {
     if !order_by.is_empty() {
-        let keys = bind_order_by(order_by, plan.schema(), catalog, cte_catalog, scope)?;
+        let keys = bind_order_by(order_by, plan.schema(), None, catalog, cte_catalog, scope)?;
         plan = LogicalPlan::Sort {
             input: Box::new(plan),
             keys,
@@ -1134,14 +1134,21 @@ fn bind_order_by_around_projection_with_input_schema(
         schema,
     } = plan
     else {
-        let sort_keys = bind_order_by(order_by, input_schema, catalog, cte_catalog, scope)?;
+        let sort_keys = bind_order_by(order_by, input_schema, None, catalog, cte_catalog, scope)?;
         return Ok(LogicalPlan::Sort {
             input: Box::new(plan),
             keys: sort_keys,
         });
     };
 
-    match bind_order_by(order_by, input_schema, catalog, cte_catalog, scope) {
+    match bind_order_by(
+        order_by,
+        input_schema,
+        Some(exprs.as_slice()),
+        catalog,
+        cte_catalog,
+        scope,
+    ) {
         Ok(sort_keys) => {
             // A projection containing a subquery is NOT order-preserving:
             // decorrelation rewrites the subquery into a (hash) join that
@@ -1153,7 +1160,7 @@ fn bind_order_by_around_projection_with_input_schema(
             // residual; the common ORDER-BY-a-selected-column case is fixed.
             if exprs.iter().any(|(e, _)| e.contains_subquery()) {
                 if let Ok(output_keys) =
-                    bind_order_by(order_by, &schema, catalog, cte_catalog, scope)
+                    bind_order_by(order_by, &schema, None, catalog, cte_catalog, scope)
                 {
                     let projected = LogicalPlan::Project {
                         input,
@@ -1186,7 +1193,7 @@ fn bind_order_by_around_projection_with_input_schema(
                 exprs,
                 schema: schema.clone(),
             };
-            let sort_keys = bind_order_by(order_by, &schema, catalog, cte_catalog, scope)?;
+            let sort_keys = bind_order_by(order_by, &schema, None, catalog, cte_catalog, scope)?;
             Ok(LogicalPlan::Sort {
                 input: Box::new(projected),
                 keys: sort_keys,

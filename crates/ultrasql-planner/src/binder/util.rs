@@ -159,16 +159,28 @@ pub(super) fn derive_output_name(ast: &Expr, bound: &ScalarExpr) -> String {
     }
 }
 
+/// Bind an `ORDER BY` list into sort keys.
+///
+/// `proj_exprs`, when `Some`, are the bound projection output expressions in
+/// the sort input's schema (the `Sort` sits *below* the projection). It is the
+/// resolution target for positional ordinals (`ORDER BY 1`): see
+/// [`positional_ordinal`]. When `None`, the sort input *is* the output relation
+/// (a set-operation `ORDER BY`, or a `Sort` lifted above the projection), so an
+/// ordinal resolves to a column reference into `input`.
 pub(super) fn bind_order_by(
     items: &[OrderItem],
     input: &Schema,
+    proj_exprs: Option<&[(ScalarExpr, String)]>,
     catalog: &dyn Catalog,
     cte_catalog: &[(String, Schema)],
     scope: &mut ScopeStack,
 ) -> Result<Vec<SortKey>, PlanError> {
     let mut keys = Vec::with_capacity(items.len());
     for item in items {
-        let expr = bind_expr_with_ctes(&item.expr, input, catalog, cte_catalog, scope)?;
+        let expr = match positional_ordinal(&item.expr) {
+            Some(n) => resolve_order_ordinal(n, input, proj_exprs)?,
+            None => bind_expr_with_ctes(&item.expr, input, catalog, cte_catalog, scope)?,
+        };
         let asc = matches!(item.direction, SortDirection::Asc);
         let nulls_first = match item.nulls {
             NullsOrder::First => true,
@@ -182,6 +194,80 @@ pub(super) fn bind_order_by(
         });
     }
     Ok(keys)
+}
+
+/// A bare unsigned integer literal in `ORDER BY` / `GROUP BY` is a 1-based
+/// positional reference to the SELECT output list (PostgreSQL semantics):
+/// `ORDER BY 1` sorts by the first output column, `GROUP BY 1` groups by the
+/// first select-list expression. Returns the ordinal when `expr` is such a
+/// reference. Only an unadorned integer literal is positional — `(1)`,
+/// `1 + 0`, `-1`, and non-integer constants are ordinary expressions, matching
+/// PostgreSQL (which sorts/groups by the constant value, a no-op / single
+/// group, rather than treating them as positions).
+pub(super) fn positional_ordinal(expr: &Expr) -> Option<u64> {
+    match expr {
+        Expr::Literal(Literal::Integer { text, .. }) => text.parse::<u64>().ok(),
+        _ => None,
+    }
+}
+
+/// Validate a 1-based positional ordinal against the number of output columns
+/// (`len`) and return the 0-based index, mirroring PostgreSQL's
+/// `<clause> position N is not in select list` error.
+pub(super) fn ordinal_index(n: u64, len: usize, clause: &'static str) -> Result<usize, PlanError> {
+    usize::try_from(n)
+        .ok()
+        .filter(|&i| i >= 1 && i <= len)
+        .map(|i| i - 1)
+        .ok_or_else(|| {
+            PlanError::TypeMismatch(format!(
+                "{clause} position {n} is not in select list (valid range is 1..={len})"
+            ))
+        })
+}
+
+/// Resolve a positional `ORDER BY` ordinal to its sort-key expression.
+///
+/// With `proj_exprs` (the `Sort` sits below the projection) the ordinal maps to
+/// the already-bound projection expression, valid in the sort input's schema —
+/// this also handles wildcards, since the projection list is already expanded.
+/// Without it the ordinal maps to a column reference into `output`, whose schema
+/// is the sort input.
+fn resolve_order_ordinal(
+    n: u64,
+    output: &Schema,
+    proj_exprs: Option<&[(ScalarExpr, String)]>,
+) -> Result<ScalarExpr, PlanError> {
+    let len = proj_exprs.map_or(output.fields().len(), <[(ScalarExpr, String)]>::len);
+    let idx = ordinal_index(n, len, "ORDER BY")?;
+    Ok(match proj_exprs {
+        Some(exprs) => exprs[idx].0.clone(),
+        None => {
+            let field = &output.fields()[idx];
+            ScalarExpr::Column {
+                name: field.name.clone(),
+                index: idx,
+                data_type: field.data_type.clone(),
+            }
+        }
+    })
+}
+
+/// The SELECT output expressions a positional `GROUP BY` ordinal references,
+/// when the projection is a plain expression list. Returns `None` if the
+/// projection contains a wildcard (`*` / `t.*`): the projection is bound after
+/// `GROUP BY`, so the expanded column count is not yet known and ordinal
+/// counting would be ambiguous — the caller rejects positional `GROUP BY` in
+/// that (rare) case rather than risk grouping by the wrong column.
+pub(super) fn plain_select_exprs(projection: &[SelectItem]) -> Option<Vec<&Expr>> {
+    let mut out = Vec::with_capacity(projection.len());
+    for item in projection {
+        match item {
+            SelectItem::Expr { expr, .. } => out.push(expr),
+            SelectItem::Wildcard { .. } | SelectItem::QualifiedWildcard { .. } => return None,
+        }
+    }
+    Some(out)
 }
 
 pub(super) fn bind_unsigned_literal(expr: &Expr, label: &'static str) -> Result<u64, PlanError> {
