@@ -516,7 +516,7 @@ async fn correlated_count_scalar_subquery_returns_zero_for_unmatched_rows() {
         )
         .await
         .expect("correlated COUNT scalar subquery succeeds");
-    let mut counts: Vec<(i32, i64)> = rows
+    let counts: Vec<(i32, i64)> = rows
         .iter()
         .filter_map(|m| match m {
             tokio_postgres::SimpleQueryMessage::Row(row) => {
@@ -525,14 +525,11 @@ async fn correlated_count_scalar_subquery_returns_zero_for_unmatched_rows() {
             _ => None,
         })
         .collect();
-    // Assert on the value SET, not row order. This test verifies the COUNT
-    // semantics — an outer row with no inner match yields 0, not NULL (a NULL
-    // would `parse().ok()?`-skip and vanish from `counts`, so the length check
-    // below still catches that regression). We sort locally because `ORDER BY`
-    // is not reliably honored above the decorrelated join (a separate,
-    // pre-existing optimizer ordering issue, tracked as a follow-up), and that
-    // ordering is not what this test is about.
-    counts.sort_unstable();
+    // `ORDER BY u_id` must be honored even though the correlated COUNT subquery
+    // decorrelates into a join below the projection — the binder lifts the Sort
+    // above the (non-order-preserving) projection — so the rows arrive in u_id
+    // order. User 3 must also show 0, NOT NULL (a NULL would `parse().ok()?`-skip
+    // and disappear from `counts`).
     assert_eq!(counts, vec![(1, 2), (2, 1), (3, 0)]);
 
     shutdown(client, server_handle).await;

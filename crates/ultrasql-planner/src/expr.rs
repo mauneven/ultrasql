@@ -230,6 +230,28 @@ impl ScalarExpr {
             Self::FunctionCall { args, .. } => args.iter().any(Self::contains_outer_column),
         }
     }
+
+    /// Returns `true` if this expression contains a scalar subquery, `EXISTS`,
+    /// or `IN`-subquery anywhere in its scalar tree (it does not recurse into
+    /// the nested subplans). The binder uses this to detect a non-order-
+    /// preserving projection: decorrelation rewrites such a subquery into a
+    /// join, so a `Sort` pushed *below* the projection would be discarded and
+    /// `ORDER BY` silently violated.
+    #[must_use]
+    pub fn contains_subquery(&self) -> bool {
+        match self {
+            Self::ScalarSubquery { .. } | Self::Exists { .. } | Self::InSubquery { .. } => true,
+            Self::Column { .. }
+            | Self::Literal { .. }
+            | Self::Parameter { .. }
+            | Self::OuterColumn { .. } => false,
+            Self::Unary { expr, .. } | Self::IsNull { expr, .. } => expr.contains_subquery(),
+            Self::Binary { left, right, .. } => {
+                left.contains_subquery() || right.contains_subquery()
+            }
+            Self::FunctionCall { args, .. } => args.iter().any(Self::contains_subquery),
+        }
+    }
 }
 
 impl fmt::Display for ScalarExpr {

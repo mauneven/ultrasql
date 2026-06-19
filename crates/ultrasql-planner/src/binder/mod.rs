@@ -1143,6 +1143,29 @@ fn bind_order_by_around_projection_with_input_schema(
 
     match bind_order_by(order_by, input_schema, catalog, cte_catalog, scope) {
         Ok(sort_keys) => {
+            // A projection containing a subquery is NOT order-preserving:
+            // decorrelation rewrites the subquery into a (hash) join that
+            // discards input row order, so a `Sort` pushed *below* the
+            // projection would be silently dropped and `ORDER BY` violated.
+            // Lift the `Sort` above the projection instead, binding the keys
+            // against the OUTPUT schema. If a sort key is not an output column
+            // we cannot lift it, so we keep the below-projection form — a rare
+            // residual; the common ORDER-BY-a-selected-column case is fixed.
+            if exprs.iter().any(|(e, _)| e.contains_subquery()) {
+                if let Ok(output_keys) =
+                    bind_order_by(order_by, &schema, catalog, cte_catalog, scope)
+                {
+                    let projected = LogicalPlan::Project {
+                        input,
+                        exprs,
+                        schema,
+                    };
+                    return Ok(LogicalPlan::Sort {
+                        input: Box::new(projected),
+                        keys: output_keys,
+                    });
+                }
+            }
             let sorted_input = if sort_keys.is_empty() {
                 input
             } else {

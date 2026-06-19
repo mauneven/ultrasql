@@ -169,6 +169,36 @@ fn set_op_with_compatible_column_types_binds() {
 }
 
 #[test]
+fn order_by_with_subquery_in_projection_sorts_above_projection() {
+    // A projection containing a subquery is not order-preserving (the subquery
+    // is later decorrelated into a join that discards input order), so the
+    // ORDER BY Sort must sit ABOVE the projection, not be pushed below it.
+    let plan =
+        parse_bind_ok("SELECT id, (SELECT max(score) FROM users) AS m FROM users ORDER BY id");
+    match &plan {
+        LogicalPlan::Sort { input, .. } => assert!(
+            matches!(input.as_ref(), LogicalPlan::Project { .. }),
+            "expected Sort over Project, got Sort over {input:?}"
+        ),
+        other => panic!("expected a top-level Sort, got {other:?}"),
+    }
+}
+
+#[test]
+fn order_by_without_subquery_keeps_sort_below_projection() {
+    // Control: an order-preserving projection keeps the efficient
+    // Sort-below-projection form (sort the input, then project).
+    let plan = parse_bind_ok("SELECT id, name FROM users ORDER BY id");
+    match &plan {
+        LogicalPlan::Project { input, .. } => assert!(
+            matches!(input.as_ref(), LogicalPlan::Sort { .. }),
+            "expected Project over Sort, got Project over {input:?}"
+        ),
+        other => panic!("expected a top-level Project, got {other:?}"),
+    }
+}
+
+#[test]
 fn binds_describe_table_output_schema() {
     let plan = parse_bind_ok("DESCRIBE TABLE users");
     let fields = plan.schema().fields();
