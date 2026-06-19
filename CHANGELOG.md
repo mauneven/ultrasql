@@ -51,6 +51,11 @@ and must document the break here.
 - Release workflow emits a source tarball for Homebrew and renders a
   source-built formula.
 
+- `EXPLAIN ANALYZE` on a hybrid search query now reports the executed retrieval
+  path: candidates examined/ranked, top-k emitted, per-component score ranges
+  (BM25, vector similarity), and a recall estimate on the `HybridSearch`
+  operator, plus index/scan choice and per-filter pruning on its child
+  operators.
 - IVFFlat-indexed filtered vector queries (`WHERE … ORDER BY <vector> LIMIT k`)
   now use a probes-based ANN over-fetch (probes scaled by filter selectivity,
   exact predicate recheck) instead of falling back to an exact scan, and

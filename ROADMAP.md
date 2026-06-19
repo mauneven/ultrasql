@@ -302,10 +302,18 @@ p50 ≈ 257 µs on 2k×16d via `benchmarks/vector_ann_hnsw.sh`):
   enforced and tested under concurrency (no cross-tenant leakage), deterministic
   time-decay ranking (`relevance × decay(age)`), and TTL/decay eviction as
   tested SQL, with a documented agent-memory example.
-- Retrieval observability (PART 5): exit condition: `EXPLAIN ANALYZE` on a
-  hybrid query reports index choice, candidates examined/pruned, filter
-  selectivity, per-component scores, and a recall estimate, with tests asserting
-  the explain reflects the executed path.
+- Retrieval observability (PART 5): DONE. `EXPLAIN ANALYZE` on a hybrid query
+  now reports the full retrieval path — index/scan choice and per-filter pruning
+  on the child operators (e.g. `Filter rows_in=4 rows_out=3`), and on the
+  `HybridSearch` operator itself: candidates examined, candidates ranked, top-k
+  emitted, per-component score ranges (`bm25_score_range`,
+  `vector_similarity_range`), and a recall estimate (1.0 — the fusion ranks every
+  examined candidate exactly; any recall loss is upstream ANN over-fetch). The
+  `HybridSearch` operator is wrapped in a profiling operator and exposes its
+  child so the profile tree recurses. Test:
+  `hybrid_search_explain_analyze_reports_retrieval_stats` asserts the explain
+  reflects the executed path. (Filtered-ANN vector-index notes were also
+  corrected — see the IVFFlat entry.)
 - Killer demo + competitive benchmarks (PART 6): shipped. Fair
   `recall@k`-with-latency benchmarks versus PostgreSQL 17 + pgvector, LanceDB,
   and Qdrant in their recommended configs — same-host SIFT, computed exact ground

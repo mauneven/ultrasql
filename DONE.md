@@ -3,6 +3,26 @@
 Completed/addressed work moved out of [ROADMAP.md](ROADMAP.md). Keep this file
 as a concise evidence ledger; roadmap stays for open gates only.
 
+## 2026-06-19 retrieval observability: EXPLAIN ANALYZE for hybrid search
+
+`EXPLAIN ANALYZE` on a hybrid query now reports the executed retrieval path
+(PART 5 done).
+
+- **HybridSearch stats** (`HybridSearchStats` in
+  `crates/ultrasql-executor/src/hybrid_search.rs`): candidates examined, ranked,
+  top-k emitted, per-component score ranges (`bm25_score_range`,
+  `vector_similarity_range`), and a recall estimate (1.0 — the fusion ranks every
+  examined candidate exactly). Surfaced via `Operator::pruning_stats`.
+- **Profile-tree integration**: the lowered `HybridSearch` is wrapped in
+  `ProfiledOperator` and overrides `profile_children`, so `EXPLAIN ANALYZE`
+  shows the operator and recurses into its child scan/filter — index/scan choice
+  and per-filter pruning (e.g. `Filter rows_in=4 rows_out=3`) are read from the
+  child operators' row counts.
+- **Test**: `hybrid_search_explain_analyze_reports_retrieval_stats` asserts the
+  explain output reflects the executed path (examined/ranked/emitted, score
+  ranges, recall, and the child Filter's pruning). 44-test server vector suite +
+  executor hybrid tests green.
+
 ## 2026-06-19 IVFFlat probes-based filtered ANN + recall artifact
 
 IVFFlat-indexed filtered vector queries now use a probes-based ANN over-fetch
