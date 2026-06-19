@@ -276,12 +276,21 @@ p50 ≈ 257 µs on 2k×16d via `benchmarks/vector_ann_hnsw.sh`):
   recall@10 ≥ 0.95 at ef ≤ 128, and a committed SIFT1M artifact from the server
   wire path. The mirror also bounds crash-recovery replay cost by the same O(1)
   access.
-- Hierarchical HNSW layers (PART 3): the persistent graph is a single navigable
-  layer. Recall holds through 50k with the diversity heuristic, but a multi-layer
-  graph would lower the ef needed for a given recall at large N. Exit condition:
-  per-node levels with per-level neighbor lists, crash/WAL-replay recovery tests,
-  and a recall/latency artifact showing lower ef-for-recall at ≥ 100k vs the
-  single-layer baseline.
+- Hierarchical HNSW layers (PART 3): DONE in code. The page-backed graph is now
+  multi-layer — per-node deterministic levels + per-layer neighbor chains (v2
+  page format), a canonical `search_layer` beam, greedy `ef=1` descent through
+  upper layers, and top-down query search; the build stays deterministic
+  (WAL-replay reconstructs an identical graph) with per-layer mirror consistency
+  asserted through insert/delete/vacuum/snapshot-reload. The recall exit
+  condition is met: at 100k×64d, multi-layer roughly doubles recall@10 at every
+  ef and reaches a given recall at ~3× lower ef than the single-layer baseline
+  (recall ≈ 0.51 at ef ≈ 40 vs ef = 128); build time is ~equal at 100k (the
+  descent amortizes the cost) and ~1.5× slower below ~50k. Evidence:
+  `crates/ultrasql-bench/src/bin/hnsw_recall_sweep.rs`,
+  `operator-reports/2026-06-hnsw-hierarchical-layers.md`. A 4-dimension
+  adversarial review found zero blockers. REMAINING: a SIFT1M artifact from the
+  server wire path (structured data, absolute recall + latency at 1M) for a
+  published 1M-scale claim.
 - Agent memory primitives (PART 4): exit condition: tenant/namespace isolation
   enforced and tested under concurrency (no cross-tenant leakage), deterministic
   time-decay ranking (`relevance × decay(age)`), and TTL/decay eviction as

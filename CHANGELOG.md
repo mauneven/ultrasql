@@ -51,6 +51,15 @@ and must document the break here.
 - Release workflow emits a source tarball for Homebrew and renders a
   source-built formula.
 
+- Page-backed HNSW is now hierarchical (multi-layer), the standard HNSW
+  structure: per-node deterministic levels + per-layer neighbor chains (v2 page
+  format; v1 snapshots load as base-only), greedy top-down descent, and a
+  canonical layer beam. At 100k×64d this roughly doubles recall@10 at every ef
+  and reaches a given recall at ~3× lower ef than the prior single-layer graph
+  (much cheaper queries for the same recall), with ~equal build time at 100k. The
+  build stays deterministic (WAL-replay reconstructs an identical graph) and
+  crash/recovery-tested. A SIFT1M structured-data artifact is still pending for a
+  published 1M-scale claim.
 - Page-backed HNSW index build is now sub-quadratic: large indexes gather a new
   node's neighbors by traversing the partially-built graph instead of scanning
   every live node, and a `node_id`-indexed in-memory graph mirror gives O(1)

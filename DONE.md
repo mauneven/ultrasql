@@ -3,6 +3,37 @@
 Completed/addressed work moved out of [ROADMAP.md](ROADMAP.md). Keep this file
 as a concise evidence ledger; roadmap stays for open gates only.
 
+## 2026-06-19 hierarchical (multi-layer) HNSW
+
+The page-backed HNSW is now multi-layer, the standard hierarchical structure. At
+100k×64d it roughly doubles recall@10 at every ef and reaches a given recall at
+~3× lower ef than the single-layer baseline (the PART 3 recall exit condition).
+
+- **Durable format:** v2 page format (landed earlier) carries per-node `level` +
+  per-layer neighbor chains; base layer (level 0) keeps the original layout, so
+  v1 snapshots load as base-only. WAL record format unchanged.
+- **Deterministic levels:** `hnsw_assign_level` derives a node's level from a
+  hash of its (monotonic) id, so WAL replay and snapshot-resumed replay
+  reconstruct byte-identical levels and graph. Levels are also persisted.
+- **Algorithm:** canonical `search_layer` beam (deterministic via a total order
+  on `(distance, node_id)`); insert does a greedy `ef=1` descent through the
+  upper layers, then connects from `min(node_level, entry_level)` down to the
+  base with the diversity heuristic and per-layer caps (`2*m` base, `m` upper);
+  query search descends top-down then beams the base. Entry point is the
+  highest-level live node; `mark_deleted`/`vacuum_deleted`/`from_page_images`
+  recompute it and relink per layer.
+- **Mirror:** the in-memory mirror is now per-layer (`levels: Vec<Vec<…>>`),
+  rebuilt from pages on load and kept in lockstep on every mutation.
+- **Verified:** recall (≥0.95@ef≤128 at 16d, ≥0.9@ef=64 at 3k), genuine
+  multi-layer build, determinism, per-layer mirror consistency through
+  insert/delete/vacuum/snapshot-reload, v1/v2 format round-trip; 41-test server
+  vector recovery suite green; 4-dimension adversarial review with zero blockers.
+- **Measured (Apple M4, 100k×64d, m=16):** recall@10 single→multi 0.34→0.61 at
+  ef=64, 0.51→0.79 at ef=128; build ~equal (78s vs 80s). Evidence:
+  `crates/ultrasql-bench/src/bin/hnsw_recall_sweep.rs`,
+  `operator-reports/2026-06-hnsw-hierarchical-layers.md`. SIFT1M structured-data
+  artifact remains for the release host.
+
 ## 2026-06-19 in-memory HNSW graph mirror (O(1) node access)
 
 Built on the same-day graph-traversal build below. A `node_id`-indexed in-memory
