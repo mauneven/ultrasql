@@ -35,13 +35,16 @@
 //! certificate verification. It is accepted by the parser but is not
 //! wired into the [`rustls::ServerConfig`] yet.
 
+use std::io;
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 use std::sync::Arc;
+use std::task::{Context, Poll};
 
 use rustls::pki_types::pem::PemObject;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 use thiserror::Error;
-use tokio::io::{AsyncRead, AsyncWrite};
+use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio_rustls::server::TlsStream;
 
 /// The 4-byte magic number that PostgreSQL clients send to request TLS.
@@ -175,6 +178,117 @@ impl TlsHandshake {
         let acceptor = tokio_rustls::TlsAcceptor::from(config);
         let tls_stream = acceptor.accept(stream).await?;
         Ok(tls_stream)
+    }
+}
+
+// ── MaybeTlsStream ────────────────────────────────────────────────────────────
+
+/// A connection stream that is either plaintext or has been upgraded to TLS.
+///
+/// The session runs over this wrapper so the PostgreSQL `SSLRequest`
+/// negotiation can swap a plaintext socket for a TLS one *in place* (via
+/// [`MaybeTlsStream::upgrade`]) without the session having to be generic over
+/// two distinct stream types.
+#[derive(Debug)]
+pub enum MaybeTlsStream<S> {
+    /// Not encrypted (no `SSLRequest`, or the server declined TLS).
+    Plain(S),
+    /// Encrypted after a successful `SSLRequest` upgrade.
+    Tls(Box<TlsStream<S>>),
+    /// Transient placeholder held only while an upgrade is in flight. Any I/O
+    /// against it fails — the connection is being torn down at that point.
+    Taken,
+}
+
+impl<S> MaybeTlsStream<S>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send,
+{
+    /// Run the server side of a TLS handshake, replacing a [`Plain`] stream
+    /// with a [`Tls`] one. A no-op if the stream is already upgraded.
+    ///
+    /// On handshake failure the stream is left in the [`Taken`] state and the
+    /// error is returned; the caller is expected to drop the connection.
+    ///
+    /// [`Plain`]: MaybeTlsStream::Plain
+    /// [`Tls`]: MaybeTlsStream::Tls
+    /// [`Taken`]: MaybeTlsStream::Taken
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TlsError::Io`] if the TLS handshake fails.
+    pub async fn upgrade(&mut self, config: Arc<rustls::ServerConfig>) -> Result<(), TlsError> {
+        match std::mem::replace(self, MaybeTlsStream::Taken) {
+            MaybeTlsStream::Plain(plain) => {
+                let tls = TlsHandshake::upgrade(plain, config).await?;
+                *self = MaybeTlsStream::Tls(Box::new(tls));
+                Ok(())
+            }
+            other => {
+                *self = other;
+                Ok(())
+            }
+        }
+    }
+
+    /// Returns `true` once the connection has been upgraded to TLS.
+    #[must_use]
+    pub const fn is_tls(&self) -> bool {
+        matches!(self, MaybeTlsStream::Tls(_))
+    }
+}
+
+fn stream_taken_error() -> io::Error {
+    io::Error::other("connection stream taken during TLS upgrade")
+}
+
+impl<S> AsyncRead for MaybeTlsStream<S>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        match self.get_mut() {
+            MaybeTlsStream::Plain(s) => Pin::new(s).poll_read(cx, buf),
+            MaybeTlsStream::Tls(s) => Pin::new(s.as_mut()).poll_read(cx, buf),
+            MaybeTlsStream::Taken => Poll::Ready(Err(stream_taken_error())),
+        }
+    }
+}
+
+impl<S> AsyncWrite for MaybeTlsStream<S>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        match self.get_mut() {
+            MaybeTlsStream::Plain(s) => Pin::new(s).poll_write(cx, buf),
+            MaybeTlsStream::Tls(s) => Pin::new(s.as_mut()).poll_write(cx, buf),
+            MaybeTlsStream::Taken => Poll::Ready(Err(stream_taken_error())),
+        }
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        match self.get_mut() {
+            MaybeTlsStream::Plain(s) => Pin::new(s).poll_flush(cx),
+            MaybeTlsStream::Tls(s) => Pin::new(s.as_mut()).poll_flush(cx),
+            MaybeTlsStream::Taken => Poll::Ready(Err(stream_taken_error())),
+        }
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        match self.get_mut() {
+            MaybeTlsStream::Plain(s) => Pin::new(s).poll_shutdown(cx),
+            MaybeTlsStream::Tls(s) => Pin::new(s.as_mut()).poll_shutdown(cx),
+            MaybeTlsStream::Taken => Poll::Ready(Err(stream_taken_error())),
+        }
     }
 }
 

@@ -115,6 +115,16 @@ struct Cli {
     #[arg(long, env = "ULTRASQL_HBA_FILE")]
     hba_file: Option<PathBuf>,
 
+    /// Path to the server's PEM-encoded TLS certificate. When set (together with
+    /// `--tls-key`), a client `SSLRequest` upgrades the connection to TLS.
+    #[arg(long, env = "ULTRASQL_TLS_CERT", requires = "tls_key")]
+    tls_cert: Option<PathBuf>,
+
+    /// Path to the server's PKCS#8 PEM-encoded TLS private key (paired with
+    /// `--tls-cert`).
+    #[arg(long, env = "ULTRASQL_TLS_KEY", requires = "tls_cert")]
+    tls_key: Option<PathBuf>,
+
     /// Tracing level filter, e.g. `info`, `debug`, `ultrasqld=trace`.
     #[arg(long, default_value = "info")]
     log_level: String,
@@ -301,6 +311,13 @@ fn main() -> std::process::ExitCode {
             return std::process::ExitCode::from(1);
         }
     };
+    let tls_config = match tls_config_from_cli(&cli) {
+        Ok(config) => config,
+        Err(e) => {
+            error!(target: "ultrasqld", error = %e, "invalid TLS configuration");
+            return std::process::ExitCode::from(1);
+        }
+    };
     if let Err(e) = listen_security_from_cli(&cli) {
         error!(target: "ultrasqld", error = %e, "invalid listener security configuration");
         return std::process::ExitCode::from(1);
@@ -364,6 +381,7 @@ fn main() -> std::process::ExitCode {
                     server.set_idle_session_timeout_ms(cli.idle_session_timeout_ms);
                     server.set_wal_archive_config(wal_archive_config.clone());
                     server = apply_auth_config(server, &auth_config);
+                    server = apply_tls_config(server, &tls_config);
                     Arc::new(server)
                 }
                 Err(e) => {
@@ -379,6 +397,7 @@ fn main() -> std::process::ExitCode {
             server.set_idle_session_timeout_ms(cli.idle_session_timeout_ms);
             server.set_wal_archive_config(wal_archive_config);
             server = apply_auth_config(server, &auth_config);
+            server = apply_tls_config(server, &tls_config);
             Arc::new(server)
         }
     };
@@ -1082,6 +1101,32 @@ fn apply_auth_config(mut server: Server, auth_config: &Option<AuthConfig>) -> Se
     server
 }
 
+fn tls_config_from_cli(cli: &Cli) -> Result<Option<std::sync::Arc<rustls::ServerConfig>>, String> {
+    // clap's `requires` guarantees cert and key are both set or both absent.
+    let (Some(cert_file), Some(key_file)) = (cli.tls_cert.as_deref(), cli.tls_key.as_deref())
+    else {
+        return Ok(None);
+    };
+    let tls_config = ultrasql_server::tls::TlsConfig {
+        cert_file: cert_file.to_path_buf(),
+        key_file: key_file.to_path_buf(),
+        ca_file: None,
+    };
+    let server_config = ultrasql_server::tls::TlsHandshake::build_server_config(&tls_config)
+        .map_err(|e| format!("load TLS certificate/key: {e}"))?;
+    Ok(Some(server_config))
+}
+
+fn apply_tls_config(
+    mut server: Server,
+    tls_config: &Option<std::sync::Arc<rustls::ServerConfig>>,
+) -> Server {
+    if let Some(config) = tls_config {
+        server = server.with_tls(config.clone());
+    }
+    server
+}
+
 fn logging_config_from_cli(cli: &Cli) -> Result<LoggingConfig, String> {
     if cli.log_min_duration_statement_ms < -1 {
         return Err("log_min_duration_statement_ms must be -1 or greater".to_string());
@@ -1781,6 +1826,8 @@ mod tests {
             auth_password_file: None,
             auth_method: "scram".to_owned(),
             hba_file: None,
+            tls_cert: None,
+            tls_key: None,
             log_level: "info".to_owned(),
             log_format: LogFormat::Text,
             log_connections: false,
@@ -1822,6 +1869,8 @@ mod tests {
             auth_password_file: None,
             auth_method: "scram".to_owned(),
             hba_file: None,
+            tls_cert: None,
+            tls_key: None,
             log_level: "info".to_owned(),
             log_format: LogFormat::Text,
             log_connections: false,
@@ -1858,6 +1907,8 @@ mod tests {
             auth_password_file: None,
             auth_method: "scram".to_owned(),
             hba_file: None,
+            tls_cert: None,
+            tls_key: None,
             log_level: "info".to_owned(),
             log_format: LogFormat::Text,
             log_connections: false,
@@ -1894,6 +1945,8 @@ mod tests {
             auth_password_file: None,
             auth_method: "scram".to_owned(),
             hba_file: None,
+            tls_cert: None,
+            tls_key: None,
             log_level: "info".to_owned(),
             log_format: LogFormat::Json,
             log_connections: true,
@@ -1934,6 +1987,8 @@ mod tests {
             auth_password_file: None,
             auth_method: "scram".to_owned(),
             hba_file: None,
+            tls_cert: None,
+            tls_key: None,
             log_level: "info".to_owned(),
             log_format: LogFormat::Text,
             log_connections: false,
@@ -1984,6 +2039,8 @@ mod tests {
             auth_password_file: Some(password_file),
             auth_method: "scram".to_owned(),
             hba_file: None,
+            tls_cert: None,
+            tls_key: None,
             log_level: "info".to_owned(),
             log_format: LogFormat::Text,
             log_connections: false,
@@ -2097,6 +2154,8 @@ mod tests {
             auth_password_file: None,
             auth_method: "scram".to_owned(),
             hba_file: None,
+            tls_cert: None,
+            tls_key: None,
             log_level: "info".to_owned(),
             log_format: LogFormat::Text,
             log_connections: false,
@@ -2206,6 +2265,8 @@ mod tests {
             auth_password_file: Some(password_file),
             auth_method: "scram".to_owned(),
             hba_file: None,
+            tls_cert: None,
+            tls_key: None,
             log_level: "info".to_owned(),
             log_format: LogFormat::Text,
             log_connections: false,
@@ -2240,6 +2301,8 @@ mod tests {
             auth_password_file: None,
             auth_method: "scram".to_owned(),
             hba_file: None,
+            tls_cert: None,
+            tls_key: None,
             log_level: "info".to_owned(),
             log_format: LogFormat::Text,
             log_connections: false,

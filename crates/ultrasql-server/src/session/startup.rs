@@ -14,7 +14,7 @@ use crate::error::ServerError;
 
 impl<RW> Session<RW>
 where
-    RW: AsyncRead + AsyncWrite + Unpin,
+    RW: AsyncRead + AsyncWrite + Unpin + Send,
 {
     /// Read the startup message and emit the canonical handshake.
     pub(crate) async fn startup(&mut self) -> Result<(), ServerError> {
@@ -47,14 +47,46 @@ where
                     let _ = self.state.cancel_registry.request_cancel(pid, secret);
                     return Ok(());
                 }
-                // SSLRequest / GSSENCRequest: `libpq`/`psql` send these as the
-                // very first message (default `sslmode=prefer` sends
-                // SSLRequest). PostgreSQL must answer with a single byte: `'S'`
-                // to upgrade or `'N'` to decline. We do not negotiate TLS/GSS
-                // yet, so we decline with `'N'`; a `prefer` client then
-                // continues in plaintext (previously the server dropped the
-                // socket with no reply, so stock clients failed to connect).
-                FrontendMessage::SslRequest | FrontendMessage::GssEncRequest => {
+                // SSLRequest / GSSENCRequest precede the real StartupMessage
+                // (default `sslmode=prefer` sends SSLRequest). PostgreSQL answers
+                // with a single byte: `'S'` to upgrade or `'N'` to decline. We
+                // answer SSLRequest with `'S'` and upgrade the stream to TLS in
+                // place when a server certificate is configured — the real
+                // StartupMessage then arrives encrypted — otherwise decline with
+                // `'N'` (a `prefer` client continues in plaintext). GSS
+                // encryption is always declined.
+                FrontendMessage::SslRequest => {
+                    negotiation_attempts += 1;
+                    if negotiation_attempts > 2 {
+                        debug!(target: "ultrasqld", "too many pre-startup negotiation requests");
+                        return Err(ServerError::UnexpectedEof);
+                    }
+                    if let Some(config) = self.state.tls_server_config.clone() {
+                        // A client must send nothing between the SSLRequest and
+                        // the TLS handshake. Any buffered bytes here are
+                        // plaintext that arrived before encryption and would
+                        // otherwise be processed as if they came over TLS — a
+                        // protocol-injection vector (cf. CVE-2021-23214). Reject.
+                        if !self.read_buf.is_empty() {
+                            debug!(
+                                target: "ultrasqld",
+                                "unexpected data after SSLRequest; rejecting before TLS upgrade"
+                            );
+                            return Err(ServerError::UnexpectedEof);
+                        }
+                        self.io.write_all(b"S").await?;
+                        self.io.flush().await?;
+                        if let Err(err) = self.io.upgrade(config).await {
+                            debug!(target: "ultrasqld", error = %err, "TLS handshake failed");
+                            return Err(ServerError::UnexpectedEof);
+                        }
+                    } else {
+                        self.io.write_all(b"N").await?;
+                        self.io.flush().await?;
+                    }
+                    continue;
+                }
+                FrontendMessage::GssEncRequest => {
                     negotiation_attempts += 1;
                     if negotiation_attempts > 2 {
                         debug!(target: "ultrasqld", "too many pre-startup negotiation requests");
@@ -454,12 +486,15 @@ where
         use crate::auth::{HbaConnectionKind, HbaMethod};
 
         // No client IP means an in-process / Unix-socket connection, which
-        // matches `local` rules; a TCP peer matches non-SSL `host` rules (TLS
-        // is not yet negotiated, so `hostssl` rules never match).
-        let conn_kind = if self.peer_ip.is_some() {
-            HbaConnectionKind::HostNoSsl
-        } else {
+        // matches `local` rules. A TCP peer matches `host` rules plus either
+        // `hostssl` or `hostnossl` depending on whether the SSLRequest upgraded
+        // the connection to TLS by this point.
+        let conn_kind = if self.peer_ip.is_none() {
             HbaConnectionKind::Local
+        } else if self.io.is_tls() {
+            HbaConnectionKind::HostSsl
+        } else {
+            HbaConnectionKind::HostNoSsl
         };
         // Canonicalize an IPv4-mapped IPv6 peer (e.g. `::ffff:127.0.0.1`, which
         // a dual-stack listener reports for an IPv4 client) to its IPv4 form so

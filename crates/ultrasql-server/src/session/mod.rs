@@ -44,7 +44,7 @@ mod timeout;
 mod txn;
 
 pub(crate) struct Session<RW> {
-    pub(super) io: RW,
+    pub(super) io: crate::tls::MaybeTlsStream<RW>,
     pub(super) read_buf: BytesMut,
     pub(super) write_buf: BytesMut,
     pub(super) state: Arc<Server>,
@@ -183,7 +183,9 @@ where
         let notify_rx = state.notify_hub.register_connection(pid);
         state.workload_recorder.register_session(pid, "tester");
         Self {
-            io,
+            // Start plaintext; a client `SSLRequest` upgrades it in place when
+            // the server has a TLS config (see `startup`).
+            io: crate::tls::MaybeTlsStream::Plain(io),
             read_buf: BytesMut::with_capacity(READ_BUFFER_INITIAL),
             write_buf: BytesMut::with_capacity(READ_BUFFER_INITIAL),
             state,

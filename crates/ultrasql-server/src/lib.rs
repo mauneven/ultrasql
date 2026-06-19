@@ -3323,6 +3323,11 @@ pub struct Server {
     /// `Trust` accepts any startup, `Md5` runs a real password
     /// challenge with [`crate::auth::md5`].
     pub auth: AuthConfig,
+    /// Optional TLS server configuration. When present, a client `SSLRequest`
+    /// is answered with `'S'` and the connection is upgraded to TLS before the
+    /// PostgreSQL startup handshake; when absent, `SSLRequest` is declined
+    /// (`'N'`) and the session continues in plaintext.
+    pub tls_server_config: Option<Arc<rustls::ServerConfig>>,
     /// Same-process role catalog backing role DDL and virtual auth views.
     pub role_catalog: Arc<auth::InMemoryAuthCatalog>,
     /// Same-process per-role live-session counter for `CONNECTION LIMIT`.
@@ -5071,6 +5076,7 @@ impl Server {
             wal_archive_config: WalArchiveConfig::default(),
             two_phase,
             auth: AuthConfig::Trust,
+            tls_server_config: None,
             role_catalog: Arc::new(auth::InMemoryAuthCatalog::with_bootstrap_superuser()),
             role_connection_limiter: Arc::new(auth::RoleConnectionLimiter::new()),
             privilege_catalog: sample_privilege_catalog(),
@@ -5557,6 +5563,18 @@ impl Server {
         self
     }
 
+    /// Builder: enable TLS with a prepared rustls server configuration.
+    ///
+    /// Build the config from a [`crate::tls::TlsConfig`] via
+    /// [`crate::tls::TlsHandshake::build_server_config`]. Once set, a client
+    /// `SSLRequest` is answered with `'S'` and the connection is upgraded to
+    /// TLS before the startup handshake.
+    #[must_use]
+    pub fn with_tls(mut self, config: Arc<rustls::ServerConfig>) -> Self {
+        self.tls_server_config = Some(config);
+        self
+    }
+
     /// Record a successful commit and, every
     /// [`UNDO_GC_INTERVAL_COMMITS`] commits, run maintenance:
     /// undo-log GC plus one pending auto-analyze task.
@@ -5936,6 +5954,7 @@ impl Server {
             wal_archive_config: WalArchiveConfig::default(),
             two_phase,
             auth: AuthConfig::Trust,
+            tls_server_config: None,
             role_catalog: Arc::new(auth::InMemoryAuthCatalog::with_bootstrap_superuser()),
             role_connection_limiter: Arc::new(auth::RoleConnectionLimiter::new()),
             privilege_catalog: sample_privilege_catalog(),
@@ -9781,7 +9800,7 @@ where
 /// disconnects. Per-query execution is delegated to [`run_select`].
 pub async fn handle_connection<RW>(io: RW, state: Arc<Server>) -> Result<(), ServerError>
 where
-    RW: AsyncRead + AsyncWrite + Unpin,
+    RW: AsyncRead + AsyncWrite + Unpin + Send,
 {
     handle_connection_with_peer(io, state, None).await
 }
@@ -9798,7 +9817,7 @@ pub async fn handle_connection_with_peer<RW>(
     peer: Option<std::net::IpAddr>,
 ) -> Result<(), ServerError>
 where
-    RW: AsyncRead + AsyncWrite + Unpin,
+    RW: AsyncRead + AsyncWrite + Unpin + Send,
 {
     let mut session = Session::new(io, state, peer);
     // Slow-loris guard. A peer that opens the TCP connection and then
