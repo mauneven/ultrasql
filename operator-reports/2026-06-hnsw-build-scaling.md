@@ -45,17 +45,36 @@ roadmap point was ~424 s by the same curve.
 
 The before-build is super-quadratic; the after-build is sub-quadratic with the
 win growing as N grows, and **no regression below the ~8k crossover** (those
-sizes still use the exhaustive scan). Extrapolating the after-curve puts 50k at
-roughly 80 s (≈ 5–6× faster than the ~424 s baseline).
+sizes still use the exhaustive scan).
+
+## Update — in-memory graph mirror (the documented next step, now landed)
+
+The gated traversal was still bottlenecked by the page-backed arena's `BTreeMap`
+block lookups (a dims-independent fixed cost per probe). Adding a `node_id`-
+indexed in-memory mirror of the graph (vectors + adjacency in flat arrays,
+rebuilt from pages on load, kept in lockstep on mutation; pages stay
+authoritative and snapshots are unchanged) makes per-node access O(1). This
+speeds up the full-scan branch too (its candidate scan now reads the mirror, not
+page chains), so even small indexes get faster:
+
+| rows  | before (full-scan) | with mirror | speedup vs before |
+|------:|-------------------:|------------:|------------------:|
+|  2000 |             0.49 s |      0.38 s |             ~1.3× |
+|  5000 |             2.37 s |      1.57 s |             ~1.5× |
+| 10000 |            18.68 s |      5.25 s |              3.6× |
+| 20000 |          ~80 s (¹) |     13.58 s |             ~5.9× |
+| 50000 |           ~424 s   |     41.17 s |             ~10×  |
+
+The mirror build is ~O(N^1.4) (50k = 41 s). This makes SIFT1M-scale builds
+**feasible** (~45 min extrapolated, versus effectively impractical before).
 
 ## Honest remaining gap
 
-This is sub-quadratic but **not** yet pgvector-competitive at SIFT1M. The
-residual constant factor is the page-backed arena's `BTreeMap` block lookups:
-each traversal probe still chases the page store (and neighbor chains) per node,
-a dims-independent fixed cost that the zero-copy view reduced but did not remove.
-Closing the SIFT1M gap (build in minutes, committed SIFT1M artifact from the
-server wire path) needs an in-memory, densely-indexed mirror of the graph
-(vectors + adjacency in flat arrays, node_id-indexed) feeding both the build
-traversal and search, so per-node access is O(1) instead of O(log N) pointer
-chasing. That mirror is the documented next step in `ROADMAP.md`.
+The build is feasible at 1M but **not yet pgvector-competitive** ("minutes" at
+1M). The residual cost is the single-layer HNSW traversal: per-insert
+construction-search cost still grows with N because there is no upper navigation
+layer to shorten the descent. Closing that gap is the separate **hierarchical
+HNSW layers** roadmap item (per-node levels + per-level neighbor lists), which
+would cut the ef needed for a given recall and the traversal depth at large N.
+A committed SIFT1M artifact from the server wire path is still required before
+any 1M-scale build claim.

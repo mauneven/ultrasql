@@ -3,6 +3,39 @@
 Completed/addressed work moved out of [ROADMAP.md](ROADMAP.md). Keep this file
 as a concise evidence ledger; roadmap stays for open gates only.
 
+## 2026-06-19 in-memory HNSW graph mirror (O(1) node access)
+
+Built on the same-day graph-traversal build below. A `node_id`-indexed in-memory
+mirror of the page-backed HNSW graph removes the `BTreeMap` per-probe constant
+factor, taking the 50k×128d build from ~424 s to ~41 s (~10×).
+
+- **Mirror:** `PageBackedHnswStorage.mirror: Vec<Option<MirrorNode>>` holds each
+  node's vector, adjacency, tid, and tombstone flag in flat `node_id`-indexed
+  arrays. Graph traversal and search read it for O(1) access instead of
+  `BTreeMap` block lookups + overflow-chain walks (`node_probe_distance`,
+  `neighbors_for_node`, `live_node_snapshot`, `trim_neighbor_list`, and the
+  construction-candidate materialization all read the mirror).
+- **Pages stay authoritative:** the mirror is a pure in-memory accelerator,
+  never serialized. The snapshot/WAL format is unchanged. It is rebuilt wholesale
+  from pages on load (`rebuild_mirror`, called from `from_page_images`, which
+  `from_snapshot_bytes` delegates to) and maintained in lockstep on every live
+  mutation (insert, `write_neighbors`, `mark_deleted`, `vacuum_deleted`, and WAL
+  replay, which reuses those same methods).
+- **Correctness:** `page_backed_hnsw_mirror_stays_consistent_through_dml_and_reload`
+  asserts the mirror is byte-for-byte equal to the page-derived state through
+  insert → delete → vacuum → snapshot reload, and that post-vacuum search never
+  returns a tombstoned/vacuumed tid. The 41-test server vector recovery suite
+  (`vector_type_round_trip`) and the build determinism/recall tests stay green.
+  A 4-dimension adversarial review (divergence, recovery, determinism, memory)
+  returned zero findings.
+- **Measured (Apple M4, 128d, m=16):** 10k 18.7 s→5.2 s, 20k ~80 s→13.6 s, 50k
+  ~424 s→41 s; even small indexes faster (2k 0.49 s→0.38 s). Build is ~O(N^1.4),
+  making SIFT1M-scale builds feasible (~45 min). Evidence:
+  `benchmarks/vector_hnsw_build_scaling.sh`,
+  `operator-reports/2026-06-hnsw-build-scaling.md`. Cost: the mirror duplicates
+  vectors in RAM (~2× vector memory), an accepted tradeoff for an in-RAM ANN
+  graph. Remaining 1M "minutes" target folds into the hierarchical-layers item.
+
 ## 2026-06-19 sub-quadratic page-backed HNSW build (graph-traversal construction)
 
 The page-backed (server) HNSW build is no longer O(N²). Graph-search candidate

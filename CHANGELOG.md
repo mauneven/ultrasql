@@ -51,15 +51,16 @@ and must document the break here.
 - Release workflow emits a source tarball for Homebrew and renders a
   source-built formula.
 
-### Changed
-
 - Page-backed HNSW index build is now sub-quadratic: large indexes gather a new
   node's neighbors by traversing the partially-built graph instead of scanning
-  every live node, with a single-page zero-copy vector view removing the
-  per-probe allocation. Small/medium indexes keep the exhaustive scan (no
-  regression). Measured 2.3×–3.7× faster at 10k–20k×128d; the SIFT1M-scale gap
-  stays open (see ROADMAP). Build stays deterministic and recall holds
-  (recall@10 ≥ 0.95 at ef ≤ 128).
+  every live node, and a `node_id`-indexed in-memory graph mirror gives O(1)
+  per-node access for both build and search (durable pages stay authoritative;
+  snapshot/WAL format unchanged). Measured ~10× faster at 50k×128d (≈424 s→41 s),
+  3.6× at 10k, with even small indexes faster and no regression; build stays
+  deterministic and recall holds (recall@10 ≥ 0.95 at ef ≤ 128). SIFT1M-scale
+  builds are now feasible; the pgvector-competitive "minutes at 1M" target folds
+  into the hierarchical-layers work (see ROADMAP). The mirror duplicates vectors
+  in RAM (~2× vector memory).
 - README benchmark tables are restricted to SQL-surface measurements. Kernel
   microbenchmarks stay internal and are not published as DB-vs-DB claims.
 - Roadmap items now distinguish implemented runtime surfaces from certification
