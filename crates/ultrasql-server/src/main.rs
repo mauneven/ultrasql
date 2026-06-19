@@ -32,7 +32,8 @@ use tokio::net::{TcpListener, TcpStream};
 use tracing::{error, info};
 use tracing_subscriber::EnvFilter;
 use ultrasql_server::{
-    AutovacuumConfig, LogStatementMode, LoggingConfig, Server, WalArchiveConfig, run_server,
+    AuthConfig, AutovacuumConfig, LogStatementMode, LoggingConfig, Server, WalArchiveConfig,
+    run_server,
 };
 
 const OPS_REQUEST_HEAD_LIMIT_BYTES: usize = 8 * 1024;
@@ -92,9 +93,20 @@ struct Cli {
     #[arg(long, env = "ULTRASQL_AUTH_USER")]
     auth_user: Option<String>,
 
-    /// File containing the MD5 authentication password for `--auth-user`.
+    /// File containing the authentication password for `--auth-user`.
     #[arg(long, env = "ULTRASQL_AUTH_PASSWORD_FILE")]
     auth_password_file: Option<PathBuf>,
+
+    /// Password authentication method for `--auth-user`: `scram`
+    /// (SCRAM-SHA-256, recommended — the password never crosses the wire and
+    /// the server stores only a derived verifier) or `md5` (legacy).
+    #[arg(
+        long,
+        env = "ULTRASQL_AUTH_METHOD",
+        default_value = "scram",
+        value_parser = ["scram", "md5"],
+    )]
+    auth_method: String,
 
     /// Tracing level filter, e.g. `info`, `debug`, `ultrasqld=trace`.
     #[arg(long, default_value = "info")]
@@ -239,8 +251,9 @@ Supported query shapes in v0.5:
 Production-oriented v0.9 flags:
   - --data-dir DIR      boot WAL-backed storage
   - --allow-insecure-listen  permit trust-auth listener outside loopback
-  - --auth-user USER    require MD5 password auth for this PostgreSQL user
-  - --auth-password-file PATH  read MD5 auth password from a private local secret file
+  - --auth-user USER    require password auth for this PostgreSQL user
+  - --auth-password-file PATH  read the auth password from a private local secret file
+  - --auth-method METHOD  scram (SCRAM-SHA-256, default) or md5 (legacy)
   - --ops-listen ADDR   serve /health, /ready, /metrics, and backup routes
   - --ops-token TOKEN   require bearer token for /backup/start and /backup/stop
   - --log-format json   emit structured logs
@@ -858,7 +871,7 @@ fn ops_token_from_cli(cli: &Cli) -> Result<Option<Arc<str>>, String> {
     Ok(Some(Arc::<str>::from(token)))
 }
 
-fn auth_config_from_cli(cli: &Cli) -> Result<Option<(String, String)>, String> {
+fn auth_config_from_cli(cli: &Cli) -> Result<Option<AuthConfig>, String> {
     match (cli.auth_user.as_deref(), cli.auth_password_file.as_deref()) {
         (None, None) => Ok(None),
         (Some(_), None) => Err("auth_password_file is required when auth_user is set".to_string()),
@@ -868,7 +881,33 @@ fn auth_config_from_cli(cli: &Cli) -> Result<Option<(String, String)>, String> {
             let raw = read_auth_password_file(password_file)?;
             let password = raw.strip_suffix('\n').unwrap_or(raw.as_str());
             validate_auth_password(password)?;
-            Ok(Some((user.to_owned(), password.to_owned())))
+            let auth = match cli.auth_method.as_str() {
+                "md5" => AuthConfig::Md5 {
+                    username: user.to_owned(),
+                    password: password.to_owned(),
+                },
+                "scram" => {
+                    // Derive the SCRAM verifier once, here, so the plaintext
+                    // password is never stored on the server.
+                    let salt = ultrasql_server::auth::PasswordHash::random_salt();
+                    let verifier = ultrasql_server::auth::PasswordHash::hash_password(
+                        password,
+                        &salt,
+                        ultrasql_server::auth::scram::DEFAULT_ITERATIONS,
+                    )
+                    .map_err(|e| format!("derive SCRAM verifier: {e}"))?;
+                    AuthConfig::Scram {
+                        username: user.to_owned(),
+                        verifier,
+                    }
+                }
+                other => {
+                    return Err(format!(
+                        "unknown auth method '{other}'; expected 'scram' or 'md5'"
+                    ));
+                }
+            };
+            Ok(Some(auth))
         }
     }
 }
@@ -1002,9 +1041,9 @@ fn validate_auth_password(password: &str) -> Result<(), String> {
     Ok(())
 }
 
-fn apply_auth_config(mut server: Server, auth_config: &Option<(String, String)>) -> Server {
-    if let Some((username, password)) = auth_config {
-        server = server.require_md5_password(username.clone(), password.clone());
+fn apply_auth_config(mut server: Server, auth_config: &Option<AuthConfig>) -> Server {
+    if let Some(auth) = auth_config {
+        server = server.with_auth(auth.clone());
     }
     server
 }
@@ -1706,6 +1745,7 @@ mod tests {
             ops_token: None,
             auth_user: None,
             auth_password_file: None,
+            auth_method: "scram".to_owned(),
             log_level: "info".to_owned(),
             log_format: LogFormat::Text,
             log_connections: false,
@@ -1745,6 +1785,7 @@ mod tests {
             ops_token: None,
             auth_user: None,
             auth_password_file: None,
+            auth_method: "scram".to_owned(),
             log_level: "info".to_owned(),
             log_format: LogFormat::Text,
             log_connections: false,
@@ -1779,6 +1820,7 @@ mod tests {
             ops_token: None,
             auth_user: None,
             auth_password_file: None,
+            auth_method: "scram".to_owned(),
             log_level: "info".to_owned(),
             log_format: LogFormat::Text,
             log_connections: false,
@@ -1813,6 +1855,7 @@ mod tests {
             ops_token: None,
             auth_user: None,
             auth_password_file: None,
+            auth_method: "scram".to_owned(),
             log_level: "info".to_owned(),
             log_format: LogFormat::Json,
             log_connections: true,
@@ -1851,6 +1894,7 @@ mod tests {
             ops_token: None,
             auth_user: None,
             auth_password_file: None,
+            auth_method: "scram".to_owned(),
             log_level: "info".to_owned(),
             log_format: LogFormat::Text,
             log_connections: false,
@@ -1899,6 +1943,7 @@ mod tests {
             ops_token: None,
             auth_user: Some("alice".to_owned()),
             auth_password_file: Some(password_file),
+            auth_method: "scram".to_owned(),
             log_level: "info".to_owned(),
             log_format: LogFormat::Text,
             log_connections: false,
@@ -1922,18 +1967,42 @@ mod tests {
 
         let auth = auth_config_from_cli(&cli).expect("password file auth config");
 
-        assert_eq!(
-            auth,
-            Some(("alice".to_owned(), "very-secret-password".to_owned()))
-        );
+        // The default `--auth-method` is SCRAM-SHA-256.
+        match auth {
+            Some(ultrasql_server::AuthConfig::Scram { username, .. }) => {
+                assert_eq!(username, "alice");
+            }
+            other => panic!("expected SCRAM auth, got {other:?}"),
+        }
         assert!(listen_security_from_cli(&cli).is_ok());
+    }
+
+    #[test]
+    fn auth_config_from_cli_md5_method_selects_md5() {
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let password_file = dir.path().join("password");
+        write_private_password_file(&password_file, "very-secret-password\n");
+        let mut cli = cli_with_auth_password_file(password_file);
+        cli.auth_user = Some("alice".to_owned());
+        cli.auth_method = "md5".to_owned();
+
+        match auth_config_from_cli(&cli).expect("md5 auth config") {
+            Some(ultrasql_server::AuthConfig::Md5 { username, password }) => {
+                assert_eq!(username, "alice");
+                assert_eq!(password, "very-secret-password");
+            }
+            other => panic!("expected MD5 auth, got {other:?}"),
+        }
     }
 
     #[test]
     fn apply_auth_config_enables_md5_password_auth() {
         let server = apply_auth_config(
             Server::with_sample_database(),
-            &Some(("alice".to_owned(), "very-secret-password".to_owned())),
+            &Some(ultrasql_server::AuthConfig::Md5 {
+                username: "alice".to_owned(),
+                password: "very-secret-password".to_owned(),
+            }),
         );
 
         match &server.auth {
@@ -1958,6 +2027,7 @@ mod tests {
             ops_token: None,
             auth_user: Some("alice".to_owned()),
             auth_password_file: None,
+            auth_method: "scram".to_owned(),
             log_level: "info".to_owned(),
             log_format: LogFormat::Text,
             log_connections: false,
@@ -2065,6 +2135,7 @@ mod tests {
             ops_token: None,
             auth_user: Some("alice".to_owned()),
             auth_password_file: Some(password_file),
+            auth_method: "scram".to_owned(),
             log_level: "info".to_owned(),
             log_format: LogFormat::Text,
             log_connections: false,
@@ -2097,6 +2168,7 @@ mod tests {
             ops_token: None,
             auth_user: None,
             auth_password_file: None,
+            auth_method: "scram".to_owned(),
             log_level: "info".to_owned(),
             log_format: LogFormat::Text,
             log_connections: false,

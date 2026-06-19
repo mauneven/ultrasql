@@ -5,7 +5,9 @@
 //! changing semantics.
 
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
-use ultrasql_protocol::{BackendMessage, FrontendMessage, decode_frontend, encode_backend};
+use ultrasql_protocol::{
+    BackendMessage, FrontendMessage, decode_frontend, decode_frontend_raw, encode_backend,
+};
 
 use super::Session;
 use crate::error::ServerError;
@@ -20,6 +22,23 @@ where
                 return Ok(msg);
             }
             // Pull more bytes from the socket.
+            let n = self.io.read_buf(&mut self.read_buf).await?;
+            if n == 0 {
+                return Err(ServerError::UnexpectedEof);
+            }
+        }
+    }
+
+    /// Read the next tagged frontend frame as raw `(tag, payload)` bytes.
+    ///
+    /// Used during the SASL handshake, where the `'p'` tag is shared by
+    /// `PasswordMessage` / `SASLInitialResponse` / `SASLResponse` and the
+    /// auth state machine must interpret the payload itself.
+    pub(crate) async fn read_raw_frontend_frame(&mut self) -> Result<(u8, Vec<u8>), ServerError> {
+        loop {
+            if let Some(frame) = decode_frontend_raw(&mut self.read_buf)? {
+                return Ok(frame);
+            }
             let n = self.io.read_buf(&mut self.read_buf).await?;
             if n == 0 {
                 return Err(ServerError::UnexpectedEof);

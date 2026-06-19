@@ -3407,6 +3407,17 @@ pub enum AuthConfig {
         /// hash on every challenge.
         password: String,
     },
+    /// Require a SCRAM-SHA-256 password exchange (RFC 7677, PostgreSQL's
+    /// default since PG 10). Unlike [`AuthConfig::Md5`] the server holds only
+    /// the derived verifier ([`crate::auth::PasswordHash`]: salt, iterations,
+    /// `StoredKey`, `ServerKey`) — never the plaintext password — and the
+    /// password never crosses the wire.
+    Scram {
+        /// Required role name presented in `StartupMessage.user`.
+        username: String,
+        /// Pre-derived SCRAM verifier for the role's password.
+        verifier: crate::auth::PasswordHash,
+    },
 }
 
 /// Run undo-log GC every `UNDO_GC_INTERVAL_COMMITS` successful
@@ -5525,6 +5536,17 @@ impl Server {
             username: username.into(),
             password: password.into(),
         };
+        self
+    }
+
+    /// Builder: set the authentication policy directly.
+    ///
+    /// Used by the CLI (which resolves [`AuthConfig::Scram`] by deriving the
+    /// verifier from a password file) and by integration tests that exercise
+    /// the SCRAM handshake.
+    #[must_use]
+    pub fn with_auth(mut self, auth: AuthConfig) -> Self {
+        self.auth = auth;
         self
     }
 

@@ -291,6 +291,28 @@ pub enum BackendMessage {
         salt: [u8; 4],
     },
 
+    /// `AuthenticationSASL` (`'R'`, sub-tag `10`): the server offers a
+    /// list of SASL authentication mechanisms (e.g. `SCRAM-SHA-256`).
+    AuthenticationSASL {
+        /// Mechanism names offered to the client, in preference order.
+        mechanisms: Vec<String>,
+    },
+
+    /// `AuthenticationSASLContinue` (`'R'`, sub-tag `11`): a mechanism-
+    /// specific challenge (the SCRAM `server-first-message`).
+    AuthenticationSASLContinue {
+        /// Opaque SASL challenge bytes.
+        data: Vec<u8>,
+    },
+
+    /// `AuthenticationSASLFinal` (`'R'`, sub-tag `12`): the final
+    /// mechanism-specific message (the SCRAM `server-final-message`),
+    /// sent immediately before `AuthenticationOk`.
+    AuthenticationSASLFinal {
+        /// Opaque SASL completion bytes.
+        data: Vec<u8>,
+    },
+
     /// `ParameterStatus` (`'S'`): announces the server's value for a
     /// runtime parameter (`server_version`, `client_encoding`, etc.).
     ParameterStatus {

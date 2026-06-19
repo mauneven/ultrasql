@@ -46,6 +46,26 @@ fn decode_backend_payload(
                     p.ensure_drained()?;
                     BackendMessage::AuthenticationMD5Password { salt }
                 }
+                10 => {
+                    // Mechanism names, each a NUL-terminated string, the list
+                    // terminated by a final empty string.
+                    let mut mechanisms = Vec::new();
+                    loop {
+                        let name = p.read_cstring()?;
+                        if name.is_empty() {
+                            break;
+                        }
+                        mechanisms.push(name);
+                    }
+                    p.ensure_drained()?;
+                    BackendMessage::AuthenticationSASL { mechanisms }
+                }
+                11 => BackendMessage::AuthenticationSASLContinue {
+                    data: p.read_remaining(),
+                },
+                12 => BackendMessage::AuthenticationSASLFinal {
+                    data: p.read_remaining(),
+                },
                 _ => return Err(ProtocolError::Malformed("unknown authentication subtype")),
             }
         }

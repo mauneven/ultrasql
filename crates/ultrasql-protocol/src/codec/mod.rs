@@ -112,6 +112,17 @@ pub fn decode_frontend(buf: &mut BytesMut) -> Result<Option<FrontendMessage>, Pr
     decode_with(buf, decode_frontend::decode_frontend_inner)
 }
 
+/// Frame the next tagged frontend message without interpreting its payload,
+/// returning `Ok(Some((tag, payload)))` once a full frame is available.
+///
+/// Used during SASL authentication: the `'p'` message tag is shared by
+/// `PasswordMessage`, `SASLInitialResponse`, and `SASLResponse`, so only the
+/// server's auth state can disambiguate them. See [`decode_frontend`] for the
+/// short-input / error contract.
+pub fn decode_frontend_raw(buf: &mut BytesMut) -> Result<Option<(u8, Vec<u8>)>, ProtocolError> {
+    decode_with(buf, decode_frontend::decode_frontend_raw_inner)
+}
+
 /// Decode a single [`BackendMessage`] from `buf`.
 ///
 /// Mirrors [`decode_frontend`]: returns `Ok(None)` on short input,

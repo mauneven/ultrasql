@@ -37,4 +37,4 @@ pub use privileges::{
     DefaultPrivilegeGrant, DefaultPrivilegeUpdate, InMemoryPrivilegeCatalog, PrivilegeGrant,
     PrivilegeKind, PrivilegeObjectKind, PrivilegeRequest,
 };
-pub use scram::{AuthError, ScramSha256Server};
+pub use scram::{AuthError, SCRAM_SHA_256, ScramSha256Server, parse_sasl_initial_response};

@@ -175,6 +175,29 @@ pub fn encode_backend(msg: &BackendMessage, buf: &mut BytesMut) {
                 payload.put_slice(salt);
             });
         }
+        BackendMessage::AuthenticationSASL { mechanisms } => {
+            write_tagged(buf, b'R', |payload| {
+                payload.put_i32(10);
+                // Each mechanism name is a NUL-terminated string; the list is
+                // terminated by an extra NUL (an empty string).
+                for mechanism in mechanisms {
+                    write_cstring(payload, mechanism);
+                }
+                payload.put_u8(0);
+            });
+        }
+        BackendMessage::AuthenticationSASLContinue { data } => {
+            write_tagged(buf, b'R', |payload| {
+                payload.put_i32(11);
+                payload.put_slice(data);
+            });
+        }
+        BackendMessage::AuthenticationSASLFinal { data } => {
+            write_tagged(buf, b'R', |payload| {
+                payload.put_i32(12);
+                payload.put_slice(data);
+            });
+        }
         BackendMessage::ParameterStatus { name, value } => {
             write_tagged(buf, b'S', |payload| {
                 write_cstring(payload, name);

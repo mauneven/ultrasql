@@ -77,6 +77,45 @@ pub enum AuthError {
     /// Cryptographic primitive initialization failed.
     #[error("crypto error: {0}")]
     Crypto(&'static str),
+
+    /// A SASL wire frame (`SASLInitialResponse` / `SASLResponse`) was malformed.
+    #[error("malformed SASL message: {0}")]
+    Sasl(&'static str),
+}
+
+/// The single SASL mechanism this server offers.
+pub const SCRAM_SHA_256: &str = "SCRAM-SHA-256";
+
+/// Parse a PostgreSQL `SASLInitialResponse` payload into its
+/// `(mechanism, initial_response)` parts.
+///
+/// Wire format: `mechanism` (NUL-terminated string), `initial_response_length`
+/// (`i32`, big-endian; `-1` means "no initial response"), then that many bytes
+/// of `initial_response` (the SCRAM `client-first-message`).
+pub fn parse_sasl_initial_response(payload: &[u8]) -> Result<(String, Vec<u8>), AuthError> {
+    let nul = payload
+        .iter()
+        .position(|&b| b == 0)
+        .ok_or(AuthError::Sasl("mechanism not NUL-terminated"))?;
+    let mechanism = std::str::from_utf8(&payload[..nul])
+        .map_err(|_| AuthError::Sasl("mechanism is not valid UTF-8"))?
+        .to_owned();
+    let rest = &payload[nul + 1..];
+    let len_bytes: [u8; 4] = rest
+        .get(..4)
+        .and_then(|s| s.try_into().ok())
+        .ok_or(AuthError::Sasl("missing initial-response length"))?;
+    let len = i32::from_be_bytes(len_bytes);
+    let data = &rest[4..];
+    let initial = if len < 0 {
+        Vec::new()
+    } else {
+        let len = usize::try_from(len).map_err(|_| AuthError::Sasl("negative length"))?;
+        data.get(..len)
+            .ok_or(AuthError::Sasl("initial response truncated"))?
+            .to_vec()
+    };
+    Ok((mechanism, initial))
 }
 
 // ── Internal helpers ──────────────────────────────────────────────────────────

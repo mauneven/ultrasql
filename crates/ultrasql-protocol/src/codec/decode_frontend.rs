@@ -44,6 +44,26 @@ pub(super) fn decode_frontend_inner(
     Ok((msg, total))
 }
 
+/// Frame the next tagged frontend message without interpreting its payload,
+/// returning `(tag, payload_bytes)`.
+///
+/// Used for SASL authentication, where the `'p'` message tag is shared by
+/// `PasswordMessage`, `SASLInitialResponse`, and `SASLResponse` and can only
+/// be disambiguated by the server's current authentication state. The auth
+/// state machine reads the raw frame and parses it itself.
+pub(super) fn decode_frontend_raw_inner(
+    bytes: &[u8],
+) -> Result<((u8, Vec<u8>), usize), ProtocolError> {
+    let first = *bytes.first().ok_or(ProtocolError::Truncated)?;
+    if first < b' ' {
+        return Err(ProtocolError::Malformed(
+            "expected a tagged frontend message during authentication",
+        ));
+    }
+    let (payload, total) = take_framed_message(bytes)?;
+    Ok(((first, payload.to_vec()), total))
+}
+
 // Large match; same structural argument as encode_frontend.
 #[allow(clippy::too_many_lines)]
 fn decode_frontend_payload(

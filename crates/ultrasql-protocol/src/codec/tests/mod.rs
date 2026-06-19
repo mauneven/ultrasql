@@ -292,6 +292,48 @@ fn authentication_md5_round_trip() {
 }
 
 #[test]
+fn authentication_sasl_round_trip() {
+    let msg = BackendMessage::AuthenticationSASL {
+        mechanisms: vec!["SCRAM-SHA-256".to_owned(), "SCRAM-SHA-256-PLUS".to_owned()],
+    };
+    assert_eq!(round_trip_backend(&msg), msg);
+}
+
+#[test]
+fn authentication_sasl_continue_round_trip() {
+    let msg = BackendMessage::AuthenticationSASLContinue {
+        data: b"r=nonce,s=salt,i=4096".to_vec(),
+    };
+    assert_eq!(round_trip_backend(&msg), msg);
+}
+
+#[test]
+fn authentication_sasl_final_round_trip() {
+    let msg = BackendMessage::AuthenticationSASLFinal {
+        data: b"v=server-signature".to_vec(),
+    };
+    assert_eq!(round_trip_backend(&msg), msg);
+}
+
+#[test]
+fn decode_frontend_raw_frames_a_password_message() {
+    use bytes::BytesMut;
+    // A `'p'` (Password / SASL) frame: tag, i32 length (incl. self), payload.
+    let payload = b"SCRAM-SHA-256\0\x00\x00\x00\x05hello";
+    let mut buf = BytesMut::new();
+    buf.extend_from_slice(b"p");
+    let frame_len = i32::try_from(4 + payload.len()).expect("frame length fits in i32");
+    buf.extend_from_slice(&frame_len.to_be_bytes());
+    buf.extend_from_slice(payload);
+    let (tag, got) = crate::decode_frontend_raw(&mut buf)
+        .expect("decode ok")
+        .expect("a full frame");
+    assert_eq!(tag, b'p');
+    assert_eq!(got, payload);
+    assert!(buf.is_empty(), "the framed bytes were consumed");
+}
+
+#[test]
 fn parameter_status_round_trip() {
     let msg = BackendMessage::ParameterStatus {
         name: "server_version".into(),

@@ -180,6 +180,30 @@ where
                     return Err(ServerError::AuthFailed);
                 }
             }
+            crate::AuthConfig::Scram { username, verifier } => {
+                let presented_user = params
+                    .iter()
+                    .find(|(k, _)| k == "user")
+                    .map(|(_, v)| v.as_str())
+                    .unwrap_or("");
+                // The username check and the SCRAM proof must both pass. A
+                // failure at any SASL step returns `Ok(false)` so a single
+                // error path runs; an IO/protocol error propagates via `?`.
+                let authenticated =
+                    presented_user == username && self.authenticate_scram(verifier).await?;
+                if !authenticated {
+                    let _ = self
+                        .send(&BackendMessage::ErrorResponse {
+                            fields: vec![
+                                (b'S', "FATAL".to_string()),
+                                (b'C', "28P01".to_string()),
+                                (b'M', "password authentication failed".to_string()),
+                            ],
+                        })
+                        .await;
+                    return Err(ServerError::AuthFailed);
+                }
+            }
         }
         // Reserve the `ultrasql_` role namespace for the system (mirrors
         // PostgreSQL's `pg_` reservation). A login under this prefix that is
@@ -332,5 +356,62 @@ where
         self.send(&BackendMessage::ReadyForQuery { status: b'I' })
             .await?;
         Ok(())
+    }
+
+    /// Drive the server side of a SCRAM-SHA-256 exchange (RFC 7677).
+    ///
+    /// Offers `SCRAM-SHA-256`, reads `client-first` (a `SASLInitialResponse`),
+    /// replies with `server-first`, reads `client-final` (a `SASLResponse`),
+    /// and verifies the client proof. Returns `Ok(true)` when the proof
+    /// verifies, `Ok(false)` on any authentication failure (bad mechanism,
+    /// malformed SASL, proof mismatch — the caller emits the error and closes),
+    /// or `Err` on an IO/connection error.
+    async fn authenticate_scram(
+        &mut self,
+        verifier: &crate::auth::PasswordHash,
+    ) -> Result<bool, ServerError> {
+        self.send(&BackendMessage::AuthenticationSASL {
+            mechanisms: vec![crate::auth::SCRAM_SHA_256.to_owned()],
+        })
+        .await?;
+
+        // client-first arrives as a `SASLInitialResponse` on the shared `'p'`
+        // tag, so read it as a raw frame and parse it ourselves.
+        let (tag, payload) = self.read_raw_frontend_frame().await?;
+        if tag != b'p' {
+            return Ok(false);
+        }
+        let Ok((mechanism, client_first)) = crate::auth::parse_sasl_initial_response(&payload)
+        else {
+            return Ok(false);
+        };
+        if mechanism != crate::auth::SCRAM_SHA_256 {
+            return Ok(false);
+        }
+
+        let mut scram = crate::auth::ScramSha256Server::new(
+            verifier.stored_key,
+            verifier.server_key,
+            verifier.salt.clone(),
+            verifier.iterations,
+        );
+        let Ok(server_first) = scram.server_first(&client_first) else {
+            return Ok(false);
+        };
+        self.send(&BackendMessage::AuthenticationSASLContinue { data: server_first })
+            .await?;
+
+        // client-final arrives as a `SASLResponse`; the whole payload is the
+        // SCRAM message bytes.
+        let (tag, client_final) = self.read_raw_frontend_frame().await?;
+        if tag != b'p' {
+            return Ok(false);
+        }
+        let Ok(server_final) = scram.server_final(&client_final) else {
+            return Ok(false);
+        };
+        self.send(&BackendMessage::AuthenticationSASLFinal { data: server_final })
+            .await?;
+        Ok(true)
     }
 }
