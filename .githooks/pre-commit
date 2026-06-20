@@ -1,18 +1,9 @@
 #!/usr/bin/env bash
-# Auto-render README.md benchmark tables from current baseline data +
-# static defaults, then re-stage the file when it changed.
+# Pre-commit: validate tests only. Nothing else.
 #
-# Also re-renders benchmarks/results/latest/results.md from the raw
-# JSON files in benchmarks/results/latest/raw/ when any of those files
-# is staged. This keeps results.md in sync without running a full
-# benchmark in the pre-commit hook (which would be too slow).
-#
-# This hook runs before every commit. It keeps the README benchmark
-# tables in sync with benchmarks/baselines/ without requiring a manual
-# step. If the README was already up to date the hook exits silently.
-#
-# Wire this hook once per clone:
-#   git config core.hooksPath .githooks
+# Wire once per clone:
+#   ln -sf ../../.githooks/pre-commit .git/hooks/pre-commit
+# Bypass a single commit with `git commit --no-verify`.
 
 set -e -o pipefail
 
@@ -25,41 +16,9 @@ if ! command -v cargo >/dev/null 2>&1; then
     fi
 fi
 
-# Auto-render README from current baseline data + static defaults.
-cargo run --release --package ultrasql-bench --bin readme-render -- \
-    --readme README.md \
-    --baselines benchmarks/baselines
+export CARGO_BUILD_JOBS
+CARGO_BUILD_JOBS="$(sysctl -n hw.ncpu 2>/dev/null || nproc 2>/dev/null || echo 4)"
+export CARGO_INCREMENTAL=0
 
-# Re-stage only if README changed.
-if ! git diff --quiet README.md; then
-    git add README.md
-    printf "\n\033[1;33m== README.md auto-regenerated and re-staged ==\033[0m\n"
-fi
-
-# ---------------------------------------------------------------------------
-# Re-render results.md when raw JSON in latest/raw/ is staged.
-#
-# We only run results-render when at least one staged file lives under
-# benchmarks/results/latest/raw/. Running it unconditionally on every
-# commit would be wasteful; we only regenerate when the raw data changed.
-# ---------------------------------------------------------------------------
-_staged_raw_json() {
-    git diff --cached --name-only | grep -q '^benchmarks/results/latest/raw/.*\.json$'
-}
-
-if _staged_raw_json 2>/dev/null; then
-    RESULTS_OUT="benchmarks/results/latest"
-    RESULTS_RAW="$RESULTS_OUT/raw"
-    if [ -d "$RESULTS_RAW" ] && [ -n "$(ls "$RESULTS_RAW"/*.json 2>/dev/null)" ]; then
-        cargo run --release --package ultrasql-bench --bin results-render -- \
-            --raw-dir "$RESULTS_RAW" \
-            --output-md  "$RESULTS_OUT/results.md" \
-            --output-json "$RESULTS_OUT/results.json"
-        # Re-stage both outputs if they changed.
-        if ! git diff --quiet "$RESULTS_OUT/results.md" 2>/dev/null || \
-           ! git diff --quiet "$RESULTS_OUT/results.json" 2>/dev/null; then
-            git add "$RESULTS_OUT/results.md" "$RESULTS_OUT/results.json"
-            printf "\n\033[1;33m== results.md auto-regenerated and re-staged ==\033[0m\n"
-        fi
-    fi
-fi
+printf "\n\033[1m== cargo test --workspace --all-features ==\033[0m\n"
+cargo test --workspace --all-features
