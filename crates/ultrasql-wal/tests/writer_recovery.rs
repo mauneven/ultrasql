@@ -198,6 +198,83 @@ fn torn_write_at_tail_stops_recovery_cleanly() {
 }
 
 #[test]
+fn torn_tail_then_write_survives_a_second_restart() {
+    // The most common crash shape: a power-loss torn tail, then an
+    // ordinary restart -> write -> restart cycle. The writer resumes into
+    // a fresh segment, so the torn residue becomes a *non-final* torn
+    // write on the second restart. Without the open-time repair, recovery
+    // aborts fatally and the database can never reopen even though every
+    // committed record is durable. With the repair, every restart recovers.
+    let dir = TempDir::new().unwrap();
+
+    // 1. Write 10 records into a single segment and shut down cleanly.
+    let buffer = Arc::new(WalBuffer::new(256 * 1024, Lsn::ZERO));
+    let writer =
+        WalWriter::open(dir.path(), Arc::clone(&buffer), writer_config(1024 * 1024)).unwrap();
+    for i in 0..10_u32 {
+        buffer.append(&build_record(i)).unwrap();
+    }
+    writer.shutdown().unwrap();
+
+    // 2. Simulate a power-loss torn tail: chop 4 bytes off the segment.
+    let segment = std::fs::read_dir(dir.path())
+        .unwrap()
+        .filter_map(std::result::Result::ok)
+        .find(|e| e.file_name().to_string_lossy().starts_with("segment_"))
+        .map(|e| e.path())
+        .expect("must have at least one segment");
+    let torn_len = std::fs::metadata(&segment).unwrap().len() - 4;
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(&segment)
+        .unwrap()
+        .set_len(torn_len)
+        .unwrap();
+
+    // 3. First restart: recovery tolerates the torn tail at the final segment.
+    let mut first_count = 0_u32;
+    let recovered_lsn = recover(dir.path(), |_| {
+        first_count += 1;
+        Ok(())
+    })
+    .unwrap();
+    assert!(
+        first_count < 10,
+        "the torn last record must not replay, recovered {first_count}"
+    );
+    assert!(
+        first_count >= 9,
+        "only the last record is torn, recovered {first_count}"
+    );
+
+    // 4. Resume from the recovered LSN, append one record, shut down. This
+    //    opens a fresh segment; the open-time repair must trim the torn
+    //    residue out of the now-previous segment so it ends on a record
+    //    boundary before it becomes non-final.
+    let buffer2 = Arc::new(WalBuffer::new(256 * 1024, recovered_lsn));
+    let writer2 =
+        WalWriter::open(dir.path(), Arc::clone(&buffer2), writer_config(1024 * 1024)).unwrap();
+    buffer2.append(&build_record(100)).unwrap();
+    writer2.shutdown().unwrap();
+
+    // 5. Second restart: must recover cleanly. Before the open-time repair
+    //    this returned a fatal `Record(Truncated { .. })` and the engine
+    //    could not reopen.
+    let mut second_count = 0_u32;
+    let final_lsn = recover(dir.path(), |_| {
+        second_count += 1;
+        Ok(())
+    })
+    .expect("second restart must recover; the torn residue must be repaired at open");
+    assert_eq!(
+        second_count,
+        first_count + 1,
+        "every surviving record plus the post-recovery write must recover"
+    );
+    assert!(final_lsn.raw() > recovered_lsn.raw());
+}
+
+#[test]
 fn recover_empty_dir_returns_zero_lsn() {
     let dir = TempDir::new().unwrap();
     let lsn = recover(dir.path(), |_| Ok(())).unwrap();

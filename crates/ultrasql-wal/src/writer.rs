@@ -78,6 +78,10 @@ pub enum WalWriterError {
         /// Counter that overflowed.
         counter: &'static str,
     },
+
+    /// Repairing the torn tail of the final segment at open failed.
+    #[error("wal writer torn-tail repair error: {0}")]
+    Repair(#[from] crate::recovery::RecoveryError),
 }
 
 /// Tuning knobs for the writer thread.
@@ -232,6 +236,21 @@ impl WalWriter {
     ) -> Result<Self, WalWriterError> {
         let dir = wal_dir.into();
         std::fs::create_dir_all(&dir)?;
+
+        // Recovery tolerates a torn record only at the *final* segment's
+        // tail, but `open` always resumes into a fresh `max + 1` segment
+        // and never reopens the torn one. Trim the torn residue now,
+        // before choosing the next index, so it cannot become a fatal
+        // non-final torn write after the next write + restart — which
+        // would leave every committed record durable yet the engine
+        // unable to reopen. Cold startup path; runs once per open.
+        if let Some(trimmed) = crate::recovery::repair_final_segment_tail(&dir)? {
+            warn!(
+                ?dir,
+                trimmed_bytes = trimmed,
+                "wal open: repaired torn tail of final segment"
+            );
+        }
 
         let next_index = next_segment_index(&dir)?;
         let initial_durable = buffer.durable_lsn().raw();
