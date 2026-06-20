@@ -336,12 +336,20 @@ impl LockManager {
         let t_states = Arc::clone(&xid_states);
         let t_stop = Arc::clone(&stop);
 
-        let handle = thread::Builder::new()
+        let handle = match thread::Builder::new()
             .name("ultrasql-deadlock-detector".into())
             .spawn(move || {
                 detector_loop(&t_table, &t_states, &t_stop, interval);
-            })
-            .ok();
+            }) {
+            Ok(handle) => Some(handle),
+            Err(e) => {
+                tracing::error!(
+                    error = %e,
+                    "failed to spawn deadlock detector; deadlock detection is DISABLED"
+                );
+                None
+            }
+        };
 
         Self {
             table,
