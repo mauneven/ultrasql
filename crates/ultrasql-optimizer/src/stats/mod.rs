@@ -38,7 +38,6 @@ pub use pg_statistic::PgStatisticRow;
 pub use relation::RelationStats;
 
 use ahash::AHashMap;
-use ultrasql_core::{Schema, Value};
 
 // ============================================================================
 // StatsError
@@ -135,22 +134,6 @@ impl InMemoryStatsCatalog {
     /// Remove statistics for a relation.
     pub fn remove(&mut self, table: &str) -> Option<RelationStats> {
         self.entries.remove(&table.to_lowercase())
-    }
-
-    /// Analyze a table and register its statistics.
-    ///
-    /// This method triggers the AnalyzeRunner to compute statistics for the
-    /// specified table and registers the resulting RelationStats in the catalog.
-    pub fn analyze_and_register(
-        &mut self,
-        table: &str,
-        schema: &Schema,
-        rows: impl Iterator<Item = Vec<Value>>,
-    ) {
-        let runner = AnalyzeRunner::new(AnalyzeOptions::default());
-        if let Ok(stats) = runner.run(table, schema, rows) {
-            self.register(stats);
-        }
     }
 }
 

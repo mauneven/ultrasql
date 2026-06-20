@@ -201,12 +201,6 @@ impl<'s> CostModel<'s> {
         }
     }
 
-    /// Create a `CostModel` with custom [`CostGucs`].
-    #[must_use]
-    pub fn with_gucs(stats: &'s dyn StatsSource, gucs: CostGucs) -> Self {
-        Self { stats, gucs }
-    }
-
     /// Recursively estimate the cost of `plan`.
     ///
     /// The estimate walks the plan tree bottom-up. For unsupported or
