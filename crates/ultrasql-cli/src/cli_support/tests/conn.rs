@@ -1,6 +1,7 @@
 //! Connection-parameter tests: URL parsing, `~/.pgpass`, merge/override
 //! precedence, and connection-string rendering.
 
+#[cfg(unix)]
 use std::fs;
 
 use super::super::cli_args::{

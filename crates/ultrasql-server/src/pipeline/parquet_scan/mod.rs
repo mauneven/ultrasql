@@ -19,7 +19,7 @@ use paths::{expand_parquet_paths, wildcard_match};
 use plan_summary::parquet_path_row_group_summary;
 #[cfg(test)]
 use predicate::ParquetLiteral;
-#[cfg(test)]
+#[cfg(all(test, unix))]
 use scan::open_regular_parquet_file;
 
 pub(in crate::pipeline) use predicate::ParquetPredicate;

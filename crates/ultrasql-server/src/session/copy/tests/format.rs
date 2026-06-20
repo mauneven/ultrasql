@@ -10,7 +10,6 @@ use super::super::fs_io::{
     RejectColumnType, copy_cells_from_row, copy_format_code, csv_record_complete,
     csv_sample_record_complete, projected_schema, read_copy_file_sample, read_copy_input_file,
     reject_column_type_matches, single_byte_delimiter, validate_copy_reject_table,
-    write_copy_output_file,
 };
 use super::{copy_env_test_lock, copy_opts, entry_with_schema, schema};
 use crate::result_encoder::SelectResult;
@@ -96,6 +95,7 @@ b"#
 
     #[cfg(unix)]
     {
+        use super::super::fs_io::write_copy_output_file;
         use std::os::unix::fs::symlink;
 
         let dir = tempfile::TempDir::new().expect("copy symlink dir");
