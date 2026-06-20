@@ -241,9 +241,7 @@ pub(crate) fn accumulate(
     let arg_val: Option<Value> = agg
         .arg
         .as_ref()
-        .map(|expr| {
-            crate::eval::eval_expr(expr, row, &[]).map_err(eval_error_to_exec_error)
-        })
+        .map(|expr| crate::eval::eval_expr(expr, row, &[]).map_err(eval_error_to_exec_error))
         .transpose()?;
 
     if let AggState::Distinct { inner, seen } = state {
@@ -441,8 +439,7 @@ fn percentile_fraction(
     let direct_arg = agg.direct_arg.as_ref().ok_or_else(|| {
         ExecError::TypeMismatch("ordered-set percentile missing fraction".to_owned())
     })?;
-    let value =
-        crate::eval::eval_expr(direct_arg, row, &[]).map_err(eval_error_to_exec_error)?;
+    let value = crate::eval::eval_expr(direct_arg, row, &[]).map_err(eval_error_to_exec_error)?;
     if value.is_null() {
         return Ok(None);
     }

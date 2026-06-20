@@ -1405,7 +1405,9 @@ mod tests {
     fn confine_object_store_key_blocks_traversal_and_foreign_roots() {
         // Relative key with `..` traversal is rejected.
         let escaped = resolve_location("s3://bucket/table", "../other/a.parquet");
-        assert!(confine_to_table_root("s3://bucket/table", "../other/a.parquet", &escaped).is_err());
+        assert!(
+            confine_to_table_root("s3://bucket/table", "../other/a.parquet", &escaped).is_err()
+        );
 
         // Absolute object key outside the root prefix is rejected.
         assert!(
@@ -1418,9 +1420,7 @@ mod tests {
         );
 
         // A local path masquerading under an object-store root is rejected.
-        assert!(
-            confine_to_table_root("s3://bucket/table", "/etc/passwd", "/etc/passwd").is_err()
-        );
+        assert!(confine_to_table_root("s3://bucket/table", "/etc/passwd", "/etc/passwd").is_err());
 
         // A legitimate in-root relative key is accepted.
         let ok = resolve_location("s3://bucket/table", "data/a.parquet");
