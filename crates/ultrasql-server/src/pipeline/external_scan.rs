@@ -20,7 +20,7 @@ use ultrasql_iceberg::plan_iceberg_scan;
 use ultrasql_objectstore::{
     ObjectLocation, expand_object_store_specs, is_object_store_uri, read_object_bytes,
 };
-use ultrasql_planner::ScalarExpr;
+use ultrasql_planner::{LogicalPlan, ScalarExpr};
 use ultrasql_vec::Batch;
 use ultrasql_vec::Bitmap;
 use ultrasql_vec::column::{BoolColumn, Column, NumericColumn, StringColumn};
@@ -42,6 +42,97 @@ const MAX_LOCAL_WILDCARD_PATTERN_CHARS: usize = 4096;
 /// [`ExternalTableScan`].
 pub(super) fn is_external_table_function(name: &str) -> bool {
     ExternalTableFormat::from_function_name(name).is_some()
+}
+
+/// Decide whether a server-file table function (`read_csv`, `read_parquet`,
+/// `read_json`, `read_ndjson`, `read_arrow`, `read_iceberg`, `iceberg_scan`,
+/// or `sniff_csv`) would read at least one LOCAL server file rather than an
+/// object-store URI.
+///
+/// Returns `Ok(true)` when any argument resolves to a local filesystem path
+/// (the host-filesystem case that must be gated), and `Ok(false)` when every
+/// path is an object-store URI (`s3://`, `r2://`, …) or when the function is
+/// not a server-file reader. Argument-evaluation failures are reported as
+/// `Ok(false)` here: this is a *pre-authorization* probe, and a genuinely
+/// malformed argument is surfaced later by the lowerer with its richer error.
+/// `sniff_csv` is unconditionally local, so it always returns `Ok(true)`.
+pub(super) fn function_scan_reads_local_file(
+    name: &str,
+    args: &[ScalarExpr],
+) -> Result<bool, ServerError> {
+    if name == "sniff_csv" {
+        // `sniff_csv` has no object-store branch; it always opens a local file.
+        return Ok(true);
+    }
+    if !is_external_table_function(name) {
+        return Ok(false);
+    }
+    // `read_csv` carries an optional trailing reject-path argument; evaluate
+    // only the leading path argument(s) for the local-vs-remote decision.
+    let path_specs = if name == "read_csv" {
+        match read_csv_external_args(args) {
+            Ok(parsed) => parsed.path_specs,
+            Err(_) => return Ok(false),
+        }
+    } else {
+        match read_external_path_specs(name, args) {
+            Ok(specs) => specs,
+            Err(_) => return Ok(false),
+        }
+    };
+    if path_specs.is_empty() {
+        return Ok(false);
+    }
+    // `Ok(false)` means every spec is local; `Err` means a mixed list, which
+    // still includes at least one local spec and so must be gated.
+    match path_specs_use_object_store(name, &path_specs) {
+        Ok(uses_object_store) => Ok(!uses_object_store),
+        Err(_) => Ok(true),
+    }
+}
+
+/// Walk a bound [`LogicalPlan`] and return `true` if any `FunctionScan` would
+/// read a LOCAL server-side file via one of the external-file table functions
+/// (or `sniff_csv`).
+///
+/// This is the detection half of the server-file privilege gate. It mirrors
+/// the recursion shape used by the Parquet `EXPLAIN` plan-summary walk so that
+/// every query shape — subqueries, CTEs, joins, set operations, `INSERT
+/// ... SELECT`, `COPY (SELECT ...)`, and `EXPLAIN` — is inspected. The caller
+/// (see [`crate::pipeline::ensure_external_local_file_access`]) decides whether
+/// to deny based on the current role's superuser status; this function carries
+/// no policy of its own.
+pub(super) fn plan_reads_local_external_file(plan: &LogicalPlan) -> Result<bool, ServerError> {
+    match plan {
+        LogicalPlan::FunctionScan { name, args, .. } => function_scan_reads_local_file(name, args),
+        LogicalPlan::Filter { input, .. }
+        | LogicalPlan::Project { input, .. }
+        | LogicalPlan::Limit { input, .. }
+        | LogicalPlan::Sort { input, .. }
+        | LogicalPlan::Aggregate { input, .. }
+        | LogicalPlan::Window { input, .. }
+        | LogicalPlan::LockRows { input, .. }
+        | LogicalPlan::Pivot { input, .. }
+        | LogicalPlan::Unpivot { input, .. }
+        | LogicalPlan::Explain { input, .. }
+        | LogicalPlan::Update { input, .. }
+        | LogicalPlan::Delete { input, .. } => plan_reads_local_external_file(input),
+        LogicalPlan::Join { left, right, .. } | LogicalPlan::SetOp { left, right, .. } => {
+            Ok(plan_reads_local_external_file(left)? || plan_reads_local_external_file(right)?)
+        }
+        LogicalPlan::Cte {
+            definition, body, ..
+        } => Ok(
+            plan_reads_local_external_file(definition)? || plan_reads_local_external_file(body)?
+        ),
+        LogicalPlan::Insert { source, .. } => plan_reads_local_external_file(source),
+        // `COPY (SELECT ...) TO file` carries the inner query in `input`;
+        // `source` is the wire endpoint (`STDIN`/`STDOUT`), not a sub-plan.
+        LogicalPlan::Copy {
+            input: Some(input), ..
+        } => plan_reads_local_external_file(input),
+        _ => Ok(false),
+    }
 }
 
 /// Lower one supported external table function into the shared scan.
@@ -1685,5 +1776,112 @@ mod tests {
         static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
         LOCK.lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn function_scan(name: &str, args: Vec<ScalarExpr>) -> LogicalPlan {
+        LogicalPlan::FunctionScan {
+            name: name.to_owned(),
+            args,
+            schema: Schema::empty(),
+        }
+    }
+
+    #[test]
+    fn local_path_external_function_is_flagged_local() {
+        for name in [
+            "read_csv",
+            "read_parquet",
+            "read_json",
+            "read_ndjson",
+            "read_arrow",
+            "read_iceberg",
+            "iceberg_scan",
+        ] {
+            assert!(
+                function_scan_reads_local_file(name, &[text_lit("/etc/passwd")]).expect("probe ok"),
+                "{name} on a local path must be flagged as a local read"
+            );
+        }
+    }
+
+    #[test]
+    fn object_store_path_external_function_is_not_local() {
+        for name in ["read_csv", "read_parquet", "read_json", "read_iceberg"] {
+            assert!(
+                !function_scan_reads_local_file(name, &[text_lit("s3://bucket/data.bin")])
+                    .expect("probe ok"),
+                "{name} on an s3:// URI must not be flagged as a local read"
+            );
+        }
+    }
+
+    #[test]
+    fn sniff_csv_is_always_local() {
+        assert!(
+            function_scan_reads_local_file("sniff_csv", &[text_lit("/tmp/data.csv")])
+                .expect("probe ok"),
+            "sniff_csv is local-only and must always be flagged"
+        );
+        // Even an s3-looking argument is local: sniff_csv has no remote branch.
+        assert!(
+            function_scan_reads_local_file("sniff_csv", &[text_lit("s3://bucket/data.csv")])
+                .expect("probe ok"),
+        );
+    }
+
+    #[test]
+    fn non_file_function_is_not_local() {
+        assert!(
+            !function_scan_reads_local_file("generate_series", &[]).expect("probe ok"),
+            "generate_series is not a server-file reader"
+        );
+        assert!(!function_scan_reads_local_file("unnest", &[]).expect("probe ok"),);
+    }
+
+    #[test]
+    fn read_csv_with_reject_path_still_flags_local() {
+        // The trailing reject-path argument must not confuse the local probe.
+        assert!(
+            function_scan_reads_local_file(
+                "read_csv",
+                &[text_lit("/data/in.csv"), text_lit("/tmp/rejects")],
+            )
+            .expect("probe ok"),
+        );
+    }
+
+    #[test]
+    fn plan_walk_finds_local_read_under_filter_and_join() {
+        // FunctionScan nested under Filter -> still detected.
+        let filtered = LogicalPlan::Filter {
+            input: Box::new(function_scan(
+                "read_parquet",
+                vec![text_lit("/srv/data.parquet")],
+            )),
+            predicate: ScalarExpr::Literal {
+                value: Value::Bool(true),
+                data_type: DataType::Bool,
+            },
+        };
+        assert!(plan_reads_local_external_file(&filtered).expect("walk ok"));
+
+        // One side of a join reads remote, the other local -> detected.
+        let join = LogicalPlan::Join {
+            left: Box::new(function_scan(
+                "read_csv",
+                vec![text_lit("s3://bucket/a.csv")],
+            )),
+            right: Box::new(function_scan("read_csv", vec![text_lit("/local/b.csv")])),
+            join_type: ultrasql_planner::LogicalJoinType::Cross,
+            condition: ultrasql_planner::LogicalJoinCondition::None,
+            schema: Schema::empty(),
+        };
+        assert!(plan_reads_local_external_file(&join).expect("walk ok"));
+    }
+
+    #[test]
+    fn plan_walk_ignores_remote_only_reads() {
+        let remote = function_scan("read_parquet", vec![text_lit("s3://bucket/data.parquet")]);
+        assert!(!plan_reads_local_external_file(&remote).expect("walk ok"));
     }
 }

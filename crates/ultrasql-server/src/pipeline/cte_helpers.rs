@@ -127,6 +127,7 @@ pub(super) fn lower_recursive_cte(
             cancel_flag: ctx.cancel_flag.clone(),
             work_mem: std::sync::Arc::clone(&ctx.work_mem),
             profile_operators: ctx.profile_operators,
+            allow_server_files: ctx.allow_server_files,
         };
 
         let mut term_op = lower_query(recursive_term, &child_ctx)?;
@@ -203,6 +204,7 @@ pub(super) fn lower_recursive_cte(
         cancel_flag: ctx.cancel_flag.clone(),
         work_mem: std::sync::Arc::clone(&ctx.work_mem),
         profile_operators: ctx.profile_operators,
+        allow_server_files: ctx.allow_server_files,
     };
     lower_query(body, &body_ctx)
 }

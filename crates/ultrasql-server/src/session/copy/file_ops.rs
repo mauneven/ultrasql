@@ -480,6 +480,7 @@ where
             cancel_flag: Some(self.cancel_flag.clone()),
             work_mem: Arc::new(ultrasql_executor::work_mem::WorkMemBudget::new(u64::MAX)),
             profile_operators: false,
+            allow_server_files: self.current_role_is_superuser(),
         };
         let text_options = crate::result_encoder::TextEncodingOptions::from_session_settings(
             ctx.session_settings.as_ref(),

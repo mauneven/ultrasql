@@ -138,6 +138,12 @@ pub(crate) fn run_plan_in_txn(args: RunPlanInTxnArgs<'_>) -> Result<SelectResult
         txn,
     )?;
 
+    // Mirror the COPY server-file gate: server-LOCAL external-file reads
+    // (read_csv/read_parquet/…/sniff_csv) are permitted only for superusers.
+    // Computed from the same role_catalog/current_user the lowering uses, so
+    // the predicate matches `Session::current_role_is_superuser` exactly.
+    let allow_server_files =
+        crate::session::role_is_superuser(role_catalog.as_ref(), &current_user);
     let ctx = LowerCtx {
         tables,
         catalog_snapshot,
@@ -179,6 +185,7 @@ pub(crate) fn run_plan_in_txn(args: RunPlanInTxnArgs<'_>) -> Result<SelectResult
         cancel_flag,
         work_mem: Arc::new(ultrasql_executor::work_mem::WorkMemBudget::new(u64::MAX)),
         profile_operators: false,
+        allow_server_files,
     };
     match plan {
         LogicalPlan::Insert { returning, .. } => {

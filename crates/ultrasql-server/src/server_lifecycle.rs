@@ -83,6 +83,9 @@ impl Server {
             cancel_flag: None,
             work_mem: Arc::new(ultrasql_executor::work_mem::WorkMemBudget::new(u64::MAX)),
             profile_operators: false,
+            // Embedded `ultrasql-local` runs as the bootstrap superuser
+            // `ultrasql`, so server-local file reads are permitted.
+            allow_server_files: true,
         };
         let outcome = (|| {
             let mut op = pipeline::lower_query(&plan, &ctx)?;

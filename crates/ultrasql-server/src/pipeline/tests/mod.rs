@@ -245,6 +245,7 @@ fn lower_query_sorts_values_in_ascending_order() {
         cancel_flag: None,
         work_mem: std::sync::Arc::new(ultrasql_executor::work_mem::WorkMemBudget::new(u64::MAX)),
         profile_operators: false,
+        allow_server_files: true,
     };
 
     let mut op = lower_query(&sort_plan, &ctx).expect("lowers");
@@ -387,6 +388,7 @@ pub(super) fn synthetic_ctx(tables: &SampleTables) -> LowerCtx<'_> {
         cancel_flag: None,
         work_mem: std::sync::Arc::new(ultrasql_executor::work_mem::WorkMemBudget::new(u64::MAX)),
         profile_operators: false,
+        allow_server_files: true,
     }
 }
 

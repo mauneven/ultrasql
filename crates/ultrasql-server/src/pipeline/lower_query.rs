@@ -62,6 +62,13 @@ pub fn lower_query(
     plan: &LogicalPlan,
     ctx: &LowerCtx<'_>,
 ) -> Result<Box<dyn Operator>, ServerError> {
+    // Pre-authorization gate: deny non-superusers from reading server-LOCAL
+    // files via the external table functions / `sniff_csv`, mirroring the
+    // server-side COPY file gate. This runs above every lowering shape —
+    // FunctionScan, the read_csv/read_parquet projection/predicate pushdowns,
+    // COPY (SELECT ...), and EXPLAIN ANALYZE — so none can bypass it. It is a
+    // no-op for superusers and for object-store (s3://) reads.
+    super::ensure_external_local_file_access(plan, ctx.allow_server_files)?;
     let op = lower_query_inner(plan, ctx)?;
     // Skip wrapping when a specialized lowering already returned a profiling
     // wrapper (e.g. a hybrid-search top-k whose projection was elided) — nesting
@@ -1277,6 +1284,7 @@ pub(super) fn lower_cte(
         cancel_flag: ctx.cancel_flag.clone(),
         work_mem: std::sync::Arc::clone(&ctx.work_mem),
         profile_operators: ctx.profile_operators,
+        allow_server_files: ctx.allow_server_files,
     };
 
     lower_query(body, &child_ctx)

@@ -130,6 +130,47 @@ pub(crate) use index_scan::{
 pub use lower_query::lower_query;
 pub use lower_simple::{build_sample_database, lower_plan};
 
+/// Pre-authorization gate for reading server-LOCAL files through the external
+/// table functions (`read_csv`, `read_parquet`, `read_json`, `read_ndjson`,
+/// `read_arrow`, `read_iceberg`, `iceberg_scan`) and `sniff_csv`.
+///
+/// These functions open files on the database host using the server process's
+/// own filesystem privileges, exactly like a server-side `COPY ... FROM/TO
+/// '<path>'`. Without this gate any authenticated non-superuser could read
+/// arbitrary server-readable files — TLS private keys, other databases' data
+/// files, `/etc/...` — via e.g. `SELECT * FROM read_csv('/etc/passwd')`. We
+/// therefore mirror the COPY server-file gate (`Session::ensure_copy_server_file_access`):
+/// access is permitted only when `allow_server_files` is `true` (the caller
+/// passes `Session::current_role_is_superuser()`), and otherwise the same
+/// [`crate::error::ServerError::InsufficientPrivilege`] variant is returned.
+///
+/// Object-store / remote URIs (`s3://`, `r2://`, …) are NOT host-filesystem
+/// access and remain allowed for every role — the walk only fires on path
+/// arguments that resolve to a local server file.
+///
+/// `allow_server_files == true` short-circuits before any plan inspection, so
+/// superusers pay nothing. The walk visits every sub-plan (subqueries, CTEs,
+/// joins, set operations, `INSERT ... SELECT`, `COPY (SELECT ...)`, and the
+/// `EXPLAIN` body) so no query shape can smuggle a local read past the gate.
+pub fn ensure_external_local_file_access(
+    plan: &ultrasql_planner::LogicalPlan,
+    allow_server_files: bool,
+) -> Result<(), crate::error::ServerError> {
+    if allow_server_files {
+        return Ok(());
+    }
+    if external_scan::plan_reads_local_external_file(plan)? {
+        return Err(crate::error::ServerError::InsufficientPrivilege(
+            "permission denied for reading server-side files: must be superuser \
+             (read_csv/read_parquet/read_json/read_ndjson/read_arrow/read_iceberg/\
+             iceberg_scan/sniff_csv on a local path require SUPERUSER; object-store \
+             URIs such as s3:// are unaffected)"
+                .to_owned(),
+        ));
+    }
+    Ok(())
+}
+
 pub(super) fn saturate_row_count(n: u64) -> usize {
     usize::try_from(n).unwrap_or(usize::MAX)
 }
@@ -303,6 +344,14 @@ pub struct LowerCtx<'a> {
     /// keeps direct operators so benchmark and production paths avoid
     /// profiling overhead.
     pub profile_operators: bool,
+    /// Whether the current role may read server-LOCAL files through the
+    /// external table functions (`read_csv`, `read_parquet`, …) and
+    /// `sniff_csv`. Set to `Session::current_role_is_superuser()` at every
+    /// session construction site — mirroring the COPY server-file gate — and
+    /// enforced by [`ensure_external_local_file_access`] at the `lower_query`
+    /// entry. Object-store reads are never affected. In-process callers that
+    /// do not represent a wire session (tests, fixtures) set this to `true`.
+    pub allow_server_files: bool,
 }
 
 /// Materialised non-recursive CTE binding.

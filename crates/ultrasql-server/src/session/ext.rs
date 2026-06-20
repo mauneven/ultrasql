@@ -596,6 +596,9 @@ where
                         u64::MAX,
                     )),
                     profile_operators: false,
+                    // Server-LOCAL external-file reads require superuser,
+                    // mirroring the server-side COPY file gate.
+                    allow_server_files: self.current_role_is_superuser(),
                 };
                 if let Some(plan) = portal_plan.as_ref() {
                     record_serializable_predicate_locks(
@@ -706,6 +709,9 @@ where
                         u64::MAX,
                     )),
                     profile_operators: false,
+                    // Server-LOCAL external-file reads require superuser,
+                    // mirroring the server-side COPY file gate.
+                    allow_server_files: self.current_role_is_superuser(),
                 };
                 if let Some(plan) = portal_plan.as_ref() {
                     record_serializable_predicate_locks(

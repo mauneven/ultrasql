@@ -63,6 +63,18 @@ where
             ));
         };
 
+        // Server-file privilege gate. EXPLAIN (without ANALYZE) opens local
+        // Parquet files via the plan-summary walk (`explain_notes` ->
+        // parquet_row_group_note / parquet_columns_read_note), which never
+        // goes through `lower_query`. Run the same gate here so
+        // `EXPLAIN SELECT * FROM read_parquet('/etc/...')` cannot read a
+        // server-local file as a non-superuser. EXPLAIN ANALYZE additionally
+        // lowers the plan, where `lower_query` enforces the gate again.
+        crate::pipeline::ensure_external_local_file_access(
+            input,
+            self.current_role_is_superuser(),
+        )?;
+
         // ANALYZE: execute the inner plan, count rows, measure wall-time.
         let actuals = if *analyze {
             Some(self.run_explain_analyze(input, catalog_snapshot)?)
@@ -265,6 +277,7 @@ where
                 cancel_flag: Some(self.cancel_flag.clone()),
                 work_mem: Arc::new(ultrasql_executor::work_mem::WorkMemBudget::new(u64::MAX)),
                 profile_operators: true,
+                allow_server_files: self.current_role_is_superuser(),
             };
             let mut op = crate::pipeline::lower_query(inner, &ctx)?;
             let mut actuals = drain_explain_operator(op.as_mut())?;
@@ -497,6 +510,7 @@ where
                 cancel_flag: Some(self.cancel_flag.clone()),
                 work_mem: Arc::new(ultrasql_executor::work_mem::WorkMemBudget::new(u64::MAX)),
                 profile_operators: false,
+                allow_server_files: self.current_role_is_superuser(),
             };
             crate::pipeline::late_materialization_summary_for_plan(plan, &ctx)
         };

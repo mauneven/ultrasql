@@ -410,11 +410,8 @@ where
         }
     }
 
-    pub(super) fn current_role_is_superuser(&self) -> bool {
-        match self.state.role_catalog.lookup_role(&self.current_user) {
-            Some(role) => role.is_superuser,
-            None => self.current_user.eq_ignore_ascii_case("tester"),
-        }
+    pub(crate) fn current_role_is_superuser(&self) -> bool {
+        role_is_superuser(self.state.role_catalog.as_ref(), &self.current_user)
     }
 
     fn lookup_role_is_privileged(&self, role: &str) -> bool {
@@ -422,6 +419,20 @@ where
             .role_catalog
             .lookup_role(role)
             .is_some_and(|role| role_is_privileged_membership_target(&role))
+    }
+}
+
+/// Whether `role_name` is a superuser in `catalog`.
+///
+/// Shared between [`Session::current_role_is_superuser`] and the
+/// statement-execution path ([`crate::txn_exec::run_plan_in_txn`]) so the
+/// server-file privilege gate uses exactly the same predicate as the COPY
+/// gate. A role absent from the catalog falls back to the test harness's
+/// `tester` superuser-equivalent (matching the rest of the auth layer).
+pub(crate) fn role_is_superuser(catalog: &dyn AuthCatalog, role_name: &str) -> bool {
+    match catalog.lookup_role(role_name) {
+        Some(role) => role.is_superuser,
+        None => role_name.eq_ignore_ascii_case("tester"),
     }
 }
 

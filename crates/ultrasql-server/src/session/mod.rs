@@ -36,6 +36,7 @@ mod privilege;
 mod privilege_enforce;
 mod privilege_sources;
 mod role;
+pub(crate) use role::role_is_superuser;
 mod run;
 mod schema;
 mod sequence;

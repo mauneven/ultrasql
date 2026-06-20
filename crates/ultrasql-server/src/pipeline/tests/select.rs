@@ -521,6 +521,7 @@ impl IndexFixture {
                 u64::MAX,
             )),
             profile_operators: false,
+            allow_server_files: true,
         }
     }
 }
