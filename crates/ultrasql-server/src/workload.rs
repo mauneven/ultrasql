@@ -340,11 +340,6 @@ impl WorkloadRecorder {
         *self.slow_query_threshold.write() = Some(threshold);
     }
 
-    /// Disable slow-query logging.
-    pub fn disable_slow_query_log(&self) {
-        *self.slow_query_threshold.write() = None;
-    }
-
     /// Record one completed statement.
     pub fn record(&self, record: WorkloadQueryRecord) {
         self.record_ref(WorkloadQueryRecordRef {

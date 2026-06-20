@@ -61,12 +61,6 @@ impl ColumnarSecondaryStore {
         Some(table)
     }
 
-    /// Return number of tables waiting for columnar rebuild.
-    #[must_use]
-    pub fn pending_count(&self) -> usize {
-        self.pending.len()
-    }
-
     /// Record a successful columnar rebuild.
     pub fn record_rebuild(
         &self,

@@ -113,15 +113,6 @@ impl Server {
         .map_err(|e| ServerError::ddl(format!("recover vector index WAL: {e}")))
     }
 
-    /// Allocate the next per-connection process id.
-    ///
-    /// Counter is monotonic; wraps after 2^32 connections. The PostgreSQL
-    /// wire layer treats the value opaquely.
-    pub fn allocate_pid(&self) -> u32 {
-        self.next_pid
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-    }
-
     /// Acquire a per-statement catalog snapshot.
     ///
     /// The returned [`Arc<CatalogSnapshot>`] is immutable and stable for the
