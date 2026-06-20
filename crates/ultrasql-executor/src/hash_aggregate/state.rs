@@ -242,9 +242,7 @@ pub(crate) fn accumulate(
         .arg
         .as_ref()
         .map(|expr| {
-            Eval::new(expr.clone())
-                .eval(row)
-                .map_err(eval_error_to_exec_error)
+            crate::eval::eval_expr(expr, row, &[]).map_err(eval_error_to_exec_error)
         })
         .transpose()?;
 
@@ -443,9 +441,8 @@ fn percentile_fraction(
     let direct_arg = agg.direct_arg.as_ref().ok_or_else(|| {
         ExecError::TypeMismatch("ordered-set percentile missing fraction".to_owned())
     })?;
-    let value = Eval::new(direct_arg.clone())
-        .eval(row)
-        .map_err(eval_error_to_exec_error)?;
+    let value =
+        crate::eval::eval_expr(direct_arg, row, &[]).map_err(eval_error_to_exec_error)?;
     if value.is_null() {
         return Ok(None);
     }
@@ -484,9 +481,7 @@ fn percentile_sample(agg: &LogicalAggregateExpr, row: &[Value]) -> Result<Value,
         .ok_or_else(|| {
             ExecError::TypeMismatch("ordered-set percentile missing order key".to_owned())
         })?;
-    Eval::new(sample_expr.clone())
-        .eval(row)
-        .map_err(eval_error_to_exec_error)
+    crate::eval::eval_expr(sample_expr, row, &[]).map_err(eval_error_to_exec_error)
 }
 
 /// Coerce a numeric `Value` to `f64` for floating-point folds.
