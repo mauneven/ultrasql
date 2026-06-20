@@ -181,11 +181,6 @@ impl<T> NumericColumn<T> {
         &self.data
     }
 
-    /// Borrow the data slice mutably.
-    pub fn data_mut(&mut self) -> &mut [T] {
-        &mut self.data
-    }
-
     /// Borrow the optional null bitmap.
     #[must_use]
     pub const fn nulls(&self) -> Option<&Bitmap> {

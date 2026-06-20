@@ -111,42 +111,8 @@ impl DictI64U8 {
         Self::try_from_slice(col.data())
     }
 
-    /// Build a single-byte dictionary from an iterator of `i64` values.
-    ///
-    /// Returns `None` if the iterator yields more than 256 distinct
-    /// values.
-    #[must_use]
-    pub fn try_from_iter<I: IntoIterator<Item = i64>>(iter: I) -> Option<Self> {
-        // The iterator API does not give us a length hint upfront in
-        // general, so we use the default `Vec` growth strategy.
-        let mut codes: Vec<u8> = Vec::new();
-        let mut dict: Vec<i64> = Vec::new();
-        let mut map: HashMap<i64, u8> = HashMap::new();
-
-        for v in iter {
-            let code = if let Some(&c) = map.get(&v) {
-                c
-            } else {
-                if dict.len() >= 256 {
-                    return None;
-                }
-                // SAFETY-of-conversion: dict.len() < 256 here, which is
-                // strictly less than `u8::MAX + 1 == 256`, so the
-                // narrowing conversion is always lossless.
-                let c = u8::try_from(dict.len()).ok()?;
-                dict.push(v);
-                map.insert(v, c);
-                c
-            };
-            codes.push(code);
-        }
-
-        Some(Self { codes, dict })
-    }
-
-    /// Build from a slice with capacity-aware allocation. Internally
-    /// drives [`Self::try_from_iter`] but pre-reserves `codes` to the
-    /// final length so the hot loop performs zero realloc.
+    /// Build from a slice with capacity-aware allocation. Pre-reserves
+    /// `codes` to the final length so the hot loop performs zero realloc.
     #[must_use]
     pub fn try_from_slice(data: &[i64]) -> Option<Self> {
         let mut codes: Vec<u8> = Vec::with_capacity(data.len());
