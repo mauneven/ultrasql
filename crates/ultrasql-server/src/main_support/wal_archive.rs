@@ -20,6 +20,7 @@ use std::fs;
 use std::path::Path;
 use std::path::PathBuf;
 use std::process::Command;
+use std::sync::Arc;
 use std::time::Duration;
 
 use tracing::{error, info};
@@ -34,16 +35,32 @@ pub(crate) async fn run_wal_archiver_loop(
     timeout: Option<Duration>,
 ) {
     let interval_ms = interval_ms.max(1);
+    let data_dir = Arc::new(data_dir);
+    let archive_command = Arc::new(archive_command);
     let mut ticker = tokio::time::interval(std::time::Duration::from_millis(interval_ms));
     loop {
         ticker.tick().await;
-        match archive_wal_once_with_timeout(&data_dir, &archive_command, timeout) {
-            Ok(archived) if archived > 0 => {
+        // `archive_wal_once_with_timeout` blocks the thread: it walks the
+        // WAL directory, polls a subprocess with `std::thread::sleep`, and
+        // waits on synchronous filesystem IO. Run it off the async reactor
+        // (mirroring the checkpoint task) so a slow/hung archive command
+        // never starves connection handling for up to the command timeout.
+        let data_dir = Arc::clone(&data_dir);
+        let archive_command = Arc::clone(&archive_command);
+        let result = tokio::task::spawn_blocking(move || {
+            archive_wal_once_with_timeout(&data_dir, &archive_command, timeout)
+        })
+        .await;
+        match result {
+            Ok(Ok(archived)) if archived > 0 => {
                 info!(target: "ultrasqld", archived, "WAL archiver completed batch");
             }
-            Ok(_) => {}
-            Err(e) => {
+            Ok(Ok(_)) => {}
+            Ok(Err(e)) => {
                 error!(target: "ultrasqld", error = %e, "WAL archiver failed");
+            }
+            Err(e) => {
+                error!(target: "ultrasqld", error = %e, "WAL archiver task panicked");
             }
         }
     }
