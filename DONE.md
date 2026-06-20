@@ -3,6 +3,42 @@
 Completed/addressed work moved out of [ROADMAP.md](ROADMAP.md). Keep this file
 as a concise evidence ledger; roadmap stays for open gates only.
 
+## 2026-06-20 WAL torn-tail repair: a second restart after a power-loss crash recovers
+
+Fixed a data-availability defect that made a database permanently unopenable
+after the most common crash (a power-loss torn tail) plus an ordinary
+restart/write/restart. Every committed transaction was durable on disk, yet the
+engine refused to start.
+
+- **The bug:** recovery tolerates a torn record only at the tail of the *final*
+  segment (`recover_with_target`, `crates/ultrasql-wal/src/recovery.rs`). But
+  `WalWriter::open` always resumes into a fresh `max + 1` segment and never
+  reopens the torn one, so the torn residue stayed physically present in what
+  became a *non-final* segment after the next write. The following restart hit
+  that residue where the tolerance does not apply and aborted with a fatal
+  `Record(Truncated { .. })`. The existing `chaos_recovery.sh` `wal_truncation`
+  leg restarts only once and never writes post-recovery, so it could not observe
+  the second-restart failure.
+- **The fix:** `repair_final_segment_tail` (`recovery.rs`) computes the final
+  segment's cleanly-decoded good prefix (via `good_prefix_len`, semantics
+  identical to recovery's torn-tail tolerance) and, only when the file is longer,
+  truncates it to that prefix and fsyncs the file and its parent directory.
+  `WalWriter::open` calls it after `create_dir_all` and before
+  `next_segment_index` (`crates/ultrasql-wal/src/writer.rs`). The repair removes
+  only bytes recovery already ignores, so it changes no recovered LSN; it is a
+  no-op after a clean shutdown and returns an error (never truncating) on genuine
+  mid-segment corruption.
+- **Evidence:** end-to-end regression
+  `torn_tail_then_write_survives_a_second_restart`
+  (`crates/ultrasql-wal/tests/writer_recovery.rs`) drives write → torn tail →
+  restart → write → restart and asserts the second restart recovers every
+  surviving record plus the post-recovery write; it fails on the pre-fix code
+  with `Record(Truncated { needed: 71, have: 67 })`. Unit tests cover
+  `good_prefix_len` and `repair_final_segment_tail` across clean, torn-tail,
+  mid-segment-corruption, no-op, empty-directory, and multi-segment cases.
+  `cargo test -p ultrasql-wal --all-features` green (166 tests); workspace clippy
+  (`--all-targets --all-features -D warnings`) and `cargo fmt --check` clean.
+
 ## 2026-06-19 retrieval observability: EXPLAIN ANALYZE for hybrid search
 
 `EXPLAIN ANALYZE` on a hybrid query now reports the executed retrieval path
