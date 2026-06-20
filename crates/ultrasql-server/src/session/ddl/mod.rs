@@ -5,6 +5,8 @@
 //! without changing semantics.
 
 mod create_index;
+mod create_index_build;
+mod create_index_build_btree;
 mod create_table;
 mod drop;
 mod index_options;
