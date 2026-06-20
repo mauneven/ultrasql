@@ -1,0 +1,485 @@
+//! Deliverable A: HOT-chain updates and in-place int32-pair update tests.
+
+use ultrasql_core::{CommandId, Xid};
+use ultrasql_mvcc::status::test_support::MapOracle;
+use ultrasql_mvcc::tuple_header::InfoMask;
+use ultrasql_mvcc::Snapshot;
+
+use super::*;
+
+#[test]
+fn update_creates_hot_chain_when_eligible_and_room() {
+    let heap = make_heap(16);
+
+    // Insert a small tuple that leaves plenty of room on the page.
+    let tid = heap.insert(rel(), b"original", opts(100)).unwrap();
+
+    let uo = update_opts(200);
+    let outcome = heap.update(tid, b"updated-payload", uo).unwrap();
+
+    assert!(outcome.hot, "expected HOT update when page has room");
+    assert_eq!(outcome.old_tid, tid);
+    // Both tids must live on the same page (same block).
+    assert_eq!(
+        outcome.old_tid.page.block, outcome.new_tid.page.block,
+        "HOT: old and new must be on the same block"
+    );
+
+    // Old version: xmax stamped, ctid redirects to new.
+    let old = heap.fetch(tid).unwrap();
+    assert_eq!(old.header.xmax, Xid::new(200));
+    assert_eq!(old.header.ctid, outcome.new_tid);
+    assert!(
+        old.header.infomask.contains(InfoMask::HOT_UPDATED),
+        "old tuple must have HOT_UPDATED bit set"
+    );
+
+    // New version: xmin set, ctid self-referential (terminal).
+    let new_tup = heap.fetch(outcome.new_tid).unwrap();
+    assert_eq!(new_tup.header.xmin, Xid::new(200));
+    assert_eq!(new_tup.header.ctid, outcome.new_tid);
+    assert!(
+        new_tup.header.infomask.contains(InfoMask::HOT_UPDATED),
+        "new tuple must have HOT_UPDATED bit set"
+    );
+    assert_eq!(new_tup.data, b"updated-payload");
+}
+
+#[test]
+fn update_falls_back_to_non_hot_when_page_full() {
+    let heap = make_heap(32);
+    // Fill the page with big tuples so there is < (header + 1 byte) left.
+    // 7000 bytes per tuple: fits once with room for header but not for a
+    // second same-size write.
+    let big = [0xAA_u8; 7000];
+    let tid = heap.insert(rel(), &big, opts(100)).unwrap();
+    // Insert another large tuple; this should spill to block 1.
+    let _ = heap.insert(rel(), &big, opts(100)).unwrap();
+
+    // Now update the first tuple on block 0.  The page is too full for
+    // another 7000-byte tuple in-place.
+    let uo = UpdateOptions {
+        xid: Xid::new(200),
+        command_id: CommandId::FIRST,
+        hot_eligible: true, // we ask for HOT but the page is full
+        wal: None,
+        vm: None,
+    };
+    let outcome = heap.update(tid, &big, uo).unwrap();
+    assert!(!outcome.hot, "expected non-HOT when page is full");
+
+    // New version lands on a different block.
+    assert_ne!(
+        outcome.old_tid.page.block, outcome.new_tid.page.block,
+        "non-HOT: old and new must be on different blocks"
+    );
+
+    // Old tuple has xmax stamped.
+    let old = heap.fetch(tid).unwrap();
+    assert_eq!(old.header.xmax, Xid::new(200));
+}
+
+#[test]
+fn update_rejected_on_already_deleted_tuple() {
+    let heap = make_heap(8);
+    let tid = heap.insert(rel(), b"to-delete", opts(100)).unwrap();
+    heap.delete(
+        tid,
+        DeleteOptions {
+            xmax: Xid::new(150),
+            cmax: CommandId::FIRST,
+            fsm: None,
+            vm: None,
+            wal: None,
+        },
+    )
+    .unwrap();
+
+    let uo = update_opts(200);
+    let err = heap.update(tid, b"should-fail", uo).unwrap_err();
+    assert!(
+        matches!(err, HeapError::MalformedHeader(_)),
+        "expected MalformedHeader on update of deleted tuple, got {err:?}"
+    );
+}
+
+#[test]
+fn inplace_int32_update_conflicts_with_in_progress_writer() {
+    let heap = make_heap(8);
+    let _tid = heap
+        .insert(rel(), &int32_pair_payload(1, 10), opts(10))
+        .unwrap();
+
+    let oracle = MapOracle::new();
+    oracle.set_committed(Xid::new(10));
+    oracle.set_in_progress(Xid::new(20));
+
+    let writer_20 = Snapshot::new(
+        Xid::new(10),
+        Xid::new(100),
+        Xid::new(20),
+        CommandId::FIRST,
+        std::iter::empty(),
+    );
+    let updated = heap
+        .update_int32_pair_inplace_undo(
+            update_int32_scan(
+                rel(),
+                heap.block_count(rel()),
+                &writer_20,
+                &oracle,
+                |id, _val| id == 1,
+            ),
+            update_int32_edit(1, 5),
+            update_int32_stamp(20),
+            None,
+            None,
+        )
+        .unwrap();
+    assert_eq!(updated, 1);
+
+    let writer_30 = Snapshot::new(
+        Xid::new(10),
+        Xid::new(100),
+        Xid::new(30),
+        CommandId::FIRST,
+        [Xid::new(20)],
+    );
+    let err = heap
+        .update_int32_pair_inplace_undo(
+            update_int32_scan(
+                rel(),
+                heap.block_count(rel()),
+                &writer_30,
+                &oracle,
+                |id, _val| id == 1,
+            ),
+            update_int32_edit(1, 7),
+            update_int32_stamp(30),
+            None,
+            None,
+        )
+        .unwrap_err();
+
+    assert!(
+        matches!(err, HeapError::WriteConflict(_)),
+        "expected write conflict for invisible in-place writer, got {err:?}"
+    );
+}
+
+#[test]
+fn inplace_int32_update_skips_unrelated_in_progress_writer() {
+    let heap = make_heap(8);
+    let _first = heap
+        .insert(rel(), &int32_pair_payload(1, 10), opts(10))
+        .unwrap();
+    let _second = heap
+        .insert(rel(), &int32_pair_payload(2, 20), opts(10))
+        .unwrap();
+
+    let oracle = MapOracle::new();
+    oracle.set_committed(Xid::new(10));
+    oracle.set_in_progress(Xid::new(20));
+
+    let writer_20 = Snapshot::new(
+        Xid::new(10),
+        Xid::new(100),
+        Xid::new(20),
+        CommandId::FIRST,
+        std::iter::empty(),
+    );
+    heap.update_int32_pair_inplace_undo(
+        update_int32_scan(
+            rel(),
+            heap.block_count(rel()),
+            &writer_20,
+            &oracle,
+            |id, _val| id == 1,
+        ),
+        update_int32_edit(1, 5),
+        update_int32_stamp(20),
+        None,
+        None,
+    )
+    .unwrap();
+
+    let writer_30 = Snapshot::new(
+        Xid::new(10),
+        Xid::new(100),
+        Xid::new(30),
+        CommandId::FIRST,
+        [Xid::new(20)],
+    );
+    let updated = heap
+        .update_int32_pair_inplace_undo(
+            update_int32_scan(
+                rel(),
+                heap.block_count(rel()),
+                &writer_30,
+                &oracle,
+                |id, _val| id == 2,
+            ),
+            update_int32_edit(1, 7),
+            update_int32_stamp(30),
+            None,
+            None,
+        )
+        .unwrap();
+
+    assert_eq!(updated, 1);
+}
+
+#[test]
+fn inplace_int32_update_records_compact_undo_batch() {
+    let heap = make_heap(8);
+    for id in 0_i32..4 {
+        heap.insert(rel(), &int32_pair_payload(id, id * 10), opts(10))
+            .unwrap();
+    }
+
+    let oracle = MapOracle::new();
+    oracle.set_committed(Xid::new(10));
+    oracle.set_in_progress(Xid::new(20));
+    let writer_20 = Snapshot::new(
+        Xid::new(10),
+        Xid::new(100),
+        Xid::new(20),
+        CommandId::FIRST,
+        std::iter::empty(),
+    );
+
+    let updated = heap
+        .update_int32_pair_inplace_undo(
+            update_int32_scan(
+                rel(),
+                heap.block_count(rel()),
+                &writer_20,
+                &oracle,
+                |_id, _val| true,
+            ),
+            update_int32_edit(1, 5),
+            update_int32_stamp(20),
+            None,
+            None,
+        )
+        .unwrap();
+
+    assert_eq!(updated, 4);
+    assert_eq!(
+        heap.undo_log_len(rel()),
+        0,
+        "bulk int32 updates must not allocate one full undo entry per row",
+    );
+    assert_eq!(heap.int32_pair_undo_batch_len(rel()), 1);
+    let log = heap.undo_log.get(&rel()).unwrap();
+    let log = log.read();
+    let batch = &log.int32_pair_batches[0];
+    assert_eq!(batch.first_slot, 0);
+    assert_eq!(usize::from(batch.slot_count), 4);
+    assert!(
+        batch.slots.is_empty(),
+        "contiguous slot updates must not allocate a slot list"
+    );
+}
+
+#[test]
+fn invisible_inplace_int32_update_reads_compact_preimage() {
+    let heap = make_heap(8);
+    heap.insert(rel(), &int32_pair_payload(1, 10), opts(10))
+        .unwrap();
+
+    let oracle = MapOracle::new();
+    oracle.set_committed(Xid::new(10));
+    oracle.set_in_progress(Xid::new(20));
+    let writer_20 = Snapshot::new(
+        Xid::new(10),
+        Xid::new(100),
+        Xid::new(20),
+        CommandId::FIRST,
+        std::iter::empty(),
+    );
+    heap.update_int32_pair_inplace_undo(
+        update_int32_scan(
+            rel(),
+            heap.block_count(rel()),
+            &writer_20,
+            &oracle,
+            |id, _val| id == 1,
+        ),
+        update_int32_edit(1, 5),
+        update_int32_stamp(20),
+        None,
+        None,
+    )
+    .unwrap();
+
+    let reader = Snapshot::new(
+        Xid::new(10),
+        Xid::new(100),
+        Xid::new(30),
+        CommandId::FIRST,
+        [Xid::new(20)],
+    );
+    let visible: Vec<HeapTuple> = heap
+        .scan_visible(rel(), heap.block_count(rel()), &reader, &oracle)
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+
+    assert_eq!(visible.len(), 1);
+    assert_eq!(int32_pair_from_payload(&visible[0].data), (1, 10));
+}
+
+#[test]
+fn rollback_inplace_int32_update_restores_compact_undo_batch() {
+    let heap = make_heap(8);
+    let tid = heap
+        .insert(rel(), &int32_pair_payload(1, 10), opts(10))
+        .unwrap();
+
+    let oracle = MapOracle::new();
+    oracle.set_committed(Xid::new(10));
+    oracle.set_in_progress(Xid::new(20));
+    let writer_20 = Snapshot::new(
+        Xid::new(10),
+        Xid::new(100),
+        Xid::new(20),
+        CommandId::FIRST,
+        std::iter::empty(),
+    );
+    heap.update_int32_pair_inplace_undo(
+        update_int32_scan(
+            rel(),
+            heap.block_count(rel()),
+            &writer_20,
+            &oracle,
+            |id, _val| id == 1,
+        ),
+        update_int32_edit(1, 5),
+        update_int32_stamp(20),
+        None,
+        None,
+    )
+    .unwrap();
+
+    assert_eq!(heap.fetch(tid).unwrap().data, int32_pair_payload(1, 15));
+    assert_eq!(heap.rollback_in_place_updates(Xid::new(20)).unwrap(), 1);
+    assert_eq!(heap.fetch(tid).unwrap().data, int32_pair_payload(1, 10));
+    assert_eq!(heap.int32_pair_undo_batch_len(rel()), 0);
+}
+
+#[test]
+fn rollback_delete_stamp_restores_logged_page() {
+    let heap = make_heap(8);
+    let tid = heap.insert(rel(), b"alive", opts(10)).unwrap();
+
+    heap.delete(tid, del_opts(20, 0)).unwrap();
+    assert_eq!(heap.fetch(tid).unwrap().header.xmax, Xid::new(20));
+
+    assert_eq!(heap.rollback_in_place_updates(Xid::new(20)).unwrap(), 1);
+    let restored = heap.fetch(tid).unwrap();
+    assert_eq!(restored.header.xmax, Xid::INVALID);
+    assert_eq!(restored.header.cmax, CommandId::FIRST);
+}
+
+#[test]
+fn parallel_no_wal_inplace_int32_update_records_undo_and_rolls_back() {
+    let heap = make_heap(4096);
+    let tids = (0_i32..4)
+        .map(|id| {
+            heap.insert(rel(), &int32_pair_payload(id, id * 10), opts(10))
+                .unwrap()
+        })
+        .collect::<Vec<_>>();
+
+    let oracle = MapOracle::new();
+    oracle.set_committed(Xid::new(10));
+    oracle.set_in_progress(Xid::new(20));
+    let writer_20 = Snapshot::new(
+        Xid::new(10),
+        Xid::new(100),
+        Xid::new(20),
+        CommandId::FIRST,
+        std::iter::empty(),
+    );
+    let updated = heap
+        .update_int32_pair_inplace_undo_parallel_no_wal(
+            update_int32_scan(rel(), 2_048, &writer_20, &oracle, |_id, _val| true),
+            update_int32_edit(1, 7),
+            update_int32_stamp(20),
+            None,
+        )
+        .unwrap();
+
+    assert_eq!(updated, 4);
+    assert_eq!(heap.int32_pair_undo_batch_len(rel()), 1);
+    for (idx, tid) in tids.iter().enumerate() {
+        let id = i32::try_from(idx).unwrap();
+        assert_eq!(
+            heap.fetch(*tid).unwrap().data,
+            int32_pair_payload(id, id * 10 + 7)
+        );
+    }
+    assert_eq!(heap.rollback_in_place_updates(Xid::new(20)).unwrap(), 4);
+    for (idx, tid) in tids.iter().enumerate() {
+        let id = i32::try_from(idx).unwrap();
+        assert_eq!(
+            heap.fetch(*tid).unwrap().data,
+            int32_pair_payload(id, id * 10)
+        );
+    }
+}
+
+#[test]
+fn point_inplace_int32_update_rechecks_tid_predicate() {
+    let heap = make_heap(8);
+    let first = heap
+        .insert(rel(), &int32_pair_payload(1, 10), opts(10))
+        .unwrap();
+    let second = heap
+        .insert(rel(), &int32_pair_payload(2, 20), opts(10))
+        .unwrap();
+
+    let oracle = MapOracle::new();
+    oracle.set_committed(Xid::new(10));
+    let writer_20 = Snapshot::new(
+        Xid::new(10),
+        Xid::new(100),
+        Xid::new(20),
+        CommandId::FIRST,
+        std::iter::empty(),
+    );
+
+    let updated = heap
+        .update_int32_pair_tid_inplace_undo(
+            UpdateInt32PairTid {
+                tid: second,
+                snapshot: &writer_20,
+                oracle: &oracle,
+                predicate: |id, _val| id == 2,
+            },
+            update_int32_edit(1, 7),
+            update_int32_stamp(20),
+            None,
+            None,
+        )
+        .unwrap();
+    assert_eq!(updated, 1);
+    assert_eq!(heap.fetch(second).unwrap().data, int32_pair_payload(2, 27));
+
+    let skipped = heap
+        .update_int32_pair_tid_inplace_undo(
+            UpdateInt32PairTid {
+                tid: first,
+                snapshot: &writer_20,
+                oracle: &oracle,
+                predicate: |id, _val| id == 2,
+            },
+            update_int32_edit(1, 100),
+            update_int32_stamp(20),
+            None,
+            None,
+        )
+        .unwrap();
+    assert_eq!(skipped, 0);
+    assert_eq!(heap.fetch(first).unwrap().data, int32_pair_payload(1, 10));
+}
