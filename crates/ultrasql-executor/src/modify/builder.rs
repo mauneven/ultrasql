@@ -208,7 +208,7 @@ impl<L: PageLoader> ModifyTable<L> {
     /// Attach a source-to-target column map for INSERT.
     ///
     /// `map[src_idx] = target_idx`. Target columns omitted by `map`
-    /// are filled with [`Value::Null`] before NOT NULL checks, index
+    /// are filled with [`Value::Null`](ultrasql_core::Value::Null) before NOT NULL checks, index
     /// key encoding, and heap row encoding run.
     #[must_use]
     pub fn with_insert_column_map(mut self, map: Vec<usize>) -> Self {

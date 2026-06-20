@@ -9,7 +9,7 @@
 //!
 //! Each `next_batch` call drains the underlying [`VisibleHeapScan`]
 //! iterator until 4096 visible tuples have landed in the per-column
-//! [`ColumnBuilder`]s, then emits the [`Batch`] and reseeds a fresh
+//! [`ColumnBuilder`]s, then emits the [`Batch`](ultrasql_vec::Batch) and reseeds a fresh
 //! set of builders. Memory usage is O(batch), not O(relation) — the
 //! v0.5 "materialise everything into `Vec<Vec<Value>>` before
 //! yielding the first batch" hack is gone.
@@ -31,7 +31,7 @@
 //!
 //! - [`operator`] — the [`Operator`] / `next_batch` implementation.
 //! - [`cache`] — the column-cache fast path (read + populate).
-//! - [`build_batch`] — the legacy `Vec<Vec<Value>>` → [`Batch`] path.
+//! - [`build_batch`] — the legacy `Vec<Vec<Value>>` → [`Batch`](ultrasql_vec::Batch) path.
 
 use std::sync::Arc;
 
@@ -61,7 +61,7 @@ const BATCH_TARGET_ROWS: usize = 4096;
 /// Sequential heap scan operator.
 ///
 /// Reads every MVCC-visible tuple from `rel` and decodes each payload
-/// directly into typed column builders, emitting 4096-row [`Batch`]es.
+/// directly into typed column builders, emitting 4096-row [`Batch`](ultrasql_vec::Batch)es.
 ///
 /// `L` is the [`PageLoader`] implementation (in production: the segment
 /// loader; in tests: an in-memory map). `O` is the [`XidStatusOracle`]

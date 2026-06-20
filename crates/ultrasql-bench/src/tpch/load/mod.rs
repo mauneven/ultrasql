@@ -16,11 +16,11 @@
 //!
 //! | Module | Responsibility |
 //! |--------|---------------|
-//! | [`arith`]       | checked fixed-point arithmetic + numeric conversions |
-//! | [`encode`]      | row encoders, literal formatters, binary heap codecs |
-//! | [`loader`]      | public load entry points + wire-protocol COPY/INSERT loaders |
-//! | [`direct_load`] | direct-load orchestration + per-query sidecar caching |
-//! | [`direct_table`]| per-table direct heap loader + Q1 columnar cache |
+//! | `arith`       | checked fixed-point arithmetic + numeric conversions |
+//! | `encode`      | row encoders, literal formatters, binary heap codecs |
+//! | `loader`      | public load entry points + wire-protocol COPY/INSERT loaders |
+//! | `direct_load` | direct-load orchestration + per-query sidecar caching |
+//! | `direct_table`| per-table direct heap loader + Q1 columnar cache |
 //! | `sidecars_*`    | TPC-H Q2-Q21 direct-load sidecar build states |
 
 use std::path::Path;

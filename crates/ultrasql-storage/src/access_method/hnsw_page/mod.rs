@@ -87,7 +87,7 @@ pub struct PageBackedHnswPageImage {
 
 /// First page-backed HNSW storage model.
 ///
-/// This is deliberately narrower than the runtime [`HnswIndex`]: it stores
+/// This is deliberately narrower than the runtime [`HnswIndex`](crate::access_method::HnswIndex): it stores
 /// nodes in page-sized records, spills vectors and adjacency lists into
 /// overflow-page chains, tracks a meta page and a free-list page, replays
 /// logical HNSW WAL records, and lets VACUUM reclaim tombstoned nodes. It is

@@ -352,7 +352,7 @@ pub struct LogicalMergeClause {
 // Transaction control
 // ============================================================================
 
-/// Transaction isolation level as carried by [`LogicalPlan::Begin`].
+/// Transaction isolation level as carried by [`LogicalPlan::Begin`](crate::plan::LogicalPlan::Begin).
 ///
 /// Maps 1:1 onto `ultrasql_txn::IsolationLevel`; redefined here so the
 /// planner crate does not depend on the txn crate.
@@ -366,7 +366,7 @@ pub enum TxnIsolationLevel {
     Serializable,
 }
 
-/// Session-setting action carried by [`LogicalPlan::SetVariable`].
+/// Session-setting action carried by [`LogicalPlan::SetVariable`](crate::plan::LogicalPlan::SetVariable).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LogicalSetVariableAction {
     /// `SET [SESSION] name = value`.
@@ -444,7 +444,7 @@ pub enum LockWaitPolicy {
     SkipLocked,
 }
 
-/// Resolved window function applied by a [`LogicalPlan::Window`] node.
+/// Resolved window function applied by a [`LogicalPlan::Window`](crate::plan::LogicalPlan::Window) node.
 ///
 /// Each variant maps 1-to-1 to an `ultrasql_executor::WindowFunc`
 /// variant; the pipeline lowerer performs the trivial conversion at

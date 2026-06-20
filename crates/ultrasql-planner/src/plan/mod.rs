@@ -11,11 +11,11 @@
 //! The plan tree was split out of a single oversized `plan.rs` into
 //! cohesive submodules with no behaviour change:
 //!
-//! - [`logical_plan`] — the central [`LogicalPlan`] enum.
-//! - [`node_types`] — supporting types for query / DML / control nodes.
-//! - [`ddl_types`] — supporting types for DDL / access-control nodes.
-//! - [`analysis`] — [`LogicalPlan`] pipeline-mode and schema methods.
-//! - [`display`] — [`LogicalPlan`] EXPLAIN-style rendering.
+//! - `logical_plan` — the central [`LogicalPlan`] enum.
+//! - `node_types` — supporting types for query / DML / control nodes.
+//! - `ddl_types` — supporting types for DDL / access-control nodes.
+//! - `analysis` — [`LogicalPlan`] pipeline-mode and schema methods.
+//! - `display` — [`LogicalPlan`] EXPLAIN-style rendering.
 //!
 //! Every previously-public path (`ultrasql_planner::plan::…`) is preserved
 //! through the re-exports below.

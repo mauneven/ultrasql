@@ -68,7 +68,7 @@ pub struct HeapDeleteInPlaceBatchEntry {
 ///
 /// Groups all in-place delete stamps that touch the same heap page into a
 /// single WAL record. The durability contract matches
-/// [`HeapUpdateInPlaceBatchPayload`]: the page LSN is stamped with this
+/// [`HeapUpdateInPlaceBatchPayload`](crate::payload::HeapUpdateInPlaceBatchPayload): the page LSN is stamped with this
 /// record's LSN after append, so recovery either replays every slot stamp in
 /// the batch or skips an already-flushed page image.
 ///

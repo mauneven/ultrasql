@@ -324,7 +324,7 @@ pub enum CopyFormat {
     Parquet,
 }
 
-/// One action clause of an [`LogicalPlan::AlterTable`].
+/// One action clause of an [`LogicalPlan::AlterTable`](crate::plan::LogicalPlan::AlterTable).
 #[derive(Clone, Debug, PartialEq)]
 pub enum LogicalAlterTableAction {
     /// `ALTER TABLE t ADD [COLUMN] c TYPE [DEFAULT expr] [NULL | NOT NULL]`.
@@ -389,7 +389,7 @@ pub enum LogicalAlterTableAction {
     },
 }
 
-/// One action clause of an [`LogicalPlan::AlterView`].
+/// One action clause of an [`LogicalPlan::AlterView`](crate::plan::LogicalPlan::AlterView).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum LogicalAlterViewAction {
     /// `ALTER VIEW v RENAME TO new_name`.

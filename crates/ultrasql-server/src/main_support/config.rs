@@ -1,6 +1,6 @@
 //! CLI-to-configuration translation and startup wiring for `ultrasqld`.
 //!
-//! Validates the parsed [`Cli`](crate::cli::Cli) into the typed config
+//! Validates the parsed [`Cli`] into the typed config
 //! structs the [`Server`] consumes (autovacuum, logging, auth, TLS),
 //! enforces listener-security and secret-file hardening rules, derives
 //! the SCRAM verifier so the plaintext password is never stored, and

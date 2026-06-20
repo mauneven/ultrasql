@@ -30,12 +30,12 @@
 //! This file declares the operator's public data types; the behavior is
 //! split across sibling submodules:
 //!
-//! - [`builder`] — the `new` constructor and `with_*` configuration methods.
-//! - [`operator`] — the [`Operator`] / `next_batch` implementation.
-//! - [`methods`] — per-row edit computation and constraint checks.
-//! - [`index_maintainer`] — the B-tree / vector index maintainer impls.
-//! - [`types`] — the small descriptor-type impls.
-//! - [`helpers`] — free helper functions shared across the above.
+//! - `builder` — the `new` constructor and `with_*` configuration methods.
+//! - `operator` — the [`Operator`] / `next_batch` implementation.
+//! - `methods` — per-row edit computation and constraint checks.
+//! - `index_maintainer` — the B-tree / vector index maintainer impls.
+//! - `types` — the small descriptor-type impls.
+//! - `helpers` — free helper functions shared across the above.
 
 use std::sync::Arc;
 

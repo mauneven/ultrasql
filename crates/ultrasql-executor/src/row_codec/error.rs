@@ -2,7 +2,7 @@
 
 use ultrasql_core::DataType;
 
-/// Errors raised by [`RowCodec`].
+/// Errors raised by [`RowCodec`](crate::row_codec::RowCodec).
 #[derive(Debug, thiserror::Error)]
 pub enum RowCodecError {
     /// Arity mismatch.
