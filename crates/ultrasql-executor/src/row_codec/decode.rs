@@ -10,7 +10,7 @@ impl RowCodec {
     ///
     /// - [`RowCodecError::Truncated`] — buffer too short.
     /// - [`RowCodecError::UnsupportedType`] — unsupported `DataType`.
-    /// - [`RowCodecError::InvalidUtf8`] — invalid UTF-8 in a Text.
+    /// - [`RowCodecError::InvalidUtf8Slice`] — invalid UTF-8 in a Text.
     #[allow(clippy::too_many_lines)]
     pub fn decode(&self, bytes: &[u8]) -> Result<Vec<Value>, RowCodecError> {
         let n = self.schema.len();
@@ -331,8 +331,9 @@ impl RowCodec {
                             have: bytes.len(),
                         });
                     }
-                    let s = String::from_utf8(bytes[cursor..str_end].to_vec())
-                        .map_err(|e| RowCodecError::InvalidUtf8(e, "text column"))?;
+                    let s = std::str::from_utf8(&bytes[cursor..str_end])
+                        .map(str::to_owned)
+                        .map_err(|e| RowCodecError::InvalidUtf8Slice(e, "text column"))?;
                     cursor += str_len;
                     match storage_type {
                         DataType::Char { .. } => Value::Char(s),
