@@ -286,21 +286,6 @@ impl<L: PageLoader> HeapAccess<L> {
         self.scan_visible_walker_inner(rel, (0, 0), block_count, snapshot, oracle, None)
     }
 
-    /// Visibility-filtered scan over a half-open block range.
-    ///
-    /// Used by parallel scan workers. `start_block` is inclusive and
-    /// `end_block` is exclusive.
-    pub fn scan_visible_walker_range<'a, O: XidStatusOracle + ?Sized>(
-        &'a self,
-        rel: RelationId,
-        start_block: u32,
-        end_block: u32,
-        snapshot: &'a Snapshot,
-        oracle: &'a O,
-    ) -> VisibleHeapWalker<'a, L, O> {
-        self.scan_visible_walker_inner(rel, (start_block, 0), end_block, snapshot, oracle, None)
-    }
-
     /// Visibility-filtered scan over a half-open block range, resuming
     /// from `(block, slot)`.
     ///

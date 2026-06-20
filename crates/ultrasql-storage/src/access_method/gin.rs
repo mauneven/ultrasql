@@ -63,15 +63,6 @@ impl GinIndex {
         }
     }
 
-    /// Create an empty GIN index with explicit fast-update mode.
-    #[must_use]
-    pub fn with_fast_update(fast_update: bool) -> Self {
-        Self {
-            storage: Mutex::new(GinStorage::default()),
-            fast_update,
-        }
-    }
-
     /// Merge every pending-list item into the main posting lists.
     ///
     /// Returns the number of pending items drained.
@@ -96,11 +87,6 @@ impl GinIndex {
     /// Probe JSONB containment (`@>`) by intersecting query tokens.
     pub fn lookup_jsonb_contains(&self, query: &str) -> Result<Vec<TupleId>, AccessMethodError> {
         self.lookup_all_tokens(&gin_jsonb_document_tokens(query))
-    }
-
-    /// Probe JSONB key existence (`?`).
-    pub fn lookup_jsonb_has_key(&self, key: &str) -> Result<Vec<TupleId>, AccessMethodError> {
-        self.lookup(gin_token("json:key", key).as_slice())
     }
 
     /// Probe JSONB any-key existence (`?|`).

@@ -511,11 +511,6 @@ impl Sequence {
         self.state.lock().increment
     }
 
-    /// Return whether CYCLE is set.
-    pub fn is_cycle(&self) -> bool {
-        self.state.lock().cycle
-    }
-
     /// Emit the current state as a sequence WAL record.
     pub fn emit_wal(
         &self,
