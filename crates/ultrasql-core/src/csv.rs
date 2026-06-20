@@ -432,17 +432,6 @@ pub fn expand_csv_path_specs(patterns: &[String]) -> Result<Vec<PathBuf>, CsvErr
     Ok(paths)
 }
 
-/// Read data records from one UTF-8 CSV file using sniffer metadata.
-///
-/// When a header is detected, it is excluded from the returned records.
-///
-/// # Errors
-///
-/// Returns [`CsvError`] on file I/O, UTF-8, or CSV syntax failure.
-pub fn read_csv_records_from_path(path: &Path) -> Result<Vec<Vec<String>>, CsvError> {
-    Ok(read_csv_data_from_path(path)?.records)
-}
-
 /// Read one UTF-8 CSV file using sniffer-derived dialect and header metadata.
 ///
 /// # Errors
@@ -563,15 +552,6 @@ pub fn read_csv_data_from_text(path: &str, text: &str) -> Result<CsvReadData, Cs
         records,
         has_header: sniff.has_header,
     })
-}
-
-/// Read the header row from the first file matched by a `read_csv` pattern.
-///
-/// # Errors
-///
-/// Returns [`CsvError`] when no files match or the first file has no header.
-pub fn read_csv_header(pattern: &str) -> Result<Vec<String>, CsvError> {
-    read_csv_header_from_specs(&[pattern.to_owned()])
 }
 
 /// Read the header row from the first file matched by one or more
