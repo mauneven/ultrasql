@@ -2,7 +2,7 @@
 //! Extracted from `expr_bind.rs` to keep each file under the 600-line ceiling.
 
 use ultrasql_core::DataType;
-use ultrasql_parser::ast::{BinaryOp, UnaryOp};
+use ultrasql_parser::ast::BinaryOp;
 
 use super::PlanError;
 
@@ -356,67 +356,14 @@ const fn dims_compatible(left: Option<u32>, right: Option<u32>) -> bool {
     }
 }
 
-pub(super) const fn display_unary(op: UnaryOp) -> &'static str {
-    match op {
-        UnaryOp::Neg => "-",
-        UnaryOp::Pos => "+",
-        UnaryOp::Not => "NOT",
-        UnaryOp::BitNot => "~",
-    }
-}
-
-pub(super) const fn display_binary(op: BinaryOp) -> &'static str {
-    match op {
-        BinaryOp::Add => "+",
-        BinaryOp::Sub => "-",
-        BinaryOp::Mul => "*",
-        BinaryOp::Div => "/",
-        BinaryOp::Mod => "%",
-        BinaryOp::Pow => "^",
-        BinaryOp::Concat => "||",
-        BinaryOp::Eq => "=",
-        BinaryOp::NotEq => "<>",
-        BinaryOp::Lt => "<",
-        BinaryOp::LtEq => "<=",
-        BinaryOp::Gt => ">",
-        BinaryOp::GtEq => ">=",
-        BinaryOp::VectorL2Distance => "<->",
-        BinaryOp::VectorNegativeInnerProduct => "<#>",
-        BinaryOp::VectorCosineDistance => "<=>",
-        BinaryOp::VectorL1Distance => "<+>",
-        BinaryOp::And => "AND",
-        BinaryOp::Or => "OR",
-        BinaryOp::Like => "LIKE",
-        BinaryOp::NotLike => "NOT LIKE",
-        BinaryOp::Ilike => "ILIKE",
-        BinaryOp::NotIlike => "NOT ILIKE",
-        BinaryOp::RegexMatch => "~",
-        BinaryOp::RegexIMatch => "~*",
-        BinaryOp::RegexNotMatch => "!~",
-        BinaryOp::RegexNotIMatch => "!~*",
-        BinaryOp::BitAnd => "&",
-        BinaryOp::BitOr => "|",
-        BinaryOp::BitXor => "#",
-        BinaryOp::ShiftLeft => "<<",
-        BinaryOp::ShiftRight => ">>",
-        BinaryOp::NetworkContainedEq => "<<=",
-        BinaryOp::NetworkContainsEq => ">>=",
-        BinaryOp::JsonGet => "->",
-        BinaryOp::JsonGetText => "->>",
-        BinaryOp::JsonGetPath => "#>",
-        BinaryOp::JsonGetPathText => "#>>",
-        BinaryOp::JsonContains => "@>",
-        BinaryOp::JsonContained => "<@",
-        BinaryOp::Overlap => "&&",
-        BinaryOp::JsonHasKey => "?",
-        BinaryOp::JsonHasAnyKey => "?|",
-        BinaryOp::JsonHasAllKeys => "?&",
-        BinaryOp::TextSearchMatch => "@@",
-    }
-}
+// Operator-token rendering lives with the operator enums in `crate::expr`;
+// re-exported here so binder modules keep their existing call paths.
+pub(super) use crate::expr::{display_binary, display_unary};
 
 #[cfg(test)]
 mod tests {
+    use ultrasql_parser::ast::UnaryOp;
+
     use super::*;
 
     fn decimal(scale: Option<i32>) -> DataType {

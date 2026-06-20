@@ -260,7 +260,13 @@ impl fmt::Display for ScalarExpr {
             Self::Column { name, .. } => f.write_str(name),
             Self::Literal { value, .. } => write!(f, "{value}"),
             Self::Parameter { index, .. } => write!(f, "${index}"),
-            Self::Unary { op, expr, .. } => write!(f, "{}{expr}", display_unary(*op)),
+            Self::Unary { op, expr, .. } => {
+                // `display_unary` returns the bare keyword; word operators
+                // (`NOT`) need a separating space before the operand, prefix
+                // operators (`-`, `+`, `~`) attach directly.
+                let sep = if matches!(op, UnaryOp::Not) { " " } else { "" };
+                write!(f, "{}{sep}{expr}", display_unary(*op))
+            }
             Self::Binary {
                 op, left, right, ..
             } => write!(f, "({left} {} {right})", display_binary(*op)),
@@ -316,17 +322,22 @@ impl fmt::Display for ScalarExpr {
     }
 }
 
-const fn display_unary(op: UnaryOp) -> &'static str {
+/// Renders a [`UnaryOp`] as its bare SQL keyword/symbol.
+///
+/// Word operators (`NOT`) carry no trailing separator; callers that splice
+/// the operator before an operand are responsible for inserting the space.
+pub(crate) const fn display_unary(op: UnaryOp) -> &'static str {
     match op {
         UnaryOp::Neg => "-",
         UnaryOp::Pos => "+",
-        UnaryOp::Not => "NOT ",
+        UnaryOp::Not => "NOT",
         UnaryOp::BitNot => "~",
     }
 }
 
+/// Renders a [`BinaryOp`] as its SQL operator token.
 #[allow(clippy::too_many_lines)]
-const fn display_binary(op: BinaryOp) -> &'static str {
+pub(crate) const fn display_binary(op: BinaryOp) -> &'static str {
     match op {
         BinaryOp::Add => "+",
         BinaryOp::Sub => "-",
