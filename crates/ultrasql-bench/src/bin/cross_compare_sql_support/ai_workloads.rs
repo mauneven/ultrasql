@@ -14,8 +14,8 @@ use super::types::{
     INGESTION_THROUGHPUT_REQUIRED_METRICS, RagRetrievalCertification, VectorTopKCertification,
 };
 use super::util::{
-    connect_sql_server, directory_size_bytes, simple_count, simple_query_rows,
-    start_persistent_bench_server, shutdown_persistent_bench_server, usize_to_f64, usize_to_u128,
+    connect_sql_server, directory_size_bytes, shutdown_persistent_bench_server, simple_count,
+    simple_query_rows, start_persistent_bench_server, usize_to_f64, usize_to_u128,
     write_json_report,
 };
 

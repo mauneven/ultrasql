@@ -51,13 +51,7 @@ pub(super) fn fmt_project(
     input.display_into(indent + 2, out);
 }
 
-pub(super) fn fmt_limit(
-    input: &LogicalPlan,
-    n: u64,
-    offset: u64,
-    indent: usize,
-    out: &mut String,
-) {
+pub(super) fn fmt_limit(input: &LogicalPlan, n: u64, offset: u64, indent: usize, out: &mut String) {
     let pad = " ".repeat(indent);
     out.push_str(&pad);
     let _ = fmt::write(out, format_args!("Limit: n={n}, offset={offset}\n"));

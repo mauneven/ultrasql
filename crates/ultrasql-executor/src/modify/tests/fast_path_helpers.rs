@@ -68,8 +68,7 @@ fn tid_extraction_and_update_fast_payloads_validate_shapes() {
     assert_eq!(one_tid, tid(4, 9));
     assert_eq!(row, &[Value::Text("x".to_owned())]);
 
-    let bad_short =
-        Batch::new([Column::Int32(NumericColumn::from_data(vec![1]))]).expect("batch");
+    let bad_short = Batch::new([Column::Int32(NumericColumn::from_data(vec![1]))]).expect("batch");
     assert!(extract_tids_from_batch(&bad_short, rel()).is_err());
     assert!(
         build_update_edits_int32_pair(

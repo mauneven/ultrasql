@@ -44,8 +44,8 @@ use crate::seq_scan::build_batch;
 use crate::{ExecError, Operator, eval_error_to_exec_error};
 
 use self::fast_path::{
-    MaskCombine, cmp_columns_to_mask, combine_masks, const_mask_i32, estimate_predicate_selectivity,
-    match_fast_predicate,
+    MaskCombine, cmp_columns_to_mask, combine_masks, const_mask_i32,
+    estimate_predicate_selectivity, match_fast_predicate,
 };
 use self::select::build_empty_batch;
 

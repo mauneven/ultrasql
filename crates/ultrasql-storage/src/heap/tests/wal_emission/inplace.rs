@@ -3,8 +3,8 @@
 //! payload-stats interaction.
 
 use ultrasql_core::{BlockNumber, CommandId, Lsn, PageId, Xid};
-use ultrasql_mvcc::status::test_support::MapOracle;
 use ultrasql_mvcc::Snapshot;
+use ultrasql_mvcc::status::test_support::MapOracle;
 use ultrasql_wal::payload::{
     HeapDeleteInPlaceBatchPayload, HeapDeleteInPlaceRangeBatchPayload,
     HeapUpdateInt32PairDeltaRangeBatchPayload,
@@ -12,10 +12,10 @@ use ultrasql_wal::payload::{
 use ultrasql_wal::record::RecordType;
 
 use super::{make_heap_with_sink, rel};
+use crate::heap::delete::{DeleteSlotWalScratch, DeleteSlotWalView};
 use crate::heap::tests::{
     int32_pair_payload, make_heap, opts, update_int32_edit, update_int32_scan, update_int32_stamp,
 };
-use crate::heap::delete::{DeleteSlotWalScratch, DeleteSlotWalView};
 use crate::heap::{
     DeleteInt32PairScan, DeleteInt32PairStamp, Int32PairCmp, Int32PairPredicate,
     UpdateInt32PairEdit, UpdateInt32PairScan, UpdateInt32PairStamp,
@@ -419,4 +419,3 @@ fn inplace_int32_delete_accepts_single_column_predicate() {
 
     assert_eq!(deleted, 2);
 }
-

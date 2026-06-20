@@ -53,7 +53,11 @@ pub(crate) fn eval_text_case(args: &[Value], mode: TextCase) -> Result<Value, Ev
     Ok(Value::Text(out))
 }
 
-pub(crate) fn text_arg<'a>(func: &str, args: &'a [Value], idx: usize) -> Result<Option<&'a str>, EvalError> {
+pub(crate) fn text_arg<'a>(
+    func: &str,
+    args: &'a [Value],
+    idx: usize,
+) -> Result<Option<&'a str>, EvalError> {
     match args.get(idx) {
         Some(Value::Text(text) | Value::Char(text)) => Ok(Some(text.as_str())),
         Some(Value::Null) => Ok(None),
@@ -87,7 +91,11 @@ pub(crate) fn int_arg(func: &str, args: &[Value], idx: usize) -> Result<Option<i
     }
 }
 
-pub(crate) fn numeric_arg(func: &str, args: &[Value], idx: usize) -> Result<Option<f64>, EvalError> {
+pub(crate) fn numeric_arg(
+    func: &str,
+    args: &[Value],
+    idx: usize,
+) -> Result<Option<f64>, EvalError> {
     match args.get(idx) {
         Some(Value::Float32(v)) => Ok(Some(f64::from(*v))),
         Some(Value::Float64(v)) => Ok(Some(*v)),
@@ -426,7 +434,11 @@ pub(crate) fn generated_text_target_len(func: &str, len: i64) -> Result<usize, E
     Ok(len)
 }
 
-pub(crate) fn generated_text_repeat_count(func: &str, text: &str, count: i64) -> Result<usize, EvalError> {
+pub(crate) fn generated_text_repeat_count(
+    func: &str,
+    text: &str,
+    count: i64,
+) -> Result<usize, EvalError> {
     if count <= 0 {
         return Ok(0);
     }
@@ -629,4 +641,3 @@ pub(crate) fn eval_quote_literal(args: &[Value]) -> Result<Value, EvalError> {
     };
     Ok(Value::Text(quote_literal(text)))
 }
-

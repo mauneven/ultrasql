@@ -3,8 +3,8 @@
 
 use std::fs;
 
-use ultrasql_server::replication::WalReceiver;
 use ultrasql_server::ValidationReport;
+use ultrasql_server::replication::WalReceiver;
 
 use super::super::cli_args::{ConnParams, CtlCommand, RecoveryTargets};
 use super::super::server_ops::{

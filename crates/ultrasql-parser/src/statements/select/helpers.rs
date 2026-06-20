@@ -2,9 +2,7 @@
 //! the `ORDER BY` list, object-name / identifier parsing, and the small
 //! comma-separated list helpers.
 
-use crate::ast::{
-    Expr, Identifier, NullsOrder, ObjectName, OrderItem, SelectItem, SortDirection,
-};
+use crate::ast::{Expr, Identifier, NullsOrder, ObjectName, OrderItem, SelectItem, SortDirection};
 use crate::parser::{ParseError, Parser};
 use crate::span::Span;
 use crate::token::TokenKind;

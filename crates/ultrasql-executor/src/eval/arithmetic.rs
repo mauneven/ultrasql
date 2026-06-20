@@ -18,7 +18,11 @@ pub(crate) enum ArithOp {
     Pow,
 }
 
-pub(crate) fn network_or_numeric_arith(lv: Value, rv: Value, op: ArithOp) -> Result<Value, EvalError> {
+pub(crate) fn network_or_numeric_arith(
+    lv: Value,
+    rv: Value,
+    op: ArithOp,
+) -> Result<Value, EvalError> {
     match (lv, rv, op) {
         (Value::Network(network), value, ArithOp::Add) => {
             let delta = integer_delta(&value)?;
@@ -143,7 +147,11 @@ pub(crate) fn numeric_arith(lv: Value, rv: Value, op: ArithOp) -> Result<Value, 
     }
 }
 
-pub(crate) fn money_arith(left: &Value, right: &Value, op: ArithOp) -> Result<Option<Value>, EvalError> {
+pub(crate) fn money_arith(
+    left: &Value,
+    right: &Value,
+    op: ArithOp,
+) -> Result<Option<Value>, EvalError> {
     match (left, right, op) {
         (Value::Money(l), Value::Money(r), ArithOp::Add) => l
             .checked_add(*r)
@@ -565,4 +573,3 @@ pub(crate) fn float64_arith(l: f64, r: f64, op: ArithOp) -> Result<Value, EvalEr
     };
     Ok(Value::Float64(result))
 }
-

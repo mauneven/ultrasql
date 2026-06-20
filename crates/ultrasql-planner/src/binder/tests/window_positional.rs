@@ -4,8 +4,8 @@
 use ultrasql_core::{DataType, Value};
 
 use super::*;
-use crate::plan::PipelineMode;
 use crate::LogicalWindowFunc;
+use crate::plan::PipelineMode;
 
 fn collect_window_funcs<'a>(plan: &'a LogicalPlan, out: &mut Vec<&'a LogicalWindowFunc>) {
     match plan {

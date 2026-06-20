@@ -582,5 +582,4 @@ impl Server {
         }
         write_runtime_metadata_file(&path, &out)
     }
-
 }

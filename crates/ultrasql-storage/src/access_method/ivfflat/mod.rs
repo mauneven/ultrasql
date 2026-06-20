@@ -70,7 +70,6 @@ struct IvfFlatEntry {
     deleted: bool,
 }
 
-
 const IVFFLAT_META_BLOCK: u32 = 0;
 const IVFFLAT_FIRST_ALLOC_BLOCK: u32 = 1;
 
@@ -190,7 +189,6 @@ struct IvfFlatEntryPage {
     deleted: bool,
 }
 
-
 fn count_to_f32(count: usize) -> f32 {
     count.to_f32().unwrap_or(f32::MAX)
 }
@@ -203,7 +201,11 @@ fn alloc_ivfflat_block(next_block: &mut u32) -> Result<BlockNumber, AccessMethod
     Ok(BlockNumber::new(block))
 }
 
-pub(crate) fn nearest_vector(centroids: &[Vec<f32>], probe: &[f32], metric: HnswMetric) -> Option<usize> {
+pub(crate) fn nearest_vector(
+    centroids: &[Vec<f32>],
+    probe: &[f32],
+    metric: HnswMetric,
+) -> Option<usize> {
     nearest_vectors(centroids, probe, metric, 1)
         .into_iter()
         .next()

@@ -149,8 +149,7 @@ fn vectorized_date_literal_i32_matches_scalar() {
     let data = vec![10_i32, 20, 30, 40, 50, 60];
     let batch =
         Batch::new([Column::Int32(NumericColumn::from_data(data.clone()))]).expect("batch ok");
-    let schema =
-        Schema::new([Field::required("o_orderdate", DataType::Date)]).expect("schema ok");
+    let schema = Schema::new([Field::required("o_orderdate", DataType::Date)]).expect("schema ok");
     let threshold = 40_i32;
     let pred = ScalarExpr::Binary {
         op: BinaryOp::GtEq,
@@ -219,8 +218,7 @@ fn vectorized_and_of_date_range_predicates_matches_scalar() {
     let data = vec![10_i32, 20, 30, 40, 50, 60];
     let batch =
         Batch::new([Column::Int32(NumericColumn::from_data(data.clone()))]).expect("batch ok");
-    let schema =
-        Schema::new([Field::required("o_orderdate", DataType::Date)]).expect("schema ok");
+    let schema = Schema::new([Field::required("o_orderdate", DataType::Date)]).expect("schema ok");
     let lower = ScalarExpr::Binary {
         op: BinaryOp::GtEq,
         left: Box::new(ScalarExpr::Column {
@@ -276,8 +274,7 @@ fn vectorized_column_column_i32_merges_nulls() {
     let mut right_validity = Bitmap::new(len, true);
     left_validity.set(1, false);
     right_validity.set(2, false);
-    let left =
-        NumericColumn::with_nulls(left_values, left_validity).expect("valid left column");
+    let left = NumericColumn::with_nulls(left_values, left_validity).expect("valid left column");
     let right =
         NumericColumn::with_nulls(right_values, right_validity).expect("valid right column");
     let batch = Batch::new([Column::Int32(left), Column::Int32(right)]).expect("batch ok");

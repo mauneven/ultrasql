@@ -20,8 +20,7 @@ fn cast_size_and_array_error_edges_cover_scalar_compat_paths() {
         Value::Int32(42)
     );
     assert!(
-        eval_fn_err("__ultrasql_cast_int2", vec![Value::Int32(40_000)])
-            .contains("out of range")
+        eval_fn_err("__ultrasql_cast_int2", vec![Value::Int32(40_000)]).contains("out of range")
     );
     assert!(
         eval_fn_err("__ultrasql_cast_int4", vec![Value::Text("x".into())])
@@ -98,9 +97,7 @@ fn cast_size_and_array_error_edges_cover_scalar_compat_paths() {
             "__ultrasql_cast_timestamp",
             vec![Value::Text("2023-08-15 04:05:06".into())]
         ),
-        Value::Timestamp(
-            parse_timestamp_text("2023-08-15 04:05:06").expect("timestamp parses")
-        )
+        Value::Timestamp(parse_timestamp_text("2023-08-15 04:05:06").expect("timestamp parses"))
     );
     assert!(
         eval_fn_err("__ultrasql_cast_date", vec![Value::Text("bad".into())])
@@ -115,8 +112,7 @@ fn cast_size_and_array_error_edges_cover_scalar_compat_paths() {
             parse_timestamptz_text("2023-08-15 04:05:06 UTC").expect("timestamptz parses")
         )
     );
-    let (timetz_micros, timetz_offset) =
-        parse_timetz_text("04:05:06-05").expect("timetz parses");
+    let (timetz_micros, timetz_offset) = parse_timetz_text("04:05:06-05").expect("timetz parses");
     assert_eq!(
         eval_fn(
             "__ultrasql_cast_timetz",
@@ -248,9 +244,7 @@ fn cast_size_and_array_error_edges_cover_scalar_compat_paths() {
         eval_fn("__ultrasql_cast_regclass", vec![Value::Int64(9)]),
         Value::RegClass(Oid::new(9))
     );
-    assert!(
-        eval_fn_err("__ultrasql_cast_regclass", vec![Value::Text("x".into())]).contains("OID")
-    );
+    assert!(eval_fn_err("__ultrasql_cast_regclass", vec![Value::Text("x".into())]).contains("OID"));
 
     assert!(eval_fn_err("__ultrasql_cast_regtype", vec![]).contains("expected 1 arg"));
     assert_eq!(
@@ -269,9 +263,7 @@ fn cast_size_and_array_error_edges_cover_scalar_compat_paths() {
         eval_fn("__ultrasql_cast_regtype", vec![Value::Int64(9)]),
         Value::RegType(Oid::new(9))
     );
-    assert!(
-        eval_fn_err("__ultrasql_cast_regtype", vec![Value::Text("x".into())]).contains("OID")
-    );
+    assert!(eval_fn_err("__ultrasql_cast_regtype", vec![Value::Text("x".into())]).contains("OID"));
 
     assert!(eval_fn_err("__ultrasql_cast_text", vec![]).contains("expected 1 arg"));
     assert_eq!(
@@ -354,4 +346,3 @@ fn cast_size_and_array_error_edges_cover_scalar_compat_paths() {
         Value::Bool(false)
     );
 }
-

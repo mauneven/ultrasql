@@ -112,8 +112,8 @@ fn date_json_xml_bit_and_network_helpers_cover_scalar_edges() {
     );
 
     let local_noon = parse_timestamp_text("2000-07-01 12:00:00").expect("timestamp parses");
-    let utc_from_new_york = parse_timestamptz_text("2000-07-01 12:00:00 America/New_York")
-        .expect("timestamptz parses");
+    let utc_from_new_york =
+        parse_timestamptz_text("2000-07-01 12:00:00 America/New_York").expect("timestamptz parses");
     assert_eq!(
         Eval::new(call(
             "timezone",
@@ -385,4 +385,3 @@ fn numeric_and_case_function_dispatch_covers_common_edges() {
         Value::Text("else".to_owned())
     );
 }
-

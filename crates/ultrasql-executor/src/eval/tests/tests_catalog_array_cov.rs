@@ -164,8 +164,7 @@ fn catalog_and_array_functions_cover_nulls_errors_and_fallbacks() {
     );
     assert!(eval_fn_err("format_type", vec![]).contains("expected 2 args"));
     assert!(
-        eval_fn_err("format_type", vec![Value::Text("bad".into()), Value::Null])
-            .contains("oid")
+        eval_fn_err("format_type", vec![Value::Text("bad".into()), Value::Null]).contains("oid")
     );
 
     assert_eq!(
@@ -247,9 +246,7 @@ fn catalog_and_array_functions_cover_nulls_errors_and_fallbacks() {
         eval_fn("array_length", vec![Value::Null, Value::Int32(1)]),
         Value::Null
     );
-    assert!(
-        eval_fn_err("array_length", vec![Value::Int32(1), Value::Int32(1)]).contains("array")
-    );
+    assert!(eval_fn_err("array_length", vec![Value::Int32(1), Value::Int32(1)]).contains("array"));
     assert!(
         eval_fn_err("array_length", vec![array.clone(), Value::Text("1".into())])
             .contains("dimension")
@@ -340,4 +337,3 @@ fn catalog_and_array_functions_cover_nulls_errors_and_fallbacks() {
 // -----------------------------------------------------------------------
 // Column reference
 // -----------------------------------------------------------------------
-

@@ -457,4 +457,3 @@ pub enum LogicalRlsCommand {
     /// `FOR DELETE`.
     Delete,
 }
-

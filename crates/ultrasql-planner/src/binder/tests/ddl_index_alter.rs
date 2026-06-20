@@ -3,8 +3,8 @@
 use ultrasql_core::{DataType, Field, Schema, Value};
 
 use super::*;
-use crate::catalog::TableMeta;
 use crate::LogicalIndexMethod;
+use crate::catalog::TableMeta;
 
 // CREATE INDEX / DROP TABLE / ALTER TABLE — DDL binder tests
 // -----------------------------------------------------------------------

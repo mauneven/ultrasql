@@ -6,8 +6,7 @@
 use std::fmt;
 
 use super::super::ddl_types::{
-    LogicalDefaultPrivilegeOperation, LogicalPrivilegeObjectKind, LogicalRlsPolicy,
-    LogicalRoleKind,
+    LogicalDefaultPrivilegeOperation, LogicalPrivilegeObjectKind, LogicalRlsPolicy, LogicalRoleKind,
 };
 
 pub(super) fn fmt_create_policy(policy: &LogicalRlsPolicy, indent: usize, out: &mut String) {

@@ -263,8 +263,11 @@ impl<L: PageLoader + Send + Sync + std::fmt::Debug + 'static> Operator for Modif
                             || !self.exclusion_checks.is_empty()
                         {
                             if let Some(column_map) = &self.insert_column_map {
-                                let expanded =
-                                    super::helpers::expand_insert_row(row, target_schema.len(), column_map)?;
+                                let expanded = super::helpers::expand_insert_row(
+                                    row,
+                                    target_schema.len(),
+                                    column_map,
+                                )?;
                                 expanded_row = expanded.values;
                                 omitted = expanded.omitted;
                             } else {

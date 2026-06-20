@@ -1,10 +1,10 @@
 //! Page-backed HNSW persistence, replay, and snapshot unit tests.
 
+use super::*;
+use crate::wal_sink::test_support::InMemoryWalSink;
 use proptest::prelude::*;
 use ultrasql_core::{BlockNumber, Lsn, PageId, RelationId, TupleId, Xid};
 use ultrasql_wal::record::{RecordType, WalRecord};
-use super::*;
-use crate::wal_sink::test_support::InMemoryWalSink;
 
 #[test]
 fn page_backed_hnsw_mirror_stays_consistent_through_dml_and_reload() {
@@ -180,8 +180,8 @@ fn hnsw_node_page_v1_decodes_as_base_only() {
     push_opt_block(&mut bytes, Some(BlockNumber::new(6)));
     bytes.push(0_u8); // not deleted; no v2 trailer follows
     let mut cursor = SnapshotCursor::new(&bytes);
-    let decoded = decode_hnsw_page_record(&mut cursor, rel, AnnPayloadKind::F32, 1)
-        .expect("decode v1 node");
+    let decoded =
+        decode_hnsw_page_record(&mut cursor, rel, AnnPayloadKind::F32, 1).expect("decode v1 node");
     assert!(cursor.is_empty(), "v1 record consumed with no trailer");
     let HnswPersistentPage::Node(got) = decoded.page else {
         panic!("expected a node page");
@@ -331,8 +331,7 @@ fn page_backed_hnsw_replays_wal_into_recovered_pages() {
 #[test]
 fn page_backed_hnsw_stamps_page_lsns_and_restores_page_images() {
     let index_rel = RelationId::new(8803);
-    let am =
-        PageBackedHnswIndex::new(index_rel, 3, HnswMetric::L2, 4, 16).expect("hnsw config");
+    let am = PageBackedHnswIndex::new(index_rel, 3, HnswMetric::L2, 4, 16).expect("hnsw config");
     let sink = InMemoryWalSink::new();
 
     am.insert_vector_logged(&[0.0, 0.0, 0.0], tid(1, 0), Xid::new(13), Some(&sink))
@@ -380,9 +379,8 @@ fn page_backed_hnsw_restore_rejects_duplicate_node_ids() {
     node.tid = tid(1, 1);
     images.push(duplicate);
 
-    let err =
-        PageBackedHnswIndex::from_page_images(index_rel, 3, HnswMetric::L2, 4, 16, images)
-            .expect_err("duplicate node ids must be refused");
+    let err = PageBackedHnswIndex::from_page_images(index_rel, 3, HnswMetric::L2, 4, 16, images)
+        .expect_err("duplicate node ids must be refused");
 
     assert!(format!("{err}").contains("duplicate node id"));
 }
@@ -498,8 +496,8 @@ fn hnsw_snapshot_round_trips_search_results() {
         let expected_lsn = am.snapshot_lsn();
 
         let bytes = am.encode_snapshot();
-        let restored = PageBackedHnswIndex::from_snapshot_bytes(index_rel, &bytes)
-            .expect("snapshot decodes");
+        let restored =
+            PageBackedHnswIndex::from_snapshot_bytes(index_rel, &bytes).expect("snapshot decodes");
 
         assert_eq!(restored.payload_kind(), kind, "payload kind preserved");
         assert_eq!(
@@ -529,8 +527,7 @@ fn hnsw_snapshot_rejects_corruption() {
     let bytes = am.encode_snapshot();
 
     // Sanity: the pristine snapshot decodes.
-    PageBackedHnswIndex::from_snapshot_bytes(index_rel, &bytes)
-        .expect("pristine snapshot decodes");
+    PageBackedHnswIndex::from_snapshot_bytes(index_rel, &bytes).expect("pristine snapshot decodes");
 
     // (a) Flip one byte in the middle of the buffer.
     let mut flipped = bytes.clone();

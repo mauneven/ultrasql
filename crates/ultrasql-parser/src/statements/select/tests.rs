@@ -3,8 +3,8 @@
 use proptest::prelude::*;
 
 use crate::ast::{
-    Distinct, Expr, JoinCondition, JoinOp, SelectItem, SetOp, SetQuantifier, Statement,
-    TableRef, XmlTableColumnKind,
+    Distinct, Expr, JoinCondition, JoinOp, SelectItem, SetOp, SetQuantifier, Statement, TableRef,
+    XmlTableColumnKind,
 };
 use crate::parser::Parser;
 
@@ -121,8 +121,7 @@ fn select_unpivot_rejects_empty_column_list() {
 
 #[test]
 fn select_inner_join_on() {
-    let stmt =
-        parse("SELECT u.id, o.total FROM users u INNER JOIN orders o ON u.id = o.user_id");
+    let stmt = parse("SELECT u.id, o.total FROM users u INNER JOIN orders o ON u.id = o.user_id");
     let Statement::Select(s) = stmt else { panic!() };
     assert_eq!(s.from.len(), 1);
     let TableRef::Join { op, condition, .. } = &s.from[0] else {

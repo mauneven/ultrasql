@@ -7,8 +7,8 @@ use ultrasql_parser::ast::BinaryOp;
 
 use super::super::*;
 use super::*;
-use crate::catalog::InMemoryCatalog;
 use crate::LogicalIndexMethod;
+use crate::catalog::InMemoryCatalog;
 
 #[test]
 fn binds_unnest_table_function_from_text_array() {

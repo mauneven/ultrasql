@@ -1,7 +1,7 @@
 //! B-tree operation payload codecs.
 
-use ultrasql_core::{PageId, RelationId};
 use ultrasql_core::endian::{read_u32_le, write_u32_le};
+use ultrasql_core::{PageId, RelationId};
 
 use super::{
     MAX_VARIABLE_PAYLOAD_BYTES, PAGE_ID_SIZE, PayloadError, checked_offset, decode_page_id,
@@ -202,4 +202,3 @@ impl BTreeOpPayload {
         })
     }
 }
-

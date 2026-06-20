@@ -134,4 +134,3 @@ pub(crate) fn eval_extremum(
     }
     Ok(best.unwrap_or(Value::Null))
 }
-

@@ -181,12 +181,17 @@ where
         //    `IndexEntry` stores 0-based positions internally, so the
         //    cast is direct. We override `root_block` to match the
         //    freshly built tree.
-        let mut entry =
-            IndexEntry::new(index_oid, index_name.to_string(), table.oid, attnums, unique)
-                .with_schema_name(index_namespace.to_string())
-                .with_primary(primary_key)
-                .with_access_method(logical_index_method_name(method), opclasses.to_vec())
-                .with_options(index_options_as_pairs(index_options));
+        let mut entry = IndexEntry::new(
+            index_oid,
+            index_name.to_string(),
+            table.oid,
+            attnums,
+            unique,
+        )
+        .with_schema_name(index_namespace.to_string())
+        .with_primary(primary_key)
+        .with_access_method(logical_index_method_name(method), opclasses.to_vec())
+        .with_options(index_options_as_pairs(index_options));
         entry.root_block = root_block;
         self.state.persistent_catalog.create_index(entry.clone())?;
         let ddl_txn = self

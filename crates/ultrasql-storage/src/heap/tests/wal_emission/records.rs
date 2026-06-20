@@ -3,7 +3,7 @@
 
 use std::sync::Arc;
 
-use ultrasql_core::{CommandId, PageId, BlockNumber, Xid};
+use ultrasql_core::{BlockNumber, CommandId, PageId, Xid};
 use ultrasql_mvcc::tuple_header::TUPLE_HEADER_SIZE;
 use ultrasql_wal::payload::{
     HEAP_UPDATE_HOT, HeapDeletePayload, HeapInsertBatchPayload, HeapInsertPayload,

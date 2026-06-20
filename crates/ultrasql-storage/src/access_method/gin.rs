@@ -8,7 +8,6 @@ use ultrasql_core::TupleId;
 
 use super::{AccessMethod, AccessMethodError};
 
-
 #[derive(Debug, Default)]
 struct GinStorage {
     postings: std::collections::BTreeMap<Vec<u8>, Vec<TupleId>>,

@@ -112,7 +112,10 @@ impl PageBackedHnswStorage {
         Ok(())
     }
 
-    pub(crate) fn node_page(&self, node_id: HnswNodeId) -> Result<Option<&HnswNodePage>, AccessMethodError> {
+    pub(crate) fn node_page(
+        &self,
+        node_id: HnswNodeId,
+    ) -> Result<Option<&HnswNodePage>, AccessMethodError> {
         let Some(block) = self.node_to_block.get(&node_id) else {
             return Ok(None);
         };
@@ -161,7 +164,10 @@ impl PageBackedHnswStorage {
         Ok(out)
     }
 
-    pub(crate) fn vector_for_node(&self, node: &HnswNodePage) -> Result<Vec<f32>, AccessMethodError> {
+    pub(crate) fn vector_for_node(
+        &self,
+        node: &HnswNodePage,
+    ) -> Result<Vec<f32>, AccessMethodError> {
         let mut vector = Vec::with_capacity(node.vector_len);
         let mut current = Some(node.vector_head);
         while let Some(block) = current {

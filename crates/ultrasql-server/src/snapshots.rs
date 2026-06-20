@@ -297,7 +297,10 @@ pub(crate) fn validate_data_dir_ownership(data_dir: &Path) -> Result<(), ServerE
     }
 }
 
-pub(crate) fn validate_data_dir_permissions(data_dir: &Path, existed: bool) -> Result<(), ServerError> {
+pub(crate) fn validate_data_dir_permissions(
+    data_dir: &Path,
+    existed: bool,
+) -> Result<(), ServerError> {
     #[cfg(unix)]
     {
         validate_data_dir_mode(data_dir, existed)
@@ -310,7 +313,10 @@ pub(crate) fn validate_data_dir_permissions(data_dir: &Path, existed: bool) -> R
 }
 
 #[cfg(unix)]
-pub(crate) fn validate_data_dir_owner(data_dir: &Path, expected_uid: u32) -> Result<(), ServerError> {
+pub(crate) fn validate_data_dir_owner(
+    data_dir: &Path,
+    expected_uid: u32,
+) -> Result<(), ServerError> {
     use std::os::unix::fs::MetadataExt;
 
     let metadata = std::fs::metadata(data_dir).map_err(ServerError::Io)?;

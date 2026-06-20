@@ -223,4 +223,3 @@ fn substring_counts_unicode_characters() {
         Value::Text("\u{00e9}".to_owned())
     );
 }
-

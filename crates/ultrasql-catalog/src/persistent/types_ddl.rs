@@ -403,5 +403,4 @@ impl PersistentCatalog {
         .map_err(|e| CatalogError::schema_conflict(format!("pg_type insert: {e}")))?;
         Ok(())
     }
-
 }

@@ -40,11 +40,11 @@ pub use self::ddl_types::{
 };
 pub use self::logical_plan::LogicalPlan;
 pub use self::node_types::{
-    AggregateFunc, ConflictTarget, LogicalAggregateExpr, LogicalAggregatingIndex,
-    LogicalAggregatingIndexExpr, LogicalDescribeObjectKind, LogicalDescribeTarget,
-    LogicalIndexMethod, LogicalIndexOption, LogicalJoinCondition, LogicalJoinType,
-    LogicalMergeAction, LogicalMergeClause, LogicalMergeMatchKind, LogicalOnConflict,
-    LogicalPivotAggregate, LogicalPivotValue, LogicalSetOp, LogicalSetQuantifier,
-    LogicalSetVariableAction, LogicalTableOption, LogicalUnpivotColumn, LogicalWindowFunc,
-    LockStrength, LockWaitPolicy, PipelineMode, SortKey, TxnIsolationLevel,
+    AggregateFunc, ConflictTarget, LockStrength, LockWaitPolicy, LogicalAggregateExpr,
+    LogicalAggregatingIndex, LogicalAggregatingIndexExpr, LogicalDescribeObjectKind,
+    LogicalDescribeTarget, LogicalIndexMethod, LogicalIndexOption, LogicalJoinCondition,
+    LogicalJoinType, LogicalMergeAction, LogicalMergeClause, LogicalMergeMatchKind,
+    LogicalOnConflict, LogicalPivotAggregate, LogicalPivotValue, LogicalSetOp,
+    LogicalSetQuantifier, LogicalSetVariableAction, LogicalTableOption, LogicalUnpivotColumn,
+    LogicalWindowFunc, PipelineMode, SortKey, TxnIsolationLevel,
 };

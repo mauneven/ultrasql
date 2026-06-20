@@ -191,7 +191,10 @@ pub(crate) fn validate_autovacuum_reloptions(
     Ok(())
 }
 
-pub(crate) fn autovacuum_config_for_table(base: AutovacuumConfig, entry: &TableEntry) -> AutovacuumConfig {
+pub(crate) fn autovacuum_config_for_table(
+    base: AutovacuumConfig,
+    entry: &TableEntry,
+) -> AutovacuumConfig {
     let mut config = base;
     if let Err(error) = apply_autovacuum_reloptions(&mut config, &entry.options) {
         tracing::warn!(

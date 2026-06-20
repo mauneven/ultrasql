@@ -1,11 +1,11 @@
 //! ivfflat access-method unit tests.
 
+use super::*;
+use crate::wal_sink::test_support::InMemoryWalSink;
 use proptest::prelude::*;
 use ultrasql_core::{Lsn, RelationId, TupleId, Xid};
 use ultrasql_wal::payload::{IvfFlatOpKind, IvfFlatOpPayload};
 use ultrasql_wal::record::{RecordType, WalRecord};
-use super::*;
-use crate::wal_sink::test_support::InMemoryWalSink;
 
 #[test]
 fn page_backed_ivfflat_rejects_random_wal_payloads_without_panicking() {
@@ -87,8 +87,8 @@ fn ivfflat_rejects_duplicate_bulk_load_tids() {
 #[test]
 fn page_backed_ivfflat_rejects_duplicate_bulk_load_tids_atomically() {
     let index_rel = RelationId::new(9899);
-    let index = PageBackedIvfFlatIndex::new(index_rel, 2, HnswMetric::L2, 2, 1)
-        .expect("ivfflat config");
+    let index =
+        PageBackedIvfFlatIndex::new(index_rel, 2, HnswMetric::L2, 2, 1).expect("ivfflat config");
 
     index
         .bulk_load_logged(vec![(vec![0.0, 0.0], tid(1, 0))], Xid::new(29), None)
@@ -112,8 +112,8 @@ fn page_backed_ivfflat_rejects_duplicate_bulk_load_tids_atomically() {
 #[test]
 fn page_backed_ivfflat_replays_centroids_lists_and_deletes() {
     let index_rel = RelationId::new(9900);
-    let source = PageBackedIvfFlatIndex::new(index_rel, 2, HnswMetric::L2, 2, 1)
-        .expect("ivfflat config");
+    let source =
+        PageBackedIvfFlatIndex::new(index_rel, 2, HnswMetric::L2, 2, 1).expect("ivfflat config");
     let sink = InMemoryWalSink::new();
 
     source
@@ -179,15 +179,13 @@ fn page_backed_ivfflat_replays_centroids_lists_and_deletes() {
 #[test]
 fn ann_quantized_payloads_keep_exact_f32_rerank_vectors() {
     let vector = vec![1.25, -2.5, 0.125];
-    let bf16 =
-        AnnVectorPayload::new(AnnPayloadKind::Bf16, &vector).expect("bf16 payload builds");
+    let bf16 = AnnVectorPayload::new(AnnPayloadKind::Bf16, &vector).expect("bf16 payload builds");
     assert_eq!(bf16.kind(), AnnPayloadKind::Bf16);
     assert_eq!(bf16.rerank_policy(), AnnRerankPolicy::ExactF32);
     assert_eq!(bf16.exact_f32(), vector.as_slice());
     assert_eq!(bf16.quantized_len_bytes(), vector.len() * 2);
 
-    let int8 =
-        AnnVectorPayload::new(AnnPayloadKind::Int8, &vector).expect("int8 payload builds");
+    let int8 = AnnVectorPayload::new(AnnPayloadKind::Int8, &vector).expect("int8 payload builds");
     assert_eq!(int8.kind(), AnnPayloadKind::Int8);
     assert_eq!(int8.rerank_policy(), AnnRerankPolicy::ExactF32);
     assert_eq!(int8.exact_f32(), vector.as_slice());
@@ -337,8 +335,8 @@ fn ivfflat_snapshot_rejects_corruption() {
 #[test]
 fn ivfflat_snapshot_replay_skips_covered_records_and_applies_newer() {
     let index_rel = RelationId::new(9_924);
-    let source = PageBackedIvfFlatIndex::new(index_rel, 2, HnswMetric::L2, 2, 1)
-        .expect("ivfflat config");
+    let source =
+        PageBackedIvfFlatIndex::new(index_rel, 2, HnswMetric::L2, 2, 1).expect("ivfflat config");
     let sink = InMemoryWalSink::new();
     source
         .bulk_load_logged(
@@ -364,8 +362,8 @@ fn ivfflat_snapshot_replay_skips_covered_records_and_applies_newer() {
 
     let bytes = source.encode_snapshot();
     let snapshot_lsn = source.snapshot_lsn();
-    let restored = PageBackedIvfFlatIndex::from_snapshot_bytes(index_rel, &bytes)
-        .expect("snapshot decodes");
+    let restored =
+        PageBackedIvfFlatIndex::from_snapshot_bytes(index_rel, &bytes).expect("snapshot decodes");
     let live_before = restored.live_len();
 
     // Every emitted record is at or below the snapshot lsn, so the redo gate
@@ -433,9 +431,7 @@ fn nearest_vectors_skips_empty_centroid_slots_without_panicking() {
         Some(2)
     );
     // All-empty centroids yield nothing to probe — and still no panic.
-    assert!(
-        nearest_vectors(&[Vec::new(), Vec::new()], &[8.0, 0.0], HnswMetric::L2, 2).is_empty()
-    );
+    assert!(nearest_vectors(&[Vec::new(), Vec::new()], &[8.0, 0.0], HnswMetric::L2, 2).is_empty());
 }
 
 #[test]

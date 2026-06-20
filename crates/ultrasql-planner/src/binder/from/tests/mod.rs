@@ -13,21 +13,21 @@ use super::csv_schema::{
     infer_csv_header_from_first_record, read_csv_header_from_first_record,
     validate_read_csv_reject_path_arg,
 };
-use super::paths::{
-    contains_wildcard, expand_file_path_specs, expand_file_paths, path_specs_use_object_store,
-    read_file_path_specs, wildcard_match,
-};
 use super::json_reader::{
     JsonColumnKind, JsonFieldAccumulator, JsonInputKind, PlannerJsonRecordReader, json_value_kind,
     json_value_to_object, widen_json_kind,
+};
+use super::paths::{
+    contains_wildcard, expand_file_path_specs, expand_file_paths, path_specs_use_object_store,
+    read_file_path_specs, wildcard_match,
 };
 use super::readers::{
     arrow_type_to_sql, planner_parquet_range_error, validate_planner_object_range,
 };
 use super::table_function::bind_json_table_function;
 use super::{
-    LogicalJoinCondition, LogicalJoinType, LogicalPlan, PlanError, READ_CSV_HEADER_SAMPLE_BYTES,
-    PLANNER_JSON_RECORD_LIMIT_BYTES, ScalarExpr, ScopeEntry, ScopeStack, bind_from,
+    LogicalJoinCondition, LogicalJoinType, LogicalPlan, PLANNER_JSON_RECORD_LIMIT_BYTES, PlanError,
+    READ_CSV_HEADER_SAMPLE_BYTES, ScalarExpr, ScopeEntry, ScopeStack, bind_from,
 };
 use crate::catalog::{InMemoryCatalog, TableMeta};
 
@@ -119,8 +119,7 @@ fn bind_from_covers_table_ref_families_and_join_scope_shapes() {
     assert_eq!(system_scope[0].qualifier, "c");
 
     let catalog = planner_test_catalog();
-    let cte_schema =
-        Schema::new([Field::required("cte_id", DataType::Int64)]).expect("cte schema");
+    let cte_schema = Schema::new([Field::required("cte_id", DataType::Int64)]).expect("cte schema");
     let cte_from = parse_from("SELECT * FROM latest AS l");
     let (cte_scan, cte_scope) = bind_from(
         &cte_from,
@@ -415,16 +414,12 @@ fn json_record_readers_stream_objects_and_report_malformed_rows() {
         None
     );
 
-    let mut scalar = PlannerJsonRecordReader::new(
-        JsonInputKind::Json,
-        Box::new(Cursor::new(b"42".to_vec())),
-    );
+    let mut scalar =
+        PlannerJsonRecordReader::new(JsonInputKind::Json, Box::new(Cursor::new(b"42".to_vec())));
     assert!(scalar.next_text("read_json", "scalar.json").is_err());
 
-    let mut bad_array = PlannerJsonRecordReader::new(
-        JsonInputKind::Json,
-        Box::new(Cursor::new(b"[1]".to_vec())),
-    );
+    let mut bad_array =
+        PlannerJsonRecordReader::new(JsonInputKind::Json, Box::new(Cursor::new(b"[1]".to_vec())));
     assert!(bad_array.next_text("read_json", "bad-array.json").is_err());
 
     let mut truncated_array = PlannerJsonRecordReader::new(

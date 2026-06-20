@@ -9,16 +9,12 @@ use ultrasql_storage::access_method::BrinIndex;
 use crate::error::ServerError;
 
 use super::LowerCtx;
-use super::btree_probe::{
-    probe_index, scan_brin_candidate_ranges, usize_to_u64_saturating,
-};
+use super::btree_probe::{probe_index, scan_brin_candidate_ranges, usize_to_u64_saturating};
 use super::catalog_lookup::{
     brin_summary, find_single_column_brin_index, find_single_column_hash_index,
     find_single_column_index, key_type_for_btree,
 };
-use super::predicate::{
-    IndexKeyRange, match_hash_equality_predicate, match_indexable_predicate,
-};
+use super::predicate::{IndexKeyRange, match_hash_equality_predicate, match_indexable_predicate};
 
 /// Try to lower a `Filter { Scan(table), predicate }` shape into an
 /// [`IndexScan`] operator backed by a B-tree probe.

@@ -4,9 +4,11 @@ use ultrasql_core::{DataType, Field, GeometryType, Oid, RangeType, Value};
 use ultrasql_executor::RowCodec;
 
 use super::super::super::jsonb_ingest::JsonbShapeCache;
-use super::super::binary::{binary_copy_cell_bytes, decode_binary_copy_cell, read_i16_be, read_i32_be};
+use super::super::binary::{
+    binary_copy_cell_bytes, decode_binary_copy_cell, read_i16_be, read_i32_be,
+};
 use super::super::decode::{
-    decode_copy_cell, decode_copy_cells_to_payload, decode_one_copy_row, days_in_month,
+    days_in_month, decode_copy_cell, decode_copy_cells_to_payload, decode_one_copy_row,
     format_float_f32, format_float_f64, parse_copy_date, parse_copy_time, parse_copy_timestamp,
     parse_copy_timestamptz, parse_copy_timetz,
 };
@@ -76,8 +78,7 @@ fn copy_text_cell_decoding_covers_types_and_errors() {
         Value::Time(1_000_000)
     );
     assert_eq!(
-        decode_copy_cell(Some(b"00:00:01+05"), &DataType::TimeTz, 0, &mut cache)
-            .expect("timetz"),
+        decode_copy_cell(Some(b"00:00:01+05"), &DataType::TimeTz, 0, &mut cache).expect("timetz"),
         Value::TimeTz {
             micros: 1_000_000,
             offset_seconds: 18_000,
@@ -129,8 +130,7 @@ fn copy_text_cell_decoding_covers_types_and_errors() {
         Value::parse_bit_string("1010").expect("bit string")
     );
     assert!(
-        decode_copy_cell(Some(b"101"), &DataType::Bit { len: Some(4) }, 0, &mut cache,)
-            .is_err()
+        decode_copy_cell(Some(b"101"), &DataType::Bit { len: Some(4) }, 0, &mut cache,).is_err()
     );
     assert!(decode_copy_cell(Some(b"{"), &DataType::Json, 0, &mut cache).is_err());
     assert_eq!(
@@ -204,9 +204,7 @@ fn copy_text_cell_decoding_covers_types_and_errors() {
             &mut cache,
         )
         .expect("range"),
-        Value::Range(
-            ultrasql_core::RangeValue::parse(RangeType::Int4, "[1,10)").expect("range")
-        )
+        Value::Range(ultrasql_core::RangeValue::parse(RangeType::Int4, "[1,10)").expect("range"))
     );
     assert!(
         decode_copy_cell(
@@ -243,8 +241,7 @@ fn copy_text_cell_decoding_covers_types_and_errors() {
         Value::Bytea(vec![10, 11])
     );
     assert_eq!(
-        decode_copy_cell(Some(b"deadbeef"), &DataType::Bytea, 0, &mut cache)
-            .expect("raw bytea"),
+        decode_copy_cell(Some(b"deadbeef"), &DataType::Bytea, 0, &mut cache).expect("raw bytea"),
         Value::Bytea(b"deadbeef".to_vec())
     );
     assert!(decode_copy_cell(Some(b"\\xabc"), &DataType::Bytea, 0, &mut cache).is_err());

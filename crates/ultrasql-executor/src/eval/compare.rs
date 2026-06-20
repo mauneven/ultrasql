@@ -365,4 +365,3 @@ impl DecimalMagnitude {
 pub(crate) fn pow10_i128(exp: u32) -> Option<i128> {
     (0..exp).try_fold(1_i128, |acc, _| acc.checked_mul(10))
 }
-

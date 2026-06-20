@@ -11,8 +11,8 @@ use ultrasql_core::{DataType, Schema};
 use crate::expr::ScalarExpr;
 
 use super::super::ddl_types::{
-    LogicalAlterTableAction, LogicalAlterViewAction, LogicalCheckConstraint,
-    LogicalCommentTarget, LogicalExclusionConstraint, LogicalUniqueConstraint,
+    LogicalAlterTableAction, LogicalAlterViewAction, LogicalCheckConstraint, LogicalCommentTarget,
+    LogicalExclusionConstraint, LogicalUniqueConstraint,
 };
 use super::super::logical_plan::LogicalPlan;
 use super::super::node_types::LogicalIndexMethod;
@@ -261,8 +261,7 @@ pub(super) fn fmt_create_index(
         out,
         format_args!(
             "Create{u}Index{c}{inx}: {qualified_index_name} ON {table_name} USING {method} (keys=[{keys}])\n",
-            qualified_index_name =
-                ultrasql_catalog::index_lookup_key(index_namespace, index_name),
+            qualified_index_name = ultrasql_catalog::index_lookup_key(index_namespace, index_name),
             keys = if columns.is_empty() {
                 key_exprs
                     .iter()
@@ -361,9 +360,7 @@ pub(super) fn fmt_alter_table(
         } => {
             let _ = fmt::write(
                 out,
-                format_args!(
-                    "AlterTable: {table_name} RENAME COLUMN {old_name} TO {new_name}\n"
-                ),
+                format_args!("AlterTable: {table_name} RENAME COLUMN {old_name} TO {new_name}\n"),
             );
         }
         LogicalAlterTableAction::RenameTable { new_name } => {

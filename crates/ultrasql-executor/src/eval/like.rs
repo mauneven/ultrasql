@@ -89,11 +89,14 @@ pub(crate) fn like_match_tokens(haystack: &[char], pattern: &[LikeToken]) -> boo
     prev[pattern.len()]
 }
 
-pub(crate) fn regex_match(haystack: &str, pattern: &str, case_insensitive: bool) -> Result<bool, EvalError> {
+pub(crate) fn regex_match(
+    haystack: &str,
+    pattern: &str,
+    case_insensitive: bool,
+) -> Result<bool, EvalError> {
     regex::RegexBuilder::new(pattern)
         .case_insensitive(case_insensitive)
         .build()
         .map(|regex| regex.is_match(haystack))
         .map_err(|err| EvalError::Type(format!("regex operator: invalid pattern: {err}")))
 }
-

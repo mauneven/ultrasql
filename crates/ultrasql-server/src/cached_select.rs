@@ -614,4 +614,3 @@ pub(crate) fn hash_index_value(value: &Value) -> Option<i64> {
         std::hash::Hasher::finish(&hasher).to_ne_bytes(),
     ))
 }
-

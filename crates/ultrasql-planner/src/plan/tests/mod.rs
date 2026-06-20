@@ -196,8 +196,7 @@ fn aggregate_schema_orders_group_by_then_aggregates() {
 #[test]
 fn join_schema_concatenates_under_outer_nullability() {
     let left_schema = Schema::new([Field::required("a", DataType::Int32)]).expect("schema ok");
-    let right_schema =
-        Schema::new([Field::nullable("b", DataType::Float64)]).expect("schema ok");
+    let right_schema = Schema::new([Field::nullable("b", DataType::Float64)]).expect("schema ok");
     let left = LogicalPlan::Scan {
         table: "t1".into(),
         schema: left_schema,
@@ -270,8 +269,7 @@ fn display_renders_aggregate_with_function_names() {
         schema: Schema::new([Field::required("v", DataType::Int32)]).expect("schema ok"),
         projection: None,
     };
-    let agg_schema =
-        Schema::new([Field::nullable("total", DataType::Int64)]).expect("schema ok");
+    let agg_schema = Schema::new([Field::nullable("total", DataType::Int64)]).expect("schema ok");
     let plan = LogicalPlan::Aggregate {
         input: Box::new(input),
         group_by: vec![],

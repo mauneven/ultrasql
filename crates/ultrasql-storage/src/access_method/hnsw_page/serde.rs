@@ -376,7 +376,9 @@ fn decode_opt_node_id(
     if present { Ok(Some(raw)) } else { Ok(None) }
 }
 
-pub(crate) fn decode_tuple_id(cursor: &mut SnapshotCursor<'_>) -> Result<TupleId, AccessMethodError> {
+pub(crate) fn decode_tuple_id(
+    cursor: &mut SnapshotCursor<'_>,
+) -> Result<TupleId, AccessMethodError> {
     let relation = RelationId::new(cursor.take_u32()?);
     let block = BlockNumber::new(cursor.take_u32()?);
     let slot = cursor.take_u16()?;

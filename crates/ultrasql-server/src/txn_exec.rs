@@ -41,7 +41,8 @@ pub(crate) struct RunPlanInTxnArgs<'a> {
     pub(crate) plan: &'a LogicalPlan,
     pub(crate) txn: &'a Transaction,
     pub(crate) catalog_snapshot: Arc<CatalogSnapshot>,
-    pub(crate) table_constraints: Arc<dashmap::DashMap<ultrasql_core::Oid, Arc<TableRuntimeConstraints>>>,
+    pub(crate) table_constraints:
+        Arc<dashmap::DashMap<ultrasql_core::Oid, Arc<TableRuntimeConstraints>>>,
     pub(crate) sequences: Arc<dashmap::DashMap<String, Arc<ultrasql_storage::sequence::Sequence>>>,
     pub(crate) sequence_owners: Arc<dashmap::DashMap<String, String>>,
     pub(crate) sequence_namespaces: Arc<dashmap::DashMap<String, String>>,
@@ -54,7 +55,8 @@ pub(crate) struct RunPlanInTxnArgs<'a> {
     pub(crate) current_user: String,
     pub(crate) session_user: String,
     pub(crate) persistent_catalog: Arc<PersistentCatalog>,
-    pub(crate) time_partitions: Arc<dashmap::DashMap<String, Arc<time_partition::TimePartitionRuntime>>>,
+    pub(crate) time_partitions:
+        Arc<dashmap::DashMap<String, Arc<time_partition::TimePartitionRuntime>>>,
     pub(crate) workload_recorder: Arc<workload::WorkloadRecorder>,
     pub(crate) autovacuum_config: AutovacuumConfig,
     pub(crate) logging_config: LoggingConfig,
@@ -379,7 +381,10 @@ pub(crate) fn equality_i64_predicate(predicate: &ScalarExpr) -> Option<(usize, i
     column_literal_i64(left, right).or_else(|| column_literal_i64(right, left))
 }
 
-pub(crate) fn column_literal_i64(column: &ScalarExpr, literal: &ScalarExpr) -> Option<(usize, i64)> {
+pub(crate) fn column_literal_i64(
+    column: &ScalarExpr,
+    literal: &ScalarExpr,
+) -> Option<(usize, i64)> {
     let ScalarExpr::Column { index, .. } = column else {
         return None;
     };
@@ -445,7 +450,9 @@ pub(crate) fn aggregating_group_key_exprs(
         .collect()
 }
 
-pub(crate) fn hnsw_metric_for_opclass_name(opclass: Option<&str>) -> Result<HnswMetric, ServerError> {
+pub(crate) fn hnsw_metric_for_opclass_name(
+    opclass: Option<&str>,
+) -> Result<HnswMetric, ServerError> {
     match opclass.unwrap_or("vector_l2_ops") {
         "vector_l2_ops" => Ok(HnswMetric::L2),
         "vector_cosine_ops" => Ok(HnswMetric::Cosine),
@@ -477,7 +484,10 @@ pub(crate) fn ann_payload_option_from_catalog(
     Ok(payload)
 }
 
-pub(crate) fn ann_payload_kind_from_value(context: &str, value: &str) -> Result<AnnPayloadKind, ServerError> {
+pub(crate) fn ann_payload_kind_from_value(
+    context: &str,
+    value: &str,
+) -> Result<AnnPayloadKind, ServerError> {
     match value.to_ascii_lowercase().as_str() {
         "f32" | "float32" => Ok(AnnPayloadKind::F32),
         "bf16" | "bfloat16" => Ok(AnnPayloadKind::Bf16),
@@ -511,7 +521,10 @@ pub(crate) fn ivfflat_options_from_catalog(
     Ok((lists, probes, payload))
 }
 
-pub(crate) fn parse_positive_ivfflat_catalog_option(name: &str, value: &str) -> Result<usize, ServerError> {
+pub(crate) fn parse_positive_ivfflat_catalog_option(
+    name: &str,
+    value: &str,
+) -> Result<usize, ServerError> {
     let parsed = value.parse::<usize>().map_err(|_| {
         ServerError::ddl(format!(
             "rebuild IVFFlat: option {name} must be a positive integer"
@@ -552,4 +565,3 @@ pub(crate) const fn row_lock_mode(strength: LockStrength) -> RowLockMode {
         LockStrength::KeyShare => RowLockMode::ForKeyShare,
     }
 }
-

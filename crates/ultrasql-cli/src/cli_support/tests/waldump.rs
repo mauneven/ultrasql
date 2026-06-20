@@ -4,7 +4,9 @@ use std::fs;
 
 use super::super::fileio::{decode_hex, hex_bytes};
 use super::super::wal_ship::{run_archive_wal, run_restore_wal};
-use super::super::waldump::{decode_wal_payload, format_decoded, run_waldump, waldump_record_lines};
+use super::super::waldump::{
+    decode_wal_payload, format_decoded, run_waldump, waldump_record_lines,
+};
 use super::cli_env_test_lock;
 
 #[test]

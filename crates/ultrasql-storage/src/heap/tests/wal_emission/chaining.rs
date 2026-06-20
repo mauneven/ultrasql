@@ -3,13 +3,15 @@
 
 use proptest::prelude::*;
 use ultrasql_core::{CommandId, Lsn, Xid};
-use ultrasql_mvcc::status::test_support::MapOracle;
 use ultrasql_mvcc::Snapshot;
+use ultrasql_mvcc::status::test_support::MapOracle;
 use ultrasql_wal::WalRecord;
 
 use super::{make_heap_with_sink, rel};
 use crate::buffer_pool::BufferPoolError;
-use crate::heap::tests::{int32_pair_from_payload, int32_pair_payload, make_heap, opts, usize_to_u8};
+use crate::heap::tests::{
+    int32_pair_from_payload, int32_pair_payload, make_heap, opts, usize_to_u8,
+};
 use crate::heap::{DeleteInt32PairScan, DeleteInt32PairStamp, HeapError, HeapTuple, InsertOptions};
 use crate::wal_sink::{WalSink, WalSinkError};
 

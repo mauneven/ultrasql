@@ -481,7 +481,10 @@ pub(crate) fn encode_table_runtime_scalar_expr_list(
     Ok(metadata_encode_list(&encoded))
 }
 
-pub(crate) fn decode_scalar_expr(tokens: &[&str], pos: &mut usize) -> Result<ScalarExpr, ServerError> {
+pub(crate) fn decode_scalar_expr(
+    tokens: &[&str],
+    pos: &mut usize,
+) -> Result<ScalarExpr, ServerError> {
     let Some(kind) = tokens.get(*pos).copied() else {
         return Err(ServerError::Ddl(
             "truncated scalar expression metadata".to_owned(),

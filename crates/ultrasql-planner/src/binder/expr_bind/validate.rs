@@ -76,7 +76,9 @@ pub(in crate::binder) fn validate_min_arg_count(
     )))
 }
 
-pub(in crate::binder) fn validate_current_schemas_args(args: &[ScalarExpr]) -> Result<(), PlanError> {
+pub(in crate::binder) fn validate_current_schemas_args(
+    args: &[ScalarExpr],
+) -> Result<(), PlanError> {
     if args.len() != 1 {
         return Err(PlanError::TypeMismatch(format!(
             "current_schemas: expected 1 argument, got {}",
@@ -126,7 +128,10 @@ pub(in crate::binder) fn validate_set_config_args(args: &[ScalarExpr]) -> Result
     Ok(())
 }
 
-pub(in crate::binder) fn validate_single_oidish_arg(func_name: &str, args: &[ScalarExpr]) -> Result<(), PlanError> {
+pub(in crate::binder) fn validate_single_oidish_arg(
+    func_name: &str,
+    args: &[ScalarExpr],
+) -> Result<(), PlanError> {
     if args.len() != 1 {
         return Err(PlanError::TypeMismatch(format!(
             "{func_name}: expected 1 argument, got {}",
@@ -161,7 +166,10 @@ pub(in crate::binder) fn validate_to_regtype_args(args: &[ScalarExpr]) -> Result
     )))
 }
 
-pub(in crate::binder) fn validate_has_privilege_args(func_name: &str, args: &[ScalarExpr]) -> Result<(), PlanError> {
+pub(in crate::binder) fn validate_has_privilege_args(
+    func_name: &str,
+    args: &[ScalarExpr],
+) -> Result<(), PlanError> {
     let expected = if func_name == "has_column_privilege" {
         4
     } else {
@@ -184,7 +192,9 @@ pub(in crate::binder) fn validate_has_privilege_args(func_name: &str, args: &[Sc
     Ok(())
 }
 
-pub(in crate::binder) fn validate_jsonb_path_exists_args(args: &[ScalarExpr]) -> Result<(), PlanError> {
+pub(in crate::binder) fn validate_jsonb_path_exists_args(
+    args: &[ScalarExpr],
+) -> Result<(), PlanError> {
     if !(2..=3).contains(&args.len()) {
         return Err(PlanError::TypeMismatch(format!(
             "jsonb_path_exists: expected 2 or 3 arguments, got {}",
@@ -194,7 +204,10 @@ pub(in crate::binder) fn validate_jsonb_path_exists_args(args: &[ScalarExpr]) ->
     Ok(())
 }
 
-pub(in crate::binder) fn validate_xml_well_formed_args(func_name: &str, args: &[ScalarExpr]) -> Result<(), PlanError> {
+pub(in crate::binder) fn validate_xml_well_formed_args(
+    func_name: &str,
+    args: &[ScalarExpr],
+) -> Result<(), PlanError> {
     validate_exact_arg_count(func_name, args, 1)?;
     validate_text_or_xml_arg(func_name, &args[0])
 }
@@ -222,7 +235,10 @@ pub(in crate::binder) fn validate_xmlserialize_args(args: &[ScalarExpr]) -> Resu
     )))
 }
 
-pub(in crate::binder) fn validate_xpath_args(func_name: &str, args: &[ScalarExpr]) -> Result<(), PlanError> {
+pub(in crate::binder) fn validate_xpath_args(
+    func_name: &str,
+    args: &[ScalarExpr],
+) -> Result<(), PlanError> {
     if !(2..=3).contains(&args.len()) {
         return Err(PlanError::TypeMismatch(format!(
             "{func_name}: expected 2 or 3 arguments, got {}",
@@ -242,7 +258,10 @@ pub(in crate::binder) fn validate_xpath_args(func_name: &str, args: &[ScalarExpr
     Ok(())
 }
 
-pub(in crate::binder) fn validate_network_inspector_args(func_name: &str, args: &[ScalarExpr]) -> Result<(), PlanError> {
+pub(in crate::binder) fn validate_network_inspector_args(
+    func_name: &str,
+    args: &[ScalarExpr],
+) -> Result<(), PlanError> {
     validate_exact_arg_count(func_name, args, 1)?;
     let data_type = args[0].data_type();
     if matches!(data_type, DataType::Null) || data_type.is_ip_network() {
@@ -269,7 +288,10 @@ pub(in crate::binder) fn validate_text_search_constructor_args(
     }
 }
 
-pub(in crate::binder) fn validate_ts_rank_args(func_name: &str, args: &[ScalarExpr]) -> Result<(), PlanError> {
+pub(in crate::binder) fn validate_ts_rank_args(
+    func_name: &str,
+    args: &[ScalarExpr],
+) -> Result<(), PlanError> {
     if args.len() != 2 {
         return Err(PlanError::TypeMismatch(format!(
             "{func_name}: expected 2 arguments, got {}",
@@ -297,12 +319,18 @@ pub(in crate::binder) fn validate_ts_headline_args(args: &[ScalarExpr]) -> Resul
     }
 }
 
-pub(in crate::binder) fn validate_tsquery_inspector_args(func_name: &str, args: &[ScalarExpr]) -> Result<(), PlanError> {
+pub(in crate::binder) fn validate_tsquery_inspector_args(
+    func_name: &str,
+    args: &[ScalarExpr],
+) -> Result<(), PlanError> {
     validate_exact_arg_count(func_name, args, 1)?;
     validate_tsquery_arg(func_name, &args[0])
 }
 
-pub(in crate::binder) fn validate_tsvector_arg(func_name: &str, arg: &ScalarExpr) -> Result<(), PlanError> {
+pub(in crate::binder) fn validate_tsvector_arg(
+    func_name: &str,
+    arg: &ScalarExpr,
+) -> Result<(), PlanError> {
     let data_type = arg.data_type();
     if matches!(data_type, DataType::Null | DataType::TsVector) {
         return Ok(());
@@ -312,7 +340,10 @@ pub(in crate::binder) fn validate_tsvector_arg(func_name: &str, arg: &ScalarExpr
     )))
 }
 
-pub(in crate::binder) fn validate_tsquery_arg(func_name: &str, arg: &ScalarExpr) -> Result<(), PlanError> {
+pub(in crate::binder) fn validate_tsquery_arg(
+    func_name: &str,
+    arg: &ScalarExpr,
+) -> Result<(), PlanError> {
     let data_type = arg.data_type();
     if matches!(data_type, DataType::Null | DataType::TsQuery) {
         return Ok(());
@@ -322,7 +353,10 @@ pub(in crate::binder) fn validate_tsquery_arg(func_name: &str, arg: &ScalarExpr)
     )))
 }
 
-pub(in crate::binder) fn validate_xml_mode_arg(func_name: &str, arg: &ScalarExpr) -> Result<(), PlanError> {
+pub(in crate::binder) fn validate_xml_mode_arg(
+    func_name: &str,
+    arg: &ScalarExpr,
+) -> Result<(), PlanError> {
     let Some(mode) = literal_text_arg(arg) else {
         return Err(PlanError::TypeMismatch(format!(
             "{func_name}: mode must be DOCUMENT or CONTENT"
@@ -346,7 +380,10 @@ pub(in crate::binder) fn literal_text_arg(arg: &ScalarExpr) -> Option<&str> {
     }
 }
 
-pub(in crate::binder) fn validate_text_or_xml_arg(func_name: &str, arg: &ScalarExpr) -> Result<(), PlanError> {
+pub(in crate::binder) fn validate_text_or_xml_arg(
+    func_name: &str,
+    arg: &ScalarExpr,
+) -> Result<(), PlanError> {
     let data_type = arg.data_type();
     if matches!(data_type, DataType::Null | DataType::Xml) || data_type.is_textlike() {
         return Ok(());
@@ -356,7 +393,10 @@ pub(in crate::binder) fn validate_text_or_xml_arg(func_name: &str, arg: &ScalarE
     )))
 }
 
-pub(in crate::binder) fn validate_text_arg(func_name: &str, arg: &ScalarExpr) -> Result<(), PlanError> {
+pub(in crate::binder) fn validate_text_arg(
+    func_name: &str,
+    arg: &ScalarExpr,
+) -> Result<(), PlanError> {
     let data_type = arg.data_type();
     if matches!(data_type, DataType::Null) || data_type.is_textlike() {
         return Ok(());
@@ -366,7 +406,10 @@ pub(in crate::binder) fn validate_text_arg(func_name: &str, arg: &ScalarExpr) ->
     )))
 }
 
-pub(in crate::binder) fn validate_vector_metric_args(func_name: &str, args: &mut [ScalarExpr]) -> Result<(), PlanError> {
+pub(in crate::binder) fn validate_vector_metric_args(
+    func_name: &str,
+    args: &mut [ScalarExpr],
+) -> Result<(), PlanError> {
     if args.len() != 2 {
         return Err(PlanError::TypeMismatch(format!(
             "{func_name}: expected 2 arguments, got {}",
@@ -407,7 +450,10 @@ pub(in crate::binder) fn coerce_vector_metric_literals(args: &mut [ScalarExpr]) 
     }
 }
 
-pub(in crate::binder) fn validate_vector_norm_args(func_name: &str, args: &[ScalarExpr]) -> Result<(), PlanError> {
+pub(in crate::binder) fn validate_vector_norm_args(
+    func_name: &str,
+    args: &[ScalarExpr],
+) -> Result<(), PlanError> {
     if args.len() != 1 {
         return Err(PlanError::TypeMismatch(format!(
             "{func_name}: expected 1 argument, got {}",
@@ -439,7 +485,9 @@ pub(in crate::binder) fn validate_vector_dims_args(args: &[ScalarExpr]) -> Resul
     )))
 }
 
-pub(in crate::binder) fn validate_hybrid_search_args(args: &mut [ScalarExpr]) -> Result<(), PlanError> {
+pub(in crate::binder) fn validate_hybrid_search_args(
+    args: &mut [ScalarExpr],
+) -> Result<(), PlanError> {
     if args.len() != 4 && args.len() != 5 {
         return Err(PlanError::TypeMismatch(format!(
             "hybrid_search: expected 4 or 5 arguments, got {}",

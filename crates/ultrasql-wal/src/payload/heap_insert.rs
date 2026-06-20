@@ -1,7 +1,7 @@
 //! Heap insert payload codecs (single + batch).
 
-use ultrasql_core::{PageId, TupleId};
 use ultrasql_core::endian::{read_u16_le, read_u32_le, write_u16_le, write_u32_le};
+use ultrasql_core::{PageId, TupleId};
 
 use super::{
     MAX_VARIABLE_PAYLOAD_BYTES, PAGE_ID_SIZE, PayloadError, TID_SIZE, checked_len_sum,
@@ -256,4 +256,3 @@ impl HeapInsertBatchPayload {
         Ok(Self { page, entries })
     }
 }
-

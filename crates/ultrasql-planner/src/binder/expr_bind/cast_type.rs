@@ -94,7 +94,10 @@ pub(in crate::binder) fn parse_decimal_type_name(type_name: &str) -> Option<Data
     })
 }
 
-pub(in crate::binder) fn resolve_cast_type_with_catalog(type_name: &str, catalog: &dyn Catalog) -> Option<DataType> {
+pub(in crate::binder) fn resolve_cast_type_with_catalog(
+    type_name: &str,
+    catalog: &dyn Catalog,
+) -> Option<DataType> {
     resolve_cast_type(type_name).or_else(|| {
         let parts = parse_pg_identifier_path(type_name)?;
         match parts.as_slice() {
@@ -200,7 +203,10 @@ pub(in crate::binder) fn parse_vector_family_type_name(type_name: &str) -> Optio
     None
 }
 
-pub(in crate::binder) fn build_vector_family_type(base: &str, dims: Option<u32>) -> Option<DataType> {
+pub(in crate::binder) fn build_vector_family_type(
+    base: &str,
+    dims: Option<u32>,
+) -> Option<DataType> {
     match base {
         "vector" => Some(DataType::Vector { dims }),
         "halfvec" => Some(DataType::HalfVec { dims }),
@@ -271,4 +277,3 @@ pub(in crate::binder) fn coerce_literal_to_match(left: &mut ScalarExpr, right: &
     coerce_literal_to_type(left, &right_target);
     coerce_literal_to_type(right, &left_target);
 }
-

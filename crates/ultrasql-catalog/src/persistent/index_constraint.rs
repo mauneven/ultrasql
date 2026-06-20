@@ -227,5 +227,4 @@ impl PersistentCatalog {
             })
             .map(|row| row.value().clone())
     }
-
 }

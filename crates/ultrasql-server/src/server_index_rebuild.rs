@@ -577,5 +577,4 @@ impl Server {
     pub fn lookup_relation_stats(&self, table: &str) -> Option<ultrasql_optimizer::RelationStats> {
         self.stats_catalog.read().lookup_relation(table)
     }
-
 }

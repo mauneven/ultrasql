@@ -4,22 +4,22 @@
 //! motion. Shared builder helpers live here and are visible to the topic
 //! submodules via `use super::*;`.
 
-mod tests_coverage;
+mod tests_arith_compare;
+mod tests_array_textsearch;
 mod tests_cast_array_cov;
 mod tests_catalog_array_cov;
 mod tests_column_literal;
-mod tests_scalar_cov;
-mod tests_money_json;
-mod tests_array_textsearch;
-mod tests_arith_compare;
+mod tests_coverage;
 mod tests_logic_concat;
-mod tests_vector;
+mod tests_money_json;
 mod tests_pattern_unary;
+mod tests_scalar_cov;
+mod tests_vector;
 
 use proptest::prelude::*;
 use ultrasql_core::{
-    BitString, DataType, Field, NetworkValue, Oid, Schema, Value, parse_date_text,
-    parse_time_text, parse_timestamp_text, parse_timestamptz_text, parse_timetz_text,
+    BitString, DataType, Field, NetworkValue, Oid, Schema, Value, parse_date_text, parse_time_text,
+    parse_timestamp_text, parse_timestamptz_text, parse_timetz_text,
 };
 use ultrasql_planner::{BinaryOp, LogicalPlan, ScalarExpr, UnaryOp};
 
@@ -243,4 +243,3 @@ fn one_col_empty_plan() -> LogicalPlan {
         schema: Schema::new([Field::required("x", DataType::Int32)]).expect("schema"),
     }
 }
-

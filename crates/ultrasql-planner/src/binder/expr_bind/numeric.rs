@@ -114,7 +114,10 @@ pub(in crate::binder) fn infer_decimal_scale_from_text(text: &str) -> Option<i32
     i32::try_from(trimmed[dot + 1..].trim_end_matches('0').len()).ok()
 }
 
-pub(in crate::binder) fn decimal_from_numeric_value(value: &Value, target_scale: Option<i32>) -> Option<(i64, i32)> {
+pub(in crate::binder) fn decimal_from_numeric_value(
+    value: &Value,
+    target_scale: Option<i32>,
+) -> Option<(i64, i32)> {
     let inferred_scale = infer_decimal_scale(value);
     let scale = match (target_scale, inferred_scale) {
         (Some(target), _) => target,
@@ -189,7 +192,10 @@ pub(in crate::binder) fn oid_from_literal_value(value: &Value) -> Option<Oid> {
     }
 }
 
-pub(in crate::binder) fn coerce_literal_to_oid_alias(expr: &mut ScalarExpr, target: &DataType) -> bool {
+pub(in crate::binder) fn coerce_literal_to_oid_alias(
+    expr: &mut ScalarExpr,
+    target: &DataType,
+) -> bool {
     fold_signed_literal(expr);
     let ScalarExpr::Literal { value, data_type } = expr else {
         return false;
@@ -269,7 +275,10 @@ pub(in crate::binder) fn coerce_literal_to_oid_alias_with_catalog(
     coerce_literal_to_oid_alias(expr, target)
 }
 
-pub(in crate::binder) fn resolve_regclass_literal(text: &str, catalog: &dyn Catalog) -> Option<Oid> {
+pub(in crate::binder) fn resolve_regclass_literal(
+    text: &str,
+    catalog: &dyn Catalog,
+) -> Option<Oid> {
     if let Some(oid) = Value::parse_oid_text(text) {
         return Some(oid);
     }
@@ -382,4 +391,3 @@ pub(in crate::binder) fn parse_negative_i64_boundary_expr(expr: &Expr) -> Option
     };
     parse_negative_i64_boundary(text)
 }
-

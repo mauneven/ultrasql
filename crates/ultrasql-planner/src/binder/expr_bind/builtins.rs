@@ -157,7 +157,10 @@ pub(in crate::binder) fn array_mutation_return_type(
     validate_array_element_argument(func_name, args, array_arg_idx, 1 - array_arg_idx, 2)
 }
 
-pub(in crate::binder) fn array_replace_return_type(func_name: &str, args: &[ScalarExpr]) -> Result<DataType, PlanError> {
+pub(in crate::binder) fn array_replace_return_type(
+    func_name: &str,
+    args: &[ScalarExpr],
+) -> Result<DataType, PlanError> {
     let array_type = validate_array_element_argument(func_name, args, 0, 1, 3)?;
     let DataType::Array(element_type) = &array_type else {
         return Ok(array_type);
@@ -367,4 +370,3 @@ pub(in crate::binder) fn is_supported_builtin(func_name: &str) -> bool {
             | "vector_dims"
     )
 }
-

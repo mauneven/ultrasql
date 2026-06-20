@@ -93,7 +93,10 @@ pub(in crate::binder) fn bind_array_literal(
     })
 }
 
-pub(in crate::binder) fn common_array_element_type(left: &DataType, right: &DataType) -> Result<DataType, PlanError> {
+pub(in crate::binder) fn common_array_element_type(
+    left: &DataType,
+    right: &DataType,
+) -> Result<DataType, PlanError> {
     if left == right || matches!(right, DataType::Null) {
         return Ok(left.clone());
     }
@@ -134,7 +137,11 @@ pub(in crate::binder) fn common_array_element_type(left: &DataType, right: &Data
 /// Unsupported variants (TIME, TIMESTAMP, TIMESTAMPTZ, complex
 /// interval syntaxes) bind to NULL today so the binder does not reject
 /// queries upstream of the executor.
-pub(in crate::binder) fn bind_typed_literal(type_name: &str, value: &str, unit: Option<&str>) -> ScalarExpr {
+pub(in crate::binder) fn bind_typed_literal(
+    type_name: &str,
+    value: &str,
+    unit: Option<&str>,
+) -> ScalarExpr {
     let type_name = type_name.to_ascii_lowercase();
     if let Some(target) = parse_vector_family_type_name(&type_name) {
         return bind_vector_family_literal(value, target);
@@ -329,7 +336,10 @@ pub(in crate::binder) fn bind_network_literal(value: &str, data_type: DataType) 
     }
 }
 
-pub(in crate::binder) fn bind_vector_family_literal(value: &str, declared_type: DataType) -> ScalarExpr {
+pub(in crate::binder) fn bind_vector_family_literal(
+    value: &str,
+    declared_type: DataType,
+) -> ScalarExpr {
     let parsed = match declared_type {
         DataType::Vector { .. } => Value::parse_vector(value),
         DataType::HalfVec { .. } => Value::parse_halfvec(value),
@@ -356,7 +366,10 @@ pub(in crate::binder) fn bind_vector_family_literal(value: &str, declared_type: 
     }
 }
 
-pub(in crate::binder) fn parse_interval_literal(text: &str, unit: Option<&str>) -> Option<(i32, i32, i64)> {
+pub(in crate::binder) fn parse_interval_literal(
+    text: &str,
+    unit: Option<&str>,
+) -> Option<(i32, i32, i64)> {
     let magnitude = text.trim();
     let unit = unit?.to_ascii_lowercase();
     match unit.as_str() {
@@ -434,7 +447,9 @@ pub(in crate::binder) fn parse_timetz_literal(text: &str) -> Option<(i64, i32)> 
     parse_timetz_text(text)
 }
 
-pub(in crate::binder) fn civil_from_days(days_since_2000_01_01: i32) -> Result<(i32, u32, u32), PlanError> {
+pub(in crate::binder) fn civil_from_days(
+    days_since_2000_01_01: i32,
+) -> Result<(i32, u32, u32), PlanError> {
     let z = days_since_2000_01_01 + 10_957;
     let z = z + 719_468;
     let era = if z >= 0 {
@@ -471,7 +486,10 @@ pub(in crate::binder) fn days_in_month(year: i32, month: u32) -> u32 {
     }
 }
 
-pub(in crate::binder) fn add_months_to_date(date_days: i32, month_delta: i32) -> Result<i32, PlanError> {
+pub(in crate::binder) fn add_months_to_date(
+    date_days: i32,
+    month_delta: i32,
+) -> Result<i32, PlanError> {
     let (year, month, day) = civil_from_days(date_days)?;
     let total_months = year
         .checked_mul(12)

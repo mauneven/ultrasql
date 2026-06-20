@@ -51,24 +51,24 @@ use anyhow::{Context, Result};
 use clap::Parser;
 use ultrasql_server::{Server, bind_listener, serve_listener};
 
+#[path = "cross_compare_sql_support/ai_workloads.rs"]
+mod ai_workloads;
+#[path = "cross_compare_sql_support/csv_workloads.rs"]
+mod csv_workloads;
+#[path = "cross_compare_sql_support/dispatch.rs"]
+mod dispatch;
+#[path = "cross_compare_sql_support/olap_workloads.rs"]
+mod olap_workloads;
+#[path = "cross_compare_sql_support/oltp_workloads.rs"]
+mod oltp_workloads;
+#[path = "cross_compare_sql_support/parquet_workloads.rs"]
+mod parquet_workloads;
+#[path = "cross_compare_sql_support/report.rs"]
+mod report;
 #[path = "cross_compare_sql_support/types.rs"]
 mod types;
 #[path = "cross_compare_sql_support/util.rs"]
 mod util;
-#[path = "cross_compare_sql_support/report.rs"]
-mod report;
-#[path = "cross_compare_sql_support/dispatch.rs"]
-mod dispatch;
-#[path = "cross_compare_sql_support/oltp_workloads.rs"]
-mod oltp_workloads;
-#[path = "cross_compare_sql_support/olap_workloads.rs"]
-mod olap_workloads;
-#[path = "cross_compare_sql_support/csv_workloads.rs"]
-mod csv_workloads;
-#[path = "cross_compare_sql_support/parquet_workloads.rs"]
-mod parquet_workloads;
-#[path = "cross_compare_sql_support/ai_workloads.rs"]
-mod ai_workloads;
 
 use ai_workloads::{run_cold_start_index_load_workload, run_ingestion_throughput_workload};
 use dispatch::run_workload;

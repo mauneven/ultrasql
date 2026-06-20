@@ -1,7 +1,7 @@
 //! Vector-index (HNSW, IVFFlat) operation payload codecs.
 
-use ultrasql_core::{BlockNumber, PageId, RelationId, TupleId};
 use ultrasql_core::endian::{read_u16_le, read_u32_le, write_u16_le, write_u32_le};
+use ultrasql_core::{BlockNumber, PageId, RelationId, TupleId};
 
 use super::{MAX_VARIABLE_PAYLOAD_BYTES, PayloadError, checked_offset, require_exact_len};
 

@@ -4,9 +4,9 @@
 //! themselves are grouped by topic into sibling files.
 
 pub(crate) use super::*;
-pub(crate) use ultrasql_core::{BlockNumber, DataType, Field, Lsn, Oid, Schema};
 pub(crate) use crate::entry::{CompositeTypeEntry, IndexEntry, TableEntry};
 pub(crate) use crate::traits::{Catalog, MutableCatalog};
+pub(crate) use ultrasql_core::{BlockNumber, DataType, Field, Lsn, Oid, Schema};
 
 pub(super) fn sample_schema() -> Schema {
     Schema::new([
@@ -29,7 +29,11 @@ pub(super) fn make_table(cat: &PersistentCatalog, name: &str) -> TableEntry {
     }
 }
 
-pub(super) fn make_table_in_schema(cat: &PersistentCatalog, schema_name: &str, name: &str) -> TableEntry {
+pub(super) fn make_table_in_schema(
+    cat: &PersistentCatalog,
+    schema_name: &str,
+    name: &str,
+) -> TableEntry {
     let mut entry = make_table(cat, name);
     entry.schema_name = schema_name.to_owned();
     entry

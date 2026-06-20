@@ -178,7 +178,11 @@ pub(super) fn rows_information_schema_table_constraints(ctx: &LowerCtx<'_>) -> V
         .collect()
 }
 
-pub(super) fn field_name_for_attnum(ctx: &LowerCtx<'_>, table_oid: Oid, col_idx: usize) -> Option<String> {
+pub(super) fn field_name_for_attnum(
+    ctx: &LowerCtx<'_>,
+    table_oid: Oid,
+    col_idx: usize,
+) -> Option<String> {
     let table = ctx.catalog_snapshot.tables_by_oid.get(&table_oid)?;
     Some(table.schema.field(col_idx)?.name.clone())
 }
@@ -265,7 +269,9 @@ pub(super) fn schema_information_schema_referential_constraints() -> Schema {
     ])
 }
 
-pub(super) fn rows_information_schema_referential_constraints(ctx: &LowerCtx<'_>) -> Vec<Vec<Value>> {
+pub(super) fn rows_information_schema_referential_constraints(
+    ctx: &LowerCtx<'_>,
+) -> Vec<Vec<Value>> {
     virtual_constraints(ctx)
         .into_iter()
         .filter(|c| c.kind == "f")

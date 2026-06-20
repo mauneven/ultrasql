@@ -571,5 +571,4 @@ impl PersistentCatalog {
         tracing::debug!(?stats, "catalog bootstrapped from heap");
         Ok(stats)
     }
-
 }

@@ -172,8 +172,7 @@ fn cast_and_size_helpers_cover_oid_reg_and_text_surfaces() {
         "gen_random_uuid should emit uuid bytes"
     );
     assert!(
-        eval_fn_err("__ultrasql_cast_oid", vec![Value::Int64(-1)])
-            .contains("value out of range")
+        eval_fn_err("__ultrasql_cast_oid", vec![Value::Int64(-1)]).contains("value out of range")
     );
 }
 
@@ -350,4 +349,3 @@ fn text_math_regex_and_format_helpers_cover_common_scalar_paths() {
         Value::Text("abc!".to_owned())
     );
 }
-

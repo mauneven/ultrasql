@@ -15,7 +15,7 @@ use ultrasql_objectstore::{
 use super::paths::{
     first_expanded_file, open_local_regular_file, path_specs_use_object_store, read_file_path_specs,
 };
-use super::{READ_CSV_HEADER_SAMPLE_BYTES, PlanError, ScalarExpr, ScopeEntry};
+use super::{PlanError, READ_CSV_HEADER_SAMPLE_BYTES, ScalarExpr, ScopeEntry};
 
 pub(super) fn bind_read_csv_table_function(
     bound_args: &[ScalarExpr],

@@ -6,8 +6,9 @@ use ultrasql_server::{LogStatementMode, Server};
 
 use crate::cli::{Cli, CliLogStatementMode, LogFormat};
 use crate::config::{
-    apply_auth_config, apply_startup_signal_files, auth_config_from_cli, autovacuum_config_from_cli,
-    listen_security_from_cli, logging_config_from_cli, ops_token_from_cli,
+    apply_auth_config, apply_startup_signal_files, auth_config_from_cli,
+    autovacuum_config_from_cli, listen_security_from_cli, logging_config_from_cli,
+    ops_token_from_cli,
 };
 
 #[test]
@@ -428,8 +429,7 @@ fn md5_auth_from_cli_rejects_unsafe_password_files() {
         let target_file = dir.path().join("target-password");
         write_private_password_file(&target_file, "very-secret-password\n");
         let symlink_file = dir.path().join("symlink-password");
-        std::os::unix::fs::symlink(&target_file, &symlink_file)
-            .expect("create password symlink");
+        std::os::unix::fs::symlink(&target_file, &symlink_file).expect("create password symlink");
         cli.auth_password_file = Some(symlink_file);
         let err = auth_config_from_cli(&cli).expect_err("password symlink rejected");
         assert!(

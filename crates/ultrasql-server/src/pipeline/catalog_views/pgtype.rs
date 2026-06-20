@@ -559,4 +559,3 @@ pub(super) fn column_default_expr(ctx: &LowerCtx<'_>, relid: Oid, idx: usize) ->
         .and_then(Option::as_ref)
         .map(|expr| format!("generated always as ({expr:?}) stored"))
 }
-

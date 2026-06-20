@@ -278,10 +278,7 @@ pub(crate) fn probe_index_entries_ordered(
     Ok(entries_out)
 }
 
-fn fetch_visible_index_payloads<I>(
-    tids: I,
-    ctx: &LowerCtx<'_>,
-) -> Result<Vec<Vec<u8>>, ServerError>
+fn fetch_visible_index_payloads<I>(tids: I, ctx: &LowerCtx<'_>) -> Result<Vec<Vec<u8>>, ServerError>
 where
     I: IntoIterator<Item = TupleId>,
 {

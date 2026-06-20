@@ -601,5 +601,4 @@ impl Server {
         );
         Ok(Some(flushed))
     }
-
 }

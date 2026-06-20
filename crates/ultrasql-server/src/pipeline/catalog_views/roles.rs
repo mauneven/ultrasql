@@ -455,4 +455,3 @@ pub(super) fn format_scale_factor(value: f64) -> String {
         .trim_end_matches('.')
         .to_owned()
 }
-

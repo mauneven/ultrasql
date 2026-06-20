@@ -9,27 +9,20 @@ use ultrasql_core::{DataType, Field, Schema};
 use ultrasql_planner::{BinaryOp, LogicalJoinCondition, LogicalJoinType, LogicalPlan, ScalarExpr};
 
 use super::correlation::{
-    CorrPair,
-    build_correlation_condition,
-    build_correlation_condition_against_right_schema,
-    collect_join_right_column_indices,
-    corr_fields,
-    distinct_correlation_keys,
-    extract_correlated_exists_input,
-    extract_correlated_scalar_input,
-    push_unique_index,
+    CorrPair, build_correlation_condition, build_correlation_condition_against_right_schema,
+    collect_join_right_column_indices, corr_fields, distinct_correlation_keys,
+    extract_correlated_exists_input, extract_correlated_scalar_input, push_unique_index,
     rebase_projected_exists_residual,
 };
 use super::helpers::{
-    anti_join,
-    conjuncts_to_and,
-    distinct_single_column,
-    filter_column_null,
-    filter_with_conjuncts,
+    anti_join, conjuncts_to_and, distinct_single_column, filter_column_null, filter_with_conjuncts,
     split_and,
 };
 
-pub(crate) fn rewrite_exists_filter_expr(outer: &LogicalPlan, predicate: &ScalarExpr) -> Option<LogicalPlan> {
+pub(crate) fn rewrite_exists_filter_expr(
+    outer: &LogicalPlan,
+    predicate: &ScalarExpr,
+) -> Option<LogicalPlan> {
     let conjuncts = split_and(predicate);
     let (idx, exists_expr) = conjuncts.iter().enumerate().find(|(_, c)| {
         matches!(

@@ -4,13 +4,14 @@
 use ultrasql_core::{DataType, Field, Value};
 use ultrasql_protocol::BackendMessage;
 
+use super::super::ServerCopyFormat;
 use super::super::decode::copy_rows_from_select_result;
 use super::super::fs_io::{
-    copy_cells_from_row, copy_format_code, csv_record_complete, csv_sample_record_complete,
-    projected_schema, read_copy_file_sample, read_copy_input_file, reject_column_type_matches,
-    single_byte_delimiter, validate_copy_reject_table, write_copy_output_file, RejectColumnType,
+    RejectColumnType, copy_cells_from_row, copy_format_code, csv_record_complete,
+    csv_sample_record_complete, projected_schema, read_copy_file_sample, read_copy_input_file,
+    reject_column_type_matches, single_byte_delimiter, validate_copy_reject_table,
+    write_copy_output_file,
 };
-use super::super::ServerCopyFormat;
 use super::{copy_env_test_lock, copy_opts, entry_with_schema, schema};
 use crate::result_encoder::SelectResult;
 

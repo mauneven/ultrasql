@@ -11,7 +11,8 @@ pub(super) use std::sync::Arc;
 pub(super) use parking_lot::Mutex;
 pub(super) use ultrasql_core::constants::PAGE_SIZE;
 pub(super) use ultrasql_core::{
-    BlockNumber, CommandId, DataType, Field, PageId, RelationId, Result, Schema, TupleId, Value, Xid,
+    BlockNumber, CommandId, DataType, Field, PageId, RelationId, Result, Schema, TupleId, Value,
+    Xid,
 };
 pub(super) use ultrasql_mvcc::{InfoMask, TupleHeader};
 pub(super) use ultrasql_storage::btree::BTree;

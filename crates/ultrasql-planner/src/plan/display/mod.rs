@@ -48,7 +48,15 @@ impl LogicalPlan {
                 func,
                 output_name,
                 ..
-            } => scans::fmt_window(input, partition_by, order_by, func, output_name, indent, out),
+            } => scans::fmt_window(
+                input,
+                partition_by,
+                order_by,
+                func,
+                output_name,
+                indent,
+                out,
+            ),
             Self::Empty { .. } => scans::fmt_empty(indent, out),
             Self::Values { rows, .. } => scans::fmt_values(rows, indent, out),
             Self::Insert {
@@ -330,14 +338,9 @@ impl LogicalPlan {
                 grantees,
                 cascade,
                 ..
-            } => roles::fmt_revoke_privileges(
-                object_kind,
-                objects,
-                grantees,
-                *cascade,
-                indent,
-                out,
-            ),
+            } => {
+                roles::fmt_revoke_privileges(object_kind, objects, grantees, *cascade, indent, out)
+            }
             Self::AlterDefaultPrivileges {
                 target_roles,
                 schemas,

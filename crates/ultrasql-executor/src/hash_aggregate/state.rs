@@ -8,7 +8,6 @@
 
 use std::collections::HashSet;
 
-use serde_json::{Number as JsonNumber, Value as JsonValue};
 use ultrasql_core::{DataType, Value};
 use ultrasql_planner::{AggregateFunc, LogicalAggregateExpr};
 
@@ -21,6 +20,7 @@ use crate::eval_error_to_exec_error;
 use crate::hash_aggregate::arith::{
     add_values, decimal_to_f64, divide_value, i64_to_f64_saturating, increment_count, value_lt,
 };
+use crate::hash_aggregate::json_agg::json_agg_text;
 use crate::hash_aggregate::key::KeyValue;
 
 /// Per-row accumulator for a single aggregate function instance.
@@ -261,7 +261,10 @@ pub(crate) fn accumulate(
     accumulate_value(state, arg_val)
 }
 
-pub(crate) fn accumulate_value(state: &mut AggState, arg_val: Option<Value>) -> Result<(), ExecError> {
+pub(crate) fn accumulate_value(
+    state: &mut AggState,
+    arg_val: Option<Value>,
+) -> Result<(), ExecError> {
     match state {
         AggState::Distinct { .. } => unreachable!("distinct wrapper handled before dispatch"),
         AggState::CountStar(n) => {
@@ -660,39 +663,4 @@ fn validate_percentile_disc_values(values: &[Value], nulls_first: bool) -> Resul
         }
     }
     Ok(())
-}
-
-fn json_agg_text(items: &[Value]) -> String {
-    let values = JsonValue::Array(items.iter().map(sql_value_to_json).collect());
-    serde_json::to_string(&values).unwrap_or_else(|_| "[]".to_owned())
-}
-
-fn sql_value_to_json(value: &Value) -> JsonValue {
-    match value {
-        Value::Null => JsonValue::Null,
-        Value::Bool(v) => JsonValue::Bool(*v),
-        Value::Int16(v) => JsonValue::Number(JsonNumber::from(i64::from(*v))),
-        Value::Int32(v) => JsonValue::Number(JsonNumber::from(i64::from(*v))),
-        Value::Int64(v) => JsonValue::Number(JsonNumber::from(*v)),
-        Value::Float32(v) => {
-            JsonNumber::from_f64(f64::from(*v)).map_or(JsonValue::Null, JsonValue::Number)
-        }
-        Value::Float64(v) => JsonNumber::from_f64(*v).map_or(JsonValue::Null, JsonValue::Number),
-        Value::Text(v) | Value::Char(v) => JsonValue::String(v.clone()),
-        Value::Json(v) | Value::Jsonb(v) => {
-            serde_json::from_str(v).unwrap_or_else(|_| JsonValue::String(v.clone()))
-        }
-        Value::Vector(values) | Value::HalfVec(values) => JsonValue::Array(
-            values
-                .iter()
-                .map(|v| {
-                    JsonNumber::from_f64(f64::from(*v)).map_or(JsonValue::Null, JsonValue::Number)
-                })
-                .collect(),
-        ),
-        Value::Array { elements, .. } => {
-            JsonValue::Array(elements.iter().map(sql_value_to_json).collect())
-        }
-        other => JsonValue::String(other.to_string()),
-    }
 }

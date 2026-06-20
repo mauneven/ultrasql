@@ -8,8 +8,8 @@ use ultrasql_catalog::TableEntry;
 use ultrasql_core::{DataType, RelationId, Schema, Value};
 use ultrasql_executor::fused_insert::FusedInsertInt32Pair;
 use ultrasql_executor::{
-    Eval, InsertConflictAction, ModifyKind, ModifyTable, ModifyTableStamps, Operator, SequenceDefault,
-    ValuesScan,
+    Eval, InsertConflictAction, ModifyKind, ModifyTable, ModifyTableStamps, Operator,
+    SequenceDefault, ValuesScan,
 };
 use ultrasql_planner::{BinaryOp, LogicalOnConflict, LogicalPlan, ScalarExpr};
 

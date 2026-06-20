@@ -145,8 +145,8 @@ fn conn_params_merge_overrides_and_connection_string_are_stable() {
         "host=override.internal port=25432 dbname=prod user=alice password=secret"
     );
 
-    let err = ConnParams::from_url("postgresql://host:notaport/db")
-        .expect_err("invalid URL port fails");
+    let err =
+        ConnParams::from_url("postgresql://host:notaport/db").expect_err("invalid URL port fails");
     assert!(format!("{err:#}").contains("invalid port in URL"));
 
     let p = ConnParams::from_url("postgresql://carol@/db").expect("empty host accepted");

@@ -5,10 +5,10 @@ use ultrasql_core::{DataType, Field, Schema, Value};
 use ultrasql_iceberg::read_iceberg_schema;
 use ultrasql_parser::ast::{JsonTableColumnKind, TypeName, XmlTableColumnKind};
 
-use super::csv_schema::{bind_read_csv_table_function, bind_sniff_csv_table_function};
 use super::super::ddl::resolve_type_name;
-use super::paths::{first_expanded_file, path_specs_use_object_store, read_file_path_specs};
+use super::csv_schema::{bind_read_csv_table_function, bind_sniff_csv_table_function};
 use super::json_reader::{JsonInputKind, infer_json_fields_from_path_specs};
+use super::paths::{first_expanded_file, path_specs_use_object_store, read_file_path_specs};
 use super::readers::{
     arrow_type_to_sql, parquet_arrow_type_to_sql, read_arrow_schema_from_path_specs,
     read_parquet_arrow_schema, read_parquet_object_schema,

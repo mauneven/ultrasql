@@ -8,16 +8,16 @@ use support::{shutdown, start_persistent_server, start_sample_server};
 use tokio_postgres::{NoTls, error::SqlState};
 use ultrasql_server::Server;
 
+#[path = "privilege_catalog_round_trip/column_and_role_acl.rs"]
+mod column_and_role_acl;
+#[path = "privilege_catalog_round_trip/default_and_persistence.rs"]
+mod default_and_persistence;
 #[path = "privilege_catalog_round_trip/grant_revoke_acl.rs"]
 mod grant_revoke_acl;
 #[path = "privilege_catalog_round_trip/grant_validation.rs"]
 mod grant_validation;
 #[path = "privilege_catalog_round_trip/metadata_rebuild.rs"]
 mod metadata_rebuild;
-#[path = "privilege_catalog_round_trip/column_and_role_acl.rs"]
-mod column_and_role_acl;
-#[path = "privilege_catalog_round_trip/default_and_persistence.rs"]
-mod default_and_persistence;
 
 async fn connect_as(
     bound: SocketAddr,

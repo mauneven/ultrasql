@@ -9,7 +9,9 @@ use std::sync::Arc;
 use tokio::io::{AsyncRead, AsyncWrite};
 use ultrasql_catalog::CatalogSnapshot;
 use ultrasql_parser::Parser;
-use ultrasql_planner::{CopyDirection, CopyFormat as PlanCopyFormat, CopySource, LogicalPlan, bind};
+use ultrasql_planner::{
+    CopyDirection, CopyFormat as PlanCopyFormat, CopySource, LogicalPlan, bind,
+};
 use ultrasql_txn::Transaction;
 
 use super::super::Session;

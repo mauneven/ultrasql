@@ -205,7 +205,10 @@ impl Server {
         Ok(())
     }
 
-    pub(crate) fn rebuild_persistent_index_sidecars(&self, recovered_lsn: Lsn) -> Result<(), ServerError> {
+    pub(crate) fn rebuild_persistent_index_sidecars(
+        &self,
+        recovered_lsn: Lsn,
+    ) -> Result<(), ServerError> {
         let snapshot = self.catalog_snapshot();
         let mut hnsw_indexes = Vec::new();
         let mut ivfflat_indexes = Vec::new();
@@ -585,5 +588,4 @@ impl Server {
         )?;
         Ok((brin, rows))
     }
-
 }

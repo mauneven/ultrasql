@@ -11,7 +11,8 @@ use ultrasql_vec::Batch;
 use ultrasql_vec::column::Column;
 
 use super::{
-    ExpandedInsertRow, InsertConflictAction, InsertIndexMaintainer, RowCodecError, UpdateFastPathInt32Pair,
+    ExpandedInsertRow, InsertConflictAction, InsertIndexMaintainer, RowCodecError,
+    UpdateFastPathInt32Pair,
 };
 use crate::ExecError;
 

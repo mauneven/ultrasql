@@ -15,6 +15,7 @@ pub(crate) use ultrasql_wal::WalRecord;
 pub(crate) use ultrasql_wal::payload::{HnswOpKind, HnswOpPayload};
 pub(crate) use ultrasql_wal::record::RecordType;
 
+pub(crate) use super::AccessMethodError;
 pub(crate) use super::ann::{
     AnnPayloadKind, AnnQuantizedPayload, AnnRerankPolicy, AnnVectorPayload, HnswMetric,
     HnswSearchResult,
@@ -24,7 +25,6 @@ pub(crate) use super::hnsw_build::{
     HnswNodeId, ann_wal_index_rel, compare_hnsw_hits, hnsw_assign_level, hnsw_level_max_neighbors,
     select_neighbors_heuristic,
 };
-pub(crate) use super::AccessMethodError;
 pub(crate) use crate::wal_sink::WalSink;
 
 mod index;
@@ -228,7 +228,6 @@ pub(crate) struct HnswFreeListPage {
     lsn: Lsn,
     blocks: Vec<BlockNumber>,
 }
-
 
 impl HnswPersistentPage {
     fn page_id(&self) -> PageId {

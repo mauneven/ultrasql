@@ -95,7 +95,9 @@ pub(in crate::binder) fn bind_column(
     })
 }
 
-pub(in crate::binder) fn qualified_column_name(name: &ultrasql_parser::ast::ObjectName) -> Option<String> {
+pub(in crate::binder) fn qualified_column_name(
+    name: &ultrasql_parser::ast::ObjectName,
+) -> Option<String> {
     let col = name.parts.last()?;
     let qualifier = name.parts.iter().rev().nth(1)?;
     Some(format!("{}.{}", qualifier.value, col.value))
@@ -332,7 +334,11 @@ pub(in crate::binder) const fn binary_operator_uses_raw_text_pattern(op: BinaryO
     )
 }
 
-pub(in crate::binder) fn coerce_binary_literals(op: BinaryOp, left: &mut ScalarExpr, right: &mut ScalarExpr) {
+pub(in crate::binder) fn coerce_binary_literals(
+    op: BinaryOp,
+    left: &mut ScalarExpr,
+    right: &mut ScalarExpr,
+) {
     if binary_operator_uses_raw_text_pattern(op)
         || money_scalar_arithmetic_keeps_operand_types(op, left, right)
     {
@@ -350,4 +356,3 @@ pub(in crate::binder) fn money_scalar_arithmetic_keeps_operand_types(
         && (matches!(left.data_type(), DataType::Money)
             || matches!(right.data_type(), DataType::Money))
 }
-

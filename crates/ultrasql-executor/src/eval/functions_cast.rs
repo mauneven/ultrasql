@@ -251,7 +251,10 @@ pub(crate) fn eval_cast_xml(args: &[Value]) -> Result<Value, EvalError> {
         })
 }
 
-pub(crate) fn textlike_cast_arg<'a>(func: &str, args: &'a [Value]) -> Result<Option<&'a str>, EvalError> {
+pub(crate) fn textlike_cast_arg<'a>(
+    func: &str,
+    args: &'a [Value],
+) -> Result<Option<&'a str>, EvalError> {
     if args.len() != 1 {
         return Err(EvalError::Type(format!(
             "{func}: expected 1 arg, got {}",
@@ -589,4 +592,3 @@ pub(crate) fn parse_pg_identifier_path(text: &str) -> Option<Vec<String>> {
         }
     }
 }
-

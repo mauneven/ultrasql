@@ -27,7 +27,9 @@ pub(crate) struct CorrelatedExistsInput {
     pub(crate) residual_predicates: Vec<ScalarExpr>,
 }
 
-pub(crate) fn extract_correlated_scalar_input(plan: LogicalPlan) -> Option<(LogicalPlan, Vec<CorrPair>)> {
+pub(crate) fn extract_correlated_scalar_input(
+    plan: LogicalPlan,
+) -> Option<(LogicalPlan, Vec<CorrPair>)> {
     let LogicalPlan::Filter { input, predicate } = plan else {
         return None;
     };
@@ -58,7 +60,11 @@ pub(crate) fn push_unique_index(indices: &mut Vec<usize>, index: usize) {
     }
 }
 
-pub(crate) fn collect_join_right_column_indices(expr: &ScalarExpr, outer_width: usize, out: &mut Vec<usize>) {
+pub(crate) fn collect_join_right_column_indices(
+    expr: &ScalarExpr,
+    outer_width: usize,
+    out: &mut Vec<usize>,
+) {
     match expr {
         ScalarExpr::Column { index, .. } => {
             if *index >= outer_width {
@@ -212,7 +218,10 @@ pub(crate) fn extract_correlated_exists_input(
     }
 }
 
-pub(crate) fn rebase_correlated_predicate(expr: &ScalarExpr, outer_width: usize) -> Option<ScalarExpr> {
+pub(crate) fn rebase_correlated_predicate(
+    expr: &ScalarExpr,
+    outer_width: usize,
+) -> Option<ScalarExpr> {
     match expr {
         ScalarExpr::Column {
             name,
@@ -332,7 +341,10 @@ pub(crate) fn parse_correlation_equality(expr: &ScalarExpr) -> Option<CorrPair> 
     }
 }
 
-pub(crate) fn distinct_correlation_keys(input: LogicalPlan, pairs: &[CorrPair]) -> Option<LogicalPlan> {
+pub(crate) fn distinct_correlation_keys(
+    input: LogicalPlan,
+    pairs: &[CorrPair],
+) -> Option<LogicalPlan> {
     let mut exprs = Vec::with_capacity(pairs.len());
     let mut fields = Vec::with_capacity(pairs.len());
     for (idx, pair) in pairs.iter().enumerate() {
@@ -371,7 +383,10 @@ pub(crate) fn distinct_correlation_keys(input: LogicalPlan, pairs: &[CorrPair]) 
     })
 }
 
-pub(crate) fn build_correlation_condition(pairs: &[CorrPair], outer_width: usize) -> Option<ScalarExpr> {
+pub(crate) fn build_correlation_condition(
+    pairs: &[CorrPair],
+    outer_width: usize,
+) -> Option<ScalarExpr> {
     let mut predicates = pairs
         .iter()
         .enumerate()

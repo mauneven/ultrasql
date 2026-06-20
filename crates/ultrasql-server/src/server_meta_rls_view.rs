@@ -504,7 +504,9 @@ impl Server {
         self.data_dir.as_ref().map(|dir| dir.join("pg_views.meta"))
     }
 
-    pub(crate) fn load_regular_view_metadata(&self) -> Result<Vec<RegularViewMetadataRecord>, ServerError> {
+    pub(crate) fn load_regular_view_metadata(
+        &self,
+    ) -> Result<Vec<RegularViewMetadataRecord>, ServerError> {
         let Some(path) = self.regular_view_metadata_path() else {
             return Ok(Vec::new());
         };
@@ -584,5 +586,4 @@ impl Server {
         }
         write_runtime_metadata_file(&path, &out)
     }
-
 }

@@ -17,7 +17,8 @@ use ultrasql_objectstore::{
 };
 
 use super::paths::{
-    expand_file_path_specs, first_expanded_file, open_local_regular_file, path_specs_use_object_store,
+    expand_file_path_specs, first_expanded_file, open_local_regular_file,
+    path_specs_use_object_store,
 };
 use super::{JSON_STREAM_CHUNK_BYTES, PlanError};
 
@@ -336,4 +337,3 @@ impl Read for PlannerObjectRangeReader {
         Ok(n)
     }
 }
-

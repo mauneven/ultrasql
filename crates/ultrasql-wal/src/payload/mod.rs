@@ -102,7 +102,10 @@ pub(crate) fn require_exact_len(bytes: &[u8], expected: usize) -> Result<(), Pay
     }
 }
 
-pub(crate) fn checked_len_sum(parts: &[usize], context: &'static str) -> Result<usize, PayloadError> {
+pub(crate) fn checked_len_sum(
+    parts: &[usize],
+    context: &'static str,
+) -> Result<usize, PayloadError> {
     parts.iter().try_fold(0_usize, |total, part| {
         total
             .checked_add(*part)
@@ -110,7 +113,11 @@ pub(crate) fn checked_len_sum(parts: &[usize], context: &'static str) -> Result<
     })
 }
 
-pub(crate) fn checked_offset(start: usize, len: usize, context: &'static str) -> Result<usize, PayloadError> {
+pub(crate) fn checked_offset(
+    start: usize,
+    len: usize,
+    context: &'static str,
+) -> Result<usize, PayloadError> {
     start
         .checked_add(len)
         .ok_or(PayloadError::Malformed(context))
@@ -259,7 +266,6 @@ pub(crate) fn decode_page_id(bytes: &[u8]) -> Result<PageId, PayloadError> {
         BlockNumber::new(block_raw),
     ))
 }
-
 
 // ---------------------------------------------------------------------------
 // Submodules

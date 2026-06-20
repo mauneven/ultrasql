@@ -268,7 +268,6 @@ fn bind_table_ref(
     }
 }
 
-
 fn qualified_system_name(name: &ultrasql_parser::ast::ObjectName) -> Option<String> {
     if name.parts.len() != 2 {
         return None;
@@ -307,4 +306,3 @@ fn rebuild_subquery_plan(
         schema: proj_schema,
     })
 }
-

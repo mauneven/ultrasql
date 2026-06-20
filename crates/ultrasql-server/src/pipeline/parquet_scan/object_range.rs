@@ -5,9 +5,7 @@ use std::io::{self, Read};
 use bytes::Bytes;
 use parquet::errors::{ParquetError, Result as ParquetResult};
 use parquet::file::reader::{ChunkReader, Length};
-use ultrasql_objectstore::{
-    ObjectLocation, read_object_range, read_object_range_with_metadata,
-};
+use ultrasql_objectstore::{ObjectLocation, read_object_range, read_object_range_with_metadata};
 
 use crate::error::ServerError;
 

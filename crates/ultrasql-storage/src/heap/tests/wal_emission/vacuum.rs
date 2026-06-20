@@ -2,12 +2,14 @@
 //! committed in-place-update slots, and skipping in-progress/alive rows.
 
 use ultrasql_core::{CommandId, Xid};
-use ultrasql_mvcc::status::test_support::MapOracle;
 use ultrasql_mvcc::Snapshot;
+use ultrasql_mvcc::status::test_support::MapOracle;
 
 use super::rel;
-use crate::heap::tests::{del_opts, int32_pair_payload, make_heap, opts, update_int32_edit, update_int32_stamp};
-use crate::heap::{UpdateInt32PairTid};
+use crate::heap::UpdateInt32PairTid;
+use crate::heap::tests::{
+    del_opts, int32_pair_payload, make_heap, opts, update_int32_edit, update_int32_stamp,
+};
 
 // ------------------------------------------------------------------
 // vacuum_heap tests

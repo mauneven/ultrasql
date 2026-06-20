@@ -122,4 +122,3 @@ fn row_to_json_uses_record_field_names() {
         })
     );
 }
-

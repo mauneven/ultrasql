@@ -4,7 +4,6 @@
 
 use super::*;
 
-
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum VectorDistanceOp {
     L2,
@@ -61,7 +60,11 @@ pub(crate) fn eval_vector_dims(args: &[Value]) -> Result<Value, EvalError> {
     Ok(Value::Int32(dims))
 }
 
-pub(crate) fn vector_distance(left: &Value, right: &Value, op: VectorDistanceOp) -> Result<Value, EvalError> {
+pub(crate) fn vector_distance(
+    left: &Value,
+    right: &Value,
+    op: VectorDistanceOp,
+) -> Result<Value, EvalError> {
     if vector_metric_kind(left) != vector_metric_kind(right) || vector_metric_kind(left).is_none() {
         return Err(EvalError::Type(format!(
             "vector distance requires matching vector, halfvec, or sparsevec operands, got {:?} and {:?}",
@@ -299,4 +302,3 @@ pub(crate) fn sparse_union_fold(
     }
     acc
 }
-

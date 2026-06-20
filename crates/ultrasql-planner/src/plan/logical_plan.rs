@@ -19,11 +19,11 @@ use super::ddl_types::{
     LogicalUniqueConstraint,
 };
 use super::node_types::{
-    LogicalAggregateExpr, LogicalAggregatingIndex, LogicalDescribeTarget, LogicalIndexMethod,
-    LogicalIndexOption, LogicalJoinCondition, LogicalJoinType, LogicalMergeClause,
-    LogicalOnConflict, LogicalPivotAggregate, LogicalPivotValue, LogicalSetOp,
-    LogicalSetQuantifier, LogicalSetVariableAction, LogicalUnpivotColumn, LogicalWindowFunc,
-    LockStrength, LockWaitPolicy, SortKey, TxnIsolationLevel,
+    LockStrength, LockWaitPolicy, LogicalAggregateExpr, LogicalAggregatingIndex,
+    LogicalDescribeTarget, LogicalIndexMethod, LogicalIndexOption, LogicalJoinCondition,
+    LogicalJoinType, LogicalMergeClause, LogicalOnConflict, LogicalPivotAggregate,
+    LogicalPivotValue, LogicalSetOp, LogicalSetQuantifier, LogicalSetVariableAction,
+    LogicalUnpivotColumn, LogicalWindowFunc, SortKey, TxnIsolationLevel,
 };
 
 /// The bound, type-checked logical plan tree.

@@ -127,14 +127,8 @@ pub(crate) async fn run_workload(
         }
         Workload::MixedCorrectness => {
             payload.answer = Some(
-                run_shared_mixed_correctness(
-                    bound,
-                    args.rows,
-                    args.warmup,
-                    total_iters,
-                    iters_us,
-                )
-                .await?,
+                run_shared_mixed_correctness(bound, args.rows, args.warmup, total_iters, iters_us)
+                    .await?,
             );
         }
         Workload::VectorTopK => {
@@ -240,9 +234,14 @@ pub(crate) async fn run_workload(
             payload.parquet_smoke_metrics = Some(metrics);
         }
         Workload::ObjectParquetRange => {
-            let metrics =
-                run_object_parquet_range_smoke(bound, args.rows, args.warmup, total_iters, iters_us)
-                    .await?;
+            let metrics = run_object_parquet_range_smoke(
+                bound,
+                args.rows,
+                args.warmup,
+                total_iters,
+                iters_us,
+            )
+            .await?;
             payload.answer = Some(metrics.answer.clone());
             payload.object_parquet_range_metrics = Some(metrics);
         }

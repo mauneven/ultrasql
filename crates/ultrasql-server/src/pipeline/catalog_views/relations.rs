@@ -307,4 +307,3 @@ pub(super) fn attrdef_oid(relid: Oid, attnum: i16) -> i64 {
         .saturating_mul(1_000)
         .saturating_add(i64::from(attnum))
 }
-

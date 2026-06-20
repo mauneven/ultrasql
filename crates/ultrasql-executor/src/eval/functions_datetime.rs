@@ -577,4 +577,3 @@ pub(crate) fn byte_index_for_char(text: &str, char_index: usize) -> usize {
         .nth(char_index)
         .map_or(text.len(), |(byte_index, _)| byte_index)
 }
-

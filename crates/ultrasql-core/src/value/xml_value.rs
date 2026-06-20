@@ -163,7 +163,11 @@ pub(crate) fn xml_collect_string_value(text: &str, element: &XmlElement, out: &m
     }
 }
 
-pub(crate) fn xml_cdata_body_before(text: &str, open: usize, limit: usize) -> Option<(&str, usize)> {
+pub(crate) fn xml_cdata_body_before(
+    text: &str,
+    open: usize,
+    limit: usize,
+) -> Option<(&str, usize)> {
     let body_start = open.checked_add(9)?;
     let cursor = xml_terminated_cursor_before(text, open, 9, "]]>", limit)?;
     let body_end = cursor.checked_sub("]]>".len())?;
@@ -218,7 +222,11 @@ pub(crate) fn xml_namespace_context(
     namespaces
 }
 
-pub(crate) fn xml_upsert_namespace(namespaces: &mut Vec<(String, String)>, prefix: &str, uri: &str) {
+pub(crate) fn xml_upsert_namespace(
+    namespaces: &mut Vec<(String, String)>,
+    prefix: &str,
+    uri: &str,
+) {
     if let Some((_, existing_uri)) = namespaces
         .iter_mut()
         .find(|(existing_prefix, _)| existing_prefix == prefix)
@@ -301,7 +309,10 @@ pub(crate) fn xml_split_qname(name: &str) -> (&str, &str) {
         .map_or(("", name), |(prefix, local)| (prefix, local))
 }
 
-pub(crate) fn xml_namespace_uri<'a>(namespaces: &'a [(String, String)], prefix: &str) -> Option<&'a str> {
+pub(crate) fn xml_namespace_uri<'a>(
+    namespaces: &'a [(String, String)],
+    prefix: &str,
+) -> Option<&'a str> {
     namespaces
         .iter()
         .rev()

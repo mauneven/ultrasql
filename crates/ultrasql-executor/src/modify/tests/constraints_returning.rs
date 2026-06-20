@@ -12,17 +12,15 @@ fn insert_column_map_sequence_generated_constraints_and_returning() {
         Field::required("stored", DataType::Text { max_len: None }),
     ])
     .expect("target schema");
-    let source_schema =
-        Schema::new([Field::required("name", DataType::Text { max_len: None })])
-            .expect("source schema");
+    let source_schema = Schema::new([Field::required("name", DataType::Text { max_len: None })])
+        .expect("source schema");
     let source = ValuesScan::new(vec![vec![lit_text("alpha")]], source_schema);
 
     let observed = Arc::new(Mutex::new(Vec::new()));
     let observed_clone = Arc::clone(&observed);
     let wal = Arc::new(InMemoryWalSink::new()) as Arc<dyn ultrasql_storage::wal_sink::WalSink>;
     let sequence = Arc::new(
-        ultrasql_storage::sequence::Sequence::new(SequenceOptions::default())
-            .expect("sequence"),
+        ultrasql_storage::sequence::Sequence::new(SequenceOptions::default()).expect("sequence"),
     );
     let sequence_default = super::SequenceDefault::new("users_id_seq", sequence)
         .with_observer(Arc::new(move |name, value| {
@@ -101,9 +99,8 @@ fn update_and_delete_operator_paths_cover_slow_branches_and_returning() {
         ]],
         child_schema.clone(),
     );
-    let returning_schema =
-        Schema::new([Field::required("name", DataType::Text { max_len: None })])
-            .expect("returning");
+    let returning_schema = Schema::new([Field::required("name", DataType::Text { max_len: None })])
+        .expect("returning");
     let mut update = ModifyTable::new(
         Arc::clone(&heap),
         rel(),

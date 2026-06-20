@@ -27,6 +27,7 @@
 //! If the input is empty and there **are** group keys, no rows are emitted.
 
 mod arith;
+mod json_agg;
 mod key;
 mod state;
 mod vec_plan;

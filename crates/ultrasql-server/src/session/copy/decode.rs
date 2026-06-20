@@ -55,8 +55,12 @@ pub(super) fn copy_rows_from_select_result(
             .map(|f| Some(f.name.as_bytes().to_vec()))
             .collect();
         match opts.format {
-            ServerCopyFormat::Text => out.extend_from_slice(&super::encode_text_row(&header_cells, opts)),
-            ServerCopyFormat::Csv => out.extend_from_slice(&super::encode_csv_row(&header_cells, opts)),
+            ServerCopyFormat::Text => {
+                out.extend_from_slice(&super::encode_text_row(&header_cells, opts))
+            }
+            ServerCopyFormat::Csv => {
+                out.extend_from_slice(&super::encode_csv_row(&header_cells, opts))
+            }
             ServerCopyFormat::Binary | ServerCopyFormat::Parquet => {}
         }
     }
@@ -64,8 +68,12 @@ pub(super) fn copy_rows_from_select_result(
     for msg in &result.messages {
         if let BackendMessage::DataRow { columns } = msg {
             match opts.format {
-                ServerCopyFormat::Text => out.extend_from_slice(&super::encode_text_row(columns, opts)),
-                ServerCopyFormat::Csv => out.extend_from_slice(&super::encode_csv_row(columns, opts)),
+                ServerCopyFormat::Text => {
+                    out.extend_from_slice(&super::encode_text_row(columns, opts))
+                }
+                ServerCopyFormat::Csv => {
+                    out.extend_from_slice(&super::encode_csv_row(columns, opts))
+                }
                 ServerCopyFormat::Binary => {
                     return Err(ServerError::Unsupported(
                         "binary COPY for query targets is not yet supported",

@@ -243,7 +243,10 @@ impl AdvisorySessionState {
     }
 }
 
-pub(crate) fn advisory_tag_from_values(name: &str, args: &[Value]) -> Result<Option<LockTag>, ServerError> {
+pub(crate) fn advisory_tag_from_values(
+    name: &str,
+    args: &[Value],
+) -> Result<Option<LockTag>, ServerError> {
     match args.len() {
         1 => {
             let Some(key) = advisory_i64_arg(name, args, 0)? else {
@@ -275,7 +278,11 @@ pub(crate) fn advisory_tag_from_values(name: &str, args: &[Value]) -> Result<Opt
     }
 }
 
-pub(crate) fn advisory_i64_arg(name: &str, args: &[Value], idx: usize) -> Result<Option<i64>, ServerError> {
+pub(crate) fn advisory_i64_arg(
+    name: &str,
+    args: &[Value],
+    idx: usize,
+) -> Result<Option<i64>, ServerError> {
     match args.get(idx) {
         Some(Value::Int16(value)) => Ok(Some(i64::from(*value))),
         Some(Value::Int32(value)) => Ok(Some(i64::from(*value))),
@@ -293,7 +300,11 @@ pub(crate) fn advisory_i64_arg(name: &str, args: &[Value], idx: usize) -> Result
     }
 }
 
-pub(crate) fn advisory_i32_arg(name: &str, args: &[Value], idx: usize) -> Result<Option<i32>, ServerError> {
+pub(crate) fn advisory_i32_arg(
+    name: &str,
+    args: &[Value],
+    idx: usize,
+) -> Result<Option<i32>, ServerError> {
     let Some(value) = advisory_i64_arg(name, args, idx)? else {
         return Ok(None);
     };

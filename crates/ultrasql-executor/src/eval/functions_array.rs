@@ -270,7 +270,10 @@ pub(crate) fn eval_array_slice(args: &[Value]) -> Result<Value, EvalError> {
     })
 }
 
-pub(crate) fn optional_array_slice_bound(value: &Value, name: &'static str) -> Result<Option<i64>, EvalError> {
+pub(crate) fn optional_array_slice_bound(
+    value: &Value,
+    name: &'static str,
+) -> Result<Option<i64>, EvalError> {
     if matches!(value, Value::Null) {
         return Ok(None);
     }
@@ -461,4 +464,3 @@ pub(crate) fn eval_string_to_array(args: &[Value]) -> Result<Value, EvalError> {
         elements,
     })
 }
-

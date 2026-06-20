@@ -3,8 +3,8 @@
 
 use proptest::prelude::*;
 use ultrasql_core::{CommandId, Xid};
-use ultrasql_mvcc::status::test_support::MapOracle;
 use ultrasql_mvcc::Snapshot;
+use ultrasql_mvcc::status::test_support::MapOracle;
 
 use super::*;
 

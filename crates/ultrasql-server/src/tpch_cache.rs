@@ -68,10 +68,12 @@ impl TpchQ1ColumnarCache {
     }
 }
 
-pub(crate) static TPCH_Q1_COLUMNAR_CACHE: OnceLock<parking_lot::RwLock<Option<Arc<TpchQ1ColumnarCache>>>> =
-    OnceLock::new();
+pub(crate) static TPCH_Q1_COLUMNAR_CACHE: OnceLock<
+    parking_lot::RwLock<Option<Arc<TpchQ1ColumnarCache>>>,
+> = OnceLock::new();
 
-pub(crate) fn tpch_q1_columnar_cache_cell() -> &'static parking_lot::RwLock<Option<Arc<TpchQ1ColumnarCache>>> {
+pub(crate) fn tpch_q1_columnar_cache_cell()
+-> &'static parking_lot::RwLock<Option<Arc<TpchQ1ColumnarCache>>> {
     TPCH_Q1_COLUMNAR_CACHE.get_or_init(|| parking_lot::RwLock::new(None))
 }
 
@@ -108,7 +110,8 @@ pub struct TpchQ2ResultRow {
 pub(crate) static TPCH_Q2_CACHE: OnceLock<parking_lot::RwLock<Option<Arc<Vec<TpchQ2ResultRow>>>>> =
     OnceLock::new();
 
-pub(crate) fn tpch_q2_cache_cell() -> &'static parking_lot::RwLock<Option<Arc<Vec<TpchQ2ResultRow>>>> {
+pub(crate) fn tpch_q2_cache_cell() -> &'static parking_lot::RwLock<Option<Arc<Vec<TpchQ2ResultRow>>>>
+{
     TPCH_Q2_CACHE.get_or_init(|| parking_lot::RwLock::new(None))
 }
 
@@ -137,7 +140,8 @@ pub struct TpchQ3ResultRow {
 pub(crate) static TPCH_Q3_CACHE: OnceLock<parking_lot::RwLock<Option<Arc<Vec<TpchQ3ResultRow>>>>> =
     OnceLock::new();
 
-pub(crate) fn tpch_q3_cache_cell() -> &'static parking_lot::RwLock<Option<Arc<Vec<TpchQ3ResultRow>>>> {
+pub(crate) fn tpch_q3_cache_cell() -> &'static parking_lot::RwLock<Option<Arc<Vec<TpchQ3ResultRow>>>>
+{
     TPCH_Q3_CACHE.get_or_init(|| parking_lot::RwLock::new(None))
 }
 
@@ -162,7 +166,8 @@ pub struct TpchQ4ResultRow {
 pub(crate) static TPCH_Q4_CACHE: OnceLock<parking_lot::RwLock<Option<Arc<Vec<TpchQ4ResultRow>>>>> =
     OnceLock::new();
 
-pub(crate) fn tpch_q4_cache_cell() -> &'static parking_lot::RwLock<Option<Arc<Vec<TpchQ4ResultRow>>>> {
+pub(crate) fn tpch_q4_cache_cell() -> &'static parking_lot::RwLock<Option<Arc<Vec<TpchQ4ResultRow>>>>
+{
     TPCH_Q4_CACHE.get_or_init(|| parking_lot::RwLock::new(None))
 }
 
@@ -187,7 +192,8 @@ pub struct TpchQ5ResultRow {
 pub(crate) static TPCH_Q5_CACHE: OnceLock<parking_lot::RwLock<Option<Arc<Vec<TpchQ5ResultRow>>>>> =
     OnceLock::new();
 
-pub(crate) fn tpch_q5_cache_cell() -> &'static parking_lot::RwLock<Option<Arc<Vec<TpchQ5ResultRow>>>> {
+pub(crate) fn tpch_q5_cache_cell() -> &'static parking_lot::RwLock<Option<Arc<Vec<TpchQ5ResultRow>>>>
+{
     TPCH_Q5_CACHE.get_or_init(|| parking_lot::RwLock::new(None))
 }
 
@@ -216,7 +222,8 @@ pub struct TpchQ7ResultRow {
 pub(crate) static TPCH_Q7_CACHE: OnceLock<parking_lot::RwLock<Option<Arc<Vec<TpchQ7ResultRow>>>>> =
     OnceLock::new();
 
-pub(crate) fn tpch_q7_cache_cell() -> &'static parking_lot::RwLock<Option<Arc<Vec<TpchQ7ResultRow>>>> {
+pub(crate) fn tpch_q7_cache_cell() -> &'static parking_lot::RwLock<Option<Arc<Vec<TpchQ7ResultRow>>>>
+{
     TPCH_Q7_CACHE.get_or_init(|| parking_lot::RwLock::new(None))
 }
 
@@ -241,7 +248,8 @@ pub struct TpchQ8ResultRow {
 pub(crate) static TPCH_Q8_CACHE: OnceLock<parking_lot::RwLock<Option<Arc<Vec<TpchQ8ResultRow>>>>> =
     OnceLock::new();
 
-pub(crate) fn tpch_q8_cache_cell() -> &'static parking_lot::RwLock<Option<Arc<Vec<TpchQ8ResultRow>>>> {
+pub(crate) fn tpch_q8_cache_cell() -> &'static parking_lot::RwLock<Option<Arc<Vec<TpchQ8ResultRow>>>>
+{
     TPCH_Q8_CACHE.get_or_init(|| parking_lot::RwLock::new(None))
 }
 
@@ -268,7 +276,8 @@ pub struct TpchQ9ResultRow {
 pub(crate) static TPCH_Q9_CACHE: OnceLock<parking_lot::RwLock<Option<Arc<Vec<TpchQ9ResultRow>>>>> =
     OnceLock::new();
 
-pub(crate) fn tpch_q9_cache_cell() -> &'static parking_lot::RwLock<Option<Arc<Vec<TpchQ9ResultRow>>>> {
+pub(crate) fn tpch_q9_cache_cell() -> &'static parking_lot::RwLock<Option<Arc<Vec<TpchQ9ResultRow>>>>
+{
     TPCH_Q9_CACHE.get_or_init(|| parking_lot::RwLock::new(None))
 }
 
@@ -302,10 +311,12 @@ pub struct TpchQ10ResultRow {
     pub c_comment: String,
 }
 
-pub(crate) static TPCH_Q10_CACHE: OnceLock<parking_lot::RwLock<Option<Arc<Vec<TpchQ10ResultRow>>>>> =
-    OnceLock::new();
+pub(crate) static TPCH_Q10_CACHE: OnceLock<
+    parking_lot::RwLock<Option<Arc<Vec<TpchQ10ResultRow>>>>,
+> = OnceLock::new();
 
-pub(crate) fn tpch_q10_cache_cell() -> &'static parking_lot::RwLock<Option<Arc<Vec<TpchQ10ResultRow>>>> {
+pub(crate) fn tpch_q10_cache_cell()
+-> &'static parking_lot::RwLock<Option<Arc<Vec<TpchQ10ResultRow>>>> {
     TPCH_Q10_CACHE.get_or_init(|| parking_lot::RwLock::new(None))
 }
 
@@ -327,10 +338,12 @@ pub struct TpchQ11ResultRow {
     pub value: i64,
 }
 
-pub(crate) static TPCH_Q11_CACHE: OnceLock<parking_lot::RwLock<Option<Arc<Vec<TpchQ11ResultRow>>>>> =
-    OnceLock::new();
+pub(crate) static TPCH_Q11_CACHE: OnceLock<
+    parking_lot::RwLock<Option<Arc<Vec<TpchQ11ResultRow>>>>,
+> = OnceLock::new();
 
-pub(crate) fn tpch_q11_cache_cell() -> &'static parking_lot::RwLock<Option<Arc<Vec<TpchQ11ResultRow>>>> {
+pub(crate) fn tpch_q11_cache_cell()
+-> &'static parking_lot::RwLock<Option<Arc<Vec<TpchQ11ResultRow>>>> {
     TPCH_Q11_CACHE.get_or_init(|| parking_lot::RwLock::new(None))
 }
 
@@ -354,10 +367,12 @@ pub struct TpchQ12ResultRow {
     pub low_line_count: i64,
 }
 
-pub(crate) static TPCH_Q12_CACHE: OnceLock<parking_lot::RwLock<Option<Arc<Vec<TpchQ12ResultRow>>>>> =
-    OnceLock::new();
+pub(crate) static TPCH_Q12_CACHE: OnceLock<
+    parking_lot::RwLock<Option<Arc<Vec<TpchQ12ResultRow>>>>,
+> = OnceLock::new();
 
-pub(crate) fn tpch_q12_cache_cell() -> &'static parking_lot::RwLock<Option<Arc<Vec<TpchQ12ResultRow>>>> {
+pub(crate) fn tpch_q12_cache_cell()
+-> &'static parking_lot::RwLock<Option<Arc<Vec<TpchQ12ResultRow>>>> {
     TPCH_Q12_CACHE.get_or_init(|| parking_lot::RwLock::new(None))
 }
 
@@ -379,10 +394,12 @@ pub struct TpchQ13ResultRow {
     pub custdist: i64,
 }
 
-pub(crate) static TPCH_Q13_CACHE: OnceLock<parking_lot::RwLock<Option<Arc<Vec<TpchQ13ResultRow>>>>> =
-    OnceLock::new();
+pub(crate) static TPCH_Q13_CACHE: OnceLock<
+    parking_lot::RwLock<Option<Arc<Vec<TpchQ13ResultRow>>>>,
+> = OnceLock::new();
 
-pub(crate) fn tpch_q13_cache_cell() -> &'static parking_lot::RwLock<Option<Arc<Vec<TpchQ13ResultRow>>>> {
+pub(crate) fn tpch_q13_cache_cell()
+-> &'static parking_lot::RwLock<Option<Arc<Vec<TpchQ13ResultRow>>>> {
     TPCH_Q13_CACHE.get_or_init(|| parking_lot::RwLock::new(None))
 }
 
@@ -402,10 +419,12 @@ pub struct TpchQ14ResultRow {
     pub promo_revenue: f64,
 }
 
-pub(crate) static TPCH_Q14_CACHE: OnceLock<parking_lot::RwLock<Option<Arc<Vec<TpchQ14ResultRow>>>>> =
-    OnceLock::new();
+pub(crate) static TPCH_Q14_CACHE: OnceLock<
+    parking_lot::RwLock<Option<Arc<Vec<TpchQ14ResultRow>>>>,
+> = OnceLock::new();
 
-pub(crate) fn tpch_q14_cache_cell() -> &'static parking_lot::RwLock<Option<Arc<Vec<TpchQ14ResultRow>>>> {
+pub(crate) fn tpch_q14_cache_cell()
+-> &'static parking_lot::RwLock<Option<Arc<Vec<TpchQ14ResultRow>>>> {
     TPCH_Q14_CACHE.get_or_init(|| parking_lot::RwLock::new(None))
 }
 
@@ -433,10 +452,12 @@ pub struct TpchQ15ResultRow {
     pub total_revenue: i64,
 }
 
-pub(crate) static TPCH_Q15_CACHE: OnceLock<parking_lot::RwLock<Option<Arc<Vec<TpchQ15ResultRow>>>>> =
-    OnceLock::new();
+pub(crate) static TPCH_Q15_CACHE: OnceLock<
+    parking_lot::RwLock<Option<Arc<Vec<TpchQ15ResultRow>>>>,
+> = OnceLock::new();
 
-pub(crate) fn tpch_q15_cache_cell() -> &'static parking_lot::RwLock<Option<Arc<Vec<TpchQ15ResultRow>>>> {
+pub(crate) fn tpch_q15_cache_cell()
+-> &'static parking_lot::RwLock<Option<Arc<Vec<TpchQ15ResultRow>>>> {
     TPCH_Q15_CACHE.get_or_init(|| parking_lot::RwLock::new(None))
 }
 
@@ -462,10 +483,12 @@ pub struct TpchQ16ResultRow {
     pub supplier_cnt: i64,
 }
 
-pub(crate) static TPCH_Q16_CACHE: OnceLock<parking_lot::RwLock<Option<Arc<Vec<TpchQ16ResultRow>>>>> =
-    OnceLock::new();
+pub(crate) static TPCH_Q16_CACHE: OnceLock<
+    parking_lot::RwLock<Option<Arc<Vec<TpchQ16ResultRow>>>>,
+> = OnceLock::new();
 
-pub(crate) fn tpch_q16_cache_cell() -> &'static parking_lot::RwLock<Option<Arc<Vec<TpchQ16ResultRow>>>> {
+pub(crate) fn tpch_q16_cache_cell()
+-> &'static parking_lot::RwLock<Option<Arc<Vec<TpchQ16ResultRow>>>> {
     TPCH_Q16_CACHE.get_or_init(|| parking_lot::RwLock::new(None))
 }
 
@@ -485,10 +508,12 @@ pub struct TpchQ17ResultRow {
     pub avg_yearly: f64,
 }
 
-pub(crate) static TPCH_Q17_CACHE: OnceLock<parking_lot::RwLock<Option<Arc<Vec<TpchQ17ResultRow>>>>> =
-    OnceLock::new();
+pub(crate) static TPCH_Q17_CACHE: OnceLock<
+    parking_lot::RwLock<Option<Arc<Vec<TpchQ17ResultRow>>>>,
+> = OnceLock::new();
 
-pub(crate) fn tpch_q17_cache_cell() -> &'static parking_lot::RwLock<Option<Arc<Vec<TpchQ17ResultRow>>>> {
+pub(crate) fn tpch_q17_cache_cell()
+-> &'static parking_lot::RwLock<Option<Arc<Vec<TpchQ17ResultRow>>>> {
     TPCH_Q17_CACHE.get_or_init(|| parking_lot::RwLock::new(None))
 }
 
@@ -518,10 +543,12 @@ pub struct TpchQ18ResultRow {
     pub sum_quantity: i64,
 }
 
-pub(crate) static TPCH_Q18_CACHE: OnceLock<parking_lot::RwLock<Option<Arc<Vec<TpchQ18ResultRow>>>>> =
-    OnceLock::new();
+pub(crate) static TPCH_Q18_CACHE: OnceLock<
+    parking_lot::RwLock<Option<Arc<Vec<TpchQ18ResultRow>>>>,
+> = OnceLock::new();
 
-pub(crate) fn tpch_q18_cache_cell() -> &'static parking_lot::RwLock<Option<Arc<Vec<TpchQ18ResultRow>>>> {
+pub(crate) fn tpch_q18_cache_cell()
+-> &'static parking_lot::RwLock<Option<Arc<Vec<TpchQ18ResultRow>>>> {
     TPCH_Q18_CACHE.get_or_init(|| parking_lot::RwLock::new(None))
 }
 
@@ -541,10 +568,12 @@ pub struct TpchQ19ResultRow {
     pub revenue: i64,
 }
 
-pub(crate) static TPCH_Q19_CACHE: OnceLock<parking_lot::RwLock<Option<Arc<Vec<TpchQ19ResultRow>>>>> =
-    OnceLock::new();
+pub(crate) static TPCH_Q19_CACHE: OnceLock<
+    parking_lot::RwLock<Option<Arc<Vec<TpchQ19ResultRow>>>>,
+> = OnceLock::new();
 
-pub(crate) fn tpch_q19_cache_cell() -> &'static parking_lot::RwLock<Option<Arc<Vec<TpchQ19ResultRow>>>> {
+pub(crate) fn tpch_q19_cache_cell()
+-> &'static parking_lot::RwLock<Option<Arc<Vec<TpchQ19ResultRow>>>> {
     TPCH_Q19_CACHE.get_or_init(|| parking_lot::RwLock::new(None))
 }
 
@@ -566,10 +595,12 @@ pub struct TpchQ20ResultRow {
     pub s_address: String,
 }
 
-pub(crate) static TPCH_Q20_CACHE: OnceLock<parking_lot::RwLock<Option<Arc<Vec<TpchQ20ResultRow>>>>> =
-    OnceLock::new();
+pub(crate) static TPCH_Q20_CACHE: OnceLock<
+    parking_lot::RwLock<Option<Arc<Vec<TpchQ20ResultRow>>>>,
+> = OnceLock::new();
 
-pub(crate) fn tpch_q20_cache_cell() -> &'static parking_lot::RwLock<Option<Arc<Vec<TpchQ20ResultRow>>>> {
+pub(crate) fn tpch_q20_cache_cell()
+-> &'static parking_lot::RwLock<Option<Arc<Vec<TpchQ20ResultRow>>>> {
     TPCH_Q20_CACHE.get_or_init(|| parking_lot::RwLock::new(None))
 }
 
@@ -591,10 +622,12 @@ pub struct TpchQ21ResultRow {
     pub numwait: i64,
 }
 
-pub(crate) static TPCH_Q21_CACHE: OnceLock<parking_lot::RwLock<Option<Arc<Vec<TpchQ21ResultRow>>>>> =
-    OnceLock::new();
+pub(crate) static TPCH_Q21_CACHE: OnceLock<
+    parking_lot::RwLock<Option<Arc<Vec<TpchQ21ResultRow>>>>,
+> = OnceLock::new();
 
-pub(crate) fn tpch_q21_cache_cell() -> &'static parking_lot::RwLock<Option<Arc<Vec<TpchQ21ResultRow>>>> {
+pub(crate) fn tpch_q21_cache_cell()
+-> &'static parking_lot::RwLock<Option<Arc<Vec<TpchQ21ResultRow>>>> {
     TPCH_Q21_CACHE.get_or_init(|| parking_lot::RwLock::new(None))
 }
 

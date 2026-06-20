@@ -313,7 +313,10 @@ pub(in crate::binder) fn coerce_literal_to_enum(expr: &mut ScalarExpr, target: &
     true
 }
 
-pub(in crate::binder) fn coerce_literal_to_composite(expr: &mut ScalarExpr, target: &DataType) -> bool {
+pub(in crate::binder) fn coerce_literal_to_composite(
+    expr: &mut ScalarExpr,
+    target: &DataType,
+) -> bool {
     let DataType::Composite { fields, .. } = target else {
         return false;
     };
@@ -420,7 +423,10 @@ pub(in crate::binder) fn coerce_literal_to_bit_string(
     true
 }
 
-pub(in crate::binder) fn coerce_literal_to_network(expr: &mut ScalarExpr, target: &DataType) -> bool {
+pub(in crate::binder) fn coerce_literal_to_network(
+    expr: &mut ScalarExpr,
+    target: &DataType,
+) -> bool {
     if !target.is_network_address() {
         return false;
     }
@@ -443,7 +449,10 @@ pub(in crate::binder) fn coerce_literal_to_network(expr: &mut ScalarExpr, target
     true
 }
 
-pub(in crate::binder) fn bit_string_from_integer_target(value: i64, target: &DataType) -> Option<BitString> {
+pub(in crate::binder) fn bit_string_from_integer_target(
+    value: i64,
+    target: &DataType,
+) -> Option<BitString> {
     let width = match target {
         DataType::Bit { len: Some(len) } => *len,
         DataType::Bit { len: None } => 1,
@@ -454,7 +463,11 @@ pub(in crate::binder) fn bit_string_from_integer_target(value: i64, target: &Dat
     BitString::from_i64(width, value)
 }
 
-pub(in crate::binder) fn coerce_literal_to_bpchar(expr: &mut ScalarExpr, target: &DataType, explicit_cast: bool) -> bool {
+pub(in crate::binder) fn coerce_literal_to_bpchar(
+    expr: &mut ScalarExpr,
+    target: &DataType,
+    explicit_cast: bool,
+) -> bool {
     fold_signed_literal(expr);
     let DataType::Char { len } = target else {
         return false;
@@ -477,4 +490,3 @@ pub(in crate::binder) fn coerce_literal_to_bpchar(expr: &mut ScalarExpr, target:
     *data_type = target.clone();
     true
 }
-

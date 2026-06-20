@@ -24,8 +24,7 @@ fn like_underscore_single_char() {
 
 #[test]
 fn like_backslash_escapes_wildcards() {
-    let escaped_underscore =
-        Eval::new(binop(BinaryOp::Like, lit_text("a_b"), lit_text(r"a\_b")));
+    let escaped_underscore = Eval::new(binop(BinaryOp::Like, lit_text("a_b"), lit_text(r"a\_b")));
     assert_eq!(escaped_underscore.eval(&[]).unwrap(), Value::Bool(true));
 
     let escaped_percent = Eval::new(binop(
@@ -35,8 +34,7 @@ fn like_backslash_escapes_wildcards() {
     ));
     assert_eq!(escaped_percent.eval(&[]).unwrap(), Value::Bool(true));
 
-    let wildcard_still_wild =
-        Eval::new(binop(BinaryOp::Like, lit_text("axb"), lit_text(r"a\_b")));
+    let wildcard_still_wild = Eval::new(binop(BinaryOp::Like, lit_text("axb"), lit_text(r"a\_b")));
     assert_eq!(wildcard_still_wild.eval(&[]).unwrap(), Value::Bool(false));
 }
 

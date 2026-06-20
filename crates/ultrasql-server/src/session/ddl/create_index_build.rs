@@ -252,9 +252,9 @@ where
                     progress.update("scanning table", blocks_done);
                     last_progress_block = blocks_done;
                 }
-                let row = codec.decode(&tuple.data).map_err(|e| {
-                    ServerError::ddl(format!("CREATE INDEX ivfflat decode: {e}"))
-                })?;
+                let row = codec
+                    .decode(&tuple.data)
+                    .map_err(|e| ServerError::ddl(format!("CREATE INDEX ivfflat decode: {e}")))?;
                 let vector = match row.get(vector_col) {
                     Some(Value::Vector(vector) | Value::HalfVec(vector)) => vector.clone(),
                     Some(Value::Null) => continue,
@@ -276,9 +276,7 @@ where
         build_result?;
         progress.update("writing catalog", block_count);
         let attnum = u16::try_from(vector_col).map_err(|_| {
-            ServerError::Unsupported(
-                "CREATE INDEX: column index does not fit in u16 attnum field",
-            )
+            ServerError::Unsupported("CREATE INDEX: column index does not fit in u16 attnum field")
         })?;
         let entry = IndexEntry::new(
             index_oid,
@@ -311,11 +309,8 @@ where
                 "CREATE IVFFLAT INDEX catalog rollback after persist error",
             ));
         }
-        self.state.commit_transaction(
-            ddl_txn,
-            true,
-            "CREATE IVFFLAT INDEX catalog transaction",
-        )?;
+        self.state
+            .commit_transaction(ddl_txn, true, "CREATE IVFFLAT INDEX catalog transaction")?;
         let mut constraints = self
             .state
             .table_constraints
@@ -392,10 +387,8 @@ where
             .ensure_table_runtime_constraints_metadata_slots_persistable()?;
         let index_rel = RelationId::new(index_oid.raw());
         let hnsw = Arc::new(
-            PageBackedHnswIndex::new_with_payload_kind(
-                index_rel, dims, metric, 16, 64, payload,
-            )
-            .map_err(|e| ServerError::ddl(format!("CREATE INDEX hnsw init: {e}")))?,
+            PageBackedHnswIndex::new_with_payload_kind(index_rel, dims, metric, 16, 64, payload)
+                .map_err(|e| ServerError::ddl(format!("CREATE INDEX hnsw init: {e}")))?,
         );
         let txn = self.state.txn_manager.begin(IsolationLevel::ReadCommitted);
         let table_rel = RelationId(table.oid);
@@ -418,9 +411,8 @@ where
         let build_result = (|| -> Result<(), ServerError> {
             let mut last_progress_block = 0;
             for result in scan {
-                let tuple = result.map_err(|e| {
-                    ServerError::ddl(format!("CREATE INDEX hnsw heap scan: {e}"))
-                })?;
+                let tuple = result
+                    .map_err(|e| ServerError::ddl(format!("CREATE INDEX hnsw heap scan: {e}")))?;
                 let blocks_done = tuple
                     .tid
                     .page
@@ -459,9 +451,7 @@ where
         build_result?;
         progress.update("writing catalog", block_count);
         let attnum = u16::try_from(vector_col).map_err(|_| {
-            ServerError::Unsupported(
-                "CREATE INDEX: column index does not fit in u16 attnum field",
-            )
+            ServerError::Unsupported("CREATE INDEX: column index does not fit in u16 attnum field")
         })?;
         let entry = IndexEntry::new(
             index_oid,
@@ -494,11 +484,8 @@ where
                 "CREATE HNSW INDEX catalog rollback after persist error",
             ));
         }
-        self.state.commit_transaction(
-            ddl_txn,
-            true,
-            "CREATE HNSW INDEX catalog transaction",
-        )?;
+        self.state
+            .commit_transaction(ddl_txn, true, "CREATE HNSW INDEX catalog transaction")?;
         let mut constraints = self
             .state
             .table_constraints

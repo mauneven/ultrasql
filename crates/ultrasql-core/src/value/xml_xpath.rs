@@ -485,4 +485,3 @@ pub(crate) fn xml_xpath_top_level_comma(text: &str) -> Option<usize> {
     }
     None
 }
-

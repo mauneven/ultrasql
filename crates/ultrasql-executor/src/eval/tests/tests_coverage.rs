@@ -255,4 +255,3 @@ fn catalog_edge_cases_cover_remaining_error_and_oid_paths() {
         .contains("text arguments")
     );
 }
-

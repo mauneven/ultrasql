@@ -9,14 +9,14 @@
 use std::io::BufReader;
 use std::sync::Arc;
 
+use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use ultrasql_catalog::{TableEntry, table_lookup_key};
-use ultrasql_core::{RelationId, Schema, Value};
 use ultrasql_core::csv::sniff_csv_text;
+use ultrasql_core::{RelationId, Schema, Value};
 use ultrasql_executor::RowCodec;
 use ultrasql_planner::{CopySource, LogicalPlan};
 use ultrasql_protocol::{BackendMessage, encode_backend};
 use ultrasql_txn::{IsolationLevel, Transaction};
-use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 
 use super::super::Session;
 use super::binary::{append_binary_copy_header, append_binary_copy_row, append_i16_be};
@@ -25,13 +25,14 @@ use super::decode::{
 };
 use super::fs_io::{
     copy_format_code, csv_record_complete, open_copy_input_file, projected_schema,
-    read_copy_file_sample, read_copy_input_file, validate_copy_reject_table, write_copy_output_file,
+    read_copy_file_sample, read_copy_input_file, validate_copy_reject_table,
+    write_copy_output_file,
 };
 use super::{
     COPY_INSERT_BATCH_ROWS, CopyOptions, CopyRejectState, CopyRejectTarget, CopyRowDecodeContext,
-    CopyTextFileStreamArgs, ServerCopyFormat, ServerError, add_copy_batch_rows, copy_add_row_counts,
-    copy_out_response_with_format, copy_table_key, encode_csv_row, encode_text_row,
-    increment_copy_rows,
+    CopyTextFileStreamArgs, ServerCopyFormat, ServerError, add_copy_batch_rows,
+    copy_add_row_counts, copy_out_response_with_format, copy_table_key, encode_csv_row,
+    encode_text_row, increment_copy_rows,
 };
 
 impl<RW> Session<RW>

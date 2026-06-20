@@ -1,10 +1,10 @@
 //! hash access-method unit tests.
 
-use ultrasql_core::{RelationId, Xid};
-use ultrasql_wal::payload::{HashOpKind, HashOpPayload};
-use ultrasql_wal::record::{RecordType};
 use super::*;
 use crate::wal_sink::test_support::InMemoryWalSink;
+use ultrasql_core::{RelationId, Xid};
+use ultrasql_wal::payload::{HashOpKind, HashOpPayload};
+use ultrasql_wal::record::RecordType;
 
 // --- HashIndex ---
 

@@ -11,9 +11,9 @@ use std::io::{BufRead, BufReader, Read, Write};
 use std::path::Path;
 
 use ultrasql_catalog::TableEntry;
-use ultrasql_core::{DataType, Schema};
 #[cfg(test)]
 use ultrasql_core::Value;
+use ultrasql_core::{DataType, Schema};
 
 use super::{
     COPY_AUTODETECT_SAMPLE_BYTES, CopyOptions, DEFAULT_COPY_BINARY_FILE_LIMIT_BYTES,
@@ -255,7 +255,10 @@ pub(super) fn copy_format_code(format: ServerCopyFormat) -> u8 {
     }
 }
 
-pub(super) fn projected_schema(entry: &TableEntry, columns: &[usize]) -> Result<Schema, ServerError> {
+pub(super) fn projected_schema(
+    entry: &TableEntry,
+    columns: &[usize],
+) -> Result<Schema, ServerError> {
     if columns.is_empty() {
         return Ok(entry.schema.clone());
     }

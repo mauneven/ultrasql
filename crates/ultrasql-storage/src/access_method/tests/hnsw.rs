@@ -1,10 +1,10 @@
 //! Runtime and page-backed HNSW unit tests (build and search).
 
-use ultrasql_core::{RelationId, TupleId, Xid};
-use ultrasql_wal::payload::{HnswOpKind, HnswOpPayload};
-use ultrasql_wal::record::{RecordType};
 use super::*;
 use crate::wal_sink::test_support::InMemoryWalSink;
+use ultrasql_core::{RelationId, TupleId, Xid};
+use ultrasql_wal::payload::{HnswOpKind, HnswOpPayload};
+use ultrasql_wal::record::RecordType;
 
 // --- HnswIndex ---
 
@@ -184,8 +184,7 @@ fn page_backed_hnsw_graph_search_is_approximate_and_exact_with_high_ef() {
         .collect();
     assert_eq!(approx.len(), k, "graph search must return k results");
     let overlap = exact.iter().filter(|t| approx.contains(t)).count();
-    let recall =
-        f64::from(u16::try_from(overlap).unwrap()) / f64::from(u16::try_from(k).unwrap());
+    let recall = f64::from(u16::try_from(overlap).unwrap()) / f64::from(u16::try_from(k).unwrap());
     assert!(recall >= 0.8, "graph recall@{k} too low: {recall}");
 }
 
@@ -313,10 +312,9 @@ fn page_backed_hnsw_traversal_build_is_deterministic_for_replay() {
     const N: u16 = 500;
     let dims_u32 = u32::try_from(DIMS).expect("dims fit u32");
     let build = || {
-        let am =
-            PageBackedHnswIndex::new(RelationId::new(8822), dims_u32, HnswMetric::L2, 12, 32)
-                .expect("page-backed hnsw config")
-                .with_build_traversal_work_threshold(0);
+        let am = PageBackedHnswIndex::new(RelationId::new(8822), dims_u32, HnswMetric::L2, 12, 32)
+            .expect("page-backed hnsw config")
+            .with_build_traversal_work_threshold(0);
         let mut rng = 0xdead_beef_cafe_f00d_u64;
         let mut next_unit = move || {
             rng = rng

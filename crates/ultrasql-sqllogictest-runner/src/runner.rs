@@ -6,7 +6,9 @@ use anyhow::{Result, bail};
 use tokio_postgres::types::Type;
 use tokio_postgres::{Client, Row};
 
-use crate::model::{QueryExpectation, SkipFilters, SortMode, StatementExpectation, TestCase, TestKind};
+use crate::model::{
+    QueryExpectation, SkipFilters, SortMode, StatementExpectation, TestCase, TestKind,
+};
 use crate::target::ReferenceTarget;
 
 pub(crate) fn format_cli_reference_rows(

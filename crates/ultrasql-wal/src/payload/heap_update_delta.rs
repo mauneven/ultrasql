@@ -1,9 +1,9 @@
 //! Heap update int32-pair-delta batch payload codecs.
 
-use ultrasql_core::{CommandId, PageId, Xid};
 use ultrasql_core::endian::{
     read_u16_le, read_u32_le, read_u64_le, write_i32_le, write_u16_le, write_u32_le, write_u64_le,
 };
+use ultrasql_core::{CommandId, PageId, Xid};
 
 use super::{
     MAX_VARIABLE_PAYLOAD_BYTES, PAGE_ID_SIZE, PayloadError, checked_len_sum, checked_offset,
@@ -428,4 +428,3 @@ impl HeapUpdateInt32PairDeltaRangeBatchPayload {
         })
     }
 }
-

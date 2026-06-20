@@ -62,8 +62,7 @@ fn real_correlated_scalar_aggregate_rewrites_to_left_join_filter() {
             data_type: DataType::Bool,
         },
     };
-    let agg_schema =
-        Schema::new([Field::nullable("avg", DataType::Float64)]).expect("schema ok");
+    let agg_schema = Schema::new([Field::nullable("avg", DataType::Float64)]).expect("schema ok");
     let aggregate = LogicalPlan::Aggregate {
         input: Box::new(sub_filter),
         group_by: Vec::new(),

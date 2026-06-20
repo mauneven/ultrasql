@@ -88,8 +88,7 @@ fn binary_copy_round_trips_rows_and_rejects_malformed_payloads() {
     assert_eq!(codec.decode(&payloads[0]).expect("row decode"), row);
 
     assert!(
-        decode_binary_copy_payload(b"bad", &entry, &[], &table_schema, &codec, &mut cache)
-            .is_err()
+        decode_binary_copy_payload(b"bad", &entry, &[], &table_schema, &codec, &mut cache).is_err()
     );
 
     let mut negative_ext = Vec::new();
@@ -113,15 +112,8 @@ fn binary_copy_round_trips_rows_and_rejects_malformed_payloads() {
     append_i16_be(&mut wrong_count, 1);
     wrong_count.extend_from_slice(&(-1_i32).to_be_bytes());
     assert!(
-        decode_binary_copy_payload(
-            &wrong_count,
-            &entry,
-            &[],
-            &table_schema,
-            &codec,
-            &mut cache
-        )
-        .is_err()
+        decode_binary_copy_payload(&wrong_count, &entry, &[], &table_schema, &codec, &mut cache)
+            .is_err()
     );
 
     let mut bad_len = Vec::new();
@@ -150,9 +142,8 @@ fn binary_copy_rejects_unsupported_critical_header_flags() {
     encoded.extend_from_slice(&0_i32.to_be_bytes());
     append_i16_be(&mut encoded, -1);
 
-    let err =
-        decode_binary_copy_payload(&encoded, &entry, &[], &table_schema, &codec, &mut cache)
-            .expect_err("unsupported critical binary COPY flags must fail closed");
+    let err = decode_binary_copy_payload(&encoded, &entry, &[], &table_schema, &codec, &mut cache)
+        .expect_err("unsupported critical binary COPY flags must fail closed");
 
     assert!(
         err.to_string()

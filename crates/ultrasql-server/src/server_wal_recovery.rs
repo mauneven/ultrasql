@@ -568,5 +568,4 @@ impl Server {
             .as_ref()
             .map(|dir| dir.join("pg_domain_runtime.meta"))
     }
-
 }

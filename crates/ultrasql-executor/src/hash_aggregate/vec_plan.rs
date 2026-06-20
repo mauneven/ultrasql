@@ -10,8 +10,8 @@ use std::collections::HashMap;
 
 use ultrasql_core::{DataType, Schema, Value};
 use ultrasql_planner::{AggregateFunc, LogicalAggregateExpr, ScalarExpr};
-use ultrasql_vec::column::Column;
 use ultrasql_vec::Batch;
+use ultrasql_vec::column::Column;
 
 use crate::ExecError;
 
@@ -60,7 +60,9 @@ pub(crate) enum VecAggSlot {
 /// scalar fast set and references a simple column. Returns `None` if any
 /// aggregate falls outside the fast set (e.g. `STRING_AGG`, `BOOL_AND`,
 /// `DISTINCT`, or a non-`Column` argument expression).
-pub(crate) fn build_vectorized_plan(aggregates: &[LogicalAggregateExpr]) -> Option<Vec<VecAggSlot>> {
+pub(crate) fn build_vectorized_plan(
+    aggregates: &[LogicalAggregateExpr],
+) -> Option<Vec<VecAggSlot>> {
     let mut plan = Vec::with_capacity(aggregates.len());
     for agg in aggregates {
         if agg.distinct {
@@ -297,7 +299,10 @@ pub(crate) fn read_i64_key(column: Option<&Column>, row: usize) -> Result<Option
     }
 }
 
-pub(crate) fn read_numeric_value(column: Option<&Column>, row: usize) -> Result<Option<i64>, ExecError> {
+pub(crate) fn read_numeric_value(
+    column: Option<&Column>,
+    row: usize,
+) -> Result<Option<i64>, ExecError> {
     match column {
         Some(Column::Int32(c)) => {
             if c.nulls().is_some_and(|nulls| !nulls.get(row)) {

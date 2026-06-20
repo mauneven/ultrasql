@@ -125,8 +125,7 @@ fn hash_agg_group_key_eval_error_propagates() {
 #[test]
 fn hash_agg_arg_eval_error_propagates() {
     let scan = MemTableScan::new(schema_group_val(), vec![make_batch_i32_i64(&[(1, 10)])]);
-    let out_schema =
-        Schema::new([Field::required("total", DataType::Int64)]).expect("schema ok");
+    let out_schema = Schema::new([Field::required("total", DataType::Int64)]).expect("schema ok");
     let agg = LogicalAggregateExpr {
         func: AggregateFunc::Sum,
         arg: Some(divide_i64_by_zero("val", 1)),
@@ -451,8 +450,8 @@ fn hash_agg_count_distinct_per_group() {
 
 #[test]
 fn hash_agg_count_expr_counts_non_null_values() {
-    let schema = Schema::new([Field::nullable("v", DataType::Text { max_len: None })])
-        .expect("schema ok");
+    let schema =
+        Schema::new([Field::nullable("v", DataType::Text { max_len: None })]).expect("schema ok");
     let scan = MemTableScan::new(
         schema,
         vec![
@@ -491,8 +490,7 @@ fn hash_agg_sum_single_int32_row_widens_to_int64() {
         schema,
         vec![Batch::new([Column::Int32(NumericColumn::from_data(vec![7]))]).expect("batch ok")],
     );
-    let out_schema =
-        Schema::new([Field::required("total", DataType::Int64)]).expect("schema ok");
+    let out_schema = Schema::new([Field::required("total", DataType::Int64)]).expect("schema ok");
     let sum_expr = LogicalAggregateExpr {
         func: AggregateFunc::Sum,
         arg: Some(col("v", 0, DataType::Int32)),
@@ -521,8 +519,7 @@ fn hash_agg_grouped_sum_keeps_null_only_groups_on_fast_path() {
     let batch = Batch::new([
         Column::Int32(NumericColumn::from_data(vec![1, 2, 3])),
         Column::Int64(
-            NumericColumn::with_nulls(vec![10, 0, 30], amount_validity)
-                .expect("amount column ok"),
+            NumericColumn::with_nulls(vec![10, 0, 30], amount_validity).expect("amount column ok"),
         ),
     ])
     .expect("batch ok");

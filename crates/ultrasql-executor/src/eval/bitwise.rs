@@ -103,7 +103,11 @@ pub(crate) fn bitwise_or_integer(
     }
 }
 
-pub(crate) fn shift_bit_string_or_integer(lv: Value, rv: Value, left_shift: bool) -> Result<Value, EvalError> {
+pub(crate) fn shift_bit_string_or_integer(
+    lv: Value,
+    rv: Value,
+    left_shift: bool,
+) -> Result<Value, EvalError> {
     match (&lv, &rv) {
         (Value::Network(_), Value::Network(_)) => network_containment(lv, rv, !left_shift, false),
         (Value::BitString(bits), _) => {
@@ -182,7 +186,11 @@ pub(crate) fn shift_amount(value: &Value) -> Result<usize, EvalError> {
 /// `op` closure receives `i64`-promoted operands so a single closure
 /// form covers all widths; the result is narrowed back to the input
 /// width.
-pub(crate) fn integer_bitwise(lv: Value, rv: Value, op: impl Fn(i64, i64) -> i64) -> Result<Value, EvalError> {
+pub(crate) fn integer_bitwise(
+    lv: Value,
+    rv: Value,
+    op: impl Fn(i64, i64) -> i64,
+) -> Result<Value, EvalError> {
     match (lv, rv) {
         (Value::Int16(l), Value::Int16(r)) => {
             let result = op(i64::from(l), i64::from(r));
@@ -202,4 +210,3 @@ pub(crate) fn integer_bitwise(lv: Value, rv: Value, op: impl Fn(i64, i64) -> i64
         ))),
     }
 }
-

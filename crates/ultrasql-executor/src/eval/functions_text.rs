@@ -103,4 +103,3 @@ pub(crate) fn format_value_text(value: &Value) -> String {
         other => other.to_string(),
     }
 }
-

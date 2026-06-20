@@ -72,8 +72,8 @@ fn archive_wal_once_reports_missing_dir_and_failed_status() {
     std::fs::write(wal_dir.join("000000010000000000000001"), b"wal-a").expect("wal a");
     std::fs::write(wal_dir.join("000000010000000000000002"), b"wal-b").expect("wal b");
 
-    let err = archive_wal_once(dir.path(), failing_shell_command())
-        .expect_err("failed archive command");
+    let err =
+        archive_wal_once(dir.path(), failing_shell_command()).expect_err("failed archive command");
     assert!(err.contains("archive command failed"));
     assert!(
         wal_dir
@@ -215,11 +215,9 @@ fn failing_shell_command() -> &'static str {
 #[test]
 fn shell_command_timeout_stops_hung_commands() {
     let started = std::time::Instant::now();
-    let err = run_shell_command_with_timeout(
-        hanging_shell_command(),
-        Some(Duration::from_millis(25)),
-    )
-    .expect_err("hung shell command should time out");
+    let err =
+        run_shell_command_with_timeout(hanging_shell_command(), Some(Duration::from_millis(25)))
+            .expect_err("hung shell command should time out");
 
     assert_eq!(err.kind(), std::io::ErrorKind::TimedOut);
     assert!(

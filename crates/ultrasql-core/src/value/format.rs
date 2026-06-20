@@ -24,7 +24,11 @@ pub(crate) fn packed_bit_position(idx: usize) -> Option<(usize, u32)> {
     Some((byte_idx, u32::try_from(shift).ok()?))
 }
 
-pub(crate) fn write_decimal_text(f: &mut fmt::Formatter<'_>, value: i64, scale: i32) -> fmt::Result {
+pub(crate) fn write_decimal_text(
+    f: &mut fmt::Formatter<'_>,
+    value: i64,
+    scale: i32,
+) -> fmt::Result {
     let sign = if value < 0 { "-" } else { "" };
     let mag = value.unsigned_abs().to_string();
     if scale <= 0 {
@@ -439,4 +443,3 @@ pub(crate) fn extract_numbers(text: &str) -> Option<Vec<f64>> {
     }
     Some(out)
 }
-

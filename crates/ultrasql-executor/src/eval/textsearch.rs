@@ -279,7 +279,11 @@ pub(crate) fn json_text(value: &Value) -> Option<&str> {
     }
 }
 
-pub(crate) fn json_has_key_set(left: &Value, right: &Value, require_all: bool) -> Result<bool, EvalError> {
+pub(crate) fn json_has_key_set(
+    left: &Value,
+    right: &Value,
+    require_all: bool,
+) -> Result<bool, EvalError> {
     let keys = match right {
         Value::Text(text) => text_collection_values(text),
         Value::Array { elements, .. } => elements
@@ -415,4 +419,3 @@ pub(crate) fn unquote_json_scalar(text: &str) -> &str {
         .and_then(|s| s.strip_suffix('"'))
         .unwrap_or(trimmed)
 }
-

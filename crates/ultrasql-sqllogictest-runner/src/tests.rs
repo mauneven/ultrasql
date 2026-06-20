@@ -5,15 +5,14 @@ use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use crate::benchmark::{
+    EngineBenchmark, escape_json, push_sql_statement, run_benchmark_suite,
+    write_benchmark_artifacts,
+};
 use crate::cli::{Cli, Mode, ReferenceEngine};
 use crate::model::{
     Directives, QueryExpectation, SkipFilters, SkipPattern, SortMode, StatementExpectation,
     TestCase, TestKind,
-};
-use crate::{apply_case_limit, compact_sql};
-use crate::benchmark::{
-    EngineBenchmark, push_sql_statement, run_benchmark_suite, write_benchmark_artifacts,
-    escape_json,
 };
 use crate::parser::{
     collect_input_files, collect_query, collect_until_blank, is_slt_file, parse_directive,
@@ -23,6 +22,7 @@ use crate::runner::{
     compare_query_expectation, effective_skip_reason, format_cli_reference_rows, hash_query_values,
 };
 use crate::target::selected_reference_engines;
+use crate::{apply_case_limit, compact_sql};
 
 fn empty_cli() -> Cli {
     Cli {

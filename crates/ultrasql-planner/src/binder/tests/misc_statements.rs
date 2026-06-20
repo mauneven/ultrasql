@@ -5,9 +5,7 @@ use ultrasql_core::{DataType, Field, Schema};
 
 use super::*;
 use crate::catalog::{InMemoryCatalog, TableMeta};
-use crate::{
-    LogicalPrivilegeKind, LogicalPrivilegeObjectKind,
-};
+use crate::{LogicalPrivilegeKind, LogicalPrivilegeObjectKind};
 
 #[test]
 fn case_branches_with_incompatible_types_are_rejected() {

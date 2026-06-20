@@ -15,7 +15,8 @@ use super::helpers::{
 };
 use super::{
     ComputedDelete, DeleteExtraction, DeleteIndexChange, InsertConflict, InsertConflictAction,
-    ModifyTable, PreparedInsert, UpdateIndexChange, VectorDeleteIndexChange, VectorUpdateIndexChange,
+    ModifyTable, PreparedInsert, UpdateIndexChange, VectorDeleteIndexChange,
+    VectorUpdateIndexChange,
 };
 use crate::eval::Eval;
 use crate::{ExecError, eval_error_to_exec_error};

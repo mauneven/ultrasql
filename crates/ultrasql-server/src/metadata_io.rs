@@ -4,8 +4,11 @@
 //! Moved verbatim from the crate root; behavior unchanged.
 use super::*;
 
-
-pub(crate) fn validation_check(name: &'static str, errors: Vec<String>, ok_detail: String) -> ValidationCheck {
+pub(crate) fn validation_check(
+    name: &'static str,
+    errors: Vec<String>,
+    ok_detail: String,
+) -> ValidationCheck {
     if errors.is_empty() {
         ValidationCheck {
             name,
@@ -89,7 +92,11 @@ pub(crate) fn capped_text_take_limit(context: &str, limit: u64) -> Result<u64, S
     })
 }
 
-pub(crate) fn capped_text_bytes_read_len(path: &Path, context: &str, len: usize) -> Result<u64, ServerError> {
+pub(crate) fn capped_text_bytes_read_len(
+    path: &Path,
+    context: &str,
+    len: usize,
+) -> Result<u64, ServerError> {
     u64::try_from(len).map_err(|_| {
         ServerError::ddl(format!(
             "{context} {} byte count exceeds u64: bytes={len}",
@@ -144,7 +151,9 @@ pub(crate) fn ensure_runtime_metadata_write_slots(path: &Path) -> Result<(), Ser
     ensure_runtime_metadata_file_slot(&tmp)
 }
 
-pub(crate) fn ensure_optional_runtime_metadata_write_slots(path: Option<PathBuf>) -> Result<(), ServerError> {
+pub(crate) fn ensure_optional_runtime_metadata_write_slots(
+    path: Option<PathBuf>,
+) -> Result<(), ServerError> {
     if let Some(path) = path {
         ensure_runtime_metadata_write_slots(&path)?;
     }

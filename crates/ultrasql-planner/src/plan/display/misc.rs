@@ -104,10 +104,7 @@ pub(super) fn fmt_describe(target: &LogicalDescribeTarget, indent: usize, out: &
             kind,
             ..
         } => {
-            let _ = fmt::write(
-                out,
-                format_args!("Describe: {kind:?} {namespace}.{name}\n"),
-            );
+            let _ = fmt::write(out, format_args!("Describe: {kind:?} {namespace}.{name}\n"));
         }
         LogicalDescribeTarget::Query { .. } => {
             out.push_str("Describe: Query\n");
@@ -152,12 +149,7 @@ pub(super) fn fmt_listen(channel: &str, indent: usize, out: &mut String) {
     let _ = fmt::write(out, format_args!("Listen: {channel}\n"));
 }
 
-pub(super) fn fmt_notify(
-    channel: &str,
-    payload: &Option<String>,
-    indent: usize,
-    out: &mut String,
-) {
+pub(super) fn fmt_notify(channel: &str, payload: &Option<String>, indent: usize, out: &mut String) {
     let pad = " ".repeat(indent);
     out.push_str(&pad);
     match payload {

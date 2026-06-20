@@ -7,36 +7,20 @@
 
 use ultrasql_core::{Field, Schema, Value};
 use ultrasql_planner::{
-    AggregateFunc,
-    LogicalAggregateExpr,
-    LogicalJoinCondition,
-    LogicalJoinType,
-    LogicalPlan,
+    AggregateFunc, LogicalAggregateExpr, LogicalJoinCondition, LogicalJoinType, LogicalPlan,
     ScalarExpr,
 };
 
 use super::correlation::{
-    CorrPair,
-    CorrelatedExistsInput,
-    build_correlation_condition,
-    build_correlation_condition_against_right_schema,
-    collect_join_right_column_indices,
-    corr_fields,
-    extract_correlated_exists_input,
-    extract_correlated_scalar_input,
-    push_unique_index,
-    rebase_projected_exists_residual,
+    CorrPair, CorrelatedExistsInput, build_correlation_condition,
+    build_correlation_condition_against_right_schema, collect_join_right_column_indices,
+    corr_fields, extract_correlated_exists_input, extract_correlated_scalar_input,
+    push_unique_index, rebase_projected_exists_residual,
 };
 use super::helpers::{
-    alias_first_column,
-    concat_schemas,
-    conjuncts_to_and,
-    filter_with_conjuncts,
-    find_first_correlated_scalar_subquery,
-    project_left,
-    replace_first_correlated_scalar_subquery,
-    replace_first_uncorrelated_scalar_subquery,
-    shift_column_indices_by,
+    alias_first_column, concat_schemas, conjuncts_to_and, filter_with_conjuncts,
+    find_first_correlated_scalar_subquery, project_left, replace_first_correlated_scalar_subquery,
+    replace_first_uncorrelated_scalar_subquery, shift_column_indices_by,
     split_outer_only_conjuncts,
 };
 
@@ -321,7 +305,9 @@ pub(crate) fn build_correlated_scalar_project_right(
     })
 }
 
-pub(crate) fn build_correlated_scalar_aggregate_right(plan: LogicalPlan) -> Option<CorrelatedScalarRight> {
+pub(crate) fn build_correlated_scalar_aggregate_right(
+    plan: LogicalPlan,
+) -> Option<CorrelatedScalarRight> {
     match plan {
         LogicalPlan::Project {
             input,
@@ -445,7 +431,9 @@ pub(crate) fn coalesce_count_with_zero(column: ScalarExpr) -> ScalarExpr {
     }
 }
 
-pub(crate) fn build_grouped_correlated_aggregate(plan: LogicalPlan) -> Option<(LogicalPlan, Vec<CorrPair>)> {
+pub(crate) fn build_grouped_correlated_aggregate(
+    plan: LogicalPlan,
+) -> Option<(LogicalPlan, Vec<CorrPair>)> {
     let LogicalPlan::Aggregate {
         input,
         group_by,

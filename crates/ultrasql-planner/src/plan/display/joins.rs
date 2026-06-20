@@ -7,8 +7,8 @@ use std::fmt;
 
 use super::super::logical_plan::LogicalPlan;
 use super::super::node_types::{
-    LogicalJoinCondition, LogicalJoinType, LogicalSetOp, LogicalSetQuantifier, LockStrength,
-    LockWaitPolicy,
+    LockStrength, LockWaitPolicy, LogicalJoinCondition, LogicalJoinType, LogicalSetOp,
+    LogicalSetQuantifier,
 };
 
 pub(super) fn fmt_join(

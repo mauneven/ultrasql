@@ -201,5 +201,4 @@ impl PersistentCatalog {
         self.snapshot.store(Arc::new(snap));
         Ok(())
     }
-
 }

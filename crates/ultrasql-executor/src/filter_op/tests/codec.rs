@@ -70,8 +70,8 @@ fn select_column_preserves_selected_nulls() {
     let mut nulls = Bitmap::new(4, true);
     nulls.set(1, false);
     nulls.set(2, false);
-    let source = NumericColumn::with_nulls(vec![10_i32, 0, 0, 9], nulls)
-        .expect("source nullable column");
+    let source =
+        NumericColumn::with_nulls(vec![10_i32, 0, 0, 9], nulls).expect("source nullable column");
 
     match select_column(&Column::Int32(source), &mask, 3).expect("select nullable int") {
         Column::Int32(selected) => {

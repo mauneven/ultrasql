@@ -463,4 +463,3 @@ pub(super) fn sequence_display_name(key: &str, namespace: &str) -> String {
         .rsplit_once('.')
         .map_or_else(|| visible.to_owned(), |(_, name)| name.to_owned())
 }
-

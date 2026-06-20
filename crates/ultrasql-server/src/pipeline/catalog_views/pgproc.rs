@@ -521,4 +521,3 @@ pub(crate) fn pg_proc_builtin_exists(name: &str) -> bool {
         .iter()
         .any(|builtin| builtin.name.eq_ignore_ascii_case(name))
 }
-

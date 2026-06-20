@@ -58,9 +58,7 @@ fn group_key_hashes_supported_value_families_with_sql_key_semantics() {
             bytes: vec![0b1010_0000, 0b1000_0000],
         },
         Value::BitString(BitString::parse("10101").expect("bits")),
-        Value::Network(
-            NetworkValue::parse_for_type(&DataType::Inet, "127.0.0.1").expect("inet"),
-        ),
+        Value::Network(NetworkValue::parse_for_type(&DataType::Inet, "127.0.0.1").expect("inet")),
         Value::Record(vec![("x".into(), Value::Int32(1))]),
     ];
 

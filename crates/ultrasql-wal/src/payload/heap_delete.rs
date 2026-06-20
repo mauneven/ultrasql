@@ -1,9 +1,9 @@
 //! Heap delete payload codecs (in-place, batch, range batch, classic).
 
-use ultrasql_core::{CommandId, PageId, TupleId, Xid};
 use ultrasql_core::endian::{
     read_u16_le, read_u32_le, read_u64_le, write_u16_le, write_u32_le, write_u64_le,
 };
+use ultrasql_core::{CommandId, PageId, TupleId, Xid};
 
 use super::{
     MAX_VARIABLE_PAYLOAD_BYTES, PAGE_ID_SIZE, PayloadError, TID_SIZE, checked_len_sum,
@@ -505,4 +505,3 @@ impl HeapDeleteInPlaceRangeBatchPayload {
         })
     }
 }
-

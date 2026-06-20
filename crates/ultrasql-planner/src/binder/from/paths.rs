@@ -4,8 +4,8 @@
 use std::fs::{self, File};
 use std::path::{Path, PathBuf};
 
-use ultrasql_objectstore::is_object_store_uri;
 use ultrasql_core::{DataType, Value};
+use ultrasql_objectstore::is_object_store_uri;
 
 use super::{PlanError, ScalarExpr};
 
@@ -40,10 +40,7 @@ pub(super) fn read_file_path_specs(
     }
 }
 
-pub(super) fn open_local_regular_file(
-    function_name: &str,
-    path: &Path,
-) -> Result<File, PlanError> {
+pub(super) fn open_local_regular_file(function_name: &str, path: &Path) -> Result<File, PlanError> {
     let metadata = fs::symlink_metadata(path).map_err(|err| {
         PlanError::TypeMismatch(format!(
             "{function_name} cannot inspect {}: {err}",

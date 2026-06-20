@@ -297,7 +297,9 @@ pub(crate) fn parse_time_and_optional_offset(text: &str) -> Option<(i64, Option<
     Some((micros, offset))
 }
 
-pub(crate) fn split_time_and_optional_zone(text: &str) -> Option<(Option<&str>, &str, Option<&str>)> {
+pub(crate) fn split_time_and_optional_zone(
+    text: &str,
+) -> Option<(Option<&str>, &str, Option<&str>)> {
     let trimmed = text.trim();
     if trimmed.is_empty() {
         return None;
@@ -567,4 +569,3 @@ pub(crate) fn civil_from_days(days_since_2000_01_01: i32) -> Option<(i32, u32, u
         u32::try_from(day).ok()?,
     ))
 }
-

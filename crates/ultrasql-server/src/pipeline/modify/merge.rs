@@ -10,7 +10,9 @@ use ultrasql_executor::{
     ModifyTable, ModifyTableStamps, Operator, ValuesScan, batch_to_rows, build_batch,
     eval_error_to_exec_error,
 };
-use ultrasql_planner::{LogicalMergeAction, LogicalMergeClause, LogicalMergeMatchKind, LogicalPlan, ScalarExpr};
+use ultrasql_planner::{
+    LogicalMergeAction, LogicalMergeClause, LogicalMergeMatchKind, LogicalPlan, ScalarExpr,
+};
 
 use crate::error::ServerError;
 use crate::pipeline::LowerCtx;
@@ -20,7 +22,9 @@ use super::constraints::{
     build_exclusion_insert_checks, build_exclusion_update_checks, build_foreign_key_checks,
     build_referenced_by_delete_checks,
 };
-use super::indexes::{build_insert_index_maintainers, build_tid_seq_scan, build_vector_index_maintainers};
+use super::indexes::{
+    build_insert_index_maintainers, build_tid_seq_scan, build_vector_index_maintainers,
+};
 use super::insert::{build_rls_insert_checks, build_rls_update_checks, build_sequence_defaults};
 use super::referential::build_referenced_by_update_checks;
 

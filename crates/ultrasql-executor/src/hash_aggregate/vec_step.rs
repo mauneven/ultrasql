@@ -281,7 +281,11 @@ fn sum_f32_nullable_widened(c: &NumericColumn<f32>) -> (f64, bool) {
 /// Update a running MIN/MAX accumulator from a column. `take_min = true`
 /// for MIN; `false` for MAX. NULLs are skipped.
 #[allow(clippy::option_if_let_else)]
-pub(crate) fn update_extremum(acc: &mut Option<Value>, col: &Column, take_min: bool) -> Result<(), ExecError> {
+pub(crate) fn update_extremum(
+    acc: &mut Option<Value>,
+    col: &Column,
+    take_min: bool,
+) -> Result<(), ExecError> {
     let candidate = match col {
         Column::Int64(c) => {
             if take_min {

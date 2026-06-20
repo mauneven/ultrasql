@@ -271,4 +271,3 @@ pub(super) fn rows_pg_publication_tables(ctx: &LowerCtx<'_>) -> Vec<Vec<Value>> 
         })
         .collect()
 }
-

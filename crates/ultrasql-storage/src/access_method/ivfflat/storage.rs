@@ -137,7 +137,11 @@ impl PageBackedIvfFlatStorage {
         Ok(removed)
     }
 
-    pub(crate) fn sync_pages(&mut self, ctx: IvfFlatPageContext, lsn: Lsn) -> Result<(), AccessMethodError> {
+    pub(crate) fn sync_pages(
+        &mut self,
+        ctx: IvfFlatPageContext,
+        lsn: Lsn,
+    ) -> Result<(), AccessMethodError> {
         self.pages.clear();
         let live_entries = self.entries.iter().filter(|entry| !entry.deleted).count();
         let tombstones = self.entries.iter().filter(|entry| entry.deleted).count();

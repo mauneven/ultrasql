@@ -135,7 +135,11 @@ pub(crate) fn parse_password_hash(
     }))
 }
 
-pub(crate) fn decode_hash_key(raw: &str, line_no: usize, field: &str) -> Result<[u8; 32], ServerError> {
+pub(crate) fn decode_hash_key(
+    raw: &str,
+    line_no: usize,
+    field: &str,
+) -> Result<[u8; 32], ServerError> {
     let bytes = B64.decode(raw).map_err(|err| {
         ServerError::ddl(format!(
             "role metadata line {} bad password {field}: {err}",
@@ -160,7 +164,11 @@ pub(crate) fn parse_role_bool(raw: &str, line_no: usize, field: &str) -> Result<
     })
 }
 
-pub(crate) fn validate_role_metadata_name(name: &str, line_no: usize, field: &str) -> Result<(), ServerError> {
+pub(crate) fn validate_role_metadata_name(
+    name: &str,
+    line_no: usize,
+    field: &str,
+) -> Result<(), ServerError> {
     if !name.trim().is_empty() {
         return Ok(());
     }
@@ -264,7 +272,10 @@ pub(crate) fn privilege_kind_name(kind: auth::PrivilegeKind) -> &'static str {
     }
 }
 
-pub(crate) fn parse_privilege_kind(raw: &str, line_no: usize) -> Result<auth::PrivilegeKind, ServerError> {
+pub(crate) fn parse_privilege_kind(
+    raw: &str,
+    line_no: usize,
+) -> Result<auth::PrivilegeKind, ServerError> {
     match raw {
         "select" => Ok(auth::PrivilegeKind::Select),
         "insert" => Ok(auth::PrivilegeKind::Insert),
@@ -371,7 +382,9 @@ pub(crate) fn rls_permissiveness_name(value: RuntimeRlsPermissiveness) -> &'stat
     }
 }
 
-pub(crate) fn parse_rls_permissiveness(value: &str) -> Result<RuntimeRlsPermissiveness, ServerError> {
+pub(crate) fn parse_rls_permissiveness(
+    value: &str,
+) -> Result<RuntimeRlsPermissiveness, ServerError> {
     match value {
         "permissive" => Ok(RuntimeRlsPermissiveness::Permissive),
         "restrictive" => Ok(RuntimeRlsPermissiveness::Restrictive),

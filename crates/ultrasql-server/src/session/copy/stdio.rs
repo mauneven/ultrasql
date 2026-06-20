@@ -22,8 +22,8 @@ use super::decode::{decode_one_copy_row, value_to_copy_cell_with_options};
 use super::fs_io::{check_copy_stdin_within_limit, copy_binary_file_limit_bytes, copy_format_code};
 use super::{
     COPY_INSERT_BATCH_ROWS, CopyOptions, CopyRowDecodeContext, ServerCopyFormat, ServerError,
-    add_copy_batch_rows, copy_in_response_with_format, copy_out_response_with_format, copy_rows_from_usize,
-    copy_table_key, encode_csv_row, encode_text_row, increment_copy_rows,
+    add_copy_batch_rows, copy_in_response_with_format, copy_out_response_with_format,
+    copy_rows_from_usize, copy_table_key, encode_csv_row, encode_text_row, increment_copy_rows,
 };
 
 impl<RW> Session<RW>

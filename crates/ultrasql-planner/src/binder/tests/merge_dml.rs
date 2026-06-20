@@ -5,9 +5,7 @@ use ultrasql_core::DataType;
 
 use super::*;
 use crate::plan::{LogicalMergeAction, LogicalMergeMatchKind};
-use crate::{
-    LogicalPrivilegeKind, LogicalPrivilegeObjectKind,
-};
+use crate::{LogicalPrivilegeKind, LogicalPrivilegeObjectKind};
 
 #[test]
 fn binds_merge_update_delete_insert_clauses() {

@@ -167,7 +167,6 @@ pub(crate) fn select_neighbors_heuristic<Id: Copy>(
     result
 }
 
-
 pub(crate) fn decode_vector_key(
     key: &[u8],
     dims: usize,
@@ -198,7 +197,10 @@ pub(crate) fn decode_vector_key(
     Ok(vector)
 }
 
-pub(crate) fn compare_hnsw_hits(left: &HnswSearchResult, right: &HnswSearchResult) -> std::cmp::Ordering {
+pub(crate) fn compare_hnsw_hits(
+    left: &HnswSearchResult,
+    right: &HnswSearchResult,
+) -> std::cmp::Ordering {
     left.distance
         .total_cmp(&right.distance)
         .then_with(|| left.tid.cmp(&right.tid))

@@ -11,9 +11,10 @@ use ultrasql_bench::registry::HostInfo;
 use super::types::{
     Args, HYBRID_SEARCH_REQUIRED_METRICS, HybridSearchCertification,
     LATE_MATERIALIZATION_ANSWER_METRICS, LATE_MATERIALIZATION_REQUIRED_METRICS,
-    OBJECT_PARQUET_RANGE_REQUIRED_METRICS, ObjectParquetRangeMetrics, PARQUET_SMOKE_REQUIRED_METRICS,
-    PARQUET_SMOKE_ROW_GROUP_ROWS, ParquetSmokeMetrics, RAG_RETRIEVAL_REQUIRED_METRICS,
-    RagRetrievalCertification, VECTOR_CERTIFICATION_METRICS, VectorTopKCertification, Workload,
+    OBJECT_PARQUET_RANGE_REQUIRED_METRICS, ObjectParquetRangeMetrics,
+    PARQUET_SMOKE_REQUIRED_METRICS, PARQUET_SMOKE_ROW_GROUP_ROWS, ParquetSmokeMetrics,
+    RAG_RETRIEVAL_REQUIRED_METRICS, RagRetrievalCertification, VECTOR_CERTIFICATION_METRICS,
+    VectorTopKCertification, Workload,
 };
 use super::util::{answer_sha256, median_sorted, percentile_nearest_rank, promote_answer_metrics};
 

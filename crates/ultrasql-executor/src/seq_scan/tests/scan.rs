@@ -9,9 +9,7 @@ use ultrasql_mvcc::Snapshot;
 use ultrasql_mvcc::status::test_support::MapOracle;
 use ultrasql_vec::column::Column;
 
-use super::{
-    drain_rows, insert_opts, make_heap, rel, schema_i32_only, schema_i32_text, snap_for,
-};
+use super::{drain_rows, insert_opts, make_heap, rel, schema_i32_only, schema_i32_text, snap_for};
 use crate::row_codec::RowCodec;
 use crate::seq_scan::SeqScan;
 use crate::{ExecError, Operator};

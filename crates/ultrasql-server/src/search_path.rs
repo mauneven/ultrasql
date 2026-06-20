@@ -166,7 +166,9 @@ pub(crate) fn local_output_from_select_result(
     })
 }
 
-pub(crate) fn local_result_messages(result: SelectResult) -> Result<Vec<BackendMessage>, ServerError> {
+pub(crate) fn local_result_messages(
+    result: SelectResult,
+) -> Result<Vec<BackendMessage>, ServerError> {
     if let Some(body) = result.streamed_body {
         return decode_local_result_body(body);
     }
@@ -176,7 +178,9 @@ pub(crate) fn local_result_messages(result: SelectResult) -> Result<Vec<BackendM
     Ok(result.messages)
 }
 
-pub(crate) fn decode_local_result_body(mut body: bytes::BytesMut) -> Result<Vec<BackendMessage>, ServerError> {
+pub(crate) fn decode_local_result_body(
+    mut body: bytes::BytesMut,
+) -> Result<Vec<BackendMessage>, ServerError> {
     let mut messages = Vec::new();
     while !body.is_empty() {
         match ultrasql_protocol::decode_backend(&mut body)? {

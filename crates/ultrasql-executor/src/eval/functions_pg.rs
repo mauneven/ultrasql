@@ -470,4 +470,3 @@ pub(crate) fn eval_pg_get_serial_sequence(args: &[Value]) -> Result<Value, EvalE
     }
     Ok(Value::Null)
 }
-

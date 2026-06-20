@@ -4,9 +4,7 @@
 //! into the [`exists_in`], [`scalar`], and [`legacy`] child modules.
 
 use ultrasql_core::{DataType, Field, Schema, Value};
-use ultrasql_planner::{
-    AggregateFunc, BinaryOp, LogicalAggregateExpr, LogicalPlan, ScalarExpr,
-};
+use ultrasql_planner::{AggregateFunc, BinaryOp, LogicalAggregateExpr, LogicalPlan, ScalarExpr};
 
 use super::*;
 use crate::rules::RewriteRule;
@@ -94,8 +92,7 @@ pub(super) fn correlated_scalar_agg_subplan(
             data_type: DataType::Bool,
         },
     };
-    let agg_schema =
-        Schema::new([Field::nullable(out_name, out_type.clone())]).expect("schema ok");
+    let agg_schema = Schema::new([Field::nullable(out_name, out_type.clone())]).expect("schema ok");
     let aggregate = LogicalPlan::Aggregate {
         input: Box::new(sub_filter),
         group_by: Vec::new(),

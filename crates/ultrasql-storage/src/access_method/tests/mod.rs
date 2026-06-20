@@ -2,16 +2,16 @@
 
 use ultrasql_core::{BlockNumber, PageId, RelationId, TupleId};
 
-use super::*;
 use super::hnsw_page::{
     HNSW_PAGE_KIND_NODE, HNSW_SNAPSHOT_VERSION, HnswLevelNeighbors, HnswNodePage,
     HnswPersistentPage, SnapshotCursor, decode_hnsw_page_record, encode_hnsw_page_record, push_len,
     push_opt_block, push_tuple_id,
 };
 use super::ivfflat::{nearest_vector, nearest_vectors};
+use super::*;
 
-mod btree;
 mod brin;
+mod btree;
 mod gin;
 mod gist;
 mod hash;

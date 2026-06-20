@@ -17,8 +17,7 @@ fn vectorized_sum_i64_matches_scalar() {
     // typed-error test below.
     let values: Vec<i64> = (0..n).map(|i| (i % 257) - 128).collect();
     let (schema, batch) = make_i64_batch(values.clone(), None);
-    let out_schema =
-        Schema::new([Field::nullable("total", DataType::Int64)]).expect("schema ok");
+    let out_schema = Schema::new([Field::nullable("total", DataType::Int64)]).expect("schema ok");
 
     let sum_val = LogicalAggregateExpr {
         func: AggregateFunc::Sum,
@@ -61,8 +60,7 @@ fn vectorized_sum_i64_matches_scalar() {
 #[test]
 fn hash_aggregate_vectorized_sum_i64_overflow_returns_typed_error() {
     let (schema, batch) = make_i64_batch(vec![i64::MAX, 1], None);
-    let out_schema =
-        Schema::new([Field::nullable("total", DataType::Int64)]).expect("schema ok");
+    let out_schema = Schema::new([Field::nullable("total", DataType::Int64)]).expect("schema ok");
     let sum_val = LogicalAggregateExpr {
         func: AggregateFunc::Sum,
         arg: Some(col("val", 0, DataType::Int64)),
@@ -88,8 +86,7 @@ fn hash_aggregate_vectorized_sum_i64_overflow_returns_typed_error() {
 #[test]
 fn hash_aggregate_scalar_sum_i64_overflow_returns_typed_error() {
     let (schema, batch) = make_i64_batch(vec![i64::MAX, 1], None);
-    let out_schema =
-        Schema::new([Field::nullable("total", DataType::Int64)]).expect("schema ok");
+    let out_schema = Schema::new([Field::nullable("total", DataType::Int64)]).expect("schema ok");
     let sum_val = LogicalAggregateExpr {
         func: AggregateFunc::Sum,
         arg: Some(col("val", 0, DataType::Int64)),
@@ -116,8 +113,8 @@ fn hash_aggregate_scalar_sum_i64_overflow_returns_typed_error() {
 #[test]
 fn scalar_count_states_reject_i64_overflow() {
     let mut count_star = AggState::CountStar(i64::MAX);
-    let err = accumulate_value(&mut count_star, None)
-        .expect_err("COUNT(*) overflow must not saturate");
+    let err =
+        accumulate_value(&mut count_star, None).expect_err("COUNT(*) overflow must not saturate");
     assert!(matches!(err, crate::ExecError::NumericFieldOverflow(_)));
 
     let mut count = AggState::Count(i64::MAX);
@@ -162,8 +159,7 @@ fn vectorized_sum_i64_honours_nulls() {
     let values: Vec<i64> = (0..i64::try_from(n).expect("n fits i64")).collect();
     let nulls_pat: Vec<bool> = (0..n).map(|i| !i.is_multiple_of(17)).collect();
     let (schema, batch) = make_i64_batch(values.clone(), Some(nulls_pat.clone()));
-    let out_schema =
-        Schema::new([Field::nullable("total", DataType::Int64)]).expect("schema ok");
+    let out_schema = Schema::new([Field::nullable("total", DataType::Int64)]).expect("schema ok");
 
     let sum_val = LogicalAggregateExpr {
         func: AggregateFunc::Sum,
@@ -213,8 +209,7 @@ fn vectorized_avg_i32_matches_scalar() {
     let values: Vec<i32> = (0_i32..4096).map(|i| i - 2048).collect();
 
     let (schema, batch) = make_i32_batch(values, None);
-    let out_schema =
-        Schema::new([Field::nullable("avg_v", DataType::Float64)]).expect("schema ok");
+    let out_schema = Schema::new([Field::nullable("avg_v", DataType::Float64)]).expect("schema ok");
 
     let avg_v = LogicalAggregateExpr {
         func: AggregateFunc::Avg,
@@ -277,8 +272,8 @@ fn scalar_avg_vector_skips_nulls_and_returns_dense_vector() {
         .expect("string column ok"),
     )])
     .expect("batch ok");
-    let out_schema = Schema::new([Field::nullable("avg_embedding", vector_type.clone())])
-        .expect("schema ok");
+    let out_schema =
+        Schema::new([Field::nullable("avg_embedding", vector_type.clone())]).expect("schema ok");
     let avg_embedding = LogicalAggregateExpr {
         func: AggregateFunc::Avg,
         arg: Some(col("embedding", 0, vector_type.clone())),
@@ -305,8 +300,8 @@ fn scalar_avg_vector_dimension_mismatch_errors() {
         ["[1,2]", "[1,2,3]"].map(str::to_owned),
     ))])
     .expect("batch ok");
-    let out_schema = Schema::new([Field::nullable("avg_embedding", vector_type.clone())])
-        .expect("schema ok");
+    let out_schema =
+        Schema::new([Field::nullable("avg_embedding", vector_type.clone())]).expect("schema ok");
     let avg_embedding = LogicalAggregateExpr {
         func: AggregateFunc::Avg,
         arg: Some(col("embedding", 0, vector_type.clone())),
@@ -439,9 +434,7 @@ fn grouped_vectorized_i64_and_null_keys_are_finalized_correctly() {
     let mut key_validity = Bitmap::new(3, true);
     key_validity.set(1, false);
     let batch = Batch::new([
-        Column::Int64(
-            NumericColumn::with_nulls(vec![10_i64, 99, 10], key_validity).expect("keys"),
-        ),
+        Column::Int64(NumericColumn::with_nulls(vec![10_i64, 99, 10], key_validity).expect("keys")),
         Column::Int64(NumericColumn::from_data(vec![1_i64, 2, 3])),
     ])
     .expect("batch ok");

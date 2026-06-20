@@ -26,7 +26,10 @@ pub(crate) fn eval_json_build_object(args: &[Value]) -> Result<Value, EvalError>
         .map_err(|err| EvalError::Type(format!("json_build_object: encode failed: {err}")))
 }
 
-pub(crate) fn eval_row_constructor(args: &[Value], return_type: &DataType) -> Result<Value, EvalError> {
+pub(crate) fn eval_row_constructor(
+    args: &[Value],
+    return_type: &DataType,
+) -> Result<Value, EvalError> {
     let field_names = match return_type {
         DataType::Record(fields) if fields.len() == args.len() => fields
             .iter()
@@ -139,7 +142,10 @@ pub(crate) enum XmlWellFormedMode {
     Document,
 }
 
-pub(crate) fn eval_xml_is_well_formed(args: &[Value], mode: XmlWellFormedMode) -> Result<Value, EvalError> {
+pub(crate) fn eval_xml_is_well_formed(
+    args: &[Value],
+    mode: XmlWellFormedMode,
+) -> Result<Value, EvalError> {
     if args.len() != 1 {
         return Err(EvalError::Type(format!(
             "xml_is_well_formed: expected 1 arg, got {}",
@@ -325,7 +331,10 @@ pub(crate) fn xpath_namespace_arg(
         .collect()
 }
 
-pub(crate) fn xml_namespace_text<'a>(function: &str, value: &'a Value) -> Result<Option<&'a str>, EvalError> {
+pub(crate) fn xml_namespace_text<'a>(
+    function: &str,
+    value: &'a Value,
+) -> Result<Option<&'a str>, EvalError> {
     match value {
         Value::Text(text) => Ok(Some(text.as_str())),
         Value::Null => Ok(None),
@@ -527,7 +536,10 @@ pub(crate) fn set_json_leaf(
     }
 }
 
-pub(crate) fn json_value_to_jsonb(value: JsonValue, function: &'static str) -> Result<Value, EvalError> {
+pub(crate) fn json_value_to_jsonb(
+    value: JsonValue,
+    function: &'static str,
+) -> Result<Value, EvalError> {
     serde_json::to_string(&value)
         .map(Value::Jsonb)
         .map_err(|err| EvalError::Type(format!("{function}: encode failed: {err}")))
@@ -621,4 +633,3 @@ pub(crate) fn is_reserved_identifier(identifier: &str) -> bool {
 pub(crate) fn quote_literal(value: &str) -> String {
     format!("'{}'", value.replace('\'', "''"))
 }
-

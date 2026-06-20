@@ -107,12 +107,8 @@ fn build_batch_covers_sql_storage_families_and_null_bitmaps() {
         Value::Text("xy".into()),
         Value::BitString(BitString::parse("1010").expect("bit")),
         Value::BitString(BitString::parse("101011").expect("varbit")),
-        Value::Network(
-            NetworkValue::parse_for_type(&DataType::Inet, "127.0.0.1").expect("inet"),
-        ),
-        Value::Network(
-            NetworkValue::parse_for_type(&DataType::Cidr, "10.0.0.0/24").expect("cidr"),
-        ),
+        Value::Network(NetworkValue::parse_for_type(&DataType::Inet, "127.0.0.1").expect("inet")),
+        Value::Network(NetworkValue::parse_for_type(&DataType::Cidr, "10.0.0.0/24").expect("cidr")),
         Value::Network(
             NetworkValue::parse_for_type(&DataType::MacAddr, "08:00:2b:01:02:03").expect("mac"),
         ),

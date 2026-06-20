@@ -4,7 +4,7 @@
 use ultrasql_core::{CommandId, Xid};
 
 use super::{make_heap_with_sink, rel};
-use crate::heap::{InsertOptions, DeleteOptions, UpdateOptions};
+use crate::heap::{DeleteOptions, InsertOptions, UpdateOptions};
 
 // -------------------------------------------------------------------
 // LSN stamping tests (Deliverable B)

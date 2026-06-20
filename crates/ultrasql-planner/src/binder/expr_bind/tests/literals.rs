@@ -3,306 +3,305 @@
 
 use super::*;
 
-    #[test]
-    fn one_day_after_epoch() {
-        assert_eq!(parse_date_literal("2000-01-02"), Some(1));
-    }
+#[test]
+fn one_day_after_epoch() {
+    assert_eq!(parse_date_literal("2000-01-02"), Some(1));
+}
 
-    #[test]
-    fn pre_epoch_six_years_back() {
-        // 1994-01-01: six 365-day years back plus one leap (1996),
-        // so 6*365 + 1 = 2191 days before the epoch.
-        assert_eq!(parse_date_literal("1994-01-01"), Some(-2191));
-    }
+#[test]
+fn pre_epoch_six_years_back() {
+    // 1994-01-01: six 365-day years back plus one leap (1996),
+    // so 6*365 + 1 = 2191 days before the epoch.
+    assert_eq!(parse_date_literal("1994-01-01"), Some(-2191));
+}
 
-    #[test]
-    fn one_year_forward_is_365_or_366() {
-        let y2000 = parse_date_literal("2000-01-01").unwrap();
-        let y2001 = parse_date_literal("2001-01-01").unwrap();
-        assert_eq!(y2001 - y2000, 366, "2000 was a leap year");
-        let y2002 = parse_date_literal("2002-01-01").unwrap();
-        assert_eq!(y2002 - y2001, 365);
-    }
+#[test]
+fn one_year_forward_is_365_or_366() {
+    let y2000 = parse_date_literal("2000-01-01").unwrap();
+    let y2001 = parse_date_literal("2001-01-01").unwrap();
+    assert_eq!(y2001 - y2000, 366, "2000 was a leap year");
+    let y2002 = parse_date_literal("2002-01-01").unwrap();
+    assert_eq!(y2002 - y2001, 365);
+}
 
-    #[test]
-    fn rejects_malformed() {
-        assert!(parse_date_literal("not-a-date").is_none());
-        assert!(parse_date_literal("2000/01/01").is_none());
-        assert!(parse_date_literal("2000-13-01").is_none());
-        assert!(parse_date_literal("2000-01-32").is_none());
-        assert!(parse_date_literal("2000-02-30").is_none());
-    }
+#[test]
+fn rejects_malformed() {
+    assert!(parse_date_literal("not-a-date").is_none());
+    assert!(parse_date_literal("2000/01/01").is_none());
+    assert!(parse_date_literal("2000-13-01").is_none());
+    assert!(parse_date_literal("2000-01-32").is_none());
+    assert!(parse_date_literal("2000-02-30").is_none());
+}
 
-    #[test]
-    fn timestamp_literal_parses_microseconds_since_epoch() {
-        assert_eq!(parse_timestamp_literal("2000-01-01 00:00:00"), Some(0));
-        assert_eq!(
-            parse_timestamp_literal("2000-01-02 00:00:00"),
-            Some(86_400_000_000)
-        );
-        assert_eq!(
-            parse_timestamp_literal("2000-01-01 01:02:03.456789"),
-            Some(3_723_456_789)
-        );
-        assert_eq!(
-            parse_timestamp_literal("2000-01-01 01:02:03.456789-08"),
-            Some(3_723_456_789),
-            "timestamp without time zone ignores input offset"
-        );
-    }
+#[test]
+fn timestamp_literal_parses_microseconds_since_epoch() {
+    assert_eq!(parse_timestamp_literal("2000-01-01 00:00:00"), Some(0));
+    assert_eq!(
+        parse_timestamp_literal("2000-01-02 00:00:00"),
+        Some(86_400_000_000)
+    );
+    assert_eq!(
+        parse_timestamp_literal("2000-01-01 01:02:03.456789"),
+        Some(3_723_456_789)
+    );
+    assert_eq!(
+        parse_timestamp_literal("2000-01-01 01:02:03.456789-08"),
+        Some(3_723_456_789),
+        "timestamp without time zone ignores input offset"
+    );
+}
 
-    #[test]
-    fn time_and_timetz_literals_parse_postgres_shapes() {
-        assert_eq!(
-            parse_time_of_day_micros("01:02:03.456789-08"),
-            Some(3_723_456_789)
-        );
-        assert_eq!(
-            parse_timetz_literal("04:05:06.789-08:00"),
-            Some((14_706_789_000, -28_800))
-        );
-        assert_eq!(
-            parse_timetz_literal("04:05:06.789 EST"),
-            Some((14_706_789_000, -18_000))
-        );
-        assert_eq!(
-            parse_timetz_literal("2000-07-01 04:05:06.789 America/New_York"),
-            Some((14_706_789_000, -14_400))
-        );
-        assert_eq!(
-            parse_timestamptz_literal("2000-01-02 03:04:05 EST"),
-            Some(115_445_000_000)
-        );
-        assert_eq!(
-            parse_timestamptz_literal("2000-07-01 00:00:00 America/New_York"),
-            parse_timestamp_literal("2000-07-01 04:00:00")
-        );
-    }
+#[test]
+fn time_and_timetz_literals_parse_postgres_shapes() {
+    assert_eq!(
+        parse_time_of_day_micros("01:02:03.456789-08"),
+        Some(3_723_456_789)
+    );
+    assert_eq!(
+        parse_timetz_literal("04:05:06.789-08:00"),
+        Some((14_706_789_000, -28_800))
+    );
+    assert_eq!(
+        parse_timetz_literal("04:05:06.789 EST"),
+        Some((14_706_789_000, -18_000))
+    );
+    assert_eq!(
+        parse_timetz_literal("2000-07-01 04:05:06.789 America/New_York"),
+        Some((14_706_789_000, -14_400))
+    );
+    assert_eq!(
+        parse_timestamptz_literal("2000-01-02 03:04:05 EST"),
+        Some(115_445_000_000)
+    );
+    assert_eq!(
+        parse_timestamptz_literal("2000-07-01 00:00:00 America/New_York"),
+        parse_timestamp_literal("2000-07-01 04:00:00")
+    );
+}
 
-    #[test]
-    fn algorithm_handles_leap_year_february() {
-        let feb29 = days_since_epoch(2000, 2, 29).expect("valid leap day");
-        let mar01 = days_since_epoch(2000, 3, 1).expect("valid March day");
-        assert_eq!(mar01 - feb29, 1, "2000-02-29 → 2000-03-01 is one day");
-    }
+#[test]
+fn algorithm_handles_leap_year_february() {
+    let feb29 = days_since_epoch(2000, 2, 29).expect("valid leap day");
+    let mar01 = days_since_epoch(2000, 3, 1).expect("valid March day");
+    assert_eq!(mar01 - feb29, 1, "2000-02-29 → 2000-03-01 is one day");
+}
 
-    #[test]
-    fn parses_interval_year_unit_into_months() {
-        assert_eq!(parse_interval_literal("1", Some("year")), Some((12, 0, 0)));
-        assert_eq!(parse_interval_literal("3", Some("month")), Some((3, 0, 0)));
-        assert_eq!(parse_interval_literal("90", Some("day")), Some((0, 90, 0)));
-    }
+#[test]
+fn parses_interval_year_unit_into_months() {
+    assert_eq!(parse_interval_literal("1", Some("year")), Some((12, 0, 0)));
+    assert_eq!(parse_interval_literal("3", Some("month")), Some((3, 0, 0)));
+    assert_eq!(parse_interval_literal("90", Some("day")), Some((0, 90, 0)));
+}
 
-    #[test]
-    fn decimal_coercion_honors_target_scale() {
-        let mut expr = ScalarExpr::Literal {
-            value: Value::Float64(0.0001),
-            data_type: DataType::Float64,
-        };
-        coerce_literal_to_type(
-            &mut expr,
-            &DataType::Decimal {
-                precision: Some(15),
-                scale: Some(2),
-            },
-        );
-        let ScalarExpr::Literal { value, data_type } = expr else {
-            panic!("expected literal");
-        };
-        assert_eq!(value, Value::Decimal { value: 0, scale: 2 });
-        assert_eq!(
-            data_type,
-            DataType::Decimal {
-                precision: Some(15),
-                scale: Some(2)
-            }
-        );
-    }
+#[test]
+fn decimal_coercion_honors_target_scale() {
+    let mut expr = ScalarExpr::Literal {
+        value: Value::Float64(0.0001),
+        data_type: DataType::Float64,
+    };
+    coerce_literal_to_type(
+        &mut expr,
+        &DataType::Decimal {
+            precision: Some(15),
+            scale: Some(2),
+        },
+    );
+    let ScalarExpr::Literal { value, data_type } = expr else {
+        panic!("expected literal");
+    };
+    assert_eq!(value, Value::Decimal { value: 0, scale: 2 });
+    assert_eq!(
+        data_type,
+        DataType::Decimal {
+            precision: Some(15),
+            scale: Some(2)
+        }
+    );
+}
 
-    #[test]
-    fn dotted_numeric_literal_binds_as_exact_decimal() {
-        let expr = bind_literal(&Literal::Float {
-            text: "0.0001".to_owned(),
-            span: Span::default(),
-        });
-        let ScalarExpr::Literal { value, data_type } = expr else {
-            panic!("expected literal");
-        };
-        assert_eq!(value, Value::Decimal { value: 1, scale: 4 });
-        assert_eq!(
-            data_type,
-            DataType::Decimal {
-                precision: None,
-                scale: Some(4)
-            }
-        );
-    }
+#[test]
+fn dotted_numeric_literal_binds_as_exact_decimal() {
+    let expr = bind_literal(&Literal::Float {
+        text: "0.0001".to_owned(),
+        span: Span::default(),
+    });
+    let ScalarExpr::Literal { value, data_type } = expr else {
+        panic!("expected literal");
+    };
+    assert_eq!(value, Value::Decimal { value: 1, scale: 4 });
+    assert_eq!(
+        data_type,
+        DataType::Decimal {
+            precision: None,
+            scale: Some(4)
+        }
+    );
+}
 
-    #[test]
-    fn decimal_literal_arithmetic_is_not_folded_through_float() {
-        let left = ScalarExpr::Literal {
-            value: Value::Decimal { value: 6, scale: 2 },
-            data_type: DataType::Decimal {
-                precision: None,
-                scale: Some(2),
-            },
-        };
-        let right = ScalarExpr::Literal {
-            value: Value::Decimal { value: 1, scale: 2 },
-            data_type: DataType::Decimal {
-                precision: None,
-                scale: Some(2),
-            },
-        };
-        let folded = try_fold_literal_binary(BinaryOp::Sub, &left, &right)
-            .expect("fold attempt should not error");
-        assert!(folded.is_none(), "decimal arithmetic must stay exact");
-    }
+#[test]
+fn decimal_literal_arithmetic_is_not_folded_through_float() {
+    let left = ScalarExpr::Literal {
+        value: Value::Decimal { value: 6, scale: 2 },
+        data_type: DataType::Decimal {
+            precision: None,
+            scale: Some(2),
+        },
+    };
+    let right = ScalarExpr::Literal {
+        value: Value::Decimal { value: 1, scale: 2 },
+        data_type: DataType::Decimal {
+            precision: None,
+            scale: Some(2),
+        },
+    };
+    let folded = try_fold_literal_binary(BinaryOp::Sub, &left, &right)
+        .expect("fold attempt should not error");
+    assert!(folded.is_none(), "decimal arithmetic must stay exact");
+}
 
-    #[test]
-    fn decimal_literal_coerces_to_float64_target() {
-        let mut expr = bind_literal(&Literal::Float {
-            text: "1.5".to_owned(),
-            span: Span::default(),
-        });
-        coerce_literal_to_type(&mut expr, &DataType::Float64);
-        let ScalarExpr::Literal { value, data_type } = expr else {
-            panic!("expected literal");
-        };
-        assert_eq!(data_type, DataType::Float64);
-        let Value::Float64(v) = value else {
-            panic!("expected float64");
-        };
-        assert!((v - 1.5).abs() < f64::EPSILON);
-    }
+#[test]
+fn decimal_literal_coerces_to_float64_target() {
+    let mut expr = bind_literal(&Literal::Float {
+        text: "1.5".to_owned(),
+        span: Span::default(),
+    });
+    coerce_literal_to_type(&mut expr, &DataType::Float64);
+    let ScalarExpr::Literal { value, data_type } = expr else {
+        panic!("expected literal");
+    };
+    assert_eq!(data_type, DataType::Float64);
+    let Value::Float64(v) = value else {
+        panic!("expected float64");
+    };
+    assert!((v - 1.5).abs() < f64::EPSILON);
+}
 
-    #[test]
-    fn typed_vector_literal_binds_to_vector_value() {
-        let expr = bind_literal(&Literal::Typed {
-            type_name: "vector".to_owned(),
-            value: "[1,2,3]".to_owned(),
-            unit: None,
-            span: Span::default(),
-        });
-        let ScalarExpr::Literal { value, data_type } = expr else {
-            panic!("expected literal");
-        };
-        assert_eq!(value, Value::Vector(vec![1.0, 2.0, 3.0]));
-        assert_eq!(data_type, DataType::Vector { dims: Some(3) });
-    }
+#[test]
+fn typed_vector_literal_binds_to_vector_value() {
+    let expr = bind_literal(&Literal::Typed {
+        type_name: "vector".to_owned(),
+        value: "[1,2,3]".to_owned(),
+        unit: None,
+        span: Span::default(),
+    });
+    let ScalarExpr::Literal { value, data_type } = expr else {
+        panic!("expected literal");
+    };
+    assert_eq!(value, Value::Vector(vec![1.0, 2.0, 3.0]));
+    assert_eq!(data_type, DataType::Vector { dims: Some(3) });
+}
 
-    #[test]
-    fn typed_vector_literal_with_modifier_validates_dimension() {
-        let expr = bind_literal(&Literal::Typed {
-            type_name: "vector(3)".to_owned(),
-            value: "[1,2,3]".to_owned(),
-            unit: None,
-            span: Span::default(),
-        });
-        let ScalarExpr::Literal { value, data_type } = expr else {
-            panic!("expected literal");
-        };
-        assert_eq!(value, Value::Vector(vec![1.0, 2.0, 3.0]));
-        assert_eq!(data_type, DataType::Vector { dims: Some(3) });
-    }
+#[test]
+fn typed_vector_literal_with_modifier_validates_dimension() {
+    let expr = bind_literal(&Literal::Typed {
+        type_name: "vector(3)".to_owned(),
+        value: "[1,2,3]".to_owned(),
+        unit: None,
+        span: Span::default(),
+    });
+    let ScalarExpr::Literal { value, data_type } = expr else {
+        panic!("expected literal");
+    };
+    assert_eq!(value, Value::Vector(vec![1.0, 2.0, 3.0]));
+    assert_eq!(data_type, DataType::Vector { dims: Some(3) });
+}
 
-    #[test]
-    fn typed_vector_literal_rejects_dimension_mismatch() {
-        let expr = bind_literal(&Literal::Typed {
-            type_name: "vector(3)".to_owned(),
-            value: "[1,2]".to_owned(),
-            unit: None,
-            span: Span::default(),
-        });
-        let ScalarExpr::Literal { value, data_type } = expr else {
-            panic!("expected literal");
-        };
-        assert_eq!(value, Value::Null);
-        assert_eq!(data_type, DataType::Vector { dims: Some(3) });
-    }
+#[test]
+fn typed_vector_literal_rejects_dimension_mismatch() {
+    let expr = bind_literal(&Literal::Typed {
+        type_name: "vector(3)".to_owned(),
+        value: "[1,2]".to_owned(),
+        unit: None,
+        span: Span::default(),
+    });
+    let ScalarExpr::Literal { value, data_type } = expr else {
+        panic!("expected literal");
+    };
+    assert_eq!(value, Value::Null);
+    assert_eq!(data_type, DataType::Vector { dims: Some(3) });
+}
 
-    #[test]
-    fn bind_time_and_timetz_literals_from_ast() {
-        let time_expr = bind_literal(&Literal::Typed {
-            type_name: "time".into(),
-            value: "04:05:06-08".into(),
-            unit: None,
-            span: Span::new(0, 0),
-        });
-        let ScalarExpr::Literal { value, data_type } = time_expr else {
-            panic!("expected time literal");
-        };
-        assert_eq!(data_type, DataType::Time);
-        assert_eq!(value, Value::Time(14_706_000_000));
+#[test]
+fn bind_time_and_timetz_literals_from_ast() {
+    let time_expr = bind_literal(&Literal::Typed {
+        type_name: "time".into(),
+        value: "04:05:06-08".into(),
+        unit: None,
+        span: Span::new(0, 0),
+    });
+    let ScalarExpr::Literal { value, data_type } = time_expr else {
+        panic!("expected time literal");
+    };
+    assert_eq!(data_type, DataType::Time);
+    assert_eq!(value, Value::Time(14_706_000_000));
 
-        let timetz_expr = bind_literal(&Literal::Typed {
-            type_name: "time with time zone".into(),
-            value: "04:05:06-08".into(),
-            unit: None,
-            span: Span::new(0, 0),
-        });
-        let ScalarExpr::Literal { value, data_type } = timetz_expr else {
-            panic!("expected timetz literal");
-        };
-        assert_eq!(data_type, DataType::TimeTz);
-        assert_eq!(
-            value,
-            Value::TimeTz {
-                micros: 14_706_000_000,
-                offset_seconds: -28_800,
-            }
-        );
-    }
+    let timetz_expr = bind_literal(&Literal::Typed {
+        type_name: "time with time zone".into(),
+        value: "04:05:06-08".into(),
+        unit: None,
+        span: Span::new(0, 0),
+    });
+    let ScalarExpr::Literal { value, data_type } = timetz_expr else {
+        panic!("expected timetz literal");
+    };
+    assert_eq!(data_type, DataType::TimeTz);
+    assert_eq!(
+        value,
+        Value::TimeTz {
+            micros: 14_706_000_000,
+            offset_seconds: -28_800,
+        }
+    );
+}
 
-    #[test]
-    fn fold_date_interval_keeps_calendar_month_semantics() {
-        let folded =
-            fold_date_interval(days_since_epoch(2000, 1, 31).expect("valid date"), 1, 0, 0)
-                .unwrap();
-        let super::ScalarExpr::Literal { value, data_type } = folded else {
-            panic!("expected folded literal");
-        };
-        assert_eq!(data_type, DataType::Date);
-        assert_eq!(
-            value,
-            Value::Date(days_since_epoch(2000, 2, 29).expect("valid leap day"))
-        );
-    }
+#[test]
+fn fold_date_interval_keeps_calendar_month_semantics() {
+    let folded =
+        fold_date_interval(days_since_epoch(2000, 1, 31).expect("valid date"), 1, 0, 0).unwrap();
+    let super::ScalarExpr::Literal { value, data_type } = folded else {
+        panic!("expected folded literal");
+    };
+    assert_eq!(data_type, DataType::Date);
+    assert_eq!(
+        value,
+        Value::Date(days_since_epoch(2000, 2, 29).expect("valid leap day"))
+    );
+}
 
-    #[test]
-    fn negative_i64_boundary_literal_folds_exactly() {
-        assert_eq!(
-            parse_negative_i64_boundary("9223372036854775808"),
-            Some(i64::MIN)
-        );
-        assert_eq!(
-            parse_negative_i64_boundary("9_223_372_036_854_775_808"),
-            Some(i64::MIN)
-        );
-        assert_eq!(parse_negative_i64_boundary("9223372036854775809"), None);
-    }
+#[test]
+fn negative_i64_boundary_literal_folds_exactly() {
+    assert_eq!(
+        parse_negative_i64_boundary("9223372036854775808"),
+        Some(i64::MIN)
+    );
+    assert_eq!(
+        parse_negative_i64_boundary("9_223_372_036_854_775_808"),
+        Some(i64::MIN)
+    );
+    assert_eq!(parse_negative_i64_boundary("9223372036854775809"), None);
+}
 
-    #[test]
-    fn folds_float_literal_subtraction() {
-        let left = ScalarExpr::Literal {
-            value: Value::Float64(0.06),
-            data_type: DataType::Float64,
-        };
-        let right = ScalarExpr::Literal {
-            value: Value::Float64(0.01),
-            data_type: DataType::Float64,
-        };
+#[test]
+fn folds_float_literal_subtraction() {
+    let left = ScalarExpr::Literal {
+        value: Value::Float64(0.06),
+        data_type: DataType::Float64,
+    };
+    let right = ScalarExpr::Literal {
+        value: Value::Float64(0.01),
+        data_type: DataType::Float64,
+    };
 
-        let folded = try_fold_literal_binary(BinaryOp::Sub, &left, &right)
-            .expect("fold succeeds")
-            .expect("float literals should fold");
-        let ScalarExpr::Literal {
-            value: Value::Float64(value),
-            data_type,
-        } = folded
-        else {
-            panic!("expected float literal");
-        };
-        assert_eq!(data_type, DataType::Float64);
-        assert!((value - 0.05).abs() < 1.0e-12, "expected 0.05, got {value}");
-    }
+    let folded = try_fold_literal_binary(BinaryOp::Sub, &left, &right)
+        .expect("fold succeeds")
+        .expect("float literals should fold");
+    let ScalarExpr::Literal {
+        value: Value::Float64(value),
+        data_type,
+    } = folded
+    else {
+        panic!("expected float literal");
+    };
+    assert_eq!(data_type, DataType::Float64);
+    assert!((value - 0.05).abs() < 1.0e-12, "expected 0.05, got {value}");
+}

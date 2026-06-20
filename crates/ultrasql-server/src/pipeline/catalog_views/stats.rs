@@ -92,7 +92,12 @@ pub(super) fn rows_pg_locks(ctx: &LowerCtx<'_>) -> Vec<Vec<Value>> {
     rows
 }
 
-pub(super) fn pg_lock_row(tag: LockTag, owner_xid: u64, mode: LockMode, granted: bool) -> Vec<Value> {
+pub(super) fn pg_lock_row(
+    tag: LockTag,
+    owner_xid: u64,
+    mode: LockMode,
+    granted: bool,
+) -> Vec<Value> {
     let pid = advisory_owner_pid(owner_xid)
         .map(Value::Int32)
         .unwrap_or(Value::Null);
@@ -302,7 +307,10 @@ pub(super) fn rows_pg_stat_user_tables(ctx: &LowerCtx<'_>) -> Vec<Vec<Value>> {
         .collect()
 }
 
-pub(super) fn table_tuple_counts(ctx: &LowerCtx<'_>, entry: &ultrasql_catalog::TableEntry) -> (i64, i64) {
+pub(super) fn table_tuple_counts(
+    ctx: &LowerCtx<'_>,
+    entry: &ultrasql_catalog::TableEntry,
+) -> (i64, i64) {
     let rel = ultrasql_core::RelationId(entry.oid);
     let block_count = ctx.heap.block_count(rel).max(entry.n_blocks);
     if block_count == 0 {
@@ -629,4 +637,3 @@ pub(super) fn rows_pg_stat_progress_create_index(ctx: &LowerCtx<'_>) -> Vec<Vec<
         })
         .collect()
 }
-

@@ -169,8 +169,7 @@ fn modify_table_builder_methods_store_runtime_descriptors() {
     let observed = Arc::new(Mutex::new(Vec::new()));
     let observed_clone = Arc::clone(&observed);
     let sequence = Arc::new(
-        ultrasql_storage::sequence::Sequence::new(SequenceOptions::default())
-            .expect("sequence"),
+        ultrasql_storage::sequence::Sequence::new(SequenceOptions::default()).expect("sequence"),
     );
     let sequence_default = super::SequenceDefault::new("users_id_seq", sequence)
         .with_observer(Arc::new(move |name, value| {
@@ -232,8 +231,8 @@ fn modify_table_builder_methods_store_runtime_descriptors() {
 #[test]
 fn not_null_and_row_codec_errors_map_to_sql_errors() {
     let schema = schema_i32_text();
-    let err = check_not_null_violations(&[Value::Int32(1), Value::Null], &schema)
-        .expect_err("not null");
+    let err =
+        check_not_null_violations(&[Value::Int32(1), Value::Null], &schema).expect_err("not null");
     assert!(matches!(err, ExecError::NotNullViolation(ref col) if col == "name"));
     check_not_null_violations(&[Value::Int32(1), Value::Text("ok".to_owned())], &schema)
         .expect("valid row");

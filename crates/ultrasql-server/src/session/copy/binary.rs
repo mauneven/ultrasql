@@ -12,8 +12,8 @@ use ultrasql_core::{
 use ultrasql_executor::RowCodec;
 
 use super::super::jsonb_ingest::{JsonbShapeCache, encode_pg_binary_jsonb, parse_json_text};
-use super::decode::{decode_copy_cell, parse_xml_text};
 use super::ServerError;
+use super::decode::{decode_copy_cell, parse_xml_text};
 
 pub(super) fn append_binary_copy_header(out: &mut Vec<u8>) {
     out.extend_from_slice(b"PGCOPY\n\xff\r\n\0");
@@ -65,7 +65,10 @@ fn append_binary_copy_cell(
     Ok(())
 }
 
-pub(super) fn binary_copy_cell_bytes(value: &Value, dtype: &DataType) -> Result<Vec<u8>, ServerError> {
+pub(super) fn binary_copy_cell_bytes(
+    value: &Value,
+    dtype: &DataType,
+) -> Result<Vec<u8>, ServerError> {
     let bytes = match (dtype, value) {
         (DataType::Bool, Value::Bool(v)) => vec![u8::from(*v)],
         (DataType::Int16, Value::Int16(v)) => v.to_be_bytes().to_vec(),

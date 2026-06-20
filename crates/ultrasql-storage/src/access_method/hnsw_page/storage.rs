@@ -142,7 +142,11 @@ impl PageBackedHnswStorage {
 
     /// Layer-`level` neighbors of a node from the mirror (O(1)). Empty when the
     /// node is absent or not present in that layer.
-    pub(crate) fn mirror_neighbors_at_level(&self, node_id: HnswNodeId, level: usize) -> Vec<HnswNodeId> {
+    pub(crate) fn mirror_neighbors_at_level(
+        &self,
+        node_id: HnswNodeId,
+        level: usize,
+    ) -> Vec<HnswNodeId> {
         self.mirror_node(node_id)
             .map(|node| node.neighbors_at(level).to_vec())
             .unwrap_or_default()

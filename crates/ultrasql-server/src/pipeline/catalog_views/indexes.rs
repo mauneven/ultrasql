@@ -321,7 +321,10 @@ pub(super) fn policy_command_code(command: crate::RuntimeRlsCommand) -> &'static
     }
 }
 
-pub(super) fn policy_role_oids(policy_roles: &[String], role_oids: &HashMap<String, i64>) -> Vec<Value> {
+pub(super) fn policy_role_oids(
+    policy_roles: &[String],
+    role_oids: &HashMap<String, i64>,
+) -> Vec<Value> {
     if policy_roles.is_empty() {
         return vec![Value::Int64(0)];
     }
@@ -345,4 +348,3 @@ pub(super) fn policy_expr_text(expr: Option<&crate::RuntimeTenantPolicyExpr>) ->
         ))
     })
 }
-

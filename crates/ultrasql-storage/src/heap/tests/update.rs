@@ -1,9 +1,9 @@
 //! Deliverable A: HOT-chain updates and in-place int32-pair update tests.
 
 use ultrasql_core::{CommandId, Xid};
+use ultrasql_mvcc::Snapshot;
 use ultrasql_mvcc::status::test_support::MapOracle;
 use ultrasql_mvcc::tuple_header::InfoMask;
-use ultrasql_mvcc::Snapshot;
 
 use super::*;
 
