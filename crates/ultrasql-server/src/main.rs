@@ -187,13 +187,21 @@ fn main() -> std::process::ExitCode {
         }
         if cli.autovacuum_interval_ms > 0 {
             let autovacuum_state = Arc::clone(&state);
-            let interval_ms = cli.autovacuum_interval_ms;
+            let interval = std::time::Duration::from_millis(cli.autovacuum_interval_ms);
             tokio::spawn(async move {
-                let mut ticker =
-                    tokio::time::interval(std::time::Duration::from_millis(interval_ms));
+                // Space cycles by `interval` AFTER each completes (not between
+                // starts), so a slow vacuum never queues a back-to-back run.
                 loop {
-                    ticker.tick().await;
-                    autovacuum_state.run_autovacuum_cycle();
+                    tokio::time::sleep(interval).await;
+                    let server = Arc::clone(&autovacuum_state);
+                    // An autovacuum cycle does blocking heap/buffer/WAL IO; run
+                    // it off the async reactor so it never stalls connection
+                    // handling.
+                    if let Err(e) =
+                        tokio::task::spawn_blocking(move || server.run_autovacuum_cycle()).await
+                    {
+                        error!(target: "ultrasqld", error = %e, "automatic autovacuum task panicked");
+                    }
                 }
             });
         }
