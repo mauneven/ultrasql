@@ -45,6 +45,8 @@ pub use payload::{
     SequenceOpKind, SequenceOpPayload,
 };
 pub use record::{RECORD_HEADER_SIZE, RecordType, WalRecord, WalRecordError, WalRecordHeader};
-pub use recovery::{RecoveryError, RecoveryTarget, recover, recover_with_target};
+pub use recovery::{
+    RecoveryError, RecoveryTarget, recover, recover_with_target, repair_final_segment_tail,
+};
 pub use truncate::{TruncationOutcome, truncate_below};
 pub use writer::{WalWriter, WalWriterConfig, WalWriterError, WalWriterStats};

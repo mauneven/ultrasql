@@ -280,6 +280,107 @@ pub fn recover_with_target(
     Ok(Lsn::new(last_good_pos))
 }
 
+/// Length of the longest prefix of `buf` that ends exactly on a
+/// cleanly-decoded record boundary.
+///
+/// This mirrors the per-segment decode loop in [`recover_with_target`]
+/// as applied to the *final* segment: a torn record at the tail — a
+/// [`WalRecordError::Truncated`], or a [`WalRecordError::CrcMismatch`]
+/// whose record runs to the end of the buffer — is treated as
+/// torn-write residue, and the byte offset of its first byte is
+/// returned. A buffer that decodes cleanly to its end returns its full
+/// length.
+///
+/// Genuine mid-segment corruption — a CRC mismatch on a record that
+/// does *not* reach the end of the buffer, or any other malformed
+/// record — is returned as an error and never reported as a good
+/// prefix, so a repair built on this helper can never silently discard
+/// real data. The semantics are identical to recovery's torn-tail
+/// tolerance so the two agree on exactly where the recoverable stream
+/// ends.
+fn good_prefix_len(buf: &[u8]) -> Result<usize, RecoveryError> {
+    let mut offset = 0;
+    while offset < buf.len() {
+        match WalRecord::decode(&buf[offset..]) {
+            Ok((_record, used)) => {
+                offset = checked_segment_offset(offset, used)?;
+            }
+            Err(WalRecordError::Truncated { .. }) => return Ok(offset),
+            Err(WalRecordError::CrcMismatch { expected, actual }) => {
+                if crc_mismatch_is_at_segment_tail(buf, offset)? {
+                    return Ok(offset);
+                }
+                return Err(RecoveryError::Record(WalRecordError::CrcMismatch {
+                    expected,
+                    actual,
+                }));
+            }
+            Err(other) => return Err(RecoveryError::Record(other)),
+        }
+    }
+    Ok(offset)
+}
+
+/// Trim torn-write residue from the tail of the final WAL segment so a
+/// later restart can recover cleanly.
+///
+/// Recovery tolerates a torn record only at the tail of the *final*
+/// segment (see [`recover`]); a torn record anywhere earlier is fatal
+/// corruption. The writer never reopens a closed segment —
+/// `WalWriter::open` always resumes into a fresh `max + 1` segment — so
+/// without this repair the torn residue stays physically present in the
+/// segment that becomes *non-final* after the next write, and the
+/// following recovery aborts fatally on it. Every committed transaction
+/// is durable on disk, yet the engine refuses to start. Calling this at
+/// writer open, before resuming, removes that residue by setting the
+/// final segment's length to its cleanly-decoded good prefix, so the
+/// segment ends on a record boundary and stays recoverable once it is
+/// no longer final.
+///
+/// Returns `Some(bytes_trimmed)` when a torn tail was removed, or `None`
+/// when the final segment already ends on a record boundary (a clean
+/// shutdown is never altered) or there is nothing to repair (no
+/// segments at or above the manifest floor). Genuine mid-segment
+/// corruption is returned as an error and never truncated, so the
+/// repair cannot mask real data loss.
+///
+/// Trimming only ever removes bytes that recovery already ignores, so it
+/// cannot change any LSN that recovery assigned. The truncation is made
+/// durable — the segment file and its parent directory are fsynced —
+/// before the function returns.
+pub fn repair_final_segment_tail(wal_dir: impl AsRef<Path>) -> Result<Option<u64>, RecoveryError> {
+    let dir = wal_dir.as_ref();
+    // Honor the manifest floor exactly as `recover_with_target` does: a
+    // partial truncation can leave superseded below-floor segments on
+    // disk, and recovery ignores them, so the segment recovery treats as
+    // "final" is the highest-index segment at or above the floor.
+    let floor = crate::manifest::read_floor(dir)?;
+    let segments: Vec<_> = list_segments(dir)?
+        .into_iter()
+        .filter(|(index, _)| *index >= floor.segment_index)
+        .collect();
+    let Some((_index, path)) = segments.last() else {
+        return Ok(None);
+    };
+
+    let buf = read_segment_bytes(path)?;
+    let file_len = u64::try_from(buf.len())
+        .map_err(|_| RecoveryError::Record(WalRecordError::Malformed("segment length overflow")))?;
+    let good = good_prefix_len(&buf)?;
+    let good_len = u64::try_from(good).map_err(|_| {
+        RecoveryError::Record(WalRecordError::Malformed("good-prefix length overflow"))
+    })?;
+    if good_len >= file_len {
+        return Ok(None);
+    }
+
+    let file = open_segment_for_truncate(path)?;
+    file.set_len(good_len)?;
+    file.sync_all()?;
+    sync_parent_dir(path)?;
+    Ok(Some(file_len - good_len))
+}
+
 fn checked_record_end(stream_pos: u64, used: usize) -> Result<u64, RecoveryError> {
     let used_u64 = u64::try_from(used).map_err(|_| {
         RecoveryError::Record(WalRecordError::Malformed("recovery record length overflow"))
@@ -384,6 +485,43 @@ fn open_recovery_segment(path: &Path) -> std::io::Result<File> {
     #[cfg(unix)]
     opts.custom_flags(libc::O_NOFOLLOW);
     opts.open(path)
+}
+
+/// Open an existing segment for the torn-tail repair truncation.
+///
+/// Write access is required for `set_len`. On Unix the open uses
+/// `O_NOFOLLOW` for the same reason the writer does: a hostile actor who
+/// plants a `segment_*` symlink must not be able to redirect the
+/// truncation at a target outside the WAL directory. The file must
+/// already exist; this never creates one.
+fn open_segment_for_truncate(path: &Path) -> std::io::Result<File> {
+    let mut opts = OpenOptions::new();
+    opts.write(true).read(false);
+    #[cfg(unix)]
+    opts.custom_flags(libc::O_NOFOLLOW);
+    opts.open(path)
+}
+
+/// Fsync the directory that holds `path` so a metadata change (here, a
+/// segment truncation) is itself durable.
+#[cfg(unix)]
+fn sync_parent_dir(path: &Path) -> std::io::Result<()> {
+    let Some(parent) = path.parent() else {
+        return Ok(());
+    };
+    let dir = File::open(parent)?;
+    match dir.sync_all() {
+        Ok(()) => Ok(()),
+        // Some filesystems reject fsync on a directory handle; the
+        // truncation is still durable via the file's own `sync_all`.
+        Err(err) if err.kind() == ErrorKind::InvalidInput => Ok(()),
+        Err(err) => Err(err),
+    }
+}
+
+#[cfg(not(unix))]
+fn sync_parent_dir(_path: &Path) -> std::io::Result<()> {
+    Ok(())
 }
 
 #[cfg(test)]
@@ -668,6 +806,170 @@ mod tests {
             matches!(err, RecoveryError::Record(WalRecordError::Truncated { .. })),
             "{err:?}"
         );
+    }
+
+    fn enc_nop(xid: u64, payload: Vec<u8>) -> Vec<u8> {
+        WalRecord::new(RecordType::Nop, Xid::new(xid), Lsn::ZERO, 0, payload)
+            .expect("test WAL record should fit size limits")
+            .encode()
+    }
+
+    #[test]
+    fn good_prefix_len_stops_at_torn_record() {
+        let r0 = enc_nop(1, vec![1, 2, 3, 4]);
+        let r1 = enc_nop(2, vec![5, 6, 7, 8]);
+        let clean = r0.len() + r1.len();
+        let mut buf = r0;
+        buf.extend_from_slice(&r1);
+        let mut partial = enc_nop(3, vec![9, 9, 9, 9]);
+        partial.truncate(RECORD_HEADER_SIZE + 1);
+        buf.extend_from_slice(&partial);
+        assert_eq!(good_prefix_len(&buf).unwrap(), clean);
+    }
+
+    #[test]
+    fn good_prefix_len_is_full_length_for_clean_buffer() {
+        let mut buf = enc_nop(1, Vec::new());
+        buf.extend_from_slice(&enc_nop(2, Vec::new()));
+        assert_eq!(good_prefix_len(&buf).unwrap(), buf.len());
+    }
+
+    #[test]
+    fn good_prefix_len_errors_on_mid_segment_crc_mismatch() {
+        let mut buf = enc_nop(1, Vec::new());
+        let mut corrupt = enc_nop(2, Vec::new());
+        corrupt[RECORD_HEADER_CRC_BYTE_OFFSET_FOR_TEST] ^= 0x01;
+        buf.extend_from_slice(&corrupt);
+        // A record AFTER the corrupt one proves the mismatch is not at the tail.
+        buf.extend_from_slice(&enc_nop(3, Vec::new()));
+        assert!(
+            matches!(
+                good_prefix_len(&buf),
+                Err(RecoveryError::Record(WalRecordError::CrcMismatch { .. }))
+            ),
+            "mid-segment corruption must not be reported as a good prefix"
+        );
+    }
+
+    #[test]
+    fn repair_final_segment_tail_trims_torn_tail_and_recovers() {
+        let dir = TempDir::new().unwrap();
+        let r0 = enc_nop(10, vec![1, 2, 3, 4]);
+        let r1 = enc_nop(11, vec![5, 6, 7, 8]);
+        let good = u64::try_from(r0.len() + r1.len()).unwrap();
+        let mut torn = enc_nop(12, vec![9, 9, 9, 9, 9, 9]);
+        torn.truncate(RECORD_HEADER_SIZE + 1);
+        let trimmed_expected = u64::try_from(torn.len()).unwrap();
+        let mut segment = r0;
+        segment.extend_from_slice(&r1);
+        segment.extend_from_slice(&torn);
+        let path = dir.path().join("segment_0000000000");
+        std::fs::write(&path, &segment).unwrap();
+
+        let trimmed = repair_final_segment_tail(dir.path())
+            .unwrap()
+            .expect("a torn tail must be reported as trimmed");
+        assert_eq!(trimmed, trimmed_expected);
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), good);
+
+        // The repaired segment ends on a record boundary and recovers
+        // cleanly — the property that fails for a non-final torn segment.
+        let mut seen = Vec::new();
+        recover(dir.path(), |rec| {
+            seen.push(rec.header.xid.raw());
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(seen, vec![10, 11]);
+    }
+
+    #[test]
+    fn repair_final_segment_tail_is_noop_on_clean_segment() {
+        let dir = TempDir::new().unwrap();
+        let mut segment = enc_nop(10, Vec::new());
+        segment.extend_from_slice(&enc_nop(11, Vec::new()));
+        let path = dir.path().join("segment_0000000000");
+        std::fs::write(&path, &segment).unwrap();
+        let original_len = std::fs::metadata(&path).unwrap().len();
+
+        assert_eq!(repair_final_segment_tail(dir.path()).unwrap(), None);
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), original_len);
+    }
+
+    #[test]
+    fn repair_final_segment_tail_handles_empty_dir() {
+        let dir = TempDir::new().unwrap();
+        assert_eq!(repair_final_segment_tail(dir.path()).unwrap(), None);
+    }
+
+    #[test]
+    fn repair_final_segment_tail_errors_and_preserves_mid_segment_corruption() {
+        let dir = TempDir::new().unwrap();
+        let mut corrupt = enc_nop(11, Vec::new());
+        corrupt[RECORD_HEADER_CRC_BYTE_OFFSET_FOR_TEST] ^= 0x01;
+        let mut segment = enc_nop(10, Vec::new());
+        segment.extend_from_slice(&corrupt);
+        segment.extend_from_slice(&enc_nop(12, Vec::new()));
+        let path = dir.path().join("segment_0000000000");
+        std::fs::write(&path, &segment).unwrap();
+        let original_len = std::fs::metadata(&path).unwrap().len();
+
+        let err = repair_final_segment_tail(dir.path())
+            .expect_err("mid-segment corruption must not be silently trimmed");
+        assert!(
+            matches!(
+                err,
+                RecoveryError::Record(WalRecordError::CrcMismatch { .. })
+            ),
+            "{err:?}"
+        );
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().len(),
+            original_len,
+            "a segment with real corruption must be left untouched"
+        );
+    }
+
+    #[test]
+    fn repair_final_segment_tail_only_touches_the_final_segment() {
+        let dir = TempDir::new().unwrap();
+        // segment_0 is clean; only the final segment_1 carries a torn tail.
+        let mut seg0 = enc_nop(10, Vec::new());
+        seg0.extend_from_slice(&enc_nop(11, Vec::new()));
+        let seg0_len = u64::try_from(seg0.len()).unwrap();
+        let r2 = enc_nop(20, vec![1, 2, 3, 4]);
+        let r2_len = u64::try_from(r2.len()).unwrap();
+        let mut torn = enc_nop(21, vec![5, 6, 7, 8]);
+        torn.truncate(RECORD_HEADER_SIZE + 1);
+        let mut seg1 = r2;
+        seg1.extend_from_slice(&torn);
+        std::fs::write(dir.path().join("segment_0000000000"), &seg0).unwrap();
+        let seg1_path = dir.path().join("segment_0000000001");
+        std::fs::write(&seg1_path, &seg1).unwrap();
+
+        repair_final_segment_tail(dir.path())
+            .unwrap()
+            .expect("the torn final segment must be trimmed");
+        assert_eq!(
+            std::fs::metadata(dir.path().join("segment_0000000000"))
+                .unwrap()
+                .len(),
+            seg0_len,
+            "the non-final segment must be left untouched"
+        );
+        assert_eq!(
+            std::fs::metadata(&seg1_path).unwrap().len(),
+            r2_len,
+            "the final segment must be trimmed to its good prefix"
+        );
+
+        let mut seen = Vec::new();
+        recover(dir.path(), |rec| {
+            seen.push(rec.header.xid.raw());
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(seen, vec![10, 11, 20]);
     }
 
     #[test]
