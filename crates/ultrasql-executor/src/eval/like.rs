@@ -2,7 +2,45 @@
 //!
 //! Extracted verbatim from the original `eval.rs`; pure code motion.
 
+use std::cell::RefCell;
+use std::collections::HashMap;
+
 use super::*;
+
+/// Upper bound on cached compiled LIKE patterns per thread. Mirrors the
+/// regex cache bound: large enough for the handful of distinct constant
+/// patterns a query holds, small enough to cap memory if patterns vary.
+const MAX_LIKE_CACHE_ENTRIES: usize = 256;
+
+thread_local! {
+    /// Memoised `compile_like_pattern` results keyed by the pattern text and
+    /// the case-insensitivity flag. The common `col LIKE 'literal'` shape
+    /// re-presents the same pattern on every row, so this turns a per-row
+    /// recompile into a single compile plus a cheap clone of the token Vec.
+    static LIKE_PATTERN_CACHE: RefCell<HashMap<(String, bool), Vec<LikeToken>>> =
+        RefCell::new(HashMap::new());
+}
+
+/// Compile `pattern` to LIKE tokens, reusing a cached compile when the same
+/// `(pattern, case_insensitive)` pair was seen before on this thread.
+///
+/// Behaviourally identical to calling [`compile_like_pattern`] directly:
+/// the function is pure, so a cached token Vec is the same value a fresh
+/// compile would produce.
+fn cached_like_pattern(pattern: &str, case_insensitive: bool) -> Vec<LikeToken> {
+    LIKE_PATTERN_CACHE.with(|cache| {
+        if let Some(found) = cache.borrow().get(&(pattern.to_owned(), case_insensitive)) {
+            return found.clone();
+        }
+        let compiled = compile_like_pattern(pattern, case_insensitive);
+        let mut map = cache.borrow_mut();
+        if map.len() >= MAX_LIKE_CACHE_ENTRIES {
+            map.clear();
+        }
+        map.insert((pattern.to_owned(), case_insensitive), compiled.clone());
+        compiled
+    })
+}
 
 // ---------------------------------------------------------------------------
 // LIKE / ILIKE pattern matching
@@ -23,7 +61,7 @@ pub(crate) fn like_match(haystack: &str, pattern: &str, case_insensitive: bool) 
     } else {
         haystack.chars().collect()
     };
-    let p = compile_like_pattern(pattern, case_insensitive);
+    let p = cached_like_pattern(pattern, case_insensitive);
     like_match_tokens(&h, &p)
 }
 
@@ -74,8 +112,13 @@ pub(crate) fn like_match_tokens(haystack: &[char], pattern: &[LikeToken]) -> boo
         }
     }
 
+    // Reuse two swap buffers across haystack characters instead of
+    // allocating a fresh `next` Vec per character. `next` is reset to all
+    // `false` at the start of each iteration, matching the original
+    // semantics where it began life as `vec![false; ..]`.
+    let mut next = vec![false; pattern.len() + 1];
     for &ch in haystack {
-        let mut next = vec![false; pattern.len() + 1];
+        next.iter_mut().for_each(|cell| *cell = false);
         for (idx, token) in pattern.iter().enumerate() {
             let col = idx + 1;
             next[col] = match token {
@@ -84,7 +127,7 @@ pub(crate) fn like_match_tokens(haystack: &[char], pattern: &[LikeToken]) -> boo
                 LikeToken::Literal(literal) => prev[col - 1] && ch == *literal,
             }
         }
-        prev = next;
+        std::mem::swap(&mut prev, &mut next);
     }
     prev[pattern.len()]
 }

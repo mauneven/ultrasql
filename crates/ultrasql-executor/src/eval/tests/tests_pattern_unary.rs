@@ -39,6 +39,31 @@ fn like_backslash_escapes_wildcards() {
 }
 
 #[test]
+fn like_constant_pattern_is_stable_across_repeats() {
+    // Re-evaluating the same constant pattern many times exercises the
+    // thread-local LIKE-pattern compile cache; results must match a single
+    // inline compile.
+    let yes = Eval::new(binop(BinaryOp::Like, lit_text("foobar"), lit_text("foo%")));
+    let no = Eval::new(binop(BinaryOp::Like, lit_text("bazbar"), lit_text("foo%")));
+    for _ in 0..1000 {
+        assert_eq!(yes.eval(&[]).unwrap(), Value::Bool(true));
+        assert_eq!(no.eval(&[]).unwrap(), Value::Bool(false));
+    }
+}
+
+#[test]
+fn like_and_ilike_distinguished_under_same_pattern() {
+    // The LIKE cache key includes the case-insensitivity flag, so a pattern
+    // compiled case-sensitively must not be served for an ILIKE request.
+    let sensitive = Eval::new(binop(BinaryOp::Like, lit_text("FOO"), lit_text("foo")));
+    let insensitive = Eval::new(binop(BinaryOp::Ilike, lit_text("FOO"), lit_text("foo")));
+    assert_eq!(sensitive.eval(&[]).unwrap(), Value::Bool(false));
+    assert_eq!(insensitive.eval(&[]).unwrap(), Value::Bool(true));
+    // Order-independence: re-check after the case-insensitive compile.
+    assert_eq!(sensitive.eval(&[]).unwrap(), Value::Bool(false));
+}
+
+#[test]
 fn not_like_positive() {
     let ev = Eval::new(binop(
         BinaryOp::NotLike,
