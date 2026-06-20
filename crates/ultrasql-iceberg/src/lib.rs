@@ -177,7 +177,7 @@ impl LoadedMetadata {
                     "iceberg_scan: current snapshot id {snapshot_id} not found"
                 ))
             })?;
-        let manifest_list = resolve_location(&self.table_root, &snapshot.manifest_list);
+        let manifest_list = resolve_confined_location(&self.table_root, &snapshot.manifest_list)?;
         let manifest_entries = read_manifest_list(&manifest_list)?;
         let mut planned = PlannedDataFiles {
             snapshot_id: Some(snapshot_id),
@@ -190,7 +190,8 @@ impl LoadedMetadata {
                 continue;
             }
             planned.manifests_scanned += 1;
-            let manifest_path = resolve_location(&self.table_root, &manifest.manifest_path);
+            let manifest_path =
+                resolve_confined_location(&self.table_root, &manifest.manifest_path)?;
             let manifest_files = read_manifest_data_files(
                 &self.table_root,
                 &manifest_path,
@@ -566,7 +567,7 @@ fn read_manifest_data_files(
         data_files.scanned += 1;
         data_files
             .data_files
-            .push(resolve_location(table_root, file_path));
+            .push(resolve_confined_location(table_root, file_path)?);
     }
     Ok(data_files)
 }
@@ -768,6 +769,116 @@ fn resolve_location(root: &str, location: &str) -> String {
         return format!("{}/{}", root.trim_end_matches('/'), location);
     }
     Path::new(root).join(location).display().to_string()
+}
+
+/// Resolve a manifest-derived `location` against `root` and confine it to the
+/// table root before it is opened.
+///
+/// Manifest contents are untrusted: a poisoned manifest could carry a
+/// `file_path` (or manifest path) that escapes the table — via `..` traversal,
+/// an absolute path, a `file://` URI, or a foreign scheme. This rejects any
+/// resolved location whose canonical form is not a descendant of the
+/// canonicalized table root, while still accepting every file genuinely under
+/// the root.
+fn resolve_confined_location(root: &str, location: &str) -> Result<String> {
+    let resolved = resolve_location(root, location);
+    confine_to_table_root(root, location, &resolved)?;
+    Ok(resolved)
+}
+
+fn confine_to_table_root(root: &str, original: &str, resolved: &str) -> Result<()> {
+    if is_object_store_uri(root) {
+        confine_object_store_key(root, original, resolved)
+    } else {
+        confine_local_descendant(root, original, resolved)
+    }
+}
+
+/// Confine an object-store-resolved location to the configured root prefix.
+///
+/// The resolved location must be an object-store URI sharing the root's scheme
+/// and authority, its key must stay under the root key prefix, and the original
+/// (pre-resolution) key must not contain any `..` traversal segment.
+fn confine_object_store_key(root: &str, original: &str, resolved: &str) -> Result<()> {
+    let escape = || {
+        IcebergError::InvalidMetadata(format!(
+            "iceberg_scan refuses manifest path escaping table root: {original}"
+        ))
+    };
+    if !is_object_store_uri(resolved) {
+        return Err(escape());
+    }
+    if key_has_parent_segment(original) || key_has_parent_segment(resolved) {
+        return Err(escape());
+    }
+    let root_prefix = root.trim_end_matches('/');
+    if resolved == root_prefix {
+        return Ok(());
+    }
+    let with_sep = format!("{root_prefix}/");
+    if resolved.starts_with(&with_sep) {
+        Ok(())
+    } else {
+        Err(escape())
+    }
+}
+
+fn key_has_parent_segment(location: &str) -> bool {
+    location.split(['/', '\\']).any(|segment| segment == "..")
+}
+
+/// Confine a local-filesystem-resolved path to a descendant of the table root.
+///
+/// Both the table root and the resolved path are canonicalized so that `..`
+/// traversal, absolute escapes, and symlink escapes all collapse to a real
+/// path that is then checked for descendancy. Non-existent in-root files are
+/// accepted by canonicalizing the nearest existing ancestor.
+fn confine_local_descendant(root: &str, original: &str, resolved: &str) -> Result<()> {
+    let escape = || {
+        IcebergError::InvalidMetadata(format!(
+            "iceberg_scan refuses manifest path escaping table root: {original}"
+        ))
+    };
+    let resolved_path = local_path_from_location(resolved);
+    let canonical_root = fs::canonicalize(Path::new(root)).map_err(|err| {
+        IcebergError::Io(format!(
+            "iceberg_scan cannot resolve table root {root}: {err}"
+        ))
+    })?;
+    let canonical_resolved = canonicalize_existing_ancestor(&resolved_path).ok_or_else(escape)?;
+    if canonical_resolved.starts_with(&canonical_root) {
+        Ok(())
+    } else {
+        Err(escape())
+    }
+}
+
+/// Canonicalize `path` by canonicalizing its nearest existing ancestor and
+/// re-appending the non-existent suffix, returning `None` if any `..` segment
+/// would climb above that canonical ancestor.
+fn canonicalize_existing_ancestor(path: &Path) -> Option<PathBuf> {
+    let mut existing = path;
+    let mut suffix: Vec<&std::ffi::OsStr> = Vec::new();
+    loop {
+        if let Ok(canonical) = fs::canonicalize(existing) {
+            let mut result = canonical;
+            for component in suffix.iter().rev() {
+                if *component == ".." {
+                    // A traversal past the canonical ancestor escapes confinement.
+                    if !result.pop() {
+                        return None;
+                    }
+                } else {
+                    result.push(component);
+                }
+            }
+            return Some(result);
+        }
+        let parent = existing.parent()?;
+        let name = existing.file_name()?;
+        suffix.push(name);
+        existing = parent;
+    }
 }
 
 fn avro_record_field<'a>(value: &'a AvroValue, name: &str) -> Option<&'a AvroValue> {
@@ -1216,6 +1327,105 @@ mod tests {
             plan.data_files,
             vec![table.join("keep.parquet").display().to_string()]
         );
+    }
+
+    #[test]
+    fn manifest_data_file_traversal_path_is_rejected() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let table = temp.path();
+        write_iceberg_metadata(table);
+        // A genuine secret living outside the table root.
+        fs::write(temp.path().join("secret.parquet"), b"PAR1").expect("write secret");
+        let metadata_dir = table.join("metadata");
+        let manifest = metadata_dir.join("new.avro");
+        let list = metadata_dir.join("new-list.avro");
+        // file_path climbs out of the table root via `..`.
+        write_manifest_with_partitions(&manifest, &[("../secret.parquet", &[])]);
+        write_manifest_list_with_bounds(&list, &[(&manifest, "", "zz")]);
+
+        let Err(err) = plan_iceberg_scan(&table.display().to_string()) else {
+            panic!("traversal data-file path should be rejected");
+        };
+
+        assert!(
+            err.to_string().contains("escaping table root"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn manifest_data_file_absolute_escape_is_rejected() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let table = temp.path().join("table");
+        write_iceberg_metadata(&table);
+        // Absolute path to a file that exists but lives outside the table root.
+        let outside = temp.path().join("outside.parquet");
+        fs::write(&outside, b"PAR1").expect("write outside file");
+        let metadata_dir = table.join("metadata");
+        let manifest = metadata_dir.join("new.avro");
+        let list = metadata_dir.join("new-list.avro");
+        write_manifest_with_partitions(
+            &manifest,
+            &[(outside.to_str().expect("outside utf8"), &[])],
+        );
+        write_manifest_list_with_bounds(&list, &[(&manifest, "", "zz")]);
+
+        let Err(err) = plan_iceberg_scan(&table.display().to_string()) else {
+            panic!("absolute escaping data-file path should be rejected");
+        };
+
+        assert!(
+            err.to_string().contains("escaping table root"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn manifest_in_root_data_file_path_is_accepted() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let table = temp.path();
+        write_iceberg_metadata(table);
+        let metadata_dir = table.join("metadata");
+        let manifest = metadata_dir.join("new.avro");
+        let list = metadata_dir.join("new-list.avro");
+        // A nested but in-root relative data file path.
+        fs::create_dir_all(table.join("data")).expect("data dir");
+        write_manifest_with_partitions(&manifest, &[("data/part-0.parquet", &[])]);
+        write_manifest_list_with_bounds(&list, &[(&manifest, "", "zz")]);
+
+        let plan = plan_iceberg_scan(&table.display().to_string()).expect("in-root scan");
+
+        assert_eq!(
+            plan.data_files,
+            vec![table.join("data/part-0.parquet").display().to_string()]
+        );
+    }
+
+    #[test]
+    fn confine_object_store_key_blocks_traversal_and_foreign_roots() {
+        // Relative key with `..` traversal is rejected.
+        let escaped = resolve_location("s3://bucket/table", "../other/a.parquet");
+        assert!(confine_to_table_root("s3://bucket/table", "../other/a.parquet", &escaped).is_err());
+
+        // Absolute object key outside the root prefix is rejected.
+        assert!(
+            confine_to_table_root(
+                "s3://bucket/table",
+                "s3://bucket/evil/a.parquet",
+                "s3://bucket/evil/a.parquet",
+            )
+            .is_err()
+        );
+
+        // A local path masquerading under an object-store root is rejected.
+        assert!(
+            confine_to_table_root("s3://bucket/table", "/etc/passwd", "/etc/passwd").is_err()
+        );
+
+        // A legitimate in-root relative key is accepted.
+        let ok = resolve_location("s3://bucket/table", "data/a.parquet");
+        assert_eq!(ok, "s3://bucket/table/data/a.parquet");
+        assert!(confine_to_table_root("s3://bucket/table", "data/a.parquet", &ok).is_ok());
     }
 
     fn write_iceberg_metadata(table_dir: &Path) {
