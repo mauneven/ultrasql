@@ -1,0 +1,632 @@
+//! Numeric/math and string scalar builtins.
+//!
+//! Extracted verbatim from the original `eval.rs`; pure code motion.
+
+use super::*;
+
+pub(crate) fn eval_abs(args: &[Value]) -> Result<Value, EvalError> {
+    if args.len() != 1 {
+        return Err(EvalError::Type(format!(
+            "abs: expected 1 arg, got {}",
+            args.len()
+        )));
+    }
+    match &args[0] {
+        Value::Int16(v) => Ok(Value::Int64(i64::from(*v).abs())),
+        Value::Int32(v) => Ok(Value::Int64(i64::from(*v).abs())),
+        Value::Int64(v) => v.checked_abs().map(Value::Int64).ok_or(EvalError::Overflow),
+        Value::Null => Ok(Value::Null),
+        other => Err(EvalError::Type(format!(
+            "abs: integer argument required, got {:?}",
+            other.data_type()
+        ))),
+    }
+}
+
+#[derive(Clone, Copy)]
+pub(crate) enum TextCase {
+    Lower,
+    Upper,
+}
+
+pub(crate) fn eval_text_case(args: &[Value], mode: TextCase) -> Result<Value, EvalError> {
+    if args.len() != 1 {
+        return Err(EvalError::Type(format!(
+            "text case function: expected 1 arg, got {}",
+            args.len()
+        )));
+    }
+    let (Value::Text(s) | Value::Char(s)) = &args[0] else {
+        return if matches!(args[0], Value::Null) {
+            Ok(Value::Null)
+        } else {
+            Err(EvalError::Type(format!(
+                "text case function: argument must be text, got {:?}",
+                args[0].data_type()
+            )))
+        };
+    };
+    let out = match mode {
+        TextCase::Lower => s.to_lowercase(),
+        TextCase::Upper => s.to_uppercase(),
+    };
+    Ok(Value::Text(out))
+}
+
+pub(crate) fn text_arg<'a>(func: &str, args: &'a [Value], idx: usize) -> Result<Option<&'a str>, EvalError> {
+    match args.get(idx) {
+        Some(Value::Text(text) | Value::Char(text)) => Ok(Some(text.as_str())),
+        Some(Value::Null) => Ok(None),
+        Some(other) => Err(EvalError::Type(format!(
+            "{func}: argument {} must be text, got {:?}",
+            idx + 1,
+            other.data_type()
+        ))),
+        None => Err(EvalError::Type(format!(
+            "{func}: missing argument {}",
+            idx + 1
+        ))),
+    }
+}
+
+pub(crate) fn int_arg(func: &str, args: &[Value], idx: usize) -> Result<Option<i64>, EvalError> {
+    match args.get(idx) {
+        Some(value) => match value.as_i64() {
+            Some(v) => Ok(Some(v)),
+            None if matches!(value, Value::Null) => Ok(None),
+            None => Err(EvalError::Type(format!(
+                "{func}: argument {} must be integer, got {:?}",
+                idx + 1,
+                value.data_type()
+            ))),
+        },
+        None => Err(EvalError::Type(format!(
+            "{func}: missing argument {}",
+            idx + 1
+        ))),
+    }
+}
+
+pub(crate) fn numeric_arg(func: &str, args: &[Value], idx: usize) -> Result<Option<f64>, EvalError> {
+    match args.get(idx) {
+        Some(Value::Float32(v)) => Ok(Some(f64::from(*v))),
+        Some(Value::Float64(v)) => Ok(Some(*v)),
+        Some(Value::Decimal { value, scale }) => {
+            let base = value.to_f64().ok_or(EvalError::Overflow)?;
+            Ok(Some(base / 10_f64.powi(*scale)))
+        }
+        Some(value) => match value.as_i64() {
+            Some(v) => v.to_f64().map(Some).ok_or(EvalError::Overflow),
+            None if matches!(value, Value::Null) => Ok(None),
+            None => Err(EvalError::Type(format!(
+                "{func}: argument {} must be numeric, got {:?}",
+                idx + 1,
+                value.data_type()
+            ))),
+        },
+        None => Err(EvalError::Type(format!(
+            "{func}: missing argument {}",
+            idx + 1
+        ))),
+    }
+}
+
+pub(crate) fn eval_numeric_unary(
+    args: &[Value],
+    func: &str,
+    op: impl FnOnce(f64) -> f64,
+) -> Result<Value, EvalError> {
+    if args.len() != 1 {
+        return Err(EvalError::Type(format!(
+            "{func}: expected 1 arg, got {}",
+            args.len()
+        )));
+    }
+    let Some(value) = numeric_arg(func, args, 0)? else {
+        return Ok(Value::Null);
+    };
+    Ok(Value::Float64(op(value)))
+}
+
+pub(crate) fn eval_numeric_binary(
+    args: &[Value],
+    func: &str,
+    op: impl FnOnce(f64, f64) -> f64,
+) -> Result<Value, EvalError> {
+    if args.len() != 2 {
+        return Err(EvalError::Type(format!(
+            "{func}: expected 2 args, got {}",
+            args.len()
+        )));
+    }
+    let Some(left) = numeric_arg(func, args, 0)? else {
+        return Ok(Value::Null);
+    };
+    let Some(right) = numeric_arg(func, args, 1)? else {
+        return Ok(Value::Null);
+    };
+    Ok(Value::Float64(op(left, right)))
+}
+
+pub(crate) fn eval_pi(args: &[Value]) -> Result<Value, EvalError> {
+    if !args.is_empty() {
+        return Err(EvalError::Type(format!(
+            "pi: expected 0 args, got {}",
+            args.len()
+        )));
+    }
+    Ok(Value::Float64(std::f64::consts::PI))
+}
+
+pub(crate) fn eval_random(args: &[Value]) -> Result<Value, EvalError> {
+    if !args.is_empty() {
+        return Err(EvalError::Type(format!(
+            "random: expected 0 args, got {}",
+            args.len()
+        )));
+    }
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or(0);
+    let low = u64::try_from(now & u128::from(u64::MAX)).unwrap_or(0);
+    let high = u64::try_from(now >> 64).unwrap_or(0);
+    let mut state =
+        low ^ high.rotate_left(11) ^ UUID_FALLBACK_COUNTER.fetch_add(1, Ordering::Relaxed);
+    state ^= state << 13;
+    state ^= state >> 7;
+    state ^= state << 17;
+    let mantissa = state & ((1_u64 << 53) - 1);
+    let numerator = mantissa.to_f64().ok_or(EvalError::Overflow)?;
+    Ok(Value::Float64(numerator / 9_007_199_254_740_992.0))
+}
+
+pub(crate) fn eval_length(args: &[Value]) -> Result<Value, EvalError> {
+    if args.len() != 1 {
+        return Err(EvalError::Type(format!(
+            "length: expected 1 arg, got {}",
+            args.len()
+        )));
+    }
+    let len = match &args[0] {
+        Value::Text(text) => text.chars().count(),
+        Value::Char(text) => bpchar_semantic_text(text).chars().count(),
+        Value::BitString(bits) => usize::try_from(bits.len())
+            .map_err(|_| EvalError::Type("length: result overflow".to_owned()))?,
+        Value::Null => return Ok(Value::Null),
+        other => {
+            return Err(EvalError::Type(format!(
+                "length: argument 1 must be text or bit string, got {:?}",
+                other.data_type()
+            )));
+        }
+    };
+    let len =
+        i32::try_from(len).map_err(|_| EvalError::Type("length: result overflow".to_owned()))?;
+    Ok(Value::Int32(len))
+}
+
+pub(crate) fn eval_bit_length(args: &[Value]) -> Result<Value, EvalError> {
+    if args.len() != 1 {
+        return Err(EvalError::Type(format!(
+            "bit_length: expected 1 arg, got {}",
+            args.len()
+        )));
+    }
+    let Some(bits) = bit_string_arg("bit_length", args, 0)? else {
+        return Ok(Value::Null);
+    };
+    let len = i32::try_from(bits.len())
+        .map_err(|_| EvalError::Type("bit_length: result overflow".to_owned()))?;
+    Ok(Value::Int32(len))
+}
+
+pub(crate) fn eval_octet_length(args: &[Value]) -> Result<Value, EvalError> {
+    if args.len() != 1 {
+        return Err(EvalError::Type(format!(
+            "octet_length: expected 1 arg, got {}",
+            args.len()
+        )));
+    }
+    let Some(bits) = bit_string_arg("octet_length", args, 0)? else {
+        return Ok(Value::Null);
+    };
+    let len = i32::try_from(bits.octet_len())
+        .map_err(|_| EvalError::Type("octet_length: result overflow".to_owned()))?;
+    Ok(Value::Int32(len))
+}
+
+pub(crate) fn eval_bit_count(args: &[Value]) -> Result<Value, EvalError> {
+    if args.len() != 1 {
+        return Err(EvalError::Type(format!(
+            "bit_count: expected 1 arg, got {}",
+            args.len()
+        )));
+    }
+    let Some(bits) = bit_string_arg("bit_count", args, 0)? else {
+        return Ok(Value::Null);
+    };
+    Ok(Value::Int64(i64::from(bits.bit_count())))
+}
+
+pub(crate) fn eval_get_bit(args: &[Value]) -> Result<Value, EvalError> {
+    if args.len() != 2 {
+        return Err(EvalError::Type(format!(
+            "get_bit: expected 2 args, got {}",
+            args.len()
+        )));
+    }
+    let Some(bits) = bit_string_arg("get_bit", args, 0)? else {
+        return Ok(Value::Null);
+    };
+    let Some(idx) = integer_arg_as_usize("get_bit", args, 1)? else {
+        return Ok(Value::Null);
+    };
+    let bit = bits
+        .bit(idx)
+        .ok_or_else(|| EvalError::Type("get_bit: bit index out of range".to_owned()))?;
+    Ok(Value::Int32(if bit { 1 } else { 0 }))
+}
+
+pub(crate) fn eval_set_bit(args: &[Value]) -> Result<Value, EvalError> {
+    if args.len() != 3 {
+        return Err(EvalError::Type(format!(
+            "set_bit: expected 3 args, got {}",
+            args.len()
+        )));
+    }
+    let Some(bits) = bit_string_arg("set_bit", args, 0)? else {
+        return Ok(Value::Null);
+    };
+    let Some(idx) = integer_arg_as_usize("set_bit", args, 1)? else {
+        return Ok(Value::Null);
+    };
+    let Some(value) = integer_arg_as_usize("set_bit", args, 2)? else {
+        return Ok(Value::Null);
+    };
+    if value > 1 {
+        return Err(EvalError::Type(
+            "set_bit: new value must be 0 or 1".to_owned(),
+        ));
+    }
+    bits.set_bit(idx, value == 1)
+        .map(Value::BitString)
+        .ok_or_else(|| EvalError::Type("set_bit: bit index out of range".to_owned()))
+}
+
+pub(crate) fn eval_trim(args: &[Value]) -> Result<Value, EvalError> {
+    if args.len() != 1 {
+        return Err(EvalError::Type(format!(
+            "trim: expected 1 arg, got {}",
+            args.len()
+        )));
+    }
+    let Some(text) = text_arg("trim", args, 0)? else {
+        return Ok(Value::Null);
+    };
+    Ok(Value::Text(text.trim().to_owned()))
+}
+
+#[derive(Clone, Copy)]
+pub(crate) enum PadSide {
+    Left,
+    Right,
+}
+
+pub(crate) fn eval_pad(args: &[Value], side: PadSide) -> Result<Value, EvalError> {
+    let func = match side {
+        PadSide::Left => "lpad",
+        PadSide::Right => "rpad",
+    };
+    if !(2..=3).contains(&args.len()) {
+        return Err(EvalError::Type(format!(
+            "{func}: expected 2 or 3 args, got {}",
+            args.len()
+        )));
+    }
+    let Some(text) = text_arg(func, args, 0)? else {
+        return Ok(Value::Null);
+    };
+    let Some(target_len) = int_arg(func, args, 1)? else {
+        return Ok(Value::Null);
+    };
+    let fill = if args.len() == 3 {
+        let Some(fill) = text_arg(func, args, 2)? else {
+            return Ok(Value::Null);
+        };
+        fill
+    } else {
+        " "
+    };
+    let target = generated_text_target_len(func, target_len)?;
+    let current = text.chars().count();
+    if target <= current {
+        return Ok(Value::Text(text.chars().take(target).collect()));
+    }
+    if fill.is_empty() {
+        return Err(EvalError::Type(format!(
+            "{func}: fill string cannot be empty"
+        )));
+    }
+    let pad_needed = target - current;
+    let mut padding = String::new();
+    for ch in fill.chars().cycle().take(pad_needed) {
+        padding.push(ch);
+    }
+    let out = match side {
+        PadSide::Left => format!("{padding}{text}"),
+        PadSide::Right => format!("{text}{padding}"),
+    };
+    Ok(Value::Text(out))
+}
+
+pub(crate) fn eval_left(args: &[Value]) -> Result<Value, EvalError> {
+    if args.len() != 2 {
+        return Err(EvalError::Type(format!(
+            "left: expected 2 args, got {}",
+            args.len()
+        )));
+    }
+    let Some(text) = text_arg("left", args, 0)? else {
+        return Ok(Value::Null);
+    };
+    let Some(count) = int_arg("left", args, 1)? else {
+        return Ok(Value::Null);
+    };
+    let chars: Vec<char> = text.chars().collect();
+    let keep = if count >= 0 {
+        usize::try_from(count)
+            .unwrap_or(usize::MAX)
+            .min(chars.len())
+    } else {
+        chars.len().saturating_sub(i64_abs_to_usize(count))
+    };
+    Ok(Value::Text(chars.into_iter().take(keep).collect()))
+}
+
+pub(crate) fn eval_right(args: &[Value]) -> Result<Value, EvalError> {
+    if args.len() != 2 {
+        return Err(EvalError::Type(format!(
+            "right: expected 2 args, got {}",
+            args.len()
+        )));
+    }
+    let Some(text) = text_arg("right", args, 0)? else {
+        return Ok(Value::Null);
+    };
+    let Some(count) = int_arg("right", args, 1)? else {
+        return Ok(Value::Null);
+    };
+    let chars: Vec<char> = text.chars().collect();
+    let skip = if count >= 0 {
+        chars
+            .len()
+            .saturating_sub(usize::try_from(count).unwrap_or(usize::MAX))
+    } else {
+        i64_abs_to_usize(count).min(chars.len())
+    };
+    Ok(Value::Text(chars.into_iter().skip(skip).collect()))
+}
+
+pub(crate) fn i64_abs_to_usize(value: i64) -> usize {
+    usize::try_from(value.unsigned_abs()).unwrap_or(usize::MAX)
+}
+
+pub(crate) fn generated_text_target_len(func: &str, len: i64) -> Result<usize, EvalError> {
+    if len <= 0 {
+        return Ok(0);
+    }
+    let len = usize::try_from(len)
+        .map_err(|_| EvalError::Type(format!("{func}: output length exceeds supported maximum")))?;
+    if len > MAX_EVAL_GENERATED_TEXT_CHARS {
+        return Err(EvalError::Type(format!(
+            "{func}: output length exceeds supported maximum"
+        )));
+    }
+    Ok(len)
+}
+
+pub(crate) fn generated_text_repeat_count(func: &str, text: &str, count: i64) -> Result<usize, EvalError> {
+    if count <= 0 {
+        return Ok(0);
+    }
+    let count = usize::try_from(count)
+        .map_err(|_| EvalError::Type(format!("{func}: output length exceeds supported maximum")))?;
+    let chars = text.chars().count();
+    let output_chars = chars.checked_mul(count).ok_or_else(|| {
+        EvalError::Type(format!("{func}: output length exceeds supported maximum"))
+    })?;
+    if output_chars > MAX_EVAL_GENERATED_TEXT_CHARS {
+        return Err(EvalError::Type(format!(
+            "{func}: output length exceeds supported maximum"
+        )));
+    }
+    Ok(count)
+}
+
+pub(crate) fn eval_position(args: &[Value]) -> Result<Value, EvalError> {
+    if args.len() != 2 {
+        return Err(EvalError::Type(format!(
+            "position: expected 2 args, got {}",
+            args.len()
+        )));
+    }
+    let Some(needle) = text_arg("position", args, 0)? else {
+        return Ok(Value::Null);
+    };
+    let Some(haystack) = text_arg("position", args, 1)? else {
+        return Ok(Value::Null);
+    };
+    let pos = haystack.find(needle).map_or(0_i32, |byte_idx| {
+        let chars_before = haystack[..byte_idx].chars().count();
+        i32::try_from(chars_before.saturating_add(1)).unwrap_or(i32::MAX)
+    });
+    Ok(Value::Int32(pos))
+}
+
+pub(crate) fn eval_replace(args: &[Value]) -> Result<Value, EvalError> {
+    if args.len() != 3 {
+        return Err(EvalError::Type(format!(
+            "replace: expected 3 args, got {}",
+            args.len()
+        )));
+    }
+    let Some(text) = text_arg("replace", args, 0)? else {
+        return Ok(Value::Null);
+    };
+    let Some(from) = text_arg("replace", args, 1)? else {
+        return Ok(Value::Null);
+    };
+    let Some(to) = text_arg("replace", args, 2)? else {
+        return Ok(Value::Null);
+    };
+    Ok(Value::Text(text.replace(from, to)))
+}
+
+pub(crate) fn eval_split_part(args: &[Value]) -> Result<Value, EvalError> {
+    if args.len() != 3 {
+        return Err(EvalError::Type(format!(
+            "split_part: expected 3 args, got {}",
+            args.len()
+        )));
+    }
+    let Some(text) = text_arg("split_part", args, 0)? else {
+        return Ok(Value::Null);
+    };
+    let Some(delimiter) = text_arg("split_part", args, 1)? else {
+        return Ok(Value::Null);
+    };
+    let Some(field) = int_arg("split_part", args, 2)? else {
+        return Ok(Value::Null);
+    };
+    if field <= 0 {
+        return Err(EvalError::Type(
+            "split_part: field position must be greater than zero".to_owned(),
+        ));
+    }
+    let target = usize::try_from(field.saturating_sub(1)).unwrap_or(usize::MAX);
+    Ok(Value::Text(
+        text.split(delimiter).nth(target).unwrap_or("").to_owned(),
+    ))
+}
+
+pub(crate) fn eval_concat(args: &[Value]) -> Result<Value, EvalError> {
+    let mut out = String::new();
+    for arg in args {
+        if !matches!(arg, Value::Null) {
+            out.push_str(&arg.to_string());
+        }
+    }
+    Ok(Value::Text(out))
+}
+
+pub(crate) fn eval_concat_ws(args: &[Value]) -> Result<Value, EvalError> {
+    if args.is_empty() {
+        return Err(EvalError::Type(
+            "concat_ws: expected at least 1 arg".to_owned(),
+        ));
+    }
+    let Some(separator) = text_arg("concat_ws", args, 0)? else {
+        return Ok(Value::Null);
+    };
+    let mut parts = Vec::new();
+    for arg in &args[1..] {
+        if !matches!(arg, Value::Null) {
+            parts.push(arg.to_string());
+        }
+    }
+    Ok(Value::Text(parts.join(separator)))
+}
+
+pub(crate) fn eval_repeat(args: &[Value]) -> Result<Value, EvalError> {
+    if args.len() != 2 {
+        return Err(EvalError::Type(format!(
+            "repeat: expected 2 args, got {}",
+            args.len()
+        )));
+    }
+    let Some(text) = text_arg("repeat", args, 0)? else {
+        return Ok(Value::Null);
+    };
+    let Some(count) = int_arg("repeat", args, 1)? else {
+        return Ok(Value::Null);
+    };
+    if text.is_empty() {
+        return Ok(Value::Text(String::new()));
+    }
+    let count = generated_text_repeat_count("repeat", text, count)?;
+    Ok(Value::Text(text.repeat(count)))
+}
+
+pub(crate) fn eval_reverse(args: &[Value]) -> Result<Value, EvalError> {
+    if args.len() != 1 {
+        return Err(EvalError::Type(format!(
+            "reverse: expected 1 arg, got {}",
+            args.len()
+        )));
+    }
+    let Some(text) = text_arg("reverse", args, 0)? else {
+        return Ok(Value::Null);
+    };
+    Ok(Value::Text(text.chars().rev().collect()))
+}
+
+pub(crate) fn eval_md5(args: &[Value]) -> Result<Value, EvalError> {
+    if args.len() != 1 {
+        return Err(EvalError::Type(format!(
+            "md5: expected 1 arg, got {}",
+            args.len()
+        )));
+    }
+    let Some(text) = text_arg("md5", args, 0)? else {
+        return Ok(Value::Null);
+    };
+    Ok(Value::Text(format!("{:x}", md5::compute(text.as_bytes()))))
+}
+
+pub(crate) fn eval_sha256(args: &[Value]) -> Result<Value, EvalError> {
+    if args.len() != 1 {
+        return Err(EvalError::Type(format!(
+            "sha256: expected 1 arg, got {}",
+            args.len()
+        )));
+    }
+    let Some(text) = text_arg("sha256", args, 0)? else {
+        return Ok(Value::Null);
+    };
+    use sha2::Digest;
+    let digest = sha2::Sha256::digest(text.as_bytes());
+    let mut out = String::with_capacity(digest.len().saturating_mul(2));
+    for byte in digest {
+        write!(&mut out, "{byte:02x}")
+            .map_err(|_| EvalError::Type("sha256: hex encoding failed".to_owned()))?;
+    }
+    Ok(Value::Text(out))
+}
+
+pub(crate) fn eval_quote_ident(args: &[Value]) -> Result<Value, EvalError> {
+    if args.len() != 1 {
+        return Err(EvalError::Type(format!(
+            "quote_ident: expected 1 arg, got {}",
+            args.len()
+        )));
+    }
+    let Some(text) = text_arg("quote_ident", args, 0)? else {
+        return Ok(Value::Null);
+    };
+    Ok(Value::Text(quote_identifier(text)))
+}
+
+pub(crate) fn eval_quote_literal(args: &[Value]) -> Result<Value, EvalError> {
+    if args.len() != 1 {
+        return Err(EvalError::Type(format!(
+            "quote_literal: expected 1 arg, got {}",
+            args.len()
+        )));
+    }
+    let Some(text) = text_arg("quote_literal", args, 0)? else {
+        return Ok(Value::Null);
+    };
+    Ok(Value::Text(quote_literal(text)))
+}
+
