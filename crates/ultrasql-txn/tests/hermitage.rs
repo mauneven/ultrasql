@@ -87,7 +87,7 @@ fn g1a_dirty_read_prevented() {
     // T2 begins while T1 is in progress.
     let t2 = mgr.begin(IsolationLevel::ReadCommitted);
     assert!(
-        t2.snapshot.xip.contains(&t1_xid),
+        t2.snapshot.xip().contains(&t1_xid),
         "T1 must be in T2's snapshot as in-progress"
     );
 
@@ -98,7 +98,7 @@ fn g1a_dirty_read_prevented() {
     let mut t2 = t2;
     mgr.refresh_snapshot(&mut t2);
     assert!(
-        !t2.snapshot.xip.contains(&t1_xid),
+        !t2.snapshot.xip().contains(&t1_xid),
         "after T1 aborts and T2 refreshes, T1 must no longer be in-progress"
     );
     assert!(mgr.is_aborted(t1_xid), "oracle must report T1 as Aborted");
@@ -126,7 +126,7 @@ fn g1b_intermediate_read_prevented() {
 
     // Verify T2 sees T1 as in-progress (cannot read T1's partial state).
     assert!(
-        t2.snapshot.xip.contains(&t1_xid),
+        t2.snapshot.xip().contains(&t1_xid),
         "T1 must be in-progress for T2's snapshot"
     );
 
@@ -192,7 +192,7 @@ fn otv_observed_transaction_vanishes_prevented() {
     // T2 begins and takes a snapshot that sees T1 as in-progress.
     let t2 = mgr.begin(IsolationLevel::RepeatableRead);
     assert!(
-        t2.snapshot.xip.contains(&t1_xid),
+        t2.snapshot.xip().contains(&t1_xid),
         "T2 must see T1 as in-progress"
     );
 
@@ -202,7 +202,7 @@ fn otv_observed_transaction_vanishes_prevented() {
     // T2's frozen snapshot (under RR) still lists T1 as in-progress, so
     // any visibility check will treat T1's writes as invisible.
     assert!(
-        t2.snapshot.xip.contains(&t1_xid),
+        t2.snapshot.xip().contains(&t1_xid),
         "under RR, T2's frozen snapshot still sees T1 as in-progress"
     );
 

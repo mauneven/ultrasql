@@ -953,7 +953,7 @@ mod tests {
         let t3 = mgr.begin(IsolationLevel::RepeatableRead);
 
         // t3's snapshot should list t1 and t2 as active.
-        let xips: Vec<Xid> = t3.snapshot.xip.iter().copied().collect();
+        let xips: Vec<Xid> = t3.snapshot.xip().to_vec();
         assert_eq!(xips, vec![t1.xid, t2.xid]);
 
         // xmin is the oldest in-progress, which is t1.
@@ -962,7 +962,7 @@ mod tests {
         // XID the counter would assign, which is t3.xid + 1.
         assert_eq!(t3.snapshot.xmax.raw(), t3.xid.raw() + 1);
         // The transaction's own XID is not in its own xip.
-        assert!(!t3.snapshot.xip.contains(&t3.xid));
+        assert!(!t3.snapshot.xip().contains(&t3.xid));
     }
 
     #[test]
@@ -973,7 +973,7 @@ mod tests {
         mgr.commit(t1).unwrap();
 
         let t4 = mgr.begin(IsolationLevel::ReadCommitted);
-        assert!(!t4.snapshot.xip.contains(&t1_xid));
+        assert!(!t4.snapshot.xip().contains(&t1_xid));
 
         // Oracle should now report t1 as Committed.
         assert_eq!(mgr.status(t1_xid), XidStatus::Committed);
@@ -1002,7 +1002,7 @@ mod tests {
 
         assert_eq!(mgr.status(xid), XidStatus::Aborted);
         assert_eq!(next.xid, Xid::new(11));
-        assert!(!next.snapshot.xip.contains(&xid));
+        assert!(!next.snapshot.xip().contains(&xid));
     }
 
     #[test]
@@ -1054,7 +1054,7 @@ mod tests {
         let mut reader = mgr.begin(IsolationLevel::ReadCommitted);
         let snap_before = reader.snapshot.clone();
         // Before refresh, t1 is in reader's xip.
-        assert!(reader.snapshot.xip.contains(&t1_xid));
+        assert!(reader.snapshot.xip().contains(&t1_xid));
         let cmd_before = reader.current_command;
 
         // Commit t1 in between.
@@ -1065,7 +1065,7 @@ mod tests {
         // Command id advanced.
         assert_eq!(reader.current_command, cmd_before.next());
         // Snapshot changed — t1 is no longer in xip.
-        assert!(!reader.snapshot.xip.contains(&t1_xid));
+        assert!(!reader.snapshot.xip().contains(&t1_xid));
         assert_ne!(reader.snapshot, snap_before);
     }
 
@@ -1076,7 +1076,7 @@ mod tests {
         let t1_xid = t1.xid;
 
         let mut reader = mgr.begin(IsolationLevel::RepeatableRead);
-        let snap_xip_before: Vec<Xid> = reader.snapshot.xip.iter().copied().collect();
+        let snap_xip_before: Vec<Xid> = reader.snapshot.xip().to_vec();
         let xmin_before = reader.snapshot.xmin;
         let xmax_before = reader.snapshot.xmax;
 
@@ -1084,12 +1084,12 @@ mod tests {
         mgr.refresh_snapshot(&mut reader);
 
         // The xip / xmin / xmax must not have changed under RR.
-        let snap_xip_after: Vec<Xid> = reader.snapshot.xip.iter().copied().collect();
+        let snap_xip_after: Vec<Xid> = reader.snapshot.xip().to_vec();
         assert_eq!(snap_xip_after, snap_xip_before);
         assert_eq!(reader.snapshot.xmin, xmin_before);
         assert_eq!(reader.snapshot.xmax, xmax_before);
         // t1 still considered active by reader's frozen snapshot.
-        assert!(reader.snapshot.xip.contains(&t1_xid));
+        assert!(reader.snapshot.xip().contains(&t1_xid));
         // current_command still advances.
         assert_eq!(reader.current_command, CommandId::FIRST.next());
         // And so does the snapshot's view of it.
@@ -1107,7 +1107,7 @@ mod tests {
         let snap_before = reader.snapshot.clone();
         mgr.refresh_snapshot(&mut reader);
         // xip / xmin / xmax unchanged.
-        assert_eq!(reader.snapshot.xip, snap_before.xip);
+        assert_eq!(reader.snapshot.xip(), snap_before.xip());
         assert_eq!(reader.snapshot.xmin, snap_before.xmin);
         assert_eq!(reader.snapshot.xmax, snap_before.xmax);
         // command id bumped on the snapshot too.

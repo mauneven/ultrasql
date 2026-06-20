@@ -46,7 +46,7 @@ fn read_committed_sees_concurrent_commit_after_refresh() {
     let t1 = mgr.begin(IsolationLevel::ReadCommitted);
 
     assert!(
-        t1.snapshot.xip.contains(&t0_xid),
+        t1.snapshot.xip().contains(&t0_xid),
         "T0 must be in T1's initial snapshot xip"
     );
 
@@ -59,7 +59,7 @@ fn read_committed_sees_concurrent_commit_after_refresh() {
 
     // T1's new snapshot must no longer include T0 (it committed).
     assert!(
-        !t1.snapshot.xip.contains(&t0_xid),
+        !t1.snapshot.xip().contains(&t0_xid),
         "after refresh, T0 must be absent from T1's refreshed snapshot"
     );
     // The oracle confirms T0 is committed.
@@ -84,7 +84,7 @@ fn read_committed_without_refresh_sees_stale_snapshot() {
     // T1 starts; its snapshot sees T0 as in-progress.
     let t1 = mgr.begin(IsolationLevel::ReadCommitted);
     assert!(
-        t1.snapshot.xip.contains(&t0_xid),
+        t1.snapshot.xip().contains(&t0_xid),
         "T0 must be in T1's initial snapshot"
     );
 
@@ -93,7 +93,7 @@ fn read_committed_without_refresh_sees_stale_snapshot() {
 
     // T1 has NOT refreshed — its snapshot still sees T0 as in-progress.
     assert!(
-        t1.snapshot.xip.contains(&t0_xid),
+        t1.snapshot.xip().contains(&t0_xid),
         "without refresh, T0 still appears in-progress in T1's old snapshot"
     );
 
@@ -123,7 +123,7 @@ fn repeatable_read_snapshot_frozen_after_begin() {
 
     // T0 must be visible as in-progress at the start.
     assert!(
-        t1.snapshot.xip.contains(&t0_xid),
+        t1.snapshot.xip().contains(&t0_xid),
         "T0 must be in T1's initial snapshot"
     );
 
@@ -133,7 +133,7 @@ fn repeatable_read_snapshot_frozen_after_begin() {
     // Capture snapshot state before refresh.
     let xmin_before = t1.snapshot.xmin;
     let xmax_before = t1.snapshot.xmax;
-    let xip_before: Vec<_> = t1.snapshot.xip.iter().copied().collect();
+    let xip_before: Vec<_> = t1.snapshot.xip().to_vec();
 
     let mut t1 = t1;
     mgr.refresh_snapshot(&mut t1);
@@ -146,14 +146,14 @@ fn repeatable_read_snapshot_frozen_after_begin() {
         t1.snapshot.xmax, xmax_before,
         "RR snapshot xmax must not change on refresh"
     );
-    let xip_after: Vec<_> = t1.snapshot.xip.iter().copied().collect();
+    let xip_after: Vec<_> = t1.snapshot.xip().to_vec();
     assert_eq!(
         xip_after, xip_before,
         "RR snapshot xip must not change on refresh"
     );
     // T0 is still considered in-progress by T1's frozen snapshot.
     assert!(
-        t1.snapshot.xip.contains(&t0_xid),
+        t1.snapshot.xip().contains(&t0_xid),
         "under RR, T0 remains in T1's frozen snapshot even after committing"
     );
 

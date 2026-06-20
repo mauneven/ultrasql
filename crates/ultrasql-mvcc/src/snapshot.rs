@@ -41,7 +41,12 @@ pub struct Snapshot {
     pub current_command: CommandId,
     /// Snapshot-time in-progress XIDs in `[xmin, xmax)`. Sorted
     /// ascending; we exploit the ordering for `binary_search`.
-    pub xip: ActiveXids,
+    ///
+    /// Private to protect the sorted invariant that
+    /// [`Snapshot::xid_in_progress`]'s `binary_search` depends on.
+    /// Read access is via [`Snapshot::xip`]; the only way to populate
+    /// it is [`Snapshot::new`], which sorts.
+    xip: ActiveXids,
 }
 
 impl Snapshot {
@@ -89,6 +94,16 @@ impl Snapshot {
     #[must_use]
     pub fn is_current_xid(&self, xid: Xid) -> bool {
         xid == self.current_xid
+    }
+
+    /// The snapshot-time in-progress XIDs in `[xmin, xmax)`, sorted
+    /// ascending.
+    ///
+    /// Returned as a shared slice so callers cannot perturb the sorted
+    /// invariant that [`Self::xid_in_progress`] relies on.
+    #[must_use]
+    pub fn xip(&self) -> &[Xid] {
+        &self.xip
     }
 }
 
@@ -140,7 +155,7 @@ mod tests {
     #[test]
     fn xip_is_sorted_after_construction() {
         let s = snap(10, 20, 15, 0, &[16, 12, 14]);
-        let xips: Vec<u64> = s.xip.iter().map(|x| x.raw()).collect();
+        let xips: Vec<u64> = s.xip().iter().map(|x| x.raw()).collect();
         assert_eq!(xips, vec![12, 14, 16]);
     }
 
