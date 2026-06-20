@@ -1,230 +1,67 @@
 #!/usr/bin/env bash
-# Run every gate the CI runs, before letting the push leave the box.
-# Refuses the push on any failure. Bypassable with --no-verify if you
-# really know what you're doing.
+# Pre-push: validate the TEST SUITE only — nothing more.
 #
-# Mirrors .github/workflows/ci.yml. If a new CI gate lands, add it here.
+# The full gate (fmt, clippy, cargo-doc strict, cargo-deny, regression bench,
+# parser fuzz, and the per-crate llvm-cov coverage floor) still runs on the
+# remote for every push/merge via .github/workflows/ci.yml + coverage.yml.
+# Keeping the local pre-push to just the tests trades a little remote-only risk
+# for a fast local push. The previous all-gates hook is in git history if you
+# want to restore it.
 #
-# Gate order (optimised for fast failure):
-#   1. cargo fmt --all -- --check          (~1 s)
-#   2. cargo clippy (lib tests only)       (~30 s after first compile)
-#   3. cargo test --lib                    (lib tests only; skip integration)
-#   4. cargo doc (strict)                  (~20 s)
-#   5. cargo deny check advisories         (skip bans/licenses/sources — CI handles them)
-#   6. regression-gate --smoke             (~5 s, "did it crash?" only)
-#   7. parser fuzz smoke                   (~15 s, nightly only)
-#   8. tests + per-crate coverage gate     (full suite under llvm-cov; the
-#                                           heavy gate, runs last so cheap
-#                                           checks fail first — several minutes)
+# Runs the ENTIRE suite (lib + integration) WITHOUT coverage instrumentation,
+# which is what made the old gate slow. A single failing test refuses the push.
 #
-# Gate 8 runs the ENTIRE test suite (lib + integration) under instrumentation,
-# so a single failing test refuses the push, and then enforces a per-crate
-# line-coverage floor. Full deny + full bench still run in CI on merge.
-# Before promoting a perf-sensitive commit run `make bench-full` locally.
-#
-# Coverage floor — ratchet toward 90%:
-#   The per-crate floor starts at the workspace's current passing level (80%,
-#   matching CI) and is RAISED toward the 90% target as coverage improves.
-#   Never lower it. Override the enforced floor for a single run with
-#   ULTRASQL_COVERAGE_MIN=<pct>. Edit COVERAGE_MIN_LINES below to ratchet the
-#   committed default upward.
-#
-# Pre-push escape hatches:
-#   ULTRASQL_SKIP_BENCH=1 git push
-#     Skips the regression gate.  Allowed ONLY for documentation-only commits.
-#   ULTRASQL_SKIP_COV=1 git push
-#     Skips the tests+coverage gate (gate 8).  Allowed ONLY for tooling/docs
-#     pushes; CI still enforces coverage on the remote.
-#   --no-verify
-#     Bypasses ALL gates.  Use only when you know what you are doing.
-#
-# Auto-skip conditions (no escape hatch needed):
-#   - Only .md / docs/** files changed  → regression + coverage gates skipped.
-#   - Only benches/** or benchmarks/results/latest/** changed  → both skipped.
+# Escape hatches:
+#   --no-verify                 bypass entirely
+#   docs/bench-only diff         auto-skipped (nothing to test)
 
 set -e -o pipefail
 
 cd "$(git rev-parse --show-toplevel)"
 
 if ! command -v cargo >/dev/null 2>&1; then
-    # Shell sourced from a non-interactive context (e.g. gh CLI) may
-    # not have $CARGO_HOME on PATH. Source the standard rustup env.
+    # Shell sourced from a non-interactive context (e.g. gh CLI) may not have
+    # $CARGO_HOME on PATH. Source the standard rustup env.
     if [ -f "$HOME/.cargo/env" ]; then
         # shellcheck disable=SC1091
         . "$HOME/.cargo/env"
     fi
 fi
 
-# Maximise parallelism so cargo phases don't serialize unnecessarily.
+# Maximise parallelism; keep the incremental cache from bloating local disk.
 export CARGO_BUILD_JOBS
 CARGO_BUILD_JOBS="$(sysctl -n hw.ncpu 2>/dev/null || nproc 2>/dev/null || echo 4)"
+export CARGO_INCREMENTAL=0
 
-step() {
-    printf "\n\033[1m== %s ==\033[0m\n" "$1"
-}
-
-# ── 1. Format ────────────────────────────────────────────────────────────────
-
-step "cargo fmt --all -- --check"
-cargo fmt --all -- --check
-
-# ── 2. Clippy ────────────────────────────────────────────────────────────────
-
-step "cargo clippy --workspace --all-targets --all-features -- -D warnings"
-cargo clippy --workspace --all-targets --all-features -- -D warnings
-
-# ── 3. Tests (lib only; integration tests run in CI) ─────────────────────────
-#
-# Using --lib skips the slower integration test binaries in tests/ while still
-# exercising all #[test] items embedded inside crate source files.
-
-step "cargo test --workspace --all-features --lib"
-cargo test --workspace --all-features --lib
-
-# ── 4. Docs ──────────────────────────────────────────────────────────────────
-
-step "cargo doc --workspace --all-features --no-deps  (strict)"
-RUSTDOCFLAGS="-D warnings -D rustdoc::broken-intra-doc-links" \
-    cargo doc --workspace --all-features --no-deps
-
-# ── 5. cargo-deny (advisories only; bans/licenses/sources in CI) ─────────────
-
-if command -v cargo-deny >/dev/null 2>&1; then
-    step "cargo deny check advisories"
-    cargo deny check advisories
-else
-    printf "\n\033[1;33m== cargo-deny not installed locally — skipped. brew install cargo-deny ==\033[0m\n"
-fi
-
-# ── 6. Regression gate ───────────────────────────────────────────────────────
-#
-# Detects whether the push includes any non-documentation / non-bench file
-# changes. Skips the gate when:
-#   a) ULTRASQL_SKIP_BENCH=1 is set in the environment.
-#   b) Every changed file is docs-only (.md, docs/**).
-#   c) Every changed file is bench-only (benches/**, benchmarks/results/latest/**).
-#
-# Pre-push uses --smoke (1 iteration, no competitor-floor checks, ≤ 5 s).
-# Full sweep: make bench-full
-
-step "regression gate (smoke — crash check only)"
-
-_run_regression_gate_smoke() {
-    cargo run --release --package ultrasql-bench --bin regression-gate -- \
-        --stage current \
-        --smoke
-}
-
+# ── Auto-skip: nothing to test when only docs/bench files changed ────────────
 _changed_files() {
-    # List files changed between the remote tip and the local HEAD.
-    # On a brand-new branch or before the first push, compare against the
-    # merge-base with main; fall back to HEAD~1 when that fails.
     if git rev-parse --verify HEAD~1 >/dev/null 2>&1; then
         git diff --name-only HEAD~1 HEAD 2>/dev/null || true
     fi
 }
 
-_is_gate_skip_only() {
-    # Return 0 (true) when EVERY changed file matches the skip pattern:
-    #   .md files, docs/**, benches/**, benchmarks/results/latest/**
+_is_docs_or_bench_only() {
     local changed
     changed=$(_changed_files)
-    if [ -z "$changed" ]; then
-        # No detectable diff — be conservative and run the gate.
-        return 1
-    fi
+    [ -z "$changed" ] && return 1   # no detectable diff → run the tests
     while IFS= read -r f; do
         case "$f" in
-            *.md | docs/* | docs\\*) ;;                          # docs-only
-            */benches/* | benches/*)  ;;                         # bench source
-            benchmarks/results/latest/*) ;;                      # bench results
-            *) return 1 ;;                                       # source file
+            *.md | docs/*) ;;                       # docs
+            */benches/* | benches/*) ;;             # bench source
+            benchmarks/results/latest/*) ;;         # bench results
+            *) return 1 ;;                          # a real source file
         esac
     done <<< "$changed"
     return 0
 }
 
-if [ -n "${ULTRASQL_SKIP_BENCH:-}" ]; then
-    printf "\n\033[1;33m== regression gate skipped (ULTRASQL_SKIP_BENCH set) ==\033[0m\n"
-    printf "   NOTE: allowed only for documentation-only commits.\n"
-    printf "   The CI bench job will enforce the gate on the remote.\n"
-elif _is_gate_skip_only; then
-    printf "\n\033[1;33m== regression gate skipped (docs/bench-only diff detected) ==\033[0m\n"
-else
-    _run_regression_gate_smoke
+if _is_docs_or_bench_only; then
+    printf "\n\033[1;33m== tests skipped (docs/bench-only diff) ==\033[0m\n"
+    exit 0
 fi
 
-# ── 7. Parser fuzz smoke (15 s, nightly only) ────────────────────────────────
-#
-# Runs the parser_fuzz target for a short wall-clock budget to catch
-# obvious panics before they reach CI. Skipped silently when:
-#   - no nightly toolchain is installed, or
-#   - cargo-fuzz is not installed.
+# ── Tests (full suite: lib + integration, no coverage instrumentation) ───────
+printf "\n\033[1m== cargo test --workspace --all-features ==\033[0m\n"
+cargo test --workspace --all-features
 
-if rustup toolchain list 2>/dev/null | grep -q '^nightly'; then
-    step "parser fuzz smoke (15s)"
-    if command -v cargo-fuzz >/dev/null 2>&1; then
-        (cd fuzz && cargo +nightly fuzz run parser_fuzz -- -max_total_time=15) || exit 1
-    else
-        printf "   cargo-fuzz not installed — skipped\n"
-    fi
-else
-    printf "\n\033[1;33m== fuzz smoke skipped (no nightly toolchain) ==\033[0m\n"
-fi
-
-# ── 8. Tests + per-crate coverage gate ───────────────────────────────────────
-#
-# Runs the ENTIRE test suite (lib + integration) under llvm-cov instrumentation
-# and refuses the push when:
-#   a) any test fails (cargo llvm-cov exits non-zero), or
-#   b) any shipping crate is below the per-crate line-coverage floor.
-#
-# The floor ratchets toward 90% (see header). It defaults to 80% — the
-# workspace's current passing floor, matching .github/workflows/coverage.yml —
-# and is raised over time. ultrasql-bench is excluded (non-published harness),
-# exactly as CI does.
-#
-# Honours ULTRASQL_SKIP_COV=1 and the same docs/bench-only auto-skip as the
-# regression gate. If cargo-llvm-cov is not installed the gate warns and skips
-# (the CI llvm-cov job still enforces coverage on the remote), matching the
-# cargo-deny fallback above.
-
-COVERAGE_MIN_LINES="${ULTRASQL_COVERAGE_MIN:-80}"  # ratchet toward 90; never lower
-COVERAGE_TARGET=90
-
-step "tests + per-crate coverage gate (floor ${COVERAGE_MIN_LINES}%, target ${COVERAGE_TARGET}%)"
-
-_run_coverage_gate() {
-    if ! command -v cargo-llvm-cov >/dev/null 2>&1; then
-        printf "\n\033[1;33m== cargo-llvm-cov not installed — coverage gate skipped ==\033[0m\n"
-        printf "   Install: cargo install cargo-llvm-cov   (CI enforces coverage on the remote)\n"
-        return 0
-    fi
-    mkdir -p target/llvm-cov
-    # `clean` discards stale profraw so the numbers reflect this exact tree.
-    cargo llvm-cov clean --workspace
-    # Runs the full test suite under instrumentation; a failing test aborts here
-    # (set -e), which is the "tests must all be green" half of the gate.
-    cargo llvm-cov --workspace --all-features \
-        --json --output-path target/llvm-cov/coverage.json
-    # The per-crate line-coverage floor is the second half of the gate.
-    python3 scripts/coverage_gate.py \
-        target/llvm-cov/coverage.json \
-        --root . \
-        --min-lines "$COVERAGE_MIN_LINES" \
-        --exclude-crate ultrasql-bench \
-        --summary-json target/llvm-cov/per-crate-coverage.json \
-        --summary-md target/llvm-cov/per-crate-coverage.md
-}
-
-if [ -n "${ULTRASQL_SKIP_COV:-}" ]; then
-    printf "\n\033[1;33m== coverage gate skipped (ULTRASQL_SKIP_COV set) ==\033[0m\n"
-    printf "   NOTE: allowed only for tooling/docs pushes.\n"
-    printf "   The CI llvm-cov job will enforce coverage on the remote.\n"
-elif _is_gate_skip_only; then
-    printf "\n\033[1;33m== coverage gate skipped (docs/bench-only diff detected) ==\033[0m\n"
-else
-    _run_coverage_gate
-fi
-
-printf "\n\033[1;32m== all gates green; push allowed ==\033[0m\n"
+printf "\n\033[1;32m== tests passed; push allowed ==\033[0m\n"
