@@ -21,7 +21,7 @@ TPCH_DUCKDB      ?= duckdb
 TPCH_QUERIES     ?= all
 TPCH_POOL_FRAMES ?= 262144
 
-.PHONY: bench-smoke bench-full bench-record tpch-validate clean-scratch help
+.PHONY: bench-smoke bench-full bench-record tpch-validate clean-scratch trim trim-deep help
 
 help:
 	@echo "UltraSQL benchmark targets:"
@@ -30,6 +30,18 @@ help:
 	@echo "  make bench-record   full sweep + write baselines/<stage>.json"
 	@echo "  make tpch-validate  TPC-H correctness; override TPCH_QUERIES=4,11,16"
 	@echo "  make clean-scratch  reclaim build/benchmark scratch disk (safe)"
+	@echo "  make trim           reclaim regenerable build trees, keep host build"
+	@echo "  make trim-deep      trim + cargo clean (frees most; next build is cold)"
+
+# Reclaim regenerable build disk (coverage, docs, cross-compile, incremental,
+# fuzz) while keeping the host debug/release builds, so it does NOT force a
+# rebuild. Use trim-deep to also purge the (stale-accumulating) host artifacts.
+trim:
+	scripts/trim-build.sh
+
+trim-deep:
+	scripts/trim-build.sh
+	$(CARGO) clean
 
 bench-smoke:
 	CARGO_INCREMENTAL=0 \
