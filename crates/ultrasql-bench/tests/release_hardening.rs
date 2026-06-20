@@ -18,6 +18,37 @@ fn repo_file(path: &str) -> String {
     fs::read_to_string(&path).unwrap_or_else(|err| panic!("read {}: {err}", path.display()))
 }
 
+/// Read a source path that may be a single file (`foo.rs`) or, after a module
+/// split, a directory module (`foo/` with mod.rs + submodules). For a directory
+/// module the combined source of every `.rs` file (recursively) is returned, so
+/// hygiene assertions keep covering the whole module.
+fn module_source(rel: &str) -> String {
+    let direct = repo_path(rel);
+    if direct.is_file() {
+        return repo_file(rel);
+    }
+    let dir = direct.with_extension(""); // `foo.rs` -> `foo/`
+    let mut out = String::new();
+    let mut stack = vec![dir];
+    while let Some(d) = stack.pop() {
+        let entries =
+            fs::read_dir(&d).unwrap_or_else(|err| panic!("read dir {}: {err}", d.display()));
+        for entry in entries {
+            let p = entry.expect("dir entry").path();
+            if p.is_dir() {
+                stack.push(p);
+            } else if p.extension().and_then(|e| e.to_str()) == Some("rs") {
+                out.push('\n');
+                out.push_str(
+                    &fs::read_to_string(&p)
+                        .unwrap_or_else(|err| panic!("read {}: {err}", p.display())),
+                );
+            }
+        }
+    }
+    out
+}
+
 #[test]
 fn catalog_upgrade_story_is_documented_and_enforced() {
     let docs = repo_file("docs/catalog-upgrades.md");
@@ -702,7 +733,7 @@ fn principal_files_keep_hygiene_guards() {
         "crates/ultrasql-storage/src/heap/helpers.rs",
         "crates/ultrasql-storage/src/heap/update.rs",
     ] {
-        let source = repo_file(path);
+        let source = module_source(path);
         assert!(
             !source.contains("#![allow(unused_imports)]"),
             "{path} must prune stale imports instead of suppressing them"
@@ -713,7 +744,7 @@ fn principal_files_keep_hygiene_guards() {
         "crates/ultrasql-storage/src/heap/delete.rs",
         "crates/ultrasql-storage/src/heap/update_inplace.rs",
     ] {
-        let source = repo_file(path);
+        let source = module_source(path);
         assert!(
             !source.contains("clippy::cast_possible") && !source.contains("clippy::cast_lossless"),
             "{path} must use checked/widening conversions instead of suppressing cast lints"
@@ -741,7 +772,7 @@ fn principal_files_keep_hygiene_guards() {
         "crates/ultrasql-executor/src/nested_loop_join.rs",
         "crates/ultrasql-executor/src/hash_aggregate.rs",
     ] {
-        let source = repo_file(path);
+        let source = module_source(path);
         assert!(
             !source.contains("expect(\"just-set\")"),
             "{path} must return ExecError::Internal instead of panicking on state-machine invariants"
@@ -771,7 +802,7 @@ fn principal_files_keep_hygiene_guards() {
         "crates/ultrasql-server/src/session/startup.rs",
         "crates/ultrasql-server/src/session/txn.rs",
     ] {
-        let source = repo_file(path);
+        let source = module_source(path);
         assert!(
             !source.contains("#![allow(unused_imports)]"),
             "{path} must prune stale imports instead of suppressing unused imports"
@@ -781,7 +812,9 @@ fn principal_files_keep_hygiene_guards() {
 
 #[test]
 fn runtime_metadata_writes_are_nofollow_and_fsynced() {
-    let source = repo_file("crates/ultrasql-server/src/lib.rs");
+    // The runtime-metadata write path lives in the `metadata_io` module
+    // (extracted from lib.rs when lib.rs was split into submodules).
+    let source = repo_file("crates/ultrasql-server/src/metadata_io.rs");
 
     for needle in [
         "fn write_runtime_metadata_file",

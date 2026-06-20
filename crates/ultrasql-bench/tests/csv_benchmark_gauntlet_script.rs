@@ -10,6 +10,28 @@ fn repo_file(path: &str) -> String {
     fs::read_to_string(&path).unwrap_or_else(|err| panic!("read {}: {err}", path.display()))
 }
 
+/// Full source of the `cross_compare_sql` driver: the binary entrypoint plus
+/// every file in its `cross_compare_sql_support/` module directory. The driver
+/// is split across modules, so workload definitions may live in any of them.
+fn cross_compare_sql_driver_source() -> String {
+    let mut src = repo_file("crates/ultrasql-bench/src/bin/cross_compare_sql.rs");
+    let support_dir =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/bin/cross_compare_sql_support");
+    let mut paths: Vec<PathBuf> = fs::read_dir(&support_dir)
+        .unwrap_or_else(|err| panic!("read dir {}: {err}", support_dir.display()))
+        .map(|entry| entry.expect("dir entry").path())
+        .filter(|p| p.extension().and_then(|e| e.to_str()) == Some("rs"))
+        .collect();
+    paths.sort();
+    for p in paths {
+        src.push('\n');
+        src.push_str(
+            &fs::read_to_string(&p).unwrap_or_else(|err| panic!("read {}: {err}", p.display())),
+        );
+    }
+    src
+}
+
 #[test]
 fn csv_gauntlet_declares_required_workloads_and_engines() {
     let script = repo_file("benchmarks/csv_benchmark_gauntlet.sh");
@@ -58,7 +80,7 @@ fn csv_gauntlet_sets_ultrasql_read_limit_for_generated_full_dataset() {
 
 #[test]
 fn cross_compare_sql_exposes_csv_workloads() {
-    let driver = repo_file("crates/ultrasql-bench/src/bin/cross_compare_sql.rs");
+    let driver = cross_compare_sql_driver_source();
 
     for workload in [
         "CsvColdRead",

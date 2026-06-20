@@ -14,6 +14,28 @@ fn repo_file(path: &str) -> String {
     fs::read_to_string(&path).unwrap_or_else(|err| panic!("read {}: {err}", path.display()))
 }
 
+/// Full source of the `cross_compare_sql` driver: the binary entrypoint plus
+/// every file in its `cross_compare_sql_support/` module directory. Workload
+/// definitions are split across those modules, so contract assertions must
+/// search the whole tree, not just the entrypoint.
+fn cross_compare_sql_driver_source() -> String {
+    let mut src = repo_file("crates/ultrasql-bench/src/bin/cross_compare_sql.rs");
+    let dir = repo_path("crates/ultrasql-bench/src/bin/cross_compare_sql_support");
+    let mut paths: Vec<PathBuf> = fs::read_dir(&dir)
+        .unwrap_or_else(|err| panic!("read dir {}: {err}", dir.display()))
+        .map(|entry| entry.expect("dir entry").path())
+        .filter(|p| p.extension().and_then(|e| e.to_str()) == Some("rs"))
+        .collect();
+    paths.sort();
+    for p in paths {
+        src.push('\n');
+        src.push_str(
+            &fs::read_to_string(&p).unwrap_or_else(|err| panic!("read {}: {err}", p.display())),
+        );
+    }
+    src
+}
+
 #[test]
 fn scale_sweep_script_uses_external_release_artifact() {
     let script = repo_file("benchmarks/run_scale_sweep.sh");
@@ -202,7 +224,7 @@ fn mixed_correctness_runner_uses_declared_storage_mode() {
 
 #[test]
 fn bulk_write_competitors_match_unindexed_ultrasql_schema() {
-    let driver = repo_file("crates/ultrasql-bench/src/bin/cross_compare_sql.rs");
+    let driver = cross_compare_sql_driver_source();
     assert!(driver.contains("CREATE TABLE {table} (id INT NOT NULL, val INT)"));
 
     // DuckDB and SQLite keep bash run_insert/run_update/run_mixed functions.
@@ -273,13 +295,13 @@ fn scale_sweep_writes_manifest_before_fastest_gate() {
 
 #[test]
 fn ultrasql_delete_benchmark_uses_rollback_methodology() {
-    let driver = repo_file("crates/ultrasql-bench/src/bin/cross_compare_sql.rs");
+    let driver = cross_compare_sql_driver_source();
     let start = driver
         .find("async fn run_shared_delete")
         .expect("run_shared_delete");
     let tail = &driver[start..];
     let end = tail
-        .find("/// Shared-table SELECT-scan workload")
+        .find("async fn run_shared_update")
         .expect("next workload marker");
     let body = &tail[..end];
 
@@ -303,12 +325,9 @@ fn ultrasql_delete_benchmark_uses_rollback_methodology() {
 
 #[test]
 fn ultrasql_bulk_write_benchmarks_use_execute_style_wire_path() {
-    let driver = repo_file("crates/ultrasql-bench/src/bin/cross_compare_sql.rs");
+    let driver = cross_compare_sql_driver_source();
     for (fn_name, next_marker) in [
-        (
-            "async fn run_shared_delete",
-            "/// Shared-table SELECT-scan workload",
-        ),
+        ("async fn run_shared_delete", "async fn run_shared_update"),
         (
             "async fn run_shared_update",
             "fn push_mixed_correctness_row",
@@ -332,7 +351,7 @@ fn ultrasql_bulk_write_benchmarks_use_execute_style_wire_path() {
 
 #[test]
 fn ultrasql_raw_driver_records_storage_profile() {
-    let driver = repo_file("crates/ultrasql-bench/src/bin/cross_compare_sql.rs");
+    let driver = cross_compare_sql_driver_source();
     assert!(driver.contains("enum StorageMode"));
     assert!(driver.contains("#[arg(long, value_enum, default_value_t = StorageMode::Memory)]"));
     assert!(driver.contains("\"storage_mode\": args.storage_mode.as_str()"));
@@ -341,7 +360,7 @@ fn ultrasql_raw_driver_records_storage_profile() {
 
 #[test]
 fn ultrasql_mixed_oltp_batches_wire_roundtrips() {
-    let driver = repo_file("crates/ultrasql-bench/src/bin/cross_compare_sql.rs");
+    let driver = cross_compare_sql_driver_source();
     let start = driver
         .find("async fn run_mixed_oltp_iter")
         .expect("run_mixed_oltp_iter");

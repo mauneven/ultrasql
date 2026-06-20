@@ -20,6 +20,28 @@ fn repo_file(path: &str) -> String {
     fs::read_to_string(&path).unwrap_or_else(|err| panic!("read {}: {err}", path.display()))
 }
 
+/// Full source of the `cross_compare_sql` driver: the binary entrypoint plus
+/// every file in its `cross_compare_sql_support/` module directory. Workload
+/// definitions are split across those modules, so contract assertions must
+/// search the whole tree, not just the entrypoint.
+fn cross_compare_sql_driver_source() -> String {
+    let mut src = repo_file("crates/ultrasql-bench/src/bin/cross_compare_sql.rs");
+    let dir = repo_path("crates/ultrasql-bench/src/bin/cross_compare_sql_support");
+    let mut paths: Vec<PathBuf> = fs::read_dir(&dir)
+        .unwrap_or_else(|err| panic!("read dir {}: {err}", dir.display()))
+        .map(|entry| entry.expect("dir entry").path())
+        .filter(|p| p.extension().and_then(|e| e.to_str()) == Some("rs"))
+        .collect();
+    paths.sort();
+    for p in paths {
+        src.push('\n');
+        src.push_str(
+            &fs::read_to_string(&p).unwrap_or_else(|err| panic!("read {}: {err}", p.display())),
+        );
+    }
+    src
+}
+
 #[test]
 fn firebolt_aggregate_script_declares_competitor_and_index_workload() {
     let script = repo_file("benchmarks/firebolt_aggregate_index.sh");
@@ -266,7 +288,7 @@ fn firebolt_artifacts_have_required_local_core_schema() {
 
 #[test]
 fn cross_compare_sql_exposes_dashboard_aggregate_workload() {
-    let driver = repo_file("crates/ultrasql-bench/src/bin/cross_compare_sql.rs");
+    let driver = cross_compare_sql_driver_source();
 
     assert!(driver.contains("DashboardAggregate"));
     assert!(driver.contains("firebolt_aggregate_index"));
@@ -279,7 +301,7 @@ fn cross_compare_sql_exposes_dashboard_aggregate_workload() {
 
 #[test]
 fn cross_compare_sql_exposes_sparse_pruning_workload() {
-    let driver = repo_file("crates/ultrasql-bench/src/bin/cross_compare_sql.rs");
+    let driver = cross_compare_sql_driver_source();
 
     assert!(driver.contains("SparsePruning"));
     assert!(driver.contains("firebolt_sparse_pruning"));
@@ -290,7 +312,7 @@ fn cross_compare_sql_exposes_sparse_pruning_workload() {
 #[test]
 fn late_materialization_script_declares_firebolt_style_workload() {
     let script = repo_file("benchmarks/late_materialization.sh");
-    let driver = repo_file("crates/ultrasql-bench/src/bin/cross_compare_sql.rs");
+    let driver = cross_compare_sql_driver_source();
     let certify = repo_file("benchmarks/certify.sh");
 
     assert!(script.contains("--workload late-materialization"));
