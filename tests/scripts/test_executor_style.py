@@ -2,6 +2,8 @@ import re
 import unittest
 from pathlib import Path
 
+from _source_text import module_text
+
 
 REPO = Path(__file__).resolve().parents[2]
 WINDOW_AGG = REPO / "crates" / "ultrasql-executor" / "src" / "window_agg.rs"
@@ -21,7 +23,7 @@ FLOAT_AS_CAST = re.compile(r"\bas\s+(?:f32|f64)\b|allow\([^)]*clippy::cast_")
 class ExecutorStyleTests(unittest.TestCase):
     def test_window_aggregate_uses_checked_integer_conversions(self) -> None:
         offenders: list[str] = []
-        for line_no, line in enumerate(WINDOW_AGG.read_text().splitlines(), start=1):
+        for line_no, line in enumerate(module_text(WINDOW_AGG).splitlines(), start=1):
             code = line.split("//", maxsplit=1)[0]
             if INTEGER_AS_CAST.search(code):
                 offenders.append(f"{WINDOW_AGG.relative_to(REPO)}:{line_no}: {line.strip()}")
@@ -30,7 +32,7 @@ class ExecutorStyleTests(unittest.TestCase):
 
     def test_seq_scan_tests_use_checked_integer_conversions(self) -> None:
         offenders: list[str] = []
-        for line_no, line in enumerate(SEQ_SCAN.read_text().splitlines(), start=1):
+        for line_no, line in enumerate(module_text(SEQ_SCAN).splitlines(), start=1):
             code = line.split("//", maxsplit=1)[0]
             if INTEGER_AS_CAST.search(code):
                 offenders.append(f"{SEQ_SCAN.relative_to(REPO)}:{line_no}: {line.strip()}")
@@ -40,7 +42,7 @@ class ExecutorStyleTests(unittest.TestCase):
     def test_aggregate_percentiles_use_checked_integer_conversions(self) -> None:
         offenders: list[str] = []
         for path in AGGREGATE_FILES:
-            for line_no, line in enumerate(path.read_text().splitlines(), start=1):
+            for line_no, line in enumerate(module_text(path).splitlines(), start=1):
                 code = line.split("//", maxsplit=1)[0]
                 if INTEGER_AS_CAST.search(code):
                     offenders.append(f"{path.relative_to(REPO)}:{line_no}: {line.strip()}")
@@ -49,7 +51,7 @@ class ExecutorStyleTests(unittest.TestCase):
 
     def test_aggregate_math_uses_checked_float_conversions(self) -> None:
         offenders: list[str] = []
-        for line_no, line in enumerate(AGGREGATE_MATH.read_text().splitlines(), start=1):
+        for line_no, line in enumerate(module_text(AGGREGATE_MATH).splitlines(), start=1):
             code = line.split("//", maxsplit=1)[0]
             if FLOAT_AS_CAST.search(code):
                 offenders.append(f"{AGGREGATE_MATH.relative_to(REPO)}:{line_no}: {line.strip()}")
@@ -59,7 +61,7 @@ class ExecutorStyleTests(unittest.TestCase):
     def test_executor_source_uses_checked_float_conversions(self) -> None:
         offenders: list[str] = []
         for path in sorted(EXECUTOR_SRC.rglob("*.rs")):
-            for line_no, line in enumerate(path.read_text().splitlines(), start=1):
+            for line_no, line in enumerate(module_text(path).splitlines(), start=1):
                 code = line.split("//", maxsplit=1)[0]
                 if FLOAT_AS_CAST.search(code):
                     offenders.append(f"{path.relative_to(REPO)}:{line_no}: {line.strip()}")

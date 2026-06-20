@@ -2,6 +2,8 @@ import re
 import unittest
 from pathlib import Path
 
+from _source_text import module_text
+
 
 REPO = Path(__file__).resolve().parents[2]
 ID_RS = REPO / "crates" / "ultrasql-core" / "src" / "id.rs"
@@ -15,7 +17,7 @@ class CoreStyleTests(unittest.TestCase):
     def test_ids_use_checked_or_lossless_integer_conversions(self) -> None:
         offenders: list[str] = []
         for source in CORE_SOURCES:
-            for line_no, line in enumerate(source.read_text().splitlines(), start=1):
+            for line_no, line in enumerate(module_text(source).splitlines(), start=1):
                 code = line.split("//", maxsplit=1)[0]
                 if INTEGER_AS_CAST.search(code):
                     offenders.append(f"{source.relative_to(REPO)}:{line_no}: {line.strip()}")
@@ -24,7 +26,7 @@ class CoreStyleTests(unittest.TestCase):
 
     def test_values_use_checked_float_conversions(self) -> None:
         offenders: list[str] = []
-        for line_no, line in enumerate(VALUE_RS.read_text().splitlines(), start=1):
+        for line_no, line in enumerate(module_text(VALUE_RS).splitlines(), start=1):
             code = line.split("//", maxsplit=1)[0]
             if VALUE_FLOAT_CAST.search(code):
                 offenders.append(f"{VALUE_RS.relative_to(REPO)}:{line_no}: {line.strip()}")

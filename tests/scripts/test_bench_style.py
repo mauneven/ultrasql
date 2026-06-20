@@ -2,6 +2,8 @@ import re
 import unittest
 from pathlib import Path
 
+from _source_text import module_text
+
 
 REPO = Path(__file__).resolve().parents[2]
 BENCH_RUN_FILES = sorted(
@@ -123,7 +125,7 @@ class BenchStyleTests(unittest.TestCase):
     def test_bench_renderer_uses_checked_numeric_conversions(self) -> None:
         offenders: list[str] = []
         for path in BENCH_FILES:
-            for line_no, line in enumerate(path.read_text().splitlines(), start=1):
+            for line_no, line in enumerate(module_text(path).splitlines(), start=1):
                 code = line.split("//", maxsplit=1)[0]
                 if NUMERIC_AS_CAST.search(code):
                     offenders.append(f"{path.relative_to(REPO)}:{line_no}: {line.strip()}")
@@ -133,7 +135,7 @@ class BenchStyleTests(unittest.TestCase):
     def test_bench_runs_use_checked_numeric_conversions(self) -> None:
         offenders: list[str] = []
         for path in BENCH_RUN_FILES:
-            for line_no, line in enumerate(path.read_text().splitlines(), start=1):
+            for line_no, line in enumerate(module_text(path).splitlines(), start=1):
                 code = line.split("//", maxsplit=1)[0]
                 if BENCH_RUN_NUMERIC_CAST.search(code):
                     offenders.append(f"{path.relative_to(REPO)}:{line_no}: {line.strip()}")
@@ -143,7 +145,7 @@ class BenchStyleTests(unittest.TestCase):
     def test_bench_helpers_use_checked_numeric_conversions(self) -> None:
         offenders: list[str] = []
         for path in BENCH_HELPER_FILES:
-            for line_no, line in enumerate(path.read_text().splitlines(), start=1):
+            for line_no, line in enumerate(module_text(path).splitlines(), start=1):
                 code = line.split("//", maxsplit=1)[0]
                 if BENCH_HELPER_NUMERIC_CAST.search(code):
                     offenders.append(f"{path.relative_to(REPO)}:{line_no}: {line.strip()}")
@@ -153,7 +155,7 @@ class BenchStyleTests(unittest.TestCase):
     def test_ann_percentiles_use_checked_index_conversions(self) -> None:
         offenders: list[str] = []
         for path in ANN_FILES:
-            for line_no, line in enumerate(path.read_text().splitlines(), start=1):
+            for line_no, line in enumerate(module_text(path).splitlines(), start=1):
                 code = line.split("//", maxsplit=1)[0]
                 if NEAREST_RANK_INDEX_CAST.search(code):
                     offenders.append(f"{path.relative_to(REPO)}:{line_no}: {line.strip()}")
@@ -163,7 +165,7 @@ class BenchStyleTests(unittest.TestCase):
     def test_ann_vector_generators_use_checked_seed_conversions(self) -> None:
         offenders: list[str] = []
         for path in ANN_FILES:
-            for line_no, line in enumerate(path.read_text().splitlines(), start=1):
+            for line_no, line in enumerate(module_text(path).splitlines(), start=1):
                 code = line.split("//", maxsplit=1)[0]
                 if ANN_VECTOR_SEED_WIDTH_CAST.search(code):
                     offenders.append(f"{path.relative_to(REPO)}:{line_no}: {line.strip()}")
@@ -173,7 +175,7 @@ class BenchStyleTests(unittest.TestCase):
     def test_ann_vector_generators_use_checked_component_conversions(self) -> None:
         offenders: list[str] = []
         for path in ANN_FILES:
-            for line_no, line in enumerate(path.read_text().splitlines(), start=1):
+            for line_no, line in enumerate(module_text(path).splitlines(), start=1):
                 code = line.split("//", maxsplit=1)[0]
                 if ANN_VECTOR_COMPONENT_FLOAT_CAST.search(code):
                     offenders.append(f"{path.relative_to(REPO)}:{line_no}: {line.strip()}")
@@ -183,7 +185,7 @@ class BenchStyleTests(unittest.TestCase):
     def test_sql_bench_percentiles_use_checked_index_conversions(self) -> None:
         offenders: list[str] = []
         for path in SQL_BENCH_FILES:
-            for line_no, line in enumerate(path.read_text().splitlines(), start=1):
+            for line_no, line in enumerate(module_text(path).splitlines(), start=1):
                 code = line.split("//", maxsplit=1)[0]
                 if SQL_PERCENTILE_INDEX_CAST.search(code):
                     offenders.append(f"{path.relative_to(REPO)}:{line_no}: {line.strip()}")
@@ -193,7 +195,7 @@ class BenchStyleTests(unittest.TestCase):
     def test_sql_bench_uses_checked_numeric_conversions(self) -> None:
         offenders: list[str] = []
         for path in SQL_BENCH_FILES:
-            for line_no, line in enumerate(path.read_text().splitlines(), start=1):
+            for line_no, line in enumerate(module_text(path).splitlines(), start=1):
                 code = line.split("//", maxsplit=1)[0]
                 if SQL_BENCH_NUMERIC_CAST.search(code):
                     offenders.append(f"{path.relative_to(REPO)}:{line_no}: {line.strip()}")
@@ -202,7 +204,7 @@ class BenchStyleTests(unittest.TestCase):
 
     def test_push_vs_pull_bench_uses_checked_integer_conversions(self) -> None:
         offenders: list[str] = []
-        for line_no, line in enumerate(PUSH_VS_PULL_BENCH.read_text().splitlines(), start=1):
+        for line_no, line in enumerate(module_text(PUSH_VS_PULL_BENCH).splitlines(), start=1):
             code = line.split("//", maxsplit=1)[0]
             if PUSH_VS_PULL_BENCH_CASTS.search(code):
                 offenders.append(f"{PUSH_VS_PULL_BENCH.relative_to(REPO)}:{line_no}: {line.strip()}")
@@ -211,7 +213,7 @@ class BenchStyleTests(unittest.TestCase):
 
     def test_v07_vectorized_bench_uses_checked_integer_conversions(self) -> None:
         offenders: list[str] = []
-        for line_no, line in enumerate(V07_VECTORIZED_BENCH.read_text().splitlines(), start=1):
+        for line_no, line in enumerate(module_text(V07_VECTORIZED_BENCH).splitlines(), start=1):
             code = line.split("//", maxsplit=1)[0]
             if V07_VECTORIZED_BENCH_CASTS.search(code):
                 offenders.append(f"{V07_VECTORIZED_BENCH.relative_to(REPO)}:{line_no}: {line.strip()}")
@@ -220,7 +222,7 @@ class BenchStyleTests(unittest.TestCase):
 
     def test_tpch_data_gen_uses_checked_conversions(self) -> None:
         offenders: list[str] = []
-        for line_no, line in enumerate(TPCH_DATA_GEN_FILE.read_text().splitlines(), start=1):
+        for line_no, line in enumerate(module_text(TPCH_DATA_GEN_FILE).splitlines(), start=1):
             code = line.split("//", maxsplit=1)[0]
             if TPCH_DATA_GEN_CAST.search(code):
                 offenders.append(
@@ -231,7 +233,7 @@ class BenchStyleTests(unittest.TestCase):
 
     def test_tpch_load_date_math_uses_checked_conversions(self) -> None:
         offenders: list[str] = []
-        for line_no, line in enumerate(TPCH_LOAD_FILE.read_text().splitlines(), start=1):
+        for line_no, line in enumerate(module_text(TPCH_LOAD_FILE).splitlines(), start=1):
             code = line.split("//", maxsplit=1)[0]
             if TPCH_LOAD_DATE_CAST.search(code):
                 offenders.append(f"{TPCH_LOAD_FILE.relative_to(REPO)}:{line_no}: {line.strip()}")
@@ -240,7 +242,7 @@ class BenchStyleTests(unittest.TestCase):
 
     def test_tpch_load_uses_checked_numeric_conversions(self) -> None:
         offenders: list[str] = []
-        for line_no, line in enumerate(TPCH_LOAD_FILE.read_text().splitlines(), start=1):
+        for line_no, line in enumerate(module_text(TPCH_LOAD_FILE).splitlines(), start=1):
             code = line.split("//", maxsplit=1)[0]
             if TPCH_LOAD_NUMERIC_CAST.search(code):
                 offenders.append(f"{TPCH_LOAD_FILE.relative_to(REPO)}:{line_no}: {line.strip()}")
@@ -256,7 +258,7 @@ class BenchStyleTests(unittest.TestCase):
             REPO / "crates" / "ultrasql-bench" / "src" / "runs" / "point_lookup.rs",
         ]
         for path in paths:
-            for line_no, line in enumerate(path.read_text().splitlines(), start=1):
+            for line_no, line in enumerate(module_text(path).splitlines(), start=1):
                 code = line.split("//", maxsplit=1)[0]
                 if BTREE_SHUFFLE_INDEX_CAST.search(code):
                     offenders.append(f"{path.relative_to(REPO)}:{line_no}: {line.strip()}")
@@ -266,7 +268,7 @@ class BenchStyleTests(unittest.TestCase):
     def test_mixed_oltp_uses_checked_rng_index_conversions(self) -> None:
         offenders: list[str] = []
         path = REPO / "crates" / "ultrasql-bench" / "src" / "runs" / "mixed_oltp.rs"
-        for line_no, line in enumerate(path.read_text().splitlines(), start=1):
+        for line_no, line in enumerate(module_text(path).splitlines(), start=1):
             code = line.split("//", maxsplit=1)[0]
             if MIXED_OLTP_INDEX_CAST.search(code):
                 offenders.append(f"{path.relative_to(REPO)}:{line_no}: {line.strip()}")
@@ -276,7 +278,7 @@ class BenchStyleTests(unittest.TestCase):
     def test_mixed_oltp_uses_checked_kind_width_conversions(self) -> None:
         offenders: list[str] = []
         path = REPO / "crates" / "ultrasql-bench" / "src" / "runs" / "mixed_oltp.rs"
-        for line_no, line in enumerate(path.read_text().splitlines(), start=1):
+        for line_no, line in enumerate(module_text(path).splitlines(), start=1):
             code = line.split("//", maxsplit=1)[0]
             if MIXED_OLTP_KIND_WIDTH_CAST.search(code):
                 offenders.append(f"{path.relative_to(REPO)}:{line_no}: {line.strip()}")
@@ -286,7 +288,7 @@ class BenchStyleTests(unittest.TestCase):
     def test_mixed_oltp_uses_checked_iteration_width_conversions(self) -> None:
         offenders: list[str] = []
         path = REPO / "crates" / "ultrasql-bench" / "src" / "runs" / "mixed_oltp.rs"
-        for line_no, line in enumerate(path.read_text().splitlines(), start=1):
+        for line_no, line in enumerate(module_text(path).splitlines(), start=1):
             code = line.split("//", maxsplit=1)[0]
             if MIXED_OLTP_ITERATION_WIDTH_CAST.search(code):
                 offenders.append(f"{path.relative_to(REPO)}:{line_no}: {line.strip()}")
@@ -296,7 +298,7 @@ class BenchStyleTests(unittest.TestCase):
     def test_tpcb_uses_checked_rng_index_conversions(self) -> None:
         offenders: list[str] = []
         path = REPO / "crates" / "ultrasql-bench" / "src" / "runs" / "tpcb.rs"
-        for line_no, line in enumerate(path.read_text().splitlines(), start=1):
+        for line_no, line in enumerate(module_text(path).splitlines(), start=1):
             code = line.split("//", maxsplit=1)[0]
             if TPCB_INDEX_CAST.search(code):
                 offenders.append(f"{path.relative_to(REPO)}:{line_no}: {line.strip()}")
@@ -306,7 +308,7 @@ class BenchStyleTests(unittest.TestCase):
     def test_tpcb_uses_checked_iteration_width_conversions(self) -> None:
         offenders: list[str] = []
         path = REPO / "crates" / "ultrasql-bench" / "src" / "runs" / "tpcb.rs"
-        for line_no, line in enumerate(path.read_text().splitlines(), start=1):
+        for line_no, line in enumerate(module_text(path).splitlines(), start=1):
             code = line.split("//", maxsplit=1)[0]
             if TPCB_ITERATION_WIDTH_CAST.search(code):
                 offenders.append(f"{path.relative_to(REPO)}:{line_no}: {line.strip()}")
@@ -316,7 +318,7 @@ class BenchStyleTests(unittest.TestCase):
     def test_tpch_q22_uses_checked_country_index_conversions(self) -> None:
         offenders: list[str] = []
         path = REPO / "crates" / "ultrasql-bench" / "src" / "runs" / "tpch_q22.rs"
-        for line_no, line in enumerate(path.read_text().splitlines(), start=1):
+        for line_no, line in enumerate(module_text(path).splitlines(), start=1):
             code = line.split("//", maxsplit=1)[0]
             if TPCH_Q22_COUNTRY_INDEX_CAST.search(code):
                 offenders.append(f"{path.relative_to(REPO)}:{line_no}: {line.strip()}")
@@ -326,7 +328,7 @@ class BenchStyleTests(unittest.TestCase):
     def test_tpch_q22_uses_checked_iteration_width_conversions(self) -> None:
         offenders: list[str] = []
         path = REPO / "crates" / "ultrasql-bench" / "src" / "runs" / "tpch_q22.rs"
-        for line_no, line in enumerate(path.read_text().splitlines(), start=1):
+        for line_no, line in enumerate(module_text(path).splitlines(), start=1):
             code = line.split("//", maxsplit=1)[0]
             if TPCH_Q22_ITERATION_WIDTH_CAST.search(code):
                 offenders.append(f"{path.relative_to(REPO)}:{line_no}: {line.strip()}")
@@ -336,7 +338,7 @@ class BenchStyleTests(unittest.TestCase):
     def test_tpcc_uses_checked_choose_index_conversions(self) -> None:
         offenders: list[str] = []
         path = REPO / "crates" / "ultrasql-bench" / "src" / "runs" / "tpcc.rs"
-        for line_no, line in enumerate(path.read_text().splitlines(), start=1):
+        for line_no, line in enumerate(module_text(path).splitlines(), start=1):
             code = line.split("//", maxsplit=1)[0]
             if TPCC_CHOOSE_INDEX_CAST.search(code):
                 offenders.append(f"{path.relative_to(REPO)}:{line_no}: {line.strip()}")
@@ -346,7 +348,7 @@ class BenchStyleTests(unittest.TestCase):
     def test_tpcc_uses_checked_seed_width_conversions(self) -> None:
         offenders: list[str] = []
         path = REPO / "crates" / "ultrasql-bench" / "src" / "runs" / "tpcc.rs"
-        for line_no, line in enumerate(path.read_text().splitlines(), start=1):
+        for line_no, line in enumerate(module_text(path).splitlines(), start=1):
             code = line.split("//", maxsplit=1)[0]
             if TPCC_SEED_WIDTH_CAST.search(code):
                 offenders.append(f"{path.relative_to(REPO)}:{line_no}: {line.strip()}")
@@ -356,7 +358,7 @@ class BenchStyleTests(unittest.TestCase):
     def test_tpcc_uses_checked_selector_width_conversions(self) -> None:
         offenders: list[str] = []
         path = REPO / "crates" / "ultrasql-bench" / "src" / "runs" / "tpcc.rs"
-        for line_no, line in enumerate(path.read_text().splitlines(), start=1):
+        for line_no, line in enumerate(module_text(path).splitlines(), start=1):
             code = line.split("//", maxsplit=1)[0]
             if TPCC_SELECTOR_WIDTH_CAST.search(code):
                 offenders.append(f"{path.relative_to(REPO)}:{line_no}: {line.strip()}")
@@ -366,7 +368,7 @@ class BenchStyleTests(unittest.TestCase):
     def test_tpcc_uses_checked_checksum_width_conversions(self) -> None:
         offenders: list[str] = []
         path = REPO / "crates" / "ultrasql-bench" / "src" / "runs" / "tpcc.rs"
-        for line_no, line in enumerate(path.read_text().splitlines(), start=1):
+        for line_no, line in enumerate(module_text(path).splitlines(), start=1):
             code = line.split("//", maxsplit=1)[0]
             if TPCC_CHECKSUM_WIDTH_CAST.search(code):
                 offenders.append(f"{path.relative_to(REPO)}:{line_no}: {line.strip()}")
@@ -376,7 +378,7 @@ class BenchStyleTests(unittest.TestCase):
     def test_tpcc_uses_checked_iteration_width_conversions(self) -> None:
         offenders: list[str] = []
         path = REPO / "crates" / "ultrasql-bench" / "src" / "runs" / "tpcc.rs"
-        for line_no, line in enumerate(path.read_text().splitlines(), start=1):
+        for line_no, line in enumerate(module_text(path).splitlines(), start=1):
             code = line.split("//", maxsplit=1)[0]
             if TPCC_ITERATION_WIDTH_CAST.search(code):
                 offenders.append(f"{path.relative_to(REPO)}:{line_no}: {line.strip()}")
@@ -386,7 +388,7 @@ class BenchStyleTests(unittest.TestCase):
     def test_cross_concurrency_uses_checked_thread_width_conversions(self) -> None:
         offenders: list[str] = []
         path = REPO / "crates" / "ultrasql-bench" / "src" / "bin" / "cross_concurrency.rs"
-        for line_no, line in enumerate(path.read_text().splitlines(), start=1):
+        for line_no, line in enumerate(module_text(path).splitlines(), start=1):
             code = line.split("//", maxsplit=1)[0]
             if CROSS_CONCURRENCY_THREAD_WIDTH_CAST.search(code):
                 offenders.append(f"{path.relative_to(REPO)}:{line_no}: {line.strip()}")
@@ -396,7 +398,7 @@ class BenchStyleTests(unittest.TestCase):
     def test_cross_concurrency_uses_checked_measurement_width_conversions(self) -> None:
         offenders: list[str] = []
         path = REPO / "crates" / "ultrasql-bench" / "src" / "bin" / "cross_concurrency.rs"
-        for line_no, line in enumerate(path.read_text().splitlines(), start=1):
+        for line_no, line in enumerate(module_text(path).splitlines(), start=1):
             code = line.split("//", maxsplit=1)[0]
             if CROSS_CONCURRENCY_MEASURE_WIDTH_CAST.search(code):
                 offenders.append(f"{path.relative_to(REPO)}:{line_no}: {line.strip()}")
@@ -406,7 +408,7 @@ class BenchStyleTests(unittest.TestCase):
     def test_cross_concurrency_uses_checked_numeric_conversions(self) -> None:
         offenders: list[str] = []
         path = REPO / "crates" / "ultrasql-bench" / "src" / "bin" / "cross_concurrency.rs"
-        for line_no, line in enumerate(path.read_text().splitlines(), start=1):
+        for line_no, line in enumerate(module_text(path).splitlines(), start=1):
             code = line.split("//", maxsplit=1)[0]
             if CROSS_CONCURRENCY_NUMERIC_CAST.search(code):
                 offenders.append(f"{path.relative_to(REPO)}:{line_no}: {line.strip()}")
@@ -416,7 +418,7 @@ class BenchStyleTests(unittest.TestCase):
     def test_cross_compare_uses_checked_numeric_conversions(self) -> None:
         offenders: list[str] = []
         path = REPO / "crates" / "ultrasql-bench" / "src" / "bin" / "cross_compare.rs"
-        for line_no, line in enumerate(path.read_text().splitlines(), start=1):
+        for line_no, line in enumerate(module_text(path).splitlines(), start=1):
             code = line.split("//", maxsplit=1)[0]
             if CROSS_COMPARE_NUMERIC_CAST.search(code):
                 offenders.append(f"{path.relative_to(REPO)}:{line_no}: {line.strip()}")
@@ -425,7 +427,7 @@ class BenchStyleTests(unittest.TestCase):
 
     def test_cross_compare_writes_uses_checked_numeric_conversions(self) -> None:
         offenders: list[str] = []
-        for line_no, line in enumerate(CROSS_COMPARE_WRITES.read_text().splitlines(), start=1):
+        for line_no, line in enumerate(module_text(CROSS_COMPARE_WRITES).splitlines(), start=1):
             code = line.split("//", maxsplit=1)[0]
             if CROSS_COMPARE_WRITES_NUMERIC_CAST.search(code):
                 offenders.append(
@@ -437,7 +439,7 @@ class BenchStyleTests(unittest.TestCase):
     def test_select_avg_uses_checked_iteration_width_conversions(self) -> None:
         offenders: list[str] = []
         path = REPO / "crates" / "ultrasql-bench" / "src" / "runs" / "select_avg_10m.rs"
-        for line_no, line in enumerate(path.read_text().splitlines(), start=1):
+        for line_no, line in enumerate(module_text(path).splitlines(), start=1):
             code = line.split("//", maxsplit=1)[0]
             if SELECT_AVG_ITERATION_WIDTH_CAST.search(code):
                 offenders.append(f"{path.relative_to(REPO)}:{line_no}: {line.strip()}")
@@ -447,7 +449,7 @@ class BenchStyleTests(unittest.TestCase):
     def test_select_sum_uses_checked_iteration_width_conversions(self) -> None:
         offenders: list[str] = []
         path = REPO / "crates" / "ultrasql-bench" / "src" / "runs" / "select_sum_65k.rs"
-        for line_no, line in enumerate(path.read_text().splitlines(), start=1):
+        for line_no, line in enumerate(module_text(path).splitlines(), start=1):
             code = line.split("//", maxsplit=1)[0]
             if SELECT_SUM_ITERATION_WIDTH_CAST.search(code):
                 offenders.append(f"{path.relative_to(REPO)}:{line_no}: {line.strip()}")
@@ -457,7 +459,7 @@ class BenchStyleTests(unittest.TestCase):
     def test_filter_sum_uses_checked_iteration_width_conversions(self) -> None:
         offenders: list[str] = []
         path = REPO / "crates" / "ultrasql-bench" / "src" / "runs" / "filter_sum_10m.rs"
-        for line_no, line in enumerate(path.read_text().splitlines(), start=1):
+        for line_no, line in enumerate(module_text(path).splitlines(), start=1):
             code = line.split("//", maxsplit=1)[0]
             if FILTER_SUM_ITERATION_WIDTH_CAST.search(code):
                 offenders.append(f"{path.relative_to(REPO)}:{line_no}: {line.strip()}")
@@ -467,7 +469,7 @@ class BenchStyleTests(unittest.TestCase):
     def test_point_lookup_uses_checked_iteration_width_conversions(self) -> None:
         offenders: list[str] = []
         path = REPO / "crates" / "ultrasql-bench" / "src" / "runs" / "point_lookup.rs"
-        for line_no, line in enumerate(path.read_text().splitlines(), start=1):
+        for line_no, line in enumerate(module_text(path).splitlines(), start=1):
             code = line.split("//", maxsplit=1)[0]
             if POINT_LOOKUP_ITERATION_WIDTH_CAST.search(code):
                 offenders.append(f"{path.relative_to(REPO)}:{line_no}: {line.strip()}")
@@ -477,7 +479,7 @@ class BenchStyleTests(unittest.TestCase):
     def test_point_lookup_binary_uses_checked_numeric_conversions(self) -> None:
         offenders: list[str] = []
         path = REPO / "crates" / "ultrasql-bench" / "src" / "bin" / "point_lookup.rs"
-        for line_no, line in enumerate(path.read_text().splitlines(), start=1):
+        for line_no, line in enumerate(module_text(path).splitlines(), start=1):
             code = line.split("//", maxsplit=1)[0]
             if POINT_LOOKUP_BIN_NUMERIC_CAST.search(code):
                 offenders.append(f"{path.relative_to(REPO)}:{line_no}: {line.strip()}")
@@ -496,7 +498,7 @@ class BenchStyleTests(unittest.TestCase):
             / "runs"
             / "btree_point_lookup.rs"
         )
-        for line_no, line in enumerate(path.read_text().splitlines(), start=1):
+        for line_no, line in enumerate(module_text(path).splitlines(), start=1):
             code = line.split("//", maxsplit=1)[0]
             if BTREE_POINT_LOOKUP_ITERATION_WIDTH_CAST.search(code):
                 offenders.append(f"{path.relative_to(REPO)}:{line_no}: {line.strip()}")
@@ -506,7 +508,7 @@ class BenchStyleTests(unittest.TestCase):
     def test_hash_aggregate_uses_checked_iteration_width_conversions(self) -> None:
         offenders: list[str] = []
         path = REPO / "crates" / "ultrasql-bench" / "src" / "runs" / "hash_aggregate.rs"
-        for line_no, line in enumerate(path.read_text().splitlines(), start=1):
+        for line_no, line in enumerate(module_text(path).splitlines(), start=1):
             code = line.split("//", maxsplit=1)[0]
             if HASH_AGGREGATE_ITERATION_WIDTH_CAST.search(code):
                 offenders.append(f"{path.relative_to(REPO)}:{line_no}: {line.strip()}")
@@ -516,7 +518,7 @@ class BenchStyleTests(unittest.TestCase):
     def test_hash_aggregate_uses_checked_group_width_conversions(self) -> None:
         offenders: list[str] = []
         path = REPO / "crates" / "ultrasql-bench" / "src" / "runs" / "hash_aggregate.rs"
-        for line_no, line in enumerate(path.read_text().splitlines(), start=1):
+        for line_no, line in enumerate(module_text(path).splitlines(), start=1):
             code = line.split("//", maxsplit=1)[0]
             if HASH_AGGREGATE_GROUP_WIDTH_CAST.search(code):
                 offenders.append(f"{path.relative_to(REPO)}:{line_no}: {line.strip()}")
@@ -526,7 +528,7 @@ class BenchStyleTests(unittest.TestCase):
     def test_range_scan_uses_checked_iteration_width_conversions(self) -> None:
         offenders: list[str] = []
         path = REPO / "crates" / "ultrasql-bench" / "src" / "runs" / "range_scan.rs"
-        for line_no, line in enumerate(path.read_text().splitlines(), start=1):
+        for line_no, line in enumerate(module_text(path).splitlines(), start=1):
             code = line.split("//", maxsplit=1)[0]
             if RANGE_SCAN_ITERATION_WIDTH_CAST.search(code):
                 offenders.append(f"{path.relative_to(REPO)}:{line_no}: {line.strip()}")
@@ -536,7 +538,7 @@ class BenchStyleTests(unittest.TestCase):
     def test_sort_large_uses_checked_iteration_width_conversions(self) -> None:
         offenders: list[str] = []
         path = REPO / "crates" / "ultrasql-bench" / "src" / "runs" / "sort_large.rs"
-        for line_no, line in enumerate(path.read_text().splitlines(), start=1):
+        for line_no, line in enumerate(module_text(path).splitlines(), start=1):
             code = line.split("//", maxsplit=1)[0]
             if SORT_LARGE_ITERATION_WIDTH_CAST.search(code):
                 offenders.append(f"{path.relative_to(REPO)}:{line_no}: {line.strip()}")
@@ -553,7 +555,7 @@ class BenchStyleTests(unittest.TestCase):
             / "runs"
             / "delete_throughput.rs"
         )
-        for line_no, line in enumerate(path.read_text().splitlines(), start=1):
+        for line_no, line in enumerate(module_text(path).splitlines(), start=1):
             code = line.split("//", maxsplit=1)[0]
             if DELETE_THROUGHPUT_ITERATION_WIDTH_CAST.search(code):
                 offenders.append(f"{path.relative_to(REPO)}:{line_no}: {line.strip()}")
@@ -570,7 +572,7 @@ class BenchStyleTests(unittest.TestCase):
             / "runs"
             / "insert_throughput.rs"
         )
-        for line_no, line in enumerate(path.read_text().splitlines(), start=1):
+        for line_no, line in enumerate(module_text(path).splitlines(), start=1):
             code = line.split("//", maxsplit=1)[0]
             if INSERT_THROUGHPUT_ITERATION_WIDTH_CAST.search(code):
                 offenders.append(f"{path.relative_to(REPO)}:{line_no}: {line.strip()}")
@@ -587,7 +589,7 @@ class BenchStyleTests(unittest.TestCase):
             / "runs"
             / "update_throughput.rs"
         )
-        for line_no, line in enumerate(path.read_text().splitlines(), start=1):
+        for line_no, line in enumerate(module_text(path).splitlines(), start=1):
             code = line.split("//", maxsplit=1)[0]
             if UPDATE_THROUGHPUT_ITERATION_WIDTH_CAST.search(code):
                 offenders.append(f"{path.relative_to(REPO)}:{line_no}: {line.strip()}")
@@ -597,7 +599,7 @@ class BenchStyleTests(unittest.TestCase):
     def test_honesty_uses_checked_iteration_width_conversions(self) -> None:
         offenders: list[str] = []
         path = REPO / "crates" / "ultrasql-bench" / "tests" / "honesty.rs"
-        for line_no, line in enumerate(path.read_text().splitlines(), start=1):
+        for line_no, line in enumerate(module_text(path).splitlines(), start=1):
             code = line.split("//", maxsplit=1)[0]
             if HONESTY_ITERATION_WIDTH_CAST.search(code):
                 offenders.append(f"{path.relative_to(REPO)}:{line_no}: {line.strip()}")
@@ -607,7 +609,7 @@ class BenchStyleTests(unittest.TestCase):
     def test_tpch_q1_uses_checked_iteration_width_conversions(self) -> None:
         offenders: list[str] = []
         path = REPO / "crates" / "ultrasql-bench" / "src" / "runs" / "tpch_q1.rs"
-        for line_no, line in enumerate(path.read_text().splitlines(), start=1):
+        for line_no, line in enumerate(module_text(path).splitlines(), start=1):
             code = line.split("//", maxsplit=1)[0]
             if TPCH_Q1_ITERATION_WIDTH_CAST.search(code):
                 offenders.append(f"{path.relative_to(REPO)}:{line_no}: {line.strip()}")
