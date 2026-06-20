@@ -32,17 +32,6 @@
 
 #![allow(clippy::print_stdout)]
 #![allow(clippy::print_stderr)]
-// The bench harness uses ad-hoc index arithmetic across synthetic data
-// generators, iteration counters, and ASCII-table renderers. The
-// library crate root carries the matching crate-level allow; replicate
-// it here because each binary is its own compilation unit.
-#![allow(
-    clippy::cast_possible_truncation,
-    clippy::cast_possible_wrap,
-    clippy::cast_sign_loss,
-    clippy::cast_lossless,
-    reason = "bench harness: deterministic synthetic data + iteration math; no impact on engine crates"
-)]
 
 use std::net::SocketAddr;
 use std::sync::Arc;
