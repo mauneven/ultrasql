@@ -19,7 +19,7 @@ impl PersistentCatalog {
     /// When all system catalog heap pages are empty (i.e. the database was
     /// just initialized) this method detects the empty heap and installs the
     /// hard-coded [`initial_snapshot`] that contains the three well-known
-    /// namespaces and the eleven system relations.  The returned
+    /// namespaces and the thirteen system relations.  The returned
     /// [`CatalogStats`] in this case reflects the initial snapshot counts.
     ///
     /// # Idempotent

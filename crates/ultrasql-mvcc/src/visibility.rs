@@ -37,7 +37,6 @@ pub trait SubxactOracle: Send + Sync {
 /// Use this when no subtransaction tracking is available or when the
 /// normal XID-status oracle already handles aborted subtransactions via
 /// CLOG entries.
-/// A no-op [`SubxactOracle`] for use when subtransactions are not tracked.
 ///
 /// See module-level docs for usage.
 #[derive(Debug)]

@@ -74,7 +74,6 @@ pub(super) fn take_framed_message(bytes: &[u8]) -> Result<(&[u8], usize), Protoc
     if bytes.len() < total {
         return Err(ProtocolError::Truncated);
     }
-    // Subtracting 4 is safe: we already verified `length >= 4`.
     let payload_end = total;
     let payload_start = HEADER_LEN;
     Ok((&bytes[payload_start..payload_end], total))

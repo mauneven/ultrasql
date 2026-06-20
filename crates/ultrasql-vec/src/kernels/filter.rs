@@ -7,7 +7,6 @@
 //! - A production implementation that exploits 64-lane packing so LLVM
 //!   autovectorizes the hot loop to NEON `cmeq`/`cmlt`/`cmgt` on aarch64 or
 //!   `vpcmpeqd`/`vpcmpgtd` on `x86_64-v3`.
-//! - An optional intrinsic specialization, gated on `cfg(target_arch = …)`.
 //!
 //! NULL handling: every kernel accepts an optional `&Bitmap` validity mask.
 //! Rows where the validity bit is 0 (NULL) always produce 0 in the output
@@ -27,8 +26,7 @@ use crate::column::NumericColumn;
 /// `column[i] == scalar` AND the row is non-null (validity bit is 1).
 ///
 /// The non-null fast path processes 64 lanes at a time so LLVM autovectorizes
-/// to NEON `cmeq.4s` on aarch64 and `vpcmpeqd` on AVX2 targets. On aarch64
-/// the intrinsic specialization `pack_eq_scalar_i32_64_neon` is used instead.
+/// to NEON `cmeq.4s` on aarch64 and `vpcmpeqd` on AVX2 targets.
 #[must_use]
 pub fn filter_eq_i32(column: &NumericColumn<i32>, scalar: i32) -> Bitmap {
     let n = column.len();
