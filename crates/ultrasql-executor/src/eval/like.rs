@@ -94,9 +94,7 @@ pub(crate) fn regex_match(
     pattern: &str,
     case_insensitive: bool,
 ) -> Result<bool, EvalError> {
-    regex::RegexBuilder::new(pattern)
-        .case_insensitive(case_insensitive)
-        .build()
+    super::regex_cache::cached_regex(pattern, case_insensitive)
         .map(|regex| regex.is_match(haystack))
         .map_err(|err| EvalError::Type(format!("regex operator: invalid pattern: {err}")))
 }

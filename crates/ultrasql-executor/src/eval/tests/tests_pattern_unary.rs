@@ -70,6 +70,63 @@ fn regex_match_operator_matches_psql_meta_patterns() {
     assert_eq!(ev.eval(&[]).unwrap(), Value::Bool(true));
 }
 
+#[test]
+fn regex_match_constant_pattern_is_stable_across_repeats() {
+    // Re-evaluating the same constant pattern many times exercises the
+    // thread-local compiled-regex cache; results must be identical to a
+    // single inline compile.
+    let yes = Eval::new(binop(
+        BinaryOp::RegexMatch,
+        lit_text("alpha123"),
+        lit_text("^[a-z]+[0-9]+$"),
+    ));
+    let no = Eval::new(binop(
+        BinaryOp::RegexMatch,
+        lit_text("ALPHA"),
+        lit_text("^[a-z]+[0-9]+$"),
+    ));
+    for _ in 0..1000 {
+        assert_eq!(yes.eval(&[]).unwrap(), Value::Bool(true));
+        assert_eq!(no.eval(&[]).unwrap(), Value::Bool(false));
+    }
+}
+
+#[test]
+fn regex_imatch_distinguished_from_match_under_same_pattern() {
+    // The cache key includes the case-insensitivity flag, so the same
+    // pattern string compiled case-sensitively must not be served for a
+    // case-insensitive request.
+    let sensitive = Eval::new(binop(
+        BinaryOp::RegexMatch,
+        lit_text("FOO"),
+        lit_text("^foo$"),
+    ));
+    let insensitive = Eval::new(binop(
+        BinaryOp::RegexIMatch,
+        lit_text("FOO"),
+        lit_text("^foo$"),
+    ));
+    assert_eq!(sensitive.eval(&[]).unwrap(), Value::Bool(false));
+    assert_eq!(insensitive.eval(&[]).unwrap(), Value::Bool(true));
+    // Order-independence: re-check after the case-insensitive compile.
+    assert_eq!(sensitive.eval(&[]).unwrap(), Value::Bool(false));
+}
+
+#[test]
+fn regex_match_invalid_pattern_errors_every_time() {
+    // An invalid pattern is never cached, so each evaluation re-reports the
+    // same error rather than succeeding spuriously.
+    let ev = Eval::new(binop(
+        BinaryOp::RegexMatch,
+        lit_text("anything"),
+        lit_text("("),
+    ));
+    for _ in 0..3 {
+        let err = ev.eval(&[]).unwrap_err();
+        assert!(format!("{err}").contains("regex operator: invalid pattern"));
+    }
+}
+
 // -----------------------------------------------------------------------
 // IsNull
 // -----------------------------------------------------------------------

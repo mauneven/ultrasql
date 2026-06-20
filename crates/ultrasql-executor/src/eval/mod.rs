@@ -487,6 +487,7 @@ mod functions_string;
 mod functions_text;
 mod like;
 mod operators;
+mod regex_cache;
 mod textsearch;
 mod vector;
 

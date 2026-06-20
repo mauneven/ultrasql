@@ -87,7 +87,7 @@ pub(crate) fn eval_regexp_replace(args: &[Value]) -> Result<Value, EvalError> {
     } else {
         ""
     };
-    let regex = regex::Regex::new(pattern)
+    let regex = super::regex_cache::cached_regex(pattern, false)
         .map_err(|err| EvalError::Type(format!("regexp_replace: invalid pattern: {err}")))?;
     let replaced = if flags.contains('g') {
         regex.replace_all(text, replacement)
