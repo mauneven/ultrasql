@@ -629,13 +629,28 @@ fn run_checkpoint_cycle_recycles_wal_like_an_explicit_checkpoint() {
     {
         let server = Server::init_with_wal_writer_config(data_dir.path(), cfg).unwrap();
         append_resolved_records(&server, 600);
-        server.run_checkpoint_cycle();
 
-        let floor = ultrasql_wal::read_floor(&wal_dir).unwrap();
+        // WAL recycling unlinks rolled-past segment files. `maybe_recycle_wal`
+        // intentionally *retains* a segment whose unlink fails and retries on
+        // the next cycle (it logs "will retry next interval"). On Windows a
+        // segment whose handle was just dropped at roll time can be
+        // transiently undeletable, so a single cycle may not advance the floor.
+        // Assert the product's real contract — *eventual* recycling — rather
+        // than racing on one cycle (this test was flaky on Windows otherwise).
+        let mut floor = ultrasql_wal::read_floor(&wal_dir).unwrap();
+        for _ in 0..100 {
+            server.run_checkpoint_cycle();
+            floor = ultrasql_wal::read_floor(&wal_dir).unwrap();
+            if floor.segment_index > 0 {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
         assert!(
             floor.segment_index > 0,
             "the automatic checkpoint cycle must recycle low WAL segments"
         );
+        // Once the floor advanced past it, segment_0 has been unlinked.
         assert!(!wal_dir.join("segment_0000000000").exists());
     }
     // The advanced floor is durable: a reopen recovers cleanly from it.
