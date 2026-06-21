@@ -74,7 +74,7 @@ impl<L: PageLoader, K: Key> Iterator for RangeIter<'_, L, K> {
 
         loop {
             let leaf = self.current_leaf?;
-            let guard = match self.tree.pool.get_page(self.tree.page_id(leaf)) {
+            let guard = match self.tree.pool.get_page_relieved(self.tree.page_id(leaf)) {
                 Ok(g) => g,
                 Err(e) => return Some(Err(e.into())),
             };
@@ -136,7 +136,7 @@ impl<L: PageLoader, K: Key> Iterator for RangeIter<'_, L, K> {
 
 impl<L: PageLoader, K: Key> RangeIter<'_, L, K> {
     fn start_slot_in_leaf(&self, leaf: BlockNumber, raw_start: i64) -> Result<usize, BTreeError> {
-        let guard = self.tree.pool.get_page(self.tree.page_id(leaf))?;
+        let guard = self.tree.pool.get_page_relieved(self.tree.page_id(leaf))?;
         let entries;
         {
             let r = guard.read();
@@ -242,7 +242,7 @@ impl<L: PageLoader> BTree<L> {
         let mut current_leaf = Some(self.descend_to_leaf_readonly(root, i64::MIN)?);
         let mut items: Vec<(K, TupleId)> = Vec::new();
         while let Some(leaf) = current_leaf {
-            let guard = self.pool.get_page(self.page_id(leaf))?;
+            let guard = self.pool.get_page_relieved(self.page_id(leaf))?;
             let (entries, right_link) = {
                 let r = guard.read();
                 let meta = NodeMeta::read_from(&r)?;

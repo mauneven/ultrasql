@@ -624,7 +624,7 @@ impl<L: PageLoader> HeapAccess<L> {
         let mut restored_relations: Vec<RelationId> = Vec::new();
         for page_id in pages {
             let mut page_restored = false;
-            let guard = self.pool.get_page(page_id)?;
+            let guard = self.get_page_relieved(page_id)?;
             let mut page = guard.write();
             let bytes = page.as_bytes_mut();
             let slot_count = PageHeader::decode(bytes)
@@ -736,7 +736,7 @@ impl<L: PageLoader> HeapAccess<L> {
         // Mutate the page. Guard is dropped at the end of this block so
         // the pin is released before WAL I/O begins.
         {
-            let guard = self.pool.get_page(tid.page)?;
+            let guard = self.get_page_relieved(tid.page)?;
             Self::delete_in_place(&guard, tid, opts.xmax, opts.cmax)?;
             self.remember_rollback_stamp_page(opts.xmax, tid.page);
             // guard drops here — pin released before WAL append
@@ -854,7 +854,7 @@ impl<L: PageLoader> HeapAccess<L> {
 
             // Mutate every slot on this page under one write guard.
             {
-                let guard = self.pool.get_page(page_id)?;
+                let guard = self.get_page_relieved(page_id)?;
                 for &slot in &slots {
                     let tid = TupleId::new(page_id, slot);
                     Self::delete_in_place(&guard, tid, opts.xmax, opts.cmax)?;
@@ -993,7 +993,7 @@ impl<L: PageLoader> HeapAccess<L> {
                 )?;
             }
 
-            let src_guard = self.pool.get_page(src_page_id)?;
+            let src_guard = self.get_page_relieved(src_page_id)?;
             let mut src_page = src_guard.write();
             {
                 let src_bytes = src_page.as_bytes_mut();
@@ -1495,7 +1495,7 @@ impl<L: PageLoader> HeapAccess<L> {
             wal_scratch.clear();
             stamp_offsets.clear();
 
-            let src_guard = self.pool.get_page(src_page_id)?;
+            let src_guard = self.get_page_relieved(src_page_id)?;
             let mut src_page = src_guard.write();
             {
                 let src_bytes = src_page.as_bytes_mut();
@@ -1701,7 +1701,7 @@ impl<L: PageLoader> HeapAccess<L> {
             let src_page_id = PageId::new(rel, BlockNumber::new(src_block));
             let mut page_deleted = false;
 
-            let src_guard = self.pool.get_page(src_page_id)?;
+            let src_guard = self.get_page_relieved(src_page_id)?;
             let mut src_page = src_guard.write();
             let src_bytes = src_page.as_bytes_mut();
             let src_slot_count = {

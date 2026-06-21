@@ -75,7 +75,7 @@ impl<L: PageLoader> HeapAccess<L> {
                 )?;
             }
             let hot_tid: Option<TupleId> = {
-                let guard = self.pool.get_page(old_tid.page)?;
+                let guard = self.get_page_relieved(old_tid.page)?;
                 let result =
                     Self::try_hot_update(&guard, old_tid, new_payload, opts, new_tuple_size)?;
                 // guard drops here — pin released before WAL I/O
@@ -136,7 +136,7 @@ impl<L: PageLoader> HeapAccess<L> {
         // Stamp the old tuple with xmax and redirect ctid. Pin the page,
         // apply the stamp, then drop the guard before WAL I/O.
         {
-            let old_guard = self.pool.get_page(old_tid.page)?;
+            let old_guard = self.get_page_relieved(old_tid.page)?;
             Self::stamp_updated_old(&old_guard, old_tid, new_tid, opts)?;
             self.remember_rollback_stamp_page(opts.xid, old_tid.page);
             // old_guard drops here — pin released before WAL append
@@ -334,7 +334,7 @@ impl<L: PageLoader> HeapAccess<L> {
                 let mut hot_count: usize = 0;
                 let mut scratch: Vec<u8> = Vec::with_capacity(64);
                 {
-                    let guard = self.pool.get_page(page_id)?;
+                    let guard = self.get_page_relieved(page_id)?;
                     let mut page = guard.write();
                     for k in i..j {
                         let new_tuple_size = TUPLE_HEADER_SIZE
@@ -470,7 +470,7 @@ impl<L: PageLoader> HeapAccess<L> {
                     m += 1;
                 }
                 // [k, m) is one source-page run.
-                let guard = self.pool.get_page(page_id)?;
+                let guard = self.get_page_relieved(page_id)?;
                 let mut page = guard.write();
                 let page_bytes = page.as_bytes_mut();
                 for idx in k..m {

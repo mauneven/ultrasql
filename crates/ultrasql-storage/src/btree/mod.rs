@@ -260,7 +260,7 @@ impl<L: PageLoader> BTree<L> {
             next_block,
         };
         // Materialize the root as a fresh empty leaf.
-        let guard = tree.pool.get_page(tree.page_id(root_block))?;
+        let guard = tree.pool.get_page_relieved(tree.page_id(root_block))?;
         {
             let mut w = guard.write();
             init_btree_page(&mut w, NodeMeta::fresh_leaf())?;

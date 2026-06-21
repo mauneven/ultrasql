@@ -62,7 +62,7 @@ impl<L: PageLoader> HeapAccess<L> {
 
         for block in 0..block_count {
             let page_id = PageId::new(rel, BlockNumber::new(block));
-            let guard = self.pool.get_page(page_id)?;
+            let guard = self.get_page_relieved(page_id)?;
 
             // Read pass: collect slots eligible for reclamation.
             // We decode only xmax (bytes 8..16) from the raw page to
@@ -212,7 +212,7 @@ impl<L: PageLoader> HeapAccess<L> {
         for block in 0..block_count {
             let block_number = BlockNumber::new(block);
             let page_id = PageId::new(rel, block_number);
-            let guard = self.pool.get_page(page_id)?;
+            let guard = self.get_page_relieved(page_id)?;
             let all_visible = {
                 let page = guard.read();
                 let page_bytes = page.as_bytes();

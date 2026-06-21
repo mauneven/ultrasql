@@ -345,7 +345,7 @@ impl<L: PageLoader> HeapAccess<L> {
                 while j < to_apply.len() && to_apply[j].tid.page == page_id {
                     j += 1;
                 }
-                let guard = self.pool.get_page(page_id)?;
+                let guard = self.get_page_relieved(page_id)?;
                 let mut page = guard.write();
                 let bytes = page.as_bytes_mut();
                 for entry in &to_apply[i..j] {
@@ -385,7 +385,7 @@ impl<L: PageLoader> HeapAccess<L> {
             }
 
             for batch in compact_to_apply.iter().rev() {
-                let guard = self.pool.get_page(batch.page)?;
+                let guard = self.get_page_relieved(batch.page)?;
                 let mut page = guard.write();
                 let bytes = page.as_bytes_mut();
                 for slot in batch_slots(batch) {
@@ -598,7 +598,7 @@ impl<L: PageLoader> HeapAccess<L> {
                 )?;
             }
 
-            let src_guard = self.pool.get_page(src_page_id)?;
+            let src_guard = self.get_page_relieved(src_page_id)?;
             let mut src_page = src_guard.write();
             let src_bytes = src_page.as_bytes_mut();
             let src_slot_count = {
@@ -1006,7 +1006,7 @@ impl<L: PageLoader> HeapAccess<L> {
             let src_page_id = PageId::new(rel, BlockNumber::new(src_block));
             let mut page_updated = false;
 
-            let src_guard = self.pool.get_page(src_page_id)?;
+            let src_guard = self.get_page_relieved(src_page_id)?;
             let mut src_page = src_guard.write();
             let src_bytes = src_page.as_bytes_mut();
             let src_slot_count = {
@@ -1167,7 +1167,7 @@ impl<L: PageLoader> HeapAccess<L> {
         let mut post_image = [0_u8; 9];
 
         {
-            let guard = self.pool.get_page(tid.page)?;
+            let guard = self.get_page_relieved(tid.page)?;
             let mut page = guard.write();
             let bytes = page.as_bytes_mut();
             let slot_count = {

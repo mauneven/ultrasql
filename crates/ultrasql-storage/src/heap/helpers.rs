@@ -389,7 +389,7 @@ impl<L: PageLoader> HeapAccess<L> {
         // A pool miss here is non-fatal for FSM accuracy; we simply return 0
         // to cause the FSM to record the block as full, which is conservative
         // and safe.
-        pool.get_page(page_id).ok().map_or(0, |guard| {
+        pool.get_page_relieved(page_id).ok().map_or(0, |guard| {
             let free = guard.read().header().free_space();
             u32::try_from(free).unwrap_or(u32::MAX)
         })

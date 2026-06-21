@@ -451,7 +451,7 @@ impl<L: PageLoader> HeapAccess<L> {
         n_atts: u16,
     ) -> Result<usize, HeapError> {
         let filled = {
-            let guard = pool.get_page(page_id)?;
+            let guard = pool.get_page_relieved(page_id)?;
             let mut page = guard.write();
             let mut filled: usize = 0;
 
@@ -617,7 +617,7 @@ impl<L: PageLoader> HeapAccess<L> {
                 opts.xmin,
             )?;
         }
-        let guard = self.pool.get_page(page_id)?;
+        let guard = self.get_page_relieved(page_id)?;
         Self::insert_into_pinned(&guard, page_id, payload, opts, n_atts, tuple_size)
     }
 

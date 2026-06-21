@@ -58,7 +58,7 @@ impl<L: PageLoader> BTree<L> {
         let mut current = Some(leftmost_leaf(self, root)?);
         let mut out = Vec::new();
         while let Some(leaf) = current {
-            let guard = self.pool.get_page(self.page_id(leaf))?;
+            let guard = self.pool.get_page_relieved(self.page_id(leaf))?;
             let (entries, right_link) = {
                 let r = guard.read();
                 let meta = NodeMeta::read_from(&r)?;
@@ -87,7 +87,7 @@ impl<L: PageLoader> BTree<L> {
     ) -> Result<BlockNumber, BTreeError> {
         let mut current = root;
         loop {
-            let guard = self.pool.get_page(self.page_id(current))?;
+            let guard = self.pool.get_page_relieved(self.page_id(current))?;
             let step = step_descend(&guard, key)?;
             drop(guard);
             match step {
@@ -108,7 +108,7 @@ impl<L: PageLoader> BTree<L> {
     ) -> Result<BlockNumber, BTreeError> {
         let mut current = root;
         loop {
-            let guard = self.pool.get_page(self.page_id(current))?;
+            let guard = self.pool.get_page_relieved(self.page_id(current))?;
             let step = step_descend(&guard, key)?;
             drop(guard);
             match step {
@@ -136,7 +136,7 @@ impl<L: PageLoader> BTree<L> {
     ) -> Result<BlockNumber, BTreeError> {
         let mut current = root;
         loop {
-            let guard = self.pool.get_page(self.page_id(current))?;
+            let guard = self.pool.get_page_relieved(self.page_id(current))?;
             let child = {
                 let r = guard.read();
                 let meta = NodeMeta::read_from(&r)?;
@@ -157,7 +157,7 @@ impl<L: PageLoader> BTree<L> {
     fn lookup_in_leaf(&self, leaf: BlockNumber, key: i64) -> Result<Option<TupleId>, BTreeError> {
         let mut current = leaf;
         loop {
-            let guard = self.pool.get_page(self.page_id(current))?;
+            let guard = self.pool.get_page_relieved(self.page_id(current))?;
             let probe = probe_leaf(&guard, key)?;
             drop(guard);
             match probe {
@@ -246,7 +246,7 @@ impl<L: PageLoader> BTree<L> {
     ) -> Result<Option<BlockNumber>, BTreeError> {
         let mut current = leaf;
         loop {
-            let guard = self.pool.get_page(self.page_id(current))?;
+            let guard = self.pool.get_page_relieved(self.page_id(current))?;
             let mut w = guard.write();
             let meta = super::node::NodeMeta::read_from(&w)?;
             debug_assert!(meta.is_leaf(), "descended to non-leaf in delete");
@@ -292,7 +292,7 @@ pub(super) fn leftmost_leaf<L: PageLoader>(
 ) -> Result<BlockNumber, BTreeError> {
     let mut current = root;
     loop {
-        let guard = tree.pool.get_page(tree.page_id(current))?;
+        let guard = tree.pool.get_page_relieved(tree.page_id(current))?;
         let (is_leaf, first_child) = {
             let r = guard.read();
             let meta = NodeMeta::read_from(&r)?;

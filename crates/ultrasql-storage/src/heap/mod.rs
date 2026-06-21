@@ -581,6 +581,32 @@ impl<L: PageLoader> HeapAccess<L> {
         }
     }
 
+    /// Acquire a page guard, relieving buffer-pool exhaustion on the way.
+    ///
+    /// This is the user-facing read/mutate entry point: heap, index, and TOAST
+    /// page accesses route through it (recovery and checkpoint-internal paths
+    /// use the raw `self.pool.get_page` because they are single-threaded and
+    /// pre-WAL-writer and must NOT trigger relief).
+    ///
+    /// It delegates to [`BufferPool::get_page_relieved`], which on
+    /// [`BufferPoolError::Exhausted`] invokes the pool's installed
+    /// [`EvictionRelief`] hook to flush dirty pages — LSN-gated, forcing the
+    /// WAL durable when every dirty victim is ahead of the durable position —
+    /// and retries within a bounded budget.
+    ///
+    /// # Errors
+    ///
+    /// Propagates any [`BufferPoolError`] (including `Exhausted` after the
+    /// relief budget is spent) as a [`HeapError`].
+    pub(crate) fn get_page_relieved(
+        &self,
+        page_id: PageId,
+    ) -> Result<crate::buffer_pool::PageGuard<L>, HeapError> {
+        self.pool
+            .get_page_relieved(page_id)
+            .map_err(HeapError::BufferPool)
+    }
+
     pub(crate) fn invalidate_int32_pair_payload_stats_relation(&self, rel: RelationId) {
         self.int32_pair_payload_stats
             .retain(|page_id, _| page_id.relation != rel);

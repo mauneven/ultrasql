@@ -23,7 +23,7 @@ impl<L: PageLoader> HeapAccess<L> {
     /// a scan should consult [`ultrasql_mvcc::is_visible`] before
     /// surfacing the tuple to user code.
     pub fn fetch(&self, tid: TupleId) -> Result<HeapTuple, HeapError> {
-        let guard = self.pool.get_page(tid.page)?;
+        let guard = self.get_page_relieved(tid.page)?;
         let owned = Self::copy_slot_bytes(&guard, tid.slot)?;
         Self::decode_tuple(tid, &owned)
     }
@@ -90,7 +90,7 @@ impl<L: PageLoader> HeapAccess<L> {
         let mut xmin_cache: Option<(Xid, u16, bool)> = None;
         for block in 0..block_count {
             let page_id = PageId::new(rel, BlockNumber::new(block));
-            let guard = self.pool.get_page(page_id)?;
+            let guard = self.get_page_relieved(page_id)?;
             let page = guard.read();
             let page_bytes = page.as_bytes();
             let slot_count = page.header().slot_count();
@@ -476,7 +476,7 @@ impl<L: PageLoader> Iterator for HeapScan<'_, L> {
             // every slot read on this page and dropped on the block
             // boundary below.
             if self.current_guard.is_none() {
-                let guard = match self.pool.get_page(page_id) {
+                let guard = match self.pool.get_page_relieved(page_id) {
                     Ok(g) => g,
                     Err(e) => {
                         self.current_block = self.current_block.saturating_add(1);

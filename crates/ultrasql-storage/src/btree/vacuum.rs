@@ -36,7 +36,7 @@ impl<L: PageLoader> BTree<L> {
         let mut removed = 0_usize;
 
         loop {
-            let guard = self.pool.get_page(self.page_id(leaf))?;
+            let guard = self.pool.get_page_relieved(self.page_id(leaf))?;
             let right_link;
             {
                 let mut w = guard.write();
@@ -72,7 +72,7 @@ impl<L: PageLoader> BTree<L> {
     fn leftmost_leaf(&self, root: BlockNumber) -> Result<BlockNumber, BTreeError> {
         let mut current = root;
         loop {
-            let guard = self.pool.get_page(self.page_id(current))?;
+            let guard = self.pool.get_page_relieved(self.page_id(current))?;
             let (is_leaf, first_child);
             {
                 let r = guard.read();

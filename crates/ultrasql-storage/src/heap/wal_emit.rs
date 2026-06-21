@@ -74,7 +74,7 @@ impl<L: PageLoader> HeapAccess<L> {
         page_id: PageId,
         lsn: Lsn,
     ) -> Result<(), HeapError> {
-        let guard = pool.get_page(page_id)?;
+        let guard = pool.get_page_relieved(page_id)?;
         guard.write().set_lsn(lsn.raw());
         Ok(())
     }
@@ -116,7 +116,7 @@ impl<L: PageLoader> HeapAccess<L> {
         // been touched in the current checkpoint cycle, so check the cheap
         // header LSN before copying the 8 KiB image.
         let page_bytes = {
-            let guard = pool.get_page(page_id)?;
+            let guard = pool.get_page_relieved(page_id)?;
             let page = guard.read();
             let page_lsn = page.header().lsn;
             if page_lsn >= checkpoint_lsn {

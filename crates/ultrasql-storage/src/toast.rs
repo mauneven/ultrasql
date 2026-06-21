@@ -315,7 +315,10 @@ impl<L: PageLoader> ToastTable<L> {
         let block_count = self.heap.block_count(self.rel);
         for block in 0..block_count {
             let page_id = PageId::new(self.rel, BlockNumber::new(block));
-            let guard = self.pool.get_page(page_id).map_err(HeapError::BufferPool)?;
+            let guard = self
+                .pool
+                .get_page_relieved(page_id)
+                .map_err(HeapError::BufferPool)?;
             let page = guard.read();
             let header = page.header();
             let slot_count = header.slot_count();

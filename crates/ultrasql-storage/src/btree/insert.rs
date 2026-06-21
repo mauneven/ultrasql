@@ -190,7 +190,7 @@ impl<L: PageLoader> BTree<L> {
         // in a stale path) has split this leaf out from under us.
         let mut current = leaf;
         loop {
-            let guard = self.pool.get_page(self.page_id(current))?;
+            let guard = self.pool.get_page_relieved(self.page_id(current))?;
             let outcome = self.try_leaf_insert(&guard, key, value, allow_duplicates)?;
             drop(guard);
             match outcome {
@@ -263,7 +263,7 @@ impl<L: PageLoader> BTree<L> {
         // Allocate a new sibling.
         let new_block = self.allocate_block();
         {
-            let right_guard = self.pool.get_page(self.page_id(new_block))?;
+            let right_guard = self.pool.get_page_relieved(self.page_id(new_block))?;
             {
                 let mut rw = right_guard.write();
                 let right_meta = NodeMeta {
@@ -328,20 +328,20 @@ impl<L: PageLoader> BTree<L> {
         let old_root = *self.root_block.lock();
         let new_left = self.allocate_block();
         let (old_root_bytes, level) = {
-            let guard = self.pool.get_page(self.page_id(old_root))?;
+            let guard = self.pool.get_page_relieved(self.page_id(old_root))?;
             let r = guard.read();
             let meta = NodeMeta::read_from(&r)?;
             (*r.as_bytes(), meta.level.saturating_add(1))
         };
         {
-            let guard = self.pool.get_page(self.page_id(new_left))?;
+            let guard = self.pool.get_page_relieved(self.page_id(new_left))?;
             guard
                 .write()
                 .as_bytes_mut()
                 .copy_from_slice(&old_root_bytes);
         }
         {
-            let guard = self.pool.get_page(self.page_id(old_root))?;
+            let guard = self.pool.get_page_relieved(self.page_id(old_root))?;
             {
                 let mut w = guard.write();
                 let meta = NodeMeta::fresh_internal(level);
@@ -375,7 +375,7 @@ impl<L: PageLoader> BTree<L> {
         sep_key: i64,
         right_child: BlockNumber,
     ) -> Result<Option<(i64, BlockNumber)>, BTreeError> {
-        let guard = self.pool.get_page(self.page_id(block))?;
+        let guard = self.pool.get_page_relieved(self.page_id(block))?;
         let outcome = self.try_internal_insert(&guard, sep_key, right_child)?;
         drop(guard);
         Ok(outcome)
@@ -438,7 +438,7 @@ impl<L: PageLoader> BTree<L> {
 
         let new_block = self.allocate_block();
         {
-            let right_guard = self.pool.get_page(self.page_id(new_block))?;
+            let right_guard = self.pool.get_page_relieved(self.page_id(new_block))?;
             {
                 let mut rw = right_guard.write();
                 let right_meta = NodeMeta {

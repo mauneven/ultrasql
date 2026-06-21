@@ -120,7 +120,7 @@ impl<L: PageLoader, O: XidStatusOracle + ?Sized> VisibleHeapWalker<'_, L, O> {
             // reads work entirely off the local scratch buffer with
             // no further lock acquires.
             if self.page_scratch.is_empty() {
-                let guard = match self.pool.get_page(page_id) {
+                let guard = match self.pool.get_page_relieved(page_id) {
                     Ok(g) => g,
                     Err(e) => {
                         self.current_block = self.current_block.saturating_add(1);
