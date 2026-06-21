@@ -130,7 +130,7 @@ pub fn write_floor(wal_dir: &Path, floor: WalFloor) -> Result<(), RecoveryError>
     {
         let mut file = std::fs::File::create(&tmp_path)?;
         file.write_all(&body)?;
-        file.sync_all()?;
+        ultrasql_core::fsync::full_fsync(&file)?;
     }
     std::fs::rename(&tmp_path, &final_path)?;
     // Make the manifest rename durable. Opening a directory as a file is not

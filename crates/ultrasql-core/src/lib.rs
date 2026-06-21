@@ -38,6 +38,7 @@ pub mod csv;
 pub mod decimal;
 pub mod endian;
 pub mod error;
+pub mod fsync;
 pub mod id;
 pub mod money;
 pub mod network;

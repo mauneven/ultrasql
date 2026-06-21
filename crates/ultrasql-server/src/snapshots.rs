@@ -63,7 +63,7 @@ pub(crate) fn write_vector_snapshot(
     {
         let mut file = std::fs::File::create(&tmp_path)?;
         file.write_all(bytes)?;
-        file.sync_all()?;
+        ultrasql_core::fsync::full_fsync(&file)?;
     }
     std::fs::rename(&tmp_path, &final_path)?;
     // fsync the directory so the rename entry itself is durable. Opening a
@@ -213,7 +213,7 @@ pub(crate) fn write_clog_snapshot(data_dir: &Path, bytes: &[u8]) -> std::io::Res
     {
         let mut file = std::fs::File::create(&tmp_path)?;
         file.write_all(bytes)?;
-        file.sync_all()?;
+        ultrasql_core::fsync::full_fsync(&file)?;
     }
     std::fs::rename(&tmp_path, &final_path)?;
     // Make the rename durable. Tolerate a non-portable directory-open failure

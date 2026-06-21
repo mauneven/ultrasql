@@ -565,7 +565,7 @@ fn write_regular_text_file(path: &Path, body: &str) -> Result<(), ServerError> {
     options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
     let mut file = options.open(&tmp).map_err(ServerError::Io)?;
     file.write_all(body.as_bytes()).map_err(ServerError::Io)?;
-    file.sync_all().map_err(ServerError::Io)?;
+    ultrasql_core::fsync::full_fsync(&file).map_err(ServerError::Io)?;
     drop(file);
     fs::rename(&tmp, path).map_err(ServerError::Io)?;
     sync_metadata_parent(path)

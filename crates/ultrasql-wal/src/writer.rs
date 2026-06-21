@@ -26,12 +26,12 @@
 //! Platform fsync semantics
 //! ------------------------
 //!
-//! Durability goes through `full_fsync`, which flushes the file to truly
-//! stable storage. On most platforms that is `File::sync_all` (`fsync(2)`); on
-//! macOS plain `fsync` does NOT force the drive to flush its own write cache,
-//! so `full_fsync` issues `fcntl(F_FULLFSYNC)` there (as PostgreSQL and SQLite
-//! do) and only falls back to `sync_all` when the filesystem/device cannot
-//! support it.
+//! Durability goes through the shared [`ultrasql_core::fsync::full_fsync`],
+//! which flushes the file to truly stable storage. On most platforms that is
+//! `File::sync_all` (`fsync(2)`); on macOS plain `fsync` does NOT force the
+//! drive to flush its own write cache, so `full_fsync` issues
+//! `fcntl(F_FULLFSYNC)` there (as PostgreSQL and SQLite do) and only falls back
+//! to `sync_all` when the filesystem/device cannot support it.
 
 use std::fs::{File, OpenOptions};
 use std::io::Write;
@@ -598,7 +598,7 @@ impl WriterDriver {
         if let Some(file) = self.current_file.as_mut() {
             let started = Instant::now();
             file.flush()?;
-            full_fsync(file)?;
+            ultrasql_core::fsync::full_fsync(file)?;
             let elapsed_us = duration_as_micros_saturated(started.elapsed());
             self.shared.record_fsync_latency(elapsed_us);
         }
@@ -718,41 +718,6 @@ fn next_segment_index(dir: &Path) -> Result<u32, WalWriterError> {
     };
     idx.checked_add(1)
         .ok_or(WalWriterError::SegmentIndexExhausted)
-}
-
-/// Force the file's contents and metadata to truly stable storage.
-///
-/// On macOS, plain `fsync` / [`File::sync_all`] only pushes data to the drive;
-/// it does NOT force the drive to flush its own write cache, so a record the
-/// engine has already reported durable can still be lost on power failure.
-/// `fcntl(fd, F_FULLFSYNC)` requests that full cache flush — the behaviour
-/// PostgreSQL and SQLite rely on for real durability on Apple hardware. If the
-/// filesystem/device cannot honor it (some network filesystems return
-/// `ENOTSUP`/`EINVAL`), fall back to `sync_all`; any other error is propagated
-/// so a genuine I/O failure is never silently downgraded to a weaker flush.
-fn full_fsync(file: &File) -> std::io::Result<()> {
-    #[cfg(target_os = "macos")]
-    {
-        use std::os::unix::io::AsRawFd;
-
-        // SAFETY: `F_FULLFSYNC` is a non-variadic `fcntl` command that takes no
-        // pointer argument; `as_raw_fd()` yields a descriptor that stays valid
-        // for the duration of the call because `file` is borrowed throughout.
-        if unsafe { libc::fcntl(file.as_raw_fd(), libc::F_FULLFSYNC) } != -1 {
-            return Ok(());
-        }
-        let err = std::io::Error::last_os_error();
-        match err.raw_os_error() {
-            // Device/filesystem without F_FULLFSYNC support: `fsync` is the
-            // strongest durability primitive available here.
-            Some(libc::ENOTSUP) | Some(libc::EOPNOTSUPP) | Some(libc::EINVAL) => file.sync_all(),
-            _ => Err(err),
-        }
-    }
-    #[cfg(not(target_os = "macos"))]
-    {
-        file.sync_all()
-    }
 }
 
 #[cfg(test)]

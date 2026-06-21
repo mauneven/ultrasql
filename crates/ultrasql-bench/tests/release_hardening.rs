@@ -819,7 +819,7 @@ fn runtime_metadata_writes_are_nofollow_and_fsynced() {
     for needle in [
         "fn write_runtime_metadata_file",
         "libc::O_NOFOLLOW",
-        "file.sync_all().map_err(ServerError::Io)?",
+        "ultrasql_core::fsync::full_fsync(&file).map_err(ServerError::Io)?",
         "std::fs::rename(&tmp, path).map_err(ServerError::Io)?",
         "sync_runtime_metadata_parent(path)",
         "fn sync_runtime_metadata_dir",
