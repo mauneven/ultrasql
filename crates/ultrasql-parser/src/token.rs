@@ -450,6 +450,23 @@ pub enum TokenKind {
     KwHeader,
     /// `DELIMITER` — delimiter option for `COPY`.
     KwDelimiter,
+    // ---- Window-frame keywords ----------------------------------------------
+    /// `RANGE` — `RANGE BETWEEN ... AND ...` window-frame mode.
+    KwRange,
+    /// `GROUPS` — `GROUPS BETWEEN ... AND ...` window-frame mode.
+    KwGroups,
+    /// `PRECEDING` — `<offset> PRECEDING` / `UNBOUNDED PRECEDING` frame bound.
+    KwPreceding,
+    /// `FOLLOWING` — `<offset> FOLLOWING` / `UNBOUNDED FOLLOWING` frame bound.
+    KwFollowing,
+    /// `UNBOUNDED` — `UNBOUNDED PRECEDING` / `UNBOUNDED FOLLOWING` frame bound.
+    KwUnbounded,
+    /// `CURRENT` — `CURRENT ROW` frame bound.
+    KwCurrent,
+    /// `TIES` — `EXCLUDE TIES` frame exclusion.
+    KwTies,
+    /// `OTHERS` — `EXCLUDE NO OTHERS` frame exclusion.
+    KwOthers,
 }
 
 impl TokenKind {

@@ -248,6 +248,15 @@ fn build_table() -> AHashMap<&'static str, TokenKind> {
         ("csv", TokenKind::KwCsv),
         ("header", TokenKind::KwHeader),
         ("delimiter", TokenKind::KwDelimiter),
+        // Window-frame keywords.
+        ("range", TokenKind::KwRange),
+        ("groups", TokenKind::KwGroups),
+        ("preceding", TokenKind::KwPreceding),
+        ("following", TokenKind::KwFollowing),
+        ("unbounded", TokenKind::KwUnbounded),
+        ("current", TokenKind::KwCurrent),
+        ("ties", TokenKind::KwTies),
+        ("others", TokenKind::KwOthers),
     ];
 
     entries.iter().copied().collect()

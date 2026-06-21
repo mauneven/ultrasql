@@ -457,3 +457,91 @@ fn function_call_without_over_keeps_none() {
     };
     assert!(over.is_none());
 }
+
+#[test]
+fn over_clause_without_frame_keeps_frame_none() {
+    let expr = parse_expr("count(*) OVER ()");
+    let Expr::Call { over, .. } = expr else {
+        panic!()
+    };
+    let spec = over.expect("OVER spec");
+    assert!(spec.frame.is_none());
+}
+
+#[test]
+fn frame_rows_between_preceding_and_current_row() {
+    use crate::ast::{FrameBound, FrameExclusion, FrameUnits};
+    let expr = parse_expr("sum(v) OVER (ORDER BY id ROWS BETWEEN 1 PRECEDING AND CURRENT ROW)");
+    let Expr::Call { over, .. } = expr else {
+        panic!()
+    };
+    let frame = over.expect("OVER spec").frame.expect("frame");
+    assert_eq!(frame.units, FrameUnits::Rows);
+    assert!(matches!(frame.start, FrameBound::Preceding(_)));
+    assert_eq!(frame.end, FrameBound::CurrentRow);
+    assert_eq!(frame.exclude, FrameExclusion::NoOthers);
+}
+
+#[test]
+fn frame_range_unbounded_both_sides() {
+    use crate::ast::{FrameBound, FrameUnits};
+    let expr =
+        parse_expr("sum(v) OVER (RANGE BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING)");
+    let Expr::Call { over, .. } = expr else {
+        panic!()
+    };
+    let frame = over.expect("OVER spec").frame.expect("frame");
+    assert_eq!(frame.units, FrameUnits::Range);
+    assert_eq!(frame.start, FrameBound::UnboundedPreceding);
+    assert_eq!(frame.end, FrameBound::UnboundedFollowing);
+}
+
+#[test]
+fn frame_groups_current_row_to_following() {
+    use crate::ast::{FrameBound, FrameUnits};
+    let expr =
+        parse_expr("sum(v) OVER (ORDER BY g GROUPS BETWEEN CURRENT ROW AND 1 FOLLOWING)");
+    let Expr::Call { over, .. } = expr else {
+        panic!()
+    };
+    let frame = over.expect("OVER spec").frame.expect("frame");
+    assert_eq!(frame.units, FrameUnits::Groups);
+    assert_eq!(frame.start, FrameBound::CurrentRow);
+    assert!(matches!(frame.end, FrameBound::Following(_)));
+}
+
+#[test]
+fn frame_bare_start_expands_end_to_current_row() {
+    use crate::ast::{FrameBound, FrameUnits};
+    let expr = parse_expr("sum(v) OVER (ORDER BY id ROWS 2 PRECEDING)");
+    let Expr::Call { over, .. } = expr else {
+        panic!()
+    };
+    let frame = over.expect("OVER spec").frame.expect("frame");
+    assert_eq!(frame.units, FrameUnits::Rows);
+    assert!(matches!(frame.start, FrameBound::Preceding(_)));
+    // Bare frame_start shorthand fills the end with CURRENT ROW.
+    assert_eq!(frame.end, FrameBound::CurrentRow);
+}
+
+#[test]
+fn frame_exclude_variants_parse() {
+    use crate::ast::FrameExclusion;
+    let cases = [
+        ("EXCLUDE CURRENT ROW", FrameExclusion::CurrentRow),
+        ("EXCLUDE GROUP", FrameExclusion::Group),
+        ("EXCLUDE TIES", FrameExclusion::Ties),
+        ("EXCLUDE NO OTHERS", FrameExclusion::NoOthers),
+    ];
+    for (excl, expected) in cases {
+        let sql = format!(
+            "sum(v) OVER (ORDER BY id ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW {excl})"
+        );
+        let expr = parse_expr(&sql);
+        let Expr::Call { over, .. } = expr else {
+            panic!()
+        };
+        let frame = over.expect("OVER spec").frame.expect("frame");
+        assert_eq!(frame.exclude, expected, "exclude clause: {excl}");
+    }
+}

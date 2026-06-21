@@ -419,21 +419,78 @@ pub struct Cte {
     pub span: Span,
 }
 
-/// `OVER (PARTITION BY ... ORDER BY ...)` window specification riding on
-/// a function call.
+/// `OVER (PARTITION BY ... ORDER BY ... ROWS/RANGE/GROUPS ...)` window
+/// specification riding on a function call.
 ///
-/// v0.5 supports an empty / present `PARTITION BY` and an empty /
-/// present `ORDER BY`. Frame clauses (`ROWS BETWEEN ... AND ...`,
-/// `RANGE BETWEEN ... AND ...`) are recognised at the kernel but the
-/// parser does not yet emit them — the default frame is "UNBOUNDED
-/// PRECEDING to CURRENT ROW for ORDER BY, UNBOUNDED PRECEDING to
-/// UNBOUNDED FOLLOWING otherwise", matching PostgreSQL.
+/// Supports an empty / present `PARTITION BY`, an empty / present
+/// `ORDER BY`, and an optional explicit frame clause ([`WindowFrame`]).
+/// When `frame` is `None` the binder applies the SQL default frame:
+/// `RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW` when an
+/// `ORDER BY` is present, otherwise `RANGE BETWEEN UNBOUNDED PRECEDING
+/// AND UNBOUNDED FOLLOWING` (the whole partition) — matching PostgreSQL.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct WindowSpec {
     /// `PARTITION BY` expressions.
     pub partition_by: Vec<Expr>,
     /// `ORDER BY` items.
     pub order_by: Vec<OrderItem>,
+    /// Explicit frame clause, or `None` for the binder-applied default.
+    pub frame: Option<WindowFrame>,
+    /// Source span.
+    pub span: Span,
+}
+
+/// Frame mode for a window-frame clause.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FrameUnits {
+    /// `ROWS` — physical row offsets within the partition.
+    Rows,
+    /// `RANGE` — logical offsets by `ORDER BY` value (peers share a frame).
+    Range,
+    /// `GROUPS` — logical offsets by number of peer groups.
+    Groups,
+}
+
+/// One endpoint of a window frame (`frame_start` / `frame_end`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum FrameBound {
+    /// `UNBOUNDED PRECEDING` — start of the partition. Only valid as a start.
+    UnboundedPreceding,
+    /// `<offset> PRECEDING` — offset before the current row/value/group.
+    Preceding(Box<Expr>),
+    /// `CURRENT ROW` — the current row (ROWS) or its peer group (RANGE/GROUPS).
+    CurrentRow,
+    /// `<offset> FOLLOWING` — offset after the current row/value/group.
+    Following(Box<Expr>),
+    /// `UNBOUNDED FOLLOWING` — end of the partition. Only valid as an end.
+    UnboundedFollowing,
+}
+
+/// `EXCLUDE` option on a window frame.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FrameExclusion {
+    /// `EXCLUDE NO OTHERS` (default) — exclude nothing.
+    NoOthers,
+    /// `EXCLUDE CURRENT ROW` — remove the current row only.
+    CurrentRow,
+    /// `EXCLUDE GROUP` — remove the current row and all its peers.
+    Group,
+    /// `EXCLUDE TIES` — remove the current row's peers but keep the row.
+    Ties,
+}
+
+/// A window-frame clause: `{ROWS|RANGE|GROUPS} <bounds> [EXCLUDE ...]`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WindowFrame {
+    /// Frame mode.
+    pub units: FrameUnits,
+    /// Frame start bound.
+    pub start: FrameBound,
+    /// Frame end bound. A bare `frame_start` (no `BETWEEN`) sets this to
+    /// [`FrameBound::CurrentRow`].
+    pub end: FrameBound,
+    /// `EXCLUDE` option; defaults to [`FrameExclusion::NoOthers`].
+    pub exclude: FrameExclusion,
     /// Source span.
     pub span: Span,
 }

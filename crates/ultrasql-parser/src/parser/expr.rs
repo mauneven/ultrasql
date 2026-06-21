@@ -842,12 +842,13 @@ impl<'src> Parser<'src> {
         Ok((items, rp.span.end))
     }
 
-    /// Parse `OVER ( [PARTITION BY expr (, expr)*] [ORDER BY item (, item)*] )`.
+    /// Parse `OVER ( [PARTITION BY expr (, expr)*] [ORDER BY item (, item)*]
+    /// [frame_clause] )`.
     ///
     /// Called immediately after the closing `)` of a function call when
-    /// the next token is `OVER`. Frame clauses (`ROWS`/`RANGE`) are
-    /// recognised at the executor but the parser does not yet emit them
-    /// — the default frame is the v0.6 follow-up.
+    /// the next token is `OVER`. The frame clause (`ROWS`/`RANGE`/`GROUPS`
+    /// with bounds and `EXCLUDE`) is parsed into [`crate::ast::WindowFrame`];
+    /// when absent the binder applies the SQL default frame.
     fn parse_over_clause(&mut self) -> Result<crate::ast::WindowSpec, ParseError> {
         let over_tok = self.expect(TokenKind::KwOver, "OVER")?;
         self.expect(TokenKind::LParen, "(")?;
@@ -915,12 +916,153 @@ impl<'src> Parser<'src> {
                 self.advance()?;
             }
         }
+        let frame = self.parse_window_frame_opt()?;
         let rp = self.expect(TokenKind::RParen, ")")?;
         Ok(crate::ast::WindowSpec {
             partition_by,
             order_by,
+            frame,
             span: crate::span::Span::new(over_tok.span.start, rp.span.end),
         })
+    }
+
+    /// Parse an optional window-frame clause:
+    /// `{ROWS|RANGE|GROUPS} ( frame_start | BETWEEN frame_start AND frame_end )
+    /// [EXCLUDE {CURRENT ROW|GROUP|TIES|NO OTHERS}]`.
+    ///
+    /// Returns `Ok(None)` when the next token is not a frame-mode keyword.
+    /// A bare `frame_start` (no `BETWEEN`) expands to
+    /// `BETWEEN frame_start AND CURRENT ROW`.
+    fn parse_window_frame_opt(&mut self) -> Result<Option<crate::ast::WindowFrame>, ParseError> {
+        let units = match self.peek()?.kind {
+            TokenKind::KwRows => crate::ast::FrameUnits::Rows,
+            TokenKind::KwRange => crate::ast::FrameUnits::Range,
+            TokenKind::KwGroups => crate::ast::FrameUnits::Groups,
+            _ => return Ok(None),
+        };
+        let units_tok = self.advance()?; // ROWS | RANGE | GROUPS
+        let start_offset = units_tok.span.start;
+
+        let (start, end) = if self.match_kw(TokenKind::KwBetween) {
+            let start = self.parse_frame_bound()?;
+            self.expect(TokenKind::KwAnd, "AND")?;
+            let end = self.parse_frame_bound()?;
+            (start, end)
+        } else {
+            // Bare frame_start shorthand: BETWEEN frame_start AND CURRENT ROW.
+            let start = self.parse_frame_bound()?;
+            (start, crate::ast::FrameBound::CurrentRow)
+        };
+
+        let mut end_offset = start_offset;
+        if let Some(t) = self.peeked.as_ref() {
+            end_offset = t.span.start.max(start_offset);
+        }
+
+        let exclude = self.parse_frame_exclusion()?;
+
+        if let Some(t) = self.peeked.as_ref() {
+            end_offset = t.span.start.max(start_offset);
+        }
+
+        Ok(Some(crate::ast::WindowFrame {
+            units,
+            start,
+            end,
+            exclude,
+            span: crate::span::Span::new(start_offset, end_offset),
+        }))
+    }
+
+    /// Parse a single frame bound:
+    /// `UNBOUNDED PRECEDING | UNBOUNDED FOLLOWING | CURRENT ROW |
+    /// <offset> PRECEDING | <offset> FOLLOWING`.
+    fn parse_frame_bound(&mut self) -> Result<crate::ast::FrameBound, ParseError> {
+        match self.peek()?.kind {
+            TokenKind::KwUnbounded => {
+                self.advance()?; // UNBOUNDED
+                match self.peek()?.kind {
+                    TokenKind::KwPreceding => {
+                        self.advance()?;
+                        Ok(crate::ast::FrameBound::UnboundedPreceding)
+                    }
+                    TokenKind::KwFollowing => {
+                        self.advance()?;
+                        Ok(crate::ast::FrameBound::UnboundedFollowing)
+                    }
+                    other => {
+                        let off = self.peek()?.span.start_usize();
+                        Err(ParseError::Expected {
+                            expected: "PRECEDING or FOLLOWING after UNBOUNDED",
+                            found: other,
+                            offset: off,
+                        })
+                    }
+                }
+            }
+            TokenKind::KwCurrent => {
+                self.advance()?; // CURRENT
+                self.expect(TokenKind::KwRow, "ROW")?;
+                Ok(crate::ast::FrameBound::CurrentRow)
+            }
+            _ => {
+                let expr = Box::new(self.parse_expr()?);
+                match self.peek()?.kind {
+                    TokenKind::KwPreceding => {
+                        self.advance()?;
+                        Ok(crate::ast::FrameBound::Preceding(expr))
+                    }
+                    TokenKind::KwFollowing => {
+                        self.advance()?;
+                        Ok(crate::ast::FrameBound::Following(expr))
+                    }
+                    other => {
+                        let off = self.peek()?.span.start_usize();
+                        Err(ParseError::Expected {
+                            expected: "PRECEDING or FOLLOWING after frame offset",
+                            found: other,
+                            offset: off,
+                        })
+                    }
+                }
+            }
+        }
+    }
+
+    /// Parse an optional `EXCLUDE` frame exclusion. Defaults to
+    /// [`crate::ast::FrameExclusion::NoOthers`] when absent.
+    fn parse_frame_exclusion(&mut self) -> Result<crate::ast::FrameExclusion, ParseError> {
+        if !self.match_kw(TokenKind::KwExclude) {
+            return Ok(crate::ast::FrameExclusion::NoOthers);
+        }
+        match self.peek()?.kind {
+            TokenKind::KwCurrent => {
+                self.advance()?; // CURRENT
+                self.expect(TokenKind::KwRow, "ROW")?;
+                Ok(crate::ast::FrameExclusion::CurrentRow)
+            }
+            TokenKind::KwGroup => {
+                self.advance()?;
+                Ok(crate::ast::FrameExclusion::Group)
+            }
+            TokenKind::KwTies => {
+                self.advance()?;
+                Ok(crate::ast::FrameExclusion::Ties)
+            }
+            TokenKind::KwNo => {
+                self.advance()?; // NO
+                self.expect(TokenKind::KwOthers, "OTHERS")?;
+                Ok(crate::ast::FrameExclusion::NoOthers)
+            }
+            other => {
+                let off = self.peek()?.span.start_usize();
+                Err(ParseError::Expected {
+                    expected: "CURRENT ROW, GROUP, TIES, or NO OTHERS after EXCLUDE",
+                    found: other,
+                    offset: off,
+                })
+            }
+        }
     }
 
     pub(crate) fn parse_cast_expr(&mut self) -> Result<Expr, ParseError> {
