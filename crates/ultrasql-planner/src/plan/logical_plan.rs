@@ -478,19 +478,21 @@ pub enum LogicalPlan {
     ///
     /// The `definition` plan is the CTE's body. The `body` plan is the
     /// main query that may reference the CTE by name. For
-    /// `WITH RECURSIVE`, `recursive = true`; the planner records this
-    /// flag but the recursive fixpoint is deferred to the executor
-    /// (wave 5). Until then a recursive CTE binding resolves
-    /// non-recursively.
+    /// `WITH RECURSIVE`, `recursive = true`; the server lowering path
+    /// executes the anchor + fixpoint loop for this flag (see the
+    /// `recursive` field note below).
     Cte {
         /// CTE name (used in `Scan` references inside `body`).
         name: String,
         /// Whether `WITH RECURSIVE` was specified.
         ///
         /// # Note
-        /// Recursion is not yet executed: the executor does not implement
-        /// the fixpoint loop. This flag is preserved so planning round-trips
-        /// correctly; a future executor wave will consume it.
+        /// When set, the server lowering path runs the anchor + fixpoint loop
+        /// (`pipeline::cte_helpers::lower_recursive_cte`: `UNION`/`UNION ALL`
+        /// with a bounded iteration cap). The standalone
+        /// `executor::physical::build_operator` path used by some unit tests
+        /// does not implement the fixpoint and materializes the definition
+        /// non-recursively.
         recursive: bool,
         /// The CTE definition plan.
         definition: Box<Self>,

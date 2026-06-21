@@ -1186,12 +1186,12 @@ fn lower_window_func(func: &ultrasql_planner::LogicalWindowFunc) -> ultrasql_exe
 ///
 /// Semantics:
 ///
-/// - Recursive CTEs (`WITH RECURSIVE`) are out of scope for this wave;
-///   the executor lacks a fixpoint loop, so the binder accepts the
-///   keyword but the lowerer rejects the plan with a precise
-///   [`ServerError::Unsupported`] rather than silently treating it as
-///   non-recursive (which would return wrong results for a self-
-///   referential definition). The recursive fixpoint is a v0.6 follow-up.
+/// - Recursive CTEs (`WITH RECURSIVE`) are lowered by
+///   [`lower_recursive_cte`], which runs the anchor + fixpoint loop
+///   (`UNION`/`UNION ALL` with a bounded iteration cap and per-row dedup
+///   for the `DISTINCT` quantifier). A definition that is not a `UNION`
+///   of an anchor and a recursive term, or that uses `INTERSECT`/`EXCEPT`,
+///   is rejected with a precise [`ServerError::Unsupported`].
 /// - Non-recursive CTEs are materialised *once* per query execution into
 ///   a shared `Arc<Vec<Batch>>`. Every reference inside the body
 ///   resolves to its own [`CteScan`] over that buffer (the

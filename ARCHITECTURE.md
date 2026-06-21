@@ -104,10 +104,12 @@ batches for clients that speak Arrow Flight.
   `write_page` API backed by positional `pread` / `pwrite`; the
   historical `use_mmap` knob is retained for older configurations but does
   not currently mmap heap segment files.
-- **Buffer pool.** CLOCK-Pro replacement with sharded page-table
-  buckets keyed by `PageId`. Pins are reference-counted; a pinned page
-  cannot be evicted. The pool is sized at startup; resizing is an
-  RFC-level change.
+- **Buffer pool.** Classic CLOCK replacement (single rotating hand that
+  clears each frame's reference bit and evicts on the next sweep) with
+  sharded page-table buckets keyed by `PageId`. Pins are reference-counted;
+  a pinned page cannot be evicted. The pool is sized at startup; resizing is
+  an RFC-level change. CLOCK-Pro is a known follow-up; the eviction trait
+  surface is kept stable so the upgrade is a drop-in.
 - **Heap access method.** Slotted-page tuple storage with HOT
   (heap-only-tuple) chains for non-indexed updates to non-key columns.
   The tuple layout stays stable so archive/export tooling can inspect rows.
@@ -131,9 +133,11 @@ batches for clients that speak Arrow Flight.
   pinned.
 
 **Rationale.** A compact slotted-page format keeps OLTP updates cheap while
-remaining inspectable by tooling. CLOCK-Pro beats classical LRU on mixed
-OLTP/OLAP workloads where a single big scan would otherwise evict the working
-set; the cost is a slightly more complex eviction state machine.
+remaining inspectable by tooling. Classic CLOCK approximates LRU at a fraction
+of the bookkeeping cost — a single reference bit per frame and one rotating
+hand — which is why it is the default replacement policy; the planned CLOCK-Pro
+upgrade would further resist a single big scan evicting the OLTP working set on
+mixed OLTP/OLAP workloads, at the cost of a more complex eviction state machine.
 
 **Tradeoffs.** Fixed 8 KiB pages are smaller than the natural unit on modern
 NVMe (4 KiB) or analytical engines (256 KiB). We accept this for predictable
@@ -436,12 +440,17 @@ parses incoming messages into typed enums (`StartupMessage`,
 `DataRow`, `CommandComplete`, `ErrorResponse`, ...).
 
 **Authentication.** Authentication wired on a live connection is `Trust`
-(accept all — the default) or a single global MD5 credential. A
-SCRAM-SHA-256 server state machine, a rustls TLS loader, and a `pg_hba`
-parser exist as tested library code but are **not yet negotiated** on a
-connection. An `SSLRequest`/`GSSENCRequest` is answered with an `N` decline,
-so connections are plaintext only. Real TLS upgrade (`S`), per-role SCRAM
-auth, and `pg_hba` enforcement are open items.
+(accept all — the default), a single global MD5 credential, per-role
+SCRAM-SHA-256, or a `pg_hba` policy. The SCRAM-SHA-256 server state machine,
+the rustls TLS loader, and the `pg_hba` matcher are negotiated live: an
+`SSLRequest` is answered with `S` and the stream is upgraded to TLS in place
+when a server certificate is configured (rejecting any plaintext buffered
+before the handshake, per CVE-2021-23214), and `pg_hba` rules select
+`hostssl`/`hostnossl` and run SCRAM against each role's own stored verifier. A
+`GSSENCRequest` is still answered with an `N` decline. Open items: the
+`md5`/`password` `pg_hba` methods are rejected because role credentials are
+stored only as SCRAM verifiers, and client-certificate / `pg_ident` mapping
+flows are not yet wired.
 
 ---
 

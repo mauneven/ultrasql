@@ -33,12 +33,19 @@ completed evidence.
   functions.
 - PL/pgSQL, stored procedures, trigger semantics, event triggers, and
   extension loading are not complete.
-- The HNSW vector index is currently single-layer (one navigable graph), not
-  the full hierarchical multi-layer HNSW, and its insert path is an exact O(N)
-  scan. Recall/latency at large scale will differ from a hierarchical
-  implementation. The on-disk page arena is also not yet read back on restart:
-  the index graph is rebuilt by replaying the HNSW WAL records, so startup time
-  grows with total insert history.
+- There are two HNSW implementations. The production page-backed index
+  (`PageBackedHnswIndex`) is hierarchical multi-layer (per-node deterministic
+  levels with per-layer neighbor chains and top-down greedy descent), its build
+  is sub-quadratic (candidate selection traverses the partially-built graph
+  above a calibrated work threshold instead of scanning every live node), and
+  its on-disk page arena is captured in a versioned, `crc32c`-checksummed
+  snapshot that is read back at restart — only the WAL tail above the snapshot's
+  high-water LSN is replayed, with a full WAL replay as the fallback when the
+  snapshot fails validation. The separate runtime in-memory index
+  (`HnswIndex`), used as a fallback ANN target, is still single-layer with an
+  exact O(N) insert scan and is not persisted: it is rebuilt by replaying the
+  HNSW WAL records on restart. Recall/latency comparisons and the SIFT1M gate
+  remain open release items (see `ROADMAP.md`).
 - Regular views support stored `SELECT` expansion, rename, schema moves, and
   restart metadata. Updatable views, `WITH CHECK OPTION`, dependency-safe
   `CREATE OR REPLACE VIEW`, materialized-view refresh/index parity, and general
@@ -46,12 +53,16 @@ completed evidence.
 
 ## Security and administration
 
-- Connection authentication is limited to `Trust` (the default — no
-  authentication) or a single global MD5 credential. A real TLS handshake
-  (`SSLRequest` is declined with `N`, so connections are plaintext only),
-  per-role SCRAM-SHA-256 negotiation, and `pg_hba` enforcement are not yet
-  wired, though the SCRAM, rustls, and `pg_hba` primitives exist as library
-  code. Do not expose the server on an untrusted network.
+- Connection authentication supports `Trust` (the default — no authentication),
+  a single global MD5 credential, per-role SCRAM-SHA-256, and `pg_hba`-driven
+  policy. An `SSLRequest` is answered with `S` and the stream is upgraded to TLS
+  in place when a server certificate is configured (with a buffered-plaintext
+  guard against CVE-2021-23214); `pg_hba` rules match `hostssl`/`hostnossl` and
+  run SCRAM against each role's own stored verifier. `GSSENCRequest` is still
+  declined. Remaining gaps: `md5`/`password` `pg_hba` methods are rejected
+  because role credentials are stored only as SCRAM verifiers, and broader
+  client-certificate / `pg_ident` mapping flows are not wired. Do not expose the
+  server on an untrusted network without a soak-tested deployment.
 - Role, privilege, default-privilege, and RLS persistence currently use runtime
   sidecar metadata; typed catalog rows and migrations remain open.
 - GUI schema-browser introspection query families are certified for pgAdmin,

@@ -345,9 +345,13 @@ pub fn build_operator(
         } => {
             // Materialise the CTE definition eagerly into an Arc-shared buffer.
             // The body plan is lowered normally; Scan nodes that reference the
-            // CTE by name will be resolved by the data_source in v0.6. When the
-            // body is Empty we expose the CteScan so tests can exercise the
-            // operator through the builder.
+            // CTE by name are resolved by the data_source. This standalone
+            // builder ignores the `recursive` flag and materialises the
+            // definition non-recursively — the anchor + fixpoint loop for
+            // `WITH RECURSIVE` lives in the server lowering path
+            // (`ultrasql_server::pipeline::cte_helpers::lower_recursive_cte`).
+            // When the body is Empty we expose the CteScan so tests can
+            // exercise the operator through the builder.
             let mut def_op = build_operator(definition, data_source)?;
             let def_schema = def_op.schema().clone();
             let mut batches: Vec<Batch> = Vec::new();

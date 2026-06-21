@@ -503,7 +503,13 @@ impl HashJoin {
             return self.build_right_phase();
         }
 
-        // Validate join type early so the error surfaces before doing any work.
+        // Validate the join type early. `RightOuter`, `FullOuter`, and `Cross`
+        // are served by NestedLoopJoin (and `Inner`/`LeftOuter` equi-joins may
+        // also be served by MergeJoin), so the planner never builds a HashJoin
+        // for them — these arms are unreachable defensive guards that surface a
+        // precise error instead of producing wrong rows if a hand-built plan
+        // ever bypasses the planner. The planner contract is covered by
+        // `ultrasql_server::pipeline::tests::lower_query_*_join_falls_back_to_nlj`.
         match self.join_type {
             LogicalJoinType::Inner
             | LogicalJoinType::LeftOuter
@@ -511,17 +517,17 @@ impl HashJoin {
             | LogicalJoinType::Anti => {}
             LogicalJoinType::RightOuter => {
                 return Err(ExecError::Unsupported(
-                    "hash join outer variant pending: RightOuter",
+                    "hash join does not serve RightOuter; planner routes it to NestedLoopJoin",
                 ));
             }
             LogicalJoinType::FullOuter => {
                 return Err(ExecError::Unsupported(
-                    "hash join outer variant pending: FullOuter",
+                    "hash join does not serve FullOuter; planner routes it to NestedLoopJoin",
                 ));
             }
             LogicalJoinType::Cross => {
                 return Err(ExecError::Unsupported(
-                    "hash join outer variant pending: Cross (use NestedLoopJoin)",
+                    "hash join does not serve Cross; planner routes it to NestedLoopJoin",
                 ));
             }
         }
