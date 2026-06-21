@@ -245,6 +245,7 @@ fn finalise_autocommit_reports_read_commit_failure() {
                 messages: Vec::new(),
                 streamed_body: None,
                 shared_streamed_body: None,
+                streaming: None,
                 rows: 0,
             }),
         )
@@ -296,6 +297,7 @@ fn finalise_autocommit_reports_logical_replication_lsn_exhaustion() {
                 messages: Vec::new(),
                 streamed_body: None,
                 shared_streamed_body: None,
+                streaming: None,
                 rows: 1,
             }),
         )

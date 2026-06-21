@@ -655,6 +655,7 @@ fn page_loader_and_local_wire_body_helpers_cover_error_paths() {
         }],
         streamed_body: None,
         shared_streamed_body: None,
+        streaming: None,
         rows: 0,
     })
     .expect("messages");

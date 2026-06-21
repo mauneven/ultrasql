@@ -193,6 +193,7 @@ where
                 }],
                 streamed_body: None,
                 shared_streamed_body: None,
+                streaming: None,
                 rows,
             })
         });
@@ -476,6 +477,10 @@ where
             jit: self.jit_config(),
             cancel_flag: Some(self.cancel_flag.clone()),
             stream_buf: &mut self.write_buf,
+            // Materialized-view maintenance INSERT reads only the row
+            // count and needs a complete body; never stream.
+            allow_streaming: false,
+            streaming_commit_txn: None,
         })?;
         Ok(result.rows)
     }

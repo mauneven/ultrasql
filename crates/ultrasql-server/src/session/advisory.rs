@@ -140,6 +140,7 @@ fn void_select_result(name: String) -> SelectResult {
         ],
         streamed_body: None,
         shared_streamed_body: None,
+        streaming: None,
         rows: 1,
     }
 }
@@ -173,6 +174,7 @@ fn bool_select_result(name: String, value: Value) -> SelectResult {
         ],
         streamed_body: None,
         shared_streamed_body: None,
+        streaming: None,
         rows: 1,
     }
 }

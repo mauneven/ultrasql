@@ -138,6 +138,7 @@ fn fast_insert_result(rows: u64) -> SelectResult {
         }],
         streamed_body: None,
         shared_streamed_body: None,
+        streaming: None,
         rows,
     }
 }

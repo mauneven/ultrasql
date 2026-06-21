@@ -775,6 +775,7 @@ fn int8_select_result(name: String, value: i64) -> SelectResult {
         ],
         streamed_body: None,
         shared_streamed_body: None,
+        streaming: None,
         rows: 1,
     }
 }

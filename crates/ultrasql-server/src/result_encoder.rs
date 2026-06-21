@@ -31,6 +31,7 @@ use ultrasql_core::{
 };
 use ultrasql_executor::Operator;
 use ultrasql_protocol::{BackendMessage, FieldDescription, encode_backend};
+use ultrasql_txn::Transaction;
 use ultrasql_vec::column::Column;
 
 use crate::error::ServerError;
@@ -407,6 +408,15 @@ pub struct SelectResult {
     /// session writes this body directly and only appends the dynamic
     /// trailer bytes (`NotificationResponse`s, `ReadyForQuery`).
     pub shared_streamed_body: Option<std::sync::Arc<[u8]>>,
+    /// Optional live streaming handle for a large top-level Simple-Query
+    /// SELECT whose body exceeded `STREAM_WINDOW_HIGH_WATER_BYTES`. When
+    /// `Some(_)`, the session ships `streamed_body` (window 0) first, then
+    /// drives the handle to drain the remaining windows to the socket with
+    /// backpressure. Mutually exclusive with the other body fields by
+    /// construction (only the top-level SELECT arm ever sets it). Boxed to
+    /// keep `SelectResult` small — the handle owns the root operator and an
+    /// optional `Transaction`.
+    pub streaming: Option<Box<StreamingSelect>>,
     /// Number of rows produced. Mirrors the value embedded in the
     /// trailing `CommandComplete` tag.
     pub rows: u64,
@@ -427,6 +437,7 @@ pub fn run_ddl_command(tag: &str) -> SelectResult {
         }],
         streamed_body: None,
         shared_streamed_body: None,
+        streaming: None,
         rows: 0,
     }
 }
@@ -491,6 +502,7 @@ pub fn run_modify_command(
         messages: vec![BackendMessage::CommandComplete { tag }],
         streamed_body: None,
         shared_streamed_body: None,
+        streaming: None,
         rows,
     })
 }
@@ -575,6 +587,7 @@ pub(crate) fn run_select_with_options(
         messages,
         streamed_body: None,
         shared_streamed_body: None,
+        streaming: None,
         rows,
     })
 }
@@ -689,6 +702,230 @@ pub(crate) fn encode_batch_into(
     Ok(())
 }
 
+/// High-water mark (in bytes) for one streamed SELECT window.
+///
+/// When a top-level Simple-Query SELECT body grows past this many bytes
+/// before the operator reaches EOF, the result is shipped to the client
+/// in bounded windows (flush, clear, refill) instead of being buffered
+/// whole. Set to 256 KiB so the `select_scan_10k` bench body (~250 KiB)
+/// stays a single window (one `write_all`, no behaviour change there)
+/// while a 100 MB scan ships in ~400 windows rather than one 100 MB
+/// allocation. A window may overshoot by at most one batch (the loop
+/// stops *after* the batch that crosses the mark), so peak wire-buffer
+/// memory is bounded by `STREAM_WINDOW_HIGH_WATER_BYTES + one batch`,
+/// independent of result cardinality.
+pub(crate) const STREAM_WINDOW_HIGH_WATER_BYTES: usize = 256 * 1024;
+
+/// A lazily-driven SELECT result: the still-live root operator plus the
+/// running state needed to encode the remainder of the wire body one
+/// window at a time.
+///
+/// Produced only by the top-level Simple-Query SELECT arm when the body
+/// crosses `STREAM_WINDOW_HIGH_WATER_BYTES` before EOF (see
+/// `run_plan_in_txn`). The async dispatcher
+/// (`Session::send_query_result_with_ready`) drives `encode_window` in
+/// a loop, flushing each window to the socket with backpressure. The
+/// `RowDescription` and the rows that filled window 0 are *not* held
+/// here — they were already encoded into the session buffer when the
+/// handle was built and ship first; this handle resumes pulling from the
+/// operator where window 0 left off.
+pub struct StreamingSelect {
+    /// Live root operator, drained one window's worth of batches per
+    /// [`encode_window`] call. Owns its inputs by `Arc`/value, so it is
+    /// `'static` and moves cleanly into the async frame.
+    op: Box<dyn Operator>,
+    /// Cached output schema (the operator's schema never changes).
+    schema: Schema,
+    /// Text-format display settings; identical to the buffered path so
+    /// the encoded bytes match byte-for-byte.
+    options: TextEncodingOptions,
+    /// Running row count. Seeded with the rows encoded into window 0 and
+    /// folded forward by every subsequent batch via `checked_add_rows`,
+    /// so it equals the `CommandComplete` tag count at EOF and
+    /// `SelectResult.rows` after the drain.
+    rows: u64,
+    /// `Some(txn)` when the drive loop must commit this autocommit
+    /// transaction after a successful drain (cursor semantics: the rows
+    /// are read under the snapshot, the commit finalises once the
+    /// operator is exhausted). `None` when the statement runs inside an
+    /// explicit transaction block whose handle stays in the session's
+    /// `TxnState` and is committed later by COMMIT.
+    commit_txn: Option<Transaction>,
+}
+
+impl std::fmt::Debug for StreamingSelect {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("StreamingSelect")
+            .field("schema", &self.schema)
+            .field("options", &self.options)
+            .field("rows", &self.rows)
+            .field("commit_txn", &self.commit_txn)
+            .finish_non_exhaustive()
+    }
+}
+
+impl StreamingSelect {
+    /// Running row count produced so far (== final `CommandComplete`
+    /// count once the drain completes). Used by the streaming harness to
+    /// assert the counter agrees with the emitted tag.
+    #[cfg(test)]
+    pub(crate) fn rows(&self) -> u64 {
+        self.rows
+    }
+
+    /// Take the autocommit transaction that must be committed after a
+    /// successful drain, leaving `None` so it is committed at most once.
+    pub(crate) fn take_commit_txn(&mut self) -> Option<Transaction> {
+        self.commit_txn.take()
+    }
+
+    /// Test-only constructor: wrap an operator in a streaming handle with
+    /// no autocommit transaction, so the byte-identity / bounded-memory /
+    /// mid-stream-error harness can drive [`encode_window`] directly.
+    #[cfg(test)]
+    pub(crate) fn for_test(op: Box<dyn Operator>, options: TextEncodingOptions) -> Self {
+        let schema = op.schema().clone();
+        Self {
+            op,
+            schema,
+            options,
+            rows: 0,
+            commit_txn: None,
+        }
+    }
+
+    /// Test-only accessor for the cached schema (used to emit the
+    /// reference `RowDescription` in the harness).
+    #[cfg(test)]
+    pub(crate) fn schema(&self) -> &Schema {
+        &self.schema
+    }
+}
+
+/// Encode the next window of a streaming SELECT body into `out`.
+///
+/// `out` must be cleared by the caller before each call. The function
+/// pulls operator batches and appends whole `DataRow` frames via the
+/// shared [`encode_batch_into`] (byte-identical to the buffered path)
+/// until either:
+///
+/// - the running body reaches `high_water` — returns `Ok(true)` (window
+///   full at a whole-frame boundary; call again for the next window), or
+/// - the operator reaches EOF — writes the trailing `CommandComplete`
+///   with the accumulated row count into `out` and returns `Ok(false)`
+///   (final window; the body is complete).
+///
+/// The window check is evaluated only *between* batches, so a window
+/// never ends mid-row. The concatenation of all windows is byte-for-byte
+/// equal to the single body [`stream_select_with_options`] would have
+/// produced (minus the `RowDescription`, which window 0 already shipped).
+///
+/// On operator error the partial `out` is left untouched and the error
+/// is propagated; the caller decides between the pre-flush (reuse
+/// today's error path) and post-flush (inline `ErrorResponse`) handling.
+pub(crate) fn encode_window(
+    s: &mut StreamingSelect,
+    out: &mut BytesMut,
+    high_water: usize,
+) -> Result<bool, ServerError> {
+    while out.len() < high_water {
+        let Some(batch) = s.op.next_batch()? else {
+            let tag = format!("SELECT {}", s.rows);
+            encode_backend(&BackendMessage::CommandComplete { tag }, out);
+            return Ok(false);
+        };
+        encode_batch_into(out, &batch, &s.schema, &s.options, &mut s.rows)?;
+    }
+    Ok(true)
+}
+
+/// Begin a streaming SELECT: encode the `RowDescription` and as many
+/// `DataRow` frames as fit in window 0 into `sink`, then decide whether
+/// the result is small (buffered) or large (streamed).
+///
+/// Mirrors [`run_select_streamed_with_options`] for the small case so a
+/// SELECT whose body fits in one window is byte- and syscall-identical
+/// to today (single `streamed_body`, no streaming handle). When window 0
+/// fills before EOF, returns the still-live operator wrapped in a
+/// [`StreamingSelect`] alongside the already-encoded window-0 body.
+///
+/// `commit_txn` is threaded into the returned handle unchanged so the
+/// caller's transaction is committed after the drain (autocommit) or
+/// kept open (explicit block); it is consumed only on the streaming
+/// branch — the buffered branch leaves the caller to finalise the txn as
+/// it does today.
+pub(crate) fn begin_streaming_select(
+    op: Box<dyn Operator>,
+    sink: &mut BytesMut,
+    options: &TextEncodingOptions,
+    commit_txn: Option<Transaction>,
+) -> Result<StreamingSelectStart, ServerError> {
+    let schema = op.schema().clone();
+    let mut handle = StreamingSelect {
+        op,
+        schema,
+        options: options.clone(),
+        rows: 0,
+        commit_txn,
+    };
+
+    let initial_cap = streamed_initial_cap(handle.op.estimated_row_count(), handle.schema.len());
+    let mut body = std::mem::take(sink);
+    prepare_stream_sink(&mut body, initial_cap);
+
+    let row_desc = build_row_description(&handle.schema);
+    encode_backend(&row_desc, &mut body);
+
+    match encode_window(&mut handle, &mut body, STREAM_WINDOW_HIGH_WATER_BYTES) {
+        Ok(false) => {
+            // EOF inside window 0: small result. The body already holds
+            // `RowDescription` + every `DataRow` + `CommandComplete`,
+            // exactly like the buffered path; return it as `streamed_body`.
+            let rows = handle.rows;
+            Ok(StreamingSelectStart::Buffered(SelectResult {
+                messages: Vec::new(),
+                streamed_body: Some(body),
+                shared_streamed_body: None,
+                streaming: None,
+                rows,
+            }))
+        }
+        Ok(true) => {
+            // Window 0 full, more rows remain: stream the rest. Window 0
+            // bytes ride along in `streamed_body` so the dispatcher ships
+            // them before pulling the next window.
+            let rows = handle.rows;
+            Ok(StreamingSelectStart::Streaming {
+                window0: body,
+                handle: Box::new(handle),
+                rows,
+            })
+        }
+        Err(e) => {
+            // No window has been flushed yet; reuse today's error path.
+            // Park the buffer back so the session keeps its allocation.
+            body.clear();
+            *sink = body;
+            Err(e)
+        }
+    }
+}
+
+/// Outcome of [`begin_streaming_select`]: either a fully-buffered small
+/// result (identical to the non-streaming path) or a streaming handle
+/// plus the already-encoded window-0 bytes.
+pub(crate) enum StreamingSelectStart {
+    /// Body fit in window 0; ship it as today's buffered `streamed_body`.
+    Buffered(SelectResult),
+    /// Body exceeded window 0; stream the remainder from `handle` after
+    /// shipping `window0`.
+    Streaming {
+        window0: BytesMut,
+        handle: Box<StreamingSelect>,
+        rows: u64,
+    },
+}
+
 // Session-owned wire-buffer reuse. The SELECT streaming path writes
 // directly into the caller-provided `BytesMut`, which the session then
 // keeps across queries. Reusing the buffer at the connection level is
@@ -774,6 +1011,7 @@ pub(crate) fn run_select_streamed_with_options(
             messages: Vec::new(),
             streamed_body: Some(body),
             shared_streamed_body: None,
+            streaming: None,
             rows,
         }),
         Err(e) => {
@@ -821,6 +1059,7 @@ pub fn run_cached_int32_pair_select_streamed(
         messages: Vec::new(),
         streamed_body: Some(body),
         shared_streamed_body: None,
+        streaming: None,
         rows,
     }
 }
@@ -840,6 +1079,7 @@ pub fn run_preencoded_select_streamed(
         messages: Vec::new(),
         streamed_body: Some(body),
         shared_streamed_body: None,
+        streaming: None,
         rows,
     }
 }
@@ -855,6 +1095,7 @@ pub fn run_shared_preencoded_select_streamed(
         messages: Vec::new(),
         streamed_body: None,
         shared_streamed_body: Some(encoded_body),
+        streaming: None,
         rows,
     }
 }

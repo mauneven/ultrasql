@@ -462,6 +462,19 @@ where
         let ready = BackendMessage::ReadyForQuery {
             status: self.txn_state.ready_for_query_status(),
         };
+        // Windowed-streaming path (highest precedence): a large top-level
+        // Simple-Query SELECT whose body exceeded the window high-water
+        // mark. `streamed_body` carries window 0 (RowDescription + the
+        // first window of DataRows); `streaming` carries the still-live
+        // operator. Ship window 0, then drive `encode_window` →
+        // `write_all().await` → clear in a loop so peak memory stays
+        // bounded by one window regardless of result size, and a slow
+        // client throttles the operator pull (the only await is the
+        // socket write; no lock is held across it).
+        if let Some(handle) = result.streaming.take() {
+            let window0 = result.streamed_body.take().unwrap_or_default();
+            return self.drive_streaming_select(handle, window0, ready).await;
+        }
         // Streamed-body path: append notifications + `ReadyForQuery`
         // directly to the result's existing `BytesMut` and write it out
         // without an extra round through `self.write_buf`. For a
@@ -526,6 +539,146 @@ where
         let res = self.io.write_all(&scratch).await;
         scratch.clear();
         self.write_buf = scratch;
+        res?;
+        self.io.flush().await?;
+        Ok(())
+    }
+
+    /// Drive a large streaming SELECT to completion: ship window 0, then
+    /// loop `encode_window` → `write_all().await` → clear until EOF,
+    /// appending notifications + `ReadyForQuery` to the final window.
+    ///
+    /// Backpressure: the only await is `write_all`; the operator pull
+    /// (`encode_window`) runs synchronously to the high-water mark and
+    /// returns *before* the await, so no operator borrow or lock is held
+    /// across it. A slow client stalls the await, which suspends the loop
+    /// and throttles the next pull — peak memory stays bounded by one
+    /// window plus one overshooting batch.
+    ///
+    /// Transaction ordering (cursor semantics): the autocommit txn carried
+    /// in the handle is committed only *after* a clean drain. On an
+    /// operator error mid-stream, ≥1 window (window 0) has already been
+    /// flushed, so per the protocol we emit `…DataRow · ErrorResponse ·
+    /// ReadyForQuery` inline (no `CommandComplete`) and abort the txn;
+    /// returning `Ok(())` keeps `handle_query` from double-reporting the
+    /// error. A socket write error tears the connection down and
+    /// propagates as today.
+    async fn drive_streaming_select(
+        &mut self,
+        mut handle: Box<crate::result_encoder::StreamingSelect>,
+        mut window0: BytesMut,
+        ready: BackendMessage,
+    ) -> Result<(), ServerError> {
+        // Commit/abort the autocommit txn (if any) after the drain. Held
+        // in an `Option` and `take`n exactly once at the terminal arm so
+        // the per-window loop never moves it.
+        let mut commit_txn = handle.take_commit_txn();
+
+        // Window 0 is already encoded (RowDescription + first DataRows);
+        // ship it first. If even this fails, the connection is dead.
+        if let Err(e) = self.io.write_all(&window0).await {
+            window0.clear();
+            self.write_buf = window0;
+            // No data acknowledged on our side; abort to release CLOG state.
+            if let Some(txn) = commit_txn.take() {
+                let _ = self
+                    .state
+                    .abort_transaction(txn, false, "streaming SELECT write error");
+            }
+            return Err(e.into());
+        }
+        let mut buf = window0;
+
+        loop {
+            buf.clear();
+            match crate::result_encoder::encode_window(
+                &mut handle,
+                &mut buf,
+                crate::result_encoder::STREAM_WINDOW_HIGH_WATER_BYTES,
+            ) {
+                Ok(more) => {
+                    if !more {
+                        // Final window: append trailer (notifications +
+                        // ReadyForQuery) so the tail order matches the
+                        // buffered path exactly.
+                        self.drain_pending_notifications_into(&mut buf);
+                        encode_backend(&ready, &mut buf);
+                    }
+                    if let Err(e) = self.io.write_all(&buf).await {
+                        buf.clear();
+                        self.write_buf = buf;
+                        if let Some(txn) = commit_txn.take() {
+                            let _ = self.state.abort_transaction(
+                                txn,
+                                false,
+                                "streaming SELECT write error",
+                            );
+                        }
+                        return Err(e.into());
+                    }
+                    if !more {
+                        // Drain complete. Commit the autocommit txn now
+                        // (cursor semantics: rows were read under the
+                        // snapshot, the commit finalises once exhausted).
+                        if let Some(txn) = commit_txn.take() {
+                            self.state.commit_transaction(
+                                txn,
+                                false,
+                                "streaming SELECT autocommit",
+                            )?;
+                            self.pending_post_commit_maintenance = true;
+                        }
+                        buf.clear();
+                        self.write_buf = buf;
+                        self.io.flush().await?;
+                        return Ok(());
+                    }
+                }
+                Err(e) => {
+                    // Operator error after ≥1 window flushed: report inline
+                    // (no CommandComplete) and abort the txn. We own error
+                    // reporting from here, so return Ok to avoid a second
+                    // ErrorResponse from `handle_query`.
+                    return self
+                        .report_streaming_error_inline(buf, commit_txn.take(), e)
+                        .await;
+                }
+            }
+        }
+    }
+
+    /// Emit `ErrorResponse · ReadyForQuery` after partial DataRows have
+    /// already reached the client, abort the streaming txn, and park the
+    /// buffer back. Used only once ≥1 window has been flushed.
+    async fn report_streaming_error_inline(
+        &mut self,
+        mut buf: BytesMut,
+        commit_txn: Option<ultrasql_txn::Transaction>,
+        err: ServerError,
+    ) -> Result<(), ServerError> {
+        // Abort the autocommit txn (read-only, so no durable marker). For
+        // an explicit-transaction streaming SELECT (`commit_txn` is None)
+        // mark the in-flight block Failed so the trailing ReadyForQuery and
+        // subsequent statements observe the aborted state, mirroring the
+        // non-streaming `InTransaction → Failed` transition.
+        if let Some(txn) = commit_txn {
+            let _ = self
+                .state
+                .abort_transaction(txn, false, "streaming SELECT operator error");
+        } else if let TxnState::InTransaction(txn) =
+            std::mem::replace(&mut self.txn_state, TxnState::Idle)
+        {
+            self.txn_state = TxnState::Failed(txn);
+        }
+
+        let status = self.txn_state.ready_for_query_status();
+        buf.clear();
+        Self::encode_error_response(&mut buf, &err.to_string(), err.sqlstate());
+        self.drain_pending_notifications_into(&mut buf);
+        encode_backend(&BackendMessage::ReadyForQuery { status }, &mut buf);
+        let res = self.io.write_all(&buf).await;
+        buf.clear();
+        self.write_buf = buf;
         res?;
         self.io.flush().await?;
         Ok(())

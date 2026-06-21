@@ -153,6 +153,7 @@ where
             }],
             streamed_body: None,
             shared_streamed_body: None,
+            streaming: None,
             rows: 0,
         })
     }
@@ -217,6 +218,7 @@ where
             }],
             streamed_body: None,
             shared_streamed_body: None,
+            streaming: None,
             rows: 0,
         })
     }
@@ -403,6 +405,7 @@ where
             }],
             streamed_body: None,
             shared_streamed_body: None,
+            streaming: None,
             rows: 0,
         })
     }

@@ -114,6 +114,7 @@ where
             messages,
             streamed_body: None,
             shared_streamed_body: None,
+            streaming: None,
             rows,
         })
     }
@@ -189,6 +190,9 @@ where
             jit: self.jit_config(),
             cancel_flag: Some(self.cancel_flag.clone()),
             stream_buf: &mut stream_buf,
+            // EXPLAIN ANALYZE only reads `result.rows`; never stream.
+            allow_streaming: false,
+            streaming_commit_txn: None,
         });
         // Always commit the read-only ANALYZE txn — we don't surface
         // its results, only the row count buried in the `SelectResult`.

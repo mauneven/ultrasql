@@ -72,6 +72,23 @@ pub(crate) struct RunPlanInTxnArgs<'a> {
     pub(crate) jit: ultrasql_vec::jit::JitConfig,
     pub(crate) cancel_flag: Option<ultrasql_executor::CancelFlag>,
     pub(crate) stream_buf: &'a mut bytes::BytesMut,
+    /// When `true`, a large SELECT (body past
+    /// [`crate::result_encoder::STREAM_WINDOW_HIGH_WATER_BYTES`]) returns
+    /// a streaming handle in `SelectResult::streaming` instead of a fully
+    /// buffered body. Set `true` only at the two top-level Simple-Query
+    /// dispatch sites; `false` for EXPLAIN ANALYZE, materialized-view
+    /// maintenance, and any other nested/local caller that needs a
+    /// complete contiguous body. The streaming handle also carries the
+    /// autocommit transaction to commit after the drain, so it is only
+    /// ever populated when the caller can drive it to completion.
+    pub(crate) allow_streaming: bool,
+    /// Autocommit transaction to hand to the streaming handle so the
+    /// drive loop commits it after the drain. `Some(_)` only on the
+    /// top-level autocommit (`Idle`) SELECT path; `None` inside an
+    /// explicit transaction block (the handle stays in `TxnState`) and on
+    /// every non-streaming caller. Ignored unless `allow_streaming` and
+    /// the SELECT body actually streams.
+    pub(crate) streaming_commit_txn: Option<Transaction>,
 }
 
 /// Run a non-DDL, non-transaction-control plan inside the given
@@ -119,6 +136,8 @@ pub(crate) fn run_plan_in_txn(args: RunPlanInTxnArgs<'_>) -> Result<SelectResult
         jit,
         cancel_flag,
         stream_buf,
+        allow_streaming,
+        streaming_commit_txn,
     } = args;
     if let Some(result) =
         try_run_cached_int32_pair_select(plan, &catalog_snapshot, heap.as_ref(), stream_buf)
@@ -229,14 +248,49 @@ pub(crate) fn run_plan_in_txn(args: RunPlanInTxnArgs<'_>) -> Result<SelectResult
             run_modify_command(op.as_mut(), "MERGE")
         }
         _ => {
-            let mut op = pipeline::lower_query(plan, &ctx)?;
-            // Streaming wire-encode hot path: bypass the
-            // `Vec<BackendMessage>` materialisation and emit
-            // `RowDescription` + N `DataRow` + `CommandComplete`
-            // directly into a single `BytesMut`. The session dispatches
-            // the body in one `write_all` + `flush` rather than the
-            // per-message loop the legacy `run_select` requires.
-            result_encoder::run_select_streamed_with_options(op.as_mut(), stream_buf, &text_options)
+            let op = pipeline::lower_query(plan, &ctx)?;
+            if allow_streaming {
+                // Top-level Simple-Query SELECT: encode window 0 and
+                // decide buffered-vs-streaming empirically. A small body
+                // (EOF within the first window) returns today's fully
+                // buffered `streamed_body` — byte- and syscall-identical
+                // to the legacy path. A large body returns a streaming
+                // handle (the still-live operator + window-0 bytes) the
+                // async dispatcher drives to drain the rest in bounded
+                // windows. `streaming_commit_txn` rides into the handle so
+                // the drive loop commits the autocommit txn after the
+                // drain (or stays `None` inside an explicit block).
+                match result_encoder::begin_streaming_select(
+                    op,
+                    stream_buf,
+                    &text_options,
+                    streaming_commit_txn,
+                )? {
+                    result_encoder::StreamingSelectStart::Buffered(result) => Ok(result),
+                    result_encoder::StreamingSelectStart::Streaming {
+                        window0,
+                        handle,
+                        rows,
+                    } => Ok(SelectResult {
+                        messages: Vec::new(),
+                        streamed_body: Some(window0),
+                        shared_streamed_body: None,
+                        streaming: Some(handle),
+                        rows,
+                    }),
+                }
+            } else {
+                // Nested / local / EXPLAIN-ANALYZE / maintenance caller:
+                // never stream — produce a complete contiguous body via the
+                // legacy whole-buffer encoder so `decode_local_result_body`
+                // and friends always see whole frames.
+                let mut op = op;
+                result_encoder::run_select_streamed_with_options(
+                    op.as_mut(),
+                    stream_buf,
+                    &text_options,
+                )
+            }
         }
     }
 }

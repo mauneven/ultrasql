@@ -166,6 +166,7 @@ fn simple_tag(tag: &str) -> SelectResult {
         }],
         streamed_body: None,
         shared_streamed_body: None,
+        streaming: None,
         rows: 0,
     }
 }

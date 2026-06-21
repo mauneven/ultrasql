@@ -156,6 +156,7 @@ b"#
         ],
         streamed_body: None,
         shared_streamed_body: None,
+        streaming: None,
         rows: 1,
     };
     let stream_schema = schema([

@@ -85,6 +85,7 @@ where
                 ],
                 streamed_body: None,
                 shared_streamed_body: None,
+                streaming: None,
                 rows: 0,
             }),
             TxnState::InTransaction(mut txn) => {
@@ -121,6 +122,7 @@ where
                     }],
                     streamed_body: None,
                     shared_streamed_body: None,
+                    streaming: None,
                     rows: 0,
                 })
             }
@@ -151,6 +153,7 @@ where
                     }],
                     streamed_body: None,
                     shared_streamed_body: None,
+                    streaming: None,
                     rows: 0,
                 })
             }
@@ -205,6 +208,7 @@ where
             }],
             streamed_body: None,
             shared_streamed_body: None,
+            streaming: None,
             rows: 0,
         })
     }
@@ -259,6 +263,7 @@ where
             }],
             streamed_body: None,
             shared_streamed_body: None,
+            streaming: None,
             rows: 0,
         })
     }
@@ -296,6 +301,7 @@ where
             messages,
             streamed_body: None,
             shared_streamed_body: None,
+            streaming: None,
             rows: 0,
         })
     }
@@ -348,6 +354,7 @@ where
             messages,
             streamed_body: None,
             shared_streamed_body: None,
+            streaming: None,
             rows: 0,
         })
     }
@@ -363,6 +370,7 @@ where
                 ],
                 streamed_body: None,
                 shared_streamed_body: None,
+                streaming: None,
                 rows: 0,
             }),
             TxnState::InTransaction(mut txn) => {
@@ -421,6 +429,7 @@ where
                     }],
                     streamed_body: None,
                     shared_streamed_body: None,
+                    streaming: None,
                     rows: 0,
                 })
             }
@@ -452,6 +461,7 @@ where
                     }],
                     streamed_body: None,
                     shared_streamed_body: None,
+                    streaming: None,
                     rows: 0,
                 })
             }
@@ -469,6 +479,7 @@ where
                 ],
                 streamed_body: None,
                 shared_streamed_body: None,
+                streaming: None,
                 rows: 0,
             }),
             TxnState::InTransaction(txn) | TxnState::Failed(txn) => {
@@ -499,6 +510,7 @@ where
                     }],
                     streamed_body: None,
                     shared_streamed_body: None,
+                    streaming: None,
                     rows: 0,
                 })
             }
@@ -522,6 +534,7 @@ where
                     }],
                     streamed_body: None,
                     shared_streamed_body: None,
+                    streaming: None,
                     rows: 0,
                 })
             }
@@ -572,6 +585,7 @@ where
                         }],
                         streamed_body: None,
                         shared_streamed_body: None,
+                        streaming: None,
                         rows: 0,
                     })
                 } else {
@@ -618,6 +632,7 @@ where
                 }],
                 streamed_body: None,
                 shared_streamed_body: None,
+                streaming: None,
                 rows: 0,
             })
         } else {

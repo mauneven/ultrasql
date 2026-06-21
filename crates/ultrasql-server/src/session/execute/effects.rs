@@ -377,6 +377,7 @@ where
             ],
             streamed_body: None,
             shared_streamed_body: None,
+            streaming: None,
             rows: 1,
         }
     }

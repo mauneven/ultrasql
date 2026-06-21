@@ -142,6 +142,15 @@ where
                     jit: self.jit_config(),
                     cancel_flag: Some(self.cancel_flag.clone()),
                     stream_buf: &mut self.write_buf,
+                    allow_streaming: true,
+                    // Clone the autocommit txn into the would-be streaming
+                    // handle: the clone shares the same XID, so the drive
+                    // loop commits the statement after the drain while the
+                    // original `txn` here is dropped uncommitted (a no-op
+                    // for an `InProgress` CLOG entry). Only consumed on the
+                    // streaming SELECT branch; the buffered/DML paths drop
+                    // the clone and `finalise_autocommit` commits `txn`.
+                    streaming_commit_txn: Some(txn.clone()),
                 });
                 self.finalise_autocommit(plan, txn, outcome)
             }
@@ -201,6 +210,13 @@ where
                     jit: self.jit_config(),
                     cancel_flag: Some(self.cancel_flag.clone()),
                     stream_buf: &mut self.write_buf,
+                    allow_streaming: true,
+                    // Inside an explicit transaction block the handle stays
+                    // in `self.txn_state` and is committed later by COMMIT,
+                    // so there is no per-statement txn to hand to the drive
+                    // loop. The streaming operator drains independently
+                    // against its cloned MVCC snapshot.
+                    streaming_commit_txn: None,
                 });
                 let outcome = match outcome {
                     Ok(result) => {
@@ -241,6 +257,18 @@ where
     ) -> Result<SelectResult, ServerError> {
         let is_dml = Self::dml_target_table(plan).is_some();
         match outcome {
+            Ok(result) if result.streaming.is_some() => {
+                // Large streaming SELECT: the txn-clone carried inside the
+                // handle is committed by the async drive loop *after* the
+                // result drains (cursor semantics). Drop the original `txn`
+                // here uncommitted — it shares the handle's XID, so the
+                // post-drain commit finalises the statement exactly once.
+                // A streaming result is always a read-only SELECT, so the
+                // DML-finalize machinery above does not apply.
+                debug_assert!(!is_dml, "streaming result must be a read-only SELECT");
+                drop(txn);
+                Ok(result)
+            }
             Ok(result) => {
                 if is_dml {
                     if let Err(e) = self.state.validate_deferred_foreign_keys(&txn) {
