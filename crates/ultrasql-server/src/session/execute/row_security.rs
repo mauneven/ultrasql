@@ -77,6 +77,7 @@ where
                 partition_by,
                 order_by,
                 func,
+                frame,
                 output_name,
                 schema,
             } => self
@@ -86,6 +87,7 @@ where
                     partition_by: partition_by.clone(),
                     order_by: order_by.clone(),
                     func: func.clone(),
+                    frame: frame.clone(),
                     output_name: output_name.clone(),
                     schema: schema.clone(),
                 })

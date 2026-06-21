@@ -130,7 +130,7 @@ pub(super) fn classify_aggregate(name: &str, args_empty: bool) -> Option<Aggrega
     }
 }
 
-pub(super) fn aggregate_return_type(func: AggregateFunc, arg_type: DataType) -> DataType {
+pub(crate) fn aggregate_return_type(func: AggregateFunc, arg_type: DataType) -> DataType {
     match func {
         AggregateFunc::CountStar | AggregateFunc::Count => DataType::Int64,
         AggregateFunc::Sum => match arg_type {

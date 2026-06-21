@@ -358,6 +358,7 @@ mod tests {
             partition_by: vec![col("id", 0)],
             order_by: Vec::new(),
             func: LogicalWindowFunc::RowNumber,
+            frame: ultrasql_planner::LogicalWindowFrame::whole_partition(),
             output_name: "rn".to_owned(),
             schema: schema(&["id", "score", "rn"]),
         };

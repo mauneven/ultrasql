@@ -196,6 +196,151 @@ fn rejects_malformed_window_function_calls() {
     }
 }
 
+fn first_window_frame(plan: &LogicalPlan) -> Option<&crate::plan::LogicalWindowFrame> {
+    match plan {
+        LogicalPlan::Window { frame, .. } => Some(frame),
+        LogicalPlan::Project { input, .. } => first_window_frame(input),
+        _ => None,
+    }
+}
+
+#[test]
+fn binds_aggregate_window_functions_with_result_types() {
+    use crate::plan::WindowAggKind;
+    let plan = parse_bind_ok(
+        "SELECT \
+            sum(id)   OVER (ORDER BY id) AS s, \
+            avg(id)   OVER (ORDER BY id) AS a, \
+            count(id) OVER (ORDER BY id) AS c, \
+            count(*)  OVER (ORDER BY id) AS cs, \
+            min(score) OVER (ORDER BY id) AS mn, \
+            max(score) OVER (ORDER BY id) AS mx \
+         FROM users",
+    );
+    let LogicalPlan::Project { schema, .. } = &plan else {
+        panic!("expected Project");
+    };
+    // sum(int) -> Int64, avg -> Float64, count/count(*) -> Int64,
+    // min/max(float) -> Float64.
+    assert_eq!(schema.field_at(0).data_type, DataType::Int64);
+    assert_eq!(schema.field_at(1).data_type, DataType::Float64);
+    assert_eq!(schema.field_at(2).data_type, DataType::Int64);
+    assert_eq!(schema.field_at(3).data_type, DataType::Int64);
+    assert_eq!(schema.field_at(4).data_type, DataType::Float64);
+    assert_eq!(schema.field_at(5).data_type, DataType::Float64);
+
+    let mut funcs = Vec::new();
+    collect_window_funcs(&plan, &mut funcs);
+    assert!(funcs.iter().any(|f| matches!(
+        f,
+        LogicalWindowFunc::Aggregate {
+            kind: WindowAggKind::Sum,
+            ..
+        }
+    )));
+    assert!(
+        funcs
+            .iter()
+            .any(|f| matches!(f, LogicalWindowFunc::CountStar))
+    );
+}
+
+#[test]
+fn default_frame_is_range_running_with_order_by() {
+    use crate::plan::{BoundFrameBound, BoundFrameUnits};
+    let plan = parse_bind_ok("SELECT sum(id) OVER (ORDER BY id) FROM users");
+    let frame = first_window_frame(&plan).expect("frame");
+    // PG default with ORDER BY: RANGE BETWEEN UNBOUNDED PRECEDING AND
+    // CURRENT ROW (NOT ROWS — proving the stepped per-peer semantics).
+    assert_eq!(frame.units, BoundFrameUnits::Range);
+    assert_eq!(frame.start, BoundFrameBound::UnboundedPreceding);
+    assert_eq!(frame.end, BoundFrameBound::CurrentRow);
+}
+
+#[test]
+fn default_frame_is_whole_partition_without_order_by() {
+    use crate::plan::{BoundFrameBound, BoundFrameUnits};
+    let plan = parse_bind_ok("SELECT sum(id) OVER (PARTITION BY name) FROM users");
+    let frame = first_window_frame(&plan).expect("frame");
+    assert_eq!(frame.units, BoundFrameUnits::Range);
+    assert_eq!(frame.start, BoundFrameBound::UnboundedPreceding);
+    assert_eq!(frame.end, BoundFrameBound::UnboundedFollowing);
+}
+
+#[test]
+fn ranking_functions_drop_user_frame() {
+    // Ranking functions ignore the frame: the binder stores the
+    // whole-partition frame regardless of the explicit ROWS frame.
+    let plan = parse_bind_ok(
+        "SELECT rank() OVER (ORDER BY id ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) FROM users",
+    );
+    let frame = first_window_frame(&plan).expect("frame");
+    assert!(frame.is_whole_partition_default());
+}
+
+#[test]
+fn explicit_rows_frame_binds_correctly() {
+    use crate::plan::{BoundFrameBound, BoundFrameUnits};
+    let plan = parse_bind_ok(
+        "SELECT sum(id) OVER (ORDER BY id ROWS BETWEEN 1 PRECEDING AND 1 FOLLOWING) FROM users",
+    );
+    let frame = first_window_frame(&plan).expect("frame");
+    assert_eq!(frame.units, BoundFrameUnits::Rows);
+    assert!(matches!(frame.start, BoundFrameBound::Preceding(_)));
+    assert!(matches!(frame.end, BoundFrameBound::Following(_)));
+}
+
+#[test]
+fn frame_validation_errors_fire() {
+    let cat = users_catalog();
+    let cases: &[(&str, &str)] = &[
+        (
+            "SELECT sum(id) OVER (ORDER BY id, score RANGE BETWEEN 1 PRECEDING AND CURRENT ROW) FROM users",
+            "exactly one ORDER BY column",
+        ),
+        (
+            "SELECT sum(id) OVER (GROUPS BETWEEN 1 PRECEDING AND CURRENT ROW) FROM users",
+            "GROUPS mode requires an ORDER BY clause",
+        ),
+        (
+            "SELECT sum(id) OVER (ORDER BY id ROWS BETWEEN UNBOUNDED FOLLOWING AND CURRENT ROW) FROM users",
+            "frame start cannot be UNBOUNDED FOLLOWING",
+        ),
+        (
+            "SELECT sum(id) OVER (ORDER BY id ROWS BETWEEN CURRENT ROW AND UNBOUNDED PRECEDING) FROM users",
+            "frame end cannot be UNBOUNDED PRECEDING",
+        ),
+        (
+            "SELECT sum(id) OVER (ORDER BY id ROWS BETWEEN 1 FOLLOWING AND CURRENT ROW) FROM users",
+            "frame starting from following row cannot have preceding rows",
+        ),
+        (
+            "SELECT sum(id) OVER (ORDER BY id ROWS BETWEEN CURRENT ROW AND 1 PRECEDING) FROM users",
+            "frame starting from current row cannot have preceding rows",
+        ),
+    ];
+    for (sql, needle) in cases {
+        let err = parse_and_bind(sql, &cat).expect_err(sql);
+        assert!(
+            matches!(&err, PlanError::InvalidWindowFrame(m) if m.contains(needle)),
+            "{sql}: expected '{needle}', got {err:?}"
+        );
+    }
+}
+
+#[test]
+fn range_offset_on_text_order_column_is_unsupported() {
+    let cat = users_catalog();
+    let sql =
+        "SELECT sum(id) OVER (ORDER BY name RANGE BETWEEN 1 PRECEDING AND CURRENT ROW) FROM users";
+    let err = parse_and_bind(sql, &cat).expect_err(sql);
+    assert!(err.is_not_supported(), "{err:?}");
+    assert!(
+        err.to_string().contains("not supported for column type"),
+        "{err:?}"
+    );
+}
+
 #[test]
 fn rejects_distinct_window_function_calls() {
     let cat = users_catalog();

@@ -488,4 +488,135 @@ pub enum LogicalWindowFunc {
     },
     /// `NTILE(n)`.
     Ntile(usize),
+    /// A frame-aware aggregate window function: `SUM`/`AVG`/`COUNT`/
+    /// `MIN`/`MAX(expr) OVER (...)`.
+    Aggregate {
+        /// Which aggregate to compute over the frame.
+        kind: WindowAggKind,
+        /// The argument expression evaluated per row.
+        expr: ScalarExpr,
+    },
+    /// `COUNT(*) OVER (...)` — counts all rows in the frame.
+    CountStar,
+}
+
+/// The aggregate kernels usable as frame-aware window functions.
+///
+/// A strict subset of [`AggregateFunc`] — only the aggregates whose
+/// running/frame evaluation is well-defined and required by the SQL
+/// window-frame surface. The executor evaluates these against the
+/// per-row computed frame.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WindowAggKind {
+    /// `SUM(expr)`.
+    Sum,
+    /// `AVG(expr)`.
+    Avg,
+    /// `COUNT(expr)` — counts non-NULL values in the frame.
+    Count,
+    /// `MIN(expr)`.
+    Min,
+    /// `MAX(expr)`.
+    Max,
+}
+
+/// Frame mode for a bound window frame.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BoundFrameUnits {
+    /// `ROWS` — physical row offsets within the partition.
+    Rows,
+    /// `RANGE` — logical offsets by `ORDER BY` value (peers share a frame).
+    Range,
+    /// `GROUPS` — logical offsets by number of peer groups.
+    Groups,
+}
+
+/// One endpoint of a bound window frame.
+#[derive(Clone, Debug, PartialEq)]
+pub enum BoundFrameBound {
+    /// `UNBOUNDED PRECEDING` — start of the partition.
+    UnboundedPreceding,
+    /// `<offset> PRECEDING` — offset before the current row/value/group.
+    Preceding(ScalarExpr),
+    /// `CURRENT ROW`.
+    CurrentRow,
+    /// `<offset> FOLLOWING` — offset after the current row/value/group.
+    Following(ScalarExpr),
+    /// `UNBOUNDED FOLLOWING` — end of the partition.
+    UnboundedFollowing,
+}
+
+/// `EXCLUDE` option on a bound window frame.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BoundFrameExclusion {
+    /// `EXCLUDE NO OTHERS` (default).
+    NoOthers,
+    /// `EXCLUDE CURRENT ROW`.
+    CurrentRow,
+    /// `EXCLUDE GROUP`.
+    Group,
+    /// `EXCLUDE TIES`.
+    Ties,
+}
+
+/// A bound window frame attached to a [`LogicalPlan::Window`] node.
+///
+/// Offset expressions are lowered to [`ScalarExpr`]; the binder fills
+/// this with the SQL default frame when the source query omits an
+/// explicit frame clause (see the window binder).
+///
+/// [`LogicalPlan::Window`]: super::LogicalPlan::Window
+#[derive(Clone, Debug, PartialEq)]
+pub struct LogicalWindowFrame {
+    /// Frame mode.
+    pub units: BoundFrameUnits,
+    /// Frame start bound.
+    pub start: BoundFrameBound,
+    /// Frame end bound.
+    pub end: BoundFrameBound,
+    /// `EXCLUDE` option.
+    pub exclude: BoundFrameExclusion,
+}
+
+impl LogicalWindowFrame {
+    /// The whole-partition frame `RANGE BETWEEN UNBOUNDED PRECEDING AND
+    /// UNBOUNDED FOLLOWING EXCLUDE NO OTHERS` — the default when there
+    /// is no `ORDER BY`, and the frame used by frame-insensitive
+    /// functions (ranking / `LAG` / `LEAD`).
+    #[must_use]
+    pub fn whole_partition() -> Self {
+        Self {
+            units: BoundFrameUnits::Range,
+            start: BoundFrameBound::UnboundedPreceding,
+            end: BoundFrameBound::UnboundedFollowing,
+            exclude: BoundFrameExclusion::NoOthers,
+        }
+    }
+
+    /// The default running frame `RANGE BETWEEN UNBOUNDED PRECEDING AND
+    /// CURRENT ROW EXCLUDE NO OTHERS` — the SQL default when an
+    /// `ORDER BY` is present and no explicit frame is given.
+    #[must_use]
+    pub fn default_running() -> Self {
+        Self {
+            units: BoundFrameUnits::Range,
+            start: BoundFrameBound::UnboundedPreceding,
+            end: BoundFrameBound::CurrentRow,
+            exclude: BoundFrameExclusion::NoOthers,
+        }
+    }
+
+    /// `true` when this frame is the whole-partition default with no
+    /// exclusion. Used by the plan display to suppress the default
+    /// frame line and keep frame-less query plans stable.
+    #[must_use]
+    pub fn is_whole_partition_default(&self) -> bool {
+        *self == Self::whole_partition()
+    }
+
+    /// `true` when this frame is the default running frame.
+    #[must_use]
+    pub fn is_default_running(&self) -> bool {
+        *self == Self::default_running()
+    }
 }

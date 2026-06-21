@@ -8,7 +8,7 @@ use std::fmt;
 use crate::expr::ScalarExpr;
 
 use super::super::logical_plan::LogicalPlan;
-use super::super::node_types::{LogicalWindowFunc, SortKey};
+use super::super::node_types::{LogicalWindowFrame, LogicalWindowFunc, SortKey};
 
 pub(super) fn fmt_scan(table: &str, indent: usize, out: &mut String) {
     let pad = " ".repeat(indent);
@@ -78,11 +78,13 @@ pub(super) fn fmt_sort(input: &LogicalPlan, keys: &[SortKey], indent: usize, out
     input.display_into(indent + 2, out);
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(super) fn fmt_window(
     input: &LogicalPlan,
     partition_by: &[ScalarExpr],
     order_by: &[SortKey],
     func: &LogicalWindowFunc,
+    frame: &LogicalWindowFrame,
     output_name: &str,
     indent: usize,
     out: &mut String,
@@ -111,8 +113,51 @@ pub(super) fn fmt_window(
         }
         out.push(']');
     }
+    // Render the frame only when it is non-default. The two default
+    // frames (whole-partition without ORDER BY, running with ORDER BY)
+    // are suppressed so frame-less query plans keep their existing
+    // display and the display tests stay stable.
+    if !frame.is_whole_partition_default() && !frame.is_default_running() {
+        out.push_str(" FRAME ");
+        fmt_window_frame(frame, out);
+    }
     out.push('\n');
     input.display_into(indent + 2, out);
+}
+
+fn fmt_window_frame(frame: &LogicalWindowFrame, out: &mut String) {
+    use super::super::node_types::{BoundFrameExclusion, BoundFrameUnits};
+    let units = match frame.units {
+        BoundFrameUnits::Rows => "ROWS",
+        BoundFrameUnits::Range => "RANGE",
+        BoundFrameUnits::Groups => "GROUPS",
+    };
+    out.push_str(units);
+    out.push_str(" BETWEEN ");
+    fmt_frame_bound(&frame.start, out);
+    out.push_str(" AND ");
+    fmt_frame_bound(&frame.end, out);
+    match frame.exclude {
+        BoundFrameExclusion::NoOthers => {}
+        BoundFrameExclusion::CurrentRow => out.push_str(" EXCLUDE CURRENT ROW"),
+        BoundFrameExclusion::Group => out.push_str(" EXCLUDE GROUP"),
+        BoundFrameExclusion::Ties => out.push_str(" EXCLUDE TIES"),
+    }
+}
+
+fn fmt_frame_bound(bound: &super::super::node_types::BoundFrameBound, out: &mut String) {
+    use super::super::node_types::BoundFrameBound;
+    match bound {
+        BoundFrameBound::UnboundedPreceding => out.push_str("UNBOUNDED PRECEDING"),
+        BoundFrameBound::Preceding(e) => {
+            let _ = fmt::write(out, format_args!("{e} PRECEDING"));
+        }
+        BoundFrameBound::CurrentRow => out.push_str("CURRENT ROW"),
+        BoundFrameBound::Following(e) => {
+            let _ = fmt::write(out, format_args!("{e} FOLLOWING"));
+        }
+        BoundFrameBound::UnboundedFollowing => out.push_str("UNBOUNDED FOLLOWING"),
+    }
 }
 
 pub(super) fn fmt_empty(indent: usize, out: &mut String) {

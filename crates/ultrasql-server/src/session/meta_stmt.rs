@@ -682,6 +682,7 @@ mod tests {
                 offset: 1,
                 default: Value::Null,
             },
+            frame: ultrasql_planner::LogicalWindowFrame::whole_partition(),
             output_name: "lag".to_owned(),
             schema: schema(),
         };

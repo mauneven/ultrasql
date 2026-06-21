@@ -249,6 +249,9 @@ impl ServerError {
                 ultrasql_planner::PlanError::NotSupported(_)
                 | ultrasql_planner::PlanError::NotSupportedOwned(_),
             ) => "0A000", // feature_not_supported
+            // windowing_error — an illegal window-frame clause (bad bound
+            // ordering, RANGE offset without one ORDER BY col, etc.).
+            Self::Plan(ultrasql_planner::PlanError::InvalidWindowFrame(_)) => "42P20",
             // undefined_table — coarse planner fallback plus the catalog
             // NotFound that surfaces when DROP / ALTER fails to resolve a name
             Self::Plan(_) | Self::Catalog(ultrasql_catalog::CatalogError::NotFound(_)) => "42P01",
@@ -295,6 +298,9 @@ impl ServerError {
             // invalid_parameter_value — runtime parameter rejected by a
             // SQL surface such as generate_series(..., step => 0).
             Self::Execute(ultrasql_executor::ExecError::InvalidParameterValue(_)) => "22023",
+            // invalid_preceding_or_following_size — a window-frame offset
+            // was negative or NULL at execution.
+            Self::Execute(ultrasql_executor::ExecError::WindowFrameError(_)) => "22013",
             // invalid_xml_document — XML cast parser rejected a document
             // value.
             Self::Execute(ultrasql_executor::ExecError::InvalidXmlDocument(_)) => "2200M",

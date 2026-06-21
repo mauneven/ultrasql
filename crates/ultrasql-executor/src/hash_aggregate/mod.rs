@@ -26,7 +26,7 @@
 //! = NULL, etc.). This matches `SELECT COUNT(*) FROM empty_table = 0`.
 //! If the input is empty and there **are** group keys, no rows are emitted.
 
-mod arith;
+pub(crate) mod arith;
 mod json_agg;
 mod key;
 mod state;

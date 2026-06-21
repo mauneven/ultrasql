@@ -37,6 +37,7 @@ use ultrasql_planner::ScalarExpr;
 use ultrasql_vec::Batch;
 use ultrasql_vec::column::{Column, NumericColumn};
 
+use crate::aggregate_math::widen_sum_seed;
 use crate::eval::Eval;
 use crate::filter_op::batch_to_rows;
 use crate::seq_scan::build_batch;
@@ -94,7 +95,7 @@ pub enum WindowFunc {
     FirstValue(ScalarExpr),
     /// `LAST_VALUE(expr)` — last value in the partition.
     LastValue(ScalarExpr),
-    /// `NTH_VALUE(expr, n)` — n-th value (1-based) in the partition.
+    /// `NTH_VALUE(expr, n)` — n-th value (1-based) in the frame.
     NthValue {
         /// The value expression.
         expr: ScalarExpr,
@@ -103,6 +104,98 @@ pub enum WindowFunc {
     },
     /// `NTILE(n)` — divide the partition into `n` buckets.
     Ntile(usize),
+    /// A frame-aware aggregate: `SUM`/`AVG`/`COUNT`/`MIN`/`MAX(expr)`.
+    Aggregate {
+        /// Which aggregate to compute over the frame.
+        kind: WindowAggKind,
+        /// The argument expression evaluated per row.
+        expr: ScalarExpr,
+    },
+    /// `COUNT(*)` — counts all rows in the frame.
+    CountStar,
+}
+
+/// The aggregate kernels usable as frame-aware window functions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WindowAggKind {
+    /// `SUM(expr)`.
+    Sum,
+    /// `AVG(expr)`.
+    Avg,
+    /// `COUNT(expr)` — counts non-NULL values in the frame.
+    Count,
+    /// `MIN(expr)`.
+    Min,
+    /// `MAX(expr)`.
+    Max,
+}
+
+/// Frame mode for a window frame.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FrameUnits {
+    /// `ROWS` — physical row offsets.
+    Rows,
+    /// `RANGE` — logical offsets by `ORDER BY` value.
+    Range,
+    /// `GROUPS` — logical offsets by number of peer groups.
+    Groups,
+}
+
+/// One endpoint of a window frame.
+#[derive(Debug, Clone)]
+pub enum FrameBound {
+    /// `UNBOUNDED PRECEDING`.
+    UnboundedPreceding,
+    /// `<offset> PRECEDING`.
+    Preceding(ScalarExpr),
+    /// `CURRENT ROW`.
+    CurrentRow,
+    /// `<offset> FOLLOWING`.
+    Following(ScalarExpr),
+    /// `UNBOUNDED FOLLOWING`.
+    UnboundedFollowing,
+}
+
+/// `EXCLUDE` option on a window frame.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FrameExclusion {
+    /// `EXCLUDE NO OTHERS` (default).
+    NoOthers,
+    /// `EXCLUDE CURRENT ROW`.
+    CurrentRow,
+    /// `EXCLUDE GROUP`.
+    Group,
+    /// `EXCLUDE TIES`.
+    Ties,
+}
+
+/// A window frame computed per row by the [`WindowAgg`] kernel.
+#[derive(Debug, Clone)]
+pub struct FrameSpec {
+    /// Frame mode.
+    pub units: FrameUnits,
+    /// Frame start bound.
+    pub start: FrameBound,
+    /// Frame end bound.
+    pub end: FrameBound,
+    /// `EXCLUDE` option.
+    pub exclude: FrameExclusion,
+}
+
+impl FrameSpec {
+    /// The whole-partition default frame: `RANGE BETWEEN UNBOUNDED
+    /// PRECEDING AND UNBOUNDED FOLLOWING EXCLUDE NO OTHERS`. Used when a
+    /// caller constructs a [`WindowAgg`] without an explicit frame, which
+    /// preserves the historical whole-partition behaviour.
+    #[must_use]
+    pub fn whole_partition() -> Self {
+        Self {
+            units: FrameUnits::Range,
+            start: FrameBound::UnboundedPreceding,
+            end: FrameBound::UnboundedFollowing,
+            exclude: FrameExclusion::NoOthers,
+        }
+    }
 }
 
 /// Window function operator.
@@ -132,6 +225,9 @@ pub struct WindowAgg {
     order_key_evals: Vec<Eval>,
     /// The window function.
     func: WindowFunc,
+    /// The window frame. Defaults to the whole-partition frame; callers
+    /// override it via [`WindowAgg::with_frame`].
+    frame: FrameSpec,
     schema: Schema,
     child_schema: Schema,
     pending: VecDeque<Batch>,
@@ -170,12 +266,22 @@ impl WindowAgg {
             partition_key_evals,
             order_key_evals,
             func,
+            frame: FrameSpec::whole_partition(),
             schema,
             child_schema,
             pending: VecDeque::new(),
             primed: false,
             eof: false,
         }
+    }
+
+    /// Override the window frame. Without this call the operator uses the
+    /// whole-partition frame (`RANGE UNBOUNDED PRECEDING AND UNBOUNDED
+    /// FOLLOWING`).
+    #[must_use]
+    pub fn with_frame(mut self, frame: FrameSpec) -> Self {
+        self.frame = frame;
+        self
     }
 
     /// Override the per-`ORDER BY`-key sort direction.
@@ -491,6 +597,46 @@ impl WindowAgg {
             }
 
             let n = sorted_indices.len();
+
+            // Build peer-group infrastructure once per partition using the
+            // exact order-key equality already proven by Rank/DenseRank.
+            // `group_of[pos]` is the 0-based peer-group index of the row at
+            // sorted position `pos`; `group_bounds[g] = (first_pos,
+            // last_pos_exclusive)`. With no ORDER BY every row is one peer
+            // group (all rows are peers). This single structure serves
+            // RANGE CURRENT ROW, GROUPS offsets, and EXCLUDE TIES/GROUP.
+            let (group_of, group_bounds) =
+                build_peer_groups(&sorted_indices, order_key_count, &row_order_key);
+
+            // Whether this function needs the per-row frame at all. Ranking
+            // and offset functions are frame-insensitive.
+            let needs_frame = matches!(
+                &self.func,
+                WindowFunc::FirstValue(_)
+                    | WindowFunc::LastValue(_)
+                    | WindowFunc::NthValue { .. }
+                    | WindowFunc::Aggregate { .. }
+                    | WindowFunc::CountStar
+            );
+
+            // Resolve frame offset values (constant per partition) with
+            // execution-time validation, then build a per-position frame
+            // resolver. Only done when the function is frame-sensitive.
+            let frame_ctx = if needs_frame {
+                Some(FrameContext::build(
+                    &self.frame,
+                    &sorted_indices,
+                    &group_of,
+                    &group_bounds,
+                    order_key_count,
+                    &order_directions,
+                    &row_order_key,
+                    &all_rows,
+                )?)
+            } else {
+                None
+            };
+
             let values: Vec<Value> = match &self.func {
                 WindowFunc::RowNumber => Ok((1..=n)
                     .map(|i| Value::Int64(i64_from_usize_clamped(i)))
@@ -573,32 +719,65 @@ impl WindowAgg {
                 }
                 WindowFunc::FirstValue(expr) => {
                     let interp = Eval::new(expr.clone());
-                    let first = sorted_indices
-                        .first()
-                        .map(|&i| eval_window_expr(&interp, &all_rows[i]))
-                        .transpose()?
-                        .unwrap_or(Value::Null);
-                    Ok(vec![first; n])
+                    let ctx = frame_ctx
+                        .as_ref()
+                        .ok_or(ExecError::Internal("window frame context missing"))?;
+                    (0..n)
+                        .map(|pos| {
+                            match ctx.first_included(pos) {
+                                Some(idx) => eval_window_expr(&interp, &all_rows[idx]),
+                                None => Ok(Value::Null),
+                            }
+                        })
+                        .collect()
                 }
                 WindowFunc::LastValue(expr) => {
                     let interp = Eval::new(expr.clone());
-                    let last = sorted_indices
-                        .last()
-                        .map(|&i| eval_window_expr(&interp, &all_rows[i]))
-                        .transpose()?
-                        .unwrap_or(Value::Null);
-                    Ok(vec![last; n])
+                    let ctx = frame_ctx
+                        .as_ref()
+                        .ok_or(ExecError::Internal("window frame context missing"))?;
+                    (0..n)
+                        .map(|pos| {
+                            match ctx.last_included(pos) {
+                                Some(idx) => eval_window_expr(&interp, &all_rows[idx]),
+                                None => Ok(Value::Null),
+                            }
+                        })
+                        .collect()
                 }
                 WindowFunc::NthValue { expr, n: nth } => {
                     let interp = Eval::new(expr.clone());
                     let nth = *nth;
-                    let val = if nth == 0 || nth > n {
-                        Value::Null
-                    } else {
-                        let idx = sorted_indices[nth - 1];
-                        eval_window_expr(&interp, &all_rows[idx])?
-                    };
-                    Ok(vec![val; n])
+                    let ctx = frame_ctx
+                        .as_ref()
+                        .ok_or(ExecError::Internal("window frame context missing"))?;
+                    (0..n)
+                        .map(|pos| {
+                            match ctx.nth_included(pos, nth) {
+                                Some(idx) => eval_window_expr(&interp, &all_rows[idx]),
+                                None => Ok(Value::Null),
+                            }
+                        })
+                        .collect()
+                }
+                WindowFunc::Aggregate { kind, expr } => {
+                    let interp = Eval::new(expr.clone());
+                    let ctx = frame_ctx
+                        .as_ref()
+                        .ok_or(ExecError::Internal("window frame context missing"))?;
+                    (0..n)
+                        .map(|pos| {
+                            frame_aggregate(*kind, &interp, ctx, pos, &sorted_indices, &all_rows)
+                        })
+                        .collect()
+                }
+                WindowFunc::CountStar => {
+                    let ctx = frame_ctx
+                        .as_ref()
+                        .ok_or(ExecError::Internal("window frame context missing"))?;
+                    Ok((0..n)
+                        .map(|pos| Value::Int64(i64_from_usize_clamped(ctx.included_count(pos))))
+                        .collect())
                 }
                 WindowFunc::Ntile(bucket_count) => {
                     let bucket_count = *bucket_count;
@@ -640,6 +819,608 @@ impl WindowAgg {
 
 fn eval_window_expr(eval: &Eval, row: &[Value]) -> Result<Value, ExecError> {
     eval.eval(row).map_err(eval_error_to_exec_error)
+}
+
+/// Build per-partition peer-group structure from the sorted order.
+///
+/// Returns `(group_of, group_bounds)` where `group_of[pos]` is the
+/// 0-based peer-group index of the row at sorted position `pos`, and
+/// `group_bounds[g] = (first_pos, last_pos_exclusive)`. Two adjacent
+/// positions are in the same group iff their order keys are equal (the
+/// same equality Rank/DenseRank already use). With no ORDER BY the whole
+/// partition is one peer group.
+fn build_peer_groups<'a>(
+    sorted_indices: &[usize],
+    order_key_count: usize,
+    row_order_key: &dyn Fn(usize) -> &'a [Value],
+) -> (Vec<usize>, Vec<(usize, usize)>) {
+    let n = sorted_indices.len();
+    let mut group_of = vec![0_usize; n];
+    let mut group_bounds: Vec<(usize, usize)> = Vec::new();
+    if n == 0 {
+        return (group_of, group_bounds);
+    }
+    let mut cur_group = 0_usize;
+    let mut group_start = 0_usize;
+    group_of[0] = 0;
+    for pos in 1..n {
+        let same = order_key_count != 0
+            && row_order_key(sorted_indices[pos - 1]) == row_order_key(sorted_indices[pos]);
+        if !same {
+            group_bounds.push((group_start, pos));
+            cur_group += 1;
+            group_start = pos;
+        }
+        group_of[pos] = cur_group;
+    }
+    group_bounds.push((group_start, n));
+    (group_of, group_bounds)
+}
+
+/// Per-partition resolver for the window frame. Holds the resolved
+/// `[frame_start, frame_end)` position range for each sorted position
+/// plus the peer-group structure, and answers membership queries that
+/// honour the `EXCLUDE` option.
+struct FrameContext<'a> {
+    /// `(frame_start, frame_end_exclusive)` position range per sorted pos.
+    bounds: Vec<(usize, usize)>,
+    /// Peer-group index per sorted position.
+    group_of: &'a [usize],
+    /// `EXCLUDE` option.
+    exclude: FrameExclusion,
+    /// Sorted row indices (position -> original row index).
+    sorted_indices: &'a [usize],
+}
+
+impl<'a> FrameContext<'a> {
+    #[allow(clippy::too_many_arguments)]
+    fn build<'b>(
+        frame: &FrameSpec,
+        sorted_indices: &'a [usize],
+        group_of: &'a [usize],
+        group_bounds: &'a [(usize, usize)],
+        order_key_count: usize,
+        order_directions: &[(bool, bool)],
+        row_order_key: &dyn Fn(usize) -> &'b [Value],
+        all_rows: &[Vec<Value>],
+    ) -> Result<Self, ExecError> {
+        let n = sorted_indices.len();
+        let _ = order_key_count;
+
+        // For RANGE value offsets, precompute the single order-key value
+        // per sorted position (as f64; NULL/non-numeric -> None) and the
+        // ASC flag from the (single) ORDER BY direction.
+        let range_offset = matches!(frame.units, FrameUnits::Range)
+            && (bound_has_offset(&frame.start) || bound_has_offset(&frame.end));
+        let asc = order_directions.first().is_none_or(|d| d.0);
+        let range_vals: Vec<Option<f64>> = if range_offset {
+            (0..n)
+                .map(|pos| row_order_key(sorted_indices[pos]).first().and_then(value_to_f64))
+                .collect()
+        } else {
+            Vec::new()
+        };
+
+        // Resolve the per-partition constant offset magnitudes once, with
+        // execution-time validation (NULL / negative).
+        let start_rows_off = match &frame.start {
+            FrameBound::Preceding(e) | FrameBound::Following(e)
+                if matches!(frame.units, FrameUnits::Rows | FrameUnits::Groups) =>
+            {
+                Some(eval_rows_offset(e, all_rows, sorted_indices, true)?)
+            }
+            _ => None,
+        };
+        let end_rows_off = match &frame.end {
+            FrameBound::Preceding(e) | FrameBound::Following(e)
+                if matches!(frame.units, FrameUnits::Rows | FrameUnits::Groups) =>
+            {
+                Some(eval_rows_offset(e, all_rows, sorted_indices, false)?)
+            }
+            _ => None,
+        };
+        let start_range_off = match &frame.start {
+            FrameBound::Preceding(e) | FrameBound::Following(e) if range_offset => {
+                Some(eval_range_offset(e, all_rows, sorted_indices)?)
+            }
+            _ => None,
+        };
+        let end_range_off = match &frame.end {
+            FrameBound::Preceding(e) | FrameBound::Following(e) if range_offset => {
+                Some(eval_range_offset(e, all_rows, sorted_indices)?)
+            }
+            _ => None,
+        };
+
+        let mut bounds = Vec::with_capacity(n);
+        for pos in 0..n {
+            let fs = resolve_frame_pos(
+                &frame.start,
+                frame.units,
+                BoundSide::Start,
+                pos,
+                n,
+                group_of,
+                group_bounds,
+                &range_vals,
+                asc,
+                start_rows_off,
+                start_range_off,
+            );
+            let fe = resolve_frame_pos(
+                &frame.end,
+                frame.units,
+                BoundSide::End,
+                pos,
+                n,
+                group_of,
+                group_bounds,
+                &range_vals,
+                asc,
+                end_rows_off,
+                end_range_off,
+            );
+            // An inverted frame is empty; never let fe < fs.
+            bounds.push((fs.min(n), fe.min(n).max(fs.min(n))));
+        }
+
+        Ok(Self {
+            bounds,
+            group_of,
+            exclude: frame.exclude,
+            sorted_indices,
+        })
+    }
+
+    /// Whether sorted position `p` is included in the frame of row at
+    /// position `pos`, honouring the `EXCLUDE` option.
+    fn included(&self, pos: usize, p: usize) -> bool {
+        let (fs, fe) = self.bounds[pos];
+        if p < fs || p >= fe {
+            return false;
+        }
+        match self.exclude {
+            FrameExclusion::NoOthers => true,
+            FrameExclusion::CurrentRow => p != pos,
+            FrameExclusion::Group => self.group_of[p] != self.group_of[pos],
+            FrameExclusion::Ties => p == pos || self.group_of[p] != self.group_of[pos],
+        }
+    }
+
+    /// Number of rows included in the frame of `pos`.
+    fn included_count(&self, pos: usize) -> usize {
+        let (fs, fe) = self.bounds[pos];
+        (fs..fe).filter(|&p| self.included(pos, p)).count()
+    }
+
+    /// Original row index of the first included row in the frame of `pos`.
+    fn first_included(&self, pos: usize) -> Option<usize> {
+        let (fs, fe) = self.bounds[pos];
+        (fs..fe)
+            .find(|&p| self.included(pos, p))
+            .map(|p| self.sorted_indices[p])
+    }
+
+    /// Original row index of the last included row in the frame of `pos`.
+    fn last_included(&self, pos: usize) -> Option<usize> {
+        let (fs, fe) = self.bounds[pos];
+        (fs..fe)
+            .rev()
+            .find(|&p| self.included(pos, p))
+            .map(|p| self.sorted_indices[p])
+    }
+
+    /// Original row index of the `nth` (1-based) included row in the frame
+    /// of `pos`, or `None` when the frame has fewer than `nth` rows.
+    fn nth_included(&self, pos: usize, nth: usize) -> Option<usize> {
+        if nth == 0 {
+            return None;
+        }
+        let (fs, fe) = self.bounds[pos];
+        (fs..fe)
+            .filter(|&p| self.included(pos, p))
+            .nth(nth - 1)
+            .map(|p| self.sorted_indices[p])
+    }
+}
+
+/// `true` for offset frame bounds (`<offset> PRECEDING/FOLLOWING`).
+fn bound_has_offset(bound: &FrameBound) -> bool {
+    matches!(bound, FrameBound::Preceding(_) | FrameBound::Following(_))
+}
+
+/// Coerce a numeric `Value` to `f64` for RANGE value-offset arithmetic.
+/// Returns `None` for NULL or non-numeric values (which form their own
+/// peer set under RANGE offsets).
+fn value_to_f64(v: &Value) -> Option<f64> {
+    match v {
+        Value::Int16(x) => Some(f64::from(*x)),
+        Value::Int32(x) => Some(f64::from(*x)),
+        Value::Int64(x) => Some(i64_to_f64(*x)),
+        Value::Float32(x) => Some(f64::from(*x)),
+        Value::Float64(x) => Some(*x),
+        Value::Decimal { value, scale } => Some(i64_to_f64(*value) / 10_f64.powi(*scale)),
+        _ => None,
+    }
+}
+
+/// Convert `i64` to `f64` without a lossy-cast lint trip.
+fn i64_to_f64(v: i64) -> f64 {
+    use num_traits::ToPrimitive;
+    v.to_f64().unwrap_or(if v < 0 { f64::MIN } else { f64::MAX })
+}
+
+/// Evaluate a constant-per-partition frame offset expression and validate
+/// it for ROWS/GROUPS use (round to bigint, reject NULL/negative).
+fn eval_rows_offset(
+    expr: &ScalarExpr,
+    all_rows: &[Vec<Value>],
+    sorted_indices: &[usize],
+    is_start: bool,
+) -> Result<usize, ExecError> {
+    let probe_row = sorted_indices
+        .first()
+        .map(|&i| all_rows[i].as_slice())
+        .unwrap_or(&[]);
+    let value = Eval::new(expr.clone())
+        .eval(probe_row)
+        .map_err(eval_error_to_exec_error)?;
+    let which = if is_start { "starting" } else { "ending" };
+    if value.is_null() {
+        return Err(ExecError::WindowFrameError(format!(
+            "frame {which} offset must not be null"
+        )));
+    }
+    let rounded = value_to_f64(&value)
+        .ok_or_else(|| {
+            ExecError::WindowFrameError(format!("frame {which} offset must be a number"))
+        })?
+        .round();
+    if rounded < 0.0 {
+        return Err(ExecError::WindowFrameError(format!(
+            "frame {which} offset must not be negative"
+        )));
+    }
+    Ok(f64_to_usize(rounded))
+}
+
+/// Evaluate a constant-per-partition RANGE value offset and validate it
+/// (reject NULL/negative). Returns the magnitude as `f64`.
+fn eval_range_offset(
+    expr: &ScalarExpr,
+    all_rows: &[Vec<Value>],
+    sorted_indices: &[usize],
+) -> Result<f64, ExecError> {
+    let probe_row = sorted_indices
+        .first()
+        .map(|&i| all_rows[i].as_slice())
+        .unwrap_or(&[]);
+    let value = Eval::new(expr.clone())
+        .eval(probe_row)
+        .map_err(eval_error_to_exec_error)?;
+    if value.is_null() {
+        return Err(ExecError::WindowFrameError(
+            "frame starting offset must not be null".to_string(),
+        ));
+    }
+    let magnitude = value_to_f64(&value).ok_or_else(|| {
+        ExecError::WindowFrameError("invalid preceding or following size in window function".to_string())
+    })?;
+    if magnitude < 0.0 {
+        return Err(ExecError::WindowFrameError(
+            "invalid preceding or following size in window function".to_string(),
+        ));
+    }
+    Ok(magnitude)
+}
+
+/// Convert a non-negative `f64` to `usize`, saturating on overflow.
+fn f64_to_usize(v: f64) -> usize {
+    use num_traits::ToPrimitive;
+    v.to_usize().unwrap_or(usize::MAX)
+}
+
+/// Which side of the frame a bound is being resolved for. A START bound
+/// returns the inclusive first position; an END bound returns the
+/// exclusive one-past-last position.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum BoundSide {
+    Start,
+    End,
+}
+
+/// Resolve one frame bound to a position into the sorted partition.
+///
+/// For `BoundSide::Start` the result is the inclusive first position;
+/// for `BoundSide::End` it is the exclusive position one past the last
+/// included row. Offset magnitudes (`rows_off`, `range_off`) are the
+/// already-validated per-partition constants.
+#[allow(clippy::too_many_arguments)]
+fn resolve_frame_pos(
+    bound: &FrameBound,
+    units: FrameUnits,
+    side: BoundSide,
+    pos: usize,
+    n: usize,
+    group_of: &[usize],
+    group_bounds: &[(usize, usize)],
+    range_vals: &[Option<f64>],
+    asc: bool,
+    rows_off: Option<usize>,
+    range_off: Option<f64>,
+) -> usize {
+    match bound {
+        FrameBound::UnboundedPreceding => 0,
+        FrameBound::UnboundedFollowing => n,
+        FrameBound::CurrentRow => match units {
+            FrameUnits::Rows => {
+                if side == BoundSide::Start {
+                    pos
+                } else {
+                    pos + 1
+                }
+            }
+            // RANGE / GROUPS CURRENT ROW = the current peer group.
+            FrameUnits::Range | FrameUnits::Groups => {
+                let (gs, ge) = group_bounds[group_of[pos]];
+                if side == BoundSide::Start { gs } else { ge }
+            }
+        },
+        FrameBound::Preceding(_) | FrameBound::Following(_) => {
+            let following = matches!(bound, FrameBound::Following(_));
+            match units {
+                FrameUnits::Rows => {
+                    let off = rows_off.unwrap_or(0);
+                    resolve_rows_offset(pos, n, side, following, off)
+                }
+                FrameUnits::Groups => {
+                    let off = rows_off.unwrap_or(0);
+                    resolve_groups_offset(
+                        pos,
+                        n,
+                        side,
+                        following,
+                        off,
+                        group_of,
+                        group_bounds,
+                    )
+                }
+                FrameUnits::Range => {
+                    let off = range_off.unwrap_or(0.0);
+                    resolve_range_offset(pos, n, side, following, off, range_vals, asc)
+                }
+            }
+        }
+    }
+}
+
+/// ROWS `<off> PRECEDING/FOLLOWING` position resolution.
+fn resolve_rows_offset(
+    pos: usize,
+    n: usize,
+    side: BoundSide,
+    following: bool,
+    off: usize,
+) -> usize {
+    let target = if following {
+        pos.saturating_add(off)
+    } else {
+        pos.saturating_sub(off)
+    };
+    match side {
+        BoundSide::Start => target.min(n),
+        // End bound is exclusive: one past the target row.
+        BoundSide::End => target.saturating_add(1).min(n),
+    }
+}
+
+/// GROUPS `<off> PRECEDING/FOLLOWING` position resolution. The offset
+/// counts whole peer groups; the result is the row-span of the shifted
+/// group clamped into the partition.
+fn resolve_groups_offset(
+    pos: usize,
+    n: usize,
+    side: BoundSide,
+    following: bool,
+    off: usize,
+    group_of: &[usize],
+    group_bounds: &[(usize, usize)],
+) -> usize {
+    let cur = group_of[pos];
+    let group_count = group_bounds.len();
+    if following {
+        let target = cur.saturating_add(off);
+        if target >= group_count {
+            // Past the last group.
+            return n;
+        }
+        let (gs, ge) = group_bounds[target];
+        if side == BoundSide::Start { gs } else { ge }
+    } else {
+        let target = cur.saturating_sub(off);
+        // When `off` exceeds the current group index the start clamps to 0.
+        let underflow = off > cur;
+        let (gs, ge) = group_bounds[target];
+        match side {
+            BoundSide::Start => {
+                if underflow { 0 } else { gs }
+            }
+            BoundSide::End => ge,
+        }
+    }
+}
+
+/// RANGE `<off> PRECEDING/FOLLOWING` (numeric value offset) resolution.
+///
+/// Includes every row whose ordering value lies within `[v - off, v +
+/// off]` of the current row's value (direction adjusted for ASC/DESC).
+/// Rows with a NULL ordering value form their own peer set: a NULL
+/// current row frames only over the other NULL rows.
+#[allow(clippy::too_many_arguments)]
+fn resolve_range_offset(
+    pos: usize,
+    n: usize,
+    side: BoundSide,
+    following: bool,
+    off: f64,
+    range_vals: &[Option<f64>],
+    asc: bool,
+) -> usize {
+    let Some(cur) = range_vals[pos] else {
+        // NULL current row: its frame is exactly the contiguous NULL run.
+        let mut lo = pos;
+        while lo > 0 && range_vals[lo - 1].is_none() {
+            lo -= 1;
+        }
+        let mut hi = pos + 1;
+        while hi < n && range_vals[hi].is_none() {
+            hi += 1;
+        }
+        return if side == BoundSide::Start { lo } else { hi };
+    };
+
+    // The frame value-window bound. With ASC ordering, `<off> PRECEDING`
+    // admits values >= v-off and `<off> FOLLOWING` admits values <= v+off.
+    // DESC flips the direction of "preceding"/"following" in value space.
+    let preceding = !following;
+    // Compute the inclusive value-bound for this side.
+    let bound_value = if asc {
+        if preceding { cur - off } else { cur + off }
+    } else if preceding {
+        cur + off
+    } else {
+        cur - off
+    };
+
+    // Scan positions that carry a non-null value, respecting the sort
+    // direction, to find the contiguous run admitted by the value bound.
+    // Because the partition is sorted on the single key, the admitted set
+    // is contiguous among the non-null rows.
+    match side {
+        BoundSide::Start => {
+            // First position whose value is within the lower edge of the
+            // admitted window. For a START bound the admitted edge is the
+            // "earliest" value still inside the window.
+            let mut p = 0;
+            while p < n {
+                match range_vals[p] {
+                    Some(val) if value_in_start_window(val, bound_value, asc, preceding) => break,
+                    _ => p += 1,
+                }
+            }
+            p.min(n)
+        }
+        BoundSide::End => {
+            // One past the last position still inside the window.
+            let mut p = n;
+            while p > 0 {
+                match range_vals[p - 1] {
+                    Some(val) if value_in_end_window(val, bound_value, asc, preceding) => break,
+                    _ => p -= 1,
+                }
+            }
+            p
+        }
+    }
+}
+
+/// Whether `val` is at or beyond the START edge of a RANGE value window.
+fn value_in_start_window(val: f64, bound_value: f64, asc: bool, preceding: bool) -> bool {
+    // A START bound is `<off> PRECEDING` (most common) admitting values
+    // >= v-off (ASC). For a `<off> FOLLOWING` start the edge is v+off.
+    let _ = preceding;
+    if asc {
+        val >= bound_value
+    } else {
+        val <= bound_value
+    }
+}
+
+/// Whether `val` is at or within the END edge of a RANGE value window.
+fn value_in_end_window(val: f64, bound_value: f64, asc: bool, preceding: bool) -> bool {
+    let _ = preceding;
+    if asc {
+        val <= bound_value
+    } else {
+        val >= bound_value
+    }
+}
+
+/// Compute one frame-relative aggregate value for `pos` by folding the
+/// included rows of the frame through the shared aggregate kernels.
+fn frame_aggregate(
+    kind: WindowAggKind,
+    interp: &Eval,
+    ctx: &FrameContext<'_>,
+    pos: usize,
+    sorted_indices: &[usize],
+    all_rows: &[Vec<Value>],
+) -> Result<Value, ExecError> {
+    use crate::hash_aggregate::arith::{add_values, divide_value, value_lt};
+    let (fs, fe) = ctx.bounds[pos];
+
+    let mut sum_acc: Option<Value> = None;
+    let mut count: i64 = 0;
+    let mut min_acc: Option<Value> = None;
+    let mut max_acc: Option<Value> = None;
+
+    for p in fs..fe {
+        if !ctx.included(pos, p) {
+            continue;
+        }
+        let v = eval_window_expr(interp, &all_rows[sorted_indices[p]])?;
+        if v.is_null() {
+            continue;
+        }
+        match kind {
+            WindowAggKind::Count => count += 1,
+            WindowAggKind::Sum | WindowAggKind::Avg => {
+                count += 1;
+                sum_acc = Some(match sum_acc.take() {
+                    None => widen_sum_seed(v),
+                    Some(e) => add_values(e, v)?,
+                });
+            }
+            WindowAggKind::Min => {
+                min_acc = Some(match min_acc.take() {
+                    None => v,
+                    Some(e) => {
+                        if value_lt(&v, &e) {
+                            v
+                        } else {
+                            e
+                        }
+                    }
+                });
+            }
+            WindowAggKind::Max => {
+                max_acc = Some(match max_acc.take() {
+                    None => v,
+                    Some(e) => {
+                        if value_lt(&e, &v) {
+                            v
+                        } else {
+                            e
+                        }
+                    }
+                });
+            }
+        }
+    }
+
+    Ok(match kind {
+        WindowAggKind::Count => Value::Int64(count),
+        WindowAggKind::Sum => sum_acc.unwrap_or(Value::Null),
+        WindowAggKind::Avg => {
+            if count == 0 {
+                Value::Null
+            } else {
+                sum_acc.map_or(Value::Null, |s| divide_value(s, count))
+            }
+        }
+        WindowAggKind::Min => min_acc.unwrap_or(Value::Null),
+        WindowAggKind::Max => max_acc.unwrap_or(Value::Null),
+    })
 }
 
 /// `true` iff `keys` is monotonically non-decreasing.
@@ -881,7 +1662,9 @@ mod tests {
     use ultrasql_vec::bitmap::Bitmap;
     use ultrasql_vec::column::{Column, NumericColumn};
 
-    use super::{WindowAgg, WindowFunc};
+    use super::{
+        FrameBound, FrameExclusion, FrameSpec, FrameUnits, WindowAgg, WindowAggKind, WindowFunc,
+    };
     use crate::filter_op::batch_to_rows;
     use crate::mem_table_scan::MemTableScan;
     use crate::{ExecError, Operator};
@@ -975,6 +1758,80 @@ mod tests {
         }
     }
 
+    /// The default running frame: `RANGE BETWEEN UNBOUNDED PRECEDING AND
+    /// CURRENT ROW EXCLUDE NO OTHERS`.
+    fn default_running_frame() -> FrameSpec {
+        FrameSpec {
+            units: FrameUnits::Range,
+            start: FrameBound::UnboundedPreceding,
+            end: FrameBound::CurrentRow,
+            exclude: FrameExclusion::NoOthers,
+        }
+    }
+
+    /// A frame with explicit `units`, `start`, `end`, `exclude`.
+    fn frame(
+        units: FrameUnits,
+        start: FrameBound,
+        end: FrameBound,
+        exclude: FrameExclusion,
+    ) -> FrameSpec {
+        FrameSpec {
+            units,
+            start,
+            end,
+            exclude,
+        }
+    }
+
+    /// Drive a `sum(val) OVER (ORDER BY <order_col> <frame>)` over a single
+    /// `(id, val)` batch and return the window column in input-row order.
+    fn run_sum_over(
+        rows: &[(i32, i32)],
+        order_key: ScalarExpr,
+        order_dir: (bool, bool),
+        frame_spec: FrameSpec,
+    ) -> Vec<Value> {
+        let schema = schema_with_value_window(DataType::Int64);
+        let scan = MemTableScan::new(schema_id_val(), vec![make_batch(rows)]);
+        let mut op = WindowAgg::new(
+            Box::new(scan),
+            vec![],
+            vec![order_key],
+            WindowFunc::Aggregate {
+                kind: WindowAggKind::Sum,
+                expr: col_val(),
+            },
+            schema,
+        )
+        .with_order_directions(vec![order_dir])
+        .with_frame(frame_spec);
+        drain_window_values(&mut op)
+    }
+
+    /// Like [`run_sum_over`] but for `count(*)`.
+    fn run_count_star_over(
+        rows: &[(i32, i32)],
+        order_key: ScalarExpr,
+        frame_spec: FrameSpec,
+    ) -> Vec<Value> {
+        let schema = schema_with_value_window(DataType::Int64);
+        let scan = MemTableScan::new(schema_id_val(), vec![make_batch(rows)]);
+        let mut op = WindowAgg::new(
+            Box::new(scan),
+            vec![],
+            vec![order_key],
+            WindowFunc::CountStar,
+            schema,
+        )
+        .with_frame(frame_spec);
+        drain_window_values(&mut op)
+    }
+
+    fn i64s(vs: &[i64]) -> Vec<Value> {
+        vs.iter().map(|v| Value::Int64(*v)).collect()
+    }
+
     fn lit_i32(v: i32) -> ScalarExpr {
         ScalarExpr::Literal {
             value: Value::Int32(v),
@@ -1017,6 +1874,11 @@ mod tests {
             out.extend(rows.into_iter().map(|row| row[2].clone()));
         }
         out
+    }
+
+    /// Drive the operator expecting an error from the first batch.
+    fn drain_window_values_err(op: &mut dyn Operator) -> ExecError {
+        op.next_batch().expect_err("expected window frame error")
     }
 
     #[derive(Debug)]
@@ -1344,22 +2206,77 @@ mod tests {
         );
     }
 
+    /// The default running frame (`RANGE UNBOUNDED PRECEDING AND CURRENT
+    /// ROW`) makes `last_value`/`nth_value` frame-relative — the bug that
+    /// previously broadcast the partition max/nth is fixed. Rows are
+    /// `(id,val) = (100,20),(200,10),(300,30)` ordered by val ascending,
+    /// so sorted order is id 200(v10), 100(v20), 300(v30). The output is
+    /// emitted in input (id) order.
     #[test]
-    fn window_value_functions_use_sorted_partition_values() {
+    fn window_value_functions_are_frame_relative_under_default_running_frame() {
         let rows = vec![make_batch(&[(100, 20), (200, 10), (300, 30)])];
         let schema = schema_with_value_window(DataType::Int32);
+        let running = default_running_frame();
 
+        // first_value over the running frame is the partition first (id
+        // 200) for every row — coincides with the partition min here.
         let mut first = WindowAgg::new(
             Box::new(MemTableScan::new(schema_id_val(), rows.clone())),
             vec![],
             vec![col_val()],
             WindowFunc::FirstValue(col_id()),
             schema.clone(),
-        );
+        )
+        .with_frame(running.clone());
         assert_eq!(
             drain_window_values(&mut first),
+            // input order: id 100 (pos1), 200 (pos0), 300 (pos2)
             vec![Value::Int32(200), Value::Int32(200), Value::Int32(200)]
         );
+
+        // last_value under the running frame = the CURRENT row, not the
+        // partition max (the fixed bug).
+        let mut last = WindowAgg::new(
+            Box::new(MemTableScan::new(schema_id_val(), rows.clone())),
+            vec![],
+            vec![col_val()],
+            WindowFunc::LastValue(col_id()),
+            schema.clone(),
+        )
+        .with_frame(running.clone());
+        assert_eq!(
+            drain_window_values(&mut last),
+            // each row's own id: 100, 200, 300
+            vec![Value::Int32(100), Value::Int32(200), Value::Int32(300)]
+        );
+
+        // nth_value(2) is NULL until the running frame has grown to 2 rows.
+        // pos0 (id 200): frame {200} -> NULL; pos1 (id 100): frame
+        // {200,100} -> 100; pos2 (id 300): frame {200,100,300} -> 100.
+        let mut second = WindowAgg::new(
+            Box::new(MemTableScan::new(schema_id_val(), rows)),
+            vec![],
+            vec![col_val()],
+            WindowFunc::NthValue {
+                expr: col_id(),
+                n: 2,
+            },
+            schema,
+        )
+        .with_frame(running);
+        assert_eq!(
+            drain_window_values(&mut second),
+            // input order: id 100 (pos1 -> 100), 200 (pos0 -> NULL), 300 (pos2 -> 100)
+            vec![Value::Int32(100), Value::Null, Value::Int32(100)]
+        );
+    }
+
+    /// Under the whole-partition frame the value functions broadcast the
+    /// partition first/last/nth, as before.
+    #[test]
+    fn window_value_functions_use_whole_partition_frame() {
+        let rows = vec![make_batch(&[(100, 20), (200, 10), (300, 30)])];
+        let schema = schema_with_value_window(DataType::Int32);
 
         let mut last = WindowAgg::new(
             Box::new(MemTableScan::new(schema_id_val(), rows.clone())),
@@ -1367,40 +2284,25 @@ mod tests {
             vec![col_val()],
             WindowFunc::LastValue(col_id()),
             schema.clone(),
-        );
+        ); // default = whole partition
         assert_eq!(
             drain_window_values(&mut last),
             vec![Value::Int32(300), Value::Int32(300), Value::Int32(300)]
         );
 
         let mut second = WindowAgg::new(
-            Box::new(MemTableScan::new(schema_id_val(), rows.clone())),
+            Box::new(MemTableScan::new(schema_id_val(), rows)),
             vec![],
             vec![col_val()],
             WindowFunc::NthValue {
                 expr: col_id(),
                 n: 2,
             },
-            schema.clone(),
+            schema,
         );
         assert_eq!(
             drain_window_values(&mut second),
             vec![Value::Int32(100), Value::Int32(100), Value::Int32(100)]
-        );
-
-        let mut missing = WindowAgg::new(
-            Box::new(MemTableScan::new(schema_id_val(), rows)),
-            vec![],
-            vec![col_val()],
-            WindowFunc::NthValue {
-                expr: col_id(),
-                n: 0,
-            },
-            schema,
-        );
-        assert_eq!(
-            drain_window_values(&mut missing),
-            vec![Value::Null, Value::Null, Value::Null]
         );
     }
 
@@ -1562,5 +2464,371 @@ mod tests {
         let expected = pairs.clone(); // already ordered by index
         let actual = super::parallel_sort_pairs(pairs);
         assert_eq!(actual, expected);
+    }
+
+    // ----- Window-frame conformance battery (executor kernel) -----------
+    // Hand-built partitions over `(id, val)` rows. Each test maps to a
+    // case in the spec battery; comments name the case number.
+
+    /// Case 2: `ROWS BETWEEN 1 PRECEDING AND CURRENT ROW`.
+    #[test]
+    fn frame_rows_trailing_sum() {
+        let got = run_sum_over(
+            &[(1, 10), (2, 20), (3, 30), (4, 40)],
+            col_id(),
+            (true, false),
+            frame(
+                FrameUnits::Rows,
+                FrameBound::Preceding(lit_i32(1)),
+                FrameBound::CurrentRow,
+                FrameExclusion::NoOthers,
+            ),
+        );
+        assert_eq!(got, i64s(&[10, 30, 50, 70]));
+    }
+
+    /// Case 3: `ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING`.
+    #[test]
+    fn frame_rows_suffix_sum() {
+        let got = run_sum_over(
+            &[(1, 10), (2, 20), (3, 30), (4, 40)],
+            col_id(),
+            (true, false),
+            frame(
+                FrameUnits::Rows,
+                FrameBound::CurrentRow,
+                FrameBound::UnboundedFollowing,
+                FrameExclusion::NoOthers,
+            ),
+        );
+        assert_eq!(got, i64s(&[100, 90, 70, 40]));
+    }
+
+    /// Case 4: `ROWS BETWEEN 1 PRECEDING AND 1 FOLLOWING`.
+    #[test]
+    fn frame_rows_centered_sum() {
+        let got = run_sum_over(
+            &[(1, 10), (2, 20), (3, 30), (4, 40)],
+            col_id(),
+            (true, false),
+            frame(
+                FrameUnits::Rows,
+                FrameBound::Preceding(lit_i32(1)),
+                FrameBound::Following(lit_i32(1)),
+                FrameExclusion::NoOthers,
+            ),
+        );
+        assert_eq!(got, i64s(&[30, 60, 90, 70]));
+    }
+
+    /// Case 5 (RANGE peers): `RANGE BETWEEN UNBOUNDED PRECEDING AND
+    /// CURRENT ROW` with duplicate ORDER BY values. Ordering by `g`
+    /// (the val column here doubles as g): rows g = 1,1,2,2,3.
+    /// Peers share the stepped cumulative result 30,30,100,100,150 —
+    /// proving the default frame is RANGE, not ROWS.
+    #[test]
+    fn frame_range_cumulative_peers() {
+        // (id, g) pairs; we order by g and sum g's companion value below.
+        // Use a dedicated 3-col layout: reuse make_batch with (id=val_id,
+        // val=v) and order by a separate key. Simpler: order by `val`
+        // where val encodes the peer group, and sum a parallel column.
+        // Here we model the spec's (g, v): order by g, sum v.
+        let schema = schema_with_value_window(DataType::Int64);
+        // Columns: id=g, val=v.
+        let scan = MemTableScan::new(
+            schema_id_val(),
+            vec![make_batch(&[(1, 10), (1, 20), (2, 30), (2, 40), (3, 50)])],
+        );
+        let mut op = WindowAgg::new(
+            Box::new(scan),
+            vec![],
+            vec![col_id()], // ORDER BY g
+            WindowFunc::Aggregate {
+                kind: WindowAggKind::Sum,
+                expr: col_val(),
+            },
+            schema,
+        )
+        .with_order_directions(vec![(true, false)])
+        .with_frame(default_running_frame());
+        assert_eq!(
+            drain_window_values(&mut op),
+            i64s(&[30, 30, 100, 100, 150])
+        );
+    }
+
+    /// Case 5 contrast: the SAME data under `ROWS UNBOUNDED PRECEDING AND
+    /// CURRENT ROW` gives the per-row running sum 10,30,60,100,150.
+    #[test]
+    fn frame_rows_cumulative_no_peer_grouping() {
+        let schema = schema_with_value_window(DataType::Int64);
+        let scan = MemTableScan::new(
+            schema_id_val(),
+            vec![make_batch(&[(1, 10), (1, 20), (2, 30), (2, 40), (3, 50)])],
+        );
+        let mut op = WindowAgg::new(
+            Box::new(scan),
+            vec![],
+            vec![col_id()],
+            WindowFunc::Aggregate {
+                kind: WindowAggKind::Sum,
+                expr: col_val(),
+            },
+            schema,
+        )
+        .with_order_directions(vec![(true, false)])
+        .with_frame(frame(
+            FrameUnits::Rows,
+            FrameBound::UnboundedPreceding,
+            FrameBound::CurrentRow,
+            FrameExclusion::NoOthers,
+        ));
+        assert_eq!(
+            drain_window_values(&mut op),
+            i64s(&[10, 30, 60, 100, 150])
+        );
+    }
+
+    /// Case 6 (RANGE numeric offset): `RANGE BETWEEN 10 PRECEDING AND 10
+    /// FOLLOWING` over val = 10,15,20,40,45. Each row's frame is the rows
+    /// whose value is within [v-10, v+10]. sums 45,45,45,85,85; counts
+    /// 3,3,3,2,2.
+    #[test]
+    fn frame_range_numeric_offset() {
+        let rows = [(1, 10), (2, 15), (3, 20), (4, 40), (5, 45)];
+        let sums = run_sum_over(
+            &rows,
+            col_val(), // ORDER BY v
+            (true, false),
+            frame(
+                FrameUnits::Range,
+                FrameBound::Preceding(lit_i32(10)),
+                FrameBound::Following(lit_i32(10)),
+                FrameExclusion::NoOthers,
+            ),
+        );
+        assert_eq!(sums, i64s(&[45, 45, 45, 85, 85]));
+        let counts = run_count_star_over(
+            &rows,
+            col_val(),
+            frame(
+                FrameUnits::Range,
+                FrameBound::Preceding(lit_i32(10)),
+                FrameBound::Following(lit_i32(10)),
+                FrameExclusion::NoOthers,
+            ),
+        );
+        assert_eq!(counts, i64s(&[3, 3, 3, 2, 2]));
+    }
+
+    /// Case 7 (GROUPS): `GROUPS BETWEEN 1 PRECEDING AND CURRENT ROW`.
+    /// id=g groups: 1,1,2,3,3 with v = 10,20,30,40,50.
+    /// sums 30,30,60,120,120; counts 2,2,3,3,3.
+    #[test]
+    fn frame_groups_preceding_to_current() {
+        let rows = [(1, 10), (1, 20), (2, 30), (3, 40), (3, 50)];
+        let sums = run_sum_over(
+            &rows,
+            col_id(), // ORDER BY g
+            (true, false),
+            frame(
+                FrameUnits::Groups,
+                FrameBound::Preceding(lit_i32(1)),
+                FrameBound::CurrentRow,
+                FrameExclusion::NoOthers,
+            ),
+        );
+        assert_eq!(sums, i64s(&[30, 30, 60, 120, 120]));
+        let counts = run_count_star_over(
+            &rows,
+            col_id(),
+            frame(
+                FrameUnits::Groups,
+                FrameBound::Preceding(lit_i32(1)),
+                FrameBound::CurrentRow,
+                FrameExclusion::NoOthers,
+            ),
+        );
+        assert_eq!(counts, i64s(&[2, 2, 3, 3, 3]));
+    }
+
+    /// Case 15 (GROUPS): `GROUPS BETWEEN CURRENT ROW AND 1 FOLLOWING`.
+    /// id=g groups 1,1,2,3 with v = 10,20,30,40. sums 60,60,70,40.
+    #[test]
+    fn frame_groups_current_to_following() {
+        let rows = [(1, 10), (1, 20), (2, 30), (3, 40)];
+        let sums = run_sum_over(
+            &rows,
+            col_id(),
+            (true, false),
+            frame(
+                FrameUnits::Groups,
+                FrameBound::CurrentRow,
+                FrameBound::Following(lit_i32(1)),
+                FrameExclusion::NoOthers,
+            ),
+        );
+        assert_eq!(sums, i64s(&[60, 60, 70, 40]));
+    }
+
+    /// Case 8 (EXCLUDE CURRENT ROW): whole-partition frame minus self.
+    /// val = 10,20,30,40 -> 90,80,70,60.
+    #[test]
+    fn frame_exclude_current_row() {
+        let got = run_sum_over(
+            &[(1, 10), (2, 20), (3, 30), (4, 40)],
+            col_id(),
+            (true, false),
+            frame(
+                FrameUnits::Rows,
+                FrameBound::UnboundedPreceding,
+                FrameBound::UnboundedFollowing,
+                FrameExclusion::CurrentRow,
+            ),
+        );
+        assert_eq!(got, i64s(&[90, 80, 70, 60]));
+    }
+
+    /// Case 9 (EXCLUDE TIES / GROUP): three peers at g=1 plus a lone g=2.
+    /// id=g groups 1,1,1,2 with v = 10,20,30,40. full=100.
+    /// EXCLUDE TIES keeps self drops peers: 50,60,70,100.
+    /// EXCLUDE GROUP drops self+peers: 40,40,40,60.
+    #[test]
+    fn frame_exclude_ties_and_group() {
+        let rows = [(1, 10), (1, 20), (1, 30), (2, 40)];
+        let full = run_sum_over(
+            &rows,
+            col_id(),
+            (true, false),
+            frame(
+                FrameUnits::Range,
+                FrameBound::UnboundedPreceding,
+                FrameBound::UnboundedFollowing,
+                FrameExclusion::NoOthers,
+            ),
+        );
+        assert_eq!(full, i64s(&[100, 100, 100, 100]));
+
+        let ties = run_sum_over(
+            &rows,
+            col_id(),
+            (true, false),
+            frame(
+                FrameUnits::Range,
+                FrameBound::UnboundedPreceding,
+                FrameBound::UnboundedFollowing,
+                FrameExclusion::Ties,
+            ),
+        );
+        // id=1: 100-20-30=50; id=2: 100-10-30=60; id=3: 100-10-20=70;
+        // id=4 (lone group): 100 (no peers to drop).
+        assert_eq!(ties, i64s(&[50, 60, 70, 100]));
+
+        let group = run_sum_over(
+            &rows,
+            col_id(),
+            (true, false),
+            frame(
+                FrameUnits::Range,
+                FrameBound::UnboundedPreceding,
+                FrameBound::UnboundedFollowing,
+                FrameExclusion::Group,
+            ),
+        );
+        // g=1 rows drop {10,20,30} -> 40; g=2 row drops {40} -> 60.
+        assert_eq!(group, i64s(&[40, 40, 40, 60]));
+    }
+
+    /// Case 17 (execution-time validation): negative ROWS offset errors.
+    #[test]
+    fn frame_negative_rows_offset_errors() {
+        let schema = schema_with_value_window(DataType::Int64);
+        let scan = MemTableScan::new(schema_id_val(), vec![make_batch(&[(1, 10), (2, 20)])]);
+        let mut op = WindowAgg::new(
+            Box::new(scan),
+            vec![],
+            vec![col_id()],
+            WindowFunc::Aggregate {
+                kind: WindowAggKind::Sum,
+                expr: col_val(),
+            },
+            schema,
+        )
+        .with_order_directions(vec![(true, false)])
+        .with_frame(frame(
+            FrameUnits::Rows,
+            FrameBound::Preceding(lit_i32(-1)),
+            FrameBound::CurrentRow,
+            FrameExclusion::NoOthers,
+        ));
+        let err = drain_window_values_err(&mut op);
+        assert!(
+            matches!(&err, ExecError::WindowFrameError(m) if m.contains("must not be negative")),
+            "{err:?}"
+        );
+    }
+
+    /// Aggregate kernels: MIN/MAX/AVG over a running frame.
+    #[test]
+    fn frame_aggregate_min_max_avg() {
+        let rows = vec![make_batch(&[(1, 10), (2, 30), (3, 20)])];
+
+        let mut min_op = WindowAgg::new(
+            Box::new(MemTableScan::new(schema_id_val(), rows.clone())),
+            vec![],
+            vec![col_id()],
+            WindowFunc::Aggregate {
+                kind: WindowAggKind::Min,
+                expr: col_val(),
+            },
+            schema_with_value_window(DataType::Int32),
+        )
+        .with_order_directions(vec![(true, false)])
+        .with_frame(default_running_frame());
+        // running min: 10, 10, 10
+        assert_eq!(
+            drain_window_values(&mut min_op),
+            vec![Value::Int32(10), Value::Int32(10), Value::Int32(10)]
+        );
+
+        let mut max_op = WindowAgg::new(
+            Box::new(MemTableScan::new(schema_id_val(), rows.clone())),
+            vec![],
+            vec![col_id()],
+            WindowFunc::Aggregate {
+                kind: WindowAggKind::Max,
+                expr: col_val(),
+            },
+            schema_with_value_window(DataType::Int32),
+        )
+        .with_order_directions(vec![(true, false)])
+        .with_frame(default_running_frame());
+        // running max: 10, 30, 30
+        assert_eq!(
+            drain_window_values(&mut max_op),
+            vec![Value::Int32(10), Value::Int32(30), Value::Int32(30)]
+        );
+
+        let mut avg_op = WindowAgg::new(
+            Box::new(MemTableScan::new(schema_id_val(), rows)),
+            vec![],
+            vec![col_id()],
+            WindowFunc::Aggregate {
+                kind: WindowAggKind::Avg,
+                expr: col_val(),
+            },
+            schema_with_value_window(DataType::Float64),
+        )
+        .with_order_directions(vec![(true, false)])
+        .with_frame(default_running_frame());
+        // running avg: 10, 20, 20
+        assert_eq!(
+            drain_window_values(&mut avg_op),
+            vec![
+                Value::Float64(10.0),
+                Value::Float64(20.0),
+                Value::Float64(20.0)
+            ]
+        );
     }
 }

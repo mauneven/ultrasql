@@ -23,7 +23,7 @@ use super::node_types::{
     LogicalDescribeTarget, LogicalIndexMethod, LogicalIndexOption, LogicalJoinCondition,
     LogicalJoinType, LogicalMergeClause, LogicalOnConflict, LogicalPivotAggregate,
     LogicalPivotValue, LogicalSetOp, LogicalSetQuantifier, LogicalSetVariableAction,
-    LogicalUnpivotColumn, LogicalWindowFunc, SortKey, TxnIsolationLevel,
+    LogicalUnpivotColumn, LogicalWindowFrame, LogicalWindowFunc, SortKey, TxnIsolationLevel,
 };
 
 /// The bound, type-checked logical plan tree.
@@ -94,6 +94,11 @@ pub enum LogicalPlan {
         order_by: Vec<SortKey>,
         /// Which window function to compute.
         func: LogicalWindowFunc,
+        /// The bound frame. The binder fills this with the SQL default
+        /// frame when the source query omits an explicit frame clause.
+        /// Frame-insensitive functions (ranking / `LAG` / `LEAD`) carry
+        /// the whole-partition frame and never branch on it.
+        frame: LogicalWindowFrame,
         /// Display name for the appended output column. Borrowed by
         /// the binder when it re-references the window result from
         /// the outer projection.

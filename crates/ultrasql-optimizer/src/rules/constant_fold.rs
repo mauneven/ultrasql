@@ -186,10 +186,23 @@ fn fold_window_func(
             || (func.clone(), false),
             |expr| (LogicalWindowFunc::NthValue { expr, n: *n }, true),
         ),
+        LogicalWindowFunc::Aggregate { kind, expr } => fold_expr(expr).map_or_else(
+            || (func.clone(), false),
+            |expr| {
+                (
+                    LogicalWindowFunc::Aggregate {
+                        kind: *kind,
+                        expr,
+                    },
+                    true,
+                )
+            },
+        ),
         LogicalWindowFunc::RowNumber
         | LogicalWindowFunc::Rank
         | LogicalWindowFunc::DenseRank
-        | LogicalWindowFunc::Ntile(_) => (func.clone(), false),
+        | LogicalWindowFunc::Ntile(_)
+        | LogicalWindowFunc::CountStar => (func.clone(), false),
     }
 }
 
@@ -259,12 +272,16 @@ fn fold_plan(plan: &LogicalPlan) -> Result<Option<LogicalPlan>, OptimizeError> {
             partition_by,
             order_by,
             func,
+            frame,
             output_name,
             schema,
         } => {
             // Window: fold the partition-by exprs, the order-by exprs,
             // and the function-internal exprs. The output column shape
-            // is fixed by the binder so the schema never changes.
+            // is fixed by the binder so the schema never changes. The
+            // frame's offset expressions are constant literals already
+            // (the binder rejects column references in them) so they are
+            // threaded through unchanged.
             let new_input = fold_plan(input)?;
             let (new_partition, partition_changed) = fold_expr_list(partition_by);
             let (new_order_by, order_changed) = fold_sort_keys(order_by);
@@ -277,6 +294,7 @@ fn fold_plan(plan: &LogicalPlan) -> Result<Option<LogicalPlan>, OptimizeError> {
                 partition_by: new_partition,
                 order_by: new_order_by,
                 func: new_func,
+                frame: frame.clone(),
                 output_name: output_name.clone(),
                 schema: schema.clone(),
             }))
@@ -1269,6 +1287,7 @@ mod tests {
                 nulls_first: false,
             }],
             func: LogicalWindowFunc::FirstValue(add_i32(lit_i32(5), lit_i32(6))),
+            frame: ultrasql_planner::LogicalWindowFrame::whole_partition(),
             output_name: "first_value".into(),
             schema: output_schema,
         };

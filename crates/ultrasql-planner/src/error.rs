@@ -51,6 +51,13 @@ pub enum PlanError {
     /// the binder, with context computed from the rejected query.
     #[error("not supported: {0}")]
     NotSupportedOwned(String),
+
+    /// A window `OVER (...)` frame clause is illegal (bad bound ordering,
+    /// `RANGE` offset without exactly one `ORDER BY` column, `GROUPS`
+    /// without `ORDER BY`, etc.). The message carries PostgreSQL-matching
+    /// text; the server maps this to SQLSTATE `42P20` (`windowing_error`).
+    #[error("{0}")]
+    InvalidWindowFrame(String),
 }
 
 impl PlanError {

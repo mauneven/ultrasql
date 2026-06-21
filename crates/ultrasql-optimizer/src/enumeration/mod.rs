@@ -348,6 +348,7 @@ pub fn reorder_inner_joins_with_stats(plan: &LogicalPlan, stats: &dyn StatsSourc
             partition_by,
             order_by,
             func,
+            frame,
             output_name,
             schema,
         } => LogicalPlan::Window {
@@ -355,6 +356,7 @@ pub fn reorder_inner_joins_with_stats(plan: &LogicalPlan, stats: &dyn StatsSourc
             partition_by: partition_by.clone(),
             order_by: order_by.clone(),
             func: func.clone(),
+            frame: frame.clone(),
             output_name: output_name.clone(),
             schema: schema.clone(),
         },

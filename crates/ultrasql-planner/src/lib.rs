@@ -42,9 +42,10 @@ pub use catalog::{Catalog, InMemoryCatalog, TableMeta};
 pub use error::PlanError;
 pub use expr::{BinaryOp, ScalarExpr, UnaryOp};
 pub use plan::{
-    AggregateFunc, ConflictTarget, CopyDirection, CopyFormat, CopySource, ExplainFormat,
-    LogicalAggregateExpr, LogicalAggregatingIndex, LogicalAggregatingIndexExpr,
-    LogicalAlterTableAction, LogicalAlterViewAction, LogicalCheckConstraint, LogicalCommentTarget,
+    AggregateFunc, BoundFrameBound, BoundFrameExclusion, BoundFrameUnits, ConflictTarget,
+    CopyDirection, CopyFormat, CopySource, ExplainFormat, LogicalAggregateExpr,
+    LogicalAggregatingIndex, LogicalAggregatingIndexExpr, LogicalAlterTableAction,
+    LogicalAlterViewAction, LogicalCheckConstraint, LogicalCommentTarget,
     LogicalDefaultPrivilegeOperation, LogicalDescribeObjectKind, LogicalDescribeTarget,
     LogicalForeignKeyConstraint, LogicalIndexMethod, LogicalIndexOption, LogicalJoinCondition,
     LogicalJoinType, LogicalMergeAction, LogicalMergeClause, LogicalMergeMatchKind,
@@ -53,7 +54,8 @@ pub use plan::{
     LogicalRlsPermissiveness, LogicalRlsPolicy, LogicalRoleKind, LogicalRoleOptions,
     LogicalSequenceChange, LogicalSequenceOptions, LogicalSetOp, LogicalSetQuantifier,
     LogicalSetVariableAction, LogicalTableOption, LogicalTenantPolicyExpr, LogicalUniqueConstraint,
-    LogicalUnpivotColumn, LogicalWindowFunc, SortKey, TxnIsolationLevel,
+    LogicalUnpivotColumn, LogicalWindowFrame, LogicalWindowFunc, SortKey, TxnIsolationLevel,
+    WindowAggKind,
 };
 
 #[cfg(test)]

@@ -561,6 +561,7 @@ where
             partition_by,
             order_by,
             func,
+            frame,
             output_name,
             schema,
         } => LogicalPlan::Window {
@@ -605,8 +606,15 @@ where
                         n: *n,
                     }
                 }
+                ultrasql_planner::LogicalWindowFunc::Aggregate { kind, expr } => {
+                    ultrasql_planner::LogicalWindowFunc::Aggregate {
+                        kind: *kind,
+                        expr: f(expr),
+                    }
+                }
                 other => other.clone(),
             },
+            frame: frame.clone(),
             output_name: output_name.clone(),
             schema: schema.clone(),
         },

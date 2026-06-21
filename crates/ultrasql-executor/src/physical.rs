@@ -374,6 +374,7 @@ pub fn build_operator(
             partition_by,
             order_by,
             func,
+            frame,
             schema,
             ..
         } => {
@@ -381,42 +382,8 @@ pub fn build_operator(
             let order_exprs: Vec<ScalarExpr> = order_by.iter().map(|k| k.expr.clone()).collect();
             let order_dirs: Vec<(bool, bool)> =
                 order_by.iter().map(|k| (k.asc, k.nulls_first)).collect();
-            let kernel_func = match func {
-                ultrasql_planner::LogicalWindowFunc::RowNumber => crate::WindowFunc::RowNumber,
-                ultrasql_planner::LogicalWindowFunc::Rank => crate::WindowFunc::Rank,
-                ultrasql_planner::LogicalWindowFunc::DenseRank => crate::WindowFunc::DenseRank,
-                ultrasql_planner::LogicalWindowFunc::Lag {
-                    expr,
-                    offset,
-                    default,
-                } => crate::WindowFunc::Lag {
-                    expr: expr.clone(),
-                    offset: *offset,
-                    default: default.clone(),
-                },
-                ultrasql_planner::LogicalWindowFunc::Lead {
-                    expr,
-                    offset,
-                    default,
-                } => crate::WindowFunc::Lead {
-                    expr: expr.clone(),
-                    offset: *offset,
-                    default: default.clone(),
-                },
-                ultrasql_planner::LogicalWindowFunc::FirstValue(e) => {
-                    crate::WindowFunc::FirstValue(e.clone())
-                }
-                ultrasql_planner::LogicalWindowFunc::LastValue(e) => {
-                    crate::WindowFunc::LastValue(e.clone())
-                }
-                ultrasql_planner::LogicalWindowFunc::NthValue { expr, n } => {
-                    crate::WindowFunc::NthValue {
-                        expr: expr.clone(),
-                        n: *n,
-                    }
-                }
-                ultrasql_planner::LogicalWindowFunc::Ntile(n) => crate::WindowFunc::Ntile(*n),
-            };
+            let kernel_func = lower_window_func_physical(func);
+            let kernel_frame = lower_window_frame_physical(frame);
             Ok(Box::new(
                 crate::WindowAgg::new(
                     child,
@@ -425,9 +392,105 @@ pub fn build_operator(
                     kernel_func,
                     schema.clone(),
                 )
-                .with_order_directions(order_dirs),
+                .with_order_directions(order_dirs)
+                .with_frame(kernel_frame),
             ))
         }
+    }
+}
+
+/// Lower a planner [`LogicalWindowFunc`] to the executor [`WindowFunc`].
+///
+/// [`LogicalWindowFunc`]: ultrasql_planner::LogicalWindowFunc
+/// [`WindowFunc`]: crate::WindowFunc
+fn lower_window_func_physical(
+    func: &ultrasql_planner::LogicalWindowFunc,
+) -> crate::WindowFunc {
+    use ultrasql_planner::LogicalWindowFunc;
+    match func {
+        LogicalWindowFunc::RowNumber => crate::WindowFunc::RowNumber,
+        LogicalWindowFunc::Rank => crate::WindowFunc::Rank,
+        LogicalWindowFunc::DenseRank => crate::WindowFunc::DenseRank,
+        LogicalWindowFunc::Lag {
+            expr,
+            offset,
+            default,
+        } => crate::WindowFunc::Lag {
+            expr: expr.clone(),
+            offset: *offset,
+            default: default.clone(),
+        },
+        LogicalWindowFunc::Lead {
+            expr,
+            offset,
+            default,
+        } => crate::WindowFunc::Lead {
+            expr: expr.clone(),
+            offset: *offset,
+            default: default.clone(),
+        },
+        LogicalWindowFunc::FirstValue(e) => crate::WindowFunc::FirstValue(e.clone()),
+        LogicalWindowFunc::LastValue(e) => crate::WindowFunc::LastValue(e.clone()),
+        LogicalWindowFunc::NthValue { expr, n } => crate::WindowFunc::NthValue {
+            expr: expr.clone(),
+            n: *n,
+        },
+        LogicalWindowFunc::Ntile(n) => crate::WindowFunc::Ntile(*n),
+        LogicalWindowFunc::Aggregate { kind, expr } => crate::WindowFunc::Aggregate {
+            kind: lower_window_agg_kind(*kind),
+            expr: expr.clone(),
+        },
+        LogicalWindowFunc::CountStar => crate::WindowFunc::CountStar,
+    }
+}
+
+/// Map a planner [`WindowAggKind`] to the executor kind.
+///
+/// [`WindowAggKind`]: ultrasql_planner::WindowAggKind
+fn lower_window_agg_kind(
+    kind: ultrasql_planner::WindowAggKind,
+) -> crate::WindowAggKind {
+    use ultrasql_planner::WindowAggKind;
+    match kind {
+        WindowAggKind::Sum => crate::WindowAggKind::Sum,
+        WindowAggKind::Avg => crate::WindowAggKind::Avg,
+        WindowAggKind::Count => crate::WindowAggKind::Count,
+        WindowAggKind::Min => crate::WindowAggKind::Min,
+        WindowAggKind::Max => crate::WindowAggKind::Max,
+    }
+}
+
+/// Lower a planner [`LogicalWindowFrame`] to the executor [`FrameSpec`].
+///
+/// [`LogicalWindowFrame`]: ultrasql_planner::LogicalWindowFrame
+/// [`FrameSpec`]: crate::FrameSpec
+fn lower_window_frame_physical(
+    frame: &ultrasql_planner::LogicalWindowFrame,
+) -> crate::FrameSpec {
+    use ultrasql_planner::{BoundFrameBound, BoundFrameExclusion, BoundFrameUnits};
+    let units = match frame.units {
+        BoundFrameUnits::Rows => crate::FrameUnits::Rows,
+        BoundFrameUnits::Range => crate::FrameUnits::Range,
+        BoundFrameUnits::Groups => crate::FrameUnits::Groups,
+    };
+    let bound = |b: &BoundFrameBound| match b {
+        BoundFrameBound::UnboundedPreceding => crate::FrameBound::UnboundedPreceding,
+        BoundFrameBound::Preceding(e) => crate::FrameBound::Preceding(e.clone()),
+        BoundFrameBound::CurrentRow => crate::FrameBound::CurrentRow,
+        BoundFrameBound::Following(e) => crate::FrameBound::Following(e.clone()),
+        BoundFrameBound::UnboundedFollowing => crate::FrameBound::UnboundedFollowing,
+    };
+    let exclude = match frame.exclude {
+        BoundFrameExclusion::NoOthers => crate::FrameExclusion::NoOthers,
+        BoundFrameExclusion::CurrentRow => crate::FrameExclusion::CurrentRow,
+        BoundFrameExclusion::Group => crate::FrameExclusion::Group,
+        BoundFrameExclusion::Ties => crate::FrameExclusion::Ties,
+    };
+    crate::FrameSpec {
+        units,
+        start: bound(&frame.start),
+        end: bound(&frame.end),
+        exclude,
     }
 }
 
@@ -830,7 +893,8 @@ mod tests {
     use ultrasql_planner::{
         AggregateFunc, BinaryOp, CopyDirection, CopyFormat, CopySource, ExplainFormat,
         LogicalAggregateExpr, LogicalJoinCondition, LogicalJoinType, LogicalPlan, LogicalSetOp,
-        LogicalSetQuantifier, LogicalWindowFunc, ScalarExpr, SortKey,
+        LogicalSetQuantifier, LogicalWindowFrame, LogicalWindowFunc, ScalarExpr, SortKey,
+        WindowAggKind,
     };
     use ultrasql_vec::Batch;
     use ultrasql_vec::column::{Column, NumericColumn};
@@ -1353,6 +1417,7 @@ mod tests {
                 nulls_first: false,
             }],
             func: LogicalWindowFunc::RowNumber,
+            frame: LogicalWindowFrame::whole_partition(),
             output_name: "rn".into(),
             schema: window_schema(DataType::Int64),
         };
@@ -1397,6 +1462,42 @@ mod tests {
                 DataType::Int32,
             ),
             (LogicalWindowFunc::Ntile(4), DataType::Int64),
+            (
+                LogicalWindowFunc::Aggregate {
+                    kind: WindowAggKind::Sum,
+                    expr: col_id(),
+                },
+                DataType::Int64,
+            ),
+            (
+                LogicalWindowFunc::Aggregate {
+                    kind: WindowAggKind::Avg,
+                    expr: col_id(),
+                },
+                DataType::Float64,
+            ),
+            (
+                LogicalWindowFunc::Aggregate {
+                    kind: WindowAggKind::Count,
+                    expr: col_id(),
+                },
+                DataType::Int64,
+            ),
+            (
+                LogicalWindowFunc::Aggregate {
+                    kind: WindowAggKind::Min,
+                    expr: col_id(),
+                },
+                DataType::Int32,
+            ),
+            (
+                LogicalWindowFunc::Aggregate {
+                    kind: WindowAggKind::Max,
+                    expr: col_id(),
+                },
+                DataType::Int32,
+            ),
+            (LogicalWindowFunc::CountStar, DataType::Int64),
         ];
         let src = StaticSource::with_users();
 
@@ -1410,6 +1511,7 @@ mod tests {
                     nulls_first: false,
                 }],
                 func,
+                frame: LogicalWindowFrame::default_running(),
                 output_name: "win".into(),
                 schema: window_schema(data_type),
             };

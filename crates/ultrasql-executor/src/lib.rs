@@ -85,7 +85,7 @@ pub mod fused_delete;
 pub mod fused_insert;
 pub mod fused_update;
 pub mod gather;
-mod hash_aggregate;
+pub(crate) mod hash_aggregate;
 mod hash_join;
 pub mod hybrid_search;
 pub mod index_scan;
@@ -168,7 +168,9 @@ pub use sort_aggregate::SortAggregate;
 pub use top_k::TopK;
 pub use unique::Unique;
 pub use values_scan::ValuesScan;
-pub use window_agg::{WindowAgg, WindowFunc};
+pub use window_agg::{
+    FrameBound, FrameExclusion, FrameSpec, FrameUnits, WindowAgg, WindowAggKind, WindowFunc,
+};
 pub use work_mem::WorkMemBudget;
 
 pub use push_pipeline::{CollectSink, VectorizedPipeline, VectorizedPipelineBuilder};
@@ -306,6 +308,12 @@ pub enum ExecError {
     /// `428C9` (`generated_always`).
     #[error("cannot insert explicit value for identity column \"{0}\"")]
     GeneratedAlwaysViolation(String),
+
+    /// A window-frame offset was invalid at execution: negative or NULL
+    /// `<offset> PRECEDING/FOLLOWING`. The server maps this to PostgreSQL
+    /// SQLSTATE `22013` (`invalid_preceding_or_following_size`).
+    #[error("{0}")]
+    WindowFrameError(String),
 }
 
 /// Convert scalar-expression interpreter errors into stable executor errors.

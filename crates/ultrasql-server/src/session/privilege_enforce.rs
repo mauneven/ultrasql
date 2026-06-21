@@ -595,13 +595,15 @@ where
             | LogicalWindowFunc::Lead { expr, .. }
             | LogicalWindowFunc::FirstValue(expr)
             | LogicalWindowFunc::LastValue(expr)
-            | LogicalWindowFunc::NthValue { expr, .. } => {
+            | LogicalWindowFunc::NthValue { expr, .. }
+            | LogicalWindowFunc::Aggregate { expr, .. } => {
                 self.collect_expr(expr, sources, PrivilegeKind::Select);
             }
             LogicalWindowFunc::RowNumber
             | LogicalWindowFunc::Rank
             | LogicalWindowFunc::DenseRank
-            | LogicalWindowFunc::Ntile(_) => {}
+            | LogicalWindowFunc::Ntile(_)
+            | LogicalWindowFunc::CountStar => {}
         }
     }
 
@@ -881,6 +883,7 @@ mod tests {
                 offset: 1,
                 default: Value::Null,
             },
+            frame: ultrasql_planner::LogicalWindowFrame::whole_partition(),
             output_name: "lag".to_owned(),
             schema: users_schema(),
         };

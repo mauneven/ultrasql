@@ -562,6 +562,7 @@ fn lower_query_inner(
             partition_by,
             order_by,
             func,
+            frame,
             schema,
             ..
         } => {
@@ -570,6 +571,7 @@ fn lower_query_inner(
             let order_dirs: Vec<(bool, bool)> =
                 order_by.iter().map(|k| (k.asc, k.nulls_first)).collect();
             let kernel_func = lower_window_func(func);
+            let kernel_frame = lower_window_frame(frame);
             Ok(Box::new(
                 ultrasql_executor::WindowAgg::new(
                     child,
@@ -578,7 +580,8 @@ fn lower_query_inner(
                     kernel_func,
                     schema.clone(),
                 )
-                .with_order_directions(order_dirs),
+                .with_order_directions(order_dirs)
+                .with_frame(kernel_frame),
             ))
         }
         LogicalPlan::Summarize {
@@ -1179,6 +1182,56 @@ fn lower_window_func(func: &ultrasql_planner::LogicalWindowFunc) -> ultrasql_exe
             }
         }
         ultrasql_planner::LogicalWindowFunc::Ntile(n) => ultrasql_executor::WindowFunc::Ntile(*n),
+        ultrasql_planner::LogicalWindowFunc::Aggregate { kind, expr } => {
+            ultrasql_executor::WindowFunc::Aggregate {
+                kind: lower_window_agg_kind(*kind),
+                expr: expr.clone(),
+            }
+        }
+        ultrasql_planner::LogicalWindowFunc::CountStar => ultrasql_executor::WindowFunc::CountStar,
+    }
+}
+
+fn lower_window_agg_kind(
+    kind: ultrasql_planner::WindowAggKind,
+) -> ultrasql_executor::WindowAggKind {
+    use ultrasql_planner::WindowAggKind;
+    match kind {
+        WindowAggKind::Sum => ultrasql_executor::WindowAggKind::Sum,
+        WindowAggKind::Avg => ultrasql_executor::WindowAggKind::Avg,
+        WindowAggKind::Count => ultrasql_executor::WindowAggKind::Count,
+        WindowAggKind::Min => ultrasql_executor::WindowAggKind::Min,
+        WindowAggKind::Max => ultrasql_executor::WindowAggKind::Max,
+    }
+}
+
+fn lower_window_frame(
+    frame: &ultrasql_planner::LogicalWindowFrame,
+) -> ultrasql_executor::FrameSpec {
+    use ultrasql_planner::{BoundFrameBound, BoundFrameExclusion, BoundFrameUnits};
+    let units = match frame.units {
+        BoundFrameUnits::Rows => ultrasql_executor::FrameUnits::Rows,
+        BoundFrameUnits::Range => ultrasql_executor::FrameUnits::Range,
+        BoundFrameUnits::Groups => ultrasql_executor::FrameUnits::Groups,
+    };
+    let bound = |b: &BoundFrameBound| match b {
+        BoundFrameBound::UnboundedPreceding => ultrasql_executor::FrameBound::UnboundedPreceding,
+        BoundFrameBound::Preceding(e) => ultrasql_executor::FrameBound::Preceding(e.clone()),
+        BoundFrameBound::CurrentRow => ultrasql_executor::FrameBound::CurrentRow,
+        BoundFrameBound::Following(e) => ultrasql_executor::FrameBound::Following(e.clone()),
+        BoundFrameBound::UnboundedFollowing => ultrasql_executor::FrameBound::UnboundedFollowing,
+    };
+    let exclude = match frame.exclude {
+        BoundFrameExclusion::NoOthers => ultrasql_executor::FrameExclusion::NoOthers,
+        BoundFrameExclusion::CurrentRow => ultrasql_executor::FrameExclusion::CurrentRow,
+        BoundFrameExclusion::Group => ultrasql_executor::FrameExclusion::Group,
+        BoundFrameExclusion::Ties => ultrasql_executor::FrameExclusion::Ties,
+    };
+    ultrasql_executor::FrameSpec {
+        units,
+        start: bound(&frame.start),
+        end: bound(&frame.end),
+        exclude,
     }
 }
 

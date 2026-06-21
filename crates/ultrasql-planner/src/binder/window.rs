@@ -15,13 +15,19 @@
 
 use ultrasql_core::{DataType, Field, Schema, Value};
 use ultrasql_parser::ast::{
-    Expr, Identifier, NullsOrder, ObjectName, SortDirection, UnaryOp, WindowSpec,
+    Expr, FrameBound, FrameExclusion, FrameUnits, Identifier, NullsOrder, ObjectName,
+    SortDirection, UnaryOp, WindowFrame, WindowSpec,
 };
 
 use crate::Catalog;
 use crate::error::PlanError;
 use crate::expr::ScalarExpr;
-use crate::plan::{LogicalPlan, LogicalWindowFunc, SortKey};
+use crate::plan::{
+    BoundFrameBound, BoundFrameExclusion, BoundFrameUnits, LogicalPlan, LogicalWindowFrame,
+    LogicalWindowFunc, SortKey, WindowAggKind,
+};
+
+use super::aggregate::aggregate_return_type;
 
 use super::ScopeStack;
 use super::expr_bind::bind_expr_with_ctes;
@@ -185,6 +191,24 @@ pub(super) fn apply_window_extractions(
             })
             .collect::<Result<_, _>>()?;
 
+        // Resolve the frame: bind an explicit frame, or apply the SQL
+        // default (RANGE running with ORDER BY; whole partition without).
+        // Frame-insensitive functions (ranking / LAG / LEAD) always carry
+        // the whole-partition frame so the executor never branches on a
+        // user-supplied frame for them — matching PostgreSQL.
+        let frame = if frame_insensitive(&func) {
+            LogicalWindowFrame::whole_partition()
+        } else {
+            resolve_window_frame(
+                ex.spec.frame.as_ref(),
+                &order_by,
+                plan.schema(),
+                catalog,
+                cte_catalog,
+                scope,
+            )?
+        };
+
         let result_type = window_func_result_type(&func);
         let mut new_fields: Vec<Field> = plan.schema().fields().to_vec();
         new_fields.push(Field::nullable(&ex.output_name, result_type));
@@ -196,11 +220,189 @@ pub(super) fn apply_window_extractions(
             partition_by,
             order_by,
             func,
+            frame,
             output_name: ex.output_name,
             schema: new_schema,
         };
     }
     Ok(plan)
+}
+
+/// `true` for window functions whose result is defined independently of
+/// the frame: the ranking functions and the offset functions
+/// (`LAG`/`LEAD`). PostgreSQL ignores any frame clause on these.
+fn frame_insensitive(func: &LogicalWindowFunc) -> bool {
+    matches!(
+        func,
+        LogicalWindowFunc::RowNumber
+            | LogicalWindowFunc::Rank
+            | LogicalWindowFunc::DenseRank
+            | LogicalWindowFunc::Ntile(_)
+            | LogicalWindowFunc::Lag { .. }
+            | LogicalWindowFunc::Lead { .. }
+    )
+}
+
+/// Bind an explicit [`WindowFrame`] (or apply the SQL default frame) to a
+/// [`LogicalWindowFrame`], validating it per the SQL/PostgreSQL window
+/// semantics. Offset expressions are bound against `schema`.
+fn resolve_window_frame(
+    frame: Option<&WindowFrame>,
+    order_by: &[SortKey],
+    schema: &Schema,
+    catalog: &dyn Catalog,
+    cte_catalog: &[(String, Schema)],
+    scope: &mut ScopeStack,
+) -> Result<LogicalWindowFrame, PlanError> {
+    let Some(frame) = frame else {
+        // No explicit frame: SQL default depends on ORDER BY presence.
+        return Ok(if order_by.is_empty() {
+            LogicalWindowFrame::whole_partition()
+        } else {
+            LogicalWindowFrame::default_running()
+        });
+    };
+
+    let units = match frame.units {
+        FrameUnits::Rows => BoundFrameUnits::Rows,
+        FrameUnits::Range => BoundFrameUnits::Range,
+        FrameUnits::Groups => BoundFrameUnits::Groups,
+    };
+
+    let start = bind_frame_bound(&frame.start, schema, catalog, cte_catalog, scope)?;
+    let end = bind_frame_bound(&frame.end, schema, catalog, cte_catalog, scope)?;
+    let exclude = match frame.exclude {
+        FrameExclusion::NoOthers => BoundFrameExclusion::NoOthers,
+        FrameExclusion::CurrentRow => BoundFrameExclusion::CurrentRow,
+        FrameExclusion::Group => BoundFrameExclusion::Group,
+        FrameExclusion::Ties => BoundFrameExclusion::Ties,
+    };
+
+    validate_frame(units, &start, &end, order_by, schema)?;
+
+    Ok(LogicalWindowFrame {
+        units,
+        start,
+        end,
+        exclude,
+    })
+}
+
+/// Bind a parser [`FrameBound`] into a [`BoundFrameBound`], lowering any
+/// offset expression to a [`ScalarExpr`]. The offset is not range-checked
+/// here (negative/NULL checks are execution-time per the SQL spec); but
+/// references to output columns / window functions / aggregates would be
+/// rejected by `bind_expr_with_ctes`.
+fn bind_frame_bound(
+    bound: &FrameBound,
+    schema: &Schema,
+    catalog: &dyn Catalog,
+    cte_catalog: &[(String, Schema)],
+    scope: &mut ScopeStack,
+) -> Result<BoundFrameBound, PlanError> {
+    Ok(match bound {
+        FrameBound::UnboundedPreceding => BoundFrameBound::UnboundedPreceding,
+        FrameBound::CurrentRow => BoundFrameBound::CurrentRow,
+        FrameBound::UnboundedFollowing => BoundFrameBound::UnboundedFollowing,
+        FrameBound::Preceding(expr) => BoundFrameBound::Preceding(bind_expr_with_ctes(
+            expr,
+            schema,
+            catalog,
+            cte_catalog,
+            scope,
+        )?),
+        FrameBound::Following(expr) => BoundFrameBound::Following(bind_expr_with_ctes(
+            expr,
+            schema,
+            catalog,
+            cte_catalog,
+            scope,
+        )?),
+    })
+}
+
+/// Validate a bound frame against the SQL window-frame rules (the §4
+/// error table). Negative/NULL offset checks are deferred to execution.
+fn validate_frame(
+    units: BoundFrameUnits,
+    start: &BoundFrameBound,
+    end: &BoundFrameBound,
+    order_by: &[SortKey],
+    schema: &Schema,
+) -> Result<(), PlanError> {
+    // UNBOUNDED FOLLOWING may not start a frame; UNBOUNDED PRECEDING may
+    // not end one.
+    if matches!(start, BoundFrameBound::UnboundedFollowing) {
+        return Err(PlanError::InvalidWindowFrame(
+            "frame start cannot be UNBOUNDED FOLLOWING".to_string(),
+        ));
+    }
+    if matches!(end, BoundFrameBound::UnboundedPreceding) {
+        return Err(PlanError::InvalidWindowFrame(
+            "frame end cannot be UNBOUNDED PRECEDING".to_string(),
+        ));
+    }
+
+    // Start-after-end ordering rules, detectable from bound kinds.
+    if matches!(start, BoundFrameBound::Following(_))
+        && matches!(
+            end,
+            BoundFrameBound::Preceding(_) | BoundFrameBound::CurrentRow
+        )
+    {
+        return Err(PlanError::InvalidWindowFrame(
+            "frame starting from following row cannot have preceding rows".to_string(),
+        ));
+    }
+    if matches!(start, BoundFrameBound::CurrentRow) && matches!(end, BoundFrameBound::Preceding(_)) {
+        return Err(PlanError::InvalidWindowFrame(
+            "frame starting from current row cannot have preceding rows".to_string(),
+        ));
+    }
+
+    // RANGE with a value offset requires exactly one ORDER BY column of a
+    // numeric type (date/time/interval offsets are deferred).
+    let has_offset = matches!(
+        start,
+        BoundFrameBound::Preceding(_) | BoundFrameBound::Following(_)
+    ) || matches!(
+        end,
+        BoundFrameBound::Preceding(_) | BoundFrameBound::Following(_)
+    );
+    if matches!(units, BoundFrameUnits::Range) && has_offset {
+        if order_by.len() != 1 {
+            return Err(PlanError::InvalidWindowFrame(
+                "RANGE with offset PRECEDING/FOLLOWING requires exactly one ORDER BY column"
+                    .to_string(),
+            ));
+        }
+        let order_type = order_by[0].expr.data_type();
+        let numeric = matches!(
+            order_type,
+            DataType::Int16
+                | DataType::Int32
+                | DataType::Int64
+                | DataType::Float32
+                | DataType::Float64
+                | DataType::Decimal { .. }
+        );
+        if !numeric {
+            // Date/time/interval RANGE offsets are an explicit deferral.
+            let _ = schema;
+            return Err(PlanError::not_supported(format!(
+                "RANGE with offset PRECEDING/FOLLOWING is not supported for column type {order_type:?}"
+            )));
+        }
+    }
+
+    // GROUPS mode requires an ORDER BY clause.
+    if matches!(units, BoundFrameUnits::Groups) && order_by.is_empty() {
+        return Err(PlanError::InvalidWindowFrame(
+            "GROUPS mode requires an ORDER BY clause".to_string(),
+        ));
+    }
+
+    Ok(())
 }
 
 /// Map a function name + argument list to a [`LogicalWindowFunc`].
@@ -360,10 +562,37 @@ fn resolve_window_func(
             }
             Ok(LogicalWindowFunc::Ntile(n))
         }
+        "count" if args.is_empty() || is_star_arg(args) => Ok(LogicalWindowFunc::CountStar),
+        "sum" | "avg" | "count" | "min" | "max" => {
+            if args.len() != 1 {
+                return Err(PlanError::TypeMismatch(format!(
+                    "{func_name}: expected 1 argument, got {}",
+                    args.len()
+                )));
+            }
+            let expr = bind_expr_with_ctes(&args[0], input_schema, catalog, cte_catalog, scope)?;
+            let kind = match func_name {
+                "sum" => WindowAggKind::Sum,
+                "avg" => WindowAggKind::Avg,
+                "count" => WindowAggKind::Count,
+                "min" => WindowAggKind::Min,
+                "max" => WindowAggKind::Max,
+                // Unreachable: the outer match arm gates these five names.
+                _ => unreachable!("aggregate window func name already matched"),
+            };
+            Ok(LogicalWindowFunc::Aggregate { kind, expr })
+        }
         other => Err(PlanError::not_supported(format!(
             "window function '{other}'"
         ))),
     }
+}
+
+/// `true` when `args` is the single `*` wildcard argument of `count(*)`.
+fn is_star_arg(args: &[Expr]) -> bool {
+    args.len() == 1
+        && matches!(&args[0], Expr::Column { name }
+            if name.parts.len() == 1 && name.parts[0].value == "*")
 }
 
 /// Fold a bound expression into a `Value` if it represents a constant
@@ -441,15 +670,27 @@ fn bind_usize_literal(
 
 /// Return the [`DataType`] of the column appended by a window function.
 fn window_func_result_type(func: &LogicalWindowFunc) -> DataType {
+    use crate::plan::AggregateFunc;
     match func {
         LogicalWindowFunc::RowNumber
         | LogicalWindowFunc::Rank
         | LogicalWindowFunc::DenseRank
-        | LogicalWindowFunc::Ntile(_) => DataType::Int64,
+        | LogicalWindowFunc::Ntile(_)
+        | LogicalWindowFunc::CountStar => DataType::Int64,
         LogicalWindowFunc::Lag { expr, .. }
         | LogicalWindowFunc::Lead { expr, .. }
         | LogicalWindowFunc::FirstValue(expr)
         | LogicalWindowFunc::LastValue(expr)
         | LogicalWindowFunc::NthValue { expr, .. } => expr.data_type(),
+        LogicalWindowFunc::Aggregate { kind, expr } => {
+            let agg = match kind {
+                WindowAggKind::Sum => AggregateFunc::Sum,
+                WindowAggKind::Avg => AggregateFunc::Avg,
+                WindowAggKind::Count => AggregateFunc::Count,
+                WindowAggKind::Min => AggregateFunc::Min,
+                WindowAggKind::Max => AggregateFunc::Max,
+            };
+            aggregate_return_type(agg, expr.data_type())
+        }
     }
 }

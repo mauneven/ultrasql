@@ -46,6 +46,7 @@ impl LogicalPlan {
                 partition_by,
                 order_by,
                 func,
+                frame,
                 output_name,
                 ..
             } => scans::fmt_window(
@@ -53,6 +54,7 @@ impl LogicalPlan {
                 partition_by,
                 order_by,
                 func,
+                frame,
                 output_name,
                 indent,
                 out,
