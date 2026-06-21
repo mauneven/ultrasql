@@ -629,42 +629,64 @@ pub(crate) fn stream_select_with_options(
     let mut rows: u64 = 0;
     loop {
         let Some(batch) = op.next_batch()? else { break };
-        let row_count = batch.rows();
-        let columns = batch.columns();
-        // Fast path: when the batch is exactly two non-nullable
-        // `Int32` columns (the `select_scan_10k` shape), use the
-        // specialised bulk writer that pre-reserves the buffer once
-        // and emits every row without per-cell enum dispatch.
-        if schema_is_int32_pair(&schema)
-            && let [Column::Int32(a), Column::Int32(b)] = columns
-            && a.nulls().is_none()
-            && b.nulls().is_none()
-        {
-            write_int32_pair_data_rows(sink, a.data(), b.data());
-            checked_add_rows(&mut rows, row_count, "SELECT")?;
-            continue;
-        }
-        // Fast path: `(Int32, Int64)` is the
-        // `WindowAgg::try_columnar_row_number` output shape used by
-        // `SELECT id, row_number() OVER (ORDER BY x) FROM t`. The
-        // writer accepts optional validity bitmaps so it stays
-        // correct when either side carries NULLs.
-        if schema_is_int32_int64_pair(&schema)
-            && let [Column::Int32(a), Column::Int64(b)] = columns
-        {
-            write_int32_int64_pair_data_rows(sink, a.data(), a.nulls(), b.data(), b.nulls());
-            checked_add_rows(&mut rows, row_count, "SELECT")?;
-            continue;
-        }
-        for row in 0..row_count {
-            write_data_row_typed_with_options(sink, columns, &schema, row, options)?;
-        }
-        checked_add_rows(&mut rows, row_count, "SELECT")?;
+        encode_batch_into(sink, &batch, &schema, options, &mut rows)?;
     }
 
     let tag = format!("SELECT {rows}");
     encode_backend(&BackendMessage::CommandComplete { tag }, sink);
     Ok(rows)
+}
+
+/// Encode a single output [`Batch`] into `out` as a run of `DataRow`
+/// wire frames and fold its row count into `rows`.
+///
+/// Lifted verbatim from the per-batch body of
+/// [`stream_select_with_options`] so the whole-buffer SELECT path and
+/// the windowed streaming path (`encode_window`) share one encoder —
+/// the bytes are therefore identical regardless of how the caller
+/// chunks batches into windows. The fast-path bulk writers
+/// (`write_int32_pair_data_rows`, `write_int32_int64_pair_data_rows`)
+/// and the general per-row path emit whole frames only, so a caller
+/// may flush after any batch and always lands on a frame boundary.
+pub(crate) fn encode_batch_into(
+    out: &mut BytesMut,
+    batch: &ultrasql_vec::Batch,
+    schema: &Schema,
+    options: &TextEncodingOptions,
+    rows: &mut u64,
+) -> Result<(), ServerError> {
+    let row_count = batch.rows();
+    let columns = batch.columns();
+    // Fast path: when the batch is exactly two non-nullable
+    // `Int32` columns (the `select_scan_10k` shape), use the
+    // specialised bulk writer that pre-reserves the buffer once
+    // and emits every row without per-cell enum dispatch.
+    if schema_is_int32_pair(schema)
+        && let [Column::Int32(a), Column::Int32(b)] = columns
+        && a.nulls().is_none()
+        && b.nulls().is_none()
+    {
+        write_int32_pair_data_rows(out, a.data(), b.data());
+        checked_add_rows(rows, row_count, "SELECT")?;
+        return Ok(());
+    }
+    // Fast path: `(Int32, Int64)` is the
+    // `WindowAgg::try_columnar_row_number` output shape used by
+    // `SELECT id, row_number() OVER (ORDER BY x) FROM t`. The
+    // writer accepts optional validity bitmaps so it stays
+    // correct when either side carries NULLs.
+    if schema_is_int32_int64_pair(schema)
+        && let [Column::Int32(a), Column::Int64(b)] = columns
+    {
+        write_int32_int64_pair_data_rows(out, a.data(), a.nulls(), b.data(), b.nulls());
+        checked_add_rows(rows, row_count, "SELECT")?;
+        return Ok(());
+    }
+    for row in 0..row_count {
+        write_data_row_typed_with_options(out, columns, schema, row, options)?;
+    }
+    checked_add_rows(rows, row_count, "SELECT")?;
+    Ok(())
 }
 
 // Session-owned wire-buffer reuse. The SELECT streaming path writes
