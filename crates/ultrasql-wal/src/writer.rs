@@ -222,6 +222,44 @@ pub struct WalWriter {
     handle: Option<JoinHandle<Result<(), WalWriterError>>>,
 }
 
+/// Cloneable, non-owning durability handle for the WAL writer.
+///
+/// Carries exactly the two operations a force-and-wait needs — [`Self::notify`]
+/// (wake the writer to fsync the drained prefix now, bypassing the group-commit
+/// window) and [`Self::flushed_lsn`] (the LSN through which the writer has
+/// fsynced) — without the owning [`WalWriter`]'s join handle. It can be cloned
+/// and moved into a closure (e.g. an eviction-relief WAL force) while the
+/// owning `WalWriter` retains responsibility for shutdown.
+///
+/// The handle shares the writer's internal state by `Arc`, so it observes the
+/// live durable LSN and its `notify` reaches the same writer thread.
+#[derive(Clone, Debug)]
+pub struct WalDurabilityHandle {
+    shared: Arc<Shared>,
+}
+
+impl WalDurabilityHandle {
+    /// Wake the writer thread and force pending WAL durable.
+    ///
+    /// Equivalent to [`WalWriter::notify`]; see its docs.
+    pub fn notify(&self) {
+        {
+            let mut state = self.shared.wake_mutex.lock();
+            state.force_fsync = true;
+            state.epoch = state.epoch.wrapping_add(1);
+        }
+        self.shared.wake_cv.notify_one();
+    }
+
+    /// LSN through which the writer thread has fsynced.
+    ///
+    /// Equivalent to [`WalWriter::flushed_lsn`].
+    #[must_use]
+    pub fn flushed_lsn(&self) -> Lsn {
+        Lsn::new(self.shared.durable_lsn.load(Ordering::Acquire))
+    }
+}
+
 impl WalWriter {
     /// Open (or reopen) the segmented WAL at `wal_dir` and spawn the
     /// background writer thread. If the directory contains existing
@@ -315,6 +353,19 @@ impl WalWriter {
     /// LSN through which the writer thread has fsynced.
     pub fn flushed_lsn(&self) -> Lsn {
         Lsn::new(self.shared.durable_lsn.load(Ordering::Acquire))
+    }
+
+    /// Return a cloneable [`WalDurabilityHandle`] sharing this writer's
+    /// durability state.
+    ///
+    /// The handle can be moved into a closure (e.g. the eviction-relief WAL
+    /// force) and used to `notify` + poll `flushed_lsn` independently of the
+    /// owning `WalWriter`, which keeps sole responsibility for shutdown.
+    #[must_use]
+    pub fn durability_handle(&self) -> WalDurabilityHandle {
+        WalDurabilityHandle {
+            shared: Arc::clone(&self.shared),
+        }
     }
 
     /// Return live WAL writer counters.

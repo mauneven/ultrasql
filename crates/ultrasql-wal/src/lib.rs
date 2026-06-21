@@ -49,4 +49,4 @@ pub use recovery::{
     RecoveryError, RecoveryTarget, recover, recover_with_target, repair_final_segment_tail,
 };
 pub use truncate::{TruncationOutcome, truncate_below};
-pub use writer::{WalWriter, WalWriterConfig, WalWriterError, WalWriterStats};
+pub use writer::{WalDurabilityHandle, WalWriter, WalWriterConfig, WalWriterError, WalWriterStats};
