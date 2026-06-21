@@ -303,6 +303,76 @@ FROM wf10 ORDER BY id
 50
 50
 
+# Case 18: RANGE numeric value offset over a NUMERIC ORDER BY column must use
+# EXACT arithmetic, not f64. With NUMERIC(4,1) values 0.1,0.2,0.3,0.4 and
+# RANGE BETWEEN 0.1 PRECEDING AND 0.1 FOLLOWING, row v=0.4's window [0.3,0.5]
+# must include the v=0.3 peer (count 2). Computing the bound in f64 yields
+# 0.4-0.1 = 0.30000000000000004 and drops the boundary row (count 1). We sum
+# id (an INT) so the result type is portable while the membership test is
+# driven by the exact NUMERIC ordering values.
+statement ok
+CREATE TABLE wf18 (id INT NOT NULL, v NUMERIC(4,1) NOT NULL)
+
+statement ok
+INSERT INTO wf18 VALUES (1,0.1),(2,0.2),(3,0.3),(4,0.4)
+
+query III nosort
+SELECT id,
+  sum(id)  OVER (ORDER BY v RANGE BETWEEN 0.1 PRECEDING AND 0.1 FOLLOWING),
+  count(*) OVER (ORDER BY v RANGE BETWEEN 0.1 PRECEDING AND 0.1 FOLLOWING)
+FROM wf18 ORDER BY id
+----
+1
+3
+2
+2
+6
+3
+3
+9
+3
+4
+7
+2
+
+# Case 19: GROUPS PRECEDING end-bound underflow must yield an EMPTY frame.
+# g=1,2,3. GROUPS BETWEEN 2 PRECEDING AND 1 PRECEDING: for the leading group
+# (g=1) the end target group is "1 PRECEDING" = group -1 which does not
+# exist, so the frame is empty and sum -> NULL (it previously leaked group 0,
+# returning 10).
+statement ok
+CREATE TABLE wf19 (id INT NOT NULL, g INT NOT NULL, v INT NOT NULL)
+
+statement ok
+INSERT INTO wf19 VALUES (1,1,10),(2,2,20),(3,3,30)
+
+query II nosort
+SELECT id,
+  sum(v) OVER (ORDER BY g GROUPS BETWEEN 2 PRECEDING AND 1 PRECEDING)
+FROM wf19 ORDER BY id
+----
+1
+NULL
+2
+10
+3
+30
+
+# Case 20: symmetric GROUPS FOLLOWING start-bound overflow -> EMPTY frame.
+# GROUPS BETWEEN 1 FOLLOWING AND 2 FOLLOWING: for the last group (g=3) the
+# start ("1 FOLLOWING") is past the end, so the frame is empty -> NULL.
+query II nosort
+SELECT id,
+  sum(v) OVER (ORDER BY g GROUPS BETWEEN 1 FOLLOWING AND 2 FOLLOWING)
+FROM wf19 ORDER BY id
+----
+1
+50
+2
+30
+3
+NULL
+
 # Note: frame validation errors (case 16: RANGE offset needs exactly one
 # ORDER BY column -> SQLSTATE 42P20; case 17: negative ROWS offset ->
 # SQLSTATE 22013) are engine-divergent and therefore covered by the

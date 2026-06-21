@@ -29,6 +29,7 @@
 //! CURRENT ROW` (the SQL default for functions that use the frame).
 //! `RANGE` frames and explicit frame bounds are a v0.6 follow-up.
 
+use std::cmp::Ordering;
 use std::collections::{HashMap, VecDeque};
 use std::thread;
 
@@ -41,7 +42,7 @@ use crate::aggregate_math::widen_sum_seed;
 use crate::eval::Eval;
 use crate::filter_op::batch_to_rows;
 use crate::seq_scan::build_batch;
-use crate::sort::compare_values_nullable;
+use crate::sort::{compare_f64_sql, compare_non_null_values, compare_values_nullable};
 use crate::{ExecError, Operator, eval_error_to_exec_error};
 
 const BATCH_TARGET_ROWS: usize = 4096;
@@ -584,10 +585,13 @@ impl WindowAgg {
                     for i in 0..order_key_count {
                         let (asc, nulls_first) =
                             order_directions.get(i).copied().unwrap_or((true, false));
-                        let mut ord = compare_values_nullable(&ka[i], &kb[i], nulls_first);
-                        if !asc {
-                            ord = ord.reverse();
-                        }
+                        // NULL placement is ABSOLUTE: it follows `nulls_first`
+                        // directly and is NOT flipped by DESC. Only the
+                        // comparison of two non-NULL values is reversed for
+                        // DESC. (Reversing the whole `compare_values_nullable`
+                        // result would move NULLs to the wrong end, breaking
+                        // explicit NULLS FIRST/LAST under DESC.)
+                        let ord = order_key_ordering(&ka[i], &kb[i], asc, nulls_first);
                         if ord != std::cmp::Ordering::Equal {
                             return ord;
                         }
@@ -647,7 +651,7 @@ impl WindowAgg {
                     let mut prev_pos: Option<usize> = None;
                     for (pos, &idx) in sorted_indices.iter().enumerate() {
                         let same = prev_pos
-                            .map(|p| row_order_key(sorted_indices[p]) == row_order_key(idx))
+                            .map(|p| same_order_key(row_order_key(sorted_indices[p]), row_order_key(idx)))
                             .unwrap_or(false);
                         if !same {
                             base_rank = pos + 1;
@@ -663,7 +667,7 @@ impl WindowAgg {
                     let mut prev_pos: Option<usize> = None;
                     for (pos, &idx) in sorted_indices.iter().enumerate() {
                         let same = prev_pos
-                            .map(|p| row_order_key(sorted_indices[p]) == row_order_key(idx))
+                            .map(|p| same_order_key(row_order_key(sorted_indices[p]), row_order_key(idx)))
                             .unwrap_or(false);
                         if !same {
                             if prev_pos.is_some() {
@@ -839,7 +843,10 @@ fn build_peer_groups<'a>(
     group_of[0] = 0;
     for pos in 1..n {
         let same = order_key_count != 0
-            && row_order_key(sorted_indices[pos - 1]) == row_order_key(sorted_indices[pos]);
+            && same_order_key(
+                row_order_key(sorted_indices[pos - 1]),
+                row_order_key(sorted_indices[pos]),
+            );
         if !same {
             group_bounds.push((group_start, pos));
             cur_group += 1;
@@ -849,6 +856,52 @@ fn build_peer_groups<'a>(
     }
     group_bounds.push((group_start, n));
     (group_of, group_bounds)
+}
+
+/// Order two window ORDER-BY key values honouring ASC/DESC and absolute
+/// NULL placement.
+///
+/// NULL placement is governed solely by `nulls_first` (NULL-vs-non-NULL
+/// and NULL-vs-NULL), independent of `asc`. Only the comparison between two
+/// non-NULL values is reversed for DESC. This matches PostgreSQL, where the
+/// direction reverses the value order but NULLS FIRST/LAST is an absolute
+/// placement of NULLs at one end of the result.
+fn order_key_ordering(a: &Value, b: &Value, asc: bool, nulls_first: bool) -> Ordering {
+    match (a.is_null(), b.is_null()) {
+        (true, true) => Ordering::Equal,
+        (true, false) => {
+            if nulls_first {
+                Ordering::Less
+            } else {
+                Ordering::Greater
+            }
+        }
+        (false, true) => {
+            if nulls_first {
+                Ordering::Greater
+            } else {
+                Ordering::Less
+            }
+        }
+        (false, false) => {
+            let ord = compare_non_null_values(a, b).unwrap_or(Ordering::Equal);
+            if asc { ord } else { ord.reverse() }
+        }
+    }
+}
+
+/// Whether two ORDER-BY key slices are peers (equal under the SAME SQL
+/// comparator the sort uses).
+///
+/// Uses `compare_values_nullable` per key rather than structural `Vec<Value>`
+/// equality so that the peer relation agrees with the sort: `NaN` compares
+/// equal to `NaN` (so adjacent NaN rows form one peer group), and NULL equals
+/// NULL. `nulls_first` is irrelevant here because equality is symmetric.
+fn same_order_key(a: &[Value], b: &[Value]) -> bool {
+    a.len() == b.len()
+        && a.iter()
+            .zip(b.iter())
+            .all(|(x, y)| compare_values_nullable(x, y, false) == std::cmp::Ordering::Equal)
 }
 
 /// Per-partition resolver for the window frame. Holds the resolved
@@ -881,26 +934,19 @@ impl<'a> FrameContext<'a> {
         let n = sorted_indices.len();
         let _ = order_key_count;
 
-        // For RANGE value offsets, precompute the single order-key value
-        // per sorted position (as f64; NULL/non-numeric -> None) and the
-        // ASC flag from the (single) ORDER BY direction.
+        // For RANGE value offsets, precompute the single order-key value per
+        // sorted position and the ASC flag from the (single) ORDER BY
+        // direction. The membership test must use EXACT arithmetic in the
+        // ORDER BY column's own type (Int64 via i128, Decimal via scale-
+        // aligned i128); computing the bound in f64 would drop exact boundary
+        // peers (e.g. NUMERIC 0.4 - 0.1 = 0.30000000000000004). f64 is used
+        // only as a fallback for genuine Float32/Float64 ORDER BY columns.
         let range_offset = matches!(frame.units, FrameUnits::Range)
             && (bound_has_offset(&frame.start) || bound_has_offset(&frame.end));
         let asc = order_directions.first().is_none_or(|d| d.0);
-        let range_vals: Vec<Option<f64>> = if range_offset {
-            (0..n)
-                .map(|pos| {
-                    row_order_key(sorted_indices[pos])
-                        .first()
-                        .and_then(value_to_f64)
-                })
-                .collect()
-        } else {
-            Vec::new()
-        };
 
-        // Resolve the per-partition constant offset magnitudes once, with
-        // execution-time validation (NULL / negative).
+        // Resolve the ROWS/GROUPS offset magnitudes once, with execution-time
+        // validation (NULL / negative).
         let start_rows_off = match &frame.start {
             FrameBound::Preceding(e) | FrameBound::Following(e)
                 if matches!(frame.units, FrameUnits::Rows | FrameUnits::Groups) =>
@@ -917,18 +963,65 @@ impl<'a> FrameContext<'a> {
             }
             _ => None,
         };
-        let start_range_off = match &frame.start {
-            FrameBound::Preceding(e) | FrameBound::Following(e) if range_offset => {
-                Some(eval_range_offset(e, all_rows, sorted_indices)?)
+
+        // For RANGE value offsets, work in EXACT arithmetic in the ORDER BY
+        // column's own type (Int64 via i128, Decimal via scale-aligned i128)
+        // so the bound `cur ± off` and the membership test keep exact boundary
+        // peers (computing the bound in f64 would drop e.g. NUMERIC 0.4 - 0.1).
+        // f64 is used only as a fallback for genuine Float32/Float64 columns.
+        let mut range_vals: Vec<Option<RangeScalar>> = Vec::new();
+        let mut start_range_off: Option<RangeScalar> = None;
+        let mut end_range_off: Option<RangeScalar> = None;
+        if range_offset {
+            // Pre-evaluate the raw offset Values so the axis scale covers both
+            // the ordering values AND the offsets (max decimal scale seen).
+            let raw_start_off = match &frame.start {
+                FrameBound::Preceding(e) | FrameBound::Following(e) => {
+                    Some(eval_raw_range_offset(e, all_rows, sorted_indices, true)?)
+                }
+                _ => None,
+            };
+            let raw_end_off = match &frame.end {
+                FrameBound::Preceding(e) | FrameBound::Following(e) => {
+                    Some(eval_raw_range_offset(e, all_rows, sorted_indices, false)?)
+                }
+                _ => None,
+            };
+            let order_values: Vec<Option<&Value>> = (0..n)
+                .map(|pos| {
+                    row_order_key(sorted_indices[pos])
+                        .first()
+                        .filter(|v| !v.is_null())
+                })
+                .collect();
+            let extra_scales = [raw_start_off.as_ref(), raw_end_off.as_ref()];
+            let axis = RangeAxis::infer(&order_values, extra_scales.into_iter().flatten())?;
+            range_vals = order_values
+                .iter()
+                .map(|v| match v {
+                    Some(value) => axis.value_to_scalar(value).map(Some),
+                    None => Ok(None),
+                })
+                .collect::<Result<_, _>>()?;
+            if let Some(v) = &raw_start_off {
+                let s = axis.value_to_scalar(v)?;
+                if s.is_negative() {
+                    return Err(ExecError::WindowFrameError(
+                        "invalid preceding or following size in window function".to_string(),
+                    ));
+                }
+                start_range_off = Some(s);
             }
-            _ => None,
-        };
-        let end_range_off = match &frame.end {
-            FrameBound::Preceding(e) | FrameBound::Following(e) if range_offset => {
-                Some(eval_range_offset(e, all_rows, sorted_indices)?)
+            if let Some(v) = &raw_end_off {
+                let s = axis.value_to_scalar(v)?;
+                if s.is_negative() {
+                    return Err(ExecError::WindowFrameError(
+                        "invalid preceding or following size in window function".to_string(),
+                    ));
+                }
+                end_range_off = Some(s);
             }
-            _ => None,
-        };
+        }
 
         let mut bounds = Vec::with_capacity(n);
         for pos in 0..n {
@@ -1049,6 +1142,176 @@ fn i64_to_f64(v: i64) -> f64 {
         .unwrap_or(if v < 0 { f64::MIN } else { f64::MAX })
 }
 
+/// A RANGE ordering value or offset in the ORDER BY column's exact-arithmetic
+/// domain. `Int` holds a scale-aligned `i128` (used for Int* and Decimal
+/// columns, where the bound `cur ± off` must be exact to keep boundary peers);
+/// `Float` holds an `f64` (fallback for genuine Float32/Float64 columns).
+#[derive(Clone, Copy)]
+enum RangeScalar {
+    Int(i128),
+    Float(f64),
+}
+
+impl RangeScalar {
+    fn is_negative(self) -> bool {
+        match self {
+            RangeScalar::Int(v) => v < 0,
+            RangeScalar::Float(v) => v < 0.0,
+        }
+    }
+
+    /// `self - other`, saturating on i128 overflow.
+    fn sub(self, other: RangeScalar) -> RangeScalar {
+        match (self, other) {
+            (RangeScalar::Int(a), RangeScalar::Int(b)) => {
+                RangeScalar::Int(a.saturating_sub(b))
+            }
+            (RangeScalar::Float(a), RangeScalar::Float(b)) => RangeScalar::Float(a - b),
+            // Mixed variants never occur: the axis fixes one domain per
+            // partition for both values and offset. Degrade to float.
+            (a, b) => RangeScalar::Float(a.as_f64() - b.as_f64()),
+        }
+    }
+
+    /// `self + other`, saturating on i128 overflow.
+    fn add(self, other: RangeScalar) -> RangeScalar {
+        match (self, other) {
+            (RangeScalar::Int(a), RangeScalar::Int(b)) => {
+                RangeScalar::Int(a.saturating_add(b))
+            }
+            (RangeScalar::Float(a), RangeScalar::Float(b)) => RangeScalar::Float(a + b),
+            (a, b) => RangeScalar::Float(a.as_f64() + b.as_f64()),
+        }
+    }
+
+    fn as_f64(self) -> f64 {
+        match self {
+            RangeScalar::Int(v) => v.to_f64_lossy(),
+            RangeScalar::Float(v) => v,
+        }
+    }
+
+    /// SQL-compatible ordering (NaN handled like the sort comparator).
+    fn cmp(self, other: RangeScalar) -> Ordering {
+        match (self, other) {
+            (RangeScalar::Int(a), RangeScalar::Int(b)) => a.cmp(&b),
+            _ => compare_f64_sql(self.as_f64(), other.as_f64()),
+        }
+    }
+}
+
+trait I128ToF64 {
+    fn to_f64_lossy(self) -> f64;
+}
+
+impl I128ToF64 for i128 {
+    fn to_f64_lossy(self) -> f64 {
+        use num_traits::ToPrimitive;
+        self.to_f64()
+            .unwrap_or(if self < 0 { f64::MIN } else { f64::MAX })
+    }
+}
+
+/// The exact-arithmetic domain for a partition's RANGE ORDER BY column.
+///
+/// `Int { scale }` aligns every Int*/Decimal value and the offset to a common
+/// decimal `scale` represented as `i128`, so `cur ± off` and the membership
+/// test are exact. `Float` is the fallback for Float32/Float64 columns.
+enum RangeAxis {
+    Int { scale: u32 },
+    Float,
+}
+
+impl RangeAxis {
+    /// Infer the domain from the partition's non-null ordering values and the
+    /// offset value(s). Picks exact i128 for Int*/Decimal columns (common
+    /// scale = max decimal scale seen across values AND offsets), and float
+    /// for Float32/Float64. Ordering-value NULLs are pre-filtered.
+    fn infer<'v>(
+        order_values: &[Option<&Value>],
+        offsets: impl Iterator<Item = &'v Value>,
+    ) -> Result<RangeAxis, ExecError> {
+        let mut saw_float = false;
+        let mut saw_exact = false;
+        let mut max_scale: u32 = 0;
+        let mut fold = |v: &Value| -> Result<(), ExecError> {
+            match v {
+                Value::Int16(_) | Value::Int32(_) | Value::Int64(_) => saw_exact = true,
+                Value::Decimal { scale, .. } => {
+                    saw_exact = true;
+                    if *scale > 0 {
+                        max_scale = max_scale.max(u32::try_from(*scale).unwrap_or(0));
+                    }
+                }
+                Value::Float32(_) | Value::Float64(_) => saw_float = true,
+                _ => {
+                    return Err(ExecError::WindowFrameError(
+                        "RANGE offset requires a numeric ORDER BY column".to_string(),
+                    ));
+                }
+            }
+            Ok(())
+        };
+        for v in order_values.iter().flatten() {
+            fold(v)?;
+        }
+        for v in offsets {
+            fold(v)?;
+        }
+        // A column should be homogeneous; if floats are present, use float.
+        if saw_float || !saw_exact {
+            Ok(RangeAxis::Float)
+        } else {
+            Ok(RangeAxis::Int { scale: max_scale })
+        }
+    }
+
+    /// Convert a numeric `Value` (the ordering value or the offset) into a
+    /// [`RangeScalar`] in this axis. Errors on non-numeric values.
+    fn value_to_scalar(&self, v: &Value) -> Result<RangeScalar, ExecError> {
+        match self {
+            RangeAxis::Float => value_to_f64(v).map(RangeScalar::Float).ok_or_else(|| {
+                ExecError::WindowFrameError(
+                    "invalid preceding or following size in window function".to_string(),
+                )
+            }),
+            RangeAxis::Int { scale } => {
+                let aligned = match v {
+                    Value::Int16(x) => i128::from(*x).checked_mul(pow10_i128(*scale)),
+                    Value::Int32(x) => i128::from(*x).checked_mul(pow10_i128(*scale)),
+                    Value::Int64(x) => i128::from(*x).checked_mul(pow10_i128(*scale)),
+                    Value::Decimal {
+                        value,
+                        scale: vscale,
+                    } => {
+                        // The axis scale is the max decimal scale across all
+                        // values and offsets, so `vscale <= scale` always
+                        // holds and the rescale is an exact upscale.
+                        let vscale = u32::try_from((*vscale).max(0)).unwrap_or(0);
+                        let up = scale.saturating_sub(vscale);
+                        i128::from(*value).checked_mul(pow10_i128(up))
+                    }
+                    _ => {
+                        return Err(ExecError::WindowFrameError(
+                            "invalid preceding or following size in window function".to_string(),
+                        ));
+                    }
+                };
+                aligned.map(RangeScalar::Int).ok_or_else(|| {
+                    ExecError::WindowFrameError(
+                        "RANGE offset arithmetic overflow".to_string(),
+                    )
+                })
+            }
+        }
+    }
+}
+
+/// `10^exp` as `i128`, saturating on overflow (exp is a small decimal scale).
+fn pow10_i128(exp: u32) -> i128 {
+    (0..exp).fold(1_i128, |acc, _| acc.saturating_mul(10))
+}
+
 /// Evaluate a constant-per-partition frame offset expression and validate
 /// it for ROWS/GROUPS use (round to bigint, reject NULL/negative).
 fn eval_rows_offset(
@@ -1083,13 +1346,15 @@ fn eval_rows_offset(
     Ok(f64_to_usize(rounded))
 }
 
-/// Evaluate a constant-per-partition RANGE value offset and validate it
-/// (reject NULL/negative). Returns the magnitude as `f64`.
-fn eval_range_offset(
+/// Evaluate a constant-per-partition RANGE value offset, rejecting NULL.
+/// Returns the raw `Value` so the caller can fold its decimal scale into the
+/// partition's exact-arithmetic axis before converting it to a [`RangeScalar`].
+fn eval_raw_range_offset(
     expr: &ScalarExpr,
     all_rows: &[Vec<Value>],
     sorted_indices: &[usize],
-) -> Result<f64, ExecError> {
+    is_start: bool,
+) -> Result<Value, ExecError> {
     let probe_row = sorted_indices
         .first()
         .map(|&i| all_rows[i].as_slice())
@@ -1098,21 +1363,13 @@ fn eval_range_offset(
         .eval(probe_row)
         .map_err(eval_error_to_exec_error)?;
     if value.is_null() {
-        return Err(ExecError::WindowFrameError(
-            "frame starting offset must not be null".to_string(),
-        ));
+        // SQLSTATE 22013. Distinguish starting vs ending offset (BUG 4a).
+        let which = if is_start { "starting" } else { "ending" };
+        return Err(ExecError::WindowFrameError(format!(
+            "frame {which} offset must not be null"
+        )));
     }
-    let magnitude = value_to_f64(&value).ok_or_else(|| {
-        ExecError::WindowFrameError(
-            "invalid preceding or following size in window function".to_string(),
-        )
-    })?;
-    if magnitude < 0.0 {
-        return Err(ExecError::WindowFrameError(
-            "invalid preceding or following size in window function".to_string(),
-        ));
-    }
-    Ok(magnitude)
+    Ok(value)
 }
 
 /// Convert a non-negative `f64` to `usize`, saturating on overflow.
@@ -1145,10 +1402,10 @@ fn resolve_frame_pos(
     n: usize,
     group_of: &[usize],
     group_bounds: &[(usize, usize)],
-    range_vals: &[Option<f64>],
+    range_vals: &[Option<RangeScalar>],
     asc: bool,
     rows_off: Option<usize>,
-    range_off: Option<f64>,
+    range_off: Option<RangeScalar>,
 ) -> usize {
     match bound {
         FrameBound::UnboundedPreceding => 0,
@@ -1179,7 +1436,7 @@ fn resolve_frame_pos(
                     resolve_groups_offset(pos, n, side, following, off, group_of, group_bounds)
                 }
                 FrameUnits::Range => {
-                    let off = range_off.unwrap_or(0.0);
+                    let off = range_off.unwrap_or(RangeScalar::Int(0));
                     resolve_range_offset(pos, n, side, following, off, range_vals, asc)
                 }
             }
@@ -1230,18 +1487,24 @@ fn resolve_groups_offset(
         let (gs, ge) = group_bounds[target];
         if side == BoundSide::Start { gs } else { ge }
     } else {
-        let target = cur.saturating_sub(off);
-        // When `off` exceeds the current group index the start clamps to 0.
+        // `<off> PRECEDING`: the target group is `cur - off`. When `off`
+        // exceeds the current group index the target underflows below group 0.
         let underflow = off > cur;
+        if underflow {
+            // The target group is before the first group. For the START side
+            // the frame still begins at the partition start; for the END side
+            // the target group does not exist, so the frame end must collapse.
+            // Returning 0 for either side yields an EMPTY frame after the
+            // `fe.max(fs)` clamp at the call site (PostgreSQL: an all-PRECEDING
+            // frame whose end group is below 0 selects no rows). Previously the
+            // END side returned `group_bounds[cur.saturating_sub(off)]`, i.e.
+            // group 0, leaking the leading group into the frame.
+            return 0;
+        }
+        let target = cur - off;
         let (gs, ge) = group_bounds[target];
         match side {
-            BoundSide::Start => {
-                if underflow {
-                    0
-                } else {
-                    gs
-                }
-            }
+            BoundSide::Start => gs,
             BoundSide::End => ge,
         }
     }
@@ -1259,8 +1522,8 @@ fn resolve_range_offset(
     n: usize,
     side: BoundSide,
     following: bool,
-    off: f64,
-    range_vals: &[Option<f64>],
+    off: RangeScalar,
+    range_vals: &[Option<RangeScalar>],
     asc: bool,
 ) -> usize {
     let Some(cur) = range_vals[pos] else {
@@ -1276,17 +1539,17 @@ fn resolve_range_offset(
         return if side == BoundSide::Start { lo } else { hi };
     };
 
-    // The frame value-window bound. With ASC ordering, `<off> PRECEDING`
-    // admits values >= v-off and `<off> FOLLOWING` admits values <= v+off.
-    // DESC flips the direction of "preceding"/"following" in value space.
+    // The frame value-window bound, computed in EXACT arithmetic in the
+    // ORDER BY column's own type. With ASC ordering, `<off> PRECEDING` admits
+    // values >= v-off and `<off> FOLLOWING` admits values <= v+off. DESC flips
+    // the direction of "preceding"/"following" in value space.
     let preceding = !following;
-    // Compute the inclusive value-bound for this side.
     let bound_value = if asc {
-        if preceding { cur - off } else { cur + off }
+        if preceding { cur.sub(off) } else { cur.add(off) }
     } else if preceding {
-        cur + off
+        cur.add(off)
     } else {
-        cur - off
+        cur.sub(off)
     };
 
     // Scan positions that carry a non-null value, respecting the sort
@@ -1296,12 +1559,11 @@ fn resolve_range_offset(
     match side {
         BoundSide::Start => {
             // First position whose value is within the lower edge of the
-            // admitted window. For a START bound the admitted edge is the
-            // "earliest" value still inside the window.
+            // admitted window.
             let mut p = 0;
             while p < n {
                 match range_vals[p] {
-                    Some(val) if value_in_start_window(val, bound_value, asc, preceding) => break,
+                    Some(val) if value_in_start_window(val, bound_value, asc) => break,
                     _ => p += 1,
                 }
             }
@@ -1312,7 +1574,7 @@ fn resolve_range_offset(
             let mut p = n;
             while p > 0 {
                 match range_vals[p - 1] {
-                    Some(val) if value_in_end_window(val, bound_value, asc, preceding) => break,
+                    Some(val) if value_in_end_window(val, bound_value, asc) => break,
                     _ => p -= 1,
                 }
             }
@@ -1322,24 +1584,22 @@ fn resolve_range_offset(
 }
 
 /// Whether `val` is at or beyond the START edge of a RANGE value window.
-fn value_in_start_window(val: f64, bound_value: f64, asc: bool, preceding: bool) -> bool {
-    // A START bound is `<off> PRECEDING` (most common) admitting values
-    // >= v-off (ASC). For a `<off> FOLLOWING` start the edge is v+off.
-    let _ = preceding;
+/// ASC admits `val >= bound`; DESC admits `val <= bound`. Inclusive boundary.
+fn value_in_start_window(val: RangeScalar, bound_value: RangeScalar, asc: bool) -> bool {
     if asc {
-        val >= bound_value
+        val.cmp(bound_value) != Ordering::Less
     } else {
-        val <= bound_value
+        val.cmp(bound_value) != Ordering::Greater
     }
 }
 
 /// Whether `val` is at or within the END edge of a RANGE value window.
-fn value_in_end_window(val: f64, bound_value: f64, asc: bool, preceding: bool) -> bool {
-    let _ = preceding;
+/// ASC admits `val <= bound`; DESC admits `val >= bound`. Inclusive boundary.
+fn value_in_end_window(val: RangeScalar, bound_value: RangeScalar, asc: bool) -> bool {
     if asc {
-        val <= bound_value
+        val.cmp(bound_value) != Ordering::Greater
     } else {
-        val >= bound_value
+        val.cmp(bound_value) != Ordering::Less
     }
 }
 
@@ -2821,5 +3081,429 @@ mod tests {
                 Value::Float64(20.0)
             ]
         );
+    }
+
+    // ---- Regression helpers for the bug-fix tests below ----
+
+    /// Window output schema for an `(id Int32, val Int64)` input plus a `win`
+    /// column of `win_type`.
+    fn schema_i64_window(win_type: DataType) -> Schema {
+        Schema::new([
+            Field::required("id", DataType::Int32),
+            Field::required("val", DataType::Int64),
+            Field::nullable("win", win_type),
+        ])
+        .expect("ok")
+    }
+
+    /// Drive `func OVER (ORDER BY val <dir> <frame>)` over a single
+    /// `(id, val Int64)` batch (with optional NULL mask on `val`) and return
+    /// the window column in input-row order.
+    fn run_i64_window(
+        rows: &[(i32, i64)],
+        nulls: Option<&[bool]>,
+        order_dir: (bool, bool),
+        func: WindowFunc,
+        win_type: DataType,
+        frame_spec: Option<FrameSpec>,
+    ) -> Vec<Value> {
+        let scan = MemTableScan::new(schema_id_val_i64(), vec![make_batch_i64(rows, nulls)]);
+        let mut op = WindowAgg::new(
+            Box::new(scan),
+            vec![],
+            vec![col_val_i64()],
+            func,
+            schema_i64_window(win_type),
+        )
+        .with_order_directions(vec![order_dir]);
+        if let Some(f) = frame_spec {
+            op = op.with_frame(f);
+        }
+        drain_window_values(&mut op)
+    }
+
+    fn make_batch_f64(rows: &[(i32, f64)]) -> Batch {
+        let id = Column::Int32(NumericColumn::from_data(
+            rows.iter().map(|(a, _)| *a).collect(),
+        ));
+        let vals = Column::Float64(NumericColumn::from_data(
+            rows.iter().map(|(_, b)| *b).collect(),
+        ));
+        Batch::new([id, vals]).expect("ok")
+    }
+
+    // ===================== BUG 1: NULLS-default ordering for DESC =========
+    //
+    // PostgreSQL default NULLS placement depends on direction: ASC -> NULLS
+    // LAST, DESC -> NULLS FIRST. Explicit NULLS FIRST/LAST must hold under
+    // both ASC and DESC. We assert both the row order (via row_number) and
+    // the default RANGE running-frame sum + rank() on a column with NULLs.
+    //
+    // Data: (id, v) = (1,10),(2,NULL),(3,30),(4,20). Non-null order ASC is
+    // 10,20,30; DESC is 30,20,10.
+
+    fn nulls_rows() -> [(i32, i64); 4] {
+        [(1, 10), (2, 0), (3, 30), (4, 20)]
+    }
+    fn nulls_mask() -> [bool; 4] {
+        [true, false, true, true]
+    }
+
+    /// row_number() in the sorted order, read back per original id (id->rn).
+    /// Returns `(id, rn)` pairs sorted by id for stable assertions.
+    fn rn_by_id(order_dir: (bool, bool)) -> Vec<(i32, i64)> {
+        let scan = MemTableScan::new(
+            schema_id_val_i64(),
+            vec![make_batch_i64(&nulls_rows(), Some(&nulls_mask()))],
+        );
+        let mut op = WindowAgg::new(
+            Box::new(scan),
+            vec![],
+            vec![col_val_i64()],
+            WindowFunc::RowNumber,
+            schema_i64_window(DataType::Int64),
+        )
+        .with_order_directions(vec![order_dir]);
+        let schema = op.schema().clone();
+        let mut out = Vec::new();
+        while let Some(b) = op.next_batch().expect("ok") {
+            for row in batch_to_rows(&b, &schema).expect("decode") {
+                let id = match &row[0] {
+                    Value::Int32(v) => *v,
+                    _ => unreachable!(),
+                };
+                let rn = match &row[2] {
+                    Value::Int64(v) => *v,
+                    _ => unreachable!(),
+                };
+                out.push((id, rn));
+            }
+        }
+        out.sort_by_key(|(id, _)| *id);
+        out
+    }
+
+    #[test]
+    fn window_nulls_default_asc_is_nulls_last() {
+        // ASC default -> NULLS LAST: 10(id1),20(id4),30(id3),NULL(id2).
+        let rn = rn_by_id((true, false));
+        assert_eq!(rn, vec![(1, 1), (2, 4), (3, 3), (4, 2)]);
+    }
+
+    #[test]
+    fn window_nulls_default_desc_is_nulls_first() {
+        // DESC default -> NULLS FIRST: NULL(id2),30(id3),20(id4),10(id1).
+        // This is the currently-correct behaviour that must NOT regress.
+        let rn = rn_by_id((false, true));
+        assert_eq!(
+            rn,
+            vec![(1, 4), (2, 1), (3, 2), (4, 3)],
+            "DESC default must place NULLs first",
+        );
+    }
+
+    #[test]
+    fn window_nulls_explicit_first_asc_and_desc() {
+        // NULLS FIRST, ASC: NULL(id2),10(id1),20(id4),30(id3).
+        let asc = rn_by_id((true, true));
+        assert_eq!(asc, vec![(1, 2), (2, 1), (3, 4), (4, 3)]);
+        // NULLS FIRST, DESC: NULL(id2),30(id3),20(id4),10(id1).
+        let desc = rn_by_id((false, true));
+        assert_eq!(desc, vec![(1, 4), (2, 1), (3, 2), (4, 3)]);
+    }
+
+    #[test]
+    fn window_nulls_explicit_last_asc_and_desc() {
+        // NULLS LAST, ASC: 10,20,30,NULL -> id1,id4,id3,id2.
+        let asc = rn_by_id((true, false));
+        assert_eq!(asc, vec![(1, 1), (2, 4), (3, 3), (4, 2)]);
+        // NULLS LAST, DESC: 30,20,10,NULL -> id3,id4,id1,id2.
+        let desc = rn_by_id((false, false));
+        assert_eq!(
+            desc,
+            vec![(1, 3), (2, 4), (3, 1), (4, 2)],
+            "NULLS LAST under DESC must place NULLs at the end",
+        );
+    }
+
+    #[test]
+    fn window_rank_and_running_frame_under_desc_nulls_first() {
+        // DESC default (NULLS FIRST). Sorted: NULL(id2),30(id3),20(id4),10(id1).
+        // rank(): NULL->1, 30->2, 20->3, 10->4.
+        let ranks = run_i64_window(
+            &nulls_rows(),
+            Some(&nulls_mask()),
+            (false, true),
+            WindowFunc::Rank,
+            DataType::Int64,
+            None,
+        );
+        // ranks read back in INPUT order id1,id2,id3,id4:
+        // id1(10)->4, id2(NULL)->1, id3(30)->2, id4(20)->3.
+        assert_eq!(ranks, i64s(&[4, 1, 2, 3]));
+
+        // Default RANGE running frame (UNBOUNDED PRECEDING .. CURRENT ROW),
+        // sum(val). In sorted order: NULL row's frame is the NULL peer set
+        // (sum over NULL vals -> NULL), then running sums 30, 50, 60.
+        // Input order id1,id2,id3,id4: id1(10)->60, id2(NULL)->NULL,
+        // id3(30)->30, id4(20)->50.
+        let sums = run_i64_window(
+            &nulls_rows(),
+            Some(&nulls_mask()),
+            (false, true),
+            WindowFunc::Aggregate {
+                kind: WindowAggKind::Sum,
+                expr: col_val_i64(),
+            },
+            DataType::Int64,
+            Some(default_running_frame()),
+        );
+        assert_eq!(
+            sums,
+            vec![
+                Value::Int64(60),
+                Value::Null,
+                Value::Int64(30),
+                Value::Int64(50),
+            ],
+        );
+    }
+
+    // ===================== BUG 2: exact-arithmetic RANGE ==================
+
+    #[test]
+    fn frame_range_large_i64_boundary_peer_exact() {
+        // Two Int64 values just above 2^53 where f64 arithmetic loses the
+        // unit: 9007199254740993 and 9007199254740995. With RANGE BETWEEN 2
+        // PRECEDING AND CURRENT ROW the larger row's window [v-2, v] must
+        // include the smaller (count 2). Computing the bound in f64 drops it
+        // (count 1) because 9007199254740995.0 - 2.0 = 9007199254740994.0 and
+        // 9007199254740992.0 < that.
+        let rows = [(1, 9_007_199_254_740_993_i64), (2, 9_007_199_254_740_995)];
+        let f = frame(
+            FrameUnits::Range,
+            FrameBound::Preceding(lit_i32(2)),
+            FrameBound::CurrentRow,
+            FrameExclusion::NoOthers,
+        );
+        let counts = run_i64_window(
+            &rows,
+            None,
+            (true, false),
+            WindowFunc::CountStar,
+            DataType::Int64,
+            Some(f.clone()),
+        );
+        // id1 (smaller): only itself -> 1; id2 (larger): both -> 2.
+        assert_eq!(counts, i64s(&[1, 2]));
+
+        let sums = run_i64_window(
+            &rows,
+            None,
+            (true, false),
+            WindowFunc::Aggregate {
+                kind: WindowAggKind::Sum,
+                expr: col_val_i64(),
+            },
+            DataType::Int64,
+            Some(f),
+        );
+        // id2's frame sum = both values = 18014398509481988.
+        assert_eq!(
+            sums,
+            vec![
+                Value::Int64(9_007_199_254_740_993),
+                Value::Int64(18_014_398_509_481_988),
+            ],
+        );
+    }
+
+    #[test]
+    fn frame_range_small_int_offset_still_correct() {
+        // Sanity: the exact path reproduces the existing f64-era result for
+        // small ints. val = 10,15,20,40,45; RANGE 10 PRECEDING..10 FOLLOWING.
+        let rows = [(1, 10_i64), (2, 15), (3, 20), (4, 40), (5, 45)];
+        let counts = run_i64_window(
+            &rows,
+            None,
+            (true, false),
+            WindowFunc::CountStar,
+            DataType::Int64,
+            Some(frame(
+                FrameUnits::Range,
+                FrameBound::Preceding(lit_i32(10)),
+                FrameBound::Following(lit_i32(10)),
+                FrameExclusion::NoOthers,
+            )),
+        );
+        assert_eq!(counts, i64s(&[3, 3, 3, 2, 2]));
+    }
+
+    // ===================== BUG 3: GROUPS PRECEDING end underflow ==========
+
+    #[test]
+    fn frame_groups_preceding_end_underflow_is_empty() {
+        // (g=1,v=10),(g=2,v=20),(g=3,v=30). ORDER BY g.
+        // GROUPS BETWEEN 2 PRECEDING AND 1 PRECEDING. For g=1 the end target
+        // group is "1 PRECEDING" = group -1, which does not exist, so the
+        // frame is EMPTY and sum -> NULL (previously returned 10).
+        let rows = [(1, 10_i64), (2, 20), (3, 30)];
+        let sums = run_i64_window(
+            &rows,
+            None,
+            (true, false),
+            WindowFunc::Aggregate {
+                kind: WindowAggKind::Sum,
+                expr: col_val_i64(),
+            },
+            DataType::Int64,
+            Some(frame(
+                FrameUnits::Groups,
+                FrameBound::Preceding(lit_i32(2)),
+                FrameBound::Preceding(lit_i32(1)),
+                FrameExclusion::NoOthers,
+            )),
+        );
+        // g=1: empty -> NULL. g=2: groups {1} -> 10. g=3: groups {1,2} -> 30.
+        assert_eq!(
+            sums,
+            vec![Value::Null, Value::Int64(10), Value::Int64(30)],
+        );
+    }
+
+    #[test]
+    fn frame_groups_following_start_overflow_is_empty() {
+        // GROUPS BETWEEN 1 FOLLOWING AND 2 FOLLOWING. For the LAST group the
+        // start ("1 FOLLOWING") is past the end, so the frame is EMPTY.
+        let rows = [(1, 10_i64), (2, 20), (3, 30)];
+        let sums = run_i64_window(
+            &rows,
+            None,
+            (true, false),
+            WindowFunc::Aggregate {
+                kind: WindowAggKind::Sum,
+                expr: col_val_i64(),
+            },
+            DataType::Int64,
+            Some(frame(
+                FrameUnits::Groups,
+                FrameBound::Following(lit_i32(1)),
+                FrameBound::Following(lit_i32(2)),
+                FrameExclusion::NoOthers,
+            )),
+        );
+        // g=1: groups {2,3} -> 50. g=2: group {3} -> 30. g=3: empty -> NULL.
+        assert_eq!(
+            sums,
+            vec![Value::Int64(50), Value::Int64(30), Value::Null],
+        );
+    }
+
+    // ===================== BUG 4(a): offset NULL message fidelity =========
+
+    #[test]
+    fn frame_range_null_end_offset_reports_ending() {
+        // A NULL ending offset must say "ending", not "starting".
+        let scan = MemTableScan::new(schema_id_val_i64(), vec![make_batch_i64(&[(1, 10)], None)]);
+        let null_i64 = ScalarExpr::Literal {
+            value: Value::Null,
+            data_type: DataType::Int64,
+        };
+        let mut op = WindowAgg::new(
+            Box::new(scan),
+            vec![],
+            vec![col_val_i64()],
+            WindowFunc::CountStar,
+            schema_i64_window(DataType::Int64),
+        )
+        .with_order_directions(vec![(true, false)])
+        .with_frame(frame(
+            FrameUnits::Range,
+            FrameBound::Preceding(lit_i32(1)),
+            FrameBound::Following(null_i64),
+            FrameExclusion::NoOthers,
+        ));
+        let err = drain_window_values_err(&mut op);
+        assert!(
+            matches!(&err, ExecError::WindowFrameError(m)
+                if m.contains("ending") && m.contains("must not be null")),
+            "expected ending-offset NULL message, got {err:?}",
+        );
+    }
+
+    // ===================== BUG 4(b): NaN peer grouping ====================
+
+    fn schema_id_val_f64() -> Schema {
+        Schema::new([
+            Field::required("id", DataType::Int32),
+            Field::required("val", DataType::Float64),
+        ])
+        .expect("ok")
+    }
+
+    fn schema_f64_window(win_type: DataType) -> Schema {
+        Schema::new([
+            Field::required("id", DataType::Int32),
+            Field::required("val", DataType::Float64),
+            Field::nullable("win", win_type),
+        ])
+        .expect("ok")
+    }
+
+    #[test]
+    fn window_nan_rows_form_one_peer_group() {
+        // Two adjacent NaN rows must be PEERS (the sort treats NaN == NaN),
+        // so rank() gives them the same rank and the default RANGE running
+        // frame yields the same stepped sum. val = 1.0, NaN, NaN.
+        let scan = MemTableScan::new(
+            schema_id_val_f64(),
+            vec![make_batch_f64(&[(1, 1.0), (2, f64::NAN), (3, f64::NAN)])],
+        );
+        let col_val_f64 = ScalarExpr::Column {
+            name: "val".into(),
+            index: 1,
+            data_type: DataType::Float64,
+        };
+        let mut rank_op = WindowAgg::new(
+            Box::new(scan),
+            vec![],
+            vec![col_val_f64.clone()],
+            WindowFunc::Rank,
+            schema_f64_window(DataType::Int64),
+        )
+        .with_order_directions(vec![(true, false)]);
+        // Sorted: 1.0, NaN, NaN. rank(): 1, 2, 2 (the two NaNs are peers).
+        assert_eq!(drain_window_values(&mut rank_op), i64s(&[1, 2, 2]));
+
+        // Default RANGE running frame, sum(val): peers share the stepped sum.
+        // 1.0 -> 1.0; the two NaN peers both -> 1.0 + NaN + NaN = NaN.
+        let scan2 = MemTableScan::new(
+            schema_id_val_f64(),
+            vec![make_batch_f64(&[(1, 1.0), (2, f64::NAN), (3, f64::NAN)])],
+        );
+        let mut sum_op = WindowAgg::new(
+            Box::new(scan2),
+            vec![],
+            vec![col_val_f64.clone()],
+            WindowFunc::Aggregate {
+                kind: WindowAggKind::Sum,
+                expr: col_val_f64,
+            },
+            schema_f64_window(DataType::Float64),
+        )
+        .with_order_directions(vec![(true, false)])
+        .with_frame(default_running_frame());
+        let sums = drain_window_values(&mut sum_op);
+        // Both NaN rows belong to the same peer group, so both see the full
+        // running frame [1.0, NaN, NaN]; the sum is NaN for all three NaN
+        // peers' positions and 1.0 for the first row.
+        assert_eq!(sums.len(), 3);
+        assert_eq!(sums[0], Value::Float64(1.0));
+        for s in &sums[1..] {
+            match s {
+                Value::Float64(x) => assert!(x.is_nan(), "expected NaN, got {x}"),
+                other => panic!("expected Float64 NaN, got {other:?}"),
+            }
+        }
     }
 }

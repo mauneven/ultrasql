@@ -183,10 +183,19 @@ pub(super) fn apply_window_extractions(
             .map(|item| -> Result<SortKey, PlanError> {
                 let bound =
                     bind_expr_with_ctes(&item.expr, plan.schema(), catalog, cte_catalog, scope)?;
+                let asc = matches!(item.direction, SortDirection::Asc);
+                // PostgreSQL's default NULLS ordering depends on direction:
+                // ASC -> NULLS LAST, DESC -> NULLS FIRST. Mirror the
+                // non-window binders (util::bind_order_by) exactly.
+                let nulls_first = match item.nulls {
+                    NullsOrder::First => true,
+                    NullsOrder::Last => false,
+                    NullsOrder::Default => !asc,
+                };
                 Ok(SortKey {
                     expr: bound,
-                    asc: matches!(item.direction, SortDirection::Asc),
-                    nulls_first: matches!(item.nulls, NullsOrder::First),
+                    asc,
+                    nulls_first,
                 })
             })
             .collect::<Result<_, _>>()?;

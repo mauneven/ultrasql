@@ -96,6 +96,62 @@ fn collect_window_funcs<'a>(plan: &'a LogicalPlan, out: &mut Vec<&'a LogicalWind
     }
 }
 
+/// Fetch the ORDER BY keys of the first (outermost) Window node.
+fn first_window_order_by(plan: &LogicalPlan) -> Option<&[crate::plan::SortKey]> {
+    match plan {
+        LogicalPlan::Window { order_by, .. } => Some(order_by),
+        LogicalPlan::Project { input, .. }
+        | LogicalPlan::Filter { input, .. }
+        | LogicalPlan::Sort { input, .. }
+        | LogicalPlan::Limit { input, .. } => first_window_order_by(input),
+        _ => None,
+    }
+}
+
+#[test]
+fn window_order_by_default_nulls_follows_direction() {
+    // PostgreSQL: ASC default -> NULLS LAST (nulls_first=false), DESC default
+    // -> NULLS FIRST (nulls_first=true). The window binder previously resolved
+    // Default to NULLS LAST unconditionally, ignoring direction (BUG 1).
+    let asc = parse_bind_ok("SELECT sum(id) OVER (ORDER BY score) FROM users");
+    let keys = first_window_order_by(&asc).expect("window order by");
+    assert_eq!(keys.len(), 1);
+    assert!(keys[0].asc, "ASC default");
+    assert!(
+        !keys[0].nulls_first,
+        "ASC default must be NULLS LAST (nulls_first=false)"
+    );
+
+    let desc = parse_bind_ok("SELECT sum(id) OVER (ORDER BY score DESC) FROM users");
+    let keys = first_window_order_by(&desc).expect("window order by");
+    assert_eq!(keys.len(), 1);
+    assert!(!keys[0].asc, "DESC");
+    assert!(
+        keys[0].nulls_first,
+        "DESC default must be NULLS FIRST (nulls_first=true)"
+    );
+}
+
+#[test]
+fn window_order_by_explicit_nulls_honored_under_desc() {
+    // Explicit NULLS FIRST/LAST must override the direction default for DESC.
+    let first = parse_bind_ok("SELECT sum(id) OVER (ORDER BY score DESC NULLS LAST) FROM users");
+    let keys = first_window_order_by(&first).expect("window order by");
+    assert!(!keys[0].asc);
+    assert!(
+        !keys[0].nulls_first,
+        "explicit NULLS LAST under DESC must stay nulls_first=false"
+    );
+
+    let last = parse_bind_ok("SELECT sum(id) OVER (ORDER BY score ASC NULLS FIRST) FROM users");
+    let keys = first_window_order_by(&last).expect("window order by");
+    assert!(keys[0].asc);
+    assert!(
+        keys[0].nulls_first,
+        "explicit NULLS FIRST under ASC must stay nulls_first=true"
+    );
+}
+
 #[test]
 fn binds_window_functions_and_preserves_result_types() {
     let plan = parse_bind_ok(

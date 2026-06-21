@@ -500,7 +500,7 @@ pub(crate) fn try_compare_values_nullable(
     }
 }
 
-fn compare_non_null_values(a: &Value, b: &Value) -> Option<Ordering> {
+pub(crate) fn compare_non_null_values(a: &Value, b: &Value) -> Option<Ordering> {
     Some(match (a, b) {
         (Value::Bool(l), Value::Bool(r)) => l.cmp(r),
         (Value::Int16(l), Value::Int16(r)) => l.cmp(r),
