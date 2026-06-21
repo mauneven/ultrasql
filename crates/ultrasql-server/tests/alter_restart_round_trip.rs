@@ -121,3 +121,117 @@ async fn alter_table_rename_table_survives_restart() {
     assert_eq!(err.code().expect("SQLSTATE").code(), "42P01");
     shutdown(running).await;
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn alter_table_add_check_constraint_survives_restart() {
+    let data_dir = tempfile::TempDir::new().unwrap();
+
+    let running = start_persistent_server(data_dir.path(), "alter_add_check_restart_test").await;
+    running
+        .client
+        .batch_execute("CREATE TABLE alter_check_restart (id INT, qty INT)")
+        .await
+        .expect("create");
+    running
+        .client
+        .batch_execute("ALTER TABLE alter_check_restart ADD CONSTRAINT qty_pos CHECK (qty > 0)")
+        .await
+        .expect("add check");
+    shutdown(running).await;
+
+    // After restart the CHECK is still enforced on DML.
+    let running = start_persistent_server(data_dir.path(), "alter_add_check_restart_test").await;
+    running
+        .client
+        .batch_execute("INSERT INTO alter_check_restart VALUES (1, 5)")
+        .await
+        .expect("valid insert after restart");
+    let err = running
+        .client
+        .batch_execute("INSERT INTO alter_check_restart VALUES (2, -1)")
+        .await
+        .expect_err("CHECK still enforced after restart");
+    assert_eq!(err.code().expect("SQLSTATE").code(), "23514");
+    shutdown(running).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn alter_table_drop_check_constraint_survives_restart() {
+    let data_dir = tempfile::TempDir::new().unwrap();
+
+    let running =
+        start_persistent_server(data_dir.path(), "alter_drop_check_restart_test").await;
+    running
+        .client
+        .batch_execute("CREATE TABLE drop_check_restart (id INT, qty INT)")
+        .await
+        .expect("create");
+    running
+        .client
+        .batch_execute("ALTER TABLE drop_check_restart ADD CONSTRAINT qty_pos CHECK (qty > 0)")
+        .await
+        .expect("add check");
+    running
+        .client
+        .batch_execute("ALTER TABLE drop_check_restart DROP CONSTRAINT qty_pos")
+        .await
+        .expect("drop check");
+    shutdown(running).await;
+
+    // After restart the dropped CHECK stays gone: a violating row lands.
+    let running =
+        start_persistent_server(data_dir.path(), "alter_drop_check_restart_test").await;
+    running
+        .client
+        .batch_execute("INSERT INTO drop_check_restart VALUES (1, -7)")
+        .await
+        .expect("dropped CHECK stays gone after restart");
+    let rows = running
+        .client
+        .query("SELECT qty FROM drop_check_restart", &[])
+        .await
+        .expect("select");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].get::<_, i32>(0), -7);
+    shutdown(running).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn alter_table_drop_unique_constraint_survives_restart() {
+    let data_dir = tempfile::TempDir::new().unwrap();
+
+    let running =
+        start_persistent_server(data_dir.path(), "alter_drop_unique_restart_test").await;
+    running
+        .client
+        .batch_execute("CREATE TABLE drop_unique_restart (id INT, code INT)")
+        .await
+        .expect("create");
+    running
+        .client
+        .batch_execute("ALTER TABLE drop_unique_restart ADD CONSTRAINT uq_code UNIQUE (code)")
+        .await
+        .expect("add unique");
+    running
+        .client
+        .batch_execute("ALTER TABLE drop_unique_restart DROP CONSTRAINT uq_code")
+        .await
+        .expect("drop unique");
+    shutdown(running).await;
+
+    // After restart the unique enforcement is gone: duplicates land.
+    let running =
+        start_persistent_server(data_dir.path(), "alter_drop_unique_restart_test").await;
+    running
+        .client
+        .batch_execute("INSERT INTO drop_unique_restart VALUES (1, 7), (2, 7)")
+        .await
+        .expect("dropped UNIQUE stays gone after restart");
+    let rows = running
+        .client
+        .query("SELECT code FROM drop_unique_restart", &[])
+        .await
+        .expect("select");
+    assert_eq!(rows.len(), 2);
+    shutdown(running).await;
+}

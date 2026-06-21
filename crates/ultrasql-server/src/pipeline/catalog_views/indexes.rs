@@ -206,6 +206,11 @@ pub(super) fn constraint_kind(row: &ultrasql_catalog::persistent::ConstraintRow)
         ultrasql_catalog::persistent::ConType::Unique => "u",
         ultrasql_catalog::persistent::ConType::Trigger => "t",
         ultrasql_catalog::persistent::ConType::Exclusion => "x",
+        // Drop tombstones are filtered out of the live `pg_constraint`
+        // map before any catalog view scans it, so this arm is
+        // unreachable in practice; map it to the empty string rather
+        // than surfacing a non-PostgreSQL `contype` if one ever leaks.
+        ultrasql_catalog::persistent::ConType::Dropped => "",
     }
 }
 

@@ -100,6 +100,12 @@ pub enum ServerError {
     #[error("{0}")]
     UndefinedObject(String),
 
+    /// A named non-relation object already exists — for example, an
+    /// `ALTER TABLE ADD CONSTRAINT` whose name is already taken on the
+    /// table. Maps to PostgreSQL SQLSTATE `42710` (`duplicate_object`).
+    #[error("{0}")]
+    DuplicateObject(String),
+
     /// A schema referenced by a qualified object name does not exist.
     /// Maps to PostgreSQL SQLSTATE `3F000` (`invalid_schema_name`).
     #[error("{0}")]
@@ -212,6 +218,7 @@ impl ServerError {
                 | Self::Ddl(_)
                 | Self::Catalog(_)
                 | Self::UndefinedObject(_)
+                | Self::DuplicateObject(_)
                 | Self::UndefinedSchema(_)
                 | Self::DependentObjectsStillExist(_)
                 | Self::TransactionAborted
@@ -246,6 +253,7 @@ impl ServerError {
             // NotFound that surfaces when DROP / ALTER fails to resolve a name
             Self::Plan(_) | Self::Catalog(ultrasql_catalog::CatalogError::NotFound(_)) => "42P01",
             Self::UndefinedObject(_) => "42704", // undefined_object
+            Self::DuplicateObject(_) => "42710", // duplicate_object
             Self::UndefinedSchema(_) => "3F000", // invalid_schema_name
             Self::Build(_) | Self::Unsupported(_) | Self::UnsupportedOwned(_) => "0A000", // feature_not_supported
             Self::UnsupportedProtocol { .. } => "08P01", // protocol_violation

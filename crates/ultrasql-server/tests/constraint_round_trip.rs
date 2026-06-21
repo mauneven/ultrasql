@@ -945,6 +945,269 @@ async fn alter_table_add_primary_key_constraint_enforces_unique() {
     graceful_shutdown(running).await;
 }
 
+/// Full `ADD CONSTRAINT ... CHECK` lifecycle: a violating INSERT is
+/// rejected with `23514`, a valid INSERT passes, and `DROP CONSTRAINT`
+/// lets the previously rejected value through.
+#[tokio::test]
+async fn alter_table_add_check_then_drop_constraint_lifecycle() {
+    let running = start_sample_server("constraint_alter_check_test").await;
+    let client = &running.client;
+
+    client
+        .batch_execute("CREATE TABLE alter_check (id INT, qty INT)")
+        .await
+        .expect("create");
+    client
+        .batch_execute("ALTER TABLE alter_check ADD CONSTRAINT qty_pos CHECK (qty > 0)")
+        .await
+        .expect("add check");
+
+    // A valid row is accepted.
+    client
+        .batch_execute("INSERT INTO alter_check VALUES (1, 5)")
+        .await
+        .expect("valid insert passes the check");
+
+    // A violating row is rejected with check_violation.
+    let err = client
+        .batch_execute("INSERT INTO alter_check VALUES (2, -1)")
+        .await
+        .expect_err("CHECK rejects qty <= 0");
+    assert_eq!(
+        err.code().expect("SQLSTATE").code(),
+        "23514",
+        "expected check_violation, got {err:?}"
+    );
+
+    // After dropping the constraint the previously rejected value lands.
+    client
+        .batch_execute("ALTER TABLE alter_check DROP CONSTRAINT qty_pos")
+        .await
+        .expect("drop check");
+    client
+        .batch_execute("INSERT INTO alter_check VALUES (2, -1)")
+        .await
+        .expect("dropping the CHECK lets the previously rejected row in");
+
+    let rows = client
+        .query("SELECT id FROM alter_check ORDER BY id", &[])
+        .await
+        .expect("select");
+    assert_eq!(rows.len(), 2);
+
+    graceful_shutdown(running).await;
+}
+
+/// `ADD CONSTRAINT ... CHECK` validates existing data: if any row
+/// already violates the predicate the statement is rejected with
+/// `23514` and the constraint is not created.
+#[tokio::test]
+async fn alter_table_add_check_rejects_existing_violating_row() {
+    let running = start_sample_server("constraint_alter_check_existing_test").await;
+    let client = &running.client;
+
+    client
+        .batch_execute("CREATE TABLE alter_check_existing (id INT, qty INT)")
+        .await
+        .expect("create");
+    client
+        .batch_execute("INSERT INTO alter_check_existing VALUES (1, 5), (2, -3)")
+        .await
+        .expect("seed with a violating row");
+
+    let err = client
+        .batch_execute("ALTER TABLE alter_check_existing ADD CONSTRAINT qty_pos CHECK (qty > 0)")
+        .await
+        .expect_err("ADD CHECK rejects pre-existing violation");
+    assert_eq!(
+        err.code().expect("SQLSTATE").code(),
+        "23514",
+        "expected check_violation at ADD time, got {err:?}"
+    );
+
+    // The constraint was not created, so a later violating INSERT still
+    // succeeds.
+    client
+        .batch_execute("INSERT INTO alter_check_existing VALUES (3, -9)")
+        .await
+        .expect("constraint was not installed");
+
+    graceful_shutdown(running).await;
+}
+
+/// `ADD CONSTRAINT ... UNIQUE` rejects a table that already contains a
+/// duplicate (`23505`); without a duplicate, a later duplicate INSERT is
+/// rejected.
+#[tokio::test]
+async fn alter_table_add_unique_constraint_existing_and_future_duplicates() {
+    let running = start_sample_server("constraint_alter_unique_test").await;
+    let client = &running.client;
+
+    // Existing duplicate blocks the ADD.
+    client
+        .batch_execute("CREATE TABLE alter_unique_dup (id INT, code INT)")
+        .await
+        .expect("create");
+    client
+        .batch_execute("INSERT INTO alter_unique_dup VALUES (1, 7), (2, 7)")
+        .await
+        .expect("seed duplicate");
+    let err = client
+        .batch_execute("ALTER TABLE alter_unique_dup ADD CONSTRAINT uq_code UNIQUE (code)")
+        .await
+        .expect_err("ADD UNIQUE rejects pre-existing duplicate");
+    assert_eq!(
+        err.code().expect("SQLSTATE").code(),
+        "23505",
+        "expected unique_violation at ADD time, got {err:?}"
+    );
+
+    // A clean table accepts the constraint and then rejects a future
+    // duplicate.
+    client
+        .batch_execute("CREATE TABLE alter_unique_ok (id INT, code INT)")
+        .await
+        .expect("create clean");
+    client
+        .batch_execute("INSERT INTO alter_unique_ok VALUES (1, 7)")
+        .await
+        .expect("seed clean");
+    client
+        .batch_execute("ALTER TABLE alter_unique_ok ADD CONSTRAINT uq_code UNIQUE (code)")
+        .await
+        .expect("add unique on clean data");
+    let dup_err = client
+        .batch_execute("INSERT INTO alter_unique_ok VALUES (2, 7)")
+        .await
+        .expect_err("UNIQUE rejects later duplicate");
+    assert_eq!(dup_err.code().expect("SQLSTATE").code(), "23505");
+
+    graceful_shutdown(running).await;
+}
+
+/// `DROP CONSTRAINT IF EXISTS` on a missing constraint is a no-op, while
+/// the bare form raises `42704`; a duplicate `ADD CONSTRAINT` name
+/// raises `42710`.
+#[tokio::test]
+async fn alter_table_drop_constraint_if_exists_and_duplicate_name() {
+    let running = start_sample_server("constraint_alter_drop_test").await;
+    let client = &running.client;
+
+    client
+        .batch_execute("CREATE TABLE alter_drop (id INT, qty INT)")
+        .await
+        .expect("create");
+
+    // IF EXISTS on a missing constraint is a no-op.
+    client
+        .batch_execute("ALTER TABLE alter_drop DROP CONSTRAINT IF EXISTS missing_con")
+        .await
+        .expect("DROP CONSTRAINT IF EXISTS is a no-op when absent");
+
+    // The bare form errors with undefined_object.
+    let err = client
+        .batch_execute("ALTER TABLE alter_drop DROP CONSTRAINT missing_con")
+        .await
+        .expect_err("DROP CONSTRAINT without IF EXISTS errors when absent");
+    assert_eq!(
+        err.code().expect("SQLSTATE").code(),
+        "42704",
+        "expected undefined_object, got {err:?}"
+    );
+
+    // Adding a constraint then re-adding the same name errors with
+    // duplicate_object.
+    client
+        .batch_execute("ALTER TABLE alter_drop ADD CONSTRAINT qty_pos CHECK (qty > 0)")
+        .await
+        .expect("add check");
+    let dup = client
+        .batch_execute("ALTER TABLE alter_drop ADD CONSTRAINT qty_pos CHECK (qty > 10)")
+        .await
+        .expect_err("duplicate constraint name is rejected");
+    assert_eq!(
+        dup.code().expect("SQLSTATE").code(),
+        "42710",
+        "expected duplicate_object, got {dup:?}"
+    );
+
+    graceful_shutdown(running).await;
+}
+
+/// Dropping an ALTER-added PRIMARY KEY constraint removes its backing
+/// unique index so duplicates are accepted again.
+#[tokio::test]
+async fn alter_table_drop_primary_key_constraint_removes_enforcement() {
+    let running = start_sample_server("constraint_drop_pk_test").await;
+    let client = &running.client;
+
+    client
+        .batch_execute("CREATE TABLE drop_pk (id INT NOT NULL, v INT)")
+        .await
+        .expect("create");
+    client
+        .batch_execute("ALTER TABLE drop_pk ADD CONSTRAINT drop_pk_pk PRIMARY KEY (id)")
+        .await
+        .expect("add pk");
+    client
+        .batch_execute("INSERT INTO drop_pk VALUES (1, 10)")
+        .await
+        .expect("insert");
+    let dup = client
+        .batch_execute("INSERT INTO drop_pk VALUES (1, 20)")
+        .await
+        .expect_err("PK rejects duplicate");
+    assert_eq!(dup.code().expect("SQLSTATE").code(), "23505");
+
+    client
+        .batch_execute("ALTER TABLE drop_pk DROP CONSTRAINT drop_pk_pk")
+        .await
+        .expect("drop pk");
+    client
+        .batch_execute("INSERT INTO drop_pk VALUES (1, 30)")
+        .await
+        .expect("after dropping PK the duplicate is accepted");
+
+    let rows = client
+        .query("SELECT v FROM drop_pk ORDER BY v", &[])
+        .await
+        .expect("select");
+    assert_eq!(rows.len(), 2);
+
+    graceful_shutdown(running).await;
+}
+
+/// `ADD CONSTRAINT ... FOREIGN KEY` is honestly deferred: it returns the
+/// documented feature-not-supported error rather than a cosmetic FK.
+#[tokio::test]
+async fn alter_table_add_foreign_key_constraint_is_not_supported() {
+    let running = start_sample_server("constraint_alter_fk_test").await;
+    let client = &running.client;
+
+    client
+        .batch_execute("CREATE TABLE fk_parent (id INT PRIMARY KEY)")
+        .await
+        .expect("create parent");
+    client
+        .batch_execute("CREATE TABLE fk_child (parent_id INT)")
+        .await
+        .expect("create child");
+
+    let err = client
+        .batch_execute(
+            "ALTER TABLE fk_child ADD CONSTRAINT fk_p FOREIGN KEY (parent_id) REFERENCES fk_parent (id)",
+        )
+        .await
+        .expect_err("ADD FOREIGN KEY is deferred");
+    assert_eq!(
+        err.code().expect("SQLSTATE").code(),
+        "0A000",
+        "expected feature_not_supported, got {err:?}"
+    );
+
+    graceful_shutdown(running).await;
+}
+
 /// Basic non-deferrable FOREIGN KEY enforcement: child writes must find
 /// a parent row, and parent key deletes/updates are restricted while a
 /// child references them.

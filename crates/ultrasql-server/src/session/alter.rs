@@ -112,6 +112,16 @@ where
             LogicalAlterTableAction::AddUniqueConstraint { constraint } => {
                 self.execute_alter_add_unique_constraint(table_name, constraint, snapshot)
             }
+            LogicalAlterTableAction::AddCheckConstraint { constraint } => {
+                self.execute_alter_add_check_constraint(table_name, constraint, snapshot)
+            }
+            LogicalAlterTableAction::DropConstraint {
+                name,
+                if_exists,
+                cascade,
+            } => self.execute_alter_drop_constraint(
+                table_name, name, *if_exists, *cascade, snapshot,
+            ),
         }
     }
 
@@ -126,6 +136,7 @@ where
                 table_name.to_owned(),
             ))
         })?;
+        self.reject_duplicate_constraint_name(table.oid, &constraint.name)?;
         if constraint.primary_key {
             for &column in &constraint.columns {
                 let field = table.schema.field(column).ok_or_else(|| {
@@ -158,7 +169,12 @@ where
             if_not_exists: false,
             schema: ultrasql_core::Schema::empty(),
         };
-        let _ = self.execute_create_index(&create_index, snapshot)?;
+        // Building the unique index scans every existing row; a
+        // pre-existing duplicate aborts the build. Surface that as a
+        // PostgreSQL-shaped 23505 naming the constraint rather than the
+        // generic DDL error the index builder raises.
+        self.execute_create_index(&create_index, snapshot)
+            .map_err(|e| map_index_build_duplicate(e, &constraint.name))?;
         let constraint_row = ultrasql_catalog::persistent::ConstraintRow {
             oid: self.state.persistent_catalog.next_oid(),
             conname: constraint.name.clone(),
@@ -205,6 +221,319 @@ where
         self.state
             .persistent_catalog
             .install_constraint_rows([constraint_row]);
+        self.plan_cache_invalidate();
+        Ok(run_ddl_command("ALTER TABLE"))
+    }
+
+    /// Reject an `ADD CONSTRAINT` whose name is already taken on the
+    /// table with SQLSTATE `42710` (`duplicate_object`), matching
+    /// PostgreSQL.
+    fn reject_duplicate_constraint_name(
+        &self,
+        table_oid: ultrasql_core::Oid,
+        constraint_name: &str,
+    ) -> Result<(), ServerError> {
+        if self
+            .state
+            .persistent_catalog
+            .lookup_constraint_by_name(table_oid, constraint_name)
+            .is_some()
+        {
+            return Err(ServerError::DuplicateObject(format!(
+                "constraint \"{constraint_name}\" for relation already exists"
+            )));
+        }
+        Ok(())
+    }
+
+    /// Execute `ALTER TABLE t ADD CONSTRAINT name CHECK (expr)`.
+    ///
+    /// 1. Reject a duplicate constraint name (`42710`).
+    /// 2. Take a per-statement MVCC snapshot and evaluate the bound
+    ///    predicate against every visible row; the first row that does
+    ///    not satisfy it aborts with `23514` (`check_violation`) naming
+    ///    the constraint, so the constraint is never added against data
+    ///    that already violates it.
+    /// 3. Persist the `pg_constraint` row, append the bound predicate to
+    ///    the table's runtime constraint side map, and flush the runtime
+    ///    metadata so the CHECK survives restart and is enforced by all
+    ///    subsequent DML.
+    fn execute_alter_add_check_constraint(
+        &self,
+        table_name: &str,
+        constraint: &ultrasql_planner::LogicalCheckConstraint,
+        snapshot: &CatalogSnapshot,
+    ) -> Result<SelectResult, ServerError> {
+        let table = snapshot.tables.get(table_name).ok_or_else(|| {
+            ServerError::Plan(ultrasql_planner::PlanError::TableNotFound(
+                table_name.to_owned(),
+            ))
+        })?;
+        self.reject_duplicate_constraint_name(table.oid, &constraint.name)?;
+
+        // Validate existing data: every visible row must satisfy the
+        // predicate before the constraint is allowed to exist.
+        let validate_txn = self.state.txn_manager.begin(IsolationLevel::ReadCommitted);
+        let validate_result = (|| -> Result<(), ServerError> {
+            let rel = RelationId(table.oid);
+            let block_count = self.state.heap.block_count(rel).max(table.n_blocks);
+            let codec = ultrasql_executor::RowCodec::new(table.schema.clone());
+            let evaluator = ultrasql_executor::Eval::new(constraint.expr.clone());
+            let scan = self.state.heap.scan_visible(
+                rel,
+                block_count,
+                &validate_txn.snapshot,
+                self.state.txn_manager.as_ref(),
+            );
+            for result in scan {
+                let tup = result.map_err(|e| {
+                    ServerError::ddl(format!("ALTER TABLE ADD CHECK scan: {e}"))
+                })?;
+                let row = codec.decode(&tup.data).map_err(|e| {
+                    ServerError::ddl(format!("ALTER TABLE ADD CHECK decode: {e}"))
+                })?;
+                match evaluator
+                    .eval(&row)
+                    .map_err(ultrasql_executor::eval_error_to_exec_error)
+                    .map_err(ServerError::Execute)?
+                {
+                    Value::Bool(true) | Value::Null => {}
+                    Value::Bool(false) => {
+                        return Err(ServerError::Execute(
+                            ultrasql_executor::ExecError::CheckViolation(constraint.name.clone()),
+                        ));
+                    }
+                    other => {
+                        return Err(ServerError::ddl(format!(
+                            "ALTER TABLE ADD CHECK '{}' evaluated to non-boolean {other:?}",
+                            constraint.name
+                        )));
+                    }
+                }
+            }
+            Ok(())
+        })();
+        if let Err(e) = validate_result {
+            return Err(self.rollback_transaction_after_error(
+                validate_txn,
+                e,
+                "ALTER TABLE ADD CHECK rollback after existing-row validation",
+            ));
+        }
+        // The validation scan only read rows; commit so the XID does not
+        // leak as in-progress.
+        self.state
+            .commit_transaction(validate_txn, true, "ALTER TABLE ADD CHECK validation")?;
+
+        // Stage the new runtime side-map entry and make sure it is
+        // serializable before any durable write.
+        let table_key = ultrasql_catalog::table_lookup_key(&table.schema_name, &table.name);
+        let previous = self
+            .state
+            .table_constraints
+            .get(&table.oid)
+            .map(|guard| guard.clone());
+        let mut runtime = previous
+            .as_ref()
+            .map(|existing| existing.as_ref().clone())
+            .unwrap_or_default();
+        runtime.checks.push(crate::RuntimeCheckConstraint {
+            name: constraint.name.clone(),
+            expr: constraint.expr.clone(),
+        });
+        self.state
+            .ensure_table_runtime_constraints_metadata_persistable(&table_key, &runtime)?;
+        self.state
+            .ensure_table_runtime_constraints_metadata_slots_persistable()?;
+
+        let constraint_row = ultrasql_catalog::persistent::ConstraintRow {
+            oid: self.state.persistent_catalog.next_oid(),
+            conname: constraint.name.clone(),
+            conrelid: table.oid,
+            contype: ultrasql_catalog::persistent::ConType::Check,
+            condeferrable: false,
+            condeferred: false,
+            conkey: Vec::new(),
+            confrelid: ultrasql_core::Oid::INVALID,
+            confkey: Vec::new(),
+        };
+        let ddl_txn = self.state.txn_manager.begin(IsolationLevel::ReadCommitted);
+        if let Err(e) = self.state.persistent_catalog.persist_constraint_row(
+            &constraint_row,
+            self.state.heap.as_ref(),
+            ddl_txn.xid,
+            ddl_txn.current_command,
+        ) {
+            return Err(self.rollback_catalog_transaction_after_error(
+                ddl_txn,
+                e.into(),
+                "ALTER TABLE ADD CHECK catalog rollback after persist error",
+            ));
+        }
+        self.state
+            .commit_transaction(ddl_txn, true, "ALTER TABLE ADD CHECK catalog transaction")?;
+
+        // Publish the catalog row and the runtime predicate, then flush
+        // runtime metadata so the CHECK is enforced after restart.
+        self.state
+            .persistent_catalog
+            .install_constraint_rows([constraint_row]);
+        self.state
+            .table_constraints
+            .insert(table.oid, Arc::new(runtime));
+        if let Err(e) = self.state.persist_table_runtime_constraints_metadata() {
+            // Roll the in-memory side map back to its prior state so a
+            // failed metadata flush does not leave an unpersisted CHECK.
+            match previous {
+                Some(previous) => {
+                    self.state.table_constraints.insert(table.oid, previous);
+                }
+                None => {
+                    self.state.table_constraints.remove(&table.oid);
+                }
+            }
+            return Err(e);
+        }
+        self.plan_cache_invalidate();
+        Ok(run_ddl_command("ALTER TABLE"))
+    }
+
+    /// Execute `ALTER TABLE t DROP CONSTRAINT [IF EXISTS] name`.
+    ///
+    /// Resolves the constraint by name on the table. A missing
+    /// constraint is a no-op under `IF EXISTS`, otherwise it raises
+    /// `42704` (`undefined_object`). On success the constraint is
+    /// removed from `pg_constraint` (with a durable tombstone so the
+    /// drop survives restart), its bound CHECK predicate is dropped from
+    /// the runtime side map, and any backing unique index is dropped so
+    /// enforcement stops on subsequent DML.
+    ///
+    /// `CASCADE` / `RESTRICT` are parsed and accepted; a constraint drop
+    /// here has no dependent objects beyond its own backing index (which
+    /// is always removed), so both behave identically.
+    fn execute_alter_drop_constraint(
+        &self,
+        table_name: &str,
+        constraint_name: &str,
+        if_exists: bool,
+        cascade: bool,
+        snapshot: &CatalogSnapshot,
+    ) -> Result<SelectResult, ServerError> {
+        let _ = cascade;
+        let table = snapshot.tables.get(table_name).ok_or_else(|| {
+            ServerError::Plan(ultrasql_planner::PlanError::TableNotFound(
+                table_name.to_owned(),
+            ))
+        })?;
+        let Some(row) = self
+            .state
+            .persistent_catalog
+            .lookup_constraint_by_name(table.oid, constraint_name)
+        else {
+            if if_exists {
+                return Ok(run_ddl_command("ALTER TABLE"));
+            }
+            return Err(ServerError::UndefinedObject(format!(
+                "constraint \"{constraint_name}\" of relation \"{}\" does not exist",
+                table.name
+            )));
+        };
+
+        // A PRIMARY KEY / UNIQUE / EXCLUSION constraint is backed by an
+        // index that uses the constraint name; it must be dropped in the
+        // same catalog transaction so unique enforcement stops. The
+        // backing index lives in the table's schema namespace under the
+        // constraint name.
+        let backing_index = matches!(
+            row.contype,
+            ultrasql_catalog::persistent::ConType::PrimaryKey
+                | ultrasql_catalog::persistent::ConType::Unique
+                | ultrasql_catalog::persistent::ConType::Exclusion
+        )
+        .then(|| {
+            self.state
+                .persistent_catalog
+                .lookup_index(&ultrasql_catalog::index_lookup_key(
+                    &table.schema_name,
+                    &row.conname,
+                ))
+        })
+        .flatten();
+
+        let ddl_txn = self.state.txn_manager.begin(IsolationLevel::ReadCommitted);
+        let persist_result = (|| -> Result<(), ServerError> {
+            self.state
+                .persistent_catalog
+                .persist_constraint_drop_tombstone(
+                    row.oid,
+                    table.oid,
+                    &row.conname,
+                    self.state.heap.as_ref(),
+                    ddl_txn.xid,
+                    ddl_txn.current_command,
+                )?;
+            if let Some(index) = &backing_index {
+                self.state.persistent_catalog.persist_index_drop_tombstone(
+                    index,
+                    self.state.heap.as_ref(),
+                    ddl_txn.xid,
+                    ddl_txn.current_command,
+                )?;
+            }
+            Ok(())
+        })();
+        if let Err(e) = persist_result {
+            return Err(self.rollback_catalog_transaction_after_error(
+                ddl_txn,
+                e,
+                "ALTER TABLE DROP CONSTRAINT catalog rollback after tombstone error",
+            ));
+        }
+        self.state.commit_transaction(
+            ddl_txn,
+            true,
+            "ALTER TABLE DROP CONSTRAINT catalog transaction",
+        )?;
+        self.state.persistent_catalog.remove_constraint(row.oid);
+        if let Some(index) = &backing_index {
+            self.state
+                .persistent_catalog
+                .clear_descriptions_for_object(index.oid);
+            self.state
+                .persistent_catalog
+                .drop_index(&ultrasql_catalog::index_lookup_key(
+                    &index.schema_name,
+                    &index.name,
+                ))?;
+        }
+
+        // Drop a bound CHECK predicate from the runtime side map and
+        // flush the change so enforcement stops after restart too.
+        if matches!(row.contype, ultrasql_catalog::persistent::ConType::Check) {
+            let previous = self
+                .state
+                .table_constraints
+                .get(&table.oid)
+                .map(|guard| guard.clone());
+            if let Some(previous) = previous {
+                let mut runtime = previous.as_ref().clone();
+                let before = runtime.checks.len();
+                let folded = constraint_name.to_ascii_lowercase();
+                runtime
+                    .checks
+                    .retain(|check| check.name.to_ascii_lowercase() != folded);
+                if runtime.checks.len() != before {
+                    self.state
+                        .table_constraints
+                        .insert(table.oid, Arc::new(runtime));
+                    if let Err(e) = self.state.persist_table_runtime_constraints_metadata() {
+                        self.state.table_constraints.insert(table.oid, previous);
+                        return Err(e);
+                    }
+                }
+            }
+        }
+
         self.plan_cache_invalidate();
         Ok(run_ddl_command("ALTER TABLE"))
     }
@@ -1443,6 +1772,20 @@ fn table_runtime_constraints_have_metadata(constraints: &crate::TableRuntimeCons
         || !constraints.foreign_keys.is_empty()
         || !constraints.exclusion_constraints.is_empty()
         || !constraints.indexes.is_empty()
+}
+
+/// Translate the generic DDL error the unique-index builder raises on a
+/// pre-existing duplicate into a PostgreSQL-shaped `UniqueViolation`
+/// (SQLSTATE `23505`) naming the constraint. Other errors pass through.
+fn map_index_build_duplicate(err: ServerError, constraint_name: &str) -> ServerError {
+    if let ServerError::Ddl(message) = &err
+        && (message.contains("duplicate key") || message.contains("DuplicateKey"))
+    {
+        return ServerError::Execute(ultrasql_executor::ExecError::UniqueViolation(
+            constraint_name.to_owned(),
+        ));
+    }
+    err
 }
 
 fn alter_constraint_attnums(columns: &[usize], name: &str) -> Result<Vec<i16>, ServerError> {
