@@ -387,6 +387,24 @@ pub enum LogicalAlterTableAction {
         /// Bound unique or primary-key constraint.
         constraint: LogicalUniqueConstraint,
     },
+    /// `ALTER TABLE t ADD CONSTRAINT name CHECK (expr)`.
+    AddCheckConstraint {
+        /// Bound check constraint validated against the table schema.
+        constraint: LogicalCheckConstraint,
+    },
+    /// `ALTER TABLE t DROP CONSTRAINT [IF EXISTS] name [CASCADE|RESTRICT]`.
+    DropConstraint {
+        /// Folded constraint name to remove.
+        name: String,
+        /// Whether a missing constraint is a no-op rather than an error.
+        if_exists: bool,
+        /// Whether `CASCADE` was requested. v0.9 treats constraint drops
+        /// as self-contained (no dependent objects beyond the backing
+        /// unique index, which is always dropped), so `CASCADE` and the
+        /// default `RESTRICT` behave identically; the flag is carried for
+        /// diagnostics and forward compatibility.
+        cascade: bool,
+    },
 }
 
 /// One action clause of an [`LogicalPlan::AlterView`](crate::plan::LogicalPlan::AlterView).

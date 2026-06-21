@@ -400,6 +400,24 @@ pub(super) fn fmt_alter_table(
                 ),
             );
         }
+        LogicalAlterTableAction::AddCheckConstraint { constraint } => {
+            let _ = fmt::write(
+                out,
+                format_args!(
+                    "AlterTable: {table_name} ADD CONSTRAINT {} CHECK\n",
+                    constraint.name
+                ),
+            );
+        }
+        LogicalAlterTableAction::DropConstraint {
+            name, if_exists, ..
+        } => {
+            let exists = if *if_exists { "IF EXISTS " } else { "" };
+            let _ = fmt::write(
+                out,
+                format_args!("AlterTable: {table_name} DROP CONSTRAINT {exists}{name}\n"),
+            );
+        }
     }
 }
 

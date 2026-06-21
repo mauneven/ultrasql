@@ -14,7 +14,7 @@ use super::shared::{
     named_or, resolve_column_nullability, unique_name,
 };
 use super::types::resolve_type_name_with_catalog;
-use crate::plan::{LogicalTableOption, LogicalUniqueConstraint};
+use crate::plan::{LogicalCheckConstraint, LogicalTableOption, LogicalUniqueConstraint};
 
 // ---------------------------------------------------------------------------
 // ALTER TABLE
@@ -23,10 +23,11 @@ use crate::plan::{LogicalTableOption, LogicalUniqueConstraint};
 /// Bind an `ALTER TABLE` statement.
 ///
 /// This wave supports `ADD COLUMN`, `DROP COLUMN`, renames, storage
-/// options, row security enablement, and PostgreSQL migration-tool
-/// `ADD CONSTRAINT ... PRIMARY KEY/UNIQUE`. Other constraint kinds
-/// are rejected with [`PlanError::NotSupported`] so the dispatcher
-/// contract stays honest.
+/// options, row security enablement, and the PostgreSQL migration-tool
+/// constraint lifecycle: `ADD CONSTRAINT ... PRIMARY KEY/UNIQUE/CHECK`
+/// and `DROP CONSTRAINT [IF EXISTS] ... [CASCADE|RESTRICT]`. `ADD
+/// CONSTRAINT ... FOREIGN KEY` and `EXCLUDE` are still rejected with
+/// [`PlanError::NotSupported`] so the dispatcher contract stays honest.
 ///
 /// For `ADD COLUMN` the binder resolves the column's data type and
 /// nullability, rejects unsupported constraints before they can be
@@ -137,20 +138,46 @@ pub(in crate::binder) fn bind_alter_table(
                 .collect::<Result<Vec<_>, PlanError>>()?;
             LogicalAlterTableAction::SetOptions { options }
         }
-        AlterTableAction::AddConstraint { constraint, .. } => {
-            LogicalAlterTableAction::AddUniqueConstraint {
-                constraint: bind_alter_add_unique_constraint(
+        AlterTableAction::AddConstraint { constraint, .. } => match constraint {
+            TableConstraint::PrimaryKey { .. } | TableConstraint::Unique { .. } => {
+                LogicalAlterTableAction::AddUniqueConstraint {
+                    constraint: bind_alter_add_unique_constraint(
+                        &raw_table_name,
+                        table_schema,
+                        constraint,
+                    )?,
+                }
+            }
+            TableConstraint::Check { .. } => LogicalAlterTableAction::AddCheckConstraint {
+                constraint: bind_alter_add_check_constraint(
                     &raw_table_name,
                     table_schema,
                     constraint,
+                    catalog,
                 )?,
+            },
+            TableConstraint::ForeignKey { .. } => {
+                return Err(PlanError::NotSupported(
+                    "ALTER TABLE: ADD CONSTRAINT FOREIGN KEY is not yet supported; \
+                     declare the foreign key in CREATE TABLE instead",
+                ));
             }
-        }
-        AlterTableAction::DropConstraint { .. } => {
-            return Err(PlanError::NotSupported(
-                "ALTER TABLE: DROP CONSTRAINT not yet supported",
-            ));
-        }
+            TableConstraint::Exclude { .. } => {
+                return Err(PlanError::NotSupported(
+                    "ALTER TABLE: ADD CONSTRAINT supports PRIMARY KEY, UNIQUE, and CHECK",
+                ));
+            }
+        },
+        AlterTableAction::DropConstraint {
+            name,
+            if_exists,
+            cascade,
+            ..
+        } => LogicalAlterTableAction::DropConstraint {
+            name: name.value.to_ascii_lowercase(),
+            if_exists: *if_exists,
+            cascade: *cascade,
+        },
     };
 
     Ok(LogicalPlan::AlterTable {
@@ -220,8 +247,10 @@ fn bind_alter_add_unique_constraint(
         TableConstraint::Check { .. }
         | TableConstraint::ForeignKey { .. }
         | TableConstraint::Exclude { .. } => {
+            // The dispatcher in `bind_alter_table` routes these elsewhere;
+            // reaching this arm would be a logic error.
             return Err(PlanError::NotSupported(
-                "ALTER TABLE: ADD CONSTRAINT supports only PRIMARY KEY and UNIQUE",
+                "ALTER TABLE: ADD CONSTRAINT supports only PRIMARY KEY and UNIQUE here",
             ));
         }
     };
@@ -247,6 +276,33 @@ fn bind_alter_add_unique_constraint(
         name,
         columns,
         primary_key,
+    })
+}
+
+fn bind_alter_add_check_constraint(
+    table_name: &str,
+    table_schema: &Schema,
+    constraint: &TableConstraint,
+    catalog: &dyn Catalog,
+) -> Result<LogicalCheckConstraint, PlanError> {
+    let TableConstraint::Check { name, expr, .. } = constraint else {
+        return Err(PlanError::NotSupported(
+            "ALTER TABLE: ADD CONSTRAINT CHECK binder reached with non-CHECK constraint",
+        ));
+    };
+    // PostgreSQL names an unnamed table-level CHECK `<table>_check`.
+    let constraint_name = named_or(name.as_ref(), || format!("{table_name}_check"));
+    let mut scope = ScopeStack::new();
+    let bound = bind_expr(expr, table_schema, catalog, &mut scope)?;
+    let ty = bound.data_type();
+    if ty != DataType::Bool && ty != DataType::Null {
+        return Err(PlanError::TypeMismatch(format!(
+            "CHECK constraint '{constraint_name}' has type {ty:?}, expected Bool",
+        )));
+    }
+    Ok(LogicalCheckConstraint {
+        name: constraint_name,
+        expr: bound,
     })
 }
 

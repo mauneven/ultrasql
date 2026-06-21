@@ -486,6 +486,100 @@ fn binds_alter_table_rename_to_new_name() {
 }
 
 #[test]
+fn binds_alter_table_add_check_constraint() {
+    let cat = users_catalog();
+    let plan = parse_and_bind(
+        "ALTER TABLE users ADD CONSTRAINT score_positive CHECK (score > 0)",
+        &cat,
+    )
+    .unwrap();
+    let LogicalPlan::AlterTable { action, .. } = plan else {
+        panic!("expected AlterTable plan");
+    };
+    let LogicalAlterTableAction::AddCheckConstraint { constraint } = action else {
+        panic!("expected AddCheckConstraint action");
+    };
+    assert_eq!(constraint.name, "score_positive");
+    // The bound predicate must resolve `score` to its column index.
+    assert!(
+        matches!(constraint.expr.data_type(), DataType::Bool | DataType::Null),
+        "CHECK predicate must be boolean, got {:?}",
+        constraint.expr.data_type()
+    );
+}
+
+#[test]
+fn binds_alter_table_add_unnamed_check_uses_pg_default_name() {
+    let cat = users_catalog();
+    let plan = parse_and_bind("ALTER TABLE users ADD CONSTRAINT score_chk CHECK (score >= 0)", &cat)
+        .unwrap();
+    let LogicalPlan::AlterTable { action, .. } = plan else {
+        panic!("expected AlterTable plan");
+    };
+    let LogicalAlterTableAction::AddCheckConstraint { constraint } = action else {
+        panic!("expected AddCheckConstraint action");
+    };
+    assert_eq!(constraint.name, "score_chk");
+}
+
+#[test]
+fn alter_table_add_check_rejects_non_boolean() {
+    let cat = users_catalog();
+    let err = parse_and_bind("ALTER TABLE users ADD CONSTRAINT bad CHECK (id + 1)", &cat)
+        .unwrap_err();
+    assert!(matches!(err, PlanError::TypeMismatch(_)), "got {err:?}");
+}
+
+#[test]
+fn alter_table_add_check_rejects_unknown_column() {
+    let cat = users_catalog();
+    let err = parse_and_bind(
+        "ALTER TABLE users ADD CONSTRAINT bad CHECK (missing_col > 0)",
+        &cat,
+    )
+    .unwrap_err();
+    assert!(matches!(err, PlanError::ColumnNotFound(_)), "got {err:?}");
+}
+
+#[test]
+fn binds_alter_table_drop_constraint() {
+    let cat = users_catalog();
+    let plan = parse_and_bind(
+        "ALTER TABLE users DROP CONSTRAINT IF EXISTS some_con CASCADE",
+        &cat,
+    )
+    .unwrap();
+    let LogicalPlan::AlterTable { action, .. } = plan else {
+        panic!("expected AlterTable plan");
+    };
+    let LogicalAlterTableAction::DropConstraint {
+        name,
+        if_exists,
+        cascade,
+    } = action
+    else {
+        panic!("expected DropConstraint action");
+    };
+    assert_eq!(name, "some_con");
+    assert!(if_exists);
+    assert!(cascade);
+}
+
+#[test]
+fn alter_table_add_foreign_key_constraint_is_rejected() {
+    let cat = users_catalog();
+    let err = parse_and_bind(
+        "ALTER TABLE users ADD CONSTRAINT fk FOREIGN KEY (id) REFERENCES other (id)",
+        &cat,
+    )
+    .unwrap_err();
+    assert!(
+        matches!(err, PlanError::NotSupported(_) | PlanError::NotSupportedOwned(_)),
+        "ADD FOREIGN KEY must be honestly deferred, got {err:?}"
+    );
+}
+
+#[test]
 fn binds_alter_view_rename_and_set_schema() {
     let mut cat = users_catalog();
     cat.register(
