@@ -354,7 +354,8 @@ fn validate_frame(
             "frame starting from following row cannot have preceding rows".to_string(),
         ));
     }
-    if matches!(start, BoundFrameBound::CurrentRow) && matches!(end, BoundFrameBound::Preceding(_)) {
+    if matches!(start, BoundFrameBound::CurrentRow) && matches!(end, BoundFrameBound::Preceding(_))
+    {
         return Err(PlanError::InvalidWindowFrame(
             "frame starting from current row cannot have preceding rows".to_string(),
         ));

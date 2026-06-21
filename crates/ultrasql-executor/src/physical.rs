@@ -403,9 +403,7 @@ pub fn build_operator(
 ///
 /// [`LogicalWindowFunc`]: ultrasql_planner::LogicalWindowFunc
 /// [`WindowFunc`]: crate::WindowFunc
-fn lower_window_func_physical(
-    func: &ultrasql_planner::LogicalWindowFunc,
-) -> crate::WindowFunc {
+fn lower_window_func_physical(func: &ultrasql_planner::LogicalWindowFunc) -> crate::WindowFunc {
     use ultrasql_planner::LogicalWindowFunc;
     match func {
         LogicalWindowFunc::RowNumber => crate::WindowFunc::RowNumber,
@@ -447,9 +445,7 @@ fn lower_window_func_physical(
 /// Map a planner [`WindowAggKind`] to the executor kind.
 ///
 /// [`WindowAggKind`]: ultrasql_planner::WindowAggKind
-fn lower_window_agg_kind(
-    kind: ultrasql_planner::WindowAggKind,
-) -> crate::WindowAggKind {
+fn lower_window_agg_kind(kind: ultrasql_planner::WindowAggKind) -> crate::WindowAggKind {
     use ultrasql_planner::WindowAggKind;
     match kind {
         WindowAggKind::Sum => crate::WindowAggKind::Sum,
@@ -464,9 +460,7 @@ fn lower_window_agg_kind(
 ///
 /// [`LogicalWindowFrame`]: ultrasql_planner::LogicalWindowFrame
 /// [`FrameSpec`]: crate::FrameSpec
-fn lower_window_frame_physical(
-    frame: &ultrasql_planner::LogicalWindowFrame,
-) -> crate::FrameSpec {
+fn lower_window_frame_physical(frame: &ultrasql_planner::LogicalWindowFrame) -> crate::FrameSpec {
     use ultrasql_planner::{BoundFrameBound, BoundFrameExclusion, BoundFrameUnits};
     let units = match frame.units {
         BoundFrameUnits::Rows => crate::FrameUnits::Rows,

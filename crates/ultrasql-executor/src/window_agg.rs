@@ -723,11 +723,9 @@ impl WindowAgg {
                         .as_ref()
                         .ok_or(ExecError::Internal("window frame context missing"))?;
                     (0..n)
-                        .map(|pos| {
-                            match ctx.first_included(pos) {
-                                Some(idx) => eval_window_expr(&interp, &all_rows[idx]),
-                                None => Ok(Value::Null),
-                            }
+                        .map(|pos| match ctx.first_included(pos) {
+                            Some(idx) => eval_window_expr(&interp, &all_rows[idx]),
+                            None => Ok(Value::Null),
                         })
                         .collect()
                 }
@@ -737,11 +735,9 @@ impl WindowAgg {
                         .as_ref()
                         .ok_or(ExecError::Internal("window frame context missing"))?;
                     (0..n)
-                        .map(|pos| {
-                            match ctx.last_included(pos) {
-                                Some(idx) => eval_window_expr(&interp, &all_rows[idx]),
-                                None => Ok(Value::Null),
-                            }
+                        .map(|pos| match ctx.last_included(pos) {
+                            Some(idx) => eval_window_expr(&interp, &all_rows[idx]),
+                            None => Ok(Value::Null),
                         })
                         .collect()
                 }
@@ -752,11 +748,9 @@ impl WindowAgg {
                         .as_ref()
                         .ok_or(ExecError::Internal("window frame context missing"))?;
                     (0..n)
-                        .map(|pos| {
-                            match ctx.nth_included(pos, nth) {
-                                Some(idx) => eval_window_expr(&interp, &all_rows[idx]),
-                                None => Ok(Value::Null),
-                            }
+                        .map(|pos| match ctx.nth_included(pos, nth) {
+                            Some(idx) => eval_window_expr(&interp, &all_rows[idx]),
+                            None => Ok(Value::Null),
                         })
                         .collect()
                 }
@@ -895,7 +889,11 @@ impl<'a> FrameContext<'a> {
         let asc = order_directions.first().is_none_or(|d| d.0);
         let range_vals: Vec<Option<f64>> = if range_offset {
             (0..n)
-                .map(|pos| row_order_key(sorted_indices[pos]).first().and_then(value_to_f64))
+                .map(|pos| {
+                    row_order_key(sorted_indices[pos])
+                        .first()
+                        .and_then(value_to_f64)
+                })
                 .collect()
         } else {
             Vec::new()
@@ -1047,7 +1045,8 @@ fn value_to_f64(v: &Value) -> Option<f64> {
 /// Convert `i64` to `f64` without a lossy-cast lint trip.
 fn i64_to_f64(v: i64) -> f64 {
     use num_traits::ToPrimitive;
-    v.to_f64().unwrap_or(if v < 0 { f64::MIN } else { f64::MAX })
+    v.to_f64()
+        .unwrap_or(if v < 0 { f64::MIN } else { f64::MAX })
 }
 
 /// Evaluate a constant-per-partition frame offset expression and validate
@@ -1104,7 +1103,9 @@ fn eval_range_offset(
         ));
     }
     let magnitude = value_to_f64(&value).ok_or_else(|| {
-        ExecError::WindowFrameError("invalid preceding or following size in window function".to_string())
+        ExecError::WindowFrameError(
+            "invalid preceding or following size in window function".to_string(),
+        )
     })?;
     if magnitude < 0.0 {
         return Err(ExecError::WindowFrameError(
@@ -1175,15 +1176,7 @@ fn resolve_frame_pos(
                 }
                 FrameUnits::Groups => {
                     let off = rows_off.unwrap_or(0);
-                    resolve_groups_offset(
-                        pos,
-                        n,
-                        side,
-                        following,
-                        off,
-                        group_of,
-                        group_bounds,
-                    )
+                    resolve_groups_offset(pos, n, side, following, off, group_of, group_bounds)
                 }
                 FrameUnits::Range => {
                     let off = range_off.unwrap_or(0.0);
@@ -1243,7 +1236,11 @@ fn resolve_groups_offset(
         let (gs, ge) = group_bounds[target];
         match side {
             BoundSide::Start => {
-                if underflow { 0 } else { gs }
+                if underflow {
+                    0
+                } else {
+                    gs
+                }
             }
             BoundSide::End => ge,
         }
@@ -2551,10 +2548,7 @@ mod tests {
         )
         .with_order_directions(vec![(true, false)])
         .with_frame(default_running_frame());
-        assert_eq!(
-            drain_window_values(&mut op),
-            i64s(&[30, 30, 100, 100, 150])
-        );
+        assert_eq!(drain_window_values(&mut op), i64s(&[30, 30, 100, 100, 150]));
     }
 
     /// Case 5 contrast: the SAME data under `ROWS UNBOUNDED PRECEDING AND
@@ -2583,10 +2577,7 @@ mod tests {
             FrameBound::CurrentRow,
             FrameExclusion::NoOthers,
         ));
-        assert_eq!(
-            drain_window_values(&mut op),
-            i64s(&[10, 30, 60, 100, 150])
-        );
+        assert_eq!(drain_window_values(&mut op), i64s(&[10, 30, 60, 100, 150]));
     }
 
     /// Case 6 (RANGE numeric offset): `RANGE BETWEEN 10 PRECEDING AND 10

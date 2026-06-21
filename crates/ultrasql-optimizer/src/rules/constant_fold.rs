@@ -188,15 +188,7 @@ fn fold_window_func(
         ),
         LogicalWindowFunc::Aggregate { kind, expr } => fold_expr(expr).map_or_else(
             || (func.clone(), false),
-            |expr| {
-                (
-                    LogicalWindowFunc::Aggregate {
-                        kind: *kind,
-                        expr,
-                    },
-                    true,
-                )
-            },
+            |expr| (LogicalWindowFunc::Aggregate { kind: *kind, expr }, true),
         ),
         LogicalWindowFunc::RowNumber
         | LogicalWindowFunc::Rank

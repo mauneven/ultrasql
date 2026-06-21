@@ -349,11 +349,15 @@ async fn aggregate_window_running_total_and_whole_partition() {
 async fn aggregate_window_range_vs_rows_peers() {
     let (client, _conn, server_handle) = start_server_and_connect().await;
     client
-        .batch_execute("CREATE TABLE s5 (id INTEGER NOT NULL, g INTEGER NOT NULL, v INTEGER NOT NULL)")
+        .batch_execute(
+            "CREATE TABLE s5 (id INTEGER NOT NULL, g INTEGER NOT NULL, v INTEGER NOT NULL)",
+        )
         .await
         .expect("create s5");
     client
-        .batch_execute("INSERT INTO s5 (id,g,v) VALUES (1,1,10),(2,1,20),(3,2,30),(4,2,40),(5,3,50)")
+        .batch_execute(
+            "INSERT INTO s5 (id,g,v) VALUES (1,1,10),(2,1,20),(3,2,30),(4,2,40),(5,3,50)",
+        )
         .await
         .expect("insert s5");
 

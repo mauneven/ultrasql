@@ -499,8 +499,7 @@ fn frame_range_unbounded_both_sides() {
 #[test]
 fn frame_groups_current_row_to_following() {
     use crate::ast::{FrameBound, FrameUnits};
-    let expr =
-        parse_expr("sum(v) OVER (ORDER BY g GROUPS BETWEEN CURRENT ROW AND 1 FOLLOWING)");
+    let expr = parse_expr("sum(v) OVER (ORDER BY g GROUPS BETWEEN CURRENT ROW AND 1 FOLLOWING)");
     let Expr::Call { over, .. } = expr else {
         panic!()
     };
