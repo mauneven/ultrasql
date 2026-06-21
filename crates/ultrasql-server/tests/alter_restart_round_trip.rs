@@ -159,8 +159,7 @@ async fn alter_table_add_check_constraint_survives_restart() {
 async fn alter_table_drop_check_constraint_survives_restart() {
     let data_dir = tempfile::TempDir::new().unwrap();
 
-    let running =
-        start_persistent_server(data_dir.path(), "alter_drop_check_restart_test").await;
+    let running = start_persistent_server(data_dir.path(), "alter_drop_check_restart_test").await;
     running
         .client
         .batch_execute("CREATE TABLE drop_check_restart (id INT, qty INT)")
@@ -179,8 +178,7 @@ async fn alter_table_drop_check_constraint_survives_restart() {
     shutdown(running).await;
 
     // After restart the dropped CHECK stays gone: a violating row lands.
-    let running =
-        start_persistent_server(data_dir.path(), "alter_drop_check_restart_test").await;
+    let running = start_persistent_server(data_dir.path(), "alter_drop_check_restart_test").await;
     running
         .client
         .batch_execute("INSERT INTO drop_check_restart VALUES (1, -7)")
@@ -200,8 +198,7 @@ async fn alter_table_drop_check_constraint_survives_restart() {
 async fn alter_table_drop_unique_constraint_survives_restart() {
     let data_dir = tempfile::TempDir::new().unwrap();
 
-    let running =
-        start_persistent_server(data_dir.path(), "alter_drop_unique_restart_test").await;
+    let running = start_persistent_server(data_dir.path(), "alter_drop_unique_restart_test").await;
     running
         .client
         .batch_execute("CREATE TABLE drop_unique_restart (id INT, code INT)")
@@ -220,8 +217,7 @@ async fn alter_table_drop_unique_constraint_survives_restart() {
     shutdown(running).await;
 
     // After restart the unique enforcement is gone: duplicates land.
-    let running =
-        start_persistent_server(data_dir.path(), "alter_drop_unique_restart_test").await;
+    let running = start_persistent_server(data_dir.path(), "alter_drop_unique_restart_test").await;
     running
         .client
         .batch_execute("INSERT INTO drop_unique_restart VALUES (1, 7), (2, 7)")

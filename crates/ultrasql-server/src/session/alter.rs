@@ -119,9 +119,9 @@ where
                 name,
                 if_exists,
                 cascade,
-            } => self.execute_alter_drop_constraint(
-                table_name, name, *if_exists, *cascade, snapshot,
-            ),
+            } => {
+                self.execute_alter_drop_constraint(table_name, name, *if_exists, *cascade, snapshot)
+            }
         }
     }
 
@@ -286,12 +286,11 @@ where
                 self.state.txn_manager.as_ref(),
             );
             for result in scan {
-                let tup = result.map_err(|e| {
-                    ServerError::ddl(format!("ALTER TABLE ADD CHECK scan: {e}"))
-                })?;
-                let row = codec.decode(&tup.data).map_err(|e| {
-                    ServerError::ddl(format!("ALTER TABLE ADD CHECK decode: {e}"))
-                })?;
+                let tup = result
+                    .map_err(|e| ServerError::ddl(format!("ALTER TABLE ADD CHECK scan: {e}")))?;
+                let row = codec
+                    .decode(&tup.data)
+                    .map_err(|e| ServerError::ddl(format!("ALTER TABLE ADD CHECK decode: {e}")))?;
                 match evaluator
                     .eval(&row)
                     .map_err(ultrasql_executor::eval_error_to_exec_error)
@@ -370,8 +369,11 @@ where
                 "ALTER TABLE ADD CHECK catalog rollback after persist error",
             ));
         }
-        self.state
-            .commit_transaction(ddl_txn, true, "ALTER TABLE ADD CHECK catalog transaction")?;
+        self.state.commit_transaction(
+            ddl_txn,
+            true,
+            "ALTER TABLE ADD CHECK catalog transaction",
+        )?;
 
         // Publish the catalog row and the runtime predicate, then flush
         // runtime metadata so the CHECK is enforced after restart.

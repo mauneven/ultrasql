@@ -511,8 +511,11 @@ fn binds_alter_table_add_check_constraint() {
 #[test]
 fn binds_alter_table_add_unnamed_check_uses_pg_default_name() {
     let cat = users_catalog();
-    let plan = parse_and_bind("ALTER TABLE users ADD CONSTRAINT score_chk CHECK (score >= 0)", &cat)
-        .unwrap();
+    let plan = parse_and_bind(
+        "ALTER TABLE users ADD CONSTRAINT score_chk CHECK (score >= 0)",
+        &cat,
+    )
+    .unwrap();
     let LogicalPlan::AlterTable { action, .. } = plan else {
         panic!("expected AlterTable plan");
     };
@@ -525,8 +528,8 @@ fn binds_alter_table_add_unnamed_check_uses_pg_default_name() {
 #[test]
 fn alter_table_add_check_rejects_non_boolean() {
     let cat = users_catalog();
-    let err = parse_and_bind("ALTER TABLE users ADD CONSTRAINT bad CHECK (id + 1)", &cat)
-        .unwrap_err();
+    let err =
+        parse_and_bind("ALTER TABLE users ADD CONSTRAINT bad CHECK (id + 1)", &cat).unwrap_err();
     assert!(matches!(err, PlanError::TypeMismatch(_)), "got {err:?}");
 }
 
@@ -574,7 +577,10 @@ fn alter_table_add_foreign_key_constraint_is_rejected() {
     )
     .unwrap_err();
     assert!(
-        matches!(err, PlanError::NotSupported(_) | PlanError::NotSupportedOwned(_)),
+        matches!(
+            err,
+            PlanError::NotSupported(_) | PlanError::NotSupportedOwned(_)
+        ),
         "ADD FOREIGN KEY must be honestly deferred, got {err:?}"
     );
 }
