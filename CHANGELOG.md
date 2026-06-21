@@ -15,6 +15,14 @@ and must document the break here.
   JSONB operators, range/geometric types, vector types, HNSW/IVFFlat indexes,
   RAG helper functions, external scans, and lakehouse-oriented CSV/Parquet
   surfaces.
+- `ALTER TABLE ... ADD CONSTRAINT ... CHECK` and
+  `ALTER TABLE ... DROP CONSTRAINT [IF EXISTS] ... [CASCADE|RESTRICT]` so
+  migration tools (Flyway, Liquibase, Rails, Django, Alembic, Prisma) can
+  evolve constraints. `ADD CHECK` and `ADD UNIQUE`/`PRIMARY KEY` validate
+  existing rows before the constraint is installed (`23514` / `23505`), the
+  change persists across restart, and `DROP CONSTRAINT` removes the backing
+  unique index. `ADD CONSTRAINT ... FOREIGN KEY` via `ALTER TABLE` is not yet
+  supported and returns `0A000`; declare foreign keys in `CREATE TABLE`.
 - Exact vector top-k fallback now uses bounded `TopK` instead of physical
   Sort and exposes exact kernel/fallback state in `EXPLAIN ANALYZE`.
 - Same-host AI/vector certification runner now requires measured UltraSQL and

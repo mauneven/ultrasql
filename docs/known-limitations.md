@@ -50,6 +50,16 @@ completed evidence.
   restart metadata. Updatable views, `WITH CHECK OPTION`, dependency-safe
   `CREATE OR REPLACE VIEW`, materialized-view refresh/index parity, and general
   `RANGE`/`LIST`/`HASH` partitioning remain roadmap items.
+- `ALTER TABLE ... ADD CONSTRAINT` covers `PRIMARY KEY`, `UNIQUE`, and `CHECK`
+  (each validated against existing rows at `ADD` time and enforced on later
+  DML), and `DROP CONSTRAINT [IF EXISTS] ... [CASCADE|RESTRICT]` removes any of
+  them along with the backing unique index. `ADD CONSTRAINT ... FOREIGN KEY`
+  and `ADD CONSTRAINT ... EXCLUDE` are not yet supported by `ALTER TABLE` and
+  return `0A000` (`feature_not_supported`); declare foreign keys and exclusion
+  constraints in `CREATE TABLE` instead, where they are fully enforced. The
+  parsed `CASCADE` / `RESTRICT` qualifier on `DROP CONSTRAINT` is accepted but
+  treated identically, since a dropped constraint has no dependent objects
+  beyond its own backing index, which is always removed.
 
 ## Security and administration
 
