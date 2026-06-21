@@ -157,6 +157,14 @@ pub enum ConType {
     Trigger,
     /// Exclusion (`'x'`).
     Exclusion,
+    /// Tombstone for a dropped constraint (`'D'`).
+    ///
+    /// The `pg_constraint` heap is append-only, so `ALTER TABLE
+    /// DROP CONSTRAINT` persists a row reusing the original constraint
+    /// OID with this type. Bootstrap keeps the latest row per OID and
+    /// skips tombstones, suppressing the dropped constraint after
+    /// restart. Not a real PostgreSQL `contype`.
+    Dropped,
 }
 
 /// A row in `pg_constraint`.

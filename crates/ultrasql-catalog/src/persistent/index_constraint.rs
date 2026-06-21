@@ -202,6 +202,66 @@ impl PersistentCatalog {
         }
     }
 
+    /// Look up a live constraint on one table by its (case-folded) name.
+    ///
+    /// Used by `ALTER TABLE DROP CONSTRAINT` to resolve a name to the
+    /// row that must be removed, and by `ADD CONSTRAINT` to reject a
+    /// duplicate name (SQLSTATE `42710`).
+    #[must_use]
+    pub fn lookup_constraint_by_name(
+        &self,
+        table_oid: Oid,
+        constraint_name: &str,
+    ) -> Option<ConstraintRow> {
+        let key = fold_name(constraint_name);
+        self.pg_constraint
+            .iter()
+            .find(|row| {
+                let row = row.value();
+                row.conrelid == table_oid && fold_name(&row.conname) == key
+            })
+            .map(|row| row.value().clone())
+    }
+
+    /// Remove one live `pg_constraint` row by OID from the side map and
+    /// rebuild the wait-free snapshot.
+    ///
+    /// Durability is the caller's responsibility: pair this with
+    /// [`Self::persist_constraint_drop_tombstone`] inside the catalog
+    /// transaction so a restart does not resurrect the constraint.
+    pub fn remove_constraint(&self, constraint_oid: Oid) {
+        self.pg_constraint.remove(&constraint_oid);
+        self.rebuild_snapshot();
+    }
+
+    /// Append a durable tombstone for a dropped constraint.
+    ///
+    /// Reuses the constraint's original OID with [`ConType::Dropped`].
+    /// Bootstrap keeps the latest `pg_constraint` row per OID and skips
+    /// tombstones, so the dropped constraint stays gone after restart.
+    pub fn persist_constraint_drop_tombstone<L: PageLoader>(
+        &self,
+        constraint_oid: Oid,
+        table_oid: Oid,
+        constraint_name: &str,
+        heap: &HeapAccess<L>,
+        xmin: ultrasql_core::Xid,
+        command_id: ultrasql_core::CommandId,
+    ) -> Result<(), CatalogError> {
+        let tombstone = ConstraintRow {
+            oid: constraint_oid,
+            conname: constraint_name.to_owned(),
+            conrelid: table_oid,
+            contype: ConType::Dropped,
+            condeferrable: false,
+            condeferred: false,
+            conkey: Vec::new(),
+            confrelid: Oid::INVALID,
+            confkey: Vec::new(),
+        };
+        self.persist_constraint_row(&tombstone, heap, xmin, command_id)
+    }
+
     /// Return a constraint that depends on an index name for one table.
     ///
     /// Constraint-created indexes use the constraint name as the index name in

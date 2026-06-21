@@ -1050,6 +1050,7 @@ fn encode_con_type(contype: ConType) -> u8 {
         ConType::Unique => b'u',
         ConType::Trigger => b't',
         ConType::Exclusion => b'x',
+        ConType::Dropped => b'D',
     }
 }
 
@@ -1061,6 +1062,7 @@ fn decode_con_type(tag: u8, offset: usize) -> Result<ConType, DecodeError> {
         b'u' => Ok(ConType::Unique),
         b't' => Ok(ConType::Trigger),
         b'x' => Ok(ConType::Exclusion),
+        b'D' => Ok(ConType::Dropped),
         _ => Err(DecodeError::InvalidTag { tag, offset }),
     }
 }

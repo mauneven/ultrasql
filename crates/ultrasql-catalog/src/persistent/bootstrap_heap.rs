@@ -231,6 +231,10 @@ impl PersistentCatalog {
         }
 
         let constraint_blocks = heap.block_count(pg_constraint_rel);
+        // The pg_constraint heap is append-only. Keep the latest row per
+        // OID (heap scan order is append order) so an ALTER TABLE
+        // DROP CONSTRAINT tombstone overrides the original row; then
+        // drop any OID whose latest row is a `Dropped` tombstone.
         let mut constraint_rows: std::collections::HashMap<Oid, ConstraintRow> =
             std::collections::HashMap::new();
         let mut total_constraint_rows: u32 = 0;
@@ -247,6 +251,7 @@ impl PersistentCatalog {
                 total_constraint_rows = total_constraint_rows.saturating_add(1);
             }
         }
+        constraint_rows.retain(|_, row| !matches!(row.contype, ConType::Dropped));
 
         let sequence_blocks = heap.block_count(pg_sequence_rel);
         let mut sequence_rows: std::collections::HashMap<Oid, SequenceRow> =
