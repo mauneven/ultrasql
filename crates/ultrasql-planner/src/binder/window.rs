@@ -209,7 +209,7 @@ pub(super) fn apply_window_extractions(
             LogicalWindowFrame::whole_partition()
         } else {
             resolve_window_frame(
-                ex.spec.frame.as_ref(),
+                ex.spec.frame.as_deref(),
                 &order_by,
                 plan.schema(),
                 catalog,

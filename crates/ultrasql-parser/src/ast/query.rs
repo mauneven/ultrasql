@@ -435,7 +435,11 @@ pub struct WindowSpec {
     /// `ORDER BY` items.
     pub order_by: Vec<OrderItem>,
     /// Explicit frame clause, or `None` for the binder-applied default.
-    pub frame: Option<WindowFrame>,
+    ///
+    /// Boxed so an explicit frame does not bloat [`Expr`]: every `Expr::Call`
+    /// carries an `Option<WindowSpec>` by value, and a frame is rare on a call,
+    /// so the box keeps the common (frame-less) `Expr` small.
+    pub frame: Option<Box<WindowFrame>>,
     /// Source span.
     pub span: Span,
 }

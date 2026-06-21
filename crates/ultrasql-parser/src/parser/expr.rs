@@ -916,7 +916,7 @@ impl<'src> Parser<'src> {
                 self.advance()?;
             }
         }
-        let frame = self.parse_window_frame_opt()?;
+        let frame = self.parse_window_frame_opt()?.map(Box::new);
         let rp = self.expect(TokenKind::RParen, ")")?;
         Ok(crate::ast::WindowSpec {
             partition_by,
