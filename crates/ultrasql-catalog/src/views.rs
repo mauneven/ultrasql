@@ -42,12 +42,18 @@ pub const fn pg_tables_def() -> &'static str {
 /// `indexdef`.
 #[must_use]
 pub const fn pg_indexes_def() -> &'static str {
+    // `tablespace` stays NULL: UltraSQL has no tablespace subsystem, so
+    // there is no real source to populate (PostgreSQL also reports NULL for
+    // indexes in the default tablespace). `indexdef` delegates to
+    // `pg_get_indexdef(i.oid)` — the index relation's oid — so psql `\d`/`\di`,
+    // pgAdmin, and ORM schema reflection see a non-NULL definition instead of
+    // breaking on a NULL.
     "CREATE OR REPLACE VIEW pg_catalog.pg_indexes AS \
      SELECT n.nspname AS schemaname, \
             t.relname AS tablename, \
             i.relname AS indexname, \
             NULL::text AS tablespace, \
-            NULL::text AS indexdef \
+            pg_catalog.pg_get_indexdef(i.oid) AS indexdef \
      FROM pg_catalog.pg_index ix \
      JOIN pg_catalog.pg_class t ON t.oid = ix.indrelid \
      JOIN pg_catalog.pg_class i ON i.oid = ix.indexrelid \
@@ -227,6 +233,19 @@ mod tests {
         assert!(
             pg_indexes_def().contains("pg_index"),
             "pg_indexes must join pg_index"
+        );
+    }
+
+    #[test]
+    fn pg_indexes_def_populates_indexdef_via_pg_get_indexdef() {
+        let def = pg_indexes_def();
+        assert!(
+            def.contains("pg_get_indexdef(i.oid) AS indexdef"),
+            "pg_indexes.indexdef must delegate to pg_get_indexdef(i.oid), got: {def}"
+        );
+        assert!(
+            !def.contains("NULL::text AS indexdef"),
+            "pg_indexes.indexdef must no longer be a NULL literal"
         );
     }
 

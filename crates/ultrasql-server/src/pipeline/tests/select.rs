@@ -34,6 +34,31 @@ fn lower_query_right_outer_equi_join_uses_nlj_not_hash_join() {
     assert_eq!(pairs, vec![(0, 1), (0, 3), (2, 2)]);
 }
 
+/// FULL OUTER over an otherwise hash-eligible equi predicate must still
+/// dispatch to NestedLoopJoin, not HashJoin. This pins the planner
+/// contract that keeps the `FullOuter` arm in `HashJoin::build_phase`
+/// dead code: that arm returns `Unsupported`, and the join is served
+/// here by NLJ instead. Paired with the `RightOuter` and `Cross` cases,
+/// it proves the physical planner never selects HashJoin for the three
+/// join types HashJoin does not execute.
+#[test]
+fn lower_query_full_outer_equi_join_uses_nlj_not_hash_join() {
+    let tables = SampleTables::new();
+    let ctx = synthetic_ctx(&tables);
+    let plan = build_int_join_plan(
+        &[1, 2],
+        &[2, 3],
+        LogicalJoinType::FullOuter,
+        equi_eq_predicate(),
+    );
+    let op = lower_query(&plan, &ctx).expect("lowers");
+    let debug = format!("{op:?}");
+    assert!(
+        debug.starts_with("NestedLoopJoin"),
+        "FullOuter must not pick HashJoin; got: {debug}"
+    );
+}
+
 #[test]
 fn direct_scalar_avg_miss_populates_column_cache_and_next_lowering_uses_cached_avg() {
     let tables = SampleTables::new();

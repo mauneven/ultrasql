@@ -329,15 +329,69 @@ pub(super) fn rows_pg_indexes(ctx: &LowerCtx<'_>) -> Vec<Vec<Value>> {
         let table_name = table
             .map(|entry| entry.name.clone())
             .unwrap_or_else(|| idx.table_oid.raw().to_string());
+        let indexdef = table.map_or(Value::Null, |entry| {
+            v_text(build_indexdef(idx, &entry.name, &entry.schema))
+        });
         rows.push(vec![
             v_text(idx.schema_name.clone()),
             v_text(table_name),
             v_text(idx.name.clone()),
+            // `tablespace` stays NULL: UltraSQL has no tablespace subsystem, and
+            // PostgreSQL also reports NULL for indexes in the default tablespace.
             Value::Null,
-            Value::Null,
+            indexdef,
         ]);
     }
     rows
+}
+
+/// Render a PostgreSQL-style `CREATE INDEX` statement for `pg_indexes.indexdef`
+/// (and the equivalent of `pg_get_indexdef`).
+///
+/// Resolves the index's key columns through the parent table's schema, so
+/// psql `\d`/`\di`, pgAdmin, and ORM schema reflection see a real definition
+/// instead of a NULL. Identifiers are quoted only when they are not a plain
+/// lowercase identifier, matching PostgreSQL's `quote_ident` behaviour.
+fn build_indexdef(idx: &ultrasql_catalog::IndexEntry, table_name: &str, table_schema: &Schema) -> String {
+    let columns: Vec<String> = idx
+        .columns
+        .iter()
+        .map(|attnum| {
+            // `idx.columns` holds 0-based attnums into the table schema.
+            table_schema
+                .fields()
+                .get(usize::from(*attnum))
+                .map_or_else(|| format!("col{attnum}"), |field| quote_ident(&field.name))
+        })
+        .collect();
+    let unique = if idx.is_unique { "UNIQUE " } else { "" };
+    format!(
+        "CREATE {unique}INDEX {name} ON {schema}.{table} USING {method} ({cols})",
+        name = quote_ident(&idx.name),
+        schema = quote_ident(&idx.schema_name),
+        table = quote_ident(table_name),
+        method = idx.access_method,
+        cols = columns.join(", "),
+    )
+}
+
+/// Quote a SQL identifier the way PostgreSQL's `quote_ident` does: a bare
+/// identifier that is a plain lowercase `[a-z_][a-z0-9_]*` is emitted as-is;
+/// anything else is wrapped in double quotes with embedded quotes doubled.
+fn quote_ident(ident: &str) -> String {
+    let is_plain = !ident.is_empty()
+        && ident
+            .chars()
+            .next()
+            .is_some_and(|c| c.is_ascii_lowercase() || c == '_')
+        && ident
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_');
+    if is_plain {
+        ident.to_owned()
+    } else {
+        format!("\"{}\"", ident.replace('"', "\"\""))
+    }
 }
 
 pub(super) fn schema_pg_views() -> Schema {

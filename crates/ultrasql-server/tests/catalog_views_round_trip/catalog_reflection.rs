@@ -98,7 +98,7 @@ async fn pg_catalog_and_information_schema_reflect_runtime_objects() {
 
     let indexes = client
         .query(
-            "SELECT indexname \
+            "SELECT indexname, indexdef \
              FROM pg_catalog.pg_indexes \
              WHERE tablename = 'meta_t'",
             &[],
@@ -107,6 +107,15 @@ async fn pg_catalog_and_information_schema_reflect_runtime_objects() {
         .expect("pg_indexes query");
     assert_eq!(indexes.len(), 1);
     assert_eq!(indexes[0].get::<_, String>(0), "meta_t_id_idx");
+    // `indexdef` must be a real CREATE INDEX statement, not NULL, so psql
+    // `\d`/`\di` and ORM schema reflection do not break.
+    let indexdef = indexes[0]
+        .get::<_, Option<String>>(1)
+        .expect("pg_indexes.indexdef must be non-NULL");
+    assert!(
+        indexdef.starts_with("CREATE") && indexdef.contains("INDEX meta_t_id_idx ON"),
+        "unexpected indexdef: {indexdef}"
+    );
 
     let sequences = client
         .query(
