@@ -46,7 +46,10 @@ pub mod vm;
 pub mod wal_applier;
 pub mod wal_sink;
 
-pub use buffer_pool::{BufferPool, BufferPoolError, BufferPoolStats, PageGuard, PageLoader};
+pub use buffer_pool::{
+    BufferPool, BufferPoolError, BufferPoolStats, EVICTION_RELIEF_ROUNDS, EvictionRelief,
+    PageGuard, PageLoader,
+};
 pub use checkpointer::{Checkpointer, CheckpointerConfig};
 pub use clog::{ClogError, PersistentClog};
 pub use fsm::FreeSpaceMap;

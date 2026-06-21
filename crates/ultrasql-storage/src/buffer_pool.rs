@@ -106,6 +106,65 @@ where
     }
 }
 
+/// Default number of bounded eviction-relief rounds
+/// [`BufferPool::get_page_relieved`] attempts before surfacing
+/// [`BufferPoolError::Exhausted`].
+///
+/// Each round attempts one [`EvictionRelief::relieve`] and retries the
+/// `get_page`. A small bound keeps the read path live: under genuine
+/// over-commit (the working set of *pinned* pages exceeds capacity, which no
+/// flush can relieve) the wrapper fails cleanly instead of spinning.
+pub const EVICTION_RELIEF_ROUNDS: usize = 3;
+
+/// Hook the owning service installs to relieve buffer-pool exhaustion by
+/// flushing dirty pages.
+///
+/// # Why a hook (and not in-pool flush)
+///
+/// The eviction sweep is intentionally read-only and the [`PageLoader`] is
+/// read-only by contract, so the pool cannot write back a dirty victim itself
+/// without breaking the latch-order invariants in ARCHITECTURE.md §14 (a WAL
+/// force must never happen under a frame latch or the `miss_lock`). The
+/// *owning* layer — the service that holds both this pool and the WAL writer —
+/// supplies an `EvictionRelief` implementation. [`BufferPool::get_page_relieved`]
+/// calls it *after* `get_page` returned [`BufferPoolError::Exhausted`] and all
+/// latches are released. Keeping this a trait object (rather than a concrete
+/// writer) leaves the pool writer-agnostic: it never names the segment manager
+/// or the server's page writer, exactly as it never names a concrete
+/// [`WalSink`].
+///
+/// # Contract
+///
+/// Implementations are invoked with **no pool, frame, or `miss_lock` latch
+/// held** and MUST:
+///
+/// 1. Not reacquire a pool/frame latch and then block on a WAL fsync.
+/// 2. Not re-enter [`BufferPool::get_page`] — the only write-back site is
+///    [`BufferPool::try_flush_dirty`], whose writer callback must not touch the
+///    pool.
+/// 3. Preserve WAL-before-data: a page is written only when its page-LSN is
+///    `<= durable_lsn`. When the durable LSN must be advanced to unblock a
+///    frame, the force happens *before* the (re-)flush.
+///
+/// `relieve` returns `Ok(())` to mean "I attempted relief; retry `get_page`".
+/// Progress is reported out of band via the pool's dirty count. Returning
+/// `Ok(())` without progress is allowed (e.g. every dirty frame is pinned);
+/// the bounded loop in [`BufferPool::get_page_relieved`] guarantees a
+/// no-progress relief cannot spin forever and ultimately surfaces `Exhausted`.
+pub trait EvictionRelief: Send + Sync {
+    /// Attempt to free buffer-pool frames by flushing dirty pages.
+    ///
+    /// See the [trait-level contract](EvictionRelief) for the latch-order and
+    /// WAL-before-data guarantees implementations must uphold.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`BufferPoolError`] if relief failed in a way that must abort
+    /// the operation (e.g. a poisoned pool, or a WAL durability timeout
+    /// surfaced through [`BufferPoolError::Loader`]).
+    fn relieve(&self) -> Result<(), BufferPoolError>;
+}
+
 /// Live diagnostics for the pool.
 #[derive(Debug, Default)]
 pub struct BufferPoolStats {
@@ -178,6 +237,17 @@ pub struct BufferPool<L: PageLoader> {
     /// access and let the owning service restart from the last consistent
     /// WAL position.
     poisoned: AtomicBool,
+    /// Optional eviction-relief hook installed by the owning service.
+    ///
+    /// Set once after construction via [`BufferPool::set_eviction_relief`]
+    /// (the hook closes over the WAL writer's force-and-wait primitive, which
+    /// is built after the pool). When present, [`BufferPool::get_page_relieved`]
+    /// invokes it on [`BufferPoolError::Exhausted`] to flush dirty pages and
+    /// retry. Guarded by a `Mutex` (read only on the rare exhaustion path, so
+    /// the lock is off the common hot path). `None` by default so unit tests
+    /// and WAL-less configurations are unaffected and `get_page_relieved`
+    /// degrades to a single `get_page`.
+    relief: Mutex<Option<Arc<dyn EvictionRelief>>>,
 }
 
 impl<L: PageLoader> std::fmt::Debug for BufferPool<L> {
@@ -260,6 +330,7 @@ impl<L: PageLoader> BufferPool<L> {
             btree_latches: Mutex::new(HashMap::new()),
             btree_block_allocators: Mutex::new(HashMap::new()),
             poisoned: AtomicBool::new(false),
+            relief: Mutex::new(None),
         }
     }
 
@@ -273,8 +344,13 @@ impl<L: PageLoader> BufferPool<L> {
     /// required for crash recovery.
     ///
     /// Eviction itself does not flush dirty pages regardless of whether a
-    /// sink is present. Flushing is the checkpointer's job; the eviction
-    /// path simply skips dirty frames.
+    /// sink is present. Flushing is performed out of band: the checkpointer
+    /// flushes on its interval, and the owning layer performs an LSN-gated
+    /// flush-on-`Exhausted` relief (via [`Self::try_flush_dirty`], forcing the
+    /// WAL durable to [`Self::oldest_unflushable_dirty_lsn`] when every dirty
+    /// victim is ahead of the durable LSN) after the sweep returns
+    /// [`BufferPoolError::Exhausted`] and all latches are released. The
+    /// eviction sweep itself simply skips dirty frames.
     #[must_use]
     pub fn with_wal(capacity: usize, loader: L, wal: Arc<dyn WalSink>) -> Self {
         assert!(capacity > 0, "buffer pool capacity must be > 0");
@@ -293,6 +369,7 @@ impl<L: PageLoader> BufferPool<L> {
             btree_latches: Mutex::new(HashMap::new()),
             btree_block_allocators: Mutex::new(HashMap::new()),
             poisoned: AtomicBool::new(false),
+            relief: Mutex::new(None),
         }
     }
 
@@ -313,6 +390,14 @@ impl<L: PageLoader> BufferPool<L> {
     /// after a page mutation.
     pub(crate) fn poison_after_wal_error(&self) {
         self.poisoned.store(true, Ordering::Release);
+    }
+
+    /// Poison the pool from a test, simulating a post-mutation WAL-append
+    /// failure, so eviction-relief poison handling can be exercised through the
+    /// public surface.
+    #[cfg(any(test, feature = "testing"))]
+    pub fn poison_for_test(&self) {
+        self.poison_after_wal_error();
     }
 
     /// Return whether this pool has seen a fatal WAL ordering failure.
@@ -568,6 +653,72 @@ impl<L: PageLoader> BufferPool<L> {
         })
     }
 
+    /// Install (or replace) the eviction-relief hook.
+    ///
+    /// Called once by the owning service after the WAL writer exists (the hook
+    /// closes over the writer's force-and-wait primitive). See
+    /// [`EvictionRelief`] for the contract the hook must satisfy.
+    pub fn set_eviction_relief(&self, relief: Arc<dyn EvictionRelief>) {
+        *self.relief.lock() = Some(relief);
+    }
+
+    /// Acquire a page guard, relieving buffer-pool exhaustion on the way.
+    ///
+    /// Behaves like [`Self::get_page`] but, on [`BufferPoolError::Exhausted`],
+    /// invokes the installed [`EvictionRelief`] hook (if any) to flush dirty
+    /// pages — LSN-gated, and forcing the WAL durable when every dirty victim
+    /// is ahead of the durable position — then retries. The loop is bounded by
+    /// [`EVICTION_RELIEF_ROUNDS`]: after exhausting the budget without finding
+    /// a clean victim it returns the original `Exhausted` rather than spinning.
+    /// `Poisoned`, `Loader`, and `WriteContention` are not eviction problems
+    /// and are returned immediately without relief.
+    ///
+    /// When no hook is installed this is exactly [`Self::get_page`] — a single
+    /// attempt with no retry — so unit tests and WAL-less configurations are
+    /// unaffected.
+    ///
+    /// # Lock order
+    ///
+    /// The relief hook is invoked only *after* `get_page` has returned and
+    /// every pool/frame/`miss_lock` latch is released, which is the only place
+    /// the hook's internal WAL force-and-wait is latch-order-safe
+    /// (ARCHITECTURE.md §14).
+    ///
+    /// # Errors
+    ///
+    /// Propagates any non-`Exhausted` [`BufferPoolError`], a `BufferPoolError`
+    /// from the relief hook, or `Exhausted` after the relief budget is spent.
+    pub fn get_page_relieved(
+        self: &Arc<Self>,
+        page_id: PageId,
+    ) -> Result<PageGuard<L>, BufferPoolError> {
+        let Some(relief) = self.relief.lock().clone() else {
+            // No hook installed: behave exactly like a bare get_page.
+            return self.get_page(page_id);
+        };
+
+        let mut round = 0;
+        loop {
+            match self.get_page(page_id) {
+                Ok(guard) => return Ok(guard),
+                Err(BufferPoolError::Exhausted) => {
+                    if round >= EVICTION_RELIEF_ROUNDS {
+                        // Budget spent; surface the original exhaustion.
+                        return Err(BufferPoolError::Exhausted);
+                    }
+                    round += 1;
+                    // No latch is held here (get_page already returned), so the
+                    // relief impl may flush and force the WAL §14-safely.
+                    relief.relieve()?;
+                    // Retry: clean victims freed by the relief flush — and any
+                    // pins released by concurrent guards' Drop between rounds —
+                    // become available on the next get_page.
+                }
+                Err(other) => return Err(other),
+            }
+        }
+    }
+
     /// Return a snapshot of pool diagnostics.
     #[must_use]
     pub fn stats(&self) -> BufferPoolStats {
@@ -613,6 +764,74 @@ impl<L: PageLoader> BufferPool<L> {
                 continue;
             };
             let page_lsn = page.header().lsn;
+            oldest = Some(match oldest {
+                Some(current) if current <= page_lsn => current,
+                _ => page_lsn,
+            });
+        }
+        oldest.map(ultrasql_core::Lsn::new)
+    }
+
+    /// Return the lowest page-LSN among dirty, unpinned, resident frames
+    /// whose page-LSN currently *exceeds* the WAL sink's durable LSN.
+    ///
+    /// This is the eviction-relief counterpart to [`Self::oldest_dirty_lsn`].
+    /// When [`Self::try_flush_dirty`] flushes nothing because every dirty
+    /// unpinned victim is ahead of the durable WAL position (the gate at the
+    /// `page_lsn > durable` check), the owning layer forces the WAL durable to
+    /// the value returned here so that *at least one* currently-blocked frame
+    /// becomes flushable. Forcing to this minimum guarantees forward progress
+    /// without over-forcing.
+    ///
+    /// Returns `None` when no dirty unpinned frame is blocked by the gate —
+    /// either there are no such frames, or every dirty frame is already at or
+    /// below the durable LSN (in which case [`Self::try_flush_dirty`] can flush
+    /// it directly without a WAL force). When the pool has no WAL sink the
+    /// durable LSN is treated as `u64::MAX`, so this always returns `None`.
+    ///
+    /// # Lock order
+    ///
+    /// Mirrors [`Self::oldest_dirty_lsn`]: it takes per-frame locks
+    /// individually (the meta lock, then a shared page read lock), never
+    /// holding two frames' locks simultaneously and never calling the WAL
+    /// under a page latch. Consistent with ARCHITECTURE.md §14.
+    #[must_use]
+    pub fn oldest_unflushable_dirty_lsn(&self) -> Option<ultrasql_core::Lsn> {
+        let durable = self
+            .wal_sink
+            .as_ref()
+            .map_or(u64::MAX, |s| s.durable_lsn().raw());
+        let mut oldest: Option<u64> = None;
+        for frame in &self.frames {
+            if !frame.dirty.load(Ordering::Acquire) {
+                continue;
+            }
+            if frame.pin_count.load(Ordering::Acquire) != 0 {
+                continue;
+            }
+            // Meta lock to read page_id and re-check the pin atomically,
+            // matching the `try_flush_dirty` discipline.
+            {
+                let pid_slot = frame.page_id.lock();
+                if frame.pin_count.load(Ordering::Acquire) != 0 {
+                    continue;
+                }
+                if pid_slot.is_none() {
+                    continue;
+                }
+            }
+            let page_lsn = {
+                let page_guard = frame.page.read();
+                match page_guard.as_ref() {
+                    Some(page) => page.header().lsn,
+                    None => continue,
+                }
+            };
+            // Frames at or below durable are already flushable by Phase A;
+            // they impose no WAL-force requirement.
+            if page_lsn <= durable {
+                continue;
+            }
             oldest = Some(match oldest {
                 Some(current) if current <= page_lsn => current,
                 _ => page_lsn,
@@ -693,11 +912,18 @@ impl<L: PageLoader> BufferPool<L> {
                 continue;
             }
             if let Some(old_id) = *page_id_slot {
-                // We do not flush dirty pages here — the storage
-                // manager is responsible for issuing the WAL flush
-                // before evicting dirty pages. The buffer pool's
-                // contract is "do not lose pinned data"; in the
-                // current bring-up there are no concurrent flushers.
+                // We do not flush dirty pages here — the eviction sweep
+                // stays read-only. When the sweep cannot find a clean
+                // victim and returns `Exhausted`, the owning layer (which
+                // holds both this pool and the WAL writer) performs an
+                // LSN-gated flush-on-`Exhausted` relief *after* all latches
+                // are released — calling `try_flush_dirty` (and, if every
+                // dirty victim is ahead of the durable WAL, forcing the WAL
+                // durable to `oldest_unflushable_dirty_lsn` first) and then
+                // retrying `get_page`. That keeps the WAL-before-data and
+                // §14 latch-order invariants intact because no WAL force or
+                // page write ever happens under a frame latch or the
+                // `miss_lock`. The sweep itself still never writes.
                 if frame.dirty.load(Ordering::Acquire) {
                     drop(page_id_slot);
                     continue;

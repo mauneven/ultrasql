@@ -306,6 +306,83 @@ pub mod test_support {
         }
     }
 
+    /// In-memory sink whose durable LSN *lags* the appended LSN until the test
+    /// explicitly advances it.
+    ///
+    /// Unlike [`InMemoryWalSink`] (where everything appended is immediately
+    /// durable), this sink assigns LSNs monotonically from 1 but reports a
+    /// `durable_lsn` that the test controls via [`Self::set_durable_lsn`]. It
+    /// models a WAL writer that has accepted records into its buffer but not
+    /// yet fsynced them — exactly the state the eviction-relief LSN gate must
+    /// respect (a dirty page whose page-LSN exceeds `durable_lsn` must not be
+    /// written).
+    #[derive(Debug, Default)]
+    pub struct LaggingWalSink {
+        inner: Mutex<LaggingInner>,
+    }
+
+    #[derive(Debug, Default)]
+    struct LaggingInner {
+        next_lsn: u64,
+        durable: u64,
+        last_lsn: HashMap<u64, Lsn>,
+    }
+
+    impl LaggingWalSink {
+        /// Construct an empty sink with `durable_lsn == 0` (nothing durable).
+        #[must_use]
+        pub fn new() -> Self {
+            Self::default()
+        }
+
+        /// Advance the reported durable LSN to `lsn` (monotonically; a lower
+        /// value is ignored). Tests call this to "fsync" the WAL up to `lsn`.
+        pub fn set_durable_lsn(&self, lsn: Lsn) {
+            let mut inner = self.inner.lock();
+            if lsn.raw() > inner.durable {
+                inner.durable = lsn.raw();
+            }
+        }
+
+        /// Return the highest LSN assigned so far (the next append gets
+        /// `assigned + 1`).
+        #[must_use]
+        pub fn assigned_lsn(&self) -> Lsn {
+            Lsn::new(self.inner.lock().next_lsn)
+        }
+    }
+
+    impl WalSink for LaggingWalSink {
+        fn append(&self, record: WalRecord) -> Result<Lsn, WalSinkError> {
+            let mut inner = self.inner.lock();
+            let next = inner
+                .next_lsn
+                .checked_add(1)
+                .ok_or_else(|| WalSinkError::Rejected("lagging WAL LSN overflow".to_owned()))?;
+            inner.next_lsn = next;
+            let lsn = Lsn::new(next);
+            inner.last_lsn.insert(record.header.xid.raw(), lsn);
+            Ok(lsn)
+        }
+
+        fn appends_without_blocking_io(&self) -> bool {
+            true
+        }
+
+        fn durable_lsn(&self) -> Lsn {
+            Lsn::new(self.inner.lock().durable)
+        }
+
+        fn last_lsn_for(&self, xid: Xid) -> Lsn {
+            self.inner
+                .lock()
+                .last_lsn
+                .get(&xid.raw())
+                .copied()
+                .unwrap_or(Lsn::ZERO)
+        }
+    }
+
     #[cfg(test)]
     mod tests {
         use ultrasql_core::{Lsn, Xid};
