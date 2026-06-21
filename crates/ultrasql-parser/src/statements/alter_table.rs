@@ -6,7 +6,7 @@
 //! - `RENAME COLUMN old TO new`
 //! - `RENAME TO new_name`
 //! - `ADD CONSTRAINT name constraint`
-//! - `DROP CONSTRAINT name [CASCADE|RESTRICT]`
+//! - `DROP CONSTRAINT [IF EXISTS] name [CASCADE|RESTRICT]`
 //! - `ENABLE ROW LEVEL SECURITY`
 //! - `SET (option = value, ...)`
 
@@ -61,13 +61,15 @@ impl Parser<'_> {
             TokenKind::KwDrop => {
                 self.advance()?; // DROP
                 if self.peek()?.kind == TokenKind::KwConstraint {
-                    // DROP CONSTRAINT name
+                    // DROP CONSTRAINT [IF EXISTS] name [CASCADE|RESTRICT]
                     self.advance()?; // CONSTRAINT
+                    let if_exists = self.parse_if_exists()?;
                     let name = self.parse_identifier()?;
                     let cascade = self.parse_cascade_restrict();
                     let end = self.peek()?.span.start;
                     return Ok(AlterTableAction::DropConstraint {
                         name,
+                        if_exists,
                         cascade,
                         span: Span::new(start, end),
                     });
@@ -219,11 +221,35 @@ mod tests {
     #[test]
     fn alter_table_drop_constraint() {
         let stmt = parse_alter("ALTER TABLE t DROP CONSTRAINT fk_user CASCADE");
-        let AlterTableAction::DropConstraint { name, cascade, .. } = stmt.action else {
+        let AlterTableAction::DropConstraint {
+            name,
+            if_exists,
+            cascade,
+            ..
+        } = stmt.action
+        else {
             panic!("expected DropConstraint")
         };
         assert_eq!(name.value, "fk_user");
+        assert!(!if_exists);
         assert!(cascade);
+    }
+
+    #[test]
+    fn alter_table_drop_constraint_if_exists() {
+        let stmt = parse_alter("ALTER TABLE t DROP CONSTRAINT IF EXISTS maybe_missing");
+        let AlterTableAction::DropConstraint {
+            name,
+            if_exists,
+            cascade,
+            ..
+        } = stmt.action
+        else {
+            panic!("expected DropConstraint")
+        };
+        assert_eq!(name.value, "maybe_missing");
+        assert!(if_exists);
+        assert!(!cascade);
     }
 
     #[test]

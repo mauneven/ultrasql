@@ -327,10 +327,13 @@ pub enum AlterTableAction {
         /// Source span.
         span: Span,
     },
-    /// `DROP CONSTRAINT name [CASCADE|RESTRICT]`.
+    /// `DROP CONSTRAINT [IF EXISTS] name [CASCADE|RESTRICT]`.
     DropConstraint {
         /// Constraint name.
         name: Identifier,
+        /// Whether `IF EXISTS` was specified, making a missing
+        /// constraint a no-op instead of an error.
+        if_exists: bool,
         /// Whether `CASCADE` was specified.
         cascade: bool,
         /// Source span.
