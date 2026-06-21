@@ -119,4 +119,5 @@ mod embedded;
 mod extended;
 mod plan_cache;
 mod recovery;
+mod result_streaming;
 mod txn;
