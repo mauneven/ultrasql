@@ -399,6 +399,14 @@ impl Server {
         // 5. Background writer thread draining the buffer to disk.
         let wal_writer = WalWriter::open(&wal_dir, Arc::clone(&wal_buffer), wal_writer_config)
             .map_err(|e| ServerError::Io(std::io::Error::other(format!("WAL writer: {e}"))))?;
+
+        // 5a. Install the LSN-gated eviction-relief hook now that the WAL
+        // writer exists (the relief's WAL force closure captures its durability
+        // handle). This converts a hard `BufferPoolError::Exhausted` on the
+        // user-facing heap/index/TOAST read path into a bounded, latch-safe,
+        // WAL-correct flush-on-evict relief.
+        Server::install_eviction_relief(&pool, &page_loader, Some(&wal_writer));
+
         let checkpointer_loader = page_loader.clone();
         let checkpointer = Some(ultrasql_storage::Checkpointer::spawn(
             &pool,

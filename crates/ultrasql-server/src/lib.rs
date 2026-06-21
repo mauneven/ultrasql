@@ -169,7 +169,7 @@ use ultrasql_storage::access_method::{
     PageBackedIvfFlatIndex,
 };
 use ultrasql_storage::btree::BTree;
-use ultrasql_storage::buffer_pool::{BufferPool, PageLoader};
+use ultrasql_storage::buffer_pool::{BufferPool, BufferPoolError, EvictionRelief, PageLoader};
 use ultrasql_storage::heap::{HeapAccess, HeapError, InsertOptions};
 use ultrasql_storage::page::Page;
 use ultrasql_storage::segment::{SegmentConfig, SegmentError, SegmentFileManager};

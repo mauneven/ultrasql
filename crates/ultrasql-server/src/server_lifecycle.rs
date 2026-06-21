@@ -148,6 +148,9 @@ impl Server {
         // user-table DML so every connection observes the same heap.
         let page_loader = BlankPageLoader::new();
         let pool = Arc::new(BufferPool::new(pool_frames, page_loader.clone()));
+        // Eviction relief with no WAL force: a sink-less pool treats the durable
+        // LSN as `u64::MAX`, so Phase A always flushes and Phase B never fires.
+        Server::install_eviction_relief(&pool, &page_loader, None);
         let heap = Arc::new(HeapAccess::new(Arc::clone(&pool)));
         let vm = Arc::new(VisibilityMap::new());
         match persistent_catalog.bootstrap_from_heap(heap.as_ref()) {
@@ -603,5 +606,156 @@ impl Server {
             "bulk load buffer-pool pressure flush"
         );
         Ok(Some(flushed))
+    }
+}
+
+/// Force-and-wait closure type used by [`ServerEvictionRelief`] to advance the
+/// durable WAL position before re-flushing a gated frame.
+///
+/// Returns `Ok(())` once the WAL is durable through the target LSN, or an
+/// `std::io::Error` (e.g. a durability timeout) on failure. The closure must
+/// be invoked with **no pool/frame latch held** — it busy-polls the WAL writer
+/// and would convoy every concurrent miss behind WAL I/O otherwise (see
+/// [`EvictionRelief`] and ARCHITECTURE.md §14).
+type WalForceFn = Arc<dyn Fn(Lsn) -> std::io::Result<()> + Send + Sync>;
+
+/// Server-side [`EvictionRelief`] implementation.
+///
+/// Reuses the single existing write-back site
+/// [`BufferPool::try_flush_dirty`](ultrasql_storage::BufferPool::try_flush_dirty)
+/// and, when every dirty victim is ahead of the durable WAL, the WAL
+/// force-and-wait primitive — both invoked from `relieve` with no pool/frame
+/// latch held (the buffer pool calls `relieve` only after `get_page` returned
+/// `Exhausted` and released its latches). It adds no new write-back path: the
+/// pool's loader stays read-only and the WAL-before-data gate is enforced
+/// entirely by `try_flush_dirty`.
+struct ServerEvictionRelief {
+    /// The buffer pool whose dirty pages this hook flushes.
+    pool: Arc<BufferPool<BlankPageLoader>>,
+    /// Writer side-channel: persists a page so its frame becomes evictable.
+    page_loader: BlankPageLoader,
+    /// Force-and-wait the WAL durable to a target LSN. `None` in WAL-less /
+    /// in-memory mode, where `durable_lsn` is treated as `u64::MAX` so Phase A
+    /// always flushes and Phase B never fires.
+    force_wal_durable: Option<WalForceFn>,
+}
+
+impl ServerEvictionRelief {
+    /// Phase A flush: write back every dirty, unpinned frame that is already
+    /// at or below the durable WAL position. Returns the number flushed.
+    fn flush_durable(&self) -> Result<usize, BufferPoolError> {
+        let loader = self.page_loader.clone();
+        self.pool
+            .try_flush_dirty(move |page_id, page| loader.store(page_id, page))
+            .map_err(BufferPoolError::Loader)
+    }
+}
+
+impl EvictionRelief for ServerEvictionRelief {
+    fn relieve(&self) -> Result<(), BufferPoolError> {
+        // A poisoned pool must not be flushed; surface it like get_page would.
+        if self.pool.is_poisoned() {
+            return Err(BufferPoolError::Poisoned);
+        }
+
+        // Phase A — flush what is already durable. No WAL force, no latch.
+        let flushed = self.flush_durable()?;
+        if flushed > 0 {
+            return Ok(());
+        }
+
+        // Phase B — every dirty unpinned victim is ahead of the durable WAL.
+        // Force the WAL durable to the lowest such page-LSN (the minimum that
+        // unblocks at least one frame) WITH NO LATCH HELD, then re-flush.
+        if let Some(target) = self.pool.oldest_unflushable_dirty_lsn() {
+            if let Some(force) = self.force_wal_durable.as_ref() {
+                warn!(
+                    target_lsn = target.raw(),
+                    "eviction relief forcing WAL durable (buffer pool too small for dirty working set)"
+                );
+                force(target).map_err(|e| BufferPoolError::Loader(ultrasql_core::Error::Io(e)))?;
+                let flushed = self.flush_durable()?;
+                if flushed == 0 {
+                    // Phase C — made no progress this round (e.g. frames got
+                    // re-dirtied above the new durable LSN by a concurrent
+                    // writer). The bounded loop in get_page_relieved decides
+                    // whether to retry or surface Exhausted.
+                    warn!(
+                        target_lsn = target.raw(),
+                        "eviction relief flushed nothing after WAL force; pool may be over-committed"
+                    );
+                }
+            } else {
+                // No WAL force available (in-memory mode). With no sink the
+                // pool treats durable as u64::MAX, so this branch is
+                // unreachable in practice; surface no progress gracefully.
+                warn!("eviction relief: dirty frames blocked by WAL gate but no force available");
+            }
+        }
+        Ok(())
+    }
+}
+
+impl Server {
+    /// Build and install the [`EvictionRelief`] hook on the buffer pool.
+    ///
+    /// Called once during construction, after the WAL writer exists (the force
+    /// closure captures the writer's durability handle). `wal_writer` is
+    /// `None` in in-memory / sample mode, where the force is a no-op because
+    /// the pool's `durable_lsn` is `u64::MAX` and Phase A always flushes.
+    pub(crate) fn install_eviction_relief(
+        pool: &Arc<BufferPool<BlankPageLoader>>,
+        page_loader: &BlankPageLoader,
+        wal_writer: Option<&ultrasql_wal::WalWriter>,
+    ) {
+        let force_wal_durable: Option<WalForceFn> = wal_writer.map(|writer| {
+            let durability = writer.durability_handle();
+            let force: WalForceFn =
+                Arc::new(move |lsn: Lsn| force_wal_durable_to(&durability, lsn));
+            force
+        });
+        let relief = Arc::new(ServerEvictionRelief {
+            pool: Arc::clone(pool),
+            page_loader: page_loader.clone(),
+            force_wal_durable,
+        });
+        pool.set_eviction_relief(relief);
+    }
+}
+
+/// Busy-poll `durability` until it has fsynced through `lsn`, forcing fsyncs
+/// with `notify`. Mirrors [`Server::wait_for_wal_durable`] but operates on a
+/// cloneable [`WalDurabilityHandle`](ultrasql_wal::WalDurabilityHandle) so it
+/// can run inside the eviction-relief closure (no `&Server` needed, no latch
+/// held).
+fn force_wal_durable_to(
+    durability: &ultrasql_wal::WalDurabilityHandle,
+    lsn: Lsn,
+) -> std::io::Result<()> {
+    if lsn == Lsn::ZERO {
+        return Ok(());
+    }
+
+    const WAL_DURABILITY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+    const WAL_DURABILITY_POLL: std::time::Duration = std::time::Duration::from_micros(50);
+
+    let started = std::time::Instant::now();
+    loop {
+        let flushed = durability.flushed_lsn();
+        if flushed.raw() >= lsn.raw() {
+            return Ok(());
+        }
+        if started.elapsed() >= WAL_DURABILITY_TIMEOUT {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                format!(
+                    "eviction-relief WAL durability wait timed out at flushed_lsn={} target_lsn={}",
+                    flushed.raw(),
+                    lsn.raw()
+                ),
+            ));
+        }
+        durability.notify();
+        std::thread::sleep(WAL_DURABILITY_POLL);
     }
 }
