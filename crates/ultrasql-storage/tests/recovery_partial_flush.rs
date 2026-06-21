@@ -75,7 +75,7 @@ use std::sync::Arc;
 use tempfile::TempDir;
 use ultrasql_core::{BlockNumber, CommandId, Lsn, PageId, RelationId, TupleId, Xid};
 use ultrasql_storage::buffer_pool::BufferPool;
-use ultrasql_storage::heap::{DeleteOptions, HeapAccess, InsertOptions};
+use ultrasql_storage::heap::{DeleteOptions, HeapAccess, HeapError, InsertOptions};
 use ultrasql_storage::page::Page;
 use ultrasql_storage::segment::{SegmentConfig, SegmentFileManager};
 use ultrasql_storage::test_support::InMemoryWalSink;
@@ -630,5 +630,466 @@ fn fpw_repairs_torn_page_while_lsn_gate_leaves_newer_page_alone() {
         newer.header.xmax,
         Xid::INVALID,
         "LSN gate must skip the stale delete redo on a legitimately newer flushed page"
+    );
+}
+
+// ===========================================================================
+// Relief-path crash-safety: pages written by LSN-gated flush-on-evict relief.
+//
+// The tests above drive the write-back through a manual `try_flush_dirty`.
+// The tests below drive it through the *production relief path*: a live
+// workload runs against a tiny relief-enabled buffer pool over real on-disk
+// segments, so as the dirty working set overflows the pool the relief routine
+// (Phase A flush, LSN-gated) actually writes pages to disk. We then crash,
+// reopen cold, replay the full WAL, and assert the recovered state — proving
+// that pages written by relief satisfy WAL-before-data and replay correctly,
+// including the STEAL case (relief writes a page belonging to an uncommitted
+// xid) and the skip-redo gate (a relief-written page is not re-redone).
+// ===========================================================================
+
+use std::sync::atomic::{AtomicU64, Ordering};
+
+use ultrasql_storage::buffer_pool::{BufferPoolError, EvictionRelief};
+use ultrasql_storage::wal_sink::{WalSink, WalSinkError};
+
+/// A `WalSink` that records every appended record (for replay) and whose
+/// durable LSN equals the highest assigned LSN — i.e. everything appended is
+/// immediately durable. This makes the relief LSN gate (`page_lsn <= durable`)
+/// pass for any page the workload has mutated, so relief writes are exercised
+/// without a separate force step. Records and per-xid `prev_lsn` chaining are
+/// kept exactly like `InMemoryWalSink`.
+#[derive(Default)]
+struct RecordingDurableSink {
+    inner: parking_lot::Mutex<RecordingInner>,
+}
+
+#[derive(Default)]
+struct RecordingInner {
+    records: Vec<(Lsn, WalRecord)>,
+    next_lsn: u64,
+    last_lsn: std::collections::HashMap<u64, Lsn>,
+}
+
+impl RecordingDurableSink {
+    fn new() -> Self {
+        Self::default()
+    }
+    fn records(&self) -> Vec<(Lsn, WalRecord)> {
+        self.inner.lock().records.clone()
+    }
+}
+
+impl WalSink for RecordingDurableSink {
+    fn append(&self, record: WalRecord) -> Result<Lsn, WalSinkError> {
+        let mut inner = self.inner.lock();
+        let next = inner
+            .next_lsn
+            .checked_add(1)
+            .ok_or_else(|| WalSinkError::Rejected("LSN overflow".to_owned()))?;
+        inner.next_lsn = next;
+        let lsn = Lsn::new(next);
+        inner.last_lsn.insert(record.header.xid.raw(), lsn);
+        inner.records.push((lsn, record));
+        Ok(lsn)
+    }
+    fn appends_without_blocking_io(&self) -> bool {
+        true
+    }
+    fn durable_lsn(&self) -> Lsn {
+        let n = self.inner.lock().next_lsn;
+        if n == 0 { Lsn::ZERO } else { Lsn::new(n) }
+    }
+    fn last_lsn_for(&self, xid: Xid) -> Lsn {
+        self.inner
+            .lock()
+            .last_lsn
+            .get(&xid.raw())
+            .copied()
+            .unwrap_or(Lsn::ZERO)
+    }
+}
+
+/// Relief impl that flushes dirty pages to the shared on-disk segment manager
+/// (auto-extending the relation like the production page loader), gated on the
+/// sink's durable LSN by reusing `try_flush_dirty`. It records, for every page
+/// written, the durable LSN at the moment of the write and the on-disk LSN the
+/// page carried, so the test can assert WAL-before-data
+/// (`on_disk_lsn <= durable_at_write`) for every relief write.
+struct ReliefToSegments {
+    pool: Arc<BufferPool<SharedSegments>>,
+    segments: Arc<SegmentFileManager>,
+    sink: Arc<RecordingDurableSink>,
+    /// Count of pages written by relief.
+    writes: Arc<AtomicU64>,
+    /// Set to a nonzero block if any relief write violated WAL-before-data.
+    violation_block: Arc<AtomicU64>,
+}
+
+impl EvictionRelief for ReliefToSegments {
+    fn relieve(&self) -> Result<(), BufferPoolError> {
+        if self.pool.is_poisoned() {
+            return Err(BufferPoolError::Poisoned);
+        }
+        let durable_at_write = self.sink.durable_lsn().raw();
+        let segments = Arc::clone(&self.segments);
+        let writes = Arc::clone(&self.writes);
+        let violation = Arc::clone(&self.violation_block);
+        self.pool
+            .try_flush_dirty(move |page_id, page| {
+                // Auto-extend the relation so write_page targets an allocated
+                // block (mirrors BlankPageLoader::store).
+                while segments
+                    .relation_size_blocks(page_id.relation)
+                    .map_err(ultrasql_core::Error::from)?
+                    <= page_id.block.raw()
+                {
+                    segments
+                        .allocate_block(page_id.relation)
+                        .map_err(ultrasql_core::Error::from)?;
+                }
+                // WAL-before-data audit: try_flush_dirty only invokes us for
+                // pages with page_lsn <= durable, so this must always hold.
+                if page.header().lsn > durable_at_write {
+                    violation.store(u64::from(page_id.block.raw()) + 1, Ordering::SeqCst);
+                }
+                segments
+                    .write_page(page_id, page)
+                    .map_err(ultrasql_core::Error::from)?;
+                writes.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            })
+            .map_err(BufferPoolError::Loader)?;
+        Ok(())
+    }
+}
+
+/// Build a tiny relief-enabled heap over `segments` with a recording sink.
+/// Returns the heap, the sink (for `records()`), and the relief audit handles.
+#[allow(clippy::type_complexity)]
+fn relief_heap(
+    segments: &Arc<SegmentFileManager>,
+    pool_frames: usize,
+) -> (
+    HeapAccess<SharedSegments>,
+    Arc<RecordingDurableSink>,
+    Arc<AtomicU64>,
+    Arc<AtomicU64>,
+) {
+    let sink = Arc::new(RecordingDurableSink::new());
+    let pool = Arc::new(BufferPool::with_wal(
+        pool_frames,
+        SharedSegments(Arc::clone(segments)),
+        Arc::clone(&sink) as Arc<dyn WalSink>,
+    ));
+    let writes = Arc::new(AtomicU64::new(0));
+    let violation_block = Arc::new(AtomicU64::new(0));
+    pool.set_eviction_relief(Arc::new(ReliefToSegments {
+        pool: Arc::clone(&pool),
+        segments: Arc::clone(segments),
+        sink: Arc::clone(&sink),
+        writes: Arc::clone(&writes),
+        violation_block: Arc::clone(&violation_block),
+    }));
+    let heap = HeapAccess::new(pool);
+    (heap, sink, writes, violation_block)
+}
+
+/// Drive eviction through the relief path: a live insert workload on a tiny
+/// pool over real on-disk segments. Assert every page relief wrote satisfies
+/// `on_disk_lsn <= durable_at_write`, then crash, reopen cold, replay the full
+/// WAL, and assert the recovered rows equal a clean full-replay reference.
+#[test]
+fn evicted_then_written_page_replays_and_never_violates_wal_before_data() {
+    const ROWS: usize = 300;
+    const PAYLOAD_LEN: usize = 200; // few rows/page so the workload spans many blocks
+    const POOL_FRAMES: usize = 4; // tiny: dirty set will far exceed it
+
+    let crash_dir = TempDir::new().unwrap();
+    let segments = open_segments(crash_dir.path());
+
+    let (records, n_blocks, relief_writes) = {
+        let (heap, sink, writes, violation) = relief_heap(&segments, POOL_FRAMES);
+        for i in 0..ROWS {
+            let mut payload = vec![0_u8; PAYLOAD_LEN];
+            payload[0] = u8::try_from(i % 251).expect("fits u8");
+            payload[1] = u8::try_from(i / 251).expect("fits u8");
+            // The relation grows on demand; the relief writer auto-extends, but
+            // the live insert cursor still needs the block present, so grow
+            // lazily exactly like the existing harness.
+            loop {
+                let next_block = heap.block_count(rel());
+                pre_grow(&segments, next_block + 1);
+                match heap.insert(rel(), &payload, insert_opts(Xid::new(1), sink.as_ref())) {
+                    Ok(_tid) => break,
+                    Err(HeapError::BufferPool(_)) => {
+                        // Should not happen: relief should keep us going. Fail
+                        // loudly so a regression surfaces.
+                        panic!("relief failed to relieve buffer-pool pressure during insert");
+                    }
+                    Err(_) => {
+                        let grow_to = heap.block_count(rel()) + 1;
+                        pre_grow(&segments, grow_to);
+                    }
+                }
+            }
+        }
+
+        // Relief must actually have written pages (the whole point).
+        let writes = writes.load(Ordering::SeqCst);
+        assert!(
+            writes > 0,
+            "the tiny pool + large dirty set must have driven relief writes"
+        );
+        // No relief write may have violated WAL-before-data.
+        assert_eq!(
+            violation.load(Ordering::SeqCst),
+            0,
+            "a relief write carried page_lsn > durable (WAL-before-data violated)"
+        );
+
+        let n_blocks = heap.block_count(rel());
+        // Flush whatever is still dirty so the on-disk image is the full
+        // pre-crash durable state (still LSN-gated; durable == latest here).
+        let _ = heap
+            .buffer_pool()
+            .try_flush_dirty(|page_id, page| segments.write_page(page_id, page).map_err(Into::into))
+            .expect("final flush");
+        segments.fsync_all().expect("fsync");
+        (sink.records(), n_blocks, writes)
+        // heap/pool drop here -> simulated crash.
+    };
+    assert!(!records.is_empty(), "workload emitted WAL");
+    let _ = relief_writes;
+
+    // Reference: a full clean replay into a blank on-disk store.
+    let reference_dir = TempDir::new().unwrap();
+    let reference_rows = {
+        let segs = open_segments(reference_dir.path());
+        pre_grow(&segs, n_blocks);
+        let pool = Arc::new(BufferPool::new(512, SharedSegments(Arc::clone(&segs))));
+        let heap = HeapAccess::new(pool);
+        replay_all(&heap, &records);
+        recovered_rows(&heap)
+    };
+    assert_eq!(
+        reference_rows.len(),
+        ROWS,
+        "clean replay recovers every row"
+    );
+
+    // Crash recovery: reopen the partially-relief-flushed store cold, replay
+    // the full WAL through the production dispatch entry point.
+    let segs = open_segments(crash_dir.path());
+    let pool = Arc::new(BufferPool::new(512, SharedSegments(Arc::clone(&segs))));
+    let heap = HeapAccess::new(pool);
+    replay_all(&heap, &records);
+
+    let recovered = recovered_rows(&heap);
+    assert_eq!(
+        recovered, reference_rows,
+        "relief-evicted + WAL-redone pages must reconstruct the exact committed state"
+    );
+}
+
+/// STEAL safety: relief writes a page whose tuples belong to an UNCOMMITTED
+/// xid (no Commit record). After crash + full replay the bytes are present
+/// byte-identically (redo is outcome-independent), and the rows are correctly
+/// invisible to a snapshot for which that xid is not committed.
+#[test]
+fn relief_writes_uncommitted_page_steal_safety() {
+    use ultrasql_mvcc::status::test_support::MapOracle;
+    use ultrasql_mvcc::{Snapshot, Visibility, is_visible};
+
+    const ROWS: usize = 200;
+    const PAYLOAD_LEN: usize = 200;
+    const POOL_FRAMES: usize = 4;
+    const UNCOMMITTED_XID: u64 = 7;
+
+    let crash_dir = TempDir::new().unwrap();
+    let segments = open_segments(crash_dir.path());
+
+    let (records, n_blocks, sample_tid) = {
+        let (heap, sink, writes, violation) = relief_heap(&segments, POOL_FRAMES);
+        let mut a_tid = None;
+        for i in 0..ROWS {
+            let mut payload = vec![0_u8; PAYLOAD_LEN];
+            payload[0] = u8::try_from(i % 251).expect("fits u8");
+            loop {
+                let next_block = heap.block_count(rel());
+                pre_grow(&segments, next_block + 1);
+                match heap.insert(
+                    rel(),
+                    &payload,
+                    insert_opts(Xid::new(UNCOMMITTED_XID), sink.as_ref()),
+                ) {
+                    Ok(tid) => {
+                        if a_tid.is_none() {
+                            a_tid = Some(tid);
+                        }
+                        break;
+                    }
+                    Err(HeapError::BufferPool(_)) => panic!("relief failed under pressure"),
+                    Err(_) => {
+                        let grow_to = heap.block_count(rel()) + 1;
+                        pre_grow(&segments, grow_to);
+                    }
+                }
+            }
+        }
+        assert!(
+            writes.load(Ordering::SeqCst) > 0,
+            "relief must have written uncommitted-xid pages"
+        );
+        assert_eq!(violation.load(Ordering::SeqCst), 0, "WAL-before-data held");
+        let n_blocks = heap.block_count(rel());
+        let _ = heap
+            .buffer_pool()
+            .try_flush_dirty(|page_id, page| segments.write_page(page_id, page).map_err(Into::into))
+            .expect("final flush");
+        segments.fsync_all().expect("fsync");
+        // NOTE: no commit record is ever appended for UNCOMMITTED_XID.
+        (sink.records(), n_blocks, a_tid.expect("a row was inserted"))
+    };
+
+    // Crash + full cold replay.
+    let segs = open_segments(crash_dir.path());
+    let pool = Arc::new(BufferPool::new(512, SharedSegments(Arc::clone(&segs))));
+    let heap = HeapAccess::new(pool);
+    let _ = n_blocks;
+    replay_all(&heap, &records);
+
+    // (a) The bytes are present: redo replays regardless of commit outcome.
+    let tuple = heap
+        .fetch(sample_tid)
+        .expect("uncommitted row's bytes present after replay");
+    assert_eq!(
+        tuple.header.xmin,
+        Xid::new(UNCOMMITTED_XID),
+        "the recovered tuple carries the uncommitted writer xid"
+    );
+
+    // (b) The row is correctly invisible: a snapshot for which UNCOMMITTED_XID
+    // is not committed (here, aborted — the crash left it unresolved) must not
+    // see it. STEAL is safe: durable pre-commit bytes never leak as visible.
+    let oracle = MapOracle::new();
+    oracle.set_aborted(Xid::new(UNCOMMITTED_XID));
+    // A snapshot taken "after" the xid, with no in-progress xids and a reader
+    // xid distinct from the writer (so the "inserted by me" fast path is not
+    // taken). xmin == xmax == UNCOMMITTED_XID + 1 means UNCOMMITTED_XID is
+    // fully resolved per the snapshot and its status is read from the oracle.
+    let reader = Xid::new(UNCOMMITTED_XID + 1);
+    let snapshot = Snapshot::new(reader, reader, reader, CommandId::FIRST, std::iter::empty());
+    let vis = is_visible(&tuple.header, &snapshot, &oracle);
+    assert_eq!(
+        vis,
+        Visibility::Invisible,
+        "an uncommitted (aborted) writer's relief-written row must be invisible"
+    );
+
+    // Non-vacuity: the very same recovered bytes ARE visible once the writer is
+    // treated as committed. So the invisibility above is a real abort filter,
+    // not an artifact of the row being malformed or otherwise unreadable —
+    // recovery faithfully reproduced the page, and MVCC alone gates visibility.
+    let committed = MapOracle::new();
+    committed.set_committed(Xid::new(UNCOMMITTED_XID));
+    assert_eq!(
+        is_visible(&tuple.header, &snapshot, &committed),
+        Visibility::Visible,
+        "the recovered row must be visible when its writer is committed (non-vacuity)"
+    );
+}
+
+/// Skip-redo gate over a relief-written page: a DELETE on a relief-evicted page
+/// is written durably (durable >= delete LSN), its on-disk xmax is tampered
+/// back to INVALID, and a second full replay must SKIP the delete redo (page
+/// LSN >= record LSN), leaving xmax INVALID — positive proof the gate fired for
+/// a relief-written page.
+#[test]
+fn relief_evicted_delete_page_skips_redo() {
+    const ROWS: usize = 200;
+    const PAYLOAD_LEN: usize = 200;
+    const POOL_FRAMES: usize = 4;
+    const DELETE_XID: u64 = 2;
+
+    let crash_dir = TempDir::new().unwrap();
+    let segments = open_segments(crash_dir.path());
+
+    let (records, deleted_tid) = {
+        let (heap, sink, writes, violation) = relief_heap(&segments, POOL_FRAMES);
+        let mut block0_tid = None;
+        for i in 0..ROWS {
+            let mut payload = vec![0_u8; PAYLOAD_LEN];
+            payload[0] = u8::try_from(i % 251).expect("fits u8");
+            loop {
+                let next_block = heap.block_count(rel());
+                pre_grow(&segments, next_block + 1);
+                match heap.insert(rel(), &payload, insert_opts(Xid::new(1), sink.as_ref())) {
+                    Ok(tid) => {
+                        if tid.page.block.raw() == 0 && block0_tid.is_none() {
+                            block0_tid = Some(tid);
+                        }
+                        break;
+                    }
+                    Err(HeapError::BufferPool(_)) => panic!("relief failed under pressure"),
+                    Err(_) => {
+                        let grow_to = heap.block_count(rel()) + 1;
+                        pre_grow(&segments, grow_to);
+                    }
+                }
+            }
+        }
+        let victim = block0_tid.expect("a row on block 0");
+        heap.delete(
+            victim,
+            DeleteOptions {
+                xmax: Xid::new(DELETE_XID),
+                cmax: CommandId::FIRST,
+                wal: Some(sink.as_ref()),
+                fsm: None,
+                vm: None,
+            },
+        )
+        .expect("delete a block-0 row");
+        assert!(writes.load(Ordering::SeqCst) > 0, "relief wrote pages");
+        assert_eq!(violation.load(Ordering::SeqCst), 0, "WAL-before-data held");
+        // Flush everything still dirty (including block 0 with the delete) so
+        // the on-disk page LSN covers the delete record.
+        let _ = heap
+            .buffer_pool()
+            .try_flush_dirty(|page_id, page| segments.write_page(page_id, page).map_err(Into::into))
+            .expect("final flush");
+        segments.fsync_all().expect("fsync");
+        (sink.records(), victim)
+    };
+
+    // Tamper the deleted row's on-disk xmax back to INVALID, so the skip-vs-redo
+    // decision becomes observable on the second replay.
+    {
+        let segs = open_segments(crash_dir.path());
+        assert_eq!(
+            on_disk_xmax(&segs, deleted_tid),
+            DELETE_XID,
+            "flushed deleted row must carry xmax = DELETE_XID before tamper"
+        );
+        tamper_xmax_to_invalid(&segs, deleted_tid);
+        segs.fsync_all().expect("fsync tamper");
+    }
+
+    // Reopen cold and replay the full WAL. The delete redo must be SKIPPED
+    // because the relief-written page's on-disk LSN >= the delete record LSN.
+    let segs = open_segments(crash_dir.path());
+    let pool = Arc::new(BufferPool::new(512, SharedSegments(Arc::clone(&segs))));
+    let heap = HeapAccess::new(pool);
+    replay_all(&heap, &records);
+
+    let recovered_xmax = heap
+        .fetch(deleted_tid)
+        .expect("deleted row still present")
+        .header
+        .xmax;
+    assert_eq!(
+        recovered_xmax,
+        Xid::INVALID,
+        "skip branch must leave the tampered xmax INVALID on the relief-written page"
     );
 }
