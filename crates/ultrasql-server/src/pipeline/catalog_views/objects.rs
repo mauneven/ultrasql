@@ -352,7 +352,11 @@ pub(super) fn rows_pg_indexes(ctx: &LowerCtx<'_>) -> Vec<Vec<Value>> {
 /// psql `\d`/`\di`, pgAdmin, and ORM schema reflection see a real definition
 /// instead of a NULL. Identifiers are quoted only when they are not a plain
 /// lowercase identifier, matching PostgreSQL's `quote_ident` behaviour.
-fn build_indexdef(idx: &ultrasql_catalog::IndexEntry, table_name: &str, table_schema: &Schema) -> String {
+fn build_indexdef(
+    idx: &ultrasql_catalog::IndexEntry,
+    table_name: &str,
+    table_schema: &Schema,
+) -> String {
     let columns: Vec<String> = idx
         .columns
         .iter()

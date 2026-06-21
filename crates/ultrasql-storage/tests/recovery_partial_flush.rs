@@ -144,10 +144,7 @@ fn pre_grow(segments: &SegmentFileManager, n_blocks: u32) {
 /// Replay every `(lsn, record)` into `heap` via the same dispatch entry
 /// point production recovery uses, passing each record's WAL LSN so the
 /// applier can compare it against the on-disk page LSN.
-fn replay_all(
-    heap: &HeapAccess<SharedSegments>,
-    records: &[(Lsn, WalRecord)],
-) {
+fn replay_all(heap: &HeapAccess<SharedSegments>, records: &[(Lsn, WalRecord)]) {
     for (lsn, record) in records {
         dispatch_record_at_lsn(heap, record, *lsn).expect("replay must apply or skip cleanly");
     }
@@ -355,8 +352,7 @@ fn wal_replay_over_partially_flushed_page_store_skips_and_redoes_per_page() {
         {
             let pre_tamper = on_disk_xmax(&segments, deleted_tid);
             assert_eq!(
-                pre_tamper,
-                DELETE_XID,
+                pre_tamper, DELETE_XID,
                 "the flushed deleted row must carry xmax = DELETE_XID before tampering"
             );
             tamper_xmax_to_invalid(&segments, deleted_tid);
