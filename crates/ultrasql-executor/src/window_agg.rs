@@ -651,7 +651,9 @@ impl WindowAgg {
                     let mut prev_pos: Option<usize> = None;
                     for (pos, &idx) in sorted_indices.iter().enumerate() {
                         let same = prev_pos
-                            .map(|p| same_order_key(row_order_key(sorted_indices[p]), row_order_key(idx)))
+                            .map(|p| {
+                                same_order_key(row_order_key(sorted_indices[p]), row_order_key(idx))
+                            })
                             .unwrap_or(false);
                         if !same {
                             base_rank = pos + 1;
@@ -667,7 +669,9 @@ impl WindowAgg {
                     let mut prev_pos: Option<usize> = None;
                     for (pos, &idx) in sorted_indices.iter().enumerate() {
                         let same = prev_pos
-                            .map(|p| same_order_key(row_order_key(sorted_indices[p]), row_order_key(idx)))
+                            .map(|p| {
+                                same_order_key(row_order_key(sorted_indices[p]), row_order_key(idx))
+                            })
                             .unwrap_or(false);
                         if !same {
                             if prev_pos.is_some() {
@@ -1163,9 +1167,7 @@ impl RangeScalar {
     /// `self - other`, saturating on i128 overflow.
     fn sub(self, other: RangeScalar) -> RangeScalar {
         match (self, other) {
-            (RangeScalar::Int(a), RangeScalar::Int(b)) => {
-                RangeScalar::Int(a.saturating_sub(b))
-            }
+            (RangeScalar::Int(a), RangeScalar::Int(b)) => RangeScalar::Int(a.saturating_sub(b)),
             (RangeScalar::Float(a), RangeScalar::Float(b)) => RangeScalar::Float(a - b),
             // Mixed variants never occur: the axis fixes one domain per
             // partition for both values and offset. Degrade to float.
@@ -1176,9 +1178,7 @@ impl RangeScalar {
     /// `self + other`, saturating on i128 overflow.
     fn add(self, other: RangeScalar) -> RangeScalar {
         match (self, other) {
-            (RangeScalar::Int(a), RangeScalar::Int(b)) => {
-                RangeScalar::Int(a.saturating_add(b))
-            }
+            (RangeScalar::Int(a), RangeScalar::Int(b)) => RangeScalar::Int(a.saturating_add(b)),
             (RangeScalar::Float(a), RangeScalar::Float(b)) => RangeScalar::Float(a + b),
             (a, b) => RangeScalar::Float(a.as_f64() + b.as_f64()),
         }
@@ -1298,9 +1298,7 @@ impl RangeAxis {
                     }
                 };
                 aligned.map(RangeScalar::Int).ok_or_else(|| {
-                    ExecError::WindowFrameError(
-                        "RANGE offset arithmetic overflow".to_string(),
-                    )
+                    ExecError::WindowFrameError("RANGE offset arithmetic overflow".to_string())
                 })
             }
         }
@@ -1545,7 +1543,11 @@ fn resolve_range_offset(
     // the direction of "preceding"/"following" in value space.
     let preceding = !following;
     let bound_value = if asc {
-        if preceding { cur.sub(off) } else { cur.add(off) }
+        if preceding {
+            cur.sub(off)
+        } else {
+            cur.add(off)
+        }
     } else if preceding {
         cur.add(off)
     } else {
@@ -3365,10 +3367,7 @@ mod tests {
             )),
         );
         // g=1: empty -> NULL. g=2: groups {1} -> 10. g=3: groups {1,2} -> 30.
-        assert_eq!(
-            sums,
-            vec![Value::Null, Value::Int64(10), Value::Int64(30)],
-        );
+        assert_eq!(sums, vec![Value::Null, Value::Int64(10), Value::Int64(30)],);
     }
 
     #[test]
@@ -3393,10 +3392,7 @@ mod tests {
             )),
         );
         // g=1: groups {2,3} -> 50. g=2: group {3} -> 30. g=3: empty -> NULL.
-        assert_eq!(
-            sums,
-            vec![Value::Int64(50), Value::Int64(30), Value::Null],
-        );
+        assert_eq!(sums, vec![Value::Int64(50), Value::Int64(30), Value::Null],);
     }
 
     // ===================== BUG 4(a): offset NULL message fidelity =========
