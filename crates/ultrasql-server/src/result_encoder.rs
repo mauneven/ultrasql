@@ -695,43 +695,56 @@ pub fn run_select_streamed(
     run_select_streamed_with_options(op, sink, &TextEncodingOptions::default())
 }
 
+/// Up-front buffer reservation (in bytes) for a streamed SELECT body.
+///
+/// When the operator advertises its row count (column-cache replay,
+/// materialised CTE, `LIMIT n`) we size the buffer to the estimated wire-byte
+/// budget so the encode loop skips repeated `BytesMut::reserve` reallocations.
+/// The width estimate assumes each column expands to a text-format datum of
+/// ~8 bytes plus a 4-byte length prefix — generous enough for typical int /
+/// small-string scans without wasting more than one growth cycle on wider
+/// relations. Wire layout per row: 1B tag + 4B length + 2B ncols + per column
+/// (4B length + ascii text); the bench's `(id INT, val INT)` lands at ~25 B/row
+/// and this bound puts us just over that. Without a hint we fall back to a
+/// 32 KiB start so small queries stay on one allocation.
+///
+/// The reservation is **capped** at [`MAX_INITIAL_CAP_BYTES`]:
+/// `estimated_row_count` is only an estimate (and on some paths is
+/// influenceable by a crafted plan/`LIMIT`), so an inflated count must never
+/// pre-allocate gigabytes before the first row is encoded — that is a
+/// server-side OOM/DoS vector. The buffer still grows (amortized) past the cap
+/// for genuinely large results; this only bounds the speculative pre-touch.
+/// The full mid-result streaming fix that bounds *peak* memory is tracked
+/// separately.
+fn streamed_initial_cap(estimated_rows: Option<usize>, cols: usize) -> usize {
+    const PER_ROW_OVERHEAD_BYTES: usize = 7; // tag + length + ncols
+    const PER_CELL_BYTES_ESTIMATE: usize = 12; // 4B length + ~8B text
+    const ROWDESC_AND_TAG_BYTES: usize = 256;
+    match estimated_rows {
+        Some(rows) => {
+            let cols = cols.max(1);
+            let per_row =
+                PER_ROW_OVERHEAD_BYTES.saturating_add(cols.saturating_mul(PER_CELL_BYTES_ESTIMATE));
+            rows.saturating_mul(per_row)
+                .saturating_add(ROWDESC_AND_TAG_BYTES)
+        }
+        None => 32 * 1024,
+    }
+    .min(MAX_INITIAL_CAP_BYTES)
+}
+
+/// Hard ceiling on the speculative up-front SELECT-body reservation. See
+/// [`streamed_initial_cap`] for why an estimate must never drive an unbounded
+/// allocation.
+const MAX_INITIAL_CAP_BYTES: usize = 16 * 1024 * 1024; // 16 MiB
+
 /// Session-aware variant of [`run_select_streamed`].
 pub(crate) fn run_select_streamed_with_options(
     op: &mut dyn Operator,
     sink: &mut BytesMut,
     options: &TextEncodingOptions,
 ) -> Result<SelectResult, ServerError> {
-    // Initial capacity: when the operator advertises its row count
-    // (column-cache replay, materialised CTE, LIMIT n) we can size
-    // the buffer to the exact wire-byte budget upfront and skip
-    // every `BytesMut::reserve` reallocation. The width estimate
-    // assumes each column expands to a 5-cell-overhead text-format
-    // datum averaging 8 bytes — generous enough for typical int /
-    // small-string scans without wasting more than one growth cycle
-    // when the relation is wider. Without a hint, fall back to the
-    // 32 KiB starting size so small queries stay on one allocation.
-    // DataRow wire layout per row: 1B tag + 4B length + 2B ncols +
-    // per column (4B length + ascii text). For a typical int column
-    // the ascii text is ~5-10 bytes; varchar columns can be wider.
-    // We size to 8B per column to stay tight on the common
-    // narrow-int case (the bench's `(id INT, val INT)` lands at
-    // ~25 B/row, and an 8 B/col bound puts us at 24 B/row + 7 B
-    // overhead = 31 B/row, just over the actual width).
-    //
-    // One extra growth cycle is cheap; over-allocating doubles the
-    // initial syscall cost (page-fault the pre-touched bytes), so
-    // we lean tight rather than generous.
-    const PER_ROW_OVERHEAD_BYTES: usize = 7; // tag + length + ncols
-    const PER_CELL_BYTES_ESTIMATE: usize = 12; // 4B length + ~8B text
-    const ROWDESC_AND_TAG_BYTES: usize = 256;
-    let initial_cap = match op.estimated_row_count() {
-        Some(rows) => {
-            let cols = op.schema().len().max(1);
-            let body = rows.saturating_mul(PER_ROW_OVERHEAD_BYTES + cols * PER_CELL_BYTES_ESTIMATE);
-            body.saturating_add(ROWDESC_AND_TAG_BYTES)
-        }
-        None => 32 * 1024,
-    };
+    let initial_cap = streamed_initial_cap(op.estimated_row_count(), op.schema().len());
     let mut body = std::mem::take(sink);
     prepare_stream_sink(&mut body, initial_cap);
     match stream_select_with_options(op, &mut body, options) {
@@ -1166,6 +1179,34 @@ mod tests {
     use ultrasql_vec::Batch;
     use ultrasql_vec::column::{Column, NumericColumn, StringColumn};
     use ultrasql_vec::dict::DictionaryColumn;
+
+    #[test]
+    fn streamed_initial_cap_bounds_inflated_row_estimates() {
+        // No row hint: small fixed start so tiny queries stay on one alloc.
+        assert_eq!(streamed_initial_cap(None, 4), 32 * 1024);
+
+        // Modest estimate: sized to the estimate, comfortably under the cap.
+        let modest = streamed_initial_cap(Some(100), 2);
+        assert!(modest < MAX_INITIAL_CAP_BYTES);
+        assert!(modest >= 100 * 7, "at least the per-row overhead budget");
+
+        // Inflated / adversarial estimate must NOT pre-allocate gigabytes:
+        // it is clamped to the hard ceiling regardless of count or width.
+        assert_eq!(
+            streamed_initial_cap(Some(usize::MAX), 64),
+            MAX_INITIAL_CAP_BYTES
+        );
+        assert_eq!(
+            streamed_initial_cap(Some(1_000_000_000), 16),
+            MAX_INITIAL_CAP_BYTES
+        );
+
+        // Zero columns is treated as one: no overflow/panic, still bounded.
+        assert_eq!(
+            streamed_initial_cap(Some(usize::MAX), 0),
+            MAX_INITIAL_CAP_BYTES
+        );
+    }
 
     #[test]
     fn run_select_produces_row_description_then_data_rows() {
