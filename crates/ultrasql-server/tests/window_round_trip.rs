@@ -234,21 +234,213 @@ async fn first_value_and_last_value_within_partition() {
             )
         })
         .collect();
-    // first_value: constant min per partition.
-    // last_value over an ORDER BY frame defaults to current-row in
-    // PostgreSQL semantics; UltraSQL's kernel returns the partition
-    // maximum for the simpler whole-partition contract.
+    // PostgreSQL semantics: the default frame is RANGE UNBOUNDED
+    // PRECEDING AND CURRENT ROW, so first_value is the partition min but
+    // last_value is the CURRENT row (not the partition max).
     assert_eq!(
         observed,
         vec![
-            (1, 10, 10, 30),
-            (1, 20, 10, 30),
+            (1, 10, 10, 10),
+            (1, 20, 10, 20),
             (1, 30, 10, 30),
-            (2, 50, 50, 100),
-            (2, 75, 50, 100),
+            (2, 50, 50, 50),
+            (2, 75, 50, 75),
             (2, 100, 50, 100),
         ]
     );
+
+    shutdown(client, server_handle).await;
+}
+
+/// Case 11: `last_value` under the default frame returns the current
+/// row; widening to `UNBOUNDED FOLLOWING` returns the true last value.
+#[tokio::test]
+async fn last_value_default_vs_unbounded_following() {
+    let (client, _conn, server_handle) = start_server_and_connect().await;
+    client
+        .batch_execute("CREATE TABLE lvt (id INTEGER NOT NULL, v INTEGER NOT NULL)")
+        .await
+        .expect("create lvt");
+    client
+        .batch_execute("INSERT INTO lvt (id, v) VALUES (1, 10), (2, 20), (3, 30)")
+        .await
+        .expect("insert lvt");
+
+    let rows = client
+        .query(
+            "SELECT id, v, \
+                last_value(v) OVER (ORDER BY id) AS lv_default, \
+                last_value(v) OVER (ORDER BY id ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) AS lv_whole \
+             FROM lvt ORDER BY id",
+            &[],
+        )
+        .await
+        .expect("last_value query");
+    let observed: Vec<(i32, i32, i32, i32)> = rows
+        .iter()
+        .map(|r| {
+            (
+                r.get::<_, i32>(0),
+                r.get::<_, i32>(1),
+                r.get::<_, i32>(2),
+                r.get::<_, i32>(3),
+            )
+        })
+        .collect();
+    assert_eq!(
+        observed,
+        vec![(1, 10, 10, 30), (2, 20, 20, 30), (3, 30, 30, 30)]
+    );
+
+    shutdown(client, server_handle).await;
+}
+
+/// Case 1: `sum(v) OVER (ORDER BY id)` is a running total; `sum(v)
+/// OVER ()` is the whole-partition total.
+#[tokio::test]
+async fn aggregate_window_running_total_and_whole_partition() {
+    let (client, _conn, server_handle) = start_server_and_connect().await;
+    client
+        .batch_execute("CREATE TABLE s1 (id INTEGER NOT NULL, v INTEGER NOT NULL)")
+        .await
+        .expect("create s1");
+    client
+        .batch_execute("INSERT INTO s1 (id, v) VALUES (1,10),(2,20),(3,30),(4,40)")
+        .await
+        .expect("insert s1");
+
+    let rows = client
+        .query(
+            "SELECT id, v, \
+                sum(v) OVER (ORDER BY id) AS run_default, \
+                sum(v) OVER ()           AS whole_part \
+             FROM s1 ORDER BY id",
+            &[],
+        )
+        .await
+        .expect("running total query");
+    let observed: Vec<(i32, i32, i64, i64)> = rows
+        .iter()
+        .map(|r| {
+            (
+                r.get::<_, i32>(0),
+                r.get::<_, i32>(1),
+                r.get::<_, i64>(2),
+                r.get::<_, i64>(3),
+            )
+        })
+        .collect();
+    assert_eq!(
+        observed,
+        vec![
+            (1, 10, 10, 100),
+            (2, 20, 30, 100),
+            (3, 30, 60, 100),
+            (4, 40, 100, 100),
+        ]
+    );
+
+    shutdown(client, server_handle).await;
+}
+
+/// Case 5: RANGE vs ROWS cumulative with duplicate ORDER BY values.
+/// Peers share the RANGE result (stepped), ROWS counts each row.
+#[tokio::test]
+async fn aggregate_window_range_vs_rows_peers() {
+    let (client, _conn, server_handle) = start_server_and_connect().await;
+    client
+        .batch_execute("CREATE TABLE s5 (id INTEGER NOT NULL, g INTEGER NOT NULL, v INTEGER NOT NULL)")
+        .await
+        .expect("create s5");
+    client
+        .batch_execute("INSERT INTO s5 (id,g,v) VALUES (1,1,10),(2,1,20),(3,2,30),(4,2,40),(5,3,50)")
+        .await
+        .expect("insert s5");
+
+    let rows = client
+        .query(
+            "SELECT id, \
+                sum(v) OVER (ORDER BY g RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS range_csum, \
+                sum(v) OVER (ORDER BY g ROWS  BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS rows_csum \
+             FROM s5 ORDER BY id",
+            &[],
+        )
+        .await
+        .expect("range vs rows query");
+    let observed: Vec<(i32, i64, i64)> = rows
+        .iter()
+        .map(|r| (r.get::<_, i32>(0), r.get::<_, i64>(1), r.get::<_, i64>(2)))
+        .collect();
+    assert_eq!(
+        observed,
+        vec![
+            (1, 30, 10),
+            (2, 30, 30),
+            (3, 100, 60),
+            (4, 100, 100),
+            (5, 150, 150),
+        ]
+    );
+
+    shutdown(client, server_handle).await;
+}
+
+/// Case 16: RANGE offset with two ORDER BY columns is rejected.
+#[tokio::test]
+async fn range_offset_two_order_columns_errors() {
+    let (client, _conn, server_handle) = start_server_and_connect().await;
+    client
+        .batch_execute("CREATE TABLE s16 (id INTEGER NOT NULL, v INTEGER NOT NULL)")
+        .await
+        .expect("create s16");
+    client
+        .batch_execute("INSERT INTO s16 (id, v) VALUES (1, 10), (2, 20)")
+        .await
+        .expect("insert s16");
+
+    let err = client
+        .query(
+            "SELECT sum(v) OVER (ORDER BY id, v RANGE BETWEEN 1 PRECEDING AND CURRENT ROW) FROM s16",
+            &[],
+        )
+        .await
+        .expect_err("two ORDER BY columns must be rejected");
+    let db_err = err.as_db_error().expect("server db error");
+    assert!(
+        db_err.message().contains("exactly one ORDER BY column"),
+        "unexpected error: {db_err}"
+    );
+    assert_eq!(db_err.code().code(), "42P20", "sqlstate: {db_err:?}");
+
+    shutdown(client, server_handle).await;
+}
+
+/// Case 17: a negative ROWS frame offset is rejected at execution.
+#[tokio::test]
+async fn negative_rows_offset_errors() {
+    let (client, _conn, server_handle) = start_server_and_connect().await;
+    client
+        .batch_execute("CREATE TABLE s17 (id INTEGER NOT NULL, v INTEGER NOT NULL)")
+        .await
+        .expect("create s17");
+    client
+        .batch_execute("INSERT INTO s17 (id, v) VALUES (1, 10), (2, 20)")
+        .await
+        .expect("insert s17");
+
+    let err = client
+        .query(
+            "SELECT sum(v) OVER (ORDER BY id ROWS BETWEEN -1 PRECEDING AND CURRENT ROW) FROM s17",
+            &[],
+        )
+        .await
+        .expect_err("negative offset must be rejected");
+    let db_err = err.as_db_error().expect("server db error");
+    assert!(
+        db_err.message().contains("must not be negative"),
+        "unexpected error: {db_err}"
+    );
+    assert_eq!(db_err.code().code(), "22013", "sqlstate: {db_err:?}");
 
     shutdown(client, server_handle).await;
 }
@@ -266,19 +458,27 @@ async fn nth_value_returns_kth_row_per_partition() {
         )
         .await
         .expect("nth_value query");
-    let observed: Vec<(i32, i32, i32)> = rows
+    // PostgreSQL semantics: under the default running frame, nth_value(2)
+    // is NULL until the frame has grown to include the 2nd row.
+    let observed: Vec<(i32, i32, Option<i32>)> = rows
         .iter()
-        .map(|r| (r.get::<_, i32>(0), r.get::<_, i32>(1), r.get::<_, i32>(2)))
+        .map(|r| {
+            (
+                r.get::<_, i32>(0),
+                r.get::<_, i32>(1),
+                r.get::<_, Option<i32>>(2),
+            )
+        })
         .collect();
     assert_eq!(
         observed,
         vec![
-            (1, 10, 20),
-            (1, 20, 20),
-            (1, 30, 20),
-            (2, 50, 75),
-            (2, 75, 75),
-            (2, 100, 75),
+            (1, 10, None),
+            (1, 20, Some(20)),
+            (1, 30, Some(20)),
+            (2, 50, None),
+            (2, 75, Some(75)),
+            (2, 100, Some(75)),
         ]
     );
 

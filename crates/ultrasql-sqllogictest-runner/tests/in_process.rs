@@ -191,6 +191,53 @@ fn portable_corpus_includes_curated_filter_setops_shard() {
 }
 
 #[test]
+fn in_process_mode_runs_window_frames_shard() {
+    let bin = env!("CARGO_BIN_EXE_ultrasql-sqllogictest-runner");
+    let suite = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tests/slt/portable/window_frames.slt")
+        .canonicalize()
+        .expect("window-frames SLT shard exists");
+
+    let output = Command::new(bin)
+        .arg("--mode")
+        .arg("in-process")
+        .arg(suite)
+        .output()
+        .expect("run SQLLogicTest runner");
+
+    assert!(
+        output.status.success(),
+        "runner failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("failed=0"), "stdout:\n{stdout}");
+}
+
+#[test]
+fn portable_corpus_includes_window_frames_shard() {
+    let suite = repo_root().join("tests/slt/portable/window_frames.slt");
+    let text = fs::read_to_string(&suite).expect("curated window-frames SLT shard exists");
+    assert!(
+        text.contains("UltraSQL-authored portable SQLLogicTest shard"),
+        "{} must document authored provenance",
+        suite.display()
+    );
+    assert!(
+        text.contains("portable window frame coverage"),
+        "{} must name its reviewed scope",
+        suite.display()
+    );
+    let case_count = count_slt_cases(&text);
+    assert!(
+        (12..=40).contains(&case_count),
+        "{} must stay as a reviewed shard, got {case_count} cases",
+        suite.display()
+    );
+}
+
+#[test]
 fn portable_corpus_includes_scalar_expression_shard() {
     let suite = repo_root().join("tests/slt/portable/scalar_expressions.slt");
     let text = fs::read_to_string(&suite).expect("curated scalar expression SLT shard exists");

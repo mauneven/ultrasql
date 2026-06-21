@@ -136,6 +136,10 @@ ORDER BY id
 20
 0
 
+# Frame-sensitive value functions under the default running frame (RANGE
+# UNBOUNDED PRECEDING AND CURRENT ROW): first_value is the partition min,
+# but last_value is the CURRENT row (matching PostgreSQL, not the old
+# whole-partition broadcast).
 query IIII nosort
 SELECT id, amount, first_value(amount) OVER (PARTITION BY grp ORDER BY amount, id), last_value(amount) OVER (PARTITION BY grp ORDER BY amount, id)
 FROM slt_pg_aggregate_window
@@ -145,12 +149,13 @@ ORDER BY id
 1
 10
 10
-20
+10
 2
 20
 10
 20
 
+# nth_value(amount, 2) is NULL until the running frame includes a 2nd row.
 query III nosort
 SELECT id, amount, nth_value(amount, 2) OVER (PARTITION BY grp ORDER BY amount, id)
 FROM slt_pg_aggregate_window
@@ -159,7 +164,7 @@ ORDER BY id
 ----
 1
 10
-20
+NULL
 2
 20
 20

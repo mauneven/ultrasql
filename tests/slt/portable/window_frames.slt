@@ -1,0 +1,310 @@
+# UltraSQL-authored portable SQLLogicTest shard.
+# Scope: portable window frame coverage — ROWS / RANGE / GROUPS frame
+# modes, all bound kinds, EXCLUDE options, aggregate window functions
+# (SUM/AVG/COUNT/MIN/MAX/COUNT(*)), the default-frame contract, and
+# frame-sensitive value functions. Results match PostgreSQL semantics.
+
+statement ok
+CREATE TABLE wf (id INT NOT NULL, v INT NOT NULL)
+
+statement ok
+INSERT INTO wf VALUES (1,10),(2,20),(3,30),(4,40)
+
+# Case 1: default frame is a running total (RANGE UNBOUNDED..CURRENT ROW);
+# empty OVER() is the whole-partition total.
+query III nosort
+SELECT id, sum(v) OVER (ORDER BY id), sum(v) OVER ()
+FROM wf ORDER BY id
+----
+1
+10
+100
+2
+30
+100
+3
+60
+100
+4
+100
+100
+
+# Case 2: ROWS BETWEEN 1 PRECEDING AND CURRENT ROW (trailing pair).
+query II nosort
+SELECT id, sum(v) OVER (ORDER BY id ROWS BETWEEN 1 PRECEDING AND CURRENT ROW)
+FROM wf ORDER BY id
+----
+1
+10
+2
+30
+3
+50
+4
+70
+
+# Case 3: ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING (suffix).
+query II nosort
+SELECT id, sum(v) OVER (ORDER BY id ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING)
+FROM wf ORDER BY id
+----
+1
+100
+2
+90
+3
+70
+4
+40
+
+# Case 4: ROWS BETWEEN 1 PRECEDING AND 1 FOLLOWING (centered).
+query II nosort
+SELECT id, sum(v) OVER (ORDER BY id ROWS BETWEEN 1 PRECEDING AND 1 FOLLOWING)
+FROM wf ORDER BY id
+----
+1
+30
+2
+60
+3
+90
+4
+70
+
+# Case 8: EXCLUDE CURRENT ROW over a whole-partition frame.
+query II nosort
+SELECT id, sum(v) OVER (ORDER BY id ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING EXCLUDE CURRENT ROW)
+FROM wf ORDER BY id
+----
+1
+90
+2
+80
+3
+70
+4
+60
+
+statement ok
+CREATE TABLE wf5 (id INT NOT NULL, g INT NOT NULL, v INT NOT NULL)
+
+statement ok
+INSERT INTO wf5 VALUES (1,1,10),(2,1,20),(3,2,30),(4,2,40),(5,3,50)
+
+# Case 5: RANGE peers vs ROWS. Peers (g=1; g=2) share the RANGE result.
+query III nosort
+SELECT id,
+  sum(v) OVER (ORDER BY g RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW),
+  sum(v) OVER (ORDER BY g ROWS  BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW)
+FROM wf5 ORDER BY id
+----
+1
+30
+10
+2
+30
+30
+3
+100
+60
+4
+100
+100
+5
+150
+150
+
+statement ok
+CREATE TABLE wf6 (id INT NOT NULL, v INT NOT NULL)
+
+statement ok
+INSERT INTO wf6 VALUES (1,10),(2,15),(3,20),(4,40),(5,45)
+
+# Case 6: RANGE numeric value offset [v-10, v+10].
+query III nosort
+SELECT id,
+  sum(v)   OVER (ORDER BY v RANGE BETWEEN 10 PRECEDING AND 10 FOLLOWING),
+  count(*) OVER (ORDER BY v RANGE BETWEEN 10 PRECEDING AND 10 FOLLOWING)
+FROM wf6 ORDER BY id
+----
+1
+45
+3
+2
+45
+3
+3
+45
+3
+4
+85
+2
+5
+85
+2
+
+statement ok
+CREATE TABLE wf7 (id INT NOT NULL, g INT NOT NULL, v INT NOT NULL)
+
+statement ok
+INSERT INTO wf7 VALUES (1,1,10),(2,1,20),(3,2,30),(4,3,40),(5,3,50)
+
+# Case 7: GROUPS BETWEEN 1 PRECEDING AND CURRENT ROW.
+query III nosort
+SELECT id,
+  sum(v)   OVER (ORDER BY g GROUPS BETWEEN 1 PRECEDING AND CURRENT ROW),
+  count(*) OVER (ORDER BY g GROUPS BETWEEN 1 PRECEDING AND CURRENT ROW)
+FROM wf7 ORDER BY id
+----
+1
+30
+2
+2
+30
+2
+3
+60
+3
+4
+120
+3
+5
+120
+3
+
+statement ok
+CREATE TABLE wf9 (id INT NOT NULL, g INT NOT NULL, v INT NOT NULL)
+
+statement ok
+INSERT INTO wf9 VALUES (1,1,10),(2,1,20),(3,1,30),(4,2,40)
+
+# Case 9: EXCLUDE TIES vs EXCLUDE GROUP over peers (g=1 has three peers).
+query IIII nosort
+SELECT id,
+  sum(v) OVER (ORDER BY g RANGE BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING),
+  sum(v) OVER (ORDER BY g RANGE BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING EXCLUDE TIES),
+  sum(v) OVER (ORDER BY g RANGE BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING EXCLUDE GROUP)
+FROM wf9 ORDER BY id
+----
+1
+100
+50
+40
+2
+100
+60
+40
+3
+100
+70
+40
+4
+100
+100
+60
+
+# Case 12: ranking functions ignore the frame; sum honors it.
+statement ok
+CREATE TABLE wf12 (id INT NOT NULL, v INT NOT NULL)
+
+statement ok
+INSERT INTO wf12 VALUES (1,10),(2,20),(3,20),(4,40)
+
+query IIIII nosort
+SELECT id,
+  row_number() OVER (ORDER BY v),
+  rank()       OVER (ORDER BY v),
+  dense_rank() OVER (ORDER BY v),
+  sum(v)       OVER (ORDER BY v ROWS BETWEEN 1 PRECEDING AND CURRENT ROW)
+FROM wf12 ORDER BY id
+----
+1
+1
+1
+1
+10
+2
+2
+2
+2
+30
+3
+3
+2
+2
+40
+4
+4
+4
+3
+60
+
+# Case 13: no ORDER BY -> whole-partition default per group.
+statement ok
+CREATE TABLE wf13 (id INT NOT NULL, g TEXT NOT NULL, v INT NOT NULL)
+
+statement ok
+INSERT INTO wf13 VALUES (1,'a',10),(2,'a',20),(3,'b',30),(4,'b',40),(5,'b',50)
+
+query III nosort
+SELECT id,
+  sum(v)   OVER (PARTITION BY g),
+  count(*) OVER (PARTITION BY g)
+FROM wf13 ORDER BY id
+----
+1
+30
+2
+2
+30
+2
+3
+120
+3
+4
+120
+3
+5
+120
+3
+
+# Case 10: first/last/nth_value are frame-sensitive over a centered frame.
+statement ok
+CREATE TABLE wf10 (id INT NOT NULL, v INT NOT NULL)
+
+statement ok
+INSERT INTO wf10 VALUES (1,10),(2,20),(3,30),(4,40),(5,50)
+
+query IIII nosort
+SELECT id,
+  first_value(v) OVER (ORDER BY id ROWS BETWEEN 1 PRECEDING AND 1 FOLLOWING),
+  last_value(v)  OVER (ORDER BY id ROWS BETWEEN 1 PRECEDING AND 1 FOLLOWING),
+  nth_value(v,2) OVER (ORDER BY id ROWS BETWEEN 1 PRECEDING AND 1 FOLLOWING)
+FROM wf10 ORDER BY id
+----
+1
+10
+20
+20
+2
+10
+30
+20
+3
+20
+40
+30
+4
+30
+50
+40
+5
+40
+50
+50
+
+# Note: frame validation errors (case 16: RANGE offset needs exactly one
+# ORDER BY column -> SQLSTATE 42P20; case 17: negative ROWS offset ->
+# SQLSTATE 22013) are engine-divergent and therefore covered by the
+# server round-trip tests and binder unit tests rather than this portable
+# cross-engine differential shard.
