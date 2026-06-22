@@ -100,6 +100,10 @@ where
                 "execute_export_database: wrong plan",
             ));
         };
+        // EXPORT DATABASE writes a dump tree to a user-supplied server-side
+        // path using the database process's own filesystem privileges, so —
+        // exactly like server-side file COPY — it is restricted to superusers.
+        self.ensure_database_dump_file_access()?;
         match self.txn_state {
             TxnState::Idle => {
                 self.export_database_to_path(path)?;
@@ -121,6 +125,10 @@ where
                 "execute_import_database: wrong plan",
             ));
         };
+        // IMPORT DATABASE reads a dump tree from a user-supplied server-side
+        // path using the database process's own filesystem privileges, so —
+        // exactly like server-side file COPY — it is restricted to superusers.
+        self.ensure_database_dump_file_access()?;
         match self.txn_state {
             TxnState::Idle => {
                 self.import_database_from_path(path)?;
@@ -130,6 +138,26 @@ where
                 ServerError::Unsupported("IMPORT DATABASE inside an explicit transaction block"),
             )),
             TxnState::Failed(_) => Err(ServerError::TransactionAborted),
+        }
+    }
+
+    /// Gate for server-side database dump file access (`EXPORT DATABASE` /
+    /// `IMPORT DATABASE`). Both statements read or write a directory tree on
+    /// the database host using the server process's own filesystem
+    /// privileges, so — like server-side file COPY (see
+    /// [`Session::ensure_copy_server_file_access`]) — they are restricted to
+    /// superusers. Without this gate any role able to run the command could
+    /// write attacker-controlled bytes anywhere the server can write (host
+    /// takeover / exfiltration) or read another tenant's dump directory.
+    fn ensure_database_dump_file_access(&self) -> Result<(), ServerError> {
+        if self.current_role_is_superuser() {
+            Ok(())
+        } else {
+            Err(ServerError::InsufficientPrivilege(
+                "permission denied for server-side database dump file access: \
+                 must be superuser to use EXPORT DATABASE / IMPORT DATABASE"
+                    .to_owned(),
+            ))
         }
     }
 
