@@ -427,7 +427,7 @@ impl<L: PageLoader> HeapAccess<L> {
             }
             if total_restored > restored_before {
                 self.invalidate_int32_pair_payload_stats_relation(rel);
-                self.column_cache.bump_version(rel);
+                self.column_cache.bump_version(rel, xid);
             }
         }
         total_restored += self.rollback_delete_stamps(xid)?;
@@ -823,7 +823,7 @@ impl<L: PageLoader> HeapAccess<L> {
 
         if total_updated > 0 {
             self.invalidate_int32_pair_payload_stats_relation(rel);
-            self.column_cache.bump_version(rel);
+            self.column_cache.bump_version(rel, xid);
         }
 
         Ok(total_updated)
@@ -961,7 +961,7 @@ impl<L: PageLoader> HeapAccess<L> {
 
         if total_updated > 0 {
             self.invalidate_int32_pair_payload_stats_relation(rel);
-            self.column_cache.bump_version(rel);
+            self.column_cache.bump_version(rel, xid);
         }
 
         Ok(total_updated)
@@ -1272,7 +1272,7 @@ impl<L: PageLoader> HeapAccess<L> {
         drop(log);
 
         self.invalidate_int32_pair_payload_stats_relation(rel);
-        self.column_cache.bump_version(rel);
+        self.column_cache.bump_version(rel, xid);
         Ok(1)
     }
 }

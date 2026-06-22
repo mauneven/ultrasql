@@ -80,12 +80,13 @@ impl<L: PageLoader> HeapAccess<L> {
         payload: &[u8],
         opts: InsertOptions<'_>,
     ) -> Result<TupleId, HeapError> {
+        let writer_xid = opts.xmin;
         let tid = self.insert_inner(rel, payload, opts)?;
         // Invalidate the columnar projection cache for this
         // relation — a new row makes any cached `Vec<Column>`
         // stale until the next `SeqScan` re-builds it.
         self.invalidate_int32_pair_payload_stats_relation(rel);
-        self.column_cache.bump_version(rel);
+        self.column_cache.bump_version(rel, writer_xid);
         Ok(tid)
     }
 
@@ -357,7 +358,7 @@ impl<L: PageLoader> HeapAccess<L> {
 
         // Invalidate columnar projection cache.
         self.invalidate_int32_pair_payload_stats_relation(rel);
-        self.column_cache.bump_version(rel);
+        self.column_cache.bump_version(rel, opts.xmin);
         Ok(out)
     }
 
@@ -423,7 +424,7 @@ impl<L: PageLoader> HeapAccess<L> {
         }
 
         self.invalidate_int32_pair_payload_stats_relation(rel);
-        self.column_cache.bump_version(rel);
+        self.column_cache.bump_version(rel, opts.xmin);
         Ok(inserted)
     }
 

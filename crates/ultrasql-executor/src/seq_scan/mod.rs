@@ -430,19 +430,66 @@ where
 
         // Decide whether this scan should populate the cache as a
         // side effect. Skip the build when (a) the scan is reading
-        // from the cache already, (b) the scan is TID-augmented, or
-        // (c) the relation is empty (no point caching nothing).
+        // from the cache already, (b) the scan is TID-augmented,
+        // (c) the relation is empty (no point caching nothing), or
+        // (d) this snapshot cannot see the relation's latest writer.
+        //
+        // Condition (d) is the column-cache **coherence guard**. The
+        // cache is shared and keyed only on the relation's mutation
+        // version, with no per-snapshot qualifier; whatever projection
+        // we publish is served to *every* later scan at the same
+        // version. A relation's version is bumped at physical
+        // insert/update/delete time, which is *before* the writer
+        // commits — so the version can already reflect a writer's rows
+        // (or deletions) while a frozen snapshot (REPEATABLE READ /
+        // SERIALIZABLE, or any snapshot taken before that writer
+        // committed) still cannot see them. If such a behind-the-commit
+        // snapshot published its projection, it would omit committed
+        // rows or resurrect deleted ones for a newer reader served from
+        // the cache.
+        //
+        // `last_writer_xid` is the highest XID that has bumped this
+        // relation's version. The build snapshot may publish only when
+        // it can see that writer: its own writes (`is_current_xid`),
+        // or a writer that is no longer in progress
+        // (`!xid_in_progress`, i.e. committed/aborted and below
+        // `xmax`). A writer still in the snapshot's in-progress set, or
+        // newer than the snapshot's `xmax`, makes the projection
+        // potentially incoherent, so the scan walks the heap without
+        // publishing and the next coherent reader rebuilds the entry.
+        // The common autocommit reader takes a fresh snapshot after the
+        // writer committed, sees it, and still publishes — the hot path
+        // is unchanged.
+        //
+        // Read order matters: sample `target_version` *before*
+        // `last_writer_xid`. A concurrent mutation between the two reads
+        // then either advances `last_writer_xid` to a writer this
+        // snapshot cannot see (the gate below rejects the build) or
+        // advances the version past `target_version` (the version guard
+        // in `ColumnCache::put` drops the finalised entry). Sampling the
+        // version first leaves no window in which a freshly-bumped
+        // writer is missed by *both* checks.
         let cache_build = if cache_eligible && !cache_hit && block_count > 0 {
             let target_version = heap.column_cache.relation_version(relation);
-            match build_initial_builders(&codec, false) {
-                Ok(builders) => Some(CacheBuildState {
-                    builders,
-                    target_version,
-                }),
-                Err(err) => {
-                    tracing::warn!(error = %err, "seq scan column-cache build disabled");
-                    None
+            let snapshot_sees_last_writer = {
+                let writer = heap.column_cache.last_writer_xid(relation);
+                writer == ultrasql_core::Xid::INVALID
+                    || snapshot_box.is_current_xid(writer)
+                    || !snapshot_box.xid_in_progress(writer)
+            };
+            if snapshot_sees_last_writer {
+                match build_initial_builders(&codec, false) {
+                    Ok(builders) => Some(CacheBuildState {
+                        builders,
+                        target_version,
+                    }),
+                    Err(err) => {
+                        tracing::warn!(error = %err, "seq scan column-cache build disabled");
+                        None
+                    }
                 }
+            } else {
+                None
             }
         } else {
             None

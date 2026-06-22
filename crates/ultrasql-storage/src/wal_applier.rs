@@ -532,7 +532,7 @@ impl<L: PageLoader + 'static> HeapTarget for HeapAccess<L> {
             }
         }
 
-        self.column_cache.bump_version(rel);
+        self.column_cache.bump_version(rel, payload.writer_xid);
         Ok(())
     }
 
@@ -628,7 +628,7 @@ impl<L: PageLoader + 'static> HeapTarget for HeapAccess<L> {
             }
         }
 
-        self.column_cache.bump_version(rel);
+        self.column_cache.bump_version(rel, payload.writer_xid);
         Ok(())
     }
 
@@ -758,7 +758,7 @@ impl<L: PageLoader + 'static> HeapTarget for HeapAccess<L> {
                     });
                 }
             }
-            self.column_cache.bump_version(rel);
+            self.column_cache.bump_version(rel, payload.writer_xid);
         }
         Ok(())
     }
@@ -865,7 +865,8 @@ impl<L: PageLoader + 'static> HeapTarget for HeapAccess<L> {
             stamp_replayed_lsn(&mut page, record_lsn);
         }
 
-        self.column_cache.bump_version(page_id.relation);
+        self.column_cache
+            .bump_version(page_id.relation, payload.xmax);
         Ok(())
     }
 
@@ -937,7 +938,8 @@ impl<L: PageLoader + 'static> HeapTarget for HeapAccess<L> {
         }
 
         if applied {
-            self.column_cache.bump_version(page_id.relation);
+            self.column_cache
+                .bump_version(page_id.relation, payload.xmax);
         }
         Ok(())
     }
@@ -1017,7 +1019,8 @@ impl<L: PageLoader + 'static> HeapTarget for HeapAccess<L> {
         }
 
         if applied {
-            self.column_cache.bump_version(page_id.relation);
+            self.column_cache
+                .bump_version(page_id.relation, payload.xmax);
         }
         Ok(())
     }

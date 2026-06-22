@@ -46,7 +46,7 @@ use std::sync::Arc;
 
 use ahash::AHashMap;
 use parking_lot::RwLock;
-use ultrasql_core::{DataType, RelationId, Schema, Value};
+use ultrasql_core::{DataType, RelationId, Schema, Value, Xid};
 use ultrasql_vec::column::Column;
 
 /// Target row count per in-memory columnar segment.
@@ -266,6 +266,12 @@ pub struct ColumnCache {
 struct ColumnCacheInner {
     versions: AHashMap<RelationId, u64>,
     entries: AHashMap<RelationId, Arc<CachedColumns>>,
+    /// Highest XID that has mutated each relation since process start
+    /// (monotone per relation). Used as the column-cache **coherence
+    /// witness**: a scan may only publish a shared projection when its
+    /// building snapshot can see this writer. See
+    /// [`ColumnCache::last_writer_xid`].
+    last_writer_xid: AHashMap<RelationId, Xid>,
 }
 
 impl ColumnCache {
@@ -286,12 +292,36 @@ impl ColumnCache {
     /// Bump the version of `rel` and drop any cached entry for it.
     ///
     /// Called by every heap mutation path
-    /// (`insert` / `update` / `delete` / bulk variants).
-    pub fn bump_version(&self, rel: RelationId) {
+    /// (`insert` / `update` / `delete` / bulk variants) with the
+    /// `writer_xid` performing the mutation. The version is bumped at
+    /// **physical mutation time**, which is *before* the writer
+    /// commits; `writer_xid` is recorded as the relation's
+    /// [`last_writer_xid`](Self::last_writer_xid) so a later scan can
+    /// refuse to publish a projection from a snapshot that cannot yet
+    /// see this writer (see the coherence guard in `SeqScan::build`).
+    pub fn bump_version(&self, rel: RelationId, writer_xid: Xid) {
         let mut g = self.inner.write();
         let v = g.versions.entry(rel).or_insert(0);
         *v = v.saturating_add(1);
         g.entries.remove(&rel);
+        let last = g.last_writer_xid.entry(rel).or_insert(Xid::INVALID);
+        if writer_xid > *last {
+            *last = writer_xid;
+        }
+    }
+
+    /// Highest XID that has mutated `rel` since process start, or
+    /// [`Xid::INVALID`] if `rel` has never been mutated.
+    ///
+    /// A scan may only **publish** a shared columnar projection for
+    /// `rel` when its building snapshot can see this writer: otherwise
+    /// the relation's version already reflects rows (or deletions) the
+    /// snapshot cannot observe, so the projection would be incoherent
+    /// for the newer readers the version-keyed cache serves it to.
+    #[must_use]
+    pub fn last_writer_xid(&self, rel: RelationId) -> Xid {
+        let g = self.inner.read();
+        g.last_writer_xid.get(&rel).copied().unwrap_or(Xid::INVALID)
     }
 
     /// Look up the cached projection for `rel` at the current

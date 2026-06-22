@@ -95,7 +95,8 @@ impl<L: PageLoader> HeapAccess<L> {
                     vm.clear(new_tid.page.relation, new_tid.page.block);
                 }
                 self.invalidate_int32_pair_payload_stats_relation(old_tid.page.relation);
-                self.column_cache.bump_version(old_tid.page.relation);
+                self.column_cache
+                    .bump_version(old_tid.page.relation, opts.xid);
                 return Ok(outcome);
             }
             // Page had no room; fall through to non-HOT path.
@@ -157,7 +158,8 @@ impl<L: PageLoader> HeapAccess<L> {
             }
         }
         self.invalidate_int32_pair_payload_stats_relation(old_tid.page.relation);
-        self.column_cache.bump_version(old_tid.page.relation);
+        self.column_cache
+            .bump_version(old_tid.page.relation, opts.xid);
         Ok(outcome)
     }
 
@@ -412,7 +414,7 @@ impl<L: PageLoader> HeapAccess<L> {
         // outcome across every page-run.
         if let Some(rel) = hot_touched_relation {
             self.invalidate_int32_pair_payload_stats_relation(rel);
-            self.column_cache.bump_version(rel);
+            self.column_cache.bump_version(rel, opts.xid);
         }
 
         // Non-HOT fallback — bulk path.
@@ -501,7 +503,7 @@ impl<L: PageLoader> HeapAccess<L> {
             }
             total = checked_heap_count_add(total, fallback.len(), "updated tuple count overflow")?;
             self.invalidate_int32_pair_payload_stats_relation(rel);
-            self.column_cache.bump_version(rel);
+            self.column_cache.bump_version(rel, opts.xid);
         }
 
         Ok((total, outcomes))

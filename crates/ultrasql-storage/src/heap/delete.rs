@@ -678,7 +678,7 @@ impl<L: PageLoader> HeapAccess<L> {
         }
 
         for rel in restored_relations {
-            self.column_cache.bump_version(rel);
+            self.column_cache.bump_version(rel, xid);
         }
 
         Ok(total_restored)
@@ -759,7 +759,7 @@ impl<L: PageLoader> HeapAccess<L> {
         // Invalidate the columnar projection cache for this
         // relation — a mutated row makes any cached `Vec<Column>`
         // stale until the next `SeqScan` re-builds it.
-        self.column_cache.bump_version(tid.page.relation);
+        self.column_cache.bump_version(tid.page.relation, opts.xmax);
         Ok(())
     }
 
@@ -883,7 +883,7 @@ impl<L: PageLoader> HeapAccess<L> {
             // Column-cache invalidation: bump the relation's version
             // for every page we touch. The first bump invalidates the
             // entry; subsequent bumps just move the version forward.
-            self.column_cache.bump_version(page_id.relation);
+            self.column_cache.bump_version(page_id.relation, opts.xmax);
             total += slots.len();
         }
         Ok(total)
@@ -1223,7 +1223,7 @@ impl<L: PageLoader> HeapAccess<L> {
         }
 
         if total_deleted > 0 {
-            self.column_cache.bump_version(rel);
+            self.column_cache.bump_version(rel, xid);
         }
 
         Ok(total_deleted)
@@ -1344,7 +1344,7 @@ impl<L: PageLoader> HeapAccess<L> {
         })?;
 
         if total_deleted > 0 {
-            self.column_cache.bump_version(rel);
+            self.column_cache.bump_version(rel, xid);
         }
 
         Ok(total_deleted)
@@ -1450,7 +1450,7 @@ impl<L: PageLoader> HeapAccess<L> {
         })?;
 
         if total_deleted > 0 {
-            self.column_cache.bump_version(rel);
+            self.column_cache.bump_version(rel, xid);
         }
 
         Ok(total_deleted)
