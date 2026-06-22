@@ -25,9 +25,15 @@
 //!
 //! # Frame support
 //!
-//! For v0.5 the frame is always `ROWS BETWEEN UNBOUNDED PRECEDING AND
-//! CURRENT ROW` (the SQL default for functions that use the frame).
-//! `RANGE` frames and explicit frame bounds are a v0.6 follow-up.
+//! Explicit window frames are supported: `ROWS` / `RANGE` / `GROUPS` units
+//! with frame bounds (`UNBOUNDED PRECEDING`, `n PRECEDING`, `CURRENT ROW`,
+//! `n FOLLOWING`, `UNBOUNDED FOLLOWING`) and `EXCLUDE NO OTHERS / CURRENT ROW
+//! / GROUP / TIES`. When no frame is given the SQL default applies: `RANGE
+//! BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW` when an `ORDER BY` is present,
+//! else the whole partition. Aggregate window functions (`SUM` / `AVG` /
+//! `COUNT` / `MIN` / `MAX` / `COUNT(*)`) are evaluated over the frame's
+//! included rows; ranking and offset functions ignore the frame per the SQL
+//! standard.
 
 use std::cmp::Ordering;
 use std::collections::{HashMap, VecDeque};
