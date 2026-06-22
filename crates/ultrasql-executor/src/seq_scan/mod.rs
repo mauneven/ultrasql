@@ -443,23 +443,41 @@ where
 
         // Decide whether this scan should populate the cache as a
         // side effect. Skip the build when (a) the scan is reading
-        // from the cache already, (b) the scan is TID-augmented, or
-        // (c) the relation is empty (no point caching nothing).
-        let cache_build = if cache_eligible && !cache_hit && block_count > 0 {
-            let target_version = heap.column_cache.relation_version(relation);
-            match build_initial_builders(&codec, false) {
-                Ok(builders) => Some(CacheBuildState {
-                    builders,
-                    target_version,
-                }),
-                Err(err) => {
-                    tracing::warn!(error = %err, "seq scan column-cache build disabled");
-                    None
+        // from the cache already, (b) the scan is TID-augmented,
+        // (c) the relation is empty (no point caching nothing), or
+        // (d) the snapshot has concurrent in-progress transactions
+        // (`xip` non-empty).
+        //
+        // (d) closes a cross-transaction coherence hole: the shared
+        // `ColumnCache` is keyed only by the per-relation mutation
+        // version, not by snapshot. A reader whose snapshot lists a
+        // concurrent writer in `xip` cannot see that writer's rows; if
+        // the writer then commits and bumps the version, this reader's
+        // rebuild at the new version would publish a projection that is
+        // already stale (missing the just-committed rows), poisoning the
+        // cache for every later reader. Only a reader with an empty
+        // `xip` observes the relation's fully-resolved state up to its
+        // `xmax`, and any subsequent commit bumps the version, so its
+        // published entry can never be silently stale. The common
+        // single-writer / autocommit hot path has an empty `xip`, so
+        // this is a zero-cost guard there.
+        let no_concurrent_writers = snapshot_box.xip().is_empty();
+        let cache_build =
+            if cache_eligible && !cache_hit && block_count > 0 && no_concurrent_writers {
+                let target_version = heap.column_cache.relation_version(relation);
+                match build_initial_builders(&codec, false) {
+                    Ok(builders) => Some(CacheBuildState {
+                        builders,
+                        target_version,
+                    }),
+                    Err(err) => {
+                        tracing::warn!(error = %err, "seq scan column-cache build disabled");
+                        None
+                    }
                 }
-            }
-        } else {
-            None
-        };
+            } else {
+                None
+            };
 
         Self {
             builders,
