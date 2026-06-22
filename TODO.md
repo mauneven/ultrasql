@@ -28,9 +28,16 @@ The top items by criticality and blast radius. These are the things that block a
    see its own writes made under an active SAVEPOINT, and the rolled-back-row hiding path
    (`is_visible_ext` / `SubxactOracle`) is dead code never invoked by any heap read path, with the
    `SUBXACT` infomask never stamped on writes. A first full-visibility attempt was reverted after an
-   adversarial review found data corruption and B-tree incoherence on `ROLLBACK TO`. It is bounded,
-   shippable, single-subsystem work (subxid stamping on every write fast-path + per-subxid index
-   undo + wiring the visibility oracle), and silently returns wrong results today. **Do this first.**
+   adversarial review found data corruption and B-tree incoherence on `ROLLBACK TO`. A
+   code-verified, corruption-proof design now exists —
+   [`docs/savepoint-subtransactions-design.md`](docs/savepoint-subtransactions-design.md): adopt
+   PostgreSQL's lossy-index + heap-recheck model (NO per-subxid index undo — the index read paths
+   already recheck heap visibility, so the index-undo problem that sank the first attempt is
+   dissolved), fix the two parent-stamp bugs (`bound_plan.rs:482`, `mvcc_maint.rs:163`), and
+   re-apply the reviewed-correct visibility/oracle/fold. It is deeply coupled (stamping ↔
+   own-write visibility ↔ commit/abort fold ↔ index model) with **no safe partial increment** (a
+   stamping fix alone trades one bug for another), so it is a dedicated multi-day effort gated on
+   the design's §5 adversarial battery before any push. Silently returns wrong results today. **Do this first.**
 2. **Predicate-precise SSI / serializable correctness** — column-range SSI degrades to relation-wide
    locks for most types and is not page/tuple/gap-precise; blocks any serializable-correctness claim
    (high).
