@@ -591,12 +591,35 @@ where
                 ))
             }
             TxnState::InTransaction(mut txn) | TxnState::Failed(mut txn) => {
-                if self
-                    .state
-                    .txn_manager
-                    .rollback_to_savepoint(&mut txn, name)
-                    .is_ok()
+                if let Ok(aborted_subxids) =
+                    self.state.txn_manager.rollback_to_savepoint(&mut txn, name)
                 {
+                    // Physically undo any in-place UPDATEs the rolled-back
+                    // subtransactions performed. ROLLBACK TO does not redo
+                    // the heap otherwise, so the post-image bytes would
+                    // linger and — once the parent commits and the row's
+                    // (correctly stamped) subxid is resolved — could be
+                    // surfaced to other backends. Undoing here restores the
+                    // pre-image in the slot for every access path.
+                    for sub_xid in &aborted_subxids {
+                        if let Err(e) = self.state.heap.rollback_in_place_updates(*sub_xid) {
+                            tracing::warn!(
+                                error = %e,
+                                "ROLLBACK TO SAVEPOINT: in-place undo failed"
+                            );
+                        }
+                    }
+                    // ROLLBACK TO changes visibility without a heap-version
+                    // bump, so drop any column-cache entry for the relations
+                    // this transaction has touched: a later same-txn or
+                    // cross-txn read must rebuild from the post-rollback
+                    // state rather than serve a savepoint-tainted projection.
+                    let modified_tables = self
+                        .pending_table_modifications
+                        .keys()
+                        .cloned()
+                        .collect::<Vec<_>>();
+                    self.invalidate_column_cache_for_tables(&modified_tables);
                     // Clear the failure flag: the rolled-back work is
                     // undone so the user can continue.
                     self.txn_state = TxnState::InTransaction(txn);
