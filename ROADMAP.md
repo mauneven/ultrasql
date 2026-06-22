@@ -146,8 +146,11 @@ file focused on what still blocks production.
 - OLTP commit-path losses (`insert_throughput_10k` → PostgreSQL,
   `mixed_oltp_pgbench_like` → SQLite/PostgreSQL): the per-commit cost is
   dominated by `full_fsync` (F_FULLFSYNC, true power-loss durability) in
-  `crates/ultrasql-wal/src/writer.rs::flush_current`, which is a *stronger*
-  guarantee than PostgreSQL's default macOS `fsync`. A durable-wait
+  `crates/ultrasql-wal/src/writer.rs::flush_current`. As of commit `963fc003`
+  `full_fsync` now backs *all* file-data fsyncs (data segments, checkpoint and
+  catalog/clog snapshots, WAL manifest, recovery, metadata, and export), not
+  just the WAL writer, so this is a *stronger* guarantee than PostgreSQL's
+  default macOS `fsync` across the whole engine, not just the log. A durable-wait
   micro-optimization (condvar wakeup instead of a 50 µs sleep-poll) was
   profiled, implemented, and reverted after a same-host A/B showed no
   improvement (~354 µs/op old vs ~384 µs/op new), because the fsync, not the

@@ -109,7 +109,9 @@ batches for clients that speak Arrow Flight.
   sharded page-table buckets keyed by `PageId`. Pins are reference-counted;
   a pinned page cannot be evicted. The pool is sized at startup; resizing is
   an RFC-level change. CLOCK-Pro is a known follow-up; the eviction trait
-  surface is kept stable so the upgrade is a drop-in.
+  surface is kept stable so the upgrade is a drop-in. Under pressure the pool
+  can also flush dirty pages to make eviction progress, gated by the WAL durable
+  LSN (see Contracts).
 - **Heap access method.** Slotted-page tuple storage with HOT
   (heap-only-tuple) chains for non-indexed updates to non-key columns.
   The tuple layout stays stable so archive/export tooling can inspect rows.
@@ -131,6 +133,13 @@ batches for clients that speak Arrow Flight.
 - Frame allocation never sleeps with a buffer-pool lock held; eviction
   uses try-locks and falls back to the CLOCK hand if the candidate is
   pinned.
+- On buffer-pool exhaustion the pool invokes an owning-service
+  `EvictionRelief` hook (installed at startup, run only after all frame/miss
+  latches are released) that flushes dirty frames whose page-LSN is at or below
+  the WAL's `durable_lsn` — forcing the WAL durable to the oldest unflushable
+  dirty LSN first when every dirty frame is blocked — then retries, up to a
+  bounded round count before surfacing `Exhausted`. Write-ahead-log ordering is
+  preserved (WAL before data) and relief never runs under a frame/miss latch.
 
 **Rationale.** A compact slotted-page format keeps OLTP updates cheap while
 remaining inspectable by tooling. Classic CLOCK approximates LRU at a fraction
@@ -150,9 +159,13 @@ same-table columnar shadow in `HeapAccess::column_cache`: committed DML
 bumps the relation version, queues a background rebuild, and drops stale
 columns. Rebuild scans use an MVCC snapshot, materialize fixed-width
 numeric columns into typed buffers, and record logical segment row
-counts for future on-disk segment spill. Scan replay validates the
-relation version before reading the shadow, so stale columnar data is
-never returned.
+counts for future on-disk segment spill. Both publishing to and reading from
+the shadow go through a snapshot-coherence gate
+(`ColumnCache::is_snapshot_coherent` / `get_for_snapshot`) that admits a
+snapshot to the version-keyed projection only when its in-progress set is empty
+and the version's last writer is invalid, own, or committed — i.e. the relation
+is quiescent for that snapshot. Under any concurrency the reader falls back to a
+correct heap scan, so stale or incoherent columnar data is never returned.
 
 **Performance implications.** The slotted-page layout keeps OLTP inserts on a
 compact row path. The B-link tree variant scales better than lock-coupling
@@ -183,7 +196,14 @@ is a known bottleneck and an open performance RFC.
 thread batches outstanding records into one WAL segment write per fsync
 window. The window is the smaller of (a) wall-clock 200 µs or (b) the
 batch size at which the next write would exceed 256 KiB. Both are
-tunable.
+tunable. The fsync at the end of each window is `full_fsync`
+(`crates/ultrasql-core/src/fsync.rs`), which on macOS issues `fcntl(F_FULLFSYNC)`
+to force the drive to flush its own write cache (as PostgreSQL and SQLite do),
+falling back to `sync_all` only on `ENOTSUP`/`EOPNOTSUPP`/`EINVAL`. The same
+`full_fsync` backs every other file-data barrier — data segments, catalog/clog
+snapshots, metadata, the WAL manifest, recovery truncation, and export — so a
+plain `sync_all` (which does not flush the drive cache on macOS) is never the
+last barrier before a committed write is reported durable.
 
 **Contracts.**
 
@@ -192,10 +212,14 @@ tunable.
 - Recovery replays records in LSN order. Truncation or CRC mismatch is
   treated as torn-write residue only at the final segment tail; corruption
   before later bytes or later segments is fatal.
-- WAL segments are 16 MiB and roll over inline when full. Segment recycling,
-  archiving, and retention-based reclamation are not yet implemented, so old
-  segments are retained (unbounded WAL growth and restart-replay time scaling
-  with total history are open items — see ROADMAP).
+- WAL segments are 16 MiB and roll over inline when full. Checkpoint-driven
+  segment recycling is implemented: `ultrasql_wal::truncate_below` removes whole
+  segments below a crash-safe floor (min of the redo point, the oldest
+  in-progress transaction LSN, and each vector-index snapshot LSN), written and
+  fsynced via the manifest before any segment is unlinked, and an automatic
+  checkpoint timer drives it — so WAL size and restart-replay time are bounded
+  by un-checkpointed work, not total history. Archiving and retention-based
+  reclamation beyond recycling remain open items (see ROADMAP).
 
 **Rationale.** Group commit is the single largest OLTP throughput
 multiplier on rotational storage and on NVMe under bursty write
@@ -322,7 +346,7 @@ produce parsers, not error stories.
    insert implicit casts per the SQL coercion matrix.
 3. **Lower.** Translate to a logical plan tree
    (`LogicalScan`, `LogicalFilter`, `LogicalProject`, `LogicalJoin`,
-   `LogicalAggregate`, `LogicalSort`, `LogicalLimit`,
+   `LogicalAggregate`, `LogicalWindow`, `LogicalSort`, `LogicalLimit`,
    `LogicalUnion`, `LogicalInsert`, `LogicalUpdate`, `LogicalDelete`,
    ...).
 
@@ -374,6 +398,9 @@ past 8 relations; we want to leave room for cross-block optimization.
 in two flavors: scalar (tuple-at-a-time) for OLTP and vectorized
 (batch-at-a-time) for OLAP. The optimizer tags each pipeline with its
 preferred flavor based on cardinality estimates and the operator mix.
+The executor includes a window operator (`WindowAgg`) supporting explicit
+frames (`ROWS`/`RANGE`/`GROUPS` bounds and `EXCLUDE`) and aggregate window
+functions over frames.
 
 **Parallelism.** Pipeline-level parallelism via partitioning. A
 parallel scan emits to N partitioned downstream pipelines, joined at a
@@ -427,6 +454,13 @@ it enters the planner; subsequent DDL in concurrent transactions does
 not perturb that statement's view. This stable snapshot is what allows online
 DDL to be safe.
 
+**Constraint evolution.** `ALTER TABLE ... ADD CONSTRAINT` supports `CHECK`,
+`UNIQUE`, and `PRIMARY KEY` (each validated against existing rows at `ADD` time
+and persisted in `pg_constraint`), and `DROP CONSTRAINT [IF EXISTS]` tombstones
+the constraint row and drops the backing unique index. `FOREIGN KEY` / `EXCLUDE`
+via `ALTER TABLE` are not supported and return `0A000`; declare them in
+`CREATE TABLE`.
+
 ---
 
 ## 12. ultrasql-protocol
@@ -466,6 +500,13 @@ pool sized to (cores − 2) by default.
 **Lifecycle.** `start` → load config → recover storage → initialize
 catalog cache → start WAL writer → start checkpointer → bind listener
 → accept → on `SIGTERM`, drain → checkpoint → flush WAL → exit.
+
+**Result path.** A large top-level Simple-Query `SELECT` whose encoded body
+exceeds the streaming high-water mark is streamed to the socket in bounded
+memory windows (carrying an autocommit transaction clone) rather than fully
+buffered, so peak wire-buffer memory is bounded by result size. Streaming is
+gated to the single-statement network path; the batch/embedded path always
+fully buffers.
 
 **Per-session transaction state.** Each connection owns a
 `TxnState` machine with three variants — `Idle`, `InTransaction(txn)`,

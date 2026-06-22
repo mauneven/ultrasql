@@ -1,6 +1,6 @@
 # Documentation Status Audit
 
-Last audited: 2026-06-16.
+Last audited: 2026-06-22.
 
 Scope: every first-party Markdown file found by:
 
@@ -39,8 +39,10 @@ unless quoting a prohibited claim in the claim-policy section.
 - Broad implemented surface exists: server, CLI, embedded Node/Bun, PostgreSQL
   wire protocol, parser, binder, optimizer, vectorized executor, MVCC heap, WAL,
   indexes, JSON/JSONB, text search, vector types, HNSW/IVFFlat, COPY, external
-  scans, regular views, export/import, pivot/unpivot, packaging, fuzz,
-  sanitizer, release, benchmark, and driver-certification work.
+  scans, regular views, export/import, pivot/unpivot, window functions with
+  explicit frames (ROWS/RANGE/GROUPS) and aggregate window functions, bounded
+  large-SELECT result streaming, packaging, fuzz, sanitizer, release, benchmark,
+  and driver-certification work.
 - Current benchmark claim remains narrow and honest: UltraSQL was the fastest
   measured engine on 17 of 24 workloads in the committed release-artifact
   DB-vs-DB scale sweep (pinned commit 77a92d7c) on the recorded Apple M4 host.
@@ -64,7 +66,7 @@ unless quoting a prohibited claim in the claim-policy section.
 
 ## First-Party Markdown Audit Ledger
 
-The audit covers these 85 files. "Checked" means the file was inspected for
+The audit covers these 96 files. "Checked" means the file was inspected for
 stale maturity language, unsupported production-readiness claims, and broad
 benchmark claims that are not backed by committed artifacts.
 
@@ -99,15 +101,19 @@ benchmark claims that are not backed by committed artifacts.
 | `docs/OPERATOR_SOAK.md` | release evidence gate; not-ready wording checked |
 | `docs/ai-database-strategy.md` | project documentation; checked for stale maturity/overclaim terms |
 | `docs/backup-restore.md` | project documentation; checked for stale maturity/overclaim terms |
+| `docs/benchmark-integrity-completion-2026-06.md` | project documentation; checked for stale maturity/overclaim terms |
 | `docs/catalog-upgrades.md` | project documentation; checked for stale maturity/overclaim terms |
 | `docs/chaos-recovery.md` | project documentation; checked for stale maturity/overclaim terms |
 | `docs/configuration.md` | project documentation; checked for stale maturity/overclaim terms |
 | `docs/documentation-status-audit.md` | project documentation; checked for stale maturity/overclaim terms |
 | `docs/driver-certification.md` | project documentation; checked for stale maturity/overclaim terms |
+| `docs/engineering-report-2026-06.md` | project documentation; checked for stale maturity/overclaim terms |
 | `docs/external-audits.md` | release evidence gate; not-ready wording checked |
 | `docs/external-validation-outreach.md` | status/claim surface; updated or checked against current evidence |
+| `docs/filtered-ann.md` | project documentation; checked for stale maturity/overclaim terms |
 | `docs/getting-started.md` | status/claim surface; updated or checked against current evidence |
 | `docs/hnsw-index-design.md` | project documentation; checked for stale maturity/overclaim terms |
+| `docs/hybrid-search.md` | project documentation; checked for stale maturity/overclaim terms |
 | `docs/incident-drills.md` | release evidence gate; not-ready wording checked |
 | `docs/index.md` | status/claim surface; updated or checked against current evidence |
 | `docs/install.md` | status/claim surface; updated or checked against current evidence |
@@ -143,9 +149,16 @@ benchmark claims that are not backed by committed artifacts.
 | `docs/testing/coverage-evidence-2026-05-29-workspace.md` | historical evidence ledger; keep dated entries, avoid rewriting old evidence |
 | `docs/testing/external-sql-test-reuse.md` | historical evidence ledger; keep dated entries, avoid rewriting old evidence |
 | `docs/testing/isolation-suite.md` | historical evidence ledger; keep dated entries, avoid rewriting old evidence |
+| `docs/transactional-embeddings.md` | project documentation; checked for stale maturity/overclaim terms |
+| `docs/vector-benchmarks.md` | benchmark/performance policy; checked for claim scoping |
+| `examples/node-rag/README.md` | test/imported fixture docs; no public maturity claim |
 | `external-audits/README.md` | release evidence gate; not-ready wording checked |
 | `fuzz/README.md` | fuzz docs; no public maturity claim |
 | `incident-drills/README.md` | release evidence gate; not-ready wording checked |
+| `operator-reports/2026-06-benchmark-row-analysis.md` | release evidence gate; not-ready wording checked |
+| `operator-reports/2026-06-hnsw-build-scaling.md` | release evidence gate; not-ready wording checked |
+| `operator-reports/2026-06-hnsw-hierarchical-layers.md` | release evidence gate; not-ready wording checked |
+| `operator-reports/2026-06-ivfflat-filtered-ann.md` | release evidence gate; not-ready wording checked |
 | `operator-reports/README.md` | release evidence gate; not-ready wording checked |
 | `packages/npm/README.md` | status/claim surface; updated or checked against current evidence |
 | `tests/isolation/NOTICE.hermitage.md` | test/imported fixture docs; no public maturity claim |

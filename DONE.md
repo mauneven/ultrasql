@@ -3,6 +3,146 @@
 Completed/addressed work moved out of [ROADMAP.md](ROADMAP.md). Keep this file
 as a concise evidence ledger; roadmap stays for open gates only.
 
+## 2026-06-22 window frames, eviction relief, bounded SELECT streaming, engine-wide F_FULLFSYNC
+
+A feature + durability + performance batch on top of `9f5ed3ec` (tip
+`953a2319`). Workspace tests, clippy (`--all-targets --all-features -D
+warnings`), and `cargo fmt --check` green.
+
+- **SQL window frames + aggregate window functions.** `OVER (...)` now accepts
+  explicit `ROWS` / `RANGE` / `GROUPS` units, frame bounds (`UNBOUNDED
+  PRECEDING`, `n PRECEDING`, `CURRENT ROW`, `n FOLLOWING`, `UNBOUNDED
+  FOLLOWING`), and `EXCLUDE NO OTHERS / CURRENT ROW / GROUP / TIES`, plus
+  aggregate window functions `SUM`/`AVG`/`COUNT`/`MIN`/`MAX(expr)` and
+  `COUNT(*)` over frames. Window calls nested inside function args, `CASE`,
+  `COALESCE`, casts, `IN`/`BETWEEN`, and array/row constructors are lifted and
+  evaluated; window-in-window and aggregate-of-window stay rejected with
+  `42P20`. Parser AST `crates/ultrasql-parser/src/ast/query.rs`
+  (`FrameUnits`/`FrameBound`/`FrameExclusion`/`WindowFrame`, `WindowSpec.frame`
+  boxed); executor `crates/ultrasql-executor/src/window_agg.rs`
+  (`FrameSpec`, `build_peer_groups`, `EXCLUDE` handling); lowering
+  `crates/ultrasql-server/src/pipeline/lower_query.rs` (`with_frame`); nested
+  lifting `crates/ultrasql-planner/src/binder/window.rs` (`extract_window_calls`
+  / `reject_nested_window`). Commits `004c1cb4`, `7e20b058`, `7b4bab77`,
+  `705d0915`, `953a2319`. Evidence: `crates/ultrasql-server/tests/window_round_trip.rs`
+  (17 pass incl. `aggregate_window_running_total_and_whole_partition`,
+  `aggregate_window_range_vs_rows_peers`,
+  `two_window_calls_nested_in_one_expression_evaluate`,
+  `window_call_nested_in_case_evaluates`,
+  `window_call_nested_in_coalesce_evaluates`) plus
+  `tests/slt/portable/window_frames.slt` (380 lines).
+- **Bounded-window large-SELECT result streaming.** A large top-level
+  Simple-Query `SELECT` whose encoded body exceeds the window high-water mark
+  streams to the socket in bounded memory windows instead of being fully
+  buffered, so peak wire-buffer memory is bounded independent of result
+  cardinality and a slow client throttles the pull. `statement_timeout` stays
+  armed across the entire windowed drain (mid-stream cancel emits `57014` then
+  `ReadyForQuery`). Streaming is gated to the single-statement network path; the
+  batch/embedded path asserts no streaming handle, fixing a txn-leak risk, and
+  the streamed pre-reservation is capped to bound OOM from inflated row
+  estimates. `crates/ultrasql-server/src/result_encoder.rs` (`StreamingSelect`,
+  `STREAM_WINDOW_HIGH_WATER_BYTES`, `encode_batch_into`),
+  `crates/ultrasql-server/src/session/run.rs` (`drive_streaming_select`,
+  batch-path assertion). Commits `013adbb6`, `6f0545bc`, `6d25711c`,
+  `62656cdf`, `d5ce4673`, `40b48b15`. Evidence:
+  `crates/ultrasql-server/src/tests/result_streaming.rs` (byte-identity +
+  bounded-memory harness).
+- **LSN-gated eviction relief (flush-on-evict).** Under buffer-pool exhaustion
+  the pool relieves pressure by flushing dirty pages, but only once a page's
+  page-LSN is at or below the WAL's `durable_lsn` (write-ahead-log rule
+  preserved); when every dirty page is blocked, relief forces the WAL durable to
+  the oldest unflushable dirty LSN to unblock eviction. Pinned frames are never
+  evicted or flushed. `crates/ultrasql-storage/src/buffer_pool.rs`
+  (`try_flush_dirty`, `EvictionRelief`, `set_eviction_relief`,
+  `oldest_unflushable_dirty_lsn`); WAL force-and-wait
+  `crates/ultrasql-wal/src/writer.rs` (`WalDurabilityHandle`,
+  `durability_handle()`). Commits `c11347db`, `06adfeed`, `60fc0009`,
+  `83f7d63e`, `bdacd882`, `90432b7d`. Also fixes a buffer-pool eviction TOCTOU:
+  the lock-free hit path re-validates page identity after pin and retries on
+  mismatch (`buffer_pool.rs`, commit `dd5bd8ab`). Evidence:
+  `crates/ultrasql-storage/tests/eviction_relief.rs` (5 pass incl.
+  `relief_respects_lsn_gate_with_sink`,
+  `pinned_frames_never_evicted_or_flushed`) and the regression test in
+  `buffer_pool.rs`.
+- **Engine-wide `F_FULLFSYNC` durability.** Every file-data fsync now routes
+  through `full_fsync` (`crates/ultrasql-core/src/fsync.rs`, `fcntl(F_FULLFSYNC)`
+  with `ENOTSUP`/`EOPNOTSUPP`/`EINVAL` fallback to `sync_all`), not just the WAL
+  writer: data-page segments (`segment.rs`), catalog/clog snapshots
+  (`snapshots.rs`), runtime metadata (`metadata_io.rs`), `EXPORT` files
+  (`export_import.rs`), WAL manifest (`manifest.rs`), and recovery truncation
+  (`recovery.rs`). Previously only the WAL used `F_FULLFSYNC`; every other
+  barrier used `sync_all`, which does not flush the drive's own write cache and
+  could silently lose committed data on macOS power loss. Commit `963fc003`.
+  Evidence: WAL replay over a partially-flushed page store —
+  `crates/ultrasql-storage/tests/recovery_partial_flush.rs`
+  (`wal_replay_over_partially_flushed_page_store_skips_and_redoes_per_page`
+  exercises the previously-never-run `should_skip_redo` skip branch, plus
+  `fpw_repairs_torn_page_while_lsn_gate_leaves_newer_page_alone`; 5 tests pass).
+  Commit `6922fae0`.
+
+## 2026-06-22 ALTER TABLE ADD CHECK / DROP CONSTRAINT
+
+`ALTER TABLE ... ADD CONSTRAINT` and `DROP CONSTRAINT [IF EXISTS]` extended
+beyond `CREATE TABLE`.
+
+- **The feature:** `ADD CONSTRAINT CHECK (...)` validates all visible rows
+  (`23514` on first violation), then is enforced by later DML and persisted
+  across restart; `ADD CONSTRAINT UNIQUE`/`PRIMARY KEY` reports a build-time
+  duplicate as `23505` naming the constraint and a duplicate constraint name as
+  `42710`; `DROP CONSTRAINT [IF EXISTS] name` returns `42704` (or no-ops under
+  `IF EXISTS`), tombstones the `pg_constraint` row, drops the backing unique
+  index, and removes the runtime `CHECK`, surviving restart. `ADD CONSTRAINT
+  FOREIGN KEY` and `ADD CONSTRAINT EXCLUDE` via `ALTER TABLE` are explicitly
+  rejected with `0A000` (declare them in `CREATE TABLE`); the parsed
+  `CASCADE`/`RESTRICT` qualifier on `DROP CONSTRAINT` is accepted but treated
+  identically.
+- **The code:** dispatch + execute in `crates/ultrasql-server/src/session/alter.rs`
+  (`execute_alter_add_check_constraint`, `execute_alter_drop_constraint`,
+  `persist_constraint_drop_tombstone`); binder
+  `crates/ultrasql-planner/src/binder/ddl/alter_table.rs`; catalog
+  `ConType::Dropped` + `lookup_constraint_by_name` + `remove_constraint` in
+  `crates/ultrasql-catalog/src/persistent/index_constraint.rs`; parser
+  `if_exists` in `crates/ultrasql-parser/src/statements/alter_table.rs`.
+  Commits `cf8e34ba`, `ac3770d0`, `e8a6969a`, `2720f383`, `d7711302`.
+- **Evidence:** `crates/ultrasql-server/tests/constraint_round_trip.rs` and
+  `crates/ultrasql-server/tests/alter_restart_round_trip.rs` (52 pass).
+
+## 2026-06-22 audit batch: jsonpath DoS, lock-table race, EXPORT superuser, protocol/catalog fixes
+
+A security/correctness batch that postdates the `2026-06-17/18` batch below.
+
+- **jsonpath recursion-depth DoS:** SQL/JSON path parse and predicate eval are
+  bounded at depth 128 (`MAX_JSON_PATH_PARSE_DEPTH`), returning `jsonpath ...
+  nested too deeply` instead of overflowing the stack.
+  `crates/ultrasql-executor/src/json_path.rs`. Commit `c8a770a9`.
+- **Lock-table prune/acquire race:** pruning re-checks the empty predicate
+  atomically under the shard lock via `remove_if`, so a concurrent acquirer is
+  not silently dropped. `crates/ultrasql-txn/src/lock.rs` (`remove_if`,
+  `prune_entry_if_empty`); regression test in `lock.rs`. Commit `4caa7965`.
+- **EXPORT/IMPORT DATABASE superuser gate:** both commands now require superuser
+  (mirrors server-side file `COPY`), closing a file-access escalation.
+  `crates/ultrasql-server/src/session/export_import.rs`. Commit `c8299fc6`.
+- **Binary `timetz` zone-offset sign:** binary `timetz` encodes the zone as
+  seconds *west* of UTC on read and write (extended protocol + binary `COPY`),
+  matching PostgreSQL. `crates/ultrasql-server/src/extended/codec.rs`,
+  `crates/ultrasql-server/src/session/copy/binary.rs`; test
+  `timetz_round_trip.rs`. Commit `6ce01df2`.
+- **Float text format on empty result-format Bind:** float columns advertise
+  text in `RowDescription` when `Bind` sends an empty result-format list,
+  matching the `DataRow` encoding. `crates/ultrasql-server/src/extended/codec.rs`;
+  test `empty_result_format_float_column_advertises_text_matching_data_row`.
+  Commit `22815261`.
+- **`pg_indexes.indexdef`:** populated via `pg_get_indexdef` (renders `CREATE
+  INDEX`) instead of `NULL`.
+  `crates/ultrasql-server/src/pipeline/catalog_views/objects.rs`. Commit
+  `4df1b2e5`.
+- **Column-cache coherence:** the columnar read cache is published and read only
+  from a quiescent, writer-visible snapshot, never from a snapshot behind a
+  concurrent commit or a non-current snapshot. (This is the clean post-revert
+  redo — the in-chain attempts were inside the reverted SAVEPOINT range.)
+  `crates/ultrasql-server/src/session/execute/dml_txn.rs` (`is_snapshot_coherent`),
+  `crates/ultrasql-server/src/cached_select.rs`. Commits `f8842b39`, `b121812a`.
+
 ## 2026-06-20 WAL torn-tail repair: a second restart after a power-loss crash recovers
 
 Fixed a data-availability defect that made a database permanently unopenable
@@ -2110,7 +2250,11 @@ the per-crate ≥80% coverage gate are all green.
 - Aggregate/window regression baseline covers grouped `COUNT` / `SUM` /
   `AVG` / `MIN` / `MAX`, `HAVING`, and core window functions:
   `row_number`, `rank`, `dense_rank`, `lag`, `lead`, `first_value`,
-  `last_value`, `nth_value`, and `ntile`.
+  `last_value`, `nth_value`, and `ntile`, plus explicit window frames
+  (`ROWS`/`RANGE`/`GROUPS` bounds and `EXCLUDE`) and aggregate window functions
+  over those frames (see the window-frame conformance battery in
+  `crates/ultrasql-server/tests/window_round_trip.rs` and
+  `tests/slt/portable/window_frames.slt`).
 - Type-coercion regression baseline covers explicit casts, assignment-compatible
   inserts, NULL casts, `COALESCE`, `CASE`, text casts, boolean casts, and
   overlength `VARCHAR` rejection.

@@ -41,7 +41,9 @@ completed evidence.
   `VARIANCE`, `CORR`, `PERCENTILE_CONT`, and
   `PERCENTILE_DISC` surfaces, including hypothetical-set aggregates,
   `DISTINCT` ordered-set forms, and additional multi-argument statistical
-  functions.
+  functions. Separately, `avg()` over an integer column returns double
+  precision (matching the DuckDB/SQLite differential oracle) rather than
+  PostgreSQL's `numeric`, so `avg` results are not arbitrary-precision.
 - PL/pgSQL, stored procedures, trigger semantics, event triggers, and
   extension loading are not complete.
 - There are two HNSW implementations. The production page-backed index
@@ -116,9 +118,13 @@ completed evidence.
   committed scoreboard, but the underlying `wal buffer full` failure is fixed in
   code: per-record backpressure is wired and a single record larger than the
   8 MiB WAL buffer is now admitted over-capacity. The artifact needs a re-run to
-  record a measurement. Separately, the WAL is never truncated — segments grow
-  unbounded and restart replays all history — which remains an open durability
-  gate (see `ROADMAP.md`, "WAL retention / segment recycling").
+  record a measurement. Checkpoint-driven WAL segment recycling is now
+  implemented: at each checkpoint the WAL is truncated below a crash-safe floor
+  (the minimum of the redo point, the oldest in-progress transaction's first
+  written LSN, and each vector-index snapshot LSN) via
+  `ultrasql_wal::truncate_below`, and an automatic checkpoint timer drives it, so
+  segments no longer grow unbounded and restart no longer replays all history.
+  Recycling is skipped when any required snapshot is not durable.
 
 ## Client ecosystem
 
