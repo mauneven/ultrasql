@@ -28,6 +28,36 @@ impl<L: PageLoader> HeapAccess<L> {
         Self::decode_tuple(tid, &owned)
     }
 
+    /// Resolve the pre-image payload for a tuple whose visibility check
+    /// returned [`Visibility::VisiblePreImage`].
+    ///
+    /// `current_payload` is the slot's current (post-image) bytes — i.e.
+    /// `HeapTuple::data` from a prior [`Self::fetch`]. Returns the
+    /// pre-image bytes the reader should observe (the youngest undo entry
+    /// whose writer is not visible to `snapshot`), or `None` if VACUUM has
+    /// already trimmed the undo entry (treat as invisible — the safe
+    /// direction). This is the access-path-agnostic counterpart to the
+    /// pre-image substitution the sequential-scan walker performs, so an
+    /// index scan surfaces the same row a seq scan would.
+    pub fn fetch_visible_pre_image<O: XidStatusOracle + ?Sized>(
+        &self,
+        tid: TupleId,
+        header: &TupleHeader,
+        current_payload: &[u8],
+        snapshot: &Snapshot,
+        oracle: &O,
+    ) -> Option<Vec<u8>> {
+        Self::lookup_undo_pre_image(
+            &self.undo_log,
+            tid.page.relation,
+            tid,
+            header,
+            current_payload,
+            snapshot,
+            oracle,
+        )
+    }
+
     /// Visibility-filtered sequential scan that yields **borrowed**
     /// slot bytes — zero `Vec<u8>` allocations per tuple.
     ///

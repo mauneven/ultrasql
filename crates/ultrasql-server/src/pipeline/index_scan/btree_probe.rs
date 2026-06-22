@@ -333,7 +333,21 @@ pub(super) fn fetch_visible_index_payload(
                 }
                 return Ok(None);
             }
-            Visibility::VisiblePreImage => return Ok(None),
+            Visibility::VisiblePreImage => {
+                // The slot holds the post-image of an in-place UPDATE this
+                // snapshot does not yet see committed (or one performed under
+                // a rolled-back savepoint). Surface the pre-image from the
+                // undo log, exactly as the sequential-scan walker does, so an
+                // index lookup agrees with a seq scan. A missing undo entry
+                // (VACUUM-trimmed) resolves to "not found".
+                return Ok(ctx.heap.fetch_visible_pre_image(
+                    current,
+                    &tuple.header,
+                    &tuple.data,
+                    &ctx.snapshot,
+                    ctx.oracle.as_ref(),
+                ));
+            }
         }
     }
     Err(ServerError::ddl(

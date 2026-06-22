@@ -357,7 +357,18 @@ impl LateMaterializeScan {
                     }
                     return Ok(None);
                 }
-                Visibility::VisiblePreImage => return Ok(None),
+                Visibility::VisiblePreImage => {
+                    // Surface the undo-log pre-image so a late-materialized
+                    // index read agrees with a sequential scan (see the
+                    // matching arm in `btree_probe::fetch_visible_index_payload`).
+                    return Ok(self.heap.fetch_visible_pre_image(
+                        current,
+                        &tuple.header,
+                        &tuple.data,
+                        &self.snapshot,
+                        self.oracle.as_ref(),
+                    ));
+                }
             }
         }
         Err(ultrasql_executor::ExecError::Internal(
