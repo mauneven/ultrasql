@@ -297,7 +297,11 @@ impl<L: PageLoader + Send + Sync + std::fmt::Debug + 'static> Operator for Fused
                 if let Some(lock) = &self.target_tid_lock {
                     let waited = lock(*tid).map_err(ExecError::TypeMismatch)?;
                     if waited && self.refresh_snapshot_after_lock {
-                        update_snapshot = self.oracle.statement_snapshot(self.xid, self.command_id);
+                        update_snapshot = self.oracle.statement_snapshot(
+                            self.xid,
+                            self.command_id,
+                            &self.snapshot,
+                        );
                         refreshed_after_lock = true;
                     }
                 }
@@ -323,7 +327,11 @@ impl<L: PageLoader + Send + Sync + std::fmt::Debug + 'static> Operator for Fused
                             && self.refresh_snapshot_after_lock
                             && !refreshed_after_lock =>
                     {
-                        update_snapshot = self.oracle.statement_snapshot(self.xid, self.command_id);
+                        update_snapshot = self.oracle.statement_snapshot(
+                            self.xid,
+                            self.command_id,
+                            &self.snapshot,
+                        );
                         self.heap
                             .update_int32_pair_tid_inplace_undo(
                                 UpdateInt32PairTid {

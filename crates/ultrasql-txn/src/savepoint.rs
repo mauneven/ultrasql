@@ -91,6 +91,13 @@ pub struct SubtxnManager {
     /// manager after updating the CLOG) and never removed — aborted state
     /// is permanent.
     rolled_back: Mutex<HashSet<Xid>>,
+    /// XIDs of subtransactions that have been **released** (merged up into
+    /// the parent) while the parent transaction is still open.  Their
+    /// writes remain visible to the parent — and behave like *self* for
+    /// own-write visibility — until the top-level transaction commits or
+    /// aborts.  Populated by [`Self::record_merged_up`] on `RELEASE`;
+    /// folded into the parent's CLOG status at top-level commit/abort.
+    merged_up: Mutex<HashSet<Xid>>,
 }
 
 impl Clone for SubtxnManager {
@@ -103,10 +110,12 @@ impl Clone for SubtxnManager {
     fn clone(&self) -> Self {
         let stack_clone = self.stack.lock().clone();
         let rolled_back_clone = self.rolled_back.lock().clone();
+        let merged_up_clone = self.merged_up.lock().clone();
         Self {
             parent_xid: self.parent_xid,
             stack: Mutex::new(stack_clone),
             rolled_back: Mutex::new(rolled_back_clone),
+            merged_up: Mutex::new(merged_up_clone),
         }
     }
 }
@@ -120,6 +129,7 @@ impl SubtxnManager {
             parent_xid: parent,
             stack: Mutex::new(Vec::new()),
             rolled_back: Mutex::new(HashSet::new()),
+            merged_up: Mutex::new(HashSet::new()),
         }
     }
 
@@ -237,6 +247,59 @@ impl SubtxnManager {
     #[must_use]
     pub fn is_rolled_back(&self, subxid: Xid) -> bool {
         self.rolled_back.lock().contains(&subxid)
+    }
+
+    /// Record `subxid` as having been **released** (merged up into the
+    /// parent) while the parent is still open.
+    ///
+    /// Called by the transaction manager after marking the subtransaction
+    /// `Committed` in the CLOG on `RELEASE SAVEPOINT`.  The subxid is then
+    /// treated as *self* for own-write visibility until the top-level
+    /// transaction resolves, matching PostgreSQL's
+    /// `TransactionIdIsCurrentTransactionId` semantics.
+    pub fn record_merged_up(&self, subxid: Xid) {
+        self.merged_up.lock().insert(subxid);
+    }
+
+    /// This transaction's own *live* (still on the stack) plus
+    /// *merged-up* (released, parent still open) subtransaction XIDs,
+    /// sorted ascending and de-duplicated.
+    ///
+    /// This is the set treated as *self* by the visibility predicate.
+    /// Empty when no savepoint is or was active in this transaction.
+    #[must_use]
+    pub fn own_live_subxids_sorted(&self) -> Vec<Xid> {
+        let mut out: Vec<Xid> = {
+            let stack = self.stack.lock();
+            let merged = self.merged_up.lock();
+            stack
+                .iter()
+                .map(|s| s.xid)
+                .chain(merged.iter().copied())
+                .collect()
+        };
+        out.sort_unstable();
+        out.dedup();
+        out
+    }
+
+    /// This transaction's rolled-back subtransaction XIDs, sorted
+    /// ascending.  Empty when nothing was rolled back.
+    #[must_use]
+    pub fn rolled_back_sorted(&self) -> Vec<Xid> {
+        let mut out: Vec<Xid> = self.rolled_back.lock().iter().copied().collect();
+        out.sort_unstable();
+        out
+    }
+
+    /// This transaction's merged-up (released, parent still open)
+    /// subtransaction XIDs, sorted ascending.  Empty when nothing was
+    /// released.
+    #[must_use]
+    pub fn merged_up_sorted(&self) -> Vec<Xid> {
+        let mut out: Vec<Xid> = self.merged_up.lock().iter().copied().collect();
+        out.sort_unstable();
+        out
     }
 }
 
