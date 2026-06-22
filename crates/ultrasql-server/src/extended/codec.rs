@@ -263,11 +263,15 @@ fn decode_param_binary(bytes: &[u8], oid: Option<u32>) -> Result<Value, DecodeEr
             if bytes.len() != 12 {
                 return Err(DecodeError::BadBytes);
             }
+            // PostgreSQL's binary timetz encodes the zone as seconds WEST of
+            // UTC, whereas our internal `offset_seconds` is east-positive.
+            // Negate the wire field to convert back to the internal sign.
+            let wire_zone = i32::from_be_bytes([bytes[8], bytes[9], bytes[10], bytes[11]]);
             Ok(Value::TimeTz {
                 micros: i64::from_be_bytes([
                     bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
                 ]),
-                offset_seconds: i32::from_be_bytes([bytes[8], bytes[9], bytes[10], bytes[11]]),
+                offset_seconds: wire_zone.wrapping_neg(),
             })
         }
         PG_OID_TEXT | PG_OID_VARCHAR | PG_OID_BPCHAR | PG_OID_TSVECTOR | PG_OID_TSQUERY => {
@@ -401,7 +405,10 @@ pub(super) fn encode_binary_value_typed(
             unpack_timetz(c.data()[row]).map(|(micros, offset_seconds)| {
                 let mut out = Vec::with_capacity(12);
                 out.extend_from_slice(&micros.to_be_bytes());
-                out.extend_from_slice(&offset_seconds.to_be_bytes());
+                // PostgreSQL's binary timetz encodes the zone as seconds WEST
+                // of UTC; our internal `offset_seconds` is east-positive, so
+                // negate to match the wire convention.
+                out.extend_from_slice(&offset_seconds.wrapping_neg().to_be_bytes());
                 out
             })
         }
@@ -867,6 +874,36 @@ mod tests {
             .unwrap(),
             pg_numeric_12_340()
         );
+    }
+
+    #[test]
+    fn binary_timetz_zone_offset_uses_postgres_west_positive_sign() {
+        use ultrasql_core::pack_timetz;
+
+        // +05:30 east of UTC → internal +19800 → PG wire -19800 (west).
+        for (offset_seconds, pg_wire_zone) in [(19_800_i32, -19_800_i32), (-28_800, 28_800)] {
+            let packed = pack_timetz(4_000, offset_seconds).expect("pack timetz");
+            let column = Column::Int64(NumericColumn::from_data(vec![packed]));
+            let bytes =
+                encode_binary_value_typed(&column, 0, &DataType::TimeTz).expect("encode timetz");
+            assert_eq!(bytes.len(), 12);
+            let wire_zone = i32::from_be_bytes([bytes[8], bytes[9], bytes[10], bytes[11]]);
+            assert_eq!(
+                wire_zone, pg_wire_zone,
+                "binary timetz zone must be west-positive for internal offset {offset_seconds}"
+            );
+
+            // Decoding the PG-convention bytes restores the internal sign.
+            let decoded = decode_param_binary(&bytes, Some(PG_OID_TIMETZ)).expect("decode timetz");
+            assert_eq!(
+                decoded,
+                Value::TimeTz {
+                    micros: 4_000,
+                    offset_seconds,
+                },
+                "binary timetz must round-trip with correct sign"
+            );
+        }
     }
 
     #[test]

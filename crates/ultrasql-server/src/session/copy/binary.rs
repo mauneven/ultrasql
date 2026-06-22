@@ -92,7 +92,10 @@ pub(super) fn binary_copy_cell_bytes(
         ) => {
             let mut out = Vec::with_capacity(12);
             out.extend_from_slice(&micros.to_be_bytes());
-            out.extend_from_slice(&offset_seconds.to_be_bytes());
+            // PostgreSQL's binary timetz encodes the zone as seconds WEST of
+            // UTC; our internal `offset_seconds` is east-positive, so negate
+            // to match the wire convention.
+            out.extend_from_slice(&offset_seconds.wrapping_neg().to_be_bytes());
             out
         }
         (DataType::Decimal { .. }, Value::Decimal { value, scale }) => {
@@ -319,11 +322,15 @@ pub(super) fn decode_binary_copy_cell(
         }
         DataType::TimeTz => {
             exact(12)?;
+            // PostgreSQL's binary timetz encodes the zone as seconds WEST of
+            // UTC, whereas our internal `offset_seconds` is east-positive.
+            // Negate the wire field to convert back to the internal sign.
+            let wire_zone = i32::from_be_bytes([bytes[8], bytes[9], bytes[10], bytes[11]]);
             Ok(Value::TimeTz {
                 micros: i64::from_be_bytes([
                     bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
                 ]),
-                offset_seconds: i32::from_be_bytes([bytes[8], bytes[9], bytes[10], bytes[11]]),
+                offset_seconds: wire_zone.wrapping_neg(),
             })
         }
         DataType::Decimal { .. } => decode_pg_numeric_binary(bytes)

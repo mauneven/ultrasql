@@ -5,9 +5,42 @@ use ultrasql_executor::RowCodec;
 
 use super::super::super::jsonb_ingest::JsonbShapeCache;
 use super::super::binary::{
-    append_binary_copy_header, append_binary_copy_row, append_i16_be, decode_binary_copy_payload,
+    append_binary_copy_header, append_binary_copy_row, append_i16_be, binary_copy_cell_bytes,
+    decode_binary_copy_cell, decode_binary_copy_payload,
 };
 use super::{entry_with_schema, schema};
+
+/// PostgreSQL's binary `timetz` encodes the zone as seconds WEST of UTC,
+/// while UltraSQL's internal `offset_seconds` is east-positive. The binary
+/// COPY boundary must therefore negate the zone on the wire. This asserts the
+/// exact wire int32 matches PG's west-positive convention (a plain internal
+/// round trip would hide the sign error, since two negations cancel).
+#[test]
+fn binary_copy_timetz_zone_offset_uses_postgres_west_positive_sign() {
+    // +05:30 east of UTC → internal +19800 → PG wire -19800 (west-positive).
+    for (offset_seconds, pg_wire_zone) in [(19_800_i32, -19_800_i32), (-28_800, 28_800)] {
+        let value = Value::TimeTz {
+            micros: 4_000,
+            offset_seconds,
+        };
+        let bytes = binary_copy_cell_bytes(&value, &DataType::TimeTz).expect("encode timetz");
+        assert_eq!(bytes.len(), 12);
+        let wire_zone = i32::from_be_bytes([bytes[8], bytes[9], bytes[10], bytes[11]]);
+        assert_eq!(
+            wire_zone, pg_wire_zone,
+            "binary timetz zone must be west-positive for internal offset {offset_seconds}"
+        );
+
+        // And decoding those PG-convention bytes restores the internal sign.
+        let mut cache = JsonbShapeCache::default();
+        let decoded = decode_binary_copy_cell(&bytes, &DataType::TimeTz, 0, &mut cache)
+            .expect("decode timetz");
+        assert_eq!(
+            decoded, value,
+            "binary timetz must round-trip with correct sign"
+        );
+    }
+}
 
 #[test]
 fn binary_copy_round_trips_rows_and_rejects_malformed_payloads() {
