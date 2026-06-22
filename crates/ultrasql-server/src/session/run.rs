@@ -247,7 +247,6 @@ where
         // request streaming.
         let outcome = self.execute_query(trimmed, true);
         self.state.workload_recorder.set_session_idle(self.pid);
-        drop(timeout_guard);
         let elapsed = started.elapsed();
         let rows = outcome.as_ref().map_or(0, |result| result.rows);
         let error = outcome.as_ref().err().map(ToString::to_string);
@@ -264,7 +263,19 @@ where
                 bind_params_redacted: false,
             });
 
-        match outcome {
+        // Keep the statement-timeout guard ARMED across the response send,
+        // not just the execute. A large SELECT streams its windows during
+        // `send_query_result_with_ready` → `drive_streaming_select`; the
+        // operator polls the cancel flag between batches, so the guard must
+        // stay live for the whole windowed drain. Dropping it before the
+        // drain (as the pre-streaming code did) left every window after
+        // window 0 running with no statement_timeout — a regression vs. the
+        // buffered path, which ran entirely under the guard. On timeout the
+        // flag trips, the next `encode_window` returns `Cancelled`, and the
+        // inline mid-stream error path emits `57014` + `ReadyForQuery` and
+        // aborts the txn. The guard is dropped once the send completes
+        // (below), so post-response maintenance runs unguarded as before.
+        let (send_result, ran_query) = match outcome {
             Ok(result) => {
                 // Append the trailing `ReadyForQuery` to the same
                 // wire-buffer the query result writes so the whole
@@ -275,18 +286,31 @@ where
                 // the cross_compare_sql bench shapes that issue one
                 // statement per wire roundtrip (UPDATE / DELETE /
                 // INSERT / mixed-oltp).
-                self.send_query_result_with_ready(result).await?;
-                if matches!(self.txn_state, TxnState::Idle) {
-                    self.run_post_response_maintenance();
-                }
+                (self.send_query_result_with_ready(result).await, true)
             }
             Err(err) => {
                 if !err.is_query_scoped() {
+                    // The guard drops here on the function-fatal error path,
+                    // resetting the cancel flag (mirrors the pre-streaming
+                    // ordering for a non-query-scoped error).
+                    drop(timeout_guard);
                     return Err(err);
                 }
-                self.send_error_with_ready(&err.to_string(), err.sqlstate())
-                    .await?;
+                (
+                    self.send_error_with_ready(&err.to_string(), err.sqlstate())
+                        .await,
+                    false,
+                )
             }
+        };
+        // Drain (or error report) finished: disarm the timer and reset the
+        // cancel flag before any post-response maintenance.
+        drop(timeout_guard);
+        send_result?;
+        // Post-response maintenance runs only after a successful query
+        // result (not after a query-scoped error), exactly as before.
+        if ran_query && matches!(self.txn_state, TxnState::Idle) {
+            self.run_post_response_maintenance();
         }
         Ok(())
     }
@@ -635,16 +659,38 @@ where
                         return Err(e.into());
                     }
                     if !more {
-                        // Drain complete. Commit the autocommit txn now
-                        // (cursor semantics: rows were read under the
-                        // snapshot, the commit finalises once exhausted).
+                        // Drain complete. The final window — including
+                        // `ReadyForQuery` — has already been written to the
+                        // socket above. Commit the autocommit txn now (cursor
+                        // semantics: rows were read under the snapshot, the
+                        // commit finalises once exhausted).
+                        //
+                        // Defensive: this commit runs *after* `ReadyForQuery`
+                        // is on the wire, so we must NOT surface a commit
+                        // failure as a second `ErrorResponse`/`ReadyForQuery`
+                        // (the client already saw a clean completion). For a
+                        // read-only Read-Committed SELECT the commit cannot
+                        // meaningfully fail; if it somehow does, log it and
+                        // keep the client's view a clean success. The CLOG
+                        // entry is left in whatever state `commit_transaction`
+                        // reached — a read-only txn writes no heap, so there
+                        // is nothing to roll back.
                         if let Some(txn) = commit_txn.take() {
-                            self.state.commit_transaction(
+                            match self.state.commit_transaction(
                                 txn,
                                 false,
                                 "streaming SELECT autocommit",
-                            )?;
-                            self.pending_post_commit_maintenance = true;
+                            ) {
+                                Ok(()) => self.pending_post_commit_maintenance = true,
+                                Err(e) => tracing::error!(
+                                    target: "ultrasqld",
+                                    pid = self.pid,
+                                    error = %e,
+                                    "post-drain autocommit commit failed after \
+                                     ReadyForQuery was flushed; not re-reporting \
+                                     to the client"
+                                ),
+                            }
                         }
                         buf.clear();
                         self.write_buf = buf;

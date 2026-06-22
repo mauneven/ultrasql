@@ -984,6 +984,17 @@ mod e2e {
     // dispatch context, these consumers take the whole-buffer path and the
     // bugs cannot occur.
 
+    /// Pull the SQLSTATE (`C` field) out of an `ErrorResponse`.
+    fn error_sqlstate(msgs: &[BackendMessage]) -> Option<String> {
+        msgs.iter().find_map(|m| match m {
+            BackendMessage::ErrorResponse { fields } => fields
+                .iter()
+                .find(|(code, _)| *code == b'C')
+                .map(|(_, value)| value.clone()),
+            _ => None,
+        })
+    }
+
     /// True when no transaction is currently in progress: the oldest
     /// in-progress XID has caught up to the next-to-allocate XID, i.e. the
     /// CLOG holds no `InProgress` entry. A leaked streaming handle would
@@ -1060,6 +1071,188 @@ mod e2e {
             state.txn_manager.oldest_in_progress(),
             state.txn_manager.next_xid()
         );
+
+        send(&mut client, &FrontendMessage::Terminate).await;
+        drop(client);
+        handle.await.expect("join").expect("clean exit");
+    }
+
+    /// BUG 3 — statement_timeout must stay armed across the streaming
+    /// drain. A small timeout on a large/slow streamed SELECT must return
+    /// SQLSTATE 57014 promptly (well under the test's 10s budget) and leave
+    /// the session/txn clean.
+    ///
+    /// Fails before the fix: the timeout guard was dropped before the
+    /// drain, so every window after window 0 ran with no statement_timeout
+    /// and the query never cancelled (it ran to completion).
+    #[tokio::test]
+    async fn statement_timeout_fires_during_streaming_drain() {
+        let (mut client, server_side) = tokio::io::duplex(8192);
+        let state = Arc::new(Server::with_sample_database());
+        let handle = tokio::spawn(handle_connection(server_side, Arc::clone(&state)));
+
+        startup(&mut client).await;
+
+        send(
+            &mut client,
+            &FrontendMessage::Query {
+                sql: "SET statement_timeout = 20".to_string(),
+            },
+        )
+        .await;
+        let _ = read_until_ready(&mut client).await;
+
+        // A huge streamed SELECT: generate_series rows stream past window 0,
+        // and the per-batch cancel poll trips the 20 ms timer mid-drain. The
+        // client keeps reading (read_until_ready loops), so the server is not
+        // blocked on backpressure — the timer, not EOF, ends the query.
+        send(
+            &mut client,
+            &FrontendMessage::Query {
+                sql: "SELECT * FROM generate_series(1, 200000000)".to_string(),
+            },
+        )
+        .await;
+
+        let (_, msgs) = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            read_until_ready(&mut client),
+        )
+        .await
+        .expect("streamed statement_timeout must resolve well under 10s");
+
+        // SQLSTATE 57014 (query_canceled), no CommandComplete (the stream
+        // did not finish), and a trailing ReadyForQuery so the session is
+        // usable again.
+        assert_eq!(
+            error_sqlstate(&msgs).as_deref(),
+            Some("57014"),
+            "expected 57014 query_canceled from the streamed drain timeout"
+        );
+        assert_eq!(
+            count_kind(&msgs, |m| matches!(
+                m,
+                BackendMessage::CommandComplete { .. }
+            )),
+            0,
+            "a cancelled stream must not emit CommandComplete"
+        );
+        assert!(matches!(
+            msgs.last().unwrap(),
+            BackendMessage::ReadyForQuery { status: b'I' }
+        ));
+
+        // The autocommit txn was aborted: no leaked in-progress XID.
+        assert!(
+            no_xid_leaked(&state),
+            "cancelled stream leaked an in-progress XID"
+        );
+
+        // Session recovers: disable the timeout and run a trivial query.
+        send(
+            &mut client,
+            &FrontendMessage::Query {
+                sql: "SET statement_timeout = 0".to_string(),
+            },
+        )
+        .await;
+        let _ = read_until_ready(&mut client).await;
+        send(
+            &mut client,
+            &FrontendMessage::Query {
+                sql: "SELECT 1".to_string(),
+            },
+        )
+        .await;
+        let (_, after) = read_until_ready(&mut client).await;
+        assert_eq!(command_tag_of(&after).as_deref(), Some("SELECT 1"));
+        assert!(matches!(
+            after.last().unwrap(),
+            BackendMessage::ReadyForQuery { status: b'I' }
+        ));
+
+        send(&mut client, &FrontendMessage::Terminate).await;
+        drop(client);
+        handle.await.expect("join").expect("clean exit");
+    }
+
+    /// BUG 3 / §3.2 — an operator error raised AFTER ≥1 window has been
+    /// flushed must report inline: `…DataRow · ErrorResponse · ReadyForQuery`
+    /// with NO CommandComplete and NO double-report, and the connection must
+    /// remain usable. Driven through the real `drive_streaming_select`, not
+    /// the encoder in isolation.
+    ///
+    /// The error is a per-row division-by-zero on the very last row, which
+    /// lands in a late batch — window 0 (and several more) flush cleanly
+    /// before the offending batch is pulled.
+    #[tokio::test]
+    async fn mid_stream_operator_error_reports_inline_and_session_recovers() {
+        let (mut client, server_side) = tokio::io::duplex(8192);
+        let state = Arc::new(Server::with_sample_database());
+        let handle = tokio::spawn(handle_connection(server_side, Arc::clone(&state)));
+
+        startup(&mut client).await;
+        let rows = 6_000usize;
+        seed_wide_table(&mut client, "mid_err", rows).await;
+
+        // `100 / (id - (rows-1))` divides by zero exactly on the last row
+        // (id = rows-1). Earlier batches stream fine; the final batch errors.
+        send(
+            &mut client,
+            &FrontendMessage::Query {
+                sql: format!("SELECT id, payload, 100 / (id - {}) FROM mid_err", rows - 1),
+            },
+        )
+        .await;
+        let (_, msgs) = read_until_ready(&mut client).await;
+
+        // At least one DataRow flushed before the error (proves we went
+        // through the streaming drain, not the pre-flush buffered path).
+        assert!(
+            count_kind(&msgs, |m| matches!(m, BackendMessage::DataRow { .. })) >= 1,
+            "expected DataRows before the mid-stream error"
+        );
+        // Division-by-zero SQLSTATE, no CommandComplete, exactly one
+        // ErrorResponse (no double-report), trailing ReadyForQuery 'I'.
+        assert_eq!(error_sqlstate(&msgs).as_deref(), Some("22012"));
+        assert_eq!(
+            count_kind(&msgs, |m| matches!(
+                m,
+                BackendMessage::CommandComplete { .. }
+            )),
+            0,
+            "a mid-stream error must not emit CommandComplete"
+        );
+        assert_eq!(
+            count_kind(&msgs, |m| matches!(m, BackendMessage::ErrorResponse { .. })),
+            1,
+            "the streaming branch must own error reporting (no double-report)"
+        );
+        assert!(matches!(
+            msgs.last().unwrap(),
+            BackendMessage::ReadyForQuery { status: b'I' }
+        ));
+
+        // The autocommit txn was aborted: no leaked in-progress XID.
+        assert!(
+            no_xid_leaked(&state),
+            "mid-stream error leaked an in-progress XID"
+        );
+
+        // Connection is still usable.
+        send(
+            &mut client,
+            &FrontendMessage::Query {
+                sql: "SELECT 1".to_string(),
+            },
+        )
+        .await;
+        let (_, after) = read_until_ready(&mut client).await;
+        assert_eq!(command_tag_of(&after).as_deref(), Some("SELECT 1"));
+        assert!(matches!(
+            after.last().unwrap(),
+            BackendMessage::ReadyForQuery { status: b'I' }
+        ));
 
         send(&mut client, &FrontendMessage::Terminate).await;
         drop(client);
