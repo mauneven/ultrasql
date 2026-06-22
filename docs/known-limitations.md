@@ -26,6 +26,17 @@ completed evidence.
   relation-level fallback, but not fully predicate-precise SSI. The covered
   Hermitage write-skew case aborts one transaction with SQLSTATE `40001`, but
   broader isolation schedules remain open.
+- `SAVEPOINT` / subtransactions are parsed and the savepoint stack is
+  maintained, but subtransaction *visibility* is incomplete: a transaction does
+  not see its own writes made under an active `SAVEPOINT` (such rows are stamped
+  with the subtransaction id, which the read snapshot does not yet treat as
+  current). A first attempt at full subtransaction visibility was reverted after
+  an adversarial review found it introduced data-corruption and B-tree
+  incoherence on `ROLLBACK TO` across the fast/fused write paths. Correct
+  support requires subxid stamping on every write fast-path (insert/update/
+  delete, including the fused and COPY paths) plus per-subxid index undo so
+  `ROLLBACK TO` restores physically-removed index entries; this is tracked as
+  dedicated work.
 - Broader aggregate coverage remains open beyond the covered `STDDEV`,
   `VARIANCE`, `CORR`, `PERCENTILE_CONT`, and
   `PERCENTILE_DISC` surfaces, including hypothetical-set aggregates,
