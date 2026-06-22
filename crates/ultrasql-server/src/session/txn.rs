@@ -405,12 +405,6 @@ where
                     return Err(e);
                 } else {
                     self.state.note_commit_for_gc();
-                    // Commit changed cross-transaction visibility for these
-                    // relations without a heap mutation; drop any version-
-                    // stamped column-cache entry a concurrent reader built
-                    // during the in-flight window so it rebuilds from the
-                    // now-committed state.
-                    self.invalidate_column_cache_for_tables(&modified_tables);
                     if let Err(e) =
                         self.maintain_aggregating_indexes_for_tables_after_commit(&modified_tables)
                     {
@@ -451,11 +445,6 @@ where
                     )));
                 }
                 let durable_abort_marker = !self.pending_table_modifications.is_empty();
-                let modified_tables = self
-                    .pending_table_modifications
-                    .keys()
-                    .cloned()
-                    .collect::<Vec<_>>();
                 if let Err(e) = self.state.abort_transaction(
                     txn,
                     durable_abort_marker,
@@ -464,7 +453,6 @@ where
                     self.clear_pending_dml_effects();
                     return Err(e);
                 }
-                self.invalidate_column_cache_for_tables(&modified_tables);
                 self.clear_pending_dml_effects();
                 // PostgreSQL emits the ROLLBACK tag here, not COMMIT.
                 Ok(SelectResult {
@@ -508,11 +496,6 @@ where
                 // Recovery treats WAL-observed, non-prepared XIDs with no
                 // commit record as aborted, so ordinary explicit rollback does
                 // not need a synchronous abort marker.
-                let modified_tables = self
-                    .pending_table_modifications
-                    .keys()
-                    .cloned()
-                    .collect::<Vec<_>>();
                 if let Err(e) = self
                     .state
                     .abort_transaction(txn, false, "explicit ROLLBACK")
@@ -520,10 +503,6 @@ where
                     self.clear_pending_dml_effects();
                     return Err(e);
                 }
-                // Abort made the transaction's writes vanish for everyone
-                // without a heap mutation; invalidate the stale column
-                // cache for the relations it touched.
-                self.invalidate_column_cache_for_tables(&modified_tables);
                 self.clear_pending_dml_effects();
                 Ok(SelectResult {
                     messages: vec![BackendMessage::CommandComplete {
@@ -591,35 +570,12 @@ where
                 ))
             }
             TxnState::InTransaction(mut txn) | TxnState::Failed(mut txn) => {
-                if let Ok(aborted_subxids) =
-                    self.state.txn_manager.rollback_to_savepoint(&mut txn, name)
+                if self
+                    .state
+                    .txn_manager
+                    .rollback_to_savepoint(&mut txn, name)
+                    .is_ok()
                 {
-                    // Physically undo any in-place UPDATEs the rolled-back
-                    // subtransactions performed. ROLLBACK TO does not redo
-                    // the heap otherwise, so the post-image bytes would
-                    // linger and — once the parent commits and the row's
-                    // (correctly stamped) subxid is resolved — could be
-                    // surfaced to other backends. Undoing here restores the
-                    // pre-image in the slot for every access path.
-                    for sub_xid in &aborted_subxids {
-                        if let Err(e) = self.state.heap.rollback_in_place_updates(*sub_xid) {
-                            tracing::warn!(
-                                error = %e,
-                                "ROLLBACK TO SAVEPOINT: in-place undo failed"
-                            );
-                        }
-                    }
-                    // ROLLBACK TO changes visibility without a heap-version
-                    // bump, so drop any column-cache entry for the relations
-                    // this transaction has touched: a later same-txn or
-                    // cross-txn read must rebuild from the post-rollback
-                    // state rather than serve a savepoint-tainted projection.
-                    let modified_tables = self
-                        .pending_table_modifications
-                        .keys()
-                        .cloned()
-                        .collect::<Vec<_>>();
-                    self.invalidate_column_cache_for_tables(&modified_tables);
                     // Clear the failure flag: the rolled-back work is
                     // undone so the user can continue.
                     self.txn_state = TxnState::InTransaction(txn);

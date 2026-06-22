@@ -389,22 +389,9 @@ where
         //   Utf8 columns lack the `with_nulls` / `from_parts`
         //   constructors `slice_column` would need, and the bench
         //   workloads never hit them on a cached path anyway.
-        // - The scanning snapshot must carry NO own subtransaction
-        //   (savepoint) context. The shared `ColumnCache` is keyed only
-        //   by relation version, which `ROLLBACK TO SAVEPOINT` does not
-        //   bump (it changes visibility without a heap mutation). A scan
-        //   whose snapshot sees savepoint-local rows (own live or
-        //   rolled-back subxids) must therefore neither read the cache
-        //   (it would miss its own savepoint writes) nor publish to it
-        //   (it would leak transaction-local rows to other snapshots).
-        //   Both subxid sets are empty for the common no-savepoint case,
-        //   so this is a zero-cost guard on the hot path.
-        let no_own_subxids = snapshot_box.own_live_subxids().is_empty()
-            && snapshot_box.own_rolled_back_subxids().is_empty();
         let cache_eligible = allow_cache
             && start_block == 0
             && !with_tids
-            && no_own_subxids
             && schema_all_fixed_numeric(codec.schema());
         let cache_read = if cache_eligible {
             heap.column_cache
@@ -443,41 +430,23 @@ where
 
         // Decide whether this scan should populate the cache as a
         // side effect. Skip the build when (a) the scan is reading
-        // from the cache already, (b) the scan is TID-augmented,
-        // (c) the relation is empty (no point caching nothing), or
-        // (d) the snapshot has concurrent in-progress transactions
-        // (`xip` non-empty).
-        //
-        // (d) closes a cross-transaction coherence hole: the shared
-        // `ColumnCache` is keyed only by the per-relation mutation
-        // version, not by snapshot. A reader whose snapshot lists a
-        // concurrent writer in `xip` cannot see that writer's rows; if
-        // the writer then commits and bumps the version, this reader's
-        // rebuild at the new version would publish a projection that is
-        // already stale (missing the just-committed rows), poisoning the
-        // cache for every later reader. Only a reader with an empty
-        // `xip` observes the relation's fully-resolved state up to its
-        // `xmax`, and any subsequent commit bumps the version, so its
-        // published entry can never be silently stale. The common
-        // single-writer / autocommit hot path has an empty `xip`, so
-        // this is a zero-cost guard there.
-        let no_concurrent_writers = snapshot_box.xip().is_empty();
-        let cache_build =
-            if cache_eligible && !cache_hit && block_count > 0 && no_concurrent_writers {
-                let target_version = heap.column_cache.relation_version(relation);
-                match build_initial_builders(&codec, false) {
-                    Ok(builders) => Some(CacheBuildState {
-                        builders,
-                        target_version,
-                    }),
-                    Err(err) => {
-                        tracing::warn!(error = %err, "seq scan column-cache build disabled");
-                        None
-                    }
+        // from the cache already, (b) the scan is TID-augmented, or
+        // (c) the relation is empty (no point caching nothing).
+        let cache_build = if cache_eligible && !cache_hit && block_count > 0 {
+            let target_version = heap.column_cache.relation_version(relation);
+            match build_initial_builders(&codec, false) {
+                Ok(builders) => Some(CacheBuildState {
+                    builders,
+                    target_version,
+                }),
+                Err(err) => {
+                    tracing::warn!(error = %err, "seq scan column-cache build disabled");
+                    None
                 }
-            } else {
-                None
-            };
+            }
+        } else {
+            None
+        };
 
         Self {
             builders,

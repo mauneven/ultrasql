@@ -6,34 +6,6 @@ impl<RW> Session<RW>
 where
     RW: AsyncRead + AsyncWrite + Unpin,
 {
-    /// Invalidate the version-stamped column cache for every relation
-    /// `tables` (lower-cased names) so a snapshot taken *after* this
-    /// transaction resolves rebuilds it from committed/aborted state.
-    ///
-    /// The `ColumnCache` is keyed only by a per-relation mutation
-    /// version. A row becoming visible (commit) or vanishing (abort /
-    /// `ROLLBACK TO`) changes visibility **without** a heap mutation, so
-    /// the version would otherwise stay put and a concurrent reader that
-    /// built (or is about to read) a cache entry during the in-flight
-    /// window would serve a stale projection. Bumping the version on
-    /// transaction resolution closes that window. No-op for the common
-    /// case where the transaction modified nothing.
-    pub(crate) fn invalidate_column_cache_for_tables(&self, tables: &[String]) {
-        if tables.is_empty() {
-            return;
-        }
-        let catalog = self.state.catalog_snapshot();
-        for name in tables {
-            let folded = name.to_ascii_lowercase();
-            if let Some(entry) = catalog.tables.get(&folded) {
-                self.state
-                    .heap
-                    .column_cache
-                    .bump_version(ultrasql_core::RelationId(entry.oid));
-            }
-        }
-    }
-
     pub(crate) fn note_dml_effect(
         &mut self,
         plan: &LogicalPlan,

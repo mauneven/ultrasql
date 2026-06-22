@@ -456,14 +456,7 @@ where
                 RelationId(entry.oid),
                 &payload_refs,
                 InsertOptions {
-                    // Use the *current* effective xid so a fast INSERT
-                    // performed under an active SAVEPOINT carries the
-                    // subtransaction's xid in `xmin` (matching the general
-                    // INSERT path in `txn_exec.rs`). Stamping `txn.xid`
-                    // (the parent) here let a ROLLBACK TO leave the row
-                    // bound to the parent, so the parent's COMMIT made the
-                    // rolled-back row permanently visible — data corruption.
-                    xmin: txn.current_xid(),
+                    xmin: txn.xid,
                     command_id: txn.current_command,
                     n_atts: 2,
                     wal: wal_sink_arc.as_deref(),

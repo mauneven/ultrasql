@@ -91,13 +91,6 @@ pub struct SubtxnManager {
     /// manager after updating the CLOG) and never removed — aborted state
     /// is permanent.
     rolled_back: Mutex<HashSet<Xid>>,
-    /// XIDs of subtransactions that have been **released** (merged up into
-    /// the parent) while the parent transaction is still open.  Their
-    /// writes remain visible to the parent — and behave like *self* for
-    /// own-write visibility — until the top-level transaction commits or
-    /// aborts.  Populated by [`Self::record_merged_up`] on `RELEASE`;
-    /// folded into the parent's CLOG status at top-level commit/abort.
-    merged_up: Mutex<HashSet<Xid>>,
 }
 
 impl Clone for SubtxnManager {
@@ -110,12 +103,10 @@ impl Clone for SubtxnManager {
     fn clone(&self) -> Self {
         let stack_clone = self.stack.lock().clone();
         let rolled_back_clone = self.rolled_back.lock().clone();
-        let merged_up_clone = self.merged_up.lock().clone();
         Self {
             parent_xid: self.parent_xid,
             stack: Mutex::new(stack_clone),
             rolled_back: Mutex::new(rolled_back_clone),
-            merged_up: Mutex::new(merged_up_clone),
         }
     }
 }
@@ -129,7 +120,6 @@ impl SubtxnManager {
             parent_xid: parent,
             stack: Mutex::new(Vec::new()),
             rolled_back: Mutex::new(HashSet::new()),
-            merged_up: Mutex::new(HashSet::new()),
         }
     }
 
@@ -184,37 +174,11 @@ impl SubtxnManager {
                     name: name.to_owned(),
                 })?;
 
-        // The target savepoint's own subxid is the low-water mark for
-        // "opened at or after this savepoint": subxids are allocated in
-        // strictly increasing order, so every subtransaction started at or
-        // after the target — whether still live on the stack or already
-        // RELEASEd into `merged_up` — has a subxid `>=` this value.
-        let cutoff = stack[pos].xid;
-
         // Drain from `pos` to the end.  The entry at `pos` itself is also
         // removed — after rollback the savepoint no longer exists and must be
         // re-established via another `SAVEPOINT name` if needed.
-        let mut removed: Vec<Xid> = stack.drain(pos..).map(|s| s.xid).collect();
+        let removed: Vec<Xid> = stack.drain(pos..).map(|s| s.xid).collect();
         drop(stack);
-
-        // Prune `merged_up`: a subtransaction that was RELEASEd *after* the
-        // target savepoint must still be discarded by ROLLBACK TO (PostgreSQL
-        // discards every subxact started after the named savepoint, released
-        // or not). `merged_up` grows monotonically on RELEASE and is never
-        // otherwise pruned, so without this an inner released savepoint's
-        // writes would survive a rollback to an outer savepoint — and be
-        // folded `Committed` at top-level commit. Move every merged-up subxid
-        // `>= cutoff` into the rolled-back set so it becomes invisible and is
-        // never folded up.
-        {
-            let mut merged = self.merged_up.lock();
-            let pruned: Vec<Xid> = merged.iter().copied().filter(|x| *x >= cutoff).collect();
-            for x in &pruned {
-                merged.remove(x);
-            }
-            drop(merged);
-            removed.extend(pruned);
-        }
         Ok(removed)
     }
 
@@ -273,59 +237,6 @@ impl SubtxnManager {
     #[must_use]
     pub fn is_rolled_back(&self, subxid: Xid) -> bool {
         self.rolled_back.lock().contains(&subxid)
-    }
-
-    /// Record `subxid` as having been **released** (merged up into the
-    /// parent) while the parent is still open.
-    ///
-    /// Called by the transaction manager after marking the subtransaction
-    /// `Committed` in the CLOG on `RELEASE SAVEPOINT`.  The subxid is then
-    /// treated as *self* for own-write visibility until the top-level
-    /// transaction resolves, matching PostgreSQL's
-    /// `TransactionIdIsCurrentTransactionId` semantics.
-    pub fn record_merged_up(&self, subxid: Xid) {
-        self.merged_up.lock().insert(subxid);
-    }
-
-    /// This transaction's own *live* (still on the stack) plus
-    /// *merged-up* (released, parent still open) subtransaction XIDs,
-    /// sorted ascending and de-duplicated.
-    ///
-    /// This is the set treated as *self* by the visibility predicate.
-    /// Empty when no savepoint is or was active in this transaction.
-    #[must_use]
-    pub fn own_live_subxids_sorted(&self) -> Vec<Xid> {
-        let mut out: Vec<Xid> = {
-            let stack = self.stack.lock();
-            let merged = self.merged_up.lock();
-            stack
-                .iter()
-                .map(|s| s.xid)
-                .chain(merged.iter().copied())
-                .collect()
-        };
-        out.sort_unstable();
-        out.dedup();
-        out
-    }
-
-    /// This transaction's rolled-back subtransaction XIDs, sorted
-    /// ascending.  Empty when nothing was rolled back.
-    #[must_use]
-    pub fn rolled_back_sorted(&self) -> Vec<Xid> {
-        let mut out: Vec<Xid> = self.rolled_back.lock().iter().copied().collect();
-        out.sort_unstable();
-        out
-    }
-
-    /// This transaction's merged-up (released, parent still open)
-    /// subtransaction XIDs, sorted ascending.  Empty when nothing was
-    /// released.
-    #[must_use]
-    pub fn merged_up_sorted(&self) -> Vec<Xid> {
-        let mut out: Vec<Xid> = self.merged_up.lock().iter().copied().collect();
-        out.sort_unstable();
-        out
     }
 }
 
@@ -505,59 +416,6 @@ mod tests {
         // First "dup" still exists.
         let snap = mgr.stack_snapshot();
         assert_eq!(snap[0].xid, xid(60));
-    }
-
-    // ── rollback_to prunes released (merged-up) inner subxids ───────────────
-
-    #[test]
-    fn rollback_to_prunes_released_inner_subxids() {
-        let mgr = SubtxnManager::new(xid(1));
-        let mut alloc = make_alloc(80);
-
-        let outer = mgr.savepoint("outer", &mut alloc, cid(0)).xid; // xid 80
-        let inner = mgr.savepoint("inner", &mut alloc, cid(1)).xid; // xid 81
-        // Release inner: it leaves the stack and joins merged_up. (The
-        // transaction manager records the merged-up xid; mirror that here.)
-        let released = mgr.release("inner").unwrap();
-        assert_eq!(released, inner);
-        mgr.record_merged_up(inner);
-        assert!(mgr.merged_up_sorted().contains(&inner));
-
-        // Rolling back to outer must discard outer AND the released inner.
-        let removed = mgr.rollback_to("outer").unwrap();
-        assert!(removed.contains(&outer));
-        assert!(
-            removed.contains(&inner),
-            "released inner subxid (>= outer's xid) must be discarded by ROLLBACK TO outer",
-        );
-        assert!(
-            !mgr.merged_up_sorted().contains(&inner),
-            "inner must be pruned from merged_up",
-        );
-        assert!(
-            !mgr.own_live_subxids_sorted().contains(&inner),
-            "inner must no longer be treated as self",
-        );
-    }
-
-    #[test]
-    fn rollback_to_keeps_released_subxids_older_than_target() {
-        let mgr = SubtxnManager::new(xid(1));
-        let mut alloc = make_alloc(90);
-
-        // Release an *earlier* savepoint, then set a later one and roll back
-        // to it: the earlier released subxid (xid < target) must survive.
-        let early = mgr.savepoint("early", &mut alloc, cid(0)).xid; // xid 90
-        mgr.release("early").unwrap();
-        mgr.record_merged_up(early);
-        let target = mgr.savepoint("target", &mut alloc, cid(1)).xid; // xid 91
-        let removed = mgr.rollback_to("target").unwrap();
-        assert!(removed.contains(&target));
-        assert!(
-            !removed.contains(&early),
-            "a released subxid older than the rollback target must survive",
-        );
-        assert!(mgr.merged_up_sorted().contains(&early));
     }
 
     #[test]
