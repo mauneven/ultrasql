@@ -656,17 +656,56 @@ impl LockManager {
     }
 
     fn prune_entry_if_empty(&self, tag: LockTag) {
-        // Try to remove the entry only if both grants and waiters are
-        // empty. We do the check under the entry lock to avoid TOCTOU.
-        if let Some(entry_ref) = self.table.get(&tag) {
-            let state = entry_ref.inner.lock();
-            if state.grants.is_empty() && state.waiters.is_empty() {
-                drop(state);
-                drop(entry_ref);
-                self.table.remove(&tag);
-            }
+        // Remove the entry only if both grants and waiters are empty, and do
+        // so atomically with respect to a concurrent `acquire`. `remove_if`
+        // evaluates the predicate *while still holding the DashMap shard
+        // lock*, so the emptiness check and the removal cannot be interleaved
+        // by another thread that obtained the same `Arc<LockEntry>` and
+        // pushed a grant. A plain `get` + `remove` would race: after the
+        // `get` returns and we drop both the entry mutex and the shard lock,
+        // a concurrent `acquire` could grant a lock on the still-present
+        // entry, and the unconditional `remove` would then evict a
+        // now-non-empty entry — orphaning that grant and letting a later
+        // acquirer create a fresh entry and grant a *conflicting* lock on the
+        // same tag (two holders on one tag).
+        // Test seam: allow a regression test to deterministically inject a
+        // concurrent `acquire` into the prune window (the point at which the
+        // buggy implementation had already observed the entry empty and
+        // dropped its locks). `remove_if` re-checks the predicate under the
+        // shard lock *after* this hook runs, so a grant pushed during the
+        // hook keeps the entry alive — exactly the property the seam proves.
+        #[cfg(test)]
+        Self::prune_window_hook();
+
+        self.table.remove_if(&tag, |_, entry| {
+            let state = entry.inner.lock();
+            state.grants.is_empty() && state.waiters.is_empty()
+        });
+    }
+
+    /// Test seam invoked inside [`Self::prune_entry_if_empty`] at the prune
+    /// window. By default a no-op; a regression test can install a callback
+    /// (see `set_prune_window_hook`) to deterministically interleave a
+    /// concurrent `acquire` with a prune.
+    #[cfg(test)]
+    fn prune_window_hook() {
+        let hook = PRUNE_WINDOW_HOOK.with(|cell| cell.borrow().clone());
+        if let Some(hook) = hook {
+            hook();
         }
     }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Per-thread prune-window callback for the prune/acquire race test.
+    static PRUNE_WINDOW_HOOK: std::cell::RefCell<Option<Arc<dyn Fn() + Send + Sync>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+fn set_prune_window_hook(hook: Option<Arc<dyn Fn() + Send + Sync>>) {
+    PRUNE_WINDOW_HOOK.with(|cell| *cell.borrow_mut() = hook);
 }
 
 impl Drop for LockManager {
@@ -1246,6 +1285,113 @@ mod tests {
         assert!(
             mgr.inspect(tag).is_some(),
             "non-fastpath lock must be in central table"
+        );
+    }
+
+    // ── prune must never evict a non-empty entry (race regression) ────────
+
+    /// `prune_entry_if_empty` must leave an entry alone if it acquired a
+    /// grant after the caller decided the entry *was* empty. The old
+    /// implementation dropped the entry mutex and the shard lock before an
+    /// unconditional `self.table.remove(&tag)`, so a grant pushed in that gap
+    /// was silently evicted. The `remove_if` predicate, evaluated under the
+    /// shard lock, closes that window: here we push a grant by hand and
+    /// confirm the prune is a no-op.
+    #[test]
+    fn prune_does_not_evict_entry_with_a_live_grant() {
+        let mgr = LockManager::new();
+        let tag = tup(400, 0, 0);
+
+        // Create the entry and grant it (simulating an `acquire` that landed
+        // between a concurrent releaser's emptiness check and its removal).
+        mgr.acquire(req(1, tag, LockMode::AccessExclusive)).unwrap();
+
+        // A prune attempt for this still-held tag must NOT remove the entry.
+        mgr.prune_entry_if_empty(tag);
+
+        let snap = mgr
+            .inspect(tag)
+            .expect("entry with a live grant must survive prune");
+        assert_eq!(snap.grants.len(), 1, "the live grant must remain");
+        assert_eq!(snap.grants[0].0, xid(1));
+
+        // And once the grant is released, the prune (driven by `release`)
+        // does reclaim the entry.
+        mgr.release(xid(1), tag, LockMode::AccessExclusive);
+        assert!(
+            mgr.inspect(tag).is_none(),
+            "empty entry should be pruned after release"
+        );
+    }
+
+    /// Deterministic prune/acquire race regression.
+    ///
+    /// This forces the exact interleaving the bug allowed via the
+    /// `prune_window_hook` test seam: while transaction 1 releases its lock
+    /// (and the lock manager runs the prune), a *concurrent* acquire by
+    /// transaction 2 lands in the prune window and is granted. The buggy
+    /// implementation re-checked emptiness, dropped both the entry mutex and
+    /// the DashMap shard lock, then unconditionally removed the entry —
+    /// silently evicting transaction 2's live grant. A third acquirer
+    /// (transaction 3) would then create a fresh entry and be granted a
+    /// *second* conflicting `AccessExclusive` on the same tag.
+    ///
+    /// With the `remove_if` fix, the predicate re-evaluates under the shard
+    /// lock *after* the window, sees transaction 2's grant, and keeps the
+    /// entry — so transaction 3's `try_acquire` correctly observes the
+    /// conflict and is refused.
+    #[test]
+    fn prune_acquire_race_never_grants_two_conflicting_holders() {
+        let mgr = Arc::new(LockManager::new());
+        // Tuple tag → never eligible for the fastpath, so release/prune go
+        // through the central table.
+        let tag = tup(500, 1, 0);
+
+        // Transaction 1 holds an exclusive lock.
+        mgr.acquire(req(1, tag, LockMode::AccessExclusive)).unwrap();
+
+        // Install a one-shot prune-window hook: when transaction 1's release
+        // reaches the prune window, transaction 2 acquires the same tag
+        // (simulating a concurrent acquire that races the prune). The grant
+        // succeeds because transaction 1's grant was already removed at this
+        // point.
+        let mgr_in_hook = Arc::clone(&mgr);
+        let fired = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let fired_in_hook = Arc::clone(&fired);
+        set_prune_window_hook(Some(Arc::new(move || {
+            // Only act on the first prune window (the one for transaction 1's
+            // release); re-entrant prunes from inside this hook must not
+            // recurse.
+            if fired_in_hook.swap(true, std::sync::atomic::Ordering::AcqRel) {
+                return;
+            }
+            mgr_in_hook
+                .acquire(req(2, tag, LockMode::AccessExclusive))
+                .expect("tx2 acquires in the prune window");
+        })));
+
+        // Release transaction 1. Internally: removes tx1's grant, then enters
+        // the prune window (firing the hook → tx2 grant lands), then runs the
+        // removal. The fix must keep the entry alive because tx2 now holds it.
+        mgr.release(xid(1), tag, LockMode::AccessExclusive);
+        set_prune_window_hook(None);
+
+        // The entry must still exist with transaction 2's grant intact.
+        let snap = mgr
+            .inspect(tag)
+            .expect("entry must survive: tx2's grant landed in the prune window");
+        assert_eq!(snap.grants.len(), 1, "tx2's grant must not be orphaned");
+        assert_eq!(snap.grants[0].0, xid(2));
+
+        // The decisive invariant: a different transaction must NOT be granted
+        // a conflicting exclusive lock. With the bug, tx2's entry was evicted,
+        // so this fresh acquire would succeed → two conflicting holders.
+        let granted = mgr
+            .try_acquire(req(3, tag, LockMode::AccessExclusive))
+            .unwrap();
+        assert!(
+            !granted,
+            "tx3 must be refused: tx2 already holds AccessExclusive on this tag"
         );
     }
 }
