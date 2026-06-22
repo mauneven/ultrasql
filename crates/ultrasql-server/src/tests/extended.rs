@@ -154,6 +154,100 @@ async fn extended_query_round_trip_with_parameter() {
     handle.await.expect("task joins").expect("clean exit");
 }
 
+/// Regression: an EMPTY result-format Bind on a float column must report
+/// TEXT (format 0) in the RowDescription, matching the TEXT bytes the
+/// DataRow actually ships.
+///
+/// The server previously special-cased `Float32`/`Float64` to BINARY
+/// (format 1) when the Bind result-format list was empty, but the row
+/// encoder ships text for an empty list — so the RowDescription lied and a
+/// client decoding per the advertised format mis-read the bytes. This test
+/// drives the exact frontend sequence libpq/JDBC use (empty
+/// `result_formats`) and asserts the format code and the wire bytes agree.
+#[tokio::test]
+async fn empty_result_format_float_column_advertises_text_matching_data_row() {
+    let (mut client, server_side) = tokio::io::duplex(8192);
+    let state = server();
+    let handle = tokio::spawn(handle_connection(server_side, state));
+
+    complete_startup(&mut client).await;
+
+    send_frontend(
+        &mut client,
+        &FrontendMessage::Parse {
+            name: "sf".to_string(),
+            sql: "SELECT 1.5::float8 AS d".to_string(),
+            param_types: vec![],
+        },
+    )
+    .await;
+    // Bind with an EMPTY result-format list — "text for every column".
+    send_frontend(
+        &mut client,
+        &FrontendMessage::Bind {
+            portal_name: "pf".to_string(),
+            statement_name: "sf".to_string(),
+            param_formats: vec![],
+            params: vec![],
+            result_formats: vec![],
+        },
+    )
+    .await;
+    send_frontend(
+        &mut client,
+        &FrontendMessage::Describe {
+            kind: ultrasql_protocol::DescribeKind::Portal,
+            name: "pf".to_string(),
+        },
+    )
+    .await;
+    send_frontend(
+        &mut client,
+        &FrontendMessage::Execute {
+            portal: "pf".to_string(),
+            max_rows: 0,
+        },
+    )
+    .await;
+    send_frontend(&mut client, &FrontendMessage::Sync).await;
+
+    let msgs = drain_until_ready(&mut client).await;
+
+    // The RowDescription must advertise TEXT (format 0) for the float column.
+    let fields = msgs
+        .iter()
+        .find_map(|m| match m {
+            BackendMessage::RowDescription { fields } => Some(fields.clone()),
+            _ => None,
+        })
+        .expect("RowDescription present");
+    assert_eq!(fields.len(), 1, "one float column");
+    assert_eq!(
+        fields[0].format_code, 0,
+        "empty result-format Bind must report TEXT (0) for the float column"
+    );
+
+    // And the DataRow must carry the TEXT encoding of 1.5 — proving the
+    // advertised format matches the bytes on the wire.
+    let rows: Vec<_> = msgs
+        .iter()
+        .filter_map(|m| match m {
+            BackendMessage::DataRow { columns } => Some(columns.clone()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(rows.len(), 1, "one row: {msgs:?}");
+    assert_eq!(
+        rows[0][0].as_deref(),
+        Some(b"1.5".as_slice()),
+        "float DataRow must be the text encoding, matching the advertised format"
+    );
+
+    send_frontend(&mut client, &FrontendMessage::Terminate).await;
+    drop(client);
+    handle.await.expect("task joins").expect("clean exit");
+}
+
 /// Extended Query round-trip for BEGIN / INSERT / COMMIT — prepared
 /// statements and unnamed portals.  Mirrors the Simple Query test
 /// `begin_commit_persists_rows_rollback_discards` over the

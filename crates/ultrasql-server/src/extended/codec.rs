@@ -504,7 +504,7 @@ pub(crate) fn row_description_for_plan_with_formats(
         .iter()
         .enumerate()
         .map(|(idx, f)| {
-            let format_code = result_format_for_column(&f.data_type, result_formats, idx);
+            let format_code = result_format_for_column(result_formats, idx);
             FieldDescription {
                 name: f.name.clone(),
                 table_oid: 0,
@@ -519,12 +519,16 @@ pub(crate) fn row_description_for_plan_with_formats(
     BackendMessage::RowDescription { fields }
 }
 
-const fn result_format_for_column(ty: &DataType, result_formats: &[i16], idx: usize) -> i16 {
+const fn result_format_for_column(result_formats: &[i16], idx: usize) -> i16 {
     match result_formats.len() {
-        0 => match ty {
-            DataType::Float32 | DataType::Float64 => 1,
-            _ => 0,
-        },
+        // An empty result-format list means "text for every column" in the
+        // extended protocol. The row encoder and `resolve_param_format` both
+        // treat the empty list as text (0) for all types, so the
+        // RowDescription MUST advertise text here too. Previously float
+        // columns were special-cased to binary (1) on an empty list, which
+        // mismatched the DataRow bytes (still text) — every client that sends
+        // an empty result-format Bind (libpq, JDBC) then mis-decoded floats.
+        0 => 0,
         1 => result_formats[0],
         _ => {
             if idx < result_formats.len() {
@@ -863,5 +867,24 @@ mod tests {
             .unwrap(),
             pg_numeric_12_340()
         );
+    }
+
+    #[test]
+    fn empty_result_formats_report_text_for_float_columns() {
+        // An empty Bind result-format list means "text for every column".
+        // The row encoder ships text for all types, so the RowDescription
+        // must report 0 (text) even for float columns — otherwise the client
+        // mis-decodes the DataRow. This is the regression: float types must
+        // NOT be special-cased to binary (1) on an empty list.
+        assert_eq!(result_format_for_column(&[], 0), 0, "float8 → text");
+        assert_eq!(result_format_for_column(&[], 1), 0, "float4 → text");
+        // Non-float types were already text on an empty list.
+        assert_eq!(result_format_for_column(&[], 2), 0);
+
+        // A single format applies to all columns; an explicit list is honored
+        // per-column (unchanged behavior).
+        assert_eq!(result_format_for_column(&[1], 0), 1);
+        assert_eq!(result_format_for_column(&[0, 1], 1), 1);
+        assert_eq!(result_format_for_column(&[0, 1], 5), 0);
     }
 }
