@@ -1,6 +1,6 @@
 //! Wire-level tests for the statistical aggregates added in v0.5.
 //!
-//! Closes the v0.5 ROADMAP item "Statistical aggregates: STDDEV,
+//! Closes the v0.5 open item "Statistical aggregates: STDDEV,
 //! VARIANCE" plus the ordered-set percentile aggregates.
 //!
 //! Each test issues the aggregate against a known input and asserts

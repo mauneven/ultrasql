@@ -108,7 +108,7 @@ and must document the break here.
   3.6× at 10k, with even small indexes faster and no regression; build stays
   deterministic and recall holds (recall@10 ≥ 0.95 at ef ≤ 128). SIFT1M-scale
   builds are now feasible; the pgvector-competitive "minutes at 1M" target folds
-  into the hierarchical-layers work (see ROADMAP). The mirror duplicates vectors
+  into the hierarchical-layers work (see TODO.md). The mirror duplicates vectors
   in RAM (~2× vector memory).
 - README benchmark tables are restricted to SQL-surface measurements. Kernel
   microbenchmarks stay internal and are not published as DB-vs-DB claims.
@@ -233,7 +233,7 @@ and must document the break here.
 ### Known gaps
 
 - v1.0 is not declared until correctness, benchmark, security, and operator
-  soak gates in `ROADMAP.md` and `docs/release-checklist.md` are satisfied.
+  soak gates in `TODO.md` and `docs/release-checklist.md` are satisfied.
 - SQL surface and operations coverage remain incomplete. See
   `docs/known-limitations.md`.
 - Production packaging beyond release archives, including Docker/Homebrew/deb/rpm

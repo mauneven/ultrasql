@@ -219,7 +219,7 @@ last barrier before a committed write is reported durable.
   fsynced via the manifest before any segment is unlinked, and an automatic
   checkpoint timer drives it — so WAL size and restart-replay time are bounded
   by un-checkpointed work, not total history. Archiving and retention-based
-  reclamation beyond recycling remain open items (see ROADMAP).
+  reclamation beyond recycling remain open items (see TODO.md).
 
 **Rationale.** Group commit is the single largest OLTP throughput
 multiplier on rotational storage and on NVMe under bursty write

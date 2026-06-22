@@ -5,7 +5,7 @@ relational data, JSON metadata, full-text, and vector embeddings in one engine �
 and ranks them together in one query.
 
 [![License: Apache 2.0 OR MIT](https://img.shields.io/badge/license-Apache_2.0_OR_MIT-blue.svg)](#license)
-[![Status: alpha](https://img.shields.io/badge/status-alpha-orange.svg)](ROADMAP.md)
+[![Status: alpha](https://img.shields.io/badge/status-alpha-orange.svg)](TODO.md)
 [![MSRV](https://img.shields.io/badge/MSRV-1.85-blue.svg)](rust-toolchain.toml)
 
 UltraSQL is a native Rust SQL database with durable storage, MVCC, WAL,
@@ -39,7 +39,7 @@ as a zero-dependency Node script in [examples/node-rag/](examples/node-rag/).
 See [docs/hybrid-search.md](docs/hybrid-search.md) for the worked example,
 [docs/vector-benchmarks.md](docs/vector-benchmarks.md) for honest
 recall-vs-latency versus pgvector / Qdrant / LanceDB, and
-[ROADMAP.md](ROADMAP.md) P2 for what is shipped versus open (selectivity-aware
+[TODO.md](TODO.md) for what is shipped versus open (selectivity-aware
 filtered ANN and competitive recall benchmarks are tracked there with measurable
 exit conditions).
 
@@ -117,7 +117,7 @@ update and 100k delete (DuckDB), or the 1M delete (ClickHouse). The committed sc
 durable mode was recorded `not_available` because the 8 MiB WAL buffer rejected
 records instead of applying backpressure. That failure is now fixed in code
 (per-record backpressure plus over-capacity admission of a single record larger
-than the buffer — see [ROADMAP.md](ROADMAP.md) and
+than the buffer — see [TODO.md](TODO.md) and
 [operator-reports/2026-06-benchmark-row-analysis.md](operator-reports/2026-06-benchmark-row-analysis.md)),
 so that row needs a re-run to record a measurement; it is still shown as
 `not_available` in the pinned artifact below. The
@@ -225,7 +225,7 @@ fuzz/         parser, wire, WAL, and planner fuzz targets
 
 - [docs/production-readiness.md](docs/production-readiness.md) - current audited readiness verdict.
 - [docs/documentation-status-audit.md](docs/documentation-status-audit.md) - current docs truth audit.
-- [ROADMAP.md](ROADMAP.md) - production plan and open gates.
+- [TODO.md](TODO.md) - open work and release gates.
 - [DONE.md](DONE.md) - completed milestones and evidence ledger.
 - [docs/getting-started.md](docs/getting-started.md) - local first steps.
 - [docs/install.md](docs/install.md) - release archives, package managers, and source build.

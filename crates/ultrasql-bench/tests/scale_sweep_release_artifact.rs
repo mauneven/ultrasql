@@ -468,7 +468,7 @@ fn scale_sweep_records_million_row_insert_honestly() {
     // The durable 1M INSERT currently fails — the 8 MiB WAL buffer rejects
     // records instead of applying backpressure — so it is recorded as an
     // explicit not_available artifact with a reason, never a fabricated win.
-    // Tracked in ROADMAP P0 with a measurable exit condition.
+    // Tracked in TODO.md with a measurable exit condition.
     let raw =
         repo_file("benchmarks/results/latest/scale-sweep/raw/insert_throughput_1m-ultrasql.json");
     let value: serde_json::Value =

@@ -1,7 +1,7 @@
 //! End-to-end `ALTER TABLE` tests against a real `tokio-postgres` client.
 //!
 //! Closes the v0.5 wire-protocol coverage gap "`ALTER TABLE` — ⚠️ no
-//! dedicated round-trip test" at `ROADMAP.md:343`. The Simple-Query
+//! dedicated round-trip test" (tracked in `TODO.md`). The Simple-Query
 //! dispatcher routes `ALTER TABLE ... ADD COLUMN` through
 //! `crates/ultrasql-server/src/session/alter.rs:107`; this file verifies
 //! the statement round-trips through `tokio-postgres` and that the

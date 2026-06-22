@@ -1,7 +1,7 @@
 //! End-to-end transaction-control tests against a real `tokio-postgres`
 //! client.
 //!
-//! Closes the v0.5 P0 ROADMAP entry "BEGIN/COMMIT/ROLLBACK end-to-end".
+//! Closes the v0.5 P0 open entry "BEGIN/COMMIT/ROLLBACK end-to-end".
 //! Drives an in-process `ultrasqld` with the same stock client every
 //! third-party Rust app uses and asserts that:
 //!

@@ -21,8 +21,8 @@
 //!   indexed column returns descending order without a Sort operator.
 //!
 //! Why no explicit "operator was `IndexScan`" wire-level assertion:
-//! the server does not yet expose `EXPLAIN` over the wire (ROADMAP
-//! v0.5 P0 lists `EXPLAIN` as ❌). The unit tests in
+//! the server does not yet expose `EXPLAIN` over the wire (TODO.md
+//! lists `EXPLAIN` as open). The unit tests in
 //! `pipeline::tests::lower_query_*_indexed_column_picks_index_scan`
 //! pin the dispatcher decision at the operator level. This file's
 //! contribution is the *behavioural* end-to-end correctness check

@@ -1,7 +1,7 @@
 # Known Limitations
 
 This document lists major SQL and operations gaps that are still open or only
-partially implemented. `ROADMAP.md` tracks open release gates; `DONE.md` tracks
+partially implemented. `TODO.md` tracks open release gates; `DONE.md` tracks
 completed evidence.
 
 ## Production readiness
@@ -58,7 +58,7 @@ completed evidence.
   (`HnswIndex`), used as a fallback ANN target, is still single-layer with an
   exact O(N) insert scan and is not persisted: it is rebuilt by replaying the
   HNSW WAL records on restart. Recall/latency comparisons and the SIFT1M gate
-  remain open release items (see `ROADMAP.md`).
+  remain open release items (see `TODO.md`).
 - Regular views support stored `SELECT` expansion, rename, schema moves, and
   restart metadata. Updatable views, `WITH CHECK OPTION`, dependency-safe
   `CREATE OR REPLACE VIEW`, materialized-view refresh/index parity, and general

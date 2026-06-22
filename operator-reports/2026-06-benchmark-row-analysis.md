@@ -6,7 +6,7 @@ on the fair, same-host data-dir scale sweep (Apple M4, PostgreSQL 17.10, DuckDB
 committed harness. The goal is an honest root-cause per row: what was measured,
 why UltraSQL is behind, and whether a correctness-preserving win is available
 now. Rows that cannot be won honestly are left as honest losses with a
-measurable exit condition in [ROADMAP.md](../ROADMAP.md).
+measurable exit condition in [TODO.md](../TODO.md).
 
 ## select_scan 100k → ClickHouse (real ~6% loss)
 
@@ -92,7 +92,7 @@ therefore not available without either (a) weakening durability to PG's macOS
 `fsync` level (dishonest vs the current guarantee) or (b) async/deferred commit
 (changes durability semantics). Both are off the table under the integrity
 rules, so these rows are formally accepted as honest losses. **Exit conditions
-(ROADMAP P0):** either a multi-client OLTP benchmark where group commit amortizes
+(TODO.md):** either a multi-client OLTP benchmark where group commit amortizes
 F_FULLFSYNC across concurrent committers and UltraSQL's tx/s meets or beats the
 winner, or an apples-to-apples same-durability comparison (both engines at
 F_FULLFSYNC, or both at `fsync`) where UltraSQL's per-commit latency is no higher.

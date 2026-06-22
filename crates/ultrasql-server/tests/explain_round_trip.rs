@@ -2,7 +2,7 @@
 //! tests against a real `tokio-postgres` client.
 //!
 //! Closes the v0.5 wire-protocol gap "`EXPLAIN` / `EXPLAIN ANALYZE` —
-//! no `LogicalPlan::Explain`, no session dispatch" at `ROADMAP.md:336`.
+//! no `LogicalPlan::Explain`, no session dispatch" (tracked in `TODO.md`).
 //! The binder now lowers every `EXPLAIN` statement into
 //! `LogicalPlan::Explain { analyze, format, input }`; the session
 //! dispatcher renders the wrapped plan into the single-column

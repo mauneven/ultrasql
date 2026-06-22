@@ -1,6 +1,6 @@
 //! End-to-end tests for FROM-less `SELECT` and the `IS NULL` predicate.
 //!
-//! Closes two v0.5 ROADMAP gaps:
+//! Closes two v0.5 open gaps:
 //! - **`Result` (constant expressions) — `SELECT 1` and similar**
 //!   (Other Operators).
 //! - **`SELECT … FROM t WHERE col IS NULL` end-to-end verification**

@@ -2,7 +2,7 @@
 //! client.
 //!
 //! Closes the v0.5 wire-protocol gap "`Unique` operator — kernel
-//! exists; DISTINCT wire path pending" (`ROADMAP.md:686`) and the v0.6
+//! exists; DISTINCT wire path pending" (tracked in `TODO.md`) and the v0.6
 //! "Hash-based DISTINCT vs Sort-based DISTINCT" item. The binder now
 //! lowers `SELECT DISTINCT` into a `LogicalPlan::Aggregate` with the
 //! projected columns as group keys and an empty aggregate list; the

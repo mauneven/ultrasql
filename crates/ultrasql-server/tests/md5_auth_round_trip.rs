@@ -1,6 +1,6 @@
 //! Wire-level tests for MD5 password authentication.
 //!
-//! Closes the v0.5 ROADMAP item "MD5 password auth (legacy, behind
+//! Closes the v0.5 open item "MD5 password auth (legacy, behind
 //! config flag)". The flag here is the builder method
 //! [`Server::require_md5_password`] — the default Server still
 //! accepts every connection unchallenged.

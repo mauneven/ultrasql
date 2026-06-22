@@ -39,7 +39,7 @@ any migration as a staged validation project until the release gates close.
 ## Data movement
 
 Use plain SQL and `COPY`-oriented flows first. Archive dump/restore breadth is
-tracked in `ROADMAP.md`; do not assume every existing dump format restores into
+tracked in `TODO.md`; do not assume every existing dump format restores into
 UltraSQL yet.
 
 ## Validation rule

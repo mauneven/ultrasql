@@ -4,7 +4,7 @@ Two missions ran back to back: (A) benchmark integrity and engine hardening,
 and (B) the first slice of the AI-native operational-database wedge. This
 report records, per part, what shipped, the measured numbers, which acceptance
 gates passed, and what honestly remains (with measurable exit conditions in
-[ROADMAP.md](../ROADMAP.md)). No number here was hand-edited; every figure comes
+[TODO.md](../TODO.md)). No number here was hand-edited; every figure comes
 from running committed code on an Apple M4 host.
 
 ## Mission A — Benchmark integrity & hardening
@@ -62,7 +62,7 @@ Profiling surfaced a real durable-write bug: a **1,000,000-row INSERT fails in
 buffer (`crates/ultrasql-server/src/lib.rs` `WAL_BUFFER_BYTES`) *rejects* records
 when full instead of applying backpressure. The README's "INSERT 1M = 337 ms"
 was a volatile-memory number; durable mode errors. This and the fair-measurement
-OLTP losses are in ROADMAP P0 with exit conditions. No OLTP leadership is
+OLTP losses are in TODO.md with exit conditions. No OLTP leadership is
 claimed. (This closed the integrity-mission Part 2 honestly; deep TPC-C
 group-commit tuning remains open.)
 
@@ -113,8 +113,8 @@ below.
 The README now leads with the AI-native wedge (embeddable, Postgres-compatible,
 ACID engine unifying SQL + JSON + full-text + vectors) and the transactional-
 consistency moat, while keeping the honest same-host scoreboard and pointing at
-ROADMAP for what is open. Every README claim maps to a shipped, tested feature
-or an explicitly-open ROADMAP item.
+TODO.md for what is open. Every README claim maps to a shipped, tested feature
+or an explicitly-open TODO.md item.
 
 ### B2–B6 — scoped with measured baselines (open)
 
@@ -125,7 +125,7 @@ matcher does not yet recognize `Sort(Filter(Scan))`. The HNSW/IVFFlat index is
 rebuilt on DML rather than reflecting committed MVCC online. Exit conditions for
 filtered ANN (B2), online index MVCC + recovery (B3), agent-memory primitives
 (B4), retrieval observability (B5), and the demo + competitive benchmarks vs
-pgvector/LanceDB/Qdrant (B6) are recorded in ROADMAP P2 "AI-Native Retrieval".
+pgvector/LanceDB/Qdrant (B6) are recorded in TODO.md "AI / Strategic surface".
 
 ## The bottom line
 
@@ -196,7 +196,7 @@ drive-cache flush), so UltraSQL is paying for a *stronger* durability guarantee.
 A correctness-preserving win is not available without weakening durability or
 changing commit semantics, both off the table under the integrity rules. So I
 reverted the change (no measured gain, added hot-path complexity) and took the
-honest acceptance (path 3b): ROADMAP P0 now lists the OLTP write workloads with
+honest acceptance (path 3b): TODO.md now lists the OLTP write workloads with
 concrete, measurable exit conditions (multi-client group-commit amortization, or
 an apples-to-apples same-durability comparison), the operator report carries the
 full before/after analysis, and stale "fastest on all rows" claims in three docs

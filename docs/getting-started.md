@@ -2,7 +2,7 @@
 
 UltraSQL is alpha. Use this guide for local development, SQL testing,
 compatibility checks, and benchmark reproduction. Do not treat this as a
-production install guide until the v1.0 release gates in `ROADMAP.md` are
+production install guide until the v1.0 release gates in `TODO.md` are
 closed.
 
 ## Install a release archive

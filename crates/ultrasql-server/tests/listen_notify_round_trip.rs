@@ -1,7 +1,7 @@
 //! End-to-end `LISTEN` / `NOTIFY` / `UNLISTEN` test against a real
 //! `tokio-postgres` client.
 //!
-//! Closes the v0.9 ROADMAP rows "LISTEN/NOTIFY end-to-end". The test
+//! Closes the v0.9 open rows "LISTEN/NOTIFY end-to-end". The test
 //! opens two `tokio-postgres` clients against the same `ultrasqld`
 //! process, has session A `LISTEN orders`, session B `NOTIFY orders,
 //! 'hello'`, and asserts that session A's connection forwards the

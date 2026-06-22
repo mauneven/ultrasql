@@ -87,9 +87,9 @@ benchmark claims that are not backed by committed artifacts.
 | `PERFORMANCE.md` | benchmark/performance policy; checked for claim scoping |
 | `README.md` | status/claim surface; updated or checked against current evidence |
 | `RFC_PROCESS.md` | project documentation; checked for stale maturity/overclaim terms |
-| `ROADMAP.md` | status/claim surface; updated or checked against current evidence |
 | `SECURITY.md` | project documentation; checked for stale maturity/overclaim terms |
 | `SECURITY_AUDIT.md` | project documentation; checked for stale maturity/overclaim terms |
+| `TODO.md` | status/claim surface; updated or checked against current evidence |
 | `benchmarks/results/latest/benchmark_arena_artifacts.md` | benchmark artifact; checked for scoped result wording |
 | `benchmarks/results/latest/methodology.md` | benchmark artifact; checked for scoped result wording |
 | `benchmarks/results/latest/results.md` | benchmark artifact; checked for scoped result wording |

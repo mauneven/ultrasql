@@ -1,4 +1,4 @@
-//! Contract tests for benchmark and roadmap status text.
+//! Contract tests for benchmark and open-work (TODO.md) status text.
 
 use std::fs;
 use std::path::PathBuf;
@@ -16,24 +16,24 @@ fn collapse_ws(text: &str) -> String {
 
 #[test]
 fn roadmap_ann_matrix_tracks_page_backed_indexes() {
-    let roadmap = repo_file("ROADMAP.md");
+    let todo = repo_file("TODO.md");
 
-    assert!(!roadmap.contains("| Runtime HNSW |"));
-    assert!(!roadmap.contains("| Production HNSW |"));
-    assert!(!roadmap.contains("| Runtime IVFFlat |"));
-    assert!(!roadmap.contains("| Production IVFFlat |"));
+    assert!(!todo.contains("| Runtime HNSW |"));
+    assert!(!todo.contains("| Production HNSW |"));
+    assert!(!todo.contains("| Runtime IVFFlat |"));
+    assert!(!todo.contains("| Production IVFFlat |"));
 
-    assert!(roadmap.contains("Page-backed HNSW"));
-    assert!(roadmap.contains("Page-backed IVFFlat"));
-    assert!(roadmap.contains("large-scale recovery certification"));
-    assert!(roadmap.contains("WAL replay fuzz/property tests"));
-    assert!(roadmap.contains("larger recall/latency artifacts"));
+    assert!(todo.contains("Page-backed HNSW"));
+    assert!(todo.contains("Page-backed IVFFlat"));
+    assert!(todo.contains("large-scale recovery certification"));
+    assert!(todo.contains("WAL replay fuzz/property tests"));
+    assert!(todo.contains("larger recall/latency artifacts"));
 }
 
 #[test]
 fn roadmap_ai_gauntlet_lists_measured_runner_set() {
-    let roadmap = repo_file("ROADMAP.md");
-    let normalized = collapse_ws(&roadmap);
+    let todo = repo_file("TODO.md");
+    let normalized = collapse_ws(&todo);
 
     assert!(normalized.contains("AI gauntlet measured artifacts"));
     for suite in [
@@ -48,35 +48,35 @@ fn roadmap_ai_gauntlet_lists_measured_runner_set() {
     ] {
         assert!(normalized.contains(suite), "missing suite {suite}");
     }
-    assert!(!roadmap.contains("filtered ANN, bulk embedding load"));
+    assert!(!todo.contains("filtered ANN, bulk embedding load"));
 }
 
 #[test]
 fn roadmap_firebolt_status_is_local_core_only() {
-    let roadmap = repo_file("ROADMAP.md");
+    let todo = repo_file("TODO.md");
 
-    assert!(roadmap.contains("target_ratio_ultrasql_vs_firebolt <= 1.0"));
-    assert!(roadmap.contains("Firebolt primary-index pruning evidence"));
-    assert!(roadmap.contains("local Firebolt Core smoke measured"));
-    assert!(roadmap.contains("Firebolt is not_available"));
-    assert!(!roadmap.contains("endpoint pending"));
-    assert!(!roadmap.contains("Cloud-first"));
+    assert!(todo.contains("target_ratio_ultrasql_vs_firebolt <= 1.0"));
+    assert!(todo.contains("Firebolt primary-index pruning evidence"));
+    assert!(todo.contains("local Firebolt Core smoke measured"));
+    assert!(todo.contains("Firebolt is not_available"));
+    assert!(!todo.contains("endpoint pending"));
+    assert!(!todo.contains("Cloud-first"));
 }
 
 #[test]
 fn roadmap_tpch_sf10_matches_complete_artifact() {
     let done = repo_file("DONE.md");
-    let roadmap = repo_file("ROADMAP.md");
+    let todo = repo_file("TODO.md");
     let normalized = collapse_ws(&done);
 
     assert!(normalized.contains("TPC-H scale 10 (all 22 queries)"));
     assert!(normalized.contains("benchmarks/results/latest/tpch_sf10_certification.json"));
     assert!(normalized.contains("status passed"));
     assert!(normalized.contains("22/22 DuckDB and UltraSQL query timings"));
-    assert!(!roadmap.contains("incomplete q21-only query set"));
-    assert!(!roadmap.contains("has not been run to completion"));
-    assert!(!roadmap.contains("remained in the `lineitem` load"));
-    assert!(!roadmap.contains("- [ ] TPC-H scale 10:"));
+    assert!(!todo.contains("incomplete q21-only query set"));
+    assert!(!todo.contains("has not been run to completion"));
+    assert!(!todo.contains("remained in the `lineitem` load"));
+    assert!(!todo.contains("- [ ] TPC-H scale 10:"));
 }
 
 #[test]

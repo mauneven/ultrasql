@@ -2,7 +2,7 @@
 //! `tokio-postgres` client.
 //!
 //! Closes the v0.5 wire-protocol gap "`INSERT … SELECT`
-//! (`pipeline.rs:1314` returns `Unsupported`)" at `ROADMAP.md:319`. The
+//! (`pipeline.rs:1314` returns `Unsupported`)" (tracked in `TODO.md`). The
 //! binder already produced `LogicalPlan::Insert { source: Select … }`;
 //! `lower_real_insert` now lowers the inner SELECT through
 //! `lower_query` and drives `ModifyTable::Insert` off its batches.

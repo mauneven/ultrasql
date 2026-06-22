@@ -56,7 +56,7 @@ cargo +nightly fuzz run <target> artifacts/<target>/<crash-file>
 
 Commit crash reproducers alongside a bug fix so they become permanent regression tests.
 
-## ROADMAP gate
+## Release gate
 
 The v1.0 release gate requires parser, planner, protocol, and WAL decoder fuzz
 targets to record one clean week of nightly or manual CI evidence. Pull requests

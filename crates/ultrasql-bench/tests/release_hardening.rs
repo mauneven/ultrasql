@@ -297,7 +297,7 @@ fn driver_certification_matrix_covers_core_ecosystem() {
     let ci = repo_file(".github/workflows/ci.yml");
     let docs = repo_file("docs/driver-certification.md");
     let release = repo_file("docs/release-checklist.md");
-    let roadmap = repo_file("ROADMAP.md");
+    let todo = repo_file("TODO.md");
     let harness = repo_file("tests/driver_certification/driver_certification.py");
 
     for needle in [
@@ -326,7 +326,7 @@ fn driver_certification_matrix_covers_core_ecosystem() {
         "Alembic",
     ] {
         assert!(docs.contains(needle), "driver docs missing {needle}");
-        assert!(roadmap.contains(needle), "ROADMAP missing {needle}");
+        assert!(todo.contains(needle), "TODO missing {needle}");
         assert!(harness.contains(needle), "cert harness missing {needle}");
     }
 
@@ -336,7 +336,7 @@ fn driver_certification_matrix_covers_core_ecosystem() {
             release.contains(needle),
             "release checklist missing {needle}"
         );
-        assert!(roadmap.contains(needle), "ROADMAP missing {needle}");
+        assert!(todo.contains(needle), "TODO missing {needle}");
         assert!(harness.contains(needle), "cert harness missing {needle}");
     }
     assert!(harness.contains("certify_psql_meta_commands"));
@@ -433,7 +433,7 @@ fn packaging_and_docs_site_surface_is_release_ready() {
     let nfpm_render = repo_file("scripts/render-nfpm-config.sh");
     let docs = repo_file("docs/packaging.md");
     let install = repo_file("docs/install.md");
-    let roadmap = repo_file("ROADMAP.md");
+    let todo = repo_file("TODO.md");
 
     for needle in [
         "site_url: https://docs.ultrasql.org/",
@@ -683,7 +683,7 @@ fn packaging_and_docs_site_surface_is_release_ready() {
     ] {
         assert!(docs.contains(needle), "packaging docs missing {needle}");
         assert!(install.contains(needle), "install docs missing {needle}");
-        assert!(roadmap.contains(needle), "ROADMAP missing {needle}");
+        assert!(todo.contains(needle), "TODO missing {needle}");
     }
     for needle in [
         "Workflow filename: release.yml",
@@ -843,7 +843,7 @@ fn final_release_requires_operator_reports_green_workflows_and_notes() {
     let notes_renderer = repo_file("scripts/render-release-notes.sh");
     let release_config = repo_file(".github/release.yml");
     let release_checklist = repo_file("docs/release-checklist.md");
-    let roadmap = repo_file("ROADMAP.md");
+    let todo = repo_file("TODO.md");
 
     for needle in [
         "30 continuous days",
@@ -968,7 +968,7 @@ fn final_release_requires_operator_reports_green_workflows_and_notes() {
             release_checklist.contains(needle),
             "release checklist missing {needle}"
         );
-        assert!(roadmap.contains(needle), "ROADMAP missing {needle}");
+        assert!(todo.contains(needle), "TODO missing {needle}");
     }
 }
 
@@ -984,7 +984,7 @@ fn final_release_requires_external_audits_and_incident_drills() {
     let release = repo_file(".github/workflows/release.yml");
     let notes_template = repo_file("docs/release-notes-template.md");
     let release_checklist = repo_file("docs/release-checklist.md");
-    let roadmap = repo_file("ROADMAP.md");
+    let todo = repo_file("TODO.md");
 
     for needle in [
         "two independent external audit reports",
@@ -1115,7 +1115,7 @@ fn final_release_requires_external_audits_and_incident_drills() {
             release_checklist.contains(needle),
             "release checklist missing {needle}"
         );
-        assert!(roadmap.contains(needle), "ROADMAP missing {needle}");
+        assert!(todo.contains(needle), "TODO missing {needle}");
     }
 }
 
@@ -1129,7 +1129,7 @@ fn final_release_requires_driver_compatibility_status() {
     let notes_template = repo_file("docs/release-notes-template.md");
     let notes_renderer = repo_file("scripts/render-release-notes.sh");
     let release_checklist = repo_file("docs/release-checklist.md");
-    let roadmap = repo_file("ROADMAP.md");
+    let todo = repo_file("TODO.md");
 
     for needle in [
         "scripts/validate-driver-compatibility.py --strict",
@@ -1147,7 +1147,7 @@ fn final_release_requires_driver_compatibility_status() {
             release_checklist.contains(needle),
             "release checklist missing {needle}"
         );
-        assert!(roadmap.contains(needle), "ROADMAP missing {needle}");
+        assert!(todo.contains(needle), "TODO missing {needle}");
     }
 
     let needle = "scripts/run-driver-release-evidence.py";
@@ -1156,7 +1156,7 @@ fn final_release_requires_driver_compatibility_status() {
         release_checklist.contains(needle),
         "release checklist missing {needle}"
     );
-    assert!(roadmap.contains(needle), "ROADMAP missing {needle}");
+    assert!(todo.contains(needle), "TODO missing {needle}");
 
     for needle in [
         "cargo",

@@ -71,7 +71,7 @@ an honest loss.
 `deny(clippy::unwrap_used, clippy::expect_used, clippy::panic)` gate (under
 `cfg(not(test))`) is now active in `ultrasql-executor` (`lib.rs:72`) and
 `ultrasql-server` (`lib.rs:51`) — and in every other library crate — with no
-`#[allow]` escape hatches. This is no longer a pending ROADMAP exit condition.
+`#[allow]` escape hatches. This is no longer a pending open exit condition.
 
 ## Part 5 — commit, certify, scoreboard
 

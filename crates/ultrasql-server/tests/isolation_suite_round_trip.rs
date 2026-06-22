@@ -21,7 +21,7 @@ fn isolation_suite_keeps_public_provenance_and_ssi_honesty() {
         fs::read_to_string(isolation_root.join("NOTICE.hermitage.md")).expect("read notice");
     let docs = fs::read_to_string(root.join("docs/testing/isolation-suite.md"))
         .expect("read isolation docs");
-    let roadmap = fs::read_to_string(root.join("ROADMAP.md")).expect("read roadmap");
+    let todo = fs::read_to_string(root.join("TODO.md")).expect("read todo");
     let limitations =
         fs::read_to_string(root.join("docs/known-limitations.md")).expect("read limitations");
 
@@ -53,7 +53,7 @@ fn isolation_suite_keeps_public_provenance_and_ssi_honesty() {
         notice.contains("Martin Kleppmann") && notice.contains("CC BY 4.0"),
         "notice:\n{notice}"
     );
-    for text in [&docs, &roadmap, &limitations] {
+    for text in [&docs, &todo, &limitations] {
         let normalized = normalize_ws(text);
         assert!(
             normalized.contains("column-range SSI"),

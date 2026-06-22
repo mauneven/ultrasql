@@ -1,7 +1,7 @@
 //! Wire-level tests for `PREPARE` / `EXECUTE` / `DEALLOCATE` issued
 //! through the Simple Query path.
 //!
-//! Closes the v0.5 ROADMAP item "PREPARE / EXECUTE / DEALLOCATE
+//! Closes the v0.5 open item "PREPARE / EXECUTE / DEALLOCATE
 //! Simple-Query round-trip".
 
 pub mod support;

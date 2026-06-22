@@ -1060,7 +1060,7 @@ mod tests {
     // -----------------------------------------------------------------------
 
     /// A synthetic git-diff output classifier: returns `true` when every
-    /// changed file is docs-only (`.md`, `docs/`, `ROADMAP.md`, `AGENTS.md`).
+    /// changed file is docs-only (`.md`, `docs/`, `TODO.md`, `AGENTS.md`).
     fn is_docs_only(changed_files: &[&str]) -> bool {
         if changed_files.is_empty() {
             return true;
@@ -1069,7 +1069,7 @@ mod tests {
             f.ends_with(".md")
                 || f.starts_with("docs/")
                 || f.starts_with("docs\\")
-                || *f == "ROADMAP.md"
+                || *f == "TODO.md"
                 || *f == "AGENTS.md"
                 || *f == "BENCHMARKS.md"
                 || *f == "CONTRIBUTING.md"
@@ -1078,7 +1078,7 @@ mod tests {
 
     #[test]
     fn skip_detection_docs_only_true() {
-        let files = ["AGENTS.md", "docs/guide.md", "ROADMAP.md"];
+        let files = ["AGENTS.md", "docs/guide.md", "TODO.md"];
         assert!(is_docs_only(&files));
     }
 

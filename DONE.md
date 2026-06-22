@@ -1,7 +1,7 @@
 # DONE
 
-Completed/addressed work moved out of [ROADMAP.md](ROADMAP.md). Keep this file
-as a concise evidence ledger; roadmap stays for open gates only.
+Completed/addressed work moved out of [TODO.md](TODO.md). Keep this file
+as a concise evidence ledger; TODO.md stays for open gates only.
 
 ## 2026-06-22 window frames, eviction relief, bounded SELECT streaming, engine-wide F_FULLFSYNC
 
@@ -292,7 +292,7 @@ factor, taking the 50k×128d build from ~424 s to ~41 s (~10×).
 
 The page-backed (server) HNSW build is no longer O(N²). Graph-search candidate
 selection at insert — the PART 3 roadmap item — landed; the SIFT1M-scale gap
-stays open (constant-factor work, see ROADMAP).
+stays open (constant-factor work, see TODO.md).
 
 - **Graph-traversal candidate selection:** `collect_construction_candidates`
   gathers a new node's neighbor pool by traversing the partially-built navigable
@@ -386,7 +386,7 @@ the per-crate ≥80% coverage gate are all green.
 - The crate-level `deny(clippy::unwrap_used, clippy::expect_used, clippy::panic)`
   gate (`cfg(not(test))`) is enforced in **every** library crate, including
   `ultrasql-executor` (`lib.rs:72`) and `ultrasql-server` (`lib.rs:51`), with no
-  escape hatches. This closes the former ROADMAP "panic hardening" exit
+  escape hatches. This closes the former open "panic hardening" exit
   condition.
 
 ## Persistent Approximate HNSW + Filtered ANN
@@ -461,7 +461,7 @@ the per-crate ≥80% coverage gate are all green.
   recommended config. On SIFT 50k×128d (Apple M4): UltraSQL recall@10 0.986 at
   ef=64 / 1.000 at ef=200, p50 697 µs at the matched point — faster than Qdrant
   (1403 µs) and LanceDB (1154 µs), slower than pgvector (319 µs). Build time
-  (~400 s O(N²)) is the open gap, tracked in ROADMAP. Evidence:
+  (~400 s O(N²)) is the open gap, tracked in TODO.md. Evidence:
   `benchmarks/vector_ann_sift.sh`, `benchmarks/scripts/vector_ann_bench.py`,
   `docs/vector-benchmarks.md`, artifacts under
   `benchmarks/results/latest/raw/vector_ann_sift_50k_k10*`.
@@ -1423,7 +1423,7 @@ the per-crate ≥80% coverage gate are all green.
   mandatory `'N'` decline so stock libpq/psql clients (default
   `sslmode=prefer`) connect in plaintext instead of being dropped; replying
   `'S'` with a real TLS handshake, per-role SCRAM auth, and pg_hba enforcement
-  remain open (tracked in ROADMAP).
+  remain open (tracked in TODO.md).
 - Parser, binder, optimizer, executor, storage, MVCC, WAL, catalog, protocol,
   server, CLI, and benchmark crates have working public surfaces and regression
   tests.
@@ -1500,7 +1500,7 @@ the per-crate ≥80% coverage gate are all green.
   `SET`, `SHOW`, and `RESET`; `DATE`, `TIMESTAMP`, and `TIMESTAMPTZ` text
   output now honors `SQL`, `German`, and `Postgres` date styles for result
   rows and COPY text/CSV paths. Locale variants remain tracked in
-  `ROADMAP.md`. Evidence:
+  `TODO.md`. Evidence:
   `cargo test -p ultrasql-server --test timetz_round_trip timetz_and_temporal_display_round_trip -- --nocapture`;
   `cargo test -p ultrasql-server --test system_functions_round_trip orm_startup_runtime_parameters_round_trip`.
 - `TimeZone` session GUC values are now validated through the same fixed-offset

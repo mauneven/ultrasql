@@ -599,7 +599,7 @@ fn conjuncts_to_and_opt(mut predicates: Vec<ScalarExpr>) -> Option<ScalarExpr> {
 /// Mirrors `physical::build_using_predicate`. Lives here so the
 /// server-side lowerer is self-contained; converging on a single shared
 /// helper lands when the server delegates to `physical::build_operator`
-/// in v0.6 (see ROADMAP P0 "Server invokes optimizer").
+/// in v0.6 (see TODO.md "Server invokes optimizer").
 pub(super) fn build_using_predicate(
     pairs: &[(usize, usize)],
     left_schema: &Schema,

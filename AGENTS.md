@@ -345,7 +345,7 @@ ultrasql/
 ├── ARCHITECTURE.md                cross-crate design
 ├── PERFORMANCE.md                 performance engineering rulebook
 ├── BENCHMARKS.md                  benchmark methodology
-├── ROADMAP.md                     shipping plan
+├── TODO.md                        open work + release gates
 ├── CONTRIBUTING.md                contributor guide
 ├── SECURITY.md                    vulnerability disclosure
 ├── RFC_PROCESS.md                 design change process

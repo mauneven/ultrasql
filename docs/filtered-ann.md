@@ -59,7 +59,7 @@ Recall floor 0.962 across every selectivity — no cliff. Loose filters take the
 ANN path at ~28× lower latency than the exact scan; selective filters fall back
 to exact and stay at recall 1.0. (A persistent metadata index would also make
 the selective-filter latency fast; that remains a future optimization — see
-ROADMAP.)
+TODO.md.)
 
 ## Scope
 

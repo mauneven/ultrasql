@@ -280,7 +280,7 @@ fn lower_query_inner(
             // pull-based `Operator` interface, so the drop-in is the
             // scalar `Sort` in `ultrasql_executor::sort`. The vectorised
             // variant would require lifting the entire pipeline to the
-            // push driver, which is a v0.7 milestone (see ROADMAP §v0.7).
+            // push driver, which is a v0.7 milestone (see TODO.md).
             let child = lower_query(input, ctx)?;
             let schema = child.schema().clone();
             Ok(Box::new(

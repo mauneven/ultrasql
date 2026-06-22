@@ -25,7 +25,7 @@
 //! ## v0.5 format support
 //!
 //! Only `text` format is required for v0.5. CSV format is a v0.6
-//! follow-up (tracked in ROADMAP.md).
+//! follow-up (tracked in TODO.md).
 //!
 //! ## Text format
 //!
