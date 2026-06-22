@@ -11,6 +11,12 @@ use ultrasql_core::{
 const JSON_PATH_DECIMAL_ARG_MAX: u32 = 1_000;
 const JSON_PATH_TIME_PRECISION_MAX: u32 = 6;
 
+/// Maximum recursion depth for the SQL/JSON path parser and predicate
+/// evaluator. Mirrors the SQL parser's `MAX_PARSE_DEPTH` so an
+/// attacker-controlled path string (bounded only by the wire-message limit)
+/// cannot drive unbounded recursive descent into a stack overflow / SIGABRT.
+const MAX_JSON_PATH_PARSE_DEPTH: usize = 128;
+
 /// Parsed SQL/JSON path expression.
 #[derive(Clone, Debug, PartialEq)]
 pub struct JsonPath {
@@ -233,7 +239,7 @@ fn select_steps(
                     collect_recursive(&item, &mut next);
                 }
                 JsonPathStep::Filter(predicate) => {
-                    if predicate_matches(&item, predicate, vars, mode)? {
+                    if predicate_matches(&item, predicate, vars, mode, 0)? {
                         next.push(item);
                     }
                 }
@@ -269,7 +275,15 @@ fn predicate_matches(
     predicate: &JsonPathPredicate,
     vars: Option<&JsonValue>,
     mode: JsonPathMode,
+    depth: usize,
 ) -> Result<bool, JsonPathError> {
+    // Defence in depth: even though the parser bounds nesting at
+    // `MAX_JSON_PATH_PARSE_DEPTH`, cap the evaluator's recursion too so a
+    // deeply-nested-but-parseable predicate (And/Or/Not chain) cannot
+    // overflow the stack at evaluation time.
+    if depth > MAX_JSON_PATH_PARSE_DEPTH {
+        return Err(JsonPathError::new("jsonpath predicate nested too deeply"));
+    }
     match predicate {
         JsonPathPredicate::Path { path, op, literal } => {
             let selected = select_steps(vec![value.clone()], path, vars, mode)?;
@@ -283,11 +297,17 @@ fn predicate_matches(
                 .iter()
                 .any(|candidate| compare_json_path_literal(candidate, *op, literal, vars)))
         }
-        JsonPathPredicate::And(left, right) => Ok(predicate_matches(value, left, vars, mode)?
-            && predicate_matches(value, right, vars, mode)?),
-        JsonPathPredicate::Or(left, right) => Ok(predicate_matches(value, left, vars, mode)?
-            || predicate_matches(value, right, vars, mode)?),
-        JsonPathPredicate::Not(inner) => Ok(!predicate_matches(value, inner, vars, mode)?),
+        JsonPathPredicate::And(left, right) => {
+            Ok(predicate_matches(value, left, vars, mode, depth + 1)?
+                && predicate_matches(value, right, vars, mode, depth + 1)?)
+        }
+        JsonPathPredicate::Or(left, right) => {
+            Ok(predicate_matches(value, left, vars, mode, depth + 1)?
+                || predicate_matches(value, right, vars, mode, depth + 1)?)
+        }
+        JsonPathPredicate::Not(inner) => {
+            Ok(!predicate_matches(value, inner, vars, mode, depth + 1)?)
+        }
     }
 }
 
@@ -978,14 +998,45 @@ fn json_path_regex_matches(value: &str, pattern: &str, flags: Option<&str>) -> b
 struct JsonPathParser<'a> {
     text: &'a str,
     pos: usize,
+    /// Current recursion depth across the mutually-recursive parse routines
+    /// (`parse_steps`, `parse_predicate_*`). Bounded by
+    /// [`MAX_JSON_PATH_PARSE_DEPTH`] so an attacker-controlled path string
+    /// cannot overflow the stack (e.g. `$ ?(!!!…@.a == 1)` or a long `(((…`
+    /// chain) and abort the server.
+    depth: usize,
 }
 
 impl<'a> JsonPathParser<'a> {
     fn new(text: &'a str) -> Self {
-        Self { text, pos: 0 }
+        Self {
+            text,
+            pos: 0,
+            depth: 0,
+        }
+    }
+
+    /// Increment the recursion depth, failing if it would exceed the bound.
+    /// Pair every successful call with [`Self::exit_recursion`].
+    fn enter_recursion(&mut self) -> Result<(), JsonPathError> {
+        self.depth += 1;
+        if self.depth > MAX_JSON_PATH_PARSE_DEPTH {
+            return Err(self.err("jsonpath nested too deeply"));
+        }
+        Ok(())
+    }
+
+    fn exit_recursion(&mut self) {
+        self.depth = self.depth.saturating_sub(1);
     }
 
     fn parse_steps(&mut self, relative: bool) -> Result<Vec<JsonPathStep>, JsonPathError> {
+        self.enter_recursion()?;
+        let result = self.parse_steps_inner(relative);
+        self.exit_recursion();
+        result
+    }
+
+    fn parse_steps_inner(&mut self, relative: bool) -> Result<Vec<JsonPathStep>, JsonPathError> {
         let mut steps = Vec::new();
         loop {
             self.skip_ws();
@@ -1067,6 +1118,13 @@ impl<'a> JsonPathParser<'a> {
     }
 
     fn parse_predicate_or(&mut self) -> Result<JsonPathPredicate, JsonPathError> {
+        self.enter_recursion()?;
+        let result = self.parse_predicate_or_inner();
+        self.exit_recursion();
+        result
+    }
+
+    fn parse_predicate_or_inner(&mut self) -> Result<JsonPathPredicate, JsonPathError> {
         let mut predicate = self.parse_predicate_and()?;
         loop {
             self.skip_ws();
@@ -1091,6 +1149,13 @@ impl<'a> JsonPathParser<'a> {
     }
 
     fn parse_predicate_not(&mut self) -> Result<JsonPathPredicate, JsonPathError> {
+        self.enter_recursion()?;
+        let result = self.parse_predicate_not_inner();
+        self.exit_recursion();
+        result
+    }
+
+    fn parse_predicate_not_inner(&mut self) -> Result<JsonPathPredicate, JsonPathError> {
         self.skip_ws();
         if self.consume_byte(b'!') {
             return self
@@ -1101,6 +1166,13 @@ impl<'a> JsonPathParser<'a> {
     }
 
     fn parse_predicate_atom(&mut self) -> Result<JsonPathPredicate, JsonPathError> {
+        self.enter_recursion()?;
+        let result = self.parse_predicate_atom_inner();
+        self.exit_recursion();
+        result
+    }
+
+    fn parse_predicate_atom_inner(&mut self) -> Result<JsonPathPredicate, JsonPathError> {
         self.skip_ws();
         if self.consume_byte(b'(') {
             let predicate = self.parse_predicate_expr()?;
@@ -1562,6 +1634,94 @@ mod tests {
 
     fn select(root: &JsonValue, path: &JsonPath) -> Vec<JsonValue> {
         select_json_path(root, path).expect("json path select")
+    }
+
+    // ── recursion-depth DoS guard (parse + eval) ─────────────────────────
+
+    /// A predicate with a pathologically long leading `!` chain must return a
+    /// clean `JsonPathError` rather than overflowing the parser's stack.
+    /// Reachable from `jsonb_path_exists/_query/_match` with an
+    /// attacker-controlled path bounded only by the wire-message limit, e.g.
+    /// `'$ ?(' || repeat('!', 2000000) || '@.a == 1)'`.
+    #[test]
+    fn deeply_nested_not_chain_is_rejected_not_crash() {
+        let mut path = String::from("$ ?(");
+        path.push_str(&"!".repeat(2_000_000));
+        path.push_str("@.a == 1)");
+        let err = parse_json_path(&path).expect_err("must reject, not overflow");
+        assert!(
+            err.to_string().contains("nested too deeply"),
+            "expected depth error, got: {err}"
+        );
+    }
+
+    /// A long chain of nested parentheses recurses several frames per `(`,
+    /// and must likewise be rejected before exhausting the stack.
+    #[test]
+    fn deeply_nested_paren_chain_is_rejected_not_crash() {
+        let mut path = String::from("$ ?(");
+        path.push_str(&"(".repeat(200_000));
+        path.push_str("@.a == 1");
+        path.push_str(&")".repeat(200_000));
+        path.push(')');
+        let err = parse_json_path(&path).expect_err("must reject, not overflow");
+        assert!(
+            err.to_string().contains("nested too deeply"),
+            "expected depth error, got: {err}"
+        );
+    }
+
+    /// A normal-depth path with a modest predicate (including nested AND and
+    /// nested NOT / parentheses, all well within the bound) must still parse
+    /// and evaluate correctly after adding the depth guard.
+    #[test]
+    fn normal_depth_path_still_parses_and_evaluates() {
+        let document = serde_json::json!({
+            "items": [
+                {"a": 1, "b": 2},
+                {"a": 1, "b": 9},
+                {"a": 5, "b": 2}
+            ]
+        });
+
+        // Nested boolean predicate: only the first element matches both.
+        let both =
+            parse_json_path("$.items[*] ? (@.a == 1 && @.b == 2)").expect("normal AND path parses");
+        assert_eq!(
+            select(&document, &both),
+            vec![serde_json::json!({"a": 1, "b": 2})]
+        );
+
+        // A few nested NOTs and parentheses (shallow) still parse and run.
+        let nots = parse_json_path("$.items[*] ? (!(!(@.a == 5)))")
+            .expect("nested-but-shallow NOT path parses");
+        assert_eq!(
+            select(&document, &nots),
+            vec![serde_json::json!({"a": 5, "b": 2})]
+        );
+    }
+
+    /// The evaluator independently bounds its And/Or/Not recursion, so a
+    /// directly-constructed deep predicate tree returns a clean error instead
+    /// of overflowing at evaluation time.
+    #[test]
+    fn deeply_nested_predicate_tree_is_bounded_at_eval() {
+        let base = JsonPathPredicate::Path {
+            path: Vec::new(),
+            op: None,
+            literal: None,
+        };
+        let mut predicate = base;
+        for _ in 0..(MAX_JSON_PATH_PARSE_DEPTH + 50) {
+            predicate = JsonPathPredicate::Not(Box::new(predicate));
+        }
+        let value = serde_json::json!({"a": 1});
+        let err = predicate_matches(&value, &predicate, None, JsonPathMode::Lax, 0)
+            .expect_err("deep predicate tree must be rejected at eval");
+        assert!(
+            err.to_string().contains("nested too deeply"),
+            "expected eval depth error, got: {err}"
+        );
     }
 
     #[test]
