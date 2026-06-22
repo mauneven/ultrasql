@@ -1398,6 +1398,546 @@ async fn set_transaction_isolation_level_round_trip() {
     shutdown(client, server_handle).await;
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Savepoint own-write visibility (the bug fix: a transaction must see its own
+// writes made under an active SAVEPOINT). Driven end-to-end through the wire.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Sort the `id` column of a result set into a `Vec<i32>`.
+fn ids_sorted(rows: &[tokio_postgres::Row]) -> Vec<i32> {
+    let mut ids: Vec<i32> = rows.iter().map(|r| r.get::<_, i32>(0)).collect();
+    ids.sort_unstable();
+    ids
+}
+
+/// C12 — Headline repro. A transaction sees its own write made under an
+/// active SAVEPOINT, *before* commit or release. This is the bug: the
+/// SELECT used to return only {1}.
+#[tokio::test]
+async fn savepoint_own_write_visible_within_transaction() {
+    let (client, _conn_handle, server_handle) = start_server_and_connect().await;
+
+    client
+        .batch_execute("CREATE TABLE t (id INT NOT NULL)")
+        .await
+        .expect("create table");
+
+    client.batch_execute("BEGIN").await.expect("BEGIN");
+    client
+        .batch_execute("INSERT INTO t VALUES (1)")
+        .await
+        .expect("pre-savepoint insert");
+    client
+        .batch_execute("SAVEPOINT s1")
+        .await
+        .expect("SAVEPOINT");
+    client
+        .batch_execute("INSERT INTO t VALUES (2)")
+        .await
+        .expect("under-savepoint insert");
+
+    // The own write under the active savepoint MUST be visible to us.
+    let rows = client
+        .query("SELECT id FROM t ORDER BY id", &[])
+        .await
+        .expect("select inside savepoint");
+    assert_eq!(
+        ids_sorted(&rows),
+        vec![1, 2],
+        "txn must see its own write under an active SAVEPOINT",
+    );
+
+    client.batch_execute("COMMIT").await.expect("COMMIT");
+    let rows = client.query("SELECT id FROM t", &[]).await.expect("after");
+    assert_eq!(ids_sorted(&rows), vec![1, 2], "both rows committed");
+
+    shutdown(client, server_handle).await;
+}
+
+/// C13 — ROLLBACK TO hides an in-savepoint insert and resurrects a
+/// row deleted under the savepoint.
+#[tokio::test]
+async fn savepoint_rollback_hides_insert_and_restores_delete() {
+    let (client, _conn_handle, server_handle) = start_server_and_connect().await;
+
+    client
+        .batch_execute("CREATE TABLE t (id INT NOT NULL)")
+        .await
+        .expect("create table");
+    client
+        .batch_execute("INSERT INTO t VALUES (10), (20)")
+        .await
+        .expect("seed");
+
+    client.batch_execute("BEGIN").await.expect("BEGIN");
+    client
+        .batch_execute("SAVEPOINT s1")
+        .await
+        .expect("SAVEPOINT");
+    client
+        .batch_execute("INSERT INTO t VALUES (30)")
+        .await
+        .expect("insert under savepoint");
+    client
+        .batch_execute("DELETE FROM t WHERE id = 10")
+        .await
+        .expect("delete under savepoint");
+
+    // Mid-savepoint: 30 visible, 10 gone.
+    let rows = client
+        .query("SELECT id FROM t ORDER BY id", &[])
+        .await
+        .expect("mid-savepoint select");
+    assert_eq!(ids_sorted(&rows), vec![20, 30]);
+
+    client
+        .batch_execute("ROLLBACK TO SAVEPOINT s1")
+        .await
+        .expect("ROLLBACK TO");
+
+    // After rollback: 30 vanished, 10 reappeared.
+    let rows = client
+        .query("SELECT id FROM t ORDER BY id", &[])
+        .await
+        .expect("post-rollback select");
+    assert_eq!(
+        ids_sorted(&rows),
+        vec![10, 20],
+        "rolled-back insert vanishes and rolled-back delete reappears",
+    );
+
+    client.batch_execute("COMMIT").await.expect("COMMIT");
+    shutdown(client, server_handle).await;
+}
+
+/// C14 — RELEASE keeps the in-savepoint write visible to the parent
+/// before COMMIT.
+#[tokio::test]
+async fn savepoint_release_keeps_write_visible_before_commit() {
+    let (client, _conn_handle, server_handle) = start_server_and_connect().await;
+
+    client
+        .batch_execute("CREATE TABLE t (id INT NOT NULL)")
+        .await
+        .expect("create table");
+
+    client.batch_execute("BEGIN").await.expect("BEGIN");
+    client
+        .batch_execute("SAVEPOINT s1")
+        .await
+        .expect("SAVEPOINT");
+    client
+        .batch_execute("INSERT INTO t VALUES (99)")
+        .await
+        .expect("insert under savepoint");
+    client
+        .batch_execute("RELEASE SAVEPOINT s1")
+        .await
+        .expect("RELEASE");
+
+    // Still inside the (uncommitted) parent txn — the merged-up write is
+    // visible as our own.
+    let rows = client
+        .query("SELECT id FROM t WHERE id = 99", &[])
+        .await
+        .expect("select after release");
+    assert_eq!(ids_sorted(&rows), vec![99], "released write stays visible");
+
+    client.batch_execute("COMMIT").await.expect("COMMIT");
+    shutdown(client, server_handle).await;
+}
+
+/// C15 — Nested savepoints. ROLLBACK TO the outer savepoint hides
+/// writes under both it and the inner one.
+#[tokio::test]
+async fn nested_savepoints_rollback_to_outer_hides_both() {
+    let (client, _conn_handle, server_handle) = start_server_and_connect().await;
+
+    client
+        .batch_execute("CREATE TABLE t (id INT NOT NULL)")
+        .await
+        .expect("create table");
+
+    client.batch_execute("BEGIN").await.expect("BEGIN");
+    client.batch_execute("SAVEPOINT a").await.expect("sp a");
+    client
+        .batch_execute("INSERT INTO t VALUES (1)")
+        .await
+        .expect("under a");
+    client.batch_execute("SAVEPOINT b").await.expect("sp b");
+    client
+        .batch_execute("INSERT INTO t VALUES (2)")
+        .await
+        .expect("under b");
+
+    // Both visible before any rollback.
+    let rows = client
+        .query("SELECT id FROM t ORDER BY id", &[])
+        .await
+        .expect("both visible");
+    assert_eq!(ids_sorted(&rows), vec![1, 2]);
+
+    client
+        .batch_execute("ROLLBACK TO SAVEPOINT a")
+        .await
+        .expect("ROLLBACK TO a");
+    let rows = client
+        .query("SELECT id FROM t ORDER BY id", &[])
+        .await
+        .expect("after rollback to a");
+    assert!(
+        ids_sorted(&rows).is_empty(),
+        "ROLLBACK TO a hides writes under a and b: got {:?}",
+        ids_sorted(&rows),
+    );
+
+    client.batch_execute("COMMIT").await.expect("COMMIT");
+    shutdown(client, server_handle).await;
+}
+
+/// C15b — Nested savepoints variant: ROLLBACK TO the inner savepoint
+/// keeps the outer write.
+#[tokio::test]
+async fn nested_savepoints_rollback_to_inner_keeps_outer() {
+    let (client, _conn_handle, server_handle) = start_server_and_connect().await;
+
+    client
+        .batch_execute("CREATE TABLE t (id INT NOT NULL)")
+        .await
+        .expect("create table");
+
+    client.batch_execute("BEGIN").await.expect("BEGIN");
+    client.batch_execute("SAVEPOINT a").await.expect("sp a");
+    client
+        .batch_execute("INSERT INTO t VALUES (1)")
+        .await
+        .expect("under a");
+    client.batch_execute("SAVEPOINT b").await.expect("sp b");
+    client
+        .batch_execute("INSERT INTO t VALUES (2)")
+        .await
+        .expect("under b");
+    client
+        .batch_execute("ROLLBACK TO SAVEPOINT b")
+        .await
+        .expect("ROLLBACK TO b");
+
+    let rows = client
+        .query("SELECT id FROM t ORDER BY id", &[])
+        .await
+        .expect("after rollback to b");
+    assert_eq!(
+        ids_sorted(&rows),
+        vec![1],
+        "ROLLBACK TO b hides only the write under b",
+    );
+
+    client.batch_execute("COMMIT").await.expect("COMMIT");
+    shutdown(client, server_handle).await;
+}
+
+/// C16 — UPDATE under a savepoint surfaces the new image; ROLLBACK TO
+/// restores the pre-image (exercises the in-place-update undo path).
+#[tokio::test]
+async fn savepoint_update_then_rollback_restores_pre_image() {
+    let (client, _conn_handle, server_handle) = start_server_and_connect().await;
+
+    client
+        .batch_execute("CREATE TABLE t (id INT NOT NULL, val INT NOT NULL)")
+        .await
+        .expect("create table");
+    client
+        .batch_execute("INSERT INTO t VALUES (1, 100)")
+        .await
+        .expect("seed v0");
+
+    client.batch_execute("BEGIN").await.expect("BEGIN");
+    client
+        .batch_execute("SAVEPOINT s1")
+        .await
+        .expect("SAVEPOINT");
+    client
+        .batch_execute("UPDATE t SET val = 200 WHERE id = 1")
+        .await
+        .expect("update under savepoint");
+
+    // New image visible under the savepoint.
+    let row = client
+        .query_one("SELECT val FROM t WHERE id = 1", &[])
+        .await
+        .expect("select new image");
+    assert_eq!(
+        row.get::<_, i32>(0),
+        200,
+        "own UPDATE visible under savepoint"
+    );
+
+    client
+        .batch_execute("ROLLBACK TO SAVEPOINT s1")
+        .await
+        .expect("ROLLBACK TO");
+
+    // Pre-image restored.
+    let row = client
+        .query_one("SELECT val FROM t WHERE id = 1", &[])
+        .await
+        .expect("select pre-image");
+    assert_eq!(
+        row.get::<_, i32>(0),
+        100,
+        "ROLLBACK TO restores the pre-update value",
+    );
+
+    client.batch_execute("COMMIT").await.expect("COMMIT");
+    shutdown(client, server_handle).await;
+}
+
+/// C17 — Isolation matrix. The headline + rollback + release behaviour
+/// is isolation-independent: it must hold identically under READ
+/// COMMITTED, REPEATABLE READ, and SERIALIZABLE. RC exercises the
+/// rebuild-with-exclusion path; RR/SSI exercise the in-place
+/// frozen-snapshot subxid patch.
+#[tokio::test]
+async fn savepoint_visibility_across_isolation_levels() {
+    let (client, _conn_handle, server_handle) = start_server_and_connect().await;
+
+    client
+        .batch_execute("CREATE TABLE t (id INT NOT NULL)")
+        .await
+        .expect("create table");
+
+    for level in ["READ COMMITTED", "REPEATABLE READ", "SERIALIZABLE"] {
+        client
+            .batch_execute("DELETE FROM t")
+            .await
+            .expect("reset table");
+
+        client
+            .batch_execute(&format!("BEGIN ISOLATION LEVEL {level}"))
+            .await
+            .unwrap_or_else(|e| panic!("BEGIN {level}: {e}"));
+        client
+            .batch_execute("INSERT INTO t VALUES (1)")
+            .await
+            .expect("base insert");
+        client
+            .batch_execute("SAVEPOINT s1")
+            .await
+            .expect("SAVEPOINT");
+        client
+            .batch_execute("INSERT INTO t VALUES (2)")
+            .await
+            .expect("under savepoint");
+
+        // Headline visibility holds under every level.
+        let rows = client
+            .query("SELECT id FROM t ORDER BY id", &[])
+            .await
+            .expect("select under savepoint");
+        assert_eq!(
+            ids_sorted(&rows),
+            vec![1, 2],
+            "own savepoint write must be visible under {level}",
+        );
+
+        // Rolled-back insert vanishes under every level.
+        client
+            .batch_execute("ROLLBACK TO SAVEPOINT s1")
+            .await
+            .expect("ROLLBACK TO");
+        let rows = client
+            .query("SELECT id FROM t ORDER BY id", &[])
+            .await
+            .expect("select after rollback");
+        assert_eq!(
+            ids_sorted(&rows),
+            vec![1],
+            "rolled-back insert must vanish under {level}",
+        );
+
+        client.batch_execute("COMMIT").await.expect("COMMIT");
+    }
+
+    shutdown(client, server_handle).await;
+}
+
+/// C18 — Cross-transaction isolation guard. Uncommitted savepoint
+/// writes must NOT leak to another transaction, even after RELEASE,
+/// until the top-level COMMIT. This is the "do not over-broaden self"
+/// invariant.
+#[tokio::test]
+async fn savepoint_writes_do_not_leak_to_other_transaction() {
+    let (a, b, a_handle, b_handle, server_handle) = start_server_and_connect_pair().await;
+
+    a.batch_execute("CREATE TABLE t (id INT NOT NULL)")
+        .await
+        .expect("create table");
+
+    a.batch_execute("BEGIN").await.expect("A BEGIN");
+    a.batch_execute("SAVEPOINT s1").await.expect("A SAVEPOINT");
+    a.batch_execute("INSERT INTO t VALUES (7)")
+        .await
+        .expect("A insert under savepoint");
+
+    // B (autocommit, fresh snapshot per statement) must NOT see A's
+    // uncommitted savepoint write.
+    let rows = b
+        .query("SELECT id FROM t WHERE id = 7", &[])
+        .await
+        .expect("B select while A holds savepoint");
+    assert!(
+        rows.is_empty(),
+        "another txn must not see uncommitted savepoint writes",
+    );
+
+    // After A RELEASE (but before A COMMIT) B still must not see it.
+    a.batch_execute("RELEASE SAVEPOINT s1")
+        .await
+        .expect("A RELEASE");
+    let rows = b
+        .query("SELECT id FROM t WHERE id = 7", &[])
+        .await
+        .expect("B select after A release, before A commit");
+    assert!(
+        rows.is_empty(),
+        "released-but-uncommitted savepoint writes must not leak to others",
+    );
+
+    // After A COMMIT, B's next snapshot sees it (fold-up).
+    a.batch_execute("COMMIT").await.expect("A COMMIT");
+    let rows = b
+        .query("SELECT id FROM t WHERE id = 7", &[])
+        .await
+        .expect("B select after A commit");
+    assert_eq!(
+        ids_sorted(&rows),
+        vec![7],
+        "committed savepoint writes become visible to others after fold-up",
+    );
+
+    drop(a);
+    drop(b);
+    a_handle.abort();
+    b_handle.abort();
+    server_handle.abort();
+}
+
+/// C19 — Rolled-back, then a savepoint with the *same name* is reused.
+/// The original (rolled-back) subxid stays invisible; the new one is
+/// distinct.
+#[tokio::test]
+async fn savepoint_rolled_back_then_reused_name() {
+    let (client, _conn_handle, server_handle) = start_server_and_connect().await;
+
+    client
+        .batch_execute("CREATE TABLE t (id INT NOT NULL)")
+        .await
+        .expect("create table");
+
+    client.batch_execute("BEGIN").await.expect("BEGIN");
+    client.batch_execute("SAVEPOINT s").await.expect("sp s #1");
+    client
+        .batch_execute("INSERT INTO t VALUES (7)")
+        .await
+        .expect("insert 7");
+    client
+        .batch_execute("ROLLBACK TO SAVEPOINT s")
+        .await
+        .expect("rollback to s #1");
+    client
+        .batch_execute("INSERT INTO t VALUES (8)")
+        .await
+        .expect("insert 8");
+    client.batch_execute("SAVEPOINT s").await.expect("sp s #2");
+    client
+        .batch_execute("INSERT INTO t VALUES (9)")
+        .await
+        .expect("insert 9");
+    client
+        .batch_execute("RELEASE SAVEPOINT s")
+        .await
+        .expect("release s #2");
+
+    let rows = client
+        .query("SELECT id FROM t ORDER BY id", &[])
+        .await
+        .expect("select after reuse");
+    assert_eq!(
+        ids_sorted(&rows),
+        vec![8, 9],
+        "rolled-back 7 gone; 8 (between) and 9 (reused savepoint) present",
+    );
+
+    client.batch_execute("COMMIT").await.expect("COMMIT");
+    shutdown(client, server_handle).await;
+}
+
+/// C20 — Cache-path stress. Insert many rows under one savepoint, roll
+/// it back, then seq-scan the relation. All rows from the rolled-back
+/// subxid must be invisible — exercising the walker's `xmin_cache`
+/// memoization of the `Invisible` classification for a single xmin.
+#[tokio::test]
+async fn savepoint_rollback_cache_path_stress() {
+    let (client, _conn_handle, server_handle) = start_server_and_connect().await;
+
+    client
+        .batch_execute("CREATE TABLE t (id INT NOT NULL)")
+        .await
+        .expect("create table");
+    client
+        .batch_execute("INSERT INTO t VALUES (1), (2), (3)")
+        .await
+        .expect("seed committed rows");
+
+    client.batch_execute("BEGIN").await.expect("BEGIN");
+    client
+        .batch_execute("SAVEPOINT s1")
+        .await
+        .expect("SAVEPOINT");
+    // Many rows under one subxid → one xmin classified Invisible after
+    // rollback; the seq-scan cache memoizes it across all of them.
+    let values: Vec<String> = (100..400).map(|i| format!("({i})")).collect();
+    client
+        .batch_execute(&format!("INSERT INTO t VALUES {}", values.join(", ")))
+        .await
+        .expect("bulk insert under savepoint");
+
+    let row = client
+        .query_one("SELECT COUNT(*) FROM t", &[])
+        .await
+        .expect("count under savepoint");
+    assert_eq!(
+        row.get::<_, i64>(0),
+        303,
+        "all rows visible under savepoint"
+    );
+
+    client
+        .batch_execute("ROLLBACK TO SAVEPOINT s1")
+        .await
+        .expect("ROLLBACK TO");
+
+    // Only the 3 committed rows remain; the 300 rolled-back rows are all
+    // invisible (cache memoizes the rolled-back subxid's xmin).
+    let row = client
+        .query_one("SELECT COUNT(*) FROM t", &[])
+        .await
+        .expect("count after rollback");
+    assert_eq!(
+        row.get::<_, i64>(0),
+        3,
+        "all rows from the rolled-back subxid must be invisible",
+    );
+    let rows = client
+        .query("SELECT id FROM t ORDER BY id", &[])
+        .await
+        .expect("scan after rollback");
+    assert_eq!(ids_sorted(&rows), vec![1, 2, 3]);
+
+    client.batch_execute("COMMIT").await.expect("COMMIT");
+    shutdown(client, server_handle).await;
+}
+
 /// Inside a REPEATABLE READ transaction the snapshot is frozen at BEGIN.
 /// A baseline row inserted before BEGIN is visible; the transaction
 /// commits cleanly to verify the full path.
