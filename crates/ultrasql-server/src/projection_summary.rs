@@ -33,9 +33,10 @@ pub(crate) fn try_run_cached_grouped_projection_select(
     plan: &LogicalPlan,
     catalog_snapshot: &Arc<CatalogSnapshot>,
     heap: &HeapAccess<BlankPageLoader>,
+    snapshot: &ultrasql_mvcc::Snapshot,
     stream_buf: &mut BytesMut,
 ) -> Option<SelectResult> {
-    let (schema, rows, entry) = cached_grouped_projection(plan, catalog_snapshot, heap)?;
+    let (schema, rows, entry) = cached_grouped_projection(plan, catalog_snapshot, heap, snapshot)?;
     let encoded_rows = u64::try_from(rows.len()).ok()?;
     if let Some(hit) = entry.text_body.read().as_ref().cloned() {
         return Some(result_encoder::run_shared_preencoded_select_streamed(
@@ -58,8 +59,9 @@ pub(crate) fn try_build_cached_grouped_projection_scan(
     plan: &LogicalPlan,
     catalog_snapshot: &Arc<CatalogSnapshot>,
     heap: &HeapAccess<BlankPageLoader>,
+    snapshot: &ultrasql_mvcc::Snapshot,
 ) -> Option<ValuesScan> {
-    let (schema, rows, _) = cached_grouped_projection(plan, catalog_snapshot, heap)?;
+    let (schema, rows, _) = cached_grouped_projection(plan, catalog_snapshot, heap, snapshot)?;
     Some(ValuesScan::new(
         rows_to_literals(rows.as_ref(), &schema),
         schema,
@@ -70,11 +72,16 @@ fn cached_grouped_projection(
     plan: &LogicalPlan,
     catalog_snapshot: &Arc<CatalogSnapshot>,
     heap: &HeapAccess<BlankPageLoader>,
+    snapshot: &ultrasql_mvcc::Snapshot,
 ) -> Option<CachedProjectionHit> {
     let shape = GroupedProjectionShape::extract(plan)?;
     let folded = shape.table.to_ascii_lowercase();
     let entry = catalog_snapshot.tables.get(&folded)?;
-    let cached = heap.column_cache.get(RelationId(entry.oid))?;
+    // Coherence gate: the grouped summary derives from the shared RAW
+    // projection, so only a quiescent, writer-visible snapshot may use it.
+    let cached = heap
+        .column_cache
+        .get_for_snapshot(RelationId(entry.oid), snapshot)?;
     let key = shape.cache_key()?;
 
     if let Some(hit) = cached

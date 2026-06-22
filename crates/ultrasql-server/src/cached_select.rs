@@ -7,6 +7,7 @@ pub(crate) fn try_run_cached_int32_pair_select(
     plan: &LogicalPlan,
     catalog_snapshot: &Arc<CatalogSnapshot>,
     heap: &HeapAccess<BlankPageLoader>,
+    snapshot: &ultrasql_mvcc::Snapshot,
     stream_buf: &mut bytes::BytesMut,
 ) -> Option<SelectResult> {
     let (table, output_schema) = match plan {
@@ -43,7 +44,9 @@ pub(crate) fn try_run_cached_int32_pair_select(
     let folded = table.to_ascii_lowercase();
     let entry = catalog_snapshot.tables.get(&folded)?;
     let rel = RelationId(entry.oid);
-    let cached = heap.column_cache.get(rel)?;
+    // Coherence gate: only serve the shared, RAW-replayed projection to a
+    // snapshot that reflects exactly the committed state at this version.
+    let cached = heap.column_cache.get_for_snapshot(rel, snapshot)?;
     let [Column::Int32(left), Column::Int32(right)] = cached.columns.as_slice() else {
         return None;
     };
@@ -81,6 +84,7 @@ pub(crate) fn try_run_cached_scalar_aggregate_select(
     plan: &LogicalPlan,
     catalog_snapshot: &Arc<CatalogSnapshot>,
     heap: &HeapAccess<BlankPageLoader>,
+    snapshot: &ultrasql_mvcc::Snapshot,
     stream_buf: &mut bytes::BytesMut,
 ) -> Option<SelectResult> {
     let (aggregate_input, group_by, aggregates, output_schema) = match plan {
@@ -148,7 +152,9 @@ pub(crate) fn try_run_cached_scalar_aggregate_select(
     let folded = table.to_ascii_lowercase();
     let entry = catalog_snapshot.tables.get(&folded)?;
     let rel = RelationId(entry.oid);
-    let cached = heap.column_cache.get(rel)?;
+    // Coherence gate: same quiescent-snapshot requirement as the int32-pair
+    // fast path — these aggregates fold the shared projection RAW.
+    let cached = heap.column_cache.get_for_snapshot(rel, snapshot)?;
 
     let cache_key = build_cached_scalar_wire_key(agg, output_schema, predicate)?;
     if let Some(encoded) = cached

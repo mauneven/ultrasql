@@ -97,6 +97,7 @@ pub fn execute_portal(
             &plan,
             &ctx.catalog_snapshot,
             ctx.heap.as_ref(),
+            &ctx.snapshot,
         ) {
         Box::new(scan)
     } else {

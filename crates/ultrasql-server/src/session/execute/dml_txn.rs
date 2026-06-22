@@ -53,20 +53,28 @@ where
         }
         let _operator_span =
             tracing::debug_span!("sql.operator", plan = ?std::mem::discriminant(plan)).entered();
-        // The cached `(Int32, Int32)` full-scan fast path is already
-        // answered from the version-stamped column cache and does not
-        // consult txn-local visibility state. In autocommit `Idle`
-        // mode there is therefore no user-visible work for `begin()` /
-        // `commit()` to do; skipping them avoids one XID allocation,
-        // one snapshot build, and one CLOG transition on the
-        // `select_scan_10k` hot path. Explicit transaction blocks keep
-        // the normal machinery so `ReadyForQuery` state and command-id
-        // progression stay unchanged there.
+        // The cached `(Int32, Int32)` full-scan fast path is answered from
+        // the version-stamped column cache. It is shared and replayed RAW,
+        // so it may only serve a snapshot that reflects exactly the
+        // committed state at the cache's version (see
+        // `ColumnCache::is_snapshot_coherent`). In autocommit `Idle` mode we
+        // still skip `begin()` / `commit()` (no XID allocation, no CLOG
+        // transition), but we build a lightweight read-only snapshot for the
+        // gate. For the quiescent `select_scan_10k` hot path the in-progress
+        // set is empty, so this is one atomic load plus an empty walk — the
+        // gate passes and the fast path fires unchanged. Under concurrency
+        // the gate fails and we fall through to the normal txn path, which
+        // walks the heap. Explicit transaction blocks reuse `txn.snapshot`.
         if matches!(self.txn_state, TxnState::Idle) {
+            let autocommit_snapshot = self
+                .state
+                .txn_manager
+                .statement_snapshot(ultrasql_core::Xid::INVALID, ultrasql_core::CommandId::FIRST);
             if let Some(result) = try_run_cached_int32_pair_select(
                 plan,
                 catalog_snapshot,
                 self.state.heap.as_ref(),
+                &autocommit_snapshot,
                 &mut self.write_buf,
             ) {
                 return Ok(result);
@@ -75,6 +83,7 @@ where
                 plan,
                 catalog_snapshot,
                 self.state.heap.as_ref(),
+                &autocommit_snapshot,
                 &mut self.write_buf,
             ) {
                 return Ok(result);
@@ -84,6 +93,7 @@ where
                     plan,
                     catalog_snapshot,
                     self.state.heap.as_ref(),
+                    &autocommit_snapshot,
                     &mut self.write_buf,
                 )
             {
@@ -95,6 +105,7 @@ where
                 plan,
                 catalog_snapshot,
                 self.state.heap.as_ref(),
+                &self.current_txn_snapshot(),
                 &mut self.write_buf,
             )
         {

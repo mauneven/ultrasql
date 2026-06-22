@@ -393,9 +393,17 @@ where
             && start_block == 0
             && !with_tids
             && schema_all_fixed_numeric(codec.schema());
+        // Column-cache **read** coherence guard. The cache is shared and
+        // replayed RAW: `next_batch_from_cache` slices the cached columns
+        // with no per-tuple visibility re-filtering, so a snapshot may only
+        // consume a published entry when it provably reflects exactly the
+        // committed state at that version.
+        // [`ColumnCache::get_for_snapshot`] folds that gate in (see
+        // [`ColumnCache::is_snapshot_coherent`]); a non-coherent snapshot
+        // misses the cache and walks the heap.
         let cache_read = if cache_eligible {
             heap.column_cache
-                .get(relation)
+                .get_for_snapshot(relation, &snapshot_box)
                 .map(|columns| CacheReadState { columns, cursor: 0 })
         } else {
             None
@@ -438,46 +446,42 @@ where
         // cache is shared and keyed only on the relation's mutation
         // version, with no per-snapshot qualifier; whatever projection
         // we publish is served to *every* later scan at the same
-        // version. A relation's version is bumped at physical
-        // insert/update/delete time, which is *before* the writer
-        // commits — so the version can already reflect a writer's rows
-        // (or deletions) while a frozen snapshot (REPEATABLE READ /
-        // SERIALIZABLE, or any snapshot taken before that writer
-        // committed) still cannot see them. If such a behind-the-commit
-        // snapshot published its projection, it would omit committed
-        // rows or resurrect deleted ones for a newer reader served from
-        // the cache.
+        // version, and is replayed RAW (no visibility re-filtering). A
+        // relation's version is bumped at physical insert/update/delete
+        // time, which is *before* the writer commits — so the version
+        // can already reflect a writer's rows (or deletions) while a
+        // frozen snapshot (REPEATABLE READ / SERIALIZABLE, or any
+        // snapshot taken before that writer committed) still cannot see
+        // them. Conversely a read-after-write snapshot can see its own
+        // uncommitted rows, and a multi-writer version reflects writers
+        // whose individual visibility differs per reader.
         //
-        // `last_writer_xid` is the highest XID that has bumped this
-        // relation's version. The build snapshot may publish only when
-        // it can see that writer: its own writes (`is_current_xid`),
-        // or a writer that is no longer in progress
-        // (`!xid_in_progress`, i.e. committed/aborted and below
-        // `xmax`). A writer still in the snapshot's in-progress set, or
-        // newer than the snapshot's `xmax`, makes the projection
-        // potentially incoherent, so the scan walks the heap without
-        // publishing and the next coherent reader rebuilds the entry.
-        // The common autocommit reader takes a fresh snapshot after the
-        // writer committed, sees it, and still publishes — the hot path
-        // is unchanged.
+        // The sound condition (applied identically to the publish side
+        // here and the read side above, via
+        // [`ColumnCache::is_snapshot_coherent`]) is that the operating
+        // snapshot provably reflects exactly the committed state at that
+        // version. The cache is then used only when the relation is
+        // effectively quiescent for this snapshot — the read-mostly
+        // workload the cache targets — and any concurrency falls back to
+        // a correct heap scan. The common autocommit reader takes a
+        // fresh snapshot after the writer committed (empty in-progress
+        // set, writer visible), so it still publishes and reuses the
+        // cache; the hot path is unchanged.
         //
-        // Read order matters: sample `target_version` *before*
-        // `last_writer_xid`. A concurrent mutation between the two reads
-        // then either advances `last_writer_xid` to a writer this
-        // snapshot cannot see (the gate below rejects the build) or
-        // advances the version past `target_version` (the version guard
-        // in `ColumnCache::put` drops the finalised entry). Sampling the
-        // version first leaves no window in which a freshly-bumped
-        // writer is missed by *both* checks.
+        // Read order matters: sample `target_version` *before* the
+        // writer state inside the gate. A concurrent mutation between the
+        // two reads then either advances the recorded writer to one this
+        // snapshot cannot see (the gate rejects the build) or advances
+        // the version past `target_version` (the version guard in
+        // `ColumnCache::put` drops the finalised entry). Sampling the
+        // version first leaves no window in which a freshly-bumped writer
+        // is missed by *both* checks.
         let cache_build = if cache_eligible && !cache_hit && block_count > 0 {
             let target_version = heap.column_cache.relation_version(relation);
-            let snapshot_sees_last_writer = {
-                let writer = heap.column_cache.last_writer_xid(relation);
-                writer == ultrasql_core::Xid::INVALID
-                    || snapshot_box.is_current_xid(writer)
-                    || !snapshot_box.xid_in_progress(writer)
-            };
-            if snapshot_sees_last_writer {
+            if heap
+                .column_cache
+                .is_snapshot_coherent(relation, &snapshot_box)
+            {
                 match build_initial_builders(&codec, false) {
                     Ok(builders) => Some(CacheBuildState {
                         builders,

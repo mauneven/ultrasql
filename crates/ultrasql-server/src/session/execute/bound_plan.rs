@@ -238,6 +238,29 @@ where
         !self.pending_table_modifications.contains_key(&table)
     }
 
+    /// MVCC snapshot to gate the cached-aggregate fast path inside an
+    /// explicit transaction.
+    ///
+    /// `can_use_cached_scalar_aggregate_in_explicit_txn` only returns `true`
+    /// for a `ReadCommitted` `InTransaction` state, so a fresh statement
+    /// snapshot (committed state now, plus this txn's own writes via its
+    /// xid) is the correct read-committed view to test against
+    /// [`ColumnCache::is_snapshot_coherent`]. Falls back to an empty
+    /// read-only snapshot if somehow called outside a live transaction; the
+    /// gate then simply governs admission like the autocommit path.
+    pub(crate) fn current_txn_snapshot(&self) -> ultrasql_mvcc::Snapshot {
+        match &self.txn_state {
+            TxnState::InTransaction(txn) => self
+                .state
+                .txn_manager
+                .statement_snapshot(txn.xid, txn.current_command),
+            _ => self
+                .state
+                .txn_manager
+                .statement_snapshot(ultrasql_core::Xid::INVALID, ultrasql_core::CommandId::FIRST),
+        }
+    }
+
     pub(crate) fn parse_fast_insert_int32_pair_sql(
         sql: &str,
     ) -> Option<FastInsertInt32PairSql<'_>> {

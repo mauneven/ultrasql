@@ -47,6 +47,7 @@ use std::sync::Arc;
 use ahash::AHashMap;
 use parking_lot::RwLock;
 use ultrasql_core::{DataType, RelationId, Schema, Value, Xid};
+use ultrasql_mvcc::Snapshot;
 use ultrasql_vec::column::Column;
 
 /// Target row count per in-memory columnar segment.
@@ -327,9 +328,102 @@ impl ColumnCache {
     /// Look up the cached projection for `rel` at the current
     /// version. Returns `None` on cache miss (no entry or stale
     /// version).
+    ///
+    /// # Coherence
+    ///
+    /// This accessor performs **no MVCC visibility check**: the returned
+    /// projection is the raw set of live tuples one building scan observed
+    /// at the relation's current version, with no per-snapshot qualifier.
+    /// It is sound only for a caller that has *already* established its
+    /// operating snapshot may consume the cache for `rel` (see
+    /// [`Self::is_snapshot_coherent`]), or for a caller that does not serve
+    /// MVCC results from it (maintenance / warming / stats).
+    ///
+    /// Any path that returns rows to a client **must** use
+    /// [`Self::get_for_snapshot`] instead, which folds the coherence gate
+    /// in. Replaying this entry RAW for a snapshot that does not reflect
+    /// exactly the committed state at this version dirty-reads or hides
+    /// rows (see the module docs and `SeqScan`'s coherence guard).
     #[must_use]
     pub fn get(&self, rel: RelationId) -> Option<Arc<CachedColumns>> {
         let g = self.inner.read();
+        let current = *g.versions.get(&rel).unwrap_or(&0);
+        g.entries
+            .get(&rel)
+            .filter(|e| e.version == current)
+            .cloned()
+    }
+
+    /// Whether `snapshot` may both **publish** to and **consume** from the
+    /// shared, version-keyed projection for `rel`.
+    ///
+    /// The cache stores one projection per relation version and is replayed
+    /// RAW — no per-tuple visibility re-filtering. A snapshot may therefore
+    /// touch the cache only when it provably reflects **exactly the
+    /// committed state** at that version. The sufficient condition is:
+    ///
+    /// ```text
+    /// snapshot.xip().is_empty()
+    ///   && ( last_writer == Xid::INVALID
+    ///        || snapshot.is_current_xid(last_writer)
+    ///        || !snapshot.xid_in_progress(last_writer) )
+    /// ```
+    ///
+    /// - `xip().is_empty()` — no *other* transaction was in progress when
+    ///   this snapshot was taken. No in-progress writer can be silently
+    ///   missed, including a writer with a *lower* xid than the recorded
+    ///   (max) `last_writer_xid` (the multi-writer hole). It also closes the
+    ///   dirty-read hole: while a writer X is in progress, every *other*
+    ///   reader has X in its in-progress set, so every other reader's gate
+    ///   fails and it walks the heap rather than consuming a projection X
+    ///   published from its own read-after-write snapshot.
+    /// - The writer predicate means the snapshot is not *behind* the latest
+    ///   writer reflected in the version: a reader frozen before that writer
+    ///   committed has it in-progress (or newer than `xmax`), so the gate
+    ///   fails and the reader walks the heap — never consuming a projection
+    ///   that includes rows committed after its snapshot.
+    ///
+    /// Together they admit the cache only when the relation is effectively
+    /// quiescent for this snapshot (the read-mostly workload the cache
+    /// targets) and fall back to a correct heap scan under any concurrency.
+    #[must_use]
+    pub fn is_snapshot_coherent(&self, rel: RelationId, snapshot: &Snapshot) -> bool {
+        if !snapshot.xip().is_empty() {
+            return false;
+        }
+        let writer = self.last_writer_xid(rel);
+        writer == Xid::INVALID
+            || snapshot.is_current_xid(writer)
+            || !snapshot.xid_in_progress(writer)
+    }
+
+    /// Coherence-gated [`Self::get`]: return the cached projection for `rel`
+    /// only when `snapshot` provably reflects exactly the committed state at
+    /// the cache's version (see [`Self::is_snapshot_coherent`]). Every path
+    /// that serves MVCC results to a client must go through this accessor;
+    /// `None` means the caller must fall back to a heap scan.
+    #[must_use]
+    pub fn get_for_snapshot(
+        &self,
+        rel: RelationId,
+        snapshot: &Snapshot,
+    ) -> Option<Arc<CachedColumns>> {
+        // Read everything under one lock so the version, last writer, and
+        // entry are mutually consistent — a concurrent `bump_version` either
+        // happens entirely before (gate sees the new writer / version) or
+        // entirely after (we return the pre-bump entry, which `get`'s
+        // version filter still matched).
+        let g = self.inner.read();
+        if !snapshot.xip().is_empty() {
+            return None;
+        }
+        let writer = g.last_writer_xid.get(&rel).copied().unwrap_or(Xid::INVALID);
+        let snapshot_sees_writer = writer == Xid::INVALID
+            || snapshot.is_current_xid(writer)
+            || !snapshot.xid_in_progress(writer);
+        if !snapshot_sees_writer {
+            return None;
+        }
         let current = *g.versions.get(&rel).unwrap_or(&0);
         g.entries
             .get(&rel)

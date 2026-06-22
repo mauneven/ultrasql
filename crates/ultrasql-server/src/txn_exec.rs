@@ -139,9 +139,13 @@ pub(crate) fn run_plan_in_txn(args: RunPlanInTxnArgs<'_>) -> Result<SelectResult
         allow_streaming,
         streaming_commit_txn,
     } = args;
-    if let Some(result) =
-        try_run_cached_int32_pair_select(plan, &catalog_snapshot, heap.as_ref(), stream_buf)
-    {
+    if let Some(result) = try_run_cached_int32_pair_select(
+        plan,
+        &catalog_snapshot,
+        heap.as_ref(),
+        &txn.snapshot,
+        stream_buf,
+    ) {
         return Ok(result);
     }
     let text_options =

@@ -147,7 +147,14 @@ pub(super) fn try_lower_cached_scalar_aggregate_i32(
     }
 
     let rel_id = RelationId(entry.oid);
-    let Some(columns) = ctx.heap.column_cache.get(rel_id) else {
+    // Coherence gate: a cached fused scan replays the shared RAW projection,
+    // so only a quiescent, writer-visible snapshot may use it; otherwise
+    // fall through to the generic heap-backed aggregate chain.
+    let Some(columns) = ctx
+        .heap
+        .column_cache
+        .get_for_snapshot(rel_id, &ctx.snapshot)
+    else {
         return Ok(None);
     };
 
@@ -402,7 +409,11 @@ pub(super) fn try_lower_fused_filter_sum_int(
             {
                 return Ok(None);
             }
-            if let Some(columns) = ctx.heap.column_cache.get(rel_id) {
+            if let Some(columns) = ctx
+                .heap
+                .column_cache
+                .get_for_snapshot(rel_id, &ctx.snapshot)
+            {
                 let fused = CachedFilterSumI32Scan::new(
                     columns,
                     pred_col,
@@ -443,7 +454,11 @@ pub(super) fn try_lower_fused_filter_sum_int(
             {
                 return Ok(None);
             }
-            if let Some(columns) = ctx.heap.column_cache.get(rel_id) {
+            if let Some(columns) = ctx
+                .heap
+                .column_cache
+                .get_for_snapshot(rel_id, &ctx.snapshot)
+            {
                 let fused = CachedFilterSumI64Scan::new(
                     columns,
                     pred_col,
