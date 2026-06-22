@@ -1969,3 +1969,437 @@ async fn repeatable_read_snapshot_frozen_wire_level() {
 
     shutdown(client, server_handle).await;
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Adversarial-review regression tests (savepoint fix, wave 2).
+//
+// Each of these fails on the pre-fix tree and passes after. They cover the
+// confirmed bugs the adversarial review reproduced empirically:
+//   - data corruption: a rolled-back savepoint INSERT becoming physically
+//     committed and visible to all sessions after the top-level COMMIT
+//     (column-cache-eligible, all-fixed-numeric, multi-column relations);
+//   - cross-transaction RELEASE leak / dirty read;
+//   - ROLLBACK TO an outer savepoint failing to discard a released inner one;
+//   - top-level COMMIT atomicity vs concurrent readers;
+//   - index-scan dropping a VisiblePreImage row.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// C21 — DATA CORRUPTION repro. A rolled-back savepoint INSERT must never
+/// become physically committed. Uses a two-column all-fixed-numeric
+/// (column-cache-eligible) relation, the exact shape that corrupted.
+///
+/// Pre-fix: the fast INSERT path stamped the *parent* xid on the row, so
+/// ROLLBACK TO left the row bound to the parent and the top-level COMMIT
+/// made the rolled-back row permanently visible to every session
+/// (other sessions saw [1,2,3,7], sum(val)=13). Heap-truth is checked from
+/// a *separate* connection so a stale cache cannot mask a real corruption.
+#[tokio::test]
+async fn savepoint_rollback_then_commit_no_corruption() {
+    let (a, b, a_handle, b_handle, server_handle) = start_server_and_connect_pair().await;
+
+    a.batch_execute("CREATE TABLE t (id INT NOT NULL, val INT NOT NULL)")
+        .await
+        .expect("create table");
+    a.batch_execute("INSERT INTO t VALUES (1, 1), (2, 2), (3, 3)")
+        .await
+        .expect("seed rows");
+    // Prime the column cache with the committed projection.
+    let _ = a
+        .query("SELECT id, val FROM t ORDER BY id", &[])
+        .await
+        .expect("prime cache");
+
+    a.batch_execute("BEGIN").await.expect("BEGIN");
+    a.batch_execute("SAVEPOINT s1").await.expect("SAVEPOINT");
+    a.batch_execute("INSERT INTO t VALUES (7, 7)")
+        .await
+        .expect("insert under savepoint");
+    // Own backend sees its own savepoint write before rollback.
+    assert_eq!(
+        ids_sorted(
+            &a.query("SELECT id FROM t", &[])
+                .await
+                .expect("own mid read")
+        ),
+        vec![1, 2, 3, 7],
+        "own backend sees its in-savepoint insert before rollback",
+    );
+
+    a.batch_execute("ROLLBACK TO s1")
+        .await
+        .expect("ROLLBACK TO");
+    // Own backend must no longer see the rolled-back insert.
+    assert_eq!(
+        ids_sorted(
+            &a.query("SELECT id FROM t", &[])
+                .await
+                .expect("own after rollback")
+        ),
+        vec![1, 2, 3],
+        "own backend must not see a rolled-back savepoint insert",
+    );
+
+    a.batch_execute("COMMIT").await.expect("COMMIT");
+
+    // Heap-truth check from a *different* connection: the rolled-back row
+    // must be gone everywhere, and sum(val) must be 6 (not 13).
+    assert_eq!(
+        ids_sorted(
+            &b.query("SELECT id FROM t ORDER BY id", &[])
+                .await
+                .expect("foreign read after commit")
+        ),
+        vec![1, 2, 3],
+        "rolled-back savepoint insert must never be visible after commit",
+    );
+    let sum: Option<i64> = b
+        .query_one("SELECT sum(val) FROM t", &[])
+        .await
+        .expect("foreign sum")
+        .get(0);
+    assert_eq!(
+        sum,
+        Some(6),
+        "sum(val) must be 6, not 13 (no phantom row 7)"
+    );
+
+    drop(a);
+    drop(b);
+    a_handle.abort();
+    b_handle.abort();
+    server_handle.abort();
+}
+
+/// C22 — RELEASE leak across transactions. A released-but-parent-still-open
+/// subxid must stay invisible to other backends, and if the parent later
+/// ROLLBACKs the released write must vanish for everyone.
+///
+/// Pre-fix: RELEASE flipped the subxid CLOG entry to Committed and removed
+/// it from the in-progress set, so a concurrent backend saw the
+/// released-but-uncommitted row, and the subxid stayed Committed forever
+/// even after the parent aborted.
+#[tokio::test]
+async fn savepoint_release_does_not_leak_across_transactions() {
+    let (a, b, a_handle, b_handle, server_handle) = start_server_and_connect_pair().await;
+
+    a.batch_execute("CREATE TABLE t (id INT NOT NULL)")
+        .await
+        .expect("create table");
+
+    a.batch_execute("BEGIN").await.expect("A BEGIN");
+    a.batch_execute("SAVEPOINT s1").await.expect("A SAVEPOINT");
+    a.batch_execute("INSERT INTO t VALUES (7)")
+        .await
+        .expect("A insert under savepoint");
+
+    // Before release: invisible to B.
+    assert!(
+        b.query("SELECT id FROM t WHERE id = 7", &[])
+            .await
+            .expect("B before release")
+            .is_empty(),
+        "uncommitted savepoint write invisible to other backend",
+    );
+
+    a.batch_execute("RELEASE SAVEPOINT s1")
+        .await
+        .expect("A RELEASE");
+    // After release, parent still open: still invisible to B (no dirty read).
+    assert!(
+        b.query("SELECT id FROM t WHERE id = 7", &[])
+            .await
+            .expect("B after release")
+            .is_empty(),
+        "released-but-parent-open subxid must not leak to another backend",
+    );
+
+    // Parent ROLLBACK: the released write must vanish for everyone — a
+    // brand-new connection must see nothing.
+    a.batch_execute("ROLLBACK").await.expect("A ROLLBACK");
+    assert!(
+        b.query("SELECT id FROM t WHERE id = 7", &[])
+            .await
+            .expect("B after parent rollback")
+            .is_empty(),
+        "a released subxid whose parent aborts must leave no row",
+    );
+
+    drop(a);
+    drop(b);
+    a_handle.abort();
+    b_handle.abort();
+    server_handle.abort();
+}
+
+/// C23 — RELEASE under REPEATABLE READ: a concurrent RR reader whose
+/// snapshot is taken after the RELEASE but before the parent COMMIT must
+/// not see the released row (snapshot isolation), and a fresh reader after
+/// the parent commits must see it (fold-up). Also exercises the
+/// column-cache coherence guard: a frozen RR reader must not poison the
+/// shared cache for later readers.
+#[tokio::test]
+async fn savepoint_release_under_repeatable_read() {
+    let (a, b, a_handle, b_handle, server_handle) = start_server_and_connect_pair().await;
+
+    a.batch_execute("CREATE TABLE t (id INT NOT NULL)")
+        .await
+        .expect("create table");
+
+    a.batch_execute("BEGIN").await.expect("A BEGIN");
+    a.batch_execute("SAVEPOINT s1").await.expect("A SAVEPOINT");
+    a.batch_execute("INSERT INTO t VALUES (7)")
+        .await
+        .expect("A insert");
+    a.batch_execute("RELEASE SAVEPOINT s1")
+        .await
+        .expect("A RELEASE");
+
+    // B's RR snapshot is taken after A's RELEASE but before A's COMMIT.
+    b.batch_execute("BEGIN ISOLATION LEVEL REPEATABLE READ")
+        .await
+        .expect("B BEGIN RR");
+    assert!(
+        b.query("SELECT id FROM t WHERE id = 7", &[])
+            .await
+            .expect("B RR read 1")
+            .is_empty(),
+        "RR snapshot taken before parent commit must not see the released row",
+    );
+
+    a.batch_execute("COMMIT").await.expect("A COMMIT");
+
+    // Same frozen RR snapshot still must not see it.
+    assert!(
+        b.query("SELECT id FROM t WHERE id = 7", &[])
+            .await
+            .expect("B RR read 2")
+            .is_empty(),
+        "RR is stable: a commit after the snapshot must remain invisible",
+    );
+    b.batch_execute("COMMIT").await.expect("B COMMIT");
+
+    // A fresh reader on B now sees the committed row (fold-up succeeded and
+    // the frozen RR reader did not poison the column cache).
+    assert_eq!(
+        ids_sorted(
+            &b.query("SELECT id FROM t", &[])
+                .await
+                .expect("B fresh read")
+        ),
+        vec![7],
+        "after the parent commits, the released write is visible to everyone",
+    );
+
+    drop(a);
+    drop(b);
+    a_handle.abort();
+    b_handle.abort();
+    server_handle.abort();
+}
+
+/// C24 — ROLLBACK TO an outer savepoint must discard rows written under an
+/// inner savepoint that was previously RELEASEd.
+///
+/// Pre-fix: `merged_up` grew monotonically and was never pruned, so the
+/// released inner subxid stayed "self", its row survived the rollback, and
+/// the top-level COMMIT folded it Committed → [1, 3] instead of [1].
+#[tokio::test]
+async fn savepoint_rollback_to_outer_discards_released_inner() {
+    let (client, _conn_handle, server_handle) = start_server_and_connect().await;
+
+    client
+        .batch_execute("CREATE TABLE t (id INT NOT NULL)")
+        .await
+        .expect("create table");
+
+    client.batch_execute("BEGIN").await.expect("BEGIN");
+    client
+        .batch_execute("INSERT INTO t VALUES (1)")
+        .await
+        .expect("insert 1");
+    client
+        .batch_execute("SAVEPOINT sp_outer")
+        .await
+        .expect("SAVEPOINT sp_outer");
+    client
+        .batch_execute("INSERT INTO t VALUES (2)")
+        .await
+        .expect("insert 2 under outer");
+    client
+        .batch_execute("SAVEPOINT sp_inner")
+        .await
+        .expect("SAVEPOINT sp_inner");
+    client
+        .batch_execute("INSERT INTO t VALUES (3)")
+        .await
+        .expect("insert 3 under inner");
+    client
+        .batch_execute("RELEASE SAVEPOINT sp_inner")
+        .await
+        .expect("RELEASE sp_inner");
+    client
+        .batch_execute("ROLLBACK TO sp_outer")
+        .await
+        .expect("ROLLBACK TO sp_outer");
+
+    assert_eq!(
+        ids_sorted(
+            &client
+                .query("SELECT id FROM t", &[])
+                .await
+                .expect("read after rollback to outer")
+        ),
+        vec![1],
+        "ROLLBACK TO outer discards rows 2 and the released inner row 3",
+    );
+
+    client.batch_execute("COMMIT").await.expect("COMMIT");
+    assert_eq!(
+        ids_sorted(
+            &client
+                .query("SELECT id FROM t", &[])
+                .await
+                .expect("read after commit")
+        ),
+        vec![1],
+        "the discarded released inner row must not be committed",
+    );
+
+    shutdown(client, server_handle).await;
+}
+
+/// C25 — A row whose in-place UPDATE under a savepoint was rolled back must
+/// read back at its pre-image value via an index lookup, after ROLLBACK TO
+/// and after the eventual COMMIT.
+///
+/// This locks the end-to-end behaviour of ROLLBACK TO physically undoing
+/// the in-place update (so the slot reverts to the pre-image) together with
+/// the index-path agreement with seq scans. The companion fix to
+/// `fetch_visible_index_payload` / `LateMaterializeScan::fetch_visible_payload`
+/// (mapping `VisiblePreImage` to the undo-log pre-image instead of `None`) is
+/// what keeps the index path correct should the in-place undo or the
+/// point-lookup seq-scan fallback ever change; this test guards that the
+/// index and seq-scan answers stay identical.
+#[tokio::test]
+async fn savepoint_rollback_index_lookup_surfaces_pre_image() {
+    let (client, _conn_handle, server_handle) = start_server_and_connect().await;
+
+    client
+        .batch_execute("CREATE TABLE t (id INT NOT NULL, val INT NOT NULL)")
+        .await
+        .expect("create table");
+    client
+        .batch_execute("INSERT INTO t VALUES (1, 100)")
+        .await
+        .expect("seed row");
+    client
+        .batch_execute("CREATE INDEX t_val_idx ON t (val)")
+        .await
+        .expect("create index");
+
+    client.batch_execute("BEGIN").await.expect("BEGIN");
+    client
+        .batch_execute("SAVEPOINT s1")
+        .await
+        .expect("SAVEPOINT");
+    client
+        .batch_execute("UPDATE t SET val = 200 WHERE id = 1")
+        .await
+        .expect("update under savepoint");
+    client
+        .batch_execute("ROLLBACK TO s1")
+        .await
+        .expect("ROLLBACK TO");
+
+    // Index lookup on the *pre-image* key must find the reverted row.
+    assert_eq!(
+        ids_sorted(
+            &client
+                .query("SELECT id FROM t WHERE val = 100", &[])
+                .await
+                .expect("index lookup on pre-image key")
+        ),
+        vec![1],
+        "index lookup on the rolled-back pre-image key must find the row",
+    );
+    // The post-image key must find nothing.
+    assert!(
+        client
+            .query("SELECT id FROM t WHERE val = 200", &[])
+            .await
+            .expect("index lookup on post-image key")
+            .is_empty(),
+        "the rolled-back post-image value must not be found via the index",
+    );
+
+    client.batch_execute("COMMIT").await.expect("COMMIT");
+    assert_eq!(
+        ids_sorted(
+            &client
+                .query("SELECT id, val FROM t", &[])
+                .await
+                .expect("read after commit")
+        ),
+        vec![1],
+        "the row persists with its pre-image value after commit",
+    );
+
+    shutdown(client, server_handle).await;
+}
+
+/// C26 — Top-level COMMIT atomicity: a concurrent reader must never observe
+/// a transaction's parent write as committed while one of its savepoint
+/// writes is still in progress (a torn read). Run many racing readers
+/// against many committing writers; every read of the table must return
+/// either both rows (parent's id=1 and savepoint's id=2) or neither — never
+/// exactly one.
+#[tokio::test]
+async fn savepoint_commit_is_atomic_for_concurrent_readers() {
+    let (a, b, a_handle, b_handle, server_handle) = start_server_and_connect_pair().await;
+
+    a.batch_execute("CREATE TABLE t (id INT NOT NULL, tag INT NOT NULL)")
+        .await
+        .expect("create table");
+
+    for round in 0..40_i32 {
+        // Writer: parent write (id=1) + savepoint write (id=2), both tagged
+        // with this round so reads can be isolated to the round's rows.
+        a.batch_execute("BEGIN").await.expect("A BEGIN");
+        a.batch_execute(&format!("INSERT INTO t VALUES (1, {round})"))
+            .await
+            .expect("A parent insert");
+        a.batch_execute("SAVEPOINT s1").await.expect("A SAVEPOINT");
+        a.batch_execute(&format!("INSERT INTO t VALUES (2, {round})"))
+            .await
+            .expect("A savepoint insert");
+
+        // Reader races the commit: kick off the read, then commit.
+        let params: [&(dyn tokio_postgres::types::ToSql + Sync); 1] = [&round];
+        let read = b.query("SELECT id FROM t WHERE tag = $1 ORDER BY id", &params);
+        let commit = a.batch_execute("COMMIT");
+        let (read_res, commit_res) = tokio::join!(read, commit);
+        commit_res.expect("A COMMIT");
+        let seen = ids_sorted(&read_res.expect("B read during commit"));
+        assert!(
+            seen.is_empty() || seen == vec![1, 2],
+            "torn read in round {round}: saw {seen:?} (expected [] or [1, 2])",
+        );
+
+        // After the commit settles, both rows must be visible.
+        assert_eq!(
+            ids_sorted(
+                &b.query("SELECT id FROM t WHERE tag = $1 ORDER BY id", &[&round])
+                    .await
+                    .expect("B read after commit")
+            ),
+            vec![1, 2],
+            "after commit both the parent and savepoint rows are visible",
+        );
+    }
+
+    drop(a);
+    drop(b);
+    a_handle.abort();
+    b_handle.abort();
+    server_handle.abort();
+}
