@@ -581,32 +581,74 @@ impl<L: PageLoader> BufferPool<L> {
         self.counters.gets.fetch_add(1, Ordering::Relaxed);
 
         if let Some(frame_idx) = self.lookup(page_id) {
-            self.frames[frame_idx]
-                .pin_count
-                .fetch_add(1, Ordering::AcqRel);
-            // `clock_ref` is purely advisory for the CLOCK eviction
-            // hand: setting it tells the next sweep "this frame was
-            // recently used; please come back later." A torn / stale
-            // read from the eviction thread is harmless — the worst
-            // case is one extra rotation of the hand before the bit
-            // takes effect, which is still bounded by the (capacity *
-            // 4) outer attempt cap in `acquire_frame_for`. The pin
-            // count above already supplies the AcqRel needed to
-            // synchronize with eviction; the clock-ref store has no
-            // happens-before consumers, so `Relaxed` is sufficient.
-            self.frames[frame_idx]
-                .clock_ref
-                .store(true, Ordering::Relaxed);
-            self.counters.hits.fetch_add(1, Ordering::Relaxed);
-            self.record_relation_hit(page_id.relation);
-            return Ok(PageGuard {
-                pool: Arc::clone(self),
-                frame_idx,
-            });
+            // Lock-free hit fast path with a pin-then-recheck-tag
+            // handshake (the classic PostgreSQL pattern).
+            //
+            // `lookup` observed `page_id -> frame_idx`, but between that
+            // observation and the pin below the evictor in
+            // `acquire_frame_for` may repurpose `frame_idx` to a
+            // different page: it can see this frame unpinned, remove the
+            // old mapping, overwrite `page_id`, and reload foreign bytes.
+            // Returning a guard for `frame_idx` without re-validating the
+            // tag would hand the caller a guard that physically reads /
+            // writes the WRONG page — silent MVCC corruption.
+            //
+            // ORDERING: the pin uses `AcqRel`. The Acquire half makes the
+            // subsequent meta-lock acquire (and everything after it)
+            // observably ordered *after* the pin became globally visible,
+            // so the evictor cannot both miss our pin and have us miss its
+            // repurpose. The Release half publishes the pin to the
+            // evictor's `pin_count.load(Acquire)` recheck. Crucially the
+            // meta-lock acquire must NOT be reordered before the pin;
+            // `AcqRel` forbids that.
+            let frame = &self.frames[frame_idx];
+            frame.pin_count.fetch_add(1, Ordering::AcqRel);
+
+            // Re-validate the tag UNDER the frame's `page_id` meta-lock.
+            // This serializes against `acquire_frame_for`, which mutates
+            // `page_id` and rechecks `pin_count == 0` under the same lock.
+            // The handshake is mutually exclusive: either the evictor took
+            // the meta-lock first and now observes our pin (so it skips
+            // this frame and the tag still matches), or we took it first
+            // and observe whatever `page_id` the evictor last committed.
+            let identity_ok = { *frame.page_id.lock() == Some(page_id) };
+            if !identity_ok {
+                // The frame was repurposed out from under us. Back the pin
+                // out and fall through to the miss path to re-resolve the
+                // page properly. `Release` publishes that we are no longer
+                // pinning so a concurrent evictor's `Acquire` recheck sees
+                // a zeroed (or correctly accounted) pin count.
+                frame.pin_count.fetch_sub(1, Ordering::Release);
+            } else {
+                // `clock_ref` is purely advisory for the CLOCK eviction
+                // hand: setting it tells the next sweep "this frame was
+                // recently used; please come back later." A torn / stale
+                // read from the eviction thread is harmless — the worst
+                // case is one extra rotation of the hand before the bit
+                // takes effect, which is still bounded by the (capacity *
+                // 4) outer attempt cap in `acquire_frame_for`. The pin
+                // count above already supplies the AcqRel needed to
+                // synchronize with eviction; the clock-ref store has no
+                // happens-before consumers, so `Relaxed` is sufficient.
+                frame.clock_ref.store(true, Ordering::Relaxed);
+                self.counters.hits.fetch_add(1, Ordering::Relaxed);
+                self.record_relation_hit(page_id.relation);
+                return Ok(PageGuard {
+                    pool: Arc::clone(self),
+                    frame_idx,
+                });
+            }
         }
 
         let _miss = self.miss_lock.lock();
 
+        // Re-check under `miss_lock`: a concurrent miss may have already
+        // installed the page. This lookup does NOT need the tag recheck
+        // that the lock-free fast path above requires, because eviction
+        // (`acquire_frame_for`) is only ever called while holding
+        // `miss_lock` — which we now hold. No other thread can repurpose a
+        // frame between this `lookup` and the pin, so the observed
+        // `frame_idx -> page_id` mapping cannot change underneath us.
         if let Some(frame_idx) = self.lookup(page_id) {
             self.frames[frame_idx]
                 .pin_count
@@ -1409,5 +1451,95 @@ mod tests {
         );
         assert_eq!(flushed, 2);
         assert_eq!(pool.stats().dirty, 0);
+    }
+
+    // -----------------------------------------------------------------------
+    // Concurrency stress: eviction TOCTOU regression
+    // -----------------------------------------------------------------------
+
+    /// Loader that stamps each page with its own block number, so a guard
+    /// handed to the caller for page P but physically backed by page Q's
+    /// frame is detectable: the LSN field will read back as Q's block, not
+    /// P's. The LSN round-trips losslessly through the page header, which
+    /// makes it a convenient per-page identity tag for the test.
+    struct StampLoader;
+    impl PageLoader for StampLoader {
+        fn load(&self, page_id: PageId) -> Result<Page> {
+            let mut page = Page::new_heap();
+            page.set_lsn(u64::from(page_id.block.raw()));
+            Ok(page)
+        }
+    }
+
+    /// Hammers concurrent `get_page` on a small pool under high eviction
+    /// pressure and asserts that no thread ever observes a guard whose page
+    /// content (the per-page identity stamp) belongs to a *different*
+    /// `page_id`.
+    ///
+    /// This reproduces the lock-free-hit-path eviction TOCTOU: a thread
+    /// reads `page_id -> frame_idx` from the page table, is preempted
+    /// before pinning, and meanwhile the evictor repurposes that frame to
+    /// another page. Without the pin-then-recheck-tag handshake the thread
+    /// returns a guard for the requested page that physically reads the
+    /// foreign page's bytes — silent corruption. With the recheck, the
+    /// thread backs the pin out and re-resolves via the miss path, so the
+    /// stamp always matches.
+    ///
+    /// Reverting the recheck in `get_page` makes this test fail (the
+    /// assertion below trips with a mismatched stamp).
+    #[test]
+    fn concurrent_get_page_never_returns_foreign_page() {
+        use std::sync::atomic::{AtomicBool, Ordering as O};
+
+        // Small pool, many distinct pages → maximal eviction churn.
+        const POOL_CAP: usize = 4;
+        const PAGES: u32 = 64;
+        const THREADS: usize = 8;
+        const ITERS: usize = 40_000;
+
+        let pool = Arc::new(BufferPool::new(POOL_CAP, StampLoader));
+        let corruption = Arc::new(AtomicBool::new(false));
+
+        let mut handles = Vec::with_capacity(THREADS);
+        for t in 0..THREADS {
+            let pool = Arc::clone(&pool);
+            let corruption = Arc::clone(&corruption);
+            handles.push(std::thread::spawn(move || {
+                // Each thread walks pages with a different stride/offset so
+                // the access streams interleave and collide on frames.
+                let stride = u32::try_from(t * 2 + 1).unwrap_or(1);
+                let mut block = u32::try_from(t).unwrap_or(0) % PAGES;
+                for _ in 0..ITERS {
+                    let want = PageId::new(RelationId::new(1), BlockNumber::new(block));
+                    match pool.get_page(want) {
+                        Ok(guard) => {
+                            // The guard claims to be `want`; verify its
+                            // physical bytes actually belong to `want`.
+                            let observed = guard.read().header().lsn;
+                            if observed != u64::from(block) {
+                                corruption.store(true, O::Relaxed);
+                            }
+                            drop(guard);
+                        }
+                        Err(BufferPoolError::Exhausted) => {
+                            // All frames momentarily pinned by peers; just
+                            // retry on the next iteration.
+                        }
+                        Err(other) => panic!("unexpected error: {other:?}"),
+                    }
+                    block = (block + stride) % PAGES;
+                }
+            }));
+        }
+
+        for h in handles {
+            h.join().expect("stress worker panicked");
+        }
+
+        assert!(
+            !corruption.load(O::Relaxed),
+            "a get_page guard returned content belonging to a different \
+             page_id — the eviction TOCTOU re-validation handshake is broken"
+        );
     }
 }
